@@ -3,7 +3,7 @@ using Gui;
 
 namespace Gui.Widget;
 
-// Shares the legacy Fit/Layout result; input is supplied by real Button descendants.
+// Uses the shared Fit/Layout result; input is supplied by real Button descendants.
 public partial class Ribbon {
     Control retainedTabs;
     Control retainedBand;
@@ -14,6 +14,7 @@ public partial class Ribbon {
     List<Control> retainedBoxes = new List<Control>();
     List<Label> retainedTitles = new List<Label>();
     RibbonLayout retainedLayout;
+    RibbonFit retainedMeasured;
     List<RibbonSlot> retainedOverflow = new List<RibbonSlot>();
     RibbonOverflow retainedPopup;
     weak App retainedApp;
@@ -47,7 +48,7 @@ public partial class Ribbon {
         retainedTabs = null; retainedBand = null; retainedMore = null;
         retainedItems = new List<Button>(); retainedLabels = new List<Label>();
         retainedGroups = new List<Control>(); retainedBoxes = new List<Control>();
-        retainedTitles = new List<Label>(); retainedLayout = null;
+        retainedTitles = new List<Label>(); retainedLayout = null; retainedMeasured = null;
         retainedOverflow = new List<RibbonSlot>();
         retainedDividers = new List<Control>(); retainedDividerItems = new List<int>();
         layoutGeneration = 0;
@@ -80,16 +81,74 @@ public partial class Ribbon {
         return result;
     }
 
+    static string RetainedItemClass(RibbonItem item, int kind) {
+        return "ribbon-cmd" + (kind == 0 ? " stacked" : (kind == 1 ? " small" : ""))
+            + (item.on ? " on" : "") + (item.menu ? " has-menu" : "");
+    }
+
+    // Measure the real standard Button: its row direction, inherited font,
+    // children, gap, padding and border must agree with Arrange. Hidden slots
+    // and compact captions are restored before any input retirement callbacks.
+    RibbonFit MeasureRetainedItems(App app, List<RibbonGroup> model) {
+        RibbonFit measured = Ribbon.FitNone(model);
+        int gap = app.Scale(Space.XS);
+        int flat = 0;
+        for (int g = 0; g < model.Count; g = g + 1) {
+            RibbonGroup group = model[g];
+            Control groupNode = groups.Count > 0 ? retainedGroups[g] : retainedBand;
+            bool groupShown = groupNode.Visible;
+            groupNode.Visible = true;
+            try {
+                for (int j = 0; j < group.items.Count; j = j + 1) {
+                    RibbonItem item = group.items[j];
+                    Button button = retainedItems[flat]; Label caption = retainedLabels[flat];
+                    bool shown = button.Visible;
+                    bool captionShown = caption != null && caption.Visible;
+                    string classes = button.ClassName;
+                    try {
+                        button.Visible = true;
+                        if (caption != null) { caption.Visible = true; }
+                        int kind = item.tile ? 2 : (item.small ? 1 : 0);
+                        button.ClassName = Ribbon.RetainedItemClass(item, kind);
+                        button.MeasureTree(app);
+                        measured.widths.Add((int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap);
+                        int tileWidth = 0;
+                        if (item.tile || item.small) {
+                            if (caption != null) { caption.Visible = false; }
+                            button.ClassName = Ribbon.RetainedItemClass(item, 2);
+                            button.MeasureTree(app);
+                            tileWidth = (int)Math.Max(button.prefW, button.StyleWidthIn(0)) + gap;
+                        }
+                        measured.tileWidths.Add(tileWidth);
+                    } finally {
+                        button.Visible = shown; button.ClassName = classes;
+                        if (caption != null) { caption.Visible = captionShown; }
+                    }
+                    flat = flat + 1;
+                }
+            } finally { groupNode.Visible = groupShown; }
+        }
+        bool moreShown = retainedMore.Visible;
+        try {
+            retainedMore.Visible = true;
+            retainedMore.MeasureTree(app);
+            measured.overflowWidth = (int)Math.Max(Ribbon.OverflowButtonW(app), retainedMore.StyleWidthIn(0));
+        } finally { retainedMore.Visible = moreShown; }
+        return measured;
+    }
+
     public override void OnMeasure(App app) {
         if (retainedBand == null) { this.BuildTree(); }
         int rows = Rows > 0 ? Rows : (tabs.Count > 0 ? 3 : 2);
         int height = tabs.Count > 0 ? Ribbon.HeightTabbed(app)
             : (groups.Count > 0 ? Ribbon.HeightGroups(app) : Ribbon.Height(app));
         int bandH = height - (tabs.Count > 0 ? Ribbon.TabStripHeight(app) : 0);
-        prefH = height;
-        prefW = Ribbon.BandWidth(app, this.RetainedModel(), bandH, rows);
         if (retainedTabs != null) { retainedTabs.MeasureTree(app); }
         if (retainedBand != null) { retainedBand.MeasureTree(app); }
+        List<RibbonGroup> model = this.RetainedModel();
+        retainedMeasured = this.MeasureRetainedItems(app, model);
+        prefH = height;
+        prefW = Ribbon.BandWidthFit(app, model, bandH, rows, retainedMeasured);
     }
 
     public override void Arrange(int x, int y, int width, int height) {
@@ -113,8 +172,8 @@ public partial class Ribbon {
         if (retainedTabs != null) {
             retainedTabs.Arrange(x, y, this.bw, stripH);
             int tx = x + app.theme.paddingSmall;
-            for (int i = 0; i < retainedTabs.Children.Count; i = i + 1) {
-                Control button = retainedTabs.Children[i];
+            for (int i = 0; i < retainedTabs.ChildCount(); i = i + 1) {
+                Control button = retainedTabs.ChildAt(i);
                 button.ClassName = "ribbon-tab " + (tab == i ? "active" : "");
                 button.MeasureTree(app);
                 int tw = button.prefW;
@@ -129,20 +188,22 @@ public partial class Ribbon {
         retainedBand.bx = x; retainedBand.by = bandY; retainedBand.bw = this.bw; retainedBand.bh = bandH;
         List<RibbonGroup> model = this.RetainedModel();
         int rows = Rows > 0 ? Rows : (tabs.Count > 0 ? 3 : 2);
-        RibbonFit fit = Ribbon.Fit(app, model, bandH, rows, this.bw);
+        RibbonFit measured = retainedMeasured;
+        retainedMeasured = null;
+        if (measured == null) { measured = this.MeasureRetainedItems(app, model); }
+        RibbonFit fit = Ribbon.Fit(app, model, bandH, rows, this.bw, measured);
         RibbonLayout layout = Ribbon.Layout(app, model, bandH, rows, fit);
         int limit = this.bw;
-        if (layout.width > limit) {
-            limit = (int)Math.Max(0, this.bw - Ribbon.OverflowButtonW(app));
-            fit = Ribbon.Fit(app, model, bandH, rows, limit);
+        bool needsOverflow = layout.width > limit;
+        for (int i = 0; i < fit.dropped.Count; i = i + 1) {
+            if (fit.dropped[i]) { needsOverflow = true; break; }
+        }
+        if (needsOverflow) {
+            limit = (int)Math.Max(0, this.bw - measured.overflowWidth);
+            fit = Ribbon.Fit(app, model, bandH, rows, limit, measured);
             layout = Ribbon.Layout(app, model, bandH, rows, fit);
         }
-        List<RibbonSlot> overflow = new List<RibbonSlot>();
-        for (int i = 0; i < layout.slots.Count; i = i + 1) {
-            RibbonSlot slot = layout.slots[i];
-            slot.overflow = slot.x + slot.w > limit || slot.h <= app.Scale(Space.XS);
-            if (slot.overflow) { overflow.Add(slot); }
-        }
+        List<RibbonSlot> overflow = this.RetainedOverflowSlots(app, model, fit, layout, limit);
         // A changed geometry/menu must retire capture/focus before hiding buttons.
         bool changed = !this.SameRetainedLayout(layout, overflow) || layoutX != x || layoutY != y
             || layoutW != this.bw || layoutH != this.bh;
@@ -157,7 +218,7 @@ public partial class Ribbon {
         bool more = overflow.Count > 0 && this.bw > 0 && bandH > 0;
         if (!this.SetRetainedShown(app, retainedMore, more, session, revision)) { return; }
         if (more) {
-            int mw = (int)Math.Min(this.bw, Ribbon.OverflowButtonW(app));
+            int mw = (int)Math.Min(this.bw, measured.overflowWidth);
             int mh = (int)Math.Min(bandH, app.Scale(24));
             retainedMore.MeasureTree(app);
             retainedMore.Arrange(x + this.bw - mw, bandY + (bandH - mh) / 2, mw, mh);
@@ -168,8 +229,8 @@ public partial class Ribbon {
 
     void WireRetainedRevision() {
         if (retainedTabs != null) {
-            for (int i = 0; i < retainedTabs.Children.Count; i = i + 1) {
-                Button button = (Button)retainedTabs.Children[i];
+            for (int i = 0; i < retainedTabs.ChildCount(); i = i + 1) {
+                Button button = (Button)retainedTabs.ChildAt(i);
                 button.Click.Clear(); button.Click.Add(this.RetainedAction(i, true, button).Run);
             }
         }
@@ -184,6 +245,28 @@ public partial class Ribbon {
         retainedMore.Click.Add(more.Run);
     }
 
+    List<RibbonSlot> RetainedOverflowSlots(App app, List<RibbonGroup> model, RibbonFit fit, RibbonLayout layout, int limit) {
+        List<RibbonSlot> overflow = new List<RibbonSlot>();
+        int flat = 0; int placed = 0;
+        for (int g = 0; g < model.Count; g = g + 1) {
+            for (int j = 0; j < model[g].items.Count; j = j + 1) {
+                if (fit.dropped[flat]) {
+                    // Optional removes the band entry, never the command's menu entry.
+                    RibbonSlot slot = new RibbonSlot();
+                    slot.flat = flat; slot.group = g; slot.item = j;
+                    slot.cmd = model[g].items[j]; slot.overflow = true;
+                    overflow.Add(slot);
+                } else {
+                    RibbonSlot slot = layout.slots[placed]; placed = placed + 1;
+                    slot.overflow = slot.x + slot.w > limit || slot.h <= app.Scale(Space.XS);
+                    if (slot.overflow) { overflow.Add(slot); }
+                }
+                flat = flat + 1;
+            }
+        }
+        return overflow;
+    }
+
     bool SameRetainedLayout(RibbonLayout layout, List<RibbonSlot> overflow) {
         if (retainedLayout == null || retainedLayout.slots.Count != layout.slots.Count
                 || retainedOverflow.Count != overflow.Count) { return false; }
@@ -191,6 +274,9 @@ public partial class Ribbon {
             RibbonSlot a = retainedLayout.slots[i]; RibbonSlot b = layout.slots[i];
             if (a.flat != b.flat || a.kind != b.kind || a.x != b.x || a.y != b.y
                 || a.w != b.w || a.h != b.h || a.overflow != b.overflow) { return false; }
+        }
+        for (int i = 0; i < overflow.Count; i = i + 1) {
+            if (retainedOverflow[i].flat != overflow[i].flat) { return false; }
         }
         return true;
     }
@@ -222,8 +308,7 @@ public partial class Ribbon {
                 app.ReleaseInputSubtree(button);
                 if (treeGeneration != session || arrangeEpoch != revision) { return false; }
             }
-            button.ClassName = "ribbon-cmd align-center justify-center "
-                + (found.kind == 1 ? "row small" : "col") + (item.on ? " on" : "");
+            button.ClassName = Ribbon.RetainedItemClass(item, found.kind);
             if (i < retainedLabels.Count && retainedLabels[i] != null) { retainedLabels[i].Visible = found.kind != 2; }
             button.MeasureTree(app);
             int gap = app.Scale(Space.XS);
@@ -316,6 +401,7 @@ public partial class Ribbon {
         for (int i = 0; i < retainedOverflow.Count; i = i + 1) {
             RibbonSlot slot = retainedOverflow[i]; RibbonItem item = slot.cmd;
             Button button = new Button();
+            button.name = "ribbon-overflow-command-" + Convert.ToString(item.act);
             button.ClassName = "contextmenu-item row align-center ghost small";
             button.SetProp("style", "flex-shrink:0");
             button.Disabled = !item.enabled;

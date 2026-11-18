@@ -1,0 +1,887 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Gui;
+
+namespace Gui.Backend;
+
+public partial class UiDriver {
+    static bool active;
+    static bool finished;
+    static App app;
+    static List<string> cmds;
+    static int pc;
+    static int waitUntilUs;  // 绝对微秒；仅在 waitArmed 时有效
+    static bool waitArmed;  // 是否有挂起等待（时钟会回绕，不能用 0 判断）
+    static bool waitFullPresent;
+    static bool traceFullPresent;
+    static int traceOwner;
+    static int traceRequest;
+    static int traceEnterMask;
+    static int traceLeaveMask;
+    static bool tracePreparationReason;
+    static string outDir;
+    static string resultsPath;
+    static int passCount;
+    static int failCount;
+
+    static List<UiProbe> probes;
+
+    // ZAN_UI_SCRIPT 驱动的会话运行中时为真（可设置 probe）。
+    static bool Active() { return active; }
+
+    // Opt in before Show; the session starts after native client metrics settle.
+    public static void Enable(App a) {
+        if (a == null) { return; }
+        if (!(a.AutomationSession() is UiDriverSession)) { a.SetAutomationSession(new UiDriverSession()); }
+        GuiFrameProfiler.EnableFromEnvironment(a);
+    }
+
+    // Start immediately for an already-shown host; client-dev still requires
+    // startup before the first measured paint. An active session is unchanged.
+    static void Begin(App a) {
+        UiDriver.Enable(a);
+        UiDriver.Start(a);
+    }
+
+    internal static void Start(App a) {
+        if (active) { return; }
+        string path = UiDriver.Env("ZAN_UI_SCRIPT");
+        if (path == "") { return; }
+        if (!File.Exists(path)) { return; }
+        app = a;
+        outDir = UiDriver.Env("ZAN_UI_OUT");
+        if (outDir == "") { outDir = "_scratch/uidrv"; }
+        Directory.CreateDirectoryRecursive(outDir);
+        resultsPath = outDir + "/results.log";
+        cmds = new List<string>();
+        string body = File.ReadAllText(path);
+        List<string> raw = body.Replace("\r", "").Split("\n");
+        for (int i = 0; i < raw.Count; i = i + 1) { cmds.Add(raw[i]); }
+        pc = 0;
+        waitUntilUs = 0;
+        waitArmed = false;
+        waitFullPresent = false;
+        traceFullPresent = App.PerfOn();
+        traceOwner = traceOwner + 1;
+        traceRequest = 0;
+        traceEnterMask = 0;
+        traceLeaveMask = 0;
+        tracePreparationReason = false;
+        passCount = 0;
+        failCount = 0;
+        commandErrors = 0;
+        commandLine = 0;
+        probes = new List<UiProbe>();
+        finished = false;
+        active = true;
+        File.WriteAllText(resultsPath,
+        "# UiDriver session: " + path + " (" + Convert.ToString(cmds.Count)
+        + " lines)\n");
+        UiDriver.ApplyStartupClient();
+        app.RequestRedraw();
+    }
+
+    // A physical test surface is fixed before the first measured paint. Scan
+    // all placement first so a late/duplicate command cannot resize then fail.
+    static void ApplyStartupClient() {
+        int first = -1;
+        int client = -1;
+        for (int i = 0; i < cmds.Count; i++) {
+            string line = TextUtil.TrimOrEmpty(cmds[i]);
+            if (line == "" || line.StartsWith("#")) { continue; }
+            if (first < 0) { first = i; }
+            List<string> tokens = UiDriver.Tok(line);
+            if (tokens[0] != "client-dev") { continue; }
+            if (client >= 0 || i != first) {
+                throw new InvalidOperationException("client-dev must be the first and only startup size command");
+            }
+            client = i;
+        }
+        if (client < 0) { return; }
+        List<string> size = UiDriver.Tok(TextUtil.TrimOrEmpty(cmds[client]));
+        if (size.Count != 3) { throw new InvalidOperationException("client-dev requires W H"); }
+        int w = UiDriver.ParseProbeId(size[1]);
+        int h = UiDriver.ParseProbeId(size[2]);
+        if (w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+            throw new InvalidOperationException("client-dev requires positive device dimensions <=16384");
+        }
+        int framesBefore = app.frameCount;
+        int perfBefore = app.perfFrames;
+        if (framesBefore != 0 || perfBefore != 0) {
+            throw new InvalidOperationException("client-dev requires an unpainted app");
+        }
+        app.SetClientSizeDev(w, h);
+        app.SyncSurface();
+        if (app.window.GetHandle() == 0 || app.window.ClientWidth() != w || app.window.ClientHeight() != h
+        || app.canvas.Width() != w || app.canvas.Height() != h
+        || app.frameCount != framesBefore || app.perfFrames != perfBefore) {
+            throw new InvalidOperationException("client-dev actual native canvas or prepaint counters mismatch: client="
+            + Convert.ToString(app.window.ClientWidth()) + "x" + Convert.ToString(app.window.ClientHeight())
+            + " canvas=" + Convert.ToString(app.canvas.Width()) + "x" + Convert.ToString(app.canvas.Height())
+            + " frames=" + Convert.ToString(app.frameCount) + "/" + Convert.ToString(app.perfFrames));
+        }
+        pc = client + 1;
+        UiDriver.Note("client-dev " + Convert.ToString(w) + " " + Convert.ToString(h)
+        + " frame_before=" + Convert.ToString(framesBefore)
+        + " frame_after=" + Convert.ToString(app.frameCount)
+        + " perf_before=" + Convert.ToString(perfBefore)
+        + " perf_after=" + Convert.ToString(app.perfFrames));
+    }
+
+    // 宿主钩子：释放 `redraw full` 在下一次脚本命令前的呈现屏障。
+    static void NotifyPresented(App owner) {
+        if (app == owner && waitFullPresent) {
+            UiDriver.TraceFullPresent(owner, 29, true);
+            UiDriver.TraceFullPresent(owner, 29, false);
+            waitFullPresent = false;
+        }
+    }
+
+    // Optional barrier observation. Each compact stage (0..29) is written once
+    // per edge/request; callers pass no strings or shadow request state.
+    static void TraceFullPresent(App owner, int stage, bool enter) {
+        if (!traceFullPresent || !waitFullPresent || app != owner || stage < 0 || stage > 29) { return; }
+        int bit = 1 << stage;
+        if (enter) {
+            if ((traceEnterMask & bit) != 0) { return; }
+            traceEnterMask = traceEnterMask | bit;
+        } else {
+            if ((traceLeaveMask & bit) != 0) { return; }
+            traceLeaveMask = traceLeaveMask | bit;
+        }
+        try {
+            UiDriver.Note("full-present owner=" + Convert.ToString(traceOwner)
+            + " request=" + Convert.ToString(traceRequest)
+            + " stage=" + Convert.ToString(stage)
+            + " edge=" + (enter ? "enter" : "leave")
+            + " us=" + Convert.ToString(Window.GetTickUs()));
+        } catch (Exception ex) {
+            // Diagnostics must never change the frame's exception or ACK path.
+            traceFullPresent = false;
+        }
+    }
+
+    static bool PreparationReasonPending(App owner) {
+        return traceFullPresent && waitFullPresent && app == owner && !tracePreparationReason;
+    }
+
+    static void TracePreparationReason(App owner, string reason) {
+        if (!UiDriver.PreparationReasonPending(owner)) { return; }
+        tracePreparationReason = true;
+        try {
+            UiDriver.Note("full-present owner=" + Convert.ToString(traceOwner)
+            + " request=" + Convert.ToString(traceRequest)
+            + " stage=18 reason=" + reason);
+        } catch (Exception ex) { traceFullPresent = false; }
+    }
+
+    // 读取环境变量；未设置（null）归一为 ""。
+    static string Env(string name) {
+        string v = Interop.EnvVar(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+
+    // 宿主钩子：发布（或覆盖）一个命名的内省 probe。
+    static void SetProbe(string name, string val) {
+        if (!active) { return; }
+        for (int i = 0; i < probes.Count; i = i + 1) {
+            if (probes[i].name == name) { probes[i].value = val; return; }
+        }
+        probes.Add(new UiProbe(name, val));
+    }
+
+    // 读取已发布的 probe 值；未发布过返回 ""。
+    static string GetProbe(string name) {
+        for (int i = 0; i < probes.Count; i = i + 1) {
+            if (probes[i].name == name) { return probes[i].value; }
+        }
+        return "";
+    }
+
+    // `clickid @name` 的数值解析：非纯十进制正整数（含空串）
+    // 一律返回 -1，由调用方记入结果日志。
+    static int ParseProbeId(string s) {
+        if (s.Length == 0 || s.Length > 9) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c < 48 || c > 57) { return -1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+
+    // 推进脚本。每个事件循环迭代调用一次（从
+    // App.ProcessEvent 和 IDE 的自定义循环）。注入下一个事件
+    // 或跳过即时（dump/assert/log）命令。在注入的批次之间
+    // 让出，使每批完全消费并渲染后再进行下一批。
+    static void Tick() {
+        if (!active || finished) { return; }
+        if (waitFullPresent) {
+            UiDriver.TraceFullPresent(app, 1, true);
+            app.pollPending = true;
+            return;
+        }
+        // 脚本运行期间保持宿主循环轮询（而非阻塞），使注入的事件
+        // 被刷出、基于时间的等待得以推进。只要求循环别睡着，不要求
+        // 重绘：把它写成 needsRedraw 会让被驱动的每一帧都变成整窗
+        // 重绘，量出来的就不再是应用真实的绘制路径。
+        app.pollPending = true;
+        // 先让之前注入的批次排空（并完成渲染）。
+        if (Window.InjectPending() > 0) { return; }
+        int nowUs = Window.GetTickUs();
+        if (waitArmed) {
+            if (nowUs - waitUntilUs < 0) { return; }
+            waitArmed = false;
+        }
+        while (pc < cmds.Count) {
+            string line = cmds[pc];
+            pc = pc + 1;
+            bool yield = UiDriver.ExecuteCommand(line, pc);
+            if (yield) { return; }
+        }
+        UiDriver.Finish();
+    }
+
+    // 执行一行命令。注入事件或设置了
+    // 等待时返回 true（调用方应在下一条命令前让循环先处理）。
+    static bool Exec(string line) {
+        return UiDriver.ExecuteCommand(line, 0);
+    }
+
+    static bool ExecCore(string line) {
+        string trimmed = TextUtil.TrimOrEmpty(line);
+        if (trimmed == "") { return false; }
+        if (TextUtil.StartsWithOr(trimmed, "#", false)) { return false; }
+        List<string> t = UiDriver.Tok(trimmed);
+        string cmd = t[0];
+
+        if (cmd == "client-dev") {
+            throw new InvalidOperationException("client-dev is only valid in the Begin startup header");
+        }
+        if (cmd == "wait") {
+            int ms = UiDriver.ArgI(t, 1, 0);
+            waitUntilUs = Window.GetTickUs() + ms * 1000;
+            waitArmed = true;
+            UiDriver.Note("wait " + Convert.ToString(ms));
+            return true;
+        }
+        if (cmd == "redraw") {
+            if (t.Count != 2 || t[1] != "full") {
+                UiDriver.CommandError("redraw: expected full");
+                return false;
+            }
+            app.RequestRedraw();
+            waitFullPresent = true;
+            traceRequest = traceRequest + 1;
+            traceEnterMask = 0;
+            traceLeaveMask = 0;
+            tracePreparationReason = false;
+            UiDriver.Note("redraw full");
+            UiDriver.TraceFullPresent(app, 0, true);
+            return true;
+        }
+        if (cmd == "freeze") {
+            if (t.Count < 2 || t.Count > 3 || t[1] != "clock") {
+                UiDriver.CommandError("freeze: expected clock [tickMs]");
+                return false;
+            }
+            int fixedMs = 600000;
+            if (t.Count == 3) { fixedMs = UiDriver.ArgI(t, 2, fixedMs); }
+            app.FreezeAnimClock(fixedMs);
+            UiDriver.Note("freeze clock " + Convert.ToString(fixedMs));
+            return false;
+        }
+        if (cmd == "unfreeze") {
+            if (t.Count != 2 || t[1] != "clock") {
+                UiDriver.CommandError("unfreeze: expected clock");
+                return false;
+            }
+            app.UnfreezeAnimClock();
+            UiDriver.Note("unfreeze clock");
+            return false;
+        }
+        if (cmd == "move") {
+            UiDriver.Inject(1, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0, 0, 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "click") {
+            UiDriver.ClickAt(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "rclick") {
+            UiDriver.ClickAt(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 1);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "clickid") {
+            // is exact.
+            string target = t.Count > 1 ? t[1] : "";
+            int id = -1;
+            ControlNode retained = UiDriver.FindInputTarget(target);
+            if (retained != null) {
+                if (retained.pointerHit == 0) {
+                    UiDriver.CommandError("clickid " + target + " -> retained target is not reachable");
+                    return false;
+                }
+                UiDriver.ClickAt(retained.x + retained.w / 2, retained.y + retained.h / 2, 0);
+                UiDriver.Note("clickid " + target + " (retained)");
+                return true;
+            }
+            if (TextUtil.StartsWithOr(target, "@", false)) {
+                // 语义名：优先按本帧命中区的标签解析（点击时刻的
+                // 注册表即真相，天然免疫控件增减导致的 id 漂移）；
+                // 未标注的控件走宿主 probe "id.<name>" 旧通道。
+                string nm = TextUtil.TrimOrEmpty(target.Substring(1));
+                HitRegion lr = UiDriver.FindRegionByLabel(nm);
+                if (lr != null) {
+                    id = lr.id;
+                    UiDriver.Note("clickid " + target + " -> id "
+                    + Convert.ToString(id) + " (label)");
+                } else {
+                    id = UiDriver.ParseProbeId(UiDriver.GetProbe("id." + nm));
+                    if (id < 0) {
+                        UiDriver.CommandError("clickid " + target + " -> no label, probe id."
+                        + nm + " missing or not a positive integer");
+                        return false;
+                    }
+                }
+            } else {
+                id = UiDriver.ArgI(t, 1, -1);
+            }
+            HitRegion r = UiDriver.FindRegion(id);
+            if (r != null) {
+                int cx = r.x + r.width / 2;
+                int cy = r.y + r.height / 2;
+                UiDriver.ClickAt(cx, cy, 0);
+                UiDriver.Note("clickid " + target + " -> (" + Convert.ToString(cx)
+                + "," + Convert.ToString(cy) + ")");
+            } else {
+                UiDriver.CommandError("clickid " + target + " -> NOT FOUND");
+                return false;
+            }
+            return true;
+        }
+        if (cmd == "scroll") {
+            UiDriver.Inject(13, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+            0, UiDriver.ArgI(t, 3, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "char") {
+            UiDriver.Inject(6, 0, 0, 0, UiDriver.ArgI(t, 1, 0), 0);
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "type") {
+            string txt = UiDriver.Unquote(UiDriver.RemainderAfter(trimmed, 1));
+            for (int i = 0; i < txt.Length; i = i + 1) {
+                int b = txt[i];
+                if (b >= 32 && b < 127) {
+                    UiDriver.Inject(6, 0, 0, 0, b, 0);
+                }
+            }
+            UiDriver.Note("type \"" + txt + "\"");
+            return true;
+        }
+        if (cmd == "keydown") {
+            UiDriver.Inject(4, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "keyup") {
+            UiDriver.Inject(5, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "ev") {
+            UiDriver.Inject(UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+            UiDriver.ArgI(t, 3, 0), UiDriver.ArgI(t, 4, 0),
+            UiDriver.ArgI(t, 5, 0), UiDriver.ArgI(t, 6, 0));
+            UiDriver.Note(trimmed);
+            return true;
+        }
+        if (cmd == "dump") {
+            UiDriver.DoDump(t);
+            return false;
+        }
+        if (cmd == "assert") {
+            UiDriver.DoAssert(t, trimmed);
+            return false;
+        }
+        if (cmd == "log") {
+            UiDriver.Note(UiDriver.RemainderAfter(trimmed, 1));
+            return false;
+        }
+        if (cmd == "quit") {
+            UiDriver.Note("quit");
+            UiDriver.Finish();
+            app.window.Close();
+            app.isRunning = false;
+            return true;
+        }
+        UiDriver.CommandError("UNKNOWN COMMAND: " + trimmed);
+        return false;
+    }
+
+    // 注入移动+按下+释放三个合成事件，等价一次点击；
+    // button 0 左键、1 右键。
+    static void ClickAt(int x, int y, int button) {
+        UiDriver.Inject(1, x, y, 0, 0, 0);  // 移动
+        UiDriver.Inject(2, x, y, button, 0, 0);  // 按下
+        UiDriver.Inject(3, x, y, button, 0, 0);  // 释放
+    }
+
+    // 向绑定窗口注入一个原始合成事件（编码同 Window.InjectEvent）。
+    static void Inject(int kind, int x, int y, int button, int code, int mods) {
+        app.window.InjectEvent(kind, x, y, button, code, mods);
+    }
+
+    // Resolve against the current routed tree before consulting legacy paint regions.
+    static ControlNode FindInputTarget(string target) {
+        bool named = TextUtil.StartsWithOr(target, "@", false);
+        string name = named ? TextUtil.TrimOrEmpty(target.Substring(1)) : "";
+        int id = named ? -1 : UiDriver.ParseProbeId(target);
+        ControlTreeDoc snapshot = UiDriver.TreeSnapshot();
+        for (int i = snapshot.inputTargets.Count - 1; i >= 0; i = i - 1) {
+            ControlNode node = snapshot.inputTargets[i];
+            if (named ? node.name == name || node.name.EndsWith(":" + name) : node.id == id) {
+                return node;
+            }
+        }
+        return null;
+    }
+
+    // 将命中区域 id 解析为区域（后注册者优先，与
+    // HitTester 的逆序命中优先级一致）。未注册时返回 null。
+    static HitRegion FindRegion(int id) {
+        int i = app.hitTester.RegionCount() - 1;
+        while (i >= 0) {
+            HitRegion r = app.hitTester.RegionAt(i);
+            if (r.id == id) { return r; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    // 将命中区域语义标签解析为区域（后注册者优先，与
+    // HitTester 的逆序命中优先级一致——同名标签叠放时顶层
+    // 拥有点击，与指针语义相同）。未标注或无此标签返回 null。
+    static HitRegion FindRegionByLabel(string name) {
+        int i = app.hitTester.RegionCount() - 1;
+        while (i >= 0) {
+            HitRegion r = app.hitTester.RegionAt(i);
+            if (r.label == name || r.label.EndsWith(":" + name)) { return r; }
+            i = i - 1;
+        }
+        return null;
+    }
+
+    // 执行 `dump` 命令：hitregions/tree/theme/pixels/probe 写出
+    // JSON 或像素文件（相对路径落到输出目录）。参数缺失或目标
+    // 未知记入结果日志。
+    static void DoDump(List<string> t) {
+        if (t.Count < 3) { UiDriver.CommandError("dump: missing args"); return; }
+        string what = t[1];
+        if (what == "hitregions") {
+            string file = t[2];
+            File.WriteAllText(UiDriver.OutPath(file), UiDriver.HitRegionsJson());
+
+            UiDriver.Note("dump hitregions -> " + file + " ("
+            + Convert.ToString(app.hitTester.RegionCount()) + " regions)");
+            return;
+        }
+        if (what == "tree") {
+            string treeFile = t[2];
+            File.WriteAllText(UiDriver.OutPath(treeFile), UiDriver.TreeJson());
+            UiDriver.Note("dump tree -> " + treeFile);
+            return;
+        }
+        if (what == "child") {
+            UiDriver.DumpChild(t[2]);
+            return;
+        }
+        if (what == "theme") {
+            string file = t[2];
+            File.WriteAllText(UiDriver.OutPath(file), UiDriver.ThemeJson());
+            UiDriver.Note("dump theme -> " + file);
+            return;
+        }
+        if (what == "pixels") {
+            string file = t[2];
+            string path = UiDriver.OutPath(file);
+            int x = 0;
+            int y = app.titlebarH;
+            int w = app.canvas.Width();
+            int h = app.canvas.Height() - y;
+            if (t.Count == 7) {
+                x = UiDriver.ArgI(t, 3, 0);
+                y = UiDriver.ArgI(t, 4, 0);
+                w = UiDriver.ArgI(t, 5, 0);
+                h = UiDriver.ArgI(t, 6, 0);
+            } else if (t.Count != 3) {
+                UiDriver.CommandError("dump pixels: expected file or file x y w h");
+                return;
+            }
+            int bytes = app.canvas.WritePixels(path, x, y, w, h);
+            int expected = 24 + w * h * 4;
+            if (bytes < 0 || bytes != expected) {
+                UiDriver.CommandError("dump pixels FAILED -> " + file
+                + " rc=" + Convert.ToString(bytes)
+                + " expected=" + Convert.ToString(expected));
+                return;
+            }
+            File.WriteAllText(path + ".size",
+            Convert.ToString(w) + "x" + Convert.ToString(h));
+            UiDriver.Note("dump pixels -> " + file + " ("
+            + Convert.ToString(w) + "x" + Convert.ToString(h)
+            + " at " + Convert.ToString(x) + ","
+            + Convert.ToString(y) + ")");
+            return;
+        }
+        if (what == "probe") {
+            if (t.Count < 4) { UiDriver.CommandError("dump probe: missing file"); return; }
+            string name = t[2];
+            string file = t[3];
+            File.WriteAllText(UiDriver.OutPath(file), UiDriver.GetProbe(name));
+            UiDriver.Note("dump probe " + name + " -> " + file);
+            return;
+        }
+        UiDriver.CommandError("dump: unknown target " + what);
+    }
+
+    // The only open child of the script owner has its own canvas and input root.
+    static void DumpChild(string file) {
+        ChildWindow window = null;
+        List<ChildWindow> windows = ChildWindows.All();
+        for (int i = 0; i < windows.Count; i = i + 1) {
+            ChildWindow candidate = windows[i];
+            if (candidate.parentApp != app || !candidate.IsOpen() || candidate.Host() == null) { continue; }
+            if (window != null) { UiDriver.CommandError("dump child: more than one open child"); return; }
+            window = candidate;
+        }
+        if (window == null) { UiDriver.CommandError("dump child: no open child"); return; }
+        App child = window.Host();
+        int width = child.canvas.Width();
+        int height = child.canvas.Height();
+        string path = UiDriver.OutPath(file);
+        if (child.canvas.WritePixels(path + ".bin", 0, 0, width, height) != 24 + width * height * 4) {
+            UiDriver.CommandError("dump child: could not write pixels");
+            return;
+        }
+        File.WriteAllText(path + ".json", Json.Serialize<ControlTreeDoc>(UiDriver.TreeSnapshotFor(child, window.View())));
+        File.WriteAllText(path + ".hwnd", Convert.ToString((long)child.window.GetHandle()));
+        UiDriver.Note("dump child -> " + file);
+    }
+
+    // 执行 `assert` 命令：按 contains/equals 比较 probe 值与期望，
+    // 计入 pass/fail 统计并把判定写入结果日志（失败附实际值，
+    // 超 200 字符截断）。
+    static void DoAssert(List<string> t, string trimmed) {
+        if (t.Count < 5 || t[1] != "probe") {
+            UiDriver.CommandError("assert: bad form: " + trimmed);
+            return;
+        }
+        string name = t[2];
+        string op = t[3];
+        string expect = UiDriver.Unquote(UiDriver.RemainderAfter(trimmed, 4));
+        string val = UiDriver.GetProbe(name);
+        bool ok = false;
+        if (op == "contains") { ok = UiDriver.Contains(val, expect); }
+        else if (op == "equals") { ok = (TextUtil.TrimOrEmpty(val) == TextUtil.TrimOrEmpty(expect)); }
+        else { UiDriver.CommandError("assert: unknown op " + op); return; }
+        if (ok) {
+            passCount = passCount + 1;
+            UiDriver.Note("ASSERT PASS  probe " + name + " " + op + " \"" + expect + "\"");
+        } else {
+            failCount = failCount + 1;
+            string shown = val;
+            if (shown.Length > 200) { shown = shown.Substring(0, 200) + "..."; }
+            UiDriver.Note("ASSERT FAIL  probe " + name + " " + op + " \"" + expect
+            + "\"  | actual=" + shown);
+        }
+    }
+
+    // 结束会话：保留断言统计并汇总独立命令错误（幂等）。
+    static void Finish() {
+        if (finished) { return; }
+        finished = true;
+        UiDriver.Note("DONE pass=" + Convert.ToString(passCount)
+        + " fail=" + Convert.ToString(failCount)
+        + " command_errors=" + Convert.ToString(commandErrors));
+    }
+
+    // ---------------- 内省序列化器 ----------------
+
+    // 全部命中区域序列化为 JSON：z 为注册序号（后注册者命中
+    // 优先），type 为 HitTester 的 widgetType。
+    static string HitRegionsJson() {
+        int n = app.hitTester.RegionCount();
+        HitRegionsDoc o = new HitRegionsDoc();
+        o.count = n;
+        o.regions = new List<HitRegionDoc>();
+        for (int i = 0; i < n; i = i + 1) {
+            HitRegion r = app.hitTester.RegionAt(i);
+            HitRegionDoc doc = new HitRegionDoc();
+            doc.z = i;
+            doc.id = r.id;
+            doc.x = r.x;
+            doc.y = r.y;
+            doc.w = r.width;
+            doc.h = r.height;
+            doc.type = r.widgetType;
+            doc.label = r.label;
+            o.regions.Add(doc);
+        }
+        return Json.Serialize<HitRegionsDoc>(o);
+    }
+
+    // Observe the active layout host separately from its composed input root.
+    static string TreeJson() {
+        return Json.Serialize<ControlTreeDoc>(UiDriver.TreeSnapshot());
+    }
+
+    // The deepest hit may be a caption; the nearest declared endpoint owns its route.
+    // Stop at independent child endpoints even when they are not eligible for focus.
+    static Control PointerEndpoint(App host, Control hit, Control inputRoot) {
+        if (hit == null || !hit.InputFocusEligible(host, inputRoot)) { return null; }
+        Control node = hit;
+        while (node != null && inputRoot.ContainsInputControl(node)) {
+            if ((node.InputFocusCapabilities() & 1) != 0 || node.HasInputClick()) { return node; }
+            node = node.parent;
+        }
+        return null;
+    }
+
+    // Observe focus and subscribed click endpoints through the routed popup/adapter root.
+    // pointerHit describes endpoint ownership at its center, not its entire rectangle.
+    static ControlTreeDoc TreeSnapshot() {
+        return UiDriver.TreeSnapshotFor(app, app != null ? app.AutomationRoot() : null);
+    }
+
+    static ControlTreeDoc TreeSnapshotFor(App host, Control currentRoot) {
+        ControlTreeDoc o = new ControlTreeDoc();
+        if (currentRoot != null) { o.root = UiDriver.NodeOf(currentRoot); }
+        o.inputTargets = new List<ControlNode>();
+        if (host == null) { return o; }
+        Control popup = host.overlayHost != null ? host.overlayHost.ActiveRoot() : null;
+        Control inputRoot = popup != null ? popup : host.rootControl;
+        if (inputRoot == null) { return o; }
+        Control capture = host.GetCapturedPointer();
+        if (capture != null && !inputRoot.ContainsInputControl(capture)) { capture = null; }
+        List<Control> focusEndpoints = new List<Control>();
+        inputRoot.CollectInputFocus(host, focusEndpoints);
+        List<Control> endpoints = new List<Control>();
+        for (int i = 0; i < focusEndpoints.Count; i = i + 1) {
+            Control endpoint = focusEndpoints[i];
+            if (!endpoints.Contains(endpoint)) { endpoints.Add(endpoint); }
+        }
+        inputRoot.CollectInputClicks(host, inputRoot, endpoints);
+        for (int i = 0; i < endpoints.Count; i = i + 1) {
+            Control endpoint = endpoints[i];
+            ControlNode node = UiDriver.NodeOf(endpoint);
+            node.id = endpoint.WidgetId();
+            node.focused = host.focus.focusedControl == endpoint ? 1 : 0;
+            Control hit = inputRoot.HitTest(endpoint.bx + endpoint.bw / 2,
+            endpoint.by + endpoint.bh / 2, 0);
+            node.pointerHit = endpoint.bw > 0 && endpoint.bh > 0
+            && endpoint.InputFocusEligible(host, inputRoot) && UiDriver.PointerEndpoint(host, hit, inputRoot) == endpoint
+            && (capture == null || capture == endpoint) ? 1 : 0;
+            o.inputTargets.Add(node);
+        }
+        return o;
+    }
+
+    // 把控件子树递归转成 dump 节点：kind/名称/停靠/可见性/
+    // 解析矩形/测量偏好/子节点。
+    static ControlNode NodeOf(Control c) {
+        ControlNode n = new ControlNode();
+        n.kind = c.Kind();
+        n.name = c.name;
+        n.visible = 0;
+        if (c.visible) { n.visible = 1; }
+        n.x = c.bx;
+        n.y = c.by;
+        n.w = c.bw;
+        n.h = c.bh;
+        n.prefW = c.prefW;
+        n.prefH = c.prefH;
+        n.kids = new List<ControlNode>();
+        for (int i = 0; i < c.ChildCount(); i = i + 1) {
+            n.kids.Add(UiDriver.NodeOf(c.ChildAt(i)));
+        }
+        return n;
+    }
+
+    // 当前皮肤解析后的样式 token，外加 DPI 缩放，调用方可
+    // 将 token 转换为命中区域所用的设备像素。
+    static string ThemeJson() {
+        Theme t = app.theme;
+        ThemeDoc o = new ThemeDoc();
+        o.scale = app.Scale(1000);
+
+        o.textPrimary = t.textPrimary;
+        o.textSecondary = t.textSecondary;
+        o.textTertiary = t.textTertiary;
+        o.textDisabled = t.textDisabled;
+        o.bgPrimary = t.bgPrimary;
+        o.bgSecondary = t.bgSecondary;
+        o.bgTertiary = t.bgTertiary;
+        o.borderPrimary = t.borderPrimary;
+        o.borderSecondary = t.borderSecondary;
+        o.divider = t.divider;
+        o.primary = t.primary;
+        o.shadowColor = t.shadowColor;
+
+        o.borderRadiusSmall = t.borderRadiusSmall;
+        o.borderRadiusMedium = t.borderRadiusMedium;
+        o.borderRadiusLarge = t.borderRadiusLarge;
+        o.borderWidth = t.borderWidth;
+
+        o.fontSizeTiny = t.fontSizeTiny;
+        o.fontSizeSmall = t.fontSizeSmall;
+        o.fontSizeMedium = t.fontSizeMedium;
+        o.fontSizeLarge = t.fontSizeLarge;
+        o.fontSizeHuge = t.fontSizeHuge;
+
+        o.heightTiny = t.heightTiny;
+        o.heightSmall = t.heightSmall;
+        o.heightMedium = t.heightMedium;
+        o.heightLarge = t.heightLarge;
+
+        o.paddingTiny = t.paddingTiny;
+        o.paddingSmall = t.paddingSmall;
+        o.paddingMedium = t.paddingMedium;
+        o.paddingLarge = t.paddingLarge;
+
+        o.gapSmall = t.gapSmall;
+        o.gapMedium = t.gapMedium;
+        o.gapLarge = t.gapLarge;
+
+        o.glass = t.glass;
+        o.gradient = t.gradient;
+        o.neu = t.neu;
+        o.brutal = t.brutal;
+        return Json.Serialize<ThemeDoc>(o);
+    }
+
+    // 布尔值的 JSON 字面量（"true"/"false"）。公开，
+    // 构建 probe JSON 的宿主（如 IDE 的编辑器快照）可复用。
+    static string JsonBool(bool b) {
+        if (b) { return "true"; }
+        return "false";
+    }
+
+    // ---------------- 小型字符串辅助 ----------------
+
+    // 向结果日志追加一行。
+    static void Note(string msg) {
+        File.AppendAllText(resultsPath, msg + "\n");
+    }
+
+    // dump 目标路径：绝对路径（以 / 开头或含盘符）原样返回，
+    // 否则拼到输出目录下。
+    static string OutPath(string file) {
+        if (TextUtil.StartsWithOr(file, "/", false) || UiDriver.Contains(file, ":")) { return file; }
+        return outDir + "/" + file;
+    }
+
+    // 取第 `idx` 个 token 的整数值；越界或缺失返回 `def`。
+    static int ArgI(List<string> t, int idx, int def) {
+        if (idx < 0 || idx >= t.Count) { return def; }
+        return Convert.ToInt32(t[idx]);
+    }
+
+    // 按空白（空格/制表符）把一行切成 token 列表。
+    static List<string> Tok(string s) {
+        List<string> outp = new List<string>();
+        if (s == null) { return outp; }
+        int len = s.Length;
+        int start = -1;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) {
+                if (start >= 0) {
+                    outp.Add(s.Substring(start, i - start));
+                    start = -1;
+                }
+            } else {
+                if (start < 0) { start = i; }
+            }
+        }
+        if (start >= 0) { outp.Add(s.Substring(start, len - start)); }
+        return outp;
+    }
+
+    // 前 `count` 个空白分隔 token 之后的所有内容，去除首尾空白。
+    static string RemainderAfter(string s, int count) {
+        if (s == null) { return ""; }
+        int i = 0;
+        int len = s.Length;
+        for (int seen = 0; seen < count && i < len; seen = seen + 1) {
+            while (i < len) {
+                int c = s[i] & 255;
+                if (c == 32 || c == 9) { i = i + 1; } else { break; }
+            }
+            while (i < len) {
+                int c = s[i] & 255;
+                if (c != 32 && c != 9) { i = i + 1; } else { break; }
+            }
+        }
+        while (i < len) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) { i = i + 1; } else { break; }
+        }
+        return s.Substring(i, len - i).Trim();
+    }
+
+    // 去除首尾成对的双引号（不配对则原样返回）。
+    static string Unquote(string s) {
+        if (s == null) { return ""; }
+        string r = s.Trim();
+        if (r.Length >= 2 && (r[0] & 255) == 34 && (r[r.Length - 1] & 255) == 34) {
+            return r.Substring(1, r.Length - 2);
+        }
+        return r;
+    }
+
+    // `s` 是否包含子串 `sub`（空子串恒为真）。
+    static bool Contains(string s, string sub) {
+        if (s == null || sub == null) { return false; }
+        if (sub.Length == 0) { return true; }
+        return s.IndexOf(sub, 0) >= 0;
+    }
+
+    // 对字符串做 JSON 转义（引号、反斜杠、控制字符）。公开，
+    // 构建 probe JSON 的宿主（如 IDE 的编辑器快照）可复用。
+    static string JsonEsc(string s) {
+        if (s == null) { return ""; }
+        int len = s.Length;
+        int last = 0;
+        StringBuilder sb = null;
+        for (int i = 0; i < len; i = i + 1) {
+            int b = s[i] & 255;
+            string esc = null;
+            if (b == 34) { esc = "\\\""; }
+            else if (b == 92) { esc = "\\\\"; }
+            else if (b == 10) { esc = "\\n"; }
+            else if (b == 13) { esc = "\\r"; }
+            else if (b == 9) { esc = "\\t"; }
+            else if (b < 32) { esc = " "; }
+            if (esc != null) {
+                if (sb == null) { sb = new StringBuilder(); }
+                if (i > last) { sb.Append(s.Substring(last, i - last)); }
+                sb.Append(esc);
+                last = i + 1;
+            }
+        }
+        if (sb == null) { return s; }
+        if (last < len) { sb.Append(s.Substring(last, len - last)); }
+        return sb.ToString();
+    }
+}
+

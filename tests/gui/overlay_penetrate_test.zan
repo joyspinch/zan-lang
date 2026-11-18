@@ -18,8 +18,8 @@ using Gui.Widget;
 // 2. OverlayPopup 端到端：SelectBox 打开后在弹层外按一下，弹层
 // 关闭且其下按钮不被该手势触发；开启帧悬停在弹层正下方的
 // 按钮坐标上，PointerCaptured 使悬停不穿透。
-// 3. ContextMenu 全窗遮挡：菜单矩形外的释放只返回 -2（关闭），
-// 其下按钮不被触发。
+// 3. retained ContextMenu/OverlayHost：菜单外手势只关闭弹层，
+// 其下按钮不被触发；选择、重开与显式关闭的通知各自恰好一次。
 class OverlayPenetrateTest {
     static int fails;
     static App app;
@@ -38,38 +38,60 @@ class OverlayPenetrateTest {
         if (got == want) { return; }
         fails = fails + 1;
         Console.WriteLine("FAIL " + what + ": got "
-            + Convert.ToString(got) + " want " + Convert.ToString(want));
+        + Convert.ToString(got) + " want " + Convert.ToString(want));
     }
 
     // 帧体只负责画内容：BeginFrame/PresentFrame 由 FrameGuarded 完成。
     static void Body() {
         // 场景 1/2 的内容：一只按钮 + 手动铺的全窗遮罩（maskOn），
         // 模拟任意“按外部关闭”的浮层在关闭前最后一帧的样子。
-        int id = underBtn.Render(app, 40, 40, 120);
-        if (Ui.Clicked(app, id)) { underClicks = underClicks + 1; }
-        if (maskOn) {
-            app.BlockHitsBelow();
-            app.RequestRedraw();
-        }
+        underBtn.Render(app, 40, 40, 120);
         // 场景 2 的内容：SelectBox 触发器画在按钮下方。
-        pick.Render(app, 40, 90, 160);
+        pick.RenderTree(app);
         // 场景 3 的内容：按钮正上方的坐标 (100,60) 供 ContextMenu
         // 菜单外释放命中。
-        int mid = menuBtn.Render(app, 200, 40, 120);
-        if (Ui.Clicked(app, mid)) { underClicks = underClicks + 1000; }
-        // 场景 3：ctxMode 时在内容帧末尾画 ContextMenu（遮罩在
-        // Render 内部注册，晚于一切内容命中区，与真实宿主一致）。
-        if (ctxMode) {
-            got = ContextMenu.Render(app, staticX, staticY, staticBody);
-        }
+        menuBtn.Render(app, 200, 40, 120);
+        // 菜单只在打开时配置；FrameGuarded 的 overlay 尾部负责真实绘制。
+        if (ctxMode && menu == null) { OverlayPenetrateTest.OpenMenu(); }
     }
 
-    static bool maskOn;
+    static Control inputRoot;
+    static void UnderClick() { underClicks = underClicks + 1; }
+    static void MenuButtonClick() { underClicks = underClicks + 1000; }
     static bool ctxMode;
-    static int staticX;
-    static int staticY;
-    static List<string> staticBody;
-    static int got;
+    static ContextMenu menu;
+    static int menuDismissals;
+    static int menuActions;
+    static int menuNotices;
+
+    static void MenuAction() {
+        menuActions = menuActions + 1;
+        menu = null;
+        ctxMode = false;
+    }
+
+    static void MenuNotice() { menuNotices = menuNotices + 1; }
+
+    static void MenuDismissed(Control sender) {
+        if (menu != sender) { return; }
+        menuDismissals = menuDismissals + 1;
+        menu = null;
+        ctxMode = false;
+    }
+
+    static void OpenMenu() {
+        ContextMenu created = new ContextMenu();
+        created.AddItem("Alpha", OverlayPenetrateTest.MenuAction);
+        created.AddItem("Beta", OverlayPenetrateTest.MenuAction);
+        created.ActionSelected.Add(OverlayPenetrateTest.MenuNotice);
+        created.Dismissed.AddS(OverlayPenetrateTest.MenuDismissed);
+        menu = created;
+        created.ShowAt(app, 60, 140);
+        if (created.IsOpen() && app.overlayHost.ActiveRoot() == created) {
+            menu = created;
+            ctxMode = true;
+        }
+    }
 
     // 真实循环里每一次渲染都 preceded 一次泵。press 与 release
     // 各自需要一次泵+帧（InjectEvent 每次只入队一条）。
@@ -101,6 +123,16 @@ class OverlayPenetrateTest {
         underBtn = new Button("Under");
         menuBtn = new Button("Menu");
         pick = new SelectBox("Pick", false);
+        pick.UseApp(app);
+        pick.MeasureTree(app);
+        pick.Arrange(40, 90, 160, pick.prefH);
+        underBtn.Click.Add(UnderClick);
+        menuBtn.Click.Add(MenuButtonClick);
+        inputRoot = new Control();
+        inputRoot.Add(underBtn); inputRoot.Add(menuBtn); inputRoot.Add(pick);
+        inputRoot.UseApp(app);
+        inputRoot.Arrange(0, 0, 400, 300);
+        app.SetRootControl(inputRoot);
         underClicks = 0;
         app.mouseX = 200;
         app.mouseY = 200;
@@ -109,20 +141,22 @@ class OverlayPenetrateTest {
         OverlayPenetrateTest.MoveTo(200, 200);
 
         // ---- 1. 纯 App 防线：遮罩上按下，遮罩消失后释放 ----------
-        maskOn = true;
-        app.window.InjectEvent(2, 100, 250, 0, 0, 0);
-        OverlayPenetrateTest.PumpAndFrame();  // 遮罩帧：按下落在全窗 blocker
-        maskOn = false;
-        app.window.InjectEvent(3, 100, 250, 0, 0, 0);
+        Control mask = new Control();
+        mask.UseApp(app); mask.Prefer(80, 60);
+        app.overlayHost.ShowAt(app, mask, 250, 180);
+        app.window.InjectEvent(2, 100, 60, 0, 0, 0);
+        OverlayPenetrateTest.PumpAndFrame();
+        app.overlayHost.Dismiss();
+        app.window.InjectEvent(3, 100, 60, 0, 0, 0);
         OverlayPenetrateTest.PumpAndFrame();  // 释放帧：弹层已“关闭”
         EqInt("release after press-on-blocker fires nothing",
-              underClicks, 0);
+        underClicks, 0);
         // 后续普通点击照常（防线不粘滞）。
         OverlayPenetrateTest.MoveTo(100, 60);
         OverlayPenetrateTest.Press(100, 60);
         OverlayPenetrateTest.Release(100, 60);
         EqInt("normal click after barrier still fires",
-              underClicks, 1);
+        underClicks, 1);
 
         // ---- 2. OverlayPopup 端到端：SelectBox 外部点击关闭 --------
         // 打开：点击触发器（press+release 各一帧）。
@@ -134,33 +168,84 @@ class OverlayPenetrateTest {
         // 遮罩把悬停收走。
         OverlayPenetrateTest.MoveTo(100, 60);
         True("hover under open popup does not reach button",
-             !app.focus.IsHovered(underBtn.wid));
+        !app.focus.IsHovered(underBtn.wid));
         // 弹层外按一下（触发器与弹层矩形之外）：SelectBox 靠
         // 释放收尾关闭（ClickAvailable），因此弹层在释放帧关闭；
         // 这次"点外部"手势不得触发其下按钮。
         OverlayPenetrateTest.Press(300, 250);
         OverlayPenetrateTest.Release(300, 250);
         True("selectbox closed by outside release", !pick.IsOpen());
+        app.FrameGuarded(OverlayPenetrateTest.Body);
+        app.FrameGuarded(OverlayPenetrateTest.Body);
         EqInt("dismiss click does not fire control under popup",
-              underClicks, 1);
+        underClicks, 1);
 
-        // ---- 3. ContextMenu 全窗遮挡：菜单外释放只关闭 -------------
-        List<string> items = new List<string>();
-        items.Add("Alpha");
-        items.Add("Beta");
-        staticBody = items;
-        staticX = 60;
-        staticY = 140;
+        // ---- 3. retained ContextMenu：真实 overlay 输入与通知 --------
         ctxMode = true;
-        // 菜单画在 (60,140)：释放落在 (300,250)——菜单与三个控件
-        // 之外，-2 关闭，menuBtn（在 (200,40)）不得被触发。
+        OverlayPenetrateTest.MoveTo(300, 250);
+        True("retained context menu opened", menu != null && menu.IsOpen());
+        OverlayPenetrateTest.Press(300, 250);
         OverlayPenetrateTest.Release(300, 250);
-        EqInt("context menu outside release returns -2", got, 0 - 2);
+        True("context menu closed by outside press", menu == null);
+        EqInt("outside dismissal notified once", menuDismissals, 1);
         EqInt("context menu dismiss does not fire control under",
-              underClicks, 1);
-        ctxMode = false;
+        underClicks, 1);
+        OverlayPenetrateTest.MoveTo(100, 60);
+        OverlayPenetrateTest.Press(100, 60);
+        OverlayPenetrateTest.Release(100, 60);
+        EqInt("new click after dismiss still fires once", underClicks, 2);
+
+        // OverlayHost consumes an Escape key press, not a character or release.
+        ctxMode = true;
+        OverlayPenetrateTest.MoveTo(300, 250);
+        app.window.InjectEvent(6, 0, 0, 0, 27, 0);
+        OverlayPenetrateTest.PumpAndFrame();
+        True("context menu ignores Escape character", menu != null && menuDismissals == 1);
+        app.window.InjectEvent(5, 0, 0, 0, 27, 0);
+        OverlayPenetrateTest.PumpAndFrame();
+        True("context menu ignores Escape key release", menu != null && menuDismissals == 1);
+        app.window.InjectEvent(4, 0, 0, 0, 65, 0);
+        OverlayPenetrateTest.PumpAndFrame();
+        True("context menu ignores other keys", menu != null && menuDismissals == 1);
+        app.window.InjectEvent(4, 0, 0, 0, 27, 0);
+        OverlayPenetrateTest.PumpAndFrame();
+        True("context menu Escape closes once", menu == null && menuDismissals == 2);
+        True("context menu claims Escape key", app.KeyConsumed());
+        app.FrameGuarded(OverlayPenetrateTest.Body);
+        True("context menu does not reuse consumed Escape", menu == null && menuDismissals == 2);
+
+        // A real routed item click publishes Action/ActionSelected, not Dismissed.
+        ctxMode = true;
+        OverlayPenetrateTest.MoveTo(300, 250);
+        Control item = menu.ChildAt(0);
+        int itemX = item.bx + item.bw / 2;
+        int itemY = item.by + item.bh / 2;
+        OverlayPenetrateTest.MoveTo(itemX, itemY);
+        OverlayPenetrateTest.Press(itemX, itemY);
+        OverlayPenetrateTest.Release(itemX, itemY);
+        EqInt("menu item Action runs once", menuActions, 1);
+        EqInt("menu ActionSelected runs once", menuNotices, 1);
+        EqInt("selection is not an outside dismissal", menuDismissals, 2);
+        EqInt("selection does not penetrate", underClicks, 2);
+
+        // Reopening the same instance dismisses its old session exactly once.
+        ctxMode = true;
+        OverlayPenetrateTest.MoveTo(300, 250);
+        ContextMenu reopened = menu;
+        reopened.ShowAt(app, 70, 150);
+        EqInt("reopen dismisses old session once", menuDismissals, 3);
+        True("reopened menu owns a live session", reopened.IsOpen());
+        menu = reopened;
+        ctxMode = true;
+        app.overlayHost.Hide(reopened);
+        app.overlayHost.Hide(reopened);
+        EqInt("explicit close notifies at most once", menuDismissals, 4);
+        True("explicit close leaves no retained menu", menu == null && !reopened.IsOpen());
+        reopened.ClearCallbacks();
+        True("ClearCallbacks clears both menu notifications",
+        reopened.ActionSelected.CountAll() == 0 && reopened.Dismissed.CountAll() == 0);
 
         Console.WriteLine(fails == 0 ? "OVERLAY PENETRATE PASS"
-            : "OVERLAY PENETRATE FAIL " + Convert.ToString(fails));
+        : "OVERLAY PENETRATE FAIL " + Convert.ToString(fails));
     }
 }

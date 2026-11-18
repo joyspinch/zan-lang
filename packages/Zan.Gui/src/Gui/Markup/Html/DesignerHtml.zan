@@ -13,13 +13,13 @@ namespace Gui.Markup;
 // name 另发 id 便于阅读；body 带 data-zan-design 标记（IsDesignDoc
 // 据此区分设计稿与普通 HTML UI 文档）。docCss 单独发 <style>，
 // bodyClass/bodyStyle 发原生壳属性，不占文档 class/style 的键。
-// - 字段对象 → 元素：kind 决定 tag，能原生就原生（Panel→div、
-// DatePicker→input+type=…），自定义组件/共享控件发 zan-<kebab>
+// - 字段对象 → 元素：kind 决定 tag，能原生就原生（DatePicker→
+// input+type=…），Panel 与其他共享控件发 zan-<kebab>
 // 标签（读端 TagKind 与运行期 TagToKind 共享映射还原）——kind
 // 由标签承载，data-kind 属性旁路已废除（B-ID159 刀2）；
 // name → id；class → class；style → style；kids → 子元素。Element
-// 用 tag；未显式标组件的原生容器用 htmlTag 保留标签，旧带定位键的
-// 裸 div 仍是 Panel。纯文本沿用 text；htmlContent/bodyContent 是
+// 用 tag；原生容器用 htmlTag 保留标签，布局只由 style 声明决定。
+// 纯文本沿用 text；htmlContent/bodyContent 是
 // string 文本片或 int 子树下标（kids/fields），保留混排文档次序。
 // - 原生属性/内容直进原生通道：<img src/alt>、<input/textarea
 // placeholder/value>、表单族 min/max/step、<progress value/max>、
@@ -123,11 +123,10 @@ public class DesignerHtml {
             b.Append(">");
             AppendContent(b, content, fields, 1);
         } else {
-            bool tight = HasInlineKids(fields);
-            b.Append(tight ? ">" : ">\n");
+            b.Append(">");
             if (fields != null && fields.IsArray()) {
                 for (int i = 0; i < fields.Count(); i = i + 1) {
-                    FieldHtml(b, fields.At(i), 1, tight);
+                    FieldHtml(b, fields.At(i), 1, true);
                 }
             }
         }
@@ -249,42 +248,9 @@ public class DesignerHtml {
 
     // ---- 元素 ↔ 字段 -----------------------------------------------------
 
-    public static bool IsPlacementKey(string key) {
-        return key == "fx" || key == "fy" || key == "fw" || key == "fh"
-            || key == "dock" || key == "span" || key == "position"
-            || key == "flexGrow"
-            || key == "margin" || key == "padding" || key == "gap"
-            || key == "flexDir" || key == "justify" || key == "alignItems" || key == "flexWrap";
-    }
-
     public static bool HasNodeAttr(WNode n, string name) {
         for (int i = 0; i < n.attrs.Count; i = i + 1) {
             if (n.attrs[i].name == name) { return true; }
-        }
-        return false;
-    }
-
-    public static bool HasPlacementAttrs(WNode n) {
-        for (int i = 0; i < n.attrs.Count; i = i + 1) {
-            string a = n.attrs[i].name;
-            if (HtmlText.StartsWith(a, "data-")
-                && IsPlacementKey(Unkebab(a.Substring(5)))) { return true; }
-        }
-        return false;
-    }
-
-    public static bool HasPlacementKeys(JsonValue o) {
-        for (int i = 0; i < o.Count(); i = i + 1) {
-            string key = o.KeyAt(i);
-            if (!IsPlacementKey(key)) { continue; }
-            JsonValue v = o.ValAt(i);
-            if (v == null) { continue; }
-            if (v.IsNumber()) {
-                if (v.ToJson() != "0" || key == "fx" || key == "fy"
-                    || key == "fw" || key == "fh") { return true; }
-            } else if (v.IsString()) {
-                if (v.AsString("") != "") { return true; }
-            } else if (v.IsBool() && v.AsBool(false)) { return true; }
         }
         return false;
     }
@@ -348,14 +314,6 @@ public class DesignerHtml {
         b.Append(pad + "<" + tag);
         string nm = o.Str("name", "");
         if (nm != "") { b.Append(" id=\"" + EscapeAttr(nm) + "\""); }
-        // zan-<kebab> 自定义族与带定位键的 div-Panel 都能从标签恢复
-        // kind；data-kind 属性旁路已废除（B-ID159 刀2）——kind 一律
-        // 由标签承载（KindTag/TagKind 共享映射保证往返）。
-        if (nativeTag == "div" && HasPlacementKeys(o)) {
-            // 原生 div 加了设计几何后仍是 Element；只记来源，正文/样式
-            // 仍沿原生通道，不让旧裸 div 的 Panel 判定改变实例类型。
-            b.Append(" data-html-tag=\"div\"");
-        }
         // input 变体组件发 type：<input type="checkbox"> 一族读起来
         // 就是原生表单控件。
         string ity = DesignerHtml.KindInputType(kind);
@@ -599,12 +557,9 @@ public class DesignerHtml {
         o.Put("kind", JsonValue.NewStr(kind));
         string id = HtmlText.NodeAttr(n.attrs, "id");
         if (id != "") { o.Put("name", JsonValue.NewStr(id)); }
-        // 让导入的原生容器保有真实标签；旧设计器把带定位键的裸 div
-        // 当 Panel，不能改它的实例类型。
+        // 原生容器始终保留标签身份，布局只由 CSS 声明决定。
         if (kind == "Element") { o.Put("tag", JsonValue.NewStr(n.tag)); }
-        else if (TagKind(n.tag) == "Panel" && !HtmlText.StartsWith(n.tag, "zan-")
-            && (n.tag != "div" || !HasPlacementAttrs(n)
-                || HtmlText.NodeAttr(n.attrs, "data-html-tag") == "div")) {
+        else if (TagKind(n.tag) == "Panel" && !HtmlText.StartsWith(n.tag, "zan-")) {
             o.Put("htmlTag", JsonValue.NewStr(n.tag));
         }
         string pgV = "";
@@ -625,13 +580,15 @@ public class DesignerHtml {
                 if (v != "") { o.Put("style", JsonValue.NewStr(v)); }
                 continue;
             }
-            // 经典与现代数据绑定指令
-            if (a == "data-bind") {
-                if (v != "") { o.Put("bind", JsonValue.NewStr(v)); }
+            // Value bindings share the runtime declaration schema.
+            if (a == "bind" || HtmlText.StartsWith(a, "bind:")) {
+                string property = a == "bind" ? "" : a.Substring(5);
+                if (property == "" && a != "bind") { throw new ArgumentException("bind: requires a component property"); }
+                DesignerHtml.AddBinding(o, v, property, true);
                 continue;
             }
-            if (a == "z-model" || a == "v-model") {
-                if (v != "") { o.Put("zModel", JsonValue.NewStr(v)); }
+            if (a.Length > 1 && a[0] == 58) {
+                DesignerHtml.AddBinding(o, v, a.Substring(1), false);
                 continue;
             }
             if (a == "z-show" || a == "v-show") {
@@ -640,10 +597,6 @@ public class DesignerHtml {
             }
             if (a == "z-hide" || a == "v-hide") {
                 if (v != "") { o.Put("zHide", JsonValue.NewStr(v)); }
-                continue;
-            }
-            if (a == "z-text" || a == "v-text") {
-                if (v != "") { o.Put("zText", JsonValue.NewStr(v)); }
                 continue;
             }
             // 现代声明式事件绑定语法：
@@ -668,7 +621,7 @@ public class DesignerHtml {
                 continue;
             }
             if (a.Length > 2 && HtmlText.StartsWith(a, "z-")) {
-                if (a == "z-model" || a == "z-show" || a == "z-hide" || a == "z-text") { continue; }
+                if (a == "z-show" || a == "z-hide") { continue; }
                 string ev = NormalizeEventName(a.Substring(2));
                 if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
                 continue;
@@ -806,68 +759,7 @@ public class DesignerHtml {
     }
 
     public static string NormalizeEventName(string raw) {
-        string s = raw.ToLower();
-        if (s == "click") { return "Click"; }
-        if (s == "dblclick" || s == "doubleclick") { return "DoubleClick"; }
-        if (s == "rightclick" || s == "right-click" || s == "contextmenu") { return "RightClick"; }
-        if (s == "rightdblclick" || s == "right-dblclick" || s == "rightdoubleclick") { return "RightDoubleClick"; }
-        if (s == "change") { return "Change"; }
-        if (s == "show") { return "Show"; }
-        if (s == "hide") { return "Hide"; }
-        if (s == "resize" || s == "sizechange" || s == "size-change") { return "Resize"; }
-        if (s == "itemclick" || s == "item-click") { return "ItemClick"; }
-        if (s == "itemdblclick" || s == "item-dblclick") { return "ItemDoubleClick"; }
-        if (s == "itemrightclick" || s == "item-right-click") { return "Context"; }
-
-        // 表格 / 数据网格专属事件
-        if (s == "rowclick" || s == "row-click") { return "RowClick"; }
-        if (s == "rowdblclick" || s == "row-dblclick" || s == "rowdoubleclick" || s == "row-doubleclick") { return "RowDoubleClick"; }
-        if (s == "rowcontext" || s == "row-context" || s == "rowrightclick" || s == "row-right-click") { return "RowContext"; }
-        if (s == "cellclick" || s == "cell-click") { return "CellClick"; }
-        if (s == "celldblclick" || s == "cell-dblclick" || s == "celldoubleclick" || s == "cell-doubleclick") { return "CellDoubleClick"; }
-        if (s == "celledit" || s == "cell-edit") { return "CellEdit"; }
-        if (s == "cellvalidating" || s == "cell-validating") { return "CellValidating"; }
-        if (s == "sort") { return "Sort"; }
-        if (s == "headerclick" || s == "header-click" || s == "colclick" || s == "col-click" || s == "columnclick" || s == "column-click") { return "HeaderClick"; }
-        if (s == "coldblclick" || s == "col-dblclick" || s == "columndblclick" || s == "column-dblclick") { return "ColumnDoubleClick"; }
-        if (s == "filterchange" || s == "filterchanged" || s == "filter-change" || s == "filter-changed") { return "FilterChanged"; }
-        if (s == "columnresize" || s == "column-resize" || s == "colresize" || s == "col-resize") { return "ColumnResize"; }
-        if (s == "columnresizeend" || s == "column-resize-end" || s == "colresizeend" || s == "col-resize-end") { return "ColumnResizeEnd"; }
-        if (s == "columnreorder" || s == "column-reorder" || s == "colreorder" || s == "col-reorder") { return "ColumnReorder"; }
-        if (s == "selectionchange" || s == "selectionchanged" || s == "selection-change" || s == "selection-changed") { return "SelectionChanged"; }
-        if (s == "groupchange" || s == "groupchanged" || s == "group-change" || s == "group-changed") { return "GroupChanged"; }
-        if (s == "bandtoggle" || s == "bandtoggled" || s == "band-toggle" || s == "band-toggled") { return "BandToggled"; }
-        if (s == "rowinserted" || s == "row-inserted") { return "RowInserted"; }
-        if (s == "rowdeleted" || s == "row-deleted") { return "RowDeleted"; }
-        if (s == "scrollchanged" || s == "scroll-changed" || s == "scroll") { return "ScrollChanged"; }
-
-        // 树 / 标签 / 分页专属事件
-        if (s == "nodeclick" || s == "node-click") { return "NodeClick"; }
-        if (s == "nodedblclick" || s == "node-dblclick") { return "NodeDoubleClick"; }
-        if (s == "nodecontext" || s == "node-context" || s == "noderightclick" || s == "node-right-click") { return "NodeContext"; }
-        if (s == "expand" || s == "nodeexpand" || s == "node-expand") { return "Expand"; }
-        if (s == "collapse" || s == "nodecollapse" || s == "node-collapse") { return "Collapse"; }
-        if (s == "check" || s == "nodecheck" || s == "node-check") { return "Check"; }
-        if (s == "tabchange" || s == "tab-change" || s == "tabchanged" || s == "tab-changed") { return "TabChanged"; }
-        if (s == "tabclose" || s == "tab-close" || s == "tabclosed" || s == "tab-closed") { return "TabClosed"; }
-        if (s == "tabadd" || s == "tab-add" || s == "tabadded" || s == "tab-added") { return "TabAdded"; }
-        if (s == "pagechange" || s == "page-change" || s == "pagechanged" || s == "page-changed") { return "PageChanged"; }
-        if (s == "pagesizechange" || s == "page-size-change" || s == "pagesizechanged" || s == "page-size-changed") { return "PageSizeChanged"; }
-
-        if (s == "focus") { return "Focus"; }
-        if (s == "blur") { return "Blur"; }
-        if (s == "keydown") { return "KeyDown"; }
-        if (s == "keyup") { return "KeyUp"; }
-        if (s == "keypress") { return "KeyPress"; }
-        if (s == "mousedown") { return "MouseDown"; }
-        if (s == "mouseup") { return "MouseUp"; }
-        if (s == "mouseenter" || s == "mouseover") { return "Enter"; }
-        if (s == "mouseleave" || s == "mouseout") { return "Leave"; }
-        if (s == "wheel") { return "Wheel"; }
-        if (raw.Length > 0 && raw[0] >= 97 && raw[0] <= 122) {
-            return (char)(raw[0] - 32) + raw.Substring(1);
-        }
-        return raw;
+        return HtmlText.EventName(raw);
     }
 
     // 一个 data- 后缀属性折进对象：on-<kebab> → "on"+Pascal 事件键；
@@ -902,27 +794,54 @@ public class DesignerHtml {
         o.Put(key2, JsonValue.NewStr(v));
     }
 
-    // 键值 → 属性写出发射（标量 false/""/0 跳过；复合值走 x- JSON）。
-    // 零值/空串有义的键豁免跳过：几何四键 fx/fy/fw/fh（矩形边界，
-    // FieldJson 无条件写出，丢了会在解码端回落到 32 的缺省高）、
-    // winZoom（0 = 适应视口，模型缺省 1000）、layoutMode（0 = 吸附/
+    // 键值 → 属性写出发射（显式布尔保留；空串/0 按键缺省省略；复合值走 x- JSON）。
+    // 零值/空串有义的键豁免跳过：winZoom（0 = 适应视口，模型缺省
+    // 1000）、layoutMode（0 = 吸附/
     // 流式布局，丢了读端回落 1 变自由布局）、pad/gap（0 = 显式无
     // 内边距/间距，压过样式表缺省）、label/placeholder（"" = 显式
     // 清空，缺了会回落 kind 缺省文案）。其余键 0/"" == 读端缺省，
     // 跳过保持文档干净；
     // 新键是否入名单由模型级往返等价校验兜底。
+    static void AddBinding(JsonValue o, string path, string property, bool twoWay) {
+        if (!ModelBindingDeclaration.ValidPath(path)) {
+            throw new ArgumentException("Binding path must be a dotted identifier path");
+        }
+        if (property == "" && !twoWay) { throw new ArgumentException("One-way binding requires a component property"); }
+        JsonValue bindings = o.Get("bindings");
+        if (bindings == null || !bindings.IsArray()) {
+            bindings = JsonValue.NewArray();
+            o.Set("bindings", bindings);
+        }
+        JsonValue item = JsonValue.NewObject();
+        item.PutStr("path", path);
+        item.PutStr("property", property);
+        item.PutBool("twoWay", twoWay);
+        bindings.Append(item);
+    }
+
     public static void AppendKey(StringBuilder b, JsonValue v, string key,
                                  int mode) {
-        if (v.IsBool()) {
-            if (v.AsBool(false)) {
-                b.Append(" data-" + KebabKey(key) + "=\"true\"");
+        if (key == "bindings") {
+            if (!v.IsArray()) { return; }
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                JsonValue item = v.At(i);
+                if (item == null || !item.IsObject()) { continue; }
+                string path = item.Str("path", "");
+                string property = item.Str("property", "");
+                bool twoWay = item.Bool("twoWay", true);
+                string attribute = twoWay ? (property == "" ? "bind" : "bind:" + property) : ":" + property;
+                b.Append(" " + attribute + "=\"" + EscapeAttr(path) + "\"");
             }
+            return;
+        }
+        if (v.IsBool()) {
+            b.Append(" data-" + KebabKey(key) + "=\""
+                + (v.AsBool(false) ? "true" : "false") + "\"");
             return;
         }
         if (v.IsNumber()) {
             string t = v.ToJson();
-            if (t != "0" || key == "fx" || key == "fy" || key == "fw"
-                || key == "fh" || key == "winZoom" || key == "layoutMode"
+            if (t != "0" || key == "winZoom" || key == "layoutMode"
                 || key == "pad" || key == "gap") {
                 b.Append(" data-" + KebabKey(key) + "=\"" + t + "\"");
             }
@@ -930,7 +849,7 @@ public class DesignerHtml {
         }
         if (v.IsString()) {
             string s = v.AsString("");
-            if (key == "zModel" || key == "zShow" || key == "zHide" || key == "zText") {
+            if (key == "zShow" || key == "zHide") {
                 if (s != "") {
                     b.Append(" " + KebabKey(key) + "=\"" + EscapeAttr(s) + "\"");
                 }
@@ -1074,7 +993,7 @@ public class DesignerHtml {
         if (kind == "InputNumber") { return "input"; }
         if (kind == "DatePicker") { return "input"; }
         if (kind == "Upload") { return "input"; }
-        if (kind == "Panel") { return "div"; }
+        if (kind == "Panel") { return "zan-panel"; }
         return "zan-" + KebabKey(kind);
     }
 

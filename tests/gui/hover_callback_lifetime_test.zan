@@ -1,0 +1,218 @@
+using System;
+using Gui;
+
+// Real offscreen Move dispatch, before any paint or legacy hit registration.
+enum HoverCallbackAction {
+    None,
+    Remove,
+    Hide,
+    Disable,
+    ReplaceRoot,
+    ReplaceRootAndRestore,
+    NestedMove,
+    Stop
+}
+
+class HoverCallbackProbe : Control {
+    public int Enters;
+    public int Leaves;
+    public int Moves;
+    public HoverCallbackAction LeaveAction;
+    public HoverCallbackAction EnterAction;
+    public weak App Host;
+    public weak Control MutationTarget;
+    public weak Control Replacement;
+    public weak HoverCallbackProbe NestedTarget;
+
+    public bool RetainedHovered() { return this.isHovered; }
+    void Mutate(HoverCallbackAction action) {
+        Control target = MutationTarget;
+        App app = Host;
+        if (action == HoverCallbackAction.Remove && target != null && target.parent != null) {
+            target.parent.Children.Remove(target);
+        } else if (action == HoverCallbackAction.Hide && target != null) {
+            target.Visible = false;
+        } else if (action == HoverCallbackAction.Disable && target != null) {
+            target.Disabled = true;
+        } else if (action == HoverCallbackAction.ReplaceRoot || action == HoverCallbackAction.ReplaceRootAndRestore) {
+            Control replacement = Replacement;
+            if (app != null && replacement != null) {
+                Control previous = app.rootControl;
+                app.SetRootControl(replacement);
+                if (action == HoverCallbackAction.ReplaceRootAndRestore) { app.SetRootControl(previous); }
+            }
+        } else if (action == HoverCallbackAction.NestedMove) {
+            HoverCallbackProbe nested = NestedTarget;
+            if (app != null && nested != null) {
+                app.ProcessOffscreenInput(1, nested.bx + 4, nested.by + 4, 0, 0, 0, 0);
+            }
+        } else if (action == HoverCallbackAction.Stop && app != null) {
+            app.StopLoop();
+        }
+    }
+    public override void OnPointerEnter(RoutedEventArgs e) {
+        base.OnPointerEnter(e);
+        if (e.originalSource != this) { return; }
+        Enters = Enters + 1;
+        HoverCallbackAction action = EnterAction;
+        EnterAction = HoverCallbackAction.None;
+        this.Mutate(action);
+    }
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        if (e.originalSource != this) { return; }
+        Leaves = Leaves + 1;
+        HoverCallbackAction action = LeaveAction;
+        LeaveAction = HoverCallbackAction.None;
+        this.Mutate(action);
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (e.originalSource == this) { Moves = Moves + 1; }
+    }
+}
+
+class HoverCallbackFixture {
+    public App App;
+    public Control Root;
+    public Control BParent;
+    public HoverCallbackProbe A;
+    public HoverCallbackProbe B;
+    public HoverCallbackProbe C;
+    public ControlInputHost InputHost;
+
+    public HoverCallbackFixture(bool borrowed) {
+        App = Gui.App.CreateOffscreen("Hover callback lifetime", 320, 120);
+        Root = new Control();
+        BParent = new Control();
+        A = new HoverCallbackProbe(); B = new HoverCallbackProbe(); C = new HoverCallbackProbe();
+        Root.Add(A); Root.Add(BParent); BParent.Add(B); Root.Add(C);
+        Root.UseApp(App);
+        Root.Arrange(0, 0, 320, 120);
+        A.Arrange(0, 0, 60, 60);
+        BParent.Arrange(80, 0, 60, 60); B.Arrange(80, 0, 60, 60);
+        C.Arrange(160, 0, 60, 60);
+        A.Host = App; B.Host = App; C.Host = App;
+        if (borrowed) {
+            InputHost = new ControlInputHost(Root);
+            InputHost.Bind(App);
+        } else { App.SetRootControl(Root); }
+        HoverCallbackLifetimeTest.Check(Root.HitTest(4, 4) == A && Root.HitTest(84, 4) == B
+        && Root.HitTest(164, 4) == C, "fixture uses actual hit testing");
+    }
+    public void Move(HoverCallbackProbe target) {
+        App.ProcessOffscreenInput(1, target.bx + 4, target.by + 4, 0, 0, 0, 0);
+    }
+    public void Close() {
+        if (InputHost != null) { InputHost.Hide(); }
+        App.SetRootControl(null);
+        App.StopLoop();
+        App.canvas.Destroy();
+    }
+}
+
+class HoverCallbackLifetimeTest {
+    public static void Check(bool ok, string label) { if (!ok) { throw new Exception("hover callback: " + label); } }
+    static void LeaveInvalidates(HoverCallbackAction action, bool ancestor) {
+        HoverCallbackFixture f = new HoverCallbackFixture(false);
+        f.Move(f.A);
+        Check(f.A.Enters == 1 && f.A.Moves == 1 && f.A.RetainedHovered(), "initial A hover before paint");
+        f.A.LeaveAction = action;
+        f.A.MutationTarget = ancestor ? f.BParent : f.B;
+        f.Move(f.B);
+        Check(f.A.Leaves == 1 && !f.A.RetainedHovered(), "A leaves exactly once before mutation");
+        Check(f.B.Enters == 0 && f.B.Moves == 0 && !f.B.RetainedHovered(), "Leave invalidated B receives no Enter or Move");
+        f.Move(f.C);
+        Check(f.B.Leaves == 0 && f.C.Enters == 1 && f.C.Moves == 1, "invalid B was never cached as hover");
+        f.Close();
+    }
+    static void LeaveReplacesRoot(bool restore) {
+        HoverCallbackFixture f = new HoverCallbackFixture(false);
+        Control replacement = new Control(); replacement.UseApp(f.App); replacement.Arrange(0, 0, 320, 120);
+        f.Move(f.A);
+        f.A.Replacement = replacement;
+        f.A.LeaveAction = restore ? HoverCallbackAction.ReplaceRootAndRestore : HoverCallbackAction.ReplaceRoot;
+        f.Move(f.B);
+        Check(f.A.Leaves == 1 && f.B.Enters == 0 && f.B.Moves == 0, "root generation fences stale B Enter/Move");
+        Check(f.App.rootControl == (restore ? f.Root : replacement), "callback root installation survives");
+        f.App.SetRootControl(f.Root);
+        f.Move(f.C);
+        Check(f.B.Leaves == 0 && f.C.Enters == 1, "root change left no stale B hover");
+        f.Close();
+    }
+    static void EnterInvalidates(HoverCallbackAction action, bool ancestor) {
+        HoverCallbackFixture f = new HoverCallbackFixture(false);
+        f.Move(f.A);
+        f.B.EnterAction = action;
+        f.B.MutationTarget = ancestor ? f.BParent : f.B;
+        f.Move(f.B);
+        Check(f.A.Leaves == 1 && f.B.Enters == 1 && f.B.Moves == 0, "Enter retirement prevents stale Move");
+        Check(f.B.Leaves == 1 && !f.B.RetainedHovered(), "Enter retirement clears hover once");
+        f.Move(f.C);
+        Check(f.B.Leaves == 1 && f.C.Enters == 1 && f.C.Moves == 1, "retired Enter target is not cached");
+        f.Close();
+    }
+    static void NestedMove(bool fromEnter) {
+        HoverCallbackFixture f = new HoverCallbackFixture(false);
+        f.Move(f.A);
+        HoverCallbackProbe callback = fromEnter ? f.B : f.A;
+        callback.NestedTarget = f.C;
+        if (fromEnter) { callback.EnterAction = HoverCallbackAction.NestedMove; }
+        else { callback.LeaveAction = HoverCallbackAction.NestedMove; }
+        f.Move(f.B);
+        Check(f.A.Leaves == 1 && f.B.Enters == (fromEnter ? 1 : 0) && f.B.Moves == 0,
+        "nested Move retires only old hover and suppresses outer B Move");
+        Check(f.C.Enters == 1 && f.C.Moves == 1 && f.C.RetainedHovered(), "nested Move establishes C");
+        Check(f.B.Leaves == (fromEnter ? 1 : 0) && !f.B.RetainedHovered(), "outer target does not retain hover");
+        f.Move(f.C);
+        Check(f.C.Enters == 1 && f.C.Leaves == 0 && f.C.Moves == 2, "next Move preserves nested cached C hover");
+        f.Move(f.A);
+        Check(f.A.Leaves == 1 && f.C.Leaves == 1 && !f.C.RetainedHovered(), "later crossing leaves C exactly once");
+        f.Close();
+    }
+    static void StoppedCallback(bool fromEnter) {
+        HoverCallbackFixture f = new HoverCallbackFixture(false);
+        f.Move(f.A);
+        if (fromEnter) { f.B.EnterAction = HoverCallbackAction.Stop; }
+        else { f.A.LeaveAction = HoverCallbackAction.Stop; }
+        f.Move(f.B);
+        Check(f.A.Leaves == 1 && f.B.Enters == (fromEnter ? 1 : 0) && f.B.Moves == 0,
+        "stopped App cannot continue hover dispatch");
+        f.Close();
+    }
+    static void BorrowedTree() {
+        HoverCallbackFixture f = new HoverCallbackFixture(true);
+        Check(f.Root.parent == null && f.App.rootControl == f.InputHost, "borrowed tree does not parent to adapter");
+        f.Move(f.A); f.Move(f.B); f.Move(f.B); f.Move(f.C);
+        Check(f.A.Enters == 1 && f.A.Leaves == 1 && f.A.Moves == 1
+        && f.B.Enters == 1 && f.B.Leaves == 1 && f.B.Moves == 2
+        && f.C.Enters == 1 && f.C.Moves == 1, "adapter membership permits ordinary hover");
+        f.Close();
+    }
+    static void Main() {
+        // The first App is the independent static frame context, not a fixture.
+        App frame = App.CreateOffscreen("Independent hover frame", 2, 2);
+        LeaveInvalidates(HoverCallbackAction.Remove, false);
+        LeaveInvalidates(HoverCallbackAction.Hide, false);
+        LeaveInvalidates(HoverCallbackAction.Disable, false);
+        LeaveInvalidates(HoverCallbackAction.Remove, true);
+        LeaveInvalidates(HoverCallbackAction.Hide, true);
+        LeaveInvalidates(HoverCallbackAction.Disable, true);
+        Console.WriteLine("leave target and ancestor eligibility: ok");
+        LeaveReplacesRoot(false); LeaveReplacesRoot(true);
+        Console.WriteLine("leave root generation: ok");
+        EnterInvalidates(HoverCallbackAction.Remove, false);
+        EnterInvalidates(HoverCallbackAction.Hide, false);
+        EnterInvalidates(HoverCallbackAction.Disable, false);
+        EnterInvalidates(HoverCallbackAction.Hide, true);
+        EnterInvalidates(HoverCallbackAction.Disable, true);
+        Console.WriteLine("enter target retirement: ok");
+        NestedMove(false); NestedMove(true);
+        Console.WriteLine("nested mouse hover ownership: ok");
+        StoppedCallback(false); StoppedCallback(true);
+        Console.WriteLine("stopped callback fence: ok");
+        BorrowedTree();
+        Console.WriteLine("borrowed input tree hover: ok");
+        frame.StopLoop();
+        frame.canvas.Destroy();
+    }
+}

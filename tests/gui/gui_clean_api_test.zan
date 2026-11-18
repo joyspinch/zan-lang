@@ -2,13 +2,117 @@ using System;
 using Gui;
 using Gui.Widget;
 
+class CleanOffscreenInputProbe {
+    public int clicks;
+    public bool replaceRoot;
+    public bool stop;
+    public weak App app;
+    public Control replacement;
+    public void Click(Control sender) {
+        clicks = clicks + 1;
+        App target = app;
+        if (target == null) { return; }
+        if (replaceRoot) { target.SetRootControl(replacement); }
+        if (stop) { target.StopLoop(); }
+    }
+}
+
+class CleanFormLifetime {
+    public weak Form form;
+    public App app;
+}
+
 class GuiCleanApiTest {
     static int fails;
+
+    static CleanFormLifetime BorrowedInputLifetime() {
+        Form form = Form.CreateOffscreen("Borrowed Form input", 160, 100);
+        Button button = new Button("Go");
+        form.Add(button);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        CleanFormLifetime witness = new CleanFormLifetime();
+        witness.form = form;
+        witness.app = form.GetApp();
+        witness.app.canvas.Destroy();
+        witness.app.canvas = null;
+        return witness;
+    }
 
     static void Check(string label, bool ok) {
         if (ok) { return; }
         fails = fails + 1;
         Console.WriteLine("FAIL: " + label);
+    }
+
+    static void OffscreenInput() {
+        Form form = Form.CreateOffscreen("Form input", 240, 180);
+        App app = form.GetApp();
+        app.SetChromeVisible(false);
+        Panel root = Panel.Column();
+        root.Grow();
+        Button button = new Button("Go");
+        button.SetProp("style", "position: absolute; right: 0; bottom: 0; width: 60px; height: 28px");
+        root.Add(button);
+        form.Add(root);
+        CleanOffscreenInputProbe probe = new CleanOffscreenInputProbe();
+        probe.app = app;
+        button.BindEventS("Click", probe.Click);
+        form.ProcessOffscreenInput(2, 230, 170, 0, 0, 0, 0);
+        Control inputRoot = app.rootControl;
+        if (app.pointerDownTarget != button) {
+            Console.WriteLine("input geometry: form=" + Convert.ToString(form.bx) + "," + Convert.ToString(form.by)
+                + "," + Convert.ToString(form.bw) + "," + Convert.ToString(form.bh)
+                + " panel=" + Convert.ToString(root.bx) + "," + Convert.ToString(root.by)
+                + "," + Convert.ToString(root.bw) + "," + Convert.ToString(root.bh)
+                + " button=" + Convert.ToString(button.bx) + "," + Convert.ToString(button.by)
+                + "," + Convert.ToString(button.bw) + "," + Convert.ToString(button.bh)
+                + " root=" + (inputRoot != null ? inputRoot.StyleType() : "null"));
+        }
+        Check("first Form input prepares and captures before paint", app.pointerDownTarget == button
+            && inputRoot is ControlInputHost && inputRoot.ContainsInputControl(form));
+        form.ProcessOffscreenInput(3, 230, 170, 0, 0, 0, 0);
+        Check("first Form click finishes without a paint", probe.clicks == 1
+            && app.rootControl == inputRoot);
+        probe.clicks = 0;
+        app.SetRootControl(root);
+        form.CaptureSnapshot();
+        int oldRight = button.bx + button.bw;
+
+        app.SetOffscreenViewport(360, 240, 100);
+        int x = app.Scale(350);
+        int y = app.Scale(230);
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+
+        Check("resize precedes first input hit", button.bx + button.bw > oldRight
+            && button.ContainsPoint(x, y) && app.pointerDownTarget == button);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        form.CaptureSnapshot();
+        form.CaptureSnapshot();
+        Check("Form input Click occurs once across snapshots", probe.clicks == 1);
+        Check("Form input keeps authored child root", app.rootControl == root);
+        Control replacement = new Control("replacement");
+        probe.replacement = replacement;
+        probe.replaceRoot = true;
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Check("callback root replacement survives input scope", probe.clicks == 2
+            && app.rootControl == replacement);
+        bool unrelatedRoot = false;
+        try { form.ProcessOffscreenInput(1, x, y, 0, 0, 0, 0); }
+        catch (InvalidOperationException error) { unrelatedRoot = true; }
+        Check("Form input rejects an unrelated root", unrelatedRoot);
+        app.SetRootControl(root);
+        probe.replaceRoot = false;
+        probe.stop = true;
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Check("callback stop preserves root and prevents later dispatch", probe.clicks == 3
+            && !app.isRunning && app.rootControl == root);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        app.canvas = null;
     }
 
     static void Main() {
@@ -31,14 +135,14 @@ class GuiCleanApiTest {
         Check("attached FindForm matches window", btn.FindForm() == win);
         Check("attached FindApp matches window app", btn.FindApp() == win.GetApp());
 
-        // 2. 测试 Tabs.AddPage 干净整洁的面向对象装配（消灭 .Root、消灭手拆 Page 容器）
+        // 2. 代码通过 Tabs.Add 与标准插槽协议装配标签页。
         Tabs tabs = new Tabs();
         Panel page1Content = Panel.Column();
         Button pageBtn = new Button("Page1Btn");
         page1Content.Add(pageBtn);
 
-        // 直接一行代码添加标签页与内容控件
-        tabs.AddPage("监控页", page1Content);
+        tabs.Add("监控页");
+        Check("page content mounts into shared slot", tabs.MountSlot("0", page1Content));
         win.Add(tabs);
 
         Check("tabs count is 1", tabs.Count() == 1);
@@ -51,6 +155,14 @@ class GuiCleanApiTest {
         Check("snapshot width", snapshot.Width() >= 640);
         Check("snapshot height", snapshot.Height() >= 480);
 
+        Check("snapshot releases its temporary Form root", win.GetApp().rootControl == null);
+        snapshot.Destroy();
+        win.GetApp().canvas = null;
+        OffscreenInput();
+        CleanFormLifetime witness = BorrowedInputLifetime();
+        Check("offscreen input root does not retain its Form", witness.form == null);
+        witness.app.SetRootControl(null);
+        witness.app.StopLoop();
         if (fails == 0) {
             Console.WriteLine("CLEAN_API_TEST_OK");
         } else {

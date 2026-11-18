@@ -1,0 +1,163 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+namespace Gui;
+
+// SOURCE ONLY. Requires 01-core-default-hosts.patch; no CMake registration supplied.
+class BoundaryLeaf : Control {
+    public int downs;
+    public int paints;
+    public bool failMeasure;
+    public BoundaryLeaf() : base("boundaryLeaf") { this.Prefer(80, 40); }
+    public override void OnMeasure(App app) {
+        if (failMeasure) { throw new InvalidOperationException("layout sentinel"); }
+        base.OnMeasure(app);
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return x >= bx && x < bx + bw && y >= by && y < by + bh ? this : null;
+    }
+    public override void OnPointerDown(RoutedEventArgs e) { downs = downs + 1; e.Handle(); }
+    public override void OnPaint(App app) { paints = paints + 1; }
+}
+
+class BoundaryFrameParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public weak BoundaryLeaf owner;
+    public bool inject;
+    public bool fail;
+    public int calls;
+    public int seenX;
+    public int seenWidth;
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+    public void BeforeInput(App app, int kind) { }
+    public void BeforePaint(App app, int frame) {
+        calls = calls + 1;
+        BoundaryLeaf leaf = owner;
+        if (leaf != null) { seenX = leaf.bx; seenWidth = leaf.bw; }
+        if (fail) { throw new InvalidOperationException("paint preparation sentinel"); }
+        if (inject) {
+            inject = false;
+            app.ProcessOffscreenInput(2, seenX + 1, leaf.by + 1, 0, 0, 0, 0);
+        }
+    }
+}
+
+class BoundaryForm : Form {
+    public BoundaryForm() : base("form boundary", 320, 180, true) { }
+    public void CheckScope(BoundaryLeaf leaf) {
+        App app = this.GetApp();
+        this.Add(leaf);
+        this.RunScoped(() => {
+            app.ProcessOffscreenInput(2, 10, app.ContentTop() + 10, 0, 0, 0, 0);
+            PreparationDefaultHostsTest.Check(leaf.bw > 0 && leaf.bh > 0
+                && 10 >= leaf.bx && 10 < leaf.bx + leaf.bw
+                && app.ContentTop() + 10 >= leaf.by && app.ContentTop() + 10 < leaf.by + leaf.bh,
+                "Form first Down lies inside naturally prepared nonzero leaf geometry");
+            PreparationDefaultHostsTest.Check(leaf.downs == 1 && leaf.paints == 0,
+                "Form natural first Down runs internal layout before first Paint");
+        });
+        PreparationDefaultHostsTest.Check(app.CurrentHostLayout() == null,
+            "Form scoped layout registration retires without retaining owner");
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+}
+
+class BoundaryWeakWitness {
+    public weak Form form;
+    public weak ChildWindow child;
+    public weak App app;
+}
+
+class PreparationDefaultHostsTest {
+    static void ReleasedForm(BoundaryWeakWitness witness) {
+        BoundaryForm form = new BoundaryForm();
+        witness.form = form; witness.app = form.GetApp();
+        form.CheckScope(new BoundaryLeaf());
+    }
+    static void ReleasedChild(BoundaryWeakWitness witness) {
+        App app = App.CreateOffscreen("weak child", 100, 80);
+        ChildWindow child = OffscreenChild(app, new BoundaryLeaf());
+        witness.child = child; witness.app = app;
+        child.Teardown();
+    }
+    public static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+
+    static ChildWindow OffscreenChild(App app, BoundaryLeaf leaf) {
+        ChildWindow child = new ChildWindow();
+        // Fixture substitutes only the platform-owned window creation. All layout,
+        // registration, binder, input and RenderContent are real default-child paths.
+        child.host = app;
+        child.open = true;
+        Control content = new Control("childContent");
+        content.inlineStyleCss = "display:flex;flex-direction:column";
+        content.Add(leaf);
+        leaf.Grow();
+        child.SetView(content, null);
+        child.EnsureHostLayoutRegistration();
+        return child;
+    }
+
+    static void ChildLayoutAndFailure() {
+        App app = App.CreateOffscreen("child boundary", 320, 180);
+        BoundaryLeaf leaf = new BoundaryLeaf();
+        ChildWindow child = OffscreenChild(app, leaf);
+        AppLoopRegistration initial = child.hostLayoutRegistration;
+        child.EnsureHostLayoutRegistration();
+        Check(child.hostLayoutRegistration == initial, "child registration is idempotent");
+        int top = app.ContentTop();
+        app.ProcessOffscreenInput(2, 20, top + 20, 0, 0, 0, 0);
+        Check(leaf.bw > 0 && leaf.bh > 0 && 20 >= leaf.bx && 20 < leaf.bx + leaf.bw
+            && top + 20 >= leaf.by && top + 20 < leaf.by + leaf.bh,
+            "child first Down lies inside naturally prepared nonzero leaf geometry");
+        Check(leaf.downs == 1 && leaf.paints == 0, "default child first Down precedes Paint");
+        Check(leaf.bx == app.ShapeOffX() + app.Scale(5)
+            && leaf.by == app.ContentTop() + app.ShapeOffY() + app.Scale(5),
+            "child input uses actual host content origin and padding");
+        BoundaryFrameParticipant participant = new BoundaryFrameParticipant(); participant.owner = leaf;
+        AppLoopRegistration registration = app.RegisterLoopParticipant(leaf, participant);
+        app.dpiScale = 200;
+        app.ScaleThemeMetrics();
+        app.RequestRedraw(); child.RenderContent();
+        Check(participant.seenX == app.ShapeOffX() + app.Scale(5)
+            && participant.seenWidth == app.ClientWidth() - app.Scale(5) * 2,
+            "BeforePaint sees default child post-layout geometry at new DPI");
+        int painted = leaf.paints;
+        participant.inject = true;
+        app.RequestRedraw(); child.RenderContent();
+        Check(leaf.paints == painted && app.preparationFrameAborted && !app.offscreenFrameActive,
+            "nested actual input aborts old frame before tree Paint and restores offscreen context");
+        Check(app.window.EventKind() == 2, "frame abort does not erase newer actual input");
+        participant.fail = true;
+        bool caught = false;
+        try { child.RenderContent(); } catch (Exception error) { caught = true; }
+        Check(caught && !app.preparingPaintParticipants && !app.offscreenFrameActive,
+            "preparation exception releases frame state and WidgetId finally executes");
+        participant.fail = false;
+        leaf.failMeasure = true;
+        caught = false;
+        try { app.ProcessOffscreenInput(2, 20, 30, 0, 0, 0, 0); }
+        catch (Exception error) { caught = true; }
+        Check(caught && app.preparingInputDepth == 0, "layout exception retires input phase depth");
+        leaf.failMeasure = false;
+        app.RequestRedraw(); child.RenderContent();
+        Check(leaf.paints == painted + 1 && !app.preparationFrameAborted,
+            "next frame can prepare and paint after exceptions");
+        registration.Invalidate();
+        child.Teardown();
+        Check(!initial.active && app.CurrentHostLayout() == null, "child teardown retires internal layout ticket");
+    }
+
+    static void Main() {
+        // frameApp retains the first App by existing contract, independent of fixture owners.
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        BoundaryForm form = new BoundaryForm(); form.CheckScope(new BoundaryLeaf());
+        ChildLayoutAndFailure();
+        BoundaryWeakWitness witness = new BoundaryWeakWitness();
+        ReleasedForm(witness);
+        Check(witness.form == null && witness.app == null, "Form layout adapter borrows owner and App");
+        ReleasedChild(witness);
+        Check(witness.child == null && witness.app == null, "Child layout adapter borrows owner and App");
+        frame.canvas.Destroy();
+        Console.WriteLine("preparation-default-hosts:ok");
+    }
+}

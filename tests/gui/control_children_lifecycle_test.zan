@@ -8,6 +8,9 @@ class ChildrenInput : Input {
     public bool CancelAttached;
     public weak App CancelHost;
     public weak Control CancelDestination;
+    public Exception CancelFailure;
+    public weak InputRetirementObserver CancelRetirementObserver;
+    public InputRetirementToken CancelReplacement;
     public ChildrenInput() : base() { }
     public bool Retired() { return !this.isPressed && !this.isHovered; }
     public override void OnPointerCancel(RoutedEventArgs e) {
@@ -15,9 +18,41 @@ class ChildrenInput : Input {
         CancelAttached = this.parent != null;
         CancelHost = this.FindApp();
         base.OnPointerCancel(e);
+        if (CancelFailure != null) { throw CancelFailure; }
         Control destination = CancelDestination;
         CancelDestination = null;
-        if (destination != null) { destination.Children.Add(this); }
+        if (destination != null) {
+            destination.Children.Add(this);
+            InputRetirementObserver observer = CancelRetirementObserver;
+            CancelRetirementObserver = null;
+            App host = this.FindApp();
+            if (host != null && observer != null) { CancelReplacement = host.WatchInputRetirement(this, observer); }
+        }
+    }
+}
+
+class ChildrenRetirementObserver : InputRetirementObserver {
+    public weak App App;
+    public weak Control Owner;
+    public weak Control First;
+    public weak Control Second;
+    public InputRetirementToken Replacement;
+    public int Calls;
+    public bool Renew;
+    public bool SawDetached;
+    public void OnInputRetired(InputRetirementToken token) {
+        Calls = Calls + 1;
+        if (!Renew) { return; }
+        Renew = false;
+        App app = App; Control owner = Owner; Control first = First; Control second = Second;
+        if (app == null || owner == null || first == null) { return; }
+        SawDetached = first.parent == null && first.FindApp() == null
+            && (second == null || (second.parent == null && second.FindApp() == null));
+        owner.Add(first);
+        Control leaf = first;
+        if (second != null) { owner.Add(second); leaf = second; }
+        Replacement = app.WatchInputRetirement(leaf, this);
+        leaf.Focus(app); app.CapturePointer(leaf);
     }
 }
 
@@ -50,7 +85,7 @@ class ControlChildrenLifecycleTest {
         App other = App.CreateOffscreen("children second", 320, 240);
         ChildrenInput input = new ChildrenInput();
         Control root = new Row() { Children = { new Column() { Children = { input } } } };
-        Control nested = root.Children[0];
+        Control nested = root.ChildAt(0);
         Check(nested.parent == root && input.parent == nested, "natural nested initializer adopts each level");
         Check(root.Children == root.Children, "facade is cached");
         Layout(app, root);
@@ -65,20 +100,20 @@ class ControlChildrenLifecycleTest {
             && app.GetCapturedPointer() == null && input.Retired(), "remove retires subtree input and host");
         Check(!nested.Children.Remove(input) && !nested.Children.Remove(null), "remove absent and null is harmless");
         nested.Children.Add(null);
-        Check(nested.Children.Count == 0, "Add null is harmless");
+        Check(nested.ChildCount() == 0, "Add null is harmless");
         nested.Children.Add(input);
         ChildrenInput sibling = new ChildrenInput();
         nested.Children.Add(sibling);
         int seen = 0;
         foreach (Control child in nested.Children) {
-            Check(child == nested.Children[seen], "enumeration preserves child order");
+            Check(child == nested.ChildAt(seen), "enumeration preserves child order");
             seen = seen + 1;
         }
         Check(seen == 2, "foreach visits all children");
         Layout(app, root);
         Arm(app, input);
         nested.Children.Clear();
-        Check(nested.Children.Count == 0 && input.parent == null && sibling.parent == null
+        Check(nested.ChildCount() == 0 && input.parent == null && sibling.parent == null
             && input.FindApp() == null && sibling.FindApp() == null, "Clear detaches all children");
         Check(input.Cancels == 2 && app.GetCapturedPointer() == null && !input.IsFocused(app), "Clear retires focus capture and press");
         nested.Children.Add(input);
@@ -87,7 +122,7 @@ class ControlChildrenLifecycleTest {
         Layout(app, root);
         Arm(app, input);
         destination.Children.Add(input);
-        Check(nested.Children.Count == 0 && destination.Children.Count == 1 && input.parent == destination
+        Check(nested.ChildCount() == 0 && destination.ChildCount() == 1 && input.parent == destination
             && input.FindApp() == app && input.Cancels == 3, "same App reparent retires input through old parent");
         Check(app.GetCapturedPointer() == null && !input.IsFocused(app), "same App transfer cannot carry active input");
         Control otherRoot = new Column();
@@ -95,14 +130,18 @@ class ControlChildrenLifecycleTest {
         Layout(app, root);
         Arm(app, input);
         otherRoot.Children.Add(destination);
-        Check(root.Children.Count == 1 && destination.parent == otherRoot && input.FindApp() == other
+        Check(root.ChildCount() == 1 && destination.parent == otherRoot && input.FindApp() == other
             && input.Cancels == 4 && input.CancelHost == app, "cross App subtree transfer retires old host before inheritance");
         Check(app.GetCapturedPointer() == null && !input.IsFocused(app) && other.GetCapturedPointer() == null,
             "cross App transfer cannot migrate capture or focus");
         Layout(other, otherRoot);
         input.Focus(other);
+        input.ScrollToEnd();
         Event(other, 6, 0, 0, 66);
-        Check(input.GetText() == "AB", "transferred nested editor receives new host input before paint");
+        Check(input.GetText() == "AB", "transferred nested editor receives new host input before paint"
+            + " (text=" + input.GetText() + ", focused=" + input.IsFocused(other)
+            + ", hosted=" + (input.FindApp() == other) + ", root=" + (other.rootControl == otherRoot)
+            + ", cancels=" + input.Cancels + ")");
         List<Control> fluentItems = new List<Control>();
         fluentItems.Add(new Control());
         Row fluentRow = new Row();
@@ -121,35 +160,41 @@ class ControlChildrenLifecycleTest {
         int cancels = input.Cancels;
         input.CancelDestination = otherRoot;
         third.Children.Add(input);
-        Check(input.parent == otherRoot && input.FindApp() == other && otherRoot.Children.Count == 1
-            && third.Children.Count == 0 && destination.Children.Count == 0 && input.Cancels == cancels + 1,
+        Check(input.parent == otherRoot && input.FindApp() == other && otherRoot.ChildCount() == 1
+            && third.ChildCount() == 0 && destination.ChildCount() == 0 && input.Cancels == cancels + 1,
             "cancel reparent to third owner wins without double ownership or cancellation");
         Layout(other, otherRoot);
         Arm(other, input);
         cancels = input.Cancels;
         input.CancelDestination = third;
         third.Children.Add(input);
-        Check(input.parent == third && third.Children.Count == 1 && otherRoot.Children.Count == 0
+        Check(input.parent == third && third.ChildCount() == 1 && otherRoot.ChildCount() == 0
             && input.FindApp() == app && input.Cancels == cancels + 1,
             "cancel reparent to requested target is idempotent");
         Layout(app, root);
         Arm(app, input);
         cancels = input.Cancels;
+        ChildrenRetirementObserver reparentObserver = new ChildrenRetirementObserver();
+        InputRetirementToken oldReparent = app.WatchInputRetirement(input, reparentObserver);
+        input.CancelRetirementObserver = reparentObserver;
         input.CancelDestination = otherRoot;
         third.Children.Remove(input);
-        Check(input.parent == otherRoot && otherRoot.Children.Count == 1 && third.Children.Count == 0
+        Check(input.parent == otherRoot && otherRoot.ChildCount() == 1 && third.ChildCount() == 0
             && input.FindApp() == other && input.Cancels == cancels + 1,
             "outer Remove preserves ownership installed by cancellation callback");
+        Check(reparentObserver.Calls == 1 && !oldReparent.IsActive()
+            && input.CancelReplacement != null && input.CancelReplacement.IsActive(),
+            "Cancel cross-parent reparent retires old token exactly once and preserves callback-created new token");
         Layout(other, otherRoot);
         Arm(other, input);
         cancels = input.Cancels;
         input.CancelDestination = third;
         destination.InsertAt(0, input);
-        Check(input.parent == third && third.Children.Count == 1 && destination.Children.Count == 0
-            && otherRoot.Children.Count == 0 && input.FindApp() == app && input.Cancels == cancels + 1,
+        Check(input.parent == third && third.ChildCount() == 1 && destination.ChildCount() == 0
+            && otherRoot.ChildCount() == 0 && input.FindApp() == app && input.Cancels == cancels + 1,
             "InsertAt respects cancellation callback ownership");
         third.Children.Add(input);
-        Check(third.Children.Count == 1, "same parent Add never duplicates a child");
+        Check(third.ChildCount() == 1, "same parent Add never duplicates a child");
         otherRoot.Children.Clear();
         app.SetRootControl(null);
         other.SetRootControl(null);
@@ -159,16 +204,76 @@ class ControlChildrenLifecycleTest {
         app.canvas.Destroy();
         other.canvas.Destroy();
     }
+    static void RetirementCommit() {
+        App app = App.CreateOffscreen("children retirement commit", 320, 240);
+        Control root = new Column(); ChildrenInput first = new ChildrenInput(); root.Add(first); Layout(app, root);
+        ChildrenRetirementObserver observer = new ChildrenRetirementObserver();
+        observer.App = app; observer.Owner = root; observer.First = first; observer.Renew = true;
+        InputRetirementToken oldFirst = app.WatchInputRetirement(first, observer);
+        root.Remove(first);
+        Check(observer.Calls == 1 && observer.SawDetached && !oldFirst.IsActive()
+            && first.parent == root && first.FindApp() == app && root.ChildCount() == 1
+            && observer.Replacement.IsActive() && app.GetCapturedPointer() == first && first.IsFocused(app),
+            "single Remove commits before retirement observer and preserves same-parent renewal");
+        root.RemoveAll();
+        Check(observer.Calls == 2 && !observer.Replacement.IsActive() && root.ChildCount() == 0,
+            "later removal retires the observer-renewed single member");
+
+        ChildrenInput second = new ChildrenInput(); root.Add(first); root.Add(second); Layout(app, root);
+        observer = new ChildrenRetirementObserver(); observer.App = app; observer.Owner = root;
+        observer.First = first; observer.Second = second; observer.Renew = true;
+        oldFirst = app.WatchInputRetirement(first, observer);
+        InputRetirementToken oldSecond = app.WatchInputRetirement(second, observer);
+        root.RemoveAll();
+        Check(observer.Calls == 2 && observer.SawDetached && !oldFirst.IsActive() && !oldSecond.IsActive()
+            && observer.Replacement.IsActive() && first.parent == root && second.parent == root && root.ChildCount() == 2
+            && app.GetCapturedPointer() == second && second.IsFocused(app),
+            "RemoveAll commits every old child before callbacks and excludes renewed later-member token");
+        root.RemoveAll();
+        Check(observer.Calls == 3 && !observer.Replacement.IsActive() && root.ChildCount() == 0,
+            "later batch retires the renewed member once");
+
+        root.Add(first); root.Add(second); Layout(app, root);
+        observer = new ChildrenRetirementObserver(); oldFirst = app.WatchInputRetirement(first, observer);
+        oldSecond = app.WatchInputRetirement(second, observer);
+        Exception sentinel = new Exception("children Cancel sentinel"); second.CancelFailure = sentinel;
+        Arm(app, second); bool caught = false;
+        try { root.RemoveAll(); }
+        catch (Exception ex) { Check(ex == sentinel, "Cancel failure preserves original exception"); caught = true; }
+        Check(caught && first.parent == root && second.parent == root && root.ChildCount() == 2
+            && oldFirst.IsActive() && oldSecond.IsActive() && observer.Calls == 0,
+            "batch Cancel exception aborts before any structural removal or retirement notification");
+        second.CancelFailure = null; root.RemoveAll();
+        Check(observer.Calls == 2 && !oldFirst.IsActive() && !oldSecond.IsActive()
+            && first.parent == null && second.parent == null && root.ChildCount() == 0,
+            "explicit retry commits and retires every previously aborted member once");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ButtonRoutedClickSubscriptions() {
+        App app = App.CreateOffscreen("button routed Click", 120, 80);
+        Button button = new Button("routed");
+        button.UseApp(app);
+        int direct = 0;
+        int named = 0;
+        button.Click.Add(() => { direct = direct + 1; });
+        button.BindEvent("Click", () => { named = named + 1; });
+        Control.RouteEvent(button, new RoutedEventArgs("Click", button));
+        Check(button.Click.CountAll() == 2 && direct == 0 && named == 0, "one routed Button Click stays deferred");
+        app.DrainPosts();
+        Check(direct == 1 && named == 1, "routed Button Click notifies each subscription once");
+        button.UseApp(null);
+        app.canvas.Destroy();
+    }
     static void Borrow(ChildrenWitness witness) {
         Control owner = new Control() { Children = { new Control() } };
         witness.Owner = owner;
-        witness.Child = owner.Children[0];
+        witness.Child = owner.ChildAt(0);
         witness.View = owner.Children;
         witness.Iterator = witness.View.GetEnumerator();
     }
     static void Main() {
         App frame = App.CreateOffscreen("frame", 2, 2);
-        Trees();
+        Trees(); RetirementCommit(); ButtonRoutedClickSubscriptions();
         ChildrenWitness witness = new ChildrenWitness();
         Borrow(witness);
         Check(witness.Owner == null && witness.View.Count == 0, "cached facade and iterator do not retain owner");

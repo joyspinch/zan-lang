@@ -41,10 +41,6 @@ public partial class Html {
             case "kind":
             case "span":
             case "child-tab":
-            case "fx":
-            case "fy":
-            case "fw":
-            case "fh":
             case "position":
             case "padding":
             case "pad":
@@ -147,7 +143,7 @@ public partial class Html {
             }
             case "textarea": {
                 TextArea ta = new TextArea();
-                ta.InitTextArea(new SignalString(n.text), "");
+                ta.InitTextArea(n.text, "");
                 c = ta;
                 break;
             }
@@ -176,7 +172,7 @@ public partial class Html {
                 } else {
                     Input inp = new Input();
                     inp.InitInput(
-                        new SignalString(HtmlText.NodeAttr(n.attrs, "value")),
+                        HtmlText.NodeAttr(n.attrs, "value"),
                         HtmlText.NodeAttr(n.attrs, "placeholder"));
                     if (type == "password") {
                         inp.SetProp("password", "true");
@@ -386,16 +382,13 @@ public partial class Html {
                 break;
             }
         }
-        // 真控件的 id 不进 nodeName（那是 Element 的），走选择器名
-        if (id != "" && !(c is Element)) { c.SetProp("name", id); }
+        // Node IDs are metadata; widget properties named "name" keep their defaults.
+        if (id != "" && !(c is Element)) { c.name = id; }
         // data-arg 预扫：属性顺序不保证（data-arg 可写在 data-on-*
         // 之后），先取出来供本节点全部事件共用；同时落 handlerArg
         // 字段，ChildWindow.WireNode 的二次接线同源。
         string darg = HtmlText.NodeAttr(n.attrs, "data-arg");
         if (darg != "") { c.handlerArg = darg; }
-        if (n.text != "" && n.text.IndexOf("{{") >= 0 && c.bindTpl == "") {
-            c.bindTpl = n.text;
-        }
         // 属性协议（与 Designer 导入的建树代码同一套语义）
         for (int i = 0; i < n.attrs.Count; i = i + 1) {
             string k = n.attrs[i].name;
@@ -424,51 +417,26 @@ public partial class Html {
                 c.slotName = v;
                 continue;
             }
+            if (k == "data-child-tab") {
+                // Designer page indices use the same mounting path as numeric slots.
+                if (c.slotName == "") { c.slotName = v; }
+                continue;
+            }
             if (k == "z-mount" || k == "data-mount") {
                 c.bindMount = v;
                 continue;
             }
-            if (k == "data-bind" || k == "z-model" || k == "v-model"
-                || HtmlText.StartsWith(k, "v-model.") || HtmlText.StartsWith(k, "z-model.")
-                || HtmlText.StartsWith(k, "data-bind.")) {
-                c.bindPath = v;
-                if (k.IndexOf(".lazy") >= 0) { c.bindLazy = true; }
-                if (k.IndexOf(".number") >= 0) { c.bindNumber = true; }
-                if (k.IndexOf(".trim") >= 0) { c.bindTrim = true; }
+            if (k == "bind" || HtmlText.StartsWith(k, "bind:")) {
+                string boundProperty = k == "bind" ? "" : k.Substring(5);
+                if (boundProperty == "" && k != "bind") {
+                    throw new ArgumentException("bind: requires a component property");
+                }
+                c.DeclareBinding(v, boundProperty, true);
                 continue;
             }
-            if (k == ":class" || k == "data-bind-class" || k == "z-class" || k == "v-bind:class") {
-                c.bindClass = v;
-                continue;
-            }
-            if (k == ":disabled" || k == "data-bind-disabled" || k == "z-disabled" || k == "v-bind:disabled") {
-                c.bindDisabled = v;
-                continue;
-            }
-            if (k == "data-if" || k == "z-show" || k == "v-show") {
-                c.bindIf = v;
-                continue;
-            }
-            if (k == "z-hide" || k == "v-hide") {
-                c.bindIf = "!" + v;
-                continue;
-            }
-            if (k == "z-text" || k == "v-text") {
-                c.bindPath = v;
-                c.bindProp = "text";
-                continue;
-            }
-            // 通用动态属性绑定（:prop / v-bind:prop / z-bind:prop）
-            string bindAttr = "";
+            // One-way declarations use a dotted model path, never an expression.
             if (k.Length > 1 && k[0] == 58) { // ':'
-                bindAttr = k.Substring(1);
-            } else if (k.Length > 7 && HtmlText.StartsWith(k, "v-bind:")) {
-                bindAttr = k.Substring(7);
-            } else if (k.Length > 7 && HtmlText.StartsWith(k, "z-bind:")) {
-                bindAttr = k.Substring(7);
-            }
-            if (bindAttr != "") {
-                c.AddBindProp(bindAttr, v);
+                c.DeclareBinding(v, k.Substring(1), false);
                 continue;
             }
             // 事件语法糖解析（data-on-*, @*, v-on:*, z-on:*, on*）
@@ -476,16 +444,16 @@ public partial class Html {
             string suffix = "";
             if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
                 suffix = k.Substring(8, k.Length - 8);
-                evt = HtmlText.EventKind(suffix);
+                evt = HtmlText.EventKind(suffix, c.Events());
             } else if (k.Length > 1 && k[0] == 64) { // '@'
                 suffix = k.Substring(1);
-                evt = HtmlText.EventKind(suffix);
+                evt = HtmlText.EventKind(suffix, c.Events());
             } else if (k.Length > 5 && (HtmlText.StartsWith(k, "v-on:") || HtmlText.StartsWith(k, "z-on:"))) {
                 suffix = k.Substring(5);
-                evt = HtmlText.EventKind(suffix);
+                evt = HtmlText.EventKind(suffix, c.Events());
             } else if (k.Length > 2 && HtmlText.StartsWith(k, "on")) {
                 suffix = k.Substring(2);
-                evt = HtmlText.EventKind(suffix);
+                evt = HtmlText.EventKind(suffix, c.Events());
             }
             if (evt != "") {
                 string mod = "";
@@ -572,37 +540,6 @@ public partial class Html {
                     c.SetProp("readonly", "true");
                     continue;
                 }
-                case "dock":
-                case "data-dock": {
-                    string dlow = v.ToLower();
-                    if (dlow == "fill") { c.Grow(); }
-                    else if (dlow == "top") { Html.AddInlineCss(doc, c, "width: 100%;"); }
-                    continue;
-                }
-                case "data-fx": {
-                    if (Html.IsIntText(v)) {
-                        Html.AddInlineCss(doc, c, "position: absolute; left: " + v + "px;");
-                    }
-                    continue;
-                }
-                case "data-fy": {
-                    if (Html.IsIntText(v)) {
-                        Html.AddInlineCss(doc, c, "position: absolute; top: " + v + "px;");
-                    }
-                    continue;
-                }
-                case "data-fw": {
-                    if (Html.IsIntText(v)) {
-                        Html.AddInlineCss(doc, c, "width: " + v + "px;");
-                    }
-                    continue;
-                }
-                case "data-fh": {
-                    if (Html.IsIntText(v)) {
-                        Html.AddInlineCss(doc, c, "height: " + v + "px;");
-                    }
-                    continue;
-                }
                 case "data-padding": {
                     if (Html.IsIntText(v)) {
                         Html.AddInlineCss(doc, c, "padding: " + v + "px;");
@@ -649,7 +586,7 @@ public partial class Html {
             }
         }
         if (id != "" && !(c is Element)) {
-            c.SetProp("name", id);
+            // HTML IDs name nodes, independently of widget properties named "name".
             c.name = id;
         }
         if (!(c is Element) && doc != null && doc.sizeClass != "" && !Html.HasSizeClass(c.Class)) {
@@ -881,7 +818,7 @@ public partial class Html {
             case "icon-view":
                 return "IconView";
             case "ribbon":
-                return "ToolStrip";
+                return "Ribbon";
             case "checkbox-group":
             case "checkboxgroup":
                 return "CheckboxGroup";

@@ -98,10 +98,6 @@ public partial class Form : Control {
         if (app != null) { app.ToggleMaximizeWindow(); }
     }
 
-    // 登记标题栏右侧客户区保护带宽度（设备像素）。
-    void SetCaptionZone(int width) {
-        if (app != null) { app.SetCaptionZone(width); }
-    }
 
     // 设置窗口保持置顶（TopMost）。
     void SetTopmost(bool on) {
@@ -124,8 +120,10 @@ public partial class Form : Control {
     // 而不是落到"未知类型"的通用表面默认值上——那会给整个
     // 设计加上一圈外边框，并把内容往里缩 paddingLarge。
     override string StyleType() { return "window"; }
-    // 顶级窗口客户区容器使用 CSS 流式排版（display 3，Flow）。
-    override int StyleDisplay() { return 3; }
+    // 客户区提供确定的尺寸；文档根与代码控件共用标准纵向 flex，
+    // Grow() 消费剩余高度，百分比尺寸按真实客户区解析。
+    override int StyleDisplay() { return computedStyle == null ? 1 : base.StyleDisplay(); }
+    override int StyleFlexDir() { return computedStyle == null ? 1 : base.StyleFlexDir(); }
 
     // ---- 每帧钩子 ----
 
@@ -253,15 +251,6 @@ public partial class Form : Control {
         handlers.SetItem(name, a);
     }
 
-    // 主动标记数据为脏（外部模型改动时通知界面立刻重绘并同步）
-    void MarkDirty() {
-        ModelHosts.MarkDirtyAll();
-        if (app != null) {
-            app.RequestRedraw();
-            app.Wake();
-        }
-    }
-
     // 为 `name` 注册的 Action；未注册时为 null。
     Action Handle(string name) {
         return handlers.Get(name);
@@ -315,8 +304,8 @@ public partial class Form : Control {
     void WireDocEvents() {
         if (this.docWired) { return; }
         this.docWired = true;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            this.WireDocNode(children[i]);
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            this.WireDocNode(this.ChildAt(i));
         }
     }
 
@@ -353,38 +342,63 @@ public partial class Form : Control {
                 c.BindEvent(evt, a);
             }
         }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.WireDocNode(c.children[j]);
+        for (int j = 0; j < c.ChildCount(); j = j + 1) {
+            this.WireDocNode(c.ChildAt(j));
         }
     }
 
     // 在当前帧中一次性测量、布局并绘制整棵树，
     // 位于装饰之下。公开以便手写循环可以组合调用它。
-    void RenderFrame(App a) {
-        int top = a.ContentTop();
-        int offX = a.ShapeOffX();
-        int offY = a.ShapeOffY();
-        int clientW = a.ClientWidth();
-        int clientH = a.ClientHeight() - top;
-        int W = a.canvas.Width();
-        int H = a.canvas.Height();
-        // 在树后绘制当前皮肤的主题背景（渐变 + 玻璃壁纸，
-        // 或纯色填充），让磨砂玻璃面板模糊真实
-        // 色彩而不是纯色清屏——与 IDE/画廊
-        // 设置窗口的方式相同。槽 0 是惯例的背景缓存槽。
-        a.PhaseBegin();
-        a.RenderBackground(0, top, W, H - top, 0);
-        a.PhaseEnd(0);
-        // 主窗口内的模型宿主：测量前把模型推入控件（绑定声明在这条
-        // 路上才生效），渲染后把控件回写模型——与子窗口（ChildWindow）
-        // 自己的每帧同步同口径。没有注册宿主时这两个调用是空转。
-        ModelHosts.SyncAll();
+    internal AppLoopRegistration hostLayoutRegistration;
+
+    private bool HostLayoutCurrent(App a, AppLoopRegistration ticket, AppPreparationProof proof,
+            int revision, int phase, long sequence, bool forInput) {
+        Control root = a.rootControl;
+        bool member = !forInput || (root != null
+            && (root.ContainsInputControl(this) || this.ContainsHostedControl(root)));
+        return member && app == a && hostLayoutRegistration == ticket
+            && a.PreparationInputCurrent(phase, sequence)
+            && a.HostPhaseCurrent(ticket, proof, revision);
+    }
+
+    internal bool SyncHostLayout(App a, bool forInput) {
+        AppLoopRegistration ticket = hostLayoutRegistration;
+        if (a != app || ticket == null || !a.LiveLoopRegistration(ticket) || ticket.host != a) { return false; }
+        AppPreparationProof proof = new AppPreparationProof(ticket);
+        int revision = a.hostLayoutRevision;
+        int phase = a.inputPreparationTicket;
+        long sequence = a.window.EventSeq();
+        if (!a.SyncModelHosts()) { return false; }
+        if (!HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput)) { return false; }
         this.MeasureTree(a);
-        a.PhaseEnd(1);
-        this.Arrange(offX, top + offY, clientW, clientH);
-        a.PhaseEnd(2);
+        if (!HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput)) { return false; }
+        this.Arrange(a.ShapeOffX(), a.ContentTop() + a.ShapeOffY(),
+            a.ClientWidth(), a.ClientHeight() - a.ContentTop());
+        return HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput);
+    }
+
+    private bool ContinueFormFrame(App a, AppLoopRegistration ticket, string boundary = "form") {
+        if (app == a && hostLayoutRegistration == ticket && a.HostLayoutPrepared(ticket)) { return true; }
+        a.TracePreparationFailure(boundary);
+        a.AbortPreparationFrame();
+        return false;
+    }
+
+    internal void RenderPreparedFrame(App a) {
+        AppLoopRegistration ticket = hostLayoutRegistration;
+        if (!ContinueFormFrame(a, ticket)) { return; }
+        int top = a.ContentTop();
+        a.PhaseBegin();
+        a.RenderBackground(0, top, a.canvas.Width(), a.canvas.Height() - top, 0);
+        if (!ContinueFormFrame(a, ticket)) { return; }
+        a.PhaseEnd(0);
         this.RenderTree(a);
-        ModelHosts.WriteBackAll();
+        if (!ContinueFormFrame(a, ticket, "form-after-tree")) { return; }
+        if (!a.WriteBackModelHosts()) {
+            a.TracePreparationFailure("form-writeback");
+            a.AbortPreparationFrame(); return;
+        }
+        if (!ContinueFormFrame(a, ticket, "form-after-writeback")) { return; }
         a.PhaseEnd(3);
     }
 
@@ -394,21 +408,26 @@ public partial class Form : Control {
     // 输入根和尺寸重绘回调只在本次循环作用域内持有窗口。
     protected void RunScoped(Action loop) {
         App prior = App.frameApp;
-        Control priorRoot = UiDriver.root;
         Control priorInputRoot = app.rootControl;
         FrameBody priorBody = app.frameBody;
+        AppLoopRegistration priorLayout = hostLayoutRegistration;
+        AppLoopRegistration scopeLayout = app.RegisterLoopParticipant(this, new FormHostLayout(this));
+        hostLayoutRegistration = scopeLayout;
         try {
-            app.SetFrameBody(() => {
-                this.RenderFrame(app);
-                app.RenderChrome(title);
+            App scopeApp = app;
+            scopeApp.SetFrameBody(() => {
+                this.RenderPreparedFrame(scopeApp);
+                if (!this.ContinueFormFrame(scopeApp, scopeLayout)) { return; }
+                scopeApp.RenderChrome(title);
+                if (!this.ContinueFormFrame(scopeApp, scopeLayout)) { return; }
             });
             app.SetRootControl(this);
-            UiDriver.SetRoot(this);
             loop();
         } finally {
+            scopeLayout.Invalidate();
+            if (hostLayoutRegistration == scopeLayout) { hostLayoutRegistration = priorLayout; }
             app.SetRootControl(priorInputRoot);
             app.SetFrameBody(priorBody);
-            UiDriver.SetRoot(priorRoot);
             App.frameApp = prior;
         }
     }
@@ -418,25 +437,37 @@ public partial class Form : Control {
         app.Show();
         this.RunScoped(() => {
             while (app.isRunning) {
+                app.TraceFullPresent(5, true);
                 if (!app.ProcessEvent()) {
                     break;
                 }
+                app.TraceFullPresent(5, false);
+                app.TraceFullPresent(6, true);
                 if (frameHook != null) { frameHook(); }
+                app.TraceFullPresent(6, false);
                 app.PerfMark("sh.framehook");
+                app.TraceFullPresent(7, true);
                 ChildWindows.PumpAll();
+                app.TraceFullPresent(7, false);
                 app.PerfMark("sh.childpump");
+                app.TraceFullPresent(8, true);
                 ChildWindows.FoldDeadlines(app);
+                app.TraceFullPresent(8, false);
                 app.PerfMark("sh.deadlines");
+                app.TraceFullPresent(9, true);
                 this.PumpTasks();
+                app.TraceFullPresent(9, false);
                 app.PerfMark("sh.tasks");
                 app.PerfMark("sh.framegate");
+                app.TraceFullPresent(10, true);
                 if (!app.needsRedraw) {
+                    app.TraceFullPresent(11, true);
                     continue;
                 }
-                app.BeginFrame();
-                RenderFrame(app);
-                app.RenderChrome(title);
-                app.PresentFrame();
+                app.TraceFullPresent(10, false);
+                app.TraceFullPresent(12, true);
+                app.SafeFrame(app.frameBody);
+                app.TraceFullPresent(12, false);
                 ChildWindows.FoldDeadlines(app);
                 this.FoldTaskDeadlines();
             }
@@ -444,14 +475,89 @@ public partial class Form : Control {
         if (exitHook != null) { exitHook(); }
     }
 
-    // 极简快照与离屏渲染封装：自动步进单帧管线，无需外部手动管理
-    // Viewport、DPI、BeginOffscreenFrame、RenderFrame 与 EndOffscreenFrame。
+    // Input and snapshots borrow the same host layout and input root. A callback may
+    // replace either registration; only this scope's unchanged generation is restored.
+    private void WithOffscreenHost(Action<AppLoopRegistration> body) {
+        App a = this.app;
+        if (a == null || !a.isRunning || a.window.GetHandle() != 0) { return; }
+        AppLoopRegistration priorLayout = hostLayoutRegistration;
+        Control priorRoot = a.rootControl;
+        AppLoopRegistration ticket = a.RegisterLoopParticipant(this, new FormHostLayout(this));
+        hostLayoutRegistration = ticket;
+        int generation = ticket.generation;
+        int rootGeneration = a.inputRootGeneration;
+        bool changedRoot = priorRoot == null;
+
+        try {
+            if (changedRoot) {
+                rootGeneration = rootGeneration + 1;
+                a.SetRootControl(this);
+            }
+            Control scopeRoot = changedRoot ? this : priorRoot;
+
+            if (app == a && a.isRunning && hostLayoutRegistration == ticket
+                    && ticket.active && ticket.generation == generation
+                    && a.rootControl == scopeRoot && a.inputRootGeneration == rootGeneration) {
+                body(ticket);
+            }
+        } finally {
+            bool ownsTicket = app == a && hostLayoutRegistration == ticket;
+
+            bool current = ownsTicket && a.isRunning && ticket.active && ticket.generation == generation;
+            if (hostLayoutRegistration == ticket) {
+                hostLayoutRegistration = current && priorLayout != null
+                    && a.LiveLoopRegistration(priorLayout) ? priorLayout : null;
+            }
+            ticket.Invalidate();
+            if (ownsTicket && changedRoot && a.rootControl == this
+                    && a.inputRootGeneration == rootGeneration) {
+                a.SetRootControl(priorRoot);
+            }
+        }
+    }
+
+    private ControlInputHost offscreenInputHost;
+
+    // Keep gesture ownership across input turns. The adapter borrows this Form
+    // weakly so App -> input root cannot retain Form -> App in an ARC cycle.
+    public void ProcessOffscreenInput(int kind, int x, int y, int button,
+            int key, int mods, int flag) {
+        App a = this.app;
+        if (a == null || !a.isRunning || a.window.GetHandle() != 0) { return; }
+        Control root = a.rootControl;
+        if (root == null) {
+            if (offscreenInputHost == null) { offscreenInputHost = new ControlInputHost(this); }
+            offscreenInputHost.Bind(a);
+            root = a.rootControl;
+        }
+        if (root == null || (!root.ContainsInputControl(this) && !this.ContainsHostedControl(root))) {
+            throw new InvalidOperationException("Offscreen Form input requires a root hosted by this Form.");
+        }
+        this.WithOffscreenHost((AppLoopRegistration ticket) => {
+            a.ProcessOffscreenInput(kind, x, y, button, key, mods, flag);
+        });
+    }
+
+    // Snapshot rendering uses the standard host preparation without replaying input.
     Canvas CaptureSnapshot() {
-        if (this.app == null) { return null; }
-        this.app.BeginOffscreenFrame();
-        this.RenderFrame(this.app);
-        this.app.RenderChrome(this.title);
-        this.app.EndOffscreenFrame();
-        return this.app.canvas;
+        App a = this.app;
+        if (a == null) { return null; }
+        this.WithOffscreenHost((AppLoopRegistration ticket) => {
+            a.snapshotInputSilenceDepth = a.snapshotInputSilenceDepth + 1;
+            try {
+                a.BeginSnapshotFrame();
+                if (a.PrepareStandardHostFrame()) {
+                    this.RenderPreparedFrame(a);
+                    if (this.ContinueFormFrame(a, ticket)) { a.RenderChrome(this.title); }
+                    if (this.ContinueFormFrame(a, ticket)) { a.EndOffscreenFrame(); }
+                }
+            } catch (Exception error) {
+                a.AbortPreparationFrame();
+                throw error;
+            } finally {
+                a.snapshotInputSilenceDepth = a.snapshotInputSilenceDepth - 1;
+            }
+        });
+        return a.canvas;
     }
 }

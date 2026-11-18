@@ -1,0 +1,93 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui;
+
+// A plan owns only slot indices and scalar keys, never children or their owner.
+internal class ChildOrderPlan {
+    List<int> keys = new List<int>();
+    List<bool> included = new List<bool>();
+    List<int> slots = new List<int>();
+    List<int> work = new List<int>();
+
+    public int rebuilds;
+    public int sorts;
+    private bool ready;
+
+    private static bool Included(Control c, bool paint, bool grid) {
+        if (paint) { return true; }
+        int pos = c.StylePosition();
+        if (!c.StyleVisible() || pos == 2) { return false; }
+        if (grid) { return c.StyleDisplay() != 2; }
+        return !(pos == 0 && (c.mx != 0 || c.my != 0));
+    }
+
+    private bool Matches(Control owner, bool paint, bool grid) {
+        int n = owner != null ? owner.ChildCount() : 0;
+        if (!ready || keys.Count != n) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            Control c = owner.ChildAt(i);
+            int key = paint ? c.StyleZIndex() : c.StyleOrder();
+            if (keys[i] != key || included[i] != ChildOrderPlan.Included(c, paint, grid)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public void Prepare(Control owner, bool paint, bool grid) {
+        if (this.Matches(owner, paint, grid)) { return; }
+        List<int> currentKeys = new List<int>();
+        List<bool> currentIncluded = new List<bool>();
+        if (owner != null) {
+            for (int i = 0; i < owner.ChildCount(); i = i + 1) {
+                Control c = owner.ChildAt(i);
+                currentKeys.Add(paint ? c.StyleZIndex() : c.StyleOrder());
+                currentIncluded.Add(ChildOrderPlan.Included(c, paint, grid));
+            }
+        }
+        ready = true;
+        rebuilds = rebuilds + 1;
+        // Replace, rather than mutate, so an enclosing traversal keeps its plan
+        // if a callback re-enters layout or input with different keys.
+        keys = currentKeys;
+        included = currentIncluded;
+        slots = new List<int>();
+        work = new List<int>();
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (included[i]) { slots.Add(i); work.Add(0); }
+        }
+        bool sorted = true;
+        for (int i = 1; i < slots.Count; i = i + 1) {
+            if (keys[slots[i - 1]] > keys[slots[i]]) { sorted = false; break; }
+        }
+        if (!sorted) { sorts = sorts + 1; this.Merge(0, slots.Count); }
+    }
+
+    private void Merge(int start, int end) {
+        if (end - start < 2) { return; }
+        int mid = start + (end - start) / 2;
+        this.Merge(start, mid);
+        this.Merge(mid, end);
+        int left = start;
+        int right = mid;
+        for (int i = start; i < end; i = i + 1) {
+            // Taking the left slot on equality preserves document order,
+            // including zero amongst positive and negative keys.
+            if (right >= end || (left < mid && keys[slots[left]] <= keys[slots[right]])) {
+                work[i] = slots[left];
+                left = left + 1;
+            } else {
+                work[i] = slots[right];
+                right = right + 1;
+            }
+        }
+        for (int i = start; i < end; i = i + 1) { slots[i] = work[i]; }
+    }
+
+    public List<Control> Project(Control owner) {
+        List<Control> result = new List<Control>();
+        for (int i = 0; i < slots.Count; i = i + 1) { result.Add(owner.ChildAt(slots[i])); }
+        return result;
+    }
+}

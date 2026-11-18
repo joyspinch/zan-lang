@@ -1,0 +1,289 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Compare cached backgrounds with the original shape painter, including alpha.
+// Foreground witnesses use standard retained panels, never a custom paint hook.
+class ShapeBackgroundCacheTest {
+    static int snapshots;
+    static int restores;
+    static int restoreKpx;
+    static int rounds;
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("Shape background cache: " + message); }
+    }
+
+    static void ResetStats() {
+        for (int i = 0; i <= 12; i = i + 1) { Canvas.RasterStat(i, 1); }
+    }
+
+    static int[] Pixels(App app) {
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        int[] pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) {
+                pixels[y * width + x] = app.canvas.GetPixel(x, y);
+            }
+        }
+        return pixels;
+    }
+
+    static void Exact(int[] actual, int[] expected, string message) {
+        Check(actual.Length == expected.Length, message + " dimensions");
+        for (int i = 0; i < actual.Length; i = i + 1) {
+            if (actual[i] != expected[i]) {
+                throw new Exception("Shape background cache: " + message
+                + " pixel=" + Convert.ToString(i) + " actual=" + Convert.ToString(actual[i])
+                + " expected=" + Convert.ToString(expected[i]));
+            }
+        }
+    }
+
+    static void Foreground(App app, Panel panel) {
+        if (panel == null) { return; }
+        panel.UseApp(app);
+        panel.MeasureTree(app);
+        panel.Arrange(app.Scale(32), app.Scale(28), app.Scale(48), app.Scale(28));
+        panel.RenderTree(app);
+    }
+
+    static int ClearColor(App app) {
+        if (app.shapeMode != 0) { return 0; }
+        return Style.Full(app, "windowbg", "", "", Style.SNormal()).BgOr(0);
+    }
+
+    static int[] Frame(App app, bool cached, Panel panel = null, Rect damage = null, int slot = 0) {
+        bool partial = damage != null;
+        app.partialFrame = partial;
+        if (partial) {
+            app.canvas.PushClip(damage.x, damage.y, damage.width, damage.height);
+            app.canvas.ClearRect(damage.x, damage.y, damage.width, damage.height, ClearColor(app));
+        } else {
+            app.canvas.Clear(ClearColor(app));
+        }
+        ResetStats();
+        try {
+            if (cached || app.shapeMode == 0) {
+                // Content coordinates intentionally omit shadow bands and titlebar:
+                // a shape snapshot must still cover the complete canvas.
+                app.RenderBackground(0, app.Scale(20), app.canvas.Width(),
+                app.canvas.Height() - app.Scale(20), slot);
+            } else {
+                if (app.shapeShadow > 0) { app.PaintShapeShadow(); }
+                app.PaintShapeFill();
+            }
+            snapshots = Canvas.RasterStat(8, 0);
+            restores = Canvas.RasterStat(9, 0);
+            restoreKpx = Canvas.RasterStat(9, 1);
+            rounds = Canvas.RasterStat(3, 0);
+            Foreground(app, panel);
+        } finally {
+            if (partial) { app.canvas.PopClip(); }
+            app.partialFrame = false;
+        }
+        return Pixels(app);
+    }
+
+    static void Rebuilt(App app, string message) {
+        int[] actual = Frame(app, true);
+        Check(snapshots == 1 && restores == 0, message + " rebuilds snapshot");
+        Exact(actual, Frame(app, false), message + " original pixels");
+        int[] hit = Frame(app, true);
+        Check(snapshots == 0 && restores == 1 && rounds == 0, message + " subsequent hit");
+        Exact(hit, actual, message + " hit pixels");
+    }
+
+    static App Fixture() {
+        App app = App.CreateOffscreen("shape background cache", 160, 120);
+        app.SetChromeVisible(false);
+        app.SetBackdropFx(false);
+        app.UseAppCss("windowbg::shape { background: rgba(40,80,120,0.88235294); }"
+        + "windowbg::shape-shadow { background: rgba(12,24,36,0.4); }");
+        app.SetWindowShape(WindowShapeDescription.FromRoundedRect(144, 104, 16).WithShadow(8));
+        app.SetOffscreenViewport(160, 120, 100);
+        return app;
+    }
+
+    static void ColdPartial() {
+        App app = Fixture();
+        try {
+            Panel panel = new Panel("cold foreground").Plain(0xFFBC7135);
+            Frame(app, false, panel);
+            Frame(app, true, panel, new Rect(0, 0, 20, 20));
+            Check(snapshots == 0 && restores == 0, "first partial frame defers snapshot capture");
+            Rebuilt(app, "first complete frame after cold partial");
+        } finally { app.canvas.Destroy(); }
+    }
+
+    static void StableAndPartial(App app) {
+        Rebuilt(app, "initial rounded translucent shape");
+        int[] background = Frame(app, true);
+        Check(background[0] == 0, "transparent corner stays transparent");
+        int alpha = (background[60 * 160 + 80] >> 24) & 255;
+        Check(alpha > 0 && alpha < 255, "fixture exercises a translucent fill");
+        bool shadow = false;
+        for (int y = 0; y < 8; y = y + 1) {
+            for (int x = 0; x < 160; x = x + 1) {
+                if (((background[y * 160 + x] >> 24) & 255) > 0) { shadow = true; }
+            }
+        }
+        Check(shadow, "fixture has nonzero shadow outside content");
+        Panel panel = new Panel("foreground").Plain(0xFFB86828);
+        int[] withPanel = Frame(app, true, panel);
+        Check(withPanel[40 * 160 + 50] != background[40 * 160 + 50], "standard panel paints foreground");
+        Rect damage = new Rect(24, 24, 64, 40);
+        int[] partial = Frame(app, true, panel, damage);
+        Check(restores == 1 && snapshots == 0 && rounds == 0, "partial hit restores without shape painting");
+        Check(restoreKpx == damage.width * damage.height / 1000, "restore work obeys dirty clip");
+        Exact(partial, withPanel, "partial hit preserves complete frame");
+        Frame(app, true, panel, new Rect(0, 0, 160, 12));
+        Check(restores == 1 && rounds == 0, "shadow strip restores from full canvas snapshot");
+        Exact(Pixels(app), withPanel, "shadow strip exact alpha");
+        Exact(Frame(app, true), background, "cache never contains foreground panel");
+    }
+
+    static void PartialMiss(App app) {
+        Panel panel = new Panel("old foreground").Plain(0xFFBC7135);
+        Frame(app, true, panel);
+        app.UseAppCss("windowbg::shape { background: rgba(100,50,90,0.88235294); }");
+        Rect damage = new Rect(0, 0, 20, 20);
+        int[] old = Pixels(app);
+        int[] partial = Frame(app, true, panel, damage);
+        Check(snapshots == 0 && restores == 0, "partial theme miss never captures unpainted pixels");
+        Check(app.canvas.GetPixel(50, 40) == old[40 * 160 + 50], "partial miss cannot expand draw clip");
+        Exact(partial, Frame(app, false, panel, damage), "partial miss follows original painter");
+        Rebuilt(app, "full frame after partial miss discards old foreground");
+        // A lost native snapshot must follow the same deferred path even with a matching key.
+        Frame(app, true, panel);
+        app.canvas.ReleaseSlot(0);
+        Frame(app, true, panel, damage);
+        Check(snapshots == 0 && restores == 0, "evicted partial miss defers capture");
+        Rebuilt(app, "full frame after eviction");
+    }
+
+    static void Invalidation(App app) {
+        int generation = app.bgThemeGen;
+        app.shapeRegions[1].radius = 22;
+        Rebuilt(app, "in place radius");
+        app.shapeRegions[1].x = 10;
+        Rebuilt(app, "in place x");
+        app.shapeRegions[1].y = 11;
+        Rebuilt(app, "in place y");
+        app.shapeRegions[1].width = 140;
+        Rebuilt(app, "in place width");
+        app.shapeRegions[1].height = 100;
+        Rebuilt(app, "in place height");
+        app.shapeRegions[1].kind = WindowShapeKind.Ellipse;
+        Rebuilt(app, "in place kind");
+        app.shapeRegions.Add(new WindowShapeRegion(1, 40, 16, 32, 24, 4));
+        Rebuilt(app, "region count and overlapping alpha");
+        app.shapeShadow = 12;
+        Rebuilt(app, "shadow size");
+        app.shapeOffX = 12;
+        Rebuilt(app, "shape x offset");
+        app.shapeOffY = 12;
+        Rebuilt(app, "shape y offset");
+        app.shapeRadius = 24;
+        Rebuilt(app, "effective shape radius");
+        app.shapeMode = 2;
+        Rebuilt(app, "shape mode");
+        app.shapeMode = 1;
+        Rebuilt(app, "shape mode restored");
+        app.metricsScale = app.metricsScale + 1;
+        Rebuilt(app, "metrics scale");
+        app.shapeSpec = app.shapeSpec + ";";
+        Rebuilt(app, "shape specification");
+        Check(app.bgThemeGen == generation, "geometry invalidation does not depend on theme generation");
+        app.bgThemeGen = app.bgThemeGen + 1;
+        Rebuilt(app, "theme generation");
+        app.theme.gradient = 1;
+        app.theme.bgGradTop = 0xFF203040;
+        app.theme.bgGradBottom = 0xFF506070;
+        Rebuilt(app, "gradient enabled");
+        app.theme.bgGradTop = 0xFF405060;
+        Rebuilt(app, "gradient top changes without theme generation");
+        app.theme.bgGradBottom = 0xFF708090;
+        Rebuilt(app, "gradient bottom changes without theme generation");
+        app.theme.glass = 1;
+        Rebuilt(app, "glass gradient mode");
+        Check(!app.FxActive(), "shape excludes dynamic full surface effects");
+        app.SetTheme(Theme.Light());
+        Rebuilt(app, "theme replacement");
+        Canvas oldCanvas = app.canvas;
+        app.canvas = new Canvas(oldCanvas.Width(), oldCanvas.Height());
+        oldCanvas.Destroy();
+        Rebuilt(app, "same size canvas replacement");
+        app.SetOffscreenViewport(160, 120, 125);
+        Rebuilt(app, "DPI change");
+        app.SetWindowShape(WindowShapeDescription.FromRoundedRect(176, 128, 12).WithShadow(8));
+        app.SetOffscreenViewport(192, 144, 125);
+        Rebuilt(app, "canvas resize");
+        Frame(app, true, null, null, 6);
+        Check(snapshots == 1 && restores == 0, "background slot changes invalidate key");
+        Rebuilt(app, "return to original slot");
+    }
+
+    static void ShapeSwitch(App app) {
+        app.SetWindowShape(WindowShapeDescription.FromRoundedRect(144, 104, 16).WithShadow(8));
+        app.SetOffscreenViewport(160, 120, 100);
+        Rebuilt(app, "shape restored after resize");
+        app.SetWindowShape("");
+        app.theme.gradient = 1;
+        app.theme.glass = 0;
+        app.theme.bgGradTop = 0xFF152535;
+        app.theme.bgGradBottom = 0xFF354555;
+        int[] wallpaper = Frame(app, true);
+        Check(snapshots == 1 && restores == 0, "rectangular wallpaper cannot restore shape slot");
+        int clearColor = ClearColor(app);
+        for (int y = 0; y < app.Scale(20); y = y + 1) {
+            for (int x = 0; x < app.canvas.Width(); x = x + 1) {
+                Check(wallpaper[y * app.canvas.Width() + x] == clearColor,
+                "wallpaper cold frame cannot paint outside its snapshot rectangle");
+            }
+        }
+        Exact(Frame(app, true), wallpaper, "rectangular wallpaper steady pixels");
+        app.SetWindowShape(WindowShapeDescription.FromRoundedRect(144, 104, 16).WithShadow(8));
+        Rebuilt(app, "shape cannot restore rectangular wallpaper slot");
+        app.SetWindowShape("");
+        Frame(app, true);
+        Panel panel = new Panel("wallpaper foreground").Plain(0xFF4A7B2C);
+        Frame(app, true, panel);
+        app.bgThemeGen = app.bgThemeGen + 1;
+        Frame(app, true, panel, new Rect(0, 20, 20, 20));
+        Check(snapshots == 0 && restores == 0, "wallpaper partial miss also defers shared snapshot");
+        int[] clean = Frame(app, true);
+        Check(snapshots == 1, "wallpaper full successor rebuilds clean snapshot");
+        Exact(Frame(app, true), clean, "wallpaper cache excludes previous foreground");
+    }
+
+    static void LargeSurface() {
+        App app = App.CreateOffscreen("large shape background", 1920, 1194);
+        try {
+            app.SetBackdropFx(false);
+            app.UseAppCss("windowbg::shape { background: rgba(40,80,120,0.88235294); }");
+            app.SetWindowShape(WindowShapeDescription.FromRoundedRect(1920, 1194, 16));
+            Frame(app, true);
+            Check(snapshots == 1 && restores == 0 && rounds > 0, "large cold frame paints and snapshots");
+            Frame(app, true);
+            Check(snapshots == 0 && restores == 1 && rounds == 0, "large warm frame skips rounded fill");
+            Check(restoreKpx == 1920 * 1194 / 1000, "large warm frame records full restore work");
+            Check(Canvas.RasterStat(1, 0) == 0, "large warm frame removes repeated alpha blend fill");
+        } finally { app.canvas.Destroy(); }
+    }
+
+    static void Main() {
+        Canvas.SetBackend(RenderBackend.Cpu());
+        ColdPartial();
+        App app = Fixture();
+        try {
+            StableAndPartial(app);
+            PartialMiss(app);
+            Invalidation(app);
+            ShapeSwitch(app);
+        } finally { app.canvas.Destroy(); }
+        LargeSurface();
+        Console.WriteLine("SHAPE_BACKGROUND_CACHE_OK");
+    }
+}

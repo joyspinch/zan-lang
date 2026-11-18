@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 
@@ -13,8 +14,8 @@ namespace Gui.Widget;
 // vol.Change += () => { ... };   // 拖动过程中值变化时触发
 // 范围模式（值 = [Low, High] 区间，Naive UI range）：
 // rg.range = true;
-// rg.data = rangeModel.lo;       // 低值双向绑定
-// rg.dataHigh = rangeModel.hi;   // 高值双向绑定
+// rg.Value = rangeModel.lo;       // 低值双向绑定
+// rg.HighValue = rangeModel.hi;   // 高值双向绑定
 // rg.Low(); rg.High(); rg.SetRange(20, 70);
 // 标记刻度（Naive UI marks / step="mark"）：
 // sl.AddMark(20, "20°C"); sl.AddMark(37, "37°C");
@@ -26,15 +27,8 @@ public class Slider : Control {
     public int minVal;
     public int maxVal;
     // 单值模式的值；range 模式下是低值（Naive UI value[0]）。
-    public SignalInt model;
-    // range 模式的高值（Naive UI value[1]）。
-    public SignalInt hiModel;
-    // 双向绑定值：`vol.data = settings.volume;` 保持模型
-    // 字段与滑块双向同步（编译器降级的 Binding）。
-    // range 模式绑定低值，高值走 dataHigh。
-    public Binding<int> data;
-    // range 模式高值的双向绑定。
-    public Binding<int> dataHigh;
+    public Binding<int> Value;
+    public Binding<int> HighValue;
     public Control trackNode;
     public Control fillNode;
     public Control thumbNode;
@@ -165,8 +159,9 @@ public class Slider : Control {
         // 横向默认 min 在左（rel 即进度）；竖向默认 min 在下
         // （要翻一次）。reverse 再翻一次 → 恰好是 vertical != reverse。
         if (vertical != reverse) { rel = len - rel; }
-        int f = rel * 1000 / len;
-        return this.Quantize(minVal + f * Span() / 1000);
+        if (len <= 0) { return this.Quantize(minVal); }
+        int delta = (int)(((long)rel * this.Span() + len / 2) / len);
+        return this.Quantize(minVal + delta);
     }
 
     // 气泡文案：tipFormat 里的 "{v}" 替换为值（Naive UI format-tooltip）。
@@ -177,13 +172,13 @@ public class Slider : Control {
     }
 
     // 公共初始化（各构造共用）。
-    private void InitSlider(int lo, int hi, SignalInt m) {
+    private void InitSlider(int lo, int hi) {
         this.InitControl("slider", 1);
         if (hi < lo) { hi = lo; }
         minVal = lo;
         maxVal = hi;
-        model = m;
-        hiModel = new SignalInt(hi);
+        Value = lo;
+        HighValue = hi;
         wiresOwnEvents = true;
         Change = new UiEvent();
         DragEnd = new UiEvent();
@@ -201,38 +196,36 @@ public class Slider : Control {
         dragThumb = 0;
         lastEdited = 1;
 
-        this.ClassName = "slider align-center";
-        trackNode = new Control { ClassName = "slider-track flex-1" };
+        this.ClassName = "slider";
+        trackNode = new Control { ClassName = "slider-track" };
         fillNode = new Control { ClassName = "slider-fill" };
         thumbNode = new Control { ClassName = "slider-thumb" };
         trackNode.Add(fillNode);
-        trackNode.Add(thumbNode);
         this.Add(trackNode);
+        this.Add(thumbNode);
     }
 
     public Slider() : this(0, 100) { }
 
-    // 自持信号：`Slider vol = new Slider(0, 100);`，之后通过 `.data` 双向绑定，
+    // 自持绑定：`Slider vol = new Slider(0, 100);`，之后通过 `.Value` 双向绑定，
     // 调用点无需任何信号接线。
     public Slider(int lo, int hi) {
-        InitSlider(lo, hi, new SignalInt(lo));
+        InitSlider(lo, hi);
     }
 
     // 当前值（单值模式即值，range 模式为低值）。
-    public int Value() { return model.Get(); }
 
     // range 模式的低值（单值模式与 Value() 相同）。
-    public int Low() { return model.Get(); }
+    public int Low() { return Value.Get(); }
 
     // range 模式的高值（单值模式返回同一个值）。
-    public int High() { return range ? hiModel.Get() : model.Get(); }
+    public int High() { return range ? HighValue.Get() : Value.Get(); }
 
     // 写入当前值（量化 + 同步双向绑定）。不触发 Change——
     // 程序化赋值不算用户手势。
     public void SetValue(int v) {
         v = this.Quantize(v);
-        model.Set(v);
-        if (data != null) { data.Set(v); }
+        Value.Set(v);
     }
 
     // 一次写入区间两端（各自量化并保持 low <= high）。
@@ -240,10 +233,8 @@ public class Slider : Control {
         lo = this.Quantize(lo);
         hi = this.Quantize(hi);
         if (hi < lo) { int tmp = lo; lo = hi; hi = tmp; }
-        model.Set(lo);
-        hiModel.Set(hi);
-        if (data != null) { data.Set(lo); }
-        if (dataHigh != null) { dataHigh.Set(hi); }
+        Value.Set(lo);
+        HighValue.Set(hi);
     }
 
     // 加一枚标记刻度（Naive UI marks 的成员）。同值重复添加覆盖
@@ -322,61 +313,56 @@ public class Slider : Control {
         return false;
     }
 
-    // 将绑定的模型值拉入本地信号，并同步声明式子节点（track/fill/thumb）几何位置。
+    public override string EffectiveClass() {
+        string classes = base.EffectiveClass();
+        if (vertical) { classes = classes + " vertical"; }
+        if (this.IsDisabled()) { classes = classes + " disabled"; }
+        return classes;
+    }
+
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            int cur = data.Get();
-            if (cur != model.Get()) { model.Set(cur); }
-        }
-        if (dataHigh != null) {
-            int cur = dataHigh.Get();
-            if (cur != hiModel.Get()) { hiModel.Set(cur); }
-        }
-        if (trackNode == null) { return; }
         if (range && hiThumbNode == null) {
             hiThumbNode = new Control { ClassName = "slider-thumb" };
-            trackNode.Add(hiThumbNode);
+            this.Add(hiThumbNode);
         }
-        int tw = trackNode.bw > 0 ? trackNode.bw : (bw > 0 ? bw : 160);
-        int th = trackNode.bh > 0 ? trackNode.bh : 6;
-        int tx = trackNode.bx > 0 ? trackNode.bx : bx;
-        int ty = trackNode.by > 0 ? trackNode.by : by + (bh - th) / 2;
-        int vLo = model.Get();
-        int vHi = range ? hiModel.Get() : vLo;
-        int fLo = this.FracOf(vLo);
-        int fHi = this.FracOf(vHi);
-        int pos = vertical ? ty : tx;
-        int len = vertical ? th : tw;
-        if (len < 1) { len = 1; }
-        int pLo = this.PxAt(fLo, pos, len);
-        int pHi = this.PxAt(fHi, pos, len);
-        int pStart = vertical ? (reverse ? ty : ty + th) : (reverse ? tx + tw : tx);
-        int fillA = range ? pLo : pStart;
+        if (hiThumbNode != null) { hiThumbNode.SetShown(range); }
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        base.Arrange(x, y, width, height);
+        int innerX = bx + this.StyleInsetL();
+        int innerY = by + this.StyleInsetT();
+        int innerW = Math.Max(0, bw - this.StyleInsetL() - this.StyleInsetR());
+        int innerH = Math.Max(0, bh - this.StyleInsetT() - this.StyleInsetB());
+        int thumbSize = Math.Min(Math.Min(innerW, innerH), thumbNode.StyleWidthIn(innerW));
+        int thickness = vertical ? trackNode.StyleWidthIn(innerW) : trackNode.StyleHeightIn(innerH);
+        thickness = Math.Min(thickness, vertical ? innerW : innerH);
+        int axisStart = (vertical ? innerY : innerX) + thumbSize / 2;
+        int axisLength = (vertical ? innerH : innerW) - thumbSize;
+        int pLo = this.PxAt(this.FracOf(Value.Get()), axisStart, axisLength);
+        int pHi = this.PxAt(this.FracOf(HighValue.Get()), axisStart, axisLength);
+        int fillA = range ? pLo : this.PxAt(0, axisStart, axisLength);
         int fillB = range ? pHi : pLo;
-        int fillMin = fillA < fillB ? fillA : fillB;
-        int fillMax = fillA < fillB ? fillB : fillA;
-        int fillSpan = fillMax - fillMin;
-        if (fillNode != null) {
-            if (vertical) {
-                fillNode.Arrange(tx, fillMin, tw, fillSpan > 0 ? fillSpan : 0);
-            } else {
-                fillNode.Arrange(fillMin, ty, fillSpan > 0 ? fillSpan : 0, th);
+        int fillStart = Math.Min(fillA, fillB);
+        int fillLength = Math.Max(fillA, fillB) - fillStart;
+        if (vertical) {
+            int center = innerX + innerW / 2;
+            int trackX = center - thickness / 2;
+            trackNode.Arrange(trackX, axisStart, thickness, axisLength);
+            fillNode.Arrange(trackX, fillStart, thickness, fillLength);
+            thumbNode.Arrange(center - thumbSize / 2, pLo - thumbSize / 2, thumbSize, thumbSize);
+            if (range && hiThumbNode != null) {
+                hiThumbNode.Arrange(center - thumbSize / 2, pHi - thumbSize / 2, thumbSize, thumbSize);
             }
-        }
-        int thumbSize = 14;
-        if (thumbNode != null) {
-            if (vertical) {
-                thumbNode.Arrange(tx + (tw - thumbSize) / 2, pLo - thumbSize / 2, thumbSize, thumbSize);
-            } else {
-                thumbNode.Arrange(pLo - thumbSize / 2, ty + (th - thumbSize) / 2, thumbSize, thumbSize);
-            }
-        }
-        if (range && hiThumbNode != null) {
-            if (vertical) {
-                hiThumbNode.Arrange(tx + (tw - thumbSize) / 2, pHi - thumbSize / 2, thumbSize, thumbSize);
-            } else {
-                hiThumbNode.Arrange(pHi - thumbSize / 2, ty + (th - thumbSize) / 2, thumbSize, thumbSize);
+        } else {
+            int center = innerY + innerH / 2;
+            int trackY = center - thickness / 2;
+            trackNode.Arrange(axisStart, trackY, axisLength, thickness);
+            fillNode.Arrange(fillStart, trackY, fillLength, thickness);
+            thumbNode.Arrange(pLo - thumbSize / 2, center - thumbSize / 2, thumbSize, thumbSize);
+            if (range && hiThumbNode != null) {
+                hiThumbNode.Arrange(pHi - thumbSize / 2, center - thumbSize / 2, thumbSize, thumbSize);
             }
         }
     }
@@ -398,61 +384,61 @@ public class Slider : Control {
 
     // 覆写：返回设计器属性清单（量程 / 值与高值 / 步长 / range、vertical、
     // reverse、标记与气泡等选项）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec lo = PropSpec.Int("min", "Minimum");
-        lo.num = minVal;
+        lo.Field("minVal", 1);
         ps.Add(lo);
         PropSpec hi = PropSpec.Int("max", "Maximum");
-        hi.num = maxVal;
+        hi.Field("maxVal", 1);
         ps.Add(hi);
-        PropSpec val = PropSpec.Int("value", "Value");
+        PropSpec val = PropSpec.Int("value", "Value").DefaultBinding();
         // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        if (data != null) { val.num = data; } else { val.snum = model; }
+        val.Field("Value", 1);
         val.Also("data");
         ps.Add(val);
         PropSpec valHi = PropSpec.Int("valueHigh", "High value");
-        if (dataHigh != null) { valHi.num = dataHigh; } else { valHi.snum = hiModel; }
+        valHi.Field("HighValue", 1);
         valHi.WithTip("Range mode's high thumb (Naive UI range value[1]).");
         ps.Add(valHi);
         PropSpec stp = PropSpec.Int("step", "Step");
-        stp.num = step;
+        stp.Field("step", 1);
         stp.WithTip("Drag/keyboard increment. 0 = any value (Naive UI step prop).");
         ps.Add(stp);
         PropSpec rng = PropSpec.Bool("range", "Range");
-        rng.flag = range;
+        rng.Field("range", 2);
         rng.WithTip("Dual thumbs; value = [Low, High] (Naive UI range).");
         ps.Add(rng);
         PropSpec vert = PropSpec.Bool("vertical", "Vertical");
-        vert.flag = vertical;
+        vert.Field("vertical", 2);
         vert.WithTip("Track stands up; needs a real height (Grow/Prefer).");
         ps.Add(vert);
         PropSpec rev = PropSpec.Bool("reverse", "Reverse");
-        rev.flag = reverse;
+        rev.Field("reverse", 2);
         rev.WithTip("Flip the track: min sits at the right / top end.");
         ps.Add(rev);
         PropSpec sm = PropSpec.Bool("stepMark", "Step on marks");
-        sm.flag = stepMark;
+        sm.Field("stepMark", 2);
         sm.WithTip("Restrict selectable values to marks (Naive UI step=\"mark\").");
         ps.Add(sm);
         PropSpec tip = PropSpec.Bool("tooltip", "Tooltip");
-        tip.flag = tooltip;
+        tip.Field("tooltip", 2);
         tip.WithTip("Show the value bubble while dragging / hovering a thumb.");
         ps.Add(tip);
         PropSpec stiff = PropSpec.Bool("showTooltip", "Always tooltip");
-        stiff.flag = showTooltip;
+        stiff.Field("showTooltip", 2);
         stiff.WithTip("Keep the value bubble visible (Naive UI show-tooltip).");
         ps.Add(stiff);
         PropSpec kb = PropSpec.Bool("keyboard", "Keyboard");
-        kb.flag = keyboard;
+        kb.Field("keyboard", 2);
         kb.WithTip("Arrow keys nudge the focused slider; Home/End jump.");
         ps.Add(kb);
         PropSpec fmt = PropSpec.Text("tipFormat", "Tooltip format");
-        fmt.str = tipFormat;
+        fmt.Field("tipFormat", 0);
         fmt.WithTip("Format-tooltip template; \"{v}\" becomes the value, e.g. \"{v}%\".");
         ps.Add(fmt);
         PropSpec mk = PropSpec.Text("marks", "Marks");
-        mk.str = marksSpec;
+        mk.Field("marksSpec", 0);
         mk.WithTip("Pipe-separated value=label pairs "
                    + "(e.g. \"0=cold|50=warm|100=hot\").");
         ps.Add(mk);
@@ -469,7 +455,7 @@ public class Slider : Control {
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "DragEnd") { DragEnd.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -477,7 +463,7 @@ public class Slider : Control {
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "DragEnd") { DragEnd.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
     public override void TriggerEvent(string evt) {
@@ -493,7 +479,7 @@ public class Slider : Control {
     }
 
     // Decorative children share the slider's input owner and focus.
-    public override Control HitTest(int x, int y, int pointerType) {
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         return this;
     }
@@ -502,23 +488,22 @@ public class Slider : Control {
         bool high = range && thumb == 2;
         if (value < minVal) { value = minVal; }
         if (value > maxVal) { value = maxVal; }
-        if (high && value < model.Get()) { value = model.Get(); }
-        if (!high && range && value > hiModel.Get()) { value = hiModel.Get(); }
-        int current = high ? hiModel.Get() : model.Get();
+        if (high && value < Value.Get()) { value = Value.Get(); }
+        if (!high && range && value > HighValue.Get()) { value = HighValue.Get(); }
+        int current = high ? HighValue.Get() : Value.Get();
         lastEdited = high ? 2 : 1;
         if (value == current) { return; }
-        if (high) { hiModel.Set(value); } else { model.Set(value); }
-        if (data != null) { data.Set(model.Get()); }
-        if (range && dataHigh != null) { dataHigh.Set(hiModel.Get()); }
+        if (high) { HighValue.Set(value); } else { Value.Set(value); }
         Change.RaiseS(this);
         app.RequestRedraw();
     }
 
     private void EditPointer(App app, RoutedEventArgs e) {
-        int pos = vertical ? by : bx;
-        int len = vertical ? bh : bw;
-        if (len < 1) { len = 1; }
-        this.EditValue(app, dragThumb, this.ValAt(vertical ? e.y : e.x, pos, len));
+        int start = vertical ? trackNode.by : trackNode.bx;
+        int length = vertical ? trackNode.bh : trackNode.bw;
+        if (length > 0) {
+            this.EditValue(app, dragThumb, this.ValAt(vertical ? e.y : e.x, start, length));
+        }
     }
 
     public override void OnPointerDown(RoutedEventArgs e) {
@@ -526,12 +511,13 @@ public class Slider : Control {
         if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) { return; }
         this.SyncBinding();
         dragThumb = 1;
-        int pos = vertical ? by : bx;
-        int len = vertical ? bh : bw;
+        int pos = vertical ? trackNode.by : trackNode.bx;
+        int len = vertical ? trackNode.bh : trackNode.bw;
+        if (len <= 0) { dragThumb = 0; return; }
         int point = vertical ? e.y : e.x;
         if (range) {
-            int lowDistance = point - this.PxAt(this.FracOf(model.Get()), pos, len);
-            int highDistance = point - this.PxAt(this.FracOf(hiModel.Get()), pos, len);
+            int lowDistance = point - this.PxAt(this.FracOf(Value.Get()), pos, len);
+            int highDistance = point - this.PxAt(this.FracOf(HighValue.Get()), pos, len);
             if (lowDistance < 0) { lowDistance = 0 - lowDistance; }
             if (highDistance < 0) { highDistance = 0 - highDistance; }
             if (highDistance < lowDistance) { dragThumb = 2; }
@@ -587,7 +573,7 @@ public class Slider : Control {
         if (key != 37 && key != 40 && key != 39 && key != 38 && key != 36 && key != 35) { return; }
         this.SyncBinding();
         int thumb = range && lastEdited == 2 ? 2 : 1;
-        int value = thumb == 2 ? hiModel.Get() : model.Get();
+        int value = thumb == 2 ? HighValue.Get() : Value.Get();
         if (key == 37 || key == 40) { value = this.StepDownVal(value); }
         if (key == 39 || key == 38) { value = this.StepUpVal(value); }
         if (key == 36) { value = minVal; }
@@ -597,7 +583,8 @@ public class Slider : Control {
     }
 
     // Retained children paint the track, fill and thumbs; input precedes paint.
+    public override int InputFocusCapabilities() { return 1; }
+
     public override void OnPaint(App app) {
-        if (!this.IsDisabled()) { app.focus.RegisterFocusable(this.WidgetId()); }
     }
 }

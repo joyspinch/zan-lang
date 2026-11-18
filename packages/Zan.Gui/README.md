@@ -65,6 +65,30 @@ roots (stdlib copies win if present):
 Browser components live in the separate `Zan.Gui.Browser` package (WebView /
 CefBrowser); `App` has no build-time dependency on it.
 
+`Form.Create` / `Run` provide the base window and system caption buttons.
+Optional services are installed by the application before `Run` or `App.Show`:
+
+```zan
+App app = form.GetApp();
+ThemeSettings.Enable(app);                // caption button and retained settings drawer
+Gui.Backend.UiDriver.Enable(app);          // ZAN_UI_SCRIPT, started after Show settles client metrics
+GuiFrameProfiler.EnableFromEnvironment(app); // ZAN_FRAME_PROF=1 frame log
+```
+
+Skin selection through `EnableSkins` / `ApplySkinName` works independently of
+the settings drawer. `ThemeSettings.Show(app)` opens that drawer directly;
+explicit legacy `ToggleThemeMenu` / `ShowThemeDrawer` calls remain available.
+Setting `ZAN_UI_SCRIPT` or `ZAN_FRAME_PROF` alone no longer installs an optional
+service into every window. `UiDriver.Begin(app)` remains the explicit start
+entry for automation clients whose window is already shown. Enabling UiDriver
+also opts into the frame profiler when `ZAN_FRAME_PROF=1` is set.
+
+`Form.Show`, `ChildWindow.SetView` and `UiViewScope.Bind` assemble the real
+`ModelBinder` for model paths, template rows and two-way binding. Hand-built
+windows can register their binder through `App.RegisterModelHost`; layout and
+writeback consume only the `AppModelHost` lifecycle contract and existing loop
+registration. Plain typed `Binding<T>` controls do not install a model engine.
+
 ## Native platform contracts
 
 `IPlatformWindow` and `IPlatformShell` select Win32 on Windows and the

@@ -1,0 +1,97 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class TextAreaPreparationInputTest {
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("TextArea preparation: " + label); }
+    }
+
+    static void Pointer(App app, int kind, int x, int y) {
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
+    }
+
+    static void Prepare(App app, TextArea area, int width, int height) {
+        area.MeasureTree(app, width);
+        area.Arrange(app.Scale(10), app.Scale(12), width, height);
+    }
+
+    static void Paint(App app, TextArea area) {
+        app.BeginOffscreenFrame();
+        area.RenderTree(app);
+        area.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+
+    static void Run(int dpi) {
+        App app = App.CreateOffscreen("textarea-prepare", 400, 300);
+        app.SetOffscreenViewport(400, 300, dpi);
+        TextArea area = new TextArea("hint");
+        area.SetProp("style", "font-size:16px;padding:8px;overflow-x:hidden;overflow-y:auto");
+        area.SetText("abcd");
+        area.UseApp(app);
+        app.SetRootControl(area);
+        Prepare(app, area, app.Scale(260), app.Scale(100));
+        Rect view = area.ScrollViewport();
+        int y = view.y + app.Scale(8);
+        int third = view.x + Canvas.MeasureText("abc", app.Scale(16)) - 1;
+        Pointer(app, 2, view.x, y);
+        Check("first Down uses prepared geometry", area.cursorPos == 0
+            && app.GetCapturedPointer() == area && area.IsFocused(app));
+        Pointer(app, 1, third, y);
+        Check("selection before any Paint", area.cursorPos == 3 && area.SelText() == "abc");
+        int anchor = area.selAnchor;
+        Paint(app, area);
+        Check("Paint does not change drag", area.cursorPos == 3 && area.selAnchor == anchor
+            && app.GetCapturedPointer() == area);
+        Pointer(app, 3, third, y);
+        Check("Up releases selection", app.GetCapturedPointer() == null && area.SelText() == "abc");
+
+        string lines = "";
+        for (int i = 0; i < 60; i = i + 1) { lines = lines + "line " + Convert.ToString(i) + "\n"; }
+        area.SetText(lines);
+        area.Blur();
+        Prepare(app, area, app.Scale(260), app.Scale(100));
+        view = area.ScrollViewport();
+        Check("content range exists before Paint", area.ScrollExtent() > view.height);
+        app.ProcessOffscreenInput(13, view.x + app.Scale(20), view.y + app.Scale(20), 0, 0 - 120, 0, 0);
+        int offset = area.ScrollTop();
+        Check("wheel commits without Paint", offset > 0);
+        Paint(app, area);
+        Paint(app, area);
+        Check("Paint cannot replay wheel", area.ScrollTop() == offset);
+
+        ScrollState metrics = new ScrollState();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int thumb = metrics.ThumbLength(app, view.height, area.ScrollExtent());
+        int start = metrics.ThumbStart(app, 0, view.height, area.ScrollExtent(), area.ScrollTop());
+        int barX = track.x + track.width / 2;
+        int barY = view.y + start + thumb / 2;
+        Pointer(app, 2, barX, barY);
+        Check("shared chrome captures", app.GetCapturedPointer() == area);
+        Pointer(app, 3, barX, view.y + view.height - 1);
+        Check("final Up commits without Move or Paint", area.ScrollTop() > offset
+            && app.GetCapturedPointer() == null);
+        offset = area.ScrollTop();
+        Paint(app, area);
+        Check("Paint preserves chrome offset", area.ScrollTop() == offset);
+
+        area.SetText("short");
+        Prepare(app, area, app.Scale(260), app.Scale(100));
+        Check("range shrink clamps during preparation", area.ScrollTop() == 0);
+        int rowCount = area.rows.Count;
+        Paint(app, area);
+        Check("Paint leaves prepared wrapping intact", area.rows.Count == rowCount
+            && area.ScrollTop() == 0);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        Run(100);
+        Run(150);
+        Run(200);
+        Console.WriteLine("TEXTAREAPREP PASS");
+    }
+}

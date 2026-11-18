@@ -1,0 +1,183 @@
+using System;
+using Gui;
+
+namespace Gui;
+
+class InitialShapeFillTest {
+    [DllImport("zan_gui", EntryPoint = "zan_gui_get_pixels")]
+    private static extern nint Pixels(int surfaceId);
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("initial shape fill: " + message); }
+    }
+
+    static void ResetStats() {
+        for (int i = 0; i <= 12; i = i + 1) { Canvas.RasterStat(i, 1); }
+    }
+
+    static void Exact(Canvas actual, int[] expected, string name) {
+        Span<int> pixels = new Span<int>(Pixels(actual.SurfaceId()), expected.Length);
+        for (int i = 0; i < expected.Length; i = i + 1) {
+            if (pixels[i] != expected[i]) {
+                throw new Exception(name + " pixel=" + Convert.ToString(i)
+                + " actual=" + Convert.ToString(pixels[i])
+                + " expected=" + Convert.ToString(expected[i]));
+            }
+        }
+    }
+
+    static int[] Capture(Canvas c) {
+        int count = c.Width() * c.Height();
+        Span<int> pixels = new Span<int>(Pixels(c.SurfaceId()), count);
+        int[] saved = new int[count];
+        for (int i = 0; i < count; i = i + 1) { saved[i] = pixels[i]; }
+        return saved;
+    }
+
+    static void Seed(Canvas c, int mode) {
+        Span<int> pixels = new Span<int>(Pixels(c.SurfaceId()), c.Width() * c.Height());
+        for (int i = 0; i < pixels.Length; i = i + 1) {
+            int a = mode == 0 ? 0 : (i & 255);
+            int rgb = ((i * 73 + 19) & 255) << 16;
+            rgb = rgb | (((i * 37 + 251) & 255) << 8) | ((i * 17 + 83) & 255);
+            pixels[i] = (a << 24) | rgb;
+        }
+    }
+
+    static void AlphaAndCoverage() {
+        Canvas old = new Canvas(37, 31);
+        Canvas actual = new Canvas(37, 31);
+        try {
+            // Every source alpha against every destination alpha, with changing
+            // straight RGB. Mode 0 also exercises nonzero hidden RGB at alpha 0.
+            for (int a = 0; a < 256; a = a + 1) {
+                int color = (a << 24) | (((a * 31 + 7) & 255) << 16)
+                | (((a * 71 + 89) & 255) << 8) | ((a * 53 + 193) & 255);
+                for (int mode = 0; mode < 2; mode = mode + 1) {
+                    for (int geometry = 0; geometry < 5; geometry = geometry + 1) {
+                        old.Clear(0);
+                        actual.Clear(0);
+                        Seed(old, mode);
+                        Seed(actual, mode);
+                        int radius = geometry == 0 ? 0 : geometry * 4;
+                        int x = geometry == 3 ? -5 : 1;
+                        int y = geometry == 4 ? -7 : 2;
+                        if (geometry == 2) {
+                            old.PushClip(3, 4, 27, 19);
+                            actual.PushClip(3, 4, 27, 19);
+                        }
+                        try {
+                            old.FillRoundRect(x, y, 35, 27, radius, color);
+                            actual.FillInitialShape(x, y, 35, 27, radius, color);
+                        } finally {
+                            if (geometry == 2) { old.PopClip(); actual.PopClip(); }
+                        }
+                        Exact(actual, Capture(old), "all alpha and AA");
+                    }
+                }
+            }
+        } finally { old.Destroy(); actual.Destroy(); }
+    }
+
+    static void WorkCounters() {
+        Canvas c = new Canvas(80, 40);
+        try {
+            c.Clear(0x00123456);
+            ResetStats();
+            c.FillInitialShape(0, 0, 80, 40, 0, 0xE1285078);
+            Check(Canvas.RasterStat(0, 2) == 3 && Canvas.RasterStat(1, 2) == 0,
+            "transparent target performs assignments, not blends");
+            Check(c.GetPixel(30, 20) == 0xE1285078, "assignment stays straight ARGB");
+            c.Clear(0xFF506070);
+            c.ClearRect(0, 0, 40, 40, 0x00778899);
+            ResetStats();
+            c.FillInitialShape(0, 0, 80, 40, 0, 0xE1285078);
+            Check(Canvas.RasterStat(0, 2) == 1 && Canvas.RasterStat(1, 2) == 1,
+            "mixed destination counts the actual assignment and blend runs");
+            c.Clear(0x00123456);
+            ResetStats();
+            c.FillInitialShape(0, 0, 80, 40, 0, 0x00112233);
+            Check(c.GetPixel(30, 20) == 0x00123456
+            && Canvas.RasterStat(0, 2) == 0 && Canvas.RasterStat(1, 2) == 0,
+            "zero source alpha does not touch hidden destination RGB");
+            c.Clear(0);
+            ResetStats();
+            c.FillInitialShape(0, 0, 80, 40, 8, 0xE1285078);
+            Check(Canvas.RasterStat(3, 0) == 1 && Canvas.RasterStat(3, 2) == 3
+            && Canvas.RasterStat(1, 2) == 0, "round call and extent stay visible");
+        } finally { c.Destroy(); }
+    }
+
+    static void OriginalShape(App app) {
+        if (app.shapeShadow > 0) { app.PaintShapeShadow(); }
+        int col = Style.Part(app, "windowbg", "shape", "", "", "", Style.SNormal()).BgOr(0);
+        for (int i = 0; i < app.shapeRegions.Count; i = i + 1) {
+            WindowShapeRegion reg = app.shapeRegions[i];
+            if (reg.kind == 3) { continue; }
+            int x = app.Scale(reg.x);
+            int y = app.Scale(reg.y);
+            int w = app.Scale(reg.width);
+            int h = app.Scale(reg.height);
+            int r = app.Scale(reg.radius);
+            if (r < 0) { r = 0; }
+            if (reg.kind == 2) { app.FillEllipse(x, y, w, h, col); }
+            else if (r > 0) { app.canvas.FillRoundRect(x, y, w, h, r, col); }
+            else { app.canvas.FillRect(x, y, w, h, col); }
+        }
+    }
+
+    static void BackgroundCase(int mode, int dpi) {
+        App app = App.CreateOffscreen("initial shape", 96, 80);
+        try {
+            app.SetChromeVisible(false);
+            app.SetBackdropFx(false);
+            app.UseAppCss("windowbg::shape { background: #e1285078; }"
+            + "windowbg::shape-shadow { background: #66102030; }");
+            WindowShapeDescription desc = WindowShapeDescription.FromRoundedRect(80, 64, 9);
+            if (mode == 1) { desc.regions.Add(new WindowShapeRegion(1, 18, 12, 60, 48, 8)); }
+            if (mode == 2) { desc = desc.WithShadow(8); }
+            if (mode == 4) { desc.regions[0].kind = WindowShapeKind.Ellipse; }
+            app.SetWindowShape(desc);
+            app.SetOffscreenViewport(96, 80, dpi);
+            app.partialFrame = mode == 3;
+            Canvas c = app.canvas;
+            c.Clear(0);
+            if (mode == 3) {
+                c.Clear(0xFFBC7135);
+                c.PushClip(7, 9, 39, 31);
+                c.ClearRect(7, 9, 39, 31, 0);
+            }
+            ResetStats();
+            app.RenderBackground(0, 0, c.Width(), c.Height(), 0);
+            int assigned = Canvas.RasterStat(0, 2);
+            int blended = Canvas.RasterStat(1, 2);
+            int[] actual = Capture(c);
+            if (mode == 3) { c.PopClip(); }
+            c.Clear(0);
+            if (mode == 3) {
+                c.Clear(0xFFBC7135);
+                c.PushClip(7, 9, 39, 31);
+                c.ClearRect(7, 9, 39, 31, 0);
+            }
+            OriginalShape(app);
+            if (mode == 3) { c.PopClip(); }
+            Exact(c, actual, "background branch exact");
+            if (mode == 0) {
+                Check(assigned > 0 && blended == 0, "single clear shape uses assignment");
+            } else if (mode != 4) {
+                Check(assigned == 0 && blended > 0, "overlap, shadow and partial keep old blend path");
+            }
+        } finally { app.canvas.Destroy(); }
+    }
+
+    static void Main() {
+        AlphaAndCoverage();
+        WorkCounters();
+        for (int mode = 0; mode < 5; mode = mode + 1) {
+            BackgroundCase(mode, 100);
+            BackgroundCase(mode, 150);
+            BackgroundCase(mode, 200);
+        }
+        Console.WriteLine("INITIAL_SHAPE_FILL_OK");
+    }
+}

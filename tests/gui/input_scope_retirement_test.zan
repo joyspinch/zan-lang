@@ -1,0 +1,396 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class InputScopeRetirementTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static InputScopeRetirementProbe Watch(App app, Control scope) {
+        InputScopeRetirementProbe probe = new InputScopeRetirementProbe();
+        probe.App = app; probe.Scope = scope;
+        probe.Token = app.WatchInputRetirement(scope, probe);
+        Check(probe.Token != null && probe.Token.IsActive(), "active scope registered");
+        return probe;
+    }
+    static Control Root(App app) {
+        Control root = new Control(); root.UseApp(app); app.SetRootControl(root); return root;
+    }
+    static void NoInputRemoval() {
+        App app = App.CreateOffscreen("scope removal", 640, 480); Control root = Root(app);
+        Control table = new Control(); Control editor = new Control();
+        Input a = new Input(""); Input b = new Input(""); Input outside = new Input("");
+        root.Add(table); table.Add(editor); editor.Add(a); editor.Add(b); root.Add(outside);
+        InputScopeRetirementProbe probe = Watch(app, editor);
+        a.Focus(app); b.Focus(app); outside.Focus(app); app.focus.ClearFocus();
+        Check(probe.Calls == 0 && probe.Token.IsActive(), "child focus transfer and ordinary blur preserve editor");
+        Check(app.GetCapturedPointer() == null, "fixture removes without capture");
+        table.Remove(editor);
+        Check(probe.Calls == 1 && probe.SawConsumed && !probe.Token.IsActive() && editor.parent == null,
+            "natural editor Remove synchronously retires without focus or capture");
+        app.ReleaseInputSubtree(editor); Check(probe.Calls == 1, "old token notified at most once");
+        table.Add(editor); probe = Watch(app, editor); root.Remove(table);
+        Check(probe.Calls == 1 && table.parent == null, "ancestor Remove synchronously retires editor scope");
+        root.Add(table); probe = Watch(app, editor); app.ReleaseInputSubtree(table);
+        Check(probe.Calls == 1 && editor.parent == table, "explicit ancestor retirement notifies before structural removal");
+        probe = Watch(app, editor); app.CancelInputSubtree(table);
+        Check(probe.Calls == 0 && probe.Token.IsActive(), "cancel-only does not retire active scope");
+        probe.Token.Invalidate(); probe.Token.Invalidate(); app.ReleaseInputSubtree(table);
+        Check(probe.Calls == 0, "idempotent Invalidate unregisters silently");
+        probe = Watch(app, editor); probe.Reobserve = true;
+        table.Remove(editor);
+        Check(editor.parent == null && probe.Calls == 1 && probe.Replacement.IsActive(),
+            "Watch alone cannot veto natural Remove or grant new ownership");
+        probe.Replacement.Invalidate();
+        table.Add(editor);
+        InputScopeRetirementProbe other = Watch(app, table); probe = Watch(app, editor);
+        app.ReleaseInputSubtree(table);
+        Check(other.Calls == 1 && probe.Calls == 1 && !other.Token.IsActive() && !probe.Token.IsActive(),
+            "default group notifies every matching active scope exactly once");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void DrawLayer(App app, LayerState layer) {
+        layer.openMs = 0;
+        app.BeginOffscreenFrame();
+        Check(app.PrepareStandardHostFrame(), "scope layer frame prepares");
+        app.EndOffscreenFrame();
+    }
+    static void ModalAndHostedRoot() {
+        App app = App.CreateOffscreen("hosted modal editor", 640, 480); Control root = Root(app);
+        Input editor = new Input(""); root.Add(editor);
+        InputScopeRetirementProbe fallback = Watch(app, editor);
+        LayerState lower = new LayerState("lower", 100, 100, 300, 220);
+        Input lowerEditor = new Input(""); lower.SetBody(lowerEditor); lower.Open(app); DrawLayer(app, lower);
+        InputRootAdapter adapter = (InputRootAdapter)app.rootControl;
+        InputScopeRetirementProbe lowerScope = Watch(app, lowerEditor);
+        lowerEditor.Focus(app); app.CapturePointer(lowerEditor);
+        LayerState modal = LayerState.PromptWith("modal", "", 0, "", 3);
+        modal.Open(app); DrawLayer(app, modal);
+        Check(!app.rootControl.ContainsInputControl(editor) && app.rootControl.ContainsHostedControl(editor),
+            "real modal masks input but keeps fallback hosted");
+        Check(fallback.Calls == 0 && lowerScope.Calls == 0 && app.GetCapturedPointer() == null,
+            "real modal cancels lower input without retiring fallback or lower editor session");
+        modal.Close(app);
+        Check(fallback.Token.IsActive() && lowerScope.Token.IsActive(), "modal close preserves lower active sessions");
+        lower.Close(app); Check(lowerScope.Calls == 1, "real lower Layer close synchronously retires editor");
+        adapter.Detach(); Check(app.rootControl == root && fallback.Calls == 0, "adapter restores still-hosted fallback");
+        app.SetRootControl(new Control());
+        Check(fallback.Calls == 1 && fallback.SawConsumed, "root hosting loss synchronously retires scope");
+        app.canvas.Destroy();
+    }
+    static void Reentry() {
+        App app = App.CreateOffscreen("scope reentry", 640, 480); Control root = Root(app);
+        Input editor = new Input(""); root.Add(editor);
+        InputScopeRetirementProbe probe = Watch(app, editor); probe.Leaf = editor; probe.Renew = true;
+        app.ReleaseInputSubtree(editor);
+        Check(probe.Calls == 1 && probe.SawConsumed && probe.Replacement != null && probe.Replacement.IsActive(),
+            "old token consumed before callback and new token excluded from old snapshot");
+        Check(app.GetCapturedPointer() == editor && app.focus.IsFocused(editor.WidgetId()),
+            "last-position notification preserves callback-created input state");
+        probe.Renew = false; app.ReleaseInputSubtree(editor);
+        Check(probe.Calls == 2 && !probe.Replacement.IsActive(), "later explicit retirement consumes new token once");
+        InputRootAdapter adapter = new InputRootAdapter("scope test adapter"); adapter.Bind(app);
+        probe = Watch(app, editor); probe.Leaf = editor; probe.Adapter = adapter; probe.Reclaim = true;
+        app.SetRootControl(new Control());
+        Check(app.rootControl == adapter && probe.Calls == 1 && probe.Replacement.IsActive(),
+            "real callback Bind reclaims old root and supersedes stale root commit");
+        probe.Reclaim = false; probe.Replacement.Invalidate(); app.CancelInputSubtree(editor); adapter.Detach();
+        probe = Watch(app, editor); probe.Reobserve = true;
+        app.SetRootControl(new Control());
+        Check(app.rootControl != root && probe.Calls == 1 && probe.Replacement.IsActive(),
+            "merely observing again has no veto over real root replacement");
+        probe.Replacement.Invalidate(); app.canvas.Destroy();
+    }
+    static void Throwing() {
+        App app = App.CreateOffscreen("scope throwing", 640, 480); Control root = Root(app);
+        Control scope = new Control(); root.Add(scope);
+        InputScopeRetirementProbe first = Watch(app, scope); InputScopeRetirementProbe second = Watch(app, scope);
+        Exception sentinel = new Exception("scope sentinel"); first.Failure = sentinel;
+        bool caught = false;
+        try { app.SetRootControl(new Control()); }
+        catch (Exception ex) { Check(ex == sentinel, "original exception object propagates"); caught = true; }
+        Check(caught && first.Calls == 1 && !first.Token.IsActive() && second.Calls == 0
+            && second.Token.IsActive() && app.rootControl == root,
+            "throw consumes only notified token and aborts root commit");
+        app.SetRootControl(new Control());
+        Check(second.Calls == 1 && !second.Token.IsActive(), "unvisited observer survives exception for later retry");
+        app.canvas.Destroy();
+    }
+    static InputRetirementToken WeakFixture(InputScopeWitness witness) {
+        App app = App.CreateOffscreen("weak scope", 16, 16); Control root = Root(app);
+        Control scope = new Control(); root.Add(scope); InputScopeRetirementProbe probe = Watch(app, scope);
+        witness.App = app; witness.Scope = scope; witness.Owner = probe;
+        app.canvas.Destroy(); return probe.Token;
+    }
+    static void ReviewLayerReentry() {
+        App app = App.CreateOffscreen("layer scope reentry", 640, 480); Root(app);
+        LayerState layer = new LayerState("reopen", 60, 60, 320, 240);
+        Input body = new Input(""); layer.SetBody(body); layer.Open(app); DrawLayer(app, layer);
+        InputScopeReviewProbe observer = new InputScopeReviewProbe();
+        observer.App = app; observer.Layer = layer; observer.Scope = body; observer.Reopen = true;
+        InputRetirementToken old = app.WatchInputRetirement(body, observer);
+        layer.Close(app);
+        Check(!old.IsActive() && observer.Calls == 1 && layer.open && !layer.closing
+            && !layer.closedRaised && observer.Replacement.IsActive(), "old Close preserves observer reopen");
+        Check(app.rootControl.ContainsInputControl(body) && app.GetCapturedPointer() == body
+            && app.focus.IsFocused(body.WidgetId()), "reopened Layer actually rebound input");
+        observer.Reopen = false; layer.open = false;
+        Check(observer.Calls == 2 && !observer.Replacement.IsActive(), "open=false retires reopened body");
+        layer.Open(app); DrawLayer(app, layer); observer.Reopen = true;
+        old = app.WatchInputRetirement(body, observer); layer.open = false;
+        Check(layer.open && observer.Calls == 3 && !old.IsActive() && observer.Replacement.IsActive(),
+            "direct open=false preserves callback reopening");
+        observer.Reopen = false; layer.Close(app);
+
+        layer = new LayerState("later endpoint", 60, 60, 320, 240);
+        body = new Input(""); layer.SetBody(body); layer.Open(app); DrawLayer(app, layer);
+        InputScopeRetirementProbe oldFooter = Watch(app, layer.windowFooter);
+        observer = new InputScopeReviewProbe(); observer.App = app; observer.Layer = layer;
+        observer.ReplaceFooter = true;
+        old = app.WatchInputRetirement(body, observer);
+        layer.CancelLayerInput();
+        Check(observer.Calls == 1 && !old.IsActive() && oldFooter.Calls == 1 && !oldFooter.Token.IsActive(),
+            "old endpoint group retires exactly once");
+        Check(observer.Replacement.IsActive() && app.rootControl.ContainsInputControl(observer.NewLeaf)
+            && app.GetCapturedPointer() == observer.NewLeaf && app.focus.IsFocused(observer.NewLeaf.WidgetId()),
+            "old group cannot retire callback replacement later endpoint");
+        observer.ReplaceFooter = false; layer.Close(app);
+        Check(observer.Calls == 2 && !observer.Replacement.IsActive(), "new later endpoint retires on actual close");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewRootObservers() {
+        App app = App.CreateOffscreen("two scope observers", 64, 64); Control root = Root(app);
+        Control scope = new Control(); root.Add(scope);
+        InputRootAdapter adapter = new InputRootAdapter("review adapter"); adapter.Bind(app);
+        InputScopeReviewProbe first = new InputScopeReviewProbe(); first.App = app; first.Adapter = adapter;
+        first.Reclaim = true;
+        InputRetirementToken firstToken = app.WatchInputRetirement(scope, first);
+        InputScopeRetirementProbe second = Watch(app, scope);
+        app.SetRootControl(new Control());
+        Check(first.Calls == 1 && !firstToken.IsActive() && second.Calls == 0 && second.Token.IsActive()
+            && app.rootControl == adapter, "first Bind supersedes old observer tail and root commit");
+        first.Reclaim = false;
+        firstToken = app.WatchInputRetirement(scope, first);
+        second.Token.Invalidate(); second = Watch(app, scope); first.Sibling = second.Token;
+        app.SetRootControl(new Control());
+        Check(first.Calls == 2 && !firstToken.IsActive() && second.Calls == 0 && !second.Token.IsActive(),
+            "observer invalidation skips unvisited sibling snapshot token");
+        root = Root(app); scope = new Control(); root.Add(scope); adapter = new InputRootAdapter("finally adapter");
+        adapter.Bind(app); first = new InputScopeReviewProbe(); first.Failure = new Exception("review finally");
+        firstToken = app.WatchInputRetirement(scope, first);
+        bool caught = false;
+        try { app.SetRootControl(new Control()); }
+        catch (Exception ex) { Check(ex == first.Failure, "same observer failure propagates"); caught = true; }
+        Check(caught && !firstToken.IsActive(), "throw consumed registration and propagated");
+        int generation = app.AdapterLifecycleRootGeneration(); adapter.Bind(app);
+        Check(app.AdapterLifecycleRootGeneration() == generation && app.rootControl == adapter,
+            "throw finally cleared pending root ticket before ordinary Bind");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static InputRetirementToken ReviewDeadOwner(App app, Control scope, InputScopeWitness witness) {
+        InputScopeRetirementProbe owner = new InputScopeRetirementProbe(); witness.Owner = owner;
+        return app.WatchInputRetirement(scope, owner);
+    }
+    static InputRetirementToken ReviewDeadScope(App app, InputScopeReviewProbe owner, InputScopeWitness witness) {
+        Control scope = new Control(); witness.Scope = scope;
+        return app.WatchInputRetirement(scope, owner);
+    }
+    static InputRetirementToken ReviewDeadApp(Control scope, InputScopeReviewProbe owner, InputScopeWitness witness) {
+        App app = App.CreateOffscreen("dead app only", 8, 8); witness.App = app;
+        InputRetirementToken token = app.WatchInputRetirement(scope, owner); app.canvas.Destroy(); return token;
+    }
+    static void ReviewWeakEndpoints() {
+        App app = App.CreateOffscreen("weak endpoints", 16, 16); Control root = Root(app);
+        Control scope = new Control(); root.Add(scope); InputScopeWitness witness = new InputScopeWitness();
+        InputRetirementToken deadOwner = ReviewDeadOwner(app, scope, witness);
+        Check(witness.Owner == null && deadOwner.IsActive(), "owner death does not keep owner or synchronously prune bit");
+        InputScopeReviewProbe owner = new InputScopeReviewProbe();
+        InputRetirementToken deadScope = ReviewDeadScope(app, owner, witness);
+        Check(witness.Scope == null && deadScope.IsActive(), "scope death does not keep scope or synchronously prune bit");
+        app.ReleaseInputSubtree(scope);
+        Check(!deadOwner.IsActive() && !deadScope.IsActive() && owner.Calls == 0,
+            "next retirement prunes dead endpoints without callback");
+        InputRetirementToken deadApp = ReviewDeadApp(scope, owner, witness);
+        Check(witness.App == null && deadApp.IsActive(), "token does not retain App while endpoints survive");
+        deadApp.Invalidate(); Check(!deadApp.IsActive() && owner.Calls == 0, "dead-App invalidation is silent");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewCancelBoundaries() {
+        App app = App.CreateOffscreen("scope Cancel boundaries", 640, 480); Root(app);
+        LayerState layer = LayerState.PromptWith("cancel group", "", 0, "", 3);
+        Button body = new Button("body"); layer.SetBody(body); layer.Open(app); DrawLayer(app, layer);
+        InputScopeCancelReview hooks = new InputScopeCancelReview(); hooks.App = app; hooks.Layer = layer;
+        hooks.Footer = layer.okBtn; body.OnRouted(hooks.Cancel); layer.okBtn.OnRouted(hooks.FooterCancel);
+        InputScopeRetirementProbe bodyScope = Watch(app, body);
+        InputScopeRetirementProbe promptScope = Watch(app, layer.promptInput);
+        InputScopeRetirementProbe footerScope = Watch(app, layer.dialogFooter);
+        app.ProcessOffscreenInput(2, body.bx + body.bw / 2, body.by + body.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == body, "real body Down captures before same-group Cancel");
+        hooks.RenderSame = true; layer.ReleaseLayerInput();
+        Check(hooks.Cancels == 1 && hooks.FooterCancels == 1 && app.GetCapturedPointer() == null
+            && !app.focus.IsFocused(layer.promptInput.WidgetId()),
+            "same-group Cancel remount does not spare later prompt and footer cleanup");
+        Check(bodyScope.Calls == 1 && promptScope.Calls == 1 && footerScope.Calls == 1,
+            "same-group Cancel remount notifies every old registration");
+        hooks.RenderSame = false; DrawLayer(app, layer);
+        bodyScope = Watch(app, body); promptScope = Watch(app, layer.promptInput); footerScope = Watch(app, layer.dialogFooter);
+        app.ProcessOffscreenInput(2, body.bx + body.bw / 2, body.by + body.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == body, "real body Down captures before throwing Cancel");
+        layer.promptInput.Focus(app); hooks.Failure = new Exception("scope cancel sentinel");
+        bool caught = false;
+        try { layer.ReleaseLayerInput(); }
+        catch (Exception ex) { Check(ex == hooks.Failure, "PointerCancel exception propagates unchanged"); caught = true; }
+        Check(caught && hooks.Cancels == 2 && app.GetCapturedPointer() == null
+            && app.focus.IsFocused(layer.promptInput.WidgetId()),
+            "throw retires old pointer before callback and leaves unvisited prompt input");
+        Check(bodyScope.Calls == 0 && promptScope.Calls == 0 && footerScope.Calls == 0
+            && bodyScope.Token.IsActive() && promptScope.Token.IsActive() && footerScope.Token.IsActive()
+            && hooks.Late.IsActive(), "Cancel failure skips Notify including newly registered token");
+        hooks.Failure = null; layer.ReleaseLayerInput();
+        Check(bodyScope.Calls == 1 && promptScope.Calls == 1 && footerScope.Calls == 1
+            && hooks.LateCalls == 1 && !hooks.Late.IsActive()
+            && !app.focus.IsFocused(layer.promptInput.WidgetId()),
+            "explicit retry retires remaining old endpoints and current registration group once");
+        layer.Close(app); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewHostingRecovery() {
+        App app = App.CreateOffscreen("Layer hosting recovery", 640, 480); Root(app);
+        LayerState layer = new LayerState("recovery", 60, 60, 320, 240);
+        Button body = new Button("body"); layer.SetBody(body); layer.Open(app); DrawLayer(app, layer);
+        InputRootAdapter adapter = (InputRootAdapter)app.rootControl;
+        Control originalBody = layer.inputBody; Control originalPrompt = layer.inputPrompt;
+        Control originalFooter = layer.inputFooter;
+        InputScopeRetirementProbe old = Watch(app, body);
+        Control replacement = new Control(); replacement.UseApp(app); app.SetRootControl(replacement);
+        Check(app.rootControl == replacement && old.Calls == 1 && !old.Token.IsActive()
+            && layer.open && layer.inputBody == originalBody && layer.inputPrompt == originalPrompt
+            && layer.inputFooter == originalFooter, "external root loss leaves same cached Layer endpoint group");
+        int lifetime = layer.inputGeneration;
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        DrawLayer(app, layer);
+        Check(app.rootControl == adapter && adapter.ContainsHostedControl(replacement)
+            && adapter.ContainsHostedControl(body) && adapter.ContainsInputControl(body)
+            && layer.inputGeneration == lifetime + 1,
+            "explicit same-group mount restores adapter and preserves new fallback");
+        InputScopeRetirementProbe current = Watch(app, body);
+        lifetime = layer.inputGeneration; DrawLayer(app, layer);
+        Check(layer.inputGeneration == lifetime && current.Calls == 0 && current.Token.IsActive(),
+            "already-linked same-group mount does not renew input lifetime");
+        app.ProcessOffscreenInput(2, body.bx + body.bw / 2, body.by + body.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == body, "restored Layer receives actual Down before explicit Bind");
+        adapter.Bind(app);
+        Check(app.rootControl == adapter && layer.inputGeneration == lifetime && current.Token.IsActive(),
+            "ordinary explicit Bind preserves same-group session");
+        layer.Close(app);
+        Check(current.Calls == 1 && !current.Token.IsActive() && app.GetCapturedPointer() == null,
+            "restored Layer still retires normally on Close");
+        app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewDialogFooterModes() {
+        App app = App.CreateOffscreen("dialog footer membership", 640, 480); Root(app);
+        LayerState layer = LayerState.PromptWith("footer modes", "", 0, "", 3);
+        Input body = new Input(""); layer.SetBody(body); layer.altText = "Other";
+        layer.Open(app); DrawLayer(app, layer);
+        Check(app.rootControl.ContainsInputControl(body) && app.rootControl.ContainsInputControl(layer.promptInput)
+            && app.rootControl.ContainsInputControl(layer.dialogFooter), "modal installs body prompt and footer in real input root");
+        Button ok = layer.okBtn; Button cancel = layer.cancelBtn; Button alt = layer.altBtn;
+        int okId = ok.WidgetId(); int cancelId = cancel.WidgetId(); int altId = alt.WidgetId();
+        InputScopeRetirementProbe bodyScope = Watch(app, body);
+        InputScopeRetirementProbe promptScope = Watch(app, layer.promptInput);
+        InputScopeRetirementProbe footerScope = Watch(app, layer.dialogFooter);
+        InputScopeRetirementProbe okScope = Watch(app, ok);
+        InputScopeRetirementProbe cancelScope = Watch(app, cancel);
+        InputScopeRetirementProbe altScope = Watch(app, alt);
+        layer.promptInput.Focus(app); app.CapturePointer(layer.promptInput);
+        layer.twoButtons = false; layer.altText = ""; DrawLayer(app, layer);
+        Check(bodyScope.Calls == 0 && bodyScope.Token.IsActive()
+            && promptScope.Calls == 0 && promptScope.Token.IsActive()
+            && app.focus.IsFocused(layer.promptInput.WidgetId()) && app.GetCapturedPointer() == layer.promptInput,
+            "footer removal preserves hosted body and prompt registrations and prompt input state");
+        Check(footerScope.Calls == 0 && footerScope.Token.IsActive() && okScope.Calls == 0 && okScope.Token.IsActive()
+            && cancelScope.Calls == 1 && !cancelScope.Token.IsActive() && altScope.Calls == 1 && !altScope.Token.IsActive()
+            && cancel.parent == null && alt.parent == null && layer.dialogFooter.ChildCount() == 1,
+            "only actually removed footer members retire, retained footer root and OK stay alive");
+        body.Focus(app); app.CapturePointer(body);
+        layer.twoButtons = true; layer.altText = "Other"; DrawLayer(app, layer);
+        Check(bodyScope.Calls == 0 && promptScope.Calls == 0 && okScope.Calls == 0 && footerScope.Calls == 0
+            && app.focus.IsFocused(body.WidgetId()) && app.GetCapturedPointer() == body,
+            "adding footer members preserves body focus and existing input registrations");
+        Check(layer.okBtn == ok && layer.cancelBtn == cancel && layer.altBtn == alt
+            && ok.WidgetId() == okId && cancel.WidgetId() == cancelId && alt.WidgetId() == altId
+            && layer.dialogFooter.ChildAt(0) == alt && layer.dialogFooter.ChildAt(1) == cancel
+            && layer.dialogFooter.ChildAt(2) == ok, "footer mode roundtrip preserves button identity and ordering");
+        cancelScope = Watch(app, cancel); altScope = Watch(app, alt);
+        ok.Focus(app); app.CapturePointer(ok); layer.twoButtons = false; DrawLayer(app, layer);
+        Check(cancelScope.Calls == 1 && !cancelScope.Token.IsActive() && altScope.Calls == 0 && altScope.Token.IsActive()
+            && okScope.Calls == 0 && okScope.Token.IsActive() && app.focus.IsFocused(okId) && app.GetCapturedPointer() == ok
+            && layer.dialogFooter.ChildAt(0) == alt && layer.dialogFooter.ChildAt(1) == ok,
+            "removing cancel preserves retained alternative and OK focus without detaching OK");
+        layer.Close(app); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewDialogFooterReentry() {
+        App app = App.CreateOffscreen("dialog footer reentry", 640, 480); Root(app);
+        LayerState layer = LayerState.PromptWith("footer reentry", "", 0, "", 3);
+        Input body = new Input(""); layer.SetBody(body); layer.altText = "Other";
+        layer.Open(app); DrawLayer(app, layer);
+        InputScopeRetirementProbe bodyScope = Watch(app, body);
+        InputScopeRetirementProbe promptScope = Watch(app, layer.promptInput);
+        InputScopeRetirementProbe okScope = Watch(app, layer.okBtn);
+        InputScopeRetirementProbe oldCancel = Watch(app, layer.cancelBtn);
+        InputScopeReviewProbe observer = new InputScopeReviewProbe();
+        observer.App = app; observer.Layer = layer; observer.Scope = layer.cancelBtn;
+        observer.RestoreDialogFooter = true;
+        InputRetirementToken oldAlt = app.WatchInputRetirement(layer.altBtn, observer);
+        int generation = layer.inputGeneration;
+        layer.altText = ""; layer.twoButtons = false; DrawLayer(app, layer);
+        Check(!oldAlt.IsActive() && observer.Calls == 1 && oldCancel.Calls == 1 && !oldCancel.Token.IsActive(),
+            "footer batch retires every removed old member exactly once across callback reentry");
+        Check(layer.inputGeneration > generation && layer.open && layer.twoButtons && layer.altText == "Renewed"
+            && layer.altBtn.parent == layer.dialogFooter && layer.cancelBtn.parent == layer.dialogFooter
+            && layer.okBtn.parent == layer.dialogFooter && layer.dialogFooter.ChildCount() == 3,
+            "old footer update cannot overwrite callback-renewed session membership");
+        Check(observer.Replacement != null && observer.Replacement.IsActive(), "renewed footer registration stays active");
+        Check(app.rootControl.ContainsInputControl(layer.cancelBtn), "renewed footer member stays in real input root");
+        Check(app.GetCapturedPointer() == layer.cancelBtn, "renewed footer capture survives old update tail");
+        Check(app.focus.IsFocused(layer.cancelBtn.WidgetId()), "renewed footer focus survives old update tail");
+        Check(bodyScope.Calls == 0 && bodyScope.Token.IsActive(), "footer renewal preserves body registration");
+        Check(promptScope.Calls == 0 && promptScope.Token.IsActive(), "footer renewal preserves prompt registration");
+        Check(okScope.Calls == 0 && okScope.Token.IsActive(), "footer renewal preserves OK registration");
+        layer.Close(app); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ReviewDialogFooterCancelReentry() {
+        App app = App.CreateOffscreen("dialog footer cancel reentry", 640, 480); Root(app);
+        LayerState layer = LayerState.PromptWith("footer cancel reentry", "", 0, "", 3);
+        Input body = new Input(""); layer.SetBody(body); layer.altText = "Other";
+        layer.Open(app); DrawLayer(app, layer);
+        InputScopeRetirementProbe bodyScope = Watch(app, body);
+        InputScopeRetirementProbe promptScope = Watch(app, layer.promptInput);
+        InputScopeRetirementProbe altScope = Watch(app, layer.altBtn);
+        InputScopeRetirementProbe cancelScope = Watch(app, layer.cancelBtn);
+        InputScopeCancelReview hooks = new InputScopeCancelReview(); hooks.App = app; hooks.Layer = layer;
+        hooks.RestoreDialogFooter = true; layer.altBtn.OnRouted(hooks.Cancel);
+        layer.altBtn.Focus(app); app.CapturePointer(layer.altBtn);
+        int generation = layer.inputGeneration;
+        layer.altText = ""; layer.twoButtons = false; DrawLayer(app, layer);
+        Check(hooks.Cancels == 1 && layer.inputGeneration > generation && layer.open
+            && layer.altText == "Cancel renewed" && layer.twoButtons
+            && layer.altBtn.parent == layer.dialogFooter && layer.cancelBtn.parent == layer.dialogFooter
+            && layer.okBtn.parent == layer.dialogFooter && layer.dialogFooter.ChildCount() == 3,
+            "PointerCancel reopening fences stale footer removal before any renewed member is detached");
+        Check(bodyScope.Calls == 0 && bodyScope.Token.IsActive() && promptScope.Calls == 0 && promptScope.Token.IsActive()
+            && altScope.Calls == 0 && altScope.Token.IsActive() && cancelScope.Calls == 0 && cancelScope.Token.IsActive()
+            && hooks.Late != null && hooks.Late.IsActive() && hooks.LateCalls == 0
+            && app.focus.IsFocused(layer.cancelBtn.WidgetId()) && app.GetCapturedPointer() == layer.cancelBtn,
+            "aborted footer removal keeps every still-hosted session and callback-created input state alive");
+        layer.Close(app); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent scope frame", 8, 8);
+        NoInputRemoval(); ModalAndHostedRoot(); Reentry(); Throwing();
+        ReviewDialogFooterModes(); ReviewDialogFooterReentry(); ReviewDialogFooterCancelReentry();
+        ReviewLayerReentry(); ReviewRootObservers(); ReviewWeakEndpoints(); ReviewCancelBoundaries(); ReviewHostingRecovery();
+        InputScopeWitness witness = new InputScopeWitness(); InputRetirementToken token = WeakFixture(witness);
+        Check(witness.App == null && witness.Scope == null && witness.Owner == null,
+            "externally retained token cannot retain App scope or observer");
+        token.Invalidate(); frame.canvas.Destroy();
+        Console.WriteLine("INPUT_SCOPE_RETIREMENT_OK");
+    }
+}

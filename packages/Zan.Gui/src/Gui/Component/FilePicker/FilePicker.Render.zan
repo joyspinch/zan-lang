@@ -7,19 +7,23 @@ using Gui.Widget;
 
 namespace Gui.Component;
 
-// 文件选择器渲染分片：纯声明式对象树与 Flex/Grid 现代盒模型。
-// 彻底物理消除所有 Canvas 手工即时模式绘制、AllocId 扁平号段与逐像素排版。
+// Paint consumes the prepared tree. Construction is called only from the
+// explicit BuildViewTree API or the UiViewScope preparation boundary.
 public partial class FilePicker {
     public void RenderWindow() {
-        if (!open || popup == null || !popup.needsRedraw) { return; }
-        popup.BeginFrame();
-        RenderContent(popup);
-        popup.RenderChrome(title);
-        popup.PresentFrame();
+        App app = popup;
+        if (!open || app == null || !app.needsRedraw) { return; }
+        app.BeginFrame();
+        if (!open || popup != app || !app.PrepareStandardHostFrame()) { return; }
+        RenderContent(app);
+        if (!open || popup != app) { return; }
+        app.RenderChrome(title);
+        app.PresentFrame();
     }
 
     public void RenderOverlay(App host) {
-        if (!open || !inlineMode) { return; }
+        if (!open || !inlineMode || inputHost == null || !inputHost.Current()
+                || !inputHost.Linked() || inputHost.HostApp() != host) { return; }
         Canvas hc = host.canvas;
         StyleBox ov = Style.Part(host, "dialog", "overlay", "", "", "",
                                  Style.SNormal());
@@ -29,31 +33,17 @@ public partial class FilePicker {
         RenderContent(host);
     }
 
-    public void RenderContent() {
-        this.RenderContent(this.App);
-    }
+    public void RenderContent() { this.RenderContent(this.App); }
     public void RenderContent(App app) {
         app = this.ResolveApp(app);
-        if (app == null || app.canvas == null) { return; }
-        if (this.viewTree == null || this.dirty) {
-            this.BuildViewTree(app);
-            this.dirty = false;
-        }
-        int W = app.canvas.Width();
-        int H = app.canvas.Height();
-        app.RenderBackground(0, 0, W, H, 6);
-        int top = app.ContentTop();
-        viewTree.MeasureTree(app);
-        viewTree.Arrange(0, top, W, H - top);
+        if (app == null || app.canvas == null || !open || inputHost == null
+                || !inputHost.Current() || !inputHost.Linked()
+                || inputHost.HostApp() != app || viewTree == null || dirty) { return; }
+        app.RenderBackground(0, 0, app.canvas.Width(), app.canvas.Height(), 6);
         viewTree.RenderTree(app);
     }
 
-    public void BuildViewTree() {
-        this.BuildViewTree(this.App);
-    }
-    public void BuildViewTree(App app) {
-        app = this.ResolveApp(app);
-        if (app == null) { return; }
+    private Control CreateViewTree(App app, FilePickerHost host, int revision) {
         Control root = new Control();
         root.ClassName = "filepicker-root col flex-1";
 
@@ -67,39 +57,29 @@ public partial class FilePicker {
         Button btnUp = new Button("");
         btnUp.ClassName = "filepicker-icon-btn";
         btnUp.Add(new IconView("arrow-up", 16));
-        btnUp.Click.Add(() => {
-            string p = FilePicker.ParentDirectory(FilePicker.Normalize(pathInput.GetText()));
-            this.Navigate(p);
-        });
+        btnUp.Click.Add(new FilePickerAction(this).Up);
         header.Add(btnUp);
 
         Button btnRefresh = new Button("");
         btnRefresh.ClassName = "filepicker-icon-btn";
         btnRefresh.Add(new IconView("refresh", 16));
-        btnRefresh.Click.Add(() => {
-            this.Navigate(pathInput.GetText());
-        });
+        btnRefresh.Click.Add(new FilePickerAction(this).Refresh);
         header.Add(btnRefresh);
 
         pathInput.ClassName = "filepicker-path flex-1";
         header.Add(pathInput);
+        if (!this.ViewBuildCurrent(host, revision)) { return null; }
 
         Input sBox = this.SearchBox();
         sBox.ClassName = "filepicker-search";
         sBox.hint = FilePicker.T("Filter by name...", "按名称筛选...");
-        sBox.Submit.Add(() => { this.MarkDirty(); });
         header.Add(sBox);
+        if (!this.ViewBuildCurrent(host, revision)) { return null; }
 
         Button btnNew = new Button(FilePicker.T("New Folder", "新建文件夹"));
         btnNew.ClassName = "filepicker-btn-new";
         btnNew.Add(new IconView("folder-plus", 16));
-        btnNew.Click.Add(() => {
-            creatingFolder = !creatingFolder;
-            if (creatingFolder) {
-                folderInput.SetText(FilePicker.T("New Folder", "新建文件夹"));
-            }
-            this.MarkDirty();
-        });
+        btnNew.Click.Add(new FilePickerAction(this).ToggleFolder);
         header.Add(btnNew);
 
         root.Add(header);
@@ -112,15 +92,13 @@ public partial class FilePicker {
             newBar.Add(newLbl);
             folderInput.ClassName = "flex-1";
             newBar.Add(folderInput);
+            if (!this.ViewBuildCurrent(host, revision)) { return null; }
             Button createBtn = new Button(FilePicker.T("Create", "创建"));
             createBtn.ClassName = "primary";
-            createBtn.Click.Add(() => { this.OnFolderSubmit(); });
+            createBtn.Click.Add(new FilePickerAction(this).SubmitFolder);
             newBar.Add(createBtn);
             Button cancelCreateBtn = new Button(FilePicker.T("Cancel", "取消"));
-            cancelCreateBtn.Click.Add(() => {
-                creatingFolder = false;
-                this.MarkDirty();
-            });
+            cancelCreateBtn.Click.Add(new FilePickerAction(this).CancelFolder);
             newBar.Add(cancelCreateBtn);
             root.Add(newBar);
         }
@@ -144,7 +122,8 @@ public partial class FilePicker {
             Button qb = new Button(qit.name);
             qb.ClassName = "filepicker-sidebar-item row align-center " + (FilePicker.SamePath(qpath, dir) ? "active" : "");
             qb.Add(new IconView(qit.icon != "" ? qit.icon : "folder", 16));
-            qb.Click.Add(() => { this.Navigate(qpath); });
+            FilePickerAction quick = new FilePickerAction(this, qpath);
+            qb.Click.Add(quick.Navigate);
             sidebar.Add(qb);
         }
 
@@ -158,7 +137,8 @@ public partial class FilePicker {
             Button rb = new Button(rpath);
             rb.ClassName = "filepicker-sidebar-item row align-center " + (FilePicker.SamePath(rpath, dir) ? "active" : "");
             rb.Add(new IconView("device-desktop", 16));
-            rb.Click.Add(() => { this.Navigate(rpath); });
+            FilePickerAction drive = new FilePickerAction(this, rpath);
+            rb.Click.Add(drive.Navigate);
             sidebar.Add(rb);
         }
 
@@ -195,62 +175,8 @@ public partial class FilePicker {
         } else {
             VirtualList vList = new VirtualList();
             vList.ClassName = "filepicker-vlist flex-1";
-            vList.SetRows(items.Count, (idx) => {
-                FilePickerItem it = items[idx];
-                string itemPath = it.path;
-                string itemName = it.name;
-                bool isDir = it.kind == 1;
-                bool multiPicked = allowMulti && this.InMultiSelection(idx, items);
-                bool isSel = selectedPath == itemPath || multiPicked;
-
-                Button rowBtn = new Button("");
-                rowBtn.ClassName = "filepicker-row row align-center " + (isSel ? "selected" : "");
-
-                if (allowMulti && !isDir) {
-                    Checkbox cb = new Checkbox();
-                    cb.SetChecked(multiPicked);
-                    rowBtn.Add(cb);
-                }
-
-                string icon = isDir ? "folder" : FilePicker.FileIconFor(itemName);
-                rowBtn.Add(new IconView(icon, 16));
-
-                Label nameLbl = new Label(itemName);
-                nameLbl.ClassName = "flex-1 text-ellipsis";
-                rowBtn.Add(nameLbl);
-
-                rowBtn.Click.Add(() => {
-                    if (isDir) {
-                        if (mode == 0) {
-                            nameInput.SetText(itemName);
-                            selectedPath = itemPath;
-                        }
-                    } else {
-                        if (allowMulti) {
-                            if (multiPicked) {
-                                this.RemoveSelectedPath(itemPath);
-                            } else {
-                                this.selectedPaths.Add(itemPath);
-                            }
-                        } else {
-                            nameInput.SetText(itemName);
-                            selectedPath = itemPath;
-                        }
-                    }
-                    this.MarkDirty();
-                });
-
-                rowBtn.OnDoubleClick(() => {
-                    if (isDir) {
-                        this.Navigate(itemPath);
-                    } else if (mode == 1) {
-                        selectedPath = itemPath;
-                        this.TryAccept();
-                    }
-                });
-
-                return rowBtn;
-            });
+            FilePickerAction rows = new FilePickerAction(this, items);
+            vList.SetRows(items.Count, rows.Row);
             mainArea.Add(vList);
         }
 
@@ -266,13 +192,12 @@ public partial class FilePicker {
 
         nameInput.ClassName = "filepicker-name flex-1";
         footer.Add(nameInput);
+        if (!this.ViewBuildCurrent(host, revision)) { return null; }
 
         Checkbox chkHidden = new Checkbox(FilePicker.T("Show hidden files", "显示隐藏文件"));
         chkHidden.SetChecked(showHidden.Get());
-        chkHidden.Change.Add(() => {
-            showHidden.Set(chkHidden.IsChecked());
-            this.MarkDirty();
-        });
+        FilePickerAction hidden = new FilePickerAction(this, chkHidden);
+        chkHidden.Change.Add(hidden.ChangeHidden);
         footer.Add(chkHidden);
 
         if (statusText != "") {
@@ -283,19 +208,16 @@ public partial class FilePicker {
 
         acceptBtn.Text = mode == 1 ? FilePicker.T("Open", "打开") : (mode == 2 ? FilePicker.T("Save", "保存") : FilePicker.T("Select", "选择"));
         acceptBtn.ClassName = "primary";
-        acceptBtn.Click.Add(() => { this.TryAccept(); });
         footer.Add(acceptBtn);
+        if (!this.ViewBuildCurrent(host, revision)) { return null; }
 
         cancelBtn.Text = FilePicker.T("Cancel", "取消");
         cancelBtn.ClassName = "secondary";
-        cancelBtn.Click.Add(() => { this.Close(); });
         footer.Add(cancelBtn);
+        if (!this.ViewBuildCurrent(host, revision)) { return null; }
 
         root.Add(footer);
 
-        this.viewTree = root;
-        if (popup != null) {
-            popup.SetRootControl(root);
-        }
+        return root;
     }
 }

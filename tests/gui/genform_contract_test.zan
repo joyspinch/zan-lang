@@ -12,6 +12,11 @@ class ContractRow {
 }
 
 class ContractDocWin : ChildWindow {
+    public void Attach(App app, Control tree, object model) {
+        host = app;
+        open = true;
+        this.SetView(tree, model);
+    }
 }
 
 class GenFormContractTest {
@@ -29,15 +34,26 @@ class GenFormContractTest {
         return c;
     }
 
+    static ModelBindingDeclaration FindBinding(Control c, string property) {
+        for (int i = 0; i < c.BindingCount; i = i + 1) {
+            ModelBindingDeclaration binding = c.BindingAt(i);
+            if (binding.Property == property) { return binding; }
+        }
+        throw new Exception("missing binding property " + property);
+    }
+
     static void Main() {
+        ControlBootstrap.Install();
         fails = 0;
         DataTableBootstrap.Install();
         string html = File.ReadAllText("tests/gui/genform_contract.html");
         HtmlDoc doc = Html.Parse(html, "", null);
         Control root = doc.root;
+        App app = App.CreateOffscreen("genform-contract", 400, 300);
+        app.UseAppCss(doc.css);
 
         Ok("HTML root and CSS", root is Element && root.Kind() == "body"
-            && root.Class == "document" && root.designCss.Contains("body.document"));
+            && root.Class == "document" && doc.css.Contains("body.document"));
         Element mixed = (Element)Ctl(root, "Mixed");
         Ok("htmlTag emits typed Element", mixed.Kind() == "span" && mixed.Class == "natural");
         Ok("mixed text preserved", mixed.elOrder != null && mixed.elOrder.Count == 3
@@ -45,9 +61,10 @@ class GenFormContractTest {
         Control action = Ctl(root, "Action");
         Ok("typed child identity", mixed.elOrder != null
             && mixed.elOrder[1].kid == action
-            && mixed.children[0] == action);
-        Ok("anchor and scalar metadata", action.designFloat
-            && action.designAnchor == 9 && action.logX == 3);
+            && mixed.ChildAt(0) == action);
+        StyleBox actionStyle = action.Box(app);
+        Ok("authored CSS positioning", actionStyle.position == 2 && actionStyle.posL == 3
+            && actionStyle.posT == 4 && actionStyle.width == 80 && actionStyle.height == 30);
         Ok("event argument", action.handlerArg == "row.id"
             && action.GetHandler("Click") == "Execute");
         Tabs tabs = (Tabs)Ctl(root, "Tabs");
@@ -61,13 +78,24 @@ class GenFormContractTest {
         Ok("input properties and unsupported metadata", entry.Class == "large"
             && entry.GetProp("required") == ""
             && entry.GetProp("placeholder") == "required entry");
-        Ok("binding retained", Ctl(root, "Left").bindPath == "left.value");
+        Control left = Ctl(root, "Left");
+        Ok("binding retained", left.BindingCount == 1
+            && left.BindingAt(0).Path == "left.value"
+            && left.BindingAt(0).Property == "" && left.BindingAt(0).TwoWay);
         Control modernModel = Ctl(root, "ModernModel");
-        Ok("modern z-model and z-show retained", modernModel.bindPath == "form.username"
-            && modernModel.bindIf == "form.isVip"
+        ModelBindingDeclaration modernValue = FindBinding(modernModel, "");
+        ModelBindingDeclaration modernVisible = FindBinding(modernModel, "visible");
+        Ok("modern value and visible bindings retained", modernModel.BindingCount == 2
+            && modernValue.Path == "form.username"
+            && modernValue.Property == "" && modernValue.TwoWay
+            && modernVisible.Path == "form.isVip"
+            && modernVisible.Property == "visible" && !modernVisible.TwoWay
             && modernModel.GetHandler("Change") == "OnUserChange");
         Control modernBtn = Ctl(root, "ModernBtn");
-        Ok("modern z-hide and dblclick retained", modernBtn.bindIf == "!form.loading"
+        ModelBindingDeclaration modernBtnVisible = FindBinding(modernBtn, "visible");
+        Ok("modern visible binding and dblclick retained", modernBtn.BindingCount == 1
+            && modernBtnVisible.Path == "form.notLoading"
+            && modernBtnVisible.Property == "visible" && !modernBtnVisible.TwoWay
             && modernBtn.GetHandler("DoubleClick") == "OnFastSubmit");
         Control gridCtl = Ctl(root, "Grid");
         DataGrid<ContractRow> typedGrid = (DataGrid<ContractRow>)gridCtl;
@@ -82,17 +110,16 @@ class GenFormContractTest {
             && typedGrid.gcols[1].desc.numeric
             && typedGrid.gcols[1].desc.summary == 1);
 
-        // 事件接线走运行期通道：宿主窗口 Wire() 把 data-on-click 名字
+        // 事件接线走运行期通道：宿主窗口 SetView() 把 data-on-click 名字
         // 接到同名 Handle 槽（含 data-arg 透传）。
         ContractDocWin w = new ContractDocWin();
         int calls = 0;
         w.Handle("Execute", () => { calls = calls + 1; });
         w.Handle("AnonymousExecute", () => { calls = calls + 10; });
-        w.SetRoot(root, JsonValue.Parse("{}"));
-        w.Wire();
+        w.Attach(app, root, JsonValue.Parse("{}"));
         ((Button)action).Click.Raise();
         Ok("event wiring retained", calls == 1);
-        Control last = root.children[root.children.Count - 1];
+        Control last = root.ChildAt(root.ChildCount() - 1);
         if (last is Button) {
             Button anonymous = (Button)last;
             anonymous.Click.Raise();

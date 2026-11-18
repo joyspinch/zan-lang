@@ -1,61 +1,247 @@
 using System;
+using System.Json;
 using Gui;
+using Gui.Backend;
+using Gui.Markup;
+using Gui.Widget;
 
 class WindowRoundRestoreTest {
     static void Assert(bool cond, string msg) {
-        if (!cond) {
-            Console.WriteLine("FAIL: " + msg);
-            throw new Exception("Assertion failed: " + msg);
+        if (!cond) { throw new Exception("Window shadow: " + msg); }
+    }
+
+    static void CheckShape(App app, int shadow) {
+        Assert(app.shapeMode == 1 && app.shapeRadius == 12, "rounded geometry retained");
+        Assert(app.shapeShadow == shadow && app.HasShadowBand(), "shadow band retained");
+        Assert(app.shapeOffX == shadow && app.shapeOffY == shadow, "content inset retained");
+    }
+
+    static void CheckPixels(App app) {
+        int x = app.ShapeOffX() / 2;
+        int y = app.canvas.Height() / 2;
+        int alpha = (app.canvas.GetPixel(x, y) >> 24) & 255;
+        Assert(alpha > 0 && alpha < 240, "shadow band has translucent pixels");
+        Assert(((app.canvas.GetPixel(app.canvas.Width() / 2, y) >> 24) & 255) == 255,
+        "rounded content stays opaque");
+        Assert(app.canvas.GetPixel(0, 0) == 0, "outside corner stays transparent");
+        WindowShapeMask mask = new WindowShapeMask();
+        byte[] coverage = mask.Coverage(app.canvas.Width(), app.canvas.Height(),
+        app.dpiScale, app.shapeRegions);
+        Assert(coverage != null && coverage[y * app.canvas.Width() + x] == 0,
+        "shadow lies outside interactive shape");
+        int layered = WindowShapeMask.LayeredArgb(app.canvas.GetPixel(x, y), 0, mask.HasShadowBand());
+        Assert(((layered >> 24) & 255) == alpha, "ULW conversion preserves shadow alpha");
+    }
+
+    static void Capture(Form form) {
+        App app = form.GetApp();
+        app.SetOffscreenViewport(160, 120, 100);
+        form.CaptureSnapshot();
+        CheckPixels(app);
+    }
+
+    static void OrdersAndHtml() {
+        Form before = Form.CreateOffscreen("shadow order", 160, 120);
+        Form after = Form.CreateOffscreen("shadow order", 160, 120);
+        Form declared = Form.CreateOffscreen("HTML shadow", 160, 120);
+        App first = before.GetApp();
+        App second = after.GetApp();
+        App htmlApp = declared.GetApp();
+        try {
+            first.SetWindowRoundCorners(true);
+            first.SetWindowShadow(10);
+            first.SetWindowShape("1,0,0,160,120,12");
+            second.SetWindowShape(WindowShapeDescription.FromRoundedRect(160, 120, 12));
+            second.SetWindowShadow(10);
+            CheckShape(first, 10);
+            CheckShape(second, 10);
+            Assert(first.shapeSpec == second.shapeSpec, "configuration order has identical geometry");
+            Capture(before);
+            Capture(after);
+            for (int y = 0; y < first.canvas.Height(); y = y + 1) {
+                for (int x = 0; x < first.canvas.Width(); x = x + 1) {
+                    Assert(first.canvas.GetPixel(x, y) == second.canvas.GetPixel(x, y),
+                    "configuration order has identical rendered pixels");
+                }
+            }
+
+            string html = "<body data-zan-design data-win-w=\"160\" data-win-h=\"120\""
+            + " data-win-shape=\"1\" data-win-shape-radius=\"12\" data-win-shadow=\"10\"></body>";
+            Designer designer = new Designer();
+            designer.LoadHtmlText(html);
+            FormBuilder.ConfigureWindow(htmlApp, JsonValue.ParseLenient(designer.SaveJson()));
+            CheckShape(htmlApp, 10);
+            Capture(declared);
+
+            string restoreSpec = first.shapeSpec;
+            first.SetWindowShape("");
+            Assert(first.shapeShadow == 0 && first.shapeOffX == 0 && !first.HasShadowBand(),
+            "clearing shape clears shadow");
+            first.SetWindowShape(restoreSpec);
+            CheckShape(first, 10);
+            Capture(before);
+            first.SetWindowShadow(0);
+            Assert(first.shapeShadow == 0 && first.shapeOffX == 0 && !first.HasShadowBand(),
+            "explicit zero removes shadow band");
+            first.SetWindowShape("");
+            first.SetWindowShadow(7);
+            first.SetWindowShape(WindowShapeDescription.FromRoundedRect(160, 120, 12).WithShadow(10));
+            CheckShape(first, 10);
+            Assert(first.windowRound, "shape transitions retain native corner preference");
+        } finally {
+            first.canvas.Destroy();
+            second.canvas.Destroy();
+            htmlApp.canvas.Destroy();
         }
     }
 
-    static void Main() {
-        App app = App.CreateOffscreen("WindowRoundRestoreTest", 800, 600);
+    static void SkinSurfaces() {
+        Form form = Form.CreateOffscreen("skin surface", 160, 120);
+        App app = form.GetApp();
+        try {
+            app.SetWindowShadow(10);
+            app.SetWindowShape("1,0,0,160,120,12");
+            app.EnableSkins();
+            string[] skins = new string[] { "porcelain", "graphite", "navy" };
+            for (int i = 0; i < skins.Length; i = i + 1) {
+                app.ApplySkinName(skins[i]);
+                Assert(app.SkinName() == skins[i], "real skin installed");
+                Capture(form);
+                int expected = App.WithAlpha(app.theme.bgPrimary, 255);
+                for (int row = 1; row <= 3; row = row + 1) {
+                    for (int column = 1; column <= 3; column = column + 1) {
+                        int pixel = app.canvas.GetPixel(40 * column, 30 + 20 * row);
+                        Assert(pixel == expected, "skin surface cannot expose the desktop");
+                    }
+                }
+                // The cached background must retain the same opaque substrate.
+                Capture(form);
+            }
+            // Explicit per-pixel translucency is still a shape style contract.
+            app.SetWindowShape("1,0,0,160,120,12");
+            app.UseAppCss("windowbg::shape { background: rgba(40,80,120,0.5); }");
+            form.CaptureSnapshot();
+            int alpha = (app.canvas.GetPixel(80, 80) >> 24) & 255;
+            Assert(alpha >= 127 && alpha <= 129, "explicit shape alpha is preserved");
+        } finally { app.canvas.Destroy(); }
+    }
 
-        // 1. 普通窗口 DWM 圆角偏好设置
-        app.SetWindowRoundCorners(true);
-        Assert(app.windowRound, "windowRound should be true");
+    static void SoftwareGlassSurface() {
+        Form form = Form.CreateOffscreen("software glass surface", 160, 120);
+        App app = form.GetApp();
+        try {
+            // Exercise composition without shipping a glass skin preset.
+            Theme glass = Theme.Dark();
+            glass.glass = 1;
+            glass.gradient = 1;
+            app.SetTheme(glass);
+            app.SetWindowShadow(10);
+            app.SetWindowShape("1,0,0,160,120,12");
+            Capture(form);
+            Assert(((app.theme.bgPrimary >> 24) & 255) < 255,
+            "glass fixture has translucent control surfaces");
+            app.SetWindowShape("");
+            form.CaptureSnapshot();
+            Assert(((app.canvas.GetPixel(80, 80) >> 24) & 255) == 255,
+            "software glass rectangular substrate remains opaque");
+        } finally { app.canvas.Destroy(); }
+    }
 
-        // 2. 异形/圆角规格与阴影配置
-        string originalSpec = "1,0,0,800,600,16";
-        app.SetWindowShape(originalSpec);
-        app.SetWindowShadow(12);
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetWindowThreadProcessId")]
+    static extern int GetWindowThreadProcessId(nint hwnd, nint processId);
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern int GetCurrentProcessId();
 
-        Assert(app.shapeMode == 1, "shapeMode should be 1");
-        Assert(app.shapeRadius == 16, "shapeRadius should be 16");
-        Assert(app.shapeShadow == 12, "shapeShadow should be 12");
-        Assert(app.shapeOffX == 12, "shapeOffX should be 12");
-        Assert(app.shapeOffY == 12, "shapeOffY should be 12");
-
-        // 3. 模拟最大化触发：规格清除与暂存
-        app.maxSavedShapeSpec = app.shapeSpec;
-        app.maxSavedShapeShadow = app.shapeShadow;
-        app.shapeShadow = 0;
-        app.SetWindowShape("");
-
-        Assert(app.shapeMode == 0, "shapeMode should be 0 when maximized");
-        Assert(app.shapeRadius == 0, "shapeRadius should be 0 when maximized");
-        Assert(app.shapeShadow == 0, "shapeShadow should be 0 when maximized");
-        Assert(app.shapeOffX == 0, "shapeOffX should be 0 when maximized");
-        Assert(app.shapeOffY == 0, "shapeOffY should be 0 when maximized");
-
-        // 4. 模拟退出最大化：还原原本的异形、圆角与阴影规格
-        string restoreSpec = app.maxSavedShapeSpec;
-        int restoreShadow = app.maxSavedShapeShadow;
-        app.maxSavedShapeSpec = "";
-        app.maxSavedShapeShadow = 0;
-        app.SetWindowShape(restoreSpec);
-        if (restoreShadow > 0) {
-            app.SetWindowShadow(restoreShadow);
+    static void Drain(App app) {
+        for (int i = 0; i < 256; i = i + 1) {
+            int result = app.PollOneEvent();
+            Assert(result >= 0, "window remains live");
+            if (result == 0) { return; }
         }
+        Assert(false, "native queue drains");
+    }
 
-        Assert(app.shapeMode == 1, "shapeMode restored to 1");
-        Assert(app.shapeRadius == 16, "shapeRadius restored to 16");
-        Assert(app.shapeShadow == 12, "shapeShadow restored to 12");
-        Assert(app.shapeOffX == 12, "shapeOffX restored to 12");
-        Assert(app.shapeOffY == 12, "shapeOffY restored to 12");
-        Assert(app.maxSavedShapeSpec == "", "maxSavedShapeSpec cleared after restore");
+    static void CheckNativePixels(App app) {
+        CheckShape(app, 10);
+        CheckPixels(app);
+        nint hwnd = app.WindowHandle();
+        nint pid = NativeMemory.Alloc(4);
+        try {
+            WindowRoundRestoreTest.GetWindowThreadProcessId(hwnd, pid);
+            Assert(new Span<int>(pid, 1)[0] == WindowRoundRestoreTest.GetCurrentProcessId(),
+            "assertions target this process HWND");
+        } finally { NativeMemory.Free(pid); }
+        Assert((Win32Shell.GetWindowLongPtrW(hwnd, -20) & 0x00080000) != 0,
+        "rounded Win10 window remains layered");
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        Assert(Win32Shell.lwBits != 0 && Win32Shell.lwW == width && Win32Shell.lwH == height,
+        "ULW bitmap matches current window");
+        int index = (height / 2) * width + app.ShapeOffX() / 2;
+        int alpha = (new Span<int>(Win32Shell.lwBits, width * height)[index] >> 24) & 255;
+        int source = (app.canvas.GetPixel(app.ShapeOffX() / 2, height / 2) >> 24) & 255;
+        Assert(alpha == source && alpha > 0 && alpha < 240, "submitted ULW shadow alpha retained");
+        int center = (new Span<int>(Win32Shell.lwBits, width * height)[(height / 2) * width + width / 2] >> 24) & 255;
+        Assert(center == 255, "submitted ULW content does not expose the desktop");
+    }
 
+    static void NativeRestore() {
+        App parent = new App("shadow parent", 160, 120);
+        ChildWindow child = new ChildWindow();
+        child.SetView(new Panel(), null);
+        try {
+            parent.Show();
+            child.OpenHost(parent);
+            App app = child.Host();
+            app.SetWindowShadow(10);
+            app.SetWindowShape("1,0,0,160,120,12");
+            Drain(app);
+            app.SyncSurface();
+            child.RequestRedraw();
+            child.Render();
+            CheckNativePixels(app);
+            Theme glass = Theme.Dark();
+            glass.glass = 1;
+            glass.gradient = 1;
+            app.SetTheme(glass);
+            child.RequestRedraw();
+            child.Render();
+            CheckNativePixels(app);
+            string original = app.shapeSpec;
+
+            app.window.ToggleMaximize();
+            Drain(app);
+            app.SyncSurface();
+            Assert(app.window.IsMaximized(), "real HWND maximized");
+            Assert(app.shapeMode == 0 && app.shapeShadow == 0 && !app.HasShadowBand(),
+            "maximized window removes shape and shadow");
+            Assert((Win32Shell.GetWindowLongPtrW(app.WindowHandle(), -20) & 0x00080000) == 0,
+            "maximized window restores opaque presentation");
+
+            app.window.ToggleMaximize();
+            Drain(app);
+            app.SyncSurface();
+            Assert(!app.window.IsMaximized(), "real HWND restored");
+            Assert(app.shapeSpec == original, "restore keeps exact geometry and one shadow band");
+            child.RequestRedraw();
+            child.Render();
+            CheckNativePixels(app);
+        } finally {
+            child.Close();
+            parent.window.Destroy();
+            parent.canvas.Destroy();
+        }
+    }
+    #endif
+
+    static void Main() {
+        OrdersAndHtml();
+        SkinSurfaces();
+        SoftwareGlassSurface();
+        #if WINDOWS
+        NativeRestore();
+        #endif
         Console.WriteLine("window-round-restore:pass");
     }
 }

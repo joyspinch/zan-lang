@@ -1,0 +1,216 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+namespace Gui.Component;
+
+public partial class FilePicker {
+    internal Control PreparationTestTree() { return viewTree; }
+    internal Input PreparationTestPath() { return pathInput; }
+    internal Input PreparationTestFolder() { return folderInput; }
+    internal Control PreparationTestSurface() { return inputHost != null ? inputHost.Surface() : null; }
+    internal void PreparationTestPopup(App app) {
+        this.BeginInline(app, 0, Directory.GetCurrentDirectory(), "", "", "popup fixture");
+        inlineMode = false; popup = app;
+    }
+    internal void PreparationTestDropPopup() { popup = null; }
+}
+
+class PickerPreparationHooks {
+    public weak FilePicker picker;
+    public weak App nextApp;
+    public int action;
+    public int cancels;
+    public int closed;
+    public void Cancel(Control sender, RoutedEventArgs args) {
+        if (args.eventName != "PointerCancel") { return; }
+        cancels = cancels + 1;
+        int next = action; action = 0;
+        if (next == 1) { picker.BindInline(nextApp); }
+        if (next == 2) {
+            picker.BeginInline(nextApp, 0, Directory.GetCurrentDirectory(), "", "", "renewed");
+        }
+        if (next == 3) { picker.HideInline(); }
+    }
+    public void Reopen() {
+        picker.BeginInline(nextApp, 0, Directory.GetCurrentDirectory(), "", "", "cancel reopened");
+    }
+    public void Closed() { closed = closed + 1; }
+}
+
+class FilePickerPreparationTest {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+    static Control Root(App app) {
+        Control root = new Control(); root.UseApp(app); app.SetRootControl(root); return root;
+    }
+    static void Prepare(App app) { app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0); }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        Check(control.bw > 0 && control.bh > 0, "prepared endpoint has input geometry");
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.DrainPosts();
+    }
+    static PickerPreparationHooks Capture(FilePicker picker, App app, int action) {
+        PickerPreparationHooks hooks = new PickerPreparationHooks();
+        hooks.picker = picker; hooks.nextApp = app; hooks.action = action;
+        Input path = picker.PreparationTestPath(); path.OnRouted(hooks.Cancel);
+        app.CapturePointer(path); path.Focus(app);
+        return hooks;
+    }
+    static void Begin(FilePicker picker, App app) {
+        picker.BeginInline(app, 0, Directory.GetCurrentDirectory(), "", "", "inline fixture");
+    }
+
+    static void FirstInputAndPurePaint() {
+        App app = App.CreateOffscreen("picker first input", 1000, 640);
+        Control fallback = Root(app); FilePicker picker = new FilePicker(); Begin(picker, app);
+        Check(picker.PreparationTestTree() == null, "binding owns input before constructing the view");
+        // Tab is the first real event: it constructs, arranges and focuses a real
+        // input without BeginFrame, RenderContent or Paint priming any geometry.
+        app.ProcessOffscreenInput(4, 0, 0, 0, 9, 0, 0);
+        Control first = picker.PreparationTestTree(); Input path = picker.PreparationTestPath();
+        Check(first != null && first.bw == app.canvas.Width() && first.bh > 0
+            && path.bw > 0 && path.bh > 0, "first input prepares the complete picker region");
+        Check(app.rootControl.ContainsInputControl(path) && !app.rootControl.ContainsInputControl(fallback),
+            "inline modal exposes picker input and masks ordinary host input");
+        Check(app.focus.focusedControl != null && first.ContainsInputControl(app.focus.focusedControl),
+            "first Tab focuses a picker endpoint");
+        Control header = first.ChildAt(0);
+        Click(app, header.ChildAt(4));
+        Check(picker.PreparationTestTree() == first, "input invalidates without building during its action");
+        Prepare(app);
+        Control rebuilt = picker.PreparationTestTree();
+        Check(rebuilt != first && rebuilt.ChildCount() == 4 && first.parent == null,
+            "next preparation replaces and retires the old tree");
+        Check(picker.PreparationTestFolder().bw > 0, "new-folder input is arranged before paint");
+        EqSubscriptions(picker, rebuilt);
+        picker.MarkDirty();
+        picker.RenderContent(app); picker.RenderOverlay(app);
+        Check(picker.PreparationTestTree() == rebuilt, "paint never constructs a dirty replacement");
+        Prepare(app);
+        Control prepared = picker.PreparationTestTree();
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame(), "picker frame preparation completes");
+        picker.RenderContent(app); picker.RenderOverlay(app); picker.RenderContent(app);
+        Check(picker.PreparationTestTree() == prepared, "repeated paint preserves prepared tree identity");
+        app.EndOffscreenFrame();
+        picker.Close();
+        Check(app.rootControl == fallback && app.GetCapturedPointer() == null,
+            "inline Close immediately restores the borrowed host root");
+        Release(app);
+    }
+    static void EqSubscriptions(FilePicker picker, Control tree) {
+        Control footer = tree.ChildAt(tree.ChildCount() - 1);
+        Check(picker.PreparationTestPath().Submit.Count() == 1 && picker.SearchBox().Submit.Count() == 1
+            && picker.PreparationTestFolder().Submit.Count() == 1
+            && footer.ChildAt(footer.ChildCount() - 2).Click.Count() == 1
+            && footer.ChildAt(footer.ChildCount() - 1).Click.Count() == 1,
+            "preparation preserves existing single subscriptions");
+    }
+
+    static void DirtyRetiresInput() {
+        App app = App.CreateOffscreen("picker retirement", 1000, 640); Root(app);
+        FilePicker picker = new FilePicker(); Begin(picker, app); Prepare(app);
+        PickerPreparationHooks hooks = Capture(picker, app, 0);
+        Control old = picker.PreparationTestTree();
+        picker.MarkDirty(); Prepare(app);
+        Check(hooks.cancels == 1 && app.GetCapturedPointer() == null && app.focus.focusedControl == null,
+            "dirty tree replacement retires old capture and focus exactly once");
+        Check(picker.PreparationTestTree() != old && old.parent == null,
+            "old tree is detached before reusable inputs move");
+        EqSubscriptions(picker, picker.PreparationTestTree());
+        picker.Close(); Release(app);
+    }
+
+    static void HiddenAndCrossApp() {
+        App a = App.CreateOffscreen("picker A", 1000, 640);
+        App b = App.CreateOffscreen("picker B", 1100, 700);
+        Control rootA = Root(a); Control rootB = Root(b);
+        FilePicker picker = new FilePicker(); Begin(picker, a); Prepare(a);
+        PickerPreparationHooks hooks = Capture(picker, a, 0);
+        Control old = picker.PreparationTestTree();
+        picker.BindInline(b);
+        Check(hooks.cancels == 1 && a.rootControl == rootA && a.GetCapturedPointer() == null,
+            "cross-App binding synchronously retires input in the previous App");
+        Prepare(a); Check(picker.PreparationTestTree() == old, "old App cannot prepare rebound picker");
+        Prepare(b);
+        Check(picker.App == b && picker.PreparationTestPath().FindApp() == b
+            && b.rootControl.ContainsInputControl(picker.PreparationTestPath())
+            && picker.PreparationTestTree().bw == b.canvas.Width(), "new App owns preparation and geometry");
+        picker.HideInline();
+        Check(picker.IsOpen() && b.rootControl == rootB, "hiding retires input without cancelling the result session");
+        old = picker.PreparationTestTree(); picker.MarkDirty(); Prepare(b);
+        picker.RenderOverlay(b);
+        Check(picker.PreparationTestTree() == old, "hidden picker has no preparation or paint tail");
+        picker.BindInline(b); Prepare(b);
+        Check(picker.PreparationTestTree() != old, "rebind after hiding restores first-input preparation");
+        Control replacement = new Control(); replacement.UseApp(b); b.SetRootControl(replacement);
+        Check(b.rootControl == replacement, "external root replacement is not superseded by retirement cleanup");
+        old = picker.PreparationTestTree(); picker.MarkDirty(); Prepare(b);
+        Check(picker.PreparationTestTree() == old, "replaced input owner retires its view registration");
+        picker.BindInline(b); Prepare(b); picker.Close();
+        Check(b.rootControl == replacement, "rebound owner restores the latest host root");
+        Release(a); Release(b);
+    }
+
+    static void CancelReentry() {
+        App a = App.CreateOffscreen("picker Cancel A", 1000, 640);
+        App b = App.CreateOffscreen("picker Cancel B", 1000, 640);
+        Control rootA = Root(a); Control rootB = Root(b);
+        FilePicker picker = new FilePicker(); Begin(picker, a); Prepare(a);
+        PickerPreparationHooks hooks = Capture(picker, a, 1); hooks.nextApp = b;
+        picker.MarkDirty(); Prepare(a);
+        Check(hooks.cancels == 1 && picker.App == b && a.rootControl == rootA,
+            "Cancel rebind fences an older tree rebuild");
+        Prepare(b);
+        Check(b.rootControl.ContainsInputControl(picker.PreparationTestPath()), "reentrant host owns live inputs");
+        hooks = Capture(picker, b, 2);
+        picker.HideInline(); Prepare(b);
+        Check(hooks.cancels == 1 && picker.IsOpen() && picker.App == b
+            && b.rootControl.ContainsInputControl(picker.PreparationTestPath()),
+            "Cancel reopen survives the old Hide unlink tail");
+        hooks = Capture(picker, b, 1);
+        Control claimed = b.rootControl;
+        b.SetRootControl(new Control());
+        Check(b.rootControl == claimed && hooks.cancels == 1,
+            "same-App Cancel rebind renews the input claim");
+        Prepare(b);
+        hooks = Capture(picker, b, 3);
+        picker.MarkDirty(); Prepare(b);
+        Check(hooks.cancels == 1 && b.rootControl == rootB,
+            "Cancel hide aborts stale tree reconstruction and restores fallback");
+        picker.BindInline(b); Prepare(b);
+        PickerPreparationHooks events = new PickerPreparationHooks(); events.picker = picker; events.nextApp = a;
+        picker.Cancelled.Add(events.Reopen); picker.Closed.Add(events.Closed);
+        picker.Close(); Prepare(a);
+        Check(picker.IsOpen() && picker.App == a && events.closed == 0
+            && a.rootControl.ContainsInputControl(picker.PreparationTestPath()),
+            "Cancelled reopen fences old Closed and retains the renewed session");
+        picker.Cancelled.Clear(); picker.Close();
+        Release(a); Release(b);
+    }
+
+    static void PopupInput() {
+        App app = App.CreateOffscreen("picker popup fixture", 1000, 640);
+        Control fallback = Root(app); FilePicker picker = new FilePicker(); picker.PreparationTestPopup(app);
+        // Uses the popup App's normal input phase, with an offscreen native
+        // surface so the regression does not open a desktop window.
+        Prepare(app);
+        Check(picker.WindowModeOpen() && picker.PreparationTestPath().bw > 0
+            && app.rootControl.ContainsInputControl(picker.PreparationTestPath()),
+            "popup App prepares and owns input before RenderWindow");
+        picker.Close();
+        Check(app.rootControl == fallback, "popup Close synchronously retires its input root");
+        picker.PreparationTestDropPopup(); Release(app);
+    }
+
+    public static void Main() {
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        FirstInputAndPurePaint(); DirtyRetiresInput(); HiddenAndCrossApp(); CancelReentry(); PopupInput();
+        Release(frame);
+        Console.WriteLine("filepicker_preparation_test OK");
+    }
+}

@@ -13,6 +13,10 @@ class PaletteChanges {
     public void Changed(Control sender) { Count = Count + 1; }
 }
 
+class PreparedPaletteModel {
+    public int Tint = 0xFF123456;
+}
+
 class ColorPickerInputLifecycleTest {
     static void Check(bool ok, string label) {
         if (!ok) { throw new Exception(label); }
@@ -40,7 +44,7 @@ class ColorPickerInputLifecycleTest {
         app.BeginOffscreenFrame();
         app.overlayHost.RenderAll(app);
         app.EndOffscreenFrame();
-        Check(panel.Children.Count == 7 && picker.inHex.parent == panel, "channels belong to palette tree");
+        Check(panel.ChildCount() == 7 && picker.inHex.parent == panel, "channels belong to palette tree");
         Check(picker.inHex.visible && !picker.inR.visible, "only selected format participates");
         int x = picker.inHex.bx + picker.inHex.bw / 2;
         int y = picker.inHex.by + picker.inHex.bh / 2;
@@ -57,7 +61,7 @@ class ColorPickerInputLifecycleTest {
         app.ProcessOffscreenInput(6, 0, 0, 0, 54, 0, 0);
         Check(picker.inHex.GetText() == "#123456", "channel edits before repaint");
         app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
-        Check(ColorPicker.RgbOf(picker.Value()) == 0x123456, "routed Enter submits to picker");
+        Check(ColorPicker.RgbOf(picker.Value.Get()) == 0x123456, "routed Enter submits to picker");
         app.CapturePointer(picker.inHex);
         picker.inputView = 0;
         panel.Arrange(panel.bx, panel.by, panel.bw, panel.bh);
@@ -75,6 +79,55 @@ class ColorPickerInputLifecycleTest {
         app.overlayHost.Show(app, picker, replacement);
         Check(app.GetCapturedPointer() == null && !picker.inR.IsFocused(app), "popup replacement releases channel state");
         app.overlayHost.Dismiss();
+        app.SetRootControl(null);
+    }
+
+    static void ExercisePrepared(App app) {
+        PreparedPaletteModel model = new PreparedPaletteModel();
+        ColorPicker picker = new ColorPicker();
+        picker.Value = model.Tint;
+        picker.Mode = "hex";
+        picker.open = true;
+        picker.UseApp(app);
+        app.SetRootControl(picker);
+        picker.MeasureTree(app);
+        picker.Arrange(20, 10, 180, 32);
+        Check(OverlayHost.IsActiveAnchor(app, picker) && picker.palettePanel != null,
+            "open state mounts popup during preparation before first paint");
+        Check(picker.CurrentRgb() == 0xFF123456, "measurement projects external color");
+        Check(picker.inHex.GetText() == "#123456FF", "popup preparation projects channel text");
+        picker.inHex.SetText("draft");
+        PaintPalette(app, picker.palettePanel);
+        Check(picker.inHex.GetText() == "draft", "palette paint preserves channel draft");
+        picker.palettePanel.Arrange(picker.palettePanel.bx, picker.palettePanel.by,
+            picker.palettePanel.bw, picker.palettePanel.bh);
+        Check(picker.inHex.GetText() == "#123456FF", "palette preparation synchronizes unfocused channel");
+        Input channel = picker.inHex;
+        Click(app, channel.bx + channel.bw / 2, channel.by + channel.bh / 2);
+        Check(channel.IsFocused(app), "prepared popup accepts first input without paint");
+        app.CapturePointer(channel);
+        Control popup = app.overlayHost.ActiveRoot();
+        model.Tint = 0xFFABCDEF;
+        picker.Disabled = true;
+        app.BeginOffscreenFrame();
+        picker.OnPaint(app);
+        picker.OnPaint(app);
+        app.EndOffscreenFrame();
+        Check(picker.CurrentRgb() == 0xFF123456 && picker.open
+                && app.overlayHost.ActiveRoot() == popup && app.GetCapturedPointer() == channel,
+            "trigger paint neither pulls model nor closes popup nor retires input");
+        picker.MeasureTree(app);
+        picker.Arrange(20, 10, 180, 32);
+        Check(picker.CurrentRgb() == 0xFFABCDEF && !picker.open
+                && app.overlayHost.ActiveRoot() == null && app.GetCapturedPointer() == null
+                && !channel.IsFocused(app), "disabled preparation closes popup and releases channel");
+        picker.Disabled = false;
+        picker.open = true;
+        picker.Arrange(40, 20, 160, 32);
+        Check(OverlayHost.IsActiveAnchor(app, picker), "prepared open can mount again");
+        picker.open = false;
+        picker.Arrange(40, 20, 160, 32);
+        Check(app.overlayHost.ActiveRoot() == null, "prepared closed state dismisses popup");
         app.SetRootControl(null);
     }
 
@@ -108,24 +161,24 @@ class ColorPickerInputLifecycleTest {
             int downCount = changes.Count;
             app.ProcessOffscreenInput(1, x + w / 2, y + h / 2, 0, 0, 0, 0);
             Check(changes.Count == downCount, "unchanged pointer point does not recommit");
-            int downValue = picker.Value();
+            int downValue = picker.Value.Get();
             app.ProcessOffscreenInput(3, x - 80, y + h + 80, 1, 0, 0, 0);
             Check(app.GetCapturedPointer() == panel && picker.dragPart == part &&
-                picker.Value() == downValue && changes.Count == downCount,
+                picker.Value.Get() == downValue && changes.Count == downCount,
                 "secondary release preserves primary drag without mutation");
             app.ProcessOffscreenInput(1, x + w + 80, y - 80, 0, 0, 0, 0);
             Check(app.GetCapturedPointer() == panel && picker.IsOpen(), "drag remains captured beyond popup and touch slop");
             if (part == 1) { Check(picker.sat == 1000 && picker.val == 1000, "SV outside clamps high"); }
             else if (part == 2) { Check(picker.hue == 359, "hue outside clamps high"); }
             else { Check(picker.alpha == 255, "alpha outside clamps high"); }
-            int value = picker.Value();
+            int value = picker.Value.Get();
             int count = changes.Count;
             app.mouseX = x - 100;
             app.mouseY = svY + app.Scale(148) + 100;
             app.focus.SetPressed(picker.wid + ColorPicker.AlphaOff());
             PaintPalette(app, panel);
             PaintPalette(app, panel);
-            Check(picker.Value() == value && changes.Count == count && picker.dragPart == part,
+            Check(picker.Value.Get() == value && changes.Count == count && picker.dragPart == part,
                 "paint cannot advance active drag or synthesize changes");
             app.focus.ClearPress();
             app.ProcessOffscreenInput(3, x - 80, y + h + 80, 0, 0, 0, 0);
@@ -133,10 +186,10 @@ class ColorPickerInputLifecycleTest {
             if (part == 1) { Check(picker.sat == 0 && picker.val == 0, "SV up applies final point"); }
             else if (part == 2) { Check(picker.hue == 0, "hue up applies final point"); }
             else { Check(picker.alpha == 0, "alpha up applies final point"); }
-            value = picker.Value();
+            value = picker.Value.Get();
             count = changes.Count;
             app.ProcessOffscreenInput(1, x + w, y, 0, 0, 0, 0);
-            Check(picker.Value() == value && changes.Count == count, "released move is inert");
+            Check(picker.Value.Get() == value && changes.Count == count, "released move is inert");
         }
     }
 
@@ -162,19 +215,19 @@ class ColorPickerInputLifecycleTest {
         int x = panel.bx + app.Scale(20);
         int y = panel.by + app.Scale(20);
         app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
-        int value = picker.Value();
+        int value = picker.Value.Get();
         int count = changes.Count;
         Control.RouteEvent(panel, new RoutedEventArgs("PointerCancel", panel, x, y));
         Check(app.GetCapturedPointer() == null && picker.dragPart == 0, "explicit cancellation releases capture");
         app.ProcessOffscreenInput(1, x + 80, y + 80, 0, 0, 0, 0);
-        Check(picker.Value() == value && changes.Count == count, "cancelled drag is inert");
+        Check(picker.Value.Get() == value && changes.Count == count, "cancelled drag is inert");
         app.ProcessOffscreenInput(3, x + 80, y + 80, 0, 0, 0, 0);
         app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
-        value = picker.Value(); count = changes.Count;
+        value = picker.Value.Get(); count = changes.Count;
         app.ProcessOffscreenInput(9, 0, 0, 0, 0, 0, 0);
         Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && !picker.IsOpen(), "focus loss cancels and dismisses");
         app.ProcessOffscreenInput(1, x + 80, y + 80, 0, 0, 0, 0);
-        Check(picker.Value() == value && changes.Count == count, "focus-loss drag is inert");
+        Check(picker.Value.Get() == value && changes.Count == count, "focus-loss drag is inert");
         picker.SetOpen(true);
         app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
         picker.SetOpen(false);
@@ -188,16 +241,16 @@ class ColorPickerInputLifecycleTest {
         app.overlayHost.Dismiss();
         picker.SetOpen(true);
         picker.Disabled = true;
-        value = picker.Value(); count = changes.Count;
+        value = picker.Value.Get(); count = changes.Count;
         Click(app, x, y);
-        Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.Value() == value && changes.Count == count,
+        Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.Value.Get() == value && changes.Count == count,
             "disabled picker rejects palette gesture before paint");
         picker.Disabled = false;
         app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
         picker.Disabled = true;
-        value = picker.Value(); count = changes.Count;
+        value = picker.Value.Get(); count = changes.Count;
         app.ProcessOffscreenInput(1, x + 80, y + 80, 0, 0, 0, 0);
-        Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.Value() == value && changes.Count == count,
+        Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.Value.Get() == value && changes.Count == count,
             "disable during drag releases without mutation");
         app.ProcessOffscreenInput(3, x + 80, y + 80, 0, 0, 0, 0);
         picker.Disabled = false;
@@ -219,16 +272,16 @@ class ColorPickerInputLifecycleTest {
         Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.alpha == 255 && changes.Count == count,
             "hiding alpha during drag cancels without commit");
         app.ProcessOffscreenInput(3, x + 80, alphaY, 0, 0, 0, 0);
-        value = picker.Value(); count = changes.Count;
+        value = picker.Value.Get(); count = changes.Count;
         Click(app, x, alphaY + app.Scale(6));
         Check(app.GetCapturedPointer() == null && picker.dragPart == 0 && picker.alpha == 255 && changes.Count == count,
             "hidden alpha strip cannot start a drag");
-        value = picker.Value(); count = changes.Count;
+        value = picker.Value.Get(); count = changes.Count;
         app.focus.SetPressed(picker.wid + ColorPicker.SvPanelOff());
         app.mouseX = panel.bx + panel.bw;
         app.mouseY = panel.by;
         PaintPalette(app, panel);
-        Check(picker.Value() == value && changes.Count == count && picker.dragPart == 0,
+        Check(picker.Value.Get() == value && changes.Count == count && picker.dragPart == 0,
             "paint cannot start drag from stale legacy pressed id");
         app.focus.ClearPress();
         int view = picker.inputView;
@@ -279,6 +332,7 @@ class ColorPickerInputLifecycleTest {
         ExerciseDrags(app, witness);
         Check(witness.Picker == null && witness.Panel == null && witness.Input == null, "drag lifecycle leaves no retained palette tree");
         ExerciseButtonTouch(app);
+        ExercisePrepared(app);
         Console.WriteLine("COLORPICKER_POINTER_DRAG_OK");
         ColorPalettePanel orphan = KeepPanel(app, witness);
         Check(witness.Picker == null && orphan.picker == null, "standalone panel borrows picker");

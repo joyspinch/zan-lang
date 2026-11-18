@@ -78,6 +78,10 @@ public partial class Control {
     // Capability declares behavior; eligibility follows the live input root.
     public virtual int InputFocusCapabilities() { return 0; }
 
+    // Native cursor presentation follows the current Control endpoint, never
+    // a paint-time numeric region. -1 means the platform default.
+    public virtual int PointerCursor() { return -1; }
+
     public bool InputFocusEligible(App app, Control root) {
         if (app == null || root == null || this.FindApp() != app
             || !root.StyleVisible() || root.IsDisabled()
@@ -85,21 +89,48 @@ public partial class Control {
         Control node = this;
         while (node != null) {
             if (!node.StyleVisible() || node.IsDisabled()) { return false; }
-            node = node.parent;
+            Control owner = node.parent;
+            if (owner != null && !owner.ChildInViewport(node)) { return false; }
+            node = owner;
         }
         return true;
     }
 
     // Called for Tab only, never for pointer Down. Borrowed roots override this
-    // alongside ContainsInputControl/FindInputFocus without adopting children.
+    // alongside ContainsInputControl/FindInputFocus without adopting childNodes.
     public virtual void CollectInputFocus(App app, List<Control> controls) {
         if (app == null || !this.StyleVisible() || this.IsDisabled()) { return; }
         if (this.FindApp() == app && (this.InputFocusCapabilities() & 1) != 0) {
             controls.Add(this);
         }
-        if (children != null) {
-            for (int i = 0; i < children.Count; i = i + 1) {
-                children[i].CollectInputFocus(app, controls);
+        if (childNodes != null) {
+            for (int i = 0; i < childNodes.Count; i = i + 1) {
+                Control child = childNodes[i];
+                if (this.ChildInViewport(child)) { child.CollectInputFocus(app, controls); }
+            }
+        }
+    }
+
+    // Like CollectInputFocus, these queries are public for automation backends in other namespaces.
+    // Click subscriptions declare pointer behavior independently of Tab capability.
+    // Read the existing slot: observing a decorative node must not allocate an event.
+    public bool HasInputClick() {
+        return extra != null && extra.Click != null && extra.Click.CountAll() > 0;
+    }
+
+    // Borrowing hosts expose their trees through LayoutChildren, but only the live
+    // routed root can admit an endpoint. Layout ownership alone grants no input.
+    public void CollectInputClicks(App app, Control root, List<Control> controls) {
+        if (app == null || root == null || !this.StyleVisible() || this.IsDisabled()) { return; }
+        if (this.HasInputClick() && this.InputFocusEligible(app, root) && !controls.Contains(this)) {
+            controls.Add(this);
+        }
+        List<Control> children = this.LayoutChildren();
+        if (children == null) { return; }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            Control child = children[i];
+            if (this.OwnsLayoutChild(child) && this.LayoutChildVisible(child) && this.ChildInViewport(child)) {
+                child.CollectInputClicks(app, root, controls);
             }
         }
     }
@@ -122,9 +153,11 @@ public partial class Control {
     public virtual Control FindInputFocus(App app) {
         if (app == null || !this.StyleVisible() || this.IsDisabled()) { return null; }
         if (this.IsFocused(app)) { return this; }
-        if (this.children != null) {
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                Control found = this.children[i].FindInputFocus(app);
+        if (this.childNodes != null) {
+            for (int i = 0; i < this.childNodes.Count; i = i + 1) {
+                Control child = this.childNodes[i];
+                if (!this.ChildInViewport(child)) { continue; }
+                Control found = child.FindInputFocus(app);
                 if (found != null) { return found; }
             }
         }
@@ -233,18 +266,6 @@ public partial class Control {
         return false;
     }
 
-    public bool IsClicked() {
-        return this.IsClicked(this.App);
-    }
-    public bool IsClicked(App app) {
-        app = this.ResolveApp(app);
-        if (app == null) { return false; }
-        int id = this.WidgetId();
-        if (id > 0 && app.Clicked(id)) { return true; }
-        if (commonId > 0 && app.Clicked(commonId)) { return true; }
-        return false;
-    }
-
     public bool IsFocused() {
         return this.IsFocused(this.App);
     }
@@ -252,8 +273,10 @@ public partial class Control {
         app = this.ResolveApp(app);
         if (app == null) { return false; }
         int id = this.WidgetId();
-        if (id > 0 && app.Focused(id)) { return true; }
-        if (commonId > 0 && app.Focused(commonId)) { return true; }
+        if (app.focus != null) {
+            if (id > 0 && app.focus.IsFocused(id)) { return true; }
+            if (commonId > 0 && app.focus.IsFocused(commonId)) { return true; }
+        }
         return false;
     }
 
@@ -286,7 +309,7 @@ public partial class Control {
     public virtual void OnClick(RoutedEventArgs e) {}
     public virtual void OnKeyDown(RoutedEventArgs e) { }
     public virtual void OnKeyUp(RoutedEventArgs e) { }
-    // Immediate semantic cleanup; business Focus/Blur events retain their frame protocol.
+    // Immediate semantic cleanup; FocusManager sends named Blur/Focus after committing the transition.
     public virtual void OnInputFocusLost() { }
     public virtual void OnTextInput(RoutedEventArgs e) { }
     public virtual void OnWheel(RoutedEventArgs e) { }

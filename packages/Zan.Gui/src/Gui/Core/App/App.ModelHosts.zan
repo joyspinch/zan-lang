@@ -1,0 +1,70 @@
+using System;
+using System.Collections.Generic;
+namespace Gui;
+
+public partial class App {
+    public void RegisterModelHost(AppModelHost binder) {
+        if (binder == null) { return; }
+        this.CheckLoopThread();
+        if (!this.isRunning) { throw new InvalidOperationException("App loop has stopped"); }
+        binder.Attach(this);
+    }
+
+    public void UnregisterModelHost(AppModelHost binder) {
+        if (binder == null || binder.HostApp() != this) { return; }
+        this.CheckLoopThread();
+        binder.Detach();
+    }
+
+    private bool LiveModelHost(AppLoopRegistration ticket) {
+        if (!LiveLoopRegistration(ticket) || !(ticket.owner is AppModelHost)) { return false; }
+        AppModelHost binder = (AppModelHost)ticket.owner;
+        if (binder.HostApp() != this || binder.HostRegistration() != ticket) {
+            ticket.Invalidate();
+            return false;
+        }
+        return true;
+    }
+
+    public int ModelHostCount() {
+        int count = 0;
+        if (loopParticipants == null) { return count; }
+        for (int i = 0; i < loopParticipants.Count; i = i + 1) {
+            if (this.LiveModelHost(loopParticipants[i])) { count = count + 1; }
+        }
+        return count;
+    }
+
+    // Called by the selected host before MeasureTree, never by arbitrary Tick.
+    // A snapshot plus the existing host revision fences reentrant replacement,
+    // Stop and registrations created by model getters/control setters.
+    public bool SyncModelHosts() { return this.VisitModelHosts(false); }
+    public bool WriteBackModelHosts() { return this.VisitModelHosts(true); }
+
+    private bool VisitModelHosts(bool writeBack) {
+        this.CheckLoopThread();
+        int generation = loopGeneration;
+        int revision = hostLayoutRevision;
+        int phase = inputPreparationTicket;
+        long sequence = window.EventSeq();
+        int frame = frameSeq;
+        Control root = rootControl;
+        int rootGeneration = inputRootGeneration;
+        List<AppLoopRegistration> tickets = this.PreparationTickets();
+        for (int i = 0; i < tickets.Count; i = i + 1) {
+            if (!isRunning || generation != loopGeneration || revision != hostLayoutRevision
+            || phase != inputPreparationTicket || sequence != window.EventSeq() || frame != frameSeq
+            || root != rootControl || rootGeneration != inputRootGeneration) { return false; }
+            AppLoopRegistration ticket = tickets[i];
+            if (!this.LiveModelHost(ticket)) { continue; }
+            AppPreparationProof proof = new AppPreparationProof(ticket);
+            AppModelHost binder = (AppModelHost)ticket.owner;
+            if (writeBack) { binder.SyncChangedValues(); }
+            else { binder.SyncFromModel(); }
+            if (!proof.Current(this)) { return false; }
+        }
+        return isRunning && generation == loopGeneration && revision == hostLayoutRevision
+        && phase == inputPreparationTicket && sequence == window.EventSeq() && frame == frameSeq
+        && root == rootControl && rootGeneration == inputRootGeneration;
+    }
+}

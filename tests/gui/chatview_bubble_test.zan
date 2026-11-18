@@ -1,6 +1,13 @@
 using System;
 using Gui;
 using Gui.Component;
+using Gui.Widget;
+
+class ChatAvatarWitness {
+    public weak Avatar first;
+    public weak Avatar second;
+    public weak ChatView chat;
+}
 
 // ChatView 气泡模式的两条回归（都来自桌面端 IM 客户端的实机反馈）：
 // // 1. 滚轮方向。`bscr` 是「离底部多少像素」（0 = 贴住最新一条），与
@@ -21,12 +28,90 @@ class ChatViewBubbleTest {
     static App app;
     static ChatView chat;
     static Rect area;
+    static int clickedAvatar;
+
+    static void AvatarClicked(int index) { clickedAvatar = index; }
+
+    static List<Avatar> Avatars(ChatView view) {
+        List<Avatar> result = new List<Avatar>();
+        for (int i = 0; i < view.ChildCount(); i = i + 1) {
+            Control child = view.ChildAt(i);
+            if (child is Avatar) { result.Add((Avatar)child); }
+        }
+        return result;
+    }
+
+    static void ClickAvatar(App host, Avatar avatar) {
+        int x = avatar.bx + avatar.bw / 2;
+        int y = avatar.by + avatar.bh / 2;
+        host.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        True("first Down targets retained avatar", avatar.ContainsInputControl(host.pointerDownTarget));
+        host.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void PreparedAvatars(ChatAvatarWitness witness) {
+        App host = App.CreateOffscreen("prepared chat avatars", 400, 300);
+        ChatView view = new ChatView().WithStyle(ChatStyle.Bubble());
+        List<ChatMessage> messages = new List<ChatMessage>();
+        messages.Add(ChatMessage.Create("user", "mine"));
+        messages.Add(ChatMessage.Create("assistant", "other"));
+        view.Bind(messages).OnAvatarClick(ChatViewBubbleTest.AvatarClicked);
+        view.UseApp(host); view.MeasureTree(host); view.Arrange(0, 0, 390, 280);
+        host.SetRootControl(view);
+        List<Avatar> avatars = Avatars(view);
+        EqInt("each visible bubble has an avatar", avatars.Count, 2);
+        if (avatars.Count != 2) { host.canvas.Destroy(); return; }
+        Avatar first = avatars[0]; Avatar second = avatars[1];
+        witness.first = first; witness.second = second; witness.chat = view;
+        True("different messages own different avatars", first != second && first.Label() != second.Label());
+        True("avatar labels exist before first Paint", first.ChildCount() == 1 && second.ChildCount() == 1
+        && ((Label)first.ChildAt(0)).GetText() == first.Label()
+        && ((Label)second.ChildAt(0)).GetText() == second.Label());
+        True("avatar geometry is prepared", first.bw > 0 && first.bh > 0 && second.bw > 0 && second.bh > 0
+        && first.bx > second.bx && first.parent == view && second.parent == view);
+        clickedAvatar = -1; ClickAvatar(host, first); EqInt("first avatar click before Paint", clickedAvatar, 0);
+        clickedAvatar = -1; ClickAvatar(host, second); EqInt("second avatar click before Paint", clickedAvatar, 1);
+        Control firstLabel = first.ChildAt(0); int firstY = first.by; int secondY = second.by;
+        int children = view.ChildCount(); int version = view.BubbleScroll().Version();
+        string preparedClass = first.Class;
+        messages[0].role = "assistant";
+        for (int i = 0; i < 2; i = i + 1) {
+            host.BeginOffscreenFrame(); view.RenderTree(host); host.EndOffscreenFrame();
+        }
+        True("Paint preserves prepared children and geometry", view.ChildCount() == children
+        && first.ChildAt(0) == firstLabel && first.by == firstY && second.by == secondY
+        && view.BubbleScroll().Version() == version && first.Class == preparedClass);
+        messages[0].role = "user";
+        for (int i = 2; i < 40; i = i + 1) { messages.Add(ChatMessage.Create(i % 2 == 0 ? "user" : "assistant", "row")); }
+        view.Arrange(0, 0, 390, 280);
+        int liveChildren = view.ChildCount(); int scroll = view.ScrollTop();
+        host.ProcessOffscreenInput(13, 200, 150, 0, 120, 0, 0);
+        True("wheel updates avatar viewport before Paint", view.ScrollTop() < scroll && view.ChildCount() <= liveChildren + 1);
+        avatars = Avatars(view); Avatar visible = null;
+        for (int i = 0; i < avatars.Count; i = i + 1) {
+            Avatar candidate = avatars[i];
+            if (candidate.by >= view.by && candidate.by + candidate.bh <= view.by + view.bh) { visible = candidate; break; }
+        }
+        True("scroll retains visible avatars", visible != null);
+        if (visible != null) {
+            clickedAvatar = -1; ClickAvatar(host, visible);
+            True("scrolled avatar click uses current message", clickedAvatar >= 0 && clickedAvatar < messages.Count - 1);
+        }
+        view.WithStyle(ChatStyle.Log()); view.Arrange(0, 0, 390, 280);
+        EqInt("log mode retires bubble avatars", Avatars(view).Count, 0);
+        view.WithStyle(ChatStyle.Bubble()); view.Arrange(0, 0, 390, 280);
+        messages.Clear(); view.Arrange(0, 0, 390, 280);
+        EqInt("empty messages retire bubble avatars", Avatars(view).Count, 0);
+        messages.Add(ChatMessage.Create("user", "again")); view.Arrange(0, 0, 390, 280);
+        view.Reset(); EqInt("Reset retires bubble avatars", Avatars(view).Count, 0);
+        host.SetRootControl(null); host.canvas.Destroy();
+    }
 
     static void EqInt(string what, int got, int want) {
         if (got == want) { return; }
         fails = fails + 1;
         Console.WriteLine("FAIL " + what + ": got "
-            + Convert.ToString(got) + " want " + Convert.ToString(want));
+        + Convert.ToString(got) + " want " + Convert.ToString(want));
     }
 
     static void True(string what, bool got) {
@@ -47,7 +132,9 @@ class ChatViewBubbleTest {
     }
 
     static void Body() {
-        chat.RenderInside(app, area);
+        chat.MeasureTree(app);
+        chat.Arrange(area.x, area.y, area.width, area.height);
+        chat.RenderTree(app);
         // 泵在完全静止（无挂起重绘/动画截止/事件）时走阻塞 GetMessageW
         // 等下一条 OS 事件。本测试靠合成事件驱动，帧与帧之间常处于静止，
         // 环境消息流一安静（无鼠标活动）泵就永挂——同一二进制早晨过、
@@ -75,7 +162,7 @@ class ChatViewBubbleTest {
         List<ChatMessage> msgs = new List<ChatMessage>();
         for (int i = 0; i < 40; i = i + 1) {
             ChatMessage m = ChatMessage.Create(
-                i % 2 == 0 ? "user" : "assistant", "第 " + Convert.ToString(i) + " 行");
+            i % 2 == 0 ? "user" : "assistant", "第 " + Convert.ToString(i) + " 行");
             m.at = 0;
             msgs.Add(m);
         }
@@ -86,6 +173,8 @@ class ChatViewBubbleTest {
         chat.WithSpeakers(ChatViewBubbleTest.Speaker, ChatViewBubbleTest.KindLabel);
         chat.Bind(msgs);
         area = new Rect(0, 0, 390, 280);
+        chat.UseApp(app);
+        app.SetRootControl(chat);
 
         app.PumpGuarded();
         app.FrameGuarded(ChatViewBubbleTest.Body);
@@ -106,14 +195,14 @@ class ChatViewBubbleTest {
         int speed = app.scrollSpeed;
         ChatViewBubbleTest.Ev(13, x, y, 120);    // 向上滚一格
         EqInt("wheel up goes back in history",
-              chat.BubbleScroll().Get(), speed);
+        chat.BubbleScroll().Get(), speed);
         ChatViewBubbleTest.Ev(13, x, y, 120);    // 再一格
         EqInt("second notch adds one more step",
-              chat.BubbleScroll().Get(), speed * 2);
+        chat.BubbleScroll().Get(), speed * 2);
 
         ChatViewBubbleTest.Ev(13, x, y, 0 - 120);   // 向下滚一格
         EqInt("wheel down comes back toward newest",
-              chat.BubbleScroll().Get(), speed);
+        chat.BubbleScroll().Get(), speed);
 
         // 反向到底不得越过最新一条（钳在 0，而不是负值）。
         ChatViewBubbleTest.Ev(13, x, y, 0 - 120);
@@ -133,7 +222,7 @@ class ChatViewBubbleTest {
         app.FrameGuarded(ChatViewBubbleTest.Body);
         int ackedH = chat.bubH;
         True("receipt label adds a row on the last bubble",
-             ackedH > baseH);
+        ackedH > baseH);
 
         // 非末条翻新（已送达 → 已读）：缓存签名只带末条的话这里高度
         // 不变——回执就永远停在第一次画出来的样子。
@@ -143,14 +232,18 @@ class ChatViewBubbleTest {
         app.FrameGuarded(ChatViewBubbleTest.Body);
         int midH = chat.bubH;
         True("receipt label on a middle bubble re-lays out",
-             midH > baseH);
+        midH > baseH);
 
         msgs[msgs.Count - 6].kind = "wx-readed";
         app.PumpGuarded();
         app.FrameGuarded(ChatViewBubbleTest.Body);
         EqInt("readed keeps the same height as acked", chat.bubH, midH);
 
+        ChatAvatarWitness witness = new ChatAvatarWitness();
+        PreparedAvatars(witness);
+        True("avatar children and chat release naturally", witness.first == null && witness.second == null && witness.chat == null);
+
         Console.WriteLine(fails == 0 ? "CHATVIEWBUBBLE PASS"
-            : "CHATVIEWBUBBLE FAIL " + Convert.ToString(fails));
+        : "CHATVIEWBUBBLE FAIL " + Convert.ToString(fails));
     }
 }

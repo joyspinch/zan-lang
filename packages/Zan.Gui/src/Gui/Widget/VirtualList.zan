@@ -17,7 +17,8 @@ public class VirtualList : Control {
     private List<string> items;
     private int selected;
     private int rowH;
-    private int activated;
+    public UiEvent Select;
+    public UiEvent Activate;
     // 模板模式的行构建器；null = 字符串行模式。
     private RowAt rowAt;
     private int rowCount;
@@ -25,10 +26,8 @@ public class VirtualList : Control {
     private bool rowsStale;
     private int builtFirst;
     private int builtLast;
-    // 字符串行悬停提示的跟踪状态：正在计时的行号（-1 无）
-    // 与指针进入该行的时刻。指针换行或离开即重置。
-    private int tipIdx;
-    private int tipSinceMs;
+    private VisibleRowHost rowHost;
+    private bool arrangingRows;
     // 视口矩形缓存，消除每帧 Render 中的堆分配
     private Rect viewportArea;
     private int layoutScrollY;
@@ -37,17 +36,17 @@ public class VirtualList : Control {
     public VirtualList() {
         this.InitControl("virtualList", 5);
 
+        this.rowHost = new VisibleRowHost(this, this);
         this.items = new List<string>();
         this.selected = 0 - 1;
         this.rowH = 0;
-        this.activated = 0 - 1;
+        Select = new UiEvent();
+        Activate = new UiEvent();
         this.rowAt = null;
         this.rowCount = 0;
         this.rowsStale = true;
         this.builtFirst = 0 - 1;
         this.builtLast = 0 - 1;
-        this.tipIdx = 0 - 1;
-        this.tipSinceMs = 0;
         this.viewportArea = new Rect(0, 0, 0, 0);
     }
 
@@ -55,10 +54,10 @@ public class VirtualList : Control {
     public override string Kind() { return "VirtualList"; }
 
     // 覆写：返回设计器属性清单（rowHeight）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec rh = PropSpec.Int("rowHeight", "Row height");
-        rh.num = rowH;
+        rh.Field("rowH", 1);
         rh.Step(1, 0, 1000);
         rh.WithTip("Fixed row height in logical pixels; zero uses the theme default.");
         ps.Add(rh);
@@ -79,6 +78,9 @@ public class VirtualList : Control {
 
     public override void Arrange(int x, int y, int w, int h) {
         bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (arrangingRows) { return; }
+        arrangingRows = true;
+        try {
         App app = this.App;
         int rh = this.ResolveRowH(app);
         if (rh < 1) { rh = 1; }
@@ -94,21 +96,25 @@ public class VirtualList : Control {
         int first = scrollY / rh;
         int last = first + view.height / rh + 2;
         if (last > this.Count()) { last = this.Count(); }
-        if (rowAt != null && app != null) { this.BuildVisible(app, first, last); }
+        if (app != null && !this.BuildVisible(app, first, last)) { return; }
+        int ticket = rowHost.Revision();
         bool hasBar = this.StyleOverflowY() == 3 || (this.StyleOverflowY() == 2 && scrollExtent > view.height);
         int reserve = app != null ? app.Scale(12) : 12;
         int rowW = view.width - (hasBar ? reserve : 0);
         if (rowW < 0) { rowW = 0; }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            children[i].Arrange(view.x, view.y + (builtFirst + i) * rh - scrollY, rowW, rh);
+        for (int i = first; i < last; i = i + 1) {
+            Control row = rowHost.Row(i);
+            if (row != null) { row.Arrange(view.x, view.y + i * rh - scrollY, rowW, rh); }
+            if (ticket != rowHost.Revision()) { return; }
         }
+        } finally { arrangingRows = false; }
     }
 
     // Input may arrive several times before the next paint/layout pass.
-    public override Control HitTest(int x, int y, int pointerType) {
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         this.Arrange(bx, by, bw, bh);
-        return base.HitTest(x, y, pointerType);
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
     }
 
     public override void OnWheel(RoutedEventArgs e) {
@@ -130,20 +136,18 @@ public class VirtualList : Control {
     public override void OnPaint(App app) { /* retained children paint in RenderTree */ }
 
     private void ReleaseRows(App app) {
-        for (int i = 0; i < children.Count; i = i + 1) {
-            if (app != null) { app.ReleaseInputSubtree(children[i]); }
-        }
-        this.RemoveAll();
+        rowsStale = true;
+        rowHost.Reset();
     }
 
     // 整体替换字符串行数据（模板模式之外的最简用法）；
     // 行数变化后选中行号自动夹回范围内。
     public void SetItems(List<string> rows) {
-        this.ReleaseRows(this.App);
-        items = rows;
+        items = rows != null ? rows : new List<string>();
         rowAt = null;
         rowCount = 0;
-        if (selected >= rows.Count) { selected = rows.Count - 1; }
+        if (selected >= items.Count) { selected = items.Count - 1; }
+        this.ReleaseRows(this.App);
     }
 
     // 追加一行字符串数据。
@@ -156,11 +160,11 @@ public class VirtualList : Control {
     public void SetRows(int count, RowAt build) {
         if (count < 0) { count = 0; }
         if (build != rowAt || count != rowCount) {
-            this.ReleaseRows(this.App);
             rowAt = build;
             rowCount = count;
             rowsStale = true;
             if (selected >= rowCount) { selected = rowCount - 1; }
+            this.ReleaseRows(this.App);
         }
     }
 
@@ -194,11 +198,51 @@ public class VirtualList : Control {
         return items[selected];
     }
 
-    // 本帧点击的行（或 -1），随后清除。
-    public int TakeActivated() {
-        int r = activated;
-        activated = 0 - 1;
-        return r;
+    public override List<string> Events() {
+        List<string> events = base.Events();
+        events.Add("Select");
+        events.Add("Activate");
+        return events;
+    }
+
+    public override void BindEvent(string evt, Action handler) {
+        if (evt == "Select") { Select.Add(handler); return; }
+        if (evt == "Activate") { Activate.Add(handler); return; }
+        base.BindEvent(evt, handler);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "Select") { Select.AddS(handler); return; }
+        if (evt == "Activate") { Activate.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    internal void SelectStringRow(Control row, int index) {
+        if (rowAt != null || index < 0 || index >= items.Count || rowHost.Row(index) != row) { return; }
+        App app = this.FindApp();
+        Control root = app != null ? app.rootControl : null;
+        int generation = app != null ? app.inputRootGeneration : 0;
+        bool changed = selected != index;
+        selected = index;
+        this.SyncStringRows();
+        if (changed) { Select.RaiseS(this); }
+        if (rowAt != null || selected != index || rowHost.Row(index) != row
+            || (app != null && (!app.isRunning || app.rootControl != root
+                || app.inputRootGeneration != generation || this.FindApp() != app))) { return; }
+        Activate.RaiseS(this);
+    }
+
+    private void SyncStringRows() {
+        if (rowAt != null) { return; }
+        for (int i = builtFirst; i < builtLast; i = i + 1) {
+            Control control = rowHost.Row(i);
+            if (control is Button && i >= 0 && i < items.Count) {
+                Button button = (Button)control;
+                if (button.Label() != items[i]) { button.SetText(items[i]); }
+                if (i == selected) { button.AddClass("selected"); }
+                else if (button.HasClass("selected")) { button.RemoveClass("selected"); }
+            }
+        }
     }
 
     // 实际使用的行高：显式 SetRowHeight 优先，否则主题值。
@@ -211,34 +255,29 @@ public class VirtualList : Control {
 
     // Keep the overlap alive: scrolling one row must not destroy an editor
     // still visible on screen, or steal its focus/capture.
-    private void BuildVisible(App app, int first, int last) {
-        if (!rowsStale && first == builtFirst && last == builtLast) { return; }
-        List<Control> previous = children;
-        int oldFirst = builtFirst;
-        int oldLast = builtLast;
-        List<Control> next = new List<Control>();
-        for (int i = first; i < last; i = i + 1) {
-            Control row = null;
-            if (!rowsStale && i >= oldFirst && i < oldLast) {
-                row = previous[i - oldFirst];
-            } else {
-                row = rowAt(i);
-                if (row == null) { row = Panel.Root("vrow"); }
-                this.Add(row);
-                row.MeasureTree(app);
+    private Control CreateRow(int index) {
+        RowAt build = rowAt;
+        if (build == null) { return new VirtualListStringRow(this, index, items[index]); }
+        Control row = build(index);
+        return row != null ? row : Panel.Root("vrow");
+    }
+
+    private bool BuildVisible(App app, int first, int last) {
+        if (!rowsStale && first == builtFirst && last == builtLast
+            && this.ChildCount() == rowHost.Count()) {
+            bool complete = true;
+            for (int i = first; i < last; i = i + 1) {
+                if (rowHost.Row(i) == null) { complete = false; break; }
             }
-            next.Add(row);
+            if (complete) { this.SyncStringRows(); return true; }
         }
-        for (int i = previous.Count - 1; i >= 0; i = i - 1) {
-            Control row = previous[i];
-            if (!next.Contains(row)) {
-                app.ReleaseInputSubtree(row);
-                this.Remove(row);
-            }
-        }
-        children = next;
+        List<int> wanted = new List<int>();
+        for (int i = first; i < last; i = i + 1) { wanted.Add(i); }
+        if (!rowHost.Reconcile(wanted, this.CreateRow, app)) { return false; }
         builtFirst = first;
         builtLast = last;
         rowsStale = false;
+        this.SyncStringRows();
+        return true;
     }
 }

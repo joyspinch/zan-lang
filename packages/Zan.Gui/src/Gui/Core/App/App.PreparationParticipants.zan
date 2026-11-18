@@ -1,0 +1,290 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+namespace Gui;
+
+public partial class App {
+    internal int snapshotInputSilenceDepth;
+    internal int preparingInputDepth;
+    internal int inputPreparationTicket;
+    internal bool preparingPaintParticipants;
+    private bool preparedPaintSequenceValid;
+    private int preparedPaintSequence;
+    internal bool preparationFrameAborted;
+    private bool preparedHostFrameValid;
+    private int preparedHostFrame;
+    private weak AppLoopRegistration preparedHostTicket;
+    internal int hostLayoutRevision;
+    private int preparedHostRevision;
+    private int preparedHostGeneration;
+    private AppPreparationProof preparedHostProof;
+    private List<AppPreparationProof> preparedPaintProofs;
+    private int preparedLoopGeneration;
+    private int preparedInputTicket;
+    private long preparedEventSequence;
+    private int preparedRootGeneration;
+    private weak Control preparedRoot;
+
+    internal bool HostPhaseCurrent(AppLoopRegistration ticket, AppPreparationProof proof, int revision) {
+        return hostLayoutRevision == revision && this.CurrentHostLayout() == ticket
+            && (ticket == null || (proof != null && proof.Current(this)));
+    }
+
+    private bool PreparationProofsCurrent(List<AppPreparationProof> proofs) {
+        if (proofs == null) { return true; }
+        for (int i = 0; i < proofs.Count; i = i + 1) {
+            if (!proofs[i].Current(this)) { return false; }
+        }
+        return true;
+    }
+
+    private List<AppLoopRegistration> PreparationTickets() {
+        List<AppLoopRegistration> snapshot = new List<AppLoopRegistration>();
+        if (loopParticipants != null) {
+            for (int i = 0; i < loopParticipants.Count; i = i + 1) {
+                snapshot.Add(loopParticipants[i]);
+            }
+        }
+        return snapshot;
+    }
+
+    internal bool PreparationInputCurrent(int ticket, long sequence) {
+        return isRunning && inputPreparationTicket == ticket && window.EventSeq() == sequence;
+    }
+
+    // A participant's callback superseded its prepared work; stop this turn's tail.
+    public void InvalidatePreparation() {
+        this.CheckLoopThread();
+        inputPreparationTicket = inputPreparationTicket + 1;
+    }
+
+    internal AppLoopRegistration CurrentHostLayout() {
+        if (loopParticipants == null) { return null; }
+        for (int i = loopParticipants.Count - 1; i >= 0; i = i - 1) {
+            AppLoopRegistration ticket = loopParticipants[i];
+            if (LiveLoopRegistration(ticket) && ticket.participant is AppHostLayout) { return ticket; }
+        }
+        return null;
+    }
+
+    private bool SyncPreparationHostLayout(bool forInput) {
+        AppLoopRegistration ticket = this.CurrentHostLayout();
+        // Custom hosts share the same model phase before optional view layout.
+        if (ticket == null) { return this.SyncModelHosts(); }
+        int revision = hostLayoutRevision;
+        AppPreparationProof proof = new AppPreparationProof(ticket);
+        AppLoopParticipant participant = ticket.participant;
+        bool complete = ((AppHostLayout)participant).SyncLayout(this, forInput);
+        return complete && this.HostPhaseCurrent(ticket, proof, revision);
+    }
+
+    private bool PrepareRetainedLayout() {
+        Control root = rootControl;
+        int generation = inputRootGeneration;
+        long sequence = window.EventSeq();
+        int phase = inputPreparationTicket;
+        int frame = frameSeq;
+        if (root != null && !root.PrepareLayoutEvents(this, true)) { return false; }
+        if (rootControl != root || inputRootGeneration != generation || window.EventSeq() != sequence
+            || inputPreparationTicket != phase || frameSeq != frame) { return false; }
+        if (overlayHost != null && !overlayHost.PrepareLayout(this)) { return false; }
+        return rootControl == root && inputRootGeneration == generation && window.EventSeq() == sequence
+            && inputPreparationTicket == phase && frameSeq == frame;
+    }
+
+    internal bool PrepareInputParticipants(int kind, long sequence) {
+        this.CheckLoopThread();
+        inputPreparationTicket = inputPreparationTicket + 1;
+        int phase = inputPreparationTicket;
+        preparingInputDepth = preparingInputDepth + 1;
+        int generation = loopGeneration;
+        List<AppLoopRegistration> tickets = this.PreparationTickets();
+        int revision = hostLayoutRevision;
+        AppLoopRegistration hostTicket = this.CurrentHostLayout();
+        AppPreparationProof hostProof = hostTicket != null ? new AppPreparationProof(hostTicket) : null;
+        List<AppPreparationProof> visited = new List<AppPreparationProof>();
+        try {
+            // Root installation is legal here: no target/focus/capture snapshot exists yet.
+            if (!this.PrepareChromeTree() || !this.PreparationInputCurrent(phase, sequence)
+                || generation != loopGeneration
+                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
+            if (!this.SyncPreparationHostLayout(true) || !this.PreparationInputCurrent(phase, sequence)
+                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
+            for (int i = 0; i < tickets.Count; i = i + 1) {
+                if (!this.PreparationInputCurrent(phase, sequence) || generation != loopGeneration
+                    || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                    || !this.PreparationProofsCurrent(visited)) { return false; }
+                AppLoopRegistration ticket = tickets[i];
+                if (!LiveLoopRegistration(ticket)) { continue; }
+                AppLoopParticipant participant = ticket.participant;
+                if (participant is AppPreparationParticipant) {
+                    AppPreparationProof proof = new AppPreparationProof(ticket);
+                    visited.Add(proof);
+                    ((AppPreparationParticipant)participant).BeforeInput(this, kind);
+                    if (!proof.Current(this) || !this.PreparationProofsCurrent(visited)
+                        || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                        || !this.PreparationInputCurrent(phase, sequence)
+                        || generation != loopGeneration) { return false; }
+                }
+            }
+            return this.PrepareRetainedLayout()
+                && this.PreparationInputCurrent(phase, sequence) && generation == loopGeneration
+                && this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                && this.PreparationProofsCurrent(visited);
+        } finally { preparingInputDepth = preparingInputDepth - 1; }
+    }
+
+    private bool PaintPreparationCurrent(int generation, int inputTicket, long sequence,
+            int frame, int rootGeneration, Control root) {
+        return isRunning && generation == loopGeneration && inputTicket == inputPreparationTicket
+            && sequence == window.EventSeq() && frame == frameSeq
+            && rootGeneration == inputRootGeneration && root == rootControl;
+    }
+
+    private bool PreparePaintParticipants() {
+        this.CheckLoopThread();
+        if (preparingPaintParticipants) { throw new InvalidOperationException("frame preparation during preparation"); }
+        if (preparedPaintSequenceValid && preparedPaintSequence == frameSeq) { return false; }
+        preparedPaintSequenceValid = true;
+        preparedPaintSequence = frameSeq;
+        preparingPaintParticipants = true;
+        int generation = loopGeneration;
+        int inputTicket = inputPreparationTicket;
+        long sequence = window.EventSeq();
+        int frame = frameSeq;
+        int rootGeneration = inputRootGeneration;
+        Control root = rootControl;
+        List<AppLoopRegistration> tickets = this.PreparationTickets();
+        AppLoopRegistration hostTicket = this.CurrentHostLayout();
+        int revision = hostLayoutRevision;
+        AppPreparationProof hostProof = hostTicket != null ? new AppPreparationProof(hostTicket) : null;
+        List<AppPreparationProof> visited = new List<AppPreparationProof>();
+        try {
+            // Chrome may install its borrowed input adapter before the frame proof.
+            if (!this.PrepareChromeTree()
+                || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame,
+                    inputRootGeneration, rootControl)
+                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
+            rootGeneration = inputRootGeneration;
+            root = rootControl;
+            if (!this.SyncPreparationHostLayout(false)
+                || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)) { return false; }
+            for (int i = 0; i < tickets.Count; i = i + 1) {
+                if (!this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)
+                    || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                    || !this.PreparationProofsCurrent(visited)) { return false; }
+                AppLoopRegistration ticket = tickets[i];
+                if (!LiveLoopRegistration(ticket)) { continue; }
+                AppLoopParticipant participant = ticket.participant;
+                if (participant is AppPreparationParticipant) {
+                    AppPreparationProof proof = new AppPreparationProof(ticket);
+                    visited.Add(proof);
+                    ((AppPreparationParticipant)participant).BeforePaint(this, frame);
+                    if (!proof.Current(this) || !this.PreparationProofsCurrent(visited)
+                        || !this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                        || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)) { return false; }
+                }
+            }
+            bool complete = this.PrepareRetainedLayout()
+                && this.PaintPreparationCurrent(generation, inputTicket, sequence, frame, rootGeneration, root)
+                && this.HostPhaseCurrent(hostTicket, hostProof, revision)
+                && this.PreparationProofsCurrent(visited);
+            if (complete) {
+                preparedHostFrameValid = true;
+                preparedHostFrame = frame;
+                preparedHostTicket = hostTicket;
+                preparedHostGeneration = hostTicket != null ? hostTicket.generation : 0;
+                preparedHostRevision = revision;
+                preparedHostProof = hostProof;
+                preparedPaintProofs = visited;
+                preparedLoopGeneration = generation;
+                preparedInputTicket = inputTicket;
+                preparedEventSequence = sequence;
+                preparedRootGeneration = rootGeneration;
+                preparedRoot = root;
+            }
+            return complete;
+        } finally { preparingPaintParticipants = false; }
+    }
+
+    internal bool HostLayoutPrepared(AppLoopRegistration ticket) {
+        return ticket != null && preparedHostFrameValid && !preparationFrameAborted
+            && preparedHostFrame == frameSeq && preparedHostTicket == ticket
+            && ticket.generation == preparedHostGeneration
+            && this.HostPhaseCurrent(ticket, preparedHostProof, preparedHostRevision)
+            && this.PreparationProofsCurrent(preparedPaintProofs)
+            && this.PaintPreparationCurrent(preparedLoopGeneration, preparedInputTicket,
+                preparedEventSequence, preparedHostFrame, preparedRootGeneration, preparedRoot);
+    }
+
+    // After each host render callback, continue only while the saved preparation proofs hold.
+    // False abandons the frame tail and presentation; an unprepared manual frame stays compatible.
+    public bool ContinuePreparedFrame() {
+        if (preparationFrameAborted) { return false; }
+        if (!preparedHostFrameValid) { return true; }
+        if (preparedHostTicket == null) {
+            if (this.HostPhaseCurrent(null, null, preparedHostRevision)
+                && this.PreparationProofsCurrent(preparedPaintProofs)
+                && this.PaintPreparationCurrent(preparedLoopGeneration, preparedInputTicket,
+                    preparedEventSequence, preparedHostFrame, preparedRootGeneration, preparedRoot)) { return true; }
+        } else if (this.HostLayoutPrepared(preparedHostTicket)) { return true; }
+        this.AbortPreparationFrame();
+        return false;
+    }
+
+    // Custom hosts call after BeginFrame and before drawing, after business updates.
+    // Runs optional owner layout; false abandons this frame, including presentation.
+    public bool PrepareStandardHostFrame() {
+        if (this.PreparePaintParticipants()) { return true; }
+        this.AbortPreparationFrame();
+        return false;
+    }
+
+    internal void TracePreparationFailure(string boundary) {
+        if (!preparedHostFrameValid || preparationFrameAborted
+            || !this.AutomationPreparationPending()) { return; }
+        try {
+            this.TraceAutomationPreparation(boundary
+            + " running=" + Convert.ToString(isRunning)
+            + " hostActive=" + Convert.ToString(preparedHostTicket != null && preparedHostTicket.active)
+            + " hostGeneration=" + Convert.ToString(preparedHostGeneration) + "/"
+            + Convert.ToString(preparedHostTicket != null ? preparedHostTicket.generation : 0)
+            + " layoutRevision=" + Convert.ToString(preparedHostRevision) + "/" + Convert.ToString(hostLayoutRevision)
+            + " loopGeneration=" + Convert.ToString(preparedLoopGeneration) + "/" + Convert.ToString(loopGeneration)
+            + " inputTicket=" + Convert.ToString(preparedInputTicket) + "/" + Convert.ToString(inputPreparationTicket)
+            + " eventSequence=" + Convert.ToString(preparedEventSequence) + "/" + Convert.ToString(window.EventSeq())
+            + " frame=" + Convert.ToString(preparedHostFrame) + "/" + Convert.ToString(frameSeq)
+            + " rootGeneration=" + Convert.ToString(preparedRootGeneration) + "/" + Convert.ToString(inputRootGeneration)
+            + " rootSame=" + Convert.ToString(preparedRoot == rootControl));
+        } catch (Exception ex) { }
+    }
+
+    internal void AbortPreparationFrame() {
+        this.TracePreparationFailure("abort");
+        preparationFrameAborted = true;
+        preparedHostFrameValid = false;
+        preparedHostTicket = null;
+        preparedHostProof = null;
+        preparedPaintProofs = null;
+        this.CancelPartialFrame();
+        this.RequestRedraw();
+        if (offscreenFrameActive) { this.CancelOffscreenFrame(); }
+    }
+
+    internal void CheckPreparationFrameEntry() {
+        if (preparingPaintParticipants) { throw new InvalidOperationException("reentrant BeginFrame during preparation"); }
+        preparationFrameAborted = false;
+        preparedHostFrameValid = false;
+        preparedHostTicket = null;
+        preparedHostProof = null;
+        preparedPaintProofs = null;
+    }
+
+    internal void RecoverPreparationFault() {
+        preparingPaintParticipants = false;
+        preparingInputDepth = 0;
+        inputPreparationTicket = inputPreparationTicket + 1;
+        this.AbortPreparationFrame();
+    }
+}

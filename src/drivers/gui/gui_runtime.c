@@ -651,6 +651,7 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
 }
 
 #include "gui_runtime_raster.c"
+#include "gui_runtime_layered.c"
 #include "gui_runtime_present.c"
 #include "gui_runtime_draw.c"
 
@@ -707,8 +708,9 @@ static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
     long long ey = (long long)idy  + (long long)idh;
     x1 = ex < (long long)s->clip_x1 ? (int)ex : s->clip_x1;
     y1 = ey < (long long)s->clip_y1 ? (int)ey : s->clip_y1;
-    ZAN_STAT(g_st_img, (long long)(x1 - x0) * (long long)(y1 - y0));
+    g_st_img.calls++;
     if (idw <= 0 || idh <= 0 || x1 <= x0 || y1 <= y0) return;
+    g_st_img.px += ((long long)x1 - x0) * ((long long)y1 - y0);
 
     int boxX = idw < isw;
     int boxY = idh < ish;

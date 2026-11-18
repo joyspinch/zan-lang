@@ -1,0 +1,441 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class Program {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+
+    static void GroupedCssIsolation() {
+        StyleSheet source = Css.Parse("label.alpha,label.beta{left:1dpx;color:#fff !important}"
+            + "label.alpha{left:40dpx;font-size:28dpx;color:#ff0000 !important}"
+            + "label.beta{left:90px;font-size:20dpx}");
+        StyleBox alpha = new StyleBox(); source.ApplyBox(alpha, "label.alpha");
+        StyleBox beta = new StyleBox(); source.ApplyBox(beta, "label.beta");
+        Check(alpha.posL == 40 && alpha.fontPx == 28 && alpha.fg == StyleSheet.ParseColor("#ff0000")
+            && beta.posL == 90 && beta.fontPx == 20 && beta.fg == StyleSheet.ParseColor("#fff"),
+            "grouped selectors own independent length, font and important color metadata");
+        System.Json.JsonValue alphaRule = source.rules.Get("label.alpha");
+        System.Json.JsonValue betaRule = source.rules.Get("label.beta");
+        Check(alphaRule != null && betaRule != null, "grouped selector rules exist");
+        if (alphaRule != null && betaRule != null) {
+            Check(alphaRule.Get("__zan_lengths") != betaRule.Get("__zan_lengths")
+                && alphaRule.Get("__zan_prescaled") != betaRule.Get("__zan_prescaled"),
+                "grouped selector metadata maps are independent");
+        }
+        StyleSheet destination = Css.Parse(""); destination.MergeSheet(source);
+        Css.MergeInto(destination, "label.alpha", Css.Parse("label.alpha{left:7dpx;color:#00ff00 !important}").rules.Get("label.alpha"));
+        StyleBox unchanged = new StyleBox(); source.ApplyBox(unchanged, "label.alpha");
+        Check(unchanged.posL == 40 && unchanged.fg == StyleSheet.ParseColor("#ff0000"),
+            "destination overrides leave source sheet metadata unchanged");
+    }
+
+    static void HtmlButtonFirstMeasure(App app) {
+        HtmlDoc doc = Html.Parse("<body data-zan-design>"
+            + "<button id='OkButton' data-label='Confirm'></button></body>", "", null);
+        Button button = (Button)doc.Get("OkButton");
+        Check(button != null && button.ChildCount() == 1 && button.ChildAt(0) is Label,
+            "HTML design label creates retained caption before first layout");
+        Label caption = (Label)button.ChildAt(0);
+        Check(caption.GetText() == "Confirm", "HTML design label reaches retained caption");
+        doc.root.MeasureTree(app);
+        Check(button.prefW > 0 && button.prefH > 0 && caption.prefW > 0 && caption.prefH > 0,
+            "HTML button and caption have intrinsic sizes on first measure without paint");
+        doc.root.MeasureTree(app);
+        button.SyncBinding();
+        Check(button.ChildCount() == 1 && button.ChildAt(0) == caption,
+            "repeat measurement and binding retain exactly one generated caption");
+    }
+
+    static void ButtonProperties(App app) {
+        Button button = new Button("Run");
+        Label caption = (Label)button.ChildAt(0);
+        Label custom = new Label("custom");
+        custom.Class = "warning";
+        custom.styleColor = StyleSheet.ParseColor("#654321");
+        button.Add(custom);
+        button.SetProp("icon", "save");
+        button.SetProp("iconPlacement", "right");
+        Control icon = button.ChildAt(2);
+        Check(button.ChildCount() == 3 && button.ChildAt(0) == caption
+            && button.ChildAt(1) == custom && icon is IconView && ((IconView)icon).Name == "save",
+            "icon is retained after business children");
+        button.SetText("Save");
+        Check(button.ChildCount() == 3 && caption.GetText() == "Save" && custom.GetText() == "custom"
+            && button.ChildAt(2) == icon, "SetText updates owned caption before trailing icon");
+        button.SetProp("text", "Save again");
+        Check(button.ChildCount() == 3 && caption.GetText() == "Save again", "property text updates owned caption");
+        button.SetProp("iconPlacement", "left");
+        Check(button.ChildCount() == 3 && button.ChildAt(0) == icon && button.ChildAt(1) == caption,
+            "icon moves without duplicating content");
+        button.SetProp("color", "#123456"); button.SetProp("textColor", "#abcdef");
+        int foreground = StyleSheet.ParseColor("#abcdef");
+        Check(button.Box(app).bg == StyleSheet.ParseColor("#123456") && caption.Box(app).fg == foreground
+            && icon.Box(app).fg == foreground && custom.styleColor == StyleSheet.ParseColor("#654321")
+            && custom.Box(app).fg == StyleSheet.ParseColor("#654321"), "owned colors preserve custom label color");
+        button.styleBgTo = StyleSheet.ParseColor("#112233"); button.computedStyle = null;
+        StyleBox gradient = button.Box(app);
+        Check(gradient.bgTo != 0, "gradient cache precondition");
+        button.SyncBinding();
+        Check(button.Box(app).bgTo == 0 && button.Box(app).bg == gradient.bg,
+            "gradient reset invalidates cache even when background unchanged");
+        button.SetProp("iconPlacement", "right");
+        Button copy = (Button)Html.Clone(button);
+        Check(copy != null && copy.ChildCount() == 3 && copy.ChildAt(0) is Label
+            && copy.ChildAt(1).GetProp("text") == "custom" && copy.ChildAt(1).Class == "warning"
+            && copy.ChildAt(2) is IconView && copy.ChildAt(1) != custom,
+            "clone has exactly one owned caption/icon and each custom child once");
+        copy.SetText("Cloned");
+        Check(copy.ChildCount() == 3 && copy.ChildAt(0).GetProp("text") == "Cloned"
+            && copy.ChildAt(1).GetProp("text") == "custom" && caption.GetText() == "Save again",
+            "cloned caption ownership supports SetText without changing source");
+        copy.SetProp("icon", "");
+        Check(copy.ChildCount() == 2 && copy.ChildAt(1).GetProp("text") == "custom", "cloned icon clears alone");
+        button.Color.Set(0); button.TextColor.Set(0); button.SyncBinding();
+        Check(button.styleBg == 0 && button.styleColor == 0 && caption.styleColor == 0 && icon.styleColor == 0
+            && custom.styleColor == StyleSheet.ParseColor("#654321"), "zero colors restore only owned projections");
+        button.SetProp("icon", "");
+        Check(button.ChildCount() == 2 && button.ChildAt(0) == caption && button.ChildAt(1) == custom,
+            "icon clear preserves business children");
+        Button cleared = (Button)Html.Clone(button);
+        Check(cleared.ChildCount() == 2 && cleared.ChildAt(1).GetProp("text") == "custom", "clone after icon clear");
+        Button empty = (Button)Html.Clone(new Button());
+        Check(empty != null && empty.ChildCount() == 0, "empty Button clone stays empty");
+        Button late = new Button(); late.SetProp("icon", "save"); late.SetProp("iconPlacement", "right");
+        late.SetText("Late");
+        Check(late.ChildCount() == 2 && late.ChildAt(0).GetProp("text") == "Late"
+            && late.ChildAt(1) is IconView, "SetText creates owned caption before existing right icon");
+        Button restored = new Button("Before clear");
+        restored.SetProp("icon", "save"); restored.SetProp("iconPlacement", "right");
+        restored.SetProp("textColor", "#abcdef");
+        Label removedCaption = (Label)restored.ChildAt(0);
+        IconView removedIcon = (IconView)restored.ChildAt(1);
+        restored.RemoveAll(); restored.SetText("After clear");
+        Check(restored.ChildCount() == 2 && restored.ChildAt(0) != removedCaption
+            && restored.ChildAt(1) != removedIcon && restored.ChildAt(0).GetProp("text") == "After clear"
+            && restored.ChildAt(0).styleColor == foreground && restored.ChildAt(1).styleColor == foreground
+            && removedCaption.GetText() == "Before clear" && removedCaption.parent == null && removedIcon.parent == null,
+            "RemoveAll recreates owned nodes without updating detached caption");
+        Label movedCaption = (Label)restored.ChildAt(0);
+        IconView movedIcon = (IconView)restored.ChildAt(1);
+        Control other = new Control(); other.Add(movedCaption); other.Add(movedIcon);
+        restored.SetText("New owner caption");
+        restored.SetProp("icon", "star"); restored.SetProp("textColor", "#123456");
+        Check(other.ChildCount() == 2 && movedCaption.parent == other && movedIcon.parent == other
+            && movedCaption.GetText() == "After clear" && movedIcon.Name == "save"
+            && movedCaption.styleColor == foreground && movedIcon.styleColor == foreground
+            && restored.ChildCount() == 2 && restored.ChildAt(0) != movedCaption && restored.ChildAt(1) != movedIcon
+            && restored.ChildAt(0).GetProp("text") == "New owner caption"
+            && ((IconView)restored.ChildAt(1)).Name == "star", "reparented generated nodes stay with other owner unchanged");
+        Label currentCaption = (Label)restored.ChildAt(0);
+        currentCaption.Text = null; restored.SyncBinding();
+        Check(currentCaption.GetText() == "New owner caption", "cleared caption Binding is recreated when text differs");
+        restored.SyncBinding();
+        Check(restored.ChildCount() == 2 && restored.ChildAt(0) == currentCaption,
+            "unchanged synchronization preserves retained nodes");
+        Console.WriteLine("button retained properties OK");
+    }
+
+    static void CollapseProperties() {
+        Collapse collapse = new Collapse();
+        collapse.SetProp("titles", "One,Two"); collapse.SetProp("bodies", "First,Second");
+        CollapseItem one = (CollapseItem)collapse.ChildAt(0);
+        CollapseItem two = (CollapseItem)collapse.ChildAt(1);
+        Check(collapse.GetProp("titles") == "One,Two" && collapse.GetProp("bodies") == "First,Second"
+            && one.Title == "One" && two.Content.GetProp("text") == "Second", "comma properties build real items");
+        Control stable = one.ChildAt(0); collapse.SyncBinding(); one.SyncBinding();
+        Check(one.ChildAt(0) == stable, "default arrow baseline avoids unnecessary rebuild");
+        collapse.SetProp("arrowPlacement", "right");
+        Control header = one.ChildAt(0);
+        Check(header.ChildAt(header.ChildCount() - 1) is IconView, "right arrow changes header order");
+        collapse.SetProp("arrowPlacement", "left"); header = one.ChildAt(0);
+        Check(header.ChildAt(0) is IconView, "left arrow changes header order");
+        collapse.ArrowPlacement = "right"; collapse.SyncBinding(); header = one.ChildAt(0);
+        Check(header.ChildAt(header.ChildCount() - 1) is IconView, "direct parent arrow write synchronizes");
+        collapse.ArrowPlacement = "left"; collapse.SyncBinding();
+        one.ArrowPlacement = "right"; one.SetArrowPlacement("right"); header = one.ChildAt(0);
+        Check(header.ChildAt(header.ChildCount() - 1) is IconView, "setter compares applied arrow after direct field write");
+        one.ArrowPlacement = "left"; one.SyncBinding();
+        Check(one.ChildAt(0).ChildAt(0) is IconView, "direct item arrow write synchronizes");
+        collapse.SetProp("expandable", "true"); one.SetExpanded(true); two.SetExpanded(true);
+        Check(!collapse.Accordion && one.IsExpanded && two.IsExpanded, "expandable allows multiple open");
+        collapse.SetProp("expandable", "false"); one.SetExpanded(false); one.SetExpanded(true);
+        Check(collapse.Accordion && one.IsExpanded && !two.IsExpanded, "accordion closes sibling");
+        Label customHeader = new Label("Custom header");
+        Flex customBody = new Flex(); customBody.Add(new Label("Nested body"));
+        one.MountSlot("header", customHeader); one.MountSlot("body", customBody);
+        Label accessory = new Label("Accessory"); one.Add(accessory);
+        collapse.SetProp("arrowPlacement", "right");
+        Check(one.ChildCount() == 3 && one.ChildAt(2) == accessory
+            && one.Header == customHeader && one.Content == customBody, "arrow rebuild preserves custom slots and children");
+        Label separator = new Label("Separator"); collapse.Add(separator);
+        Collapse copy = (Collapse)Html.Clone(collapse);
+        Check(copy != null && copy.ChildCount() == 3 && copy.ChildAt(2).GetProp("text") == "Separator",
+            "Collapse clone discards replay panels and clones business children once");
+        CollapseItem copiedOne = (CollapseItem)copy.ChildAt(0);
+        CollapseItem copiedTwo = (CollapseItem)copy.ChildAt(1);
+        Check(copiedOne.ChildCount() == 3 && copiedOne.Header != customHeader && copiedOne.Content != customBody
+            && copiedOne.Header.GetProp("text") == "Custom header" && copiedOne.Content.ChildCount() == 1
+            && copiedOne.Content.ChildAt(0).GetProp("text") == "Nested body"
+            && copiedOne.ChildAt(2).GetProp("text") == "Accessory" && copiedOne.IsExpanded && !copiedTwo.IsExpanded,
+            "CollapseItem clone preserves custom header/body/accessory without generated duplicates");
+        copiedTwo.SetExpanded(true);
+        Check(!copiedOne.IsExpanded && copiedTwo.IsExpanded && one.IsExpanded && !two.IsExpanded,
+            "cloned collapse callbacks belong to cloned tree");
+        Collapse empty = (Collapse)Html.Clone(new Collapse());
+        Check(empty != null && empty.ChildCount() == 0, "empty Collapse clone has no replay-created panel");
+        CollapseItem item = new CollapseItem("Standalone");
+        Label direct = new Label("Direct child"); item.InsertAt(item.ChildCount(), direct);
+        CollapseItem itemCopy = (CollapseItem)Html.Clone(item);
+        Check(itemCopy.Content == null && itemCopy.ChildCount() == 2
+            && itemCopy.ChildAt(1).GetProp("text") == "Direct child", "standalone clone preserves direct child without adopting body slot");
+        Console.WriteLine("collapse retained properties OK");
+    }
+
+    static void TabsProperties(App app) {
+        Tabs tabs = new Tabs(); tabs.Add("One"); tabs.Add("Two");
+        Control stable = tabs.navStrip; tabs.SyncBinding();
+        Check(tabs.navStrip == stable, "default Tabs constructor establishes projection baseline");
+        tabs.SetProp("tabStyle", "card");
+        Check(tabs.GetProp("tabStyle") == "card" && Style.Has(tabs.navStrip.Class, "card"), "canonical tab style reaches nav CSS");
+        tabs.SetProp("style", "segment");
+        Check(tabs.GetProp("tabStyle") == "segment" && Style.Has(tabs.navStrip.Class, "segment"), "legacy style enum remains accepted");
+        tabs.SetProp("orient", "vertical");
+        Check(tabs.GetProp("orient") == "vertical" && Style.Has(tabs.navStrip.Class, "tabs-nav-vertical")
+            && Style.Has(tabs.Class, "row"), "vertical tabs change nav and host orientation");
+        tabs.SetProp("showAdd", "true"); tabs.SetProp("closable", "true");
+        Check(tabs.navStrip.ChildCount() == 3 && tabs.navStrip.ChildAt(0).ChildCount() == 2,
+            "property writes create add and close buttons");
+        tabs.SetProp("showAdd", "false"); tabs.SetProp("closable", "false");
+        Check(tabs.navStrip.ChildCount() == 2 && tabs.navStrip.ChildAt(0).ChildCount() == 1,
+            "false removes generated add and close buttons");
+        tabs.style = Tabs.Card(); tabs.SyncBinding();
+        Check(Style.Has(tabs.navStrip.Class, "card"), "direct style write rebuilds");
+        tabs.orient = Tabs.Horizontal(); tabs.SyncBinding();
+        Check(Style.Has(tabs.navStrip.Class, "tabs-nav-horizontal") && Style.Has(tabs.Class, "col"), "direct orientation write rebuilds");
+        tabs.showAdd = true; tabs.SyncBinding();
+        Check(tabs.navStrip.ChildCount() == 3, "direct showAdd true rebuilds");
+        tabs.closableAll = true; tabs.SyncBinding();
+        Check(tabs.navStrip.ChildAt(0).ChildCount() == 2, "direct closableAll true rebuilds");
+        tabs.showAdd = false; tabs.SyncBinding();
+        Check(tabs.navStrip.ChildCount() == 2, "direct showAdd false rebuilds");
+        tabs.closableAll = false; tabs.SyncBinding();
+        Check(tabs.navStrip.ChildAt(0).ChildCount() == 1, "direct closableAll false rebuilds");
+        string css = "padding-left: 13px; background-color: #123456;";
+        Control plain = new Control(); plain.SetProp("style", css);
+        tabs.SetProp("style", css);
+        Check(tabs.GetProp("style") == plain.GetProp("style") && tabs.GetProp("tabStyle") == "card"
+            && tabs.Box(app).padL == 13 && tabs.Box(app).bg == StyleSheet.ParseColor("#123456"),
+            "CSS style retains base getter and effective padding/background");
+        tabs.SetProp("tabStyle", "line"); tabs.SetProp("style", "segment");
+        Check(tabs.GetProp("tabStyle") == "segment" && Style.Has(tabs.navStrip.Class, "segment")
+            && tabs.Box(app).padL == 13 && tabs.Box(app).bg == StyleSheet.ParseColor("#123456"),
+            "canonical and legacy semantic style writes preserve inline CSS");
+        Tabs copy = (Tabs)Html.Clone(tabs);
+        Check(copy != null && copy.Count() == 2 && copy.ChildCount() == 2 && copy.GetProp("tabStyle") == "segment"
+            && copy.navStrip.ChildCount() == 2, "Tabs clone retains canonical appearance without generated duplicates");
+        Tabs slots = new Tabs();
+        slots.SetProp("activeTab", "1");
+        slots.SetProp("options", "First|Second");
+        Check(slots.Count() == 2 && slots.GetProp("options") == "First|Second" && slots.Active() == 1,
+            "options materialize labels without losing early activeTab");
+        Button hidden = new Button("Hidden");
+        Button shown = new Button("Shown");
+        Check(slots.MountSlot("0", hidden) && slots.MountSlot("Second", shown),
+            "numeric and label slots mount page content");
+        Check(hidden.parent == slots.Page(0) && shown.parent == slots.Page(1)
+            && slots.Page(0).parent == slots.contentBox && slots.Page(1).parent == slots.contentBox
+            && !slots.Page(0).StyleVisible() && slots.Page(1).StyleVisible() && slots.ChildCount() == 2,
+            "late pages retain generated content parent and selected visibility");
+        Check(slots.SlotHost(1) == slots.Page(1) && slots.NamedSlotHost("default") == slots.Page(0),
+            "designer slot and default slot resolve existing pages");
+        slots.tabs[0].closable = true;
+        slots.tabs[0].Header(new Label("Header"));
+        slots.Extra(new Button("Extra"));
+        slots.BuildTree();
+        Tabs slotsCopy = (Tabs)Html.Clone(slots);
+        Check(slotsCopy != null && slotsCopy.Count() == 2 && slotsCopy.tabs[0] != slots.tabs[0]
+            && slotsCopy.tabs[0].closable && slotsCopy.tabs[0].headerSlot != slots.tabs[0].headerSlot
+            && slotsCopy.extraSlot != null && slotsCopy.extraSlot != slots.extraSlot,
+            "Tabs clone independently retains model header and extra content");
+        Check(slotsCopy.Active() == 1 && slotsCopy.ChildCount() == 2 && slotsCopy.contentBox.ChildCount() == 2
+            && slotsCopy.Page(0).ChildCount() == 1 && slotsCopy.Page(1).ChildCount() == 1
+            && slotsCopy.Page(0).ChildAt(0) != hidden && slotsCopy.Page(1).ChildAt(0) != shown
+            && slotsCopy.Page(0).ChildAt(0).parent == slotsCopy.Page(0)
+            && slotsCopy.Page(1).ChildAt(0).parent == slotsCopy.Page(1)
+            && !slotsCopy.Page(0).StyleVisible() && slotsCopy.Page(1).StyleVisible(),
+            "Tabs clone contains business children once with final page visibility");
+        slots.Select(0);
+        Check(slots.Page(0).StyleVisible() && !slots.Page(1).StyleVisible()
+            && slotsCopy.Active() == 1 && slotsCopy.Page(1).StyleVisible(),
+            "source selection updates pages without changing clone selection");
+        HtmlDoc parsed = Html.Parse("<zan-tabs id='slot-tabs' data-active-tab='1' data-options='First|Second'>"
+            + "<button id='slot-hidden' data-slot='0'>Hidden</button>"
+            + "<button id='slot-shown' data-slot='1'>Shown</button>"
+            + "<button id='child-tab-hidden' data-child-tab='0'>Hidden designer child</button>"
+            + "<button id='child-tab-shown' data-child-tab='1'>Shown designer child</button></zan-tabs>", "", null);
+        Tabs parsedTabs = (Tabs)parsed.Get("slot-tabs");
+        Control parsedHidden = parsed.Get("slot-hidden");
+        Control parsedShown = parsed.Get("slot-shown");
+        Control childTabHidden = parsed.Get("child-tab-hidden");
+        Control childTabShown = parsed.Get("child-tab-shown");
+        Check(parsedTabs != null && parsedHidden != null && parsedShown != null
+            && parsedTabs.Count() == 2 && parsedTabs.Active() == 1
+            && parsedHidden.parent == parsedTabs.Page(0)
+            && parsedShown.parent == parsedTabs.Page(1)
+            && !parsedTabs.Page(0).StyleVisible() && parsedTabs.Page(1).StyleVisible(),
+            "HTML numeric slots honor activeTab before child assembly");
+        Check(parsedTabs != null && childTabHidden != null && childTabShown != null
+            && childTabHidden.parent == parsedTabs.Page(0) && childTabShown.parent == parsedTabs.Page(1)
+            && parsedTabs.Page(0).ChildCount() == 2 && parsedTabs.Page(1).ChildCount() == 2
+            && !parsedTabs.Page(0).StyleVisible() && parsedTabs.Page(1).StyleVisible(),
+            "Designer childTab indices mount through numeric page slots with selected visibility");
+        slots.Select(1);
+        Button cloneFirstTab = (Button)slotsCopy.navStrip.ChildAt(0);
+        cloneFirstTab.Click.RaiseS(cloneFirstTab);
+        Check(slotsCopy.Active() == 0 && slots.Active() == 1 && slots.Page(1).StyleVisible()
+            && slotsCopy.Page(0).StyleVisible(), "cloned nav click selects clone without changing source");
+        Tabs globalClose = new Tabs();
+        globalClose.SetProp("closable", "true");
+        globalClose.SetProp("options", "First|Second");
+        Check(globalClose.navStrip.ChildAt(0).ChildCount() == 2, "global closable applies to options");
+        globalClose.SetProp("closable", "false");
+        Check(!globalClose.tabs[0].closable && !globalClose.tabs[1].closable
+            && globalClose.navStrip.ChildAt(0).ChildCount() == 1
+            && globalClose.navStrip.ChildAt(1).ChildCount() == 1,
+            "global closable false removes option close buttons without per-tab flags");
+        Tabs appended = new Tabs(); appended.Add("One");
+        TabPane secondPane = new TabPane(); secondPane.SetLabel("Two"); appended.AddPane(secondPane);
+        Check(appended.Count() == 2 && appended.LabelAt(0) == "One" && appended.LabelAt(1) == "Two"
+            && secondPane.parent == appended.Page(1), "Add then AddPane appends without replacing direct label");
+        Tabs predeclared = new Tabs(); predeclared.SetProp("options", "First|Second");
+        Control earlySecondPage = predeclared.NamedSlotHost("Second");
+        TabPane firstPane = new TabPane(); firstPane.SetLabel("First");
+        TabPane lastPane = new TabPane(); lastPane.SetLabel("Second");
+        predeclared.AddPane(firstPane); predeclared.AddPane(lastPane);
+        Check(predeclared.Count() == 2 && predeclared.LabelAt(0) == "First" && predeclared.LabelAt(1) == "Second"
+            && firstPane.parent == predeclared.Page(0) && lastPane.parent == earlySecondPage,
+            "precreated named page does not consume predeclared pane labels");
+        Tabs mixed = new Tabs(); mixed.SetProp("options", "First|Second"); mixed.Add("Third");
+        TabPane fourthPane = new TabPane(); fourthPane.SetLabel("Fourth"); mixed.AddPane(fourthPane);
+        Check(mixed.Count() == 4 && mixed.GetProp("options") == "First|Second|Third|Fourth"
+            && fourthPane.parent == mixed.Page(3), "direct Add ends predeclared pane consumption");
+        HtmlDoc paneDoc = Html.Parse("<zan-tabs id='pane-tabs' data-active-tab='1'>"
+            + "<tab-pane title='First'><button id='pane-first'>First</button></tab-pane>"
+            + "<tab-pane title='Second'><button id='pane-second'>Second</button></tab-pane></zan-tabs>", "", null);
+        Tabs paneTabs = (Tabs)paneDoc.Get("pane-tabs");
+        Control paneFirst = paneDoc.Get("pane-first");
+        Control paneSecond = paneDoc.Get("pane-second");
+        Check(paneTabs != null && paneFirst != null && paneSecond != null
+            && paneFirst.parent != null && paneSecond.parent != null
+            && paneTabs.Count() == 2 && paneTabs.GetProp("options") == "First|Second"
+            && paneTabs.Page(0).ChildCount() == 1 && paneTabs.Page(1).ChildCount() == 1
+            && paneFirst.parent.parent == paneTabs.Page(0)
+            && paneSecond.parent.parent == paneTabs.Page(1)
+            && !paneTabs.Page(0).StyleVisible() && paneTabs.Page(1).StyleVisible(),
+            "HTML two TabPane nodes consume predeclared labels once and retain page content");
+        Tabs filled = new Tabs(); filled.Add("First"); filled.Add("Second");
+        Button positioned = new Button("Positioned");
+        positioned.SetProp("style", "position:absolute;left:12px;top:14px;width:20px;height:20px;");
+        filled.Page(1).Add(positioned); filled.Select(1);
+        filled.UseApp(app);
+        for (int orientation = 0; orientation < 2; orientation = orientation + 1) {
+            filled.SetProp("orient", orientation == 0 ? "horizontal" : "vertical");
+            filled.MeasureTree(app); filled.Arrange(0, 0, 320, 240);
+            Control viewport = filled.contentBox;
+            Control activePage = filled.Page(1);
+            Check(viewport.bh > 100 && activePage.bh == viewport.bh
+                && activePage.by == viewport.by && activePage.bw == viewport.bw
+                && activePage.bx == viewport.bx,
+                "Tabs active page fills actual content viewport with only positioned children");
+            if (orientation == 0) {
+                Check(viewport.by == filled.navStrip.by + filled.navStrip.bh
+                    && viewport.by + viewport.bh == filled.by + filled.bh - filled.StyleInsetB(),
+                    "horizontal Tabs content fills remaining height below retained nav");
+            } else {
+                Check(viewport.bh == filled.bh - filled.StyleInsetT() - filled.StyleInsetB()
+                    && viewport.bx == filled.navStrip.bx + filled.navStrip.bw,
+                    "vertical Tabs content fills height beside retained nav");
+            }
+        }
+        Console.WriteLine("tabs retained properties OK");
+    }
+
+    static void FieldFlowBoundaries() {
+        HtmlDoc local = Html.Parse("<body><panel id='local-mark' data-zan-design>"
+            + "<button id='local-field' data-span='12'>Local</button></panel>"
+            + "<panel id='plain-host'><button id='plain-field' data-span='12'>Plain</button></panel></body>", "", null);
+        Control localHost = local.Get("local-mark");
+        Control localField = local.Get("local-field");
+        Control plainHost = local.Get("plain-host");
+        Control plainField = local.Get("plain-field");
+        Check(localHost != null && localField != null && plainHost != null && plainField != null
+            && localField.parent == localHost && plainField.parent == plainHost,
+            "local design marker does not enable field wrapping anywhere in document");
+        HtmlDoc unresolved = Html.Parse("<body data-zan-design><zan-tabs id='fallback-tabs' data-options='First|Second'>"
+            + "<button id='fallback-field' data-slot='missing' data-span='12' data-label='Caption'>Field</button>"
+            + "</zan-tabs></body>", "", null);
+        Control fallbackHost = unresolved.Get("fallback-tabs");
+        Control fallbackField = unresolved.Get("fallback-field");
+        Check(fallbackHost != null && fallbackField != null && fallbackField.parent == fallbackHost
+            && fallbackHost.ChildCount() == 3 && fallbackHost.ChildAt(2) == fallbackField,
+            "unresolved slot preserves ordinary AddChild fallback without wrappers");
+        HtmlDoc ordered = Html.Parse("<body data-zan-design><panel id='flow-order'>"
+            + "<button id='field-a' data-span='12'>A</button>"
+            + "<button id='field-b' data-position='Float'>B</button>"
+            + "<button id='field-c' data-span='12'>C</button>"
+            + "<button id='field-d' data-span='12'>D</button></panel></body>", "", null);
+        Control orderHost = ordered.Get("flow-order");
+        Control fieldA = ordered.Get("field-a");
+        Control fieldB = ordered.Get("field-b");
+        Control fieldC = ordered.Get("field-c");
+        Control fieldD = ordered.Get("field-d");
+        Check(orderHost != null && fieldA != null && fieldB != null && fieldC != null && fieldD != null
+            && orderHost.ChildCount() == 3 && orderHost.ChildAt(0) is FbFlow
+            && orderHost.ChildAt(1) == fieldB && orderHost.ChildAt(2) is FbFlow
+            && fieldA.parent == orderHost.ChildAt(0) && fieldC.parent == orderHost.ChildAt(2)
+            && fieldD.parent == fieldC.parent && fieldA.parent != fieldC.parent,
+            "ordinary sibling ends flow segment while consecutive fields share new flow");
+        HtmlDoc switched = Html.Parse("<body data-zan-design><zan-tabs id='flow-slots' data-options='First|Second'>"
+            + "<button id='slot-a' data-slot='0' data-span='12'>A</button>"
+            + "<button id='slot-b' data-slot='1' data-span='12'>B</button>"
+            + "<button id='slot-c' data-slot='0' data-span='12'>C</button></zan-tabs></body>", "", null);
+        Tabs slotHost = (Tabs)switched.Get("flow-slots");
+        Control slotA = switched.Get("slot-a");
+        Control slotB = switched.Get("slot-b");
+        Control slotC = switched.Get("slot-c");
+        Check(slotHost != null && slotA != null && slotB != null && slotC != null
+            && slotHost.Page(0).ChildCount() == 2 && slotHost.Page(1).ChildCount() == 1
+            && slotA.parent != slotC.parent, "slot host changes end contiguous helper flow");
+        HtmlDoc defaults = Html.Parse("<body data-zan-design>"
+            + "<zan-tabs id='default-tabs' data-active-tab='1' data-options='First|Second'>"
+            + "<input id='default-tab-field' data-span='12' data-label='Hidden caption'></zan-tabs>"
+            + "<split-panel id='default-split'><input id='default-split-field' data-span='12'"
+            + " data-label='First pane'></split-panel></body>", "", null);
+        Tabs defaultTabs = (Tabs)defaults.Get("default-tabs");
+        Control tabField = defaults.Get("default-tab-field");
+        Check(defaultTabs != null && tabField != null && tabField.parent is FbStack
+            && tabField.parent.parent is FbFlow && tabField.parent.parent.parent == defaultTabs.Page(0)
+            && defaultTabs.ChildCount() == 2 && defaultTabs.Page(0).ChildCount() == 1
+            && !defaultTabs.Page(0).StyleVisible() && defaultTabs.Active() == 1,
+            "omitted childTab zero wraps field inside default hidden Tabs page");
+        SplitPanel defaultSplit = (SplitPanel)defaults.Get("default-split");
+        Control splitField = defaults.Get("default-split-field");
+        Check(defaultSplit != null && splitField != null && splitField.parent is FbStack
+            && splitField.parent.parent is FbFlow && splitField.parent.parent.parent == defaultSplit.First()
+            && defaultSplit.NamedSlotHost("") == defaultSplit.First()
+            && defaultSplit.NamedSlotHost("default") == defaultSplit.First()
+            && defaultSplit.ChildCount() == 2 && defaultSplit.Second().ChildCount() == 0,
+            "omitted childTab zero wraps field inside default SplitPanel first pane");
+    }
+
+    static void Main() {
+        ControlBootstrap.Install();
+        App app = App.CreateOffscreen("retained properties", 320, 240);
+        GroupedCssIsolation();
+        HtmlButtonFirstMeasure(app);
+        ButtonProperties(app);
+        CollapseProperties();
+        TabsProperties(app);
+        FieldFlowBoundaries();
+    }
+}

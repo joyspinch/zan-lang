@@ -4,10 +4,8 @@ using Gui;
 namespace Gui.Widget;
 
 public class RadioGroup : ChoiceGroup {
-    // 组真相：当前选中选项的 value。
-    public SignalInt model;
-    // 组级双向绑定：写的是选中选项的 value（越界/禁用的值不生效）。
-    public Binding<int> data;
+    // 选中选项的值，子单选按钮直接共享这一绑定。
+    public Binding<int> Value;
     // 连体按钮段形态开关：true 时子项是段形态 Radio（`radiobutton`
     // 样式族），false 是圆点 Radio。两种形态同一套子项管理。
     public Binding<bool> Buttons;
@@ -25,26 +23,21 @@ public class RadioGroup : ChoiceGroup {
     // 构造：默认选中 value 0（第 0 项）。
     public RadioGroup() {
         this.InitChoice();
-        this.model = new SignalInt(0);
+        this.Value = 0;
         this.optionMetas = new List<RadioOptionMeta>();
         this.Buttons = false;
         this.Size = "medium";
         this.Change = new UiEvent();
     }
 
-    // 选中信号。默认形态（圆点）且未设自定义 value 时与
-    // `SelectedIndex()` 等价（value = 下标）；组真相始终是它，
-    // 用 `SelectedValue()` / `SetSelectedValue()` 读写更稳。
-    public SignalInt Selected() { return this.model; }
-
     // 当前选中的选项 value（= model 现值）。
-    public int SelectedValue() { return this.model.Get(); }
+    public int SelectedValue() { return this.Value.Get(); }
 
     // 当前选中项的下标；model 值没有对应选项时回退：value 走
     // 下标语义（没有任何自定义 value）则 model 现值就是下标，
     // 越界时收进最后一项；自定义 value 而无匹配才是 -1。
     public int SelectedIndex() {
-        int v = this.model.Get();
+        int v = this.Value.Get();
         for (int i = 0; i < this.optionMetas.Count; i = i + 1) {
             if (this.optionMetas[i].value == v) { return i; }
         }
@@ -74,9 +67,8 @@ public class RadioGroup : ChoiceGroup {
         int i = this.IndexOfValue(v);
         if (i < 0) { return; }
         if (i < this.optionMetas.Count && this.optionMetas[i].disabled) { return; }
-        if (this.model.Get() == v) { return; }
-        this.model.Set(v);
-        if (data != null) { data.Set(v); }
+        if (this.Value.Get() == v) { return; }
+        this.Value.Set(v);
     }
 
     // 程序化选中第 index 个选项（静默）。越界 / 禁用无操作。
@@ -107,7 +99,7 @@ public class RadioGroup : ChoiceGroup {
     public void SetOptions(List<RadioOption> opts) {
         for (int i = 0; i < opts.Count; i = i + 1) {
             RadioOption o = opts[i];
-            int v = o.hasValue ? o.value : this.children.Count;
+            int v = o.hasValue ? o.value : this.ChildCount();
             Control item = this.AddOption(o.label, v, o.disabled);
             if (item != null && o.cls != "") { item.AddClass(o.cls); }
         }
@@ -119,29 +111,16 @@ public class RadioGroup : ChoiceGroup {
     public void SyncGroup() {
         // 文本/JSON 路径（SetOptionsText）只经基类 AddOption，元数据
         // 在这里补齐：value = 下标、不禁用。
-        while (this.optionMetas.Count < this.children.Count) {
+        while (this.optionMetas.Count < this.ChildCount()) {
             this.optionMetas.Add(new RadioOptionMeta(this.optionMetas.Count, false));
-        }
-        if (data != null) {
-            int cur = data.Get();
-            if (cur != this.model.Get()) {
-                int i = this.IndexOfValue(cur);
-                bool ok = this.children.Count == 0;
-                if (i >= 0 && i < this.optionMetas.Count
-                    && !this.optionMetas[i].disabled) { ok = true; }
-                if (ok) { this.model.Set(cur); }
-                else {
-                    // 绑定字段里是脏值（无此选项/禁用）：回写 model 现值。
-                    data.Set(this.model.Get());
-                }
-            }
         }
         string sizeCls = Control.SizeClass(this.Size.Get());
         bool segForm = this.Buttons.Get();
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            Control c = this.children[i];
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control c = this.ChildAt(i);
             if (!(c is Radio)) { continue; }
             Radio r = (Radio)c;
+            r.Value = Value;
             if (i < this.optionMetas.Count) {
                 r.optionValue = this.optionMetas[i].value;
                 r.Disabled = this.optionMetas[i].disabled;
@@ -151,7 +130,7 @@ public class RadioGroup : ChoiceGroup {
                 // 连体段接缝：首段恢复左边框、尾段收外侧圆角
                 // （`rb-first`/`rb-last` 类，CSS 段规则配套）。
                 if (i == 0) { r.AddClass("rb-first"); } else { r.RemoveClass("rb-first"); }
-                if (i == this.children.Count - 1) { r.AddClass("rb-last"); } else { r.RemoveClass("rb-last"); }
+                if (i == this.ChildCount() - 1) { r.AddClass("rb-last"); } else { r.RemoveClass("rb-last"); }
             }
         }
     }
@@ -167,15 +146,10 @@ public class RadioGroup : ChoiceGroup {
         return false;
     }
 
-    // 用户切换后把 model 现值回写组级绑定。
-    private void PushValue() {
-        if (data != null) { data.Set(this.model.Get()); }
-    }
-
     // 清空全部选项（两种形态共用）：用于从文本/JSON 重建选项；
     // 覆写基类以连元数据一起清。
     public override void ClearOptions() {
-        this.children.Clear();
+        this.RemoveAll();
         this.labels.Clear();
         this.optionMetas.Clear();
     }
@@ -190,7 +164,7 @@ public class RadioGroup : ChoiceGroup {
         while (this.optionMetas.Count <= index) {
             this.optionMetas.Add(new RadioOptionMeta(this.optionMetas.Count, false));
         }
-        Radio r = new Radio(this.model, this.optionMetas[index].value, text,
+        Radio r = new Radio(this.Value, this.optionMetas[index].value, text,
             this.Buttons.Get());
         r.Disabled = this.optionMetas[index].disabled;
         // 组级联动经 OnChildEvent 冒泡（见下），不再挂捕获组的闭包
@@ -202,8 +176,7 @@ public class RadioGroup : ChoiceGroup {
     // 再触发组 Change——与旧闭包接线同序。
     public override void OnChildEvent(Control child, string evt) {
         if (evt == "Change") {
-            this.PushValue();
-            this.Change.RaiseS(this);
+                this.Change.RaiseS(this);
         }
     }
 
@@ -229,7 +202,7 @@ public class RadioGroup : ChoiceGroup {
                 this.Buttons.Set(want);
                 // 形态切换：children 按新形态整体重建（圆点=圆环+标签，
                 // 段=单标签），labels 与元数据不动。
-                this.children.Clear();
+                this.RemoveAll();
                 for (int i = 0; i < this.labels.Count; i = i + 1) {
                     this.Add(this.MakeItem(i, this.labels[i]));
                 }
@@ -279,11 +252,11 @@ public class RadioGroup : ChoiceGroup {
                         if (lbl == "") { lbl = it.Str("name", ""); }
                         if (lbl == "") { lbl = it.Str("title", ""); }
                         if (lbl == "") { lbl = it.Str("text", ""); }
-                        int val = it.Int("value", this.children.Count);
+                        int val = it.Int("value", this.ChildCount());
                         bool dis = it.Bool("disabled", false);
                         this.AddOption(lbl, val, dis);
                     } else {
-                        this.AddOption(it.AsString(""), this.children.Count, false);
+                        this.AddOption(it.AsString(""), this.ChildCount(), false);
                     }
                 }
                 return;
@@ -297,25 +270,25 @@ public class RadioGroup : ChoiceGroup {
                 dis = true;
                 current = current.Substring(0, current.Length - 1);
             }
-            this.AddOption(current, this.children.Count, dis);
+            this.AddOption(current, this.ChildCount(), dis);
         }
     }
 
     // 覆写：基类清单之外追加 buttons/size/value（value 优先指向
     // 活的外部绑定）。
-    public override List<PropSpec> Props() {
-        List<PropSpec> ps = base.Props();
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = base.DefineProps();
         PropSpec btn = PropSpec.Bool("buttons", "Buttons");
-        btn.flag = Buttons;
+        btn.Field("Buttons", 2);
         btn.WithTip("Button-style radio group (Element Plus radio-button)");
         ps.Add(btn);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.str = Size;
+        sz.Field("Size", 0);
         ps.Add(sz);
         // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        PropSpec val = PropSpec.Int("value", "Selected");
-        if (data != null) { val.num = data; } else { val.snum = model; }
+        PropSpec val = PropSpec.Int("value", "Selected").DefaultBinding();
+        val.Field("Value", 1);
         val.Also("data");
         ps.Add(val);
         return ps;
@@ -324,14 +297,14 @@ public class RadioGroup : ChoiceGroup {
     // 覆写："Change" 挂组事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
     // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
 

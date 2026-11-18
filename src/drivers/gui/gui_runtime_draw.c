@@ -20,21 +20,23 @@ EXPORT void zan_gui_draw_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
 #define ZAN_CORNER_BR 4
 #define ZAN_CORNER_BL 8
 
-static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
-                           int radius, int mask, u32 c) {
+#include "gui_runtime_initial_fill.c"
+
+static void zan_shape_fill_round(zan_surface_t *s, int x, int y, int w, int h,
+                                  int radius, int mask, u32 c, int initial) {
     int r = radius;
     int ix = x, iy = y, iw = w, ih = h;
     int m = mask;
-    if (r <= 0 || (m & 15) == 0) { cpu_fill_rect(s, x, y, w, h, c); return; }
+    if (r <= 0 || (m & 15) == 0) { zan_shape_fill_rect(s, x, y, w, h, c, initial); return; }
     if (r > iw/2) r = iw/2;
     if (r > ih/2) r = ih/2;
     ZAN_STAT(g_st_round, (long long)iw * (long long)ih);
 
     int xl = ix + r, xr = ix + iw - r;
     int yt = iy + r, yb = iy + ih - r;
-    cpu_fill_rect(s, xl, iy, iw - 2*r, r, c);
-    cpu_fill_rect(s, ix, yt, iw, ih - 2*r, c);      /* middle */
-    cpu_fill_rect(s, xl, yb, iw - 2*r, r, c);
+    zan_shape_fill_rect(s, xl, iy, iw - 2*r, r, c, initial);
+    zan_shape_fill_rect(s, ix, yt, iw, ih - 2*r, c, initial);      /* middle */
+    zan_shape_fill_rect(s, xl, yb, iw - 2*r, r, c, initial);
 
     double cc[4][2] = {
         {xl, yt},     /* TL, square px<xl, py<yt */
@@ -47,7 +49,7 @@ static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
     int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
     for (int ci = 0; ci < 4; ci++) {
         if (!(m & bit[ci])) {
-            cpu_fill_rect(s, zx[ci], zy[ci], r, r, c);
+            zan_shape_fill_rect(s, zx[ci], zy[ci], r, r, c, initial);
             continue;
         }
         double ccx = cc[ci][0], ccy = cc[ci][1];
@@ -57,11 +59,29 @@ static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
                 double ddy = (double)py + 0.5 - ccy;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
                 double cov = (double)r - dist + 0.5;
-                if (cov >= 1.0) set_pixel(s, px, py, c);
-                else if (cov > 0.0) set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+                if (cov >= 1.0) zan_shape_fill_pixel(s, px, py, c, 255, initial);
+                else if (cov > 0.0) zan_shape_fill_pixel(s, px, py, c, (int)(cov * 255.0), initial);
             }
         }
     }
+}
+
+static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
+                           int radius, int mask, u32 c) {
+    zan_shape_fill_round(s, x, y, w, h, radius, mask, c, 0);
+}
+
+/* Internal shape background entry; other backends retain their old painter. */
+EXPORT void zan_gui_fill_initial_shape(i32 surface_id, i32 x, i32 y, i32 w,
+    i32 h, i32 radius, i32 color) {
+    if (surface_id < 0 || surface_id >= g_surface_count || w <= 0 || h <= 0) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s) return;
+    if (s->be && s->be != &zan_cpu_backend) {
+        ZAN_IMPL(s, fill_round)->fill_round(s, x, y, w, h, radius, 15, (u32)color);
+        return;
+    }
+    zan_shape_fill_round(s, x, y, w, h, radius, 15, (u32)color, 1);
 }
 
 EXPORT void zan_gui_fill_rounded_rect_mask(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 mask, i32 color) {

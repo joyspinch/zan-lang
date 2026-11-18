@@ -1,0 +1,159 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class StyledTextBindingProbe {
+    public int value;
+    public int calls;
+    public weak App app;
+    public weak StyledText text;
+    public Control replacement;
+    public bool nested;
+    public int Value {
+        get { return value; }
+        set {
+            this.value = value; calls = calls + 1;
+            App host = app; StyledText target = text;
+            if (replacement != null && host != null) {
+                Control next = replacement; replacement = null; host.SetRootControl(next);
+            }
+            if (nested && host != null && target != null) {
+                nested = false; target.scrollBar.Set(0); target.Arrange(target.bx, target.by, target.bw, target.bh);
+                host.ProcessOffscreenInput(2, target.bx + 25, target.by + 15, 0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+class StyledTextPreparationInputTest {
+    static void Check(bool value, string label) { if (!value) { throw new Exception(label); } }
+    static void Event(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Layout(App app, StyledText text, int w, int h) {
+        text.UseApp(app); text.MeasureTree(app); text.Arrange(10, 10, w, h); app.SetRootControl(text);
+    }
+    static TextRun Header(string name, string initial, string role) {
+        TextRun line = TextRun.Create(name, 0xFFFFFFFF, 3);
+        line.ava = initial; line.tagCls = role; line.status = "running"; line.pct = 25; line.time = "12:34";
+        return line;
+    }
+    static List<TextRun> Lines(int count) {
+        List<TextRun> lines = new List<TextRun>();
+        for (int i = 0; i < count; i = i + 1) { lines.Add(TextRun.Create("row " + Convert.ToString(i), 0xFFFFFFFF, 0)); }
+        return lines;
+    }
+    static int CountKind(Control root, string kind) {
+        int count = root.Kind() == kind ? 1 : 0;
+        for (int i = 0; i < root.ChildCount(); i = i + 1) { count = count + CountKind(root.ChildAt(i), kind); }
+        return count;
+    }
+    static void Paint(App app, StyledText text) {
+        app.BeginOffscreenFrame(); text.RenderTree(app); app.EndOffscreenFrame();
+    }
+    static int[] Pixels(App app) {
+        int width = app.canvas.Width(); int height = app.canvas.Height(); int[] pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) { pixels[y * width + x] = app.canvas.GetPixel(x, y); }
+        }
+        return pixels;
+    }
+    static void DefaultAndChildren(App app) {
+        StyledText text = new StyledText();
+        Check(text.thinkOpen != null && text.thinkOpen.Get() == 0 && text.scrollBar != null && text.scrollBar.Get() == 0,
+        "constructor has valid zero bindings");
+        Layout(app, text, 520, 200);
+        Check(text.ScrollTop() == 0 && text.maxScroll == 0, "empty default Arrange is safe");
+        text.lines = new List<TextRun>();
+        text.lines.Add(Header("First", "A", "primary")); text.lines.Add(Header("Second", "B", "success"));
+        text.lines.Add(TextRun.Create("selectable", 0xFFFFFFFF, 0));
+        text.busy = true; text.busyText = "Waiting"; text.sel = new LogState(); text.interactive = true;
+        text.Arrange(10, 10, 520, 200);
+        Control viewport = text.ChildAt(0);
+        Check(CountKind(text, "Avatar") == 2 && CountKind(text, "Tag") == 6, "each visible header owns distinct real child parts");
+        Control first = viewport.ChildAt(1); Control second = viewport.ChildAt(2);
+        Avatar firstAvatar = (Avatar)first.ChildAt(0); Avatar secondAvatar = (Avatar)second.ChildAt(0);
+        Check(first != second && firstAvatar != secondAvatar && firstAvatar.Label() == "A" && secondAvatar.Label() == "B",
+        "header values do not alias another row");
+        Check(first.parent == viewport && firstAvatar.FindApp() == app && firstAvatar.bw > 0,
+        "headers adopted measured arranged before first Paint");
+        Label busy = (Label)viewport.ChildAt(0);
+        Check(busy.GetText() == "Waiting" && busy.bw > 0 && busy.StyleVisible(), "busy Label prepared before first Paint");
+        text.Arrange(10, 10, 520, 200);
+        Check(viewport.ChildAt(1) == first && viewport.ChildAt(2) == second, "unchanged layout keeps persistent children");
+        int rowH = StyledText.RowH(app); Rect view = text.ScrollViewport();
+        Event(app, 2, text.bx + 25, view.y + rowH * 2 + rowH / 2, 0, 0);
+        Event(app, 1, text.bx + 95, view.y + rowH * 2 + rowH / 2, 0, 0);
+        Event(app, 3, text.bx + 95, view.y + rowH * 2 + rowH / 2, 0, 0);
+        Check(text.sel.HasSelection() && !text.sel.selDrag && app.GetCapturedPointer() == null, "real first-Paint-free selection drag commits");
+        app.FreezeAnimClock(1000); Paint(app, text); int[] before = Pixels(app);
+        int scroll = text.ScrollTop(); int version = text.scrollBar.Version(); int selected = text.sel.selC1;
+        string prepared = ((Tag)first.ChildAt(1)).Label();
+        text.lines[0].text = "not prepared"; text.busyText = "not prepared";
+        Paint(app, text); int[] after = Pixels(app);
+        for (int i = 0; i < before.Length; i = i + 1) { Check(before[i] == after[i], "repeated Paint consumes identical prepared pixels"); }
+        Check(text.ScrollTop() == scroll && text.scrollBar.Version() == version && text.sel.selC1 == selected
+        && ((Tag)first.ChildAt(1)).Label() == prepared && busy.GetText() == "Waiting",
+        "Paint cannot import inputs write bindings mutate children or selection");
+        app.UnfreezeAnimClock(); app.SetRootControl(null);
+    }
+    static void InputsAndScroll(App app) {
+        StyledText text = new StyledText(); text.lines = Lines(30); text.interactive = true;
+        text.sel = new LogState(); text.toolOpen = new List<int>();
+        text.lines[0].kind = 4; text.lines[1].kind = 5; text.lines[1].meta = 7;
+        Layout(app, text, 520, 150);
+        Rect view = text.ScrollViewport(); int rowH = StyledText.RowH(app);
+        Binding<int> binding = text.scrollBar;
+        binding.Set(text.maxScroll);
+        Event(app, 2, view.x + 25, view.y + rowH / 2, 0, 0);
+        Check(text.ScrollTop() == 0 && text.thinkOpen.Get() == 1 && !text.sel.selDrag,
+        "external Set imports before real Down and default think toggles without Paint");
+        Event(app, 3, view.x + 25, view.y + rowH / 2, 0, 0);
+        Event(app, 2, view.x + 25, view.y + rowH + rowH / 2, 0, 0);
+        Event(app, 3, view.x + 25, view.y + rowH + rowH / 2, 0, 0);
+        Check(text.toolOpen.Count == 1 && text.toolOpen[0] == 7, "tool row toggles before Paint exactly once");
+        Event(app, 13, view.x + 25, view.y + 15, 0, -120);
+        int offset = text.ScrollTop();
+        Check(offset > 0 && binding.Get() > 0 && text.scrollBar == binding, "shared wheel commits sole Binding");
+        int projected = binding.Get(); binding.Set(projected);
+        Event(app, 1, view.x + 25, view.y + 15, 0, 0);
+        int expected = Math.Max(0, text.ScrollExtent() - view.height - projected * rowH);
+        Check(text.ScrollTop() == expected, "same-valued external Set is a new exact row request");
+        text.SetScrollTop(0);
+        ScrollState metrics = new ScrollState(); Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        int tx = track.x + track.width / 2; int ty = view.y + metrics.ThumbLength(app, view.height, text.ScrollExtent()) / 2;
+        Event(app, 2, tx, ty, 0, 0);
+        Check(app.GetCapturedPointer() == text && !text.sel.selDrag, "shared scrollbar owns capture before content drag");
+        Event(app, 1, tx, ty + 25, 0, 0); Event(app, 3, tx, ty + 30, 0, 0);
+        Check(text.ScrollTop() > 0 && app.GetCapturedPointer() == null, "shared scrollbar Move Up commit and retire capture");
+        int before = text.ScrollTop(); int version = binding.Version(); Paint(app, text); Paint(app, text);
+        Check(text.ScrollTop() == before && binding.Version() == version, "Paint cannot replay scrollbar or wheel");
+        binding.Set(0); Event(app, 1, view.x + 25, view.y + 15, 0, 0);
+        int bottom = text.ScrollTop(); text.lines.Add(TextRun.Create("append", 0xFFFFFFFF, 0)); text.Arrange(10, 10, 520, 150);
+        Check(binding.Get() == 0 && text.ScrollTop() == bottom + rowH, "append preserves exact bottom anchor");
+        app.SetRootControl(null);
+    }
+    static void CallbackGuards(App app) {
+        StyledText text = new StyledText(); text.lines = Lines(30); text.interactive = true; text.sel = new LogState();
+        StyledTextBindingProbe probe = new StyledTextBindingProbe(); probe.app = app; probe.text = text;
+        text.scrollBar = probe.Value; Layout(app, text, 520, 150);
+        Control replacement = new Control(); replacement.UseApp(app); replacement.MeasureTree(app); replacement.Arrange(0, 0, 600, 300);
+        probe.replacement = replacement; text.scrollBar.Set(100000);
+        // Arm a callback only for preparation's clamp, not the external request itself.
+        app.SetRootControl(text); probe.replacement = replacement; probe.value = 100000;
+        Rect view = text.ScrollViewport(); Event(app, 2, view.x + 25, view.y + 15, 0, 0);
+        Check(app.rootControl == replacement && !text.sel.selDrag && app.GetCapturedPointer() == null,
+        "binding clamp root replacement consumes stale input before selection");
+        app.SetRootControl(text); probe.value = 0; text.Arrange(10, 10, 520, 150);
+        probe.value = 100000; probe.nested = true;
+        Event(app, 2, view.x + 25, view.y + 15, 0, 0);
+        Check(text.scrollBar.Get() == 0 && text.ScrollTop() == text.ScrollExtent() - view.height,
+        "nested setter Arrange and input own newer scroll request");
+        app.ReleasePointerCapture(); text.sel.selDrag = false; app.SetRootControl(null);
+    }
+    static int Main() {
+        App app = App.CreateOffscreen("StyledText retained preparation", 600, 300);
+        DefaultAndChildren(app); InputsAndScroll(app); CallbackGuards(app);
+        app.canvas.Destroy(); Console.WriteLine("PASS styledtext prepared children input binding guards paint"); return 0;
+    }
+}

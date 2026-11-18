@@ -5,7 +5,7 @@
 // 2) OnCreate 钩子：装载之后、宿主创建之前恰好调一次（时序同旧"先 Build
 //    再 OpenHost"）；ViewModel() 覆写换挂 JsonValue 模型（bind 走它、事件
 //    仍解析窗方法，JsonValue 键不是反射字段——bind 对账跳过）；
-// 3) 默认模型 = 窗自身：data-bind/z-text 初始推送 + 改字段一帧同步；
+// 3) 默认模型 = 窗自身：bind/bind:text 初始推送 + 改字段一帧同步；
 //    :options 绑 List<string> 字段、:disabled 绑 bool 字段；z-mount 把
 //    OnCreate 里建的 Control 字段挂进槽位；
 // 4) 装配序：@click 自动接线到实例方法（UiEvent.Raise 模拟点击）、OnLoad
@@ -16,6 +16,7 @@ using System;
 using System.Collections.Generic;
 using System.Json;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
 
 class FlatCw : ChildWindow {
@@ -68,14 +69,148 @@ class CloseRecursionCw : ChildWindow {
     }
 }
 
-// z-text + 裸 readonly 通道：textarea 文本绑定实例字段（bindProp=text
+// bind:text + 裸 readonly 通道：textarea 文本绑定实例字段（BindingAt(0).Property=text
 // 初始推送 + 一帧同步）；裸 readonly 属性经 Html 属性协议落
 // PropSpec("readonly") 真生效。
 class TextCw : ChildWindow {
     public string introText = "hello";
 }
 
+// ConfigWindow-style dynamic options use the binder's string dictionary model.
+// SetView must validate keys rather than reflecting the dictionary as a POCO.
+class DictionaryCw : ChildWindow {
+    public Dictionary<string, string> state;
+    public List<string> optionKeys;
+    public int closeRequests;
+    int activeTab;
+
+    public DictionaryCw() {
+        state = new Dictionary<string, string>();
+        state["tab"] = "0";
+        optionKeys = new List<string>();
+        optionKeys.Add("skins");
+        optionKeys.Add("strictMemory");
+        optionKeys.Add("denyWarnings");
+        optionKeys.Add("macMultiInstance");
+        optionKeys.Add("secStripSymbols");
+        optionKeys.Add("secHideDiagnostics");
+        optionKeys.Add("secObfStrings");
+        optionKeys.Add("skin_porcelain");
+        optionKeys.Add("skin_graphite");
+        optionKeys.Add("skin_navy");
+        HtmlDoc doc = Html.Parse("<div class='col'><input id='config' type='radio' bind='tab' option='0'>"
+        + "<input id='assets' type='radio' bind='tab' option='1'></div>", "", null);
+        Control view = doc.root;
+        for (int i = 0; i < optionKeys.Count; i = i + 1) {
+            string key = optionKeys[i];
+            state[key] = i % 2 == 0 ? "1" : "0";
+            Checkbox option = new Checkbox(key);
+            option.name = key;
+            option.BindPath(key);
+            view.Add(option);
+        }
+        this.SetView(view, state);
+    }
+
+    override int Height() { return 700; }
+    override void OnCloseRequested() { closeRequests = closeRequests + 1; }
+
+    override void AfterFrame() {
+        // ConfigWindow schedules its changed page after native-frame writeback.
+        int tab = Convert.ToInt32(state["tab"]);
+        if (tab != activeTab) {
+            activeTab = tab;
+            this.RequestRedraw();
+        }
+    }
+}
+
 class CaseMain {
+    static void Check(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static void Dispatch(DictionaryCw window, App parent, int kind, int x, int y) {
+        App app = window.Host();
+        long before = app.window.EventSeq();
+        app.window.InjectEvent(kind, x, y, 0, 0, 0);
+        // The parent pumps the process queue and ChildWindows.RouteEvent sends
+        // this native event to ChildWindow.ApplyEvent exactly once by sequence.
+        for (int attempt = 0; attempt < 128; attempt = attempt + 1) {
+            Check(parent.PollOneEvent() >= 0, "dictionary window event pump stays open");
+            if (app.window.EventSeq() > before && Window.EventHwnd() == app.WindowHandle()
+            && app.window.EventKind() == kind && app.window.EventX() == x && app.window.EventY() == y) { return; }
+        }
+        throw new Exception("dictionary window receives the injected native event");
+    }
+
+    static void Click(DictionaryCw window, App parent, Control control) {
+        App app = window.Host();
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Check(control.bw > 0 && control.bh > 0, "dictionary window input is arranged: " + control.name);
+        Control hit = window.View().HitTest(x, y, 0);
+        while (hit != null && hit != control) { hit = hit.parent; }
+        Check(hit == control, "native click hits the requested control: " + control.name);
+        Dispatch(window, parent, 2, x, y);
+        Check(control.IsPressed(), "native pointer down reaches the requested control: " + control.name);
+        Dispatch(window, parent, 3, x, y);
+        Check(!control.IsPressed(), "native pointer up releases the requested control: " + control.name);
+        app.DrainPosts();
+    }
+
+    static void DictionaryWindow(App parent) {
+        DictionaryCw window = new DictionaryCw();
+        window.OpenHost(parent);
+        Control view = window.View();
+        Radio config = (Radio)view.Find("config");
+        Radio assets = (Radio)view.Find("assets");
+        Check(config != null && assets != null && config.IsSelected() && !assets.IsSelected(),
+        "dictionary window initializes both tab bindings");
+        Click(window, parent, assets);
+        Check(window.state["tab"] == "1" && assets.IsSelected(),
+        "real radio input writes the dictionary tab: model=" + window.state["tab"]
+        + ", assets=" + assets.GetProp("value") + ", config=" + config.GetProp("value"));
+        // Native routing already committed the changed control. Like ConfigWindow,
+        // AfterFrame requests the next page frame, which updates the sibling too.
+        Check(window.NeedsRedraw(), "tab change schedules the next configuration page frame");
+        window.Render();
+        Check(!config.IsSelected() && assets.IsSelected(), "dictionary tab synchronizes to both radio controls");
+        for (int i = 0; i < window.optionKeys.Count; i = i + 1) {
+            string key = window.optionKeys[i];
+            Checkbox option = (Checkbox)view.Find(key);
+            bool initial = i % 2 == 0;
+            Check(option != null && option.GetProp("value") == (initial ? "true" : "false"),
+            "dictionary window initializes static and dynamic options: " + key);
+            Click(window, parent, option);
+            Check(option.GetProp("value") == (initial ? "false" : "true")
+            && window.state[key] == (initial ? "false" : "true"),
+            "real checkbox input writes its dictionary key: " + key);
+            window.state[key] = initial ? "1" : "0";
+            window.RequestRedraw();
+            window.Render();
+            Check(option.GetProp("value") == (initial ? "true" : "false"),
+            "dictionary model changes synchronize back to the checkbox: " + key);
+        }
+        List<string> missing = new List<string>();
+        DocWire.CollectBinds(view, window.state, missing);
+        Check(missing.Count == 0, "all ConfigWindow-style dictionary bindings validate");
+        window.state.Remove("skin_navy");
+        DocWire.CollectBinds(view, window.state, missing);
+        Check(missing.Count == 1 && missing[0] == "skin_navy", "missing dynamic dictionary key remains a binding error");
+        window.Close();
+        Check(!window.IsOpen() && window.closeRequests == 1, "dictionary window closes through its normal lifecycle");
+
+        Dictionary<string, double> numbers = new Dictionary<string, double>();
+        numbers["nested.amount"] = 0.0;
+        Check(DocWire.FieldExists(numbers, "nested.amount") && !DocWire.FieldExists(numbers, "missing"),
+        "numeric dictionary validates complete keys and rejects absent keys");
+        Dictionary<string, bool> flags = new Dictionary<string, bool>();
+        flags["enabled"] = false;
+        Check(DocWire.FieldExists(flags, "enabled") && !DocWire.FieldExists(flags, "missing"),
+        "boolean dictionary accepts false values and rejects absent keys");
+    }
+
     static int Main() {
         Html.Install();
         ControlBootstrap.Install();
@@ -87,6 +222,7 @@ class CaseMain {
 
         // 1+2+3+4：装配全链（窗代码零装载语句）
         App host = App.CreateDark("cwdocscan", 320, 240);
+        DictionaryWindow(host);
         FlatCw f = new FlatCw();
         f.OpenHost(host);
         if (f.root == null || f.root.Find("f1") == null) {
@@ -118,7 +254,7 @@ class CaseMain {
             }
         }
         Control slot = f.root.Find("fslot");
-        if (slot == null || slot.children.Count != 1 || slot.children[0] != f.panel) {
+        if (slot == null || slot.ChildCount() != 1 || slot.ChildAt(0) != f.panel) {
             Console.WriteLine("MOUNT_MISS");
             bad = bad + 1;
         }
@@ -135,7 +271,6 @@ class CaseMain {
         f.greeting = "yo";
         f.busy = false;
         f.names.Add("gamma");
-        f.MarkDirty();
         f.RequestRedraw();
         f.Render();
         if (fl.GetText() != "yo") {
@@ -178,13 +313,13 @@ class CaseMain {
             bad = bad + 1;
         }
 
-        // z-text 绑定 + 裸 readonly：初始推送、只读落 PropSpec、
-        // 改字段一帧同步（SyncFromNode bindProp=text 路径）。
+        // bind:text 绑定 + 裸 readonly：初始推送、只读落 PropSpec、
+        // 改字段一帧同步（SyncFromNode 的 text 值绑定路径）。
         TextCw t = new TextCw();
         t.OpenHost(host);
         TextArea ta = (TextArea)t.root.Find("ta1");
         if (ta == null || ta.GetText() != "hello") {
-            Console.WriteLine("ZTEXT_INIT_MISS");
+            Console.WriteLine("BIND_TEXT_INIT_MISS");
             bad = bad + 1;
         }
         if (ta.GetProp("readonly") != "true") {
@@ -192,11 +327,10 @@ class CaseMain {
             bad = bad + 1;
         }
         t.introText = "changed";
-        t.MarkDirty();
         t.RequestRedraw();
         t.Render();
         if (ta.GetText() != "changed") {
-            Console.WriteLine("ZTEXT_SYNC_MISS");
+            Console.WriteLine("BIND_TEXT_SYNC_MISS");
             bad = bad + 1;
         }
         t.Close();

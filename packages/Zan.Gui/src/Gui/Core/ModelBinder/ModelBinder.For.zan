@@ -49,40 +49,99 @@ public partial class ModelBinder {
     }
 
     void RegisterTemplates(Control c) {
-        if (c.Kind() == "template") {
-            if (this.tmplMetas == null) {
-                this.tmplMetas = new List<ChildTemplateMeta>();
-            }
-            bool known = false;
+        AppLoopRegistration ticket = this.hostRegistration;
+        int generation = ticket != null ? ticket.generation : 0;
+        Control tree = this.root;
+        object state = this.model;
+        this.RegisterTemplatesCurrent(c, ticket, generation, tree, state);
+    }
+
+    private void RegisterTemplatesCurrent(Control c, AppLoopRegistration ticket, int generation, Control tree, object state) {
+        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+        string kind = c.Kind();
+        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+        if (kind == "template") {
+            if (this.tmplMetas == null) { this.tmplMetas = new List<ChildTemplateMeta>(); }
             for (int i = 0; i < this.tmplMetas.Count; i = i + 1) {
-                if (this.tmplMetas[i].template == c) { known = true; break; }
+                if (this.tmplMetas[i].template == c) { return; }
             }
-            if (!known) {
-                string rawFor = c.CssAttr("data-for");
-                string srcPath = "";
-                string alias = "";
-                ModelBinder.ParseForAttr(rawFor, out srcPath, out alias);
-                this.tmplMetas.Add(new ChildTemplateMeta(c, 0 - 1, srcPath, alias));
-            }
+            string rawFor = c.CssAttr("data-for");
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+            string srcPath = "";
+            string alias = "";
+            ModelBinder.ParseForAttr(rawFor, out srcPath, out alias);
+            this.tmplMetas.Add(new ChildTemplateMeta(c, 0 - 1, srcPath, alias));
             return;
         }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.RegisterTemplates(c.children[j]);
+        for (int j = 0; j < c.ChildCount(); j = j + 1) {
+            this.RegisterTemplatesCurrent(c.ChildAt(j), ticket, generation, tree, state);
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+        }
+    }
+
+    private object TemplateSource(JsonValue arr, JsonDoc doc, List<object> objList, object strongList) {
+        if (arr != null) { return arr; }
+        if (doc != null) { return doc; }
+        if (objList != null) { return objList; }
+        return strongList;
+    }
+
+    private object TemplateItem(JsonValue arr, List<object> objList, object strongList, int index) {
+        if (arr != null) { return arr.At(index); }
+        if (objList != null) { return objList[index]; }
+        if (strongList != null) { return strongList.InvokeObject("Get", index); }
+        return null;
+    }
+
+    private bool TemplateChanged(ChildTemplateMeta meta, object source, JsonValue arr, JsonDoc doc,
+            List<object> objList, object strongList, int n) {
+        if (meta.lastCount != n || meta.source != source) { return true; }
+        // JsonDoc is immutable; a new document is caught by source identity.
+        if (doc != null) { return false; }
+        if (meta.items == null || meta.items.Count != n) { return true; }
+        for (int k = 0; k < n; k = k + 1) {
+            object item = this.TemplateItem(arr, objList, strongList, k);
+            if (meta.items[k] != item) { return true; }
+        }
+        return false;
+    }
+
+    private void RememberTemplate(ChildTemplateMeta meta, object source, JsonValue arr, JsonDoc doc,
+            List<object> objList, object strongList, int n) {
+        meta.lastCount = n;
+        meta.source = source;
+        if (doc != null) {
+            meta.items = null;
+            return;
+        }
+        if (meta.items == null) { meta.items = new List<object>(); }
+        else { meta.items.Clear(); }
+        for (int k = 0; k < n; k = k + 1) {
+            object item = this.TemplateItem(arr, objList, strongList, k);
+            meta.items.Add(item);
         }
     }
 
     void EnsureExpanded() {
+        AppLoopRegistration ticket = this.hostRegistration;
+        int generation = ticket != null ? ticket.generation : 0;
+        Control tree = this.root;
+        object state = this.model;
+        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
         if (this.tmplMetas == null) { return; }
         for (int i = 0; i < this.tmplMetas.Count; i = i + 1) {
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
             Control t = this.tmplMetas[i].template;
             string path = this.tmplMetas[i].sourcePath;
             if (path == "") {
                 string a = "";
-                ModelBinder.ParseForAttr(t.CssAttr("data-for"), out path, out a);
+                string rawFor = t.CssAttr("data-for");
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                ModelBinder.ParseForAttr(rawFor, out path, out a);
                 this.tmplMetas[i].sourcePath = path;
                 this.tmplMetas[i].alias = a;
             }
-            if (path == "" || t.children.Count == 0) { continue; }
+            if (path == "" || t.ChildCount() == 0) { continue; }
             JsonValue arr = null;
             JsonDoc doc = null;
             List<object> objList = null;
@@ -111,9 +170,11 @@ public partial class ModelBinder {
                     }
                 } else {
                     string pleaf = "";
-                    object ptarget = ModelBinder.ResolveFieldScope(this.model, path, out pleaf);
+                    object ptarget = this.ResolveTemplateFieldScope(state, path, out pleaf, ticket, generation, tree, state);
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                     if (ptarget != null && ptarget.HasField(pleaf)) {
                         object fo = ptarget.GetFieldObject(pleaf);
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                         if (fo != null && fo is List<object>) {
                             objList = (List<object>)fo;
                             n = objList.Count;
@@ -123,21 +184,30 @@ public partial class ModelBinder {
                             // 行内 bind 与 data-key 走既有反射字段通道。
                             strongList = fo;
                             n = fo.InvokeInt("Count");
+                            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                         }
                     }
                 }
             }
 
             string keyAttr = t.CssAttr("data-key");
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+            ChildTemplateMeta meta = this.tmplMetas[i];
+            object source = this.TemplateSource(arr, doc, objList, strongList);
+            bool templateChanged = this.TemplateChanged(meta, source, arr, doc, objList, strongList, n);
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+            if (!templateChanged) { continue; }
 
             if (keyAttr != "" && (arr != null || (doc != null && docArrSlot >= 0) || objList != null || strongList != null)) {
-                if (!this.dirty && this.tmplMetas[i].lastCount == n) { continue; }
-                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, objList, strongList, n, keyAttr, this.tmplMetas[i]);
+                this.EnsureExpandedKeyed(t, arr, doc, docArrSlot, objList, strongList, n, keyAttr, meta, ticket, generation, tree, state);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
             } else {
-                if (this.tmplMetas[i].lastCount == n) { continue; }
                 this.RemoveRows(t);
-                this.tmplMetas[i].lastCount = n;
-                if (n == 0) { continue; }
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
+                if (n == 0) {
+                    this.RememberTemplate(meta, source, arr, doc, objList, strongList, n);
+                    continue;
+                }
                 Control p = t.parent;
                 if (p == null) { continue; }
                 int cur = p.IndexOf(t) + 1;
@@ -151,28 +221,33 @@ public partial class ModelBinder {
                         item = objList[k];
                     } else if (strongList != null) {
                         item = strongList.InvokeObject("Get", k);
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                     }
-                    for (int j = 0; j < t.children.Count; j = j + 1) {
-                        Control row = App.CloneTree(t.children[j]);
+                    for (int j = 0; j < t.ChildCount(); j = j + 1) {
+                        Control row = App.CloneTree(t.ChildAt(j));
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                         if (row == null) { continue; }
                         p.InsertAt(cur, row);
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                         cur = cur + 1;
-                        this.ScopeRow(row, item, this.tmplMetas[i].alias, true);
-                        this.WireNode(row);
+                        this.ScopeRow(row, item, meta.alias, true);
                         if (this.expandedRows == null) {
                             this.expandedRows = new List<ChildExpandedRow>();
                         }
                         this.expandedRows.Add(new ChildExpandedRow(row, t));
+                        this.WireNode(row);
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                     }
                 }
             }
+            this.RememberTemplate(meta, source, arr, doc, objList, strongList, n);
         }
     }
 
-    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, List<object> objList, object strongList, int n, string keyAttr, ChildTemplateMeta meta) {
+    void EnsureExpandedKeyed(Control t, JsonValue arr, JsonDoc doc, int docArrSlot, List<object> objList, object strongList, int n, string keyAttr, ChildTemplateMeta meta, AppLoopRegistration ticket, int generation, Control tree, object state) {
+        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
         Control p = t.parent;
         if (p == null) { return; }
-        meta.lastCount = n;
 
         List<ChildExpandedRow> oldRows = new List<ChildExpandedRow>();
         Dict<string, ChildExpandedRow> oldRowMap = new Dict<string, ChildExpandedRow>();
@@ -217,6 +292,7 @@ public partial class ModelBinder {
                 }
             } else if (objList != null || strongList != null) {
                 object item = objList != null ? objList[k] : strongList.InvokeObject("Get", k);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                 if (item != null) {
                     if (item is Dictionary<string, string>) {
                         Dictionary<string, string> d = (Dictionary<string, string>)item;
@@ -229,11 +305,14 @@ public partial class ModelBinder {
                         }
                     } else {
                         string leaf = "";
-                        object target = ModelBinder.ResolveFieldScope(item, actualKey, out leaf);
+                        object target = this.ResolveTemplateFieldScope(item, actualKey, out leaf, ticket, generation, tree, state);
+                        if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                         if (target != null && target.HasField(leaf)) {
                             keyVal = target.GetFieldString(leaf);
+                            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                             if (keyVal == "") {
                                 double d = target.GetFieldDouble(leaf);
+                                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                                 if (d != 0.0) { keyVal = Convert.ToString(d); }
                             }
                         }
@@ -250,6 +329,7 @@ public partial class ModelBinder {
             if (!newKeySet.ContainsKey(oldKey)) {
                 Control row = oldRows[i].rowRoot;
                 this.DetachRow(row);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                 this.ScopeDropRow(row, true);
                 this.RemoveExpandedRowEntry(oldRows[i]);
                 oldRows.RemoveAt(i);
@@ -268,6 +348,7 @@ public partial class ModelBinder {
                 item = objList[k];
             } else if (strongList != null) {
                 item = strongList.InvokeObject("Get", k);
+                if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
             }
             string keyVal = newKeys[k];
 
@@ -276,13 +357,14 @@ public partial class ModelBinder {
                 this.ScopeRow(matched.rowRoot, item, meta.alias, true);
                 insertPos = insertPos + 1;
             } else {
-                for (int j = 0; j < t.children.Count; j = j + 1) {
-                    Control row = App.CloneTree(t.children[j]);
+                for (int j = 0; j < t.ChildCount(); j = j + 1) {
+                    Control row = App.CloneTree(t.ChildAt(j));
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                     if (row == null) { continue; }
                     p.InsertAt(insertPos, row);
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                     insertPos = insertPos + 1;
                     this.ScopeRow(row, item, meta.alias, true);
-                    this.WireNode(row);
                     ChildExpandedRow entry = new ChildExpandedRow(row, t, keyVal);
                     if (this.expandedRows == null) {
                         this.expandedRows = new List<ChildExpandedRow>();
@@ -290,6 +372,8 @@ public partial class ModelBinder {
                     this.expandedRows.Add(entry);
                     oldRows.Add(entry);
                     oldRowMap[keyVal] = entry;
+                    this.WireNode(row);
+                    if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
                 }
             }
         }
@@ -306,14 +390,41 @@ public partial class ModelBinder {
     }
 
     void RemoveRows(Control t) {
-        if (this.expandedRows == null) { return; }
+        AppLoopRegistration ticket = this.hostRegistration;
+        int generation = ticket != null ? ticket.generation : 0;
+        Control tree = this.root;
+        object state = this.model;
+        if (!this.HostBindingCurrent(ticket, generation, tree, state) || this.expandedRows == null) { return; }
         for (int i = this.expandedRows.Count - 1; i >= 0; i = i - 1) {
             if (this.expandedRows[i].template != t) { continue; }
             Control row = this.expandedRows[i].rowRoot;
+            // DropKid may remove document order before Remove throws: keep the row
+            // entry and scope until successful retirement so the next pass can retry.
             this.DetachRow(row);
+            if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
             this.ScopeDropRow(row, true);
             this.expandedRows.RemoveAt(i);
         }
+    }
+
+    // Resolve nested POCO paths without calling another old getter after rebinding.
+    private object ResolveTemplateFieldScope(object scope, string path, out string leafField,
+            AppLoopRegistration ticket, int generation, Control tree, object state) {
+        leafField = path;
+        if (scope == null || path == "") { return null; }
+        object cursor = scope;
+        int start = 0;
+        int dot = path.IndexOf(".");
+        while (dot >= 0) {
+            string segment = path.Substring(start, dot - start);
+            if (!cursor.HasField(segment)) { return null; }
+            cursor = cursor.GetFieldObject(segment);
+            if (!this.HostBindingCurrent(ticket, generation, tree, state) || cursor == null) { return null; }
+            start = dot + 1;
+            dot = path.IndexOf(".", start);
+        }
+        leafField = path.Substring(start);
+        return cursor;
     }
 
     void DetachRow(Control row) {
@@ -329,11 +440,11 @@ public partial class ModelBinder {
     void ScopeRow(Control c, object item, string alias, bool rowRoot) {
         c.item = item;
         c.itemAlias = alias;
-        if (rowRoot || c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "" || c.bindTpl != "" || (c.bindProps != null && c.bindProps.Count > 0)) {
+        if (rowRoot || (c.bindings != null && c.bindings.Count > 0)) {
             this.ScopePut(c, item, alias);
         }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.ScopeRow(c.children[j], item, alias, false);
+        for (int j = 0; j < c.ChildCount(); j = j + 1) {
+            this.ScopeRow(c.ChildAt(j), item, alias, false);
         }
     }
 
@@ -369,11 +480,11 @@ public partial class ModelBinder {
     void ScopeDropRow(Control c, bool rowRoot) {
         c.item = null;
         c.itemAlias = "";
-        if (rowRoot || c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "" || c.bindTpl != "" || (c.bindProps != null && c.bindProps.Count > 0)) {
+        if (rowRoot || (c.bindings != null && c.bindings.Count > 0)) {
             this.ScopeDropOne(c);
         }
-        for (int j = 0; j < c.children.Count; j = j + 1) {
-            this.ScopeDropRow(c.children[j], false);
+        for (int j = 0; j < c.ChildCount(); j = j + 1) {
+            this.ScopeDropRow(c.ChildAt(j), false);
         }
     }
 

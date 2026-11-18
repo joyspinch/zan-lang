@@ -5,6 +5,12 @@ using Gui.Widget;
 class AppPostLifetimeWatch {
     public weak App app;
     public weak SignalInt capture;
+    public weak AppCloseOwner owner;
+}
+
+class AppCloseOwner {
+    public App app;
+    public int calls;
 }
 
 class AppPostLifecycleTest {
@@ -49,11 +55,93 @@ class AppPostLifecycleTest {
         ev.PostS(sender);
     }
 
+    static void BindClose(App app, AppPostLifetimeWatch watch, bool stop) {
+        AppCloseOwner owner = new AppCloseOwner();
+        owner.app = app;
+        watch.owner = owner;
+        app.OnCloseRequest(() => {
+            owner.calls = owner.calls + 1;
+            if (stop) {
+                owner.app.StopLoop();
+                Check("executing close handler retains owner", watch.owner != null);
+                owner.calls = owner.calls + 1;
+                Check("close handler continues after reentrant stop", owner.calls == 2);
+            }
+        });
+    }
+
+    static void BindVeto(App app, AppPostLifetimeWatch watch) {
+        SignalInt capture = new SignalInt(0);
+        watch.capture = capture;
+        app.OnCloseGuard(() => { return capture.Get() != 0; });
+    }
+
+    static void BindStoppingGuard(App app, AppPostLifetimeWatch watch) {
+        AppCloseOwner owner = new AppCloseOwner();
+        owner.app = app;
+        watch.owner = owner;
+        app.OnCloseGuard(() => {
+            owner.app.StopLoop();
+            Check("executing close guard retains owner", watch.owner != null);
+            owner.calls = owner.calls + 1;
+            Check("close guard continues after reentrant stop", owner.calls == 1);
+            return false;
+        });
+    }
+
+    static void CheckCloseLifetime() {
+        App app = App.CreateOffscreen("close ownership", 8, 8);
+        AppPostLifetimeWatch stopped = new AppPostLifetimeWatch();
+        stopped.app = app;
+        BindClose(app, stopped, false);
+        BindVeto(app, stopped);
+        app.StopLoop();
+        app.StopLoop();
+        Check("stop releases uncalled close handler and guard", stopped.owner == null && stopped.capture == null);
+        app.canvas.Destroy();
+        app = null;
+        Check("stopped close cycle releases App", stopped.app == null);
+
+        app = App.CreateOffscreen("deferred close", 8, 8);
+        AppPostLifetimeWatch pending = new AppPostLifetimeWatch();
+        BindClose(app, pending, false);
+        BindVeto(app, pending);
+        Check("veto keeps loop running", app.HandleCloseRequest() && app.isRunning);
+        Check("veto preserves callbacks", pending.owner != null && pending.capture != null);
+        Check("veto does not notify close", pending.owner.calls == 0 && !app.closePending);
+        pending.capture.Set(1);
+        Check("accepted close waits for drain", app.HandleCloseRequest() && app.isRunning);
+        Check("accepted close notifies once", pending.owner.calls == 1 && app.closePending);
+        Check("repeated close still waits", app.HandleCloseRequest() && app.isRunning);
+        Check("pending close remains one-shot", pending.owner.calls == 1);
+        app.StopLoop();
+        Check("completed drain releases close owner", pending.owner == null && pending.capture == null);
+        app.canvas.Destroy();
+
+        app = App.CreateOffscreen("reentrant close", 8, 8);
+        AppPostLifetimeWatch reentrant = new AppPostLifetimeWatch();
+        BindClose(app, reentrant, true);
+        Check("close handler may stop loop", !app.HandleCloseRequest() && !app.isRunning);
+        Check("returned handler releases its owner", reentrant.owner == null);
+        app.StopLoop();
+        app.canvas.Destroy();
+
+        app = App.CreateOffscreen("reentrant close guard", 8, 8);
+        AppPostLifetimeWatch guarded = new AppPostLifetimeWatch();
+        BindStoppingGuard(app, guarded);
+        app.HandleCloseRequest();
+        Check("guard may stop loop before vetoing close", !app.isRunning);
+        Check("returned guard releases its owner", guarded.owner == null);
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
     static void Main() {
         Dispatcher.Init();
         // The legacy frame context retains the first App, so keep it separate
         // from the instances whose weak lifetime is asserted below.
         App frame = App.CreateOffscreen("frame context", 8, 8);
+        CheckCloseLifetime();
         App first = App.CreateOffscreen("first", 8, 8);
         App second = App.CreateOffscreen("second", 8, 8);
         SignalInt calls = new SignalInt(0);

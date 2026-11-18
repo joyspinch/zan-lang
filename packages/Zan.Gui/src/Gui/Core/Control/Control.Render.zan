@@ -7,11 +7,19 @@ namespace Gui;
 
 // Control.Render.zan - 控件树绘制管线、渲染调度、视口裁剪与滚动条绘制
 public partial class Control {
+    // Composite controls that paint their retained childNodes inside content clips
+    // keep normal tree ownership/input, while suppressing a second paint traversal.
+    public virtual bool ChildControlsRenderedByOwner() { return false; }
+
+    protected void PaintContentMask(App host, int color) {
+        host.PaintContentMask(bx, by, bw, bh, color);
+    }
+
     // 在 `area` 内布局并绘制此子树：宿主只需这一句
     // 即可把矩形交给保留组件（测量、停靠、绘制）。
     void RenderInside(App app, Rect area) {
         if (area == null || area.width <= 0 || area.height <= 0 || area.x <= -1000 || area.y <= -1000) { return; }
-        this.MeasureTree(app);
+        this.MeasureTree(app, area.width);
         // 视口模型（P1）：Chrome 里塌陷链逃出 body 后成为 html 的
         // 外边距，把内容从视口顶部推下来。窗口渲染入口等价于
         // html/视口，根的塌陷链在这里落地为内容偏移（legacy/
@@ -27,26 +35,14 @@ public partial class Control {
         this.RenderTree(app);
     }
 
-    // 以自身测量出的尺寸在 (x, y) 处绘制此子树：适用于
-    // 有位置但给不出矩形的宿主（预览、状态条）。
-    void RenderAt(App app, int x, int y) {
-        this.MeasureTree(app);
-        this.Arrange(x, y, prefW, prefH);
-        this.RenderTree(app);
-    }
-
-    // 在 (x, y) 处按 `w` 像素宽绘制此子树，高度按自身测量。
-    void RenderAt(App app, int x, int y, int w) {
-        this.MeasureTree(app);
-        this.Arrange(x, y, w, prefH);
-        this.RenderTree(app);
-    }
-
     // 渲染子树：先自身，再裁剪到本节点矩形内的子节点，
     // 子节点不能画到父节点之外（原生裁剪栈）。命名为
     // RenderTree（而非 Paint），因为一些控件已声明了静态
     // Paint，而编译器仅按名称解析方法调用。
     void RenderTree(App app) {
+        // Owner-painted composites may call another child after a callback retired the frame.
+        // Fence before InheritApp can transfer that child back to the obsolete host.
+        if (!app.ContinuePreparedFrame()) { return; }
         // 本节点渲染期间它是 CSS 组合器/结构性伪类的匹配上下文
         // （app.styleCtx，Style.Full 读取）；退出时恢复，异常也不泄漏。
         Control prevCtx = app.styleCtx;
@@ -58,61 +54,68 @@ public partial class Control {
         }
     }
 
+    private bool PaintNodeCurrent(App host, Control ownerParent, int revision, Control root,
+    int generation, long sequence, int phase, int frame) {
+        return host.ContinuePreparedFrame() && host.isRunning
+        && this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)
+        && this.LayoutNodeCurrent(host, ownerParent, revision) && this.StyleVisible()
+        && (ownerParent == null || ownerParent.OwnsLayoutChild(this));
+    }
+
     void RenderTreeInner(App app) {
         if (app != null && this.app != app) { this.InheritApp(app); }
         if (!this.ComputedStyleCurrent(app)) {
             this.ResolveStyle(app, Style.SNormal());
         }
-        if (!this.StyleVisible()) {
-            if (lastVisible && this.extra != null && this.extra.Hide != null && this.extra.Hide.CountAll() > 0) { this.extra.Hide.RaiseS(this); }
-            lastVisible = false;
-            return;
-        }
-        if (!lastVisible && everLaidOut && this.extra != null && this.extra.Show != null && this.extra.Show.CountAll() > 0) { this.extra.Show.RaiseS(this); }
-        lastVisible = true;
+        if (!this.StyleVisible()) { return; }
+        Control ownerParent = parent;
+        int revision = this.LayoutRevision();
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        int phase = app.inputPreparationTicket;
+        int frame = app.frameSeq;
         // 卡顿归因：分析器开着时取本节点自己那段绘制（不含子树）
         // 的耗时，由 App 留住本帧最贵的那一个。整帧只有几毫秒而
         // 尖尖那一帧到二十多毫秒时，需要知道是哪个控件在花钱。
         int selfT0 = 0;
         bool selfProf = App.PerfOn();
         if (selfProf) { selfT0 = Window.GetTickUs(); }
-        this.SyncBinding();
         // 自段哈希（）：置换累加器、计本节点自己的命令流，
         // OnPaint 出口比对——与上面卡顿归因同一段（不含子树，
         // 子树在下方递归里自成一段自算自比）。
-        bool hashSeg = app.PaintHashBegin();
-        PaintStyleBox(app);
-        OnPaint(app);
-        if (hashSeg) {
-            app.PaintHashEndSelf(this.CommonId(), bx, by, bw, bh);
+        PaintHashToken hashSeg = app.PaintHashBeginScope();
+        try {
+            PaintStyleBox(app);
+            OnPaint(app);
+            if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+            app.PaintHashEndSelf(hashSeg, this.CommonId(), bx, by, bw, bh);
+        } finally {
+            App.PaintHashRestore(hashSeg);
         }
         if (selfProf) {
             app.PerfNode(this.Kind(), name, Window.GetTickUs() - selfT0);
         }
-        this.FireCommon(app);
-        if (Tip != "" && (Ui.HoverLevelMsIn(app, this.CommonId(), 0, bx, by, bw, bh) >= 900
-                          || Ui.HoldTipIn(app, this.CommonId(), bx, by, bw, bh))) {
+        if (Tip != "" && (app.StyleHoverLevelIn(this.CommonId(), 0, bx, by, bw, bh) >= 900
+        || app.HoldTip(this))) {
             int place = Widget.Tooltip.Bottom();
             if (TipSide == "top") { place = Widget.Tooltip.Top(); }
             else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
             else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
             Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
         }
-        if (this.extra != null && this.extra.Paint != null && this.extra.Paint.CountAll() > 0) { this.extra.Paint.RaiseS(this); }
-        if (everLaidOut && (bw != lastBw || bh != lastBh) && this.extra != null && this.extra.Resize != null && this.extra.Resize.CountAll() > 0) {
-            this.extra.Resize.RaiseS(this);
+        if (this.extra != null && this.extra.Paint != null && this.extra.Paint.CountAll() > 0) {
+            this.extra.Paint.RaiseS(this);
+            if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
         }
-        lastBw = bw;
-        lastBh = bh;
-        everLaidOut = true;
         bool scrollC = this.IsScrollContainer();
-        if (children.Count > 0) {
+        if (childNodes.Count > 0 && !this.ChildControlsRenderedByOwner()) {
             // overflow：引擎缺省裁剪（子节点不画出界）；显式
             // `overflow: visible` 放行溢出内容。hidden/scroll/auto
             // 与缺省同义地裁剪；滚动容器额外在 padding box 裁剪
             // （CSS：滚动内容被 border 内侧矩形收口）。
             bool clipKids = computedStyle == null
-                || computedStyle.overflow != 0;
+            || computedStyle.overflow != 0;
             int clipX = bx;
             int clipY = by;
             int clipW = bw;
@@ -121,39 +124,23 @@ public partial class Control {
                 clipX = bx + computedStyle.BorderLeftPx();
                 clipY = by + computedStyle.BorderTopPx();
                 clipW = bw - computedStyle.BorderLeftPx()
-                    - computedStyle.BorderRightPx();
+                - computedStyle.BorderRightPx();
                 clipH = bh - computedStyle.BorderTopPx()
-                    - computedStyle.BorderBottomPx();
+                - computedStyle.BorderBottomPx();
             }
             if (clipKids) {
                 app.canvas.PushClip(clipX, clipY, clipW, clipH);
             }
-            // z-index：有非零值时兄弟按值稳定排序绘制（0 保持
-            // 文档序）；HitTest 用同一份顺序的逆序。
-            bool anyZ = false;
-            for (int i = 0; i < children.Count; i = i + 1) {
-                if (children[i].StyleZIndex() != 0) { anyZ = true; break; }
-            }
-            if (anyZ) {
-                List<Control> ordered = new List<Control>();
-                for (int i = 0; i < children.Count; i = i + 1) {
-                    Control c = children[i];
-                    int z = c.StyleZIndex();
-                    int ins = ordered.Count;
-                    while (ins > 0 && ordered[ins - 1].StyleZIndex() > z) {
-                        ins = ins - 1;
-                    }
-                    ordered.Insert(ins, c);
-                }
+            try {
+                // Same stable z-index plan as HitTest; CSS order is layout only.
+                List<Control> ordered = this.PaintChildren();
                 for (int i = 0; i < ordered.Count; i = i + 1) {
-                    ordered[i].RenderTree(app);
+                    Control child = ordered[i];
+                    if (!this.OwnsLayoutChild(child) || !this.ChildInViewport(child)) { continue; }
+                    child.RenderTree(app);
+                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
                 }
-            } else {
-                for (int i = 0; i < children.Count; i = i + 1) {
-                    children[i].RenderTree(app);
-                }
-            }
-            if (clipKids) { app.canvas.PopClip(); }
+            } finally { if (clipKids) { app.canvas.PopClip(); } }
         }
         // Overlay chrome uses the same geometry as routed pointer input.
         if (scrollC) { this.PaintScrollBars(app); }

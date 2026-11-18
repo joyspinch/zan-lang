@@ -1,0 +1,275 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Widget;
+
+namespace Gui;
+
+class TemplateReentryAction {
+    public weak ModelBinder Binder;
+    public weak App Target;
+    public Control Replacement;
+    public JsonValue ReplacementModel;
+    public int Mode;
+    public int Calls;
+    public void Run() {
+        int mode = Mode;
+        if (mode == 0) { return; }
+        Mode = 0; Calls = Calls + 1;
+        ModelBinder binder = Binder;
+        if (mode == 1) { binder.SetRoot(Replacement, ReplacementModel); }
+        if (mode == 2) { binder.Detach(); }
+        if (mode == 3) { Target.RegisterModelHost(binder); }
+    }
+}
+
+class TemplateReentryList {
+    public TemplateReentryAction Action;
+    public int Phase;
+    public int Length = 1;
+    public int Counts;
+    public int Gets;
+    public int TriggerGet = 1;
+    public object Item = new TemplateReentryItem();
+    public int Count() {
+        Counts = Counts + 1;
+        if (Phase == 2) { Action.Run(); }
+        return Length;
+    }
+    public object Get(int index) {
+        Gets = Gets + 1;
+        if (Phase == 3 && Gets == TriggerGet) { Action.Run(); }
+        return Item;
+    }
+}
+
+class TemplateReentryItem {
+    public TemplateReentryAction Action;
+    public string Id {
+        get {
+            if (Action != null) { Action.Run(); }
+            return "first";
+        }
+    }
+}
+
+class TemplateReentryModel {
+    public TemplateReentryList List;
+    public TemplateReentryAction Action;
+    public int Phase;
+    public int Reads;
+    public object Rows {
+        get {
+            Reads = Reads + 1;
+            if (Phase == 1) { Action.Run(); }
+            return List;
+        }
+    }
+    public object Branch {
+        get {
+            if (Phase == 4) { Action.Run(); }
+            return this;
+        }
+    }
+}
+
+class TemplateReentryNode : Control {
+    public string Source = "Rows as row";
+    public string Key = "";
+    public TemplateReentryAction Action;
+    public string Trigger;
+    public TemplateReentryNode() : base("template") { this.Add(new Control()); }
+    public override string Kind() {
+        if (Trigger == "kind") { Action.Run(); }
+        return "template";
+    }
+    public override string CssAttr(string key) {
+        if (Trigger == key) { Action.Run(); }
+        if (key == "data-for") { return Source; }
+        if (key == "data-key") { return Key; }
+        return base.CssAttr(key);
+    }
+}
+
+class TemplateReentryInput : Input {
+    public TemplateReentryAction Action;
+    public Exception Failure;
+    public int Cancels;
+    public TemplateReentryInput() : base() { }
+    public override void OnPointerCancel(RoutedEventArgs args) {
+        Cancels = Cancels + 1;
+        base.OnPointerCancel(args);
+        if (Failure != null) { throw Failure; }
+        if (Action != null) { Action.Run(); }
+    }
+}
+
+class ModelHostTemplateReentryTest {
+    static void Check(bool ok, string text) { if (!ok) { throw new Exception(text); } }
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+    static void Layout(App app, Control root) {
+        root.UseApp(app); root.MeasureTree(app); root.Arrange(0, 0, 200, 160); app.SetRootControl(root);
+    }
+    static TemplateReentryAction ActionFor(ModelBinder binder, App target, int mode) {
+        TemplateReentryAction action = new TemplateReentryAction();
+        action.Binder = binder; action.Target = target; action.Mode = mode;
+        action.Replacement = new Control(); action.ReplacementModel = JsonValue.NewObject();
+        return action;
+    }
+    static TemplateReentryModel ModelFor(TemplateReentryAction action, int phase) {
+        TemplateReentryModel model = new TemplateReentryModel();
+        model.Action = action; model.Phase = phase;
+        model.List = new TemplateReentryList(); model.List.Action = action; model.List.Phase = phase;
+        return model;
+    }
+    static void CheckRetired(ModelBinder binder, TemplateReentryAction action, AppLoopRegistration old, int mode) {
+        Check(action.Calls == 1 && !old.active, "callback retires the captured ticket exactly once");
+        if (mode == 1) {
+            Check(binder.Root() == action.Replacement && binder.Model() == action.ReplacementModel
+            && binder.valueBindings == null && binder.collectedStructureRevision == -1,
+            "old expansion preserves replacement tree, model and pending initial synchronization");
+        }
+        if (mode == 2) { Check(binder.Root() == null && binder.Model() == null, "old expansion cannot revive detached binding"); }
+        if (mode == 3) { Check(binder.HostApp() == action.Target && binder.hostRegistration != old, "new App owns a fresh registration"); }
+    }
+
+    static void ModelCallbacks(App app, App target) {
+        for (int keyed = 0; keyed < 2; keyed = keyed + 1) {
+            for (int phase = 1; phase <= 6; phase = phase + 1) {
+                if (keyed == 0 && phase > 4) { continue; }
+                for (int mode = 1; mode <= 3; mode = mode + 1) {
+                    ModelBinder binder = new ModelBinder();
+                    TemplateReentryAction action = ActionFor(binder, target, mode);
+                    TemplateReentryModel model = ModelFor(action, phase);
+                    if (phase == 5) { model.List.Phase = 3; model.List.TriggerGet = 2; }
+                    if (phase == 6) { ((TemplateReentryItem)model.List.Item).Action = action; }
+                    Control root = new Control(); TemplateReentryNode template = new TemplateReentryNode();
+                    if (keyed == 1) { template.Key = "row.Id"; }
+                    if (phase == 4) { template.Source = "Branch.Rows as row"; }
+                    root.Add(template); binder.SetRoot(root, (object)model); app.RegisterModelHost(binder);
+                    binder.RegisterTemplates(root); AppLoopRegistration old = binder.hostRegistration;
+                    binder.EnsureExpanded();
+                    CheckRetired(binder, action, old, mode);
+                    Check(root.ChildCount() == 1 && binder.expandedRows == null && binder.scopeBindings == null,
+                    "getter/Count/Get retirement cannot insert or scope an old row");
+                    int expectedGets = phase == 5 ? 2 : ((phase == 3 || phase == 6) ? 1 : 0);
+                    Check(model.List.Gets == expectedGets, "no later reflected Get after retirement");
+                    if (phase == 4) { Check(model.Reads == 0, "nested path stops before the next getter"); }
+                    binder.Detach();
+                }
+            }
+        }
+        Console.WriteLine("template model callbacks OK");
+    }
+
+    static void ControlCallbacks(App app, App target) {
+        for (int phase = 0; phase < 5; phase = phase + 1) {
+            ModelBinder binder = new ModelBinder();
+            TemplateReentryAction action = ActionFor(binder, target, 1);
+            TemplateReentryModel model = ModelFor(action, 0);
+            Control root = new Control(); TemplateReentryNode template = new TemplateReentryNode(); root.Add(template);
+            template.Action = action;
+            binder.SetRoot(root, (object)model); app.RegisterModelHost(binder);
+            AppLoopRegistration old = binder.hostRegistration;
+            if (phase < 2) {
+                template.Trigger = phase == 0 ? "kind" : "data-for";
+                binder.RegisterTemplates(root);
+            } else {
+                binder.RegisterTemplates(root);
+                if (phase == 2) { template.Trigger = "data-key"; }
+                if (phase == 3) { App.SetCloneTree((Control prototype) => { action.Run(); return new Control(); }); }
+                if (phase == 4) {
+                    App.SetCloneTree((Control prototype) => { return new Control(); });
+                    App.SetLinkScanner((Control row, App host) => { action.Run(); });
+                }
+                binder.EnsureExpanded();
+            }
+            CheckRetired(binder, action, old, 1);
+            Check(binder.tmplMetas == null && binder.expandedRows == null && binder.scopeBindings == null && root.ChildCount() == 1,
+            "virtual/clone callbacks cannot register old templates or rows into replacement");
+            binder.Detach(); App.SetCloneTree(null); App.SetLinkScanner(null);
+        }
+        Console.WriteLine("template control callbacks OK");
+    }
+
+    static void InsertCallback(App app, App target) {
+        ModelBinder binder = new ModelBinder(); TemplateReentryAction action = ActionFor(binder, target, 3);
+        TemplateReentryModel model = ModelFor(action, 0);
+        Control scene = new Control(); Control root = new Control(); Control parking = new Control();
+        TemplateReentryNode template = new TemplateReentryNode(); root.Add(template); scene.Add(root); scene.Add(parking);
+        TemplateReentryInput row = new TemplateReentryInput(); row.Action = action; parking.Add(row);
+        Layout(app, scene); row.Focus(app); app.CapturePointer(row, true);
+        binder.SetRoot(root, (object)model); app.RegisterModelHost(binder); binder.RegisterTemplates(root);
+        AppLoopRegistration old = binder.hostRegistration;
+        App.SetCloneTree((Control prototype) => { return row; });
+        binder.EnsureExpanded();
+        CheckRetired(binder, action, old, 3);
+        Check(row.Cancels == 1 && binder.ScopeOf(row) == null && binder.expandedRows == null,
+        "InsertAt cancellation transfer stops before old scope/wiring/bookkeeping");
+        App.SetCloneTree(null); binder.Detach(); app.SetRootControl(null);
+        Console.WriteLine("template insert callback OK");
+    }
+
+    static void RemoveCallbacks(App app, App target) {
+        for (int keyed = 0; keyed < 2; keyed = keyed + 1) {
+            ModelBinder binder = new ModelBinder(); TemplateReentryAction action = ActionFor(binder, target, 0);
+            TemplateReentryModel model = ModelFor(action, 0);
+            Control root = new Control(); TemplateReentryNode template = new TemplateReentryNode(); root.Add(template);
+            if (keyed == 1) { template.Key = "row.Id"; }
+            TemplateReentryInput row = new TemplateReentryInput(); row.Action = action;
+            binder.SetRoot(root, (object)model); app.RegisterModelHost(binder); binder.RegisterTemplates(root);
+            App.SetCloneTree((Control prototype) => { return row; }); binder.EnsureExpanded();
+            Layout(app, root); row.Focus(app); app.CapturePointer(row, true);
+            AppLoopRegistration old = binder.hostRegistration;
+            action.Mode = 3; model.List.Length = 0; binder.EnsureExpanded();
+            CheckRetired(binder, action, old, 3);
+            Check(row.Cancels == 1 && binder.expandedRows.Count == 1 && binder.ScopeOf(row) == model.List.Item,
+            "removal transfer stops before old scope/table mutation");
+            Check(binder.tmplMetas[0].lastCount == 1, "retired removal does not commit incoming count");
+            binder.EnsureExpanded();
+            Check(binder.expandedRows.Count == 0 && binder.ScopeOf(row) == null && binder.tmplMetas[0].lastCount == 0,
+            "new registration can finish pending row retirement");
+            App.SetCloneTree(null); binder.Detach(); app.SetRootControl(null);
+        }
+        Console.WriteLine("template remove callbacks OK");
+    }
+
+    static void ElementRetry(App app) {
+        ModelBinder binder = new ModelBinder(); TemplateReentryAction action = ActionFor(binder, app, 0);
+        TemplateReentryModel model = ModelFor(action, 0);
+        Element root = new Element(); root.InitElement("div", "template-retry");
+        TemplateReentryNode template = new TemplateReentryNode(); root.AddKid(template);
+        TemplateReentryInput row = new TemplateReentryInput();
+        binder.SetRoot(root, (object)model); app.RegisterModelHost(binder); binder.RegisterTemplates(root);
+        App.SetCloneTree((Control prototype) => { return row; }); binder.EnsureExpanded();
+        // Record the existing row between text entries in Element's document order.
+        root.AddText("before"); root.AddKid(row); root.AddText("after");
+        Layout(app, root); row.Focus(app); app.CapturePointer(row, true);
+        Exception sentinel = new Exception("template retirement failure"); row.Failure = sentinel;
+        model.List.Length = 0; bool caught = false;
+        try { binder.EnsureExpanded(); } catch (Exception error) { caught = error == sentinel; }
+        Check(caught && row.parent == root && binder.expandedRows.Count == 1 && binder.ScopeOf(row) == model.List.Item,
+        "DropKid failure retains pending row and scope for retry");
+        Check(binder.tmplMetas[0].lastCount == 1 && root.elOrder.Count == 3,
+        "failed retirement keeps old count while DropKid already removed only row document entry");
+        row.Failure = null; binder.EnsureExpanded();
+        Check(row.parent == null && binder.expandedRows.Count == 0 && binder.ScopeOf(row) == null
+        && root.elOrder.Count == 3 && root.elOrder[1].text == "before" && root.elOrder[2].text == "after",
+        "retry retires the child without losing adjacent text document order");
+        App.SetCloneTree(null); binder.Detach(); app.SetRootControl(null);
+        Console.WriteLine("template Element retry OK");
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("template frame", 1, 1);
+        App app = App.CreateOffscreen("template host", 240, 180);
+        App target = App.CreateOffscreen("template transfer", 240, 180);
+        CloneTreeFn clone = App.cloneTree; LinkScanFn scan = App.linkScanner;
+        App.SetCloneTree((Control prototype) => { return new Control(); }); App.SetLinkScanner(null);
+        ModelCallbacks(app, target); ControlCallbacks(app, target); InsertCallback(app, target);
+        RemoveCallbacks(app, target); ElementRetry(app);
+        App.SetCloneTree(clone); App.SetLinkScanner(scan);
+        Release(app); Release(target); Release(frame);
+        Console.WriteLine("model-host-template-reentry:ok");
+    }
+}

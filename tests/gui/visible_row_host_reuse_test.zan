@@ -1,0 +1,157 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class VisibleRowCounter {
+    public int created;
+    public weak ListView<string> list;
+    public bool refresh;
+    public Control Build(string value) {
+        created = created + 1;
+        if (refresh) {
+            refresh = false;
+            ListView<string> target = list;
+            if (target != null) { target.Refresh(); }
+        }
+        return new Input(value);
+    }
+    public Control BuildAt(int index) { created = created + 1; return new Input(Convert.ToString(index)); }
+    public Control BuildNode(TreeNode node) { created = created + 1; return new Input(node.label); }
+}
+class VisibleRowCancelThrow : Input {
+    public bool fail = true;
+    public VisibleRowCancelThrow() : base("cancel") { }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        if (fail) { fail=false;throw new Exception("cancel probe"); }
+    }
+}
+class VisibleRowWitness {
+    public weak Control row;
+    public weak Control owner;
+}
+class VisibleRowHostReuseTest {
+    static void Check(bool value, string message) { if (!value) { throw new Exception(message); } }
+    static void Paint(App app, Control control) {
+        app.BeginOffscreenFrame();control.RenderTree(app);app.EndOffscreenFrame();
+    }
+    static void ListCase(int count, VisibleRowWitness witness) {
+        App app = App.CreateOffscreen("visible-list", 320, 240);
+        VisibleRowCounter counter = new VisibleRowCounter();
+        List<string> data = new List<string>();
+        for (int i = 0; i < count; i = i + 1) { data.Add(Convert.ToString(i)); }
+        ListView<string> list = new ListView<string>(counter.Build).WithFixedRowHeight(32);
+        counter.list = list;
+        list.Bind(data);list.UseApp(app);app.SetRootControl(list);
+        list.MeasureTree(app);list.Arrange(0,0,300,128);
+        int bound = 128 / app.Scale(32) + 2;
+        Check(list.ChildAt(0).ChildCount() <= bound,"list visible bound");
+        Check(list.RowControl(count-1)==null,"offscreen original index absent");
+        Control overlap=list.RowControl(1);Control departure=list.RowControl(0);
+        witness.row=departure;witness.owner=list;
+        Input editor=(Input)overlap;
+        editor.Focus(app);app.CapturePointer(editor,true);
+        int before=counter.created;
+        Paint(app,list);Paint(app,list);
+        Check(counter.created==before,"list paint read only");
+        list.SetScrollTop(app.Scale(32));
+        Check(list.RowControl(1)==overlap,"visible intersection identity");
+        Check(editor.IsFocused(app)&&app.GetCapturedPointer()==editor,"overlap focus and capture retained");
+        Check(list.RowControl(0)==null&&departure.parent==null,"departure retired");
+        Control hit=list.HitTest(overlap.bx+2,overlap.by+2,0);
+        Check(hit!=null&&overlap.by==list.ScrollViewport().y,"input geometry before repaint");
+        list.SetScrollTop(app.Scale(320));
+        Check(!editor.IsFocused(app)&&app.GetCapturedPointer()!=editor,"departure clears focus and capture");
+        list.SetScrollTop(app.Scale(32));overlap=list.RowControl(1);
+        list.SetScrollTop(0);
+        Check(list.RowControl(1)==overlap&&list.RowControl(0)!=departure,"scroll back keeps overlap, rebuilds departure");
+        Control moved=list.RowControl(0);Control other=new Control();other.Add(moved);
+        list.Arrange(0,0,300,128);
+        Check(moved.parent==other&&list.RowControl(0)!=null&&list.RowControl(0)!=moved,"moved row replaced without stealing");
+        counter.refresh=true;list.Refresh();list.Arrange(0,0,300,128);
+        Check(list.rowsStale,"reentrant refresh invalidates build");
+        list.Arrange(0,0,300,128);
+        Check(!list.rowsStale&&list.ChildAt(0).ChildCount()<=bound,"reentrant recovery bounded");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void TreeCase(int count) {
+        App app=App.CreateOffscreen("visible-tree",320,240);
+        VisibleRowCounter counter=new VisibleRowCounter();
+        List<TreeNode> data=new List<TreeNode>();
+        data.Add(TreeNode.Dir("folder",0,true));
+        for(int i=1;i<count;i=i+1){data.Add(TreeNode.FileIcon(Convert.ToString(i),1,"file"));}
+        TreeView tree=new TreeView(counter.BuildNode).WithFixedRowHeight(24);
+        tree.Bind(data);tree.UseApp(app);app.SetRootControl(tree);
+        tree.MeasureTree(app);tree.Arrange(0,0,300,96);
+        Check(tree.ChildAt(0).ChildCount()<=96/app.Scale(24)+2,"tree visible bound");
+        Control overlap=tree.RowControl(1);
+        tree.SetScrollTop(app.Scale(24));
+        Check(tree.RowControl(1)==overlap&&tree.RowControl(0)==null,"tree data identity");
+        data[0].expanded=false;tree.Arrange(0,0,300,96);
+        Check(tree.RowControl(1)==null&&tree.ContentHeight()==app.Scale(24),"collapsed subtree retired");
+        data[0].expanded=true;tree.Arrange(0,0,300,96);
+        Check(tree.RowControl(1)!=null&&tree.RowControl(count-1)==null,"expand builds visible original indices");
+        int before=counter.created;Paint(app,tree);Check(counter.created==before,"tree paint read only");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void VirtualCase(int count) {
+        App app=App.CreateOffscreen("visible-virtual",320,240);
+        VisibleRowCounter counter=new VisibleRowCounter();
+        VirtualList list=new VirtualList();list.SetRowHeight(32);list.SetRows(count,counter.BuildAt);
+        list.UseApp(app);app.SetRootControl(list);list.MeasureTree(app);list.Arrange(0,0,300,128);
+        Control overlap=list.ChildAt(1);
+        list.SetScrollTop(app.Scale(32));list.HitTest(2,2,0);
+        Check(list.ChildAt(0)==overlap&&list.ChildCount()<=128/app.Scale(32)+2,"virtual overlap and bound");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void PropertyCase(int count) {
+        App app=App.CreateOffscreen("visible-properties",320,240);
+        PropertyGrid grid=new PropertyGrid();List<PropSpec> specs=new List<PropSpec>();
+        for(int i=0;i<count;i=i+1){specs.Add(PropSpec.Text("p"+Convert.ToString(i),"Property").Half());}
+        grid.Bind("many",specs);grid.UseApp(app);app.SetRootControl(grid);grid.MeasureTree(app);grid.Arrange(0,0,300,128);
+        Check(grid.ChildCount()<=2*(128/app.Scale(32)+1),"half property row bound");
+        Control overlap=grid.ChildAt(2);Control departure=grid.ChildAt(0);
+        grid.SetScrollTop(app.Scale(32));
+        Check(overlap.parent==grid&&departure.parent==null,"property intersection retired");
+        Check(grid.ChildCount()<=2*(128/app.Scale(32)+1),"property scroll bound");
+        grid.SetScrollTop(0);Check(overlap.parent==grid,"property scroll back overlap");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void VariableCase() {
+        App app=App.CreateOffscreen("variable-rows",320,240);
+        List<string> data=new List<string>();data.Add("a");data.Add("b");
+        ListView<string> list=new ListView<string>(value=>new Label(value).Height(value=="a"?24:56));
+        list.Bind(data);list.UseApp(app);app.SetRootControl(list);list.MeasureTree(app);list.Arrange(0,0,300,32);
+        Check(list.ContentHeight()==app.Scale(80),"variable measurement preserved");
+        Check(list.RowControl(1)!=null,"variable path retains measure instances");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void RetirementRetry() {
+        App app=App.CreateOffscreen("retirement-retry",320,240);
+        Control owner=new Control();owner.UseApp(app);app.SetRootControl(owner);
+        VisibleRowHost host=new VisibleRowHost(owner,owner);
+        VisibleRowCancelThrow row=new VisibleRowCancelThrow();
+        List<int> wanted=new List<int>();wanted.Add(0);
+        RowAt build=index=>row;
+        Check(host.Reconcile(wanted,build,app),"retry fixture mounted");
+        row.Arrange(0,0,100,32);app.CapturePointer(row,true);
+        bool threw=false;
+        try { host.Reset(); } catch(Exception error) { threw=true; }
+        Check(threw&&host.Row(0)==null,"throw preserves private retirement debt");
+        host.Reset();
+        Check(row.parent==null&&owner.ChildCount()==0,"reset retry removes orphan");
+        wanted.Clear();
+        Check(host.Reconcile(wanted,build,app)&&owner.ChildCount()==0,"reconcile after retry empty");
+        app.SetRootControl(null);app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame=App.CreateOffscreen("frame",2,2);
+        VisibleRowWitness witness=new VisibleRowWitness();
+        ListCase(1000,witness);Check(witness.row==null&&witness.owner==null,"row host weak lifetime");
+        ListCase(10000,witness);Check(witness.row==null&&witness.owner==null,"large row host weak lifetime");
+        TreeCase(1000);TreeCase(10000);VirtualCase(1000);VirtualCase(10000);
+        PropertyCase(1000);PropertyCase(10000);VariableCase();RetirementRetry();
+        frame.canvas.Destroy();Console.WriteLine("VISIBLE_ROW_HOST_REUSE_OK");
+    }
+}

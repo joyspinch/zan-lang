@@ -4,9 +4,7 @@ using Gui;
 
 namespace Gui;
 
-// 每帧命中区注册表：控件渲染时登记矩形，鼠标/触摸事件据此
-// 解析目标。附带阻挡区（模态遮罩）、事件锚点（按下/点击的
-// 跨帧目标重绑定）与整帧快照（条带帧的事件解析基准）。
+// 尚未迁移的绘制区域投影。真实输入由当前对象树路由，区域不参与目标重绑定。
 public class HitTester {
     List<HitRegion> regions;
     // 阻挡区域（widgetType == -1，通过 App.BlockHitsRect 注册），
@@ -28,39 +26,8 @@ public class HitTester {
     List<HitRegion> poolB;
     bool useA;
     int used;
-    int activeAnchorCount;
-
-    // 目标锚点（0 按下、1 点击、2 右键按下、3 右键点击）。鼠标事件
-    // 在上一帧的命中区上解析出目标，而控件要到下一帧渲染时才去对比
-    // 自己的 id。控件 id 是即时模式的分配序号，只要中间多出或少掉
-    // 一个控件（典型如右键菜单开/关），其后所有 id 都会整体平移，
-    // 于是上一帧解析出的 id 在本帧落到了另一个控件上——这就是
-    // “开过右键菜单后信号乱串”的根源。矩形来自布局，不随 id 平移，
-    // 因此锚点同时记住命中区的矩形；本帧哪个控件注册到同一个矩形，
-    // 哪个才是真正的目标，注册时就地把锚点 id 改写过去（以 HitAnchor 实体承载，消除平行列表）。
-    List<HitAnchor> anchors;
-
-    // 事件解析基准：最近一个完整帧的命中区快照。局部帧只渲染损伤
-    // 条带，条带外的控件本帧不注册命中区；若事件按「上一帧」解析，
-    // 上一帧恰好是条带帧时，条带外的点击会全部扑空（表现为点击
-    // 无响应/迟钝）。条带裁剪的前提是条带外像素与控件均未变化，
-    // 所以最近一次整帧的命中区对条带外依然正确——整帧结束时由
-    // App 拷贝一份（KeepFullSnapshot）作为解析基准（以 HitSnapshotItem 实体承载，消除平行列表）。
-    List<HitSnapshotItem> snapshots;
-    int snapUsed;
-
-    // 按压状态的持有者（App 构造后 BindFocus）：按下锚点按矩形重绑
-    // 到新 id 时，FocusManager.pressedId 若还指着旧 id 就一并改写。
-    // pressedId 在按下时写入、释放才清，中间若本帧前面的控件增减把
-    // 序号顶漂（列表滚动时可见行数变化、弹层开合、前方控件多画少
-    // 画一个），持按压的控件拿新 id 查 IsPressed 会失配——滚动条/
-    // 滑块拖到一半突然停摆，id 漂回来又瞬移到指针处。锚点记的是
-    // 矩形，跟着矩形走的才是同一个控件，pressedId 也该跟着它走。
-    FocusManager focus;
-
-    // 构造：初始化双复用池、阻挡区表、锚点表与快照表。
+    // 构造：初始化双复用池与阻挡区表。
     HitTester() {
-        focus = null;
         poolA = new List<HitRegion>();
         poolB = new List<HitRegion>();
         useA = true;
@@ -70,29 +37,6 @@ public class HitTester {
         blockersB = new List<HitRegion>();
         blockers = blockersA;
         prevBlockers = blockersB;
-        anchors = new List<HitAnchor>{ new HitAnchor(), new HitAnchor(), new HitAnchor(), new HitAnchor() };
-        activeAnchorCount = 0;
-        snapshots = new List<HitSnapshotItem>();
-        snapUsed = 0;
-    }
-
-    // 绑定焦点状态机，使按下锚点的矩形重绑同步到 pressedId
-    // （App 构造时调用一次；未绑定则只重绑锚点）。
-    void BindFocus(FocusManager f) { focus = f; }
-
-    // 整帧（非条带帧）渲染结束时调用：把当前命中区拷贝为事件
-    // 解析的基准。regions 是复用池，对象会被下一帧就地改写，因此
-    // 必须按值拷贝（AnchorAt 只用到这六个 int）。
-    void KeepFullSnapshot() {
-        int n = used;
-        while (snapshots.Count < n) {
-            snapshots.Add(new HitSnapshotItem(0, 0, 0, 0, 0, 0));
-        }
-        for (int i = 0; i < n; i = i + 1) {
-            HitRegion r = regions[i];
-            snapshots[i].Set(r.id, r.x, r.y, r.width, r.height, r.widgetType);
-        }
-        snapUsed = n;
     }
 
     // 开启新的一帧：当前阻挡区转为 prevBlockers，切换到另一个
@@ -111,40 +55,6 @@ public class HitTester {
         blockers.Clear();
         used = 0;
     }
-
-    // 在最近一个完整帧的命中区快照上解析 (px, py) 的目标并记入
-    // 锚点 `k`；`below` 为真时跳过阻挡区，解析其下方的控件（右键用）。
-    int AnchorAt(int k, int px, int py, bool below) {
-        int i = snapUsed - 1;
-        while (i >= 0) {
-            HitSnapshotItem sn = snapshots[i];
-            int wtype = sn.widgetType;
-            bool skip = below && wtype == -1;
-            if (!skip && px >= sn.x && px < sn.x + sn.width
-                && py >= sn.y && py < sn.y + sn.height) {
-                if (anchors[k].isSet == 0) { activeAnchorCount = activeAnchorCount + 1; }
-                anchors[k].Set(sn.id, sn.x, sn.y, sn.width, sn.height, wtype);
-                return sn.id;
-            }
-            i = i - 1;
-        }
-        this.ClearAnchor(k);
-        return -1;
-    }
-
-    // 作废锚点 `k`（id 复位为 -1）。
-    void ClearAnchor(int k) {
-        if (anchors[k].isSet == 1) { activeAnchorCount = activeAnchorCount - 1; }
-        anchors[k].Clear();
-    }
-
-    // 锚点 `k` 最近一次 AnchorAt 命中的区域类型
-    // （HitRegion.widgetType，-1 = 阻挡区）。仅在 AnchorAt 返回
-    // id >= 0（命中）后读取才有意义；ClearAnchor 不重置类型。
-    int AnchorTypeOf(int k) { return anchors[k].widgetType; }
-
-    // 锚点 `k` 当前对应的控件 id（本帧已按矩形改写过）。
-    int AnchorIdOf(int k) { return anchors[k].id; }
 
     // 本帧已注册的命中区数量（`regions` 是复用池，末尾
     // 可能残留上一帧的对象，遍历要以此为界）。
@@ -171,31 +81,6 @@ public class HitTester {
         r.label = label;
         used = used + 1;
         if (wtype == -1) { blockers.Add(r); }
-        // 锚点重绑定必须取「最后一个」匹配而非首匹配：命中区按
-        // 绘制次序注册（底层先、顶层后），AnchorAt 也按最顶层优先
-        // 解析。孪生矩形——gallery 级联窗口开到第 7 个与第 1 个完全
-        // 重合、photos 遮罩叠在对话框遮罩上（同 (0,0,W,H)）——按
-        // 首匹配会让按住/点击目标被下层的孪生控件抢走，顶层窗口
-        // 的按钮/拖动全部失效。持续扫到最后一个匹配，与一次全新
-        // AnchorAt 在同一点上的解析结果一致。
-        if (activeAnchorCount > 0) {
-            for (int k = 0; k < 4; k = k + 1) {
-                HitAnchor a = anchors[k];
-                if (a.isSet == 1
-                    && a.widgetType == wtype
-                    && a.x == x && a.y == y
-                    && a.width == w && a.height == h) {
-                    // 按下锚点（k==0）换了 id 且按压还握在旧 id 上：把
-                    // 按压一并带到新 id（见 focus 字段的注释）。释放后
-                    // pressedId 为 -1，不会被锚点的滞留值重新点亮。
-                    if (k == 0 && focus != null && a.id >= 0
-                        && a.id != id && focus.pressedId == a.id) {
-                        focus.SetPressed(id);
-                    }
-                    a.id = id;
-                }
-            }
-        }
     }
 
     // 按现成的 HitRegion 注册本帧命中区（字段展开转发 RegisterRect）。

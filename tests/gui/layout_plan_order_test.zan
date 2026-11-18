@@ -1,0 +1,312 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+class LayoutOrderPaintProbe : Control {
+    public static string trace = "";
+    public LayoutOrderPaintProbe(string id) { this.InitControl(id, 0); }
+    public override void OnPaint(App app) { LayoutOrderPaintProbe.trace = LayoutOrderPaintProbe.trace + name; }
+}
+
+internal class LayoutOrderLifetimeProbe {
+    public weak Control Witness;
+}
+
+class LayoutOrderBorrowedRootProbe : Control {
+    public weak Control Target;
+    public bool Direct;
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (Target == null) { return null; }
+        return Direct ? Target : Target.HitTest(x, y, pointerType, excludedSubtrees);
+    }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+        Console.WriteLine(label);
+    }
+
+    static Control Leaf(string id, int order) {
+        Control c = new Control(id);
+        c.Prefer(10, 10);
+        c.computedStyle = new StyleBox();
+        c.computedStyle.width = 10;
+        c.computedStyle.height = 10;
+        c.computedStyle.shrink = 0;
+        c.computedStyle.order = order;
+        return c;
+    }
+
+    static Control Container(int display) {
+        Control c = new Control();
+        c.computedStyle = new StyleBox();
+        c.computedStyle.display = display;
+        c.computedStyle.gridCols = "10px 10px 10px 10px 10px";
+        c.computedStyle.gridRows = "10px 10px";
+        return c;
+    }
+
+    static void Orders(int display, string label) {
+        Control root = Container(display);
+        Control a = Leaf("A", 2);
+        Control b = Leaf("B", 0);
+        Control c = Leaf("C", -2);
+        Control d = Leaf("D", 0);
+        Control e = Leaf("E", 2);
+        root.Add(a); root.Add(b); root.Add(c); root.Add(d); root.Add(e);
+        root.Arrange(0, 0, 50, 20);
+        Check(c.bx == 0 && b.bx == 10 && d.bx == 20 && a.bx == 30 && e.bx == 40,
+              label + " mixed order and stable ties");
+        a.computedStyle.order = -3;
+        root.Arrange(0, 0, 50, 20);
+        Check(a.bx == 0 && c.bx == 10 && b.bx == 20 && d.bx == 30 && e.bx == 40,
+              label + " dynamic order");
+        c.visible = false;
+        root.Arrange(0, 0, 50, 20);
+        Check(a.bx == 0 && b.bx == 10 && d.bx == 20 && e.bx == 30,
+              label + " hide");
+        c.visible = true;
+        root.MoveChild(d, 1); root.MoveChild(b, 3);
+        root.Arrange(0, 0, 50, 20);
+        Check(a.bx == 0 && c.bx == 10 && d.bx == 20 && b.bx == 30 && e.bx == 40,
+              label + " show and controlled reorder");
+        Control f = Leaf("F", 0);
+        root.Remove(d); root.InsertAt(1, f);
+        root.Arrange(0, 0, 50, 20);
+        Check(f.bx == 20 && b.bx == 30, label + " same key replacement");
+        root.Remove(root.ChildAt(0));
+        root.Arrange(0, 0, 50, 20);
+        Check(c.bx == 0 && f.bx == 10 && b.bx == 20 && e.bx == 30,
+              label + " controlled removal");
+        f.computedStyle.position = 2;
+        root.Arrange(0, 0, 50, 20);
+        Check(c.bx == 0 && b.bx == 10 && e.bx == 20, label + " absolute excluded");
+        f.computedStyle.position = 0;
+        f.computedStyle.display = 2;
+        root.Arrange(0, 0, 50, 20);
+        Check(c.bx == 0 && b.bx == 10 && e.bx == 20, label + " display none excluded");
+        f.computedStyle.display = 0;
+        root.Children.Clear();
+        root.Arrange(0, 0, 50, 20);
+        root.Children.Add(f); root.Children.Add(c);
+        root.Arrange(0, 0, 50, 20);
+        Check(c.bx == 0 && f.bx == 10, label + " clear and append");
+    }
+
+    static void GridInputs() {
+        Control root = Container(4);
+        root.computedStyle.gridCols = "10px 20px";
+        root.computedStyle.gridRows = "10px 20px";
+        Control a = Leaf("A", 0);
+        Control b = Leaf("B", 0);
+        root.Add(a); root.Add(b);
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 10, "grid initial tracks");
+        root.computedStyle.gridCols = "30px 20px";
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 30, "grid template text invalidation");
+        b.computedStyle.gColStart = 1;
+        b.computedStyle.gRowStart = 2;
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 0 && b.by == 10, "grid placement mutation");
+        root.computedStyle.gridRows = "15px 20px";
+        root.Arrange(0, 0, 100, 100);
+        Check(b.by == 15, "grid row text invalidation");
+        b.computedStyle.gColStart = 3;
+        root.computedStyle.gridAutoCols = "7px";
+        root.computedStyle.gridAutoRows = "9px";
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 50 && b.by == 15, "grid implicit tracks");
+        b.computedStyle.gColStart = 4;
+        b.computedStyle.gRowStart = 4;
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 57 && b.by == 44, "grid implicit placement expansion");
+        root.computedStyle.gridAutoCols = "13px";
+        root.computedStyle.gridAutoRows = "11px";
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 63 && b.by == 46, "grid implicit text invalidation");
+        root.computedStyle.gridCols = "1fr 1fr";
+        root.computedStyle.gridRows = "1fr 1fr";
+        b.computedStyle.gColStart = 2; b.computedStyle.gRowStart = 2;
+        root.Arrange(0, 0, 100, 100);
+        Check(b.bx == 50 && b.by == 50, "grid available size initial");
+        root.Arrange(0, 0, 160, 120);
+        Check(b.bx == 80 && b.by == 60, "grid available size recomputed");
+    }
+
+    static void MeasureAndArrange(App app) {
+        Control flex = Container(1);
+        Control a = Leaf("A", 2);
+        Control b = Leaf("B", 0);
+        Control c = Leaf("C", -2);
+        flex.Add(a); flex.Add(b); flex.Add(c);
+        flex.MeasureFlexContent(app);
+        Check(flex.prefW == 30 && flex.prefH == 10, "flex measured order plan");
+        flex.Arrange(0, 0, 30, 10);
+        Check(c.bx == 0 && b.bx == 10 && a.bx == 20, "flex measure arrange reuse");
+        a.computedStyle.order = -3;
+        flex.Arrange(0, 0, 30, 10);
+        Check(a.bx == 0 && c.bx == 10, "flex mutation after measure");
+        Control grid = Container(4);
+        grid.computedStyle.gridCols = "10px 20px";
+        Control d = Leaf("D", 1);
+        Control e = Leaf("E", 0);
+        grid.Add(d); grid.Add(e);
+        grid.MeasureGridContent(app);
+        Check(grid.prefW == 30, "grid measured track plan");
+        grid.Arrange(0, 0, 30, 20);
+        Check(e.bx == 0 && d.bx == 10, "grid measure arrange reuse");
+        grid.computedStyle.gridCols = "20px 10px";
+        grid.Arrange(0, 0, 30, 20);
+        Check(d.bx == 20, "grid mutation after measure");
+    }
+
+    static void Paint(App app, Control root, string expected, string label) {
+        LayoutOrderPaintProbe.trace = "";
+        app.BeginOffscreenFrame(); root.RenderTree(app); app.EndOffscreenFrame();
+        Check(LayoutOrderPaintProbe.trace == expected, label);
+    }
+
+    static void PaintAndHit() {
+        App app = App.CreateOffscreen("layout order", 100, 100);
+        MeasureAndArrange(app);
+        Control root = new Control();
+        LayoutOrderPaintProbe a = new LayoutOrderPaintProbe("A");
+        LayoutOrderPaintProbe b = new LayoutOrderPaintProbe("B");
+        LayoutOrderPaintProbe c = new LayoutOrderPaintProbe("C");
+        root.Add(a); root.Add(b); root.Add(c); root.UseApp(app);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, 100, 100);
+        a.Arrange(0, 0, 40, 40); b.Arrange(0, 0, 40, 40); c.Arrange(0, 0, 40, 40);
+        a.computedStyle.zIndex = 2; b.computedStyle.zIndex = 0; c.computedStyle.zIndex = -2;
+        Paint(app, root, "CBA", "paint mixed z");
+        Check(root.HitTest(5, 5) == a, "hit reverses paint z");
+        a.computedStyle.zIndex = 0; c.computedStyle.zIndex = 0;
+        a.computedStyle.order = 10; b.computedStyle.order = -10;
+        Paint(app, root, "ABC", "paint same z ignores layout order");
+        Check(root.HitTest(5, 5) == c, "hit same z last document child");
+        root.MoveChild(c, 0); root.MoveChild(a, 2);
+        Paint(app, root, "CBA", "paint same z controlled reorder");
+        Check(root.HitTest(5, 5) == a, "hit same z controlled reorder");
+        b.computedStyle.zIndex = 3;
+        Check(root.HitTest(5, 5) == b, "hit observes z mutation before paint");
+        Paint(app, root, "CAB", "paint reuses updated z order");
+        b.visible = false;
+        Check(root.HitTest(5, 5) == a, "hit hidden top excluded");
+        Paint(app, root, "CA", "paint hidden top excluded");
+        b.visible = true;
+        Paint(app, root, "CAB", "paint shown top restored");
+        app.canvas.Destroy();
+    }
+
+    static void ExcludedSubtrees() {
+        Control root = Container(0);
+        Control lower = Leaf("lower", 0);
+        Control group = Container(0);
+        Control child = Leaf("upper child", 0);
+        root.Add(lower); root.Add(group); group.Add(child);
+        root.Arrange(0, 0, 80, 80);
+        lower.Arrange(0, 0, 40, 40); group.Arrange(0, 0, 40, 40); child.Arrange(0, 0, 40, 40);
+        group.computedStyle.zIndex = 5;
+        Check(root.HitTest(5, 5) == child, "hit high z descendant");
+        List<Control> excluded = new List<Control>();
+        excluded.Add(group);
+        Check(root.HitTest(5, 5, excluded) == lower, "hit excludes whole high z subtree");
+        Check(root.HitTest(5, 5, 1, excluded) == lower, "touch hit uses same subtree exclusions");
+        Check(root.ChildAt(0) == lower && root.ChildAt(1) == group && child.parent == group
+            && group.visible && child.visible && group.computedStyle.zIndex == 5,
+            "hit exclusions preserve ownership order and style");
+        excluded.Clear(); excluded.Add(child);
+        Check(root.HitTest(5, 5, excluded) == group, "hit child exclusion retains eligible ancestor");
+        excluded.Clear(); excluded.Add(root);
+        Check(root.HitTest(5, 5, excluded) == null, "hit can exclude query root");
+
+        LayoutOrderBorrowedRootProbe borrowed = new LayoutOrderBorrowedRootProbe();
+        borrowed.Target = group;
+        borrowed.computedStyle = new StyleBox();
+        root.Add(borrowed);
+        borrowed.Arrange(0, 0, 40, 40);
+        borrowed.computedStyle.zIndex = 10;
+        excluded.Clear(); excluded.Add(child);
+        Check(borrowed.HitTest(5, 5, excluded) == group, "borrowed root forwards subtree exclusions");
+        borrowed.Target = child; borrowed.Direct = true;
+        excluded.Clear(); excluded.Add(group);
+        Check(borrowed.HitTest(5, 5, excluded) == null, "hit filters excluded ancestors of direct results");
+        Check(root.HitTest(5, 5, excluded) == lower, "excluded borrowed result falls through to lower sibling");
+        Check(root.HitTest(5, 5) == child, "hit exclusion has no effect on later queries");
+    }
+
+    static long SnapshotBytes(Control root, ChildOrderPlan plan, bool prepare) {
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int turn = 0; turn < 64; turn = turn + 1) {
+            if (prepare) { plan.Prepare(root, false, false); }
+            List<Control> snapshot = plan.Project(root);
+            if (snapshot.Count != 3) { throw new Exception("snapshot count"); }
+        }
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    static void SteadyPlans() {
+        Control root = Container(4);
+        root.Add(Leaf("A", 2)); root.Add(Leaf("B", 0)); root.Add(Leaf("C", -2));
+        ChildOrderPlan order = new ChildOrderPlan();
+        order.Prepare(root, false, false);
+        int builds = order.rebuilds;
+        int sorts = order.sorts;
+        long baseline = SnapshotBytes(root, order, false);
+        long steady = SnapshotBytes(root, order, true);
+        Check(steady == baseline && steady > 0, "warm order allocates only traversal snapshot");
+        Check(order.rebuilds == builds && order.sorts == sorts && sorts == 1,
+              "warm order does not rebuild or sort");
+        root.ChildAt(0).computedStyle.order = -3;
+        order.Prepare(root, false, false);
+        Check(order.rebuilds == builds + 1 && order.sorts == sorts + 1,
+              "order mutation rebuilds and sorts once");
+        List<Control> items = root.SnapshotChildren();
+        GridLayoutPlan grid = new GridLayoutPlan();
+        grid.Prepare(root.computedStyle, items);
+        int parses = grid.parses;
+        int placements = grid.placements;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int turn = 0; turn < 64; turn = turn + 1) {
+            grid.Prepare(root.computedStyle, items);
+        }
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Check(allocated == 0, "warm grid plan comparison allocates nothing");
+        Check(grid.parses == parses && grid.placements == placements && parses == 4 && placements == 1,
+              "warm grid does not parse or place again");
+        root.computedStyle.gridCols = "20px 10px";
+        grid.Prepare(root.computedStyle, items);
+        Check(grid.parses == parses + 1 && grid.placements == placements + 1,
+              "changed grid track parses once");
+        root.ChildAt(0).computedStyle.gColSpan = 2;
+        grid.Prepare(root.computedStyle, items);
+        Check(grid.parses == parses + 1 && grid.placements == placements + 2,
+              "changed placement reuses parsed tracks");
+    }
+
+    static void PlanLifetime() {
+        Control root = Container(4);
+        LayoutOrderLifetimeProbe probe = new LayoutOrderLifetimeProbe();
+        {
+            Control leaf = Leaf("gone", 0);
+            probe.Witness = leaf;
+            root.Add(leaf);
+            root.Arrange(0, 0, 50, 20);
+            root.HitTest(1, 1);
+            root.Children.Clear();
+        }
+        Check(probe.Witness == null, "plans do not retain removed children");
+    }
+
+    static void Main() {
+        Orders(1, "flex");
+        Orders(4, "grid");
+        GridInputs();
+        PaintAndHit();
+        ExcludedSubtrees();
+        SteadyPlans();
+        PlanLifetime();
+    }
+}

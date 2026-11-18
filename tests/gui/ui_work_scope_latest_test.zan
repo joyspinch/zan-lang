@@ -1,0 +1,304 @@
+using System;
+using System.Threading;
+using Gui;
+
+namespace UiWorkScopeLatestTest;
+
+// Headless UI owner. Worker functions only consume strings/tokens and capture
+// independent synchronization objects; no worker closes over a Program owner.
+class Program {
+    string text = "";
+    string error = "";
+    bool current = true;
+    int applies;
+    int failures;
+    UiWorkScopeJob<Program, string, string> replacement;
+    UiWorkScope<Program, string, string> work;
+
+    static void Require(bool value, string message) {
+        if (!value) { throw new Exception(message); }
+    }
+
+    static Program Owner(App app) {
+        Program owner = new Program();
+        owner.work = new UiWorkScope<Program, string, string>(app, owner);
+        return owner;
+    }
+
+    static bool Current(Program owner) { return owner.current; }
+    static string Compute(string snapshot, CancellationToken token) {
+        token.ThrowIfCancellationRequested();
+        return snapshot + "/prepared";
+    }
+    static void Apply(Program owner, string result) {
+        owner.text = result;
+        owner.applies = owner.applies + 1;
+    }
+    static void Failed(Program owner, Exception failure) {
+        owner.error = failure.Message;
+        owner.failures = owner.failures + 1;
+    }
+    static string ThrowWorker(string snapshot, CancellationToken token) {
+        throw new IOException(snapshot);
+    }
+    static void ThrowApply(Program owner, string result) {
+        throw new InvalidOperationException("apply boundary");
+    }
+
+    static UiWorkScopeJob<Program, string, string> Start(Program owner, string snapshot) {
+        return owner.work.StartLatest(snapshot, Program.Compute, Program.Current, Program.Apply, Program.Failed);
+    }
+
+    static void Wait(UiWorkScopeJob<Program, string, string> job) {
+        Task waiter = Task.Run(job.WaitForWorkerAsync());
+        waiter.Wait();
+        Require(job.IsWorkerDrained, "worker completion barrier");
+    }
+
+    static void Drain(UiWorkScope<Program, string, string> scope) {
+        Task waiter = Task.Run(scope.DrainAsync());
+        waiter.Wait();
+        Require(scope.IsClosed, "drain closes scope");
+    }
+
+    static void CheckPostAndLatest(App app) {
+        Program owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> old = Program.Start(owner, "old");
+        Program.Wait(old);
+        Require(owner.text == "", "worker must not apply without UI Post dispatch");
+        UiWorkScopeJob<Program, string, string> latest = Program.Start(owner, "latest");
+        Program.Wait(latest);
+        Require(old.IsRetired, "superseding retires an already queued result");
+        app.DrainPosts();
+        Require(owner.text == "latest/prepared" && owner.applies == 1, "only latest posted result applies");
+        app.DrainPosts();
+        Require(owner.applies == 1 && latest.IsRetired, "delivery is exactly once");
+        Program.Drain(owner.work);
+    }
+
+    static void CheckOutOfOrder(App app) {
+        Program owner = Program.Owner(app);
+        Semaphore entered = new Semaphore(0, 1);
+        Semaphore release = new Semaphore(0, 1);
+        Func<string, CancellationToken, string> slow = (string snapshot, CancellationToken token) => {
+            entered.Release();
+            if (!release.WaitOne(5000)) { throw new Exception("slow worker release timeout"); }
+            // Deliberately ignore cancellation: latest protection must still hold.
+            return snapshot;
+        };
+        UiWorkScopeJob<Program, string, string> old = owner.work.StartLatest(
+            "slow", slow, Program.Current, Program.Apply, Program.Failed);
+        Require(entered.WaitOne(5000), "old worker entered");
+        UiWorkScopeJob<Program, string, string> latest = Program.Start(owner, "new");
+        Program.Wait(latest);
+        app.DrainPosts();
+        Require(owner.text == "new/prepared", "latest can apply while retired worker still runs");
+        release.Release();
+        Program.Wait(old);
+        app.DrainPosts();
+        Require(owner.text == "new/prepared" && owner.applies == 1, "late old completion cannot overwrite new page");
+        Program.Drain(owner.work);
+        entered.Dispose(); release.Dispose();
+    }
+
+    static void CheckCurrentAndCancel(App app) {
+        Program owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> changed = Program.Start(owner, "revision");
+        Program.Wait(changed);
+        owner.current = false;
+        app.DrainPosts();
+        Require(owner.applies == 0 && changed.IsRetired, "business revision predicate rejects result");
+        owner.current = true;
+        UiWorkScopeJob<Program, string, string> cancelled = Program.Start(owner, "cancel");
+        Program.Wait(cancelled);
+        owner.work.CancelLatest();
+        app.DrainPosts();
+        Require(owner.applies == 0 && cancelled.IsRetired, "explicit cancellation retires pending delivery");
+        Program.Drain(owner.work);
+    }
+
+    static void CheckErrors(App app) {
+        Program owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> failed = owner.work.StartLatest(
+            "worker boundary", Program.ThrowWorker, Program.Current, Program.Apply, Program.Failed);
+        Program.Wait(failed);
+        Require(failed.Error != null && owner.failures == 0, "worker error is observable before UI delivery");
+        app.DrainPosts();
+        Require(owner.failures == 1 && owner.error == "worker boundary" && owner.applies == 0,
+            "worker failure reaches UI error callback once");
+        UiWorkScopeJob<Program, string, string> stale = owner.work.StartLatest(
+            "stale error", Program.ThrowWorker, Program.Current, Program.Apply, Program.Failed);
+        Program.Wait(stale);
+        UiWorkScopeJob<Program, string, string> good = Program.Start(owner, "good");
+        Program.Wait(good);
+        app.DrainPosts();
+        Require(owner.failures == 1 && owner.text == "good/prepared", "stale error cannot pollute replacement page");
+        UiWorkScopeJob<Program, string, string> applying = owner.work.StartLatest(
+            "apply", Program.Compute, Program.Current, Program.ThrowApply, Program.Failed);
+        Program.Wait(applying);
+        bool threw = false;
+        try { app.DrainPosts(); }
+        catch (InvalidOperationException failure) { threw = failure.Message == "apply boundary"; }
+        Require(threw && owner.failures == 1 && applying.IsRetired,
+            "UI business exception propagates outside worker failure boundary");
+        Program.Drain(owner.work);
+    }
+
+    static async void ObserveDrain(UiWorkScope<Program, string, string> scope, Semaphore completed) {
+        await scope.DrainAsync();
+        completed.Release();
+    }
+
+    static void CheckCloseAndDrain(App app) {
+        Program owner = Program.Owner(app);
+        Semaphore entered = new Semaphore(0, 1);
+        Semaphore release = new Semaphore(0, 1);
+        Semaphore exited = new Semaphore(0, 1);
+        Func<string, CancellationToken, string> slow = (string snapshot, CancellationToken token) => {
+            entered.Release();
+            if (!release.WaitOne(5000)) { throw new Exception("close release timeout"); }
+            bool cancelled = token.IsCancellationRequested;
+            exited.Release();
+            if (!cancelled) { throw new Exception("scope close did not cancel worker token"); }
+            return snapshot;
+        };
+        UiWorkScopeJob<Program, string, string> running = owner.work.StartLatest(
+            "closing", slow, Program.Current, Program.Apply, Program.Failed);
+        Require(entered.WaitOne(5000), "closing worker entered");
+        UiWorkScopeJob<Program, string, string> second = owner.work.StartLatest(
+            "closing second", slow, Program.Current, Program.Apply, Program.Failed);
+        Require(entered.WaitOne(5000), "second closing worker entered");
+        owner.work.Close();
+        Require(running.IsRetired && second.IsRetired && !running.IsWorkerDrained && !second.IsWorkerDrained,
+            "Close retires UI but does not fake worker completion");
+        Semaphore completed = new Semaphore(0, 2);
+        // Direct async calls on the UI caller, deliberately NOT wrapped in Run.
+        Program.ObserveDrain(owner.work, completed);
+        Program.ObserveDrain(owner.work, completed);
+        Require(!completed.WaitOne(0), "overlapping drains return while workers remain blocked");
+        owner.text = "waiting";
+        app.Post(() => { owner.text = "UI progressed during drain"; });
+        app.DrainPosts();
+        Require(owner.text == "UI progressed during drain" && !running.IsWorkerDrained,
+            "UI Post dispatch progresses before the blocked worker is released");
+        release.Release();
+        Require(exited.WaitOne(5000), "first closing worker exit timeout");
+        Require(!completed.WaitOne(0), "both drains still wait for the remaining captured worker");
+        release.Release();
+        Require(exited.WaitOne(5000), "second closing worker exit timeout");
+        Require(completed.WaitOne(5000) && completed.WaitOne(5000), "overlapping drain completion timeout");
+        Require(running.IsWorkerDrained && second.IsWorkerDrained && owner.applies == 0,
+            "both drains complete without result delivery");
+        completed.Dispose();
+        app.DrainPosts();
+        Require(owner.applies == 0 && owner.failures == 0, "closed scope never writes back");
+        bool refused = false;
+        try { Program.Start(owner, "closed"); }
+        catch (InvalidOperationException failure) { refused = true; }
+        Require(refused, "closed scope rejects new jobs");
+        Program.Drain(owner.work);
+        entered.Dispose(); release.Dispose(); exited.Dispose();
+    }
+
+    static bool CurrentStarts(Program owner) {
+        owner.replacement = Program.Start(owner, "predicate replacement");
+        return true;
+    }
+    static bool CurrentCancels(Program owner) { owner.work.CancelLatest(); return true; }
+    static bool CurrentCloses(Program owner) { owner.work.Close(); return true; }
+
+    static void CheckPredicateReentry(App app) {
+        Program owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> old = owner.work.StartLatest(
+            "old", Program.Compute, Program.CurrentStarts, Program.Apply, Program.Failed);
+        Program.Wait(old);
+        app.DrainPosts();
+        Require(owner.replacement != null, "predicate started replacement");
+        Program.Wait(owner.replacement);
+        app.DrainPosts();
+        Require(owner.text == "predicate replacement/prepared" && owner.applies == 1,
+            "predicate StartLatest preserves and applies only replacement");
+        Program.Drain(owner.work);
+        owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> cancelled = owner.work.StartLatest(
+            "cancel", Program.Compute, Program.CurrentCancels, Program.Apply, Program.Failed);
+        Program.Wait(cancelled);
+        app.DrainPosts();
+        Require(owner.applies == 0, "predicate CancelLatest suppresses delivery");
+        Program.Drain(owner.work);
+        owner = Program.Owner(app);
+        UiWorkScopeJob<Program, string, string> closed = owner.work.StartLatest(
+            "close", Program.Compute, Program.CurrentCloses, Program.Apply, Program.Failed);
+        Program.Wait(closed);
+        app.DrainPosts();
+        Require(owner.applies == 0 && owner.work.IsClosed, "predicate Close suppresses delivery");
+        Program.Drain(owner.work);
+    }
+
+    static void CheckCancellationReentry(App app) {
+        Program owner = Program.Owner(app);
+        UiWorkScope<Program, string, string> scope = owner.work;
+        // Register on worker, invoke on the UI caller of Cancel/Start. This
+        // deliberately exercises arbitrary cancellation callback reentry.
+        WeakReference<Program> weakOwner = new WeakReference<Program>(owner);
+        Action replace = () => {
+            Program target = weakOwner.Target;
+            if (target != null) { target.replacement = Program.Start(target, "cancel replacement"); }
+        };
+        Func<string, CancellationToken, string> registering = (string snapshot, CancellationToken token) => {
+            token.Register(replace);
+            return snapshot;
+        };
+        UiWorkScopeJob<Program, string, string> old = scope.StartLatest(
+            "old", registering, Program.Current, Program.Apply, Program.Failed);
+        Program.Wait(old);
+        bool superseded = false;
+        try { Program.Start(owner, "outer start"); }
+        catch (InvalidOperationException failure) { superseded = true; }
+        Require(superseded && old.IsRetired, "reentrant cancellation supersedes outer StartLatest");
+        Require(owner.replacement != null, "cancellation callback created replacement");
+        Program.Wait(owner.replacement);
+        app.DrainPosts();
+        Require(owner.text == "cancel replacement/prepared" && owner.applies == 1,
+            "outer StartLatest cannot erase cancellation callback's newer job");
+        Program.Drain(scope);
+    }
+
+    static void CheckWeakOwner(App app) {
+        Program owner = Program.Owner(app);
+        WeakReference<Program> witness = new WeakReference<Program>(owner);
+        UiWorkScope<Program, string, string> scope = owner.work;
+        UiWorkScopeJob<Program, string, string> queued = Program.Start(owner, "weak");
+        Program.Wait(queued);
+        owner = null;
+        Require(!witness.IsAlive, "scope and queued Post must not retain owner");
+        app.DrainPosts();
+        Require(queued.IsRetired, "dead owner's pending result retires");
+        Program.Drain(scope);
+    }
+
+    static void CheckStoppedApp() {
+        App app = App.CreateOffscreen("stopped UI work", 64, 64);
+        Program owner = Program.Owner(app);
+        app.StopLoop();
+        UiWorkScopeJob<Program, string, string> job = Program.Start(owner, "stopped");
+        Program.Wait(job);
+        Require(job.IsRetired && owner.applies == 0, "rejected Post retires result");
+        Program.Drain(owner.work);
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("UI work scope", 64, 64);
+        Program.CheckPostAndLatest(app);
+        Program.CheckOutOfOrder(app);
+        Program.CheckCurrentAndCancel(app);
+        Program.CheckErrors(app);
+        Program.CheckCloseAndDrain(app);
+        Program.CheckPredicateReentry(app);
+        Program.CheckCancellationReentry(app);
+        Program.CheckWeakOwner(app);
+        app.StopLoop();
+        Program.CheckStoppedApp();
+        Console.WriteLine("ui work scope latest ok");
+    }
+}

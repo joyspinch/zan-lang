@@ -4,13 +4,14 @@ using Gui.Backend;
 
 namespace Gui;
 
-// 上一渲染帧的三个目标 id，维护 Tab 焦点环、嵌套 id 段与
-// IME 会话跟随。App 在解析每帧指针/键盘事件时写入，
-// 控件在渲染时查询。
+// 当前对象树的焦点、悬停和按压状态；Tab 与 IME 由实时控件能力决定。
 public class FocusManager {
     int focusedId;
     weak App owner;
     weak Control focusedControl;
+    private long focusRevision;
+    // Held only across synchronous retirement callbacks; finally restores the outer fence.
+    private List<Control> retiringFocusRoots;
 
     void BindApp(App app) { owner = app; }
 
@@ -33,25 +34,9 @@ public class FocusManager {
     // 就重置，滚动/重排导致的悬停重算（RefreshScrollHover 等）
     // 也走 SetHovered，自然重新计时。
     int hoverStartMs;
-    // 上一渲染帧结束时三个 id 的快照。
-    // RollFrame()（由 App.PresentFrame 调用）将
-    // 实时 id 复制进来，控件据此比较 IsHovered(id) 与 WasHovered(id) 以检测本帧的
-    // 进入/离开和焦点/失焦转换。
-    int prevFocusedId;
-    int prevHoveredId;
-    int prevPressedId;
     int nextId;
-    // 本帧可聚焦控件按其注册顺序排列的 id，供 Tab
-    // / Shift+Tab 将焦点移到下一个/上一个。每帧重建。
-    List<int> tabOrder;
-    // Optional weak endpoints accompany paint ids. An expired/hidden/moved
-    // retained endpoint must not return through the legacy compatibility path.
-    List<PaintFocusEndpoint> tabEndpoints;
     // 嵌套的 id 段：PushIds 时压入当前计数器，PopIds 时恢复。
     List<int> scopeReturn;
-    // 文本可编辑控件每帧登记的 id；焦点落在其中之一才开
-    // IME 会话（每帧随 ResetIds 重建）。
-    List<int> textIds;
     // 当前 IME 会话归属的控件 id（-1=会话关闭）。只在
     // 翻转时通知后端；Android 软键盘随会话显隐。
     int imeSessionId;
@@ -67,14 +52,8 @@ public class FocusManager {
         hoveredId = -1;
         pressedId = -1;
         hoverStartMs = 0;
-        prevFocusedId = -1;
-        prevHoveredId = -1;
-        prevPressedId = -1;
         nextId = 0;
-        tabOrder = new List<int>();
-        tabEndpoints = new List<PaintFocusEndpoint>();
         scopeReturn = new List<int>();
-        textIds = new List<int>();
         imeSessionId = -1;
         idStack = new List<int>();
         seqStack = new List<int>();
@@ -165,28 +144,13 @@ public class FocusManager {
         this.PopId();
     }
 
-    // 帧开始时调用：id 计数归零，Tab 环、id 段栈与文本控件表清空复用。
+    // 帧开始时重置尚未迁移的数值 ID 分配作用域。
     void ResetIds() {
         nextId = 0;
-        tabEndpoints.Clear();
-        if (tabOrder != null) { tabOrder.Clear(); } else { tabOrder = new List<int>(); }
         if (scopeReturn != null) { scopeReturn.Clear(); } else { scopeReturn = new List<int>(); }
-        if (textIds != null) { textIds.Clear(); } else { textIds = new List<int>(); }
         if (idStack != null) { idStack.Clear(); }
         if (seqStack != null) { seqStack.Clear(); }
         scopeAutoSeq = 0;
-    }
-
-    // 可聚焦控件每帧（按渲染顺序）记录自身，使键盘
-    // Tab 遍历拥有稳定、按布局排序的环。
-    void RegisterFocusable(int id) {
-        tabOrder.Add(id);
-        tabEndpoints.Add(null);
-    }
-
-    void RegisterFocusable(int id, Control control) {
-        tabOrder.Add(id);
-        tabEndpoints.Add(new PaintFocusEndpoint(control));
     }
 
     Control CurrentInputRoot() {
@@ -200,22 +164,8 @@ public class FocusManager {
         return control != null && control.InputFocusEligible(owner, root);
     }
 
-    // 文本可编辑控件（Input/TextArea/InputOtp/InputNumber 一类）
-    // 每帧随 RegisterFocusable 一并登记，供 IME 会话跟随判断。
-    void RegisterTextEditable(int id) {
-        textIds.Add(id);
-    }
-
-    // id 在 Tab 环中的下标，不在环中时 -1。
-    int IndexOf(int id) {
-        for (int i = 0; i < tabOrder.Count; i = i + 1) {
-            if (tabOrder[i] == id) { return i; }
-        }
-        return -1;
-    }
-
     // 将焦点移到下一个可聚焦控件（循环）。`dir` 为 +1 表示 Tab，
-    // -1 表示 Shift+Tab。若无任何可聚焦控件渲染则为空操作。
+    // -1 表示 Shift+Tab。当前树无可聚焦控件时为空操作。
     void FocusStep(int dir) {
         Control root = this.CurrentInputRoot();
         // Transient projection follows current tree order, including same-App
@@ -231,24 +181,10 @@ public class FocusManager {
             if (ids.Contains(id)) { continue; }
             ids.Add(id); endpoints.Add(control);
         }
-        for (int i = 0; i < tabOrder.Count; i = i + 1) {
-            int id = tabOrder[i];
-            if (ids.Contains(id)) { continue; }
-            PaintFocusEndpoint paint = tabEndpoints[i];
-            Control control = paint != null ? paint.control : null;
-            if (paint != null && (!this.CurrentEndpoint(control, root)
-                || (control.InputFocusCapabilities() & 1) == 0)) { continue; }
-            // An active retained popup owns keyboard input; unowned legacy ids
-            // cannot prove popup membership and must not escape that scope.
-            App app = owner;
-            if (paint == null && app != null && app.overlayHost != null
-                && app.overlayHost.ActiveRoot() != null) { continue; }
-            ids.Add(id); endpoints.Add(control);
-        }
         if (ids.Count == 0 || this.CurrentInputRoot() != root) { return; }
         int idx = ids.IndexOf(focusedId);
         int next = idx < 0 ? (dir >= 0 ? 0 : ids.Count - 1)
-            : (idx + dir + ids.Count) % ids.Count;
+        : (idx + dir + ids.Count) % ids.Count;
         this.SetFocused(ids[next], endpoints[next]);
     }
 
@@ -259,39 +195,12 @@ public class FocusManager {
     // id 是当前按下目标时为 true。
     bool IsPressed(int id) { return pressedId == id; }
 
-    // 上一渲染帧 id 持有焦点时为 true（配合 IsFocused 检测获得/失去焦点）。
-    bool WasFocused(int id) { return prevFocusedId == id; }
-    // 上一渲染帧指针悬停在 id 上时为 true（配合 IsHovered 检测进入/离开）。
-    bool WasHovered(int id) { return prevHoveredId == id; }
-    // 上一渲染帧 id 是按下目标时为 true。
-    bool WasPressed(int id) { return prevPressedId == id; }
-
-    // 将实时 id 快照为“上一帧”基线。每渲染一帧调用一次，
-    // （在 App.PresentFrame 中）即控件查询完本帧的
-    // 进入/离开/焦点转换之后。
-    void RollFrame() {
-        prevFocusedId = focusedId;
-        prevHoveredId = hoveredId;
-        prevPressedId = pressedId;
-        this.UpdateImeSession();
-    }
-
-    // IME 会话跟随文本焦点：焦点在本帧登记的文本控件上则开，
-    // 否则关；只在翻转时触达后端。桌面端会话在建窗时已常开，
-    // 此处的开是幂等空操作；Android 软键盘随会话显隐——
-    // 会话常开会让键盘在没有任何可输入目标时也占住半屏。
     void UpdateImeSession() {
         int want = -1;
         Control control = focusedControl;
-        if (control != null && control.InputFocusCapabilities() != 0) {
-            if (this.CurrentEndpoint(control, this.CurrentInputRoot())
-                && control.WidgetId() == focusedId
-                && (control.InputFocusCapabilities() & 2) != 0) { want = focusedId; }
-        } else {
-            for (int i = 0; i < textIds.Count; i = i + 1) {
-                if (textIds[i] == focusedId) { want = focusedId; break; }
-            }
-        }
+        if (control != null && this.CurrentEndpoint(control, this.CurrentInputRoot())
+        && control.WidgetId() == focusedId
+        && (control.InputFocusCapabilities() & 2) != 0) { want = focusedId; }
         if (want == imeSessionId) { return; }
         imeSessionId = want;
         Ime.SetOpen(want >= 0);
@@ -300,18 +209,65 @@ public class FocusManager {
     // 写入焦点 id（事件解析层在按下时调用，-1 = 无）。
     void SetFocused(int id) { this.SetFocused(id, null); }
 
+    private bool HostedEndpoint(Control control) {
+        App app = owner;
+        if (app == null) { return false; }
+        Control popup = app.overlayHost != null ? app.overlayHost.ActiveRoot() : null;
+        return this.CurrentEndpoint(control, app.rootControl) || this.CurrentEndpoint(control, popup);
+    }
+
+    private bool InsideRetiredFocus(Control control, List<Control> roots) {
+        if (control == null || roots == null) { return false; }
+        for (int i = 0; i < roots.Count; i = i + 1) {
+            if (roots[i].ContainsHostedControl(control)) { return true; }
+        }
+        return false;
+    }
+
+    void ReconcileFocus(Control retired) {
+        if (retired == null || !retired.ContainsHostedControl(focusedControl)
+        || this.HostedEndpoint(focusedControl)) { return; }
+        List<Control> roots = new List<Control>(); roots.Add(retired);
+        this.ReconcileFocus(roots);
+    }
+
+    void ReconcileFocus(List<Control> retired) {
+        Control current = focusedControl;
+        if (!this.InsideRetiredFocus(current, retired) || this.HostedEndpoint(current)) { return; }
+        List<Control> previous = retiringFocusRoots;
+        List<Control> roots = retired;
+        if (previous != null) {
+            roots = new List<Control>(); roots.AddRange(previous); roots.AddRange(retired);
+        }
+        retiringFocusRoots = roots;
+        try { this.ClearFocus(); }
+        finally { retiringFocusRoots = previous; }
+    }
+
     void SetFocused(int id, Control control) {
-        if (focusedId == id) {
-            if (control != null) { focusedControl = control; }
+        if (this.InsideRetiredFocus(control, retiringFocusRoots) && !this.HostedEndpoint(control)) { return; }
+        if (focusedId == id && (control == null || focusedControl == control)) {
             this.UpdateImeSession();
             return;
         }
         Control previous = focusedControl;
+        focusRevision = focusRevision + 1;
+        long revision = focusRevision;
         focusedId = id;
-        focusedControl = id >= 0 ? (control != null ? control : this.ResolveFocusedControl()) : null;
+        Control current = id >= 0 ? (control != null ? control : this.ResolveFocusedControl()) : null;
+        focusedControl = current;
         this.UpdateImeSession();
-        // Commit before notification. A callback may choose a third focus owner.
-        if (previous != null) { previous.OnInputFocusLost(); }
+        // Commit before cleanup and business notifications. Either callback may
+        // transfer focus again, including away and back to the same endpoint.
+        if (previous != null) {
+            if (previous.ResolveApp(null) == owner) { previous.OnInputFocusLost(); }
+            if (previous.ResolveApp(null) == owner) { previous.TriggerEvent("Blur"); }
+            if (focusRevision != revision) { return; }
+        }
+        if (current != null && focusedControl == current && focusedId == id
+        && this.HostedEndpoint(current)) {
+            current.TriggerEvent("Focus");
+        }
     }
     // 写入悬停 id（本帧命中测试的最顶层控件，-1 = 无）。目标
     // 变化时重记 hoverStartMs——悬停提示的"停稳计时"从这里起算。

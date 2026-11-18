@@ -1,0 +1,97 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class PhotoCloseCounter {
+    public int Count;
+    public void Invoke() { Count = Count + 1; }
+}
+class PhotoWitness {
+    public weak App App;
+    public weak PhotoViewer Viewer;
+    public weak Control Carousel;
+}
+class LayerPhotosRetainedTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Drain() {
+        Action action = Dispatcher.Take();
+        while (action != null) { action(); action = Dispatcher.Take(); }
+    }
+    static void Click(App app, int x, int y) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain();
+    }
+    static void ClickControl(App app, Control control) {
+        Click(app, control.bx + control.bw / 2, control.by + control.bh / 2);
+    }
+    static void OwnSession(PhotoWitness witness) {
+        App app = App.CreateOffscreen("Photo lifecycle", 800, 600);
+        witness.App = app;
+        Button background = new Button("Background");
+        PhotoCloseCounter backgroundClicks = new PhotoCloseCounter();
+        background.Click.Add(backgroundClicks.Invoke);
+        app.SetRootControl(background);
+        background.MeasureTree(app); background.Arrange(0, 0, 800, 600);
+        background.Focus(app); app.CapturePointer(background);
+        List<string> slides = new List<string>();
+        slides.Add("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='72' height='48'><rect width='72' height='48' fill='blue'/></svg>");
+        slides.Add(slides[0]); slides.Add(slides[0]);
+        Binding<int> index = 0;
+        PhotoViewer viewer = Layer.OpenPhotos(app, slides, index, new CarouselAnim());
+        witness.Viewer = viewer;
+        PhotoCloseCounter closes = new PhotoCloseCounter();
+        viewer.Dismissed.Add(closes.Invoke);
+        Check(viewer.ChildCount() == 3, "photo retains carousel close and counter children: " + Convert.ToString(viewer.ChildCount()));
+        Carousel carousel = (Carousel)viewer.ChildAt(0);
+        witness.Carousel = carousel;
+        Check(app.GetCapturedPointer() == null && !background.IsFocused(app), "open retires background input");
+        Check(app.overlayHost.ActiveRoot() == viewer, "viewer mounts shared overlay");
+        app.ProcessOffscreenInput(4, 0, 0, 0, 39, 0, 0);
+        Check(index.Get() == 1, "right arrow before first paint");
+        app.ProcessOffscreenInput(4, 0, 0, 0, 37, 0, 0);
+        Check(index.Get() == 0, "left arrow before first paint");
+        ClickControl(app, carousel.chrome.nextBtn);
+        Check(index.Get() == 1, "retained next arrow routes once");
+        ClickControl(app, carousel.chrome.dotBtns[2]);
+        Check(index.Get() == 2, "retained indicator routes once");
+        Check(backgroundClicks.Count == 0 && viewer.Active, "photo overlay masks background");
+        app.ProcessOffscreenInput(2, carousel.bx + carousel.bw / 2, carousel.by + carousel.bh / 2, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(1, 2, app.titlebarH + 2, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 2, app.titlebarH + 2, 0, 0, 0, 0);
+        Drain();
+        Check(viewer.Active && closes.Count == 0, "content drag out does not close scrim");
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame();
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame();
+        Check(viewer.ChildAt(0) == carousel && closes.Count == 0, "paint preserves controls and does not replay input");
+        Click(app, 2, app.titlebarH + 2);
+        Check(!viewer.Active && closes.Count == 1 && app.overlayHost.ActiveRoot() == null, "paired scrim click closes immediately once");
+        viewer.Show(app);
+        ClickControl(app, viewer.ChildAt(1));
+        Check(!viewer.Active && closes.Count == 2, "close button closes once");
+        viewer.Show(app);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 27, 0, 0);
+        Check(!viewer.Active && closes.Count == 3, "Escape closes in shared input");
+        viewer.Show(app);
+        carousel.chrome.nextBtn.Focus(app); app.CapturePointer(carousel.chrome.nextBtn);
+        Layer.ClosePhotos(app);
+        Check(app.GetCapturedPointer() == null && !carousel.chrome.nextBtn.IsFocused(app), "explicit close retires subtree input");
+        Check(closes.Count == 4, "explicit close notifies once");
+        App other = App.CreateOffscreen("Other photos", 400, 300);
+        PhotoViewer second = Layer.OpenPhotos(other, slides, 0, null);
+        viewer.Show(app);
+        Layer.ClosePhotos(app);
+        Check(second.Active && other.overlayHost.ActiveRoot() == second, "photo lifetime is per App");
+        second.Close(); other.canvas.Destroy();
+        app.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("Frame", 2, 2);
+        PhotoWitness witness = new PhotoWitness();
+        OwnSession(witness);
+        Drain();
+        Check(witness.App == null && witness.Viewer == null && witness.Carousel == null, "viewer carousel and App release without cycles");
+        frame.canvas.Destroy();
+        Console.WriteLine("LAYER_PHOTOS_RETAINED_OK");
+    }
+}

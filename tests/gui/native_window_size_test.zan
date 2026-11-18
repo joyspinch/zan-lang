@@ -1,13 +1,24 @@
 using System;
 using Gui;
 using Gui.Backend;
+using Gui.Widget;
 
 class NativeWindowSizeTest {
     #if WINDOWS
     [DllImport("user32", EntryPoint = "SendMessageW")]
     static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "GetClientRect")]
+    static extern int GetClientRect(nint hwnd, nint rect);
     static int renderScale;
     static int renderCalls;
+    static Form resizeForm;
+    static Panel resizeBody;
+    static Canvas resizeCanvas;
+    static int resizePhase;
+    static int resizeFrame;
+    static int resizeStarted;
+    static int restoredWidth;
+    static int restoredHeight;
     #endif
 
     static void Check(string name, bool ok) {
@@ -73,6 +84,102 @@ class NativeWindowSizeTest {
         NativeMemory.Free(info);
         Check("main stage minimum width stays physical", w == 400);
         Check("main stage minimum content stays physical", h == 300 + stage.GetTitlebarHeight());
+    }
+
+    static void CheckFormViewport(string phase) {
+        App app = resizeForm.GetApp();
+        nint rect = NativeMemory.Alloc(16);
+        int w = 0;
+        int h = 0;
+        try {
+            Check(phase + " native client query",
+                NativeWindowSizeTest.GetClientRect(app.WindowHandle(), rect) != 0);
+            Span<int> values = new Span<int>(rect, 4);
+            w = values[2] - values[0];
+            h = values[3] - values[1];
+        } finally { NativeMemory.Free(rect); }
+        Check(phase + " native client is usable", w > 0 && h > app.ContentTop());
+        Check(phase + " window tracks native client",
+            app.window.ClientWidth() == w && app.window.ClientHeight() == h);
+        Check(phase + " canvas tracks native client",
+            app.canvas.Width() == w && app.canvas.Height() == h);
+        Check(phase + " app tracks native client", app.ClientWidth() == w && app.ClientHeight() == h);
+        Check(phase + " Form root fills content", resizeForm.bx == 0
+            && resizeForm.by == app.ContentTop() && resizeForm.bw == w
+            && resizeForm.bh == h - app.ContentTop());
+        Check(phase + " body follows Form root", resizeBody.bx == resizeForm.bx
+            && resizeBody.by == resizeForm.by && resizeBody.bw == resizeForm.bw
+            && resizeBody.bh == resizeForm.bh);
+        Check(phase + " frame has no errors", app.FrameErrorCount() == 0);
+        Check(phase + " current canvas was presented",
+            Win32Shell.SurfaceOf(app.WindowHandle()) == app.canvas.SurfaceId());
+        int inset = app.Scale(16);
+        Check(phase + " body paints far corner",
+            (app.canvas.GetPixel(w - inset, h - inset) & 0xFFFFFF) == 0x2468AC);
+    }
+
+    static void AdvanceFormResize() {
+        App app = resizeForm.GetApp();
+        Check("Form resize finishes before timeout", Window.GetTickMs() - resizeStarted < 10000);
+        if (resizePhase == 0) {
+            if (app.FrameSeq() == 0) { return; }
+            CheckFormViewport("initial");
+            restoredWidth = app.window.ClientWidth();
+            restoredHeight = app.window.ClientHeight();
+            resizeCanvas = app.canvas;
+            resizeFrame = app.FrameSeq();
+            resizePhase = 1;
+            resizeForm.ToggleMaximize();
+            return;
+        }
+        if (resizePhase == 1) {
+            Check("maximized frame completed", app.FrameSeq() > resizeFrame);
+            Check("real Form window maximized", app.window.IsMaximized());
+            CheckFormViewport("maximized");
+            Check("maximized client exposes new area", app.ClientWidth() > restoredWidth
+                && app.ClientHeight() > restoredHeight);
+            Check("maximized canvas replaced", app.canvas != resizeCanvas);
+            resizeCanvas = app.canvas;
+            resizeFrame = app.FrameSeq();
+            resizePhase = 2;
+            resizeForm.ToggleMaximize();
+            return;
+        }
+        if (resizePhase == 2) {
+            Check("restored frame completed", app.FrameSeq() > resizeFrame);
+            Check("real Form window restored", !app.window.IsMaximized());
+            CheckFormViewport("restored");
+            Check("restored client returns to baseline", app.ClientWidth() == restoredWidth
+                && app.ClientHeight() == restoredHeight);
+            Check("restored canvas replaced", app.canvas != resizeCanvas);
+            resizePhase = 3;
+            resizeForm.Close();
+        }
+    }
+
+    static void CheckFormResize() {
+        resizeForm = Form.Create("Native Form resize", 320, 240);
+        resizeBody = Panel.Column();
+        resizeBody.Plain(0xFF2468AC);
+        resizeBody.Grow();
+        resizeBody.Add(new Label("Adaptive native content"));
+        resizeForm.Add(resizeBody);
+        resizePhase = 0;
+        resizeStarted = Window.GetTickMs();
+        App app = resizeForm.GetApp();
+        // Observe completed frames through the natural Form loop; do not manually
+        // synchronize the surface or arrange controls after the native transition.
+        resizeForm.Every(50, NativeWindowSizeTest.AdvanceFormResize);
+        try {
+            resizeForm.Run();
+            Check("Form completed maximize and restore", resizePhase == 3);
+        } finally {
+            app.window.Destroy();
+            app.canvas.Destroy();
+            resizeCanvas = null;
+            resizeBody = null;
+            resizeForm = null;
+        }
     }
 
     static void CheckDpiUpdates(Window mainStage) {
@@ -206,6 +313,7 @@ class NativeWindowSizeTest {
         Check("stage height", stage.ClientHeight() == 300 + stage.GetTitlebarHeight());
         stage.Destroy();
         NativeWindowSizeTest.CheckDpiUpdates(mainStage);
+        NativeWindowSizeTest.CheckFormResize();
         window.Destroy();
         mainStage.Destroy();
         #endif

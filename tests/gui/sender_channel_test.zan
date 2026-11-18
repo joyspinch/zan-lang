@@ -2,16 +2,9 @@ using System;
 using Gui;
 using Gui.Widget;
 
-// 事件 sender 平行通道契约（S = Sender，2e296631 落地）：
-// 新旧双通道互不干扰、可混用，触发顺序先无参后带 sender，
-// sender 恒为触发事件的控件。锁定的事实：
-// - UiEvent.RaiseS/RaiseIfS 全通道触发，RemoveS 只摘 sender 通道；
-// - WidgetEvents.Any() 与各门控数两通道合计（仅 sender 注册也照常
-// 注册命中区域——漏数会让 sender-only 控件收不到点击）；
-// - Control.OnClickS → BindEventS → WidgetEvents.AddByNameS 路由，
-// 基类未声明的语义事件名安全忽略；按钮的 OnClickS 进按钮自己的
-// 语义 Click（PostS 派发），与 OnClick 同一队列；
-// - 旧 OnClick/+= 通道行为不变（437 个既有注册点的兼容面）。
+// 单一事件槽支持无参与 sender 订阅，触发顺序先无参后 sender。
+// Click 仅由 Control 持有；按名称接线、链式订阅与直接访问共用此槽。
+// WidgetEvents 仅保留其余路由事件，sender-only 订阅也计入 Any()。
 // 期望输出：ALL PASS。
 class SenderChannelTest {
     static int oldHits;
@@ -55,30 +48,30 @@ class SenderChannelTest {
         ev2.RemoveS(h);
         Check("RemoveS removes again", ev2.CountS() == 0);
 
-        // WidgetEvents：仅 sender 注册也让 Any() 为真（命中区域照常注册）。
+        // WidgetEvents 的 sender-only 订阅计入门控，Click 不再有第二个槽。
         WidgetEvents w = new WidgetEvents();
         Check("Any empty", w.Any() == false);
         Check("unknown name rejected", w.AddByNameS("Nope", (Control s) => { }) == false);
-        Check("AddByNameS Click", w.AddByNameS("Click", (Control s) => { }) == true);
+        Check("Click belongs to Control", w.AddByNameS("Click", (Control s) => { }) == false);
+        Check("AddByNameS DoubleClick", w.AddByNameS("DoubleClick", (Control s) => { }) == true);
         Check("Any after sender-only", w.Any() == true);
-        Check("Click CountS==1", w.Click.CountS() == 1);
+        Check("DoubleClick CountS==1", w.DoubleClick.CountS() == 1);
 
-        // Control 链式 OnClickS -> BindEventS -> AddByNameS 路由
-        // （Panel 无特化重写，走基类通用事件包）。
+        // Panel 与 Button 的链式接线都经过基类 BindEventS。
         Control c = new Panel();
         c.OnClickS((Control s) => { sHits = sHits + 100; lastS = s; });
-        Check("OnClickS routed to On.Click", c.On.Click.CountS() == 1);
+        Check("OnClickS routed to Click", c.Click.CountS() == 1);
         c.OnChangeS((Control s) => { });
-        Check("OnChangeS ignored on base (no Change channel)", c.On.Click.CountS() == 1);
+        Check("OnChangeS ignored on base (no Change channel)", c.Click.CountS() == 1);
 
         // 旧通道不受影响：OnClick/+= 继续可用且与 sender 通道共存。
         c.OnClick(() => { oldHits = oldHits + 100; });
-        c.On.Click.Add(() => { oldHits = oldHits + 1000; });
-        Check("old OnClick registered", c.On.Click.Count() == 2);
-        Check("both channels coexist", c.On.Click.CountAll() == 3);
+        c.Click.Add(() => { oldHits = oldHits + 1000; });
+        Check("old OnClick registered", c.Click.Count() == 2);
+        Check("both channels coexist", c.Click.CountAll() == 3);
 
         // RaiseS 全链路：两通道都触发，sender 正确。
-        c.On.Click.RaiseIfS(true, c);
+        c.Click.RaiseIfS(true, c);
         Check("RaiseS old channel", oldHits == 1102);
         Check("RaiseS sender channel", sHits == 102);
         Check("RaiseS sender is c", lastS == c);
@@ -92,10 +85,15 @@ class SenderChannelTest {
 
         // 生命周期 OnShowS/OnHideS 走 AddS。
         Control d = new Button();
-        d.OnShowS((Control s) => { });
-        d.OnHideS((Control s) => { });
+        d.OnShowS((Control s) => { lastS = s; sHits = sHits + 1; });
+        d.OnHideS((Control s) => { lastS = s; sHits = sHits + 1; });
+        d.BindEventS("Resize", (Control s) => { lastS = s; sHits = sHits + 1; });
         Check("OnShowS", d.Show.CountS() == 1);
         Check("OnHideS", d.Hide.CountS() == 1);
+        d.TriggerEvent("Show");
+        d.TriggerEvent("Hide");
+        d.TriggerEvent("Resize");
+        Check("named lifecycle carries sender", lastS == d && sHits == 105);
 
         if (fails == 0) {
             Console.WriteLine("ALL PASS");

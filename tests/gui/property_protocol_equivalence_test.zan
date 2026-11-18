@@ -1,0 +1,258 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class PropertyProtocolModel {
+    public string selection = "0";
+}
+
+// The fixture also probes dynamic descriptors without retaining a resolved spec.
+class PropertyProtocolEquivalenceTest : Control {
+    public Binding<string> Content;
+    public int Builds;
+    public int ExtraWrites;
+    public int ExtraReads;
+    public string Projection;
+
+    protected override List<PropSpec> DefineProps() {
+        Builds = Builds + 1;
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec text = PropSpec.Text("text", "Text");
+        text.Field("Content", 0);
+        ps.Add(text);
+        ps.Add(PropSpec.Text("unbound", "Unbound"));
+        ps.Add(PropSpec.Text("projection", "Projection").ViaExtra().Also("projected"));
+        return ps;
+    }
+
+    public override string GetExtra(string key) {
+        ExtraReads = ExtraReads + 1;
+        if (key == "projection") { return Projection; }
+        return "";
+    }
+
+    public override bool SetExtra(string key, string val) {
+        ExtraWrites = ExtraWrites + 1;
+        if (key == "projection") { Projection = val; return true; }
+        return false;
+    }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("property protocol: " + label); }
+    }
+
+    static void FreshDescriptors() {
+        PropertyProtocolEquivalenceTest probe = new PropertyProtocolEquivalenceTest();
+        probe.Content = "first";
+        probe.name = "protocol-id";
+        probe.Projection = "";
+        Check("unlisted value is not an alias", probe.GetProp("value") == "");
+        Check("schema built once", probe.Builds == 1);
+        List<PropSpec> schema = probe.Props();
+        probe.SetProp("data", "ignored");
+        Check("unlisted data does not write text", probe.Content.Get() == "first" && probe.name != "ignored");
+        probe.Class = "";
+        probe.SetProp("text", "second");
+        Check("canonical write preserves node identity", probe.Content.Get() == "second"
+        && probe.name == "protocol-id");
+        Binding<string> old = probe.Content;
+        probe.Content = "replacement";
+        probe.SetProp("text", "fresh");
+        Check("replacement Binding reached", probe.Content.Get() == "fresh" && old.Get() == "second");
+        Check("same descriptor follows replacement", schema[0].ReadFrom(probe) == "fresh");
+        Check("unbound PropOf stays null", probe.PropOf("unbound") == null);
+        Check("computed PropOf stays null", probe.PropOf("projected") == null);
+        Check("unbound metadata remains available", probe.BindingSpec("unbound", false) != null);
+        probe.ExtraReads = 0;
+        Check("empty computed result", probe.GetProp("projected") == "");
+        Check("computed alias resolves once", probe.ExtraReads == 1);
+        probe.ExtraWrites = 0;
+        probe.SetProp("projected", "computed");
+        Check("computed canonical setter", probe.Projection == "computed" && probe.ExtraWrites == 1);
+        probe.ExtraWrites = 0;
+        probe.SetProp("round", "true");
+        Check("unknown setter called once", probe.ExtraWrites == 1);
+        Check("unknown flag remains class", probe.GetProp("class") == "round");
+        Check("missing property", probe.GetProp("missing") == "");
+        probe.SetProp("disabled", "1");
+        Check("base disabled fallback", probe.GetProp("disabled") == "true");
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 100; i = i + 1) {
+            if (probe.Props() != schema || probe.GetProp("text") != "fresh") {
+                throw new Exception("property protocol: cached read");
+            }
+        }
+        Check("steady metadata access allocates nothing", GC.GetAllocatedBytesForCurrentThread() == before);
+        Check("schema reused for every operation", probe.Builds == 1);
+
+        FormField field = new FormField(0);
+        field.SetProp("fname", "field-id");
+        Check("field name explicitly renames node", field.fname == "field-id" && field.name == "field-id");
+        field.SetProp("label", "display label");
+        Check("field label preserves node identity", field.name == "field-id");
+        List<PropSpec> initial = field.Props();
+        field.ftype = 72;
+        PropSpec placeholder = field.BindingSpec("placeholder", false);
+        Check("type change invalidates schema", field.Props() != initial
+            && placeholder != null && placeholder.label == "Start URL");
+        field.customKind = "Example";
+        Check("custom schema appears", field.BindingSpec("customKind", false) != null);
+        field.customKind = "";
+        Check("custom schema retires", field.BindingSpec("customKind", false) == null);
+    }
+
+    static void LabelAndButton() {
+        Label label = new Label("seed");
+        List<string> aliases = new List<string>{ "text", "data", "value" };
+        for (int i = 0; i < aliases.Count; i = i + 1) {
+            string value = "label-" + Convert.ToString(i);
+            label.SetProp(aliases[i], value);
+            Check("Label alias preserves identity " + aliases[i], label.GetText() == value
+            && label.GetProp("name") == "seed" && label.GetProp("text") == value
+            && label.GetProp("value") == value && label.GetProp("data") == value);
+            label.Text = null;
+            Check("Label cleared Binding reads empty", label.GetProp(aliases[i]) == "");
+            label.SetProp(aliases[i], value);
+            Check("Label cleared Binding restored", label.Text != null && label.GetText() == value
+            && label.GetProp("name") == "seed");
+        }
+        label.SetProp("text", "");
+        Check("Label empty text preserves identity", label.GetText() == "" && label.GetProp("name") == "seed");
+        Binding<string> old = label.Text;
+        label.Text = "replacement";
+        label.SetProp("data", "live");
+        Check("Label replacement Binding", label.GetText() == "live" && old.Get() == "");
+
+        Button button = new Button("seed");
+        button.SetProp("value", "caption");
+        Check("Button text alias", button.Label() == "caption");
+        button.SetProp("class", "round tiny");
+        button.SetProp("type", "primary");
+        button.SetProp("size", "small");
+        Check("Button size writes class", button.GetProp("class") == "round primary small");
+        Check("Button size Binding preserved", button.Size.Get() == "medium" && button.GetProp("size") == "medium");
+        button.SetProp("type", "success");
+        Check("Button type replaces class group", button.GetProp("class") == "round small success");
+    }
+
+    static string Options() {
+        return "[{\"label\":\"Alpha\",\"value\":\"alpha\"},{\"label\":\"Beta\",\"value\":\"beta\"},{\"label\":\"Zero\",\"value\":\"0\"}]";
+    }
+
+    static void SelectProjections(bool html) {
+        SelectBox select = new SelectBox();
+        if (html) {
+            HtmlDoc doc = Html.Parse("<select></select>", "", null);
+            select = (SelectBox)doc.root.ChildAt(0);
+        }
+        string options = Options();
+        select.SetProp("options", options);
+        Check("options raw representation", select.GetProp("options") == options);
+        List<string> indices = new List<string>{ "value", "selected", "data" };
+        for (int i = 0; i < indices.Count; i = i + 1) {
+            string key = indices[i];
+            select.SetProp("val", "0");
+            Check("numeric-looking key", select.GetProp("value") == "2");
+            select.SetProp(key, "1");
+            Check("index alias " + key, select.GetProp(key) == "1" && select.GetExtra(key) == "1"
+                && select.GetProp("selectedValue") == "beta" && select.GetProp("text") == "Beta");
+            select.SetProp(key, "garbage");
+            select.SetProp(key, "99");
+            select.SetProp(key, "-2");
+            Check("invalid index ignored", select.GetProp("value") == "1");
+            select.SetProp(key, null);
+            Check("null index clears", select.GetProp("value") == "-1" && select.GetProp("text") == "");
+            select.SetExtra(key, "0");
+            Check("direct Extra index retained", select.GetProp("selectedValue") == "alpha");
+            select.SetProp(key, "");
+            Check("empty index clears", select.GetProp("value") == "-1");
+        }
+        List<string> keys = new List<string>{ "selectedValue", "val" };
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            select.SetProp(keys[i], "0");
+            select.SetProp(keys[i], "Beta");
+            Check("key never falls back to label", select.GetProp("value") == "2");
+            select.SetProp(keys[i], "");
+            Check("empty key clears", select.GetProp("selectedValue") == "");
+        }
+        List<string> texts = new List<string>{ "text", "label", "selectedText" };
+        for (int i = 0; i < texts.Count; i = i + 1) {
+            select.SetProp(texts[i], "Beta");
+            Check("text alias " + texts[i], select.GetProp("value") == "1"
+                && select.GetProp(texts[i]) == "Beta" && select.GetExtra(texts[i]) == "Beta");
+            select.SetProp(texts[i], "unknown");
+            Check("unknown text ignored", select.GetProp("value") == "1");
+            select.SetProp(texts[i], "");
+            Check("empty text clears", select.GetProp("value") == "-1");
+        }
+        PropSpec keySpec = select.BindingSpec("", false);
+        if (keySpec == null) {
+            throw new Exception("property protocol: missing default key descriptor");
+        }
+        Check("default key projection", keySpec.key == "selectedValue");
+        PropSpec numericSpec = select.BindingSpec("", true);
+        if (numericSpec == null) {
+            throw new Exception("property protocol: missing default numeric descriptor");
+        }
+        Check("default numeric projection", numericSpec.key == "value");
+        Check("computed key remains unbound", select.PropOf("val") == null);
+    }
+
+    static void SelectBindings() {
+        SelectBox select = new SelectBox();
+        select.SetProp("options", Options());
+        Binding<int> first = 0;
+        select.Value = first;
+        select.SetProp("value", "1");
+        Check("binding updated once", first.Get() == 1 && first.Version() == 1);
+        Binding<int> second = 0;
+        select.Value = second;
+        PropSpec descriptor = select.BindingSpec("value", true);
+        if (descriptor == null) {
+            throw new Exception("property protocol: missing numeric descriptor");
+        }
+        select.SetProp("selected", "2");
+        Check("replacement binding updated", second.Get() == 2 && second.Version() == 1
+            && first.Get() == 1 && first.Version() == 1);
+        select.Value = 0;
+        Binding<int> old = select.Value;
+        select.SetProp("data", "0");
+        Check("aliases use current binding", old.Get() == 0 && second.Get() == 2);
+        select.Value = 1;
+        Check("descriptor reused after retarget", select.BindingSpec("value", true) == descriptor);
+        select.SetProp("val", "beta");
+        Check("key writes current binding", select.Value.Get() == 1 && old.Get() == 0
+            && second.Get() == 2);
+        select.SetProp("value", "");
+        Check("clear writes only current binding", select.GetProp("value") == "-1"
+            && select.Value.Get() == -1 && old.Get() == 0 && second.Get() == 2);
+    }
+
+    static void ModelBinding() {
+        SelectBox select = new SelectBox();
+        select.SetProp("options", Options());
+        select.BindPath("selection");
+        PropertyProtocolModel model = new PropertyProtocolModel();
+        ModelBinder binder = new ModelBinder();
+        binder.SetRoot(select, model);
+        binder.Wire();
+        Check("binder loads key projection", select.GetProp("value") == "2");
+        select.SetProp("text", "Beta");
+        binder.SyncChangedValues();
+        Check("binder writes key projection", model.selection == "beta");
+        binder.SyncFromModel();
+        Check("binder round trip", select.GetProp("selectedValue") == "beta");
+        binder.Detach();
+    }
+
+    static void Main() {
+        FreshDescriptors();
+        LabelAndButton();
+        SelectProjections(false);
+        SelectProjections(true);
+        SelectBindings();
+        ModelBinding();
+        Console.WriteLine("property_protocol_equivalence_test: OK");
+    }
+}

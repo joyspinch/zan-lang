@@ -1,0 +1,354 @@
+using System;
+using System.Json;
+using System.Collections.Generic;
+using Gui.Widget;
+using Gui;
+namespace Gui;
+
+class ModelHostScopeWitness {
+    public weak ModelBinder binder;
+    public weak Control tree;
+    public weak JsonValue model;
+    public weak App app;
+}
+
+class ModelHostScopeLeaf : Control {
+    public string value;
+    public weak ModelBinder binder;
+    public Control replacement;
+    public JsonValue replacementModel;
+    public bool detachOnSet;
+    public bool replaceOnSet;
+    public bool detachOnGet;
+    public bool detachOnPaint;
+    public int sets;
+    public ModelHostScopeLeaf() : base("modelScopeLeaf") {
+        this.BindPath("value", "text"); this.Prefer(100, 40);
+    }
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("text", "Text").ViaExtra());
+        return ps;
+    }
+    void UnregisterBinder() {
+        ModelBinder current = binder;
+        if (current == null) { return; }
+        App owner = current.HostApp();
+        if (owner != null) { owner.UnregisterModelHost(current); }
+        else { current.Detach(); }
+    }
+    public override string GetProp(string key) {
+        if (key != "text") { return base.GetProp(key); }
+        if (detachOnGet) { detachOnGet = false; this.UnregisterBinder(); }
+        return value;
+    }
+    public override void SetProp(string key, string text) {
+        if (key != "text") { base.SetProp(key, text); return; }
+        value = text; sets = sets + 1;
+        if (detachOnSet) { detachOnSet = false; this.UnregisterBinder(); }
+        if (replaceOnSet) {
+            replaceOnSet = false;
+            ModelBinder current = binder;
+            if (current != null) { current.SetRoot(replacement, replacementModel); }
+        }
+    }
+    public override void OnPaint(App app) {
+        if (detachOnPaint) { detachOnPaint = false; this.UnregisterBinder(); }
+    }
+}
+
+class ModelHostScopePoco {
+    public string backing;
+    public int mode;
+    public weak ModelBinder binder;
+    public weak App target;
+    public Control replacement;
+    public JsonValue replacementModel;
+    public string Value {
+        get { return backing; }
+        set {
+            backing = value;
+            ModelBinder current = binder;
+            if (current == null || mode == 0) { return; }
+            int action = mode; mode = 0;
+            if (action == 1) { current.Detach(); }
+            if (action == 2) {
+                current.SetRoot(replacement, replacementModel);
+                current.SyncFromModel();
+            }
+            if (action == 3) {
+                App next = target;
+                if (next != null) { next.RegisterModelHost(current); }
+            }
+        }
+    }
+}
+
+class ModelHostDetachInput : Input {
+    public weak ModelBinder binder;
+    public weak App app;
+    public Control replacement;
+    public JsonValue next;
+    public bool replace;
+    public bool fail;
+    public override void OnPointerCancel(RoutedEventArgs args) {
+        base.OnPointerCancel(args);
+        if (fail) { fail = false; throw new InvalidOperationException("cancel retry"); }
+        if (replace) {
+            replace = false;
+            ModelBinder current = binder; App host = app;
+            current.SetRoot(replacement, next); host.RegisterModelHost(current); current.SyncFromModel();
+        }
+    }
+}
+
+class ModelHostWireHook {
+    public weak ModelBinder binder;
+    public Control replacement;
+    public JsonValue model;
+    public bool armed;
+    public int scans;
+    public void Scan(Control tree, App app) {
+        scans = scans + 1;
+        if (!armed) { return; }
+        armed = false; binder.SetRoot(replacement, model);
+    }
+}
+
+class ModelHostScopeForm : Form {
+    public ModelHostScopeForm() : base("model host scope", 240, 120, true) { }
+    public void PreparedPaint() {
+        App app = this.GetApp();
+        this.RunScoped(() => {
+            app.BeginFrame();
+            if (app.PrepareStandardHostFrame()) { this.RenderPreparedFrame(app); }
+            if (app.ContinuePreparedFrame()) { app.PresentFrame(); }
+        });
+    }
+}
+
+class ModelHostAppScopeTest {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static JsonValue State(string value) { JsonValue model = JsonValue.NewObject(); model.PutStr("value", value); return model; }
+    static ModelBinder Bind(App app, Control tree, JsonValue model) {
+        ModelBinder binder = new ModelBinder(); binder.SetRoot(tree, model);
+        app.RegisterModelHost(binder); binder.Wire(); return binder;
+    }
+    static void ReleaseApp(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+
+    static void Isolation() {
+        ModelHostScopeForm first = new ModelHostScopeForm();
+        ModelHostScopeForm second = new ModelHostScopeForm();
+        App a = first.GetApp(); App b = second.GetApp();
+        ModelHostScopeLeaf x = new ModelHostScopeLeaf(); first.Add(x);
+        ModelHostScopeLeaf y = new ModelHostScopeLeaf(); second.Add(y);
+        JsonValue mx = State("x"); JsonValue my = State("y");
+        ModelBinder bx = Bind(a, x, mx); ModelBinder by = Bind(b, y, my);
+        a.RegisterModelHost(bx);
+        Check(a.ModelHostCount() == 1 && b.ModelHostCount() == 1, "duplicate registration is App-local and idempotent");
+        mx.Set("value", JsonValue.NewStr("x2")); my.Set("value", JsonValue.NewStr("y2"));
+        Check(bx.valueBindings[0].snapshot == "x" && by.valueBindings[0].snapshot == "y"
+        && x.sets == 1 && y.sets == 1, "external edits leave each App's previous synchronization intact");
+        first.PreparedPaint();
+        Check(x.value == "x2" && y.value == "y" && x.sets == 2 && y.sets == 1
+        && bx.valueBindings[0].snapshot == "x2" && by.valueBindings[0].snapshot == "y",
+        "first Form cannot synchronize the second App");
+        y.value = "user-y";
+        first.PreparedPaint();
+        Check(my.Str("value", "") == "y2", "first Form cannot write back the second App");
+        Check(b.WriteBackModelHosts() && my.Str("value", "") == "user-y", "current App explicitly writes its own model");
+        AppLoopRegistration old = bx.hostRegistration;
+        b.RegisterModelHost(bx);
+        Check(!old.active && a.ModelHostCount() == 0 && b.ModelHostCount() == 2, "cross-App transfer retires the original ticket");
+        a.StopLoop();
+        Check(bx.Root() == x && bx.HostApp() == b, "old App Stop cannot detach transferred binder");
+        b.UnregisterModelHost(bx); b.UnregisterModelHost(by);
+        Check(b.ModelHostCount() == 0 && bx.Root() == null && by.Root() == null, "App unregister detaches only the supplied binder");
+        ReleaseApp(a); ReleaseApp(b);
+    }
+
+    static void ReplacementAndReentry() {
+        App app = App.CreateOffscreen("model reentry", 240, 120);
+        ModelHostScopeLeaf oldLeaf = new ModelHostScopeLeaf();
+        ModelHostScopeLeaf newLeaf = new ModelHostScopeLeaf();
+        JsonValue initial = State("old"); JsonValue replacement = State("new");
+        ModelBinder binder = Bind(app, oldLeaf, initial); oldLeaf.binder = binder;
+        AppLoopRegistration old = binder.hostRegistration;
+        oldLeaf.replacement = newLeaf; oldLeaf.replacementModel = replacement;
+        oldLeaf.replaceOnSet = true;
+        initial.Set("value", JsonValue.NewStr("replace"));
+        Check(!app.SyncModelHosts(), "SetProp replacement abandons old host synchronization");
+        Check(!old.active && binder.hostRegistration != old && binder.Root() == newLeaf
+        && binder.valueBindings == null && binder.collectedStructureRevision == -1 && newLeaf.sets == 0,
+        "new root owns a fresh ticket and awaits its own initial synchronization");
+        Check(app.SyncModelHosts() && newLeaf.value == "new", "next preparation syncs replacement root");
+        newLeaf.binder = binder; newLeaf.detachOnGet = true; newLeaf.value = "old-tail";
+        Check(!app.WriteBackModelHosts() && replacement.Str("value", "") == "new", "GetProp detach prevents stale writeback");
+        Check(binder.Root() == null && app.ModelHostCount() == 0, "reentrant unregister clears binding and registration");
+        binder.SetRoot(newLeaf, replacement); app.RegisterModelHost(binder);
+        newLeaf.detachOnSet = true; replacement.Set("value", JsonValue.NewStr("detach"));
+        Check(!app.SyncModelHosts() && binder.Root() == null && binder.valueBindings == null,
+        "SetProp detach cannot recreate retired snapshots");
+        binder.SetRoot(newLeaf, replacement); app.RegisterModelHost(binder);
+        AppLoopRegistration stopped = binder.hostRegistration;
+        app.StopLoop();
+        Check(!stopped.active && binder.Root() == null && binder.Model() == null && binder.HostApp() == null,
+        "StopLoop retires ticket and detaches tree/model/App");
+        bool refused = false;
+        try { app.RegisterModelHost(binder); } catch (InvalidOperationException error) { refused = true; }
+        Check(refused, "stopped App cannot accept a new binder");
+        // Standalone binders remain legal and do not require a loop ticket.
+        binder.SetRoot(newLeaf, replacement); binder.SyncFromModel();
+        Check(newLeaf.value == "detach", "unregistered binder still synchronizes directly");
+        binder.Detach(); app.canvas.Destroy();
+    }
+
+    static void PocoSetterTails() {
+        App app = App.CreateOffscreen("setter tails", 100, 80);
+        App next = App.CreateOffscreen("setter transfer", 100, 80);
+        for (int mode = 1; mode <= 3; mode = mode + 1) {
+            ModelHostScopePoco model = new ModelHostScopePoco(); model.backing = "initial";
+            ModelHostScopeLeaf leaf = new ModelHostScopeLeaf(); leaf.SetBindingPath(0, "Value");
+            ModelBinder binder = new ModelBinder(); binder.SetRoot(leaf, (object)model);
+            app.RegisterModelHost(binder); binder.SyncFromModel();
+            model.binder = binder; model.mode = mode; model.target = next;
+            ModelHostScopeLeaf replacement = new ModelHostScopeLeaf();
+            model.replacement = replacement; model.replacementModel = State("replacement");
+            AppLoopRegistration old = binder.hostRegistration;
+            ModelValueBinding oldValue = binder.valueBindings[0];
+            leaf.value = "edited";
+            Check(!app.WriteBackModelHosts() && model.backing == "edited" && !old.active
+            && oldValue.hasSnapshot && oldValue.snapshot == "initial",
+            "POCO setter retirement cannot commit a stale writeback snapshot");
+            if (mode == 1) { Check(binder.Root() == null && binder.valueBindings == null, "setter Detach cannot revive old snapshots"); }
+            if (mode == 2) {
+                Check(binder.Root() == replacement && replacement.value == "replacement", "setter SetRoot keeps replacement synchronization");
+                Check(binder.valueBindings.Count == 1 && binder.valueBindings[0].control == replacement,
+                "setter replacement has only its own snapshot");
+            }
+            if (mode == 3) {
+                Check(binder.HostApp() == next && next.ModelHostCount() == 1, "setter re-registration transfers App");
+                // Creating replacement advances the structure revision, so writeback
+                // may rebuild records. Observe the live record after that refresh.
+                ModelValueBinding transferredValue = binder.valueBindings[0];
+                Check(transferredValue.control == leaf && transferredValue.hasSnapshot
+                && transferredValue.snapshot == "initial", "transfer preserves the uncommitted live snapshot");
+                leaf.value = "transferred-edit";
+                Check(app.ModelHostCount() == 0 && app.WriteBackModelHosts() && model.backing == "edited"
+                && transferredValue.snapshot == "initial", "old App cannot write the transferred binding");
+                Check(next.WriteBackModelHosts() && model.backing == "transferred-edit"
+                && binder.valueBindings[0].control == leaf && binder.valueBindings[0].hasSnapshot
+                && binder.valueBindings[0].snapshot == "transferred-edit" && oldValue.snapshot == "initial",
+                "only the new App can commit the transferred binding snapshot");
+            }
+            binder.Detach();
+        }
+        ReleaseApp(app); ReleaseApp(next);
+    }
+
+    static void RenderRetires() {
+        ModelHostScopeForm form = new ModelHostScopeForm(); App app = form.GetApp();
+        ModelHostScopeLeaf leaf = new ModelHostScopeLeaf(); form.Add(leaf);
+        JsonValue model = State("before"); ModelBinder binder = Bind(app, leaf, model);
+        leaf.binder = binder; leaf.value = "user"; leaf.detachOnPaint = true;
+        form.PreparedPaint();
+        Check(model.Str("value", "") == "before" && binder.Root() == null && app.preparationFrameAborted,
+        "render-time unmount aborts prepared frame before old writeback");
+        ReleaseApp(app);
+    }
+
+    static void CustomFrameWriteBackRetires() {
+        App app = App.CreateOffscreen("custom frame writeback", 240, 120);
+        ModelHostScopeLeaf leaf = new ModelHostScopeLeaf();
+        JsonValue model = State("before"); ModelBinder binder = Bind(app, leaf, model);
+        leaf.binder = binder; app.SetRootControl(leaf);
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame(), "custom frame prepares its model");
+        leaf.value = "stale"; leaf.detachOnGet = true;
+        leaf.RenderTree(app); app.EndOffscreenFrame();
+        Check(model.Str("value", "") == "before" && binder.Root() == null
+        && app.ModelHostCount() == 0 && app.preparationFrameAborted,
+        "custom frame writeback retirement aborts the presentation tail without committing stale values");
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame(), "custom frame recovers after writeback retirement");
+        leaf.RenderTree(app); app.EndOffscreenFrame();
+        Check(!app.preparationFrameAborted, "next custom frame presents without its retired model");
+        ReleaseApp(app);
+    }
+
+    static void DropBinder(App app, ModelHostScopeWitness witness) {
+        ModelHostScopeLeaf leaf = new ModelHostScopeLeaf(); JsonValue model = State("weak");
+        ModelBinder binder = Bind(app, leaf, model);
+        witness.binder = binder; witness.tree = leaf; witness.model = model;
+    }
+    static void DropApp(ModelBinder binder, ModelHostScopeWitness witness) {
+        App app = App.CreateOffscreen("weak model app", 100, 80);
+        witness.app = app; app.RegisterModelHost(binder); app.canvas.Destroy();
+    }
+    static void WeakLifetimes() {
+        App app = App.CreateOffscreen("weak binder host", 100, 80);
+        ModelHostScopeWitness witness = new ModelHostScopeWitness();
+        DropBinder(app, witness);
+        Check(witness.binder == null && witness.tree == null && witness.model == null && app.ModelHostCount() == 0,
+        "App registration does not retain binder or its object graph");
+        ModelBinder binder = new ModelBinder(); DropApp(binder, witness);
+        Check(witness.app == null && binder.HostApp() == null, "binder registration cannot retain its App");
+        binder.Detach(); ReleaseApp(app);
+    }
+
+    static void DetachAndWireTails() {
+        App app = App.CreateOffscreen("detach rows", 240, 120);
+        Control old = new Control(); ModelHostDetachInput input = new ModelHostDetachInput(); old.Add(input);
+        ModelHostScopeLeaf replacement = new ModelHostScopeLeaf(); JsonValue next = State("new-row");
+        ModelBinder binder = new ModelBinder(); binder.SetRoot(old, State("old-row")); app.RegisterModelHost(binder);
+        binder.expandedRows = new List<ChildExpandedRow>(); binder.expandedRows.Add(new ChildExpandedRow(input, old));
+        app.SetRootControl(old); old.UseApp(app); input.Arrange(0, 0, 100, 40);
+        input.binder = binder; input.app = app; input.replacement = replacement; input.next = next; input.replace = true;
+        app.CapturePointer(input, true);
+        binder.Detach();
+        Check(binder.Root() == replacement && binder.Model() == next && binder.HostApp() == app
+        && replacement.value == "new-row" && binder.valueBindings != null && binder.valueBindings.Count == 1
+        && binder.valueBindings[0].control == replacement && binder.valueBindings[0].hasSnapshot
+        && binder.valueBindings[0].snapshot == "new-row", "Detach cancellation preserves callback-installed binding");
+        binder.Detach(); binder.SetRoot(old, State("retry")); app.RegisterModelHost(binder);
+        old.Add(input); binder.expandedRows = new List<ChildExpandedRow>();
+        binder.expandedRows.Add(new ChildExpandedRow(input, old)); input.fail = true;
+        app.CapturePointer(input, true);
+        bool failed = false;
+        try { binder.Detach(); } catch (InvalidOperationException error) { failed = true; }
+        Check(failed && input.parent == old && binder.retiringRows != null && binder.retiringRows.Count == 1,
+        "throwing Cancel retains pending old row ownership");
+        binder.Detach();
+        Check(input.parent == null && binder.retiringRows == null, "retry completes old row retirement");
+        LinkScanFn prior = App.linkScanner;
+        ModelHostWireHook hook = new ModelHostWireHook(); hook.binder = binder;
+        hook.replacement = replacement; hook.model = next; hook.armed = true;
+        Control child = new Control(); old.Add(child);
+        binder.SetRoot(old, State("wire")); app.RegisterModelHost(binder);
+        try {
+            App.SetLinkScanner(hook.Scan); binder.Wire();
+            Check(hook.scans == 1 && binder.Root() == replacement && binder.tmplMetas == null
+            && binder.valueBindings == null && binder.collectedStructureRevision == -1,
+            "Wire AutoLink replacement stops old recursion/template registration/initial sync");
+        } finally { App.SetLinkScanner(prior); }
+        binder.Detach(); ReleaseApp(app);
+    }
+
+    static void ChildOrder() {
+        App app = App.CreateOffscreen("model child", 240, 120);
+        ChildWindow child = new ChildWindow(); child.host = app; child.open = true;
+        ModelHostScopeLeaf leaf = new ModelHostScopeLeaf(); JsonValue model = State("child");
+        child.SetView(leaf, model); child.EnsureHostLayoutRegistration();
+        model.Set("value", JsonValue.NewStr("before-input"));
+        app.ProcessOffscreenInput(1, 5, app.ContentTop() + 5, 0, 0, 0, 0);
+        Check(leaf.value == "before-input" && leaf.bw > 0, "child input preparation synchronizes before layout");
+        child.Teardown(); Check(app.ModelHostCount() == 0, "child teardown retires registered binder");
+    }
+
+    static void Main() {
+        // Isolate the existing first-App frame fixture from weak-lifetime checks.
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        Isolation(); ReplacementAndReentry(); PocoSetterTails(); RenderRetires(); CustomFrameWriteBackRetires();
+        WeakLifetimes(); DetachAndWireTails(); ChildOrder();
+        ReleaseApp(frame);
+        Console.WriteLine("model-host-app-scope:ok");
+    }
+}

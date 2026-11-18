@@ -2,6 +2,63 @@ using System;
 using Gui;
 using Gui.Widget;
 
+namespace Gui;
+
+class OverlayPreparationEvents {
+    public int resizes;
+    public void Resized() { resizes = resizes + 1; }
+}
+
+class OverlayPreparationProbe : Control {
+    public weak Control replacement;
+    public OverlayPreparationEvents events = new OverlayPreparationEvents();
+    public int desiredWidth = 120;
+    public int measureMode;
+    public int arrangeMode;
+    public int mutations;
+    public int arrangements;
+    public int arrangementsAfterCallback;
+    public int resizesAfterCallback;
+
+    public OverlayPreparationProbe() : base("overlay-preparation-probe") {
+        prefW = desiredWidth;
+        prefH = 100;
+        this.Resize.Add(events.Resized);
+    }
+
+    void Mutate(App app, int mode) {
+        if (mode == 0) { return; }
+        mutations = mutations + 1;
+        if (mode == 1) { app.SetRootControl(replacement); }
+        if (mode == 2) { app.window.SetLocalEvent(1, 1, 1, 0, 0, 0, 0); }
+        if (mode == 3) { app.PrepareInputParticipants(1, app.window.EventSeq()); }
+        arrangementsAfterCallback = arrangements;
+        resizesAfterCallback = events.resizes;
+    }
+
+    public override void OnMeasure(App app) {
+        prefW = desiredWidth;
+        prefH = 100;
+        int mode = measureMode;
+        measureMode = 0;
+        this.Mutate(app, mode);
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        arrangements = arrangements + 1;
+        base.Arrange(x, y, width, height);
+        int mode = arrangeMode;
+        arrangeMode = 0;
+        this.Mutate(this.App, mode);
+    }
+}
+
+class OverlayPreparationLifetime {
+    public weak App host;
+    public weak Control popup;
+    public weak OverlayPreparationEvents events;
+}
+
 class CancelReopenPopup : Control {
     public weak App Host;
     public weak Control Anchor;
@@ -94,6 +151,8 @@ class Program : Control {
         host.RenderAll(app);
         Check(!app.blocksInputBelow && !app.hitTester.BlockerAt(41, 81),
             "Hidden popup must not register legacy blockers");
+        Check(first.dismissed == 2, "Painting hidden popup does not dispatch dismissal");
+        Check(app.PrepareInputParticipants(1, app.window.EventSeq()), "Hidden popup retirement prepares");
         Check(first.dismissed == 3, "Hidden popup must be dismissed during update");
         oldPopup.Visible = true;
         host.Show(app, first, oldPopup);
@@ -102,6 +161,8 @@ class Program : Control {
         host.RenderAll(app);
         Check(!app.blocksInputBelow && !app.hitTester.BlockerAt(41, 81),
             "Zero-width popup must not register blockers or be resurrected by layout");
+        Check(first.dismissed == 3, "Painting zero-size popup does not dispatch dismissal");
+        Check(app.PrepareInputParticipants(1, app.window.EventSeq()), "Zero-size popup retirement prepares");
         Check(first.dismissed == 4, "Zero-size popup must be dismissed");
 
         host.Show(app, first, oldPopup);
@@ -111,9 +172,17 @@ class Program : Control {
         Check(first.dismissed == 5, "Hidden anchor must be notified on cleanup");
         first.Visible = true;
         host.Show(app, null, replacement);
+        int focused = app.focus.focusedId;
+        bool clickClaimed = app.clickClaimed;
         host.RenderAll(app);
-        Check(app.blocksInputBelow && app.hitTester.BlockerAt(replacement.bx + 1, replacement.by + 1),
-            "Visible popup must register actual legacy blocker geometry");
+        host.RenderAll(app);
+        Check(host.HitTest(replacement.bx + 1, replacement.by + 1, 0) == replacement,
+        "Visible popup uses current tree geometry for input");
+        Check(app.focus.focusedId == focused && app.clickClaimed == clickClaimed
+        && !app.blocksInputBelow && app.hitTester.RegionCount() == 0,
+        "Repeated popup Paint does not change focus, click ownership or legacy hit tables");
+        Check(host.HandleInput(app, 2, 310, 230, 0) && !host.HasActive(),
+        "Visible popup consumes outside down through retained routing");
         host.Dismiss();
         app.canvas.Destroy();
     }
@@ -180,7 +249,7 @@ class Program : Control {
         popup.Arrange(40, 80, 180, 100);
         popup.RenderTree(app);
         app.overlayHost.Show(app, null, popup);
-        Control label = button.children[0];
+        Control label = button.ChildAt(0);
         int x = label.bx + label.bw / 2;
         int y = label.by + label.bh / 2;
         Check(app.overlayHost.HitTest(x, y, 0) == label, "Overlay hit must descend standard Control tree");
@@ -265,7 +334,68 @@ class Program : Control {
         a.canvas.Destroy(); b.canvas.Destroy();
     }
 
+    static void PreparationCallbackFence(int mode, bool arrange, bool paint,
+    OverlayPreparationLifetime lifetime) {
+        App app = App.CreateOffscreen("Overlay preparation callback", 320, 240);
+        Control root = new Control("preparation-root");
+        Control replacement = new Control("replacement-root");
+        app.SetRootControl(root);
+        root.MeasureTree(app);
+        root.Arrange(0, app.ContentTop(), 320, 160);
+        OverlayPreparationProbe popup = new OverlayPreparationProbe();
+        popup.replacement = replacement;
+        lifetime.host = app;
+        lifetime.popup = popup;
+        lifetime.events = popup.events;
+        app.overlayHost.ShowAt(app, popup, 20, app.ContentTop() + 20);
+        Check(app.PrepareInputParticipants(1, app.window.EventSeq()), "popup establishes layout baseline");
+        Check(popup.events.resizes == 0, "first popup preparation sends no initial Resize");
+        int registration = app.overlayHost.RetirementRevision();
+        popup.desiredWidth = 140;
+        if (arrange) { popup.arrangeMode = mode; } else { popup.measureMode = mode; }
+        bool complete;
+        if (paint) {
+            app.BeginOffscreenFrame();
+            complete = app.PrepareStandardHostFrame();
+        } else {
+            complete = app.PrepareInputParticipants(1, app.window.EventSeq());
+        }
+        Check(popup.mutations == 1 && !complete, "popup callback retires the old preparation turn");
+        Check(popup.arrangements == popup.arrangementsAfterCallback,
+        "callback invalidation stops the old popup Arrange tail");
+        Check(popup.events.resizes == popup.resizesAfterCallback,
+        "callback invalidation stops the old popup layout notification tail");
+        Check(app.overlayHost.ActiveRoot() == popup
+        && app.overlayHost.RetirementRevision() == registration,
+        "point popup keeps its registration after callback invalidation");
+        if (mode == 1) { Check(app.rootControl == replacement, "popup callback replacement root survives"); }
+        Check(app.PrepareInputParticipants(1, app.window.EventSeq()), "popup recovers on fresh preparation");
+        Check(popup.bw == 140 && popup.events.resizes == 1,
+        "fresh preparation commits the changed geometry exactly once");
+        if (paint) { Check(app.preparationFrameAborted, "invalidated paint frame remains abandoned"); }
+        app.overlayHost.Dismiss();
+        app.SetRootControl(null);
+        app.StopLoop();
+        app.DrainPosts();
+        app.canvas.Destroy();
+    }
+
+    static void PreparationCallbackFences() {
+        for (int mode = 1; mode <= 3; mode = mode + 1) {
+            for (int stage = 0; stage < 2; stage = stage + 1) {
+                for (int phase = 0; phase < 2; phase = phase + 1) {
+                    OverlayPreparationLifetime lifetime = new OverlayPreparationLifetime();
+                    PreparationCallbackFence(mode, stage == 1, phase == 1, lifetime);
+                    Check(lifetime.host == null && lifetime.popup == null && lifetime.events == null,
+                    "popup callback fixture releases App, popup and event relay");
+                }
+            }
+        }
+    }
+
     static void Main() {
+        App frame = App.CreateOffscreen("Overlay test frame", 1, 1);
+        PreparationCallbackFences();
         AnchoredCrossAppReopen(true);
         AnchoredCrossAppReopen(false);
         AnchoredCancelReopen();
@@ -273,6 +403,8 @@ class Program : Control {
         ClosingInput();
         OwnerLifetime();
         RoutedClick();
+        frame.StopLoop();
+        frame.canvas.Destroy();
         Console.WriteLine("overlay_host_routing_test OK");
     }
 }

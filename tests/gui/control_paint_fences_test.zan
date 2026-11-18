@@ -1,0 +1,265 @@
+using System;
+using Gui;
+using Game.Foundation.Gui;
+
+namespace Gui;
+
+class ControlPaintFenceProbe : Control {
+    public int paints;
+    public int measures;
+    public int revision;
+    public weak App paintedApp;
+    public weak ControlPaintFenceHooks mutation;
+
+    public ControlPaintFenceProbe(string name) : base(name) { }
+    protected override int LayoutRevision() { return revision; }
+    public override void OnMeasure(App app) { measures = measures + 1; base.OnMeasure(app); }
+    public override void OnPaint(App app) {
+        paints = paints + 1;
+        paintedApp = app;
+        App.PaintHashOp(91, paints, 0, 0, 0);
+        ControlPaintFenceHooks hook = mutation;
+        if (hook != null) { hook.Apply(false); }
+    }
+}
+
+// Event subscriptions own the hook, which only borrows the business objects.
+class ControlPaintFenceHooks {
+    public weak App host;
+    public weak App destination;
+    public weak HudLayer hud;
+    public weak Control root;
+    public weak ControlPaintFenceProbe actor;
+    public int mode;
+    public bool inSignal;
+    public bool fired;
+    public int signals;
+
+    public void OnSignal() { signals = signals + 1; this.Apply(true); }
+    public void Apply(bool signal) {
+        if (fired || signal != inSignal) { return; }
+        fired = true;
+        App app = host;
+        HudLayer layer = hud;
+        Control tree = root;
+        if (app == null || tree == null) { return; }
+        if (mode == 1 && layer != null) { layer.SetVisible(false); }
+        if (mode == 2 && layer != null) { layer.Remove(tree); }
+        if (mode == 3 && layer != null) { layer.Clear(); }
+        if (mode == 4 && layer != null && destination != null) { layer.Bind(destination); }
+        if (mode == 5) { app.SetRootControl(new Control("replacement-input-root")); }
+        if (mode == 6) { app.window.SetLocalEvent(1, 17, 19, 0, 0, 0, 0); }
+        if (mode == 7) { app.InvalidatePreparation(); }
+        if (mode == 8 && tree.parent != null) { tree.parent.Remove(tree); }
+        if (mode == 9) { tree.SetShown(false); }
+        if (mode == 10 && actor != null) { actor.revision = actor.revision + 1; }
+        if (mode == 11) { throw new Exception("control paint injected failure"); }
+    }
+}
+
+class ControlPaintFenceWatch {
+    public weak App first;
+    public weak App second;
+    public weak HudLayer hud;
+    public weak Control tree;
+    public weak Control actor;
+    public weak ControlPaintFenceHooks hook;
+}
+
+class ControlPaintFencesTest {
+    static int failures;
+
+    static void Check(bool ok, string why) {
+        if (!ok) { failures = failures + 1; Console.WriteLine("FAIL " + why); }
+    }
+
+    static void Restored(App app, Control context, PaintHashToken hash, string why) {
+        Check(app.styleCtx == context, why + " restores style context");
+        PaintHashToken current = app.PaintHashBeginScope();
+        Check(current.armed == hash.armed && current.accumulator == hash.accumulator,
+        why + " restores paint hash");
+        App.PaintHashRestore(current);
+        int color = unchecked((int)0xff37a95c);
+        app.canvas.FillRect(200, 140, 1, 1, color);
+        Check(app.canvas.GetPixel(200, 140) == color, why + " restores child clip");
+    }
+
+    static void HudMutation(int mode, bool signal, bool child, ControlPaintFenceWatch watch) {
+        App first = App.CreateOffscreen("control paint fence", 240, 180);
+        App second = App.CreateOffscreen("control paint destination", 280, 200);
+        first.SetRootControl(new Control("world"));
+        HudLayer hud = new HudLayer();
+        ControlPaintFenceProbe tree = new ControlPaintFenceProbe("hud-root");
+        ControlPaintFenceProbe actor = child ? new ControlPaintFenceProbe("first-child") : tree;
+        ControlPaintFenceProbe descendant = new ControlPaintFenceProbe("descendant");
+        ControlPaintFenceProbe sibling = new ControlPaintFenceProbe("tail-sibling");
+        if (child) { tree.Add(actor); }
+        actor.Add(descendant); tree.Add(sibling);
+        hud.Add(tree); hud.SetBounds(24, 32, 100, 70); hud.Bind(first);
+        ControlPaintFenceHooks hook = new ControlPaintFenceHooks();
+        hook.host = first; hook.destination = second; hook.hud = hud; hook.root = tree;
+        hook.actor = actor; hook.mode = mode; hook.inSignal = signal;
+        actor.mutation = hook; actor.Paint.Add(hook.OnSignal);
+        watch.first = first; watch.second = second; watch.hud = hud;
+        watch.tree = tree; watch.actor = actor; watch.hook = hook;
+        first.BeginOffscreenFrame();
+        Check(first.PrepareStandardHostFrame(), "HUD mutation premise prepares");
+        Control context = new Control("sentinel-context"); first.styleCtx = context;
+        PaintHashToken previous = first.PaintHashBeginScope();
+        App.PaintHashResume(true); App.PaintHashOp(92, 1, 2, 3, 4);
+        PaintHashToken hash = first.PaintHashBeginScope(); App.PaintHashRestore(hash);
+        string label = "HUD mode=" + Convert.ToString(mode) + " signal=" + Convert.ToString(signal)
+        + " child=" + Convert.ToString(child);
+        hud.Paint(first);
+        if (ProcessHost.Env("ZAN_CONTROL_PAINT_BASELINE") == "1") {
+            Console.WriteLine("BASELINE actor=" + Convert.ToString(actor.paints)
+            + " signal=" + Convert.ToString(hook.signals)
+            + " descendant=" + Convert.ToString(descendant.paints)
+            + " sibling=" + Convert.ToString(sibling.paints)
+            + " visible=" + Convert.ToString(hud.IsVisible()));
+        }
+        Check(hook.fired && actor.paints == 1, label + " invokes actor once");
+        Check(hook.signals == (signal ? 1 : 0), label + " fences Paint signal");
+        Check(descendant.paints == 0 && sibling.paints == 0, label + " fences descendants and siblings");
+        Check(!first.ContinuePreparedFrame(), label + " invalidates old frame");
+        int tailPaints = sibling.paints;
+        sibling.RenderTree(first);
+        Check(sibling.paints == tailPaints, label + " rejects a subsequent stale RenderTree entry");
+        if (mode == 4) {
+            Check(second.rootControl is InputRootAdapter && descendant.FindApp() == second && descendant.paintedApp == null,
+            label + " never consumes destination geometry on old App");
+        }
+        Restored(first, context, hash, label);
+        App.PaintHashRestore(previous); first.styleCtx = null;
+        first.CancelOffscreenFrame(); second.CancelOffscreenFrame();
+        hud.Clear(); hud.SetVisible(false);
+        first.SetRootControl(null); second.SetRootControl(null);
+        first.StopLoop(); second.StopLoop(); first.canvas.Destroy(); second.canvas.Destroy();
+    }
+
+    static void DirectMutation(int mode, bool signal, bool prepared) {
+        App app = App.CreateOffscreen("direct control paint fence", 240, 180);
+        ControlPaintFenceProbe root = new ControlPaintFenceProbe("code-root");
+        ControlPaintFenceProbe actor = new ControlPaintFenceProbe("code-actor");
+        ControlPaintFenceProbe descendant = new ControlPaintFenceProbe("code-descendant");
+        ControlPaintFenceProbe sibling = new ControlPaintFenceProbe("code-sibling");
+        root.Add(actor); actor.Add(descendant); root.Add(sibling);
+        app.SetRootControl(root); root.MeasureTree(app); root.Arrange(20, 30, 100, 70);
+        ControlPaintFenceHooks hook = new ControlPaintFenceHooks();
+        hook.host = app; hook.root = mode == 8 || mode == 9 ? actor : root;
+        hook.actor = actor; hook.mode = mode; hook.inSignal = signal;
+        actor.mutation = hook; actor.Paint.Add(hook.OnSignal);
+        app.BeginOffscreenFrame();
+        if (prepared) { Check(app.PrepareStandardHostFrame(), "direct mutation premise prepares"); }
+        Control context = new Control("direct-sentinel"); app.styleCtx = context;
+        PaintHashToken previous = app.PaintHashBeginScope(); App.PaintHashResume(true);
+        App.PaintHashOp(93, 4, 3, 2, 1);
+        PaintHashToken hash = app.PaintHashBeginScope(); App.PaintHashRestore(hash);
+        string label = "direct mode=" + Convert.ToString(mode) + " signal=" + Convert.ToString(signal)
+        + " prepared=" + Convert.ToString(prepared);
+        bool thrown = false;
+        try { root.RenderTree(app); }
+        catch (Exception error) {
+            thrown = error.Message == "control paint injected failure";
+            if (!thrown) { throw error; }
+        }
+        Check(thrown == (mode == 11), label + " preserves exceptions");
+        Check(hook.fired && actor.paints == 1, label + " invokes actor once");
+        Check(hook.signals == (signal ? 1 : 0), label + " fences signal");
+        Check(descendant.paints == 0 && sibling.paints == (mode >= 8 && mode <= 10 ? 1 : 0),
+        label + " stops only the invalid child callback tail");
+        Restored(app, context, hash, label);
+        App.PaintHashRestore(previous); app.styleCtx = null;
+        app.CancelOffscreenFrame(); app.SetRootControl(null); app.StopLoop(); app.canvas.Destroy();
+    }
+
+    static void NormalCodeTree() {
+        App app = App.CreateOffscreen("normal code paint", 240, 180);
+        ControlPaintFenceProbe root = new ControlPaintFenceProbe("normal-code");
+        ControlPaintFenceProbe first = new ControlPaintFenceProbe("normal-first");
+        ControlPaintFenceProbe second = new ControlPaintFenceProbe("normal-second");
+        root.Add(first); root.Add(second); app.SetRootControl(root);
+        root.MeasureTree(app); root.Arrange(20, 30, 100, 70);
+        ControlPaintFenceHooks hook = new ControlPaintFenceHooks(); first.Paint.Add(hook.OnSignal);
+        for (int frame = 0; frame < 2; frame = frame + 1) {
+            app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "normal code prepares");
+            int measures = first.measures;
+            root.RenderTree(app); root.RenderTree(app);
+            Check(first.measures == measures, "normal paint does not measure");
+            Check(app.ContinuePreparedFrame(), "normal code keeps prepared frame");
+            app.CancelOffscreenFrame();
+        }
+        Check(root.paints == 4 && first.paints == 4 && second.paints == 4 && hook.signals == 4,
+        "normal code paints each node and signal exactly once per traversal");
+        app.SetRootControl(null); app.StopLoop(); app.canvas.Destroy();
+    }
+
+    static void NormalHtmlTree() {
+        App app = App.CreateOffscreen("normal HTML paint", 240, 180);
+        HtmlDoc doc = Html.Parse("<body><div id='paint-parent'><div id='paint-first'></div><div id='paint-second'></div></div></body>", "", null);
+        Control root = doc.root;
+        Control first = doc.Get("paint-first"); Control second = doc.Get("paint-second");
+        Check(root != null && first != null && second != null, "HTML builds ordinary retained tree");
+        ControlPaintFenceHooks head = new ControlPaintFenceHooks();
+        ControlPaintFenceHooks tail = new ControlPaintFenceHooks();
+        first.Paint.Add(head.OnSignal); second.Paint.Add(tail.OnSignal);
+        app.SetRootControl(root); root.MeasureTree(app); root.Arrange(0, 0, 240, 180);
+        for (int frame = 0; frame < 2; frame = frame + 1) {
+            app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "normal HTML prepares");
+            root.RenderTree(app);
+            Check(app.ContinuePreparedFrame(), "normal HTML keeps prepared frame");
+            app.CancelOffscreenFrame();
+        }
+        Check(head.signals == 2 && tail.signals == 2, "normal HTML paints each child once per traversal");
+        app.SetRootControl(null); app.StopLoop(); app.canvas.Destroy();
+    }
+
+    static void RunCases() {
+        App previous = App.FrameApp();
+        if (ProcessHost.Env("ZAN_CONTROL_PAINT_BASELINE") == "1") {
+            ControlPaintFenceWatch watch = new ControlPaintFenceWatch();
+            HudMutation(1, false, false, watch);
+            bool released = watch.first == null && watch.second == null && watch.hud == null
+            && watch.tree == null && watch.actor == null && watch.hook == null;
+            Console.WriteLine("BASELINE weakReleased=" + Convert.ToString(released));
+            Check(released, "baseline weak release");
+            if (failures == 0) { Console.WriteLine("CONTROL_PAINT_FENCES_BASELINE_OK"); }
+            return;
+        }
+        NormalCodeTree(); NormalHtmlTree();
+        Console.WriteLine("normal code and HTML paint preserved");
+        for (int mode = 1; mode <= 4; mode = mode + 1) {
+            for (int signal = 0; signal < 2; signal = signal + 1) {
+                for (int child = 0; child < 2; child = child + 1) {
+                    ControlPaintFenceWatch watch = new ControlPaintFenceWatch();
+                    HudMutation(mode, signal == 1, child == 1, watch);
+                    Check(watch.first == null && watch.second == null && watch.hud == null
+                    && watch.tree == null && watch.actor == null && watch.hook == null,
+                    "HUD paint fence releases Apps tree and event hook");
+                }
+            }
+        }
+        Console.WriteLine("HUD Hide Remove Clear and cross-App paint fences");
+        for (int mode = 5; mode <= 10; mode = mode + 1) {
+            for (int signal = 0; signal < 2; signal = signal + 1) {
+                DirectMutation(mode, signal == 1, true);
+                DirectMutation(mode, signal == 1, false);
+            }
+        }
+        Console.WriteLine("root event phase visibility and ownership paint fences");
+        DirectMutation(11, false, true); DirectMutation(11, true, true);
+        Console.WriteLine("clip style and paint hash restored on abort and exception");
+        Check(App.FrameApp() == previous, "paint frames release ambient App");
+        if (failures == 0) { Console.WriteLine("CONTROL_PAINT_FENCES_OK"); }
+    }
+
+    static void Main() {
+        App previous = App.FrameApp();
+        App frame = App.CreateOffscreen("independent paint frame owner", 16, 16);
+        try { RunCases(); }
+        finally {
+            frame.StopLoop(); frame.canvas.Destroy(); App.frameApp = previous;
+        }
+        if (failures != 0) { throw new Exception("CONTROL_PAINT_FENCES failures=" + Convert.ToString(failures)); }
+    }
+}

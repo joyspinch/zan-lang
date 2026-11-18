@@ -11,6 +11,8 @@ public class ButtonGroup : Control {
     private int size;
     private bool vertical;
     private int active;
+    public UiEvent SelectionChanged;
+    private int lastClicked = -1;
 
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return vertical ? 1 : 0; }
@@ -22,6 +24,7 @@ public class ButtonGroup : Control {
         size = 2;
         vertical = false;
         active = 0 - 1;
+        SelectionChanged = new UiEvent();
         Class = "row align-center";
     }
 
@@ -56,16 +59,17 @@ public class ButtonGroup : Control {
     // 段数（段按钮个数）。
     public int SegCount() {
         int n = 0;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            if (children[i] is Button) { n = n + 1; }
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is Button) { n = n + 1; }
         }
         return n;
     }
 
     // 清空全部段。
     public void ClearSegs() {
-        this.children.Clear();
+        this.RemoveAll();
         active = 0 - 1;
+        lastClicked = -1;
     }
 
     // 按标签追加一个段（返回本组，链式）。
@@ -80,24 +84,24 @@ public class ButtonGroup : Control {
     }
 
     public Button ButtonAt(int i) {
-        if (i >= 0 && i < children.Count && children[i] is Button) {
-            return (Button)children[i];
+        if (i >= 0 && i < this.ChildCount() && this.ChildAt(i) is Button) {
+            return (Button)this.ChildAt(i);
         }
         return null;
     }
 
     // ---- 段选择 conveniences（DataTable 组件列等保留态宿主用）----
-    // 高亮以段按钮的 `active` 类为准；点击消费读段按钮的 clicked 逐帧标志。
+    // 高亮以段按钮的 `active` 类为准；动作由子控件语义 Click 路由提交。
 
     // 当前高亮段的标签（无高亮为空串）。
     public string ActiveLabel() {
-        if (active >= 0 && active < children.Count && children[active] is Button) {
-            Button b = (Button)children[active];
+        if (active >= 0 && active < this.ChildCount() && this.ChildAt(active) is Button) {
+            Button b = (Button)this.ChildAt(active);
             return b.Label();
         }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            if (!(children[i] is Button)) { continue; }
-            Button b = (Button)children[i];
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (!(this.ChildAt(i) is Button)) { continue; }
+            Button b = (Button)this.ChildAt(i);
             if (Style.Has(b.Class, "active")) { return b.Label(); }
         }
         return "";
@@ -109,9 +113,9 @@ public class ButtonGroup : Control {
     // 按下标设高亮段（-1 清除）；越界静默忽略。
     public void SetActiveIndex(int idx) {
         active = idx;
-        for (int k = 0; k < children.Count; k = k + 1) {
-            if (!(children[k] is Button)) { continue; }
-            Button b = (Button)children[k];
+        for (int k = 0; k < this.ChildCount(); k = k + 1) {
+            if (!(this.ChildAt(k) is Button)) { continue; }
+            Button b = (Button)this.ChildAt(k);
             if (k == idx) { b.AddClass("active"); } else { b.RemoveClass("active"); }
         }
     }
@@ -119,45 +123,49 @@ public class ButtonGroup : Control {
     // 按标签设高亮段；`label` 为空串清除。无匹配项时保留原状。
     public void SetActive(string label) {
         if (label == "") { this.SetActiveIndex(0 - 1); return; }
-        for (int k = 0; k < children.Count; k = k + 1) {
-            if (!(children[k] is Button)) { continue; }
-            Button b = (Button)children[k];
+        for (int k = 0; k < this.ChildCount(); k = k + 1) {
+            if (!(this.ChildAt(k) is Button)) { continue; }
+            Button b = (Button)this.ChildAt(k);
             if (b.Label() == label) { this.SetActiveIndex(k); return; }
         }
     }
 
-    // 本帧被点击的段索引；-1 无（消费语义：读后即清）。
-    public int TakeClicked() {
-        for (int k = 0; k < children.Count; k = k + 1) {
-            if (!(children[k] is Button)) { continue; }
-            Button b = (Button)children[k];
-            if (b.clicked) {
-                b.clicked = false;
-                return k;
-            }
-        }
-        return 0 - 1;
+    public override void OnChildEvent(Control child, string evt) {
+        base.OnChildEvent(child, evt);
+        if (evt != "Click" || child == null || child.parent != this || !(child is Button)) { return; }
+        int index = this.IndexOf(child);
+        if (index < 0) { return; }
+        lastClicked = index;
+        this.SetActiveIndex(index);
+        SelectionChanged.RaiseS(this);
+    }
+
+    // DataTable's cell adapter consumes one committed action during preparation.
+    internal int TakeSelectionAction() {
+        int result = lastClicked;
+        lastClicked = -1;
+        return result;
     }
 
     public override string Kind() { return "ButtonGroup"; }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec type = PropSpec.Enum("type", "Type",
             new List<string>{ "default", "primary", "info", "success",
                               "warning", "error" });
-        type.num = btnType;
+        type.Field("btnType", 1);
         ps.Add(type);
         PropSpec style = PropSpec.Enum("style", "Style",
             new List<string>{ "solid", "outline" });
-        style.num = btnStyle;
+        style.Field("btnStyle", 1);
         ps.Add(style);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.num = size;
+        sz.Field("size", 1);
         ps.Add(sz);
         PropSpec vert = PropSpec.Bool("vertical", "Vertical");
-        vert.flag = vertical;
+        vert.Field("vertical", 2);
         ps.Add(vert);
         return ps;
     }

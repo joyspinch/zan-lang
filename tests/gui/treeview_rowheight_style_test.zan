@@ -1,0 +1,117 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// A derived host can have its own surface selector while keeping tree row metrics.
+class RowHeightSurfaceTree : TreeView {
+    public override string StyleType() { return "treeview"; }
+}
+
+class TreeViewRowHeightStyleTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception("tree row style: " + label); } }
+    static int ReferenceHeight(App app, TreeView tree) {
+        StyleBox box = Style.Full(app, "tree", tree.Class, tree.name, Style.SNormal());
+        Style.Inline(box, tree);
+        return box.HeightOr(app.theme.heightSmall);
+    }
+    static TreeView Fixture(App app) {
+        TreeView tree = new TreeView();
+        List<TreeNode> nodes = new List<TreeNode>();
+        nodes.Add(TreeNode.File("first", 0)); nodes.Add(TreeNode.File("second", 0));
+        tree.Bind(nodes); tree.UseApp(app);
+        return tree;
+    }
+    static void Stable(App app) {
+        app.UseAppCss("tree { height:28px; background:#102030; } tree:hover { height:44px; }");
+        TreeView tree = Fixture(app);
+        app.styleCtx = tree;
+        tree.MeasureTree(app);
+        StyleBox normal = tree.computedStyle;
+        int before = Style.StatPeek(0);
+        for (int i = 0; i < 12; i = i + 1) {
+            Check(tree.RowHeight(app) == app.Scale(28), "stable normal row height");
+            tree.MeasureTree(app);
+            Check(tree.computedStyle == normal, "Measure and RowHeight preserve normal box identity");
+        }
+        Check(Style.StatPeek(0) == before, "warm Measure and RowHeight perform no Full lookup");
+        StyleBox hover = tree.BoxState(app, Style.SHover());
+        Check(hover.height == app.Scale(44), "hover surface uses hover metric");
+        for (int i = 0; i < 3; i = i + 1) {
+            Check(tree.RowHeight(app) == app.Scale(28), "row metric stays normal under hover");
+            Check(tree.computedStyle == hover && tree.computedStyle.height == app.Scale(44), "RowHeight does not overwrite hover box");
+        }
+        tree.MeasureTree(app);
+        Check(tree.computedStyle.height == app.Scale(28), "Measure explicitly restores normal surface");
+        StyleBox previous = tree.computedStyle;
+        app.UseAppCss("tree { height:35px; } tree.dense { height:23px; }");
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree) && tree.RowHeight(app) == app.Scale(35), "cached normal theme invalidation");
+        Check(tree.computedStyle == previous, "expired normal query leaves surface untouched");
+        tree.MeasureTree(app);
+        previous = tree.computedStyle;
+        app.dpiScale = 150;
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree) && tree.RowHeight(app) == app.Scale(35), "cached normal DPI invalidation");
+        Check(tree.computedStyle == previous, "DPI query leaves surface untouched");
+        tree.MeasureTree(app);
+        previous = tree.computedStyle;
+        app.metricsScale = 125;
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree), "cached normal metric scale invalidation");
+        Check(tree.computedStyle == previous, "metric scale query leaves surface untouched");
+        tree.Class = "dense";
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree), "cached normal class invalidation");
+        app.dpiScale = 100;
+        app.metricsScale = 100;
+        app.styleCtx = null;
+    }
+    static void AliasAndInvalidation(App app) {
+        app.UseAppCss("tree { height:28px; } treeview { height:71px; } treeview:hover { height:83px; } tree.dense { height:24px; }");
+        TreeView tree = new RowHeightSurfaceTree(); tree.UseApp(app);
+        app.styleCtx = tree;
+        tree.MeasureTree(app);
+        StyleBox surface = tree.computedStyle;
+        Check(surface.height == app.Scale(71), "derived surface selector retained after Measure");
+        for (int i = 0; i < 3; i = i + 1) {
+            Check(tree.RowHeight(app) == app.Scale(28) && tree.computedStyle == surface, "tree alias metric cannot replace treeview surface");
+        }
+        StyleBox hover = tree.BoxState(app, Style.SHover());
+        Check(tree.RowHeight(app) == app.Scale(28) && tree.computedStyle == hover, "alias query preserves active surface state");
+        app.UseAppCss("tree { height:36px; } treeview { height:75px; } tree.dense { height:25px; }");
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree) && tree.RowHeight(app) == app.Scale(36), "theme replacement invalidates alias metric");
+        Check(tree.computedStyle == hover, "fresh alias query still cannot write surface cache");
+        app.dpiScale = 150;
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree) && tree.RowHeight(app) == app.Scale(36), "DPI replacement invalidates alias metric");
+        tree.Class = "dense";
+        Check(tree.RowHeight(app) == ReferenceHeight(app, tree) && tree.RowHeight(app) == app.Scale(25), "class replacement invalidates alias metric");
+        app.UseAppCss("tree { height:32px; } tree:last-child { height:40px; } treeview { height:75px; }");
+        TreeView last = Fixture(app); Control parent = new Control(); parent.UseApp(app); parent.Add(last);
+        app.styleCtx = last;
+        last.MeasureTree(app);
+        StyleBox structural = last.computedStyle;
+        Check(last.RowHeight(app) == ReferenceHeight(app, last) && last.RowHeight(app) == app.Scale(40), "live structural selector initial");
+        parent.Add(new Control());
+        Check(last.RowHeight(app) == ReferenceHeight(app, last) && last.RowHeight(app) == app.Scale(32), "live structural selector changes without alias cache");
+        Check(last.computedStyle == structural, "live structural query leaves surface untouched");
+        tree.WithFixedRowHeight(19);
+        Check(tree.RowHeight(app) == app.Scale(19), "fixed row metric keeps explicit DPI contract");
+        app.dpiScale = 100;
+        app.styleCtx = null;
+    }
+    static void Pixels(App app, string path) {
+        app.UseAppCss("tree { background:#202830; color:#ddeeff; } treeview::label { color:#ddeeff; }");
+        TreeView tree = Fixture(app);
+        app.canvas.Clear(0);
+        tree.MeasureTree(app); tree.Arrange(0, 0, 240, 120); tree.RenderTree(app);
+        Check(app.canvas.WritePixels(path, 0, 0, 240, 120) == 24 + 240 * 120 * 4, "pixel capture");
+    }
+    static void Main(string[] args) {
+        App frame = App.CreateOffscreen("Independent row style frame", 2, 2);
+        App app = App.CreateOffscreen("Tree row style", 240, 120);
+        if (args.Length == 2 && args[0] == "pixels") { Pixels(app, args[1]); }
+        else {
+            Stable(app); AliasAndInvalidation(app);
+            Console.WriteLine("TREEVIEW_ROWHEIGHT_STYLE_OK");
+        }
+        app.StopLoop(); app.canvas.Destroy();
+        frame.StopLoop(); frame.canvas.Destroy();
+    }
+}

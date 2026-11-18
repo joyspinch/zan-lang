@@ -1,0 +1,181 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// Carousel 保留输入回归：首绘前控件页可命中、过渡几何由准备阶段建立、
+// autoplay/过渡推进在循环阶段完成、绘制与快照不重放任何事件。
+class CarouselChangeEvents {
+    public int changes;
+    public weak Control sender;
+    public void Changed(Control control) { changes = changes + 1; sender = control; }
+}
+
+class CarouselClickCounter {
+    public int clicks;
+    public void Invoke() { clicks = clicks + 1; }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("Carousel retained input: " + label); }
+    }
+
+    static void Click(Form form, int x, int y) {
+        form.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static void Main() {
+        App sentinel = App.CreateOffscreen("sentinel", 1, 1);
+        Form form = Form.CreateOffscreen("Carousel", 240, 120);
+        App app = form.GetApp();
+        app.SetChromeVisible(false);
+
+        // ---- 首绘前的页命中与可见性 --------------------------------
+        Carousel carousel = new Carousel();
+        carousel.SetProp("style", "width:100%;height:100%");
+        CarouselClickCounter aClicks = new CarouselClickCounter();
+        CarouselClickCounter bClicks = new CarouselClickCounter();
+        Button pageA = new Button("A");
+        Button pageB = new Button("B");
+        pageA.Click.Add(aClicks.Invoke);
+        pageB.Click.Add(bClicks.Invoke);
+        carousel.AddSlideView(pageA);
+        carousel.AddSlideView(pageB);
+        CarouselChangeEvents events = new CarouselChangeEvents();
+        carousel.BindEventS("Change", events.Changed);
+        form.Add(carousel);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(carousel.chrome != null, "chrome mounts on first input preparation");
+        Check(pageA.visible && !pageB.visible, "first preparation shows only the current slide");
+        Click(form, 120, 50);
+        Check(aClicks.clicks == 1 && bClicks.clicks == 0, "current slide hits before paint");
+
+        // ---- GoTo 后重准备的可见性与命中 ------------------------------
+        carousel.GoTo(app, 1);
+        Check(events.changes == 1 && events.sender == carousel, "GoTo raises Change once");
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!pageA.visible && pageB.visible, "reprepared visibility follows index");
+        Click(form, 120, 50);
+        Check(bClicks.clicks == 1 && aClicks.clicks == 1, "hit follows reprepared page");
+
+        // ---- 重复快照不重放 ------------------------------------------
+        form.CaptureSnapshot();
+        form.CaptureSnapshot();
+        Check(aClicks.clicks == 1 && bClicks.clicks == 1 && events.changes == 1,
+            "snapshots never replay input or change");
+
+        // ---- autoplay：循环阶段推进，Change 语义与 GoTo 一致 ----------
+        carousel.autoplay = false;
+        form.Remove(carousel);
+        Carousel auto = new Carousel();
+        auto.SetProp("style", "width:100%;height:100%");
+        auto.AddSlide("one");
+        auto.AddSlide("two");
+        auto.autoplay = true;
+        auto.intervalMs = 0;
+        CarouselChangeEvents autoEvents = new CarouselChangeEvents();
+        auto.BindEventS("Change", autoEvents.Changed);
+        form.Add(auto);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        // 注册发生在本轮准备阶段，本轮 EndLoopTurn 就会 tick 一次。
+        int before = autoEvents.changes;
+        int tickTurns = 3;
+        for (int i = 0; i < tickTurns; i = i + 1) {
+            form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        }
+        Check(autoEvents.changes == before + tickTurns
+            && auto.Index.Get() == (before + tickTurns) % 2,
+            "autoplay advances one page per loop turn");
+        Check(autoEvents.sender == auto, "autoplay Change sender is the carousel");
+        form.CaptureSnapshot();
+        Check(autoEvents.changes == before + tickTurns, "snapshot does not advance autoplay");
+
+        // Detached controls may remain externally owned; their old driver must stop.
+        form.Remove(auto);
+        int detachedChanges = autoEvents.changes;
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(autoEvents.changes == detachedChanges, "detached carousel cannot autoplay");
+        auto.autoplay = false;
+
+        // 单页不推进。
+        Carousel single = new Carousel();
+        single.SetProp("style", "width:100%;height:100%");
+        single.AddSlide("only");
+        single.autoplay = true;
+        single.intervalMs = 0;
+        CarouselChangeEvents singleEvents = new CarouselChangeEvents();
+        single.BindEventS("Change", singleEvents.Changed);
+        form.Add(single);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(singleEvents.changes == 0, "single slide never autoplays");
+
+        // ---- 过渡：准备阶段建立滑动几何，循环阶段落定 ------------------
+        form.Remove(single);
+        single.autoplay = false;
+        Carousel animated = new Carousel();
+        animated.SetProp("style", "width:100%;height:100%");
+        CarouselClickCounter tAClicks = new CarouselClickCounter();
+        CarouselClickCounter tBClicks = new CarouselClickCounter();
+        Button slideA = new Button("tA");
+        Button slideB = new Button("tB");
+        slideA.Click.Add(tAClicks.Invoke);
+        slideB.Click.Add(tBClicks.Invoke);
+        animated.AddSlideView(slideA);
+        animated.AddSlideView(slideB);
+        // 第三页让 0→1 的方向判定无回绕歧义（两页时前后向目标相同）。
+        animated.AddSlideView(new Button("tC"));
+        CarouselAnim state = new CarouselAnim();
+        animated.Animate(state);
+        form.Add(animated);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        animated.GoTo(app, 1);
+        Check(state.animating && state.from == 0 && state.dir == 1, "GoTo starts the transition");
+        Click(form, 120, 50);
+        Check(tAClicks.clicks == 1 && tBClicks.clicks == 0, "entering slide starts outside the box");
+        int start = Window.GetTickMs();
+        while (Window.GetTickMs() - start < TransitionWaitMs()) { }
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!state.animating && state.shown == 1, "loop tick completes the transition");
+        Click(form, 120, 50);
+        Check(tBClicks.clicks == 1 && tAClicks.clicks == 1, "hit follows the completed transition");
+        form.CaptureSnapshot();
+        Check(tAClicks.clicks == 1 && tBClicks.clicks == 1, "snapshot does not replay during transition");
+
+        form.Remove(animated);
+        Carousel mixed = new Carousel();
+        mixed.SetProp("style", "width:100%;height:100%");
+        mixed.AddSlide("text before");
+        Button middle = new Button("middle");
+        mixed.AddSlideView(middle);
+        mixed.AddSlide("text after");
+        Button last = new Button("last");
+        mixed.AddSlideView(last);
+        form.Add(mixed);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!middle.visible && !last.visible, "leading text page keeps controls hidden");
+        mixed.GoTo(1);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(middle.visible && !last.visible, "mixed page index maps to middle control");
+        mixed.GoTo(2);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!middle.visible && !last.visible, "interleaved text page keeps controls hidden");
+        mixed.GoTo(3);
+        form.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!middle.visible && last.visible, "mixed page index maps to last control");
+        app.SetRootControl(null);
+        app.StopLoop();
+        app.canvas.Destroy();
+        app.canvas = null;
+        sentinel.StopLoop();
+        sentinel.canvas.Destroy();
+        sentinel.canvas = null;
+        Console.WriteLine("CAROUSEL_RETAINED_INPUT_OK");
+    }
+
+    // 过渡时长 160ms 的等待上限，留出真实时钟推进余量。
+    static int TransitionWaitMs() { return 240; }
+}

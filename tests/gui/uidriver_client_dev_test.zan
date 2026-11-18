@@ -1,0 +1,79 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Backend;
+
+class UiDriverClientDevTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("client-dev: " + message); }
+    }
+
+    static void Rejected(App app, string name, string script) {
+        File.WriteAllText("script.uidrv", script);
+        bool rejected = false;
+        try {
+            try { UiDriver.Begin(app); }
+            catch (InvalidOperationException ex) {
+                rejected = true;
+                File.AppendAllText("rejections.txt", name + ": " + ex.Message + "\n");
+            }
+            Check(rejected, name);
+        } finally { UiDriver.active = false; }
+    }
+
+    static int Main() {
+        Directory.CreateDirectoryRecursive("build/test-out/gui-client-dev");
+        Environment.SetCurrentDirectory("build/test-out/gui-client-dev");
+        string here = Environment.CurrentDirectory;
+        File.WriteAllText("rejections.txt", "");
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        Environment.SetEnvironmentVariable("ZAN_UI_OUT", here + "/uidrv");
+        Environment.SetEnvironmentVariable("ZAN_FRAME_PROF", "1");
+        App app = new App("Startup exact device client", 240, 160);
+        try {
+            app.Show();
+            Check(app.window.GetHandle() != 0, "real native HWND");
+            Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", here + "/script.uidrv");
+            Rejected(app, "zero", "client-dev 0 481\n");
+            Rejected(app, "negative", "client-dev -1 481\n");
+            Rejected(app, "malformed", "client-dev 643x 481\n");
+            Rejected(app, "oversize", "client-dev 16385 481\n");
+            Rejected(app, "late", "wait 1\nclient-dev 643 481\n");
+            Rejected(app, "duplicate", "client-dev 643 481\nclient-dev 643 481\n");
+            Rejected(app, "native minimum mismatch", "client-dev 1 1\n");
+            File.WriteAllText("script.uidrv", "# startup canvas\n\nclient-dev 643 481\nwait 500\n");
+            File.WriteAllText("zan_frame_perf.log", "");
+            UiDriver.Begin(app);
+            Check(app.frameCount == 0 && app.perfFrames == 0, "startup counters remain zero");
+            Check(app.window.ClientWidth() == 643 && app.window.ClientHeight() == 481,
+            "native client matches device size");
+            Check(app.canvas.Width() == 643 && app.canvas.Height() == 481, "actual canvas matches");
+            string startup = File.ReadAllText("uidrv/results.log");
+            File.WriteAllText("startup-results.txt", startup);
+            Check(startup.Contains("frame_before=0 frame_after=0 perf_before=0 perf_after=0"),
+            "prepaint receipt within the standard Show-before-first-frame path");
+            app.FreezeAnimClock(600000);
+            Check(app.SafeFrame(() => {
+                app.canvas.FillRect(0, 0, 643, 481, 0xff18232d);
+            }), "real first frame");
+            Check(app.frameCount > 0, "real presentation recorded");
+            string log = File.ReadAllText("zan_frame_perf.log");
+            Check(log.Contains("firstframe ") && log.Contains("surface=643x481 clock=raw-ms"),
+            "first measured surface is the startup canvas");
+            bool lateRejected = false;
+            try { UiDriver.Exec("client-dev 644 482"); }
+            catch (InvalidOperationException ex) { lateRejected = true; }
+            Check(lateRejected && app.canvas.Width() == 643, "runtime resize forbidden");
+            UiDriver.active = false;
+            Rejected(app, "already presented", "client-dev 643 481\n");
+            Check(app.window.GetHandle() != 0, "native HWND retained until final cleanup");
+        } finally {
+            app.UnfreezeAnimClock();
+            app.window.Destroy();
+            app.canvas.Destroy();
+            UiDriver.active = false;
+        }
+        Console.WriteLine("uidriver client-dev ok");
+        return 0;
+    }
+}

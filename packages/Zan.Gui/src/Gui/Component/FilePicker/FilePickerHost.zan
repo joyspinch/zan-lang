@@ -1,0 +1,109 @@
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component;
+
+// A stable preparation root borrows the replaceable picker tree. The input
+// adapter keeps the host's ordinary root in its fallback slot, never as a child.
+class FilePickerHost : InputRootAdapter, UiViewOwner, InputRetirementObserver {
+    private weak FilePicker owner;
+    private weak App host;
+    private Control surface;
+    private UiViewScope view;
+    private InputRetirementToken retirement;
+    private bool retired;
+    private bool released;
+
+    public FilePickerHost(FilePicker owner, App app) : base("filepicker_input") {
+        this.owner = owner; this.host = app;
+        surface = new Control(); surface.ClassName = "col";
+        surface.UseApp(app); this.UseApp(app);
+    }
+
+    public App HostApp() { return host; }
+    public Control Surface() { return surface; }
+    public bool Current() {
+        return !retired && owner != null && owner.CurrentInputHost(this)
+            && host != null && host.isRunning;
+    }
+    public bool Linked() {
+        App app = host;
+        return app != null && app.rootControl is InputRootAdapter
+            && ((InputRootAdapter)app.rootControl).ContainsAdapter(this);
+    }
+    public void Activate() {
+        App app = host;
+        if (!this.Current()) { return; }
+        view = new UiViewScope(app, this, surface);
+        this.Bind(app);
+        if (!this.Current() || !this.Linked()) { this.Retire(); return; }
+        retirement = app.WatchInputRetirement(surface, this);
+        this.MarkDirty();
+    }
+    public void MarkDirty() {
+        App app = host;
+        if (app != null) { app.RequestRedraw(); app.Wake(); }
+    }
+    public void Mount(Control tree) { if (this.Current()) { surface.Add(tree); } }
+
+    public void PrepareView(UiViewScope scope, App app) {
+        if (!this.Current() || !this.Linked() || app != host || scope != view) { return; }
+        FilePicker picker = owner;
+        if (!picker.PreparePickerView(this, app)
+                || !this.Current() || !this.Linked() || scope != view) { return; }
+        int top = app.ContentTop();
+        scope.Layout(0, top, app.canvas.Width(), app.canvas.Height() - top);
+    }
+    public void ViewAction(string name, Control sender) { }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+
+    public override int InputPriority() { return 2; }
+    public override bool ContainsHostedControl(Control control) {
+        return base.ContainsHostedControl(control)
+            || (this.Current() && surface.ContainsHostedControl(control));
+    }
+    public override bool ContainsInputControl(Control control) {
+        if (!this.Current()) { return content != null && content.ContainsInputControl(control); }
+        return control == this || surface.ContainsInputControl(control);
+    }
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        if (this.Current()) { surface.CollectInputFocus(app, controls); }
+        else { base.CollectInputFocus(app, controls); }
+    }
+    public override Control FindInputFocus(App app) {
+        if (!this.Current()) { return content != null ? content.FindInputFocus(app) : null; }
+        Control focused = surface.FindInputFocus(app);
+        return focused != null ? focused : this;
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!this.Current()) { return content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null; }
+        Control hit = surface.HitTest(x, y, pointerType, excludedSubtrees);
+        return hit != null ? hit : this;
+    }
+    protected override void OnReleaseInput(App app) {
+        if (released) { return; }
+        released = true;
+        app.ReleaseInputSubtree(surface);
+    }
+    public void OnInputRetired(InputRetirementToken token) {
+        if (retirement != token || retired) { return; }
+        retirement = null;
+        FilePicker picker = owner;
+        if (picker != null) { picker.InputHostRetired(this); }
+    }
+    public void Retire() { this.Retire(true); }
+    public void Retire(bool unlink) {
+        if (retired) { return; }
+        retired = true;
+        if (retirement != null) { retirement.Invalidate(); retirement = null; }
+        UiViewScope previous = view; view = null;
+        if (previous != null) { previous.Retire(); }
+        if (unlink) {
+            this.Detach();
+            // Cancel may install a newer adapter above us. The second unlink uses
+            // the new chain, while OnReleaseInput remains strictly single-shot.
+            if (this.Linked()) { this.Detach(); }
+        }
+        owner = null; host = null;
+    }
+}

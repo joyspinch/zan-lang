@@ -1,0 +1,361 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class InputStyleSizeState {
+    public string Value;
+}
+
+// Headless retained-style counterexamples. Each mutation leaves the old
+// type/class/index path unchanged, so a path-only cache returns stale geometry.
+class StyleRelationInvalidationTest {
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        throw new Exception("Style relation: " + label);
+    }
+
+    static Element Node(string tag, string id) {
+        Element node = new Element();
+        node.InitElement(tag, id);
+        return node;
+    }
+
+    static StyleBox Box(App app, Control node) {
+        app.styleCtx = node;
+        return node.Box(app);
+    }
+
+    static StyleBox BaseBox(App app, Control node) {
+        app.styleCtx = node;
+        return Style.Full(app, node.StyleType(), node.Class, node.name, Style.SNormal());
+    }
+
+    static void LastChild(App app) {
+        app.UseAppCss("leaf { width:11px; } leaf:last-child { width:31px; }");
+        Element root = StyleRelationInvalidationTest.Node("host", "root");
+        root.UseApp(app);
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "same");
+        Element tail = StyleRelationInvalidationTest.Node("tail", "tail");
+        root.Add(leaf);
+        StyleRelationInvalidationTest.Check("initial last child",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 31);
+        root.Add(tail);
+        StyleRelationInvalidationTest.Check("append changes App base cache",
+            StyleRelationInvalidationTest.BaseBox(app, leaf).width == 11);
+        StyleRelationInvalidationTest.Check("append changes Control cache",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        root.Remove(tail);
+        StyleRelationInvalidationTest.Check("remove restores last child",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 31);
+        // Structural edits use the ownership contract and invalidate selector relations.
+        root.Children.Add(tail);
+        tail.parent = root;
+        leaf.MeasureTree(app);
+        StyleRelationInvalidationTest.Check("MeasureTree uses the same predicate",
+            leaf.computedStyle.width == 11);
+        root.Remove(root.ChildAt(1));
+        tail.parent = null;
+        leaf.MeasureTree(app);
+        StyleRelationInvalidationTest.Check("direct removal restores geometry",
+            leaf.computedStyle.width == 31);
+    }
+
+    static void AncestorIdAndTrees(App app) {
+        app.UseAppCss("leaf { width:11px; } #hot leaf { width:41px; }");
+        Element hot = StyleRelationInvalidationTest.Node("host", "hot");
+        Element cold = StyleRelationInvalidationTest.Node("host", "cold");
+        Element a = StyleRelationInvalidationTest.Node("leaf", "same");
+        Element b = StyleRelationInvalidationTest.Node("leaf", "same");
+        hot.Add(a);
+        cold.Add(b);
+        StyleRelationInvalidationTest.Check("hot ancestor",
+            StyleRelationInvalidationTest.Box(app, a).width == 41);
+        StyleRelationInvalidationTest.Check("same structure different ancestor id",
+            StyleRelationInvalidationTest.Box(app, b).width == 11);
+        hot.name = "cold";
+        StyleRelationInvalidationTest.Check("direct ancestor id write",
+            StyleRelationInvalidationTest.Box(app, a).width == 11);
+        hot.name = "hot";
+        StyleRelationInvalidationTest.Check("ancestor id restore",
+            StyleRelationInvalidationTest.BaseBox(app, a).width == 41);
+        cold.name = "hot";
+        StyleRelationInvalidationTest.Check("other tree id changes independently",
+            StyleRelationInvalidationTest.Box(app, b).width == 41);
+    }
+
+    static void Attributes(App app) {
+        app.UseAppCss("leaf { width:11px; } leaf[data-mode=on] { width:51px; }");
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "attr");
+        StyleRelationInvalidationTest.Check("attribute initially absent",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        leaf.SetAttr("data-mode", "on");
+        StyleRelationInvalidationTest.Check("SetAttr invalidates local box", leaf.computedStyle == null);
+        StyleRelationInvalidationTest.Check("SetAttr changes App base cache",
+            StyleRelationInvalidationTest.BaseBox(app, leaf).width == 51);
+        StyleRelationInvalidationTest.Check("SetAttr changes owned cache",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 51);
+        leaf.SetAttr("data-mode", "off");
+        StyleRelationInvalidationTest.Check("attribute replacement",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        // Attribute dependencies nested in logical pseudos must reach Style.Full.
+        app.UseAppCss("leaf { width:11px; } leaf:is([data-mode=on]) { width:53px; }");
+        leaf.SetAttr("data-mode", "on");
+        StyleRelationInvalidationTest.Check("nested attribute dependency",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 53);
+        leaf.SetAttr("data-mode", "off");
+        StyleRelationInvalidationTest.Check("nested attribute replacement",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+    }
+
+    static void SiblingsAndDescendants(App app) {
+        app.UseAppCss("leaf { width:11px; } .hot + leaf { width:61px; }");
+        Element root = StyleRelationInvalidationTest.Node("host", "siblings");
+        Element prev = StyleRelationInvalidationTest.Node("marker", "prev");
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "leaf");
+        root.Add(prev);
+        root.Add(leaf);
+        StyleRelationInvalidationTest.Check("cold sibling",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        prev.Class = "hot";
+        StyleRelationInvalidationTest.Check("sibling class mutation",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 61);
+        app.UseAppCss("host { width:11px; } host:has([data-mode=on]) { width:71px; }");
+        StyleRelationInvalidationTest.Check("has initially absent",
+            StyleRelationInvalidationTest.Box(app, root).width == 11);
+        leaf.SetAttr("data-mode", "on");
+        StyleRelationInvalidationTest.Check("descendant attribute changes has",
+            StyleRelationInvalidationTest.Box(app, root).width == 71);
+        leaf.SetAttr("data-mode", "off");
+        StyleRelationInvalidationTest.Check("descendant attribute clears has",
+            StyleRelationInvalidationTest.Box(app, root).width == 11);
+        app.UseAppCss("leaf { width:11px; } leaf:last-of-type { width:73px; }");
+        Element later = StyleRelationInvalidationTest.Node("other", "later");
+        root.Add(later);
+        StyleRelationInvalidationTest.Check("last of type initially",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 73);
+        later.styleTypeLower = "leaf";
+        StyleRelationInvalidationTest.Check("sibling type mutation",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+    }
+
+    static void AncestorStateAndPart(App app) {
+        app.UseAppCss("leaf { width:11px; } host:hover leaf { width:81px; }"
+            + " leaf::probe { width:12px; } #hot leaf::probe { width:82px; }");
+        Element root = StyleRelationInvalidationTest.Node("host", "cold");
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "part");
+        root.Add(leaf);
+        StyleRelationInvalidationTest.Box(app, root);
+        StyleRelationInvalidationTest.Check("ancestor initially normal",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        app.styleCtx = root;
+        root.BoxState(app, Style.SHover());
+        StyleRelationInvalidationTest.Check("ancestor state mutation",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 81);
+        app.styleCtx = leaf;
+        StyleRelationInvalidationTest.Check("part initially cold",
+            Style.Part(app, "leaf", "probe", "", "", "part", 0).width == 12);
+        root.name = "hot";
+        StyleRelationInvalidationTest.Check("part ancestor id mutation",
+            Style.Part(app, "leaf", "probe", "", "", "part", 0).width == 82);
+    }
+
+    static void SameCountReplacement(App app) {
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "replacement");
+        app.UseAppCss("leaf { width:17px; }");
+        StyleRelationInvalidationTest.Check("replacement starts independent",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 17);
+        app.UseAppCss("leaf[data-mode=on] { width:19px; }");
+        leaf.SetAttr("data-mode", "on");
+        StyleRelationInvalidationTest.Check("same rule count gains attribute dependency",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 19);
+        leaf.SetAttr("data-mode", "off");
+        StyleRelationInvalidationTest.Check("replacement dependency stays live",
+            StyleRelationInvalidationTest.Box(app, leaf).width != 19);
+        app.UseAppCss("leaf { width:23px; }");
+        StyleRelationInvalidationTest.Check("same rule count returns to independent",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 23);
+        // MergeSheet invalidates its index even when it only overwrites an
+        // existing selector; dependency classification follows that new index.
+        StyleSheet sheet = Css.Parse("leaf { width:17px; }");
+        sheet.ContextDependency();
+        sheet.MergeSheet(Css.Parse("leaf { width:23px; }"));
+        StyleRelationInvalidationTest.Check("same-count merge reindexes",
+            sheet.ContextDependency() == 0);
+        sheet.MergeSheet(Css.Parse("leaf:has(marker) { width:29px; }"));
+        StyleRelationInvalidationTest.Check("merge refreshes dependency classification",
+            sheet.ContextDependency() == 2);
+        // Media rules must enter the same classifier after Index rebuilds.
+        StyleSheet media = Css.Parse("@media (min-width:1px) { leaf[data-x] { width:31px; } }");
+        StyleRelationInvalidationTest.Check("media-only attribute dependency",
+            media.ContextDependency() == 2);
+    }
+
+    // Optional measurements keep the simple ancestor path and live structural
+    // path separate. This is a correctness fix; live paths may resolve on every
+    // request. No assertion claims a speedup for the conservative policy.
+    static void Bench(App app, bool live) {
+        app.UseAppCss(live ? "leaf:last-child { width:31px; }"
+                          : ".host leaf { width:31px; }");
+        Element root = StyleRelationInvalidationTest.Node("host", "bench");
+        root.Class = "host";
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "bench-leaf");
+        root.Add(leaf);
+        StyleRelationInvalidationTest.Box(app, leaf);
+        int before = Style.StatPeek(0);
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        long start = Stopwatch.GetMicroseconds();
+        for (int frame = 0; frame < 120; frame = frame + 1) {
+            StyleRelationInvalidationTest.Box(app, leaf);
+        }
+        long elapsed = Stopwatch.GetMicroseconds() - start;
+        long allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        Console.WriteLine("STYLE_RELATION_BENCH live=" + Convert.ToString(live)
+            + " frames=120 style_resolve=" + Convert.ToString(Style.StatPeek(0) - before)
+            + " elapsed_us=" + Convert.ToString(elapsed)
+            + " allocated_bytes=" + Convert.ToString(allocatedBytes));
+    }
+
+    static void OwnershipAndStableCache(App app) {
+        app.UseAppCss(".host leaf { width:91px; }");
+        Element root = StyleRelationInvalidationTest.Node("host", "stable");
+        root.Class = "host";
+        Element a = StyleRelationInvalidationTest.Node("leaf", "same");
+        Element b = StyleRelationInvalidationTest.Node("leaf", "same");
+        root.Add(a);
+        root.Add(b);
+        a.Bg(0xff123456);
+        StyleBox owned = StyleRelationInvalidationTest.Box(app, a);
+        int before = Style.StatPeek(0);
+        StyleRelationInvalidationTest.Check("unchanged relation retains owned box",
+            StyleRelationInvalidationTest.Box(app, a) == owned);
+        StyleRelationInvalidationTest.Check("unchanged relation skips base resolution",
+            Style.StatPeek(0) == before);
+        StyleBox other = StyleRelationInvalidationTest.Box(app, b);
+        StyleRelationInvalidationTest.Check("StyleBox independent ownership", other != owned);
+        StyleRelationInvalidationTest.Check("inline remains Control responsibility",
+            owned.bg == 0xff123456 && other.bg != 0xff123456);
+        StyleRelationInvalidationTest.Check("base cache contains no inline mutation",
+            StyleRelationInvalidationTest.BaseBox(app, a).bg != 0xff123456);
+    }
+
+    static void ProjectedAncestor(App app) {
+        app.UseAppCss("leaf { width:11px; } input.small > leaf { width:29px; }"
+            + " input.large > leaf { width:43px; } input.error.round > leaf { width:59px; }"
+            + " leaf::probe { width:12px; } input.large leaf::probe { width:47px; }");
+        InputStyleSizeState state = new InputStyleSizeState();
+        state.Value = "medium";
+        Input root = new Input();
+        root.Class = "author  small";
+        root.Size = state.Value;
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "projected");
+        root.Add(leaf);
+        StyleRelationInvalidationTest.Check("author small ancestor starts cached",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 29);
+        string authoredPath = Style.CtxSig(leaf);
+        state.Value = "large";
+        string largePath = Style.CtxSig(leaf);
+        StyleRelationInvalidationTest.Check("binding changes ancestor cache identity without measure",
+            largePath != authoredPath && root.Class == "author  small"
+            && root.EffectiveClass() == "author large");
+        StyleRelationInvalidationTest.Check("projected ancestor invalidates App base cache",
+            StyleRelationInvalidationTest.BaseBox(app, leaf).width == 43);
+        StyleBox owned = StyleRelationInvalidationTest.Box(app, leaf);
+        StyleRelationInvalidationTest.Check("projected ancestor invalidates Control cache", owned.width == 43);
+        int before = Style.StatPeek(0);
+        StyleRelationInvalidationTest.Check("stable projected ancestor retains cache",
+            StyleRelationInvalidationTest.Box(app, leaf) == owned && Style.StatPeek(0) == before);
+        StyleRelationInvalidationTest.Check("part cache uses projected ancestor",
+            Style.Part(app, "leaf", "probe", "", "", leaf.name, 0).width == 47);
+        Input other = new Input();
+        other.Class = "author  small";
+        Element otherLeaf = StyleRelationInvalidationTest.Node("leaf", "projected");
+        other.Add(otherLeaf);
+        StyleRelationInvalidationTest.Check("same author classes cannot alias different projections",
+            StyleRelationInvalidationTest.Box(app, otherLeaf).width == 29);
+        state.Value = "medium";
+        StyleRelationInvalidationTest.Check("medium restores exact ancestor path",
+            Style.CtxSig(leaf) == authoredPath && root.EffectiveClass() == "author  small");
+        StyleRelationInvalidationTest.Check("medium restores cached descendant geometry",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 29);
+        root.FieldStatus = "error";
+        root.Round = true;
+        StyleRelationInvalidationTest.Check("ancestor status and round change cache key",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 59);
+        root.FieldStatus = "invalid";
+        root.Round = false;
+        StyleRelationInvalidationTest.Check("ancestor variants restore without consuming author classes",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 29
+            && root.Class == "author  small" && Style.CtxSig(leaf) == authoredPath);
+    }
+
+    static void ProjectedSiblingsAndHas(App app) {
+        Element host = StyleRelationInvalidationTest.Node("host", "input-relations");
+        Element watch = StyleRelationInvalidationTest.Node("watch", "watch");
+        Input input = new Input();
+        input.Class = "author small";
+        Element leaf = StyleRelationInvalidationTest.Node("leaf", "after-input");
+        host.Add(watch);
+        host.Add(input);
+        host.Add(leaf);
+        app.UseAppCss("leaf { width:11px; height:13px; }"
+            + " input.large + leaf { width:61px; } input.large ~ leaf { height:67px; }");
+        StyleRelationInvalidationTest.Check("author sibling initially small",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11);
+        input.Size = "large";
+        StyleRelationInvalidationTest.Check("adjacent and general siblings see effective classes",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 61
+            && StyleRelationInvalidationTest.Box(app, leaf).height == 67);
+        input.Size = "medium";
+        StyleRelationInvalidationTest.Check("sibling caches restore on medium",
+            StyleRelationInvalidationTest.Box(app, leaf).width == 11
+            && StyleRelationInvalidationTest.Box(app, leaf).height == 13);
+        app.UseAppCss("host { width:11px; } watch { width:13px; height:17px; }"
+            + " host:has(> input.large.error.round) { width:71px; }"
+            + " watch:has(+ input.large.error.round) { width:73px; }"
+            + " watch:has(~ input.large.error.round) { height:79px; }");
+        StyleRelationInvalidationTest.Check("has starts with author classes",
+            StyleRelationInvalidationTest.Box(app, host).width == 11
+            && StyleRelationInvalidationTest.Box(app, watch).width == 13);
+        input.Size = "large";
+        input.FieldStatus = "error";
+        input.Round = true;
+        StyleRelationInvalidationTest.Check("has child and sibling candidates use effective classes",
+            StyleRelationInvalidationTest.Box(app, host).width == 71
+            && StyleRelationInvalidationTest.Box(app, watch).width == 73
+            && StyleRelationInvalidationTest.Box(app, watch).height == 79
+            && input.Class == "author small");
+        input.Round = false;
+        StyleRelationInvalidationTest.Check("has caches react to direct variant changes",
+            StyleRelationInvalidationTest.Box(app, host).width == 11
+            && StyleRelationInvalidationTest.Box(app, watch).width == 13
+            && StyleRelationInvalidationTest.Box(app, watch).height == 17);
+        input.Round = true;
+        StyleRelationInvalidationTest.Check("has can restore the same projected query",
+            StyleRelationInvalidationTest.Box(app, host).width == 71);
+        input.Size = null;
+        StyleRelationInvalidationTest.Check("missing size restores author small in has",
+            StyleRelationInvalidationTest.Box(app, host).width == 11
+            && input.Class == "author small" && input.EffectiveClass() == "author small error round");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Style relations", 320, 240);
+        app.SetOffscreenViewport(320, 240, 100);
+        StyleRelationInvalidationTest.LastChild(app);
+        StyleRelationInvalidationTest.AncestorIdAndTrees(app);
+        StyleRelationInvalidationTest.Attributes(app);
+        StyleRelationInvalidationTest.SiblingsAndDescendants(app);
+        StyleRelationInvalidationTest.AncestorStateAndPart(app);
+        StyleRelationInvalidationTest.SameCountReplacement(app);
+        StyleRelationInvalidationTest.OwnershipAndStableCache(app);
+        StyleRelationInvalidationTest.ProjectedAncestor(app);
+        StyleRelationInvalidationTest.ProjectedSiblingsAndHas(app);
+        if (Interop.EnvVar("ZAN_STYLE_RELATION_BENCH") == "1") {
+            StyleRelationInvalidationTest.Bench(app, false);
+            StyleRelationInvalidationTest.Bench(app, true);
+        }
+        app.styleCtx = null;
+        app.canvas.Destroy();
+        Console.WriteLine("STYLE_RELATION_INVALIDATION_OK");
+    }
+}

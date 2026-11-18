@@ -8,10 +8,15 @@ namespace Gui.Widget;
 // 内部完全由标准 Button、Label、IconView 等基础控件组合而成，彻底物理删除所有画布微绘与坐标手算。
 public class Menu : Control {
     public List<MenuItem> items;
-    public SignalString selectedKey;
-    public SignalInt selected;
+    // 选中项的 key / 下标走统一 Binding<T> 通道（宿主持有模型字段）。
+    public Binding<string> selectedKey;
+    public Binding<int> selected;
     public MenuExpandState expandState;
     public UiEvent Select;
+    internal int treeGeneration;
+    private string builtKey;
+    private int builtIndex;
+    private bool preparingSelection;
 
     public override int StyleDisplay() { return 1; } // Flex
     public override int StyleFlexDir() { return 1; } // Column
@@ -20,8 +25,8 @@ public class Menu : Control {
         this.InitControl("menu", 1);
         this.ClassName = "menu col";
         items = new List<MenuItem>();
-        selectedKey = new SignalString("");
-        selected = new SignalInt(0 - 1);
+        selectedKey = "";
+        selected = 0 - 1;
         expandState = new MenuExpandState();
         Select = new UiEvent();
         wiresOwnEvents = true;
@@ -38,7 +43,7 @@ public class Menu : Control {
         this.BuildTree();
     }
 
-    public Menu(List<string> strItems, SignalInt sel) {
+    public Menu(List<string> strItems, Binding<int> sel) {
         InitMenu();
         if (sel != null) { selected = sel; }
         if (strItems != null) {
@@ -49,7 +54,7 @@ public class Menu : Control {
         this.BuildTree();
     }
 
-    public Menu(List<MenuItem> treeItems, SignalString selKey) {
+    public Menu(List<MenuItem> treeItems, Binding<string> selKey) {
         InitMenu();
         if (selKey != null) { selectedKey = selKey; }
         if (treeItems != null) { items = treeItems; }
@@ -79,34 +84,46 @@ public class Menu : Control {
     }
 
     public void SelectIndex(int idx) {
-        if (selected != null) { selected.Set(idx); }
+        selected.Set(idx);
         if (idx >= 0 && idx < items.Count) {
             string k = items[idx].key;
-            if (k != null && k != "") {
-                if (selectedKey != null) { selectedKey.Set(k); }
-            }
+            if (k != null && k != "") { selectedKey.Set(k); }
         }
-        Select.RaiseS(this);
         this.BuildTree();
+        Select.RaiseS(this);
     }
 
     public void SelectKey(string key) {
-        if (selectedKey != null) { selectedKey.Set(key); }
+        selectedKey.Set(key);
         for (int i = 0; i < items.Count; i = i + 1) {
-            if (items[i].key == key) {
-                if (selected != null) { selected.Set(i); }
-            }
+            if (items[i].key == key) { selected.Set(i); }
         }
-        Select.RaiseS(this);
         this.BuildTree();
+        Select.RaiseS(this);
     }
 
     public void BuildTree() {
-        this.children.Clear();
-        string curKey = selectedKey != null ? selectedKey.Get() : "";
-        int curIdx = selected != null ? selected.Get() : (0 - 1);
-
+        treeGeneration = treeGeneration + 1;
+        int ticket = treeGeneration;
+        App host = this.FindApp();
+        Control ownerParent = parent;
+        this.RemoveAll();
+        if (ticket != treeGeneration || this.FindApp() != host || parent != ownerParent) { return; }
+        string curKey = selectedKey.Get();
+        int curIdx = selected.Get();
+        if (ticket != treeGeneration || this.FindApp() != host || parent != ownerParent) { return; }
+        builtKey = curKey;
+        builtIndex = curIdx;
         this.AppendItems(this, items, 0, curKey, curIdx);
+    }
+
+    public override void SyncBinding() {
+        if (preparingSelection) { return; }
+        preparingSelection = true;
+        try {
+            base.SyncBinding();
+            if (selectedKey.Get() != builtKey || selected.Get() != builtIndex) { this.BuildTree(); }
+        } finally { preparingSelection = false; }
     }
 
     private void AppendItems(Control parent, List<MenuItem> list, int depth, string curKey, int curIdx) {
@@ -132,9 +149,10 @@ public class Menu : Control {
                 bool isExpanded = expandState.Contains(mKey);
                 Button grpBtn = new Button("");
                 grpBtn.ClassName = "menu-item menu-group-header row align-center justify-between";
+                grpBtn.Disabled = m.disabled;
 
                 Control leftBox = new Control();
-                leftBox.ClassName = "row align-center gap-small";
+                leftBox.ClassName = "menu-group-label row align-center gap-small";
                 if (m.icon != null && m.icon != "") {
                     leftBox.Add(new IconView(m.icon, 16));
                 }
@@ -145,10 +163,8 @@ public class Menu : Control {
                 arr.ClassName = "menu-arrow text-muted";
                 grpBtn.Add(arr);
 
-                grpBtn.Click.Add(() => {
-                    expandState.Toggle(mKey);
-                    this.BuildTree();
-                });
+                MenuItemAction groupAction = new MenuItemAction(this, m, mKey, true);
+                grpBtn.Click.Add(groupAction.Invoke);
                 parent.Add(grpBtn);
 
                 if (isExpanded && m.children != null && m.children.Count > 0) {
@@ -159,7 +175,8 @@ public class Menu : Control {
                 }
             } else {
                 // 普通叶子项
-                bool isActive = (curKey != "" && mKey == curKey) || (curIdx >= 0 && itemIdx == curIdx);
+                bool isActive = curKey != "" ? mKey == curKey
+                    : (depth == 0 && curIdx >= 0 && itemIdx == curIdx);
                 Button btn = new Button("");
                 btn.ClassName = "menu-item row align-center gap-small " + (isActive ? "active" : "") + (m.disabled ? " disabled" : "");
                 btn.Disabled = m.disabled;
@@ -178,35 +195,42 @@ public class Menu : Control {
                     btn.Add(sc);
                 }
 
-                btn.Click.Add(() => {
-                    if (!m.disabled) {
-                        this.SelectKey(mKey);
-                    }
-                });
+                MenuItemAction selectAction = new MenuItemAction(this, m, mKey, false);
+                btn.Click.Add(selectAction.Invoke);
                 parent.Add(btn);
             }
         }
     }
 
-    public override void OnPaint(App app) {
-        int id = this.CommonId();
-        this.SyncBinding();
-        app.focus.RegisterFocusable(id);
-        app.hitTester.RegisterRect(id, bx, by, bw, bh, 0);
-        On.Fire(app, id, this);
-    }
+    public override int InputFocusCapabilities() { return 1; }
 
     public override string Kind() { return "Menu"; }
 
-    public override List<PropSpec> Props() {
+    public override List<string> Events() {
+        List<string> events = Control.CommonEvents();
+        events.Add("Select");
+        return events;
+    }
+
+    public override void BindEvent(string evt, Action handler) {
+        if (evt == "Select") { Select.Add(handler); return; }
+        base.BindEvent(evt, handler);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "Select") { Select.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec k = PropSpec.Text("selectedKey", "Selected Key");
-        k.str = selectedKey != null ? selectedKey.Get() : "";
+        PropSpec k = PropSpec.Text("selectedKey", "Selected Key").DefaultBinding();
+        k.ViaExtra();
         k.Also("value");
         k.Also("data");
         ps.Add(k);
-        PropSpec s = PropSpec.Int("selected", "Selected Index");
-        s.num = selected != null ? selected.Get() : 0;
+        PropSpec s = PropSpec.Int("selected", "Selected Index").DefaultBinding();
+        s.ViaExtra();
         ps.Add(s);
         ps.Add(this.SizeProp());
         return ps;
@@ -214,21 +238,21 @@ public class Menu : Control {
 
     public override string GetProp(string key) {
         if (key == "selectedKey" || key == "value" || key == "data") {
-            return selectedKey != null ? selectedKey.Get() : "";
+            return selectedKey.Get();
         }
         if (key == "selected") {
-            return Convert.ToString(selected != null ? selected.Get() : 0);
+            return Convert.ToString(selected.Get());
         }
         return base.GetProp(key);
     }
 
     public override void SetProp(string key, string val) {
         if (key == "selectedKey" || key == "value" || key == "data") {
-            if (selectedKey != null) { selectedKey.Set(val); }
+            selectedKey.Set(val);
             return;
         }
         if (key == "selected") {
-            if (selected != null) { selected.Set(Convert.ToInt32(val)); }
+            selected.Set(Convert.ToInt32(val));
             return;
         }
         base.SetProp(key, val);

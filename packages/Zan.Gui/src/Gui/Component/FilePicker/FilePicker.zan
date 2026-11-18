@@ -7,7 +7,7 @@ using Gui.Widget;
 
 namespace Gui.Component;
 
-// 可复用的应用内路径选择器，承载于独立 GUI 窗口。
+// 可复用路径选择器：独立窗口或显式绑定的宿主内模态视图。
 public partial class FilePicker : IModalWindow {
     public static string lang = "zh";
 
@@ -28,15 +28,16 @@ public partial class FilePicker : IModalWindow {
     private SignalInt listScroll;
     private SignalBool showHidden;
     private App popup;
-    public App App { get { return this.popup != null ? this.popup : App.FrameApp(); } }
+    public App App { get { return this.popup != null ? this.popup
+        : (this.inputHost != null ? this.inputHost.HostApp() : App.FrameApp()); } }
     public App ResolveApp(App app) {
         if (app != null) { return app; }
         return this.App;
     }
     // Android 降级标志：移动端单 Activity 窗口模式下，第二个 OS 窗口
     // 创建后不可见，对话框无法以独立子窗口弹起。inlineMode=true 时选择器改由
-    // 宿主窗口内的全屏模态承载（RenderOverlay），事件也走宿主，
-    // OwnsWindow 恒 false。
+    // 宿主窗口内的全屏模态承载。BeginInline/BindInline 在输入前绑定宿主，
+    // RenderOverlay 只绘制已准备的树；OwnsWindow 恒 false。
     private Button acceptBtn;
     private Button cancelBtn;
     private Flex footerBar;
@@ -92,16 +93,18 @@ public partial class FilePicker : IModalWindow {
 
     public void MarkDirty() {
         this.dirty = true;
-        if (popup != null) { popup.RequestRedraw(); }
+        this.viewRevision = this.viewRevision + 1;
+        if (inputHost != null) { inputHost.MarkDirty(); }
+        else if (popup != null) { popup.RequestRedraw(); }
     }
 
     public FilePicker() {
         this.pathInput = new Input("path");
-        this.pathInput.Submit.Add(() => { this.OnPathSubmit(); });
+        this.pathInput.Submit.Add(new FilePickerAction(this).SubmitPath);
         this.nameInput = new Input("file name");
-        this.nameInput.Submit.Add(() => { this.TryAccept(); });
+        this.nameInput.Submit.Add(new FilePickerAction(this).Accept);
         this.folderInput = new Input("folder name");
-        this.folderInput.Submit.Add(() => { this.OnFolderSubmit(); });
+        this.folderInput.Submit.Add(new FilePickerAction(this).SubmitFolder);
         this.searchInput = null;
         this.treeScroll = new SignalInt(0);
         this.listScroll = new SignalInt(0);
@@ -109,6 +112,8 @@ public partial class FilePicker : IModalWindow {
         this.popup = null;
         this.acceptBtn = new Button { Class = "primary" };
         this.cancelBtn = new Button { Class = "secondary" };
+        this.acceptBtn.Click.Add(new FilePickerAction(this).Accept);
+        this.cancelBtn.Click.Add(new FilePickerAction(this).Close);
         this.footerBar = new Flex();
         this.footerBar.ClassName = "row justify-end align-center gap-medium";
         this.footerBar.Add(this.cancelBtn);
@@ -155,11 +160,12 @@ public partial class FilePicker : IModalWindow {
         filterSel.Set(0);
     }
 
-    // 筛选框，首次渲染时按当前界面语言建好并复用。
+    // 筛选框，首次准备时按当前界面语言建好并复用。
     public Input SearchBox() {
         if (searchInput == null) {
             searchInput = new Input(
                 FilePicker.T("Filter by name...", "按名称筛选..."));
+            searchInput.Submit.Add(new FilePickerAction(this).Filter);
         }
         return searchInput;
     }
@@ -396,14 +402,22 @@ public partial class FilePicker : IModalWindow {
         string defaultName,
         string dialogTitle
     ) {
-        // 在对话框已打开时重新打开，不能使旧窗口
-        // 成为孤儿：先关闭旧窗口，保证任何时候只有一个选择器窗口。
-        if (popup != null) {
-            popup.window.Close();
-            popup.window.Destroy();
-            popup = null;
-            open = false;
+        App host = inlineMode && inputHost != null ? inputHost.HostApp() : App.FrameApp();
+        this.BeginCore(pickerMode, initial, extension, defaultName, dialogTitle, host, false);
+    }
+
+    private void BeginCore(int pickerMode, string initial, string extension,
+            string defaultName, string dialogTitle, App host, bool forceInline) {
+        int session = inputSession + 1; inputSession = session;
+        open = false;
+        App previous = popup; popup = null;
+        bool current = this.RetireInputHost(session);
+        if (previous != null) {
+            previous.StopLoop();
+            previous.window.Close();
+            previous.window.Destroy();
         }
+        if (!current || inputSession != session) { return; }
         mode = pickerMode;
         title = dialogTitle;
         suffix = extension;
@@ -494,8 +508,8 @@ public partial class FilePicker : IModalWindow {
         inlineMode = true;
         popup = null;
         #else
-        inlineMode = false;
-        popup = App.CreateDark(dialogTitle, 760, 500);
+        inlineMode = forceInline;
+        popup = forceInline ? null : App.CreateDark(dialogTitle, 760, 500);
         if (popup == null) {
             // 平台拿不到第二窗口（无头/受限环境）时同样走内嵌模态，
             // 按钮至少有响应。
@@ -510,6 +524,7 @@ public partial class FilePicker : IModalWindow {
         }
         open = true;
         closing = false;
+        this.InstallInputHost(popup != null ? popup : host);
         this.MarkDirty();
     }
 
@@ -686,19 +701,19 @@ public partial class FilePicker : IModalWindow {
         }
         open = false;
         closing = true;
-        // 这里只 Close（投递关闭事件），不 Destroy：Finish 全部从
-        // RenderContent 的按钮分支里调用，正处在弹窗自己的一帧中间，
-        // 当场销毁窗口会让随后的 PresentFrame 落在死 surface 上。
-        // 残留的 popup 引用由下一轮 ApplyEvent 收到 kind 8 时销毁清空；
-        // OwnsWindow 的句柄相等判定保证它不会认领别的窗口的事件。
-        if (popup != null) { popup.window.Close(); }
+        // Retire input synchronously. Native destruction remains with ApplyEvent
+        // or SweepClosed so callers may safely finish an in-progress frame.
+        int session = inputSession + 1; inputSession = session;
+        App previous = popup;
+        if (!this.RetireInputHost(session)) { return; }
+        if (previous != null && popup == previous) { previous.window.Close(); }
         if (action == 1) { Accepted.Raise(); } else { Cancelled.Raise(); }
+        if (inputSession != session) { return; }
         Closed.Raise();
     }
 
-    // `idx` 行在多选集合里时为 true。列表行每帧重建（items
-    // 是 RenderContent 的局部量），这里按路径字符串比较——多选集合
-    // 存的本来就是路径。
+    // `idx` 行在多选集合里时为 true。列表快照在准备期重建，
+    // 多选集合按路径比较，旧行的动作保持创建时的快照语义。
     public bool InMultiSelection(int idx, List<FilePickerItem> items) {
         if (idx < 0 || idx >= items.Count) { return false; }
         return selectedPaths.Contains(items[idx].path);
@@ -721,33 +736,30 @@ public partial class FilePicker : IModalWindow {
 
     public bool ApplyEvent(nint evHwnd) {
         if (!OwnsWindow(evHwnd)) { return true; }
-        int kind = popup.EventKind();
+        App app = popup;
+        int kind = app.EventKind();
         if (kind == 8) {
-            if (!closing && result == 0) {
-                result = 2;
-                selectedPath = "";
-                Cancelled.Raise();
-                Closed.Raise();
-            }
-            open = false;
-            closing = false;
-            popup.window.Destroy();
+            if (open && !closing) { this.Close(); }
+            // Close callbacks may already have opened a different window.
+            if (popup != app) { return false; }
             popup = null;
+            app.StopLoop();
+            app.window.Destroy();
+            closing = false;
             return false;
         }
-        bool keep = popup.ApplyEvent(evHwnd);
-        if (kind == 13 && popup != null) { popup.RequestRedraw(); }
+        bool keep = app.ApplyEvent(evHwnd);
+        if (kind == 13 && popup == app) { app.RequestRedraw(); }
         return keep;
     }
 
-    // 程序化 Close（Finish(2)）留下的 popup 引用在这里收尾：宿主在
-    // TakeResult != 0 的那一轮（弹窗刚关闭）调用一次，销毁 OS 窗口并
-    // 清空引用，OwnsWindow 随即回到 false。用户点叉的路径走
-    // ApplyEvent 的 kind 8 分支，不需要这步。
+    // The host may sweep a programmatically closed native window after reading
+    // TakeResult. Publish the empty slot before releasing the old App.
     public void SweepClosed() {
         if (popup != null && !open) {
-            popup.window.Destroy();
-            popup = null;
+            App previous = popup; popup = null;
+            previous.StopLoop();
+            previous.window.Destroy();
         }
     }
 

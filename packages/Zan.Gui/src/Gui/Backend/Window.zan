@@ -31,6 +31,7 @@ public class Window {
     static extern int zan_gui_guard_recovered();
 
     nint handle;
+    WindowLifetime lifetime;
     int width;
     int height;
     int localKind;
@@ -55,6 +56,7 @@ public class Window {
         } else {
             this.handle = Platform.Window().CreateWindow(title, width, height);
         }
+        this.lifetime = Platform.CaptureWindowLifetime(this.handle);
         this.width = width;
         this.height = height;
     }
@@ -195,24 +197,37 @@ public class Window {
         return Platform.Window().TakeDisplayFrame(handle);
     }
 
+    bool NativeClosed() { return lifetime != null && lifetime.closed; }
+
+    int CompleteWindowEvent(int result) {
+        // Preserve an event already selected for another live window. This
+        // Window's terminal state remains available on its next pump call.
+        if (result >= 0 && this.NativeClosed()
+        && (result == 1 || Window.EventHwnd() == 0 || Window.EventHwnd() == handle)) { return 0 - 1; }
+        return result;
+    }
+
     // 阻塞直到下一个 OS 事件到达。成功返回 0，退出返回 -1。
     int WaitEvent() {
+        if (this.NativeClosed()) { return 0 - 1; }
         if (handle == 0) { return 0; }
-        return Platform.Shell().WaitEvent();
+        return this.CompleteWindowEvent(Platform.Shell().WaitEvent());
     }
 
     // 阻塞直到 OS 事件到达或 `ms` 毫秒过去。
     // 返回 0=收到事件、1=超时、-1=退出。在内核中空闲，
     // 等待下一帧截止时间的动画循环不消耗 CPU。
     int WaitEventTimeout(int ms) {
+        if (this.NativeClosed()) { return 0 - 1; }
         if (handle == 0) { return 0; }
-        return Platform.Shell().WaitEventTimeout(ms);
+        return this.CompleteWindowEvent(Platform.Shell().WaitEventTimeout(ms));
     }
 
     // 不阻塞地轮询事件。返回 0=收到事件、1=无事件、-1=退出。
     int PollEvent() {
+        if (this.NativeClosed()) { return 0 - 1; }
         if (handle == 0) { return 0; }
-        return Platform.Shell().PollEvent();
+        return this.CompleteWindowEvent(Platform.Shell().PollEvent());
     }
 
     // 从任意线程唤醒阻塞在 WaitEvent 中的 UI 线程，使其能排空
@@ -456,10 +471,10 @@ public class Window {
     }
 
     // 彻底拆除窗口（销毁 OS 窗口）。
-    // 在响应关闭事件后调用，避免对话框作为
-    // 孤儿滞留；在主窗口上为空操作。
+    // 在响应关闭事件后调用，避免对话框作为孤儿滞留。
+    // 已销毁创建的包装不能再操作被系统复用的数值句柄。
     void Destroy() {
-        if (handle == 0) { return; }
+        if (handle == 0 || this.NativeClosed()) { return; }
         Platform.Window().Destroy(handle);
     }
 

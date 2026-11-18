@@ -267,43 +267,15 @@ public partial class Win32Shell {
         if (Win32Shell.shapeMode != 0) {
             mask = Win32Shell.ShapeMask(pw, ph);
         }
-        // 逐行拷：目标行跨距按窗口宽 ww，源行跨距按表面宽 sw；两者在缩放
-        // 的一瞬并不相等（把它们当成同一个就是那片斜切）。窗口坐标 y 对应
-        // 客户区行 sy = y - oy，列同样偏移 ox；客户区之外（最大化时的边框
-        // 环）保持全透明。
-        int y = 0;
-        while (y < wh) {
-            nint dstRow = Win32Shell.lwBits + y * ww * 4;
-            int sy = y - oy;
-            int x = 0;
-            if (sy < 0 || sy >= copyH) {
-                // 表面还没长到窗口这么大的那一圈：给它全透明，由 DWM 填
-                // 模糊背景（下一帧应用就把它画满了），而不是搬旧像素。
-                while (x < ww) {
-                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
-                    x = x + 1;
-                }
-            } else {
-                nint srcRow = pixels + sy * sw * 4;
-                while (x < ox) {
-                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
-                    x = x + 1;
-                }
-                while (x < ox + copyW) {
-                    int p = Win32Shell.S32(srcRow, (x - ox) * 4);
-                    int cov = 255;
-                    if (mask != null) { cov = mask[sy * pw + (x - ox)]; }
-                    new Span<int>(dstRow + x * 4, 1)[0] =
-                        WindowShapeMask.LayeredArgb(p, cov, Win32Shell.hasShadowBand);
-                    x = x + 1;
-                }
-                while (x < ww) {
-                    new Span<int>(dstRow + x * 4, 1)[0] = 0;
-                    x = x + 1;
-                }
-            }
-            y = y + 1;
-        }
+        // 源表面、窗口 DIB 与 coverage 各用自己的跨距。偏移之外及表面
+        // 尚未覆盖的窗口像素由批量转换清零，避免缩放期间沿用旧帧内容。
+        // coverage 仍由同一 ShapeMask 按客户区尺寸/DPI 采样；先裁 alpha
+        // 再预乘 RGB 的两次截断必须与 WindowShapeMask.LayeredArgb 一致。
+        if (ww > 536870911 || sw > 536870911) { return; }
+        int maskLength = mask == null ? 0 : mask.Length;
+        if (Win32Shell.PrepareLayeredArgb(Win32Shell.lwBits, ww, wh, ww * 4,
+        pixels, copyW, copyH, sw * 4, ox, oy, mask, pw, maskLength,
+        Win32Shell.hasShadowBand ? 1 : 0) == 0) { return; }
         nint screenDc = Win32Shell.GetDC(0);
         nint size = NativeMemory.Alloc(8);
         new Span<int>(size, 1)[0] = ww;

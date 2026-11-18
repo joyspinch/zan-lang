@@ -1,9 +1,16 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 using Gui.Widget;
+using Gui.Component.DataTable;
 using Game.Foundation.Gui;
 using Game.Core;
+
+class GuiHostTableSource : DataSource {
+    public override int RowCount() { return 30; }
+    public override string CellText(int row, int col) { return "Row " + Convert.ToString(row); }
+}
 
 class GuiHostFocusProbe : Control {
     public int losses;
@@ -35,6 +42,8 @@ class GuiHostLoopTest : IGuiHostLoop {
     int actionPressFrames;
     int actionReleaseFrames;
     GameViewport viewport;
+    JsonValue hudModel;
+    ModelBinder hudBinder;
     bool started;
     bool stopped;
     long startUs;
@@ -61,8 +70,8 @@ class GuiHostLoopTest : IGuiHostLoop {
     void TraceRoute(Control sender, RoutedEventArgs e) {
         if (ProcessHost.Env("ZAN_GUIHOST_DIAG") != "1") { return; }
         Console.WriteLine("GUIHOST_ROUTE event=" + e.eventName + " sender=" + Node(sender)
-            + " original=" + Node(e.originalSource) + " handled=" + e.handled
-            + " x=" + e.x + " y=" + e.y);
+        + " original=" + Node(e.originalSource) + " handled=" + e.handled
+        + " x=" + e.x + " y=" + e.y);
     }
 
     void TraceEvent(GuiHost host, int kind) {
@@ -72,24 +81,24 @@ class GuiHostLoopTest : IGuiHostLoop {
         int y = app.window.EventY();
         Control hit = app.rootControl != null ? app.rootControl.HitTest(x, y, app.currentPointerType) : null;
         Console.WriteLine("GUIHOST_EVENT kind=" + kind + " seq=" + app.window.EventSeq()
-            + " x=" + x + " y=" + y + " root=" + Node(app.rootControl)
-            + " tree_hit=" + Node(hit) + " flat_hit=" + app.hitTester.HitTest(x, y)
-            + " down_target=" + Node(app.pointerDownTarget)
-            + " captured=" + Node(app.GetCapturedPointer())
-            + " button=" + Node(button) + " button_clicked=" + button.clicked
-            + " rect=" + button.bx + "," + button.by + "," + button.bw + "," + button.bh);
+        + " x=" + x + " y=" + y + " root=" + Node(app.rootControl)
+        + " tree_hit=" + Node(hit) + " flat_hit=" + app.hitTester.HitTest(x, y)
+        + " down_target=" + Node(app.pointerDownTarget)
+        + " captured=" + Node(app.GetCapturedPointer())
+        + " button=" + Node(button)
+        + " rect=" + button.bx + "," + button.by + "," + button.bw + "," + button.bh);
     }
 
     void Diagnose(GuiHost host, string label) {
         App app = host.App();
         Console.WriteLine("GUIHOST_DIAG " + label + " visible=" + app.window.IsVisible()
-            + " focused=" + app.window.IsFocused() + " handle=" + app.window.handle
-            + " frames=" + frames + " updates=" + updates + " steps=" + fixedSteps
-            + " elapsed_ms=" + elapsedMilliseconds
-            + " wall_ms=" + ((Stopwatch.GetMicroseconds() - startUs) / 1000)
-            + " presses=" + presses + " releases=" + releases + " clicks=" + clicks
-            + " key_down=" + keyPresses + " key_up=" + keyReleases
-            + " poll=" + app.lastPollResult + " event=" + app.EventKind());
+        + " focused=" + app.window.IsFocused() + " handle=" + app.window.handle
+        + " frames=" + frames + " updates=" + updates + " steps=" + fixedSteps
+        + " elapsed_ms=" + elapsedMilliseconds
+        + " wall_ms=" + ((Stopwatch.GetMicroseconds() - startUs) / 1000)
+        + " presses=" + presses + " releases=" + releases + " clicks=" + clicks
+        + " key_down=" + keyPresses + " key_up=" + keyReleases
+        + " poll=" + app.lastPollResult + " event=" + app.EventKind());
     }
 
     void Start(GuiHost host) {
@@ -118,6 +127,10 @@ class GuiHostLoopTest : IGuiHostLoop {
         button.MeasureTree(app);
         button.Arrange(40, app.ContentTop() + 30, 160, 48);
         host.Hud().Add(button);
+        button.BindPath("caption", "text");
+        hudModel = JsonValue.NewObject(); hudModel.PutStr("caption", "HUD action");
+        hudBinder = new ModelBinder(); hudBinder.SetRoot(button, hudModel);
+        app.RegisterModelHost(hudBinder); hudBinder.Wire();
     }
 
     void Event(GuiHost host, int kind, int keycode) {
@@ -139,6 +152,9 @@ class GuiHostLoopTest : IGuiHostLoop {
         elapsedMilliseconds += deltaMilliseconds;
         if (host.Input().Pressed("test-action")) { actionPressFrames++; }
         if (host.Input().Released("test-action")) { actionReleaseFrames++; }
+        if (frames == 1) {
+            hudModel.Set("caption", JsonValue.NewStr("HUD model update"));
+        }
         if (viewport.Input.IsLeftDown || viewport.Input.IsRightDown) {
             throw new Exception("HUD-owned pointer input leaked into viewport");
         }
@@ -155,11 +171,18 @@ class GuiHostLoopTest : IGuiHostLoop {
 
     void Render(GuiHost host, Canvas canvas, double alpha) {
         frames++;
+        if (frames == 2) {
+            if (button.Text.Get() != "HUD model update") { throw new Exception("GuiHost must synchronize HUD models before Render"); }
+            button.Text = "HUD edited during render";
+        }
+        if (frames == 3 && hudModel.Str("caption", "") != "HUD edited during render") {
+            throw new Exception("GuiHost must write HUD models before presentation");
+        }
         canvas.Clear(0xff14291f);
         viewport.Arrange(0, host.App().ContentTop(), canvas.Width(), canvas.Height() - host.App().ContentTop());
         viewport.RenderTree(host.App());
         if (frames > 1 && (button.by != host.App().ContentTop()
-            || button.bh != host.App().ClientHeight() - host.App().ContentTop())) {
+        || button.bh != host.App().ClientHeight() - host.App().ContentTop())) {
             throw new Exception("HUD must be arranged in the content area below chrome");
         }
         int x = button.bx + button.bw / 2;
@@ -190,24 +213,24 @@ class GuiHostLoopTest : IGuiHostLoop {
     void Stop(GuiHost host) {
         stopped = true;
         if (!started || updates != frames || fixedSteps < 5
-            || fixedMilliseconds != fixedSteps * 100 || frames <= fixedSteps * 2
-            || presses != 4 || releases != 4 || clicks != 4
-            || keyPresses != 1 || keyReleases != 1) {
+        || fixedMilliseconds != fixedSteps * 100 || frames <= fixedSteps * 2
+        || presses != 4 || releases != 4 || clicks != 4
+        || keyPresses != 1 || keyReleases != 1) {
             this.Diagnose(host, "exit assertions");
         }
         GuiHostLoopTest.Check(started, "Start precedes callbacks");
         GuiHostLoopTest.Check(updates == frames, "one Update per rendered frame");
         GuiHostLoopTest.Check(fixedSteps >= 5 && fixedMilliseconds == fixedSteps * 100,
-            "fixed simulation advances while rendering independently");
+        "fixed simulation advances while rendering independently");
         GuiHostLoopTest.Check(frames > fixedSteps * 2,
-            "render cadence is independent of fixed simulation interval");
+        "render cadence is independent of fixed simulation interval");
         GuiHostLoopTest.Check(presses == 4 && releases == 4,
-            "all injected HUD press/release events reach game loop");
+        "all injected HUD press/release events reach game loop");
         GuiHostLoopTest.Check(keyPresses == 1 && keyReleases == 1,
-            "queued key press/release reach game loop");
+        "queued key press/release reach game loop");
         GuiHostLoopTest.Check(clicks == 4, "HUD clicks survive drain and repaint without replay");
         GuiHostLoopTest.Check(actionPressFrames == 1 && actionReleaseFrames == 1,
-            "semantic input edges last exactly one Update");
+        "semantic input edges last exactly one Update");
         button.Click.Clear();
         button.OnPreviewRouted(null);
         button.OnRouted(null);
@@ -238,11 +261,11 @@ class GuiHostLoopTest : IGuiHostLoop {
         Require(vp.Input.MouseX == 15 && vp.Input.MouseY == 20, "routed viewport coordinates are local");
         Send(host, 2, 45, 70, 0, 99, 0);
         Require(vp.Input.IsLeftDown && !vp.Input.IsRightDown && app.GetCapturedPointer() == vp,
-            "real left button ignores unrelated keycode and captures");
+        "real left button ignores unrelated keycode and captures");
         Send(host, 2, 45, 70, 1, 99, 0);
         Send(host, 3, 200, 160, 0, 99, 0);
         Require(!vp.Input.IsLeftDown && vp.Input.IsRightDown && app.GetCapturedPointer() == vp,
-            "one button up preserves other button capture");
+        "one button up preserves other button capture");
         Send(host, 1, 210, 170, 0, 0, 0);
         Require(vp.Input.MouseX == 180 && vp.Input.MouseY == 120, "captured movement crosses viewport boundary");
         Send(host, 3, 210, 170, 1, 0, 0);
@@ -250,14 +273,15 @@ class GuiHostLoopTest : IGuiHostLoop {
         Send(host, 2, 45, 70, 0, 0, 1);
         Send(host, 1, 150, 140, 0, 0, 1);
         Require(vp.Input.IsLeftDown && vp.Input.IsDragging && app.GetCapturedPointer() == vp,
-            "touch drag survives slop and viewport boundary");
+        "touch drag survives slop and viewport boundary");
         Send(host, 9, 0, 0, 0, 0, 0);
         Require(!vp.Input.IsLeftDown && !vp.Input.IsDragging && app.GetCapturedPointer() == null,
-            "window blur cancels drag without up");
+        "window blur cancels drag without up");
         app.SetPointerDeviceType(0);
         Input editor = new Input("");
         host.Hud().Add(editor);
-        host.Hud().RenderIn(app, 30, 50, 80, 32);
+        host.Hud().SetBounds(30, 50, 80, 32);
+        host.Hud().Bind(app);
         Send(host, 2, 45, 60, 0, 0, 0);
         Send(host, 3, 45, 60, 0, 0, 0);
         Require(!vp.Input.IsLeftDown && editor.IsFocused(app), "HUD shields viewport before world input");
@@ -295,24 +319,22 @@ class GuiHostLoopTest : IGuiHostLoop {
         app.overlayHost.Dismiss();
         probe.visible = true;
         host.Hud().Add(probe);
-        host.Hud().RenderIn(app, 120, 50, 60, 30);
+        host.Hud().SetBounds(120, 50, 60, 30);
+        host.Hud().Bind(app);
         probe.Focus(app);
         probe.redirect = editor;
         vp.Focus(app);
         Require(editor.IsFocused(app) && probe.losses == 2, "focus-loss reentry retains third focus owner");
         probe.redirect = null;
         vp.Focus(app);
-        app.focus.tabOrder.Clear();
-        app.focus.RegisterFocusable(vp.WidgetId());
-        app.focus.RegisterFocusable(editor.WidgetId());
         Send(host, 4, 0, 0, 0, 67, 0);
         app.focus.FocusStep(1);
-        Require(editor.IsFocused(app) && !vp.Input.keyState[67], "Tab uses immediate focus setter");
+        Require(editor.IsFocused(app) && !vp.Input.keyState[67], "Tab follows retained focus endpoints");
         host.Input().ProcessKey(65, true);
         host.ReleaseInput();
         host.ReleaseInput();
         Require(!host.Input().Down("global") && host.Input().Pressed("global") && host.Input().Released("global"),
-            "stop releases global actions without erasing edges");
+        "stop releases global actions without erasing edges");
         vp.Disabled = true;
         vp.Focus(app);
         Send(host, 4, 0, 0, 0, 68, 0);
@@ -320,9 +342,8 @@ class GuiHostLoopTest : IGuiHostLoop {
         Require(!vp.Input.keyState[68] && !vp.Input.IsLeftDown, "disabled viewport rejects keys and pointer down");
         vp.Disabled = false;
         vp.CurrentScene = null;
-        app.focus.tabOrder.Clear();
         vp.RenderTree(app);
-        Require(app.focus.IndexOf(vp.WidgetId()) >= 0, "empty-scene viewport remains focusable");
+        Require((vp.InputFocusCapabilities() & 1) != 0, "empty-scene viewport remains focusable");
         host.Hud().Clear();
         host.SetContentRoot(null);
         vp.off.Destroy();
@@ -340,13 +361,13 @@ class GuiHostLoopTest : IGuiHostLoop {
         host.SetContentRoot(previous);
         Input editor = new Input("");
         host.Hud().Add(editor);
-        host.Hud().RenderIn(app, 0, 60, 180, 32);
+        host.Hud().SetBounds(0, 60, 180, 32);
+        host.Hud().Bind(app);
         InputRootAdapter hudRoot = (InputRootAdapter)app.rootControl;
         LayerState layer = new LayerState("Floating", 250, 120, 300, 240);
         layer.SetBody(new Control("layer-body"));
         layer.Open(app);
         layer.openMs = 0;
-        Layer.Render(app, layer);
         InputRootAdapter layerRoot = (InputRootAdapter)app.rootControl;
         Require(layerRoot != hudRoot && layerRoot.ContainsAdapter(hudRoot), "Layer wraps existing host HUD");
         editor.Focus(app);
@@ -365,17 +386,17 @@ class GuiHostLoopTest : IGuiHostLoop {
         previous = null;
         Require(witness.redirect == null, "replaced fallback releases old content ownership");
         Require(app.rootControl == layerRoot && layerRoot.ContainsAdapter(hudRoot)
-            && app.GetCapturedPointer() == editor && editor.IsFocused(app), "content replacement preserves Layer HUD focus and capture");
+        && app.GetCapturedPointer() == editor && editor.IsFocused(app), "content replacement preserves Layer HUD focus and capture");
         host.SetContentRoot(next);
         Require(app.GetCapturedPointer() == editor && editor.IsFocused(app), "same content replacement is input-idempotent");
         host.SetContentRoot(layerRoot);
         Require(app.rootControl == layerRoot && !hudRoot.SetContentRoot(hudRoot)
-            && !hudRoot.SetContentRoot(layerRoot), "content setter rejects adapter cycles");
+        && !hudRoot.SetContentRoot(layerRoot), "content setter rejects adapter cycles");
         next.Focus(app);
         app.CapturePointer(next, true);
         host.SetContentRoot(new Control("third"));
         Require(!next.IsFocused(app) && app.GetCapturedPointer() == null,
-            "replacing fallback releases only departed world input");
+        "replacing fallback releases only departed world input");
         GuiHostFocusProbe reentrant = new GuiHostFocusProbe();
         reentrant.RenderInside(app, new Rect(0, 0, 180, 32));
         host.SetContentRoot(reentrant);
@@ -403,7 +424,7 @@ class GuiHostLoopTest : IGuiHostLoop {
         Button upper = new Button("upper");
         hud.Add(lower);
         hud.Add(upper);
-        hud.Render(app, app.canvas);
+        hud.Bind(app);
         lower.Arrange(20, 50, 80, 40);
         upper.Arrange(20, 50, 80, 40);
         // 测根自身区域，绕开文字子节点，断言输入层次与绘制顺序相同。
@@ -413,33 +434,41 @@ class GuiHostLoopTest : IGuiHostLoop {
         if (hud.inputRoot.HitTest(200, 140, 0) != content || content.parent != null) {
             throw new Exception("Transparent HUD must preserve content hit and parent");
         }
+        List<Control> excluded = new List<Control>();
+        excluded.Add(upper);
+        Require(hud.inputRoot.HitTest(21, 51, 0, excluded) == lower, "excluded HUD exposes lower sibling");
+        excluded.Add(lower);
+        Require(hud.inputRoot.HitTest(21, 51, 0, excluded) == content, "excluded HUD preserves world fallback");
+        excluded.Add(content);
+        Require(hud.inputRoot.HitTest(21, 51, 0, excluded) == null, "excluded world cannot leak through HUD fallback");
         hud.Remove(upper);
         if (hud.inputRoot.HitTest(21, 51, 0) != lower) { throw new Exception("Removed HUD must stop receiving input"); }
         app.CapturePointer(lower);
         app.focus.SetFocused(lower.WidgetId());
         hud.SetVisible(false);
         if (app.rootControl != content || app.GetCapturedPointer() != null
-            || app.focus.IsFocused(lower.WidgetId())) {
+        || app.focus.IsFocused(lower.WidgetId())) {
             throw new Exception("Hidden HUD must detach input, focus and capture");
         }
         if (app.rootControl.HitTest(21, 51, 0) != content) { throw new Exception("Hidden HUD must stop receiving input"); }
         Require(hud.inputRoot.HitTest(21, 51, 0) == null && !hud.inputRoot.ContainsInputControl(content), "detached HUD adapter no longer owns fallback");
+        hud.SetBounds(30, 60, 100, 70);
         hud.SetVisible(true);
-        hud.RenderIn(app, 30, 60, 100, 70);
         if (lower.bx != 30 || lower.by != 60 || lower.bw != 100 || lower.bh != 70
-            || app.rootControl != hud.inputRoot) {
+        || app.rootControl != hud.inputRoot) {
             throw new Exception("HUD region must share rendered geometry and input binding");
         }
         HudLayer second = new HudLayer();
         Input field = new Input("HUD text");
         second.Add(field);
-        second.RenderIn(app, 140, 60, 90, 40);
+        second.SetBounds(140, 60, 90, 40);
+        second.Bind(app);
         field.Focus(app);
         app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
         if (field.GetText() != "A") { throw new Exception("HUD aggregate must route focused text"); }
         app.CapturePointer(lower);
-        hud.RenderIn(app, 30, 60, 100, 70);
-        second.RenderIn(app, 140, 60, 90, 40);
+        hud.Bind(app);
+        second.Bind(app);
         if (app.GetCapturedPointer() != lower) { throw new Exception("HUD reordering must preserve capture"); }
         app.DispatchVisualTree(1, 220, 160, 0, 0);
         if (app.GetCapturedPointer() != lower) { throw new Exception("HUD capture must belong to aggregate input tree"); }
@@ -450,7 +479,7 @@ class GuiHostLoopTest : IGuiHostLoop {
         hud.Clear();
         if (app.GetCapturedPointer() != null) { throw new Exception("Cleared HUD must release capture immediately"); }
         if (hud.inputRoot.HitTest(21, 51, 0) != content) { throw new Exception("Cleared HUD must restore content input"); }
-        hud.Render(app, app.canvas);
+        hud.Paint(app);
         if (app.rootControl != hud.inputRoot || content.parent != null) {
             throw new Exception("HUD root binding must be stable without reparenting");
         }
@@ -466,7 +495,7 @@ class GuiHostLoopTest : IGuiHostLoop {
         button.MeasureTree(app);
         button.Arrange(20, 40, 160, 48);
         button.RenderTree(app);
-        Control label = button.children[0];
+        Control label = button.ChildAt(0);
         int x = label.bx + label.bw / 2;
         int y = label.by + label.bh / 2;
         if (button.HitTest(x, y, 0) != label) { throw new Exception("Click regression must start on label"); }
@@ -507,12 +536,281 @@ class GuiHostLoopTest : IGuiHostLoop {
         app.canvas.Destroy();
     }
 
+    static void PaintPreparedHud(App app, HudLayer hud, HudPreparationProbe probe, bool shouldPaint) {
+        for (int frame = 0; frame < 2; frame = frame + 1) {
+            app.BeginFrame();
+            Require(app.PrepareStandardHostFrame(), "HUD frame uses shared preparation");
+            HudPaintSnapshot snapshot = new HudPaintSnapshot(app, hud);
+            int measured = probe.measures;
+            int arranged = probe.arrangements;
+            int painted = probe.paints;
+            for (int pass = 0; pass < 2; pass = pass + 1) {
+                hud.Paint(app);
+                int expected = shouldPaint ? painted + pass + 1 : painted;
+                Require(probe.paints == expected, "HUD Paint consumes only active borrowed roots");
+                Require(probe.measures == measured && probe.arrangements == arranged,
+                "consecutive HUD Paint never measures or arranges");
+                Require(snapshot.Current(app, hud),
+                "HUD Paint never rebinds changes generations or invalidates the prepared proof");
+                if (shouldPaint) { Require(probe.paintedApp == app, "HUD paints the tree prepared for this App"); }
+            }
+            app.CancelOffscreenFrame();
+        }
+    }
+
+    static void TestHudPaintConsumption() {
+        App first = App.CreateOffscreen("HUD pure Paint", 240, 180);
+        Control world = new Control("paint-world"); first.SetRootControl(world);
+        HudLayer hud = new HudLayer();
+        HudPreparationProbe probe = new HudPreparationProbe();
+        hud.Add(probe); hud.SetBounds(32, 44, 90, 52); hud.Bind(first);
+        first.ProcessOffscreenInput(2, 40, 50, 0, 0, 0, 0);
+        Require(first.pointerDownTarget == probe && probe.paints == 0,
+        "prepared HUD receives first Down without any Paint");
+        first.ProcessOffscreenInput(3, 40, 50, 0, 0, 0, 0);
+
+        HudLayer upper = new HudLayer();
+        Control cover = new Control("upper-hud");
+        upper.Add(cover); upper.SetBounds(32, 44, 90, 52); upper.Bind(first);
+        PaintPreparedHud(first, hud, probe, true);
+        Require(first.rootControl == upper.inputRoot && first.rootControl.HitTest(40, 50, 0) == cover,
+        "painting a lower HUD does not rebind it above the current input tree");
+        Require(probe.bx == 32 && probe.by == 44 && probe.bw == 90 && probe.bh == 52,
+        "HUD Paint preserves the explicit prepared region");
+        upper.SetVisible(false); upper.Clear();
+
+        hud.SetVisible(false);
+        PaintPreparedHud(first, hud, probe, false);
+        Require(first.rootControl == world && !hud.inputRoot.IsBoundTo(first),
+        "hidden HUD Paint cannot restore its input adapter");
+        hud.SetVisible(true);
+        PaintPreparedHud(first, hud, probe, true);
+        hud.inputRoot.Detach();
+        PaintPreparedHud(first, hud, probe, false);
+        Require(first.rootControl == world && !hud.inputRoot.IsBoundTo(first),
+        "detached visible HUD Paint cannot restore retired input ownership");
+        hud.Bind(first);
+
+        App second = App.CreateOffscreen("HUD pure Paint destination", 320, 220);
+        Control secondWorld = new Control("second-paint-world"); second.SetRootControl(secondWorld);
+        hud.Bind(second);
+        PaintPreparedHud(first, hud, probe, false);
+        Require(first.rootControl == world && second.rootControl == hud.inputRoot && probe.App == second,
+        "Paint on the old App cannot revive a retired HUD scope or steal its root");
+        PaintPreparedHud(second, hud, probe, true);
+        Require(hud.Remove(probe), "HUD Paint regression removes its borrowed root");
+        PaintPreparedHud(second, hud, probe, false);
+        Require(hud.Count() == 0 && !hud.inputRoot.ContainsInputControl(probe),
+        "Paint cannot restore a removed HUD member");
+        hud.Add(probe);
+        PaintPreparedHud(second, hud, probe, true);
+        hud.Clear();
+        PaintPreparedHud(second, hud, probe, false);
+        Require(hud.Count() == 0 && !hud.inputRoot.ContainsInputControl(probe),
+        "Paint cannot restore a cleared HUD scope");
+        hud.SetVisible(false);
+        first.SetRootControl(null); second.SetRootControl(null);
+        first.StopLoop(); second.StopLoop(); first.canvas.Destroy(); second.canvas.Destroy();
+    }
+
+    static void TestHudPaintAddition(bool duringPaint) {
+        App app = App.CreateOffscreen("HUD addition after preparation", 240, 180);
+        HudLayer hud = new HudLayer();
+        HudPreparationProbe first = new HudPreparationProbe(); first.hud = hud;
+        HudPreparationProbe added = new HudPreparationProbe();
+        hud.Add(first); hud.SetBounds(32, 44, 90, 52); hud.Bind(app);
+        app.BeginOffscreenFrame();
+        Require(app.PrepareStandardHostFrame(), "HUD addition starts from a prepared frame");
+        int measured = first.measures;
+        int arranged = first.arrangements;
+        if (duringPaint) { first.replacement = added; first.addOnPaint = true; }
+        else { hud.Add(added); }
+        hud.Paint(app);
+        Require(added.measures == 0 && added.arrangements == 0 && added.paints == 0,
+        "HUD Add after preparation never paints an unmeasured member: duringPaint="
+        + Convert.ToString(duringPaint) + " measures=" + Convert.ToString(added.measures)
+        + " arrangements=" + Convert.ToString(added.arrangements) + " paints=" + Convert.ToString(added.paints));
+        Require(first.measures == measured && first.arrangements == arranged
+        && first.paints == (duringPaint ? 1 : 0), "HUD Add abandons only the old paint tail without layout");
+        Require(!app.ContinuePreparedFrame(), "HUD membership addition invalidates the current prepared frame");
+        app.CancelOffscreenFrame();
+        PaintPreparedHud(app, hud, added, true);
+        app.ProcessOffscreenInput(2, 40, 50, 0, 0, 0, 0);
+        Require(app.pointerDownTarget == added, "next shared preparation activates the added HUD root");
+        app.ProcessOffscreenInput(3, 40, 50, 0, 0, 0, 0);
+        hud.Clear(); hud.SetVisible(false); app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+
+    static void TestHudPreparationBeforeInput() {
+        App first = App.CreateOffscreen("HUD prepare before input", 240, 180);
+        Control content = new Control("world");
+        first.SetRootControl(content);
+        HudLayer hud = new HudLayer();
+        Control target = new Control("prepaint-hud-target");
+        HudLayoutEvents events = new HudLayoutEvents(); events.Bind(target);
+        HudLayoutEvents background = new HudLayoutEvents(); background.Bind(content);
+        hud.Add(target);
+        hud.SetBounds(32, 44, 90, 52);
+        hud.Bind(first);
+        first.ProcessOffscreenInput(2, 40, 50, 0, 0, 0, 0);
+        Require(target.bx == 32 && target.by == 44 && target.bw == 90 && target.bh == 52
+        && first.pointerDownTarget == target,
+        "HUD explicit bounds are arranged and hit before first paint");
+        Require(events.shows == 0 && events.hides == 0 && events.resizes == 0,
+        "HUD first preparation establishes lifecycle without initial notifications");
+        first.ProcessOffscreenInput(3, 40, 50, 0, 0, 0, 0);
+        hud.SetVisible(false);
+        Require(first.rootControl == content && first.GetCapturedPointer() == null,
+        "hiding HUD retires preparation and restores input root");
+        Require(events.hides == 1 && background.hides == 0,
+        "HUD detach notifies borrowed controls without hiding the world");
+        hud.SetVisible(true);
+        first.ProcessOffscreenInput(2, 40, 50, 0, 0, 0, 0);
+        Require(first.pointerDownTarget == target && target.bx == 32 && target.by == 44,
+        "showing HUD binds a fresh preparation scope before input");
+        Require(events.shows == 1 && events.hides == 1 && events.resizes == 0,
+        "HUD rebind shows the existing control once before Paint");
+        first.ProcessOffscreenInput(3, 40, 50, 0, 0, 0, 0);
+
+        App second = App.CreateOffscreen("HUD preparation rebind", 320, 220);
+        Control secondContent = new Control("second-world");
+        second.SetRootControl(secondContent);
+        hud.UseDefaultBounds();
+        hud.Bind(second);
+        second.SetOffscreenViewport(360, 260, 100);
+        second.ProcessOffscreenInput(2, 20, second.ContentTop() + 20, 0, 0, 0, 0);
+        Require(first.rootControl == content && second.rootControl == hud.inputRoot
+        && target.bx == 0 && target.by == second.ContentTop()
+        && target.bw == second.ClientWidth()
+        && target.bh == second.ClientHeight() - second.ContentTop(),
+        "cross-App bind retires the old scope and prepares current default size before input");
+        Require(events.shows == 2 && events.hides == 2 && events.resizes == 1,
+        "HUD cross-App preparation delivers Hide Show and current-size Resize once");
+        second.ProcessOffscreenInput(3, 20, second.ContentTop() + 20, 0, 0, 0, 0);
+        Require(events.shows == 2 && events.hides == 2 && events.resizes == 1,
+        "consecutive HUD input does not replay lifecycle notifications");
+        hud.Clear();
+        second.SetRootControl(null);
+        first.StopLoop(); second.StopLoop();
+        first.canvas.Destroy(); second.canvas.Destroy();
+    }
+
+    static void TestHudDataTableBeforePaint() {
+        GuiHost host = new GuiHost("HUD DataTable preparation", 720, 480, 100);
+        App app = App.CreateOffscreen("HUD DataTable preparation", 720, 480);
+        host.app = app;
+        host.SetContentRoot(new Control("world"));
+        List<DataColumn> columns = new List<DataColumn>();
+        columns.Add(new DataColumn("Name", 180));
+        DataTableControl table = new DataTableControl(columns, new GuiHostTableSource());
+        table.state.rowH = 28;
+        table.state.showSummary = false; table.state.showStatusBar = false;
+        table.state.showFilterRow = false; table.state.showSelectionSummary = false;
+        Panel detail = Panel.Column();
+        Input editor = new Input("HUD detail");
+        detail.Add(editor);
+        table.state.detail = new ControlDetailProvider((a, src, row) => detail, 4);
+        DataTable.ExpandRow(table.state, table.source, 0);
+        HudLayer hud = host.Hud();
+        hud.Add(table);
+        hud.SetBounds(24, 36, 600, 320);
+        hud.Bind(app);
+        int px = 38;
+        int py = 36 + app.theme.heightMedium + 28 + 8;
+        app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
+        Require(app.pointerDownTarget == editor && editor.IsFocused(app) && detail.parent == table,
+        "public HUD path prepares DataTable details before first paint");
+        app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        Require(editor.GetText().Contains("A"), "HUD DataTable accepts text before paint");
+        string previous = editor.GetText();
+        DataTable.CollapseRow(table.state, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
+        Require(detail.parent == null && editor.GetText() == previous && !editor.IsFocused(app),
+        "HUD collapse retires focused detail before the next text input");
+        DataTable.ExpandRow(table.state, table.source, 0);
+        hud.SetBounds(64, 56, 600, 320);
+        app.ProcessOffscreenInput(2, px + 40, py + 20, 0, 0, 0, 0);
+        Require(app.pointerDownTarget == editor && table.bx == 64 && table.by == 56,
+        "HUD DataTable bound changes prepare the next pointer without paint");
+        app.ProcessOffscreenInput(3, px + 40, py + 20, 0, 0, 0, 0);
+        table.state.scrollRow = 12;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 67, 0, 0);
+        Require(detail.parent == null && editor.GetText() == previous && !editor.IsFocused(app),
+        "HUD scroll retires focused detail before the next input");
+        hud.Clear(); hud.SetVisible(false); host.SetContentRoot(null);
+        app.StopLoop(); app.canvas.Destroy();
+    }
+
+    static void TestHudMeasureMutation(int mode, HudLifetimeWatch watch) {
+        App first = App.CreateOffscreen("HUD measure mutation", 240, 180);
+        App second = App.CreateOffscreen("HUD measure destination", 320, 220);
+        Control world = new Control("measure-world"); first.SetRootControl(world);
+        HudLayer hud = new HudLayer();
+        HudPreparationProbe probe = new HudPreparationProbe();
+        watch.first = first; watch.second = second; watch.hud = hud; watch.root = probe;
+        probe.hud = hud; probe.nextApp = second;
+        hud.Add(probe); hud.SetBounds(32, 44, 90, 52); hud.Bind(first);
+        int arranged = probe.arrangements;
+        int measured = probe.measures;
+        probe.mode = mode;
+        first.SetOffscreenViewport(260, 200, 100);
+        first.ProcessOffscreenInput(2, 40, 50, 0, 0, 0, 0);
+        if (mode == 4) {
+            Require(hud.inputApp == second && first.rootControl == world
+            && probe.arrangements == arranged + 1 && probe.measures == measured + 2
+            && probe.App == second,
+            "Measure cross-App rebind arranges only the new scope: host=" + Convert.ToString(hud.inputApp == second)
+            + " fallback=" + Convert.ToString(first.rootControl == world)
+            + " arrangements=" + Convert.ToString(probe.arrangements - arranged)
+            + " app=" + Convert.ToString(probe.App == second));
+        } else {
+            Require(probe.arrangements == arranged && first.pointerDownTarget != probe,
+            "Measure Remove/Clear/Hide abandons the retired layout and input tail");
+            if (mode == 1 || mode == 2) { Require(hud.Count() == 0, "Measure removal commits membership"); }
+            if (mode == 3) { Require(!hud.IsVisible() && first.rootControl == world, "Measure hide restores fallback"); }
+        }
+        hud.Clear(); hud.SetVisible(false);
+        first.StopLoop(); second.StopLoop(); first.canvas.Destroy(); second.canvas.Destroy();
+    }
+
+    static void TestHudReleaseReentry() {
+        App app = App.CreateOffscreen("HUD release reentry", 240, 180);
+        HudLayer hud = new HudLayer();
+        HudPreparationProbe probe = new HudPreparationProbe(); probe.hud = hud;
+        Control survivor = new Control("reentrant-survivor"); probe.replacement = survivor;
+        hud.Add(probe); hud.SetBounds(24, 40, 100, 60); hud.Bind(app);
+        probe.Focus(app); probe.reenterOnLoss = true;
+        Require(hud.Remove(probe) && hud.Count() == 1 && hud.controls[0] == survivor,
+        "Remove focus callback retains the newly added root");
+        hud.Remove(survivor); hud.Add(probe); hud.Bind(app);
+        probe.Focus(app); probe.reenterOnLoss = true;
+        hud.Clear();
+        Require(hud.Count() == 1 && hud.controls[0] == survivor,
+        "Clear focus callback retains the newly added root");
+        app.ProcessOffscreenInput(2, 30, 50, 0, 0, 0, 0);
+        Require(app.pointerDownTarget == survivor, "reentrant Add gets a fresh preparation scope");
+        hud.Clear(); hud.SetVisible(false); app.StopLoop(); app.canvas.Destroy();
+    }
+
     static void Main() {
         Console.WriteLine("GUIHOST_RUN_BEGIN");
         TestCapturedButtonClicks();
         TestViewportRouting();
         TestHostContentReplacement();
         TestHudInputRoot();
+        TestHudPaintConsumption();
+        TestHudPaintAddition(true);
+        TestHudPaintAddition(false);
+        TestHudPreparationBeforeInput();
+        TestHudDataTableBeforePaint();
+        for (int mode = 1; mode <= 4; mode = mode + 1) {
+            HudLifetimeWatch watch = new HudLifetimeWatch();
+            TestHudMeasureMutation(mode, watch);
+            Require(watch.first == null && watch.second == null && watch.hud == null && watch.root == null,
+            "retired HUD measurement releases both Apps the layer and the borrowed root");
+        }
+        TestHudReleaseReentry();
         GuiHostLoopTest loop = new GuiHostLoopTest();
         GuiHost host = new GuiHost("GuiHost HUD input regression", 360, 240, 100);
         GuiHostLoopTest.Check(host.Run(loop), "host returns normally");

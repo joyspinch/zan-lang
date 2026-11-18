@@ -1,0 +1,215 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+namespace Gui;
+
+// SOURCE ONLY; real ProcessOffscreenInput/PresentFrame/CaptureSnapshot paths.
+internal class V3Layout : AppHostLayout {
+    internal override bool SyncLayout(App app, bool forInput) { return true; }
+}
+
+class V3InputLeaf : Control {
+    public int keys;
+    public int ups;
+    public int texts;
+    public int downs;
+    public V3InputLeaf() : base("v3InputLeaf") { }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return x >= bx && x < bx + bw && y >= by && y < by + bh ? this : null;
+    }
+    public override void OnKeyDown(RoutedEventArgs e) { keys = keys + 1; e.Handle(); }
+    public override void OnKeyUp(RoutedEventArgs e) { ups = ups + 1; e.Handle(); }
+    public override void OnTextInput(RoutedEventArgs e) { texts = texts + 1; e.Handle(); }
+    public override void OnPointerDown(RoutedEventArgs e) { downs = downs + 1; e.Handle(); }
+}
+
+class V3ClaimParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public bool claim;
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+    public void BeforePaint(App app, int frame) { }
+    public void BeforeInput(App app, int kind) { if (claim) { app.ClaimKey(); } }
+}
+
+class V3OverlayLeaf : Control {
+    public AppLoopRegistration retire;
+    public int calls;
+    public V3OverlayLeaf() : base("v3OverlayLeaf") { }
+    public override void OnPaintOverlay(App app) { calls = calls + 1; retire.Invalidate(); }
+}
+
+class V3SnapshotForm : Form {
+    public V3SnapshotForm(App a) : base() { this.InitControl("v3Snapshot", 5); this.app = a; }
+}
+
+class PreparationV3ClaimTailsSnapshotTest {
+    static int secondTail;
+    static int firstTail;
+    static AppLoopRegistration retire;
+    static bool nestedInput;
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static void First(App app) {
+        firstTail = firstTail + 1;
+        if (nestedInput) { app.ProcessOffscreenInput(2, 4, 4, 0, 0, 0, 0); }
+        else { retire.Invalidate(); }
+    }
+    static void Second(App app) { secondTail = secondTail + 1; }
+    static void Claims() {
+        App app = App.CreateOffscreen("v3 claims", 240, 160);
+        V3InputLeaf leaf = new V3InputLeaf(); leaf.Arrange(0, 0, 240, 160);
+        app.SetRootControl(leaf); app.focus.SetFocused(leaf.WidgetId(), leaf);
+        V3ClaimParticipant participant = new V3ClaimParticipant(); participant.claim = true;
+        AppLoopRegistration ticket = app.RegisterLoopParticipant(app, participant);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 65, 0, 0);
+        Check(leaf.keys == 0 && app.KeyConsumed() && app.EventKind() == 0,
+            "claimed KeyDown reaches neither retained nor legacy EventKind");
+        Check(app.routedWindowHandled && app.routedWindowDispatchComplete, "claim completes as handled");
+        app.ProcessOffscreenInput(5, 0, 0, 0, 65, 0, 0);
+        Check(leaf.ups == 0 && app.EventKind() == 0, "claimed KeyUp is suppressed");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 120, 0, 0);
+        Check(leaf.texts == 0 && app.EventKind() == 0, "claimed text is suppressed");
+        app.ProcessOffscreenInput(4, 0, 0, 0, 9, 0, 0);
+        Check(app.KeyConsumed() && leaf.keys == 0 && app.focus.focusedControl == leaf,
+            "claimed Tab never reaches focus traversal");
+        participant.claim = false;
+        app.ProcessOffscreenInput(4, 0, 0, 0, 66, 0, 0);
+        Check(leaf.keys == 1, "new physical keyboard event routes normally");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 121, 0, 0);
+        Check(leaf.texts == 1, "new physical text event routes normally");
+        participant.claim = true;
+        app.ProcessOffscreenInput(2, 12, 12, 0, 0, 0, 0);
+        Check(leaf.downs == 1, "ClaimKey on mouse event does not block unrelated Down");
+        ticket.Invalidate(); app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void TailFence(int mode) {
+        App app = App.CreateOffscreen("v3 tail fence", 240, 160);
+        AppLoopRegistration host = app.RegisterLoopParticipant(app, new V3Layout());
+        AppLoopRegistration participant = app.RegisterLoopParticipant(app, new V3ClaimParticipant());
+        firstTail = 0; secondTail = 0; retire = mode == 2 ? participant : host; nestedInput = mode == 1;
+        app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "tail frame prepares");
+        app.PresentFrame();
+        Check(firstTail == 1 && secondTail == 0 && app.preparationFrameAborted,
+            "first present tail invalidation skips second tail");
+        participant.Invalidate(); host.Invalidate(); app.StopLoop(); app.canvas.Destroy();
+    }
+    static void OverlayFence() {
+        App app = App.CreateOffscreen("v3 overlay fence", 240, 160);
+        AppLoopRegistration host = app.RegisterLoopParticipant(app, new V3Layout());
+        V3OverlayLeaf overlay = new V3OverlayLeaf(); overlay.retire = host;
+        firstTail = 0; secondTail = 0;
+        app.BeginOffscreenFrame(); Check(app.PrepareStandardHostFrame(), "overlay frame prepares");
+        app.AddOverlay(OverlayPopup.Host(overlay));
+        app.PresentFrame();
+        Check(overlay.calls == 1 && firstTail == 0 && secondTail == 0 && app.preparationFrameAborted,
+            "overlay invalidation skips tooltip/present tail chain");
+        host.Invalidate(); app.StopLoop(); app.canvas.Destroy();
+    }
+    static void GrowMatchesCss(App app) {
+        Control fluentParent = new Control("fluentGrowParent");
+        fluentParent.SetProp("style", "display:flex;flex-direction:column");
+        Control fluent = new Control("fluentGrowChild"); fluentParent.Add(fluent);
+        fluentParent.MeasureTree(app);
+        Check(fluent.StyleGrow() == 0, "Grow premise has resolved non-growing style");
+        fluent.Grow();
+        fluentParent.MeasureTree(app); fluentParent.Arrange(0, 0, 100, 80);
+        Control cssParent = new Control("cssGrowParent");
+        cssParent.SetProp("style", "display:flex;flex-direction:column");
+        Control css = new Control("cssGrowChild");
+        css.SetProp("style", "flex-grow:1"); cssParent.Add(css);
+        cssParent.MeasureTree(app); cssParent.Arrange(0, 0, 100, 80);
+        Check(fluent.StyleGrow() == 1 && css.StyleGrow() == 1
+            && fluent.bw > 0 && fluent.bh > 0
+            && fluent.bx == css.bx && fluent.by == css.by
+            && fluent.bw == css.bw && fluent.bh == css.bh,
+            "Grow after style resolution matches CSS flex-grow:1 layout");
+        Check(fluent.StyleShrink() == css.StyleShrink()
+            && fluent.StyleBasisIn(80) == css.StyleBasisIn(80),
+            "Grow preserves default shrink and basis");
+        fluent.SetProp("style", "flex:2 0 12px");
+        fluentParent.MeasureTree(app);
+        Check(fluent.StyleGrow() == 2 && fluent.StyleShrink() == 0
+            && fluent.StyleBasisIn(80) == app.Scale(12),
+            "explicit CSS flex shorthand overrides Grow without losing shrink or basis");
+        fluent.SetProp("style", "flex-grow:0;flex-shrink:0;flex-basis:12px");
+        fluent.Grow(); fluentParent.MeasureTree(app);
+        Check(fluent.StyleGrow() == 0 && fluent.StyleShrink() == 0
+            && fluent.StyleBasisIn(80) == app.Scale(12),
+            "explicit inline flex-grow retains precedence over later Grow");
+        fluent.SetProp("style", "");
+        fluentParent.MeasureTree(app); fluentParent.Arrange(0, 0, 100, 80);
+        Check(fluent.StyleGrow() == 1 && fluent.StyleShrink() == css.StyleShrink()
+            && fluent.StyleBasisIn(80) == css.StyleBasisIn(80)
+            && fluent.bw == css.bw && fluent.bh == css.bh,
+            "clearing inline CSS restores fluent Grow and default shrink/basis");
+    }
+    static void SnapshotDoesNotReplay(int oldKind) {
+        App app = App.CreateOffscreen("v3 snapshot", 320, 240);
+        Control input = new Control("realRoot");
+        Control anchor = new Control("realAnchor"); input.Add(anchor);
+        input.MeasureTree(app); input.Arrange(0, 0, 320, 240); anchor.Arrange(16, 16, 60, 24);
+        app.SetRootControl(input);
+        // Finish a real old event BEFORE opening the popup. No event slot rewriting.
+        app.ProcessOffscreenInput(oldKind, 300, 220, 0, 0, 0, 0);
+        long sequence = app.window.EventSeq();
+        Control popup = new Control("realPopup"); popup.Prefer(100, 80);
+        popup.inlineStyleCss = "display:flex;flex-direction:column";
+        V3InputLeaf endpoint = new V3InputLeaf();
+        endpoint.Grow();
+        popup.Add(endpoint);
+        app.overlayHost.Show(app, anchor, popup);
+        Check(app.overlayHost.ActiveRoot() == popup && popup.bw > 0 && popup.bh > 0,
+            "snapshot premise has a truly active laid-out popup");
+        Check(endpoint.StyleGrow() == 1 && endpoint.bw > 0 && endpoint.bh > 0,
+            "popup child geometry is real"
+            + " oldKind=" + Convert.ToString(oldKind)
+            + " anchor=" + Convert.ToString(anchor.bx) + "," + Convert.ToString(anchor.by)
+            + "," + Convert.ToString(anchor.bw) + "," + Convert.ToString(anchor.bh)
+            + " popup=" + Convert.ToString(popup.bx) + "," + Convert.ToString(popup.by)
+            + "," + Convert.ToString(popup.bw) + "," + Convert.ToString(popup.bh)
+            + " popupPref=" + Convert.ToString(popup.prefW) + "," + Convert.ToString(popup.prefH)
+            + " display=" + Convert.ToString(popup.StyleDisplay())
+            + " direction=" + Convert.ToString(popup.StyleFlexDir())
+            + " child=" + Convert.ToString(endpoint.bx) + "," + Convert.ToString(endpoint.by)
+            + "," + Convert.ToString(endpoint.bw) + "," + Convert.ToString(endpoint.bh)
+            + " childPref=" + Convert.ToString(endpoint.prefW) + "," + Convert.ToString(endpoint.prefH)
+            + " grow=" + Convert.ToString(endpoint.StyleGrow())
+            + " visible=" + (endpoint.StyleVisible() ? "true" : "false")
+            + " childApp=" + (endpoint.FindApp() == app ? "true" : "false")
+            + " parent=" + (endpoint.parent == popup ? "true" : "false")
+            + " focus=" + (app.focus.focusedControl == endpoint ? "endpoint" : "other")
+            + " capture=" + (app.GetCapturedPointer() == endpoint ? "endpoint" : "other")
+            + " seq=" + Convert.ToString(app.window.EventSeq()));
+        app.focus.SetFocused(endpoint.WidgetId(), endpoint); app.CapturePointer(endpoint, true);
+        Check(app.focus.focusedControl == endpoint && app.GetCapturedPointer() == endpoint,
+            "snapshot premise owns non-null popup focus/capture");
+        int revision = app.overlayHost.RetirementRevision(); int rootGeneration = app.inputRootGeneration;
+        V3SnapshotForm form = new V3SnapshotForm(app); form.Add(new Control("snapshotLeaf"));
+        // Remove fixture tails while snapshot tests normal painting, not forced abort.
+        App.presentTails.Clear();
+        form.CaptureSnapshot();
+        Check(app.overlayHost.ActiveRoot() == popup && app.overlayHost.RetirementRevision() == revision,
+            "snapshot tail does not replay completed Down/focus-loss into popup retirement");
+        Check(app.focus.focusedControl == endpoint && app.GetCapturedPointer() == endpoint,
+            "snapshot leaves newly established popup input endpoints intact");
+        Check(app.window.EventSeq() == sequence && app.window.EventKind() == oldKind
+            && app.rootControl == input && app.inputRootGeneration == rootGeneration,
+            "snapshot retains physical event identity and input root");
+        Check(app.snapshotInputSilenceDepth == 0, "snapshot input silence scope is restored");
+        app.overlayHost.Dismiss(); app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void Main() {
+        App sentinel = App.CreateOffscreen("v3 sentinel", 1, 1);
+        GrowMatchesCss(sentinel);
+        Claims();
+        // Save and restore existing global hooks; fixture does not erase external hooks.
+        var prior = App.presentTails;
+        App.presentTails = null;
+        try {
+            App.AddPresentTail(First); App.AddPresentTail(Second);
+            TailFence(0); TailFence(1); TailFence(2); OverlayFence();
+            SnapshotDoesNotReplay(2); SnapshotDoesNotReplay(9);
+        } finally { App.presentTails = prior; }
+        sentinel.canvas.Destroy();
+        Console.WriteLine("preparation-v3-claim-tails-snapshot:ok");
+    }
+}

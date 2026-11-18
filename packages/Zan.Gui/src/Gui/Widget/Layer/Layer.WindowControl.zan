@@ -1,0 +1,502 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// Persistent projection of LayerState's page-window state. Custom body controls
+// retain their original parents; LayerInputRoot borrows the complete surface.
+class LayerWindowControl : Control {
+    weak LayerState state;
+    LayerWindowAction action;
+    Button minimize;
+    Button maximize;
+    Button close;
+    bool moving;
+    bool sizing;
+    int direction;
+    int pointerId = -1;
+    Label titleLabel;
+    Control footerRoot;
+    Rect bodyBounds = new Rect(0, 0, 0, 0);
+    LayerWindowPaint paint = new LayerWindowPaint();
+    bool preparedClosing;
+    int preparation;
+
+    bool Current(App app, Control root, int generation, long sequence, LayerState model, int session, int ticket) {
+        return preparation == ticket && model.open
+        && LayerPreparation.Current(app, root, generation, sequence, model, session);
+    }
+
+    public void PrepareClosing(App app, LayerState model) {
+        preparedClosing = true; paint.PrepareExit(app, model);
+    }
+    public override bool ChildControlsRenderedByOwner() { return preparedClosing; }
+
+    public LayerWindowControl(LayerState model) : base("layer-window") {
+        state = model;
+        action = new LayerWindowAction(model);
+        minimize = WindowButton("minimize", 1, action);
+        maximize = WindowButton("maximize", 2, action);
+        close = WindowButton("close", 3, action);
+        close.ClassName = "danger ghost";
+        titleLabel = new Label();
+        titleLabel.SetProp("style", "background:transparent;border:0;pointer-events:none");
+        this.Add(titleLabel);
+        this.Add(minimize);
+        this.Add(maximize);
+        this.Add(close);
+        footerRoot = model.windowFooter;
+        this.Add(footerRoot);
+        wiresOwnEvents = true;
+    }
+
+    static Button WindowButton(string glyph, int command, LayerWindowAction owner) {
+        Button button = new Button { Icon = glyph, ClassName = "ghost" };
+        button.Click.Add(() => owner.Run(command));
+        return button;
+    }
+
+    bool SyncFooter(App app, LayerState model) {
+        Control next = model.windowFooter;
+        if (footerRoot == next && (next == null || next.parent == this)) { return true; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq(); int session = model.inputGeneration; int ticket = preparation;
+        Control previous = footerRoot;
+        if (previous != null && previous.parent == this) { this.Remove(previous); }
+        if (!this.Current(app, root, generation, sequence, model, session, ticket)
+        || model.windowFooter != next) { return false; }
+        footerRoot = next;
+        if (next != null && next.parent != this) { this.Add(next); }
+        return this.Current(app, root, generation, sequence, model, session, ticket)
+        && model.windowFooter == next && footerRoot == next && (next == null || next.parent == this);
+    }
+
+    public override void SyncBinding() {
+        LayerState model = state;
+        if (model == null) { return; }
+        App app = this.FindApp();
+        if (app != null && model.open && !this.SyncFooter(app, model)) { return; }
+        string title = model.title;
+        if (titleLabel.GetText() != title) { titleLabel.Text = title; }
+        if (model.okBtn.Label() != model.okText) { model.okBtn.SetText(model.okText); }
+        if (model.cancelBtn.Label() != model.cancelText) { model.cancelBtn.SetText(model.cancelText); }
+        minimize.Icon = model.state == 2 ? "restore" : "minimize";
+        maximize.Icon = model.state == 1 ? "restore" : "maximize";
+        minimize.Tip = model.state == 2 ? "Restore" : "Minimize";
+        maximize.Tip = model.state == 1 ? "Restore" : "Maximize";
+        minimize.SyncBinding(); maximize.SyncBinding(); close.SyncBinding();
+    }
+
+    public override void OnMeasure(App app) {
+        LayerState model = state;
+        if (model == null) { return; }
+        if (!model.open) { return; }
+        if (model.sizeMinW > 0 && model.state == 0 && !model.dragging && !model.sizing) {
+            model.ApplySizeToContent(app);
+        }
+        if (model.autoCenter && model.state == 0 && !model.dragging && !model.sizing) {
+            int x = (app.canvas.Width() - model.w) / 2;
+            int y = (app.canvas.Height() - model.h) / 2;
+            if (y < app.titlebarH) { y = app.titlebarH; }
+            model.x = x; model.y = y; model.sx = x; model.sy = y;
+        }
+        List<int> bounds = new List<int>();
+        Layer.Bounds(app, model, bounds);
+        prefW = bounds[2]; prefH = bounds[3];
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        LayerState model = state;
+        App app = this.FindApp();
+        if (model == null || app == null || !model.open || model.modal) { return; }
+        preparation = preparation + 1; int ticket = preparation;
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq(); int session = model.inputGeneration;
+        int windowState = model.state;
+        if (!this.SyncFooter(app, model)) { return; }
+        List<int> bounds = new List<int>();
+        Layer.Bounds(app, model, bounds);
+        bx = bounds[0]; by = bounds[1] - Layer.EntranceDy(app, model); bw = bounds[2]; bh = bounds[3];
+        int bar = Layer.BarH(app);
+        int buttonWidth = Layer.BtnW(app);
+        int x = bx + bw;
+        titleLabel.Arrange(bx + app.Scale(14) + app.theme.iconSizeSmall + app.theme.gapSmall,
+        by, bw - Layer.BtnW(app) * 3 - app.Scale(32), bar);
+        close.Arrange(x - buttonWidth, by, buttonWidth, bar);
+        maximize.Arrange(x - buttonWidth * 2, by, buttonWidth, bar);
+        minimize.Arrange(x - buttonWidth * 3, by, buttonWidth, bar);
+        close.SetShown(model.open);
+        maximize.SetShown(model.open && model.state != 2);
+        minimize.SetShown(model.open);
+        if (model.state == 2) {
+            minimize.Arrange(x - buttonWidth, by, buttonWidth, bar);
+        }
+        model.windowFooter.SetShown(model.open && model.footer && model.state != 2);
+        if (model.state != 2) {
+            int footerHeight = model.footer ? Layer.FooterH(app) : 0;
+            model.windowFooter.MeasureTree(app, bw - app.Scale(32));
+            if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+            model.windowFooter.Arrange(bx + app.Scale(16), by + bh - footerHeight,
+            bw - app.Scale(32), app.theme.heightMedium);
+            if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+        }
+        if (model.state != 2) {
+            int bodyY = by + bar + app.Scale(16);
+            if (model.body != "") { bodyY = bodyY + app.Scale(28); }
+            int bodyH = by + bh - (model.footer ? Layer.FooterH(app) : 0) - bodyY - app.Scale(8);
+            if (bodyH < 0) { bodyH = 0; }
+            bodyBounds = new Rect(bx + app.Scale(20), bodyY, bw - app.Scale(40), bodyH);
+            Control content = model.wrap != null ? (Control)model.wrap : model.view;
+            if (content != null) {
+                content.UseApp(app);
+                content.MeasureTree(app, bodyBounds.width);
+                if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+                if (model.wrap == null && content.prefH > bodyH && content.Kind() != "ScrollColumn") {
+                    ScrollColumn scroll = new ScrollColumn();
+                    scroll.With(content); model.wrap = scroll; content = scroll;
+                    content.UseApp(app); content.MeasureTree(app, bodyBounds.width);
+                }
+                if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+                content.Arrange(bodyBounds.x, bodyBounds.y, bodyBounds.width, bodyBounds.height);
+                if (!this.Current(app, root, generation, sequence, model, session, ticket)) { return; }
+            }
+        }
+        if (!this.Current(app, root, generation, sequence, model, session, ticket)
+        || model.modal || model.state != windowState) { return; }
+        int inputSession = session;
+        Control nextBody = windowState == 2 ? null : this;
+        if (model.inputApp != app || model.inputBody != nextBody
+        || model.inputPrompt != null || model.inputFooter != null) {
+            inputSession = inputSession + 1;
+        }
+        model.SetLayerInput(app, this, null, null, bx, by, bw, bh);
+        if (!this.Current(app, root, generation, sequence, model, inputSession, ticket)
+        || model.modal || model.state != windowState) { return; }
+        preparedClosing = false;
+        paint.Prepare(app, model, bx, by, bw, bh, bodyBounds);
+    }
+
+    public override void OnPaint(App app) { paint.Paint(app); }
+
+    bool TitleAt(int x, int y) {
+        App app = this.FindApp();
+        if (app == null) { return false; }
+        int bar = Layer.BarH(app);
+        return x >= bx && x < bx + bw - Layer.BtnW(app) * 3 && y >= by && y < by + bar;
+    }
+
+    int ResizeAt(int x, int y) {
+        LayerState model = state;
+        App app = this.FindApp();
+        if (model == null || app == null || model.state != 0) { return 0; }
+        int edge = app.Scale(5); int corner = app.Scale(9);
+        if (x >= bx + bw - corner && y >= by + bh - corner) { return 4; }
+        if (x < bx + corner && y >= by + bh - corner) { return 5; }
+        if (x < bx + edge && y >= by + corner) { return 1; }
+        if (x >= bx + bw - edge && y >= by + Layer.BarH(app)) { return 2; }
+        if (y >= by + bh - edge && x >= bx + corner) { return 3; }
+        return 0;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        LayerState model = state;
+        App app = this.FindApp();
+        if (e.handled || model == null || app == null || !model.open
+        || app.GetCapturedPointer() != null || e.originalSource != this
+        || app.window.EventButton() != 0) { return; }
+        direction = this.ResizeAt(e.x, e.y);
+        if (direction == 0 && !this.TitleAt(e.x, e.y)) { return; }
+        if (direction == 0 && model.state == 2) { return; }
+        moving = direction == 0; sizing = direction != 0;
+        model.dragging = moving; model.sizing = sizing;
+        model.autoCenter = false; model.sizeMinW = 0;
+        Layer.RegisterOpen(app, model);
+        model.grabDx = e.x - model.x; model.grabDy = e.y - model.y;
+        if (sizing) {
+            model.rDir = direction; model.rStartX = model.x; model.rStartY = model.y;
+            model.rStartW = model.w; model.rStartH = model.h;
+            model.grabDx = e.x; model.grabDy = e.y;
+        }
+        pointerId = e.pointerType;
+        app.CapturePointer(this, true);
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        base.OnPointerMove(e);
+        LayerState model = state; App app = this.FindApp();
+        if (model == null || app == null) { return; }
+        if (app.GetCapturedPointer() != this || (!moving && !sizing)
+        || e.pointerType != pointerId) { return; }
+        if (moving) {
+            model.x = e.x - model.grabDx; model.y = e.y - model.grabDy;
+            if (model.x < 0) { model.x = 0; }
+            if (model.y < app.titlebarH) { model.y = app.titlebarH; }
+            int maxX = app.canvas.Width() - bw; if (maxX < 0) { maxX = 0; }
+            if (model.x > maxX) { model.x = maxX; }
+            int maxY = app.canvas.Height() - bh; if (maxY < app.titlebarH) { maxY = app.titlebarH; }
+            if (model.y > maxY) { model.y = maxY; }
+        } else { Layer.ApplyResize(app, model, e.x, e.y); }
+        this.MeasureTree(app); this.Arrange(0, 0, 0, 0);
+        app.RequestRedraw(); e.Handle();
+    }
+
+    void EndGesture(RoutedEventArgs e) {
+        LayerState model = state; App app = this.FindApp();
+        moving = false; sizing = false; direction = 0; pointerId = -1;
+        if (model != null) { model.dragging = false; model.sizing = false; }
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        if (app != null) { app.RequestRedraw(); }
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App app = this.FindApp();
+        if ((moving || sizing) && app != null && app.window.EventButton() == 0) {
+            this.OnPointerMove(e);
+            this.EndGesture(e);
+        }
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e); this.EndGesture(e);
+    }
+
+    Control Body() {
+        LayerState model = state;
+        // Retirement must still see the old borrowed subtree after open/state changes.
+        return model != null ? (model.wrap != null ? (Control)model.wrap : model.view) : null;
+    }
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        Control body = this.Body();
+        if (body == null) { return children; }
+        if (children == null) { children = new List<Control>(); }
+        if (!children.Contains(body)) { children.Add(body); }
+        return children;
+    }
+
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child != null && child == this.Body());
+    }
+
+    protected override bool LayoutChildVisible(Control child) {
+        LayerState model = state;
+        return model != null && model.open && (child != this.Body() || model.state != 2);
+    }
+
+    protected override int LayoutRevision() {
+        LayerState model = state;
+        return model != null ? model.inputGeneration : 0;
+    }
+
+    public override bool ContainsHostedControl(Control control) {
+        Control body = this.Body();
+        return base.ContainsHostedControl(control) || (body != null && body.ContainsHostedControl(control));
+    }
+    public override bool ContainsInputControl(Control control) {
+        Control body = this.Body();
+        return base.ContainsInputControl(control) || (body != null && body.ContainsInputControl(control));
+    }
+    public override Control FindInputFocus(App app) {
+        Control body = this.Body();
+        Control focused = body != null ? body.FindInputFocus(app) : null;
+        return focused != null ? focused : base.FindInputFocus(app);
+    }
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        base.CollectInputFocus(app, controls);
+        Control body = this.Body();
+        if (body != null) { body.CollectInputFocus(app, controls); }
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        LayerState model = state;
+        if (model == null || !model.open || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        App app = this.FindApp();
+        if (model.state == 2 && (app == null || !Layer.Contains(app, model, x, y))) { return null; }
+        if (this.ResizeAt(x, y) != 0) { return this; }
+        Control body = this.Body();
+        if (body != null && Layer.Inside(x, y, bodyBounds.x, bodyBounds.y, bodyBounds.width, bodyBounds.height)) {
+            Control hit = body.HitTest(x, y, pointerType, excludedSubtrees);
+            if (hit != null) { return hit; }
+        }
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
+    }
+    public override void OnClick(RoutedEventArgs e) {
+        LayerState model = state;
+        App app = this.FindApp();
+        if (model != null && model.open && model.state == 2 && e.originalSource == this
+        && app != null && this.TitleAt(e.x, e.y)) {
+            model.state = 0; app.RequestRedraw(); e.Handle();
+        }
+    }
+
+    public override int PointerCursor() { return 6; }
+}
+
+class LayerWindowAction {
+    weak LayerState owner;
+    public LayerWindowAction(LayerState model) { owner = model; }
+    public void Run(int command) {
+        LayerState model = owner;
+        if (model == null || !model.open) { return; }
+        if (command == 3) { Layer.Close(model.inputApp, model); return; }
+        if (command == 1) {
+            if (model.state == 0) {
+                model.sx = model.x; model.sy = model.y; model.sw = model.w; model.sh = model.h;
+            }
+            model.state = model.state == 2 ? 0 : 2;
+        } else if (command == 2) {
+            if (model.state == 1) {
+                model.state = 0; model.x = model.sx; model.y = model.sy;
+                model.w = model.sw; model.h = model.sh;
+            } else {
+                if (model.state == 0) {
+                    model.sx = model.x; model.sy = model.y; model.sw = model.w; model.sh = model.h;
+                }
+                model.state = 1;
+            }
+        }
+        model.autoCenter = false; model.sizeMinW = 0;
+        if (model.inputApp != null) { model.inputApp.RequestRedraw(); }
+    }
+}
+
+class LayerWindowHost : Control, AppLoopParticipant, AppPreparationParticipant {
+    weak AppLoopRegistration registration;
+    weak App hostApp;
+    public List<LayerState> models = new List<LayerState>();
+    public List<LayerWindowControl> windows = new List<LayerWindowControl>();
+    List<LayerWindowControl> prepared = new List<LayerWindowControl>();
+    int preparation;
+    int deadline = -1;
+
+    public LayerWindowHost(App app) : base("layer-windows") {
+        hostApp = app; this.UseApp(app); wiresOwnEvents = true;
+        registration = app.RegisterLoopParticipant(app, this);
+    }
+
+    public override void OnMeasure(App app) {
+        prefW = app.canvas.Width(); prefH = app.canvas.Height();
+        for (int i = 0; i < windows.Count; i = i + 1) { windows[i].MeasureTree(app); }
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        App app = hostApp;
+        if (app != null) { pw = app.canvas.Width(); ph = app.canvas.Height(); }
+        bx = 0; by = 0; bw = pw; bh = ph;
+        int minimized = 0;
+        for (int i = 0; i < models.Count; i = i + 1) {
+            LayerState model = models[i];
+            if (model.open && model.state == 2) { model.minSlot = minimized; minimized = minimized + 1; }
+        }
+        for (int i = 0; i < windows.Count; i = i + 1) { windows[i].Arrange(0, 0, pw, ph); }
+    }
+
+    public override bool ChildControlsRenderedByOwner() { return true; }
+
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        if (windows.Count == 0) { return children; }
+        if (children == null) { children = new List<Control>(); }
+        for (int i = 0; i < windows.Count; i = i + 1) {
+            if (!children.Contains(windows[i])) { children.Add(windows[i]); }
+        }
+        return children;
+    }
+
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child is LayerWindowControl
+        && windows.Contains((LayerWindowControl)child));
+    }
+
+    protected override bool LayoutChildVisible(Control child) {
+        if (!(child is LayerWindowControl)) { return true; }
+        LayerState model = ((LayerWindowControl)child).state;
+        return model != null && model.open && models.Contains(model);
+    }
+
+    protected override int LayoutRevision() { return preparation; }
+
+    public void Sync(App app, List<LayerState> list) {
+        models.Clear(); models.AddRange(list);
+        for (int i = 0; i < models.Count; i = i + 1) {
+            LayerState model = models[i];
+            if (model.modal || (!model.open && !model.closing)) { continue; }
+            LayerWindowControl window = null;
+            for (int j = 0; j < windows.Count; j = j + 1) {
+                if (windows[j].state == model) { window = windows[j]; break; }
+            }
+            if (window == null) {
+                window = new LayerWindowControl(model);
+                window.UseApp(app);
+                windows.Add(window);
+            }
+        }
+        this.Prepare(app);
+    }
+
+    bool Prepare(App app) {
+        preparation = preparation + 1; int ticket = preparation;
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        List<LayerState> snapshot = new List<LayerState>(); snapshot.AddRange(models);
+        deadline = -1; prepared.Clear();
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            LayerState model = snapshot[i];
+            if (model.modal) { continue; }
+            if (!LayerPreparation.Advance(app, model)) { return false; }
+            if (preparation != ticket || app.rootControl != root || app.inputRootGeneration != generation
+            || app.window.EventSeq() != sequence) { return false; }
+            int due = model.open && model.AutoCloseMs > 0 && model.openMs > 0 ? model.openMs + model.AutoCloseMs : -1;
+            if (due >= 0 && (deadline < 0 || due < deadline)) { deadline = due; }
+        }
+        this.MeasureTree(app); this.Arrange(0, 0, app.canvas.Width(), app.canvas.Height());
+        // A successful endpoint rebind may stop this layout and resume on the next pass.
+        if (preparation != ticket || app.rootControl != root || app.inputRootGeneration != generation
+        || app.window.EventSeq() != sequence) { return true; }
+        prepared.Clear();
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            LayerState model = snapshot[i];
+            if ((!model.open && !model.closing) || model.modal) { continue; }
+            for (int j = 0; j < windows.Count; j = j + 1) {
+                if (windows[j].state == model) {
+                    if (!model.open) { windows[j].PrepareClosing(app, model); }
+                    prepared.Add(windows[j]); break;
+                }
+            }
+        }
+        Layer.FlushCloseRedraw(app);
+        return true;
+    }
+    public void BeforeInput(App app, int kind) {
+        if (!this.Prepare(app)) { app.InvalidatePreparation(); }
+    }
+    public void BeforePaint(App app, int frameSequence) {
+        if (!this.Prepare(app)) { app.InvalidatePreparation(); }
+    }
+    public void Tick(App app, int now) { if (deadline >= 0 && now >= deadline) { this.Prepare(app); } }
+    public int NextDeadline() { return deadline; }
+    public override void OnPaint(App app) {
+        for (int i = 0; i < prepared.Count; i = i + 1) { prepared[i].RenderTree(app); }
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        for (int i = models.Count - 1; i >= 0; i = i - 1) {
+            LayerState model = models[i];
+            if (!model.open || model.modal) { continue; }
+            for (int j = 0; j < windows.Count; j = j + 1) {
+                if (windows[j].state != model) { continue; }
+                Control hit = windows[j].HitTest(x, y, pointerType, excludedSubtrees);
+                if (hit != null) { return hit; }
+            }
+        }
+        return null;
+    }
+
+    void Raise(LayerState model) {
+        int at = models.IndexOf(model);
+        if (at >= 0 && at < models.Count - 1) { models.RemoveAt(at); models.Add(model); }
+    }
+}

@@ -1,0 +1,98 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace Gui;
+
+class OptionalAutomation : AppAutomationSession {
+    public int shown;
+    public int ticks;
+    public int presented;
+    public int traces;
+    public int stopped;
+    public void Shown(App app) { shown = shown + 1; }
+    public void Tick(App app) { ticks = ticks + 1; }
+    public void Presented(App app) { presented = presented + 1; }
+    public void TracePresent(App app, int stage, bool enter) { traces = traces + 1; }
+    public bool PreparationReasonPending(App app) { return true; }
+    public void TracePreparationReason(App app, string reason) { traces = traces + 1; }
+    public void Stopped(App app) { stopped = stopped + 1; }
+}
+
+class GuiOptionalFeatures {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void Main() {
+        Html.Install();
+        ControlBootstrap.Install();
+        Form form = Form.CreateOffscreen("optional features", 640, 480);
+        App app = form.GetApp();
+        HtmlDoc doc = Html.Parse("<div id=\"page\">"
+        + "<input id=\"query\" bind=\"query\">"
+        + "<span id=\"conditional\" :visible=\"shown\">Visible</span>"
+        + "<template data-for=\"items\"><span bind=\"name\"></span></template>"
+        + "</div>", "", null);
+        Control page = doc.root.Children[0];
+        form.Add(page);
+        JsonValue model = JsonValue.Parse("{\"query\":\"initial\",\"shown\":true,\"items\":[{\"name\":\"first\"}]}");
+        ModelBinder binder = new ModelBinder();
+        binder.SetRoot(page, model);
+        app.RegisterModelHost(binder);
+        binder.Wire();
+        Check(app.ModelHostCount() == 1 && binder.HostApp() == app, "real binder registered through host contract");
+        Check(page.ChildCount() == 4 && page.ChildAt(3).GetProp("text") == "first", "HTML template expanded through real clone registration");
+        Control input = page.Find("query");
+        Control conditional = page.Find("conditional");
+        Check(input != null && conditional != null, "HTML controls exist");
+        model.PathSet("query", "from model");
+        model.PathSet("shown", "false");
+        form.CaptureSnapshot();
+        Check(input.GetProp("value") == "from model", "host layout synchronizes input binding");
+        Check(!conditional.visible, "host layout synchronizes conditional visibility");
+        input.SetProp("value", "from control");
+        form.CaptureSnapshot();
+        JsonValue query = model.Get("query");
+        Check(query != null && query.AsString("") == "from control", "host presentation writes back input");
+        app.UnregisterModelHost(binder);
+        Check(app.ModelHostCount() == 0 && binder.HostApp() == null, "binder detached");
+
+        OptionalAutomation session = new OptionalAutomation();
+        app.SetAutomationSession(session);
+        app.AutomationShown();
+        app.TickAutomation();
+        app.TraceFullPresent(21, true);
+        app.AutomationPresented();
+        Check(session.shown == 1 && session.ticks == 1 && session.presented == 1 && session.traces == 1,
+        "core session hooks dispatch only to the installed session");
+        app.SetAutomationSession(null);
+        Check(session.stopped == 1, "replacing automation ends its session");
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        Environment.SetEnvironmentVariable("ZAN_FRAME_PROF", "");
+        UiDriver.Enable(app);
+        Check(app.AutomationSession() != null && !UiDriver.Active(), "real automation opt-in keeps unset scripts idle");
+        app.SetAutomationSession(null);
+
+        Check(!app.HasThemeSettings() && !app.showThemeButton, "theme UI starts absent");
+        ThemeSettings.Enable(app);
+        Check(app.HasThemeSettings() && app.showThemeButton, "explicit theme entry installs caption behavior");
+        app.InvokeThemeSettings();
+        ThemeDrawer drawer = app.themeDrawer != null ? (ThemeDrawer)app.themeDrawer : null;
+        Check(drawer != null && drawer.IsOpen() && app.overlayHost.ActiveRoot() == drawer, "installed theme action opens real retained drawer");
+        app.InvokeThemeSettings();
+        Check(!drawer.IsOpen() && !app.overlayHost.HasActive(), "same action closes the real drawer");
+        Check(app.showCloseButton && app.showMinimizeButton && app.showMaximizeButton, "system window buttons survive feature opt-in");
+
+        Check(app.FrameDiagnostics() == null, "diagnostics start absent");
+        GuiFrameProfiler.Enable(app);
+        Check(app.FrameDiagnostics() is GuiFrameProfiler, "real profiler installs explicitly");
+        app.StopLoop();
+        Check(app.AutomationSession() == null && app.ModelHostCount() == 0 && app.themeDrawer == null,
+        "stopping clears optional sessions and retained settings");
+        app.canvas.Destroy();
+        Console.WriteLine("GUI_OPTIONAL_FEATURES_OK");
+    }
+}

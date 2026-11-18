@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class CullMeasurePaintProbe : Control {
+    public int paints;
+    public CullMeasurePaintProbe(string id, int height) {
+        this.InitControl(id, 0);
+        this.Prefer(100, height);
+    }
+    public override void OnPaint(App app) { paints = paints + 1; }
+}
+
+class CullMeasureReentryInput : Input {
+    public weak ScrollColumn column;
+    public bool armed;
+    public CullMeasureReentryInput() : base("") { }
+    public override void OnInputFocusLost() {
+        base.OnInputFocusLost();
+        ScrollColumn owner = column;
+        if (!armed || owner == null) { return; }
+        armed = false;
+        owner.SetScrollTop(0);
+        owner.Arrange(owner.bx, owner.by, owner.bw, owner.bh);
+    }
+}
+
+class ScrollColumnCullMeasureTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("ScrollColumn cull measure: " + label); }
+    }
+    static Control Row(string id, int height) {
+        Control row = new Control(id);
+        row.SetProp("style", "display:block");
+        CullMeasurePaintProbe content = new CullMeasurePaintProbe(id + "-content", height);
+        row.Add(content);
+        return row;
+    }
+    static void Layout(App app, ScrollColumn column) {
+        column.MeasureTree(app);
+        column.Arrange(20, 20, 200, 100);
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame();
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+    }
+    static void NaturalExtent(App app) {
+        ScrollColumn column = new ScrollColumn();
+        column.UseApp(app);
+        Control a = Row("short", 40);
+        Control b = Row("tall", 336);
+        Control c = Row("last", 128);
+        column.Add(a); column.Add(b); column.Add(c);
+        Layout(app, column);
+        app.SetRootControl(column);
+        Check(a.prefH == 40 && b.prefH == 336 && c.prefH == 128 && column.scrollExtent == 504,
+            "natural subtree heights establish extent");
+        column.SetScrollTop(404);
+        Layout(app, column);
+        for (int pass = 0; pass < 4; pass = pass + 1) {
+            Layout(app, column);
+            Check(a.visible && b.visible && c.visible, "viewport never rewrites author visible");
+            Check(a.prefH == 40 && b.prefH == 336 && c.prefH == 128
+                && column.scrollExtent == 504 && column.ScrollTop() == 404,
+                "offscreen subtree remeasure preserves height extent and offset");
+        }
+        CullMeasurePaintProbe first = (CullMeasurePaintProbe)a.ChildAt(0);
+        CullMeasurePaintProbe last = (CullMeasurePaintProbe)c.ChildAt(0);
+        first.paints = 0; last.paints = 0;
+        Paint(app, column);
+        Check(first.paints == 0 && last.paints == 1, "fully offscreen row is not painted");
+        column.SetScrollTop(0);
+        Layout(app, column);
+        Check(a.by == 20 && b.by == 60 && c.by == 396 && column.scrollExtent == 504,
+            "natural rows scroll back without losing later content");
+        first.paints = 0; last.paints = 0;
+        Paint(app, column);
+        Check(first.paints == 1 && last.paints == 0, "returning row paints while offscreen row stays culled");
+        b.visible = false;
+        Layout(app, column);
+        Check(!b.visible && column.scrollExtent == 168 && c.by == 60,
+            "author hidden row stays hidden and contributes no height");
+        column.SetScrollTop(68);
+        Layout(app, column);
+        Check(!b.visible && column.scrollExtent == 168, "scrolling never revives author hidden row");
+        b.visible = true;
+        column.SetScrollTop(0);
+        Layout(app, column);
+        Check(b.prefH == 336 && column.scrollExtent == 504, "author restores natural height");
+        b.SetProp("style", "display:none");
+        Layout(app, column);
+        Check(b.visible && !b.StyleVisible() && column.scrollExtent == 168,
+            "stylesheet hidden row contributes no extent without rewriting author flag");
+        b.SetProp("style", "display:block");
+        Layout(app, column);
+        Check(b.prefH == 336 && column.scrollExtent == 504, "stylesheet restores natural height");
+        app.SetRootControl(null);
+    }
+    static void InputClipAndRetirement(App app) {
+        Control outer = new Control("outer");
+        outer.UseApp(app);
+        ScrollColumn column = new ScrollColumn();
+        CullMeasureReentryInput editor = new CullMeasureReentryInput();
+        editor.Prefer(100, 40);
+        editor.column = column;
+        Control editorRow = new Control("editor-row");
+        editorRow.SetProp("style", "display:block");
+        editorRow.Add(editor);
+        column.Add(editorRow);
+        column.Add(Row("spacer", 300));
+        outer.Add(column);
+        outer.MeasureTree(app);
+        outer.Arrange(0, 0, 400, 400);
+        column.Arrange(20, 20, 200, 100);
+        app.SetRootControl(outer);
+        Paint(app, outer);
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        Check(editor.IsFocused(app) && app.GetCapturedPointer() == editor, "visible row owns focus and capture");
+        column.SetScrollTop(200);
+        column.Arrange(20, 20, 200, 100);
+        Check(editor.visible && editorRow.visible && !column.ChildInViewport(editorRow)
+            && !editor.IsFocused(app) && app.GetCapturedPointer() == null,
+            "viewport cull retires descendant focus and capture without hiding author");
+        Check(column.HitTest(30, 30) != editor && column.HitTest(30, 5) == null,
+            "offscreen child and outside viewport cannot receive pointer");
+        List<Control> endpoints = new List<Control>();
+        outer.CollectInputFocus(app, endpoints);
+        Check(!endpoints.Contains(editor), "nested viewport removes culled editor from tab candidates");
+        Check(!editor.InputFocusEligible(app, outer), "nested viewport rejects culled focus endpoint");
+        column.SetScrollTop(20);
+        column.Arrange(20, 20, 200, 100);
+        Check(column.HitTest(30, 25) == editor && column.HitTest(30, 10) == null,
+            "partially visible row hits only inside viewport");
+        column.SetScrollTop(0);
+        column.Arrange(20, 20, 200, 100);
+        Paint(app, outer);
+        editor.Focus(app);
+        app.CapturePointer(editor);
+        editor.armed = true;
+        column.SetScrollTop(200);
+        column.Arrange(20, 20, 200, 100);
+        Check(column.ScrollTop() == 0 && editor.by == 20 && editor.visible,
+            "retirement reentry owns final scroll and row geometry");
+        Check(app.GetCapturedPointer() == null, "retired capture stays released after reentry");
+        app.SetRootControl(null);
+    }
+    static void Main() {
+        App app = App.CreateOffscreen("ScrollColumn cull measure", 400, 400);
+        NaturalExtent(app);
+        InputClipAndRetirement(app);
+        app.canvas.Destroy();
+        Console.WriteLine("SCROLLCOLUMN_CULL_MEASURE_OK");
+    }
+}

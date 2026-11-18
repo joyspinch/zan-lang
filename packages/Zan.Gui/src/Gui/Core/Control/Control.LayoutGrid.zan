@@ -6,17 +6,9 @@ namespace Gui;
 
 // Control.LayoutGrid.zan - CSS Grid 容器尺寸度量与网格排布
 public partial class Control {
-    // grid 条目：可见、非定位、非 none 的直接子项（文档序）。
+    // Grid auto-placement follows stable CSS order, independently of z-index.
     List<Control> GridItems() {
-        List<Control> items = new List<Control>();
-        if (children == null || children.Count == 0) { return items; }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            if (!c.StyleVisible() || c.StylePosition() == 2
-                || c.StyleDisplay() == 2) { continue; }
-            items.Add(c);
-        }
-        return items;
+        return this.PlannedChildren(false, true);
     }
 
     // 条目外围宽（轨道尺寸用）：声明宽用声明值（包含块未定，%
@@ -33,66 +25,34 @@ public partial class Control {
         return h + c.StyleMarT() + c.StyleMarB();
     }
 
+    private int GridMeasureWidth() {
+        if (measureWidth < 0 && hintWrapW <= 0 && !this.StyleDeclaresWidthAbs()) { return 0 - 1; }
+        int width = this.WrapContentWidth();
+        return width > 0 ? width : 0;
+    }
+
     // 按内容测量一个 `display: grid` 容器：列轨先定宽（声明宽的容器
     // 按声明内容宽放大 fr/auto，auto 容器只按内容基尺寸），宽度相关
     // 的条目高度按所在列宽重测后定行轨。只填补留空的轴。
     void MeasureGridContent(App app) {
-        if (prefW > 0 && prefH > 0) { return; }
+        // Definite columns defer their childNodes here, even when both parent axes are authored.
+        if (prefW > 0 && prefH > 0 && (app == null || measureIntrinsic)) { return; }
         StyleBox sb = computedStyle;
         if (sb == null) { sb = new StyleBox(); }
         int colGap = this.StyleColGap(this.StyleGap());
         int rowGap = this.StyleRowGap(this.StyleGap());
-        List<GridTrack> colDefs = CssGrid.ParseTracks(sb.gridCols);
-        List<GridTrack> rowDefs = CssGrid.ParseTracks(sb.gridRows);
-        List<GridTrack> autoCols = CssGrid.ParseTracks(sb.gridAutoCols);
-        List<GridTrack> autoRows = CssGrid.ParseTracks(sb.gridAutoRows);
         List<Control> items = this.GridItems();
-        GridPlace pl = CssGrid.Place(items, colDefs.Count, rowDefs.Count);
-        // 列：跨 1 格条目的外围宽喂给 auto 轨道。
-        List<int> at = new List<int>();
-        List<int> sz = new List<int>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            GridItemSlot slot = pl.slots[i];
-            if (slot.colSpan != 1) { continue; }
-            at.Add(slot.colStart);
-            sz.Add(this.GridOuterW(items[i]));
-        }
-        int colAvail = 0 - 1;
-        if (this.StyleDeclaresWidthAbs()) {
-            colAvail = this.StyleWidthIn(0)
-                - this.StyleInsetL() - this.StyleInsetR();
-            if (colAvail < 0) { colAvail = 0; }
-        }
-        List<int> colW = CssGrid.SizeTracks(colDefs, autoCols, pl.nCols,
-                                         at, sz, colAvail, colGap);
-        // 行：高度依赖宽度的条目按所在列宽重测（流容器断行）。
-        at = new List<int>();
-        sz = new List<int>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            Control c = items[i];
-            GridItemSlot slot = pl.slots[i];
-            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
-                int inner = CssGrid.SpanSum(colW, colGap, slot.colStart,
-                                         slot.colSpan)
-                    - c.StyleMarL() - c.StyleMarR();
-                if (inner < 0) { inner = 0; }
-                c.HintWrapWidth(inner);
-                c.prefH = 0;
-                c.fillH = false;
-                c.MeasureFlow(null);
-            }
-            if (slot.rowSpan != 1) { continue; }
-            at.Add(slot.rowStart);
-            sz.Add(this.GridOuterH(items[i]));
-        }
+        GridLayoutPlan plan = this.PlanGrid(items);
+        GridPlace pl = plan.placement;
+        int colAvail = this.GridMeasureWidth();
+        List<int> colW = this.GridColumns(plan, items, colAvail, colGap);
         int rowAvail = 0 - 1;
         if (this.StyleDeclaresHeightAbs()) {
             rowAvail = this.StyleHeightIn(0)
                 - this.StyleInsetT() - this.StyleInsetB();
             if (rowAvail < 0) { rowAvail = 0; }
         }
-        List<int> rowH = CssGrid.SizeTracks(rowDefs, autoRows, pl.nRows,
-                                         at, sz, rowAvail, rowGap);
+        List<int> rowH = this.GridRows(measuringTree ? app : null, plan, items, colW, rowAvail, colGap, rowGap);
         int sumW = CssGrid.SpanSum(colW, colGap, 0, pl.nCols);
         int sumH = CssGrid.SpanSum(rowH, rowGap, 0, pl.nRows);
         if (prefH <= 0 && sumH > 0) {
@@ -115,45 +75,13 @@ public partial class Control {
         if (sb == null) { sb = new StyleBox(); }
         int colGap = this.StyleColGap(this.StyleGap());
         int rowGap = this.StyleRowGap(this.StyleGap());
-        List<GridTrack> colDefs = CssGrid.ParseTracks(sb.gridCols);
-        List<GridTrack> rowDefs = CssGrid.ParseTracks(sb.gridRows);
-        List<GridTrack> autoCols = CssGrid.ParseTracks(sb.gridAutoCols);
-        List<GridTrack> autoRows = CssGrid.ParseTracks(sb.gridAutoRows);
         List<Control> items = this.GridItems();
-        GridPlace pl = CssGrid.Place(items, colDefs.Count, rowDefs.Count);
-        List<int> at = new List<int>();
-        List<int> sz = new List<int>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            GridItemSlot slot = pl.slots[i];
-            if (slot.colSpan != 1) { continue; }
-            at.Add(slot.colStart);
-            sz.Add(this.GridOuterW(items[i]));
-        }
+        GridLayoutPlan plan = this.PlanGrid(items);
+        GridPlace pl = plan.placement;
         if (cw < 0) { cw = 0; }
-        List<int> colW = CssGrid.SizeTracks(colDefs, autoCols, pl.nCols,
-                                         at, sz, cw, colGap);
-        at = new List<int>();
-        sz = new List<int>();
-        for (int i = 0; i < items.Count; i = i + 1) {
-            Control c = items[i];
-            GridItemSlot slot = pl.slots[i];
-            if (!c.StyleDeclaresHeightAbs() && c.StyleDisplay() == 3) {
-                int inner = CssGrid.SpanSum(colW, colGap, slot.colStart,
-                                         slot.colSpan)
-                    - c.StyleMarL() - c.StyleMarR();
-                if (inner < 0) { inner = 0; }
-                c.HintWrapWidth(inner);
-                c.prefH = 0;
-                c.fillH = false;
-                c.MeasureFlow(null);
-            }
-            if (slot.rowSpan != 1) { continue; }
-            at.Add(slot.rowStart);
-            sz.Add(this.GridOuterH(items[i]));
-        }
         if (ch < 0) { ch = 0; }
-        List<int> rowH = CssGrid.SizeTracks(rowDefs, autoRows, pl.nRows,
-                                         at, sz, ch, rowGap);
+        List<int> colW = this.GridColumns(plan, items, cw, colGap);
+        List<int> rowH = this.GridRows(null, plan, items, colW, ch, colGap, rowGap);
         for (int i = 0; i < items.Count; i = i + 1) {
             Control c = items[i];
             GridItemSlot slot = pl.slots[i];

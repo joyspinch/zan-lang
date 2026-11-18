@@ -15,9 +15,9 @@ public class Calendar : Control {
     // 显示模式：month | panel（Binding<string>，设计器可读写）。
     public Binding<string> Mode;
     // 双向绑定选中日期字符串 (YYYY-MM-DD)
-    public Binding<string> data;
+    public Binding<string> Value;
     // 选中日期（当天 00:00）；null = 未选。
-    public DateTime selected;
+    private DateTime selected;
     // 视图所在年月：跟随选中日、翻页箭头与"今天"。
     public int viewYear;
     // 视图所在月（1–12）。
@@ -66,6 +66,7 @@ public class Calendar : Control {
 
         DateTime today = DateTime.Now();
         selected = Calendar.DayOf(today);
+        Value = selected.ToDateString();
         viewYear = today.Year();
         viewMonth = today.Month();
 
@@ -151,7 +152,12 @@ public class Calendar : Control {
     // ---- 取值 / 设值 ------------------------------------------------
 
     // 选中日期；panel 的"清除"之后为 null。
-    public DateTime GetDate() { return selected; }
+    public DateTime GetDate() { this.SyncBinding(); return selected; }
+
+    // 绘制只观察准备阶段已同步的选择，不读取绑定或更新日期子树。
+    internal bool IsSelectedDate(DateTime value) {
+        return selected != null && selected.Equals(value);
+    }
 
     // 程序化设值（归一化到当天 00:00 并把视图带到该月），
     // 不触发 Change——与 Input.SetText 的语义一致。
@@ -159,6 +165,7 @@ public class Calendar : Control {
         if (value == null) { this.ClearDate(); return; }
         DateTime d = Calendar.DayOf(value);
         selected = d;
+        Value.Set(d.ToDateString());
         viewYear = d.Year();
         viewMonth = d.Month();
         this.SyncCalendarView(null);
@@ -168,7 +175,7 @@ public class Calendar : Control {
     public void ClearDate() {
         if (selected == null) { return; }
         selected = null;
-        if (data != null) { data.Set(""); }
+        if (Value != null) { Value.Set(""); }
         this.SyncCalendarView(null);
         Change.RaiseS(this);
     }
@@ -227,14 +234,14 @@ public class Calendar : Control {
     public void PickDate(DateTime picked) {
         if (this.IsDayDisabled(picked)) { return; }
         bool monthChanged = picked.Month() != viewMonth
-            || picked.Year() != viewYear;
+        || picked.Year() != viewYear;
         bool valueChanged = selected == null || !selected.Equals(picked);
         selected = picked;
         viewYear = picked.Year();
         viewMonth = picked.Month();
         this.SyncCalendarView(null);
         if (valueChanged) {
-            if (data != null) { data.Set(selected != null ? selected.ToDateString() : ""); }
+            if (Value != null) { Value.Set(selected != null ? selected.ToDateString() : ""); }
             Change.RaiseS(this);
         }
         if (monthChanged) { PanelChange.RaiseS(this); }
@@ -250,7 +257,7 @@ public class Calendar : Control {
     // ---- 声明式子树构建与状态同步 -------------------------------------
 
     public void BuildTree() {
-        this.children.Clear();
+        this.RemoveAll();
 
         // 1. 头部栏
         headerBox = new Control();
@@ -359,25 +366,25 @@ public class Calendar : Control {
     public override string Kind() { return "Calendar"; }
 
     // 覆写：返回设计器属性清单（text/mode/data/value）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec text = PropSpec.Text("text", "Date");
-        text.str = data;
+        PropSpec text = PropSpec.Text("text", "Date").DefaultBinding();
+        text.Field("Value", 0);
         text.Also("value");
         text.Also("data");
         text.WithTip("Selected date in YYYY-MM-DD; empty = none (cleared).");
         ps.Add(text);
         PropSpec mode = PropSpec.Enum("mode", "Mode",
-            new List<string>{ "month", "panel" });
-        mode.str = Mode;
+        new List<string>{ "month", "panel" });
+        mode.Field("Mode", 0);
         ps.Add(mode);
         return ps;
     }
 
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            string val = data.Get();
+        if (Value != null) {
+            string val = Value.Get();
             if (val == "" || val == null) {
                 if (selected != null) { selected = null; }
             } else {
@@ -392,11 +399,12 @@ public class Calendar : Control {
                 }
             }
         }
+        this.SyncCalendarView(this.FindApp());
     }
 
     public override string GetProp(string key) {
         if (key == "data" || key == "value" || key == "text") {
-            if (data != null) { return data.Get(); }
+            if (Value != null) { return Value.Get(); }
             if (selected == null) { return ""; }
             return selected.ToDateString();
         }
@@ -406,7 +414,7 @@ public class Calendar : Control {
 
     public override void SetProp(string key, string val) {
         if (key == "data" || key == "value" || key == "text") {
-            if (data != null) { data.Set(val); }
+            if (Value != null) { Value.Set(val); }
             DateTime d = DateTime.ParseDate(val);
             if (d != null) {
                 selected = d;
@@ -429,8 +437,7 @@ public class Calendar : Control {
     // 设计器读取选中日期（"text"/"value"/"data" 同键，YYYY-MM-DD；未选返回 ""）。
     public override string GetExtra(string key) {
         if (key == "text" || key == "value" || key == "data") {
-            if (selected == null) { return ""; }
-            return selected.ToDateString();
+            return Value.Get();
         }
         return "";
     }
@@ -441,10 +448,7 @@ public class Calendar : Control {
         if (key == "text" || key == "value" || key == "data") {
             DateTime d = DateTime.ParseDate(val);
             if (d == null) { return true; }
-            selected = d;
-            viewYear = d.Year();
-            viewMonth = d.Month();
-            this.SyncCalendarView(null);
+            this.SetDate(d);
             return true;
         }
         return false;
@@ -463,7 +467,7 @@ public class Calendar : Control {
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "PanelChange") { PanelChange.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -471,7 +475,7 @@ public class Calendar : Control {
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "PanelChange") { PanelChange.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
     // ---- 测量与绘制 --------------------------------------------------
@@ -479,7 +483,7 @@ public class Calendar : Control {
     // 覆写：按模式量首选尺寸——面板模式紧凑，月历默认 600x340
     public override void OnMeasure(App app) {
         StyleBox s = this.ResolveStyleCached(app, "calendar", Class,
-                                             Style.SNormal());
+        Style.SNormal());
         if (Mode != null && Mode.Get() == "panel") {
             prefW = s.WidthOr(app.Scale(250));
             prefH = s.HeightOr(app.Scale(32 + 24 + 6 * 28 + 36));
@@ -563,9 +567,6 @@ public class Calendar : Control {
     }
 
     public override void OnPaint(App app) {
-        this.SyncBinding();
-        this.SyncCalendarView(app);
-
         // 网格细分割线（按主题 border token 绘制）
         Canvas c = app.canvas;
         bool isPanel = (Mode != null && Mode.Get() == "panel");
@@ -598,7 +599,7 @@ public class Calendar : Control {
         string toneCls = Calendar.ToneClass(tone);
         if (toneCls != "") { cls = Class + " " + toneCls; }
         StyleBox ms = this.ResolvePartAs(app, "calendar", "mark", "", cls,
-                                         Style.SNormal());
+        Style.SNormal());
         return ms.FgOr(fallback != 0 ? fallback : Calendar.ToneColor(app, tone));
     }
 }
@@ -632,22 +633,31 @@ public class CalendarCell : Control {
     public override void OnPaint(App app) {
         Canvas c = app.canvas;
         if (calendar == null || date == null) { return; }
-        Theme t = app.theme;
         bool en = !calendar.IsDisabled();
         bool dis = calendar.IsDayDisabled(date);
         bool inMonth = (date.Month() == calendar.viewMonth && date.Year() == calendar.viewYear);
-        bool sel = (calendar.selected != null && calendar.selected.Equals(date));
+        bool sel = calendar.IsSelectedDate(date);
         bool isToday = date.Equals(Calendar.TodayRef());
 
-        // 选中或悬停底色
+        int state = Style.SNormal();
+        if (!en || dis) { state = Style.SDisabled(); }
+        else if (this.isHovered) { state = Style.SHover(); }
+        if (sel) { state = state | Style.SSelected(); }
+        string cls = calendar.Class;
+        if (!inMonth) { cls = cls + " secondary"; }
+        StyleBox cellS = calendar.ResolvePartAs(app, "calendar", "cell", "label", cls, state);
+        int bg = cellS.BgOr(0);
+        int fg = cellS.FgOr(0);
         if (sel) {
-            c.FillRoundRect(bx + 1, by + 1, bw - 2, bh - 2, app.Scale(3), t.primary);
-        } else if (this.isHovered && en && !dis) {
-            c.FillRoundRect(bx + 1, by + 1, bw - 2, bh - 2, app.Scale(3), t.bgHover);
+            StyleBox dayS = calendar.ResolvePartAs(app, "calendar", "day", "", calendar.Class, state);
+            bg = dayS.BgOr(bg);
+            fg = dayS.FgOr(fg);
+        }
+        if (bg != 0) {
+            c.FillRoundRect(bx + 1, by + 1, bw - 2, bh - 2, app.Scale(3), bg);
         }
 
         // 日期数字
-        int fg = sel ? 0xFFFFFFFF : (dis ? t.textDisabled : (inMonth ? t.textPrimary : t.textSecondary));
         int fs = Style.FontFallback(app, "small");
         int nx = bx + app.Scale(7);
         int ny = by + app.Scale(5);

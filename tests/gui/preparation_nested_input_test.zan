@@ -1,0 +1,80 @@
+using System;
+using Gui;
+namespace Gui;
+
+// UNCOMPILED real dispatch counterexample for parent-review Core proposal.
+class PreparationInputProbe : Control {
+    public int downs; public int ups; public int clicks;
+    public PreparationInputProbe() { this.InitControl("preparationInputProbe", 0); }
+    public override void OnPaint(App app) {
+        app.hitTester.RegisterRect(this.WidgetId(), bx, by, bw, bh, 3);
+    }
+    public override void OnPointerDown(RoutedEventArgs e) { downs = downs + 1; }
+    public override void OnPointerUp(RoutedEventArgs e) { ups = ups + 1; }
+    public override void OnClick(RoutedEventArgs e) { clicks = clicks + 1; e.Handle(); }
+}
+class PreparationNestedParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public weak Control owner;
+    public bool armed;
+    public int afterInnerGesture; public long afterInnerSequence;
+    public int afterInnerFocus; public int afterInnerMouseX; public int afterInnerMouseY;
+    public bool afterInnerHandled; public int afterInnerRouteGesture;
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+    public void BeforePaint(App app, int frameSequence) { }
+    public void BeforeInput(App app, int kind) {
+        if (!armed || kind != 2) { return; }
+        armed = false;
+        app.ProcessOffscreenInput(2, 210, 30, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 210, 30, 0, 0, 0, 0);
+        afterInnerGesture = app.pointerGestureTicket;
+        afterInnerSequence = app.window.EventSeq();
+        afterInnerFocus = app.focus.focusedId;
+        afterInnerMouseX = app.mouseX; afterInnerMouseY = app.mouseY;
+        afterInnerHandled = app.routedWindowHandled;
+        afterInnerRouteGesture = app.routedWindowGestureTicket;
+        // This participant's own work ends here; no old ownership is published.
+    }
+}
+class PreparationTailParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public int calls;
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+    public void BeforeInput(App app, int kind) { calls = calls + 1; }
+    public void BeforePaint(App app, int frameSequence) { }
+}
+class PreparationNestedInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Main() {
+        App app = App.CreateOffscreen("nested preparation", 320, 180);
+        PreparationInputProbe root = new PreparationInputProbe();
+        PreparationInputProbe left = new PreparationInputProbe();
+        PreparationInputProbe right = new PreparationInputProbe();
+        root.Add(left); root.Add(right); root.UseApp(app); root.MeasureTree(app);
+        root.Arrange(0, 0, 320, 180); left.Arrange(10, 10, 120, 100); right.Arrange(170, 10, 120, 100);
+        app.SetRootControl(root);
+        app.BeginOffscreenFrame(); root.RenderTree(app); app.EndOffscreenFrame();
+        PreparationNestedParticipant nested = new PreparationNestedParticipant(); nested.owner = root;
+        PreparationTailParticipant tail = new PreparationTailParticipant();
+        AppLoopRegistration first = app.RegisterLoopParticipant(root, nested);
+        AppLoopRegistration second = app.RegisterLoopParticipant(root, tail);
+        nested.armed = true;
+        // Outer Down on A never reaches snapshots/routes/fallback after the
+        // participant legally completes a newer Down+Up on B.
+        app.ProcessOffscreenInput(2, 30, 30, 0, 0, 0, 0);
+        Check(left.downs == 0 && left.ups == 0 && left.clicks == 0, "old outer route abandoned");
+        Check(right.downs == 1 && right.ups == 1 && right.clicks == 1, "new inner pair delivered once");
+        Check(tail.calls == 2, "old phase skips tail; two distinct inner events run it");
+        Check(!app.pointerDown && app.GetCapturedPointer() == null, "old Down cannot recreate press/capture");
+        Check(app.window.EventSeq() == nested.afterInnerSequence
+            && app.pointerGestureTicket == nested.afterInnerGesture
+            && app.routedWindowGestureTicket == nested.afterInnerRouteGesture
+            && app.routedWindowHandled == nested.afterInnerHandled,
+            "outer dispatch cannot overwrite newer sequence gesture or handled");
+        Check(app.focus.focusedId == nested.afterInnerFocus
+            && app.mouseX == nested.afterInnerMouseX && app.mouseY == nested.afterInnerMouseY,
+            "outer ConsumeRoutedInput/legacy never reads inner kind or restores old coordinates");
+        first.Invalidate(); second.Invalidate(); app.SetRootControl(null); app.canvas.Destroy();
+        Console.WriteLine("preparation-nested-input:ok");
+    }
+}

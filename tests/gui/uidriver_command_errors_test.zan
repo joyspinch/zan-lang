@@ -1,0 +1,71 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Backend;
+
+class UiDriverCommandErrorsTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("UiDriver commands: " + message); }
+    }
+
+    static string Session(string name, string script) {
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        App app = new App("UiDriver command results", 240, 160);
+        try {
+            app.Show();
+            string folder = Environment.CurrentDirectory + "/" + name;
+            Directory.CreateDirectoryRecursive(folder);
+            Directory.CreateDirectoryRecursive(folder + "/blocked");
+            File.WriteAllText(folder + "/script.uidrv", script);
+            Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", folder + "/script.uidrv");
+            Environment.SetEnvironmentVariable("ZAN_UI_OUT", folder);
+            UiDriver.Begin(app);
+            for (int turn = 0; turn < 20 && !UiDriver.finished; turn++) {
+                UiDriver.Tick();
+                if (UiDriver.waitFullPresent) {
+                    Check(app.SafeFrame(() => {
+                        app.canvas.FillRect(0, 0, 240, 160, 0xff18232d);
+                    }), "real barrier presents");
+                    Check(!UiDriver.waitFullPresent, "real barrier acknowledged");
+                }
+            }
+            Check(UiDriver.finished, "session completed");
+            return File.ReadAllText(folder + "/results.log");
+        } finally {
+            app.UnfreezeAnimClock();
+            UiDriver.active = false;
+            app.window.Destroy();
+            app.canvas.Destroy();
+        }
+    }
+
+    static int Main() {
+        Directory.CreateDirectoryRecursive("build/test-out/gui-uidriver-command-errors");
+        Environment.SetCurrentDirectory("build/test-out/gui-uidriver-command-errors");
+        Environment.SetEnvironmentVariable("ZAN_FRAME_PROF", "1");
+        string valid = Session("valid", "freeze clock 600000\nredraw full\nunfreeze clock\nassert probe missing equals \"\"\nquit\n");
+        Check(valid.Contains("DONE pass=1 fail=0 command_errors=0"), "positive result");
+        Check(!valid.Contains("COMMAND ERROR"), "positive has no errors");
+        string rejected = Session("rejected",
+        "# physical script line retained\nredraw partial\nfreeze wrong\nunfreeze clock 600000\n"
+        + "clickid @missing\nclickid -1\nunknown-command\ndump\n"
+        + "dump pixels invalid.bin 0\ndump pixels blocked 0 0 1 1\n"
+        + "dump probe absent\ndump unknown out\nassert\nassert probe absent invalid x\nquit\n");
+        Check(rejected.Contains("COMMAND ERROR line=4 unfreeze: expected clock"), "physical command line");
+        Check(rejected.Contains("dump pixels FAILED"), "actual pixel write failure");
+        Check(rejected.Contains("DONE pass=0 fail=0 command_errors=13"), "each rejection counted once");
+        string assertion = Session("assertion", "assert probe missing equals expected\nquit\n");
+        Check(assertion.Contains("ASSERT FAIL") && assertion.Contains("DONE pass=0 fail=1 command_errors=0"),
+        "assertion failures stay separate from command errors");
+        string exception = Session("exception", "log initialized\n");
+        // Runtime client-dev must still throw its original exception type.
+        bool caught = false;
+        try { UiDriver.Exec("client-dev 643 481"); }
+        catch (InvalidOperationException ex) { caught = true; }
+        Check(caught, "original command exception type propagates");
+        Check(File.ReadAllText("exception/results.log").Contains("COMMAND ERROR line=0 command threw"),
+        "exception recorded once for direct Exec");
+        Console.WriteLine("uidriver command errors ok");
+        return 0;
+    }
+}

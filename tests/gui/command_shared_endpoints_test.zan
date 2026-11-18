@@ -1,0 +1,111 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class SharedCommandOwner : UiCommandOwner {
+    public bool Enabled = true;
+    public bool Checked;
+    public int Calls;
+    public weak UiCommand MutatingCommand;
+    public int Mutation;
+    public bool CanExecuteCommand(int key) {
+        UiCommand command = MutatingCommand;
+        if (command != null && Mutation == 1) { command.Detach(); }
+        if (command != null && Mutation == 2) { command.Key = 8; }
+        return Enabled && key == 7;
+    }
+    public bool IsCommandChecked(int key) { return Checked && key == 7; }
+    public void ExecuteCommand(int key) { Calls = Calls + 1; Checked = !Checked; }
+}
+
+class SharedCommandRibbon {
+    public weak Ribbon Endpoint;
+    public UiCommand Command;
+    public void Selected() {
+        Ribbon endpoint = Endpoint;
+        if (endpoint != null && endpoint.lastAct == Command.Key) { Command.TryExecute(); }
+    }
+}
+
+class SharedCommandWitness { public weak SharedCommandOwner Owner; }
+
+class CommandSharedEndpointsTest {
+    static void Check(bool value, string message) { if (!value) { throw new Exception(message); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Layout(App app, Control root, int width, int height) {
+        app.SetRootControl(root); root.MeasureTree(app); root.Arrange(10, 10, width, height);
+    }
+    static void Click(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "real endpoint layout");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static void Paint(App app, Control root) {
+        app.BeginOffscreenFrame(); root.RenderTree(app); app.overlayHost.RenderAll(app); app.EndOffscreenFrame();
+    }
+    static void SharedEndpoints() {
+        App app = App.CreateOffscreen("shared command endpoints", 720, 400);
+        SharedCommandOwner owner = new SharedCommandOwner();
+        UiCommand command = new UiCommand(owner, 7, "Debug").Shortcut(116, 0, 5);
+        Panel root = Panel.Column(); Button button = new Button("Debug"); root.Add(button);
+        command.Bind(button.Click);
+        Layout(app, root, 680, 360); Click(app, button);
+        Check(owner.Calls == 1 && command.IsChecked(), "button executes and checked reads live owner");
+        Paint(app, root); Paint(app, root);
+        Check(owner.Calls == 1, "paint does not execute command");
+
+        Ribbon ribbon = new Ribbon(); RibbonGroup group = new RibbonGroup("Run");
+        RibbonItem item = RibbonItem.Large("bug", command.Text); item.act = command.Key; group.Add(item); ribbon.AddGroup(group);
+        SharedCommandRibbon bridge = new SharedCommandRibbon(); bridge.Endpoint = ribbon; bridge.Command = command;
+        ribbon.CommandClicked.Add(bridge.Selected);
+        Layout(app, ribbon, 680, Ribbon.HeightGroups(app));
+        Click(app, ribbon.ChildAt(0).ChildAt(0).ChildAt(0));
+        Check(owner.Calls == 2 && !command.IsChecked(), "ribbon uses same command and checked state");
+
+        Layout(app, root, 680, 360);
+        ContextMenu menu = new ContextMenu(); menu.AddItem(command.Text, command.Invoke);
+        menu.ShowAt(app, 30, 30); Click(app, menu.ChildAt(0));
+        Check(owner.Calls == 3 && !menu.IsOpen(), "context menu executes same command once");
+        Check(command.HandleShortcut(5, 116, 0) && owner.Calls == 4, "shortcut executes same command");
+        Check(!command.HandleShortcut(4, 116, 0) && !command.HandleShortcut(5, 116, 1)
+            && owner.Calls == 4, "shortcut checks event and modifiers");
+
+        app.Post(command.Invoke); owner.Enabled = false; Drain(app);
+        Click(app, button);
+        Check(!command.CanExecute() && owner.Calls == 4, "queued and button actions recheck live availability");
+        menu.ShowAt(app, 30, 30); Click(app, menu.ChildAt(0));
+        Check(owner.Calls == 4 && command.HandleShortcut(5, 116, 0), "disabled menu and matching shortcut cannot execute");
+        owner.Enabled = true; owner.Checked = true;
+        Check(command.CanExecute() && command.IsChecked(), "external model change is visible without rebuilding command");
+        command.Detach(); Click(app, button);
+        Check(!command.CanExecute() && !command.IsChecked() && owner.Calls == 4, "detach retires all shared endpoints");
+        UiCommand detachedDuringCheck = new UiCommand(owner, 7, "detach during check");
+        detachedDuringCheck.Bind(null); owner.MutatingCommand = detachedDuringCheck; owner.Mutation = 1;
+        Check(!detachedDuringCheck.TryExecute() && owner.Calls == 4, "CanExecute detaching command cannot execute captured owner");
+        UiCommand changedDuringCheck = new UiCommand(owner, 7, "change during check");
+        owner.MutatingCommand = changedDuringCheck; owner.Mutation = 2;
+        Check(!changedDuringCheck.TryExecute() && changedDuringCheck.Key == 8 && owner.Calls == 4,
+            "CanExecute changing key cannot execute unvalidated command");
+        owner.MutatingCommand = null; owner.Mutation = 0;
+        app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+        Console.WriteLine("COMMAND_SHARED_ENDPOINTS_OK");
+    }
+    static UiCommand Borrow(SharedCommandWitness witness, UiEvent endpoint) {
+        SharedCommandOwner owner = new SharedCommandOwner(); witness.Owner = owner;
+        UiCommand command = new UiCommand(owner, 7, "borrowed"); command.Bind(endpoint);
+        return command;
+    }
+    static void WeakOwner() {
+        SharedCommandWitness witness = new SharedCommandWitness(); UiEvent endpoint = new UiEvent();
+        UiCommand command = Borrow(witness, endpoint);
+        Check(witness.Owner == null && !command.CanExecute() && !command.IsChecked(), "event and command do not retain owner");
+        endpoint.Raise(); Check(!command.TryExecute(), "late event after natural owner release is harmless");
+        Console.WriteLine("COMMAND_WEAK_OWNER_OK");
+    }
+    static void Main() { SharedEndpoints(); WeakOwner(); }
+}

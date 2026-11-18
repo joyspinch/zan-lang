@@ -21,8 +21,7 @@ namespace Gui;
 // // 属性协议：id → 选择器名（nodeName），class → AddClass，
 // style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
 // data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
-// data-bind → bindPath，data-if → bindIf。其余属性（Element 进
-// 原始属性表；真控件忽略）。
+// bind / :prop → bindings。其余属性（Element 进原始属性表；真控件忽略）。
 // // 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：装载入口
 // Html.Load(app, ...) 在本文件，内部经 Parse→Install 自动装声明层；
 // App 只做组合根，不背 HTML 装载职责。拼写了任何 Html.* 入口的程序
@@ -34,11 +33,10 @@ public partial class Html {
 
     // 向 App 注册链接扫描与模板行克隆两个委托槽（ModelBinder.WireNode
     // /For 经 App.AutoLinkTree/CloneTree 反转调用），并补齐 Element 的
-    // title 提示与远端图片通道。HTML 装载入口是 Html.Load，不经槽。
+    // title 提示与远端图片通道。动态组件由应用装配入口显式注册。
     public static void Install() {
         if (loaderInstalled) { return; }
         loaderInstalled = true;
-        ControlBootstrap.Install();
         App.SetLinkScanner(AutoLinkTree);
         Element.SetTipPainter(Html.PaintTip);
         App.SetCloneTree(Html.Clone);
@@ -179,6 +177,13 @@ public partial class Html {
         doc.css = wd.css;
         doc.gen = 0;
         string sizeClass = "";
+        bool designFields = false;
+        for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (wd.nodes[i].tag != "body") { continue; }
+            for (int j = 0; j < wd.nodes[i].attrs.Count; j = j + 1) {
+                if (wd.nodes[i].attrs[j].name == "data-zan-design") { designFields = true; }
+            }
+        }
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
             string fs = HtmlText.NodeAttr(wd.nodes[i].attrs, "data-form-size");
             if (fs == "0") { sizeClass = "large"; break; }
@@ -197,14 +202,13 @@ public partial class Html {
             if (n.tag == "option" || n.tag == "thead" || n.tag == "tbody" || n.tag == "tfoot") {
                 continue;
             }
+            FbFlow fieldFlow = null;
             for (int k = 0; k < n.items.Count; k = k + 1) {
                 WItem it = n.items[k];
                 if (it.kid < 0) {
+                    if (it.text.Trim() != "") { fieldFlow = null; }
                     if (c is Element) {
                         ((Element)c).AddText(it.text);
-                        if (it.text.IndexOf("{{") >= 0 && c.bindTpl == "") {
-                            c.bindTpl = it.text;
-                        }
                     } else if (c is TableCell) {
                         string t = it.text.Trim();
                         if (t != "") {
@@ -229,6 +233,7 @@ public partial class Html {
                 } else {
                     WNode kidNode = wd.nodes[it.kid];
                     if (IsMetaChild(n.tag, kidNode.tag)) {
+                        fieldFlow = null;
                         // 若父容器是 Table 且子项是 thead/tbody/tfoot 元节点，把内部 tr 扁平转挂到 Table
                         if (c is Table && (kidNode.tag == "thead" || kidNode.tag == "tbody" || kidNode.tag == "tfoot")) {
                             for (int ti = 0; ti < kidNode.items.Count; ti = ti + 1) {
@@ -272,7 +277,8 @@ public partial class Html {
                         continue;
                     }
                     Control kidCtl = built[it.kid];
-                    Html.AddChild(c, kidCtl);
+                    if (designFields) { fieldFlow = Html.AddFieldChild(c, kidCtl, kidNode, fieldFlow); }
+                    else { Html.AddChild(c, kidCtl); }
                 }
             }
         }
@@ -355,6 +361,55 @@ public partial class Html {
 
     // 挂子节点：支持 slot 具名插槽路由分发；Element 父走 AddKid（与 AddText 的文档序交错，
     // 行盒混排依赖），控件父走普通 Add。
+    // Design field metadata composes the existing flow/caption panels at assembly.
+    // Native HTML and positioned children retain the ordinary mounting path.
+    // The returned flow belongs only to this Parse assembly run and contiguous segment.
+    public static FbFlow AddFieldChild(Control parent, Control c, WNode node, FbFlow flow) {
+        string spanText = HtmlText.NodeAttr(node.attrs, "data-span");
+        string caption = HtmlText.NodeAttr(node.attrs, "data-label");
+        string position = HtmlText.NodeAttr(node.attrs, "data-position");
+        if (parent is Element || c is Element) {
+            Html.AddChild(parent, c);
+            return null;
+        }
+        Control host = parent;
+        if (c.slotName != "") {
+            Control slot = parent.NamedSlotHost(c.slotName);
+            if (slot == null) {
+                Html.AddChild(parent, c);
+                return null;
+            }
+            host = slot;
+        } else {
+            Control slot = parent.NamedSlotHost("default");
+            if (slot != null) { host = slot; }
+        }
+        // Positioned design fields use the same authored slot as flow fields.
+        if (position == "1" || position == "Float" || c.StylePosition() == 2
+            || !Html.IsIntText(spanText)) {
+            Html.AddChild(host, c);
+            return null;
+        }
+        if (flow == null || flow.parent != host) {
+            flow = new FbFlow();
+            host.Add(flow);
+        }
+        int span = Convert.ToInt32(spanText);
+        if (span < 1) { span = 1; }
+        if (span > 24) { span = 24; }
+        Control cell = c;
+        // These controls render their own label; other fields use a caption above.
+        if (caption != "" && !(c is Label) && !(c is Button)
+            && !(c is Checkbox) && !(c is Radio)) {
+            FbStack stack = new FbStack();
+            stack.Add(new Label(caption));
+            stack.Add(c);
+            cell = stack;
+        }
+        flow.AddCell(cell, span);
+        return flow;
+    }
+
     public static void AddChild(Control parent, Control c) {
         if (c.slotName != "" && parent.MountSlot(c.slotName, c)) {
             return;
@@ -383,23 +438,15 @@ public partial class Html {
             el.Class = src.Class;
             el.prefW = src.prefW;
             el.prefH = src.prefH;
-            el.bindPath = src.bindPath;
-            el.bindProp = src.bindProp;
-            el.bindIf = src.bindIf;
-            el.bindClass = src.bindClass;
-            el.bindDisabled = src.bindDisabled;
+            if (src.bindings != null) {
+                for (int bi = 0; bi < src.bindings.Count; bi = bi + 1) {
+                    ModelBindingDeclaration binding = src.bindings[bi];
+                    el.DeclareBinding(binding.path, binding.property, binding.twoWay);
+                }
+            }
             el.baseClass = src.baseClass;
             el.handlerArg = src.handlerArg;
             el.slotName = src.slotName;
-            el.bindLazy = src.bindLazy;
-            el.bindNumber = src.bindNumber;
-            el.bindTrim = src.bindTrim;
-            el.bindTpl = src.bindTpl;
-            if (src.bindProps != null) {
-                for (int bpi = 0; bpi < src.bindProps.Count; bpi = bpi + 1) {
-                    el.AddBindProp(src.bindProps[bpi].prop, src.bindProps[bpi].expr);
-                }
-            }
             for (int ei = 0; ei < src.events.Count; ei = ei + 1) {
                 el.SetHandler(src.events[ei].key, src.events[ei].val);
             }
@@ -415,7 +462,7 @@ public partial class Html {
                     }
                 }
             } else {
-                List<Control> kids = src.children;
+                List<Control> kids = src.SnapshotChildren();
                 for (int i = 0; i < kids.Count; i = i + 1) {
                     Control kid = Html.Clone(kids[i]);
                     if (kid != null) { el.AddKid(kid); }
@@ -435,23 +482,15 @@ public partial class Html {
         n.Class = c.Class;
         n.prefW = c.prefW;
         n.prefH = c.prefH;
-        n.bindPath = c.bindPath;
-        n.bindProp = c.bindProp;
-        n.bindIf = c.bindIf;
-        n.bindClass = c.bindClass;
-        n.bindDisabled = c.bindDisabled;
+        if (c.bindings != null) {
+            for (int bi = 0; bi < c.bindings.Count; bi = bi + 1) {
+                ModelBindingDeclaration binding = c.bindings[bi];
+                n.DeclareBinding(binding.path, binding.property, binding.twoWay);
+            }
+        }
         n.baseClass = c.baseClass;
         n.handlerArg = c.handlerArg;
         n.slotName = c.slotName;
-        n.bindLazy = c.bindLazy;
-        n.bindNumber = c.bindNumber;
-        n.bindTrim = c.bindTrim;
-        n.bindTpl = c.bindTpl;
-        if (c.bindProps != null) {
-            for (int bpi = 0; bpi < c.bindProps.Count; bpi = bpi + 1) {
-                n.AddBindProp(c.bindProps[bpi].prop, c.bindProps[bpi].expr);
-            }
-        }
         for (int ei = 0; ei < c.events.Count; ei = ei + 1) {
             n.SetHandler(c.events[ei].key, c.events[ei].val);
         }
@@ -562,9 +601,9 @@ public partial class Html {
     public static void AutoLink(Control c, App app) {
         if (app == null) { return; }
         if (!(c is Element)) { return; }
-        if (c.On.Click.Count() > 0) { return; }
         string href = c.CssAttr("href");
         if (!Html.Navigable(href)) { return; }
+        if (c.Click.CountAll() > 0) { return; }
         bool blank = c.CssAttr("target") == "_blank";
         c.BindEvent("Click", () => { Html.OpenLink(app, href, blank); });
     }
@@ -574,8 +613,8 @@ public partial class Html {
         Install();
         if (root == null) { return; }
         Html.AutoLink(root, app);
-        for (int i = 0; i < root.children.Count; i = i + 1) {
-            Html.AutoLinkTree(root.children[i], app);
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Html.AutoLinkTree(root.ChildAt(i), app);
         }
     }
 

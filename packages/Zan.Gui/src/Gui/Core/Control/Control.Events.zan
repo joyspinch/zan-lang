@@ -142,47 +142,10 @@ public partial class Control {
         app = this.ResolveApp(app);
         if (app == null) { return false; }
         int id = this.WidgetId();
-        if (id > 0 && app.Active(id)) { return true; }
-        if (commonId > 0 && app.Active(commonId)) { return true; }
-        return false;
-    }
-
-    // 判断本帧是否在控件上完成了一次完整的主键点击（MouseUp 落在控件上）
-    public virtual bool WasClicked() {
-        return this.WasClicked(this.App);
-    }
-    public virtual bool WasClicked(App app) {
-        app = this.ResolveApp(app);
-        if (app == null) { return false; }
-        int id = this.WidgetId();
-        if (id > 0 && app.Clicked(id)) { return true; }
-        if (commonId > 0 && app.Clicked(commonId)) { return true; }
-        return false;
-    }
-
-    // 判断本帧是否在控件上完成了一次右键点击
-    public virtual bool IsRightClicked() {
-        return this.IsRightClicked(this.App);
-    }
-    public virtual bool IsRightClicked(App app) {
-        app = this.ResolveApp(app);
-        if (app == null) { return false; }
-        int id = this.WidgetId();
-        if (id > 0 && app.RightClicked(id)) { return true; }
-        if (commonId > 0 && app.RightClicked(commonId)) { return true; }
-        return false;
-    }
-
-    // 判断本帧是否在控件上触发了双击
-    public virtual bool IsDoubleClicked() {
-        return this.IsDoubleClicked(this.App);
-    }
-    public virtual bool IsDoubleClicked(App app) {
-        app = this.ResolveApp(app);
-        if (app == null) { return false; }
-        int id = this.WidgetId();
-        if (id > 0 && app.DoubleClicked(id)) { return true; }
-        if (commonId > 0 && app.DoubleClicked(commonId)) { return true; }
+        if (app.focus != null) {
+            if (id > 0 && app.focus.IsPressed(id) && app.focus.IsHovered(id)) { return true; }
+            if (commonId > 0 && app.focus.IsPressed(commonId) && app.focus.IsHovered(commonId)) { return true; }
+        }
         return false;
     }
 
@@ -211,47 +174,30 @@ public partial class Control {
         }
     }
 
-    // 把已解析的矩形注册为命中区域并触发通用事件包，
-    // 使指针/焦点/键盘事件对所有控件生效，而不只是
-    // 自行接线 `On` 的那几个。控件自行接线
-    // 自己的事件或无人监听时跳过——未使用的容器不能
-    // 抢走画在它下面的内容的指针。
-    public virtual void FireCommon() {
-        this.FireCommon(this.App);
-    }
-    public virtual void FireCommon(App app) {
-        if (wiresOwnEvents) { return; }
-        app = this.ResolveApp(app);
-        if (app == null) { return; }
-        // `Click` 有订阅者时也要接线（Click.Add 不经过 On 注册表）。
-        bool clickWatched = this.extra != null && this.extra.Click != null
-            && this.extra.Click.CountAll() > 0;
-        if (!On.Any() && !clickWatched) { return; }
-        if (bw <= 0 || bh <= 0) { return; }
-        int id = this.CommonId();
-        string a11y = this.EffectiveA11yRole("control") + ":" + this.EffectiveA11yLabel(name);
-        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
-        On.Fire(app, id, this);
-    }
-
     // 按名称触发已绑定的事件（测试或合成事件调度通道）
     public virtual void TriggerEvent(string evt) {
         if (evt == "Click") {
             if (this.extra != null && this.extra.Click != null) {
                 this.extra.Click.RaiseS(this);
             }
+            return;
         }
-        if (evt == "Resize") { Resize.Raise(); return; }
-        if (evt == "Show") { Show.Raise(); return; }
-        if (evt == "Hide") { Hide.Raise(); return; }
+        if (evt == "Resize") {
+            if (this.extra != null && this.extra.Resize != null) { this.extra.Resize.RaiseS(this); }
+            return;
+        }
+        if (evt == "Show") {
+            if (this.extra != null && this.extra.Show != null) { this.extra.Show.RaiseS(this); }
+            return;
+        }
+        if (evt == "Hide") {
+            if (this.extra != null && this.extra.Hide != null) { this.extra.Hide.RaiseS(this); }
+            return;
+        }
         On.FireByName(evt, this);
     }
 
-    // 自持事件控件（Input/TextArea 等 wiresOwnEvents 一族）的命名
-    // 键盘/焦点事件出口：它们不走 FireCommon 的通用事件轮询，按键
-    // 与焦点变化路径上主动 FireByName，文档 `on<Event>` 解析出的
-    // KeyDown/KeyPress/Focus/Blur 绑定因此对输入件同样生效。无订阅
-    // 者时 RaiseS 是空操作。
+    // 输入控件在键盘/焦点路由中使用同一命名事件表；空订阅不分配。
     void FireKeyNamed(string evt) {
         On.FireByName(evt, this);
     }
@@ -285,55 +231,15 @@ public partial class Control {
     }
 
 
-    // 本帧此控件是否触发了它的主动作（按钮被按下、菜单项被选中）。
-    // 这是 Click 一类事件的*轮询*版本：每帧重建控件树的宿主留不住
-    // 处理器，而按一排按钮各挂一个处理器也说明不了任何事情——它们
-    // 只想在排完版之后问一句「刚才谁被按了」。默认 false；有主动作
-    // 的控件覆写它，宿主便可以遍历整棵子树一次问遍所有控件。
-    public virtual bool Fired() {
-        return false;
-    }
-
-    // 子树里本帧触发了主动作的第一个控件（深度优先，绘制顺序），
-    // 没有则为 null。
-    Control FiredIn() {
-        if (this.Fired()) { return this; }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control hit = children[i].FiredIn();
-            if (hit != null) { return hit; }
-        }
-        return null;
-    }
-
     // 所有控件暴露的通用事件名（指针/焦点/键盘/
     // 触摸/拖拽/生命周期），按检查器顺序。控件将其前置到自己的
     // 语义事件之前（在 Events() 中）。
     static List<string> CommonEvents() {
-        List<string> e = new List<string>{
-            "Click",
-            "DoubleClick",
-            "RightClick",
-            "RightDoubleClick",
-            "MouseDown",
-            "MouseUp",
-            "Enter",
-            "Leave",
-            "Move",
-            "Wheel",
-            "Focus",
-            "Blur",
-            "KeyDown",
-            "KeyUp",
-            "KeyPress",
-            "Tap",
-            "LongPress",
-            "Swipe",
-            "DragStart",
-            "Drag",
-            "Drop",
-            "Resize",
-            "Show",
-            "Hide" };
+        List<string> e = WidgetEvents.Names();
+        e.Insert(0, "Click");
+        e.Add("Resize");
+        e.Add("Show");
+        e.Add("Hide");
         return e;
     }
 
@@ -344,23 +250,19 @@ public partial class Control {
         return Control.CommonEvents();
     }
 
-    // 把解析出的 Action 订阅到指定事件。基类把通用事件包
-    // （Click/Enter/.../Drop）映射到 `On`；控件重写以把
-    // 自己的语义事件（Change/Submit/RowClick/...）路由到正确的
-    // UiEvent 字段，然后为通用事件集调用基类。JSON
-    // 加载器用它附加经注册表解析的 `on<Event>` 处理器。
+    // HTML、设计器和代码的按名接线共用此入口。Click/生命周期使用
+    // Control 的唯一事件槽，其余路由事件使用 On。控件只特化自身事件。
     public virtual void BindEvent(string evt, Action a) {
+        if (evt == "Click") { Click.Add(a); return; }
         if (evt == "Resize") { Resize.Add(a); return; }
         if (evt == "Show") { Show.Add(a); return; }
         if (evt == "Hide") { Hide.Add(a); return; }
         On.AddByName(evt, a);
     }
 
-    // <see cref="BindEvent"/> 的 sender 通道：处理器在触发时收到
-    // 本控件。基类按事件名路由到 <see cref="WidgetEvents.AddByNameS"/>；
-    // 为 <see cref="BindEvent"/> 特化过事件（如 Change/Toggle）的
-    // 控件同样重写本方法，把对应名字接进自己的 UiEvent。
+    // BindEvent 的 sender 订阅形式，使用相同事件槽和派发入口。
     public virtual void BindEventS(string evt, ControlEvent h) {
+        if (evt == "Click") { Click.AddS(h); return; }
         if (evt == "Resize") { Resize.AddS(h); return; }
         if (evt == "Show") { Show.AddS(h); return; }
         if (evt == "Hide") { Hide.AddS(h); return; }
@@ -370,11 +272,7 @@ public partial class Control {
     // `key` 对应的规格；若此控件未发布该绑定
     // 属性则返回 null。
     public PropSpec PropOf(string key) {
-        List<PropSpec> ps = this.Props();
-        for (int i = 0; i < ps.Count; i = i + 1) {
-            if (ps[i].Answers(key) && ps[i].IsBound()) { return ps[i]; }
-        }
-        return null;
+        return PropSpec.Find(this.Props(), key, true);
     }
 
     // 为无法用字段表达的属性提供的挂钩——逗号连接的条目列表、

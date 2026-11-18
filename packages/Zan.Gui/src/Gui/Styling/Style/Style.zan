@@ -227,19 +227,18 @@ public partial class Style {
         StyleSheet basef = Style.BaseSheet(app);
         StyleSheet chartf = app.chartSheet;
         StyleSheet sheet = app.sheet;
-        // 组合器/结构性伪类的命中随节点在树里的位置变化：表里有这类
-        // 选择器且当前正处于 retained 渲染树中时，把位置签名并进缓存
-        // 键——不同容器里的同名控件才不会共用一份错误的缓存。
-        Control ctxNode = null;
-        if (Style.AnyRelational(basef, chartf, sheet)) {
-            ctxNode = app.styleCtx;
-        }
-        string sig = ctxNode == null ? "" : Style.CtxSig(ctxNode);
+        int dependency = Style.ContextDependency(basef, chartf, sheet);
+        Control ctxNode = dependency == 0 ? null : app.styleCtx;
+        bool cacheable = dependency < 2 || ctxNode == null;
+        string sig = Style.ContextSig(app, dependency);
         string key = type + "|" + cls + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
-        if (Style.AnyMedia(basef, chartf, sheet)) { key = key + "#" + Style.MediaSig(app); }
         if (sig != "") { key = key + "#" + sig; }
-        StyleBox hit = Style.CacheGet(app, key);
-        if (hit != null) { return hit.Clone(); }
+        if (cacheable) {
+            StyleBox hit = Style.CacheGet(app, key);
+            if (hit != null) { return hit.Clone(); }
+        } else {
+            Style.statResolve = Style.statResolve + 1;
+        }
 
         StyleBox b = new StyleBox();
         Style.Defaults(app, b, type, cls, state);
@@ -257,7 +256,7 @@ public partial class Style {
         }
         Style.Shell(app, b, type, cls, state);
         Style.ScaleLayout(app, b);
-        Style.CachePut(app, key, b);
+        if (cacheable) { Style.CachePut(app, key, b); }
         return b.Clone();
     }
     public static StyleBox Full(string type, string cls, string id, int state) {
@@ -278,18 +277,19 @@ public partial class Style {
         StyleSheet basef = Style.BaseSheet(app);
         StyleSheet chartf = app.chartSheet;
         StyleSheet sheet = app.sheet;
-        // 同 Full：有树上下文选择器时把节点位置签名并进缓存键。
-        Control ctxNode = null;
-        if (Style.AnyRelational(basef, chartf, sheet)) {
-            ctxNode = app.styleCtx;
-        }
-        string sig = ctxNode == null ? "" : Style.CtxSig(ctxNode);
+        int dependency = Style.ContextDependency(basef, chartf, sheet);
+        Control ctxNode = dependency == 0 ? null : app.styleCtx;
+        bool cacheable = dependency < 2 || ctxNode == null;
+        string sig = Style.ContextSig(app, dependency);
         string key = type + "::" + part + "|" + fallbackType + "|" + cls
             + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
-        if (Style.AnyMedia(basef, chartf, sheet)) { key = key + "#" + Style.MediaSig(app); }
         if (sig != "") { key = key + "#" + sig; }
-        StyleBox hit = Style.CacheGet(app, key);
-        if (hit != null) { return hit.Clone(); }
+        if (cacheable) {
+            StyleBox hit = Style.CacheGet(app, key);
+            if (hit != null) { return hit.Clone(); }
+        } else {
+            Style.statResolve = Style.statResolve + 1;
+        }
 
         StyleBox b = new StyleBox();
         if (fallbackType != "") {
@@ -317,7 +317,7 @@ public partial class Style {
         }
         if (fallbackType != "") { Style.Shell(app, b, fallbackType, cls, state); }
         Style.ScaleLayout(app, b);
-        Style.CachePut(app, key, b);
+        if (cacheable) { Style.CachePut(app, key, b); }
         return b.Clone();
     }
     public static StyleBox Part(string type, string part, string fallbackType,
@@ -524,34 +524,58 @@ public partial class Style {
             || (sheet != null && sheet.HasMedia());
     }
 
+    // This classification is cached with each sheet's parsed index. It does
+    // not scan selectors or the tree on the steady no-context path.
+    public static int ContextDependency(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
+        int dependency = basef == null ? 0 : basef.ContextDependency();
+        int chartDependency = chartf == null ? 0 : chartf.ContextDependency();
+        int sheetDependency = sheet == null ? 0 : sheet.ContextDependency();
+        if (chartDependency > dependency) { dependency = chartDependency; }
+        if (sheetDependency > dependency) { dependency = sheetDependency; }
+        return dependency;
+    }
+
+    public static int ContextDependency(App app) {
+        if (app == null) { return 0; }
+        return Style.ContextDependency(Style.BaseSheet(app), app.chartSheet, app.sheet);
+    }
+
     public static bool AnyRelational(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
-        return (basef != null && basef.HasRelational())
-            || (chartf != null && chartf.HasRelational())
-            || (sheet != null && sheet.HasRelational());
+        return Style.ContextDependency(basef, chartf, sheet) != 0;
     }
 
-    // 与 Full/Part 使用同一依赖判定；普通选择器不依赖树位置，
-    // 无需拼祖先链，也不能因 measure/render 的上下文切换击穿控件缓存。
+    // Full/Part and Control use the same dependency/environment decision.
+    // A path is deliberately not offered as a key for live-only selectors.
     public static string ContextSig(App app) {
-        if (!Style.AnyRelational(Style.BaseSheet(app), app.chartSheet, app.sheet)) {
-            return "";
-        }
-        return Style.CtxSig(app.styleCtx);
+        return Style.ContextSig(app, Style.ContextDependency(app));
     }
 
-    // 树上下文的缓存键签名：从根到 `node` 的 `类型.类/序号` 链。
-    // 树的结构一变签名就变，样式缓存随之自然失效。
+    public static string ContextSig(App app, int dependency) {
+        if (app == null) { return ""; }
+        string sig = dependency == 1 ? Style.CtxSig(app.styleCtx) : "";
+        if (dependency == 2 && app.styleCtx != null) { sig = "live"; }
+        if (Style.AnyMedia(Style.BaseSheet(app), app.chartSheet, app.sheet)) {
+            sig = sig + "#" + Style.MediaSig(app);
+        }
+        return sig;
+    }
+
+    // Length prefixes prevent names/classes containing separators from
+    // aliasing another path. The host's explicit state is already a cache
+    // dimension; only ancestors use their last resolved NodeState.
     public static string CtxSig(Control node) {
-        if (node == null) { return ""; }
         string sig = "";
         Control anc = node;
         while (anc != null) {
-            string piece = anc.StyleType();
-            if (anc.Class != "") { piece = piece + "." + anc.Class; }
+            string type = anc.StyleType();
+            string cls = anc.EffectiveClass();
+            string piece = Convert.ToString(type.Length) + ":" + type
+                + Convert.ToString(cls.Length) + ":" + cls
+                + Convert.ToString(anc.name.Length) + ":" + anc.name;
             Control par = anc.parent;
-            if (par != null) {
-                piece = piece + "/" + Convert.ToString(par.IndexOf(anc));
-            }
+            int index = par == null ? 0 : par.IndexOf(anc);
+            int state = anc == node ? 0 : Style.NodeState(anc);
+            piece = piece + "/" + Convert.ToString(index) + "/" + Style.StateStr(state);
             sig = sig == "" ? piece : piece + ">" + sig;
             anc = par;
         }
@@ -641,9 +665,7 @@ public partial class Style {
         return Style.EasedId(null, id, type, cls, name, false, false);
     }
 
-    // EasedId 的按矩形版本：悬停/按下/焦点的缓动程度按
-    // (x, y, w, h) 矩形测量（Ui.*LevelMsIn），用于命中区域
-    // 与绘制矩形不一致的控件。
+    // EasedId 的按矩形版本：缓动重绘限定在控件的已排列矩形内。
     public static StyleBox EasedIdIn(App app, int id, string type, string cls, string name,
                               bool disabled, bool selected,
                               int x, int y, int w, int h) {
@@ -663,12 +685,13 @@ public partial class Style {
         if (disabled) {
             return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
         }
+        if (app == null) { app = App.FrameApp(); }
         StyleBox base0 = Style.Full(app, type, cls, name, latched);
         base0.fxId = id;
         int ms = base0.TransitionOr(0 - 1);
-        int hv = Ui.HoverLevelMs(app, id, ms);
-        int pv = Ui.PressLevelMs(app, id, ms);
-        int fv = Ui.FocusLevelMs(app, id, ms);
+        int hv = app != null ? app.StyleHoverLevel(id, ms) : 0;
+        int pv = app != null ? app.StylePressLevel(id, ms) : 0;
+        int fv = app != null ? app.StyleFocusLevel(id, ms) : 0;
         StyleBox cur = base0;
         if (hv > 0) {
             StyleBox hover = Style.Full(app, type, cls, name, latched + Style.SHover());
@@ -694,12 +717,13 @@ public partial class Style {
         if (disabled) {
             return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
         }
+        if (app == null) { app = App.FrameApp(); }
         StyleBox base0 = Style.Full(app, type, cls, name, latched);
         base0.fxId = id;
         int ms = base0.TransitionOr(0 - 1);
-        int hv = Ui.HoverLevelMsIn(app, id, ms, x, y, w, h);
-        int pv = Ui.PressLevelMsIn(app, id, ms, x, y, w, h);
-        int fv = Ui.FocusLevelMsIn(app, id, ms, x, y, w, h);
+        int hv = app != null ? app.StyleHoverLevelIn(id, ms, x, y, w, h) : 0;
+        int pv = app != null ? app.StylePressLevelIn(id, ms, x, y, w, h) : 0;
+        int fv = app != null ? app.StyleFocusLevelIn(id, ms, x, y, w, h) : 0;
         StyleBox cur = base0;
         if (hv > 0) {
             StyleBox hover = Style.Full(app, type, cls, name,
@@ -751,11 +775,12 @@ public partial class Style {
             return Style.Part(app, type, part, fallbackType, cls, name,
                               Style.SDisabled() + latched);
         }
+        if (app == null) { app = App.FrameApp(); }
         StyleBox base0 = Style.Part(app, type, part, fallbackType, cls, name, latched);
         int ms = base0.TransitionOr(0 - 1);
-        int hv = Ui.HoverLevelMs(app, id, ms);
-        int pv = Ui.PressLevelMs(app, id, ms);
-        int fv = Ui.FocusLevelMs(app, id, ms);
+        int hv = app != null ? app.StyleHoverLevel(id, ms) : 0;
+        int pv = app != null ? app.StylePressLevel(id, ms) : 0;
+        int fv = app != null ? app.StyleFocusLevel(id, ms) : 0;
         StyleBox cur = base0;
         if (hv > 0) {
             StyleBox hover = Style.Part(app, type, part, fallbackType, cls, name,
@@ -784,11 +809,12 @@ public partial class Style {
             return Style.Part(app, type, part, fallbackType, cls, name,
                               Style.SDisabled() + latched);
         }
+        if (app == null) { app = App.FrameApp(); }
         StyleBox base0 = Style.Part(app, type, part, fallbackType, cls, name, latched);
         int ms = base0.TransitionOr(0 - 1);
-        int hv = Ui.HoverLevelMsIn(app, id, ms, x, y, w, h);
-        int pv = Ui.PressLevelMsIn(app, id, ms, x, y, w, h);
-        int fv = Ui.FocusLevelMsIn(app, id, ms, x, y, w, h);
+        int hv = app != null ? app.StyleHoverLevelIn(id, ms, x, y, w, h) : 0;
+        int pv = app != null ? app.StylePressLevelIn(id, ms, x, y, w, h) : 0;
+        int fv = app != null ? app.StyleFocusLevelIn(id, ms, x, y, w, h) : 0;
         StyleBox cur = base0;
         if (hv > 0) {
             StyleBox hover = Style.Part(app, type, part, fallbackType, cls, name,

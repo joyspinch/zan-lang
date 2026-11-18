@@ -1,0 +1,168 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class SelectInputState {
+    public weak SelectBox Box;
+    public int Opens;
+    public int Closes;
+    public int Changes;
+    public bool Reopen;
+    public void Opened(Control sender) { Opens = Opens + 1; }
+    public void Closed(Control sender) { Closes = Closes + 1; }
+    public void Changed(Control sender) {
+        Changes = Changes + 1;
+        SelectBox box = Box;
+        if (Reopen && box != null) {
+            Reopen = false;
+            box.SetOpen(false); box.SetOpen(true);
+        }
+    }
+}
+class SelectInputWitness {
+    public weak App Host;
+    public weak SelectBox Box;
+    public weak Control Popup;
+}
+class SelectBoxRoutedInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Input(App app, int kind, int x, int y, int key) {
+        app.ProcessOffscreenInput(kind, x, y, 0, key, 0, 0);
+    }
+    static void Click(App app, Control target) {
+        int x = target.bx + 8; int y = target.by + target.bh / 2;
+        Input(app, 2, x, y, 0); Input(app, 3, x, y, 0);
+    }
+    static SelectBoxOptionButton Row(Control node, int index) {
+        if (node is SelectBoxOptionButton) {
+            SelectBoxOptionButton row = (SelectBoxOptionButton)node;
+            if (row.OptionIndex == index) { return row; }
+        }
+        for (int i = 0; i < node.ChildCount(); i = i + 1) {
+            SelectBoxOptionButton found = Row(node.ChildAt(i), index);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static void Paint(App app, SelectBox box) {
+        app.BeginOffscreenFrame(); box.RenderTree(app); box.RenderTree(app);
+        app.RunOverlays(); app.RunOverlays(); app.EndOffscreenFrame();
+    }
+    static void RetainedLayout(App app, SelectBox box, SelectInputState state) {
+        Control root = app.rootControl;
+        Control popup = app.overlayHost.ActiveRoot();
+        int selected = box.Selected(); int model = box.Value.Get();
+        int opens = state.Opens; int closes = state.Closes; int changes = state.Changes;
+        bool open = box.IsOpen();
+        box.MeasureTree(app); int naturalW = box.prefW; int naturalH = box.prefH;
+        Check(naturalW > 0 && naturalH > 0, "retained fixture has measured natural size");
+        app.BeginOffscreenFrame();
+        try {
+            box.Arrange(20, 20, 173, naturalH);
+            Check(box.bx == 20 && box.by == 20 && box.bw == 173 && box.bh == naturalH
+                && app.rootControl == root, "declared width is arranged without replacing input root");
+            box.Arrange(24, 28, naturalW, naturalH);
+            Check(box.bx == 24 && box.by == 28 && box.bw == naturalW && box.bh == naturalH
+                && app.rootControl == root, "natural size is arranged without installing root");
+            box.Arrange(20, 20, 180, naturalH);
+            box.RenderTree(app); box.RenderTree(app);
+            app.RunOverlays(); app.RunOverlays();
+        } finally { app.EndOffscreenFrame(); }
+        Check(app.rootControl == root && app.overlayHost.ActiveRoot() == popup
+            && box.IsOpen() == open && box.Selected() == selected && box.Value.Get() == model
+            && state.Opens == opens && state.Closes == closes && state.Changes == changes,
+            "retained paint never installs input ownership or replays notifications");
+    }
+    static SelectInputWitness Exercise() {
+        App app = App.CreateOffscreen("SelectBox actual input", 420, 280);
+        SelectBox box = new SelectBox("Pick");
+        box.AddOption("Alpha"); box.AddOption("Beta"); box.AddOption("Gamma");
+        box.opts[0].val = "key-a"; box.opts[1].disabled = true; box.opts[2].val = "key-c";
+        box.AddGroup("Group heading");
+        Binding<int> model = -1; box.Value = model;
+        SelectInputState state = new SelectInputState(); state.Box = box;
+        box.Open.AddS(state.Opened); box.Close.AddS(state.Closed); box.Change.AddS(state.Changed);
+        app.SetRootControl(box); box.UseApp(app); box.MeasureTree(app); box.Arrange(20, 20, 180, 32);
+        Click(app, box);
+        Control popup = app.overlayHost.ActiveRoot();
+        Check(box.IsOpen() && popup != null && state.Opens == 1, "zero Paint real head click mounts popup");
+        Check(Row(popup, 2) != null && Row(popup, 2).bw > 0 && Row(popup, 3) == null,
+            "actual option tree arranged before Paint and group has no selectable row");
+        Paint(app, box);
+        Check(app.overlayHost.ActiveRoot() == popup && state.Opens == 1 && state.Changes == 0,
+            "repeated Paint cannot reopen or dispatch");
+        Click(app, Row(popup, 2));
+        Check(box.Selected() == 2 && box.SelectedValue() == "key-c" && box.SelectedLabel() == "Gamma"
+            && model.Get() == 2 && state.Changes == 1 && state.Closes == 1 && !box.IsOpen(),
+            "actual option settles original index key label model and closes synchronously");
+        Click(app, box); Click(app, box);
+        Check(!box.IsOpen() && state.Opens == 2 && state.Closes == 2,
+            "actual second head gesture closes without Paint");
+        box.Focus(app); Input(app, 4, 0, 0, 32);
+        Check(box.IsOpen(), "Space opens before Paint");
+        Input(app, 4, 0, 0, 36); Input(app, 4, 0, 0, 40); Input(app, 4, 0, 0, 13);
+        Check(box.Selected() == 2 && !box.IsOpen(), "Home Down skips disabled row and Enter commits");
+        box.Focus(app); Input(app, 4, 0, 0, 40);
+        Check(box.IsOpen(), "ArrowDown opens");
+        Input(app, 4, 0, 0, 27);
+        Check(!box.IsOpen(), "Escape dismisses synchronously");
+        Click(app, box); popup = app.overlayHost.ActiveRoot(); state.Reopen = true;
+        Click(app, Row(popup, 0));
+        Check(box.IsOpen() && app.overlayHost.ActiveRoot() != null && state.Changes == 2,
+            "Change reopen owns new session and old option cannot close it");
+        popup = app.overlayHost.ActiveRoot(); SelectBoxOptionButton stale = Row(popup, 2);
+        Input(app, 2, stale.bx + 8, stale.by + 8, 0);
+        box.SetOpen(false);
+        Input(app, 3, stale.bx + 8, stale.by + 8, 0);
+        Check(!box.IsOpen() && state.Changes == 2, "canceled old Down never commits");
+        Click(app, box); Input(app, 2, 400, 260, 0); Input(app, 3, 400, 260, 0);
+        Check(!box.IsOpen(), "outside gesture dismisses without Paint");
+        Click(app, box); Input(app, 9, 0, 0, 0);
+        Check(!box.IsOpen(), "blur closes old session");
+        box.Clearable(true); box.SetIndex(2); box.SyncBinding();
+        StyleBox headStyle = box.ResolveStyleAs(app, "select", box.StyleClass(), Style.SNormal());
+        StyleBox arrowStyle = box.ResolvePartAs(app, "select", "arrow", "", box.StyleClass(), Style.SNormal());
+        StyleBox clearStyle = box.ResolvePartAs(app, "select", "clear", "", box.StyleClass(), Style.SNormal());
+        int clearSize = clearStyle.FontOr(app.theme.iconSizeSmall);
+        int clearX = box.bx + box.bw - headStyle.PadROr(app.Scale(6))
+            - arrowStyle.FontOr(app.theme.iconSizeSmall) - app.Scale(4) - clearSize / 2;
+        int changes = state.Changes; int opens = state.Opens;
+        Input(app, 2, clearX, box.by + box.bh / 2, 0);
+        Input(app, 3, clearX, box.by + box.bh / 2, 0);
+        Check(box.Selected() == -1 && model.Get() == -1 && !box.IsOpen()
+            && state.Changes == changes && state.Opens == opens,
+            "zero Paint clear preserves Clear API and does not open or raise Change");
+        box.Clearable(false);
+        // Keep all zero-Paint input checks above; exercise stable retained layout afterwards.
+        Click(app, box);
+        popup = app.overlayHost.ActiveRoot();
+        Check(box.IsOpen() && popup != null, "retained layout fixture opens through real input");
+        RetainedLayout(app, box, state);
+        Click(app, Row(popup, 2));
+        Check(!box.IsOpen() && box.Selected() == 2 && model.Get() == 2,
+            "retained layout fixture selects through real input");
+        RetainedLayout(app, box, state);
+        app.SetRootControl(null);
+        RetainedLayout(app, box, state);
+        Control fallback = new Control(); app.SetRootControl(fallback);
+        RetainedLayout(app, box, state);
+        app.SetRootControl(box);
+        App other = App.CreateOffscreen("other SelectBox host", 420, 280);
+        app.SetRootControl(null); other.SetRootControl(box); box.UseApp(other);
+        box.MeasureTree(other); box.Arrange(20, 20, 180, 32); Click(other, box);
+        Check(box.IsOpen() && other.overlayHost.ActiveRoot() != null && app.overlayHost.ActiveRoot() == null,
+            "cross App mounts only actual new host");
+        other.SetRootControl(null);
+        Check(!box.IsOpen() && other.overlayHost.ActiveRoot() == null, "anchor retirement closes");
+        SelectInputWitness witness = new SelectInputWitness();
+        witness.Host = other; witness.Box = box; witness.Popup = popup;
+        app.canvas.Destroy(); other.canvas.Destroy(); return witness;
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("unrelated frame App", 2, 2);
+        SelectInputWitness witness = Exercise();
+        Check(witness.Host == null && witness.Box == null && witness.Popup == null,
+            "weak popup rows do not retain App or owner");
+        frame.canvas.Destroy(); Console.WriteLine("SELECTBOX_ROUTED_INPUT_OK");
+    }
+}

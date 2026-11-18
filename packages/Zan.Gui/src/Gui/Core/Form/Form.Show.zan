@@ -7,13 +7,13 @@ using Gui.Markup;
 namespace Gui;
 
 // 声明式窗口半边（B-ID147，Form 的 partial）：子类即窗口——业务字段即
-// ViewModel（data-bind 路径直接对上），方法即事件（@click 按名接线到本
+// ViewModel（bind 路径直接对上），方法即事件（@click 按名接线到本
 // 实例）。Show() 按"类名 ↔ 同目录同名 .html"约定装载界面并进消息循环；
-// 没有 html 的窗口走纯代码 Add 建树。owner 与标题/尺寸等窗口键都在
-// html 根属性上，动态绑定走 bindProps 通用泵。
+// 没有 html 的窗口走纯代码 Add 建树。owner 与标题/尺寸等静态窗口键都在
+// html 根属性上。
 public partial class Form {
     // 按名接线与绑定泵共用；Show() 装配时创建。
-    public ModelBinder docBinder;
+    private AppModelHost docBinder;
 
     // 装配出的整棵树根（markup 文档的 body 或代码建的容器）。
     public Control docRoot;
@@ -44,12 +44,24 @@ public partial class Form {
         this.assembleDoc(false);
         this.Run();
         Form host = this.owner;
-        if (host != null) { host.MarkDirty(); }
+        if (host != null && host.app != null) {
+            host.app.RequestRedraw();
+            host.app.Wake();
+        }
     }
+
+    // Override only when the view model is not the Form instance itself.
+    protected virtual object ViewModel() { return null; }
 
     // ---- 装配 ----
 
     void assembleDoc(bool offscreen) {
+        if (this.docBinder != null) {
+            App previousApp = this.docBinder.HostApp();
+            if (previousApp != null) { previousApp.UnregisterModelHost(this.docBinder); }
+            this.docBinder = null;
+        }
+        if (this.docRoot != null) { this.Remove(this.docRoot); this.docRoot = null; }
         // 声明层与控件 kind 名单（data-for 行克隆按 kind 重建），均幂等。
         Html.Install();
         ControlBootstrap.Install();
@@ -63,9 +75,8 @@ public partial class Form {
         if (html != null) {
             HtmlDoc doc = Html.Parse(html, "", null);
             tree = doc.root;
-            // 窗口键是根元素的普通属性：静态初值读一次，:data-win-* 动态
-            // 绑定走根控件 bindProps 的通用泵。设计稿方言把键写在 body
-            // 上——根优先，两级都看。
+            // 窗口键是根元素的静态普通属性，在装配期读取一次。
+            // 设计稿方言把键写在 body 上——根优先，两级都看。
             string t = Form.WinKey(tree, "data-win-title");
             if (t != "") { title = t; }
             string w = Form.WinKey(tree, "data-win-w");
@@ -102,19 +113,19 @@ public partial class Form {
         this.Add(tree);
 
         this.docRoot = tree;
-        this.docBinder = new ModelBinder();
-        if (this.AutoWireDoc()) {
-            this.docBinder.SetRoot(tree, this);
-            this.docBinder.Wire();
+        ModelBinder binder = new ModelBinder();
+        this.docBinder = binder;
+        app.RegisterModelHost(binder);
+        if (this.AutoWireDoc(binder)) {
+            object vm = this.ViewModel();
+            object boundModel = vm;
+            if (boundModel == null) { boundModel = this; }
+            binder.SetRoot(tree, boundModel);
+            binder.Wire();
         }
-        ModelHosts.Register(app, this.docBinder);
         this.CheckBindsDoc(tree);
         if (this.HasMethod("OnLoad")) {
             this.Invoke("OnLoad", this);
-            // OnLoad 里的模型初始化要进下一帧：装配首泵（Wire 内）在
-            // OnLoad 之前跑过（B-ID149⑤ 脏跳过下不再有自动首帧），
-            // 框架替用户标脏一次。
-            this.docBinder.MarkDirty();
         }
     }
 
@@ -122,8 +133,8 @@ public partial class Form {
     static string WinKey(Control tree, string key) {
         string v = tree.CssAttr(key);
         if (v != "") { return v; }
-        for (int i = 0; i < tree.children.Count; i = i + 1) {
-            v = tree.children[i].CssAttr(key);
+        for (int i = 0; i < tree.ChildCount(); i = i + 1) {
+            v = tree.ChildAt(i).CssAttr(key);
             if (v != "") { return v; }
         }
         return "";
@@ -132,8 +143,8 @@ public partial class Form {
     // 按名自动接线：树上的处理器名逐个 HasMethod 对账（缺失即 fail-fast），
     // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中）。
     // 实现已收口到 DocWire（ChildWindow 子窗同一装配语义）。
-    bool AutoWireDoc() {
-        return DocWire.AutoWire(this, this, this.docBinder, () => { this.MarkDirty(); });
+    bool AutoWireDoc(ModelBinder binder) {
+        return DocWire.AutoWire(this, this, binder);
     }
 
     // 启动期绑定对账：bind 路径解析不到本实例字段的，开窗前一次性列出。

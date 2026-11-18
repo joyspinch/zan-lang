@@ -41,6 +41,7 @@ public partial class Control {
             } else if (!row && prefH > 0) {
                 wrapMain = prefH - this.StyleInsetT() - this.StyleInsetB();
             }
+            if (row && measureWidth >= 0) { wrapMain = this.WrapContentWidth(); }
         }
 
         int onLine = 0;
@@ -50,6 +51,14 @@ public partial class Control {
         int crossSum = 0;
         int lines = 0;
         List<Control> flexKids = this.FlexKids();
+        if (app != null && !measureIntrinsic && row && this.StyleWrap() == 0 && measureWidth >= 0) {
+            int available = this.WrapContentWidth();
+            if (available < 0) { available = 0; }
+            List<int> allocated = this.FlexLineSizes(flexKids, 0, flexKids.Count, available, 0, mainGap, true);
+            for (int k = 0; k < flexKids.Count; k = k + 1) {
+                flexKids[k].MeasureTree(app, allocated[k]);
+            }
+        }
         for (int i = 0; i < flexKids.Count; i = i + 1) {
             Control c = flexKids[i];
             // 主轴尺寸和排布时用同一个来源：flex-basis 优先，其次
@@ -138,27 +147,8 @@ public partial class Control {
     // 常规流）、按 CSS `order` 稳定排序（同 order 保持文档序）。
     // 测量（MeasureFlexContent）与排布（ArrangeFlex）共用同一份
     // 顺序，断行行数才一致。
-    static List<Control> emptyKids = new List<Control>();
-
     List<Control> FlexKids() {
-        if (children == null || children.Count == 0) { return Control.emptyKids; }
-        List<Control> items = new List<Control>();
-        for (int k = 0; k < children.Count; k = k + 1) {
-            Control c = children[k];
-            if (!c.StyleVisible() || c.StylePosition() == 2 || (c.StylePosition() == 0 && (c.mx != 0 || c.my != 0))) { continue; }
-            int ord = c.StyleOrder();
-            if (ord == 0) {
-                items.Add(c);
-                continue;
-            }
-            int ins = items.Count;
-            while (ins > 0 && items[ins - 1].StyleOrder() > ord) {
-                ins = ins - 1;
-            }
-            items.Insert(ins, c);
-        }
-        if (items.Count == 0) { return Control.emptyKids; }
-        return items;
+        return this.PlannedChildren(false, false);
     }
 
     void ArrangeFlex(int cx, int cy, int cw, int ch, int gapPx) {
@@ -264,15 +254,9 @@ public partial class Control {
         this.ArrangeFlexLineSlice(items, 0, items.Count, cx, cy, cw, ch, gapPx, row, crossOff, crossBox);
     }
 
-    // ArrangeFlexLine 的切片版本：直接在主项列表中按 [start, end) 索引进行排布，
-    // 避免多行换行排布时每行动态分配中间 List<Control>。
-    void ArrangeFlexLineSlice(List<Control> items, int start, int end, int cx, int cy, int cw, int ch,
-                              int gapPx, bool row, int crossOff, int crossBox) {
+    private List<int> FlexLineSizes(List<Control> items, int start, int end, int cw, int ch, int gapPx, bool row) {
         int n = end - start;
-        if (n <= 0) { return; }
-        int mainBox = cw;
-        if (!row) { mainBox = ch; }
-
+        int mainBox = row ? cw : ch;
         List<int> sizes = new List<int>();
         int used = 0;
         int totalGrow = 0;
@@ -384,8 +368,14 @@ public partial class Control {
                     while (i < n) {
                         int f = 0;
                         if (items[start + i].StyleShrink() != 0) {
-                            if (row) { f = items[start + i].StyleClampW(cw, items[start + i].MinContentMain(row)); }
-                            else { f = items[start + i].StyleClampH(ch, items[start + i].MinContentMain(row)); }
+                            Control child = items[start + i];
+                            StyleBox style = child.computedStyle;
+                            bool explicitMin = style != null && (row
+                                ? (style.minW >= 0 || style.minWPm >= 0)
+                                : (style.minH >= 0 || style.minHPm >= 0));
+                            int minimum = explicitMin ? 0 : child.MinContentMain(row);
+                            if (row) { f = child.StyleClampW(cw, minimum); }
+                            else { f = child.StyleClampH(ch, minimum); }
                             if (f > sizes[i]) { f = sizes[i]; }
                             give = give - sizes[i];
                         }
@@ -430,6 +420,27 @@ public partial class Control {
             }
             free = 0;
         }
+
+        return sizes;
+    }
+
+    // ArrangeFlexLine 的切片版本：直接在主项列表中按 [start, end) 索引进行排布，
+    // 避免多行换行排布时每行动态分配中间 List<Control>。
+    void ArrangeFlexLineSlice(List<Control> items, int start, int end, int cx, int cy, int cw, int ch,
+                              int gapPx, bool row, int crossOff, int crossBox) {
+        int n = end - start;
+        if (n <= 0) { return; }
+        int mainBox = cw;
+        if (!row) { mainBox = ch; }
+
+        List<int> sizes = this.FlexLineSizes(items, start, end, cw, ch, gapPx, row);
+        int used = n > 1 ? (n - 1) * gapPx : 0;
+        for (int k = 0; k < n; k = k + 1) {
+            used = used + sizes[k] + items[start + k].MarMain(row);
+        }
+        int free = mainBox - used;
+        if (free < 0) { free = 0; }
+        int i = 0;
 
         int offset = 0;
         int between = gapPx;

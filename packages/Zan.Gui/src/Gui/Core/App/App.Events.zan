@@ -34,8 +34,11 @@ public partial class App {
     bool ProcessEventCore() {
         // 推进活动的自动化脚本（注入合成事件，
         // 由同一循环随后轮询并分发）。未启用驱动时为空操作。
-        UiDriver.Tick();
+        this.TraceFullPresent(2, true);
+        this.TickAutomation();
+        this.TraceFullPresent(2, false);
         this.PerfMark("sh.evdriver");
+        this.TraceFullPresent(3, true);
         // 如果重绘已挂起（例如点击处理程序在帧中修改了状态），
         // 不要阻塞等待下一个 OS 事件——改为轮询，
         // 让新状态立即绘制。否则阻塞直到事件到达。
@@ -101,6 +104,7 @@ public partial class App {
         } else {
             result = window.WaitEvent();
         }
+        this.TraceFullPresent(3, false);
         bool displayReady = window.TakeDisplayFrame();
         bool displayAnimationDue = displayReady && displayAnimationPending;
         bool displayFxDue = displayReady && displayFxPending;
@@ -116,7 +120,9 @@ public partial class App {
 
         // 在 UI 线程上运行从后台线程调度来的工作。
         // Wake() 仅投递一个空事件（kind 0）来触发此逻辑。
+        this.TraceFullPresent(4, true);
         DrainPosts();
+        this.TraceFullPresent(4, false);
         this.PerfMark("sh.posts");
 
         int kind = this.NormalizedKind();
@@ -187,7 +193,8 @@ public partial class App {
         this.SyncSurface();
         this.PerfMark("sh.surface");
 
-        this.DispatchWindowInput(kind);
+        long dispatchSequence = window.EventSeq();
+        if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return true; }
         if (this.ConsumeRoutedInput(kind)) { return true; }
 
         // 失焦（kind 9）需要渲染一帧：打开中的浮层（右键菜单、
@@ -210,147 +217,9 @@ public partial class App {
             forceFullNext = true;
         }
 
-        if (kind == 1) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
-            int oldHover = focus.hoveredId;
-            focus.SetHovered(hitId);
-            if (hitId != oldHover) {
-                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
-                else { this.NoteRedrawWhy("hover-late"); }
-                needsRedraw = true;
-            }
-            // 当控件被按住（如滑块/滚动条拖拽）时，
-            // 随指针移动持续重绘，使数值实时跟随光标。
-            if (focus.pressedId >= 0) {
-                this.NoteRedrawWhy("drag");
-                needsRedraw = true;
-            }
-            // 按住按钮：即时模式的拖拽（设计器抓手/框选/缩放手柄）写在
-            // 渲染代码里，按在空白处时没有任何控件被按下，所以必须
-            // 单看按键状态让每次移动都到达一帧，否则拖不动。
-            if (pointerDown) {
-                this.NoteRedrawWhy("pointer-down");
-                needsRedraw = true;
-            }
-            int cursorId = hitId;
-            if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
-            int wtype = hitTester.GetWidgetType(cursorId);
-            if (wtype == 0) {
-                Window.SetCursor(1);
-            } else if (wtype == 1) {
-                Window.SetCursor(2);
-            } else if (wtype == 4) {
-                Window.SetCursor(3);
-            } else if (wtype == 5) {
-                Window.SetCursor(4);
-            } else if (wtype == 6) {
-                Window.SetCursor(6);
-            } else if (wtype == 7) {
-                Window.SetCursor(7);
-            } else if (wtype == 8) {
-                Window.SetCursor(8);
-            } else {
-                Window.SetCursor(0);
-            }
-        }
-
-        if (kind == 2) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
-            if (window.EventButton() == 1) {
-                // 次要按钮：记录 Ui.RightClicked 的目标，
-                // 但不动主焦点/按下状态，这样右键
-                // 点击永远不会抢走键盘焦点或触发主点击。
-                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
-                    menuBlockPrevious);
-                // 主目标是跨帧保留的（上一次左键点在哪个控件上），
-                // 而 Ui.Pressed/Ui.Clicked 只看事件类型不看按钮，
-                // 所以必须在这里清掉：否则右键会把上一次左键点过的
-                // 控件（例如功能区的“发布”）重新触发一次。
-                pressTargetId = -1;
-                hitTester.ClearAnchor(0);
-            } else {
-                focus.SetPressed(hitId);
-                if (!routedFocusAssigned) { focus.SetFocused(hitId); }
-                hitTester.ClearAnchor(2);
-                hitTester.ClearAnchor(3);
-                rightPressTargetId = -1;
-                rightClickTargetId = -1;
-                pressTargetId = hitId;
-                pressOnBlocker = this.PressHitBlocker(hitId, mouseX, mouseY);
-                pointerDown = true;
-                NotePressStart(hitId, mouseX, mouseY);
-            }
-            this.NoteRedrawWhy("NotePressStart");
-            needsRedraw = true;
-        }
-
-        if (kind == 3) {
-            if (this.currentPointerType == 1 || window.EventFlag() == 1) {
-                // 触控抬起：清空即时模式的 Hover 态，根除桌面按钮 Sticky Hover 浅色残留
-                if (focus != null) {
-                    focus.SetHovered(-1);
-                }
-            }
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
-            if (window.EventButton() == 1) {
-                // 次要按钮释放：仅解析右键点击目标，并清掉主点击
-                // 目标，这样这一帧没有任何控件看到 Ui.Clicked。
-                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
-                    menuBlockPrevious);
-                clickTargetId = -1;
-                hitTester.ClearAnchor(1);
-            } else {
-                pointerDown = false;
-                // 对照上一帧仍然完整的
-                // 命中区域（含弹层，最上层优先）解析点击目标，
-                // 在 BeginFrame 清除它们之前完成，使本帧恰好一个控件看到 Ui.Clicked。
-                // 触摸拖拽的收尾释放不是点击（EventFlag==1，驱动在
-                // 手势松手时打的标记）：点击目标不发布（保持 -1），
-                // 所有只认 ClickTarget 的表面——Ribbon/Wizard 命令、
-                // Layer 遮罩与关闭钮、表头排序、标题栏按钮、Dock 标签
-                // ——在拖拽松手时统一失活；Ui.Clicked/ClickAvailable
-                // 另有各自的同款防线。释放本身照常完成拖拽收尾
-                // （MouseReleased 语义、ClearPress），滚动条/滑块/
-                // 窗口拖动不受影响。
-                if (window.EventFlag() == 1) {
-                    clickTargetId = -1;
-                    NoteRelease(mouseX, mouseY);
-                    focus.ClearPress();
-                } else if (pressOnBlocker) {
-                    // 按下落在阻挡区/空白（弹层遮罩、模态变暗层或
-                    // 无命中区的表面）：这是弹层「按外部关闭」的那
-                    // 一下按下。弹层会在本帧渲染时读到 kind==2 并把
-                    // 自己关掉，于是释放帧快照里弹层已经不存在——
-                    // 若仍把释放解析成点击目标，该点恰好落到其下的
-                    // 控件上，同一次手势就先关菜单再点穿到后面的内
-                    // 容（下拉/菜单/抽屉/layer 的“点击穿透”）。
-                    // 发布保持 -1、双击基线不更新，释放本身照常完成
-                    // 拖拽收尾；各弹层自带的 ClaimClick 防线（打开
-                    // 那一帧）与本防线（关闭那一手势）互补。
-                    clickTargetId = -1;
-                    NoteRelease(mouseX, mouseY);
-                    focus.ClearPress();
-                } else {
-                    clickTargetId = hitId;
-                    NoteRelease(mouseX, mouseY);
-                    NoteClickTarget(clickTargetId);
-                    focus.ClearPress();
-                }
-            }
-            this.NoteRedrawWhy("click");
-            needsRedraw = true;
-        }
-
-        // Tab / Shift+Tab 在上一帧构建的可聚焦环上移动键盘焦点
-        // （见 FocusManager.RegisterFocusable）。
+        // Tab / Shift+Tab 按当前输入树的焦点能力移动键盘焦点。
         if (kind == 4 && window.EventKeyCode() == 9) {
-            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+            if (!this.HasOverlays() && !blocksInputBelow) {
                 int dir = 1;
                 if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
                 focus.FocusStep(dir);
@@ -518,22 +387,10 @@ public partial class App {
             return true;
         }
 
-        int curW = window.ClientWidth();
-        int curH = window.ClientHeight();
-        if (curW > 0 && curH > 0) {
-            if (curW != canvas.Width() || curH != canvas.Height()) {
-                this.SwapCanvas(curW, curH);
-                int viewH = curH - titlebarH;
-                int maxScroll = contentHeight - viewH;
-                if (maxScroll < 0) { maxScroll = 0; }
-                if (scrollY > maxScroll) { scrollY = maxScroll; }
-                if (scrollY < 0) { scrollY = 0; }
-                this.NoteRedrawWhy("ApplyEvent");
-                needsRedraw = true;
-            }
-        }
+        this.SyncSurface();
 
-        this.DispatchWindowInput(kind);
+        long dispatchSequence = window.EventSeq();
+        if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return true; }
         if (this.ConsumeRoutedInput(kind)) { return true; }
 
         // 失焦（kind 9）需要渲染一帧，让打开中的浮层自行关闭
@@ -551,123 +408,8 @@ public partial class App {
             forceFullNext = true;
         }
 
-        if (kind == 1) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.HitTest(mouseX, mouseY);
-            int oldHover = focus.hoveredId;
-            focus.SetHovered(hitId);
-            if (hitId != oldHover) {
-                // 将下一帧裁剪到离开和进入的控件，
-                // 但仅当悬停是唯一的重绘原因时：
-                // 状态变化请求的重绘可能触及任意
-                // 像素，裁剪掉它会丢失该更新。
-                if (!needsRedraw) { this.NoteHoverDamage(oldHover, hitId); }
-                this.NoteRedrawWhy("ApplyEvent");
-                needsRedraw = true;
-            }
-            if (focus.pressedId >= 0) {
-                this.NoteRedrawWhy("press-hold");
-                needsRedraw = true;
-            }
-            // 按住按钮：即时模式拖拽逻辑（画布元素、选框、
-            // 缩放手柄）位于渲染代码中，因此指针按下期间
-            // 的每次移动都必须到达一帧，即使不在任何控件上。
-            if (pointerDown) {
-                this.NoteRedrawWhy("pointer-down");
-                needsRedraw = true;
-            }
-            int cursorId = hitId;
-            if (focus.pressedId >= 0) { cursorId = focus.pressedId; }
-            int wtype = hitTester.GetWidgetType(cursorId);
-            if (wtype == 0) { Window.SetCursor(1); }
-            else if (wtype == 1) { Window.SetCursor(2); }
-            else if (wtype == 4) { Window.SetCursor(3); }
-            else if (wtype == 5) { Window.SetCursor(4); }
-            else if (wtype == 6) { Window.SetCursor(6); }
-            else if (wtype == 7) { Window.SetCursor(7); }
-            else if (wtype == 8) { Window.SetCursor(8); }
-            else { Window.SetCursor(0); }
-        }
-
-        if (kind == 2) {
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.AnchorAt(0, mouseX, mouseY, false);
-            if (window.EventButton() == 1) {
-                rightPressTargetId = hitTester.AnchorAt(2, mouseX, mouseY,
-                    menuBlockPrevious);
-                pressTargetId = -1;
-                hitTester.ClearAnchor(0);
-            } else {
-                focus.SetPressed(hitId);
-                if (!routedFocusAssigned) { focus.SetFocused(hitId); }
-                // 主键按下作废上一次右键解析出的目标：否则被右键
-                // 点过的控件会一直认为自己是次要目标，之后在别处的
-                // 每一次点击它都会跟着响应（树行被莫名展开/折叠）。
-                hitTester.ClearAnchor(2);
-                hitTester.ClearAnchor(3);
-                rightPressTargetId = -1;
-                rightClickTargetId = -1;
-                pressTargetId = hitId;
-                pressOnBlocker = this.PressHitBlocker(hitId, mouseX, mouseY);
-                pointerDown = true;
-                NotePressStart(hitId, mouseX, mouseY);
-            }
-            this.NoteRedrawWhy("NotePressStart");
-            needsRedraw = true;
-        }
-
-        if (kind == 3) {
-            if (this.currentPointerType == 1 || window.EventFlag() == 1) {
-                // 触控抬起：清空即时模式的 Hover 态，根除桌面按钮 Sticky Hover 浅色残留
-                if (focus != null) {
-                    focus.SetHovered(-1);
-                }
-            }
-            mouseX = window.EventX();
-            mouseY = window.EventY();
-            int hitId = hitTester.AnchorAt(1, mouseX, mouseY, false);
-            if (window.EventButton() == 1) {
-                rightClickTargetId = hitTester.AnchorAt(3, mouseX, mouseY,
-                    menuBlockPrevious);
-                clickTargetId = -1;
-                hitTester.ClearAnchor(1);
-            } else {
-                // 与 ProcessEvent 的点击发布同语义（见彼处注释）：
-                // 触摸拖拽收尾释放不发布点击目标，只完成拖拽收尾。
-                pointerDown = false;
-                if (window.EventFlag() == 1) {
-                    clickTargetId = -1;
-                    NoteRelease(mouseX, mouseY);
-                    focus.ClearPress();
-                } else if (pressOnBlocker) {
-                    // 按下落在阻挡区/空白（弹层遮罩、模态变暗层或
-                    // 无命中区的表面）：这是弹层「按外部关闭」的那
-                    // 一下按下。弹层会在本帧渲染时读到 kind==2 并把
-                    // 自己关掉，于是释放帧快照里弹层已经不存在——
-                    // 若仍把释放解析成点击目标，该点恰好落到其下的
-                    // 控件上，同一次手势就先关菜单再点穿到后面的内
-                    // 容（下拉/菜单/抽屉/layer 的“点击穿透”）。
-                    // 发布保持 -1、双击基线不更新，释放本身照常完成
-                    // 拖拽收尾；各弹层自带的 ClaimClick 防线（打开
-                    // 那一帧）与本防线（关闭那一手势）互补。
-                    clickTargetId = -1;
-                    NoteRelease(mouseX, mouseY);
-                    focus.ClearPress();
-                } else {
-                    clickTargetId = hitId;
-                    NoteRelease(mouseX, mouseY);
-                    NoteClickTarget(clickTargetId);
-                    focus.ClearPress();
-                }
-            }
-            this.NoteRedrawWhy("click");
-            needsRedraw = true;
-        }
-
         if (kind == 4 && window.EventKeyCode() == 9) {
-            if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+            if (!this.HasOverlays() && !blocksInputBelow) {
                 int dir = 1;
                 if (Modifiers.HasShift(window.EventMods())) { dir = -1; }
                 focus.FocusStep(dir);

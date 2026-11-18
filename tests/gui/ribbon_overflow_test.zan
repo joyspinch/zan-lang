@@ -2,20 +2,12 @@ using System;
 using Gui;
 using Gui.Widget;
 
-// Ribbon 溢出菜单回归：条带放不下时，右端出现「»」，放不下的
-// 命令收进菜单（以前是直接被裁掉——命令还在，却点不着）。
-// 三件事：
-//   ① 窄条带：溢出清单非空，且"画在条带上的 + 进菜单的"= 命令
-//      总数（没有命令凭空消失），画出来的都整整齐齐落在可用宽度
-//      内（不画半个按钮）；
-//   ② 宽条带：没有溢出；
-//   ③ 按语义名点「»」→ 渲染返回 OverflowRequest（宿主据此开菜单）。
+// Retained Ribbon 溢出回归：窄条带把放不下的命令收进真实菜单，
+// 宽条带不留溢出；「»」和菜单项都通过真实 Button Down/Up 路由。
 class RibbonOverflowTest {
     static int fails;
     static App app;
     static List<RibbonGroup> groups;
-    static int renderW;
-    static int seenHit;
     static int totalCmds;
 
     static void EqInt(string what, int got, int want) {
@@ -31,47 +23,113 @@ class RibbonOverflowTest {
         Console.WriteLine("FAIL " + what);
     }
 
-    // 命令规模照着设计器排版组来：17 个图标格 + 2 个大命令
-    // （那条工具条只有 324px，右半就是被裁掉的那批）。
+    // 命令规模照着设计器排版组来：17 个图标格 + 2 个大命令。
     static void Build() {
         groups = new List<RibbonGroup>();
         RibbonGroup ga = new RibbonGroup("Layout");
         for (int i = 0; i < 17; i = i + 1) {
-            ga.Add(RibbonItem.Tile("align-left", "Tile " + Convert.ToString(i)));
+            RibbonItem item = RibbonItem.Tile("align-left", "Tile " + Convert.ToString(i));
+            item.act = i;
+            ga.Add(item);
         }
         groups.Add(ga);
         RibbonGroup gb = new RibbonGroup("Run");
-        gb.Add(RibbonItem.Large("play", "Run"));
-        gb.Add(RibbonItem.Large("bug", "Debug"));
+        RibbonItem run = RibbonItem.Large("play", "Run"); run.act = 17;
+        RibbonItem debug = RibbonItem.Large("bug", "Debug"); debug.act = 18;
+        gb.Add(run);
+        gb.Add(debug);
         groups.Add(gb);
         totalCmds = 19;
     }
 
-    static void Body() {
-        int h = Ribbon.RenderGroups(app, 0, 0, renderW, groups);
-        // 只记"有返回"的那一帧：命中之后下一帧又回到 -1。
-        if (h != 0 - 1) { seenHit = h; }
+    static void Layout(Ribbon ribbon, int width) {
+        app.SetRootControl(ribbon);
+        ribbon.MeasureTree(app);
+        ribbon.Arrange(0, 0, width, Ribbon.HeightGroups(app));
     }
 
-    static void Frame() {
-        app.PumpGuarded();
-        app.FrameGuarded(RibbonOverflowTest.Body);
+    static void Click(Control control) {
+        EqTrue("real Button is laid out", control != null && control.bw > 0 && control.bh > 0);
+        if (control == null) { return; }
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        EqTrue("real Down captures Button", app.GetCapturedPointer() == control);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.DrainPosts();
+    }
+
+    static void CheckClientPopup(Control popup) {
+        int margin = app.Scale(Space.XS);
+        EqTrue("popup stays inside client content, excluding the shadow and title bar",
+            popup.bx >= app.ShapeOffX() + margin
+            && popup.by >= app.ShapeOffY() + app.ContentTop() + margin
+            && popup.bx + popup.bw <= app.ShapeOffX() + app.ClientWidth() - margin
+            && popup.by + popup.bh <= app.ShapeOffY() + app.ClientHeight() - margin);
+    }
+
+    static void ScrollPopupAtDpi(Ribbon ribbon, int dpi) {
+        app.SetOffscreenViewport(600, 240, dpi);
+        app.shapeOffX = 10; app.shapeOffY = 10;
+        int width = app.Scale(160);
+        Layout(ribbon, width);
+        ribbon.Arrange(app.ShapeOffX() + app.ClientWidth() - width,
+            app.ShapeOffY() + app.ContentTop(), width, Ribbon.HeightGroups(app));
+        Click(ribbon.OverflowButton());
+        Control popup = app.overlayHost.ActiveRoot();
+        EqTrue("short viewport opens the real retained menu", popup != null);
+        if (popup == null) { return; }
+        CheckClientPopup(popup);
+        EqTrue("popup has the standard menu surface", popup.Kind() == "ContextMenu"
+            && popup.name == "ribbon-overflow-menu");
+        EqTrue("short viewport clamps menu and exposes vertical scrolling", popup.bh <= app.canvas.Height() * 60 / 100
+            && popup.ScrollExtent() > popup.bh - popup.StyleInsetT() - popup.StyleInsetB());
+        Control last = popup.ChildAt(popup.ChildCount() - 1);
+        int expected = ribbon.OverflowSlots()[popup.ChildCount() - 1].cmd.act;
+        int steps = 0;
+        while (last.by + last.bh > popup.by + popup.bh - popup.StyleInsetB() && steps < 40) {
+            app.ProcessOffscreenInput(13, popup.bx + popup.bw / 2, popup.by + popup.bh / 2, 0, -120, 0, 0);
+            steps = steps + 1;
+        }
+        EqTrue("standard Wheel reaches the complete last command row", popup.ScrollTop() > 0
+            && last.by >= popup.by + popup.StyleInsetT()
+            && last.by + last.bh <= popup.by + popup.bh - popup.StyleInsetB());
+        ribbon.lastAct = -1;
+        Click(last);
+        EqInt("scrolled last row routes its original command", ribbon.lastAct, expected);
+        EqTrue("scrolled selection closes the actual popup", !app.overlayHost.HasActive());
+
+        Control positioned = new Control("client-bounds-popup");
+        positioned.prefW = app.canvas.Width() * 2;
+        positioned.prefH = app.canvas.Height() * 2;
+        app.overlayHost.ShowAt(app, positioned, app.canvas.Width(), app.canvas.Height());
+        CheckClientPopup(positioned);
+        EqTrue("oversized point popup is clamped to the available client content box",
+            positioned.bw == app.ClientWidth() - app.Scale(Space.XS * 2)
+            && positioned.bh == app.ClientHeight() - app.ContentTop() - app.Scale(Space.XS * 2));
+        app.overlayHost.Dismiss();
+        positioned.prefW = app.Scale(40); positioned.prefH = app.Scale(40);
+        app.overlayHost.ShowAt(app, positioned, -100, -100);
+        CheckClientPopup(positioned);
+        EqTrue("point popup below the origin starts inside the client content box",
+            positioned.bx == app.ShapeOffX() + app.Scale(Space.XS)
+            && positioned.by == app.ShapeOffY() + app.ContentTop() + app.Scale(Space.XS));
+        app.overlayHost.Dismiss();
+        app.shapeOffX = 0; app.shapeOffY = 0;
     }
 
     static void Main() {
         fails = 0;
-        seenHit = 0 - 1;
-        app = new App("ribbon-overflow", 1200, 320);
-        app.Show();
+        app = App.CreateOffscreen("ribbon-overflow", 1200, 320);
         Build();
+        Ribbon ribbon = new Ribbon();
+        for (int i = 0; i < groups.Count; i = i + 1) { ribbon.AddGroup(groups[i]); }
 
-        // ① 窄条带（设计器工具条的宽度）。
-        renderW = 320;
-        Frame();
-        Frame();
-        List<RibbonSlot> over = Ribbon.LastOverflow();
+        // 窄条带：每个命令要么完整落位，要么进入 retained 溢出清单。
+        Layout(ribbon, 320);
+        List<RibbonSlot> over = ribbon.OverflowSlots();
         EqTrue("narrow ribbon overflows", over.Count > 0);
-        RibbonLayout lay = Ribbon.LastLayout();
+        RibbonLayout lay = ribbon.CurrentLayout();
         int visible = 0;
         int overN = 0;
         for (int i = 0; i < lay.slots.Count; i = i + 1) {
@@ -81,33 +139,40 @@ class RibbonOverflowTest {
                 continue;
             }
             visible = visible + 1;
-            EqTrue("visible slot inside width", s.x + s.w <= renderW);
+            EqTrue("visible slot inside width", s.x + s.w <= ribbon.OverflowButton().bx);
         }
         EqInt("no command lost", visible + overN, totalCmds);
         EqInt("overflow list matches slots", over.Count, overN);
-        EqTrue("overflow button placed", Ribbon.LastOverflowButton().width > 0);
+        EqTrue("retained overflow Button placed", ribbon.OverflowButton().Visible
+            && ribbon.OverflowButton().bw > 0);
 
-        // ② 宽条带：装得下就没有溢出。
-        renderW = 1100;
-        Frame();
-        Frame();
-        EqInt("wide ribbon has no overflow", Ribbon.LastOverflow().Count, 0);
+        // 宽条带：装得下就没有溢出。
+        Layout(ribbon, 1100);
+        EqInt("wide ribbon has no overflow", ribbon.OverflowSlots().Count, 0);
+        EqTrue("wide ribbon hides overflow Button", !ribbon.OverflowButton().Visible);
 
-        // ③ 按语义名点「»」→ 渲染报溢出请求。
-        renderW = 320;
-        Frame();
-        UiDriver.app = app;
-        UiDriver.resultsPath = "build/ribbon_overflow_results.log";
-        UiDriver.probes = new List<UiProbe>();
-        if (File.Exists(UiDriver.resultsPath)) {
-            File.Delete(UiDriver.resultsPath);
+        // 真实 Button 点击打开菜单，再由真实菜单 Button 路由原命令。
+        Layout(ribbon, 320);
+        over = ribbon.OverflowSlots();
+        EqTrue("narrow overflow restored", over.Count > 0);
+        if (over.Count > 0) {
+            int expected = over[0].cmd.act;
+            ribbon.lastAct = -1;
+            Click(ribbon.OverflowButton());
+            Control popup = app.overlayHost.ActiveRoot();
+            EqTrue("retained overflow Button opens menu", popup != null);
+            if (popup != null) {
+                EqInt("menu contains every overflow command", popup.ChildCount(), over.Count);
+                Click(popup.ChildAt(0));
+                EqInt("menu Button routes original act", ribbon.lastAct, expected);
+                EqTrue("menu Button selection closes popup", !app.overlayHost.HasActive());
+            }
         }
-        bool ok = UiDriver.Exec("clickid @ribbon-more");
-        EqInt("exec @ribbon-more accepted", ok ? 1 : 0, 1);
-        for (int i = 0; i < 4; i = i + 1) { Frame(); }
-        EqInt("overflow requested", seenHit, Ribbon.OverflowRequest);
-        File.Delete(UiDriver.resultsPath);
 
+        ScrollPopupAtDpi(ribbon, 100); ScrollPopupAtDpi(ribbon, 150); ScrollPopupAtDpi(ribbon, 200);
+        app.SetRootControl(null);
+        app.DrainPosts();
+        app.canvas.Destroy();
         Console.WriteLine(fails == 0 ? "RIBBONOVF PASS"
             : "RIBBONOVF FAIL " + Convert.ToString(fails));
     }

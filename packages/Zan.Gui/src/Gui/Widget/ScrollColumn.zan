@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 
@@ -7,14 +8,28 @@ namespace Gui.Widget;
 // 子控件按各自自然高度自上而下堆叠；
 // 当内容总高度超过容器时，按共享的滚动量
 // 向上偏移，并裁剪到其边界内（RenderTree
-// 已推入裁剪区），隐藏滚出视野的行（使其不响应
-// 点击），滚轮与滚动条使用 Control 的保留式滚动状态。
+// 已推入裁剪区），离屏行仅退出绘制/输入，不改作者 visible
+// 或自然测量；滚轮与滚动条使用 Control 的保留式滚动状态。
 // 在文档中以 "ScrollColumn" 类型注册。
 public class ScrollColumn : Control {
     // Arrange 后写出：子控件总内容高度（px），供滚动计算。
     private int contentH;
     // 滚动条预留宽度（缩放后，OnMeasure 刷新）。
     private int barReserve;
+    private int arrangeRevision;
+    // IDs carry viewport retirement state without retaining removed rows.
+    private List<int> retiredRows;
+
+    private bool RowInViewport(Control child) {
+        if (child == null || !child.StyleVisible() || child.bw <= 0 || child.bh <= 0) { return false; }
+        int left = bx + (computedStyle != null ? computedStyle.BorderLeftPx() : 0);
+        int right = bx + bw - (computedStyle != null ? computedStyle.BorderRightPx() : 0);
+        int top = by + (computedStyle != null ? computedStyle.BorderTopPx() : 0);
+        int bottom = by + bh - (computedStyle != null ? computedStyle.BorderBottomPx() : 0);
+        return right > left && bottom > top
+            && child.bx + child.bw > left && child.bx < right
+            && child.by + child.bh > top && child.by < bottom;
+    }
 
     // 初始化：以 "scroll" 注册（子控件自然垂直堆叠），置共享滚动状态
     // 与滚动条预留宽。
@@ -47,9 +62,21 @@ public class ScrollColumn : Control {
         barReserve = app.Scale(12);
     }
 
-    // 按自然高度自上而下堆叠子控件，向上偏移
-    // 当前滚动量；完全在视口外的行被隐藏。
+    public override bool ChildInViewport(Control child) {
+        return this.RowInViewport(child);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        // Touch slop must not admit a child through the viewport's border/outside.
+        Rect view = this.ScrollViewport();
+        if (!view.Contains(x, y)) { return null; }
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
+    }
+
+    // Author visibility owns layout. Viewport culling owns only paint/input.
     public override void Arrange(int px, int py, int pw, int ph) {
+        arrangeRevision = arrangeRevision + 1;
+        int revision = arrangeRevision;
         if (pw < 0) { pw = 0; }
         if (ph < 0) { ph = 0; }
         bx = px;
@@ -73,15 +100,27 @@ public class ScrollColumn : Control {
         int innerW = viewW - padL - padR - barReserve;
         if (innerW < 0) { innerW = 0; }
 
-        // Count every natural row before culling: hidden offscreen rows still own extent.
+        // Strong call-local snapshot: Arrange and retirement callbacks may replace children.
+        List<Control> rows = new List<Control>();
+        rows = this.SnapshotChildren();
+        List<int> heights = new List<int>();
+        List<bool> shown = new List<bool>();
         int total = padT + padB;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            int hh = c.StyleHeight();
-            if (hh <= 0) { hh = c.prefH; }
-            if (hh < 0) { hh = 0; }
-            total = total + hh;
-            if (i > 0) { total = total + gapPx; }
+        int rowCount = 0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Control c = rows[i];
+            bool participates = c.StyleVisible();
+            shown.Add(participates);
+            int hh = 0;
+            if (participates) {
+                hh = c.StyleHeight();
+                if (hh <= 0) { hh = c.prefH; }
+                if (hh < 0) { hh = 0; }
+                if (rowCount > 0) { total = total + gapPx; }
+                total = total + hh;
+                rowCount = rowCount + 1;
+            }
+            heights.Add(hh);
         }
         contentH = total;
         scrollExtent = total > viewH ? total : viewH;
@@ -91,25 +130,42 @@ public class ScrollColumn : Control {
         if (scrollY < 0) { scrollY = 0; }
         scrollX = 0;
 
+        int offset = scrollY;
         int viewY = py + borderT;
-        int cy = viewY + padT - scrollY;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
-            int hh = c.StyleHeight();
-            if (hh <= 0) { hh = c.prefH; }
-            if (hh < 0) { hh = 0; }
-            bool onScreen = (cy + hh) > viewY && cy < (viewY + viewH);
-            if (!onScreen && c.visible) {
-                App app = this.FindApp();
-                if (app != null) { app.ReleaseInputSubtree(c); }
-            }
-            c.visible = onScreen;
+        int cy = viewY + padT - offset;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Control c = rows[i];
+            if (!shown[i] || c.parent != this || this.IndexOf(c) < 0) { continue; }
+            int hh = heights[i];
             c.Arrange(px + borderL + padL, cy, innerW, hh);
+            if (arrangeRevision != revision || scrollY != offset) { return; }
             cy = cy + hh + gapPx;
+        }
+
+        List<int> nextRetired = new List<int>();
+        List<Control> retiring = new List<Control>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            Control c = rows[i];
+            if (c.parent != this || this.IndexOf(c) < 0 || this.RowInViewport(c)) { continue; }
+            int id = c.WidgetId();
+            if (retiredRows != null && retiredRows.Contains(id)) { nextRetired.Add(id); }
+            else { retiring.Add(c); }
+        }
+        // Commit before callbacks. Reentrant Arrange owns the new cull set and geometry.
+        retiredRows = nextRetired;
+        App app = this.FindApp();
+        if (app != null) {
+            for (int i = 0; i < retiring.Count; i = i + 1) {
+                Control c = retiring[i];
+                if (c.parent != this || this.IndexOf(c) < 0 || this.RowInViewport(c)) { continue; }
+                retiredRows.Add(c.WidgetId());
+                app.ReleaseInputSubtree(c);
+                if (arrangeRevision != revision || scrollY != offset) { return; }
+            }
         }
     }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(this.SizeProp());
         return ps;

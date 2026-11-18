@@ -1,0 +1,169 @@
+using System;
+using Gui;
+
+class LayeredBulkTest {
+    [DllImport("zan_gui", EntryPoint = "zan_gui_prepare_layered_argb")]
+    private static extern int Prepare(nint dst, int dstWidth, int dstHeight,
+    int dstStride, nint src, int srcWidth, int srcHeight, int srcStride,
+    int offsetX, int offsetY, byte[] coverage, int coverageStride,
+    int coverageLength, int shadowBand);
+
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL layered bulk: " + name);
+            throw new Exception("layered bulk: " + name);
+        }
+    }
+
+    static int SourcePixel(int index) {
+        int a = index & 255;
+        int r = (index / 256) & 255;
+        int g = (index * 37 + 19) & 255;
+        int b = (index * 73 + 251) & 255;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    // Compare every active destination pixel with the former shell's exact
+    // per-pixel path; independent sentinels cover both row paddings and guards.
+    static void Compare(string name, int sw, int sh, int sourceStride,
+    int dw, int dh, int targetStride, int ox, int oy, byte[] mask,
+    int maskStride, bool shadow) {
+        int sourceCount = sourceStride * sh;
+        int targetCount = targetStride * dh;
+        nint sourceMemory = NativeMemory.Alloc((sourceCount + 4) * 4);
+        nint targetMemory = NativeMemory.Alloc((targetCount + 4) * 4);
+        Check(name + " allocation", sourceMemory != 0 && targetMemory != 0);
+        try {
+            Span<int> source = new Span<int>(sourceMemory, sourceCount + 4);
+            Span<int> target = new Span<int>(targetMemory, targetCount + 4);
+            for (int i = 0; i < sourceCount + 4; i = i + 1) { source[i] = 0x13579BDF; }
+            for (int i = 0; i < targetCount + 4; i = i + 1) { target[i] = 0x2468ACE0; }
+            for (int y = 0; y < sh; y = y + 1) {
+                for (int x = 0; x < sw; x = x + 1) {
+                    source[2 + y * sourceStride + x] = SourcePixel(y * sw + x);
+                }
+            }
+            int length = mask == null ? 0 : mask.Length;
+            byte[] savedMask = new byte[length];
+            for (int i = 0; i < length; i = i + 1) { savedMask[i] = mask[i]; }
+            Check(name + " accepted", Prepare(targetMemory + 8, dw, dh, targetStride * 4,
+            sourceMemory + 8, sw, sh, sourceStride * 4, ox, oy,
+            mask, maskStride, length, shadow ? 1 : 0) == 1);
+            for (int y = 0; y < dh; y = y + 1) {
+                for (int x = 0; x < targetStride; x = x + 1) {
+                    int expected = x >= dw ? 0x2468ACE0 : 0;
+                    long sx = (long)x - ox;
+                    long sy = (long)y - oy;
+                    if (x < dw && sx >= 0 && sx < sw && sy >= 0 && sy < sh) {
+                        int cov = mask == null ? 255 : (int)mask[(int)sy * maskStride + (int)sx];
+                        expected = WindowShapeMask.LayeredArgb(SourcePixel((int)sy * sw + (int)sx), cov, shadow);
+                    }
+                    if (target[2 + y * targetStride + x] != expected) { Check(name + " exact destination", false); }
+                }
+            }
+            Check(name + " destination guards", target[0] == 0x2468ACE0 && target[1] == 0x2468ACE0
+            && target[targetCount + 2] == 0x2468ACE0 && target[targetCount + 3] == 0x2468ACE0);
+            for (int i = 0; i < sourceCount + 4; i = i + 1) {
+                int expected = 0x13579BDF;
+                int at = i - 2;
+                if (at >= 0 && at < sourceCount && at % sourceStride < sw) {
+                    expected = SourcePixel((at / sourceStride) * sw + at % sourceStride);
+                }
+                if (source[i] != expected) { Check(name + " source unchanged", false); }
+            }
+            for (int i = 0; i < length; i = i + 1) {
+                if (mask[i] != savedMask[i]) { Check(name + " mask unchanged", false); }
+            }
+        } finally {
+            NativeMemory.Free(sourceMemory);
+            NativeMemory.Free(targetMemory);
+        }
+    }
+
+    static void AlphaAndPlacement() {
+        // Every 0..255 alpha x 0..255 coverage pair, including 239/240 shadow
+        // threshold and sub-byte alpha rounding, with three varying RGB lanes.
+        byte[] mask = new byte[259 * 256];
+        for (int y = 0; y < 256; y = y + 1) {
+            for (int x = 0; x < 259; x = x + 1) { mask[y * 259 + x] = (byte)y; }
+        }
+        Compare("all alpha coverage", 256, 256, 261, 263, 260, 268, 3, 2, mask, 259, false);
+        Compare("all shadow alpha coverage", 256, 256, 261, 256, 256, 260, 0, 0, mask, 259, true);
+        Compare("rectangle without mask", 19, 17, 23, 24, 22, 29, 2, 3, null, 0, false);
+        Compare("source larger than target", 19, 17, 23, 8, 6, 11, 0, 0, null, 0, false);
+        Compare("negative offset clipping", 19, 17, 23, 12, 10, 16, -3, -4, null, 0, false);
+        Compare("source off right", 19, 17, 23, 12, 10, 16, 20, 0, null, 0, false);
+        Compare("source off bottom", 19, 17, 23, 12, 10, 16, 0, 20, null, 0, false);
+        Compare("extreme positive offsets", 19, 17, 23, 12, 10, 16, 2147483647, 2147483647, null, 0, false);
+        Compare("extreme negative offsets", 19, 17, 23, 12, 10, 16, -2147483647 - 1, -2147483647 - 1, null, 0, false);
+        Compare("empty width clears", 0, 7, 3, 12, 10, 16, 0, 0, null, 0, false);
+        Compare("empty height clears", 7, 0, 9, 12, 10, 16, 0, 0, null, 0, false);
+    }
+
+    static void ShapesAtDpi(int dpi) {
+        int width = 37 * dpi / 100;
+        int height = 29 * dpi / 100;
+        WindowShapeMask shape = new WindowShapeMask();
+        for (int mode = 0; mode < 6; mode = mode + 1) {
+            List<WindowShapeRegion> regions = new List<WindowShapeRegion>();
+            if (mode == 0) { regions.Add(new WindowShapeRegion(1, 2, 3, 31, 22, 0)); }
+            if (mode == 1 || mode == 3 || mode == 5) {
+                regions.Add(new WindowShapeRegion(1, 2, 3, 31, 22, 7));
+            }
+            if (mode == 2 || mode == 3) { regions.Add(new WindowShapeRegion(2, 17, -2, 23, 18, 0)); }
+            if (mode == 4 || mode == 5) { regions.Add(new WindowShapeRegion(3, 0, 0, 37, 29, 0)); }
+            byte[] mask = shape.Coverage(width, height, dpi, regions);
+            Check("shape coverage exists", mask != null);
+            Compare("shape DPI offset/short source", width - 5, height - 3, width + 3,
+            width + 7, height + 6, width + 12, 3, 2, mask, width, shape.HasShadowBand());
+            Compare("shape DPI cropped target", width, height, width + 3,
+            width - 4, height - 2, width + 1, -2, -1, mask, width, shape.HasShadowBand());
+        }
+    }
+
+    static void InvalidBounds() {
+        nint dst = NativeMemory.Alloc(256);
+        nint src = NativeMemory.Alloc(256);
+        Check("boundary allocation", dst != 0 && src != 0);
+        try {
+            Span<int> target = new Span<int>(dst, 64);
+            for (int i = 0; i < 64; i = i + 1) { target[i] = 0x2468ACE0; }
+            byte[] mask = new byte[16];
+            Check("null destination rejected", Prepare(0, 4, 4, 16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("null source rejected", Prepare(dst, 4, 4, 16, 0, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("zero target rejected", Prepare(dst, 0, 4, 16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("negative target rejected", Prepare(dst, 4, -1, 16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("negative source rejected", Prepare(dst, 4, 4, 16, src, -1, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("short destination stride rejected", Prepare(dst, 4, 4, 12, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("short source stride rejected", Prepare(dst, 4, 4, 16, src, 4, 4, 12, 0, 0, null, 0, 0, 0) == 0);
+            Check("negative stride rejected", Prepare(dst, 4, 4, -16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("unaligned destination rejected", Prepare(dst + 1, 4, 4, 16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("unaligned source rejected", Prepare(dst, 4, 4, 16, src + 1, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("incomplete mask rejected", Prepare(dst, 4, 4, 16, src, 4, 4, 16, 0, 0, mask, 4, 15, 0) == 0);
+            Check("short mask stride rejected", Prepare(dst, 4, 4, 16, src, 4, 4, 16, 0, 0, mask, 3, 16, 0) == 0);
+            Check("negative mask length rejected", Prepare(dst, 4, 4, 16, src, 4, 4, 16, 0, 0, mask, 4, -1, 0) == 0);
+            Check("overlapping buffers rejected", Prepare(dst, 4, 4, 16, dst, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("partial overlap rejected", Prepare(dst, 4, 4, 16, dst + 8, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            Check("oversized destination row rejected", Prepare(dst, 2147483647, 1, 16, src, 4, 4, 16, 0, 0, null, 0, 0, 0) == 0);
+            for (int i = 0; i < 64; i = i + 1) { Check("invalid call does not write", target[i] == 0x2468ACE0); }
+            Check("null empty source clears", Prepare(dst, 4, 4, 16, 0, 0, 4, 0, 0, 0, null, 0, 0, 0) == 1);
+            for (int i = 0; i < 16; i = i + 1) { Check("empty clears active pixels", target[i] == 0); }
+        } finally {
+            NativeMemory.Free(src);
+            NativeMemory.Free(dst);
+        }
+    }
+
+    static void Main() {
+        AlphaAndPlacement();
+        ShapesAtDpi(100);
+        ShapesAtDpi(125);
+        ShapesAtDpi(150);
+        ShapesAtDpi(200);
+        ShapesAtDpi(300);
+        InvalidBounds();
+        Check("snapshot remains straight", WindowShapeMask.SnapshotStraightArgb(0x80FF8040, 128, false) == 0x40FF8040);
+        Check("layered double truncation", WindowShapeMask.LayeredArgb(0x80FF8040, 128, false) == 0x40402010);
+        Console.WriteLine("LAYERED_BULK_OK");
+    }
+}

@@ -1,0 +1,300 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class ToolStripInputCounts {
+    public int indexed;
+    public int itemEvents;
+    public int buttonEvents;
+    public int last;
+    public void Index(int index) { indexed = indexed + 1; last = index; }
+    public void Item() { itemEvents = itemEvents + 1; }
+    public void Button() { buttonEvents = buttonEvents + 1; }
+}
+
+class ToolStripLayoutInputTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("ToolStrip: " + label); }
+    }
+
+    static List<Button> Items(ToolStrip bar) {
+        List<Button> items = new List<Button>();
+        Check(bar.Count() == 5 && bar.ItemAt(-1) == null && bar.ItemAt(5) == null,
+            "public insertion indices exclude the spacer");
+        for (int i = 0; i < bar.Count(); i = i + 1) {
+            Button item = bar.ItemAt(i);
+            Check(item != null, "every insertion index has an item");
+            items.Add(item);
+        }
+        Check(items[0].Label() == "L" && items[1].Label() == "R1"
+            && items[2].Label() == "" && items[3].Label() == "L2" && items[4].Label() == "R2",
+            "mixed left/right/separator indices retain insertion order");
+        Check(items[2].Disabled.Get() && items[2].IsDisabled()
+            && Style.Has(items[2].Class, "toolstrip-separator"), "separator is semantically disabled");
+        return items;
+    }
+
+    static List<Button> Populate(ToolStrip bar) {
+        Button first = bar.NewItem("L", "");
+        Check(bar.AddRight("R1") == 1 && bar.AddSeparator() == 2
+            && bar.Add("L2") == 3 && bar.AddRight("R2", "") == 4,
+            "NewItem/Add/AddRight/AddSeparator share insertion indices");
+        List<Button> items = Items(bar);
+        Check(items[0] == first, "NewItem remains the first left item");
+        return items;
+    }
+
+    static ToolStrip Build(int source) {
+        if (source == 0) {
+            ToolStrip bar = new ToolStrip();
+            Populate(bar);
+            return bar;
+        }
+        HtmlDoc doc = Html.Parse("<zan-tool-strip options='L|>R1|-|L2|>R2'></zan-tool-strip>", "", null);
+        Check(doc.root != null && doc.root.ChildCount() == 1 && doc.root.ChildAt(0) is ToolStrip,
+            "HTML options construct a real ToolStrip");
+        ToolStrip bar = (ToolStrip)doc.root.ChildAt(0);
+        doc.root.Remove(bar);
+        return bar;
+    }
+
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { return; }
+            action();
+        }
+    }
+
+    static void Paint(App app, ToolStrip bar) {
+        app.BeginOffscreenFrame();
+        bar.RenderTree(app);
+        bar.RenderTree(app);
+        app.EndOffscreenFrame();
+        Drain(app);
+    }
+
+    static void Hook(List<Button> items, ToolStripInputCounts counts) {
+        for (int i = 0; i < items.Count; i = i + 1) { items[i].Click.Add(counts.Button); }
+    }
+
+    static void Geometry(App app, ToolStrip bar, List<Button> items, int dpi, int width, string phase) {
+        string at = phase + " dpi=" + Convert.ToString(dpi) + " width=" + Convert.ToString(width);
+        app.SetOffscreenViewport(width + 30, 80, dpi);
+        bar.UseApp(app);
+        bar.MeasureTree(app, app.Scale(width));
+        bar.Arrange(app.Scale(7), app.Scale(11), app.Scale(width), app.Scale(34));
+        app.SetRootControl(bar);
+        Check(bar.bw == app.Scale(width) && bar.bh == app.Scale(34), "requested region " + at);
+        for (int i = 0; i < bar.ChildCount(); i = i + 1) {
+            Control child = bar.ChildAt(i);
+            Check(child.bw >= 0 && child.bh >= 0 && child.bx >= bar.bx && child.by >= bar.by
+                && child.bx + child.bw <= bar.bx + bar.bw && child.by + child.bh <= bar.by + bar.bh,
+                "contains every child including the spacer " + at);
+            for (int j = i + 1; j < bar.ChildCount(); j = j + 1) {
+                Control other = bar.ChildAt(j);
+                Check(child.bx + child.bw <= other.bx || other.bx + other.bw <= child.bx,
+                    "all child rectangles are disjoint " + at);
+            }
+        }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Button item = items[i];
+            Check(bar.ItemAt(i) == item && item.parent == bar && item.bw > 0 && item.bh > 0,
+                "nonzero geometry preserves item identity " + at);
+            int center = item.by * 2 + item.bh - (bar.by * 2 + bar.bh);
+            Check(center >= -2 && center <= 2, "single centered row " + at);
+        }
+        Check(items[0].bx + items[0].bw <= items[2].bx
+            && items[2].bx + items[2].bw <= items[3].bx
+            && items[3].bx + items[3].bw <= items[4].bx
+            && items[4].bx + items[4].bw <= items[1].bx,
+            "left items stay in order and new right items extend leftward " + at);
+        Check(items[0].bx == bar.bx + bar.padL
+            && items[1].bx + items[1].bw == bar.bx + bar.bw - bar.padR,
+            "groups anchor to opposite inner edges " + at);
+        Check(items[2].bw == app.Scale(1) && items[2].computedStyle.BgOr(0) != 0,
+            "separator is a visible one-pixel divider at device scale " + at
+                + " actual=" + items[2].bw.ToString() + " expected=" + app.Scale(1).ToString()
+                + " background=" + items[2].Box(app).BgOr(0).ToString());
+    }
+
+    static void Input(App app, ToolStrip bar, List<Button> items, ToolStripInputCounts counts, string phase) {
+        // Test the routed tree before its first paint, then ensure painting cannot replay clicks.
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Button item = items[i];
+            int before = counts.indexed;
+            int last = bar.LastIndex();
+            int x = item.bx + item.bw / 2;
+            int y = item.by + item.bh / 2;
+            app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+            Drain(app);
+            Check(counts.indexed == before && counts.itemEvents == before && counts.buttonEvents == before,
+                "Down never activates an item " + phase);
+            if (i != 2) { Check(app.GetCapturedPointer() == item, "button captures actual Down " + phase); }
+            else { Check(app.GetCapturedPointer() != item, "disabled separator cannot capture " + phase); }
+            app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+            Drain(app);
+            int expected = i == 2 ? before : before + 1;
+            Check(counts.indexed == expected && counts.itemEvents == expected && counts.buttonEvents == expected
+                && app.GetCapturedPointer() == null, "Up dispatches each enabled callback exactly once " + phase);
+            Check(bar.LastIndex() == (i == 2 ? last : i)
+                && bar.SelectedIndex() == bar.LastIndex() && (i == 2 || counts.last == i),
+                "callback and LastIndex use insertion indices " + phase);
+            Paint(app, bar);
+            Check(counts.indexed == expected && counts.itemEvents == expected && counts.buttonEvents == expected,
+                "painting does not replay callbacks " + phase);
+        }
+    }
+
+    static void ResizeAndInput(App app, ToolStrip bar, List<Button> items, ToolStripInputCounts counts,
+        int dpi, string phase) {
+        Geometry(app, bar, items, dpi, 640, phase);
+        List<int> wide = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            wide.Add(items[i].bx); wide.Add(items[i].by); wide.Add(items[i].bw); wide.Add(items[i].bh);
+        }
+        Input(app, bar, items, counts, phase + " wide");
+        Geometry(app, bar, items, dpi, 240, phase);
+        Check(items[1].bx < wide[4] && items[0].bx == wide[0], "resize moves only the right anchor");
+        Input(app, bar, items, counts, phase + " narrow");
+        Geometry(app, bar, items, dpi, 640, phase);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Check(items[i].bx == wide[i * 4] && items[i].by == wide[i * 4 + 1]
+                && items[i].bw == wide[i * 4 + 2] && items[i].bh == wide[i * 4 + 3],
+                "wide geometry restores after narrow resize " + phase);
+        }
+    }
+
+    static void Exercise(App app, int source, int dpi) {
+        ToolStrip bar = Build(source);
+        List<Button> items = Items(bar);
+        ToolStripInputCounts counts = new ToolStripInputCounts();
+        bar.OnItemClick(counts.Index);
+        bar.ItemClick.Add(counts.Item);
+        Hook(items, counts);
+        string phase = (source == 0 ? "code" : "HTML") + " dpi=" + Convert.ToString(dpi);
+        ResizeAndInput(app, bar, items, counts, dpi, phase);
+        bar.Clear();
+        Check(bar.Count() == 0 && bar.ItemAt(0) == null && bar.ChildCount() == 1,
+            "Clear retains only the flexible spacer");
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Check(items[i].parent == null, "Clear detaches every old item");
+        }
+        items = Populate(bar);
+        Hook(items, counts);
+        ResizeAndInput(app, bar, items, counts, dpi, phase + " Clear repopulated");
+        bar.SetItemsText("L|>R1|-|L2|>R2");
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Check(items[i].parent == null, "SetItemsText detaches replaced items");
+        }
+        items = Items(bar);
+        Hook(items, counts);
+        ResizeAndInput(app, bar, items, counts, dpi, phase + " options rebuilt");
+        app.SetRootControl(null);
+    }
+
+    static void LongCaption(App app, int source, int dpi) {
+        string caption = "A very long operation caption that must shrink before adjacent actions disappear";
+        ToolStrip bar = new ToolStrip();
+        if (source == 0) {
+            bar.Add(caption, "file");
+            bar.Add("Go");
+            bar.AddRight("", "x");
+        } else {
+            HtmlDoc doc = Html.Parse("<zan-tool-strip options='" + caption
+                + ":file|Go|>:x'></zan-tool-strip>", "", null);
+            bar = (ToolStrip)doc.root.ChildAt(0);
+            doc.root.Remove(bar);
+        }
+        ToolStripInputCounts counts = new ToolStripInputCounts();
+        bar.OnItemClick(counts.Index);
+        app.SetOffscreenViewport(1310, 80, dpi);
+        bar.UseApp(app);
+        bar.MeasureTree(app, app.Scale(1280));
+        bar.Arrange(app.Scale(7), app.Scale(11), app.Scale(1280), app.Scale(34));
+        List<int> natural = new List<int>();
+        for (int i = 0; i < bar.Count(); i = i + 1) {
+            Button item = bar.ItemAt(i);
+            Check(item.bw == item.computedStyle.ClampW(item.prefW),
+                "wide actions use their real child content preference");
+            natural.Add(item.bx); natural.Add(item.bw);
+        }
+        app.SetOffscreenViewport(270, 80, dpi);
+        bar.MeasureTree(app, app.Scale(240));
+        bar.Arrange(app.Scale(7), app.Scale(11), app.Scale(240), app.Scale(34));
+        app.SetRootControl(bar);
+        Button longAction = bar.ItemAt(0);
+        Button adjacentAction = bar.ItemAt(1);
+        Button rightAction = bar.ItemAt(2);
+        Check(longAction != null && adjacentAction != null && rightAction != null,
+            "all long-caption actions remain present after resize");
+        if (longAction == null || adjacentAction == null || rightAction == null) { return; }
+        Check(longAction.bw < natural[1], "long caption yields its spare width on resize");
+        Check(adjacentAction.bw == natural[3] && rightAction.bw == natural[5],
+            "short adjacent actions retain their natural hit width");
+        for (int i = 0; i < bar.Count(); i = i + 1) {
+            Button item = bar.ItemAt(i);
+            Check(item.bw >= app.theme.heightLarge,
+                "long caption preserves adjacent action hit width index=" + i.ToString()
+                    + " width=" + item.bw.ToString() + " dpi=" + dpi.ToString());
+            Check(item.bx >= bar.bx && item.bx + item.bw <= bar.bx + bar.bw,
+                "long-caption actions remain inside toolbar");
+            for (int j = 0; j < item.ChildCount(); j = j + 1) {
+                Control child = item.ChildAt(j);
+                Check(child.bw > 0 && child.bx >= item.bx
+                    && child.bx + child.bw <= item.bx + item.bw,
+                    "long-caption children stay within their allocated action");
+                if (i == 0 && child is Label) {
+                    Check(child.bw < child.prefW, "long caption yields space to its icon");
+                }
+                if (child is IconView) {
+                    Check(child.bw == app.Scale(20) && child.bh == app.Scale(20)
+                        && child.bx >= item.bx && child.bx + child.bw <= item.bx + item.bw,
+                        "toolbar icon remains square and contained before first paint");
+                }
+            }
+            for (int j = i + 1; j < bar.Count(); j = j + 1) {
+                Button other = bar.ItemAt(j);
+                Check(item.bx + item.bw <= other.bx || other.bx + other.bw <= item.bx,
+                    "long-caption actions stay disjoint");
+            }
+            int x = item.bx + item.bw / 2;
+            int y = item.by + item.bh / 2;
+            app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+            Check(app.GetCapturedPointer() == item, "long-caption action captures Down");
+            app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+            Drain(app);
+            Check(counts.indexed == i + 1 && counts.last == i,
+                "long-caption action dispatches exactly once");
+        }
+        Paint(app, bar);
+        Check(counts.indexed == 3, "long-caption paint does not replay input");
+        app.SetOffscreenViewport(1310, 80, dpi);
+        bar.MeasureTree(app, app.Scale(1280));
+        bar.Arrange(app.Scale(7), app.Scale(11), app.Scale(1280), app.Scale(34));
+        for (int i = 0; i < bar.Count(); i = i + 1) {
+            Button item = bar.ItemAt(i);
+            Check(item.bx == natural[i * 2] && item.bw == natural[i * 2 + 1],
+                "natural action geometry restores after a compressed caption");
+        }
+        app.SetRootControl(null);
+    }
+
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+
+    static void Main() {
+        ControlBootstrap.Install();
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        App app = App.CreateOffscreen("ToolStrip layout/input", 680, 80);
+        for (int source = 0; source < 2; source = source + 1) {
+            for (int dpi = 100; dpi <= 200; dpi = dpi + 50) {
+                Exercise(app, source, dpi);
+                LongCaption(app, source, dpi);
+            }
+        }
+        Release(app);
+        Release(frame);
+        Console.WriteLine("toolstrip-layout-input:ok");
+    }
+}

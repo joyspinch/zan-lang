@@ -14,7 +14,7 @@ namespace Gui.Widget;
 //   r.Change += () => { OnSelected(); };
 //
 // 响应式数据绑定：
-//   r.data = form.selectedOption;
+//   r.Value = form.selectedOption;
 //
 // 复合互嵌（DOM 组合，圆点形态）：
 //   Radio custom = new Radio(2, "").With(new Label("VIP会员")).With(new Tag("推荐"));
@@ -23,8 +23,7 @@ namespace Gui.Widget;
 //   .tiny .small .medium .large (尺寸档位)
 //   .bordered                   (边框变体，圆点形态)
 public class Radio : InteractiveControl {
-    public SignalInt model;
-    public Binding<int> data;
+    public Binding<int> Value;
     public int optionValue;
     public string label;
     public Binding<bool> Bordered;
@@ -35,9 +34,10 @@ public class Radio : InteractiveControl {
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
 
-    private void InitRadio(SignalInt m, int ov, string lbl, bool button) {
+    private void InitRadio(Binding<int> value, int ov, string lbl, bool button) {
         this.InitInteractive(lbl);
-        model = m != null ? m : new SignalInt(0);
+        Value = 0;
+        if (value != null) { Value = value; }
         optionValue = ov;
         label = lbl;
         Bordered = false;
@@ -51,19 +51,9 @@ public class Radio : InteractiveControl {
     // 按形态（重）建子节点：圆点 = 圆环 + 标签；按钮段 = 标签。
     // 形态切换与标签变更都经这里保持子树与状态一致。
     public void BuildNodes() {
-        this.children.Clear();
-        if (buttonForm) {
-            if (label != "") {
-                Label ln = new Label(label);
-                ln.ClassName = "radiobutton-label";
-                this.Add(ln);
-            }
-            return;
-        }
-        this.Add(new RadioIndicator(this));
-        if (label != "") {
-            this.Add(new Label(label));
-        }
+        this.RemoveAll();
+        if (!buttonForm) { this.Add(new RadioIndicator(this)); }
+        this.SetLabel(label);
     }
 
     public Radio() {
@@ -74,29 +64,43 @@ public class Radio : InteractiveControl {
         InitRadio(null, ov, lbl, false);
     }
 
-    public Radio(SignalInt m, int ov, string lbl) {
-        InitRadio(m, ov, lbl, false);
+    public Radio(Binding<int> value, int ov, string lbl) {
+        InitRadio(value, ov, lbl, false);
     }
 
     // 连体按钮段形态构造（el-radio-button 对应物；一般由
     // RadioGroup 按钮形态经 MakeItem 造，独立段也可自持信号）。
-    public Radio(SignalInt m, int ov, string lbl, bool button) {
-        InitRadio(m, ov, lbl, button);
+    public Radio(Binding<int> value, int ov, string lbl, bool button) {
+        InitRadio(value, ov, lbl, button);
     }
 
-    public bool IsSelected() { return model.Get() == optionValue; }
+    public bool IsSelected() { return Value.Get() == optionValue; }
 
     public void SetSelected(bool sel) {
         if (sel) { this.Select(); }
     }
 
+    public override void SetProp(string key, string val) {
+        if (key == "label" || key == "text") {
+            this.SetLabel(val);
+            this.Invalidate();
+            return;
+        }
+        base.SetProp(key, val);
+    }
+
     public void SetLabel(string v) {
         label = v;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            if (children[i] is Label) {
-                ((Label)children[i]).Text = v;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is Label) {
+                ((Label)this.ChildAt(i)).SetProp("text", v);
                 return;
             }
+        }
+        if (v != "") {
+            Label caption = new Label(v);
+            if (buttonForm) { caption.ClassName = "radiobutton-label"; }
+            this.Add(caption);
         }
     }
 
@@ -113,14 +117,12 @@ public class Radio : InteractiveControl {
     private void ApplyVariants() {
         this.ApplySizeClass();
         if (!buttonForm && Bordered != null && Bordered.Get()) { this.AddClass("bordered"); }
+        else { this.RemoveClass("bordered"); }
     }
 
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            int v = data.Get();
-            if (v != model.Get()) { model.Set(v); }
-        }
+        this.ApplyVariants();
         if (!buttonForm) { return; }
         // 段形态的选中态是自己的类（`.radiobutton.selected`，与
         // `:checked` 双通道并存）；圆点形态的状态类由 RadioIndicator
@@ -133,30 +135,29 @@ public class Radio : InteractiveControl {
     }
 
     public void Select() {
-        if (model.Get() == optionValue) { return; }
-        model.Set(optionValue);
-        if (data != null) { data.Set(optionValue); }
+        if (Value.Get() == optionValue) { return; }
+        Value.Set(optionValue);
         Change.RaiseS(this);
         if (parent != null) { parent.OnChildEvent(this, "Change"); }
     }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec text = PropSpec.Text("label", "Label");
-        text.str = label;
+        text.Field("label", 0);
         text.Also("text");
         ps.Add(text);
         PropSpec opt = PropSpec.Int("option", "Option");
-        opt.num = optionValue;
+        opt.Field("optionValue", 1);
         ps.Add(opt);
         PropSpec sel = PropSpec.Int("value", "Selected").DefaultBinding();
-        if (data != null) { sel.num = data; } else { sel.snum = model; }
+        sel.Field("Value", 1);
         sel.Also("data");
         ps.Add(sel);
         ps.Add(this.SizeProp());
         if (!buttonForm) {
             PropSpec bd = PropSpec.Bool("bordered", "Bordered");
-            bd.flag = Bordered;
+            bd.Field("Bordered", 2);
             ps.Add(bd);
         }
         return ps;
@@ -164,7 +165,7 @@ public class Radio : InteractiveControl {
 
     public override void OnClick(RoutedEventArgs e) {
         if (this.IsDisabled()) { return; }
-        if (model.Get() != optionValue) {
+        if (Value.Get() != optionValue) {
             this.Select();
             App a = this.FindApp();
             if (a != null) { a.RequestRedraw(); }
@@ -174,7 +175,7 @@ public class Radio : InteractiveControl {
 
     public override void OnKeyDown(RoutedEventArgs e) {
         if (!this.IsDisabled() && (e.keyCode == 32 || e.keyCode == 13)) {
-            if (model.Get() != optionValue) {
+            if (Value.Get() != optionValue) {
                 this.Select();
                 App a = this.FindApp();
                 if (a != null) { a.RequestRedraw(); }
@@ -185,16 +186,8 @@ public class Radio : InteractiveControl {
         base.OnKeyDown(e);
     }
 
-    public override void OnPaint(App app) {
-        int id = this.CommonId();
-        bool off = this.IsDisabled();
-        this.ApplyVariants();
-        SyncBinding();
-        if (!off) { app.focus.RegisterFocusable(id); }
-        string a11y = this.EffectiveA11yRole("radio") + ":" + this.EffectiveA11yLabel(label);
-        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
-        if (!off) { On.Fire(app, id, this); }
-    }
+    public override int InputFocusCapabilities() { return 1; }
+
 }
 
 // 单选框指示器（小圆环）：纯 Flex 节点，完全由 CSS 盒模型渲染。

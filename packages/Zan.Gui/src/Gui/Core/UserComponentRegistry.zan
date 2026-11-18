@@ -14,6 +14,13 @@ namespace Gui;
 // 实例值优先，缺省取声明的 def，落到声明的目标控件上。
 public class UserComponentRegistry {
     static List<UserComponent> components;
+    private static List<string> building;
+
+    private static Control CreateRegistered(string kind) { return Build(kind); }
+
+    private static void RegisterFactory(string name) {
+        ControlFactory.Register(name, CreateRegistered);
+    }
 
     static void EnsureInit() {
         if (components == null) {
@@ -25,9 +32,14 @@ public class UserComponentRegistry {
     static void Register(string name, string json) {
         EnsureInit();
         for (int i = 0; i < components.Count; i = i + 1) {
-            if (components[i].name == name) { components[i].json = json; return; }
+            if (components[i].name.ToLower() == name.ToLower()) {
+                components[i].json = json;
+                RegisterFactory(name);
+                return;
+            }
         }
         components.Add(new UserComponent(name, json));
+        RegisterFactory(name);
     }
 
     // 批量装载（与 Designer.SetUserComponents 同源）。
@@ -35,7 +47,8 @@ public class UserComponentRegistry {
         EnsureInit();
         components.Clear();
         for (int i = 0; i < comps.Count; i = i + 1) {
-            components.Add(comps[i]);
+            components.Add(new UserComponent(comps[i].name, comps[i].json));
+            RegisterFactory(comps[i].name);
         }
     }
 
@@ -43,7 +56,7 @@ public class UserComponentRegistry {
     static string JsonOf(string name) {
         EnsureInit();
         for (int i = 0; i < components.Count; i = i + 1) {
-            if (components[i].name == name) { return components[i].json; }
+            if (components[i].name.ToLower() == name.ToLower()) { return components[i].json; }
         }
         return "";
     }
@@ -54,24 +67,33 @@ public class UserComponentRegistry {
     static Control Build(string name, JsonValue instanceProps) {
         string doc = JsonOf(name);
         if (doc == "") { return null; }
-        Control ctl = null;
-        JsonValue root = null;
-        string trimmed = doc.Trim();
-        if (trimmed.StartsWith("<")) {
-            HtmlDoc hd = Html.Parse(trimmed, "", null);
-            if (hd != null) { ctl = hd.root; }
-            root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(trimmed, "")));
-        } else {
-            root = JsonValue.ParseLenient(doc);
-            if (root != null) {
-                string html = DesignerHtml.FromJsonDoc(doc);
-                HtmlDoc hd = Html.Parse(html, "", null);
-                if (hd != null) { ctl = hd.root; }
+        if (building == null) { building = new List<string>(); }
+        string key = name.ToLower();
+        for (int i = 0; i < building.Count; i = i + 1) {
+            if (building[i] == key) {
+                throw new InvalidOperationException("Circular user component reference: " + name);
             }
         }
-        if (ctl == null || root == null) { return null; }
-        ApplyProps(ctl, root, instanceProps);
-        return ctl;
+        building.Add(key);
+        try {
+            string html = doc.Trim();
+            JsonValue root = null;
+            if (html.StartsWith("<")) {
+                root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(html, "")));
+            } else {
+                root = JsonValue.ParseLenient(doc);
+                if (root == null || !root.IsObject()) { return null; }
+                html = DesignerHtml.FromJsonDoc(doc);
+            }
+            if (root == null || !root.IsObject()) { return null; }
+            HtmlDoc parsed = Html.Parse(html, "", null);
+            if (parsed == null || parsed.root == null) { return null; }
+            Control control = new UserComponentControl(name, root, parsed);
+            ApplyProps(control, root, instanceProps);
+            return control;
+        } finally {
+            building.RemoveAt(building.Count - 1);
+        }
     }
 
     static Control Build(string name) {
@@ -94,7 +116,6 @@ public class UserComponentRegistry {
             string def = dd.Str("def", "");
             string val = instanceProps != null && instanceProps.IsObject()
                 ? instanceProps.Str(dd.Str("key", ""), def) : def;
-            if (val == "") { continue; }
             Control t = root.Find(target);
             if (t != null) { t.SetProp(dd.Str("prop", "text"), val); }
         }

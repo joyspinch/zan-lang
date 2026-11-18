@@ -17,7 +17,7 @@ public partial class App {
         return true;
     }
 
-    // 离屏输入通过上一帧的命中登记解析，本实例不泵或重写 OS 事件。
+    // 离屏输入直接命中当前对象树，本实例不泵或重写 OS 事件。
     void ProcessOffscreenInput(int kind, int x, int y, int button,
             int key, int mods, int flag) {
         if (window.GetHandle() != 0) { return; }
@@ -29,54 +29,12 @@ public partial class App {
             wheelReplayArmed = false;
             window.SetLocalEvent(kind, x, y, button, key, mods, flag);
 
-            this.DispatchWindowInput(kind);
+            long dispatchSequence = window.EventSeq();
+            if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return; }
             if (this.ConsumeRoutedInput(kind)) { return; }
 
-            if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
-                mouseX = x;
-                mouseY = y;
-                focus.SetHovered(hitTester.HitTest(x, y));
-            }
-            if (kind == 2) {
-                if (button == 1) {
-                    rightPressTargetId = hitTester.AnchorAt(2, x, y, menuBlockPrevious);
-                    hitTester.ClearAnchor(0);
-                } else {
-                    int hit = hitTester.AnchorAt(0, x, y, false);
-                    pressTargetId = hit;
-                    // 离屏路径的「空处按下即压制释放」沿用；另加与窗口
-                    // 路径同源的判据：按在阻挡区（浮层遮罩）上的那次按下
-                    // 同样不得把释放解析成下层控件的点击。
-                    pressOnBlocker = hit < 0
-                        || hitTester.AnchorTypeOf(0) == 0 - 1;
-                    pointerDown = true;
-                    focus.SetPressed(hit);
-                    if (!routedFocusAssigned) { focus.SetFocused(hit); }
-                    hitTester.ClearAnchor(2);
-                    hitTester.ClearAnchor(3);
-                    this.NotePressStart(hit, x, y);
-                }
-            } else if (kind == 3) {
-                clickSeenSeq = 0 - 1;
-                clickEvSeq = window.EventSeq();
-                if (button == 1) {
-                    rightClickTargetId = hitTester.AnchorAt(3, x, y, menuBlockPrevious);
-                    hitTester.ClearAnchor(1);
-                } else {
-                    int hit = hitTester.AnchorAt(1, x, y, false);
-                    pointerDown = false;
-                    if (flag == 1 || pressOnBlocker) {
-                        clickTargetId = 0 - 1;
-                        hitTester.ClearAnchor(1);
-                    } else {
-                        clickTargetId = hit;
-                        this.NoteClickTarget(hit);
-                    }
-                    this.NoteRelease(x, y);
-                    focus.ClearPress();
-                }
-            } else if (kind == 4 && key == 9) {
-                if (!this.HasOverlays() && !blocksInputBelow && tabHoldId < 0) {
+            if (kind == 4 && key == 9) {
+                if (!this.HasOverlays() && !blocksInputBelow) {
                     focus.FocusStep(Modifiers.HasShift(mods) ? 0 - 1 : 1);
                 }
             }
@@ -89,17 +47,25 @@ public partial class App {
     }
 
     // 离屏帧只重置本 App 的登记和表面，不泵系统事件或同步平台外壳。
-    void BeginOffscreenFrame() {
+    long offscreenOpenedEventSequence;
+
+    internal void BeginSnapshotFrame() { this.BeginOffscreenFrameCore(false); }
+
+    void BeginOffscreenFrame() { this.BeginOffscreenFrameCore(true); }
+
+    private void BeginOffscreenFrameCore(bool serviceInput) {
+        this.CheckPreparationFrameEntry();
         if (window.GetHandle() != 0) { return; }
         offscreenFrameParent = App.frameApp;
         App.frameApp = this;
         offscreenFrameActive = true;
+        offscreenOpenedEventSequence = window.EventSeq();
         offscreenTooltip = Widget.Tooltip.Suspend();
         try {
             lastFrameMs = nowMs;
             if (!freezeAnimClock) { nowMs = Window.GetTickMs(); }
             needsRedraw = false;
-            this.TickRoutedLongPress();
+            if (serviceInput) { this.TickRoutedLongPress(); }
             frameSeq = frameSeq + 1;
             blurSlotSeq = 0;
             clickClaimed = false;
@@ -110,7 +76,6 @@ public partial class App {
             wheelCapOrder = 0;
             wheelCapW = 0;
             wheelCapH = 0;
-            tabHoldId = 0 - 1;
             inputBlockPrevious = blocksInputBelow;
             blocksInputBelow = false;
             menuBlockPrevious = menuBlock;
@@ -120,7 +85,6 @@ public partial class App {
             partialPending = false;
             paintHashOn = false;
             glassDeferred = false;
-            hitTester.Clear();
             focus.ResetIds();
             glassRects.Clear();
             overlays.Clear();
@@ -149,22 +113,23 @@ public partial class App {
         App.frameApp = offscreenFrameParent;
         offscreenFrameParent = null;
         offscreenFrameActive = false;
-        window.SetLocalEvent(0, mouseX, mouseY, 0, 0, 0, 0);
+        if (!preparedHostFrameValid && window.EventSeq() == offscreenOpenedEventSequence) {
+            window.SetLocalEvent(0, mouseX, mouseY, 0, 0, 0, 0);
+        }
     }
 
     void EndOffscreenFrame() {
+        if (!this.ContinuePreparedFrame()) { return; }
         if (window.GetHandle() != 0 || !offscreenFrameActive) { return; }
         try {
             this.RenderFrameOverlays();
+            if (!this.ContinuePreparedFrame()) { return; }
             if (this.FxActive()) {
                 BackdropFx.PaintFx(this, canvas, this.EffectiveFx(), 0, 0,
                     canvas.Width(), canvas.Height(), nowMs, theme, dpiScale);
                 BackdropFx.TakeDamage();
             }
-            hitTester.KeepFullSnapshot();
-            focus.prevFocusedId = focus.focusedId;
-            focus.prevHoveredId = focus.hoveredId;
-            focus.prevPressedId = focus.pressedId;
+            focus.UpdateImeSession();
             if (this.EventKind() == 13 && wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
                 offscreenWheelPending = true;
                 offscreenWheelX = window.EventX();

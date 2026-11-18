@@ -406,6 +406,15 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
 }
 
 #define ZAN_BLUR_CACHE_SLOTS 256
+/* Final glass composition belongs to the same bounded blur slot. */
+typedef struct {
+    int valid, pending, sid;
+    int key[12];
+    u32 *pixels; /* source followed by final straight-ARGB pixels */
+    size_t cap;
+    uint64_t age;
+} zan_glass_cache_t;
+
 typedef struct {
     int valid;
     int sid; 
@@ -414,6 +423,7 @@ typedef struct {
     u32 src_sum;
     u32 *pixels;
     size_t cap;
+    zan_glass_cache_t glass;
 } zan_blur_cache_t;
 
 static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
@@ -427,6 +437,8 @@ static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
     return sum ^ (u32)(rw * 31 + rh);
 }
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
+
+#include "gui_runtime_glass.c"
 
 static long long g_blur_partial_miss;
 
@@ -448,25 +460,27 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     if (r > 40) r = 40;
 
     zan_blur_cache_t *c = &g_blur_cache[slot];
+    /* Any independent blur call changes this slot's output dependency. */
+    if (!c->glass.pending) c->glass.valid = 0;
     size_t n = (size_t)rw * (size_t)rh;
 
     int geom_ok = c->valid && c->pixels && c->sid == s->id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
         && c->r == r && c->cr == cr && c->cmask == cmask;
     int covers = clip_covers(s, x0, y0, x1, y1);
-    u32 sum = geom_ok ? zan_src_sum(s, x0, y0, rw, rh) : 0;
+    u32 sum = geom_ok && dirty ? zan_src_sum(s, x0, y0, rw, rh) : 0;
     if (geom_ok && (!dirty || (covers && sum == c->src_sum))) {
+        /* Keep the established panel-area blurhit statistic. Cached pixels
+         * already contain rounded coverage and straight alpha: copy, no blend. */
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
-        if (covers) {
-            for (int j = 0; j < rh; j++)
-                memcpy(s->pixels + (size_t)(y0 + j) * s->stride + x0,
-                       c->pixels + (size_t)j * rw, (size_t)rw * sizeof(u32));
-        } else {
-            for (int j = 0; j < rh; j++) {
-                u32 *src = c->pixels + (size_t)j * rw;
-                for (int i = 0; i < rw; i++)
-                    blur_put(s, x0 + i, y0 + j, src[i], 255);
-            }
+        int cx0 = x0 > s->clip_x0 ? x0 : s->clip_x0;
+        int cy0 = y0 > s->clip_y0 ? y0 : s->clip_y0;
+        int cx1 = x1 < s->clip_x1 ? x1 : s->clip_x1;
+        int cy1 = y1 < s->clip_y1 ? y1 : s->clip_y1;
+        for (int py = cy0; py < cy1; py++) {
+            memcpy(s->pixels + (size_t)py * s->stride + cx0,
+                   c->pixels + (size_t)(py - y0) * rw + (cx0 - x0),
+                   (size_t)(cx1 - cx0) * sizeof(u32));
         }
         return;
     }
@@ -554,6 +568,9 @@ static zan_blur_cache_t *zan_snap_slot(int slot) {
 
 static void zan_cache_drop_surface(int sid) {
     for (int i = 0; i < ZAN_BLUR_CACHE_SLOTS; i++) {
+        if (g_blur_cache[i].glass.pixels && g_blur_cache[i].glass.sid == sid) {
+            zan_glass_drop(&g_blur_cache[i].glass);
+        }
         if (g_blur_cache[i].valid && g_blur_cache[i].sid == sid) {
             g_blur_cache[i].valid = 0;
         }

@@ -48,6 +48,20 @@ public class InputRootAdapter : Control {
         if (content != null) { content.CollectInputFocus(app, controls); }
     }
 
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        if (content == null) { return children; }
+        if (children == null) { children = new List<Control>(); }
+        if (!children.Contains(content)) { children.Add(content); }
+        return children;
+    }
+
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child != null && child == content);
+    }
+
+    protected override int LayoutRevision() { return inputLifetime; }
+
     // Overlay adapters precede ordinary content/HUD adapters regardless of bind order.
     public virtual int InputPriority() { return 0; }
 
@@ -115,6 +129,12 @@ public class InputRootAdapter : Control {
             if (active == null || !active.ContainsAdapter(this) || !active.ContainsAdapter(tail)) { return false; }
         }
         tail.content = root;
+        if (app != null) {
+            // Active chain content changed even though the App root identity did not.
+            // Supersede any older callback-bearing SetRootControl installation too.
+            app.inputRootGeneration = app.inputRootGeneration + 1;
+            app.inputRootChangeTicket = 0;
+        }
         return true;
     }
 
@@ -135,6 +155,17 @@ public class InputRootAdapter : Control {
         app.FenceInputRootChange(oldRoot);
         this.OnReleaseInput(app);
         if (inputLifetime != session || inputApp != app || content != fallback) { return; }
+        // Retired borrowed trees leave the next preparation walk; notify them before unlinking.
+        // The displaced fallback stays visible and belongs to the surviving input chain.
+        List<Control> children = this.LayoutChildren();
+        if (children != null) {
+            for (int i = 0; i < children.Count; i = i + 1) {
+                Control child = children[i];
+                if (child == fallback || !this.OwnsLayoutChild(child)) { continue; }
+                child.RetireLayoutEvents(app, this);
+                if (inputLifetime != session || inputApp != app || content != fallback) { return; }
+            }
+        }
         if (linked) {
             if (!this.OwnsInputSlot(app, owner)
                     || (owner != null && owner.inputLifetime != ownerSession)) { return; }

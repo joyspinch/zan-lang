@@ -1,0 +1,203 @@
+using System.Collections.Generic;
+using System;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// Explicit retained lifetime: Show mounts the same tree in OverlayHost; Close
+// retires input immediately. Painting never creates controls or handles input.
+public class PhotoViewer : Control, AppLoopParticipant, AppPreparationParticipant {
+    weak App ownerApp;
+    weak AppLoopRegistration registration;
+    Binding<int> index;
+    Carousel carousel;
+    Button closeButton;
+    Label counter;
+    bool active;
+    int generation;
+    public UiEvent Dismissed;
+
+    public PhotoViewer(List<string> slides, Binding<int> model, CarouselAnim animation) : base("photos") {
+        index = 0;
+        if (model != null) { index = model; }
+        Dismissed = new UiEvent();
+        carousel = new Carousel(index);
+        if (slides != null) {
+            for (int i = 0; i < slides.Count; i = i + 1) {
+                carousel.AddSlideView(new Image(slides[i], "", "cover"));
+            }
+        }
+        carousel.Animate(animation);
+        closeButton = new Button { Icon = "close", ClassName = "ghost" };
+        PhotoViewerAction closeAction = new PhotoViewerAction(this);
+        closeButton.Click.Add(closeAction.Close);
+        counter = new Label();
+        counter.SetProp("style", "pointer-events:none;background:transparent");
+        this.Add(carousel);
+        this.Add(closeButton);
+        this.Add(counter);
+        wiresOwnEvents = true;
+    }
+
+    public bool Active { get { return active; } }
+
+    public void Show(App app) {
+        if (app == null) { return; }
+        if (active && ownerApp == app && app.overlayHost.ActiveRoot() == this) { return; }
+        if (active) {
+            int expected = generation + 1;
+            this.Close();
+            if (active || generation != expected) { return; }
+        }
+        PhotoViewer previous = Layer.Context(app).photoViewer;
+        if (previous != null && previous != this) {
+            previous.Close();
+            if (Layer.Context(app).photoViewer != null && Layer.Context(app).photoViewer != previous) { return; }
+        }
+        generation = generation + 1;
+        int ticket = generation;
+        ownerApp = app;
+        active = true;
+        this.UseApp(app);
+        this.SetShown(true);
+        Layer.Context(app).photoViewer = this;
+        app.CancelInputSubtree(app.rootControl);
+        if (!active || generation != ticket || ownerApp != app) { return; }
+        registration = app.RegisterLoopParticipant(app, this);
+        this.Prepare(app);
+        if (!active || generation != ticket || ownerApp != app) { return; }
+        app.overlayHost.ShowAt(app, this, 0, app.titlebarH);
+        if (active && generation == ticket && app.overlayHost.ActiveRoot() != this) { this.FinishClose(); }
+        app.RequestRedraw();
+    }
+
+    // Clear the old session before callbacks; a callback may reopen this viewer.
+    void FinishClose() {
+        if (!active) { return; }
+        active = false;
+        generation = generation + 1;
+        App app = ownerApp;
+        ownerApp = null;
+        AppLoopRegistration old = registration;
+        registration = null;
+        if (old != null) { old.Invalidate(); }
+        int closedGeneration = generation;
+        if (app != null) {
+            AppLayerContext context = Layer.Context(app);
+            if (context.photoViewer == this) { context.photoViewer = null; }
+        }
+        this.SetShown(false);
+        if (generation != closedGeneration || active) { return; }
+        if (app != null) {
+            app.ReleaseInputSubtree(this);
+            if (generation != closedGeneration || active) { return; }
+            app.RequestRedraw();
+        }
+        Dismissed.RaiseS(this);
+    }
+
+    public void Close() {
+        if (!active) { return; }
+        App app = ownerApp;
+        if (app != null && app.overlayHost.ActiveRoot() == this) { app.overlayHost.Hide(this); }
+        else { this.FinishClose(); }
+    }
+
+    public override void OnPopupDismissed() { this.FinishClose(); }
+    public override bool OnPopupEscape(App app) { this.Close(); return true; }
+
+    public void Step(int delta) {
+        App app = ownerApp;
+        if (!active || app == null || app.overlayHost.ActiveRoot() != this) { return; }
+        if (delta < 0) { carousel.Prev(app); } else { carousel.Next(app); }
+        this.UpdateCounter();
+        app.RequestRedraw();
+    }
+
+    void UpdateCounter() {
+        counter.Text = "Photo " + Convert.ToString(index.Get() + 1) + " / "
+            + Convert.ToString(carousel.slides.Count);
+    }
+
+    public override void SyncBinding() { this.UpdateCounter(); base.SyncBinding(); }
+
+    void Prepare(App app) {
+        if (!active || ownerApp != app) { return; }
+        this.UpdateCounter();
+        this.MeasureTree(app);
+        this.Arrange(0, app.titlebarH, app.canvas.Width(), app.canvas.Height() - app.titlebarH);
+    }
+
+    public void BeforeInput(App app, int kind) { this.Prepare(app); }
+    public void BeforePaint(App app, int frameSequence) { this.Prepare(app); }
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+
+    public override void OnMeasure(App app) {
+        prefW = app.canvas.Width(); prefH = app.canvas.Height() - app.titlebarH;
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        App app = ownerApp;
+        if (app == null) { return; }
+        px = 0; py = app.titlebarH; pw = app.canvas.Width(); ph = app.canvas.Height() - py;
+        bx = px; by = py; bw = pw; bh = ph;
+        int contentW = pw * 7 / 10;
+        int contentH = ph * 7 / 10;
+        int x = px + (pw - contentW) / 2;
+        int y = py + (ph - contentH) / 2;
+        carousel.Arrange(x, y, contentW, contentH);
+        int current = index.Get();
+        if (current < 0) { current = 0; }
+        if (current >= carousel.slides.Count) { current = carousel.slides.Count - 1; }
+        carousel.ShowSlides(current, current, 0, 1);
+        int buttonSize = app.Scale(36);
+        int buttonY = y - app.Scale(42);
+        if (buttonY < py + app.Scale(6)) { buttonY = py + app.Scale(6); }
+        closeButton.Arrange(x + contentW - buttonSize, buttonY, buttonSize, buttonSize);
+        counter.Arrange(x, y - app.Scale(28), contentW - buttonSize - app.theme.gapSmall,
+            Canvas.FontHeight(this.Box(app).FontOr(Style.FontFallback(app, "medium"))));
+    }
+
+    public override void OnPaint(App app) {
+        if (!active) { return; }
+        app.canvas.FillRect(bx, by, bw, bh, this.Box(app).bg);
+        NativeLayer.Occlude(app, bx, by, bw, bh);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return active ? base.HitTestCore(x, y, pointerType, excludedSubtrees) : null;
+    }
+
+    public override Control FindInputFocus(App app) {
+        if (!active) { return null; }
+        Control focused = base.FindInputFocus(app);
+        return focused != null ? focused : this;
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        base.OnClick(e);
+        // Shared routed Click requires both Down and Up on this surface. A
+        // gesture starting inside Carousel and ending on the scrim cannot close.
+        if (e.handled || e.originalSource != this) { return; }
+        e.Handle();
+        this.Close();
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.handled) { return; }
+        if (e.keyCode == 27) { e.Handle(); this.Close(); }
+        else if (e.keyCode == 37) { e.Handle(); this.Step(-1); }
+        else if (e.keyCode == 39) { e.Handle(); this.Step(1); }
+    }
+}
+
+class PhotoViewerAction {
+    weak PhotoViewer viewer;
+    public PhotoViewerAction(PhotoViewer owner) { viewer = owner; }
+    public void Close() {
+        PhotoViewer owner = viewer;
+        if (owner != null) { owner.Close(); }
+    }
+}

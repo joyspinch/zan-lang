@@ -2,30 +2,6 @@ using System;
 using Gui;
 using Gui.Widget;
 
-class LegacyScrollSurface : Control {
-    public ScrollView View;
-    public SignalInt Offset;
-    public bool UseBar;
-    public LegacyScrollSurface(bool bar) {
-        this.InitControl("legacy-scroll-surface", 0);
-        View = new ScrollView();
-        Offset = new SignalInt(0);
-        UseBar = bar;
-    }
-    public override void OnPaint(App app) {
-        if (UseBar) {
-            Scrollbar.HandleWheel(app, bx, by, bw, bh, 1000, Offset);
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - app.Scale(10), by,
-                bh, bh, 1000, Offset, bx, by, bw, bh);
-        } else {
-            Rect area = new Rect(bx, by, bw, bh);
-            View.Begin(app, area, 1000);
-            View.End(app, area);
-        }
-    }
-    public int Position() { return UseBar ? Offset.Get() : View.Offset(); }
-}
-
 class ScrollColumnWitness {
     public weak ScrollColumn Column;
     public weak Control Row;
@@ -62,26 +38,27 @@ class ScrollColumnInputLifecycleTest {
     static void Exercise(App app, ScrollColumnWitness witness) {
         ScrollColumn column = Column(app, "padding:4px 6px;border:2px solid #222;gap:8px");
         witness.Column = column;
-        witness.Row = column.Children[0];
+        witness.Row = column.ChildAt(0);
         Check(column.Kind() == "ScrollColumn" && column.scrollExtent == 384 && column.scrollExtentX == 196,
             "natural rows and gaps include culled rows; border defines viewport");
-        Check(column.Children[0].bx == 28 && column.Children[0].by == 26 && column.Children[0].bw == 172,
+        Check(column.ChildAt(0).bx == 28 && column.ChildAt(0).by == 26 && column.ChildAt(0).bw == 172,
             "padding and reserved scrollbar preserve child geometry: "
-                + Convert.ToString(column.Children[0].bx) + ","
-                + Convert.ToString(column.Children[0].by) + ","
-                + Convert.ToString(column.Children[0].bw));
+                + Convert.ToString(column.ChildAt(0).bx) + ","
+                + Convert.ToString(column.ChildAt(0).by) + ","
+                + Convert.ToString(column.ChildAt(0).bw));
         Input(app, 13, 50, 50, -120, 0);
         int offset = column.ScrollTop();
         Check(offset == app.scrollSpeed, "wheel mutates shared offset before paint");
         Paint(app, column);
         Check(column.ScrollTop() == offset, "repeated paint never replays wheel");
         column.Arrange(20, 20, 200, 100);
-        Check(column.Children[0].by == 26 - offset && column.scrollExtent == 384,
+        Check(column.ChildAt(0).by == 26 - offset && column.scrollExtent == 384,
             "Arrange positions rows from shared offset without losing extent");
         column.SetScrollTop(150);
         column.Arrange(20, 20, 200, 100);
-        Check(!column.Children[0].visible && column.Children[3].visible && column.scrollExtent == 384,
-            "scroll culls rows without shrinking extent");
+        Check(column.ChildAt(0).visible && !column.ChildInViewport(column.ChildAt(0))
+            && column.ChildInViewport(column.ChildAt(3)) && column.scrollExtent == 384,
+            "scroll culls paint/input without changing author visibility or extent");
         column.SetScrollTop(0);
         column.Arrange(20, 20, 200, 100);
         ScrollState geometry = new ScrollState();
@@ -130,23 +107,23 @@ class ScrollColumnInputLifecycleTest {
     }
     static void InlinePadding(App app) {
         ScrollColumn column = Column(app, "padding:2px 8px 6px 10px;border:2px solid #222");
-        Check(column.Children[0].bx == 32 && column.Children[0].by == 24
-            && column.Children[0].bw == 166 && column.scrollExtent == 328,
+        Check(column.ChildAt(0).bx == 32 && column.ChildAt(0).by == 24
+            && column.ChildAt(0).bw == 166 && column.scrollExtent == 328,
             "four-side inline padding reaches actual layout");
         column.SetProp("style", "border:2px solid #222");
         column.MeasureTree(app);
         column.Arrange(20, 20, 200, 100);
         ScrollColumn baseline = Column(app, "border:2px solid #222");
-        Check(column.Children[0].bx == baseline.Children[0].bx
-            && column.Children[0].by == baseline.Children[0].by
-            && column.Children[0].bw == baseline.Children[0].bw,
+        Check(column.ChildAt(0).bx == baseline.ChildAt(0).bx
+            && column.ChildAt(0).by == baseline.ChildAt(0).by
+            && column.ChildAt(0).bw == baseline.ChildAt(0).bw,
             "replacing inline padding restores stylesheet geometry");
         column.Pad(5);
         column.SetProp("style", "padding:2px 8px 6px 10px;border:2px solid #222");
         column.MeasureTree(app);
         column.Arrange(20, 20, 200, 100);
-        Check(column.Children[0].bx == 27 && column.Children[0].by == 27
-            && column.Children[0].bw == 174,
+        Check(column.ChildAt(0).bx == 27 && column.ChildAt(0).by == 27
+            && column.ChildAt(0).bw == 174,
             "explicit Pad keeps its documented layout priority");
         app.SetRootControl(null);
     }
@@ -156,7 +133,7 @@ class ScrollColumnInputLifecycleTest {
         Check(hidden.ScrollTop() == 0, "explicit hidden suppresses wheel");
         hidden.SetScrollTop(60);
         hidden.Arrange(20, 20, 200, 100);
-        Check(hidden.ScrollTop() == 60 && hidden.Children[0].by == -40,
+        Check(hidden.ScrollTop() == 60 && hidden.ChildAt(0).by == -40,
             "hidden retains programmatic scrolling");
         ScrollColumn visible = Column(app, "overflow:visible");
         Input(app, 13, 50, 50, -120, 0);
@@ -209,48 +186,48 @@ class ScrollColumnInputLifecycleTest {
             "visible editor receives text with focus and capture");
         column.SetScrollTop(150);
         column.Arrange(20, 20, 200, 100);
-        Check(!editor.visible && !editor.IsFocused(app) && app.GetCapturedPointer() == null,
-            "culling editor releases focus and capture before paint");
+        Check(editor.visible && !column.ChildInViewport(editor)
+            && !editor.InputFocusEligible(app, column)
+            && !editor.IsFocused(app) && app.GetCapturedPointer() == null,
+            "culling editor releases focus and capture before paint without hiding author");
         app.ProcessOffscreenInput(6, 0, 0, 0, 66, 0, 0);
         Paint(app, column);
         Check(editor.GetText() == "A", "culled editor cannot consume text or replay it during paint");
         column.SetScrollTop(0);
         column.Arrange(20, 20, 200, 100);
-        Check(editor.visible && !editor.IsFocused(app), "returning row does not restore hidden focus");
+        Check(editor.visible && column.ChildInViewport(editor) && !editor.IsFocused(app),
+            "returning row restores viewport eligibility without restoring focus");
         app.SetRootControl(null);
     }
-    static void MixedWheel(App app, bool bar) {
+    static void NestedWheel(App app, bool overflowing) {
         Control outer = new Control();
         outer.UseApp(app);
-        outer.SetProp("style", "overflow:auto;display:block");
-        LegacyScrollSurface legacy = new LegacyScrollSurface(bar);
-        legacy.SetProp("style", "height:100px;width:120px");
+        outer.SetProp("style", "overflow:auto;display:block;padding:0");
+        ScrollColumn inner = new ScrollColumn();
+        inner.SetProp("style", "height:100px;width:120px;padding:0;gap:0");
+        Control content = new Control();
+        content.Prefer(100, overflowing ? 1000 : 100);
+        inner.Add(content);
         Control spacer = new Control();
         spacer.SetProp("style", "height:500px;width:100px");
-        outer.Add(legacy);
+        outer.Add(inner);
         outer.Add(spacer);
         outer.MeasureTree(app);
         outer.Arrange(20, 20, 200, 160);
         app.SetRootControl(outer);
-        Input(app, 1, 50, 50, 0, 0);
-        Paint(app, outer);
         Input(app, 13, 50, 50, -120, 0);
-        Check(outer.ScrollTop() == app.scrollSpeed && legacy.Position() == 0,
-            "routed ancestor alone consumes mixed wheel before paint");
+        Check(inner.ScrollTop() == (overflowing ? app.scrollSpeed : 0)
+            && outer.ScrollTop() == (overflowing ? 0 : app.scrollSpeed),
+            "deepest overflowing retained owner consumes before paint");
         Paint(app, outer);
         Paint(app, outer);
-        Check(outer.ScrollTop() == app.scrollSpeed && legacy.Position() == 0,
-            "legacy paint cannot replay routed wheel event sequence");
-        outer.SetProp("style", "overflow:visible;display:block");
-        outer.SetScrollTop(0);
-        outer.MeasureTree(app);
-        outer.Arrange(20, 20, 200, 160);
-        Input(app, 1, 50, 50, 0, 0);
-        Paint(app, outer);
+        Check(inner.ScrollTop() == (overflowing ? app.scrollSpeed : 0)
+            && outer.ScrollTop() == (overflowing ? 0 : app.scrollSpeed),
+            "paint never replays the routed wheel");
+        inner.SetDisabled(true);
+        int hold = inner.ScrollTop();
         Input(app, 13, 50, 50, -120, 0);
-        Paint(app, outer);
-        Check(legacy.Position() == app.scrollSpeed && outer.ScrollTop() == 0,
-            "next genuine legacy-only wheel still scrolls");
+        Check(inner.ScrollTop() == hold, "disabled child never changes offset");
         app.SetRootControl(null);
     }
     static void Main() {
@@ -263,8 +240,8 @@ class ScrollColumnInputLifecycleTest {
         OverflowModes(app);
         HiddenEditor(app, witness);
         Check(witness.Column == null && witness.Row == null, "culled editor and owner release without cycles");
-        MixedWheel(app, false);
-        MixedWheel(app, true);
+        NestedWheel(app, false);
+        NestedWheel(app, true);
         app.canvas.Destroy();
         frame.canvas.Destroy();
         Console.WriteLine("SCROLLCOLUMN_INPUT_LIFECYCLE_OK");

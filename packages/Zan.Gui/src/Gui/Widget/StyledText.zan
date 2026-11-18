@@ -4,484 +4,365 @@ using Gui.Component;
 
 namespace Gui.Widget;
 
-// 聊天记录的展示网格：一个自管绘制的内容型控件，承接整行网格——
-// 块底色 / 竖条 / 代码底纹 / 正文 / 选中反白 / 头行（委托给 Avatar +
-// Tag）/ busy 提示。它把记录渲染从视图层搬到标准库组件，这样
-// ChatArea 作为视图层不再有任何画布自绘调用。
-// 每帧由调用方绑定：行缓存、滚动、busy、选择状态、交互开关、
-// 思考折叠信号、工具展开列表，以及 busy 行要显示的文本（已由调用方
-// 本地化，控件本身不依赖 IDE 的翻译层）。绘制完成后 `maxScroll`
-// 写出最大滚动偏移，供调用方回读。
+// Pre-wrapped chat rows. Measure/Arrange prepare raster values and retained children;
+// input uses Control's routed events and ScrollState, and Paint consumes that preparation.
 public class StyledText : Control {
-    // 展示行缓存（调用方每帧赋值）；null 或空 = 不画。
     public List<TextRun> lines;
-    // 滚动偏移（底端锚定的行数，0 = 贴住最新一行），调用方持有。
-    public int scroll;
-    // true 时在记录末尾追加一行 busy 提示（busyText）。
     public bool busy;
-    // 文本选择状态（interactive 时由控件更新）。
     public LogState sel;
-    // 允许指针交互：拖选文本、点击思考折叠行与工具摘要行。
     public bool interactive;
-    // 思考折叠信号（1 = 展开），点击 kind-4 行切换；null = 无该行。
-    public SignalInt thinkOpen;
-    // 已展开工具结果的消息索引列表，点击 kind-5 行增删。
+    // 1 = expanded; both bindings are valid zero-valued snapshots by default.
+    public Binding<int> thinkOpen;
     public List<int> toolOpen;
-    // busy 行文本（调用方已本地化）。
     public string busyText;
-    // 绘制后写出：本帧的最大滚动偏移，供调用方回读。
+    // Prepared maximum distance from the bottom, in rows.
     public int maxScroll;
-    // 调用方的滚动偏移信号（底端锚定，单位是展示行，0 = 贴住最新一行）。
-    // 给了它就在右侧画一条可拖动的纵向滚动条：只有滚轮的时候，长记录既
-    // 看不出自己停在整段的哪一段，也没法一把拖回去。null = 不画。
-    public SignalInt scrollBar;
+    // The sole public scroll input: rows from the bottom, 0 = exact pixel bottom.
+    public Binding<int> scrollBar;
 
-    // busy 行复用的实例常驻 Label（避免跨组件实例状态竞态）。
-    private Label thinkingLbl;
+    private StyledTextViewport content;
+    private Label busyLabel;
+    private List<StyledTextHeader> headers;
+    private List<StyledTextPaintRow> paintRows;
+    private Rect preparedView;
+    private bool scrollReady;
+    private bool arrangingScroll;
+    private int projectedScroll;
+    private int observedScrollVersion;
+    private Binding<int> observedScrollBinding;
+    private int maximumPixel;
+    private int preparationTicket;
+    private int preparedTicket;
 
-    // 头行复用的实例常驻 Avatar（避免跨组件实例状态竞态）。
-    private Avatar headAva;
-
-    // 头行复用的实例常驻 Tag（消除静态 Tag.Chip / Tag.Width 绕路渲染）。
-    private Tag headTag;
-
-    // 滚动条要的是「像素、从顶算」的信号，而记录的滚动是「行、从底算」。
-    // 实例常驻一个转换用的信号，避免多实例竞态。
-    private SignalInt barSig;
-
-    // 常驻的滚动条转换信号（惰性创建，避免每帧新分配）。
-    private SignalInt BarSig() {
-        if (this.barSig == null) { this.barSig = new SignalInt(0); }
-        return this.barSig;
-    }
-
-    // 纵向滚动条占掉的宽度。调用方按它收窄换行宽度，最长的一行才不会被
-    // 压在滑块底下。
-    public static int BarW(App app) { return app.Scale(12); }
-
-    // 惰性创建常驻的「思考中」标签（hint small 样式），避免每帧分配。
-    private void EnsureThinking(App app) {
-        if (this.thinkingLbl == null) {
-            this.thinkingLbl = new Label();
-            this.thinkingLbl.Class = "hint small";
-        }
-    }
-
-    // 空控件；行缓存与各状态由调用方每帧绑定（见类型注释）。
     public StyledText() {
         this.InitControl("styledText", 1);
-        // OnPaint 自行绘制网格，不让框架再铺一层 CSS 表面。
         styleSurfaceOwned = true;
-        lines = null;
-        scroll = 0;
-        busy = false;
-        sel = null;
-        interactive = false;
-        thinkOpen = null;
-        toolOpen = null;
-        busyText = "";
-        maxScroll = 0;
-        scrollBar = null;
-        thinkingLbl = null;
-        barSig = null;
-        headAva = null;
+        lines = null; busy = false; sel = null; interactive = false;
+        thinkOpen = 0; scrollBar = 0;
+        toolOpen = null; busyText = ""; maxScroll = 0;
+        headers = new List<StyledTextHeader>();
+        paintRows = new List<StyledTextPaintRow>();
+        content = new StyledTextViewport();
+        busyLabel = new Label(""); busyLabel.Class = "hint small";
+        busyLabel.SetShown(false); content.Add(busyLabel); this.Add(content);
     }
 
-    // 记录的字号，解析自各行绘制时用的同一套样式，使测量与绘制不会错位。
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        App app = this.App;
+        int pad = app != null ? app.Scale(6) : 6;
+        int rowH = app != null ? StyledText.RowH(app) : 1;
+        int rows = Math.Max(1, (view.height - pad * 2) / rowH);
+        return new Rect(view.x, view.y + pad, view.width, Math.Max(0, Math.Min(rows * rowH, view.height - pad)));
+    }
+
+    private bool PreparationCurrent(App app, Control root, int generation, long sequence, int ticket) {
+        return this.FindApp() == app && app.rootControl == root && app.inputRootGeneration == generation
+        && app.window.EventSeq() == sequence && preparationTicket == ticket;
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        preparationTicket = preparationTicket + 1;
+        int ticket = preparationTicket;
+        bx = x; by = y; bw = Math.Max(0, w); bh = Math.Max(0, h);
+        App app = this.App;
+        if (app == null) { return; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        if (scrollBar == null) { scrollBar = 0; }
+        if (thinkOpen == null) { thinkOpen = 0; }
+        Binding<int> binding = scrollBar;
+        int requested = binding.Get();
+        if (!this.PreparationCurrent(app, root, generation, sequence, ticket) || scrollBar != binding) { return; }
+        bool external = !scrollReady || binding != observedScrollBinding
+        || requested != projectedScroll || binding.Version() != observedScrollVersion;
+        int distance = maximumPixel - this.ScrollTop();
+        Rect view = this.ScrollViewport();
+        int rowH = StyledText.RowH(app);
+        int total = lines != null ? lines.Count : 0;
+        if (busy) { total = total + 1; }
+        scrollExtent = total * rowH; scrollExtentX = view.width;
+        maximumPixel = Math.Max(0, scrollExtent - view.height);
+        maxScroll = (maximumPixel + rowH - 1) / rowH;
+        int rows = Math.Max(0, Math.Min(maxScroll, requested));
+        int next = external ? maximumPixel - rows * rowH : maximumPixel - distance;
+        scrollReady = true;
+        arrangingScroll = true;
+        try { this.SetScrollTop(Math.Max(0, Math.Min(maximumPixel, next))); }
+        finally { arrangingScroll = false; }
+        if (!this.ProjectScroll(app, ticket)
+        || !this.PreparationCurrent(app, root, generation, sequence, ticket)) { return; }
+        this.PrepareVisuals(app);
+    }
+
+    private bool ProjectScroll(App app, int ticket) {
+        if (!scrollReady || app == null) { return false; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        if (scrollBar == null) { scrollBar = 0; }
+        Binding<int> binding = scrollBar;
+        int current = binding.Get();
+        if (!this.PreparationCurrent(app, root, generation, sequence, ticket) || scrollBar != binding) { return false; }
+        int rowH = StyledText.RowH(app);
+        int value = Math.Max(0, Math.Min(maxScroll, (maximumPixel - this.ScrollTop() + rowH - 1) / rowH));
+        projectedScroll = value; observedScrollBinding = binding;
+        observedScrollVersion = binding.Version();
+        if (current != value) {
+            // Commit observation before user code. Nested Set/Arrange owns its newer state.
+            observedScrollVersion = observedScrollVersion + 1;
+            binding.Set(value);
+        }
+        return this.PreparationCurrent(app, root, generation, sequence, ticket)
+        && scrollBar == binding && binding.Version() == observedScrollVersion;
+    }
+
+    public override void OnScrollChanged() {
+        if (arrangingScroll) { return; }
+        preparationTicket = preparationTicket + 1;
+        int ticket = preparationTicket;
+        App app = this.App;
+        if (this.ProjectScroll(app, ticket)) { this.PrepareVisuals(app); }
+    }
+
+    public override void OnPreviewRoutedEvent(RoutedEventArgs e) {
+        if (e.handled) { return; }
+        App app = this.App;
+        if (app == null) { return; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        int expected = preparationTicket + 1;
+        this.Arrange(bx, by, bw, bh);
+        if (this.FindApp() != app || app.rootControl != root || app.inputRootGeneration != generation
+        || app.window.EventSeq() != sequence || preparationTicket != expected || preparedTicket != expected
+        || !e.GestureRouteCurrent()) { e.Handle(); return; }
+        base.OnPreviewRoutedEvent(e);
+    }
+
+    private void SelectAt(int x, int y, bool begin) {
+        App app = this.App;
+        if (app == null || sel == null || lines == null || lines.Count == 0) { return; }
+        Rect view = this.ScrollViewport();
+        int row = Math.Max(0, Math.Min(lines.Count - 1, (y - view.y + this.ScrollTop()) / StyledText.RowH(app)));
+        int col = StyledText.ColAt(lines[row].text, bx + app.Scale(6) + app.Scale(3) + app.Scale(8), StyledText.FontPx(app), x);
+        if (begin) { sel.selR0 = row; sel.selC0 = col; }
+        sel.selR1 = row; sel.selC1 = col;
+        this.PrepareVisuals(app); app.RequestRedraw();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || app.window.EventButton() != 0 || !interactive
+        || this.IsDisabled() || lines == null || lines.Count == 0) { return; }
+        Rect view = this.ScrollViewport();
+        if (!view.Contains(e.x, e.y)) { return; }
+        int row = Math.Max(0, Math.Min(lines.Count - 1, (e.y - view.y + this.ScrollTop()) / StyledText.RowH(app)));
+        TextRun line = lines[row];
+        if (line.kind == 4) {
+            if (thinkOpen == null) { thinkOpen = 0; }
+            Binding<int> binding = thinkOpen;
+            Control root = app.rootControl; int generation = app.inputRootGeneration;
+            long sequence = app.window.EventSeq();
+            int ticket = preparationTicket;
+            int value = binding.Get();
+            if (!this.PreparationCurrent(app, root, generation, sequence, ticket) || thinkOpen != binding) { e.Handle(); return; }
+            e.Handle(); app.RequestRedraw(); binding.Set(1 - value);
+            return;
+        }
+        if (line.kind == 5 && toolOpen != null && line.meta >= 0) {
+            int at = toolOpen.IndexOf(line.meta);
+            if (at >= 0) { toolOpen.RemoveAt(at); } else { toolOpen.Add(line.meta); }
+        } else {
+            if (sel == null) { return; }
+            this.SelectAt(e.x, e.y, true); sel.selDrag = true; app.CapturePointer(this, true);
+        }
+        e.Handle(); app.RequestRedraw();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.App;
+        if (!e.handled && app != null && sel != null && sel.selDrag && app.GetCapturedPointer() == this) {
+            this.SelectAt(e.x, e.y, false); e.Handle();
+        }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || app.window.EventButton() != 0 || sel == null || !sel.selDrag
+        || app.GetCapturedPointer() != this) { return; }
+        this.SelectAt(e.x, e.y, false);
+        sel.selDrag = false; app.ReleasePointerCapture(); e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        if (sel != null) { sel.selDrag = false; }
+        base.OnPointerCancel(e);
+    }
+
+    public static int BarW(App app) { return app.Scale(12); }
+
     public static int FontPx(App app) {
-        return Style.Of(app, "label", "small", Style.SNormal())
-            .FontOr(Style.FontFallback(app, "small"));
+        return Style.Of(app, "label", "small", Style.SNormal()).FontOr(Style.FontFallback(app, "small"));
     }
 
-    // 一行的高度：一行文本加呼吸空间，且不小于头行要画的芯片。两者
-    // 都解释了之前面板为何显得局促错位——固定 18px 在大 UI 缩放
-    // 下比字体的行盒更紧，也比它要装的 Tag 更矮。
     public static int RowH(App app) {
-        int h = Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(3);
-        int chip = app.theme.heightTiny;
-        if (h < chip) { h = chip; }
-        return h;
+        return Math.Max(Canvas.FontHeight(StyledText.FontPx(app)) + app.Scale(3), app.theme.heightTiny);
     }
 
-    // 轮次之间的分隔线高度：块与块之间只让出这么多，不再插空行。
     public static int SepH(App app) { return app.Scale(1); }
 
-    // `mouseY` 下的展示行索引（底端锚定的记录，第一可见行为 `start`）。
-    public static int RowAt(int startY, int pad, int rowH, int start,
-            int count, int mouseY) {
-        int rel = (mouseY - (startY + pad)) / rowH;
-        if (rel < 0) { rel = 0; }
-        int ri = start + rel;
-        if (ri < 0) { ri = 0; }
-        if (ri >= count) { ri = count - 1; }
-        return ri;
+    public static int RowAt(int startY, int pad, int rowH, int start, int count, int mouseY) {
+        return Math.Max(0, Math.Min(count - 1, start + Math.Max(0, (mouseY - startY - pad) / rowH)));
     }
 
-    // 发言者名字的首个可见字符，用于圆形 Avatar。CJK 名字保留首字；
-    // 拉丁名字大写。
     public static string Initial(string name) {
         if (name == "") { return "?"; }
-        // 按字符边界而非字节边界截断：CJK 名字每字 3 字节，Left(name,1)
-        // 会切下码点的三分之一，变成头像里看到的乱码。
         int end = Text.NextCharEnd(name, 0);
-        if (end <= 0) { end = 1; }
-        string ch = Text.Left(name, end);
-        return ch.ToUpper();
+        return Text.Left(name, end > 0 ? end : 1).ToUpper();
     }
 
-    // 实例常驻的头行头像实例（惰性创建：每个可见轮次都画一个头行，
-    // 复用同一实例避免每行每帧分配控件与跨实例冲突）。
-    private Avatar HeadAvatar() {
-        if (this.headAva == null) {
-            this.headAva = new Avatar();
-        }
-        return this.headAva;
-    }
-
-    private Tag HeadTag() {
-        if (this.headTag == null) {
-            this.headTag = new Tag();
-        }
-        return this.headTag;
-    }
-
-    private int TagWidth(App app, string text, string cls) {
-        if (text == "") { return 0; }
-        Tag t = this.HeadTag();
-        t.SetText(text);
-        t.Class = cls;
-        t.MeasureTree(app);
-        return t.prefW;
-    }
-
-    private void RenderHeadTag(App app, int x, int y, string text, string cls) {
-        Tag t = this.HeadTag();
-        t.SetText(text);
-        t.Class = cls;
-        t.MeasureTree(app);
-        int h = t.prefH > 0 ? t.prefH : app.theme.heightTiny;
-        t.Arrange(x, y, t.prefW, h);
-        t.RenderTree(app);
-    }
-
-    // 绘制消息头行：时刻贴右缘，再从左向右画头像、名字与状态/进度
-    // 芯片；右缘空间不足时宁可丢弃后面的芯片也不压到时刻上。
-    private void PaintHeadRow(App app, TextRun ln, int x, int y, int rowH,
-            int rightEdge, StyleBox timeStyle) {
-        int cx = x;
-        // 时刻贴右缘，并把芯片可用的右边界收回来：成员名很长时宁可
-        // 不画后面的芯片，也不能让它们跑到时刻上面。
-        if (ln.time != "") {
-            Theme th = app.theme;
-            int timeFont = timeStyle.FontOr(Style.FontFallback(app, "small"));
-            int tw = Canvas.MeasureText(ln.time, timeFont);
-            int tx = rightEdge - tw;
-            int tdy = (rowH - timeFont) / 2;
-            if (tdy < 0) { tdy = 0; }
-            if (tx > x) {
-                app.canvas.DrawText(tx, y + tdy, ln.time, timeStyle.FgOr(0),
-                    timeFont);
-                rightEdge = tx - app.Scale(6);
-            }
-        }
-        // 名字条上的一切都按控件真实高度在行内居中：芯片高度为
-        // theme.heightTiny，按更短的猜测行高布局正是把名字压进下一行的原因。
-        int chipH = app.theme.heightTiny;
-        int chipY = y + (rowH - chipH) / 2;
-        if (chipY < y) { chipY = y; }
-        Avatar av = this.HeadAvatar();
-        av.Text = ln.ava;
-        av.Size = 16;
-        av.Class = ln.tagCls;
-        int d = av.Diameter(app);
-        int avY = y + (rowH - d) / 2;
-        if (avY < y) { avY = y; }
-        av.Arrange(cx, avY, d, d);
-        av.RenderTree(app);
-        cx = cx + d + app.Scale(5);
-        int nameW = this.TagWidth(app, ln.text, ln.tagCls);
-        if (cx + nameW <= rightEdge) {
-            this.RenderHeadTag(app, cx, chipY, ln.text, ln.tagCls);
-            cx = cx + nameW + app.Scale(4);
-        }
-        if (ln.status != "") {
-            int stW = this.TagWidth(app, ln.status, "");
-            if (cx + stW <= rightEdge) {
-                this.RenderHeadTag(app, cx, chipY, ln.status, "");
-                cx = cx + stW + app.Scale(4);
-            }
-        }
-        if (ln.pct >= 0) {
-            string pl = Convert.ToString(ln.pct) + "%";
-            int plW = this.TagWidth(app, pl, "primary");
-            if (cx + plW <= rightEdge) {
-                this.RenderHeadTag(app, cx, chipY, pl, "primary");
-            }
-        }
-    }
-
-    // 覆写：纯铺满槽位的画布，偏好尺寸取当前边界。
     public override void OnMeasure(App app) {
-        // 纯铺满槽位的画布：尺寸由 RenderInside 的 Rect 决定，
-        // 这里把偏好设成当前边界即可。
-        prefW = bw;
-        prefH = bh;
+        prefW = bw; prefH = bh;
+        this.Arrange(bx, by, bw, bh);
     }
 
-    // 覆写：绘制整行网格（正文/代码底纹/头行/busy 行），处理文本
-    // 选择、折叠行与工具行的点击及滚动条交互，并写出 maxScroll。
+    private StyledTextHeader HeaderAt(int index, App app, TextRun line) {
+        if (index >= headers.Count) {
+            StyledTextHeader added = new StyledTextHeader();
+            headers.Add(added); content.Add(added);
+        }
+        StyledTextHeader header = headers[index];
+        header.SetShown(true); header.Prepare(app, line);
+        return header;
+    }
+
+    private void PrepareVisuals(App app) {
+        if (app == null) { return; }
+        preparedView = this.ScrollViewport();
+        content.Arrange(preparedView.x, preparedView.y, preparedView.width, preparedView.height);
+        int rowH = StyledText.RowH(app); int font = StyledText.FontPx(app);
+        int textDy = Math.Max(0, (rowH - Canvas.FontHeight(font)) / 2);
+        int pad = app.Scale(6); int railW = app.Scale(3);
+        int inset = this.StyleOverflowY() >= 2 && maximumPixel > 0 ? StyledText.BarW(app) : 0;
+        int blockX = bx + pad; int blockW = Math.Max(0, bw - pad * 2 - inset);
+        int textX = blockX + railW + app.Scale(8);
+        int sr0 = sel != null ? sel.selR0 : -1; int sc0 = sel != null ? sel.selC0 : 0;
+        int sr1 = sel != null ? sel.selR1 : -1; int sc1 = sel != null ? sel.selC1 : 0;
+        if (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1)) {
+            int swap = sr0; sr0 = sr1; sr1 = swap;
+            swap = sc0; sc0 = sc1; sc1 = swap;
+        }
+        int selection = Style.Part(app, "styledtext", "selection", "", "", "", Style.SNormal()).BgOr(0);
+        int code = Style.Part(app, "styledtext", "code", "", "", "", Style.SNormal()).BgOr(0);
+        int separator = Style.Part(app, "styledtext", "separator", "", "", "", Style.SNormal()).BgOr(0);
+        StyleBox timeStyle = Style.Part(app, "styledtext", "time", "", "", "", Style.SNormal());
+        int count = lines != null ? lines.Count : 0;
+        int first = this.ScrollTop() / rowH;
+        int last = Math.Min(count, (this.ScrollTop() + preparedView.height + rowH - 1) / rowH);
+        int visible = Math.Max(0, last - first);
+        while (paintRows.Count < visible) { paintRows.Add(new StyledTextPaintRow()); }
+        while (paintRows.Count > visible) { paintRows.RemoveAt(paintRows.Count - 1); }
+        int head = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            TextRun line = lines[i];
+            if (line.kind != 3) { continue; }
+            int right = bx + bw - pad - inset;
+            if (line.time != "") {
+                int timeWidth = Canvas.MeasureText(line.time, timeStyle.FontOr(Style.FontFallback(app, "small")));
+                if (right - timeWidth > textX) { right = right - timeWidth - app.Scale(6); }
+            }
+            StyledTextHeader header = this.HeaderAt(head, app, line);
+            header.Arrange(textX, preparedView.y + i * rowH - this.ScrollTop(), Math.Max(0, right - textX), rowH);
+            head = head + 1;
+        }
+        while (headers.Count > head) {
+            StyledTextHeader removed = headers[headers.Count - 1];
+            headers.RemoveAt(headers.Count - 1); content.Remove(removed);
+        }
+        for (int i = first; i < last; i = i + 1) {
+            TextRun line = lines[i]; StyledTextPaintRow row = paintRows[i - first];
+            row.y = preparedView.y + i * rowH - this.ScrollTop(); row.height = rowH;
+            row.blockX = blockX; row.blockWidth = blockW; row.railWidth = railW;
+            string role = line.owner == 0 ? "primary" : (line.owner == 2 ? "tool" : (line.owner == 3 ? "error" : "success"));
+            row.railColor = Style.Part(app, "styledtext", "rail", "", role, "", Style.SNormal()).BgOr(0);
+            row.tintColor = Style.Part(app, "styledtext", "tint", "", role, "", Style.SNormal()).BgOr(0);
+            row.spacer = line.kind == 6; row.code = line.kind == 1;
+            row.codeX = textX - app.Scale(2); row.codeWidth = Math.Max(0, blockW - railW - app.Scale(4)); row.codeColor = code;
+            row.selectionX = 0; row.selectionWidth = 0; row.selectionColor = selection;
+            row.separatorHeight = line.last ? StyledText.SepH(app) : 0; row.separatorColor = separator;
+            row.text = line.kind == 3 ? "" : line.text; row.textX = textX;
+            row.textY = row.y + textDy; row.font = font; row.color = line.color;
+            row.glyph = ""; row.time = "";
+            this.PrepareSelection(row, line, i, sr0, sc0, sr1, sc1, pad);
+            if (line.kind == 3) {
+                int right = bx + bw - pad - inset;
+                if (line.time != "") {
+                    row.timeFont = timeStyle.FontOr(Style.FontFallback(app, "small"));
+                    int width = Canvas.MeasureText(line.time, row.timeFont);
+                    int tx = right - width;
+                    if (tx > textX) {
+                        row.time = line.time; row.timeX = tx; row.timeY = row.y + Math.Max(0, (rowH - row.timeFont) / 2);
+                        row.timeColor = timeStyle.FgOr(0); right = tx - app.Scale(6);
+                    }
+                }
+            } else if (line.kind == 1) { row.textX = textX + app.Scale(4); }
+            else if (line.kind == 5 && line.text != null && (line.text.StartsWith("▼ ") || line.text.StartsWith("▶ "))) {
+                row.glyph = line.text.StartsWith("▼ ") ? "chevron-down" : "chevron-right";
+                row.glyphSize = app.Scale(11); row.glyphX = textX;
+                row.glyphY = row.y + (rowH - row.glyphSize) / 2;
+                row.textX = textX + row.glyphSize + app.Scale(4);
+                row.text = line.text.Substring(Text.NextCharEnd(line.text, 0) + 1);
+            }
+        }
+        bool showBusy = busy && count * rowH < this.ScrollTop() + preparedView.height
+        && (count + 1) * rowH > this.ScrollTop();
+        busyLabel.SetShown(showBusy);
+        if (showBusy) {
+            string text = busyText;
+            if (busyLabel.GetText() != text) { busyLabel.Text = text; }
+            busyLabel.MeasureTree(app);
+            busyLabel.Arrange(bx + pad, preparedView.y + count * rowH - this.ScrollTop(),
+            Math.Max(0, bw - pad * 2 - inset), rowH);
+        }
+        preparedTicket = preparationTicket;
+    }
+
+    private void PrepareSelection(StyledTextPaintRow row, TextRun line, int index,
+    int sr0, int sc0, int sr1, int sc1, int pad) {
+        if (row.spacer || sr0 < 0 || index < sr0 || index > sr1) { return; }
+        int from = index == sr0 ? sc0 : 0;
+        int to = index == sr1 ? sc1 : line.text.Length;
+        from = Math.Max(0, Math.Min(line.text.Length, from)); to = Math.Max(from, Math.Min(line.text.Length, to));
+        int x = row.textX + Canvas.MeasureText(Text.Left(line.text, from), row.font);
+        int end = row.textX + Canvas.MeasureText(Text.Left(line.text, to), row.font);
+        if (index < sr1) { end = end + pad; }
+        row.selectionX = x; row.selectionWidth = Math.Max(2, end - x);
+    }
+
     public override void OnPaint(App app) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        if (lines == null || lines.Count == 0) { return; }
-        List<TextRun> cache = lines;
-        int pad = app.Scale(6);
-        int rowH = StyledText.RowH(app);
-        int fontPx = StyledText.FontPx(app);
-        int textDy = (rowH - Canvas.FontHeight(fontPx)) / 2;
-        if (textDy < 0) { textDy = 0; }
-        int extra = 0;
-        if (busy) { extra = 1; }
-        int total = cache.Count + extra;
-        int maxRows = (bh - pad * 2) / rowH;
-        if (maxRows < 1) { maxRows = 1; }
-        int maxSc = total - maxRows;
-        if (maxSc < 0) { maxSc = 0; }
-        int sc = scroll;
-        if (sc > maxSc) { sc = maxSc; }
-        if (sc < 0) { sc = 0; }
-        int start = total - maxRows - sc;
-        if (start < 0) { start = 0; }
-        this.maxScroll = maxSc;
-        // 有得滚才画滚动条，也才收窄正文：内容装得下时右边不该空出一条。
-        bool wantBar = scrollBar != null && maxSc > 0;
-        int inset = 0;
-        if (wantBar) { inset = StyledText.BarW(app); }
-        // 在已换行展示行上拖拽选择，复用 LogView 的选择模型
-        // （LogState + LogView.ColAt / SelectionText）。滚轮滚动仍由
-        // 调用方持有，以保留它自己的滚动模型。
-        if (interactive && cache.Count > 0) {
-            int hid = app.focus.AllocId();
-            app.hitTester.RegisterRect(hid, bx, by, bw, bh, 1);
-            int kind = app.EventKind();
-            bool over = app.mouseX >= bx && app.mouseX < bx + bw
-                && app.mouseY >= by && app.mouseY < by + bh;
-            // 滑块上的按下归滚动条，不能同时开一段文本选区（选区只看坐标，
-            // 不过 hitTester），否则拖条子的同时整屏反白。
-            if (wantBar && app.mouseX >= bx + bw - inset - app.Scale(5)) {
-                over = false;
-            }
-            if (kind == 2 && app.window.EventButton() == 0 && over
-                && !app.PointerCaptured()) {
-                int ri = StyledText.RowAt(by, pad, rowH, start,
-                    cache.Count, app.mouseY);
-                if (ri >= 0 && ri < cache.Count && cache[ri].kind == 4) {
-                    // 点击「思考过程」折叠行展开/收起推理，而非开始文本选择。
-                    thinkOpen.Set(1 - thinkOpen.Get());
-                    app.RequestRedraw();
-                } else if (ri >= 0 && ri < cache.Count && cache[ri].kind == 5) {
-                    // 点击工具摘要行展开/收起该工具结果
-                    // （在 toolOpen 中切换它的消息索引）。
-                    int mid = 0 - 1;
-                    if (ri < cache.Count) { mid = cache[ri].meta; }
-                    if (mid >= 0) {
-                        int at = 0 - 1;
-                        for (int z = 0; z < toolOpen.Count; z = z + 1) {
-                            if (toolOpen[z] == mid) { at = z; }
-                        }
-                        if (at >= 0) { toolOpen.RemoveAt(at); }
-                        else { toolOpen.Add(mid); }
-                        app.RequestRedraw();
-                    }
-                } else {
-                    int cc = StyledText.ColAt(cache[ri].text,
-                        bx + pad + app.Scale(11),
-                        StyledText.FontPx(app), app.mouseX);
-                    sel.selR0 = ri; sel.selC0 = cc;
-                    sel.selR1 = ri; sel.selC1 = cc;
-                    sel.selDrag = true;
-                    app.RequestRedraw();
-                }
-            }
-            if (kind == 1 && sel.selDrag) {
-                int ri = StyledText.RowAt(by, pad, rowH, start,
-                    cache.Count, app.mouseY);
-                int cc = StyledText.ColAt(cache[ri].text,
-                    bx + pad + app.Scale(11),
-                    StyledText.FontPx(app), app.mouseX);
-                sel.selR1 = ri; sel.selC1 = cc;
-                app.RequestRedraw();
-            }
-            if (kind == 3 && sel.selDrag) {
-                sel.selDrag = false;
-                app.RequestRedraw();
-            }
-        }
-        int sr0 = sel.selR0; int sc0 = sel.selC0;
-        int sr1 = sel.selR1; int sc1 = sel.selC1;
-        if (sr0 >= 0 && (sr0 > sr1 || (sr0 == sr1 && sc0 > sc1))) {
-            int tr = sr0; sr0 = sr1; sr1 = tr;
-            int tc = sc0; sc0 = sc1; sc1 = tc;
-        }
-        StyleBox selStyle = Style.Part(app, "styledtext", "selection", "",
-                                       "", "", Style.SNormal());
-        StyleBox codeStyle = Style.Part(app, "styledtext", "code", "",
-                                        "", "", Style.SNormal());
-        StyleBox sepStyle = Style.Part(app, "styledtext", "separator", "",
-                                       "", "", Style.SNormal());
-        StyleBox timeStyle = Style.Part(app, "styledtext", "time", "",
-                                        "", "", Style.SNormal());
-        StyleBox successRail = Style.Part(app, "styledtext", "rail", "",
-                                          "success", "", Style.SNormal());
-        StyleBox successTint = Style.Part(app, "styledtext", "tint", "",
-                                          "success", "", Style.SNormal());
-        StyleBox primaryRail = Style.Part(app, "styledtext", "rail", "",
-                                          "primary", "", Style.SNormal());
-        StyleBox primaryTint = Style.Part(app, "styledtext", "tint", "",
-                                          "primary", "", Style.SNormal());
-        StyleBox toolRail = Style.Part(app, "styledtext", "rail", "",
-                                       "tool", "", Style.SNormal());
-        StyleBox toolTint = Style.Part(app, "styledtext", "tint", "",
-                                       "tool", "", Style.SNormal());
-        StyleBox errorRail = Style.Part(app, "styledtext", "rail", "",
-                                        "error", "", Style.SNormal());
-        StyleBox errorTint = Style.Part(app, "styledtext", "tint", "",
-                                        "error", "", Style.SNormal());
-        int selCol = selStyle.BgOr(0);
-        c.PushClip(bx, by, bw, bh);
-        int idx = start;
-        int codeBg = codeStyle.BgOr(0);
-        // 每个轮次画成一个块：左边一条彩色竖条，加一层发言者颜色的
-        // 淡色衬于它的每一行之后。正是这个——而非每行标记——让一个问题、
-        // 一个答案和一段工具输出一眼可分。
-        int barW = app.Scale(3);
-        int blockX = bx + pad;
-        int textX = blockX + barW + app.Scale(8);
-        int blockW = bw - pad * 2 - inset;
-        int textW2 = blockW - barW - app.Scale(8);
-        for (int row = 0; idx < total && row < maxRows; row = row + 1) {
-            int ry = by + pad + row * rowH;
-            if (idx < cache.Count) {
-                int who = 1;
-                if (cache[idx].owner >= 0) { who = cache[idx].owner; }
-                int rail = successRail.BgOr(0);
-                int tint = successTint.BgOr(0);
-                if (who == 0) {
-                    rail = primaryRail.BgOr(0);
-                    tint = primaryTint.BgOr(0);
-                } else if (who == 2) {
-                    rail = toolRail.BgOr(0);
-                    tint = toolTint.BgOr(0);
-                } else if (who == 3) {
-                    rail = errorRail.BgOr(0);
-                    tint = errorTint.BgOr(0);
-                }
-                bool spacer = cache[idx].kind == 6;
-                if (!spacer) {
-                    c.FillRect(blockX, ry, blockW, rowH, tint);
-                    c.FillRect(blockX, ry, barW, rowH, rail);
-                }
-                if (!spacer && cache[idx].kind == 1) {
-                    c.FillRect(textX - app.Scale(2), ry,
-                        textW2 + app.Scale(4), rowH, codeBg);
-                }
-                if (!spacer && sr0 >= 0 && idx >= sr0 && idx <= sr1) {
-                    string ln = cache[idx].text;
-                    int hs = 0;
-                    int he = ln.Length;
-                    if (idx == sr0) { hs = sc0; }
-                    if (idx == sr1) { he = sc1; }
-                    if (hs < 0) { hs = 0; }
-                    if (he > ln.Length) { he = ln.Length; }
-                    if (hs > he) { hs = he; }
-                    int hx0 = textX
-                        + Canvas.MeasureText(Text.Left(ln, hs), StyledText.FontPx(app));
-                    int hx1 = textX
-                        + Canvas.MeasureText(Text.Left(ln, he), StyledText.FontPx(app));
-                    if (idx < sr1) { hx1 = hx1 + pad; }
-                    if (hx1 < hx0 + 2) { hx1 = hx0 + 2; }
-                    c.FillRect(hx0, ry, hx1 - hx0, rowH, selCol);
-                }
-                if (!spacer && cache[idx].last) {
-                    // 轮次收束：一条细线断开相邻的两个色块，代价是 1px
-                    // 而不是一整行。
-                    int sh = StyledText.SepH(app);
-                    c.FillRect(blockX, ry + rowH - sh, blockW, sh,
-                        sepStyle.BgOr(0));
-                }
-                if (spacer) {
-                    // 占位空行：两轮次之间的纯间隔行，无需绘制。
-                } else if (cache[idx].kind == 3) {
-                    // 轮次的名字行，由共享控件而非这里手绘拼成：发言者的
-                    // 圆形 Avatar、名字的 Tag 芯片，团队聊天下再加一个
-                    // 节拍 Tag 和一个百分比 Tag。手搓这个胶囊正是让助手
-                    // 的外观偏离 IDE 中所有其它列表行的原因。
-                    this.PaintHeadRow(app, cache[idx], textX, ry, rowH,
-                        bx + bw - pad - inset, timeStyle);
-                } else if (cache[idx].kind == 1) {
-                    c.DrawText(textX + app.Scale(4), ry + textDy,
-                        cache[idx].text, cache[idx].color, fontPx);
-                } else if (cache[idx].kind == 5) {
-                    string sTxt = cache[idx].text;
-                    int curX = textX;
-                    if (sTxt != null && (sTxt.StartsWith("▼ ") || sTxt.StartsWith("▶ "))) {
-                        bool isOpen = sTxt.StartsWith("▼ ");
-                        int gsz = app.Scale(11);
-                        int gy = ry + (rowH - gsz) / 2;
-                        c.DrawGlyphIn(isOpen ? "chevron-down" : "chevron-right",
-                            curX, gy, gsz, gsz, gsz, cache[idx].color);
-                        curX = curX + gsz + app.Scale(4);
-                        sTxt = sTxt.Substring(2);
-                    }
-                    c.DrawText(curX, ry + textDy, sTxt, cache[idx].color, fontPx);
-                } else {
-                    c.DrawText(textX, ry + textDy, cache[idx].text,
-                        cache[idx].color, fontPx);
-                }
-            } else {
-                // busy 行：常驻 Label 替代每帧 DrawStyledText。
-                this.EnsureThinking(app);
-                this.thinkingLbl.Text = busyText;
-                this.thinkingLbl.RenderAt(app, bx + pad, ry + textDy);
-            }
-            idx = idx + 1;
-        }
-        c.PopClip();
-        // 纵向滚动条：记录的滚动是「从底算的行数」，滚动条说的是「从顶算的
-        // 像素」，在这里换一下再把拖动结果写回调用方的信号。
-        if (wantBar) {
-            int trackH = bh - pad * 2;
-            SignalInt px = this.BarSig();
-            px.Set((maxSc - sc) * rowH);
-            Scrollbar.RenderVerticalScrollIn(app, bx + bw - inset, by + pad,
-                trackH, maxRows * rowH, total * rowH, px,
-                bx, by, bw, bh);
-            int top = px.Get() / rowH;
-            int want = maxSc - top;
-            if (want < 0) { want = 0; }
-            if (want > maxSc) { want = maxSc; }
-            if (want != sc) { scrollBar.Set(want); app.RequestRedraw(); }
-        }
+        Canvas canvas = app.canvas;
+        canvas.PushClip(preparedView.x, preparedView.y, preparedView.width, preparedView.height);
+        for (int i = 0; i < paintRows.Count; i = i + 1) { paintRows[i].Paint(canvas); }
+        canvas.PopClip();
     }
 
-    // 文本字符列命中计算：根据鼠标坐标计算列索引
     public static int ColAt(string line, int textX, int fontSize, int mouseX) {
-        for (int i = 0; i < line.Length; i = i + 1) {
-            int wa = Canvas.MeasureText(Text.Left(line, i), fontSize);
-            int wb = Canvas.MeasureText(Text.Left(line, i + 1), fontSize);
-            if (mouseX < textX + (wa + wb) / 2) { return i; }
+        for (int i = 0; i < line.Length; i = Text.NextCharEnd(line, i)) {
+            int next = Text.NextCharEnd(line, i);
+            int left = Canvas.MeasureText(Text.Left(line, i), fontSize);
+            int right = Canvas.MeasureText(Text.Left(line, next), fontSize);
+            if (mouseX < textX + (left + right) / 2) { return i; }
         }
         return line.Length;
     }
 
-    // ---- 设计器 / 序列化模型 ----
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "StyledText"; }
-
-    public override List<PropSpec> Props() {
-        List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(this.SizeProp());
-        return ps;
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> props = new List<PropSpec>(); props.Add(this.SizeProp()); return props;
     }
 }

@@ -31,7 +31,7 @@ class RibbonRetainedComponentTest {
     static void Click(App app, Control control) { QueueClick(app, control); Drain(app); }
     static Control GroupButton(Ribbon ribbon, int group, int index) {
         int band = ribbon.tabs.Count > 0 ? 1 : 0;
-        return ribbon.Children[band].Children[group].Children[0].Children[index];
+        return ribbon.ChildAt(band).ChildAt(group).ChildAt(0).ChildAt(index);
     }
     static Ribbon Model() {
         Ribbon ribbon = new Ribbon();
@@ -51,6 +51,41 @@ class RibbonRetainedComponentTest {
         app.SetRootControl(ribbon); ribbon.MeasureTree(app);
         int height = ribbon.tabs.Count > 0 ? Ribbon.HeightTabbed(app) : Ribbon.HeightGroups(app);
         ribbon.Arrange(10, 10, width, height);
+    }
+    static void CheckDpiLayout(App app, Ribbon ribbon) {
+        RibbonLayout layout = ribbon.CurrentLayout();
+        Check(layout != null && layout.slots.Count > 0, "DPI preparation supplies real retained slots");
+        RibbonSlot slot = layout.slots[0];
+        Control button = GroupButton(ribbon, slot.group, slot.item);
+        int gap = app.Scale(Space.XS);
+        int natural = (int)Math.Max(button.prefW, button.StyleWidthIn(0));
+        Check(slot.kind == 0 && !slot.overflow && button.Visible
+            && slot.w == (int)Math.Max(app.Scale(64), natural + gap),
+            "actual DPI slot includes the standard Button natural width, size floor and slot gap");
+        Check(button.bx == ribbon.bx + slot.x && button.bw == slot.w - gap
+            && button.bh == slot.h - gap && button.bw >= natural,
+            "actual DPI Button receives the complete measured content box inside its slot");
+        int captions = 0; int icons = 0;
+        for (int i = 0; i < button.ChildCount(); i = i + 1) {
+            Control child = button.ChildAt(i);
+            if (!child.StyleVisible()) { continue; }
+            Check(child.bx >= button.bx + button.StyleInsetL()
+                && child.bx + child.bw <= button.bx + button.bw - button.StyleInsetR(),
+                "DPI icon and caption remain inside the real standard Button insets");
+            if (child is Label) {
+                Label caption = (Label)child; captions = captions + 1;
+                int font = caption.ResolvedStyle(app).FontOr(Style.FontFallback(app, "medium"));
+                Check(caption.Str() == "Primary"
+                    && caption.bw - caption.StyleInsetL() - caption.StyleInsetR() >= Canvas.MeasureText(caption.Str(), font),
+                    "complete caption fits at the actual resolved DPI font without clipping or ellipsis");
+            }
+            if (child is IconView) {
+                icons = icons + 1;
+                Check(child.prefW == app.Scale(20) && child.bw >= child.prefW,
+                    "standard primary icon is measured and allocated at the current DPI");
+            }
+        }
+        Check(captions == 1 && icons == 1, "DPI assertion covers the actual retained primary icon and label");
     }
     static void Component() {
         App a = App.CreateOffscreen("Ribbon A", 1200, 500);
@@ -95,13 +130,13 @@ class RibbonRetainedComponentTest {
                 "each real visible item stays fully inside reserved content area");
         }
         a.SetOffscreenViewport(1200, 500, 150); Layout(a, ribbon, a.Scale(1000));
-        Check(ribbon.CurrentLayout().slots[0].w == a.Scale(64), "150 percent actual slots use shared DPI geometry");
+        CheckDpiLayout(a, ribbon);
         a.SetOffscreenViewport(1200, 500, 200); Layout(a, ribbon, a.Scale(1000));
-        Check(ribbon.CurrentLayout().slots[0].w == a.Scale(64), "200 percent actual slots use shared DPI geometry");
+        CheckDpiLayout(a, ribbon);
         a.SetOffscreenViewport(1200, 500, 100);
         Ribbon commands = new Ribbon(); RibbonCmd command = new RibbonCmd("save", "Save"); command.act = 99;
         commands.AddCommand(command); commands.CommandClicked.Add(hooks.Command); hooks.Ribbon = commands;
-        Layout(a, commands, 1000); Click(a, commands.Children[0].Children[0]);
+        Layout(a, commands, 1000); Click(a, commands.ChildAt(0).ChildAt(0));
         Check(hooks.Count == 2 && hooks.Seen == 99, "flat command retains act and original tree path");
         a.SetRootControl(null); b.SetRootControl(null); Drain(a); Drain(b); a.canvas.Destroy(); b.canvas.Destroy();
         Console.WriteLine("RIBBON_RETAINED_INPUT_OK");
@@ -138,18 +173,18 @@ class RibbonRetainedComponentTest {
         Ribbon ribbon = Model(); ribbon.tabs.Add("Home"); ribbon.tabs.Add("View");
         RibbonComponentHooks hooks = new RibbonComponentHooks(); hooks.Ribbon = ribbon;
         ribbon.CommandClicked.Add(hooks.Command); Layout(app, ribbon, 1000);
-        Control band = ribbon.Children[1]; Control first = GroupButton(ribbon, 0, 0);
+        Control band = ribbon.ChildAt(1); Control first = GroupButton(ribbon, 0, 0);
         Paint(app, ribbon); Paint(app, ribbon);
-        Check(band == ribbon.Children[1] && first == GroupButton(ribbon, 0, 0), "repaint preserves component tree identity");
-        Click(app, ribbon.Children[0].Children[1]);
-        Check(ribbon.activeTab.Get() == 1 && ribbon.Children[1] != band, "real tab selects and rebuilds before Paint");
+        Check(band == ribbon.ChildAt(1) && first == GroupButton(ribbon, 0, 0), "repaint preserves component tree identity");
+        Click(app, ribbon.ChildAt(0).ChildAt(1));
+        Check(ribbon.activeTab.Get() == 1 && ribbon.ChildAt(1) != band, "real tab selects and rebuilds before Paint");
         Layout(app, ribbon, 180); Check(ribbon.OverflowSlots().Count > 0, "narrow component exposes overflow");
         int expected = ribbon.OverflowSlots()[0].cmd.act;
         Click(app, ribbon.OverflowButton()); Control popup = app.overlayHost.ActiveRoot();
         Check(popup != null, "overflow opens through shared OverlayHost");
         Paint(app, ribbon); Paint(app, ribbon);
         Check(app.overlayHost.ActiveRoot() == popup, "repaint preserves popup session");
-        Click(app, popup.Children[0]);
+        Click(app, popup.ChildAt(0));
         Check(hooks.Count == 1 && hooks.Seen == expected && !app.overlayHost.HasActive(), "overflow reports original act once");
         Paint(app, ribbon); Check(hooks.Count == 1, "Paint does not replay command");
         Click(app, ribbon.OverflowButton()); Input(app, 4, 0, 0, 0, 27);
@@ -159,7 +194,7 @@ class RibbonRetainedComponentTest {
         Click(app, ribbon.OverflowButton()); Input(app, 9, 0, 0, 0, 0);
         Check(!app.overlayHost.HasActive(), "blur closes component popup");
         Click(app, ribbon.OverflowButton()); popup = app.overlayHost.ActiveRoot();
-        QueueMutation(app, popup.Children[0], () => {
+        QueueMutation(app, popup.ChildAt(0), () => {
             Check(ribbon.RetireInput(), "explicit retirement completes"); hooks.Mutations = hooks.Mutations + 1;
         });
         Check(hooks.Mutations == 1, "queued retirement ran before stale popup action"); Drain(app);

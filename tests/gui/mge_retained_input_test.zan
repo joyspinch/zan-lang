@@ -1,0 +1,227 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+namespace Mge;
+
+// Link the actual editor (exclude tools/mge/Mge.zan, its production Main).
+// Extra sources: tools/mge/{MgeEditor,MgeRootView,MgeSheetView,Str}.zan and
+// tools/mge/Models/{FieldSpec,MapDoc,Sheet}.zan. Use --package-project <repo>.
+class MgeRetainedWitness {
+    public weak App App;
+    public weak MgeRootView View;
+    public weak Control Root;
+    public weak Control World;
+}
+
+class MgeCancelReentry {
+    public weak App App;
+    public weak MgeRootView Old;
+    public weak Control Replacement;
+    public int Calls;
+    public bool Renew;
+    public void Route(Control sender, RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel" || !Renew) { return; }
+        Renew = false; Calls = Calls + 1;
+        MgeRootView old = Old; App app = App;
+        if (old != null) { old.Retire(); }
+        Mge.Attach(app);
+        Control button = MgeRetainedInputTest.Find(Mge.rootView.Root(), "mge-map-create");
+        Replacement = button;
+        button.Focus(app); app.CapturePointer(button, true);
+    }
+}
+
+class MgeRetainedInputTest {
+    static void Check(bool value, string label) { if (!value) { throw new Exception(label); } }
+    static Control Find(Control root, string name) {
+        if (root == null) { return null; }
+        if (root.name == name) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = Find(root.ChildAt(i), name); if (found != null) { return found; }
+        }
+        return null;
+    }
+    static Control Named(string name) { return Find(Mge.rootView.Root(), name); }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Event(App app, int kind, int x, int y, int key) { app.ProcessOffscreenInput(kind, x, y, 0, key, 0, 0); }
+    static void Prepare(App app) { Event(app, 1, 0, 0, 0); }
+    static void Down(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "production control has geometry");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        Event(app, 2, x, y, 0);
+        Check(app.GetCapturedPointer() == control, "real Down captures production control");
+    }
+    static void Up(App app, Control control) { Event(app, 3, control.bx + control.bw / 2, control.by + control.bh / 2, 0); Drain(app); }
+    static void Click(App app, Control control) { Down(app, control); Up(app, control); }
+    static void Text(App app, Input input, string text) {
+        Click(app, input);
+        Check(input.IsFocused(app), "actual input focuses before Paint");
+        input.SelectAll();
+        for (int i = 0; i < text.Length; i = i + 1) { Event(app, 6, 0, 0, text[i]); }
+        Drain(app);
+    }
+    static void Paint(App app) {
+        app.BeginOffscreenFrame();
+        Check(app.PrepareStandardHostFrame(), "production frame prepares");
+        Mge.rootView.Render(app); app.overlayHost.RenderAll(app); app.EndOffscreenFrame(); Drain(app);
+    }
+    static App Open(int width, int height, bool mapPage) {
+        Mge.Initialize();
+        MapDoc first = MapDoc.Create("alpha", 8, 8); MapDoc second = MapDoc.Create("beta", 8, 8);
+        Mge.maps.Add(first); Mge.maps.Add(second); Mge.SelectMap(0);
+        JsonValue npc = Mge.sheets[0].NewRow(); npc.Set("name", JsonValue.NewStr("monster"));
+        Mge.sheets[0].rows.Add(npc); Mge.sheets[0].sel = 0;
+        Mge.tab = mapPage ? 3 : 0;
+        App app = App.CreateOffscreen("MGE actual retained input", width, height); Mge.Attach(app); return app;
+    }
+    static void Close(App app) {
+        Mge.Close(); app.SetRootControl(null); app.StopLoop(); Drain(app); app.canvas.Destroy();
+    }
+    static void FirstInputAndFields() {
+        App app = Open(1280, 1000, false);
+        Control root = Mge.rootView.Root(); Control tab = Named("mge-tab-3");
+        Check(tab.bw == 0, "construction registers without painting or arranging");
+        int x = app.Scale(30); int y = app.ContentTop() + app.Scale(12) + 3 * app.Scale(44) + app.Scale(20);
+        Event(app, 2, x, y, 0); Check(app.GetCapturedPointer() == tab, "very first Down prepares registered production navigation");
+        Event(app, 3, x, y, 0); Drain(app);
+        Check(Mge.tab == 3 && Mge.rootView.Root() == root, "first Up switches page without Paint");
+        Prepare(app);
+        MapDoc map = Mge.CurrentMap();
+        Mge.mapInputs[2].SetText("91"); // Deliberately uncommitted unrelated field.
+        Text(app, Mge.mapInputs[0], "renamed");
+        Check(map.name == "renamed" && map.cellH == 32 && Mge.mapInputs[2].GetText() == "91", "Change commits exactly its own map field");
+        Text(app, Mge.mapInputs[1], "80q");
+        Check(map.cellW == 80 && Mge.mapInputs[1].GetText() == "80" && map.cellH == 32, "numeric Change sanitizes and commits only that field");
+        Text(app, Mge.mapInputs[3], "10"); Text(app, Mge.mapInputs[4], "9");
+        Check(map.cols == 10 && map.rows == 9 && map.cells.Count == 90, "row and column Change resizes before Paint");
+        Text(app, Mge.mapInputs[5], "4"); Text(app, Mge.mapInputs[6], "3");
+        Check(map.startX == 4 && map.startY == 3, "start fields commit through routed text");
+        Text(app, Mge.spawnCount, "7x"); Text(app, Mge.spawnRange, "2");
+        Check(Mge.spawnAmount == 7 && Mge.spawnRadius == 2, "spawn settings commit without pulling other fields");
+        Mge.mapDirty = false;
+        Paint(app); Paint(app);
+        Check(map.cellH == 32 && map.name == "renamed" && !Mge.mapDirty && Mge.mapInputs[2].GetText() == "91", "repeated Paint neither pulls form nor changes business state");
+        Close(app); Console.WriteLine("mge first-input and field commits passed");
+    }
+    static void ListsAndEmptyState() {
+        App app = Open(1280, 1000, true); Prepare(app);
+        Control mapList = Named("mge-map-list"); Control first = mapList.ChildAt(0); Control second = mapList.ChildAt(1);
+        MapDoc firstMap = Mge.maps[0]; MapDoc secondMap = Mge.maps[1];
+        Click(app, Named("mge-map-create"));
+        Check(Mge.maps.Count == 3 && mapList.ChildCount() == 3 && mapList.ChildAt(0) == first && mapList.ChildAt(1) == second,
+            "map append preserves existing retained buttons immediately");
+        Click(app, first); Check(Mge.CurrentMap() == firstMap, "retained map row resolves model identity");
+        Click(app, Named("mge-map-delete"));
+        Check(Mge.maps.Count == 2 && mapList.ChildCount() == 2 && mapList.ChildAt(0) == second && Mge.CurrentMap() == secondMap,
+            "map deletion preserves surviving row identity and selection");
+        first.Click.RaiseS(first); Drain(app);
+        Check(Mge.CurrentMap() == secondMap, "removed row action cannot select shifted index");
+        Click(app, Named("mge-map-default")); Check(secondMap.isDefault, "retained default map action works");
+        Click(app, Named("mge-tab-0")); Click(app, Named("mge-tab-3")); Prepare(app);
+        Control world = Named("mge-world");
+        Mge.mapTool = 1; Mge.spawnAmount = 4; Mge.spawnRadius = 2;
+        Event(app, 2, world.bx + 3, world.by + 3, 0); Event(app, 3, world.bx + 3, world.by + 3, 0); Drain(app);
+        Control spawnList = Named("mge-spawn-list");
+        Check(secondMap.spawns.Count == 1 && spawnList.ChildCount() == 1 && secondMap.spawns[0].Int("count", 0) == 4,
+            "world spawn append synchronizes retained list without Paint");
+        Control spawnFirst = spawnList.ChildAt(0);
+        int cell = world.bw / secondMap.cols;
+        Event(app, 2, world.bx + cell + 3, world.by + 3, 0); Event(app, 3, world.bx + cell + 3, world.by + 3, 0); Drain(app);
+        Check(secondMap.spawns.Count == 2 && spawnList.ChildAt(0) == spawnFirst, "spawn append preserves surviving child identity");
+        Control spawnSecond = spawnList.ChildAt(1);
+        Prepare(app); Click(app, spawnFirst);
+        Check(secondMap.spawns.Count == 1 && spawnList.ChildCount() == 1 && spawnList.ChildAt(0) == spawnSecond,
+            "spawn delete resolves identity and keeps visible intersection");
+        spawnFirst.Click.RaiseS(spawnFirst); Drain(app); Check(secondMap.spawns.Count == 1, "removed spawn action is inert");
+        Mge.mapTool = 3;
+        Event(app, 2, world.bx + cell + 3, world.by + 3, 0); Event(app, 3, world.bx + cell + 3, world.by + 3, 0); Drain(app);
+        Check(secondMap.spawns.Count == 0 && spawnList.ChildCount() == 0, "world erase synchronizes retained spawn removal");
+        while (Mge.maps.Count > 0) { Prepare(app); Click(app, Named("mge-map-delete")); }
+        Check(Mge.CurrentMap() == null && mapList.ChildCount() == 0 && Mge.mapInputs[0].GetText() == ""
+            && Mge.spawnCount.GetText() == "" && Mge.spawnRange.GetText() == "" && Mge.mapInputs[0].IsDisabled()
+            && Named("mge-map-delete").IsDisabled() && world.IsDisabled(), "last map removal clears and disables actual retained form immediately");
+        Click(app, Named("mge-map-create")); Prepare(app);
+        Check(Mge.CurrentMap() != null && !Mge.mapInputs[0].IsDisabled() && Mge.spawnCount.GetText() == "4", "create from empty state restores controls and spawn defaults");
+        Close(app); Console.WriteLine("mge map and spawn lists passed");
+    }
+    static void GeometryPageAndCapture() {
+        App app = Open(1280, 1000, true); Prepare(app);
+        MapDoc map = Mge.CurrentMap(); Control world = Named("mge-world");
+        app.canvas.Destroy(); app.canvas = new Canvas(1000, 700);
+        // No frame or Paint between changed geometry and the next actual input.
+        Mge.mapTool = 2;
+        int expectedX = app.Scale(350) + app.Scale(8); int expectedY = app.ContentTop() + app.Scale(8 + (28 + 8) * 2);
+        Event(app, 2, expectedX + 3, expectedY + 3, 0);
+        Check(world.bx == expectedX && world.by == expectedY && app.GetCapturedPointer() == world && map.startX == 0 && map.startY == 0,
+            "input uses current resized viewport geometry before Paint");
+        app.ProcessOffscreenInput(3, expectedX + 3, expectedY + 3, 1, 0, 0, 0);
+        Check(app.GetCapturedPointer() == world, "secondary Up cannot terminate primary world capture");
+        Event(app, 3, expectedX + 3, expectedY + 3, 0); Check(app.GetCapturedPointer() == null, "primary Up releases real capture API");
+        Mge.mapTool = 0; Mge.brush = 3; map.SetCell(0, 0, 0); map.SetCell(1, 0, 0);
+        int cell = world.bw / map.cols;
+        Event(app, 2, world.bx + 2, world.by + 2, 0);
+        Event(app, 3, world.bx + cell + 2, world.by + 2, 0);
+        Check(map.CellAt(0, 0) == 3 && map.CellAt(1, 0) == 3 && app.GetCapturedPointer() == null, "world commits final Up cell before releasing capture");
+        Event(app, 2, world.bx + 2, world.by + 2, 0);
+        Mge.tab = 0;
+        Event(app, 1, world.bx + cell * 2 + 2, world.by + 2, 0);
+        Check(app.GetCapturedPointer() == null && map.CellAt(2, 0) == 0 && !Named("mge-map-page").Visible,
+            "current active page retires captured old world before next input");
+        Input sheetInput = Mge.sheets[0].inputs[0]; Prepare(app); Text(app, sheetInput, "changedNpc");
+        JsonValue selectedNpc = Mge.sheets[0].Selected();
+        Check(selectedNpc != null && selectedNpc.Str("name", "") == "changedNpc", "standard sheet remains editable without Paint");
+        Mge.tab = 3; Prepare(app);
+        Check(!sheetInput.IsFocused(app), "leaving sheet retires actual editor focus");
+        map.Resize(100, 100); Prepare(app);
+        Check(world.bw <= app.Scale(1000 - 350 - 260 - 16), "world input bounds are clipped to center region");
+        int last = map.CellAt(99, 0); int outsideX = Named("mge-map-props").bx + 4;
+        Event(app, 2, outsideX, world.by + 2, 0); Event(app, 3, outsideX, world.by + 2, 0);
+        Check(map.CellAt(99, 0) == last && app.GetCapturedPointer() != world, "clipped world cannot steal property-panel input");
+        Close(app); Console.WriteLine("mge current geometry page and capture passed");
+    }
+    static void SheetListsAndRetire() {
+        App app = Open(1280, 1000, false); Prepare(app);
+        Control sheetRoot = Named("mge-sheet-0"); Control left = sheetRoot.ChildAt(0);
+        Control actions = left.ChildAt(1); Control rows = left.ChildAt(2);
+        Control original = rows.ChildAt(0);
+        Click(app, actions.ChildAt(0)); Check(Mge.sheets[0].rows.Count == 2 && rows.ChildAt(0) == original, "sheet create keeps surviving row");
+        Click(app, actions.ChildAt(1)); Check(Mge.sheets[0].rows.Count == 3 && rows.ChildAt(0) == original, "sheet duplicate uses actual retained action");
+        Click(app, actions.ChildAt(2)); Check(Mge.sheets[0].rows.Count == 2 && rows.ChildAt(0) == original, "sheet delete keeps surviving row");
+        Text(app, Mge.sheets[0].search, "monster"); Check(rows.ChildCount() == 1 && rows.ChildAt(0) == original, "sheet search preserves matching row identity");
+        MgeRootView old = Mge.rootView; Control root = old.Root();
+        Input editor = Mge.sheets[0].inputs[0]; Down(app, editor); editor.Focus(app);
+        old.Retire();
+        Check(!old.IsActive() && !editor.IsFocused(app) && app.GetCapturedPointer() == null, "retire releases borrowed input and scope before Paint");
+        original.Click.RaiseS(original); Drain(app);
+        Check(Mge.sheets[0].rows.Count == 2, "retired action is inert");
+        Mge.Attach(app); Prepare(app);
+        Mge.tab = 3; Prepare(app); Control world = Named("mge-world");
+        MgeCancelReentry reentry = new MgeCancelReentry(); reentry.App = app; reentry.Old = Mge.rootView; reentry.Renew = true;
+        world.OnRouted(reentry.Route);
+        Event(app, 2, world.bx + 2, world.by + 2, 0);
+        MgeRootView retiring = Mge.rootView; retiring.Retire();
+        Check(reentry.Calls == 1 && Mge.rootView != retiring && Mge.rootView.IsActive()
+            && app.GetCapturedPointer() == reentry.Replacement && reentry.Replacement.IsFocused(app),
+            "Cancel reentry replacement survives old view retirement tail");
+        reentry.Replacement.OnRouted(null); Close(app); Console.WriteLine("mge standard sheets and retirement passed");
+    }
+    static MgeRetainedWitness BorrowedLifetime() {
+        App app = Open(1280, 1000, true); Prepare(app);
+        MgeRetainedWitness witness = new MgeRetainedWitness(); witness.App = app; witness.View = Mge.rootView;
+        witness.Root = Mge.rootView.Root(); witness.World = Named("mge-world");
+        Close(app); return witness;
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame owner", 2, 2);
+        FirstInputAndFields(); ListsAndEmptyState(); GeometryPageAndCapture(); SheetListsAndRetire();
+        MgeRetainedWitness witness = BorrowedLifetime();
+        Check(witness.App == null && witness.View == null && witness.Root == null && witness.World == null, "view scope and borrowed host do not keep ARC owners alive");
+        Console.WriteLine("mge borrowed lifetime passed");
+        frame.StopLoop(); frame.canvas.Destroy();
+    }
+}

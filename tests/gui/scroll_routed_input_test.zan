@@ -18,6 +18,59 @@ class ScrollOverrideControl : Control {
     }
 }
 
+class CountedLayoutLabel : Label {
+    public int measures;
+    public CountedLayoutLabel(string text) { this.InitLabel(text); this.SetWrap(true); }
+    public override void OnMeasure(App app) {
+        measures = measures + 1;
+        base.OnMeasure(app);
+    }
+}
+
+class BindingConstraintLabel : Label {
+    public string pendingStyle = "";
+    public int mutation;
+    public Control replacementRoot;
+    public int bindings;
+    public int measures;
+    public int measuredWidth;
+
+    public BindingConstraintLabel(string text) { this.InitLabel(text); this.SetWrap(true); }
+
+    public override void SyncBinding() {
+        bindings = bindings + 1;
+        base.SyncBinding();
+        string style = pendingStyle;
+        pendingStyle = "";
+        if (style != "") { this.SetProp("style", style); }
+        int action = mutation;
+        mutation = 0;
+        if (action == 1) {
+            Control owner = parent;
+            if (owner != null) { owner.Remove(this); }
+        } else if (action == 2) {
+            App host = this.App;
+            Control next = replacementRoot;
+            replacementRoot = null;
+            if (host != null) { host.SetRootControl(next); }
+        }
+    }
+
+    public override void OnMeasure(App app) {
+        measures = measures + 1;
+        measuredWidth = measureWidth;
+        base.OnMeasure(app);
+    }
+}
+
+class BindingConstraintContainer : Control {
+    public int measures;
+    public override void OnMeasure(App app) {
+        measures = measures + 1;
+        base.OnMeasure(app);
+    }
+}
+
 class ScrollRoutedInputTest {
     int wheels;
     int downs;
@@ -173,7 +226,7 @@ class ScrollRoutedInputTest {
         Layout(app, host, 200, 160);
         Input(app, 1, x, y + 10, 0, 0, 0);
         Check("hidden active axis cancels while other remains auto", !host.scroll.Active()
-            && app.GetCapturedPointer() == null && host.ScrollTop() == 0);
+        && app.GetCapturedPointer() == null && host.ScrollTop() == 0);
         host.SetProp("style", "overflow:auto;display:block;border:2px solid black");
         Layout(app, host, 200, 160);
         Input(app, 2, x, y, 0, 0, 0);
@@ -191,9 +244,61 @@ class ScrollRoutedInputTest {
         app.SetRootControl(null);
     }
 
+    static int ThumbPixel(App app, Control host, ScrollState metrics, Rect view) {
+        int x = metrics.Track(app, view.x, view.y, view.width, view.height, false).x + 2;
+        int y = metrics.ThumbStart(app, view.y, view.height, host.scrollExtent, host.ScrollTop())
+        + metrics.ThumbLength(app, view.height, host.scrollExtent) / 2;
+        return app.canvas.GetPixel(x, y);
+    }
+
+    static void Hover(App app) {
+        Control host = Box("overflow:auto;display:block;border:2px solid black");
+        host.Add(Box("width:500px;height:600px"));
+        Layout(app, host, 200, 160);
+        ScrollState metrics = new ScrollState();
+        Rect view = host.ScrollViewport();
+        Rect vertical = metrics.Track(app, view.x, view.y, view.width, view.height, false);
+        Rect horizontal = metrics.Track(app, view.x, view.y, view.width, view.height, true);
+        int x = vertical.x + vertical.width / 2;
+        int y = view.y + metrics.ThumbLength(app, view.height, host.scrollExtent) / 2;
+        Input(app, 1, 0, 0, 0, 0, 0);
+        Paint(app, host);
+        int normal = ThumbPixel(app, host, metrics, view);
+        Input(app, 1, x, y, 0, 0, 0);
+        Check("routed thumb hover", host.ScrollBarHoverAxis(app) == 1);
+        Paint(app, host);
+        int hovered = ThumbPixel(app, host, metrics, view);
+        Check("thumb hover changes paint", hovered != normal);
+        Input(app, 1, x, view.y + view.height / 2, 0, 0, 0);
+        Check("track retains axis hover", host.ScrollBarHoverAxis(app) == 1);
+        Paint(app, host);
+        Check("track hover leaves thumb normal", ThumbPixel(app, host, metrics, view) == normal);
+        Input(app, 1, x, horizontal.y + horizontal.height / 2, 0, 0, 0);
+        Check("horizontal wins shared corner hover", host.ScrollBarHoverAxis(app) == 2);
+        Input(app, 1, x, y, 0, 0, 0);
+        Control popup = Box("width:80px;height:60px");
+        popup.UseApp(app);
+        popup.MeasureTree(app);
+        app.overlayHost.ShowAt(app, popup, 30, 30);
+        Check("popup suppresses stale underlying hover", host.ScrollBarHoverAxis(app) == 0);
+        Paint(app, host);
+        Check("popup leaves underlying thumb normal", ThumbPixel(app, host, metrics, view) == normal);
+        app.overlayHost.Dismiss();
+        Input(app, 1, x, y, 0, 0, 0);
+        Input(app, 2, x, y, 0, 0, 0);
+        Input(app, 1, -40, y + 30, 0, 0, 0);
+        Check("drag outside keeps retained capture", host.scroll.Active() && app.GetCapturedPointer() == host);
+        Paint(app, host);
+        Check("captured thumb remains highlighted", ThumbPixel(app, host, metrics, view) == hovered);
+        Input(app, 3, -40, y + 30, 0, 0, 0);
+        Input(app, 1, 0, 0, 0, 0, 0);
+        Check("leave retires chrome hover", host.ScrollBarHoverAxis(app) == 0);
+        app.SetRootControl(null);
+    }
+
     static void Equivalence(App app) {
         HtmlDoc doc = Html.Parse("<div style='overflow:auto;display:block'><div style='width:400px;height:500px'></div></div>", "", null);
-        Control html = doc.root.children[0];
+        Control html = doc.root.ChildAt(0);
         Control code = Box("overflow:auto;display:block");
         code.Add(Box("width:400px;height:500px"));
         Layout(app, code, 180, 140);
@@ -204,8 +309,8 @@ class ScrollRoutedInputTest {
         Input(app, 13, 50, 50, -120, 0, 0);
         Input(app, 13, 50, 50, -120, Modifiers.Shift(), 0);
         Check("HTML and code extents and wheel agree", html.scrollExtent == code.scrollExtent
-            && html.scrollExtentX == code.scrollExtentX && html.ScrollTop() == code.ScrollTop()
-            && html.ScrollLeft() == code.ScrollLeft());
+        && html.scrollExtentX == code.scrollExtentX && html.ScrollTop() == code.ScrollTop()
+        && html.ScrollLeft() == code.ScrollLeft());
         Control empty = Box("overflow:scroll");
         Layout(app, empty, 180, 140);
         empty.scrollExtent = 0;
@@ -238,7 +343,7 @@ class ScrollRoutedInputTest {
         int before = host.routes;
         Input(app, 2, x, y, 0, 0, 0);
         Check("chrome bypasses overridden content hook", app.GetCapturedPointer() == host
-            && host.routes == before && count.downs == 1);
+        && host.routes == before && count.downs == 1);
         Input(app, 1, -40, y + 30, 0, 0, 0);
         Check("override drag moves before paint", host.ScrollTop() > 0);
         Input(app, 3, -40, y + 30, 0, 0, 0);
@@ -291,13 +396,325 @@ class ScrollRoutedInputTest {
         app.SetRootControl(null);
     }
 
+    static Element LayoutBox(string style) {
+        Element box = new Element();
+        box.InitElement("div", "");
+        box.SetProp("style", style);
+        return box;
+    }
+
+    static void SameGeometry(Control html, Control code) {
+        Check("paired child count", html.ChildCount() == code.ChildCount());
+        for (int i = 0; i < html.ChildCount(); i = i + 1) {
+            SameGeometry(html.ChildAt(i), code.ChildAt(i));
+        }
+        Check("paired node geometry " + html.name + " html=" + html.bx + "," + html.by + "," + html.bw + "," + html.bh
+        + ",prefH=" + html.prefH + ",font=" + html.computedStyle.fontPx + ",set=" + html.prefSet
+        + " code=" + code.bx + "," + code.by + "," + code.bw + "," + code.bh + ",prefH=" + code.prefH
+        + ",font=" + code.computedStyle.fontPx + ",set=" + code.prefSet,
+        html.bx == code.bx && html.by == code.by
+        && html.bw == code.bw && html.bh == code.bh
+        && (html.StyleDeclaresHeight() || html.prefH == code.prefH)
+        && html.scrollExtent == code.scrollExtent && html.scrollExtentX == code.scrollExtentX);
+    }
+
+    static void RenderPair(App app, Control html, Control code, int width, int height) {
+        // The borrowed HTML subtree still has its unhosted document parent.
+        html.UseApp(app);
+        code.UseApp(app);
+        app.BeginOffscreenFrame();
+        html.RenderInside(app, new Rect(20, 20, width, height));
+        code.RenderInside(app, new Rect(20, 20, width, height));
+        app.EndOffscreenFrame();
+        SameGeometry(html, code);
+    }
+
+    static void WrappedHeight(App app, Label text) {
+        StyleBox style = text.ResolvedStyle(app);
+        int font = style.FontOr(Style.FontFallback(app, "medium"));
+        int insetW = style.PadLOr(0) + style.PadROr(0) + style.BorderLeftPx() + style.BorderRightPx();
+        int insetH = style.PadTOr(0) + style.PadBOr(0) + style.BorderTopPx() + style.BorderBottomPx();
+        int lines = TextWrap.Lines(text.Str(), text.bw - insetW, font).Count;
+        int expected = lines * Canvas.FontHeight(font) + app.theme.gapSmall + insetH;
+        Check("wrapped text height at current width " + text.bw + ": " + text.prefH + " vs " + expected,
+        text.prefH == expected && text.bh == expected);
+    }
+
+    static void TextResizeEquivalence(App app) {
+        string longText = "A complex window must measure real text at the available width before placing the next row. "
+        + "Changing the window width must update every nested label in the same layout pass.";
+        string column = "display:flex;flex-direction:column;padding:8px;gap:6px;flex-shrink:0";
+        string textStyle = "font-size:14px;padding:3px;flex-shrink:0";
+        HtmlDoc doc = Html.Parse("<div style='overflow:auto;display:block'><div style='" + column
+        + "'><label wrap='true' style='" + textStyle + "'>" + longText
+        + "</label><label style='" + textStyle + "'>Following row</label></div></div>", "", null);
+        Control html = doc.root.ChildAt(0);
+        Control code = Box("overflow:auto;display:block");
+        Control body = Box(column);
+        Label text = new Label(longText);
+        text.SetWrap(true);
+        text.SetProp("style", textStyle);
+        Label following = new Label("Following row");
+        following.SetProp("style", textStyle);
+        body.Add(text);
+        body.Add(following);
+        code.Add(body);
+        Label htmlText = (Label)html.ChildAt(0).ChildAt(0);
+        app.UseAppCss(doc.css);
+        for (int dpi = 100; dpi <= 200; dpi = dpi + 50) {
+            app.SetOffscreenViewport(640, 480, dpi);
+            int narrow = app.Scale(190);
+            int wide = app.Scale(460);
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            WrappedHeight(app, text);
+            WrappedHeight(app, htmlText);
+            int narrowHeight = text.bh;
+            Check("following row clears wrapped text", following.by >= text.by + text.bh);
+            RenderPair(app, html, code, wide, app.Scale(180));
+            WrappedHeight(app, text);
+            Check("wider slot reduces text height", text.bh < narrowHeight);
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            WrappedHeight(app, text);
+            Check("narrow resize restores text height", text.bh == narrowHeight);
+            text.Text = "Short text";
+            htmlText.Text = "Short text";
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            WrappedHeight(app, text);
+            Check("shorter binding shrinks layout", text.bh < narrowHeight);
+            text.Text = longText;
+            htmlText.Text = longText;
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            WrappedHeight(app, text);
+            Check("binding regrowth restores layout", text.bh == narrowHeight);
+            int grownExtent = code.scrollExtent;
+            body.RemoveAll();
+            html.ChildAt(0).RemoveAll();
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            Check("empty content shrinks scroll extent", code.scrollExtent <= grownExtent);
+            body.Add(text);
+            body.Add(following);
+            html.ChildAt(0).Add(htmlText);
+            Label restoredFollowing = new Label("Following row");
+            restoredFollowing.SetProp("style", textStyle);
+            html.ChildAt(0).Add(restoredFollowing);
+            RenderPair(app, html, code, narrow, app.Scale(180));
+            WrappedHeight(app, text);
+            Check("restored children recover scroll extent", code.scrollExtent == grownExtent);
+        }
+        app.SetOffscreenViewport(320, 240, 100);
+    }
+
+    static void AllocatedTextEquivalence(App app, bool grid) {
+        string textValue = "Nested content must use the allocated column width to calculate its full height. "
+        + "The next block must start after the final wrapped line, even on the first frame after resizing.";
+        string outerStyle = grid
+        ? "display:grid;grid-template-columns:70px minmax(0,1fr);gap:8px;align-items:start"
+        : "display:flex;flex-direction:row;gap:8px;align-items:flex-start";
+        string sideStyle = "width:70px;height:30px;flex-shrink:0";
+        string bodyStyle = "display:flex;flex-direction:column;gap:4px;flex:1;min-width:0";
+        string textStyle = "font-size:14px;flex-shrink:0";
+        HtmlDoc doc = Html.Parse("<div style='display:block;overflow:auto'><div style='" + outerStyle
+        + "'><div style='" + sideStyle + "'></div><div style='" + bodyStyle
+        + "'><label wrap='true' style='" + textStyle + "'>" + textValue
+        + "</label><label>Inner following row</label></div></div><label>Outer following row</label></div>", "", null);
+        Control html = doc.root.ChildAt(0);
+        Control code = LayoutBox("display:block;overflow:auto");
+        Control outer = LayoutBox(outerStyle);
+        Control body = LayoutBox(bodyStyle);
+        Label text = new Label(textValue);
+        text.SetWrap(true);
+        text.SetProp("style", textStyle);
+        Label innerFollowing = new Label("Inner following row");
+        Label outerFollowing = new Label("Outer following row");
+        body.Add(text);
+        body.Add(innerFollowing);
+        outer.Add(LayoutBox(sideStyle));
+        outer.Add(body);
+        code.Add(outer);
+        code.Add(outerFollowing);
+        app.UseAppCss(doc.css);
+        Label htmlAllocated = (Label)html.ChildAt(0).ChildAt(1).ChildAt(0);
+        Check("paired wrap enabled", htmlAllocated.wrap && text.wrap);
+        for (int pass = 0; pass < 3; pass = pass + 1) {
+            int width = pass == 1 ? 460 : 240;
+            RenderPair(app, html, code, width, 180);
+            WrappedHeight(app, text);
+            Check("allocated text stays inside parent", text.bw <= body.bw && body.bx + body.bw <= outer.bx + outer.bw);
+            Check("inner row follows allocated text", innerFollowing.by >= text.by + text.bh);
+            Check("outer row follows allocated container", outerFollowing.by >= innerFollowing.by + innerFollowing.bh);
+        }
+    }
+
+    static void ScrollExtentAfterResize(App app) {
+        Control root = Box("display:block;overflow:auto;padding:6px;border:2px solid red");
+        Control body = Box("width:100px;height:80px");
+        root.Add(body);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, 70, 60);
+        root.SetScrollTop(100);
+        root.SetScrollLeft(100);
+        root.Arrange(0, 0, 70, 60);
+        Rect view = root.ScrollViewport();
+        Check("layout clamps both axes to the wheel viewport",
+            root.ScrollTop() == root.ScrollExtent() - view.height
+            && root.ScrollLeft() == root.ScrollExtentX() - view.width);
+        root.Arrange(0, 0, 116, 96);
+        Check("content fitting the padded viewport clears both offsets",
+            root.ScrollTop() == 0 && root.ScrollLeft() == 0 && body.bx == 8 && body.by == 8);
+    }
+
+    static void ConstraintEdges(App app) {
+        Control root = LayoutBox("display:flex;flex-direction:column;width:600px;padding:10px");
+        Label text = new Label("Margins, border and padding must be deducted from the current slot before wrapping this long text.");
+        text.SetWrap(true);
+        text.SetProp("style", "margin:0 16px;padding:5px;border:1px solid red;font-size:14px;flex-shrink:0");
+        root.Add(text);
+        root.HintWrapWidth(550);
+        app.UseAppCss("");
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(20, 20, 190, 300));
+        app.EndOffscreenFrame();
+        WrappedHeight(app, text);
+        Check("allocated root overrides declared width", text.bw == 138);
+        Check("authored hint restored after allocated measure", root.hintWrapW == 550 && text.hintWrapW == 0);
+
+        Control grid = LayoutBox("display:grid;grid-template-columns:1fr;align-items:start");
+        Label fixedText = new Label("A content-box label must include padding when measuring its declared width.");
+        fixedText.SetWrap(true);
+        fixedText.SetProp("style", "box-sizing:content-box;width:100px;max-width:100px;padding:10px;font-size:14px");
+        grid.Add(fixedText);
+        app.BeginOffscreenFrame();
+        grid.RenderInside(app, new Rect(20, 20, 240, 300));
+        app.EndOffscreenFrame();
+        WrappedHeight(app, fixedText);
+        Check("content box is clamped before adding padding", fixedText.bw == 120);
+    }
+
+    static void BindingConstraintEdges(App app) {
+        app.SetOffscreenViewport(320, 240, 100);
+        app.UseAppCss("");
+        string value = "Binding changes must reach the current measurement before wrapping this text and placing the following row.";
+        string basic = "font-size:14px;padding:0;border:0;flex-shrink:0";
+        for (int mode = 0; mode < 2; mode = mode + 1) {
+            Control root = LayoutBox("display:flex;flex-direction:column;padding:0;gap:0;align-items:stretch");
+            BindingConstraintLabel text = new BindingConstraintLabel(value);
+            text.SetProp("style", basic + (mode == 0 ? ";margin:0" : ";width:200px;margin:0"));
+            Label following = new Label("Following bound row");
+            following.SetProp("style", "flex-shrink:0");
+            root.Add(text); root.Add(following);
+            root.UseApp(app); app.SetRootControl(root);
+            root.MeasureTree(app, 240); root.Arrange(20, 20, 240, 1000);
+            Check("binding constraint initial width", text.measuredWidth == (mode == 0 ? 240 : 200));
+            for (int pass = 0; pass < 2; pass = pass + 1) {
+                text.pendingStyle = basic + (mode == 0
+                ? (pass == 0 ? ";margin:0 32px" : ";margin:0")
+                : (pass == 0 ? ";width:100px;margin:0" : ";width:200px;margin:0"));
+                int bindings = text.bindings;
+                int measures = text.measures;
+                int expected = mode == 0 ? (pass == 0 ? 176 : 240) : (pass == 0 ? 100 : 200);
+                root.MeasureTree(app, 240);
+                Check("binding dimensions reach the first measurement mode=" + mode + " pass=" + pass,
+                text.measuredWidth == expected && text.measures == measures + 1);
+                Check("allocated measurement synchronizes binding once", text.bindings == bindings + 1);
+                root.Arrange(20, 20, 240, 1000);
+                Check("bound geometry uses current width", text.bw == expected);
+                WrappedHeight(app, text);
+                Check("following row clears newly bound wrapping", following.by >= text.by + text.bh);
+            }
+            app.SetRootControl(null); root.RemoveAll();
+        }
+    }
+
+    static void BindingConstraintRetirement(App app) {
+        for (int action = 1; action <= 2; action = action + 1) {
+            BindingConstraintContainer root = new BindingConstraintContainer();
+            root.SetProp("style", "display:flex;flex-direction:column;padding:0;gap:0");
+            BindingConstraintLabel text = new BindingConstraintLabel("A retired binding cannot finish the old measurement.");
+            text.SetProp("style", "font-size:14px;flex-shrink:0");
+            CountedLayoutLabel following = new CountedLayoutLabel("Old sibling");
+            following.SetProp("style", "flex-shrink:0");
+            root.Add(text); root.Add(following);
+            root.UseApp(app); app.SetRootControl(root);
+            root.MeasureTree(app, 240);
+            Control replacement = Box("display:block");
+            text.replacementRoot = action == 2 ? replacement : null;
+            text.mutation = action;
+            int bindings = text.bindings;
+            int measures = text.measures;
+            int rootMeasures = root.measures;
+            int followingMeasures = following.measures;
+            root.MeasureTree(app, 240);
+            Check("retired binding stops the old node measurement action=" + action,
+            text.bindings == bindings + 1 && text.measures == measures);
+            if (action == 1) {
+                Check("binding detach preserves the parent and remaining traversal", text.parent == null
+                && root.ChildCount() == 1 && root.ChildAt(0) == following && app.rootControl == root
+                && following.measures == followingMeasures + 1 && root.measures == rootMeasures + 1);
+            } else {
+                Check("binding root replacement stops the old tree tail", app.rootControl == replacement
+                && following.measures == followingMeasures && root.measures == rootMeasures);
+            }
+            app.SetRootControl(null); root.RemoveAll();
+        }
+    }
+
+    static void WrappedRowResize(App app) {
+        Control root = LayoutBox("display:flex;flex-direction:column");
+        Control row = LayoutBox("display:flex;flex-wrap:wrap;gap:6px;flex-shrink:0");
+        for (int i = 0; i < 3; i = i + 1) { row.Add(LayoutBox("width:90px;height:30px;flex-shrink:0")); }
+        Label following = new Label("After wrapping row");
+        root.Add(row); root.Add(following);
+        for (int pass = 0; pass < 3; pass = pass + 1) {
+            int width = pass == 1 ? 320 : 190;
+            app.BeginOffscreenFrame();
+            root.RenderInside(app, new Rect(20, 20, width, 300));
+            app.EndOffscreenFrame();
+            int expected = pass == 1 ? 30 : 66;
+            Check("wrapping row remeasures current width", row.prefH == expected && row.bh == expected);
+            Check("following row clears wrap", following.by >= row.by + row.bh);
+        }
+    }
+
+    static void NestedMeasureBudget(App app) {
+        for (int mode = 0; mode < 2; mode = mode + 1) {
+            Control root = LayoutBox("display:block");
+            Control at = root;
+            int depth = 7;
+            for (int i = 0; i < depth; i = i + 1) {
+                string style = mode == 0 ? "display:grid;grid-template-columns:minmax(0,1fr)"
+                : "display:flex;flex-direction:row";
+                Control nested = LayoutBox(style + ";flex:1;min-width:0");
+                at.Add(nested);
+                at = nested;
+            }
+            CountedLayoutLabel text = new CountedLayoutLabel("Deeply nested content must have bounded measurement cost while using its allocated width.");
+            text.SetProp("style", "flex:1;min-width:0;font-size:14px");
+            at.Add(text);
+            app.BeginOffscreenFrame();
+            root.RenderInside(app, new Rect(20, 20, 220, 300));
+            app.EndOffscreenFrame();
+            WrappedHeight(app, text);
+            Check("nested measurement stays linear mode=" + mode + " calls=" + text.measures, text.measures <= depth + 2);
+        }
+    }
+
     static void Main() {
         App app = App.CreateOffscreen("Scroll routed input", 320, 240);
+        BindingConstraintEdges(app);
+        BindingConstraintRetirement(app);
         WheelChain(app);
         Drag(app);
+        Hover(app);
         Equivalence(app);
         Overrides(app);
         OffscreenReplay(app);
+        TextResizeEquivalence(app);
+        AllocatedTextEquivalence(app, true);
+        AllocatedTextEquivalence(app, false);
+        ConstraintEdges(app);
+        ScrollExtentAfterResize(app);
+        WrappedRowResize(app);
+        NestedMeasureBudget(app);
         app.SetRootControl(null);
         app.canvas.Destroy();
         Console.WriteLine("SCROLL_ROUTED_INPUT_TEST_OK");

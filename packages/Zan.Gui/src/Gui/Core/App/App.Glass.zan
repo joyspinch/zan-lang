@@ -4,7 +4,7 @@ using Gui.Backend;
 namespace Gui;
 
 public partial class App {
-    void NoteHoverDamage(int oldId, int newId) {
+    void NoteHoverDamage(Control oldControl, Control newControl) {
         if (this.ForceFullFrames()) { partialPending = false; return; }
         // 同一批事件里已经有人要求过整窗重绘（RequestRedraw，说不清
         // 改了哪些像素）：悬停不得反过来把它降级成一条条带，否则
@@ -19,10 +19,8 @@ public partial class App {
             partialPending = false;
             return;
         }
-        int raX, raY, raW, raH;
-        int rbX, rbY, rbW, rbH;
-        bool hasRa = hitTester.TryGetRect(oldId, out raX, out raY, out raW, out raH);
-        bool hasRb = hitTester.TryGetRect(newId, out rbX, out rbY, out rbW, out rbH);
+        bool hasRa = oldControl != null && oldControl.bw > 0 && oldControl.bh > 0;
+        bool hasRb = newControl != null && newControl.bw > 0 && newControl.bh > 0;
         if (!hasRa && !hasRb) {
             this.NoteRedrawWhy("hover-norect");
             partialPending = false;
@@ -34,16 +32,16 @@ public partial class App {
         int x1 = 0;
         int y1 = 0;
         if (hasRa) {
-            if (raX < x0) { x0 = raX; }
-            if (raY < y0) { y0 = raY; }
-            if (raX + raW > x1) { x1 = raX + raW; }
-            if (raY + raH > y1) { y1 = raY + raH; }
+            if (oldControl.bx < x0) { x0 = oldControl.bx; }
+            if (oldControl.by < y0) { y0 = oldControl.by; }
+            if (oldControl.bx + oldControl.bw > x1) { x1 = oldControl.bx + oldControl.bw; }
+            if (oldControl.by + oldControl.bh > y1) { y1 = oldControl.by + oldControl.bh; }
         }
         if (hasRb) {
-            if (rbX < x0) { x0 = rbX; }
-            if (rbY < y0) { y0 = rbY; }
-            if (rbX + rbW > x1) { x1 = rbX + rbW; }
-            if (rbY + rbH > y1) { y1 = rbY + rbH; }
+            if (newControl.bx < x0) { x0 = newControl.bx; }
+            if (newControl.by < y0) { y0 = newControl.by; }
+            if (newControl.bx + newControl.bw > x1) { x1 = newControl.bx + newControl.bw; }
+            if (newControl.by + newControl.bh > y1) { y1 = newControl.by + newControl.bh; }
         }
         x0 = x0 - pad;
         y0 = y0 - pad;
@@ -132,54 +130,6 @@ public partial class App {
         return true;
     }
 
-    void BeginIdScope(string scopeName) {
-        focus.PushId(scopeName);
-        if (!App.PerfOn()) { return; }
-        int now = Window.GetTickUs();
-        if (scopeEndUs > 0) {
-            int gap = now - scopeEndUs;
-            if (gap > phaseSecTopUs) {
-                phaseSecTopUs = gap;
-                phaseSecTop = "after" + Convert.ToString(scopeEndId);
-            }
-        }
-        scopeId = IdHash.HashString(scopeName);
-        scopeAtUs = now;
-    }
-
-    void BeginIdScope(int first) {
-        focus.PushIds(first);
-        // 分析器开着时把每个 id 段当作一个可计时的区域：它们正好是
-        // 宕机把界面分开的那几块（功能区、编辑区、各个面板），于是
-        // 不需要在宿主里另埋一套标记点。
-        if (!App.PerfOn()) { return; }
-        int now = Window.GetTickUs();
-        // 两个 id 段之间的活（宿主在面板之外直接画的东西）也要有人认：
-        // 否则尖尖那一帧只能看到“整棑很贵、每段都很便宜”。
-        if (scopeEndUs > 0) {
-            int gap = now - scopeEndUs;
-            if (gap > phaseSecTopUs) {
-                phaseSecTopUs = gap;
-                phaseSecTop = "after" + Convert.ToString(scopeEndId);
-            }
-        }
-        scopeId = first;
-        scopeAtUs = now;
-    }
-
-    void EndIdScope() {
-        focus.PopIds();
-        if (!App.PerfOn()) { return; }
-        int now = Window.GetTickUs();
-        int us = now - scopeAtUs;
-        scopeEndUs = now;
-        scopeEndId = scopeId;
-        if (us > phaseSecTopUs) {
-            phaseSecTopUs = us;
-            phaseSecTop = Convert.ToString(scopeId);
-        }
-    }
-
     // 压入字符串命名的 ID 作用域（Path Hash ID Stack）。
     void PushId(string strKey) { focus.PushId(strKey); }
 
@@ -188,12 +138,6 @@ public partial class App {
 
     // 弹出当前 ID 作用域。
     void PopId() { focus.PopId(); }
-
-    // 计算指定字符串 key 在当前作用域下的唯一哈希 ID。
-    int GetId(string strKey) { return focus.GetId(strKey); }
-
-    // 计算指定整数 key 在当前作用域下的唯一哈希 ID。
-    int GetId(int intKey) { return focus.GetId(intKey); }
 
     // StyleBox 在画玻璃时登记面板矩形（本帧内有效）。见 glassPanels 与 glassRects。
     void NoteGlassRect(int x, int y, int w, int h) {
@@ -353,10 +297,26 @@ public partial class App {
         this.NoteRedrawWhy("glass-refresh");
     }
 
+    // Tests the App-owned damage clip captured by BeginFrame, not mutable
+    // next-frame damage or nested clips installed by a component.
+    public bool FrameDamageContains(int x, int y, int w, int h) {
+        if (!partialFrame) { return true; }
+        return w >= 0 && h >= 0 && x >= presentX && y >= presentY
+        && (long)x + w <= (long)presentX + presentW
+        && (long)y + h <= (long)presentY + presentH;
+    }
+
+    // Require the next actual frame to be full without scheduling a redraw.
+    // This does not change the current frame's clip; Present and abort keep the latch.
+    public void RequireFullFrame() {
+        forceFullNext = true;
+    }
+
     // 声明本次状态变化只改变 [x,y,w,h] 这块像素：下一帧被裁剪
     // 到它（与本帧其他声明合并），而不是重绘整个窗口。
     // 同一帧里任何 RequestRedraw 都会让下一帧回到整窗重绘。
     public void NoteDamage(int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) { return; }
         if (this.ForceFullFrames()) { partialBlocked = true; }
         needsRedraw = true;
         if (partialBlocked || this.HasOverlays()) {
@@ -397,13 +357,7 @@ public partial class App {
         dmgW = dw;
         dmgH = dh;
         partialPending = true;
-        if (App.PerfOn()) {
-            File.AppendAllText("zan_frame_perf.log",
-                "damage_decl=" + Convert.ToString(dmgX) + ","
-                + Convert.ToString(dmgY) + "+"
-                + Convert.ToString(dmgW) + "x"
-                + Convert.ToString(dmgH) + "\n");
-        }
+        if (frameDiagnostics != null) { frameDiagnostics.Damage(false, dmgX, dmgY, dmgW, dmgH); }
     }
 
     // 滚轮把某块可滚动区域的内容平移了一段：变的只有这块像素，
@@ -413,13 +367,7 @@ public partial class App {
         // 顺带续上滚动串的时间窗：串内的玻璃面板暂用旧模糊
         // （BackdropDirtyIn），串结束由 EndFrame 武装一帧扩展刷新。
         scrollBusyUntilMs = nowMs + 140;
-        if (App.PerfOn()) {
-            File.AppendAllText("zan_frame_perf.log",
-                "scroll_damage=" + Convert.ToString(x) + ","
-                + Convert.ToString(y) + "+"
-                + Convert.ToString(w) + "x"
-                + Convert.ToString(h) + "\n");
-        }
+        if (frameDiagnostics != null) { frameDiagnostics.Damage(true, x, y, w, h); }
         this.NoteDamage(x, y, w, h);
     }
 
@@ -453,7 +401,6 @@ public partial class App {
         if (showPinButton) { count = count + 1; }
         if (showMinimizeButton) { count = count + 1; }
         if (showMaximizeButton) { count = count + 1; }
-        if (capActionIds != null) { count = count + capActionIds.Length; }
         return count;
     }
 
@@ -467,7 +414,7 @@ public partial class App {
             themeButton = false;
             pinButton = false;
         }
-        showThemeButton = themeButton;
+        showThemeButton = themeButton && themeSettingsAction != null;
         showPinButton = pinButton;
         showMinimizeButton = minimizeButton;
         showMaximizeButton = maximizeButton;
@@ -496,10 +443,9 @@ public partial class App {
     // 那 46x33 —— 提示画在标题栏下方，整条都在裁剪框外，于是它一个像素也落
     // 不到屏幕上（只有别的原因触发整窗重绘时才闪一下）。
     bool CaptionTipShown(int id, int bx, int bw, int hbar) {
-        int rh = hbar + this.Scale(80);
-        int ty = this.ShapeOffY();
-        return Ui.HoverLevelMsIn(this, id, 0, this.CaptionTipX(bx, bw), ty,
-            this.Scale(300), rh) >= 900;
+        if (focus == null || !focus.IsHovered(id)) { return false; }
+        if (this.PointerCaptured()) { return false; }
+        return Window.GetTickMs() - focus.hoverStartMs >= 900;
     }
 
     // 标题提示区的左边（提示居中挂在按钮下方）。

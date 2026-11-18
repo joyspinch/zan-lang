@@ -1,0 +1,209 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class TagCloseReentry {
+    public weak DynamicTags owner;
+    public int calls;
+    public void Routed(Control sender, RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel" || calls != 0) { return; }
+        calls = calls + 1;
+        DynamicTags tags = owner;
+        if (tags != null) { tags.SetItems(new List<string>{ "new" }); }
+    }
+}
+
+class TagLabelWitness {
+    public Tag owner;
+    public weak Control label;
+}
+
+class TagCloseTest {
+    static void Check(bool value, string label) {
+        if (!value) { throw new Exception(label); }
+    }
+
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+
+    static Button CloseButton(Tag tag) {
+        Button result = null;
+        for (int i = 0; i < tag.ChildCount(); i = i + 1) {
+            if (tag.ChildAt(i) is Button && tag.ChildAt(i).HasClass("tag-close")) {
+                Check(result == null, "Tag has exactly one generated close button");
+                result = (Button)tag.ChildAt(i);
+            }
+        }
+        Check(result != null, "closable Tag builds a retained close button before Paint");
+        return result;
+    }
+
+    static void Click(App app, Control root, Control target) {
+        app.SetRootControl(root);
+        root.MeasureTree(app); root.Arrange(0, 0, 600, 100);
+        Check(target.bw > 0 && target.bh > 0, "close target has usable geometry");
+        int x = target.bx + target.bw / 2; int y = target.by + target.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+
+    static void ContentAndClone(App app) {
+        Tag tag = new Tag("first"); tag.Closable = true;
+        Control label = tag.ChildAt(0);
+        tag.Add(label); tag.SetText("updated");
+        Check(tag.ChildCount() == 2 && tag.ChildAt(0) == label
+        && label.GetProp("text") == "updated"
+        && tag.ChildAt(1) == CloseButton(tag),
+        "readding text preserves its identity and keeps close last");
+
+        Tag custom = new Tag(); custom.Closable = true;
+        IconView icon = new IconView("check"); custom.Add(icon);
+        Label authored = new Label("authored"); custom.Add(authored);
+        Button action = new Button("custom"); custom.Add(action);
+        custom.SetText("one"); custom.SetText("two"); custom.SetText("");
+        Check(custom.ChildCount() == 5 && authored.GetProp("text") == "authored"
+        && custom.ChildAt(3).GetProp("text") == "",
+        "SetText updates only its owned label after custom content");
+        custom.SetText("source");
+        custom.ChildAt(3).ClassName = "owned-text";
+        custom.Add(icon);
+        Check(custom.ChildAt(custom.ChildCount() - 1) == CloseButton(custom),
+        "readding custom content keeps close last");
+        Tag copy = (Tag)Html.Clone(custom);
+        Check(copy.ChildCount() == custom.ChildCount()
+        && copy.ChildAt(0).GetProp("text") == "authored"
+        && copy.ChildAt(1) is Button && copy.ChildAt(2).HasClass("owned-text")
+        && copy.ChildAt(3) is IconView && copy.ChildAt(4) == CloseButton(copy),
+        "clone preserves authored content, order and exactly one generated close");
+        copy.SetText("clone");
+        Check(copy.ChildCount() == 5 && copy.ChildAt(2).GetProp("text") == "clone"
+        && custom.ChildAt(2).GetProp("text") == "source",
+        "clone owns its text label independently");
+        int sourceCloses = 0; int cloneCloses = 0;
+        custom.Close.Add(() => { sourceCloses = sourceCloses + 1; });
+        copy.Close.Add(() => { cloneCloses = cloneCloses + 1; });
+        Click(app, copy, CloseButton(copy));
+        Check(cloneCloses == 1 && sourceCloses == 0,
+        "cloned close button targets only the cloned tag");
+        Control moved = copy.ChildAt(2); copy.Remove(moved); copy.SetText("replacement");
+        Check(copy.ChildCount() == 5 && moved.GetProp("text") == "clone"
+        && copy.ChildAt(3).GetProp("text") == "replacement",
+        "text moved outside a tag is not mutated by later SetText");
+    }
+
+    static void StaleClose(App app) {
+        DynamicTags tags = new DynamicTags();
+        tags.Add("a"); tags.Add("b"); tags.Add("c");
+        app.SetRootControl(tags); tags.MeasureTree(app); tags.Arrange(0, 0, 600, 100);
+        Tag old = (Tag)tags.ChildAt(1);
+        old.TriggerEvent("Close"); tags.RemoveAt(0); Drain(app);
+        Check(tags.Count() == 2 && tags.TextAt(0) == "b" && tags.TextAt(1) == "c",
+        "queued old close cannot delete another item after rebuild");
+        old = (Tag)tags.ChildAt(0); old.TriggerEvent("Close");
+        tags.SetItems(new List<string>{ "new", "new" }); Drain(app);
+        Check(tags.Count() == 2 && tags.TextAt(0) == "new" && tags.TextAt(1) == "new",
+        "queued close cannot delete replacement items with duplicate labels");
+    }
+
+    static TagLabelWitness DetachedLabel() {
+        Tag tag = new Tag("owned");
+        Control label = tag.ChildAt(0);
+        TagLabelWitness witness = new TagLabelWitness();
+        witness.owner = tag; witness.label = label;
+        tag.Remove(label);
+        return witness;
+    }
+
+    static void RemovedLabelLifetime() {
+        TagLabelWitness witness = DetachedLabel();
+        Check(witness.owner.ChildCount() == 1 && witness.label == null,
+        "removed owned Label releases without another SetText while Tag stays alive");
+    }
+
+    static void LegacyAction() {
+        DynamicTags tags = new DynamicTags(new List<string>{ "one", "two" });
+        DynamicTagsAction action = new DynamicTagsAction(tags, 0);
+        action.Close();
+        Check(tags.Count() == 1 && tags.TextAt(0) == "two", "two-argument close snapshots its current Tag");
+        DynamicTagsAction stale = new DynamicTagsAction(tags, 0);
+        tags.SetItems(new List<string>{ "replacement" }); stale.Close();
+        Check(tags.Count() == 1 && tags.TextAt(0) == "replacement", "two-argument close cannot delete replacement Tag");
+    }
+
+    static void ReentrantRebuild(App app) {
+        DynamicTags tags = new DynamicTags(new List<string>{ "old" });
+        app.SetRootControl(tags); tags.MeasureTree(app); tags.Arrange(0, 0, 600, 100);
+        TagCloseReentry relay = new TagCloseReentry(); relay.owner = tags;
+        tags.OnRouted(relay.Routed);
+        Tag old = (Tag)tags.ChildAt(0);
+        app.CapturePointer(CloseButton(old));
+        tags.SetItems(new List<string>{ "outer" });
+        Check(relay.calls == 1 && tags.Count() == 1 && tags.TextAt(0) == "new"
+        && tags.ChildCount() == 2, "nested SetItems supersedes the old rebuild tail");
+        tags.OnRouted(null); app.SetRootControl(null); Drain(app);
+    }
+
+    static void EditingWithoutPaint(App app) {
+        DynamicTags tags = new DynamicTags();
+        app.SetRootControl(tags); tags.MeasureTree(app); tags.Arrange(0, 0, 600, 100);
+        tags.StartEdit();
+        Input editor = (Input)tags.ChildAt(tags.ChildCount() - 1);
+        tags.MeasureTree(app); tags.Arrange(0, 0, 600, 100);
+        Check(editor.IsFocused(app), "StartEdit focuses the real Input without Paint");
+        app.ProcessOffscreenInput(6, 0, 0, 0, 120, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 13, 0, 0);
+        Check(tags.Count() == 1 && tags.TextAt(0) == "x"
+        && !(tags.ChildAt(tags.ChildCount() - 1) is Input), "Enter commits the edit before Paint");
+        tags.RenderTree(app); tags.RenderTree(app);
+        Check(tags.Count() == 1, "repeated Paint cannot replay the Enter commit");
+        tags.StartEdit(); tags.MeasureTree(app); tags.Arrange(0, 0, 600, 100);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 121, 0, 0);
+        app.ProcessOffscreenInput(4, 0, 0, 0, 27, 0, 0);
+        Check(tags.Count() == 1 && !(tags.ChildAt(tags.ChildCount() - 1) is Input),
+        "Escape cancels the edit without Paint");
+        tags.RenderTree(app); tags.RenderTree(app);
+        Check(tags.Count() == 1, "repeated Paint cannot replay Escape");
+        app.SetRootControl(null); Drain(app);
+    }
+
+    static void Main() {
+        ControlBootstrap.Install();
+        App app = App.CreateOffscreen("Tag close", 640, 160);
+        Tag tag = new Tag("close me"); tag.Closable = true; tag.Checkable = true;
+        int closes = 0; int toggles = 0;
+        tag.Close.Add(() => { closes = closes + 1; });
+        tag.Change.Add(() => { toggles = toggles + 1; });
+        Click(app, tag, CloseButton(tag));
+        Check(closes == 1 && toggles == 0 && !tag.IsChecked(), "close fires once without toggling its tag");
+        tag.Closable = false;
+        Check(!CloseButton(tag).Visible, "turning Closable off hides the retained close button");
+        tag.TriggerEvent("Close"); Drain(app);
+        Check(closes == 1, "Close does not fire while Closable is false");
+        tag.Closable = true;
+        tag.Disabled.Set(true); Click(app, tag, CloseButton(tag));
+        Check(closes == 1, "disabled tag ignores close input");
+        tag.Disabled.Set(false);
+        Flex parent = Flex.Column(); parent.Add(tag); parent.Disabled.Set(true);
+        Click(app, parent, CloseButton(tag));
+        Check(closes == 1, "ancestor-disabled tag ignores close input");
+        parent.Disabled.Set(false); Click(app, parent, CloseButton(tag));
+        Check(closes == 2, "reenabled tag accepts a fresh close input before Paint");
+        ContentAndClone(app); StaleClose(app);
+        RemovedLabelLifetime(); LegacyAction(); ReentrantRebuild(app); EditingWithoutPaint(app);
+
+        DynamicTags tags = new DynamicTags(); tags.Add("one"); tags.Add("two");
+        Click(app, tags, CloseButton((Tag)tags.ChildAt(0)));
+        Check(tags.Count() == 1 && tags.TextAt(0) == "two", "actual DynamicTags close removes the selected item");
+        Click(app, tags, CloseButton((Tag)tags.ChildAt(0)));
+        Check(tags.Count() == 0, "rebuilt close action removes the remaining item once");
+
+        Tag leakTag = new Tag("cycle check"); leakTag.Closable = true;
+        leakTag.SetShown(false); app.SetRootControl(leakTag); leakTag.MeasureTree(app);
+        app.SetRootControl(null); leakTag = null;
+        app.DrainPosts(); Drain(app); app.canvas.Destroy();
+        Console.WriteLine("TAG_CLOSE_OK");
+    }
+}

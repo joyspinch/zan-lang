@@ -3,16 +3,18 @@ using Gui;
 
 namespace Gui.Widget;
 
-// Retained menus use ShowAt; the ownerless static Render remains legacy compatibility.
+// Retained menus are configured before ShowAt; OverlayHost owns painting and input.
 public class ContextMenu : Control {
     public List<MenuItem> items;
     public UiEvent ActionSelected;
+    public UiEvent Dismissed;
     List<Action> itemActions;
     bool treeDirty = true;
     bool opened;
     int generation;
     int selectedAction = -1;
     bool resultPending;
+    int dismissalSuppressed = -1;
     weak App popupApp;
 
     public override int StyleDisplay() { return 1; }
@@ -24,6 +26,7 @@ public class ContextMenu : Control {
         items = new List<MenuItem>();
         itemActions = new List<Action>();
         ActionSelected = new UiEvent();
+        Dismissed = new UiEvent();
         this.wiresOwnEvents = true;
         this.Pad(Space.XS);
     }
@@ -81,9 +84,9 @@ public class ContextMenu : Control {
     }
 
     void WireItems() {
-        for (int i = 0; i < children.Count; i = i + 1) {
-            if (children[i] is Button) {
-                Button button = (Button)children[i];
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is Button) {
+                Button button = (Button)this.ChildAt(i);
                 button.Click.Clear();
                 ContextMenuAction action = new ContextMenuAction();
                 action.owner = this;
@@ -95,11 +98,11 @@ public class ContextMenu : Control {
     }
 
     public override void OnMeasure(App app) {
-        if (treeDirty || children.Count != items.Count) { this.BuildTree(); }
+        if (treeDirty || this.ChildCount() != items.Count) { this.BuildTree(); }
         int width = app.Scale(140);
         int height = app.Scale(Space.XS * 2);
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control child = children[i];
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control child = this.ChildAt(i);
             child.MeasureTree(app);
             if (child.prefW + app.Scale(Space.SM * 2) > width) { width = child.prefW + app.Scale(Space.SM * 2); }
             height = height + child.prefH;
@@ -147,8 +150,11 @@ public class ContextMenu : Control {
         Action callback = index < itemActions.Count ? itemActions[index] : null;
         UiEvent notification = ActionSelected;
         int action = item.action;
+        // Selection has its own ActionSelected notification; it is not an outside dismissal.
+        dismissalSuppressed = session;
         host.overlayHost.Hide(this);
-        // Dismissal callbacks may have reopened this same instance.
+        if (dismissalSuppressed == session) { dismissalSuppressed = -1; }
+        // Input retirement or an item callback may have reopened this same instance.
         if (opened || generation != session + 1) { return; }
         selectedAction = action;
         resultPending = true;
@@ -159,9 +165,14 @@ public class ContextMenu : Control {
     }
 
     public override void OnPopupDismissed() {
+        if (!opened) { return; }
+        int session = generation;
+        bool notify = dismissalSuppressed != session;
         opened = false;
         popupApp = null;
         generation = generation + 1;
+        if (dismissalSuppressed == session) { dismissalSuppressed = -1; }
+        if (notify) { Dismissed.RaiseS(this); }
     }
 
     // Configured subscriptions survive closing and reopening, like other controls.
@@ -169,11 +180,12 @@ public class ContextMenu : Control {
     public void ClearCallbacks() {
         for (int i = 0; i < itemActions.Count; i = i + 1) { itemActions[i] = null; }
         ActionSelected.Clear();
+        Dismissed.Clear();
     }
 
     public override string Kind() { return "ContextMenu"; }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> properties = new List<PropSpec>();
         properties.Add(this.SizeProp());
         return properties;
@@ -201,166 +213,4 @@ public class ContextMenu : Control {
         return "";
     }
 
-    public static void PaintItem(App app, int x, int y, int w, int h,
-                                 string label, string accel, bool hovered) {
-        Canvas c = app.canvas;
-        StyleBox s;
-        int state = Style.SNormal();
-        if (hovered) { state = Style.SHover(); }
-        s = Style.Part(app, "contextmenu", "item", "", "", "", state);
-        int fs = s.FontOr(Style.FontFallback(app, "small"));
-        int ty = Canvas.CenterTextY(y, h, fs);
-        if (hovered && s.bg != 0) {
-            c.FillRoundRect(x + app.Scale(3), y, w - app.Scale(6), h, app.Scale(3), s.bg);
-        }
-        int textX = x + app.Scale(12);
-        string drawLbl = label;
-        if (drawLbl != null && drawLbl.StartsWith("✓ ")) {
-            int gsz = app.Scale(12);
-            int gy = y + (h - gsz) / 2;
-            c.DrawGlyphIn("check", textX, gy, gsz, gsz, gsz, s.fg);
-            textX = textX + gsz + app.Scale(6);
-            drawLbl = drawLbl.Substring(2);
-        } else if (drawLbl != null && drawLbl.StartsWith("   ")) {
-            textX = textX + app.Scale(18);
-            drawLbl = drawLbl.Substring(3);
-        }
-        c.DrawText(textX, ty, drawLbl, s.fg, fs);
-        if (accel.Length > 0) {
-            if (accel == "✓") {
-                int gsz = app.Scale(12);
-                int gy = y + (h - gsz) / 2;
-                c.DrawGlyphIn("check", x + w - gsz - app.Scale(14), gy, gsz, gsz, gsz, s.fg);
-            } else {
-                StyleBox asx = Style.Part(app, "contextmenu", "accel", "", "",
-                                          "", Style.SNormal());
-                int afg = asx.fg != 0 ? asx.fg : Style.Fade(s.fg, 120);
-                int aw = Canvas.MeasureText(accel, fs);
-                c.DrawText(x + w - aw - app.Scale(14), ty, accel, afg, fs);
-            }
-        }
-    }
-
-    public static void PaintSeparator(App app, int x, int y, int w) {
-        StyleBox s = Style.Part(app, "contextmenu", "separator", "", "", "",
-                                Style.SNormal());
-        int lineCol = s.bg != 0 ? s.bg : app.theme.borderSecondary;
-        app.canvas.FillRect(x + app.Scale(8), y, w - app.Scale(16), 1, lineCol);
-    }
-
-    public static int Height(App app, List<string> labels) {
-        StyleBox s = Style.Part(app, "contextmenu", "item", "", "", "",
-                                Style.SNormal());
-        int itemH = Canvas.FontHeight(
-            s.FontOr(Style.FontFallback(app, "small"))) + app.Scale(8);
-        if (itemH < app.Scale(26)) { itemH = app.Scale(26); }
-        int sepH = app.Scale(7);
-        int h = app.Scale(4) * 2;
-        for (int i = 0; i < labels.Count; i = i + 1) {
-            if (ContextMenu.IsSep(labels[i])) { h = h + sepH; } else { h = h + itemH; }
-        }
-        return h;
-    }
-
-    public static int Render(App app, int mx, int my, List<string> labels) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox itemStyle = Style.Part(app, "contextmenu", "item", "", "",
-                                        "", Style.SNormal());
-        int fontSize = itemStyle.FontOr(Style.FontFallback(app, "small"));
-        int itemH = Canvas.FontHeight(fontSize) + app.Scale(8);
-        if (itemH < app.Scale(26)) { itemH = app.Scale(26); }
-        int sepH = app.Scale(7);
-        int mW = app.Scale(140);
-        for (int i = 0; i < labels.Count; i = i + 1) {
-            string raw = labels[i];
-            if (!ContextMenu.IsSep(raw)) {
-                string ml = ContextMenu.ParseMainLabel(raw);
-                string ac = ContextMenu.ParseAccel(raw);
-                int lw = Canvas.MeasureText(ml, fontSize) + app.Scale(28);
-                if (ac.Length > 0) {
-                    lw = lw + Canvas.MeasureText(ac, fontSize) + app.Scale(24);
-                }
-                if (lw > mW) { mW = lw; }
-            }
-        }
-        int mH = ContextMenu.Height(app, labels);
-
-        int winW = c.Width();
-        int winH = c.Height();
-        if (mx + mW > winW) { mx = winW - mW - app.Scale(4); }
-        if (my + mH > winH) { my = winH - mH - app.Scale(4); }
-        if (mx < 0) { mx = 0; }
-        if (my < app.titlebarH) { my = app.titlebarH; }
-
-        app.BlockHitsMenu();
-
-        int hovRow = 0 - 1;
-        int hy = my + app.Scale(4);
-        for (int hi = 0; hi < labels.Count; hi = hi + 1) {
-            int rh = itemH;
-            if (ContextMenu.IsSep(labels[hi])) { rh = sepH; }
-            else if (app.mouseX >= mx && app.mouseX < mx + mW
-                     && app.mouseY >= hy && app.mouseY < hy + rh) {
-                hovRow = hi;
-            }
-            hy = hy + rh;
-        }
-        if (hovRow != app.menuHoverRow) {
-            app.menuHoverRow = hovRow;
-            app.RequestRedraw();
-        }
-
-        StyleBox s = Style.Of(app, "contextmenu", "", Style.SNormal());
-        c.FillRoundRect(mx + s.shadowDx, my + s.shadowDy, mW, mH,
-                        app.Scale(4), s.shadow);
-        app.canvas.SurfaceRoundRect(mx, my, mW, mH,
-            s.RadiusOr(app.theme.borderRadiusLarge), s.bg,
-            s.borderColor, s.BorderWOr(1));
-        app.BlockHitsRect(mx, my, mW, mH);
-
-        int ry = my + app.Scale(4);
-        for (int ri = 0; ri < labels.Count; ri = ri + 1) {
-            string raw = labels[ri];
-            if (ContextMenu.IsSep(raw)) {
-                ContextMenu.PaintSeparator(app, mx, ry + sepH / 2, mW);
-                ry = ry + sepH;
-            } else {
-                bool hov = app.mouseX >= mx && app.mouseX < mx + mW
-                           && app.mouseY >= ry && app.mouseY < ry + itemH;
-                string ml = ContextMenu.ParseMainLabel(raw);
-                string ac = ContextMenu.ParseAccel(raw);
-                ContextMenu.PaintItem(app, mx, ry, mW, itemH, ml, ac, hov);
-                ry = ry + itemH;
-            }
-        }
-
-        if (app.EventKind() == 2 && app.window.EventButton() == 1) {
-            bool onMenu = app.mouseX >= mx && app.mouseX < mx + mW
-                          && app.mouseY >= my && app.mouseY < my + mH;
-            if (!onMenu) { return 0 - 2; }
-        }
-
-        if (app.ClickAvailable() && app.window.EventButton() == 0) {
-            bool inside = app.mouseX >= mx && app.mouseX < mx + mW
-                          && app.mouseY >= my && app.mouseY < my + mH;
-            if (inside) {
-                int cy = my + app.Scale(4);
-                for (int ci = 0; ci < labels.Count; ci = ci + 1) {
-                    int rh = itemH;
-                    if (ContextMenu.IsSep(labels[ci])) { rh = sepH; }
-                    else if (app.mouseY >= cy && app.mouseY < cy + rh) {
-                        app.ClaimClick();
-                        return ci;
-                    }
-                    cy = cy + rh;
-                }
-                app.ClaimClick();
-                return 0 - 1;
-            }
-            app.ClaimClick();
-            return 0 - 2;
-        }
-        return 0 - 1;
-    }
 }

@@ -20,6 +20,43 @@ class UploadTest {
     static int downloadCount;
     static int exceedCount;
     static int customId;
+    static weak Upload releasedUpload;
+    static weak UploadFile releasedFile;
+
+    static Control Part(Control root, string token) {
+        if (root == null) { return null; }
+        if ((" " + root.ClassName + " ").Contains(" " + token + " ")) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = Part(root.ChildAt(i), token);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    static void Layout(App app, Upload up, int x, int y, int w, int h) {
+        app.SetRootControl(up);
+        up.MeasureTree(app, w);
+        up.Arrange(x, y, w, h);
+    }
+
+    static void ClickPart(App app, Control part) {
+        True("click part exists", part != null);
+        if (part == null) { return; }
+        True("click part arranged", part.bw > 0 && part.bh > 0);
+        int x = part.bx + part.bw / 2;
+        int y = part.by + part.bh / 2;
+        app.DispatchVisualTree(2, x, y, 0, 0);
+        app.DispatchVisualTree(3, x, y, 0, 0);
+    }
+
+    static void MakeReleasedTree() {
+        Upload up = new Upload();
+        up.ShowDownloadButton = true;
+        UploadFile file = up.AddFile("released.png", "", "http://host/released.png");
+        releasedUpload = up;
+        releasedFile = file;
+        up.BuildTree();
+    }
 
     static void OnChange() { changeCount = changeCount + 1; }
     static void OnUpload() { uploadCount = uploadCount + 1; }
@@ -242,7 +279,7 @@ class UploadTest {
         Eq("clear change event", changeCount, 5);
         Eq("clear empties", sub.Files.Count, 0);
 
-        // ---- 渲染一帧：命中区 / 拖放落区 / CSS 解析 ---------------------
+        // ---- Retained tree input before the first paint -----------------
         App app = new App("uploadtest", 800, 600);
         Upload view = new Upload();
         Wire(view);
@@ -250,73 +287,115 @@ class UploadTest {
         view.Thumbnail = true;
         UploadFile t1 = view.AddFile("photo.jpg", "", "http://host/p.jpg");
         Eq("view item success", t1.status, UploadStatus.Success());
-        view.Arrange(40, 50, 320, 200);
-        view.RenderTree(app);
-        int wid = view.BaseId();
-        Eq("render returns base", wid, view.BaseId());
-        List<int> tr = app.hitTester.RectOf(wid);
-        True("trigger rect", tr != null);
-        if (tr != null) {
-            Eq("trigger x", tr[0], 40);
-            Eq("trigger y", tr[1], 50);
-            True("trigger w", tr[2] > 60 && tr[2] < 200);
-            Eq("trigger h", tr[3], app.theme.heightMedium);
+        Layout(app, view, 40, 50, 320, 200);
+        Control trigger = Part(view, "upload-trigger");
+        Control row = Part(view, "upload-item");
+        True("trigger retained", trigger != null && trigger.parent == view);
+        True("row retained", row != null && row.parent != null);
+        if (trigger != null) {
+            True("trigger measured", trigger.bw > 60 && trigger.bh > 0);
+            True("drop inside", view.WantsDropAt(trigger.bx + 1, trigger.by + 1));
+            True("drop right edge excluded", !view.WantsDropAt(trigger.bx + trigger.bw, trigger.by + 1));
+            True("drop bottom edge excluded", !view.WantsDropAt(trigger.bx + 1, trigger.by + trigger.bh));
         }
-        int rid = wid + 8;
-        List<int> row = app.hitTester.RectOf(rid);
-        True("row rect", row != null);
-        if (row != null) {
-            Eq("row x", row[0], 40);
-            True("row below trigger", row[1] >= 50 + app.Scale(20));
-            Eq("row w spans", row[2], 320);
+        if (row != null && trigger != null) {
+            True("row below trigger", row.by >= trigger.by + trigger.bh);
+            True("row measured", row.bw > 0 && row.bh > 0);
         }
-        True("name link rect", app.hitTester.RectOf(rid + 1) != null);
-        True("download rect", app.hitTester.RectOf(rid + 3) != null);
-        True("remove rect", app.hitTester.RectOf(rid + 2) != null);
-        // 拖放落区 = 触发按钮矩形；界外拒绝。
-        if (tr != null) {
-            True("drop inside", view.WantsDropAt(tr[0] + 5, tr[1] + 5));
-            True("drop outside x", !view.WantsDropAt(tr[0] + tr[2] + 10, tr[1] + 5));
-            True("drop outside y", !view.WantsDropAt(tr[0] + 5, tr[1] + tr[3] + 10));
-        }
-        // CSS 解析非回退：::trigger 皮肤给了主色底。
         StyleBox ts = view.TriggerStyle(app, false);
         True("trigger bg themed", ts.BgOr(0) == app.theme.primary);
+        int beforeDownload = downloadCount;
+        ClickPart(app, Part(view, "upload-name-link"));
+        Eq("name routes once before paint", downloadCount, beforeDownload + 1);
+        True("download last item", view.LastItem == t1);
+        ClickPart(app, Part(view, "download"));
+        Eq("button routes once before paint", downloadCount, beforeDownload + 2);
+        view.RenderTree(app);
+        Eq("paint never downloads", downloadCount, beforeDownload + 2);
+        ClickPart(app, trigger);
+        True("trigger routes picker", view.DialogOpen());
+        view.CloseDialog(); view.TakeDialogResult(); view.SweepDialogClosed();
+        ClickPart(app, Part(view, "remove"));
+        Eq("remove routes once", view.Files.Count, 0);
+        Layout(app, view, 40, 50, 320, 200);
+        True("removed tree refreshed", Part(view, "upload-item") == null);
 
-        // ---- Dragger 形态：大虚线区 + Tip，落区铺满整块 -----------------
+        // Controlled Files and config changes refresh generated nodes.
+        List<UploadFile> shared = new List<UploadFile>();
+        UploadFile controlled = new UploadFile();
+        controlled.id = 400; controlled.name = "controlled.txt";
+        shared.Add(controlled);
+        view.SetFiles(shared);
+        Layout(app, view, 40, 50, 320, 200);
+        True("controlled row created", Part(view, "upload-item") != null);
+        Control stableRow = Part(view, "upload-item");
+        Layout(app, view, 40, 50, 320, 200);
+        True("unchanged tree stays retained", Part(view, "upload-item") == stableRow);
+        view.SetItemStatus(controlled.id, UploadStatus.Uploading(), "");
+        view.SetItemPercent(controlled.id, 37);
+        Layout(app, view, 40, 50, 320, 200);
+        Control progress = Part(view, "upload-progress");
+        True("progress real control", progress is Progress);
+        if (progress is Progress) { Eq("progress synchronized", ((Progress)progress).percent, 37); }
+        controlled.name = "renamed.txt";
+        controlled.message = "failed externally";
+        controlled.status = UploadStatus.Error();
+        Layout(app, view, 40, 50, 320, 200);
+        Control message = Part(view, "upload-msg");
+        True("external status refreshed", message is Label);
+        if (message is Label) { EqStr("external message", ((Label)message).GetText(), "failed externally"); }
+        controlled.status = UploadStatus.Success(); controlled.url = "http://host/controlled";
+        view.Disabled = true;
+        Layout(app, view, 40, 50, 320, 200);
+        beforeDownload = downloadCount;
+        ClickPart(app, Part(view, "upload-name-link"));
+        Eq("disabled download blocked", downloadCount, beforeDownload);
+        True("disabled remove absent", Part(view, "remove") == null);
+        view.Disabled = false; view.ShowTrigger = false;
+        Layout(app, view, 40, 50, 320, 200);
+        True("trigger config refreshed", Part(view, "upload-trigger") == null);
+        True("hidden trigger clears drop bounds", !view.WantsDropAt(41, 51));
+        shared.Clear();
+        Layout(app, view, 40, 50, 320, 200);
+        True("shared clear refreshed", Part(view, "upload-item") == null);
+
+        // ---- Dragger and picture card retained routing ------------------
         Upload dr = new Upload();
         Wire(dr);
-        dr.Dragger = true;
-        dr.Tip = "支持 png/jpg";
-        dr.Arrange(60, 70, 360, 200);
-        dr.RenderTree(app);
-        int dwid = dr.BaseId();
-        List<int> drect = app.hitTester.RectOf(dwid + 1);
-        True("dragger rect", drect != null);
-        if (drect != null) {
-            Eq("dragger x", drect[0], 60);
-            Eq("dragger w", drect[2], 360);
-            True("dragger tall", drect[3] > app.Scale(90));
+        dr.Dragger = true; dr.Tip = "支持 png/jpg";
+        Layout(app, dr, 60, 70, 360, 200);
+        Control dragger = Part(dr, "upload-dragger");
+        True("dragger retained", dragger != null);
+        if (dragger != null) {
+            True("dragger tall", dragger.bh > app.Scale(90));
+            True("dragger drop", dr.WantsDropAt(dragger.bx + 1, dragger.by + 1));
         }
-        True("dragger drop", dr.WantsDropAt(61, 71));
+        ClickPart(app, Part(dr, "upload-dragger-text"));
+        True("dragger child routes picker", dr.DialogOpen());
+        dr.CloseDialog(); dr.TakeDialogResult(); dr.SweepDialogClosed();
 
-        // ---- 照片墙：方格 + 添加块命中区 --------------------------------
         Upload pc = new Upload();
-        Wire(pc);
-        pc.PictureCard = true;
+        Wire(pc); pc.PictureCard = true; pc.ShowDownloadButton = true;
         UploadFile t2 = pc.AddFile("c1.jpg", "", "http://host/c1.jpg");
-        pc.Arrange(500, 50, 300, 200);
-        pc.RenderTree(app);
-        int pwid = pc.BaseId();
-        List<int> tile = app.hitTester.RectOf(pwid + 8);
-        List<int> add = app.hitTester.RectOf(pwid + 2);
-        True("tile rect", tile != null);
-        True("add tile rect", add != null);
-        if (tile != null) {
-            Eq("tile size", tile[2], app.Scale(96));
-            Eq("tile x", tile[0], 500);
-        }
+        Layout(app, pc, 500, 50, 300, 200);
+        Control tile = Part(pc, "upload-tile");
+        Control add = Part(pc, "upload-tile-add");
+        True("tile retained", tile != null);
+        True("add retained", add != null);
+        if (tile != null) { Eq("tile size", tile.bw, app.Scale(96)); }
         True("card drop zone", pc.WantsDropAt(510, 60));
+        beforeDownload = downloadCount;
+        ClickPart(app, Part(pc, "upload-tile-download"));
+        Eq("card download routes", downloadCount, beforeDownload + 1);
+        ClickPart(app, add);
+        True("card add routes picker", pc.DialogOpen());
+        pc.CloseDialog(); pc.TakeDialogResult(); pc.SweepDialogClosed();
+        ClickPart(app, Part(pc, "upload-tile-remove"));
+        Eq("card remove routes", pc.Files.Count, 0);
+        app.SetRootControl(null);
+        MakeReleasedTree();
+        True("upload event graph released", releasedUpload == null);
+        True("upload file owner weak", releasedFile == null);
 
         // ---- Multiple：内建弹窗走多选模式 -----------------------------
         // 弹窗本体是 FilePicker 的独立窗口，这里只钉住组件侧的路由与

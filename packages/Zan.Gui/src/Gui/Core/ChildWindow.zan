@@ -7,12 +7,12 @@ using Gui.Widget;
 
 namespace Gui;
 
-public class ChildWindow {
+public class ChildWindow : AppLoopOwner {
+    internal AppLoopRegistration hostLayoutRegistration;
     App host;
     weak App parentApp;
     Control root;
-    ModelBinder binder;
-    object model;
+    AppModelHost binder;
     bool open;
     bool destroyed;
     bool designAssembled;
@@ -23,7 +23,7 @@ public class ChildWindow {
     ChildWindow() {
         host = null;
         root = null;
-        binder = new ModelBinder();
+        binder = null;
         open = false;
         destroyed = false;
         idBase = WidgetId.Block(1000);
@@ -56,19 +56,27 @@ public class ChildWindow {
 
     // 模型宿主（惰性建）：Zan 的子类构造不跑父构造，父构造里的字段
     // 初始化在子类实例上不生效——首次用到时再补，否则 binder 是 null。
-    ModelBinder Binder() {
+    private ModelBinder Binder() {
         if (binder == null) { binder = new ModelBinder(); }
-        return binder;
+        return (ModelBinder)binder;
     }
 
-    // 挂树与数据模型
-    void SetRoot(Control tree, object m) {
+    // Install one retained view and, optionally, its independent model. The
+    // framework performs event wiring and synchronization during host assembly.
+    public void SetView(Control tree, object m) {
         root = tree;
-        model = m;
-        this.Binder().SetRoot(tree, m);
-        if (host != null) { host.SetRootControl(tree); }
-        UiDriver.SetRoot(tree);
+        ModelBinder current = this.Binder();
+        current.SetRoot(tree, m);
+        if (host != null) {
+            host.SetRootControl(tree);
+            if (open && tree != null) {
+                host.RegisterModelHost(current);
+                current.Wire();
+            }
+        }
     }
+
+    public Control View() { return root; }
 
     // 运行期装载设计稿（B-ID149：Html.Parse 单跳管线，与 Form.Show 同源）。
     // 名字解析与 Form.Show 同一约定：DesignName() 覆写优先（自定义名），
@@ -77,7 +85,7 @@ public class ChildWindow {
     // ViewModel、方法即事件处理器）。
     // 装载是框架的事（与 Form.Show 零装载语句同一契约）：只由
     // AssembleDesign 调用，private 让窗代码里的装载调用编译期即报错。
-    // 已 SetRoot 手搭树的窗（无同名设计稿）这里是 no-op。
+    // 已 SetView 手搭树的窗（无同名设计稿）这里是 no-op。
     private void EnsureDesign() {
         if (this.root != null) { return; }
         string tname = this.DesignName();
@@ -86,7 +94,7 @@ public class ChildWindow {
         if (html != null) {
             HtmlDoc doc = Html.Parse(html, "", null);
             if (doc.root != null) {
-                this.SetRoot(doc.root, this);
+                this.SetView(doc.root, this);
             }
         }
     }
@@ -94,10 +102,10 @@ public class ChildWindow {
     // 业务初始化钩子：框架在设计稿装载后、宿主创建与声明式接线之前
     // 调用一次（时序同旧"先 Build 再 OpenHost"，Title()/IdBase() 能看到
     // 这里算出的状态）。在这里算绑定字段的初值、建 z-mount 要挂的
-    // 复合控件；不装载、不 Find、不 SetRoot、不手工接线。
+    // 复合控件；不装载、不 Find、不手工接线。
     protected virtual void OnCreate() { }
 
-    // bind 模型覆写：默认 null = 窗自身（或手搭树 SetRoot 指定的模型）；
+    // bind 模型覆写：默认 null = 窗自身（或 SetView 指定的模型）；
     // JsonValue 等外部模型的窗覆写返回之。事件处理器恒解析窗方法。
     protected virtual object ViewModel() { return null; }
 
@@ -110,7 +118,7 @@ public class ChildWindow {
         this.OnCreate();
         if (this.root == null) { return; }
         object vm = this.ViewModel();
-        if (vm != null) { this.SetRoot(this.root, vm); }
+        if (vm != null) { this.SetView(this.root, vm); }
         DocWire.MountSlots(this.root, this);
     }
 
@@ -126,15 +134,14 @@ public class ChildWindow {
         ModelBinder b = this.Binder();
         if (b.Model() == null) { b.SetRoot(this.root, this); }
         object bm = b.Model();
-        DocWire.AutoWire(this.root, this, b, () => { this.MarkDirty(); });
+        DocWire.AutoWire(this.root, this, b);
         if (!(bm is JsonValue)) {
             DocWire.CheckBinds(this.root, bm, this.GetType().Name);
         }
-        b.SetApp(host);
+        host.RegisterModelHost(b);
         b.Wire();
         if (this.HasMethod("OnLoad")) {
             this.Invoke("OnLoad", this);
-            b.MarkDirty();
         }
     }
 
@@ -162,27 +169,6 @@ public class ChildWindow {
         this.Binder().HandleItem(name, a);
     }
 
-    void Wire() {
-        this.Binder().SetApp(host);
-        this.Binder().Wire();
-    }
-
-    // 模型同步转发（绑定实现见 ModelBinder）：窗口每帧在渲染前把
-    // 模型推入控件、渲染后把控件回写模型；这两个入口也供宿主手动
-    // 驱动（离屏渲染、自定义帧循环）。
-    void SyncFromModel() {
-        this.Binder().MarkDirty();
-        this.Binder().SyncFromModel();
-    }
-
-    void SyncChangedNode(Control c) {
-        this.Binder().SyncChangedNode(c);
-    }
-
-    // 主动标记子窗口数据为脏（外部模型变化时通知窗口下一帧立刻同步）
-    void MarkDirty() {
-        this.Binder().MarkDirty();
-    }
     virtual bool Pending() { return false; }
 
     virtual void AfterFrame() { }
@@ -225,6 +211,7 @@ public class ChildWindow {
                                   parent.UserWallpaperOpacity());
         }
         this.AssembleDoc();
+        this.EnsureHostLayoutRegistration();
         host.Show();
         host.RequestRedraw();
         ChildWindows.Register(this);
@@ -250,6 +237,7 @@ public class ChildWindow {
         host.SetChromeButtons(this.ShowTheme(), this.ShowPin(), this.ShowMinimize(),
                               this.ShowMaximize());
         this.AssembleDoc();
+        this.EnsureHostLayoutRegistration();
         host.Show();
         host.RequestRedraw();
     }
@@ -294,41 +282,92 @@ public class ChildWindow {
     // 本帧该子窗的渲染耗时（微秒）。
     long LastRenderUs() { return this.lastRenderUs; }
 
+    internal void EnsureHostLayoutRegistration() {
+        if (host == null || !open) { return; }
+        if (root != null && binder != null) { host.RegisterModelHost(binder); }
+        if (hostLayoutRegistration != null && hostLayoutRegistration.active && hostLayoutRegistration.host == host) { return; }
+        AppLoopRegistration previous = hostLayoutRegistration;
+        hostLayoutRegistration = null;
+        if (previous != null) { previous.Invalidate(); }
+        hostLayoutRegistration = host.RegisterLoopParticipant(this, new ChildHostLayout(this));
+    }
+
+    private bool ChildLayoutCurrent(App app, Control tree, AppLoopRegistration ticket,
+            AppPreparationProof proof, int revision, int phase, long sequence, bool forInput) {
+        bool member = !forInput || tree == null || (app.rootControl != null && app.rootControl.ContainsInputControl(tree));
+        return member && open && !destroyed && host == app && root == tree && renderCb == null
+            && hostLayoutRegistration == ticket && app.PreparationInputCurrent(phase, sequence)
+            && app.HostPhaseCurrent(ticket, proof, revision);
+    }
+
+    internal bool SyncHostLayout(App app, bool forInput) {
+        if (renderCb != null) { return true; }
+        AppLoopRegistration ticket = hostLayoutRegistration;
+        Control tree = root;
+        if (app != host || !open || destroyed || ticket == null || !app.LiveLoopRegistration(ticket)) { return false; }
+        AppPreparationProof proof = new AppPreparationProof(ticket);
+        int revision = app.hostLayoutRevision;
+        int phase = app.inputPreparationTicket;
+        long sequence = app.window.EventSeq();
+        if (tree == null) { return ChildLayoutCurrent(app, tree, ticket, proof, revision, phase, sequence, forInput); }
+        if (!app.SyncModelHosts()) { return false; }
+        if (!ChildLayoutCurrent(app, tree, ticket, proof, revision, phase, sequence, forInput)) { return false; }
+        tree.MeasureTree(app);
+        if (!ChildLayoutCurrent(app, tree, ticket, proof, revision, phase, sequence, forInput)) { return false; }
+        int pad = app.Scale(5);
+        tree.Arrange(app.ShapeOffX() + pad, app.ContentTop() + app.ShapeOffY() + pad,
+            app.ClientWidth() - pad * 2, app.ClientHeight() - app.ContentTop() - pad * 2);
+        return ChildLayoutCurrent(app, tree, ticket, proof, revision, phase, sequence, forInput);
+    }
+
+    private bool ContinueChildFrame(App app, Control tree, AppLoopRegistration ticket) {
+        if (open && !destroyed && host == app && root == tree && renderCb == null
+            && hostLayoutRegistration == ticket && app.HostLayoutPrepared(ticket)) { return true; }
+        app.AbortPreparationFrame();
+        return false;
+    }
+
     // 真正的绘制（Render 的计时包装之外的部分）。
     void RenderContent() {
+        // WidgetId.Push/Pop are stateless compatibility no-ops in the pinned base.
         WidgetId.Push("child_window");
-        if (idBase != 0) { WidgetId.Push(idBase); }
-        if (renderCb != null) {
-            renderCb();
-        } else {
-            host.BeginFrame();
-            int top = host.ContentTop();
-            if (root != null) {
-                SyncFromModel();
-                root.MeasureTree(host);
-                // 阴影带外扩的异形宿主把内容轮廓推离画布原点
-                // (ShapeOffX, ShapeOffY)：保留树从内容原点起摆，绘制、
-                // 命中区与画布坐标三方才对齐（普通宿主两值恒 0，无感）。
-                // 弹窗统一四周 5px 外边距（随宿主 DPI 缩放）：内容树
-                // 不顶满客户区，贴边留一线呼吸空隙。
-                int pad = host.Scale(5);
-                root.Arrange(host.ShapeOffX() + pad,
-                             top + host.ShapeOffY() + pad,
-                             host.ClientWidth() - pad * 2,
-                             host.ClientHeight() - top - pad * 2);
-                root.RenderTree(host);
+        bool pushedId = idBase != 0;
+        if (pushedId) { WidgetId.Push(idBase); }
+        App frameHost = host;
+        try {
+            if (renderCb != null) {
+                renderCb();
+            } else {
+                frameHost.BeginFrame();
+                if (!frameHost.PrepareStandardHostFrame()) { return; }
+                AppLoopRegistration ticket = hostLayoutRegistration;
+                Control tree = root;
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                // 异形宿主在 BeginFrame 中清为透明，形状底色和阴影带
+                // 与 Form 共用背景阶段，不能依赖子控件恰好铺满轮廓。
+                if (frameHost.shapeMode != 0) {
+                    frameHost.RenderBackground(0, 0, frameHost.canvas.Width(),
+                    frameHost.canvas.Height(), 0);
+                    if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                }
+                if (tree != null) { tree.RenderTree(frameHost); }
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                string caption = this.Title();
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                frameHost.RenderChrome(caption);
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                frameHost.PresentFrame();
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
+                if (!frameHost.WriteBackModelHosts()) { frameHost.AbortPreparationFrame(); return; }
+                if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
             }
-            host.RenderChrome(this.Title());
-            host.PresentFrame();
-            // 回写在弹层之后：下拉/弹出层的选择是在 PresentFrame 里的
-            // RunOverlays 阶段才发生的，在它之前读回控件值只会读到旧值，
-            // 而下一帧的 SyncFromModel 又把旧值写回控件——绑定了状态实体
-            // 的下拉框因此永远切不动（不带 bind、由代码读 Value() 的下拉
-            // 不受影响，这就是「有的能切有的不能」）。
-            if (root != null) { SyncChangedNode(root); }
+        } catch (Exception error) {
+            if (frameHost != null) { frameHost.AbortPreparationFrame(); }
+            throw error;
+        } finally {
+            if (pushedId) { WidgetId.Pop(); }
+            WidgetId.Pop();
         }
-        if (idBase != 0) { WidgetId.Pop(); }
-        WidgetId.Pop();
         this.AfterFrame();
     }
 
@@ -379,22 +418,18 @@ public class ChildWindow {
     void Teardown() {
         if (destroyed) { return; }
         destroyed = true;
+        AppLoopRegistration oldLayout = hostLayoutRegistration;
+        hostLayoutRegistration = null;
+        if (oldLayout != null) { oldLayout.Invalidate(); }
         renderCb = null;
         if (binder != null) {
             binder.Detach();
         }
-        // UiDriver 是进程级关联：只撤销仍属于本窗口的引用。
-        if (root != null && UiDriver.root == root) { UiDriver.SetRoot(null); }
         if (host != null) {
             host.StopLoop();
             host.SetRootControl(null);
-            if (UiDriver.app == host) {
-                UiDriver.active = false;
-                UiDriver.app = null;
-            }
         }
         root = null;
-        model = null;
         if (host != null) {
             if (host.window != null) { host.window.Destroy(); }
             // 光栅 surface 与 OS 窗口是两份资源：销毁窗口只释放

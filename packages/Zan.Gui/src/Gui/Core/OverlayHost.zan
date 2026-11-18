@@ -45,36 +45,70 @@ public class OverlayHost {
         return activePopup.HitTest(x, y, pointerType);
     }
 
-    private void ArrangePopup(App app) {
-        if (activePopup == null) { return; }
-        if (positioned) {
+    private bool PopupLayoutCurrent(App app, Control popup, Control anchor, int ticket,
+    Control root, int generation, long sequence, int phase, int frame) {
+        return app.isRunning && ownerApp == app && app.overlayHost == this
+        && activePopup == popup && activeAnchor == anchor && revision == ticket
+        && app.rootControl == root && app.inputRootGeneration == generation
+        && app.window.EventSeq() == sequence && app.inputPreparationTicket == phase
+        && app.frameSeq == frame;
+    }
+
+    private bool ArrangePopup(App app) {
+        if (activePopup == null) { return true; }
+        Control popup = activePopup;
+        Control anchor = activeAnchor;
+        int ticket = revision;
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        int phase = app.inputPreparationTicket;
+        int frame = app.frameSeq;
+        popup.InheritApp(app);
+        popup.MeasureTree(app);
+        if (!this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame)) { return false; }
+        if (positioned || anchor != null) {
             int margin = app.Scale(Space.XS);
-            int availableW = app.canvas.Width() - margin * 2;
-            int availableH = app.canvas.Height() - margin * 2;
+            int contentX = 0;
+            int contentY = 0;
+            int contentW = 0;
+            int contentH = 0;
+            app.ContentBounds(out contentX, out contentY, out contentW, out contentH);
+            int left = contentX + margin;
+            int top = contentY + margin;
+            int right = contentX + contentW - margin;
+            int bottom = contentY + contentH - margin;
+            int availableW = right - left;
+            int availableH = bottom - top;
             if (availableW < 1) { availableW = 1; }
             if (availableH < 1) { availableH = 1; }
-            int width = activePopup.prefW;
-            int height = activePopup.prefH;
+            int width = popup.prefW;
+            int height = popup.prefH;
+            if (!positioned && anchor != null) {
+                if (width <= 0) { width = anchor.bw; }
+                if (height <= 0) { height = app.Scale(200); }
+            }
             if (width > availableW) { width = availableW; }
             if (height > availableH) { height = availableH; }
             if (width < 1) { width = 1; }
             if (height < 1) { height = 1; }
             int x = pointX;
             int y = pointY;
-            if (x + width > app.canvas.Width() - margin) { x = app.canvas.Width() - margin - width; }
-            if (y + height > app.canvas.Height() - margin) { y = app.canvas.Height() - margin - height; }
-            if (x < margin) { x = margin; }
-            if (y < margin) { y = margin; }
-            activePopup.Arrange(x, y, width, height);
-            return;
+            if (!positioned && anchor != null) {
+                x = anchor.bx;
+                y = anchor.by + anchor.bh + margin;
+                if (y + height > bottom) {
+                    int above = anchor.by - margin - height;
+                    y = above >= top ? above : bottom - height;
+                }
+            }
+            if (x + width > right) { x = right - width; }
+            if (y + height > bottom) { y = bottom - height; }
+            if (x < left) { x = left; }
+            if (y < top) { y = top; }
+            popup.Arrange(x, y, width, height);
         }
-        if (activeAnchor == null) { return; }
-        activePopup.MeasureTree(app);
-        int popW = activePopup.prefW > 0 ? activePopup.prefW : activeAnchor.bw;
-        int popH = activePopup.prefH > 0 ? activePopup.prefH : app.Scale(200);
-        int popX = OverlayPopup.FitX(app, activeAnchor.bx, popW);
-        int popY = OverlayPopup.FitY(app, activeAnchor.by + activeAnchor.bh + app.Scale(4), activeAnchor.bh, popH);
-        activePopup.Arrange(popX, popY, popW, popH);
+        return this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame);
     }
 
     public void Show(App app, Control anchor, Control popup) {
@@ -83,6 +117,11 @@ public class OverlayHost {
 
     public void ShowAt(App app, Control popup, int x, int y) {
         this.ShowCore(app, null, popup, true, x, y);
+    }
+
+    // Positioned layout with the same weak anchor retirement as Show.
+    public void ShowAtAnchor(App app, Control anchor, Control popup, int x, int y) {
+        this.ShowCore(app, anchor, popup, true, x, y);
     }
 
     private void ShowCore(App app, Control anchor, Control popup, bool atPoint, int x, int y) {
@@ -200,6 +239,7 @@ public class OverlayHost {
     }
 
     public void Update(App app) {
+        if (app != null && app.snapshotInputSilenceDepth > 0) { return; }
         if (app == null || ownerApp != app || activePopup == null) { return; }
         int kind = app.EventKind();
         int key = app.window != null ? app.window.EventKeyCode() : 0;
@@ -219,17 +259,29 @@ public class OverlayHost {
         }
     }
 
-    public void RenderAll(App app) {
-        if (app == null || ownerApp != app || activePopup == null) { return; }
-        // Point popups are already laid out; paint must not replay opening input.
-        if (!positioned) { this.Update(app); }
-        else if (!this.HasActive()) { this.Dismiss(); }
-        if (!this.HasActive()) { return; }
-        if (!positioned) { this.ArrangePopup(app); }
-        if (!this.HasActive()) { this.Dismiss(); return; }
+    internal bool PrepareLayout(App app) {
+        if (app == null || ownerApp != app || activePopup == null) { return true; }
+        int ticket = revision;
         Control popup = activePopup;
-        app.BlockHitsBelow();
-        app.BlockHitsRect(popup.bx, popup.by, popup.bw, popup.bh);
+        Control anchor = activeAnchor;
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        int phase = app.inputPreparationTicket;
+        int frame = app.frameSeq;
+        if (!this.HasActive()) {
+            this.Dismiss();
+            return revision == ticket + 1 && activePopup == null;
+        }
+        if (!this.ArrangePopup(app)) { return false; }
+        return this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame)
+        && popup.PrepareLayoutEvents(app, true)
+        && this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame);
+    }
+
+    public void RenderAll(App app) {
+        if (app == null || ownerApp != app || !this.HasActive()) { return; }
+        Control popup = activePopup;
         popup.RenderTree(app);
     }
 

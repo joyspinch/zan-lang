@@ -1,20 +1,54 @@
-// WEB_GUI_ROADMAP P8：文档动态原语（<template data-for> / data-if）
-// 的运行时通道无头用例。Html.Parse 建树 → ChildWindow 挂模型：
-// 模板行按源数组克隆展开、行内 bind/bindIf 以本项 JsonValue 为
-// 第一作用域、data-if 真值插拔、数组长度变化整组重建、行内与根级
-// 双向回写。不泵事件，直调 SyncFromModel/SyncChangedNode。
+// 文档动态原语（<template data-for> / :visible）的运行时通道无头用例。
+// Html.Parse 建树 → ChildWindow 挂强类型模型：模板行按源列表克隆展开、
+// 行内 bind/:visible 以本项为第一作用域、列表变化调和、行内与根级双向回写。
+// 不泵事件，经 App 同步与回写模型宿主。
 using System;
-using System.Json;
+using System.Collections.Generic;
 using Gui;
 using Gui.Widget;
 
+class DynItem {
+    public string name;
+    public string qty;
+    public bool on;
+
+    public DynItem(string name, string qty, bool on) {
+        this.name = name;
+        this.qty = qty;
+        this.on = on;
+    }
+}
+
+class DynModel {
+    public bool flag = true;
+    public string title = "hello";
+    public string city = "Shanghai";
+    public List<string> cities;
+    public List<DynItem> items;
+
+    public DynModel() {
+        cities = new List<string>();
+        cities.Add("Beijing");
+        cities.Add("Shanghai");
+        items = new List<DynItem>();
+        items.Add(new DynItem("a", "1", true));
+        items.Add(new DynItem("b", "2", false));
+    }
+}
+
 class DynConfWin : ChildWindow {
+    public void Attach(App app, Control tree, object model) {
+        host = app;
+        open = true;
+        this.SetView(tree, model);
+    }
 }
 
 class GuiHtmlDynamic {
     static int fails;
     static string picked;
     static int pickCount;
+    static DynItem pickedScope;
 
     static void Eq(string what, string got, string want) {
         if (got == want) { return; }
@@ -39,113 +73,100 @@ class GuiHtmlDynamic {
         pickCount = 0;
         string html = "<div>"
             + "<template data-for=\"items\">"
-            + "<li class=\"row\" @click=\"pickrow\"><span data-bind=\"name\"></span>"
-            + "<input data-bind=\"qty\" data-if=\"on\" />"
+            + "<li class=\"row\" @click=\"pickrow\"><span bind=\"name\"></span>"
+            + "<input bind=\"qty\" :visible=\"on\" />"
             + "<button data-on-click=\"pick\" data-arg=\"rowqty\">Go</button></li>"
             + "</template>"
-            + "<input data-bind=\"title\" data-if=\"flag\" />"
+            + "<input bind=\"title\" :visible=\"flag\" />"
             + "</div>"
             + "<div><button data-on-click=\"pick\" data-arg=\"apple\">P</button></div>"
-            + "<div><select data-bind=\"city\" :options=\"cities\"></select></div>";
+            + "<div><select bind=\"city\" :options=\"cities\"></select></div>";
         HtmlDoc doc = Html.Parse(html, "", null);
         Control rootT = doc.root;
-        Control div = rootT.children[0];
+        Control div = rootT.ChildAt(0);
 
-        // 未挂模型：动态原语惰性——原型隐藏（UA 样式表 display:none
-        // 的类语义在 Kind 上，见 Gui_html_css 的 type 选择器用例），
-        // 不展开、不插拔。
+        // 未挂模型：动态原语惰性——原型隐藏，不展开、不插拔。
         DynConfWin w = new DynConfWin();
-        w.SetRoot(rootT, null);
-        w.Wire();
+        App app = App.CreateOffscreen("gui-html-dynamic", 400, 300);
+        w.Attach(app, rootT, null);
         GuiHtmlDynamic.Eq("inert kids", Convert.ToString(div.ChildCount()), "2");
 
-        JsonValue model = JsonValue.Parse(
-            "{\"flag\":true,\"title\":\"hello\",\"city\":\"sh\","
-            + "\"cities\":[{\"label\":\"Beijing\",\"value\":\"bj\"},{\"label\":\"Shanghai\",\"value\":\"sh\"}],"
-            + "\"items\":[{\"name\":\"a\",\"qty\":\"1\",\"on\":true},"
-            + "{\"name\":\"b\",\"qty\":\"2\",\"on\":false}]}");
-        w.SetRoot(rootT, model);
+        DynModel model = new DynModel();
         w.HandleArg("pick", (string s) => { picked = s;
                                            pickCount = pickCount + 1; });
-        w.Wire();
+        w.HandleItem("pickrow", (Control sender, object value) => {
+            if (value is DynItem) { pickedScope = (DynItem)value; }
+        });
+        w.SetView(rootT, model);
 
         // 首展：模板后两行 li（每项克隆一个原型子项），行内作用域
         // 推送与插拔同时生效。
         GuiHtmlDynamic.Eq("expanded kids",
                           Convert.ToString(div.ChildCount()), "4");
-        Control row0 = div.children[1];
-        Control row1 = div.children[2];
-        Control title = div.children[3];
+        Control row0 = div.ChildAt(1);
+        Control row1 = div.ChildAt(2);
+        Control title = div.ChildAt(3);
         GuiHtmlDynamic.Eq("row0 kind", row0.Kind(), "li");
-        GuiHtmlDynamic.Eq("row0 name", row0.children[0].GetProp("text"), "a");
-        GuiHtmlDynamic.Eq("row1 name", row1.children[0].GetProp("text"), "b");
+        GuiHtmlDynamic.Eq("row0 name", row0.ChildAt(0).GetProp("text"), "a");
+        GuiHtmlDynamic.Eq("row1 name", row1.ChildAt(0).GetProp("text"), "b");
         GuiHtmlDynamic.Eq("inp0 shown",
-                          Vis(row0.children[1].visible), "1");
+                          Vis(row0.ChildAt(1).visible), "1");
         GuiHtmlDynamic.Eq("inp1 hidden",
-                          Vis(row1.children[1].visible), "0");
+                          Vis(row1.ChildAt(1).visible), "0");
 
-        // 行根作用域：行根常是 @click 的宿主（sender 槽按被接线控件
-        // 回查 ScopeOf）。行根自己没有绑定声明——早期只给声明了绑定
-        // 的控件登记作用域，ScopeOf 返回 null，处理器早退，行点击
-        // 静默失灵（界面正常、点击毫无反应）。
-        JsonValue rowScope = w.Binder().ScopeOf(row0);
+        // 行根本身没有绑定声明，事件仍须取得本项作用域。
+        row0.Click.Raise();
+        DynItem rowScope = pickedScope;
         GuiHtmlDynamic.Eq("row root scope",
-                          (rowScope == null) ? "" : rowScope.Str("name", ""), "a");
-        JsonValue rowScope1 = w.Binder().ScopeOf(row1);
+                          (rowScope == null) ? "" : rowScope.name, "a");
+        pickedScope = null;
+        row1.Click.Raise();
+        DynItem rowScope1 = pickedScope;
         GuiHtmlDynamic.Eq("row1 root scope",
-                          (rowScope1 == null) ? "" : rowScope1.Str("name", ""), "b");
+                          (rowScope1 == null) ? "" : rowScope1.name, "b");
 
-        // 根级 data-if 插拔。
+        // 根级 :visible 插拔。
         GuiHtmlDynamic.Eq("title shown",
                           Vis(title.visible), "1");
-        model.PathSet("flag", "false");
-        w.SyncFromModel();
+        model.flag = false;
+        app.SyncModelHosts();
         GuiHtmlDynamic.Eq("title hidden",
                           Vis(title.visible), "0");
 
-        // 数组长度变化 → 整组重建。
-        JsonValue items2 = JsonValue.Parse(
-            "[{\"name\":\"a\",\"qty\":\"1\",\"on\":true}]");
-        model.PathSetValue("items", items2);
-        w.SyncFromModel();
+        // 同根替换列表 → 按实际源身份调和。
+        model.items = new List<DynItem>();
+        model.items.Add(new DynItem("a", "1", true));
+        app.SyncModelHosts();
         GuiHtmlDynamic.Eq("shrunk kids",
                           Convert.ToString(div.ChildCount()), "3");
 
         // 行内回写（改克隆 span 的文本 → items[0].name）与根级回写。
-        div.children[1].children[0].SetProp("text", "z");
+        div.ChildAt(1).ChildAt(0).SetProp("text", "z");
         title.SetProp("value", "changed");
-        w.SyncChangedNode(rootT);
-        JsonValue back = model.Get("items");
-        JsonValue back0 = back == null ? null : back.At(0);
-        JsonValue backn = back0 == null ? null : back0.Get("name");
-        JsonValue mt = model.Get("title");
-        GuiHtmlDynamic.Eq("row writeback",
-                          backn == null ? "?" : backn.AsString(""), "z");
-        GuiHtmlDynamic.Eq("root writeback",
-                          mt == null ? "?" : mt.AsString(""), "changed");
+        app.WriteBackModelHosts();
+        GuiHtmlDynamic.Eq("row writeback", model.items[0].name, "z");
+        GuiHtmlDynamic.Eq("root writeback", model.title, "changed");
 
-        // data-arg 带参事件：静态按钮（WireNode 一次性解析）与模板
-        // 行按钮（行展开时逐行 WireNode）都把 data-arg 快照闭包进
+        // data-arg 带参事件：静态按钮与模板行按钮都把 data-arg 快照闭包进
         // 处理器；带参槽未命中不挤占无参 Handle 同名条目。
-        Control argDiv = rootT.children[1];
-        ((Button)argDiv.children[0]).Click.Raise();
+        Control argDiv = rootT.ChildAt(1);
+        ((Button)argDiv.ChildAt(0)).Click.Raise();
         GuiHtmlDynamic.Eq("static arg", picked, "apple");
         GuiHtmlDynamic.Eq("static fires once",
                           Convert.ToString(pickCount), "1");
-        Control rowBtn = div.children[1].children[2];
+        Control rowBtn = div.ChildAt(1).ChildAt(2);
         ((Button)rowBtn).Click.Raise();
         GuiHtmlDynamic.Eq("row arg", picked, "rowqty");
         GuiHtmlDynamic.Eq("row fires twice",
                           Convert.ToString(pickCount), "2");
 
-        // 动态模型数组驱动选项绑定（:options="cities" 与 data-bind="city"）
-        Control selDiv = rootT.children[2];
-        SelectBox citySel = (SelectBox)selDiv.children[0];
-        GuiHtmlDynamic.Eq("city init sel", citySel.SelectedValue(), "sh");
+        // 强类型字符串列表驱动选项绑定。
+        Control selDiv = rootT.ChildAt(2);
+        SelectBox citySel = (SelectBox)selDiv.ChildAt(0);
+        GuiHtmlDynamic.Eq("city init sel", citySel.SelectedValue(), "Shanghai");
         citySel.Select(0);
-        w.SyncChangedNode(rootT);
-        JsonValue backCity = model.Get("city");
-        GuiHtmlDynamic.Eq("city writeback", backCity == null ? "?" : backCity.AsString(""), "bj");
+        app.WriteBackModelHosts();
+        GuiHtmlDynamic.Eq("city writeback", model.city, "Beijing");
 
         citySel = null;
         rootT = null;

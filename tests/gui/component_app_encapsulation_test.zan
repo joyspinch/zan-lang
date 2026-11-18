@@ -19,6 +19,33 @@ using Gui.Widget;
 using Game.Render3D;
 using Game.Animation;
 
+namespace Gui.Component;
+
+public partial class FilePicker {
+    public Control EncapsulationTestViewTree() { return viewTree; }
+    internal void EncapsulationTestConfigure(int pickerMode, bool multi) {
+        mode=pickerMode; allowMulti=multi; open=true; closing=false; result=0;
+    }
+    internal string EncapsulationTestName() { return nameInput.GetText(); }
+    internal bool EncapsulationTestHidden() { return showHidden.Get(); }
+    internal bool EncapsulationTestDirty() { return dirty; }
+    internal void EncapsulationTestClearDirty() { dirty=false; }
+}
+class FilePickerEncapsulationWitness {
+    public weak FilePicker Picker;
+    public UiEvent Submit;
+    public Control Row;
+    public Control View;
+    public RowAt Rows;
+}
+class FilePickerEncapsulationState {
+    public int Paths;
+    public int Accepts;
+    public int Cancels;
+    public void Accepted() { Accepts=Accepts+1; }
+    public void Cancelled() { Cancels=Cancels+1; }
+    public void Changed() { Paths=Paths+1; }
+}
 class ComponentAppEncapsulationTest {
     static int fails;
 
@@ -34,6 +61,126 @@ class ComponentAppEncapsulationTest {
         Console.WriteLine("FAIL " + what + ": got " + got + " want " + want);
     }
 
+    static FilePickerEncapsulationWitness PickerLifetime(App app, bool build) {
+        FilePicker picker = new FilePicker();
+        FilePickerEncapsulationWitness witness = new FilePickerEncapsulationWitness(); witness.Picker=picker;
+        if (build) {
+            picker.BuildViewTree(app);
+            Control firstTree=picker.EncapsulationTestViewTree();
+            True("FilePicker builds actual nonempty view tree",firstTree!=null&&firstTree.ChildCount()>0);
+            picker.BuildViewTree(app);
+            True("FilePicker rebuild replaces actual nonempty view tree",picker.EncapsulationTestViewTree()!=firstTree&&picker.EncapsulationTestViewTree().ChildCount()>0);
+            Eq("rebuilding FilePicker wires search Submit once",picker.SearchBox().Submit.Count(),1);
+            FilePickerEncapsulationState state = new FilePickerEncapsulationState();
+            picker.PathChanged.Add(state.Changed);
+            List<FilePickerItem> items = new List<FilePickerItem>();
+            items.Add(new FilePickerItem("folder",Directory.GetCurrentDirectory(),1));
+            Control row = picker.BuildFileRow(0,items);
+            row.TriggerEvent("DoubleClick");
+            Eq("FilePicker row navigation notifies once",state.Paths,1);
+        }
+        witness.Submit=picker.SearchBox().Submit;
+        witness.View=picker.EncapsulationTestViewTree();
+        if (build) {
+            List<FilePickerItem> retainedItems=new List<FilePickerItem>();
+            retainedItems.Add(new FilePickerItem("retained",Directory.GetCurrentDirectory(),1));
+            witness.Row=picker.BuildFileRow(0,retainedItems);
+            witness.Rows=new FilePickerAction(picker,retainedItems).Row;
+        }
+        app.Post(new FilePickerAction(picker).Filter);
+        return witness;
+    }
+
+    static void PickerActions(App app) {
+        FilePicker picker=new FilePicker();
+        FilePickerEncapsulationState state=new FilePickerEncapsulationState();
+        picker.PathChanged.Add(state.Changed);
+        picker.Accepted.Add(state.Accepted);
+        picker.Cancelled.Add(state.Cancelled);
+        string cwd=FilePicker.Normalize(Directory.GetCurrentDirectory());
+        picker.Navigate(cwd);
+        picker.BuildViewTree(app);
+        picker.BuildViewTree(app);
+        Control tree=picker.EncapsulationTestViewTree();
+        Control header=tree.ChildAt(0);
+        Control footer=tree.ChildAt(2);
+        Input path=(Input)header.ChildAt(2);
+        Input name=(Input)footer.ChildAt(1);
+        Control accept=footer.ChildAt(footer.ChildCount()-2);
+        Control cancel=footer.ChildAt(footer.ChildCount()-1);
+        Eq("FilePicker path Submit wired once",path.Submit.Count(),1);
+        Eq("FilePicker name Submit wired once",name.Submit.Count(),1);
+        Eq("FilePicker accept wired once",accept.Click.Count(),1);
+        Eq("FilePicker cancel wired once",cancel.Click.Count(),1);
+        int paths=state.Paths;
+        header.ChildAt(0).Click.Raise();
+        True("FilePicker up uses current path",picker.CurrentDirectory()==FilePicker.ParentDirectory(cwd));
+        path.SetText(cwd); path.Submit.Raise();
+        header.ChildAt(1).Click.Raise();
+        Eq("FilePicker up submit refresh each notify once",state.Paths,paths+3);
+        List<FilePickerItem> quickItems=FilePicker.QuickAccessItems();
+        Control sidebar=tree.ChildAt(1).ChildAt(0);
+        if (quickItems.Count>0) {
+            sidebar.ChildAt(1).Click.Raise();
+            True("FilePicker quick action keeps target path",picker.CurrentDirectory()==FilePicker.Normalize(quickItems[0].path));
+        }
+        List<string> roots=Directory.GetRootsUtf8();
+        if (roots.Count>0) {
+            sidebar.ChildAt(quickItems.Count+2).Click.Raise();
+            True("FilePicker drive action keeps target path",picker.CurrentDirectory()==FilePicker.Normalize(roots[0]));
+        }
+        picker.Navigate(cwd);
+        picker.EncapsulationTestClearDirty(); picker.SearchBox().Submit.Raise();
+        True("FilePicker search invalidates view",picker.EncapsulationTestDirty());
+        Checkbox hidden=(Checkbox)footer.ChildAt(2);
+        hidden.SetChecked(true); hidden.Change.Raise();
+        True("FilePicker hidden change reads checkbox",picker.EncapsulationTestHidden());
+        header.ChildAt(4).Click.Raise(); picker.BuildViewTree(app);
+        tree=picker.EncapsulationTestViewTree();
+        Eq("FilePicker new-folder toggle opens bar",tree.ChildCount(),4);
+        Control newBar=tree.ChildAt(1); Input folder=(Input)newBar.ChildAt(1);
+        Eq("FilePicker folder Submit wired once",folder.Submit.Count(),1);
+        True("FilePicker new-folder default name",folder.GetText()==FilePicker.T("New Folder","新建文件夹"));
+        folder.SetText(""); folder.Submit.Raise(); newBar.ChildAt(2).Click.Raise();
+        True("FilePicker invalid folder submit preserves directory",picker.CurrentDirectory()==cwd);
+        newBar.ChildAt(3).Click.Raise(); picker.BuildViewTree(app);
+        Eq("FilePicker cancel-folder hides bar",picker.EncapsulationTestViewTree().ChildCount(),3);
+        List<FilePickerItem> items=new List<FilePickerItem>();
+        FilePickerItem item=new FilePickerItem("folder",cwd,1); items.Add(item);
+        Control row=picker.BuildFileRow(0,items);
+        item.name="changed"; item.path="missing-folder"; item.kind=0;
+        row.Click.Raise();
+        True("FilePicker folder click retains name path kind snapshot",picker.SelectedPath()==cwd&&picker.EncapsulationTestName()=="folder");
+        paths=state.Paths; row.TriggerEvent("DoubleClick");
+        Eq("FilePicker folder double-click retains directory snapshot",state.Paths,paths+1);
+        string file=FilePicker.Normalize(Environment.ProcessPath);
+        items.Clear(); items.Add(new FilePickerItem("file",file,0));
+        picker.EncapsulationTestConfigure(1,false);
+        row=picker.BuildFileRow(0,items); row.Click.Raise(); row.TriggerEvent("DoubleClick");
+        True("FilePicker open file double-click accepts",picker.SelectedPath()==file&&!picker.IsOpen());
+        Eq("FilePicker open file notifies once",state.Accepts,1);
+        Eq("FilePicker open file result",picker.TakeResult(),1);
+        picker.Navigate(cwd); picker.EncapsulationTestConfigure(2,false);
+        row=picker.BuildFileRow(0,items); row.TriggerEvent("DoubleClick");
+        True("FilePicker save file double-click stays open",picker.IsOpen()&&picker.SelectedPath()=="");
+        picker.EncapsulationTestConfigure(1,true);
+        Control unpicked=picker.BuildFileRow(0,items); unpicked.Click.Raise();
+        Control picked=picker.BuildFileRow(0,items);
+        picker.SelectedPaths().Clear(); picked.Click.Raise();
+        Eq("FilePicker picked snapshot removes without toggling current state",picker.SelectedPaths().Count,0);
+        unpicked.Click.Raise(); unpicked.Click.Raise();
+        Eq("FilePicker unpicked snapshot adds on each old-row action",picker.SelectedPaths().Count,2);
+        accept.Click.Raise();
+        Eq("FilePicker accept button calls original multi acceptance",picker.TakeResult(),1);
+        picker.Navigate(cwd); picker.EncapsulationTestConfigure(0,false); name.Submit.Raise();
+        Eq("FilePicker name Submit accepts folder",picker.TakeResult(),1);
+        picker.EncapsulationTestConfigure(0,false); cancel.Click.Raise();
+        Eq("FilePicker cancel button calls close",picker.TakeResult(),2);
+        Eq("FilePicker accept callbacks notify once per acceptance",state.Accepts,3);
+        Eq("FilePicker cancel callback notifies once",state.Cancels,1);
+        True("FilePicker cancel clears selected path",picker.SelectedPath()=="");
+    }
+
     public static void Main() {
         App app = new App("encap_test", 800, 600);
 
@@ -47,9 +194,6 @@ class ComponentAppEncapsulationTest {
         True("root IsHovered() returns false", !root.IsHovered());
         True("root IsPressed() returns false", !root.IsPressed());
         True("root IsActive() returns false", !root.IsActive());
-        True("root WasClicked() returns false", !root.WasClicked());
-        True("root IsRightClicked() returns false", !root.IsRightClicked());
-        True("root IsDoubleClicked() returns false", !root.IsDoubleClicked());
         root.Focus();
         root.Blur();
 
@@ -230,12 +374,14 @@ class ComponentAppEncapsulationTest {
         ch.SetTheme("dark");
         True("ch.GetOption() != null", ch.GetOption() != null);
 
-        // 13. Transfer 无参 ComputeMetrics 与 Render 测试
+        // 13. Transfer 是宿主树中的 retained 控件，由父树测量与布局。
         Transfer<string> tr = new Transfer<string>();
         root.Add(tr);
         True("tr has App", tr.App != null);
         tr.ComputeMetrics();
-        tr.Render(0, 0, 400, 300);
+        tr.MeasureTree(app);
+        tr.Arrange(0, 0, 400, 300);
+        True("tr retained layout", tr.bw == 400 && tr.bh == 300);
 
         // 14. DynamicTags 无参 FinishEdit 测试
         DynamicTags dt = new DynamicTags();
@@ -264,8 +410,10 @@ class ComponentAppEncapsulationTest {
         Layer.Notify("test notice default");
         Layer.Tips(10, 20, "hover tip");
         Layer.Tips("hover tip 2", 30, 40);
-        int modalHit = Layer.Modal(400, 300, "Modal Title");
-        True("Layer.Modal completes", modalHit >= 0);
+        LayerState modal = LayerState.Alert("Modal Title", "Modal Body", 0);
+        modal.Open(app);
+        True("retained Layer modal mounts overlay", app.overlayHost.ActiveRoot() != null);
+        modal.Close(app);
 
         // LayerState 面向对象原生生命周期与层级判定测试
         LayerState ls = LayerState.Alert("Test Alert", "Alert Body", 0);
@@ -304,13 +452,12 @@ class ComponentAppEncapsulationTest {
         True("opt.Clone() deep copies tree", optClone != null && optClone.title == "Main Chart" && optClone.series.Count == 1);
         True("optClone deep copied axis", optClone.xAxes.Count == 1 && optClone.xAxes[0].title == "X Axis");
 
-        // 19. Ui 无参交互门面与自动 App 帧上下文测试
-        True("Ui.Clicked(0) returns false without crash", !Ui.Clicked(0));
-        True("Ui.Hovered(0) returns false without crash", !Ui.Hovered(0));
-        True("Ui.Pressed(0) returns false without crash", !Ui.Pressed(0));
-        True("Ui.Active(0) returns false without crash", !Ui.Active(0));
-        True("Ui.Focused(0) returns false without crash", !Ui.Focused(0));
-        True("Ui.Over(0, 0, 10, 10) safe", !Ui.Over(0, 0, 10, 10));
+        app.focus.ClearFocus();
+        // 19. Unmounted retained controls have no input state.
+        Control unmounted = new Control();
+        True("unmounted control is not hovered", !unmounted.IsHovered());
+        True("unmounted control is not pressed", !unmounted.IsPressed());
+        True("unmounted control is not focused", !unmounted.IsFocused());
 
         // 20. UiRole / UiState 标准 PascalCase 常量与 UiElement 语义化实例方法
         Eq("UiRole.PushButton constant", UiRole.PushButton, 0x2B);
@@ -401,6 +548,17 @@ class ComponentAppEncapsulationTest {
         True("gv.CardWidth(1000) without App computes valid card width", gv.CardWidth(1000) > 0);
         True("gv.CardHeight() without App computes valid card height", gv.CardHeight() > 0);
 
+        FilePickerEncapsulationWitness plainPicker=PickerLifetime(app,false);
+        FilePickerEncapsulationWitness builtPicker=PickerLifetime(app,true);
+        True("FilePicker constructor callbacks release weak owner",plainPicker.Picker==null);
+        True("FilePicker repeated view rebuild releases weak owner",builtPicker.Picker==null);
+        plainPicker.Submit.Raise(); builtPicker.Submit.Raise();
+        builtPicker.Row.Click.Raise(); builtPicker.Row.TriggerEvent("DoubleClick");
+        Control expiredRow=builtPicker.Rows(0);
+        Eq("FilePicker expired row factory returns empty control",expiredRow.ChildCount(),0);
+        app.DrainPosts();
+        True("FilePicker retained and queued actions leave owner released",plainPicker.Picker==null&&builtPicker.Picker==null);
+        PickerActions(app);
         FilePicker fp = new FilePicker();
         True("fp.Inside(1000, 1000, 10, 10) safe out of bounds", !fp.Inside(1000, 1000, 10, 10));
         True("fp.Clicked(0, 0, 10, 10) safe without App", !fp.Clicked(0, 0, 10, 10));
@@ -421,24 +579,28 @@ class ComponentAppEncapsulationTest {
         True("popCtrl.BuildDefaultPopup() returns null safe", popCtrl.BuildDefaultPopup() == null);
 
         PopupTrigger popTrig = new PopupTrigger();
-        popTrig.PaintTrigger(0, 0, 100, 30);
+        True("PopupTrigger declares retained keyboard focus", (popTrig.InputFocusCapabilities() & 1) != 0);
 
         RichText rt = new RichText("Hello [color=red]World[/color]");
         rt.RebuildLayout(300, 14);
         True("rt.RebuildLayout() computes rowH", rt.RowHeight() > 0);
 
-        ScrollView sv = new ScrollView();
-        Rect svRect = new Rect(0, 0, 100, 200);
-        int svOff = sv.Begin(svRect, 500);
-        Eq("sv.Begin() returns initial offset 0", svOff, 0);
-        sv.End(svRect);
+        ScrollColumn scroll = new ScrollColumn();
+        Label scrollBody = new Label("Retained scroll body");
+        scrollBody.Prefer(100, 500);
+        scroll.Add(scrollBody);
+        root.Add(scroll);
+        scroll.MeasureTree(app, 100);
+        scroll.Arrange(0, 0, 100, 200);
+        Eq("ScrollColumn starts at offset zero", scroll.ScrollTop(), 0);
+        Eq("ScrollColumn retains its real child", scroll.ChildCount(), 1);
 
         SelectBox sb = new SelectBox();
         Eq("sb.FilterBarH() when filterable=false is 0", sb.FilterBarH(), 0);
-        sb.PaintHead(0, 0, 100, 32);
+        True("SelectBox declares retained keyboard focus", (sb.InputFocusCapabilities() & 1) != 0);
 
         ListView lv = new ListView();
-        True("lv.RowInteract() returns valid hit id", lv.RowInteract(0, 0, 0, 100, 30) > 0);
+        True("lv participates in the current input tree", root.ContainsInputControl(lv));
         lv.PaintEmpty();
 
         TreeView tv = new TreeView();
@@ -526,7 +688,6 @@ class ComponentAppEncapsulationTest {
         Eq("wnd.GetText() on 0 handle returns empty", wnd.GetText() == "" ? 1 : 0, 1);
 
         Control stateCtrl = new Control();
-        True("stateCtrl.IsClicked() safe without crash", !stateCtrl.IsClicked());
         True("stateCtrl.IsFocused() safe without crash", !stateCtrl.IsFocused());
         True("stateCtrl.IsActive() safe without crash", !stateCtrl.IsActive());
 

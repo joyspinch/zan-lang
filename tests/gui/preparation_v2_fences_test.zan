@@ -1,0 +1,309 @@
+using System;
+using Gui;
+namespace Gui;
+
+// Default-host preparation and callback invalidation regressions.
+internal class V2Layout : AppHostLayout {
+    public int layouts;
+    internal override bool SyncLayout(App app, bool forInput) { layouts = layouts + 1; return true; }
+}
+
+class V2FenceParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public AppLoopRegistration ticket;
+    public int mode;
+    public int inputs;
+    public int paints;
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+    void Mutate(App app) {
+        if (mode == 1) { ticket.Invalidate(); }
+        if (mode == 2) { ticket.generation = ticket.generation + 1; }
+        if (mode == 3) { ticket.participant = new V2FenceParticipant(); }
+        if (mode == 4) {
+            AppLoopRegistration shadow = app.RegisterLoopParticipant(app, new V2Layout());
+            shadow.Invalidate();
+        }
+    }
+    public void BeforeInput(App app, int kind) { inputs = inputs + 1; Mutate(app); }
+    public void BeforePaint(App app, int frame) { paints = paints + 1; Mutate(app); }
+}
+
+class V2PaintLeaf : Control {
+    public AppLoopRegistration retire;
+    public int measures;
+    public int paints;
+    public V2PaintLeaf() : base("v2PaintLeaf") { }
+    public override void OnMeasure(App app) { measures = measures + 1; base.OnMeasure(app); }
+    public override void OnPaint(App app) {
+        paints = paints + 1;
+        if (retire != null) { retire.Invalidate(); }
+    }
+}
+
+class V2SnapshotForm : Form {
+    public V2SnapshotForm(App a) : base() { this.InitControl("v3SnapshotForm", 5); this.app = a; }
+    public void CheckPrepared(V2PaintLeaf leaf) {
+        App a = this.app;
+        this.Add(leaf); leaf.Grow();
+        this.RunScoped(() => {
+            int before = leaf.measures;
+            a.BeginOffscreenFrame();
+            PreparationV2FencesTest.Check(a.PrepareStandardHostFrame(), "default Form prepares");
+            int measured = leaf.measures;
+            PreparationV2FencesTest.Check(measured > before, "layout happened before paint");
+            this.RenderPreparedFrame(a);
+            PreparationV2FencesTest.Check(leaf.measures == measured && leaf.paints == 1,
+            "prepared Form consumption adds no layout");
+            a.EndOffscreenFrame();
+        });
+        int snapshotBefore = leaf.measures;
+        this.CaptureSnapshot();
+        PreparationV2FencesTest.Check(leaf.measures > snapshotBefore && leaf.paints == 2,
+        "snapshot uses the same prepared Form pipeline");
+    }
+}
+
+class V2LayoutEvents {
+    public weak App Host;
+    public weak Control Owner;
+    public int Shows;
+    public int Hides;
+    public int Resizes;
+    public int Mode;
+    public weak ControlInputHost Borrowed;
+    public bool RebindOnHide;
+    public void Show() { Shows = Shows + 1; }
+    public void Hide() {
+        Hides = Hides + 1;
+        ControlInputHost borrowed = Borrowed;
+        App host = Host;
+        if (RebindOnHide && borrowed != null && host != null) {
+            RebindOnHide = false;
+            borrowed.Bind(host);
+        }
+    }
+    public void Resize() {
+        Resizes = Resizes + 1;
+        App host = Host;
+        Control owner = Owner;
+        int mode = Mode; Mode = 0;
+        if (host == null || owner == null) { return; }
+        if (mode == 1 && owner.parent != null) { owner.parent.Remove(owner); }
+        if (mode == 2) { host.SetRootControl(new Control("replacement")); }
+        if (mode == 3) {
+            Control root = host.rootControl;
+            host.SetRootControl(null);
+            host.SetRootControl(root);
+        }
+        if (mode == 4) { host.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0); }
+        ControlInputHost borrowed = Borrowed;
+        if (mode == 5 && borrowed != null) { borrowed.Hide(); }
+        if (mode == 6 && borrowed != null) { borrowed.Detach(); }
+    }
+    public void Bind(App host, Control owner) {
+        Host = host; Owner = owner;
+        owner.Show.Add(this.Show); owner.Hide.Add(this.Hide); owner.Resize.Add(this.Resize);
+    }
+}
+
+class V2LifetimeWatch {
+    public weak App Host;
+    public weak Control Tree;
+    public weak ControlInputHost Borrowed;
+    public weak V2LayoutEvents Events;
+}
+
+class PreparationV2FencesTest {
+    public static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static void Fence(int mode, bool paint) {
+        App a = App.CreateOffscreen("v2 fence", 160, 100);
+        V2Layout layout = new V2Layout();
+        AppLoopRegistration host = a.RegisterLoopParticipant(a, layout);
+        V2FenceParticipant subject = new V2FenceParticipant(); subject.mode = mode;
+        subject.ticket = a.RegisterLoopParticipant(a, subject);
+        V2FenceParticipant tail = new V2FenceParticipant();
+        AppLoopRegistration tailTicket = a.RegisterLoopParticipant(a, tail);
+        if (paint) {
+            a.BeginOffscreenFrame();
+            Check(!a.PrepareStandardHostFrame(), "mutated paint callback abandons frame");
+            Check(tail.paints == 0 && a.preparationFrameAborted && !a.offscreenFrameActive,
+            "no stale paint participant tail");
+        } else {
+            a.window.SetLocalEvent(2, 10, 10, 0, 0, 0, 0);
+            Check(!a.PrepareInputParticipants(2, a.window.EventSeq()), "mutated input callback abandons event");
+            Check(tail.inputs == 0, "no stale input participant tail");
+        }
+        subject.ticket.Invalidate(); tailTicket.Invalidate(); host.Invalidate();
+        a.StopLoop(); a.canvas.Destroy();
+    }
+    static void LastCallbackAndPreparedGeneration() {
+        App a = App.CreateOffscreen("last callback", 160, 100);
+        AppLoopRegistration host = a.RegisterLoopParticipant(a, new V2Layout());
+        V2FenceParticipant subject = new V2FenceParticipant();
+        subject.ticket = a.RegisterLoopParticipant(a, subject); subject.mode = 1;
+        a.BeginOffscreenFrame();
+        Check(!a.PrepareStandardHostFrame(), "last callback self retirement is checked immediately");
+        subject.mode = 0; subject.ticket = a.RegisterLoopParticipant(a, subject);
+        a.BeginOffscreenFrame();
+        Check(a.PrepareStandardHostFrame() && a.HostLayoutPrepared(host), "fresh host is prepared");
+        host.generation = host.generation + 1;
+        Check(!a.HostLayoutPrepared(host) && !a.ContinuePreparedFrame(), "prepared cache includes host generation");
+        subject.ticket.Invalidate(); host.Invalidate(); a.StopLoop(); a.canvas.Destroy();
+    }
+    static void ChildPaintRetirement() {
+        App a = App.CreateOffscreen("child paint retirement", 160, 100);
+        ChildWindow child = new ChildWindow(); child.host = a; child.open = true;
+        V2PaintLeaf leaf = new V2PaintLeaf(); leaf.Grow();
+        Control tree = new Control("v2ChildRoot"); tree.Add(leaf);
+        child.SetView(tree, null); child.EnsureHostLayoutRegistration();
+        leaf.retire = child.hostLayoutRegistration;
+        child.RenderContent();
+        Check(leaf.paints == 1 && a.preparationFrameAborted && !a.offscreenFrameActive,
+        "child RenderTree retirement prevents Chrome/Present stale tail");
+        child.Teardown();
+    }
+    static void SnapshotKeepsInputOwner() {
+        App a = App.CreateOffscreen("snapshot input owner", 240, 160);
+        Control input = new Control("realInput");
+        Control endpoint = new Control("realEndpoint"); input.Add(endpoint);
+        a.SetRootControl(input);
+        input.MeasureTree(a); input.Arrange(0, 0, 240, 160);
+        endpoint.Arrange(8, 8, 40, 24);
+        a.focus.SetFocused(endpoint.WidgetId(), endpoint);
+        a.CapturePointer(endpoint, true);
+        Control popup = new Control("realPopup");
+        a.overlayHost.Show(a, endpoint, popup);
+        Control activePopup = a.overlayHost.ActiveRoot();
+        Check(activePopup == popup, "snapshot premise has a real active popup");
+        Check(a.GetCapturedPointer() == endpoint && a.focus.focusedControl == endpoint, "non-null input endpoints");
+        int overlayRevision = a.overlayHost.RetirementRevision();
+        int rootGeneration = a.inputRootGeneration;
+        Control capture = a.GetCapturedPointer();
+        Control focused = a.focus.focusedControl;
+        V2SnapshotForm form = new V2SnapshotForm(a);
+        V2PaintLeaf leaf = new V2PaintLeaf(); form.Add(leaf); leaf.Grow();
+        V2LayoutEvents events = new V2LayoutEvents(); events.Bind(a, leaf);
+        form.CaptureSnapshot();
+        Check(events.Shows == 0 && events.Hides == 0 && events.Resizes == 0,
+        "snapshot leaves real lifecycle state untouched");
+        Check(a.rootControl == input && a.inputRootGeneration == rootGeneration,
+        "snapshot did not install itself as real input root");
+        Check(a.GetCapturedPointer() == capture && a.focus.focusedControl == focused,
+        "snapshot did not retire capture or focus");
+        Check(a.overlayHost.ActiveRoot() == activePopup
+        && a.overlayHost.RetirementRevision() == overlayRevision,
+        "snapshot did not retire real overlay");
+        Check(leaf.measures > 0 && leaf.paints == 1, "non-input-owner snapshot still lays out and paints");
+        a.overlayHost.Dismiss(); a.StopLoop(); a.SetRootControl(null); a.canvas.Destroy();
+    }
+    static bool PrepareLifecycle(App app) {
+        return app.PrepareInputParticipants(1, app.window.EventSeq());
+    }
+    static void LayoutNotifications() {
+        App app = App.CreateOffscreen("layout notifications", 240, 160);
+        Control fallback = new Control("fallback");
+        V2PaintLeaf leaf = new V2PaintLeaf();
+        V2LayoutEvents events = new V2LayoutEvents(); events.Bind(app, leaf);
+        V2LayoutEvents background = new V2LayoutEvents(); background.Bind(app, fallback);
+        app.SetRootControl(fallback); fallback.UseApp(app);
+        fallback.MeasureTree(app); fallback.Arrange(0, 0, 240, 160);
+        leaf.UseApp(app); leaf.MeasureTree(app); leaf.Arrange(10, 10, 80, 40);
+        ControlInputHost borrowed = new ControlInputHost(leaf); borrowed.Bind(app);
+        Check(PrepareLifecycle(app), "borrowed first layout prepares");
+        Check(events.Shows == 0 && events.Hides == 0 && events.Resizes == 0,
+        "first layout establishes lifecycle baseline without callbacks");
+        leaf.SetShown(false);
+        Check(PrepareLifecycle(app) && events.Hides == 1, "borrowed tree receives Hide before Paint");
+        leaf.SetShown(true); leaf.Arrange(10, 10, 100, 50);
+        Check(PrepareLifecycle(app) && events.Shows == 1 && events.Resizes == 1,
+        "borrowed tree receives Show and Resize during preparation");
+        app.BeginOffscreenFrame(); leaf.RenderTree(app); leaf.RenderTree(app); app.EndOffscreenFrame();
+        Check(events.Shows == 1 && events.Hides == 1 && events.Resizes == 1 && leaf.paints == 2,
+        "repeated Paint does not replay layout notifications");
+        Check(PrepareLifecycle(app) && events.Resizes == 1, "unchanged preparation does not repeat Resize");
+        borrowed.Hide();
+        Check(events.Hides == 2 && background.Hides == 0 && app.rootControl == fallback,
+        "host retirement hides only its borrowed tree before unlinking");
+        borrowed.Bind(app);
+        Check(PrepareLifecycle(app) && events.Shows == 2 && background.Shows == 0,
+        "rebinding shows the same borrowed tree without replaying fallback lifecycle");
+        borrowed.Hide(); app.SetRootControl(null); app.StopLoop(); app.DrainPosts(); app.canvas.Destroy();
+    }
+    static void LayoutCallbackFence(int mode) {
+        App app = App.CreateOffscreen("layout callback fence", 240, 160);
+        Control root = new Control("layout root");
+        Control first = new Control("first"); Control second = new Control("second");
+        root.Add(first); root.Add(second); root.UseApp(app); app.SetRootControl(root);
+        root.MeasureTree(app); root.Arrange(0, 0, 240, 160);
+        first.Arrange(0, 0, 80, 40); second.Arrange(0, 50, 80, 40);
+        V2LayoutEvents head = new V2LayoutEvents(); head.Bind(app, first);
+        V2LayoutEvents tail = new V2LayoutEvents(); tail.Bind(app, second);
+        Check(PrepareLifecycle(app), "callback fixture establishes baseline");
+        first.Arrange(0, 0, 100, 40); second.Arrange(0, 50, 100, 40); head.Mode = mode;
+        bool complete = PrepareLifecycle(app);
+        Check(head.Resizes == 1, "Resize callback executes once");
+        if (mode == 1) {
+            Check(complete && first.parent == null && tail.Resizes == 1,
+            "self-removal retires only that subtree and preserves sibling notification");
+        } else {
+            Check(!complete && tail.Resizes == 0, "root change or nested input retires the old traversal tail");
+        }
+        app.SetRootControl(null); app.StopLoop(); app.DrainPosts(); app.canvas.Destroy();
+    }
+    static void BorrowedLifetime(V2LifetimeWatch watch) {
+        App app = App.CreateOffscreen("layout weak lifetime", 160, 100);
+        Control tree = new Control("borrowed lifetime");
+        ControlInputHost borrowed = new ControlInputHost(tree);
+        V2LayoutEvents events = new V2LayoutEvents(); events.Bind(app, tree); events.Borrowed = borrowed;
+        watch.Host = app; watch.Tree = tree; watch.Borrowed = borrowed; watch.Events = events;
+        tree.UseApp(app); tree.MeasureTree(app); tree.Arrange(0, 0, 100, 60);
+        borrowed.Bind(app); Check(PrepareLifecycle(app), "lifetime fixture prepares borrowed tree");
+        events.Mode = 5; tree.Arrange(0, 0, 120, 60);
+        Check(!PrepareLifecycle(app) && events.Hides == 1 && app.rootControl == null,
+        "lifetime fixture retires through real Resize callback");
+        app.StopLoop(); app.DrainPosts(); app.canvas.Destroy();
+    }
+    static void BorrowedRetirement(int mode, bool rebind) {
+        App app = App.CreateOffscreen("layout retirement", 240, 160);
+        Control fallback = new Control("world"); app.SetRootControl(fallback);
+        Control tree = new Control("borrowed"); Control child = new Control("child"); tree.Add(child);
+        tree.UseApp(app); tree.MeasureTree(app); tree.Arrange(0, 0, 100, 60);
+        child.Arrange(0, 0, 80, 40);
+        ControlInputHost borrowed = new ControlInputHost(tree); borrowed.Bind(app);
+        V2LayoutEvents head = new V2LayoutEvents(); head.Bind(app, tree); head.Borrowed = borrowed;
+        V2LayoutEvents tail = new V2LayoutEvents(); tail.Bind(app, child);
+        Check(PrepareLifecycle(app), "retirement fixture establishes baseline");
+        head.Mode = mode; head.RebindOnHide = rebind;
+        tree.Arrange(0, 0, 120, 60); child.Arrange(0, 0, 100, 40);
+        Check(!PrepareLifecycle(app) && head.Resizes == 1 && tail.Resizes == 0,
+        "retiring borrowed host stops the old descendant callbacks");
+        Check(head.Hides == 1, "retirement during Resize delivers deferred Hide");
+        if (rebind) {
+            Check(app.rootControl == borrowed && PrepareLifecycle(app) && head.Shows == 1,
+            "Hide callback rebind survives old teardown and prepares the same instance");
+        } else {
+            Check(app.rootControl == fallback && tail.Hides == 1,
+            "retirement during callback unlinks host and hides its descendants");
+        }
+        borrowed.Hide(); app.SetRootControl(null); app.StopLoop(); app.DrainPosts(); app.canvas.Destroy();
+    }
+    static void Main() {
+        // Keep the pre-existing frameApp ownership contract separate from fixture Apps.
+        App sentinel = App.CreateOffscreen("v2 sentinel", 1, 1);
+        for (int mode = 1; mode <= 4; mode = mode + 1) { Fence(mode, false); Fence(mode, true); }
+        LastCallbackAndPreparedGeneration();
+        ChildPaintRetirement();
+        App a = App.CreateOffscreen("form compatible", 160, 100);
+        V2SnapshotForm form = new V2SnapshotForm(a); form.CheckPrepared(new V2PaintLeaf());
+        a.StopLoop(); a.SetRootControl(null); a.canvas.Destroy();
+        SnapshotKeepsInputOwner();
+        LayoutNotifications();
+        for (int mode = 1; mode <= 4; mode = mode + 1) { LayoutCallbackFence(mode); }
+        BorrowedRetirement(5, false); BorrowedRetirement(6, false); BorrowedRetirement(5, true);
+        V2LifetimeWatch lifetime = new V2LifetimeWatch(); BorrowedLifetime(lifetime);
+        Check(lifetime.Host == null && lifetime.Tree == null && lifetime.Borrowed == null && lifetime.Events == null,
+        "retired layout traversal releases App tree host and event relay");
+        sentinel.canvas.Destroy();
+        Console.WriteLine("preparation-v2-fences:ok");
+    }
+}

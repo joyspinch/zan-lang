@@ -1,0 +1,241 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+namespace Gui;
+
+// UNCOMPILED counterexamples for the ALTERNATIVE root-boundary helper.
+// Compile with reviewed Core bool/consumer fences and alternative helper INSTEAD
+// of App.PreparationParticipants.zan. No BeginFrame/Paint is used anywhere.
+class RootInstallProbe : Control {
+    public int downs; public int ups; public int clicks; public int cancels;
+    public bool replaceOnCancel;
+    public weak RootInstallParticipant coordinator;
+    public Control cancelReplacement;
+    public weak InputRootAdapter contentAdapter;
+    public bool replaceContentOnCancel;
+    public bool contentCommit;
+    public RootInstallProbe() { this.InitControl("rootInstallProbe", 0); }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return x >= bx && x < bx + bw && y >= by && y < by + bh ? this : null;
+    }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (app == null) { throw new Exception("root-install Down endpoint has no App"); }
+        downs = downs + 1; app.CapturePointer(this, true); e.Handle();
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (app == null) { throw new Exception("root-install Up endpoint has no App"); }
+        ups = ups + 1; app.ReleasePointerCapture();
+    }
+    public override void OnClick(RoutedEventArgs e) { clicks = clicks + 1; e.Handle(); }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        cancels = cancels + 1;
+        if (replaceContentOnCancel) {
+            replaceContentOnCancel = false;
+            InputRootAdapter adapter = contentAdapter;
+            if (adapter == null) { throw new Exception("content replacement adapter expired"); }
+            contentCommit = adapter.SetContentRoot(cancelReplacement);
+        }
+        if (replaceOnCancel) {
+            replaceOnCancel = false;
+            RootInstallParticipant owner = coordinator;
+            // Legal same-EventSeq replacement, no new input. Fully prepare C
+            // immediately so the interrupted B Sync cannot publish stale state.
+            owner.Select(cancelReplacement); owner.Sync(this.FindApp());
+        }
+    }
+}
+class RootInstallAdapter : InputRootAdapter {
+    public Control target;
+    public RootInstallAdapter() : base("rootInstallAdapter") { }
+    public override bool ContainsInputControl(Control control) {
+        return control == this || target != null && target.ContainsInputControl(control)
+            || content != null && content.ContainsInputControl(control);
+    }
+    public override bool ContainsHostedControl(Control control) {
+        return control == this || target != null && target.ContainsHostedControl(control)
+            || content != null && content.ContainsHostedControl(control);
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        Control hit = target != null ? target.HitTest(x, y, pointerType, excludedSubtrees) : null;
+        return hit != null ? hit : (content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null);
+    }
+}
+class RootInstallParticipant : AppLoopParticipant, AppPreparationParticipant {
+    public weak App owner;
+    public Control selected;
+    public Control ready;
+    public RootInstallAdapter adapter;
+    public int revision;
+    public int staleTails;
+    public void Select(Control next) { selected = next; revision = revision + 1; }
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+    public void BeforePaint(App app, int frameSequence) { }
+    public void BeforeInput(App app, int kind) { this.Sync(app); }
+    bool Current(App app, Control target, int version, int phase, long sequence) {
+        return owner == app && app.isRunning && selected == target && revision == version
+            && app.inputPreparationTicket == phase && app.window.EventSeq() == sequence;
+    }
+    public void Sync(App app) {
+        if (owner != app || selected == null) { return; }
+        Control next = selected; int version = revision;
+        int phase = app.inputPreparationTicket; long sequence = app.window.EventSeq();
+        if (ready == next && (adapter != null ? app.rootControl == adapter
+            && adapter.target == next : app.rootControl == next)) { return; }
+        // Fixtures are preconstructed; production construction uses the same
+        // guards after each callback-bearing step. This phase has no series scan.
+        next.UseApp(app);
+        if (!Current(app, next, version, phase, sequence)) { staleTails = staleTails + 1; return; }
+        next.MeasureTree(app);
+        if (!Current(app, next, version, phase,sequence)) { staleTails = staleTails + 1; return; }
+        next.Arrange(10, 10, 280, 140);
+        if (!Current(app, next, version, phase, sequence)) { staleTails = staleTails + 1; return; }
+        if (adapter != null) {
+            adapter.target = next; adapter.Bind(app);
+        } else { app.SetRootControl(next); }
+        if (!Current(app, next, version, phase, sequence)) { staleTails = staleTails + 1; return; }
+        bool installed = adapter != null ? app.rootControl == adapter && adapter.target == next
+            && adapter.ContainsInputControl(next) : app.rootControl == next;
+        if (!installed) { staleTails = staleTails + 1; return; }
+        ready = next;
+    }
+}
+class PreparationRootInstallInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static RootInstallParticipant Participant(App app, Control selected) {
+        RootInstallParticipant participant = new RootInstallParticipant();
+        participant.owner = app; participant.Select(selected); return participant;
+    }
+    static void Input(App app, int kind) { app.ProcessOffscreenInput(kind, 30, 30, 0, 0, 0, 0); }
+    static void FirstBind() {
+        App app = App.CreateOffscreen("first adapter bind", 320, 180);
+        RootInstallProbe target = new RootInstallProbe();
+        RootInstallParticipant participant = Participant(app, target);
+        participant.adapter = new RootInstallAdapter();
+        // Stable App weak owner already exists; selected host is NOT the weak
+        // registration owner, so its replacement cannot retire the coordinator.
+        AppLoopRegistration registration = app.RegisterLoopParticipant(app, participant);
+        Check(app.rootControl == null && participant.ready == null, "fixture has no root or Paint");
+        int generation = app.inputRootGeneration;
+        Input(app, 2);
+        Check(app.inputRootGeneration != generation && app.rootControl == participant.adapter,
+            "BeforeInput Bind really installs first root");
+        Check(target.downs == 1 && participant.ready == target && app.GetCapturedPointer() == target,
+            "SAME original first Down routes once to prepared first host");
+        bool capturedBeforeUp = app.GetCapturedPointer() == target;
+        bool downTargetBeforeUp = app.pointerDownTarget == target;
+        int gestureBeforeUp = app.pointerGestureTicket;
+        Input(app, 3);
+        Check(target.ups == 1 && target.clicks == 1, "first pair completes normally"
+            + " downs=" + Convert.ToString(target.downs)
+            + " ups=" + Convert.ToString(target.ups)
+            + " clicks=" + Convert.ToString(target.clicks)
+            + " cancels=" + Convert.ToString(target.cancels)
+            + " target=" + Convert.ToString(target.bx) + "," + Convert.ToString(target.by)
+            + "," + Convert.ToString(target.bw) + "," + Convert.ToString(target.bh)
+            + " adapter=" + Convert.ToString(participant.adapter.bx) + "," + Convert.ToString(participant.adapter.by)
+            + "," + Convert.ToString(participant.adapter.bw) + "," + Convert.ToString(participant.adapter.bh)
+            + " capturedBeforeUp=" + (capturedBeforeUp ? "true" : "false")
+            + " downTargetBeforeUp=" + (downTargetBeforeUp ? "true" : "false")
+            + " captureAfterUp=" + (app.GetCapturedPointer() == target ? "target" : (app.GetCapturedPointer() == null ? "null" : "other"))
+            + " focus=" + (app.focus.focusedControl == target ? "target" : (app.focus.focusedControl == null ? "null" : "other"))
+            + " focusId=" + Convert.ToString(app.focus.focusedId)
+            + " gesture=" + Convert.ToString(gestureBeforeUp) + "->" + Convert.ToString(app.pointerGestureTicket)
+            + " root=" + (app.rootControl == participant.adapter ? "adapter" : "other")
+            + " ready=" + (participant.ready == target ? "target" : "other")
+            + " contains=" + (participant.adapter.ContainsInputControl(target) ? "true" : "false")
+            + " staleTails=" + Convert.ToString(participant.staleTails)
+            + " seq=" + Convert.ToString(app.window.EventSeq())
+            + " kind=" + Convert.ToString(app.window.EventKind())
+            + " handled=" + (app.routedWindowHandled ? "true" : "false")
+            + " complete=" + (app.routedWindowDispatchComplete ? "true" : "false"));
+        registration.Invalidate(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void ExternalSelection() {
+        App app = App.CreateOffscreen("external selection", 320, 180);
+        RootInstallProbe first = new RootInstallProbe(); RootInstallProbe second = new RootInstallProbe();
+        RootInstallParticipant participant = Participant(app, first);
+        // Registration-time explicit Sync is also supported, without Paint.
+        participant.Sync(app);
+        AppLoopRegistration registration = app.RegisterLoopParticipant(app, participant);
+        participant.Select(second); // authoritative external fact; no Sync yet
+        int generation = app.inputRootGeneration;
+        Input(app, 2);
+        Check(app.inputRootGeneration != generation && app.rootControl == second && participant.ready == second,
+            "selection update prepares/installs owner inside this event");
+        Check(first.downs == 0 && second.downs == 1 && app.GetCapturedPointer() == second,
+            "original Down reaches new owner once, never discarded or sent to old owner");
+        Input(app, 3); Check(second.clicks == 1, "external selection first pair completes");
+        registration.Invalidate(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void SameEventReplacement() {
+        App app = App.CreateOffscreen("same event replacement", 320, 180);
+        RootInstallProbe first = new RootInstallProbe();
+        RootInstallProbe pending = new RootInstallProbe(); RootInstallProbe replacement = new RootInstallProbe();
+        RootInstallParticipant participant = Participant(app, first); participant.Sync(app);
+        AppLoopRegistration registration = app.RegisterLoopParticipant(app, participant);
+        Input(app, 2); Check(app.GetCapturedPointer() == first, "old owner captured");
+        first.coordinator = participant; first.cancelReplacement = replacement; first.replaceOnCancel = true;
+        participant.Select(pending);
+        // SetRootControl(B) cancels A; A's callback replaces selection/root with
+        // fully synchronized C at the SAME sequence. B must not publish ready.
+        Input(app, 2);
+        Check(first.cancels == 1 && pending.downs == 0 && replacement.downs == 1,
+            "same event replacement wins and original current Down routes C");
+        Check(participant.staleTails == 1 && participant.ready == replacement
+            && app.rootControl == replacement && app.GetCapturedPointer() == replacement,
+            "interrupted B tail cannot overwrite newer C readiness/root/capture");
+        Input(app, 3); Check(replacement.clicks == 1, "replacement receives matching Up and Click");
+        registration.Invalidate(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+    static void AdapterContentCommit() {
+        App app = App.CreateOffscreen("active adapter content generation", 320, 180);
+        RootInstallAdapter adapter = new RootInstallAdapter();
+        RootInstallProbe first = new RootInstallProbe();
+        first.UseApp(app); first.Arrange(10, 10, 280, 140);
+        int unboundGeneration = app.inputRootGeneration;
+        Check(adapter.SetContentRoot(first) && app.inputRootGeneration == unboundGeneration,
+            "unbound adapter content commit does not change App generation");
+        app.SetRootControl(first);
+        adapter.Bind(app);
+        Check(app.rootControl == adapter && adapter.ContainsInputControl(first),
+            "Bind retains the actual first input root as adapter fallback");
+        int activeGeneration = app.inputRootGeneration;
+        Check(adapter.SetContentRoot(first) && app.inputRootGeneration == activeGeneration,
+            "same active content identity does not invalidate generation");
+        Check(!adapter.SetContentRoot(new RootInstallAdapter())
+            && app.inputRootGeneration == activeGeneration,
+            "rejected adapter content does not invalidate generation");
+        Check(!adapter.SetContentRoot(adapter) && app.inputRootGeneration == activeGeneration,
+            "rejected content cycle does not invalidate generation");
+        RootInstallProbe replacement = new RootInstallProbe();
+        replacement.UseApp(app); replacement.Arrange(10, 10, 280, 140);
+        Input(app, 2);
+        Check(app.GetCapturedPointer() == first && first.downs == 1,
+            "active adapter content owns actual Down before root installation");
+        first.contentAdapter = adapter;
+        first.cancelReplacement = replacement;
+        first.replaceContentOnCancel = true;
+        Control rejectedOuterRoot = new Control("older root installation");
+        app.SetRootControl(rejectedOuterRoot);
+        Check(first.cancels == 1 && first.contentCommit
+            && app.rootControl == adapter
+            && adapter.ContainsInputControl(replacement) && !adapter.ContainsInputControl(first),
+            "content commit in retirement callback supersedes older SetRootControl");
+        Check(app.inputRootGeneration == activeGeneration + 2 && app.inputRootChangeTicket == 0,
+            "root attempt and successful content change each advance once without pending ticket");
+        int committedGeneration = app.inputRootGeneration;
+        Check(adapter.SetContentRoot(replacement) && app.inputRootGeneration == committedGeneration,
+            "same committed content remains generation-stable");
+        adapter.Bind(app);
+        Check(app.inputRootGeneration == committedGeneration && app.inputRootChangeTicket == 0,
+            "ordinary rebind cannot revive a superseded root ticket");
+        adapter.Detach(); app.canvas.Destroy();
+    }
+    static void Main() {
+        FirstBind(); ExternalSelection(); SameEventReplacement(); AdapterContentCommit();
+        Console.WriteLine("preparation-root-install-input:ok");
+    }
+}

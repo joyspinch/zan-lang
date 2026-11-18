@@ -25,14 +25,106 @@ public class PropSpec {
     Binding<string> str;
     Binding<int> num;
     Binding<bool> flag;
-    // 针对值具有响应性的控件，用 signal 而非字段：
-    // 写入经由 Set 走，订阅者仍能收到变更事件。
-    SignalString sstr;
-    SignalInt snum;
-    SignalBool sflag;
-    // 写入该属性同时重命名节点时为 true，使设计器
-    // 树跟随标识该控件的文本。
-    bool syncName;
+    // A control schema names its field, without capturing the current Binding.
+    // Editor rows may still hold their own local Binding above.
+    private string member;
+    private int memberKind;
+    private int memberStorage;
+
+    public PropSpec Field(string name, int valueKind) {
+        if (name == null || name == "" || valueKind < 0 || valueKind > 2) {
+            throw new ArgumentException("A property field requires a name and a string, int or bool value kind.");
+        }
+        member = name;
+        memberKind = valueKind;
+        memberStorage = -1;
+        return this;
+    }
+
+    private int Storage(Control owner) {
+        if (memberStorage >= 0) { return memberStorage; }
+        TypeInfo type = owner.GetType();
+        for (int i = 0; i < type.FieldCount; i = i + 1) {
+            if (type.GetFieldName(i) != member) { continue; }
+            string declared = type.GetFieldType(i);
+            string scalar = "string";
+            if (memberKind == 1) { scalar = "int"; }
+            else if (memberKind == 2) { scalar = "bool"; }
+            if (declared == scalar) { memberStorage = 0; return 0; }
+            if (declared == "System.Binding<" + scalar + ">" || declared == "Binding<" + scalar + ">") {
+                memberStorage = 1;
+                return 1;
+            }
+            throw new InvalidOperationException("Property field has an incompatible type: " + member);
+        }
+        throw new InvalidOperationException("Property field does not exist: " + member);
+    }
+
+    public string ReadFrom(Control owner) {
+        if (ExtraAccess) { return owner.GetProp(key); }
+        if (member == "") { return this.Read(); }
+        bool binding = this.Storage(owner) == 1;
+        if (memberKind == 0) {
+            if (!binding) { return owner.GetFieldString(member); }
+            Binding<string> value = (Binding<string>)owner.GetFieldObject(member);
+            return value != null ? value.Get() : "";
+        }
+        if (memberKind == 1) {
+            if (!binding) { return Convert.ToString(owner.GetFieldInt(member)); }
+            Binding<int> value = (Binding<int>)owner.GetFieldObject(member);
+            return Convert.ToString(value != null ? value.Get() : 0);
+        }
+        if (!binding) { return PropSpec.Flag(owner.GetFieldBool(member)); }
+        Binding<bool> value = (Binding<bool>)owner.GetFieldObject(member);
+        return PropSpec.Flag(value != null && value.Get());
+    }
+
+    public void WriteTo(Control owner, string val) {
+        if (ExtraAccess) { owner.SetProp(key, val); return; }
+        if (member == "") { this.Write(val); return; }
+        bool binding = this.Storage(owner) == 1;
+        if (memberKind == 0) {
+            if (!binding) { owner.SetFieldString(member, val); return; }
+            Binding<string> value = (Binding<string>)owner.GetFieldObject(member);
+            if (value != null) { value.Set(val); }
+            else { Binding<string> created = val; owner.SetFieldObject(member, created); }
+            return;
+        }
+        if (memberKind == 1) {
+            if (!this.AcceptNumber(val)) { return; }
+            int number = this.NumberValue(val);
+            if (!binding) { owner.SetFieldInt(member, number); return; }
+            Binding<int> value = (Binding<int>)owner.GetFieldObject(member);
+            if (value != null) { value.Set(number); }
+            else { Binding<int> created = number; owner.SetFieldObject(member, created); }
+            return;
+        }
+        bool flagValue = PropSpec.IsOn(val);
+        if (!binding) { owner.SetFieldBool(member, flagValue); return; }
+        Binding<bool> value = (Binding<bool>)owner.GetFieldObject(member);
+        if (value != null) { value.Set(flagValue); }
+        else { Binding<bool> created = flagValue; owner.SetFieldObject(member, created); }
+    }
+
+    private bool AcceptNumber(string val) {
+        if (kind == 4 || PropSpec.IsIntText(val)) { return true; }
+        if (kind == 3) {
+            for (int i = 0; i < options.Count; i = i + 1) {
+                if (options[i] == val) { return true; }
+            }
+        }
+        return false;
+    }
+
+    private int NumberValue(string val) {
+        if (kind == 4) { return PropSpec.ColorInt(val); }
+        if (kind == 3) {
+            for (int i = 0; i < options.Count; i = i + 1) {
+                if (options[i] == val) { return i; }
+            }
+        }
+        return Convert.ToInt32(val);
+    }
     // 属性的说明文字：在属性面板中悬停该行时以气泡提示展示，
     // 解释这个属性的作用。为空则不显示提示。
     string tip;
@@ -50,6 +142,24 @@ public class PropSpec {
     public bool halfRow;
     // 默认模型属性可有文本/数字两个投影；访问仍由 Control 的虚属性协议完成。
     bool defaultBinding;
+    // Computed projections keep their semantic setter/getter in Control's Extra hooks.
+    // This is descriptor metadata only: never cache an instance Binding globally.
+    public bool ExtraAccess;
+
+    public PropSpec ViaExtra() {
+        ExtraAccess = true;
+        return this;
+    }
+
+    // Resolve aliases against one freshly obtained descriptor list. PropOf keeps
+    // its historical bound-only contract; property dispatch may include Extra projections.
+    public static PropSpec Find(List<PropSpec> specs, string key, bool boundOnly) {
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            PropSpec p = specs[i];
+            if (p.Answers(key) && (p.IsBound() || (!boundOnly && p.ExtraAccess))) { return p; }
+        }
+        return null;
+    }
 
     public PropSpec DefaultBinding() {
         defaultBinding = true;
@@ -59,9 +169,10 @@ public class PropSpec {
     // 编辑器 kind 不等于值类型：枚举可能绑定字符串，也可能绑定数字。
     // 无字段的计算属性沿用声明的 kind。
     public int ValueKind() {
-        if (str != null || sstr != null) { return 0; }
-        if (flag != null || sflag != null) { return 2; }
-        if (num != null || snum != null) { return 1; }
+        if (member != "") { return memberKind; }
+        if (str != null) { return 0; }
+        if (flag != null) { return 2; }
+        if (num != null) { return 1; }
         if (kind == 1 || kind == 4) { return 1; }
         if (kind == 2) { return 2; }
         return 0;
@@ -74,10 +185,9 @@ public class PropSpec {
         kind = kd;
         options = new List<string>();
         str = null;
-        sstr = null;
-        snum = null;
-        sflag = null;
-        syncName = false;
+        member = "";
+        memberKind = 0;
+        memberStorage = -1;
         tip = "";
         step = 1;
         lo = 0;
@@ -108,22 +218,13 @@ public class PropSpec {
         return this;
     }
 
-    // spec 一旦指向字段或 signal 即为 true，这正是
-    // 基类无需控件协助就能服务该属性的原因。
     bool IsBound() {
-        return str != null || num != null || flag != null ||
-               sstr != null || snum != null || sflag != null;
+        return member != "" || str != null || num != null || flag != null;
     }
 
     // 当 `key` 命名该属性（自身键或某个别名）时为 true。
     bool Answers(string k) {
         return key == k || Style.Has(alias, k);
-    }
-
-    // 将此属性标记为同时命名节点的属性。
-    PropSpec AsName() {
-        syncName = true;
-        return this;
     }
 
     // 给属性挂一段说明（返回 this，便于链式调用）。属性面板
@@ -170,9 +271,6 @@ public class PropSpec {
         if (str != null) { return str.Get(); }
         if (num != null) { return Convert.ToString(num.Get()); }
         if (flag != null) { return PropSpec.Flag(flag.Get()); }
-        if (sstr != null) { return sstr.Get(); }
-        if (snum != null) { return Convert.ToString(snum.Get()); }
-        if (sflag != null) { return PropSpec.Flag(sflag.Get()); }
         return "";
     }
 
@@ -182,40 +280,12 @@ public class PropSpec {
     // "vertical")` 写入的是该选项的下标。只认数字序号的话，
     // strtoll 对非数字串静默返回 0，"vertical" 会无声落回第一项。
     void Write(string val) {
-        if (kind == 3 && options.Count > 0) {
-            int oi = 0 - 1;
-            for (int i = 0; i < options.Count; i = i + 1) {
-                if (options[i] == val) { oi = i; break; }
-            }
-            if (oi >= 0) {
-                if (num != null) { num.Set(oi); return; }
-                if (snum != null) { snum.Set(oi); return; }
-                if (str == null && sstr == null) { return; }
-                /* 绑定的是文本时存选项名本身，交给下面的文本写入。 */
-            }
-            /* 没命中选项名（含数字序号、垃圾值）时按整数走原路。 */
-        }
         if (str != null) { str.Set(val); return; }
         if (num != null) {
-            // 颜色属性（kind 4）认两种形态：十进制打包色（Read 的
-            // 形态）与 CSS 颜色文本（设计器取色器写回的 "#rrggbb" /
-            // "#aarrggbb" / "rgba(...)" / 命名色）。只按整数解析的话，
-            // 一条人可读的颜色值会静默落成 0（"没设颜色"）。
-            if (kind == 4) { num.Set(PropSpec.ColorInt(val)); return; }
-            if (PropSpec.IsIntText(val)) {
-                num.Set(Convert.ToInt32(val));
-            }
+            if (this.AcceptNumber(val)) { num.Set(this.NumberValue(val)); }
             return;
         }
-        if (flag != null) { flag.Set(PropSpec.IsOn(val)); return; }
-        if (sstr != null) { sstr.Set(val); return; }
-        if (snum != null) {
-            if (PropSpec.IsIntText(val)) {
-                snum.Set(Convert.ToInt32(val));
-            }
-            return;
-        }
-        if (sflag != null) { sflag.Set(PropSpec.IsOn(val)); }
+        if (flag != null) { flag.Set(PropSpec.IsOn(val)); }
     }
 
     // 颜色属性的文档值 → 打包 0xAARRGGBB。整数字面（历史形态）

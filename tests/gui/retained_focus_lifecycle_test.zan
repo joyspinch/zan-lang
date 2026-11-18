@@ -11,8 +11,8 @@ class FocusBorrowedRoot : InputRootAdapter {
     public override Control FindInputFocus(App app) {
         return content != null ? content.FindInputFocus(app) : null;
     }
-    public override Control HitTest(int x, int y, int pointerType) {
-        return content != null ? content.HitTest(x, y, pointerType) : null;
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        return content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null;
     }
 }
 
@@ -34,6 +34,34 @@ class FocusWeakWitness {
     public weak Control target;
 }
 
+class FocusNotifications {
+    public int gained;
+    public int lost;
+    public weak App app;
+    public weak Control bounce;
+    public weak Control winner;
+    public bool armed;
+    public weak Control batchSibling;
+    public bool batchCommitted;
+    public void Gained() { gained = gained + 1; }
+    public void Lost() {
+        lost = lost + 1;
+        Control sibling = batchSibling;
+        App host = app; Control first = bounce; Control last = winner;
+        if (lost == 2 && sibling != null) {
+            batchCommitted = sibling.parent == null;
+            if (host != null) {
+                host.focus.SetFocused(sibling.WidgetId(), sibling);
+                if (last != null) { host.focus.SetFocused(last.WidgetId(), last); }
+            }
+        }
+        if (!armed || host == null || last == null) { return; }
+        armed = false;
+        if (first != null) { host.focus.SetFocused(first.WidgetId(), first); }
+        host.focus.SetFocused(last.WidgetId(), last);
+    }
+}
+
 class RetainedFocusLifecycleTest {
     static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
     static void Drain(App app) {
@@ -51,10 +79,66 @@ class RetainedFocusLifecycleTest {
         Check(app.focus.IsFocused(control.WidgetId()) && app.focus.focusedControl == control, label);
         Check(app.focus.imeSessionId == (text ? control.WidgetId() : 0 - 1), label + " IME");
     }
-    static void RegisterTemporary(App app, FocusWeakWitness witness) {
-        Input input = new Input("temporary"); input.UseApp(app);
-        app.focus.RegisterFocusable(input.WidgetId(), input);
+    static void RemoveTemporary(App app, Control root, FocusWeakWitness witness) {
+        Input input = new Input("temporary");
+        root.Add(input);
+        input.Focus(app);
+        root.Remove(input);
         witness.target = input;
+    }
+    static void NamedNotifications(App app) {
+        Control root = new Control("named_focus"); root.UseApp(app);
+        Input first = new Input("first"); Input second = new Input("second");
+        Input third = new Input("third");
+        root.Add(first); root.Add(second); root.Add(third);
+        FocusNotifications a = new FocusNotifications();
+        FocusNotifications b = new FocusNotifications();
+        FocusNotifications c = new FocusNotifications();
+        first.BindEvent("Focus", a.Gained); first.BindEvent("Blur", a.Lost);
+        second.BindEvent("Focus", b.Gained); second.BindEvent("Blur", b.Lost);
+        third.BindEvent("Focus", c.Gained); third.BindEvent("Blur", c.Lost);
+        app.SetRootControl(root); root.MeasureTree(app); root.Arrange(0, 0, 480, 320);
+        first.Arrange(10, 10, 120, 32); second.Arrange(10, 55, 120, 32);
+        third.Arrange(10, 100, 120, 32);
+        Click(app, first);
+        Check(a.gained == 1 && a.lost == 0, "named Focus before first paint");
+        app.focus.SetFocused(first.WidgetId(), first);
+        Check(a.gained == 1, "same endpoint does not repeat Focus");
+        app.BeginOffscreenFrame(); root.RenderTree(app); root.RenderTree(app); app.EndOffscreenFrame();
+        Check(a.gained == 1 && a.lost == 0, "repeated paints do not dispatch focus events");
+        Click(app, second);
+        Check(a.lost == 1 && b.gained == 1, "named Blur and Focus on pointer transfer");
+        // The nested transfer returns to the outer destination. Endpoint equality
+        // alone would send its Focus twice; the revision must suppress the tail.
+        b.app = app; b.bounce = third; b.winner = first; b.armed = true;
+        app.focus.SetFocused(first.WidgetId(), first);
+        Expect(app, first, true, "named Blur reentry returns to outer endpoint");
+        Check(a.gained == 2 && a.lost == 2 && b.lost == 1 && c.gained == 1 && c.lost == 1,
+            "reentrant transition emits no stale duplicate Focus");
+        a.app = app; a.winner = first; a.armed = true;
+        root.Remove(first);
+        Check(a.lost == 4 && a.gained == 3 && app.focus.focusedId < 0 && app.focus.imeSessionId < 0,
+            "removal retires focus restored by its Blur callback");
+        app.focus.SetFocused(second.WidgetId(), second);
+        b.winner = second; b.bounce = null; b.armed = true;
+        Control replacement = new Control("named_replacement"); replacement.UseApp(app);
+        app.SetRootControl(replacement);
+        Check(b.lost == 3 && app.focus.focusedId < 0 && app.focus.imeSessionId < 0,
+            "root replacement retires focus restored by its Blur callback");
+        app.SetRootControl(null); root.RemoveAll(); Drain(app);
+        Control batch = new Control("focus_batch"); batch.UseApp(app);
+        Input batchFirst = new Input("batch first"); Input batchLast = new Input("batch last");
+        batch.Add(batchFirst); batch.Add(batchLast); app.SetRootControl(batch);
+        FocusNotifications batchEvents = new FocusNotifications();
+        batchEvents.app = app; batchEvents.winner = batchFirst; batchEvents.armed = true;
+        batchEvents.batchSibling = batchLast;
+        batchFirst.BindEvent("Blur", batchEvents.Lost);
+        app.focus.SetFocused(batchFirst.WidgetId(), batchFirst);
+        batch.RemoveChildren(batch.SnapshotChildren(), () => { return true; });
+        Check(batchEvents.lost == 2 && batchEvents.batchCommitted && batch.ChildCount() == 0,
+            "batch reconciliation notifies after all structural removals");
+        Check(app.focus.focusedId < 0 && app.focus.imeSessionId < 0, "batch retires callback-restored focus");
+        app.SetRootControl(null); Drain(app);
     }
     static int Main() {
         App app = App.CreateOffscreen("retained focus before paint", 480, 320);
@@ -67,7 +151,6 @@ class RetainedFocusLifecycleTest {
         first.Arrange(10, 10, 200, 32); button.Arrange(10, 55, 200, 32); last.Arrange(10, 100, 200, 72);
         // First behavior assertion is real input after Measure/Arrange. No Paint,
         // manual focus assignment or registration is allowed to prepare it.
-        Check(app.focus.IndexOf(first.WidgetId()) < 0, "paint table starts empty");
         Click(app, first); Expect(app, first, true, "prepaint pointer Input focus");
         first.SetText("ab");
         // Backend delivers Backspace through TextInput, as it does characters.
@@ -78,10 +161,10 @@ class RetainedFocusLifecycleTest {
         Tab(app); Expect(app, button, false, "prepaint Tab Button");
         Tab(app); Expect(app, last, true, "prepaint Tab TextArea");
         Tab(app); Expect(app, first, true, "prepaint Tab wraps");
-        app.focus.ResetIds(); app.focus.UpdateImeSession();
-        Expect(app, first, true, "ResetIds preserves retained text capability");
+        app.focus.UpdateImeSession();
+        Expect(app, first, true, "IME reads current retained text capability");
         // Reorder within this App without another measure, paint or registry pass.
-        root.children.RemoveAt(2); root.children.Insert(0, last);
+        root.MoveChild(last, 0);
         app.focus.ClearFocus(); Tab(app); Expect(app, last, true, "Tab follows current order");
         last.visible = false; app.focus.ClearFocus(); Tab(app);
         Expect(app, first, true, "hidden endpoint excluded");
@@ -99,7 +182,10 @@ class RetainedFocusLifecycleTest {
         // The old focus notification may select a third endpoint. The outer
         // pointer transition must not restore Button or close the winner's IME.
         Click(app, first); first.Host = app; first.Winner = last; first.Armed = true;
+        FocusNotifications cleanupEvents = new FocusNotifications();
+        first.BindEvent("Blur", cleanupEvents.Lost);
         Click(app, button); Expect(app, last, true, "focus lost reentry winner");
+        Check(cleanupEvents.lost == 1, "cleanup hook reentry still delivers departing Blur");
         // A separately hosted child remains physically inside the parent tree.
         App child = App.CreateOffscreen("child focus", 160, 80);
         Input foreign = new Input("foreign"); foreign.UseApp(child); root.Add(foreign);
@@ -115,30 +201,27 @@ class RetainedFocusLifecycleTest {
         Click(app, popupInput); Expect(app, popupInput, true, "overlay pointer before paint");
         app.focus.FocusStep(1); Expect(app, popupInput, true, "overlay Tab scope");
         app.overlayHost.Hide(popup);
-        // Paint compatibility metadata cannot resurrect invalid endpoints.
+        // Painting cannot resurrect invalid endpoints.
         app.BeginOffscreenFrame(); root.RenderTree(app); app.EndOffscreenFrame();
         first.visible = false; last.Disabled.Set(true);
         app.focus.ClearFocus(); app.focus.FocusStep(1);
-        Expect(app, button, false, "paint ids do not resurrect hidden or disabled endpoints");
-        FocusWeakWitness witness = new FocusWeakWitness(); RegisterTemporary(app, witness);
-        Check(witness.target == null, "paint endpoint metadata is weak");
-        // Replacing a root retires its endpoint and the old paint metadata.
+        Expect(app, button, false, "painting does not resurrect hidden or disabled endpoints");
+        FocusWeakWitness witness = new FocusWeakWitness(); RemoveTemporary(app, root, witness);
+        Check(witness.target == null, "removed focus endpoint is not retained");
+        // Replacing a root retires its endpoint.
         Control replacement = new Control("replacement"); replacement.UseApp(app);
         Input replacementInput = new Input("replacement input"); replacement.Add(replacementInput);
         app.focus.SetFocused(button.WidgetId(), button);
         app.SetRootControl(replacement);
         Check(app.focus.focusedId < 0 && app.focus.imeSessionId < 0, "root replacement retires old focus");
         replacement.MeasureTree(app); replacement.Arrange(0, 0, 480, 320);
-        app.focus.FocusStep(1); Expect(app, replacementInput, true, "old paint table cannot enter replaced root");
-        // The old pure-id registration remains available with no retained root.
-        adapter.Detach(); app.SetRootControl(null); app.focus.ResetIds();
-        app.focus.RegisterFocusable(71); app.focus.RegisterFocusable(72);
-        app.focus.RegisterTextEditable(72); app.focus.ClearFocus();
-        app.focus.FocusStep(1); Check(app.focus.IsFocused(71), "legacy first id");
-        app.focus.FocusStep(1); Check(app.focus.IsFocused(72) && app.focus.imeSessionId == 72, "legacy text id");
-        app.focus.ClearFocus(); app.focus.ResetIds();
+        app.focus.FocusStep(1); Expect(app, replacementInput, true, "Tab cannot enter replaced root");
+        adapter.Detach(); app.SetRootControl(null); app.focus.ClearFocus();
+        app.focus.FocusStep(1);
+        Check(app.focus.focusedId < 0 && app.focus.imeSessionId < 0, "no root has no focus or IME endpoint");
         child.SetRootControl(null); Drain(child); child.canvas.Destroy();
-        root.RemoveAll(); popup.RemoveAll(); Drain(app); app.canvas.Destroy();
+        root.RemoveAll(); popup.RemoveAll(); Drain(app);
+        NamedNotifications(app); app.canvas.Destroy();
         Console.WriteLine("RETAINED_FOCUS_LIFECYCLE_OK");
         return 0;
     }

@@ -1,0 +1,321 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// One OverlayHost popup owns every modal LayerState in an App.  Keeping one
+// stable root lets a newer dialog cover an older one without destroying the
+// older dialog's retained controls or input lifetime.
+class LayerDialogHost : Control, AppLoopParticipant, AppPreparationParticipant {
+    weak App dialogApp;
+    weak AppLoopRegistration registration;
+    int preparation;
+    int deadline = -1;
+
+    public LayerDialogHost(App app) : base("layer-dialogs") {
+        dialogApp = app;
+        this.UseApp(app);
+        wiresOwnEvents = true;
+        registration = app.RegisterLoopParticipant(app, this);
+    }
+
+    public override void OnMeasure(App app) {
+        prefW = app.canvas.Width();
+        prefH = app.canvas.Height();
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        App app = dialogApp;
+        if (app != null) { pw = app.canvas.Width(); ph = app.canvas.Height(); }
+        bx = 0; by = 0; bw = pw; bh = ph;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            this.ChildAt(i).Arrange(0, 0, pw, ph);
+        }
+    }
+
+    bool Current(App app, Control root, int generation, long sequence, int ticket) {
+        return preparation == ticket && app.rootControl == root && app.inputRootGeneration == generation
+        && app.window.EventSeq() == sequence;
+    }
+
+    public void SyncStates(App app) {
+        if (app == null) { return; }
+        preparation = preparation + 1; int ticket = preparation;
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        dialogApp = app;
+        AppLayerContext context = Layer.Context(app);
+        for (int i = this.ChildCount() - 1; i >= 0; i = i - 1) {
+            LayerDialogControl surface = (LayerDialogControl)this.ChildAt(i);
+            LayerState state = surface.state;
+            if (state == null || !state.open || !state.modal || context.zorder.IndexOf(state) < 0) {
+                this.Remove(surface);
+                if (!this.Current(app, root, generation, sequence, ticket)) { return; }
+            }
+        }
+        int index = 0;
+        for (int i = 0; i < context.zorder.Count; i = i + 1) {
+            LayerState state = context.zorder[i];
+            if (!state.open || !state.modal) { continue; }
+            if (state.retainedDialog == null) { state.retainedDialog = new LayerDialogControl(state); }
+            LayerDialogControl surface = state.retainedDialog;
+            if (surface.parent != this) { this.Add(surface); }
+            if (!this.Current(app, root, generation, sequence, ticket)) { return; }
+            this.MoveChild(surface, index);
+            index = index + 1;
+        }
+        if (this.ChildCount() == 0) {
+            if (app.overlayHost.ActiveRoot() == this) { app.overlayHost.Hide(this); }
+        } else {
+            this.MeasureTree(app);
+            if (!this.Current(app, root, generation, sequence, ticket)) { return; }
+            if (app.overlayHost.ActiveRoot() != this) {
+                app.overlayHost.ShowAt(app, this, 0, 0);
+            } else {
+                this.Arrange(0, 0, app.canvas.Width(), app.canvas.Height());
+            }
+        }
+        app.RequestRedraw();
+    }
+
+    bool Prepare(App app) {
+        preparation = preparation + 1; int ticket = preparation;
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq();
+        List<LayerState> states = new List<LayerState>(); states.AddRange(Layer.Context(app).zorder);
+        deadline = -1;
+        for (int i = 0; i < states.Count; i = i + 1) {
+            LayerState state = states[i];
+            if (!state.modal) { continue; }
+            if (!LayerPreparation.Advance(app, state)) { return false; }
+            if (preparation != ticket || app.rootControl != root || app.inputRootGeneration != generation
+            || app.window.EventSeq() != sequence) { return false; }
+            int due = state.open && state.AutoCloseMs > 0 && state.openMs > 0 ? state.openMs + state.AutoCloseMs : -1;
+            if (due >= 0 && (deadline < 0 || due < deadline)) { deadline = due; }
+        }
+        // Endpoint installation may legitimately replace the root during layout.
+        this.SyncStates(app);
+        return true;
+    }
+    public void BeforeInput(App app, int kind) {
+        if (!this.Prepare(app)) { app.InvalidatePreparation(); }
+    }
+    public void BeforePaint(App app, int frameSequence) {
+        if (!this.Prepare(app)) { app.InvalidatePreparation(); }
+    }
+    public void Tick(App app, int now) { if (deadline >= 0 && now >= deadline) { this.Prepare(app); } }
+    public int NextDeadline() { return deadline; }
+
+    public override bool OnPopupEscape(App app) {
+        return Layer.CloseTopmostDialog(app);
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        App app = dialogApp;
+        if (!e.handled && app != null && Layer.Key(app, e.keyCode)) {
+            e.Handle();
+            return;
+        }
+        base.OnKeyDown(e);
+    }
+}
+
+// Full-screen retained modal surface.  Chrome is visual only; all actionable
+// controls are real children and receive their input from the Visual Tree.
+class LayerDialogControl : Control {
+    public weak LayerState state;
+    Button closeButton;
+    Control bodyClip;
+    Control bodyRoot;
+    Control promptRoot;
+    int surfaceX;
+    int surfaceY;
+    int surfaceW;
+    int surfaceH;
+    int preparation;
+    LayerDialogPaint paint = new LayerDialogPaint();
+
+    public LayerDialogControl(LayerState owner) : base("layer-dialog") {
+        state = owner;
+        wiresOwnEvents = true;
+        closeButton = new Button("").Ghost();
+        closeButton.Icon = "close";
+        closeButton.ClassName = "dialog-close ghost";
+        closeButton.wid = owner.closeId;
+        LayerAction closeAction = new LayerAction(owner, 3);
+        closeButton.Click.Add(closeAction.Invoke);
+        this.Add(closeButton);
+        bodyClip = new Control();
+        bodyClip.SetProp("style", "overflow:hidden");
+        bodyClip.SetShown(false);
+        this.Add(bodyClip);
+        this.Add(owner.dialogFooter);
+    }
+
+    void SyncFooter(LayerState s) {
+        s.okBtn.SetText(s.okText);
+        s.okBtn.ClassName = "primary";
+        s.cancelBtn.SetText(s.cancelText);
+        s.altBtn.SetText(s.altText);
+        bool changed = s.okBtn.parent != s.dialogFooter
+        || (s.altText != "") != (s.altBtn.parent == s.dialogFooter)
+        || s.twoButtons != (s.cancelBtn.parent == s.dialogFooter);
+        if (!changed) { return; }
+        App app = this.FindApp();
+        if (app == null) { return; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq(); int session = s.inputGeneration;
+        List<Control> removed = new List<Control>();
+        if (s.altText == "" && s.altBtn.parent == s.dialogFooter) { removed.Add(s.altBtn); }
+        if (!s.twoButtons && s.cancelBtn.parent == s.dialogFooter) { removed.Add(s.cancelBtn); }
+        s.dialogFooter.RemoveChildren(removed, () => { return LayerPreparation.Current(app, root, generation, sequence, s, session); });
+        if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+        int index = 0;
+        if (s.altText != "") {
+            if (s.altBtn.parent != s.dialogFooter) { s.dialogFooter.InsertAt(index, s.altBtn); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+            s.dialogFooter.MoveChild(s.altBtn, index); index = index + 1;
+        }
+        if (s.twoButtons) {
+            if (s.cancelBtn.parent != s.dialogFooter) { s.dialogFooter.InsertAt(index, s.cancelBtn); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+            s.dialogFooter.MoveChild(s.cancelBtn, index); index = index + 1;
+        }
+        if (s.okBtn.parent != s.dialogFooter) { s.dialogFooter.InsertAt(index, s.okBtn); }
+        if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+        s.dialogFooter.MoveChild(s.okBtn, index);
+    }
+
+    void SyncChildren(LayerState s) {
+        App app = this.FindApp();
+        if (app == null) { return; }
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq(); int session = s.inputGeneration;
+        this.SyncFooter(s);
+        if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+        Control nextBody = s.wrap != null ? s.wrap : s.view;
+        if (bodyRoot != nextBody) {
+            if (bodyRoot != null && bodyRoot.parent == bodyClip) { bodyClip.Remove(bodyRoot); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+            bodyRoot = nextBody;
+            if (bodyRoot != null) { bodyClip.Add(bodyRoot); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+        }
+        bodyClip.SetShown(bodyRoot != null);
+        Control nextPrompt = s.promptArea != null ? (Control)s.promptArea : (Control)s.promptInput;
+        if (promptRoot != nextPrompt) {
+            if (promptRoot != null && promptRoot.parent == this) { this.Remove(promptRoot); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+            promptRoot = nextPrompt;
+            if (promptRoot != null) { this.Add(promptRoot); }
+            if (!LayerPreparation.Current(app, root, generation, sequence, s, session)) { return; }
+        }
+        if (s.dialogFooter.parent != this) { this.Add(s.dialogFooter); }
+    }
+
+    public override void SyncBinding() {
+        LayerState s = state;
+        if (s == null) { return; }
+        this.SyncChildren(s);
+        base.SyncBinding();
+    }
+
+    public override void OnMeasure(App app) {
+        prefW = app.canvas.Width();
+        prefH = app.canvas.Height();
+    }
+
+    bool Current(App app, Control root, int generation, long sequence, LayerState s, int session, int ticket) {
+        return preparation == ticket && s.open && LayerPreparation.Current(app, root, generation, sequence, s, session);
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        App app = this.FindApp();
+        LayerState s = state;
+        if (app == null || s == null) { return; }
+        preparation = preparation + 1; int ticket = preparation;
+        Control root = app.rootControl; int generation = app.inputRootGeneration;
+        long sequence = app.window.EventSeq(); int session = s.inputGeneration;
+        if (!s.open || !s.modal) { return; }
+        pw = app.canvas.Width(); ph = app.canvas.Height();
+        bx = 0; by = 0; bw = pw; bh = ph;
+        // Open may mount and lay out before the first RenderTree/SyncBinding.
+        // Materialize and measure the stable children before using their sizes.
+        this.SyncChildren(s);
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        int contentW = app.Scale(s.w) - app.theme.paddingLarge * 2;
+        if (contentW < 1) { contentW = 1; }
+        if (promptRoot != null) { promptRoot.MeasureTree(app, contentW); }
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        if (bodyRoot != null) { bodyRoot.MeasureTree(app, contentW); }
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        s.dialogFooter.MeasureTree(app, contentW);
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        closeButton.MeasureTree(app);
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        int entP = Layer.Entrance(app, s);
+        if (entP < 1000) { app.RequestAnimationFrameIn(0, 0, pw, ph); }
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        int w = app.Scale(s.w);
+        int h = app.Scale(s.h);
+        int availW = pw - app.Scale(16) * 2;
+        int availH = ph - app.Scale(16) * 2;
+        if (w > availW) { w = availW; }
+        if (h > availH) { h = availH; }
+        surfaceW = w; surfaceH = h;
+        surfaceX = (pw - w) / 2;
+        surfaceY = (ph - h) / 2 - (1000 - entP) * app.Scale(12) / 1000;
+        Theme t = app.theme;
+        int pad = t.paddingLarge;
+        int ico = t.iconSizeLarge;
+        int bodyY = surfaceY + pad + ico + t.gapMedium;
+        if (promptRoot != null) {
+            int iy = bodyY + app.Scale(30);
+            int ih = t.heightMedium;
+            if (s.promptArea != null) {
+                ih = surfaceY + h - t.heightMedium - pad * 2 - iy;
+                if (ih < 0) { ih = 0; }
+            }
+            promptRoot.Arrange(surfaceX + pad, iy, w - pad * 2, ih);
+            if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        }
+        if (bodyRoot != null) {
+            int vy = bodyY;
+            if (s.body != "") { vy = bodyY + app.Scale(28); }
+            int actionH = s.twoButtons || s.altText != "" ? t.heightMedium + app.Scale(24) : 0;
+            int vh = surfaceY + h - pad - actionH - vy;
+            if (vh < 0) { vh = 0; }
+            bodyClip.Arrange(surfaceX + pad, vy, w - pad * 2, vh);
+            if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+            bodyRoot.Arrange(surfaceX + pad, vy, w - pad * 2, vh);
+            if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        } else {
+            bodyClip.Arrange(0, 0, 0, 0);
+        }
+        int by = surfaceY + h - t.heightMedium - pad;
+        s.dialogFooter.Arrange(surfaceX + pad, by, w - pad * 2, t.heightMedium);
+        if (!this.Current(app, root, generation, sequence, s, session, ticket)) { return; }
+        closeButton.Arrange(surfaceX + w - t.heightMedium, surfaceY,
+        t.heightMedium, t.heightMedium);
+        if (!this.Current(app, root, generation, sequence, s, session, ticket) || !s.modal) { return; }
+        int inputSession = session;
+        if (s.inputApp != app || s.inputBody != bodyRoot || s.inputPrompt != promptRoot || s.inputFooter != s.dialogFooter) {
+            inputSession = inputSession + 1;
+        }
+        s.SetLayerInput(app, bodyRoot, promptRoot, s.dialogFooter, surfaceX, surfaceY, surfaceW, surfaceH);
+        if (preparation != ticket || !s.open || !s.modal || s.inputGeneration != inputSession
+        || app.rootControl != root || app.inputRootGeneration != generation || app.window.EventSeq() != sequence) { return; }
+        paint.Prepare(app, s, surfaceX, surfaceY, surfaceW, surfaceH);
+    }
+
+    public override void OnPaint(App app) { paint.Paint(app); }
+
+    public override void OnClick(RoutedEventArgs e) {
+        LayerState s = state;
+        if (s == null || !s.open || e.originalSource != this) { return; }
+        if (s.shadeClose) { s.action = 2; }
+        e.Handle();
+    }
+}

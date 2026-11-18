@@ -1,0 +1,504 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// Observe the declaration while selectors run, so write-then-restore is visible.
+class InputClassProjectionProbe : Input {
+    public string Author;
+    public int ClassReads;
+
+    public override string CssAttr(string key) {
+        if (key == "data-author") {
+            ClassReads = ClassReads + 1;
+            if (Class != Author || this.GetProp("class") != Author) {
+                throw new Exception("Input selector observed a rewritten author Class");
+            }
+            return "ok";
+        }
+        return base.CssAttr(key);
+    }
+}
+
+class InputPaintPurityTest {
+    public string bound;
+    int changes;
+    int clicks;
+    int downs;
+    int ups;
+    int submits;
+    int focuses;
+    int blurs;
+
+    public void Change() { changes = changes + 1; }
+    public void Click() { clicks = clicks + 1; }
+    public void Down() { downs = downs + 1; }
+    public void Up() { ups = ups + 1; }
+    public void Submit() { submits = submits + 1; }
+    public void Focused() { focuses = focuses + 1; }
+    public void Blurred() { blurs = blurs + 1; }
+
+    static void Check(string label, bool ok) {
+        if (!ok) { throw new Exception("Input paint purity: " + label); }
+    }
+
+    static Input Mount(App app, InputPaintPurityTest counts, string text) {
+        Input input = new Input("hint");
+        input.SetProp("style", "font-size:16px;padding:8px");
+        input.SetText(text);
+        input.BindEvent("Change", counts.Change);
+        input.BindEvent("Click", counts.Click);
+        input.BindEvent("MouseDown", counts.Down);
+        input.BindEvent("MouseUp", counts.Up);
+        input.BindEvent("Submit", counts.Submit);
+        input.BindEvent("Focus", counts.Focused);
+        input.BindEvent("Blur", counts.Blurred);
+        input.UseApp(app);
+        input.MeasureTree(app);
+        input.Arrange(20, 20, 260, 40);
+        app.SetRootControl(input);
+        return input;
+    }
+
+    static void Pointer(App app, int kind, int x, int y) {
+        app.SetPointerDeviceType(0);
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
+    }
+
+    static void ClickAt(App app, int x, int y) {
+        Pointer(app, 2, x, y);
+        Pointer(app, 3, x, y);
+    }
+
+    static void TextInput(App app, int code) {
+        app.ProcessOffscreenInput(6, 0, 0, 0, code, 0, 0);
+    }
+
+    static void Key(App app, int code, int mods) {
+        app.ProcessOffscreenInput(4, 0, 0, 0, code, mods, 0);
+    }
+
+    static int TextX(Input input, string prefix) {
+        return input.bx + 8 + Canvas.MeasureText(prefix, 16);
+    }
+
+    static void Paint(App app, Input input) {
+        // Call the actual paint hook twice with the last physical event still
+        // in the window slot. Preparation/layout are intentionally separate.
+        app.BeginOffscreenFrame();
+        input.OnPaint(app);
+        input.OnPaint(app);
+        app.EndOffscreenFrame();
+    }
+
+    static void Selection(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "abcd");
+        int left = TextX(input, "");
+        int second = TextX(input, "ab") - 1;
+        int y = input.by + input.bh / 2;
+        Pointer(app, 2, left, y);
+        Check("first Down places caret and focuses without paint", input.cursorPos == 0
+            && input.selAnchor == 0 && input.IsFocused(app) && app.GetCapturedPointer() == input
+            && counts.downs == 1 && counts.focuses == 1);
+        Pointer(app, 1, second, y);
+        Check("drag establishes a real selection", input.cursorPos == 2 && input.SelText() == "ab");
+        Paint(app, input);
+        Check("paint leaves drag and notifications intact", input.cursorPos == 2 && input.selAnchor == 0
+            && app.GetCapturedPointer() == input && counts.downs == 1 && counts.clicks == 0);
+        Pointer(app, 3, second, y);
+        Check("Up preserves selection and emits one Click", input.SelText() == "ab"
+            && app.GetCapturedPointer() == null && counts.ups == 1 && counts.clicks == 1);
+        Paint(app, input);
+        Check("paint cannot collapse or replay selection", input.SelText() == "ab" && counts.clicks == 1);
+        TextInput(app, 88);
+        Check("typed text replaces dragged range", input.GetText() == "Xcd" && !input.HasSel() && counts.changes == 1);
+        Paint(app, input);
+        Check("paint cannot replay text", input.GetText() == "Xcd" && counts.changes == 1);
+
+        input.SetText("abcd");
+        input.cursorPos = 1;
+        input.selAnchor = -1;
+        // The routed modifier is authoritative even when the native event slot
+        // still contains an unmodified text event.
+        RoutedEventArgs shiftDown = new RoutedEventArgs("PointerDown", input, TextX(input, "abc") - 1, y);
+        shiftDown.modifiers = Modifiers.Shift();
+        input.RouteEvent(shiftDown);
+        Check("Shift Down anchors at previous caret", shiftDown.handled && input.cursorPos == 3 && input.selAnchor == 1);
+        Pointer(app, 3, TextX(input, "abc") - 1, y);
+        Check("Shift selection survives release", input.SelText() == "bc");
+        Pointer(app, 2, left, y);
+        Pointer(app, 1, -30, y);
+        Check("outside drag clamps to start", input.cursorPos == 0 && app.GetCapturedPointer() == input);
+        Pointer(app, 1, 500, y);
+        Check("outside drag reaches end", input.cursorPos == 4 && input.SelText() == "abcd");
+        int clickCount = counts.clicks;
+        Pointer(app, 3, 500, y);
+        Check("outside Up releases without Click", app.GetCapturedPointer() == null
+            && input.SelText() == "abcd" && counts.clicks == clickCount);
+        app.SetRootControl(null);
+    }
+
+    static void Trail(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "secret");
+        counts.bound = "secret";
+        input.Text = counts.bound;
+        input.password = true;
+        int x = input.bx + input.bw - 2;
+        int y = input.by + input.bh / 2;
+        Pointer(app, 2, x, y);
+        Check("eye Down captures but does not reveal", !input.reveal && app.GetCapturedPointer() == input);
+        Pointer(app, 3, x, y);
+        Check("eye Click reveals once before paint", input.reveal && counts.clicks == 1 && counts.changes == 0);
+        Paint(app, input);
+        Paint(app, input);
+        Check("paint cannot toggle password", input.reveal && counts.clicks == 1);
+        Pointer(app, 2, x, y);
+        Pointer(app, 3, input.bx + 10, y);
+        Check("release off eye does not toggle", input.reveal && app.GetCapturedPointer() == null);
+        Pointer(app, 2, x, y);
+        Pointer(app, 9, x, y);
+        Pointer(app, 3, x, y);
+        Check("cancelled eye cannot toggle on late Up", input.reveal && app.GetCapturedPointer() == null);
+        input.Clearable = true;
+        input.SetError("invalid");
+        Pointer(app, 2, x, y);
+        Paint(app, input);
+        Check("paint during clear Down does not clear", input.GetText() == "secret" && counts.changes == 0);
+        Pointer(app, 3, x, y);
+        Check("clear wins over eye and writes binding once", input.GetText() == "" && counts.bound == ""
+            && input.cursorPos == 0 && input.selAnchor == -1 && input.errMsg == ""
+            && input.reveal && counts.changes == 1);
+        Paint(app, input);
+        Check("paint after clear cannot activate newly visible eye", input.reveal && counts.changes == 1);
+        ClickAt(app, x, y);
+        Check("empty clearable password shows working eye", !input.reveal && counts.changes == 1);
+        input.SetText("later");
+        Pointer(app, 2, x, y);
+        input.Clearable = false;
+        Pointer(app, 3, x, y);
+        Check("slot changed between Down and Up cannot execute other action", input.GetText() == "later" && !input.reveal);
+        input.password = false;
+        input.iconTrail = "search";
+        ClickAt(app, x, y);
+        Check("decorative trailing icon does not edit", input.GetText() == "later" && !input.reveal && counts.changes == 1);
+        input.Clearable = true;
+        input.iconTrail = "";
+        Pointer(app, 2, x, y);
+        Pointer(app, 3, 500, y);
+        Check("clear released outside is cancelled", input.GetText() == "later");
+        app.SetRootControl(null);
+    }
+
+    static void FocusAndCancel(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "abcd");
+        input.Autoselect = true;
+        int x = TextX(input, "");
+        int y = input.by + input.bh / 2;
+        ClickAt(app, x, y);
+        Check("first pointer focus autoselects before paint", input.SelText() == "abcd" && input.autoselected);
+        Paint(app, input);
+        Check("paint preserves autoselection", input.SelText() == "abcd");
+        ClickAt(app, x, y);
+        Check("next click can collapse autoselection", input.cursorPos == 0 && !input.HasSel());
+        input.PassiveActivated = true;
+        TextInput(app, 88);
+        Check("passive focus rejects text", input.GetText() == "abcd");
+        TextInput(app, 13);
+        TextInput(app, 88);
+        Check("passive activation preserves editing", input.passiveActive && input.GetText() == "Xabcd");
+        Pointer(app, 2, x, y);
+        Pointer(app, 1, TextX(input, "Xa") - 1, y);
+        app.focus.ClearFocus();
+        Check("blur immediately clears selection and capture", !input.HasSel() && !input.autoselected
+            && !input.passiveActive && app.GetCapturedPointer() == null && counts.blurs == 1);
+        int caret = input.cursorPos;
+        Pointer(app, 1, 500, y);
+        Check("late motion after blur is inert", input.cursorPos == caret);
+        input.Focus();
+        Check("programmatic Focus before paint autoselects", input.IsFocused(app) && input.SelText() == "Xabcd");
+        input.Blur();
+        Check("programmatic Blur cleans immediately", !input.IsFocused(app) && !input.HasSel());
+        input.Autoselect = false;
+        input.PassiveActivated = false;
+        Pointer(app, 2, x, y);
+        app.ProcessOffscreenInput(3, x, y, 1, 0, 0, 0);
+        Check("secondary Up preserves primary capture", app.GetCapturedPointer() == input);
+        RoutedEventArgs handled = new RoutedEventArgs("PointerUp", input, x, y);
+        handled.Handle();
+        input.OnPointerUp(handled);
+        Check("handled Up leaves capture alone", app.GetCapturedPointer() == input);
+        Pointer(app, 9, x, y);
+        Check("Cancel releases selection capture", app.GetCapturedPointer() == null);
+        caret = input.cursorPos;
+        int anchor = input.selAnchor;
+        Pointer(app, 1, 500, y);
+        Pointer(app, 3, 500, y);
+        Check("cancelled selection ignores late motion and Up", input.cursorPos == caret
+            && input.selAnchor == anchor && app.GetCapturedPointer() == null);
+        input.Loading = true;
+        caret = input.cursorPos;
+        ClickAt(app, TextX(input, "Xab") - 1, y);
+        TextInput(app, 90);
+        Check("loading rejects pointer and text edits", input.cursorPos == caret && input.GetText() == "Xabcd"
+            && app.GetCapturedPointer() == null);
+        input.Loading = false;
+        input.Disabled = true;
+        ClickAt(app, TextX(input, "Xab") - 1, y);
+        TextInput(app, 90);
+        Check("disabled rejects edits", input.cursorPos == caret && input.GetText() == "Xabcd"
+            && app.GetCapturedPointer() == null);
+        input.Disabled = false;
+        app.SetRootControl(null);
+    }
+
+    static void CurrentGeometry(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "abcd");
+        input.Prefix = "prefix";
+        input.PrefixIcon = "search";
+        input.Suffix = "suffix";
+        input.ShowCount = true;
+        int y = input.by + input.bh / 2;
+        int textStart = input.bx + 8 + 16 + 4 + Canvas.MeasureText("prefix", 16) + 4;
+        ClickAt(app, textStart, y);
+        Check("prefix geometry is ready without paint", input.cursorPos == 0);
+        int second = textStart + Canvas.MeasureText("ab", 16) - 1;
+        ClickAt(app, second, y);
+        Check("prefix and count share text geometry", input.cursorPos == 2);
+        input.SetProp("style", "font-size:20px;padding:12px");
+        input.Prefix = "";
+        input.PrefixIcon = "";
+        input.Arrange(40, 40, 220, 44);
+        y = input.by + input.bh / 2;
+        int third = input.bx + 12 + Canvas.MeasureText("abc", 20) - 1;
+        ClickAt(app, third, y);
+        Check("style and bounds change before paint updates caret geometry", input.cursorPos == 3);
+        input.Suffix = "";
+        input.ShowCount = false;
+        input.Clearable = true;
+        input.SetText("a long line that extends beyond the whole input viewport");
+        input.ScrollToEnd();
+        Pointer(app, 2, input.bx + 12, y);
+        Check("scrolled text uses current caret viewport", input.cursorPos > 0);
+        Pointer(app, 3, input.bx + 12, y);
+        ClickAt(app, input.bx + input.bw - 2, y);
+        Check("resized clear target works without intervening paint", input.GetText() == "");
+
+        input.password = true;
+        input.Clearable = false;
+        input.SetText("中A");
+        input.ScrollToStart();
+        int masked = input.bx + 12 + Canvas.MeasureText("*", 20);
+        ClickAt(app, masked, y);
+        Check("masked UTF8 click stays on a codepoint boundary", input.cursorPos == 0 || input.cursorPos == 3 || input.cursorPos == 4);
+        TextInput(app, 90);
+        Check("masked UTF8 insertion preserves source bytes", input.GetText() == "Z中A"
+            || input.GetText() == "中ZA" || input.GetText() == "中AZ");
+        app.SetRootControl(null);
+    }
+
+    static void PaintOnly(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "local");
+        input.Focus();
+        counts.bound = "new model value";
+        input.Text = counts.bound;
+        input.Autoselect = true;
+        input.autoselected = false;
+        input.cursorPos = 99;
+        input.selAnchor = -1;
+        input.passiveActive = true;
+        string cls = input.Class;
+        Paint(app, input);
+        Check("paint does not pull model clamp cursor or autoselect",
+            counts.bound == "new model value" && input.cursorPos == 99 && input.selAnchor == -1
+            && !input.autoselected && input.passiveActive && input.Class == cls && counts.changes == 0);
+        app.focus.ClearFocus();
+        input.selAnchor = 0;
+        input.cursorPos = 2;
+        input.autoselected = true;
+        input.passiveActive = true;
+        Paint(app, input);
+        Check("unfocused paint cannot clean semantic state", input.selAnchor == 0 && input.cursorPos == 2
+            && input.autoselected && input.passiveActive);
+        Check("explicit model read still synchronizes", input.GetText() == "new model value");
+        app.SetRootControl(null);
+    }
+
+    static void Editing(App app) {
+        InputPaintPurityTest counts = new InputPaintPurityTest();
+        Input input = Mount(app, counts, "");
+        counts.bound = "seed";
+        input.Text = counts.bound;
+        input.Autoselect = true;
+        input.Focus();
+        TextInput(app, 0x4E2D);
+        Check("first text pulls model and replaces selected value", input.GetText() == "中" && counts.bound == "中");
+        Key(app, 36, 0);
+        TextInput(app, 65);
+        Key(app, 39, Modifiers.Shift());
+        Check("keyboard Shift selects complete UTF8 codepoint", input.SelText() == "中");
+        TextInput(app, 8);
+        Check("Backspace deletes selected range", input.GetText() == "A");
+        Key(app, 36, 0);
+        Key(app, 46, 0);
+        Check("Delete removes codepoint at caret", input.GetText() == "");
+        string clipboard = Clipboard.GetText();
+        try {
+            input.SetText("copy中");
+            Key(app, 65, Modifiers.Ctrl());
+            Key(app, 67, Modifiers.Ctrl());
+            Check("Ctrl+C copies selected source bytes", Clipboard.GetText() == "copy中" && input.GetText() == "copy中");
+            Key(app, 88, Modifiers.Ctrl());
+            Check("Ctrl+X removes selected source bytes", input.GetText() == "" && counts.bound == "");
+            Key(app, 86, Modifiers.Ctrl());
+            Check("Ctrl+V inserts clipboard through route", input.GetText() == "copy中" && counts.bound == "copy中");
+        } finally { Clipboard.SetText(clipboard); }
+        input.SetText("");
+        input.Filter = Input.OnlyDigits;
+        input.MaxLen = 2;
+        TextInput(app, 49);
+        TextInput(app, 65);
+        TextInput(app, 50);
+        TextInput(app, 51);
+        Check("filter and maximum length survive route migration", input.GetText() == "12" && counts.bound == "12");
+        Key(app, 65, Modifiers.Ctrl());
+        TextInput(app, 51);
+        Check("Ctrl+A replacement obeys same filter", input.GetText() == "3");
+        TextInput(app, 13);
+        Check("Enter submits once", counts.submits == 1);
+        int changes = counts.changes;
+        Paint(app, input);
+        Paint(app, input);
+        Check("repeated paint cannot replay submit or edit", counts.submits == 1
+            && counts.changes == changes && input.GetText() == "3");
+        input.Filter = null;
+        input.MaxLen = 0;
+        counts.bound = "external";
+        input.Autoselect = false;
+        Key(app, 35, 0);
+        TextInput(app, 33);
+        Check("model replacement before input uses fresh text", input.GetText() == "external!" && counts.bound == "external!");
+        app.SetRootControl(null);
+    }
+
+    static void ProjectionCase(App app, InputClassProjectionProbe input,
+    string effective, int height, int padding) {
+        Control node = input;
+        Check("effective classes dispatch through Control", node.EffectiveClass() == effective);
+        Check("projection preserves exact author text", input.Class == input.Author
+        && input.GetProp("class") == input.Author);
+        app.styleCtx = input;
+        input.MeasureTree(app);
+        Check("measure and computed style use projected classes", input.prefH == height
+        && input.computedStyle.height == height && input.computedStyleCls == effective);
+        Check("normal style and Box agree", input.ResolveStyle(app, 0).height == height
+        && node.Box(app).height == height);
+        input.Arrange(20, 20, 260, height);
+        int reads = input.ClassReads;
+        ClickAt(app, input.bx + padding + Canvas.MeasureText("ab", 16) - 1,
+        input.by + input.bh / 2);
+        Check("input geometry uses projected padding without paint", input.cursorPos == 2
+        && input.ClassReads > reads && input.Class == input.Author);
+        reads = input.ClassReads;
+        Paint(app, input);
+        Check("paint uses projection without rewriting declaration", input.ClassReads > reads
+        && input.Class == input.Author && input.GetProp("class") == input.Author
+        && input.computedStyle.height == height && input.computedStyleCls == effective);
+    }
+
+    static void ClassProjection(App app) {
+        app.UseAppCss("input { height:32px; padding:4px; font-size:16px; transition:none; }"
+            + " input.tiny { height:24px; padding:6px; }"
+            + " input.small { height:28px; padding:8px; }"
+            + " input.medium { height:32px; padding:10px; }"
+            + " input.large { height:40px; padding:12px; }"
+            + " input.error.round { height:48px; padding-left:20px; }"
+            + " input[data-author=ok] { color:#123456; }"
+            + " input.error.round::count[data-author=ok] { font-size:18px; }");
+        Element plain = new Element();
+        plain.InitElement("plain", "plain");
+        plain.Class = "author  small";
+        Check("default Control projection is the author declaration", plain.EffectiveClass() == plain.Class);
+        InputClassProjectionProbe input = new InputClassProjectionProbe();
+        string author = "author tiny medium small large  author";
+        input.Author = author;
+        input.Class = author;
+        input.SetText("abcd");
+        input.UseApp(app);
+        app.SetRootControl(input);
+        ProjectionCase(app, input, author, 40, 12);
+        input.Size = "large";
+        ProjectionCase(app, input, "author author large", 40, 12);
+        input.Size = "small";
+        ProjectionCase(app, input, "author author small", 28, 8);
+        input.Size = "tiny";
+        ProjectionCase(app, input, "author author tiny", 24, 6);
+        input.Size = "medium";
+        ProjectionCase(app, input, author, 40, 12);
+        input.Size = "invalid-size";
+        ProjectionCase(app, input, author, 40, 12);
+        input.Size = null;
+        ProjectionCase(app, input, author, 40, 12);
+        input.Size = "small";
+        input.FieldStatus = "error";
+        input.Round = true;
+        input.ShowCount = true;
+        ProjectionCase(app, input, "author author small error round", 48, 20);
+        Check("count part uses the same projection", Style.Part(app, "input", "count", "",
+            input.EffectiveClass(), input.name, 0).fontPx == 18);
+        input.FieldStatus = "unrecognized";
+        input.Round = false;
+        ProjectionCase(app, input, "author author small", 28, 8);
+        author = "author large error round  author";
+        input.Author = author;
+        input.Class = author;
+        input.Size = "medium";
+        ProjectionCase(app, input, author, 48, 20);
+        Check("author status and round classes survive projection removal", input.Class == author);
+        app.SetRootControl(null);
+        app.styleCtx = null;
+        app.UseAppCss("");
+    }
+
+    static void PaintHostState(App app) {
+        Input input = new Input("paint host");
+        input.SetText("local");
+        input.Class = "author small";
+        input.Size = "large";
+        input.FieldStatus = "warning";
+        input.Round = true;
+        input.Arrange(20, 20, 260, 40);
+        input.lastKeyNamedSeq = 73;
+        Paint(app, input);
+        Check("first paint cannot attach a host or reset key deduplication",
+            input.liveApp == null && input.lastKeyNamedSeq == 73 && input.Class == "author small"
+            && input.EffectiveClass() == "author large warning round");
+        App other = App.CreateOffscreen("Input previous host", 320, 240);
+        input.liveApp = other;
+        input.lastKeyNamedSeq = 91;
+        Paint(app, input);
+        Check("paint cannot rebind an existing host or reset its event sequence",
+            input.liveApp == other && input.lastKeyNamedSeq == 91 && input.Class == "author small");
+        input.liveApp = null;
+        other.canvas.Destroy();
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Input paint purity", 640, 320);
+        Selection(app);
+        Trail(app);
+        FocusAndCancel(app);
+        CurrentGeometry(app);
+        PaintOnly(app);
+        Editing(app);
+        ClassProjection(app);
+        PaintHostState(app);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        Console.WriteLine("INPUT_PAINT_PURITY_TEST_OK");
+    }
+}

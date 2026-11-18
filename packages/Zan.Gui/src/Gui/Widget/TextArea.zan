@@ -5,11 +5,9 @@ using Gui.Backend;
 namespace Gui.Widget;
 
 public class TextArea : Control {
-    // 内部编辑缓冲（SignalString）；外部通道是 data。
-    public SignalString model;
-    // 双向绑定文本：`notes.data = doc.body;` 保持模型字段与
-    // 文本框双向同步（编译器降级的 Binding）。
-    public Binding<string> data;
+    // 私有草稿隔离选区替换和输入过滤的中间值。
+    private string editText;
+    public Binding<string> Text;
     // 占位文本（内容为空且未聚焦时显示）。
     public string hint;
     // 光标位置（字节偏移）。
@@ -17,8 +15,6 @@ public class TextArea : Control {
     // 选区的固定端（字节偏移），-1 表示无选区。光标是活动端，
     // 因此 Shift+方向键、拖动和 Ctrl+A 都只移动 `cursorPos`。
     public int selAnchor;
-    // 垂直滚动偏移（px）。
-    public int scrollY;
     // 控件命中 id。
     public int wid;
     // 宿主在输入路由前设置：下一个聚焦键盘事件交给补全列表等属主，
@@ -62,6 +58,7 @@ public class TextArea : Control {
     public bool CountGraphemes;
     // 校验状态：""/success/warning/error，映射 base.css 字段状态类。
     public string FieldStatus;
+    private string preparedStatus;
     // 圆角框（整高半圆角），走 `.round` 类。
     public bool Round;
     // 输入过滤（Naive UI allow-input）：收到插入后的完整候选文本，
@@ -73,9 +70,11 @@ public class TextArea : Control {
     // 立即模式工厂与保留式构造器
     // 共用的初始化：设置 Control 基座（默认停靠顶部，追加的区域
     // 自动吸附），再设置文本框专属状态。
-    public void InitTextArea(SignalString sig, string hintText) {
+    public void InitTextArea(Binding<string> text, string hintText) {
         this.InitControl("textarea", 1);
-        model = sig;
+        Text = "";
+        if (text != null) { Text = text; }
+        editText = Text.Get();
         hint = hintText;
         cursorPos = 0;
         selAnchor = -1;
@@ -107,12 +106,13 @@ public class TextArea : Control {
 
     // 保留式构造器：`TextArea notes = new TextArea("Notes...");`
     public TextArea(string hintText) {
-        InitTextArea(new SignalString(""), hintText);
+        InitTextArea("", hintText);
     }
 
     // 当前文本。
     public string GetText() {
-        return model.Get();
+        this.SyncBinding();
+        return editText;
     }
 
     // 只读：可选中复制，不可编辑。
@@ -147,7 +147,7 @@ public class TextArea : Control {
     public int ContentHeight(App app) {
         app = this.ResolveApp(app);
         int n = this.Lines().Count;
-        if (wrapTxt == model.Get() && wrapW > 0 && rows.Count > 0) {
+        if (wrapTxt == editText && wrapW > 0 && rows.Count > 0) {
             n = rows.Count;
         }
         if (n < 1) { n = 1; }
@@ -164,7 +164,7 @@ public class TextArea : Control {
 
     // 覆盖文本：光标收到文末、清空选区并写回绑定。
     public void SetText(string v) {
-        model.Set(v);
+        editText = v;
         cursorPos = v.Length;
         selAnchor = -1;
         PushBinding();
@@ -172,18 +172,28 @@ public class TextArea : Control {
 
     // 将绑定的模型值拉入编辑缓冲区（model -> UI）。
     public override void SyncBinding() {
-        if (data == null) { return; }
-        string cur = data.Get();
-        if (cur != model.Get()) {
-            model.Set(cur);
-            if (cursorPos > cur.Length) { cursorPos = cur.Length; }
+        base.SyncBinding();
+        App host = this.FindApp();
+        if (liveApp != host) { lastKeyNamedSeq = 0; }
+        liveApp = host;
+        string status = Control.StatusSanitize(FieldStatus);
+        if (preparedStatus != status) {
+            if (preparedStatus != "") { this.RemoveClass(preparedStatus); }
+            if (status != "") { this.AddClass(status); }
+            preparedStatus = status;
+        }
+        if (Round) { this.AddClass("round"); }
+        else { this.RemoveClass("round"); }
+        string cur = Text.Get();
+        if (cur != editText) {
+            editText = cur;
+            this.ClampCursor();
         }
     }
 
     // 通过绑定把编辑缓冲区写回（UI -> model）。
-    public void PushBinding() {
-        if (data == null) { return; }
-        data.Set(model.Get());
+    private void PushBinding() {
+        Text.Set(editText);
     }
 
     // 所有 UI 编辑都汇入这里：先写回，再通知。
@@ -217,23 +227,23 @@ public class TextArea : Control {
 
     // 当前文本的计数值（按 CountGraphemes 口径）。
     public int CountOf(string s) {
-        if (CountGraphemes) { return Text.Graphemes(s); }
-        return Text.Chars(s);
+        if (CountGraphemes) { return Gui.Text.Graphemes(s); }
+        return Gui.Text.Chars(s);
     }
 
     // 当前文本的计数值。
-    public int CountValue() { return this.CountOf(model.Get()); }
+    public int CountValue() { return this.CountOf(this.GetText()); }
 
     // 选中全部文本（等同于用户按 Ctrl+A）。
     public void SelectAll() {
         selAnchor = 0;
-        cursorPos = model.Get().Length;
+        cursorPos = editText.Length;
     }
 
     // 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
     public void Clear() {
-        if (model.Get() == "") { return; }
-        model.Set("");
+        if (editText == "") { return; }
+        editText = "";
         cursorPos = 0;
         selAnchor = -1;
         Edited();
@@ -257,12 +267,96 @@ public class TextArea : Control {
 
     // 控件命中 id。
     public override int InputFocusCapabilities() { return 3; }
+    public override int PointerCursor() { return 1; }
+
+    int pointerInnerX;
+    int pointerInnerY;
+    int pointerLineH;
+    int pointerFont;
+    int pointerInnerW;
+    int pointerInnerH;
+    int preparedCaretPos = 0 - 1;
+    bool preparedFocused;
+
+    public override Rect ScrollViewport() {
+        return new Rect(pointerInnerX, pointerInnerY, pointerInnerW, pointerInnerH);
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        base.Arrange(x, y, width, height);
+        App app = this.FindApp();
+        if (app == null) { return; }
+        StyleBox style = this.ResolveStyleAs(app, "textarea", Class, Style.SNormal());
+        int left = style.PadLOr(app.Scale(6));
+        int top = style.PadTOr(app.Scale(6));
+        pointerInnerX = x + left;
+        pointerInnerY = y + top;
+        pointerInnerW = Math.Max(0, width - left - style.PadROr(app.Scale(6)));
+        pointerInnerH = Math.Max(0, height - this.BottomRowH(app) - top - style.PadBOr(app.Scale(6)));
+        pointerLineH = TextArea.LineHeight(app);
+        pointerFont = style.FontOr(Style.FontFallback(app, "medium"));
+        int wrapWidth = pointerInnerW - app.Scale(10);
+        if (wrapWidth < app.Scale(24)) { wrapWidth = pointerInnerW; }
+        this.Wrap(wrapWidth, pointerFont);
+        this.ClampCursor();
+        scrollExtent = rows.Count * pointerLineH;
+        scrollExtentX = pointerInnerW;
+        bool focused = this.IsFocused(app) && !this.IsDisabled();
+        if (focused && (!preparedFocused || preparedCaretPos != cursorPos)) {
+            int caretTop = this.RowOfPos(cursorPos) * pointerLineH;
+            if (caretTop < scrollY) { scrollY = caretTop; }
+            if (caretTop + pointerLineH > scrollY + pointerInnerH) {
+                scrollY = caretTop + pointerLineH - pointerInnerH;
+            }
+        }
+        scrollY = Math.Min(Math.Max(0, scrollY), Math.Max(0, scrollExtent - pointerInnerH));
+        preparedFocused = focused;
+        preparedCaretPos = cursorPos;
+        if (!focused && selAnchor >= 0) { selAnchor = 0 - 1; }
+        if (focused && !readOnly) {
+            int row = this.RowOfPos(cursorPos);
+            int col = Math.Min(Math.Max(0, cursorPos - rows[row].start), rows[row].len);
+            int caretX = pointerInnerX + Canvas.MeasureText(this.RowText(row).Substring(0, col), pointerFont);
+            int caretY = pointerInnerY + row * pointerLineH - scrollY;
+            app.SetImeCaret(caretX, caretY + Canvas.FontHeight(pointerFont));
+        }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        App app = this.FindApp();
+        if (app == null) { return; }
+        cursorPos = this.PosFromMouse(app, pointerInnerX, pointerInnerY, pointerLineH, pointerFont);
+        if (!Modifiers.HasShift(e.modifiers) || selAnchor < 0) { selAnchor = cursorPos; }
+        this.ClampCursor(); app.CapturePointer(this); app.RequestRedraw(); e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        base.OnPointerMove(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        App app = this.FindApp();
+        if (app == null || app.GetCapturedPointer() != this) { return; }
+        int drag = this.PosFromMouse(app, pointerInnerX, pointerInnerY, pointerLineH, pointerFont);
+        if (drag != cursorPos) {
+            cursorPos = drag; this.ClampCursor(); app.RequestRedraw();
+        }
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        App app = this.FindApp();
+        if (app == null || app.GetCapturedPointer() != this) { return; }
+        if (selAnchor == cursorPos) { selAnchor = -1; }
+        app.ReleasePointerCapture(); app.RequestRedraw(); e.Handle();
+    }
 
     public override int WidgetId() { return wid; }
 
     // 光标移到文末（渲染沿本就会把光标滚进视口）。
     public void ScrollToEnd() {
-        cursorPos = model.Get().Length;
+        cursorPos = editText.Length;
         selAnchor = -1;
         if (liveApp != null) { liveApp.RequestRedraw(); }
     }
@@ -276,7 +370,7 @@ public class TextArea : Control {
 
     // 光标与选区锚点钳回文本范围内。
     public void ClampCursor() {
-        string txt = model.Get();
+        string txt = editText;
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
         if (cursorPos < 0) { cursorPos = 0; }
         if (selAnchor > txt.Length) { selAnchor = txt.Length; }
@@ -292,16 +386,16 @@ public class TextArea : Control {
     // 选区文本（无选区为 ""）。
     public string SelText() {
         if (!HasSel()) { return ""; }
-        return model.Get().Substring(SelStart(), SelEnd() - SelStart());
+        return editText.Substring(SelStart(), SelEnd() - SelStart());
     }
 
     // 删除选中的范围，并把光标收拢到其起点。
     public void DeleteSel() {
         if (!HasSel()) { return; }
-        string txt = model.Get();
+        string txt = editText;
         int s = SelStart();
         int e = SelEnd();
-        model.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        editText = txt.Substring(0, s) + txt.Substring(e, txt.Length - e);
         cursorPos = s;
         selAnchor = -1;
     }
@@ -310,18 +404,18 @@ public class TextArea : Control {
     // 被拒绝时完整回滚（选区也还回去）。与 Input 同款：过滤后
     // 整体被改写时光标按净增字节平移，上限按 CountOf 口径计。
     public bool Insert(string s) {
-        string orig = model.Get();
+        string orig = editText;
         int origCursor = cursorPos;
         int origAnchor = selAnchor;
         bool hadSel = HasSel();
         if (hadSel) { DeleteSel(); }
-        string txt = model.Get();
-        string cand = Text.InsertAt(txt, cursorPos, s);
+        string txt = editText;
+        string cand = Gui.Text.InsertAt(txt, cursorPos, s);
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null
             || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
-            model.Set(orig);
+            editText = orig;
             cursorPos = origCursor;
             selAnchor = origAnchor;
             return false;
@@ -335,7 +429,7 @@ public class TextArea : Control {
             selAnchor = -1;
             return false;
         }
-        model.Set(final);
+        editText = final;
         cursorPos = cp;
         selAnchor = -1;
         Edited();
@@ -348,8 +442,8 @@ public class TextArea : Control {
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null) { return false; }
-        if (final == model.Get()) { return false; }
-        model.Set(final);
+        if (final == editText) { return false; }
+        editText = final;
         if (cursorPos > final.Length) { cursorPos = final.Length; }
         if (selAnchor > final.Length) { selAnchor = final.Length; }
         Edited();
@@ -358,7 +452,7 @@ public class TextArea : Control {
 
     // 文本按行返回，每次编辑最多拆分一次。
     public List<string> Lines() {
-        string txt = model.Get();
+        string txt = editText;
         if (cacheLines == null || cacheTxt != txt) {
             cacheLines = Gui.TextWrap.SplitLines(txt);
             cacheTxt = txt;
@@ -368,7 +462,7 @@ public class TextArea : Control {
 
     // 重算软换行（文本 / 宽度 / 字号变了才算）。
     public void Wrap(int maxW, int fs) {
-        string txt = model.Get();
+        string txt = editText;
         if (wrapTxt == txt && wrapW == maxW && wrapFs == fs
             && rows.Count > 0) {
             return;
@@ -415,8 +509,8 @@ public class TextArea : Control {
             }
             // 不在一个多字节字符中间断开，也至少往前走一个字（否则一个比
             // 框还宽的字会让这个循环原地转）。
-            lo = Text.ClampCharStart(rest, lo);
-            if (lo <= 0) { lo = Text.NextCharEnd(rest, 0); }
+            lo = Gui.Text.ClampCharStart(rest, lo);
+            if (lo <= 0) { lo = Gui.Text.NextCharEnd(rest, 0); }
             int cut = lo;
             // 能在空格处断就在空格处断，英文单词不被劈开；整段没空格
             // （中文）就按字断。
@@ -453,7 +547,7 @@ public class TextArea : Control {
     // 第 `i` 行显示出来的那段文本。
     public string RowText(int i) {
         if (i < 0 || i >= rows.Count) { return ""; }
-        string txt = model.Get();
+        string txt = editText;
         int s = rows[i].start;
         int n = rows[i].len;
         if (s > txt.Length) { return ""; }
@@ -470,7 +564,7 @@ public class TextArea : Control {
     private bool HandleKeyEvent(App app, int kind, int code, int mods) {
         this.EnsureRows();
         this.ClampCursor();
-        string txt = model.Get();
+        string txt = editText;
 
         if (kind == 6) {
             if (readOnly) { return false; }
@@ -480,8 +574,8 @@ public class TextArea : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos > 0) {
-                    int start = Text.PrevCharStart(txt, cursorPos);
-                    if (this.DeleteCandidate(Text.DeleteBefore(txt, cursorPos))) {
+                    int start = Gui.Text.PrevCharStart(txt, cursorPos);
+                    if (this.DeleteCandidate(Gui.Text.DeleteBefore(txt, cursorPos))) {
                         cursorPos = start;
                     }
                     app.RequestRedraw();
@@ -495,7 +589,7 @@ public class TextArea : Control {
                 if (this.Insert("  ")) { app.RequestRedraw(); }
                 return true;
             } else {
-                string ch = Text.CharStr(code);
+                string ch = Gui.Text.CharStr(code);
                 if (ch.Length > 0 && app.window.EventSeq() != this.lastKeyNamedSeq) {
                     // 字符键出口：落文本之前通知（DOM keypress 语义）；
                     // 仅 KeyPress 兼容通知在控件内按本地序号去重。
@@ -548,10 +642,10 @@ public class TextArea : Control {
                     selAnchor = -1;
                 }
                 if (kc == 37) {
-                    if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); }
+                    if (cursorPos > 0) { cursorPos = Gui.Text.PrevCharStart(txt, cursorPos); }
                     app.RequestRedraw();
                 } else if (kc == 39) {
-                    if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); }
+                    if (cursorPos < txt.Length) { cursorPos = Gui.Text.NextCharEnd(txt, cursorPos); }
                     app.RequestRedraw();
                 } else if (kc == 38 || kc == 40) {
                     // 上/下走的是看得见的行（软换行后的显示行）：一句被折成
@@ -582,7 +676,7 @@ public class TextArea : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos < txt.Length) {
-                    if (this.DeleteCandidate(Text.RemoveAt(txt, cursorPos))) {
+                    if (this.DeleteCandidate(Gui.Text.RemoveAt(txt, cursorPos))) {
                         app.RequestRedraw();
                     }
                 }
@@ -625,26 +719,9 @@ public class TextArea : Control {
         int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
-        // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
-        if (liveApp != app) { lastKeyNamedSeq = 0; }
-        liveApp = app;
-
         bool off = this.IsDisabled();
-        app.focus.RegisterFocusable(id, this);
-        app.focus.RegisterTextEditable(id);
         bool focused = app.focus.IsFocused(id) && !off;
-
-        // 校验状态与圆角：与 Input 同款，把类并进 Class 再解析
-        // （渲染末恢复，避免设计器读到污染字段），base.css 的
-        // `.success/.warning/.error` 与 `.round` 规则负责外观。
-        string origClass = Class;
-        string stCls = Control.StatusSanitize(FieldStatus);
-        if (stCls != "") { this.AddClass(stCls); }
-        if (Round) { this.AddClass("round"); }
-
-        SyncBinding();
-        string txt = model.Get();
-        this.ClampCursor();
+        string txt = editText;
 
         // 外框（填充、边框、圆角、hover/focus 淡变）全部来自样式层，
         // 皮肤的 `textarea:hover / textarea:focus` 规则即可重设。
@@ -662,54 +739,15 @@ public class TextArea : Control {
                        errorStyle.BorderWOr(2));
         }
 
-        int padL = s.PadLOr(app.Scale(6));
-        int padR = s.PadROr(app.Scale(6));
-        int padT = s.PadTOr(app.Scale(6));
-        int padB = s.PadBOr(app.Scale(6));
-        int innerX = x + padL;
-        int innerY = y + padT;
-        int innerW = w - padL - padR;
-        int innerH = h - padT - padB;
-        int lineH = TextArea.LineHeight(app);
-
-        // 折行宽度给滚动条留出位置，否则溢出时每行的最后几个字会被滚
-        // 动条盖住（而且“溢出才变窄”会在两种折法之间来回跳）。
-        int wrapWidth = innerW - app.Scale(10);
-        if (wrapWidth < app.Scale(24)) { wrapWidth = innerW; }
-        this.Wrap(wrapWidth, fs);
-        int contentH = rows.Count * lineH;
-
+        int innerX = pointerInnerX;
+        int innerY = pointerInnerY;
+        int innerW = pointerInnerW;
+        int innerH = pointerInnerH;
+        int lineH = pointerLineH;
         int caretRow = this.RowOfPos(cursorPos);
         int caretCol = cursorPos - rows[caretRow].start;
         if (caretCol < 0) { caretCol = 0; }
         if (caretCol > rows[caretRow].len) { caretCol = rows[caretRow].len; }
-
-        // 保持光标可见（仅在获得焦点 / 正在编辑时）。
-        if (focused) {
-            int caretTop = caretRow * lineH;
-            if (caretTop < scrollY) { scrollY = caretTop; }
-            if (caretTop + lineH > scrollY + innerH) {
-                scrollY = caretTop + lineH - innerH;
-            }
-        }
-
-        bool overBox = app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
-        bool ownsWheel = false;
-        // 认领以真溢出为前提：内容折行后放得下视口时不认领，滚轮
-        // 穿透给外层容器/页面（认领了 scrollY 也只会被下面钳回 0）。
-        if (overBox && contentH > innerH) {
-            ownsWheel = app.CaptureWheel(x, y, w, h);
-        }
-        if (ownsWheel) {
-            int d = app.window.EventKeyCode();
-            scrollY = scrollY - d * app.scrollSpeed / 120;
-            app.RequestRedraw();
-        }
-        int maxScroll = contentH - innerH;
-        if (maxScroll < 0) { maxScroll = 0; }
-        if (scrollY > maxScroll) { scrollY = maxScroll; }
-        if (scrollY < 0) { scrollY = 0; }
 
         c.PushClip(innerX, innerY, innerW, innerH);
         if (txt == "" && !focused) {
@@ -760,41 +798,9 @@ public class TextArea : Control {
                 int fh = Canvas.FontHeight(fs);
                 c.FillRect(caretX, caretY, caretStyle.WidthOr(1), fh,
                            caretStyle.BgOr(caretStyle.FgOr(s.accent)));
-                // 让 IME 组合窗口跟随光标。
-                app.SetImeCaret(caretX, caretY + fh);
             }
         }
         c.PopClip();
-
-        // 内容溢出时的垂直滚动条（限制 + 裁剪）。
-        if (contentH > innerH && innerH > 0) {
-            StyleBox sbStyle = this.ResolvePartAs(
-                app, "textarea", "scrollbar", "", Class, Style.SNormal());
-            StyleBox sbTrack = this.ResolvePartAs(
-                app, "textarea", "scrollbar-track", "", Class,
-                Style.SNormal());
-            int barW = sbStyle.WidthOr(app.Scale(6));
-            int barX = x + w - barW - app.Scale(2);
-            int minThumb = app.Scale(24);
-            if (minThumb > innerH) { minThumb = innerH; }
-            int thumbH = innerH * innerH / contentH;
-            if (thumbH < minThumb) { thumbH = minThumb; }
-            if (thumbH > innerH) { thumbH = innerH; }
-            int travel = innerH - thumbH;
-            if (travel < 0) { travel = 0; }
-            int thumbY = innerY;
-            if (maxScroll > 0) { thumbY = innerY + scrollY * travel / maxScroll; }
-            if (thumbY < innerY) { thumbY = innerY; }
-            if (thumbY + thumbH > innerY + innerH) { thumbY = innerY + innerH - thumbH; }
-            c.PushClip(innerX, innerY, innerW, innerH);
-            if (sbTrack.bg != 0) {
-                c.FillRoundRect(barX, innerY, barW, innerH, barW / 2,
-                                sbTrack.bg);
-            }
-            c.FillRoundRect(barX, thumbY, barW, thumbH, barW / 2,
-                            sbStyle.BgOr(s.fg));
-            c.PopClip();
-        }
 
         // 校验消息显示在字段下方（在内容裁剪区之外绘制，
         // 不会被 PopClip 截掉）。
@@ -815,40 +821,7 @@ public class TextArea : Control {
                        countStyle.FgOr(s.fg), cfs);
         }
 
-        app.hitTester.RegisterRect(id, x, y, w, h, 1);
-
-        // 鼠标选择：按下锚定选区并放置光标，按住拖动移动活动端。
-        if (Ui.PressedDown(app, id) && !off) {
-            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
-            if (!Modifiers.HasShift(app.window.EventMods()) || selAnchor < 0) {
-                selAnchor = cursorPos;
-            }
-            this.ClampCursor();
-            app.RequestRedraw();
-        } else if (focused && app.focus.IsPressed(id) && app.EventKind() == 1) {
-            int drag = this.PosFromMouse(app, innerX, innerY, lineH, fs);
-            if (drag != cursorPos) {
-                cursorPos = drag;
-                this.ClampCursor();
-                app.RequestRedraw();
-            }
-        }
-        // 单消费者点击：当此区域是框架解析出的点击
-        // 目标时放置光标。
-        if (app.ClickTarget() == id && !app.ClickClaimed() && !off) {
-            cursorPos = this.PosFromMouse(app, innerX, innerY, lineH, fs);
-            if (selAnchor == cursorPos) { selAnchor = -1; }
-            this.ClampCursor();
-            app.RequestRedraw();
-        }
-        if (!focused && selAnchor >= 0) { selAnchor = -1; }
-
-        // 恢复 Class，避免设计器/序列化器读到污染字段。
-        Class = origClass;
-
-        // 键盘族由 OnKeyDown/OnKeyUp/OnTextInput 路由处理。
-        // 的命名出口；其余通用事件照常按帧快照轮询。
-        On.FireNonKey(app, id, this);
+        // 键盘与文本输入全部由 OnKeyDown/OnKeyUp/OnTextInput 路由处理。
         return id;
     }
 
@@ -861,32 +834,32 @@ public class TextArea : Control {
     public override string StyleType() { return "textarea"; }
 
     // 覆写：返回设计器属性清单（占位 / 文本 / 状态 / 长度 / 计数 / 圆角）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec ph = PropSpec.Text("hint", "Placeholder");
-        ph.str = hint;
+        ph.Field("hint", 0);
         ph.Also("placeholder");
         ps.Add(ph);
-        ps.Add(PropSpec.Text("text", "Text"));
+        ps.Add(PropSpec.Text("text", "Text").DefaultBinding().ViaExtra());
         PropSpec st = PropSpec.Enum("status", "Status",
             new List<string>{ "", "success", "warning", "error" });
-        st.str = FieldStatus;
+        st.Field("FieldStatus", 0);
         ps.Add(st);
         PropSpec ml = PropSpec.Int("maxlen", "MaxLen");
-        ml.num = MaxLen;
+        ml.Field("MaxLen", 1);
         ml.Step(1, 0, 4096);
         ps.Add(ml);
         PropSpec sc = PropSpec.Bool("showCount", "ShowCount");
-        sc.flag = ShowCount;
+        sc.Field("ShowCount", 2);
         ps.Add(sc);
         PropSpec rd = PropSpec.Bool("round", "Round");
-        rd.flag = Round;
+        rd.Field("Round", 2);
         ps.Add(rd);
         PropSpec ro = PropSpec.Bool("readonly", "ReadOnly");
-        ro.flag = readOnly;
+        ro.Field("readOnly", 2);
         ps.Add(ro);
         PropSpec ah = PropSpec.Bool("autoHeight", "AutoHeight");
-        ah.flag = autoHeight;
+        ah.Field("autoHeight", 2);
         ah.WithTip("Grow the box with its content instead of scrolling inside a fixed height.");
         ps.Add(ah);
         return ps;
@@ -894,7 +867,7 @@ public class TextArea : Control {
 
     // 文本经由 SetText 写入，使光标保持在范围内。
     public override string GetExtra(string key) {
-        if (key == "text" || key == "value") { return model.Get(); }
+        if (key == "text" || key == "value") { return this.GetText(); }
         return "";
     }
 
@@ -904,7 +877,7 @@ public class TextArea : Control {
         if (key == "text" || key == "value") {
             // 值没变就别碰光标/选区：属性写入可能每帧都来，而 SetText 的语义是
             // 「换了一段文本」——光标收到末尾。
-            if (val != model.Get()) { this.SetText(val); }
+            if (val != this.GetText()) { this.SetText(val); }
             return true;
         }
         if (key == "countGraphemes") {
@@ -923,14 +896,14 @@ public class TextArea : Control {
     // 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
     // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
 

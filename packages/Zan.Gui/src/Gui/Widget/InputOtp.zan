@@ -7,13 +7,13 @@ namespace Gui.Widget;
 // 验证码输入框（Ant Design Input.OTP 对位）：N 个一格一字符的小框
 // （默认 6），键盘直录、退格回退、方向键移格、Ctrl+V 整段粘贴。
 // 保留式控件：稳定 WidgetId 使焦点在兄弟/弹层变动后仍能保持，
-// 点击/焦点由框架按整框一个命中区解析（格内定位走几何），编辑逻辑
-// 全部收在不依赖 App 的纯函数里（TypeChar/Backspace/MoveLeft/
+// 点击/焦点由框架按 Visual Tree 路由解析，编辑逻辑全部收在
+// 不依赖 App 的纯函数里（TypeChar/Backspace/MoveLeft/
 // Paste/SetCode…），无窗口即可单测：
-// code.data = form.otp;          // 双向绑定验证码字符串
+// code.Value = form.otp;          // 双向绑定验证码字符串
 // code.Change += () => { ... };  // 每格编辑时触发
 // code.Complete += () => { ... };// 最后一格填满时触发一次
-// code.Render(app, 40, 40, 320, 40);
+// app.SetRootControl(code);
 // 能力面（对齐 antd Input.OTP 文档页）：`Length` 字符数、
 // `MaskMode` 密码模式（点显）、`Block` 占满宽度、`Size` 三档、
 // `ReadOnly`/`Disabled`/`SetStatus` 状态族、`Groups`+`Separator`
@@ -33,9 +33,9 @@ public class InputOtp : Control {
 
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
-    // 双向绑定验证码：`otp.data = form.code;`（编译器降级的
+    // 双向绑定验证码：`otp.Value = form.code;`（编译器降级的
     // Binding）。未设置时只编辑内部格子。
-    public Binding<string> data;
+    public Binding<string> Value;
     // 尺寸档位：tiny/small/medium/large，映射 `.small/.large` 类
     // （与 Input 同一路数，几何在 base.css 的 otp规则里）。
     public Binding<string> Size;
@@ -119,7 +119,7 @@ public class InputOtp : Control {
     }
 
     public void BuildCells() {
-        this.children.Clear();
+        this.RemoveAll();
         cellNodes = new List<Control>();
         cellLabels = new List<Label>();
         int sepCount = this.SeparatorCount();
@@ -142,6 +142,7 @@ public class InputOtp : Control {
     // 公共初始化（各构造共用）。
     public void InitOtp(int n) {
         this.InitControl("otp", 1);
+        Value = "";
         if (n < 1) { n = 1; }
         length = n;
         cells = new List<string>();
@@ -282,7 +283,7 @@ public class InputOtp : Control {
     // 格——Complete 只在「这次真的把验证码填满」的沿上发（在满格
     // 上重敲同字 / 程序化覆盖不算「刚填上」）。
     private void Edited(bool filled) {
-        if (data != null) { data.Set(this.GetCode()); }
+        if (Value != null) { Value.Set(this.GetCode()); }
         Change.RaiseS(this);
         bool full = this.IsFull();
         if (full && !wasFull && filled) { Complete.RaiseS(this); }
@@ -475,8 +476,9 @@ public class InputOtp : Control {
     // 相同就不动；重写格子内容时保留光标格（避免每帧重写 active）。
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            string cur = data.Get();
+        liveApp = this.FindApp();
+        if (Value != null) {
+            string cur = Value.Get();
             if (cur != this.GetCode()) {
                 int wantActive = active;
                 this.SetCode(cur);
@@ -508,31 +510,32 @@ public class InputOtp : Control {
     public override Binding<string> SizeOf() { return Size; }
 
     // 覆写：返回设计器属性清单（长度 / 尺寸 / 掩码 / 分组 / 只读 / 状态 / 分隔符）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("value", "Value").DefaultBinding().ViaExtra());
         PropSpec len = PropSpec.Int("length", "Length");
-        len.num = length;
+        len.Field("length", 1);
         len.Step(1, 1, 32);
         ps.Add(len);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.str = Size;
+        sz.Field("Size", 0);
         ps.Add(sz);
         PropSpec mask = PropSpec.Bool("mask", "Mask");
-        mask.flag = MaskMode;
+        mask.Field("MaskMode", 2);
         ps.Add(mask);
         PropSpec blk = PropSpec.Bool("block", "Block");
-        blk.flag = Block;
+        blk.Field("Block", 2);
         ps.Add(blk);
         PropSpec ro = PropSpec.Bool("readonly", "ReadOnly");
-        ro.flag = ReadOnly;
+        ro.Field("ReadOnly", 2);
         ps.Add(ro);
         PropSpec st = PropSpec.Enum("status", "Status",
             new List<string>{ "", "success", "warning", "error" });
-        st.str = FieldStatus;
+        st.Field("FieldStatus", 0);
         ps.Add(st);
         PropSpec sep = PropSpec.Text("separator", "Separator");
-        sep.str = Separator;
+        sep.Field("Separator", 0);
         ps.Add(sep);
         return ps;
     }
@@ -595,7 +598,7 @@ public class InputOtp : Control {
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "Complete") { Complete.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -603,20 +606,7 @@ public class InputOtp : Control {
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "Complete") { Complete.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
-
-    // --- 保留模式钩子（Control） ---
-
-    public override void OnPaint(App app) {
-        int id = this.CommonId();
-        liveApp = app;
-        app.focus.RegisterFocusable(id, this);
-        app.focus.RegisterTextEditable(id);
-        SyncBinding();
-        string a11y = this.EffectiveA11yRole("textbox") + ":" + this.EffectiveA11yLabel("OTP");
-        app.hitTester.RegisterRectL(id, bx, by, bw, bh, 0, a11y);
-        On.Fire(app, id, this);
-    }
 }

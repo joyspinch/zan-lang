@@ -1,0 +1,167 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+public partial class SelectBox {
+    private int inputSession;
+    private weak App popupApp;
+    private Control inputPopup;
+    private bool preparingHead;
+    private bool headPressed;
+    private int headPressSession;
+    private List<SelectOption> headPressOptions;
+    private bool headPressClear;
+    private SelectBoxOptionPanel optionPanel;
+    internal int InputSession() { return inputSession; }
+
+    public override int InputFocusCapabilities() { return 1; }
+
+    private bool InputSessionCurrent(App app, int session, List<SelectOption> options) {
+        return this.FindApp() == app && inputSession == session && opts == options;
+    }
+    private bool HeadSource(Control source) {
+        Control node = source;
+        while (node != null && node != this) {
+            if (node == inputPopup || node == customPopup || node == defaultPopupCard
+                    || node == defaultTreeCard || node == defaultCascadeCard) { return false; }
+            node = node.parent;
+        }
+        return node == this;
+    }
+    private bool ClearAt(App app, int x, int y) {
+        if (!clearable || !this.HasValue() || !this.ContainsPoint(x, y, 0)) { return false; }
+        string cls = this.StyleClass();
+        StyleBox style = this.ResolveStyleAs(app, "select", cls, Style.SNormal());
+        StyleBox arrow = this.ResolvePartAs(app, "select", "arrow", "", cls, Style.SNormal());
+        StyleBox clear = this.ResolvePartAs(app, "select", "clear", "", cls, Style.SNormal());
+        int size = clear.FontOr(app.theme.iconSizeSmall);
+        int left = bx + bw - style.PadROr(app.Scale(6))
+            - arrow.FontOr(app.theme.iconSizeSmall) - app.Scale(4) - size;
+        return x >= left && x < left + size;
+    }
+    // Layout/update boundary, also used when public open was authored before layout.
+    private void PrepareHead(App app) {
+        if (preparingHead || app == null || this.FindApp() != app) { return; }
+        preparingHead = true;
+        try {
+            int preparedSession = inputSession; List<SelectOption> preparedOptions = opts;
+            this.SyncBinding();
+            if (!this.InputSessionCurrent(app, preparedSession, preparedOptions)) { return; }
+            trigX = bx; trigY = by; trigW = bw; lastH = bh;
+            App previous = popupApp;
+            if (inputPopup != null && previous != null && previous != app) {
+                int session = inputSession;
+                Control previousPopup = inputPopup;
+                previous.overlayHost.Hide(previousPopup);
+                if (this.FindApp() != app || inputSession != session || inputPopup != previousPopup) { return; }
+                previousPopup.UseApp(app);
+            }
+            if (this.IsDisabled() && open) { this.SetOpen(false); return; }
+            if (open && !app.overlayHost.IsAnchorActive(this)) { this.MountInputPopup(app); }
+        } finally { preparingHead = false; }
+    }
+    public override void Arrange(int x, int y, int width, int height) {
+        bx = x; by = y; bw = width; bh = height;
+        this.PrepareHead(this.FindApp());
+    }
+    private void MountInputPopup(App app) {
+        int session = inputSession; List<SelectOption> options = opts;
+        Control popup = customPopup != null ? customPopup
+            : (treeMode ? this.EnsureTreeCard(app)
+            : (cascade ? this.EnsureCascadeCard(app) : this.EnsurePopupCard(app)));
+        if (!this.InputSessionCurrent(app, session, options) || !open || popup == null) { return; }
+        inputPopup = popup; popupApp = app;
+        popup.UseApp(app);
+        popup.MeasureTree(app);
+        if (!this.InputSessionCurrent(app, session, options) || !open || inputPopup != popup) { return; }
+        int width = popup.prefW > bw ? popup.prefW : bw;
+        int height = popup.prefH > 0 ? popup.prefH : app.Scale(200);
+        int x = OverlayPopup.FitX(app, bx, width);
+        int y = OverlayPopup.FitY(app, by + bh + app.Scale(4), bh, height);
+        if (placement == 1) { y = by + bh + app.Scale(4); }
+        if (placement == 2) { y = by - height - app.Scale(4); }
+        popup.Arrange(x, y, width, height);
+        if (!this.InputSessionCurrent(app, session, options) || !open || inputPopup != popup) { return; }
+        // Positioned host drawing does not poll input or rebuild during Paint.
+        app.overlayHost.ShowAtAnchor(app, this, popup, x, y);
+        if (!this.InputSessionCurrent(app, session, options) || !open
+                || app.overlayHost.ActiveRoot() != popup) { return; }
+        // Flat defaults focus their real row; hierarchical/custom content owns its keys.
+        if (!cascade && !treeMode && customPopup == null) {
+            if (optionPanel != null) { optionPanel.FocusOption(app, Value.Get(), 1); }
+        }
+    }
+    public override void OnPointerDown(RoutedEventArgs e) {
+        if (e.handled || this.IsDisabled() || !this.HeadSource(e.originalSource)) { return; }
+        App app = this.FindApp();
+        if (app == null || app.window.EventButton() != 0) { return; }
+        this.PrepareHead(app);
+        if (this.FindApp() != app || this.IsDisabled()) { return; }
+        base.OnPointerDown(e);
+        headPressed = true; headPressSession = inputSession; headPressOptions = opts;
+        headPressClear = this.ClearAt(app, e.x, e.y);
+        app.CapturePointer(this);
+        e.Handle();
+    }
+    public override void OnPointerUp(RoutedEventArgs e) {
+        if (!this.HeadSource(e.originalSource)) { return; }
+        base.OnPointerUp(e);
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        headPressed = false; headPressOptions = null;
+        base.OnPointerCancel(e);
+    }
+    public override void OnClick(RoutedEventArgs e) {
+        App app = this.FindApp();
+        bool armed = headPressed; headPressed = false;
+        List<SelectOption> options = headPressOptions; headPressOptions = null;
+        if (e.handled || !armed || app == null || this.IsDisabled()
+                || !this.HeadSource(e.originalSource)
+                || !this.InputSessionCurrent(app, headPressSession, options)) { return; }
+        if (headPressClear && this.ClearAt(app, e.x, e.y)) {
+            this.Clear(); this.SyncBinding(); app.RequestRedraw(); e.Handle(); return;
+        }
+        this.SetOpen(!open);
+        if (this.FindApp() == app) { app.RequestRedraw(); }
+        e.Handle();
+    }
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (e.handled || this.IsDisabled() || !this.HeadSource(e.originalSource)) { return; }
+        App app = this.FindApp(); if (app == null) { return; }
+        if (e.keyCode == 13 || e.keyCode == 32 || e.keyCode == 38 || e.keyCode == 40
+                || e.keyCode == 36 || e.keyCode == 35) {
+            bool wasOpen = open;
+            int session = inputSession; List<SelectOption> options = opts;
+            if (!open) { this.SetOpen(true); session = session + 1; }
+            if (!this.InputSessionCurrent(app, session, options)) { e.Handle(); return; }
+            if (open && !cascade && !treeMode && customPopup == null && inputPopup != null
+                    && optionPanel != null) {
+                SelectBoxOptionPanel popup = optionPanel;
+                if (e.keyCode == 36 || e.keyCode == 35) {
+                    popup.FocusOption(app, -1, e.keyCode == 36 ? 1 : -1);
+                } else if (wasOpen && (e.keyCode == 38 || e.keyCode == 40)) {
+                    popup.MoveFocus(app, e.keyCode == 40 ? 1 : -1);
+                }
+            }
+            e.Handle(); return;
+        }
+        if ((e.keyCode == 27 || e.keyCode == 9) && open) {
+            this.SetOpen(false);
+            if (e.keyCode == 27) { e.Handle(); }
+            return;
+        }
+        base.OnKeyDown(e);
+    }
+    internal void CommitFlatOption(int index, SelectOption option, int session, App app,
+                                  List<SelectOption> options) {
+        if (!open || !this.InputSessionCurrent(app, session, options)
+                || index < 0 || index >= opts.Count || opts[index] != option
+                || option.disabled || option.grp) { return; }
+        this.Choose(index);
+        if (!this.InputSessionCurrent(app, session, options) || !open) { return; }
+        if (!multi) { this.SetOpen(false); }
+    }
+}

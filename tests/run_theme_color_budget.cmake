@@ -10,8 +10,9 @@
 # When you legitimately REMOVE reads, lower (or delete) that file's budget
 # line so the debt cannot silently creep back.
 #
-# Whitelisted (they implement the style layer itself): packages/Zan.Gui/src/Gui/Styling/Theme.zan,
-# Style.zan, StyleBox.zan, Fx.zan.
+# Whitelisted (they implement the style layer itself): Theme.zan, the
+# Style/Style.zan and Style/Style.Defaults.zan partials, StyleBox/StyleBox.zan,
+# and Rendering/Fx.zan.
 #
 # Inputs: ROOT (repository root).
 
@@ -21,7 +22,7 @@ cmake_policy(SET CMP0007 NEW)
 # self-checks; these reads are not drawing paths. When adding exported fields,
 # keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
-  "packages/Zan.Gui/src/Gui/Backend/UiDriver.zan=12"
+  "packages/Zan.Gui/src/Gui/Core/Automation/UiDriver.zan=12"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
@@ -31,8 +32,11 @@ file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
 set(_fail "")
 foreach(_f ${_sources})
   file(RELATIVE_PATH _rel "${ROOT}" "${_f}")
-  if(_rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Theme.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Style.zan"
-     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/StyleBox.zan" OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Rendering/Fx.zan")
+  if(_rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Theme.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Style/Style.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/Style/Style.Defaults.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Styling/StyleBox/StyleBox.zan"
+     OR _rel STREQUAL "packages/Zan.Gui/src/Gui/Rendering/Fx.zan")
     continue()
   endif()
   file(STRINGS "${_f}" _lines ENCODING UTF-8)

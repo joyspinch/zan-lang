@@ -6,6 +6,11 @@ namespace Gui.Widget;
 // Borrows layer trees: their existing layout, parents and event routes stay intact.
 class LayerInputRoot : InputRootAdapter {
     weak AppLayerContext context;
+    public LayerDialogHost dialogHost;
+    public LayerQueueControl queueHost;
+    public LayerWindowHost windowHost;
+
+    public void SetWindowHost(LayerWindowHost host) { windowHost = host; }
 
     public LayerInputRoot(AppLayerContext context) : base("layer_input") {
         this.context = context;
@@ -82,21 +87,28 @@ class LayerInputRoot : InputRootAdapter {
         return content != null ? content.FindInputFocus(app) : null;
     }
 
-    public override Control HitTest(int x, int y, int pointerType) {
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (context != null) {
             LayerState modal = this.Modal();
             for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
                 LayerState s = context.zorder[i];
                 if (s.open && !s.modal && s.state == 2 && inputApp != null
-                    && Layer.Contains(inputApp, s, x, y)) { return this; }
+                    && Layer.Contains(inputApp, s, x, y) && windowHost != null) {
+                    Control minimized = windowHost.HitTest(x, y, pointerType, excludedSubtrees);
+                    if (minimized != null) { return minimized; }
+                }
                 if (s.open && (s.modal || s.state != 2) && Layer.Inside(x, y, s.inputX, s.inputY, s.inputW, s.inputH)) {
-                    Control hit = s.HitLayerInput(x, y, pointerType);
+                    Control hit = s.HitLayerInput(x, y, pointerType, excludedSubtrees);
                     return hit != null ? hit : this;
                 }
                 if (s == modal) { return this; }
             }
         }
-        return content != null ? content.HitTest(x, y, pointerType) : null;
+        if (windowHost != null) {
+            Control hit = windowHost.HitTest(x, y, pointerType, excludedSubtrees);
+            if (hit != null) { return hit; }
+        }
+        return content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null;
     }
 
     // Blank surface input still reaches legacy caption/resize/shade handling.
@@ -104,6 +116,18 @@ class LayerInputRoot : InputRootAdapter {
         if (e.eventName == "KeyDown" && inputApp != null && Layer.Key(inputApp, e.keyCode)) {
             e.Handle();
         }
+    }
+
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        if (windowHost == null) { return children; }
+        if (children == null) { children = new List<Control>(); }
+        if (!children.Contains(windowHost)) { children.Add(windowHost); }
+        return children;
+    }
+
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child != null && child == windowHost);
     }
 
     public override int InputPriority() { return 1; }
@@ -117,10 +141,10 @@ class LayerInputRoot : InputRootAdapter {
 
     void Activate(LayerState s) {
         if (s.modal && inputApp != null) {
-            if (content != null) { inputApp.ReleaseInputSubtree(content); }
+            if (content != null) { inputApp.CancelInputSubtree(content); }
             for (int i = 0; i < context.zorder.Count; i = i + 1) {
                 LayerState other = context.zorder[i];
-                if (other != s) { other.CancelLayerInput(); }
+                if (other != s) { other.CancelLayerInputOnly(); }
             }
         }
     }

@@ -1,5 +1,5 @@
 // WEB_GUI_ROADMAP P8 用例：设计稿的动态原语（<template data-for> / data-if）
-// 宿主挂模型验证行展开、作用域推送、插拔与双向回写。无头直调同步通道。
+// 宿主挂模型验证行展开、作用域推送、插拔与双向回写。无头经 App 同步通道。
 // 设计稿经 Html.Parse 单跳建树，宿主仍是 ChildWindow 的模型宿主通道。
 using System;
 using System.IO;
@@ -9,6 +9,11 @@ using Gui;
 using Gui.Widget;
 
 class FormDynamicWin : ChildWindow {
+    public void Attach(App app, Control tree, object model) {
+        host = app;
+        open = true;
+        this.SetView(tree, model);
+    }
 }
 
 class DsnDynProbe {
@@ -28,6 +33,7 @@ class DsnDynProbe {
     }
 
     static void Main() {
+        ControlBootstrap.Install();
         fails = 0;
         // 模板行展开经 App 克隆槽（Gui.Html.Install 注册）：
         // 本用例驱动 data-for 语义，先装声明层。
@@ -44,41 +50,39 @@ class DsnDynProbe {
             "{\"showTitle\":true,\"title\":\"hello\","
             + "\"items\":[{\"name\":\"a\"},{\"name\":\"b\"}]}");
         FormDynamicWin w = new FormDynamicWin();
-        w.SetRoot(root, model);
-        w.Wire();
+        App app = App.CreateOffscreen("form-dynamic", 400, 300);
+        w.Attach(app, root, model);
 
         // 模板行展开后根面板子项 = 模板 + 2 行 li + Title。
         DsnDynProbe.Eq("panel kids", Convert.ToString(root.ChildCount()), "4");
-        Control row0 = root.children[1];
-        Control row1 = root.children[2];
-        Control title = root.children[3];
+        Control row0 = root.ChildAt(1);
+        Control row1 = root.ChildAt(2);
+        Control title = root.ChildAt(3);
         DsnDynProbe.Eq("row0 kind", row0.Kind(), "li");
-        DsnDynProbe.Eq("row0 name", row0.children[0].GetProp("text"), "a");
-        DsnDynProbe.Eq("row1 name", row1.children[0].GetProp("text"), "b");
+        DsnDynProbe.Eq("row0 name", row0.ChildAt(0).GetProp("text"), "a");
+        DsnDynProbe.Eq("row1 name", row1.ChildAt(0).GetProp("text"), "b");
 
         // data-if：showTitle=true 可见 + bind 推送。
         DsnDynProbe.Eq("title visible", Convert.ToString(title.visible), "true");
         DsnDynProbe.Eq("title value", title.GetProp("value"), "hello");
 
-        // 插拔：外部改模型必须显式标脏（B-ID149⑤ 脏跳过不认
-        // JsonValue 原地变异）→ 再同步。
+        // 插拔：外部改模型后经 App 泵同步（B-ID149⑤ 不认
+        // JsonValue 原地变异的隐式标脏）。
         model.PathSet("showTitle", "false");
-        w.MarkDirty();
-        w.SyncFromModel();
+        app.SyncModelHosts();
         DsnDynProbe.Eq("title hidden", Convert.ToString(title.visible), "false");
 
         // 数组收缩 → 重建为 1 行（panel 子项 3）。
         JsonValue items2 = JsonValue.Parse("[{\"name\":\"a\"}]");
         model.PathSetValue("items", items2);
-        w.MarkDirty();
-        w.SyncFromModel();
+        app.SyncModelHosts();
         DsnDynProbe.Eq("panel kids after shrink",
                        Convert.ToString(root.ChildCount()), "3");
 
         // 行内回写：改克隆 span 的文本 → 模型 items[0].name。
-        Control rowq = root.children[1];
-        rowq.children[0].SetProp("text", "z");
-        w.SyncChangedNode(root);
+        Control rowq = root.ChildAt(1);
+        rowq.ChildAt(0).SetProp("text", "z");
+        app.WriteBackModelHosts();
         JsonValue back = model.Get("items");
         JsonValue back0 = back == null ? null : back.At(0);
         JsonValue backn = back0 == null ? null : back0.Get("name");
@@ -87,7 +91,7 @@ class DsnDynProbe {
 
         // 根级回写。
         title.SetProp("value", "changed");
-        w.SyncChangedNode(root);
+        app.WriteBackModelHosts();
         JsonValue mt = model.Get("title");
         DsnDynProbe.Eq("model title", mt == null ? "?" : mt.AsString(""), "changed");
 

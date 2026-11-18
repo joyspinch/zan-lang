@@ -1,0 +1,295 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class TabsInputCounts {
+    public int changed;
+    public int closed;
+    public int added;
+    public int mutations;
+    // 回调内读到的 payload：关闭下标顺序、变更后活动页、新增插入点。
+    public List<int> closedIdx = new List<int>();
+    public List<int> addedIdx = new List<int>();
+    public int lastChanged;
+    public void Changed(Control s) {
+        changed = changed + 1;
+        lastChanged = ((Tabs)s).Active();
+    }
+    public void Closed(Control s) {
+        closed = closed + 1;
+        closedIdx.Add(((Tabs)s).ClosedIndex());
+    }
+    public void Added(Control s) {
+        added = added + 1;
+        addedIdx.Add(((Tabs)s).Count());
+    }
+}
+
+class TabsNestedClose {
+    public bool nested;
+    public int outer;
+    public int inner;
+    public int restored;
+    public void Close(Control sender) {
+        Tabs tabs = (Tabs)sender;
+        if (nested) { inner = tabs.ClosedIndex(); return; }
+        outer = tabs.ClosedIndex();
+        nested = true;
+        tabs.CloseTab(0);
+        restored = tabs.ClosedIndex();
+    }
+}
+
+class TabsLayoutInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception("Tabs: " + label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static Control Part(Control parent, string cls) {
+        for (int i = 0; i < parent.ChildCount(); i = i + 1) {
+            if (Style.Has(parent.ChildAt(i).Class, cls)) { return parent.ChildAt(i); }
+        }
+        return null;
+    }
+    static Control Header(Tabs tabs, int index) { return tabs.navStrip.ChildAt(index); }
+    static Control Close(Tabs tabs, int index) { return Part(Header(tabs, index), "tab-item-close"); }
+    static Tabs Build(int source, int style, int orient) {
+        Tabs tabs = null;
+        if (source == 0) {
+            tabs = new Tabs(style, orient);
+            tabs.Add("Home", false); tabs.Add("A", true); tabs.Add("B", true); tabs.Add("C", true);
+            tabs.SetShowAdd(true);
+        } else {
+            string appearance = style == 0 ? "line" : (style == 1 ? "card" : "segment");
+            HtmlDoc doc = Html.Parse("<zan-tabs options='Home|A|B|C' closable='true' data-show-add='true' data-tab-style='"
+                + appearance + "' orient='" + (orient == 0 ? "horizontal" : "vertical") + "'></zan-tabs>", "", null);
+            Check(doc.root != null && doc.root.ChildCount() == 1 && doc.root.ChildAt(0) is Tabs,
+                "HTML options create a real Tabs");
+            tabs = (Tabs)doc.root.ChildAt(0); doc.root.Remove(tabs);
+            Check(tabs.closableAll && tabs.Closable(0), "HTML closable applies to options-created tabs");
+        }
+        Check(tabs.Count() == 4 && tabs.OptionsText() == "Home|A|B|C" && tabs.showAdd
+            && tabs.style == style && tabs.orient == orient, "code/HTML model and appearance agree source=" + source.ToString() + " count=" + tabs.Count().ToString()
+                + " add=" + tabs.showAdd.ToString() + " style=" + tabs.style.ToString() + " orient=" + tabs.orient.ToString());
+        Button extra = new Button("Extra");
+        extra.inlineStyleCss = "width:52px;height:26px;flex-shrink:0;";
+        tabs.Extra(extra); return tabs;
+    }
+    static TabsInputCounts Hook(Tabs tabs) {
+        TabsInputCounts counts = new TabsInputCounts();
+        tabs.TabChanged.AddS(counts.Changed); tabs.TabClosed.AddS(counts.Closed); tabs.TabAdded.AddS(counts.Added);
+        return counts;
+    }
+    static void Paint(App app, Tabs tabs, int width) {
+        app.SetRootControl(tabs);
+        app.BeginOffscreenFrame();
+        Rect area = new Rect(app.Scale(7), app.Scale(11), app.Scale(width), app.Scale(200));
+        tabs.RenderInside(app, area); tabs.RenderInside(app, area);
+        app.EndOffscreenFrame(); Drain(app);
+    }
+    static void Input(App app, int kind, int x, int y, int button) {
+        app.ProcessOffscreenInput(kind, x, y, button, 0, 0, 0);
+    }
+    static void Click(App app, Control target, Control owner) {
+        Check(target != null && target.bw > 0 && target.bh > 0, "real click target has geometry");
+        int x = target.bx + target.bw / 2; int y = target.by + target.bh / 2;
+        Input(app, 2, x, y, 0);
+        Check(app.GetCapturedPointer() == owner, "actual Down captures nearest button owner=" + owner.Class + " at=" + x.ToString() + "," + y.ToString()
+            + " target=" + target.Class + " root=" + app.rootControl.Class);
+        Input(app, 3, x, y, 0); Drain(app);
+        Check(app.GetCapturedPointer() == null, "actual Up releases capture");
+    }
+    static bool Contains(Control outer, Control inner) {
+        return inner.bw > 0 && inner.bh > 0 && inner.bx >= outer.bx && inner.by >= outer.by
+            && inner.bx + inner.bw <= outer.bx + outer.bw && inner.by + inner.bh <= outer.by + outer.bh;
+    }
+    static void CheckSquareAction(App app, Control button) {
+        Check(button.bw == app.Scale(22) && button.bh == app.Scale(22), "tab action uses a scaled 22x22 square");
+        Check(button.ChildCount() == 1 && button.ChildAt(0) is IconView, "tab action owns its real icon child");
+        Control icon = button.ChildAt(0);
+        int dx = icon.bx * 2 + icon.bw - button.bx * 2 - button.bw;
+        int dy = icon.by * 2 + icon.bh - button.by * 2 - button.bh;
+        Check(Contains(button, icon) && icon.bw == icon.bh && dx >= -2 && dx <= 2 && dy >= -2 && dy <= 2,
+            "tab action icon is centered and contained");
+    }
+    static void Geometry(App app, Tabs tabs, int width) {
+        Check(tabs.bw == app.Scale(width) && tabs.bh == app.Scale(200), "RenderInside uses the requested rectangle");
+        string appearance = tabs.style == 0 ? "line" : (tabs.style == 1 ? "card" : "segment");
+        Check(Style.Has(tabs.Class, appearance) && Style.Has(tabs.navStrip.Class, appearance), "root/nav appearance classes");
+        int activeCount = 0;
+        for (int i = 0; i < tabs.Count(); i = i + 1) {
+            Control header = Header(tabs, i);
+            bool selected = Style.Has(header.Class, "active");
+            if (selected) { activeCount = activeCount + 1; }
+            Check(selected == (i == tabs.Active()) && Style.Has(header.Class, appearance), "only active tab has selected class");
+            Control previous = app.styleCtx;
+            app.styleCtx = header;
+            StyleBox box = header.ResolveStyle(app, Style.SNormal());
+            app.styleCtx = previous;
+            if (selected) {
+                Check(box.FgOr(0) == (tabs.style == 1 ? app.theme.textPrimary : app.theme.primary), "selected foreground style=" + tabs.style.ToString() + " orient=" + tabs.orient.ToString()
+                    + " actual=" + box.FgOr(0).ToString());
+                if (tabs.style == 0) {
+                    Check((tabs.orient == 0 ? box.borderBottomW : box.borderLeftW) == app.Scale(2), "line selection uses the orientation edge");
+                } else {
+                    Check(box.BgOr(0) == app.theme.bgPrimary && box.radius > 0, "card/segment selected surface and corners");
+                    Check(box.BorderBottomPx() == 0, "card/segment do not inherit the line underline style=" + tabs.style
+                        + " orient=" + tabs.orient + " border=" + box.BorderBottomPx());
+                }
+            } else { Check(box.FgOr(0) == app.theme.textSecondary, "inactive foreground"); }
+            Control close = Close(tabs, i);
+            Check((close != null) == tabs.Closable(i), "pinned tabs have no close button");
+            if (close == null) { continue; }
+            CheckSquareAction(app, close);
+            Check(Contains(header, close), "close square fits its tab");
+            Control title = Part(header, "tab-item-title");
+            Check(title.bx + title.bw < close.bx, "tab title has clearance before the close button");
+            int center = close.by * 2 + close.bh - header.by * 2 - header.bh;
+            int inset = header.StyleInsetT() - header.StyleInsetB();
+            Check(center >= inset - 2 && center <= inset + 2, "close is centered in the tab content");
+        }
+        Check(activeCount == 1, "one selected header");
+        if (tabs.orient == 0 && width == 640) {
+            Control extra = tabs.GetExtra(); Control nav = tabs.navStrip;
+            Check(extra != null && extra.parent == nav && Contains(nav, extra)
+                && extra.bx + extra.bw == nav.bx + nav.bw - nav.padR, "extra slot aligns to the right inner edge");
+            Control add = Part(nav, "tab-add-btn");
+            Check(add != null && add.bx + add.bw <= extra.bx, "add and extra do not overlap");
+            CheckSquareAction(app, add);
+            Control last = Header(tabs, tabs.Count() - 1);
+            int center = add.by * 2 + add.bh - last.by * 2 - last.bh;
+            Check(add.bx > last.bx + last.bw && center >= -2 && center <= 2,
+                "add clears the last tab and shares its horizontal centerline");
+        }
+    }
+    static void Resize(App app, Tabs tabs) {
+        Paint(app, tabs, 640); Geometry(app, tabs, 640);
+        List<int> wide = new List<int>();
+        for (int i = 0; i < tabs.Count(); i = i + 1) {
+            Control header = Header(tabs, i);
+            wide.Add(header.bx); wide.Add(header.by); wide.Add(header.bw); wide.Add(header.bh);
+        }
+        Paint(app, tabs, 240); Geometry(app, tabs, 240);
+        Paint(app, tabs, 640); Geometry(app, tabs, 640);
+        for (int i = 0; i < tabs.Count(); i = i + 1) {
+            Control header = Header(tabs, i);
+            Check(header.bx == wide[i * 4] && header.by == wide[i * 4 + 1]
+                && header.bw == wide[i * 4 + 2] && header.bh == wide[i * 4 + 3], "640-240-640 restores header geometry");
+        }
+    }
+    static void Behavior(App app, Tabs tabs, int source) {
+        tabs.Select(2); Paint(app, tabs, 640);
+        TabsInputCounts counts = Hook(tabs);
+        Control title = Part(Header(tabs, 1), "tab-item-title");
+        int x = title.bx + title.bw / 2; int y = title.by + title.bh / 2;
+        Input(app, 2, x, y, 1);
+        Check(tabs.TakeContext() == 1 && tabs.TakeContext() == -1, "right Down records context tab once");
+        Input(app, 3, x, y, 1); Drain(app);
+        Check(tabs.Active() == 2 && counts.changed == 0 && counts.closed == 0, "right button does not select or close");
+        Control close = Close(tabs, 1);
+        Click(app, close.ChildAt(0), close);
+        Check(tabs.Count() == 3 && tabs.Active() == 1 && tabs.LabelAt(1) == "B"
+            && counts.closed == 1 && counts.changed == 1 && counts.closedIdx[0] == 1
+            && counts.lastChanged == 1, "inactive close preserves active identity and shifts its index once");
+        Paint(app, tabs, 640); Geometry(app, tabs, 640);
+        close = Close(tabs, 1); Click(app, close.ChildAt(0), close);
+        Check(tabs.Count() == 2 && tabs.Active() == 1 && tabs.LabelAt(1) == "C"
+            && counts.closed == 2 && counts.changed == 2 && counts.closedIdx[1] == 1
+            && counts.lastChanged == 1, "active close selects its successor at the same index once");
+        Paint(app, tabs, 640); Geometry(app, tabs, 640);
+        if (source == 0) {
+            tabs.CloseTab(0);
+            Check(tabs.Count() == 2 && tabs.LabelAt(0) == "Home"
+                && counts.closed == 2, "pinned Home survives close requests");
+        }
+        Control header = Header(tabs, 0); Click(app, Part(header, "tab-item-title"), header);
+        Check(tabs.Active() == 0 && counts.changed == 3 && counts.lastChanged == 0,
+            "real title click selects exactly once");
+        Paint(app, tabs, 640); Geometry(app, tabs, 640);
+        Control add = Part(tabs.navStrip, "tab-add-btn"); Click(app, add.ChildAt(0), add);
+        Check(counts.added == 1 && counts.addedIdx[0] == 2 && tabs.Count() == 2,
+            "showAdd raises one request without inserting a tab");
+        Paint(app, tabs, 640); Paint(app, tabs, 640);
+        Check(counts.changed == 3 && counts.closed == 2 && counts.added == 1, "repeated rendering never replays select/close/add");
+    }
+    static void Overflow(App app, Tabs tabs) {
+        for (int i = 0; i < 12; i = i + 1) { tabs.Add("Page " + Convert.ToString(i), true); }
+        tabs.Select(0); Paint(app, tabs, 240);
+        Control nav = tabs.navStrip; Rect view = nav.ScrollViewport();
+        if (tabs.orient == 0) {
+            Check(nav.ScrollExtentX() > view.width, "narrow horizontal nav owns overflow");
+            nav.SetScrollLeft(app.Scale(40));
+            Check(nav.ScrollLeft() > 0 && nav.ScrollTop() == 0, "horizontal scroll uses nav ScrollLeft");
+        } else {
+            Check(nav.ScrollExtent() > view.height, "short vertical nav owns overflow");
+            nav.SetScrollTop(app.Scale(40));
+            Check(nav.ScrollTop() > 0 && nav.ScrollLeft() == 0, "vertical scroll uses nav ScrollTop");
+        }
+        tabs.Select(tabs.Count() - 1); Paint(app, tabs, 240);
+        nav = tabs.navStrip; Control last = Header(tabs, tabs.Active()); view = nav.ScrollViewport();
+        Check(tabs.orient == 0 ? nav.ScrollLeft() > 0 : nav.ScrollTop() > 0, "selecting last reveals it through nav scrolling");
+        Check(last.bx >= view.x && last.by >= view.y && last.bx + last.bw <= view.x + view.width
+            && last.by + last.bh <= view.y + view.height, "selected last header is fully visible orient=" + tabs.orient.ToString()
+                + " header=" + last.bx.ToString() + "," + last.by.ToString() + "," + last.bw.ToString() + "," + last.bh.ToString()
+                + " viewport=" + view.x.ToString() + "," + view.y.ToString() + "," + view.width.ToString() + "," + view.height.ToString());
+        tabs.SetLabel(tabs.Active(), "A very long document title that must leave room for the close button in a narrow window");
+        Paint(app, tabs, 240);
+        Control longHeader = Header(tabs, tabs.Active());
+        Control longClose = Close(tabs, tabs.Active());
+        Check(Contains(tabs.navStrip, longHeader) && Contains(longHeader, longClose),
+            "long titles preserve a fully visible close button");
+        // Return to the first header through the model, then verify actual routing after reveal.
+        tabs.Select(0); Paint(app, tabs, 240); Control header = Header(tabs, 0);
+        Click(app, Part(header, "tab-item-title"), header);
+        Check(tabs.Active() == 0 && (tabs.orient == 0 ? tabs.navStrip.ScrollLeft() == 0 : tabs.navStrip.ScrollTop() == 0),
+            "revealing first restores origin and a real click reaches the visible tab");
+    }
+    static void Stale(App app, int source, int kind) {
+        Tabs tabs = Build(source, Tabs.Line(), Tabs.Horizontal());
+        TabsInputCounts counts = Hook(tabs); Paint(app, tabs, 640);
+        Control owner = kind == 0 ? Header(tabs, 1) : (kind == 1 ? Close(tabs, 1) : Part(tabs.navStrip, "tab-add-btn"));
+        Control target = kind == 0 ? Part(owner, "tab-item-title") : owner.ChildAt(0);
+        int x = target.bx + target.bw / 2; int y = target.by + target.bh / 2;
+        Input(app, 2, x, y, 0); Check(app.GetCapturedPointer() == owner, "stale-action fixture has actual capture");
+        // Same count and indices: only tree retirement distinguishes the queued old action.
+        app.Post(() => { tabs.SetLabel(0, "Renamed"); counts.mutations = counts.mutations + 1; });
+        Input(app, 3, x, y, 0); Drain(app);
+        Check(counts.mutations == 1 && tabs.LabelAt(0) == "Renamed" && tabs.Count() == 4 && tabs.Active() == 0
+            && counts.changed == 0 && counts.closed == 0 && counts.added == 0 && app.GetCapturedPointer() == null,
+            "preceding posted BuildTree invalidates queued select/close/add from real Up");
+        Paint(app, tabs, 640);
+        owner = kind == 0 ? Header(tabs, 1) : (kind == 1 ? Close(tabs, 1) : Part(tabs.navStrip, "tab-add-btn"));
+        target = kind == 0 ? Part(owner, "tab-item-title") : owner.ChildAt(0);
+        Click(app, target, owner);
+        Check(kind == 0 ? counts.changed == 1 && tabs.Active() == 1
+            : (kind == 1 ? counts.closed == 1 && tabs.Count() == 3 : counts.added == 1), "fresh generation still accepts actual clicks");
+        app.SetRootControl(null);
+    }
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); Drain(app); app.canvas.Destroy(); }
+    static void Main() {
+        Dispatcher.Init(); App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        App app = App.CreateOffscreen("Tabs layout/input", 680, 240);
+        for (int source = 0; source < 2; source = source + 1) {
+            for (int dpi = 100; dpi <= 200; dpi = dpi + 50) {
+                app.SetOffscreenViewport(680, 240, dpi);
+                for (int style = 0; style < 3; style = style + 1) {
+                    for (int orient = 0; orient < 2; orient = orient + 1) {
+                        Tabs tabs = Build(source, style, orient);
+                        Resize(app, tabs); Behavior(app, tabs, source); Overflow(app, tabs); app.SetRootControl(null);
+                    }
+                }
+                for (int kind = 0; kind < 3; kind = kind + 1) { Stale(app, source, kind); }
+            }
+        }
+        Tabs reentrant = new Tabs();
+        reentrant.Add("A", true); reentrant.Add("B", true); reentrant.Add("C", true);
+        TabsNestedClose nested = new TabsNestedClose();
+        reentrant.TabClosed.AddS(nested.Close);
+        reentrant.CloseTab(2);
+        Check(nested.outer == 2 && nested.inner == 0 && nested.restored == 2
+            && reentrant.ClosedIndex() == -1 && reentrant.Count() == 1,
+            "nested close scopes payload until the outer callback returns");
+        Release(app); Release(frame); Console.WriteLine("tabs-layout-input:ok");
+    }
+}

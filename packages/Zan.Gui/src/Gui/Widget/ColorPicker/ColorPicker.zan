@@ -18,16 +18,13 @@ namespace Gui.Widget;
 // 带透明度（Naive UI show-alpha，默认开）：
 // pick.SetShowAlpha(false);          // 隐藏透明度条，alpha 恒 1
 // 内部以 HSV（h 0..359、s/v 0..1000）+ alpha（0..255）工作，绑定
-// 值是打包的 0xAARRGGBB（`SignalInt` / `Binding<int>` 双向）。Zan
+// 值是打包的 0xAARRGGBB（`Binding<int>` 双向）。Zan
 // 的 int 是 32 位，打包色常以负数形式存储——凡提取分量一律走
 // RgbOf / AlphaOf（App.LerpColor 同款符号安全写法），禁止裸除。
 public partial class ColorPicker : Control {
     public Control customPopup;
     // 内部当前打包色信号（0xAARRGGBB）；存在双向绑定时与其同步。
-    public SignalInt model;
-    // 双向绑定值（打包 0xAARRGGBB）：`pick.data = model.color;`
-    // 保持模型字段与选择器双向同步。
-    public Binding<int> data;
+    public Binding<int> Value;
     // 触发条命中 id；+1/+2/+3 为 SV 面板 / 色相条 / 透明度条（WidgetId.Block(8)）。
     public int wid;
     // 值变化时触发（C# 风格：`pick.Change += h;`）。拖动面板/条、
@@ -87,9 +84,9 @@ public partial class ColorPicker : Control {
     public int basePacked;
 
     // 公共初始化：分配 id 块、建默认输入行并挂 Submit 静态转发。
-    private void InitPicker(SignalInt m) {
+    private void InitPicker(int packed) {
         this.InitControl("colorpicker", 1);
-        model = m;
+        Value = packed;
         wid = this.CommonId() * 10;
         wiresOwnEvents = true;
         Change = new UiEvent();
@@ -137,13 +134,13 @@ public partial class ColorPicker : Control {
 
     // Default design-time constructor（黑色）。
     public ColorPicker() {
-        this.InitPicker(new SignalInt(0xFF000000));
-        this.ApplyPacked(model.Get());
+        this.InitPicker(0xFF000000);
+        this.ApplyPacked(Value.Get());
     }
 
     // 自持信号：`ColorPicker pick = new ColorPicker(0xFF5B3737);`
     public ColorPicker(int packed) {
-        this.InitPicker(new SignalInt(packed));
+        this.InitPicker(packed);
         this.ApplyPacked(packed);
     }
 
@@ -169,26 +166,22 @@ public partial class ColorPicker : Control {
     // 程序化赋值（同步内部 HSV 与触发条；不触发 Change）。
     public void SetColor(int packed) {
         this.ApplyPacked(packed);
-        model.Set(this.CurrentRgb());
-        if (data != null) { data.Set(this.CurrentRgb()); }
+        Value.Set(this.CurrentRgb());
     }
 
     // 当前模型值（打包 0xAARRGGBB）。
-    public int Value() { return model.Get(); }
 
     // 用户手势落定：写模型、写回双向绑定、触发 Change。
     public void Commit() {
         int packed = this.CurrentRgb();
-        model.Set(packed);
-        if (data != null) { data.Set(packed); }
+        Value.Set(packed);
         Change.RaiseS(this);
     }
 
-    // 将绑定的模型值拉入内部状态（model -> UI）。
     public override void SyncBinding() {
-        if (data == null) { return; }
-        int cur = data.Get();
-        if (!ColorPicker.SamePacked(cur, model.Get())) { model.Set(cur); }
+        base.SyncBinding();
+        int packed = Value.Get();
+        if (!ColorPicker.SamePacked(packed, this.CurrentRgb())) { this.ApplyPacked(packed); }
     }
 
     // 显示透明度条（Naive UI show-alpha）。关闭时 alpha 恒 1。
@@ -320,19 +313,19 @@ public partial class ColorPicker : Control {
     public override string Kind() { return "ColorPicker"; }
 
     // 设计器属性表：showAlpha 开关与 mode 取值格式枚举。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec col = PropSpec.Text("value", "Color");
+        PropSpec col = PropSpec.Text("value", "Color").DefaultBinding();
         col.Also("data");
         col.Also("color");
         ps.Add(col);
         PropSpec sm = PropSpec.Bool("showAlpha", "Show alpha");
-        sm.flag = showAlpha;
+        sm.Field("showAlpha", 2);
         sm.WithTip("Show the alpha slider (Naive UI show-alpha).");
         ps.Add(sm);
         PropSpec md = PropSpec.Enum("mode", "Mode",
             new List<string>{ "rgb", "hex", "hsl", "hsb" });
-        md.str = Mode;
+        md.Field("Mode", 0);
         md.WithTip("Format of the value text (Naive UI modes[0]).");
         ps.Add(md);
         return ps;
@@ -377,14 +370,14 @@ public partial class ColorPicker : Control {
     // 设计器事件绑定："Change" 订阅 Change，其余事件走通用 On。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
     // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
     public override void TriggerEvent(string evt) {
@@ -415,22 +408,7 @@ public partial class ColorPicker : Control {
 
     private int PaintTrigger(App app, int x, int y, int width, int height) {
         int id = wid;
-        this.bx = x;
-        this.by = y;
-        this.bw = width;
-        this.bh = height;
-        SyncBinding();
-        // 外部写模型（程序化赋值）时把内部 HSV 拉齐。
-        int ext = model.Get();
-        if (!ColorPicker.SamePacked(ext, this.CurrentRgb())) {
-            this.ApplyPacked(ext);
-        }
         bool disabled = this.IsDisabled();
-
-        if (this.open && !disabled && !OverlayHost.IsActiveAnchor(app, this)) {
-            Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard(app);
-            OverlayHost.ShowPopup(app, this, pop);
-        }
         StyleBox root = this.ResolveEasedStyleAsIn(
             app, id, "colorpicker", Class, disabled, false, x, y, width, height);
         root.Paint(app, x, y, width, height);
@@ -446,12 +424,6 @@ public partial class ColorPicker : Control {
             trg.SetRadius(trg.RadiusOr(app.Scale(4)));
             trg.Paint(app, x + pad, y + pad, swW, swH);
         }
-        app.hitTester.RegisterRect(id, x, y, width, height, 3);
-        app.focus.RegisterFocusable(id);
-        if (disabled && open) {
-            this.SetOpen(false);
-        }
-        if (this.On.Any()) { On.Fire(app, id, this); }
         return id;
     }
 
@@ -499,16 +471,40 @@ public partial class ColorPicker : Control {
         return defaultPopupCard;
     }
 
+    private bool preparingPopup;
+
+    private void PreparePopup(App app) {
+        if (preparingPopup || !this.CanPrepareInputState(app)) { return; }
+        preparingPopup = true;
+        try {
+            if (this.IsDisabled()) { open = false; }
+            if (!open) {
+                if (OverlayHost.IsActiveAnchor(app, this)) { OverlayHost.DismissPopupFor(app); }
+                return;
+            }
+            if (bw <= 0 || bh <= 0 || OverlayHost.IsActiveAnchor(app, this)) { return; }
+            Control pop = customPopup != null ? customPopup : this.EnsurePopupCard(app);
+            OverlayHost.ShowPopup(app, this, pop);
+        } finally { preparingPopup = false; }
+    }
+
     public void SetOpen(bool want) {
-        if (open == want) { return; }
+        if (open != want) { viewAligned = false; }
         open = want;
-        App a = this.App;
-        if (want) {
-            Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard(a);
-            OverlayHost.ShowPopup(a, this, pop);
-        } else {
-            if (OverlayHost.IsActiveAnchor(a, this)) { OverlayHost.DismissPopupFor(a); }
-        }
+        this.PreparePopup(this.FindApp());
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        App owner = this.FindApp();
+        Control ownerParent = parent;
+        Control root = owner != null ? owner.rootControl : null;
+        int generation = this.InputRootRevision(owner);
+        long sequence = owner != null ? owner.window.EventSeq() : 0;
+        base.Arrange(x, y, w, h);
+        if (owner == null || this.FindApp() != owner || parent != ownerParent
+                || owner.rootControl != root || this.InputRootRevision(owner) != generation
+                || owner.window.EventSeq() != sequence) { return; }
+        this.PreparePopup(owner);
     }
 
     // 插槽支持：支持任意复杂组件（如调色板、预设色块、表格）互嵌到颜色选择器弹层
@@ -522,7 +518,7 @@ public partial class ColorPicker : Control {
 
     public void SetPopupContent(Control c) {
         this.customPopup = c;
-        if (c != null && !children.Contains(c)) {
+        if (c != null && this.IndexOf(c) < 0) {
             this.Add(c);
         }
     }
@@ -708,6 +704,8 @@ public partial class ColorPicker : Control {
     }
 
     // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成触发器绘制与事件交互（弹层经 OnPaintOverlay 延迟绘制）。
+    public override int InputFocusCapabilities() { return 1; }
+
     public override void OnPaint(App app) {
         this.PaintTrigger(app, bx, by, bw, bh);
     }

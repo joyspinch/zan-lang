@@ -4,17 +4,15 @@ using Gui;
 namespace Gui.Widget;
 
 // 高层、自包含的 select / 下拉框。
-// 有状态（创建一次，跨帧保留）。单个 Render() 绘制
-// 触发控件和弹出层，并自持开/关、选项列表、单选或
-// 多选、可选清除按钮、尺寸和状态变体，以及
-// 选项列表较长时自滚动的弹出层（鼠标滚轮 + 滚动条 + 裁剪），
-// 因此调用处只需：
-// SelectBox city = new SelectBox("Pick a city", false);   // 创建一次
-// city.Render(app, x, y, w);                           // 每帧
-// int i = city.Selected();          // 无选中时为 -1
+// 创建一次并挂入 retained Children 树；父容器负责 CSS 布局。
+// 控件自持开/关、选项列表、单选或多选、可选清除按钮、尺寸和状态变体，
+// 长选项列表的弹出层复用统一 OverlayHost 与路由输入：
+// SelectBox city = new SelectBox("Pick a city");
+// form.Children.Add(city);
+// int i = city.Value.Get();          // 无选中时为 -1
 // 多选：SelectBox.Multi(hint) + IsChosen(i)。流畅配置：
 // 尺寸档另行赋值：`box.Size = "large";`（"small"/"medium"/"large"）。
-// 绑定：`sel.data = form.color;` 将选中索引双向绑定到
+// 绑定：`sel.Value = form.color;` 将选中索引双向绑定到
 // 普通字段；`SelectBox.FromOptions(options, hint)` 从标签列表构建，
 // 且 `sel.Change += h;` 在每次选择变化时触发。
 public partial class SelectBox : Control {
@@ -22,16 +20,8 @@ public partial class SelectBox : Control {
     public List<SelectOption> opts;
     public Control customPopup;
     public Card defaultPopupCard;
-    // 单选选中下标（-1 无）；多选模式不用。
-    public int selected;
-    // 可选共享选择信号（SelectBox.Bind）。
-    public SignalInt model;
-    // 双向绑定的选中索引：`sel.data = form.color;`（编译器降级的
-    // Binding）。新变动的一方生效，弹出层与字段保持同步。
-    public Binding<int> data;
-    // 上次与 model / data 同步的值：SyncBinding 据此判断谁变了。
-    public int lastModel;
-    public int lastData;
+    // 单选索引，-1 表示无选择；多选集合由选项维护。
+    public Binding<int> Value;
     // 选择变化时触发（`sel.Change += h;`）。
     public UiEvent Change;
     // 选项列表打开/关闭时触发，无论由哪种方式
@@ -48,9 +38,6 @@ public partial class SelectBox : Control {
     public bool open;
     // 弹层列表滚动偏移（像素）。
     public int scrollY;
-    // 弹层滚动偏移的信号视图：内嵌 Scrollbar 直接拖它，
-    // 每帧与 `scrollY` 互相同步。
-    public SignalInt scrollSignal;
     // 尺寸档："small" / "medium" / "large"（§6.4 尺寸档统一 string）。
     // Binding<string> 使属性面板的 size 行真正写回；渲染时映射为
     // select.* 档位 class（base.css 的 --height-* token 规则）。
@@ -162,7 +149,7 @@ public partial class SelectBox : Control {
     public SelectBox(string hintText, bool isMulti) {
         this.InitControl("selectbox", 0);
         this.opts = new List<SelectOption>();
-        this.selected = 0 - 1;
+        Value = -1;
         this.hint = hintText;
         this.multi = isMulti;
         this.clearable = false;
@@ -180,8 +167,6 @@ public partial class SelectBox : Control {
         this.lastH = 0;
         this.hoverRow = 0 - 1;
         this.wiresOwnEvents = true;
-        this.lastModel = 0 - 1;
-        this.lastData = 0 - 1;
         this.tableColumns = null;
         this.filterHint = "";
         this.cascade = false;
@@ -209,9 +194,9 @@ public partial class SelectBox : Control {
 
     // 当前选中项的数据值（无显式值时返回 label；未选中时返回 ""）。
     public string SelectedValue() {
-        if (selected >= 0 && selected < opts.Count) {
-            string v = opts[selected].val;
-            return (v != null && v != "") ? v : opts[selected].label;
+        if (Value.Get() >= 0 && Value.Get() < opts.Count) {
+            string v = opts[Value.Get()].val;
+            return (v != null && v != "") ? v : opts[Value.Get()].label;
         }
         return "";
     }
@@ -242,13 +227,13 @@ public partial class SelectBox : Control {
         popupWDirty = true;
         opts = new List<SelectOption>();
         if (text == null) {
-            selected = 0 - 1;
+            Value.Set(0 - 1);
             scrollY = 0;
             return;
         }
         string s = text.Trim();
         if (s == "") {
-            selected = 0 - 1;
+            Value.Set(0 - 1);
             scrollY = 0;
             return;
         }
@@ -275,7 +260,7 @@ public partial class SelectBox : Control {
                         opts.Add(new SelectOption(sv, sv, false));
                     }
                 }
-                if (selected >= opts.Count) { selected = opts.Count - 1; }
+                if (Value.Get() >= opts.Count) { Value.Set(opts.Count - 1); }
                 scrollY = 0;
                 return;
             }
@@ -287,7 +272,7 @@ public partial class SelectBox : Control {
                 opts.Add(new SelectOption(p, p, false));
             }
         }
-        if (selected >= opts.Count) { selected = opts.Count - 1; }
+        if (Value.Get() >= opts.Count) { Value.Set(opts.Count - 1); }
         scrollY = 0;
     }
 
@@ -343,16 +328,12 @@ public partial class SelectBox : Control {
         return rows;
     }
 
-    // 当前选中下标（Selected 的别名）。
-    public int Value() { return selected; }
-
     // 外部设定选中下标（钳制到有效范围，-1 = 无选择）。
     // 程序化赋值不触发 Change；弹出层与渲染下一帧读到新值。
     public void SetIndex(int idx) {
         if (idx >= opts.Count) { idx = opts.Count - 1; }
         if (idx < 0) { idx = 0 - 1; }
-        selected = idx;
-        lastModel = selected;
+        Value.Set(idx);
     }
 
     // 按选项文本或值匹配并选中
@@ -381,8 +362,9 @@ public partial class SelectBox : Control {
             if (cur is SelectBox) {
                 SelectBox sb = (SelectBox)cur;
                 int idx = Convert.ToInt32(sender.name);
-                sb.Choose(idx);
-                if (!sb.multi) { sb.SetOpen(false); }
+                if (idx >= 0 && idx < sb.opts.Count) {
+                    sb.CommitFlatOption(idx, sb.opts[idx], sb.inputSession, sb.FindApp(), sb.opts);
+                }
                 return;
             }
             cur = cur.Parent();
@@ -398,8 +380,11 @@ public partial class SelectBox : Control {
             defaultPopupCard.Pad(4);
             defaultPopupCard.parent = this;
         }
+        int session = inputSession; List<SelectOption> options = opts;
         defaultPopupCard.RemoveAll();
-        Panel col = Panel.Column();
+        if (!this.InputSessionCurrent(app, session, options)) { return defaultPopupCard; }
+        optionPanel = new SelectBoxOptionPanel(this);
+        SelectBoxOptionPanel col = optionPanel;
         col.Gap(2);
         for (int i = 0; i < opts.Count; i = i + 1) {
             SelectOption op = opts[i];
@@ -408,17 +393,18 @@ public partial class SelectBox : Control {
                 grp.AddClass("muted");
                 col.Add(grp);
             } else {
-                Button item = new Button(op.label).Ghost();
+                SelectBoxOptionButton item = new SelectBoxOptionButton(this, i, op, opts, inputSession);
+                item.Ghost();
                 item.AddClass("align-left");
                 item.Class = "select-option";
                 item.name = Convert.ToString(i);
-                if (selected == i) { item.AddClass("is-selected"); }
+                if (Value.Get() == i) { item.AddClass("is-selected"); }
                 if (op.disabled) { item.Disabled.Set(true); }
-                item.Click.AddS(SelectBox.OnOptionButtonClick);
+                col.Rows.Add(item);
                 col.Add(item);
             }
         }
-        defaultPopupCard.With(col);
+        defaultPopupCard.Content(col);
         if (app != null) {
             defaultPopupCard.OnMeasure(app);
         }
@@ -430,68 +416,45 @@ public partial class SelectBox : Control {
     // 报告。
     public void SetOpen(bool v) {
         if (open == v) { return; }
+        inputSession = inputSession + 1;
+        headPressed = false; headPressOptions = null;
         open = v;
+        App app = this.FindApp();
+        int session = inputSession; List<SelectOption> options = opts;
         if (v) {
             scrollY = 0;
-            // 级联弹层回到第一列；单选已有选中值时把它的祖先链展开，
-            // 重开弹层能直接看到选中路径（多选没有单一选中，回第一列）。
-            cascadePath = new List<int>();
-            cascadeCols = null;
-            if (cascade && !multi && selected >= 0 && selected < opts.Count) {
-                List<int> chain = new List<int>();
-                int walk = opts[selected].parentIdx;
+            cascadePath = new List<int>(); cascadeCols = null;
+            if (cascade && !multi && Value.Get() >= 0 && Value.Get() < opts.Count) {
+                List<int> chain = new List<int>(); int walk = opts[Value.Get()].parentIdx;
                 while (walk >= 0 && walk < opts.Count && chain.Count < 3) {
-                    chain.Insert(0, walk);
-                    walk = opts[walk].parentIdx;
+                    chain.Insert(0, walk); walk = opts[walk].parentIdx;
                 }
                 cascadePath = chain;
             }
-            // 开层即一次新搜索：清掉上一次的关键词。
             if (filterable && filterBox != null) {
-                filterBox.SetText("");
-                filterText = "";
-                this.RebuildFilter();
+                filterBox.SetText(""); filterText = ""; this.RebuildFilter();
             }
-
-            Control pop = this.customPopup != null ? this.customPopup
-                        : (this.treeMode ? this.EnsureTreeCard(App.FrameApp())
-                        : (this.cascade ? this.EnsureCascadeCard(App.FrameApp())
-                        : this.EnsurePopupCard(App.FrameApp())));
-            OverlayHost.ShowPopup(App.FrameApp(), this, pop);
+            this.SyncBinding();
+            if (!this.InputSessionCurrent(app, session, options) || !open) { return; }
+            if (app != null && bw > 0 && bh > 0) { this.MountInputPopup(app); }
+            if (!this.InputSessionCurrent(app, session, options) || !open) { return; }
             Open.RaiseS(this);
-        }
-        else {
-            OverlayHost.DismissPopup();
+        } else {
+            App previous = popupApp; Control popup = inputPopup;
+            popupApp = null; inputPopup = null;
+            if (previous != null && popup != null) { previous.overlayHost.Hide(popup); }
+            if (!this.InputSessionCurrent(app, session, options) || open) { return; }
             Close.RaiseS(this);
         }
+        if (this.InputSessionCurrent(app, session, options) && app != null) { app.RequestRedraw(); }
     }
 
     public override void OnPopupDismissed() {
-        if (this.open) {
-            this.SetOpen(false);
-        }
-    }
-
-    // 将共享信号和双向绑定与 `selected` 协调一致。
-    // 弹出层直接写 `selected`，因此每一侧都与
-    // 上次同步值比较，发生变动的一方生效。
-    public override void SyncBinding() {
-        if (model != null) {
-            int m = model.Get();
-            if (m != selected) {
-                if (selected != lastModel) { model.Set(selected); }
-                else { selected = m; }
-            }
-            lastModel = selected;
-        }
-        if (data != null) {
-            int b = data.Get();
-            if (b != selected) {
-                if (selected != lastData) { data.Set(selected); }
-                else { selected = b; }
-            }
-            lastData = selected;
-        }
+        if (!open) { return; }
+        inputSession = inputSession + 1;
+        headPressed = false; headPressOptions = null;
+        open = false; popupApp = null; inputPopup = null;
+        Close.RaiseS(this);
     }
 
     // 应用弹出层作出的选择：将绑定和 Change
@@ -503,10 +466,8 @@ public partial class SelectBox : Control {
         if (multi) {
             opts[idx].chosen = !opts[idx].chosen;
         } else {
-            if (selected == idx) { return; }
-            selected = idx;
-            if (model != null) { model.Set(idx); lastModel = idx; }
-            if (data != null) { data.Set(idx); lastData = idx; }
+            if (Value.Get() == idx) { return; }
+            Value.Set(idx);
         }
         Change.RaiseS(this);
     }
@@ -631,7 +592,7 @@ public partial class SelectBox : Control {
 
     // 当前选中下标（-1 无）。
     public int Selected() {
-        return selected;
+        return Value.Get();
     }
 
     // 选项总数（程序化灌入/对账用）。
@@ -641,7 +602,7 @@ public partial class SelectBox : Control {
 
     // 当前选中项的标签（未选中返回空串）。
     public string SelectedLabel() {
-        return this.OptionLabel(selected);
+        return this.OptionLabel(Value.Get());
     }
 
     // 返回当前选中项的文本标签（与 VirtualList 接口一致）。
@@ -678,23 +639,21 @@ public partial class SelectBox : Control {
             return false;
         }
         if (pathText != "") { return true; }
-        return selected >= 0 && selected < opts.Count;
+        return Value.Get() >= 0 && Value.Get() < opts.Count;
     }
 
     // 以编程方式设置选中索引（-1 清除）。保持绑定的
     // model/data 同步，但不触发 Change（调用方发起的更新）。
     public void Select(int idx) {
-        if (idx < 0) { selected = 0 - 1; return; }
+        if (idx < 0) { Value.Set(0 - 1); return; }
         if (idx >= opts.Count) { return; }
-        selected = idx;
-        if (model != null) { model.Set(idx); lastModel = idx; }
-        if (data != null) { data.Set(idx); lastData = idx; }
+        Value.Set(idx);
     }
 
     // 清除取值：单选/级联复位选中与路径，多选清全部勾选，
     // 树形清 TreeView 选中（选项列表保留）。
     public void Clear() {
-        selected = 0 - 1;
+        Value.Set(0 - 1);
         pathText = "";
         treeSelSeen = 0 - 1;
         cascadeCols = null;
@@ -708,7 +667,7 @@ public partial class SelectBox : Control {
     // 候选项时需要它。
     public void ClearOptions() {
         opts = new List<SelectOption>();
-        selected = 0 - 1;
+        Value.Set(0 - 1);
         scrollY = 0;
         filteredIdx = null;
         popupWDirty = true;
@@ -743,13 +702,13 @@ public partial class SelectBox : Control {
         // 级联按当前 showPath 动态出路径/短标签（选择后切换设置也
         // 立即生效）；树形仍用收值时缓存的 payload 文本。
         if (cascade) {
-            if (selected >= 0 && selected < opts.Count) {
-                return this.ValueText(selected);
+            if (Value.Get() >= 0 && Value.Get() < opts.Count) {
+                return this.ValueText(Value.Get());
             }
             return pathText;
         }
         if (pathText != "") { return pathText; }
-        if (selected >= 0 && selected < opts.Count) { return opts[selected].label; }
+        if (Value.Get() >= 0 && Value.Get() < opts.Count) { return opts[Value.Get()].label; }
         return "";
     }
 
@@ -800,58 +759,30 @@ public partial class SelectBox : Control {
 
     // 覆写：高取样式行高（触发器），宽缺省 200。
     public override void OnMeasure(App app) {
+        this.SyncBinding();
         StyleBox s = this.ResolveStyleAs(app, "select", Class, Style.SNormal());
         prefH = s.HeightOr(this.HeadHeight(app.theme));
         prefW = s.WidthOr(app.Scale(200));
     }
 
-    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成触发器绘制与事件交互（弹层经 OnPaintOverlay 延迟绘制）。
+    // 触发器外观投影；输入由保留树分发，弹层经 OnPaintOverlay 绘制。
     public override void OnPaint(App app) {
-        this.PaintHead(app, bx, by, bw, bh);
-    }
-
-    public void PaintHead(int x, int y, int w, int hIn) {
-        this.PaintHead(this.App, x, y, w, hIn);
-    }
-    public void PaintHead(App app, int x, int y, int w, int hIn) {
+        int x = bx;
+        int y = by;
+        int w = bw;
+        int hIn = bh;
         app = this.ResolveApp(app);
         if (app == null || app.canvas == null) { return; }
         Canvas c = app.canvas;
         Theme t = app.theme;
-        this.SyncBinding();
-
         string cls = this.StyleClass();
         int h = this.HeadHeight(t);
         if (hIn > 0) { h = hIn; }
-        this.bx = x;
-        this.by = y;
-        this.bw = w;
-        this.bh = h;
-
-        if (this.open && !OverlayHost.IsActiveAnchor(app, this)) {
-            Control pop = this.customPopup != null ? this.customPopup
-                        : (this.treeMode ? this.EnsureTreeCard(app)
-                        : (this.cascade ? this.EnsureCascadeCard(app)
-                        : this.EnsurePopupCard(app)));
-            OverlayHost.ShowPopup(app, this, pop);
-        }
-
         StyleBox s = this.ResolveEasedStyleAsIn(
             app, wid, "select", cls, false, open, x, y, w, h);
         h = s.HeightOr(h);
-        this.lastH = h;
         int fs = this.FontSize(app, s);
-        app.focus.RegisterFocusable(wid);
-        app.hitTester.RegisterRect(wid, x, y, w, h, 1);
-
-        int ek = app.EventKind();
-        int eb = app.window.EventButton();
-        // 触发器按几何判断悬停/点击，因此必须问过弹层：直接读
-        // 原始事件时，画在它上面的下拉/菜单/模态的点击会一路
-        // 穿透下来，把这个选择框也打开。
-        bool leftUp = app.ClickAvailable() && eb == 0;
-
-        bool overHead = Ui.Over(app, x, y, w, h);
+        bool overHead = app.focus != null && app.focus.IsHovered(wid);
 
         // 有值时的清除按钮几何（箭头左侧）。
         int partState = Style.StateOf(app, wid, false);
@@ -889,8 +820,7 @@ public partial class SelectBox : Control {
             // 级联多选：勾选值渲染成标签芯片（× 可单独移除，
             // 放不下折叠 +N），而不是一长串逗号文本。
             CascadePanel.DrawCascadeTags(this, app, c, t, cls, partState, x, y, w, h,
-                                         pad, arrowSlot, showClear, clearSize, fs,
-                                         leftUp);
+                                         pad, arrowSlot, showClear, clearSize, fs);
         } else if (shown == "") {
             int hintFs = placeholderStyle.FontOr(fs);
             int hintY = Canvas.CenterTextY(y, h, hintFs);
@@ -918,30 +848,7 @@ public partial class SelectBox : Control {
         c.DrawGlyphIn("chevron-down", x + w - arrowSlot, y,
             arrowSlot, h, arrowSize, arrowStyle.FgOr(s.fg));
 
-        // ---- 触发控件输入（仅关闭状态） ----
-        // 弹出层自身的点击（选择选项 / 外部关闭）在
-        // OnPaintOverlay 中处理，使其在覆盖阶段解析于内容之上。
-        // 芯片 × 移除值的点击已在 DrawCascadeTags 里认领，跳过。
-        if (leftUp && !open && !app.ClickClaimed()) {
-            if (overClear) {
-                this.Clear();
-                app.RequestRedraw();
-            } else if (overHead) {
-                this.SetOpen(true);
-                // 认领打开时的点击，使刚显示的弹出层不会把
-                // 它当作外部按压而在同一帧立即关闭。
-                app.ClaimClick();
-                app.RequestRedraw();
-            }
-        }
-        On.Fire(app, wid, this);
 
-        // 将选项列表推迟到覆盖阶段：随后它绘制在所有
-        // 在此控件之后绘制的控件（无遮挡），并注册最顶层
-        // 命中区域（不穿透点击）。参见 OnPaintOverlay。
-        trigX = x;
-        trigY = y;
-        trigW = w;
     }
 
     // 弹层宽度：不窄于触发器，但至少能放下最长的一条；
@@ -1010,10 +917,21 @@ public partial class SelectBox : Control {
     }
 
     public void SetPopupContent(Control c) {
-        this.customPopup = c;
-        if (c != null && !children.Contains(c)) {
-            this.Add(c);
+        Control previous = customPopup;
+        if (previous == c) { return; }
+        App app = this.FindApp();
+        int session = inputSession; List<SelectOption> options = opts;
+        bool reopen = open;
+        if (reopen) {
+            this.SetOpen(false); session = session + 1;
+            if (!this.InputSessionCurrent(app, session, options) || open || customPopup != previous) { return; }
         }
+        if (previous != null && previous.parent == this) { this.Remove(previous); }
+        if (!this.InputSessionCurrent(app, session, options) || open || customPopup != previous) { return; }
+        customPopup = c;
+        if (c != null && this.IndexOf(c) < 0) { this.Add(c); }
+        if (!this.InputSessionCurrent(app, session, options) || open || customPopup != c) { return; }
+        if (reopen) { this.SetOpen(true); }
     }
 
     public Control GetPopupContent() {

@@ -44,266 +44,71 @@ public class CascadePanel : Control {
         prefH = viewH;
     }
 
+    private List<CascadePanelColumn> columns;
+
     public override void Arrange(int px, int py, int pw, int ph) {
-        base.Arrange(px, py, pw, ph);
-        if (box != null && box.filterable) {
-            if (box.filterBox == null) {
-                string bhStr = box.filterHint;
-                if (bhStr == "") { bhStr = "Search"; }
-                box.filterBox = new Input(bhStr);
-                box.filterBox.Clearable = true;
-                this.Add(box.filterBox);
+        bx = px; by = py; bw = Math.Max(0, pw); bh = Math.Max(0, ph);
+        App app = this.App;
+        SelectBox s = box;
+        if (app == null || s == null) { return; }
+        if (s.cascadePath == null) { s.cascadePath = new List<int>(); }
+        int margin = app.Scale(8);
+        int filterH = s.FilterBarH(app);
+        int chrome = s.filterable && filterH > 0 ? filterH + margin * 2 : 0;
+        if (s.filterable) {
+            if (s.filterBox == null) {
+                s.filterBox = new Input(s.filterHint == "" ? "Search" : s.filterHint);
+                s.filterBox.Clearable = true;
             }
-            int sbMargin = 8;
-            int fbH = 32;
-            box.filterBox.Arrange(px + sbMargin, py + sbMargin, pw - sbMargin * 2, fbH);
+            if (s.filterBox.parent != this) { this.Add(s.filterBox); }
+            s.filterBox.SetShown(true);
+            s.filterBox.MeasureTree(app);
+            s.filterBox.Arrange(px + margin, py + margin, Math.Max(0, pw - margin * 2), filterH);
+            string live = s.filterBox.GetText();
+            if (live != s.filterText) { s.SetFilterText(live); }
+        } else if (s.filterBox != null && s.filterBox.parent == this) { this.Remove(s.filterBox); }
+        bool filtering = s.filterable && s.filterText != "";
+        if (filtering && s.cascadeFilter == null) { s.RebuildFilter(); }
+        int count = filtering ? 1 : Math.Min(4, s.cascadePath.Count + 1);
+        if (columns == null) { columns = new List<CascadePanelColumn>(); }
+        while (columns.Count > count) {
+            CascadePanelColumn old = columns[columns.Count - 1];
+            columns.RemoveAt(columns.Count - 1);
+            this.Remove(old);
+        }
+        while (columns.Count < count) {
+            CascadePanelColumn column = new CascadePanelColumn(s, columns.Count);
+            columns.Add(column);
+            this.Add(column);
+        }
+        int colW = count > 0 ? pw / count : pw;
+        for (int col = 0; col < count; col = col + 1) {
+            CascadePanelColumn column = columns[col];
+            column.rows = new List<int>();
+            column.filtering = filtering;
+            if (filtering) {
+                if (s.cascadeFilter != null) { column.rows.AddRange(s.cascadeFilter); }
+            } else {
+                List<SelectOption> current = s.cascRoots;
+                if (col > 0) {
+                    int index = s.cascadePath[col - 1];
+                    current = index >= 0 && index < s.opts.Count ? s.opts[index].children : null;
+                }
+                if (current != null) {
+                    for (int i = 0; i < current.Count; i = i + 1) { column.rows.Add(current[i].flatIdx); }
+                }
+            }
+            column.MeasureTree(app);
+            column.Arrange(px + col * colW, py + chrome,
+                col == count - 1 ? pw - col * colW : colW, Math.Max(0, ph - chrome));
         }
     }
 
     public override void OnPaint(App app) {
-        if (box == null || app == null) { return; }
-        SelectBox s = this.box;
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        if (s.cascRoots == null || s.cascRoots.Count == 0) { return; }
-        if (s.cascadePath == null) { s.cascadePath = new List<int>(); }
-
-        int overlayBase = app.hitTester.RegionCount();
-        int ek = app.EventKind();
-        int optH = s.lastH > 0 ? s.lastH : app.theme.heightMedium;
-        int visRows = s.maxVisible;
-        if (visRows < 4) { visRows = 4; }
-
-        int fbH = s.FilterBarH(app);
-        int sbMargin = app.Scale(8);
-        int chrome = 0;
-        if (s.filterable && fbH > 0) { chrome = fbH + sbMargin * 2; }
-        int viewH = bh > 0 ? bh : OverlayPopup.FitH(app, visRows * optH + chrome);
-        int rowsY = 0;
-        int rowsH = viewH - chrome;
-        int w = bw > 0 ? bw : prefW;
-
-        bool filtering = s.filterable && s.filterText != "";
-        List<int> flat = null;
-        if (filtering) {
-            if (s.cascadeFilter == null) { s.RebuildFilter(); }
-            flat = s.cascadeFilter;
-        }
-
-        int nCols;
-        int colW;
-        if (filtering) {
-            nCols = 1;
-            colW = s.bw > 0 ? s.bw : w;
-            if (colW < app.Scale(220)) { colW = app.Scale(220); }
-            w = colW;
-        } else {
-            nCols = s.cascadePath.Count + 1;
-            if (nCols > 4) { nCols = 4; }
-            colW = s.bw > 0 ? s.bw : (w / nCols);
-            if (colW < app.Scale(160)) { colW = app.Scale(160); }
-            w = colW * nCols;
-        }
-        int room = app.canvas.Width() - app.Scale(8);
-        if (w > room) { w = room; }
-        colW = w / nCols;
-        if (colW < 1) { colW = 1; }
-
-        int popX = OverlayPopup.FitX(app, s.bx, w);
-        int popY = OverlayPopup.FitY(app, s.by + optH + app.Scale(4), optH, viewH);
-        rowsY = popY + chrome;
-
-        app.BlockHitsBelow();
-        StyleBox pop = s.ResolvePartAs(app, "select", "popup", "popup",
-                                       s.Class, Style.SSelected());
-        pop.Paint(app, popX, popY, w, viewH);
-        app.BlockHitsRect(popX, popY, w, viewH);
-
-        int rowPad = t.paddingSmall;
-        bool consumed = false;
-        int over = 0 - 1;
-
-        int fs = Style.FontFallback(app, "medium");
-        StyleBox arrowStyle = s.ResolvePartAs(app, "select", "arrow", "",
-                                             s.Class, Style.SSelected());
-        int arrowSlot = arrowStyle.WidthOr(t.paddingLarge + t.iconSizeSmall);
-
-        // ---- 搜索条（filterable）----
-        if (s.filterable && fbH > 0 && s.filterBox != null) {
-            if (!app.focus.IsFocused(s.filterBox.WidgetId())) {
-                app.focus.SetFocused(s.filterBox.WidgetId());
-            }
-            string live = s.filterBox.GetText();
-            if (live != s.filterText) {
-                s.filterText = live;
-                s.RebuildFilter();
-                flat = s.cascadeFilter;
-                filtering = s.filterText != "";
-                app.RequestRedraw();
-            }
-        }
-
-        for (int col = 0; col < nCols; col = col + 1) {
-            int count = 0;
-            List<int> rowsIdx = new List<int>();
-            if (filtering) {
-                count = 0;
-                if (flat != null) { count = flat.Count; }
-                int off = s.ColScroll(0, count * optH, rowsH);
-                int r = off / optH;
-                while (r * optH < off + rowsH && r < count) {
-                    rowsIdx.Add(flat[r]);
-                    r = r + 1;
-                }
-            } else {
-                List<SelectOption> cur = s.cascRoots;
-                if (col > 0) {
-                    cur = null;
-                    int pi = s.cascadePath[col - 1];
-                    if (pi >= 0 && pi < s.opts.Count) { cur = s.opts[pi].children; }
-                }
-                if (cur != null) { count = cur.Count; }
-                int off = s.ColScroll(col, count * optH, rowsH);
-                int r = off / optH;
-                while (r * optH < off + rowsH && r < count) {
-                    rowsIdx.Add(cur[r].flatIdx);
-                    r = r + 1;
-                }
-            }
-            int offCol = s.ColScroll(col, count * optH, rowsH);
-            int cx = popX + col * colW;
-            int hovRel = 0 - 1;
-            if (app.mouseX >= cx && app.mouseX < cx + colW
-                && app.mouseY >= rowsY && app.mouseY < rowsY + rowsH) {
-                int rel = (app.mouseY - rowsY + offCol) / optH;
-                if (rel >= 0 && rel < rowsIdx.Count) { hovRel = rel; }
-            }
-            c.PushClip(cx, rowsY, colW, rowsH);
-            for (int rr = 0; rr < rowsIdx.Count; rr = rr + 1) {
-                int idx = rowsIdx[rr];
-                SelectOption o = s.opts[idx];
-                int ry = rowsY + rr * optH - offCol;
-                bool hov = rr == hovRel && !o.grp && !o.disabled;
-                int st = Style.SNormal();
-                if (o.disabled) {
-                    st = Style.SDisabled();
-                } else {
-                    if (hov) { st = st + Style.SHover(); }
-                    if (!s.multi && idx == s.selected) {
-                        st = st + Style.SSelected();
-                    }
-                }
-                StyleBox row = s.ResolvePartAs(app, "select", "option",
-                                               "option", s.Class, st);
-                row.Paint(app, cx, ry, colW, optH);
-                int rowFs = row.FontOr(fs);
-                int tx = cx + rowPad;
-                if (s.multi) {
-                    int bs = CascadePanel.DrawCascadeCheck(s, app, c, t, s.Class, cx, ry,
-                                                           optH, o.chosen,
-                                                           s.IsPartial(idx));
-                    tx = cx + rowPad + bs + app.Scale(8);
-                }
-                string label = o.label;
-                if (filtering) { label = s.PathOf(idx); }
-                int labW = cx + colW - rowPad - tx;
-                if (o.HasChildren() && !filtering) {
-                    labW = labW - arrowSlot;
-                }
-                c.DrawText(tx, Canvas.CenterTextY(ry, optH, rowFs),
-                    Ellipsis.Fit(label, labW, rowFs), row.fg, rowFs);
-                if (o.HasChildren() && !filtering) {
-                    c.DrawGlyphIn("chevron-right", cx + colW - arrowSlot, ry,
-                        arrowSlot, optH, arrowSlot - t.paddingSmall, row.fg);
-                }
-                if (hov) { over = idx; }
-                if (hov && s.hoverExpand && !filtering && o.HasChildren()) {
-                    List<int> np = new List<int>();
-                    for (int i = 0; i < col && i < s.cascadePath.Count; i = i + 1) {
-                        np.Add(s.cascadePath[i]);
-                    }
-                    np.Add(idx);
-                    if (!s.SameCascadePath(np)) {
-                        s.cascadePath = np;
-                        app.RequestRedraw();
-                    }
-                }
-                if (hov && app.ClickAvailable() && !consumed) {
-                    consumed = true;
-                    app.ClaimClick();
-                    if (filtering) {
-                        if (s.multi) {
-                            s.SetChecked(idx, !o.chosen);
-                            if (s.clearFilterAfter) { s.SetFilterText(""); }
-                        } else {
-                            if (s.clearFilterAfter) { s.SetFilterText(""); }
-                            s.ChooseCascade(idx);
-                        }
-                    } else if (s.multi && (app.mouseX < tx || !o.HasChildren()
-                                         || !s.cascadeLink)) {
-                        s.SetChecked(idx, !o.chosen);
-                    } else if (!s.multi && (!o.HasChildren() || !s.cascadeLink)) {
-                        s.ChooseCascade(idx);
-                    } else {
-                        List<int> next = new List<int>();
-                        for (int i = 0; i < col && i < s.cascadePath.Count; i = i + 1) {
-                            next.Add(s.cascadePath[i]);
-                        }
-                        next.Add(idx);
-                        s.cascadePath = next;
-                    }
-                    app.RequestRedraw();
-                }
-            }
-            c.PopClip();
-            if (app.ClickAvailable() && !consumed
-                && app.hitTester.HitTestFrom(app.mouseX, app.mouseY,
-                                             overlayBase) != 0 - 1) {
-                consumed = true;
-                app.ClaimClick();
-            }
-            if (count * optH > rowsH && rowsH > 0) {
-                bool ownsWheel = app.CaptureWheel(cx, rowsY, colW, rowsH);
-                if (ownsWheel && ek == 13) {
-                    int d = app.window.EventKeyCode();
-                    int v = s.ColScroll(col, count * optH, rowsH);
-                    s.SetColScroll(col, v - d * app.scrollSpeed / 120);
-                    app.RequestRedraw();
-                }
-                if (s.cascadeCols == null) { s.cascadeCols = new List<CascadeColumnScroll>(); }
-                while (s.cascadeCols.Count <= col) { s.cascadeCols.Add(new CascadeColumnScroll(0, null)); }
-                if (s.cascadeCols[col].signal == null) {
-                    s.cascadeCols[col].signal = new SignalInt(0);
-                }
-                SignalInt sig = s.cascadeCols[col].signal;
-                sig.Set(s.ColScroll(col, count * optH, rowsH));
-                Scrollbar.RenderVerticalScroll(app,
-                    cx + colW - app.Scale(12), rowsY + app.Scale(2),
-                    rowsH - app.Scale(4), rowsH - app.Scale(4),
-                    count * optH, sig);
-                int sb = sig.Get();
-                if (sb > count * optH - rowsH) { sb = count * optH - rowsH; }
-                if (sb < 0) { sb = 0; }
-                if (sb != s.ColScroll(col, count * optH, rowsH)) {
-                    s.SetColScroll(col, sb);
-                    app.RequestRedraw();
-                }
-            }
-        }
-
-        if (filtering && (flat == null || flat.Count == 0)) {
-            StyleBox grpStyle = s.ResolvePartAs(app, "select", "group", "",
-                                                s.Class, Style.SNormal());
-            c.DrawText(popX + rowPad, Canvas.CenterTextY(rowsY, optH, fs),
-                Ellipsis.Fit("No matches", w - rowPad * 2, fs),
-                grpStyle.FgOr(pop.fg), grpStyle.FontOr(fs));
-        }
-
-        if (over != s.hoverRow) {
-            s.hoverRow = over;
-            s.Hover.RaiseS(s);
-            app.RequestRedraw();
-        }
+        SelectBox s = box;
+        if (s == null) { return; }
+        StyleBox popup = s.ResolvePartAs(app, "select", "popup", "popup", s.Class, Style.SSelected());
+        popup.Paint(app, bx, by, bw, bh);
     }
 
     // 级联行首的勾选框：复用 checkbox 的 box/check 样式 part。
@@ -331,11 +136,12 @@ public class CascadePanel : Control {
         return bs;
     }
 
-    // 级联多选的触发器：勾选值渲染成一排标签芯片。
+    // 级联多选的触发器：勾选值渲染成一排标签芯片（× 的移除走
+    // SelectBox 真实输入路径，绘制只消费状态）。
     public static void DrawCascadeTags(SelectBox s, App app, Canvas c, Theme t, string cls,
                                        int partState, int x, int y, int w, int h,
                                        int pad, int arrowSlot, bool showClear,
-                                       int clearSize, int fs, bool leftUp) {
+                                       int clearSize, int fs) {
         List<int> vs = s.ValueIdxs();
         int rightEdge = x + w - pad - arrowSlot - t.paddingSmall;
         if (showClear) { rightEdge = rightEdge - clearSize - t.paddingSmall; }
@@ -363,14 +169,6 @@ public class CascadePanel : Control {
             int xx = cx + cw - app.Scale(5) - chipFs;
             c.DrawGlyphIn("close", xx, cy, chipFs + app.Scale(4), chipH,
                           chipFs - 2, chip.fg);
-            if (leftUp && !app.ClickClaimed()
-                && app.mouseX >= xx - app.Scale(2)
-                && app.mouseX < cx + cw
-                && app.mouseY >= cy && app.mouseY < cy + chipH) {
-                app.ClaimClick();
-                s.SetChecked(vs[i], false);
-                app.RequestRedraw();
-            }
             cx = cx + cw + gap;
             shownN = shownN + 1;
         }
@@ -389,7 +187,7 @@ public class CascadePanel : Control {
 
     public override string Kind() { return "CascadePanel"; }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(this.SizeProp());
         return ps;

@@ -2,26 +2,10 @@ using System;
 using Gui;
 using Gui.Widget;
 
-// ListView 自带滚动条的按住拖动回归：行命中区收窄到 rowW=bw-barW
-// 之后，轨道/滑块必须仍可按住拖动——滚动条命中区比行后注册（更
-// 顶层），且向行内侧多伸 grab=Scale(5) 抓取边距。事件按真实节奏
-// 注入：每次 inject 后单独 pump+frame，另加稳定帧（悬停/损伤收尾
-// 需要落帧；真实鼠标拖动天然跨多帧）。回归六件事：
-// ①按下滑块进入拖拽且 offset 不跳；②拖动 offset 跟随（dy*mo/travel）；
-// ③按在轨道上，点击跳转对准该处；④按在贴轨道的 grab 边距内拖动
-// 仍是滚动条接管——行不选中、释放也不选中；⑤逐像素拖动全程精确
-// 跟随——滚动中可见行数在 n/n+1 间来回变，行命中 id 若按可见行逐帧
-// 发号，滚动条 id 跟着漂移、IsPressed 失配，拖两三像素就停摆（曾经
-// 的「拖动被干扰」）；⑥拖动中列表前方多注册/撤掉一个命中区（弹层
-// 开合、前方控件增减）把滚动条 id 顶漂，按压随锚点矩形重绑到新 id，
-// 拖动不停摆、抓取点不重取（id 回来时不瞬移）。
+// Actual retained input: thumb/track/grab margin, final Up, pixel motion and
+// sibling insertion must preserve one body-owned capture before any Paint.
 class ListViewScrollbarDragTest {
     static int fails;
-    static App app;
-    static ListView<string> list;
-    static Rect area;
-    // ⑥ 在列表之前多注册一个命中区，顶漂其后所有即时模式 id。
-    static bool driftBefore;
 
     static void EqInt(string what, int got, int want) {
         if (got == want) { return; }
@@ -30,149 +14,114 @@ class ListViewScrollbarDragTest {
             + Convert.ToString(got) + " want " + Convert.ToString(want));
     }
 
-    static void Body() {
-        if (driftBefore) {
-            int d = app.focus.AllocId();
-            app.hitTester.RegisterRect(d, 0, 290, 10, 10, 0);
-        }
-        list.RenderInside(app, area);
+    static void Check(bool ok, string what) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
     }
 
-    // 注入一个事件并让它独占一帧（真实输入节奏）。
-    static void Ev(int kind, int x, int y) {
-        app.window.InjectEvent(kind, x, y, 0, 0, 0);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
+    static void Ev(App app, int kind, int x, int y) {
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
     }
 
-    static void Main() {
-        fails = 0;
-        driftBefore = false;
-        app = new App("listview-drag", 400, 300);
-        app.Show();
-        app.RequestAnimationFrame(16);
+    static void Exercise(int dpi) {
+        App app = App.CreateOffscreen("listview-drag", 400, 300);
+        app.SetOffscreenViewport(400, 300, dpi);
+        Control root = new Column();
         List<string> data = new List<string>();
         for (int i = 0; i < 100; i = i + 1) {
             data.Add("row " + Convert.ToString(i));
         }
-        list = new ListView<string>(r => new ListItem(r));
+        ListView<string> list = new ListView<string>(r => new ListItem(r));
         list.Bind(data);
-        area = new Rect(0, 0, 390, 280);
-
-        // 两拍稳定帧：字体/行高就位后，几何量按框架公式复算
-        // minThumb=Scale(24)、contentH=实测 prefH 累计——ListItem
-        // 行约 37 逻辑 px，不是统一 RowHeight，推错拖拽期望全错）。
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        int barW = app.Scale(10);
-        int stripX = area.x + area.width - barW;   // 轨道左缘
-        int viewH = area.height;
+        root.Add(list);
+        root.UseApp(app);
+        app.SetRootControl(root);
+        root.MeasureTree(app);
+        root.Arrange(0, 0, app.Scale(400), app.Scale(300));
+        list.Arrange(app.Scale(5), app.Scale(7), app.Scale(390), app.Scale(280));
+        Control body = list.RowControl(0).parent;
+        Rect view = list.ScrollViewport();
+        ScrollState metrics = new ScrollState();
+        Rect track = metrics.Track(app, view.x, view.y, view.width, view.height, false);
         int contentH = list.ContentHeightForTest(app);
-        int thumbH = viewH * viewH / contentH;
-        int minThumb = app.Scale(24);
-        if (thumbH < minThumb) { thumbH = minThumb; }
-        int travel = viewH - thumbH;
-        int mo = contentH - viewH;
-
-        // ① 悬停到位再按住滑块中心（offset=0 时滑块贴轨道顶）：
-        // 进入拖拽，offset 不跳。
-        int startX = stripX + barW / 2;
-        int startY = thumbH / 2;
-        ListViewScrollbarDragTest.Ev(1, startX, startY);
-        ListViewScrollbarDragTest.Ev(2, startX, startY);
-        EqInt("press on thumb starts drag offset", list.scroll.Get(), 0);
-
-        // ② 按住往下拖 100 逻辑 px：offset = 100*mo/travel。
-        int wantOff = 100 * mo / travel;
-        ListViewScrollbarDragTest.Ev(1, startX, startY + 100);
-        EqInt("drag moves offset", list.scroll.Get(), wantOff);
-
-        // 释放后 offset 保持。
-        ListViewScrollbarDragTest.Ev(3, startX, startY + 100);
-        EqInt("release keeps offset", list.scroll.Get(), wantOff);
-
-        // ③ 点击跳转：按在轨道中部（滑块之外），按住期间 offset
-        // 对心到点击处（grabDy=thumbH/2）。
-        int midY = area.y + viewH / 2;
-        ListViewScrollbarDragTest.Ev(1, startX, midY);
-        ListViewScrollbarDragTest.Ev(2, startX, midY);
-        int relMid = midY - area.y - thumbH / 2;
-        if (relMid < 0) { relMid = 0; }
-        if (relMid > travel) { relMid = travel; }
-        int baseOffOff = relMid * mo / travel;
-        EqInt("track click jumps", list.scroll.Get(), baseOffOff);
-        ListViewScrollbarDragTest.Ev(3, startX, midY);
-
-        // ④ 行热区让位后，贴轨道左缘的 grab 边距（Scale(5)）内
-        // 按住拖动仍是滚动条接管：offset 跟随指针（期望值按
-        // 框架的绝对映射逐式复算，容 ±2 舍入），行不选中、
-        // 释放也不选中（回归「拖滚动条松手把行点了」）。
-        int grab = app.Scale(5);
-        int edgeX = stripX - grab + 1;
-        int thumbTop = baseOffOff * travel / mo;
-        int dragY = thumbTop + thumbH / 2;
-        int grabDy = dragY - thumbTop;
-        ListViewScrollbarDragTest.Ev(1, edgeX, dragY);
-        ListViewScrollbarDragTest.Ev(2, edgeX, dragY);
-        ListViewScrollbarDragTest.Ev(1, edgeX, dragY + 40);
-        int wantEdge = (dragY + 40 - grabDy) * mo / travel;
-        int gotEdge = list.scroll.Get();
-        int drift = wantEdge - gotEdge;
-        if (drift < 0) { drift = 0 - drift; }
-        if (drift > 2) {
-            fails = fails + 1;
-            Console.WriteLine("FAIL inner grab edge drags thumb: got "
-                + Convert.ToString(gotEdge) + " want~ "
-                + Convert.ToString(wantEdge));
+        int thumbH = metrics.ThumbLength(app, view.height, contentH);
+        int travel = view.height - thumbH;
+        int maximum = contentH - view.height;
+        Check(travel > 0 && maximum > 0, "overflow has draggable thumb");
+        if (travel <= 0 || maximum <= 0) {
+            app.SetRootControl(null); app.canvas.Destroy(); return;
         }
-        EqInt("no row selected by edge drag", list.sel, 0 - 1);
-        ListViewScrollbarDragTest.Ev(3, edgeX, dragY + 40);
-        EqInt("no row selected after release", list.sel, 0 - 1);
+        int startX = track.x + track.width / 2;
+        int startY = track.y + thumbH / 2;
 
-        // ⑤ 回到顶部，按住滑块中心逐像素下拉 40 步：每步 offset 都须
-        // 精确等于 k*mo/travel。行高约 37 逻辑 px、viewH=280，滚动中
-        // 可见行数在 8/9 间来回变；行命中 id 若按可见行逐帧发号，
-        // 第 2~3 步滚动条 id 就漂走、IsPressed 失配、拖动停摆。
-        list.scroll.Set(0);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        ListViewScrollbarDragTest.Ev(1, startX, startY);
-        ListViewScrollbarDragTest.Ev(2, startX, startY);
+        Ev(app, 2, startX, startY);
+        Check(app.GetCapturedPointer() == body, "thumb Down captures retained body before Paint");
+        EqInt("thumb Down keeps offset", list.scroll.Get(), 0);
+        int distance = app.Scale(60);
+        int wanted = distance * maximum / travel;
+        Ev(app, 1, startX, startY + distance);
+        EqInt("drag follows pointer", list.scroll.Get(), wanted);
+        // Up may carry a newer position without an intervening Move or Paint.
+        distance = app.Scale(70);
+        wanted = distance * maximum / travel;
+        Ev(app, 3, startX, startY + distance);
+        EqInt("Up commits final coordinate", list.scroll.Get(), wanted);
+        Check(app.GetCapturedPointer() == null, "Up releases body capture");
+
+        list.SetScrollTop(0);
+        int midY = track.y + view.height / 2;
+        Ev(app, 2, startX, midY);
+        int jumped = (midY - track.y - thumbH / 2) * maximum / travel;
+        EqInt("track Down centers thumb", list.scroll.Get(), jumped);
+        Ev(app, 3, startX, midY);
+
+        list.SetScrollTop(0);
+        int edgeX = track.x - app.Scale(5) + 1;
+        Ev(app, 2, edgeX, startY);
+        Check(app.GetCapturedPointer() == body, "content-side grab margin captures body");
+        Ev(app, 1, edgeX, startY + app.Scale(30));
+        EqInt("grab margin follows pointer", list.scroll.Get(), app.Scale(30) * maximum / travel);
+        Ev(app, 3, edgeX, startY + app.Scale(30));
+        EqInt("grab drag never selects row", list.SelectedIndex(), -1);
+
+        list.SetScrollTop(0);
+        Ev(app, 2, startX, startY);
         int stalls = 0;
         for (int k = 1; k <= 40; k = k + 1) {
-            ListViewScrollbarDragTest.Ev(1, startX, startY + k);
-            int wantK = k * mo / travel;
-            if (list.scroll.Get() != wantK) { stalls = stalls + 1; }
+            Ev(app, 1, startX, startY + k);
+            if (list.scroll.Get() != k * maximum / travel) { stalls = stalls + 1; }
         }
         EqInt("pixel-step drag never stalls", stalls, 0);
-        ListViewScrollbarDragTest.Ev(3, startX, startY + 40);
+        Ev(app, 3, startX, startY + 40);
 
-        // ⑥ 再拖一遍，第 6~13 步在列表前方多注册一个命中区（把滚动条
-        // id 顶漂一位），第 14 步撤掉：按压随锚点矩形重绑到新 id，
-        // 全程不停摆；抓取点沿用，id 回来时也不瞬移。
-        list.scroll.Set(0);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        app.PumpGuarded();
-        app.FrameGuarded(ListViewScrollbarDragTest.Body);
-        ListViewScrollbarDragTest.Ev(1, startX, startY);
-        ListViewScrollbarDragTest.Ev(2, startX, startY);
+        list.SetScrollTop(0);
+        Ev(app, 2, startX, startY);
+        Control sibling = new Button("Unrelated");
         stalls = 0;
         for (int k = 1; k <= 20; k = k + 1) {
-            driftBefore = k >= 6 && k < 14;
-            ListViewScrollbarDragTest.Ev(1, startX, startY + k);
-            int wantK = k * mo / travel;
-            if (list.scroll.Get() != wantK) { stalls = stalls + 1; }
+            if (k == 6) { root.Add(sibling); sibling.Arrange(0, 0, 2, 2); }
+            if (k == 14) { root.Remove(sibling); }
+            Ev(app, 1, startX, startY + k);
+            if (list.scroll.Get() != k * maximum / travel || app.GetCapturedPointer() != body) {
+                stalls = stalls + 1;
+            }
         }
-        EqInt("drag survives id drift before list", stalls, 0);
-        ListViewScrollbarDragTest.Ev(3, startX, startY + 20);
-        driftBefore = false;
-        EqInt("no row selected after drift drag", list.sel, 0 - 1);
+        EqInt("drag survives unrelated sibling insertion and removal", stalls, 0);
+        Ev(app, 3, startX, startY + 20);
+        EqInt("sibling changes never select row", list.SelectedIndex(), -1);
+        Check(app.GetCapturedPointer() == null, "sibling changes preserve final release");
 
+        int beforePaint = list.scroll.Get();
+        app.BeginOffscreenFrame(); list.RenderTree(app); list.RenderTree(app); app.EndOffscreenFrame();
+        EqInt("repeated Paint keeps committed offset", list.scroll.Get(), beforePaint);
+        EqInt("repeated Paint never selects row", list.SelectedIndex(), -1);
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+
+    static void Main() {
+        for (int dpi = 100; dpi <= 200; dpi = dpi + 50) { Exercise(dpi); }
         Console.WriteLine(fails == 0 ? "LISTVIEWDRAG PASS"
             : "LISTVIEWDRAG FAIL " + Convert.ToString(fails));
     }

@@ -1,0 +1,364 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// One retained input root owns the three panels. Panels outside the root rectangle
+// remain in its input ancestry; only the visible panels participate in hit testing.
+public class RichMenu : Control {
+    public UiEvent ActionSelected;
+    public UiEvent Dismissed;
+    public RichMenuPanel rootPanel;
+    public RichMenuPanel childPanel;
+    public RichMenuPanel grandPanel;
+    public int maxRows;
+    public int minWidth;
+    List<MenuItem> items;
+    weak App popupApp;
+    weak Control popupAnchor;
+    AppLoopRegistration registration;
+    bool opened;
+    int generation;
+    int selectedAction = -1;
+    bool resultPending;
+    bool selecting;
+    int sub = -1;
+    int sub2 = -1;
+    int graceRow = -1;
+    int graceRow2 = -1;
+    int graceDeadline = -1;
+    int graceDeadline2 = -1;
+    int pointX;
+    int pointY;
+    bool atAnchor;
+
+    public RichMenu() {
+        this.InitControl("contextmenu", 1);
+        this.wiresOwnEvents = true;
+        this.WithMinTouchSize(0);
+        ActionSelected = new UiEvent();
+        Dismissed = new UiEvent();
+        items = new List<MenuItem>();
+        rootPanel = new RichMenuPanel(this, 0);
+        childPanel = new RichMenuPanel(this, 1);
+        grandPanel = new RichMenuPanel(this, 2);
+        this.Add(rootPanel);
+        this.Add(childPanel);
+        this.Add(grandPanel);
+        childPanel.visible = false;
+        grandPanel.visible = false;
+    }
+
+    public override string Kind() { return "RichMenu"; }
+    public override bool ChildControlsRenderedByOwner() { return true; }
+    public bool IsOpen() { return opened; }
+    public bool IsSelecting() { return selecting; }
+    public void RefreshItems(List<MenuItem> value) {
+        if (!RichMenuModels.Equal(items, value)) { this.SetItems(value); }
+    }
+    public int Session() { return generation; }
+    public int SelectedAction() { return selectedAction; }
+    public int TakeAction() {
+        if (!resultPending) { return -1; }
+        resultPending = false;
+        return selectedAction;
+    }
+    public List<MenuItem> Items() { return items; }
+
+    // Configuration is explicit, before opening (or from a preparation callback).
+    // Replacing a model retires its input rows before publishing the new session.
+    public void SetItems(List<MenuItem> value) {
+        if (value == null) { value = new List<MenuItem>(); }
+        items = RichMenuModels.Copy(value);
+        sub = -1;
+        sub2 = -1;
+        this.ClearGrace();
+        rootPanel.SetItems(items, generation);
+        childPanel.SetItems(null, generation);
+        grandPanel.SetItems(null, generation);
+        childPanel.visible = false;
+        grandPanel.visible = false;
+        if (opened) { this.Prepare(popupApp); }
+    }
+
+    public void ShowAt(App app, int x, int y) { this.ShowCore(app, null, x, y, false); }
+    public void ShowFor(App app, Control anchor) {
+        if (anchor == null) { return; }
+        this.ShowCore(app, anchor, anchor.bx, anchor.by + anchor.bh + app.Scale(4), true);
+    }
+    public void ShowAtAnchor(App app, Control anchor, int x, int y) {
+        this.ShowCore(app, anchor, x, y, false);
+    }
+
+    void ShowCore(App app, Control anchor, int x, int y, bool followAnchor) {
+        if (app == null || app.overlayHost == null) { return; }
+        if (opened) {
+            int previous = generation;
+            this.Close();
+            if (opened || generation != previous + 1) { return; }
+        }
+        generation = generation + 1;
+        int session = generation;
+        opened = true;
+        popupApp = app;
+        popupAnchor = anchor;
+        atAnchor = followAnchor;
+        pointX = x;
+        pointY = y;
+        selectedAction = -1;
+        resultPending = false;
+        sub = -1;
+        sub2 = -1;
+        this.ClearGrace();
+        this.UseApp(app);
+        rootPanel.scrollY = 0;
+        rootPanel.SetItems(items, session);
+        childPanel.SetItems(null, session);
+        grandPanel.SetItems(null, session);
+        childPanel.visible = false;
+        grandPanel.visible = false;
+        this.MeasureTree(app);
+        this.Prepare(app);
+        if (anchor == null) { app.overlayHost.ShowAt(app, this, bx, by); }
+        else { app.overlayHost.ShowAtAnchor(app, anchor, this, bx, by); }
+        if (!opened || generation != session || popupApp != app) { return; }
+        if (app.overlayHost.ActiveRoot() != this) { this.OnPopupDismissed(); return; }
+        RichMenuSession participant = new RichMenuSession();
+        participant.owner = this;
+        participant.session = session;
+        registration = app.RegisterLoopParticipant(this, participant);
+        app.RequestRedraw();
+    }
+
+    public void Close() {
+        App app = popupApp;
+        if (!opened) { return; }
+        if (app != null && app.overlayHost.ActiveRoot() == this) { app.overlayHost.Hide(this); }
+        else { this.OnPopupDismissed(); }
+    }
+
+    public override void OnPopupDismissed() {
+        if (!opened) { return; }
+        bool notify = !selecting;
+        opened = false;
+        popupApp = null;
+        popupAnchor = null;
+        generation = generation + 1;
+        if (registration != null) { registration.Invalidate(); registration = null; }
+        this.ClearGrace();
+        if (notify) { Dismissed.RaiseS(this); }
+    }
+
+    public void Activate(RichMenuRow source, RichMenuPanel panel, int index, int session) {
+        App app = popupApp;
+        if (!opened || session != generation || app == null || app.overlayHost.ActiveRoot() != this) { return; }
+        if (!panel.visible || index < 0 || index >= panel.items.Count
+            || index >= panel.ChildCount() || panel.ChildAt(index) != source) { return; }
+        MenuItem item = panel.items[index];
+        if (item == null || item.disabled || item.kind != 0) { return; }
+        int action = item.action;
+        selecting = true;
+        app.overlayHost.Hide(this);
+        selecting = false;
+        if (opened || generation != session + 1) { return; }
+        selectedAction = action;
+        resultPending = true;
+        ActionSelected.RaiseS(this);
+    }
+
+    public void Hover(RichMenuPanel panel, int index, int session) {
+        if (!opened || generation != session || !panel.visible) { return; }
+        if (index < 0 || index >= panel.items.Count) { return; }
+        MenuItem item = panel.items[index];
+        if (panel.level == 2) {
+            graceDeadline = -1;
+            graceDeadline2 = -1;
+        } else if (panel.level == 1) {
+            graceDeadline = -1;
+            if (item.kind == 3 && !item.disabled && item.children != null) {
+                graceDeadline2 = -1;
+                if (sub2 != index) {
+                    sub2 = index;
+                    grandPanel.visible = true;
+                    grandPanel.SetItems(item.children, generation);
+                }
+            } else if (sub2 >= 0 && graceRow2 != index) {
+                graceRow2 = index;
+                graceDeadline2 = Window.GetTickMs() + 400;
+            }
+        } else {
+            if (item.kind == 3 && !item.disabled && item.children != null) {
+                graceDeadline = -1;
+                if (sub != index) {
+                    sub = index;
+                    sub2 = -1;
+                    graceDeadline2 = -1;
+                    childPanel.visible = true;
+                    grandPanel.visible = false;
+                    childPanel.SetItems(item.children, generation);
+                }
+            } else if (sub >= 0 && graceRow != index) {
+                graceRow = index;
+                graceDeadline = Window.GetTickMs() + 400;
+            }
+        }
+        this.Prepare(popupApp);
+        if (registration != null) { registration.Reschedule(); }
+        if (popupApp != null) { popupApp.RequestRedraw(); }
+    }
+
+    // Entering a foreground panel cancels the grace of its ancestor, including
+    // padding/separators. Leaving a row cancels its pending expiry.
+    public void EnterPanel(int level) {
+        if (level > 0) { graceDeadline = -1; graceRow = -1; }
+        if (level > 1) { graceDeadline2 = -1; graceRow2 = -1; }
+    }
+    public void LeaveRow(int level, int index) {
+        if (level == 0 && graceRow == index) { graceRow = -1; graceDeadline = -1; }
+        if (level == 1 && graceRow2 == index) { graceRow2 = -1; graceDeadline2 = -1; }
+    }
+    void ClearGrace() {
+        graceRow = -1;
+        graceRow2 = -1;
+        graceDeadline = -1;
+        graceDeadline2 = -1;
+    }
+    public int NextDeadline(int session) {
+        if (!opened || generation != session) { return -1; }
+        if (graceDeadline < 0) { return graceDeadline2; }
+        if (graceDeadline2 < 0 || graceDeadline < graceDeadline2) { return graceDeadline; }
+        return graceDeadline2;
+    }
+    public void Tick(App app, int now, int session) {
+        if (!opened || generation != session || app != popupApp) { return; }
+        bool changed = false;
+        if (graceDeadline >= 0 && now >= graceDeadline) {
+            sub = -1;
+            sub2 = -1;
+            childPanel.visible = false;
+            grandPanel.visible = false;
+            this.ClearGrace();
+            changed = true;
+        }
+        if (graceDeadline2 >= 0 && now >= graceDeadline2) {
+            sub2 = -1;
+            grandPanel.visible = false;
+            graceDeadline2 = -1;
+            graceRow2 = -1;
+            changed = true;
+        }
+        if (changed) { app.RequestRedraw(); }
+    }
+
+    public void Prepare(App app) {
+        if (app == null) { return; }
+        int width = RichMenu.Width(app, items);
+        if (width < minWidth) { width = minWidth; }
+        int availableW = app.canvas.Width() - app.Scale(8);
+        if (width > availableW) { width = availableW; }
+        int height = RichMenu.ViewHeight(app, items, maxRows);
+        int x = pointX;
+        int y = pointY;
+        Control anchor = popupAnchor;
+        if (atAnchor && anchor != null) {
+            x = anchor.bx;
+            y = OverlayPopup.FitY(app, anchor.by + anchor.bh + app.Scale(4), anchor.bh, height);
+        }
+        x = OverlayPopup.FitX(app, x, width);
+        int margin = app.Scale(4);
+        if (y + height > app.canvas.Height() - margin) { y = app.canvas.Height() - margin - height; }
+        if (y < margin) { y = margin; }
+        prefW = width;
+        prefH = height;
+        this.Arrange(x, y, width, height);
+    }
+
+    public override void OnMeasure(App app) {
+        prefW = RichMenu.Width(app, items);
+        if (prefW < minWidth) { prefW = minWidth; }
+        prefH = RichMenu.ViewHeight(app, items, maxRows);
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w; bh = h;
+        rootPanel.Arrange(x, y, w, h);
+        if (childPanel.visible && sub >= 0 && sub < rootPanel.ChildCount()) {
+            this.ArrangeChild(childPanel, rootPanel, rootPanel.ChildAt(sub));
+        }
+        if (grandPanel.visible && sub2 >= 0 && sub2 < childPanel.ChildCount()) {
+            this.ArrangeChild(grandPanel, childPanel, childPanel.ChildAt(sub2));
+        }
+    }
+    void ArrangeChild(RichMenuPanel panel, RichMenuPanel parentPanel, Control row) {
+        App app = this.App;
+        int w = RichMenu.Width(app, panel.items);
+        int h = RichMenu.ViewHeight(app, panel.items, 11);
+        int margin = app.Scale(4);
+        int x = parentPanel.bx + parentPanel.bw - margin;
+        if (x + w > app.canvas.Width() - margin) { x = parentPanel.bx - w + margin; }
+        x = OverlayPopup.FitX(app, x, w);
+        int y = row.by;
+        if (y + h > app.canvas.Height() - margin) { y = app.canvas.Height() - margin - h; }
+        if (y < margin) { y = margin; }
+        panel.Arrange(x, y, w, h);
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!opened || !this.StyleVisible()) { return null; }
+        Control hit = grandPanel.visible ? grandPanel.HitTest(x, y, pointerType, excludedSubtrees) : null;
+        if (hit == null && childPanel.visible) { hit = childPanel.HitTest(x, y, pointerType, excludedSubtrees); }
+        if (hit == null) { hit = rootPanel.HitTest(x, y, pointerType, excludedSubtrees); }
+        return hit;
+    }
+    public override void OnPaint(App app) {
+        rootPanel.RenderTree(app);
+        if (childPanel.visible) { childPanel.RenderTree(app); }
+        if (grandPanel.visible) { grandPanel.RenderTree(app); }
+    }
+    public void ClearCallbacks() { ActionSelected.Clear(); Dismissed.Clear(); }
+
+    public static int RowHeight(App app) { return app.Scale(23); }
+    public static int PadV(App app) { return app.Scale(4); }
+    public static int PadH(App app) { return app.Scale(6); }
+    public static int ItemHeight(App app, MenuItem item) {
+        if (item.kind == 1) { return app.Scale(6); }
+        if (item.kind == 2) { return app.Scale(18); }
+        return RichMenu.RowHeight(app);
+    }
+    public static int Height(App app, List<MenuItem> model) {
+        int height = RichMenu.PadV(app) * 2;
+        if (model != null) {
+            for (int i = 0; i < model.Count; i = i + 1) { height = height + RichMenu.ItemHeight(app, model[i]); }
+        }
+        return height;
+    }
+    public static int ViewHeight(App app, List<MenuItem> model, int rows) {
+        int height = RichMenu.Height(app, model);
+        if (rows <= 0) { return height; }
+        int available = app.canvas.Height() - app.Scale(8);
+        if (available < 1) { available = 1; }
+        if (height <= available) { return height; }
+        int cap = RichMenu.PadV(app) * 2 + rows * RichMenu.RowHeight(app);
+        return cap < available ? cap : available;
+    }
+    public static int Width(App app, List<MenuItem> model) {
+        int label = 0;
+        int right = 0;
+        if (model != null) {
+            for (int i = 0; i < model.Count; i = i + 1) {
+                MenuItem item = model[i];
+                if (item.kind != 1) {
+                    int width = Canvas.MeasureText(item.label, Style.FontFallback(app, "small"));
+                    if (width > label) { label = width; }
+                }
+                if (item.kind == 0 && item.shortcut != null && item.shortcut != "") {
+                    int width = Canvas.MeasureText(item.shortcut, Style.FontFallback(app, "small"));
+                    if (width > right) { right = width; }
+                }
+                if (item.kind == 3 && app.theme.iconSizeSmall > right) { right = app.theme.iconSizeSmall; }
+            }
+        }
+        int width = RichMenu.PadH(app) * 2 + app.theme.iconSizeSmall + app.Scale(22) + label + right;
+        return width < app.Scale(140) ? app.Scale(140) : width;
+    }
+}

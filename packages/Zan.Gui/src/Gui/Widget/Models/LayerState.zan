@@ -25,19 +25,26 @@ public class LayerState {
     public int sw;
     public int sh;
     int windowState;
+    int inputGeneration;
     public int state {
         get { return windowState; }
         set {
-            if (!modal && windowState != value && value == 2) { this.ReleaseLayerInput(); }
+            if (windowState == value) { return; }
+            inputGeneration = inputGeneration + 1;
             windowState = value;
+            if (!modal && value == 2) { this.ReleaseLayerInput(); }
         }
     }
     bool inputOpen;
     public bool open {
         get { return inputOpen; }
         set {
-            if (inputOpen && !value) { this.ReleaseLayerInput(); }
+            if (inputOpen == value) { return; }
+            inputGeneration = inputGeneration + 1;
             inputOpen = value;
+            App host = inputApp;
+            if (!value) { this.ReleaseLayerInput(); }
+            if (host != null && modal) { Layer.SyncDialogs(host); }
         }
     }
     public bool dragging;
@@ -73,8 +80,8 @@ public class LayerState {
     public Flex windowFooter;
     public Input promptInput;  // kind 2 的文本输入框（其他情况为 null）
     public int openMs;  // layer 打开时的墙钟毫秒数（入场动画用）
-    // 最小化任务条槽位（左下角横排第几个），由 RenderStack 每帧
-    // 按堆叠顺序指派；单独 Render 的窗口保持 0。
+    // 最小化任务条槽位（左下角横排第几个），由 retained 窗口宿主
+    // 在准备布局时按打开堆叠顺序指派。
     public int minSlot;
     // page 层的嵌入式正文控件树（layui page 层放任意 HTML 的等价物）：
     // 宿主构造一棵保留的组件树（表单/面板等）挂进来，每帧渲染在
@@ -84,8 +91,12 @@ public class LayerState {
         get { return bodyView; }
         set {
             if (bodyView == value) { return; }
+            int generation = inputGeneration + 1;
+            inputGeneration = generation;
             this.ReleaseLayerInput();
+            if (inputGeneration != generation) { return; }
             if (wrap != null && bodyView != null) { wrap.Remove(bodyView); }
+            if (inputGeneration != generation) { return; }
             wrap = null;
             bodyView = value;
         }
@@ -99,40 +110,87 @@ public class LayerState {
     int inputW;
     int inputH;
 
+    // A group snapshots old registrations before any endpoint can call business code.
+    // New bindings fence only stale input cleanup; every old token is still notified.
+    void RetireLayerInputs(App app, Control body, Control prompt, Control footerRoot, int generation) {
+        if (app == null || (body == null && prompt == null && footerRoot == null)) { return; }
+        List<InputRetirementToken> retiring = app.SnapshotInputRetirements(body, null, false);
+        retiring.AddRange(app.SnapshotInputRetirements(prompt, null, false));
+        retiring.AddRange(app.SnapshotInputRetirements(footerRoot, null, false));
+        // Match App.ReleaseInputSubtree: Cancel exceptions propagate before Notify.
+        // Unnotified registrations stay active; callers may explicitly retry retirement.
+        if (inputGeneration == generation && body != null) { app.CancelInputSubtree(body); }
+        if (inputGeneration == generation && prompt != null) { app.CancelInputSubtree(prompt); }
+        if (inputGeneration == generation && footerRoot != null) { app.CancelInputSubtree(footerRoot); }
+        app.NotifyInputRetirements(retiring, 0, false);
+    }
+
+    // Modal masking keeps registrations alive and cancels only the old endpoint group.
+    void CancelLayerInputOnly() {
+        App app = inputApp;
+        Control body = inputBody; Control prompt = inputPrompt; Control footerRoot = inputFooter;
+        int generation = inputGeneration;
+        if (app == null) { return; }
+        if (body != null) { app.CancelInputSubtree(body); }
+        if (inputGeneration != generation) { return; }
+        if (prompt != null) { app.CancelInputSubtree(prompt); }
+        if (inputGeneration != generation) { return; }
+        if (footerRoot != null) { app.CancelInputSubtree(footerRoot); }
+    }
+
     void CancelLayerInput() {
-        if (inputApp == null) { return; }
-        if (inputBody != null) { inputApp.ReleaseInputSubtree(inputBody); }
-        if (inputPrompt != null) { inputApp.ReleaseInputSubtree(inputPrompt); }
-        if (inputFooter != null) { inputApp.ReleaseInputSubtree(inputFooter); }
+        this.RetireLayerInputs(inputApp, inputBody, inputPrompt, inputFooter, inputGeneration);
     }
 
     void ReleaseLayerInput() {
-        this.CancelLayerInput();
-        inputBody = null;
-        inputPrompt = null;
-        inputFooter = null;
+        App app = inputApp;
+        Control body = inputBody; Control prompt = inputPrompt; Control footerRoot = inputFooter;
+        int generation = inputGeneration;
+        this.RetireLayerInputs(app, body, prompt, footerRoot, generation);
+        // A throw leaves unvisited old endpoints available for a later retirement.
+        // A callback-published group belongs to the new generation.
+        if (inputGeneration != generation) { return; }
+        inputBody = null; inputPrompt = null; inputFooter = null;
     }
 
     void SetLayerInput(App app, Control bodyRoot, Control prompt, Control footerRoot,
             int x, int y, int w, int h) {
-        if (inputApp != null && inputApp != app) {
-            this.ReleaseLayerInput();
-            Layer.Context(inputApp).zorder.Remove(this);
-        }
-        if (!open || (!modal && state == 2)) { this.ReleaseLayerInput(); }
-        else {
-            if (inputApp != null) {
-                if (inputBody != null && inputBody != bodyRoot
-                    && (bodyRoot == null || !bodyRoot.ContainsInputControl(inputBody))) {
-                    inputApp.ReleaseInputSubtree(inputBody);
+        bool accepts = open && (modal || state != 2);
+        // Geometry-only rendering is not a renewed input lifetime, including in Cancel.
+        if (inputApp == app && inputBody == (accepts ? bodyRoot : null)
+                && inputPrompt == (accepts ? prompt : null)
+                && inputFooter == (accepts ? footerRoot : null)) {
+            inputX = x; inputY = y; inputW = w; inputH = h;
+            if (app != null) {
+                AppLayerContext context = Layer.Context(app);
+                InputRootAdapter active = app.rootControl is InputRootAdapter ? (InputRootAdapter)app.rootControl : null;
+                bool linked = context.inputRoot != null && active != null
+                    && active.ContainsAdapter(context.inputRoot) && context.zorder.IndexOf(this) >= 0;
+                if (!linked) {
+                    // Cached endpoints do not establish ownership after an external root change.
+                    // Restore through the existing adapter composition, once per real rebind.
+                    inputGeneration = inputGeneration + 1;
+                    Layer.BindInput(app, this);
                 }
-                if (inputPrompt != null && inputPrompt != prompt) { inputApp.ReleaseInputSubtree(inputPrompt); }
-                if (inputFooter != null && inputFooter != footerRoot) { inputApp.ReleaseInputSubtree(inputFooter); }
             }
-            inputBody = bodyRoot;
-            inputPrompt = prompt;
-            inputFooter = footerRoot;
+            return;
         }
+        int generation = inputGeneration + 1;
+        inputGeneration = generation;
+        App previousApp = inputApp;
+        Control body = inputBody; Control oldPrompt = inputPrompt; Control footerRootOld = inputFooter;
+        bool changedApp = previousApp != null && previousApp != app;
+        if (!changedApp && accepts) {
+            if (body == bodyRoot || (bodyRoot != null && bodyRoot.ContainsHostedControl(body))) { body = null; }
+            if (oldPrompt == prompt) { oldPrompt = null; }
+            if (footerRootOld == footerRoot) { footerRootOld = null; }
+        }
+        this.RetireLayerInputs(previousApp, body, oldPrompt, footerRootOld, generation);
+        if (inputGeneration != generation) { return; }
+        if (changedApp) { Layer.Context(previousApp).zorder.Remove(this); }
+        inputBody = accepts ? bodyRoot : null;
+        inputPrompt = accepts ? prompt : null;
+        inputFooter = accepts ? footerRoot : null;
         inputApp = app;
         inputX = x; inputY = y; inputW = w; inputH = h;
         Layer.BindInput(app, this);
@@ -160,11 +218,11 @@ public class LayerState {
         return found;
     }
 
-    Control HitLayerInput(int x, int y, int pointerType) {
+    Control HitLayerInput(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!open || (!modal && state == 2)) { return null; }
-        Control hit = inputFooter != null ? inputFooter.HitTest(x, y, pointerType) : null;
-        if (hit == null && inputBody != null) { hit = inputBody.HitTest(x, y, pointerType); }
-        if (hit == null && inputPrompt != null) { hit = inputPrompt.HitTest(x, y, pointerType); }
+        Control hit = inputFooter != null ? inputFooter.HitTest(x, y, pointerType, excludedSubtrees) : null;
+        if (hit == null && inputBody != null) { hit = inputBody.HitTest(x, y, pointerType, excludedSubtrees); }
+        if (hit == null && inputPrompt != null) { hit = inputPrompt.HitTest(x, y, pointerType, excludedSubtrees); }
         return hit;
     }
     // 点遮罩关闭（模态对话框）：按下与抬起都落在遮罩、且不在对话框
@@ -222,6 +280,7 @@ public class LayerState {
     // 超高时包住 view 的滚动列（SizeToContent 现算时才可能建立）；
     // 渲染与命中都走 wrap，view 始终是宿主 SetBody 的原树。
     public Control wrap;
+    LayerDialogControl retainedDialog;
 
     public LayerState(string title, int x, int y, int w, int h) {
         this.title = title;
@@ -252,7 +311,7 @@ public class LayerState {
         this.okText = "OK";
         this.cancelText = "Cancel";
         this.altText = "";
-        this.okBtn = new Button { Class = "primary" };
+        this.okBtn = new Button { ClassName = "primary" };
         this.cancelBtn = new Button { };
         this.altBtn = new Button { };
         LayerAction okAction = new LayerAction(this, 1);
@@ -424,8 +483,11 @@ public class LayerState {
             sc.With(view);
             wrap = sc;
         } else if (!scrolling && wrap != null) {
+            int generation = inputGeneration;
             this.ReleaseLayerInput();
+            if (inputGeneration != generation) { return; }
             wrap.Remove(view);
+            if (inputGeneration != generation) { return; }
             wrap = null;
         }
         int w = contentW + padX;
@@ -457,6 +519,8 @@ public class LayerState {
     }
 
     public void Open(App app) {
+        // Even an already-open session renewal supersedes a callback-bearing close.
+        inputGeneration = inputGeneration + 1;
         open = true;
         action = 0;
         openMs = Window.GetTickMs();

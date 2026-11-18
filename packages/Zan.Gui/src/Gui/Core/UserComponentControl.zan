@@ -1,0 +1,98 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui.Markup;
+
+namespace Gui;
+
+// One definition snapshot, hosted by the ordinary retained control tree.
+internal class UserComponentControl : Control {
+    private string componentKind;
+    private JsonValue definition;
+    private Control document;
+    private string documentCss;
+    private weak App styledApp;
+
+    internal UserComponentControl(string kind, JsonValue source, HtmlDoc doc) : base(kind) {
+        componentKind = kind;
+        definition = source;
+        document = doc.root;
+        documentCss = doc.css;
+        this.AddClass("user-component");
+        document.Grow();
+        this.Add(document);
+    }
+
+    public override string Kind() { return componentKind; }
+
+    // The factory reconstructs the definition. Clone only public instance values.
+    public override void CloneContentTo(Control target, CloneTreeFn clone) { }
+
+    private JsonValue Declaration(string key) {
+        JsonValue declarations = definition.Get("props");
+        if (declarations == null || !declarations.IsArray()) { return null; }
+        for (int i = 0; i < declarations.Count(); i = i + 1) {
+            JsonValue declaration = declarations.At(i);
+            if (declaration != null && declaration.IsObject()
+                    && declaration.Str("key", "").ToLower() == key.ToLower()) { return declaration; }
+        }
+        return null;
+    }
+
+    private Control PropertyTarget(JsonValue declaration) {
+        string target = declaration.Str("target", "");
+        return target == "" ? null : document.Find(target);
+    }
+
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> specs = new List<PropSpec>();
+        JsonValue declarations = definition.Get("props");
+        if (declarations == null || !declarations.IsArray()) { return specs; }
+        for (int i = 0; i < declarations.Count(); i = i + 1) {
+            JsonValue declaration = declarations.At(i);
+            if (declaration == null || !declaration.IsObject()) { continue; }
+            string key = declaration.Str("key", "");
+            if (key == "") { continue; }
+            string label = declaration.Str("label", key);
+            Control target = this.PropertyTarget(declaration);
+            PropSpec source = target == null ? null
+                : PropSpec.Find(target.Props(), declaration.Str("prop", "text"), false);
+            PropSpec spec = PropSpec.Text(key, label);
+            if (source != null) {
+                if (source.kind == 1) { spec = PropSpec.Int(key, label); }
+                else if (source.kind == 2) { spec = PropSpec.Bool(key, label); }
+                else if (source.kind == 3) { spec = PropSpec.Enum(key, label, source.options); }
+                else if (source.kind == 4) { spec = PropSpec.Color(key, label); }
+            }
+            spec.ViaExtra();
+            if (declaration.Has("def")) { spec.Default(declaration.Str("def", "")); }
+            specs.Add(spec);
+        }
+        return specs;
+    }
+
+    public override string GetExtra(string key) {
+        JsonValue declaration = this.Declaration(key);
+        if (declaration == null) { return base.GetExtra(key); }
+        Control target = this.PropertyTarget(declaration);
+        return target == null ? "" : target.GetProp(declaration.Str("prop", "text"));
+    }
+
+    public override bool SetExtra(string key, string value) {
+        JsonValue declaration = this.Declaration(key);
+        if (declaration == null) { return base.SetExtra(key, value); }
+        Control target = this.PropertyTarget(declaration);
+        if (target != null) { target.SetProp(declaration.Str("prop", "text"), value); }
+        return true;
+    }
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        if (app != null && styledApp != app) {
+            styledApp = app;
+            string scope = app.NextLoadScope();
+            app.ApplyScopedTree(document, documentCss == "" ? "" : HtmlScope.Styles(documentCss, scope), scope);
+            Html.AutoLinkTree(document, app);
+        }
+        return base.ResolveStyle(app, state);
+    }
+}

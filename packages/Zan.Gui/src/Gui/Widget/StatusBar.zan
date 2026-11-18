@@ -10,14 +10,18 @@ namespace Gui.Widget;
 // // 每帧：
 public class StatusBar : Control {
     private List<Label> items;
+    private Control spacer;
     private int tintBg;  // 0 = 主题表面，否则为纯色着色
     // `options` 的原样文本，供检查器 / 序列化按原样回读。
     private string itemsSpec;
 
     // 空状态栏（之后 AddLeft/AddRight，或 SetItemsText）。
     public StatusBar() {
-        this.InitControl("statusBar", 2);
+        this.InitControl("statusBar");
         items = new List<Label>();
+        spacer = new Control("statusSpacer");
+        spacer.SetProp("style", "flex:1;min-width:0;order:1");
+        this.Add(spacer);
         tintBg = 0;
         itemsSpec = "";
     }
@@ -26,13 +30,13 @@ public class StatusBar : Control {
     public override string Kind() { return "StatusBar"; }
 
     // 覆写：返回设计器属性清单（tint）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec tint = PropSpec.Color("tint", "Tint");
-        tint.num = tintBg;
+        tint.Field("tintBg", 1);
         ps.Add(tint);
         PropSpec it = PropSpec.Text("options", "Items");
-        it.str = itemsSpec;
+        it.Field("itemsSpec", 0);
         it.WithTip("Pipe-separated items; prefix > to right-align "
                    + "(e.g. \"main|>clock\").");
         ps.Add(it);
@@ -55,13 +59,14 @@ public class StatusBar : Control {
 
     // 追加一个左对齐项；返回其索引供后续更新。
     public int AddLeft(string text) {
-        Label l = NewItem(text);
+        this.NewItem(text);
         return items.Count - 1;
     }
 
-    // 追加一个右对齐项；返回其索引供后续更新。
+    // 右侧项按添加顺序从右向左扩展；列表索引保持添加顺序。
     public int AddRight(string text) {
-        Label l = NewItem(text);
+        Label l = this.NewItem(text);
+        l.SetProp("style", "order:" + (2147483647 - items.Count).ToString());
         return items.Count - 1;
     }
 
@@ -69,6 +74,7 @@ public class StatusBar : Control {
     public void Clear() {
         items = new List<Label>();
         this.RemoveAll();
+        this.Add(spacer);
     }
 
     // 按序列化文本重建全部项：每条一个标题，`|` 分隔，
@@ -128,26 +134,15 @@ public class StatusBar : Control {
     // （SetTint 或 `statusbar` 样式的纵向渐变）。
     public override void OnMeasure(App app) {
         Theme t = app.theme;
-        padL = app.Scale(8);
-        padR = app.Scale(10);
-        padT = 0;
-        padB = 0;
-        gap = app.Scale(14);
-        prefH = app.Scale(22);
-        // CSS 表面：基础 PaintStyleBox 在 OnPaint 运行前填充此处。
-        // 从上到下的微妙渐变给状态栏一点层次感。
-        // 表面色只写字段（同 ToolStrip）：Bg()/Gradient() 会把
-        // computedStyle 清空，MeasureTree 里样式解析先于 OnMeasure，
-        // 清空后父容器 flex 排布读不到 flex-grow 等 CSS 布局属性。
-        if (tintBg != 0) {
-            styleBg = tintBg;
-            styleBgTo = 0;
-        } else {
-            StyleBox s = this.BoxState(app, Style.SNormal());
-            int topc = s.BgOr(0);
-            styleBg = topc;
-            styleBgTo = App.Darken(topc, 60);
-        }
+        // Tint is a measured surface result, never an authored inline background.
+        // Resolve afresh so clearing tint also drops the previous frame's override.
+        StyleBox surface = this.ResolveStyleAs(app, this.StyleType(), this.EffectiveClass(), Style.SNormal());
+        padL = surface.PadLOr(t.paddingSmall);
+        padR = surface.PadROr(t.paddingSmall);
+        padT = surface.PadTOr(0);
+        padB = surface.PadBOr(0);
+        gap = surface.GapOr(t.gapLarge);
+        prefH = surface.HeightOr(t.heightTiny);
         // 窗口圆角契约：当处于圆角窗口（DWM 或异形）且底角未单独显式指定时，
         // 将底部左右圆角半径与窗口轮廓焊合，避免方角状态栏底角刺破窗口圆角轮廓。
         int cr = app.EffectiveCornerRadius();
@@ -161,17 +156,17 @@ public class StatusBar : Control {
             styleRadius = 0;
             styleCorners = 0;
         }
-        // 字段是在解析之后改的，把 inline 覆盖补映到已解析的 box 上，
-        // 本帧表面保持正确，也不用为看一眼新底色就整体重解析。
-        if (computedStyle != null) { Style.Inline(computedStyle, this); }
+        // Keep the window-corner adjustment on this frame's resolved surface.
+        Style.Inline(surface, this);
+        if (tintBg != 0) {
+            surface.bg = tintBg;
+            surface.bgTo = 0;
+        }
     }
 
-    // 覆写：画顶部分隔线（表面填充由 OnMeasure 设置的基础 CSS
-    // 样式层完成）。
+    // 表面由基础 CSS 样式层填充；这里只绘制顶部分隔线。
     public override void OnPaint(App app) {
-        // 只有顶部细线分隔线是内容；表面填充由
-        // 基础 CSS 样式层处理（styleBg 在 OnMeasure 中设置）。
-        StyleBox divider = this.ResolveStyleAs(app, "divider", "", Style.SNormal());
+        StyleBox divider = Control.BareBox(app, "divider", Style.SNormal());
         app.canvas.FillRect(bx, by, bw, divider.HeightOr(1),
                             divider.BgOr(0));
     }

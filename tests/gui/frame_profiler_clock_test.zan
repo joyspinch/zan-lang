@@ -1,0 +1,104 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+class FrameProfilerClockTest {
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("frame profiler: " + message); }
+    }
+
+    // Exercise the checked-in budget fixture's commands, so malformed clock
+    // transitions cannot hide behind successful pixel comparisons.
+    static void CheckFixtureClock(App app, string fixture) {
+        File.WriteAllText("clock.uidrv", "wait 1\n");
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", Environment.CurrentDirectory + "/clock.uidrv");
+        Environment.SetEnvironmentVariable("ZAN_UI_OUT", Environment.CurrentDirectory + "/uidrv");
+        UiDriver.Begin(app);
+        int freezes = 0;
+        int unfreezes = 0;
+        int barriers = 0;
+        List<string> lines = fixture.Replace("\r", "").Split("\n");
+        for (int i = 0; i < lines.Count; i++) {
+            string line = lines[i];
+            if (line.StartsWith("freeze ")) {
+                UiDriver.Exec(line);
+                Check(app.freezeAnimClock && Window.GetTickMs() == 600000, "fixture clock freezes");
+                freezes++;
+            } else if (line.StartsWith("unfreeze ")) {
+                UiDriver.Exec(line);
+                Check(!app.freezeAnimClock, "fixture clock resumes: " + line);
+                int tick = Window.GetTickMs();
+                Thread.Sleep(20);
+                Check(Window.GetTickMs() != tick, "resumed clock advances");
+                unfreezes++;
+            } else if (line == "redraw full") {
+                Check(UiDriver.Exec(line) && UiDriver.waitFullPresent, "fixture barrier arms");
+                Check(app.SafeFrame(() => {
+                    app.canvas.FillRect(0, 0, 643, 481, 0xff18232d);
+                }), "fixture barrier presents");
+                Check(!UiDriver.waitFullPresent, "fixture barrier acknowledges presentation");
+                barriers++;
+            }
+        }
+        Check(freezes == 2 && unfreezes == 2 && barriers == 6,
+        "both fixture clock transitions and both full-present triples exercised");
+    }
+
+    static int Main() {
+        string fixture = File.ReadAllText("tests/perf/ide_hover_scroll.uidrv");
+        Environment.SetEnvironmentVariable("ZAN_FRAME_PROF", "1");
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        Directory.CreateDirectoryRecursive("build/test-out/gui-frame-profiler");
+        Environment.SetCurrentDirectory("build/test-out/gui-frame-profiler");
+        File.WriteAllText("zan_frame_perf.log", "");
+        App app = new App("Frame profiler clock", 240, 160);
+        GuiFrameProfiler.EnableFromEnvironment(app);
+        try {
+            app.Show();
+            app.SetClientSizeDev(643, 481);
+            app.SyncSurface();
+            app.FreezeAnimClock(600000);
+            for (int frame = 0; frame < 30; frame++) {
+                // Deliberate measured work: an animation-clock read stays fixed,
+                // while every real render must retain this cost in the profiler.
+                Check(app.SafeFrame(() => {
+                    app.canvas.FillRect(0, 0, 643, 481, 0xff18232d);
+                    Thread.Sleep(20);
+                }), "real frame presents");
+                Check(Window.GetTickMs() == 600000, "animation remains frozen");
+                if (frame == 0) {
+                    Check(app.perfWorstMs >= 20, "frozen first frame retains whole cost");
+                    Check(app.perfRenderMs >= 20, "frozen first frame retains render cost");
+                    Check(app.perfSlowFrames == 1, "slow remains count whole >16ms");
+                }
+            }
+            string log = File.ReadAllText("zan_frame_perf.log");
+            Check(log.Contains("firstframe whole_ms="), "first frame recorded");
+            Check(log.Contains("frames=30 full=30"), "complete real batch recorded");
+            Check(log.Contains("slow=30"), "every deliberate slow frame counted");
+            int surfaces = 0;
+            List<string> lines = log.Split("\n");
+            for (int i = 0; i < lines.Count; i++) {
+                string line = lines[i];
+                if (line.StartsWith("firstframe ") || line.StartsWith("frames=30 ")) {
+                    Check(line.Contains(" surface=643x481 clock=raw-ms"),
+                    "actual full canvas and independent clock emitted");
+                    surfaces++;
+                }
+            }
+            Check(surfaces == 2, "first and batch surfaces both checked");
+            Check(app.canvas.Width() == 643 && app.canvas.Height() == 481,
+            "surface is real canvas including chrome");
+            CheckFixtureClock(app, fixture);
+        } finally {
+            app.UnfreezeAnimClock();
+            UiDriver.active = false;
+            app.window.Destroy();
+            app.canvas.Destroy();
+        }
+        Console.WriteLine("frame profiler clock ok");
+        return 0;
+    }
+}

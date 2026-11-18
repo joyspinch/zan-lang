@@ -2,7 +2,7 @@ using System;
 using Gui;
 using Gui.Backend;
 
-namespace Tests.ChildWindowCallbackLifecycle;
+namespace Gui;
 
 class Owner {
     public ChildWindow window;
@@ -13,6 +13,16 @@ class Owner {
 }
 
 class Program {
+    static ChildWindow OffscreenChild(App host, Control tree, string model) {
+        ChildWindow child = new ChildWindow();
+        // Substitute only native creation; retain the real child layout and teardown paths.
+        child.host = host;
+        child.open = true;
+        child.SetView(tree, (object)model);
+        child.EnsureHostLayoutRegistration();
+        return child;
+    }
+
     static void Wire(Owner owner) {
         owner.window.SetRender(() => { owner.Render(); });
     }
@@ -33,27 +43,43 @@ class Program {
         window = null;
         Console.WriteLine("window-released=" + Convert.ToString(!windowLife.IsAlive));
 
-        ChildWindow rooted = new ChildWindow();
-        Control tree = new Control();
+        App rootedHost = App.CreateOffscreen("rooted child", 100, 80);
+        Control tree = new Control("child-tree");
         WeakReference<Control> treeLife = new WeakReference<Control>(tree);
-        rooted.SetRoot(tree, (object)"model");
+        ChildWindow rooted = OffscreenChild(rootedHost, tree, "model");
+        UiDriver.app = rootedHost;
+        ControlTreeDoc rootedSnapshot = UiDriver.TreeSnapshot();
+        bool ownedRootObserved = rootedHost.AutomationRoot() == tree
+        && rootedSnapshot.root != null && rootedSnapshot.root.name == "child-tree";
         tree = null;
         rooted.Teardown();
+        ControlTreeDoc retiredSnapshot = UiDriver.TreeSnapshot();
         Console.WriteLine("owned-driver-root-released=" + Convert.ToString(
-            UiDriver.root == null && !treeLife.IsAlive));
+        ownedRootObserved && rootedHost.CurrentHostLayout() == null
+        && rootedHost.AutomationRoot() == null && retiredSnapshot.root == null && !treeLife.IsAlive));
+        UiDriver.app = null;
         rooted = null;
 
-        ChildWindow closing = new ChildWindow();
-        ChildWindow other = new ChildWindow();
-        closing.SetRoot(new Control(), (object)"closing");
-        Control otherTree = new Control();
-        other.SetRoot(otherTree, (object)"other");
+        App closingHost = App.CreateOffscreen("closing child", 100, 80);
+        ChildWindow closing = OffscreenChild(closingHost, new Control("closing-tree"), "closing");
+        App otherHost = App.CreateOffscreen("other child", 100, 80);
+        Control otherTree = new Control("other-tree");
+        WeakReference<Control> otherTreeLife = new WeakReference<Control>(otherTree);
+        ChildWindow other = OffscreenChild(otherHost, otherTree, "other");
+        UiDriver.app = otherHost;
+        AppLoopRegistration otherLayout = otherHost.CurrentHostLayout();
         closing.Teardown();
+        ControlTreeDoc otherSnapshot = UiDriver.TreeSnapshot();
         Console.WriteLine("other-driver-root-preserved=" + Convert.ToString(
-            UiDriver.root == otherTree && other.Binder().Root() == otherTree));
+        otherLayout != null && otherHost.CurrentHostLayout() == otherLayout
+        && otherHost.AutomationRoot() == otherTree && other.View() == otherTree
+        && otherSnapshot.root != null && otherSnapshot.root.name == "other-tree"));
+        otherTree = null;
         other.Teardown();
+        if (otherHost.AutomationRoot() != null || otherHost.CurrentHostLayout() != null
+        || otherTreeLife.IsAlive) { throw new Exception("other child tree retained after teardown"); }
+        UiDriver.app = null;
         closing = null;
         other = null;
-        otherTree = null;
     }
 }

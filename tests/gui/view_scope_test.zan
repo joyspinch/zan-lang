@@ -1,0 +1,417 @@
+using System;
+using System.Json;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+namespace Gui;
+
+class ViewScopeOwner : UiViewOwner {
+    public UiViewScope view;
+    public int calls;
+    public int pointers;
+    public bool layout;
+    public bool retireOnAction;
+    public void PrepareView(UiViewScope scope, App app) {
+        if (layout) { scope.Layout(7, 11, 150, 80); }
+    }
+    public void ViewAction(string name, Control sender) {
+        calls = calls + 1;
+        if (retireOnAction) { view.Retire(); }
+    }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { pointers = pointers + 1; }
+}
+
+class ViewScopeLeaf : Control {
+    public weak App host;
+    public Control replacement;
+    public weak UiViewScope view;
+    public JsonValue next;
+    public bool swapOnMeasure;
+    public bool renewOnCancel;
+    public int paints;
+    public ViewScopeLeaf() : base("viewScopeLeaf") { this.Prefer(100, 40); }
+    public override void OnMeasure(App app) {
+        base.OnMeasure(app);
+        if (swapOnMeasure) { swapOnMeasure = false; app.SetRootControl(replacement); }
+    }
+    public override void OnPointerCancel(RoutedEventArgs args) {
+        base.OnPointerCancel(args);
+        if (renewOnCancel) {
+            renewOnCancel = false;
+            UiViewScope current = view;
+            current.Bind(next);
+        }
+    }
+    public override void OnPaint(App app) { paints = paints + 1; }
+}
+
+class ViewScopeWitness {
+    public weak UiViewScope scope;
+    public weak ViewScopeOwner owner;
+    public weak ModelBinder binder;
+    public weak Control tree;
+    public weak App app;
+    public UiViewActions queued;
+}
+
+class ViewScopeTest {
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static JsonValue State(string value) { JsonValue model = JsonValue.NewObject(); model.PutStr("value", value); return model; }
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+
+    static void ComposedPages() {
+        App app = App.CreateOffscreen("composed views", 320, 240);
+        Control parent = new Control(); app.SetRootControl(parent);
+        Control first = new Control(); Control second = new Control();
+        ViewScopeOwner a = new ViewScopeOwner(); ViewScopeOwner b = new ViewScopeOwner();
+        a.view = new UiViewScope(app, a, first); b.view = new UiViewScope(app, b, second);
+        a.view.Mount(parent); b.view.Mount(parent);
+        a.view.Bind(State("one")); b.view.Bind(State("two"));
+        ModelBinder ba = a.view.Binder(); ModelBinder bb = b.view.Binder();
+        UiViewActions old = a.view.Action("select", first);
+        UiViewActions live = b.view.Action("select", second);
+        old.Run(); live.Run();
+        Check(a.calls == 1 && b.calls == 1 && app.ModelHostCount() == 2 && parent.ChildCount() == 2,
+            "composed views independently own models, tree mounts and weak actions");
+        a.view.Retire(); old.Run(); live.Run();
+        Check(a.calls == 1 && b.calls == 2 && ba.Root() == null && bb.Root() == second
+            && app.ModelHostCount() == 1 && first.parent == null && second.parent == parent,
+            "one page retirement cancels queued work without touching its sibling");
+        b.retireOnAction = true; live.Run(); live.Run();
+        Check(b.calls == 3 && !b.view.IsActive() && bb.Root() == null && parent.ChildCount() == 0,
+            "action retirement rejects queued callback tails and releases only its mount");
+        Release(app);
+    }
+
+    static void StandardHostModels() {
+        App app = App.CreateOffscreen("standard host models", 320, 240);
+        ViewScopeOwner owner = new ViewScopeOwner(); owner.layout = true;
+        Input input = new Input(); input.BindPath("value", "text");
+        owner.view = new UiViewScope(app, owner, input);
+        ControlInputHost mounted = new ControlInputHost(input); mounted.Bind(app);
+        JsonValue model = State("initial");
+        owner.view.Bind(model);
+        ModelBinder binder = owner.view.Binder();
+        model.Set("value", JsonValue.NewStr("before input"));
+        app.ProcessOffscreenInput(2, 20, 25, 0, 0, 0, 0);
+        Check(input.GetProp("text") == "before input" && input.bx == 7 && input.by == 11,
+            "custom host synchronizes its model before input layout: text=" + input.GetProp("text")
+                + " x=" + input.bx + " y=" + input.by + " hosts=" + app.ModelHostCount());
+        app.ProcessOffscreenInput(3, 20, 25, 0, 0, 0, 0);
+        model.Set("value", JsonValue.NewStr("before paint"));
+        app.BeginFrame();
+        Check(app.PrepareStandardHostFrame() && input.GetProp("text") == "before paint",
+            "custom host synchronizes business updates before painting");
+        input.SetText("edited during frame"); input.RenderTree(app);
+        app.PresentFrame();
+        Check(model.Str("value", "") == "edited during frame",
+            "custom host writes control changes before presenting");
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame(), "custom host prepares a replacement test frame");
+        input.SetText("discard old frame");
+        JsonValue replacement = State("replacement"); owner.view.Bind(replacement);
+        Check(!app.ContinuePreparedFrame() && app.preparationFrameAborted
+            && replacement.Str("value", "") == "replacement",
+            "new model registration invalidates the saved custom host frame");
+        app.BeginFrame();
+        Check(app.PrepareStandardHostFrame() && input.GetProp("text") == "replacement",
+            "replacement model synchronizes on the next custom host frame");
+        input.RenderTree(app); app.EndOffscreenFrame();
+        owner.view.Retire(); mounted.Hide();
+        Check(binder.Root() == null && app.ModelHostCount() == 0,
+            "custom host retires only its own model registration");
+        Release(app);
+    }
+
+    static void NoInputLayoutAndTemporaryInvalidation() {
+        App app = App.CreateOffscreen("layout without input", 320, 240);
+        ViewScopeOwner owner = new ViewScopeOwner(); ViewScopeLeaf root = new ViewScopeLeaf();
+        owner.view = new UiViewScope(app, owner, root);
+        Check(app.rootControl == null && owner.view.Layout(17, 23, 100, 60)
+            && app.rootControl == null && root.bx == 17 && root.by == 23 && root.bw == 100,
+            "scope can lay out an offscreen-only tree without claiming input ownership");
+        owner.layout = true; app.SetRootControl(root);
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame(), "stable optional layout prepares");
+        root.RenderTree(app); Check(root.paints == 1, "prepared tree paints once"); app.PresentFrame();
+        Control replacement = new Control(); root.replacement = replacement; root.swapOnMeasure = true;
+        app.BeginFrame();
+        bool ready = app.PrepareStandardHostFrame();
+        if (ready && app.ContinuePreparedFrame()) { root.RenderTree(app); }
+        Check(!ready && root.paints == 1 && owner.view.IsActive(),
+            "Measure root replacement aborts old paint while keeping scope reusable");
+        app.SetRootControl(root);
+        app.BeginFrame(); Check(app.PrepareStandardHostFrame() && owner.view.IsActive(), "next frame reuses the same scope ticket");
+        root.RenderTree(app); app.PresentFrame(); Check(root.paints == 2, "new preparation resumes rendering");
+        owner.view.Retire(); Release(app);
+    }
+
+    static void ReentrantBind() {
+        App app = App.CreateOffscreen("bind reentry", 320, 240);
+        ViewScopeOwner owner = new ViewScopeOwner(); Control root = new Control();
+        ViewScopeLeaf row = new ViewScopeLeaf(); root.Add(row); app.SetRootControl(root);
+        owner.view = new UiViewScope(app, owner, root);
+        owner.view.Bind(State("old"));
+        ModelBinder old = owner.view.Binder();
+        old.expandedRows = new List<ChildExpandedRow>(); old.expandedRows.Add(new ChildExpandedRow(row, root));
+        row.view = owner.view; row.next = State("callback"); row.renewOnCancel = true;
+        // Input-root selection does not associate a tree with its layout App.
+        root.UseApp(app); root.MeasureTree(app); root.Arrange(0, 0, 320, 240);
+        app.CapturePointer(row, true);
+        owner.view.Bind(State("outer"));
+        ModelBinder current = owner.view.Binder();
+        Check(current != null && current != old,
+            "Bind cleanup callback installs a replacement binder");
+        Check(current.Model() == row.next,
+            "outer Bind preserves the callback's replacement model");
+        Check(current.Root() == root,
+            "replacement binder still owns the view root");
+        Check(current.HostApp() == app,
+            "replacement binder still owns the view App");
+        Check(current.hostRegistration != null && current.hostRegistration.active,
+            "replacement binder ticket remains active before host counting");
+        Check(app.ModelHostCount() == 1,
+            "reentrant Bind leaves exactly one registered host: " + Convert.ToString(app.ModelHostCount())
+                + " ticket=" + (current.hostRegistration == null ? "null"
+                    : (current.hostRegistration.active ? "active" : "inactive"))
+                + " app=" + (current.HostApp() == app ? "same" : "different"));
+        Check(old.Root() == null && row.parent == null, "old binding finishes only its old row retirement");
+        owner.view.Retire(); Release(app);
+    }
+
+    static void DropView(App app, ViewScopeWitness witness) {
+        ViewScopeOwner owner = new ViewScopeOwner(); Control root = new Control();
+        owner.view = new UiViewScope(app, owner, root);
+        owner.view.Bind(State("weak"));
+        ModelBinder binder = owner.view.Binder();
+        witness.scope = owner.view; witness.owner = owner; witness.tree = root; witness.binder = binder;
+        witness.queued = owner.view.Action("stale", root);
+    }
+    static void DropApp(ViewScopeOwner owner, Control root, ViewScopeWitness witness) {
+        App app = App.CreateOffscreen("weak view App", 100, 80);
+        owner.view = new UiViewScope(app, owner, root); witness.app = app; app.canvas.Destroy();
+    }
+    static void WeakAndStop() {
+        App app = App.CreateOffscreen("weak views", 100, 80); ViewScopeWitness witness = new ViewScopeWitness();
+        DropView(app, witness);
+        Check(witness.scope == null && witness.owner == null && witness.binder == null && witness.tree == null
+            && app.ModelHostCount() == 0, "App and queued weak actions do not retain the view graph");
+        witness.queued.Run();
+        ViewScopeOwner owner = new ViewScopeOwner(); Control root = new Control();
+        DropApp(owner, root, witness);
+        Check(witness.app == null && !owner.view.IsActive(), "scope does not retain its App"); owner.view.Retire();
+        owner.view = new UiViewScope(app, owner, root);
+        owner.view.Bind(State("stop"));
+        ModelBinder binder = owner.view.Binder(); UiViewActions queued = owner.view.Action("late", root);
+        app.StopLoop(); queued.Run();
+        Check(!owner.view.IsActive() && binder.Root() == null && owner.calls == 0, "Stop retires scope, binder and pending actions");
+        Release(app);
+    }
+
+    static void ConstrainedTextLayout() {
+        App app = App.CreateOffscreen("constrained view", 640, 480);
+        ViewScopeOwner owner = new ViewScopeOwner();
+        Control root = new Control(); root.SetProp("style", "display:flex;flex-direction:column");
+        Label text = new Label("Embedded views must measure wrapping text at their current region width before arranging the next row.");
+        text.SetWrap(true); text.SetProp("style", "font-size:14px;flex-shrink:0");
+        root.Add(text);
+        owner.view = new UiViewScope(app, owner, root);
+        Check(owner.view.Layout(7, 11, 180, 300), "narrow view lays out");
+        int narrow = text.bh;
+        int font = text.ResolvedStyle(app).FontOr(Style.FontFallback(app, "medium"));
+        Check(narrow == TextWrap.Lines(text.Str(), text.bw, font).Count * Canvas.FontHeight(font) + app.theme.gapSmall,
+            "scope measures current region on first layout");
+        Check(owner.view.Layout(7, 11, 460, 300) && text.bh < narrow, "wider view reflows immediately");
+        Check(owner.view.Layout(7, 11, 180, 300) && text.bh == narrow && app.rootControl == null,
+            "narrow view restores height without installing input root");
+        owner.view.Retire(); Release(app);
+    }
+
+    static List<Label> StatusBarItems(StatusBar bar) {
+        List<Label> items = new List<Label>();
+        for (int i = 0; i < 4; i = i + 1) {
+            Label item = bar.ItemAt(i);
+            Check(item != null, "status bar exposes each item independently of its spacer");
+            items.Add(item);
+        }
+        Check(bar.ItemAt(-1) == null && bar.ItemAt(4) == null, "status bar item indices exclude the spacer");
+        Check(items[0].Str() == "left" && items[1].Str() == "right1"
+            && items[2].Str() == "laterLeft" && items[3].Str() == "right2",
+            "status bar retains mixed insertion indices and strips right markers");
+        return items;
+    }
+
+    static List<Label> PopulateStatusBar(StatusBar bar) {
+        Label first = bar.NewItem("left");
+        Check(bar.AddRight("right1") == 1 && bar.AddLeft("laterLeft") == 2 && bar.AddRight("right2") == 3,
+            "NewItem, AddLeft and AddRight share insertion indices");
+        List<Label> items = StatusBarItems(bar);
+        Check(items[0] == first, "NewItem is the first left item");
+        return items;
+    }
+
+    static void StatusBarLayout(App app, UiViewScope view, StatusBar bar, List<Label> items,
+        int dpi, int width, string phase) {
+        string at = phase + " dpi=" + Convert.ToString(dpi) + " width=" + Convert.ToString(width);
+        app.SetOffscreenViewport(width + 30, 80, dpi);
+        Check(view.Layout(app.Scale(7), app.Scale(11), app.Scale(width), app.Scale(22))
+            && app.rootControl == null, "status bar offscreen layout " + at);
+        Check(bar.bx == app.Scale(7) && bar.by == app.Scale(11) && bar.bw == app.Scale(width)
+            && bar.bh == app.Scale(22), "status bar uses its view region " + at);
+        // Include the flexible spacer without assuming a raw child count.
+        for (int i = 0; i < bar.ChildCount(); i = i + 1) {
+            Control child = bar.ChildAt(i);
+            Check(child.bw >= 0 && child.bh >= 0 && child.bx >= bar.bx && child.by >= bar.by
+                && child.bx + child.bw <= bar.bx + bar.bw && child.by + child.bh <= bar.by + bar.bh,
+                "status bar contains every child rectangle " + at);
+            for (int j = i + 1; j < bar.ChildCount(); j = j + 1) {
+                Control other = bar.ChildAt(j);
+                Check(child.bx + child.bw <= other.bx || other.bx + other.bw <= child.bx,
+                    "status bar child rectangles including the spacer do not overlap " + at);
+            }
+        }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Label item = items[i];
+            Check(bar.ItemAt(i) == item && item.parent == bar, "status bar preserves ItemAt identity " + at);
+            Check(item.bw > 0 && item.bh > 0 && item.by == items[0].by && item.bh == items[0].bh,
+                "status bar items occupy one horizontal row " + at);
+            int center = item.by * 2 + item.bh - (bar.by * 2 + bar.bh);
+            Check(center >= -2 && center <= 2, "status bar centers labels vertically " + at);
+            int natural = item.prefW;
+            if (natural < app.Scale(32)) { natural = app.Scale(32); }
+            Check(item.bw <= natural + 1, "status bar leaves flexible space to the spacer " + at);
+            for (int j = i + 1; j < items.Count; j = j + 1) {
+                Label other = items[j];
+                Check(item.bx + item.bw <= other.bx || other.bx + other.bw <= item.bx,
+                    "status bar item rectangles do not overlap " + at);
+            }
+        }
+        Check(items[0].bx + items[0].bw <= items[2].bx
+            && items[2].bx + items[2].bw <= items[3].bx
+            && items[3].bx + items[3].bw <= items[1].bx,
+            "status bar keeps left insertion order and extends new right items leftward " + at);
+        Check(items[0].bx <= bar.bx + app.Scale(24)
+            && items[1].bx + items[1].bw >= bar.bx + bar.bw - app.Scale(24),
+            "status bar anchors the two groups to opposite edges " + at);
+    }
+
+    static void StatusBarResize(App app, UiViewScope view, StatusBar bar, List<Label> items,
+        int dpi, string phase, bool updated) {
+        StatusBarLayout(app, view, bar, items, dpi, 640, phase);
+        List<int> wide = new List<int>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            wide.Add(items[i].bx); wide.Add(items[i].by); wide.Add(items[i].bw); wide.Add(items[i].bh);
+        }
+        // Four 32px minima plus padding and all spacer/item gaps fit at 240px.
+        StatusBarLayout(app, view, bar, items, dpi, 240, phase);
+        if (updated) {
+            Check(items[0].bw < wide[2] && items[0].bw < items[0].prefW,
+                "status bar shrinks updated intrinsic text at narrow width dpi=" + Convert.ToString(dpi));
+        }
+        StatusBarLayout(app, view, bar, items, dpi, 640, phase);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Check(items[i].bx == wide[i * 4] && items[i].by == wide[i * 4 + 1]
+                && items[i].bw == wide[i * 4 + 2] && items[i].bh == wide[i * 4 + 3],
+                "status bar wide geometry restores " + phase + " dpi=" + Convert.ToString(dpi));
+        }
+    }
+
+    static void StatusBarSurface(App app, UiViewScope view, StatusBar bar, List<Label> items,
+        int expected, string phase) {
+        app.BeginOffscreenFrame();
+        StatusBarLayout(app, view, bar, items, 100, 640, phase);
+        Check(bar.computedStyle != null && bar.computedStyle.BgOr(0) == expected
+            && bar.computedStyle.bgTo == 0, "status bar resolves the current surface " + phase);
+        Check(bar.styleBg == 0 && bar.styleBgTo == 0,
+            "status bar measurement keeps theme and tint out of authored inline state " + phase);
+        bar.RenderTree(app);
+        Check(app.canvas.GetPixel(bar.bx + bar.bw / 2, bar.by + bar.bh / 2) == expected,
+            "status bar paints the current surface " + phase);
+        Check(bar.computedStyle.BgOr(0) == expected,
+            "status bar divider preserves its resolved surface " + phase);
+        app.EndOffscreenFrame();
+    }
+
+    static void StatusBarSkins(App app, UiViewScope view, StatusBar bar, List<Label> items, string origin) {
+        List<string> skins = new List<string>{ "porcelain", "graphite", "navy", "porcelain" };
+        int debugTint = app.theme.statusDebugBg;
+        for (int tinted = 0; tinted < 2; tinted = tinted + 1) {
+            bar.SetTint(tinted == 0 ? 0 : debugTint);
+            for (int i = 0; i < skins.Count; i = i + 1) {
+                string phase = origin + " " + skins[i] + " step=" + Convert.ToString(i);
+                int index = app.SkinIndexOf(skins[i]);
+                Check(index >= 0, "status bar skin exists " + phase);
+                app.ApplySkin(index);
+                int background = Control.BareBox(app, "statusbar", Style.SNormal()).BgOr(0);
+                Check(background == app.theme.bgSecondary, "status bar CSS consumes the skin surface " + phase);
+                if (tinted == 0) {
+                    StatusBarSurface(app, view, bar, items, background, phase);
+                    StatusBarSurface(app, view, bar, items, background, phase + " repeated");
+                } else {
+                    StatusBarSurface(app, view, bar, items, debugTint, phase + " debug across skin");
+                    bar.SetTint(0);
+                    StatusBarSurface(app, view, bar, items, background, phase + " debug reset");
+                    debugTint = app.theme.statusDebugBg;
+                    bar.SetTint(debugTint);
+                    StatusBarSurface(app, view, bar, items, debugTint, phase + " current skin debug restored");
+                }
+            }
+        }
+        bar.SetTint(0);
+        StatusBarSurface(app, view, bar, items,
+            Control.BareBox(app, "statusbar", Style.SNormal()).BgOr(0), origin + " final reset");
+    }
+
+    static void StatusBarGeometry() {
+        App app = App.CreateOffscreen("status bar geometry", 680, 80);
+        string spec = "left|>right1|laterLeft|>right2";
+        for (int source = 0; source < 2; source = source + 1) {
+            StatusBar bar = new StatusBar();
+            List<Label> items;
+            string origin = "code";
+            if (source == 0) { items = PopulateStatusBar(bar); }
+            else {
+                HtmlDoc doc = Html.Parse("<zan-status-bar options='left|>right1|laterLeft|>right2'></zan-status-bar>", "", null);
+                Check(doc.root != null && doc.root.ChildCount() == 1 && doc.root.ChildAt(0) is StatusBar,
+                    "HTML builds the status bar control");
+                bar = (StatusBar)doc.root.ChildAt(0);
+                items = StatusBarItems(bar); origin = "HTML options";
+            }
+            ViewScopeOwner owner = new ViewScopeOwner();
+            owner.view = new UiViewScope(app, owner, bar);
+            for (int dpi = 100; dpi <= 200; dpi = dpi + 50) {
+                StatusBarResize(app, owner.view, bar, items, dpi, origin, false);
+                bar.SetText(0, "left status updated with a much longer message");
+                bar.SetText(1, "right status updated");
+                Check(items[0].Str() == "left status updated with a much longer message"
+                    && items[1].Str() == "right status updated", "status bar updates text through stable indices");
+                StatusBarResize(app, owner.view, bar, items, dpi, origin + " updated", true);
+                bar.SetText(0, "left"); bar.SetText(1, "right1");
+                StatusBarResize(app, owner.view, bar, items, dpi, origin + " text restored", false);
+                bar.Clear();
+                Check(bar.ItemAt(0) == null && bar.ItemAt(3) == null, "Clear removes all public status items");
+                for (int i = 0; i < items.Count; i = i + 1) {
+                    Check(items[i].parent == null, "Clear detaches old status labels");
+                }
+                items = PopulateStatusBar(bar);
+                StatusBarResize(app, owner.view, bar, items, dpi, origin + " Clear repopulated", false);
+                bar.SetItemsText(spec);
+                for (int i = 0; i < items.Count; i = i + 1) {
+                    Check(items[i].parent == null, "SetItemsText detaches replaced status labels");
+                }
+                items = StatusBarItems(bar);
+                StatusBarResize(app, owner.view, bar, items, dpi, origin + " SetItemsText restored", false);
+            }
+            StatusBarSkins(app, owner.view, bar, items, origin);
+            owner.view.Retire();
+        }
+        Release(app);
+    }
+
+    static void Main() {
+        ControlBootstrap.Install();
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        ComposedPages(); StandardHostModels(); NoInputLayoutAndTemporaryInvalidation(); ReentrantBind(); WeakAndStop(); ConstrainedTextLayout();
+        StatusBarGeometry();
+        Release(frame);
+        Console.WriteLine("view-scope:ok");
+    }
+}

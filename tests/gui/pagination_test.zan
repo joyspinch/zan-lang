@@ -2,11 +2,28 @@ using System;
 using Gui;
 using Gui.Widget;
 
+class PaginationBoundPage {
+    public int value = 1;
+    public int reads;
+    public int Page {
+        get { reads = reads + 1; return value; }
+        set { this.value = value; }
+    }
+}
+
+class PaginationViewOwner : UiViewOwner {
+    public void PrepareView(UiViewScope view, App app) {
+        view.Layout(12, app.ContentTop() + 12, 600, 44);
+    }
+    public void ViewAction(string name, Control sender) { }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+}
+
 // Gui.Pagination 的无窗口回归：Element Plus 页码窗口算法
 // （BuildPagesSlots，0 = 省略号）、item-count 计页与钳制、
 // SetPage/Change 事件、sizes / 顺序 / 自定义文案往返，以及
 // 组件模型（Kind/Props/GetProp/SetProp/SetExtra/Events/
-// ControlFactory）。页码走注入的 SignalInt 读取，不需要 App。
+// ControlFactory）。页码走 Binding；离屏宿主验证准备期建树与 Paint 只读。
 class PaginationTest {
     static int fails;
     static int chgCount;
@@ -42,6 +59,55 @@ class PaginationTest {
 
     static void OnChg() { chgCount = chgCount + 1; }
 
+    static Control Part(Pagination pagination, string cls) {
+        for (int i = 0; i < pagination.ChildCount(); i = i + 1) {
+            Control child = pagination.ChildAt(i);
+            if (child.HasClass(cls)) { return child; }
+        }
+        throw new Exception("missing pagination part " + cls);
+    }
+
+    static void PreparationAndPaint() {
+        App app = App.CreateOffscreen("Pagination preparation", 640, 160);
+        PaginationBoundPage model = new PaginationBoundPage();
+        Pagination pagination = new Pagination(30);
+        pagination.Page = model.Page;
+        pagination.Change.Add(PaginationTest.OnChg);
+        app.SetRootControl(pagination);
+        PaginationViewOwner owner = new PaginationViewOwner();
+        UiViewScope view = new UiViewScope(app, owner, pagination);
+        model.value = 12;
+        chgCount = 0;
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Control selected = Part(pagination, "primary");
+        EqStr("binding prepares numbered button before paint", selected.GetProp("text"), "12");
+        Control next = Part(pagination, "pagination-next");
+        EqBool("prepared next button has geometry", next.bw > 0 && next.bh > 0, true);
+        int x = next.bx + next.bw / 2;
+        int y = next.by + next.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        app.DrainPosts();
+        Eq("prepared next click updates binding without paint", model.value, 13);
+        Eq("prepared next click notifies once", chgCount, 1);
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        selected = Part(pagination, "primary");
+        EqStr("following preparation has current page", selected.GetProp("text"), "13");
+        model.value = 30;
+        int reads = model.reads;
+        pagination.RenderTree(app);
+        pagination.RenderTree(app);
+        Eq("paint does not read page binding", model.reads, reads);
+        EqBool("paint preserves prepared button identity", Part(pagination, "primary") == selected, true);
+        EqStr("paint preserves prepared page snapshot", selected.GetProp("text"), "13");
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        EqStr("next preparation consumes changed binding", Part(pagination, "primary").GetProp("text"), "30");
+        EqBool("last page disables next before paint", Part(pagination, "pagination-next").Disabled.Get(), true);
+        view.Retire();
+        app.SetRootControl(null);
+        app.StopLoop(); app.DrainPosts(); app.canvas.Destroy();
+    }
+
     static void Main() {
         // 重臂注册制:标准控件工厂需先装(见 ControlBootstrap)。
         ControlBootstrap.Install();
@@ -52,31 +118,31 @@ class PaginationTest {
         EqList("flat 6", Pagination.BuildPages(6, 3), "1,2,3,4,5,6");
         // 领起长串（当前页靠前）：1..6 + 省略号 + 尾页。
         EqList("front", Pagination.BuildPages(100, 1),
-               "1,2,3,4,5,6,0,100");
+        "1,2,3,4,5,6,0,100");
         // 边界：当前页 = slots-2 = 5 仍在领起串里，6 起进入居中窗口。
         EqList("front edge 5", Pagination.BuildPages(100, 5),
-               "1,2,3,4,5,6,0,100");
+        "1,2,3,4,5,6,0,100");
         EqList("mid edge 6", Pagination.BuildPages(100, 6),
-               "1,0,4,5,6,7,8,0,100");
+        "1,0,4,5,6,7,8,0,100");
         // 居中：当前页 ± half-1，两侧省略号。
         EqList("mid", Pagination.BuildPages(100, 50),
-               "1,0,48,49,50,51,52,0,100");
+        "1,0,48,49,50,51,52,0,100");
         EqList("mid edge 95", Pagination.BuildPages(100, 95),
-               "1,0,93,94,95,96,97,0,100");
+        "1,0,93,94,95,96,97,0,100");
         // 收尾长串：省略号 + 最后 6 页。
         EqList("tail", Pagination.BuildPages(100, 100),
-               "1,0,95,96,97,98,99,100");
+        "1,0,95,96,97,98,99,100");
         EqList("tail edge 96", Pagination.BuildPages(100, 96),
-               "1,0,95,96,97,98,99,100");
+        "1,0,95,96,97,98,99,100");
         // 槽位数 5：居中窗口变 ±1。
         EqList("slots 5 mid", Pagination.BuildPagesSlots(100, 50, 5),
-               "1,0,49,50,51,0,100");
+        "1,0,49,50,51,0,100");
         // 当前页越界钳制。
         EqList("clamp high", Pagination.BuildPages(3, 99), "1,2,3");
         EqList("clamp low", Pagination.BuildPages(3, 0), "1,2,3");
 
         // ---- item-count 模式：条目数 + 每页条数推导页数 -------------
-        SignalInt m = new SignalInt(1);
+        Binding<int> m = 1;
         Pagination p = Pagination.WithCount(101, 10, m);
         Eq("count 101/10 pages", p.TotalPages(), 11);
         EqBool("count mode on", p.UsesItemCount(), true);
@@ -88,17 +154,17 @@ class PaginationTest {
         p.SetPage(99);
         Eq("clamped to last", m.Get(), 6);
         // ceil 边界：整除不加页，余 1 加一页。
-        Eq("count 200/20", Pagination.WithCount(200, 20, new SignalInt(1))
-           .TotalPages(), 10);
-        Eq("count 201/20", Pagination.WithCount(201, 20, new SignalInt(1))
-           .TotalPages(), 11);
+        Eq("count 200/20", Pagination.WithCount(200, 20, 1)
+        .TotalPages(), 10);
+        Eq("count 201/20", Pagination.WithCount(201, 20, 1)
+        .TotalPages(), 11);
         // SetTotal 回到显式页数模式。
         p.SetTotal(12);
         EqBool("count mode off", p.UsesItemCount(), false);
         Eq("explicit pages", p.TotalPages(), 12);
 
         // ---- SetPage：钳制 + Change 恰好一次 ------------------------
-        SignalInt m2 = new SignalInt(1);
+        Binding<int> m2 = 1;
         Pagination p2 = new Pagination(12, m2);
         chgCount = 0;
         p2.Change.Add(PaginationTest.OnChg);
@@ -113,7 +179,7 @@ class PaginationTest {
         Eq("setpage high clamp", m2.Get(), 12);
         Eq("clamped moves fire", chgCount, 3);
         // BindEvent("Change") 与 Change.Add 等价。
-        Pagination p2b = new Pagination(12, new SignalInt(1));
+        Pagination p2b = new Pagination(12, 1);
         chgCount = 0;
         p2b.BindEvent("Change", PaginationTest.OnChg);
         p2b.SetPage(2);
@@ -140,7 +206,7 @@ class PaginationTest {
         p4.Prefix("A").Suffix("B").ShowTotal(true);
         p4.Jumper(true).ShowSizes(true);
         EqStr("order default", p4.OrderText(),
-              "prefix, total, pager, suffix, jumper, sizes");
+        "prefix, total, pager, suffix, jumper, sizes");
         p4.SetOrderText("jumper, sizes, pager");
         EqStr("order custom", p4.OrderText(), "jumper, sizes, pager");
         // 缺 pager 自动补回；非法段名丢弃。
@@ -151,7 +217,7 @@ class PaginationTest {
         // 空串回到默认顺序。
         p4.SetOrderText("");
         EqStr("order reset", p4.OrderText(),
-              "prefix, total, pager, suffix, jumper, sizes");
+        "prefix, total, pager, suffix, jumper, sizes");
 
         // ---- 窗口按钮数规范化（奇数、>=5）---------------------------
         Pagination p5 = new Pagination(10);
@@ -228,11 +294,12 @@ class PaginationTest {
         } else {
             EqStr("factory kind", made.Kind(), "Pagination");
         }
-        SignalInt m8 = new SignalInt(4);
+        Binding<int> m8 = 4;
         Pagination ofd = Pagination.Of(12, m8);
         Eq("of pages", ofd.TotalPages(), 12);
         Eq("of page", m8.Get(), 4);
 
+        PreparationAndPaint();
         if (fails == 0) {
             Console.WriteLine("pagination_test OK");
         } else {

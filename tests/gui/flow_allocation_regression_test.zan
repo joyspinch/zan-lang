@@ -1,0 +1,165 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+class FlowAllocationHookProbe : Control {
+    public int begins;
+    public Control supplied;
+
+    public FlowAllocationHookProbe() { this.InitControl("hook", 0); }
+
+    public override void InlineRunsBegin() { begins = begins + 1; }
+
+    public override List<FlowEntry> FlowEntries() {
+        List<FlowEntry> entries = base.FlowEntries();
+        if (supplied != null) {
+            FlowEntry entry = new FlowEntry();
+            entry.kid = supplied;
+            entries.Add(entry);
+        }
+        return entries;
+    }
+}
+
+class FlowAllocationReentryProbe : Control {
+    public static string trace = "";
+    public weak Control host;
+    public Control replacement;
+    public bool armed;
+
+    public FlowAllocationReentryProbe(string id) { this.InitControl(id, 0); }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        FlowAllocationReentryProbe.trace = FlowAllocationReentryProbe.trace + name;
+        base.Arrange(x, y, w, h);
+        if (armed) {
+            armed = false;
+            Control owner = host;
+            if (owner != null) {
+                owner.Children.Clear();
+                owner.Add(replacement);
+                owner.Arrange(0, 0, 100, 100);
+            }
+        }
+    }
+}
+
+class Program {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("flow allocation: " + label); }
+    }
+
+    static void Box(Control c, int w, int h) {
+        c.computedStyle = new StyleBox();
+        c.computedStyle.width = w;
+        c.computedStyle.height = h;
+    }
+
+    static void EmptyAndVirtual(App app) {
+        FlowAllocationHookProbe c = new FlowAllocationHookProbe();
+        Box(c, 0, 0);
+        List<FlowEntry> first = c.FlowEntries();
+        first.Add(new FlowEntry());
+        Check(c.FlowEntries().Count == 0, "empty public lists remain independent");
+        c.MeasureContent(app);
+        c.Arrange(0, 0, 100, 100);
+        Check(c.begins == 1, "empty arrange still clears inline runs");
+        Control item = new Control("virtual-item");
+        Box(item, 9, 7);
+        c.supplied = item;
+        c.MeasureContent(app);
+        Check(c.ChildCount() == 0 && c.prefH == 7, "virtual leaf content measured");
+        c.Arrange(0, 0, 100, 100);
+        Check(c.begins == 2 && item.bw == 9 && item.bh == 7, "virtual leaf content arranged");
+    }
+
+    static void MixedAndClear(App app) {
+        Element e = new Element();
+        e.InitElement("div", "mixed");
+        Box(e, 0, 0);
+        e.computedStyle.display = 3;
+        e.computedStyle.bfc = 1;
+        e.elBefore = "before";
+        e.elAfter = "after";
+        e.SetText("body");
+        List<FlowEntry> text = e.FlowEntries();
+        Check(text.Count == 3 && text[0].text == "before" && text[1].text == "body"
+            && text[2].text == "after", "childless pseudo and body order");
+        e.MeasureContent(app);
+        Check(e.prefH > 0, "childless text measured");
+        e.Arrange(0, 0, 200, 100);
+        Check(e.elRuns.Count > 0, "text runs placed");
+        e.SetText("");
+        e.elBefore = "";
+        e.elAfter = "";
+        e.Arrange(0, 0, 200, 100);
+        Check(e.elRuns.Count == 0 && e.elRunsFresh, "empty arrange retires old runs");
+        Control block = new Control("block");
+        Box(block, 10, 8);
+        e.AddText("left");
+        e.AddKid(block);
+        e.AddText("right");
+        List<FlowEntry> mixed = e.FlowEntries();
+        Check(mixed.Count == 3 && mixed[0].text == "left" && mixed[1].kid == block
+            && mixed[2].text == "right", "mixed document order");
+        e.Arrange(0, 0, 200, 100);
+        Check(block.by > 0 && e.elRuns.Count > 0, "inline block inline segments");
+        e.ClearKids();
+        e.Arrange(0, 0, 200, 100);
+        Check(e.elRuns.Count == 0, "cleared mixed content retires runs");
+    }
+
+    static void FloatAndClear(App app) {
+        Control root = new Control("float-root");
+        Box(root, 100, 0);
+        root.hintWrapW = 100;
+        root.computedStyle.bfc = 1;
+        Control floating = new Control("float");
+        Box(floating, 30, 20);
+        floating.computedStyle.floatSide = 1;
+        Control cleared = new Control("clear");
+        Box(cleared, 40, 5);
+        cleared.computedStyle.clearSide = 3;
+        root.Add(floating);
+        root.Add(cleared);
+        root.MeasureContent(app);
+        Check(root.prefH == 25, "lazy float measured with clear");
+        root.Arrange(0, 0, 100, 100);
+        Check(floating.by == 0 && cleared.by == 20, "lazy float arranged with clear");
+        Check(cleared.hostFloats != null && cleared.hostFloats.Count == 1,
+            "float intrusion copied to child");
+        floating.computedStyle.floatSide = 0;
+        root.Arrange(0, 0, 100, 100);
+        Check(cleared.hostFloats == null && cleared.by == 20, "no float clears prior intrusion");
+        root.Children.Clear();
+        root.Arrange(0, 0, 100, 100);
+    }
+
+    static void ReentrySnapshot() {
+        Control root = new Control("reentry-root");
+        Box(root, 100, 0);
+        FlowAllocationReentryProbe a = new FlowAllocationReentryProbe("A");
+        FlowAllocationReentryProbe b = new FlowAllocationReentryProbe("B");
+        FlowAllocationReentryProbe x = new FlowAllocationReentryProbe("X");
+        Box(a, 10, 10); Box(b, 10, 10); Box(x, 10, 10);
+        root.Add(a); root.Add(b);
+        a.host = root;
+        a.replacement = x;
+        a.armed = true;
+        FlowAllocationReentryProbe.trace = "";
+        root.Arrange(0, 0, 100, 100);
+        Check(FlowAllocationReentryProbe.trace == "AXB", "reentry preserves outer child snapshot");
+        Check(root.ChildCount() == 1 && root.ChildAt(0) == x && b.by == 10,
+            "outer snapshot finishes after children replaced");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("flow allocation regression", 320, 240);
+        EmptyAndVirtual(app);
+        MixedAndClear(app);
+        FloatAndClear(app);
+        ReentrySnapshot();
+        app.canvas.Destroy();
+        Console.WriteLine("FLOW_ALLOCATION_REGRESSION_OK");
+    }
+}

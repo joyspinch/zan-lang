@@ -16,9 +16,9 @@ public delegate string InputFilterFn(string candidate);
 // 暴露委托事件：
 // name.Change += () => { ... };   // 每次编辑时触发
 // name.Submit += () => { ... };   // 回车时触发
-// name.Render(app, x, y, w, h);
+// app.SetRootControl(name);
 // 获得焦点时消费键盘事件（可打印字符、Backspace、
-// Delete、Left/Right/Home/End），就地编辑绑定的 SignalString，并将
+// Delete、Left/Right/Home/End），就地编辑Text 绑定的编辑缓冲，并将
 // 光标位置上报给框架，使 IME 组合窗口
 // 跟随光标移动。
 // 能力面（对齐 Naive UI Input）：`Disabled`（继承自 Control）、
@@ -27,14 +27,9 @@ public delegate string InputFilterFn(string candidate);
 // `Round` 圆角、`PassiveActivated` 回车激活、`Filter` 输入过滤、
 // 以及 Clear/Focus/Blur/SelectAll/ScrollToEnd 手动操作。
 public class Input : Control {
-    // 内部编辑缓冲（SignalString，§6.2 内部状态缓冲）：光标、选区、
-    // 过滤、IME 组合等编辑操作的运行时真相。不是绑定协议，
-    // 外部通道是 `data`（Binding<string>）。
-    public SignalString editSig;
-    // 双向绑定文本：`name.data = user.name;` 使输入框与
-    // 模型双向保持同步（编译器降级的 Binding）。可选的；
-    // 未设置时，输入框仅编辑其内部 SignalString。
-    public Binding<string> data;
+    // 编辑草稿在过滤和选区替换完成后一次写回，拒绝的候选值不进入模型。
+    private string editText;
+    public Binding<string> Text;
     // 占位文本（内容为空时显示）。
     public string hint;
     // 光标位置（字节偏移）。
@@ -45,9 +40,7 @@ public class Input : Control {
     public int selAnchor;
     // 控件命中 id。
     public int wid;
-    // 上一帧渲染时的宿主 App：手动操作（Focus/Blur/Clear/
-    // ScrollToEnd）需要在事件回调里改焦点并请求重绘，而回调
-    // 没有 app 形参——渲染沿顺手记一笔即可。
+    // 最近参与布局或输入的宿主；手动操作也可在首次绘制前调用。
     public weak App liveApp;
     // 密码掩码：设置后文本以 `*` 渲染，直到被明文显示。
     public bool password;
@@ -64,7 +57,7 @@ public class Input : Control {
     // 校验错误信息；"" 表示有效。SetError 会绘制红色边框，并
     // 在字段下方显示消息；任何编辑都会清除它。
     public string errMsg;
-    // 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
+    // 尺寸变体：对应 ClassName = "small" / "large"（Naive UI size prop）。
     // Binding<string> 使 `inp.Size = vm.density;` 可响应式换档，
     // 属性面板（PropSpec.Enum + str 绑定）也能直接读写选项文本。
     public Binding<string> Size;
@@ -115,18 +108,27 @@ public class Input : Control {
     public bool passiveActive;
     // KeyPress 兼容通知按宿主窗口的本地文本事件序号去重。
     public long lastKeyNamedSeq;
+    private bool pointerSelecting;
+    private bool pointerOnTrail;
+    // 0 = decorative slot, 1 = clear, 2 = password reveal.
+    private int pointerTrailAction;
+    private int pointerClickAction;
+    private int pointerX;
+    private int pointerY;
+    private bool autoselectPending;
 
     // 输入过滤（Naive UI allow-input）：返回清洗后的候选文本，
     // null 表示原样拒绝。用于「只允许数字」「trim 空白」这类
     // 输入约束。内置 `Input.OnlyDigits` / `Input.NoSpaces`。
     public InputFilterFn Filter;
 
-    // 立即模式工厂与保留模式构造函数共用的初始化函数：
-    // 设置 Control 基类（停靠顶部，使追加的输入框
-    // 自动贴齐），再设置输入框专属状态。
-    public void InitInput(SignalString sig, string hintText) {
+    // 保留模式构造函数共用的初始化函数：设置 Control 基类，
+    // 再设置输入框专属状态。
+    public void InitInput(Binding<string> text, string hintText) {
         this.InitControl("input", 1);
-        editSig = sig;
+        Text = "";
+        if (text != null) { Text = text; }
+        editText = Text.Get();
         hint = hintText;
         cursorPos = 0;
         selAnchor = -1;
@@ -164,7 +166,7 @@ public class Input : Control {
 
     // 保留模式构造函数：`Input name = new Input("Your name");`
     public Input(string hintText) {
-        InitInput(new SignalString(""), hintText);
+        InitInput("", hintText);
     }
 
     // 一个与 `s` 等长（按字节）的 `*` 字符串，使掩码显示保持
@@ -176,20 +178,22 @@ public class Input : Control {
     }
 
     // 当前文本。
-    public string GetText() { return editSig.Get(); }
+    public string GetText() { this.SyncBinding(); return editText; }
 
     // 宿主调整占位文字（SelectBox 的筛选框在 Filterable(true) 之后
     // 才由 FilterHint 定文案，晚于构造）。
     public void SetHint(string v) { hint = v; }
 
     public override int InputFocusCapabilities() { return 3; }
+    public override int PointerCursor() { return 1; }
 
     public override int WidgetId() { return wid; }
 
     // 覆盖文本：光标收到末尾、清空选区并写回绑定。
     public void SetText(string v) {
-        editSig.Set(v);
+        editText = v;
         cursorPos = v.Length;
+        selAnchor = -1;
         PushBinding();
     }
 
@@ -198,13 +202,13 @@ public class Input : Control {
     // 字段在 Focus 事件里调用它。
     public void SelectAll() {
         selAnchor = 0;
-        cursorPos = editSig.Get().Length;
+        cursorPos = editText.Length;
     }
 
     // 清空内容（Naive UI ref.clear()）。触发 Change，光标归零。
     public void Clear() {
-        if (editSig.Get() == "") { return; }
-        editSig.Set("");
+        if (editText == "") { return; }
+        editText = "";
         cursorPos = 0;
         selAnchor = -1;
         Edited();
@@ -214,9 +218,12 @@ public class Input : Control {
     // 以编程方式把焦点抢到本输入框（Naive UI ref.focus()）。
     // 禁用态不响应。
     public void Focus() {
-        if (liveApp == null || this.IsDisabled()) { return; }
-        liveApp.focus.SetFocused(wid);
-        liveApp.RequestRedraw();
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || this.IsDisabled()) { return; }
+        liveApp = app;
+        app.focus.SetFocused(wid, this);
+        app.RequestRedraw();
     }
 
     // 交出焦点（Naive UI ref.blur()）。
@@ -229,7 +236,7 @@ public class Input : Control {
     // 光标移到行尾（Naive UI ref.scrollTo 的等价物：渲染沿本来
     // 就会把光标滚进视口）。
     public void ScrollToEnd() {
-        cursorPos = editSig.Get().Length;
+        cursorPos = editText.Length;
         selAnchor = -1;
         if (liveApp != null) { liveApp.RequestRedraw(); }
     }
@@ -255,12 +262,12 @@ public class Input : Control {
 
     // 当前文本的计数值（按 CountGraphemes 口径）。
     public int CountOf(string s) {
-        if (CountGraphemes) { return Text.Graphemes(s); }
-        return Text.Chars(s);
+        if (CountGraphemes) { return Gui.Text.Graphemes(s); }
+        return Gui.Text.Chars(s);
     }
 
     // 当前文本的计数值。
-    public int CountValue() { return this.CountOf(editSig.Get()); }
+    public int CountValue() { return this.CountOf(this.GetText()); }
 
     // 字数统计的显示文本："当前 / 上限"；计数超过 99 时上限侧
     // 截为 "99+"（Naive UI 的显示口径）。
@@ -276,7 +283,7 @@ public class Input : Control {
         string outStr = "";
         int i = 0;
         while (i < s.Length) {
-            int e = Text.NextCharEnd(s, i);
+            int e = Gui.Text.NextCharEnd(s, i);
             string ch = s.Substring(i, e - i);
             if (ch.Length == 1) {
                 int b = s[i];
@@ -306,18 +313,16 @@ public class Input : Control {
 
     // 把绑定的模型值拉入编辑缓冲区（model -> UI）。
     public override void SyncBinding() {
-        if (data == null) { return; }
-        string cur = data.Get();
-        if (cur != editSig.Get()) {
-            editSig.Set(cur);
-            if (cursorPos > cur.Length) { cursorPos = cur.Length; }
+        string cur = Text.Get();
+        if (cur != editText) {
+            editText = cur;
+            this.ClampCursor();
         }
     }
 
     // 把编辑缓冲区通过绑定写回模型（UI -> model）。
-    public void PushBinding() {
-        if (data == null) { return; }
-        data.Set(editSig.Get());
+    private void PushBinding() {
+        Text.Set(editText);
     }
 
     // 所有 UI 编辑都汇入此处：先写回，再通知；同时清除
@@ -330,7 +335,7 @@ public class Input : Control {
 
     // 光标与选区锚点钳回文本范围内。
     public void ClampCursor() {
-        string txt = editSig.Get();
+        string txt = editText;
         if (cursorPos > txt.Length) { cursorPos = txt.Length; }
         if (cursorPos < 0) { cursorPos = 0; }
         if (selAnchor > txt.Length) { selAnchor = txt.Length; }
@@ -346,16 +351,16 @@ public class Input : Control {
     // 选区文本（无选区为 ""）。
     public string SelText() {
         if (!HasSel()) { return ""; }
-        return editSig.Get().Substring(SelStart(), SelEnd() - SelStart());
+        return editText.Substring(SelStart(), SelEnd() - SelStart());
     }
 
     // 删除选中的范围，并把光标收拢到其起点。
     private void DeleteSel() {
         if (!HasSel()) { return; }
-        string txt = editSig.Get();
+        string txt = editText;
         int s = SelStart();
         int e = SelEnd();
-        editSig.Set(txt.Substring(0, s) + txt.Substring(e, txt.Length - e));
+        editText = txt.Substring(0, s) + txt.Substring(e, txt.Length - e);
         cursorPos = s;
         selAnchor = -1;
     }
@@ -367,18 +372,18 @@ public class Input : Control {
     // trim 式过滤器甩到文末。上限按 CountOf 口径计，与字数
     // 统计显示同一个数。
     public bool Insert(string s) {
-        string orig = editSig.Get();
+        string orig = editText;
         int origCursor = cursorPos;
         int origAnchor = selAnchor;
         bool hadSel = HasSel();
         if (hadSel) { DeleteSel(); }
-        string txt = editSig.Get();
-        string cand = Text.InsertAt(txt, cursorPos, s);
+        string txt = editText;
+        string cand = Gui.Text.InsertAt(txt, cursorPos, s);
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null
             || (MaxLen > 0 && this.CountOf(final) > MaxLen)) {
-            editSig.Set(orig);
+            editText = orig;
             cursorPos = origCursor;
             selAnchor = origAnchor;
             return false;
@@ -392,7 +397,7 @@ public class Input : Control {
             selAnchor = -1;
             return false;
         }
-        editSig.Set(final);
+        editText = final;
         cursorPos = cp;
         selAnchor = -1;
         Edited();
@@ -406,8 +411,8 @@ public class Input : Control {
         string final = cand;
         if (Filter != null) { final = Filter(cand); }
         if (final == null) { return false; }
-        if (final == editSig.Get()) { return false; }
-        editSig.Set(final);
+        if (final == editText) { return false; }
+        editText = final;
         if (cursorPos > final.Length) { cursorPos = final.Length; }
         if (selAnchor > final.Length) { selAnchor = final.Length; }
         Edited();
@@ -417,7 +422,7 @@ public class Input : Control {
     // 路由输入复用原有编辑规则；返回 true 表示该事件已归本控件。
     private bool HandleKeyEvent(App app, int kind, int code, int mods) {
         ClampCursor();
-        string txt = editSig.Get();
+        string txt = editText;
         // 被动激活：聚焦后先用回车"解锁"，解锁前不消费任何编辑键
         // （Naive UI passively-activated：Tab 聚焦不该吞掉输入）。
         if (PassiveActivated && !passiveActive) {
@@ -435,8 +440,8 @@ public class Input : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos > 0) {
-                    int start = Text.PrevCharStart(txt, cursorPos);
-                    if (this.DeleteCandidate(Text.DeleteBefore(txt, cursorPos))) {
+                    int start = Gui.Text.PrevCharStart(txt, cursorPos);
+                    if (this.DeleteCandidate(Gui.Text.DeleteBefore(txt, cursorPos))) {
                         cursorPos = start;
                     }
                     app.RequestRedraw();
@@ -451,7 +456,7 @@ public class Input : Control {
             } else if (code == 9) {
                 // 忽略 Tab（由框架焦点遍历处理）——不消费，Tab 留给框架。
             } else {
-                string ch = Text.CharStr(code);
+                string ch = Gui.Text.CharStr(code);
                 if (ch.Length > 0 && app.window.EventSeq() != this.lastKeyNamedSeq) {
                     // 字符键出口：落文本之前通知（DOM keypress 语义）；
                     // 仅 KeyPress 兼容通知在控件内按本地序号去重。
@@ -513,8 +518,8 @@ public class Input : Control {
                     return true;
                 }
                 if (!shift) { selAnchor = -1; }
-                if (kc == 37) { if (cursorPos > 0) { cursorPos = Text.PrevCharStart(txt, cursorPos); } }
-                else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Text.NextCharEnd(txt, cursorPos); } }
+                if (kc == 37) { if (cursorPos > 0) { cursorPos = Gui.Text.PrevCharStart(txt, cursorPos); } }
+                else if (kc == 39) { if (cursorPos < txt.Length) { cursorPos = Gui.Text.NextCharEnd(txt, cursorPos); } }
                 else if (kc == 36) { cursorPos = 0; }
                 else if (kc == 35) { cursorPos = txt.Length; }
                 app.RequestRedraw();
@@ -525,7 +530,7 @@ public class Input : Control {
                     Edited();
                     app.RequestRedraw();
                 } else if (cursorPos < txt.Length) {
-                    if (this.DeleteCandidate(Text.RemoveAt(txt, cursorPos))) {
+                    if (this.DeleteCandidate(Gui.Text.RemoveAt(txt, cursorPos))) {
                         app.RequestRedraw();
                     }
                 }
@@ -547,59 +552,228 @@ public class Input : Control {
             this.SelectAll();
             autoselected = true;
         }
+        autoselectPending = false;
         if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
+        this.UpdateInputCaret(app);
+    }
+
+    private InputGeometry InputGeometryForStyle(App app, StyleBox style, int x, int y, int w, int h) {
+        int font = style.FontOr(Style.FontFallback(app, "medium"));
+        string text = editText;
+        bool clear = Clearable && text != "" && !this.IsDisabled() && !Loading
+            && (this.IsFocused(app) || this.isHovered || app.focus.IsHovered(wid));
+        bool trail = Loading || clear || password || iconTrail != "";
+        int suffixWidth = Suffix != null && Suffix != "" ? Canvas.MeasureText(Suffix, font) : 0;
+        int countWidth = 0;
+        if (ShowCount) {
+            string count = Input.CountText(this.CountOf(text), MaxLen);
+            StyleBox countStyle = this.ResolvePartAs(app, "input", "count", "", this.EffectiveClass(), Style.SNormal());
+            countWidth = Canvas.MeasureText(count, countStyle.FontOr(Style.FontFallback(app, "small")));
+        }
+        string prefixIcon = iconLead != "" ? iconLead : PrefixIcon;
+        int prefixWidth = Prefix != null && Prefix != "" ? Canvas.MeasureText(Prefix, font) : 0;
+        string display = text;
+        if (password && !reveal) { display = Input.Mask(text); }
+        return InputGeometry.Build(app, x, y, w, h, font,
+            style.PadLOr(app.Scale(6)), style.PadROr(app.Scale(6)), app.Scale(4),
+            prefixIcon != "", prefixWidth, suffixWidth, countWidth, trail, clear, display, cursorPos);
+    }
+
+    public override string EffectiveClass() {
+        string cls = this.SizeClassIn(Class);
+        cls = Control.ClassWith(cls, Control.StatusSanitize(FieldStatus));
+        if (Round) { cls = Control.ClassWith(cls, "round"); }
+        return cls;
+    }
+
+    private InputGeometry CurrentInputGeometry(App app) {
+        // Geometry is cheap derived state, not a snapshot of the last paint.
+        // Text, selection, inline styles, slots and bounds can all change between events.
+        StyleBox style = this.ResolveEasedStyleAsIn(app, wid, "input", this.EffectiveClass(),
+            this.IsDisabled(), false, bx, by, bw, bh);
+        return this.InputGeometryForStyle(app, style, bx, by, bw, bh);
+    }
+
+    private void UpdateInputCaret(App app) {
+        if (!this.IsFocused(app) || this.IsDisabled()) { return; }
+        InputGeometry geometry = this.CurrentInputGeometry(app);
+        app.SetImeCaret(geometry.innerX - geometry.scrollX + geometry.caretWidth,
+            geometry.textY + Canvas.FontHeight(geometry.font));
+    }
+
+    private int TrailAction(InputGeometry geometry) {
+        if (Loading || this.IsDisabled()) { return 0; }
+        if (geometry.showClear) { return 1; }
+        if (password) { return 2; }
+        return 0;
+    }
+
+    private void MovePointerCaret(App app, int x) {
+        this.SyncBinding();
+        this.ClampCursor();
+        InputGeometry geometry = this.CurrentInputGeometry(app);
+        cursorPos = geometry.CursorAt(x, editText);
+        this.UpdateInputCaret(app);
+        app.RequestRedraw();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || e.originalSource != this || app == null || this.IsDisabled()
+            || Loading || app.window.EventButton() != 0 || !this.IsFocused(app)) { return; }
+        liveApp = app;
+        this.SyncBinding();
+        this.ClampCursor();
+        InputGeometry geometry = this.CurrentInputGeometry(app);
+        pointerClickAction = 0;
+        pointerX = e.x;
+        pointerY = e.y;
+        pointerOnTrail = geometry.OnTrail(e.x, e.y);
+        pointerTrailAction = pointerOnTrail ? this.TrailAction(geometry) : 0;
+        pointerSelecting = !pointerOnTrail;
+        bool shift = Modifiers.HasShift(e.modifiers);
+        if (pointerSelecting) {
+            if (shift) {
+                if (selAnchor < 0) { selAnchor = cursorPos; }
+                cursorPos = geometry.CursorAt(e.x, editText);
+            } else if (!autoselectPending) {
+                cursorPos = geometry.CursorAt(e.x, editText);
+                selAnchor = cursorPos;
+            }
+        }
+        autoselectPending = false;
+        base.OnPointerDown(e);
+        app.CapturePointer(this, pointerSelecting);
+        this.UpdateInputCaret(app);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || app == null || app.GetCapturedPointer() != this) { return; }
+        if (this.IsDisabled() || Loading || !this.IsFocused(app)) { this.OnPointerCancel(e); return; }
+        if (pointerSelecting && (e.x != pointerX || e.y != pointerY)) {
+            pointerX = e.x;
+            pointerY = e.y;
+            this.MovePointerCaret(app, e.x);
+        }
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.FindApp();
+        if (e.handled || app == null || app.GetCapturedPointer() != this
+            || app.window.EventButton() != 0) { return; }
+        if (this.IsDisabled() || Loading || !this.IsFocused(app)) {
+            this.OnPointerCancel(e);
+            e.Handle();
+            return;
+        }
+        this.SyncBinding();
+        this.ClampCursor();
+        InputGeometry geometry = this.CurrentInputGeometry(app);
+        pointerClickAction = pointerOnTrail && geometry.OnTrail(e.x, e.y)
+            && pointerTrailAction == this.TrailAction(geometry) ? pointerTrailAction : 0;
+        if (pointerSelecting && (e.x != pointerX || e.y != pointerY)) {
+            this.MovePointerCaret(app, e.x);
+        }
+        if (selAnchor == cursorPos) { selAnchor = -1; }
+        pointerSelecting = false;
+        pointerOnTrail = false;
+        pointerTrailAction = 0;
+        base.OnPointerUp(e);
+        app.ReleasePointerCapture();
+        app.RequestRedraw();
+        // Leave Up unhandled so App can validate the actual release target and
+        // synthesize one Click (including its standard named notification).
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        int action = pointerClickAction;
+        pointerClickAction = 0;
+        App app = this.FindApp();
+        if (e.handled || e.originalSource != this || app == null || this.IsDisabled()
+            || Loading || app.window.EventButton() != 0 || !this.IsFocused(app)) { return; }
+        this.SyncBinding();
+        InputGeometry geometry = this.CurrentInputGeometry(app);
+        if (action != 0 && geometry.OnTrail(e.x, e.y) && action == this.TrailAction(geometry)) {
+            if (action == 1) { this.Clear(); }
+            else { reveal = !reveal; }
+        }
+        this.UpdateInputCaret(app);
+        app.RequestRedraw();
+        e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        base.OnPointerCancel(e);
+        pointerSelecting = false;
+        pointerOnTrail = false;
+        pointerTrailAction = 0;
+        pointerClickAction = 0;
+        autoselectPending = false;
+        if (selAnchor == cursorPos) { selAnchor = -1; }
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    public override void OnInputFocusLost() {
+        // CancelInputSubtree routes PointerCancel before clearing focus. Focus loss
+        // must finish an active gesture, not cancel the same retirement a second time.
+        App app = this.FindApp();
+        if (this.isPressed || this.isHovered || pointerSelecting || pointerOnTrail
+                || pointerTrailAction != 0 || pointerClickAction != 0 || autoselectPending
+                || (app != null && app.GetCapturedPointer() == this)) {
+            RoutedEventArgs cancel = new RoutedEventArgs("PointerCancel", this, 0, 0);
+            this.OnPointerCancel(cancel);
+        }
+        selAnchor = -1;
+        autoselected = false;
+        passiveActive = false;
+    }
+
+    public override void TriggerEvent(string evt) {
+        if (evt == "Focus") {
+            App app = this.FindApp();
+            if (app != null) {
+                liveApp = app;
+                this.SyncBinding();
+                this.ClampCursor();
+                if (Autoselect && !autoselected) {
+                    this.SelectAll();
+                    autoselected = true;
+                    autoselectPending = true;
+                }
+                this.UpdateInputCaret(app);
+                app.RequestRedraw();
+            }
+        }
+        base.TriggerEvent(evt);
     }
 
     public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
     public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
     public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
 
-    // 内部绘制实现：输入框核心绘制与 IME 编辑管线。
+    // Only visual output; input, focus and IME caret updates run outside paint.
     private int PaintInput(App app, int x, int y, int w, int h) {
         int id = wid;
         Canvas c = app.canvas;
         Theme t = app.theme;
-        // 事件回调没有 app 形参，渲染沿记一笔宿主供手动操作使用。
-        if (liveApp != app) { lastKeyNamedSeq = 0; }
-        liveApp = app;
-
         bool off = this.IsDisabled();
-        app.focus.RegisterFocusable(id, this);
-        app.focus.RegisterTextEditable(id);
-        bool focused = app.focus.IsFocused(id) && !off;
+        bool focused = this.IsFocused(app) && !off;
 
-        // Size 字段映射为 Class 片段（tiny/small/medium/large），
-        // base.css 的 input.* 档位规则负责重设高度/字号。
-        string origClass = Class;
-        this.ApplySizeClass();
-        // 校验状态与圆角同理：`.success/.warning/.error` 描边
-        // （base.css 已有），`.round` 整高半圆角。设计器可经
-        // PropSpec 直写字段，脏值先过白名单，不会长出没人认的 class。
-        string stCls = Control.StatusSanitize(FieldStatus);
-        if (stCls != "") { this.AddClass(stCls); }
-        if (Round) { this.AddClass("round"); }
+        string cls = this.EffectiveClass();
 
-        if (focused) {
-            // Autoselect: 首次获焦时全选。
-            if (Autoselect && !autoselected) {
-                SelectAll();
-                autoselected = true;
-            }
-        }
-        if (!focused) {
-            autoselected = false;
-            passiveActive = false;
-        }
-
-        SyncBinding();
-        string txt = editSig.Get();
-        ClampCursor();
+        string txt = editText;
 
         // 整个外框（填充、边框、圆角、阴影、hover/focus 淡变）
         // 来自样式层，因此皮肤的 `input:hover / input:focus`
         // 规则即可重设字段样式，无需改动此代码。
         StyleBox s = this.ResolveEasedStyleAsIn(
-            app, id, "input", Class, off, false, x, y, w, h);
+            app, id, "input", cls, off, false, x, y, w, h);
         s.Paint(app, x, y, w, h);
         int fs = s.FontOr(Style.FontFallback(app, "medium"));
         int accent = s.accent;
@@ -608,108 +782,55 @@ public class Input : Control {
         StyleBox errorStyle = null;
         if (errMsg != "") {
             errorStyle = this.ResolvePartAs(app, "input", "error", "",
-                                            Class, Style.SNormal());
+                                            cls, Style.SNormal());
             c.DrawRect(x, y, w, h, errorStyle.BorderOr(errorStyle.fg),
                        errorStyle.BorderWOr(2));
         }
 
+        InputGeometry geometry = this.InputGeometryForStyle(app, s, x, y, w, h);
         int padL = s.PadLOr(app.Scale(6));
-        int padR = s.PadROr(app.Scale(6));
         int slotGap = app.Scale(4);
-        // 尾端槽从右往左排：清除钮 / 密码眼 / 加载圈 共用一个图标位
-        // （优先级 loading > clear > eye > iconTrail），其后是后缀
-        // 文字、字数统计。前缀槽与前置图标在最左。
-        int glyphSz = fs;
+        int glyphSz = geometry.glyph;
+        int innerX = geometry.innerX;
+        int innerW = geometry.innerWidth;
+        int textY = geometry.textY;
+        int iconX = geometry.iconX;
+        int iconW = geometry.hasTrail ? glyphSz : 0;
+        int sfxX = geometry.suffixX;
+        int countX = geometry.countX;
+        int scrollX = geometry.scrollX;
+        int caretW = geometry.caretWidth;
+        string disp = geometry.display;
         string preIcon = iconLead;
         if (preIcon == "" && PrefixIcon != "") { preIcon = PrefixIcon; }
-        string pfx = "";
-        if (Prefix != null) { pfx = Prefix; }
-        string sfx = "";
-        if (Suffix != null) { sfx = Suffix; }
-        bool showClear = Clearable && txt != "" && !off && !Loading
-            && (focused || app.focus.IsHovered(id));
-        bool passEye = password && !showClear && !Loading;
+        string pfx = Prefix != null ? Prefix : "";
+        string sfx = Suffix != null ? Suffix : "";
+        string countTxt = ShowCount ? Input.CountText(this.CountOf(txt), MaxLen) : "";
+        bool showClear = geometry.showClear;
         string trailIcon = iconTrail;
-        if (passEye) {
-            trailIcon = PasswordIcon;
-            if (trailIcon == "") { trailIcon = "eye"; }
+        if (password && !showClear && !Loading) {
+            trailIcon = PasswordIcon != "" ? PasswordIcon : "eye";
         }
-        if (showClear) {
-            trailIcon = ClearIcon;
-            if (trailIcon == "") { trailIcon = "x"; }
-        }
-        // loading 时不画静态图标，转圈单独绘制（占同一槽位）。
-        bool trailArea = Loading || trailIcon != "";
-        int iconW = trailArea ? glyphSz : 0;
-        int sfxW = 0;
-        if (sfx != "") { sfxW = Canvas.MeasureText(sfx, fs); }
-        string countTxt = "";
-        int countW = 0;
-        if (ShowCount) {
-            int n = this.CountOf(txt);
-            countTxt = Input.CountText(n, MaxLen);
-            int cfs = Style.FontFallback(app, "small");
-            countW = Canvas.MeasureText(countTxt, cfs);
-        }
-        int preIconW = preIcon != "" ? glyphSz : 0;
-        int pfxW = pfx != "" ? Canvas.MeasureText(pfx, fs) : 0;
-        int leadSlot = 0;
-        if (preIconW > 0) { leadSlot = leadSlot + preIconW + slotGap; }
-        if (pfxW > 0) { leadSlot = leadSlot + pfxW + slotGap; }
-
-        int rightAnchor = x + w - padR;
-        int iconX = 0;
-        if (trailArea) {
-            iconX = rightAnchor - glyphSz;
-            rightAnchor = iconX - slotGap;
-        }
-        int sfxX = 0;
-        if (sfxW > 0) {
-            sfxX = rightAnchor - sfxW;
-            rightAnchor = sfxX - slotGap;
-        }
-        int countX = 0;
-        if (countW > 0) {
-            countX = rightAnchor - countW;
-            rightAnchor = countX - slotGap;
-        }
-        int trailSlot = (x + w - padR) - rightAnchor;
-        if (trailSlot < 0) { trailSlot = 0; }
-
-        int innerX = x + padL + leadSlot;
-        int innerW = w - padL - padR - leadSlot - trailSlot;
-        if (innerW < 0) { innerW = 0; }
-        int textY = Canvas.CenterTextY(y, h, fs);
-        // 掩码显示：字节长度不变，cursorPos 仍可正确索引。
-        string disp = txt;
-        if (password && !reveal) { disp = Input.Mask(txt); }
-        bool onTrail = trailArea && !off && app.mouseX >= iconX
-            && app.mouseX < iconX + glyphSz + padR && app.mouseY >= y && app.mouseY < y + h;
+        if (showClear) { trailIcon = ClearIcon != "" ? ClearIcon : "x"; }
+        bool onTrail = !off && geometry.OnTrail(app.mouseX, app.mouseY);
 
         StyleBox placeholderStyle = this.ResolveEasedPartAsIn(
-            app, id, "input", "placeholder", "", Class, false, false,
+            app, id, "input", "placeholder", "", cls, false, false,
             x, y, w, h);
         StyleBox selectionStyle = this.ResolveEasedPartAsIn(
-            app, id, "input", "selection", "", Class, false, false,
+            app, id, "input", "selection", "", cls, false, false,
             x, y, w, h);
         StyleBox caretStyle = this.ResolveEasedPartAsIn(
-            app, id, "input", "caret", "", Class, false, false,
+            app, id, "input", "caret", "", cls, false, false,
             x, y, w, h);
         int placeholderFont = placeholderStyle.FontOr(fs);
         int caretColor = caretStyle.BgOr(caretStyle.FgOr(caretStyle.AccentOr(accent)));
 
-        int caretW = 0;
-        if (disp != "") {
-            caretW = Canvas.MeasureText(Text.Left(disp, cursorPos), fs);
-        }
-        int scrollX = 0;
-        if (caretW > innerW) { scrollX = caretW - innerW; }
-
         c.PushClip(innerX, y, innerW, h);
         if (focused && HasSel()) {
             // 文本后的选区高亮。
-            int selPx0 = Canvas.MeasureText(Text.Left(disp, SelStart()), fs);
-            int selPx1 = Canvas.MeasureText(Text.Left(disp, SelEnd()), fs);
+            int selPx0 = Canvas.MeasureText(Gui.Text.Left(disp, SelStart()), fs);
+            int selPx1 = Canvas.MeasureText(Gui.Text.Left(disp, SelEnd()), fs);
             int selH = Canvas.FontHeight(fs);
             c.FillRect(innerX - scrollX + selPx0, textY, selPx1 - selPx0, selH,
                        selectionStyle.BgOr(accent));
@@ -730,8 +851,6 @@ public class Input : Control {
             int cursorH = Canvas.FontHeight(fs);
             int cursorWidth = caretStyle.WidthOr(1);
             c.FillRect(cursorX, textY, cursorWidth, cursorH, caretColor);
-            // 让 IME 组合窗口保持在光标处。
-            app.SetImeCaret(cursorX, textY + cursorH);
             // 组词预览：拼音等组合中、尚未上屏的串以 placeholder 色画在
             // 光标右侧；上屏后 native 清空预览，真文本接在原文本后面。
             if (composing != "") {
@@ -746,25 +865,25 @@ public class Input : Control {
         int slotX = x + padL;
         if (preIcon != "") {
             StyleBox iconStyle = this.ResolvePartAs(
-                app, "input", "icon", "", Class, Style.SNormal());
+                app, "input", "icon", "", cls, Style.SNormal());
             c.DrawGlyphIn(preIcon, slotX, y, glyphSz, h, glyphSz,
                 iconStyle.FgOr(s.fg));
             slotX = slotX + glyphSz + slotGap;
         }
         if (pfx != "") {
             StyleBox pfxStyle = this.ResolvePartAs(
-                app, "input", "prefix", "", Class, Style.SNormal());
+                app, "input", "prefix", "", cls, Style.SNormal());
             c.DrawText(slotX, textY, pfx, pfxStyle.FgOr(s.fg), fs);
         }
         if (sfx != "") {
             StyleBox sfxStyle = this.ResolvePartAs(
-                app, "input", "suffix", "", Class, Style.SNormal());
+                app, "input", "suffix", "", cls, Style.SNormal());
             c.DrawText(sfxX, textY, sfx, sfxStyle.FgOr(s.fg), fs);
         }
         // 字数统计：右对齐在文本与后缀之间（`input::count`，小一号）。
         if (countTxt != "") {
             StyleBox countStyle = this.ResolvePartAs(
-                app, "input", "count", "", Class, Style.SNormal());
+                app, "input", "count", "", cls, Style.SNormal());
             int cfs = countStyle.FontOr(Style.FontFallback(app, "small"));
             c.DrawText(countX, Canvas.CenterTextY(y, h, cfs), countTxt,
                        countStyle.FgOr(s.fg), cfs);
@@ -793,7 +912,7 @@ public class Input : Control {
             // 图标颜色来自 `input::icon`：悬停用 :hover，密码明文
             // （眼睛常亮）用 :selected。
             StyleBox iconStyle = this.ResolvePartAs(
-                app, "input", "icon", "", Class, Style.SNormal());
+                app, "input", "icon", "", cls, Style.SNormal());
             int iconState = Style.SNormal();
             if (onTrail) { iconState = Style.SHover(); }
             if (password && reveal && !showClear) {
@@ -801,7 +920,7 @@ public class Input : Control {
             }
             if (iconState != Style.SNormal()) {
                 iconStyle = this.ResolvePartAs(
-                    app, "input", "icon", "", Class, iconState);
+                    app, "input", "icon", "", cls, iconState);
             }
             c.DrawGlyphIn(trailIcon, iconX, y, glyphSz, h, glyphSz,
                           iconStyle.FgOr(s.fg));
@@ -814,58 +933,6 @@ public class Input : Control {
                        errorStyle.FontOr(Style.FontFallback(app, "small")));
         }
 
-        string a11y = this.EffectiveA11yRole("textbox") + ":" + this.EffectiveA11yLabel(hint != "" ? hint : name);
-        app.hitTester.RegisterRectL(id, x, y, w, h, 1, a11y);
-
-        // 密码明文 / 清空按钮点击：都在尾端图标上释放左键。
-        if (onTrail && app.EventKind() == 3
-                && app.window.EventButton() == 0 && app.ClickAvailable()) {
-            if (showClear) {
-                this.Clear();
-            } else if (password) {
-                reveal = !reveal;
-                app.RequestRedraw();
-            }
-            app.ClaimClick();
-        }
-
-        // 鼠标选择：按下锚定选区并放置光标；
-        // 按住拖动移动光标端；松开保留选区
-        // （收起为空的选区清除锚点）。
-        if (Ui.PressedDown(app, id) && !onTrail && !off) {
-            int rel = app.mouseX - innerX + scrollX;
-            cursorPos = Gui.TextWrap.ColFromX(disp, rel, fs);
-            if (Modifiers.HasShift(app.window.EventMods()) && selAnchor >= 0) {
-                // Shift+点击从现有锚点扩展选区。
-            } else {
-                selAnchor = cursorPos;
-            }
-            app.RequestRedraw();
-        } else if (focused && app.focus.IsPressed(id)
-                   && app.EventKind() == 1) {
-            int rel = app.mouseX - innerX + scrollX;
-            int drag = Gui.TextWrap.ColFromX(disp, rel, fs);
-            if (drag != cursorPos) {
-                cursorPos = drag;
-                app.RequestRedraw();
-            }
-        }
-        // 单消费者点击：当本输入框是框架解析出的
-        // 点击目标时，放置光标。
-        if (app.ClickTarget() == id && !app.ClickClaimed() && !onTrail && !off) {
-            int rel = app.mouseX - innerX + scrollX;
-            cursorPos = Gui.TextWrap.ColFromX(disp, rel, fs);
-            if (selAnchor == cursorPos) { selAnchor = -1; }
-            app.RequestRedraw();
-        }
-        if (!focused && selAnchor >= 0) { selAnchor = -1; }
-
-        // 恢复 Class，避免设计器/序列化器读到污染的字段。
-        Class = origClass;
-
-        // 键盘族由 OnKeyDown/OnKeyUp/OnTextInput 路由处理。
-        // 的命名出口；其余通用事件照常按帧快照轮询。
-        On.FireNonKey(app, id, this);
         return id;
     }
 
@@ -877,60 +944,59 @@ public class Input : Control {
     public override Binding<string> SizeOf() { return Size; }
 
     // 覆写：返回设计器属性清单（占位 / 文本 / 尺寸 / 前后缀 / 状态 / 长度等）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec ph = PropSpec.Text("hint", "Placeholder");
-        ph.str = hint;
+        ph.Field("hint", 0);
         ph.Also("placeholder");
         ps.Add(ph);
-        PropSpec txt = PropSpec.Text("value", "Value");
-        txt.sstr = editSig;
-        if (data != null) { txt.str = data; }
+        PropSpec txt = PropSpec.Text("value", "Value").DefaultBinding();
+        txt.Field("Text", 0);
         txt.Also("text");
         txt.Also("data");
         ps.Add(txt);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.str = Size;
+        sz.Field("Size", 0);
         ps.Add(sz);
         PropSpec clr = PropSpec.Bool("clearable", "Clearable");
-        clr.flag = Clearable;
+        clr.Field("Clearable", 2);
         ps.Add(clr);
         PropSpec asel = PropSpec.Bool("autoselect", "Autoselect");
-        asel.flag = Autoselect;
+        asel.Field("Autoselect", 2);
         ps.Add(asel);
         PropSpec pfx = PropSpec.Text("prefix", "Prefix");
-        pfx.str = Prefix;
+        pfx.Field("Prefix", 0);
         ps.Add(pfx);
         PropSpec sfx = PropSpec.Text("suffix", "Suffix");
-        sfx.str = Suffix;
+        sfx.Field("Suffix", 0);
         ps.Add(sfx);
         PropSpec st = PropSpec.Enum("status", "Status",
             new List<string>{ "", "success", "warning", "error" });
-        st.str = FieldStatus;
+        st.Field("FieldStatus", 0);
         ps.Add(st);
         PropSpec ml = PropSpec.Int("maxlen", "MaxLen");
-        ml.num = MaxLen;
+        ml.Field("MaxLen", 1);
         ml.Step(1, 0, 4096);
         ps.Add(ml);
         PropSpec sc = PropSpec.Bool("showCount", "ShowCount");
-        sc.flag = ShowCount;
+        sc.Field("ShowCount", 2);
         ps.Add(sc);
         PropSpec rd = PropSpec.Bool("round", "Round");
-        rd.flag = Round;
+        rd.Field("Round", 2);
         ps.Add(rd);
         PropSpec ld = PropSpec.Bool("loading", "Loading");
-        ld.flag = Loading;
+        ld.Field("Loading", 2);
         ps.Add(ld);
         PropSpec pa = PropSpec.Bool("passive", "PassiveActivated");
-        pa.flag = PassiveActivated;
+        pa.Field("PassiveActivated", 2);
         ps.Add(pa);
         return ps;
     }
 
     // 文本经 SetText 写入，保证光标与选区不越界。
     public override string GetExtra(string key) {
-        if (key == "text" || key == "value" || key == "data") { return editSig.Get(); }
+        if (key == "text" || key == "value" || key == "data") { return this.GetText(); }
         if (key == "password") { return password ? "true" : "false"; }
         if (key == "iconLead" || key == "icon") { return iconLead; }
         if (key == "iconTrail") { return iconTrail; }
@@ -946,7 +1012,7 @@ public class Input : Control {
         if (key == "text" || key == "value" || key == "data") {
             // 同一个值再写一遍不算编辑：SetText 会把光标收到末尾，而属性
             // 写入可能每帧都来（数据绑定、文案刷新），那样方向键就白按了。
-            if (val != editSig.Get()) { this.SetText(val); }
+            if (val != this.GetText()) { this.SetText(val); }
             return true;
         }
         if (key == "password") { password = (val == "true"); return true; }
@@ -976,7 +1042,7 @@ public class Input : Control {
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "Submit") { Submit.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -984,7 +1050,7 @@ public class Input : Control {
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "Submit") { Submit.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
 
@@ -992,32 +1058,18 @@ public class Input : Control {
 
     // 覆写：按尺寸档解析样式，高取样式行高，宽缺省 220。
     public override void OnMeasure(App app) {
+        if (liveApp != app) { lastKeyNamedSeq = 0; }
+        liveApp = app;
+        this.SyncBinding();
+        this.ClampCursor();
         Theme t = app.theme;
-        // 尺寸档（Size → .tiny/.small/.medium/.large）在渲染前也要生效：
-        // 临时把档位 class 并入 Class 再解析，量出的高度
-        // 与每帧渲染一致。
-        string origClass = Class;
-        this.ApplySizeClass();
-        StyleBox s = this.ResolveStyleAs(app, "input", Class, Style.SNormal());
+        StyleBox s = this.Box(app);
         prefH = s.HeightOr(t.heightMedium);
         prefW = s.WidthOr(app.Scale(220));
-        Class = origClass;
     }
 
-    // 覆写：保留模式绘制——基于自身盒模型 (bx, by, bw, bh) 完成绘制与编辑交互。
+    // Retained paint consumes the arranged bounds without dispatching input.
     public override void OnPaint(App app) {
         this.PaintInput(app, bx, by, bw, bh);
-    }
-
-    public int Render(App app, int x, int y, int w) {
-        return this.Render(app, x, y, w, app != null ? app.Scale(28) : 28);
-    }
-
-    public int Render(App app, int x, int y, int w, int h) {
-        this.bx = x;
-        this.by = y;
-        this.bw = w;
-        this.bh = h;
-        return this.PaintInput(app, x, y, w, h);
     }
 }

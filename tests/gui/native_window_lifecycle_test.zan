@@ -1,0 +1,313 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+class NativeWindowLifecycleTest {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "IsWindow")]
+    static extern int IsWindow(nint hwnd);
+    [DllImport("user32", EntryPoint = "GetWindow")]
+    static extern nint GetWindow(nint hwnd, int command);
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int message, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "PostQuitMessage")]
+    static extern void PostQuitMessage(int exitCode);
+    [DllImport("user32", EntryPoint = "SetTimer")]
+    static extern nint SetTimer(nint hwnd, nint timerId, int interval, nint callback);
+    [DllImport("user32", EntryPoint = "KillTimer")]
+    static extern int KillTimer(nint hwnd, nint timerId);
+    [DllImport("user32", EntryPoint = "SetWindowLongPtrW")]
+    static extern nint SetWindowLongPtrW(nint hwnd, int index, nint value);
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    static extern int GetCurrentThreadId();
+    [DllImport("user32", EntryPoint = "PostThreadMessageW")]
+    static extern int PostThreadMessageW(int threadId, int message, nint wp, nint lp);
+    static App waitingOwner;
+    static App waitingPeer;
+    static bool waitCallbackRan;
+    static bool nestedQueueDrained;
+
+    static void CloseDuringWait(nint hwnd, int message, nint timerId, int tick) {
+        NativeWindowLifecycleTest.KillTimer(0, timerId);
+        waitingOwner.window.Destroy();
+        for (int turn = 0; turn < 256; turn++) {
+            if (Platform.Shell().PollEvent() == 1) {
+                nestedQueueDrained = true;
+                break;
+            }
+        }
+        if (waitingPeer != null) {
+            NativeWindowLifecycleTest.SendMessageW(waitingPeer.window.GetHandle(),
+            0x0102, (nint)81, 0);
+        } else {
+            NativeWindowLifecycleTest.PostThreadMessageW(
+            NativeWindowLifecycleTest.GetCurrentThreadId(), 0, 0, 0);
+        }
+        waitCallbackRan = true;
+    }
+
+    static void CheckCloseDuringWait() {
+        for (int pass = 0; pass < 2; pass++) {
+            App old = new App("Lifecycle nested wait owner", 240, 160);
+            App peer = null;
+            nint timerId = 0;
+            try {
+                CheckNative(old, "nested wait main");
+                old.Show();
+                PumpLive(old, "nested wait main", false);
+                if (pass == 1) {
+                    peer = new App("Lifecycle nested wait peer", 160, 100);
+                    // Keep a real independent live peer while its former owner
+                    // is destroyed inside the native timer callback.
+                    NativeWindowLifecycleTest.SetWindowLongPtrW(peer.window.GetHandle(), -8, 0);
+                    Check(NativeWindowLifecycleTest.GetWindow(peer.window.GetHandle(), 4) == 0,
+                    "native wait peer has independent lifetime");
+                    peer.Show();
+                    PumpLive(old, "nested wait with peer", false);
+                }
+                waitingOwner = old;
+                waitingPeer = peer;
+                waitCallbackRan = false;
+                nestedQueueDrained = false;
+                timerId = NativeWindowLifecycleTest.SetTimer(0, 0, 1,
+                (nint)NativeWindowLifecycleTest.CloseDuringWait);
+                Check(timerId != 0, "native close timer registered");
+                for (int turn = 0; turn < 256; turn++) {
+                    int result = old.window.WaitEvent();
+                    if (!waitCallbackRan) { continue; }
+                    Check(nestedQueueDrained, "nested pump consumed prior close and wake");
+                    if (pass == 0) {
+                        Check(result < 0, "same wait returns terminal after thread WM_NULL");
+                    } else {
+                        Check(result == 0 && Window.EventHwnd() == peer.window.GetHandle()
+                        && peer.window.EventKind() == 6 && peer.window.EventKeyCode() == 81,
+                        "selected peer event survives owner termination");
+                        Check(old.window.PollEvent() < 0,
+                        "owner terminal survives delivering the selected peer event");
+                    }
+                    break;
+                }
+                Check(waitCallbackRan, "native close timer ran within bounded waits");
+                PumpClosed(old, "owner closed during wait");
+            } finally {
+                if (timerId != 0) { NativeWindowLifecycleTest.KillTimer(0, timerId); }
+                waitingOwner = null;
+                waitingPeer = null;
+                try { Dispose(peer, false); }
+                finally { Dispose(old, waitCallbackRan); }
+            }
+        }
+        Console.WriteLine("NATIVE_LIFECYCLE_NESTED_WAIT_OK");
+    }
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("native window lifecycle: " + message); }
+    }
+
+    static void CheckNative(App app, string name) {
+        nint hwnd = app.window.GetHandle();
+        Check(hwnd != 0, name + " has a nonzero native handle");
+        Check(NativeWindowLifecycleTest.IsWindow(hwnd) != 0,
+        name + " is a live native window");
+        Check(NativeWindowLifecycleTest.GetWindow(hwnd, 4) == 0,
+        name + " begins a new unowned main-window lifetime");
+    }
+
+    static void PumpLive(App app, string name, bool rejectRetiredText) {
+        for (int turn = 0; turn < 256; turn++) {
+            int result = app.PollOneEvent();
+            Check(result >= 0 && app.isRunning, name + " survives real native pumping");
+            if (result == 0) { return; }
+            if (rejectRetiredText && Window.EventHwnd() == app.window.GetHandle()) {
+                Check(app.window.EventKind() != 6 || app.window.EventKeyCode() != 90,
+                name + " does not receive retired-window WM_CHAR");
+            }
+        }
+        Check(false, name + " native queue drains within 256 turns");
+    }
+
+    static void PumpClosed(App app, string name) {
+        for (int turn = 0; turn < 256; turn++) {
+            if (!app.isRunning) { return; }
+            int result = app.PollOneEvent();
+            if (result < 0) {
+                Check(!app.isRunning, name + " actually stops its App loop");
+                return;
+            }
+        }
+        Check(false, name + " retains a deliverable close for its old App");
+    }
+
+    static void Present(App app, string name) {
+        Check(app.SafeFrame(() => {
+            app.canvas.FillRect(0, 0, 32, 32, 0xff18232d);
+        }), name + " presents a real native frame");
+        Check(app.isRunning, name + " remains running after present");
+    }
+
+    static void Dispose(App app, bool nativeAlreadyDestroyed) {
+        if (app == null) { return; }
+        try {
+            app.StopLoop();
+        } finally {
+            try {
+                // Never destroy an old numerical HWND again: Windows may have
+                // reused it for a later lifetime by the time cleanup executes.
+                if (!nativeAlreadyDestroyed) { app.window.Destroy(); }
+            } finally {
+                app.canvas.Destroy();
+            }
+        }
+    }
+
+    static void CheckChildClose() {
+        App main = new App("Lifecycle owner", 240, 160);
+        Window child = null;
+        bool childDestroyed = false;
+        try {
+            CheckNative(main, "first main");
+            main.Show();
+            PumpLive(main, "first main", false);
+            child = new Window("Lifecycle owned child", 160, 100);
+            Check(child.GetHandle() != 0
+            && NativeWindowLifecycleTest.IsWindow(child.GetHandle()) != 0,
+            "owned child is native");
+            Check(NativeWindowLifecycleTest.GetWindow(child.GetHandle(), 4)
+            == main.window.GetHandle(), "secondary window owner is the live main");
+            child.Destroy();
+            childDestroyed = true;
+            Check(NativeWindowLifecycleTest.IsWindow(child.GetHandle()) == 0,
+            "owned child is destroyed");
+            PumpLive(main, "main after child close", false);
+            Present(main, "main after child close");
+            Console.WriteLine("NATIVE_LIFECYCLE_CHILD_OK");
+        } finally {
+            try {
+                if (child != null && !childDestroyed) { child.Destroy(); }
+            } finally { Dispose(main, false); }
+        }
+    }
+
+    static void CheckRestartWithOldAppPending() {
+        // Real allocation only; a reused HWND is neither forced nor required.
+        // The fixed bound prevents turning this regression into a reuse fuzzer.
+        for (int cycle = 0; cycle < 3; cycle++) {
+            App old = new App("Lifecycle retiring main", 240, 160);
+            App next = null;
+            bool oldDestroyed = false;
+            try {
+                CheckNative(old, "retiring main");
+                old.Show();
+                PumpLive(old, "retiring main", false);
+                Present(old, "retiring main");
+                // Synchronous native delivery queues a real backend posted
+                // event before destruction, without injecting a fake HWND.
+                NativeWindowLifecycleTest.SendMessageW(old.window.GetHandle(),
+                0x0102, (nint)90, 0);
+                old.window.Destroy();
+                oldDestroyed = true;
+                Check(NativeWindowLifecycleTest.IsWindow(old.window.GetHandle()) == 0,
+                "retiring main really reached native destruction");
+                Check(old.isRunning, "old App has not consumed its close yet");
+
+                // No sentinel owner, manual quit drain, backend reset or direct
+                // static-state mutation is allowed between these two windows.
+                next = new App("Lifecycle restarted main", 240, 160);
+                CheckNative(next, "restarted main");
+                next.Show();
+                PumpLive(next, "restarted main before old loop drains", true);
+                Present(next, "restarted main");
+                Check(old.window.WaitEvent() < 0, "old blocking wait retains terminal state");
+                Check(old.window.WaitEventTimeout(0) < 0, "old timed wait retains terminal state");
+                old.window.Destroy();
+                CheckNative(next, "new main survives repeated old Destroy");
+                PumpClosed(old, "retired App after new main is running");
+                CheckNative(next, "new main after old App drains");
+                PumpLive(next, "new main after old App drains", true);
+                Present(next, "new main after old App drains");
+            } finally {
+                try { Dispose(next, false); }
+                finally { Dispose(old, oldDestroyed); }
+            }
+        }
+        Console.WriteLine("NATIVE_LIFECYCLE_RESTART_OK");
+    }
+
+    static void CheckRequestClose() {
+        App old = new App("Lifecycle WM_CLOSE main", 240, 160);
+        App next = null;
+        bool oldDestroyed = false;
+        try {
+            CheckNative(old, "WM_CLOSE main");
+            old.Show();
+            PumpLive(old, "WM_CLOSE main", false);
+            old.RequestClose();
+            PumpClosed(old, "WM_CLOSE main");
+            Check(NativeWindowLifecycleTest.IsWindow(old.window.GetHandle()) == 0,
+            "RequestClose reaches native destruction");
+            oldDestroyed = true;
+            next = new App("Lifecycle after WM_CLOSE", 240, 160);
+            CheckNative(next, "main after WM_CLOSE");
+            next.Show();
+            PumpLive(next, "main after WM_CLOSE", false);
+            Present(next, "main after WM_CLOSE");
+            Console.WriteLine("NATIVE_LIFECYCLE_REQUEST_CLOSE_OK");
+        } finally {
+            try { Dispose(next, false); }
+            finally { Dispose(old, oldDestroyed); }
+        }
+    }
+
+    static void CheckExternalQuit() {
+        for (int pass = 0; pass < 2; pass++) {
+            App old = new App("Lifecycle before external quit", 240, 160);
+            App next = null;
+            bool oldDestroyed = false;
+            try {
+                CheckNative(old, "main before external quit");
+                old.Show();
+                PumpLive(old, "main before external quit", false);
+                old.window.Destroy();
+                oldDestroyed = true;
+                // An external quit is queued before the replacement is created.
+                // Exit code zero is also external: code alone is not provenance.
+                int exitCode = 0;
+                if (pass == 1) { exitCode = 73; }
+                NativeWindowLifecycleTest.PostQuitMessage(exitCode);
+                next = new App("Lifecycle external quit receiver", 240, 160);
+                CheckNative(next, "external-quit replacement");
+                next.Show();
+                PumpClosed(next, "external WM_QUIT across recreation");
+                Check(NativeWindowLifecycleTest.IsWindow(next.window.GetHandle()) != 0,
+                "external thread quit still stops a live-window App");
+                PumpClosed(old, "old App retains its own terminal state");
+            } finally {
+                try { Dispose(next, false); }
+                finally { Dispose(old, oldDestroyed); }
+            }
+        }
+        Console.WriteLine("NATIVE_LIFECYCLE_EXTERNAL_QUIT_OK");
+    }
+    #endif
+
+    static int Main() {
+        #if WINDOWS
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        Environment.SetEnvironmentVariable("ZAN_FRAME_PROF", "");
+        string selected = Interop.EnvVar("ZAN_NATIVE_LIFECYCLE_CASE");
+        if (selected == null || selected == "") { selected = "all"; }
+        Check(selected == "all" || selected == "child" || selected == "restart"
+        || selected == "request-close" || selected == "external-quit" || selected == "nested-wait",
+        "known scratch probe case");
+        if (selected == "all" || selected == "child") { CheckChildClose(); }
+        if (selected == "all" || selected == "restart") { CheckRestartWithOldAppPending(); }
+        if (selected == "all" || selected == "request-close") { CheckRequestClose(); }
+        if (selected == "all" || selected == "external-quit") { CheckExternalQuit(); }
+        if (selected == "all" || selected == "nested-wait") { CheckCloseDuringWait(); }
+        Console.WriteLine("NATIVE_WINDOW_LIFECYCLE_OK");
+        return 0;
+        #else
+        return 0;
+        #endif
+    }
+}

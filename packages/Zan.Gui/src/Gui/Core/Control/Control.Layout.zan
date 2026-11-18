@@ -6,6 +6,53 @@ namespace Gui;
 
 // Control.Layout.zan - 现代标准布局引擎：尺寸度量（Measure）与 Flex/Grid/Flow 排版（Arrange）
 public partial class Control {
+    // Allocated border-box width for this pass; -1 keeps intrinsic/hint sizing.
+    protected int measureWidth = 0 - 1;
+    // Intrinsic walks visit each descendant once; allocation belongs to the final pass.
+    private bool measureIntrinsic;
+    private bool measuringTree;
+    private weak App measuringApp;
+    private List<App> measuringAncestors;
+    private bool syncingBinding;
+
+    private bool PrepareBindings(App app) {
+        if (syncingBinding) { return false; }
+        Control ownerParent = parent;
+        Control root = app != null ? app.rootControl : null;
+        int generation = app != null ? app.inputRootGeneration : 0;
+        long sequence = app != null && app.window != null ? app.window.EventSeq() : 0;
+        syncingBinding = true;
+        try { this.SyncBinding(); }
+        finally { syncingBinding = false; }
+        return parent == ownerParent && this.FindApp() == app
+        && (app == null || (app.rootControl == root && app.inputRootGeneration == generation
+        && (app.window == null || app.window.EventSeq() == sequence)));
+    }
+
+    private void MeasureIntrinsicTree(App app) {
+        bool previous = measureIntrinsic;
+        measureIntrinsic = true;
+        try {
+            this.MeasureTree(app);
+        } finally {
+            measureIntrinsic = previous;
+        }
+    }
+
+    private void PrepareMeasureStyle(App app) {
+        Control previous = app.styleCtx;
+        app.styleCtx = this;
+        try {
+            if (this.app != app) { this.InheritApp(app); }
+            if (!this.PrepareBindings(app)) { return; }
+            if (!this.ComputedStyleCurrent(app) || computedStyleState != Style.SNormal()) {
+                this.ResolveStyle(app, Style.SNormal());
+            }
+        } finally {
+            app.styleCtx = previous;
+        }
+    }
+
     // 测量阶段入口（Arrange 之前每帧调用）：换算文档声明的逻辑
     // 尺寸（ApplyDeclaredUnits）→ 常态样式过期时重新解析 →
     // 不可见节点到此为止（不测量子树）→ 传播断行宽度提示 →
@@ -13,19 +60,60 @@ public partial class Control {
     // width/height 声明的正数尺寸优先于自测结果）→ 容器按内容
     // 补齐未定轴（MeasureFlow/MeasureFlexContent/MeasureGridContent）。
     void MeasureTree(App app) {
+        this.MeasureTree(app, -1, false);
+    }
+
+    private void MeasureTree(App app, int available, bool clamp) {
+        if (measuringTree && (measuringApp == app
+        || (measuringAncestors != null && measuringAncestors.Contains(app)))) { return; }
+        // A callback may transfer this tree to another App. Measure that scope,
+        // but reject a cycle back into any still-active measurement.
+        App previousApp = measuringApp;
+        bool previous = measuringTree;
+        if (previous) {
+            if (measuringAncestors == null) { measuringAncestors = new List<App>(); }
+            measuringAncestors.Add(previousApp);
+        }
         // 测量和绘制必须按同一个节点求组合器；只在绘制时推上下文
         // 会让后代选择器的尺寸在测量阶段丢失，并逐帧来回击穿样式缓存。
         Control prevCtx = app.styleCtx;
+        int previousWidth = measureWidth;
         app.styleCtx = this;
+        measuringTree = true;
+        measuringApp = app;
         try {
-            this.MeasureTreeInner(app);
+            this.MeasureTreeInner(app, available, clamp);
         } finally {
+            measureWidth = previousWidth;
+            measuringTree = previous;
+            measuringApp = previousApp;
+            if (previous) {
+                measuringAncestors.RemoveAt(measuringAncestors.Count - 1);
+                if (measuringAncestors.Count == 0) { measuringAncestors = null; }
+            }
             app.styleCtx = prevCtx;
         }
     }
 
-    void MeasureTreeInner(App app) {
+    // A host constraint belongs to this measurement pass. Restore the authored
+    // hint so resizing, moving a subtree and intrinsic measurement stay fresh.
+    public void MeasureTree(App app, int width) {
+        int previous = measureWidth;
+        measureWidth = width > 0 ? width : 0;
+        try {
+            this.MeasureTree(app);
+        } finally {
+            measureWidth = previous;
+        }
+    }
+
+    private void MeasureTreeInner(App app, int available, bool clamp) {
         if (app != null && this.app != app) { this.InheritApp(app); }
+        if (!this.PrepareBindings(app)) { return; }
+        Control ownerParent = parent;
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration;
+        long sequence = app.window != null ? app.window.EventSeq() : 0;
         // 上一帧按内容补齐的轴先归还，等子树测完再重新补齐——
         // 补齐规则只在轴为空时生效，不清零的话首帧的错值就永久化了。
         if (this.fillW) { prefW = 0; this.fillW = false; }
@@ -35,13 +123,53 @@ public partial class Control {
         // 每帧一次就是白花的几十万纳秒。状态样式（悬停/按下的
         // 过渡态）标记为 -1，因此永远不会被当成常态复用。
         if (!this.ComputedStyleCurrent(app)
-            || computedStyleState != Style.SNormal()) {
+        || computedStyleState != Style.SNormal()) {
             this.ResolveStyle(app, Style.SNormal());
         }
+        // Binding callbacks may change margins or declared width in this pass.
+        if (available >= 0) {
+            int room = available - this.StyleMarL() - this.StyleMarR();
+            if (room < 0) { room = 0; }
+            int width = this.StyleDeclaresWidth() ? this.StyleWidthIn(available) : room;
+            if (clamp && width > room) { width = room; }
+            measureWidth = width > 0 ? width : 0;
+        }
         if (!this.StyleVisible()) { return; }
-        this.PropagateWrapHint();
+        int display = this.StyleDisplay();
+        int childWidth = this.WrapContentWidth();
+        bool row = display == 1 && this.StyleFlexDir() != 1;
+        bool intrinsicKids = measureIntrinsic || display == 4 || (row && this.StyleWrap() == 0);
+        bool deferGridKids = false;
+        List<Control> children = this.SnapshotChildren();
+        if (display == 4 && !measureIntrinsic) {
+            // Placement needs current child styles, but definite columns need no intrinsic sizes.
+            for (int i = 0; i < children.Count; i = i + 1) {
+                Control child = children[i];
+                if (child.parent != this) { continue; }
+                child.PrepareMeasureStyle(app);
+                if (parent != ownerParent || this.FindApp() != app || app.rootControl != root
+                || app.inputRootGeneration != generation
+                || (app.window != null && app.window.EventSeq() != sequence)) { return; }
+            }
+            List<Control> items = this.GridItems();
+            deferGridKids = this.GridColumnsDefinite(this.PlanGrid(items), this.GridMeasureWidth());
+        }
         for (int i = 0; i < children.Count; i = i + 1) {
-            children[i].MeasureTree(app);
+            Control child = children[i];
+            if (child.parent != this) { continue; }
+            if (deferGridKids) {
+                if (child.StyleVisible() && child.StylePosition() != 2 && child.StyleDisplay() != 2) { continue; }
+                child.MeasureTree(app);
+            } else if (intrinsicKids) {
+                child.MeasureIntrinsicTree(app);
+            } else if (!row && childWidth > 0) {
+                child.MeasureInWidth(app, childWidth, display == 1);
+            } else {
+                child.MeasureTree(app);
+            }
+            if (parent != ownerParent || this.FindApp() != app || app.rootControl != root
+            || app.inputRootGeneration != generation
+            || (app.window != null && app.window.EventSeq() != sequence)) { return; }
         }
         // 作者要求的尺寸（Prefer()，或 UiDoc 中的 `width`/`height`）
         // 优先于控件自行测量的尺寸：OnMeasure
@@ -52,6 +180,9 @@ public partial class Control {
         int keepH = prefH;
         bool keepSet = prefSet;
         OnMeasure(app);
+        if (parent != ownerParent || this.FindApp() != app || app.rootControl != root
+        || app.inputRootGeneration != generation
+        || (app.window != null && app.window.EventSeq() != sequence)) { return; }
         if (keepSet) {
             if (keepW > 0) { prefW = keepW; }
             if (keepH > 0) { prefH = keepH; }
@@ -66,16 +197,28 @@ public partial class Control {
     // 还不知道各自能分到多少，就不传。
     // 少了这一步，只有最外层容器能拿到宿主给的宽度：嵌在一列里的
     // 换行 flex 行会按单行测量，第二行被裁掉。
+    private void MeasureInWidth(App app, int available, bool clamp) {
+        this.MeasureTree(app, available > 0 ? available : 0, clamp);
+    }
+
+    private int WrapContentWidth() {
+        int width = measureWidth;
+        if (width < 0) {
+            width = hintWrapW;
+            if (this.StyleDeclaresWidth()) { width = this.StyleWidthIn(width); }
+            else if (prefSet && prefW > 0) { width = prefW; }
+            else if (width <= 0) { width = prefW; }
+        }
+        return width - this.StyleInsetL() - this.StyleInsetR();
+    }
+
     void PropagateWrapHint() {
-        int inner = prefW;
-        if (inner <= 0) { inner = hintWrapW; }
-        if (inner <= 0) { return; }
-        inner = inner - this.StyleInsetL() - this.StyleInsetR();
+        int inner = this.WrapContentWidth();
         if (inner <= 0) { return; }
         bool flex = this.StyleDisplay() == 1;
         bool flexRow = flex && this.StyleFlexDir() != 1;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
+        for (int i = 0; i < childNodes.Count; i = i + 1) {
+            Control c = childNodes[i];
             if (c.hintWrapW > 0) { continue; }
             if (flex && flexRow) { continue; }
             c.hintWrapW = inner;
@@ -150,7 +293,7 @@ public partial class Control {
             // 百分比高在包含块定下后是确定值——声明了 % 高的空块
             // 不塌穿（CSS 8.3.1：有高度的块不参与塌穿）。
             if (sb.height > 0 || sb.heightPm > 0
-                || sb.minH > 0 || sb.minHPm > 0) { return false; }
+            || sb.minH > 0 || sb.minHPm > 0) { return false; }
             if (sb.BorderTopPx() > 0 || sb.BorderBottomPx() > 0) { return false; }
             if (c.StyleInsetT() > 0 || c.StyleInsetB() > 0) { return false; }
         }
@@ -171,7 +314,7 @@ public partial class Control {
     // （窗口根相对）；topY = piece 顶（基线 − asc），drawOff =
     // 半行距下移，DrawText y = topY + drawOff。
     public virtual void InlineRunPlace(int x, int topY, int w, int h, int drawOff,
-                                int fs, string text) { }
+    int fs, string text) { }
 
     // 真块流测量（P1）：margin 塌陷后取各块高度之和——兄弟相邻
     // margin 合并、容器不塌陷（FlowSepT/B）时首/尾 margin 计入
@@ -180,22 +323,27 @@ public partial class Control {
     // 的 BFC 容器"把链关在内容框里占高。
     void MeasureFlow(App app) {
         if (prefW > 0 && prefH > 0) { return; }
+        this.MeasureFlowEntries(app, this.FlowEntries());
+    }
+
+    private void MeasureFlowEntries(App app, List<FlowEntry> es) {
+        if (es.Count == 0 || (prefW > 0 && prefH > 0)) { return; }
         int sumH = 0;
         int maxW = 0;
         int rows = 0;
         bool sepT = this.FlowSepT();
         bool sepB = this.FlowSepB();
         int pending = 0 - 1;  // 待结算的塌陷链（-1 = 还没有占高块）
-        int wrapW = hintWrapW - this.StyleInsetL() - this.StyleInsetR();
-        List<FlowEntry> es = this.FlowEntries();
-        List<FlowEntry> seg = new List<FlowEntry>();
+        int wrapW = this.WrapContentWidth();
+        List<FlowEntry> seg = null;
         // P3：float 入侵表（内容框坐标）+ 行内段的流起点——段在
         // float 之后的行要绕排，段高才与排布端一致。父块下传的
         // hostFloats 复制进来（本容器的 float 也会追加到这张表，
         // 共享实例会把表污染回父级和下一帧）。
-        List<FloatIntrusion> floats = new List<FloatIntrusion>();
+        List<FloatIntrusion> floats = null;
         int ownFloats = 0;
-        if (this.hostFloats != null) {
+        if (this.hostFloats != null && this.hostFloats.Count > 0) {
+            floats = new List<FloatIntrusion>();
             for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
                 floats.Add(this.hostFloats[fi]);
             }
@@ -206,7 +354,8 @@ public partial class Control {
             FlowEntry e = i < es.Count ? es[i] : null;
             Control c = e != null ? e.kid : null;
             if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
-                if (seg.Count == 0) {
+                if (seg == null) {
+                    seg = new List<FlowEntry>();
                     segY = sumH + (pending > 0 ? pending : 0);
                 }
                 seg.Add(e);
@@ -214,10 +363,10 @@ public partial class Control {
             }
             // 块级边界：结算行内段（段是无 margin 的匿名块，塌陷
             // 上下义务为 0）。
-            if (seg.Count > 0) {
+            if (seg != null && seg.Count > 0) {
                 FlowSegment fs2 = this.FlowLayoutSegment(
-                    seg, wrapW > 0 ? wrapW : 0, 0, floats, segY);
-                seg = new List<FlowEntry>();
+                seg, wrapW > 0 ? wrapW : 0, 0, floats, segY);
+                seg = null;
                 if (fs2.lines.Count > 0) {
                     if (pending >= 0) {
                         sumH = sumH + CollapseMargins(pending, 0);
@@ -236,6 +385,7 @@ public partial class Control {
             if (c == null) { break; }
             // P3：float 子项——脱离流，占入侵表；宽度计 shrink-to-fit。
             if (c.StyleFloat() != 0) {
+                if (floats == null) { floats = new List<FloatIntrusion>(); }
                 // CSS 9.5.1 规则 2：后声明 float 的顶边不得高于先声明
                 // float 的顶边（f3 坠到 61 后，f4 不能再回 y=1 的空档，
                 // 只能在 61 起找位、撞 f3 再坠 100）。
@@ -246,11 +396,11 @@ public partial class Control {
                 // 这是容器的内在宽累积（maxW）：float 的 % 宽按 auto
                 // 回落测量偏好（css-sizing），不算进内在贡献。
                 int fw = c.StyleDeclaresWidthAbs()
-                    ? c.StyleWidthIn(wrapW) : c.prefW;
+                ? c.StyleWidthIn(wrapW) : c.prefW;
                 int fwm = (fw > 0 ? fw : 0) + c.StyleMarL() + c.StyleMarR();
                 if (fwm > maxW) { maxW = fwm; }
                 this.PlaceFloatKid(floats, c, wrapW > 0 ? wrapW : 0, fy,
-                                   0, 0, false);
+                0, 0, false);
                 continue;
             }
             bool empty = this.IsEmptyFlowBlock(c);
@@ -264,7 +414,7 @@ public partial class Control {
             int clear = 0;
             if (clr != 0) {
                 int clearY = LineBox.ClearY(
-                    floats, clr, sumH + (pending > 0 ? pending : 0));
+                floats, clr, sumH + (pending > 0 ? pending : 0));
                 int need = clearY - sumH;
                 if (need > 0) { clear = need; }
             }
@@ -295,10 +445,10 @@ public partial class Control {
             // 换算到子块内容框坐标后，auto 高子块带表重测（被 float
             // 顶高的部分计入堆叠）；声明高的盒子高不变，只传表供其
             // 行盒绕排。无 float 时清掉上一帧残留。
-            if (floats.Count > 0) {
+            if (floats != null && floats.Count > 0) {
                 this.SetHostFloats(c, floats,
-                                   c.StyleMarL() + c.StyleInsetL(),
-                                   sumH + withMt2 + c.StyleInsetT());
+                c.StyleMarL() + c.StyleInsetL(),
+                sumH + withMt2 + c.StyleInsetT());
                 if (!c.StyleDeclaresHeightAbs()) {
                     c.prefH = 0;
                     c.fillH = false;
@@ -323,8 +473,8 @@ public partial class Control {
         // float 的 margin 底边；非 BFC 容器 float 溢出（Chrome 同款）。
         // 只收编自己放的 float：祖先下传的该走"毗邻收窄"（未实现），
         // 收编会把容器高错误地撑到祖先 float 的底边。
-        if (floats.Count > ownFloats && computedStyle != null
-            && computedStyle.bfc != 0) {
+        if (floats != null && floats.Count > ownFloats && computedStyle != null
+        && computedStyle.bfc != 0) {
             for (int i = ownFloats; i < floats.Count; i = i + 1) {
                 if (floats[i].yBot > sumH) { sumH = floats[i].yBot; }
             }
@@ -364,9 +514,10 @@ public partial class Control {
         int placed = 0;
         // P3：float 入侵表（内容框坐标）+ 行内段流起点（同测量端）。
         // hostFloats 复制进来，防 PlaceFloatKid 把追加项写回共享表。
-        List<FloatIntrusion> floats = new List<FloatIntrusion>();
-        int ownFloats = floats.Count;
-        if (this.hostFloats != null) {
+        List<FloatIntrusion> floats = null;
+        int ownFloats = 0;
+        if (this.hostFloats != null && this.hostFloats.Count > 0) {
+            floats = new List<FloatIntrusion>();
             for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
                 floats.Add(this.hostFloats[fi]);
             }
@@ -376,22 +527,24 @@ public partial class Control {
         int align = computedStyle != null ? computedStyle.align : 0;
         this.InlineRunsBegin();
         List<FlowEntry> es = this.FlowEntries();
-        List<FlowEntry> seg = new List<FlowEntry>();
+        if (es.Count == 0) { return; }
+        List<FlowEntry> seg = null;
         for (int i = 0; i <= es.Count; i = i + 1) {
             FlowEntry e = i < es.Count ? es[i] : null;
             Control c = e != null ? e.kid : null;
             if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
                 if (c != null) { c.InlineRunsBegin(); }
-                if (seg.Count == 0) {
+                if (seg == null) {
+                    seg = new List<FlowEntry>();
                     segY = (y - cy) + (pending > 0 ? pending : 0);
                 }
                 seg.Add(e);
                 continue;
             }
             // 块级边界：落位行内段（无 margin 义务，塌陷语义同测量端）。
-            if (seg.Count > 0) {
+            if (seg != null && seg.Count > 0) {
                 FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw,
-                                                         floats, segY);
+                floats, segY);
                 if (fs2.lines.Count > 0) {
                     if (pending >= 0) {
                         y = y + CollapseMargins(pending, 0);
@@ -402,12 +555,13 @@ public partial class Control {
                     y = y + fs2.height;
                     placed = placed + 1;
                 }
-                seg = new List<FlowEntry>();
+                seg = null;
             }
             if (c == null) { break; }
             // P3：float 子项——脱离流，占入侵表并落位（不计 gap/rows）。
             // 规则 2 的顶边下限与测量端同式。
             if (c.StyleFloat() != 0) {
+                if (floats == null) { floats = new List<FloatIntrusion>(); }
                 int fy = (y - cy) + (pending > 0 ? pending : 0);
                 for (int oi = ownFloats; oi < floats.Count; oi = oi + 1) {
                     if (floats[oi].yTop > fy) { fy = floats[oi].yTop; }
@@ -424,7 +578,7 @@ public partial class Control {
             int clear = 0;
             if (clr != 0) {
                 int clearY = LineBox.ClearY(
-                    floats, clr, (y - cy) + (pending > 0 ? pending : 0));
+                floats, clr, (y - cy) + (pending > 0 ? pending : 0));
                 int need = clearY - (y - cy);
                 if (need > 0) { clear = need; }
             }
@@ -475,10 +629,10 @@ public partial class Control {
             }
             // P3：float 下传（同测量端）——落位前把入侵表换算给子块，
             // auto 高子块带表重测定高，堆叠与文本绕排才一致。
-            if (floats.Count > 0) {
+            if (floats != null && floats.Count > 0) {
                 this.SetHostFloats(c, floats,
-                                   x - cx + c.StyleInsetL(),
-                                   (y - cy) + c.StyleInsetT());
+                x - cx + c.StyleInsetL(),
+                (y - cy) + c.StyleInsetT());
                 if (!c.StyleDeclaresHeightAbs()) {
                     c.prefH = 0;
                     c.fillH = false;
@@ -527,7 +681,7 @@ public partial class Control {
     // 时把子项 Arrange 到 border box。测量/排布两端共用同一算法，
     // 行盒绕排的高度才与落位一致。
     void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW,
-                       int yFlow, int cx, int cy, bool place) {
+    int yFlow, int cx, int cy, bool place) {
         int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(frameW) : c.prefW;
         int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
         if (w < 0) { w = 0; }
@@ -578,10 +732,10 @@ public partial class Control {
     // 基线整体错位。只服务行盒 piece；块级子树的样式解析不受影响。
     StyleBox InheritText(StyleBox parent, StyleBox own) {
         int pfs = parent.fontPx > 0 ? parent.fontPx
-            : (parent.envRemPx > 0 ? parent.envRemPx : 14);
+        : (parent.envRemPx > 0 ? parent.envRemPx : 14);
         bool need = own.fontPx <= 0
-            || (own.lineHeightKind == 0 && parent.lineHeightKind != 0)
-            || (own.whiteSpace == 0 && parent.whiteSpace != 0);
+        || (own.lineHeightKind == 0 && parent.lineHeightKind != 0)
+        || (own.whiteSpace == 0 && parent.whiteSpace != 0);
         if (!need) { return own; }
         StyleBox d = own.Clone();
         if (d.fontPx <= 0) { d.fontPx = pfs; }
@@ -602,8 +756,8 @@ public partial class Control {
     // floats/segY（P3）：段前的 float 入侵表与段在流里的起点——
     // 行盒绕排用；floats 为 null/空时与旧路径逐 bit 相同。
     FlowSegment FlowLayoutSegment(List<FlowEntry> seg,
-                                  int wrapW, int wAvail,
-                                  List<FloatIntrusion> floats, int segY) {
+    int wrapW, int wAvail,
+    List<FloatIntrusion> floats, int segY) {
         FlowSegment fs2 = new FlowSegment();
         List<InlinePiece> items = new List<InlinePiece>();
         StyleBox sb = computedStyle;
@@ -631,7 +785,7 @@ public partial class Control {
             if (w < 0) { w = 0; }
             if (h < 0) { h = 0; }
             items.Add(LineBox.MakeBox(c, w, h, c.StyleMarL(), c.StyleMarR(),
-                                      c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
+            c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
         }
         List<InlineLine> lines = new List<InlineLine>();
         if (floats != null && floats.Count > 0) {
@@ -660,7 +814,7 @@ public partial class Control {
     // baseline + x 高一半 / top、bottom 对行盒上下）落位；文本型
     // owner 的矩形 = 全部 run 的并集（inline 盒的 Chrome 矩形语义）。
     void FlowSegmentPlace(FlowSegment fs2, int cx, int y0, int availW,
-                          int align, List<FlowEntry> seg) {
+    int align, List<FlowEntry> seg) {
         List<Control> owners = new List<Control>();
         List<int> uL = new List<int>();
         List<int> uT = new List<int>();
@@ -696,7 +850,7 @@ public partial class Control {
                         // 探针实测：盒顶 = baseline − xh/2 − 盒高/2）。
                         StyleBox sbp = computedStyle;
                         int pfp = sbp != null && sbp.fontPx > 0 ? sbp.fontPx
-                            : (sbp != null && sbp.envRemPx > 0 ? sbp.envRemPx : 14);
+                        : (sbp != null && sbp.envRemPx > 0 ? sbp.envRemPx : 14);
                         int xh2 = Canvas.FontHeight(pfp) * 5 / 24;
                         topY = baseline - xh2 - p.boxH / 2;
                     }
@@ -744,7 +898,11 @@ public partial class Control {
     // 纯 CSS 标准流式/弹性容器内容测量（Flex / Grid / Flow）
     // 只填补留空的那根轴：OnMeasure 或作者给过的尺寸优先。
     void MeasureContent(App app) {
-        if (children.Count == 0 && this.FlowEntries().Count == 0) { return; }
+        List<FlowEntry> entries = null;
+        if (childNodes.Count == 0) {
+            entries = this.FlowEntries();
+            if (entries.Count == 0) { return; }
+        }
         int disp = this.StyleDisplay();
         if (disp == 1) {
             this.MeasureFlexContent(app);
@@ -754,8 +912,9 @@ public partial class Control {
             this.MeasureGridContent(app);
             return;
         }
-        // 纯 CSS 标准流式测量（Flow / Block / Inline 默认兜底）
-        this.MeasureFlow(app);
+        // Reuse only this call's private snapshot; never cache a virtual public result.
+        if (entries != null) { this.MeasureFlowEntries(app, entries); }
+        else { this.MeasureFlow(app); }
     }
 
     // 把请求尺寸钳制到可用空间内；任一为负时返回 0。
@@ -773,58 +932,33 @@ public partial class Control {
         return requested;
     }
 
-    // 计算此节点及其子树（通过停靠）的边界。
-    // 虚方法，使容器（如 ScrollColumn）可以偏移/裁剪其子节点。
-    // 滚动容器排布收口（P6）：流/flex/grid/legacy 四条排布路径都
-    // 经过这里；非滚动容器零开销。clientH 是内容框高。
-    void ArrangeScrollTail(int clientH) {
-        if (children == null || children.Count == 0 || !this.IsScrollContainer()) { return; }
-        this.UpdateScroll(clientH, this.StylePadB());
-    }
-
-    // Arrange 尾段（P6 滚动容器）：算内容延伸、钳偏移、把子树平移
-    // -scrollY/-scrollX。延伸 = 可见内容底/右缘（子项 border-box，
-    // absolute 后代也计入——Chrome 里 abs 后代贡献滚动溢出）+ 自身
-    // 对应侧 padding，换算到 padding-box 坐标；下限 = client 尺寸
-    // （内容不足不滚）。`clientH` 是内容框高，`padB` 是内容框底
-    // padding（延伸含它，CSSOM scrollHeight/scrollWidth 同义）。
-    void UpdateScroll(int clientH, int padB) {
+    // 排布、滚轮和滚动条共用视口，内容范围包含末端 padding。
+    void ArrangeScrollTail() {
+        if (!this.IsScrollContainer()) { return; }
+        Rect view = this.ScrollViewport();
         int previousX = scrollX;
         int previousY = scrollY;
-        int bottom = 0;
-        int right = 0;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
+        int bottom = view.y;
+        int right = view.x;
+        for (int i = 0; i < childNodes.Count; i = i + 1) {
+            Control c = childNodes[i];
             if (!c.StyleVisible() || c.StylePosition() == 2) { continue; }
             int b = c.by + c.bh;
             if (b > bottom) { bottom = b; }
             int r = c.bx + c.bw;
             if (r > right) { right = r; }
         }
-        // padding-box 顶 = by + borderT = 内容框顶（by+InsetT）- padT
-        int top = this.by + this.StyleInsetT() - this.StylePadT();
-        this.scrollExtent = bottom > 0 ? bottom + padB - top : clientH;
-        if (this.scrollExtent < clientH) { this.scrollExtent = clientH; }
-        int mo = this.scrollExtent - clientH;
-        if (mo < 0) { mo = 0; }
-        if (this.scrollY > mo) { this.scrollY = mo; }
-        if (this.scrollY < 0) { this.scrollY = 0; }
-        // 水平轴（P6 横滚）：同式换算右缘。客户端宽 = 内容框宽；
-        // 右缘下限 = 内容框右（内容不足不横滚）。
-        int clientW = this.bw - this.StyleInsetL() - this.StyleInsetR();
-        int left = this.bx + this.StyleInsetL() - this.StylePadL();
-        this.scrollExtentX = right > 0 ? right + this.StylePadR() - left
-                                       : clientW;
-        if (this.scrollExtentX < clientW) { this.scrollExtentX = clientW; }
-        int moX = this.scrollExtentX - clientW;
-        if (moX < 0) { moX = 0; }
-        if (this.scrollX > moX) { this.scrollX = moX; }
-        if (this.scrollX < 0) { this.scrollX = 0; }
+        int width = Math.Max(0, view.width);
+        int height = Math.Max(0, view.height);
+        scrollExtent = Math.Max(height, bottom + this.StylePadB() - view.y);
+        scrollExtentX = Math.Max(width, right + this.StylePadR() - view.x);
+        scrollY = Math.Max(0, Math.Min(scrollY, scrollExtent - height));
+        scrollX = Math.Max(0, Math.Min(scrollX, scrollExtentX - width));
         int dy = 0 - this.scrollY;
         int dx = 0 - this.scrollX;
         if (dy != 0 || dx != 0) {
-            for (int i = 0; i < children.Count; i = i + 1) {
-                children[i].ShiftTree(dx, dy);
+            for (int i = 0; i < childNodes.Count; i = i + 1) {
+                childNodes[i].ShiftTree(dx, dy);
             }
         }
         this.NotifyScrollChanged(previousX, previousY);
@@ -835,8 +969,8 @@ public partial class Control {
     public virtual void ShiftTree(int dx, int dy) {
         this.bx = this.bx + dx;
         this.by = this.by + dy;
-        for (int i = 0; i < children.Count; i = i + 1) {
-            children[i].ShiftTree(dx, dy);
+        for (int i = 0; i < childNodes.Count; i = i + 1) {
+            childNodes[i].ShiftTree(dx, dy);
         }
     }
 
@@ -876,7 +1010,7 @@ public partial class Control {
         }
         this.ArrangePositioned(pbx, pby, pbw, pbh);
         this.CheckKidsLayout();
-        this.ArrangeScrollTail(ch);
+        this.ArrangeScrollTail();
     }
 
     // 排布 `position` 子项。absolute/fixed 脱离常规流（停靠/flex/flow
@@ -886,9 +1020,9 @@ public partial class Control {
     // relative 不脱流，在流位置上平移（left/right 同设按 CSS 用
     // left，top/bottom 同设用 top，未声明当 0）。
     void ArrangePositioned(int cx, int cy, int cw, int ch) {
-        if (children == null || children.Count == 0) { return; }
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control c = children[i];
+        if (childNodes == null || childNodes.Count == 0) { return; }
+        for (int i = 0; i < childNodes.Count; i = i + 1) {
+            Control c = childNodes[i];
             if (!c.StyleVisible()) { continue; }
             StyleBox sb = c.computedStyle;
             int pos = c.StylePosition();
@@ -907,9 +1041,9 @@ public partial class Control {
             if (posT == 0 - 1 && c.my != 0) { posT = c.my; }
             if (pos == 1) {
                 int dx = posL != 0 - 1 ? posL
-                    : (posR != 0 - 1 ? 0 - posR : 0);
+                : (posR != 0 - 1 ? 0 - posR : 0);
                 int dy = posT != 0 - 1 ? posT
-                    : (posB != 0 - 1 ? 0 - posB : 0);
+                : (posB != 0 - 1 ? 0 - posB : 0);
                 if (dx != 0 || dy != 0) {
                     c.Arrange(c.bx + dx, c.by + dy, c.bw, c.bh);
                 }

@@ -1,0 +1,264 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class MenuInputCounts {
+    public int selected;
+    public void Selected() { selected = selected + 1; }
+}
+
+class MenuLayoutInputTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception("Menu: " + label); }
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { return; }
+            action();
+        }
+    }
+    static Control Part(Control root, string cls) {
+        if (Style.Has(root.Class, cls)) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = Part(root.ChildAt(i), cls);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static bool HasTitle(Control root, string title) {
+        if (root is Label && root.GetProp("text") == title) { return true; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            if (HasTitle(root.ChildAt(i), title)) { return true; }
+        }
+        return false;
+    }
+    static Button Row(Control root, string title) {
+        if (root is Button && HasTitle(root, title)) { return (Button)root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Button found = Row(root.ChildAt(i), title);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static Menu Build(int source) {
+        Menu menu = new Menu();
+        if (source == 1) {
+            // HTML supports Menu properties, not a declarative MenuItem child schema.
+            // Populate its model in code; this does not claim HTML item-construction coverage.
+            HtmlDoc doc = Html.Parse("<zan-menu data-selected-key='nested'></zan-menu>", "", null);
+            Check(doc.root != null && doc.root.ChildCount() == 1 && doc.root.ChildAt(0) is Menu,
+                "HTML constructs a real Menu through the production factory");
+            menu = (Menu)doc.root.ChildAt(0);
+            doc.root.Remove(menu);
+            Check(menu.selectedKey.Get() == "nested", "HTML selected-key property");
+        } else { menu.selectedKey.Set("nested"); }
+        MenuItem home = MenuItem.Shortcut("Home", "file", "Ctrl+H", 10);
+        home.key = "home";
+        menu.items.Add(home);
+        menu.items.Add(MenuItem.Item("Other", "", 11));
+        menu.items.Add(MenuItem.Separator());
+        List<MenuItem> deep = new List<MenuItem>();
+        MenuItem nested = MenuItem.Shortcut("Nested", "file", "Ctrl+N", 12);
+        nested.key = "nested";
+        deep.Add(nested);
+        deep.Add(MenuItem.Item("Twin", "", 13));
+        List<MenuItem> children = new List<MenuItem>();
+        children.Add(MenuItem.Item("Peer", "", 14));
+        MenuItem advanced = MenuItem.Submenu("Advanced", "file", deep);
+        advanced.key = "advanced";
+        children.Add(advanced);
+        MenuItem tools = MenuItem.Submenu("Tools", "file", children);
+        tools.key = "tools";
+        menu.items.Add(tools);
+        menu.items.Add(MenuItem.Disabled("Disabled", "file", 15));
+        List<MenuItem> lockedChildren = new List<MenuItem>();
+        lockedChildren.Add(MenuItem.Item("Hidden", "", 16));
+        MenuItem locked = MenuItem.Submenu("Locked", "file", lockedChildren);
+        locked.key = "locked"; locked.disabled = true;
+        menu.items.Add(locked);
+        // Deliberately stale top-level index: a nonempty key must take precedence at every depth.
+        menu.selected.Set(0);
+        menu.expandState.Toggle("tools"); menu.expandState.Toggle("advanced");
+        menu.BuildTree();
+        return menu;
+    }
+    static bool Contains(Control outer, Control inner) {
+        return inner.bw > 0 && inner.bh > 0 && inner.bx >= outer.bx && inner.by >= outer.by
+            && inner.bx + inner.bw <= outer.bx + outer.bw && inner.by + inner.bh <= outer.by + outer.bh;
+    }
+    static StyleBox Normal(App app, Control control) {
+        Control previous = app.styleCtx;
+        app.styleCtx = control;
+        StyleBox box = control.ResolveStyle(app, Style.SNormal());
+        app.styleCtx = previous;
+        return box;
+    }
+    static int TreeGeometry(App app, Control root, string key, string phase) {
+        int active = 0;
+        bool row = Style.Has(root.Class, "menu-item") || Style.Has(root.Class, "row");
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control child = root.ChildAt(i);
+            Check(child.parent == root && Contains(root, child), "retained child containment " + phase
+                + " parent=" + root.Class + " rect=" + root.bx + "," + root.by + "," + root.bw + "," + root.bh
+                + " child=" + child.Class + " rect=" + child.bx + "," + child.by + "," + child.bw + "," + child.bh);
+            for (int j = i + 1; j < root.ChildCount(); j = j + 1) {
+                Control other = root.ChildAt(j);
+                Check(row ? child.bx + child.bw <= other.bx : child.by + child.bh <= other.by,
+                    "horizontal rows / vertical columns never overlap " + phase
+                    + " parent=" + root.Class + " child=" + child.Class + " rect=" + child.bx + "," + child.by + "," + child.bw + "," + child.bh
+                    + " other=" + other.Class + " rect=" + other.bx + "," + other.by + "," + other.bw + "," + other.bh);
+            }
+            active = active + TreeGeometry(app, child, key, phase);
+        }
+        if (Style.Has(root.Class, "menu-separator")) {
+            Check(root.bh == app.Scale(1) && root.bw > 0 && Normal(app, root).BgOr(0) != 0,
+                "visible scaled one-pixel separator " + phase);
+        }
+        if (root is Button && !Style.Has(root.Class, "menu-group-header")) {
+            bool selected = Style.Has(root.Class, "active");
+            bool expected = HasTitle(root, key == "nested" ? "Nested" : "Home");
+            Check(selected == expected, "only the keyed leaf is active; indices do not duplicate highlights " + phase);
+            if (selected) {
+                active = active + 1;
+                Control label = Part(root, "menu-item-label");
+                Check(label != null && Normal(app, root).BgOr(0) != 0
+                    && Normal(app, root).BgOr(0) != Normal(app, RowTop(root, "Other")).BgOr(0)
+                    && Normal(app, label).FgOr(0) == app.theme.primary,
+                    "selected surface and actual title foreground " + phase);
+            }
+        }
+        return active;
+    }
+    static Control RowTop(Control control, string title) {
+        Control root = control;
+        while (root.parent != null) { root = root.parent; }
+        Button found = Row(root, title);
+        Check(found != null, "comparison row exists");
+        return found;
+    }
+    static void Layout(App app, Menu menu, int dpi, int width, string phase) {
+        app.SetOffscreenViewport(width + 30, 520, dpi);
+        menu.UseApp(app);
+        menu.MeasureTree(app, app.Scale(width));
+        menu.Arrange(app.Scale(7), app.Scale(11), app.Scale(width), app.Scale(480));
+        app.SetRootControl(menu);
+        Check(TreeGeometry(app, menu, menu.selectedKey.Get(), phase) == 1, "one active leaf " + phase);
+        Button home = Row(menu, "Home"); Button nested = Row(menu, "Nested");
+        Check(home != null && nested != null, "retained leaf rows exist");
+        Check(home.ChildCount() == 3 && home.ChildAt(0) is IconView
+            && home.ChildAt(1) is Label && home.ChildAt(2) is Label,
+            "real icon/title/shortcut children");
+        Check(home.ChildAt(0).bw == app.Scale(16) && home.ChildAt(0).bh == app.Scale(16),
+            "icon retains scaled square dimensions");
+        Button tools = Row(menu, "Tools"); Button advanced = Row(menu, "Advanced");
+        Check(tools != null && advanced != null && tools.ChildCount() == 2
+            && advanced.ChildCount() == 2 && tools.ChildAt(1) is IconView,
+            "group retains left row and arrow");
+        Check(Style.Has(advanced.parent.Class, "menu-subgroup")
+            && Style.Has(nested.parent.Class, "menu-subgroup")
+            && advanced.bx > tools.bx && nested.bx > advanced.bx,
+            "each subgroup column indents its descendants");
+    }
+    static void Paint(App app, Menu menu) {
+        app.BeginOffscreenFrame(); menu.RenderTree(app); menu.RenderTree(app);
+        app.EndOffscreenFrame(); Drain(app);
+    }
+    static void Click(App app, Menu menu, MenuInputCounts counts, Button button, bool enabled) {
+        Check(button != null && button.bw > 0 && button.bh > 0, "real input target");
+        Check(button.IsDisabled() == !enabled, "disabled model reaches real Button semantics");
+        int before = counts.selected; string key = menu.selectedKey.Get();
+        bool expanded = menu.expandState.Contains("tools");
+        int x = button.bx + button.bw / 2; int y = button.by + button.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Check(counts.selected == before && menu.selectedKey.Get() == key
+            && menu.expandState.Contains("tools") == expanded, "Down never selects or expands");
+        Check(enabled ? app.GetCapturedPointer() == button : app.GetCapturedPointer() == null,
+            "Down captures only enabled button");
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0); Drain(app);
+        Check(app.GetCapturedPointer() == null, "Up releases capture");
+    }
+    static void Stale(App app, Menu menu, MenuInputCounts counts, string title, int dpi, int width) {
+        Button retired = Row(menu, title);
+        Check(retired != null, "retired input row exists");
+        List<Control> old = new List<Control>();
+        for (int i = 0; i < menu.ChildCount(); i = i + 1) { old.Add(menu.ChildAt(i)); }
+        string selected = menu.selectedKey.Get(); int before = counts.selected;
+        bool expanded = menu.expandState.Contains("tools");
+        int x = retired.bx + retired.bw / 2; int y = retired.by + retired.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == retired, "stale sequence starts with actual capture");
+        app.Post(menu.BuildTree); app.DrainPosts();
+        for (int i = 0; i < old.Count; i = i + 1) {
+            Check(old[i].parent == null, "BuildTree detaches every retired top-level child");
+        }
+        Check(app.GetCapturedPointer() == null, "rebuild releases retired capture");
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0); Drain(app);
+        Check(counts.selected == before && menu.selectedKey.Get() == selected
+            && menu.expandState.Contains("tools") == expanded,
+            "Down/Post(BuildTree)/Up cannot select or expand through retired rows");
+        Layout(app, menu, dpi, width, "after stale " + title);
+        // Event posts can already retain a callback when its physical row is retired.
+        retired.Click.Post(); Drain(app);
+        Check(counts.selected == before && menu.selectedKey.Get() == selected
+            && menu.expandState.Contains("tools") == expanded,
+            "retired generation callbacks cannot mutate the current menu");
+    }
+    static void Exercise(App app, int source, int dpi) {
+        Menu menu = Build(source);
+        MenuInputCounts counts = new MenuInputCounts(); menu.Select.Add(counts.Selected);
+        string phase = (source == 0 ? "code" : "HTML props/code items") + " dpi=" + dpi.ToString();
+        for (int size = 0; size < 3; size = size + 1) {
+            int width = size == 1 ? 240 : 640;
+            Layout(app, menu, dpi, width, phase);
+            List<int> wide = new List<int>();
+            Button anchor = Row(menu, "Home");
+            wide.Add(anchor.bx); wide.Add(anchor.by); wide.Add(anchor.bw); wide.Add(anchor.bh);
+            int before = counts.selected;
+            Click(app, menu, counts, Row(menu, "Disabled"), false); Click(app, menu, counts, Row(menu, "Locked"), false);
+            Check(counts.selected == before && menu.selectedKey.Get() == "nested"
+                && !menu.expandState.Contains("locked") && Row(menu, "Hidden") == null,
+                "disabled leaf/group cannot activate or expand");
+            Click(app, menu, counts, Row(menu, "Home"), true);
+            Check(counts.selected == before + 1 && menu.selectedKey.Get() == "home", "leaf selects once on Up");
+            Layout(app, menu, dpi, width, phase);
+            Click(app, menu, counts, Row(menu, "Nested"), true);
+            Check(counts.selected == before + 2 && menu.selectedKey.Get() == "nested", "true nested leaf selects its key");
+            Layout(app, menu, dpi, width, phase);
+            Click(app, menu, counts, Row(menu, "Tools"), true);
+            Check(!menu.expandState.Contains("tools") && Row(menu, "Nested") == null,
+                "group Up collapses descendants");
+            menu.MeasureTree(app, app.Scale(width));
+            menu.Arrange(app.Scale(7), app.Scale(11), app.Scale(width), app.Scale(480));
+            Click(app, menu, counts, Row(menu, "Tools"), true);
+            Check(menu.expandState.Contains("tools") && counts.selected == before + 2, "group expands without selecting");
+            Layout(app, menu, dpi, width, phase);
+            Stale(app, menu, counts, "Home", dpi, width); Stale(app, menu, counts, "Tools", dpi, width);
+            Paint(app, menu);
+            Check(counts.selected == before + 2, "painting cannot replay callbacks");
+            anchor = Row(menu, "Home");
+            Check(anchor.bx == wide[0] && anchor.by == wide[1] && anchor.bw == wide[2] && anchor.bh == wide[3],
+                "rebuild preserves requested layout");
+        }
+        Layout(app, menu, dpi, 640, phase + " restore");
+        Button restored = Row(menu, "Home");
+        int x = restored.bx; int y = restored.by; int w = restored.bw; int h = restored.bh;
+        Layout(app, menu, dpi, 240, phase + " narrow"); Layout(app, menu, dpi, 640, phase + " restore");
+        restored = Row(menu, "Home");
+        Check(restored.bx == x && restored.by == y && restored.bw == w && restored.bh == h,
+            "wide geometry restores after narrow viewport");
+        app.SetRootControl(null);
+    }
+    static void Release(App app) { app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy(); }
+    static void Main() {
+        ControlBootstrap.Install();
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        App app = App.CreateOffscreen("Menu layout/input", 680, 520);
+        for (int source = 0; source < 2; source = source + 1) {
+            for (int dpi = 100; dpi <= 200; dpi = dpi + 50) { Exercise(app, source, dpi); }
+        }
+        Release(app); Release(frame);
+        Console.WriteLine("menu-layout-input:ok");
+    }
+}

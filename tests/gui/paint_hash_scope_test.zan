@@ -1,0 +1,223 @@
+using System;
+using Gui;
+
+class HashScopeLeaf : Control {
+    public int color = unchecked((int)0xFF307090);
+    public bool fail;
+    public override void OnPaint(App app) {
+        app.canvas.FillRect(bx, by, bw, bh, color);
+        if (fail) { fail = false; throw new Exception("paint scope probe"); }
+    }
+}
+
+class HashScopeNested : Control {
+    public HashScopeLeaf leaf;
+    public override void OnPaint(App app) {
+        app.canvas.FillRect(bx, by, bw, bh, unchecked((int)0xFF203040));
+        try { leaf.RenderTree(app); }
+        catch (Exception ex) {
+            // This fixture owns the injected paint failure; the parent continues.
+        }
+        app.canvas.FillRect(bx, by, 2, bh, unchecked((int)0xFF506070));
+    }
+}
+
+class HashScopeSurface : Control {
+    public HashScopeNested nested;
+    public int ancestorColor = unchecked((int)0xFF405060);
+    public int ownerColor = unchecked((int)0xFF708090);
+    public int ownerId = WidgetId.Next();
+    public bool emptyAncestor;
+    public override void OnPaint(App app) {
+        if (!emptyAncestor) { app.canvas.FillRect(0, 48, 320, 20, ancestorColor); }
+        nested.RenderTree(app);
+        // The immediate child is an explicit owner, even though it has no tree node.
+        PaintHashToken token = app.PaintHashBeginScope();
+        try {
+            app.canvas.FillRect(180, 120, 40, 20, ownerColor);
+            app.PaintHashEndSelf(token, ownerId, 180, 120, 40, 20);
+        } finally { App.PaintHashRestore(token); }
+        if (!emptyAncestor) { app.canvas.FillRect(0, 220, 320, 2, unchecked((int)0xFF102030)); }
+    }
+}
+
+class PaintHashScopeTest {
+    static void Check(bool value, string why) {
+        if (!value) { throw new Exception(why); }
+    }
+    static HashScopeSurface Surface() {
+        HashScopeSurface root = new HashScopeSurface();
+        root.nested = new HashScopeNested();
+        root.nested.leaf = new HashScopeLeaf();
+        root.Arrange(0, 48, 320, 180);
+        root.nested.Arrange(20, 80, 80, 40);
+        root.nested.leaf.Arrange(30, 90, 20, 10);
+        return root;
+    }
+    static int[] Pixels(App app) {
+        int width = app.canvas.Width();
+        int height = app.canvas.Height();
+        int[] pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) {
+                pixels[y * width + x] = app.canvas.GetPixel(x, y);
+            }
+        }
+        return pixels;
+    }
+    static void Same(int[] full, int[] partial, string why) {
+        Check(full.Length == partial.Length, why + " dimensions");
+        for (int i = 0; i < full.Length; i = i + 1) {
+            Check(full[i] == partial[i], why + " pixel=" + Convert.ToString(i));
+        }
+    }
+    static void Begin(App app) {
+        app.FreezeAnimClock(1000);
+        app.SyncSurface();
+        app.BeginFrame();
+    }
+    static void Paint(App app, HashScopeSurface root) {
+        root.RenderTree(app);
+        app.PresentFrame();
+    }
+    static void Warm(App app, HashScopeSurface root) {
+        app.RequestRedraw();
+        Begin(app);
+        Paint(app, root);
+        Begin(app);
+        Paint(app, root);
+    }
+    static int[] Full(App app, HashScopeSurface root) {
+        app.RequestRedraw();
+        Begin(app);
+        Check(!app.partialFrame, "reference is a full frame");
+        Paint(app, root);
+        return Pixels(app);
+    }
+    static void NestedAndOwner(App app, HashScopeSurface root) {
+        Warm(app, root);
+        root.nested.leaf.color = unchecked((int)0xFFB04060);
+        app.NoteDamage(20, 80, 80, 40);
+        Begin(app);
+        Check(app.partialFrame, "nested child starts partial");
+        Paint(app, root);
+        Check(!app.needsRedraw, "child change does not become ancestor damage");
+        int[] partial = Pixels(app);
+        Same(Full(app, root), partial, "nested full/partial");
+        root.ownerColor = unchecked((int)0xFF809020);
+        app.NoteDamage(180, 120, 40, 20);
+        Begin(app);
+        Check(app.partialFrame, "explicit non-tree owner stays partial");
+        Paint(app, root);
+        Check(!app.needsRedraw, "non-tree child excludes ancestor hash");
+        partial = Pixels(app);
+        Same(Full(app, root), partial, "non-tree full/partial");
+        Console.WriteLine("nested and non-tree owner pixels ok");
+    }
+    static void AncestorAndException(App app, HashScopeSurface root) {
+        root.ancestorColor = unchecked((int)0xFF904020);
+        app.NoteDamage(20, 80, 80, 40);
+        Begin(app);
+        Check(app.partialFrame, "ancestor discovery starts partial");
+        Paint(app, root);
+        Check(app.needsRedraw, "real ancestor prefix outside clip declares damage");
+        Begin(app);
+        Check(!app.partialFrame, "large ancestor repair is full");
+        Paint(app, root);
+        int[] repaired = Pixels(app);
+        Same(Full(app, root), repaired, "ancestor repaired full/partial");
+        root.nested.leaf.fail = true;
+        app.NoteDamage(20, 80, 80, 40);
+        Begin(app);
+        Paint(app, root);
+        Check(!app.needsRedraw, "caught nested paint restores parent hash");
+        int[] partial = Pixels(app);
+        Same(Full(app, root), partial, "exception full/partial");
+        app.NoteDamage(20, 80, 80, 40);
+        Begin(app);
+        Paint(app, root);
+        Check(!app.needsRedraw, "successful segment after exception remains stable");
+        Console.WriteLine("ancestor change and exception recovery pixels ok");
+    }
+    static void EmptyAndPending(App app, HashScopeSurface root) {
+        root.emptyAncestor = true;
+        root.Arrange(0, 48, 320, 0);
+        Warm(app, root);
+        root.nested.leaf.color = unchecked((int)0xFF309060);
+        app.NoteDamage(20, 80, 80, 40);
+        app.NoteDamage(0, 48, 320, 0);
+        app.NoteDamage(0, 0, 0, 240);
+        app.NoteDamage(0, 0, -1, 240);
+        app.NoteDamage(25, 85, 10, 10);
+        Begin(app);
+        Check(app.partialFrame, "empty ancestor cannot promote damage to full");
+        Check(app.FrameDamageContains(20, 80, 80, 40), "valid pending union retained");
+        Check(!app.FrameDamageContains(19, 80, 1, 1), "zero-height ancestor cannot widen union");
+        Check(!app.FrameDamageContains(20, 79, 1, 1), "zero-width ancestor cannot widen union");
+        Paint(app, root);
+        Check(!app.needsRedraw, "zero-height ancestor has no follow-up damage");
+        int[] partial = Pixels(app);
+        Same(Full(app, root), partial, "zero-height full/partial");
+        Console.WriteLine("empty ancestor and pending damage pixels ok");
+    }
+    static void Segment(App app, int id, int value) {
+        PaintHashToken token = app.PaintHashBeginScope();
+        try {
+            App.PaintHashOp(91, value, 0, 0, 0);
+            app.PaintHashEndSelf(token, id, 180, 120, 40, 20);
+        } finally { App.PaintHashRestore(token); }
+    }
+    static void FrozenClipAndSuspend(App app, HashScopeSurface root) {
+        int first = WidgetId.Next();
+        int second = WidgetId.Next();
+        Begin(app);
+        Segment(app, first, 1);
+        Segment(app, second, 1);
+        Paint(app, root);
+        app.NoteDamage(20, 80, 80, 40);
+        Begin(app);
+        Check(app.partialFrame, "frozen clip starts partial");
+        Segment(app, first, 2);
+        Check(app.needsRedraw, "first outside owner declares pending damage");
+        Check(!app.FrameDamageContains(180, 120, 40, 20), "pending union is not already painted");
+        app.needsRedraw = false;
+        Segment(app, second, 2);
+        Check(app.needsRedraw, "second outside owner checks frozen present clip");
+        bool armed = App.PaintHashSuspend();
+        PaintHashToken suspended = app.PaintHashBeginScope();
+        try { App.PaintHashOp(92, 1, 2, 3, 4); }
+        finally { App.PaintHashRestore(suspended); }
+        Check(!App.PaintHashArmed(), "nested scope preserves suspended state");
+        App.PaintHashResume(armed);
+        Check(App.PaintHashArmed(), "resume restores armed state");
+        Paint(app, root);
+        Begin(app);
+        Check(app.partialFrame, "multiple pending owners retain bounded repair");
+        Check(app.FrameDamageContains(180, 120, 40, 20), "next frame paints pending owner union");
+        Paint(app, root);
+        int[] partial = Pixels(app);
+        Same(Full(app, root), partial, "pending owner repair full/partial");
+        Console.WriteLine("frozen clip and suspended scope pixels ok");
+    }
+    static void Main() {
+        App previous = App.FrameApp();
+        App app = new App("paint hash scopes", 320, 240, true);
+        try {
+            app.Show();
+            app.SyncSurface();
+            app.SetPartialFrames(true);
+            HashScopeSurface root = Surface();
+            NestedAndOwner(app, root);
+            AncestorAndException(app, root);
+            EmptyAndPending(app, root);
+            FrozenClipAndSuspend(app, root);
+            Console.WriteLine("PAINT_HASH_SCOPE_OK");
+        } finally {
+            app.UnfreezeAnimClock();
+            app.StopLoop();
+            app.window.Destroy();
+            app.canvas.Destroy();
+            App.frameApp = previous;
+        }
+    }
+}

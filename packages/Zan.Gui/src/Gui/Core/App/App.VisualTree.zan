@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using System.Collections.Generic;
 
 namespace Gui;
 
@@ -29,6 +30,7 @@ public partial class App {
     int retainedLongPressPointerType;
     bool retainedLongPressReserved;
     int routedWindowGestureTicket;
+    bool routedWindowDispatchComplete;
 
     bool RetainedLongPressOwnsGesture() {
         // Remains reserved through slop/cancel/Up, until the next physical Down.
@@ -117,6 +119,17 @@ public partial class App {
         return root != null && root.ContainsInputControl(control);
     }
 
+    bool PointerEndpointCurrent(Control control, Control root) {
+        if (!this.BelongsToInputTree(control, root)) { return false; }
+        Control node = control;
+        while (node != null) {
+            if (node.App != this || !node.StyleVisible() || node.IsDisabled()) { return false; }
+            if (node == root) { return true; }
+            node = node.parent;
+        }
+        return true;
+    }
+
     void CancelRoutedPointer() {
         Control target = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
         capturedPointerControl = null;
@@ -152,24 +165,52 @@ public partial class App {
             routedWheelConsumedSequence = window.EventSeq();
             routedWheelConsumedSequenceValid = true;
         }
+        this.SyncRoutedPointerState(kind);
         lastInputMs = Window.GetTickMs();
         needsRedraw = true;
         return true;
     }
 
+    void SyncRoutedPointerState(int kind) {
+        if (focus == null) { return; }
+        Control hovered = lastHoveredControl;
+        Control pressed = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
+        int oldHover = focus.hoveredId;
+        focus.SetHovered(hovered != null ? hovered.WidgetId() : -1);
+        focus.SetPressed(pressed != null ? pressed.WidgetId() : -1);
+        Control cursorControl = pressed != null ? pressed : hovered;
+        int cursor = cursorControl != null ? cursorControl.PointerCursor() : -1;
+        if (cursor == 0) { Window.SetCursor(1); }
+        else if (cursor == 1) { Window.SetCursor(2); }
+        else if (cursor == 4) { Window.SetCursor(3); }
+        else if (cursor == 5) { Window.SetCursor(4); }
+        else if (cursor == 6) { Window.SetCursor(6); }
+        else if (cursor == 7) { Window.SetCursor(7); }
+        else if (cursor == 8) { Window.SetCursor(8); }
+        else { Window.SetCursor(0); }
+    }
+
     // Both native event pumps enter here; one event is routed once per App.
-    void DispatchWindowInput(int kind) {
+    bool DispatchWindowInput(int kind) {
         if (kind != 1 && kind != 2 && kind != 3 && kind != 4
                 && kind != 5 && kind != 6 && kind != 9 && kind != 13) {
             routedWindowHandled = false;
             routedFocusAssigned = false;
+            long ignoredSequence = window.EventSeq();
             this.TickRoutedLongPress();
-            return;
+            return window.EventSeq() == ignoredSequence;
         }
         long sequence = window.EventSeq();
-        if (routedWindowSequenceValid && routedWindowSequence == sequence) { return; }
+        if (routedWindowSequenceValid && routedWindowSequence == sequence) { return routedWindowDispatchComplete; }
         routedWindowSequence = sequence;
         routedWindowSequenceValid = true;
+        routedWindowDispatchComplete = false;
+        if (!this.PrepareInputParticipants(kind, sequence)) { return false; }
+        if (this.KeyBlocked(kind)) {
+            routedWindowHandled = true;
+            routedWindowDispatchComplete = true;
+            return true;
+        }
         routedFocusAssigned = false;
         // Snapshot before callbacks and before a consumed retained event can early-return.
         if (kind == 1 || kind == 2 || kind == 3 || kind == 13) {
@@ -178,17 +219,27 @@ public partial class App {
         }
         if (kind == 2 && window.EventButton() != 1) {
             pointerDown = true;
-            int hit = hitTester.AnchorAt(0, mouseX, mouseY, false);
-            this.NotePressStart(hit, mouseX, mouseY);
+            // A fresh physical gesture belongs to the tree, even when it hits
+            // a plain container. NotePressStart advances the gesture ticket.
+            this.NotePressStart(-1, mouseX, mouseY);
         }
         int pointerType = window.EventFlag() == 1 ? 1 : this.currentPointerType;
         int key = window.EventKeyCode();
         int dispatchTicket = pointerGestureTicket;
-        routedWindowHandled = this.DispatchVisualTree(kind, window.EventX(),
+        bool handled = this.DispatchVisualTree(kind, window.EventX(),
             window.EventY(), key, kind == 13 ? key : 0, pointerType);
+        // Nested input owns its newer sequence and dispatch result.
+        if (window.EventSeq() != sequence || !routedWindowSequenceValid
+            || routedWindowSequence != sequence) { return false; }
+        // Pointer gestures have exactly one owner. An unhandled plain-Control
+        // target or an empty point must never fall through to legacy ids.
+        if (!handled && (kind == 1 || kind == 2 || kind == 3)) { handled = true; }
+        routedWindowHandled = handled;
         routedWindowGestureTicket = dispatchTicket;
         if (dispatchTicket != pointerGestureTicket) { routedWindowHandled = true; }
         if (routedWindowHandled) { needsRedraw = true; }
+        routedWindowDispatchComplete = true;
+        return true;
     }
 
     Control FindFocusedControl(Control root) {
@@ -236,6 +287,15 @@ public partial class App {
     // Retire each old resource independently; a new capture does not spare an old overlay.
     public void ReleaseInputSubtree(Control root) {
         if (root == null) { return; }
+        List<InputRetirementToken> retiring = this.SnapshotInputRetirements(root, null, false);
+        this.CancelInputSubtree(root);
+        // Last: a retirement callback may synchronously establish new input/session state.
+        this.NotifyInputRetirements(retiring, 0, false);
+    }
+
+    // Cancel transient input without retiring a still-hosted business session.
+    public void CancelInputSubtree(Control root) {
+        if (root == null) { return; }
         OverlayHost host = overlayHost;
         int overlayTicket = host != null ? host.RetirementRevision() : 0;
         FocusManager oldFocus = focus;
@@ -278,6 +338,7 @@ public partial class App {
         inputRootChangeTicket = ticket;
         try {
             Control previous = rootControl;
+            List<InputRetirementToken> retiring = this.SnapshotInputRetirements(previous, root, true);
             OverlayHost host = overlayHost;
             int overlayTicket = host != null ? host.RetirementRevision() : 0;
             FocusManager oldFocus = focus;
@@ -305,20 +366,23 @@ public partial class App {
             if (overlayHost == host && host != null) { host.RetireAnchorOutside(root, overlayTicket); }
             // Another root installation or adapter lifecycle fence supersedes this ticket.
             if (inputRootGeneration != ticket) { return; }
+            this.NotifyInputRetirements(retiring, ticket, true);
+            if (inputRootGeneration != ticket) { return; }
             this.rootControl = root;
+            if (focus != null) { focus.ReconcileFocus(previous); }
         } finally {
             // A callback may have started a newer installation; retire only our ticket.
             if (inputRootChangeTicket == ticket) { inputRootChangeTicket = 0; }
         }
     }
 
-    // 将底层 OS 输入事件尝试分发给 Visual Tree 路由管线（默认采用当前指针类型）。
-    // 返回 true 表示 Visual Tree 已完全消费（e.handled == true），无需继续走老式 HitTester 扁平查表。
+    // 将底层 OS 输入事件分发给 Visual Tree 路由管线（默认采用当前指针类型）。
+    // 返回 true 表示事件或其所属指针手势已由树/overlay 接管。
     public bool DispatchVisualTree(int eventKind, int x, int y, int keyCode, int delta) {
         return this.DispatchVisualTree(eventKind, x, y, keyCode, delta, this.currentPointerType);
     }
 
-    // 双模混合指针输入路由核心仲裁器：
+    // 指针输入路由核心仲裁器：
     // - 鼠标模式 (0): 1px 像素级命中、高精度悬停穿越、零延迟点击
     // - 触控模式 (1): 44px 热区容差吸附、8px 防抖死区判定、滑动时取消按压、抬手消除 Sticky Hover
     // - 笔模式 (2): 高精度触控笔与压感
@@ -342,8 +406,10 @@ public partial class App {
         }
         Control popup = overlayHost != null ? overlayHost.ActiveRoot() : null;
         Control inputRoot = popup != null ? popup : rootControl;
-        if (capturedPointerControl != null && !this.BelongsToInputTree(capturedPointerControl, inputRoot)) {
+        if (capturedPointerControl != null && !this.PointerEndpointCurrent(capturedPointerControl, inputRoot)) {
             this.CancelRoutedPointer();
+            // Cancel callbacks may replace the root or start another gesture.
+            return true;
         }
         if (inputRoot == null && capturedPointerControl == null) { return false; }
 
@@ -353,6 +419,10 @@ public partial class App {
         if (!keyboard && target == null && inputRoot != null) {
             target = inputRoot.HitTest(x, y, pointerType);
         }
+        // Focus may transfer while PointerDown is bubbling. KeyUp/TextInput
+        // are separate OS events, so resolve their endpoint after that callback
+        // instead of retaining the root snapshot chosen before PointerDown.
+        if (keyboard) { target = this.FindFocusedControl(inputRoot); }
 
         // Fix the ticket before any pointer-cancel callback can reenter.
         int dispatchTicket = pointerGestureTicket;
@@ -383,23 +453,75 @@ public partial class App {
                     }
                 }
             } else {
-                // 鼠标模式：标准的实时 Hover 穿越（PointerEnter / PointerLeave）
+                // Hover callbacks may retire this hit or synchronously dispatch newer input.
+                long hoverSequence = window.EventSeq();
+                int hoverRootGeneration = inputRootGeneration;
                 if (this.lastHoveredControl != target) {
-                    if (this.lastHoveredControl != null) {
-                        RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", this.lastHoveredControl, x, y, pointerType);
-                        Control.RouteEvent(this.lastHoveredControl, leave);
+                    Control previousHover = this.lastHoveredControl;
+                    if (focus != null) {
+                        this.NoteHoverDamage(previousHover, target);
                     }
-                    this.lastHoveredControl = target;
+                    this.lastHoveredControl = null;
+                    if (previousHover != null) {
+                        RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", previousHover, x, y, pointerType);
+                        Control.RouteEvent(previousHover, leave);
+                    }
+                    if (!isRunning || window.EventSeq() != hoverSequence
+                    || inputRootGeneration != hoverRootGeneration
+                    || dispatchTicket != pointerGestureTicket) { return true; }
+                    Control hoverPopup = overlayHost != null ? overlayHost.ActiveRoot() : null;
+                    if ((hoverPopup != null ? hoverPopup : rootControl) != inputRoot
+                    || this.lastHoveredControl != null) { return true; }
                     if (target != null) {
+                        if (!this.BelongsToInputTree(target, inputRoot)) { return true; }
+                        // As with LongPressRouteCurrent, adapter membership is authoritative;
+                        // borrowed trees need not parent to inputRoot. Check their real ancestors.
+                        Control hoverNode = target;
+                        while (hoverNode != null) {
+                            if (hoverNode.App != this || !hoverNode.StyleVisible() || hoverNode.IsDisabled()) { return true; }
+                            if (hoverNode == inputRoot) { break; }
+                            hoverNode = hoverNode.parent;
+                        }
+                        this.lastHoveredControl = target;
                         RoutedEventArgs enter = new RoutedEventArgs("PointerEnter", target, x, y, pointerType);
                         Control.RouteEvent(target, enter);
+                    }
+                }
+                // Do not clear or replace hover established by a nested Leave/Enter callback.
+                if (!isRunning || window.EventSeq() != hoverSequence
+                || inputRootGeneration != hoverRootGeneration
+                || dispatchTicket != pointerGestureTicket) { return true; }
+                Control movePopup = overlayHost != null ? overlayHost.ActiveRoot() : null;
+                if ((movePopup != null ? movePopup : rootControl) != inputRoot
+                || this.lastHoveredControl != target) { return true; }
+                if (target != null) {
+                    bool hoverEligible = this.BelongsToInputTree(target, inputRoot);
+                    Control moveNode = target;
+                    while (hoverEligible && moveNode != null) {
+                        if (moveNode.App != this || !moveNode.StyleVisible() || moveNode.IsDisabled()) { hoverEligible = false; }
+                        if (moveNode == inputRoot) { break; }
+                        moveNode = moveNode.parent;
+                    }
+                    if (!hoverEligible) {
+                        this.lastHoveredControl = null;
+                        RoutedEventArgs leave = new RoutedEventArgs("PointerLeave", target, x, y, pointerType);
+                        Control.RouteEvent(target, leave);
+                        return true;
                     }
                 }
             }
         }
 
         if (target == null) {
-            if (eventKind == 3) { this.pointerDownTarget = null; }
+            if (eventKind == 2 && window.EventButton() != 1 && focus != null) {
+                focus.ClearFocus();
+                pointerDownTarget = null;
+            }
+            if (eventKind == 3) {
+                this.pointerDownTarget = null;
+                pointerDown = false;
+                this.NoteRelease(x, y);
+            }
             return popup != null;
         }
 
@@ -441,16 +563,19 @@ public partial class App {
         // 焦点取最近的可聚焦祖先，并在路由前设置，处理程序可主动转移焦点。
         if (eventKind == 2 && window.EventButton() != 1) {
             Control node = target;
+            bool assigned = false;
             while (node != null) {
                 int id = node.WidgetId();
                 if (node.InputFocusEligible(this, inputRoot)
-                    && (((node.InputFocusCapabilities() & 1) != 0) || focus.IndexOf(id) >= 0)) {
+                    && (node.InputFocusCapabilities() & 1) != 0) {
                     focus.SetFocused(id, node);
                     routedFocusAssigned = true;
+                    assigned = true;
                     break;
                 }
                 node = node.parent;
             }
+            if (!assigned && focus != null) { focus.ClearFocus(); }
         }
         if (dispatchTicket != pointerGestureTicket) { return true; }
         Control.RouteEvent(target, e);

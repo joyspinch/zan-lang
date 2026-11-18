@@ -61,7 +61,7 @@ public partial class App {
     void MarkScope(Control n, string zs) {
         n.AddClass(zs);
         for (int i = 0; i < n.ChildCount(); i = i + 1) {
-            this.MarkScope(n.children[i], zs);
+            this.MarkScope(n.ChildAt(i), zs);
         }
     }
 
@@ -197,6 +197,76 @@ public partial class App {
             this.Scale(280), 156, 120, 250);
     }
 
+    // 与壁纸共用调用方的背景槽；只在完整帧捕获形状与阴影的透明基面。
+    // 保存区域值而非列表身份，使原地改几何也能使缓存失效。
+    WindowShapeDescription bgShapeSnapshot;
+    Theme bgShapeTheme;
+    string bgShapeSpec;
+    int bgShapeWidth;
+    int bgShapeHeight;
+    int bgShapeDpi;
+    int bgShapeMetrics;
+    int bgShapeRadius;
+    int bgShapeMode;
+    int bgShapeSlot;
+    int bgShapeGradient;
+    int bgShapeGradTop;
+    int bgShapeGradBottom;
+    int bgShapeGlass;
+
+    bool ShapeBackgroundMatches(int width, int height, int slot) {
+        if (bgShapeSnapshot == null || bgShapeTheme != theme
+        || bgShapeWidth != width || bgShapeHeight != height
+        || bgShapeDpi != dpiScale || bgShapeMetrics != metricsScale
+        || bgShapeRadius != shapeRadius || bgShapeMode != shapeMode
+        || bgShapeSlot != slot
+        || bgShapeSpec != shapeSpec
+        || bgShapeSnapshot.shadow != shapeShadow
+        || bgShapeSnapshot.offsetX != shapeOffX
+        || bgShapeSnapshot.offsetY != shapeOffY
+        || bgShapeGradient != theme.gradient
+        || bgShapeGradTop != theme.bgGradTop
+        || bgShapeGradBottom != theme.bgGradBottom
+        || bgShapeGlass != theme.glass) { return false; }
+        int count = shapeRegions == null ? 0 : shapeRegions.Count;
+        if (bgShapeSnapshot.regions.Count != count) { return false; }
+        for (int i = 0; i < count; i = i + 1) {
+            WindowShapeRegion a = bgShapeSnapshot.regions[i];
+            WindowShapeRegion b = shapeRegions[i];
+            if (a.kind != b.kind || a.x != b.x || a.y != b.y
+            || a.width != b.width || a.height != b.height
+            || a.radius != b.radius) { return false; }
+        }
+        return true;
+    }
+
+    void RememberShapeBackground(int width, int height, int slot) {
+        WindowShapeDescription snapshot = new WindowShapeDescription();
+        snapshot.shadow = shapeShadow;
+        snapshot.offsetX = shapeOffX;
+        snapshot.offsetY = shapeOffY;
+        if (shapeRegions != null) {
+            for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+                snapshot.regions.Add(shapeRegions[i].Clone());
+            }
+        }
+        bgShapeSnapshot = snapshot;
+        bgShapeTheme = theme;
+        bgShapeSpec = shapeSpec;
+        bgShapeWidth = width;
+        bgShapeHeight = height;
+        bgShapeDpi = dpiScale;
+        bgShapeMetrics = metricsScale;
+        bgShapeRadius = shapeRadius;
+        bgShapeMode = shapeMode;
+        bgShapeSlot = slot;
+        bgShapeGradient = theme.gradient;
+        bgShapeGradTop = theme.bgGradTop;
+        bgShapeGradBottom = theme.bgGradBottom;
+        bgShapeGlass = theme.glass;
+        bgSnapGen = bgThemeGen;
+    }
+
     // 将当前皮肤的窗口背景绘制到 [x,y,w,h]：渐变 +
     // 柔和色斑（用于渐变/玻璃预设，使磨砂面板能模糊
     // 真实色彩），否则为纯色 bgPrimary 填充。每次重绘缓存——
@@ -213,9 +283,29 @@ public partial class App {
         // 参数是内容区坐标（调用方按 ContentTop/ClientWidth 布局），
         // 这里忽略：轮廓与阴影带覆盖整幅表面，按画布坐标一次画完。
         if (shapeMode != 0) {
+            int width = c.Width();
+            int height = c.Height();
+            bool matches = this.ShapeBackgroundMatches(width, height, slot);
+            if (matches && bgSnapGen == bgThemeGen
+            && c.RestoreRect(0, 0, width, height, slot)) { return; }
+            // RestoreRect 只写当前 clip；SnapshotRect 却读取整个矩形。
+            // 局部 miss 时不能捕获 clip 外上一帧的控件，也不能扩张 draw clip。
+            bgSnapGen = 0;
             if (shapeShadow > 0) { this.PaintShapeShadow(); }
             this.PaintShapeFill();
+            // 异形背景只绘制上述静态形状；渐变壁纸与动态 Fx 不进入此分支。
+            // 仍记录主题渐变参数，防止切换渐变状态后复用旧主题基面。
+            if (!partialFrame) {
+                c.SnapshotRect(0, 0, width, height, slot);
+                this.RememberShapeBackground(width, height, slot);
+            }
             return;
+        }
+        if (bgShapeSnapshot != null) {
+            // 壁纸和形状可能恰好同尺寸、同槽、同主题代次，不能互相恢复。
+            bgShapeSnapshot = null;
+            bgShapeTheme = null;
+            bgSnapGen = 0;
         }
         // 原生玻璃：窗口是一张扁平的半透明薄片（在
         // BeginFrame 中清除），覆盖在 OS 模糊的桌面之上。加上柔和的从上到下
@@ -247,21 +337,29 @@ public partial class App {
                 restored = c.RestoreRect(x, y, w, h, slot);
             }
             if (!restored) {
-                if (t.gradient != 0) {
-                    c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
-                    if (t.glass != 0) {
-                        this.BackdropGlassWallpaper(x, y, w, h);
+                bgSnapGen = 0;
+                // 径向色斑可越出背景矩形；限制到快照范围，使冷帧和恢复帧
+                // 对矩形之外的像素保持一致。PushClip 与已有损伤裁剪取交集。
+                c.PushClip(x, y, w, h);
+                try {
+                    if (t.gradient != 0) {
+                        c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
+                        if (t.glass != 0) {
+                            this.BackdropGlassWallpaper(x, y, w, h);
+                        } else {
+                            this.BackdropGradientWallpaper(x, y, w, h);
+                        }
                     } else {
-                        this.BackdropGradientWallpaper(x, y, w, h);
+                        StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
+                        Style.SNormal());
+                        c.FillRect(x, y, w, h, bgStyle.BgOr(0));
                     }
-                } else {
-                    StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
-                                                  Style.SNormal());
-                    c.FillRect(x, y, w, h, bgStyle.BgOr(0));
+                    this.RenderWallpaperImage(x, y, w, h);
+                } finally { c.PopClip(); }
+                if (!partialFrame) {
+                    c.SnapshotRect(x, y, w, h, slot);
+                    bgSnapGen = bgThemeGen;
                 }
-                this.RenderWallpaperImage(x, y, w, h);
-                c.SnapshotRect(x, y, w, h, slot);
-                bgSnapGen = bgThemeGen;
             }
         } else {
             StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
@@ -279,7 +377,6 @@ public partial class App {
         if (shapeRegions == null || shapeRegions.Count == 0) {
             return;
         }
-        Canvas c = canvas;
         StyleBox shapeStyle = Style.Part(this, "windowbg", "shape", "",
                                           "", "", Style.SNormal());
         int col = shapeStyle.BgOr(0);
@@ -294,6 +391,28 @@ public partial class App {
         }
         if (col == 0) { col = 0xFF2D2D30; }
 
+        // Only a full, single-region background without shadow is an initial layer.
+        // Native also checks destination alpha; ordinary callers keep source-over.
+        int solidRegions = 0;
+        for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+            if (shapeRegions[i].kind != 3) { solidRegions = solidRegions + 1; }
+        }
+        this.PaintShapeRegions(col, !partialFrame && shapeShadow == 0 && solidRegions == 1);
+    }
+
+    internal void PaintContentMask(int x, int y, int width, int height, int color) {
+        if (width <= 0 || height <= 0 || color == 0) { return; }
+        if (shapeMode == 0 || shapeRegions == null || shapeRegions.Count == 0) {
+            canvas.FillRect(x, y, width, height, color);
+            return;
+        }
+        canvas.PushClip(x, y, width, height);
+        try { this.PaintShapeRegions(color, false); }
+        finally { canvas.PopClip(); }
+    }
+
+    private void PaintShapeRegions(int col, bool initial) {
+        Canvas c = canvas;
         for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
             WindowShapeRegion reg = shapeRegions[ri];
             if (reg.kind != 3) {
@@ -306,6 +425,8 @@ public partial class App {
                 if (w > 0 && h > 0) {
                     if (reg.kind == 2) {
                         this.FillEllipse(x, y, w, h, col);
+                    } else if (initial) {
+                        c.FillInitialShape(x, y, w, h, r, col);
                     } else if (r > 0) {
                         c.FillRoundRect(x, y, w, h, r, col);
                     } else {
@@ -472,11 +593,8 @@ public partial class App {
         // 像素以幽灵色块的形式留在画布与屏幕上。
         bool fullRepair = fxTouchedFull || fxTouched == null;
         bool ok;
-        if (App.PerfOn()) {
-            File.AppendAllText("zan_frame_perf.log",
-                "fxp full=" + (fullRepair ? 1 : 0)
-                + " n=" + (fxTouched == null ? 0 : fxTouched.Count / 4)
-                + "\n");
+        if (frameDiagnostics != null) {
+            frameDiagnostics.FxRepair(fullRepair, fxTouched == null ? 0 : fxTouched.Count / 4);
         }
         if (fullRepair) {
             ok = fc.RestoreRect(0, 0, cw, chh, App.FxSnapSlot());

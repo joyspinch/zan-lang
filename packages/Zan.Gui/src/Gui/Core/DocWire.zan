@@ -5,15 +5,14 @@ namespace Gui;
 
 // 声明式文档装配的共享底座：Form.Show 与 ChildWindow 的同一装配语义——
 // 树上处理器名收集、按名对账接线（缺失 fail-fast）、bind 路径启动期对账。
-// vm 同时是处理器方法与 bind 路径的解析对象；afterInvoke 在每次处理器
-// 触发后调用（窗各自标脏：Form 走 ModelHosts，ChildWindow 走本窗泵）。
-// 注意：FieldExists 是 POCO 反射（HasField），JsonValue 模型的键不是
+// vm 同时是处理器方法与 bind 路径的解析对象；ModelBinder 在事件返回后统一标脏。
+// FieldExists 校验 POCO 字段与受支持字典键；JsonValue 模型的键不是
 // 反射字段——调用方须对 JsonValue 模型跳过 CheckBinds。
 public class DocWire {
     // 按名自动接线：树上处理器名逐个对 vm HasMethod（缺失即 exit 1 列出），
     // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中），
-    // 每次触发后调 afterInvoke 标脏。返回值恒 true（对账失败不返回）。
-    public static bool AutoWire(Control tree, object vm, ModelBinder b, Action afterInvoke) {
+    // 每次触发后由 ModelBinder 统一标脏。返回值恒 true（对账失败不返回）。
+    public static bool AutoWire(Control tree, object vm, ModelBinder b) {
         List<string> names = new List<string>();
         DocWire.CollectHandlers(tree, names);
         List<string> missing = new List<string>();
@@ -22,8 +21,8 @@ public class DocWire {
             if (b.HasHandler(h)) { continue; }
             if (!vm.HasMethod(h)) { missing.Add(h); continue; }
             string evt = h;
-            b.Handle(h, () => { vm.Invoke(evt); afterInvoke(); });
-            b.HandleArg(h, (string s) => { vm.Invoke(evt, s); afterInvoke(); });
+            b.Handle(h, () => { vm.Invoke(evt); });
+            b.HandleArg(h, (string s) => { vm.Invoke(evt, s); });
         }
         if (missing.Count > 0) {
             string list = "";
@@ -57,35 +56,22 @@ public class DocWire {
             string h = c.events[i].val;
             if (h != "" && !names.Contains(h)) { names.Add(h); }
         }
-        for (int j = 0; j < c.children.Count; j++) {
-            DocWire.CollectHandlers(c.children[j], names);
+        for (int j = 0; j < c.ChildCount(); j++) {
+            DocWire.CollectHandlers(c.ChildAt(j), names);
         }
     }
 
     public static void CollectBinds(Control c, object vm, List<string> bad) {
         // 模板行内绑定以行项为作用域，对根模型校验会假失败——子树跳过。
         if (c.Kind() == "template") { return; }
-        if (c.bindPath != "" && !DocWire.FieldExists(vm, c.bindPath)) {
-            bad.Add(c.bindPath);
-        }
-        if (DocWire.IsPlainPath(c.bindIf) && !DocWire.FieldExists(vm, c.bindIf)) {
-            bad.Add(c.bindIf);
-        }
-        if (DocWire.IsPlainPath(c.bindDisabled) && !DocWire.FieldExists(vm, c.bindDisabled)) {
-            bad.Add(c.bindDisabled);
-        }
-        // :prop="field"（如 :options）同样启动期对账：字面量/关键字/表达式跳过，
-        // 否则拼错的字段名只会静默渲染成空。
-        if (c.bindProps != null) {
-            for (int k = 0; k < c.bindProps.Count; k++) {
-                string ex = c.bindProps[k].expr;
-                if (DocWire.IsFieldRef(ex) && !DocWire.FieldExists(vm, ex)) {
-                    bad.Add(ex);
-                }
+        if (c.bindings != null) {
+            for (int i = 0; i < c.bindings.Count; i = i + 1) {
+                string path = c.bindings[i].path;
+                if (!DocWire.FieldExists(vm, path)) { bad.Add(path); }
             }
         }
-        for (int j = 0; j < c.children.Count; j++) {
-            DocWire.CollectBinds(c.children[j], vm, bad);
+        for (int j = 0; j < c.ChildCount(); j++) {
+            DocWire.CollectBinds(c.ChildAt(j), vm, bad);
         }
     }
 
@@ -122,8 +108,8 @@ public class DocWire {
     static void CollectMounts(Control c, List<Control> slots) {
         if (c.Kind() == "template") { return; }
         if (c.bindMount != "") { slots.Add(c); }
-        for (int j = 0; j < c.children.Count; j++) {
-            DocWire.CollectMounts(c.children[j], slots);
+        for (int j = 0; j < c.ChildCount(); j++) {
+            DocWire.CollectMounts(c.ChildAt(j), slots);
         }
     }
 
@@ -138,6 +124,17 @@ public class DocWire {
     }
 
     public static bool FieldExists(object vm, string path) {
+        // Match ModelBinder's scalar dictionary contract: a key is the whole
+        // binding path, including dots; it is not a reflected POCO field.
+        if (vm is Dictionary<string, string>) {
+            return ((Dictionary<string, string>)vm).ContainsKey(path);
+        }
+        if (vm is Dictionary<string, double>) {
+            return ((Dictionary<string, double>)vm).ContainsKey(path);
+        }
+        if (vm is Dictionary<string, bool>) {
+            return ((Dictionary<string, bool>)vm).ContainsKey(path);
+        }
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(vm, path, out leaf);
         return target != null && target.HasField(leaf);

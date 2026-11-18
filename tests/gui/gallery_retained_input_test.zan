@@ -1,0 +1,124 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+class GalleryRetainedInputTest {
+    static void Check(bool ok, string text) { if (!ok) { throw new Exception(text); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Click(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "real retained control has bounds");
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0); Drain(app);
+    }
+    static Control Command(Ribbon ribbon) { return ribbon.ChildAt(1).ChildAt(0).ChildAt(0).ChildAt(0); }
+    static void CustomFrames() {
+        App app = App.CreateOffscreen("Gallery custom frame contract", 800, 600);
+        GalleryRetainedFixture fixture = new GalleryRetainedFixture(); fixture.app = app;
+        Designer designer = new Designer();
+        GalleryRetainedInput owner = new GalleryRetainedInput(app, designer, new SignalInt(0), fixture.Prepare);
+        fixture.owner = owner;
+        Button button = new Button("Demo action");
+        button.Click.Add(fixture.DemoCommand);
+        owner.AddDemo("test", button); fixture.demo = owner.Demo("test");
+        Check(button.bw == 0, "unprepared demo starts without geometry");
+        bool ready = GalleryFrame.Render(app, fixture.Paint);
+        Check(!ready && fixture.paints == 0 && app.needsRedraw && !app.ContinuePreparedFrame(),
+        "first root installation aborts before paint/present and requests the next frame");
+        ready = GalleryFrame.Render(app, fixture.Paint);
+        Check(ready, "second custom frame prepares after root installation without input");
+        Check(button.bw > 0 && button.bh > 0 && fixture.paints == 1,
+        "first custom frame lays out and paints the actual demo");
+        Check(app.hitTester.HitTest(button.bx + button.bw / 2, button.by + button.bh / 2) >= 0,
+        "prepared demo registers a real hitregion");
+        Click(app, button); Check(fixture.commands == 1, "prepared demo dispatches actual retained input");
+        fixture.retireDuringPaint = true;
+        if (GalleryFrame.Render(app, fixture.Paint)) { fixture.Pick(); }
+        Check(fixture.picks == 0 && !app.ContinuePreparedFrame(),
+        "retired callback ticket rejects frame tail and picker launch");
+        app.StopLoop(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void SearchBeforePaint() {
+        App app = App.CreateOffscreen("Gallery navigation input", 800, 600);
+        GalleryRetainedFixture fixture = new GalleryRetainedFixture();
+        fixture.ribbonShown = false; fixture.searchShown = true;
+        GalleryRetainedInput owner = new GalleryRetainedInput(app, new Designer(), new SignalInt(0), fixture.Prepare);
+        fixture.owner = owner;
+        Input search = new Input("Search components"); search.SetProp("style", "height:30px;");
+        owner.AddDemo("navigation-search", search);
+        Check(search.bw == 0, "navigation starts without painted geometry");
+        app.ProcessOffscreenInput(2, 30, 90, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 30, 90, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 84, 0, 0); Drain(app);
+        Check(search.GetText() == "T" && fixture.paints == 0,
+        "first click/char edits prepared navigation search before any Paint");
+        app.ProcessOffscreenInput(2, 30, 90, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == search && app.focus.focusedControl == search,
+        "navigation search owns real focus and pointer selection capture");
+        fixture.searchShown = false;
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0); Drain(app);
+        Check(app.GetCapturedPointer() != search && app.focus.focusedControl != search,
+        "hidden drawer immediately releases search focus and capture during preparation");
+        Check(search.GetText() == "T" && (app.rootControl == null || !app.rootControl.ContainsInputControl(search)),
+        "hidden drawer releases search input and ignores characters");
+        fixture.searchShown = true; Click(app, search);
+        app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0); Drain(app);
+        Check(search.GetText() == "TA", "first input after showing navigation restores its existing scope");
+        owner.Retire();
+        app.ProcessOffscreenInput(6, 0, 0, 0, 88, 0, 0); Drain(app);
+        Check(search.GetText() == "TA" && (app.rootControl == null || !app.rootControl.ContainsInputControl(search)),
+        "retired navigation releases focused input and cannot receive characters");
+        app.StopLoop(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+    }
+    static void Main() {
+        ControlBootstrap.Install();
+        CustomFrames();
+        SearchBeforePaint();
+        App app = App.CreateOffscreen("gallery retained input", 1200, 800);
+        Designer designer = new Designer(); GalleryRetainedFixture fixture = new GalleryRetainedFixture();
+        SignalInt tab = new SignalInt(2);
+        GalleryRetainedInput owner = new GalleryRetainedInput(app, designer, tab, fixture.Prepare); fixture.owner = owner;
+        GalleryRibbonView view = owner.RibbonView(); Ribbon ribbon = view.Root();
+        ribbon.CommandClicked.Add(fixture.Command);
+        // Coordinates are known before any Paint or explicit first preparation.
+        app.ProcessOffscreenInput(2, 40, 32, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, 40, 32, 0, 0, 0, 0); Drain(app);
+        Check(tab.Get() == 0, "first input prepares and clicks tab without registering a late participant");
+        app.ProcessOffscreenInput(1, 100, 32, 0, 0, 0, 0);
+        Control command = Command(ribbon); Click(app, command);
+        Check(fixture.commands == 1, "retained Gallery command dispatches before Paint");
+        app.BeginOffscreenFrame(); view.Render(app); app.EndOffscreenFrame();
+        app.BeginOffscreenFrame(); view.Render(app); app.EndOffscreenFrame();
+        Check(Command(ribbon) == command && fixture.commands == 1, "paint preserves command identity and does not replay action");
+        fixture.label = "Translated"; app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(Command(ribbon) != command && ribbon.tabs[0] == "Translated", "same-tab model changes rebuild before input");
+        command = Command(ribbon); Click(app, command);
+        fixture.ribbonShown = false; app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(view.View().IsActive() && (app.rootControl == null || !app.rootControl.ContainsInputControl(command)),
+        "hidden Gallery Ribbon keeps scope and retires hosted input");
+        fixture.ribbonShown = true; Click(app, command);
+        Check(fixture.commands == 3 && Command(ribbon) == command, "first input after show uses retained scope and tree");
+        fixture.clip = new Rect(20, 20, 760, 12);
+        int count = fixture.commands; Click(app, command);
+        Check(fixture.commands == count, "Ribbon command cannot hit outside current viewport clip");
+        fixture.clip = new Rect(20, 20, 760, 180); fixture.ribbonShown = false; fixture.designerShown = true;
+        app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Control inspector = designer.InspectorInputRoot();
+        Check(inspector != null && inspector.visible && inspector.bw > 0, "Gallery prepares current embedded Inspector region");
+        fixture.designerShown = false; app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(!inspector.visible, "switching away suspends Designer Inspector");
+        fixture.designerShown = true; app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(designer.InspectorInputRoot() == inspector && inspector.visible, "Designer show reuses its early registration");
+        Designer replacement = new Designer(); owner.ReplaceDesigner(replacement);
+        Check(designer.InspectorInputRoot() == null && replacement.InspectorInputRoot() != null,
+        "explicit replacement retires old Designer and registers replacement before input");
+        UiViewScope scope = view.View(); app.StopLoop();
+        Check(replacement.InspectorInputRoot() == null && !scope.IsActive(), "Stop retires all Gallery owned views");
+        owner.Retire(); app.SetRootControl(null); Drain(app); app.canvas.Destroy();
+        Console.WriteLine("gallery retained input ok");
+    }
+}

@@ -6,32 +6,34 @@ namespace Gui.Widget;
 // 折叠面板（手风琴）：纯 Flex 纵向容器，由 CollapseItem 声明式子节点构成。
 // 彻底物理消除手算高度、Canvas.DrawText、Canvas.FillRect 与逐帧手动 Arrange。
 public class Collapse : Control {
-    public SignalInt open;
     public Binding<int> Active;
-    public Binding<int> data { get { return Active; } set { Active = value; } }
     public UiEvent Change;
     public bool Accordion;
+    public string ArrowPlacement = "left";
     private bool updatingItems;
+    private int appliedActive = -1;
 
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 1; } // flex-direction: column
 
-    private void InitCollapse(SignalInt m) {
+    private void InitCollapse(Binding<int> active) {
         this.InitControl("collapse", 1);
-        open = m != null ? m : new SignalInt(0 - 1);
+        Active = -1;
+        if (active != null) { Active = active; }
         Accordion = true;
         wiresOwnEvents = true;
         Change = new UiEvent();
     }
 
     public Collapse() { InitCollapse(null); }
-    public Collapse(SignalInt m) { InitCollapse(m); }
+    public Collapse(Binding<int> active) { InitCollapse(active); }
 
     public void AddItem(CollapseItem item) {
-        if (item == null || this.children.Contains(item)) { return; }
-        if (open != null && open.Get() == this.children.Count) {
+        if (item == null || (this.IndexOf(item) >= 0)) { return; }
+        if (Active.Get() == this.ChildCount()) {
             item.SetExpanded(true);
         }
+        item.SetArrowPlacement(ArrowPlacement);
         CollapseAction action = new CollapseAction(this, item);
         item.Toggle.Add(action.Toggle);
         base.Add(item);
@@ -41,22 +43,22 @@ public class Collapse : Control {
     public void OnItemToggled(CollapseItem item) {
         if (updatingItems || item == null) { return; }
         int idx = 0 - 1;
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            if (this.children[i] == item) { idx = i; }
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) == item) { idx = i; }
         }
         if (idx < 0) { return; }
         updatingItems = true;
         try {
             if (item.IsExpanded && Accordion) {
-                for (int i = 0; i < this.children.Count; i = i + 1) {
-                    if (this.children[i] is CollapseItem && i != idx) {
-                        ((CollapseItem)this.children[i]).SetExpanded(false);
+                for (int i = 0; i < this.ChildCount(); i = i + 1) {
+                    if (this.ChildAt(i) is CollapseItem && i != idx) {
+                        ((CollapseItem)this.ChildAt(i)).SetExpanded(false);
                     }
                 }
             }
             int value = item.IsExpanded ? idx : (0 - 1);
-            if (open != null) { open.Set(value); }
-            if (Active != null) { Active.Set(value); }
+            Active.Set(value);
+            appliedActive = value;
         } finally {
             updatingItems = false;
         }
@@ -92,10 +94,10 @@ public class Collapse : Control {
         bool wasUpdating = updatingItems;
         updatingItems = true;
         try {
-            open.Set(idx);
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                if (this.children[i] is CollapseItem) {
-                    ((CollapseItem)this.children[i]).SetExpanded(i == idx);
+            appliedActive = idx;
+            for (int i = 0; i < this.ChildCount(); i = i + 1) {
+                if (this.ChildAt(i) is CollapseItem) {
+                    ((CollapseItem)this.ChildAt(i)).SetExpanded(i == idx);
                 }
             }
         } finally {
@@ -105,9 +107,31 @@ public class Collapse : Control {
 
     public override void SyncBinding() {
         base.SyncBinding();
-        if (Active == null) { return; }
+        this.SyncArrowPlacement();
         int cur = Active.Get();
-        if (cur != open.Get()) { this.ApplyActiveIndex(cur); }
+        if (cur != appliedActive) { this.ApplyActiveIndex(cur); }
+    }
+
+    private string appliedArrowPlacement = "left";
+    private void SyncArrowPlacement() {
+        string next = ArrowPlacement == "right" ? "right" : "left";
+        if (appliedArrowPlacement == next) { return; }
+        appliedArrowPlacement = next;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (this.ChildAt(i) is CollapseItem) { ((CollapseItem)this.ChildAt(i)).SetArrowPlacement(next); }
+        }
+    }
+
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        Collapse copy = (Collapse)target;
+        copy.RemoveAll();
+        copy.Active.Set(0 - 1);
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control next = clone(this.ChildAt(i));
+            if (next != null) { copy.Add(next); }
+        }
+        copy.Active.Set(Active.Get());
+        copy.SyncArrowPlacement();
     }
 
     public override string Kind() { return "Collapse"; }
@@ -128,22 +152,68 @@ public class Collapse : Control {
         base.BindEventS(evt, a);
     }
 
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec act = PropSpec.Int("active", "Active");
-        act.num = Active;
+        ps.Add(PropSpec.Text("titles", "Panel titles (comma separated)").ViaExtra());
+        ps.Add(PropSpec.Text("bodies", "Panel bodies (comma separated)").ViaExtra());
+        PropSpec arrow = PropSpec.Enum("arrowPlacement", "Arrow placement", new List<string>());
+        arrow.Option("left"); arrow.Option("right");
+        ps.Add(arrow.ViaExtra());
+        ps.Add(PropSpec.Bool("expandable", "Allow multiple panels open").ViaExtra());
+        PropSpec act = PropSpec.Int("active", "Active").DefaultBinding();
+        act.Field("Active", 1);
         act.Also("data");
         act.Also("value");
         ps.Add(act);
         PropSpec acc = PropSpec.Bool("accordion", "Accordion");
-        acc.flag = Accordion;
+        acc.Field("Accordion", 2);
         ps.Add(acc);
         return ps;
     }
 
+    public override string GetExtra(string key) {
+        if (key == "arrowPlacement") { return ArrowPlacement; }
+        if (key == "expandable") { return PropSpec.Flag(!Accordion); }
+        if (key != "titles" && key != "bodies") { return base.GetExtra(key); }
+        List<string> values = new List<string>();
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            if (!(this.ChildAt(i) is CollapseItem)) { continue; }
+            CollapseItem item = (CollapseItem)this.ChildAt(i);
+            values.Add(key == "titles" ? item.Title : (item.Content != null ? item.Content.GetProp("text") : ""));
+        }
+        return string.Join(",", values);
+    }
+
+    public override bool SetExtra(string key, string val) {
+        if (key == "expandable") { Accordion = !PropSpec.IsOn(val); return true; }
+        if (key == "arrowPlacement") {
+            if (val != "left" && val != "right") { return true; }
+            ArrowPlacement = val;
+            this.SyncArrowPlacement();
+            return true;
+        }
+        if (key != "titles" && key != "bodies") { return base.SetExtra(key, val); }
+        // Empty scalar replay on an empty tree must not synthesize a panel during clone.
+        if (val == "" && this.ChildCount() == 0) { return true; }
+        List<string> values = val.Split(",");
+        int ordinal = 0;
+        for (int i = 0; i < this.ChildCount() && ordinal < values.Count; i = i + 1) {
+            if (!(this.ChildAt(i) is CollapseItem)) { continue; }
+            CollapseItem item = (CollapseItem)this.ChildAt(i);
+            if (key == "titles") { item.SetProp("title", values[ordinal]); }
+            else { item.MountSlot("body", new Label(values[ordinal])); }
+            ordinal = ordinal + 1;
+        }
+        while (ordinal < values.Count) {
+            this.AddPanel(key == "titles" ? values[ordinal] : "", key == "bodies" ? values[ordinal] : "");
+            ordinal = ordinal + 1;
+        }
+        return true;
+    }
+
     public override string GetProp(string key) {
         if (key == "active" || key == "data" || key == "value") {
-            return Convert.ToString(Active != null ? Active.Get() : open.Get());
+            return Convert.ToString(Active.Get());
         }
         return base.GetProp(key);
     }
@@ -151,7 +221,7 @@ public class Collapse : Control {
     public override void SetProp(string key, string val) {
         if (key == "active" || key == "data" || key == "value") {
             int idx = Convert.ToInt32(val);
-            if (Active != null) { Active.Set(idx); }
+            Active.Set(idx);
             this.ApplyActiveIndex(idx);
             return;
         }

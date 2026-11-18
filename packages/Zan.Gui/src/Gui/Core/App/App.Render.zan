@@ -5,28 +5,57 @@ namespace Gui;
 
 public partial class App {
     void RenderFrameOverlays() {
+        if (!this.ContinuePreparedFrame()) { return; }
         RunOverlays();
+        if (!this.ContinuePreparedFrame()) { return; }
         Widget.Tooltip.Flush(this);
+        if (!this.ContinuePreparedFrame()) { return; }
         if (presentTails != null) {
             for (int i = 0; i < presentTails.Count; i = i + 1) {
+                if (!this.ContinuePreparedFrame()) { return; }
                 presentTails[i](this);
+                if (!this.ContinuePreparedFrame()) { return; }
             }
+        }
+        // Form/ChildWindow own their model phases. Prepared custom hosts commit
+        // here so native presentation and offscreen snapshots share one boundary.
+        if (preparedHostFrameValid && preparedHostTicket == null) {
+            if (!this.WriteBackModelHosts()) { this.AbortPreparationFrame(); return; }
+            if (!this.ContinuePreparedFrame()) { return; }
         }
     }
 
     void PresentFrame() {
+        this.TraceFullPresent(21, true);
+        if (!this.ContinuePreparedFrame()) {
+            this.TraceFullPresent(22, true);
+            return;
+        }
         if (window.GetHandle() == 0) { this.EndOffscreenFrame(); return; }
         int perfT0 = 0;
-        if (App.PerfOn()) { perfT0 = Window.GetTickMs(); }
+        if (App.PerfOn()) { perfT0 = Window.RawTickMs(); }
         // 最后绘制并分发弹层，使其位于所有内容之上并拥有
         // 最顶层命中区域（框架拥有的遮罩/层叠层）。
+        this.TraceFullPresent(23, true);
         this.RenderFrameOverlays();
+        this.TraceFullPresent(23, false);
+        if (!this.ContinuePreparedFrame()) {
+            this.TraceFullPresent(22, true);
+            return;
+        }
         // 弹层落定之后再结算原生浮层：此刻本帧所有拦截区都已注册，
         // 能算出网页视图真正该露出的区域（菜单/对话框压住的部分被
         // 裁掉），否则原生层会盖住它上面的一切。
+        this.TraceFullPresent(24, true);
         NativeLayer.Flush(this);
+        this.TraceFullPresent(24, false);
+        if (!this.ContinuePreparedFrame()) {
+            this.TraceFullPresent(22, true);
+            return;
+        }
+        this.TraceFullPresent(25, true);
         int perfT1 = 0;
-        if (App.PerfOn()) { perfT1 = Window.GetTickMs(); }
+        if (App.PerfOn()) { perfT1 = Window.RawTickMs(); }
         // 标志性皮肤动画：快照完成后的帧（槽位 7），然后
         // 在其上合成特效层。之后的纯特效 tick 恢复
         // 快照并重新合成（FxPresent），无需重新渲染。
@@ -82,9 +111,7 @@ public partial class App {
                 fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
                                 App.FxSnapSlot());
                 fxSnapValid = true;
-                if (App.PerfOn()) {
-                    File.AppendAllText("zan_frame_perf.log", "fframe snap=1\n");
-                }
+                if (frameDiagnostics != null) { frameDiagnostics.Snapshot(); }
             }
             BackdropFx.PaintFx(this, fc, this.EffectiveFx(), 0, 0, fc.Width(), fc.Height(),
                               fxNow, theme, dpiScale);
@@ -107,10 +134,12 @@ public partial class App {
         }
         int perfPreMs = 0;
         if (App.PerfOn()) {
-            perfPreMs = Window.GetTickMs();
+            perfPreMs = Window.RawTickMs();
             perfOverlayMs = perfOverlayMs + (perfT1 - perfT0);
             perfFxMs = perfFxMs + (perfPreMs - perfT1);
         }
+        this.TraceFullPresent(25, false);
+        this.TraceFullPresent(26, true);
         // 计数器每帧都读，否则整窗帧会把上一帧的欠账带过来。
         int blurMiss = Canvas.TakeBlurPartialMiss();
         if (partialFrame) {
@@ -142,14 +171,8 @@ public partial class App {
             } else {
                 blurMissStreak = 0;
             }
-            if (App.PerfOn()) {
-                File.AppendAllText("zan_frame_perf.log",
-                    "pframe present=" + Convert.ToString(presentX) + ","
-                    + Convert.ToString(presentY) + "+"
-                    + Convert.ToString(presentW) + "x"
-                    + Convert.ToString(presentH)
-                    + " miss=" + Convert.ToString(blurMiss)
-                    + "\n");
+            if (frameDiagnostics != null) {
+                frameDiagnostics.Partial(presentX, presentY, presentW, presentH, blurMiss);
             }
             window.PresentDirty(presentX, presentY, presentW, presentH);
         } else {
@@ -167,10 +190,15 @@ public partial class App {
             lastFullFrameMs = Window.GetTickMs();
         }
         this.SettleGlassRefresh();
-        // 完整帧结束时刷新事件解析基准：条带帧不刷新，条带外沿用
-        // 最近一次整帧的命中区（见 HitTester.KeepFullSnapshot）。
-        if (!partialFrame) { hitTester.KeepFullSnapshot(); }
+        this.TraceFullPresent(26, false);
+        if (!this.ContinuePreparedFrame()) {
+            this.TraceFullPresent(22, false);
+            return;
+        }
+        this.TraceFullPresent(27, true);
         window.Present(canvas);
+        this.TraceFullPresent(27, false);
+        this.TraceFullPresent(28, true);
         if (fxPagePending) {
             fxPagePending = false;
             if (partialFrame && this.FxActive() && window.IsVisible()) {
@@ -194,16 +222,18 @@ public partial class App {
         } else {
             wheelReplayArmed = false;
         }
-        UiDriver.NotifyPresented(this);
+        this.TraceFullPresent(28, false);
+        this.TraceFullPresent(21, false);
+        this.AutomationPresented();
         if (App.PerfOn()) {
-            int endMs = Window.GetTickMs();
+            int endMs = Window.RawTickMs();
             this.RecordFramePerf(perfBeginMs, perfPreMs, endMs, partialFrame);
         }
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
         // 将悬停/焦点/按下快照为本帧的"上一帧"基线，
         // 使下一渲染帧能检测进入/离开和焦点/失焦转换
-        focus.RollFrame();
+        focus.UpdateImeSession();
         // 滚轮把内容挪到指针底下的那一帧在出完帧后重算悬停目标：
         // 此时命中区已按滚动后的新位置注册完毕，重算才是准的。
         // （放在 PresentFrame 而不是 SafeFrame/RunLoop——自托管应用
@@ -236,12 +266,15 @@ public partial class App {
 
 
     void BeginFrame() {
+        this.CheckPreparationFrameEntry();
         displayAnimationPending = false;
         frameCadence.SetRate(window.RefreshRate());
         frameCadence.Begin(Stopwatch.GetMicroseconds());
         if (window.GetHandle() == 0) { this.BeginOffscreenFrame(); return; }
         this.SyncNativeDpi();
-        if (App.PerfOn()) { perfBeginMs = Window.GetTickMs(); }
+        // Animation may be frozen for pixel comparisons; measured work uses
+        // the independent monotonic clock so frozen frames retain real cost.
+        if (App.PerfOn()) { perfBeginMs = Window.RawTickMs(); }
         if (App.PerfOn()) { Canvas.TextStatEnable(true); }
         // 在任何绘制之前应用新选的内置皮肤，
         // 使整个窗口（内容 + 框架）本帧以新主题重绘。
@@ -296,7 +329,6 @@ public partial class App {
         wheelCapH = 0;
         wheelClaimSeen = false;
         wheelConsumed = false;
-        tabHoldId = -1;
         inputBlockPrevious = blocksInputBelow;
         blocksInputBelow = false;
         menuBlockPrevious = menuBlock;
@@ -307,7 +339,6 @@ public partial class App {
         // ProcessEvent（按下置位）之后、释放帧的 ProcessEvent（读取）
         // 之前各跑一次，复位会把跨帧手势状态抹掉。写入点只有
         // kind==2 主键按下分支（每次按下无条件重写）。
-        hitTester.Clear();
         glassRects.Clear();
         window.ClearHitGuards();
         focus.ResetIds();
@@ -324,9 +355,7 @@ public partial class App {
         // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
         // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
         // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
-        // 滚轮条带（TakeDueWheelRect 声明）不受此限：滚轮不发布点击
-        // 目标（ClickAvailable 只认 kind==3），条带外的控件不需要本
-        // 帧注册命中区，HitTester 上一帧快照继续有效。
+        // 滚轮条带同样不参与命中归属：输入始终命中当前对象树。
         if (inputNeedsFrame) { partialPending = false; }
         if (partialPending && dmgW > 0 && dmgH > 0) {
             partialFrame = true;
@@ -428,7 +457,11 @@ public partial class App {
     // 按注册顺序绘制并分发本帧注册的所有遮罩。
     // 在主渲染之后、PresentFrame 之前调用一次。
     void RunOverlays() {
+        if (!this.ContinuePreparedFrame()) { return; }
+        Widget.Layer.PaintRetained(this);
+        if (!this.ContinuePreparedFrame()) { return; }
         for (int i = 0; i < overlays.Count; i = i + 1) {
+            if (!this.ContinuePreparedFrame()) { return; }
             OverlayPopup p = overlays[i];
             // 每个浮层自成一段独立作用域：一个下拉打开时会多领两个
             // 拦截区 id，若共用一条递增序号，排在它后面的
@@ -436,12 +469,17 @@ public partial class App {
             // 使用作用域 Hash 栈消除 950000 魔数号段，各浮层完全隔离。
             focus.PushId("App.Overlay");
             focus.PushId(i);
-            p.PaintOverlay(this);
-            focus.PopId();
-            focus.PopId();
+            try { p.PaintOverlay(this); }
+            finally {
+                focus.PopId();
+                focus.PopId();
+            }
+            if (!this.ContinuePreparedFrame()) { return; }
         }
+        if (!this.ContinuePreparedFrame()) { return; }
         if (this.overlayHost != null) {
             this.overlayHost.RenderAll(this);
+            if (!this.ContinuePreparedFrame()) { return; }
         }
     }
 
@@ -463,8 +501,7 @@ public partial class App {
         // 渲染，因此读取上一帧的拦截器；
         // 拦截器自身主体（本帧已铺设遮罩）通过
         // BlockerAt 排除，以保持可交互。
-        return hitTester.PrevBlockerAt(mouseX, mouseY)
-            && !hitTester.BlockerAt(mouseX, mouseY);
+        return overlayHost != null && overlayHost.HasActive();
     }
 
     // 注册一个吞掉 [x,y,w,h] 区域点击的命中区域，
@@ -475,7 +512,6 @@ public partial class App {
     // 处处优先。返回拦截器 id。
     int BlockHitsRect(int x, int y, int w, int h) {
         int id = focus.AllocId();
-        hitTester.RegisterRect(id, x, y, w, h, -1);
         return id;
     }
 
@@ -509,19 +545,13 @@ public partial class App {
         return this.BlockHitsBelow();
     }
 
-    // 右键的命中目标。菜单的遮罩不拥有次要按钮，所以这里越过
-    // 阻挡区，解析到其下方的控件。
-    int RightHitTest(int px, int py) {
-        if (menuBlockPrevious) { return hitTester.HitTestBelowBlockers(px, py); }
-        return hitTester.HitTest(px, py);
-    }
-
     int BlockHitsBelow() {
         bool firstBlock = !blocksInputBelow;
         blocksInputBelow = true;
         int id = BlockHitsRect(0, 0, canvas.Width(), canvas.Height());
         hitOnlyBlockers.Add(id);
-        if (firstBlock && !inputBlockPrevious) {
+        // Snapshot paint keeps modal occlusion without changing real input ownership.
+        if (firstBlock && !inputBlockPrevious && snapshotInputSilenceDepth == 0) {
             focus.SetFocused(id);
             // 模态在本帧出现，因此正在
             // 分发的点击（打开它的那次）已消耗：否则，
@@ -570,25 +600,6 @@ public partial class App {
     // 幂等，重复调用无害。桌面无作用（滚轮本就恒归控件）。
     void ClaimDrag() { dragClaimId = focus.pressedId; }
 
-    // 游戏宿主每帧挂住的事件 kind（HoldEventKind 设置，0 = 本帧
-    // 无事件）与所属窗口。普通 GUI 应用从不挂住，恒为未武装。
-    int holdEvKind;
-    nint holdEvHwnd;
-    bool holdEvArmed;
-
-    // 游戏宿主（GuiHost.Run）每帧排空事件后调用。排空循环的最后
-    // 一次"队列已空"轮询会经 ClearEvent 清掉原生"正在处理的事件"
-    // 状态，而保留树控件（HUD 挂件、HTML 场景按钮）在渲染期才经
-    // EventKind() 读它——不挂住的话 Ui.Clicked 的 kind==3 永远
-    // 不成立，标准控件在游戏窗口里收不到任何点击。挂住值只对
-    // 本帧渲染期有效：宿主下一帧会用新值（无事件帧挂 0）覆盖，
-    // 不会泄漏到后续帧。
-    void HoldEventKind(int kind) {
-        this.holdEvKind = kind;
-        this.holdEvHwnd = this.window.GetHandle();
-        this.holdEvArmed = true;
-    }
-
     // ---- 键盘事件的「一次性消费」 -------------------------------------
     // 原生事件槽里的键盘事件（kind 4 按下 / 5 抬起 / 6 字符）一直留到
     // 下一次轮询为止；这段时间里窗口可能渲染多帧（子窗几乎每帧都脏，
@@ -619,8 +630,6 @@ public partial class App {
     // 投递给兄弟或子窗口的点击和按键，并在 id 恰好
     // 对齐时触发自己的控件。每个窗口拥有的表面
     // 都必须询问其 App，而非共享的原生状态。
-    // 原生状态已被清（排空后的空轮询）且宿主挂住了本帧事件时，
-    // 回退到挂住值（见 HoldEventKind）。
     // 键盘事件是否已被控件消费掉（只有 kind 4/5/6 受此闸门约束；
     // 鼠标/滚轮事件另有 ClaimClick 之类的闸门）。
     bool KeyBlocked(int kind) {
@@ -628,18 +637,13 @@ public partial class App {
     }
 
     int EventKind() {
+        if (snapshotInputSilenceDepth > 0) { return 0; }
         if (window.GetHandle() == 0) {
             int kind0 = this.NormalizedKind();
             return this.KeyBlocked(kind0) ? 0 : kind0;
         }
         nint evh = Window.EventHwnd();
-        if (evh != window.GetHandle()) {
-            if (evh == 0 && this.holdEvArmed
-                && this.holdEvHwnd == window.GetHandle()) {
-                return this.holdEvKind;
-            }
-            return 0;
-        }
+        if (evh != window.GetHandle()) { return 0; }
         int kind = this.NormalizedKind();
         /* 已被控件消费掉的键盘事件不再重复投递（见 ClaimKey）。 */
         return this.KeyBlocked(kind) ? 0 : kind;
@@ -662,33 +666,15 @@ public partial class App {
     // 在 3；不锁定的话按钮会在每个动画帧重新触发。同一帧内
     // 多个表面照常都能读到（绑定只记帧序，不做独占）。
     bool ClickFrameCurrent() {
+        // Retained ownership belongs to the event sequence, across draw frames.
+        if (routedWindowSequenceValid && routedWindowSequence == window.EventSeq()
+                && routedWindowHandled) { return false; }
         if (this.clickSeenSeq < 0) { this.clickSeenSeq = this.frameSeq; }
         return this.clickSeenSeq == this.frameSeq;
     }
 
     // 当前帧序号（BeginFrame 递增）。诊断用。
     int FrameSeq() { return frameSeq; }
-
-    // 按下是否落在阻挡区（浮层遮罩/模态变暗层）上。
-    // 判据必须看「按下命中的那个区域是不是阻挡区」，而不是
-    // 「有没有命中任何东西」：AnchorAt 解析上一帧快照时并不跳过
-    // wtype==-1 的遮罩（HitTester.zan 的 skip 只在 below=true 时
-    // 生效），所以按在遮罩上时 hitId 就是遮罩自己的 id（>=0），
-    // `hitId < 0` 恒为假——pressOnBlocker 形同虚设，「按外部关闭」
-    // 的浮层在按下帧关掉自己后（遮罩随之不在该帧快照里），释放
-    // 照常解析成下层控件的点击目标，同一次手势就先关菜单再点穿
-    // 到后面的内容（下拉/菜单/抽屉/layer 的「点击穿透」）。
-    // 两段判据：命中了遮罩（AnchorTypeOf 为 -1）算按在遮罩上；
-    // 什么都没命中但当前帧有遮罩盖住该点（遮罩比快照新）也算。
-    bool PressHitBlocker(int hitId, int px, int py) {
-        if (hitId >= 0) { return hitTester.AnchorTypeOf(0) == 0 - 1; }
-        return hitTester.BlockerAt(px, py);
-    }
-
-    // 本次释放所属的手势是否按在阻挡区上。跨越按下帧与释放帧
-    // 保持（BeginFrame 不复位，见字段注释）。Ui.Clicked 据此拒绝
-    // 向被遮罩的控件投递这次点击；ClickAvailable 另有同源的一道。
-    bool PressOnBlocker() { return pressOnBlocker; }
 
     bool ClickAvailable() {
         if (this.EventKind() != 3 || clickClaimed) { return false; }
@@ -708,18 +694,6 @@ public partial class App {
 
     // 当前释放是否已被某表面认领（见 ClaimClick）。
     bool ClickClaimed() { return clickClaimed; }
-
-    // 当前点击（mouse-up）落到的控件 id，无则 -1。
-    int ClickTarget() { return hitTester.AnchorIdOf(1); }
-
-    // 当前按下（mouse-down）落到的控件 id，无则 -1。
-    int PressTarget() { return hitTester.AnchorIdOf(0); }
-
-    // 当前次要（右键）点击落到的控件 id，无则 -1。
-    int RightClickTarget() { return hitTester.AnchorIdOf(3); }
-
-    // 当前次要（右键）按下落到的控件 id，无则 -1。
-    int RightPressTarget() { return hitTester.AnchorIdOf(2); }
 
     // 当完成的点击在双击时间窗内是同一控件上的第二次点击时
     // 为真（见 Ui.DoubleClicked）。
@@ -861,151 +835,47 @@ public partial class App {
         return Window.GetTickMs() - pressStartMs;
     }
 
-    // ---- 交互查询实例方法（面向对象交互门面） ----
-    public bool Clicked(int id) {
-        if (this.EventKind() != 3) { return false; }
-        if (!this.ClickFrameCurrent()) { return false; }
-        if (this.ClickClaimed()) { return false; }
-        if (this.window.EventFlag() == 1) { return false; }
-        if (this.LongPressFired()) { return false; }
-        if (this.PressOnBlocker()) { return false; }
-        return this.ClickTarget() == id;
+    // CSS transition projections. These read the current retained endpoints;
+    // they are not an event-delivery or hit-registration API.
+    int StyleHoverLevel(int id, int ms) {
+        int target = focus != null && focus.IsHovered(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 120; }
+        return this.AnimTo(IdHash.HashInt(id, 301), target, ms);
+    }
+    int StyleHoverLevelIn(int id, int ms, int x, int y, int w, int h) {
+        int target = focus != null && focus.IsHovered(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 120; }
+        return this.AnimToIn(IdHash.HashInt(id, 301), target, ms, x, y, w, h);
+    }
+    int StylePressLevel(int id, int ms) {
+        int target = focus != null && focus.IsPressed(id) && focus.IsHovered(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 80; }
+        return this.AnimTo(IdHash.HashInt(id, 302), target, ms);
+    }
+    int StylePressLevelIn(int id, int ms, int x, int y, int w, int h) {
+        int target = focus != null && focus.IsPressed(id) && focus.IsHovered(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 80; }
+        return this.AnimToIn(IdHash.HashInt(id, 302), target, ms, x, y, w, h);
+    }
+    int StyleFocusLevel(int id, int ms) {
+        int target = focus != null && focus.IsFocused(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 140; }
+        return this.AnimTo(IdHash.HashInt(id, 303), target, ms);
+    }
+    int StyleFocusLevelIn(int id, int ms, int x, int y, int w, int h) {
+        int target = focus != null && focus.IsFocused(id) ? 1000 : 0;
+        if (ms <= 0) { ms = 140; }
+        return this.AnimToIn(IdHash.HashInt(id, 303), target, ms, x, y, w, h);
     }
 
-    public bool OwnsClick(int id) {
-        return this.ClickAvailable() && this.ClickTarget() == id;
-    }
-
-    public bool PressedDown(int id) {
-        if (this.EventKind() != 2) { return false; }
-        return this.PressTarget() == id;
-    }
-
-    public bool PressedOutside(int id) {
-        if (this.EventKind() != 2) { return false; }
-        return this.PressTarget() != id;
-    }
-
-    public bool Hovered(int id) {
-        return this.focus.IsHovered(id);
-    }
-
-    public bool Over(int x, int y, int w, int h) {
-        if (this.PointerCaptured()) { return false; }
-        if (this.mouseX < x || this.mouseX >= x + w) { return false; }
-        if (this.mouseY < y || this.mouseY >= y + h) { return false; }
-        return true;
-    }
-
-    public bool ClickedIn(int x, int y, int w, int h) {
-        if (!this.ClickAvailable()) { return false; }
-        return this.Over(x, y, w, h);
-    }
-
-    public bool Pressed(int id) {
-        return this.focus.IsPressed(id);
-    }
-
-    public bool Focused(int id) {
-        return this.focus.IsFocused(id);
-    }
-
-    public bool Active(int id) {
-        if (!this.focus.IsPressed(id)) { return false; }
-        return this.focus.IsHovered(id);
-    }
-
-    public int HotId() {
-        return this.focus.hoveredId;
-    }
-
-    public bool MouseReleased() {
-        return this.EventKind() == 3;
-    }
-
-    public bool MousePressed() {
-        return this.EventKind() == 2;
-    }
-
-    public bool Entered(int id) {
-        return this.focus.IsHovered(id) && !this.focus.WasHovered(id);
-    }
-
-    public bool Left(int id) {
-        return !this.focus.IsHovered(id) && this.focus.WasHovered(id);
-    }
-
-    public bool FocusGained(int id) {
-        return this.focus.IsFocused(id) && !this.focus.WasFocused(id);
-    }
-
-    public bool FocusLost(int id) {
-        return !this.focus.IsFocused(id) && this.focus.WasFocused(id);
-    }
-
-    public bool DoubleClicked(int id) {
-        if (this.EventKind() != 3) { return false; }
-        if (!this.DoubleClickNow()) { return false; }
-        if (this.PressOnBlocker()) { return false; }
-        return this.ClickTarget() == id;
-    }
-
-    public int KeyDown() {
-        if (this.EventKind() != 4) { return 0; }
-        return this.window.EventKeyCode();
-    }
-
-    public bool KeyPressed(int code) {
-        return this.KeyDown() == code;
-    }
-
-    public bool Tapped(int id) {
-        return this.Clicked(id);
-    }
-
-    public int Swipe() {
-        if (this.EventKind() != 3) { return 0; }
-        return this.SwipeDir();
-    }
-
-    public bool SwipedOn(int id, int dir) {
-        if (this.EventKind() != 3) { return false; }
-        return this.SwipeTarget() == id && this.SwipeDir() == dir;
-    }
-
-    public bool LongPressed(int id) {
-        return this.PollLongPress(id);
-    }
-
-    public bool MouseUpOn(int id) {
-        if (this.EventKind() != 3) { return false; }
-        return this.SwipeTarget() == id;
-    }
-
-    public bool RightClicked(int id) {
-        if (this.EventKind() != 3) { return false; }
-        if (this.window.EventButton() != 1) { return false; }
-        return this.RightClickTarget() == id;
-    }
-
-    public bool RightPressedDown(int id) {
-        if (this.EventKind() != 2) { return false; }
-        if (this.window.EventButton() != 1) { return false; }
-        return this.RightPressTarget() == id;
-    }
-
-    public bool SwipedAny(int id) {
-        if (this.EventKind() != 3) { return false; }
-        return this.SwipeTarget() == id && this.SwipeDir() != 0;
-    }
-
-    public bool Dragging(int id) {
-        if (this.EventKind() != 1) { return false; }
-        return this.focus.IsPressed(id);
-    }
-
-    public bool Dropped(int id) {
-        if (this.EventKind() != 3) { return false; }
-        return this.SwipeTarget() == id;
+    bool HoldTip(Control control) {
+        if (control == null || !this.TouchDevice() || focus == null) { return false; }
+        Control pressed = capturedPointerControl != null ? capturedPointerControl : pointerDownTarget;
+        if (pressed != control || !focus.IsPressed(control.WidgetId())) { return false; }
+        if (mouseX < control.bx || mouseX >= control.bx + control.bw
+            || mouseY < control.by || mouseY >= control.by + control.bh) { return false; }
+        if (this.HeldPressMs() >= 900) { return true; }
+        this.RequestWakeFrameIn(80);
+        return false;
     }
 }

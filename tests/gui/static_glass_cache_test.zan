@@ -1,0 +1,262 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+class StaticGlassCacheTest {
+    static int snaps;
+    static int restores;
+    static int grads;
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception("Static glass cache: " + message); }
+    }
+
+    static void ResetStats() {
+        for (int i = 0; i <= 12; i = i + 1) { Canvas.RasterStat(i, 1); }
+    }
+
+    static int[] Pixels(App app) {
+        int[] pixels = new int[160 * 120];
+        for (int y = 0; y < 120; y = y + 1) {
+            for (int x = 0; x < 160; x = x + 1) {
+                pixels[y * 160 + x] = app.canvas.GetPixel(x, y);
+            }
+        }
+        return pixels;
+    }
+
+    static void Exact(int[] actual, int[] expected, string message) {
+        Check(actual.Length == expected.Length, message + " dimensions");
+        for (int i = 0; i < actual.Length; i = i + 1) {
+            if (actual[i] != expected[i]) {
+                throw new Exception("Static glass cache: " + message + " pixel="
+                + Convert.ToString(i) + " actual=" + Convert.ToString(actual[i])
+                + " expected=" + Convert.ToString(expected[i]));
+            }
+        }
+    }
+
+    static App Fixture() {
+        App app = App.CreateOffscreen("static glass cache", 160, 120);
+        app.SetChromeVisible(false);
+        app.SetBackdropFx(false);
+        app.SetOffscreenViewport(160, 120, 100);
+        return app;
+    }
+
+    static StyleBox Glass() {
+        StyleBox s = new StyleBox();
+        s.visible = 1;
+        s.opacity = 1000;
+        s.scale = 1000;
+        s.bg = (int)0x6A3A6086;
+        s.blur = 4;
+        s.radius = 14;
+        s.sheen = 240;
+        s.borderW = 0;
+        s.fxId = 731;
+        return s;
+    }
+
+    static void Background(App app, int changed) {
+        // Transparent pixels carry nonzero straight RGB; rounded corners and
+        // the panel's surroundings must retain those exact bits.
+        app.canvas.Clear(0x00123456);
+        app.canvas.ClearRect(24, 20, 90, 72, (int)0x705588AA);
+        if (changed != 0) { app.canvas.ClearRect(29, 25, 1, 1, (int)0xFFE2A031); }
+    }
+
+    static void Original(App app, StyleBox s, bool dirty) {
+        Canvas c = app.canvas;
+        // Native slots are process-wide: keep the reference's blur cache away
+        // from App's 0..63 composition slots so comparison cannot evict a hit.
+        int slot = 200 + s.fxId % 32;
+        int radius = s.RadiusOr(0);
+        int corners = s.Corners();
+        c.BlurRoundCached(16, 12, 128, 96, s.PaintLength(app, s.blur, StyleBox.SourceBlur()),
+        slot, dirty, radius, corners);
+        c.FillRoundRectIn(16, 12, 128, 96, radius, corners, s.Fade(s.bg));
+        s.PaintSheen(app, 16, 12, 128, 96, radius);
+    }
+
+    static void Foreground(App app) {
+        Panel panel = new Panel("foreground witness").Plain((int)0xFFC47132);
+        panel.UseApp(app);
+        panel.MeasureTree(app);
+        panel.Arrange(50, 46, 30, 24);
+        panel.RenderTree(app);
+    }
+
+    static int[] Frame(App app, StyleBox s, bool cached, int changed = 0,
+    Rect clip = null, bool foreground = false, bool reset = true) {
+        app.partialFrame = clip != null;
+        app.backdropDirty = true;
+        if (reset) { Background(app, changed); }
+        if (clip != null) { app.canvas.PushClip(clip.x, clip.y, clip.width, clip.height); }
+        ResetStats();
+        try {
+            if (cached) { s.Paint(app, 16, 12, 128, 96); }
+            else { Original(app, s, true); }
+            snaps = Canvas.RasterStat(8, 0);
+            restores = Canvas.RasterStat(9, 0);
+            grads = Canvas.RasterStat(2, 0);
+            if (foreground) { Foreground(app); }
+        } finally {
+            if (clip != null) { app.canvas.PopClip(); }
+            app.partialFrame = false;
+        }
+        return Pixels(app);
+    }
+
+    static void ColdWarmAndBackground() {
+        App app = Fixture();
+        App reference = Fixture();
+        StyleBox s = Glass();
+        try {
+            int[] cold = Frame(app, s, true);
+            Check(snaps == 2 && restores == 0, "cold captures input and final pixels");
+            Exact(cold, Frame(reference, s, false), "cold original pixels");
+            int[] warm = Frame(app, s, true);
+            Check(snaps == 0 && restores == 1, "warm uses counted restore");
+            Check(Canvas.RasterStat(9, 1) == 12, "restore counts actual 12288 pixels");
+            Exact(warm, cold, "warm alpha and pixels");
+            Check(warm[0] == 0x00123456 && warm[12 * 160 + 16] == 0x00123456,
+            "transparent outside and rounded corner preserved");
+            Frame(app, s, true, 0, null, true);
+            Exact(Frame(app, s, true), cold, "child foreground excluded from capture");
+            int[] changed = Frame(app, s, true, 1);
+            Check(snaps == 2 && restores == 0, "single unsampled source pixel invalidates");
+            // A distinct slot forces the original painter to read new source.
+            s.fxId = 733;
+            Exact(changed, Frame(reference, s, false, 1), "background change exact pixels");
+            int[] changedWarm = Frame(app, s, true, 1);
+            Exact(changedWarm, changed, "changed source cold pixels");
+            Frame(app, s, true, 1);
+            Check(restores == 1 && snaps == 0, "changed source warms again");
+            s.bg = (int)0x7F214365;
+            int[] tint = Frame(app, s, true, 1);
+            Check(snaps == 2, "tint invalidates");
+            Exact(tint, Frame(reference, s, false, 1), "tint original pixels");
+            s.sheen = 410;
+            int[] sheen = Frame(app, s, true, 1);
+            Check(snaps == 2, "sheen invalidates");
+            Exact(sheen, Frame(reference, s, false, 1), "sheen original pixels");
+        } finally {
+            app.canvas.Destroy();
+            reference.canvas.Destroy();
+        }
+    }
+
+    static void Clipped() {
+        App app = Fixture();
+        App reference = Fixture();
+        StyleBox s = Glass();
+        Rect clip = new Rect(25, 22, 24, 30);
+        try {
+            Frame(app, s, true);
+            Frame(reference, s, false);
+            int[] actual = Frame(app, s, true, 0, clip);
+            Check(snaps == 0 && restores == 0, "partial clip cannot capture or restore final");
+            Exact(actual, Frame(reference, s, false, 0, clip), "partial warm original pixels");
+            // Clip excludes the whole panel: every pixel stays at the source.
+            int[] outside = Frame(app, s, true, 0, new Rect(0, 0, 4, 4));
+            Background(reference, 0);
+            Exact(outside, Pixels(reference), "empty intersection is unchanged");
+            s.fxId = 741;
+            actual = Frame(app, s, true, 1, clip);
+            Check(snaps == 0, "cold partial miss does not capture");
+            Exact(actual, Frame(reference, s, false, 1, clip), "cold partial original pixels");
+            actual = Frame(app, s, true, 1);
+            Check(snaps == 2, "full frame after partial rebuilds");
+            s.fxId = 743;
+            Exact(actual, Frame(reference, s, false, 1), "full recovery pixels");
+        } finally {
+            app.canvas.Destroy();
+            reference.canvas.Destroy();
+        }
+    }
+
+    static void SurfacesAndSlots() {
+        App a = Fixture();
+        App b = Fixture();
+        StyleBox s = Glass();
+        try {
+            int[] original = Frame(a, s, true);
+            Frame(b, s, true, 1);
+            Check(snaps == 2 && restores == 0, "same slot different surface misses");
+            Exact(Frame(a, s, true), original, "surface alternation exact");
+            Check(snaps == 2, "returning surface rebuilds");
+            Frame(a, s, true);
+            Check(restores == 1, "returning surface then hits");
+            for (int i = 0; i < 70; i = i + 1) {
+                a.frameCount = a.frameCount + 1;
+                a.BlurSlotFor(10000 + i);
+            }
+            Exact(Frame(a, s, true), original, "slot eviction preserves pixels");
+        } finally { a.canvas.Destroy(); b.canvas.Destroy(); }
+        App replacement = Fixture();
+        try {
+            Frame(replacement, s, true);
+            Check(snaps == 2 && restores == 0, "reused surface identity has no stale capture");
+        } finally { replacement.canvas.Destroy(); }
+    }
+
+    static void BlurHitClip(App app, int[] cached, Rect clip, string label) {
+        Background(app, 1);
+        int[] expected = Pixels(app);
+        for (int y = clip.y; y < clip.y + clip.height; y = y + 1) {
+            for (int x = clip.x; x < clip.x + clip.width; x = x + 1) {
+                if (x >= 16 && x < 144 && y >= 12 && y < 108) {
+                    expected[y * 160 + x] = cached[y * 160 + x];
+                }
+            }
+        }
+        app.canvas.PushClip(0, 0, 160, 120);
+        app.canvas.PushClip(clip.x, clip.y, clip.width, clip.height);
+        ResetStats();
+        try {
+            app.canvas.BlurRoundCached(16, 12, 128, 96, 4, 180, false, 14, Corner.All());
+            bool hits = clip.x < 144 && clip.y < 108
+            && clip.x + clip.width > 16 && clip.y + clip.height > 12;
+            int calls = 0;
+            if (hits) { calls = 1; }
+            Check(Canvas.RasterStat(6, 0) == calls, label + " blurhit calls");
+            int area = 0;
+            if (hits) { area = 12; }
+            Check(Canvas.RasterStat(6, 1) == area, label + " original full-panel blurhit area");
+            Check(Canvas.RasterStat(5, 0) == 0, label + " does not recompute blur");
+            Exact(Pixels(app), expected, label + " exact cached coverage, alpha and clip guards");
+        } finally { app.canvas.PopClip(); app.canvas.PopClip(); }
+    }
+
+    static void BlurPartialHits() {
+        App app = Fixture();
+        try {
+            Background(app, 0);
+            app.canvas.BlurRoundCached(16, 12, 128, 96, 4, 180, true, 14, Corner.All());
+            int[] cached = Pixels(app);
+            BlurHitClip(app, cached, new Rect(16, 12, 8, 8), "rounded transparent corner");
+            BlurHitClip(app, cached, new Rect(28, 30, 1, 1), "one-pixel hit");
+            BlurHitClip(app, cached, new Rect(0, 0, 32, 28), "partly outside panel");
+            BlurHitClip(app, cached, new Rect(140, 100, 20, 20), "right-bottom clip");
+            BlurHitClip(app, cached, new Rect(0, 0, 4, 4), "empty intersection");
+            BlurHitClip(app, cached, new Rect(0, 0, 160, 120), "full clip dirty-false hit");
+        } finally { app.canvas.Destroy(); }
+    }
+
+    static int Main() {
+        BlurPartialHits();
+        ColdWarmAndBackground();
+        Clipped();
+        SurfacesAndSlots();
+        StyleBox s = Glass();
+        Check(s.StaticGlassEligible(), "fixture uses public static glass mechanism");
+        s.shadow = (int)0x40000000;
+        Check(!s.StaticGlassEligible(), "external shadow retains original bounds path");
+        s.shadow = 0;
+        s.anim = 1;
+        Check(!s.StaticGlassEligible(), "animation retains original path");
+        Console.WriteLine("STATIC_GLASS_CACHE_OK");
+        return 0;
+    }
+}

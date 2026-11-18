@@ -1,0 +1,92 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+class ControlInputHostReentryHooks {
+    public weak ControlInputHost NextHost;
+    public weak App Target;
+    public weak Control Root;
+    public weak Button Button;
+    public int Cancels;
+
+    public void Routed(Control sender, RoutedEventArgs args) {
+        if (args.eventName != "PointerCancel") { return; }
+        Cancels = Cancels + 1;
+        if (Cancels != 1) { return; }
+        ControlInputHost host = NextHost;
+        App app = Target;
+        Control root = Root;
+        Button button = Button;
+        if (host == null || app == null || root == null || button == null) { return; }
+        host.Bind(app);
+        root.MeasureTree(app); root.Arrange(10, 10, 280, 120);
+        app.ProcessOffscreenInput(2, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0, 0, 0);
+        app.focus.SetFocused(button.WidgetId(), button);
+    }
+}
+
+class ControlInputHostReentryTest {
+    static void Check(bool value, string label) { if (!value) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Down(App app, Control root, Button button) {
+        root.MeasureTree(app); root.Arrange(10, 10, 280, 120);
+        app.ProcessOffscreenInput(2, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == button, "actual Down captures the borrowed button");
+    }
+    static void SameHostReentry() {
+        App app = App.CreateOffscreen("ControlInputHost Hide reentry", 320, 200);
+        Control fallback = new Control(); app.SetRootControl(fallback);
+        Control root = new Control(); Button button = new Button("reenter"); root.Add(button);
+        ControlInputHost host = new ControlInputHost(root); host.Bind(app); Down(app, root, button);
+        app.focus.ClearFocus();
+        ControlInputHost nextHost = new ControlInputHost(root);
+        ControlInputHostReentryHooks hooks = new ControlInputHostReentryHooks();
+        hooks.NextHost = nextHost; hooks.Target = app; hooks.Root = root; hooks.Button = button;
+        button.OnRouted(hooks.Routed);
+
+        host.Hide();
+        Check(hooks.Cancels == 1, "Hide dispatches one cancellation for the old capture");
+        Check(app.rootControl == nextHost && nextHost.ContainsInputControl(button),
+        "synchronous replacement host over the same tree remains installed");
+        Check(app.GetCapturedPointer() == button && app.focus.IsFocused(button.WidgetId()),
+        "new Down capture and focus survive the outer Hide");
+        List<Control> focus = new List<Control>(); nextHost.CollectInputFocus(app, focus);
+        Check(focus.Count == 1 && focus[0] == button, "replacement host exposes its focused borrowed control");
+
+        app.ProcessOffscreenInput(3, button.bx + button.bw / 2, button.by + button.bh / 2, 0, 0, 0, 0);
+        Drain(app); nextHost.Hide(); host.Hide();
+        Check(app.rootControl == fallback && app.GetCapturedPointer() == null,
+        "later ordinary Hide calls restore the exact fallback after both adapters detach");
+        Check(hooks.Cancels == 1, "Hide after Up does not cancel the already released replacement capture");
+        app.canvas.Destroy();
+    }
+    static void NormalHideAndCrossAppBind() {
+        App oldApp = App.CreateOffscreen("ControlInputHost old App", 320, 200);
+        App nextApp = App.CreateOffscreen("ControlInputHost next App", 320, 200);
+        Control oldFallback = new Control(); oldApp.SetRootControl(oldFallback);
+        Control nextFallback = new Control(); nextApp.SetRootControl(nextFallback);
+        Control root = new Control(); Button button = new Button("cross App"); root.Add(button);
+        ControlInputHost host = new ControlInputHost(root); host.Bind(oldApp); Down(oldApp, root, button);
+        int cancels = 0;
+        button.OnRouted((sender, args) => { if (args.eventName == "PointerCancel") { cancels = cancels + 1; } });
+        host.Bind(nextApp);
+        Check(cancels == 1 && oldApp.rootControl == oldFallback && oldApp.GetCapturedPointer() == null,
+        "cross-App Bind retires old borrowed input once and restores its fallback");
+        Check(nextApp.rootControl == host && host.ContainsInputControl(button)
+        && root.FindApp() == nextApp, "cross-App Bind installs the borrowed tree on the new App");
+        Down(nextApp, root, button); host.Hide();
+        Check(cancels == 2 && nextApp.rootControl == nextFallback && nextApp.GetCapturedPointer() == null,
+        "normal Hide releases the new App capture once and restores its fallback");
+        Drain(oldApp); Drain(nextApp); oldApp.canvas.Destroy(); nextApp.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("independent frame", 8, 8);
+        SameHostReentry(); NormalHideAndCrossAppBind();
+        frame.canvas.Destroy();
+        Console.WriteLine("CONTROL_INPUT_HOST_REENTRY_OK");
+    }
+}

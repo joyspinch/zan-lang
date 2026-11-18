@@ -1,19 +1,47 @@
 using System;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
 
-// UiDriver `clickid @语义名` 回归：命中区注册时带的语义标签
-// （HitRegion.label，RegisterRectL 标注）在点击时刻由驱动当场
-// 解析为区域中心并注入——脚本从此不持有数字 id。数字 id 逐帧
-// 由 AllocId 顺序发号，前方控件增减即整体移位（ListView 拖动
-// 停摆、菜单滚动条跳跃都曾是这个冲突），脚本若握着旧号必然
-// 点错；按名解析以"当帧注册表即真相"根除它。三件事：
-// ①按名点击落在带标签的控件上、同名者后注册（顶层）优先、
-// 未标签兄弟不受牵连；②前方多注册一个命中区把数字 id 顶漂
-// 后按名点击仍然命中（漂移对标签通道不可见）；③未知名字
-// 被拒绝且不注入任何事件。驱动状态白盒最小初始化（app/
-// resultsPath/probes），Exec 直接喂命令行，与真实会话同一
-// 执行路径。
+namespace Gui;
+
+class UiDriverScopedForm : Form {
+    public void Enter(Action loop) { this.RunScoped(loop); }
+}
+
+class UiDriverSnapshotWatch {
+    public weak Form form;
+    public weak App app;
+    public weak Control page;
+    public ControlTreeDoc snapshot;
+}
+
+class UiDriverLabelClickWatch {
+    public int clicks;
+    public weak Control sender;
+
+    public void Clicked(Control control) { clicks = clicks + 1; sender = control; }
+    public void ClickedPlain() { clicks = clicks + 1; }
+}
+
+// A layout participant can borrow a tree without admitting it to input routing.
+class UiDriverLayoutOnlyHost : Control {
+    public Control layoutOnly;
+
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        if (children == null) { children = new List<Control>(); }
+        if (layoutOnly != null) { children.Add(layoutOnly); }
+        return children;
+    }
+
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child != null && child == layoutOnly);
+    }
+}
+
+// clickid resolves semantic names from the live retained input tree.
+// Sibling changes must not redirect clicks; unknown or occluded targets are refused.
 class UiDriverLabelClickTest {
     static int fails;
     static App app;
@@ -26,25 +54,32 @@ class UiDriverLabelClickTest {
         if (got == want) { return; }
         fails = fails + 1;
         Console.WriteLine("FAIL " + what + ": got "
-            + Convert.ToString(got) + " want " + Convert.ToString(want));
+        + Convert.ToString(got) + " want " + Convert.ToString(want));
     }
 
+    static Control inputRoot;
+    static Button alpha;
+    static Button beta;
+    static Button gamma;
+    static Button sibling;
+    static StatusBar statusBar;
+    static Label lspStatus;
+    static UiDriverLabelClickWatch statusWatch;
+
+    static void AlphaClick() { clickedAlpha = true; }
+    static void BetaClick() { betaClicks = betaClicks + 1; }
+    static void GammaClick() { clickedGamma = true; }
+
     static void Body() {
-        // 漂移源：开启后抢走第一个号，其后所有 id 每帧移位
-        // （弹层开合、列表可见行数抖动的同款场景）。
-        if (driftGate) {
-            int d = app.focus.AllocId();
-            app.hitTester.RegisterRect(d, 0, 290, 10, 10, 0);
-        }
-        int a = app.focus.AllocId();
-        int b = app.focus.AllocId();
-        int g = app.focus.AllocId();
-        app.hitTester.RegisterRectL(a, 10, 10, 80, 40, 0, "alpha");
-        app.hitTester.RegisterRectL(b, 200, 10, 80, 40, 0, "beta");
-        app.hitTester.RegisterRectL(g, 10, 200, 80, 40, 0, "gamma");
-        if (Ui.Clicked(app, a)) { clickedAlpha = true; }
-        if (Ui.Clicked(app, b)) { betaClicks = betaClicks + 1; }
-        if (Ui.Clicked(app, g)) { clickedGamma = true; }
+        sibling.SetShown(driftGate);
+        inputRoot.MeasureTree(app);
+        inputRoot.Arrange(0, 0, 400, 300);
+        alpha.Arrange(10, 80, 80, 40);
+        beta.Arrange(200, 80, 80, 40);
+        gamma.Arrange(10, 200, 80, 40);
+        sibling.Arrange(0, 290, 10, 10);
+        statusBar.Arrange(0, 260, 400, 30);
+        inputRoot.RenderTree(app);
     }
 
     // 消费一帧（事件泵 + 重建命中注册表）。
@@ -53,8 +88,313 @@ class UiDriverLabelClickTest {
         app.FrameGuarded(UiDriverLabelClickTest.Body);
     }
 
+    static ControlNode Target(ControlTreeDoc snapshot, Control control) {
+        for (int i = 0; i < snapshot.inputTargets.Count; i = i + 1) {
+            if (snapshot.inputTargets[i].id == control.WidgetId()) { return snapshot.inputTargets[i]; }
+        }
+        return null;
+    }
+
+    static int TargetCount(ControlTreeDoc snapshot, Control control) {
+        int count = 0;
+        for (int i = 0; i < snapshot.inputTargets.Count; i = i + 1) {
+            if (snapshot.inputTargets[i].id == control.WidgetId()) { count = count + 1; }
+        }
+        return count;
+    }
+
+    static ControlNode FindNode(ControlNode node, string name) {
+        if (node == null) { return null; }
+        if (node.name == name) { return node; }
+        for (int i = 0; i < node.kids.Count; i = i + 1) {
+            ControlNode found = FindNode(node.kids[i], name);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    static void CheckFormSnapshot(App host, UiDriverScopedForm form, Button command, Label status) {
+        EqInt("automation observes the active Form layout owner", host.AutomationRoot() == form ? 1 : 0, 1);
+        EqInt("input adapters remain the routed root", host.rootControl is ControlInputHost ? 1 : 0, 1);
+        ControlTreeDoc snapshot = UiDriver.TreeSnapshot();
+        EqInt("snapshot root is the real Form", snapshot.root.name == form.name ? 1 : 0, 1);
+        EqInt("snapshot preserves Form geometry", snapshot.root.w == form.bw && snapshot.root.h == form.bh ? 1 : 0, 1);
+        ControlNode page = FindNode(snapshot.root, "ide-start-page");
+        EqInt("snapshot includes visible Start-like subtree", page != null && page.visible == 1 && page.w == 400 ? 1 : 0, 1);
+        EqInt("snapshot includes the real nested command", FindNode(page, "start-new-file") != null ? 1 : 0, 1);
+        ControlNode target = Target(snapshot, command);
+        EqInt("Start-like command remains reachable through adapters", target != null ? target.pointerHit : 0, 1);
+        ControlNode statusNode = FindNode(snapshot.root, "ide-lsp-status");
+        EqInt("snapshot includes the real status Label", statusNode != null && statusNode.kind == "Label" ? 1 : 0, 1);
+        target = Target(snapshot, status);
+        EqInt("status Label remains reachable through adapters", target != null ? target.pointerHit : 0, 1);
+        EqInt("status Label has no Tab capability", status.InputFocusCapabilities(), 0);
+    }
+
+    static void ScopedSnapshot(UiDriverSnapshotWatch watch, bool fail) {
+        UiDriverScopedForm form = new UiDriverScopedForm();
+        form.InitForm("scoped driver snapshot", 400, 300, true);
+        form.name = "driver-form";
+        App host = form.GetApp();
+        Control page = new Control("ide-start-page");
+        Button command = new Button("New File"); command.name = "start-new-file";
+        StatusBar status = new StatusBar();
+        Label statusItem = status.ItemAt(status.AddRight("LSP: off")); statusItem.name = "ide-lsp-status";
+        UiDriverLabelClickWatch clicks = new UiDriverLabelClickWatch(); statusItem.OnClickS(clicks.Clicked);
+        page.Add(command); form.Add(page); form.Add(status); form.UseApp(host);
+        form.MeasureTree(host); form.Arrange(0, 0, 400, 300);
+        page.Arrange(0, 40, 400, 230); command.Arrange(10, 80, 160, 40);
+        status.Arrange(0, 270, 400, 30);
+        watch.form = form; watch.app = host; watch.page = page;
+        Input navigation = new Input("Search");
+        navigation.MeasureTree(host, 100); navigation.Arrange(280, 200, 100, 32);
+        ControlInputHost navigationHost = new ControlInputHost(navigation);
+        ControlInputHost nestedHost = new ControlInputHost(navigation);
+        Control priorRoot = new Control("prior-input-root"); host.SetRootControl(priorRoot);
+        App priorDriver = UiDriver.app;
+        App priorFrame = App.frameApp;
+        bool caught = false;
+        try {
+            UiDriver.app = host;
+            EqInt("unscoped automation falls back to actual input root", host.AutomationRoot() == priorRoot ? 1 : 0, 1);
+            form.Enter(() => {
+                AppLoopRegistration outer = host.CurrentHostLayout();
+                navigationHost.Bind(host);
+                CheckFormSnapshot(host, form, command, statusItem);
+                Control outerInput = host.rootControl;
+                bool nestedCaught = false;
+                try {
+                    form.Enter(() => {
+                        EqInt("nested scope installs its own live layout ticket", host.CurrentHostLayout() != outer ? 1 : 0, 1);
+                        nestedHost.Bind(host);
+                        CheckFormSnapshot(host, form, command, statusItem);
+                        if (fail) { throw new Exception("nested snapshot failure"); }
+                    });
+                } catch (Exception e) {
+                    if (e.Message != "nested snapshot failure") { throw; }
+                    nestedCaught = true;
+                }
+                EqInt("nested exception propagation", nestedCaught == fail ? 1 : 0, 1);
+                EqInt("nested scope restores outer layout ticket", host.CurrentHostLayout() == outer ? 1 : 0, 1);
+                EqInt("nested scope restores outer input adapter", host.rootControl == outerInput ? 1 : 0, 1);
+                CheckFormSnapshot(host, form, command, statusItem);
+                nestedHost.Hide();
+                watch.snapshot = UiDriver.TreeSnapshot();
+                if (fail) { throw new Exception("outer snapshot failure"); }
+            });
+        } catch (Exception e) {
+            if (e.Message != "outer snapshot failure") { throw; }
+            caught = true;
+        }
+        finally { UiDriver.app = priorDriver; }
+        EqInt("outer exception propagation", caught == fail ? 1 : 0, 1);
+        EqInt("scope retires layout ticket", host.CurrentHostLayout() == null ? 1 : 0, 1);
+        EqInt("scope restores input root and automation fallback",
+        host.rootControl == priorRoot && host.AutomationRoot() == priorRoot ? 1 : 0, 1);
+        EqInt("scope restores frame context", host.frameBody == null && App.frameApp == priorFrame ? 1 : 0, 1);
+        nestedHost.Hide(); navigationHost.Hide();
+        host.StopLoop(); host.SetRootControl(null); host.DrainPosts(); host.canvas.Destroy();
+    }
+
+    static void ScopeSnapshotLifetimes() {
+        UiDriverSnapshotWatch watch = new UiDriverSnapshotWatch();
+        ScopedSnapshot(watch, false);
+        EqInt("normal scope and saved snapshot release Form/App/page",
+        watch.form == null && watch.app == null && watch.page == null ? 1 : 0, 1);
+        EqInt("saved snapshot keeps only node values", FindNode(watch.snapshot.root, "start-new-file") != null ? 1 : 0, 1);
+        ScopedSnapshot(watch, true);
+        EqInt("exception scope and saved snapshot release Form/App/page",
+        watch.form == null && watch.app == null && watch.page == null ? 1 : 0, 1);
+    }
+
+    static void RetainedSnapshot() {
+        App host = App.CreateOffscreen("retained driver snapshot", 400, 300);
+        Input detail = new Input("Details"); Input navigation = new Input("Search components");
+        detail.MeasureTree(host, 160); detail.Arrange(200, 80, 160, 32);
+        navigation.MeasureTree(host, 160); navigation.Arrange(10, 80, 160, 32);
+        ControlInputHost detailHost = new ControlInputHost(detail); detailHost.Bind(host);
+        ControlInputHost navigationHost = new ControlInputHost(navigation); navigationHost.Bind(host);
+        UiDriver.app = host;
+        int before = host.hitTester.RegionCount();
+        ControlTreeDoc snapshot = UiDriver.TreeSnapshot();
+        EqInt("borrowed navigation is observed outside reported demo tree", snapshot.inputTargets.Count, 2);
+        ControlNode target = Target(snapshot, detail);
+        EqInt("retained center reaches actual endpoint", target != null ? target.pointerHit : 0, 1);
+        EqInt("snapshot does not register flat hits", host.hitTester.RegionCount(), before);
+        host.ProcessOffscreenInput(2, 220, 90, 0, 0, 0, 0);
+        host.ProcessOffscreenInput(3, 220, 90, 0, 0, 0, 0);
+        host.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
+        EqInt("real Down Up Char edits retained input", detail.GetText() == "A" ? 1 : 0, 1);
+        snapshot = UiDriver.TreeSnapshot(); target = Target(snapshot, detail);
+        EqInt("snapshot observes actual focus", target != null ? target.focused : 0, 1);
+        host.CapturePointer(navigation);
+        snapshot = UiDriver.TreeSnapshot(); target = Target(snapshot, detail);
+        EqInt("capture on another endpoint refuses center", target != null ? target.pointerHit : 1, 0);
+        host.ReleasePointerCapture();
+        navigation.Arrange(200, 80, 160, 32);
+        snapshot = UiDriver.TreeSnapshot(); target = Target(snapshot, detail);
+        EqInt("actual adapter precedence refuses occluded endpoint", target != null ? target.pointerHit : 1, 0);
+        navigationHost.Hide();
+        snapshot = UiDriver.TreeSnapshot();
+        EqInt("hidden borrowed root is absent", Target(snapshot, navigation) == null ? 1 : 0, 1);
+        host.overlayHost.ShowAt(host, navigation, 20, 140);
+        snapshot = UiDriver.TreeSnapshot();
+        EqInt("popup is the routed input root", snapshot.inputTargets.Count, 1);
+        EqInt("popup masks underlying endpoint", Target(snapshot, detail) == null ? 1 : 0, 1);
+        host.overlayHost.Dismiss(); detailHost.Hide();
+        UiDriver.app = null;
+        host.StopLoop(); host.SetRootControl(null); host.DrainPosts(); host.canvas.Destroy();
+    }
+
+    static void ClickSnapshot() {
+        App host = App.CreateOffscreen("subscribed click snapshot", 400, 300);
+        UiDriverLayoutOnlyHost tree = new UiDriverLayoutOnlyHost();
+        UiDriverLabelClickWatch clicks = new UiDriverLabelClickWatch();
+        StatusBar status = new StatusBar();
+        Label item = status.ItemAt(status.AddRight("LSP: off")); item.name = "ide-lsp-status";
+        item.OnClickS(clicks.Clicked);
+        Label decorative = new Label("decoration");
+        Label plainClick = new Label("plain Click"); plainClick.OnClick(clicks.ClickedPlain);
+        Button command = new Button("command"); command.Click.Add(clicks.ClickedPlain);
+        Label layoutOnly = new Label("layout only"); layoutOnly.OnClickS(clicks.Clicked);
+        tree.layoutOnly = layoutOnly;
+        tree.Add(status); tree.Add(decorative); tree.Add(plainClick); tree.Add(command);
+        tree.UseApp(host); host.SetRootControl(tree);
+        tree.MeasureTree(host); tree.Arrange(0, 0, 400, 300);
+        status.Arrange(0, 260, 400, 30); decorative.Arrange(10, 140, 120, 30);
+        plainClick.Arrange(10, 100, 120, 30); command.Arrange(200, 100, 160, 30);
+        layoutOnly.UseApp(host); layoutOnly.MeasureTree(host); layoutOnly.Arrange(10, 180, 120, 30);
+        UiDriver.app = host;
+        int regions = host.hitTester.RegionCount();
+        ControlTreeDoc snapshot = UiDriver.TreeSnapshot();
+        ControlNode target = Target(snapshot, item);
+        EqInt("sender Click Label is a pointer endpoint", target != null ? target.pointerHit : 0, 1);
+        EqInt("plain Click Label is a pointer endpoint", Target(snapshot, plainClick) != null ? 1 : 0, 1);
+        EqInt("decorative Label is not an endpoint", Target(snapshot, decorative) == null ? 1 : 0, 1);
+        EqInt("layout-only borrowed Label is outside real input root", Target(snapshot, layoutOnly) == null ? 1 : 0, 1);
+        EqInt("focus plus Click endpoint appears once", TargetCount(snapshot, command), 1);
+        EqInt("click observation does not register legacy hits", host.hitTester.RegionCount(), regions);
+        EqInt("empty Click slot has no subscribers", decorative.Click.CountAll(), 0);
+        EqInt("empty Click slot remains decorative", Target(UiDriver.TreeSnapshot(), decorative) == null ? 1 : 0, 1);
+        List<Control> focusTargets = new List<Control>();
+        host.rootControl.CollectInputFocus(host, focusTargets);
+        EqInt("click-only Label stays outside Tab order", focusTargets.Contains(item) ? 1 : 0, 0);
+        EqInt("plain Click Label stays outside Tab order", focusTargets.Contains(plainClick) ? 1 : 0, 0);
+        host.focus.FocusStep(1);
+        EqInt("Tab still reaches keyboard endpoint", host.focus.focusedControl == command ? 1 : 0, 1);
+        int x = item.bx + item.bw / 2; int y = item.by + item.bh / 2;
+        EqInt("status center really hits Label", host.rootControl.HitTest(x, y, 0) == item ? 1 : 0, 1);
+        host.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        host.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        EqInt("real status Down Up invokes sender Click once", clicks.clicks, 1);
+        EqInt("real status Click preserves sender", clicks.sender == item ? 1 : 0, 1);
+        EqInt("pointer click does not grant Label keyboard focus", host.focus.focusedControl == item ? 1 : 0, 0);
+        host.ProcessOffscreenInput(2, 60, 115, 0, 0, 0, 0);
+        host.ProcessOffscreenInput(3, 60, 115, 0, 0, 0, 0);
+        EqInt("real plain Click invokes no-argument subscription", clicks.clicks, 2);
+        ControlInputHost duplicate = new ControlInputHost(tree); duplicate.Bind(host);
+        snapshot = UiDriver.TreeSnapshot();
+        EqInt("borrowed plus fallback Click is deduplicated by identity", TargetCount(snapshot, item), 1);
+        EqInt("borrowed plus fallback focus is deduplicated by identity", TargetCount(snapshot, command), 1);
+        duplicate.Hide();
+        host.CapturePointer(command);
+        target = Target(UiDriver.TreeSnapshot(), item);
+        EqInt("capture on another endpoint refuses Click Label", target != null ? target.pointerHit : 1, 0);
+        host.ReleasePointerCapture();
+        item.SetShown(false);
+        EqInt("hidden Click Label is absent", Target(UiDriver.TreeSnapshot(), item) == null ? 1 : 0, 1);
+        item.SetShown(true); item.Disabled = true;
+        EqInt("disabled Click Label is absent", Target(UiDriver.TreeSnapshot(), item) == null ? 1 : 0, 1);
+        item.Disabled = false; status.Disabled = true;
+        EqInt("disabled ancestor masks Click Label", Target(UiDriver.TreeSnapshot(), item) == null ? 1 : 0, 1);
+        status.Disabled = false;
+        item.Click.Clear();
+        EqInt("cleared Click subscription removes endpoint", Target(UiDriver.TreeSnapshot(), item) == null ? 1 : 0, 1);
+        item.OnClickS(clicks.Clicked);
+        target = Target(UiDriver.TreeSnapshot(), item);
+        EqInt("rebinding Click restores endpoint", target != null ? target.pointerHit : 0, 1);
+        Label popup = new Label("popup action"); popup.OnClickS(clicks.Clicked);
+        host.overlayHost.ShowAt(host, popup, 20, 40);
+        snapshot = UiDriver.TreeSnapshot(); target = Target(snapshot, popup);
+        EqInt("popup Click Label owns its routed endpoint", target != null ? target.pointerHit : 0, 1);
+        EqInt("popup masks underlying Click Label", Target(snapshot, item) == null ? 1 : 0, 1);
+        host.overlayHost.Dismiss();
+        Button cover = new Button("cover"); tree.Add(cover); cover.UseApp(host);
+        cover.MeasureTree(host); cover.Arrange(item.bx, item.by, item.bw, item.bh);
+        target = Target(UiDriver.TreeSnapshot(), item);
+        EqInt("occluded Click Label stays observed but unreachable", target != null ? target.pointerHit : 1, 0);
+        host.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        host.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        EqInt("occlusion really blocks status Click", clicks.clicks, 2);
+        UiDriver.app = null;
+        host.StopLoop(); host.SetRootControl(null); host.DrainPosts(); host.canvas.Destroy();
+    }
+
+    static void CompositeSnapshot() {
+        App host = App.CreateOffscreen("composite driver snapshot", 400, 300);
+        Control tree = new Control();
+        Button button = new Button();
+        Panel captionHost = new Panel();
+        Label caption = new Label("composite caption");
+        captionHost.Add(caption); button.Add(captionHost); tree.Add(button);
+        tree.UseApp(host); host.SetRootControl(tree);
+        tree.MeasureTree(host); tree.Arrange(0, 0, 400, 300);
+        button.Arrange(10, 10, 160, 60);
+        captionHost.Arrange(10, 10, 160, 60); caption.Arrange(10, 10, 160, 60);
+        UiDriver.app = host;
+        EqInt("composite center hits caption", tree.HitTest(90, 40, 0) == caption ? 1 : 0, 1);
+        ControlNode target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("caption route belongs to Button", target != null ? target.pointerHit : 0, 1);
+        UiDriverLabelClickWatch clicks = new UiDriverLabelClickWatch(); caption.OnClickS(clicks.Clicked);
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("subscribed caption owns its pointer endpoint", target != null ? target.pointerHit : 1, 0);
+        ControlNode captionTarget = Target(UiDriver.TreeSnapshot(), caption);
+        EqInt("subscribed caption is independently reachable", captionTarget != null ? captionTarget.pointerHit : 0, 1);
+        caption.Click.Clear();
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("cleared caption returns its route to Button", target != null ? target.pointerHit : 0, 1);
+        Input nested = new Input(); captionHost.Add(nested);
+        nested.UseApp(host); nested.MeasureTree(host); nested.Arrange(10, 10, 160, 60);
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("independent child endpoint blocks outer Button", target != null ? target.pointerHit : 1, 0);
+        ControlNode childTarget = Target(UiDriver.TreeSnapshot(), nested);
+        EqInt("independent child endpoint owns center", childTarget != null ? childTarget.pointerHit : 0, 1);
+        nested.Disabled = true;
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("disabled child endpoint does not expose outer Button", target != null ? target.pointerHit : 1, 0);
+        captionHost.Remove(nested);
+        Button nestedButton = new Button("nested"); captionHost.Add(nestedButton);
+        nestedButton.UseApp(host); nestedButton.MeasureTree(host); nestedButton.Arrange(10, 10, 160, 60);
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("nested Button owns its caption route", target != null ? target.pointerHit : 1, 0);
+        captionHost.Remove(nestedButton);
+        captionHost.Disabled = true;
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("disabled caption ancestor refuses center", target != null ? target.pointerHit : 1, 0);
+        captionHost.Disabled = false;
+        Button cover = new Button("cover"); tree.Add(cover);
+        cover.UseApp(host); cover.MeasureTree(host); cover.Arrange(10, 10, 160, 60);
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("later sibling blocks composite center", target != null ? target.pointerHit : 1, 0);
+        tree.Remove(cover);
+        tree.Arrange(0, 0, 60, 300);
+        button.Arrange(10, 10, 160, 60);
+        captionHost.Arrange(10, 10, 160, 60); caption.Arrange(10, 10, 160, 60);
+        target = Target(UiDriver.TreeSnapshot(), button);
+        EqInt("clipped composite center refuses input", target != null ? target.pointerHit : 1, 0);
+        UiDriver.app = null;
+        host.StopLoop(); host.SetRootControl(null); host.DrainPosts(); host.canvas.Destroy();
+    }
+
     static void Main() {
         fails = 0;
+        // App retains the first host as its ambient frame context. Keep that
+        // context outside the Form/App/page graph whose lifetime is under test.
+        App frame = App.CreateOffscreen("driver outer frame context", 1, 1);
+        ScopeSnapshotLifetimes();
+        RetainedSnapshot();
+        ClickSnapshot();
+        CompositeSnapshot();
         driftGate = false;
         clickedAlpha = false;
         clickedGamma = false;
@@ -62,6 +402,18 @@ class UiDriverLabelClickTest {
         app = new App("uidrv-label-click", 400, 300);
         app.Show();
         app.RequestAnimationFrame(16);
+        inputRoot = new Control();
+        alpha = new Button("Alpha"); alpha.name = "alpha"; alpha.Click.Add(AlphaClick);
+        beta = new Button("Beta"); beta.name = "beta"; beta.Click.Add(BetaClick);
+        gamma = new Button("Gamma"); gamma.name = "gamma"; gamma.Click.Add(GammaClick);
+        sibling = new Button("");
+        statusBar = new StatusBar();
+        lspStatus = statusBar.ItemAt(statusBar.AddRight("LSP: off")); lspStatus.name = "ide-lsp-status";
+        statusWatch = new UiDriverLabelClickWatch(); lspStatus.OnClickS(statusWatch.Clicked);
+        inputRoot.Add(sibling); inputRoot.Add(alpha); inputRoot.Add(beta); inputRoot.Add(gamma);
+        inputRoot.Add(statusBar);
+        inputRoot.UseApp(app);
+        app.SetRootControl(inputRoot);
         Frame();
         Frame();
 
@@ -75,12 +427,24 @@ class UiDriverLabelClickTest {
         }
 
         // ① 按名点击：注入 move+press+release 三事件，逐帧消费。
+        Control betaHit = inputRoot.HitTest(beta.bx + beta.bw / 2, beta.by + beta.bh / 2, 0);
+        EqInt("real click center hits retained caption", betaHit != beta && betaHit is Label ? 1 : 0, 1);
         bool ok = UiDriver.Exec("clickid @beta");
         EqInt("exec @beta accepted", ok ? 1 : 0, 1);
         for (int i = 0; i < 4; i = i + 1) { Frame(); }
         EqInt("beta clicked via label", betaClicks, 1);
         EqInt("alpha not clicked", clickedAlpha ? 1 : 0, 0);
         EqInt("gamma not clicked", clickedGamma ? 1 : 0, 0);
+
+        // The IDE status contract is a sender-bound Label, not a focusable Button.
+        ControlNode statusTarget = UiDriver.FindInputTarget("@ide-lsp-status");
+        EqInt("semantic status resolves from retained input before legacy fallback", statusTarget != null ? statusTarget.pointerHit : 0, 1);
+        ok = UiDriver.Exec("clickid @ide-lsp-status");
+        EqInt("exec status Label accepted", ok ? 1 : 0, 1);
+        for (int i = 0; i < 4; i = i + 1) { Frame(); }
+        EqInt("semantic status click invokes sender subscription once", statusWatch.clicks, 1);
+        EqInt("semantic status click preserves Label sender", statusWatch.sender == lspStatus ? 1 : 0, 1);
+        EqInt("semantic status click does not acquire Label keyboard focus", app.focus.focusedControl == lspStatus ? 1 : 0, 0);
 
         // ② 前方多注册一个命中区（数字 id 顶漂一位）后按名点击：
         // 标签在当帧注册表里重查，漂移不可见。
@@ -100,8 +464,14 @@ class UiDriverLabelClickTest {
         Frame();
         EqInt("no click after refused name", betaClicks, 2);
 
+        app.CapturePointer(alpha);
+        EqInt("captured target refuses semantic click", UiDriver.Exec("clickid @beta") ? 1 : 0, 0);
+        app.ReleasePointerCapture();
+        UiDriver.app = null;
+        app.SetRootControl(null); app.StopLoop();
+        frame.StopLoop(); frame.canvas.Destroy();
         File.Delete(UiDriver.resultsPath);
         Console.WriteLine(fails == 0 ? "UIDRVLBL PASS"
-            : "UIDRVLBL FAIL " + Convert.ToString(fails));
+        : "UIDRVLBL FAIL " + Convert.ToString(fails));
     }
 }

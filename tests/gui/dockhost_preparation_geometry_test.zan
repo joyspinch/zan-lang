@@ -1,0 +1,449 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+class DockHostPreparationGeometryTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static string Geometry(Rect r) {
+        return Convert.ToString(r.x) + "," + Convert.ToString(r.y) + ","
+        + Convert.ToString(r.width) + "," + Convert.ToString(r.height);
+    }
+
+    static void Equal(Rect actual, Rect expected, string label) {
+        Check(Geometry(actual) == Geometry(expected), label + ": "
+        + Geometry(actual) + " != " + Geometry(expected));
+    }
+
+    static void Parked(Rect actual, string label) {
+        Equal(actual, new Rect(0 - 30000, 0 - 30000, 1, 1), label);
+    }
+
+    static void Dpi(App app, int scale) {
+        app.dpiScale = scale;
+        app.theme = Theme.Light();
+        app.theme.ScaleByDpi(scale);
+    }
+
+    static List<string> Ids() {
+        List<string> ids = new List<string>();
+        ids.Add("editor"); ids.Add("extra");
+        ids.Add("left1"); ids.Add("left2");
+        ids.Add("right"); ids.Add("bottom1"); ids.Add("bottom2");
+        ids.Add("missing");
+        return ids;
+    }
+
+    // Both paths use the real DockHost. The oracle is Begin/ContentParked,
+    // with additional literal expectations below, rather than a copied layout.
+    static void Pair(App app, DockHost dock, Rect area, string label) {
+        app.BeginOffscreenFrame();
+        List<string> ids = Ids();
+        List<Rect> prepared = new List<Rect>();
+        List<string> oldBodies = new List<string>();
+        string saved = dock.SaveLayout();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            oldBodies.Add(Geometry(dock.Content(ids[i])));
+            prepared.Add(dock.PreviewContent(app, area, ids[i]));
+        }
+        Check(saved == dock.SaveLayout(), label + " preview preserves persisted layout");
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            Check(oldBodies[i] == Geometry(dock.Content(ids[i])), label + " preview preserves body " + ids[i]);
+            Equal(dock.PreviewContent(app, area, ids[i]), prepared[i], label + " repeat " + ids[i]);
+        }
+        app.SetRootControl(dock);
+        dock.PrepareHost(app, area);
+        dock.RenderPrepared(app);
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            Equal(dock.ContentParked(ids[i]), prepared[i], label + " current content " + ids[i]);
+        }
+        dock.RenderOverlay(app);
+        app.EndOffscreenFrame();
+    }
+
+    static DockHost Layout() {
+        DockHost dock = new DockHost();
+        dock.RegisterFixed("editor", "Editor");
+        dock.Register("extra", "Extra", DockSide.Center(), true, false);
+        dock.Register("left1", "Left 1", DockSide.Left(), true, true);
+        dock.Register("left2", "Left 2", DockSide.Left(), true, true);
+        dock.Register("right", "Right", DockSide.Right(), true, true);
+        dock.Register("bottom1", "Bottom 1", DockSide.Bottom(), true, true);
+        dock.Register("bottom2", "Bottom 2", DockSide.Bottom(), true, true);
+        dock.SetWeight("left1", 1);
+        dock.SetWeight("left2", 2);
+        dock.SetWeight("bottom1", 2);
+        dock.SetWeight("bottom2", 1);
+        return dock;
+    }
+
+    static void DefaultAndVisibility(App app) {
+        Dpi(app, 100);
+        DockHost dock = Layout();
+        Rect wide = new Rect(17, 23, 1200, 700);
+        Pair(app, dock, wide, "first weighted layout");
+        int header = app.theme.heightMedium;
+        Equal(dock.ContentParked("editor"), new Rect(262, 23 + header, 670, 525 - header),
+        "fixed center shows header when sharing tabs");
+        Equal(dock.ContentParked("left1"), new Rect(17, 23 + header, 240, 231 - header),
+        "first weighted vertical group");
+        Equal(dock.ContentParked("left2"), new Rect(17, 259 + header, 240, 464 - header),
+        "last vertical group absorbs rounding");
+        Parked(dock.ContentParked("extra"), "inactive tab parked");
+
+        dock.Focus("extra");
+        Pair(app, dock, wide, "active tab switched before paint");
+        Parked(dock.ContentParked("editor"), "inactive fixed panel parked");
+        Check(dock.ContentParked("extra").y == wide.y + header, "ordinary selected tab retains header");
+        dock.Close("extra");
+        Pair(app, dock, wide, "fixed center alone");
+        Equal(dock.ContentParked("editor"), new Rect(262, 23, 670, 525), "solo fixed center is headerless");
+        DockPanel pinned = dock.Find("editor");
+        Check(pinned != null && pinned.headerless && !pinned.closable,
+        "RegisterFixed preserves supported fixed/pinned semantics");
+
+        dock.Close("right");
+        dock.Close("bottom1");
+        dock.Close("bottom2");
+        Pair(app, dock, wide, "hidden sides before paint");
+        Equal(dock.ContentParked("editor"), new Rect(262, 23, 955, 700),
+        "hidden right and bottom consume no extent or splitter");
+        dock.Show("right"); dock.Show("bottom1"); dock.Show("bottom2");
+        Pair(app, dock, wide, "restored sides");
+        Equal(dock.ContentParked("editor"), new Rect(262, 23, 670, 525), "restored saved side extents");
+
+        DockGroup left = dock.LastGroupOf(DockSide.Left());
+        Check(left != null, "left group exists");
+        left.active = 99;
+        Pair(app, dock, wide, "invalid active selection clamped without preview mutation");
+        dock.Show("extra");
+        DockGroup center = dock.LastGroupOf(DockSide.Center());
+        Check(center != null, "center group exists");
+        center.active = 99;
+        Pair(app, dock, wide, "invalid active index selects last tab");
+        Parked(dock.ContentParked("editor"), "out of range index clamps to last rather than first");
+        DockPanel extra = dock.Find("extra");
+        Check(extra != null, "extra panel exists");
+        extra.hidden = true;
+        Pair(app, dock, wide, "hidden selected member falls back without stale body");
+        Equal(dock.ContentParked("editor"), new Rect(262, 23, 670, 525),
+        "only visible fixed member has no header");
+        dock.ReleaseControls();
+    }
+
+    static void ResizeAndSnapshot(App app) {
+        Dpi(app, 100);
+        DockHost dock = Layout();
+        dock.Close("extra");
+        Rect wide = new Rect(11, 19, 1200, 700);
+        Pair(app, dock, wide, "resize baseline");
+        Rect snapshot = dock.PreviewContent(app, wide, "editor");
+        string frozen = Geometry(snapshot);
+        dock.SetSideExtent(DockSide.Left(), 310);
+        dock.SetSideExtent(DockSide.Right(), 330);
+        dock.SetSideExtent(DockSide.Bottom(), 210);
+        Rect current = new Rect(31, 41, 1400, 900);
+        Rect beforePaint = dock.PreviewContent(app, current, "editor");
+        Equal(beforePaint, new Rect(346, 41, 750, 685), "preparation uses current area and extents");
+        Pair(app, dock, current, "current resized layout");
+        Check(frozen == Geometry(snapshot), "old preparation snapshot survives next Begin");
+        beforePaint.Set(1, 2, 3, 4);
+        Equal(dock.ContentParked("editor"), new Rect(346, 41, 750, 685),
+        "mutating returned preparation snapshot cannot change committed content");
+        Pair(app, dock, new Rect(31, 41, 700, 190), "clamped narrow and short");
+        Check(dock.ContentParked("editor").height == 120, "short layout preserves minimum center height");
+        Pair(app, dock, current, "restore after clamp");
+        Equal(dock.ContentParked("editor"), new Rect(346, 41, 750, 685), "clamping did not persist side shrink");
+        Pair(app, dock, new Rect(31, 41, 237, 39), "minimized group geometry");
+        Pair(app, dock, current, "restore after tiny group layout");
+        Equal(dock.ContentParked("editor"), new Rect(346, 41, 750, 685), "tiny layout did not persist side shrink");
+        dock.ReleaseControls();
+    }
+
+    static void LogicalDpi(App app) {
+        DockHost dock = Layout();
+        string layout = "v2;S=260,300,180;G=3,0,0,editor|extra"
+        + ";G=0,101,0,left1;G=0,204,0,left2;G=1,0,0,right"
+        + ";G=2,100,0,bottom1;G=2,200,0,bottom2";
+        Dpi(app, 150);
+        Check(dock.LoadLayout(layout), "load logical layout at 150 DPI");
+        Rect current = new Rect(13, 29, 1500, 900);
+        Rect prepared = dock.PreviewContent(app, current, "editor");
+        int header = app.theme.heightMedium;
+        Equal(prepared, new Rect(410, 29 + header, 646, 623 - header),
+        "logical sides and current DPI splitter before first Begin");
+        Pair(app, dock, current, "pending logical DPI layout");
+        Equal(dock.ContentParked("left1"), new Rect(13, 29 + header, 390, 295 - header),
+        "pending group extents scale before proportional rounding");
+        Pair(app, dock, new Rect(43, 59, 1600, 1000), "DPI resize uses current rectangle");
+        Dpi(app, 200);
+        Pair(app, dock, new Rect(7, 9, 1700, 1000), "live DPI metrics before paint");
+        Check(dock.ContentParked("left1").y == 9 + app.theme.heightMedium,
+        "current DPI header used before paint");
+        Check(dock.LoadLayout(layout), "reload logical layout at 200 DPI");
+        Pair(app, dock, new Rect(7, 9, 1700, 1000), "new logical layout at current DPI");
+        Check(dock.ContentParked("left1").width == 520, "logical extent restored at current DPI");
+        dock.ReleaseControls();
+    }
+
+    static void Input(App app, int kind, int x, int y, int button, int code) {
+        app.ProcessOffscreenInput(kind, x, y, button, code, 0, 0);
+    }
+
+    static void RetainedInput(App app) {
+        DockHost dock = new DockHost();
+        dock.Register("one", "One", DockSide.Center(), true, false);
+        dock.Register("two", "Two", DockSide.Center(), true, false);
+        Input firstInput = new Input("First content");
+        Input secondInput = new Input("Second content");
+        dock.SetContent("one", firstInput); dock.SetContent("two", secondInput);
+        app.SetRootControl(dock);
+        dock.PrepareHost(app, new Rect(20, 20, 760, 400));
+        Control content = dock.ContentRoot("one");
+        Check(content != null && content.parent == dock && content.StyleVisible(), "active content is a real child");
+        int font = Style.FontFallback(app, "small");
+        int firstWidth = app.theme.paddingMedium * 2 + Canvas.MeasureText("One", font) + app.theme.gapSmall + font;
+        int x = 20 + firstWidth + app.theme.paddingMedium + 2;
+        int y = 20 + app.theme.heightMedium / 2;
+        Control target = dock.HitTest(x, y);
+        Check(target != null && target != dock && target.parent == dock, "tab routes through the retained tree");
+        Input(app, 2, x, y, 0, 0); Input(app, 3, x, y, 0, 0);
+        dock.PrepareHost(app, new Rect(20, 20, 760, 400));
+        Control second = dock.ContentRoot("two");
+        Check(content != null && second != null && !content.StyleVisible() && second.StyleVisible(), "tab click switches content before paint");
+        Check(secondInput.bw > 0 && secondInput.bh > 0, "content child receives arranged bounds");
+        Control inputTarget = dock.HitTest(secondInput.bx + 4, secondInput.by + 4);
+        Check(inputTarget == secondInput, "content input participates in the same dock tree");
+        Input(app, 2, secondInput.bx + 4, secondInput.by + 4, 0, 0);
+        Input(app, 3, secondInput.bx + 4, secondInput.by + 4, 0, 0);
+        Check(secondInput.IsFocused(app), "content input receives native routed focus");
+        app.CapturePointer(secondInput);
+        dock.Focus("one"); dock.PrepareHost(app, new Rect(20, 20, 760, 400));
+        Check(!secondInput.IsFocused(app) && app.GetCapturedPointer() == null, "inactive content retires focus and capture");
+        dock.Focus("two"); dock.PrepareHost(app, new Rect(20, 20, 760, 400));
+        string saved = dock.SaveLayout(); int children = dock.ChildCount();
+        app.BeginOffscreenFrame(); dock.RenderPrepared(app); dock.RenderPrepared(app); dock.RenderOverlay(app); app.EndOffscreenFrame();
+        Check(saved == dock.SaveLayout() && children == dock.ChildCount(), "repeated paint has no input or layout effects");
+        int closeX = 20 + firstWidth + app.theme.paddingMedium + Canvas.MeasureText("Two", font) + app.theme.gapSmall + font / 2;
+        Input(app, 2, closeX, y, 0, 0); Input(app, 3, closeX, y, 0, 0);
+        DockPanel closed = dock.Find("two");
+        Check(closed != null && closed.hidden, "real close child closes the selected panel");
+        dock.PrepareHost(app, new Rect(20, 20, 760, 400));
+        Check(content != null && content.StyleVisible(), "closing restores remaining content");
+        dock.ReleaseControls(); app.SetRootControl(null);
+    }
+
+    static void SplitterInput(App app) {
+        DockHost dock = Layout();
+        Rect area = new Rect(20, 20, 1400, 800);
+        app.SetRootControl(dock); dock.PrepareHost(app, area);
+        Rect left = dock.Content("left1");
+        int x = left.Right() + app.Scale(2); int y = left.y + left.height / 2;
+        int width = left.width;
+        Input(app, 2, x, y, 0, 0);
+        Check(app.GetCapturedPointer() != null, "side splitter captures a real endpoint");
+        Input(app, 1, x + app.Scale(20), y, 0, 0); Input(app, 3, x + app.Scale(20), y, 0, 0);
+        Check(app.GetCapturedPointer() == null && dock.TakeChanged(), "splitter up releases capture and commits resize");
+        dock.PrepareHost(app, area);
+        Check(dock.Content("left1").width == width + app.Scale(20), "splitter input changes prepared extent");
+        left = dock.Content("left1");
+        x = left.Right() + app.Scale(2);
+        Input(app, 2, x, y, 0, 0); Input(app, 1, x + app.Scale(8), y, 0, 0);
+        dock.ReleaseControls();
+        Check(app.GetCapturedPointer() == null, "releasing host retires splitter capture");
+        string saved = dock.SaveLayout();
+        Input(app, 1, x + app.Scale(40), y, 0, 0);
+        Check(saved == dock.SaveLayout(), "cancelled splitter cannot consume later motion");
+        app.SetRootControl(null);
+    }
+
+    static string SideSizes(DockHost dock) {
+        string saved = dock.SaveLayout();
+        int groups = saved.IndexOf(";G=");
+        return groups >= 0 ? saved.Substring(0, groups) : saved;
+    }
+
+    static void DocumentReserve(App app) {
+        List<int> scales = new List<int> { 100, 150, 200 };
+        for (int i = 0; i < scales.Count; i = i + 1) {
+            Dpi(app, scales[i]);
+            DockHost dock = Layout(); dock.Close("extra"); dock.SetCenterReserve(50, 60);
+            dock.SetSideExtent(DockSide.Left(), app.Scale(240));
+            dock.SetSideExtent(DockSide.Right(), app.Scale(280));
+            dock.SetSideExtent(DockSide.Bottom(), app.Scale(190));
+            Rect area = new Rect(13, 17, app.Scale(1300), app.Scale(660));
+            Pair(app, dock, area, "document-first defaults");
+            Rect editor = dock.Content("editor");
+            Check(editor.width >= area.width / 2 && editor.height * 100 >= area.height * 70,
+            "default documents keep at least half the width and seventy percent of workspace height");
+            dock.SetSideExtent(DockSide.Right(), app.Scale(600));
+            dock.SetSideExtent(DockSide.Bottom(), app.Scale(540));
+            string saved = SideSizes(dock);
+            Pair(app, dock, area, "oversized historical side extents");
+            editor = dock.Content("editor");
+            Check(editor.width >= area.width / 2 && editor.height * 100 >= area.height * 60,
+            "oversized saved tools/output cannot displace the document minimum");
+            Check(saved == SideSizes(dock), "temporary document reserve leaves saved side extents intact");
+            Pair(app, dock, new Rect(13, 17, app.Scale(680), app.Scale(280)), "small document workspace");
+            Check(saved == SideSizes(dock), "small window does not persist temporary side shrink");
+            Pair(app, dock, area, "document reserve restored");
+            editor = dock.Content("editor");
+            int x = editor.x + app.Scale(16); int y = editor.Bottom() + app.Scale(2);
+            int originalHeight = editor.height;
+            Input(app, 2, x, y, 0, 0);
+            Check(app.GetCapturedPointer() != null, "clamped bottom splitter captures its real endpoint");
+            Input(app, 1, x, y + app.Scale(24), 0, 0); Input(app, 3, x, y + app.Scale(24), 0, 0);
+            dock.PrepareHost(app, area);
+            Check(dock.Content("editor").height == originalHeight + app.Scale(24),
+            "drag starts at visible clamped extent and responds immediately");
+            editor = dock.Content("editor"); y = editor.Bottom() + app.Scale(2);
+            Input(app, 2, x, y, 0, 0); Input(app, 1, x, y - app.Scale(500), 0, 0);
+            Input(app, 3, x, y - app.Scale(500), 0, 0); dock.PrepareHost(app, area);
+            editor = dock.Content("editor");
+            Check(editor.height * 100 >= area.height * 60, "dragging output larger uses the same document reserve");
+            Check(dock.TakeChanged() && app.GetCapturedPointer() == null, "explicit drag commits its legal extent");
+            string dragged = dock.SaveLayout();
+            DockHost restored = Layout(); restored.Close("extra"); restored.SetCenterReserve(50, 60);
+            Check(restored.LoadLayout(dragged), "explicit resized layout can be restored");
+            Pair(app, restored, area, "restored legal document split");
+            Rect restoredEditor = restored.Content("editor");
+            Check(restoredEditor.x == editor.x && restoredEditor.y == editor.y && restoredEditor.width == editor.width
+            && Math.Abs(restoredEditor.height - editor.height) <= app.Scale(1),
+            "saved resize agrees within one logical pixel of serialization precision");
+            restored.ReleaseControls(); dock.ReleaseControls(); app.SetRootControl(null);
+        }
+    }
+
+    static void SymmetricSides(App app) {
+        List<int> scales = new List<int> { 100, 150, 200 };
+        for (int i = 0; i < scales.Count; i = i + 1) {
+            Dpi(app, scales[i]);
+            DockHost dock = Layout(); dock.Close("extra"); dock.SetCenterReserve(50, 60);
+            int requestedLeft = app.Scale(240); int requestedRight = app.Scale(280);
+            dock.SetSideExtent(DockSide.Left(), requestedLeft);
+            dock.SetSideExtent(DockSide.Right(), requestedRight);
+            Rect wide = new Rect(13, 17, app.Scale(1300), app.Scale(660));
+            Pair(app, dock, wide, "symmetric sides wide baseline");
+            Check(dock.Content("left1").width == requestedLeft
+            && dock.Content("right").width == requestedRight, "fitting side requests are unchanged");
+            string saved = SideSizes(dock);
+            Rect narrow = new Rect(13, 17, app.Scale(680), app.Scale(660));
+            Pair(app, dock, narrow, "proportional narrow sides");
+            int left = dock.Content("left1").width; int right = dock.Content("right").width;
+            int budget = narrow.width - narrow.width / 2 - app.Scale(5) * 2;
+            Check(left + right == budget && dock.Content("editor").width == narrow.width / 2,
+            "both side widths share exactly the budget outside the center reserve");
+            Check(left > 0 && right > 0 && left == (int)((long)budget * requestedLeft
+            / ((long)requestedLeft + requestedRight)), "narrow sides retain requested proportions");
+            Check(saved == SideSizes(dock), "proportional preparation preserves requested side extents");
+            dock.SetSideExtent(DockSide.Left(), requestedRight);
+            dock.SetSideExtent(DockSide.Right(), requestedLeft);
+            string swapped = SideSizes(dock);
+            Pair(app, dock, narrow, "swapped narrow side requests");
+            Check(Math.Abs(dock.Content("left1").width - right) <= 1
+            && Math.Abs(dock.Content("right").width - left) <= 1,
+            "exchanging left and right requests mirrors geometry within one device pixel");
+            Pair(app, dock, new Rect(13, 17, app.Scale(360), app.Scale(280)), "below combined side minimum");
+            Check(dock.Content("left1").width > 0 && dock.Content("right").width > 0
+            && dock.Content("editor").width == app.Scale(240), "tiny sides share space below their soft minimum");
+            Pair(app, dock, new Rect(13, 17, app.Scale(190), app.Scale(190)), "center consumes extreme width");
+            Check(dock.Content("left1").width == 0 && dock.Content("right").width == 0
+            && dock.Content("editor").width == app.Scale(190) - app.Scale(5) * 2,
+            "impossible reserve gives all available width to the center without negative sides");
+            Check(swapped == SideSizes(dock), "extreme geometry does not persist temporary side shrink");
+            Pair(app, dock, wide, "swapped side requests restored after extreme width");
+            Check(dock.Content("left1").width == requestedRight
+            && dock.Content("right").width == requestedLeft, "wide layout restores both saved requests");
+            dock.ReleaseControls(); app.SetRootControl(null);
+        }
+    }
+
+    static void ClampedSideDrag(App app) {
+        List<int> scales = new List<int> { 100, 150, 200 };
+        for (int i = 0; i < scales.Count; i = i + 1) {
+            Dpi(app, scales[i]);
+            for (int side = 0; side < 2; side = side + 1) {
+                DockHost dock = Layout(); dock.Close("extra"); dock.SetCenterReserve(50, 60);
+                dock.SetSideExtent(DockSide.Left(), app.Scale(240));
+                dock.SetSideExtent(DockSide.Right(), app.Scale(280));
+                Rect area = new Rect(13, 17, app.Scale(680), app.Scale(660));
+                Pair(app, dock, area, "side drag starts from clamped geometry");
+                Rect left = dock.Content("left1"); Rect right = dock.Content("right");
+                int leftWidth = left.width; int rightWidth = right.width;
+                int x = side == DockSide.Left() ? left.Right() + app.Scale(2) : right.x - app.Scale(2);
+                int y = area.y + area.height / 2;
+                string saved = SideSizes(dock);
+                dock.TakeChanged();
+                Input(app, 2, x, y, 0, 0);
+                Check(app.GetCapturedPointer() != null, "clamped side splitter captures before paint");
+                Input(app, 1, x, y, 0, 0); Input(app, 3, x, y, 0, 0);
+                Pair(app, dock, area, "stationary clamped splitter");
+                Check(saved == SideSizes(dock) && !dock.TakeChanged(),
+                "starting and releasing a clamped splitter cannot persist temporary extents");
+                int movement = side == DockSide.Left() ? 0 - app.Scale(10) : app.Scale(10);
+                Input(app, 2, x, y, 0, 0); Input(app, 1, x + movement, y, 0, 0);
+                Pair(app, dock, area, "first compressed side drag motion");
+                Check(dock.Content("left1").width == leftWidth + (side == DockSide.Left() ? movement : 0)
+                && dock.Content("right").width == rightWidth - (side == DockSide.Right() ? movement : 0),
+                "first motion changes only the visible dragged side without a second proportional clamp");
+                Input(app, 3, x + movement, y, 0, 0);
+                Check(dock.TakeChanged() && app.GetCapturedPointer() == null, "explicit side resize commits once");
+                int resizedLeft = dock.Content("left1").width; int resizedRight = dock.Content("right").width;
+                string resized = SideSizes(dock);
+                Pair(app, dock, area, "released compressed side geometry");
+                Check(resized == SideSizes(dock) && dock.Content("left1").width == resizedLeft
+                && dock.Content("right").width == resizedRight, "release cannot replay proportional shrink");
+                Pair(app, dock, new Rect(13, 17, app.Scale(1300), app.Scale(660)), "explicit side resize widened");
+                Check(dock.Content("left1").width == resizedLeft && dock.Content("right").width == resizedRight,
+                "widening preserves the explicit visible resize");
+                dock.ReleaseControls(); app.SetRootControl(null);
+            }
+        }
+    }
+
+    static void ConsoleInput(App app) {
+        List<LogLine> lines = new List<LogLine>();
+        for (int i = 0; i < 60; i = i + 1) { lines.Add(LogLine.OfText("line " + Convert.ToString(i))); }
+        ConsoleView console = new ConsoleView(); console.BindItems(lines);
+        app.SetRootControl(console); console.UseApp(app); console.MeasureTree(app); console.Arrange(20, 20, 500, 200);
+        Check(console.State().scroll == 0, "console starts at newest");
+        Input(app, 13, 100, 100, 0, 120);
+        Check(console.State().scroll > 0, "console wheel changes shared state before paint");
+        int offset = console.ScrollTop(); int scroll = console.State().scroll;
+        app.BeginOffscreenFrame(); console.RenderTree(app); console.RenderTree(app); app.EndOffscreenFrame();
+        Check(console.ScrollTop() == offset && console.State().scroll == scroll, "console paint cannot replay wheel");
+        Input(app, 2, 40, 30, 0, 0); Input(app, 3, 120, 50, 0, 0);
+        Check(console.State().HasSelection() && app.GetCapturedPointer() == null, "console selection uses retained capture and final up");
+        LogState shared = new LogState(); shared.Reset(); shared.scroll = 5;
+        console.UseState(shared); console.Arrange(20, 20, 500, 200);
+        Check(console.State() == shared && shared.scroll == 5, "shared log state imports its history offset");
+        lines.Add(LogLine.OfText("appended")); console.Arrange(20, 20, 500, 200);
+        Check(shared.scroll == 5, "append preserves the current distance from newest");
+        console.Reset(); console.Arrange(20, 20, 500, 200);
+        Check(shared.scroll == 0, "reset reprojects newest even after pixel wheel residue");
+        Input(app, 2, 40, 30, 0, 0);
+        Check(app.GetCapturedPointer() == console, "console selection captures its retained endpoint");
+        app.SetRootControl(null);
+        Check(!shared.selDrag && app.GetCapturedPointer() == null, "root replacement cancels console selection");
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Dock preparation geometry", 1800, 1100);
+        DefaultAndVisibility(app);
+        Console.WriteLine("dock preparation: weights / headers / fixed panel / active / hidden / restored: ok");
+        ResizeAndSnapshot(app);
+        Console.WriteLine("dock preparation: current resize / clamps / tiny restore / independent snapshots: ok");
+        LogicalDpi(app);
+        Console.WriteLine("dock preparation: pending logical extents / current DPI / current bounds: ok");
+        DocumentReserve(app); SymmetricSides(app); ClampedSideDrag(app);
+        Dpi(app, 100);
+        RetainedInput(app); SplitterInput(app); ConsoleInput(app);
+        Dpi(app, 150); RetainedInput(app); SplitterInput(app);
+        Dpi(app, 200); RetainedInput(app); SplitterInput(app);
+        app.canvas.Destroy();
+        Console.WriteLine("dockhost_preparation_geometry: ok");
+    }
+}

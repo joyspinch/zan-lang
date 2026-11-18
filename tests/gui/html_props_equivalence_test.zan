@@ -15,7 +15,7 @@ class HtmlPropsEquivalenceTest {
 
     static Control One(string html) {
         HtmlDoc doc = Html.Parse(html, "", null);
-        return doc.root.children[0];
+        return doc.root.ChildAt(0);
     }
 
     static void Same(string what, Control html, Control code, string key, string want) {
@@ -25,8 +25,7 @@ class HtmlPropsEquivalenceTest {
     }
 
     static void Charts() {
-        // ChartHost 只覆写 SetProp/GetProp，未发布 title/type PropSpec；
-        // HTML 必须尊重虚方法，不能另建一份属性白名单。
+        // HTML 和代码共用 ChartHost 发布的属性协议，不能另建属性白名单。
         ChartHost.Install();
         ChartHost code = new ChartHost();
         code.SetProp("type", "pie");
@@ -49,6 +48,105 @@ class HtmlPropsEquivalenceTest {
         mixedCode.SetProp("type", "wordCloud");
         Control mixed = HtmlPropsEquivalenceTest.One("<chart type='wordCloud'></chart>");
         HtmlPropsEquivalenceTest.Same("chart mixed-case type", mixed, mixedCode, "type", "wordCloud");
+    }
+
+    static void Check(string what, bool ok) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void ChartPropertyOrder() {
+        ChartHost code = new ChartHost();
+        code.SetProp("title", "Traffic");
+        code.SetProp("type", "pie");
+        Control reverse = HtmlPropsEquivalenceTest.One("<chart title='Traffic' type='pie'></chart>");
+        HtmlPropsEquivalenceTest.Same("reverse chart type", reverse, code, "type", "pie");
+        HtmlPropsEquivalenceTest.Same("reverse chart title", reverse, code, "title", "Traffic");
+        HtmlPropsEquivalenceTest.Eq("reverse option title", ((ChartHost)reverse).GetOption().title, "Traffic");
+
+        ChartOption pie = code.GetOption();
+        pie.series[0].data[0].val = 123;
+        code.SetProp("type", "pie");
+        HtmlPropsEquivalenceTest.Check("repeated type retains option and data",
+            code.GetOption() == pie && code.GetOption().series[0].data[0].val == 123);
+        HtmlPropsEquivalenceTest.Eq("repeated type retains title", code.GetProp("title"), "Traffic");
+        code.SetChartType("line");
+        HtmlPropsEquivalenceTest.Check("different type rebuilds series",
+            code.GetOption() != pie && code.GetOption().series[0].type == ChartType.Line);
+        HtmlPropsEquivalenceTest.Eq("different type retains title", code.GetOption().title, "Traffic");
+        code.SetProp("title", "Updated");
+        code.SetProp("type", "bar");
+        HtmlPropsEquivalenceTest.Eq("latest title survives property switch", code.GetProp("title"), "Updated");
+        ChartOption bar = code.GetOption();
+        code.SetProp("type", "");
+        code.SetChartType(null);
+        HtmlPropsEquivalenceTest.Check("default type replay retains option", code.GetOption() == bar);
+        HtmlPropsEquivalenceTest.Eq("default type normalized", code.GetProp("type"), "bar");
+    }
+
+    static void ChartMetadata() {
+        ChartHost chart = new ChartHost();
+        List<PropSpec> specs = chart.Props();
+        HtmlPropsEquivalenceTest.Check("chart metadata complete", specs.Count == 3);
+        PropSpec type = PropSpec.Find(specs, "type", true);
+        PropSpec title = PropSpec.Find(specs, "title", true);
+        PropSpec toolbox = PropSpec.Find(specs, "widgetToolbox", true);
+        HtmlPropsEquivalenceTest.Check("chart metadata bound", type != null && title != null && toolbox != null);
+        if (type == null || title == null || toolbox == null) { return; }
+        HtmlPropsEquivalenceTest.Check("chart metadata editor kinds",
+            type.kind == 3 && title.kind == 0 && toolbox.kind == 2);
+        HtmlPropsEquivalenceTest.Check("chart metadata value kinds",
+            type.ValueKind() == 0 && title.ValueKind() == 0 && toolbox.ValueKind() == 2);
+        HtmlPropsEquivalenceTest.Check("chart metadata defaults present",
+            type.HasDefault() && title.HasDefault() && toolbox.HasDefault());
+        HtmlPropsEquivalenceTest.Eq("type default", type.DefaultValue(), "bar");
+        HtmlPropsEquivalenceTest.Eq("title default", title.DefaultValue(), "");
+        HtmlPropsEquivalenceTest.Eq("toolbox default", toolbox.DefaultValue(), "false");
+        HtmlPropsEquivalenceTest.Eq("bound type initial", type.ReadFrom(chart), "bar");
+        HtmlPropsEquivalenceTest.Eq("bound title initial", title.ReadFrom(chart), "");
+        HtmlPropsEquivalenceTest.Eq("bound toolbox initial", toolbox.ReadFrom(chart), "false");
+        for (int i = (int)ChartType.Line; i <= (int)ChartType.Custom; i = i + 1) {
+            string name = ChartKinds.TypeName((ChartType)i);
+            HtmlPropsEquivalenceTest.Check("chart enum " + name, type.options.Contains(name));
+        }
+        string[] aliases = new string[]{ "area", "stacked", "hbar", "hstacked", "donut" };
+        for (int i = 0; i < aliases.Length; i = i + 1) {
+            HtmlPropsEquivalenceTest.Check("chart alias " + aliases[i], type.options.Contains(aliases[i]));
+        }
+
+        title.WriteTo(chart, "Bound title");
+        type.WriteTo(chart, "pie");
+        HtmlPropsEquivalenceTest.Check("bound type uses semantic setter",
+            chart.GetOption().series[0].type == ChartType.Pie);
+        HtmlPropsEquivalenceTest.Eq("bound switch retains title", title.ReadFrom(chart), "Bound title");
+        ChartOption pie = chart.GetOption();
+        type.WriteTo(chart, "pie");
+        HtmlPropsEquivalenceTest.Check("bound repeated type retains option", chart.GetOption() == pie);
+        toolbox.WriteTo(chart, "true");
+        HtmlPropsEquivalenceTest.Check("bound toolbox writes host", chart.IsWidgetToolbox());
+        chart.SetWidgetToolbox(false);
+        HtmlPropsEquivalenceTest.Eq("bound toolbox follows direct setter", toolbox.ReadFrom(chart), "false");
+        chart.SetProp("widgetToolbox", "1");
+        HtmlPropsEquivalenceTest.Eq("toolbox property reads metadata", toolbox.ReadFrom(chart), "true");
+
+        ChartOption replacement = ChartHost.SampleOf("scatter");
+        replacement.title = "Replacement";
+        chart.SetOption(replacement);
+        HtmlPropsEquivalenceTest.Eq("existing type binding follows SetOption", type.ReadFrom(chart), "scatter");
+        HtmlPropsEquivalenceTest.Eq("existing title binding follows SetOption", title.ReadFrom(chart), "Replacement");
+        type.WriteTo(chart, "scatter");
+        HtmlPropsEquivalenceTest.Check("SetOption data survives repeated type", chart.GetOption() == replacement);
+        title.WriteTo(chart, "Current option");
+        HtmlPropsEquivalenceTest.Eq("existing binding writes current option", replacement.title, "Current option");
+        HtmlPropsEquivalenceTest.Eq("existing binding leaves old option alone", pie.title, "Bound title");
+        chart.SetProp("title", "Property title");
+        HtmlPropsEquivalenceTest.Eq("property writes reach existing binding", title.ReadFrom(chart), "Property title");
+        chart.SetChartType("boxplot");
+        PropSpec custom = PropSpec.Find(chart.Props(), "type", true);
+        HtmlPropsEquivalenceTest.Check("custom type available to metadata export",
+            custom != null && custom.options.Contains("boxplot"));
+        HtmlPropsEquivalenceTest.Eq("custom type retains title", chart.GetOption().title, "Property title");
     }
 
     static void Values() {
@@ -111,7 +209,7 @@ class HtmlPropsEquivalenceTest {
 
     static void ConstructorAttributes() {
         Input input = new Input();
-        input.InitInput(new SignalString("secret"), "Password");
+        input.InitInput("secret", "Password");
         input.SetProp("password", "true");
         Control htmlInput = HtmlPropsEquivalenceTest.One("<input type='password' value='secret' placeholder='Password'>");
         HtmlPropsEquivalenceTest.Same("text input value", htmlInput, input, "value", "secret");
@@ -119,7 +217,7 @@ class HtmlPropsEquivalenceTest {
         HtmlPropsEquivalenceTest.Same("password input", htmlInput, input, "password", "true");
 
         TextArea area = new TextArea();
-        area.InitTextArea(new SignalString(""), "");
+        area.InitTextArea("", "");
         area.SetProp("placeholder", "Notes");
         HtmlPropsEquivalenceTest.Same("textarea placeholder",
             HtmlPropsEquivalenceTest.One("<textarea placeholder='Notes'></textarea>"), area, "placeholder", "Notes");
@@ -135,12 +233,43 @@ class HtmlPropsEquivalenceTest {
         HtmlPropsEquivalenceTest.Same("img alt", img, image, "alt", "Image description");
     }
 
+    static void CatalogMetadata() {
+        List<string> kinds = ControlFactory.Kinds();
+        HtmlPropsEquivalenceTest.Check("catalog includes standard widgets", kinds.Count > 50);
+        for (int i = 0; i < kinds.Count; i = i + 1) {
+            Control control = ControlFactory.Create(kinds[i]);
+            HtmlPropsEquivalenceTest.Check("catalog creates " + kinds[i], control != null);
+            if (control == null) { continue; }
+            List<PropSpec> specs = control.Props();
+            for (int j = 0; j < specs.Count; j = j + 1) {
+                PropSpec spec = specs[j];
+                if (spec.key == "" || (!spec.IsBound() && !spec.ExtraAccess)) { continue; }
+                string label = kinds[i] + "." + spec.key;
+                try {
+                    string value = spec.ReadFrom(control);
+                    HtmlPropsEquivalenceTest.Eq(label + " protocol", control.GetProp(spec.key), value);
+                    control.SetProp(spec.key, value);
+                    HtmlPropsEquivalenceTest.Eq(label + " property replay", spec.ReadFrom(control), value);
+                    spec.WriteTo(control, value);
+                    HtmlPropsEquivalenceTest.Eq(label + " metadata replay", control.GetProp(spec.key), value);
+                } catch (Exception failure) {
+                    fails = fails + 1;
+                    Console.WriteLine("FAIL " + label + ": " + failure.Message);
+                }
+            }
+        }
+    }
+
     static void Main() {
+        ControlBootstrap.Install();
         fails = 0;
         HtmlPropsEquivalenceTest.Charts();
+        HtmlPropsEquivalenceTest.ChartPropertyOrder();
+        HtmlPropsEquivalenceTest.ChartMetadata();
         HtmlPropsEquivalenceTest.Values();
         HtmlPropsEquivalenceTest.Titles();
         HtmlPropsEquivalenceTest.ConstructorAttributes();
+        HtmlPropsEquivalenceTest.CatalogMetadata();
         Console.WriteLine(fails == 0 ? "html props equivalence ok" : "html props equivalence FAILED");
     }
 }

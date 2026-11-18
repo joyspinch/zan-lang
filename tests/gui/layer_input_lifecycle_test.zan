@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 using Gui.Widget;
@@ -5,6 +6,29 @@ using Gui.Widget;
 class LayerClickCounter {
     public int Count;
     public void Invoke() { Count = Count + 1; }
+}
+
+class LayerPreparationCallbacks {
+    public weak App Host;
+    public weak LayerState Model;
+    public Control Replacement;
+    public int Opened;
+    public int Closed;
+    public bool Reopen;
+    public void OnOpened() {
+        Opened = Opened + 1;
+        App app = Host;
+        if (Replacement != null && app != null) {
+            Control next = Replacement; Replacement = null; app.SetRootControl(next);
+        }
+    }
+    public void OnClosed() {
+        Closed = Closed + 1;
+        App app = Host; LayerState state = Model;
+        if (Reopen && app != null && state != null) {
+            Reopen = false; state.AutoCloseMs = 0; state.Open(app); state.openMs = 0;
+        }
+    }
 }
 
 class LayerWitness {
@@ -15,7 +39,7 @@ class LayerWitness {
 
 class LayerTestInputWrapper : InputRootAdapter {
     public LayerTestInputWrapper() : base("test_input_wrapper") { }
-    public override Control HitTest(int x, int y, int pointerType) { return content.HitTest(x, y, pointerType); }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) { return content.HitTest(x, y, pointerType, excludedSubtrees); }
     public override bool ContainsInputControl(Control control) { return control == this || content.ContainsInputControl(control); }
     public override Control FindInputFocus(App app) { return content.FindInputFocus(app); }
 }
@@ -40,8 +64,9 @@ class LayerInputLifecycleTest {
 
     static void Draw(App app, LayerState state) {
         state.openMs = 0;
+        Layer.RegisterOpen(app, state);
         app.BeginOffscreenFrame();
-        Layer.Render(app, state);
+        Check(app.PrepareStandardHostFrame(), "retained layer frame prepares");
         app.EndOffscreenFrame();
     }
 
@@ -67,11 +92,15 @@ class LayerInputLifecycleTest {
         app.CapturePointer(background);
         Draw(app, page);
         Check(app.rootControl == inputRoot && ((InputRootAdapter)inputRoot).ContainsAdapter(wrapper)
-            && app.GetCapturedPointer() == background, "heterogeneous input adapter preserves layer priority without cycle");
+        && app.GetCapturedPointer() == background, "heterogeneous input adapter preserves layer priority without cycle");
         app.ReleasePointerCapture();
         Click(app, body);
         app.ProcessOffscreenInput(6, 0, 0, 0, 65, 0, 0);
         Check(body.GetText() == "A", "floating body receives routed text");
+        Check(page.okBtn.bw > 0 && page.okBtn.Label() == page.okText, "window footer has prepared caption geometry");
+        int footerX = page.okBtn.bx + page.okBtn.bw / 2;
+        int footerY = page.okBtn.by + page.okBtn.bh / 2;
+        Check(page.okBtn.ContainsInputControl(inputRoot.HitTest(footerX, footerY, 0)), "window footer wins actual root hit test");
         Click(app, page.okBtn);
         Check(page.action == 1, "window footer receives routed click");
         LayerState front = new LayerState("Front", 40, 50, 440, 300);
@@ -118,7 +147,7 @@ class LayerInputLifecycleTest {
     }
 
     static void ExerciseDialogs(App app, LayerWitness witness, LayerState page,
-            Input replacement, Control inputRoot) {
+    Input replacement, Control inputRoot) {
         LayerClickCounter backgroundClicks = new LayerClickCounter();
         Button backgroundButton = new Button("Background");
         backgroundButton.Click.Add(backgroundClicks.Invoke);
@@ -139,16 +168,16 @@ class LayerInputLifecycleTest {
         modalFallback.Bind(app);
         Draw(app, prompt);
         Check(app.rootControl == inputRoot && ((InputRootAdapter)inputRoot).ContainsAdapter(modalFallback),
-            "modal structural chain survives heterogeneous adapter bind");
+        "modal structural chain survives heterogeneous adapter bind");
         prompt.promptInput.Focus(app);
         app.CapturePointer(prompt.promptInput);
         modalFallback.Bind(app);
         Draw(app, prompt);
         Check(app.GetCapturedPointer() == prompt.promptInput && prompt.promptInput.IsFocused(app),
-            "modal rebind preserves active input state");
+        "modal rebind preserves active input state");
         modalFallback.Detach();
         Check(app.rootControl == inputRoot && app.GetCapturedPointer() == prompt.promptInput,
-            "fallback adapter detach preserves modal capture");
+        "fallback adapter detach preserves modal capture");
         app.ReleasePointerCapture();
         Check(!inputRoot.ContainsInputControl(replacement), "modal excludes lower layer capture");
         Check(inputRoot.HitTest(1, 1, 0) != backgroundButton, "modal mask blocks background pointer");
@@ -208,7 +237,7 @@ class LayerInputLifecycleTest {
         app.ProcessOffscreenInput(3, captionX + 12, captionY + 8, 0, 0, 0, 0);
         Draw(app, chrome);
         Check(chrome.x == 12 && chrome.y == app.titlebarH + 8 && !chrome.dragging,
-            "blank window caption preserves legacy drag without background click");
+        "blank window caption preserves legacy drag without background click");
         int closeX = chrome.x + chrome.w - Layer.BtnW(app) / 2;
         int closeY = chrome.y + Layer.BarH(app) / 2;
         app.ProcessOffscreenInput(2, closeX, closeY, 0, 0, 0, 0);
@@ -222,11 +251,117 @@ class LayerInputLifecycleTest {
         app.CapturePointer(replacement);
         ((InputRootAdapter)inputRoot).Detach();
         Check(app.rootControl == backgroundButton && app.GetCapturedPointer() == null
-            && !replacement.IsFocused(app), "layer detach releases owned state and restores fallback");
+        && !replacement.IsFocused(app), "layer detach releases owned state and restores fallback root="
+        + Convert.ToString(app.rootControl == backgroundButton) + " capture=" + Convert.ToString(app.GetCapturedPointer() == null)
+        + " focus=" + Convert.ToString(replacement.IsFocused(app)));
         Draw(app, page);
         Check(app.rootControl == inputRoot && inputRoot.ContainsInputControl(replacement),
-            "detached layer adapter rebind restores input membership");
+        "detached layer adapter rebind restores input membership");
         page.Close(app);
+    }
+
+    static void ExerciseQueues() {
+        App app = App.CreateOffscreen("Retained layer queues", 640, 480);
+        LayerClickCounter clicks = new LayerClickCounter();
+        Button background = new Button("Background");
+        background.Click.Add(clicks.Invoke);
+        app.SetRootControl(background);
+        Layer.Msg(app, "Saved", 3);
+        Layer.Notify(app, "Build complete", 3);
+        Control queues = Layer.Context(app).inputRoot.queueHost;
+        app.BeginOffscreenFrame();
+        Check(app.PrepareStandardHostFrame(), "queue frame prepares");
+        background.Arrange(0, 0, 640, 480);
+        background.RenderTree(app);
+        app.EndOffscreenFrame();
+        Check(Layer.Context(app).toasts.Count == 1 && Layer.Context(app).notifs.Count == 1,
+        "retained queue binds toast and notification models");
+        Check(queues.HitTest(320, 60, 0) == null, "retained queue is click-through");
+        Click(app, background);
+        Check(clicks.Count == 1, "queue does not intercept routed background click");
+        ToastItem toast = Layer.Context(app).toasts[0];
+        ToastItem notification = Layer.Context(app).notifs[0];
+        app.FreezeAnimClock(5000); toast.bornMs = 1000; toast.lifeMs = 10000;
+        notification.bornMs = 1000; notification.lifeMs = 10000;
+        app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(queues.ChildCount() == 2 && queues.ChildAt(0).bw > 0, "queue prepares real children before Paint");
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame(); int[] before = Pixels(app);
+        int childCount = queues.ChildCount(); int toastY = toast.curY;
+        toast.text = "unprepared"; notification.text = "unprepared"; toast.lifeMs = 0; notification.lifeMs = 0;
+        app.BeginOffscreenFrame(); app.EndOffscreenFrame(); int[] after = Pixels(app);
+        for (int i = 0; i < before.Length; i = i + 1) { Check(before[i] == after[i], "queue Paint consumes prepared pixels"); }
+        Check(!toast.closing && !notification.closing && toast.curY == toastY && queues.ChildCount() == childCount,
+        "queue Paint cannot expire advance or remove models");
+        app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(toast.closing && notification.closing, "queue expiry advances before input");
+        app.FreezeAnimClock(5300); app.ProcessOffscreenInput(1, 1, 1, 0, 0, 0, 0);
+        Check(queues.ChildCount() == 0 && Layer.Context(app).toasts.Count == 0 && Layer.Context(app).notifs.Count == 0,
+        "queue preparation retires expired retained children");
+        app.UnfreezeAnimClock(); app.canvas.Destroy();
+    }
+
+    static int[] Pixels(App app) {
+        int width = app.canvas.Width(); int height = app.canvas.Height(); int[] pixels = new int[width * height];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) { pixels[y * width + x] = app.canvas.GetPixel(x, y); }
+        }
+        return pixels;
+    }
+
+    static void ExercisePreparation() {
+        App app = App.CreateOffscreen("Layer preparation", 640, 480);
+        Control background = new Control(); background.UseApp(app); background.MeasureTree(app); background.Arrange(0, 0, 640, 480);
+        app.SetRootControl(background);
+        LayerState page = new LayerState("First input", 40, 50, 440, 300);
+        LayerPreparationCallbacks callbacks = new LayerPreparationCallbacks(); callbacks.Host = app; callbacks.Model = page;
+        page.Opened.Add(callbacks.OnOpened); page.Closed.Add(callbacks.OnClosed);
+        page.Open(app); page.openMs = 0;
+        Check(page.okBtn.bw > 0 && page.okBtn.Label() == "OK", "window footer prepared on Open before Paint");
+        Click(app, page.okBtn);
+        Check(page.action == 1 && callbacks.Opened == 1, "first input routes footer and advances Opened once before Paint");
+        Control surface = page.windowFooter.parent;
+        app.FreezeAnimClock(2000);
+        app.BeginOffscreenFrame(); surface.RenderTree(app); app.EndOffscreenFrame(); int[] first = Pixels(app);
+        page.title = "unprepared title"; page.body = "unprepared body"; page.openedRaised = false;
+        app.BeginOffscreenFrame(); surface.RenderTree(app); surface.RenderTree(app); app.EndOffscreenFrame(); int[] second = Pixels(app);
+        Check(callbacks.Opened == 1 && !page.openedRaised, "Paint does not advance Opened");
+        // Compare one prepared paint per cleared frame; extra Paint may alpha-compose shadows.
+        app.BeginOffscreenFrame(); surface.RenderTree(app); app.EndOffscreenFrame(); second = Pixels(app);
+        for (int i = 0; i < first.Length; i = i + 1) { Check(first[i] == second[i], "window Paint consumes prepared text and pixels"); }
+        page.openedRaised = true; page.AutoCloseMs = 1; page.openMs = 1;
+        app.BeginOffscreenFrame(); surface.RenderTree(app); app.EndOffscreenFrame();
+        Check(page.open && callbacks.Closed == 0, "Paint does not advance AutoClose");
+        callbacks.Reopen = true;
+        app.ProcessOffscreenInput(1, 20, 20, 0, 0, 0, 0);
+        Check(page.open && callbacks.Closed == 1 && page.AutoCloseMs == 0, "autoclose callback reopen owns newer session");
+        page.Close(app); app.ProcessOffscreenInput(1, 20, 20, 0, 0, 0, 0);
+        app.FreezeAnimClock(2120); app.ProcessOffscreenInput(1, 20, 20, 0, 0, 0, 0);
+        Check(page.closing && callbacks.Closed == 2, "closing snapshot prepares outside Paint");
+        app.BeginOffscreenFrame(); surface.RenderTree(app); app.EndOffscreenFrame(); int[] closing = Pixels(app);
+        page.title = "unprepared closing title"; page.body = "unprepared closing body"; app.FreezeAnimClock(2300);
+        app.BeginOffscreenFrame(); surface.RenderTree(app); app.EndOffscreenFrame(); int[] closingAgain = Pixels(app);
+        for (int i = 0; i < closing.Length; i = i + 1) { Check(closing[i] == closingAgain[i], "closing Paint consumes saved progress and text"); }
+        Check(page.closing && callbacks.Closed == 2, "Paint cannot finish closing or repeat Closed");
+        app.ProcessOffscreenInput(1, 20, 20, 0, 0, 0, 0);
+        Check(!page.closing && callbacks.Closed == 2, "preparation completes closing once");
+        LayerState dialog = LayerState.Confirm("Callback", "body", 0);
+        LayerPreparationCallbacks modalCallbacks = new LayerPreparationCallbacks(); modalCallbacks.Host = app; modalCallbacks.Model = dialog;
+        Control replacement = new Control(); replacement.UseApp(app); replacement.MeasureTree(app); replacement.Arrange(0, 0, 640, 480);
+        modalCallbacks.Replacement = replacement; dialog.Opened.Add(modalCallbacks.OnOpened);
+        dialog.Open(app); dialog.openMs = 0;
+        Control previousRoot = app.rootControl;
+        int rootGeneration = app.inputRootGeneration; int inputSession = dialog.inputGeneration;
+        long eventSequence = app.window.EventSeq();
+        app.ProcessOffscreenInput(2, dialog.okBtn.bx + 3, dialog.okBtn.by + 3, 0, 0, 0, 0);
+        Check(app.rootControl == replacement && modalCallbacks.Opened == 1 && dialog.action == 0 && app.GetCapturedPointer() == null,
+        "Opened root replacement aborts old input before footer: replacement=" + Convert.ToString(app.rootControl == replacement ? 1 : 0)
+        + " previous=" + Convert.ToString(app.rootControl == previousRoot ? 1 : 0)
+        + " opened=" + Convert.ToString(modalCallbacks.Opened) + " action=" + Convert.ToString(dialog.action)
+        + " captured=" + Convert.ToString(app.GetCapturedPointer() != null ? 1 : 0)
+        + " rootGeneration=" + Convert.ToString(rootGeneration) + "/" + Convert.ToString(app.inputRootGeneration)
+        + " inputSession=" + Convert.ToString(inputSession) + "/" + Convert.ToString(dialog.inputGeneration)
+        + " EventSeq=" + Convert.ToString(eventSequence) + "/" + Convert.ToString(app.window.EventSeq()));
+        Layer.CloseAll(app, 0); app.UnfreezeAnimClock(); app.canvas.Destroy();
     }
 
     static void OwnSession(LayerWitness witness) {
@@ -241,6 +376,8 @@ class LayerInputLifecycleTest {
         LayerWitness witness = new LayerWitness();
         OwnSession(witness);
         Check(witness.App == null && witness.Layer == null && witness.Body == null, "layer context and roots release without cycles");
+        ExerciseQueues();
+        ExercisePreparation();
         frame.canvas.Destroy();
         Console.WriteLine("LAYER_INPUT_LIFECYCLE_OK");
     }

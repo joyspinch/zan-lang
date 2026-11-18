@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 using Gui.Backend;
@@ -26,9 +27,9 @@ public class TreeView : Control {
     // 下一次绘制时体现（自定义节点控件需要重建时调用 Refresh()）。
     public List<TreeNode> data;
     // 焦点/选中行信号（-1 = 无；可经 BindSel 换成共享信号）。
-    public SignalInt sel;
-    // 垂直滚动偏移。
-    public SignalInt scroll;
+    public Binding<int> Value;
+    // 垂直滚动偏移走统一 Binding<int> 通道（宿主可注入自己的模型字段）。
+    public Binding<int> scroll;
     // 顶部内联过滤行（WithFilter 挂入；过滤由宿主重绑列表完成）。
     public Input filter;
     // 是否显示复选框列（WithChecks）。
@@ -52,6 +53,9 @@ public class TreeView : Control {
     public int ctxRow;
     public int ctxX;
     public int ctxY;
+    private int hoveredRow = -1;
+
+    private bool IsRowHovered(int index) { return hoveredRow == index; }
 
     // 树没有节点时居中显示（"" 不绘制任何内容）。
     public string Empty;
@@ -89,24 +93,28 @@ public class TreeView : Control {
     private bool layingRows;
     private bool projectingScroll;
     private int filterRevision;
-    private List<Control> dataRows;
+    private VisibleRowHost rowHost;
+    private int fixedRowHeight;
     private int rowsRevision;
     private bool buildingRows;
 
-    private Control DataRow(int index) {
-        if (dataRows == null || index < 0 || index >= dataRows.Count) { return null; }
-        Control row = dataRows[index];
-        if (row == null || rowsBody == null || row.parent != rowsBody || rowsBody.IndexOf(row) < 0) { return null; }
-        return row;
+    private Control DataRow(int index) { return rowHost != null ? rowHost.Row(index) : null; }
+
+    // Positive logical pixels are an explicit geometry contract. Zero restores
+    // measured variable rows; unknown template heights are never estimated.
+    // The caller promises every row has this height, including skin overrides.
+    // RowControl uses original data indices and returns null outside the viewport.
+    public TreeView WithFixedRowHeight(int height) {
+        fixedRowHeight = height > 0 ? height : 0;
+        this.RetireRows();
+        return this;
     }
 
     private void RetireRows() {
         rowsRevision = rowsRevision + 1;
         rowsStale = true;
         builtFor = -1;
-        dataRows = null;
-        // RemoveAll snapshots; Remove cancels input while the old parent path is valid.
-        if (rowsBody != null) { rowsBody.RemoveAll(); }
+        if (rowHost != null) { rowHost.Reset(); }
     }
 
     private Checkbox treeCheck;
@@ -123,10 +131,11 @@ public class TreeView : Control {
         this.InitControl("tree", 5);
         rowsBody = new TreeRowsPanel(this);
         base.Add(rowsBody);
+        rowHost = new VisibleRowHost(this, rowsBody);
         this.rowBuf = new Rect(0, 0, 0, 0);
         data = new List<TreeNode>();
-        sel = new SignalInt(0 - 1);
-        scroll = new SignalInt(0);
+        Value = -1;
+        scroll = 0;
         filter = null;
         checks = false;
         multi = false;
@@ -171,6 +180,7 @@ public class TreeView : Control {
         TreeView copy = (TreeView)target;
         copy.Bind(data);
         copy.NodeSlot(tpl);
+        copy.WithFixedRowHeight(fixedRowHeight);
         if (filter != null) { copy.WithFilter((Input)clone(filter)); }
     }
 
@@ -271,6 +281,12 @@ public class TreeView : Control {
         int width = view.width;
         if (rowsBody.scrollExtent > view.height) { width = width - (app != null ? app.Scale(12) : 12); }
         if (width < 0) { width = 0; }
+        if (fixedRowHeight > 0) {
+            if (scroll.Get() != off) { scroll.Set(off); }
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            this.BuildRows(app);
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+        }
         int y = view.y - off;
         for (int i = 0; i < data.Count; i = i + 1) {
             Control row = this.DataRow(i);
@@ -316,7 +332,7 @@ public class TreeView : Control {
         if (app.window.EventButton() == 1) {
             if (!(multi && this.IsMarked(index))) {
                 if (multi) { marks = new List<int>(); }
-                sel.Set(index);
+                Value.Set(index);
             }
             ctxRow = index; ctxX = e.x; ctxY = e.y;
             Context.PostS(this);
@@ -325,6 +341,7 @@ public class TreeView : Control {
         }
         if (app.window.EventButton() != 0) { return; }
         dropDone = false;
+        if (e.IsTouch()) { dropDone = true; }
         ctxRow = index; ctxX = e.x; ctxY = e.y;
         Press.PostS(this);
         if (reorder) {
@@ -351,7 +368,14 @@ public class TreeView : Control {
 
     public override void OnPointerMove(RoutedEventArgs e) {
         base.OnPointerMove(e);
+        int row = this.DataIndexAt(e.x, e.y);
+        if (hoveredRow != row) { hoveredRow = row; this.NoteSelfDamage(this.App); }
         if (!e.handled) { this.UpdateRoutedDrop(e); }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        hoveredRow = -1;
     }
 
     public override void OnPointerUp(RoutedEventArgs e) {
@@ -388,7 +412,7 @@ public class TreeView : Control {
             return;
         }
             TreeNode n = data[index];
-            int mods = app.window.EventMods();
+            int mods = e.modifiers;
             if (multi && Modifiers.HasCtrl(mods)) {
                 // 将行切入/切出多选。不触发 Select
                 // （切换不是选中），目录保留
@@ -397,20 +421,20 @@ public class TreeView : Control {
                 for (int mi = 0; mi < marks.Count; mi = mi + 1) {
                     if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
                 }
-                if (sel.Get() == index) { sel.Set(0 - 1); was = true; }
+                if (Value.Get() == index) { Value.Set(0 - 1); was = true; }
                 if (!was) {
-                    if (sel.Get() < 0) { sel.Set(index); }
+                    if (Value.Get() < 0) { Value.Set(index); }
                     else { marks.Add(index); }
                 }
                 ctxRow = index;
                 this.NoteSelfDamage(app);
                 return;
             }
-            if (multi && Modifiers.HasShift(mods) && sel.Get() >= 0) {
+            if (multi && Modifiers.HasShift(mods) && Value.Get() >= 0) {
                 // 将选择从焦点行扩展到本行，
                 // 只标记可见行，使折叠目录的子节点
                 // 永远不会被悄悄选中。
-                int a = sel.Get();
+                int a = Value.Get();
                 int b = index;
                 if (b < a) { int tmp = a; a = b; b = tmp; }
                 int r = a;
@@ -422,9 +446,9 @@ public class TreeView : Control {
                 this.NoteSelfDamage(app);
                 return;
             }
-            bool moved = sel.Get() != index;
+            bool moved = Value.Get() != index;
             if (multi) { marks = new List<int>(); }
-            sel.Set(index);
+            Value.Set(index);
             ctxRow = index;
             if (n.isDir) {
                 n.expanded = !n.expanded;
@@ -432,7 +456,7 @@ public class TreeView : Control {
                 if (n.expanded) { Expand.PostS(this); } else { Collapse.PostS(this); }
             }
             if (moved) { Select.PostS(this); }
-            if (app.DoubleClickNow()) { Activate.PostS(this); }
+            if (e.isDoubleClick) { Activate.PostS(this); }
             this.NoteSelfDamage(app);
         e.Handle();
     }
@@ -445,7 +469,7 @@ public class TreeView : Control {
             if (index >= 0) {
                 if (!(multi && this.IsMarked(index))) {
                     if (multi) { marks = new List<int>(); }
-                    sel.Set(index);
+                    Value.Set(index);
                 }
                 ctxRow = index; ctxX = e.x; ctxY = e.y;
                 pressed = false; dragging = false; dragRow = -1; dropAt = -1;
@@ -462,32 +486,32 @@ public class TreeView : Control {
     public override string Kind() { return "TreeView"; }
 
     // 覆写：返回设计器属性清单（checks/empty/sel/value）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec sl = PropSpec.Int("value", "Selected");
-        sl.snum = sel;
+        PropSpec sl = PropSpec.Int("value", "Selected").DefaultBinding();
+        sl.Field("Value", 1);
         sl.Also("data");
         sl.Also("sel");
         ps.Add(sl);
         PropSpec chk = PropSpec.Bool("checks", "Checkboxes");
-        chk.flag = checks;
+        chk.Field("checks", 2);
         ps.Add(chk);
         PropSpec mul = PropSpec.Bool("multi", "Multi select");
-        mul.flag = multi;
+        mul.Field("multi", 2);
         ps.Add(mul);
         PropSpec reo = PropSpec.Bool("reorder", "Drag reorder");
-        reo.flag = reorder;
+        reo.Field("reorder", 2);
         reo.WithTip("Allow dragging nodes to move or re-parent them.");
         ps.Add(reo);
         PropSpec empty = PropSpec.Text("empty", "Empty text");
-        empty.str = Empty;
+        empty.Field("Empty", 0);
         ps.Add(empty);
         return ps;
     }
 
     public override string GetProp(string key) {
         if (key == "data" || key == "value" || key == "sel") {
-            return Convert.ToString(sel != null ? sel.Get() : -1);
+            return Convert.ToString(Value != null ? Value.Get() : -1);
         }
         if (key == "empty") { return Empty; }
         return base.GetProp(key);
@@ -496,7 +520,7 @@ public class TreeView : Control {
     public override void SetProp(string key, string val) {
         if (key == "data" || key == "value" || key == "sel") {
             int idx = Convert.ToInt32(val);
-            if (sel != null) { sel.Set(idx); }
+            if (Value != null) { Value.Set(idx); }
             return;
         }
         if (key == "empty") { Empty = val; return; }
@@ -504,6 +528,16 @@ public class TreeView : Control {
     }
 
     // 覆写：CSS 类型选择器名（"tree"）。
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.Arrange(bx, by, bw, bh);
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.Arrange(bx, by, bw, bh);
+        return base.FindInputFocus(app);
+    }
+
     public override string StyleType() { return "tree"; }
 
     // ---- 数据 ---------------------------------------------------------------
@@ -513,7 +547,7 @@ public class TreeView : Control {
         if (nodes == null) { data = new List<TreeNode>(); }
         else { data = nodes; }
         this.RetireRows();
-        if (sel.Get() >= data.Count) { sel.Set(0 - 1); }
+        if (Value.Get() >= data.Count) { Value.Set(0 - 1); }
         int mi = marks.Count - 1;
         while (mi >= 0) {
             if (marks[mi] >= data.Count) { marks.RemoveAt(mi); }
@@ -534,10 +568,7 @@ public class TreeView : Control {
 
     // 共享调用方的选择信号，供在节点列表重建时
     // 持久化选择的宿主使用。
-    public TreeView BindSel(SignalInt s) {
-        if (s != null) { sel = s; }
-        return this;
-    }
+
 
     // 在树顶部绘制内联过滤行，本身不进行过滤：
     // 宿主在输入变化时重新绑定过滤后的列表。
@@ -557,10 +588,10 @@ public class TreeView : Control {
         return this;
     }
 
-    public override Control HitTest(int x, int y, int pointerType) {
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         this.Arrange(bx, by, bw, bh);
-        return base.HitTest(x, y, pointerType);
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
     }
 
     public TreeView WithChecks() {
@@ -605,32 +636,32 @@ public class TreeView : Control {
     public TreeNode NodeAt(int row) { return data[row]; }
 
     // 选中行号（-1 = 无选中）。
-    public int SelectedIndex() { return sel.Get(); }
+    public int SelectedIndex() { return Value.Get(); }
 
     // 是否有一行处于选中状态。
-    public bool HasSelection() { return this.Has(sel.Get()); }
+    public bool HasSelection() { return this.Has(Value.Get()); }
 
     // 选中的节点；仅在 HasSelection() 时有效。
-    public TreeNode Selected() { return data[sel.Get()]; }
+    public TreeNode Selected() { return data[Value.Get()]; }
 
     // 编程式选中一行，变化时触发 Select。
     public void SelectIndex(int row) {
         if (row < 0 - 1 || row >= data.Count) { return; }
-        if (sel.Get() == row) { return; }
-        sel.Set(row);
+        if (Value.Get() == row) { return; }
+        Value.Set(row);
         Select.PostS(this);
     }
 
     // 清空选中与全部多选标记。
     public void ClearSelection() {
-        sel.Set(0 - 1);
+        Value.Set(0 - 1);
         marks = new List<int>();
     }
 
     // `row` 属于选择集（含焦点行）时返回 true。
     public bool IsMarked(int row) {
         if (row < 0) { return false; }
-        if (row == sel.Get()) { return true; }
+        if (row == Value.Get()) { return true; }
         for (int i = 0; i < marks.Count; i = i + 1) {
             if (marks[i] == row) { return true; }
         }
@@ -761,8 +792,15 @@ public class TreeView : Control {
     public int RowHeight() { return this.RowHeight(this.App); }
     public int RowHeight(App app) {
         app = this.ResolveApp(app);
+        if (fixedRowHeight > 0) { return app != null ? app.Scale(fixedRowHeight) : fixedRowHeight; }
         if (app == null) { return 24; }
-        StyleBox s = this.ResolveStyleAs(app, "tree", Class, Style.SNormal());
+        // Row metrics must not replace the surface selector or its active state.
+        StyleBox s = computedStyle;
+        if (computedStyleState != Style.SNormal()
+        || !this.ComputedStyleCurrentAs(app, "tree", Class)) {
+            s = Style.Full(app, "tree", Class, name, Style.SNormal());
+            Style.Inline(s, this);
+        }
         return s.HeightOr(app.theme.heightSmall);
     }
 
@@ -821,6 +859,7 @@ public class TreeView : Control {
     public int RowExtent(Control row) { return this.RowExtent(this.App, row); }
     public int RowExtent(App app, Control row) {
         app = this.ResolveApp(app);
+        if (fixedRowHeight > 0) { return this.RowHeight(app); }
         int h = row.prefH;
         if (h <= 0) { h = this.RowHeight(app); }
         return h;
@@ -830,48 +869,53 @@ public class TreeView : Control {
     // 测量子控件，因为树的测量阶段在发现需要重建时
     // 已经走过了它们。
     public void BuildRows() { this.BuildRows(this.App); }
+    private Control CreateRow(int index) {
+        TreeNode node = data[index];
+        if (tpl != null) { return tpl(node); }
+        if (node.extra == null) { return null; }
+        Row row = new Row().AlignCenter().Gap(6);
+        row.Child(new Label(node.label));
+        row.Child(new Spacer());
+        row.Child(node.extra);
+        return row;
+    }
+
     public void BuildRows(App app) {
-        App host = this.FindApp();
-        Control ownerParent = parent;
-        app = host != null ? host : this.ResolveApp(app);
-        if (buildingRows || (!rowsStale && builtFor == data.Count)) { return; }
+        if (buildingRows || (fixedRowHeight <= 0 && !rowsStale && builtFor == data.Count)) { return; }
         buildingRows = true;
         try {
-            this.RetireRows();
-            if (this.FindApp() != host || parent != ownerParent) { return; }
-            int ticket = rowsRevision;
-            List<TreeNode> source = data;
-            NodeOf template = tpl;
-            List<Control> mapped = new List<Control>();
-            dataRows = mapped;
-            for (int i = 0; i < source.Count; i = i + 1) {
-                Control row = null;
-                if (template != null) { row = template(source[i]); }
-                else if (source[i].extra != null) {
-                    Row r = new Row().AlignCenter().Gap(6);
-                    r.Child(new Label(source[i].label));
-                    r.Child(new Spacer());
-                    r.Child(source[i].extra);
-                    row = r;
-                }
-                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
-                // A repeated template object cannot represent two independent rows.
-                if (row != null && rowsBody.IndexOf(row) < 0 && rowsBody.Adoptable(row)) {
-                    rowsBody.Add(row);
-                    if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) {
-                        if (ticket != rowsRevision && this.FindApp() == host && parent == ownerParent
-                            && row.parent == rowsBody) { rowsBody.Remove(row); }
-                        return;
-                    }
-                }
-                else { row = null; }
-                if (row != null && row.parent != rowsBody) { row = null; }
-                mapped.Add(row);
-                if (row != null) { row.MeasureTree(app); }
-                if (ticket != rowsRevision || this.FindApp() != host || parent != ownerParent) { return; }
+            App host = this.FindApp();
+            Control ownerParent = parent;
+            Control root = host != null ? host.rootControl : null;
+            int expectedRevision = rowsRevision;
+            if (rowsStale || builtFor != data.Count) {
+                expectedRevision = expectedRevision + 1;
+                this.RetireRows();
             }
+            if (rowsRevision != expectedRevision || this.FindApp() != host || parent != ownerParent
+                || (host != null && host.rootControl != root)) { return; }
+            int ticket = rowsRevision;
+            List<int> wanted = new List<int>();
+            int n = data.Count;
+            if (this.Templated()) {
+                int hideDepth = -1;
+                int top = 0;
+                int height = this.RowHeight(app);
+                int offset = scroll.Get();
+                Rect view = this.ScrollViewport();
+                for (int i = 0; i < n; i = i + 1) {
+                    TreeNode node = data[i];
+                    if (fixedRowHeight <= 0) { wanted.Add(i); continue; }
+                    if (hideDepth >= 0 && node.depth > hideDepth) { continue; }
+                    hideDepth = -1;
+                    if (top + height > offset && top < offset + view.height + height) { wanted.Add(i); }
+                    top = top + height;
+                    if (node.isDir && !node.expanded) { hideDepth = node.depth; }
+                }
+            }
+            if (!rowHost.Reconcile(wanted, this.CreateRow, app) || ticket != rowsRevision) { return; }
             rowsStale = false;
-            builtFor = source.Count;
+            builtFor = n;
         } finally { buildingRows = false; }
     }
 
@@ -898,129 +942,6 @@ public class TreeView : Control {
         int inH = barH - app.Scale(4);
         // filter is a real child; Arrange and RenderTree belong to retained traversal.
         return rows;
-    }
-
-    // 一行的选择 / 展开 / 上下文交互。返回注册的 id，
-    // 以便据此绘制悬停状态。
-    public int RowInteract(int index, Rect row) {
-        return this.RowInteract(this.App, index, row);
-    }
-    public int RowInteract(App app, int index, Rect row) {
-        app = this.ResolveApp(app);
-        if (app == null || app.focus == null || app.hitTester == null) { return 0; }
-        int id = app.focus.AllocId();
-        app.hitTester.RegisterRect(id, row.x, row.y, row.width, row.height, 0);
-        // 按下/点击的目标由 App 在事件到达时对着上一帧完整的命中区
-        // 解析，行自己再做一次 HitTest 只能看到本帧已注册的一半，
-        // 会抢走本该属于行内控件或上层浮层的手势。
-        if (app.PressTarget() != id && app.ClickTarget() != id
-            && app.RightPressTarget() != id) { return id; }
-        if (app.PressTarget() == id && app.EventKind() == 2
-            && app.window.EventButton() == 0) {
-            ctxRow = index;
-            ctxX = app.mouseX;
-            ctxY = app.mouseY;
-            if (reorder) {
-                pressed = true;
-                dragRow = index;
-                dragging = false;
-                dropAt = 0 - 1;
-                if (app.TouchDevice()) { app.ClaimDrag(); }
-            }
-            Press.PostS(this);
-        }
-        // 刚刚拖完的那一次松手不是点击：否则落点那一行会被
-        // 顺带选中，目录还会被展开 / 折叠。
-        if (dropDone) { return id; }
-        // 必须同时是本次点击解析出的目标：ClickAvailable() 只回答
-        // “本帧有一次可用的主键点击”，不认 id，单靠它会让任何进到
-        // 这里的行响应发生在别处的点击。
-        if (app.ClickTarget() == id && app.ClickAvailable()) {
-            TreeNode n = data[index];
-            int mods = app.window.EventMods();
-            if (multi && Modifiers.HasCtrl(mods)) {
-                // 将行切入/切出多选。不触发 Select
-                // （切换不是选中），目录保留
-                // 展开状态，使选择可以包含已折叠的文件夹。
-                bool was = false;
-                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
-                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
-                }
-                if (sel.Get() == index) { sel.Set(0 - 1); was = true; }
-                if (!was) {
-                    if (sel.Get() < 0) { sel.Set(index); }
-                    else { marks.Add(index); }
-                }
-                ctxRow = index;
-                this.NoteSelfDamage(app);
-                return id;
-            }
-            if (multi && Modifiers.HasShift(mods) && sel.Get() >= 0) {
-                // 将选择从焦点行扩展到本行，
-                // 只标记可见行，使折叠目录的子节点
-                // 永远不会被悄悄选中。
-                int a = sel.Get();
-                int b = index;
-                if (b < a) { int tmp = a; a = b; b = tmp; }
-                int r = a;
-                while (r <= b) {
-                    if (!this.IsMarked(r) && this.Shown(r)) { marks.Add(r); }
-                    r = r + 1;
-                }
-                ctxRow = index;
-                this.NoteSelfDamage(app);
-                return id;
-            }
-            bool moved = sel.Get() != index;
-            if (multi) { marks = new List<int>(); }
-            sel.Set(index);
-            ctxRow = index;
-            if (n.isDir) {
-                n.expanded = !n.expanded;
-                rowsStale = true;
-                if (n.expanded) { Expand.PostS(this); } else { Collapse.PostS(this); }
-            }
-            if (moved) { Select.PostS(this); }
-            if (app.DoubleClickNow()) { Activate.PostS(this); }
-            this.NoteSelfDamage(app);
-        } else if (app.RightPressTarget() == id && app.EventKind() == 2
-                   && app.window.EventButton() == 1) {
-            // 右键点击会把选择移到菜单所针对的行，
-            // 但不触发 Select：打开上下文菜单不是选中。
-            // 右键点击已属于多选集合的行
-            // 保持选择不变，使上下文操作可以作用于全部。
-            if (!(multi && this.IsMarked(index))) {
-                if (multi) { marks = new List<int>(); }
-                sel.Set(index);
-            }
-            ctxRow = index;
-            ctxX = app.mouseX;
-            ctxY = app.mouseY;
-            Context.PostS(this);
-            this.NoteSelfDamage(app);
-        } else if (app.TouchDevice() && app.PollLongPress(id)) {
-            // 触摸长按等价右键：按住行上不动打开上下文菜单，
-            // 选择语义与右键一致（针对行不触发 Select，已属
-            // 多选的行保持选择不变）。触摸按下帧已把行记入
-            // 拖拽预备态（pressed/dragRow）——长按意味着这是
-            // 菜单手势而不是行拖拽，就地清掉。
-            if (!(multi && this.IsMarked(index))) {
-                if (multi) { marks = new List<int>(); }
-                sel.Set(index);
-            }
-            ctxRow = index;
-            ctxX = app.mouseX;
-            ctxY = app.mouseY;
-            if (reorder) {
-                pressed = false;
-                dragRow = 0 - 1;
-                dragging = false;
-                dropAt = 0 - 1;
-            }
-            Context.PostS(this);
-            this.NoteSelfDamage(app);
-        }
-        return id;
     }
 
     // 选择、展开、折叠只改变树自己的那块像素，因此把损伤
@@ -1164,7 +1085,7 @@ public class TreeView : Control {
         int box = app.Scale(16);
         int checkCol = 0;
         if (checks) { checkCol = box + app.Scale(6); }
-        int selRow = sel.Get();
+        int selRow = Value.Get();
         bool checkClick = false;
         int hideDepth = 0 - 1;
         int y = rows.y - off;
@@ -1202,7 +1123,7 @@ public class TreeView : Control {
                     if (active) {
                         c.FillRect(rb.x, rb.y, rowW, rh, rowSelected.BgOr(0));
                         c.FillRect(rb.x, rb.y, app.Scale(3), rh, indicator.BgOr(0));
-                    } else if (id >= 0 && app.focus.IsHovered(id)) {
+                    } else if (this.IsRowHovered(k)) {
                         c.FillRect(rb.x, rb.y, rowW, rh, rowHover.BgOr(0));
                     }
                     if (checks) {
@@ -1297,7 +1218,7 @@ public class TreeView : Control {
         if (evt == "Check") { Check.Add(a); return; }
         if (evt == "Press") { Press.Add(a); return; }
         if (evt == "Move") { Move.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -1311,7 +1232,7 @@ public class TreeView : Control {
         if (evt == "Check") { Check.AddS(a); return; }
         if (evt == "Press") { Press.AddS(a); return; }
         if (evt == "Move") { Move.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
     public override void TriggerEvent(string evt) {

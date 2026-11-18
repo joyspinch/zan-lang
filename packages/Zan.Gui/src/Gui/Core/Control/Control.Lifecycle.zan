@@ -1,0 +1,135 @@
+using System.Collections.Generic;
+
+namespace Gui;
+
+public partial class Control {
+    private bool preparingLayoutEvents;
+    private weak Control preparingLayoutOwner;
+    private weak Control preparingLayoutParent;
+    private int preparingLayoutOwnerRevision;
+    private weak App retiringLayoutApp;
+    private weak Control retiringLayoutOwner;
+    private int retiringLayoutRevision;
+
+    // Derived controls may prepare geometry during snapshots, but must preserve real input ownership.
+    protected bool CanPrepareInputState(App host) {
+        return host != null && host.snapshotInputSilenceDepth == 0;
+    }
+
+    // Root identity alone cannot detect a callback reinstalling the same input tree.
+    protected int InputRootRevision(App host) {
+        return host != null ? host.inputRootGeneration : 0;
+    }
+
+    // Borrowing hosts extend this snapshot without adopting or dispatching another tree walk.
+    // Leaves allocate nothing. Membership is checked again after every user callback.
+    protected virtual List<Control> LayoutChildren() {
+        return childNodes.Count == 0 ? null : this.SnapshotChildren();
+    }
+
+    protected virtual bool OwnsLayoutChild(Control child) {
+        return child != null && child.parent == this && this.IndexOf(child) >= 0;
+    }
+
+    protected virtual bool LayoutChildVisible(Control child) { return true; }
+    protected virtual int LayoutRevision() { return 0; }
+
+    private bool LayoutPhaseCurrent(App host, Control root, int generation,
+    long sequence, int phase, int frame) {
+        return host.rootControl == root && host.inputRootGeneration == generation
+        && host.inputPreparationTicket == phase && host.frameSeq == frame
+        && host.window.EventSeq() == sequence;
+    }
+
+    private bool LayoutNodeCurrent(App host, Control ownerParent, int revision) {
+        if (parent != ownerParent || this.FindApp() != host || this.LayoutRevision() != revision) { return false; }
+        Control child = this;
+        Control owner = preparingLayoutOwner;
+        while (owner != null) {
+            if (owner.LayoutRevision() != child.preparingLayoutOwnerRevision || owner.FindApp() != host
+            || !owner.OwnsLayoutChild(child)) { return false; }
+            if (!owner.preparingLayoutEvents) { return true; }
+            if (owner.parent != owner.preparingLayoutParent) { return false; }
+            child = owner;
+            owner = owner.preparingLayoutOwner;
+        }
+        return true;
+    }
+
+    internal void RetireLayoutEvents(App host, Control owner) {
+        if (host == null || owner == null) { return; }
+        if (preparingLayoutEvents) {
+            retiringLayoutApp = host;
+            retiringLayoutOwner = owner;
+            retiringLayoutRevision = owner.LayoutRevision();
+            return;
+        }
+        this.PrepareOwnedLayoutEvents(host, false, owner);
+    }
+
+    // Commit lifecycle state before callbacks; Paint only consumes prepared geometry.
+    internal bool PrepareLayoutEvents(App host, bool ancestorVisible) {
+        return this.PrepareOwnedLayoutEvents(host, ancestorVisible, null);
+    }
+
+    private bool PrepareOwnedLayoutEvents(App host, bool ancestorVisible, Control owner) {
+        if (host == null || host.snapshotInputSilenceDepth > 0) { return true; }
+        if (preparingLayoutEvents) { return false; }
+        if (this.app != host) { this.InheritApp(host); }
+        Control ownerParent = parent;
+        Control root = host.rootControl;
+        int generation = host.inputRootGeneration;
+        long sequence = host.window.EventSeq();
+        int phase = host.inputPreparationTicket;
+        int frame = host.frameSeq;
+        int revision = this.LayoutRevision();
+        preparingLayoutOwner = owner;
+        preparingLayoutParent = ownerParent;
+        preparingLayoutOwnerRevision = owner != null ? owner.LayoutRevision() : 0;
+        preparingLayoutEvents = true;
+        try {
+            bool shown = ancestorVisible && this.StyleVisible();
+            bool show = shown && !lastVisible && everLaidOut;
+            bool hide = !shown && lastVisible;
+            bool resize = shown && everLaidOut && (bw != lastBw || bh != lastBh);
+            lastVisible = shown;
+            if (shown) {
+                lastBw = bw;
+                lastBh = bh;
+                everLaidOut = true;
+            }
+            if (hide && extra != null && extra.Hide != null) { extra.Hide.RaiseS(this); }
+            if (!this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)) { return false; }
+            if (!this.LayoutNodeCurrent(host, ownerParent, revision)) { return true; }
+            if (show && extra != null && extra.Show != null) { extra.Show.RaiseS(this); }
+            if (!this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)) { return false; }
+            if (!this.LayoutNodeCurrent(host, ownerParent, revision)) { return true; }
+            if (resize && extra != null && extra.Resize != null) { extra.Resize.RaiseS(this); }
+            if (!this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)) { return false; }
+            if (!this.LayoutNodeCurrent(host, ownerParent, revision)) { return true; }
+            List<Control> children = this.LayoutChildren();
+            if (children == null) { return true; }
+            for (int i = 0; i < children.Count; i = i + 1) {
+                Control child = children[i];
+                if (!this.OwnsLayoutChild(child)) { continue; }
+                if (!child.PrepareOwnedLayoutEvents(host, shown && this.LayoutChildVisible(child), this)) { return false; }
+                if (!this.LayoutPhaseCurrent(host, root, generation, sequence, phase, frame)) { return false; }
+                if (!this.LayoutNodeCurrent(host, ownerParent, revision)) { return true; }
+            }
+            return true;
+        } finally {
+            preparingLayoutEvents = false;
+            preparingLayoutOwner = null;
+            preparingLayoutParent = null;
+            App retiredApp = retiringLayoutApp;
+            Control retiredOwner = retiringLayoutOwner;
+            int retiredRevision = retiringLayoutRevision;
+            retiringLayoutApp = null;
+            retiringLayoutOwner = null;
+            if (retiredApp != null && retiredOwner != null && this.FindApp() == retiredApp
+            && retiredOwner.LayoutRevision() == retiredRevision && retiredOwner.OwnsLayoutChild(this)) {
+                this.PrepareOwnedLayoutEvents(retiredApp, false, retiredOwner);
+            }
+        }
+    }
+}

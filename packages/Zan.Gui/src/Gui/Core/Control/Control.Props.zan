@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Json;
 using Gui;
 
 namespace Gui;
@@ -16,18 +17,30 @@ public partial class Control {
 
     // Copy business content only; composite widgets rebuild their generated parts.
     public virtual void CloneContentTo(Control target, CloneTreeFn clone) {
-        for (int i = 0; i < children.Count; i = i + 1) {
-            Control child = clone(children[i]);
+        for (int i = 0; i < childNodes.Count; i = i + 1) {
+            Control child = clone(childNodes[i]);
             if (child == null) { continue; }
             if (child.slotName != "" && target.MountSlot(child.slotName, child)) { continue; }
             target.Add(child);
         }
     }
 
-    // 供检查器和序列化器使用的控件专属可编辑属性。
-    // 通用几何（dock/pad/gap/size/pos/name）由 Serialize 处理，
-    // 因此这里只返回控件独有的属性。基类没有。
-    public virtual List<PropSpec> Props() {
+    // Build a schema once per instance. Field descriptors resolve the current
+    // Binding at access time; replacing a Binding never invalidates metadata.
+    public List<PropSpec> Props() {
+        int schemaKey = this.PropertySchemaKey();
+        ControlExtra state = this.EnsureExtra();
+        if (state.propertySpecs == null || state.propertySchemaKey != schemaKey) {
+            List<PropSpec> specs = this.DefineProps();
+            state.propertySpecs = specs;
+            state.propertySchemaKey = schemaKey;
+        }
+        return state.propertySpecs;
+    }
+
+    protected virtual int PropertySchemaKey() { return 0; }
+
+    protected virtual List<PropSpec> DefineProps() {
         return new List<PropSpec>();
     }
 
@@ -47,15 +60,7 @@ public partial class Control {
             if (first == null) { first = p; }
             if ((p.ValueKind() == 1) == numeric) { return p; }
         }
-        if (first != null) { return first; }
-        // 既有控件未声明默认时，保留 value/data/text 的属性协议顺序。
-        for (int pass = 0; pass < 3; pass = pass + 1) {
-            string key = pass == 0 ? "value" : (pass == 1 ? "data" : "text");
-            for (int i = 0; i < ps.Count; i = i + 1) {
-                if (ps[i].Answers(key)) { return ps[i]; }
-            }
-        }
-        return null;
+        return first;
     }
 
     // 一切由字段支撑的属性仅由 Props() 提供。
@@ -105,23 +110,26 @@ public partial class Control {
         return true;
     }
 
+    // Aliases resolve against the cached schema; field access follows the current Binding.
+    private PropSpec ResolveProperty(string key) {
+        return PropSpec.Find(this.Props(), key, false);
+    }
+
     // 通过控件在 Props() 中绑定的访问器，按键以文本形式读取属性——
     // 这样控件只需发布每个属性一次，无需自己的
     // 字符串映射。`class`、`name` 和 `disabled` 对所有控件都有应答。
     public virtual string GetProp(string key) {
         if (key == "class") { return Class; }
-        if (key == "name") { return name; }
-        PropSpec p = this.PropOf(key);
-        if (p == null && (key == "data" || key == "value")) {
-            p = this.PropOf("value");
-            if (p == null) { p = this.PropOf("data"); }
-            if (p == null) { p = this.PropOf("text"); }
-        } else if (p == null && key == "text") {
-            p = this.PropOf("text");
-            if (p == null) { p = this.PropOf("value"); }
-            if (p == null) { p = this.PropOf("data"); }
+        if (key == "visible") { return PropSpec.Flag(this.Visible); }
+        if (key == "name") {
+            // Match SetProp: a bound widget name is distinct from the node ID.
+            PropSpec np = this.PropOf(key);
+            if (np != null && np.IsBound()) { return np.ReadFrom(this); }
+            return name;
         }
-        if (p != null && p.IsBound()) { return p.Read(); }
+        PropSpec p = this.ResolveProperty(key);
+        if (p != null && p.ExtraAccess) { return this.GetExtra(p.key); }
+        if (p != null && p.IsBound()) { return p.ReadFrom(this); }
         // `disabled` 是基类字段（沿树继承的禁用标志）——每个控件都
         // 有这个状态，属性协议必须应答它。控件自己没声明该属性时，
         // 设计器写进去的"禁用"落不到控件上（基类兜底会把它当样式
@@ -129,7 +137,7 @@ public partial class Control {
         if (key == "disabled") { return PropSpec.Flag(this.Disabled.Get()); }
         string extra = this.GetExtra(key);
         if (extra != "") { return extra; }
-        if (p != null) { return p.Read(); }
+        if (p != null) { return p.ReadFrom(this); }
         return "";
     }
 
@@ -139,6 +147,7 @@ public partial class Control {
     // 控件没有字段对应的视觉变体。
     public virtual void SetProp(string key, string val) {
         if (key == "class") { Class = val; this.Invalidate(); return; }
+        if (key == "visible") { this.Visible = PropSpec.IsOn(val); this.Invalidate(); return; }
         if (key == "style") {
             // 内联 CSS 声明即时落控件（布局键落字段、视觉键落 style*
             // 覆盖字段）。清掉常态样式缓存：SetProp 可能发生在首绘
@@ -154,13 +163,11 @@ public partial class Control {
             // （data-x-props/原生属性）下永远喂不进去。
             PropSpec np = this.PropOf(key);
             if (np != null && np.IsBound()) {
-                np.Write(val);
-                if (np.syncName) { name = val; }
+                np.WriteTo(this, val);
                 this.Invalidate();
                 return;
             }
             if (this.SetExtra(key, val)) {
-                if (np != null && np.syncName) { name = val; }
                 this.Invalidate();
                 return;
             }
@@ -168,30 +175,24 @@ public partial class Control {
             this.Invalidate();
             return;
         }
-        PropSpec p = this.PropOf(key);
-        if (p == null && (key == "data" || key == "value")) {
-            p = this.PropOf("value");
-            if (p == null) { p = this.PropOf("data"); }
-            if (p == null) { p = this.PropOf("text"); }
-        } else if (p == null && key == "text") {
-            p = this.PropOf("text");
-            if (p == null) { p = this.PropOf("value"); }
-            if (p == null) { p = this.PropOf("data"); }
+        PropSpec p = this.ResolveProperty(key);
+        if (p != null && p.ExtraAccess) {
+            if (this.SetExtra(p.key, val)) {
+                this.Invalidate();
+            }
+            return;
         }
         if (p != null && p.IsBound()) {
-            p.Write(val);
-            if (p.syncName) { name = val; }
+            p.WriteTo(this, val);
             this.Invalidate();
             return;
         }
         if (this.SetExtra(key, val)) {
-            if (p != null && p.syncName) { name = val; }
             this.Invalidate();
             return;
         }
         if (p != null) {
-            p.Write(val);
-            if (p.syncName) { name = val; }
+            p.WriteTo(this, val);
             this.Invalidate();
             return;
         }
@@ -202,7 +203,6 @@ public partial class Control {
             this.Invalidate();
             return;
         }
-        if (this.SetExtra(key, val)) { this.Invalidate(); return; }
         if (val == "true") { this.AddClass(key); this.Invalidate(); }
         else if (val != "" && val != "false") { this.AddClass(val); this.Invalidate(); }
     }
@@ -214,25 +214,162 @@ public partial class Control {
         if (txt == "") { return; }
         PropSpec p = this.PropOf("text");
         if (p == null) { return; }
-        p.Write(txt);
-        if (p.syncName) { name = txt; }
+        // Preserve the widget setter's retained projection before first measure.
+        this.SetProp(p.key, txt);
     }
 
-    // 添加动态属性绑定规则
-    void AddBindProp(string prop, string expr) {
-        ControlExtra e = this.EnsureExtra();
-        if (e.bindProps == null) {
-            e.bindProps = new List<BindPropEntry>();
+    // Declare a model path against a component property. An empty property uses
+    // the component's DefaultBinding metadata; no expression evaluator is involved.
+    internal ModelBindingDeclaration DeclareBinding(string path, string property, bool twoWay) {
+        if (!ModelBindingDeclaration.ValidPath(path)) {
+            throw new ArgumentException("Binding path must be a dotted identifier path");
         }
-        e.bindProps.Add(new BindPropEntry(prop, expr));
+        if (property != "" && (property.IndexOf(".") >= 0 || !ModelBindingDeclaration.ValidPath(property))) {
+            throw new ArgumentException("Binding property must be an identifier");
+        }
+        ControlExtra e = this.EnsureExtra();
+        if (e.bindings == null) { e.bindings = new List<ModelBindingDeclaration>(); }
+        for (int i = 0; i < e.bindings.Count; i = i + 1) {
+            ModelBindingDeclaration existing = e.bindings[i];
+            if (existing.property == property) {
+                throw new InvalidOperationException("Duplicate binding for property '" + property + "'");
+            }
+        }
+        ModelBindingDeclaration declaration = new ModelBindingDeclaration(path, property, twoWay);
+        e.bindings.Add(declaration);
+        Control.NoteBindingStructureChanged();
+        return declaration;
+    }
+
+    public Control BindPath(string path) {
+        this.DeclareBinding(path, "", true);
+        return this;
+    }
+
+    public Control BindPath(string path, string property) {
+        if (property == "") { throw new ArgumentException("Binding property cannot be empty"); }
+        this.DeclareBinding(path, property, true);
+        return this;
+    }
+
+    public Control BindOneWay(string path, string property) {
+        if (property == "") { throw new ArgumentException("Binding property cannot be empty"); }
+        this.DeclareBinding(path, property, false);
+        return this;
+    }
+
+    public int BindingCount {
+        get { return this.bindings != null ? this.bindings.Count : 0; }
+    }
+
+    public ModelBindingDeclaration BindingAt(int index) {
+        if (this.bindings == null || index < 0 || index >= this.bindings.Count) {
+            throw new ArgumentException("Binding index out of range");
+        }
+        return this.bindings[index];
+    }
+
+    public void SetBindingPath(int index, string path) {
+        if (!ModelBindingDeclaration.ValidPath(path)) {
+            throw new ArgumentException("Binding path must be a dotted identifier path");
+        }
+        ModelBindingDeclaration declaration = this.BindingAt(index);
+        if (declaration.path == path) { return; }
+        declaration.path = path;
+        Control.NoteBindingStructureChanged();
+    }
+
+    public void SetBindingProperty(int index, string property) {
+        if (property != "" && (property.IndexOf(".") >= 0 || !ModelBindingDeclaration.ValidPath(property))) {
+            throw new ArgumentException("Binding property must be an identifier");
+        }
+        ModelBindingDeclaration declaration = this.BindingAt(index);
+        if (!declaration.twoWay && property == "") {
+            throw new ArgumentException("One-way binding requires a component property");
+        }
+        for (int i = 0; i < this.bindings.Count; i = i + 1) {
+            if (i != index && this.bindings[i].property == property) {
+                throw new InvalidOperationException("Duplicate binding for property '" + property + "'");
+            }
+        }
+        if (declaration.property == property) { return; }
+        declaration.property = property;
+        Control.NoteBindingStructureChanged();
+    }
+
+    public void RemoveBindingAt(int index) {
+        this.BindingAt(index);
+        this.bindings.RemoveAt(index);
+        Control.NoteBindingStructureChanged();
+    }
+
+    public void ClearBindings() {
+        if (this.bindings != null && this.bindings.Count > 0) {
+            this.bindings.Clear();
+            Control.NoteBindingStructureChanged();
+        }
+    }
+
+    // Designer documents use one canonical array for both HTML and code-tree export.
+    public JsonValue BindingsJson() {
+        JsonValue result = JsonValue.NewArray();
+        for (int i = 0; i < this.BindingCount; i = i + 1) {
+            ModelBindingDeclaration binding = this.BindingAt(i);
+            JsonValue item = JsonValue.NewObject();
+            item.PutStr("path", binding.Path);
+            item.PutStr("property", binding.Property);
+            item.PutBool("twoWay", binding.TwoWay);
+            result.Append(item);
+        }
+        return result;
+    }
+
+    public void ReadBindingsJson(JsonValue source) {
+        this.ClearBindings();
+        if (source == null) { return; }
+        if (!source.IsArray()) { throw new ArgumentException("Bindings must be an array"); }
+        for (int i = 0; i < source.Count(); i = i + 1) {
+            JsonValue item = source.At(i);
+            if (item == null || !item.IsObject()) {
+                throw new ArgumentException("Binding declaration must be an object");
+            }
+            string path = item.Str("path", "");
+            string property = item.Str("property", "");
+            bool twoWay = item.Bool("twoWay", true);
+            if (!twoWay && property == "") {
+                throw new ArgumentException("One-way binding requires a component property");
+            }
+            this.DeclareBinding(path, property, twoWay);
+        }
+    }
+
+    public void CopyBindingsTo(Control target) {
+        if (target == null) { throw new ArgumentException("Binding copy target is required"); }
+        target.ClearBindings();
+        for (int i = 0; i < this.BindingCount; i = i + 1) {
+            ModelBindingDeclaration binding = this.BindingAt(i);
+            target.DeclareBinding(binding.Path, binding.Property, binding.TwoWay);
+        }
+    }
+
+    public bool BindingsEqual(Control other) {
+        if (other == null || this.BindingCount != other.BindingCount) { return false; }
+        for (int i = 0; i < this.BindingCount; i = i + 1) {
+            ModelBindingDeclaration a = this.BindingAt(i);
+            ModelBindingDeclaration b = other.BindingAt(i);
+            if (a.Path != b.Path || a.Property != b.Property || a.TwoWay != b.TwoWay) { return false; }
+        }
+        return true;
+    }
+
+    static string ClassWith(string source, string cls) {
+        if (source == null) { source = ""; }
+        if (cls == null || cls == "" || Style.Has(source, cls)) { return source; }
+        return source == "" ? cls : source + " " + cls;
     }
 
     // 若样式类尚不存在则添加它。
-    void AddClass(string cls) {
-        if (cls == "" || Style.Has(Class, cls)) { return; }
-        if (Class == "") { Class = cls; return; }
-        Class = Class + " " + cls;
-    }
+    void AddClass(string cls) { Class = Control.ClassWith(Class, cls); }
 
     // 把 `cls` 从 `Class` 里移除（不存在则原样；类列表以空格分隔）。
     // 与 AddClass 成对：新控件的状态类（selected/checked/indeterminate…）
@@ -266,8 +403,12 @@ public partial class Control {
     // 对齐方式都得自己先去清掉上一次留下的类。这个方法把互斥
     // 关系收在一处，供 Flex/Grid 这类有多组变体的容器使用。
     void SetClassIn(string group, string cls) {
+        Class = Control.ClassIn(Class, group, cls);
+    }
+
+    static string ClassIn(string source, string group, string cls) {
         List<string> drop = Style.Classes(group);
-        List<string> cur = Style.Classes(Class);
+        List<string> cur = Style.Classes(source);
         string kept = "";
         for (int i = 0; i < cur.Count; i = i + 1) {
             bool inGroup = false;
@@ -277,8 +418,7 @@ public partial class Control {
             if (inGroup) { continue; }
             if (kept == "") { kept = cur[i]; } else { kept = kept + " " + cur[i]; }
         }
-        Class = kept;
-        this.AddClass(cls);
+        return Control.ClassWith(kept, cls);
     }
 
     // Naive UI `size` prop 值对应的 class 片段：四档一一对应
@@ -322,11 +462,16 @@ public partial class Control {
     // 控件在解析样式前调用它，并在解析后把 Class 还原——档位因此
     // 只是"这一帧的排布"，不会污染作者写下的 Class。
     void ApplySizeClass() {
+        Class = this.SizeClassIn(Class);
+    }
+
+    // Project a size binding without consuming the author's class declaration.
+    string SizeClassIn(string source) {
         Binding<string> sz = this.SizeOf();
-        if (sz == null) { return; }
+        if (sz == null) { return source; }
         string cls = Control.SizeClass(sz.Get());
-        if (cls == "" || cls == "medium") { return; }
-        this.SetClassIn("tiny small medium large", cls);
+        if (cls == "" || cls == "medium") { return source; }
+        return Control.ClassIn(source, "tiny small medium large", cls);
     }
 
     // 设计器属性：尺寸档。控件在 Props() 里加一行
@@ -334,7 +479,7 @@ public partial class Control {
     // 写法一致。
     PropSpec SizeProp() {
         PropSpec sz = PropSpec.Enum("size", "Size", PropSpec.Sizes());
-        sz.str = this.SizeOf();
+        if (this.SizeOf() != null) { sz.Field("Size", 0); }
         return sz;
     }
 

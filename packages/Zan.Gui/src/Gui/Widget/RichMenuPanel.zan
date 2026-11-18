@@ -1,0 +1,89 @@
+using System.Collections.Generic;
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// Scrolling, wheel ownership and drag capture are the ordinary Control contract.
+public class RichMenuPanel : Control {
+    public weak RichMenu owner;
+    public List<MenuItem> items;
+    public int level;
+    public int session;
+
+    public RichMenuPanel(RichMenu menu, int depth) {
+        this.InitControl("contextmenu", 1);
+        this.wiresOwnEvents = true;
+        this.WithMinTouchSize(0);
+        this.SetProp("style", "overflow-x:hidden;overflow-y:auto");
+        owner = menu;
+        level = depth;
+        items = new List<MenuItem>();
+    }
+    public void SetItems(List<MenuItem> model, int generation) {
+        this.RemoveAll();
+        items = model != null ? model : new List<MenuItem>();
+        session = generation;
+        scrollY = 0;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            this.Add(new RichMenuRow(this, items[i], i, generation));
+        }
+    }
+    public override Rect ScrollViewport() { return new Rect(bx, by, bw, bh); }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w; bh = h;
+        App app = this.App;
+        if (app == null) { return; }
+        scrollExtent = RichMenu.Height(app, items);
+        scrollExtentX = w;
+        int max = scrollExtent - h;
+        if (max < 0) { max = 0; }
+        if (scrollY > max) { scrollY = max; }
+        if (scrollY < 0) { scrollY = 0; }
+        int yy = y + RichMenu.PadV(app) - scrollY;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            int height = RichMenu.ItemHeight(app, items[i]);
+            this.ChildAt(i).Arrange(x, yy, w, height);
+            yy = yy + height;
+        }
+    }
+    public override bool ChildInViewport(Control child) {
+        return child.by < by + bh && child.by + child.bh > by;
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!visible || x < bx || x >= bx + bw || y < by || y >= by + bh) { return null; }
+        if (scrollExtent > bh && x >= bx + bw - this.App.Scale(10)) { return this; }
+        for (int i = this.ChildCount() - 1; i >= 0; i = i - 1) {
+            Control row = this.ChildAt(i);
+            if (this.ChildInViewport(row) && y >= row.by && y < row.by + row.bh
+                && !Control.HitTestExcluded(row, excludedSubtrees)) { return row; }
+        }
+        return this;
+    }
+    public override void OnScrollChanged() {
+        this.Arrange(bx, by, bw, bh);
+        RichMenu menu = owner;
+        if (menu != null) { menu.Prepare(this.App); }
+    }
+    public override void OnPointerEnter(RoutedEventArgs e) {
+        base.OnPointerEnter(e);
+        if (owner != null) { owner.EnterPanel(level); }
+    }
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (owner != null) { owner.EnterPanel(level); }
+    }
+    public override void OnPaint(App app) {
+        StyleBox box = this.Box(app);
+        int radius = box.RadiusOr(app.theme.borderRadiusMedium);
+        if (box.shadow != 0) {
+            int blur = box.shadowBlur > 0 ? box.shadowBlur : 10;
+            app.canvas.ShadowRoundRect(bx + box.shadowDx, by + box.shadowDy, bw, bh,
+                radius, app.Scale(blur), box.Fade(box.shadow));
+        }
+        app.canvas.FillRoundRect(bx, by, bw, bh, radius, box.BgOr(0));
+        app.canvas.DrawRoundRect(bx, by, bw, bh, radius, box.BorderOr(0), box.BorderWOr(1));
+        app.BlockHitsRect(bx, by, bw, bh);
+        NativeLayer.Occlude(app, bx, by, bw, bh);
+    }
+}

@@ -17,7 +17,7 @@ public delegate string NumParser(string text);
 public delegate bool NumValidator(int value);
 
 // 数字输入框（Naive UI n-input-number）：内嵌 −/+ 步进按钮，
-// 中间是可编辑的数字区。绑定 SignalInt / `.data` 双向同步；
+// 中间是可编辑的数字区。通过 Value 绑定双向同步；
 // min/max 钳制，step 定步长；聚焦后 ↑/↓ 键同样加减，回车提交。
 // age.Change += () => { ... };
 // age.Prefix = "¥";             // 前缀
@@ -39,10 +39,7 @@ public delegate bool NumValidator(int value);
 // `input::suffix` part——代码只留几何与交互，不直读主题语义色。
 public class InputNumber : Control {
     // 值信号：立即模式与保留模式共用一条真值来源。
-    public SignalInt model;
-    // 双向绑定状态：`num.data = model.field;` 使模型字段与
-    // 输入框双向同步（编译器降级的 Binding）。
-    public Binding<int> data;
+    public Binding<int> Value;
     // 空值占位提示（值为 0 且不在编辑时显示 hint 而非 "0" 的场景
     // 由 hint != "" 决定；默认 "" 直接显示数值）。
     public string hint;
@@ -101,9 +98,9 @@ public class InputNumber : Control {
     public bool invalidFlag;
 
     // 公共初始化（各构造共用）。
-    private void InitNumber(SignalInt m, int lo, int hi) {
+    private void InitNumber(int lo, int hi) {
         this.InitControl("inputNumber", 1);
-        model = m;
+        Value = lo;
         minV = lo;
         maxV = hi;
         stepV = 1;
@@ -147,12 +144,12 @@ public class InputNumber : Control {
 
     // Default design-time constructor（范围 0..100）。
     public InputNumber() {
-        InitNumber(new SignalInt(0), 0, 100);
+        InitNumber(0, 100);
     }
 
     // `new InputNumber(0, 120)` —— 带取值范围。
     public InputNumber(int lo, int hi) {
-        InitNumber(new SignalInt(lo), lo, hi);
+        InitNumber(lo, hi);
     }
 
     // 控件类型标识（序列化/设计器用）。
@@ -208,7 +205,6 @@ public class InputNumber : Control {
     }
 
     // 当前值（经绑定解析）。
-    public int Value() { return model.Get(); }
 
     // ---- 定点数数学（纯函数，无窗口可测） ------------------------------
 
@@ -277,7 +273,7 @@ public class InputNumber : Control {
 
     // 当前完整展示串（分组 + Formatter），即字段里显示的那段数字。
     public string DisplayText() {
-        string s = this.PlainText(model.Get());
+        string s = this.PlainText(Value.Get());
         if (GroupDigits) { s = InputNumber.GroupThousands(s); }
         if (Formatter != null) { s = Formatter(s); }
         return s;
@@ -378,9 +374,8 @@ public class InputNumber : Control {
     // 内部写值：钳制、写回绑定、跑验证并触发 Change（值未变时静默）。
     public void SetRaw(int v) {
         v = this.Clamp(v);
-        if (model.Get() == v) { return; }
-        model.Set(v);
-        if (data != null) { data.Set(v); }
+        if (Value.Get() == v) { return; }
+        Value.Set(v);
         this.RunValidator(v);
         Change.RaiseS(this);
     }
@@ -416,19 +411,19 @@ public class InputNumber : Control {
     // 解析编辑缓冲为数值并提交（空缓冲/非法串还原当前值）。
     public void CommitBuffer() {
         if (editBuf == "") { return; }
-        int v = ParseScaled(editBuf, this.Decimals(), model.Get(), Parser);
+        int v = ParseScaled(editBuf, this.Decimals(), Value.Get(), Parser);
         editBuf = "";
         this.SetRaw(v);
     }
 
     public void StepDown() {
         if (this.IsDisabled() || Loading) { return; }
-        this.SetRaw(this.StepDownVal(model.Get()));
+        this.SetRaw(this.StepDownVal(Value.Get()));
     }
 
     public void StepUp() {
         if (this.IsDisabled() || Loading) { return; }
-        this.SetRaw(this.StepUpVal(model.Get()));
+        this.SetRaw(this.StepUpVal(Value.Get()));
     }
 
     public void OnInputChange() {
@@ -448,55 +443,55 @@ public class InputNumber : Control {
 
     // 覆写：返回设计器属性清单（值 / 尺寸档 / 前后缀 / 按钮位置）；
     // 设计期常量键（min/max/step 等）经 GetExtra/SetExtra 应答。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         // 值通道指向活的外部绑定（§6.1 单协议，snum 直写 model、
         // precision/group 是设计期常量：普通字段直赋即实时绑定
         // （PropSpec 合成访问器对，与 Progress.fillColor 同一惯用法）。
         // value/text 的读写经 GetProp/SetProp 覆写走 ParseScaled 与
         // DisplayText（见下）。
-        PropSpec val = PropSpec.Int("value", "Value");
+        PropSpec val = PropSpec.Int("value", "Value").DefaultBinding();
         // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        if (data != null) { val.num = data; } else { val.snum = model; }
+        val.Field("Value", 1);
         val.Also("text");
         ps.Add(val);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.str = Size;
+        sz.Field("Size", 0);
         ps.Add(sz);
         PropSpec pfx = PropSpec.Text("prefix", "Prefix");
-        pfx.str = Prefix;
+        pfx.Field("Prefix", 0);
         ps.Add(pfx);
         PropSpec sfx = PropSpec.Text("suffix", "Suffix");
-        sfx.str = Suffix;
+        sfx.Field("Suffix", 0);
         ps.Add(sfx);
         PropSpec plc = PropSpec.Enum("placement", "Button Placement",
             new List<string>{ "both", "right" });
-        plc.str = Placement;
+        plc.Field("Placement", 0);
         ps.Add(plc);
         PropSpec mn = PropSpec.Int("min", "Min");
-        mn.num = minV;
+        mn.Field("minV", 1);
         ps.Add(mn);
         PropSpec mx = PropSpec.Int("max", "Max");
-        mx.num = maxV;
+        mx.Field("maxV", 1);
         ps.Add(mx);
         PropSpec stp = PropSpec.Int("step", "Step");
-        stp.num = stepV;
+        stp.Field("stepV", 1);
         stp.StepBy(1);
         stp.WithTip("Increment of the +/- buttons, in display units "
                     + "(scaled by precision).");
         ps.Add(stp);
         PropSpec hnt = PropSpec.Text("hint", "Placeholder");
-        hnt.str = hint;
+        hnt.Field("hint", 0);
         hnt.Also("placeholder");
         ps.Add(hnt);
         PropSpec pre = PropSpec.Int("precision", "Precision");
-        pre.num = Precision;
+        pre.Field("Precision", 1);
         pre.Step(1, 0, 6);
         pre.WithTip("Decimal places (fixed-point model: value * 10^precision).");
         ps.Add(pre);
         PropSpec grp = PropSpec.Bool("group", "Group digits");
-        grp.flag = GroupDigits;
+        grp.Field("GroupDigits", 2);
         grp.Also("groupDigits");
         grp.WithTip("Show thousands separators while displaying.");
         ps.Add(grp);
@@ -516,7 +511,7 @@ public class InputNumber : Control {
     // 整数），再经 SetRaw 收口钳制/校验/事件。
     public override void SetProp(string key, string val) {
         if (key == "value" || key == "text") {
-            this.SetRaw(ParseScaled(val, this.Decimals(), model.Get(), Parser));
+            this.SetRaw(ParseScaled(val, this.Decimals(), Value.Get(), Parser));
             return;
         }
         base.SetProp(key, val);
@@ -555,7 +550,7 @@ public class InputNumber : Control {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "Submit") { Submit.Add(a); return; }
         if (evt == "Invalid") { Invalid.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
@@ -564,7 +559,7 @@ public class InputNumber : Control {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "Submit") { Submit.AddS(a); return; }
         if (evt == "Invalid") { Invalid.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
 
@@ -572,15 +567,9 @@ public class InputNumber : Control {
 
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            int cur = data.Get();
-            if (cur < minV) { cur = minV; }
-            if (cur > maxV) { cur = maxV; }
-            if (cur != model.Get()) {
-                model.Set(cur);
-                data.Set(cur);
-            }
-        }
+        int current = Value.Get();
+        int clamped = this.Clamp(current);
+        if (current != clamped) { Value.Set(clamped); }
         if (inputNode != null) {
             string expected = this.DisplayText();
             if (inputNode.GetText() != expected) {
@@ -589,7 +578,4 @@ public class InputNumber : Control {
         }
     }
 
-    public override void OnPaint(App app) {
-        SyncBinding();
-    }
 }

@@ -1,0 +1,215 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// Retained queue items are ordinary children.  They have no hit regions or
+// per-frame polling; the parent updates their model and geometry in layout.
+class LayerQueueItemControl : Control {
+    ToastItem item;
+    bool notification;
+    int alpha;
+    string text = ""; string iconName = "";
+    int radius; int padding; int gap; int glyph; int font; int background; int border; int borderWidth;
+    int foreground; int iconColor; int stripe; int stripeWidth;
+
+    public LayerQueueItemControl(ToastItem model, bool isNotification) : base(isNotification ? "notification" : "toast") {
+        item = model;
+        notification = isNotification;
+        alpha = 1000;
+        wiresOwnEvents = true;
+    }
+
+    public ToastItem Model() { return item; }
+    public bool IsNotification() { return notification; }
+    public void SetAlpha(int value) { alpha = value; }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) { return null; }
+
+    public override void OnMeasure(App app) {
+        Theme t = app.theme;
+        if (notification) {
+            prefW = app.Scale(300);
+            prefH = t.heightLarge + t.paddingSmall;
+            return;
+        }
+        StyleBox style = Style.Of(app, "toast", Layer.RoleClass(item.type), Style.SNormal());
+        int fontSize = style.FontOr(Style.FontFallback(app, "medium"));
+        prefW = t.paddingMedium * 2 + t.iconSizeSmall + t.gapSmall
+        + Canvas.MeasureText(item.text, fontSize);
+        prefH = t.heightMedium;
+    }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        bx = px; by = py; bw = pw; bh = ph;
+        App app = this.FindApp();
+        if (app == null) { return; }
+        Theme theme = app.theme;
+        text = item.text; iconName = Layer.RoleIcon(item.type);
+        string role = Layer.RoleClass(item.type);
+        string kind = notification ? "notification" : "toast";
+        StyleBox style = Style.Of(app, kind, role, Style.SNormal());
+        radius = theme.borderRadiusMedium; padding = theme.paddingMedium; gap = theme.gapSmall;
+        glyph = notification ? theme.iconSizeMedium : theme.iconSizeSmall;
+        font = style.FontOr(Style.FontFallback(app, "medium")); background = style.bg;
+        border = Style.Fade(style.borderColor, alpha); borderWidth = style.BorderWOr(1);
+        foreground = Style.Fade(style.fg, alpha);
+        string part = notification ? "bar" : "icon";
+        StyleBox accent = Style.Part(app, kind, part, "", role, "", Style.SNormal());
+        iconColor = Style.Fade(notification ? accent.bg : accent.fg, alpha);
+        stripe = Style.Fade(accent.bg, alpha); stripeWidth = notification ? accent.WidthOr(3) : 0;
+    }
+
+    public override void OnPaint(App app) {
+        Canvas canvas = app.canvas;
+        int shadow = 34 * alpha / 1000;
+        canvas.FillRoundRect(bx + 1, by + 2, bw, bh, radius, shadow * 16777216);
+        app.FillGlass(bx, by, bw, bh, radius, background, alpha);
+        canvas.DrawRoundRect(bx, by, bw, bh, radius, border, borderWidth);
+        if (stripeWidth > 0) { canvas.FillRect(bx, by, stripeWidth, bh, stripe); }
+        canvas.DrawGlyphIn(iconName, bx + padding, by, glyph, bh, glyph, iconColor);
+        canvas.DrawText(bx + padding + glyph + gap, Canvas.CenterTextY(by, bh, font), text, foreground, font);
+    }
+}
+
+// Toast and notification queues share one retained root.  Hosts render this
+// control with the normal Measure/Arrange/RenderTree path; no Layer.Render*
+// entry or flat hit registration is involved.
+class LayerQueueControl : Control, AppLoopParticipant, AppPreparationParticipant {
+    weak App queueApp;
+    weak AppLoopRegistration registration;
+    List<LayerQueueItemControl> views;
+    int deadline = -1;
+
+    public LayerQueueControl(App app) : base("layer-queues") {
+        queueApp = app;
+        this.UseApp(app);
+        views = new List<LayerQueueItemControl>();
+        wiresOwnEvents = true;
+        registration = app.RegisterLoopParticipant(app, this);
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) { return null; }
+
+    public override void OnMeasure(App app) {
+        prefW = app.canvas.Width();
+        prefH = app.canvas.Height();
+    }
+
+    LayerQueueItemControl FindView(ToastItem item) {
+        for (int i = 0; i < views.Count; i = i + 1) {
+            if (views[i].Model() == item) { return views[i]; }
+        }
+        return null;
+    }
+
+    void SyncQueue(List<ToastItem> models, bool notification) {
+        for (int i = views.Count - 1; i >= 0; i = i - 1) {
+            LayerQueueItemControl view = views[i];
+            if (view.IsNotification() != notification) { continue; }
+            if (models.IndexOf(view.Model()) < 0) {
+                this.Remove(view);
+                views.RemoveAt(i);
+            }
+        }
+        for (int i = 0; i < models.Count; i = i + 1) {
+            if (this.FindView(models[i]) == null) {
+                LayerQueueItemControl view = new LayerQueueItemControl(models[i], notification);
+                views.Add(view);
+                this.Add(view);
+            }
+        }
+    }
+
+    public override void SyncBinding() {
+        base.SyncBinding();
+        App app = queueApp;
+        if (app == null) { return; }
+        AppLayerContext context = Layer.Context(app);
+        int now = Window.GetTickMs();
+        for (int i = context.toasts.Count - 1; i >= 0; i = i - 1) {
+            ToastItem item = context.toasts[i];
+            if (item.closing && now - item.closeMs >= 240) { context.toasts.RemoveAt(i); }
+        }
+        for (int i = context.notifs.Count - 1; i >= 0; i = i - 1) {
+            ToastItem item = context.notifs[i];
+            if (item.closing && now - item.closeMs >= 260) { context.notifs.RemoveAt(i); }
+        }
+        this.SyncQueue(context.toasts, false);
+        this.SyncQueue(context.notifs, true);
+    }
+
+    public void BeforeInput(App app, int kind) { this.MeasureTree(app); this.Arrange(0, 0, app.canvas.Width(), app.canvas.Height()); }
+    public void BeforePaint(App app, int frameSequence) { this.BeforeInput(app, 0); }
+    public void Tick(App app, int now) { if (deadline >= 0 && now >= deadline) { this.BeforeInput(app, 0); } }
+    public int NextDeadline() { return deadline; }
+
+    void IncludeDeadline(int due) { if (deadline < 0 || due < deadline) { deadline = due; } }
+
+    public override void Arrange(int px, int py, int pw, int ph) {
+        App app = queueApp;
+        if (app == null) { return; }
+        // Hosts arrange before RenderTree; bind newly enqueued models now so
+        // their first visible frame already has valid retained-child geometry.
+        this.SyncBinding();
+        pw = app.canvas.Width(); ph = app.canvas.Height();
+        bx = 0; by = 0; bw = pw; bh = ph;
+        AppLayerContext context = Layer.Context(app);
+        Theme t = app.theme;
+        int now = Window.GetTickMs();
+        deadline = -1;
+        int gap = app.Scale(8);
+        int slotH = t.heightMedium + gap;
+        int topY = app.titlebarH + app.Scale(10);
+        int rx = 0; int ry = app.titlebarH; int rw = pw; int rh = ph - app.titlebarH;
+        for (int i = 0; i < context.toasts.Count; i = i + 1) {
+            ToastItem item = context.toasts[i];
+            if (!item.closing && now - item.bornMs >= item.lifeMs) {
+                item.closing = true; item.closeMs = now;
+            }
+            this.IncludeDeadline(item.closing ? item.closeMs + 240 : item.bornMs + item.lifeMs);
+            int ty = topY + i * slotH;
+            if (item.curY < 0 - 9000) { item.curY = ty - app.Scale(14); }
+            else { item.curY = item.curY + (ty - item.curY) / 3; }
+            int enterP = App.Ease(Layer.Clamp01((now - item.bornMs) * 1000 / 220));
+            int exitP = item.closing ? App.Ease(Layer.Clamp01((now - item.closeMs) * 1000 / 240)) : 0;
+            LayerQueueItemControl view = this.FindView(item);
+            if (view == null) { continue; }
+            view.MeasureTree(app);
+            int width = view.prefW;
+            int x = (pw - width) / 2;
+            view.SetAlpha(enterP * (1000 - exitP) / 1000);
+            view.Arrange(x, item.curY, width, t.heightMedium);
+            if (i == 0) { rx = x; ry = item.curY; rw = width + 1; rh = t.heightMedium + 2; }
+        }
+        Layer.MarkQueueDirty(app, context.toastPrev, context.toasts.Count > 0, rx, ry, rw, rh);
+        int widthN = app.Scale(300);
+        int heightN = t.heightLarge + t.paddingSmall;
+        int gapN = app.Scale(10);
+        int xN = pw - widthN - app.Scale(16);
+        int yN = app.titlebarH + app.Scale(12);
+        int rxN = xN; int ryN = yN; int rwN = widthN; int rhN = heightN;
+        for (int i = 0; i < context.notifs.Count; i = i + 1) {
+            ToastItem item = context.notifs[i];
+            if (!item.closing && now - item.bornMs >= item.lifeMs) {
+                item.closing = true; item.closeMs = now;
+            }
+            this.IncludeDeadline(item.closing ? item.closeMs + 260 : item.bornMs + item.lifeMs);
+            int ty = yN + i * (heightN + gapN);
+            if (item.curY < 0 - 9000) { item.curY = ty; }
+            else { item.curY = item.curY + (ty - item.curY) / 3; }
+            int enterP = App.Ease(Layer.Clamp01((now - item.bornMs) * 1000 / 240));
+            int exitP = item.closing ? App.Ease(Layer.Clamp01((now - item.closeMs) * 1000 / 260)) : 0;
+            int a = enterP * (1000 - exitP) / 1000;
+            LayerQueueItemControl view = this.FindView(item);
+            if (view == null) { continue; }
+            view.SetAlpha(a);
+            int cx = xN + (1000 - a) * app.Scale(24) / 1000;
+            view.Arrange(cx, item.curY, widthN, heightN);
+            if (i == 0) { rxN = cx; ryN = item.curY; rwN = widthN; rhN = heightN; }
+        }
+        Layer.MarkQueueDirty(app, context.notifPrev, context.notifs.Count > 0, rxN, ryN, rwN, rhN);
+    }
+}

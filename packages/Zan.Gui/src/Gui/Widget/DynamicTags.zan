@@ -17,7 +17,8 @@ public class DynamicTags : Control {
     private Input editor;
     private bool editing;
     private bool takeFocus;
-    private bool editorFocused;
+    private int rebuildGeneration;
+    private DynamicTagsAction editorAction;
 
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
@@ -38,7 +39,6 @@ public class DynamicTags : Control {
         editor = new Input("");
         editing = false;
         takeFocus = false;
-        editorFocused = false;
         wiresOwnEvents = true;
         Change = new UiEvent();
         this.RebuildChildren();
@@ -88,6 +88,25 @@ public class DynamicTags : Control {
         this.RebuildChildren();
     }
 
+    private string OptionsText() {
+        string text = "";
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (i > 0) { text = text + "|"; }
+            text = text + items[i];
+        }
+        return text;
+    }
+
+    private void SetOptionsText(string value) {
+        List<string> next = new List<string>();
+        string text = value != null ? value : "";
+        List<string> labels = text.Split("|");
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            if (labels[i] != "") { next.Add(labels[i]); }
+        }
+        this.SetItems(next);
+    }
+
     public void Clear() {
         items.Clear();
         this.RebuildChildren();
@@ -108,7 +127,6 @@ public class DynamicTags : Control {
         editing = true;
         editor.SetText("");
         takeFocus = true;
-        editorFocused = true;
         this.RebuildChildren();
     }
 
@@ -122,7 +140,6 @@ public class DynamicTags : Control {
         string t = editor.GetText();
         editing = false;
         takeFocus = false;
-        editorFocused = false;
         editor.SetText("");
         if (add && t != "" && this.CanAdd()) {
             this.Add(t);
@@ -132,19 +149,32 @@ public class DynamicTags : Control {
         if (app != null) { app.RequestRedraw(); }
     }
 
+    public int RebuildGeneration() { return rebuildGeneration; }
+
     public void RebuildChildren() {
-        this.RemoveAll();
+        rebuildGeneration = rebuildGeneration + 1;
+        DynamicTagsAction proof = new DynamicTagsAction(this, -1);
+        this.RemoveChildren(this.SnapshotChildren(), proof.Current);
+        // Cancellation may rebuild this same instance; only the latest call appends.
+        if (!proof.Current()) { return; }
         for (int i = 0; i < items.Count; i = i + 1) {
             Tag t = new Tag(items[i]);
             t.Closable = this.Closable;
-            DynamicTagsAction closeAction = new DynamicTagsAction(this, i);
+            DynamicTagsAction closeAction = new DynamicTagsAction(this, i, t);
             t.Close.Add(closeAction.Close);
             this.Add(t);
+            if (!proof.Current()) { return; }
         }
 
+        if (editorAction != null) { editor.Submit.Remove(editorAction.Submit); }
+        editorAction = null;
         if (editing) {
             if (Placeholder != "") { editor.hint = Placeholder; }
+            editorAction = new DynamicTagsAction(this, -1);
+            editor.Submit.Add(editorAction.Submit);
             this.Add(editor);
+            if (!proof.Current()) { return; }
+            this.FocusEditor(this.FindApp());
         } else if (this.CanAdd()) {
             Button addBtn = new Button("+ " + this.AddLabel());
             addBtn.AddClass("dashed");
@@ -161,22 +191,33 @@ public class DynamicTags : Control {
     public override string Kind() { return "DynamicTags"; }
     public override Binding<string> SizeOf() { return Size; }
 
-    public override List<PropSpec> Props() {
+    public override string GetExtra(string key) {
+        if (key == "options") { return this.OptionsText(); }
+        return base.GetExtra(key);
+    }
+
+    public override bool SetExtra(string key, string val) {
+        if (key == "options") { this.SetOptionsText(val); return true; }
+        return base.SetExtra(key, val);
+    }
+
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("options", "Options").ViaExtra());
         PropSpec cl = PropSpec.Bool("closable", "Closable");
-        cl.flag = Closable;
+        cl.Field("Closable", 2);
         ps.Add(cl);
         PropSpec mx = PropSpec.Int("max", "Max");
-        mx.num = Max;
+        mx.Field("Max", 1);
         ps.Add(mx);
         PropSpec at = PropSpec.Text("addText", "Add text");
-        at.str = AddText;
+        at.Field("AddText", 0);
         ps.Add(at);
         PropSpec ph = PropSpec.Text("placeholder", "Placeholder");
-        ph.str = Placeholder;
+        ph.Field("Placeholder", 0);
         ps.Add(ph);
         PropSpec sz = PropSpec.Enum("size", "Size", PropSpec.Sizes());
-        sz.str = Size;
+        sz.Field("Size", 0);
         ps.Add(sz);
         return ps;
     }
@@ -186,19 +227,23 @@ public class DynamicTags : Control {
         this.ApplySizeClass();
     }
 
-    public override void OnPaint(App app) {
-        if (editing) {
-            if (takeFocus) {
-                app.focus.SetFocused(editor.CommonId());
-                takeFocus = false;
-            }
-            int ekind = app.EventKind();
-            int ekey = app.window.EventKeyCode();
-            if (ekind == 6 && ekey == 13) {
-                this.FinishEdit(app, true);
-            } else if (ekind == 4 && ekey == 27) {
-                this.FinishEdit(app, false);
-            }
+    private void FocusEditor(App app) {
+        if (!editing || !takeFocus || app == null || editor.parent != this) { return; }
+        takeFocus = false;
+        editor.Focus(app);
+    }
+
+    public override void OnMeasure(App app) {
+        // An edit started before mounting receives its endpoint during preparation.
+        this.FocusEditor(app);
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (editing && !this.IsDisabled() && e.keyCode == 27) {
+            this.FinishEdit(false);
+            e.Handle();
+            return;
         }
+        base.OnKeyDown(e);
     }
 }

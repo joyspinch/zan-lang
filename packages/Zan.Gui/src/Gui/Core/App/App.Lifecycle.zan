@@ -44,8 +44,8 @@ public partial class App {
         int nCap = 0;
         if (showChrome) { nCap = ChromeButtonCount(); }
         window.SetCaptionButtons(nCap);
-        // 设置 ZAN_UI_SCRIPT 时启用 AI 自动化驱动（否则不生效）。
-        UiDriver.Begin(this);
+        // Automation is installed by its explicit entry point.
+        this.AutomationShown();
     }
 
     // 显示窗口并运行标准事件循环直至关闭，
@@ -171,10 +171,11 @@ public partial class App {
         App a = App.frameApp;
         if (a == null || a.frameBody == null) { return; }
         if (hwnd != a.WindowHandle()) { return; }
+        bool priorPainting = App.wndProcPainting;
         App.wndProcPainting = true;
-        a.SyncSurface();
-        a.SafeFrame(a.frameBody);
-        App.wndProcPainting = false;
+        try {
+            a.FrameGuarded(a.frameBody);
+        } finally { App.wndProcPainting = priorPainting; }
     }
 
     // 受保护的标准事件循环：每一轮的事件分发与
@@ -216,33 +217,56 @@ public partial class App {
     // 运行时检查）由护栏记录后丢掉这一次事件——两者都不再让
     // 进程消失。
     bool PumpGuarded() {
+        App priorApp = App.guardApp;
+        FrameBody priorBody = App.guardBody;
+        int priorWhat = App.guardWhat;
+        bool priorAlive = App.guardPumpAlive;
+        bool priorPainting = App.wndProcPainting;
+        int priorSnapshotSilence = snapshotInputSilenceDepth;
         App.guardApp = this;
         App.guardWhat = 0;
         App.guardPumpAlive = isRunning;
-        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
-            // 这次事件在原生层崩了：记录（zan_crash.log 里已有带
-            // 回溯的记录）、重画一帧，然后继续泵下一个事件。
+        bool complete = Window.GuardCall((nint)App.GuardBody, 0);
+        bool alive = App.guardPumpAlive;
+        App.guardApp = priorApp;
+        App.guardBody = priorBody;
+        App.guardWhat = priorWhat;
+        App.guardPumpAlive = priorAlive;
+        App.wndProcPainting = priorPainting;
+        snapshotInputSilenceDepth = priorSnapshotSilence;
+        if (!complete) {
+            this.RecoverPreparationFault();
             this.NoteFrameError("event", "native fault recovered");
-            this.RequestRedraw();
             return isRunning;
         }
-        return App.guardPumpAlive;
+        return alive;
     }
 
     // SafeFrame 再加一层原生故障护栏：这一帧里的硬故障
     // 只丢掉这一帧。
     bool FrameGuarded(FrameBody body) {
+        App priorApp = App.guardApp;
+        FrameBody priorBody = App.guardBody;
+        int priorWhat = App.guardWhat;
+        bool priorAlive = App.guardPumpAlive;
+        bool priorPainting = App.wndProcPainting;
+        int priorSnapshotSilence = snapshotInputSilenceDepth;
         App.guardApp = this;
         App.guardWhat = 1;
         App.guardBody = body;
-        if (!Window.GuardCall((nint)App.GuardBody, 0)) {
+        bool complete = Window.GuardCall((nint)App.GuardBody, 0);
+        App.guardApp = priorApp;
+        App.guardBody = priorBody;
+        App.guardWhat = priorWhat;
+        App.guardPumpAlive = priorAlive;
+        App.wndProcPainting = priorPainting;
+        snapshotInputSilenceDepth = priorSnapshotSilence;
+        if (!complete) {
+            this.RecoverPreparationFault();
             this.NoteFrameError("frame", "native fault recovered");
-            // 这一帧半途而废：脏区裁剪已经不可信，下一帧整窗重画。
-            this.CancelPartialFrame();
-            this.RequestRedraw();
             return false;
         }
-        return true;
+        return !preparationFrameAborted;
     }
 
     // 本次运行被原生护栏吞掉的硬故障次数。
@@ -266,11 +290,36 @@ public partial class App {
     // BeginFrame/PresentFrame 对。
     bool SafeFrame(FrameBody body) {
         try {
+            this.TraceFullPresent(13, true);
+            this.SyncSurface();
+            this.TraceFullPresent(13, false);
+            this.TraceFullPresent(14, true);
             BeginFrame();
+            this.TraceFullPresent(14, false);
+            this.TraceFullPresent(15, true);
+            if (this.CurrentHostLayout() != null && !this.PrepareStandardHostFrame()) {
+                this.TraceFullPresent(16, true);
+                return false;
+            }
+            this.TraceFullPresent(15, false);
+            this.TraceFullPresent(17, true);
             body();
+            this.TraceFullPresent(17, false);
+            if (!this.ContinuePreparedFrame()) {
+                this.TraceFullPresent(18, true);
+                return false;
+            }
+            this.TraceFullPresent(19, true);
             PresentFrame();
+            this.TraceFullPresent(19, false);
+            if (!this.ContinuePreparedFrame()) {
+                this.TraceFullPresent(18, false);
+                return false;
+            }
             return true;
         } catch (Exception ex) {
+            this.TraceFullPresent(20, true);
+            this.AbortPreparationFrame();
             this.NoteFrameError("frame", ex.Message);
             // 这一帧残缺：丢掉那个脏区裁剪，下一帧全重绘。
             this.CancelPartialFrame();
@@ -288,12 +337,14 @@ public partial class App {
     void RefreshScrollHover() {
         if (!this.scrollHoverDirty) { return; }
         this.scrollHoverDirty = false;
-        int nh = hitTester.HitTest(mouseX, mouseY);
-        if (nh == focus.hoveredId) { return; }
-        int oh = focus.hoveredId;
-        focus.SetHovered(nh);
+        Control previous = this.lastHoveredControl;
+        Control next = overlayHost != null ? overlayHost.HitTest(mouseX, mouseY, currentPointerType) : null;
+        if (next == null && rootControl != null) { next = rootControl.HitTest(mouseX, mouseY, currentPointerType); }
+        if (next == previous) { return; }
+        this.lastHoveredControl = next;
+        focus.SetHovered(next != null ? next.WidgetId() : -1);
         this.NoteRedrawWhy("scroll-hover");
-        if (!needsRedraw) { this.NoteHoverDamage(oh, nh); }
+        if (!needsRedraw) { this.NoteHoverDamage(previous, next); }
         needsRedraw = true;
     }
 
@@ -405,6 +456,15 @@ public partial class App {
     }
     public int ClientHeight() {
         return canvas.Height() - this.ShapeOffY() * 2;
+    }
+
+    // Device coordinates inside the client, below the caption and outside the shadow band.
+    internal void ContentBounds(out int x, out int y, out int width, out int height) {
+        int top = this.ContentTop();
+        x = this.ShapeOffX();
+        y = this.ShapeOffY() + top;
+        width = Math.Max(0, this.ClientWidth());
+        height = Math.Max(0, this.ClientHeight() - top);
     }
 
     // 离屏预览保留声明的逻辑视口；原生窗口按实际客户区换算 CSS 逻辑长度。
@@ -727,6 +787,10 @@ public partial class App {
     // Native tombstones stay queued until taken; sibling/global work survives.
     public void StopLoop() {
         lock (this) { isRunning = false; }
+        // Stopped callbacks must not keep their window owner alive.
+        closeRequest = null;
+        closeGuard = null;
+        this.SetAutomationSession(null);
         Exception loopError = null;
         try { this.ClearLoopParticipants(); }
         catch (Exception error) { loopError = error; }
@@ -783,8 +847,9 @@ public partial class App {
     // 同意 → 通知 closeRequest（一次性）并停循环退出；
     // 否决 → 什么都不做，窗口继续存在。
     bool HandleCloseRequest() {
-        if (this.closeGuard != null) {
-            if (!this.closeGuard()) { return true; }
+        Func<bool> guard = closeGuard;
+        if (guard != null) {
+            if (!guard()) { return true; }
             // 同意关闭：Windows 上窗口此刻还活着（WM_CLOSE 被拦下
             // 没销毁），这里显式销毁它，让窗口真正消失。
             this.window.Destroy();
@@ -799,7 +864,8 @@ public partial class App {
         }
         if (!closePending) {
             closePending = true;
-            closeRequest();
+            Action handler = closeRequest;
+            handler();
         }
         return isRunning;
     }
@@ -1011,11 +1077,8 @@ public partial class App {
             this.NoteRedrawWhy("ProcessEvent");
             needsRedraw = true;
         }
-        // 纯动画唤醒：若上一帧所有动画都声明了范围，
-        // 把这一帧裁剪到它们的并集。输入事件触发的帧不裁剪：
-        // 点击/按键改变哪些像素只有控件渲染时读到 Ui.Clicked
-        // 才知道，无法提前声明；而裁剪帧只渲染条带内的控件，
-        // 点击目标在条带外时点击既不被处理也不被重绘。
+        // 纯动画唤醒：若上一帧所有动画都声明了范围，把这一帧裁剪到并集。
+        // 输入触发的帧不裁剪：路由回调可能更新任意关联控件的样式。
         // 滚轮是例外（见 wheelScrollInput）：它的消费与损伤都在
         // 渲染期声明，且声明者几何=上一帧认领视口，可以收窄。
         bool wheelFrame = !fxOnly && this.wheelScrollInput

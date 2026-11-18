@@ -8,8 +8,7 @@ namespace Gui.Widget;
 // 组合导航标签条与内容页容器，彻底物理删除所有画布微绘与坐标手算。
 public partial class Tabs : Control {
     public List<TabItem> tabs;
-    public int active;
-    public Binding<int> data;
+    public Binding<int> ActiveIndex;
     public int style;
     public int orient; // 0 = Horizontal, 1 = Vertical
     public bool showAdd;
@@ -19,12 +18,13 @@ public partial class Tabs : Control {
     public int ctxIndex;
     public List<Panel> pages;
     public string itemsSpec;
+    private int pendingPaneIndex = 0 - 1;
     public Control extraSlot;
 
-    public int changedIndex;
-    public int closedIndex;
-    public int addedIndex;
-    public List<int> closedQueue;
+    // 最近一次关闭的页签下标（hostModel 模式下就是事件里的原下标）。
+    // 唯一读取时机是 TabClosed 回调内部；批量关闭时每次回调都对应
+    // 自己的下标。没有独立的事件队列双输出。
+    private int closedIndex;
 
     public Control navStrip;
     public Control contentBox;
@@ -49,7 +49,7 @@ public partial class Tabs : Control {
     public Tabs(int style, int orient) {
         this.InitControl("tabs", 1);
         this.tabs = new List<TabItem>();
-        this.active = 0;
+        ActiveIndex = 0;
         this.style = style;
         this.orient = orient;
         this.showAdd = false;
@@ -59,10 +59,7 @@ public partial class Tabs : Control {
         this.ctxIndex = 0 - 1;
         this.pages = new List<Panel>();
         this.itemsSpec = "";
-        this.changedIndex = 0 - 1;
         this.closedIndex = 0 - 1;
-        this.addedIndex = 0 - 1;
-        this.closedQueue = new List<int>();
         this.TabChanged = new UiEvent();
         this.TabClosed = new UiEvent();
         this.TabAdded = new UiEvent();
@@ -71,6 +68,15 @@ public partial class Tabs : Control {
         this.ClassName = "tabs " + (orient == 1 ? "row" : "col");
         this.BuildTree();
     }
+
+    internal int treeGeneration;
+    private bool revealActive = true;
+    private int builtActive = -1;
+    private bool appliedAppearance;
+    private int appliedStyle;
+    private int appliedOrient;
+    private bool appliedShowAdd;
+    private bool appliedClosable;
 
     public override int StyleDisplay() { return 1; } // Flex
     public override int StyleFlexDir() { return orient == 1 ? 0 : 1; }
@@ -82,15 +88,13 @@ public partial class Tabs : Control {
 
     public void SetHostModel(bool on) { hostModel = on; }
 
-    public int Active() { return active; }
+    public int Active() { return ActiveIndex.Get(); }
 
     public void Select(int idx) {
-        if (idx != active && idx >= 0 && (tabs.Count == 0 || idx < tabs.Count)) {
-            active = idx;
-            changedIndex = idx;
-            if (data != null) { data.Set(idx); }
-            TabChanged.RaiseS(this);
+        if (idx != ActiveIndex.Get() && idx >= 0 && (tabs.Count == 0 || idx < tabs.Count)) {
+            ActiveIndex.Set(idx);
             this.BuildTree();
+            TabChanged.RaiseS(this);
         }
     }
 
@@ -99,6 +103,32 @@ public partial class Tabs : Control {
     }
 
     public int Count() { return tabs.Count; }
+
+    public string OptionsText() {
+        string text = "";
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (i > 0) { text = text + "|"; }
+            text = text + tabs[i].label;
+        }
+        return text;
+    }
+
+    public void SetOptionsText(string value) {
+        string text = value != null ? value : "";
+        if (text == this.OptionsText()) { return; }
+        itemsSpec = text;
+        tabs.Clear();
+        pages.Clear();
+        pendingPaneIndex = 0;
+        if (text != "") {
+            List<string> labels = text.Split("|");
+            for (int i = 0; i < labels.Count; i = i + 1) {
+                tabs.Add(new TabItem(labels[i], false));
+            }
+        }
+        // Attribute order may select a page before its options or content exist.
+        this.BuildTree();
+    }
 
     public string LabelAt(int idx) {
         if (idx >= 0 && idx < tabs.Count) { return tabs[idx].label; }
@@ -116,7 +146,8 @@ public partial class Tabs : Control {
     public void Clear() {
         tabs.Clear();
         pages.Clear();
-        active = 0;
+        pendingPaneIndex = 0 - 1;
+        ActiveIndex.Set(0);
         this.BuildTree();
     }
 
@@ -125,16 +156,18 @@ public partial class Tabs : Control {
     }
 
     public Tabs Add(string label, bool closable) {
+        pendingPaneIndex = 0 - 1;
         tabs.Add(new TabItem(label, closable));
-        if (active < 0) { active = 0; }
+        if (ActiveIndex.Get() < 0) { ActiveIndex.Set(0); }
         this.BuildTree();
         return this;
     }
 
     public Tabs Add(TabItem item) {
         if (item != null) {
+            pendingPaneIndex = 0 - 1;
             tabs.Add(item);
-            if (active < 0) { active = 0; }
+            if (ActiveIndex.Get() < 0) { ActiveIndex.Set(0); }
             this.BuildTree();
         }
         return this;
@@ -142,9 +175,19 @@ public partial class Tabs : Control {
 
     public Tabs AddPane(TabPane pane) {
         if (pane != null) {
-            tabs.Add(new TabItem(pane.Label(), pane.IsClosable()));
-            this.With(pane);
-            if (active < 0) { active = 0; }
+            // Html.Build already declares labels before assembling TabPane children.
+            int index = tabs.Count;
+            if (pendingPaneIndex >= 0 && pendingPaneIndex < tabs.Count) {
+                index = pendingPaneIndex;
+                pendingPaneIndex = pendingPaneIndex + 1;
+                tabs[index].label = pane.Label();
+                tabs[index].closable = pane.IsClosable();
+            } else {
+                pendingPaneIndex = 0 - 1;
+                tabs.Add(new TabItem(pane.Label(), pane.IsClosable()));
+            }
+            this.Page(index).Add(pane);
+            if (ActiveIndex.Get() < 0) { ActiveIndex.Set(0); }
             this.BuildTree();
         }
         return this;
@@ -163,28 +206,28 @@ public partial class Tabs : Control {
     }
 
     private void ReindexClosed(int idx) {
-        if (active > idx) { active = active - 1; }
-        if (active >= tabs.Count) { active = tabs.Count - 1; }
-        if (active < 0 && tabs.Count > 0) { active = 0; }
+        pendingPaneIndex = 0 - 1;
+        if (ActiveIndex.Get() > idx) { ActiveIndex.Set(ActiveIndex.Get() - 1); }
+        if (ActiveIndex.Get() >= tabs.Count) { ActiveIndex.Set(tabs.Count - 1); }
+        if (ActiveIndex.Get() < 0 && tabs.Count > 0) { ActiveIndex.Set(0); }
     }
 
     private void EmitClosed(int idx) {
+        int previous = closedIndex;
         closedIndex = idx;
-        closedQueue.Add(idx);
-        TabClosed.RaiseS(this);
+        try { TabClosed.RaiseS(this); }
+        finally { closedIndex = previous; }
     }
 
     public void CloseTab(int idx) {
         if (!this.Closable(idx)) { return; }
-        int before = active;
+        int before = ActiveIndex.Get();
         if (!hostModel) {
             tabs.RemoveAt(idx);
             if (idx < pages.Count) { this.DropPage(idx); }
             this.ReindexClosed(idx);
             this.BuildTree();
-            if (data != null) { data.Set(active); }
-            if (active != before || idx == before) {
-                changedIndex = active;
+            if (ActiveIndex.Get() != before || idx == before) {
                 TabChanged.RaiseS(this);
             }
         }
@@ -206,7 +249,7 @@ public partial class Tabs : Control {
             if (i != keep && this.Closable(i)) { doomed.Add(i); }
         }
         if (doomed.Count == 0) { return; }
-        int before = active;
+        int before = ActiveIndex.Get();
         TabItem beforeItem = null;
         if (before >= 0 && before < tabs.Count) { beforeItem = tabs[before]; }
         int removedBeforeKeep = 0;
@@ -218,49 +261,37 @@ public partial class Tabs : Control {
                 if (idx < pages.Count) { this.DropPage(idx); }
                 this.ReindexClosed(idx);
             }
+            int ticket = treeGeneration;
+            int remaining = tabs.Count;
+            App host = this.FindApp();
+            Control ownerParent = parent;
             this.EmitClosed(idx);
+            if (treeGeneration != ticket || tabs.Count != remaining
+                || this.FindApp() != host || parent != ownerParent) { return; }
         }
         if (hostModel) { return; }
-        if (keep >= 0) { active = keep - removedBeforeKeep; }
+        if (keep >= 0) { ActiveIndex.Set(keep - removedBeforeKeep); }
         this.BuildTree();
-        if (data != null) { data.Set(active); }
         TabItem afterItem = null;
-        if (active >= 0 && active < tabs.Count) { afterItem = tabs[active]; }
+        if (ActiveIndex.Get() >= 0 && ActiveIndex.Get() < tabs.Count) { afterItem = tabs[ActiveIndex.Get()]; }
         // A removed active tab can be replaced at the same numeric index.
-        if (active != before || afterItem != beforeItem) {
-            changedIndex = active;
+        if (ActiveIndex.Get() != before || afterItem != beforeItem) {
             TabChanged.RaiseS(this);
         }
     }
 
+    // 新增按钮意图（宿主自己把新页插到当前末尾）。
     public void TriggerAdd() {
-        addedIndex = tabs.Count;
         TabAdded.RaiseS(this);
     }
 
-    public int TakeChanged() {
-        int c = changedIndex;
-        changedIndex = 0 - 1;
-        return c;
+    // TabClosed 回调内读取：本次回调对应的被关页签下标。
+    public int ClosedIndex() {
+        return closedIndex;
     }
 
-    public int TakeClosed() {
-        if (closedQueue.Count == 0) {
-            closedIndex = 0 - 1;
-            return 0 - 1;
-        }
-        int idx = closedQueue[0];
-        closedQueue.RemoveAt(0);
-        closedIndex = closedQueue.Count > 0 ? closedQueue[0] : (0 - 1);
-        return idx;
-    }
-
-    public int TakeAdded() {
-        int a = addedIndex;
-        addedIndex = 0 - 1;
-        return a;
-    }
-
+    // 右键命中的页签下标，消费后清零；这是右键菜单取数，不是事件
+    // 之外的重复输出。
     public int TakeContext() {
         int c = ctxIndex;
         ctxIndex = 0 - 1;
@@ -270,12 +301,32 @@ public partial class Tabs : Control {
     public int HeaderHeight() { return this.HeaderHeight(this.App); }
     public int HeaderHeight(App app) {
         app = this.ResolveApp(app);
-        return app != null ? app.theme.heightMedium : 32;
+        if (app == null) { return 32; }
+        if (Style.Has(Class, "small") || (Size != null && Size.Get() == "small")) { return app.theme.heightSmall; }
+        if (Style.Has(Class, "large") || (Size != null && Size.Get() == "large")) { return app.theme.heightLarge; }
+        return app.theme.heightMedium;
     }
 
     public void Extra(Control extra) {
         extraSlot = extra;
         this.BuildTree();
+    }
+
+    public Control GetExtra() { return extraSlot; }
+
+    public override Control SlotHost(int slot) { return this.Page(slot); }
+
+    public override Control NamedSlotHost(string slot) {
+        if (slot == "" || slot == "default") { return this.Page(0); }
+        if (Control.IsNumericSlot(slot)) { return this.SlotHost(Convert.ToInt32(slot)); }
+        if (slot == "extra") {
+            if (extraSlot == null) { this.Extra(new Control()); }
+            return extraSlot;
+        }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (tabs[i].label == slot) { return this.Page(i); }
+        }
+        return base.NamedSlotHost(slot);
     }
 
     public Panel Page(int i) {
@@ -284,8 +335,10 @@ public partial class Tabs : Control {
         while (pages.Count <= want) {
             Panel p = Panel.Root("page" + Convert.ToString(pages.Count));
             p.Pad(0);
+            p.inlineStyleCss = "flex-grow: 1; min-width: 0; min-height: 0;";
+            p.Visible = (pages.Count == ActiveIndex.Get());
             pages.Add(p);
-            this.With(p);
+            contentBox.Add(p);
         }
         return pages[want];
     }
@@ -296,27 +349,39 @@ public partial class Tabs : Control {
         if (i < 0 || i >= pages.Count) { return; }
         List<Panel> keep = new List<Panel>();
         for (int k = 0; k < pages.Count; k = k + 1) {
-            if (k == i) { this.Remove(pages[k]); }
+            if (k == i) { contentBox.Remove(pages[k]); }
             else { keep.Add(pages[k]); }
         }
         pages = keep;
     }
 
     public void BuildTree() {
+        builtActive = ActiveIndex.Get();
+        treeGeneration = treeGeneration + 1;
+        revealActive = true;
+        this.SetClassIn("row col", orient == 1 ? "row" : "col");
+        this.SetClassIn("line card segment", style == 1 ? "card" : (style == 2 ? "segment" : "line"));
+        appliedAppearance = true; appliedStyle = style; appliedOrient = orient;
+        appliedShowAdd = showAdd; appliedClosable = closableAll;
+        int ticket = treeGeneration;
+        App host = this.FindApp();
+        Control ownerParent = parent;
         this.RemoveAll();
+        if (treeGeneration != ticket || this.FindApp() != host || parent != ownerParent) { return; }
 
         // 1. 导航条容器
         navStrip = new Control();
         string orientClass = (orient == 1) ? "col tabs-nav-vertical" : "row tabs-nav-horizontal align-center";
         string styleClass = (style == 1) ? "card" : (style == 2 ? "segment" : "line");
         navStrip.ClassName = "tabs-nav " + orientClass + " " + styleClass;
+        navStrip.inlineStyleCss = "display: flex; flex-direction: " + (orient == 1 ? "column" : "row") + "; flex-shrink: 0; min-width: 0; min-height: 0;";
 
         for (int i = 0; i < tabs.Count; i = i + 1) {
             int tidx = i;
             TabItem item = tabs[i];
-            bool isActive = (i == active);
+            bool isActive = (i == ActiveIndex.Get());
 
-            Button tabBtn = new Button("");
+            TabHeaderButton tabBtn = new TabHeaderButton();
             tabBtn.ClassName = "tab-item row align-center " + (isActive ? "active" : "") + " " + styleClass;
 
             if (item.headerSlot != null) {
@@ -328,8 +393,9 @@ public partial class Tabs : Control {
             tabBtn.Add(lbl);
 
             if (item.closable || closableAll) {
-                Button closeBtn = new Button("×");
-                closeBtn.ClassName = "tab-item-close ghost tiny";
+                Button closeBtn = new Button(new IconView("x", 12));
+                closeBtn.ClassName = "tab-item-close";
+                closeBtn.Tip = "Close";
                 TabsAction closeAction = new TabsAction(this, tidx, true);
                 closeBtn.Click.Add(() => { closeAction.Invoke(); });
                 tabBtn.Add(closeBtn);
@@ -342,14 +408,18 @@ public partial class Tabs : Control {
         }
 
         if (showAdd) {
-            Button addBtn = new Button("+");
-            addBtn.ClassName = "tab-add-btn ghost small";
+            Button addBtn = new Button(new IconView("plus", 12));
+            addBtn.ClassName = "tab-add-btn";
+            addBtn.Tip = "Add";
             TabsAction addAction = new TabsAction(this, 0 - 1, false);
             addBtn.Click.Add(() => { addAction.Invoke(); });
             navStrip.Add(addBtn);
         }
 
         if (extraSlot != null) {
+            Control spacer = new Control();
+            spacer.SetProp("style", "flex:1;min-width:0;min-height:0");
+            navStrip.Add(spacer);
             navStrip.Add(extraSlot);
         }
 
@@ -357,30 +427,69 @@ public partial class Tabs : Control {
 
         // 2. 内容面板容器
         contentBox = new Control();
-        contentBox.ClassName = "tabs-content col flex-1";
+        contentBox.ClassName = "tabs-content col";
+        contentBox.inlineStyleCss = "display: flex; flex-direction: column; flex-grow: 1; min-width: 0; min-height: 0;";
 
         for (int pi = 0; pi < pages.Count; pi = pi + 1) {
-            pages[pi].Visible = (pi == active);
+            pages[pi].Visible = (pi == ActiveIndex.Get());
             contentBox.Add(pages[pi]);
         }
 
         this.Add(contentBox);
     }
 
+    public override void Arrange(int x, int y, int width, int height) {
+        bool resized = width != bw || height != bh;
+        base.Arrange(x, y, width, height);
+        if ((!revealActive && !resized) || ActiveIndex.Get() < 0 || ActiveIndex.Get() >= tabs.Count
+            || navStrip == null || ActiveIndex.Get() >= navStrip.ChildCount()) { return; }
+        revealActive = false;
+        Control selected = navStrip.ChildAt(ActiveIndex.Get());
+        Rect viewport = navStrip.ScrollViewport();
+        if (orient == 0) {
+            int offset = navStrip.ScrollLeft();
+            if (selected.bx < viewport.x) { offset = offset + selected.bx - viewport.x; }
+            else if (selected.bx + selected.bw > viewport.x + viewport.width) {
+                offset = offset + selected.bx + selected.bw - viewport.x - viewport.width;
+            }
+            navStrip.SetScrollLeft(offset);
+        } else {
+            int offset = navStrip.ScrollTop();
+            if (selected.by < viewport.y) { offset = offset + selected.by - viewport.y; }
+            else if (selected.by + selected.bh > viewport.y + viewport.height) {
+                offset = offset + selected.by + selected.bh - viewport.y - viewport.height;
+            }
+            navStrip.SetScrollTop(offset);
+        }
+        navStrip.Arrange(navStrip.bx, navStrip.by, navStrip.bw, navStrip.bh);
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        App host = this.FindApp();
+        if (host == null || host.window.EventButton() != 1 || navStrip == null) { return; }
+        Control header = e.originalSource;
+        while (header != null && header.parent != navStrip) { header = header.parent; }
+        if (header == null) { return; }
+        int index = navStrip.IndexOf(header);
+        if (index >= 0 && index < tabs.Count) { ctxIndex = index; e.Handle(); host.RequestRedraw(); }
+    }
+
     public override void SyncBinding() {
         base.SyncBinding();
-        if (data != null) {
-            int cur = data.Get();
-            if (cur != active && cur >= 0 && (tabs.Count == 0 || cur < tabs.Count)) {
-                this.Select(cur);
-            }
-        }
+        if (!appliedAppearance || appliedStyle != style || appliedOrient != orient
+            || appliedShowAdd != showAdd || appliedClosable != closableAll) { this.BuildTree(); }
+        if (ActiveIndex.Get() != builtActive) { this.BuildTree(); }
     }
 
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
         Tabs copy = (Tabs)target;
         copy.tabs.Clear();
         copy.pages.Clear();
+        copy.ActiveIndex.Set(ActiveIndex.Get());
+        copy.itemsSpec = this.OptionsText();
+        copy.pendingPaneIndex = pendingPaneIndex;
+        copy.extraSlot = null;
         for (int i = 0; i < tabs.Count; i = i + 1) {
             TabItem item = new TabItem(tabs[i].label, tabs[i].closable);
             if (tabs[i].headerSlot != null) { item.Header(clone(tabs[i].headerSlot)); }
@@ -396,10 +505,42 @@ public partial class Tabs : Control {
     public override string Kind() { return "Tabs"; }
     public override Binding<string> SizeOf() { return Size; }
 
-    public override List<PropSpec> Props() {
+    public override List<string> Events() {
+        List<string> events = Control.CommonEvents();
+        events.Add("TabChanged");
+        events.Add("TabClosed");
+        events.Add("TabAdded");
+        return events;
+    }
+
+    public override void BindEvent(string evt, Action handler) {
+        if (evt == "TabChanged") { TabChanged.Add(handler); return; }
+        if (evt == "TabClosed") { TabClosed.Add(handler); return; }
+        if (evt == "TabAdded") { TabAdded.Add(handler); return; }
+        base.BindEvent(evt, handler);
+    }
+
+    public override void BindEventS(string evt, ControlEvent handler) {
+        if (evt == "TabChanged") { TabChanged.AddS(handler); return; }
+        if (evt == "TabClosed") { TabClosed.AddS(handler); return; }
+        if (evt == "TabAdded") { TabAdded.AddS(handler); return; }
+        base.BindEventS(evt, handler);
+    }
+
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec act = PropSpec.Int("active", "Active");
-        act.num = data;
+        ps.Add(PropSpec.Text("options", "Tabs").ViaExtra());
+        PropSpec appearance = PropSpec.Enum("tabStyle", "Tab style", new List<string>());
+        appearance.Option("line"); appearance.Option("card"); appearance.Option("segment");
+        ps.Add(appearance.ViaExtra());
+        PropSpec orientation = PropSpec.Enum("orient", "Orientation", new List<string>());
+        orientation.Option("horizontal"); orientation.Option("vertical");
+        ps.Add(orientation.ViaExtra());
+        ps.Add(PropSpec.Bool("showAdd", "Show add button").ViaExtra());
+        ps.Add(PropSpec.Bool("closable", "All closable").ViaExtra());
+        PropSpec act = PropSpec.Int("active", "Active").DefaultBinding();
+        act.Field("ActiveIndex", 1);
+        act.Also("activeTab");
         act.Also("data");
         act.Also("value");
         ps.Add(act);
@@ -407,15 +548,46 @@ public partial class Tabs : Control {
         return ps;
     }
 
+    public override string GetExtra(string key) {
+        if (key == "options") { return this.OptionsText(); }
+        if (key == "tabStyle") { return style == 1 ? "card" : (style == 2 ? "segment" : "line"); }
+        if (key == "orient") { return orient == 1 ? "vertical" : "horizontal"; }
+        if (key == "showAdd") { return PropSpec.Flag(showAdd); }
+        if (key == "closable") { return PropSpec.Flag(closableAll); }
+        return base.GetExtra(key);
+    }
+
+    public override bool SetExtra(string key, string val) {
+        if (key == "options") { this.SetOptionsText(val); return true; }
+        if (key == "tabStyle" || key == "style") {
+            if (val == "line" || val == "0") { style = 0; }
+            else if (val == "card" || val == "1") { style = 1; }
+            else if (val == "segment" || val == "2") { style = 2; }
+            else { return false; }
+        } else if (key == "orient") {
+            if (val == "horizontal" || val == "0") { orient = 0; }
+            else if (val == "vertical" || val == "1") { orient = 1; }
+            else { return false; }
+            this.SetClassIn("row col", orient == 1 ? "row" : "col");
+        } else if (key == "showAdd") { showAdd = PropSpec.IsOn(val); }
+        else if (key == "closable") { closableAll = PropSpec.IsOn(val); }
+        else { return base.SetExtra(key, val); }
+        this.BuildTree();
+        return true;
+    }
+
     public override string GetProp(string key) {
-        if (key == "active" || key == "data" || key == "value") {
-            return Convert.ToString(active);
+        if (key == "active" || key == "activeTab" || key == "data" || key == "value") {
+            return Convert.ToString(ActiveIndex.Get());
         }
         return base.GetProp(key);
     }
 
     public override void SetProp(string key, string val) {
-        if (key == "active" || key == "data" || key == "value") {
+        // Semantic tab style shares a name with inline CSS. Only its declared
+        // enum values are intercepted; CSS declarations retain the base path.
+        if (key == "style" && this.SetExtra(key, val)) { this.Invalidate(); return; }
+        if (key == "active" || key == "activeTab" || key == "data" || key == "value") {
             this.Select(Convert.ToInt32(val));
             return;
         }

@@ -1,0 +1,96 @@
+using Gui;
+
+namespace Gui.Component;
+
+public partial class FilePicker {
+    private FilePickerHost inputHost;
+    private int inputSession;
+    private int viewRevision;
+
+    internal bool CurrentInputHost(FilePickerHost host) { return open && inputHost == host; }
+    internal void InputHostRetired(FilePickerHost host) {
+        if (inputHost != host) { return; }
+        inputSession = inputSession + 1;
+        inputHost = null;
+        viewRevision = viewRevision + 1;
+        dirty = true;
+        // Notification runs inside SetRootControl/ReleaseInputSubtree. Its
+        // caller owns the structural replacement; do not supersede its ticket.
+        host.Retire(false);
+    }
+    private bool RetireInputHost(int session) {
+        FilePickerHost previous = inputHost;
+        inputHost = null;
+        viewRevision = viewRevision + 1;
+        if (previous != null) { previous.Retire(); }
+        return inputSession == session;
+    }
+    private void InstallInputHost(App app) {
+        if (app == null || !app.isRunning || !open) { return; }
+        int session = inputSession + 1; inputSession = session;
+        if (!this.RetireInputHost(session)) { return; }
+        FilePickerHost next = new FilePickerHost(this, app);
+        inputHost = next;
+        dirty = true;
+        next.Activate();
+        if (inputSession == session && inputHost == next && !next.Current()) { inputHost = null; }
+    }
+
+    // Bind before the host processes input. RenderOverlay only paints this host.
+    // Begin uses the current frame App when falling back from a native popup;
+    // callers outside a frame can select inline hosting explicitly here.
+    public void BeginInline(App host, int pickerMode, string initial, string extension,
+            string defaultName, string dialogTitle) {
+        this.BeginCore(pickerMode, initial, extension, defaultName, dialogTitle, host, true);
+    }
+    public void BindInline(App host) {
+        if (!open || !inlineMode || host == null) { return; }
+        if (inputHost != null && inputHost.HostApp() == host && inputHost.Current() && inputHost.Linked()) {
+            // Rebinding the same identity renews its claim during a Cancel
+            // callback, fencing an older root installation or tree rebuild.
+            inputSession = inputSession + 1; viewRevision = viewRevision + 1;
+            inputHost.Bind(host);
+            this.MarkDirty();
+            return;
+        }
+        this.InstallInputHost(host);
+    }
+    public void HideInline() {
+        if (!inlineMode) { return; }
+        int session = inputSession + 1; inputSession = session;
+        this.RetireInputHost(session);
+    }
+
+    private bool ViewBuildCurrent(FilePickerHost host, int revision) {
+        return viewRevision == revision && inputHost == host
+            && (host == null || host.Current());
+    }
+    internal bool PreparePickerView(FilePickerHost host, App app) {
+        if (!this.CurrentInputHost(host)) { return false; }
+        if (viewTree == null || dirty || viewTree.parent != host.Surface()) { this.BuildViewTree(app); }
+        return this.CurrentInputHost(host) && viewTree != null && !dirty
+            && viewTree.parent == host.Surface();
+    }
+
+    public void BuildViewTree() { this.BuildViewTree(this.App); }
+    public void BuildViewTree(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return; }
+        FilePickerHost host = inputHost;
+        if (host != null && (host.HostApp() != app || !host.Current())) { return; }
+        int revision = viewRevision + 1; viewRevision = revision;
+        Control previous = viewTree;
+        App previousApp = previous != null ? previous.FindApp() : null;
+        if (previousApp != null) { previousApp.ReleaseInputSubtree(previous); }
+        if (!this.ViewBuildCurrent(host, revision)) { return; }
+        if (previous != null && previous.parent != null) { previous.parent.Remove(previous); }
+        if (!this.ViewBuildCurrent(host, revision)) { return; }
+        // A callback invalidating the view during construction keeps its dirty bit.
+        dirty = false;
+        Control tree = this.CreateViewTree(app, host, revision);
+        if (tree == null || !this.ViewBuildCurrent(host, revision)) { return; }
+        tree.UseApp(app);
+        viewTree = tree;
+        if (host != null) { host.Mount(tree); }
+    }
+}

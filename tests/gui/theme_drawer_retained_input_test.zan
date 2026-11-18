@@ -1,0 +1,377 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui;
+
+class ThemeDrawerWitness {
+    public int clicks;
+    public int changes;
+    public weak App app;
+    public weak Form form;
+    public weak ThemeDrawer drawer;
+    public weak Control button;
+    public void Clicked() { clicks = clicks + 1; }
+    public void Changed() { changes = changes + 1; }
+}
+
+class ThemeDrawerTestForm : Form {
+    private ThemeDrawerWitness witness;
+    private Button underlying;
+
+    public ThemeDrawerTestForm(ThemeDrawerWitness state) : base("Appearance drawer", 960, 1100, true) {
+        witness = state;
+        underlying = new Button("Underlying action");
+        underlying.Prefer(200, WidgetSize.Medium);
+        underlying.Click.Add(state.Clicked);
+        this.Add(underlying);
+    }
+
+    static void Check(bool ok, string message) { if (!ok) { throw new Exception(message); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void ClickAt(App app, int x, int y) {
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static void Click(App app, Control control) {
+        Check(control != null && control.bw > 0 && control.bh > 0, "real control has prepared geometry");
+        ClickAt(app, control.bx + control.bw / 2, control.by + control.bh / 2);
+    }
+    static Control Named(ThemeDrawer drawer, string name) {
+        Control control = drawer.Find(name);
+        Check(control != null, "retained setting exists: " + name);
+        return control;
+    }
+    static void Reveal(App app, ScrollColumn scroll, Control control) {
+        app.ProcessOffscreenInput(1, scroll.bx + 8, scroll.by + 8, 0, 0, 0, 0);
+        for (int i = 0; i < 60; i = i + 1) {
+            if (control.by >= scroll.by && control.by + control.bh <= scroll.by + scroll.bh) { return; }
+            int delta = control.by < scroll.by ? 120 : -120;
+            app.ProcessOffscreenInput(13, scroll.bx + 8, scroll.by + scroll.bh / 2, 0, delta, 0, 0);
+        }
+        Check(false, "setting scrolls into the current viewport: " + control.name);
+    }
+    static void Setting(App app, ThemeDrawer drawer, string name, bool motion) {
+        Control control = Named(drawer, name);
+        Reveal(app, motion ? drawer.motionScroll : drawer.styleScroll, control);
+        Click(app, control);
+    }
+    static void SliderValue(App app, ThemeDrawer drawer, Slider slider, int xPercent) {
+        Reveal(app, drawer.styleScroll, slider);
+        int x = slider.bx + slider.bw * xPercent / 100;
+        int y = slider.by + slider.bh / 2;
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == slider, "slider owns actual retained pointer capture");
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Drain(app);
+    }
+    static void Caption(App app) {
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(app.chromeTheme != null && app.chromeTheme.name == "window-theme", "caption uses real named theme Button");
+        Click(app, app.chromeTheme);
+    }
+
+    static void SkinCatalog(App app) {
+        Check(app.SkinCount() == 3 && app.SkinNameAt(0) == "porcelain"
+        && app.SkinNameAt(1) == "graphite" && app.SkinNameAt(2) == "navy",
+        "the shipped catalog contains exactly the three new skins in product order");
+        Check(Skin.LabelOf("porcelain") == "浅色" && Skin.LabelOf("graphite") == "石墨"
+        && Skin.LabelOf("navy") == "深蓝", "catalog labels describe the new product choices");
+        Theme baseline = app.SkinThemeAt(0);
+        for (int i = 0; i < app.SkinCount(); i = i + 1) {
+            Theme candidate = app.SkinThemeAt(i);
+            Check(candidate.glass == 0 && candidate.gradient == 0 && candidate.fx == 0
+            && candidate.neu == 0 && candidate.brutal == 0,
+            "built-in skins use calm opaque surfaces");
+            Check(candidate.heightTiny == baseline.heightTiny && candidate.heightSmall == baseline.heightSmall
+            && candidate.heightMedium == baseline.heightMedium && candidate.heightLarge == baseline.heightLarge
+            && candidate.fontSizeTiny == baseline.fontSizeTiny && candidate.fontSizeSmall == baseline.fontSizeSmall
+            && candidate.fontSizeMedium == baseline.fontSizeMedium && candidate.fontSizeLarge == baseline.fontSizeLarge
+            && candidate.fontSizeHuge == baseline.fontSizeHuge, "skin choice preserves control and type sizes");
+            Check(candidate.paddingTiny == baseline.paddingTiny && candidate.paddingSmall == baseline.paddingSmall
+            && candidate.paddingMedium == baseline.paddingMedium && candidate.paddingLarge == baseline.paddingLarge
+            && candidate.gapSmall == baseline.gapSmall && candidate.gapMedium == baseline.gapMedium
+            && candidate.gapLarge == baseline.gapLarge && candidate.borderRadiusSmall == baseline.borderRadiusSmall
+            && candidate.borderRadiusMedium == baseline.borderRadiusMedium
+            && candidate.borderRadiusLarge == baseline.borderRadiusLarge,
+            "skin choice preserves spacing and corner metrics");
+            app.ApplySkin(i);
+            Check(app.Density() == 1, "a new skin does not change the user's selected density");
+            Check(Style.Full(app, "button", "primary", "", Style.SNormal()).BgOr(0) == candidate.primary
+            && Style.Full(app, "button", "primary", "", Style.SHover()).BgOr(0) == candidate.primaryHover
+            && Style.Full(app, "button", "primary", "", Style.SActive()).BgOr(0) == candidate.primaryPressed,
+            "standard buttons consume distinct normal, hover and pressed skin states");
+            Check(Style.Full(app, "input", "", "", Style.SFocus()).borderColor == candidate.borderFocus,
+            "standard field focus consumes the skin focus token");
+            Check(Style.Full(app, "input", "", "", Style.SDisabled()).BgOr(0) == candidate.bgDisabled
+            && Style.Full(app, "tab", "", "", Style.SDisabled()).FgOr(0) == candidate.textDisabled,
+            "disabled fields and tabs retain visible neutral skin states");
+            Check(Style.Full(app, "tab", "", "", Style.SSelected()).FgOr(0) == candidate.primary
+            && Style.Part(app, "input", "selection", "", "", "", Style.SNormal()).BgOr(0) != candidate.bgPrimary,
+            "selected tabs and input selection remain distinct from the content surface");
+        }
+    }
+
+    static void AccentStyles(App app, int color) {
+        Check(Style.Full(app, "button", "primary", "", Style.SNormal()).BgOr(0) == color,
+        "standard primary Button consumes selected accent");
+        int semantic = Style.Full(app, "button", "theme-accent-projection", "", Style.SNormal()).BgOr(0);
+        Check(semantic == color, "application semantic CSS consumes selected accent after skin root tokens: "
+        + app.SkinName() + " expected=" + Convert.ToString(color) + " actual=" + Convert.ToString(semantic));
+    }
+
+    static void DrawerGeometry(App app, ThemeDrawer drawer) {
+        Check(drawer.Box().style == 0 && drawer.Box().name == "theme-drawer-surface"
+        && drawer.Box().StyleType() == "panel", "Drawer owns a real standard surface Panel");
+        for (int i = 0; i < 3; i = i + 1) {
+            Control card = Named(drawer, "theme-skin-" + Convert.ToString(i));
+            Control preview = Named(drawer, "theme-skin-preview-" + Convert.ToString(i));
+            Check(card.bh == app.Scale(72) && !Style.Has(card.Class, "small"),
+            "skin card CSS keeps its full 72 logical pixel height");
+            Check(preview.parent == card && preview.ChildCount() == 3
+            && preview.bh == app.Scale(24) && preview.bw >= card.bw / 2,
+            "candidate preview has a full-width visible standard Panel tree");
+            Control caption = card.ChildAt(1);
+            Check(caption.by >= preview.by + preview.bh && caption.bh > 0
+            && caption.by + caption.bh <= card.by + card.bh,
+            "skin preview and caption occupy distinct unclipped rows");
+            for (int j = 0; j < 3; j = j + 1) {
+                Control swatch = preview.ChildAt(j);
+                Check(swatch.bw > 0 && swatch.bh > 0 && swatch.by >= preview.by
+                && swatch.by + swatch.bh <= preview.by + preview.bh,
+                "each candidate preview color block has visible geometry");
+            }
+        }
+    }
+
+    static void DrawerSurfacePixels(App app, ThemeDrawer drawer) {
+        Control surface = drawer.Box();
+        int x = surface.bx + surface.bw / 2;
+        int y = surface.by + surface.bh - surface.StyleInsetB() / 2;
+        int expectedSurface = App.WithAlpha(app.theme.bgPrimary, 255);
+        app.canvas.Clear(0xffff00ff);
+        app.overlayHost.RenderAll(app);
+        Check(app.canvas.GetPixel(x, y) == expectedSurface,
+        "Drawer surface hides underlying content with its opaque theme fill");
+        app.canvas.Clear(0xff00ffff);
+        app.overlayHost.RenderAll(app);
+        Check(app.canvas.GetPixel(x, y) == expectedSurface,
+        "Drawer surface remains opaque over a different underlying image");
+    }
+
+    static void DrawerPixels(App app, ThemeDrawer drawer, int previewIndex) {
+        DrawerSurfacePixels(app, drawer);
+        Control preview = Named(drawer, "theme-skin-preview-" + Convert.ToString(previewIndex));
+        Theme candidate = app.SkinThemeAt(previewIndex);
+        List<int> colors = new List<int>{ candidate.bgSecondary, candidate.bgActive, candidate.primary };
+        for (int i = 0; i < 3; i = i + 1) {
+            Control swatch = preview.ChildAt(i);
+            Check(app.canvas.GetPixel(swatch.bx + swatch.bw / 2, swatch.by + swatch.bh / 2) == colors[i],
+            "rendered candidate preview uses its own palette color block " + Convert.ToString(i));
+        }
+    }
+
+    private void ReopenQueuedSession() {
+        App app = this.GetApp();
+        app.overlayHost.Dismiss();
+        app.ToggleThemeMenu(0);
+    }
+
+    public void Exercise() {
+        this.RunScoped(this.ExerciseScoped);
+    }
+
+    private void ExerciseScoped() {
+        App app = this.GetApp();
+        app.showChrome = true;
+        app.EnableSkins();
+        ThemeSettings.Enable(app);
+        SkinCatalog(app);
+        int porcelain = app.SkinIndexOf("porcelain");
+        int graphite = app.SkinIndexOf("graphite");
+        int navy = app.SkinIndexOf("navy");
+        Check(porcelain >= 0 && graphite >= 0 && navy >= 0, "shipped porcelain, graphite and navy skins are available");
+        app.ApplySkin(porcelain);
+        app.UseAppCss("button.theme-accent-projection { background: var(--primary); }");
+        app.themeMenuChange.Add(witness.Changed);
+        Check(app.frameSeq == 0 && app.themeDrawer == null, "no Paint or theme tree exists yet");
+        // The real caption Down performs its first layout; no Render/Toggle shortcut.
+        int captionX = app.canvas.Width() - app.ChromeButtonCount() * app.Scale(46) + app.Scale(23);
+        ClickAt(app, captionX, app.Scale(16));
+        ThemeDrawer drawer = app.themeDrawer != null ? (ThemeDrawer)app.themeDrawer : null;
+        Check(drawer != null && drawer.IsOpen() && app.overlayHost.ActiveRoot() == drawer,
+        "first real caption Down/Up opens standard Drawer before first Paint");
+        Check(app.frameSeq == 0, "drawer layout finishes before the first paint");
+        Control initialSurface = drawer.Box();
+        Check(initialSurface.bw > 0 && initialSurface.bw + initialSurface.StyleMarL() + initialSurface.StyleMarR()
+            == Math.Min(app.Scale(360), drawer.bw), "first input prepares complete drawer bounds");
+        DrawerGeometry(app, drawer);
+        witness.drawer = drawer;
+        witness.button = drawer.wallpaperPick;
+        Check(Named(drawer, "theme-opacity") is Slider && Named(drawer, "theme-animations") is Checkbox,
+        "settings are standard retained controls");
+        Check(drawer.opacity.minVal == 50 && drawer.opacity.maxVal == 100 && drawer.opacity.step == 10
+        && drawer.wallpaperOpacity.minVal == 50 && drawer.wallpaperOpacity.maxVal == 100
+        && drawer.wallpaperOpacity.step == 10, "both sliders preserve six historical percentage choices");
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(graphite), false);
+        Check(app.SkinName() == "graphite" && app.ThemeMenuIndex() == graphite && witness.changes == 1,
+        "real skin button applies skin and raises existing notification once");
+        Setting(app, drawer, "theme-accent-2", false);
+        Check(app.accentOverride == Theme.Rgb(139, 92, 246), "accent setting survives as existing override");
+        AccentStyles(app, app.accentOverride);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(navy), false);
+        AccentStyles(app, app.accentOverride);
+        Setting(app, drawer, "theme-accent-0", false);
+        Check(app.accentOverride == 0, "default accent removes override");
+        AccentStyles(app, app.SkinThemeAt(navy).primary);
+        Setting(app, drawer, "theme-accent-2", false);
+        AccentStyles(app, app.accentOverride);
+        int beforeDensity = witness.changes;
+        Setting(app, drawer, "theme-density-2", false);
+        Check(app.Density() == 2 && witness.changes == beforeDensity + 1, "density button updates existing state and notification");
+        SliderValue(app, drawer, drawer.opacity, 40);
+        Check(app.WindowOpacity() >= 50 && app.WindowOpacity() <= 90 && app.WindowOpacity() % 10 == 0,
+        "window transparency uses real Slider input and existing API");
+        Setting(app, drawer, "theme-wallpaper-pick-0", false);
+        Check(app.ConsumeWallpaperPick() && !app.ConsumeWallpaperPick(), "wallpaper picker request keeps consume-once contract");
+        app.SetUserWallpaper("theme-drawer-test-wallpaper.png", 90);
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Check(!drawer.wallpaperClear.IsDisabled() && drawer.wallpaperPick.Label() == "theme-drawer-test-wallpaper.png",
+        "host wallpaper result is projected during input preparation");
+        SliderValue(app, drawer, drawer.wallpaperOpacity, 50);
+        int strength = app.UserWallpaperOpacity();
+        Check(strength >= 50 && strength <= 90 && strength % 10 == 0 && app.HasUserWallpaper(),
+        "wallpaper Slider changes user blend strength without replacing path");
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(porcelain), false);
+        AccentStyles(app, app.accentOverride);
+        Check(app.Density() == 2, "skin switching preserves the user's large density choice");
+        Check(app.UserWallpaperPath() == "theme-drawer-test-wallpaper.png" && app.UserWallpaperOpacity() == strength,
+        "skin switch preserves chosen wallpaper and blend strength");
+        Setting(app, drawer, "theme-wallpaper-clear-0", false);
+        Check(!app.HasUserWallpaper(), "clear uses existing skin-art fallback contract");
+        Click(app, Named(drawer, "theme-tab-1"));
+        Check(drawer.motionScroll.visible && !drawer.styleScroll.visible, "motion tab switches retained pages");
+        bool enabled = app.fxEnabled;
+        Setting(app, drawer, "theme-animations", true);
+        Check(app.fxEnabled != enabled, "animation Checkbox calls existing backdrop switch");
+        Setting(app, drawer, "theme-effect-8", true);
+        Check(app.fxKindOverride == 8 && app.EffectiveFx() == 8, "all historical effects include grid");
+        Setting(app, drawer, "theme-effect--1", true);
+        Check(app.fxKindOverride == -1, "effect follows skin again");
+        Control staleEffect = Named(drawer, "theme-effect-8");
+        Reveal(app, drawer.motionScroll, staleEffect);
+        int staleX = staleEffect.bx + staleEffect.bw / 2;
+        int staleY = staleEffect.by + staleEffect.bh / 2;
+        app.ProcessOffscreenInput(2, staleX, staleY, 0, 0, 0, 0);
+        app.Post(this.ReopenQueuedSession);
+        app.ProcessOffscreenInput(3, staleX, staleY, 0, 0, 0, 0);
+        Drain(app);
+        Check(drawer.IsOpen() && app.fxKindOverride == -1,
+        "queued close/reopen between real Down and posted action retires the old session delegate");
+        Check(app.frameSeq == 0, "all principal settings work before first Paint");
+        Click(app, Named(drawer, "theme-tab-0"));
+        DrawerGeometry(app, drawer);
+        DrawerPixels(app, drawer, graphite);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(navy), false);
+        Check(app.theme.glass == 0 && app.theme.gradient == 0 && app.theme.fx == 0,
+        "new built-in skin has an opaque static surface");
+        DrawerGeometry(app, drawer);
+        DrawerPixels(app, drawer, graphite);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(porcelain), false);
+        Click(app, Named(drawer, "theme-tab-1"));
+        DrawerSurfacePixels(app, drawer);
+
+        app.ProcessOffscreenInput(2, drawer.Box().bx + 4, drawer.Box().by + 4, 0, 0, 0, 0);
+        int focus = app.focus.focusedId;
+        Control capture = app.GetCapturedPointer();
+        int regions = app.hitTester.RegionCount();
+        bool clickClaimed = app.clickClaimed;
+        bool blocked = app.blocksInputBelow;
+        int changes = witness.changes;
+        int opacity = app.WindowOpacity();
+        Control child = Named(drawer, "theme-effect-8");
+        app.canvas.Clear(0xffffffff);
+        int original = app.canvas.GetPixel(10, app.ContentTop() + 10);
+        app.overlayHost.RenderAll(app);
+        Check(app.canvas.GetPixel(10, app.ContentTop() + 10) != original, "standard Drawer still paints its mask");
+        app.overlayHost.RenderAll(app);
+        Check(app.focus.focusedId == focus && app.GetCapturedPointer() == capture
+        && app.hitTester.RegionCount() == regions && app.clickClaimed == clickClaimed
+        && app.blocksInputBelow == blocked && witness.changes == changes && app.WindowOpacity() == opacity
+        && Named(drawer, "theme-effect-8") == child, "repeated Paint consumes prepared tree without input or model mutation");
+        app.ProcessOffscreenInput(3, drawer.Box().bx + 4, drawer.Box().by + 4, 0, 0, 0, 0);
+
+        ClickAt(app, underlying.bx + underlying.bw / 2, underlying.by + underlying.bh / 2);
+        Check(!drawer.IsOpen() && !app.overlayHost.HasActive() && witness.clicks == 0,
+        "mask Down dismisses and its Up cannot click through into underlying root");
+        Click(app, underlying);
+        Check(witness.clicks == 1, "closed drawer releases input to underlying root");
+        Caption(app);
+        Check(app.themeDrawer == drawer && drawer.IsOpen(), "reopening keeps tree and controls");
+        Click(app, Named(drawer, "theme-tab-0"));
+        Reveal(app, drawer.styleScroll, drawer.opacity);
+        app.ProcessOffscreenInput(2, drawer.opacity.bx + drawer.opacity.bw / 2,
+        drawer.opacity.by + drawer.opacity.bh / 2, 0, 0, 0, 0);
+        Check(app.GetCapturedPointer() == drawer.opacity, "open slider capture exists before Escape");
+        app.ProcessOffscreenInput(4, 0, 0, 0, 27, 0, 0);
+        Check(!drawer.IsOpen() && app.GetCapturedPointer() == null && app.focus.focusedControl == null,
+        "Escape closes overlay and releases focused/captured drawer input");
+        Caption(app);
+        Click(app, drawer.closeBtn);
+        Check(!drawer.IsOpen() && !app.overlayHost.HasActive(), "standard close Button unregisters overlay");
+        Caption(app);
+        app.ProcessOffscreenInput(9, 0, 0, 0, 0, 0, 0);
+        Check(!drawer.IsOpen(), "blur dismisses drawer");
+        Caption(app);
+        app.dpiScale = 200;
+        app.ScaleThemeMetrics();
+        app.canvas.Destroy();
+        app.canvas = new Canvas(560, 480);
+        app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+        Control surface = drawer.Box();
+        Check(drawer.bx == 0 && drawer.bw == 560
+        && drawer.by == app.ContentTop() && drawer.bh == 480 - app.ContentTop()
+        && surface.bx == surface.StyleMarL() && surface.by == drawer.by + surface.StyleMarT()
+        && surface.bx + surface.bw + surface.StyleMarR() == 560
+        && surface.by + surface.bh + surface.StyleMarB() == 480,
+        "input preparation fits and insets the resized narrow drawer at 200 percent DPI");
+        int before = drawer.styleScroll.ScrollTop();
+        app.ProcessOffscreenInput(13, drawer.styleScroll.bx + 16,
+        drawer.styleScroll.by + drawer.styleScroll.bh / 2, 0, -120, 0, 0);
+        Check(drawer.styleScroll.ScrollTop() > before, "retained wheel scroll works after resize and DPI change");
+        app.StopLoop();
+        Check(app.themeDrawer == null && !app.overlayHost.HasActive() && !drawer.IsOpen(),
+        "Stopped retires drawer, overlay registration and weak relays");
+    }
+}
+
+class ThemeDrawerRetainedInputTest {
+    static void Run(ThemeDrawerWitness witness) {
+        ThemeDrawerTestForm form = new ThemeDrawerTestForm(witness);
+        App app = form.GetApp();
+        witness.app = app;
+        witness.form = form;
+        form.Exercise();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+    }
+    static void Main() {
+        ControlBootstrap.Install();
+        // App.FrameApp intentionally keeps the first App as the process primer.
+        App primer = App.CreateOffscreen("Theme drawer lifetime primer", 1, 1);
+        primer.StopLoop();
+        ThemeDrawerWitness witness = new ThemeDrawerWitness();
+        Run(witness);
+        if (witness.drawer != null) { throw new Exception("weak drawer releases after scope"); }
+        if (witness.button != null) { throw new Exception("weak setting control releases after scope"); }
+        if (witness.form != null) { throw new Exception("weak Form releases after scope"); }
+        if (witness.app != null) { throw new Exception("weak App releases after scope"); }
+        primer.canvas.Destroy();
+        Console.WriteLine("theme drawer retained input ok");
+    }
+}
