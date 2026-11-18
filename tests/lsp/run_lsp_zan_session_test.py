@@ -234,7 +234,7 @@ def check_workspace(s, workspace):
     expect_diag(caller, 4, set())
 
     open_doc(library, "namespace Library; public class Service { public int Count; }")
-    expect_diag(caller, 4, {"type 'Library.Service' has no member 'Read'"})
+    expect_diag(caller, 4, {"type 'Library.Service' has no method 'Read'"})
     expect_diag(library, 1, set())
     change_doc(library, 2, "namespace Library; public class Service { public static int Read() { return 1; } }")
     expect_diag(caller, 4, {"type 'Library.Service' has no member 'Count'"})
