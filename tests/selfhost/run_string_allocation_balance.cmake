@@ -47,9 +47,10 @@ endfunction()
 _stage(emit "${GEN1}" "${OUTDIR}/raw.ll" "${_source}")
 _stage(verify-raw "${LLVM_AS}" "${OUTDIR}/raw.ll" -o "${OUTDIR}/raw.bc")
 file(READ "${OUTDIR}/raw.ll" _ir)
-# Exact external symbol boundaries; monitor itself calls the original CRT.
+# Rewrite declarations, calls, and function-pointer operands. The monitor
+# itself calls the original CRT.
 foreach(_name malloc calloc realloc free)
-  string(REPLACE "@${_name}(" "@string_probe_${_name}(" _ir "${_ir}")
+  string(REGEX REPLACE "@${_name}([^a-zA-Z0-9_.$-]|$)" "@string_probe_${_name}\\1" _ir "${_ir}")
 endforeach()
 file(WRITE "${OUTDIR}/monitored.ll" "${_ir}")
 _stage(verify "${LLVM_AS}" "${OUTDIR}/monitored.ll" -o "${OUTDIR}/probe.bc")
