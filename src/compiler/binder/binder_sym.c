@@ -205,8 +205,7 @@ static void midx_buckets_rehash(zan_symbol_t *type,
                                 struct zan_member_name_index *ix, int ncap) {
     int *grown = (int *)malloc((size_t)ncap * sizeof(*grown));
     if (!grown) {
-        fprintf(stderr, "error: out of memory tracking member names\n");
-        exit(1);
+        zan_host_oom();
     }
     for (int i = 0; i < ncap; i++) grown[i] = -1;
     for (int n = 0; n < ix->node_count; n++) {
@@ -261,8 +260,7 @@ static struct zan_member_name_index *midx_for(zan_binder_t *b,
         b->member_idx = (struct zan_member_idx_slot *)calloc(
             (size_t)ncap, sizeof(*b->member_idx));
         if (!b->member_idx) {
-            fprintf(stderr, "error: out of memory tracking member names\n");
-            exit(1);
+            zan_host_oom();
         }
         b->member_idx_cap = ncap;
         b->member_idx_count = 0;
@@ -272,8 +270,7 @@ static struct zan_member_name_index *midx_for(zan_binder_t *b,
             (struct zan_member_idx_slot *)calloc((size_t)ncap,
                                                  sizeof(*grown));
         if (!grown) {
-            fprintf(stderr, "error: out of memory tracking member names\n");
-            exit(1);
+            zan_host_oom();
         }
         for (int i = 0; i < b->member_idx_cap; i++) {
             if (!b->member_idx[i].type) continue;
@@ -295,14 +292,12 @@ static struct zan_member_name_index *midx_for(zan_binder_t *b,
     struct zan_member_name_index *ix =
         (struct zan_member_name_index *)calloc(1, sizeof(*ix));
     if (!ix) {
-        fprintf(stderr, "error: out of memory tracking member names\n");
-        exit(1);
+        zan_host_oom();
     }
     ix->bucket_cap = 16;
     ix->buckets = (int *)malloc((size_t)ix->bucket_cap * sizeof(*ix->buckets));
     if (!ix->buckets) {
-        fprintf(stderr, "error: out of memory tracking member names\n");
-        exit(1);
+        zan_host_oom();
     }
     for (int i = 0; i < ix->bucket_cap; i++) ix->buckets[i] = -1;
     b->member_idx[j].type = type_sym;
