@@ -278,10 +278,9 @@ $zanArgs += $script:embedArgs
 $zanArgs += ("@" + $rsp)
 $zanArgs += @("-o", $exeOut, "--subsystem", "windows")
 # Release shape (--publish): Os codegen + the optimization sweep + a stripped
-# link. The unoptimized dev default (O0 + fast_codegen) made the exe ~21 MB,
-# of which 13.8 MB was .text alone; the same sources publish to ~14 MB. The
-# debug ARC guards are off either way (below), so a long-running editor loses
-# nothing it was using. Crash line numbers in build\zan_crash.log were the
+# link. Compare actual artifacts when checking size; the application and its
+# retained dependency graph change over time. Crash line numbers in
+# build\zan_crash.log were the
 # -g DWARF line tables: drop the crash-log source resolution for now; module
 # +offset still lands there, and ZAN_IDE_ZANC_ARGS="-g" brings the tables back
 # for a dedicated debug build when a crash needs triaging.
@@ -335,10 +334,9 @@ $out = & $zanc @zanArgs 2>&1
 $code = $LASTEXITCODE
 $ErrorActionPreference = $prevEap
 if ($code -ne 0) {
-    # Show every diagnostic, not just the tail: a failed build is read from
-    # this output and a truncated list hides the first (usually root) error.
-    $out | Select-String -Pattern 'error|warning' | ForEach-Object { $_.Line }
-    $out | Select-Object -Last 10
+    # Linker and optimizer failures need not contain "error" or "warning".
+    # Preserve the complete output so the first failure remains diagnosable.
+    $out | ForEach-Object { Write-Output $_ }
     Write-Output "IDE_LINK_FAILED code=$code"
     exit 1
 }
