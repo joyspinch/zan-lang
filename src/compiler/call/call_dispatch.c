@@ -459,6 +459,7 @@
                         LLVMValueRef  fn;
                         LLVMTypeRef   fnty;
                         LLVMValueRef  tagc;
+                        LLVMValueRef  eligibility;
                     } ifc_candidate_t;
 
                     int cand_cap = g->struct_type_count + g->generic_inst_count + 4;
@@ -467,7 +468,6 @@
                     int cand_count = 0;
 
                     /* 1. 非泛型类候选 */
-                        LLVMValueRef  eligibility;
                     for (int si = 0; si < g->struct_type_count; si++) {
                         zan_symbol_t *cls = g->struct_types[si].sym;
                         if (!cls || is_user_generic_sym(cls)) continue;
@@ -520,14 +520,6 @@
                         cand_count++;
                     }
 
-                    zan_compile_trace("ifc dispatch %.*s: cands=%d (structs=%d ginsts=%d)",
-                        (int)callee->member.name.len, callee->member.name.str,
-                        cand_count, g->struct_type_count, g->generic_inst_count);
-                    if (cand_count == 1 && cands[0].cls && cands[0].impl_m &&
-                        cands[0].fn && cands[0].fnty) {
-                        unsigned npar = LLVMCountParamTypes(cands[0].fnty);
-                        LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
-                        LLVMGetParamTypes(cands[0].fnty, pts);
                     unsigned candidate_md = LLVMGetMDKindIDInContext(
                         c, "zan.interface.candidate", 23);
                     if (g->publish_instance_prune) {
@@ -546,6 +538,14 @@
                         }
                     }
 
+                    zan_compile_trace("ifc dispatch %.*s: cands=%d (structs=%d ginsts=%d)",
+                        (int)callee->member.name.len, callee->member.name.str,
+                        cand_count, g->struct_type_count, g->generic_inst_count);
+                    if (cand_count == 1 && cands[0].cls && cands[0].impl_m &&
+                        cands[0].fn && cands[0].fnty) {
+                        unsigned npar = LLVMCountParamTypes(cands[0].fnty);
+                        LLVMTypeRef *pts = (LLVMTypeRef *)calloc((size_t)(npar > 0 ? npar : 1), sizeof(LLVMTypeRef));
+                        LLVMGetParamTypes(cands[0].fnty, pts);
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         /* A556-2：结构体箱的载荷在首字 vtable tag 之后（+8），
@@ -563,6 +563,9 @@
                         const char *cn = has_res ? "ifccall" : "";
                         LLVMValueRef r = emit_dispatch_call(g, cands[0].cls, cands[0].impl_m,
                                                             cands[0].fn, cands[0].fnty, ca, cargc, cn);
+                        if (cands[0].eligibility &&
+                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
+                            LLVMSetMetadata(r, candidate_md, cands[0].eligibility);
                         if (has_res) {
                             r = emit_boundary_coerce(g, r, res_ty);
                         } else {
@@ -571,9 +574,6 @@
                         for (int k = 0; k < n_eh_args; k++)
                             emit_eh_tmp_pop(g);
                         if (recv_eh_pushed) emit_eh_tmp_pop(g);
-                        if (cands[0].eligibility &&
-                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
-                            LLVMSetMetadata(r, candidate_md, cands[0].eligibility);
                         for (int k = 0; k < uargc; k++)
                             emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
                         emit_release_owned_call_temp(g, callee->member.object, recv, locals);
@@ -596,6 +596,8 @@
                         LLVMBasicBlockRef nextbb = LLVMAppendBasicBlockInContext(c, g->current_fn, "ifc.next");
                         LLVMValueRef tagc = cands[ci].tagc;
                         LLVMValueRef cmp = zan_icmp(g->builder, LLVMIntEQ, tag, tagc, "ifc.eq");
+                        if (cands[ci].eligibility && LLVMIsAInstruction(cmp))
+                            LLVMSetMetadata(cmp, candidate_md, cands[ci].eligibility);
                         LLVMBuildCondBr(g->builder, cmp, callbb, nextbb);
 
                         LLVMPositionBuilderAtEnd(g->builder, callbb);
@@ -605,8 +607,6 @@
                         int cargc = uargc + 1;
                         LLVMValueRef *ca = (LLVMValueRef *)calloc((size_t)cargc, sizeof(LLVMValueRef));
                         /* A556-2：结构体箱的 this 指向载荷（+8），见单候选分支 */
-                        if (cands[ci].eligibility && LLVMIsAInstruction(cmp))
-                            LLVMSetMetadata(cmp, candidate_md, cands[ci].eligibility);
                         LLVMValueRef thisv = recv;
                         if (cands[ci].cls->kind == SYM_STRUCT)
                             thisv = LLVMBuildGEP2(g->builder,
@@ -619,6 +619,9 @@
                                 ? emit_boundary_coerce(g, avals[k], pts[k + 1]) : avals[k];
                         const char *cn = has_res ? "ifccall" : "";
                         LLVMValueRef r = zan_call_or_invoke(g, g->builder, cands[ci].fnty, cands[ci].fn, ca, (unsigned)cargc, cn);
+                        if (cands[ci].eligibility &&
+                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
+                            LLVMSetMetadata(r, candidate_md, cands[ci].eligibility);
                         if (has_res) {
                             r = emit_boundary_coerce(g, r, res_ty);
                             phi_vals[np] = r; phi_bbs[np] = LLVMGetInsertBlock(g->builder); np++;
@@ -628,9 +631,6 @@
                         LLVMPositionBuilderAtEnd(g->builder, nextbb);
                     }
                     free(cands);
-                        if (cands[ci].eligibility &&
-                            (LLVMIsACallInst(r) || LLVMIsAInvokeInst(r)))
-                            LLVMSetMetadata(r, candidate_md, cands[ci].eligibility);
 
                     emit_runtime_check(g, LLVMConstInt(LLVMInt1TypeInContext(c), 1, 0),
                                        expr->loc, "interface dispatch has no implementation");
