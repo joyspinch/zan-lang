@@ -44,6 +44,11 @@ static bool builtin_type_name(zan_istr_t name) {
     return false;
 }
 
+static zan_istr_t declared_type_name(const zan_ast_node_t *node, zan_istr_t name) {
+    zan_istr_t original = zan_ast_orig_name(node);
+    return original.len ? original : name;
+}
+
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     zan_symbol_t **syms = (zan_symbol_t **)zan_arena_alloc(
         b->arena, sizeof(zan_symbol_t *) *
@@ -56,12 +61,13 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             zan_istr_t name = node->method_decl.name;
             /* Func/Action 可被同名 delegate 遮蔽（resolve_type 会优先取
              * 用户声明，C# 语义）；其余内建名一律拦。 */
-            bool shadowable_delegate = istr_eq(name, "Func", 4) ||
-                                       istr_eq(name, "Action", 6);
-            if (builtin_type_name(name) && !shadowable_delegate) {
+            zan_istr_t declared = declared_type_name(node, name);
+            bool shadowable_delegate = istr_eq(declared, "Func", 4) ||
+                                       istr_eq(declared, "Action", 6);
+            if (builtin_type_name(declared) && !shadowable_delegate) {
                 zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1009,
                               "type declaration '%.*s' collides with a built-in type name",
-                              name.len, name.str);
+                              declared.len, declared.str);
                 continue;
             }
             zan_symbol_t *existing = scope_find(b->current_scope, name);
@@ -83,10 +89,11 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
 
             zan_istr_t name = node->type_decl.name;
 
-            if (builtin_type_name(name)) {
+            zan_istr_t declared = declared_type_name(node, name);
+            if (builtin_type_name(declared)) {
                 zan_diag_emit_code(b->diag, DIAG_ERROR, node->loc, 1009,
                               "type declaration '%.*s' collides with a built-in type name",
-                              name.len, name.str);
+                              declared.len, declared.str);
                 continue;
             }
 
@@ -511,7 +518,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
             im->method_decl.body)
             continue;
         if (!class_has_interface_method(b, cls, im, bind_tps, bind_args)) {
-            zan_diag_emit_code(b->diag, DIAG_ERROR, im->loc, 1015,
+            zan_diag_emit_code(b->diag, DIAG_ERROR, cls->decl->loc, 1015,
                           "type '%.*s' does not implement interface method '%.*s'",
                           (int)cls->name.len, cls->name.str,
                           (int)im->method_decl.name.len,
@@ -550,7 +557,7 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
         zan_ast_node_t *decl = decls->items[i];
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
         zan_symbol_t *cls = scope_find(b->current_scope, decl->type_decl.name);
-        if (!cls || !cls->type) continue;
+        if (!cls || !cls->type || cls->decl != decl) continue;
         for (int j = 0; j < cls->type->interface_count; j++) {
             zan_type_t *iface = cls->type->interfaces[j];
             if (iface && iface->sym && iface->sym->decl)
@@ -658,7 +665,7 @@ static zan_type_t *bind_signature_type(zan_binder_t *b, zan_ast_node_t *ref) {
 static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
-    if (!type_sym) return;
+    if (!type_sym || type_sym->decl != type_node) return;
 
     zan_scope_t *saved = b->current_scope;
     b->current_scope = scope_new(b->arena, saved);

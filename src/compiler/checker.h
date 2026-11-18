@@ -56,6 +56,8 @@ struct zan_checker {
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
                       zan_arena_t *arena, zan_diag_t *diag);
 void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit);
+/* Check bodies and declarations from one source after binding the whole unit. */
+void zan_checker_check_file(zan_checker_t *c, zan_ast_node_t *unit, uint32_t file_id);
 
 zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr);
 void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt);

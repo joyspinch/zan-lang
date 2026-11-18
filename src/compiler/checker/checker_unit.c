@@ -278,8 +278,7 @@ static void check_abstract_implementations(zan_checker_t *c,
         zan_symbol_t *owner = items[i].owner;
         if (checker_class_overrides(sym, m->name, checker_method_param_count(m), 0))
             continue;
-        zan_diag_emit_code(c->diag, DIAG_ERROR,
-            m->decl ? m->decl->loc : (zan_loc_t){0, 0, 0}, 2093,
+        zan_diag_emit_code(c->diag, DIAG_ERROR, sym->decl->loc, 2093,
             "non-abstract class '%.*s' does not implement abstract method "
             "'%.*s' inherited from '%.*s'",
             (int)sym->name.len, sym->name.str,
@@ -566,7 +565,7 @@ static zan_ast_node_t *checker_synthesize_controllers_array(zan_checker_t *c,
     return n;
 }
 
-void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
+static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file_id) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
     checker_collect_table_entities(c, unit);
@@ -589,6 +588,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         }
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
+            if (only_file_id >= 0 && member->loc.file_id != only_file_id) continue;
             check_weak_member(c, decl, member);
             check_extern_static(c, member);
             if ((member->kind == AST_FIELD_DECL || member->kind == AST_PROPERTY_DECL) &&
@@ -618,4 +618,12 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         }
         c->binder->current_scope = saved_scope;
     }
+}
+
+void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
+    check_unit(c, unit, -1);
+}
+
+void zan_checker_check_file(zan_checker_t *c, zan_ast_node_t *unit, uint32_t file_id) {
+    check_unit(c, unit, file_id);
 }

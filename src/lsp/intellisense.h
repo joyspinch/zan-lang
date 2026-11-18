@@ -279,7 +279,12 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
                                 char *final_member, size_t final_cap);
 
 
+typedef void (*intel_directory_fn)(void *context, const char *directory);
+
 void intel_index_project(intellisense_t *is, const char *project_root);
+/* The callback receives each directory visited by the scan. */
+void intel_index_project_ex(intellisense_t *is, const char *project_root,
+                            intel_directory_fn visit_directory, void *context);
 
 void intel_index_files(intellisense_t *is, const char **filepaths, int count);
 

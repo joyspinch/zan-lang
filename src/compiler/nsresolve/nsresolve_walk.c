@@ -204,6 +204,8 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_INTERFACE_DECL:
     case AST_ENUM_DECL: {
         int saved_fields = c->fields.count;
+        const zan_ast_list_t *saved_type_params = c->type_params;
+        c->type_params = &n->type_decl.type_params;
         for (int i = 0; i < n->type_decl.members.count; i++) {
             zan_ast_node_t *m = n->type_decl.members.items[i];
             if (m && (m->kind == AST_FIELD_DECL || m->kind == AST_PROPERTY_DECL))
@@ -214,13 +216,16 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
             nr_walk_list(c, n->type_decl.where_clauses, ns, usings);
         nr_walk_list(c, &n->type_decl.members, ns, usings);
         c->fields.count = saved_fields;
+        c->type_params = saved_type_params;
         break;
     }
 
     case AST_DELEGATE_DECL:
     case AST_METHOD_DECL:
     case AST_CONSTRUCTOR_DECL:
-    case AST_DESTRUCTOR_DECL:
+    case AST_DESTRUCTOR_DECL: {
+        const zan_ast_list_t *saved_type_params = c->method_type_params;
+        c->method_type_params = &n->method_decl.type_params;
         c->shadow.count = 0;
         for (int i = 0; i < c->fields.count; i++)
             shadow_add(&c->shadow, c->fields.items[i]);
@@ -233,7 +238,9 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
             nr_walk_list(c, &n->method_decl.ext->base_args, ns, usings);
         }
         nr_walk(c, n->method_decl.body, ns, usings);
+        c->method_type_params = saved_type_params;
         break;
+    }
 
     case AST_FIELD_DECL:
     case AST_PROPERTY_DECL:
@@ -482,7 +489,8 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     }
 }
 
-void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
+static void nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
+                          zan_diag_t *diag, bool qualified_keys) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zan_ast_list_t *decls = &unit->comp_unit.decls;
     if (decls->count == 0) return;
@@ -492,18 +500,10 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         zan_compile_trace("nsresolve: unit subtree nodes=%zu (allocated=%zu)",
                           zan_ast_subtree_count(unit), zan_ast_node_count());
 
-    nr_ctx_t c;
+    nr_ctx_t c = {0};
     c.arena = arena;
     c.diag = diag;
-    c.count = 0;
-    c.refs = NULL;
-    c.quiet_ambiguity = false;
-    c.shadow.items = NULL;
-    c.shadow.count = 0;
-    c.shadow.cap = 0;
-    c.fields.items = NULL;
-    c.fields.count = 0;
-    c.fields.cap = 0;
+    c.qualified_keys = qualified_keys;
     c.items = (nr_type_t *)zan_arena_alloc(arena,
                     sizeof(nr_type_t) * (size_t)(decls->count + 1));
 
@@ -537,8 +537,8 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     }
 
     for (int i = 0; i < c.count; i++) {
-        if (!c.items[i].conflicting) continue;
-        zan_istr_t m = mangle(&c, c.items[i].full);
+        if (qualified_keys ? c.items[i].ns.len == 0 : !c.items[i].conflicting) continue;
+        zan_istr_t m = qualified_keys ? c.items[i].full : mangle(&c, c.items[i].full);
         c.items[i].final = m;
         if (zan_ast_orig_name(c.items[i].decl).len == 0)
             zan_ast_ensure_decl_meta(c.items[i].decl, arena)->orig_name = c.items[i].simple;
@@ -552,7 +552,16 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         c.shadow.count = 0;
         nr_walk(&c, d, zan_ast_ns_name(d), zan_ast_ns_usings(d));
     }
+    free(c.fields.items);
     free(c.shadow.items);
+}
+
+void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
+    nsresolve_run(unit, arena, diag, false);
+}
+
+void zan_nsresolve_workspace(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
+    nsresolve_run(unit, arena, diag, true);
 }
 
 void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,

@@ -832,6 +832,7 @@ endif()
 # engine to serve the Language Server Protocol over stdio.
 add_executable(zan-lsp
     src/lsp/lsp_main.c
+    src/compiler/nsresolve.c
     src/common/json.c
     src/common/rpc.c
     src/compiler/arena.c

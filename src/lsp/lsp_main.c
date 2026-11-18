@@ -9,6 +9,7 @@
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
+#include "nsresolve.h"
 
 #include "intellisense.h"
 #include "builtin_api.h"
@@ -51,6 +52,7 @@ typedef int lsp_sock_t;
 #define LSP_MAX_DOCS 256
 
 #define LSP_DIAG_QUIET_MS 200
+#define LSP_MANIFEST_POLL_MS 1000
 
 typedef struct lsp_msg {
     struct lsp_msg *next;
@@ -66,6 +68,13 @@ typedef struct {
     uint64_t revision;
 } lsp_doc_t;
 
+typedef struct lsp_project_directory {
+    struct lsp_project_directory *next;
+    bool has_manifest;       /* Protected by doc_lock. */
+    bool observed_manifest;  /* Used only by the diagnostic thread. */
+    char path[];
+} lsp_project_directory_t;
+
 typedef struct {
     lsp_doc_t docs[LSP_MAX_DOCS];
     int       doc_count;
@@ -73,6 +82,7 @@ typedef struct {
     bool      shutdown_requested;
     bool      project_indexed;
     char      workspace_root[1024];
+    lsp_project_directory_t *project_directories;
     FILE     *out;
     bool       use_sock;
     lsp_sock_t sock;
@@ -723,8 +733,52 @@ static void method_call_context(const char *text, size_t offset,
 
 /* diagnostics */
 
+typedef struct {
+    char path[512];
+    char *text;
+} lsp_diag_source_t;
+
+typedef struct {
+    lsp_diag_source_t *items;
+    int count;
+    bool workspace;
+} lsp_diag_sources_t;
+
+static char *read_file_all(const char *path);
 static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
-                                         const zan_ast_node_t *unit);
+                                         const zan_ast_node_t *unit, bool workspace);
+
+static zan_ast_node_t *parse_diagnostic_source(zan_arena_t *arena, zan_diag_t *diag,
+                                               const char *text, uint32_t file_id) {
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, text, strlen(text), file_id, arena, diag);
+    zan_parser_t parser;
+    zan_parser_init(&parser, &lex, arena, diag);
+    return zan_parser_parse(&parser);
+}
+
+static void add_diagnostic_sources(zan_ast_node_t *unit, zan_arena_t *arena,
+                                   lsp_diag_sources_t *sources) {
+    zan_nsresolve_stamp(unit, arena);
+    for (int i = 0; i < sources->count; i++) {
+        lsp_diag_source_t *source = &sources->items[i];
+        if (!source->text) source->text = read_file_all(source->path);
+        if (!source->text) continue;
+
+        zan_diag_t *diag = zan_diag_new(arena);
+        zan_diag_set_capture(diag, true);
+        zan_ast_node_t *dependency = parse_diagnostic_source(arena, diag, source->text,
+                                                              (uint32_t)i + 1);
+        bool parsed = dependency && !zan_diag_has_errors(diag);
+        zan_diag_free_buffers(diag);
+        if (!parsed) continue;
+
+        zan_nsresolve_stamp(dependency, arena);
+        zan_ast_list_t *decls = &dependency->comp_unit.decls;
+        for (int j = 0; j < decls->count; j++)
+            zan_ast_list_push(&unit->comp_unit.decls, decls->items[j], arena);
+    }
+}
 
 static char *diagnostics_payload(const char *uri, int version, json_value *diagnostics) {
     json_value *params = json_new_obj();
@@ -740,7 +794,8 @@ static char *diagnostics_payload(const char *uri, int version, json_value *diagn
     return payload;
 }
 
-static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
+static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const char *text,
+                                       lsp_diag_sources_t *sources) {
     json_value *arr = json_new_arr();
     size_t ul = strlen(uri);
     if ((ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
@@ -752,14 +807,15 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const c
     zan_diag_set_capture(diag, true);
     zan_diag_add_file(diag, uri, text);
 
-    zan_lexer_t lex;
-    zan_lexer_init(&lex, text, strlen(text), 0, arena, diag);
-
-    zan_parser_t parser;
-    zan_parser_init(&parser, &lex, arena, diag);
-    zan_ast_node_t *ast = zan_parser_parse(&parser);
-
+    zan_ast_node_t *ast = parse_diagnostic_source(arena, diag, text, 0);
     if (ast && !zan_diag_has_errors(diag)) {
+        if (sources->workspace) {
+            zan_diag_only_file(diag, 0);
+            add_diagnostic_sources(ast, arena, sources);
+            zan_nsresolve_workspace(ast, arena, diag);
+            /* Qualified binder keys separate partial types in different namespaces. */
+            zan_parser_merge_partials(ast, arena, diag);
+        }
         zan_binder_t binder;
         zan_binder_init(&binder, arena, diag);
         zan_binder_bind(&binder, ast);
@@ -767,14 +823,14 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const c
         if (!zan_diag_has_errors(diag)) {
             zan_checker_t checker;
             zan_checker_init(&checker, &binder, arena, diag);
-            zan_checker_check(&checker, ast);
+            zan_checker_check_file(&checker, ast, 0);
         }
     }
 
     int count = zan_diag_entry_count(diag);
     for (int i = 0; i < count; i++) {
         const zan_diag_entry_t *e = zan_diag_entry_at(diag, i);
-        if (lsp_diag_known_external_type(s, e->message, ast)) continue;
+        if (lsp_diag_known_external_type(s, e->message, ast, sources->workspace)) continue;
         int line = (int)e->loc.line > 0 ? (int)e->loc.line - 1 : 0;
         /* e->loc */
         int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
@@ -1398,6 +1454,20 @@ static void ensure_packages_indexed(lsp_server_t *s) {
     index_needed_packages(s);
 }
 
+/* Entries are prepended under doc_lock and live until the worker joins. */
+static void remember_project_directory(void *context, const char *path) {
+    lsp_server_t *s = context;
+    for (const lsp_project_directory_t *dir = s->project_directories; dir; dir = dir->next) {
+        if (intel_same_file(dir->path, path)) return;
+    }
+    size_t len = strlen(path);
+    lsp_project_directory_t *dir = calloc(1, sizeof(*dir) + len + 1);
+    if (!dir) return;
+    memcpy(dir->path, path, len + 1);
+    dir->next = s->project_directories;
+    s->project_directories = dir;
+}
+
 static void ensure_project_indexed(lsp_server_t *s) {
     if (s->project_indexed) return;
     s->project_indexed = true;
@@ -1408,7 +1478,8 @@ static void ensure_project_indexed(lsp_server_t *s) {
         intel_init(g_project_intel);
     }
     if (s->workspace_root[0]) {
-        intel_index_project(g_project_intel, s->workspace_root);
+        intel_index_project_ex(g_project_intel, s->workspace_root,
+                               remember_project_directory, s);
         if (intel_cancel_flag) {
             s->project_indexed = false;
             return;
@@ -1417,15 +1488,6 @@ static void ensure_project_indexed(lsp_server_t *s) {
     ensure_stdlib_indexed(s);
 }
 
-static void update_project_index(const char *uri, const char *text) {
-    if (!g_project_intel) return;
-    char path[1024];
-    uri_to_native_path(uri, path, sizeof(path));
-    intel_parse_file(g_project_intel, path, text, strlen(text));
-}
-
-static char *read_file_all(const char *path);
-
 static void restore_project_index(const char *uri) {
     if (!g_project_intel) return;
     char path[1024];
@@ -1433,6 +1495,83 @@ static void restore_project_index(const char *uri) {
     char *text = strncmp(uri, "file://", 7) == 0 ? read_file_all(path) : NULL;
     intel_parse_file(g_project_intel, path, text, text ? strlen(text) : 0);
     free(text);
+}
+
+static bool is_path_separator(char ch) {
+#ifdef _WIN32
+    if (ch == '\\') return true;
+#endif
+    return ch == '/';
+}
+
+static bool path_under_directory(const char *path, const char *directory) {
+    if (!directory[0]) return false;
+    size_t len = strlen(directory);
+    while (len && is_path_separator(directory[len - 1])) len--;
+    if (strlen(path) <= len || !is_path_separator(path[len])) return false;
+    char prefix[1024], root[1024];
+    if (len >= sizeof(prefix)) return false;
+    memcpy(prefix, path, len);
+    memcpy(root, directory, len);
+    prefix[len] = root[len] = '\0';
+    return intel_same_file(prefix, root);
+}
+
+static bool workspace_source_path(const lsp_server_t *s, const char *path) {
+    size_t len = strlen(path);
+    return len > 4 && strcmp(path + len - 4, ".zan") == 0 &&
+           path_under_directory(path, s->workspace_root);
+}
+
+/* The root pointers are shared by all paths in a diagnostic scope. */
+static const char *diagnostic_project_root(const lsp_server_t *s, const char *path) {
+    const char *root = s->workspace_root;
+    size_t root_len = 0;
+    for (const lsp_project_directory_t *dir = s->project_directories; dir; dir = dir->next) {
+        if (!dir->has_manifest) continue;
+        size_t len = strlen(dir->path);
+        if (len > root_len && path_under_directory(path, dir->path)) {
+            root = dir->path;
+            root_len = len;
+        }
+    }
+    return root;
+}
+
+static bool workspace_source_uri(const lsp_server_t *s, const char *uri,
+                                 char *path, size_t capacity) {
+    if (strncmp(uri, "file://", 7) != 0) return false;
+    uri_to_native_path(uri, path, capacity);
+    return workspace_source_path(s, path);
+}
+
+static void update_project_index(lsp_server_t *s, const char *uri, const char *text) {
+    if (!g_project_intel) return;
+    char path[1024];
+    uri_to_native_path(uri, path, sizeof(path));
+    intel_parse_file(g_project_intel, path, text, strlen(text));
+    if (strncmp(uri, "file://", 7) != 0 || !workspace_source_path(s, path)) return;
+
+    /* Files opened in a directory created after indexing can introduce a project. */
+    for (size_t i = strlen(path); i > 0; i--) {
+        if (!is_path_separator(path[i - 1])) continue;
+        path[i - 1] = '\0';
+        if (!path_under_directory(path, s->workspace_root)) break;
+        remember_project_directory(s, path);
+    }
+}
+
+/* A dependency edit invalidates pending and published results for open sources. */
+static void invalidate_project_diagnostics(lsp_server_t *s, const char *uri) {
+    char path[1024];
+    if (!workspace_source_uri(s, uri, path, sizeof(path))) return;
+    const char *root = diagnostic_project_root(s, path);
+    for (int i = 0; i < s->doc_count; i++) {
+        lsp_doc_t *doc = &s->docs[i];
+        if (strcmp(doc->uri, uri) != 0 && workspace_source_uri(s, doc->uri, path, sizeof(path)) &&
+            diagnostic_project_root(s, path) == root)
+            lsp_schedule_diagnostics(s, doc, doc->version);
+    }
 }
 
 static int lsp_read_version(json_value *td, int fallback) {
@@ -1451,8 +1590,9 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
     lsp_schedule_diagnostics(s, d, lsp_read_version(td, 0));
 
     ensure_project_indexed(s);
-    update_project_index(uri, text);
+    update_project_index(s, uri, text);
     ensure_packages_indexed(s);
+    invalidate_project_diagnostics(s, uri);
 }
 
 static void lsp_doc_apply_change(lsp_doc_t *d, json_value *change) {
@@ -1514,7 +1654,8 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     }
     if (!d) return;
     lsp_schedule_diagnostics(s, d, incoming);
-    update_project_index(uri, d->text);
+    update_project_index(s, uri, d->text);
+    invalidate_project_diagnostics(s, uri);
 }
 
 static intellisense_t *g_doc_intel = NULL;
@@ -1577,10 +1718,9 @@ static bool lsp_namespace_visible(const zan_ast_node_t *unit, const char *ns) {
     return false;
 }
 
-/* 单文档 binder 看不到其他文件。只在项目索引有可见的同名类型时，
- * 过滤这两条未定义类型诊断。命名空间和 using 来自同一份诊断快照。 */
+/* Dependencies outside the workspace still use the index for type diagnostics. */
 static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
-                                         const zan_ast_node_t *unit) {
+                                         const zan_ast_node_t *unit, bool workspace) {
     static const char type_prefix[] = "[E1005] undefined type '";
     static const char base_prefix[] = "[E1013] undefined base type '";
     if (!unit) return false;
@@ -1606,6 +1746,7 @@ static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
     for (int i = 0; g_project_intel && i < g_project_intel->symbol_count; i++) {
         const isym_t *sym = &g_project_intel->symbols[i];
         if (!sym->is_top_level_type || (base && sym->kind == ISYM_ENUM)) continue;
+        if (workspace && workspace_source_path(s, sym->file)) continue;
         /* 长度达到字段上限时，索引名可能已被截断。 */
         if (len >= sizeof(sym->name) - 1 || strlen(sym->name) != len ||
             memcmp(sym->name, short_name, len) != 0)
@@ -1632,6 +1773,7 @@ static void handle_did_close(lsp_server_t *s, json_value *params) {
         last_version = d->version;
         lsp_remove_doc(s, uri);
         restore_project_index(uri);
+        invalidate_project_diagnostics(s, uri);
     }
     doc_intel_invalidate(uri);
     char *payload = diagnostics_payload(uri, last_version, json_new_arr());
@@ -1639,18 +1781,103 @@ static void handle_did_close(lsp_server_t *s, json_value *params) {
     free(payload);
 }
 
+/* Copy paths and editor buffers under doc_lock, then read disk on the worker. */
+static lsp_diag_sources_t snapshot_diagnostic_sources(lsp_server_t *s, const char *uri) {
+    lsp_diag_sources_t sources = {0};
+    char primary[1024];
+    if (!g_project_intel || !workspace_source_uri(s, uri, primary, sizeof(primary)))
+        return sources;
+
+    const char *root = diagnostic_project_root(s, primary);
+    int count = g_project_intel->indexed_file_count;
+    sources.items = calloc((size_t)count, sizeof(*sources.items));
+    if (count && !sources.items) return sources;
+    sources.workspace = true;
+    for (int i = 0; i < count; i++) {
+        const char *path = g_project_intel->indexed_files[i];
+        if (!workspace_source_path(s, path) || intel_same_file(path, primary) ||
+            diagnostic_project_root(s, path) != root) continue;
+        lsp_diag_source_t *source = &sources.items[sources.count++];
+        strcpy(source->path, path);
+    }
+    for (int i = 0; i < s->doc_count; i++) {
+        const lsp_doc_t *doc = &s->docs[i];
+        char path[1024];
+        if (!workspace_source_uri(s, doc->uri, path, sizeof(path))) continue;
+        for (int j = 0; j < sources.count; j++) {
+            lsp_diag_source_t *source = &sources.items[j];
+            if (!source->text && intel_same_file(source->path, path)) {
+                source->text = dup_str(doc->text);
+                break;
+            }
+        }
+    }
+    return sources;
+}
+
+static bool project_manifest_present(const char *directory) {
+    char path[1040];
+    size_t len = strlen(directory);
+    const char *sep = len && is_path_separator(directory[len - 1]) ? "" : "/";
+    int written = snprintf(path, sizeof(path), "%s%szan.proj", directory, sep);
+    if (written < 0 || (size_t)written >= sizeof(path)) return false;
+#ifdef _WIN32
+    DWORD attributes = zan_utf8_get_file_attributes(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+/* Probe without doc_lock, then apply the whole observation before taking a
+ * diagnostic snapshot. Directory entries remain valid across unlock. */
+static void refresh_project_manifests(lsp_server_t *s, lsp_project_directory_t *head) {
+    for (lsp_project_directory_t *dir = head; dir; dir = dir->next)
+        dir->observed_manifest = project_manifest_present(dir->path);
+
+    bool changed = false;
+    lsp_doc_lock(s);
+    for (lsp_project_directory_t *dir = head; dir; dir = dir->next) {
+        if (dir->has_manifest == dir->observed_manifest) continue;
+        dir->has_manifest = dir->observed_manifest;
+        changed = true;
+    }
+    if (changed) {
+        for (int i = 0; i < s->doc_count; i++) {
+            lsp_doc_t *doc = &s->docs[i];
+            char path[1024];
+            if (workspace_source_uri(s, doc->uri, path, sizeof(path)))
+                lsp_schedule_diagnostics(s, doc, doc->version);
+        }
+    }
+    lsp_doc_unlock(s);
+}
+
 static int diag_worker_loop(lsp_server_t *s) {
+    lsp_project_directory_t *last_polled = NULL;
+    uint64_t next_manifest_poll = 0;
     for (;;) {
         lsp_sleep_ms(20);
         char *uri = NULL, *text = NULL;
         int version = 0;
         uint64_t revision = 0;
+        lsp_diag_sources_t sources = {0};
         lsp_doc_lock(s);
         if (s->diag_stop) {
             lsp_doc_unlock(s);
             break;
         }
         uint64_t now = lsp_now_ms();
+        lsp_project_directory_t *directories = s->project_directories;
+        if (directories && s->doc_count &&
+            (directories != last_polled || now >= next_manifest_poll)) {
+            lsp_doc_unlock(s);
+            refresh_project_manifests(s, directories);
+            last_polled = directories;
+            next_manifest_poll = lsp_now_ms() + LSP_MANIFEST_POLL_MS;
+            continue;
+        }
         for (int i = 0; i < s->doc_count; i++) {
             lsp_doc_t *d = &s->docs[i];
             if (d->diag_pending && now - d->last_change_ms >= LSP_DIAG_QUIET_MS) {
@@ -1658,14 +1885,21 @@ static int diag_worker_loop(lsp_server_t *s) {
                 text = dup_str(d->text);
                 version = d->version;
                 revision = d->revision;
+                if (uri && text) sources = snapshot_diagnostic_sources(s, uri);
                 d->diag_pending = false;
                 break;
             }
         }
         lsp_doc_unlock(s);
-        if (!uri) continue;
+        if (!uri || !text) {
+            free(uri);
+            free(text);
+            continue;
+        }
 
-        json_value *diagnostics = collect_diagnostics(s, uri, text);
+        json_value *diagnostics = collect_diagnostics(s, uri, text, &sources);
+        for (int i = 0; i < sources.count; i++) free(sources.items[i].text);
+        free(sources.items);
         char *payload = diagnostics_payload(uri, version, diagnostics);
         /* The check and write share the lock with didChange and didClose.
          * Clients can reuse an LSP version when reopening the same URI. */
@@ -4375,6 +4609,11 @@ int main(int argc, char **argv) {
 #endif
     lsp_locks_free(&server);
 
+    while (server.project_directories) {
+        lsp_project_directory_t *dir = server.project_directories;
+        server.project_directories = dir->next;
+        free(dir);
+    }
     for (int i = 0; i < server.doc_count; i++) {
         free(server.docs[i].uri);
         free(server.docs[i].text);

@@ -3090,12 +3090,23 @@ static bool index_skip_dir(const char *name) {
 
 volatile int intel_cancel_flag = 0;
 
+static bool index_join_path(char *path, size_t cap, const char *dir, const char *name) {
+    size_t len = strlen(dir);
+    const char *sep = len && dir[len - 1] == '/' ? "" : "/";
+#ifdef _WIN32
+    sep = len && (dir[len - 1] == '/' || dir[len - 1] == '\\') ? "" : "\\";
+#endif
+    int written = snprintf(path, cap, "%s%s%s", dir, sep, name);
+    return written >= 0 && (size_t)written < cap;
+}
+
 #ifdef _WIN32
 
-static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
+static void index_directory_recursive(intellisense_t *is, const char *dir_path,
+                                      intel_directory_fn visit_directory, void *context) {
     if (intel_cancel_flag) return;
     char search_path[1024];
-    snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+    if (!index_join_path(search_path, sizeof(search_path), dir_path, "*")) return;
 
     wchar_t wsearch[1024];
     if (MultiByteToWideChar(CP_UTF8, 0, search_path, -1, wsearch, 1024) <= 0) return;
@@ -3103,6 +3114,7 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(wsearch, &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
+    if (visit_directory) visit_directory(context, dir_path);
 
     do {
         if (intel_cancel_flag) break;
@@ -3113,11 +3125,11 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
             continue;
 
         char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, filename_utf8);
+        if (!index_join_path(full_path, sizeof(full_path), dir_path, filename_utf8)) continue;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!index_skip_dir(filename_utf8)) {
-                index_directory_recursive(is, full_path);
+                index_directory_recursive(is, full_path, visit_directory, context);
             }
         } else {
             size_t name_len = strlen(filename_utf8);
@@ -3153,16 +3165,13 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
     FindClose(hFind);
 }
 
-void intel_index_project(intellisense_t *is, const char *project_root) {
-    if (!project_root || !project_root[0]) return;
-    index_directory_recursive(is, project_root);
-}
-
 #else
-static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
+static void index_directory_recursive(intellisense_t *is, const char *dir_path,
+                                      intel_directory_fn visit_directory, void *context) {
     if (intel_cancel_flag) return;
     DIR *dir = opendir(dir_path);
     if (!dir) return;
+    if (visit_directory) visit_directory(context, dir_path);
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -3170,14 +3179,14 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
         if (entry->d_name[0] == '.') continue;
 
         char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+        if (!index_join_path(full_path, sizeof(full_path), dir_path, entry->d_name)) continue;
 
         struct stat st;
         if (stat(full_path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
             if (!index_skip_dir(entry->d_name)) {
-                index_directory_recursive(is, full_path);
+                index_directory_recursive(is, full_path, visit_directory, context);
             }
         } else if (S_ISREG(st.st_mode)) {
             size_t name_len = strlen(entry->d_name);
@@ -3210,11 +3219,17 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
     closedir(dir);
 }
 
-void intel_index_project(intellisense_t *is, const char *project_root) {
-    if (!project_root || !project_root[0]) return;
-    index_directory_recursive(is, project_root);
-}
 #endif
+
+void intel_index_project_ex(intellisense_t *is, const char *project_root,
+                            intel_directory_fn visit_directory, void *context) {
+    if (!project_root || !project_root[0]) return;
+    index_directory_recursive(is, project_root, visit_directory, context);
+}
+
+void intel_index_project(intellisense_t *is, const char *project_root) {
+    intel_index_project_ex(is, project_root, NULL, NULL);
+}
 
 void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
     for (int i = 0; i < count; i++) {

@@ -11,7 +11,52 @@ import time
 from pathlib import Path
 
 
+DISK_DEPENDENCY = """namespace App.Services;
+public class Service {
+    public int Count;
+    public static int Read() { return 1; }
+    MissingSignatureType broken;
+}
+public interface IReader { int Read(); }
+public abstract class AbstractReader { public abstract int Read(); }
+"""
+MISSING_METHOD = "[E2084] type 'App.Services.Service' has no method 'Read'"
+
+
+PROJECT_SOURCES = {
+    "parent/zan.proj": "name=Parent\n",
+    "parent-extra/zan.proj": "name=Sibling\n",
+    "parent/nested/zan.proj": "name=Nested\n",
+    "parent/Token.zan": "namespace Shared; public class ParentToken {}",
+    "parent/src/lib/Helper.zan": """namespace Shared;
+public class Helper { public static int ParentOnly() { return 1; } }
+""",
+    "parent-extra/src/Helper.zan": """namespace Shared;
+public class Helper { public static int SiblingOnly() { return 2; } }
+public class SiblingOnly {}
+""",
+    "parent/nested/src/Library.zan": """namespace Shared;
+public class NestedOnly {}
+""",
+}
+
+
 CASES = [
+    ("parent/src/Valid.zan", """using Shared;
+class ParentUse { static int Read() { return Helper.ParentOnly(); } }
+""", set()),
+    ("parent/src/Invalid.zan", """using Shared;
+class InvalidUse { SiblingOnly sibling; NestedOnly nested; }
+""", {"[E1005] undefined type 'SiblingOnly'", "[E1005] undefined type 'NestedOnly'"}),
+    ("parent-extra/src/Valid.zan", """using Shared;
+class SiblingUse { static int Read() { return Helper.SiblingOnly(); } }
+""", set()),
+    ("parent/nested/src/Invalid.zan", """using Shared;
+class InvalidUse { Helper fromParent; }
+""", {"[E1005] undefined type 'Helper'"}),
+    ("loose.zan", """using Shared;
+class LooseUse { Helper fromProject; }
+""", {"[E1005] undefined type 'Helper'"}),
     ("lib.zan", """namespace App.Shared;
 
 public class Helper {
@@ -41,6 +86,41 @@ class Prog {
     }
 }
 """, set()),
+    ("members.zan", """using App.Services;
+class MemberUse {
+    static int Read(Service service) {
+        return Service.Read() + service.Count;
+    }
+}
+""", set()),
+    ("member_typos.zan", """using App.Services;
+class MemberTypos {
+    static int Read(Service service) {
+        int a = App.Services.Service.Reed();
+        int b = service.Cuont;
+        return a + b;
+    }
+}
+""", {"[E2084] type 'App.Services.Service' has no method 'Reed'",
+      "[E2084] type 'App.Services.Service' has no member 'Cuont'"}),
+    ("generic_shadow.zan", """namespace App.Services;
+class GenericShadow<Service> {
+    Service Echo(Service value) { return value; }
+}
+class GenericUse {
+    static int Run(GenericShadow<int> box) { return box.Echo(3); }
+}
+""", set()),
+    ("reserved.zan", """namespace App.Services;
+class Task {}
+""", {"[E1009] type declaration 'Task' collides with a built-in type name"}),
+    ("missing_implementation.zan", """using App.Services;
+class Reader : IReader {}
+""", {"[E1015] type 'Reader' does not implement interface method 'Read'"}),
+    ("missing_override.zan", """using App.Services;
+class ConcreteReader : AbstractReader {}
+""", {"[E2093] non-abstract class 'ConcreteReader' does not implement abstract method "
+      "'Read' inherited from 'App.Services.AbstractReader'"}),
     ("no_import.zan", """// namespace App.Shared;
 class NoImport {
     Helper value;
@@ -120,7 +200,7 @@ def run_session(proc, workspace, messages, deadline):
         if "result" not in response:
             raise RuntimeError(f"{method} failed: {response}")
 
-    request("initialize", 1, {"rootUri": workspace.as_uri(), "capabilities": {}})
+    request("initialize", 1, {"rootUri": workspace.as_uri() + "/", "capabilities": {}})
     send("initialized", {})
     pending = {}
     for name, text, wanted in CASES:
@@ -164,6 +244,14 @@ def run_session(proc, workspace, messages, deadline):
 
     def close_document(uri):
         send("textDocument/didClose", {"textDocument": {"uri": uri}})
+
+    # An unsaved dependency changes its own project's caller at the same version.
+    project_lib = (workspace / "parent/src/lib/Helper.zan").as_uri()
+    project_caller = (workspace / "parent/src/Valid.zan").as_uri()
+    open_document(project_lib, 1, "namespace Shared; public class Helper {}")
+    next_diagnostics(project_caller, 1, {"[E2084] type 'Shared.Helper' has no method 'ParentOnly'"})
+    close_document(project_lib)
+    next_diagnostics(project_caller, 1, set())
 
     # Reopen the last document slot with a lower version and different text.
     uri = (workspace / "missing_base.zan").as_uri()
@@ -209,6 +297,38 @@ def run_session(proc, workspace, messages, deadline):
     change_document(uri, 6, use)
     next_diagnostics(uri, 6, {"[E1005] undefined type 'DraftOnly'"})
 
+    # Dependency edits republish diagnostics with the caller's unchanged version.
+    service = (workspace / "service.zan").as_uri()
+    caller = (workspace / "members.zan").as_uri()
+    open_document(service, 1, "namespace App.Services; public class Service { public int Count; }")
+    next_diagnostics(caller, 1, {MISSING_METHOD})
+    close_document(service)
+    next_diagnostics(caller, 1, set())
+
+    # Change project ownership on disk with no editor notifications or version changes.
+    ownership = (workspace / "parent/src/Ownership.zan").as_uri()
+    open_document(ownership, 1, "using Shared; class Ownership { ParentToken parent; Helper helper; }")
+    next_diagnostics(ownership, 1, set())
+    manifest = workspace / "parent/src/zan.proj"
+    manifest.write_text("name=SourceProject\n", encoding="utf-8")
+    next_diagnostics(ownership, 1, {"[E1005] undefined type 'ParentToken'"})
+    moved = workspace / "parent/src/lib/zan.proj"
+    manifest.rename(moved)
+    next_diagnostics(ownership, 1, {"[E1005] undefined type 'Helper'"})
+    moved.unlink()
+    next_diagnostics(ownership, 1, set())
+
+    # Opening a source in a new directory discovers its manifest as well.
+    new_project = workspace / "parent/new/src"
+    new_project.mkdir(parents=True)
+    new_manifest = new_project.parent / "zan.proj"
+    new_manifest.write_text("name=NewProject\n", encoding="utf-8")
+    new_uri = (new_project / "Use.zan").as_uri()
+    open_document(new_uri, 1, "using Shared; class UseParent { ParentToken parent; }")
+    next_diagnostics(new_uri, 1, {"[E1005] undefined type 'ParentToken'"})
+    new_manifest.unlink()
+    next_diagnostics(new_uri, 1, set())
+
     request("shutdown", 2)
     send("exit")
     code = proc.wait(timeout=max(0, deadline - time.monotonic()))
@@ -224,6 +344,11 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="lsp_diag_suppress_") as temp_dir:
         workspace = Path(temp_dir)
+        (workspace / "service.zan").write_text(DISK_DEPENDENCY, encoding="utf-8")
+        for name, text in PROJECT_SOURCES.items():
+            path = workspace / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
         for name, text, _ in CASES:
             (workspace / name).write_text(text, encoding="utf-8")
 

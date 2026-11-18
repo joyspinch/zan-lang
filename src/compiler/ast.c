@@ -6,7 +6,7 @@
 
 _Static_assert(sizeof(zan_ast_node_t) <= 120, "AST node layout regressed");
 
-static size_t g_ast_node_count;
+static _Thread_local size_t g_ast_node_count;
 
 size_t zan_ast_node_count(void) { return g_ast_node_count; }
 

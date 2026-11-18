@@ -44,6 +44,7 @@ typedef struct {
 } zan_diag_dedup_sig_t;
 
 struct zan_diag {
+    int64_t only_file_id;  /* -1 includes all sources. */
     int error_count;
     int warning_count;
     int max_errors;
@@ -86,6 +87,7 @@ struct zan_diag {
 };
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena);
+void zan_diag_only_file(zan_diag_t *diag, uint32_t file_id);
 void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled);
 /* A382②：告警级别开关。0=none（告警不打印不计数）1=default 2=error（升级为错） */
 void zan_diag_set_warn_level(zan_diag_t *diag, int level);

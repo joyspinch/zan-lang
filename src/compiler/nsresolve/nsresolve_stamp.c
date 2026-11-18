@@ -163,6 +163,9 @@ typedef struct {
      * "ambiguous type"，元素节点再报一遍就是同一条诊断出现两次。解析元素
      * 节点时把这个标志置上，抑制重复的那一条。 */
     bool quiet_ambiguity;
+    bool qualified_keys;
+    const zan_ast_list_t *type_params;
+    const zan_ast_list_t *method_type_params;
 } nr_ctx_t;
 
 static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
@@ -365,10 +368,23 @@ static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
     return n;
 }
 
+static bool matches_type_param(const zan_ast_list_t *params, zan_istr_t name) {
+    if (!params) return false;
+    for (int i = 0; i < params->count; i++) {
+        const zan_ast_node_t *param = params->items[i];
+        if (param && param->kind == AST_IDENTIFIER && ns_istr_eq(param->ident.name, name))
+            return true;
+    }
+    return false;
+}
+
 static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
                         zan_istr_t ctx_ns, zan_ast_list_t *usings) {
     zan_istr_t R = tr->type_ref.name;
     if (R.len == 0) return;
+    if (c->qualified_keys && tr->type_ref.type_args.count == 0 &&
+        (matches_type_param(c->type_params, R) || matches_type_param(c->method_type_params, R)))
+        return;
     nr_type_t *t = NULL;
 
     if (ns_has_dot(R)) {
@@ -392,11 +408,13 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
             if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
             return;
         }
-        uint32_t last = 0;
-        for (uint32_t i = 0; i < R.len; i++)
-            if (R.str[i] == '.') last = i + 1;
-        R = mk_istr(c->arena, R.str + last, R.len - last);
-        tr->type_ref.name = R;
+        if (!c->qualified_keys) {
+            uint32_t last = 0;
+            for (uint32_t i = 0; i < R.len; i++)
+                if (R.str[i] == '.') last = i + 1;
+            R = mk_istr(c->arena, R.str + last, R.len - last);
+            tr->type_ref.name = R;
+        }
     }
 
     t = find_full_joined(c, ctx_ns, R);
@@ -529,7 +547,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
      * Gui.Backend.Window）时，裸名 + 成员访问按"谁声明了这个成员"消歧：
      * 命中唯一就用它；命中多个 → 报歧义（和类型位置的诊断同一口径）；
      * 命中零个 → 不猜，交给后面的诊断。 */
-    if (!t && member.len) {
+    if (!t && member.len && !c->qualified_keys) {
         int hits = 0;
         t = pick_by_member(c, R, member, &hits);
         if (!t && hits > 1 && c->diag)
@@ -546,7 +564,10 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
 static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     zan_istr_t empty = {0};
     if (!n) return empty;
-    if (n->kind == AST_IDENTIFIER) return n->ident.name;
+    if (n->kind == AST_IDENTIFIER) {
+        if (c->qualified_keys && shadow_has(&c->shadow, n->ident.name)) return empty;
+        return n->ident.name;
+    }
     if (n->kind == AST_MEMBER_ACCESS) {
         zan_istr_t head = flatten_receiver(c, n->member.object);
         if (head.len == 0) return empty;

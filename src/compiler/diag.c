@@ -9,6 +9,7 @@
 #include "../common/host_oom.h"
 zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     zan_diag_t *d = (zan_diag_t *)zan_arena_alloc(arena, sizeof(zan_diag_t));
+    d->only_file_id = -1;
     d->error_count = 0;
     d->warning_count = 0;
     d->max_errors = 100;
@@ -38,6 +39,10 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->dedup_count = 0;
     d->dedup_cap = 0;
     return d;
+}
+
+void zan_diag_only_file(zan_diag_t *diag, uint32_t file_id) {
+    diag->only_file_id = file_id;
 }
 
 void zan_diag_set_max_errors(zan_diag_t *diag, int max_errors) {
@@ -238,6 +243,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
                            zan_loc_t loc, int code, const char *fmt,
                            va_list args) {
+    if (diag->only_file_id >= 0 && loc.file_id != diag->only_file_id) return;
     char msgbuf[1024];
     char prefix[16];
     if (code > 0) {
@@ -465,7 +471,7 @@ void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
 }
 
 void zan_compile_trace(const char *fmt, ...) {
-    static int on = -1;
+    static _Thread_local int on = -1;
     if (on < 0) on = getenv("ZANC_TRACE") ? 1 : 0;
     if (!on) return;
     va_list ap;
