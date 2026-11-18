@@ -1,0 +1,64 @@
+using System;
+using System.IO.Compression;
+
+namespace System.Drawing.Imaging;
+
+// 8-bit PNG encoding. Pixels are top-to-bottom tightly packed RGB/RGBA bytes;
+// they are not native ARGB32/BGRA memory. Invalid dimensions or length throw.
+public class Png {
+    public static byte[] Encode(int width, int height, byte[] rgba) {
+        return Png.EncodePixels(width, height, rgba, 4);
+    }
+
+    public static byte[] EncodeRgb(int width, int height, byte[] rgb) {
+        return Png.EncodePixels(width, height, rgb, 3);
+    }
+
+    static byte[] EncodePixels(int width, int height, byte[] pixels, int channels) {
+        if (width <= 0 || height <= 0 || pixels == null) {
+            throw new ArgumentException("PNG dimensions and pixels must not be empty");
+        }
+        long rowBytes = (long)width * channels;
+        if (rowBytes >= int.MaxValue) {
+            throw new ArgumentException("PNG row exceeds supported size");
+        }
+        long pixelBytes = rowBytes * height;
+        long scanBytes = (rowBytes + 1) * height;
+        if (pixelBytes > int.MaxValue || scanBytes > int.MaxValue || pixels.Length != pixelBytes) {
+            throw new ArgumentException("PNG pixel length or dimensions are invalid");
+        }
+        int row = (int)rowBytes;
+        byte[] raw = new byte[(int)scanBytes];
+        for (int y = 0; y < height; y = y + 1) {
+            NativeMemory.Copy((nint)raw + y * (row + 1) + 1, (nint)pixels + y * row, row);
+        }
+        byte[] compressed = Deflate.ZlibCompress(raw, 9);
+        if (compressed.Length > int.MaxValue - 57) {
+            throw new ArgumentException("PNG encoded data exceeds supported size");
+        }
+        byte[] result = new byte[57 + compressed.Length];
+        result[0] = 137; result[1] = 80; result[2] = 78; result[3] = 71;
+        result[4] = 13; result[5] = 10; result[6] = 26; result[7] = 10;
+        byte[] header = new byte[13];
+        Png.WriteInt(header, 0, width); Png.WriteInt(header, 4, height);
+        header[8] = 8; header[9] = channels == 4 ? (byte)6 : (byte)2;
+        int at = Png.WriteChunk(result, 8, (byte)'I', (byte)'H', (byte)'D', (byte)'R', header);
+        at = Png.WriteChunk(result, at, (byte)'I', (byte)'D', (byte)'A', (byte)'T', compressed);
+        Png.WriteChunk(result, at, (byte)'I', (byte)'E', (byte)'N', (byte)'D', new byte[0]);
+        return result;
+    }
+
+    static void WriteInt(byte[] data, int at, int value) {
+        data[at] = (byte)(value >> 24); data[at + 1] = (byte)(value >> 16);
+        data[at + 2] = (byte)(value >> 8); data[at + 3] = (byte)value;
+    }
+
+    static int WriteChunk(byte[] dst, int at, byte b0, byte b1, byte b2, byte b3, byte[] data) {
+        Png.WriteInt(dst, at, data.Length);
+        dst[at + 4] = b0; dst[at + 5] = b1; dst[at + 6] = b2; dst[at + 7] = b3;
+        if (data.Length > 0) { NativeMemory.Copy((nint)dst + at + 8, (nint)data, data.Length); }
+        int crc = Crc32.Compute(dst, at + 4, data.Length + 4, 0);
+        Png.WriteInt(dst, at + 8 + data.Length, crc);
+        return at + 12 + data.Length;
+    }
+}
