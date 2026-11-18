@@ -51,7 +51,8 @@ partial class Irgen {
         // its define line through its closing '}' at column 0)
         List<int> defStart = new List<int>();
         List<int> defEnd = new List<int>();
-        List<string> defName = new List<string>();
+        MethIndex defs = new MethIndex();
+        List<int> reached = new List<int>();
         int i = 0;
         while (i < lnCount) {
             string ln = modText.Substring(lineStart[i], lineLen[i]);
@@ -63,57 +64,49 @@ partial class Irgen {
                     if (bl == "}") { break; }
                     i = i + 1;
                 }
+                defs.Add(nm, defStart.Count);
                 defStart.Add(st);
                 defEnd.Add(i);
-                defName.Add(nm);
+                reached.Add(0);
             }
             i = i + 1;
         }
-        if (defName.Count == 0) { return modText; }
+        if (defStart.Count == 0) { return modText; }
 
-        List<int> blockScanned = new List<int>();
-        int k = 0;
-        while (k < defName.Count) { blockScanned.Add(0); k = k + 1; }
-
-        // roots: the @symbols on every NON-define line (global initializers
-        // -- vtables and function-pointer tables are data, so their targets
-        // stay reachable -- plus declares and attributes) and the `main`
-        // entry the linker references externally
-        List<string> keep = new List<string>();
+        // Collect roots from outside the function bodies, then add the
+        // entry and the hooks referenced by the linked runtime.
+        List<int> pending = new List<int>();
+        List<string> names = new List<string>();
         i = 0;
         int defRun = 0;
         while (i < lnCount) {
-            if (defRun < defName.Count && defStart[defRun] == i) {
+            if (defRun < defStart.Count && defStart[defRun] == i) {
                 i = defEnd[defRun] + 1;
                 defRun = defRun + 1;
                 continue;
             }
-            CollectHeadRefs(modText.Substring(lineStart[i], lineLen[i]), keep);
+            CollectHeadRefs(modText.Substring(lineStart[i], lineLen[i]), names);
+            QueueDefinitions(names, defs, reached, pending);
             i = i + 1;
         }
-        keep.Add("main");
-        // the weak coroutine set: the linked C runtime references these from
-        // outside the module, so reachability inside the module never sees them
-        keep.Add("zan_co_ready"); keep.Add("zan_co_ready_batch"); keep.Add("zan_co_sched_init");
-        keep.Add("zan_co_sched_run"); keep.Add("zan_co_sched_run_until"); keep.Add("zan_co_delay");
-        keep.Add("zan_io_pump"); keep.Add("zan_io_pump_timeout");
-        keep.Add("__zan_async_unwind"); keep.Add("__zan_co_frame_free");
-        keep.Add("__zan_co_now_ms"); keep.Add("__zan_co_reap");
-        // Native dispatch/thread code calls these backend-specific ARC/ABI hooks.
-        keep.Add("zan_backend_delegate_retain"); keep.Add("zan_backend_delegate_release");
-        keep.Add("zan_backend_delegate_invoke"); keep.Add("zarr_owner");
+        names.Add("main");
+        names.Add("zan_co_ready"); names.Add("zan_co_ready_batch"); names.Add("zan_co_sched_init");
+        names.Add("zan_co_sched_run"); names.Add("zan_co_sched_run_until"); names.Add("zan_co_delay");
+        names.Add("zan_io_pump"); names.Add("zan_io_pump_timeout");
+        names.Add("__zan_async_unwind"); names.Add("__zan_co_frame_free");
+        names.Add("__zan_co_now_ms"); names.Add("__zan_co_reap");
+        names.Add("zan_backend_delegate_retain"); names.Add("zan_backend_delegate_release");
+        names.Add("zan_backend_delegate_invoke"); names.Add("zarr_owner");
+        QueueDefinitions(names, defs, reached, pending);
 
         int wi = 0;
-        while (wi < keep.Count) {
-            string want = keep[wi];
+        while (wi < pending.Count) {
+            int bi = pending[wi];
             wi = wi + 1;
-            int bi = BlockOf(defName, want);
-            if (bi < 0) { continue; }
-            if (blockScanned[bi] == 1) { continue; }
-            blockScanned[bi] = 1;
             int from = lineStart[defStart[bi]];
             int to = lineStart[defEnd[bi]] + lineLen[defEnd[bi]];
-            CollectHeadRefs(modText.Substring(from, to - from), keep);
+            CollectHeadRefs(modText.Substring(from, to - from), names);
+            QueueDefinitions(names, defs, reached, pending);
         }
 
         // rebuild the module: skip define blocks that stayed unreachable
@@ -121,8 +114,8 @@ partial class Irgen {
         i = 0;
         int defIdx = 0;
         while (i < lnCount) {
-            if (defIdx < defName.Count && defStart[defIdx] == i) {
-                if (blockScanned[defIdx] == 0) {
+            if (defIdx < defStart.Count && defStart[defIdx] == i) {
+                if (reached[defIdx] == 0) {
                     // drop the whole block: fast-forward past its closing '}'
                     i = defEnd[defIdx] + 1;
                     defIdx = defIdx + 1;
@@ -137,13 +130,17 @@ partial class Irgen {
         return result.ToString();
     }
 
-    int BlockOf(List<string> names, string want) {
-        int k = 0;
-        while (k < names.Count) {
-            if (names[k] == want) { return k; }
-            k = k + 1;
+    void QueueDefinitions(List<string> names, MethIndex defs, List<int> reached, List<int> pending) {
+        int i = 0;
+        while (i < names.Count) {
+            int bi = defs.First(names[i]);
+            if (bi >= 0 && reached[bi] == 0) {
+                reached[bi] = 1;
+                pending.Add(bi);
+            }
+            i = i + 1;
         }
-        return -1;
+        names.Clear();
     }
 
     // the symbol name of a `define ... @name(...)` line
@@ -160,8 +157,7 @@ partial class Irgen {
         return line.Substring(at + 1, j - at - 1);
     }
 
-    // every @symbol mentioned in the text, in order (duplicates fine: the
-    // worklist skips already-scanned blocks)
+    // Every @symbol mentioned in the text, in order.
     void CollectHeadRefs(string text, List<string> into) {
         int i = 0;
         while (i < text.Length) {
