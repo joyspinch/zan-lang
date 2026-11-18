@@ -3315,6 +3315,11 @@ kernel32、shell32、user32、advapi32、version）。
   正案补链接参数），63 存量钉 + 新钉一次收口——比逐案手动快且防
   「修一处漂三处」。
 
+- 虚调用槽查询必须匹配所选重载的完整参数签名和引用传递方式。
+  同名虚重载不能替代继承的普通方法重载。`inherited_overload_chain` 与
+  `inherited_onclick_field_method_group` 分别覆盖普通和嵌套接收者的方法组，
+  `generic_virtual_dispatch` 继续覆盖真正的虚分派。
+
 ## 164. 泛型类自有实例的 per-instantiation vtable round11（B-ID218）
 
 **现象**：generic_virtual_dispatch 5 断言 wrong-answer，`direct.Accepts`
