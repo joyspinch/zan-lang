@@ -31,8 +31,7 @@
 - [~] B-ID218 GUI 发布体积收口：已拆开字段反射 metadata 与实例 hook 保留，并切断接口候选自分配闭环；同步修复 ARC 把同址不同 load 错认同一对象的问题。同一 Form+Panel+Label+Button、同一编译器、943 项输入哈希一致，Windows x64 `--publish --no-icon` 对照 EXE 9,883,136→4,106,240 B（-58.45%），含两个 DLL 共 10,793,915→5,017,019 B（-53.52%），正常优化真实窗口均自动关闭 exit0；首轮 16 条定向回归通过，外部聚合/回调补强后 6 条收口复验通过（共 17 个不同 CTest），证据 `build/test-out/gui-size-roots-e399/delivery.json`。剩余归因已完成：原产物 `.text` 2,646,528 B，反射静态表 564,384 B；通用帧链直接引用 ModelBinder、UiDriver→反射 JSON，另有全单元静态初始化与递归字段元数据根，证据 `build/test-out/gui-chrome-audit-e399/size-audit.json`。已修复标题栏非法集合挂载静默失效、二次布局覆盖、无效图标名、Panel CSS 盒模型漏测及 Prefer 覆盖旧测量标记；7 条定向回归通过，144 DPI 实窗截图与最小化/最大化/还原/标题关闭/正文关闭点击通过。余项：可选绑定/自动化能力隔离、静态初始化及查询元数据需求收敛、固定发布预算门禁；控件注册替换沿 B-ID172，不另造 Install 梯子。当前结果不代表全组件、全平台或响应性能验收完成。
 
 - [ ] B-ID220 ZanIDE 项目配置窗打开停顿。用 `tests/ide/theme_drawer_probe.ps1 -ProjectOverflowOnly` 恢复工程，在窄窗溢出菜单点击「项目配置」。Windows x64 正式发布构建有一次 `UIWATCHDOG stall stage=child-window blocked=246ms`，原始输出见 `build/test-out/ide-theme-drawer/project-overflow/stdout.log`。待区分窗口装配、绑定准备与首帧耗时，定位后复验打开、关闭和重复打开。
-- [ ] B-ID221 ZanIDE 符号导出进程的退出生命周期。
-- [ ] B-ID226 diag_docapp_no_entry 金标过期（2026-11-19 B-ID222 验证时实证，HEAD 存量红非新引入）：链接器报文已 lld 化（实测 `ld.lld: error: undefined symbol: WinMain`，PATH 上 VS2022 LLVM 的 ld.lld），CMakeLists.txt:1801 的 EXPECT_REGEX 仍锁 GNU ld 措辞（`undefined reference to .WinMain.`）——全仓唯一用此措辞的金标。修法二选一：(a) 链接器消息规范化（对齐 main_driver.c:1058 ELF 路已有的 lld 措辞归一先例）；(b) 更新金标正则兼容两种措辞。定位到 exe 链接的 ld 回落点后单跑收口，归属 driver/toolchain 面。工程加载或符号刷新经 `EmitSymbolsDetach` 启动后台编译，`DrainSymbolWorkAsync` 只等待监视器线程。待为发起的导出建立进程归属和退出策略，验证导出在途时关闭 IDE 或切换工程，避免遗留进程或旧结果写回。工程模式探针在清理临时工程前会等待该工程的 worker。
+- [ ] B-ID221 ZanIDE 符号导出进程的退出生命周期。工程加载或符号刷新经 `EmitSymbolsDetach` 启动后台编译，`DrainSymbolWorkAsync` 只等待监视器线程。待为发起的导出建立进程归属和退出策略，验证导出在途时关闭 IDE 或切换工程，避免遗留进程或旧结果写回。工程模式探针在清理临时工程前会等待该工程的 worker。
 
 ### 批次 3 · 有前置（前置闭了再领）
 

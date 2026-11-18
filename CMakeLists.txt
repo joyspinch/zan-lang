@@ -1798,7 +1798,7 @@ add_test(NAME diag_docapp_no_entry
     -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/docapp_no_entry.zan
     "-DZANC_ARGS=--auto-stdlib"
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_docapp_no_entry${_exe_ext}
-    "-DEXPECT_REGEX=undefined reference to .WinMain."
+    "-DEXPECT_REGEX=undefined (reference to .WinMain.|symbol: WinMain)"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_docapp_no_entry PROPERTIES TIMEOUT 120)
 
