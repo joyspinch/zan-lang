@@ -9,18 +9,16 @@ namespace Gui.Component;
 // 拖动分隔手柄调整大小，每个标签可拖到另一个
 // 组（或拖到边缘以在那里新建组）并关闭，整个
 // 布局会序列化为字符串，重启后仍能恢复。
-// 保留模式：宿主只创建一次、面板只注册一次，然后每帧
-// 在 Begin 与 End 之间驱动它，把每个面板画进宿主交回的矩形
-// 中：
-// // 仅一次：
-// dock.RegisterFixed("editor", "Editor");            // 中央文档区
-// dock.LoadLayout(File.ReadAllText(layoutPath));     // 可选
-// // 每帧：
-// RenderExplorer(app, dock.Content("explorer"));     // 隐藏时为空矩形
-// dock.End(app);                                     // 拖拽幽灵 + 放置提示
+// 宿主只创建并注册一次，把 DockHost 挂入现有 Control 树；
+// SetContent 为每个面板装配真实内容，Arrange 准备几何和输入。
+// dock.RegisterFixed("editor", "Editor");
+// dock.SetContent("editor", editor);
+// root.Add(dock);
+// 宿主准备阶段调用 PrepareHost；RenderTree 消费准备结果，
+// RenderOverlay 在内容之后绘制拖拽幽灵与放置提示。
 // 关闭的面板只是隐藏而不会被遗忘：HiddenIds() 为"恢复
 // 面板"菜单提供数据，Show(id) 可将其停靠回原位置。
-public partial class DockHost {
+public partial class DockHost : Control {
     private List<DockPanel> panels;
     private List<DockGroup> groups;
 
@@ -31,6 +29,8 @@ public partial class DockHost {
     private bool sized;
     private int dpiScale;
     private bool logicalLayoutPending;
+    private int centerWidthPercent;
+    private int centerHeightPercent;
 
     // 拖拽状态：正在拖拽的面板和已解析的放置目标。
     // dropKind：0 = 无，1 = 并入 `dropGroup`，2 = 在 `dropSide` 新建组
@@ -50,14 +50,7 @@ public partial class DockHost {
     private ContextMenu panelMenu;
     private weak App menuApp;
 
-
     public string emptyMenuLabel;
-    // 触摸长按开菜单的哨兵一次性闸门：EventKind 跨帧滞留
-    // （动画帧回读旧值），哨兵若每帧都补记会把 longPressFired
-    // 反复清零，释放帧就再也读不到"刚长按过"。按事件序号
-    // 只在真正的新按压帧记一次。
-    private int stripSentinelSeq;
-
     // Ribbon 面板开关：它们对应的 id 以及在
     // 宿主命令列表中的起始位置（见 AddSwitches）。
     private List<string> switchIds;
@@ -76,6 +69,9 @@ public partial class DockHost {
 
     // 空布局：无面板、无分组，尺寸未定（首帧取默认值）。
     public DockHost() {
+        this.InitControl("dockhost", 0);
+        this.inputParts = new List<DockInputPart>();
+        this.contentRoots = new List<Control>();
         this.panels = new List<DockPanel>();
         this.groups = new List<DockGroup>();
         this.leftW = 0;
@@ -94,9 +90,7 @@ public partial class DockHost {
         this.dropRect = new Rect(0, 0, 0, 0);
         this.panelMenu = new ContextMenu();
 
-
         this.emptyMenuLabel = "No closed panels";
-        this.stripSentinelSeq = 0;
         this.switchIds = new List<string>();
         this.switchBase = 0 - 1;
         this.switchHideHint = "Click to hide this panel";
@@ -135,7 +129,13 @@ public partial class DockHost {
         menuApp = null;
     }
 
-    public void ReleaseControls() { this.CloseMenu(); }
+    public void ReleaseControls() {
+        this.CloseMenu();
+        App app = this.App;
+        if (app != null) { app.CancelInputSubtree(this); }
+        dragging = false; dragArmed = false; dragId = ""; dropKind = 0;
+        if (pendingResize) { changed = true; pendingResize = false; }
+    }
 
     public DockPanel Find(string id) {
         for (int i = 0; i < panels.Count; i = i + 1) {
@@ -199,6 +199,14 @@ public partial class DockHost {
         groups[gi].weight = weight;
     }
 
+    // Reserve a share of the host for documents in addition to the absolute
+    // minimum. Zero keeps the unrestricted workspace contract. Temporary clamps
+    // never replace saved extents; explicit splitter drags commit the visible size.
+    public void SetCenterReserve(int widthPercent, int heightPercent) {
+        centerWidthPercent = Math.Max(0, Math.Min(100, widthPercent));
+        centerHeightPercent = Math.Max(0, Math.Min(100, heightPercent));
+    }
+
     // 设置某一侧的像素尺寸（左右为宽度，底部为高度）。
     public void SetSideExtent(int side, int px) {
         if (side == 0) { leftW = px; }
@@ -215,18 +223,14 @@ public partial class DockHost {
         return p.body.width > 0 && p.body.height > 0;
     }
 
-    // 上一次 Begin() 解析出的内容矩形。隐藏（或未激活）的
-    // 面板得到零尺寸矩形，调用方可以用
-    // 单个 `if (r.width <= 0) { }` 守卫跳过渲染，或直接画到空处。
+    // 上一次 Arrange/PrepareHost 准备的内容矩形；隐藏或未激活面板为零尺寸。
     public Rect Content(string id) {
         DockPanel p = this.Find(id);
         if (p == null) { return new Rect(0, 0, 0, 0); }
         return p.body;
     }
 
-    // 与 Content 类似，但隐藏面板得到一个停在屏幕外远处的 1x1 矩形，
-    // 而不是零尺寸矩形。始终渲染（并注册命中区域）的即时模式内容
-    // 可以不加守卫：它只是画在屏幕外而已。
+    // 几何查询：隐藏面板返回屏幕外的 1x1 矩形；内容树由 SetContent 管理。
     public Rect ContentParked(string id) {
         DockPanel p = this.Find(id);
         if (p == null || p.hidden || p.body.width <= 0 || p.body.height <= 0) {
@@ -323,7 +327,7 @@ public partial class DockHost {
             if (p.closable && !p.headerless && !p.noSwitch) {
                 switchIds.Add(p.id);
                 grp.Add(RibbonItem.Toggle(p.icon, p.title, !p.hidden)
-                    .SetTip(this.SwitchTip(p)));
+                .SetTip(this.SwitchTip(p)));
             }
         }
         groups.Add(grp);
@@ -557,13 +561,13 @@ public partial class DockHost {
     // 出现和消失的面板。
     public string SaveLayout() {
         string s = "v2;S=" + Convert.ToString(PersistLogical(leftW)) + ","
-            + Convert.ToString(PersistLogical(rightW)) + ","
-            + Convert.ToString(PersistLogical(bottomH));
+        + Convert.ToString(PersistLogical(rightW)) + ","
+        + Convert.ToString(PersistLogical(bottomH));
         for (int i = 0; i < groups.Count; i = i + 1) {
             DockGroup g = groups[i];
             s = s + ";G=" + Convert.ToString(g.side) + ","
-                + Convert.ToString(PersistLogical(g.extent)) + ","
-                + Convert.ToString(g.active);
+            + Convert.ToString(PersistLogical(g.extent)) + ","
+            + Convert.ToString(g.active);
             for (int j = 0; j < g.ids.Count; j = j + 1) {
                 if (j == 0) { s = s + ","; } else { s = s + "|"; }
                 s = s + g.ids[j];

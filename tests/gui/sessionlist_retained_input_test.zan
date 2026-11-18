@@ -1,0 +1,452 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class SessionListRetainedProbe {
+    public SessionList list;
+    public int created;
+    public int selected = -1;
+    public int archived = -1;
+    public int deleted = -1;
+    public int renamed = -1;
+    public string title;
+    public weak App redirectApp;
+    public bool redirectOnCancel;
+    public int cancels;
+    public Control redirectInputRoot;
+    public Control redirectCapture;
+    public Control redirectFocus;
+    public weak App redirectBinding;
+    public int redirectGeneration;
+    public int redirectInputRootGeneration;
+    public int redirectX;
+    public int redirectY;
+    public bool cancelAtListRoot;
+    public bool cancelOriginalSearch;
+    public bool redirectFocused;
+    public bool redirectInputMember;
+    public void Changed() {
+        SessionListAction action = list.TakeAction();
+        if (action.created) { created = created + 1; }
+        if (action.selected >= 0) { selected = action.selected; }
+        if (action.archived >= 0) { archived = action.archived; }
+        if (action.deleted >= 0) { deleted = action.deleted; }
+        if (action.renamed >= 0) { renamed = action.renamed; title = action.title; }
+    }
+    public void Routed(Control sender, RoutedEventArgs args) {
+        if (args.eventName != "PointerCancel" || !redirectOnCancel) { return; }
+        redirectOnCancel = false;
+        cancels = cancels + 1;
+        cancelAtListRoot = sender == list.Root();
+        cancelOriginalSearch = args.originalSource == list.Root().ChildAt(1);
+        App app = redirectApp;
+        list.InitializeHost(app);
+        list.PrepareHost(app, 12, 12, 360, 360);
+        Control search = list.Root().ChildAt(1);
+        redirectX = search.bx + 4; redirectY = search.by + 4;
+        app.ProcessOffscreenInput(2, redirectX, redirectY, 0, 0, 0, 0);
+        redirectInputRoot = app.rootControl;
+        redirectCapture = app.GetCapturedPointer();
+        redirectFocus = app.focus.focusedControl;
+        redirectBinding = search.FindApp();
+        redirectGeneration = list.InputGeneration();
+        redirectInputRootGeneration = app.inputRootGeneration;
+        redirectFocused = search.IsFocused(app);
+        redirectInputMember = app.rootControl != null && app.rootControl.ContainsInputControl(search);
+    }
+}
+
+class SessionListProbeRelay {
+    private weak SessionListRetainedProbe owner;
+    public SessionListProbeRelay(SessionListRetainedProbe owner) { this.owner = owner; }
+    public void Changed() { if (owner != null) { owner.Changed(); } }
+    public void Routed(Control sender, RoutedEventArgs args) {
+        if (owner != null) { owner.Routed(sender, args); }
+    }
+}
+
+class SessionListWeakWitness {
+    public weak SessionList Owner;
+    public Control Root;
+    public SessionListRow Row;
+}
+
+class SessionListRetainedInputTest {
+    static weak SessionList diagnosticList;
+    static int targetIndex;
+    static string stage;
+
+    static int ChildIndex(Control control) {
+        if (control == null || control.parent == null) { return -1; }
+        Control parent = control.parent;
+        for (int i = 0; i < parent.ChildCount(); i = i + 1) {
+            if (parent.ChildAt(i) == control) { return i; }
+        }
+        return -1;
+    }
+    static void PrintControl(App app, Control control, string label) {
+        if (control == null) { Console.WriteLine(label + " null"); return; }
+        Console.WriteLine(label + " index=" + Convert.ToString(ChildIndex(control))
+            + " name=" + control.name + " kind=" + control.Kind()
+            + " widgetId=" + Convert.ToString(control.WidgetId())
+            + " class=" + control.Class
+            + " visible=" + Convert.ToString(control.Visible)
+            + " styleVisible=" + Convert.ToString(control.StyleVisible())
+            + " bounds=" + Convert.ToString(control.bx) + "," + Convert.ToString(control.by)
+            + "," + Convert.ToString(control.bw) + "," + Convert.ToString(control.bh)
+            + " preferred=" + Convert.ToString(control.prefW) + "," + Convert.ToString(control.prefH)
+            + " appMatches=" + Convert.ToString(control.FindApp() == app)
+            + " inputMember=" + Convert.ToString(app.rootControl != null
+                && app.rootControl.ContainsInputControl(control)));
+    }
+    static void PrintTargetFailure(App app, Control target) {
+        Console.WriteLine("SESSIONLIST_TARGET_FAILURE stage=" + stage
+            + " targetIndex=" + Convert.ToString(targetIndex)
+            + " eventSeq=" + Convert.ToString(app.window.EventSeq())
+            + " inputRootGeneration=" + Convert.ToString(app.inputRootGeneration));
+        Control node = target;
+        for (int depth = 0; node != null && depth < 16; depth = depth + 1) {
+            PrintControl(app, node, "ancestor[" + Convert.ToString(depth) + "]");
+            node = node.parent;
+        }
+        PrintControl(app, app.rootControl, "app.inputRoot");
+        SessionList list = diagnosticList;
+        if (list == null) { Console.WriteLine("SessionList owner unavailable"); return; }
+        Console.WriteLine("SessionList hostMatches=" + Convert.ToString(list.HostApp() == app)
+            + " generation=" + Convert.ToString(list.InputGeneration())
+            + " inputCurrent=" + Convert.ToString(list.InputCurrent(list.InputGeneration())));
+        Control root = list.Root();
+        PrintControl(app, root, "SessionList.root");
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control child = root.ChildAt(i);
+            PrintControl(app, child, "root.child[" + Convert.ToString(i) + "]");
+            for (int j = 0; j < child.ChildCount(); j = j + 1) {
+                Control grandchild = child.ChildAt(j);
+                string path = "root.child[" + Convert.ToString(i) + "].child[" + Convert.ToString(j) + "]";
+                PrintControl(app, grandchild, path);
+                for (int k = 0; k < grandchild.ChildCount(); k = k + 1) {
+                    PrintControl(app, grandchild.ChildAt(k), path + ".child[" + Convert.ToString(k) + "]");
+                }
+            }
+        }
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+    static void Event(App app, int kind, int x, int y, int button, int key) {
+        app.ProcessOffscreenInput(kind, x, y, button, key, 0, 0);
+    }
+    static void Down(App app, Control c) {
+        targetIndex = targetIndex + 1;
+        if (c == null || !c.Visible || c.bw <= 0 || c.bh <= 0) { PrintTargetFailure(app, c); }
+        Check(c != null && c.Visible && c.bw > 0 && c.bh > 0, "target has prepared bounds");
+        Event(app, 2, c.bx + c.bw / 2, c.by + c.bh / 2, 0, 0);
+    }
+    static void Click(App app, Control c) {
+        Down(app, c);
+        Event(app, 3, c.bx + c.bw / 2, c.by + c.bh / 2, 0, 0);
+    }
+    static void RawClick(App app, int x, int y) {
+        Event(app, 2, x, y, 0, 0);
+        Event(app, 3, x, y, 0, 0);
+    }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) {
+            Action action = Dispatcher.Take();
+            if (action == null) { return; }
+            action();
+        }
+    }
+    static SessionListRow Row(SessionList list, int index) {
+        Control rows = list.Root().ChildAt(2);
+        for (int i = 0; i < rows.ChildCount(); i = i + 1) {
+            if (rows.ChildAt(i) is SessionListRow) {
+                SessionListRow row = (SessionListRow)rows.ChildAt(i);
+                if (row.Index() == index) { return row; }
+            }
+        }
+        return null;
+    }
+    static SessionListHostPreparation Host(App app, SessionList list) {
+        SessionListHostPreparation prepare = new SessionListHostPreparation();
+        prepare.List = list; prepare.Enabled = true;
+        prepare.X = 10; prepare.Y = 10; prepare.Width = 380; prepare.Height = 380;
+        // Early InitializeHost is part of assembly, before any raw input snapshot.
+        list.InitializeHost(app);
+        app.RegisterLoopParticipant(app, prepare);
+        return prepare;
+    }
+    static void Close(App app) { app.StopLoop(); Drain(app); app.canvas.Destroy(); }
+
+    static void Actions(App app, SessionList list, SessionListRetainedProbe probe) {
+        stage = "Actions/new root[0]";
+        Click(app, list.Root().ChildAt(0)); Drain(app);
+        Check(probe.created == 1, "New action routes before Paint");
+        Check(Row(list, 0) != null && Row(list, 1) == null,
+            "archived rows stay hidden until requested");
+        stage = "Actions/show archived root[3]";
+        Click(app, list.Root().ChildAt(3)); Drain(app);
+        SessionListRow beta = Row(list, 1);
+        Check(beta != null, "archive toggle rebuilds retained rows immediately");
+        // New rows receive their bounds in the next real input preparation.
+        Event(app, 1, 0, 0, 0, 0);
+        stage = "Actions/select beta[0]";
+        Click(app, beta.ChildAt(0)); Drain(app);
+        Check(probe.selected == 1, "row selection routes before Paint");
+        stage = "Actions/edit beta[2]";
+        Click(app, beta.ChildAt(2)); Drain(app);
+        beta = Row(list, 1);
+        Check(beta != null && beta.ChildAt(1).Visible, "rename enters retained Input mode");
+        Input rename = (Input)beta.ChildAt(1);
+        Check(rename.GetText() == "Beta chat", "rename starts from the actual title");
+        rename.SetText("Renamed chat");
+        Event(app, 6, 0, 0, 0, 13); Drain(app);
+        Check(probe.renamed == 1 && probe.title == "Renamed chat",
+            "Enter submits renamed title through retained route");
+        beta = Row(list, 1);
+        Check(beta != null && !beta.ChildAt(1).Visible, "submit retires the rename editor");
+
+        Input search = (Input)list.Root().ChildAt(1);
+        stage = "Actions/search root[1]";
+        Click(app, search);
+        Event(app, 6, 0, 0, 0, 98); Event(app, 6, 0, 0, 0, 101);
+        Event(app, 6, 0, 0, 0, 116); Event(app, 6, 0, 0, 0, 97); Drain(app);
+        Check(search.GetText() == "beta" && Row(list, 0) == null && Row(list, 1) != null,
+            "raw search input filters the retained row tree case-insensitively");
+        // Beta remains visible while archived mode is enabled. Do not toggle it
+        // away and then operate an old detached row.
+        Event(app, 1, 0, 0, 0, 0);
+        beta = Row(list, 1);
+        stage = "Actions/archive beta[3]";
+        Click(app, beta.ChildAt(3)); Drain(app);
+        Check(probe.archived == 1, "archive action routes from visible row control");
+        stage = "Actions/delete beta[4]";
+        Click(app, beta.ChildAt(4)); Drain(app);
+        Check(probe.deleted == 1, "delete action routes from visible row control");
+        stage = "Actions/hide archived root[3]";
+        Click(app, list.Root().ChildAt(3)); Drain(app);
+        Check(Row(list, 1) == null, "archive mode off really removes Beta");
+        search.SetText(""); list.SearchChanged();
+        Event(app, 1, 0, 0, 0, 0);
+    }
+
+    static void TransferAndSuspend(App a, App b, SessionList list,
+            SessionListRetainedProbe probe, SessionListHostPreparation prepareA) {
+        Input search = (Input)list.Root().ChildAt(1);
+        stage = "Transfer/A search root[1]";
+        Down(a, search);
+        Check(search.IsFocused(a) && a.GetCapturedPointer() == search,
+            "real search Down holds focus and capture before transfer");
+        int before = probe.created;
+        // Queue a real production Button delegate without draining its App.
+        list.Root().ChildAt(0).TriggerEvent("Click");
+        SessionListHostPreparation prepareB = Host(b, list);
+        Check(list.HostApp() == b && a.GetCapturedPointer() == null && !search.IsFocused(a),
+            "A to B retires old input and focus immediately");
+        Drain(a);
+        Check(probe.created == before, "A's queued action cannot execute in B's session");
+        string old = search.GetText();
+        Event(a, 6, 0, 0, 0, 120);
+        Check(search.GetText() == old, "old host cannot send text after transfer");
+        // First B input prepares bounds and routes, with no Paint or priming move.
+        Event(b, 2, search.bx + 4, search.by + 4, 0, 0);
+        Check(search.IsFocused(b) && b.GetCapturedPointer() == search && prepareB.Calls == 1,
+            "first raw input in B reaches the existing tree");
+        Event(b, 3, search.bx + 4, search.by + 4, 0, 0);
+        RawClick(a, list.Root().ChildAt(0).bx + 4, list.Root().ChildAt(0).by + 4);
+        Check(probe.created == before, "old host cannot click borrowed content");
+
+        // Client bounds must retain top across the scope's later PrepareView.
+        prepareB.Client = true; prepareB.Top = 36;
+        Event(b, 1, 0, 0, 0, 0);
+        Check(list.Root().by == b.ContentTop() + b.ShapeOffY() + 36,
+            "shared preparation preserves client top offset");
+        Check(list.Root().bh == b.ClientHeight() - b.ContentTop() - 36,
+            "shared preparation preserves client height");
+        prepareB.Client = false;
+        prepareB.X = 24; prepareB.Y = 80;
+        Event(b, 1, 0, 0, 0, 0);
+        Control button = list.Root().ChildAt(0);
+        int oldX = button.bx + button.bw / 2;
+        int oldY = button.by + button.bh / 2;
+        // Change geometry immediately before Down; only BeforeInput prepares it.
+        prepareB.Y = 170;
+        RawClick(b, oldX, oldY + 90);
+        Check(probe.created == before + 1 && list.Root().by == 170,
+            "current host bounds are prepared before the same raw Down");
+        RawClick(b, oldX, oldY);
+        Check(probe.created == before + 1, "previous bounds no longer activate the button");
+
+        stage = "Suspend/B search root[1]";
+        Down(b, search);
+        Check(search.IsFocused(b) && b.GetCapturedPointer() == search,
+            "hide fixture has actual focus and capture");
+        Control adapter = b.rootControl;
+        list.Root().ChildAt(0).TriggerEvent("Click");
+        prepareB.Enabled = false;
+        list.SuspendHost();
+        Check(list.HostApp() == b && b.rootControl == adapter && !list.Root().Visible,
+            "suspend retains both early host registrations");
+        Check(b.GetCapturedPointer() == null && !search.IsFocused(b),
+            "suspend releases focus and capture synchronously");
+        Drain(b);
+        Check(probe.created == before + 1, "queued pre-hide action is fenced");
+        old = search.GetText(); Event(b, 6, 0, 0, 0, 122);
+        RawClick(b, oldX, oldY + 90);
+        Check(search.GetText() == old && probe.created == before + 1,
+            "suspended tree accepts neither text nor clicks");
+        prepareB.Enabled = true;
+        Event(b, 2, search.bx + 4, search.by + 4, 0, 0);
+        Check(b.rootControl == adapter && search.IsFocused(b) && b.GetCapturedPointer() == search,
+            "first resume Down works with unchanged early input registration");
+        Event(b, 3, search.bx + 4, search.by + 4, 0, 0);
+        stage = "Resume/B new root[0]";
+        Click(b, list.Root().ChildAt(0)); Drain(b);
+        Check(probe.created == before + 2, "resumed controls use fresh callbacks");
+
+        list.Root().ChildAt(0).TriggerEvent("Click");
+        list.RetireHost();
+        Check(list.HostApp() == null && b.GetCapturedPointer() == null && !search.IsFocused(b),
+            "RetireHost releases B scope and input");
+        // This is the same original App A, not a new fixture App.
+        list.InitializeHost(a);
+        prepareA.Y = 10;
+        Drain(b);
+        Check(probe.created == before + 2, "pre-retire queued action cannot cross the fresh A scope");
+        Event(a, 2, 14, 14, 0, 0);
+        Check(a.GetCapturedPointer() == list.Root().ChildAt(0),
+            "A to B to RetireHost to A first raw Down reaches a fresh scope");
+        Event(a, 3, 14, 14, 0, 0); Drain(a);
+        Check(probe.created == before + 3, "rebound A click dispatches exactly once");
+        list.RetireHost();
+        list.Create(); Drain(a);
+        SessionListAction stale = list.TakeAction();
+        Check(probe.created == before + 3 && !stale.created,
+            "retired direct action neither notifies nor leaves pending work");
+    }
+
+    static void Reentry(App a, App b, App c, SessionList list, SessionListRetainedProbe probe) {
+        list.InitializeHost(a); list.PrepareHost(a, 12, 12, 360, 360);
+        SessionListProbeRelay relay = new SessionListProbeRelay(probe);
+        list.Root().OnRouted(relay.Routed);
+        Input search = (Input)list.Root().ChildAt(1);
+        stage = "Reentry/A search root[1]";
+        Down(a, search);
+        probe.redirectApp = c; probe.redirectOnCancel = true;
+        list.InitializeHost(b);
+        Check(probe.cancels == 1 && list.HostApp() == c,
+            "cancellation reentry chooses C and supersedes outer transfer to B");
+        if (!search.IsFocused(c) || c.GetCapturedPointer() != search) {
+            Console.WriteLine("SESSIONLIST_REENTRY_FAILURE cancels=" + Convert.ToString(probe.cancels)
+                + " cancelAtListRoot=" + Convert.ToString(probe.cancelAtListRoot)
+                + " cancelOriginalSearch=" + Convert.ToString(probe.cancelOriginalSearch)
+                + " hostIsA=" + Convert.ToString(list.HostApp() == a)
+                + " hostIsB=" + Convert.ToString(list.HostApp() == b)
+                + " hostIsC=" + Convert.ToString(list.HostApp() == c)
+                + " generation=" + Convert.ToString(list.InputGeneration())
+                + " inputCurrent=" + Convert.ToString(list.InputCurrent(list.InputGeneration())));
+            Console.WriteLine("callback.end rootSame=" + Convert.ToString(c.rootControl == probe.redirectInputRoot)
+                + " rootIsList=" + Convert.ToString(c.rootControl == list.Root())
+                + " rootIsAdapter=" + Convert.ToString(c.rootControl is ControlInputHost)
+                + " generation=" + Convert.ToString(probe.redirectGeneration)
+                + " inputRootGeneration=" + Convert.ToString(probe.redirectInputRootGeneration)
+                + " capturedSearch=" + Convert.ToString(probe.redirectCapture == search)
+                + " focusedSearch=" + Convert.ToString(probe.redirectFocus == search)
+                + " isFocused=" + Convert.ToString(probe.redirectFocused)
+                + " bindingIsC=" + Convert.ToString(probe.redirectBinding == c)
+                + " inputMember=" + Convert.ToString(probe.redirectInputMember)
+                + " down=" + Convert.ToString(probe.redirectX) + "," + Convert.ToString(probe.redirectY));
+            Console.WriteLine("outer.end searchBindingIsA=" + Convert.ToString(search.FindApp() == a)
+                + " searchBindingIsB=" + Convert.ToString(search.FindApp() == b)
+                + " searchBindingIsC=" + Convert.ToString(search.FindApp() == c)
+                + " inputRootGeneration=" + Convert.ToString(c.inputRootGeneration)
+                + " focusedId=" + Convert.ToString(c.focus.focusedId)
+                + " searchWidgetId=" + Convert.ToString(search.WidgetId())
+                + " isFocused=" + Convert.ToString(search.IsFocused(c)));
+            PrintControl(c, search, "current.search");
+            PrintControl(c, list.Root(), "current.listRoot");
+            PrintControl(c, c.rootControl, "C.inputRoot");
+            if (c.rootControl is ControlInputHost) {
+                ControlInputHost input = (ControlInputHost)c.rootControl;
+                Console.WriteLine("C.adapter contentIsListRoot=" + Convert.ToString(input.ContentRoot() == list.Root()));
+            }
+            PrintControl(c, c.GetCapturedPointer(), "C.capture");
+            PrintControl(c, c.focus.focusedControl, "C.focus");
+            PrintControl(a, a.GetCapturedPointer(), "A.capture");
+            PrintControl(b, b.GetCapturedPointer(), "B.capture");
+            PrintControl(c, probe.redirectCapture, "callback.end.capture");
+            PrintControl(c, probe.redirectFocus, "callback.end.focus");
+        }
+        Check(search.IsFocused(c) && c.GetCapturedPointer() == search,
+            "old retirement tail preserves reentrant C focus and capture");
+        Check(a.GetCapturedPointer() == null && b.GetCapturedPointer() == null,
+            "superseded hosts keep no borrowed capture");
+        Event(c, 3, search.bx + 4, search.by + 4, 0, 0);
+        list.Root().OnRouted(null);
+        list.RetireHost();
+
+        list.InitializeHost(a); list.PrepareHost(a, 10, 10, 380, 380);
+        SessionListRow alpha = Row(list, 0);
+        Check(alpha != null, "stale row fixture is visible");
+        alpha.ChildAt(4).TriggerEvent("Click");
+        list.SearchChanged();
+        int deleted = probe.deleted;
+        Drain(a);
+        Check(probe.deleted == deleted && alpha.parent == null,
+            "removed row queued delegate cannot act on replacement rows");
+        list.RetireHost();
+    }
+
+    static SessionListWeakWitness WeakOwner(App app) {
+        SessionList list = new SessionList("Search", "New");
+        List<string> titles = new List<string>(); titles.Add("Held row");
+        List<int> flags = new List<int>(); flags.Add(0);
+        list.Bind(titles, 0, flags);
+        list.InitializeHost(app); list.PrepareHost(app, 10, 10, 360, 360);
+        SessionListWeakWitness witness = new SessionListWeakWitness();
+        witness.Owner = list; witness.Root = list.Root(); witness.Row = Row(list, 0);
+        witness.Root.ChildAt(0).TriggerEvent("Click");
+        witness.Row.ChildAt(4).TriggerEvent("Click");
+        return witness;
+    }
+
+    static void Main() {
+        // The first App is the library's frameApp; business App weak lifetime
+        // must not be confused with that process-owned frame reference.
+        App frame = App.CreateOffscreen("SessionList frame", 32, 32);
+        App a = App.CreateOffscreen("SessionList A", 420, 420);
+        App b = App.CreateOffscreen("SessionList B", 420, 420);
+        App c = App.CreateOffscreen("SessionList C", 420, 420);
+        SessionList list = new SessionList("Search", "New chat").EmptyText("No chats");
+        diagnosticList = list;
+        SessionListRetainedProbe probe = new SessionListRetainedProbe(); probe.list = list;
+        List<string> titles = new List<string>(); titles.Add("Alpha chat"); titles.Add("Beta chat");
+        List<int> flags = new List<int>(); flags.Add(0); flags.Add(1);
+        list.Bind(titles, 0, flags);
+        SessionListProbeRelay relay = new SessionListProbeRelay(probe); list.Action.Add(relay.Changed);
+        SessionListHostPreparation prepareA = Host(a, list);
+        // No PrepareHost/Paint priming: first raw Down performs current layout.
+        Event(a, 2, 14, 14, 0, 0);
+        Check(a.GetCapturedPointer() == list.Root().ChildAt(0) && prepareA.Calls == 1,
+            "early InitializeHost permits the first raw input before any Paint");
+        Event(a, 9, 0, 0, 0, 0);
+        Actions(a, list, probe);
+        TransferAndSuspend(a, b, list, probe, prepareA);
+        prepareA.Enabled = false;
+        Reentry(a, b, c, list, probe);
+
+        SessionListWeakWitness witness = WeakOwner(c);
+        Check(witness.Owner == null && witness.Root != null && witness.Row != null,
+            "retained tree, scope, adapter and queued delegates do not retain SessionList owner");
+        Drain(c);
+        stage = "WeakOwner/C retained root[0]";
+        Click(c, witness.Root.ChildAt(0)); Drain(c);
+        Check(witness.Owner == null, "late production callbacks remain harmless after owner release");
+        c.SetRootControl(null);
+        Close(a); Close(b); Close(c); Close(frame);
+        Console.WriteLine("SESSIONLIST_RETAINED_INPUT_OK");
+    }
+}

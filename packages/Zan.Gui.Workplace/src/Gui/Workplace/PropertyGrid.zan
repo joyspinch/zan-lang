@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System;
 using Gui;
 using Gui.Widget;
@@ -12,8 +13,10 @@ namespace Gui.Component;
 public class PropertyGrid : Control {
     // 当前绑定的属性行（Bind 每帧灌入，不拷贝）。
     private List<PropSpec> data;
-    // 每行一个强类型行编辑器实体（包含对应的 Input/Switch/SelectBox/按键ID/影子值）。
+    // Original-index lookup: only visible entries hold editor entities.
     private List<PropertyGridRow> rows;
+    private VisibleRowHost rowHost;
+    private List<string> rowSchemas;
     // 当前绑定对象的标识，变化时重建编辑器。
     private string key;
     private int bindingEpoch;
@@ -36,6 +39,8 @@ public class PropertyGrid : Control {
         this.InitControl("props", 5);
         data = new List<PropSpec>();
         rows = new List<PropertyGridRow>();
+        rowHost = new VisibleRowHost(this, this);
+        rowSchemas = new List<string>();
         key = "";
         Empty = "";
         hitRow = 0 - 1;
@@ -117,6 +122,7 @@ public class PropertyGrid : Control {
     // 才重建编辑器，否则沿用现有的，输入焦点和光标不会每帧丢失。
     public void Bind(string k, List<PropSpec> specs) {
         if (k == key && this.SameSchema(specs)) {
+            if (data != specs) { rowHost.Invalidate(); }
             data = specs;
             this.ReloadExternal();
             this.PrepareRows();
@@ -136,6 +142,7 @@ public class PropertyGrid : Control {
         List<PropSpec> expectedData = data;
         List<PropertyGridRow> previous = rows;
         rows = new List<PropertyGridRow>();
+        rowSchemas = new List<string>();
         hitRow = 0 - 1;
         for (int i = 0; i < previous.Count; i = i + 1) {
             // Reentrant binding owns a different row list. Finish retiring this
@@ -143,40 +150,54 @@ public class PropertyGrid : Control {
             this.RetireRow(previous[i]);
         }
         if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return; }
+        rowHost.Reset();
+        if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return; }
         for (int i = 0; i < data.Count; i = i + 1) {
-            PropSpec prop = data[i];
-            PropertyGridRow row = new PropertyGridRow();
-            row.index = i;
-            row.schema = this.SchemaOf(prop);
-            string value = prop.Read();
-            if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return; }
-            row.shadow = value;
-            row.root = new Control("property-row-" + Convert.ToString(i));
-            row.root.Tip = prop.tip;
-            row.label = new Label(prop.label);
-            row.reset = new Button { Icon = "refresh", Class = "tiny" };
-            row.minus = new Button("-").Small();
-            row.plus = new Button("+").Small();
-            row.group = new Button(prop.label).Small();
-            if (prop.kind == 5) { row.root.Add(row.group); }
-            else {
-                row.root.Add(row.label);
-                if (prop.kind == 2) {
-                    row.flag = new Switch(); row.flag.Size = "small";
-                    row.flag.SetOn(PropSpec.IsOn(row.shadow)); row.root.Add(row.flag);
-                } else if (prop.kind == 3) {
-                    row.pick = SelectBox.FromOptions(prop.options, "");
-                    row.pick.SetIndex(this.IndexOfValue(prop,row.shadow));
-                    for (int option = 0; option < prop.options.Count; option = option + 1) {
-                        row.segments.Add(new Button(prop.options[option]).Small());
-                    }
-                } else {
-                    row.text = new Input(""); row.text.SetText(row.shadow); row.root.Add(row.text);
-                }
-            }
-            rows.Add(row);
+            rows.Add(null);
+            rowSchemas.Add(this.SchemaOf(data[i]));
         }
         this.RefreshRows();
+    }
+
+    private Control CreateRow(int i) {
+        App expectedApp = this.App;
+        Control expectedRoot = expectedApp != null ? expectedApp.rootControl : null;
+        int ticket = bindingEpoch;
+        List<PropSpec> expectedData = data;
+        PropSpec prop = data[i];
+        PropertyGridRow row = new PropertyGridRow();
+        row.index = i;
+        row.schema = this.SchemaOf(prop);
+        string value = prop.Read();
+        if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return null; }
+        row.shadow = value;
+        row.root = new Control("property-row-" + Convert.ToString(i));
+        row.root.Tip = prop.tip;
+        row.label = new Label(prop.label);
+        row.reset = new Button { Icon = "refresh", Class = "tiny" };
+        row.minus = new Button("-").Small();
+        row.plus = new Button("+").Small();
+        row.group = new Button(prop.label).Small();
+        if (prop.kind == 5) { row.root.Add(row.group); }
+        else {
+            row.root.Add(row.label);
+            if (prop.kind == 2) {
+                row.flag = new Switch(); row.flag.Size = "small";
+                row.flag.SetOn(PropSpec.IsOn(row.shadow)); row.root.Add(row.flag);
+            } else if (prop.kind == 3) {
+                row.pick = SelectBox.FromOptions(prop.options, "");
+                row.pick.SetIndex(this.IndexOfValue(prop,row.shadow));
+                for (int option = 0; option < prop.options.Count; option = option + 1) {
+                    row.segments.Add(new Button(prop.options[option]).Small());
+                }
+            } else {
+                row.text = new Input(""); row.text.SetText(row.shadow); row.root.Add(row.text);
+            }
+        }
+        if (!this.LayoutCurrent(expectedApp,expectedRoot,ticket,expectedData)) { return null; }
+        rows[i] = row;
+        this.WireRow(row);
+        return row.root;
     }
 
     // 枚举值（可能存的是序号，也可能是选项文本）对应的选项下标。
@@ -194,7 +215,7 @@ public class PropertyGrid : Control {
     // 枚举行当前选择在模型里的字符串形式：绑定到 int 的存序号，
     // 绑定到字符串的存选项文本。
     private string PickValue(PropSpec p, int idx) {
-        if (p.num != null || p.snum != null) { return Convert.ToString(idx); }
+        if (p.ValueKind() == 1) { return Convert.ToString(idx); }
         if (idx >= 0 && idx < p.options.Count) { return p.options[idx]; }
         return "";
     }
@@ -219,8 +240,9 @@ public class PropertyGrid : Control {
     private string Editor(int i) {
         PropSpec p = data[i];
         PropertyGridRow r = rows[i];
+        if (r == null || r.root == null) { return p.Read(); }
         if (p.kind == 2) { return r.flag.IsOn() ? "true" : "false"; }
-        if (p.kind == 3) { return this.PickValue(p, r.pick.Value()); }
+        if (p.kind == 3) { return this.PickValue(p, r.pick.Value.Get()); }
         return r.text.GetText();
     }
 
@@ -228,6 +250,7 @@ public class PropertyGrid : Control {
     private void Load(int i, string val) {
         PropSpec p = data[i];
         PropertyGridRow r = rows[i];
+        if (r == null || r.root == null) { return; }
         if (p.kind == 2) { r.flag.SetOn(PropSpec.IsOn(val)); return; }
         if (p.kind == 3) { r.pick.SetIndex(this.IndexOfValue(p, val)); return; }
         r.text.SetText(val);
@@ -275,8 +298,19 @@ public class PropertyGrid : Control {
         PropSpec p=specs[i];
         if (!p.hasDef||!p.IsBound()) { return; }
         PropertyGridRow row=rows[i];
-        int binding=bindingEpoch;int epoch=row.epoch;
+        int binding=bindingEpoch;
         App app=this.App;
+        if (row == null) {
+            Control expectedRoot=app!=null?app.rootControl:null;
+            if (BeforeChange!=null) { BeforeChange(p.key); }
+            if (!this.LayoutCurrent(app,expectedRoot,binding,specs) || specs[i]!=p) { return; }
+            p.Write(p.defVal);
+            if (!this.LayoutCurrent(app,expectedRoot,binding,specs) || specs[i]!=p) { return; }
+            hitRow=i;Change.PostS(this);
+            if (app!=null) { app.RequestRedraw();this.PrepareRows(); }
+            return;
+        }
+        int epoch=row.epoch;
         Control root=app!=null?app.rootControl:null;
         if (BeforeChange!=null) { BeforeChange(p.key); }
         if (!this.CanCommitRow(row,binding,epoch,app,root,specs,p)) { return; }
@@ -326,7 +360,6 @@ public class PropertyGrid : Control {
 
     public override void OnMeasure(App app) { prefH = this.ContentHeight(app); }
 
-    // Scratch implementation fragment: not applied or compiled.
     public override StyleBox ResolveStyle(App app, int state) {
         StyleBox box = base.ResolveStyle(app, state);
         if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
@@ -335,15 +368,15 @@ public class PropertyGrid : Control {
 
     private string SchemaOf(PropSpec p) {
         string result = Convert.ToString(p.key.Length) + ":" + p.key
-            + "|" + Convert.ToString(p.alias.Length) + ":" + p.alias
-            + "|" + Convert.ToString(p.defaultBinding)
-            + "|" + Convert.ToString(p.label.Length) + ":" + p.label
-            + "|" + Convert.ToString(p.tip.Length) + ":" + p.tip
-            + "|" + Convert.ToString(p.defVal.Length) + ":" + p.defVal
-            + "|" + Convert.ToString(p.kind) + "|" + Convert.ToString(p.halfRow) + "|" + Convert.ToString(p.ValueKind())
-            + "|" + Convert.ToString(p.step) + "|" + Convert.ToString(p.lo) + "|" + Convert.ToString(p.hi)
-            + "|" + Convert.ToString(p.hasRange) + "|" + Convert.ToString(p.hasDef)
-            + "|" + Convert.ToString(p.syncName) + "|" + Convert.ToString(p.IsBound());
+        + "|" + Convert.ToString(p.alias.Length) + ":" + p.alias
+        + "|" + Convert.ToString(p.defaultBinding)
+        + "|" + Convert.ToString(p.label.Length) + ":" + p.label
+        + "|" + Convert.ToString(p.tip.Length) + ":" + p.tip
+        + "|" + Convert.ToString(p.defVal.Length) + ":" + p.defVal
+        + "|" + Convert.ToString(p.kind) + "|" + Convert.ToString(p.halfRow) + "|" + Convert.ToString(p.ValueKind())
+        + "|" + Convert.ToString(p.step) + "|" + Convert.ToString(p.lo) + "|" + Convert.ToString(p.hi)
+        + "|" + Convert.ToString(p.hasRange) + "|" + Convert.ToString(p.hasDef)
+        + "|" + Convert.ToString(p.IsBound());
         for (int i = 0; i < p.options.Count; i = i + 1) {
             // Length prefix keeps literal separators in option labels unambiguous.
             result = result + "|" + Convert.ToString(p.options[i].Length) + ":" + p.options[i];
@@ -354,36 +387,36 @@ public class PropertyGrid : Control {
     private bool SameSchema(List<PropSpec> specs) {
         if (specs == null || rows.Count != specs.Count) { return false; }
         for (int i = 0; i < specs.Count; i = i + 1) {
-            if (rows[i].schema != this.SchemaOf(specs[i])) { return false; }
+            if (rowSchemas[i] != this.SchemaOf(specs[i])) { return false; }
         }
         return true;
     }
 
     private bool CurrentRow(PropertyGridRow row, int binding, int epoch) {
         return row != null && bindingEpoch == binding && row.epoch == epoch
-            && row.index >= 0 && row.index < rows.Count && rows[row.index] == row;
+        && row.index >= 0 && row.index < rows.Count && rows[row.index] == row;
     }
 
     // Layout snapshots include host/root/spec-list identity: same-schema Bind
     // and cross-App adoption need not advance bindingEpoch.
     private bool LayoutCurrent(App app, Control root, int binding, List<PropSpec> specs) {
         return this.App == app && (app == null || app.rootControl == root)
-            && bindingEpoch == binding && data == specs;
+        && bindingEpoch == binding && data == specs;
     }
 
     private bool LayoutRow(App app, Control root, int binding, List<PropSpec> specs, PropertyGridRow row, int epoch) {
         return this.LayoutCurrent(app,root,binding,specs) && this.CurrentRow(row,binding,epoch)
-            && row.root.parent == this && row.root.App == app;
+        && row.root != null && row.root.parent == this && row.root.App == app;
     }
 
     // Public Reset may run off-tree, but every callback must preserve the
     // exact model, host/root and row from the start of this operation.
     private bool CanCommitRow(PropertyGridRow row, int binding, int epoch, App expectedApp, Control expectedRoot, List<PropSpec> specs, PropSpec prop) {
         if (!this.LayoutCurrent(expectedApp,expectedRoot,binding,specs)
-            || !this.CurrentRow(row,binding,epoch) || row.index >= specs.Count || specs[row.index] != prop) { return false; }
-        if (expectedRoot == null || !expectedRoot.ContainsInputControl(this)) { return true; }
+        || !this.CurrentRow(row,binding,epoch) || row.index >= specs.Count || specs[row.index] != prop) { return false; }
+        if (row.root == null || expectedRoot == null || !expectedRoot.ContainsInputControl(this)) { return true; }
         return row.root.parent == this && row.root.App == expectedApp
-            && this.StyleVisible() && !this.IsDisabled();
+        && this.StyleVisible() && !this.IsDisabled();
     }
 
     private void CloseRowPicker(PropertyGridRow row) {
@@ -407,9 +440,13 @@ public class PropertyGrid : Control {
         // Scroll retirement may synchronously move/rebind this same row during
         // popup Cancel. Only the original session may remove its root.
         if (!this.LayoutCurrent(app,root,binding,specs) || row.epoch!=epoch
-            || row.root!=rowRoot || rowRoot.App!=app || rowRoot.parent!=this) { return; }
+        || row.root!=rowRoot || rowRoot.App!=app || rowRoot.parent!=this) { return; }
         row.epoch=row.epoch+1;
         this.Remove(rowRoot);
+        if (this.LayoutCurrent(app,root,binding,specs) && row.index >= 0 && row.index < rows.Count
+        && rows[row.index] == row && row.root == rowRoot && rowRoot.parent == null) {
+            rows[row.index] = null;
+        }
     }
 
     private void WireRow(PropertyGridRow row) {
@@ -441,7 +478,7 @@ public class PropertyGrid : Control {
     }
 
     public void ApplyRowAction(PropertyGridRow row, int binding, int epoch, int action, int argument) {
-        if (!this.CurrentRow(row,binding,epoch) || row.root.parent != this || this.IsDisabled() || !this.StyleVisible()) { return; }
+        if (!this.CurrentRow(row,binding,epoch) || row.root == null || row.root.parent != this || this.IsDisabled() || !this.StyleVisible()) { return; }
         App app = this.App;
         if (app == null) { return; }
         Control root = app.rootControl;
@@ -453,7 +490,7 @@ public class PropertyGrid : Control {
         if (action == 1) { this.ResetToDefault(index); return; }
         if (action == 2) { this.Step(app,index,argument * prop.step); return; }
         if (action == 4) {
-            if (argument == row.pick.Value()) { return; }
+            if (argument == row.pick.Value.Get()) { return; }
             row.pick.SetIndex(argument);
         }
         this.SubmitRow(app,index,binding,epoch);
@@ -467,8 +504,8 @@ public class PropertyGrid : Control {
         for (int i=0;i<specs.Count&&i<rows.Count;i=i+1) {
             PropSpec prop=specs[i];
             PropertyGridRow row=rows[i];
+            if (row==null||row.root==null||prop.kind==5||!prop.IsBound()) { continue; }
             int epoch=row.epoch;
-            if (prop.kind==5||!prop.IsBound()) { continue; }
             string current=prop.Read();
             if (!this.LayoutCurrent(app,root,ticket,specs)||!this.CurrentRow(row,ticket,epoch)) { return; }
             if (current!=row.shadow) {
@@ -508,6 +545,12 @@ public class PropertyGrid : Control {
         hitRow=index;
         Change.PostS(this);
         app.RequestRedraw();this.PrepareRows();
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x,y,pointerType)) { return null; }
+        this.Arrange(bx,by,bw,bh);
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
     }
 
     public override void OnScrollChanged() { this.PrepareRows(); }
@@ -573,7 +616,7 @@ public class PropertyGrid : Control {
                 Button button=row.segments[i];
                 this.AdoptPart(row,button,segmented,app,root,ticket,specs,epoch); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
                 if (segmented) {
-                    button.Checked=i==row.pick.Value();
+                    button.Checked=i==row.pick.Value.Get();
                     button.MeasureTree(app); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
                     button.Arrange(editorX+i*partW,editorY,i==count-1?editorW-i*partW:partW,editorH); if (!this.LayoutRow(app,root,ticket,specs,row,epoch)) { return; }
                 }
@@ -616,6 +659,31 @@ public class PropertyGrid : Control {
             }
             if (rowW-labelW<app.Scale(60)) { labelW=rowW-app.Scale(60); }
             if (labelW<app.Scale(40)) { labelW=app.Scale(40); }
+            // Determine geometry from specs alone. At most two editors occupy
+            // one physical line; no offscreen editor is constructed to measure.
+            List<int> wanted = new List<int>();
+            int top = view.y - this.ScrollTop();
+            bool hidden = false;
+            for (int i = 0; i < specs.Count; i = i + 1) {
+                PropSpec prop = specs[i];
+                if (prop.kind == 5) { hidden = this.IsSectionCollapsed(prop.label); }
+                bool shown = prop.kind == 5 || !hidden;
+                bool pair = prop.kind != 5 && prop.halfRow && i + 1 < specs.Count
+                && specs[i + 1].halfRow && specs[i + 1].kind != 5;
+                if (shown && top + rowH > view.y && top < view.y + view.height && this.StyleVisible()) {
+                    wanted.Add(i);
+                    if (pair) { wanted.Add(i + 1); }
+                }
+                if (shown) { top = top + rowH; }
+                if (pair) { i = i + 1; }
+            }
+            List<PropertyGridRow> previous = rows;
+            for (int i = 0; i < previous.Count; i = i + 1) {
+                if (!wanted.Contains(i)) { this.RetireRow(previous[i]); }
+                if (!this.LayoutCurrent(app,root,ticket,specs)) { return; }
+            }
+            if (!rowHost.Reconcile(wanted, this.CreateRow, app)
+            || !this.LayoutCurrent(app,root,ticket,specs)) { return; }
             int y=view.y-this.ScrollTop();
             bool collapsed=false;
             for (int i=0;i<data.Count&&i<rows.Count;i=i+1) {
@@ -685,14 +753,14 @@ public class PropertyGrid : Control {
     // 绑定事件："Change" 接 UiEvent，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
-        On.AddByName(evt, a);
+        base.BindEvent(evt, a);
     }
 
     // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
     // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
-        On.AddByNameS(evt, a);
+        base.BindEventS(evt, a);
     }
 
 }

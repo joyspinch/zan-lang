@@ -39,8 +39,7 @@ public partial class ChatView : Control {
     private int actMsg;
     private int actX;
     private int actY;
-    // 命中测试要从鼠标坐标换算气泡几何，而点击事件到达时手里没有
-    // App 参数——OnPaint 把当帧的 app 缓存下来供 AvatarHit 用。
+    // Arrange 保存准备气泡几何所用的 App，供路由点击回调换算坐标。
     private weak App uiApp;
 
     // 正在排的那份行表，以及增量重排用的水位线：`cacheTurns` 之前的
@@ -59,8 +58,8 @@ public partial class ChatView : Control {
 
     // 展开的消息下标（工具结果与长代码块共用一份）。
     private List<int> toolOpen;
-    private SignalInt thinkOpen;
-    private SignalInt scrollSig;
+    private Binding<int> thinkOpen;
+    private Binding<int> scrollSig;
     private LogState sel;
     private bool busy;
     // 记录网格与空态提示：常驻子控件，绘制全在它们内部。
@@ -82,7 +81,7 @@ public partial class ChatView : Control {
     // 本次几何是整份重排（会丢弃选区）。
     private bool bubStale;
     // 气泡模式的像素滚动信号（0 = 贴住最新一条）。
-    private SignalInt bscr;
+    private Binding<int> bscr;
     // 气泡正文的最大宽度比例（千分比），由 `WithBubbleWidth` 给。
     private int bubWMille;
     // 上次量气泡用的布局签名（`BubbleLayoutSig`），变了就是整份重排。
@@ -106,8 +105,7 @@ public partial class ChatView : Control {
     // 就是整条），宿主据此在输入区拉起引用条。
     private ChatQuote quoteCb;
 
-    // 空视图：英文默认文案，常驻的记录网格与空态提示都已建好
-    // （是否显示由每帧绘制决定）。
+    // 空视图：英文默认文案；Arrange 根据数据切换常驻网格与空态提示。
     public ChatView() {
         this.InitControl("chat", 5);
         this.Pad(0);
@@ -133,13 +131,13 @@ public partial class ChatView : Control {
         show = new List<TextRun>();
         showStale = false;
         toolOpen = new List<int>();
-        thinkOpen = new SignalInt(0);
-        scrollSig = new SignalInt(0);
+        thinkOpen = 0;
+        scrollSig = 0;
         bub = new List<ChatBubble>();
         bubKey = "";
         bubH = 0;
         bubStale = false;
-        bscr = new SignalInt(0);
+        bscr = 0;
         bubWMille = 620;
         bubSig = "";
         showNames = false;
@@ -152,9 +150,7 @@ public partial class ChatView : Control {
         busy = false;
         grid = new StyledText();
         grid.Grow();
-        // 两个子控件按数据互斥显示：显示与否由 OnPaint 决定，而绘制发生在
-        // 同一帧的排版之后，所以出生时先都收起来——否则首帧排版会看到两个
-        // 满框的兄弟叠在一起（重叠自检会把它报成手打布局事故）。
+        // 两个常驻子控件先隐藏，首次 Arrange 按消息数据选择可见节点。
         grid.SetShown(false);
         this.Add(grid);
         emptyLbl = new Label();
@@ -259,12 +255,12 @@ public partial class ChatView : Control {
     // 选区状态（宿主可持久化或复位）。
     public LogState Selection() { return sel; }
 
-    // 底端锚定的滚动偏移信号（0 = 贴住最新一行）。
-    public SignalInt Scroll() { return scrollSig; }
+    // 底端锚定的滚动偏移绑定（0 = 贴住最新一行）。
+    public Binding<int> Scroll() { return scrollSig; }
 
-    // 气泡模式的像素滚动偏移信号（0 = 贴住最新一条）。宿主把它接到
+    // 气泡模式的像素滚动偏移绑定（0 = 贴住最新一条）。宿主把它接到
     // 自己的滚动记忆上时用；不接也不影响滚轮与拖动。
-    public SignalInt BubbleScroll() { return bscr; }
+    public Binding<int> BubbleScroll() { return bscr; }
 
     // 换掉一整份记录（切换会话）：缓存、折叠、选区与滚动全部归零。
     public void Reset() {
@@ -281,6 +277,8 @@ public partial class ChatView : Control {
         bubH = 0;
         bubStale = false;
         bscr.Set(0);
+        App app = this.App;
+        if (app != null) { this.PrepareBubbleAvatars(app); }
         sel.Reset();
         scrollSig.Set(0);
     }
@@ -313,11 +311,66 @@ public partial class ChatView : Control {
 
     // ---- retained 钩子 ----------------------------------------------
 
-    // 绘制：按有无消息在记录网格与空态提示间切换；消费滚轮、做
-    // 增量重排（受时间预算约束），把排好的行、滚动、选区与折叠
-    // 状态交给常驻的 StyledText 呈现。
-    public override void OnPaint(App app) {
+    private bool bubbleScrollReady;
+    private int projectedBubbleScroll;
+    private int bubbleMaximum;
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == -1) {
+            box.overflowY = style == ChatStyle.Bubble() ? 2 : 1;
+            box.overflow = 1;
+        }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        App app = this.App;
+        int pad = app != null ? app.Scale(10) : 10;
+        return new Rect(view.x, view.y + pad, view.width, Math.Max(0, view.height - pad * 2));
+    }
+
+    public override void OnScrollChanged() {
+        if (style != ChatStyle.Bubble() || !bubbleScrollReady) { return; }
+        projectedBubbleScroll = Math.Max(0, bubbleMaximum - this.ScrollTop());
+        if (bscr.Get() != projectedBubbleScroll) { bscr.Set(projectedBubbleScroll); }
+        App app = this.App;
+        if (app != null) { this.PrepareBubbleAvatars(app); }
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = Math.Max(0, w); bh = Math.Max(0, h);
+        App app = this.App;
+        if (app == null) { return; }
         uiApp = app;
+        this.PrepareChat(app);
+        if (style == ChatStyle.Bubble()) {
+            bool external = !bubbleScrollReady || bscr.Get() != projectedBubbleScroll;
+            int distance = bubbleMaximum - this.ScrollTop();
+            Rect view = this.ScrollViewport();
+            scrollExtent = bubH;
+            scrollExtentX = view.width;
+            bubbleMaximum = Math.Max(0, bubH - view.height);
+            int next = bubbleMaximum - (external ? bscr.Get() : distance);
+            bubbleScrollReady = true;
+            int previous = this.ScrollTop();
+            this.SetScrollTop(Math.Max(0, Math.Min(bubbleMaximum, next)));
+            if (previous == this.ScrollTop()) { this.OnScrollChanged(); }
+        } else {
+            bubbleScrollReady = false;
+            scrollExtent = bh;
+            scrollExtentX = bw;
+            this.SetScrollTop(0);
+            this.PrepareBubbleAvatars(app);
+        }
+        emptyLbl.MeasureTree(app);
+        emptyLbl.Arrange(x, y, w, h);
+        grid.MeasureTree(app);
+        grid.Arrange(x, y, w, h);
+    }
+
+    private void PrepareChat(App app) {
         bool has = data != null && data.Count > 0;
         bool bubMode = style == ChatStyle.Bubble();
         emptyLbl.SetShown(!has && !busy);
@@ -326,20 +379,15 @@ public partial class ChatView : Control {
         grid.SetShown(!bubMode && (has || busy));
         if (!has && !busy) {
             emptyLbl.Text = str.empty;
+            if (bubMode) { this.BuildBubble(app); }
             return;
         }
         if (bubMode) {
-            this.TakeBubbleWheel(app);
             this.BuildBubble(app);
-            this.BubbleMouse(app);
-            this.PaintBubbles(app);
-            this.TakeBubbleCopy(app);
             return;
         }
-        this.TakeWheel(app);
         this.Build(app);
         grid.lines = show;
-        grid.scroll = scrollSig.Get();
         grid.busy = busy;
         grid.sel = sel;
         grid.interactive = true;
@@ -349,12 +397,48 @@ public partial class ChatView : Control {
         // 记录网格自己画纵向滚动条（它才知道行高与可见行数），这里只把同一个
         // 滚动信号交给它，滚轮与拖动于是动的是同一个量。
         grid.scrollBar = scrollSig;
-        // StyledText 在绘制时算出最大滚动，绘制发生在子控件那一步，
-        // 因此这里读到的是上一帧的界限——足够用来夹住滚动值。
-        int max = grid.maxScroll;
-        if (scrollSig.Get() > max) { scrollSig.Set(max); }
-        if (scrollSig.Get() < 0) { scrollSig.Set(0); }
-        this.TakeCopy(app);
+    }
+
+    public override void OnPaint(App app) {
+        if (style == ChatStyle.Bubble()) { this.PaintBubbles(app); }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || this.IsDisabled() || style != ChatStyle.Bubble()) { return; }
+        this.BubbleMouse(app);
+        if (selDrag) { app.CapturePointer(this, true); e.Handle(); }
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.App;
+        if (!e.handled && app != null && style == ChatStyle.Bubble()) { this.BubbleMouse(app); }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || style != ChatStyle.Bubble()) { return; }
+        if (selDrag && app.window.EventButton() == 0) {
+            ChatHit hit = this.SnapHit(this.HitBubble(app, e.x, e.y, true));
+            if (hit.msg >= 0) { selMsg1 = hit.msg; selOff1 = hit.off; }
+            selDrag = false;
+            if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+            e.Handle();
+            app.RequestRedraw();
+        } else { this.BubbleMouse(app); }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        selDrag = false;
+        actMsg = -1;
+        base.OnPointerCancel(e);
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || e.handled) { return; }
+        if (style == ChatStyle.Bubble()) { this.TakeBubbleCopy(app); }
+        else { this.TakeCopy(app); }
     }
 
     // 宿主注册「气泡头像被点」回调；链式返回自己。
@@ -363,29 +447,17 @@ public partial class ChatView : Control {
         return this;
     }
 
-    // 点击命中测试：只有 bubble 模式响应。点击坐标来自缓存的
-    // uiApp（事件到达在两帧之间，没有 app 参数），气泡几何与
-    // PaintBubbles 同一套换算：先滚动态偏移出每条气泡的 y，
-    // 头像在气泡同行一侧（我方在右、对方在左），直径 34 缩放像素。
+    // Use the prepared child geometry, including themed avatar dimensions.
     public void AvatarHit() {
-        if (avatarClick == null || uiApp == null) { return; }
-        if (style != ChatStyle.Bubble() || bubKey == "") { return; }
         App app = uiApp;
-        if (app.mouseX < bx || app.mouseX >= bx + bw) { return; }
-        if (app.mouseY < by || app.mouseY >= by + bh) { return; }
-        int pad = app.Scale(12); int padV = app.Scale(10); int avaD = app.Scale(34);
-        int viewH = bh - padV * 2; if (viewH < 0) { viewH = 0; }
-        int over = bubH - viewH; if (over < 0) { over = 0; }
-        int y0 = by + padV - (over - bscr.Get());
-        for (int i = 0; i < bub.Count; i = i + 1) {
-            ChatBubble b = bub[i];
-            if (b.waiting) { continue; }
-            int ry = y0 + b.top;
-            if (app.mouseY < ry || app.mouseY >= ry + avaD) { continue; }
-            int avaX = bx + pad;
-            if (b.mine) { avaX = bx + bw - pad - avaD; }
-            if (app.mouseX >= avaX && app.mouseX < avaX + avaD) {
-                avatarClick(b.idx);
+        if (avatarClick == null || app == null || style != ChatStyle.Bubble()
+        || bubKey == "" || bubbleAvatars == null) { return; }
+        if (app.mouseX < bx || app.mouseX >= bx + bw
+        || app.mouseY < by || app.mouseY >= by + bh) { return; }
+        for (int i = 0; i < bubbleAvatars.Count; i = i + 1) {
+            ChatBubbleAvatar avatar = bubbleAvatars[i];
+            if (avatar.HitTest(app.mouseX, app.mouseY) != null) {
+                avatarClick(avatar.messageIndex);
                 return;
             }
         }
@@ -412,7 +484,7 @@ public partial class ChatView : Control {
         if (viewH < 0) { viewH = 0; }
         int over = bubH - viewH;
         if (over < 0) { over = 0; }
-        int y0 = by + padV - (over - bscr.Get());
+        int y0 = by + padV - this.ScrollTop();
         int fallMsg = 0 - 1;
         int fallOff = 0;
         for (int i = 0; i < bub.Count; i = i + 1) {
@@ -540,7 +612,7 @@ public partial class ChatView : Control {
         if (bubKey == "") { return; }
         int kind = app.EventKind();
         bool inside = app.mouseX >= bx && app.mouseX < bx + bw
-            && app.mouseY >= by && app.mouseY < by + bh;
+        && app.mouseY >= by && app.mouseY < by + bh;
         if (kind == 1) {
             if (selDrag) {
                 ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, true));
@@ -596,7 +668,7 @@ public partial class ChatView : Control {
             // 卡片单击：松开还在同一泡、且基本没挪动才算（拖动手势
             // 不触发，交给滚动/选区语义）。
             if (app.window.EventButton() == 0 && this.actMsg >= 0
-                    && bubbleActivate != null && inside) {
+            && bubbleActivate != null && inside) {
                 ChatHit h = this.SnapHit(this.HitBubble(app, app.mouseX, app.mouseY, false));
                 int dx = app.mouseX - this.actX;
                 int dy = app.mouseY - this.actY;
@@ -660,49 +732,6 @@ public partial class ChatView : Control {
         return this.SpeakerName(m);
     }
 
-    // 指针在气泡区上时滚轮滚动：气泡是像素滚动的，一档滚 40px（约一
-    // 行多一点），而不是记录模式的一整行。
-    public void TakeBubbleWheel(App app) {
-        // 认领以真溢出为前提：内容放得下视口时不认领，滚轮穿透给
-        // 外层容器/页面（认领了 bscr 也只会被钳回 0 白吃一格）。
-        int padV = app.Scale(10);
-        int viewH = bh - padV * 2;
-        int over = bubH - viewH;
-        if (over <= 0) { return; }
-        if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
-        int d = app.window.EventKeyCode();
-        int step = d / 120;
-        if (step == 0) {
-            if (d > 0) { step = 1; }
-            else if (d < 0) { step = 0 - 1; }
-        }
-        // bscr 是「离底部多少像素」（与记录模式的 scrollSig 同一语义：
-        // 0 = 贴住最新一条）。滚轮向上 = step 为正 = 要看更旧的内容 =
-        // 离底部更远，所以是加不是减——此前这里写成减号，滚轮方向整个
-        // 反了（向上滚反而跳到最新）。
-        bscr.Set(bscr.Get() + step * app.Scale(40));
-        if (bscr.Get() > over) { bscr.Set(over); }
-        if (bscr.Get() < 0) { bscr.Set(0); }
-        app.RequestRedraw();
-    }
-
-    // 指针在记录上时滚轮滚动。
-    public void TakeWheel(App app) {
-        // 认领以真溢出为前提：grid.maxScroll 是上一帧绘制算出的界限
-        // （本帧绘制在子控件那步才更新），跨界时认领晚一帧，无害；
-        // 记录放得下时不认领，滚轮穿透给外层。
-        if (grid.maxScroll <= 0) { return; }
-        if (!app.CaptureWheel(bx, by, bw, bh)) { return; }
-        int d = app.window.EventKeyCode();
-        int step = d / 120;
-        if (step == 0) {
-            if (d > 0) { step = 1; }
-            else if (d < 0) { step = 0 - 1; }
-        }
-        scrollSig.Set(scrollSig.Get() + step);
-        app.RequestRedraw();
-    }
-
     // 指针在记录上时 Ctrl+C 复制选中的文本。
     public void TakeCopy(App app) {
         if (app.EventKind() != 4) { return; }
@@ -725,21 +754,21 @@ public partial class ChatView : Control {
         if (!Modifiers.HasCtrl(app.window.EventMods())) { return; }
         int code = app.window.EventKeyCode();
         if (code == 67) {  // Ctrl+C
-            if (!this.HasBubbleSelection()) { return; }
-            if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
-            if (app.mouseY < by || app.mouseY > by + bh) { return; }
-            Clipboard.SetText(this.BubbleSelectionText());
-            app.RequestRedraw();
-            return;
-        }
-        if (code == 65) {  // Ctrl+A：全选
-            if (data == null || data.Count == 0) { return; }
-            if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
-            if (app.mouseY < by || app.mouseY > by + bh) { return; }
-            selMsg0 = 0; selOff0 = 0;
-            selMsg1 = data.Count - 1;
-            selOff1 = data[data.Count - 1].text.Length;
-            app.RequestRedraw();
-        }
+        if (!this.HasBubbleSelection()) { return; }
+        if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
+        if (app.mouseY < by || app.mouseY > by + bh) { return; }
+        Clipboard.SetText(this.BubbleSelectionText());
+        app.RequestRedraw();
+        return;
     }
+    if (code == 65) {  // Ctrl+A：全选
+    if (data == null || data.Count == 0) { return; }
+    if (app.mouseX < bx || app.mouseX > bx + bw) { return; }
+    if (app.mouseY < by || app.mouseY > by + bh) { return; }
+    selMsg0 = 0; selOff0 = 0;
+    selMsg1 = data.Count - 1;
+    selOff1 = data[data.Count - 1].text.Length;
+    app.RequestRedraw();
+}
+}
 }

@@ -1,0 +1,217 @@
+using System;
+using Gui;
+
+namespace Gui.Component;
+
+// The actual tab, close and splitter endpoints live in the host's visual tree.
+internal class DockInputPart : Control {
+    internal weak DockHost owner;
+    internal string key;
+    internal bool used;
+    internal string panelId;
+    internal int action;
+    internal int groupKey;
+    internal int nextKey;
+    internal bool vertical;
+    internal int start;
+    internal int first;
+    internal int second;
+    internal int delta;
+
+    public override int InputFocusCapabilities() { return 0; }
+    public override bool AcceptsRetainedLongPress() { return action <= 3; }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        base.OnRoutedEvent(e);
+        DockHost host = owner;
+        if (host != null && e.GestureRouteCurrent()) { host.RouteDockPart(this, e); }
+    }
+}
+
+public partial class DockHost {
+    private List<DockInputPart> inputParts;
+    private List<Control> contentRoots;
+
+    public override string Kind() { return "DockHost"; }
+    public override int InputFocusCapabilities() { return 0; }
+
+    // The caller mounts DockHost in its existing input root before preparing it.
+    public void PrepareHost(App app, Rect bounds) {
+        if (app == null || bounds == null) { return; }
+        this.UseApp(app);
+        this.MeasureTree(app, bounds.width);
+        this.Arrange(bounds.x, bounds.y, bounds.width, bounds.height);
+    }
+
+    public Control ContentRoot(string id) {
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            if (panels[i].id != id) { continue; }
+            while (contentRoots.Count <= i) {
+                Control root = new Control("dockcontent");
+                contentRoots.Add(root);
+                this.Add(root);
+            }
+            return contentRoots[i];
+        }
+        return null;
+    }
+
+    public void SetContent(string id, Control content) {
+        Control root = this.ContentRoot(id);
+        if (root == null) { throw new ArgumentException("unknown dock panel: " + id); }
+        root.RemoveAll();
+        if (content != null) { content.Grow(); root.Add(content); }
+    }
+
+    private DockInputPart Part(string key, int action, int x, int y, int w, int h) {
+        DockInputPart part = null;
+        for (int i = 0; i < inputParts.Count; i = i + 1) {
+            if (inputParts[i].key == key) { part = inputParts[i]; break; }
+        }
+        if (part == null) {
+            part = new DockInputPart(); part.key = key; part.owner = this;
+            inputParts.Add(part); this.Add(part);
+        }
+        part.action = action;
+        part.used = true;
+        part.SetShown(w > 0 && h > 0);
+        part.UseApp(this.App);
+        part.MeasureTree(this.App);
+        part.Arrange(x, y, Math.Max(0, w), Math.Max(0, h));
+        return part;
+    }
+
+    private DockInputPart Splitter(string key, int action, int groupKey, int nextKey,
+    int x, int y, int w, int h, bool vertical) {
+        DockInputPart part = this.Part(key, action, x, y, w, h);
+        part.groupKey = groupKey; part.nextKey = nextKey; part.vertical = vertical;
+        return part;
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = Math.Max(0, w); bh = Math.Max(0, h);
+        App app = this.App;
+        if (app == null) { return; }
+        for (int i = 0; i < inputParts.Count; i = i + 1) {
+            inputParts[i].used = false;
+        }
+        this.PrepareDockLayout(app, new Rect(bx, by, bw, bh));
+        for (int i = 0; i < inputParts.Count; i = i + 1) {
+            if (!inputParts[i].used && inputParts[i].StyleVisible()) {
+                inputParts[i].SetShown(false); app.CancelInputSubtree(inputParts[i]);
+            }
+        }
+        for (int i = 0; i < panels.Count; i = i + 1) {
+            Control root = this.ContentRoot(panels[i].id);
+            Rect bounds = panels[i].body;
+            bool shown = !panels[i].hidden && bounds.width > 0 && bounds.height > 0;
+            bool retire = root.StyleVisible() && !shown;
+            root.SetShown(shown);
+            if (retire) { app.CancelInputSubtree(root); }
+            root.MeasureTree(app, bounds.width);
+            root.Arrange(bounds.x, bounds.y, bounds.width, bounds.height);
+        }
+    }
+
+    internal void RouteDockPart(DockInputPart part, RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null) { return; }
+        string name = e.eventName;
+        if (name == "PointerCancel") {
+            dragging = false; dragArmed = false; dragId = ""; dropKind = 0;
+            if (pendingResize) { changed = true; pendingResize = false; }
+            e.Handle(); app.RequestRedraw(); return;
+        }
+        if (e.handled || this.IsDisabled() || !part.StyleVisible()) { return; }
+        bool primary = app.window.EventButton() == 0;
+        if (name == "LongPress" || name == "RightClick") {
+            if (!dragging && part.action <= 3) { this.OpenMenu(app, e.x, e.y); e.Handle(); }
+            return;
+        }
+        if (name == "PointerDown" && primary && part.action >= 2 && part.action != 3) {
+            dragArmed = false;
+            part.start = part.vertical ? e.x : e.y;
+            DockLayoutGeometry geometry = this.ResolveDockGeometry(app, area, false);
+            part.first = part.action == 4 ? geometry.LeftW : part.action == 5 ? geometry.RightW : geometry.BottomH;
+            part.second = part.action == 4 ? geometry.RightW : geometry.LeftW;
+            part.delta = 0;
+            if (part.action == 7) {
+                int index = this.IndexOfKey(part.groupKey);
+                int next = this.IndexOfKey(part.nextKey);
+                if (index < 0 || next < 0) { return; }
+                part.first = groups[index].extent; part.second = groups[next].extent;
+            }
+            app.CapturePointer(part, true); e.Handle();
+        }
+        if ((name == "PointerMove" || (name == "PointerUp" && primary))
+        && app.GetCapturedPointer() == part) {
+            if (part.action == 2) {
+                int distance = (int)Math.Abs(e.x - app.pressStartX) + (int)Math.Abs(e.y - app.pressStartY);
+                if (!dragging && distance > app.Scale(6)) {
+                    dragging = true; dragArmed = true; dragId = part.panelId;
+                }
+                if (dragging) { this.ResolveDrop(app); }
+            } else if (part.action >= 4) {
+                int delta = (part.vertical ? e.x : e.y) - part.start;
+                if (delta != part.delta) {
+                    part.delta = delta;
+                    if (part.action == 4 || part.action == 5) {
+                        int side = part.action == 4 ? DockSide.Left() : DockSide.Right();
+                        int extent = part.first + (part.action == 4 ? delta : 0 - delta);
+                        DockLayoutGeometry resized = this.ResolveDockGeometry(app, area, false,
+                        side, extent, part.second);
+                        if (this.SideHasVisible(DockSide.Left())) { leftW = resized.LeftW; }
+                        if (this.SideHasVisible(DockSide.Right())) { rightW = resized.RightW; }
+                    }
+                    if (part.action == 6) {
+                        bottomH = Math.Max(app.Scale(72), part.first - delta);
+                        DockLayoutGeometry resized = this.ResolveDockGeometry(app, area, false);
+                        bottomH = resized.BottomH;
+                    }
+                    if (part.action == 7) {
+                        int index = this.IndexOfKey(part.groupKey); int next = this.IndexOfKey(part.nextKey);
+                        int min = app.Scale(56);
+                        if (index >= 0 && next >= 0 && part.first + delta >= min && part.second - delta >= min) {
+                            groups[index].extent = part.first + delta; groups[next].extent = part.second - delta;
+                        }
+                    }
+                    pendingResize = true;
+                }
+            }
+            if (name == "PointerUp") {
+                if (dragging) { this.ApplyDrop(); }
+                dragging = false; dragId = ""; dropKind = 0;
+                if (pendingResize) { changed = true; pendingResize = false; }
+                app.ReleasePointerCapture();
+            }
+            if (name != "PointerUp" || part.action != 2 || dragArmed) { e.Handle(); }
+            app.RequestRedraw();
+        }
+        if (name == "Click" && primary && part.action >= 2 && part.action <= 3) {
+            if (!dragArmed) {
+                if (part.action == 3) { this.Close(part.panelId); }
+                else {
+                    int index = this.GroupOf(part.panelId);
+                    if (index >= 0) { groups[index].active = this.IndexIn(groups[index], part.panelId); }
+                }
+            }
+            dragArmed = false; e.Handle(); app.RequestRedraw();
+        }
+    }
+
+    internal void PaintSplitter(App app, DockInputPart part) {
+        StyleBox box = Control.BareBox(app, "splitter",
+        part.isHovered || part.isPressed ? Style.SHover() : Style.SNormal());
+        box.Paint(app, part.bx, part.by, part.bw, part.bh);
+    }
+
+    public void RenderPrepared(App app) { this.OnPaint(app); }
+    public override void OnPaint(App app) {
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            if (this.GroupHasVisible(groups[i])) { this.PaintGroup(app, groups[i]); }
+        }
+        for (int i = 0; i < inputParts.Count; i = i + 1) {
+            DockInputPart part = inputParts[i];
+            if (part.action >= 4 && part.StyleVisible()) { this.PaintSplitter(app, part); }
+        }
+    }
+}

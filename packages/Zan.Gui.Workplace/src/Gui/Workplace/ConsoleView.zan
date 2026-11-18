@@ -30,6 +30,7 @@ public class ConsoleView : Control {
         this.InitControl("console", 5);
         items = new List<LogLine>();
         st = new LogState();
+        st.Reset();
         Empty = "";
         live = true;
     }
@@ -84,7 +85,7 @@ public class ConsoleView : Control {
     public LogState State() { return st; }
 
     // 跳回最新一行并清除选择。
-    public void Reset() { st.Reset(); }
+    public void Reset() { st.Reset(); scrollReady = false; }
 
     // 当前选中的文本（无选择时为 ""）。
     public string SelectedText() {
@@ -94,23 +95,104 @@ public class ConsoleView : Control {
     }
 
     // 覆写：设计器属性（空态文案与只读开关；数据经 Bind 在代码侧给）。
-    public override List<PropSpec> Props() {
+    protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec emp = PropSpec.Text("empty", "Empty text");
-        emp.str = Empty;
+        emp.Field("Empty", 0);
         emp.WithTip("Shown centred when there are no lines; \"\" hides it.");
         ps.Add(emp);
         PropSpec lv = PropSpec.Bool("live", "Live");
-        lv.flag = live;
+        lv.Field("live", 2);
         lv.WithTip("Off renders a passive strip: no wheel or drag selection.");
         ps.Add(lv);
         return ps;
     }
 
-    // 绘制：整体委托给 LogView.RenderItems（含滚轮、尾部滚动与选择）。
+    private int rowPixel;
+    private int maximum;
+    private int projectedScroll;
+    private bool scrollReady;
+
+    public ConsoleView UseState(LogState state) {
+        if (state == null) { throw new ArgumentException("log state required"); }
+        st = state; scrollReady = false;
+        return this;
+    }
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        if (box.overflowCss == -1) { box.overflowY = live ? 2 : 1; box.overflow = 1; }
+        return box;
+    }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        App app = this.App;
+        int pad = app != null ? LogView.Padding(app) : 6;
+        int row = rowPixel > 0 ? rowPixel : 18;
+        return new Rect(view.x, view.y + pad, view.width, Math.Max(0, view.height - pad * 2) / row * row);
+    }
+
+    public override void OnScrollChanged() {
+        if (!scrollReady || rowPixel <= 0) { return; }
+        projectedScroll = Math.Max(0, maximum - this.ScrollTop()) / rowPixel;
+        st.scroll = projectedScroll;
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = Math.Max(0, w); bh = Math.Max(0, h);
+        App app = this.App;
+        if (app == null) { return; }
+        rowPixel = LogView.RowHeight(app);
+        int rows = LogView.VisibleRows(app, bh);
+        bool external = !scrollReady || st.scroll != projectedScroll;
+        int distance = maximum - this.ScrollTop();
+        maximum = Math.Max(0, items.Count - rows) * rowPixel;
+        scrollExtent = maximum + this.ScrollViewport().height;
+        scrollExtentX = bw;
+        int next = maximum - (external ? st.scroll * rowPixel : distance);
+        scrollReady = true;
+        this.SetScrollTop(Math.Max(0, Math.Min(maximum, next)));
+        this.OnScrollChanged();
+    }
+
+    private void SelectAt(int x, int y, bool anchor) {
+        App app = this.App;
+        int row = LogView.RowAt(app, by, bh, items.Count, st.scroll, y);
+        int column = row >= 0 ? LogView.ColAt(items[row].text, bx + LogView.Padding(app),
+        Style.FontFallback(app, "small"), x) : 0;
+        if (anchor) { st.selR0 = row; st.selC0 = column; }
+        st.selR1 = row; st.selC1 = column;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        App app = this.App;
+        if (e.handled || app == null || !live || this.IsDisabled() || e.originalSource != this
+        || app.window.EventButton() != 0 || this.ScrollBarHit(e.x, e.y) != 0) { return; }
+        this.SelectAt(e.x, e.y, true); st.selDrag = true;
+        app.CapturePointer(this, true); app.RequestRedraw(); e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || !st.selDrag || app.GetCapturedPointer() != this) { return; }
+        this.SelectAt(e.x, e.y, false); app.RequestRedraw(); e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        App app = this.App;
+        if (app == null || !st.selDrag || app.window.EventButton() != 0) { return; }
+        this.SelectAt(e.x, e.y, false); st.selDrag = false;
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        app.RequestRedraw(); e.Handle();
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        st.selDrag = false; st.barDrag = false;
+        base.OnPointerCancel(e);
+    }
+
     public override void OnPaint(App app) {
-        List<LogLine> lines = items;
-        if (lines == null) { lines = new List<LogLine>(); }
-        LogView.RenderItems(app, bx, by, bw, bh, lines, st, Empty, live);
+        LogView.PaintItems(app, bx, by, bw, bh, items, st, Empty);
     }
 }
