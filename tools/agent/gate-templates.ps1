@@ -6,8 +6,9 @@
 #   zan.proj           name = {{NAME}} / entry = src/{{NAME}}.html
 # 步骤 = IDE 建项目的等价动作：复制 -> App.* 改名 -> {{NAME}} 替换 -> 全源 + 入口一起编。
 #
-# 用 --emit-lib：跳过链接阶段（GUI 模板的 WinMain 宿主由真实建项目路径提供，
-# 不属于"我把 API 改坏了"这一类）。它验证的是 类型/符号/codegen 这一层。
+# 用 --emit-lib -O0：验证类型、符号、IR/codegen 及共享库链接，不要求 GUI 的
+# WinMain 入口。模板库公开面保留范围大，无需反复做发布优化；真实 EXE 的
+# 发布优化与入口链接由应用构建验收。
 #
 #   tools/agent/gate-templates.ps1                 # 全部
 #   tools/agent/gate-templates.ps1 -Filter gui/*   # 子集
@@ -160,7 +161,7 @@ foreach ($t in $tpls) {
     $out = Join-Path $Work ($tag + '.dll')
     # 不用 --deny-warnings：基线不干净时它会把 stdlib 既有告警升成错误，
     # 让每个模板都假红（实测 TaskCompletionSource.zan:101 的闭包捕获告警）。
-    $argv = @($inputs) + @('--auto-stdlib', '--emit-lib', '-o', ("`"$out`""))
+    $argv = @($inputs) + @('--auto-stdlib', '--emit-lib', '-O0', '-o', ("`"$out`""))
     $r = Invoke-Zanc -argv $argv -out $out -timeoutMs ($TimeoutSec * 1000)
 
     $bad = ($r.exit -ne 0) -or ($r.text -match '\b[1-9]\d*\s+error\(s\)') -or ($r.text -match '(?m)^\S.*?:\d+:\d+:\s*error:')
