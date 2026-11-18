@@ -2727,6 +2727,16 @@ add_test(NAME diag_collection_unknown_member
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_collection_unknown_member PROPERTIES TIMEOUT 60)
 
+add_test(NAME diag_coll_member_init_standalone
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/coll_member_init_standalone.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_coll_member_init_standalone${_exe_ext}
+    "-DEXPECT_REGEX=collection member initializer is only allowed inside an object initializer"
+    "-DEXPECT_ERROR_COUNT=1"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_coll_member_init_standalone PROPERTIES TIMEOUT 60)
+
 # An unresolved method call whose result is then read (`t.Describe().Name`) never
 # emitted the inner call, so the chain answered the member fallback's 0 instead
 # of reporting the missing method -- the unchained `var g = t.Describe();` was

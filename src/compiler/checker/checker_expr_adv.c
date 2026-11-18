@@ -595,6 +595,12 @@
             return inner ? inner : c->binder->type_error;
         }
 
+    case AST_COLL_INIT:
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 3022,
+            "collection member initializer is only allowed inside an object "
+            "initializer attached to 'new' or a factory call");
+        return c->binder->type_error;
+
     case AST_BASE_EXPR:
         return c->binder->type_error; /* resolved in */
     default: {

@@ -858,6 +858,9 @@ literal         = INT_LIT | FLOAT_LIT | STRING_LIT | CHAR_LIT
 qualified_name  = IDENT { "." IDENT } ;
 ```
 
+集合成员初始化 `Children = { a, b }` 只允许出现在附着于 `new` 或工厂调用的对象初始化器内；
+独立语句 `obj.Children = { a, b };` 报 E3022。修改已有对象的集合使用 `obj.Children.Add(a)`。
+
 ---
 
 ## Appendix A: 已实现与保留
