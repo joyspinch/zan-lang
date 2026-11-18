@@ -39,7 +39,15 @@ static void *(__cdecl *g_native_realloc)(void *, size_t);
 static BOOL CALLBACK zan_mem_init_native_alloc(PINIT_ONCE once, PVOID arg,
                                                PVOID *context) {
     (void)once; (void)arg; (void)context;
+    /* MinGW 链接的宿主挂 msvcrt.dll；clang/MSVC-CRT（libcmt/ucrt）宿主
+     * 没有 msvcrt——UCRT 的 malloc/free/calloc/realloc 同样是进程真实
+     * 分配器，必须回退，否则非 MinGW 宿主启动即 ExitProcess(127)
+     * （探针：zanrt_mem_recommit_test 在 MSVC-CRT 构建下无输出即退）。
+     * 静态 CRT 宿主连 ucrtbase 都没挂：LoadLibrary 显式载入，native
+     * 堆自洽成对（分配与释放都走同一组函数），不与宿主 CRT 混用。 */
     HMODULE crt = GetModuleHandleA("msvcrt.dll");
+    if (!crt) crt = GetModuleHandleA("ucrtbase.dll");
+    if (!crt) crt = LoadLibraryA("ucrtbase.dll");
     if (!crt) return FALSE;
     g_native_malloc = (void *(__cdecl *)(size_t))GetProcAddress(crt, "malloc");
     g_native_free = (void (__cdecl *)(void *))GetProcAddress(crt, "free");
