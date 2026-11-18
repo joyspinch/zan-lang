@@ -1,0 +1,231 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Component;
+
+class IdeDocumentPageHostTest {
+    static string testRoot = "build/test-out/ide-document-page-host";
+
+    static void Check(bool condition, string reason) {
+        if (!condition) { throw new Exception(reason); }
+    }
+
+    static ZanIDE Host(App app, string directory) {
+        ZanIDE host = new ZanIDE(app);
+        host.root = directory;
+        Directory.CreateDirectoryRecursive(directory);
+        return host;
+    }
+
+    static TabRecord Target(ZanIDE host, string text) {
+        string path = host.root + "/Main.zan";
+        File.WriteAllText(path, text);
+        TabRecord tab = TabRecord.Create("Main.zan", text, path);
+        host.tabs.Add(tab);
+        host.tabs.Add(TabRecord.Create("Diff", "", "@diff:Main.zan"));
+        host.docs.Note(path, text, FileInfo.GetLastWriteTime(path));
+        host.editor.documentPath = path;
+        host.editor.LoadText(text);
+        host.bindingCodeTab = tab; host.lastActive = 0;
+        host.activeTab.Set(1); host.UpdateActiveCodeTab();
+        return tab;
+    }
+
+    static void SelectTarget(ZanIDE host, TabRecord tab) {
+        tab.preparedBody = tab.body;
+        tab.preparedText = CodeEditor.PrepareText(tab.body);
+        host.activeTab.Set(0); host.UpdateActiveCodeTab();
+    }
+
+    static IdeDocumentPageWork AcceptSnapshot(ZanIDE host, string text) {
+        StagedFile staged = AiStaging.Stage(host.root, "Main.zan", text);
+        return host.BeginDiffWrite("Main.zan", staged);
+    }
+
+    static void FinishWrite(ZanIDE host, IdeDocumentPageWork work) {
+        Task worker = Task.Run(work.WriteDiff);
+        worker.Wait();
+        Check(worker.IsCompleted, "real Diff worker completes before controlled UI delivery");
+        host.app.DrainPosts();
+        Check(work.completed, "worker Post reaches the real partial completion");
+    }
+
+    static void SafeEditorAdoption(App app) {
+        AiStaging.Clear();
+        ZanIDE host = Host(app, testRoot + "/safe");
+        TabRecord tab = Target(host, "old\n");
+        IdeDocumentPageWork work = AcceptSnapshot(host, "accepted\n");
+        Check(work.tab == tab && work.originalBody == "old\n" && work.editorCaptured,
+        "production submission captures the original TabRecord, body and resident editor");
+        SelectTarget(host, tab);
+        int staleBinding = host.codeBindingSequence;
+        CodeEditorTextLoad staleRequest = host.editor.BeginTextLoad(tab.path, CodeEditor.LangForName(tab.path));
+        CodeEditorPreparedText staleText = CodeEditor.PrepareText("old\n");
+        FinishWrite(host, work);
+        Check(work.staged.accepted && File.ReadAllText(work.fullPath) == work.text,
+        "the accepted snapshot is written and marked accepted");
+        Check(tab.body == work.text && host.editor.GetText() == work.text
+        && host.bindingCodeTab == tab && host.lastActive == 0,
+        "returning to the target before completion reloads the actual editor through the real load chain");
+        Check(host.codeBindingSequence > staleBinding && host.projectSourceRequests >= 2,
+        "completion retires the previous binding and runs ApplyCodeTab again");
+        host.ApplyCodeTab(tab, staleRequest, staleText, "old\n", staleBinding, work.workspace);
+        Check(host.editor.GetText() == work.text && !staleText.applied,
+        "a code-load completion captured before Diff adoption cannot restore the old buffer");
+        Check(!host.docs.IsDirty(tab.path, host.editor.GetText())
+        && host.docs.StampOf(tab.path) == work.stamp,
+        "the accepted disk snapshot becomes the current document baseline");
+        int logged = host.log.Count;
+        work.ApplyDiff();
+        Check(host.log.Count == logged && !host.diffWritePending && host.diffWriteWork == null,
+        "a duplicate completion is inert and does not replay success");
+        host.editor.DetachAnalysis();
+    }
+
+    static void PreserveEdits(App app) {
+        AiStaging.Clear();
+        ZanIDE host = Host(app, testRoot + "/editing");
+        TabRecord tab = Target(host, "old\n");
+        IdeDocumentPageWork work = AcceptSnapshot(host, "accepted\n");
+        SelectTarget(host, tab);
+        host.editor.LoadText("typed during write\n");
+        FinishWrite(host, work);
+        Check(host.editor.GetText() == "typed during write\n" && tab.body == "old\n",
+        "unsynchronized active-editor edits are not overwritten by the disk completion");
+        Check(host.docs.IsDirty(tab.path, host.editor.GetText()) && work.staged.accepted,
+        "preserved editor edits remain dirty against the accepted disk snapshot");
+
+        AiStaging.Clear();
+        ZanIDE switched = Host(app, testRoot + "/edited-and-switched");
+        TabRecord switchedTab = Target(switched, "old\n");
+        IdeDocumentPageWork switchedWork = AcceptSnapshot(switched, "accepted\n");
+        SelectTarget(switched, switchedTab);
+        switched.editor.LoadText("typed then switched\n");
+        switchedTab.body = switched.editor.GetText();
+        switched.activeTab.Set(1); switched.UpdateActiveCodeTab();
+        FinishWrite(switched, switchedWork);
+        Check(switchedTab.body == "typed then switched\n" && switched.docs.IsDirty(switchedTab.path, switchedTab.body),
+        "edits stored on a tab before switching away survive completion");
+        SelectTarget(switched, switchedTab);
+        Check(switched.editor.GetText() == "typed then switched\n",
+        "selecting the preserved tab loads its edits rather than the accepted disk snapshot");
+        host.editor.DetachAnalysis(); switched.editor.DetachAnalysis();
+    }
+
+    static void WorkspaceAndSnapshotRetirement(App app) {
+        AiStaging.Clear();
+        ZanIDE host = Host(app, testRoot + "/workspace-a");
+        Target(host, "old A\n");
+        IdeDocumentPageWork work = AcceptSnapshot(host, "accepted A\n");
+        StagedFile original = work.staged;
+        host.CancelDocumentReads();
+        host.root = testRoot + "/workspace-b";
+        Directory.CreateDirectoryRecursive(host.root);
+        host.tabs = new List<TabRecord>();
+        TabRecord other = Target(host, "B remains\n");
+        FinishWrite(host, work);
+        Check(original.accepted && File.ReadAllText(work.fullPath) == "accepted A\n",
+        "workspace retirement does not forget the completed authorized write");
+        Check(other.body == "B remains\n" && host.editor.GetText() == "B remains\n"
+        && host.docs.TextOf(other.path) == "B remains\n",
+        "an old workspace result cannot refill the new workspace tab or editor");
+
+        host.activeTab.Set(1);
+        IdeDocumentPageWork restagedWork = AcceptSnapshot(host, "old staged B\n");
+        StagedFile replacement = AiStaging.Stage(host.root, "Main.zan", "new staged B\n");
+        FinishWrite(host, restagedWork);
+        Check(replacement == restagedWork.staged && !replacement.accepted
+        && replacement.stagedText == "new staged B\n",
+        "writing an older snapshot never accepts a newer version of the same StagedFile");
+
+        host.activeTab.Set(1);
+        IdeDocumentPageWork failure = AcceptSnapshot(host, "will fail\n");
+        host.CancelDocumentReads(); host.root = testRoot + "/retired";
+        failure.failure = "controlled write failure";
+        failure.ApplyDiff();
+        Check(!failure.staged.accepted && host.log[host.log.Count - 1].Contains("controlled write failure")
+        && host.log[host.log.Count - 1].Contains(failure.fullPath),
+        "failed old-workspace writes retain their exact failure and path");
+        host.editor.DetachAnalysis();
+    }
+
+    static void ReopenedTab(App app) {
+        AiStaging.Clear();
+        ZanIDE host = Host(app, testRoot + "/reopened");
+        TabRecord original = Target(host, "old\n");
+        IdeDocumentPageWork work = AcceptSnapshot(host, "accepted\n");
+        TabRecord replacement = TabRecord.Create("Main.zan", "reopened edits\n", original.path);
+        host.tabs[0] = replacement;
+        FinishWrite(host, work);
+        Check(replacement.body == "reopened edits\n" && original.body == "old\n",
+        "a closed and reopened tab with the same path is outside the captured completion");
+        host.editor.DetachAnalysis();
+    }
+
+    static void DrainRecent(ZanIDE host) {
+        Task drain = Task.Run(host.DrainWorkspaceWorkAsync());
+        drain.Wait();
+        Check(drain.IsCompleted && host.recentWorkspaceQueue == null,
+        "the production persistence queue is drained and retired without UI callbacks");
+        host.app.DrainPosts();
+    }
+
+    static void RecentSequences(App app) {
+        ZanIDE.configRoot = testRoot + "/config";
+        Directory.CreateDirectoryRecursive(ZanIDE.configRoot);
+        ZanIDE host = Host(app, testRoot + "/recent-workspace");
+        string first = testRoot + "/recent-a";
+        string second = testRoot + "/recent-b";
+        string third = testRoot + "/recent-c";
+        string added = testRoot + "/recent-d";
+        Directory.CreateDirectoryRecursive(first); Directory.CreateDirectoryRecursive(second);
+        Directory.CreateDirectoryRecursive(third); Directory.CreateDirectoryRecursive(added);
+        File.WriteAllText(ZanIDE.RecentProjectsPath(), first + "\n" + second + "\n" + third + "\n");
+        host.RequestStartPageData(first);
+        host.RequestStartPageData(second);
+        DrainRecent(host);
+        Check(File.ReadAllText(ZanIDE.RecentProjectsPath()) == third + "\n",
+        "two submissions remove both paths through the single real read-modify-write queue");
+        Check(host.startPage.RecentPath(0) == third && host.startPage.RecentPath(1) == "",
+        "only the latest sequence publishes the post-removal snapshot");
+        host.RememberWorkspaceAsync(added);
+        DrainRecent(host);
+        Check(host.startPage.RecentPath(0) == added && host.startPage.RecentPath(1) == third,
+        "workspace persistence is followed by its Start refresh even without another page activation");
+
+        IdeDocumentPageWork canceled = new IdeDocumentPageWork();
+        canceled.owner = host; canceled.host = app; canceled.root = host.root;
+        canceled.workspace = host.documentWorkspace; canceled.sequence = host.startPageDataSequence;
+        canceled.removePath = third; canceled.cancellation = host.documentReadCancellation.Token;
+        host.CancelDocumentReads();
+        IdeRecentWorkspace item = new IdeRecentWorkspace(); item.documentPageWork = canceled;
+        int logCount = host.log.Count;
+        Check(ZanIDE.PersistWorkspaceItem(item) == "", "canceled Start snapshot is not an IO failure");
+        app.DrainPosts();
+        Check(canceled.canceled && canceled.completed && host.log.Count == logCount,
+        "retired reads quietly reject their UI result");
+        Check(File.ReadAllText(ZanIDE.RecentProjectsPath()) == added + "\n"
+        && host.startPage.RecentPath(1) == third,
+        "a submitted removal still persists while the retired UI snapshot is ignored");
+        host.editor.DetachAnalysis();
+    }
+
+    static void Main() {
+        if (Directory.Exists(testRoot)) { Directory.DeleteRecursive(testRoot); }
+        Directory.CreateDirectoryRecursive(testRoot);
+        App app = App.CreateOffscreen("document page host", 800, 600);
+        try {
+            SafeEditorAdoption(app);
+            PreserveEdits(app);
+            WorkspaceAndSnapshotRetirement(app);
+            ReopenedTab(app);
+            RecentSequences(app);
+            AiStaging.Clear();
+            Console.WriteLine("IDE_DOCUMENT_PAGE_HOST_OK");
+        } finally {
+            app.DrainPosts(); app.SetRootControl(null); app.StopLoop(); app.canvas.Destroy();
+            if (Directory.Exists(testRoot)) { Directory.DeleteRecursive(testRoot); }
+        }
+    }
+}

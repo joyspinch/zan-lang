@@ -4,38 +4,149 @@ using Gui.Widget;
 using Gui.Component;
 
 partial class ZanIDE {
-    void AiRenderSessions(App app, Rect area) {
-        int pad = app.theme.paddingTiny;
+    bool AgentOn() { return dock != null && dock.Visible("agent"); }
+
+    void ToggleAgent() {
+        if (dock == null) { return; }
+        if (this.AgentOn()) {
+            dock.Close("agent");
+            if (aiSessNav != null) { aiSessNav.SuspendHost(); }
+        } else {
+            if (aiWin != null && aiWin.IsOpen()) {
+                this.RetireAiSessionsView();
+                aiWin.Close();
+                aiWin = null;
+            }
+            dock.SetContent("agent", aiPanel);
+            dock.Show("agent");
+            if (!shuttingDown && !closeRequested) {
+                Rect area = dock.PreviewContent(app, dock.Content("editor"), "agent");
+                this.PrepareAiSessionsView(app, area);
+            }
+        }
+        dock.TakeClosed();
+        app.RequestRedraw();
+    }
+
+    bool AiInWindow() { return aiWin != null && aiWin.IsOpen(); }
+
+    int AiSessionSidebarWidth(App host, Rect area) {
+        if (host == null || area == null) { return 0; }
+        int width = host.Scale(154);
+        if (width > area.width - host.Scale(150)) { return 0; }
+        return width;
+    }
+
+    Rect PrepareAiSessionBounds(App host, Rect area) {
+        if (aiPanel == null || area == null) { return new Rect(0, 0, 0, 0); }
+        return aiPanel.LayoutSidebarForSessions(host, area,
+        this.AiSessionSidebarWidth(host, area));
+    }
+
+    static void AiSessionNavigationChanged() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiSessNav == null || ide.app == null) { return; }
+        SessionListAction action = ide.aiSessNav.TakeAction();
+        if (action.Any()) { ide.ApplyAiSessionAction(action); }
+    }
+
+    void PrepareAiSessionsView(App host) {
+        if (aiSessNav == null || host == null) { return; }
+        if (this.AiInWindow()) { return; }
+        if (shuttingDown || closeRequested || dock == null) {
+            this.RetireAiSessionsView();
+            return;
+        }
+        Rect area = dock.PreviewContent(host, dock.Content("editor"), "agent");
+        if (!dock.Visible("agent") || area == null || area.width <= 0
+        || area.height <= 0 || area.x < 0
+        || area.x > host.canvas.Width()) {
+            aiSessNav.SuspendHost();
+            return;
+        }
+        this.PrepareAiSessionsAt(host, area);
+    }
+
+    void PrepareAiSessionsView(App host, Rect area) {
+        if (aiSessNav == null || host == null || area == null
+        || shuttingDown || closeRequested) {
+            this.RetireAiSessionsView();
+            return;
+        }
+        this.PrepareAiSessionsAt(host, area);
+    }
+
+    private void PrepareAiSessionsAt(App host, Rect area) {
+        aiSessNav.InitializeHost(host);
+        aiSessNav.Bind(this.AiSessionTitles(), aiSessCur,
+        this.AiSessionArchiveFlags());
+        Rect sidebar = this.PrepareAiSessionBounds(host, area);
+        if (sidebar == null || sidebar.width <= 0 || sidebar.height <= 0) {
+            aiSessNav.SuspendHost();
+            return;
+        }
+        int pad = host.theme.paddingTiny;
+        int width = sidebar.width - pad * 2;
+        int height = sidebar.height - pad * 2;
+        if (width <= 0 || height <= 0) {
+            aiSessNav.SuspendHost();
+            return;
+        }
+        aiSessNav.PrepareHost(host, sidebar.x + pad, sidebar.y + pad,
+        width, height);
+    }
+
+    void PrepareAiSessionsWindow(App host) {
+        if (aiSessNav == null || host == null
+        || shuttingDown || closeRequested) {
+            this.RetireAiSessionsView();
+            return;
+        }
+        aiSessNav.InitializeHost(host);
+        Rect area = new Rect(host.ShapeOffX(),
+        host.ContentTop() + host.ShapeOffY(), host.ClientWidth(),
+        host.ClientHeight() - host.ContentTop());
+        this.PrepareAiSessionsAt(host, area);
+    }
+
+    private List<string> AiSessionTitles() {
         List<string> titles = new List<string>();
-        List<int> archives = new List<int>();
         for (int i = 0; i < aiSessions.Count; i = i + 1) {
             string title = aiSessions[i].title;
             if (title == "") { title = ZanIDE.AiSessTitleOf(aiSessions[i]); }
-            if (title == "") { title = ZanIDE.T("New chat ", "新会话 ") + Convert.ToString(i + 1); }
+            if (title == "") {
+                title = ZanIDE.T("New chat ", "新会话 ") + Convert.ToString(i + 1);
+            }
             titles.Add(title);
-            archives.Add(aiSessions[i].archived);
         }
-        SessionListAction action = aiSessNav.RenderEx(app, area.x + pad, area.y + pad,
-            area.width - pad * 2, area.height - pad * 2, titles, aiSessCur, archives);
-        if (action.archived >= 0 || action.deleted >= 0 || action.renamed >= 0
-            || action.created || action.selected >= 0 && action.selected != aiSessCur) {
-            int version = this.AiSessionVersion();
-            IdeAiSessionContext context = aiSessionContext;
-            app.Post(delegate () {
-                if (this.AiSessionMatches(context, version)) { this.ApplyAiSessionAction(action); }
-            });
+        return titles;
+    }
+
+    private List<int> AiSessionArchiveFlags() {
+        List<int> flags = new List<int>();
+        for (int i = 0; i < aiSessions.Count; i = i + 1) {
+            flags.Add(aiSessions[i].archived);
         }
+        return flags;
+    }
+
+    void RetireAiSessionsView() {
+        if (aiSessNav != null) { aiSessNav.RetireHost(); }
+    }
+
+    void AiRenderSessions(App app, Rect area) {
+        if (aiSessNav != null) { aiSessNav.RenderPrepared(app); }
     }
 
     void ApplyAiSessionAction(SessionListAction action) {
-        if (aiSessions == null || aiSessCur < 0 || aiSessCur >= aiSessions.Count) { return; }
+        if (aiSessions == null || aiSessions.Count == 0) { return; }
         if (aiBusy.Get() == 0 && action.archived >= 0 && action.archived < aiSessions.Count) {
             int index = action.archived;
             aiSessions[index].archived = aiSessions[index].archived == 0 ? 1 : 0;
             this.AiSessionChanged();
             this.SaveAiSessions();
             Layer.Msg(aiSessions[index].archived == 1
-                ? ZanIDE.T("Chat archived", "会话已归档") : ZanIDE.T("Chat restored", "会话已恢复"), 3);
+            ? ZanIDE.T("Chat archived", "会话已归档") : ZanIDE.T("Chat restored", "会话已恢复"), 3);
         } else if (aiBusy.Get() == 0 && action.deleted >= 0 && action.deleted < aiSessions.Count) {
             this.RememberAiSessionCurrent();
             int index = action.deleted;
@@ -75,7 +186,7 @@ partial class ZanIDE {
             this.AiChatReset();
             this.SaveAiSessions();
         } else if (aiBusy.Get() == 0 && action.selected >= 0 && action.selected < aiSessions.Count
-            && action.selected != aiSessCur) {
+        && action.selected != aiSessCur) {
             this.RememberAiSessionCurrent();
             this.AiSessionChanged();
             this.UseAiSessionCurrent(action.selected);

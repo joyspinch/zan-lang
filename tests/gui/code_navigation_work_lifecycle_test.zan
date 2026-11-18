@@ -1,0 +1,95 @@
+using System;
+using System.Diagnostics;
+using System.Threading;
+
+class NavigationWorkWatch {
+    public weak IdeCodeNavigationWork work;
+}
+
+class NavigationWorkerResult {
+    public int value;
+}
+
+class Program {
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void Idle(IdeCodeNavigationWork work) {
+        for (int i = 0; i < 4; i = i + 1) {
+            Task idle = work.DrainAsync();
+            idle.Wait();
+            Program.Require(idle.IsCompleted, "idle drain completes");
+        }
+    }
+
+    static void Overlapping(NavigationWorkWatch watch) {
+        IdeCodeNavigationWork work = new IdeCodeNavigationWork();
+        watch.work = work;
+        Program.Idle(work);
+        work.Begin();
+        work.Begin();
+        Task first = work.DrainAsync();
+        Task second = work.DrainAsync();
+        Program.Require(!first.IsCompleted && !second.IsCompleted,
+            "overlapping drains must wait for pending work");
+        work.Complete();
+        Program.Require(!first.IsCompleted && !second.IsCompleted,
+            "one remaining work item must keep both drains pending");
+        work.Complete();
+        first.Wait();
+        second.Wait();
+        Program.Require(first.IsCompleted && second.IsCompleted,
+            "both drains complete after the last work item");
+        Program.Idle(work);
+    }
+
+    static void Worker(NavigationWorkWatch watch, int mode) {
+        IdeCodeNavigationWork work = new IdeCodeNavigationWork();
+        watch.work = work;
+        NavigationWorkerResult result = new NavigationWorkerResult();
+        CancellationTokenSource cancellation = new CancellationTokenSource();
+        if (mode == 1) { cancellation.Cancel(); }
+        Task worker = work.Run(delegate () {
+            if (cancellation.Token.IsCancellationRequested) { return; }
+            try {
+                if (mode == 2) { throw new Exception("worker failure"); }
+                result.value = 1;
+            } catch (Exception error) {
+                result.value = error.Message == "worker failure" ? 2 : -1;
+            }
+        });
+        Task drained = work.DrainAsync();
+        Program.Require(!drained.IsCompleted,
+            "queued worker must keep drain pending");
+        drained.Wait();
+        worker.Wait();
+        Program.Require(drained.IsCompleted && worker.IsCompleted,
+            "worker and drain must both finish");
+        int expected = mode == 1 ? 0 : (mode == 2 ? 2 : 1);
+        Program.Require(result.value == expected,
+            "worker success/cancellation/caught failure result");
+        Program.Idle(work);
+        cancellation.Dispose();
+    }
+
+    static void Released(NavigationWorkWatch watch) {
+        // DONE can precede frame-local/this release; do not retain a weak target.
+        long deadline = Stopwatch.GetMilliseconds() + 2000;
+        while (watch.work != null && Stopwatch.GetMilliseconds() < deadline) {
+            Thread.Sleep(1);
+        }
+        Program.Require(watch.work == null, "completed work retained after helper return");
+    }
+
+    static void Main() {
+        NavigationWorkWatch watch = new NavigationWorkWatch();
+        Program.Overlapping(watch);
+        Program.Released(watch);
+        for (int mode = 0; mode < 3; mode = mode + 1) {
+            Program.Worker(watch, mode);
+            Program.Released(watch);
+        }
+        Console.WriteLine("CODE_NAVIGATION_WORK_LIFECYCLE_OK");
+    }
+}

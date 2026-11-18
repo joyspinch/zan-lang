@@ -46,12 +46,11 @@ partial class TeamBoard {
     // 用户拖出来的任务图高度（逻辑像素，0 = 跟着内容自适应）。存逻辑
     // 像素而不是设备像素，换屏 / 改 DPI 后拖过的高度跟着缩放。
     int graphLogH;
-    // 图下沿拖拽条的命中区 id。
-    int sizerId;
+    bool sizing;
 
     void OnInit() {
         TeamBoard.current = this;
-        this.logGap = 4;
+        this.Gap(4);
         this.TeamLbl.SetProp("text", ZanIDE.T("Team", "团队"));
         this.Pipeline.AddStep(ZanIDE.T("PM", "产品"));
         this.Pipeline.AddStep(ZanIDE.T("Arch", "架构"));
@@ -71,8 +70,8 @@ partial class TeamBoard {
         this.ProjBtn.SetProp("text", ZanIDE.T("< Project", "< 项目对话"));
         this.ProjBtn.visible = false;
         this.Graph.EmptyText(ZanIDE.T("No tasks yet -- ask the team to plan"
-                + " the work and the graph appears here.",
-            "还没有任务：让团队先把活拆成任务图，这里就会出现节点。"));
+        + " the work and the graph appears here.",
+        "还没有任务：让团队先把活拆成任务图，这里就会出现节点。"));
         this.Graph.OnSelect(TeamBoard.NodePicked);
         this.Graph.OnActivate(TeamBoard.NodeStarted);
         this.Graph.OnBlocked(TeamBoard.NodeBlocked);
@@ -90,7 +89,10 @@ partial class TeamBoard {
         this.Sizer.visible = false;
         this.Why.visible = false;
         graphLogH = 0;
-        sizerId = WidgetId.Next();
+        TeamBoardSizerEvents resize = new TeamBoardSizerEvents();
+        resize.owner = this;
+        this.Sizer.OnRouted(resize.Route);
+        this.Sizer.SetProp("style", "height:7px;background:var(--divider);");
     }
 
     // 没拖过时任务图能自己长到多高（逻辑像素）：再高就在图里滚，否则
@@ -151,36 +153,28 @@ partial class TeamBoard {
         prefH = h;
     }
 
-    // 任务图下沿的拖拽条：图的高度不再写死，拉一把就能把整张图铺开看，
-    // 双击回到跟着内容自适应。
-    override void OnPaint(App app) {
-        if (!this.Sizer.visible || this.Sizer.bh <= 0) { return; }
-        bool hot = app.focus.IsHovered(sizerId)
-            || app.focus.IsPressed(sizerId);
-        int col = app.theme.divider;
-        if (hot) { col = app.theme.primary; }
-        int gripW = app.Scale(28);
-        if (gripW > this.Sizer.bw) { gripW = this.Sizer.bw; }
-        int thick = app.Scale(2);
-        app.canvas.FillRect(this.Sizer.bx + (this.Sizer.bw - gripW) / 2,
-            this.Sizer.by + (this.Sizer.bh - thick) / 2, gripW, thick, col);
-        app.hitTester.RegisterRect(sizerId, this.Sizer.bx, this.Sizer.by,
-            this.Sizer.bw, this.Sizer.bh, 5);
-        if (Ui.DoubleClicked(app, sizerId)) {
-            graphLogH = 0;
-            app.RequestRedraw();
-            return;
-        }
-        if (app.focus.IsPressed(sizerId)) {
-            int want = TeamBoard.Unscale(app, app.mouseY - this.Graph.by);
+    // Capture keeps the resize gesture on the real sizer when the pointer leaves it.
+    void ResizeGraph(Control sender, RoutedEventArgs e) {
+        if (sender != this.Sizer || !this.Sizer.StyleVisible() || this.App == null) { return; }
+        if (e.eventName == "PointerDown") {
+            sizing = true;
+            this.App.CapturePointer(sender, true);
+            e.Handle();
+        } else if (e.eventName == "PointerMove" && sizing) {
+            int want = TeamBoard.Unscale(this.App, e.y - this.Graph.by);
             if (want < TeamBoard.GraphMin()) { want = TeamBoard.GraphMin(); }
-            if (want > TeamBoard.GraphDragMax()) {
-                want = TeamBoard.GraphDragMax();
-            }
-            if (want != graphLogH) {
-                graphLogH = want;
-                app.RequestRedraw();
-            }
+            if (want > TeamBoard.GraphDragMax()) { want = TeamBoard.GraphDragMax(); }
+            graphLogH = want;
+            e.Handle();
+            this.Invalidate();
+        } else if (e.eventName == "PointerUp" || e.eventName == "PointerCancel") {
+            sizing = false;
+            if (this.App.GetCapturedPointer() == sender) { this.App.ReleasePointerCapture(); }
+            e.Handle();
+        } else if (e.eventName == "Click" && e.isDoubleClick) {
+            graphLogH = 0;
+            e.Handle();
+            this.Invalidate();
         }
     }
 
@@ -296,8 +290,8 @@ partial class TeamBoard {
     // 改了多少东西（空串＝没人在跑）。`lockedNode`：这一拍正占着的节点，
     // 此时图上的操作都会被拦，卡片上得看得出来。
     void Sync(bool teamOn, bool busy, AiTeamState st, List<AiTask> tasks,
-            SignalInt open, string curNode, string liveNode, string liveText,
-            string lockedNode) {
+    SignalInt open, string curNode, string liveNode, string liveText,
+    string lockedNode) {
         TeamBoard.openSig = open;
         this.ModeSw.SetOn(teamOn);
         bool nowOn = teamOn;
@@ -329,7 +323,7 @@ partial class TeamBoard {
         int at = AiTeam.IndexOfTask(tasks, st.activeTask);
         if (at >= 0) { pct = tasks[at].progress; }
         this.ShowMember(st.activeAgent, TeamBoard.StatusOf(st, busy),
-            TeamBoard.StatusClass(st, busy), pct);
+        TeamBoard.StatusClass(st, busy), pct);
 
         this.Pipeline.visible = isOpen;
         this.Graph.visible = isOpen;
@@ -340,15 +334,15 @@ partial class TeamBoard {
         }
 
         this.Pipeline.SetProp("current",
-            Convert.ToString(AiTeam.StageOf(st.activeAgent)));
+        Convert.ToString(AiTeam.StageOf(st.activeAgent)));
         // 任务图：节点 + 前置连线由画布自己布局，锁状态由它从 deps 推出，
         // 所以这里只在图真的变了的时候重新交一份节点。
         string sig = TeamBoard.GraphSigOf(tasks) + "|" + curNode
-            + "|" + liveNode + "|" + liveText + "|" + lockedNode;
+        + "|" + liveNode + "|" + liveText + "|" + lockedNode;
         if (graphSig != sig) {
             graphSig = sig;
             this.Graph.Bind(TeamBoard.NodesOf(tasks, liveNode, liveText,
-                lockedNode));
+            lockedNode));
             this.Graph.SelectId(curNode);
         }
         // 选中的节点被前置卡着时，把「差哪一个、它现在什么状态」写在图
@@ -369,14 +363,14 @@ partial class TeamBoard {
     // 这段映射住在界面层而不是 AiTaskGraph：服务层不依赖 Gui
     // （服务层不得依赖界面层），而 GraphNode 是画布的类型。
     static List<GraphNode> NodesOf(List<AiTask> tasks, string liveNode,
-            string liveText, string lockedNode) {
+    string liveText, string lockedNode) {
         List<GraphNode> outNodes = new List<GraphNode>();
         for (int i = 0; i < tasks.Count; i = i + 1) {
             AiTask t = tasks[i];
             GraphNode n = GraphNode.Of(t.id, AiTaskGraph.CardTitle(t));
             if (t.owner != "") {
                 n = n.WithTag(AiTeam.DisplayName(t.owner),
-                    AiTeam.RoleTagClass(t.owner));
+                AiTeam.RoleTagClass(t.owner));
             }
             // 正在跑的那个节点，状态短语换成它真在干的事（拍子 + 改动）；
             // 「进行中 40%」看不出在干什么，这行字看得出。锁住的那个节点
@@ -388,7 +382,7 @@ partial class TeamBoard {
             // 的节点，照实说「已开工·未在跑」，高亮也让给在跑的那个。
             string tone = AiTeam.TaskStateClass(t.state);
             if (t.state == AiTeam.TaskDoing() && liveText != ""
-                    && t.id != liveNode) {
+            && t.id != liveNode) {
                 stx = ZanIDE.T("started, idle", "已开工·未在跑");
                 tone = "";
             }
@@ -418,10 +412,10 @@ partial class TeamBoard {
         for (int i = 0; i < tasks.Count; i = i + 1) {
             AiTask t = tasks[i];
             sb.Append(t.id + "~" + t.title + "~" + t.owner + "~"
-                + Convert.ToString(t.state) + "~"
-                + Convert.ToString(t.progress) + "~"
-                + AiTaskPlan.SigOf(t) + "~"
-                + AiTeam.JoinIds(t.deps) + ";");
+            + Convert.ToString(t.state) + "~"
+            + Convert.ToString(t.progress) + "~"
+            + AiTaskPlan.SigOf(t) + "~"
+            + AiTeam.JoinIds(t.deps) + ";");
         }
         return sb.ToString();
     }
@@ -441,7 +435,7 @@ partial class TeamBoard {
     // 发给谁由输入框上方的提示行决定，这里只读不写。
     void ShowMember(string roleId, string state, string stateCls, int pct) {
         string sig = roleId + "|" + state + "|" + stateCls + "|"
-            + Convert.ToString(pct);
+        + Convert.ToString(pct);
         if (TeamBoard.chipSig == sig) { return; }
         TeamBoard.chipSig = sig;
         string cls = AiTeam.RoleTagClass(roleId);

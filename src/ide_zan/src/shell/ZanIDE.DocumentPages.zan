@@ -1,0 +1,191 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+
+partial class ZanIDE : IdeDocumentPageOwner {
+    bool startPageWasVisible;
+    string startPageDataRoot;
+    int startPageDataSequence;
+    bool diffWritePending;
+    IdeDocumentPageWork diffWriteWork;
+
+    void RetireDocumentPages() {
+        startPageDataSequence = startPageDataSequence + 1;
+        if (startPage != null) { startPage.owner = null; startPage.SetShown(false); }
+        if (diffView != null) { diffView.owner = null; diffView.SetShown(false); }
+    }
+
+    bool DocumentPageCurrent(Control page, string path) {
+        int active = activeTab.Get();
+        return !shuttingDown && !closeRequested && page != null && page.parent == shellRoot
+        && page.StyleVisible() && active >= 0 && active < tabs.Count && tabs[active].path == path;
+    }
+
+    void PumpDocumentPages() {
+        int active = activeTab.Get();
+        bool start = active >= 0 && active < tabs.Count && tabs[active].path == "@start";
+        if (start && (!startPageWasVisible || startPageDataRoot != root)) { this.RequestStartPageData(); }
+        startPageWasVisible = start;
+    }
+
+    void RequestStartPageData(string removePath = "") {
+        if (shuttingDown || closeRequested) { return; }
+        startPageDataSequence = startPageDataSequence + 1;
+        startPageDataRoot = root;
+        IdeDocumentPageWork work = new IdeDocumentPageWork();
+        work.owner = this; work.host = app; work.root = root;
+        work.workspace = documentWorkspace; work.sequence = startPageDataSequence;
+        work.removePath = removePath; work.cancellation = documentReadCancellation.Token;
+        IdeRecentWorkspace next = new IdeRecentWorkspace();
+        next.documentPageWork = work;
+        this.QueueWorkspacePersistence(next);
+    }
+
+    void ApplyStartPageData(IdeDocumentPageWork work) {
+        if (work.completed) { return; }
+        work.completed = true;
+        if (work.failure != "") { log.Add("> Start page: " + work.failure); }
+        if (shuttingDown || closeRequested || work.canceled || work.workspace != documentWorkspace
+        || work.root != root || work.sequence != startPageDataSequence || startPage == null) { return; }
+        if (work.failure == "") { startPage.SetRecents(work.recents); startPage.SetNews(work.news); }
+        app.InvalidatePreparation();
+        app.RequestRedraw();
+    }
+
+    public void StartPageAction(StartPage sender, int action, string path) {
+        if (sender != startPage || !this.DocumentPageCurrent(sender, "@start")) { return; }
+        if (action >= 1 && action <= 4) {
+            this.RunRibbonCommand(app, action == 4 ? 16 : action - 1);
+        } else if (action == 5 && path != "") {
+            if (path != root) { this.OpenProjectAsync(path); }
+            else {
+                if (tabs.Count == 0) { this.RequestFirstDocumentAsync(); lastActive = -1; rescan = true; }
+                log.Add("> Project already open: " + root);
+            }
+        } else if (action == 6 && path != "") {
+            if (path == "@docs") {
+                int index = ZanIDE.FindTabByPath(tabs, "@docs");
+                if (index < 0) {
+                    tabs.Add(TabRecord.Create(ZanIDE.T("Help", "帮助"), "", "@docs"));
+                    index = tabs.Count - 1;
+                }
+                activeTab.Set(index); lastActive = -1;
+            } else { ZanIDE.OpenExternal(path); }
+        } else if (action == 7 && path != "") { this.RequestStartPageData(path); }
+        app.InvalidatePreparation();
+        app.RequestRedraw();
+    }
+
+    public void DiffViewAction(DiffView sender, bool accept, string path) {
+        if (sender != diffView || !this.DocumentPageCurrent(sender, "@diff:" + path) || diffWritePending) { return; }
+        StagedFile staged = AiStaging.Get(path);
+        if (staged == null) { return; }
+        if (accept) {
+            IdeDocumentPageWork work = this.BeginDiffWrite(path, staged);
+            this.TrackDocumentWorker(Task.Run(work.WriteDiff));
+        } else {
+            AiStaging.Reject(path);
+            log.Add(ZanIDE.T("> Discarded AI changes: " + path, "> 已丢弃 AI 修改: " + path));
+            int active = activeTab.Get();
+            tabs.RemoveAt(active);
+            if (active >= tabs.Count) { active = tabs.Count - 1; }
+            activeTab.Set(active); lastActive = -1;
+        }
+        app.InvalidatePreparation();
+        app.RequestRedraw();
+    }
+
+    IdeDocumentPageWork BeginDiffWrite(string path, StagedFile staged) {
+        IdeDocumentPageWork work = new IdeDocumentPageWork();
+        work.owner = this; work.host = app; work.root = root; work.workspace = documentWorkspace;
+        work.path = path; work.fullPath = staged.fullPath; work.stagedFullPath = staged.fullPath;
+        if (work.fullPath == "") { work.fullPath = AiStaging.ResolveFullPath(root, path); }
+        work.text = staged.stagedText; work.staged = staged; work.diffs = staged.diffs;
+        this.CaptureDiffTarget(work);
+        diffWriteWork = work; diffWritePending = true;
+        diffView.Disabled = true;
+        return work;
+    }
+
+    void CaptureDiffTarget(IdeDocumentPageWork work) {
+        int index = ZanIDE.FindTabByPath(tabs, work.fullPath);
+        if (index < 0) { index = ZanIDE.FindTabByPath(tabs, work.path); }
+        if (index < 0 || index >= tabs.Count) { return; }
+        TabRecord tab = tabs[index];
+        work.tab = tab; work.tabPath = tab.path; work.originalBody = tab.body;
+        if (editor.documentPath == tab.path) {
+            work.editorCaptured = true;
+            work.editorStamp = editor.TextStamp();
+            work.editorText = editor.GetText();
+        }
+    }
+
+    int DiffTargetIndex(IdeDocumentPageWork work) {
+        if (work.tab == null || work.tab.path != work.tabPath) { return -1; }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (tabs[i] == work.tab) { return i; }
+        }
+        return -1;
+    }
+
+    bool DiffTargetUnedited(IdeDocumentPageWork work) {
+        if (work.tab == null || work.tab.body != work.originalBody) { return false; }
+        if (editor.documentPath != work.tabPath) { return true; }
+        if (work.editorCaptured && editor.TextStamp() == work.editorStamp) { return true; }
+        string original = work.editorCaptured ? work.editorText : work.originalBody;
+        return DocBaseline.SameText(editor.GetText(), original);
+    }
+
+    void ApplyDiffWrite(IdeDocumentPageWork work) {
+        if (work.completed) { return; }
+        work.completed = true;
+        if (diffWriteWork == work) {
+            diffWriteWork = null; diffWritePending = false;
+            if (diffView != null) { diffView.Disabled = false; }
+        }
+        // Workspace retirement only rejects UI adoption; the authorized disk write still completed.
+        if (work.failure != "") { log.Add("> Diff: " + work.fullPath + ": " + work.failure); }
+        else {
+            StagedFile staged = AiStaging.Get(work.path);
+            if (staged != null && staged == work.staged && staged.fullPath == work.stagedFullPath
+            && staged.diffs == work.diffs && staged.stagedText == work.text) { staged.accepted = true; }
+            log.Add(ZanIDE.T("> Accepted AI changes: ", "> 已接受并落盘 AI 修改: ") + work.fullPath);
+        }
+        if (shuttingDown || closeRequested) { return; }
+        if (work.failure == "" && work.workspace == documentWorkspace && work.root == root) {
+            int index = this.DiffTargetIndex(work);
+            if (index >= 0) {
+                TabRecord tab = tabs[index];
+                docs.Note(tab.path, work.text, work.stamp);
+                if (this.DiffTargetUnedited(work)) {
+                    tab.body = work.text;
+                    tab.preparedBody = work.text; tab.preparedText = work.prepared;
+                    this.InvalidateCodeTabBinding(tab);
+                    if (index == activeTab.Get()) { this.UpdateActiveCodeTab(); }
+                } else {
+                    log.Add(ZanIDE.T("> Kept edits made while accepting AI changes: ",
+                    "> 保留接受 AI 修改期间的编辑: ") + tab.path);
+                }
+            }
+        }
+        app.InvalidatePreparation();
+        app.RequestRedraw();
+    }
+
+    void PrepareDocumentPages(App host, Rect body, string path) {
+        bool start = path == "@start";
+        bool diff = path.StartsWith("@diff:");
+        startPage.SetShown(start);
+        diffView.SetShown(diff);
+        if (start) {
+            startPage.UseApp(host); startPage.MeasureTree(host, body.width);
+            startPage.Arrange(body.x, body.y, body.width, body.height);
+        }
+        if (diff) {
+            diffView.BindPath(path);
+            diffView.UseApp(host); diffView.MeasureTree(host, body.width);
+            diffView.Arrange(body.x, body.y, body.width, body.height);
+        }
+    }
+}

@@ -7,16 +7,21 @@ using Gui.Widget;
 // 代码差异审查视图（@diff: 虚拟标签页）
 // 展示待审阅文件的路径、新增/删除统计、差异行清单，并提供接受/丢弃操作按钮
 public class DiffView : Control {
-    static DiffView current;
-    public static DiffView Current() { return current; }
-
+    public weak IdeDocumentPageOwner owner;
+    StagedFile preparedFile;
+    List<DiffLine> preparedDiffs;
+    bool preparedAccepted;
+    int preparedAdds;
+    int preparedDels;
+    bool prepared;
+    int actionRevision;
+    DiffViewEvents events;
     string targetPath;
     Label titleLabel;
     Label statsLabel;
     Button acceptBtn;
     Button rejectBtn;
     ListView<DiffLine> list;
-    int action; // 1 = accept, 2 = reject
 
     static string T(string en, string zh) {
         return Lang.Tr(en, zh);
@@ -25,9 +30,10 @@ public class DiffView : Control {
     public DiffView() {
         this.InitControl("diffView", 5);
         this.Class = "diffview-host";
-        DiffView.current = this;
+        name = "ide-diff-page";
         this.targetPath = "";
-        this.action = 0;
+        events = new DiffViewEvents();
+        events.owner = this;
 
         // 顶部工具栏
         Panel toolbar = Panel.Row();
@@ -44,15 +50,13 @@ public class DiffView : Control {
 
         acceptBtn = new Button(DiffView.T("Accept (落盘保存)", "接受此修改"));
         acceptBtn.Class = "primary small";
-        acceptBtn.Click += () => {
-            if (DiffView.current != null) { DiffView.current.action = 1; }
-        };
+        acceptBtn.name = "diff-accept";
+        acceptBtn.Click.AddS(events.Accept);
 
         rejectBtn = new Button(DiffView.T("Discard (丢弃改动)", "放弃此修改"));
         rejectBtn.Class = "small";
-        rejectBtn.Click += () => {
-            if (DiffView.current != null) { DiffView.current.action = 2; }
-        };
+        rejectBtn.name = "diff-reject";
+        rejectBtn.Click.AddS(events.Reject);
 
         toolbar.Add(titleLabel);
         toolbar.Add(statsLabel);
@@ -75,11 +79,26 @@ public class DiffView : Control {
         if (norm.StartsWith("@diff:")) {
             norm = norm.Substring(6, norm.Length - 6);
         }
-        if (norm == this.targetPath && list.data != null) { return; }
-        this.targetPath = norm;
-        this.action = 0;
-
         StagedFile sf = AiStaging.Get(norm);
+        if (prepared && norm == targetPath && sf == preparedFile
+        && (sf == null || (sf.diffs == preparedDiffs && sf.accepted == preparedAccepted
+        && sf.adds == preparedAdds && sf.dels == preparedDels))) { return; }
+        // Already queued clicks retain the old relay and cannot act on new content.
+        acceptBtn.Click.RemoveS(events.Accept);
+        rejectBtn.Click.RemoveS(events.Reject);
+        actionRevision = actionRevision + 1;
+        events = new DiffViewEvents();
+        events.owner = this;
+        events.revision = actionRevision;
+        acceptBtn.Click.AddS(events.Accept);
+        rejectBtn.Click.AddS(events.Reject);
+        targetPath = norm;
+        prepared = true;
+        preparedFile = sf;
+        preparedDiffs = sf != null ? sf.diffs : null;
+        preparedAccepted = sf != null && sf.accepted;
+        preparedAdds = sf != null ? sf.adds : 0;
+        preparedDels = sf != null ? sf.dels : 0;
         if (sf != null) {
             string title = "Diff: " + sf.path;
             if (sf.accepted) {
@@ -99,10 +118,11 @@ public class DiffView : Control {
         }
     }
 
-    public int TakeAction() {
-        int a = this.action;
-        this.action = 0;
-        return a;
+    void SubmitAction(Control sender, bool accept, int revision) {
+        IdeDocumentPageOwner target = owner;
+        if (target == null || revision != actionRevision || !this.StyleVisible()
+        || sender != (accept ? acceptBtn : rejectBtn)) { return; }
+        target.DiffViewAction(this, accept, targetPath);
     }
 
     public string CurrentPath() {

@@ -18,7 +18,7 @@ partial class ZanIDE {
     IdeDesignDocument displayedScene;
     IdeDesignDocument displayedFormCode;
     IdeDesignLoad designLoad;
-    int designLoadSequence;
+    UiWorkScope<ZanIDE, IdeDesignLoadSnapshot, IdeDesignLoadResult> designLoadScope;
     bool designStopping;
     bool designCaptureQueued;
     bool designWritesPausing;
@@ -83,7 +83,7 @@ partial class ZanIDE {
             if (designWorkers[i].drained.IsCompleted) { designWorkers.RemoveAt(i); }
         }
         if (leased) {
-            if (designLoad != null) { designLoad.work.cancelled.Store(1); designLoad = null; }
+            this.CancelDesignLoad();
             return;
         }
         for (int i = 0; i < deferredDesignSaves.Count; i = i + 1) {
@@ -110,14 +110,12 @@ partial class ZanIDE {
     }
 
     void CancelDesignLoad() {
-        if (designLoad != null) { designLoad.work.cancelled.Store(1); }
+        if (designLoadScope != null) { designLoadScope.CancelLatest(); }
         designLoad = null;
-        designLoadSequence = designLoadSequence + 1;
     }
 
     bool DesignLoadCurrent(IdeDesignLoad request) {
-        if (designStopping || designLoad != request || request.sequence != designLoadSequence
-            || request.work.cancelled.Load() != 0 || this.CodeNavigationBusy() || designWritesPausing
+        if (designStopping || designLoad != request || this.CodeNavigationBusy() || designWritesPausing
             || !this.DesignDocumentCurrent(request.document)) { return false; }
         int active = activeTab.Get();
         return active >= 0 && active < tabs.Count && tabs[active] == request.document.tab
@@ -139,107 +137,100 @@ partial class ZanIDE {
     void BeginDesignLoad(IdeDesignDocument document, int mode) {
         this.CancelDesignLoad();
         IdeDesignLoad request = new IdeDesignLoad();
-        request.work = this.TrackDesignWork(); request.document = document;
-        request.work.workspace = document.workspace; request.work.tabSet = document.tabSet;
-        request.work.tab = document.tab; request.work.path = document.path;
-        request.sequence = designLoadSequence; request.revision = document.revision; request.mode = mode;
+        request.document = document; request.revision = document.revision; request.mode = mode;
         request.path = document.path; request.body = document.tab.body; request.project = document.project;
         request.html = document.tab.designDoc;
         designLoad = request;
-        // 后台闭包只读取这些值与独立快照，不解引用 request.document/tab/Designer。
-        string path = request.path; string body = request.body; string project = request.project;
-        bool html = request.html;
-        bool scene = ZanIDE.IsScenePath(path);
-        DesignerDocumentSnapshot options = mode == 1 ? formDesigner.CaptureDocumentOptions() : null;
-        DesignerDocumentSnapshot localForm = document.form;
-        SceneDoc localScene = document.scene;
-        IdeDesignWork work = request.work;
-        if (mode == 3) { request.textRequest = formCodeEd.BeginTextLoad(path, CodeEditor.LangForName(path)); }
-        App host = app;
-        Task.Run(delegate () {
-            try {
-                if (work.cancelled.Load() != 0) { return; }
-                DesignerDocumentSnapshot form = null; DesignerDocumentSnapshot formBaseline = null;
-                ScenePreparedDocument sceneDocument = null; SceneDoc sceneBaseline = null;
-                CodeEditorPreparedText code = null;
-                List<UserComponent> components = null; List<string> bindVars = null; List<string> candidateHandlers = null;
-                string failure = "";
-                try {
-                    if (mode == 1) {
-                        if (localForm != null) { form = localForm.Copy(); }
-                        else {
-                            string json = html ? DesignerHtml.DocOf(HtmlParser.Parse(body, "")) : body;
-                            form = Designer.PrepareJson(json, options);
-                        }
-                        formBaseline = form.Copy();
-                        components = ZanIDE.ReadDesignComponents(project);
-                        string codeBehind = ZanIDE.CodeBehindPath(path);
-                        string cbText = File.Exists(codeBehind) ? File.ReadAllText(codeBehind) : "";
-                        bindVars = cbText != "" ? ZanIDE.ScanBindVars(cbText) : new List<string>();
-                        candidateHandlers = cbText != "" ? ZanIDE.ScanCandidateHandlers(cbText) : new List<string>();
-                    } else if (mode == 2) {
-                        sceneDocument = localScene != null ? new ScenePreparedDocument()
-                            : SceneDesigner.PrepareDoc(body);
-                        if (localScene != null) { sceneDocument.document = localScene.CaptureSnapshot(); }
-                        else if (sceneDocument.document == null) { sceneDocument.document = new SceneDoc(ZanIDE.SceneBaseName(path), 1280, 720); }
-                        sceneBaseline = sceneDocument.document.CaptureSnapshot();
-                    } else {
-                        string text = localForm != null ? (html ? localForm.ToHtml() : localForm.ToJson())
-                            : localScene != null ? localScene.ToHtml() : body;
-                        if (scene) { text = ZanIDE.GenSceneFile(ZanIDE.SceneBaseName(path), SceneDoc.Parse(text)); }
-                        code = CodeEditor.PrepareText(text);
-                    }
-                } catch (Exception error) {
-                    // 准备阶段失败在 UI 报告；不得让后台任务无声消失。
-                    failure = error.Message;
-                }
-                if (work.cancelled.Load() != 0) { return; }
-                host.Post(delegate () {
-                    if (!this.DesignLoadCurrent(request)) {
-                        if (designLoad == request) { designLoad = null; }
-                        return;
-                    }
-                    designLoad = null;
-                    if (failure != "") {
-                        log.Add("> Design load: " + failure);
-                        // 设计期错误也进错误列表（VS：设计器的错误出现在 Error List）。
-                        this.SetIdeError(path, failure);
-                        host.RequestRedraw();
-                        return;
-                    }
-                    if (mode == 1) {
-                        if (!formDesigner.ApplyPreparedDocument(form)) { return; }
-                        document.form = form.loadError ? null : formBaseline;
-                        formDesigner.SetUserComponents(components); formDesigner.SetBindVars(bindVars); formDesigner.SetCandidateHandlers(candidateHandlers);
-                        displayedForm = document; loadedFormPath = path; formCache = body;
-                        if (formDesigner.loadError) {
-                            log.Add("> Malformed design, opened blank: " + path + " (" + form.lastError + ")");
-                            this.SetIdeError(path, form.lastError);
-                        } else {
-                            this.ClearIdeDiagnostics(path);
-                        }
-                    } else if (mode == 2) {
-                        if (!sceneDesigner.ApplyPreparedDocument(sceneDocument)) { return; }
-                        document.scene = sceneDocument.loadError ? null : sceneBaseline;
-                        displayedScene = document; loadedScenePath = path; sceneCache = body;
-                        SceneDesigner.assetsDir = ZanIDE.AssetsDir(project);
-                        if (sceneDesigner.loadError) {
-                            log.Add("> Malformed scene, opened blank: " + path + " (" + sceneDocument.lastError + ")");
-                            this.SetIdeError(path, sceneDocument.lastError);
-                        } else {
-                            this.ClearIdeDiagnostics(path);
-                        }
-                    } else {
-                        if (!formCodeEd.ApplyPreparedText(request.textRequest, code)) { return; }
-                        displayedFormCode = document; formCodeLoaded = path;
-                    }
-                    host.RequestRedraw();
-                });
-            } finally {
-                // 关闭等待此屏障，与 UI 消息泵是否还处理 Post 无关。
-                work.drained.TrySetResult(true);
+        IdeDesignLoadSnapshot snapshot = new IdeDesignLoadSnapshot();
+        snapshot.mode = mode; snapshot.path = request.path; snapshot.body = request.body;
+        snapshot.project = request.project; snapshot.html = request.html;
+        snapshot.scenePath = ZanIDE.IsScenePath(request.path);
+        snapshot.options = mode == 1 ? formDesigner.CaptureDocumentOptions() : null;
+        // Stored baselines are immutable: edits replace them with new captures.
+        // The worker copies before preparing a mutable result; no UI crosses.
+        snapshot.form = document.form; snapshot.scene = document.scene;
+        if (mode == 3) { request.textRequest = formCodeEd.BeginTextLoad(request.path, CodeEditor.LangForName(request.path)); }
+        if (designLoadScope == null) {
+            designLoadScope = new UiWorkScope<ZanIDE, IdeDesignLoadSnapshot, IdeDesignLoadResult>(app, this);
+        }
+        designLoadScope.StartLatest(snapshot, ZanIDE.PrepareDesignLoad,
+            (ZanIDE owner) => {
+                if (owner.DesignLoadCurrent(request)) { return true; }
+                if (owner.designLoad == request) { owner.designLoad = null; }
+                return false;
+            },
+            (ZanIDE owner, IdeDesignLoadResult result) => { owner.ApplyDesignLoad(request, result); },
+            (ZanIDE owner, Exception failure) => {
+                owner.designLoad = null;
+                owner.log.Add("> Design load: " + failure.Message);
+                owner.SetIdeError(request.path, failure.Message);
+                owner.app.RequestRedraw();
+            });
+    }
+
+    // Worker entry: immutable data only. Domain malformed-document results
+    // remain successful prepared values; thrown preparation failures go to UI.
+    static IdeDesignLoadResult PrepareDesignLoad(IdeDesignLoadSnapshot snapshot, CancellationToken token) {
+        token.ThrowIfCancellationRequested();
+        IdeDesignLoadResult result = new IdeDesignLoadResult();
+        if (snapshot.mode == 1) {
+            if (snapshot.form != null) { result.form = snapshot.form.Copy(); }
+            else {
+                string json = snapshot.html ? DesignerHtml.DocOf(HtmlParser.Parse(snapshot.body, "")) : snapshot.body;
+                result.form = Designer.PrepareJson(json, snapshot.options);
             }
-        });
+            result.formBaseline = result.form.Copy();
+            token.ThrowIfCancellationRequested();
+            result.components = ZanIDE.ReadDesignComponents(snapshot.project);
+            string codeBehind = ZanIDE.CodeBehindPath(snapshot.path);
+            string cbText = File.Exists(codeBehind) ? File.ReadAllText(codeBehind) : "";
+            result.bindVars = cbText != "" ? ZanIDE.ScanBindVars(cbText) : new List<string>();
+            result.candidateHandlers = cbText != "" ? ZanIDE.ScanCandidateHandlers(cbText) : new List<string>();
+        } else if (snapshot.mode == 2) {
+            result.scene = snapshot.scene != null ? new ScenePreparedDocument() : SceneDesigner.PrepareDoc(snapshot.body);
+            if (snapshot.scene != null) { result.scene.document = snapshot.scene.CaptureSnapshot(); }
+            else if (result.scene.document == null) {
+                result.scene.document = new SceneDoc(ZanIDE.SceneBaseName(snapshot.path), 1280, 720);
+            }
+            result.sceneBaseline = result.scene.document.CaptureSnapshot();
+        } else {
+            string text = snapshot.form != null ? (snapshot.html ? snapshot.form.ToHtml() : snapshot.form.ToJson())
+                : snapshot.scene != null ? snapshot.scene.ToHtml() : snapshot.body;
+            if (snapshot.scenePath) { text = ZanIDE.GenSceneFile(ZanIDE.SceneBaseName(snapshot.path), SceneDoc.Parse(text)); }
+            result.code = CodeEditor.PrepareText(text);
+        }
+        token.ThrowIfCancellationRequested();
+        return result;
+    }
+
+    void ApplyDesignLoad(IdeDesignLoad request, IdeDesignLoadResult result) {
+        designLoad = null;
+        IdeDesignDocument document = request.document;
+        string path = request.path;
+        if (request.mode == 1) {
+            if (!formDesigner.ApplyPreparedDocument(result.form)) { return; }
+            document.form = result.form.loadError ? null : result.formBaseline;
+            formDesigner.SetUserComponents(result.components); formDesigner.SetBindVars(result.bindVars);
+            formDesigner.SetCandidateHandlers(result.candidateHandlers);
+            displayedForm = document; loadedFormPath = path; formCache = request.body;
+            if (formDesigner.loadError) {
+                log.Add("> Malformed design, opened blank: " + path + " (" + result.form.lastError + ")");
+                this.SetIdeError(path, result.form.lastError);
+            } else { this.ClearIdeDiagnostics(path); }
+        } else if (request.mode == 2) {
+            if (!sceneDesigner.ApplyPreparedDocument(result.scene)) { return; }
+            document.scene = result.scene.loadError ? null : result.sceneBaseline;
+            displayedScene = document; loadedScenePath = path; sceneCache = request.body;
+            SceneDesigner.assetsDir = ZanIDE.AssetsDir(request.project);
+            if (sceneDesigner.loadError) {
+                log.Add("> Malformed scene, opened blank: " + path + " (" + result.scene.lastError + ")");
+                this.SetIdeError(path, result.scene.lastError);
+            } else { this.ClearIdeDiagnostics(path); }
+        } else {
+            if (!formCodeEd.ApplyPreparedText(request.textRequest, result.code)) { return; }
+            displayedFormCode = document; formCodeLoaded = path;
+        }
+        app.RequestRedraw();
     }
 
     bool FormDesignReady() {
@@ -469,6 +460,7 @@ partial class ZanIDE {
         // 可在 shuttingDown 已置位后捕获；不得丢掉最后一个 UI 事件的编辑。
         this.CaptureDesignEdits();
         this.CancelDesignLoad();
+        if (designLoadScope != null) { designLoadScope.Close(); }
         designStopping = true;
         for (int i = 0; i < designWorkers.Count; i = i + 1) {
             IdeDesignWork work = designWorkers[i];
@@ -479,6 +471,7 @@ partial class ZanIDE {
     // 主侧先排空/结束导航磁盘事务，再调用此方法放行最后的独立保存快照。
     async void DrainDesignWorkAsync() {
         this.ResumeDesignWrites();
+        if (designLoadScope != null) { await designLoadScope.DrainAsync(); }
         for (int i = 0; i < designWorkers.Count; i = i + 1) {
             IdeDesignWork work = designWorkers[i];
             await work.drained.Task;

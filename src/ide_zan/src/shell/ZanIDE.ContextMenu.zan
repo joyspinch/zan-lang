@@ -11,32 +11,44 @@ using Gui.Component;
 using Game.Scene;
 using Gui.Backend;
 
+// Menu callbacks borrow the shell and its window; retaining a menu must not retain the IDE.
+class IdeContextMenuAction {
+    public weak ZanIDE Owner;
+    public weak App Host;
+    public int MenuKind;
+    public int Choice;
+
+    public void Run() {
+        ZanIDE ide = Owner;
+        App app = Host;
+        if (ide != null && app != null) { ide.RunContextMenuAction(app, MenuKind, Choice); }
+    }
+}
+
+class IdeContextMenuDismissed {
+    public weak ZanIDE Owner;
+    public weak App Host;
+    public int MenuKind;
+
+    public void Run(Control sender) {
+        ZanIDE ide = Owner;
+        App app = Host;
+        if (ide != null && app != null && sender is ContextMenu) {
+            ide.DismissContextMenu(app, MenuKind, (ContextMenu)sender);
+        }
+    }
+}
+
 partial class ZanIDE {
     void RenderContextMenu(App app) {
-        if (ctxKind == 0) { return; }
-        if (ctxKind == 7) {
-            // 任务图节点的右键菜单：小赞住在独立窗口时那扇窗自己画；
-            // 住在主窗口右侧的 Agent 面板时由这里画（坐标是主窗口的
-            // 客户区坐标，菜单必须画在同一扇窗里）。
-            if (this.AiInWindow()) { return; }
-            List<string> aiLabels = new List<string>();
-            this.AiGraphMenuLabels(aiLabels);
-            app.PushId("AiGraphContextMenu");
-            app.BlockHitsMenu();
-            int aiChosen = ContextMenu.Render(app, ctxX, ctxY, aiLabels);
-            app.PopId();
-            if (aiChosen == 0 - 2) {
-                ctxKind = 0;
-                app.RequestRedraw();
-            } else if (aiChosen >= 0) {
-                this.AiGraphMenu(ctxTaskId, aiChosen);
-                ctxKind = 0;
-                app.RequestRedraw();
-            }
-            return;
-        }
+        if (ctxKind == 0 || (ctxMenu != null && ctxMenu.IsOpen() && ctxMenuApp == app)) { return; }
+        if (ctxKind < 1 || ctxKind > 7) { ctxKind = 0; return; }
+        // 独立小赞窗口由 AiAssistantWindow 在同一个 OverlayHost 入口打开菜单。
+        if (ctxKind == 7 && this.AiInWindow()) { return; }
         List<string> cmLabels = new List<string>();
-        if (ctxKind == 1) {
+        if (ctxKind == 7) {
+            this.AiGraphMenuLabels(cmLabels);
+        } else if (ctxKind == 1) {
             cmLabels.Add(ZanIDE.T("New File", "新建文件"));
             cmLabels.Add(ZanIDE.T("New Folder", "新建文件夹"));
             cmLabels.Add("-");
@@ -105,46 +117,79 @@ partial class ZanIDE {
                 cmLabels.Add("-");
             }
             cmLabels.Add(ZanIDE.T("Copy Name", "复制名称"));
-        } else if (ctxKind == 8) {
-            // 功能区溢出菜单：文案在打开「»」时定下。
-            for (int i = 0; i < ribbonOverflowLabels.Count; i = i + 1) {
-                cmLabels.Add(ribbonOverflowLabels[i]);
-            }
         }
-        app.PushId("ZanIdeContextMenu");
-        app.BlockHitsMenu();
-        int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
-        app.PopId();
-        if (ctxKind == 8) {
-            // 功能区溢出菜单：左键点「»」打开的那一帧带着那次点击，
-            // 而菜单开在按钮下方（点击落在菜单外）——先跳过这一帧，
-            // 否则菜单同帧自关。
-            if (!ribbonOverflowArm) {
-                ribbonOverflowArm = true;
-                app.RequestRedraw();
-                return;
+        int openingKind = ctxKind;
+        ContextMenu menu = this.CreateContextMenu(app, openingKind, cmLabels);
+        ctxMenu = menu;
+        ctxMenuApp = app;
+        menu.ShowAt(app, ctxX, ctxY);
+        // Closing a previous window's menu may notify synchronously; restore only a live opening.
+        if (ctxMenu == menu && menu.IsOpen() && app.overlayHost.ActiveRoot() == menu) {
+            ctxKind = openingKind;
+        }
+    }
+
+    void CloseIdeContextMenu() {
+        ContextMenu menu = ctxMenu;
+        App host = ctxMenuApp;
+        if (menu != null && host != null) { host.overlayHost.Hide(menu); }
+        if (ctxMenu == menu) { ctxMenu = null; ctxMenuApp = null; }
+        ctxKind = 0;
+    }
+
+    ContextMenu CreateContextMenu(App app, int menuKind, List<string> labels) {
+        ContextMenu menu = new ContextMenu();
+        IdeContextMenuDismissed dismissed = new IdeContextMenuDismissed();
+        dismissed.Owner = this;
+        dismissed.Host = app;
+        dismissed.MenuKind = menuKind;
+        menu.Dismissed.AddS(dismissed.Run);
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            if (ContextMenu.IsSep(labels[i])) {
+                menu.AddSeparator();
+                continue;
             }
-            if (chosen == 0 - 2) {
-                ctxKind = 0;
-                Ribbon.SetOverflowMenuOpen(false);
-                app.RequestRedraw();
-            } else if (chosen >= 0) {
-                int act = 0 - 1;
-                if (chosen < ribbonOverflowActions.Count) {
-                    act = ribbonOverflowActions[chosen];
-                }
-                ctxKind = 0;
-                Ribbon.SetOverflowMenuOpen(false);
-                app.RequestRedraw();
-                if (act >= 0) { this.RunRibbonCommand(app, act); }
-            }
+            IdeContextMenuAction action = new IdeContextMenuAction();
+            action.Owner = this;
+            action.Host = app;
+            action.MenuKind = menuKind;
+            action.Choice = i;
+            menu.AddItem(labels[i], action.Run);
+        }
+        return menu;
+    }
+
+    void DismissContextMenu(App app, int menuKind, ContextMenu menu) {
+        if (menuKind == 100) {
+            if (coCtxMenu != menu) { return; }
+            this.ClearOutputContextMenuState();
+        } else if (menuKind == 101) {
+            if (codeActionMenu != menu) { return; }
+            this.CloseCodeActionMenuState();
+        } else {
+            if (menuKind < 1 || menuKind > 7 || ctxMenu != menu) { return; }
+            ctxMenu = null;
+            ctxMenuApp = null;
+            if (ctxKind == menuKind) { ctxKind = 0; }
+        }
+        app.RequestRedraw();
+    }
+
+    void RunContextMenuAction(App app, int menuKind, int chosen) {
+        if (menuKind == 100) {
+            this.ApplyOutputContextMenu(app, chosen);
             return;
         }
-        if (chosen == 0 - 2) {
-            ctxKind = 0;
+        if (menuKind == 101) {
+            this.ApplyCodeAction(chosen);
+            this.CloseCodeActionMenuState();
             app.RequestRedraw();
-        } else if (chosen >= 0) {
-            if (ctxKind == 1) {
+            return;
+        }
+        if (menuKind < 1 || menuKind > 7) { return; }
+        if (menuKind == 7) {
+            this.AiGraphMenu(ctxTaskId, chosen);
+        } else if (ctxKind == 1) {
                 if (chosen == 0 && dlg == null) {
                     dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
                     dlgMode = 2;
@@ -316,8 +361,9 @@ partial class ZanIDE {
                     }
                 }
             }
-            ctxKind = 0;
-            app.RequestRedraw();
-        }
+        ctxMenu = null;
+        ctxMenuApp = null;
+        ctxKind = 0;
+        app.RequestRedraw();
     }
 }

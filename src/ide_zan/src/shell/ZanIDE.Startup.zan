@@ -26,7 +26,7 @@ partial class ZanIDE {
         Gui.Component.WebView.WebViewBootstrap.Install();
         Gui.Component.CefBrowser.CefControlBootstrap.Install();
         IdeDesignedRegistry.Install();
-        app.UseAppCss(ZanIDE.PageCss());
+        app.UseAppCss(app.AppCss() + "\n" + ZanIDE.PageCss());
         InitWizardCatalogs();
         InitDialogState();
         InitDocState();
@@ -40,10 +40,13 @@ partial class ZanIDE {
         InitPanelsAndDock(cfg);
         InitGitPanel();
         InitSidebarState();
+        InitRunState(cfg);
         InitDockPanels(form);
+        this.SyncEditorTabs();
+        this.InitializeRibbonView();
         InitHelpPanel();
         InitAiState();
-        InitRunState(cfg);
+        aiPanel.SetModelSelect(aiModelSel);
         IdeUpdate.CheckOnStartup();
 
         lastPresent = 0;
@@ -59,6 +62,8 @@ partial class ZanIDE {
         int cfgW = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winW", 1080), 640, 4000);
         int cfgH = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "winH", 720), 480, 3000);
         app = form.GetApp();
+        ThemeSettings.Enable(app);
+        Gui.Backend.UiDriver.Enable(app);
         app.themeTipText = ZanIDE.T("Theme", "主题");
         app.pinTipText = ZanIDE.T("Pin on top", "置顶");
         app.minimizeTipText = ZanIDE.T("Minimize", "最小化");
@@ -67,24 +72,12 @@ partial class ZanIDE {
         app.closeTipText = ZanIDE.T("Close", "关闭");
         app.SetPartialFrames(ZanIDE.CfgInt(cfg, "partialFrames", 0) == 1);
         app.SetRenderBackend(ZanIDE.CfgClamp(
-            ZanIDE.CfgInt(cfg, "renderBackend", 0), 0, 2));
-        // 首启默认亮色（"light"）：配置缺失 / skin 键缺失 / skin 键为空
-        // 都落到亮色基线；用户在标题栏选择器挑过皮肤后由 SaveSettings
-        // 以名字落盘，此后永远跟随用户的选择。
-        string skinName = ZanIDE.CfgStr(cfg, "skin", "light");
-        if (skinName == "") { skinName = "light"; }
-        bool skinNumeric = true;
-        for (int si = 0; si < skinName.Length; si = si + 1) {
-            if (!ZanIDE.IsDigit(skinName.Substring(si, 1))) { skinNumeric = false; break; }
-        }
-        if (!skinNumeric) {
-            app.ApplySkinName(skinName);
-        } else {
-            // 旧配置只有数字索引：按旧索引恢复（内置包 order 未变过，
-            // 索引仍指向用户当初选的皮肤），关窗时 SaveSettings 会以
-            // 皮肤名重写，完成到名字持久化的升级。
-            app.ApplySkin(ZanIDE.CfgInt(cfg, "skin", 1));
-        }
+        ZanIDE.CfgInt(cfg, "renderBackend", 0), 0, 2));
+        // 皮肤按稳定名字持久化。旧集合已经移除；缺失、空值、旧数字索引
+        // 或不可用的皮肤名统一回到浅色，避免旧索引误指向新集合。
+        string skinName = ZanIDE.CfgStr(cfg, "skin", Skin.DefaultName());
+        if (app.SkinIndexOf(skinName) < 0) { skinName = Skin.DefaultName(); }
+        app.ApplySkinName(skinName);
         winOpacity = ZanIDE.CfgClamp(ZanIDE.CfgInt(cfg, "opacity", 100), 30, 100);
         app.SetWindowOpacity(winOpacity);
         wallPath = ZanIDE.CfgStr(cfg, "wallpaper", "");
@@ -140,8 +133,8 @@ partial class ZanIDE {
         log = new List<string>();
         if (ZanIDE.pendingSyncNote > 0) {
             log.Add("> " + ZanIDE.T("Update applied: ", "更新已应用：")
-                + Convert.ToString(ZanIDE.pendingSyncNote)
-                + ZanIDE.T(" file(s) from the last sync.", " 个文件（来自上次同步）。"));
+            + Convert.ToString(ZanIDE.pendingSyncNote)
+            + ZanIDE.T(" file(s) from the last sync.", " 个文件（来自上次同步）。"));
             ZanIDE.pendingSyncNote = 0;
         }
         if (haveProject) {
@@ -153,7 +146,7 @@ partial class ZanIDE {
             string want = "gpu";
             if (app.RenderBackendMode() == RenderBackend.Auto()) { want = "auto"; }
             log.Add("> renderer: renderBackend=" + want
-                + ", active " + app.RenderBackendName());
+            + ", active " + app.RenderBackendName());
         }
 
         ZanIDE.uiLang = ZanIDE.ReadUiLang();
@@ -165,178 +158,178 @@ partial class ZanIDE {
         List<string> compLangDirs = new List<string> {
             "packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/lang",
             "../packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/lang" };
-        Lang.LoadDirs(compLangDirs);
-        Lang.Set(ZanIDE.uiLang == "zh" ? "" : ZanIDE.uiLang);
-        Wizard.lang = ZanIDE.uiLang;
-        Designer.lang = ZanIDE.uiLang;
-        SceneDesigner.lang = ZanIDE.uiLang;
-        ZanIDE.ApplyCaptionTips(app);
-        ribbonTabs = ZanIDE.RibbonTabs();
-        ribbonTab = new SignalInt(0);
-    }
+            Lang.LoadDirs(compLangDirs);
+            Lang.Set(ZanIDE.uiLang == "zh" ? "" : ZanIDE.uiLang);
+            Wizard.lang = ZanIDE.uiLang;
+            Designer.lang = ZanIDE.uiLang;
+            SceneDesigner.lang = ZanIDE.uiLang;
+            ZanIDE.ApplyCaptionTips(app);
+            ribbonTabs = ZanIDE.RibbonTabs();
+            ribbonTab = 0;
+        }
 
-    void InitWizardCatalogs() {
-        catNames = new List<string>{
-            "Console", "Library", "Window App", "WebView", "Server", "Custom" };
+        void InitWizardCatalogs() {
+            catNames = new List<string>{
+                "Console", "Library", "Window App", "WebView", "Server", "Custom" };
 
-        tpls = new List<Tpl>();
-        wizTpls = new List<WizardTemplate>();
+                tpls = new List<Tpl>();
+                wizTpls = new List<WizardTemplate>();
 
-        fileItems = new List<WizardItem>{
-            new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
-            new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
-            new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
-            new WizardItem(ZanIDE.T("GUI Window (Flow)", "GUI 窗口 (流式布局)"), "layout", ZanIDE.T("Window: creates Name.html (flow layout) + Name.zan (code-behind).", "窗口：创建 Name.html（声明式流式布局）+ Name.zan（代码后置）。")),
-            new WizardItem(ZanIDE.T("GUI Window (Free)", "GUI 窗口 (自由布局)"), "maximize", ZanIDE.T("Window: creates Name.html (free layout) + Name.zan (code-behind).", "窗口：创建 Name.html（绝对定位自由画布）+ Name.zan（代码后置）。")),
-            new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.html (game scene layout) + Name.zan (code-behind).", "场景：创建 Name.html（游戏场景布局）+ Name.zan（代码后置）。")),
-            new WizardItem(ZanIDE.T("Lua Script", "Lua 脚本"), "file", ZanIDE.T("Script: creates Name.lua, loaded by a Zan host through System.Scripting.Lua (not run on its own).", "脚本：创建 Name.lua，由 Zan 宿主通过 System.Scripting.Lua 加载（不能单独运行）。")),
-            new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
-            new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
-    }
+                fileItems = new List<WizardItem>{
+                    new WizardItem(ZanIDE.T("Program (Main)", "程序 (Main)"), "arrow-right", ZanIDE.T("Code file: class with a static Main() entry point.", "代码文件：带静态 Main() 入口的类。")),
+                    new WizardItem(ZanIDE.T("Class", "类"), "grid", ZanIDE.T("Code file: an empty class with fields and methods.", "代码文件：带字段和方法的空类。")),
+                    new WizardItem(ZanIDE.T("Interface", "接口"), "copy", ZanIDE.T("Code file: a base class defining a contract.", "代码文件：定义契约的基类。")),
+                    new WizardItem(ZanIDE.T("GUI Window (Flow)", "GUI 窗口 (流式布局)"), "layout", ZanIDE.T("Window: creates Name.html (flow layout) + Name.zan (code-behind).", "窗口：创建 Name.html（声明式流式布局）+ Name.zan（代码后置）。")),
+                    new WizardItem(ZanIDE.T("GUI Window (Free)", "GUI 窗口 (自由布局)"), "maximize", ZanIDE.T("Window: creates Name.html (free layout) + Name.zan (code-behind).", "窗口：创建 Name.html（绝对定位自由画布）+ Name.zan（代码后置）。")),
+                    new WizardItem(ZanIDE.T("Game Scene (Designer)", "游戏场景 (设计器)"), "maximize", ZanIDE.T("Scene: creates Name.html (game scene layout) + Name.zan (code-behind).", "场景：创建 Name.html（游戏场景布局）+ Name.zan（代码后置）。")),
+                    new WizardItem(ZanIDE.T("Lua Script", "Lua 脚本"), "file", ZanIDE.T("Script: creates Name.lua, loaded by a Zan host through System.Scripting.Lua (not run on its own).", "脚本：创建 Name.lua，由 Zan 宿主通过 System.Scripting.Lua 加载（不能单独运行）。")),
+                    new WizardItem(ZanIDE.T("Empty File", "空文件"), "file", ZanIDE.T("Code file: a blank .zan file.", "代码文件：空白的 .zan 文件。")),
+                    new WizardItem(ZanIDE.T("Folder", "文件夹"), "folder", ZanIDE.T("Creates a new folder under src/.", "在 src/ 下创建一个新文件夹。")) };
+                }
 
-    void InitDialogState() {
-        dlg = null;
-        dlgMode = 0;
-        pathPicker = new FilePicker();
-        ChildWindows.RegisterPicker(pathPicker);
-        pathPickerOwner = 0;
-        catSel = new SignalInt(0);
-        pSel = new SignalInt(0);
-        fSel = new SignalInt(0);
-        fSizeSel = new SignalInt(-1);
-        fSizeWIn = new Input(ZanIDE.T("width", "宽"));
-        fSizeWIn.SetText("480");
-        fSizeHIn = new Input(ZanIDE.T("height", "高"));
-        fSizeHIn.SetText("520");
-        pSizeSel = new SignalInt(-1);
-        pSizeWIn = new Input(ZanIDE.T("width", "宽"));
-        pSizeHIn = new Input(ZanIDE.T("height", "高"));
-        pSizeSeededFor = 0 - 1;
-        pDevSel = new SignalInt(0);
-        pDevRot = new SignalInt(0);
+                void InitDialogState() {
+                    dlg = null;
+                    dlgMode = 0;
+                    pathPicker = new FilePicker();
+                    ChildWindows.RegisterPicker(pathPicker);
+                    pathPickerOwner = 0;
+                    catSel = new SignalInt(0);
+                    pSel = new SignalInt(0);
+                    fSel = new SignalInt(0);
+                    fSizeSel = new SignalInt(-1);
+                    fSizeWIn = new Input(ZanIDE.T("width", "宽"));
+                    fSizeWIn.SetText("480");
+                    fSizeHIn = new Input(ZanIDE.T("height", "高"));
+                    fSizeHIn.SetText("520");
+                    pSizeSel = new SignalInt(-1);
+                    pSizeWIn = new Input(ZanIDE.T("width", "宽"));
+                    pSizeHIn = new Input(ZanIDE.T("height", "高"));
+                    pSizeSeededFor = 0 - 1;
+                    pDevSel = new SignalInt(0);
+                    pDevRot = new SignalInt(0);
 
-        platformGroups = new List<string>{ "Windows", "Linux", "macOS", "Android",
-            "HarmonyOS" };
-        // id 与 ZanIDE.PlatformCsvIds 一一同位（列主序）；TplSupports
-        // 按 id 的 OS 前缀对照模板 platforms= 置灰不可支持的 chip。
-        platforms = new List<WizardTarget>{
-            new WizardTarget("x64", 1, "windows-x64"), new WizardTarget("ARM64", 1, "windows-arm64"),
-            new WizardTarget("x64", 1, "linux-x64"), new WizardTarget("ARM64", 1, "linux-arm64"),
-            new WizardTarget("x64", 1, "macos-x64"), new WizardTarget("ARM64", 1, "macos-arm64"),
-            new WizardTarget("x64", 0, "android-x64"), new WizardTarget("ARM64", 0, "android-arm64"),
-            new WizardTarget("x64", 0, "ohos-x64"), new WizardTarget("ARM64", 0, "ohos-arm64") };
-        pNameInput = new Input(ZanIDE.T("project name", "项目名称"));
-        pNameInput.SetText("NewProject");
-        pLocInput = new Input(ZanIDE.T("location", "位置"));
-        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
-        fNameInput = new Input(ZanIDE.T("file name", "文件名称"));
-        fNameInput.SetText("NewFile");
+                    platformGroups = new List<string>{ "Windows", "Linux", "macOS", "Android",
+                    "HarmonyOS" };
+                    // id 与 ZanIDE.PlatformCsvIds 一一同位（列主序）；TplSupports
+                    // 按 id 的 OS 前缀对照模板 platforms= 置灰不可支持的 chip。
+                    platforms = new List<WizardTarget>{
+                        new WizardTarget("x64", 1, "windows-x64"), new WizardTarget("ARM64", 1, "windows-arm64"),
+                        new WizardTarget("x64", 1, "linux-x64"), new WizardTarget("ARM64", 1, "linux-arm64"),
+                        new WizardTarget("x64", 1, "macos-x64"), new WizardTarget("ARM64", 1, "macos-arm64"),
+                        new WizardTarget("x64", 0, "android-x64"), new WizardTarget("ARM64", 0, "android-arm64"),
+                        new WizardTarget("x64", 0, "ohos-x64"), new WizardTarget("ARM64", 0, "ohos-arm64") };
+                        pNameInput = new Input(ZanIDE.T("project name", "项目名称"));
+                        pNameInput.SetText("NewProject");
+                        pLocInput = new Input(ZanIDE.T("location", "位置"));
+                        pLocInput.SetText(ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome()));
+                        fNameInput = new Input(ZanIDE.T("file name", "文件名称"));
+                        fNameInput.SetText("NewFile");
 
-        ctxKind = 0;
-        ctxX = 0;
-        ctxY = 0;
-        ctxTarget = 0 - 1;
-        ctxTaskId = "";
+                        ctxKind = 0;
+                        ctxX = 0;
+                        ctxY = 0;
+                        ctxTarget = 0 - 1;
+                        ctxTaskId = "";
 
-        tmplCatSel = new SignalInt(0);
-        tmplNameInput = new Input(ZanIDE.T("template name", "模板名称"));
-        tmplNameInput.SetText("MyTemplate");
-        saveItems = new List<WizardItem>{
-            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
-            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
-            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
-            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
-            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
-            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
-    }
+                        tmplCatSel = new SignalInt(0);
+                        tmplNameInput = new Input(ZanIDE.T("template name", "模板名称"));
+                        tmplNameInput.SetText("MyTemplate");
+                        saveItems = new List<WizardItem>{
+                            new WizardItem("Console", "menu", ZanIDE.T("Save under the Console category.", "保存到 Console 分类下。")),
+                            new WizardItem("Library", "grid", ZanIDE.T("Save under the Library category.", "保存到 Library 分类下。")),
+                            new WizardItem("Window App", "maximize", ZanIDE.T("Save under the Window App category.", "保存到 Window App 分类下。")),
+                            new WizardItem("WebView", "folder", ZanIDE.T("Save under the WebView category.", "保存到 WebView 分类下。")),
+                            new WizardItem("Server", "arrow-right", ZanIDE.T("Save under the Server category.", "保存到 Server 分类下。")),
+                            new WizardItem("Custom", "file", ZanIDE.T("Save under the Custom category.", "保存到 Custom 分类下。")) };
+                        }
 
-    void InitFindReplaceState() {
-        findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
-        fifHits = new List<SearchHit>();
-        fifQuery = "";
-        fifRepl = "";
-        fifSel = 0 - 1;
-        renameWord = "";
-        // 查找 / 替换条和跳转 / 重命名 / 全项目搜索那个小输入条都是保留
-        // 控件：字段是标准 Input，点击能落进去，光标、选择和输入法状态
-        // 在帧之间也留得住。
-        findBar = FindBar.Create();
-        refList = new RefListPopup();
-        refAnchorLine = 0;
-        quickPrompt = new QuickPrompt();
-        promptMode = 0;
-        symbolList = new SymbolListPopup();
-        symbolQuery = "";
-        symbolHits = new List<LspWorkspaceSymbol>();
-        startPage = new StartPage();
-        diffView = new DiffView();
-        compactHeaderView = new CompactHeader();
-    }
+                        void InitFindReplaceState() {
+                            findMode = 0;    // 0=hidden, 1=find, 2=replace, 3=gotoLine, 4=bpCondition, 5=rename,
+                            fifHits = new List<SearchHit>();
+                            fifQuery = "";
+                            fifRepl = "";
+                            fifSel = 0 - 1;
+                            renameWord = "";
+                            // 查找 / 替换条和跳转 / 重命名 / 全项目搜索那个小输入条都是保留
+                            // 控件：字段是标准 Input，点击能落进去，光标、选择和输入法状态
+                            // 在帧之间也留得住。
+                            findBar = FindBar.Create();
+                            refList = new RefListPopup();
+                            refAnchorLine = 0;
+                            quickPrompt = new QuickPrompt();
+                            promptMode = 0;
+                            symbolList = new SymbolListPopup();
+                            symbolQuery = "";
+                            symbolHits = new List<LspWorkspaceSymbol>();
+                            startPage = new StartPage();
+                            diffView = new DiffView();
+                            compactHeaderView = new CompactHeader();
+                        }
 
-    void InitPublishState() {
-        pubWin = null;
-        pubPending = false;
-        pubPlatformOptions = new List<PublishTargetOption>();
-        pubRoot = "";
-        pubPacked = false;
-        pubBusy = false;
-        pubStep = null;
-        pubStartMs = 0;
-        pubPackStartMs = 0;
-        pubExes = new List<string>();
-        pubLogLen = 0;
-        pubPacking = false;
-        pubDoneAsk = null;
-        pubDoneTarget = "";
-    }
+                        void InitPublishState() {
+                            pubWin = null;
+                            pubPending = false;
+                            pubPlatformOptions = new List<PublishTargetOption>();
+                            pubRoot = "";
+                            pubPacked = false;
+                            pubBusy = false;
+                            pubStep = null;
+                            pubStartMs = 0;
+                            pubPackStartMs = 0;
+                            pubExes = new List<string>();
+                            pubLogLen = 0;
+                            pubPacking = false;
+                            pubDoneAsk = null;
+                            pubDoneTarget = "";
+                        }
 
-    void InitEditorAppearance() {
-        cfgWin = null;
-        marketplaceWin = null;
-        marketplaceRetryBuild = false;
-        edThemeIdx = ZanIDE.ReadEditorTheme();
-        edFontPx = ZanIDE.ReadEditorFont();
-        compactHeader = ZanIDE.ReadEditorCompactHeader();
-        defFontPx = app.theme.fontSizeMedium;
-        settingsWindow = null;
-    }
+                        void InitEditorAppearance() {
+                            cfgWin = null;
+                            marketplaceWin = null;
+                            marketplaceRetryBuild = false;
+                            edThemeIdx = ZanIDE.ReadEditorTheme();
+                            edFontPx = ZanIDE.ReadEditorFont();
+                            compactHeader = ZanIDE.ReadEditorCompactHeader();
+                            defFontPx = app.theme.fontSizeMedium;
+                            settingsWindow = null;
+                        }
 
-    void InitHelpBrowser() {
-        pendingGotoLine = 0 - 1;
-        pendingGotoCol = 0;
-    }
+                        void InitHelpBrowser() {
+                            pendingGotoLine = 0 - 1;
+                            pendingGotoCol = 0;
+                        }
 
-    void InitOutputSelection() {
-        coCtxOpen = false;
-        coCtxX = 0;
-        coCtxY = 0;
-        coCtxRow = 0 - 1;
-    }
+                        void InitOutputSelection() {
+                            coCtxOpen = false;
+                            coCtxX = 0;
+                            coCtxY = 0;
+                            coCtxRow = 0 - 1;
+                        }
 
-    void InitDebugState() {
-        dbgState = 0;
-        dbgExecLine = -1;
-        dbg = null;
-        dbgConsole = new List<string>();
-        dbgVarInfo = new List<DbgVar>();
-        dbgStack = new List<DbgFrame>();
-        dbgPanelTab = new SignalInt(0);
-        bpConds = new List<DbgBreakpoint>();
-        dbgWatches = new List<DbgVar>();
-        lspSess = null;
-        lspTried = false;
-    }
+                        void InitDebugState() {
+                            dbgState = 0;
+                            dbgExecLine = -1;
+                            dbg = null;
+                            dbgConsole = new List<string>();
+                            dbgVarInfo = new List<DbgVar>();
+                            dbgStack = new List<DbgFrame>();
+                            dbgPanelTab = new SignalInt(0);
+                            bpConds = new List<DbgBreakpoint>();
+                            dbgWatches = new List<DbgVar>();
+                            lspSess = null;
+                            lspTried = false;
+                        }
 
-    void InitDesignerState() {
-        designerMode = false;
-        formDesigner = new Designer();
-        codeViewForm = "";
-        formCodeEd = new CodeEditor();
-        formCodeEd.AttachAnalysis(app);
-        formCodeLoaded = "";
-        sceneMode = false;
-        sceneDesigner = new SceneDesigner();
-        assetMgr = AssetManager.Create();
-    }
+                        void InitDesignerState() {
+                            designerMode = false;
+                            formDesigner = new Designer();
+                            codeViewForm = "";
+                            formCodeEd = new CodeEditor();
+                            formCodeEd.AttachAnalysis(app);
+                            formCodeLoaded = "";
+                            sceneMode = false;
+                            sceneDesigner = new SceneDesigner();
+                            assetMgr = AssetManager.Create();
+                        }
 
-}
+                    }

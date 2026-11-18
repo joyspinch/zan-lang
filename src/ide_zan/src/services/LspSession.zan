@@ -32,6 +32,8 @@ partial class LspSession {
     LspStartReport startReport;
     // 进程内启动轮次：每次启动换一个端口段（见 Start）。
     static int lspStartSeq;
+    // The transport worker owns the OS child as well as the TCP connection.
+    ProcessSpawn serverProcess;
 
     nint sock;
     int seq;
@@ -265,6 +267,9 @@ partial class LspSession {
                 }
                 activeCommand = null;
                 connection.Poll();
+                #if WINDOWS
+                if (connection.serverProcess != null) { connection.serverProcess.ReadAvailable(); }
+                #endif
             }
         } catch (Exception e) {
             Console.WriteLine("LSP service failed: " + e.Message);
@@ -484,15 +489,28 @@ partial class LspSession {
                 report.attempts = attempt + 1;
                 report.lastPort = port;
             }
-            // 长期运行的子进程必须走 StartDetachedSafe：RunDetached 在
-            // Windows 上会多挂一层 cmd.exe + conhost.exe，语言服务这种
-            // 每次开工程都要起的进程正是这类堆积的来源。
             List<string> args = new List<string>();
             args.Add("--port");
             args.Add(Convert.ToString(port));
+            #if WINDOWS
+            ProcessSpawn child = ProcessSpawn.Spawn(exe, args);
+            if (child == null) { continue; }
+            try {
+                LspSession s = LspSession.Open(port, root, report, cancellation);
+                if (s != null) {
+                    s.serverProcess = child;
+                    child = null;
+                    return s;
+                }
+            } finally {
+                // A cancelled/failed handshake must not leave a server in accept.
+                LspSession.ReapServer(child);
+            }
+            #else
             Process.StartDetachedSafe(exe, args);
             LspSession s = LspSession.Open(port, root, report, cancellation);
             if (s != null) { return s; }
+            #endif
         }
         if (report != null && report.code == 0) { report.code = 2; }
         if (report != null && report.code == 2) {
@@ -589,6 +607,27 @@ partial class LspSession {
     // 启动诊断袋：IDE 拿它把"语言服务不可用"翻译成具体原因。
     LspStartReport StartReport() { return this.startReport; }
 
+    static void ReapServer(ProcessSpawn child) {
+        #if WINDOWS
+        if (child == null) { return; }
+        try {
+            int code = -258;
+            long deadline = Stopwatch.GetMilliseconds() + 3000;
+            while (code == -258 && Stopwatch.GetMilliseconds() < deadline) {
+                // ProcessSpawn combines stdout/stderr; drain diagnostics so a
+                // full pipe cannot block the server's normal teardown.
+                child.ReadAvailable();
+                code = child.WaitExitCode(25);
+            }
+            if (code == -258) {
+                if (!child.Kill()) { throw new Exception("LSP process termination failed"); }
+                code = child.WaitExitCode(3000);
+            }
+            if (code == -258 || code == -1) { throw new Exception("LSP process did not exit"); }
+        } finally { child.Dispose(); }
+        #endif
+    }
+
     void Shutdown() {
         if (background) {
             if (stopping) { return; }
@@ -601,21 +640,32 @@ partial class LspSession {
             commands.Complete();
             return;
         }
-        if (alive) {
-            this.RequestWait("shutdown", "");
-            this.Notify("exit", "");
-            long deadline = Stopwatch.GetMilliseconds() + 1000;
-            while (alive && nonBlocking && sendQueue.Count > 0 && Stopwatch.GetMilliseconds() < deadline) {
-                FlushSendQueue();
-                if (sendQueue.Count > 0) { SnoozeMs(2); }
+        ProcessSpawn child = serverProcess;
+        serverProcess = null;
+        try {
+            if (alive) {
+                this.RequestWait("shutdown", "");
+                this.Notify("exit", "");
+                long deadline = Stopwatch.GetMilliseconds() + 1000;
+                while (alive && nonBlocking && sendQueue.Count > 0 && Stopwatch.GetMilliseconds() < deadline) {
+                    FlushSendQueue();
+                    if (sendQueue.Count > 0) { SnoozeMs(2); }
+                }
             }
+        } finally {
+            try { Disconnect(); }
+            finally { LspSession.ReapServer(child); }
         }
-        Disconnect();
     }
 
     async void ShutdownAsync() {
         if (!background) { Shutdown(); return; }
         int ignored = await serviceStopped.Task;
+        if (stopping) {
+            // The joined service can no longer dispatch into its retired owner.
+            onDiagnostics = null;
+            uiDispatcher = null;
+        }
     }
 
     // 同一文档只打开一次，后续未保存修改走递增版本的全量 didChange。

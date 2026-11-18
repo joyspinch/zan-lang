@@ -15,6 +15,56 @@ using Gui.Component;
 // 醒一次，见 ZanIDE.zan 的 RequestWakeIn(aiPollMs)），PumpAll 每圈都会
 // 泵到本窗口，空转时一帧都不画。
 public class AiAssistantWindow : ChildWindow {
+    AppLoopRegistration sessionsPreparation;
+
+    // Custom rendering bypasses ChildWindow's retained-root layout. Register
+    // before the first input snapshot so resize cannot borrow Paint bounds.
+    void InitializeSessionsHost(App host) {
+        if (host == null) { return; }
+        if (sessionsPreparation != null && sessionsPreparation.active
+        && sessionsPreparation.host == host) { return; }
+        this.RetireSessionsPreparation();
+        sessionsPreparation = host.RegisterLoopParticipant(this,
+        new IdeAiWindowPreparation(this));
+        ZanIDE ide = ZanIDE.current;
+        if (ide != null) {
+            if (ide.dock != null && ide.dock.Visible("agent")) {
+                ide.PrepareAiSessionsView(ide.app);
+            } else {
+                if (ide.aiPanel.parent != null) { ide.aiPanel.parent.Remove(ide.aiPanel); }
+                this.SetView(ide.aiPanel, null);
+                ide.PrepareAiSessionsWindow(host);
+            }
+        }
+    }
+
+    void PrepareSessionsHost(App host) {
+        if (sessionsPreparation == null || !sessionsPreparation.active
+        || sessionsPreparation.host != host || !this.IsOpen()) { return; }
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.aiWin != this) { return; }
+        if (ide.dock != null && ide.dock.Visible("agent")) {
+            Rect area = ide.dock.PreviewContent(ide.app,
+            ide.dock.Content("editor"), "agent");
+            ide.PrepareAiSessionsView(ide.app, area);
+        } else {
+            int top = host.ContentTop();
+            Rect area = new Rect(host.ShapeOffX(), top + host.ShapeOffY(),
+            host.ClientWidth(), host.ClientHeight() - top);
+            ide.PrepareAiPanel(host, area);
+            ide.aiPanel.UseApp(host);
+            ide.aiPanel.MeasureTree(host, area.width);
+            ide.aiPanel.Arrange(area.x, area.y, area.width, area.height);
+            ide.PrepareAiSessionsWindow(host);
+        }
+    }
+
+    private void RetireSessionsPreparation() {
+        AppLoopRegistration previous = sessionsPreparation;
+        sessionsPreparation = null;
+        if (previous != null) { previous.Invalidate(); }
+    }
+
     // ---- 重绘快照（Pending 逐项比较，AfterFrame 落盘）----
     // 不拼签名字符串：Pending 每轮循环都会跑，逐字段比较开销可忽略。
     int sBusy;
@@ -44,12 +94,14 @@ public class AiAssistantWindow : ChildWindow {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
         if (ide.aiWin != null && ide.aiWin.IsOpen()) {
+            ide.RetireAiSessionsView();
             ide.aiWin.Close();
             ide.aiWin = null;
         } else {
             // 右侧那扇 Agent 面板开着就先收掉：同一块小赞控件树不能
             // 画两遍（两个宿主共用同一批控件 id，点击会落到另一个上）。
             if (ide.dock != null && !ide.dock.IsHidden("agent")) {
+                ide.RetireAiSessionsView();
                 ide.dock.Close("agent");
                 ide.dock.TakeClosed();
             }
@@ -63,39 +115,42 @@ public class AiAssistantWindow : ChildWindow {
         w.SetRender(() => {
             App hApp = w.Host();
             ZanIDE ide = ZanIDE.current;
-            if (ide == null || hApp == null) { return; }
+            if (ide == null || hApp == null || ide.aiWin != w) { return; }
             // 面板已经挪回主窗口右侧时，这里不画：同一块控件树画两遍
             // 会让两处共用同一批控件 id，点击会落到另一个宿主上。
-            if (ide.dock != null && !ide.dock.IsHidden("agent")) { return; }
+            if (ide.dock != null && !ide.dock.IsHidden("agent")) {
+                Rect dockArea = ide.dock.PreviewContent(ide.app,
+                ide.dock.Content("editor"), "agent");
+                ide.PrepareAiSessionsView(ide.app, dockArea);
+                return;
+            }
             hApp.BeginFrame();
+            if (!hApp.PrepareStandardHostFrame()) { return; }
             int top = hApp.ContentTop();
-            Rect area = new Rect(0, top, hApp.ClientWidth(),
-                hApp.ClientHeight() - top);
+            Rect area = new Rect(hApp.ShapeOffX(),
+            top + hApp.ShapeOffY(), hApp.ClientWidth(),
+            hApp.ClientHeight() - top);
             ide.RenderAiPanel(hApp, area);
-            // 任务图节点的右键菜单（ctxKind == 7）：TeamBoard 的右键
-            // 坐标是本窗口的客户区坐标，菜单必须画在同一扇窗里。主窗口
-            // 的 ctxKind 分发对 kind 7 整体跳过（见 ZanIDE.PaintFrame）。
-            if (ide.ctxKind == 7) {
+            if (!hApp.ContinuePreparedFrame()) { return; }
+            // 任务图菜单与主窗口共用外壳状态，但由本窗口的 OverlayHost 持有。
+            if (ide.ctxKind == 7 && (ide.ctxMenu == null || !ide.ctxMenu.IsOpen()
+            || ide.ctxMenuApp != hApp)) {
                 List<string> cmLabels = new List<string>();
                 ide.AiGraphMenuLabels(cmLabels);
-                hApp.PushId("AiAssistantCtxMenu");
-                hApp.BlockHitsMenu();
-                int chosen = ContextMenu.Render(hApp, ide.ctxX, ide.ctxY,
-                    cmLabels);
-                hApp.PopId();
-                if (chosen == 0 - 2) {
-                    ide.ctxKind = 0;
-                    hApp.RequestRedraw();
-                } else if (chosen >= 0) {
-                    ide.AiGraphMenu(ide.ctxTaskId, chosen);
-                    ide.ctxKind = 0;
-                    hApp.RequestRedraw();
+                ContextMenu menu = ide.CreateContextMenu(hApp, 7, cmLabels);
+                ide.ctxMenu = menu;
+                ide.ctxMenuApp = hApp;
+                menu.ShowAt(hApp, ide.ctxX, ide.ctxY);
+                if (ide.ctxMenu == menu && menu.IsOpen()
+                && hApp.overlayHost.ActiveRoot() == menu) {
+                    ide.ctxKind = 7;
                 }
             }
             hApp.RenderChrome(w.Title());
             hApp.PresentFrame();
         });
         w.OpenHost(parent);
+        w.InitializeSessionsHost(w.Host());
         return w;
     }
 
@@ -108,8 +163,19 @@ public class AiAssistantWindow : ChildWindow {
     // 只要把可能开着的任务图右键菜单状态收掉，免得菜单悬在已经关掉
     // 的窗口坐标上。
     override void OnCloseRequested() {
+        this.RetireSessionsPreparation();
         ZanIDE ide = ZanIDE.current;
-        if (ide != null && ide.ctxKind == 7) { ide.ctxKind = 0; }
+        if (ide != null && ide.aiWin == this) {
+            if (ide.ctxKind == 7) { ide.CloseIdeContextMenu(); }
+            if (!ide.shuttingDown && !ide.closeRequested && ide.dock != null
+            && ide.dock.Visible("agent")) {
+                Rect area = ide.dock.PreviewContent(ide.app,
+                ide.dock.Content("editor"), "agent");
+                ide.PrepareAiSessionsView(ide.app, area);
+            } else {
+                ide.RetireAiSessionsView();
+            }
+        }
     }
 
     // 数据快照对比：任何一处外壳侧的小赞状态变了就重画。这里不追踪

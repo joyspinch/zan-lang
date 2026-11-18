@@ -1,0 +1,197 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+partial class ZanIDE {
+    Ribbon ribbonControl;
+    ControlInputHost ribbonInput;
+    UiViewScope ribbonView;
+    IdeRibbonViewOwner ribbonViewOwner;
+    weak App ribbonViewApp;
+    bool ribbonPreparing;
+    bool ribbonPrepared;
+    int ribbonViewEpoch;
+    int ribbonPreparedTab = -1;
+    string ribbonPreparedLanguage;
+    int ribbonPreparedTheme = -1;
+    int ribbonPreparedDpi;
+
+    void InitializeRibbonView() {
+        if (app == null || !app.isRunning || shuttingDown || closeRequested || ribbonView != null) { return; }
+        ribbonControl = new Ribbon();
+        ribbonControl.name = "ide-ribbon";
+        ribbonControl.activeTab = ribbonTab;
+        ribbonControl.Visible = false;
+        ribbonViewOwner = new IdeRibbonViewOwner();
+        ribbonViewOwner.Owner = this;
+        ribbonViewApp = app;
+        ribbonInput = new ControlInputHost(ribbonControl);
+        ribbonView = new UiViewScope(app, ribbonViewOwner, ribbonControl);
+        ribbonControl.CommandClicked.Add(ribbonView.Action("command", ribbonControl).Run);
+        ribbonControl.TabChanged.Add(ribbonView.Action("tab", ribbonControl).Run);
+    }
+
+    bool RibbonViewReady(App host) {
+        return host != null && host == app && host == ribbonViewApp && host.isRunning
+            && !shuttingDown && !closeRequested && !compactHeader && ribbonPrepared
+            && ribbonView != null && ribbonView.IsActive() && ribbonControl != null && ribbonControl.Visible
+            && ribbonPreparedTab == ribbonTab.Get() && ribbonPreparedLanguage == ZanIDE.uiLang
+            && ribbonPreparedTheme == host.bgThemeGen && ribbonPreparedDpi == host.dpiScale;
+    }
+
+    bool RibbonPreparationCurrent(App host, Ribbon tree, UiViewScope view, int epoch, int tab, string language) {
+        return host != null && host == app && host == ribbonViewApp && host.isRunning
+            && !shuttingDown && !closeRequested && !compactHeader && ribbonViewEpoch == epoch
+            && ribbonControl == tree && ribbonView == view && view.IsActive()
+            && ribbonTab.Get() == tab && ZanIDE.uiLang == language;
+    }
+
+    // Called both by the IDE's prepared region and by this independently owned
+    // view. It must build its own groups: first Down/DPI need no preceding Paint.
+    public void PrepareRibbonView(App host) {
+        if (host == null || host != app) { return; }
+        if (!host.isRunning || shuttingDown || closeRequested) { this.RetireRibbonView(); return; }
+        if (ribbonView == null) { this.InitializeRibbonView(); }
+        if (ribbonView == null || ribbonPreparing) { return; }
+        ribbonPreparing = true;
+        try {
+            Ribbon tree = ribbonControl; UiViewScope view = ribbonView;
+            ribbonPrepared = false;
+            if (compactHeader) {
+                if (!tree.RetireInput()) { return; }
+                if (ribbonControl != tree || ribbonView != view || !compactHeader) { return; }
+                tree.Visible = false;
+                ribbonInput.Hide();
+                return;
+            }
+            int epoch = ribbonViewEpoch;
+            int tab = ribbonTab.Get(); string language = ZanIDE.uiLang;
+            int theme = host.bgThemeGen; int dpi = host.dpiScale;
+            List<RibbonGroup> groups = this.CommandRibbonGroups(tab);
+            int commandGroups = groups.Count;
+            if (!this.RibbonPreparationCurrent(host, tree, view, epoch, tab, language)) { return; }
+            if (tab == ZanIDE.RibbonViewTab()) {
+                // DockHost's contract is a flat index, never a semantic command ID.
+                dock.AddSwitchGroup(groups, ZanIDE.T("Panels", "面板"));
+                int flat = 0;
+                for (int g = 0; g < groups.Count; g = g + 1) {
+                    for (int j = 0; j < groups[g].items.Count; j = j + 1) {
+                        if (g >= commandGroups) { groups[g].items[j].act = -1 - flat; }
+                        flat = flat + 1;
+                    }
+                }
+            } else { dock.ClearSwitches(); }
+            bool rebuild = ribbonPreparedTab != tab || ribbonPreparedLanguage != language
+                || !ZanIDE.RibbonGroupsSameShape(tree.groups, groups);
+            bool retire = rebuild || ribbonPreparedTheme != theme || ribbonPreparedDpi != dpi
+                || !tree.Visible || ZanIDE.RibbonPanelStateChanged(tree.groups, groups);
+            if (retire) {
+                if (!tree.RetireInput()) { return; }
+                if (!this.RibbonPreparationCurrent(host, tree, view, epoch, tab, language)) { return; }
+            }
+            if (rebuild) {
+                ribbonTabs = ZanIDE.RibbonTabs();
+                tree.tabs = ribbonTabs; tree.activeTab = ribbonTab; tree.groups = groups;
+                tree.BuildTree();
+                if (!this.RibbonPreparationCurrent(host, tree, view, epoch, tab, language)) { return; }
+            } else {
+                // Preserve buttons while refreshing the prepared model. Definitions
+                // and DockHost switches are separate live snapshots on every prepare.
+                for (int g = 0; g < groups.Count; g = g + 1) {
+                    for (int j = 0; j < groups[g].items.Count; j = j + 1) {
+                        RibbonItem live = groups[g].items[j]; RibbonItem item = tree.groups[g].items[j];
+                        item.on = live.on; item.enabled = live.enabled; item.tip = live.tip;
+                    }
+                }
+            }
+            tree.Visible = true;
+            ribbonInput.Bind(host);
+            if (!this.RibbonPreparationCurrent(host, tree, view, epoch, tab, language)) { return; }
+            // Refresh tips without rebuilding buttons (panel visibility changes the hint).
+            if (tree.ChildCount() > 1) {
+                Control band = tree.ChildAt(1);
+                for (int g = 0; g < tree.groups.Count; g = g + 1) {
+                    Control items = band.ChildAt(g).ChildAt(0);
+                    for (int j = 0; j < tree.groups[g].items.Count; j = j + 1) {
+                        RibbonItem item = tree.groups[g].items[j];
+                        items.ChildAt(j).Tip = item.tip != "" ? item.tip : item.label;
+                    }
+                }
+            }
+            if (!view.Layout(host.ShapeOffX(), host.ShapeOffY() + host.ContentTop(),
+                host.ClientWidth(), Ribbon.HeightTabbed(host))) { return; }
+            Control overflow = tree.OverflowButton();
+            if (overflow != null) { overflow.name = "ide-ribbon-overflow"; }
+            if (!this.RibbonPreparationCurrent(host, tree, view, epoch, tab, language)
+                || theme != host.bgThemeGen || dpi != host.dpiScale) { return; }
+            ribbonPreparedTab = tab; ribbonPreparedLanguage = language;
+            ribbonPreparedTheme = theme; ribbonPreparedDpi = dpi;
+            ribbonPrepared = true;
+        } finally { ribbonPreparing = false; }
+    }
+
+    static bool RibbonGroupsSameShape(List<RibbonGroup> a, List<RibbonGroup> b) {
+        if (a.Count != b.Count) { return false; }
+        for (int g = 0; g < a.Count; g = g + 1) {
+            if (a[g].title != b[g].title || a[g].items.Count != b[g].items.Count) { return false; }
+            for (int j = 0; j < a[g].items.Count; j = j + 1) {
+                RibbonItem x = a[g].items[j]; RibbonItem y = b[g].items[j];
+                if (x.act != y.act || x.label != y.label || x.icon != y.icon || x.small != y.small
+                    || x.tile != y.tile || x.menu != y.menu || x.toggle != y.toggle || x.optional != y.optional) { return false; }
+            }
+        }
+        return true;
+    }
+
+    static bool RibbonPanelStateChanged(List<RibbonGroup> a, List<RibbonGroup> b) {
+        if (!ZanIDE.RibbonGroupsSameShape(a, b)) { return true; }
+        for (int g = 0; g < a.Count; g = g + 1) {
+            for (int j = 0; j < a[g].items.Count; j = j + 1) {
+                RibbonItem x = a[g].items[j]; RibbonItem y = b[g].items[j];
+                if (x.on != y.on || x.enabled != y.enabled || x.tip != y.tip) { return true; }
+            }
+        }
+        return false;
+    }
+
+    public void RibbonViewAction(string name, Control sender) {
+        if (sender != ribbonControl || !this.RibbonViewReady(app)) {
+            // TabChanged arrives after the component changes activeTab itself.
+            if (name == "tab" && sender == ribbonControl && app != null && app.isRunning
+                && !shuttingDown && !closeRequested && !compactHeader) { this.PrepareRibbonView(app); }
+            return;
+        }
+        if (name != "command") { return; }
+        int act = ribbonControl.lastAct;
+        ribbonControl.lastAct = -1000000;
+        if (act >= 0 && act <= 20) { this.Command(act).TryExecute(); }
+        else if (act < 0 && ribbonPreparedTab == ZanIDE.RibbonViewTab()) {
+            int flat = -1 - act;
+            int cursor = 0; bool found = false;
+            for (int g = 0; g < ribbonControl.groups.Count; g = g + 1) {
+                for (int j = 0; j < ribbonControl.groups[g].items.Count; j = j + 1) {
+                    if (cursor == flat && ribbonControl.groups[g].items[j].act == act) { found = true; }
+                    cursor = cursor + 1;
+                }
+            }
+            if (found) { dock.HandleRibbon(flat); }
+        }
+        // Command execution can hide the Ribbon, close the window, toggle a
+        // panel, or change command availability. Retire stale input immediately.
+        this.PrepareRibbonView(app);
+    }
+
+    void RetireRibbonView() {
+        ribbonViewEpoch = ribbonViewEpoch + 1;
+        ribbonPrepared = false;
+        UiViewScope view = ribbonView; ribbonView = null;
+        ControlInputHost input = ribbonInput; ribbonInput = null;
+        Ribbon tree = ribbonControl; ribbonControl = null;
+        IdeRibbonViewOwner owner = ribbonViewOwner; ribbonViewOwner = null;
+        ribbonViewApp = null;
+        if (owner != null) { owner.Owner = null; }
+        if (view != null) { view.Retire(); }
+        if (tree != null) { tree.RetireInput(); tree.Visible = false; }
+        if (input != null) { input.Hide(); }
+    }
+}

@@ -14,10 +14,50 @@ using Gui.Backend;
 // 功能区上一次点击变成一次操作：新建 / 打开 / 保存 / 构建 / 运行 / 调试 /
 // 发布 / 配置 / 库市场 / 设置 / 帮助。命令本身是纯配置（图标、文案、动作
 // 号，见 ZanIDE.Ribbon），这里是它们各自要做的事。
-partial class ZanIDE {
-    // 执行动作号 `rc`（-1 表示这一帧没有点击）。
-    void RunRibbonCommand(App app, int rc) {
-        if (closeRequested) { return; }
+partial class ZanIDE : UiCommandOwner {
+    List<UiCommand> uiCommands;
+
+    UiCommand Command(int key) {
+        if (uiCommands == null) {
+            uiCommands = new List<UiCommand>();
+            for (int i = 0; i <= 20; i = i + 1) {
+                uiCommands.Add(new UiCommand(this, i, ""));
+            }
+            uiCommands[7].Shortcut(116, 0, 5);
+            uiCommands[19].Shortcut(65, 3, 5);
+        }
+        return uiCommands[key];
+    }
+
+    public bool CanExecuteCommand(int key) {
+        if (closeRequested) { return false; }
+        bool project = haveProject;
+        if (key == 8 || key == 11 || key == 12 || key == 15) { return project; }
+        if (key == 4 || key == 6 || key == 7) {
+            int active = activeTab.Get();
+            string path = active >= 0 && active < tabs.Count ? tabs[active].path : "";
+            bool target = project || (path != "" && path != "@start");
+            if (key == 7 && dbgState == 2) { return !pubBusy; }
+            return target && !buildBusy && !pubBusy && (key != 7 || dbgState == 0);
+        }
+        return true;
+    }
+
+    public bool IsCommandChecked(int key) {
+        if (key == 19) { return this.AgentOn(); }
+        if (key == 17) { return aiWin != null && aiWin.IsOpen(); }
+        if (key == 11) { return autoRun; }
+        return false;
+    }
+
+    public void ExecuteCommand(int key) { this.ExecuteIdeCommand(app, key); }
+
+    void RunRibbonCommand(App app, int key) {
+        if (key >= 0 && key <= 20) { this.Command(key).TryExecute(); }
+    }
+
+    // 工程操作仍在 IDE：共享命令只统一入口、可用性与开关状态。
+    void ExecuteIdeCommand(App app, int rc) {
         if (rc == 0 && dlg == null) {
             this.OpenNewProjectWizardAsync();
         } else if (rc == 1 && dlg == null) {
@@ -68,11 +108,7 @@ partial class ZanIDE {
             }
             Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
         } else if (rc == 4) {
-            if (buildBusy) {
-                Layer.Msg(ZanIDE.T("Build already running…", "构建进行中…"), 2);
-            } else if (pubBusy) {
-                Layer.Msg(ZanIDE.T("Publish in progress…", "发布进行中…"), 2);
-            } else {
+            {
                 int atB = activeTab.Get();
                 string apB = "";
                 if (atB >= 0 && atB < tabs.Count) { apB = tabs[atB].path; }
@@ -99,28 +135,14 @@ partial class ZanIDE {
         } else if (rc == 7) {
             // Debug (F5)
             designerMode = false;
-            if (pubBusy) {
-                Layer.Msg(ZanIDE.T("Publish in progress…", "发布进行中…"), 2);
-            } else if (dbgState == 0) {
-                if (!buildBusy) {
-                    string targetD = ZanIDE.PathOf(tabs, activeTab);
-                    this.SaveActiveTabThen(delegate () {
-                        this.BeginBuildJob(targetD, false, true);
-                        dock.Focus("output");
-                    });
-                }
+            if (dbgState == 0) {
+                string targetD = ZanIDE.PathOf(tabs, activeTab);
+                this.SaveActiveTabThen(delegate () {
+                    this.BeginBuildJob(targetD, false, true);
+                    dock.Focus("output");
+                });
             } else if (dbgState == 2) {
-                if (dbg != null) { dbg.Continue(); }
-                dbgState = ZanIDE.DbgSync(dbg, editor, log, dbgConsole);
-                dbgExecLine = ZanIDE.DbgLine(dbg);
-                dbgVarInfo = ZanIDE.DbgVars(dbg);
-                dbgStack = ZanIDE.DbgStack(dbg);
-                ZanIDE.DbgEvalWatches(dbg, dbgWatches);
-                if (dbgState == 2) {
-                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
-                } else {
-                    dbg = null;
-                }
+                this.BeginDebugCommand("continue");
             }
         } else if (rc == 8 && dlg == null) {
             tmplCatSel.Set(5);

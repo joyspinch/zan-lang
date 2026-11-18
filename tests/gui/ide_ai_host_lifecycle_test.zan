@@ -1,0 +1,137 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class IdeAiHostLifecycleTest {
+    static string stage = "dock first";
+    static void Check(bool value, string label) { if (!value) { throw new Exception(stage + ": " + label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { break; } action(); }
+    }
+    static void Event(App app, int kind, int x, int y) { app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0); }
+    static void Turn(App app) { Event(app, 1, 0, 0); }
+    static void Down(App app, Control control) {
+        Check(control.bw > 0 && control.bh > 0, "production session control prepared: "
+        + Convert.ToString(control.bx) + "," + Convert.ToString(control.by) + ","
+        + Convert.ToString(control.bw) + "," + Convert.ToString(control.bh));
+        Event(app, 2, control.bx + control.bw / 2, control.by + control.bh / 2);
+        Check(app.GetCapturedPointer() == control, "actual input captures production session control at "
+        + Convert.ToString(control.bx) + "," + Convert.ToString(control.by));
+    }
+    static void Up(App app, Control control) { Event(app, 3, control.bx + control.bw / 2, control.by + control.bh / 2); Drain(app); }
+    static void Click(App app, Control control) { Down(app, control); Up(app, control); }
+    static void Paint(ZanIDE ide, App app) {
+        app.BeginOffscreenFrame(); ide.AiRenderSessions(app, null); app.EndOffscreenFrame();
+    }
+    static void Lifecycle() {
+        App main = App.CreateOffscreen("IDE AI dock", 1400, 850);
+        App child = App.CreateOffscreen("IDE AI child", 640, 720);
+        App replacement = App.CreateOffscreen("IDE AI replacement", 640, 720);
+        App visibleChild = App.CreateOffscreen("IDE AI visible dock close", 640, 720);
+        ZanIDE ide = new ZanIDE(main);
+        SessionList list = ide.List();
+        Turn(main);
+        Control create = list.Root().ChildAt(0);
+        Input search = (Input)list.Root().ChildAt(1);
+        Check(list.HostApp() == main && list.Root().Visible, "actual IDE dock prepares SessionList before Paint");
+        Check(list.Root().bw > 0 && list.Root().bh > 0, "IDE sidebar actual bounds "
+        + Convert.ToString(list.Root().bw) + "," + Convert.ToString(list.Root().bh)
+        + " area=" + Convert.ToString(ide.Dock().Content("agent").width));
+        int before = ide.aiSessions.Count;
+        Click(main, create);
+        Check(ide.aiSessions.Count == before + 1 && ide.Saves == 1,
+        "real routed action reaches production IDE session consumer once");
+        Paint(ide, main); Paint(ide, main);
+        Check(ide.aiSessions.Count == before + 1, "painting cannot replay IDE session action");
+
+        stage = "dock search";
+        Down(main, search); create.TriggerEvent("Click");
+        ide.ToggleDock();
+        Check(!list.Root().Visible && main.GetCapturedPointer() == null && !search.IsFocused(main),
+        "actual Agent hide retires search focus and capture immediately");
+        Drain(main);
+        Check(ide.aiSessions.Count == before + 1, "queued pre-hide action is retired by IDE toggle");
+        ide.ToggleDock();
+        Down(main, search); Up(main, search);
+        Check(search.IsFocused(main), "actual Agent show resumes first input without Paint");
+        Down(main, search); create.TriggerEvent("Click");
+        AiAssistantWindow window = ide.Child(child);
+        Check(!ide.Dock().Visible("agent") && list.HostApp() == child
+        && main.GetCapturedPointer() == null && !search.IsFocused(main),
+        "actual ribbon transition transfers same list from dock to child");
+        Drain(main);
+        Check(ide.aiSessions.Count == before + 1, "queued dock action cannot execute in child");
+        stage = "child first";
+        Turn(child); Down(child, search); Up(child, search);
+        string old = search.GetText();
+        main.ProcessOffscreenInput(6, 0, 0, 0, 120, 0, 0);
+        Check(search.GetText() == old, "old dock App cannot deliver text after child transfer");
+        int height = list.Root().bh;
+        stage = "child resize";
+        child.SetOffscreenViewport(640, 980, 100);
+        Down(child, search);
+        Check(list.Root().bh > height + 200, "child resize updates actual IDE sidebar before same Down without Paint");
+        Up(child, search);
+        child.SetOffscreenViewport(240, 980, 100);
+        Turn(child);
+        Check(!list.Root().Visible && child.GetCapturedPointer() == null && !search.IsFocused(child),
+        "narrow child suspends sidebar before input");
+        stage = "child DPI restore";
+        child.SetOffscreenViewport(1000, 1100, 150);
+        Turn(child);
+        Down(child, search); Up(child, search);
+        Check(list.Root().Visible && list.Root().bw > 180,
+        "child width and DPI restore actual sidebar through pre-input preparation");
+        Click(child, create);
+        Check(ide.aiSessions.Count == before + 2, "resized child action reaches production IDE consumer once");
+
+        // Replace the child without destroying the old registration: its late
+        // preparation and close must not retire or steal the new host.
+        replacement.UseAppCss(main.AppCss());
+        AiAssistantWindow newer = new AiAssistantWindow();
+        newer.host = replacement; newer.open = true; newer.parentApp = main;
+        ide.aiWin = newer; newer.InitializeSessionsHost(replacement);
+        stage = "child replacement";
+        Down(replacement, search);
+        Turn(child); window.Close();
+        Check(list.HostApp() == replacement && replacement.GetCapturedPointer() == search,
+        "stale child preparation and close preserve current child's input");
+        Up(replacement, search);
+        list.Root().ChildAt(0).TriggerEvent("Click");
+        ide.ToggleDock();
+        Check(!newer.IsOpen() && list.HostApp() == main && !ide.Dock().IsHidden("agent"),
+        "actual Agent toggle closes child and transfers list back to dock before Paint");
+        Turn(main);
+        Check(ide.Dock().Visible("agent") && list.HostApp() == main,
+        "returned dock commits current geometry before first input without Paint");
+        Drain(replacement);
+        Check(ide.aiSessions.Count == before + 2, "queued child action cannot cross return to dock");
+        Turn(replacement);
+        Check(list.HostApp() == main, "retired child registration cannot reclaim dock");
+        Down(main, search); Up(main, search);
+        // Real close notification while dock is visible preserves dock ownership.
+        visibleChild.UseAppCss(main.AppCss());
+        window = new AiAssistantWindow(); window.host = visibleChild; window.open = true;
+        ide.aiWin = window; window.InitializeSessionsHost(visibleChild); Turn(visibleChild);
+        window.Close();
+        Check(list.HostApp() == main && list.Root().Visible,
+        "child close prepares current visible dock without Paint");
+        Down(main, search); create.TriggerEvent("Click");
+        ide.Shutdown();
+        Check(list.HostApp() == null && main.GetCapturedPointer() == null && !search.IsFocused(main),
+        "actual IDE retirement detaches scope and borrowed input");
+        Drain(main); Turn(main); Turn(child);
+        Check(list.HostApp() == null && ide.aiSessions.Count == before + 2,
+        "shutdown rejects queued action and later host preparation");
+        ide.Dispose();
+        main.StopLoop(); child.StopLoop(); replacement.StopLoop();
+        main.canvas.Destroy();
+    }
+    static void Main() {
+        App frame = App.CreateOffscreen("IDE AI frame", 32, 32);
+        Lifecycle(); frame.StopLoop(); frame.canvas.Destroy();
+        Console.WriteLine("IDE AI host lifecycle: PASS");
+    }
+}

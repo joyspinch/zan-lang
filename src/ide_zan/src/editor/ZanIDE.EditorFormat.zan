@@ -64,11 +64,117 @@ partial class ZanIDE {
         return true;
     }
 
+    public void PrepareView(UiViewScope view, App host) {
+        if (explorerPanel != null && explorerPanel.OwnsView(view)) {
+            if (shuttingDown || closeRequested || dock == null) { explorerPanel.RetireHost(); }
+            else { explorerPanel.PrepareHost(host, dock.ContentParked("explorer"), tree); }
+            return;
+        }
+        if (toolsPanel != null && toolsPanel.OwnsView(view)) {
+            if (shuttingDown || closeRequested || dock == null) { toolsPanel.RetireHost(); }
+            else { toolsPanel.PrepareHost(host, dock.ContentParked("tools"), rtToolTree); }
+            return;
+        }
+        if (stdlibPanel != null && stdlibPanel.OwnsView(view)) {
+            if (shuttingDown || closeRequested || dock == null) { stdlibPanel.RetireHost(); }
+            else { stdlibPanel.PrepareHost(host, dock.ContentParked("stdlib"), exTree); }
+            return;
+        }
+        if (view != editorTabsView || editorTabs == null || dock == null) { return; }
+        // Form.Run replaces the startup input root; restore Tabs before the preparation proof is captured.
+        if (editorTabsInput != null) { editorTabsInput.Bind(host); }
+        Rect area = dock.Content("editor");
+        int tabsHeight = editorTabs.HeaderHeight(host);
+        view.Layout(area.x, area.y, area.width, tabsHeight);
+        this.PrepareAiSessionsView(host);
+        // Ribbon prepares through its own UiViewOwner, including before the first input.
+        // Dock geometry is prepared by Form before view participants run.
+        // Register the canvas here so first input and resize never borrow Paint coordinates.
+        int active = activeTab.Get();
+        bool design = active >= 0 && active < tabs.Count
+        && (ZanIDE.IsFormPath(tabs[active].path) || tabs[active].designDoc)
+        && codeViewForm != tabs[active].path && this.FormDesignReady()
+        && !shuttingDown && !closeRequested && dlg == null;
+        if (formDesigner != null) {
+            if (design) {
+                int designHeight = this.DesignTabsApplicable() ? host.Scale(26) : 0;
+                formDesigner.hostPanels = true;
+                formDesigner.PrepareInspectorInput(host, dock.ContentParked("props"));
+                formDesigner.PrepareCanvasInput(host, new Rect(area.x, area.y + tabsHeight + designHeight,
+                area.width, area.height - tabsHeight - designHeight));
+            } else { formDesigner.SuspendInspectorInput(); formDesigner.SuspendCanvasInput(); }
+        }
+        if (sceneDesigner != null) {
+            bool scene = active >= 0 && active < tabs.Count
+            && ZanIDE.IsScenePath(tabs[active].path)
+            && codeViewForm != tabs[active].path && this.SceneDesignReady()
+            && !shuttingDown && !closeRequested && dlg == null;
+            if (scene) {
+                int designHeight = this.DesignTabsApplicable() ? host.Scale(26) : 0;
+                sceneDesigner.hostPanels = true;
+                sceneDesigner.SetBounds(host, area.x, area.y + tabsHeight + designHeight,
+                area.width, area.height - tabsHeight - designHeight);
+                sceneDesigner.SetHostPanelBounds(host, dock.ContentParked("toolbox"), dock.ContentParked("props"));
+            } else { sceneDesigner.SetVisible(false); }
+        }
+    }
+
+    public void ViewAction(string name, Control sender) { }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+
+    void RetireEditorTabsView() {
+        if (editorTabsView != null) { editorTabsView.Retire(); editorTabsView = null; }
+        if (editorTabsInput != null) { editorTabsInput.Hide(); editorTabsInput = null; }
+    }
+
+    // 页签条事件（单一输出：回调内读状态）。hostModel 模式下 IDE 自己
+    // 持有文档模型，事件只负责把外壳选中与关闭意图同步过来。
+    void BindEditorTabHandlers() {
+        IdeEditorTabEvents relay = new IdeEditorTabEvents();
+        relay.owner = this;
+        editorTabs.TabChanged.AddS(relay.Changed);
+        editorTabs.TabAdded.AddS(relay.Added);
+        editorTabs.TabClosed.AddS(relay.Closed);
+    }
+
+    void OnEditorTabChanged(Control sender) {
+        if (sender != editorTabs || shuttingDown || closeRequested) { return; }
+        int chg = editorTabs.Active();
+        if (chg < 0 || chg == activeTab.Get()) { return; }
+        formDesigner.ResetInteractionState();
+        sceneDesigner.ResetInteractionState();
+        activeTab.Set(chg);
+    }
+
+    void OnEditorTabAdded(Control sender) {
+        if (sender != editorTabs || shuttingDown || closeRequested) { return; }
+        if (ctxKind != 0 || dlg != null || app == null) { return; }
+        dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
+        dlgMode = 2;
+    }
+
+    void OnEditorTabClosed(Control sender) {
+        if (sender != editorTabs || shuttingDown || closeRequested || ctxKind != 0) { return; }
+        // ClosedIndex belongs to this callback; reset/reentrant close may replace it.
+        int closed = editorTabs.ClosedIndex();
+        if (closed < 0 || closed >= tabs.Count) { return; }
+        formDesigner.ResetInteractionState();
+        sceneDesigner.ResetInteractionState();
+        if (sender != editorTabs || shuttingDown || closeRequested) { return; }
+        this.RequestCloseTab(closed);
+    }
+
     void SyncEditorTabs() {
+        if (shuttingDown || closeRequested) {
+            this.RetireEditorTabsView(); this.RetireRibbonView();
+            if (formDesigner != null) { formDesigner.RetireInspectorInput(); formDesigner.RetireCanvasInput(); }
+            return;
+        }
         if (editorTabs == null) {
             editorTabs = new Tabs(Tabs.Card());
             editorTabs.SetShowAdd(true);
             editorTabs.SetHostModel(true);
+            this.BindEditorTabHandlers();
         }
         if (!ZanIDE.TabsMatchRecords(editorTabs, tabs)) {
             Tabs nt = new Tabs(Tabs.Card());
@@ -77,7 +183,23 @@ partial class ZanIDE {
             for (int i = 0; i < tabs.Count; i = i + 1) {
                 nt.Add(tabs[i].name, true);
             }
+            this.RetireEditorTabsView();
             editorTabs = nt;
+            this.BindEditorTabHandlers();
         }
+        editorTabs.name = "ide-document-tabs";
+        if (editorTabsInput == null) {
+            editorTabsInput = new ControlInputHost(editorTabs);
+            editorTabsView = new UiViewScope(app, this, editorTabs);
+        }
+        // Bind preserves independently composed inputs and is inert once linked.
+        editorTabsInput.Bind(app);
+        if (formDesigner != null) {
+            formDesigner.InitializeCanvasInput(app);
+            formDesigner.InitializeInspectorInput(app);
+        }
+        // Scene regions are initialized by active-scene preparation via SetBounds.
+        // Reopening them here during Paint undoes hidden-page retirement and
+        // changes the input root after the Form has saved its preparation proof.
     }
 }

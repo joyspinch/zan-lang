@@ -1,0 +1,167 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+partial class ZanIDE {
+    Control shellRoot;
+
+    void InitializeShellControls(Control root) {
+        shellRoot = root;
+        if (root == null) { throw new InvalidOperationException("IDE Shell control missing"); }
+        root.name = "ide-shell-root";
+        dock.name = "ide-workspace-dock";
+        statusBar.name = "ide-status-bar";
+        root.Add(dock);
+        root.Add(statusBar);
+        root.Add(editor);
+        formCodeEd.name = "ide-design-code-editor";
+        root.Add(formCodeEd);
+        startPage.owner = this;
+        diffView.owner = this;
+        startPage.SetShown(false);
+        diffView.SetShown(false);
+        root.Add(startPage);
+        root.Add(diffView);
+        this.InitializeDesignTabs(root);
+        dock.SetContent("explorer", explorerPanel);
+        dock.SetContent("structure", structurePanel);
+        dock.SetContent("stdlib", stdlibPanel);
+        dock.SetContent("tools", toolsPanel);
+        dock.SetContent("examples", examplesPanel);
+        dock.SetContent("git", gitPanel);
+        dock.SetContent("output", outputPanel);
+        Control outputRoot = dock.ContentRoot("output");
+        if (outputRoot != null) { outputRoot.Add(dbgPanel); }
+        dock.SetContent("errors", errorsPanel);
+        dock.SetContent("terminal", terminalPanel);
+        dock.SetContent("agent", aiPanel);
+        Label item = statusBar.ItemAt(sbLspItem);
+        item.name = "ide-lsp-status";
+        IdeEditorTabEvents relay = new IdeEditorTabEvents(); relay.owner = this;
+        item.OnClickS(relay.LspClicked);
+    }
+
+    void OnLspStatusClicked(Control sender) {
+        if (statusBar == null || sender != statusBar.ItemAt(sbLspItem)
+        || shuttingDown || closeRequested) { return; }
+        this.RetryLsp();
+    }
+
+    void PrepareDesignCandidateHandlers() {
+        if (!this.FormDesignReady()) { return; }
+        int active = activeTab.Get();
+        if (active < 0 || active >= tabs.Count) { return; }
+        string path = tabs[active].path;
+        if ((!ZanIDE.IsFormPath(path) && !tabs[active].designDoc) || codeViewForm == path) { return; }
+        string codeBehind = ZanIDE.CodeBehindPath(path);
+        if (!File.Exists(codeBehind)) { return; }
+        int index = ZanIDE.FindTabByPath(tabs, codeBehind);
+        string body = index >= 0 && index < tabs.Count && tabs[index].body != ""
+        ? tabs[index].body : File.ReadAllText(codeBehind);
+        formDesigner.SetCandidateHandlers(ZanIDE.ScanCandidateHandlers(body));
+    }
+
+    void PrepareStatusBar(App host) {
+        Theme t = host.theme;
+        bool debugging = dbgState == 2;
+        int text = debugging ? t.onScrim : t.textPrimary;
+        int muted = debugging ? t.tooltipTextMuted : t.textSecondary;
+        string position = ZanIDE.T("Ln ", "行 ") + Convert.ToString(editor.CurLine() + 1)
+        + ZanIDE.T(", Col ", "，列 ") + Convert.ToString(editor.CurCol() + 1);
+        string mode = "Zan";
+        if (editor.SyntaxLang() == 1) { mode = "Lua"; }
+        if (editor.SyntaxLang() == 2) { mode = "Python"; }
+        if (this.FormDesignReady()) { mode = ZanIDE.T("Designer", "设计器"); }
+        if (pubBusy) {
+            string step = pubStep != null && pubStep.Length > 0 ? pubStep + " · " : "";
+            int seconds = pubStartMs != 0 ? (int)((Window.GetTickMs() - pubStartMs) / 1000) : 0;
+            mode = ZanIDE.T("Publishing ", "发布中 ") + step + Convert.ToString(seconds) + "s";
+        }
+        if (pubPacking) { mode = ZanIDE.T("Packaging...", "打包中..."); }
+        if (debugging) { mode = ZanIDE.T("Debugging", "调试中"); }
+        statusBar.SetTint(debugging ? t.statusDebugBg : 0);
+        statusBar.SetText(sbPosItem, position);
+        statusBar.SetColor(sbPosItem, text);
+        statusBar.SetText(sbWorkItem, this.WorkFaceLabel());
+        statusBar.SetColor(sbWorkItem, text);
+        statusBar.SetText(sbModeItem, mode);
+        statusBar.SetColor(sbModeItem, text);
+        statusBar.SetColor(sbEncItem, muted);
+        int lsp = this.RefreshLspState();
+        statusBar.SetText(sbLspItem, this.LspStatusText());
+        statusBar.SetColor(sbLspItem, lsp == 3 ? t.warning : (lsp == 2 ? text : muted));
+        if (UiDriver.Active()) {
+            UiDriver.SetProbe("lsp.state", Convert.ToString(lsp));
+            UiDriver.SetProbe("lsp.text", this.LspStatusText());
+            UiDriver.SetProbe("lsp.error", this.lspError == null ? "" : this.lspError);
+            UiDriver.SetProbe("lsp.restarts", Convert.ToString(lspRestarts));
+            UiDriver.SetProbe("lsp.connectMs", Convert.ToString(lspConnectMs));
+        }
+    }
+
+    void PrepareShellControls(App host) {
+        if (shellRoot == null || dock == null || shuttingDown || closeRequested) { return; }
+        this.SyncEditorTabs();
+        editorTabs.Select(activeTab.Get());
+        this.PrepareDesignCandidateHandlers();
+        if (dbgState == 2) { editor.SetDebugVars(dbgVarInfo); }
+        else { editor.SetDebugVars(new List<DbgVar>()); }
+        int left = host.ShapeOffX();
+        int width = host.ClientWidth();
+        int bottom = host.ShapeOffY() + host.ClientHeight();
+        int ribbonHeight = compactHeader ? host.Scale(34) : Ribbon.HeightTabbed(host);
+        int debugHeight = dbgState == 2 ? host.Scale(38) : 0;
+        int statusHeight = host.Scale(22);
+        int top = host.ShapeOffY() + host.ContentTop() + ribbonHeight + debugHeight;
+        int dockHeight = bottom - top - statusHeight;
+        if (dockHeight < 0) { dockHeight = 0; }
+        Rect dockBounds = new Rect(left, top, width, dockHeight);
+        outputPanel.SetShown(dbgState != 2);
+        dbgPanel.SetShown(dbgState == 2);
+        if (dbgState == 2) { dbgPanel.Prepare(host, dbgPanelTab, dbgConsole, dbgVarInfo, dbgWatches, dbgStack); }
+        else { outputPanel.Prepare(host, log); }
+        bool terminalVisible = dock.Visible("terminal");
+        List<string> terminalLines = log;
+        if (terminalVisible && termFp == 0 && this.TermEnsure() == 0) {
+            terminalLines = new List<string>();
+            terminalLines.Add(ZanIDE.T("(could not open a shell session)", "（无法打开 shell 会话）"));
+        }
+        terminalPanel.Prepare(host, terminalLines, terminalVisible);
+        dock.PrepareHost(host, dockBounds);
+        if (!this.AiInWindow() && !dock.IsHidden("agent")) {
+            if (aiPanel.parent == null) { dock.SetContent("agent", aiPanel); }
+            this.PrepareAiPanel(host, dock.ContentParked("agent"));
+            dock.PrepareHost(host, dockBounds);
+        }
+        Rect area = dock.Content("editor");
+        int tabsHeight = editorTabs != null ? editorTabs.HeaderHeight(host) : host.theme.heightMedium;
+        Rect body = new Rect(area.x, area.y + tabsHeight, area.width, area.height - tabsHeight);
+        this.PrepareDesignTabs(host, body);
+        int act = activeTab.Get();
+        string path = act >= 0 && act < tabs.Count ? tabs[act].path : "";
+        this.PrepareDocumentPages(host, body, path);
+        bool design = this.DesignTabsApplicable();
+        bool code = design && codeViewForm == path && this.DesignCodeReady();
+        bool regular = !design && path != "" && path != "@start" && path != "@docs" && !path.StartsWith("@diff:");
+        editor.SetShown(regular);
+        formCodeEd.SetShown(code);
+        if (regular) {
+            ZanIDE.ApplyEditorTheme(host, editor, edThemeIdx, edFontPx);
+            editor.UseApp(host); editor.MeasureTree(host, body.width);
+            editor.Arrange(body.x, body.y, body.width, body.height);
+        }
+        if (code) {
+            int designHeight = host.Scale(26);
+            ZanIDE.ApplyEditorTheme(host, formCodeEd, edThemeIdx, edFontPx);
+            formCodeEd.UseApp(host); formCodeEd.MeasureTree(host, body.width);
+            formCodeEd.Arrange(body.x, body.y + designHeight, body.width, body.height - designHeight);
+        }
+        this.PrepareStatusBar(host);
+        statusBar.UseApp(host); statusBar.MeasureTree(host, width);
+        statusBar.Arrange(left, bottom - statusHeight, width, statusHeight);
+        this.SyncPublishDialog();
+    }
+}
