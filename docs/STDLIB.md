@@ -796,6 +796,161 @@ not the program's eventual exit status.
 `Process.Spawn` currently provides live stdin/stdout pipes on Windows; the
 POSIX implementation returns `null`.
 
+### 3.10 Zan.Gui — retained preparation and style contracts
+
+**Current implementation** — checked against source on 2026-11-17.
+`Zan.Gui` is a package; the following contracts apply to its retained controls
+and borrowed input roots.
+
+Lifecycle notifications run in the shared preparation phase, before input
+routing or frame presentation. `Control.PrepareLayoutEvents` commits visibility
+and size before invoking `Hide`, `Show` or `Resize` handlers. The first visible
+preparation establishes a baseline without an initial `Show` or `Resize`.
+`RenderTree` does not replay those notifications. Borrowed roots participate
+through `LayoutChildren`, `OwnsLayoutChild`, `LayoutChildVisible` and
+`LayoutRevision`; they keep their existing parent relationships. After user
+callbacks, preparation rechecks the App, root generation, event, preparation
+phase and ownership revision. Retirement and rebinding must preserve those
+checks so an old walk cannot continue into a replacement session.
+`AppPreparationParticipant` implementations call `App.InvalidatePreparation()`
+when a business callback invalidates their current preparation turn. It checks
+loop-thread ownership and advances the existing preparation ticket, stopping the
+remaining input or paint preparation. Installing an input root during a valid
+preparation remains supported; root installation alone does not cancel the turn.
+
+Drawing rechecks the frame and node ownership after `OnPaint`, the `Paint` event
+and each child traversal. A callback that hides, removes or transfers the current
+subtree stops its remaining drawing; a frame invalidated by root, event or
+preparation changes stops before another subtree can inherit the obsolete App.
+Removing one child leaves valid siblings eligible to draw. Early returns and
+exceptions restore the clip stack, style context and paint hash scope.
+
+`OverlayHost` checks its registration and the App/root, event, preparation and
+frame identities immediately after measuring or arranging a popup. An invalidated
+turn stops before its remaining layout or lifecycle callbacks. Point popups keep
+their registration and resume on a fresh preparation. Hidden and zero-size popups
+retire during preparation; `RenderAll` only draws prepared controls and does not
+change focus, claim clicks or register legacy hit blockers.
+
+Configure a `HudLayer` with `SetBounds` (or `UseDefaultBounds`) and `Bind(app)`
+before shared App preparation. `Paint(app)` only draws its prepared tree while
+its input adapter remains in that App's current root chain. Repeated painting
+does not bind, measure, arrange or reset the region; painting a hidden, detached
+or transferred layer does not reinstall it. Adding a member to an already bound
+layer invalidates the current preparation ticket. The new member is measured and
+arranged by the next shared preparation before it can be painted.
+The former `Render`, `RenderIn`,
+`RenderViewport`, `PrepareLayout` and `BindInputRoot` entry points are removed.
+HUD hit testing forwards the complete `excludedSubtrees` list through both
+HUD controls and fallback content. Borrowed hosts share the normal lifecycle
+walk; they do not dispatch a second notification traversal. Measurement may
+follow a control transferred to another App during a callback, while recursive
+measurement in an App already active on that control's measurement stack is
+suppressed. Temporary measurement guards are released when the call returns.
+When a parent supplies an available width, measurement synchronizes the child's
+binding once, resolves its current style, then calculates the width from its
+current margins and width declaration. A binding change takes effect in that
+same pass; the temporary constraint is restored on return.
+
+`Control.EffectiveClass()` returns the author's `Class` by default. `Input`
+overrides it to project `Size`, sanitized `FieldStatus` and `Round` into visual
+classes without rewriting `Class` or `GetProp("class")`. Normal style resolution,
+cache identity, selector context, `:has`, input parts and input geometry use
+that projection. Input painting does not update `liveApp` or
+`lastKeyNamedSeq`; host and key-sequence bookkeeping belongs to preparation
+and input handling.
+
+`Pagination.Page` is a `Binding<int>`. Use its typed binding or the `page`
+property for the current page; the generic property aliases `data` and `value`
+are still accepted, but are not Signal objects. For example, with
+`using System;` and `using Gui.Widget;`:
+
+```csharp
+Binding<int> page = 1;
+Pagination pager = Pagination.WithCount(101, 10, page);
+pager.SetPage(3);  // page.Get() is now 3
+```
+
+`Pagination.SyncBinding()` checks the current binding and rebuilds generated
+children before measurement. Its paint path does not read the page binding or
+rebuild the tree. The prepared buttons can receive routed input before their
+first paint.
+
+`ChatView` bubble avatars are retained children prepared by its layout and scroll
+callbacks. Each visible message has its own avatar and generated label; painting
+does not change its text or geometry. Avatar clicks use those same prepared child
+bounds. Empty messages, reset and switching to log mode retire the avatar children.
+The former `Control.RenderAt` overloads, which measured and arranged while drawing,
+are removed; hosts prepare layout separately and draw with `RenderTree`.
+
+The IDE's Start and Diff pages are retained children of its shell. Shell
+preparation selects, measures and arranges the visible document page before
+input; painting only renders that prepared tree. Page actions use weak instance
+owners instead of static current-page mailboxes. Diff refreshes observe both
+same-path staged-content changes and acceptance state, and retire queued actions
+when the prepared content changes. Start data reads and recent-project mutations
+share the existing persistence queue; Diff writes run in the background. Completion
+updates the original staging snapshot and only adopts editor results when the
+workspace, tab instance and intervening edits still permit it.
+
+The caption's theme action opens a standard retained `Drawer` through
+`OverlayHost`. Its appearance and motion pages share normal controls, preparation
+and routed input; painting neither rebuilds settings nor registers hit blockers.
+Settings include skin previews, accent, density, opacity, wallpaper, animation
+and background effects. An accent override reaches both skin rules and application
+CSS variables, persists across skin changes and yields to the skin when reset.
+Closing the drawer retires its input before the next
+paint, and an outside press cannot click through to the underlying page.
+The built-in skins are `porcelain` (浅色), `graphite` (石墨) and `navy` (深蓝).
+They share typography, spacing and density; switching skins changes their palette.
+Custom skin packages remain discoverable through `Skin.Names()`. The IDE restores
+saved skin names and falls back to `porcelain` when a saved name is unavailable.
+
+The IDE shell lays out content inside the shaped window's client bounds, excluding
+the outer shadow band. `DockHost.SetCenterReserve(widthPercent, heightPercent)`
+optionally preserves a share of the workspace for its central document area; zero
+retains the default absolute minimum. Preview, preparation and splitter dragging
+use the same geometry resolver. When both side panels exceed the available width,
+they shrink in proportion to their requested extents. Temporary clamping does not
+rewrite saved extents; dragging starts at the currently visible splitter.
+
+`App.AutomationRoot()` observes the current live layout host, falling back to the
+input root when no control owns that layout scope. UiDriver tree snapshots use
+this layout tree, while `inputTargets` observe the actual routed input root and
+active overlay. A composed input adapter therefore does not hide the window's
+visual tree; scope retirement restores the prior host without a static root.
+Click subscriptions appear as pointer endpoints independently of Tab focus capability;
+labels with click handlers remain observable without entering keyboard traversal.
+
+`App.SetWindowShadow()` may precede the first `SetWindowShape()` call: that first
+shape inherits the pending shadow unless its description already supplies a
+shadow. Clearing the shape clears its shadow. Shaped `ChildWindow` hosts draw the
+same standard background and shadow stage as `Form`; maximization removes the
+outer shape and restoration restores its original description and shadow band.
+The base `windowbg` and `windowbg::shape` styles use the opaque `--window-bg`
+substrate. Software glass keeps translucent controls inside that substrate;
+it does not expose the desktop through a rounded window. Explicit shape-background
+alpha, native glass and whole-window opacity remain independent choices.
+
+`Layer.Open(app)` and queued messages register with the shared preparation and
+input pipeline. App draws their prepared window and queue trees before modal
+overlays. Callers no longer use `Layer.RenderStack` or a public `QueueHost` to
+measure or draw those trees themselves. Replacing a window footer updates its
+actual adopted child; minimizing a window restricts hits to its taskbar bounds.
+
+Sources: [Control lifecycle](../packages/Zan.Gui/src/Gui/Core/Control/Control.Lifecycle.zan),
+[tree drawing](../packages/Zan.Gui/src/Gui/Core/Control/Control.Render.zan),
+[App preparation](../packages/Zan.Gui/src/Gui/Core/App/App.PreparationParticipants.zan),
+[measurement](../packages/Zan.Gui/src/Gui/Core/Control/Control.Layout.zan),
+[style resolution](../packages/Zan.Gui/src/Gui/Core/Control/Control.Style.zan),
+[selector context](../packages/Zan.Gui/src/Gui/Styling/Style/Style.zan),
+[selector matching](../packages/Zan.Gui/src/Gui/Styling/Models/Selector.zan),
+[Input](../packages/Zan.Gui/src/Gui/Widget/Input.zan),
+[Pagination](../packages/Zan.Gui/src/Gui/Widget/Pagination.zan),
+[borrowed root adapter](../packages/Zan.Gui/src/Gui/Core/InputRootAdapter.zan),
+[HUD input root](../packages/Zan.Game/src/Game/Foundation/Gui/HudInputRoot.zan),
+[HUD layer](../packages/Zan.Game/src/Game/Foundation/Gui/HudLayer.zan).
+
 ## 4. Module Resolution Rules
 
 ### 4.1 Search Order
