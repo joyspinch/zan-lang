@@ -4221,6 +4221,8 @@ find_program(SELFHOST_CLANG NAMES clang)
 # Previously the harnesses carried their own copy and the bootstrap scripts
 # still listed a 9-file subset -- a source added to one place was silently
 # missing from the closure, which is how the fixed point rotted unnoticed.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/scripts/selfhost_sources.txt)
 file(STRINGS ${CMAKE_SOURCE_DIR}/scripts/selfhost_sources.txt _sh_lines)
 set(SELFHOST_SOURCES)
 foreach(_sh_line IN LISTS _sh_lines)

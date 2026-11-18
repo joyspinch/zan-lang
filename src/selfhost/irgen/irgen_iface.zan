@@ -1,0 +1,260 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+class ClosedInterfaceDispatch {
+    public Node receiver;
+    public Node method;
+    public List<string> paramTypes;
+    public string ret;
+
+    public ClosedInterfaceDispatch(Node receiver, Node method, List<string> paramTypes, string ret) {
+        this.receiver = receiver;
+        this.method = method;
+        this.paramTypes = paramTypes;
+        this.ret = ret;
+    }
+}
+
+partial class Irgen {
+    ExprVal EmitInterfaceCall(ExprVal recv, Node ifc, Node method, Node call) {
+        string owner = DeclOwnerOf(ifc, method);
+        Node ownerType = FindInterfaceInstance(recv.ty, MkType(owner), 0);
+        Node retTy = binder.SubstOwner(method.type, ownerType);
+        string rt = IsAsync(method) ? "i8*" : MapType(retTy);
+        List<Node> actuals = OrderArgs(method, call);
+        List<string> types = new List<string>();
+        string args = "i8* " + Coerce(recv, "i8*");
+        int i = 0;
+        while (i < actuals.Count) {
+            Node pty = binder.SubstOwner(ParamTypeNode(method, i), ownerType);
+            string ll = MapType(pty);
+            string value;
+            if (IsRefParam(method, i) && actuals[i] != null && actuals[i].kind == AK.OutArg()) {
+                ll = ll + "*";
+                if (actuals[i].type != null) { value = NewOutLocal(actuals[i]); }
+                else { value = RefPlacePtr(actuals[i].a, pty); }
+            } else {
+                value = CallArg(GenArgExpr(actuals[i], pty), pty, false);
+            }
+            types.Add(ll);
+            args = args + ", " + ll + " " + value;
+            i = i + 1;
+        }
+        int at = 0;
+        while (at < closedInterfaceDispatches.Count) {
+            ClosedInterfaceDispatch prior = closedInterfaceDispatches[at];
+            if (prior.method == method && binder.SameType(prior.receiver, recv.ty) && prior.ret == rt) { break; }
+            at = at + 1;
+        }
+        if (at == closedInterfaceDispatches.Count) {
+            closedInterfaceDispatches.Add(new ClosedInterfaceDispatch(recv.ty, method, types, rt));
+        }
+        string insn = "call " + rt + " @zinterface_dispatch_" + at + "(" + args + ")";
+        if (rt == "void") {
+            L("  " + insn);
+            return new ExprVal("0", MkType("void"));
+        }
+        string result = NT();
+        L("  " + result + " = " + insn);
+        if (IsAsync(method)) {
+            Node task = MkType("__task"); task.a = retTy;
+            return AsyncFrame(result, task);
+        }
+        AddTemp(result, retTy);
+        return new ExprVal(result, retTy);
+    }
+
+    // Follow each substituted edge of the class/interface inheritance graph.
+    Node FindInterfaceInstance(Node candidate, Node target, int depth) {
+        if (candidate == null || depth >= 64) { return null; }
+        if (candidate.sval == target.sval) {
+            if (target.kids.Count == 0 || binder.SameType(candidate, target)
+                || MentionsTypeParam(target) || MentionsTypeParam(candidate)) { return candidate; }
+            if (candidate.kids.Count != target.kids.Count) { return null; }
+            Node decl = binder.FindType(target.sval);
+            if (decl == null || binder.TypeParams(decl).Count != target.kids.Count) { return null; }
+            int ti = 0;
+            int ai = 0;
+            while (ti < decl.kids.Count) {
+                Node param = decl.kids[ti];
+                if (param.kind == AK.TypeParam()) {
+                    Node from = candidate.kids[ai];
+                    Node to = target.kids[ai];
+                    if (!binder.SameType(from, to) && (param.ival == 0
+                        || !IsPtrLL(MapType(from)) || !IsPtrLL(MapType(to)))) { return null; }
+                    ai = ai + 1;
+                }
+                ti = ti + 1;
+            }
+            if (binder.VariantArgsCompatible(FormatTypeNode(target), FormatTypeNode(candidate))) { return candidate; }
+            return null;
+        }
+        Node found = FindInterfaceInstance(binder.BaseType(candidate), target, depth + 1);
+        if (found != null) { return found; }
+        Node cls = binder.FindType(candidate.sval);
+        if (cls == null || cls.interfaceRefs == null) { return null; }
+        int i = 0;
+        while (i < cls.interfaceRefs.Count) {
+            found = FindInterfaceInstance(binder.SubstOwner(cls.interfaceRefs[i], candidate), target, depth + 1);
+            if (found != null) { return found; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    Node InterfaceImplementation(ClosedInterfaceDispatch dispatch, Node cls, Node instance) {
+        Node receiver = instance == null ? MkType(cls.sval) : instance;
+        Node bound = FindInterfaceInstance(receiver, dispatch.receiver, 0);
+        if (bound == null) { return null; }
+        string owner = DeclOwnerOf(binder.FindType(bound.sval), dispatch.method);
+        Node methodOwner = FindInterfaceInstance(bound, MkType(owner), 0);
+        Node cur = receiver;
+        while (cur != null) {
+            Node decl = binder.FindType(cur.sval);
+            if (decl == null || HasMod(decl, MOD.Iface())) { break; }
+            int i = 0;
+            while (i < decl.kids.Count) {
+                Node m = decl.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == dispatch.method.sval && !IsStatic(m)
+                    && !IsAbstract(m) && IsAsync(m) == IsAsync(dispatch.method)
+                    && MethodParamCount(m) == dispatch.paramTypes.Count) {
+                    int j = 0;
+                    while (j < dispatch.paramTypes.Count) {
+                        if (IsRefParam(m, j) != IsRefParam(dispatch.method, j)) { break; }
+                        Node actual = binder.SubstOwner(ParamTypeNode(m, j), cur);
+                        Node expected = binder.SubstOwner(ParamTypeNode(dispatch.method, j), methodOwner);
+                        if (!binder.SameType(actual, expected)) { break; }
+                        j = j + 1;
+                    }
+                    if (j == dispatch.paramTypes.Count) { return m; }
+                }
+                i = i + 1;
+            }
+            cur = binder.BaseType(cur);
+        }
+        return null;
+    }
+
+    string QueueInterfaceTarget(Node cls, Node instance, Node method, string owner) {
+        if (instance == null || !MentionsTPDeep(method)) { return MethodSym(owner, method); }
+        List<string> names = TParams(binder.FindType(owner));
+        List<Node> args = TypeArgsForAncestor(cls, owner, instance.kids);
+        if (names.Count == 0 || args == null || args.Count != names.Count) { return MethodSym(owner, method); }
+        string tag = SpecTagC(method, args, new List<string>(), names, args, "I");
+        if (tag == "") { return MethodSym(owner, method); }
+        return SpecQueueTy(owner, method, names, args, tag, InstType(owner, args));
+    }
+
+    // Concrete targets can discover more allocations and interface calls.
+    void QueueClosedInterfaceTargets() {
+        int i = 0;
+        while (i < closedInterfaceDispatches.Count) {
+            ClosedInterfaceDispatch dispatch = closedInterfaceDispatches[i];
+            int j = 0;
+            while (j < specVtSyms.Count) {
+                Node cls = specVtCls[j];
+                Node instance = specVtArgs[j];
+                Node method = InterfaceImplementation(dispatch, cls, instance);
+                if (method != null) { QueueInterfaceTarget(cls, instance, method, DeclOwnerOf(cls, method)); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Both signatures are known here. Reinterpret only the erased slot or the
+    // pointer representation, after source-level conversions at the call site.
+    string InterfaceOperand(string value, string from, string to) {
+        if (from == to) { return value; }
+        if (from == "i64") { return FromI64(value, to); }
+        if (to == "i64") { return ToI64(value, from); }
+        string converted = NT();
+        L("  " + converted + " = bitcast " + from + " " + value + " to " + to);
+        return converted;
+    }
+
+    void EmitInterfaceTarget(ClosedInterfaceDispatch dispatch, Node cls, Node instance, string table) {
+        Node method = InterfaceImplementation(dispatch, cls, instance);
+        if (method == null) { return; }
+        string owner = DeclOwnerOf(cls, method);
+        string symbol = QueueInterfaceTarget(cls, instance, method, owner);
+        int spec = IndexOfStr(specSyms, symbol);
+        Node impl = spec < 0 ? method : specMs[spec];
+        string rt = IsAsync(impl) ? "i8*" : MapTypeDecl(impl.type, owner);
+        if ((rt == "void") != (dispatch.ret == "void")) { return; }
+        int i = 0;
+        List<string> types = new List<string>();
+        while (i < dispatch.paramTypes.Count) {
+            string ll = MapTypeDecl(ParamTypeNode(impl, i), owner);
+            if (IsRefParam(impl, i)) {
+                ll = ll + "*";
+                if (ll != dispatch.paramTypes[i]) { return; }
+            }
+            types.Add(ll);
+            i = i + 1;
+        }
+        List<Node> slots = new List<Node>();
+        CollectVSlotNodes(cls, slots);
+        int match = NL(); int next = NL();
+        string cmp = NT();
+        L("  " + cmp + " = icmp eq i8* %tag, bitcast ([" + slots.Count + " x i8*]* @" + table + " to i8*)");
+        L("  br i1 " + cmp + ", label %L" + match + ", label %L" + next);
+        Label(match);
+        string self = NT();
+        L("  " + self + " = bitcast i8* %receiver to %" + owner + "*");
+        string args = "%" + owner + "* " + self;
+        i = 0;
+        while (i < types.Count) {
+            string actual = InterfaceOperand("%p" + i, dispatch.paramTypes[i], types[i]);
+            args = args + ", " + types[i] + " " + actual;
+            i = i + 1;
+        }
+        string call = "call " + rt + " @" + symbol + "(" + args + ")" + StaticDispatchMarker(cls, method, symbol, instance);
+        if (rt == "void") {
+            L("  " + call);
+            L("  ret void");
+        } else {
+            string value = NT();
+            L("  " + value + " = " + call);
+            string result = InterfaceOperand(value, rt, dispatch.ret);
+            L("  ret " + dispatch.ret + " " + result);
+        }
+        Label(next);
+    }
+
+    void EmitClosedInterfaceDispatches() {
+        if (closedInterfaceDispatches.Count == 0) { return; }
+        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+        int i = 0;
+        while (i < closedInterfaceDispatches.Count) {
+            ClosedInterfaceDispatch dispatch = closedInterfaceDispatches[i];
+            string sig = "define internal " + dispatch.ret + " @zinterface_dispatch_" + i + "(i8* %receiver";
+            int j = 0;
+            while (j < dispatch.paramTypes.Count) {
+                sig = sig + ", " + dispatch.paramTypes[j] + " %p" + j;
+                j = j + 1;
+            }
+            tmp = 0; lbl = 0;
+            L(sig + ") {"); L("entry:");
+            L("  %tagp = bitcast i8* %receiver to i8**");
+            L("  %tag = load i8*, i8** %tagp");
+            j = 0;
+            while (j < specVtSyms.Count) {
+                EmitInterfaceTarget(dispatch, specVtCls[j], specVtArgs[j], specVtSyms[j]);
+                j = j + 1;
+            }
+            j = 0;
+            while (j < binder.types.Count) {
+                Node cls = binder.types[j];
+                if (cls.kind == AK.ClassDecl() && !HasMod(cls, MOD.Abstract()) && !HasMod(cls, MOD.Iface()) && IsPolyClass(cls)) {
+                    EmitInterfaceTarget(dispatch, cls, null, cls.sval + "_vtable");
+                }
+                j = j + 1;
+            }
+            L("  call void @abort()");
+            L("  unreachable"); L("}");
+            i = i + 1;
+        }
+    }
+}
