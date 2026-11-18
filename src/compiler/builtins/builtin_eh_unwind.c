@@ -628,6 +628,22 @@ void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind) {
     LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     zan_call2(g->builder, fnty, get_eh_tmp_push_fn(g), &tagged, 1, "");
 }
+void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value) {
+    /* Erased delegates carry a closure tag, not EH kind bits. Both branches
+     * register exactly one owner for the caller's single normal-path pop. */
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef dlg = LLVMAppendBasicBlockInContext(g->ctx, fn, "tmp.edlg");
+    LLVMBasicBlockRef obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "tmp.eobj");
+    LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "tmp.eend");
+    LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, value), dlg, obj);
+    LLVMPositionBuilderAtEnd(g->builder, dlg);
+    emit_eh_tmp_push_slot(g, value, ZAN_EH_SLOT_DLG);
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, obj);
+    emit_eh_tmp_push(g, value);
+    LLVMBuildBr(g->builder, done);
+    LLVMPositionBuilderAtEnd(g->builder, done);
+}
 void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef mp = emit_eh_mark_ptr(g, top);

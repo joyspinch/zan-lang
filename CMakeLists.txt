@@ -3484,7 +3484,8 @@ foreach(_src ${_conf_srcs})
   # 1500s default and one hung case alone costs 25 minutes.
   set(_case_strict_args "")
   set(_case_workdir_arg "")
-  if(_name STREQUAL "lambda_local_exception_cleanup")
+  if(_name STREQUAL "lambda_local_exception_cleanup" OR
+     _name STREQUAL "arc_callback_receiver_lifetime")
     set(_case_strict_args ";-g;--strict-runtime;--check-leaks;--arc-guard")
     set(_case_workdir_arg "-DWORKDIR=${CMAKE_SOURCE_DIR}")
   endif()
@@ -3511,7 +3512,8 @@ foreach(_src ${_conf_srcs})
   endif()
   set_tests_properties(case_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT ${_case_timeout})
-  if(_name STREQUAL "lambda_local_exception_cleanup")
+  if(_name STREQUAL "lambda_local_exception_cleanup" OR
+     _name STREQUAL "arc_callback_receiver_lifetime")
     set_tests_properties(case_${_name} PROPERTIES
       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
   endif()

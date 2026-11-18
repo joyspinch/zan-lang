@@ -1,0 +1,250 @@
+using System;
+
+interface CallbackReceiverContract {
+    int Fire(bool fail);
+}
+
+class CallbackReceiver : CallbackReceiverContract {
+    public Action callback;
+    public int value = 42;
+
+    public int Fire(bool fail) {
+        callback();
+        if (fail) { throw new Exception("receiver callback failure"); }
+        return value;
+    }
+
+    public T Echo<T>(T value) {
+        callback();
+        return value;
+    }
+
+    public int Argument(int supplied) {
+        return value + supplied;
+    }
+
+    public CallbackReceiver ReturnThis() {
+        callback();
+        return this;
+    }
+
+    public int Observe(CallbackReceiverOwner owner) {
+        owner.aliveInCall = owner.witness != null;
+        return value;
+    }
+}
+
+class OtherCallbackReceiver : CallbackReceiverContract {
+    public int Fire(bool fail) { return 0; }
+}
+
+class CallbackReceiverOwner {
+    public CallbackReceiver node;
+    public CallbackReceiverContract contract;
+    public weak CallbackReceiver witness;
+    public bool aliveInCallback;
+    public bool aliveInCall;
+    public int calls;
+
+    public void Start() {
+        node = new CallbackReceiver();
+        witness = node;
+        node.callback = this.Clear;
+        aliveInCallback = false;
+    }
+
+    public void Clear() {
+        calls = calls + 1;
+        node = null;
+        contract = null;
+        aliveInCallback = witness != null;
+    }
+
+    public int ClearArgument() {
+        this.Clear();
+        return 8;
+    }
+}
+
+class ArcCallbackReceiverLifetime {
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static void FieldCalls() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        owner.Start();
+        Check(owner.node.Fire(false) == 42, "field receiver value");
+        Check(owner.aliveInCallback, "field receiver alive in callback");
+        Check(owner.witness == null, "field receiver retired after return");
+
+        owner.Start();
+        bool caught = false;
+        try { owner.node.Fire(true); }
+        catch (Exception error) { caught = true; }
+        Check(caught && owner.aliveInCallback, "throwing receiver alive in callback");
+        Check(owner.witness == null, "throwing receiver retired after unwind");
+
+        owner.Start();
+        Check(owner.node.Echo<int>(73) == 73, "generic receiver result");
+        Check(owner.aliveInCallback, "generic receiver alive in callback");
+        Check(owner.witness == null, "generic receiver retired after return");
+
+        owner.Start();
+        Check(owner.node.Argument(owner.ClearArgument()) == 50, "receiver survives argument evaluation");
+        Check(owner.aliveInCallback && owner.witness == null, "argument receiver lifetime");
+
+        owner.Start();
+        Check(owner.witness.Argument(owner.ClearArgument()) == 50, "weak receiver survives argument evaluation");
+        Check(owner.aliveInCallback && owner.witness == null, "weak receiver retires at call boundary");
+    }
+
+    static int BorrowedParameter(CallbackReceiver receiver) {
+        return receiver.Fire(false);
+    }
+
+    static void ParameterCalls() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        owner.Start();
+        Check(BorrowedParameter(owner.node) == 42, "borrowed parameter result");
+        Check(owner.aliveInCallback, "borrowed parameter alive in callback");
+        Check(owner.witness == null, "borrowed parameter retired after call");
+    }
+
+    static void InterfaceCalls() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        // Keep two concrete implementers live so interface dispatch cannot collapse
+        // to the single-implementation shortcut.
+        CallbackReceiverContract other = new OtherCallbackReceiver();
+        Check(other.Fire(false) == 0, "second interface implementation");
+        owner.Start();
+        owner.contract = owner.node;
+        owner.node = null;
+        Check(owner.contract.Fire(false) == 42, "interface receiver value");
+        Check(owner.aliveInCallback, "interface receiver alive in callback");
+        Check(owner.witness == null, "interface receiver retired after return");
+
+        owner.Start();
+        owner.contract = owner.node;
+        owner.node = null;
+        bool caught = false;
+        try { owner.contract.Fire(true); }
+        catch (Exception error) { caught = true; }
+        Check(caught && owner.aliveInCallback, "interface receiver alive during throw");
+        Check(owner.witness == null, "interface receiver retired after unwind");
+    }
+
+    static void CapturedLocal() {
+        CallbackReceiver receiver = new CallbackReceiver();
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        owner.witness = receiver;
+        bool alive = false;
+        receiver.callback = () => {
+            receiver = null;
+            alive = owner.witness != null;
+        };
+        Check(receiver.Fire(false) == 42, "captured receiver result");
+        Check(alive, "captured receiver alive in callback");
+        Check(owner.witness == null, "captured receiver retired after return");
+    }
+
+    static int ClearRefArgument(ref CallbackReceiver receiver, CallbackReceiverOwner owner, bool fail) {
+        receiver = null;
+        owner.aliveInCallback = owner.witness != null;
+        if (fail) { throw new Exception("ref argument failure"); }
+        return 8;
+    }
+
+    static void OwnedLocalRefArgument() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        CallbackReceiver receiver = new CallbackReceiver();
+        owner.witness = receiver;
+        Check(receiver.Argument(ClearRefArgument(ref receiver, owner, false)) == 50,
+        "owned local receiver result");
+        Check(receiver == null && owner.aliveInCallback, "owned local alive after ref clear");
+        Check(owner.witness == null, "owned local retired at call boundary");
+
+        receiver = new CallbackReceiver();
+        owner.witness = receiver;
+        bool caught = false;
+        try { receiver.Argument(ClearRefArgument(ref receiver, owner, true)); }
+        catch (Exception error) { caught = true; }
+        Check(caught && receiver == null && owner.aliveInCallback, "owned local alive before argument throw");
+        Check(owner.witness == null, "owned local retired on argument unwind");
+    }
+
+    static int NestedArgument(CallbackReceiverOwner owner, bool fail) {
+        owner.Clear();
+        try { throw new Exception("nested argument handler"); }
+        catch (Exception error) {
+            Check(owner.witness != null, "outer receiver survives nested handler");
+        }
+        if (fail) { throw new Exception("outer argument failure"); }
+        return 8;
+    }
+
+    static void NestedArgumentEh() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        owner.Start();
+        Check(owner.node.Argument(NestedArgument(owner, false)) == 50, "nested argument result");
+        Check(owner.aliveInCallback && owner.witness == null, "nested handler preserves receiver owner");
+        owner.Start();
+        bool caught = false;
+        try { owner.node.Argument(NestedArgument(owner, true)); }
+        catch (Exception error) { caught = true; }
+        Check(caught && owner.aliveInCallback && owner.witness == null, "nested argument unwinds receiver owner");
+    }
+
+    static Action TaggedCapture(CallbackReceiverOwner owner) {
+        CallbackReceiver capture = new CallbackReceiver();
+        owner.witness = capture;
+        return () => { capture.Argument(0); };
+    }
+
+    static bool ThrowTaggedArgument(CallbackReceiverOwner owner) {
+        Check(owner.witness != null, "tagged receiver capture alive before argument throw");
+        owner.aliveInCall = true;
+        throw new Exception("tagged argument failure");
+        return false;
+    }
+
+    static void TaggedReceiverEh() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        bool caught = false;
+        // The argument throws before interface dispatch; the owned erased
+        // closure must still release its captured owner on this EH path.
+        try { ((CallbackReceiverContract)TaggedCapture(owner)).Fire(ThrowTaggedArgument(owner)); }
+        catch (Exception error) { caught = true; }
+        Check(caught && owner.aliveInCall && owner.witness == null, "tagged receiver capture retired on unwind");
+    }
+
+    static void ReturnedThis() {
+        CallbackReceiverOwner owner = new CallbackReceiverOwner();
+        owner.Start();
+        Check(owner.node.ReturnThis().Observe(owner) == 42 && owner.witness == null,
+        "returned this retired in the same expression");
+        Check(owner.aliveInCallback && owner.aliveInCall, "returned this alive through the consuming call");
+    }
+
+    static void OwnedAndNull() {
+        Check(new CallbackReceiver().Argument(8) == 50, "owned temporary receiver");
+        CallbackReceiver receiver = null;
+        bool caught = false;
+        try { receiver.Argument(8); }
+        catch (Exception error) { caught = true; }
+        Check(caught, "null receiver still throws");
+    }
+
+    static void Main() {
+        FieldCalls();
+        ParameterCalls();
+        InterfaceCalls();
+        CapturedLocal();
+        OwnedLocalRefArgument();
+        NestedArgumentEh();
+        TaggedReceiverEh();
+        ReturnedThis();
+        OwnedAndNull();
+        Console.WriteLine("CALLBACK_RECEIVER_LIFETIME_OK");
+    }
+}

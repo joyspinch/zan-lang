@@ -176,7 +176,7 @@ partial class Irgen {
         return locName.Count;
     }
 
-    void TransferAwaitTemp(ExprVal value) {
+    bool TransferTempOwner(ExprVal value) {
         int i = stmtTemps.Count - 1;
         while (i >= 0) {
             string op = stmtTemps[i];
@@ -186,10 +186,41 @@ partial class Irgen {
                     L("  store " + lt + " null, " + lt + "* " + op);
                 }
                 stmtTemps.RemoveAt(i); stmtTempTypes.RemoveAt(i);
-                return;
+                return true;
             }
             i = i - 1;
         }
+        return false;
+    }
+
+    void TransferAwaitTemp(ExprVal value) {
+        TransferTempOwner(value);
+    }
+
+    string HoldCallReceiver(ExprVal recv) {
+        Node cls = ClassOf(recv.ty);
+        if (cls == null || cls.kind == AK.StructDecl() || recv.op == "%this"
+        || !ArcManaged(recv.ty) || !IsPtrLL(MapType(recv.ty))) { return ""; }
+        // The loaded value needs its own owner even when its local slot owns it:
+        // a ref argument or callback may replace that slot before dispatch.
+        // Adopt +1 expression results so they retire at this call boundary.
+        if (!TransferTempOwner(recv)) { EmitArcRetain(recv.op, recv.ty); }
+        string lt = MapType(recv.ty);
+        string slot = NTS(); EA(slot, lt);
+        if (eaActive) { entryAllocas.Append("  store " + lt + " null, " + lt + "* " + slot + "\n"); }
+        L("  store " + lt + " " + recv.op + ", " + lt + "* " + slot);
+        ArmLocalSlot(slot, recv.ty, false);
+        return slot;
+    }
+
+    void DropCallReceiver(string slot, Node ty) {
+        if (slot == "") { return; }
+        string lt = MapType(ty);
+        RetireLocalSlot(slot, lt);
+        string value = NT();
+        L("  " + value + " = load " + lt + ", " + lt + "* " + slot);
+        L("  store " + lt + " null, " + lt + "* " + slot);
+        EmitArcRelease(value, ty);
     }
 
     void RetireLocalSlot(string slot, string lt) {

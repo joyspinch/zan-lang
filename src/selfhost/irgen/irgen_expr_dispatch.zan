@@ -264,6 +264,36 @@ partial class Irgen {
     // the base class' own body, not the override (src/compiler/irgen_call.c:
     // base_recv -> emit_dispatch_call with a NULL class).
     ExprVal EmitInstanceCallAs(ExprVal recv, string clsName, string name, Node e, bool direct) {
+        // Save the actual owner before a null guard can substitute scratch.
+        string owner = HoldCallReceiver(recv);
+        ExprVal target = GuardCallReceiver(recv, name, e, direct);
+        ExprVal result = EmitInstanceCallCore(target, clsName, name, e, direct);
+        DropCallReceiver(owner, recv.ty);
+        return result;
+    }
+
+    ExprVal GuardCallReceiver(ExprVal recv, string name, Node e, bool direct) {
+        if (direct || e.a == null || e.a.kind != AK.MemberAccess()
+        || !IsPtrLL(MapType(recv.ty))) { return recv; }
+        string rt = MapType(recv.ty);
+        string isNull = NT();
+        L("  " + isNull + " = icmp eq " + rt + " " + recv.op + ", null");
+        Node obj = e.a.a;
+        string receiverName = obj != null && obj.kind == AK.Ident() && obj.sval != ""
+        ? obj.sval : name;
+        EmitRuntimeCheckIf(e, isNull, "null reference: receiver '" + receiverName + "' is null");
+        if (!ExternSeen("__zan_soft_scratch")) {
+            externDecls.Add("__zan_soft_scratch");
+            H("@__zan_soft_scratch = internal global [64 x i8] zeroinitializer");
+        }
+        string scratch = NT();
+        L("  " + scratch + " = getelementptr inbounds [64 x i8], [64 x i8]* @__zan_soft_scratch, i64 0, i64 0");
+        string selected = NT();
+        L("  " + selected + " = select i1 " + isNull + ", i8* " + scratch + ", i8* " + recv.op);
+        return new ExprVal(selected, recv.ty);
+    }
+
+    ExprVal EmitInstanceCallCore(ExprVal recv, string clsName, string name, Node e, bool direct) {
         Node cls = binder.FindType(clsName);
         // the receiver's instantiated type (Query<Entity>) is what binds the
         // declaration's type parameters while overload scoring looks at the

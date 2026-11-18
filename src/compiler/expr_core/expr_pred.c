@@ -95,11 +95,9 @@ void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr,
              (int)field->name.len, field->name.str);
     emit_runtime_check(g, is_null, loc, msg);
 }
-LLVMValueRef emit_guarded_member_object_ex(zan_irgen_t *g,
-                                                  zan_ast_node_t *member,
-                                                  local_scope_t *locals,
-                                                  bool async_gate) {
-    LLVMValueRef value = emit_expr(g, member->member.object, locals);
+static LLVMValueRef guard_member_object_value(zan_irgen_t *g,
+        zan_ast_node_t *member, local_scope_t *locals, bool async_gate,
+        LLVMValueRef value) {
     if (member && !member->member.null_cond)
         emit_weak_read_guard(g, member->member.object, value,
                              member->member.object->loc, locals);
@@ -141,6 +139,40 @@ LLVMValueRef emit_guarded_member_object_ex(zan_irgen_t *g,
         }
     }
     return value;
+}
+
+LLVMValueRef emit_guarded_member_object_ex(zan_irgen_t *g,
+        zan_ast_node_t *member, local_scope_t *locals, bool async_gate) {
+    LLVMValueRef value = emit_expr(g, member->member.object, locals);
+    return guard_member_object_value(g, member, locals, async_gate, value);
+}
+
+LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
+        LLVMValueRef value, local_scope_t *locals) {
+    zan_type_t *type = infer_expr_type(g, object, locals);
+    if (g->current_fn_no_runtime || !object || !type ||
+        (type->kind != TYPE_CLASS && type->kind != TYPE_INTERFACE) ||
+        object->kind == AST_THIS_EXPR || object->kind == AST_BASE_EXPR ||
+        expr_yields_owned_rc_value(g, object, locals) ||
+        LLVMGetTypeKind(LLVMTypeOf(value)) != LLVMPointerTypeKind) return NULL;
+    /* Protect the loaded value before null guards substitute scratch. Even an
+     * owned local's slot can be cleared by a ref argument before dispatch. */
+    emit_retain_obj_value(g, value);
+    emit_eh_tmp_push_obj(g, value);
+    return value;
+}
+
+LLVMValueRef emit_call_member_object(zan_irgen_t *g, zan_ast_node_t *member,
+        local_scope_t *locals, bool async_gate, LLVMValueRef *borrowed_owner) {
+    LLVMValueRef value = emit_expr(g, member->member.object, locals);
+    *borrowed_owner = emit_hold_call_receiver(g, member->member.object, value, locals);
+    return guard_member_object_value(g, member, locals, async_gate, value);
+}
+
+void emit_drop_call_receiver(zan_irgen_t *g, LLVMValueRef borrowed_owner) {
+    if (!borrowed_owner) return;
+    emit_eh_tmp_pop(g);
+    emit_release_obj_value(g, borrowed_owner);
 }
 
 /* 读路径（字段/下标/属性等）维持原口径：软基址替换，报告后继续。 */

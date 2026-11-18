@@ -176,6 +176,7 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
         (size_t)(total > 0 ? total : 1), sizeof(zan_ast_node_t *));
     int *arg_eh_pushed = (int *)calloc(
         (size_t)(total > 0 ? total : 1), sizeof(int));
+    LLVMValueRef borrowed_receiver = NULL;
     if (this_off) {
         LLVMTypeRef this_ty = LLVMTypeOf(LLVMGetParam(sp.fn, 0));
         LLVMValueRef self;
@@ -185,9 +186,11 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
                              (sp.msym->decl->method_decl.modifiers & MOD_ASYNC) != 0);
             if (call && call->kind == AST_CALL && call->call.callee &&
                 call->call.callee->kind == AST_MEMBER_ACCESS) {
-                self = emit_guarded_member_object_ex(g, call->call.callee, locals, is_async);
+                self = emit_call_member_object(g, call->call.callee, locals,
+                    is_async, &borrowed_receiver);
             } else {
                 self = emit_expr(g, recv_expr, locals);
+                borrowed_receiver = emit_hold_call_receiver(g, recv_expr, self, locals);
             }
         } else {
             self = LLVMBuildLoad2(g->builder,
@@ -202,7 +205,7 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
             !expr_is_local_ident(recv_expr, locals) &&
             expr_yields_owned_rc_value(g, recv_expr, locals) &&
             LLVMGetTypeKind(LLVMTypeOf(self)) == LLVMPointerTypeKind) {
-            emit_eh_tmp_push(g, self);
+            emit_eh_tmp_push_obj(g, self);
             arg_eh_pushed[0] = 1;
         }
     }
@@ -228,6 +231,7 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     for (int j = 0; j < total; j++)
         if (aexprs[j])
             emit_release_owned_call_temp(g, aexprs[j], call_args[j], locals);
+    emit_drop_call_receiver(g, borrowed_receiver);
     free(arg_eh_pushed);
     free(aexprs);
     free(call_args);
@@ -339,7 +343,7 @@ int emit_intrinsic_own_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
     if (!lt || !is_rc_managed_type(lt) ||
         expr_is_local_ident(lobj, locals) ||
         !expr_yields_owned_rc_value(g, lobj, locals)) return 0;
-    emit_eh_tmp_push(g, recv);
+    emit_eh_tmp_push_obj(g, recv);
     return 1;
 }
 void emit_intrinsic_drop_recv(zan_irgen_t *g, zan_ast_node_t *lobj,
@@ -361,26 +365,9 @@ int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
     }
     int ehk = eh_slot_kind_of(at);
     if (ehk == ZAN_EH_SLOT_OBJ) {
-        /* Erased delegate tags must not be interpreted as EH kind bits.
-         * Each branch pushes one entry for the caller's single pop. */
-        LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-        LLVMBasicBlockRef dlg = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.edlg");
-        LLVMBasicBlockRef obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.eobj");
-        LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "arg.eend");
-        LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, val), dlg, obj);
-        LLVMPositionBuilderAtEnd(g->builder, dlg);
-        emit_eh_tmp_push_slot(g, val, ZAN_EH_SLOT_DLG);
-        LLVMBuildBr(g->builder, done);
-        LLVMPositionBuilderAtEnd(g->builder, obj);
-        emit_eh_tmp_push(g, val);
-        LLVMBuildBr(g->builder, done);
-        LLVMPositionBuilderAtEnd(g->builder, done);
-        return 1;
-    }
-    if (ehk != ZAN_EH_SLOT_OBJ) {
-        emit_eh_tmp_push_slot(g, val, ehk);
+        emit_eh_tmp_push_obj(g, val);
     } else {
-        emit_eh_tmp_push(g, val);
+        emit_eh_tmp_push_slot(g, val, ehk);
     }
     return 1;
 }

@@ -105,6 +105,7 @@
                                 int argc = expr->call.args.count + recv_off;
                                 LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                                     (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
+                                LLVMValueRef borrowed_receiver = NULL;
                                 if (!callee_static) {
                                     LLVMTypeRef at = local_slot_type(g, local);
                                     if (LLVMGetTypeKind(at) == LLVMPointerTypeKind) {
@@ -112,6 +113,8 @@
                                     } else {
                                         call_args[0] = local->alloca;
                                     }
+                                    borrowed_receiver = emit_hold_call_receiver(g,
+                                        callee->member.object, call_args[0], locals);
                                     /* null 接收者 guard（TASKS.md A507）：这条
                                      * 局部变量快速路径曾完全无检查——this=null
                                      * 一路进方法体读字段，SIGSEGV 且无任何诊断
@@ -193,6 +196,7 @@
                                     emit_release_owned_call_temp(g, expr->call.args.items[k],
                                         call_args[k + recv_off], locals);
                                 }
+                                emit_drop_call_receiver(g, borrowed_receiver);
                                 free(call_args);
                                 return result;
                             }
@@ -301,11 +305,13 @@
                             LLVMValueRef *call_args = (LLVMValueRef *)calloc(
                                 (size_t)(argc > 0 ? argc : 1), sizeof(LLVMValueRef));
                             LLVMValueRef recv_val = NULL;
+                            LLVMValueRef borrowed_receiver = NULL;
                             int recv_eh_pushed = 0;
                             if (!callee_static) {
-                                recv_val = emit_guarded_member_object_ex(
+                                recv_val = emit_call_member_object(
                                     g, callee, locals,
-                                    call_is_async_callee(g, expr, locals));
+                                    call_is_async_callee(g, expr, locals),
+                                    &borrowed_receiver);
                                 call_args[0] = recv_val;
                                 if (LLVMGetTypeKind(LLVMTypeOf(recv_val)) == LLVMStructTypeKind) {
                                     LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(recv_val), "recv.tmp");
@@ -355,6 +361,7 @@
                                 emit_release_owned_call_temp(g, expr->call.args.items[k],
                                     call_args[k + recv_off], locals);
                             }
+                            emit_drop_call_receiver(g, borrowed_receiver);
                             free(call_args);
                             return result;
                         }
@@ -432,8 +439,9 @@
 
                     int uargc = expr->call.args.count;
                     int n_eh_args = 0;
-                    LLVMValueRef recv = emit_guarded_member_object_ex(
-                        g, callee, locals, m_async != 0);
+                    LLVMValueRef borrowed_receiver = NULL;
+                    LLVMValueRef recv = emit_call_member_object(
+                        g, callee, locals, m_async != 0, &borrowed_receiver);
                     /* Getter/call receivers transfer +1 ownership. Keep it armed
                      * while evaluating arguments and invoking the implementation. */
                     int recv_eh_pushed = emit_intrinsic_own_recv(
@@ -577,6 +585,7 @@
                         for (int k = 0; k < uargc; k++)
                             emit_release_owned_call_temp(g, expr->call.args.items[k], avals[k], locals);
                         emit_release_owned_call_temp(g, callee->member.object, recv, locals);
+                        emit_drop_call_receiver(g, borrowed_receiver);
                         free(ca); free(pts); free(avals); free(cands);
                         return r;
                     }
@@ -656,6 +665,7 @@
                                                      avals[k], locals);
                     emit_release_owned_call_temp(g, callee->member.object, recv,
                                                  locals);
+                    emit_drop_call_receiver(g, borrowed_receiver);
                     free(avals); free(phi_vals); free(phi_bbs);
                     return result;
                 }

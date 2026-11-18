@@ -485,6 +485,8 @@ void emit_eh_tmp_pop(zan_irgen_t *g);
 void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
 void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
 void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top);
+/* Register one class/interface owner, including erased tagged delegates. */
+void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value);
 void emit_eh_tmp_unwind_to(zan_irgen_t *g, LLVMValueRef mark);
 void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
 LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr, zan_ast_node_t *qmem, local_scope_t *locals);
@@ -627,6 +629,11 @@ LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp, zan_type_t *rt, i
 void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr, LLVMValueRef value, zan_loc_t loc, local_scope_t *locals);
 zan_symbol_t * expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
+LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
+    LLVMValueRef value, local_scope_t *locals);
+LLVMValueRef emit_call_member_object(zan_irgen_t *g, zan_ast_node_t *member,
+    local_scope_t *locals, bool async_gate, LLVMValueRef *borrowed_owner);
+void emit_drop_call_receiver(zan_irgen_t *g, LLVMValueRef borrowed_owner);
 bool expr_is_bool(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool expr_is_char(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool expr_is_int32(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
