@@ -3482,6 +3482,12 @@ foreach(_src ${_conf_srcs})
   # milliseconds, so anything past two minutes is a hang (a coroutine parked on
   # a dead socket, a server that never stops). Without it ctest waits out its
   # 1500s default and one hung case alone costs 25 minutes.
+  set(_case_strict_args "")
+  set(_case_workdir_arg "")
+  if(_name STREQUAL "lambda_local_exception_cleanup")
+    set(_case_strict_args ";-g;--strict-runtime;--check-leaks;--arc-guard")
+    set(_case_workdir_arg "-DWORKDIR=${CMAKE_SOURCE_DIR}")
+  endif()
   add_test(NAME case_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -3489,7 +3495,8 @@ foreach(_src ${_conf_srcs})
       -DEXPECTED=${_expected}
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/case_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${_extra_args}"
+      "-DZANC_ARGS=${_extra_args}${_case_strict_args}"
+      ${_case_workdir_arg}
       "-DRUN_ARGS=${_run_args}"
       "-DEXPECT_LEAK_SITE=${_expect_leak_site}"
       "-DEXPECT_LEAK=${_expect_leak}"
@@ -3504,6 +3511,10 @@ foreach(_src ${_conf_srcs})
   endif()
   set_tests_properties(case_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT ${_case_timeout})
+  if(_name STREQUAL "lambda_local_exception_cleanup")
+    set_tests_properties(case_${_name} PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
+  endif()
   if(_name STREQUAL "opt_arc_field_reload")
     set_tests_properties(case_${_name} PROPERTIES
       ENVIRONMENT "ZAN_NO_SHARD=1;ZAN_RT_HARD=1")

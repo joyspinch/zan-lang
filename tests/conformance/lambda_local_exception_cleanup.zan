@@ -1,0 +1,148 @@
+using System;
+
+class LambdaCleanupItem {
+    public int value;
+    public LambdaCleanupItem(int value) { this.value = value; }
+}
+
+class LambdaCleanupWatch {
+    public weak LambdaCleanupItem item;
+    public weak LambdaCleanupItem outer;
+    public weak LambdaCleanupItem capture;
+    public int observed;
+}
+
+class LambdaCleanupHost<T> {
+    public T value;
+    public LambdaCleanupWatch watch;
+
+    public void Run() {
+        Action call = () => {
+            LambdaCleanupItem local = new LambdaCleanupItem(31);
+            this.watch.item = local;
+            LambdaLocalExceptionCleanup.Check(this.value != null, "generic this context");
+            this.watch.observed = local.value;
+            LambdaLocalExceptionCleanup.Fail();
+        };
+        LambdaLocalExceptionCleanup.ExpectError(call);
+        LambdaLocalExceptionCleanup.Check(this.watch.item == null, "generic this lambda local released");
+        LambdaLocalExceptionCleanup.Check(this.watch.observed == 31, "generic lambda executed");
+        LambdaLocalExceptionCleanup.Check(this.value != null, "generic caller context restored");
+    }
+}
+
+class LambdaLocalExceptionCleanup {
+    static LambdaCleanupWatch watch;
+
+    public static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    public static void Fail() { throw new Exception("lambda cleanup"); }
+
+    public static void ExpectError(Action call) {
+        bool caught = false;
+        try { call(); }
+        catch (Exception error) { caught = error.Message == "lambda cleanup"; }
+        Check(caught, "exception propagated to caller");
+    }
+
+    static void Noncaptured() {
+        // Only static state is used: native targets emit a raw function pointer.
+        ExpectError(() => {
+            LambdaCleanupItem local = new LambdaCleanupItem(11);
+            watch.item = local;
+            Check(watch.item != null, "noncaptured local alive before throw");
+            watch.observed = local.value;
+            Fail();
+        });
+        Check(watch.item == null && watch.observed == 11, "noncaptured local released on unwind");
+    }
+
+    static void Captured() {
+        LambdaCleanupWatch state = new LambdaCleanupWatch();
+        LambdaCleanupItem capture = new LambdaCleanupItem(7);
+        state.capture = capture;
+        Action call = () => {
+            LambdaCleanupItem local = new LambdaCleanupItem(capture.value);
+            state.item = local;
+            Check(state.capture != null && state.item != null, "captured owners alive in lambda");
+            state.observed = local.value;
+            Fail();
+        };
+        ExpectError(call);
+        Check(state.item == null && state.observed == 7, "captured lambda local released on unwind");
+        capture = null;
+        Check(state.capture == null, "shared captured slot remains valid after unwind");
+        call = null;
+    }
+
+    static void Nested() {
+        LambdaCleanupWatch state = new LambdaCleanupWatch();
+        ExpectError(() => {
+            LambdaCleanupItem outer = new LambdaCleanupItem(19);
+            state.outer = outer;
+            ExpectError(() => {
+                LambdaCleanupItem inner = new LambdaCleanupItem(outer.value);
+                state.item = inner;
+                Fail();
+            });
+            Check(state.item == null, "inner lambda local released before outer resumes");
+            Check(state.outer != null && outer.value == 19, "inner unwind preserves outer capture");
+            // This local is registered after nested lambda emission, so it also
+            // checks restoration of the outer lambda's cleanup context.
+            LambdaCleanupItem after = new LambdaCleanupItem(23);
+            state.item = after;
+            state.observed = after.value;
+            Fail();
+        });
+        Check(state.item == null && state.outer == null, "outer lambda locals and cell released");
+        Check(state.observed == 23, "outer lambda resumed after inner handler");
+    }
+
+    static void CapturedParameter() {
+        LambdaCleanupItem item = new LambdaCleanupItem(29);
+        watch.item = item;
+        Action<LambdaCleanupItem> call = value => {
+            Action nested = () => { Check(value.value == 29, "boxed lambda parameter alive"); };
+            nested();
+            Fail();
+        };
+        bool caught = false;
+        try { call(item); }
+        catch (Exception error) { caught = error.Message == "lambda cleanup"; }
+        Check(caught && watch.item != null, "parameter unwind preserves caller owner");
+        item = null;
+        Check(watch.item == null, "lambda parameter cell released on unwind");
+    }
+
+    static void NormalAndDirectThrow() {
+        Action call = () => {
+            LambdaCleanupItem local = new LambdaCleanupItem(37);
+            watch.item = local;
+        };
+        call();
+        Check(watch.item == null, "normal fallthrough releases local");
+        ExpectError(() => {
+            LambdaCleanupItem local = new LambdaCleanupItem(41);
+            watch.item = local;
+            throw new Exception("lambda cleanup");
+        });
+        Check(watch.item == null, "direct throw releases local");
+    }
+
+    static void Main() {
+        watch = new LambdaCleanupWatch();
+        Noncaptured();
+        Captured();
+        Nested();
+        CapturedParameter();
+        NormalAndDirectThrow();
+        LambdaCleanupHost<int> host = new LambdaCleanupHost<int>();
+        host.value = 43;
+        host.watch = watch;
+        host.Run();
+        watch = null;
+        Console.WriteLine("ALL LAMBDA LOCAL EXCEPTION CLEANUP TESTS PASSED");
+    }
+}

@@ -220,6 +220,26 @@
 - **展开顺序**：EH 临时栈是 LIFO。被捕获局部的 cell 由作用域绑定持有
   （`own_box_cell`，先入栈），闭包实参后入栈 → 展开时先放闭包（闭包析构
   释放它对 cell 的引用）再放 cell，计数刚好归零；反过来就会多释放一次。
+- **lambda 必须建立自身函数级 EH/ARC 边界**（2026-11-18，宿主后端已验证）：
+  `emit_lambda_typed` 切走外层 lpad 栈是为了隔离宿主 alloca，但清空后必须为
+  lambda 安装自己的方法级 lpad；否则 `arc_own_local → lpad_register_local`
+  在 depth=0 时跳过登记，被调方法抛异常并外逃就会漏掉 lambda 的局部对象。
+  在参数捕获 cell 建立前记录本函数 EH 临时栈水位，复用 `init_fn_lpad` /
+  `finish_fn_lpad` 及按调用位置筛选局部的既有 cleanup；展开仅释放本函数拥有的
+  局部/cell 与水位以上临时量，闭包借用的捕获不接管、不释放。正常尾部也须释放
+  owned locals，再 disarm；表达式体丢弃的 owned 结果按既有临时量协议释放。
+  嵌套 lambda 发码前保存、结束后恢复外层 lpad 内容与深度、catch/finally/pending、
+  EH armed/循环边界、函数返回契约及 ctor/main/no-runtime 标记、locals/active cleanup、
+  `this`/async frame、类型与泛型实例/方法绑定、ARC 语句深度及调试位置；不能把外层
+  alloca 带入 lambda IR，也不能让内层清理作用域覆盖外层后续发码。
+  主线程报告新 host 的 `case_lambda_local_exception_cleanup`（weak lifetime，覆盖
+  非捕获/捕获/嵌套、参数 cell、泛型 this、正常退出及直接 throw）与
+  `case_lambda_lpad_stack`、`case_delegate_callee_exception_owner`、
+  `case_delegate_argument_exception_owner`、`case_async_finally_nested_lambda`、
+  `case_lambda_value_return`、`case_lambda_struct_return` 全部 PASS；原消费者
+  `conformance_gui_model_binding_equivalence` 严格 ARC PASS，JsonDoc 的原 leak2 归零。
+  业务断言全过不能替代生命周期断言与泄漏检查；不可通过外移局部对象或关闭 ARC
+  绕过缺陷。以上证据不外推为 selfhost、所有交叉目标或全部异步异常路径已验收。
 - **构造路径也是调用，实参同样要登记**：类构造与结构体构造（字段初始化式）
   都是调用，实参里的拥有型临时量归调用方所有——构造函数一抛，就得由展开器
   放。早先这两条路径**只把对象压进 EH 临时栈，实参没登记**：

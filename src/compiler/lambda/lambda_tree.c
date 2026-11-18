@@ -440,7 +440,21 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef saved_fn = g->current_fn;
     /* 嵌套 Lambda 就地挂起当前生成函数并切换上下文 */
     bool saved_fn_is_main = g->current_fn_is_main;
+    bool saved_fn_is_ctor = g->current_fn_is_ctor;
+    bool saved_fn_no_runtime = g->current_fn_no_runtime;
+    void *saved_locals = g->current_locals;
+    void *saved_cleanup_locals = g->active_cleanup_locals;
+    LLVMValueRef saved_cleanup_fn = g->active_cleanup_fn;
+    zan_symbol_t *saved_type_sym = g->current_type_sym;
+    zan_type_t *saved_inst = g->cur_inst;
+    zan_type_t *saved_recv_type = g->cur_recv_type;
+    zan_ast_list_t *saved_mtps = g->cur_mtps;
+    zan_type_t **saved_mbind = g->cur_mbind;
+    int saved_arc_depth = g->arc_stmt_depth;
     g->current_fn_is_main = false;
+    g->current_fn_is_ctor = false;
+    g->current_fn_no_runtime = false;
+    g->arc_stmt_depth = 0;
     LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
     zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
     LLVMValueRef saved_this = g->current_this;
@@ -523,6 +537,25 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
 
     local_scope_t lambda_locals;
     local_scope_init(&lambda_locals, g->arena);
+    g->current_locals = &lambda_locals;
+    g->active_cleanup_locals = &lambda_locals;
+    g->active_cleanup_fn = lambda_fn;
+
+    /* A lambda is a synchronous function with its own cleanup boundary. Keep
+     * the caller's EH temporaries below this mark; captures remain borrowed
+     * from the closure, while owned locals/parameter cells register here. */
+    zan_lpad_entry_t *lambda_lpad = &g->lpad_stack[g->lpad_depth++];
+    *lambda_lpad = (zan_lpad_entry_t){
+        .fn = lambda_fn,
+        .lpad_bb = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "fn.lpad"),
+        .fin_idx = -1
+    };
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
+    zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t,
+        get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
+    init_fn_lpad(g, lambda_lpad, &lambda_locals, fn_tmp_mark);
+
     /* 捕获变量排布于闭包首部，进入函数体时从环境记录中重载为局部变量 */
     if (is_closure) {
         LLVMValueRef rec = LLVMGetParam(lambda_fn, 0);
@@ -568,12 +601,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                expr->lambda.body);
     }
 
+    LLVMValueRef result = NULL;
     if (expr->lambda.body && expr->lambda.body->kind == AST_BLOCK) {
         emit_stmt(g, expr->lambda.body, &lambda_locals);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            if (ret_void) LLVMBuildRetVoid(g->builder);
-            else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
-        }
     } else if (expr->lambda.body) {
         zan_type_t *bty = infer_expr_type(g, expr->lambda.body, &lambda_locals);
         check_implicit_narrowing(g, rett, bty, expr->lambda.body, "return");
@@ -581,9 +611,11 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
          * 值类型给引用类型返回位的委托，运行期只会造出野指针。 */
         check_no_boxing_conversion(g, rett, bty, expr->lambda.body,
                                    "lambda return");
-        LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
+        result = emit_expr(g, expr->lambda.body, &lambda_locals);
         if (ret_void) {
-            LLVMBuildRetVoid(g->builder);
+            emit_release_owned_call_temp(g, expr->lambda.body, result,
+                                         &lambda_locals);
+            result = NULL;
         } else if (rett) {
             /* 表达式主体 Lambda 返回托管引用时按规则保留引用计数 */
             if (is_rc_managed_type(rett) &&
@@ -599,7 +631,6 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                 result = coerce_struct_value_arg(g, result, ret_type);
             }
             result = emit_boundary_coerce(g, result, ret_type);
-            LLVMBuildRet(g->builder, result);
         } else {
             /* 未传期望类型的 lambda（作为实参经 emit_expr 发射，expected=NULL）
              * 返回契约仍然是「向调用方移交 +1 强引用」：调用点按拥有临时对待
@@ -612,15 +643,31 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                 emit_rc_retain_for_type(g, bty, result);
             }
             result = coerce_to_i64(g, result);
-            LLVMBuildRet(g->builder, result);
         }
-    } else {
-        if (ret_void) LLVMBuildRetVoid(g->builder);
-        else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
     }
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        emit_release_owned_locals(g, &lambda_locals);
+        emit_eh_disarm_from(g, 0);
+        if (ret_void) LLVMBuildRetVoid(g->builder);
+        else LLVMBuildRet(g->builder, result ? result : LLVMConstNull(ret_type));
+    }
+
+    g->lpad_depth = 0;
+    finish_fn_lpad(g, lambda_lpad);
 
     g->current_fn = saved_fn;
     g->current_fn_is_main = saved_fn_is_main;
+    g->current_fn_is_ctor = saved_fn_is_ctor;
+    g->current_fn_no_runtime = saved_fn_no_runtime;
+    g->current_locals = saved_locals;
+    g->active_cleanup_locals = saved_cleanup_locals;
+    g->active_cleanup_fn = saved_cleanup_fn;
+    g->current_type_sym = saved_type_sym;
+    g->cur_inst = saved_inst;
+    g->cur_recv_type = saved_recv_type;
+    g->cur_mtps = saved_mtps;
+    g->cur_mbind = saved_mbind;
+    g->arc_stmt_depth = saved_arc_depth;
     g->current_fn_ret_type = saved_fn_ret;
     g->current_fn_zan_ret_type = saved_fn_zan_ret;
     g->throw_locals_base = saved_throw_base;
