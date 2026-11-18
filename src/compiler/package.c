@@ -26,7 +26,6 @@
 #include "../common/host_oom.h"
 #include "../common/json.h"
 #include "diag.h"
-#include "incremental.h"
 
 /* Forward declarations for cross-module static utilities */
 static bool pkg_is_dir(const char *path);

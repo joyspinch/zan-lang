@@ -189,7 +189,6 @@ add_executable(zanc
     src/compiler/irgen_weak.c
     src/compiler/irgen_compact.cpp
     src/compiler/optimizer.c
-    src/compiler/incremental.c
     src/compiler/package.c
     src/compiler/crosscomp.c
     src/compiler/winres.c
