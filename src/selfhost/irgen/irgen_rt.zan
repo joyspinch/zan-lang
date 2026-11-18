@@ -6,11 +6,13 @@ partial class Irgen {
     void EmitListRuntime() {
         EmitListRuntimeCore();
         EmitListRuntimeOps();
+        EmitListReflectionRuntime();
     }
 
     /// %zlist type + dtor/reverse/new.
     void EmitListRuntimeCore() {
-        H("%zlist = type { i64, i64, i64*, i64 }");
+        // Keep the count, capacity, slots, and ownership offsets stable.
+        H("%zlist = type { i64, i64, i64*, i64, i8* }");
         H("define void @zlist_dtor(i8* %p) {");
         H("entry:");
         H("  %l = bitcast i8* %p to %zlist*");
@@ -79,7 +81,11 @@ partial class Irgen {
         H("  ret void");
         H("}");
         H("define i8* @zlist_new(i64 %owns) {");
-        H("  %p = call i8* @zalloc(i64 32, i8* bitcast (void (i8*)* @zlist_dtor to i8*), " + ContainerCid("List") + ")");
+        H("  %p = call i8* @zlist_new_typed(i64 %owns, i8* null)");
+        H("  ret i8* %p");
+        H("}");
+        H("define i8* @zlist_new_typed(i64 %owns, i8* %meta) {");
+        H("  %p = call i8* @zalloc(i64 40, i8* bitcast (void (i8*)* @zlist_dtor to i8*), " + ContainerCid("List") + ")");
         H("  %l = bitcast i8* %p to %zlist*");
         H("  %c = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -89,7 +95,83 @@ partial class Irgen {
         H("  store i64* null, i64** %d");
         H("  %op = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
         H("  store i64 %owns, i64* %op");
+        H("  %type = getelementptr %zlist, %zlist* %l, i32 0, i32 4");
+        H("  store i8* %meta, i8** %type");
         H("  ret i8* %p");
+        H("}");
+    }
+
+    void EmitListReflectionRuntime() {
+        H("define internal i8* @zlist_typeinfo(i8* %p) {");
+        H("  %l = bitcast i8* %p to %zlist*");
+        H("  %slot = getelementptr %zlist, %zlist* %l, i32 0, i32 4");
+        H("  %meta = load i8*, i8** %slot");
+        H("  ret i8* %meta");
+        H("}");
+        H("define internal i1 @zlist_matches_type(i8* %p, i8* %meta) {");
+        H("  %cid = call i8* @__zan_class_id(i8* %p)");
+        string listCid = IsContainerType("List") ? "bitcast (i8** @__tid_List to i8*)" : "null";
+        H("  %list = icmp eq i8* %cid, " + listCid);
+        H("  br i1 %list, label %check, label %miss");
+        H("check:");
+        H("  %actual = call i8* @zlist_typeinfo(i8* %p)");
+        H("  %same = icmp eq i8* %actual, %meta");
+        H("  ret i1 %same");
+        H("miss:");
+        H("  ret i1 false");
+        H("}");
+        H("define internal i64 @zlist_reflection_kind(i8* %p) {");
+        H("  %meta = call i8* @zlist_typeinfo(i8* %p)");
+        H("  %missing = icmp eq i8* %meta, null");
+        H("  br i1 %missing, label %miss, label %read");
+        H("read:");
+        H("  %raw = getelementptr i8, i8* %meta, i64 -136");
+        H("  %slot = bitcast i8* %raw to i64*");
+        H("  %kind = load i64, i64* %slot");
+        H("  ret i64 %kind");
+        H("miss:");
+        H("  ret i64 0");
+        H("}");
+        H("define internal i8* @zlist_reflection_new(i8* %meta) {");
+        H("  %raw = getelementptr i8, i8* %meta, i64 -128");
+        H("  %slot = bitcast i8* %raw to i64*");
+        H("  %owns = load i64, i64* %slot");
+        H("  %valid = icmp sge i64 %owns, 0");
+        H("  br i1 %valid, label %make, label %miss");
+        H("make:");
+        H("  %list = call i8* @zlist_new_typed(i64 %owns, i8* %meta)");
+        H("  ret i8* %list");
+        H("miss:");
+        H("  ret i8* null");
+        H("}");
+        H("define internal i64 @zlist_reflection_add(i8* %p, i64 %value, i64 %source) {");
+        H("  %kind = call i64 @zlist_reflection_kind(i8* %p)");
+        H("  %ref = icmp uge i64 %kind, 3");
+        H("  br i1 %ref, label %reference, label %scalar");
+        H("scalar:");
+        H("  %supported = icmp ne i64 %kind, 0");
+        H("  %same = icmp eq i64 %kind, %source");
+        H("  %valid = and i1 %supported, %same");
+        H("  br i1 %valid, label %add, label %miss");
+        H("reference:");
+        H("  %source_ref = icmp uge i64 %source, 3");
+        H("  br i1 %source_ref, label %check_null, label %miss");
+        H("check_null:");
+        H("  %nil = icmp eq i64 %value, 0");
+        H("  br i1 %nil, label %add, label %check_ref");
+        H("check_ref:");
+        H("  %meta = call i8* @zlist_typeinfo(i8* %p)");
+        H("  %raw = getelementptr i8, i8* %meta, i64 -120");
+        H("  %slot = bitcast i8* %raw to i1 (i8*)**");
+        H("  %accepts = load i1 (i8*)*, i1 (i8*)** %slot");
+        H("  %ptr = inttoptr i64 %value to i8*");
+        H("  %ok = call i1 %accepts(i8* %ptr)");
+        H("  br i1 %ok, label %add, label %miss");
+        H("add:");
+        H("  call void @zlist_add(i8* %p, i64 %value)");
+        H("  ret i64 1");
+        H("miss:");
+        H("  ret i64 0");
         H("}");
     }
 

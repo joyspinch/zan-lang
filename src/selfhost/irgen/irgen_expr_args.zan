@@ -123,6 +123,7 @@ partial class Irgen {
                 Node scls = binder.FindType(curClass);
                 if (scls != null && FindStaticField(scls, place.sval) != null) {
                     string sown = StaticFieldOwner(scls, place.sval);
+                    DemandStaticType(sown, CurInstFor(sown));
                     return StaticGlobal(sown, place.sval, CurInstFor(sown));
                 }
                 // this.field
@@ -142,7 +143,10 @@ partial class Irgen {
                 Node tc = binder.FindType(place.a.sval);
                 if (tc != null && FindStaticField(tc, place.sval) != null) {
                     string sown = StaticFieldOwner(tc, place.sval);
-                    string gv = StaticGlobal(sown, place.sval, CurInstFor(sown));
+                    List<Node> inst = ConcreteInstArgs(place, sown);
+                    if (inst == null) { inst = CurInstFor(sown); }
+                    DemandStaticType(sown, inst);
+                    string gv = StaticGlobal(sown, place.sval, inst);
                     if (lt != "i64") {
                         string cast = NT();
                         L("  " + cast + " = bitcast i64* " + gv + " to " + lt + "*");
@@ -354,8 +358,8 @@ partial class Irgen {
     bool CtorSrcTy(string t) {
         if (t == null) { return false; }
         if (t == "bool" || t == "sbyte" || t == "byte" || t == "short"
-                || t == "ushort" || t == "int" || t == "uint" || t == "long"
-                || t == "ulong" || t == "nint" || t == "char") { return true; }
+        || t == "ushort" || t == "int" || t == "uint" || t == "long"
+        || t == "ulong" || t == "nint" || t == "char") { return true; }
         Node d = binder.FindType(t);
         return d != null && d.kind == AK.EnumDecl();
     }
@@ -377,7 +381,7 @@ partial class Irgen {
         if (pd == null || pd.kind != AK.ClassDecl()) { return null; }
         int k = arg.kind;
         if (k == AK.NewExpr() || k == AK.NullLit() || k == AK.OutArg()
-                || k == AK.ThisExpr() || k == AK.BaseExpr() || k == AK.Lambda()) { return null; }
+        || k == AK.ThisExpr() || k == AK.BaseExpr() || k == AK.Lambda()) { return null; }
         Node st = ArgTypeNode(arg);
         if (st == null) { return null; }
         string sn = st.sval;
@@ -399,7 +403,7 @@ partial class Irgen {
         ne.Add(arg);
         if (ResolveCtor(pd, ne) == null) {
             diags.Error("cannot convert '" + sn + "' to '" + pty.sval
-                + "' in argument: no matching constructor", arg.line, arg.col);
+            + "' in argument: no matching constructor", arg.line, arg.col);
             return null;
         }
         return ne;
@@ -519,7 +523,7 @@ partial class Irgen {
                 return e.kids;
             }
             diags.Error("too many arguments to '" + m.sval + "' (expected "
-                + np + ", got " + e.kids.Count + ")", e.line, e.col);
+            + np + ", got " + e.kids.Count + ")", e.line, e.col);
         }
         bool anyNamed = false;
         int j = 0;
@@ -552,7 +556,7 @@ partial class Irgen {
                 } else if (pdefault[k] != null) { slots[k] = pdefault[k]; }
                 else {
                     diags.Error("missing required argument for parameter '"
-                        + pnames[k] + "' of '" + m.sval + "'", e.line, e.col);
+                    + pnames[k] + "' of '" + m.sval + "'", e.line, e.col);
                     Node z = new Node(AK.IntLit()); z.ival = 0; slots[k] = z;
                 }
             }
@@ -598,6 +602,7 @@ partial class Irgen {
             if (e != null && e.a != null && e.a.kind == AK.MemberAccess()) {
                 iargs = ConcreteInstArgs(e.a, clsName);
             }
+            if (iargs == null) { iargs = CurInstFor(clsName); }
             // only a method declared by the generic class ITSELF: an
             // inherited one lives in a base class that has no type parameters
             if (ctps.Count > 0 && DeclOwnerOf(cls, m) == clsName && iargs != null) {
@@ -644,9 +649,16 @@ partial class Irgen {
         }
         string declCls = clsName;
         if (m != null) { declCls = DeclOwnerOf(cls, m); }
+        List<Node> initArgs = ctypes;
+        if (initArgs.Count == 0) {
+            initArgs = e != null && e.a != null ? ConcreteInstArgs(e.a, declCls) : null;
+            if (initArgs == null) { initArgs = CurInstFor(declCls); }
+        }
+        DemandStaticType(declCls, initArgs);
         string rt = "i64";
         if (m != null) { rt = MapTypeDecl(m.type, declCls); }
         if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), declCls); }
+        if (m != null && HasMod(m, MOD.Extern())) { DemandExternalType(m.type); }
         string nativeRt = rt;
         if (sym.StartsWith("__zan_decimal_")) { nativeRt = DecimalNativeReturn(sym, rt); }
         bool isAsyncCall = (m != null && IsAsync(m));
@@ -677,7 +689,7 @@ partial class Irgen {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (spec) { pty = SubstTP(pty, stns, strs); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
-                && aargs[i].kind == AK.OutArg()) {
+            && aargs[i].kind == AK.OutArg()) {
                 if (i > 0) { args = args + ", "; }
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
@@ -732,8 +744,8 @@ partial class Irgen {
             // C `free(s)` consumes the string: null out the freed lvalue so
             // ARC never touches the dangling pointer again
             if (m != null && HasMod(m, MOD.Extern()) && ExternName(m) == "free"
-                && aargs.Count == 1 && aargs[0] != null && freeArgIsStr
-                && (aargs[0].kind == AK.Ident() || aargs[0].kind == AK.MemberAccess())) {
+            && aargs.Count == 1 && aargs[0] != null && freeArgIsStr
+            && (aargs[0].kind == AK.Ident() || aargs[0].kind == AK.MemberAccess())) {
                 StoreTo(aargs[0], new ExprVal("null", MkType("string")));
             }
             return new ExprVal("0", MkType("void"));
@@ -903,7 +915,7 @@ partial class Irgen {
             return;
         }
         if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.ForStmt()
-            || k == AK.ForeachStmt() || k == AK.SwitchStmt() || k == AK.TryStmt()) {
+        || k == AK.ForeachStmt() || k == AK.SwitchStmt() || k == AK.TryStmt()) {
             mixed[0] = 1;
             return;
         }

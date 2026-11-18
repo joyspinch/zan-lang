@@ -12,14 +12,17 @@ partial class Irgen {
 
     ExprVal EmitGetType(ExprVal recv) {
         string staticName = recv.ty != null ? recv.ty.sval : "object";
-        ExprVal fallback = ReflMetaFor(recv.ty, staticName);
-        if (recv.ty == null || recv.op == "null") { return fallback; }
+        string display = IsListType(recv.ty) ? FormatTypeNode(recv.ty) : staticName;
+        ExprVal fallback = ReflMetaFor(recv.ty, display);
+        if (recv.ty == null || recv.op == "null" || IsListType(recv.ty) || !IsPtrLL(MapType(recv.ty))) { return fallback; }
         Node scls = binder.FindType(staticName);
         if (scls != null && scls.kind == AK.StructDecl()) { return fallback; }
         if (scls != null && scls.kind == AK.EnumDecl()) { return fallback; }
         if (recv.ty.ival > 0) { return fallback; }
+        string raw = Coerce(recv, "i8*");
         string cid = NT();
-        L("  " + cid + " = call i8* @__zan_class_id(i8* " + recv.op + ")");
+        L("  " + cid + " = call i8* @__zan_class_id(i8* " + raw + ")");
+        bool canBeList = IsContainerType("List") && (staticName == "object" || DynamicReferenceType(recv.ty));
         List<string> cands = new List<string>();
         int i = 0;
         while (i < tidNames.Count) {
@@ -29,13 +32,31 @@ partial class Irgen {
             }
             i = i + 1;
         }
-        if (cands.Count <= 1) {
+        if (cands.Count <= 1 && !canBeList) {
             return fallback;
         }
         int lend = NL();
         string resSlot = NT();
         L("  " + resSlot + " = alloca i8*");
         L("  store i8* " + fallback.op + ", i8** " + resSlot);
+        if (canBeList) {
+            int listFound = NL();
+            int other = NL();
+            string isList = NT();
+            L("  " + isList + " = icmp eq i8* " + cid + ", bitcast (i8** @__tid_List to i8*)");
+            L("  br i1 " + isList + ", label %L" + listFound + ", label %L" + other);
+            Label(listFound);
+            string meta = NT();
+            L("  " + meta + " = call i8* @zlist_typeinfo(i8* " + raw + ")");
+            string hasMeta = NT();
+            L("  " + hasMeta + " = icmp ne i8* " + meta + ", null");
+            string listType = NT();
+            string openList = ReflMetaConst(MkType("List"), "List");
+            L("  " + listType + " = select i1 " + hasMeta + ", i8* " + meta + ", i8* " + openList);
+            L("  store i8* " + listType + ", i8** " + resSlot);
+            L("  br label %L" + lend);
+            Label(other);
+        }
         int ci = 0;
         while (ci < cands.Count) {
             string cand = cands[ci];
@@ -154,35 +175,41 @@ partial class Irgen {
         }
     }
 
-    string ReflMetaConst(Node ty, string disp) {
-        ReflMetaFor(ty, disp);
-        int i = 0;
-        string gv = "";
-        while (i < reflMetaNames.Count) {
-            if (reflMetaNames[i] == disp) {
-                gv = reflMetaGvs[i];
-                break;
-            }
-            i = i + 1;
-        }
-        if (gv == "") { return "null"; }
-        List<int> bytes = DecodeStr(disp);
-        int nlen = bytes.Count + 1;
-        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
-        return "getelementptr inbounds (" + tyDecl + ", " + tyDecl + "* " + gv + ", i64 0, i32 14, i64 0)";
+    int ListSlotOwnership(Node elem) {
+        if (IsDelegate(elem)) { return 2; }
+        return ArcManaged(elem) || IsDecimal(elem) ? 1 : 0;
+    }
+
+    // Reflection can pass scalars and references in one word. Aggregate
+    // elements keep their metadata but have no erased getter or adder.
+    int ListReflectionSlotKind(Node elem) {
+        if (elem == null || IsStructTy(elem) || IsNullableValue(elem) || IsDecimal(elem) || IsErasedType(elem)) { return 0; }
+        if (MapType(elem) == "i64") { return 1; }
+        if (MapType(elem) == "double") { return 2; }
+        if (elem.ival == 0 && elem.sval == "string") { return 3; }
+        return ArrayReferenceElement(elem) ? 4 : 0;
+    }
+
+    string ReflMetaLayout(int nameSize) {
+        // The List slot kind, ownership, and reference predicate precede the existing TypeInfo header.
+        return "{ i64, i64, i1 (i8*)*, i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nameSize + " x i8] }";
+    }
+
+    string ReflMetaAddress(string globalName, int nameSize) {
+        string layout = ReflMetaLayout(nameSize);
+        return "getelementptr inbounds (" + layout + ", " + layout + "* " + globalName + ", i64 0, i32 17, i64 0)";
     }
 
     ExprVal ReflMetaFor(Node ty, string disp) {
+        return new ExprVal(ReflMetaConst(ty, disp), MkType("TypeInfo"));
+    }
+
+    string ReflMetaConst(Node ty, string disp) {
+        List<int> bytes = DecodeStr(disp);
+        int nlen = bytes.Count + 1;
         int i = 0;
         while (i < reflMetaNames.Count) {
-            if (reflMetaNames[i] == disp) {
-                string gv = reflMetaGvs[i];
-                List<int> eb = DecodeStr(disp);
-                string tyDeclExisting = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + (eb.Count + 1) + " x i8] }";
-                string te = NT();
-                L("  " + te + " = getelementptr inbounds " + tyDeclExisting + ", " + tyDeclExisting + "* " + gv + ", i64 0, i32 14, i64 0");
-                return new ExprVal(te, MkType("TypeInfo"));
-            }
+            if (reflMetaNames[i] == disp) { return ReflMetaAddress(reflMetaGvs[i], nlen); }
             i = i + 1;
         }
 
@@ -223,7 +250,9 @@ partial class Irgen {
         List<string> fAttrs = new List<string>();
 
         Node targetCls = binder.FindType(disp);
-        bool isBuiltinList = disp == "List" || (disp.Length > 5 && disp.Substring(0, 5) == "List<" && disp.Substring(disp.Length - 1, 1) == ">");
+        bool isBuiltinList = IsContainerType("List") && (disp == "List" || (disp.StartsWith("List<") && disp.EndsWith(">")));
+        bool isClosedList = isBuiltinList && IsListType(ty) && ty.kids.Count == 1 && !MentionsTypeParam(ty.kids[0]);
+        Node listElem = isClosedList ? ty.kids[0] : null;
         if (isBuiltinList) {
             fNames.Add("Count");
             fTys.Add("int");
@@ -291,7 +320,9 @@ partial class Irgen {
                 string ftiExpr = "null";
                 string ftName = fTys[fi];
                 if (ftName != "" && ftName != "object" && ftName != "void" && ftName != disp) {
-                    ftiExpr = ReflMetaConst(MkType(ftName), ftName);
+                    Node fieldTy = targetCls != null && targetCls.kind != AK.EnumDecl()
+                        ? FieldType(targetCls, fNames[fi]) : MkType(ftName);
+                    ftiExpr = ReflMetaConst(fieldTy, ftName);
                 }
                 fb.Append("    { i8*, i8*, i64, i64, i8*, i64, i8*, i8*, i8* } { ");
                 fb.Append("i8* " + fnStr + ", ");
@@ -342,8 +373,8 @@ partial class Irgen {
                 int tai = 0;
                 while (tai < typeArgCount) {
                     string targName = targs[tai];
-                    ReflMetaFor(MkType(targName), targName);
-                    string targConst = ReflMetaConst(MkType(targName), targName);
+                    Node argTy = ty != null && tai < ty.kids.Count ? ty.kids[tai] : MkType(targName);
+                    string targConst = ReflMetaConst(argTy, targName);
                     tab.Append("    i8* " + targConst + ",\n");
                     tai = tai + 1;
                 }
@@ -355,18 +386,15 @@ partial class Irgen {
         }
 
         string elemGlobal = "null";
-        if (disp.Length > 2 && disp.Substring(disp.Length - 2, 2) == "[]") {
+        if (disp.EndsWith("[]")) {
             string el = disp.Substring(0, disp.Length - 2);
-            ReflMetaFor(MkType(el), el);
-            elemGlobal = ReflMetaConst(MkType(el), el);
-        } else if (disp.Length > 1 && disp.Substring(disp.Length - 1, 1) == "?") {
+            Node elemTy = ty != null && ty.ival >= 1 ? ArrElemOf(ty) : MkType(el);
+            elemGlobal = ReflMetaConst(elemTy, el);
+        } else if (disp.EndsWith("?")) {
             string el = disp.Substring(0, disp.Length - 1);
-            ReflMetaFor(MkType(el), el);
             elemGlobal = ReflMetaConst(MkType(el), el);
-        } else if (disp.Length > 5 && disp.Substring(0, 5) == "List<" && disp.Substring(disp.Length - 1, 1) == ">") {
-            string el = disp.Substring(5, disp.Length - 6).Trim();
-            ReflMetaFor(MkType(el), el);
-            elemGlobal = ReflMetaConst(MkType(el), el);
+        } else if (listElem != null) {
+            elemGlobal = ReflMetaConst(listElem, FormatTypeNode(listElem));
         }
 
         List<string> mNames = new List<string>();
@@ -464,9 +492,14 @@ partial class Irgen {
                 cFlags.Add(0);
             }
         } else if (isBuiltinList) {
-            string elemTypeStr = "object";
-            if (disp.Length > 5 && disp.Substring(0, 5) == "List<" && disp.Substring(disp.Length - 1, 1) == ">") {
-                elemTypeStr = disp.Substring(5, disp.Length - 6).Trim();
+            string elemTypeStr = listElem != null ? FormatTypeNode(listElem) : "object";
+            if (isClosedList) {
+                cNames.Add(".ctor");
+                cRetTys.Add(disp);
+                cRetKinds.Add(15);
+                cPCnts.Add(0);
+                cPTypesGvs.Add("null");
+                cFlags.Add(0);
             }
             mNames.Add("Count");
             mRetTys.Add("int");
@@ -501,6 +534,16 @@ partial class Irgen {
             ptb2.Append("]");
             H(ptb2.ToString());
             mPTypesGvs.Add("bitcast ([1 x i8*]* " + ptGv2 + " to i8**)");
+            mFlags.Add(0);
+            mAttrs.Add("");
+
+            mNames.Add("Add");
+            mRetTys.Add("void");
+            mRetKinds.Add(0);
+            mPCnts.Add(1);
+            string addParams = "@__zan_refl_mpt_" + metaIdx + "_3";
+            H(addParams + " = private unnamed_addr constant [1 x i8*] [i8* " + GenConstStr(elemTypeStr) + "]");
+            mPTypesGvs.Add("bitcast ([1 x i8*]* " + addParams + " to i8**)");
             mFlags.Add(0);
             mAttrs.Add("");
         }
@@ -554,16 +597,30 @@ partial class Irgen {
             ctorsGlobal = "bitcast ([" + ctorCount + " x { i8*, i8*, i64, i64, i8**, i8*, i64 }]* " + cGvName + " to i8*)";
         }
 
-        List<int> bytes = DecodeStr(disp);
         string bodytxt = "";
         int bi = 0;
         while (bi < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[bi]); bi = bi + 1; }
         bodytxt = bodytxt + "\\00";
-        int nlen = bytes.Count + 1;
-
-        string tyDecl = "{ i8*, i8*, i8*, i8*, i64, i8*, i64, i8*, i8*, i8*, i64, i64, i64, i64, [" + nlen + " x i8] }";
+        int slotKind = ListReflectionSlotKind(listElem);
+        string accepts = "null";
+        if (slotKind == 3 || slotKind == 4) {
+            string predicate = gvName + "_accepts";
+            if (IsListType(listElem)) {
+                string elemType = ReflMetaConst(listElem, FormatTypeNode(listElem));
+                H("define internal i1 " + predicate + "(i8* %value) {");
+                H("  %ok = call i1 @zlist_matches_type(i8* %value, i8* " + elemType + ")");
+                H("  ret i1 %ok");
+                H("}");
+                accepts = predicate;
+            } else {
+                accepts = ArrayStorePredicate(listElem, predicate);
+            }
+        }
         StringBuilder tb = new StringBuilder();
-        tb.Append(gvName + " = private unnamed_addr constant " + tyDecl + " {\n");
+        tb.Append(gvName + " = private unnamed_addr constant " + ReflMetaLayout(nlen) + " {\n");
+        tb.Append("    i64 " + slotKind + ",\n");
+        tb.Append("    i64 " + (isClosedList ? ListSlotOwnership(listElem) : -1) + ",\n");
+        tb.Append("    i1 (i8*)* " + accepts + ",\n");
         // B-ID107: full_name (-112 slot), ns-qualified like the C host's
         // render_type_full; type_attrs (-104 slot); table_name (-96 slot)
         string typeAttrs = (targetCls != null && targetCls.attrBlob != null && targetCls.attrBlob != "") ? targetCls.attrBlob : "";
@@ -586,9 +643,7 @@ partial class Irgen {
         tb.Append("}");
         H(tb.ToString());
 
-        string t = NT();
-        L("  " + t + " = getelementptr inbounds " + tyDecl + ", " + tyDecl + "* " + gvName + ", i64 0, i32 14, i64 0");
-        return new ExprVal(t, MkType("TypeInfo"));
+        return ReflMetaAddress(gvName, nlen);
     }
 
     // B-ID107: FullName = ns-qualified name ("System.Json.JsonValue"),

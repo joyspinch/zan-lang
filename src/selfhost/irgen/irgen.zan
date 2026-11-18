@@ -173,6 +173,7 @@ partial class Irgen {
     public List<Node> specVtCls;
     public List<Node> specVtArgs;
     public List<string> specVtSyms;
+    List<ClosedInterfaceDispatch> closedInterfaceDispatches = new List<ClosedInterfaceDispatch>();
     // the symbol of the constructor being emitted ("" = the shared one)
     public string curCtorSym;
     // the instantiations of generic classes the program uses: the class name
@@ -184,6 +185,17 @@ partial class Irgen {
     public List<Node> instConts;
     public List<string> instKeys;
     public List<string> declaredStaticGlobals;
+    // Startup demand is separate from metadata/code retention. Entries are
+    // declaration owners paired with concrete class arguments, never open T.
+    public List<Node> sinitTypes;
+    public List<string> sinitSyms;
+    public List<Node> sinitDispatchTypes;
+    public List<Node> sinitDispatchMethods;
+    public List<string> sinitDispatchTargets;
+    public List<string> sinitDispatchTables;
+    public List<int> sinitDispatchSlots;
+    public List<string> sinitVtableTargets;
+    public List<string> sinitExportRoots;
     // the class instantiation of the method being emitted: a specialized clone
     // of a generic class (`Stat<int>`) carries its concrete type arguments, so
     // a bare static field inside it names that instantiation's own storage
@@ -316,6 +328,15 @@ partial class Irgen {
         instConts = new List<Node>();
         instKeys = new List<string>();
         declaredStaticGlobals = new List<string>();
+        sinitTypes = new List<Node>();
+        sinitSyms = new List<string>();
+        sinitDispatchTypes = new List<Node>();
+        sinitDispatchMethods = new List<Node>();
+        sinitDispatchTargets = new List<string>();
+        sinitDispatchTables = new List<string>();
+        sinitDispatchSlots = new List<int>();
+        sinitVtableTargets = new List<string>();
+        sinitExportRoots = new List<string>();
         curInstArgs = new List<Node>();
         curInstCls = "";
         finBodies = new List<Node>();
@@ -640,7 +661,6 @@ partial class Irgen {
         if (replace) { EmitArcRelease(old, ty); }
     }
 
-
     // ---- driver ----
     public string Gen(Node unit) {
         string exeDir = Environment.ExeDir();
@@ -757,6 +777,7 @@ partial class Irgen {
         // have to be known before the globals and the static initializers
         // are emitted
         DiscoverInsts(unit);
+        SeedStaticInitTypes(unit);
         // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
@@ -778,7 +799,7 @@ partial class Irgen {
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())
-                && d.sval != "Vector128" && d.sval != "Vector256") { EmitClassDtor(d); GcProbeNoteClass(d); }
+            && d.sval != "Vector128" && d.sval != "Vector256") { EmitClassDtor(d); GcProbeNoteClass(d); }
             i = i + 1;
         }
         // per-struct default-instance constructor and array fill: a struct
@@ -788,7 +809,7 @@ partial class Irgen {
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.StructDecl()
-                && d.sval != "Vector128" && d.sval != "Vector256") {
+            && d.sval != "Vector128" && d.sval != "Vector256") {
                 EmitStructNewObj(d);
                 EmitStructArrInit(d);
             }
@@ -808,76 +829,88 @@ partial class Irgen {
         int cp = 0;
         int fp = 0;
         int vp = 0;
+        int si = 0;
+        bool pendingInterfaceDispatch = closedInterfaceDispatches.Count > 0;
         while (sp < specMs.Count || cp < specCtors.Count || fp < specFinitSyms.Count
-            || vp < specVtSyms.Count) {
-        while (sp < specMs.Count) {
-            // the clone's receiver carries the concrete type arguments of the
-            // class it specializes (`Pool<string>`), so a field read inside it
-            // resolves the real value type
-            Node pthis = curThisTy;
-            List<Node> pargs = curInstArgs; string pcls = curInstCls;
-            curThisTy = specThis[sp];
-            // the clone's class instantiation: its static storage is the one
-            // of that instantiation (`Stat<int>.s` is not `Stat<double>.s`)
-            curInstArgs = new List<Node>(); curInstCls = "";
-            if (curThisTy != null && curThisTy.kids.Count > 0) {
-                curInstArgs = curThisTy.kids;
-                curInstCls = curThisTy.sval;
+        || vp < specVtSyms.Count || si < sinitTypes.Count || pendingInterfaceDispatch) {
+            while (si < sinitTypes.Count) {
+                GenStaticInit(sinitTypes[si], sinitSyms[si]);
+                si = si + 1;
             }
-            GenMethod(specClss[sp], specMs[sp], false);
-            curThisTy = pthis;
-            curInstArgs = pargs; curInstCls = pcls;
-            sp = sp + 1;
-        }
-        // the specialized constructors of the generic classes: same shape as
-        // the method clones -- the receiver carries the concrete type
-        // arguments, so the collections the constructor creates know their
-        // element type
-        while (cp < specCtors.Count) {
-            Node pthis = curThisTy;
-            List<Node> pargs = curInstArgs; string pcls = curInstCls;
-            string psym = curCtorSym;
-            curThisTy = specCtorThis[cp];
-            curInstArgs = new List<Node>(); curInstCls = "";
-            if (curThisTy != null && curThisTy.kids.Count > 0) {
-                curInstArgs = curThisTy.kids;
-                curInstCls = curThisTy.sval;
+            while (sp < specMs.Count) {
+                // the clone's receiver carries the concrete type arguments of the
+                // class it specializes (`Pool<string>`), so a field read inside it
+                // resolves the real value type
+                Node pthis = curThisTy;
+                List<Node> pargs = curInstArgs; string pcls = curInstCls;
+                curThisTy = specThis[sp];
+                // the clone's class instantiation: its static storage is the one
+                // of that instantiation (`Stat<int>.s` is not `Stat<double>.s`)
+                curInstArgs = new List<Node>(); curInstCls = "";
+                if (curThisTy != null && curThisTy.kids.Count > 0) {
+                    curInstArgs = curThisTy.kids;
+                    curInstCls = curThisTy.sval;
+                }
+                GenMethod(specClss[sp], specMs[sp], false);
+                curThisTy = pthis;
+                curInstArgs = pargs; curInstCls = pcls;
+                sp = sp + 1;
             }
-            curCtorSym = specCtorSyms[cp];
-            GenCtor(specCtorCls[cp], specCtors[cp]);
-            curCtorSym = psym;
-            curThisTy = pthis;
-            curInstArgs = pargs; curInstCls = pcls;
-            cp = cp + 1;
-        }
-        // the specialized field-initializer helpers of the generic classes
-        // (B-ID216): emitted with the instantiation bound, so `new T[n]` in a
-        // field initializer builds the array descriptor for the real element
-        // type. The shared helper erases it: the accept predicate generated
-        // for the open parameter rejects every reference-element store.
-        while (fp < specFinitSyms.Count) {
-            Node pthis = curThisTy;
-            List<Node> pargs = curInstArgs; string pcls = curInstCls;
-            curThisTy = specFinitThis[fp];
-            curInstArgs = new List<Node>(); curInstCls = "";
-            if (curThisTy != null && curThisTy.kids.Count > 0) {
-                curInstArgs = curThisTy.kids;
-                curInstCls = specFinitCls[fp].sval;
+            // the specialized constructors of the generic classes: same shape as
+            // the method clones -- the receiver carries the concrete type
+            // arguments, so the collections the constructor creates know their
+            // element type
+            while (cp < specCtors.Count) {
+                Node pthis = curThisTy;
+                List<Node> pargs = curInstArgs; string pcls = curInstCls;
+                string psym = curCtorSym;
+                curThisTy = specCtorThis[cp];
+                curInstArgs = new List<Node>(); curInstCls = "";
+                if (curThisTy != null && curThisTy.kids.Count > 0) {
+                    curInstArgs = curThisTy.kids;
+                    curInstCls = curThisTy.sval;
+                }
+                curCtorSym = specCtorSyms[cp];
+                GenCtor(specCtorCls[cp], specCtors[cp]);
+                curCtorSym = psym;
+                curThisTy = pthis;
+                curInstArgs = pargs; curInstCls = pcls;
+                cp = cp + 1;
             }
-            GenFieldInitsFnAs(specFinits[fp], specFinitSyms[fp]);
-            curThisTy = pthis;
-            curInstArgs = pargs; curInstCls = pcls;
-            fp = fp + 1;
+            // the specialized field-initializer helpers of the generic classes
+            // (B-ID216): emitted with the instantiation bound, so `new T[n]` in a
+            // field initializer builds the array descriptor for the real element
+            // type. The shared helper erases it: the accept predicate generated
+            // for the open parameter rejects every reference-element store.
+            while (fp < specFinitSyms.Count) {
+                Node pthis = curThisTy;
+                List<Node> pargs = curInstArgs; string pcls = curInstCls;
+                curThisTy = specFinitThis[fp];
+                curInstArgs = new List<Node>(); curInstCls = "";
+                if (curThisTy != null && curThisTy.kids.Count > 0) {
+                    curInstArgs = curThisTy.kids;
+                    curInstCls = specFinitCls[fp].sval;
+                }
+                GenFieldInitsFnAs(specFinits[fp], specFinitSyms[fp]);
+                curThisTy = pthis;
+                curInstArgs = pargs; curInstCls = pcls;
+                fp = fp + 1;
+            }
+            // B-ID218: the per-instantiation vtables queued by SpecVtableSym. A
+            // slot whose implementing body mentions the class's type parameters
+            // queues its specialized clone here, so the sp loop above picks it
+            // up in the same pass -- the table can safely reference it.
+            while (vp < specVtSyms.Count) {
+                EmitVtableAs(specVtCls[vp], specVtArgs[vp], specVtSyms[vp]);
+                vp = vp + 1;
+            }
+            // Interface targets can queue more concrete bodies, and those
+            // bodies can allocate further implementors. Close both queues
+            // before emitting the final dispatch helpers.
+            QueueClosedInterfaceTargets();
+            pendingInterfaceDispatch = false;
         }
-        // B-ID218: the per-instantiation vtables queued by SpecVtableSym. A
-        // slot whose implementing body mentions the class's type parameters
-        // queues its specialized clone here, so the sp loop above picks it
-        // up in the same pass -- the table can safely reference it.
-        while (vp < specVtSyms.Count) {
-            EmitVtableAs(specVtCls[vp], specVtArgs[vp], specVtSyms[vp]);
-            vp = vp + 1;
-        }
-        }
+        EmitClosedInterfaceDispatches();
         // The coroutine runtime is emitted unconditionally, not only when the
         // program awaits something: the C runtime object the program links
         // against references zan_co_ready (zan_io_recv_co), so the symbol has
@@ -901,8 +934,9 @@ partial class Irgen {
         // and drop the dead `define` blocks. Skipped for library output: a
         // lib's public API is referenced from OUTSIDE the module, which
         // reachability inside the module never sees.
-        if (!libOut) { return PruneDeadCode(head.ToString()); }
-        return head.ToString();
+        string moduleText = ResolveStaticInits(head.ToString());
+        if (!libOut) { return PruneDeadCode(moduleText); }
+        return moduleText;
     }
 
     void EmitStruct(Node cls) {
@@ -954,17 +988,17 @@ partial class Irgen {
                     // to zan_hw_* in the C runtime).
                     bool lowered = false;
                     if (MatchBuiltinClass(cls.sval, "Vector128") || MatchBuiltinClass(cls.sval, "Vector256") || MatchBuiltinClass(cls.sval, "BitOperations")
-                        || MatchBuiltinClass(cls.sval, "Sse2") || MatchBuiltinClass(cls.sval, "Sse42") || MatchBuiltinClass(cls.sval, "Aes")
-                        || MatchBuiltinClass(cls.sval, "PixelOps")) {
+                    || MatchBuiltinClass(cls.sval, "Sse2") || MatchBuiltinClass(cls.sval, "Sse42") || MatchBuiltinClass(cls.sval, "Aes")
+                    || MatchBuiltinClass(cls.sval, "PixelOps")) {
                         lowered = true;
                     } else if (MatchBuiltinClass(cls.sval, "NativeMemory")) {
                         string nm = ExternName(m);
                         if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Copy2D" || nm == "Fill"
-                            || nm == "Compare" || nm == "GetString" || nm == "PutString"
-                            || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
-                            || nm == "Crc32Update"
-                            || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode"
-                            || nm == "Sha256" || nm == "Sha1" || nm == "Sha512" || nm == "Sm3") {
+                        || nm == "Compare" || nm == "GetString" || nm == "PutString"
+                        || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
+                        || nm == "Crc32Update"
+                        || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode"
+                        || nm == "Sha256" || nm == "Sha1" || nm == "Sha512" || nm == "Sm3") {
                             lowered = true;
                         }
                     }
@@ -975,8 +1009,7 @@ partial class Irgen {
             else if (m.kind == AK.CtorDecl()) {
                 // a static constructor is not an instance constructor: it has
                 // no receiver and runs once at program entry
-                if (IsStatic(m)) { GenStaticCtor(cls, m); }
-                else { GenCtor(cls, m); }
+                if (!IsStatic(m)) { GenCtor(cls, m); }
             }
             i = i + 1;
         }

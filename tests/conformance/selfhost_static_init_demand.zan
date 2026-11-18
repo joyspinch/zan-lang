@@ -1,0 +1,81 @@
+using System;
+
+class StaticDemandWitness {
+    public static int Made;
+    public static int Boxes;
+}
+
+class StaticDemandNewOnly {
+    static StaticDemandNewOnly() { StaticDemandWitness.Made = StaticDemandWitness.Made + 1; }
+}
+
+class StaticDemandVirtualState {
+    public static int Value = 40;
+    static StaticDemandVirtualState() { Value = Value + 2; }
+}
+
+class StaticDemandVirtualBase {
+    public virtual int Read() { return 0; }
+}
+
+class StaticDemandVirtualLive : StaticDemandVirtualBase {
+    public override int Read() { return StaticDemandVirtualState.Value; }
+}
+
+class StaticDemandVirtualMetadata : StaticDemandVirtualBase {
+    static StaticDemandVirtualMetadata() { Console.WriteLine("UNEXPECTED metadata cctor"); }
+    public override int Read() { return StaticDemandDead.Value; }
+}
+
+class StaticDemandDead {
+    public static int Value = Start();
+    static int Start() { Console.WriteLine("UNEXPECTED dead field"); return 99; }
+    static StaticDemandDead() { Console.WriteLine("UNEXPECTED dead cctor"); }
+}
+
+class StaticDemandClosed<T> {
+    public static int Value = 7;
+    static StaticDemandClosed() {
+        Bump();
+        StaticDemandWitness.Boxes = StaticDemandWitness.Boxes + 1;
+    }
+    static void Bump() { Value = Value + 3; }
+}
+
+class StaticDemandHelper {
+    public static int Read() { return StaticDemandVirtualState.Value; }
+}
+
+class StaticDemandRoot {
+    public static int Value = StaticDemandHelper.Read() + 1;
+    static StaticDemandRoot() { Value = Value + 1; }
+}
+
+class Program {
+    static int DeadMethod() {
+        StaticDemandVirtualMetadata unused = new StaticDemandVirtualMetadata();
+        return unused.Read();
+    }
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+    static void Main() {
+        Console.WriteLine("selfhost static demand begin");
+        Require(StaticDemandWitness.Made == 1, "reachable new initializes before Main");
+        Require(StaticDemandWitness.Boxes == 2, "only used closed instances initialize");
+        Require(StaticDemandRoot.Value == 44, "helper dependency fields then cctor");
+        StaticDemandNewOnly made = new StaticDemandNewOnly();
+        Require(made != null, "new without instance constructor");
+        StaticDemandVirtualBase value = new StaticDemandVirtualLive();
+        Require(value.Read() == 42, "base virtual call follows allocated implementation");
+        TypeInfo metadata = typeof(StaticDemandVirtualMetadata);
+        TypeInfo closedMetadata = typeof(StaticDemandClosed<double>);
+        Require(metadata.Name == "StaticDemandVirtualMetadata" && closedMetadata.Name.Length > 0,
+        "metadata does not activate types");
+        Require(StaticDemandClosed<int>.Value == 10 && StaticDemandClosed<string>.Value == 10,
+        "closed cctor uses its own static helper and storage");
+        StaticDemandClosed<int>.Value = 90;
+        Require(StaticDemandClosed<string>.Value == 10, "closed static cells independent");
+        Console.WriteLine("selfhost static demand PASS");
+    }
+}
