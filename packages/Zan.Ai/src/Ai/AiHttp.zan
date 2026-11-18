@@ -1,42 +1,28 @@
 using System;
 using System.Collections.Generic;
 using System.Json;
-using System.Net.External;
 using System.Net.Http;
 using System.Net.Http.Client;
 
 namespace Ai;
 
-// Zan.Ai 包内共用的出网机械层（B-ID167② 提炼）。
-//
-// `AiClient` 与 `AnthropicClient` 原各持一份逐行相同的 POST 骨架
-// （请求体上限 → 指数退避重试 → 2xx 返回 / 4xx 立即失败 / 5xx 重试）、
-// 一份端点 → HttpClient 缓存和一份错误文案提取——三个客户端协议不同，
-// 但"怎么出网、怎么重试、怎么报错"是同一件事，只写一遍。
-//
-// 协议差异留在客户端侧：鉴权头（Bearer vs x-api-key）、请求路径、
-// 调用策略都由各客户端自己设置——本层只管裸连接的创建与缓存。
-// 差异里唯一进本层的是错误文案的**前缀**（"AI 服务返回 …" /
-// "Anthropic 服务返回 …"），以 `scope` 参数区分。
-//
-// `lastError` 由 `Post` 写在本层，客户端包装器负责拷进自己的公开
-// 字段——`IChat.LastError()` 的公开契约不挪动。
-public class AiHttp : IDisposable {
-    private AiConfig config;
+internal class AiPostResult {
+    public string body;
+    public string error;
 
-    // 端点 → HttpClient（**按端点复用**，与原客户端同一纪律：每次请求
-    // 新建 HttpClient 等于每次丢掉连接池里的 keep-alive 连接——连接被
-    // 服务端留着，客户端这边却已经把它丢了）。流式通路以自定义键
-    // （Canonical + "|sse"）同池缓存。
+    public AiPostResult(string body, string error) {
+        this.body = body;
+        this.error = error;
+    }
+}
+
+// 两个客户端共用连接缓存、POST 重试和错误解析，协议各自配置。
+internal class AiHttp : IDisposable {
+    // 按端点复用连接池。流式通路以 Canonical + "|sse" 区分。
     private Dictionary<string, HttpClient> clients;
 
-    // 上一次 Post 失败的原因（成功时为空串）。
-    public string lastError;
-
-    public AiHttp(AiConfig config) {
-        this.config = config == null ? new AiConfig("", "", "") : config;
+    public AiHttp() {
         this.clients = new Dictionary<string, HttpClient>();
-        this.lastError = "";
     }
 
     // 关闭所有出网连接（进程退出前或长寿命客户端空闲时调用）。
@@ -73,47 +59,39 @@ public class AiHttp : IDisposable {
         return new HttpClient(ep.Host(), ep.Port());
     }
 
-    // 发起一次 POST（带重试）。失败返回 null，原因在 lastError。
-    //
-    // http 由调用方给出（`Client(ep)` 的产物，鉴权/策略头已就位）、
-    // fullPath 是完整请求路径（含端点路径部分）——本层不建连接也不拼
-    // URL，连接面与路径规则完整留在客户端侧。scope 进错误文案
-    // （"AI" / "Anthropic"），文案与原两份实现逐字一致。
-    public async string Post(HttpClient http, string fullPath, string payload, string scope) {
-        if (payload.Length > this.config.requestLimitBytes) {
-            this.lastError = "请求体超过上限（"
-                + this.config.requestLimitBytes.ToString() + " 字节）";
-            return null;
+    // 先验请求体，再在每次尝试内解析连接和路径，让初始化异常也走重试。
+    public async AiPostResult Post(AiConfig config, string payload, string scope,
+                                   Func<HttpClient> getClient, Func<string> getPath) {
+        if (payload.Length > config.requestLimitBytes) {
+            return new AiPostResult(null, "请求体超过上限（"
+                + config.requestLimitBytes.ToString() + " 字节）");
         }
-        int attempts = this.config.maxAttempts;
+        int attempts = config.maxAttempts;
         if (attempts < 1) { attempts = 1; }
         string lastReason = "";
+        int wait = 100;
         for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
             if (attempt > 0) {
-                // 指数退避：100ms / 200ms / 400ms …（上限 2 秒）。
-                int wait = 100 * (1 << (attempt - 1));
-                if (wait > 2000) { wait = 2000; }
                 await Task.Delay(wait);
+                wait = Math.Min(wait * 2, 2000);
             }
             try {
-                HttpResponse resp = await http.SendAsync("POST", fullPath, payload);
+                HttpClient http = getClient();
+                HttpResponse resp = await http.SendAsync("POST", getPath(), payload);
                 int status = resp.statusCode;
                 string bodyText = resp.body;
                 if (status >= 200 && status < 300) {
-                    return bodyText;
+                    return new AiPostResult(bodyText, null);
                 }
-                // 4xx 不重试（请求本身有问题）。
                 if (status < 500) {
-                    this.lastError = AiHttp.HttpErrorMessage(status, bodyText, scope);
-                    return null;
+                    return new AiPostResult(null, AiHttp.HttpErrorMessage(status, bodyText, scope));
                 }
                 lastReason = scope + " 服务返回 " + status.ToString();
             } catch (Exception e) {
                 lastReason = "请求 " + scope + " 服务失败：" + e.Message;
             }
         }
-        this.lastError = lastReason;
-        return null;
+        return new AiPostResult(null, lastReason);
     }
 
     // 从 HTTP 响应里提错误文案（4xx 时的解释）。响应体是 OpenAI 兼容

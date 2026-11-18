@@ -37,6 +37,7 @@ class Prog {
     // 收到的请求（路径 / 头 / 正文）。
     static List<string> paths;
     static List<string> keys;
+    static List<string> authorizations;
     static List<string> versions;
     static List<string> bodies;
 
@@ -67,10 +68,12 @@ class Prog {
         res.keepAlive = true;
         Prog.paths.Add(req.path);
         Prog.keys.Add(req.GetHeader("x-api-key"));
+        Prog.authorizations.Add(req.GetHeader("Authorization"));
         Prog.versions.Add(req.GetHeader("anthropic-version"));
         Prog.bodies.Add(req.body);
         if (Prog.failStatus != 0) {
             res.statusCode = Prog.failStatus;
+            if (Prog.failStatus == 503) { Prog.failStatus = 0; }
             res.body = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\","
                 + "\"message\":\"max_tokens: required\"}}";
             return res;
@@ -154,6 +157,7 @@ class Prog {
         Directory.CreateDirectory("_scratch");
         Prog.paths = new List<string>();
         Prog.keys = new List<string>();
+        Prog.authorizations = new List<string>();
         Prog.versions = new List<string>();
         Prog.bodies = new List<string>();
         Prog.script = new List<List<AiToolCall>>();
@@ -347,10 +351,68 @@ class Prog {
                 bad = bad + 1;
             }
             Console.WriteLine("err=" + client.lastError);
+            Prog.failStatus = 503;
+            int before = Prog.paths.Count;
+            client.config.maxAttempts = 2;
+            reply = await client.CompleteMessages(msgs, 0.0, "");
+            if (reply != Prog.scriptText || client.LastError() != ""
+                || Prog.paths.Count != before + 2) {
+                Console.WriteLine("anthropic retry: " + client.LastError());
+                bad = bad + 1;
+            }
             client.Close();
         }
 
-        // ---- 4. 静态翻译函数（不经网络） ----
+        // ---- 4. 替换配置后，超限请求在初始化连接前被拒绝 ----
+        {
+            string url = "http://127.0.0.1:" + Convert.ToString(Prog.PORT) + "/v1";
+            AiEndpoint ep = AiEndpoint.Parse(url);
+            AiClient client = new AiClient(new AiConfig(url, "", "test"));
+            AiConfig config = new AiConfig(url, "before-limit", "test");
+            config.requestLimitBytes = 2;
+            config.maxAttempts = 2;
+            client.config = config;
+
+            int before = Prog.paths.Count;
+            string reply = await client.PostJson(ep, "/chat/completions", "{ }");
+            if (reply != null || Prog.paths.Count != before
+                || client.LastError() != "请求体超过上限（2 字节）") {
+                Console.WriteLine("post limit: " + client.LastError());
+                bad = bad + 1;
+            }
+
+            // 如果超限路径提前建了连接，这里会收到旧的鉴权头。
+            config.apiKey = "accepted";
+            Prog.failStatus = 503;
+            before = Prog.paths.Count;
+            reply = await client.PostJson(ep, "/chat/completions", "{}");
+            // PostJson 成功时保留调用方已有的诊断。
+            if (reply == null || Prog.paths.Count != before + 2
+                || client.LastError() != "请求体超过上限（2 字节）") {
+                Console.WriteLine("post retry: " + client.LastError());
+                bad = bad + 1;
+            }
+            for (int i = before; i < Prog.paths.Count; i = i + 1) {
+                if (Prog.paths[i] != "/v1/chat/completions" || Prog.bodies[i] != "{}"
+                    || Prog.authorizations[i] != "Bearer accepted") {
+                    Console.WriteLine("post request shape mismatch");
+                    bad = bad + 1;
+                }
+            }
+
+            Prog.failStatus = 502;
+            before = Prog.paths.Count;
+            reply = await client.PostJson(ep, "/chat/completions", "{}");
+            if (reply != null || Prog.paths.Count != before + 2
+                || client.LastError() != "AI 服务返回 502") {
+                Console.WriteLine("post retry exhausted: " + client.LastError());
+                bad = bad + 1;
+            }
+            Prog.failStatus = 0;
+            client.Close();
+        }
+
+        // ---- 5. 静态翻译函数（不经网络） ----
         {
             // 两条 system 消息拼成一段（顺序不变）。
             List<AiMessage> msgs = new List<AiMessage>();
