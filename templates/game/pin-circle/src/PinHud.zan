@@ -1,0 +1,347 @@
+using System;
+using System.Collections.Generic;
+using Game.Kit;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+
+namespace PinCircle;
+
+// One retained tree, shared by the existing three scene instances. Only the
+// world remains in PinView; all player-facing controls use Gui input and skin.
+public class PinHud : UiViewOwner {
+    PinWorld game;
+    weak PinView view;
+    weak HtmlScene scene;
+    weak SceneRouter router;
+    HudLayer layer;
+    UiViewScope scope;
+    Action startAction;
+    Action homeAction;
+    Action pauseAction;
+    Action confirmAction;
+    Action backAction;
+    Panel root;
+    Panel menu;
+    Panel play;
+    Panel modal;
+    Panel card;
+    Panel instrument;
+    Label remaining;
+    Label rotorCaption;
+    Label medal;
+    Image titleArt;
+    Label best;
+    Label level;
+    Label pattern;
+    Label status;
+    Label heading;
+    Label detail;
+    Label hint;
+    Label caption;
+    Label fireCaption;
+    Label playHint;
+    Button start;
+    Button home;
+    Button pause;
+    Button confirm;
+    Button back;
+    List<Panel> dots;
+    string mode;
+    int animationMs;
+    bool paused;
+
+    PinHud(PinWorld game, PinView view, App app) {
+        this.game = game;
+        this.view = view;
+        app.UseCss(PinHud.Css());
+        this.layer = new HudLayer();
+        this.root = new Panel("pin-hud");
+        this.root.Class = "pin-hud";
+        this.instrument = this.Group(this.root, "pin-instrument");
+        this.remaining = this.LabelAt(this.instrument, "", "pin-paper", "remaining");
+        this.rotorCaption = this.LabelAt(this.instrument, "", "pin-gold", "rotor-caption");
+        this.menu = this.Group(this.root, "pin-menu");
+        this.LabelAt(this.menu, "O R B I T   /   P R E C I S I O N", "pin-gold", "eyebrow");
+        this.LabelAt(this.menu, "一 瞬 之 间  ·  恰 好 入 隙", "pin-muted", "subtitle");
+        this.titleArt = new Image(Assets.Find("assets/title.png"), "星 环 机 关", "contain");
+        this.titleArt.Class = "pin-title-art";
+        this.menu.Add(this.titleArt);
+        this.start = this.ButtonAt(this.menu, "▷", "pin-seal", "start");
+        this.LabelAt(this.menu, "开 始 挑 战", "pin-paper", "start-caption");
+        this.LabelAt(this.menu, "点击发射  ·  针针入隙  ·  步步进阶", "pin-muted", "menu-hint");
+        this.best = this.LabelAt(this.menu, "", "pin-gold", "best");
+        this.play = this.Group(this.root, "pin-play");
+        this.home = this.ButtonAt(this.play, "←", "pin-tool", "home");
+        this.pause = this.ButtonAt(this.play, "Ⅱ", "pin-tool", "pause");
+        this.LabelAt(this.play, "星 环 机 关", "pin-gold", "title");
+        this.level = this.LabelAt(this.play, "", "pin-paper", "level");
+        this.dots = new List<Panel>();
+        for (int i = 0; i < 18; i = i + 1) {
+            Panel dot = new Panel("pin-dot");
+            dot.Class = "pin-dot";
+            this.play.Add(dot);
+            this.dots.Add(dot);
+        }
+        this.pattern = this.LabelAt(this.play, "", "pin-muted", "pattern");
+        this.fireCaption = this.LabelAt(this.play, "轻触发射", "pin-paper", "fire-caption");
+        this.playHint = this.LabelAt(this.play, "点击空白处或按空格  ·  避开针球与针杆", "pin-muted", "play-hint");
+        this.modal = this.Group(this.root, "pin-modal");
+        this.card = this.Group(this.modal, "pin-card");
+        this.status = this.LabelAt(this.card, "", "pin-gold", "status");
+        this.medal = this.LabelAt(this.card, "◇", "pin-medal", "medal");
+        this.heading = this.LabelAt(this.card, "", "pin-paper", "heading");
+        this.detail = this.LabelAt(this.card, "", "pin-muted", "detail");
+        this.confirm = this.ButtonAt(this.card, "▷", "pin-seal", "confirm");
+        this.caption = this.LabelAt(this.card, "", "pin-paper", "confirm-caption");
+        this.back = this.ButtonAt(this.card, "返回主菜单", "pin-back", "back");
+        this.hint = this.LabelAt(this.modal, "", "pin-muted", "result-hint");
+        this.layer.Add(this.root);
+        this.layer.SetVisible(false);
+    }
+
+    Panel Group(Control parent, string cls) {
+        Panel panel = new Panel(cls);
+        panel.Class = cls;
+        parent.Add(panel);
+        return panel;
+    }
+    Label LabelAt(Control parent, string text, string cls, string name) {
+        Label label = new Label(text);
+        label.name = name;
+        label.Class = "pin-label " + cls;
+        parent.Add(label);
+        return label;
+    }
+    Button ButtonAt(Control parent, string text, string cls, string name) {
+        Button button = new Button(text);
+        button.name = name;
+        button.Class = cls;
+        if (cls == "pin-seal") {
+            Image art = new Image(Assets.Find("assets/rotor.png"), "", "contain");
+            art.Class = "pin-seal-art";
+            button.InsertAt(0, art);
+        }
+        parent.Add(button);
+        return button;
+    }
+
+    void Enter(SceneRouter router, HtmlScene scene, string mode) {
+        this.Exit();
+        this.router = router;
+        this.scene = scene;
+        this.mode = mode;
+        App app = router.Host().App();
+        this.scope = new UiViewScope(app, this, this.root);
+        this.startAction = this.scope.Action("start", this.start).Run;
+        this.homeAction = this.scope.Action("home", this.home).Run;
+        this.pauseAction = this.scope.Action("pause", this.pause).Run;
+        this.confirmAction = this.scope.Action("confirm", this.confirm).Run;
+        this.backAction = this.scope.Action("home", this.back).Run;
+        this.start.OnClick(this.startAction);
+        this.home.OnClick(this.homeAction);
+        this.pause.OnClick(this.pauseAction);
+        this.confirm.OnClick(this.confirmAction);
+        this.back.OnClick(this.backAction);
+        this.root.OnPreviewRouted(this.scope.Action("world", this.root).Pointer);
+        this.Sync(0);
+        this.layer.SetVisible(true);
+        this.layer.Bind(app);
+    }
+
+    void Exit() {
+        UiViewScope previous = this.scope;
+        this.scope = null;
+        this.scene = null;
+        this.router = null;
+        // Retire queued actions before releasing capture/focus can call back.
+        if (previous != null) { previous.Retire(); }
+        this.layer.SetVisible(false);
+        if (this.startAction != null) { this.start.Click.Remove(this.startAction); }
+        if (this.homeAction != null) { this.home.Click.Remove(this.homeAction); }
+        if (this.pauseAction != null) { this.pause.Click.Remove(this.pauseAction); }
+        if (this.confirmAction != null) { this.confirm.Click.Remove(this.confirmAction); }
+        if (this.backAction != null) { this.back.Click.Remove(this.backAction); }
+        this.startAction = null;
+        this.homeAction = null;
+        this.pauseAction = null;
+        this.confirmAction = null;
+        this.backAction = null;
+        this.root.OnPreviewRouted(null);
+    }
+
+    void Sync(int animationMs) {
+        this.SyncState(animationMs);
+    }
+
+    void SyncState(int animationMs) {
+        this.animationMs = animationMs;
+        bool wasPaused = this.paused;
+        this.paused = this.mode == "play" && this.game.paused;
+        SceneRouter activeRouter = this.router;
+        if (wasPaused != this.paused && activeRouter != null) {
+            // Release only the controls leaving the active modal/toolbar state.
+            App app = activeRouter.Host().App();
+            if (this.paused) { app.ReleaseInputSubtree(this.home); app.ReleaseInputSubtree(this.pause); }
+            else { app.ReleaseInputSubtree(this.modal); }
+        }
+        bool result = this.paused || this.mode == "over";
+        this.menu.SetShown(this.mode == "menu");
+        this.play.SetShown(this.mode != "menu");
+        this.home.SetShown(this.mode == "play" && !result);
+        this.pause.SetShown(this.mode == "play" && !result);
+        this.fireCaption.SetShown(this.mode == "play" && !result);
+        this.playHint.SetShown(this.mode == "play" && !result);
+        this.remaining.SetProp("text", this.mode == "menu" ? "01" : Convert.ToString(this.game.Remaining()));
+        this.rotorCaption.SetProp("text", this.mode == "menu" ? "入 隙" : "待 发 射");
+        this.modal.SetShown(result);
+        this.best.SetProp("text", "本次最高   " + this.game.bestLevel + "   关");
+        this.level.SetProp("text", "第 " + this.game.level + " 关");
+        this.pattern.SetProp("text", this.game.PatternName());
+        for (int i = 0; i < this.dots.Count; i = i + 1) {
+            this.dots[i].SetShown(i < this.game.target);
+            this.dots[i].SetProp("class", i < this.game.inserted ? "pin-dot pin-dot-filled" : "pin-dot");
+        }
+        bool won = this.game.state == RoundState.Cleared;
+        this.status.SetProp("text", this.paused ? "TAKE A BREATH" : (won ? "PERFECT TIMING" : "ONE MORE TRY"));
+        this.heading.SetProp("text", this.paused ? "蓄 势 待 发" : (won ? "针 针 入 隙" : "再 差 一 瞬"));
+        this.detail.SetProp("text", "第 " + this.game.level + " 关   /   已入隙 " + this.game.inserted + " · " + this.game.target);
+        this.confirm.SetText(!this.paused && !won ? "↶" : "▷");
+        this.medal.SetProp("text", this.paused ? "Ⅱ" : (won ? "✓" : "!"));
+        this.medal.SetProp("class", "pin-label pin-medal " + (this.paused ? "pin-gold" : (won ? "pin-jade" : "pin-danger")));
+        this.caption.SetProp("text", this.paused ? "继续挑战" : (won ? "开启下一关" : "重试本关"));
+        this.hint.SetProp("text", this.paused ? "P / 空格继续  ·  Esc 返回" : "Enter / 空格继续  ·  Esc 返回");
+        this.confirm.Disabled = this.mode == "over" && animationMs < 240;
+        // Configure child styles before the shared HUD scope measures them.
+        // Enter uses this same path before its first Bind and first input.
+        if (activeRouter != null) {
+            App app = activeRouter.Host().App();
+            this.Layout(this.layer.BoundsWidth(app), this.layer.BoundsHeight(app));
+        }
+    }
+
+    void Render(App app) { this.layer.Paint(app); }
+    public void PrepareView(UiViewScope view, App app) {
+        SceneRouter owner = this.router;
+        HtmlScene active = this.scene;
+        if (view != this.scope || owner == null || active == null || owner.Current() != active
+            || owner.Host().App() != app) { return; }
+        // Shared input preparation runs before every event, even between renders.
+        // FixedStep owns the 240ms gate; prepare only projects its current value.
+        int time = this.animationMs;
+        if (active is PinMenuScene) { time = ((PinMenuScene)active).timeMs; }
+        if (active is PinPlayScene) { time = ((PinPlayScene)active).pauseTime; }
+        if (active is PinOverScene) { time = ((PinOverScene)active).waitMs; }
+        this.SyncState(time);
+    }
+    public void ViewAction(string name, Control sender) {
+        HtmlScene active = this.scene;
+        SceneRouter owner = this.router;
+        if (owner == null || active == null || owner.Current() != active) { return; }
+        if (name == "home") { owner.Go("menu"); }
+        if (name == "start" && active is PinMenuScene) { ((PinMenuScene)active).Start(); }
+        if (name == "pause" && active is PinPlayScene) { ((PinPlayScene)active).TogglePause(); }
+        if (name == "confirm") {
+            if (active is PinPlayScene && this.game.paused) { ((PinPlayScene)active).TogglePause(); }
+            if (active is PinOverScene) { ((PinOverScene)active).Continue(); }
+        }
+    }
+    public void ViewPointer(Control sender, RoutedEventArgs args) {
+        // Preview only the world surface. Button descendants keep normal Gui
+        // capture/focus/Click; a menu click never also launches a needle.
+        if (args.eventName != "PointerDown" && args.eventName != "MouseDown") { return; }
+        Control source = args.originalSource;
+        while (source != null && source != this.root) {
+            if (source is Button) { return; }
+            source = source.Parent();
+        }
+        SceneRouter owner = this.router;
+        HtmlScene active = this.scene;
+        if (owner == null || active == null || owner.Current() != active) { return; }
+        if (owner.Host().App().window.EventButton() != 0) { return; }
+        if (this.mode != "play" || this.game.paused) { args.Handle(); return; }
+        PinView view = this.view;
+        if (view != null) {
+            view.Sync(owner.Host());
+            if (view.my > view.Dp(96) && active is PinPlayScene) { ((PinPlayScene)active).Fire(); }
+        }
+        args.Handle();
+    }
+
+    // Device-space geometry is prepared by HudLayer before input. Original
+    // action centers survive both the stage viewport and title-bar offset.
+    void Layout(int width, int height) {
+        double s = Math.Min(width / 600.0, height / 900.0);
+        int cx = width / 2;
+        int cy = height / 2 - (int)(84 * s);
+        int action = cy + (int)(PinWorld.LaunchRadius * 1.32 * s);
+        int menuY = height - (int)(196 * s);
+        int ry = height / 2 - (int)(12 * s);
+        this.Box(this.instrument, 0, 0, width, height, 0);
+        int rotorY = cy + (this.mode == "menu" ? (int)(36*s) : 0);
+        this.Box(this.remaining, 0, rotorY-(int)(34*s), width, (int)(64*s), (int)(54*s));
+        this.Box(this.rotorCaption, 0, rotorY+(int)(30*s), width, (int)(28*s), (int)(18*s));
+        this.Box(this.titleArt, cx-(int)(240*s), (int)(80*s), (int)(480*s), (int)(90*s), 0);
+        this.Box(this.menu, 0, 0, width, height, 0);
+        this.Box(this.play, 0, 0, width, height, 0);
+        this.Box(this.modal, 0, 0, width, height, 0);
+        this.Place(this.menu, "eyebrow", 0, (int)(40*s), width, (int)(28*s), (int)(18*s));
+        this.Place(this.menu, "subtitle", 0, (int)(172*s), width, (int)(28*s), (int)(18*s));
+        this.Box(this.start, cx-(int)(52*s), menuY-(int)(52*s), (int)(104*s), (int)(104*s), (int)(40*s));
+        this.Place(this.menu, "start-caption", 0, menuY+(int)(64*s), width, (int)(36*s), (int)(27*s));
+        this.Place(this.menu, "menu-hint", 0, height-(int)(78*s), width, (int)(28*s), (int)(18*s));
+        this.Box(this.best, 0, height-(int)(40*s), width, (int)(28*s), (int)(18*s));
+        this.Box(this.home, (int)(20*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(26*s));
+        this.Box(this.pause, width-(int)(68*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(24*s));
+        this.Place(this.play, "title", (int)(76*s), (int)(22*s), width-(int)(152*s), (int)(28*s), (int)(18*s));
+        this.Box(this.level, (int)(76*s), (int)(56*s), width-(int)(152*s), (int)(36*s), (int)(27*s));
+        for (int i = 0; i < this.dots.Count; i = i + 1) {
+            int dx = cx + (int)((i * 2 - this.game.target + 1) * 8 * s);
+            this.Box(this.dots[i], dx-(int)(3*s), (int)(109*s), (int)(6*s), (int)(6*s), 0);
+        }
+        this.Box(this.pattern, 0, cy+(int)(204*1.32*s), width, (int)(28*s), (int)(18*s));
+        this.Place(this.play, "fire-caption", 0, action+(int)(44*s), width, (int)(36*s), (int)(27*s));
+        this.Place(this.play, "play-hint", 0, height-(int)(28*s), width, (int)(28*s), (int)(18*s));
+        double entry = 1 - Math.Pow(1 - Math.Min(1, this.animationMs / 300.0), 3);
+        int y = ry-(int)(230*s)+(int)((1-entry)*16*s);
+        int cardX = cx-(int)(200*s);
+        this.Box(this.card, cardX, y, (int)(400*s), (int)(480*s), 0);
+        this.Place(this.card, "status", 0, (int)(32*s), (int)(400*s), (int)(28*s), (int)(18*s));
+        this.Place(this.card, "medal", 0, (int)(74*s), (int)(400*s), (int)(64*s), (int)(48*s));
+        this.Box(this.heading, 0, (int)(160*s), (int)(400*s), (int)(48*s), (int)(36*s));
+        this.Box(this.detail, 0, (int)(220*s), (int)(400*s), (int)(28*s), (int)(18*s));
+        // Buttons remain at the old hit centers while the decorative panel enters.
+        this.Box(this.confirm, cx-cardX-(int)(44*s), ry+(int)(36*s)-y, (int)(88*s), (int)(88*s), (int)(36*s));
+        this.Box(this.caption, 0, ry+(int)(138*s)-y, (int)(400*s), (int)(36*s), (int)(27*s));
+        this.Box(this.back, (int)(124*s), ry+(int)(182*s)-y, (int)(152*s), (int)(48*s), (int)(18*s));
+        this.Box(this.hint, 0, height-(int)(44*s), width, (int)(28*s), (int)(18*s));
+    }
+    void Place(Control parent, string name, int x, int y, int w, int h, int font) {
+        Control child = parent.FindByName(name);
+        if (child != null) { this.Box(child, x, y, w, h, font); }
+    }
+    void Box(Control control, int x, int y, int w, int h, int font) {
+        string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + w + "dpx;height:" + h + "dpx";
+        if (font > 0) { style = style + ";font-size:" + font + "dpx"; }
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+    }
+    static string Css() {
+        return ".pin-hud,.pin-menu,.pin-play{position:relative;background:transparent;padding:0;border:0}"
+            + ".pin-menu,.pin-play,.pin-modal,.pin-card,.pin-instrument,.pin-title-art{position:absolute;padding:0;margin:0}"
+            + ".pin-modal{background:rgba(1,16,20,0.80);border:0}"
+            + ".pin-card{background:#051d21;border:2dpx solid #735d37;border-radius:var(--radius-large);box-shadow:0 8dpx 24dpx rgba(0,0,0,0.35)}"
+            + "label.pin-label{position:absolute;padding:0;margin:0;border:0;background:transparent;text-align:center;vertical-align:top}"
+            + ".pin-dot{position:absolute;background:rgba(217,183,123,0.28);border:0;border-radius:var(--radius-full)}.pin-dot-filled{background:#69e4c4}"
+            + "label.pin-paper{color:#f7eed6}label.pin-gold{color:#d9b77b}label.pin-muted{color:#89aba8}label.pin-medal,label.pin-jade{color:#69e4c4}label.pin-danger{color:#ff8b76}"
+            + "button.pin-tool,button.pin-seal,button.pin-back{position:absolute;padding:0;margin:0;justify-content:center;align-items:center;color:#f7eed6;background:#092f32;border:1dpx solid #735d37;border-radius:var(--radius-full)}"
+            + "button.pin-seal{background:radial-gradient(circle,#174b47,#051c21);border:2dpx solid #d9b77b;box-shadow:0 0 12dpx rgba(105,228,196,0.12)}"
+            + "image.pin-seal-art{position:absolute;left:4%;top:4%;width:92%;height:92%;background:transparent;border:0;padding:0}button.pin-seal label{z-index:1}"
+            + "button.pin-back{background:transparent;border-color:transparent;color:#89aba8}"
+            + "button.pin-tool label,button.pin-seal label,button.pin-back label{background:transparent;border:0;font-size:inherit;color:inherit;text-align:center;padding:0;margin:0}"
+            + "button.pin-tool:hover,button.pin-seal:hover,button.pin-back:hover{background:#164b45;color:#f7eed6;border-color:#69e4c4}"
+            + "button.pin-tool:active,button.pin-seal:active,button.pin-back:active{background:#236758;border-color:#f7eed6}"
+            + "button.pin-tool:focus,button.pin-seal:focus,button.pin-back:focus{border:2dpx solid #69e4c4}"
+            + "button.pin-tool:disabled,button.pin-seal:disabled,button.pin-back:disabled{background:#122e30;color:#58736e;border-color:#46605a}";
+    }
+}
+

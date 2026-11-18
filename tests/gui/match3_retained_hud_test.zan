@@ -1,0 +1,286 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+using Game.Kit;
+using Match3;
+
+// Compile with Match3Game/Match3Hud, excluding template main.
+// No GuiHost.Run and no real window: route actual offscreen App input.
+public class Match3RetainedHudTest {
+    static void Require(bool ok, string reason) {
+        if (!ok) { throw new Exception(reason); }
+    }
+
+    static void Down(GuiHost host, int x, int y, int button) {
+        host.app.ProcessOffscreenInput(2, x, y, button, 0, 0, 0);
+    }
+
+    static void Up(GuiHost host, int x, int y, int button) {
+        host.app.ProcessOffscreenInput(3, x, y, button, 0, 0, 0);
+    }
+
+    public static void Main() {
+        GuiHost host = new GuiHost("Match3 retained HUD", 720, 960, 60);
+        host.app = App.CreateOffscreen("Match3 retained HUD", 720, 960);
+        CDraw.vpS = 65536;
+        CDraw.vpX = 0;
+        CDraw.vpY = 0;
+        Match3Game game = Match3Game.Create();
+        Match3Hud hud = new Match3Hud(host, game);
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        hud.Layout(host.app);
+        Require(hud.title.bx == 40 && hud.title.by == 50 && hud.title.bw == 640 && hud.title.bh == 40,
+            "startup title authored geometry");
+        Require(hud.score.bx == 40 && hud.score.by == 100 && hud.score.bw == 356 && hud.score.bh == 32
+            && hud.moves.bx == 400 && hud.moves.by == 100 && hud.moves.bw == 300 && hud.moves.bh == 32,
+            "grouped CSS keeps independent HUD geometry");
+        Require(hud.title.computedStyle.fontPx == 28 && hud.score.computedStyle.fontPx == 20
+            && hud.moves.computedStyle.fontPx == 20 && hud.title.computedStyle.fg == unchecked((int)0xffffffff)
+            && hud.score.computedStyle.fg == unchecked((int)0xffffc53d)
+            && hud.moves.computedStyle.fg == unchecked((int)0xff40a9ff),
+            "grouped CSS keeps independent HUD typography and colors");
+        Control root = hud.root;
+        Control result = hud.result;
+        int childCount = hud.root.ChildCount();
+        Require(host.app.rootControl.ContainsInputControl(hud.root), "explicit input owner");
+        Require(hud.score.GetText() == "SCORE: 0 / 1500"
+            && hud.moves.GetText() == "MOVES LEFT: 25", "startup labels");
+        Require(!hud.result.visible, "result hidden initially");
+
+        // Selection is a down behavior. Move/right down must never select.
+        host.app.ProcessOffscreenInput(1, 136, 232, 0, 0, 0, 0);
+        Require(!game.hasSelection, "motion is not selection");
+        Down(host, 136, 232, 1);
+        Up(host, 136, 232, 1);
+        Require(!game.hasSelection, "right button is not selection");
+        Down(host, 136, 232, 0);
+        Require(game.hasSelection && game.selectedCol == 0 && game.selectedRow == 0,
+            "left down selects before release");
+        Up(host, 136, 232, 0);
+        Require(game.movesLeft == 25, "release does not swap");
+
+        // Deterministic legal swap fixture; game equations remain baseline code.
+        game.InitBoard();
+        game.board.Set(0, 0, 1);
+        game.board.Set(1, 0, 1);
+        game.board.Set(2, 0, 2);
+        game.board.Set(2, 1, 1);
+        Down(host, 264, 232, 0);
+        Up(host, 264, 232, 0);
+        Down(host, 264, 296, 0);
+        Up(host, 264, 296, 0);
+        Require(game.movesLeft == 24 && game.score > 0, "legal swap commits once");
+        Require(hud.score.GetText() == "SCORE: " + Convert.ToString(game.score) + " / 1500"
+            && hud.moves.GetText() == "MOVES LEFT: 24", "event updates labels before Paint");
+        Require(game.floatingTexts.ActiveCount > 0
+            && game.floatingTexts.items[0].x == 264.0
+            && game.floatingTexts.items[0].y == 264.0,
+            "floating score remains anchored to swapped world tile");
+        double timer = game.floatingTexts.items[0].timer;
+        hud.Layout(host.app);
+        for (int i = 0; i < 3; i = i + 1) {
+            game.Render(host.app.canvas);
+            hud.root.RenderTree(host.app);
+        }
+        Require(game.movesLeft == 24 && game.floatingTexts.items[0].timer == timer,
+            "repeated Paint neither commits nor advances feedback");
+        Require(hud.root == root && hud.result == result
+            && hud.root.ChildCount() == childCount, "tree identity stable");
+
+        game.gameOver = true;
+        game.score = 1500;
+        hud.SyncState();
+        hud.Layout(host.app);
+        Require(hud.resultTitle.GetText() == "STAGE CLEAR!" && hud.result.visible,
+            "winning result");
+        // Replay by down at a board cell: the same press cannot select it.
+        Down(host, 136, 232, 0);
+        Require(!game.gameOver && game.score == 0 && game.movesLeft == 25
+            && !game.hasSelection && !hud.result.visible, "anywhere down replays once");
+        Up(host, 136, 232, 0);
+        Require(!game.hasSelection, "restart release cannot select");
+        game.gameOver = true;
+        game.movesLeft = 0;
+        hud.SyncState();
+        hud.Layout(host.app);
+        Require(hud.resultTitle.GetText() == "OUT OF MOVES!", "losing result");
+        // Direct and named subscriptions share one deferred Click notification.
+        Button subscribed = new Button("shared Click");
+        subscribed.UseApp(host.app);
+        int directHits = 0;
+        int namedHits = 0;
+        subscribed.Click.Add(() => { directHits = directHits + 1; });
+        subscribed.BindEvent("Click", () => { namedHits = namedHits + 1; });
+        Require(subscribed.Click.CountAll() == 2, "one Click retains both handlers");
+        Control.RouteEvent(subscribed, new RoutedEventArgs("Click", subscribed));
+        Require(directHits == 0 && namedHits == 0, "Click dispatch stays deferred");
+        host.app.DrainPosts();
+        Require(directHits == 1 && namedHits == 1, "both subscriptions run once");
+        host.app.DrainPosts();
+        Require(directHits == 1 && namedHits == 1, "repeated DrainPosts cannot duplicate Click");
+        subscribed.UseApp(null);
+        // This template only had Esc on the keyboard. Do not assume Button
+        // Enter synthesis. Verify its actual semantic Click action and Post drain.
+        // Independent subscriptions preserve the real HUD and its action shape.
+        // Collect every channel before asserting so one run reports all cases.
+        Button naturalSubscription = new Button("natural subscription");
+        naturalSubscription.OnClick(hud.view.Action("replay", hud.replay).Run);
+        Button explicitSubscription = new Button("explicit subscription");
+        explicitSubscription.BindEvent("Click", hud.view.Action("replay", hud.replay).Run);
+        Button controlSubscription = new Button("control subscription");
+        Control controlReceiver = controlSubscription;
+        controlReceiver.OnClick(hud.view.Action("replay", hud.replay).Run);
+        Require(naturalSubscription.Click.CountAll() == 1
+            && explicitSubscription.Click.CountAll() == 1
+            && controlSubscription.Click.CountAll() == 1,
+            "all subscription forms use Control.Click");
+        Require(hud.replay.Click.CountAll() == 1, "HUD replay has one Click subscription");
+        Require(hud.view != null && hud.view.IsActive()
+            && hud.replay.FindApp() == host.app && host.app.isRunning,
+            "semantic replay stage: action owner and live host retained");
+        hud.replay.Focus(host.app);
+        Control.RouteEvent(hud.replay, new RoutedEventArgs("Click", hud.replay));
+        Require(hud.replay.Click.CountAll() == 1,
+            "semantic replay stage: routed Click keeps one subscription");
+        bool postsDrained = false;
+        Require(host.app.TryPost(() => { postsDrained = true; }),
+            "semantic replay stage: live host accepts queue sentinel");
+        host.app.DrainPosts();
+        Require(postsDrained, "semantic replay stage: DrainPosts executes queued work");
+        Require(!game.gameOver && !hud.result.visible, "standard semantic replay");
+        Require(!hud.replay.IsFocused(host.app), "hidden result releases focus");
+        Require(game.floatingTexts.ActiveCount > 0, "replay retains existing floating-score lifetime");
+        game.Update(2.0);
+        Require(game.floatingTexts.ActiveCount == 0, "original world feedback expiry");
+        Require(hud.root == root && hud.result == result
+            && hud.root.ChildCount() == childCount, "replay retains tree identity");
+        // Simulate the post-SyncSurface boundary without a native window.
+        // Neither loop.Update nor Layout/Paint may run between resize and Down.
+        game.gameOver = true;
+        game.score = 1500;
+        game.movesLeft = 0;
+        hud.SyncState();
+        hud.Layout(host.app);
+        int oldWidth = hud.root.bw;
+        int oldHeight = hud.root.bh;
+        int newWidth = oldWidth + 160;
+        int newHeight = oldHeight + 120;
+        host.app.SwapCanvas(newWidth, newHeight);
+        Require(hud.root.bw == oldWidth && hud.root.bh == oldHeight,
+            "surface replacement alone leaves retained bounds stale");
+        // This point is outside both old axes, inside the enlarged surface.
+        Down(host, oldWidth + 40, oldHeight + 40, 0);
+        Require(hud.root.bw == newWidth && hud.root.bh == newHeight,
+            "first resized Down lays out before the bounds check");
+        Require(!game.gameOver && game.score == 0 && game.movesLeft == 25
+            && !game.hasSelection && !hud.result.visible,
+            "first Down in newly exposed area replays before Update or Paint");
+        Up(host, oldWidth + 40, oldHeight + 40, 0);
+        Require(!game.hasSelection && game.movesLeft == 25,
+            "resized replay release cannot select or spend a move");
+        // Keep the just-dispatched event state while Paint repeats. A paint-time
+        // input bridge would wrongly replay this deliberately pending result.
+        game.gameOver = true;
+        game.score = 1500;
+        game.movesLeft = 0;
+        hud.SyncState();
+        for (int paint = 0; paint < 3; paint = paint + 1) {
+            game.Render(host.app.canvas);
+            hud.root.RenderTree(host.app);
+        }
+        Require(game.gameOver && game.score == 1500 && game.movesLeft == 0
+            && !game.hasSelection && hud.result.visible,
+            "Paint after resized input never commits a pending replay");
+        Require(hud.root == root && hud.result == result
+            && hud.root.ChildCount() == childCount, "resize retains tree identity");
+        // Real OnMeasure callbacks replace root or stop the owner during layout.
+        Panel replacement = new Panel("replacement");
+        replacement.Arrange(17, 23, 80, 60);
+        Match3PreparationProbe probe = new Match3PreparationProbe();
+        probe.host = host;
+        probe.hud = hud;
+        probe.replacement = replacement;
+        hud.root.Add(probe);
+        int widthBeforeCallback = hud.root.bw;
+        host.app.SwapCanvas(newWidth + 20, newHeight + 20);
+        probe.mode = 1;
+        Down(host, 136, 232, 0);
+        Require(host.app.rootControl.ContainsInputControl(replacement)
+            && !host.app.rootControl.ContainsInputControl(hud.root)
+            && hud.root.bw == widthBeforeCallback,
+            "root replacement in Measure rejects stale Arrange tail");
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        probe.mode = 2;
+        Down(host, 136, 232, 0);
+        Require(host.app.rootControl.ContainsInputControl(replacement)
+            && hud.root.bw == widthBeforeCallback,
+            "Stop reentry in Measure retires before root release and rejects tail");
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        hud.Layout(host.app);
+        // BeforePaint uses the same owner layout after a business update.
+        host.app.BeginOffscreenFrame();
+        Require(host.app.PrepareStandardHostFrame(), "optional BeforePaint prepares");
+        Require(hud.root.bw == host.app.canvas.Width(), "BeforePaint uses actual owner region");
+        host.app.CancelOffscreenFrame();
+        // No AppHostLayout ticket: opt-in proofs must still fence paint tails.
+        host.app.BeginOffscreenFrame();
+        Require(host.app.PrepareStandardHostFrame(), "root-swap frame prepares");
+        Control preparedOuterRoot = host.app.rootControl;
+        int preparedFrame = host.app.FrameSeq();
+        host.SetContentRoot(replacement);
+        Control swappedOuterRoot = host.app.rootControl;
+        bool containsReplacement = swappedOuterRoot != null
+            && swappedOuterRoot.ContainsInputControl(replacement);
+        bool containsOldHud = swappedOuterRoot != null
+            && swappedOuterRoot.ContainsInputControl(hud.root);
+        bool sameOuterRoot = swappedOuterRoot == preparedOuterRoot;
+        string swapState = " frameBefore=" + Convert.ToString(preparedFrame)
+            + " frameAfter=" + Convert.ToString(host.app.FrameSeq())
+            + " containsReplacement=" + (containsReplacement ? "true" : "false")
+            + " containsOldHud=" + (containsOldHud ? "true" : "false")
+            + " sameOuterRoot=" + (sameOuterRoot ? "true" : "false");
+        Require(containsReplacement && !containsOldHud,
+            "prepared fallback replacement committed:" + swapState);
+        Require(preparedOuterRoot != null && sameOuterRoot,
+            "prepared fallback replacement retains outer root:" + swapState);
+        Require(!host.app.ContinuePreparedFrame(),
+            "prepared root swap rejects paint tail:" + swapState);
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        host.app.BeginOffscreenFrame();
+        Require(host.app.PrepareStandardHostFrame(), "stop frame prepares");
+        hud.StopPreparation();
+        Require(!host.app.ContinuePreparedFrame(), "prepared owner stop rejects paint tail");
+        host.app.BeginOffscreenFrame();
+        Require(host.app.ContinuePreparedFrame(), "unprepared manual frame remains compatible");
+        host.app.CancelOffscreenFrame();
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        // Public SetContentRoot remains geometry-neutral for non-opt-in content.
+        Panel manual = new Panel("manual-region");
+        manual.Arrange(30, 50, 80, 60);
+        host.SetContentRoot(manual);
+        Down(host, 45, 70, 0);
+        Up(host, 45, 70, 0);
+        Require(manual.bx == 30 && manual.by == 50 && manual.bw == 80
+            && manual.bh == 60, "non-opt-in root retains its actual region");
+        host.SetContentRoot(hud.root);
+        hud.AttachPreparation(host);
+        hud.Layout(host.app);
+        hud.StopPreparation();
+        // Repeated Stop is inert; stale callbacks cannot prepare a new root.
+        hud.StopPreparation();
+        host.SetContentRoot(manual);
+        host.app.SwapCanvas(newWidth + 80, newHeight + 80);
+        Down(host, 45, 70, 0);
+        Up(host, 45, 70, 0);
+        Require(manual.bw == 80 && manual.bh == 60, "retired owner cannot relayout replacement");
+        host.SetContentRoot(null);
+        host.app.StopLoop();
+        Console.WriteLine("MATCH3_RETAINED_HUD_PASS");
+    }
+}

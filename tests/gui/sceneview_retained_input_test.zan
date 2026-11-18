@@ -1,0 +1,84 @@
+using System;
+using Gui;
+using Game.Scene;
+
+class SceneViewRetainedInputTest {
+    string lastHandler;
+    int calls;
+    void Upper() { lastHandler = "Upper"; calls = calls + 1; }
+    void Lower() { lastHandler = "Lower"; calls = calls + 1; }
+    void Grid() { lastHandler = "Grid"; calls = calls + 1; }
+    void Added() { lastHandler = "Added"; calls = calls + 1; }
+
+    static void Require(bool condition, string label) {
+        if (!condition) { throw new Exception(label); }
+    }
+    static void Send(App app, int kind, int x, int y) {
+        app.ProcessOffscreenInput(kind, x, y, 0, 0, 0, 0);
+        app.DrainPosts();
+    }
+    static void Click(App app, int x, int y) { Send(app, 2, x, y); Send(app, 3, x, y); }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Retained scene input", 480, 360);
+        Control world = new Control("world"); app.SetRootControl(world);
+        SceneDoc doc = new SceneDoc("scene", 240, 160); doc.SetLayersActive(true);
+        SceneViewRetainedInputTest witness = new SceneViewRetainedInputTest();
+        doc.SetHandler("Upper", witness.Upper); doc.SetHandler("Lower", witness.Lower);
+        doc.SetHandler("Grid", witness.Grid); doc.SetHandler("Added", witness.Added);
+        SceneElement lower = new SceneElement("button", "lower");
+        lower.At(30, 20).Size(80, 40).Order(4).On("Click", "Lower");
+        SceneElement upper = new SceneElement("button", "upper");
+        upper.At(30, 20).Size(80, 40).Order(4).On("Click", "Upper");
+        SceneElement grid = new SceneElement("skillslot", "grid");
+        grid.At(10, 90).Size(20, 20).Grid(1, 3, 4, 4).On("Click", "Grid");
+        doc.Add(lower); doc.Add(upper); doc.Add(grid);
+        SceneViewSession view = SceneView.Attach(app, doc);
+        Require(view != null, "attach creates retained scene");
+        // Retained storage starts in paint order: grid(z=0), lower(z=4), upper(z=4).
+        Control identity = view.ElementControlAt(2);
+        SceneRect bounds = doc.Resolve(upper, app.canvas.Width(), app.canvas.Height() - app.ContentTop());
+        int x = bounds.Xi() + bounds.Wi() / 2;
+        int y = app.ContentTop() + bounds.Yi() + bounds.Hi() / 2;
+        Click(app, x, y);
+        Require(witness.lastHandler == "Upper" && witness.calls == 1,
+            "same-z later document element wins before paint");
+        Require(view.ElementControlAt(2) == identity, "input preparation preserves element identity");
+        Send(app, 2, x, y);
+        Require(app.pointerDownTarget == identity && app.GetCapturedPointer() == identity,
+            "scene pointer down captures retained element");
+        Send(app, 1, 470, 350); Send(app, 3, 470, 350);
+        Require(app.GetCapturedPointer() == null && witness.lastHandler == "Upper" && witness.calls == 1,
+            "outside release cancels click");
+        upper.Order(1);
+        Click(app, x, y);
+        Require(witness.lastHandler == "Lower" && witness.calls == 2 && view.ElementControlAt(2) == identity,
+            "z mutation reorders input without replacing retained controls");
+        SceneRect slots = doc.Resolve(grid, app.canvas.Width(), app.canvas.Height() - app.ContentTop());
+        Click(app, slots.Xi() + slots.Wi() - 2, app.ContentTop() + slots.Yi() + 2);
+        Require(witness.lastHandler == "Grid" && witness.calls == 3, "grid total resolved extent receives input");
+        Send(app, 2, x, y);
+        lower.SetVisible(false);
+        Send(app, 1, x, y);
+        Require(app.GetCapturedPointer() == null, "hidden scene element retires capture before dispatch");
+        doc.elements.RemoveAt(doc.elements.IndexOf(lower));
+        SceneElement added = new SceneElement("button", "added");
+        added.At(30, 20).Size(80, 40).Order(9).On("Click", "Added"); doc.Add(added);
+        Click(app, x, y);
+        Require(witness.lastHandler == "Added" && witness.calls == 4 && view.ElementCount() == 3,
+            "document membership changes are reflected before input");
+        App second = App.CreateOffscreen("Retained scene destination", 640, 480);
+        view.Bind(second);
+        Require(app.rootControl == world, "cross-App bind restores old fallback");
+        second.SetOffscreenViewport(720, 520, 100);
+        SceneRect next = doc.Resolve(added, 720, 520 - second.ContentTop());
+        Click(second, next.Xi() + 4, second.ContentTop() + next.Yi() + 4);
+        Require(witness.lastHandler == "Added" && witness.calls == 5 && identity.App == second,
+            "cross-App scope uses current content bounds");
+        view.Retire(); view.Retire();
+        Require(second.rootControl == null && second.GetCapturedPointer() == null,
+            "retire is idempotent and releases scene input");
+        app.StopLoop(); second.StopLoop(); app.canvas.Destroy(); second.canvas.Destroy();
+        Console.WriteLine("SCENEVIEW_RETAINED_INPUT_OK");
+    }
+}

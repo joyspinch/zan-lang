@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+
+// Persistent HUD. World drawing does not paint or hit-test player UI.
+public class SnHud {
+    weak SnGame game;
+    HudLayer layer;
+    SnHudRoot root;
+    Label score;
+    Label tier;
+    Label kills;
+    Label feverText;
+    Label toast;
+    Progress fever;
+    SnMinimap minimap;
+    List<Label> popLabels;
+    int now;
+
+    SnHud(SnGame game, App app) {
+        this.game = game;
+        app.UseCss(SnHud.Css());
+        this.root = new SnHudRoot(this);
+        this.root.Class = "snake-hud";
+        this.score = this.AddLabel("snake-score");
+        this.tier = this.AddLabel("snake-tier");
+        this.kills = this.AddLabel("snake-kills");
+        this.feverText = this.AddLabel("snake-fever-text");
+        this.feverText.SetProp("text", "狂热 x2");
+        this.toast = this.AddLabel("snake-toast");
+        this.fever = new Progress(0, 1);
+        this.fever.Class = "snake-fever";
+        this.fever.ShowText(false);
+        this.root.Add(this.fever);
+        this.minimap = new SnMinimap(game);
+        this.minimap.Class = "snake-minimap";
+        this.root.Add(this.minimap);
+        this.popLabels = new List<Label>();
+        this.layer = new HudLayer();
+        this.layer.Add(this.root);
+        this.layer.SetVisible(false);
+    }
+
+    Label AddLabel(string cls) {
+        Label label = new Label("");
+        label.Class = cls;
+        this.root.Add(label);
+        return label;
+    }
+    void Enter(App app) {
+        if (this.game == null) { return; }
+        this.Sync(Window.GetTickMs());
+        this.layer.SetVisible(true);
+        this.layer.Bind(app);
+    }
+    void Exit() { this.layer.SetVisible(false); }
+    void Sync(int now) {
+        if (this.game == null) { return; }
+        this.now = now;
+        this.score.SetProp("text", "" + this.game.score.Get());
+        this.tier.SetProp("text", SnGame.TierName(this.game.titleTier) + " · 长度 " + this.game.me.length);
+        this.kills.SetProp("text", "击败 " + this.game.kills);
+        this.kills.SetShown(this.game.kills > 0);
+        this.minimap.Sync();
+        this.fever.SetPercent(this.game.fever);
+        this.feverText.SetShown(this.game.feverOn);
+        string hue = this.game.feverOn ? " snake-hue-" + ((now / 80) % 6) : "";
+        this.fever.SetProp("class", "snake-fever" + hue);
+        int age = now - this.game.toastAt;
+        this.toast.SetProp("text", this.game.toastText);
+        this.toast.SetShown(age < 1500);
+        // Expiry is a presentation update, never a side effect of painting.
+        for (int i = this.game.pops.Count - 1; i >= 0; i = i - 1) {
+            if (now - this.game.pops[i].bornAt > 950) { this.game.pops.RemoveAt(i); }
+        }
+        while (this.popLabels.Count < this.game.pops.Count) {
+            this.popLabels.Add(this.AddLabel("snake-popup"));
+        }
+        for (int i = 0; i < this.popLabels.Count; i = i + 1) {
+            Label label = this.popLabels[i];
+            bool shown = i < this.game.pops.Count;
+            label.SetShown(shown);
+            if (shown) { label.SetProp("text", this.game.pops[i].text); }
+        }
+    }
+    void Render(App app) { this.layer.Paint(app); }
+
+    void Layout(int width, int height) {
+        if (this.game == null) { return; }
+        double scale = Math.Min(width / 1280.0, height / 720.0);
+        this.Box(this.score, (int)(28*scale), (int)(18*scale), (int)(460*scale), (int)(68*scale), (int)(63*scale), "");
+        this.Box(this.tier, (int)(30*scale), (int)(84*scale), (int)(460*scale), (int)(28*scale), (int)(18*scale), "");
+        this.Box(this.kills, (int)(30*scale), (int)(114*scale), (int)(400*scale), (int)(28*scale), (int)(18*scale), "");
+        this.Box(this.fever, width/2-(int)(150*scale), height-(int)(30*scale), (int)(300*scale), (int)(12*scale), 0, "");
+        this.Box(this.feverText, width/2-(int)(150*scale), height-(int)(56*scale), (int)(300*scale), (int)(28*scale), (int)(18*scale), "");
+        this.Box(this.toast, 0, (int)(120*scale), width, (int)(48*scale), (int)(36*scale), ";color:rgba(255,235,140," + this.ToastAlpha() + ")");
+        this.Box(this.minimap, width-(int)(180*scale), height-(int)(110*scale), (int)(168*scale), (int)(98*scale), 0, "");
+        int camX = SnGame.WrapP(this.game.me.headX / 256, SnGame.WW());
+        int camY = SnGame.WrapP(this.game.me.headY / 256, SnGame.WH());
+        // The world's short-axis viewport scale and the HUD region share the
+        // same transform; long axes extend rather than stretching the stage.
+        double worldScale = Math.Min(width / (double)SnGame.VW(), height / (double)SnGame.VH());
+        for (int i = 0; i < this.game.pops.Count; i = i + 1) {
+            Popup p = this.game.pops[i];
+            int age = this.now - p.bornAt;
+            int sx = width/2 + (int)(SnGame.WrapD(p.x-camX, SnGame.WW())*worldScale);
+            int sy = height/2 + (int)((SnGame.WrapD(p.y-camY, SnGame.WH())-age/10)*worldScale);
+            int pw = (int)(400*scale);
+            double alpha = Math.Max(0, 255-age*255/950) / 255.0;
+            this.Box(this.popLabels[i], sx-pw/2, sy, pw, (int)(40*scale), (int)(27*scale),
+                ";color:rgba(" + p.cr + "," + p.cg + "," + p.cb + "," + alpha + ")");
+        }
+    }
+    double ToastAlpha() {
+        int age = this.now - this.game.toastAt;
+        return age > 1100 ? Math.Max(0, 255-(age-1100)*255/400) / 255.0 : 1;
+    }
+    void Box(Control control, int x, int y, int w, int h, int font, string extra) {
+        string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + w + "dpx;height:" + h + "dpx";
+        if (font > 0) { style = style + ";font-size:" + font + "dpx"; }
+        style = style + extra;
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+    }
+    static string Css() {
+        return ".snake-hud{position:relative;padding:0;border:0;background:transparent}"
+            + ".snake-hud label{position:absolute;padding:0;margin:0;border:0;background:transparent;vertical-align:top;text-align:left;text-shadow:1dpx 2dpx 0 rgba(0,0,0,0.6)}"
+            + ".snake-score{color:#ffe678}.snake-tier{color:#aadcff}.snake-kills{color:#ffaabe}"
+            + ".snake-hud label.snake-fever-text{color:#ffc8f0;text-align:center}.snake-hud label.snake-toast{color:#ffeb8c;text-align:center}.snake-hud label.snake-popup{text-align:center}"
+            + ".snake-fever{position:absolute;padding:0;margin:0;gap:0;border:0;border-radius:0;background:transparent}"
+            + ".snake-fever .progress-track{height:100%;background:rgba(30,34,60,0.78);border:0;border-radius:0;padding:0}"
+            + ".snake-fever .progress-fill{height:100%;background:#ff8cc8;border:0;border-radius:0}"
+            + ".snake-hue-0 .progress-fill{background:#ff6e8c}.snake-hue-1 .progress-fill{background:#ffcd5a}"
+            + ".snake-hue-2 .progress-fill{background:#78eb8c}.snake-hue-3 .progress-fill{background:#5aa0ff}"
+            + ".snake-hue-4 .progress-fill{background:#aa78ff}.snake-hue-5 .progress-fill{background:#ffeb78}"
+            + ".snake-minimap{color:#8cffd2;position:absolute;padding:0;border:1dpx solid rgba(120,130,190,0.47);border-radius:var(--radius-medium);background:rgba(12,16,34,0.75)}"
+            + ".snake-minimap-dot{position:absolute;padding:0;margin:0;border:0;border-radius:var(--radius-full)}.snake-minimap-player{z-index:1}";
+    }
+}
+

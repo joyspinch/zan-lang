@@ -1,0 +1,129 @@
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+
+namespace Gui;
+
+public class HudLayoutEvents {
+    public int shows;
+    public int hides;
+    public int resizes;
+    public void OnShown() { shows = shows + 1; }
+    public void OnHidden() { hides = hides + 1; }
+    public void OnResized() { resizes = resizes + 1; }
+    public void Bind(Control control) {
+        control.Show.Add(this.OnShown);
+        control.Hide.Add(this.OnHidden);
+        control.Resize.Add(this.OnResized);
+    }
+}
+
+public class HudLifetimeWatch {
+    public weak App first;
+    public weak App second;
+    public weak HudLayer hud;
+    public weak Control root;
+}
+
+// Keep registration identity as well as counts: a replacement scope must not hide
+// behind an unchanged number of participants during an otherwise read-only Paint.
+public class HudPaintSnapshot {
+    weak Control inputRoot;
+    int inputRootGeneration;
+    int bindingGeneration;
+    int loopGeneration;
+    int layoutRevision;
+    int preparationTicket;
+    int frame;
+    long sequence;
+    List<AppLoopRegistration> tickets;
+    List<int> generations;
+    List<bool> active;
+
+    public HudPaintSnapshot(App app, HudLayer hud) {
+        inputRoot = app.rootControl;
+        inputRootGeneration = app.inputRootGeneration;
+        bindingGeneration = hud.bindingGeneration;
+        loopGeneration = app.loopGeneration;
+        layoutRevision = app.hostLayoutRevision;
+        preparationTicket = app.inputPreparationTicket;
+        frame = app.frameSeq;
+        sequence = app.window.EventSeq();
+        tickets = new List<AppLoopRegistration>();
+        generations = new List<int>();
+        active = new List<bool>();
+        if (app.loopParticipants != null) {
+            for (int i = 0; i < app.loopParticipants.Count; i = i + 1) {
+                AppLoopRegistration ticket = app.loopParticipants[i];
+                tickets.Add(ticket); generations.Add(ticket.generation); active.Add(ticket.active);
+            }
+        }
+    }
+
+    public bool Current(App app, HudLayer hud) {
+        if (inputRoot != app.rootControl || inputRootGeneration != app.inputRootGeneration
+        || bindingGeneration != hud.bindingGeneration || loopGeneration != app.loopGeneration
+        || layoutRevision != app.hostLayoutRevision || preparationTicket != app.inputPreparationTicket
+        || frame != app.frameSeq || sequence != app.window.EventSeq()) { return false; }
+        int count = app.loopParticipants != null ? app.loopParticipants.Count : 0;
+        if (count != tickets.Count) { return false; }
+        for (int i = 0; i < tickets.Count; i = i + 1) {
+            AppLoopRegistration ticket = app.loopParticipants[i];
+            if (ticket != tickets[i] || ticket.generation != generations[i] || ticket.active != active[i]) { return false; }
+        }
+        return app.ContinuePreparedFrame();
+    }
+}
+
+// Mutation happens inside Measure, before UiViewScope may arrange the old root.
+public class HudPreparationProbe : Panel {
+    public weak HudLayer hud;
+    public weak App nextApp;
+    public Control replacement;
+    public int mode;
+    public int measures;
+    public int arrangements;
+    public int paints;
+    public weak App paintedApp;
+    public bool addOnPaint;
+    public bool reenterOnLoss;
+
+    public HudPreparationProbe() : base("hud-preparation-probe") { }
+
+    public override void OnMeasure(App app) {
+        measures = measures + 1;
+        int action = mode; mode = 0;
+        HudLayer layer = hud;
+        if (layer != null) {
+            if (action == 1) { layer.Remove(this); }
+            if (action == 2) { layer.Clear(); }
+            if (action == 3) { layer.SetVisible(false); }
+            if (action == 4 && nextApp != null) { layer.Bind(nextApp); }
+        }
+        base.OnMeasure(app);
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        arrangements = arrangements + 1;
+        base.Arrange(x, y, width, height);
+    }
+
+    public override void OnPaint(App app) {
+        paints = paints + 1;
+        paintedApp = app;
+        if (addOnPaint) {
+            addOnPaint = false;
+            HudLayer layer = hud;
+            if (layer != null && replacement != null) { layer.Add(replacement); }
+        }
+        base.OnPaint(app);
+    }
+
+    public override void OnInputFocusLost() {
+        if (!reenterOnLoss) { return; }
+        reenterOnLoss = false;
+        HudLayer layer = hud;
+        if (layer != null && replacement != null) { layer.Add(replacement); }
+    }
+}

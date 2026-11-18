@@ -1,0 +1,150 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Game.Foundation.Gui;
+using Game.Kit;
+
+namespace Survivor;
+
+// Persist the controls for the whole session, including the floating-text pool.
+public class SurvivorHud {
+    public Panel root;
+    public Label level;
+    public Progress experience;
+    public Label kills;
+    public Label time;
+    public List<Progress> enemyHealth;
+    public List<Label> floating;
+    public HudLayer layer;
+    SurvivorGame game;
+    Panel healthLayer;
+
+    public SurvivorHud(Gui.App app, SurvivorGame game) {
+        this.game = game;
+        app.UseCss(SurvivorHud.Css());
+        this.root = new Panel("survivor-hud");
+        this.root.Class = "survivor-hud";
+        this.enemyHealth = new List<Progress>();
+        this.healthLayer = new Panel("survivor-health-layer");
+        this.healthLayer.Class = "survivor-health-layer";
+        this.root.Add(this.healthLayer);
+        this.floating = new List<Label>();
+        for (int i = 0; i < game.floatingTexts.capacity; i = i + 1) {
+            Label number = new Label("");
+            number.Class = "survivor-floating";
+            number.SetShown(false);
+            this.root.Add(number);
+            this.floating.Add(number);
+        }
+        Panel bar = new Panel("survivor-status");
+        bar.Class = "survivor-status";
+        this.level = new Label("");
+        this.level.Class = "survivor-level";
+        bar.Add(this.level);
+        this.experience = new Progress(0, 1);
+        this.experience.Class = "survivor-experience";
+        this.experience.showIndicator = false;
+        bar.Add(this.experience);
+        this.kills = new Label("");
+        this.kills.Class = "survivor-kills";
+        bar.Add(this.kills);
+        this.time = new Label("");
+        this.time.Class = "survivor-time";
+        bar.Add(this.time);
+        this.root.Add(bar);
+        this.layer = new HudLayer();
+        this.layer.Add(this.root);
+        // This template's world still uses raw Canvas coordinates. Commit the
+        // same full-canvas rectangle before the first event, not first Paint.
+        this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
+        this.layer.Bind(app);
+        this.SyncState(app);
+    }
+
+    public void SyncState(Gui.App app) {
+        this.level.SetProp("text", "LV. " + Convert.ToString(game.level));
+        this.kills.SetProp("text", "KILLS: " + Convert.ToString(game.killCount));
+        int mins = (int)game.gameTime / 60;
+        int secs = (int)game.gameTime % 60;
+        this.time.SetProp("text", "TIME: " + (mins < 10 ? "0" : "")
+            + Convert.ToString(mins) + ":" + (secs < 10 ? "0" : "") + Convert.ToString(secs));
+        this.experience.SetPercent(game.expToNext > 0 ? game.exp * 100 / game.expToNext : 0);
+        this.SyncEnemyHealth();
+        this.SyncFloating();
+        this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
+        this.layer.SetVisible(app.window.GetHandle() == 0 || app.window.IsVisible());
+    }
+
+    void SyncEnemyHealth() {
+        // The game retains enemy slots; keep the corresponding controls too.
+        while (this.enemyHealth.Count < game.enemies.Count) {
+            Progress health = new Progress(100, 1);
+            health.Class = "survivor-enemy-health";
+            health.showIndicator = false;
+            this.healthLayer.Add(health);
+            this.enemyHealth.Add(health);
+        }
+        for (int i = 0; i < this.enemyHealth.Count; i = i + 1) {
+            Enemy enemy = game.enemies[i];
+            Progress health = this.enemyHealth[i];
+            health.SetShown(enemy.active && enemy.hp < enemy.maxHp);
+            if (!health.visible) { continue; }
+            health.SetPercent(enemy.maxHp > 0 ? enemy.hp * 100 / enemy.maxHp : 0);
+            health.SetProp("style", "left:" + Convert.ToString((int)enemy.x + (int)game.shake.OffsetX - 12)
+                + "dpx;top:" + Convert.ToString((int)enemy.y + (int)game.shake.OffsetY - 22) + "dpx");
+        }
+    }
+
+    void SyncFloating() {
+        for (int i = 0; i < this.floating.Count; i = i + 1) {
+            FloatingTextPool.FloatingItem item = game.floatingTexts.items[i];
+            Label number = this.floating[i];
+            number.SetShown(item.active);
+            if (!item.active) { continue; }
+            number.SetProp("text", item.text);
+            double progress = item.timer / item.lifetime;
+            double opacity = progress > 0.6 ? 1.0 - (progress - 0.6) / 0.4 : 1.0;
+            if (opacity < 0.0) { opacity = 0.0; }
+            int fs = (int)(16.0 * item.scale);
+            if (fs < 10) { fs = 10; }
+            number.Class = item.isCrit ? "survivor-floating survivor-critical"
+                : (item.text.StartsWith("+") ? "survivor-floating survivor-heal" : "survivor-floating");
+            number.SetProp("style", "left:" + Convert.ToString((int)item.x) + "dpx;top:"
+                + Convert.ToString((int)item.y) + "dpx;font-size:" + Convert.ToString(fs)
+                + "dpx;opacity:" + Convert.ToString(opacity));
+        }
+    }
+
+    public void Render(Gui.App app) {
+        this.layer.Paint(app);
+    }
+
+    public void Stop() {
+        this.layer.SetVisible(false);
+        this.layer.Clear();
+    }
+
+    public static string Css() {
+        return ".survivor-hud{position:relative;background:transparent;padding:0;border:0}"
+            + ".survivor-health-layer{position:absolute;left:0;top:0;width:100%;height:100%;background:transparent;padding:0;border:0}"
+            + ".survivor-status{position:absolute;left:0;top:0;width:1280dpx;height:50dpx;"
+            + "background:rgba(10,10,16,0.8);padding:0;border:0}"
+            + ".survivor-status label,.survivor-floating{position:absolute;padding:0;margin:0;"
+            + "border:0;background:transparent;vertical-align:top;text-align:left}"
+            + ".survivor-status label{top:14dpx;height:30dpx;font-size:20dpx}"
+            + ".survivor-level{left:30dpx;width:80dpx;color:#ffc53d}"
+            + ".survivor-kills{left:550dpx;width:200dpx;color:#ff4d4f}"
+            + ".survivor-time{left:750dpx;width:240dpx;color:#fff}"
+            + "progress.survivor-experience,progress.survivor-enemy-health{position:absolute;"
+            + "padding:0;margin:0;border:0;border-radius:0;background:transparent;gap:0}"
+            + "progress.survivor-experience{left:110dpx;top:18dpx;width:400dpx;height:14dpx}"
+            + "progress.survivor-enemy-health{width:24dpx;height:3dpx}"
+            + ".survivor-experience .progress-track{height:14dpx;background:#333344;border-radius:0}"
+            + ".survivor-experience .progress-fill{height:100%;background:#00e5ff;border-radius:0}"
+            + ".survivor-enemy-health .progress-track{height:3dpx;background:#555;border-radius:0}"
+            + ".survivor-enemy-health .progress-fill{height:100%;background:#ff4d4f;border-radius:0}"
+            + ".survivor-floating{width:240dpx;height:48dpx;font-size:16dpx;color:#fff}"
+            + ".survivor-critical{color:#ffd700}.survivor-heal{color:#00ff7f}";
+    }
+}

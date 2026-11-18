@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace Game.Scene;
+
+public partial class SceneDesigner {
+    weak App resourceApp;
+    weak App contextApp;
+    weak App layerApp;
+    int resourceGeneration;
+
+    public bool PopupActionCurrent(ContextMenu popup, bool layer) {
+        if (popup == null || popup.IsOpen() || popup.SelectedAction() < 0
+            || !(layer ? layerPopup == popup : contextPopup == popup)) { return false; }
+        if (layer) { layerPopup = null; layerApp = null; layerMenuOpen = false; }
+        else { contextPopup = null; contextApp = null; ctxOpen = false; }
+        return true;
+    }
+    public bool ResourceActionCurrent(int generation) {
+        return generation == resourceGeneration && resPick != 0 && resourceApp == viewApp;
+    }
+    void WireResourceAction() {
+        if (resList == null) { return; }
+        resList.Select.Clear();
+        SceneDesignerAction action = new SceneDesignerAction(this, "resource");
+        action.popupGeneration = resourceGeneration;
+        resList.OnSelect(action.Run);
+    }
+
+    void HidePopup(App app, Control popup) {
+        if (app != null && popup != null && app.overlayHost.ActiveRoot() == popup) { app.overlayHost.Hide(popup); }
+    }
+    void CloseDesignerPopups() {
+        ContextMenu oldContext = contextPopup; ContextMenu oldLayer = layerPopup;
+        SceneDesignerResourcePopup oldResource = resourcePopup;
+        App ca = contextApp; App la = layerApp; App ra = resourceApp;
+        contextPopup = null; layerPopup = null;
+        contextApp = null; layerApp = null; resourceApp = null;
+        ctxOpen = false; layerMenuOpen = false; resPick = 0;
+        resourceGeneration = resourceGeneration + 1;
+        int session = boundsGeneration;
+        int resourceSession = resourceGeneration;
+        this.HidePopup(ca, oldContext);
+        if (boundsGeneration != session || resourceGeneration != resourceSession) { return; }
+        this.HidePopup(la, oldLayer);
+        if (boundsGeneration != session || resourceGeneration != resourceSession) { return; }
+        this.HidePopup(ra, oldResource);
+    }
+
+    public void OpenContextMenu(App app, int x, int y) {
+        if (sel == null || viewApp != app) { return; }
+        ContextMenu popup = new ContextMenu();
+        this.ContextItem(popup, SceneDesigner.T("Duplicate", "复制"));
+        this.ContextItem(popup, SceneDesigner.T("Delete", "删除"));
+        popup.AddSeparator();
+        this.ContextItem(popup, SceneDesigner.T("Bring Forward", "上移一层"));
+        this.ContextItem(popup, SceneDesigner.T("Send Backward", "下移一层"));
+        this.ContextItem(popup, SceneDesigner.T("Bring to Front", "置顶"));
+        this.ContextItem(popup, SceneDesigner.T("Send to Back", "置底"));
+        popup.AddSeparator();
+        if (sel.Layer() != editLayer) {
+            this.ContextItem(popup, SceneDesigner.T("Move to ", "移至 ")
+                + (editLayer == "" ? SceneDesigner.T("Base layer", "基础层") : editLayer));
+        } else if (sel.Layer() != "") { this.ContextItem(popup, SceneDesigner.T("Move to Base layer", "移至基础层")); }
+        this.ContextItem(popup, SceneDesigner.T("Snap to Grid", "对齐到网格"));
+        if (selExtra.Count >= 2) {
+            this.ContextItem(popup, SceneDesigner.T("Distribute Horizontally", "水平均分间距"));
+            this.ContextItem(popup, SceneDesigner.T("Distribute Vertically", "垂直均分间距"));
+        }
+        this.ContextItem(popup, SceneDesigner.T("Center on Canvas (H)", "水平居中到画布"));
+        this.ContextItem(popup, SceneDesigner.T("Center on Canvas (V)", "垂直居中到画布"));
+        this.ContextItem(popup, sel.Locked() ? SceneDesigner.T("Unlock", "解锁") : SceneDesigner.T("Lock", "锁定"));
+        contextPopup = popup; contextApp = app; ctxOpen = true; ctxX = x; ctxY = y;
+        popup.ShowAt(app, x, y);
+    }
+    void ContextItem(ContextMenu popup, string label) {
+        SceneDesignerAction action = new SceneDesignerAction(this, "context");
+        action.index = popup.items.Count; action.value = label; action.menu = popup;
+        popup.AddItem(label, action.Run);
+    }
+    public void OpenLayerMenu(App app) {
+        if (app == null || viewApp != app) { return; }
+        if (layerPopup != null && layerPopup.IsOpen()) { this.HidePopup(layerApp, layerPopup); layerMenuOpen = false; return; }
+        ContextMenu popup = new ContextMenu();
+        this.LayerItem(popup, SceneDesigner.T("Base layer", "基础层"), "", false);
+        List<string> layers = this.DocLayers();
+        for (int i = 0; i < layers.Count; i = i + 1) { this.LayerItem(popup, layers[i], layers[i], false); }
+        popup.AddSeparator();
+        this.LayerItem(popup, "+ " + SceneDesigner.T("New Layer", "新建图层"), "", true);
+        layerPopup = popup; layerApp = app; layerMenuOpen = true;
+        popup.ShowAt(app, surface.bx + app.Scale(12), surface.by + app.Scale(8) + this.BarH(app));
+    }
+    void LayerItem(ContextMenu popup, string label, string layer, bool create) {
+        SceneDesignerAction action = new SceneDesignerAction(this, "layer");
+        action.value = layer; action.index = create ? 1 : 0; action.menu = popup;
+        popup.AddItem(label, action.Run);
+    }
+    public void ChooseLayer(string layer, bool create) {
+        this.CancelCanvasGesture();
+        if (create) {
+            int number = this.DocLayers().Count + 1;
+            layer = "layer" + SceneDoc.IntStr(number);
+            while (this.DocHasLayer(layer)) { number = number + 1; layer = "layer" + SceneDoc.IntStr(number); }
+        }
+        editLayer = layer; this.Select(null); layerMenuOpen = false;
+        msg = layer == "" ? SceneDesigner.T("editing base layer", "正在编辑基础层")
+            : SceneDesigner.T("editing layer ", "正在编辑层 ") + layer;
+    }
+
+    // The project watcher explicitly invalidates unchanged-directory source edits.
+    // Opening/painting never re-enumerates a source whose directory/revision is unchanged.
+    public void InvalidateResourceSource() { resourceSourceDirty = true; }
+    public void SetResourceSource(List<string> files) {
+        List<string> snapshot = new List<string>();
+        if (files != null) { for (int i = 0; i < files.Count; i = i + 1) { snapshot.Add(files[i]); } }
+        resourceSource = snapshot; resourceDirectory = SceneDesigner.assetsDir;
+        resourceSourceDirty = false;
+        this.BindResourceSource();
+    }
+    void RefreshResourceSource() {
+        if (!resourceSourceDirty && resourceDirectory == SceneDesigner.assetsDir && resourceSource != null) { return; }
+        resourceSource = DirectoryTree.Names(SceneDesigner.assetsDir, PathFilter.Only(".png .jpg .jpeg .bmp .gif .webp"));
+        resourceDirectory = SceneDesigner.assetsDir; resourceSourceDirty = false;
+        this.BindResourceSource();
+    }
+    void BindResourceSource() {
+        if (resList == null || resourceSource == null) { return; }
+        List<string> picks = new List<string>(); picks.Add(SceneDesigner.T("(none)", "（无）"));
+        for (int i = 0; i < resourceSource.Count; i = i + 1) { picks.Add(resourceSource[i]); }
+        resList.Bind(picks);
+    }
+    public void OpenResourcePicker(int target) {
+        App app = viewApp;
+        if (app == null || target < 1 || target > 2) { return; }
+        if (resList == null) {
+            resList = new ListView<string>(new ListColumn<string>("", s => s));
+            resList.Class = "flat";
+            resList.EmptyText(SceneDesigner.T("no image resources; add files via Project Config", "暂无图片资源，可在项目配置中添加"));
+            SceneDesignerAction action = new SceneDesignerAction(this, "resource");
+            resList.OnSelect(action.Run);
+            resourcePopup = new SceneDesignerResourcePopup(this, resList);
+            this.BindResourceSource();
+        }
+        this.RefreshResourceSource();
+        resList.ClearSelection(); resPick = target;
+        resourceGeneration = resourceGeneration + 1;
+        this.WireResourceAction();
+        resourcePopup.title.Text = target == 1 ? SceneDesigner.T("Pick a resource (assets/)", "选择资源（assets/）")
+            : SceneDesigner.T("Pick a background (assets/)", "选择背景（assets/）");
+        resourceApp = app;
+        resourcePopup.MeasureTree(app);
+        if (resourceApp != app || viewApp != app || !viewVisible) { return; }
+        int width = app.Scale(300); int height = app.Scale(320);
+        Rect area = designerBounds;
+        int x = area != null ? area.x + (area.width - width) / 2 : (app.canvas.Width() - width) / 2;
+        int y = area != null ? area.y + (area.height - height) / 2 : (app.canvas.Height() - height) / 2;
+        app.overlayHost.ShowAt(app, resourcePopup, x, y);
+    }
+    public void ResourcePopupDismissed(SceneDesignerResourcePopup popup) {
+        if (resourcePopup == popup) {
+            resourceGeneration = resourceGeneration + 1;
+            resPick = 0; resourceApp = null;
+        }
+    }
+    void CloseResourcePicker() {
+        App app = resourceApp; resourceApp = null; resPick = 0;
+        this.HidePopup(app, resourcePopup);
+    }
+}

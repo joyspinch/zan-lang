@@ -17,7 +17,14 @@
 
 ## 运行与编译
 
-```bash
-zanc src/FpsGame.zan src/main.zan --auto-stdlib --package-project <zan-lang-root> -o fps3d.exe
-./fps3d.exe
+在当前主仓根目录运行以下 PowerShell 命令，直接编译模板原始源码，不复制模板树：
+
+```powershell
+Set-Location D:/project/zan-lang
+& ./scripts/build_gate.ps1 -Name build -Script {
+    build/zanc.exe templates/game/fps-3d/src/main.zan templates/game/fps-3d/src --auto-stdlib --package-project . --publish --subsystem windows -o build/fps3d.exe
+}
+build/fps3d.exe
 ```
+
+`main.zan` 必须排在首位，随后 `src` 目录递归纳入 `FpsGame.zan`、`FpsHud.zan`、`FpsCrosshair.zan` 等全部源码，已列入口不会重复纳入。`--package-project .` 使用当前主仓的 `packages/`；当前模板没有需要额外内嵌的素材目录。生成的原生驱动文件应与程序保持在同一目录。

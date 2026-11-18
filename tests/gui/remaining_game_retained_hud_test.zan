@@ -1,0 +1,138 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Survivor;
+using Fps3D;
+
+// Compile with the production SurvivorGame/SurvivorHud and FpsGame/FpsHud/
+// FpsCrosshair sources. Exclude each application's Main source.
+public class RemainingHudWitness {
+    public weak Gui.App app;
+    public weak Control root;
+    public weak SurvivorHud survivor;
+    public weak FpsHud fps;
+}
+
+public class RemainingGameRetainedHudTest {
+    static void Require(bool ok, string reason) {
+        if (!ok) { throw new Exception(reason); }
+    }
+
+    static void PrepareInput(Gui.App app) {
+        app.ProcessOffscreenInput(1, 1100, 650, 0, 0, 0, 0);
+    }
+
+    static bool Contains(Gui.App app, Control control) {
+        Control root = app.rootControl;
+        return root != null && root.ContainsInputControl(control);
+    }
+
+    static void SurvivorCase(RemainingHudWitness witness) {
+        Gui.App app = Gui.App.CreateOffscreen("survivor production HUD", 1280, 720);
+        SurvivorGame game = SurvivorGame.Create();
+        SurvivorHud hud = new SurvivorHud(app, game);
+        witness.app = app; witness.root = hud.root; witness.survivor = hud;
+        PrepareInput(app);
+        Require(Contains(app, hud.root), "survivor bound before Paint");
+        Require(hud.level.bx == 30 && hud.level.by == 14
+            && hud.experience.bx == 110 && hud.experience.by == 18
+            && hud.experience.bw == 400 && hud.experience.bh == 14,
+            "survivor authored geometry before Paint");
+        Require(hud.level.GetText() == "LV. 1" && hud.kills.GetText() == "KILLS: 0"
+            && hud.time.GetText() == "TIME: 00:00", "survivor startup state");
+        game.level = 3; game.killCount = 21; game.gameTime = 125.0;
+        game.exp = 25; game.expToNext = 50;
+        Enemy enemy = new Enemy(200.0, 300.0, 100, 70.0, -1);
+        enemy.hp = 40;
+        game.enemies.Add(enemy);
+        game.floatingTexts.SpawnDamage(210.0, 280.0, 50, true);
+        hud.SyncState(app);
+        PrepareInput(app);
+        Require(hud.level.GetText() == "LV. 3" && hud.kills.GetText() == "KILLS: 21"
+            && hud.time.GetText() == "TIME: 02:05" && hud.experience.Percent() == 50,
+            "survivor update state");
+        Require(hud.enemyHealth.Count == 1 && hud.enemyHealth[0].visible
+            && hud.enemyHealth[0].Percent() == 40 && hud.enemyHealth[0].bx == 188
+            && hud.enemyHealth[0].by == 278, "enemy retained health follows world anchor");
+        Require(hud.floating.Count == 64 && hud.floating[0].visible
+            && hud.floating[0].GetText() == "!50" && hud.floating[0].bx == 210
+            && hud.floating[0].by == 280, "retained pooled damage labels");
+        Control root = hud.root;
+        Progress health = hud.enemyHealth[0];
+        Label number = hud.floating[0];
+        int count = root.ChildCount();
+        double timer = game.floatingTexts.items[0].timer;
+        app.BeginOffscreenFrame();
+        hud.Render(app); hud.Render(app);
+        app.EndOffscreenFrame();
+        Require(hud.root == root && hud.enemyHealth[0] == health && hud.floating[0] == number
+            && root.ChildCount() == count && game.floatingTexts.items[0].timer == timer,
+            "survivor repeated Paint is read-only and tree stable");
+        enemy.active = false;
+        game.floatingTexts.items[0].active = false;
+        hud.SyncState(app);
+        Require(!health.visible && !number.visible, "retired world feedback is hidden");
+        app.CapturePointer(hud.time);
+        hud.layer.SetVisible(false);
+        Require(app.GetCapturedPointer() == null && !Contains(app, root),
+            "survivor hiding retires layer capture and input membership");
+        hud.layer.SetVisible(true); PrepareInput(app);
+        Require(hud.root == root && Contains(app, root), "survivor show reuses tree");
+        hud.Stop(); hud.Stop();
+        Require(hud.layer.Count() == 0 && !hud.layer.IsVisible()
+            && !Contains(app, root), "survivor Stop is idempotent");
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+
+    static void FpsCase(RemainingHudWitness witness) {
+        Gui.App app = Gui.App.CreateOffscreen("FPS production HUD", 1280, 720);
+        FpsGame game = FpsGame.Create();
+        FpsHud hud = new FpsHud(app, game);
+        witness.app = app; witness.root = hud.root; witness.fps = hud;
+        PrepareInput(app);
+        Require(Contains(app, hud.root)
+            && hud.position.bx == 20 && hud.position.by == 38
+            && hud.crosshair.bx == 632 && hud.crosshair.by == 352
+            && hud.crosshair.bw == 17 && hud.crosshair.bh == 17,
+            "FPS status and crosshair prepared before Paint");
+        Require(hud.backend.GetText() == "BACKEND: CPU (3D Wireframe Fallback)"
+            && hud.aim.GetText().StartsWith("AIM: NO TARGET"), "FPS fallback state");
+        game.drawResult = 1; game.freeLookMode = true;
+        game.targetHit = true; game.hitDistance = 7.0f;
+        hud.SyncState(app); PrepareInput(app);
+        Require(hud.backend.GetText() == "BACKEND: GPU (OpenGL 3.3)"
+            && hud.viewMode.GetText().StartsWith("VIEW: [FREE LOOK MODE]")
+            && hud.aim.GetText() == "LOCKED ON CUBE (DIST: 7m)"
+            && hud.crosshair.Box(app).FgOr(0) == unchecked((int)0xff00ff00),
+            "FPS target and view state use game skin");
+        Control root = hud.root;
+        Control crosshair = hud.crosshair;
+        app.BeginOffscreenFrame(); hud.Render(app); hud.Render(app); app.EndOffscreenFrame();
+        Require(hud.root == root && hud.crosshair == crosshair && game.targetHit
+            && game.freeLookMode && game.hitDistance == 7.0f, "FPS Paint preserves state and identity");
+        app.CapturePointer(hud.crosshair);
+        hud.layer.SetVisible(false);
+        Require(app.GetCapturedPointer() == null && !Contains(app, root),
+        "FPS hiding retires layer capture and input membership");
+        hud.layer.SetVisible(true); PrepareInput(app);
+        Require(hud.root == root && hud.crosshair == crosshair && Contains(app, root),
+        "FPS show reuses retained tree");
+        app.CapturePointer(hud.crosshair);
+        hud.Stop(); hud.Stop();
+        Require(app.GetCapturedPointer() == null && hud.layer.Count() == 0
+            && !Contains(app, root), "FPS Stop retires input");
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+
+    public static void Main() {
+        Gui.App frame = Gui.App.CreateOffscreen("frame fixture", 1, 1);
+        RemainingHudWitness witness = new RemainingHudWitness();
+        SurvivorCase(witness);
+        Require(witness.app == null && witness.root == null && witness.survivor == null,
+            "survivor graph releases");
+        FpsCase(witness);
+        Require(witness.app == null && witness.root == null && witness.fps == null, "FPS graph releases");
+        frame.canvas.Destroy();
+        Console.WriteLine("REMAINING_GAME_RETAINED_HUD_OK");
+    }
+}

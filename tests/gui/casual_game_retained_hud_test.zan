@@ -1,0 +1,295 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Kit;
+using Game.Foundation.Gui;
+using PinCircle;
+
+// Compile with the production snake/pin-circle sources, excluding both mains.
+// Only resource locations change: the scenes, HUDs, input and clocks are real.
+class CasualSnakeMenuScene : SnMenuScene {
+    public CasualSnakeMenuScene(SnGame game) : base(game) { }
+    public override string HtmlFile() { return "templates/game/snake/assets/scenes/menu.html"; }
+}
+
+class CasualSnakeOverScene : SnOverScene {
+    public CasualSnakeOverScene(SnGame game) : base(game) { }
+    public override string HtmlFile() { return "templates/game/snake/assets/scenes/over.html"; }
+}
+
+class CasualHudWitness {
+    public weak App app;
+    public weak SceneRouter router;
+    public weak SnGame snake;
+    public weak SnHud snakeHud;
+    public weak PinView pin;
+    public weak PinHud pinHud;
+    public weak Control root;
+}
+
+class CasualGameRetainedHudTest {
+    static void Require(bool ok, string reason) {
+        if (!ok) { throw new Exception(reason); }
+    }
+
+    static bool Contains(App app, Control control) {
+        Control root = app.rootControl;
+        return root != null && root.ContainsInputControl(control);
+    }
+
+    static void Send(SceneRouter router, int kind, int x, int y, int key) {
+        GuiHost host = router.Host();
+        host.App().ProcessOffscreenInput(kind, x, y, 0, key, 0, 0);
+        host.DispatchKeyEvent(router);
+    }
+
+    static void Key(SceneRouter router, int key) {
+        Send(router, 4, 0, 0, key);
+        Send(router, 5, 0, 0, key);
+        router.Host().App().DrainPosts();
+    }
+
+    static void Click(SceneRouter router, Control control) {
+        Require(control.bw > 0 && control.bh > 0, "production button prepared before first paint");
+        int x = control.bx + control.bw / 2;
+        int y = control.by + control.bh / 2;
+        Send(router, 2, x, y, 0);
+        Send(router, 3, x, y, 0);
+        router.Host().App().DrainPosts();
+    }
+
+    static void SnakeCase(CasualHudWitness witness) {
+        GuiHost host = new GuiHost("snake production HUD", 1280, 720, 16);
+        host.app = App.CreateOffscreen("snake production HUD", 1280, 720);
+        App app = host.app;
+        CDraw.StageViewport(app.canvas, app.ContentTop(), 1280, 720, 0);
+        SceneRouter router = new SceneRouter(host);
+        SnGame game = SnGame.Create(host);
+        SnPlayScene play = new SnPlayScene(game);
+        router.Register("menu", new CasualSnakeMenuScene(game));
+        router.Register("play", play);
+        router.Register("over", new CasualSnakeOverScene(game));
+        router.Go("play"); router.ApplyPending();
+        SnHud hud = game.hud;
+        Require(game.toastText != null && game.toastText == "" && hud.toast.name != null
+            && hud.toast.GetText() == "", "snake first HUD bind receives initialized empty toast");
+        witness.app = app; witness.router = router; witness.snake = game;
+        witness.snakeHud = hud; witness.root = hud.root;
+        Control root = hud.root;
+        Require(Contains(app, root) && hud.score.bw > 0 && hud.score.by >= app.ContentTop(),
+            "snake enters with actual HUD geometry before paint");
+        Require(hud.score is Label && hud.tier is Label && hud.fever is Progress
+            && hud.score.GetText() == "0", "snake uses retained standard state controls");
+        Require(hud.minimap is Panel && hud.minimap.markers.Count == game.foes.Count
+            && hud.minimap.player.bw > 0, "snake radar retains standard Panel markers");
+        Send(router, 2, hud.score.bx + 8, hud.score.by + 8, 0);
+        Require(game.boostHeld, "snake display HUD does not swallow mouse boost");
+        Send(router, 3, hud.score.bx + 8, hud.score.by + 8, 0);
+        Require(!game.boostHeld, "snake mouse boost release");
+        Send(router, 4, 0, 0, 32);
+        Require(game.boostKey, "snake keyboard boost down");
+        Send(router, 5, 0, 0, 32);
+        Require(!game.boostKey, "snake keyboard boost up");
+        game.score.Set(123); game.kills = 2; game.fever = 75;
+        game.Toast("retained toast", 1000);
+        game.AddPop(game.me.headX / 256, game.me.headY / 256, "+12", 1000, 255, 200, 90);
+        hud.Sync(1000);
+        Send(router, 1, 1100, 650, 0);
+        Label popup = hud.popLabels[0];
+        Require(hud.score.GetText() == "123" && hud.kills.GetText() == "击败 2"
+            && hud.fever.Percent() == 75 && hud.toast.GetText() == "retained toast"
+            && popup.GetText() == "+12" && popup.visible, "snake model projects to retained controls");
+        int count = root.ChildCount();
+        int radarCount = hud.minimap.ChildCount();
+        Panel playerMarker = hud.minimap.player;
+        int headX = game.me.headX;
+        app.BeginOffscreenFrame(); hud.Render(app); hud.Render(app); app.EndOffscreenFrame();
+        Require(hud.root == root && root.ChildCount() == count && hud.popLabels[0] == popup
+            && hud.minimap.ChildCount() == radarCount && hud.minimap.player == playerMarker
+            && game.pops.Count == 1 && game.me.headX == headX,
+            "snake repeated HUD paint preserves tree and simulation");
+        hud.Sync(1951);
+        Require(game.pops.Count == 0 && !popup.visible, "snake popup retires during synchronization");
+        game.AddPop(game.me.headX / 256, game.me.headY / 256, "+5", 2000, 90, 220, 255);
+        hud.Sync(2000);
+        Require(hud.popLabels[0] == popup && popup.visible && root.ChildCount() == count,
+            "snake popup slot is retained and reused");
+        app.CapturePointer(hud.score);
+        game.ExitHud(); game.ExitHud();
+        Require(app.GetCapturedPointer() == null && !Contains(app, root), "snake hide retires capture and input root");
+        game.EnterHud(app);
+        Require(hud.root == root && Contains(app, root), "snake reentry preserves HUD identity");
+        Key(router, 27); router.ApplyPending();
+        Require(router.CurrentName() == "menu" && !Contains(app, root), "snake Esc exits play and hides HUD");
+        Key(router, 13); router.ApplyPending();
+        Require(router.Current() == play && game.hud == hud && hud.root == root,
+            "snake Enter restarts through original menu scene");
+        Require(game.toastText != null && game.toastText == "" && hud.toast.GetText() == "",
+            "snake restart clears previous round toast before retained HUD synchronization");
+        game.over = true;
+        play.FixedStep(16); router.ApplyPending();
+        Require(router.CurrentName() == "over" && Contains(app, root), "snake result scene reuses HUD");
+        Key(router, 32); router.ApplyPending();
+        Require(router.Current() == play && !game.over && game.hud == hud, "snake result Space retries");
+        router.Stop(host); router.Stop(host);
+        Require(!hud.layer.IsVisible() && !Contains(app, root), "snake Stop retires production HUD");
+        // The retained tree may outlive its game without owning it back.
+        SnGame shortLived = SnGame.Create(host);
+        shortLived.StartGame(0);
+        SnHud borrowedHud = new SnHud(shortLived, app);
+        witness.snake = shortLived;
+        shortLived = null;
+        Require(witness.snake == null, "snake HUD borrows game without ARC cycle");
+        borrowedHud.Sync(0);
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+
+    static void PinCase(CasualHudWitness witness) {
+        GuiHost host = new GuiHost("pin production HUD", 600, 900, 16);
+        host.app = App.CreateOffscreen("pin production HUD", 600, 900);
+        App app = host.app;
+        CDraw.StageViewport(app.canvas, app.ContentTop(), 600, 900, 0);
+        PinWorld game = new PinWorld();
+        PinView view = new PinView();
+        SceneRouter router = new SceneRouter(host);
+        PinMenuScene menu = new PinMenuScene(game, view);
+        PinPlayScene play = new PinPlayScene(game, view);
+        PinOverScene over = new PinOverScene(game, view);
+        router.Register("menu", menu); router.Register("play", play); router.Register("over", over);
+        router.Go("menu"); router.ApplyPending();
+        PinHud hud = view.hud;
+        witness.app = app; witness.router = router; witness.pin = view;
+        witness.pinHud = hud; witness.root = hud.root;
+        Control root = hud.root;
+        Button start = hud.start;
+        Require(Contains(app, root) && hud.menu.visible && !hud.play.visible
+            && start.bw > 0 && start.bh > 0 && start.Click.Count() == 1,
+            "pin menu prepared and wired once before paint");
+        Click(router, start);
+        Require(router.pendingName == "play" && !game.flying, "pin menu click starts without world shot");
+        router.ApplyPending();
+        Require(router.Current() == play && hud.root == root && !hud.menu.visible && hud.play.visible,
+            "pin play reuses production tree");
+        app.CapturePointer(hud.home);
+        Key(router, 80);
+        Require(game.paused && hud.modal.visible && !hud.home.visible && !hud.pause.visible
+            && app.GetCapturedPointer() == null, "pin keyboard pause retires hidden toolbar capture immediately");
+        int elapsed = game.elapsedMs;
+        play.FixedStep(120);
+        Require(game.elapsedMs == elapsed, "pin pause preserves world clock");
+        Send(router, 2, 20, 500, 0); Send(router, 3, 20, 500, 0);
+        Require(!game.flying && game.paused, "pin paused world pointer is blocked");
+        app.CapturePointer(hud.confirm);
+        Key(router, 80);
+        Require(!game.paused && !hud.modal.visible && app.GetCapturedPointer() == null,
+            "pin unpause retires hidden modal capture");
+        app.SetOffscreenViewport(900, 1350, 100);
+        int resizedWidth = hud.layer.BoundsWidth(app);
+        int resizedHeight = hud.layer.BoundsHeight(app);
+        double resizedScale = Math.Min(resizedWidth / 600.0, resizedHeight / 900.0);
+        int pauseWidth = (int)(48 * resizedScale);
+        int pauseX = resizedWidth - (int)(68 * resizedScale) + pauseWidth / 2;
+        int pauseY = hud.layer.BoundsY(app) + (int)(24 * resizedScale) + pauseWidth / 2;
+        // Send directly to the new region: no Update, Paint or warm-up input.
+        Send(router, 2, pauseX, pauseY, 0);
+        Require(hud.pause.bw == pauseWidth && hud.pause.bx + pauseWidth / 2 == pauseX
+        && hud.pause.by + pauseWidth / 2 == pauseY
+        && hud.pause.ContainsInputControl(app.pointerDownTarget),
+        "pin resized region is configured before its first input");
+        Send(router, 3, pauseX, pauseY, 0); app.DrainPosts();
+        Require(game.paused && !game.flying && play.pauseTime == 0, "pin standard pause button toggles without firing");
+        int confirmX = resizedWidth / 2;
+        int confirmY = hud.layer.BoundsY(app) + resizedHeight / 2 - (int)(12 * resizedScale)
+        + (int)(36 * resizedScale) + (int)(88 * resizedScale) / 2;
+        // The hidden modal still held its old bounds; request the current region directly.
+        Send(router, 2, confirmX, confirmY, 0);
+        Require(hud.confirm.ContainsInputControl(app.pointerDownTarget),
+        "pin newly visible resized modal prepares before its first input");
+        Send(router, 3, confirmX, confirmY, 0); app.DrainPosts();
+        Require(!game.paused && !game.flying, "pin standard confirm resumes");
+        Send(router, 4, 0, 0, 32);
+        Require(game.flying && view.spaceHeld, "pin Space fires");
+        game.flying = false;
+        Send(router, 4, 0, 0, 32);
+        Require(!game.flying, "pin held Space does not repeat fire");
+        Send(router, 5, 0, 0, 32);
+        Require(!view.spaceHeld, "pin Space release clears latch");
+        Key(router, 82);
+        Require(!game.flying && game.elapsedMs == 0 && play.resultWait == 0, "pin R restarts original round");
+        Send(router, 2, 20, 500, 0); Send(router, 3, 20, 500, 0);
+        Require(game.flying, "pin unconsumed world pointer fires through retained root");
+        Key(router, 82);
+        int children = root.ChildCount();
+        int handlers = hud.pause.Click.Count();
+        double rotation = game.rotation;
+        app.BeginOffscreenFrame(); hud.Render(app); hud.Render(app); app.EndOffscreenFrame();
+        Require(hud.root == root && root.ChildCount() == children && hud.pause.Click.Count() == handlers
+            && game.rotation == rotation && game.elapsedMs == 0, "pin repeated HUD paint preserves state and subscriptions");
+        hud.pause.TriggerEvent("Click");
+        app.CapturePointer(hud.pause);
+        view.ExitHud(); view.ExitHud();
+        app.DrainPosts();
+        Require(!game.paused && app.GetCapturedPointer() == null && !Contains(app, root)
+            && hud.pause.Click.Count() == 0, "pin exit retires queued click capture and owned subscription");
+        router.Go("play"); router.ApplyPending();
+        Require(hud.root == root && hud.pause.Click.Count() == 1 && Contains(app, root),
+            "pin reentry registers one current action");
+        game.state = RoundState.Failed;
+        play.FixedStep(399);
+        Require(router.pendingName == "" && router.Current() == play, "pin result remains in play before 400ms");
+        play.FixedStep(1);
+        Require(router.pendingName == "over", "pin result transitions at 400ms");
+        router.ApplyPending();
+        Require(router.Current() == over && hud.confirm.Disabled.Get(), "pin result starts with 240ms confirmation gate");
+        Key(router, 13);
+        Require(router.pendingName == "", "pin Enter respects initial confirmation gate");
+        over.FixedStep(239);
+        Click(router, hud.confirm);
+        Require(router.pendingName == "" && hud.confirm.Disabled.Get(), "pin click respects 239ms confirmation gate");
+        over.FixedStep(1);
+        // No Update or Render between expiry and this real input.
+        Click(router, hud.confirm);
+        Require(router.pendingName == "play" && !hud.confirm.Disabled.Get() && game.level == 1,
+            "pin input preparation opens confirmation exactly at 240ms");
+        router.ApplyPending();
+        game.state = RoundState.Cleared;
+        play.FixedStep(400); router.ApplyPending();
+        over.FixedStep(240);
+        Send(router, 4, 0, 0, 32);
+        app.DrainPosts();
+        Require(router.pendingName == "play" && game.level == 2 && view.spaceHeld,
+            "pin result Space advances a cleared round");
+        router.ApplyPending();
+        Send(router, 4, 0, 0, 32);
+        Require(!game.flying, "pin scene transition retains held Space latch");
+        Send(router, 5, 0, 0, 32);
+        Key(router, 27); router.ApplyPending();
+        Require(router.Current() == menu && hud.menu.visible, "pin Esc returns to original menu");
+        Key(router, 13); router.ApplyPending();
+        Require(router.Current() == play && game.level == 1, "pin menu Enter starts first round");
+        Click(router, hud.home); router.ApplyPending();
+        Require(router.Current() == menu && !game.flying, "pin standard home button returns without shooting");
+        Send(router, 4, 0, 0, 32); app.DrainPosts(); router.ApplyPending();
+        Require(router.Current() == play && view.spaceHeld && !game.flying,
+            "pin menu Space starts without firing in the new scene");
+        Send(router, 5, 0, 0, 32);
+        app.CapturePointer(hud.home);
+        router.Stop(host); router.Stop(host);
+        Require(!hud.layer.IsVisible() && !Contains(app, root) && app.GetCapturedPointer() == null
+            && hud.home.Click.Count() == 0, "pin Stop retires production view idempotently");
+        app.StopLoop(); app.SetRootControl(null); app.canvas.Destroy();
+    }
+
+    public static void Main() {
+        App frame = App.CreateOffscreen("frame fixture", 1, 1);
+        CasualHudWitness witness = new CasualHudWitness();
+        SnakeCase(witness);
+        Require(witness.app == null && witness.router == null && witness.snake == null
+            && witness.snakeHud == null && witness.root == null, "snake production graph releases");
+        PinCase(witness);
+        Require(witness.app == null && witness.router == null && witness.pin == null
+            && witness.pinHud == null && witness.root == null, "pin production graph releases");
+        frame.canvas.Destroy();
+        Console.WriteLine("CASUAL_GAME_RETAINED_HUD_OK");
+    }
+}

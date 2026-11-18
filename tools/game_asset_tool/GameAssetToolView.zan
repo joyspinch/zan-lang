@@ -1,0 +1,479 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace Tools.GameAsset;
+
+class GameAssetToolView : UiViewOwner, AppLoopOwner {
+    weak App host;
+    GameAssetModel model;
+    GameAssetViewport viewport;
+    Panel editor;
+    Flex body;
+    Flex workspace;
+    List<Flex> pages;
+    List<Button> tabs;
+    List<GameAssetToolBinding> bindings;
+    List<Input> spriteInputs;
+    List<Input> atlasInputs;
+    List<Input> depthInputs;
+    List<Label> sorting;
+    List<GameAssetPreview> previews;
+    SelectBox actionSelect;
+    SelectBox directionSelect;
+    SelectBox partSelect;
+    SelectBox paperDirectionSelect;
+    SelectBox brushSelect;
+    Label status;
+    Label frame;
+    Label mirror;
+    Label atlasSummary;
+    Label tileSummary;
+    Button play;
+    Button step;
+    Button calculate;
+    Button copy;
+    Button save;
+    TextArea json;
+    UiViewScope scope;
+    ControlInputHost input;
+    AppLoopRegistration loop;
+    int epoch;
+    int revision;
+    int activePage;
+    bool retired;
+    bool shown;
+    bool ready;
+    bool synchronizing;
+    bool customBounds;
+    int left; int top; int width; int height;
+    Rect requestedClip;
+    Rect actualClip;
+
+    public GameAssetToolView(App app) {
+        model = new GameAssetModel();
+        bindings = new List<GameAssetToolBinding>();
+        pages = new List<Flex>(); tabs = new List<Button>(); previews = new List<GameAssetPreview>();
+        spriteInputs = new List<Input>(); atlasInputs = new List<Input>();
+        depthInputs = new List<Input>(); sorting = new List<Label>();
+        viewport = new GameAssetViewport(); viewport.visible = false;
+        editor = Panel.Column(); editor.Pad(0); editor.Gap(0);
+        editor.SetProp("style", "overflow:hidden;"); viewport.Add(editor);
+        this.Build();
+        this.Bind(app);
+    }
+
+    public GameAssetModel Model() { return model; }
+    public Control Root() { return viewport; }
+    public UiViewScope Scope() { return scope; }
+    public ControlInputHost InputHost() { return input; }
+    public int Epoch() { return epoch; }
+    public Button Tab(int index) { return tabs[index]; }
+    public Input SpriteInput(int index) { return spriteInputs[index]; }
+    public Input AtlasInput(int index) { return atlasInputs[index]; }
+    public SelectBox ActionSelect() { return actionSelect; }
+    public SelectBox DirectionSelect() { return directionSelect; }
+    public SelectBox PartSelect() { return partSelect; }
+    public Input DepthInput(int index) { return depthInputs[index]; }
+    public SelectBox BrushSelect() { return brushSelect; }
+    public Button StepButton() { return step; }
+    public Button CalculateButton() { return calculate; }
+    public GameAssetPreview Preview(int index) { return previews[index]; }
+    public bool IsReady() { return ready; }
+
+    void Subscribe(UiEvent evt, Control sender, string name) {
+        GameAssetToolBinding binding = new GameAssetToolBinding();
+        binding.Event = evt; binding.Sender = sender; binding.Name = name; bindings.Add(binding);
+        sender.Named("asset:" + name);
+    }
+
+    void Wire() {
+        for (int i = 0; i < bindings.Count; i = i + 1) { bindings[i].Wire(this, epoch); }
+    }
+
+    void Renew() { epoch = epoch + 1; if (scope != null && scope.IsActive()) { this.Wire(); } }
+
+    Label Caption(Control parent, string text) {
+        Label label = new Label(text); label.AddClass("small");
+        label.SetProp("style", "flex-shrink:0;"); parent.Add(label); return label;
+    }
+
+    Flex Row(Control parent) {
+        Flex row = Flex.Row().AlignCenter(); row.Gap(Space.S);
+        row.SetProp("style", "flex-grow:0;flex-shrink:0;"); parent.Add(row); return row;
+    }
+
+    Input Field(Control parent, string title, string text, string name, List<Input> fields) {
+        this.Caption(parent, title);
+        Input field = new Input(title); field.SetText(text); field.AddClass("small");
+        field.SetProp("style", "flex-shrink:0;"); parent.Add(field); fields.Add(field);
+        this.Subscribe(field.Change, field, name); return field;
+    }
+
+    SelectBox Select(Control parent, string title, string[] options, string name) {
+        this.Caption(parent, title);
+        SelectBox select = new SelectBox(title); select.AddClass("small");
+        select.SetProp("style", "flex-shrink:0;");
+        for (int i = 0; i < options.Length; i = i + 1) { select.AddOption(options[i]); }
+        parent.Add(select); this.Subscribe(select.Change, select, name); return select;
+    }
+
+    Button Command(Control parent, string title, string name) {
+        Button button = new Button(title).Small(); button.SetProp("style", "flex-shrink:0;");
+        parent.Add(button); this.Subscribe(button.Click, button, name); return button;
+    }
+
+    void Build() {
+        body = Flex.Row(); body.SetProp("style", "flex-grow:1;flex-basis:0;min-height:0;min-width:0;overflow:hidden;");
+        editor.Add(body);
+        Panel railSurface = new Panel("asset-navigation"); railSurface.Prefer(180, 0);
+        railSurface.SetProp("style", "flex-shrink:0;overflow-y:auto;"); body.Add(railSurface);
+        Flex rail = Flex.Column(); rail.Gap(Space.S); railSurface.Add(rail);
+        this.Caption(rail, "游戏素材工作台"); this.Caption(rail, "Game Asset Studio");
+        string[] names = new string[] { "5向/8向动作序列", "纸娃娃层深矩阵", "纹理图集紧凑打包", "等轴测瓦片切片" };
+        for (int i = 0; i < names.Length; i = i + 1) {
+            tabs.Add(this.Command(rail, names[i], "tab:" + Convert.ToString(i)));
+        }
+        workspace = Flex.Column(); workspace.SetProp("style", "flex-grow:1;flex-basis:0;min-width:0;min-height:0;overflow:hidden;");
+        body.Add(workspace);
+        for (int i = 0; i < 4; i = i + 1) {
+            Flex page = Flex.Row(); page.visible = i == model.CurrentTab;
+            page.SetProp("style", "flex-grow:1;flex-basis:0;min-width:0;min-height:0;overflow:hidden;");
+            workspace.Add(page); pages.Add(page);
+            Panel properties = new Panel("asset-properties"); properties.Prefer(300, 0);
+            properties.SetProp("style", "flex-shrink:0;overflow-y:auto;"); page.Add(properties);
+            Flex form = Flex.Column(); form.Gap(Space.S); properties.Add(form);
+            Flex stage = Flex.Column(); stage.Gap(Space.S);
+            stage.SetProp("style", "flex-grow:1;flex-basis:0;min-width:0;min-height:0;overflow:hidden;"); page.Add(stage);
+            if (i == 0) { this.BuildSprite(form, stage); }
+            else if (i == 1) { this.BuildPaperdoll(form, stage); }
+            else if (i == 2) { this.BuildAtlas(form, stage); }
+            else { this.BuildTiles(form, stage); }
+            GameAssetPreview preview = new GameAssetPreview(this, i); previews.Add(preview); stage.Add(preview);
+        }
+        Panel output = new Panel("asset-output"); output.Prefer(300, 0);
+        output.SetProp("style", "display:flex;flex-direction:column;flex-shrink:0;min-height:0;overflow:hidden;"); body.Add(output);
+        Flex outputColumn = Flex.Column(); outputColumn.Gap(Space.S);
+        outputColumn.SetProp("style", "flex-grow:1;flex-basis:0;min-height:0;min-width:0;"); output.Add(outputColumn);
+        this.Caption(outputColumn, "配置 JSON / 图层绘制队列");
+        for (int i = 0; i < model.PaperdollParts.Count; i = i + 1) { sorting.Add(this.Caption(outputColumn, "")); }
+        json = new TextArea("导出的素材配置").ReadOnly(true);
+        json.SetProp("style", "flex-grow:1;flex-basis:0;min-height:0;"); outputColumn.Add(json);
+        Flex footer = this.Row(editor); footer.Pad(Space.XS);
+        status = this.Caption(footer, ""); status.SetProp("style", "flex-grow:1;flex-basis:0;min-width:0;");
+        save = this.Command(footer, "保存配置文件", "save");
+        copy = this.Command(footer, "复制 JSON 配置", "copy");
+        this.Refresh();
+    }
+
+    void BuildSprite(Control form, Control stage) {
+        this.Caption(form, "5方向对称与8向映射配置");
+        this.Caption(form, "东侧 SE/E/NE 镜像到 SW/W/NW，立省37.5%显存");
+        this.Field(form, "角色模型标识", model.SpriteModel, "sprite:model", spriteInputs);
+        this.Field(form, "切片宽度", Convert.ToString(model.SpriteFrameWidth), "sprite:width", spriteInputs);
+        this.Field(form, "切片高度", Convert.ToString(model.SpriteFrameHeight), "sprite:height", spriteInputs);
+        this.Field(form, "每方向帧数", Convert.ToString(model.SpriteFrameCount), "sprite:frames", spriteInputs);
+        this.Field(form, "播放帧率", Convert.ToString(model.SpriteFps), "sprite:fps", spriteInputs);
+        actionSelect = this.Select(form, "动作类型 (Action)", new string[] { "Idle", "Walk", "Attack", "Cast", "Die" }, "action");
+        actionSelect.SetIndex(1);
+        directionSelect = this.Select(form, "当前朝向与镜像检查", new string[] {
+            "正东 (E)", "东南 (SE)", "正南 (S)", "西南 (SW) [镜像]", "正西 (W) [镜像]", "西北 (NW) [镜像]", "正北 (N)", "东北 (NE)"
+        }, "direction");
+        directionSelect.SetIndex(model.SelectedDir8);
+        Flex controls = this.Row(stage); play = this.Command(controls, "暂停", "play");
+        step = this.Command(controls, "单步步进", "step"); frame = this.Caption(controls, "");
+        mirror = this.Caption(stage, "");
+    }
+
+    void BuildPaperdoll(Control form, Control stage) {
+        this.Caption(form, "纸娃娃挂件与动态层深矩阵");
+        this.Caption(form, "身体/衣服/武器/翅膀/发型独立，解决前后穿模");
+        partSelect = new SelectBox("配置部件"); partSelect.AddClass("small");
+        for (int i = 0; i < model.PaperdollParts.Count; i = i + 1) { partSelect.AddOption(model.PaperdollParts[i].Name); }
+        partSelect.SetIndex(model.SelectedPartIndex); form.Add(partSelect); this.Subscribe(partSelect.Change, partSelect, "part");
+        this.Caption(form, "8方向层深偏移（每次 ±5）");
+        string[] dirs = new string[] { "正东 (E)", "东南 (SE)", "正南 (S正面)", "西南 (SW)", "正西 (W)", "西北 (NW)", "正北 (N背面)", "东北 (NE)" };
+        Flex header = this.Row(form);
+        Label direction = this.Caption(header, "方向"); direction.Prefer(100, 0);
+        this.Caption(header, "− / 深度 / +");
+        for (int d = 0; d < 8; d = d + 1) {
+            Flex row = this.Row(form); Label label = this.Caption(row, dirs[d]); label.Prefer(100, 0);
+            this.Command(row, "−", "depth-:" + Convert.ToString(d));
+            Input value = new Input("层深"); value.AddClass("small"); value.Prefer(76, 0);
+            row.Add(value); depthInputs.Add(value); this.Subscribe(value.Change, value, "depth:" + Convert.ToString(d));
+            this.Command(row, "+", "depth+:" + Convert.ToString(d));
+        }
+        paperDirectionSelect = this.Select(stage, "切换测试朝向", new string[] { "E", "SE", "S", "SW", "W", "NW", "N", "NE" }, "paper-direction");
+        paperDirectionSelect.SetIndex(model.PaperdollDir8);
+    }
+
+    void BuildAtlas(Control form, Control stage) {
+        this.Caption(form, "纹理图集紧凑打包计算器");
+        this.Caption(form, "最优 POT 尺寸 / 利用率 / RGBA32 / UV 归一化网格");
+        this.Field(form, "图集名称", model.AtlasName, "atlas:name", atlasInputs);
+        this.Field(form, "单切片宽度", Convert.ToString(model.AtlasFrameW), "atlas:width", atlasInputs);
+        this.Field(form, "单切片高度", Convert.ToString(model.AtlasFrameH), "atlas:height", atlasInputs);
+        this.Field(form, "总切片帧数", Convert.ToString(model.AtlasTotalFrames), "atlas:count", atlasInputs);
+        calculate = this.Command(form, "重新计算最优图集规格", "calculate"); calculate.AddClass("primary");
+        atlasSummary = this.Caption(form, "");
+        this.Caption(stage, "Atlas UV 预览 · 指向帧切片查看归一化坐标");
+    }
+
+    void BuildTiles(Control form, Control stage) {
+        this.Caption(form, "2:1 等轴测地砖与碰撞标记");
+        this.Caption(form, "地砖 64×32 · 8列×8行 · 水平连续碰撞体合并");
+        brushSelect = this.Select(form, "选择涂刷属性", new string[] {
+            "平地 (Ground)", "阻挡 (Solid 障碍)", "透明遮挡 (Alpha)", "出生点 (Spawn)"
+        }, "brush");
+        brushSelect.SetIndex(model.TileBrush);
+        tileSummary = this.Caption(form, "");
+        this.Caption(stage, "点击或拖拽菱形网格涂刷属性");
+    }
+
+    public void Bind(App app) {
+        if (retired || app == null) { return; }
+        if (host == app && scope != null && scope.IsActive()) { this.Show(); return; }
+        int session = revision + 1; revision = session;
+        ready = false; shown = false; viewport.visible = false; epoch = epoch + 1;
+        UiViewScope oldScope = scope; scope = null;
+        ControlInputHost oldInput = input; input = null;
+        AppLoopRegistration oldLoop = loop; loop = null; host = null;
+        if (oldScope != null) { oldScope.Retire(); }
+        if (oldLoop != null) { oldLoop.Invalidate(); }
+        if (oldInput != null) { oldInput.Hide(); }
+        if (revision != session || retired) { return; }
+        host = app; shown = true; viewport.visible = true;
+        scope = new UiViewScope(app, this, viewport);
+        // A new scope needs its own actions; old queued actions retain the retired one.
+        for (int i = 0; i < bindings.Count; i = i + 1) { bindings[i].Action = null; }
+        input = new ControlInputHost(viewport);
+        GameAssetToolLoop participant = new GameAssetToolLoop(); participant.Owner = this;
+        loop = app.RegisterLoopParticipant(this, participant);
+        this.Wire();
+        input.Bind(app);
+        if (revision != session || host != app || retired || !shown) { return; }
+        app.RequestRedraw();
+    }
+
+    public void Show() {
+        if (retired || host == null || scope == null || !scope.IsActive() || shown) { return; }
+        int session = revision + 1; revision = session;
+        shown = true; ready = false; viewport.visible = true; this.Renew();
+        ControlInputHost current = input; App app = host; current.Bind(app);
+        if (revision != session || !shown || retired || host != app) { return; }
+        app.RequestRedraw();
+    }
+
+    public void Hide() {
+        if (!shown && !ready) { return; }
+        revision = revision + 1; epoch = epoch + 1;
+        shown = false; ready = false; viewport.visible = false;
+        ControlInputHost previous = input;
+        if (previous != null) { previous.Hide(); }
+    }
+
+    public void Retire() {
+        if (retired) { return; }
+        retired = true; revision = revision + 1; epoch = epoch + 1;
+        shown = false; ready = false; viewport.visible = false;
+        UiViewScope previous = scope; scope = null;
+        ControlInputHost oldInput = input; input = null;
+        AppLoopRegistration oldLoop = loop; loop = null; host = null;
+        if (previous != null) { previous.Retire(); }
+        if (oldLoop != null) { oldLoop.Invalidate(); }
+        if (oldInput != null) { oldInput.Hide(); }
+    }
+
+    public void Stopped(App app) { if (host == app) { this.Retire(); } }
+
+    public void SetBounds(int x, int y, int w, int h, Rect clip) {
+        bool changed = !customBounds || left != x || top != y || width != w || height != h
+        || requestedClip == null || clip == null || requestedClip.x != clip.x || requestedClip.y != clip.y
+        || requestedClip.width != clip.width || requestedClip.height != clip.height;
+        customBounds = true; left = x; top = y; width = w; height = h;
+        requestedClip = clip != null ? new Rect(clip.x, clip.y, clip.width, clip.height) : null;
+        if (!changed) { return; }
+        int session = revision + 1; revision = session; ready = false; this.Renew();
+        App app = host; if (app != null) { app.ReleaseInputSubtree(viewport); }
+        if (revision == session && !retired && app == host && app != null) { app.RequestRedraw(); }
+    }
+
+    public void UseWindowBounds() {
+        customBounds = false; requestedClip = null; ready = false; revision = revision + 1; this.Renew();
+        App app = host; if (app != null) { app.ReleaseInputSubtree(viewport); app.RequestRedraw(); }
+    }
+
+    public bool PointVisible(int x, int y) {
+        return shown && ready && actualClip != null && x >= actualClip.x && y >= actualClip.y
+        && x < actualClip.x + actualClip.width && y < actualClip.y + actualClip.height;
+    }
+
+    public bool ActionCurrent(int actionEpoch, Control sender) {
+        if (retired || !shown || !ready || epoch != actionEpoch || host == null || !host.isRunning
+        || scope == null || !scope.IsActive() || sender == null || sender.FindApp() != host
+        || host.rootControl == null || !host.rootControl.ContainsInputControl(sender)) { return false; }
+        Control node = sender;
+        while (node != null) {
+            if (!node.StyleVisible() || node.IsDisabled()) { return false; }
+            node = node.parent;
+        }
+        return true;
+    }
+
+    public void SelectTab(int index) {
+        if (retired || index < 0 || index >= pages.Count || activePage == index) { return; }
+        int session = revision + 1; revision = session;
+        Flex oldPage = pages[activePage];
+        model.CurrentTab = index; activePage = index; this.Renew();
+        for (int i = 0; i < pages.Count; i = i + 1) { pages[i].visible = i == index; }
+        App app = host;
+        if (app != null) { app.ReleaseInputSubtree(oldPage); }
+        if (revision != session || retired || host != app || model.CurrentTab != index) { return; }
+        model.UpdateJsonExport(); this.Refresh();
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    public void PrepareView(UiViewScope view, App app) {
+        if (view != scope || host != app || retired || !view.IsActive()) { return; }
+        if (activePage != model.CurrentTab) {
+            int before = revision;
+            this.SelectTab((int)Math.Max(0, (int)Math.Min(3, model.CurrentTab)));
+            if (revision != before + 1 || view != scope || host != app || retired || !view.IsActive()) { return; }
+        }
+        ready = false;
+        if (!shown) { return; }
+        int x = customBounds ? left : 0; int y = customBounds ? top : app.ContentTop();
+        int w = customBounds ? width : app.canvas.Width();
+        int h = customBounds ? height : app.canvas.Height() - y;
+        Rect clip = customBounds && requestedClip != null ? requestedClip : new Rect(x, y, w, h);
+        int cx = (int)Math.Max(0, (int)Math.Max(x, clip.x)); int cy = (int)Math.Max(app.ContentTop(), (int)Math.Max(y, clip.y));
+        int cr = (int)Math.Min(app.canvas.Width(), (int)Math.Min(x + w, clip.x + clip.width));
+        int cb = (int)Math.Min(app.canvas.Height(), (int)Math.Min(y + h, clip.y + clip.height));
+        Rect next = new Rect(cx, cy, (int)Math.Max(0, cr - cx), (int)Math.Max(0, cb - cy));
+        int session = revision;
+        bool changed = actualClip != null && (actualClip.x != next.x || actualClip.y != next.y
+        || actualClip.width != next.width || actualClip.height != next.height);
+        actualClip = next;
+        if (changed) {
+            this.Renew(); app.ReleaseInputSubtree(viewport);
+            if (session != revision || host != app || view != scope || !shown || retired) { return; }
+        }
+        if (w <= 0 || h <= 0 || next.width <= 0 || next.height <= 0) { viewport.visible = false; return; }
+        viewport.visible = true;
+        this.Refresh();
+        viewport.SetContentBounds(x, y, w, h);
+        if (!view.Layout(next.x, next.y, next.width, next.height)) { return; }
+        ready = session == revision && host == app && view == scope && shown && view.IsActive();
+    }
+
+    void Refresh() {
+        synchronizing = true;
+        status.SetProp("text", model.StatusMsg);
+        frame.SetProp("text", "帧: " + Convert.ToString(model.AnimCurrentFrame + 1) + " / " + Convert.ToString(model.SpriteFrameCount));
+        play.SetText(model.AnimPlaying ? "暂停" : "播放");
+        int[] sourceRows = new int[] { 2, 1, 0, 1, 2, 3, 4, 3 };
+        bool mirrored = model.SelectedDir8 >= 3 && model.SelectedDir8 <= 5;
+        mirror.SetProp("text", "当前朝向: " + directionSelect.OptionLabel(model.SelectedDir8)
+        + " · 原始切片行 " + Convert.ToString(sourceRows[model.SelectedDir8]) + (mirrored ? " · GPU FlipX = true" : " · 无镜像"));
+        PaperdollPart selected = model.PaperdollParts[model.SelectedPartIndex];
+        for (int i = 0; i < depthInputs.Count; i = i + 1) {
+            string value = Convert.ToString(selected.DepthPerDir[i]);
+            if (depthInputs[i].GetText() != value && !depthInputs[i].IsFocused(host)) { depthInputs[i].SetText(value); }
+        }
+        List<PaperdollPart> ordered = new List<PaperdollPart>();
+        for (int i = 0; i < model.PaperdollParts.Count; i = i + 1) { ordered.Add(model.PaperdollParts[i]); }
+        for (int i = 1; i < ordered.Count; i = i + 1) {
+            PaperdollPart item = ordered[i]; int j = i - 1;
+            while (j >= 0 && ordered[j].DepthPerDir[model.PaperdollDir8] > item.DepthPerDir[model.PaperdollDir8]) {
+                ordered[j + 1] = ordered[j]; j = j - 1;
+            }
+            ordered[j + 1] = item;
+        }
+        for (int i = 0; i < sorting.Count; i = i + 1) {
+            sorting[i].visible = model.CurrentTab == 1;
+            sorting[i].SetProp("text", Convert.ToString(i + 1) + ". " + ordered[i].Name
+            + " · " + Convert.ToString(ordered[i].DepthPerDir[model.PaperdollDir8]));
+        }
+        int pixels = model.AtlasResultWidth * model.AtlasResultHeight;
+        int used = model.AtlasTotalFrames * model.AtlasFrameW * model.AtlasFrameH;
+        atlasSummary.SetProp("text", "推荐 POT: " + Convert.ToString(model.AtlasResultWidth) + " × " + Convert.ToString(model.AtlasResultHeight)
+        + " px\n网格: " + Convert.ToString(model.AtlasResultCols) + " 列 × " + Convert.ToString(model.AtlasResultRows)
+        + " 行\n利用率: " + Convert.ToString(pixels > 0 ? used * 100 / pixels : 0)
+        + "%\nRGBA32: ~" + Convert.ToString(pixels * 4 / 1024) + " KB");
+        int solids = 0;
+        for (int i = 0; i < model.TileGrid.Length; i = i + 1) { if (model.TileGrid[i] == 1) { solids = solids + 1; } }
+        int merged = model.CalculateMergedCollidersCount();
+        tileSummary.SetProp("text", "原始碰撞体: " + Convert.ToString(solids) + " 个\n水平合并: " + Convert.ToString(merged)
+        + " 组\n遍历削减: " + Convert.ToString(solids > 0 ? (solids - merged) * 100 / solids : 0) + "%");
+        if (json.GetText() != model.ExportedJsonText) { json.SetText(model.ExportedJsonText); }
+        for (int i = 0; i < tabs.Count; i = i + 1) { tabs[i].SetClassIn("primary", i == model.CurrentTab ? "primary" : ""); }
+        synchronizing = false;
+    }
+
+    public void ViewAction(string name, Control sender) {
+        if (synchronizing || !this.ActionCurrent(epoch, sender)) { return; }
+        if (name.StartsWith("tab:")) { this.SelectTab(ToolUtil.ToInt(name.Substring(4), -1)); return; }
+        if (name == "action") { model.SpriteAction = actionSelect.SelectedText(); }
+        else if (name == "direction") { model.SelectedDir8 = directionSelect.Selected(); }
+        else if (name == "part") { model.SelectedPartIndex = partSelect.Selected(); }
+        else if (name == "paper-direction") { model.PaperdollDir8 = paperDirectionSelect.Selected(); }
+        else if (name == "brush") { model.TileBrush = brushSelect.Selected(); }
+        else if (name == "play") { model.AnimPlaying = !model.AnimPlaying; }
+        else if (name == "step") {
+            model.AnimPlaying = false; model.AnimCurrentFrame = (model.AnimCurrentFrame + 1) % model.SpriteFrameCount;
+        } else if (name.StartsWith("depth")) {
+            int colon = name.IndexOf(":"); int dir = ToolUtil.ToInt(name.Substring(colon + 1), -1);
+            if (dir < 0 || dir >= 8) { return; }
+            PaperdollPart part = model.PaperdollParts[model.SelectedPartIndex];
+            if (name.StartsWith("depth-:")) { part.DepthPerDir[dir] = part.DepthPerDir[dir] - 5; }
+            else if (name.StartsWith("depth+:")) { part.DepthPerDir[dir] = part.DepthPerDir[dir] + 5; }
+            else { part.DepthPerDir[dir] = ToolUtil.ToInt(depthInputs[dir].GetText(), part.DepthPerDir[dir]); }
+        } else if (name.StartsWith("sprite:")) {
+            model.SpriteModel = spriteInputs[0].GetText();
+            model.SpriteFrameWidth = (int)Math.Max(1, ToolUtil.ToInt(spriteInputs[1].GetText(), model.SpriteFrameWidth));
+            model.SpriteFrameHeight = (int)Math.Max(1, ToolUtil.ToInt(spriteInputs[2].GetText(), model.SpriteFrameHeight));
+            model.SpriteFrameCount = (int)Math.Max(1, ToolUtil.ToInt(spriteInputs[3].GetText(), model.SpriteFrameCount));
+            model.SpriteFps = (int)Math.Max(1, ToolUtil.ToInt(spriteInputs[4].GetText(), model.SpriteFps));
+            model.AnimCurrentFrame = model.AnimCurrentFrame % model.SpriteFrameCount;
+        } else if (name.StartsWith("atlas:") || name == "calculate") {
+            model.AtlasName = atlasInputs[0].GetText();
+            model.AtlasFrameW = (int)Math.Max(1, ToolUtil.ToInt(atlasInputs[1].GetText(), model.AtlasFrameW));
+            model.AtlasFrameH = (int)Math.Max(1, ToolUtil.ToInt(atlasInputs[2].GetText(), model.AtlasFrameH));
+            model.AtlasTotalFrames = (int)Math.Max(1, ToolUtil.ToInt(atlasInputs[3].GetText(), model.AtlasTotalFrames));
+            model.CalculateAtlasLayout();
+            model.StatusMsg = "已重新解算图集尺寸：" + Convert.ToString(model.AtlasResultWidth) + "x" + Convert.ToString(model.AtlasResultHeight);
+        } else if (name == "copy") {
+            Clipboard.SetText(model.ExportedJsonText); model.StatusMsg = "已复制当前配置 JSON 到系统剪贴板！";
+        } else if (name == "save") { model.SaveCurrentConfig(); }
+        model.UpdateJsonExport(); this.Refresh();
+        App app = host; if (app != null) { app.RequestRedraw(); }
+    }
+
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+
+    public void PaintTile(GameAssetPreview sender, int index) {
+        if (!this.ActionCurrent(epoch, sender) || model.CurrentTab != 3 || index < 0 || index >= model.TileGrid.Length) { return; }
+        if (model.TileGrid[index] == model.TileBrush) { return; }
+        model.TileGrid[index] = model.TileBrush; model.UpdateJsonExport(); this.Refresh();
+        App app = host; if (app != null) { app.RequestRedraw(); }
+    }
+
+    public void Advance(App app, int now) {
+        if (host != app || retired || !shown || !model.AnimPlaying || model.SpriteFps <= 0 || model.CurrentTab != 0) { return; }
+        int interval = (int)Math.Max(1, 1000 / model.SpriteFps);
+        if (now - model.LastAnimTick >= interval) {
+            model.AnimCurrentFrame = (model.AnimCurrentFrame + 1) % model.SpriteFrameCount;
+            model.LastAnimTick = now; app.RequestRedraw();
+        }
+    }
+
+    public int NextDeadline() {
+        return !retired && shown && model.AnimPlaying && model.CurrentTab == 0
+        ? (int)model.LastAnimTick + (int)Math.Max(1, 1000 / model.SpriteFps) : -1;
+    }
+
+    public void Render(App app) {
+        if (host == app && ready && shown && scope != null && scope.IsActive()) { viewport.RenderTree(app); }
+    }
+}

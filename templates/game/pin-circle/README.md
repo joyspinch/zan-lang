@@ -18,29 +18,34 @@
 
 ## 文件
 
-- `src/World.zan`：独立固定步长仿真、关卡参数、针球与针杆碰撞。
-- `src/View.zan`：素材绘制、动效、舞台坐标与点击几何。
-- `src/main.zan`：菜单、游戏和结算场景，以及鼠标与键盘输入。
+- `src/PinWorld.zan`、`src/Entities/`：独立固定步长仿真、关卡参数、针球与针杆碰撞。
+- `src/PinView.zan`、`src/PinHud.zan`：素材绘制、标准组件 HUD、动效、舞台坐标与点击几何；HUD 在共享测量前配置当前区域。
+- `src/main.zan`、`src/Scenes/`：程序入口、菜单、游戏和结算场景，以及鼠标与键盘输入。
 - `assets/`：背景、机关、三种针球和标题图片。
 - `template.manifest`、`zan.proj`：IDE 模板发现与工程入口，无固定平台。
 
 ## 编译运行
 
-在仓库根目录运行以下 PowerShell 命令。安装版 SDK 使用其 `toolchain/zanc.exe` 替换编译器路径。
+在当前主仓根目录运行以下 PowerShell 命令，直接编译模板原始源码，不复制模板树。安装版 SDK 使用其 `toolchain/zanc.exe` 替换编译器路径，并将包工程根设为对应 SDK 根目录。
 
 ```powershell
-New-Item -ItemType Directory -Force build/pin-circle | Out-Null
-build/zanc.exe templates/game/pin-circle/src/main.zan templates/game/pin-circle/src/World.zan templates/game/pin-circle/src/View.zan --auto-stdlib --embed assets=templates/game/pin-circle/assets --publish --subsystem windows -o build/pin-circle/PinCircle.exe
+Set-Location D:/project/zan-lang
+& ./scripts/build_gate.ps1 -Name build -Script {
+    New-Item -ItemType Directory -Force build/pin-circle | Out-Null
+    build/zanc.exe templates/game/pin-circle/src/main.zan templates/game/pin-circle/src --auto-stdlib --package-project . --embed templates/game/pin-circle/assets=assets --publish --subsystem windows -o build/pin-circle/PinCircle.exe
+}
 build/pin-circle/PinCircle.exe
 ```
 
-`--embed` 把游戏素材放入程序，运行时不需要另找模板目录。生成的原生驱动文件应与程序保持在同一目录。
+入口 `main.zan` 排在首位，随后 `src` 目录递归纳入 `PinWorld`、`PinView`、Entities、Scenes 和 HUD 的全部源码，已列入口不会重复纳入。`--package-project .` 使用当前主仓的 `packages/`。`--embed 磁盘路径=内嵌前缀` 把模板素材放到程序内的 `assets/`，运行时不需要另找模板目录。生成的原生驱动文件应与程序保持在同一目录。
 
-IDE 新建项目会复制 `assets/`，普通运行从项目资源目录读取；IDE 发布会按工程的单文件设置内嵌或复制资源。新建项目后也可在项目根目录直接编译：
+IDE 新建项目会复制 `assets/`，普通运行从项目资源目录读取；IDE 发布会按工程的单文件设置内嵌或复制资源。新建项目后也可在项目根目录直接编译；以下仍使用当前主仓编译器和包（新建项目是产品功能，不用于复制模板做验证）：
 
 ```powershell
-New-Item -ItemType Directory -Force build | Out-Null
-zanc src/main.zan src/World.zan src/View.zan --auto-stdlib --embed assets=assets --publish --subsystem windows -o build/game.exe
+& D:/project/zan-lang/scripts/build_gate.ps1 -Name build -Script {
+    New-Item -ItemType Directory -Force build | Out-Null
+    D:/project/zan-lang/build/zanc.exe src/main.zan src --auto-stdlib --package-project D:/project/zan-lang --embed assets=assets --publish --subsystem windows -o build/game.exe
+}
 build/game.exe
 ```
 
@@ -51,7 +56,11 @@ build/game.exe
 在仓库根目录发布适用于 Android 9（API 28）及以上 ARM64 设备的 APK：
 
 ```powershell
-build/zanc.exe templates/game/pin-circle/src/main.zan templates/game/pin-circle/src/World.zan templates/game/pin-circle/src/View.zan --auto-stdlib --embed assets=templates/game/pin-circle/assets --publish --target android-arm64 --emit-apk build/pin-circle/PinCircle-arm64.apk --apk-package com.zan.pincircle --apk-label "见缝插针·星环机关" -o build/pin-circle/PinCircle-arm64.so
+Set-Location D:/project/zan-lang
+& ./scripts/build_gate.ps1 -Name build -Script {
+    New-Item -ItemType Directory -Force build/pin-circle | Out-Null
+    build/zanc.exe templates/game/pin-circle/src/main.zan templates/game/pin-circle/src --auto-stdlib --package-project . --embed templates/game/pin-circle/assets=assets --publish --target android-arm64 --emit-apk build/pin-circle/PinCircle-arm64.apk --apk-package com.zan.pincircle --apk-label "见缝插针·星环机关" -o build/pin-circle/PinCircle-arm64.so
+}
 ```
 
 `--emit-apk` 后面必须紧跟 APK 路径，`-o` 指定中间原生库。SDK 须带有 Android ARM64 运行时和 GUI、图片、游戏驱动，`JAVA_HOME` 指向可用于签名的 JDK。素材和原生驱动随 APK 打包，安装后无需复制外置资源。默认使用 SDK 的测试证书签名，可侧载安装；商店发布须换成自己的正式签名。
@@ -82,10 +91,13 @@ python tests/templates/pin-circle/run.py
 - 通关结算直接返回菜单、重新开始与点击进入下一关；场景夹具仅给第一关注入安全发射，仍复用实际场景和物理模型。
 - 发布程序从没有外置素材的目录启动，以及窗口放大为 900×1350 后的绘制和点击。
 
-日志与 PNG 截图写入 `_scratch/pin-circle-tests/`，最终输出应以 `PASS pin-circle:` 结尾。窗口测试需要 Windows；单独的模型回归不依赖窗口：
+日志与 PNG 截图写入 `build/test-out/pin-circle-tests/`，可执行程序写入 `build/cases/`，最终输出应以 `PASS pin-circle:` 结尾。回归入口直接复用主树的模型和场景源码，不复制模板树。窗口测试需要 Windows；单独的模型回归不依赖窗口，只纳入模型源码，不传含产品 `Main` 的整个 `src` 目录：
 
 ```powershell
-New-Item -ItemType Directory -Force _scratch/pin-circle-tests | Out-Null
-build/zanc.exe tests/templates/pin-circle/world_test.zan templates/game/pin-circle/src/World.zan --auto-stdlib -o _scratch/pin-circle-tests/world-test.exe
-_scratch/pin-circle-tests/world-test.exe
+Set-Location D:/project/zan-lang
+& ./scripts/build_gate.ps1 -Name build -Script {
+    New-Item -ItemType Directory -Force build/cases | Out-Null
+    build/zanc.exe tests/templates/pin-circle/world_test.zan templates/game/pin-circle/src/PinWorld.zan templates/game/pin-circle/src/Entities --auto-stdlib --package-project . -o build/cases/pin_circle_world-test.exe
+}
+build/cases/pin_circle_world-test.exe
 ```

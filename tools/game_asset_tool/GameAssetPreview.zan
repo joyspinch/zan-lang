@@ -1,0 +1,150 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Tools.GameAsset;
+
+// Only asset/world imagery is painted here. All editor chrome is a retained
+// standard widget; this control edits tiles only from routed pointer events.
+class GameAssetPreview : Control {
+    public weak GameAssetToolView Owner;
+    public int Mode;
+    int hoveredTile = -1;
+    bool dragging;
+    int dragEpoch;
+
+    public GameAssetPreview(GameAssetToolView owner, int mode) {
+        Owner = owner; Mode = mode;
+        this.SetProp("style", "flex-grow:1;flex-basis:0;min-width:0;min-height:0;overflow:hidden;");
+    }
+
+    public int TileAt(App app, int x, int y) {
+        GameAssetToolView owner = Owner;
+        if (owner == null || app == null || !owner.PointVisible(x, y)
+                || x < bx || y < by || x >= bx + bw || y >= by + bh) { return -1; }
+        GameAssetModel model = owner.Model();
+        int hw = app.Scale(model.TileWidth) / 2; int hh = app.Scale(model.TileHeight) / 2;
+        int ox = bx + bw / 2; int oy = by + app.Scale(90);
+        for (int row = model.TileRows - 1; row >= 0; row = row - 1) {
+            for (int col = model.TileCols - 1; col >= 0; col = col - 1) {
+                int dx = x - ox - (col - row) * hw;
+                int dy = y - oy - (col + row) * hh;
+                if (Math.Abs(dx) * hh + Math.Abs(dy) * hw <= hw * hh) {
+                    return row * model.TileCols + col;
+                }
+            }
+        }
+        return -1;
+    }
+
+    void Hover(App app, int x, int y) {
+        GameAssetToolView owner = Owner;
+        if (owner == null) { return; }
+        if (Mode == 3) {
+            int next = this.TileAt(app, x, y);
+            if (next != hoveredTile) { hoveredTile = next; app.RequestRedraw(); }
+        } else if (Mode == 2) {
+            GameAssetModel model = owner.Model();
+            int next = -1;
+            int px = bx + app.Scale(16); int py = by + app.Scale(16);
+            int pw = bw - app.Scale(32); int ph = bh - app.Scale(32);
+            int cw = pw / (int)Math.Max(1, model.AtlasResultCols);
+            int ch = ph / (int)Math.Max(1, model.AtlasResultRows);
+            if (cw > 0 && ch > 0 && owner.PointVisible(x, y)
+                    && x >= px && y >= py && x < px + pw && y < py + ph) {
+                int col = (x - px) / cw; int row = (y - py) / ch;
+                if (col < model.AtlasResultCols && row < model.AtlasResultRows) {
+                    next = row * model.AtlasResultCols + col;
+                    if (next >= model.AtlasTotalFrames) { next = -1; }
+                }
+            }
+            if (model.HoveredAtlasFrame != next) { model.HoveredAtlasFrame = next; app.RequestRedraw(); }
+        }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        GameAssetToolView owner = Owner; App app = this.FindApp();
+        if (e.originalSource != this || owner == null || app == null || Mode != 3
+                || app.window.EventButton() != 0 || !owner.ActionCurrent(owner.Epoch(), this)) { return; }
+        int tile = this.TileAt(app, e.x, e.y);
+        if (tile < 0) { return; }
+        dragging = true; dragEpoch = owner.Epoch();
+        app.CapturePointer(this, true); e.Handle();
+        owner.PaintTile(this, tile);
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        GameAssetToolView owner = Owner; App app = this.FindApp();
+        if (owner == null || app == null || !owner.ActionCurrent(owner.Epoch(), this)) { return; }
+        this.Hover(app, e.x, e.y);
+        if (dragging && app.GetCapturedPointer() == this && owner.ActionCurrent(dragEpoch, this)) {
+            e.Handle(); owner.PaintTile(this, this.TileAt(app, e.x, e.y));
+        }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        GameAssetToolView owner = Owner; App app = this.FindApp();
+        if (app == null || !dragging || app.GetCapturedPointer() != this) { return; }
+        e.Handle();
+        if (app.window.EventButton() != 0) { return; }
+        int epoch = dragEpoch;
+        dragging = false;
+        app.ReleasePointerCapture();
+        if (owner != null && owner.ActionCurrent(epoch, this)) {
+            owner.PaintTile(this, this.TileAt(app, e.x, e.y));
+        }
+    }
+
+    public override void OnPointerCancel(RoutedEventArgs e) {
+        dragging = false; hoveredTile = -1;
+        base.OnPointerCancel(e);
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        hoveredTile = -1;
+        GameAssetToolView owner = Owner;
+        if (owner != null) { owner.Model().HoveredAtlasFrame = -1; }
+        App app = this.FindApp(); if (app != null) { app.RequestRedraw(); }
+        base.OnPointerLeave(e);
+    }
+
+    public override void OnPaint(App app) {
+        GameAssetToolView owner = Owner;
+        if (owner == null || bw <= 0 || bh <= 0 || !owner.ActionCurrent(owner.Epoch(), this)) { return; }
+        GameAssetModel model = owner.Model(); Canvas c = app.canvas;
+        c.PushClip(bx, by, bw, bh);
+        model.DrawStageBackground(c, bx, by, bw, bh);
+        int cx = bx + bw / 2; int cy = by + bh / 2 - app.Scale(20);
+        if (Mode == 0) {
+            bool mirror = model.SelectedDir8 >= 3 && model.SelectedDir8 <= 5;
+            model.DrawIsoDiamond(c, cx, cy + app.Scale(64), app.Scale(160), app.Scale(80),
+                (int)0xFF2A2E39, (int)0xFF3F4656);
+            model.DrawDirectionCompass(c, cx, cy + app.Scale(64), model.SelectedDir8);
+            model.DrawCharacterSilhouette(c, cx, cy, model.SelectedDir8, mirror, model.AnimCurrentFrame, model.SpriteAction);
+            model.DrawFrameFilmStrip(c, bx + app.Scale(16), by + bh - app.Scale(60), bw - app.Scale(32),
+                app.Scale(44), model.AnimCurrentFrame, model.SpriteFrameCount);
+        } else if (Mode == 1) {
+            model.DrawPaperdollStack(c, cx, cy, model.PaperdollDir8);
+        } else if (Mode == 2) {
+            model.DrawAtlasGrid(app, c, bx + app.Scale(16), by + app.Scale(16), bw - app.Scale(32), bh - app.Scale(32));
+        } else {
+            int hw = app.Scale(model.TileWidth) / 2; int hh = app.Scale(model.TileHeight) / 2;
+            int ox = bx + bw / 2; int oy = by + app.Scale(90);
+            int[] fills = new int[] { (int)0xFF2E323B, (int)0xFFD32F2F, (int)0xFF1976D2, (int)0xFFFFA000 };
+            int[] borders = new int[] { (int)0xFF454B58, (int)0xFFFF5252, (int)0xFF448AFF, (int)0xFFFFD740 };
+            for (int row = 0; row < model.TileRows; row = row + 1) {
+                for (int col = 0; col < model.TileCols; col = col + 1) {
+                    int index = row * model.TileCols + col; int kind = model.TileGrid[index];
+                    int sx = ox + (col - row) * hw; int sy = oy + (col + row) * hh;
+                    model.DrawIsoDiamond(c, sx, sy, hw * 2, hh * 2, fills[kind],
+                        hoveredTile == index ? (int)0xFF00E676 : borders[kind]);
+                    if (kind != 0) {
+                        c.DrawTextCentered(sx - hw, sy - hh, hw * 2, hh * 2,
+                            kind == 1 ? "阻" : (kind == 2 ? "透" : "怪"), (int)0xFFFFFFFF, app.theme.fontSizeTiny);
+                    }
+                }
+            }
+        }
+        c.PopClip();
+    }
+}

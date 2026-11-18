@@ -12,20 +12,29 @@ public class HudLayer {
     public List<Control> controls;
     public bool visible;
     HudInputRoot inputRoot;
+    HudInputPreparation preparation;
+    weak App inputApp;
+    bool useDefaultBounds;
+    int boundsX;
+    int boundsY;
+    int boundsWidth;
+    int boundsHeight;
+    int bindingGeneration;
 
     public HudLayer() {
         this.controls = new List<Control>();
         this.visible = true;
+        this.useDefaultBounds = true;
     }
 
     // 输入顺序与合成一致：HUD 后加者在上，其下才是宿主原来的内容树。
     // 只查询现有树，不收养/重排内容节点，也不让透明 HUD 空区吞掉世界输入。
-    Control HitTest(int x, int y, int pointerType) {
+    Control HitTest(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (this.visible && this.controls != null) {
             for (int i = this.controls.Count - 1; i >= 0; i--) {
                 Control control = this.controls[i];
                 if (control != null && control.visible) {
-                    Control hit = control.HitTest(x, y, pointerType);
+                    Control hit = control.HitTest(x, y, pointerType, excludedSubtrees);
                     if (hit != null) { return hit; }
                 }
             }
@@ -33,16 +42,39 @@ public class HudLayer {
         return null;
     }
 
-    void BindInputRoot(App app) {
+    public void Bind(App app) {
+        if (app == null || !app.isRunning) { return; }
+        bindingGeneration = bindingGeneration + 1;
+        int generation = bindingGeneration;
+        if (this.inputApp != app) {
+            if (this.preparation != null) { this.preparation.RetireViews(); }
+            if (this.inputRoot != null) { this.inputRoot.Detach(); }
+            if (generation != bindingGeneration) { return; }
+            this.inputApp = app;
+        }
+        if (!this.visible) { return; }
         if (this.inputRoot == null) { this.inputRoot = new HudInputRoot(this); }
         this.inputRoot.Bind(app);
+        if (generation != bindingGeneration || this.inputApp != app || !this.visible
+        || !this.inputRoot.IsBoundTo(app)) { return; }
+        if (this.preparation == null) { this.preparation = new HudInputPreparation(this); }
+        this.preparation.Bind(app);
+        this.preparation.LayoutNow(app);
     }
 
     // Update fallback without displacing already-bound HUD or Layer adapters.
     public bool SetContentRoot(App app, Control root) {
         if (app == null || root is InputRootAdapter) { return false; }
-        this.BindInputRoot(app);
-        return this.inputRoot.SetContentRoot(root);
+        this.Bind(app);
+        if (!this.visible) { app.SetRootControl(root); return app.rootControl == root; }
+        return this.inputRoot != null && this.inputRoot.IsBoundTo(app) && this.inputRoot.SetContentRoot(root);
+    }
+
+    public int BoundsX(App app) { return useDefaultBounds ? 0 : boundsX; }
+    public int BoundsY(App app) { return useDefaultBounds ? app.ContentTop() : boundsY; }
+    public int BoundsWidth(App app) { return useDefaultBounds ? app.ClientWidth() : boundsWidth; }
+    public int BoundsHeight(App app) {
+        return useDefaultBounds ? app.ClientHeight() - app.ContentTop() : boundsHeight;
     }
 
     // HUD 是否可见。
@@ -52,11 +84,16 @@ public class HudLayer {
 
     // 设置 HUD 显示/隐藏。
     public void SetVisible(bool v) {
-        if (!v && this.inputRoot != null) { this.inputRoot.Detach(); }
+        if (this.visible == v) { return; }
         this.visible = v;
+        bindingGeneration = bindingGeneration + 1;
+        if (!v) {
+            if (this.preparation != null) { this.preparation.RetireViews(); }
+            if (this.inputRoot != null) { this.inputRoot.Detach(); }
+        } else if (this.inputApp != null) { this.Bind(this.inputApp); }
     }
 
-    bool ContainsControl(Control control) {
+    public bool ContainsControl(Control control) {
         if (control == null) { return false; }
         for (int i = 0; i < this.controls.Count; i = i + 1) {
             if (this.controls[i].ContainsInputControl(control)) { return true; }
@@ -74,15 +111,37 @@ public class HudLayer {
     }
 
     void ReleaseInput(App app) {
-        for (int i = 0; i < this.controls.Count; i = i + 1) {
-            app.ReleaseInputSubtree(this.controls[i]);
+        int generation = bindingGeneration;
+        List<Control> snapshot = new List<Control>();
+        for (int i = 0; i < this.controls.Count; i = i + 1) { snapshot.Add(this.controls[i]); }
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            if (generation != bindingGeneration || this.inputApp != app) { return; }
+            app.ReleaseInputSubtree(snapshot[i]);
         }
+    }
+
+    // App-space region, consumed by the existing view scopes before input and paint.
+    public void SetBounds(int x, int y, int width, int height) {
+        this.useDefaultBounds = false;
+        this.boundsX = x;
+        this.boundsY = y;
+        this.boundsWidth = width > 0 ? width : 0;
+        this.boundsHeight = height > 0 ? height : 0;
+    }
+
+    public void UseDefaultBounds() {
+        this.useDefaultBounds = true;
     }
 
     // 挂载一个 GUI 控件至 HUD 层。
     public void Add(Control control) {
         if (control != null) {
             this.controls.Add(control);
+            if (this.preparation != null && this.inputApp != null) {
+                // A newly registered scope has no proof in the already-prepared frame.
+                this.inputApp.InvalidatePreparation();
+                this.preparation.Bind(this.inputApp);
+            }
         }
     }
 
@@ -91,8 +150,10 @@ public class HudLayer {
         if (control == null) { return false; }
         int idx = this.controls.IndexOf(control);
         if (idx >= 0) {
-            if (this.inputRoot != null) { this.inputRoot.ReleaseInput(control); }
+            // Commit membership before focus/cancel callbacks can re-enter Add/Remove/Clear.
             this.controls.RemoveAt(idx);
+            if (this.preparation != null) { this.preparation.Remove(control); }
+            if (this.inputRoot != null) { this.inputRoot.ReleaseInput(control); }
             return true;
         }
         return false;
@@ -100,12 +161,17 @@ public class HudLayer {
 
     // 清空所有 HUD 控件。
     public void Clear() {
-        if (this.inputRoot != null) {
-            for (int i = 0; i < this.controls.Count; i = i + 1) {
-                this.inputRoot.ReleaseInput(this.controls[i]);
-            }
+        List<Control> previous = this.controls;
+        this.controls = new List<Control>();
+        if (this.preparation != null) { this.preparation.RetireViews(); }
+        App app = this.inputApp;
+        int generation = bindingGeneration;
+        if (app == null) { return; }
+        for (int i = 0; i < previous.Count; i = i + 1) {
+            if (generation != bindingGeneration || this.inputApp != app) { return; }
+            Control root = previous[i];
+            if (this.controls.IndexOf(root) < 0) { app.ReleaseInputSubtree(root); }
         }
-        this.controls.Clear();
     }
 
     // 当前挂载的控件数量。
@@ -113,37 +179,23 @@ public class HudLayer {
         return this.controls.Count;
     }
 
-    // 在游戏画面渲染完成后调用，将 HUD 控件分层叠画至画布上。
-    // 支持自动根据视口大小（vw x vh）执行弹性盒/浮动锚点布局后绘制。
-    //
-    // 布局在这一层做（Measure + Arrange）而不是交给项目：控件没排过版
-    // 就 RenderTree，等于画一棵没有尺寸的树——设置浮层这类"根填满窗口
-    // + 内部居中"的结构整层是空的，**Esc 打开等于没打开**。项目侧
-    // 再排一次是重复劳动，且十个游戏各写一遍还会各写各的。
-    public void Render(App app, Canvas canvas) {
-        int top = app.ContentTop();
-        this.RenderIn(app, 0, top, app.ClientWidth(), app.ClientHeight() - top);
-    }
-
-    // 编辑器停靠区和嵌入式 HUD 共用同一树的布局、绘制与输入，不重新收养控件。
-    public void RenderIn(App app, int x, int y, int width, int height) {
-        if (!this.visible) { return; }
-        this.BindInputRoot(app);
-        if (this.controls.Count == 0) { return; }
-        if (width < 0) { width = 0; }
-        if (height < 0) { height = 0; }
-        for (int i = 0; i < this.controls.Count; i = i + 1) {
-            Control c = this.controls[i];
-            if (c != null && c.visible) {
-                c.MeasureTree(app);
-                c.Arrange(x, y, width, height);
-                c.RenderTree(app);
-            }
+    // Bind and configure bounds before the shared App preparation. Painting only
+    // consumes that borrowed tree; it never reinstalls a hidden or detached adapter.
+    public void Paint(App app) {
+        if (!this.PaintCurrent(app)) { return; }
+        int generation = bindingGeneration;
+        List<Control> prepared = this.controls;
+        for (int i = 0; i < prepared.Count; i = i + 1) {
+            Control c = prepared[i];
+            if (c != null && c.visible) { c.RenderTree(app); }
+            if (generation != bindingGeneration || prepared != this.controls || !this.PaintCurrent(app)) { return; }
         }
     }
 
-    // 视口尺寸感知渲染：自动针对指定尺寸视口（如 1920x1080）执行 Arrange 与绘制。
-    public void RenderViewport(App app, Canvas canvas, int vw, int vh) {
-        this.RenderIn(app, 0, 0, vw, vh);
+    bool PaintCurrent(App app) {
+        if (app == null || !this.visible || this.inputApp != app || this.inputRoot == null
+        || !this.inputRoot.IsBoundTo(app) || !app.ContinuePreparedFrame()) { return false; }
+        InputRootAdapter root = app.rootControl is InputRootAdapter ? (InputRootAdapter)app.rootControl : null;
+        return root != null && root.ContainsAdapter(this.inputRoot);
     }
 }

@@ -1,0 +1,284 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Tools.GameAsset;
+
+class GameAssetRetainedWitness {
+    public weak GameAssetToolView View;
+    public weak GameAssetModel Model;
+    public weak Control Root;
+    public weak App Host;
+    public Button Orphan;
+}
+
+class GameAssetRetainedHooks {
+    public weak GameAssetToolView View;
+    public weak App Target;
+    public bool Rebind;
+    public bool ShowAgain;
+    public bool RedirectTab;
+    public int Cancels;
+    public int Renewals;
+    public void NextPage() { if (View != null) { Renewals = Renewals + 1; View.SelectTab(2); } }
+    public void ReplaceHost() { if (View != null) { Renewals = Renewals + 1; View.Bind(Target); } }
+
+    public void Cancel(Control sender, RoutedEventArgs e) {
+        if (e.eventName != "PointerCancel" || View == null) { return; }
+        Cancels = Cancels + 1;
+        if (Rebind) { Rebind = false; View.Bind(Target); }
+        if (ShowAgain) { ShowAgain = false; View.Show(); }
+        if (RedirectTab) { RedirectTab = false; View.SelectTab(2); }
+    }
+    public void Hide() { if (View != null) { Renewals = Renewals + 1; View.Hide(); } }
+}
+
+class GameAssetToolRetainedInputTest {
+    static void Check(bool ok, string label) { if (!ok) { throw new Exception(label); } }
+    static void Drain(App app) {
+        app.DrainPosts();
+        while (true) { Action action = Dispatcher.Take(); if (action == null) { return; } action(); }
+    }
+    static void Send(App app, int kind, int x, int y, int key) {
+        app.ProcessOffscreenInput(kind, x, y, 0, key, 0, 0); Drain(app);
+    }
+    static void Prepare(App app) { Send(app, 1, 1, 1, 0); }
+    static void ClickAt(App app, int x, int y) { Send(app, 2, x, y, 0); Send(app, 3, x, y, 0); }
+    static void Click(App app, Control control) {
+        int frame = app.FrameSeq();
+        // A previous Up may switch the page in EndLoopTurn. Its newly visible
+        // controls are laid out by the next input prepare, not by the old Up.
+        // Drive that real turn before reading the next target's coordinates.
+        Prepare(app);
+        Check(app.FrameSeq() == frame, "Click preparation must not Paint");
+        Check(control != null && control.bw > 0 && control.bh > 0,
+        "production control arranged before real click");
+        ClickAt(app, control.bx + control.bw / 2, control.by + control.bh / 2);
+    }
+    static SelectBoxOptionButton Option(Control root, int index) {
+        if (root == null) { return null; }
+        if (root is SelectBoxOptionButton) {
+            SelectBoxOptionButton row = (SelectBoxOptionButton)root;
+            if (row.OptionIndex == index) { return row; }
+        }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            SelectBoxOptionButton found = Option(root.ChildAt(i), index);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static void Choose(App app, SelectBox box, int index) {
+        Click(app, box);
+        Check(box.IsOpen() && app.overlayHost != null, "real SelectBox opens without Paint");
+        SelectBoxOptionButton option = Option(app.overlayHost.ActiveRoot(), index);
+        Check(option != null && option.bw > 0, "standard popup option prepared without Paint");
+        Click(app, option);
+        Check(box.Selected() == index && !box.IsOpen(), "real routed option commits once");
+    }
+    static void Edit(App app, Input input, int ch) {
+        Click(app, input);
+        Check(input.IsFocused(app), "retained editor gets actual focus without Paint");
+        Send(app, 6, 0, 0, ch);
+    }
+    static void Paint(App app, GameAssetToolView view) {
+        app.BeginOffscreenFrame();
+        Check(app.PrepareStandardHostFrame() && app.ContinuePreparedFrame(), "production frame prepares");
+        view.Render(app); view.Render(app);
+        Check(app.ContinuePreparedFrame(), "read-only Paint preserves preparation");
+        app.EndOffscreenFrame();
+    }
+    static Control FindAction(Control root, string text) {
+        if (root is Button && ((Button)root).Label() == text) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = FindAction(root.ChildAt(i), text); if (found != null) { return found; }
+        }
+        return null;
+    }
+
+    static void InputAndGeometry() {
+        App app = App.CreateOffscreen("asset retained editor", 1600, 1000);
+        GameAssetToolView view = new GameAssetToolView(app); GameAssetModel model = view.Model();
+        model.AnimPlaying = false;
+        int initialFrame = app.FrameSeq();
+        // Neither an explicit prepare nor a Paint precedes this real Down.
+        ClickAt(app, 36, 36);
+        Check(view.IsReady() && view.Root().bw == 1600, "first input prepares early registered production view");
+        Control root = view.Root(); Input original = view.SpriteInput(0);
+        Control editor = root.ChildAt(0); Control body = editor.ChildAt(0);
+        Control output = body.ChildAt(2); Control outputColumn = output.ChildAt(0);
+        TextArea json = (TextArea)outputColumn.ChildAt(outputColumn.ChildCount() - 1);
+        string geometry = " root=" + Convert.ToString(root.bw) + "x" + Convert.ToString(root.bh)
+        + " editor=" + Convert.ToString(editor.bw) + "x" + Convert.ToString(editor.bh)
+        + " body=" + Convert.ToString(body.bw) + "x" + Convert.ToString(body.bh)
+        + " output=" + Convert.ToString(output.bw) + "x" + Convert.ToString(output.bh)
+        + " column=" + Convert.ToString(outputColumn.bw) + "x" + Convert.ToString(outputColumn.bh)
+        + " json=" + Convert.ToString(json.bw) + "x" + Convert.ToString(json.bh)
+        + " minimumHeight=" + Convert.ToString(app.Scale(100));
+        Check(json.bw > 0 && json.bh > app.Scale(100),
+        "JSON output has readable geometry before Paint:" + geometry);
+        Check(json.GetText().Length > 0, "JSON output text is nonempty before Paint");
+        Check(json.GetText() == model.ExportedJsonText,
+        "JSON output matches current model before Paint: actualLength=" + Convert.ToString(json.GetText().Length)
+        + " modelLength=" + Convert.ToString(model.ExportedJsonText.Length));
+        Edit(app, original, 88);
+        Check(model.SpriteModel == original.GetText() && model.SpriteModel.Contains("X")
+        && model.ExportedJsonText.Contains(model.SpriteModel), "real character commits sprite model before Paint");
+        Choose(app, view.ActionSelect(), 2);
+        Check(model.SpriteAction == "Attack", "actual action selector routes business Change");
+        Choose(app, view.DirectionSelect(), 4);
+        Check(model.SelectedDir8 == 4, "actual direction selector routes before Paint");
+        Click(app, view.StepButton());
+        Check(model.AnimCurrentFrame == 1 && !model.AnimPlaying, "actual playback step routes once");
+        int frame = model.AnimCurrentFrame;
+        Click(app, view.Tab(1));
+        Check(model.CurrentTab == 1 && !original.IsFocused(app) && view.Root() == root,
+        "page change retires old editor focus while preserving tree");
+        Choose(app, view.PartSelect(), 4);
+        Check(model.SelectedPartIndex == 4, "paperdoll part selection uses production selector");
+        int depth = model.PaperdollParts[4].DepthPerDir[0];
+        Control increment = FindAction(view.Root(), "+");
+        Check(increment != null, "paperdoll increment exists in retained standard tree");
+        Click(app, increment);
+        Check(model.PaperdollParts[4].DepthPerDir[0] == depth + 5, "retained increment edits selected depth once");
+        Edit(app, view.DepthInput(0), 49);
+        Check(model.PaperdollParts[4].DepthPerDir[0] == ToolUtil.ToInt(view.DepthInput(0).GetText(), 0),
+        "depth text editor commits through real Change");
+        Click(app, view.Tab(2));
+        Edit(app, view.AtlasInput(0), 89);
+        Check(model.AtlasName == view.AtlasInput(0).GetText(), "atlas name edit commits before Paint");
+        view.AtlasInput(1).SetText("64"); Click(app, view.CalculateButton());
+        Check(model.AtlasFrameW == 64 && model.ExportedJsonText.Contains("\"frameWidth\":64"),
+        "calculate action reads actual retained parameter editor");
+        Check(app.FrameSeq() == initialFrame, "all editor actions above occur with no Paint");
+        string export = model.ExportedJsonText; int tab = model.CurrentTab;
+        Paint(app, view); Paint(app, view);
+        Check(view.Root() == root && view.SpriteInput(0) == original && model.ExportedJsonText == export
+        && model.CurrentTab == tab && model.AnimCurrentFrame == frame, "repeated Paint preserves identity and business state");
+        int resizeFrame = app.FrameSeq();
+        app.SetOffscreenViewport(1800, 1100, 150); Prepare(app);
+        int physicalWidth = app.Scale(1800); int physicalHeight = app.Scale(1100);
+        Check(app.canvas.Width() == physicalWidth && app.canvas.Height() == physicalHeight,
+        "logical resize viewport projects to physical canvas at current DPI");
+        Check(view.IsReady() && root.bx == 0 && root.by == app.ContentTop()
+        && root.bw == app.canvas.Width() && root.bh == app.canvas.Height() - app.ContentTop(),
+        "resize and DPI use current host bounds before input");
+        Check(app.FrameSeq() == resizeFrame, "resize preparation must not Paint");
+        Click(app, view.Tab(0)); Edit(app, original, 90);
+        Check(model.SpriteModel == original.GetText(), "input continues at resized retained coordinates");
+        int current = model.CurrentTab;
+        view.SetBounds(120, 80, 1600, 900, new Rect(120, 80, 1600, 1)); Prepare(app);
+        Click(app, view.Tab(3));
+        Check(model.CurrentTab == current && !original.IsFocused(app), "clip shares drawing and input and retires focus");
+        view.SetBounds(120, 80, 1600, 900, new Rect(120, 80, 1600, 900)); Prepare(app);
+        Click(app, view.Tab(3));
+        Check(model.CurrentTab == 3, "restored current clipping accepts retained navigation");
+        model.CurrentTab = 2; Prepare(app);
+        Check(view.AtlasInput(0).StyleVisible() && view.IsReady() && model.ExportedJsonText.Contains("atlasName"),
+        "prepare reconciles current model active page without Paint");
+        Click(app, view.AtlasInput(0));
+        view.SetBounds(120, 80, 0, 0, new Rect(120, 80, 0, 0)); Prepare(app);
+        Check(!view.IsReady() && !view.AtlasInput(0).IsFocused(app) && app.GetCapturedPointer() == null,
+        "zero-size host retires focus and capture without Paint");
+        view.Retire(); app.StopLoop(); Drain(app); app.canvas.Destroy();
+    }
+
+    static void TilesAndReentry() {
+        App app = App.CreateOffscreen("asset map old host", 1600, 1000);
+        App target = App.CreateOffscreen("asset map rebound host", 1700, 1000);
+        Control oldFallback = new Control(); app.SetRootControl(oldFallback);
+        Control newFallback = new Control(); target.SetRootControl(newFallback);
+        GameAssetToolView view = new GameAssetToolView(app); GameAssetModel model = view.Model();
+        model.AnimPlaying = false; view.SelectTab(3); Prepare(app);
+        Choose(app, view.BrushSelect(), 3);
+        GameAssetPreview map = view.Preview(3);
+        int x = map.bx + map.bw / 2; int y = map.by + app.Scale(90);
+        Check(map.TileAt(app, x, y) == 0, "diamond hit uses the current retained preview geometry");
+        Send(app, 2, x, y, 0);
+        Check(app.GetCapturedPointer() == map && model.TileGrid[0] == 3, "real map Down paints and captures before Paint");
+        Send(app, 1, x + app.Scale(32), y + app.Scale(16), 0);
+        Send(app, 3, x + app.Scale(64), y + app.Scale(32), 0);
+        Check(model.TileGrid[1] == 3 && model.TileGrid[2] == 3 && app.GetCapturedPointer() == null,
+        "map Move and final Up coordinates commit without Paint");
+        int frame = app.FrameSeq(); string export = model.ExportedJsonText;
+        Paint(app, view); Paint(app, view);
+        Check(model.ExportedJsonText == export && app.FrameSeq() > frame, "map Paint never replays brush mutation");
+        GameAssetRetainedHooks hooks = new GameAssetRetainedHooks(); hooks.View = view; hooks.Target = target;
+        map.OnRouted(hooks.Cancel);
+        Send(app, 2, x, y, 0); hooks.RedirectTab = true;
+        view.SelectTab(1);
+        Check(hooks.Cancels == 1 && model.CurrentTab == 2 && model.ExportedJsonText.Contains("atlasName"),
+        "cancel reentry page selection wins over older SelectTab tail");
+        view.SelectTab(3); Prepare(app);
+        x = map.bx + map.bw / 2; y = map.by + app.Scale(90);
+        Send(app, 2, x, y, 0); hooks.ShowAgain = true; view.Hide();
+        Prepare(app);
+        Check(view.IsReady() && app.rootControl.ContainsInputControl(map), "cancel reentry Show wins over Hide tail");
+        Send(app, 2, x, y, 0); hooks.Rebind = true; view.Hide();
+        Prepare(target);
+        Check(app.rootControl == oldFallback && map.FindApp() == target
+        && target.rootControl.ContainsInputControl(map) && view.IsReady(),
+        "cancel reentry host replacement survives old input cleanup");
+        x = map.bx + map.bw / 2; y = map.by + target.Scale(90);
+        Send(target, 2, x, y, 0);
+        Check(target.GetCapturedPointer() == map, "replacement host receives real map capture");
+        UiViewScope scope = view.Scope(); view.Retire(); view.Retire();
+        Check(!scope.IsActive() && target.GetCapturedPointer() == null && target.rootControl == newFallback,
+        "idempotent retire releases current capture and restores exact fallback");
+        app.StopLoop(); target.StopLoop(); Drain(app); Drain(target); app.canvas.Destroy(); target.canvas.Destroy();
+    }
+
+    static void LateActionsAndClose() {
+        App app = App.CreateOffscreen("asset queued actions", 1600, 1000);
+        GameAssetToolView view = new GameAssetToolView(app); view.Model().AnimPlaying = false; Prepare(app);
+        GameAssetRetainedHooks hooks = new GameAssetRetainedHooks(); hooks.View = view;
+        Button step = view.StepButton(); int x = step.bx + step.bw / 2; int y = step.by + step.bh / 2;
+        Send(app, 2, x, y, 0);
+        Check(app.GetCapturedPointer() == step, "real Down establishes production button capture");
+        app.Post(hooks.Hide);
+        Send(app, 3, x, y, 0);
+        Check(hooks.Renewals == 1 && view.Model().AnimCurrentFrame == 0,
+        "FIFO Hide before queued production Click invalidates the old action");
+        view.Show(); Prepare(app); Click(app, step);
+        Check(view.Model().AnimCurrentFrame == 1, "new visible session receives current action");
+        Send(app, 2, x, y, 0); app.Post(hooks.NextPage); Send(app, 3, x, y, 0);
+        Check(view.Model().CurrentTab == 2 && view.Model().AnimCurrentFrame == 1,
+        "FIFO page change invalidates old queued playback action");
+        view.SelectTab(0); Prepare(app);
+        App target = App.CreateOffscreen("asset queued replacement", 1600, 1000); hooks.Target = target;
+        Send(app, 2, x, y, 0); app.Post(hooks.ReplaceHost); Send(app, 3, x, y, 0);
+        Check(view.Model().AnimCurrentFrame == 1 && view.Root().FindApp() == target,
+        "FIFO host replacement retires old queued scope action");
+        Prepare(target); Click(target, step);
+        Check(view.Model().AnimCurrentFrame == 2, "replacement scope accepts fresh routed Click");
+        Edit(target, view.SpriteInput(0), 81);
+        UiViewScope scope = view.Scope(); target.StopLoop();
+        Check(!scope.IsActive() && target.GetCapturedPointer() == null && !view.SpriteInput(0).IsFocused(target),
+        "window Stop retires scope, focus and capture synchronously");
+        int frame = view.Model().AnimCurrentFrame;
+        step.Click.Post(); Drain(target);
+        Check(view.Model().AnimCurrentFrame == frame, "late retired subscription is inert");
+        view.Retire(); app.StopLoop(); app.canvas.Destroy(); target.canvas.Destroy();
+    }
+
+    static void WeakLifetime(GameAssetRetainedWitness witness) {
+        App app = App.CreateOffscreen("asset weak owner", 1600, 1000);
+        GameAssetToolView view = new GameAssetToolView(app); view.Model().AnimPlaying = false;
+        Prepare(app); Paint(app, view);
+        witness.View = view; witness.Model = view.Model(); witness.Root = view.Root(); witness.Host = app;
+        // Keep a real subscribed child after its owner dies. It must not retain
+        // its scope, owner, tree, model or host through an event closure.
+        witness.Orphan = view.StepButton(); view.Root().RemoveAll();
+        app.StopLoop(); Drain(app); app.canvas.Destroy();
+    }
+
+    static void Main() {
+        App frame = App.CreateOffscreen("independent static frame", 8, 8);
+        InputAndGeometry(); TilesAndReentry(); LateActionsAndClose();
+        GameAssetRetainedWitness witness = new GameAssetRetainedWitness(); WeakLifetime(witness);
+        Check(witness.View == null && witness.Model == null && witness.Root == null && witness.Host == null,
+        "production view and host release while subscribed orphan remains alive");
+        witness.Orphan.Click.Raise();
+        Check(witness.View == null && witness.Host == null, "weak late callback is safe after owner release");
+        witness.Orphan = null; frame.StopLoop(); frame.canvas.Destroy();
+        Console.WriteLine("GAME_ASSET_TOOL_RETAINED_INPUT_OK");
+    }
+}

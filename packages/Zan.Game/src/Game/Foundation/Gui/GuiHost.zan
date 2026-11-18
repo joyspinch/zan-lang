@@ -93,38 +93,28 @@ public class GuiHost {
         this.lastTick = Window.GetTickMs();
         loop.Start(this);
         if (this.contentRoot != null) { this.SetContentRoot(this.contentRoot); }
-        this.hud.BindInputRoot(this.app);
+        this.hud.Bind(this.app);
         while (this.running) {
             this.input.BeginFrame();
-            // 帧回调/空唤醒没有输入，不能回退成上一帧挂载的释放事件。
-            this.app.HoldEventKind(0);
             // 无输入时等显示帧，有输入时立即派发；排空阶段始终非阻塞。
             if (!this.app.ProcessEvent()) { this.running = false; break; }
             int drained = 0;
-            int lastEvKind = 0;
 
             if (this.app.lastPollResult == 0) {
-                lastEvKind = this.app.EventIsMine() ? this.app.window.EventKind() : 0;
 
                 this.DispatchKeyEvent(loop);
                 drained = 1;
             }
-            // Standard controls already route each event in the App input pump.
-            // Retain one discrete event per frame for legacy paint-time consumers.
-            while (drained < 32 && (lastEvKind < 2 || lastEvKind > 6)) {
+            // Route every queued input once before advancing the frame.
+            while (drained < 32) {
                 int ev = this.app.PollOneEvent();
                 if (ev < 0) { this.running = false; break; }
                 if (ev == 0) { break; }
-                // 原生事件状态此刻仍有效，记下本帧最后分发的事件 kind。
-                lastEvKind = this.app.EventIsMine() ? this.app.window.EventKind() : 0;
 
                 this.DispatchKeyEvent(loop);
                 drained = drained + 1;
             }
             if (!this.running) { break; }
-            // Compatibility only: paint-time Ui consumers still read the held kind.
-            // Routed controls and GameViewport never replay input from rendering.
-            this.app.HoldEventKind(lastEvKind);
 
 
             // 窗口最小化/不可见（全平台）：完全跳过光栅化与上屏，仅保持逻辑步进并深睡。
@@ -160,6 +150,8 @@ public class GuiHost {
             loop.Update(this, delta);
 
             this.app.BeginFrame();
+            // Optional participants own their geometry; SetContentRoot stays layout-neutral.
+            if (!this.app.PrepareStandardHostFrame()) { continue; }
             // 窗口跟随（全平台）：画布 = 客户区/表面（桌面标题栏原生
             // 通栏固顶、缩放照常重铺），游戏逻辑分辨率经 CDraw 视口
             // 等比铺满内容区——短轴贴设计、长轴延展，任何窗口满铺：
@@ -169,10 +161,13 @@ public class GuiHost {
                                 this.logicalWidth, this.logicalHeight,
                                 CDraw.Argb(255, 24, 24, 28));
             loop.Render(this, this.app.canvas, this.clock.Alpha());
-            this.hud.Render(this.app, this.app.canvas);
+            if (!this.app.ContinuePreparedFrame()) { continue; }
+            this.hud.Paint(this.app);
+            if (!this.app.ContinuePreparedFrame()) { continue; }
             // 标准 Gui 标题栏画在游戏内容之上（内容区从
             // ContentTop() 之下开始）；全屏收起标题栏后自然消失。
             this.app.RenderChrome(this.title);
+            if (!this.app.ContinuePreparedFrame()) { continue; }
 
             this.app.PresentFrame();
             // 连续渲染：游戏每帧都要画，下一圈继续出帧。

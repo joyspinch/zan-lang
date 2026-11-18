@@ -1,0 +1,461 @@
+using System;
+using System.IO;
+using System.Json;
+using Gui;
+using Gui.Backend;
+
+namespace Tools.GameAsset;
+
+// Business state is independent of the retained tree and painting.
+class GameAssetModel {
+    public int CurrentTab = 0; // 0: 5向/8向动作, 1: 纸娃娃层深, 2: 图集打包, 3: 等轴测瓦片
+    public string StatusMsg = "就绪 - 游戏素材管理工作台";
+
+    // ---- Tab 0: 5向/8向动作序列帧数据 ----
+    public string SpriteModel = "Warrior_Male";
+    public string SpriteAction = "Walk";
+    public int SpriteFrameCount = 6;
+    public int SpriteFrameWidth = 128;
+    public int SpriteFrameHeight = 128;
+    public int SpriteFps = 10;
+    public int SelectedDir8 = 2; // 0: East, 1: SouthEast, 2: South, 3: SouthWest, 4: West, 5: NorthWest, 6: North, 7: NorthEast
+    public bool AnimPlaying = true;
+    public int AnimCurrentFrame = 0;
+    public long LastAnimTick = 0;
+
+    // ---- Tab 1: 纸娃娃层深矩阵数据 ----
+    public List<PaperdollPart> PaperdollParts;
+    public int SelectedPartIndex = 0;
+    public int PaperdollDir8 = 2; // 默认朝南
+
+    // ---- Tab 2: 纹理图集紧凑打包数据 ----
+    public string AtlasName = "hero_spritesheet";
+    public int AtlasFrameW = 128;
+    public int AtlasFrameH = 128;
+    public int AtlasTotalFrames = 30; // 5 方向 x 6 帧
+    public int AtlasResultWidth = 1024;
+    public int AtlasResultHeight = 512;
+    public int AtlasResultCols = 8;
+    public int AtlasResultRows = 4;
+    public int HoveredAtlasFrame = -1;
+
+    // ---- Tab 3: 等轴测 2:1 菱形地砖切片数据 ----
+    public int TileWidth = 64;
+    public int TileHeight = 32;
+    public int TileCols = 8;
+    public int TileRows = 8;
+    public int[] TileGrid; // 0: 平地, 1: 障碍, 2: 透明遮挡, 3: 刷怪点
+    public int TileBrush = 1; // 默认画障碍
+
+    // 导出的 JSON 文本缓冲区
+    public string ExportedJsonText = "";
+
+    public GameAssetModel() {
+        // 2. 初始化纸娃娃部件与层深
+        PaperdollParts = new List<PaperdollPart>();
+        // 朝向定义：0:E, 1:SE, 2:S(正面), 3:SW, 4:W, 5:NW, 6:N(背面), 7:NE
+        // 翅膀：正面在后(-20)，背面在外覆盖后背(+30)
+        PaperdollParts.Add(new PaperdollPart("wing", "翅膀 (Wing)", (int)0xFF9C27B0, new int[] { -10, -15, -20, -15, -10, 20, 30, 20 }));
+        // 身体：基准层 (0)
+        PaperdollParts.Add(new PaperdollPart("body", "身体 (Body)", (int)0xFF2196F3, new int[] { 0, 0, 0, 0, 0, 0, 0, 0 }));
+        // 衣服：贴身覆盖身体 (+5)
+        PaperdollParts.Add(new PaperdollPart("cloth", "重铠 (Cloth)", (int)0xFF4CAF50, new int[] { 5, 5, 5, 5, 5, -5, -5, -5 }));
+        // 发型/头盔：头部上方 (+8)
+        PaperdollParts.Add(new PaperdollPart("hair", "头盔 (Hair)", (int)0xFFFF9800, new int[] { 8, 8, 8, 8, 8, 10, 10, 10 }));
+        // 武器：正面握在胸前最外层(+10)，背面收在身后被身体阻挡(-30)
+        PaperdollParts.Add(new PaperdollPart("weapon", "武器 (Weapon)", (int)0xFFE91E63, new int[] { 8, 10, 10, 10, 8, -15, -30, -15 }));
+
+        // 3. 计算图集初值
+        CalculateAtlasLayout();
+
+        // 4. 初始化等轴测瓦片网格
+        TileGrid = new int[TileCols * TileRows];
+        for (int i = 0; i < TileGrid.Length; i = i + 1) {
+            TileGrid[i] = 0; // 平地
+        }
+        // 默认放几个障碍测试
+        TileGrid[2 * TileCols + 3] = 1;
+        TileGrid[2 * TileCols + 4] = 1;
+        TileGrid[2 * TileCols + 5] = 1;
+        TileGrid[4 * TileCols + 2] = 2; // 透明掩码
+
+        UpdateJsonExport();
+    }
+
+    public void DrawStageBackground(Canvas c, int x, int y, int w, int h) {
+        c.FillRect(x, y, w, h, (int)0xFF1B1E24);
+        // 绘制微弱点阵或网格线
+        int step = 32;
+        int gridColor = (int)0xFF232730;
+        for (int gx = x; gx < x + w; gx = gx + step) {
+            c.DrawLine(gx, y, gx, y + h, gridColor, 1);
+        }
+        for (int gy = y; gy < y + h; gy = gy + step) {
+            c.DrawLine(x, gy, x + w, gy, gridColor, 1);
+        }
+    }
+
+    public void DrawIsoDiamond(Canvas c, int cx, int cy, int w, int h, int fillCol, int borderCol) {
+        int hw = w / 2;
+        int hh = h / 2;
+        // 菱形四点: top(cx, cy-hh), right(cx+hw, cy), bottom(cx, cy+hh), left(cx-hw, cy)
+        // 简易绘制填充
+        for (int dy = -hh; dy <= hh; dy = dy + 1) {
+            int spanW = (int)((double)hw * (1.0 - (double)Math.Abs(dy) / (double)hh));
+            if (spanW > 0) {
+                c.FillRect(cx - spanW, cy + dy, spanW * 2, 1, fillCol);
+            }
+        }
+        c.DrawLine(cx, cy - hh, cx + hw, cy, borderCol, 1);
+        c.DrawLine(cx + hw, cy, cx, cy + hh, borderCol, 1);
+        c.DrawLine(cx, cy + hh, cx - hw, cy, borderCol, 1);
+        c.DrawLine(cx - hw, cy, cx, cy - hh, borderCol, 1);
+    }
+
+    public void DrawDirectionCompass(Canvas c, int cx, int cy, int dir8) {
+        double[] angles = new double[] { 0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0 };
+        double rad = angles[dir8] * 3.14159265 / 180.0;
+        int r = 70;
+        int tx = cx + (int)(Math.Cos(rad) * (double)r);
+        int ty = cy + (int)(Math.Sin(rad) * (double)(r / 2)); // 2:1 扁平感
+
+        c.DrawLine(cx, cy, tx, ty, (int)0xFF00E676, 2);
+        c.FillCircle(tx, ty, 5, (int)0xFF00E676);
+    }
+
+    public void DrawCharacterSilhouette(Canvas c, int cx, int cy, int dir8, bool mirror, int frame, string action) {
+        // 基础动画位移参数
+        int bob = (frame % 2 == 1) ? -4 : 0;
+        if (action == "Attack") {
+            bob = (frame == 2 || frame == 3) ? -8 : 0;
+        }
+
+        int bodyY = cy + bob;
+        int flipSign = mirror ? -1 : 1;
+
+        // 头部
+        c.FillCircle(cx, bodyY - 45, 14, (int)0xFFFFCC80);
+        // 头盔/发型
+        c.FillRect(cx - 15, bodyY - 60, 30, 12, (int)0xFFFF9800);
+
+        // 躯干 (Cloth / Armor)
+        c.FillRoundRect(cx - 18, bodyY - 30, 36, 40, 4, (int)0xFF4CAF50);
+
+        // 翅膀 (根据朝向决定是在身体后面还是前面)
+        bool wingInFront = (dir8 == 5 || dir8 == 6 || dir8 == 7); // 背向时翅膀在外层
+        int wingColor = (int)0x809C27B0; // 半透紫
+
+        if (!wingInFront) {
+            c.FillRoundRect(cx - 45, bodyY - 40, 90, 24, 6, wingColor);
+        }
+
+        // 双腿
+        int legOffset = (frame % 4 < 2) ? 6 : -6;
+        c.FillRect(cx - 12 + legOffset, bodyY + 10, 8, 26, (int)0xFF37474F);
+        c.FillRect(cx + 4 - legOffset, bodyY + 10, 8, 26, (int)0xFF263238);
+
+        // 武器手持方向
+        int weaponX = cx + flipSign * 24;
+        int weaponY = bodyY - 10;
+        if (action == "Attack") {
+            weaponX = cx + flipSign * (30 + frame * 4);
+            weaponY = bodyY - 10 - frame * 3;
+        }
+
+        // 武器巨剑
+        c.FillRect(weaponX - 3, weaponY - 35, 6, 45, (int)0xFFE91E63);
+        c.FillRect(weaponX - 8, weaponY - 5, 16, 4, (int)0xFFFFD54F);
+
+        if (wingInFront) {
+            // 背面视角：翅膀绘制在最外层
+            c.FillRoundRect(cx - 50, bodyY - 38, 100, 26, 6, (int)0xD09C27B0);
+        }
+    }
+
+    public void DrawFrameFilmStrip(Canvas c, int x, int y, int w, int h, int curFrame, int totalFrames) {
+        c.FillRoundRect(x, y, w, h, 4, (int)0xFF22262E);
+        c.DrawRoundRect(x, y, w, h, 4, (int)0xFF383D48, 1);
+
+        int cellW = w / totalFrames;
+        for (int f = 0; f < totalFrames; f = f + 1) {
+            int fx = x + f * cellW;
+            bool isCurrent = f == curFrame;
+            if (isCurrent) {
+                c.FillRoundRect(fx + 2, y + 2, cellW - 4, h - 4, 3, (int)0xFF1976D2);
+            }
+            c.DrawRoundRect(fx + 2, y + 2, cellW - 4, h - 4, 3, (int)0xFF454B58, 1);
+            c.DrawTextCentered(fx, y, cellW, h, ToolUtil.FromInt(f + 1), isCurrent ? (int)0xFFFFFFFF : (int)0xFFB0B3B8, 12);
+        }
+    }
+
+    public void DrawPaperdollStack(Canvas c, int cx, int cy, int dir8) {
+        // 展示纸娃娃各图层沿 Z 轴的相对排列剖面图
+        c.DrawTextCentered(cx - 200, cy - 140, 400, 24, "【朝向 " + ToolUtil.FromInt(dir8) + "】部件实际层深渲染堆叠剖面", (int)0xFFFFFFFF, 14);
+
+        // 收集并排序
+        List<PaperdollPart> sorted = new List<PaperdollPart>();
+        for (int i = 0; i < PaperdollParts.Count; i = i + 1) {
+            sorted.Add(PaperdollParts[i]);
+        }
+
+        // 插入排序
+        for (int i = 1; i < sorted.Count; i = i + 1) {
+            PaperdollPart key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j].DepthPerDir[dir8] > key.DepthPerDir[dir8]) {
+                sorted[j + 1] = sorted[j];
+                j = j - 1;
+            }
+            sorted[j + 1] = key;
+        }
+
+        // 从后往前绘制堆叠卡片
+        int startY = cy + 60;
+        int layerH = 34;
+        for (int i = 0; i < sorted.Count; i = i + 1) {
+            PaperdollPart p = sorted[i];
+            int ly = startY - i * layerH;
+            int lw = 260;
+            int lx = cx - lw / 2;
+
+            c.FillRoundRect(lx, ly, lw, layerH - 4, 4, (int)0xFF2A2E39);
+            c.FillRoundRect(lx + 4, ly + 4, 10, layerH - 12, 2, p.Color);
+
+            int depth = p.DepthPerDir[dir8];
+            string depthStr = "Depth: " + (depth > 0 ? "+" : "") + ToolUtil.FromInt(depth);
+            string orderStr = "#" + ToolUtil.FromInt(i + 1) + " (最" + (i == 0 ? "底" : (i == sorted.Count - 1 ? "顶" : "中")) + ")";
+
+            c.DrawText(lx + 24, ly + 6, p.Name, (int)0xFFFFFFFF, 12);
+            c.DrawText(lx + 130, ly + 6, depthStr, (int)0xFF00E676, 12);
+            c.DrawText(lx + lw - 55, ly + 6, orderStr, (int)0xFFB0B3B8, 11);
+        }
+    }
+
+    public void DrawAtlasGrid(App a, Canvas c, int x, int y, int w, int h) {
+        c.FillRect(x, y, w, h, (int)0xFF21252D);
+        c.DrawRoundRect(x, y, w, h, 4, (int)0xFF3B404D, 1);
+
+        int cols = AtlasResultCols > 0 ? AtlasResultCols : 1;
+        int rows = AtlasResultRows > 0 ? AtlasResultRows : 1;
+        int cellW = w / cols;
+        int cellH = h / rows;
+
+        for (int r = 0; r < rows; r = r + 1) {
+            for (int col = 0; col < cols; col = col + 1) {
+                int frameIdx = r * cols + col;
+                int cx = x + col * cellW;
+                int cy = y + r * cellH;
+
+                if (frameIdx < AtlasTotalFrames) {
+                    bool isHovered = HoveredAtlasFrame == frameIdx;
+                    int bg = isHovered ? (int)0xFF2E3B52 : (int)0xFF282D37;
+                    c.FillRect(cx + 1, cy + 1, cellW - 2, cellH - 2, bg);
+                    c.DrawRect(cx + 1, cy + 1, cellW - 2, cellH - 2, isHovered ? (int)0xFF00E676 : (int)0xFF3F4554, 1);
+
+                    // 绘制小人形动作剪影
+                    int dir = frameIdx / 6;
+                    int subFrame = frameIdx % 6;
+                    c.FillCircle(cx + cellW / 2, cy + cellH / 2 - 8, 8, (int)0xFFFFCC80);
+                    c.FillRoundRect(cx + cellW / 2 - 10, cy + cellH / 2 + 2, 20, 16, 2, (int)0xFF4CAF50);
+
+                    // 标号与 UV
+                    c.DrawText(cx + 4, cy + 4, "#" + ToolUtil.FromInt(frameIdx), (int)0xFFB0B3B8, 10);
+                    if (isHovered) {
+                        double u0 = (double)(col * AtlasFrameW) / (double)AtlasResultWidth;
+                        double v0 = (double)(r * AtlasFrameH) / (double)AtlasResultHeight;
+                        string uvText = "U:" + ToolUtil.FromInt((int)(u0 * 100)) + "% V:" + ToolUtil.FromInt((int)(v0 * 100)) + "%";
+                        c.DrawText(cx + 4, cy + cellH - 14, uvText, (int)0xFF00E676, 10);
+                    }
+                } else {
+                    // 空余空白显存区域
+                    c.FillRect(cx + 1, cy + 1, cellW - 2, cellH - 2, (int)0xFF1B1D22);
+                    c.DrawTextCentered(cx, cy, cellW, cellH, "(空闲)", (int)0xFF4A4E58, 10);
+                }
+            }
+        }
+    }
+
+    public int CalculateMergedCollidersCount() {
+        // 水平线段合并统计：扫描每行连续的障碍块
+        int count = 0;
+        for (int r = 0; r < TileRows; r = r + 1) {
+            bool inSolid = false;
+            for (int col = 0; col < TileCols; col = col + 1) {
+                int cell = TileGrid[r * TileCols + col];
+                if (cell == 1) {
+                    if (!inSolid) {
+                        count = count + 1;
+                        inSolid = true;
+                    }
+                } else {
+                    inSolid = false;
+                }
+            }
+        }
+        return count;
+    }
+
+    public void CalculateAtlasLayout() {
+        int fw = AtlasFrameW > 0 ? AtlasFrameW : 64;
+        int fh = AtlasFrameH > 0 ? AtlasFrameH : 64;
+        int count = AtlasTotalFrames > 0 ? AtlasTotalFrames : 1;
+
+        int totalArea = fw * fh * count;
+        int side = 256;
+        while ((side * side) < totalArea && side < 4096) {
+            side = side * 2;
+        }
+
+        int cols = side / fw;
+        if (cols < 1) { cols = 1; }
+        int rows = (count + cols - 1) / cols;
+
+        int requiredH = rows * fh;
+        int h = 256;
+        while (h < requiredH && h < 4096) {
+            h = h * 2;
+        }
+
+        AtlasResultWidth = side;
+        AtlasResultHeight = h;
+        AtlasResultCols = cols;
+        AtlasResultRows = rows;
+    }
+
+    public void UpdateJsonExport() {
+        if (CurrentTab == 0) {
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("model", SpriteModel);
+            root.PutStr("action", SpriteAction);
+            root.PutStr("mode", "5DirSymmetricMirror");
+            root.PutInt("frameCount", SpriteFrameCount);
+            root.PutInt("fps", SpriteFps);
+
+            JsonValue dirArr = JsonValue.NewArray();
+            string[] dirNames = new string[] { "East", "SouthEast", "South", "SouthWest", "West", "NorthWest", "North", "NorthEast" };
+            int[] mappedSource = new int[] { 2, 1, 0, 1, 2, 3, 4, 3 };
+            bool[] flipX = new bool[] { false, false, false, true, true, true, false, false };
+
+            for (int i = 0; i < 8; i = i + 1) {
+                JsonValue item = JsonValue.NewObject();
+                item.PutInt("directionIndex", i);
+                item.PutStr("directionName", dirNames[i]);
+                item.PutInt("sourceSliceRow", mappedSource[i]);
+                item.PutBool("flipX", flipX[i]);
+                dirArr.Append(item);
+            }
+            root.Put("directions", dirArr);
+            ExportedJsonText = root.ToJson();
+        } else if (CurrentTab == 1) {
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("kind", "PaperdollConfig");
+            root.PutInt("partCount", PaperdollParts.Count);
+
+            JsonValue partArr = JsonValue.NewArray();
+            for (int i = 0; i < PaperdollParts.Count; i = i + 1) {
+                PaperdollPart p = PaperdollParts[i];
+                JsonValue pj = JsonValue.NewObject();
+                pj.PutStr("id", p.Id);
+                pj.PutStr("name", p.Name);
+
+                JsonValue depths = JsonValue.NewArray();
+                for (int d = 0; d < 8; d = d + 1) {
+                    depths.Append(JsonValue.NewInt(p.DepthPerDir[d]));
+                }
+                pj.Put("depthPerDir", depths);
+                partArr.Append(pj);
+            }
+            root.Put("parts", partArr);
+            ExportedJsonText = root.ToJson();
+        } else if (CurrentTab == 2) {
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("atlasName", AtlasName);
+            root.PutInt("atlasWidth", AtlasResultWidth);
+            root.PutInt("atlasHeight", AtlasResultHeight);
+            root.PutInt("frameWidth", AtlasFrameW);
+            root.PutInt("frameHeight", AtlasFrameH);
+            root.PutInt("cols", AtlasResultCols);
+            root.PutInt("rows", AtlasResultRows);
+            root.PutInt("totalFrames", AtlasTotalFrames);
+
+            JsonValue framesArr = JsonValue.NewArray();
+            for (int i = 0; i < AtlasTotalFrames; i = i + 1) {
+                int c = i % AtlasResultCols;
+                int r = i / AtlasResultCols;
+                int px = c * AtlasFrameW;
+                int py = r * AtlasFrameH;
+                double u0 = (double)px / (double)AtlasResultWidth;
+                double v0 = (double)py / (double)AtlasResultHeight;
+                double u1 = (double)(px + AtlasFrameW) / (double)AtlasResultWidth;
+                double v1 = (double)(py + AtlasFrameH) / (double)AtlasResultHeight;
+
+                JsonValue fj = JsonValue.NewObject();
+                fj.PutInt("id", i);
+                fj.PutInt("px", px);
+                fj.PutInt("py", py);
+                fj.PutDouble("u0", u0);
+                fj.PutDouble("v0", v0);
+                fj.PutDouble("u1", u1);
+                fj.PutDouble("v1", v1);
+                framesArr.Append(fj);
+            }
+            root.Put("frames", framesArr);
+            ExportedJsonText = root.ToJson();
+        } else {
+            JsonValue root = JsonValue.NewObject();
+            root.PutStr("kind", "IsometricTilemap");
+            root.PutInt("tileWidth", TileWidth);
+            root.PutInt("tileHeight", TileHeight);
+            root.PutInt("cols", TileCols);
+            root.PutInt("rows", TileRows);
+
+            JsonValue gridArr = JsonValue.NewArray();
+            for (int i = 0; i < TileGrid.Length; i = i + 1) {
+                gridArr.Append(JsonValue.NewInt(TileGrid[i]));
+            }
+            root.Put("tiles", gridArr);
+
+            // 导出合并后的碰撞体
+            JsonValue collidersArr = JsonValue.NewArray();
+            for (int r = 0; r < TileRows; r = r + 1) {
+                int startCol = -1;
+                for (int col = 0; col < TileCols; col = col + 1) {
+                    if (TileGrid[r * TileCols + col] == 1) {
+                        if (startCol < 0) { startCol = col; }
+                    } else {
+                        if (startCol >= 0) {
+                            JsonValue cj = JsonValue.NewObject();
+                            cj.PutInt("row", r);
+                            cj.PutInt("startCol", startCol);
+                            cj.PutInt("endCol", col - 1);
+                            cj.PutInt("length", col - startCol);
+                            collidersArr.Append(cj);
+                            startCol = -1;
+                        }
+                    }
+                }
+                if (startCol >= 0) {
+                    JsonValue cj = JsonValue.NewObject();
+                    cj.PutInt("row", r);
+                    cj.PutInt("startCol", startCol);
+                    cj.PutInt("endCol", TileCols - 1);
+                    cj.PutInt("length", TileCols - startCol);
+                    collidersArr.Append(cj);
+                }
+            }
+            root.Put("mergedColliders", collidersArr);
+            ExportedJsonText = root.ToJson();
+        }
+    }
+
+    public void SaveCurrentConfig() {
+        string fname = "asset_config.json";
+        if (CurrentTab == 0) { fname = "5dir_mapping_" + SpriteModel + ".json"; }
+        else if (CurrentTab == 1) { fname = "paperdoll_depth_matrix.json"; }
+        else if (CurrentTab == 2) { fname = AtlasName + "_manifest.json"; }
+        else { fname = "iso_tilemap_colliders.json"; }
+
+        File.WriteAllText(fname, ExportedJsonText);
+        StatusMsg = "成功导出配置文件: " + fname;
+    }
+}

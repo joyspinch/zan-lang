@@ -1,0 +1,98 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+class SceneDesignerRetainedInputTest {
+    static void Require(bool condition, string label) {
+        if (!condition) { throw new Exception(label); }
+    }
+    static void Send(App app, int kind, int x, int y, int button) {
+        app.ProcessOffscreenInput(kind, x, y, button, 0, 0, 0); app.DrainPosts();
+    }
+    static void Click(App app, Control control) {
+        int x = control.bx + control.bw / 2; int y = control.by + control.bh / 2;
+        Send(app, 2, x, y, 0); Send(app, 3, x, y, 0);
+    }
+    static Control FindPalette(Control root) {
+        if (root is SceneDesignerPaletteItem) { return root; }
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Control found = FindPalette(root.ChildAt(i));
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+    static void Main() {
+        App app = App.CreateOffscreen("Scene designer retained input", 1280, 900);
+        Control world = new Control("host-world"); app.SetRootControl(world);
+        SceneDesigner designer = new SceneDesigner(); designer.hostPanels = true;
+        designer.InitializeInput(app); designer.InitializeInput(app);
+        Control canvas = designer.CanvasRoot(); Control palette = designer.PaletteRoot();
+        Require(!canvas.Visible && !palette.Visible, "early registration leaves unbounded regions hidden");
+        designer.SetBounds(app, 220, 30, 760, 820);
+        designer.SetHostPanelBounds(app, new Rect(0, 30, 210, 820), new Rect(990, 30, 280, 820));
+        Control paletteItem = FindPalette(palette);
+        Require(paletteItem != null && paletteItem.bw > 0 && canvas.bw > 0,
+            "standard palette and canvas geometry prepared before first paint");
+        int before = designer.doc.Count(); Click(app, paletteItem);
+        Require(designer.doc.Count() == before + 1 && designer.sel != null,
+            "retained palette click adds one element before paint");
+        SceneElement element = designer.sel;
+        int x = designer.canvasOX + designer.DesignLeft(element) * designer.canvasScale / 1000
+            + element.TotalW() * designer.canvasScale / 2000;
+        int y = designer.canvasOY + designer.DesignTop(element) * designer.canvasScale / 1000
+            + element.TotalH() * designer.canvasScale / 2000;
+        int left = designer.DesignLeft(element);
+        Send(app, 2, x, y, 0);
+        Require(app.pointerDownTarget == canvas && app.GetCapturedPointer() == canvas
+            && designer.dragging && !designer.resizing, "canvas down captures retained surface");
+        Send(app, 3, x + 48, y + 24, 0);
+        Require(designer.DesignLeft(element) != left && !designer.dragging && app.GetCapturedPointer() == null,
+            "release coordinate commits drag without an intervening move");
+        Require(designer.CanvasRoot() == canvas && designer.PaletteRoot() == palette,
+            "input preparation preserves standard tree identity");
+        int handleX = designer.canvasOX + designer.DesignLeft(element) * designer.canvasScale / 1000;
+        int handleY = designer.canvasOY + designer.DesignTop(element) * designer.canvasScale / 1000;
+        Send(app, 2, handleX, handleY, 0);
+        Require(app.GetCapturedPointer() == canvas && designer.resizing && !designer.dragging,
+            "painted resize handle retains capture and resize semantics");
+        Send(app, 9, 0, 0, 0);
+        Require(app.GetCapturedPointer() == null && !designer.resizing && !designer.dragging,
+            "window blur cancels retained canvas gesture");
+        designer.OpenContextMenu(app, 400, 300);
+        ContextMenu oldMenu = designer.contextPopup;
+        Require(app.overlayHost.ActiveRoot() == oldMenu && oldMenu.ChildCount() > 0,
+            "context popup is a standard tree immediately");
+        designer.OpenContextMenu(app, 430, 320);
+        int count = designer.doc.Count();
+        SceneDesignerAction stale = new SceneDesignerAction(designer, "context"); stale.menu = oldMenu; stale.index = 0;
+        stale.Run();
+        Require(designer.doc.Count() == count, "superseded popup callback cannot mutate document");
+        app.overlayHost.Dismiss();
+        List<string> files = new List<string>(); files.Add("a.png"); designer.SetResourceSource(files);
+        designer.OpenResourcePicker(1);
+        Control resource = app.overlayHost.ActiveRoot();
+        Require(resource is SceneDesignerResourcePopup && designer.resList != null,
+            "resource picker opens through shared standard overlay");
+        app.overlayHost.Dismiss();
+        Require(designer.resPick == 0, "resource dismissal clears picker target");
+        designer.SetHostPanelBounds(app, null, null);
+        Require(!palette.Visible && !designer.InspectorRoot().Visible, "parked host panels release visibility");
+        designer.SetHostPanelBounds(app, new Rect(0, 40, 210, 800), new Rect(990, 40, 280, 800));
+        Require(palette.Visible && palette.by == 40, "resuming host panels uses current bounds");
+        Send(app, 2, x, y, 0);
+        designer.SetVisible(false);
+        Require(app.GetCapturedPointer() == null && !designer.dragging && app.rootControl == world,
+            "hiding designer retires regions, gestures and input chain");
+        App second = App.CreateOffscreen("Scene designer destination", 1000, 760);
+        designer.InitializeInput(second);
+        designer.SetBounds(second, 180, 20, 600, 700);
+        designer.SetHostPanelBounds(second, new Rect(0, 20, 170, 700), null);
+        Require(app.rootControl == world && canvas.App == second && palette.App == second,
+            "cross-App regions bind only the destination");
+        designer.ResetInteractionState(); second.StopLoop(); app.StopLoop();
+        app.canvas.Destroy(); second.canvas.Destroy();
+        Console.WriteLine("SCENE_DESIGNER_RETAINED_INPUT_OK");
+    }
+}

@@ -1,0 +1,284 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+namespace Game.Scene;
+
+public partial class SceneDesigner {
+    weak App viewApp;
+    SceneDesignerRegion canvasRegion;
+    SceneDesignerRegion paletteRegion;
+    SceneDesignerRegion inspectorRegion;
+    SceneDesignerSurface surface;
+    Ribbon retainedRibbon;
+    List<SceneBarDispatch> barDispatches;
+    ScrollColumn paletteRoot;
+    Panel controlsSection;
+    Panel componentsSection;
+    Button controlsHeader;
+    Button componentsHeader;
+    ContextMenu contextPopup;
+    ContextMenu layerPopup;
+    SceneDesignerResourcePopup resourcePopup;
+    List<string> resourceSource;
+    string resourceDirectory;
+    bool resourceSourceDirty = true;
+    Rect designerBounds;
+    int inputGeneration;
+    int boundsGeneration;
+    bool viewVisible = true;
+    int callbackGeneration = -1;
+
+    public bool InputVisible() { return viewVisible && viewApp != null; }
+    public int InputGeneration() { return inputGeneration; }
+    public Ribbon RetainedRibbon() { this.EnsureRetained(); return retainedRibbon; }
+    public Control CanvasRoot() { this.EnsureRetained(); return surface; }
+    public Control PaletteRoot() { this.EnsureRetained(); return paletteRoot; }
+
+    void EnsureRetained() {
+        if (surface != null) { return; }
+        retainedRibbon = new Ribbon();
+        this.BuildRibbonModel();
+        SceneDesignerAction command = new SceneDesignerAction(this, "ribbon");
+        retainedRibbon.CommandClicked.Add(command.Run);
+        surface = new SceneDesignerSurface(this, retainedRibbon);
+        canvasRegion = new SceneDesignerRegion(this, "canvas", surface);
+        this.BuildPalette();
+        paletteRegion = new SceneDesignerRegion(this, "palette", paletteRoot);
+        inspectorRegion = new SceneDesignerRegion(this, "inspector", this.InspectorRoot());
+    }
+
+    bool BindView(App app) {
+        if (app == null) { return false; }
+        this.EnsureRetained();
+        if (viewApp != null && viewApp != app) {
+            int before = boundsGeneration;
+            this.SetVisible(false);
+            if (boundsGeneration != before + 1 || viewApp != null) { return false; }
+        }
+        viewApp = app; viewVisible = true;
+        this.WireRetainedCallbacks();
+        return true;
+    }
+
+    // Register before an input turn snapshots participants; geometry follows in PrepareView.
+    public void InitializeInput(App app) {
+        if (!this.BindView(app)) { return; }
+        canvasRegion.InitializeInput(app);
+        if (viewApp != app || !viewVisible) { return; }
+        paletteRegion.InitializeInput(app);
+        if (viewApp != app || !viewVisible) { return; }
+        inspectorRegion.InitializeInput(app);
+    }
+
+    // Hosts call this from their preparation/layout phase, before input dispatch.
+    // Render remains a compatibility boundary with the same cached region.
+    public void SetBounds(App app, int x, int y, int w, int h) {
+        if (w <= 1 || h <= 1) { this.SetVisible(false); return; }
+        if (!this.BindView(app)) { return; }
+        int session = boundsGeneration + 1; boundsGeneration = session;
+        designerBounds = new Rect(x, y, w, h);
+        int pad = app.Scale(10);
+        int bodyH = h - app.Scale(22) - pad * 2;
+        int avail = w - pad * 4;
+        if (avail < app.Scale(80)) { avail = app.Scale(80); }
+        int palW = app.Scale(172); int inspW = app.Scale(276);
+        if (hostPanels) { palW = 0; inspW = 0; avail = w - pad * 2; }
+        int minCan = app.Scale(200);
+        if (palW + inspW + minCan > avail) {
+            int side = (int)Math.Max(0, avail - minCan);
+            int sum = palW + inspW;
+            if (sum > 0) { palW = side * palW / sum; inspW = side - palW; }
+            if (palW < app.Scale(120)) { inspW = inspW + palW; palW = 0; }
+            if (inspW < app.Scale(180)) { palW = palW + inspW; inspW = 0; }
+            if (palW > 0 && palW < app.Scale(120)) { palW = 0; }
+        }
+        int canW = (int)Math.Max(app.Scale(80), avail - palW - inspW);
+        int palX = x + pad;
+        int canX = hostPanels ? palX : (palW > 0 ? palX + palW + pad : palX + pad);
+        int inspX = canX + canW + pad;
+        canvasRegion.SetBounds(app, canX, y + pad, canW, bodyH);
+        if (!this.BoundsCurrent(app, session)) { return; }
+        if (!hostPanels) {
+            paletteRegion.SetBounds(app, palX, y + pad, palW, bodyH);
+            if (!this.BoundsCurrent(app, session)) { return; }
+            inspectorRegion.SetBounds(app, inspX, y + pad, inspW, bodyH);
+        }
+    }
+
+    bool BoundsCurrent(App app, int session) {
+        return viewVisible && viewApp == app && boundsGeneration == session;
+    }
+
+    public void SetHostPanelBounds(App app, Rect tools, Rect properties) {
+        if (!this.BindView(app)) { return; }
+        hostPanels = true;
+        int session = boundsGeneration + 1; boundsGeneration = session;
+        if (tools != null && tools.x > -1000) {
+            paletteRegion.SetBounds(app, tools.x, tools.y, tools.width, tools.height);
+        } else { paletteRegion.Suspend(); }
+        if (!this.BoundsCurrent(app, session)) { return; }
+        if (properties != null && properties.x > -1000) {
+            inspectorRegion.SetBounds(app, properties.x, properties.y, properties.width, properties.height);
+        } else { inspectorRegion.Suspend(); }
+    }
+
+    public void SetVisible(bool shown) {
+        if (shown) { viewVisible = true; return; }
+        int session = boundsGeneration + 1; boundsGeneration = session;
+        inputGeneration = inputGeneration + 1;
+        viewVisible = false; viewApp = null;
+        this.CancelCanvasGesture(); this.CancelPaletteGesture();
+        this.CloseDesignerPopups();
+        if (boundsGeneration != session) { return; }
+        if (retainedRibbon != null && !retainedRibbon.RetireInput()) { return; }
+        if (boundsGeneration != session) { return; }
+        if (canvasRegion != null) { canvasRegion.Hide(); }
+        if (boundsGeneration != session) { return; }
+        if (paletteRegion != null) { paletteRegion.Hide(); }
+        if (boundsGeneration != session) { return; }
+        if (inspectorRegion != null) { inspectorRegion.Hide(); }
+    }
+
+    public void SetInspectorVisible(bool shown) {
+        if (!shown && inspectorRegion != null) { inspectorRegion.Suspend(); }
+    }
+
+    public void PrepareRegion(SceneDesignerRegion region, App app) {
+        if (!viewVisible || viewApp != app) { return; }
+        if (region == canvasRegion) { this.SyncRibbon(); }
+        if (region == paletteRegion) { this.RefreshPalette(); }
+        if (region == inspectorRegion) { this.SyncInspector(); }
+    }
+
+    void WireRetainedCallbacks() {
+        if (retainedRibbon == null || callbackGeneration == inputGeneration) { return; }
+        callbackGeneration = inputGeneration;
+        retainedRibbon.CommandClicked.Clear();
+        retainedRibbon.CommandClicked.Add(new SceneDesignerAction(this, "ribbon").Run);
+        controlsHeader.Click.Clear(); componentsHeader.Click.Clear();
+        SceneDesignerAction controls = new SceneDesignerAction(this, "fold");
+        controls.value = SceneDesigner.T("CONTROLS", "控件"); controlsHeader.Click.Add(controls.Run);
+        SceneDesignerAction components = new SceneDesignerAction(this, "fold");
+        components.value = SceneDesigner.T("COMPONENTS", "组件"); componentsHeader.Click.Add(components.Run);
+        this.WireResourceAction();
+    }
+
+    bool RetireDocumentInput() {
+        int session = boundsGeneration + 1; boundsGeneration = session;
+        inputGeneration = inputGeneration + 1;
+        this.CancelCanvasGesture(); this.CancelPaletteGesture();
+        this.CloseDesignerPopups();
+        if (boundsGeneration != session) { return false; }
+        if (retainedRibbon != null && !retainedRibbon.RetireInput()) { return false; }
+        if (boundsGeneration != session) { return false; }
+        App app = viewApp;
+        if (app != null) {
+            if (surface != null) { app.ReleaseInputSubtree(surface); }
+            if (boundsGeneration != session) { return false; }
+            if (paletteRoot != null) { app.ReleaseInputSubtree(paletteRoot); }
+            if (boundsGeneration != session) { return false; }
+            if (inspector != null) { app.ReleaseInputSubtree(inspector.root); }
+        }
+        if (boundsGeneration != session) { return false; }
+        this.WireRetainedCallbacks();
+        return true;
+    }
+
+    public void RequestViewRedraw() { App app = viewApp; if (app != null) { app.RequestRedraw(); } }
+
+    public void Render(App app, int x, int y, int w, int h) { this.RenderPinned(app, x, y, w, h); }
+    public void RenderPinned(App app, int x, int y, int w, int h) {
+        this.SetBounds(app, x, y, w, h);
+        if (!viewVisible || viewApp != app || designerBounds == null) { return; }
+        app.canvas.PushClip(x, y, w, h);
+        canvasRegion.Paint(app);
+        if (!hostPanels) { paletteRegion.Paint(app); inspectorRegion.Paint(app); }
+        this.RenderStatus(app, app.canvas, app.theme, x + app.Scale(10),
+            y + h - app.Scale(30), w - app.Scale(20));
+        this.PaintPaletteGhost(app);
+        app.canvas.PopClip();
+    }
+    public void RenderHostPanels(App app, Rect toolRect, Rect propRect) {
+        this.SetHostPanelBounds(app, toolRect, propRect);
+        if (viewApp != app) { return; }
+        paletteRegion.Paint(app); inspectorRegion.Paint(app);
+    }
+    public void RenderCanvas(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (!this.BindView(app)) { return; }
+        canvasRegion.SetBounds(app, x, y, w, h); canvasRegion.Paint(app);
+    }
+    public void RenderPalette(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        if (!this.BindView(app)) { return; }
+        paletteRegion.SetBounds(app, x, y, w, h); paletteRegion.Paint(app);
+    }
+    void RenderInspectorTree(App app, Control root, int x, int y, int w, int h) {
+        if (!this.BindView(app)) { return; }
+        inspectorRegion.SetBounds(app, x, y, w, h); inspectorRegion.Paint(app);
+    }
+
+    void SyncRibbon() {
+        if (barDispatches == null) { return; }
+        for (int i = 0; i < barDispatches.Count; i = i + 1) {
+            SceneBarDispatch action = barDispatches[i];
+            RibbonItem item = this.BarItemAt(i);
+            if (item == null) { continue; }
+            if (action.group <= 3) { item.enabled = sel != null; }
+            if (action.group == 2 && action.index == 2) { item.on = sel != null && sel.Locked(); }
+            if (action.group == 5) {
+                if (action.index == 0) { item.on = showGrid; }
+                if (action.index == 1) { item.on = snap; }
+                if (action.index == 4) { item.on = showTags; }
+                if (action.index == 2) { item.label = SceneDesigner.T("Step ", "步长 ") + SceneDoc.IntStr(grid); }
+            }
+            if (action.group == 4 && action.index == 4) { item.on = hand; }
+            if (action.group == 6 && action.index == 1) { item.on = showGhost; }
+            if (action.group == 6 && action.index == 0) {
+                item.label = SceneDesigner.T("Edit: ", "编辑：") + (editLayer == "" ? SceneDesigner.T("Base", "基础层") : editLayer);
+            }
+            this.UpdateRibbonCaption(i, item.label);
+        }
+    }
+
+    RibbonItem BarItemAt(int flat) {
+        int index = flat;
+        for (int i = 0; i < retainedRibbon.groups.Count; i = i + 1) {
+            RibbonGroup group = retainedRibbon.groups[i];
+            if (index < group.items.Count) { return group.items[index]; }
+            index = index - group.items.Count;
+        }
+        return null;
+    }
+
+    void UpdateRibbonCaption(int index, string text) {
+        // Ribbon's public model and its existing standard Label share one content value.
+        RibbonLayout layout = retainedRibbon.CurrentLayout();
+        if (layout == null) { return; }
+        this.UpdateRibbonCaptionIn(retainedRibbon, index, text);
+    }
+    bool UpdateRibbonCaptionIn(Control node, int index, string text) {
+        // The item action is its stable flat order in the standard hierarchy.
+        int flat = 0;
+        for (int g = 0; g < retainedRibbon.Children.Count; g = g + 1) {
+            Control band = retainedRibbon.Children[g];
+            for (int k = 0; k < band.Children.Count; k = k + 1) {
+                Control group = band.Children[k];
+                if (group.Children.Count == 0) { continue; }
+                Control box = group.Children[0];
+                for (int n = 0; n < box.Children.Count; n = n + 1) {
+                    Control button = box.Children[n];
+                    if (flat == index) {
+                        for (int l = 0; l < button.Children.Count; l = l + 1) {
+                            if (button.Children[l] is Label) { ((Label)button.Children[l]).Text = text; }
+                        }
+                        return true;
+                    }
+                    flat = flat + 1;
+                }
+            }
+        }
+        return false;
+    }
+}

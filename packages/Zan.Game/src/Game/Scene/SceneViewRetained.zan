@@ -1,0 +1,291 @@
+using System.Collections.Generic;
+using Gui;
+
+namespace Game.Scene;
+
+class SceneViewClickAction {
+    private weak SceneViewSession owner;
+    private weak SceneElement element;
+
+    public SceneViewClickAction(SceneViewSession owner, SceneElement element) {
+        this.owner = owner;
+        this.element = element;
+    }
+
+    public void Invoke() {
+        SceneViewSession current = owner;
+        SceneElement target = element;
+        if (current != null && target != null) { current.RunClick(target); }
+    }
+}
+
+class SceneViewElementControl : Control {
+    private weak SceneViewSession owner;
+    private SceneElement element;
+    private SceneViewClickAction action;
+    private int paintX;
+    private int paintY;
+    private int paintW;
+    private int paintH;
+    private int scaleMilli;
+
+    public SceneViewElementControl(SceneViewSession owner, SceneElement element)
+            : base(element.Name()) {
+        this.owner = owner;
+        this.element = element;
+        this.action = new SceneViewClickAction(owner, element);
+    }
+
+    public SceneElement Element() { return element; }
+
+    public void SetPaintGeometry(int x, int y, int width, int height, int scale) {
+        paintX = x;
+        paintY = y;
+        paintW = width;
+        paintH = height;
+        scaleMilli = scale;
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        SceneViewSession current = owner;
+        if (current == null || !current.IsActive() || element == null || element.OnAction("Click") == "") { return null; }
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
+    }
+
+    public override void OnPaint(App app) {
+        SceneViewSession current = owner;
+        if (current == null || element == null || !current.IsActive()) { return; }
+        SceneView.DrawElement(app, app.canvas, app.theme, element,
+            paintX, paintY, paintW, paintH, scaleMilli);
+    }
+
+    public override void OnPointerDown(RoutedEventArgs args) {
+        App app = this.FindApp();
+        if (app == null || this.IsDisabled() || app.window.EventButton() != 0) { return; }
+        base.OnPointerDown(args);
+        app.CapturePointer(this);
+        args.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs args) {
+        App app = this.FindApp();
+        if (app == null || app.window.EventButton() != 0) { return; }
+        base.OnPointerUp(args);
+        if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+    }
+
+    public override void OnClick(RoutedEventArgs args) {
+        if (this.IsDisabled()) { return; }
+        action.Invoke();
+        args.Handle();
+    }
+}
+
+public class SceneViewSession : InputRootAdapter, UiViewOwner {
+    private weak App host;
+    private SceneDoc doc;
+    private UiViewScope view;
+    private List<SceneViewElementControl> controls;
+    private bool active;
+    private int viewX;
+    private int viewY;
+    private int viewW;
+    private int viewH;
+    private int scaleMilli;
+    private int generation;
+
+    public SceneViewSession(App app, SceneDoc doc) : base("scene_view") {
+        this.host = app;
+        this.doc = doc;
+        this.controls = new List<SceneViewElementControl>();
+        this.active = true;
+        List<SceneElement> ordered = SceneView.OrderByZ(doc);
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            SceneElement element = ordered[i];
+            SceneViewElementControl control = new SceneViewElementControl(this, element);
+            controls.Add(control);
+            this.Add(control);
+        }
+        this.view = new UiViewScope(app, this, this);
+    }
+
+    public bool IsActive() { return active && host != null && host.isRunning && doc != null; }
+    public SceneDoc Doc() { return doc; }
+    public int ElementCount() { return controls.Count; }
+    public Control ElementControlAt(int index) { return controls[index]; }
+
+    public override void Bind(App app) {
+        if (app == null || !app.isRunning || !this.IsActive()) { return; }
+        int session = generation + 1; generation = session;
+        if (host != app || view == null || !view.IsActive()) {
+            UiViewScope previous = view; view = null;
+            if (previous != null) { previous.Retire(); }
+            if (generation != session || !active) { return; }
+            base.Bind(app);
+            if (generation != session || !active || inputApp != app) { return; }
+            host = app;
+            view = new UiViewScope(app, this, this);
+        } else { base.Bind(app); }
+        if (generation == session && inputApp == app) { this.LayoutNow(); }
+    }
+
+    bool SyncElements() {
+        if (!this.IsActive()) { return false; }
+        SceneDoc scene = doc; App app = host; int session = generation;
+        List<SceneElement> ordered = SceneView.OrderByZ(scene);
+        for (int i = controls.Count - 1; i >= 0; i = i - 1) {
+            SceneViewElementControl control = controls[i];
+            if (ordered.IndexOf(control.Element()) >= 0) { continue; }
+            controls.RemoveAt(i);
+            this.Remove(control);
+            if (!active || generation != session || host != app || doc != scene) { return false; }
+        }
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            SceneElement element = ordered[i];
+            SceneViewElementControl control = null;
+            for (int k = 0; k < controls.Count; k = k + 1) {
+                if (controls[k].Element() == element) { control = controls[k]; break; }
+            }
+            if (control == null) {
+                control = new SceneViewElementControl(this, element);
+                controls.Add(control); this.Add(control);
+            }
+            this.MoveChild(control, i);
+        }
+        return active && generation == session && host == app && doc == scene;
+    }
+
+    public bool LayoutNow() {
+        if (!this.IsActive() || view == null) { return false; }
+        App app = host;
+        if (app == null || !this.SyncElements()) { return false; }
+        int top = app.ContentTop();
+        int width = app.canvas.Width();
+        int height = app.canvas.Height() - top;
+        if (height < 1) { height = 1; }
+        return view.Layout(0, top, width, height);
+    }
+
+    public void PrepareView(UiViewScope scope, App app) {
+        if (!active || app != host || scope != view || !this.SyncElements()) { return; }
+        int top = app.ContentTop();
+        int width = app.canvas.Width();
+        int height = app.canvas.Height() - top;
+        if (height < 1) { height = 1; }
+        scope.Layout(0, top, width, height);
+    }
+
+    public void ViewAction(string name, Control sender) { }
+    public void ViewPointer(Control sender, RoutedEventArgs args) { }
+
+    public void RunClick(SceneElement element) {
+        if (!this.IsActive() || doc.elements.IndexOf(element) < 0 || !doc.ElementHit(element)) { return; }
+        string actions = element.OnAction("Click");
+        if (actions.Length == 0) { return; }
+        doc.RunActions(actions, element.Layer());
+        App app = host;
+        if (app != null) { app.RequestRedraw(); app.Wake(); }
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        base.Arrange(x, y, width, height);
+        viewX = x;
+        viewY = y;
+        viewW = width;
+        viewH = height;
+        SceneDoc scene = doc;
+        if (scene == null) { return; }
+        SceneMetrics metrics = scene.Metrics(width, height);
+        scaleMilli = (int)(metrics.ScaleX() * 1000.0);
+        if (scaleMilli < 1) { scaleMilli = 1; }
+        for (int i = 0; i < controls.Count; i = i + 1) {
+            SceneViewElementControl control = controls[i];
+            SceneElement element = control.Element();
+            bool visible = scene.ElementHit(element);
+            bool wasVisible = control.Visible;
+            control.Visible = visible;
+            if (wasVisible && !visible && host != null) { host.ReleaseInputSubtree(control); }
+            if (!this.IsActive() || doc != scene) { return; }
+            if (!visible) { continue; }
+            SceneRect rect = scene.Resolve(element, width, height);
+            int ex = x + rect.Xi();
+            int ey = y + rect.Yi();
+            int ew = rect.Wi();
+            int eh = rect.Hi();
+            control.Arrange(ex, ey, ew, eh);
+            int paintW = SceneView.IsSlotKind(element.Kind()) ? element.W() * scaleMilli / 1000 : ew;
+            int paintH = SceneView.IsSlotKind(element.Kind()) ? element.H() * scaleMilli / 1000 : eh;
+            control.SetPaintGeometry(ex, ey, paintW, paintH, scaleMilli);
+        }
+    }
+
+    public override void OnPaint(App app) {
+        app.canvas.FillRect(viewX, viewY, viewW, viewH,
+            SceneView.PackColor(doc.ClearR(), doc.ClearG(), doc.ClearB(), 255));
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (this.StyleVisible()) {
+            for (int i = this.ChildCount() - 1; i >= 0; i = i - 1) {
+                Control hit = this.ChildAt(i).HitTest(x, y, pointerType, excludedSubtrees);
+                if (hit != null) { return hit; }
+            }
+        }
+        return content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null;
+    }
+
+    public override bool ContainsInputControl(Control control) {
+        if (active && control == this) { return true; }
+        if (active) {
+            for (int i = 0; i < controls.Count; i = i + 1) {
+                SceneViewElementControl node = controls[i];
+                if (node.StyleVisible() && node.ContainsInputControl(control)) { return true; }
+            }
+        }
+        return content != null && content.ContainsInputControl(control);
+    }
+
+    public override Control FindInputFocus(App app) {
+        if (active) {
+            for (int i = this.ChildCount() - 1; i >= 0; i = i - 1) {
+                Control focused = this.ChildAt(i).FindInputFocus(app);
+                if (focused != null) { return focused; }
+            }
+        }
+        return content != null ? content.FindInputFocus(app) : null;
+    }
+
+    public override void CollectInputFocus(App app, List<Control> targets) {
+        if (active) {
+            for (int i = 0; i < this.ChildCount(); i = i + 1) { this.ChildAt(i).CollectInputFocus(app, targets); }
+        }
+        base.CollectInputFocus(app, targets);
+    }
+
+    protected override void OnReleaseInput(App app) {
+        int session = generation;
+        List<SceneViewElementControl> snapshot = new List<SceneViewElementControl>();
+        for (int i = 0; i < controls.Count; i = i + 1) { snapshot.Add(controls[i]); }
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            if (generation != session) { return; }
+            app.ReleaseInputSubtree(snapshot[i]);
+        }
+    }
+
+    public void Render(App app) {
+        if (!this.IsActive() || host != app || !app.ContinuePreparedFrame()) { return; }
+        this.RenderTree(app);
+    }
+
+    public void Retire() {
+        if (!active) { return; }
+        active = false; generation = generation + 1;
+        UiViewScope previous = view;
+        view = null;
+        if (previous != null) { previous.Retire(); }
+        this.Detach();
+        this.RemoveAll(); controls.Clear();
+        doc = null;
+        host = null;
+    }
+}

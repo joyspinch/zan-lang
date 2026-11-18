@@ -1,24 +1,25 @@
 using System;
-using System.Globalization;
 using System.Collections.Generic;
-using System.IO;
 using Gui;
-using Gui.Component;
 using Gui.Widget;
 using Gui.Backend;
 
 namespace Game.Scene;
 
 public partial class SceneDesigner {
-    // --- 画布（在设计分辨率上自由放置） ------------------
+    int canvasX; int canvasY; int canvasW; int canvasH;
+    int canvasOX; int canvasOY; int canvasCW; int canvasCH; int canvasScale = 1;
+    int canvasPointerX; int canvasPointerY;
+    int canvasButton = -1;
+    bool canvasUndo;
+    bool canvasMoved;
+    weak SceneElement canvasPressed;
 
-
-    // 渲染设计画布：信箱式适配/缩放/平移、网格与背景参考图、元素绘制与选中手柄、智能参考线、拖拽/缩放/框选交互、面板拖放放置与右键菜单触发；最后处理键盘快捷键。
-    public void RenderCanvas(App app, Canvas c, Theme t, int x, int y, int w, int h) {
-        app.FillChrome(x, y, w, h, t.borderRadiusLarge, t.bgTertiary);
-        app.canvas.DrawRect(x, y, w, h,
-            app.theme.borderPrimary, 1);
-
+    public bool CanvasContains(int x, int y) {
+        return SceneDesigner.InRect(x, y, canvasX, canvasY, canvasW, canvasH)
+            && SceneDesigner.InRect(x, y, canvasOX, canvasOY, canvasCW, canvasCH);
+    }
+    public void PrepareCanvas(App app, int x, int y, int w, int h) {
         int dw = this.doc.DesignWidth();
         int dh = this.doc.DesignHeight();
         if (dw <= 0) { dw = 1; }
@@ -26,8 +27,6 @@ public partial class SceneDesigner {
         // 设计画布上方条带中的功能区式小按钮工具栏
         // （该区域此前是空的信箱式留白）。
         int barH = this.BarH(app) + app.Scale(6);
-        this.RenderLayoutBar(app, c, t,
-            x + app.Scale(12), y + app.Scale(8), w - app.Scale(24), this.BarH(app));
 
         int inX = x + app.Scale(12);
         int inY = y + app.Scale(8) + barH;
@@ -76,32 +75,17 @@ public partial class SceneDesigner {
         // 工具栏下方）而非居中，避免上方留出空白带。
         int oy = inY - this.panY;
 
-        // 滚轮：Ctrl 无级缩放（以视口为中心），
-        // 否则滚轮上下平移、Shift+滚轮左右平移。
-        if (SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)
-                && app.CaptureWheel(inX, inY, inW, inH)) {
-            int wdelta = app.window.EventKeyCode();
-            int mods = app.window.EventMods();
-            if (Modifiers.HasCtrl(mods)) {
-                int z = this.zoom;
-                if (z == 0) { z = psMilli * 100 / app.dpiScale; }
-                if (wdelta > 0) { z = z * 11 / 10; } else { z = z * 10 / 11; }
-                if (z < 100) { z = 100; }
-                if (z > 4000) { z = 4000; }
-                this.zoom = z;
-            } else {
-                int step = app.Scale(60);
-                if (Modifiers.HasShift(mods)) {
-                    if (wdelta > 0) { this.panX = this.panX - step; }
-                    else if (wdelta < 0) { this.panX = this.panX + step; }
-                } else {
-                    if (wdelta > 0) { this.panY = this.panY - step; }
-                    else if (wdelta < 0) { this.panY = this.panY + step; }
-                }
-            }
-            app.RequestRedraw();
-        }
+        canvasX = inX; canvasY = inY; canvasW = inW; canvasH = inH;
+        canvasOX = ox; canvasOY = oy; canvasCW = cw; canvasCH = ch; canvasScale = psMilli;
+    }
 
+    public void PaintCanvas(App app, Canvas c, Theme t, int x, int y, int w, int h) {
+        app.FillChrome(x, y, w, h, t.borderRadiusLarge, t.bgTertiary);
+        c.DrawRect(x, y, w, h, t.borderPrimary, 1);
+        int dw = (int)Math.Max(1, this.doc.DesignWidth());
+        int dh = (int)Math.Max(1, this.doc.DesignHeight());
+        int inX = canvasX; int inY = canvasY; int inW = canvasW; int inH = canvasH;
+        int ox = canvasOX; int oy = canvasOY; int cw = canvasCW; int ch = canvasCH; int psMilli = canvasScale;
         // 设计画布背景（清除色）+ 可选背景参考图。
         // 设计视图中，很暗的清除色会被提亮到中灰色，
         // 仅限编辑时，以保证组件清晰可辨（实际
@@ -145,39 +129,6 @@ public partial class SceneDesigner {
                 gy = gy + gstep;
             }
         }
-
-        int ek = app.EventKind();
-        if (app.PointerCaptured()) { ek = 0; }
-
-        // 抓手：中键在视口任意处按下即抓住画布拖动
-        // （左键留给选择和框选）；开了抓手开关时左键也拖。
-        bool handHere = this.hand
-            && SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH);
-        if (this.hand) { this.dragging = false; this.resizing = false; this.marquee = false; }
-        if (handHere) { Window.SetCursor(1); }
-        if (ek == 2 && (app.window.EventButton() == 2
-                || (handHere && app.window.EventButton() == 0))
-                && SceneDesigner.InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
-            this.panning = true;
-            this.panSX = app.mouseX;
-            this.panSY = app.mouseY;
-            this.panOX = this.panX;
-            this.panOY = this.panY;
-        }
-        if (this.panning && ek == 1) {
-            this.panX = this.panOX - (app.mouseX - this.panSX);
-            this.panY = this.panOY - (app.mouseY - this.panSY);
-            // 拖动中同样钳制，否则这一帧画布会先飞出去再弹回来。
-            if (this.panX > panMaxX) { this.panX = panMaxX; }
-            if (this.panX < 0 - panMaxX) { this.panX = 0 - panMaxX; }
-            if (this.panY > panMaxY) { this.panY = panMaxY; }
-            if (this.panY < panMinY) { this.panY = panMinY; }
-            ox = inX + (inW - cw) / 2 - this.panX;
-            oy = inY - this.panY;
-            app.RequestRedraw();
-        }
-        if (this.panning && ek == 3) { this.panning = false; }
-        if (this.panning) { Window.SetCursor(1); }
 
         // 元素从后到前绘制（z 小者先），命中测试从前往后。
         // 层过滤：只画当前编辑层；其它层在 Ghost 开启时画成
@@ -282,192 +233,6 @@ public partial class SceneDesigner {
         c.PopClip();
         c.PopClip();
 
-        // 面板拖拽的放置：在画布上释放时，以光标为中心
-        // 添加元素（居中），并转换为设计空间坐标。
-        if (this.palDrag.Length > 0 && ek == 3) {
-            if (SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
-                int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-                int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-                this.AddElementAt(this.palDrag, mDesX, mDesY);
-            } else {
-                this.msg = SceneDesigner.T("drop cancelled", "已取消拖放");
-            }
-            this.palDrag = "";
-            app.RequestRedraw();
-        }
-
-        // 在画布上右键：选中光标下的元素并
-        // 打开上下文菜单（复制 / 删除 / z 顺序 / 锁定）。
-        if (!this.ctxOpen && ek == 2 && app.window.EventButton() == 1
-                && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
-            SceneElement rhit = null;
-            int rj = ordered.Count - 1;
-            while (rj >= 0) {
-                SceneElement e = ordered[rj];
-                if (!this.InEditLayer(e)) { rj = rj - 1; continue; }
-                int ex = ox + this.DesignLeft(e) * psMilli / 1000;
-                int ey = oy + this.DesignTop(e) * psMilli / 1000;
-                int exw = e.TotalW() * psMilli / 1000;
-                int exh = e.TotalH() * psMilli / 1000;
-                if (SceneDesigner.InRect(app.mouseX, app.mouseY, ex, ey, exw, exh)) {
-                    rhit = e;
-                    rj = -1;
-                } else {
-                    rj = rj - 1;
-                }
-            }
-            if (rhit != null) {
-                if (rhit != this.sel && !this.IsExtraSel(rhit)) {
-                    this.sel = rhit;
-                    this.selExtra = new List<SceneElement>();
-                } else if (rhit != this.sel) {
-                    this.sel = rhit;
-                }
-                this.ctxOpen = true;
-                this.ctxX = app.mouseX;
-                this.ctxY = app.mouseY;
-                this.ctxHover = 0 - 1;
-                app.RequestRedraw();
-            }
-        }
-
-        // 指针交互：按下选中并开始拖拽/缩放（最上层优先）。
-        // 抓手模式下这些全部让位——左键只平移画布。
-        if (!this.hand && !this.ctxOpen && ek == 2 && app.window.EventButton() == 0
-                && SceneDesigner.InRect(app.mouseX, app.mouseY, ox, oy, cw, ch)) {
-            // 当前选中项的缩放手柄优先（开始缩放）。
-            bool started = false;
-            if (this.sel != null && !this.sel.Locked()) {
-                int sx = ox + this.DesignLeft(this.sel) * psMilli / 1000;
-                int sy = oy + this.DesignTop(this.sel) * psMilli / 1000;
-                int sw = this.sel.TotalW() * psMilli / 1000;
-                int sh = this.sel.TotalH() * psMilli / 1000;
-                int hs = app.Scale(10);
-                for (int hnum = 0; hnum < 8 && !started; hnum = hnum + 1) {
-                    int hx = SceneDesigner.HandleX(hnum, sx, sw);
-                    int hy = SceneDesigner.HandleY(hnum, sy, sh);
-                    if (SceneDesigner.InRect(app.mouseX, app.mouseY,
-                            hx - hs, hy - hs, hs * 2, hs * 2)) {
-                        this.PushUndo();
-                        this.resizing = true;
-                        this.resizeH = hnum;
-                        started = true;
-                    }
-                }
-            }
-            if (!started) {
-                SceneElement hit = null;
-                int j = ordered.Count - 1;
-                while (j >= 0) {
-                    SceneElement e = ordered[j];
-                    if (!this.InEditLayer(e)) { j = j - 1; continue; }
-                    int ex = ox + this.DesignLeft(e) * psMilli / 1000;
-                    int ey = oy + this.DesignTop(e) * psMilli / 1000;
-                    int exw = e.TotalW() * psMilli / 1000;
-                    int exh = e.TotalH() * psMilli / 1000;
-                    if (SceneDesigner.InRect(app.mouseX, app.mouseY, ex, ey, exw, exh)) {
-                        hit = e;
-                        j = -1;
-                    } else {
-                        j = j - 1;
-                    }
-                }
-                bool ctrl = Modifiers.HasCtrl(app.window.EventMods());
-                if (ctrl && hit != null) {
-                    // Ctrl+点击：切换加入/移出多选。
-                    if (this.sel == null) { this.sel = hit; }
-                    else { this.ToggleExtraSel(hit); }
-                } else if (hit != null && (hit == this.sel || this.IsExtraSel(hit))) {
-                    // 按下当前多选中的成员可保持
-                    // 整组一起拖拽。
-                    if (hit != this.sel && this.IsExtraSel(hit)) {
-                        this.ToggleExtraSel(hit);
-                        this.selExtra.Add(this.sel);
-                        this.sel = hit;
-                    }
-                } else {
-                    this.sel = hit;
-                    this.selExtra = new List<SceneElement>();
-                }
-                bool dbl = (hit != null && app.DoubleClickNow());
-                if (dbl) {
-                    string h = hit.OnAction("Click");
-                    if (h == "") {
-                        string nm = hit.Name();
-                        if (nm == "") { nm = "Element"; }
-                        h = "On" + nm + "Click";
-                        hit.On("Click", h);
-                        this.clickIn.SetText(h);
-                    }
-                    this.openCodeBehindElement = "handler:" + h;
-                    this.openCodeBehindRequested = true;
-                    this.msg = SceneDesigner.T("navigating to handler: ", "跳转到事件处理器: ") + h;
-                }
-                if (hit == null && !ctrl) {
-                    // 在空白画布上按下：开始橡皮筋（框选）拖拽——
-                    // 释放时选中框触及的所有元素。
-                    this.marquee = true;
-                    this.mqSX = app.mouseX;
-                    this.mqSY = app.mouseY;
-                }
-                if (hit != null && !ctrl && !dbl) {
-                    if (hit.Locked()) {
-                        this.msg = SceneDesigner.T("element is locked", "元素已锁定");
-                    } else {
-                        this.PushUndo();
-                        this.dragging = true;
-                        int dLeft = this.DesignLeft(hit);
-                        int dTop = this.DesignTop(hit);
-                        int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-                        int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-                        this.dragDx = mDesX - dLeft;
-                        this.dragDy = mDesY - dTop;
-                    }
-                }
-            }
-            app.RequestRedraw();
-        }
-
-        // 拖拽：在设计空间移动选中元素，保持其锚点。
-        this.guideX = 0 - 1;
-        this.guideY = 0 - 1;
-        if (this.dragging && ek == 1 && this.sel != null) {
-            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-            int newLeft = mDesX - this.dragDx;
-            int newTop = mDesY - this.dragDy;
-            // 智能参考线（其他元素的边缘/中心、画布中心）
-            // 优先于网格；否则实时吸附网格，使元素
-            // 在拖拽过程中即对齐，而非释放时才对齐。
-            int tw2 = this.sel.TotalW();
-            int th2 = this.sel.TotalH();
-            int snX = this.SnapAxisX(newLeft, tw2);
-            if (snX != 0 - 100000) { newLeft = snX; }
-            else if (this.snap && this.grid > 0) {
-                newLeft = (newLeft + this.grid / 2) / this.grid * this.grid;
-            }
-            int snY = this.SnapAxisY(newTop, th2);
-            if (snY != 0 - 100000) { newTop = snY; }
-            else if (this.snap && this.grid > 0) {
-                newTop = (newTop + this.grid / 2) / this.grid * this.grid;
-            }
-            int oldLeft = this.DesignLeft(this.sel);
-            int oldTop = this.DesignTop(this.sel);
-            this.SetDesignPos(this.sel, newLeft, newTop);
-            // 多选：组内其余元素按相同增量跟随移动。
-            int mdx = newLeft - oldLeft;
-            int mdy = newTop - oldTop;
-            if (mdx != 0 || mdy != 0) {
-                for (int me = 0; me < this.selExtra.Count; me = me + 1) {
-                    SceneElement ee = this.selExtra[me];
-                    if (!ee.Locked()) {
-                        this.SetDesignPos(ee, this.DesignLeft(ee) + mdx, this.DesignTop(ee) + mdy);
-                    }
-                }
-            }
-            app.RequestRedraw();
-        }
-
         // 在整个画布上绘制当前激活的智能参考线。
         if (this.guideX >= 0) {
             int gsx = ox + this.guideX * psMilli / 1000;
@@ -478,113 +243,15 @@ public partial class SceneDesigner {
             c.FillRect(ox, gsy, cw, 1, SceneDesigner.PackColor(255, 80, 200, 220));
         }
 
-        // 缩放：拖拽任意手柄。左/上手柄在缩放的同时移动元素，
-        // 网格组缩放其单元尺寸，使整个占地
-        // 跟随光标。
-        if (this.resizing && ek == 1 && this.sel != null && !this.sel.Locked()) {
-            int mDesX = (app.mouseX - ox) * 1000 / psMilli;
-            int mDesY = (app.mouseY - oy) * 1000 / psMilli;
-            if (this.snap && this.grid > 0) {
-                mDesX = (mDesX + this.grid / 2) / this.grid * this.grid;
-                mDesY = (mDesY + this.grid / 2) / this.grid * this.grid;
-            }
-            int oldL = this.DesignLeft(this.sel);
-            int oldT = this.DesignTop(this.sel);
-            int oldR = oldL + this.sel.TotalW();
-            int oldB = oldT + this.sel.TotalH();
-            int newL = oldL;
-            int newT = oldT;
-            int newR = oldR;
-            int newB = oldB;
-            int hn = this.resizeH;
-            // 0=TL 1=T 2=TR 3=R 4=BR 5=B 6=BL 7=L
-            if (hn == 0 || hn == 6 || hn == 7) { newL = mDesX; }
-            if (hn == 0 || hn == 1 || hn == 2) { newT = mDesY; }
-            if (hn == 2 || hn == 3 || hn == 4) { newR = mDesX; }
-            if (hn == 4 || hn == 5 || hn == 6) { newB = mDesY; }
-            if (newR - newL < 8) {
-                if (hn == 0 || hn == 6 || hn == 7) { newL = newR - 8; } else { newR = newL + 8; }
-            }
-            if (newB - newT < 8) {
-                if (hn == 0 || hn == 1 || hn == 2) { newT = newB - 8; } else { newB = newT + 8; }
-            }
-            int nw = (newR - newL - (this.sel.Cols() - 1) * this.sel.GapX()) / this.sel.Cols();
-            int nh = (newB - newT - (this.sel.Rows() - 1) * this.sel.GapY()) / this.sel.Rows();
-            if (nw < 4) { nw = 4; }
-            if (nh < 4) { nh = 4; }
-            this.sel.Size(nw, nh);
-            // 重新锚定，使设计空间左上角落在 (newL, newT)。
-            int rbX = this.sel.AnchorX() * this.doc.DesignWidth() / 1000
-                - this.sel.AnchorX() * this.sel.TotalW() / 1000;
-            int rbY = this.sel.AnchorY() * this.doc.DesignHeight() / 1000
-                - this.sel.AnchorY() * this.sel.TotalH() / 1000;
-            this.sel.At(newL - rbX, newT - rbY);
-            app.RequestRedraw();
-        }
-
-        // 框选：在空白画布上拖拽时显示实时矩形；释放时
-        // 多选所有与框相交的元素。
         if (this.marquee) {
-            int rx = this.mqSX;
-            int ry = this.mqSY;
-            int rw = app.mouseX - rx;
-            int rh = app.mouseY - ry;
-            if (rw < 0) { rx = rx + rw; rw = 0 - rw; }
-            if (rh < 0) { ry = ry + rh; rh = 0 - rh; }
+            int rx = (int)Math.Min(this.mqSX, canvasPointerX);
+            int ry = (int)Math.Min(this.mqSY, canvasPointerY);
+            int rw = (int)Math.Abs(canvasPointerX - this.mqSX);
+            int rh = (int)Math.Abs(canvasPointerY - this.mqSY);
             c.FillRect(rx, ry, rw, rh, SceneDesigner.PackColor(80, 130, 220, 40));
             c.DrawRect(rx, ry, rw, rh, t.primary, 1);
-            if (ek == 3) {
-                this.marquee = false;
-                if (rw > 3 || rh > 3) {
-                    this.sel = null;
-                    this.selExtra = new List<SceneElement>();
-                    for (int mi = 0; mi < ordered.Count; mi = mi + 1) {
-                        SceneElement e = ordered[mi];
-                        int ex = ox + this.DesignLeft(e) * psMilli / 1000;
-                        int ey = oy + this.DesignTop(e) * psMilli / 1000;
-                        int exw = e.TotalW() * psMilli / 1000;
-                        int exh = e.TotalH() * psMilli / 1000;
-                        if (ex < rx + rw && ex + exw > rx && ey < ry + rh && ey + exh > ry) {
-                            if (this.sel == null) { this.sel = e; }
-                            else { this.selExtra.Add(e); }
-                        }
-                    }
-                    int selN = this.selExtra.Count;
-                    if (this.sel != null) { selN = selN + 1; }
-                    if (selN > 0) {
-                        this.msg = SceneDesigner.T("selected ", "已选中 ")
-                            + SceneDoc.IntStr(selN)
-                            + SceneDesigner.T(" element(s)", " 个元素");
-                    }
-                }
-            }
-            app.RequestRedraw();
         }
-
-        if (ek == 3 && (this.dragging || this.resizing)) {
-            // 网格吸附在释放时一次性应用，保持拖拽本身流畅。
-            if (this.dragging && this.snap && this.grid > 0 && this.sel != null) {
-                int fl = this.DesignLeft(this.sel);
-                int ft = this.DesignTop(this.sel);
-                int sl = (fl + this.grid / 2) / this.grid * this.grid;
-                int st = (ft + this.grid / 2) / this.grid * this.grid;
-                this.SetDesignPos(this.sel, sl, st);
-                for (int me = 0; me < this.selExtra.Count; me = me + 1) {
-                    SceneElement ee = this.selExtra[me];
-                    if (!ee.Locked()) {
-                        this.SetDesignPos(ee,
-                            this.DesignLeft(ee) + (sl - fl), this.DesignTop(ee) + (st - ft));
-                    }
-                }
-            }
-            this.dragging = false;
-            this.resizing = false;
-            app.RequestRedraw();
-        }
-
-        this.HandleKeys(app);
     }
-
     // 缩放手柄 hnum 的屏幕空间 X 坐标（0=TL 1=T 2=TR 3=R 4=BR 5=B 6=BL 7=L；ex/exw 为元素屏幕矩形）。
     public static int HandleX(int hnum, int ex, int exw) {
         if (hnum == 0 || hnum == 6 || hnum == 7) { return ex; }
@@ -673,63 +340,6 @@ public partial class SceneDesigner {
         if (app.focus.IsFocused(this.inpIdClass)) { return true; }
         if (app.focus.IsFocused(this.inpIdColor)) { return true; }
         return false;
-    }
-
-    // 键盘编辑：方向键按一个网格步长微调选中项（Shift = 1px），Delete/Backspace 删除，Ctrl+0 重置缩放，Ctrl+Z/Y 撤销重做，Ctrl+C/V 复制粘贴，Ctrl+D 复制，Ctrl+A 全选，Ctrl+L 锁/解锁切换，Esc 取消选中。检查器输入框获得焦点时忽略全部按键。
-    public void HandleKeys(App app) {
-        if (this.AnyInputFocused(app)) { return; }
-        int ek = app.EventKind();
-        if (app.PointerCaptured()) { ek = 0; }
-        // Ctrl+字母快捷键以文本输入控制码到达：
-        // ^A=1 全选，^Z=26 撤销，^Y=25 重做，^C=3 复制，^V=22 粘贴，^D=4 复制，^L=12 锁定/解锁。
-        if (ek == 6) {
-            int cc = app.window.EventKeyCode();
-            if (cc == 1) { this.SelectAll(); app.RequestRedraw(); return; }
-            if (cc == 26) { this.Undo(); app.RequestRedraw(); return; }
-            if (cc == 25) { this.Redo(); app.RequestRedraw(); return; }
-            if (cc == 3) { this.CopySel(); app.RequestRedraw(); return; }
-            if (cc == 22) { this.PasteClip(); app.RequestRedraw(); return; }
-            if (cc == 4 && this.sel != null) {
-                this.DuplicateSel();
-                app.RequestRedraw();
-                return;
-            }
-            if (cc == 12 && this.sel != null) {
-                this.ToggleLockSel();
-                app.RequestRedraw();
-                return;
-            }
-        }
-        if (ek != 4) { return; }
-        int kc = app.window.EventKeyCode();
-        if (kc == 27) {
-            if (this.sel != null || this.selExtra.Count > 0 || this.ctxOpen || this.layerMenuOpen) {
-                this.ClearSel();
-                app.RequestRedraw();
-                return;
-            }
-        }
-        if ((kc == 48 || kc == 96) && Modifiers.HasCtrl(app.window.EventMods())) {
-            this.zoom = 1000;
-            this.panX = 0;
-            this.panY = 0;
-            this.msg = SceneDesigner.T("zoom reset to 100%", "缩放已重置为 100%");
-            app.RequestRedraw();
-            return;
-        }
-        if (this.sel == null) { return; }
-        int step = this.grid;
-        if (step < 1) { step = 1; }
-        if (Modifiers.HasShift(app.window.EventMods())) { step = 1; }
-        if (kc == 37) { this.NudgeSel(0 - step, 0); app.RequestRedraw(); }
-        else if (kc == 39) { this.NudgeSel(step, 0); app.RequestRedraw(); }
-        else if (kc == 38) { this.NudgeSel(0, 0 - step); app.RequestRedraw(); }
-        else if (kc == 40) { this.NudgeSel(0, step); app.RequestRedraw(); }
-        else if (kc == 46 || kc == 8) { this.DeleteSel(); app.RequestRedraw(); }
-        else if (kc == 33) { this.RaiseSel(1); this.msg = SceneDesigner.T("raised one layer", "已上移一层"); app.RequestRedraw(); }
-        else if (kc == 34) { this.RaiseSel(0 - 1); this.msg = SceneDesigner.T("lowered one layer", "已下移一层"); app.RequestRedraw(); }
-        else if (kc == 36 && Modifiers.HasCtrl(app.window.EventMods())) { this.SelToTop(); this.msg = SceneDesigner.T("brought to top", "已置顶"); app.RequestRedraw(); }
-        else if (kc == 35 && Modifiers.HasCtrl(app.window.EventMods())) { this.SelToBottom(); this.msg = SceneDesigner.T("sent to bottom", "已置底"); app.RequestRedraw(); }
     }
 
     // 文档元素的 z 顺序副本（按 Z 升序稳定插入排序，元素数少）。

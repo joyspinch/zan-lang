@@ -1,0 +1,196 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Game.Scene;
+
+public partial class SceneDesigner {
+    SceneDoc gestureDocument;
+    int canvasStartX;
+    int canvasStartY;
+    weak SceneElement canvasLastClick;
+
+    SceneElement CanvasHit(int x, int y) {
+        List<SceneElement> ordered = this.OrderedByZ();
+        for (int i = ordered.Count - 1; i >= 0; i = i - 1) {
+            SceneElement element = ordered[i];
+            if (!this.InEditLayer(element)) { continue; }
+            int ex = canvasOX + this.DesignLeft(element) * canvasScale / 1000;
+            int ey = canvasOY + this.DesignTop(element) * canvasScale / 1000;
+            if (SceneDesigner.InRect(x, y, ex, ey, element.TotalW() * canvasScale / 1000, element.TotalH() * canvasScale / 1000)) { return element; }
+        }
+        return null;
+    }
+
+    public void CancelCanvasGesture() {
+        dragging = false; resizing = false; marquee = false; panning = false;
+        canvasButton = -1; canvasPressed = null; gestureDocument = null;
+        canvasUndo = false; canvasMoved = false; guideX = -1; guideY = -1;
+    }
+
+    public void CanvasDown(App app, SceneDesignerSurface source, RoutedEventArgs e) {
+        int button = app.window.EventButton();
+        if (canvasButton >= 0 || !viewVisible || viewApp != app || !SceneDesigner.InRect(e.x, e.y, canvasX, canvasY, canvasW, canvasH)) { return; }
+        int session = inputGeneration;
+        SceneDoc currentDocument = doc;
+        app.focus.SetFocused(source.WidgetId());
+        if (session != inputGeneration || !viewVisible || viewApp != app || currentDocument != doc) { return; }
+        if (button == 1) {
+            if (!this.CanvasContains(e.x, e.y)) { return; }
+            SceneElement hit = this.CanvasHit(e.x, e.y);
+            if (hit == null) { return; }
+            if (hit != sel && !this.IsExtraSel(hit)) { this.Select(hit); }
+            else if (hit != sel) { this.ToggleExtraSel(hit); if (sel != null) { selExtra.Add(sel); } sel = hit; }
+            this.OpenContextMenu(app, e.x, e.y); e.Handle(); return;
+        }
+        bool pan = button == 2 || (button == 0 && hand);
+        if (!pan && (button != 0 || !this.CanvasContains(e.x, e.y))) { return; }
+        canvasButton = button; gestureDocument = doc;
+        canvasStartX = e.x; canvasStartY = e.y;
+        canvasPointerX = e.x; canvasPointerY = e.y; canvasMoved = false; canvasUndo = false;
+        if (pan) {
+            panning = true; panSX = e.x; panSY = e.y; panOX = panX; panOY = panY;
+        } else {
+            bool ctrl = Modifiers.HasCtrl(e.modifiers);
+            bool resize = !ctrl && this.CanvasResizeHandle(app, e.x, e.y);
+            if (!resize) {
+                SceneElement hit = this.CanvasHit(e.x, e.y); canvasPressed = hit;
+                if (ctrl && hit != null) {
+                    if (sel == null) { this.Select(hit); } else { this.ToggleExtraSel(hit); }
+                } else if (hit != null && (hit == sel || this.IsExtraSel(hit))) {
+                    if (hit != sel) { this.ToggleExtraSel(hit); selExtra.Add(sel); sel = hit; }
+                } else if (!ctrl) { this.Select(hit); }
+                if (hit == null && !ctrl) { marquee = true; mqSX = e.x; mqSY = e.y; }
+                if (hit != null && !ctrl && !hit.Locked()) {
+                    dragging = true;
+                    dragDx = (e.x - canvasOX) * 1000 / canvasScale - this.DesignLeft(hit);
+                    dragDy = (e.y - canvasOY) * 1000 / canvasScale - this.DesignTop(hit);
+                } else if (hit != null && hit.Locked()) { msg = SceneDesigner.T("element is locked", "元素已锁定"); }
+            }
+        }
+        app.CapturePointer(source, true);
+        app.RequestRedraw(); e.Handle();
+    }
+
+    bool CanvasResizeHandle(App app, int x, int y) {
+        if (sel == null || sel.Locked()) { return false; }
+        int sx = canvasOX + this.DesignLeft(sel) * canvasScale / 1000;
+        int sy = canvasOY + this.DesignTop(sel) * canvasScale / 1000;
+        int sw = sel.TotalW() * canvasScale / 1000; int sh = sel.TotalH() * canvasScale / 1000;
+        // PaintCanvas draws an 8px square; a 20px hit box consumes the entire
+        // interior of small elements at fit zoom and turns a centre drag into resize.
+        int size = app.Scale(8) / 2;
+        for (int i = 0; i < 8; i = i + 1) {
+            int hx = SceneDesigner.HandleX(i, sx, sw); int hy = SceneDesigner.HandleY(i, sy, sh);
+            if (SceneDesigner.InRect(x, y, hx - size, hy - size, size * 2, size * 2)) {
+                resizing = true; resizeH = i; return true;
+            }
+        }
+        return false;
+    }
+
+    public void CanvasMove(App app, SceneDesignerSurface source, RoutedEventArgs e) {
+        if (canvasButton < 0 || app.GetCapturedPointer() != source) { return; }
+        if (gestureDocument != doc || !viewVisible || source.IsDisabled()) { this.CancelCanvasGesture(); return; }
+        this.UpdateCanvasGesture(app, e.x, e.y);
+        app.RequestRedraw(); e.Handle();
+    }
+    public void CanvasUp(App app, SceneDesignerSurface source, RoutedEventArgs e) {
+        if (canvasButton < 0 || app.window.EventButton() != canvasButton || app.GetCapturedPointer() != source) { return; }
+        if (gestureDocument != doc || !viewVisible || source.IsDisabled()) {
+            this.CancelCanvasGesture(); app.ReleasePointerCapture(); e.Handle(); return;
+        }
+        // Up owns the final event coordinate even when no Move was dispatched.
+        this.UpdateCanvasGesture(app, e.x, e.y);
+        if (marquee) { this.CompleteCanvasMarquee(e.x, e.y); }
+        bool click = !canvasMoved && canvasButton == 0 && canvasPressed != null;
+        SceneElement pressed = canvasPressed;
+        this.CancelCanvasGesture();
+        canvasPressed = click ? pressed : null;
+        app.ReleasePointerCapture(); app.RequestRedraw();
+        if (!click) { e.Handle(); }
+    }
+    public void CanvasClick(RoutedEventArgs e) {
+        SceneElement hit = canvasPressed; canvasPressed = null;
+        SceneElement previous = canvasLastClick; canvasLastClick = hit;
+        if (!e.isDoubleClick || previous != hit || hit == null || hit != sel
+                || !this.CanvasContains(e.x, e.y) || this.CanvasHit(e.x, e.y) != hit) { return; }
+        string handler = hit.OnAction("Click");
+        if (handler == "") {
+            string name = hit.Name(); if (name == "") { name = "Element"; }
+            handler = "On" + name + "Click"; hit.On("Click", handler); clickIn.SetText(handler);
+        }
+        openCodeBehindElement = "handler:" + handler; openCodeBehindRequested = true;
+        msg = SceneDesigner.T("navigating to handler: ", "跳转到事件处理器: ") + handler;
+        this.RequestViewRedraw(); e.Handle();
+    }
+
+    void CompleteCanvasMarquee(int x, int y) {
+        int left = (int)Math.Min(mqSX, x); int top = (int)Math.Min(mqSY, y);
+        int width = (int)Math.Abs(x - mqSX); int height = (int)Math.Abs(y - mqSY);
+        if (width <= 3 && height <= 3) { return; }
+        this.Select(null);
+        List<SceneElement> ordered = this.OrderedByZ();
+        for (int i = 0; i < ordered.Count; i = i + 1) {
+            SceneElement element = ordered[i];
+            if (!this.InEditLayer(element)) { continue; }
+            int ex = canvasOX + this.DesignLeft(element) * canvasScale / 1000;
+            int ey = canvasOY + this.DesignTop(element) * canvasScale / 1000;
+            int ew = element.TotalW() * canvasScale / 1000; int eh = element.TotalH() * canvasScale / 1000;
+            if (ex < left + width && ex + ew > left && ey < top + height && ey + eh > top) {
+                if (sel == null) { sel = element; } else { selExtra.Add(element); }
+            }
+        }
+        int count = selExtra.Count + (sel != null ? 1 : 0);
+        if (count > 0) { msg = SceneDesigner.T("selected ", "已选中 ") + SceneDoc.IntStr(count) + SceneDesigner.T(" element(s)", " 个元素"); }
+    }
+
+    public void CanvasWheel(App app, RoutedEventArgs e) {
+        if (!SceneDesigner.InRect(e.x, e.y, canvasX, canvasY, canvasW, canvasH) || e.delta == 0) { return; }
+        if (Modifiers.HasCtrl(e.modifiers)) {
+            int next = e.delta > 0 ? zoom * 11 / 10 : zoom * 10 / 11;
+            zoom = (int)Math.Max(100, Math.Min(4000, next));
+        } else {
+            int step = app.Scale(60) * (e.delta > 0 ? -1 : 1);
+            if (Modifiers.HasShift(e.modifiers)) { panX = panX + step; } else { panY = panY + step; }
+        }
+        this.PrepareCanvas(app, surface.bx, surface.by, surface.bw, surface.bh);
+        app.RequestRedraw(); e.Handle();
+    }
+
+    public void CanvasKey(App app, RoutedEventArgs e, bool text) {
+        if (this.AnyInputFocused(app) || canvasButton >= 0 || e.handled) { return; }
+        int key = e.keyCode;
+        if (text) {
+            if (key == 1) { this.SelectAll(); }
+            else if (key == 26) { this.Undo(); }
+            else if (key == 25) { this.Redo(); }
+            else if (key == 3) { this.CopySel(); }
+            else if (key == 22) { this.PasteClip(); }
+            else if (key == 4 && sel != null) { this.DuplicateSel(); }
+            else if (key == 12 && sel != null) { this.ToggleLockSel(); }
+            else { return; }
+        } else if (key == 27) { this.ClearSel(); }
+        else if ((key == 48 || key == 96) && Modifiers.HasCtrl(e.modifiers)) {
+            zoom = 1000; panX = 0; panY = 0; msg = SceneDesigner.T("zoom reset to 100%", "缩放已重置为 100%");
+        } else {
+            if (sel == null) { return; }
+            int step = Modifiers.HasShift(e.modifiers) ? 1 : (int)Math.Max(1, grid);
+            if (key == 37) { this.NudgeSel(-step, 0); }
+            else if (key == 39) { this.NudgeSel(step, 0); }
+            else if (key == 38) { this.NudgeSel(0, -step); }
+            else if (key == 40) { this.NudgeSel(0, step); }
+            else if (key == 46 || key == 8) { this.DeleteSel(); }
+            else if (key == 33) { this.RaiseSel(1); }
+            else if (key == 34) { this.RaiseSel(-1); }
+            else if (key == 36 && Modifiers.HasCtrl(e.modifiers)) { this.SelToTop(); }
+            else if (key == 35 && Modifiers.HasCtrl(e.modifiers)) { this.SelToBottom(); }
+            else { return; }
+        }
+        app.RequestRedraw(); e.Handle();
+    }
+    // Kept as a source-compatible entry: keyboard input is dispatched by the tree.
+    public void HandleKeys(App app) { }
+}
