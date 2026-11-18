@@ -293,11 +293,12 @@
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
                 if (method_sym) {
                     bool callee_static = (method_sym->modifiers & MOD_STATIC) != 0;
-                    int spec = try_method_spec(g, method_sym, expr,
-                                               callee->member.object, locals);
+                    /* A same-named field can route Type.Method<T>() here.
+                     * Only extension calls pass a receiver as a static argument. */
+                    zan_ast_node_t *call_recv = callee_static ? NULL : callee->member.object;
+                    int spec = try_method_spec(g, method_sym, expr, call_recv, locals);
                     if (spec >= 0)
-                        return emit_method_spec_call(g, spec, expr,
-                                                     callee->member.object, locals);
+                        return emit_method_spec_call(g, spec, expr, call_recv, locals);
                     for (int fi = irgen_find_function(g, method_sym); fi >= 0; fi = -1) {
                         if (g->functions[fi].sym == method_sym) {
                             int recv_off = callee_static ? 0 : 1;

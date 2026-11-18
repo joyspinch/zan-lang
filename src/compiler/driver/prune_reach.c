@@ -6,6 +6,17 @@ static int pi_typeish(zan_token_kind_t k) {
            k == TK_VOID;
 }
 
+static bool pi_is_orm_conn_hook(zan_istr_t name) {
+    return name.len == 6 && memcmp(name.str, "__Conn", 6) == 0;
+}
+
+/* A zero-argument __Conn hook enables recv.<Entity> on its class and
+   descendants. The checker can synthesize both of these type references. */
+static void pi_seed_orm_accessor_deps(void) {
+    pi_flag_ident(NULL, "BaseRepository", 14);
+    pi_flag_ident(NULL, "ZanSql", 6);
+}
+
 static void pi_seed_source(const char *source, size_t len) {
     g_scale_stats.seed_sources++;
     zan_arena_t *arena = zan_arena_new();
@@ -158,6 +169,10 @@ static void pi_seed_source(const char *source, size_t len) {
                         if (prev != TK_DOT) {
                             chain = name;
                             zan_token_t next = zan_lexer_peek(&lex);
+                            if (next.kind == TK_LPAREN &&
+                                pi_is_orm_conn_hook(tok.str_val) &&
+                                zan_lexer_peek2(&lex).kind == TK_RPAREN)
+                                pi_seed_orm_accessor_deps();
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -274,6 +289,9 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL:
     case AST_DELEGATE_DECL:
+        if (n->kind == AST_METHOD_DECL && n->method_decl.params.count == 0 &&
+            pi_is_orm_conn_hook(n->method_decl.name))
+            pi_seed_orm_accessor_deps();
         pi_seed_ast(n->method_decl.return_type);
         pi_seed_list(&n->method_decl.params);
         pi_seed_list(&n->method_decl.type_params);
