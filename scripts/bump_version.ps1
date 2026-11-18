@@ -1,9 +1,5 @@
-﻿# bump_version.ps1 -- Increments the patch component of the root VERSION file
-# (the single source of truth every binary reports) and prints the new version.
-#
-# Releases are cut by scripts\publish_ide.ps1, which calls this first, so each
-# published build carries a version nobody has to remember to raise. A release
-# that must set major/minor edits VERSION by hand and publishes with -NoBump.
+﻿# bump_version.ps1 -- Increments VERSION and the gen1 identity before the
+# release build. scripts\publish_ide.ps1 packages the selected version with -NoBump.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\bump_version.ps1
 #         Add  -Part minor|major  to raise that component instead (the lower
@@ -14,41 +10,81 @@ param([ValidateSet('patch', 'minor', 'major')][string]$Part = 'patch')
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $file = Join-Path $root 'VERSION'
-
-$current = (Get-Content $file -Raw).Trim()
-if ($current -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
-    Write-Output "BUMP_FAILED: VERSION is '$current', expected MAJOR.MINOR.PATCH"
-    exit 1
-}
-$major = [int]$Matches[1]
-$minor = [int]$Matches[2]
-$patch = [int]$Matches[3]
-
-if ($Part -eq 'major') { $major = $major + 1; $minor = 0; $patch = 0 }
-elseif ($Part -eq 'minor') { $minor = $minor + 1; $patch = 0 }
-else { $patch = $patch + 1 }
-
-$next = "$major.$minor.$patch"
-# No trailing newline juggling: the file is read with .Trim() everywhere (CMake
-# strips it, build_ide.ps1 trims it), and one terminating newline keeps it a
-# well-formed text file.
-[System.IO.File]::WriteAllText($file, "$next`n")
-
-# Keep the self-hosted driver's identity literal on the same single source of
-# truth (B-ID189): the differential gate fail-closes when gen1's --version
-# drifts from zanc's, so the bump must rewrite it here, not leave that to
-# whoever remembers it exists.
 $driver = Join-Path $root 'src\selfhost\driver\main.zan'
-$driverText = [System.IO.File]::ReadAllText($driver)
-$pattern = '(static string SelfhostVersion\(\) \{ return ")[^"]+("; \})'
-$updated = [regex]::Replace($driverText, $pattern, ('${1}' + $next + '${2}'), 'Multiline')
-if ($updated -eq $driverText) {
-    Write-Output "BUMP_FAILED: SelfhostVersion literal not found in src\selfhost\driver\main.zan"
+$paths = @($file, $driver)
+$streams = @{}
+$original = @{}
+$text = @{}
+$attempted = @()
+
+try {
+    # Keep both files exclusively open through validation, writing and rollback.
+    foreach ($path in $paths) {
+        $stream = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+        $streams[$path] = $stream
+        $snapshot = [System.IO.MemoryStream]::new()
+        $stream.CopyTo($snapshot)
+        $original[$path] = $snapshot.ToArray()
+        $snapshot.Position = 0
+        $reader = [System.IO.StreamReader]::new($snapshot)
+        try { $text[$path] = $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+    }
+
+    $current = $text[$file].Trim()
+    if ($current -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+        throw "VERSION is '$current', expected MAJOR.MINOR.PATCH"
+    }
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    $patch = [int]$Matches[3]
+
+    # The differential gate (B-ID189) requires gen1 and gen0 to agree.
+    $driverText = $text[$driver]
+    $pattern = '(?m)^[ \t]*static\s+string\s+SelfhostVersion\s*\(\s*\)\s*\{\s*return\s+"([^"\r\n]*)"\s*;\s*\}'
+    $literals = [regex]::Matches($driverText, $pattern)
+    if ($literals.Count -ne 1 -or $literals[0].Groups[1].Value -cne $current) {
+        throw "Expected exactly one SelfhostVersion literal matching VERSION ($current) in src\selfhost\driver\main.zan"
+    }
+    $literal = $literals[0].Groups[1]
+
+    if ($Part -eq 'major') { $major = $major + 1; $minor = 0; $patch = 0 }
+    elseif ($Part -eq 'minor') { $minor = $minor + 1; $patch = 0 }
+    else { $patch = $patch + 1 }
+
+    $next = "$major.$minor.$patch"
+    $updated = @{
+        $file   = "$next`n"
+        $driver = $driverText.Remove($literal.Index, $literal.Length).Insert($literal.Index, $next)
+    }
+    foreach ($path in $paths) {
+        $stream = $streams[$path]
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($updated[$path])
+        $attempted += $path
+        $stream.Position = 0
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.SetLength($bytes.Length)
+        $stream.Flush()
+    }
+} catch {
+    Write-Output "BUMP_FAILED: $($_.Exception.Message)"
+    foreach ($path in $attempted) {
+        try {
+            $stream = $streams[$path]
+            $bytes = $original[$path]
+            $stream.Position = 0
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.SetLength($bytes.Length)
+            $stream.Flush()
+        } catch {
+            Write-Output "BUMP_FAILED: Could not restore '$path': $($_.Exception.Message)"
+        }
+    }
     exit 1
+} finally {
+    foreach ($stream in $streams.Values) { $stream.Dispose() }
 }
-[System.IO.File]::WriteAllText($driver, $updated)
+
 Write-Output "VERSION_BUMPED $current -> $next"
-# 显式成功退出：调用方（publish_ide.ps1）按 $LASTEXITCODE 判断这一步，
-# 而纯 PowerShell 脚本不设置它——不写这一行，上一条原生命令留下的
-# 退出码就会被当成"版本号没升上去"，发布在第一步直接失败。
+# Set $LASTEXITCODE for callers that invoke this script from PowerShell.
 exit 0
