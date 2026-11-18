@@ -299,3 +299,26 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
 
 - 面向发布（对外可见的行为变化/API 新增）才动版本文件；
   内部修复不动。版本变更单独提交或随主功能提交，不夹带无关改动。
+
+## 七、批量收口与门禁协作（2026-11-18 实测）
+
+- **带 pathspec 的 `git add` 是全有或全无**：任一通配符没有命中（如
+  `tests/gui/pivot_*` 实际不存在）整条命令一个文件都不暂存，错误只在 stderr；
+  随后 `git commit -- <同一 pathspec>` 也因 "did not match" 失败。大批量收口前
+  先在 `git status` 里确认每个通配符有命中，宁可改用目录前缀或精确文件清单。
+- **改编译器对必须带 `selfhost-verified:` 标记**（commit-msg 钩子硬拦截）：
+  跑过档写 `selfhost-verified: selfhost_gen1 selfhost_fixed_point selfhost_diff`；
+  未经本轮重验的转库提交如实写 `selfhost-verified: none -- <原因>`，不要编造测试名。
+- **分层棘轮（B-ID171~179）按 HEAD 已提交基线比对**：同一提交里"改基线 + 改代码"
+  无效。正确顺序：先单独提交基线（`python scripts/gui_layer_rules.py --update <文件>`
+  + `ZAN_GUI_BASELINE_RAISE=1` + 提交说明写明理由），再提代码；Zan.Gui 之外的
+  测试夹具新建 `Signal*`、App 仲裁调用同样要进基线。基线按文件逐个补，
+  用 `python scripts/check_code_standards.py --staged` 一次扫全违规再批量 update。
+- **PascalCase 门禁对 `op_*` 是已证实误报**：`op_add/op_sub` 是编译器脱糖生成的
+  运算符重载固定命名（`src/selfhost/frontend/parser_desugar.zan:175-181` 由编译器
+  自己生成同名方法），`check_code_standards.py` 豁免表只有 `operator` 关键字。
+  此类经证实的误报按规则 0 用 `--no-verify`，并在提交说明写明证据与"其余检查
+  已在前次尝试机检通过"。
+- **并行会话在持续提交的共享工作树上做批量收口**：按域分批 pathspec 提交，
+  每批先 `git diff --cached --name-only` 复核构成；并行会话正在编辑的文件按
+  "在途快照"收口并在提交说明如实标注归属，不当作自己验证过的工作。
