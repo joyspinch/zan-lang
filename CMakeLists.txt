@@ -191,7 +191,6 @@ add_executable(zanc
     src/compiler/optimizer.c
     src/compiler/incremental.c
     src/compiler/package.c
-    src/compiler/stdlib_ext.c
     src/compiler/crosscomp.c
     src/compiler/winres.c
     src/compiler/embedres.c
