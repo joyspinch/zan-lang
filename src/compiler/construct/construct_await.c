@@ -764,6 +764,11 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     get_async_result_ptr(g));
                 LLVMValueRef must_suspend = zan_icmp(g->builder, LLVMIntEQ, r,
                     LLVMConstInt(di32, 0, 0), "join.susp");
+                /* entry 值不跨 suspend 存活（resume 端支配关系断了）：
+                 * 存进帧 SUB 槽（与 direct await 同一复用纪律），resume 端取回。 */
+                LLVMBuildStore(g->builder,
+                    LLVMBuildIntToPtr(g->builder, entry, di8ptr, "join.entry.p"),
+                    get_async_sub_slot_ptr(g));
                 LLVMValueRef fn = g->current_fn;
                 LLVMBasicBlockRef susp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "join.park");
                 LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
@@ -776,6 +781,48 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 di_set_loc(g, expr->loc);
+                LLVMValueRef entry_r = LLVMBuildPtrToInt(g->builder,
+                    LLVMBuildLoad2(g->builder, di8ptr, get_async_sub_slot_ptr(g),
+                                   "join.entry.rl"),
+                    di64, "join.entry.back");
+                /* M2：joiner 唤醒后若 join 快照持有失败子任务的异常对象
+                 * （任务结束锁内已从子帧转移所有权），转入 EH 全局并沿
+                 * await 链重抛——控制器动作等反射派发的异常因此可达
+                 * WebApp 错误处理。 */
+                {
+                    LLVMTypeRef jx_type = LLVMFunctionType(di8ptr,
+                        (LLVMTypeRef[]){ di64,
+                                         LLVMPointerType(di8ptr, 0),
+                                         LLVMPointerType(di32, 0) }, 3, 0);
+                    LLVMValueRef jx = LLVMGetNamedFunction(g->mod, "zan_join_exc");
+                    if (!jx) jx = LLVMAddFunction(g->mod, "zan_join_exc", jx_type);
+                    LLVMValueRef tid_p = LLVMBuildAlloca(g->builder, di8ptr, "join.xtid");
+                    LLVMValueRef own_p = LLVMBuildAlloca(g->builder, di32, "join.xown");
+                    LLVMValueRef jexc = zan_call2(g->builder, jx_type, jx,
+                        (LLVMValueRef[]){ entry_r, tid_p, own_p }, 3, "join.exc");
+                    LLVMValueRef top_g, bufs_g, exc_g;
+                    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+                    LLVMBasicBlockRef jthr = LLVMAppendBasicBlockInContext(g->ctx,
+                        g->current_async_resume_fn, "join.rethrow");
+                    LLVMBasicBlockRef jok = LLVMAppendBasicBlockInContext(g->ctx,
+                        g->current_async_resume_fn, "join.ok");
+                    LLVMBuildCondBr(g->builder,
+                        zan_icmp(g->builder, LLVMIntNE, jexc,
+                                 LLVMConstNull(di8ptr), "join.failed"),
+                        jthr, jok);
+                    LLVMPositionBuilderAtEnd(g->builder, jthr);
+                    LLVMBuildStore(g->builder, jexc, exc_g);
+                    LLVMBuildStore(g->builder,
+                        LLVMBuildLoad2(g->builder, di8ptr, tid_p, "join.xtid.v"),
+                        get_eh_exc_tid_global(g));
+                    LLVMBuildStore(g->builder,
+                        LLVMBuildLoad2(g->builder, di32, own_p, "join.xown.v"),
+                        get_eh_exc_owned_global(g));
+                    emit_raise_exception(g);
+                    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                        LLVMBuildUnreachable(g->builder);
+                    LLVMPositionBuilderAtEnd(g->builder, jok);
+                }
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "join.r2");
             }
             LLVMValueRef r2 = zan_call2(g->builder, jw_type, jw,

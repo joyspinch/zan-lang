@@ -1,0 +1,66 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+// M2：join 必须沿 await 链传播子任务异常——反射派发（InvokeTask）与
+// Task.Spawn 两条路都要可达 WebApp 错误处理。
+class Job {
+    public int Ran;
+
+    public async void Fail() {
+        Ran = 1;
+        // 先 park 一拍再抛：保证 bind 发生在子任务完成前（确定性路径）。
+        // 即时 throw 且先于 bind 被 reap 的子任务，异常传播是既有 WhenAll
+        // 语义缺口（TASKS.md 记账）。
+        await Task.Delay(1);
+        throw new Exception("boom reflected");
+    }
+}
+
+class Program {
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static async int ReflectedProbe() {
+        Job job = new Job();
+        List<long> hs = new List<long>();
+        hs.Add(job.InvokeTask("Fail"));
+        await Task.WhenAll(hs);
+        return 0;
+    }
+
+    static async void SpawnFail() {
+        await Task.Delay(1);
+        throw new Exception("boom spawn");
+    }
+
+    static async int SpawnProbe() {
+        List<long> hs = new List<long>();
+        hs.Add(Task.Spawn(SpawnFail()));
+        await Task.WhenAll(hs);
+        return 0;
+    }
+
+    static async int Main() {
+        try {
+            int rc = await ReflectedProbe();
+            Console.WriteLine("BAD reflected swallowed rc=" + rc);
+            return 1;
+        } catch (Exception e) {
+            Check(e.Message == "boom reflected", "reflected exc message");
+            Console.WriteLine("reflected propagated");
+        }
+
+        try {
+            int rc = await SpawnProbe();
+            Console.WriteLine("BAD spawn swallowed rc=" + rc);
+            return 1;
+        } catch (Exception e) {
+            Check(e.Message == "boom spawn", "spawn exc message");
+            Console.WriteLine("spawn propagated");
+        }
+        Console.WriteLine("join exc propagation passed");
+        return 0;
+    }
+}

@@ -126,12 +126,24 @@ typedef struct zan_co_header_probe {
     void (*sched_step)(void *);     /* ASYNC_FRAME_SCHED_STEP (ptr) */
     int state;                      /* ASYNC_FRAME_STATE (i32) */
     int done;                       /* ASYNC_FRAME_DONE (i32) */
+    void *awaiter;                  /* ASYNC_FRAME_AWAITER (ptr) */
+    void *awaiter_step;             /* ASYNC_FRAME_AWAITER_STEP (ptr) */
+    long long result;               /* ASYNC_FRAME_RESULT (i64) */
+    void (*cleanup)(void *);        /* ASYNC_FRAME_CLEANUP (ptr) */
+    int hcount;                     /* ASYNC_FRAME_HCOUNT (i32) */
+    void (*self_step)(void *);      /* ASYNC_FRAME_SELF_STEP (ptr) */
+    void *exc;                      /* ASYNC_FRAME_EXC (ptr) */
+    void *exc_tid;                  /* ASYNC_FRAME_EXC_TID (ptr) */
+    int exc_owned;                  /* ASYNC_FRAME_EXC_OWNED (i32) */
 } zan_co_header_probe;
 _Static_assert(offsetof(zan_co_header_probe, done) == JOIN_OFF_DONE,
                "JOIN_OFF_DONE drifts from the emitter's ASYNC_FRAME_DONE "
                "(see irgen_expr_core.c)");
 _Static_assert(offsetof(zan_co_header_probe, state) == JOIN_OFF_DONE - (int)sizeof(int),
                "co header state/done pair out of order vs JOIN_OFF_DONE");
+#define JOIN_OFF_EXC     (int)offsetof(zan_co_header_probe, exc)
+#define JOIN_OFF_EXC_TID (int)offsetof(zan_co_header_probe, exc_tid)
+#define JOIN_OFF_EXC_OWN (int)offsetof(zan_co_header_probe, exc_owned)
 
 typedef struct zan_join_pair {
     void            *frame;
@@ -149,6 +161,11 @@ typedef struct zan_join {
     int              npairs;
     int              winner;
     int              remaining;
+    /* M2：首个失败子任务的异常快照（任务结束锁内从子帧转移所有权），
+     * joiner 唤醒后经 zan_join_exc 取走并沿 await 链重抛。 */
+    void            *exc;
+    void            *exc_tid;
+    int              exc_owned;
     int              capacity;
     zan_join_pair_t  pairs[];
 } zan_join_t;
@@ -335,6 +352,20 @@ static void join_on_task_end_locked(void *frame, zan_join_wakes_t *wakes) {
             pr->done = 1;
             zan_join_t *j = pr->owner;
             j->remaining--;
+            /* M2：子任务带异常结束时，此刻子帧尚未拆除——把异常对象
+             * 所有权从子帧转移到 join 快照（清子帧槽位防二次释放），
+             * joiner 唤醒后经 zan_join_exc 取走重抛。仅记首个。 */
+            if (!j->exc) {
+                void *exc = *(void **)((unsigned char *)frame + JOIN_OFF_EXC);
+                if (exc) {
+                    j->exc = exc;
+                    j->exc_tid = *(void **)((unsigned char *)frame + JOIN_OFF_EXC_TID);
+                    j->exc_owned =
+                        *(volatile int *)((unsigned char *)frame + JOIN_OFF_EXC_OWN);
+                    *(void **)((unsigned char *)frame + JOIN_OFF_EXC) = NULL;
+                    *(volatile int *)((unsigned char *)frame + JOIN_OFF_EXC_OWN) = 0;
+                }
+            }
             if (!j->fired && (j->any ? join_any_done(j) : j->remaining == 0)) {
                 j->fired = 1;
                 /* A ready waiter may immediately cancel and free its join. */
@@ -408,6 +439,21 @@ int zan_join_bind(long long entry, void *frame, int idx) {
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
+        if (done && !j->exc) {
+            /* M2：已完成（甚至已 throw）的子任务在 bind 前就绪时，异常
+             * 快照仍要收——否则 join 语义吞掉先于 bind 的失败。帧未 reap
+             * 时 EXC 槽位有效（所有权随快照转移）；已 reap 的帧在
+             * live 检查处就已跳过。 */
+            void *exc = *(void **)((unsigned char *)frame + JOIN_OFF_EXC);
+            if (exc) {
+                j->exc = exc;
+                j->exc_tid = *(void **)((unsigned char *)frame + JOIN_OFF_EXC_TID);
+                j->exc_owned =
+                    *(volatile int *)((unsigned char *)frame + JOIN_OFF_EXC_OWN);
+                *(void **)((unsigned char *)frame + JOIN_OFF_EXC) = NULL;
+                *(volatile int *)((unsigned char *)frame + JOIN_OFF_EXC_OWN) = 0;
+            }
+        }
         if (!done) {
             if (j->npairs >= j->capacity) { live_unlock(); return 0; }
             zan_join_pair_t *pr = &j->pairs[j->npairs];
@@ -435,6 +481,22 @@ int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
     if (!satisfied) { j->joiner = frame; j->joiner_step = step; }
     live_unlock();
     return satisfied ? 1 : 0;
+}
+
+void *zan_join_exc(long long entry, void **tid_out, int *owned_out) {
+    zan_join_t *j = (zan_join_t *)(intptr_t)entry;
+    if (!j) return NULL;
+    live_lock();
+    void *exc = j->exc;
+    void *tid = j->exc_tid;
+    int owned = j->exc_owned;
+    j->exc = NULL;
+    j->exc_tid = NULL;
+    j->exc_owned = 0;
+    live_unlock();
+    if (tid_out) *tid_out = tid;
+    if (owned_out) *owned_out = owned;
+    return exc;
 }
 
 void zan_join_cancel(long long entry) {
