@@ -40,12 +40,26 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
                        LLVMGetTypeKind(ptypes[0]) != LLVMPointerTypeKind))
         return NULL;
 
-    char nm[128];
-    snprintf(nm, sizeof(nm), "__zan.refl.thunk.%s.%d", tag ? tag : "m",
-             g->refl_thunk_count++);
+    /* Inherited copies must refer to the same callable payload. Key by the
+     * complete LLVM callee identity and receiver convention, never by member
+     * name (overrides/specializations can have the same source name). */
+    size_t fn_len = 0;
+    const char *fn_name = LLVMGetValueName2(fn, &fn_len);
+    size_t name_cap = fn_len + 64;
+    char *nm = (char *)malloc(name_cap);
+    if (!nm) return NULL;
+    snprintf(nm, name_cap, "__zan.refl.thunk.%s.%c.%.*s", tag ? tag : "m",
+             is_static ? 's' : 'i', (int)fn_len, fn_name);
+    LLVMValueRef cached = LLVMGetNamedFunction(g->mod, nm);
+    if (cached) {
+        free(nm);
+        return LLVMConstBitCast(cached, i8ptr);
+    }
     LLVMTypeRef th_ty = LLVMFunctionType(vd,
         (LLVMTypeRef[]){ i8ptr, i64ptr, i64ptr }, 3, 0);
     LLVMValueRef th = LLVMAddFunction(g->mod, nm, th_ty);
+    free(nm);
+    g->refl_thunk_count++;
     LLVMSetLinkage(th, LLVMInternalLinkage);
 
     zan_builder_point_t pt = zan_builder_save(g);
@@ -149,7 +163,7 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     int flags = is_static ? ZAN_REFL_MF_STATIC : 0;
     if (decl->method_decl.modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT))
         flags |= ZAN_REFL_MF_VIRTUAL;
-    flags |= refl_accessor_flag(sym, msym);
+    flags |= refl_accessor_flag(sym, msym->name);
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
     if (late) {
         /* 在 publish 模式下，仅为属性访问器（get_/set_）、带注解方法、

@@ -1,4 +1,5 @@
 /* rt_hw_b64.c: Base64 快速查表与编解码向量加速实现 */
+#include "rt_hw_internal.h"
 
 /* 7 */
 
@@ -165,33 +166,5 @@ int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
     }
 
     return (int64_t)(d - dst);
-}
-
-static inline int zan_ctz64_local(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_ctzll(x);
-#elif defined(_MSC_VER)
-    unsigned long idx;
-    _BitScanForward64(&idx, x);
-    return (int)idx;
-#else
-    int n = 0;
-    while ((x & 1) == 0) { x >>= 1; n++; }
-    return n;
-#endif
-}
-
-static inline int zan_ctz32_local(uint32_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_ctz(x);
-#elif defined(_MSC_VER)
-    unsigned long idx;
-    _BitScanForward(&idx, x);
-    return (int)idx;
-#else
-    int n = 0;
-    while ((x & 1) == 0) { x >>= 1; n++; }
-    return n;
-#endif
 }
 

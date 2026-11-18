@@ -402,6 +402,7 @@ void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef sl
 void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type, LLVMValueRef slot);
 void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type, LLVMValueRef out_ptr, LLVMValueRef value);
 void emit_vtables(zan_irgen_t *g);
+void note_virtual_slot_demand(zan_irgen_t *g, zan_symbol_t *owner, int slot);
 LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym, zan_ast_node_t *decl, zan_type_t **args, int argc, LLVMTypeRef *out_fn_type);
 LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym, zan_type_t **args, int argc, LLVMTypeRef *out_fn_type);
 zan_type_t * generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym, zan_ast_node_t *call, local_scope_t *locals);
@@ -484,9 +485,9 @@ void emit_eh_tmp_drop(zan_irgen_t *g, LLVMValueRef obj);
 void emit_eh_tmp_pop(zan_irgen_t *g);
 void emit_eh_tmp_push(zan_irgen_t *g, LLVMValueRef obj);
 void emit_eh_tmp_push_slot(zan_irgen_t *g, LLVMValueRef slot, int kind);
-void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top);
 /* Register one class/interface owner, including erased tagged delegates. */
 void emit_eh_tmp_push_obj(zan_irgen_t *g, LLVMValueRef value);
+void emit_eh_unwind_to_handler(zan_irgen_t *g, LLVMValueRef top);
 void emit_eh_tmp_unwind_to(zan_irgen_t *g, LLVMValueRef mark);
 void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
 LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr, zan_ast_node_t *qmem, local_scope_t *locals);
@@ -504,6 +505,9 @@ LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g);
 LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g);
 LLVMValueRef get_libc_fn(zan_irgen_t *g, const char *name, LLVMTypeRef ty);
 LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym, zan_symbol_t *fsym, zan_type_t *inst);
+void irgen_record_static_type_use(zan_irgen_t *g, zan_symbol_t *sym, zan_type_t *inst);
+LLVMValueRef get_static_init_coordinator(zan_irgen_t *g);
+void finalize_static_rc_cleanup(zan_irgen_t *g);
 LLVMValueRef get_str_case_fn(zan_irgen_t *g, int upper);
 LLVMValueRef get_str_join_fn(zan_irgen_t *g);
 LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g);
@@ -625,15 +629,15 @@ zan_type_t * dict_key_type(zan_irgen_t *g, zan_type_t *t);
 zan_type_t * dict_value_type(zan_type_t *t);
 LLVMValueRef emit_guarded_member_object(zan_irgen_t *g, zan_ast_node_t *member, local_scope_t *locals);
 LLVMValueRef emit_guarded_member_object_ex(zan_irgen_t *g, zan_ast_node_t *member, local_scope_t *locals, bool async_gate);
-LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp, zan_type_t *rt, int mode);
-void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr, LLVMValueRef value, zan_loc_t loc, local_scope_t *locals);
-zan_symbol_t * expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
-int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
     LLVMValueRef value, local_scope_t *locals);
 LLVMValueRef emit_call_member_object(zan_irgen_t *g, zan_ast_node_t *member,
     local_scope_t *locals, bool async_gate, LLVMValueRef *borrowed_owner);
 void emit_drop_call_receiver(zan_irgen_t *g, LLVMValueRef borrowed_owner);
+LLVMValueRef emit_task_member(zan_irgen_t *g, LLVMValueRef hp, zan_type_t *rt, int mode);
+void emit_weak_read_guard(zan_irgen_t *g, zan_ast_node_t *read_expr, LLVMValueRef value, zan_loc_t loc, local_scope_t *locals);
+zan_symbol_t * expr_class_sym(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
+int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool expr_is_bool(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool expr_is_char(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool expr_is_int32(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
@@ -834,13 +838,15 @@ void emit_site_meta_table(zan_irgen_t *g);
 bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt, LLVMValueRef recv, zan_istr_t name, zan_ast_node_t **args, int argc, local_scope_t *locals, LLVMValueRef *out);
 bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti, zan_istr_t name, zan_ast_node_t **args, int argc, local_scope_t *locals, LLVMValueRef *out);
 void refl_finalize_mtabs(zan_irgen_t *g);
+void refl_compact_member_tables(zan_irgen_t *g);
 LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp, int disp_len);
 LLVMValueRef refl_obj_type_fn(zan_irgen_t *g);
 void refl_reserve_thunk_sites(zan_irgen_t *g);
-bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym);
+bool refl_needs_site_meta(zan_irgen_t *g);
 bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
 bool refl_is_exact_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
 bool refl_ctor_needs_thunk(zan_irgen_t *g);
+bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl);
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
@@ -848,7 +854,6 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
 
 /* --- From irgen_stmt.c (7 functions) --- */
 bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals);
-bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
 void emit_eh_disarm_from(zan_irgen_t *g, int base);
 void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals, const zan_irgen_finally_entry_t *entry);

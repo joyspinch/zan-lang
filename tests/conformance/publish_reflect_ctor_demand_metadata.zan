@@ -2,8 +2,8 @@ using System;
 using System.Collections.Generic;
 
 // Publish IR contract: no __zan.refl.thunk.new.* or list_ctor.* definitions.
-// The dead helper contains CreateInstance deliberately: an AST-wide scan must
-// not turn metadata-only reflection into callable constructor demand.
+// Dead helpers contain CreateInstance and GetType deliberately: an AST-wide
+// scan must not enable constructor calls or dynamic allocation-site metadata.
 class CtorDemandMetadataChild {
     public int Value;
     public CtorDemandMetadataChild(int value) { Value = value; }
@@ -19,14 +19,31 @@ class CtorDemandMetadataOwner {
     }
 }
 
+// This class and List are allocated normally, outside typeof's type graph.
+// Their reflection-only hook must not become callable through their sites.
+class CtorDemandMetadataUnrelated {
+    public int SiteMetadataUnrelatedField;
+    public CtorDemandMetadataUnrelated(int value) { SiteMetadataUnrelatedField = value; }
+    public void OnMetadataSiteOnly() {
+        Console.WriteLine("SITE_METADATA_UNRELATED_HOOK_MUST_BE_DEAD");
+    }
+}
+
 class Program {
     static object UnusedFactory(TypeInfo type) { return type.CreateInstance(); }
+    static TypeInfo UnusedRuntimeType(object value) { return value.GetType(); }
 
     static void Require(bool value, string message) {
         if (!value) throw new Exception(message);
     }
 
     static void Main() {
+        CtorDemandMetadataUnrelated unrelated = new CtorDemandMetadataUnrelated(73);
+        List<CtorDemandMetadataUnrelated> unrelatedItems = new List<CtorDemandMetadataUnrelated>();
+        unrelatedItems.Add(unrelated);
+        Require(unrelated.SiteMetadataUnrelatedField == 73 &&
+        unrelatedItems[0].SiteMetadataUnrelatedField == 73,
+        "ordinary class and List use independent of reflection");
         TypeInfo type = typeof(CtorDemandMetadataOwner);
         Require(type.ConstructorCount == 2, "constructor count retained");
         Require(type.GetCtorParamCount(0) == 0, "default constructor shape");
@@ -36,7 +53,7 @@ class Program {
         Require(type.FieldCount == 2, "field metadata retained");
         TypeInfo list = typeof(List<CtorDemandMetadataChild>);
         Require(list.ConstructorCount == 1 && list.GetCtorParamCount(0) == 0,
-            "builtin List constructor metadata retained");
+        "builtin List constructor metadata retained");
         Require(list.ElementType.ConstructorCount == 1, "element constructor metadata");
         Require(list.ElementType.GetCtorParamType(0, 0) == "int", "element parameter metadata");
         Console.WriteLine("metadata PASS");

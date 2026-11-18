@@ -1,4 +1,5 @@
 /* rt_hw_asym.c: X25519 标量乘法、有限域算术与 RSA 大数模幂/CRT 实现 */
+#include "rt_hw_internal.h"
 
 #if defined(__SIZEOF_INT128__) || (defined(__clang__) || defined(__GNUC__))
 typedef unsigned __int128 zan_fe_u128;

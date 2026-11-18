@@ -121,7 +121,7 @@ static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
 struct embed_api_ctx {
     LLVMTypeRef  i8, i8p, i32, i64, ent_ty;
     LLVMValueRef gtbl, gcnt, gbuf, empty;
-    LLVMValueRef own_tbl, own_cnt;
+    LLVMValueRef own_tbl, own_cnt, own_payloads;
     long long    buf_cap;
     unsigned long long seed;
 };
@@ -188,6 +188,19 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
         LLVMConstInt(c->i32, 0, 0), "iseq"), hit, next);
 
     LLVMPositionBuilderAtEnd(b, hit);
+    if (c->own_payloads) {
+        /* Only baked rows have aliases. Registered rows still win by name. */
+        LLVMValueRef zero = LLVMConstInt(c->i64, 0, 0);
+        LLVMValueRef slot = LLVMBuildLoad2(b, c->i64, sv, "payload.slot");
+        LLVMValueRef own = LLVMBuildICmp(b, LLVMIntNE, slot, zero, "payload.own");
+        LLVMValueRef index = LLVMBuildSelect(b, own, i, zero, "payload.index");
+        LLVMValueRef owner_ptr = LLVMBuildGEP2(b, c->i32, c->own_payloads,
+                                             &index, 1, "payload.owner.p");
+        LLVMValueRef owner = LLVMBuildLoad2(b, c->i32, owner_ptr, "payload.owner");
+        LLVMValueRef payload = embed_entry_at(b, c, c->own_tbl,
+                                             LLVMBuildZExt(b, owner, c->i64, "payload.row"));
+        ent = LLVMBuildSelect(b, own, payload, ent, "payload.entry");
+    }
     LLVMBuildRet(b, ent);
 
     LLVMPositionBuilderAtEnd(b, next);
@@ -840,9 +853,76 @@ int zan_embed_emit_specs(zan_irgen_t *g, const char *const *specs, int count) {
     return zan_embed_emit_specs_filtered(g, specs, count, NULL, 0);
 }
 
+struct embed_baked_entry {
+    int owner;
+    LLVMValueRef name, data, length;
+};
+
+struct embed_payload_ref {
+    const zan_embed_file_t *file;
+    uint64_t hash;
+};
+
+static int embed_compare_content(const struct embed_payload_ref *a,
+                                 const struct embed_payload_ref *b) {
+    if (a->hash != b->hash) return a->hash < b->hash ? -1 : 1;
+    if (a->file->len != b->file->len) return a->file->len < b->file->len ? -1 : 1;
+    return memcmp(a->file->data, b->file->data, (size_t)a->file->len);
+}
+
+static int embed_compare_payloads(const void *left, const void *right) {
+    const struct embed_payload_ref *a = left, *b = right;
+    int cmp = embed_compare_content(a, b);
+    if (cmp != 0) return cmp;
+    /* Break ties by original resource order without reordering the rows. */
+    return (a->file > b->file) - (a->file < b->file);
+}
+
+static bool embed_plan_payloads(const zan_embed_list_t *files,
+                                struct embed_baked_entry *baked, uint64_t *seed_out,
+                                bool *shares_payloads) {
+    struct embed_payload_ref *refs = NULL;
+    if (files->n > 0) {
+        refs = calloc((size_t)files->n, sizeof(*refs));
+        if (!refs) return false;
+    }
+    /* Keep the original seed derivation over every name and original payload. */
+    uint64_t seed = 1469598103934665603ULL;
+    for (int i = 0; i < files->n; i++) {
+        const zan_embed_file_t *file = &files->v[i];
+        for (const char *p = file->name; *p; p++) {
+            seed ^= (unsigned char)*p;
+            seed *= 1099511628211ULL;
+        }
+        seed ^= 0xFF;
+        seed *= 1099511628211ULL;
+        uint64_t hash = 1469598103934665603ULL;
+        for (long long j = 0; j < file->len; j++) {
+            seed ^= file->data[j];
+            seed *= 1099511628211ULL;
+            hash ^= file->data[j];
+            hash *= 1099511628211ULL;
+        }
+        refs[i] = (struct embed_payload_ref){ file, hash };
+    }
+    if (files->n > 1) qsort(refs, (size_t)files->n, sizeof(*refs), embed_compare_payloads);
+    int owner = 0;
+    for (int i = 0; i < files->n; i++) {
+        int index = (int)(refs[i].file - files->v);
+        if (i == 0 || embed_compare_content(&refs[i - 1], &refs[i]) != 0) owner = index;
+        baked[index].owner = owner;
+        if (owner != index) *shares_payloads = true;
+    }
+    free(refs);
+    *seed_out = embed_mix64(seed ^ 0x5A4E454D42524453ULL);
+    return true;
+}
+
 int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int count) {
-    zan_embed_list_t files;
-    memset(&files, 0, sizeof(files));
+    zan_embed_list_t files = {0};
+    struct embed_baked_entry *baked = NULL;
+    LLVMValueRef *ents = NULL;
+    int result = -1;
 
     for (int i = 0; i < count; i++) {
         if (!specs[i].spec || !specs[i].spec[0]) continue;
@@ -867,91 +947,56 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
         if (files.n == before) {
             fprintf(stderr, "error: --embed '%s' matched no readable file\n",
                     specs[i].spec);
-            for (int f = 0; f < files.n; f++) {
-                free(files.v[f].name);
-                free(files.v[f].data);
-            }
-            free(files.v);
-            return -1;
+            goto cleanup;
         }
     }
-    unsigned char *compressed = (unsigned char *)calloc(
-        (size_t)(files.n > 0 ? files.n : 1), 1);
-    if (!compressed) {
-        for (int f = 0; f < files.n; f++) {
-            free(files.v[f].name);
-            free(files.v[f].data);
-        }
-        free(files.v);
-        return -1;
+
+    uint64_t seed;
+    bool shares_payloads = false;
+    baked = calloc((size_t)(files.n > 0 ? files.n : 1), sizeof(*baked));
+    ents = calloc((size_t)files.n + 1, sizeof(*ents));
+    if (!baked || !ents || !embed_plan_payloads(&files, baked, &seed, &shares_payloads)) {
+        fprintf(stderr, "error: out of memory preparing embedded resources\n");
+        goto cleanup;
     }
-    /* 种子从本次内嵌的全部（名字+原始字节）确定性派生：同一份资源
-     * 两次构建产出一致（确定性构建可复现），资源集不同则密钥流不同。 */
-    uint64_t seed = 1469598103934665603ULL;
-    for (int i = 0; i < files.n; i++) {
-        const char *p = files.v[i].name ? files.v[i].name : "";
-        for (; *p; p++) {
-            seed ^= (unsigned char)*p;
-            seed *= 1099511628211ULL;
-        }
-        seed ^= 0xFF;
-        seed *= 1099511628211ULL;
-        for (long long j = 0; j < files.v[i].len; j++) {
-            seed ^= files.v[i].data[j];
-            seed *= 1099511628211ULL;
-        }
-    }
-    seed = embed_mix64(seed ^ 0x5A4E454D42524453ULL);
-    int any_compressed = 0;
-    int any_encrypted = 0;
-    for (int i = 0; i < files.n; i++) {
-        long long clen = 0;
-        unsigned char *cbuf = embed_maybe_compress(files.v[i].data,
-                                                   files.v[i].len, &clen);
-        if (cbuf) {
-            free(files.v[i].data);
-            files.v[i].data = cbuf;
-            files.v[i].len = clen;
-            compressed[i] = 1;
-            any_compressed = 1;
-        }
-        embed_crypt(files.v[i].name, files.v[i].data, files.v[i].len, seed);
-        any_encrypted = 1;
-    }
-    if (any_compressed || any_encrypted) g->uses_inflate = true;
+
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fields[] = { i8p, i8p, i64 };
     LLVMTypeRef ent_ty = LLVMStructTypeInContext(g->ctx, fields, 3, 0);
-
-    LLVMValueRef *ents = (LLVMValueRef *)malloc(
-        (size_t)(files.n + 1) * sizeof(LLVMValueRef));
-    if (!ents) return -1;
     long long total_names = 0;
     for (int i = 0; i < files.n; i++) {
-        total_names += (long long)strlen(files.v[i].name) + 1;
+        const zan_embed_file_t *file = &files.v[i];
+        long long name_len = (long long)strlen(file->name);
+        total_names += name_len + 1;
         char label[64];
         snprintf(label, sizeof(label), "zan.embed.n%d", i);
-        LLVMValueRef name = embed_bytes_global(g, label,
-            (const unsigned char *)files.v[i].name,
-            (long long)strlen(files.v[i].name));
-        snprintf(label, sizeof(label), "zan.embed.d%d", i);
-        LLVMValueRef data = embed_bytes_global(g, label, files.v[i].data,
-                                               files.v[i].len);
-        if (!name || !data) {
-            free(ents);
-            free(compressed);
-            for (int f = 0; f < files.n; f++) {
-                free(files.v[f].name);
-                free(files.v[f].data);
-            }
-            free(files.v);
-            return -1;
+        baked[i].name = embed_bytes_global(g, label,
+                                          (const unsigned char *)file->name, name_len);
+        if (!baked[i].name) goto cleanup;
+
+        struct embed_baked_entry *owner = &baked[baked[i].owner];
+        if (owner == &baked[i]) {
+            long long len = file->len, clen = 0;
+            unsigned char *cbuf = embed_maybe_compress(file->data, len, &clen);
+            unsigned char *data = cbuf ? cbuf : file->data;
+            if (cbuf) len = clen;
+            embed_crypt(file->name, data, len, seed);
+            snprintf(label, sizeof(label), "zan.embed.d%d", i);
+            owner->data = embed_bytes_global(g, label, data, len);
+            uint64_t flags = ZAN_EMBED_ENCRYPTED;
+            if (cbuf) flags |= ZAN_EMBED_COMPRESSED;
+            free(cbuf);
+            if (!owner->data) goto cleanup;
+            owner->length = LLVMConstInt(i64, (uint64_t)len | flags, 0);
         }
-        unsigned long long lval = (unsigned long long)files.v[i].len;
-        if (compressed[i]) lval |= ZAN_EMBED_COMPRESSED;
-        lval |= ZAN_EMBED_ENCRYPTED;
-        LLVMValueRef vals[] = { name, data, LLVMConstInt(i64, lval, 0) };
+        /* Alias rows retain their names but have no separate decode state. */
+        LLVMValueRef vals[] = { baked[i].name, baked[i].data,
+                                baked[i].length };
+        if (owner != &baked[i]) {
+            vals[1] = LLVMConstNull(i8p);
+            vals[2] = LLVMConstNull(i64);
+        }
         ents[i] = LLVMConstNamedStruct(ent_ty, vals, 3);
     }
     LLVMValueRef nulls[] = { LLVMConstNull(i8p), LLVMConstNull(i8p),
@@ -969,12 +1014,22 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
         LLVMValueRef idx[] = { zero, zero };
         tbl0 = LLVMConstInBoundsGEP2(tbl_ty, tbl, idx, 2);
     }
-    free(ents);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef own_payloads = NULL;
+    if (shares_payloads) {
+        LLVMTypeRef owners_ty = LLVMArrayType(i32, (unsigned)files.n);
+        own_payloads = LLVMAddGlobal(g->mod, owners_ty, "zan.embed.payloads");
+        for (int i = 0; i < files.n; i++)
+            ents[i] = LLVMConstInt(i32, (unsigned)baked[i].owner, 0);
+        LLVMSetInitializer(own_payloads, LLVMConstArray(i32, ents, (unsigned)files.n));
+        LLVMSetLinkage(own_payloads, LLVMPrivateLinkage);
+        LLVMSetGlobalConstant(own_payloads, 1);
+    }
 
     struct embed_api_ctx c;
     c.i8 = LLVMInt8TypeInContext(g->ctx);
     c.i8p = i8p;
-    c.i32 = LLVMInt32TypeInContext(g->ctx);
+    c.i32 = i32;
     c.i64 = i64;
     c.ent_ty = ent_ty;
     c.buf_cap = total_names + 4096;
@@ -986,6 +1041,7 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
     LLVMSetLinkage(c.gcnt, LLVMInternalLinkage);
     c.own_tbl = tbl0;
     c.own_cnt = LLVMConstInt(i64, (unsigned long long)files.n, 0);
+    c.own_payloads = own_payloads;
     c.seed = seed;
     c.gbuf = LLVMAddGlobal(g->mod, i8p, "zan.embed.gbuf");
     LLVMSetInitializer(c.gbuf, LLVMConstNull(i8p));
@@ -1007,20 +1063,22 @@ int zan_embed_emit_spec_list(zan_irgen_t *g, const zan_embed_spec_t *specs, int 
 
     embed_emit_register(g, &c);
     LLVMValueRef find = embed_emit_find(g, &c);
-    LLVMValueRef unzip = (any_compressed || any_encrypted)
-                             ? embed_emit_unzip(g, &c)
-                             : embed_emit_passthrough(g, &c);
+    LLVMValueRef unzip = files.n > 0 ? embed_emit_unzip(g, &c)
+                                    : embed_emit_passthrough(g, &c);
     embed_emit_read_has_bytes(g, &c, find, unzip);
     embed_emit_list(g, &c);
 
+    if (files.n > 0) g->uses_inflate = true;
     g->uses_embed_api = false;
+    result = files.n;
 
-    int n = files.n;
-    for (int i = 0; i < n; i++) {
+cleanup:
+    for (int i = 0; i < files.n; i++) {
         free(files.v[i].name);
         free(files.v[i].data);
     }
     free(files.v);
-    free(compressed);
-    return n;
+    free(ents);
+    free(baked);
+    return result;
 }

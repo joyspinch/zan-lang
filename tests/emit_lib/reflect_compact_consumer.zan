@@ -1,0 +1,66 @@
+using System;
+
+class CompactDllConsumerLocal {
+    public double LocalMeasure;
+    public bool LocalEnabled;
+    public int LocalCount;
+    public CompactDllConsumerLocal() { }
+    public int OnLocal(int value) { return value + 3; }
+}
+
+class Main {
+    [DllImport("emitlib_reflect_compact.dll")]
+    static extern TypeInfo CompactReflectionLib_GetTypeInfo();
+
+    static void Check(bool condition, string message) {
+        if (!condition) throw new Exception(message);
+    }
+
+    static int FindMethod(TypeInfo type, string name) {
+        for (int i = 0; i < type.MethodCount; i++) {
+            if (type.GetMethodName(i) == name) return i;
+        }
+        return -1;
+    }
+
+    static void Main() {
+        // Keep a distinct compact record/payload pool in this module. Reading
+        // DLL indices with these bases must fail the remote assertions below.
+        TypeInfo local = typeof(CompactDllConsumerLocal);
+        Check(local.FieldCount == 3 && local.GetFieldName(0) == "LocalMeasure" &&
+            local.GetFieldType(0) == "double", "consumer local field pool");
+        int localMethod = FindMethod(local, "OnLocal");
+        Check(local.GetMethodReturnType(localMethod) == "int" &&
+            local.GetMethodParamType(localMethod, 0) == "int" &&
+            local.ConstructorCount == 1, "consumer local method pool");
+
+        TypeInfo remote = CompactReflectionLib_GetTypeInfo();
+        Check(remote.Name == "CompactDllRecord" && remote.TableName == "compact_dll_records",
+            "DLL descriptor header");
+        Check(remote.FieldCount == 2 && remote.GetFieldName(0) == "RemoteId" &&
+            remote.GetFieldName(1) == "RemoteText" && remote.GetFieldType(0) == "int" &&
+            remote.GetFieldType(1) == "string" && remote.HasField("RemoteId") &&
+            !remote.HasField("LocalMeasure"), "DLL field record and payload bases");
+        Check(remote.GetFieldCustomName(0) == "remote_id" && remote.IsFieldPk(0) &&
+            remote.IsFieldRequired(1) && remote.GetFieldDefault(1) == "remote-default" &&
+            remote.GetFieldTypeInfo(0).Name == "int" &&
+            remote.GetFieldTypeInfo(1).Name == "string", "DLL field detail payloads");
+        int method = FindMethod(remote, "OnRemote");
+        int staticMethod = FindMethod(remote, "OnStatic");
+        Check(method >= 0 && staticMethod >= 0 && remote.HasMethod("OnRemote") &&
+            !remote.HasMethod("OnLocal") && remote.GetMethodReturnType(method) == "string" &&
+            remote.GetMethodParamCount(method) == 1 &&
+            remote.GetMethodParamType(method, 0) == "string" &&
+            remote.GetMethodCustomAttributes(method).Contains("COMPACT_DLL_METHOD_ATTRIBUTE") &&
+            !remote.IsMethodStatic(method) && remote.IsMethodStatic(staticMethod),
+            "DLL method record and payload bases");
+        Check(remote.ConstructorCount == 2 && remote.GetCtorParamCount(0) == 0 &&
+            remote.GetCtorParamCount(1) == 1 && remote.GetCtorParamType(1, 0) == "string",
+            "DLL constructor record and payload bases");
+        Check(remote.GetFieldName(-1) == "" && remote.GetMethodName(9999) == "" &&
+            remote.GetCtorParamType(9999, 0) == "", "DLL query guards");
+        Check(local.GetFieldName(0) == "LocalMeasure" &&
+            local.GetMethodName(localMethod) == "OnLocal", "consumer pool remains local");
+        Console.WriteLine("compact DLL reflection PASS");
+    }
+}

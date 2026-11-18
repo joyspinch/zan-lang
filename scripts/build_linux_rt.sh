@@ -80,18 +80,18 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
     # zanrt_timer.o.
     "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_crash.c" -o "$out/zanrt_crash.o"
-    # Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a
-    # bare object: a bare .o on the link line is loaded whole, so every
-    # program carried the entire SHA/AES/SM3/SM4 block even when it used none
-    # of it. As an archive member the linker pulls it only when the program
-    # really references a zan_hw_* symbol.
-    # Rebuild this together with zanrt_timer.o: both derive from the same
-    # rt_hw_accel.c, and mixing generations would define the same symbol
-    # twice (TASKS.md A493).
-    "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
-        -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
+    # Independent feature members keep JSON/CPU users from loading crypto.
+    set --
+    for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
+        crypto_name=${crypto_src##*/}
+        crypto_obj="$out/zan_crypto_${crypto_name%.c}.o"
+        "$ZIG" cc -target "$arch-linux-musl" -g0 -std=c11 -fPIC \
+            -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$crypto_src" -o "$crypto_obj"
+        set -- "$@" "$crypto_obj"
+    done
     rm -f "$out/libzancrypto.a"
-    "$ZIG" ar rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
+    "$ZIG" ar rcs "$out/libzancrypto.a" "$@"
+    rm -f "$@"
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so the cross link injects these
     # two objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).

@@ -33,4 +33,5 @@ typedef struct {
 #include "emit/emit_main.c"
 #include "emit/emit_async.c"
 #include "emit/emit_methods.c"
+#include "emit/emit_static_init.c"
 #include "emit/emit_target.c"

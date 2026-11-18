@@ -47,12 +47,8 @@ static LLVMValueRef refl_find_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, more, body, miss);
 
     LLVMPositionBuilderAtEnd(g->builder, body);
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, i,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef fname = LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildBitCast(g->builder, fe, LLVMPointerType(i8ptr, 0), "refl.fnp"),
-        "refl.fn");
+    LLVMValueRef fe = refl_member_row(g, fields, i, false);
+    LLVMValueRef fname = refl_field_ptr(g, fields, fe, 0);
     LLVMValueRef c = zan_call2(g->builder,
         LLVMFunctionType(i32, (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0),
         g->fn_strcmp, (LLVMValueRef[]){ fname, want }, 2, "refl.cmp");
@@ -180,11 +176,9 @@ static LLVMValueRef refl_get_i64_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, have);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef kind = refl_hdr_i64(g, fe, 16, "refl.kind");
-    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.off");
+    LLVMValueRef fe = refl_member_row(g, fields, idx, false);
+    LLVMValueRef kind = refl_member_u32(g, fe, false, 7);
+    LLVMValueRef foff = refl_field_offset(g, fe);
     LLVMBuildCondBr(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
                       LLVMConstInt(i64, ZAN_REFL_FK_ENUM_MEMBER, 0), "refl.isem"),
@@ -298,11 +292,9 @@ static LLVMValueRef refl_get_f64_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, kinds);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef kind = refl_hdr_i64(g, fe, 16, "refl.kind");
-    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.off");
+    LLVMValueRef fe = refl_member_row(g, fields, idx, false);
+    LLVMValueRef kind = refl_member_u32(g, fe, false, 7);
+    LLVMValueRef foff = refl_field_offset(g, fe);
     LLVMValueRef sw = LLVMBuildSwitch(g->builder, kind, via_i, 2);
     LLVMAddCase(sw, LLVMConstInt(i64, ZAN_REFL_FK_FLOAT, 0), ld32);
     LLVMAddCase(sw, LLVMConstInt(i64, ZAN_REFL_FK_DOUBLE, 0), ld64);
@@ -389,11 +381,9 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, chk);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef kind = refl_hdr_i64(g, fe, 16, "refl.kind");
-    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.off");
+    LLVMValueRef fe = refl_member_row(g, fields, idx, false);
+    LLVMValueRef kind = refl_member_u32(g, fe, false, 7);
+    LLVMValueRef foff = refl_field_offset(g, fe);
     LLVMBuildCondBr(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
                       LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.isstr"),
@@ -476,11 +466,9 @@ static LLVMValueRef refl_get_obj_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, chk);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef kind = refl_hdr_i64(g, fe, 16, "refl.kind");
-    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.off");
+    LLVMValueRef fe = refl_member_row(g, fields, idx, false);
+    LLVMValueRef kind = refl_member_u32(g, fe, false, 7);
+    LLVMValueRef foff = refl_field_offset(g, fe);
     LLVMValueRef is_ref = LLVMBuildOr(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, kind,
                       LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.isref"),
@@ -543,8 +531,7 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, load);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef byte_off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
+    LLVMValueRef row = refl_member_row(g, fields, idx, false);
     LLVMValueRef sel = LLVMBuildSelect(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_WHICH_NAME, 0), "refl.isname"),
@@ -552,24 +539,20 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
         LLVMBuildSelect(g->builder,
             LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                           LLVMConstInt(i64, ZAN_REFL_WHICH_TYPE, 0), "refl.istype"),
-            LLVMConstInt(i64, 8, 0),
+            LLVMConstInt(i64, 1, 0),
             LLVMBuildSelect(g->builder,
                 LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                               LLVMConstInt(i64, ZAN_REFL_WHICH_CUSTOM, 0), "refl.iscust"),
-                LLVMConstInt(i64, 32, 0),
+                LLVMConstInt(i64, 2, 0),
                 LLVMBuildSelect(g->builder,
                     LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                                   LLVMConstInt(i64, ZAN_REFL_WHICH_DEFAULT, 0), "refl.isdef"),
-                    LLVMConstInt(i64, 48, 0),
-                    LLVMConstInt(i64, 64, 0), "refl.sel4"),
+                    LLVMConstInt(i64, 3, 0),
+                    LLVMConstInt(i64, 5, 0), "refl.sel4"),
                 "refl.sel3"),
             "refl.sel2"),
         "refl.sel");
-    byte_off = LLVMBuildAdd(g->builder, byte_off, sel, "refl.fo2");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &byte_off, 1, "refl.fe");
-    LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildBitCast(g->builder, fe, LLVMPointerType(i8ptr, 0), "refl.fp"),
-        "refl.fv");
+    LLVMValueRef sv = refl_member_ptr(g, fields, row, false, sel);
     LLVMBuildRet(g->builder, LLVMBuildSelect(g->builder,
         LLVMBuildIsNull(g->builder, sv, "refl.fnull"), empty, sv, "refl.name"));
 

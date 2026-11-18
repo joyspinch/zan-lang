@@ -495,6 +495,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     g->refl_metas[g->refl_meta_count].name =
         zan_arena_strdup(g->arena, disp, (size_t)disp_len);
     g->refl_metas[g->refl_meta_count].rec = rec;
+    g->refl_metas[g->refl_meta_count].gv = gv;
     g->refl_meta_count++;
     g->refl_used = true;
 
@@ -593,22 +594,26 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
     if (g->refl_used) {
         int sites, metas, mtabs;
         int ctor_cursor = 0;
+        bool site_meta_before;
         do {
+            site_meta_before = refl_needs_site_meta(g);
             sites = g->leak_site_count;
             metas = g->refl_meta_count;
             mtabs = g->refl_mtab_count;
-            for (int i = 1; i < g->leak_site_count; i++) {
-                if (g->site_coll && g->site_coll[i]) {
-                    if (g->site_coll[i] == 1) {
-                        zan_type_t *elem = g->site_coll_elem[i];
-                        refl_meta_for(g, zan_binder_make_list_type(g->binder, elem), NULL, 0);
-                    }
-                } else {
-                    zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
-                    if (sym && sym->type) {
-                        zan_type_t *t = g->site_inst && g->site_inst[i]
-                            ? g->site_inst[i] : sym->type;
-                        refl_meta_for(g, t, NULL, 0);
+            if (refl_needs_site_meta(g)) {
+                for (int i = 1; i < g->leak_site_count; i++) {
+                    if (g->site_coll && g->site_coll[i]) {
+                        if (g->site_coll[i] == 1) {
+                            zan_type_t *elem = g->site_coll_elem[i];
+                            refl_meta_for(g, zan_binder_make_list_type(g->binder, elem), NULL, 0);
+                        }
+                    } else {
+                        zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
+                        if (sym && sym->type) {
+                            zan_type_t *t = g->site_inst && g->site_inst[i]
+                                ? g->site_inst[i] : sym->type;
+                            refl_meta_for(g, t, NULL, 0);
+                        }
                     }
                 }
             }
@@ -639,10 +644,78 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
                 }
                 if (init) LLVMSetInitializer(g->refl_mtabs[i].gv, init);
             }
-        } while (sites != g->leak_site_count || metas != g->refl_meta_count ||
+        } while (site_meta_before != refl_needs_site_meta(g) ||
+                 sites != g->leak_site_count || metas != g->refl_meta_count ||
                  mtabs != g->refl_mtab_count);
     }
 }
+/* Project only after emitted capabilities converge. Keep the ABI, row order,
+ * call flags and parameter counts; lookup/invocation do not need type strings. */
+static void refl_project_member_table(zan_irgen_t *g, LLVMValueRef table,
+                                      LLVMTypeRef row_type, unsigned arity,
+                                      unsigned omitted_columns) {
+    if (!omitted_columns) return;
+    while (LLVMIsAConstantExpr(table)) {
+        LLVMOpcode op = LLVMGetConstOpcode(table);
+        if (op != LLVMBitCast && op != LLVMAddrSpaceCast) return;
+        table = LLVMGetOperand(table, 0);
+    }
+    if (!LLVMIsAGlobalVariable(table)) return;
+    LLVMValueRef init = LLVMGetInitializer(table);
+    LLVMTypeRef type = LLVMGlobalGetValueType(table);
+    if (!init || LLVMGetTypeKind(type) != LLVMArrayTypeKind) return;
+    unsigned n = LLVMGetArrayLength(type);
+    LLVMValueRef *rows = (LLVMValueRef *)calloc(n, sizeof(*rows));
+    if (!rows) return; /* Allocation failure keeps complete metadata. */
+    for (unsigned i = 0; i < n; i++) {
+        LLVMValueRef row = LLVMGetAggregateElement(init, i);
+        if (!row || LLVMIsNull(row)) {
+            rows[i] = LLVMConstNull(row_type);
+            continue;
+        }
+        LLVMValueRef values[9];
+        for (unsigned j = 0; j < arity; j++) {
+            LLVMValueRef value = LLVMGetAggregateElement(row, j);
+            values[j] = omitted_columns & (1u << j) ? LLVMConstNull(LLVMTypeOf(value)) : value;
+        }
+        rows[i] = LLVMConstNamedStruct(row_type, values, arity);
+    }
+    LLVMSetInitializer(table, LLVMConstArray(row_type, rows, n));
+    free(rows);
+}
+
+static void refl_project_member_metadata(zan_irgen_t *g) {
+    if (!g->publish_reflect_demand) return;
+    unsigned queries = g->refl_query_used;
+    unsigned fields = 0, methods = 0, ctors = (1u << 1) | (1u << 7);
+    if (!(queries & ZAN_REFL_QUERY_FIELD_TYPE)) fields |= 1u << 1;
+    if (!(queries & ZAN_REFL_QUERY_FIELD_CUSTOM)) fields |= 1u << 4;
+    if (!(queries & ZAN_REFL_QUERY_FIELD_DEFAULT)) fields |= 1u << 6;
+    if (!(queries & ZAN_REFL_QUERY_FIELD_TYPEINFO)) fields |= 1u << 7;
+    if (!(queries & ZAN_REFL_QUERY_FIELD_ATTRS)) fields |= 1u << 8;
+    if (!(queries & ZAN_REFL_QUERY_METHOD_RETURN)) methods |= 1u << 1;
+    if (!(queries & ZAN_REFL_QUERY_METHOD_PARAMS)) methods |= 1u << 4;
+    if (!(queries & ZAN_REFL_QUERY_METHOD_ATTRS)) methods |= 1u << 7;
+    if (!(queries & ZAN_REFL_QUERY_CTOR_PARAMS)) ctors |= 1u << 4;
+    for (int i = 0; i < g->refl_meta_count; i++) {
+        LLVMValueRef gv = g->refl_metas[i].gv;
+        LLVMValueRef init = LLVMGetInitializer(gv);
+        if (!init || LLVMIsNull(init)) continue;
+        LLVMValueRef values[15];
+        for (unsigned j = 0; j < 15; j++)
+            values[j] = LLVMGetAggregateElement(init, j);
+        refl_project_member_table(g, values[9], refl_field_type(g), 9, fields);
+        refl_project_member_table(g, values[3], refl_method_type(g), 8, methods);
+        if (!g->refl_ctor_used && !(queries & ZAN_REFL_QUERY_CTORS)) {
+            values[5] = LLVMConstNull(LLVMTypeOf(values[5]));
+            values[6] = LLVMConstNull(LLVMTypeOf(values[6]));
+        } else {
+            refl_project_member_table(g, values[5], refl_method_type(g), 8, ctors);
+        }
+        LLVMSetInitializer(gv, LLVMConstNamedStruct(LLVMGlobalGetValueType(gv), values, 15));
+    }
+}
+
 void refl_finalize_mtabs(zan_irgen_t *g) {
     for (int i = 0; i < g->refl_mtab_count; i++) {
         if (g->refl_mtabs[i].ctors) continue;
@@ -651,6 +724,7 @@ void refl_finalize_mtabs(zan_irgen_t *g) {
                                            g->refl_mtabs[i].n, true);
         if (init) LLVMSetInitializer(g->refl_mtabs[i].gv, init);
     }
+    refl_project_member_metadata(g);
 }
 
 static LLVMValueRef refl_hdr_i64(zan_irgen_t *g, LLVMValueRef ti, int off,

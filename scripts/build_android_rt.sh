@@ -102,12 +102,18 @@ for pair in android-x64:x86_64 android-arm64:aarch64; do
     # zanrt_timer.o.
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
         -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_crash.c" -o "$out/zanrt_crash.o"
-    # Crypto as an archive member -- see scripts/build_linux_rt.sh for why a
-    # bare .o on the link line is wrong here.
-    "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
-        -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$ACCEL/zan_hw_accel.c" -o "$out/zan_crypto.o"
+    # Independent feature members keep JSON/CPU users from loading crypto.
+    set --
+    for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
+        crypto_name=${crypto_src##*/}
+        crypto_obj="$out/zan_crypto_${crypto_name%.c}.o"
+        "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
+            -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$crypto_src" -o "$crypto_obj"
+        set -- "$@" "$crypto_obj"
+    done
     rm -f "$out/libzancrypto.a"
-    "$AR" rcs "$out/libzancrypto.a" "$out/zan_crypto.o"
+    "$AR" rcs "$out/libzancrypto.a" "$@"
+    rm -f "$@"
     "$CC" --sysroot="$SYSROOT" -target "$triple" -g0 -std=c11 -fPIC \
         -I "$RT" -I "$EMBED" -I "$ROOT/src/common" -O2 -ffunction-sections -fdata-sections -c "$EMBED/zan_embed_api.c" \
         -o "$out/zan_embed_api.o"

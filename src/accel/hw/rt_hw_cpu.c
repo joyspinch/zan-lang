@@ -1,4 +1,5 @@
 /* rt_hw_cpu.c: CPU 特征指令集探针与硬件 KAT 校验门禁实现 */
+#include "rt_hw_internal.h"
 
 static volatile int g_cpuid_state = 0; /* 0: uninit, 1: initing, 2: ready */
 static int g_has_popcnt   = 0;
@@ -152,7 +153,7 @@ static void zan_hw_init_cpu_features_impl(void) {
     }
 }
 
-static void zan_hw_init_cpu_features(void) {
+void zan_hw_init_cpu_features(void) {
     if (__atomic_load_n(&g_cpuid_state, __ATOMIC_ACQUIRE) == 2) return;
     int expected = 0;
     if (__atomic_compare_exchange_n(&g_cpuid_state, &expected, 1, 0,
@@ -174,17 +175,9 @@ static void zan_hw_init_cpu_features(void) {
     }
 }
 
-static int g_gate_sha256 = 0;
-static int g_gate_sha1   = 0;
-static int g_gate_sha512 = 0;
-static int g_gate_sm3    = 0;
-static int g_gate_aes    = 0;
-static int g_gate_ghash  = 0;
-static int g_gate_crc32c = 0;
-static int g_gate_crc32  = 0;
-static int g_gate_sm4    = 0;
+int zan_hw_gate_states[ZAN_HW_GATE_COUNT] = {0};
 
-static int zan_hw_gate(int *state, int feature, int (*kat)(void)) {
+int zan_hw_gate(int *state, int feature, int (*kat)(void)) {
     int s = __atomic_load_n(state, __ATOMIC_ACQUIRE);
     if (s != 0 && s != 2) return s == 1;
     if (!feature) {
@@ -228,29 +221,8 @@ int zan_hw_kat_state(int id) {
     }
 }
 
-/* Requirements belong to implementations, not the public CPU bit queries.
- * CPUID masks can expose AES/SHA/PCLMUL without their helper SSE extensions. */
-enum {
-    ZAN_HW_SSSE3 = 1u << 0,
-    ZAN_HW_SSE41 = 1u << 1,
-    ZAN_HW_AES = 1u << 2,
-    ZAN_HW_SHA = 1u << 3,
-    ZAN_HW_PCLMUL = 1u << 4,
-    ZAN_HW_AVX2 = 1u << 5,
-    ZAN_HW_VAES = 1u << 6,
-    ZAN_HW_REQ_PIXEL = ZAN_HW_SSSE3,
-    ZAN_HW_REQ_AES = ZAN_HW_AES | ZAN_HW_SSSE3 | ZAN_HW_SSE41,
-    ZAN_HW_REQ_SHA = ZAN_HW_SHA | ZAN_HW_SSSE3 | ZAN_HW_SSE41,
-    ZAN_HW_REQ_GHASH = ZAN_HW_PCLMUL | ZAN_HW_SSSE3 | ZAN_HW_SSE41,
-    ZAN_HW_REQ_SM4 = ZAN_HW_AES | ZAN_HW_SSSE3,
-    ZAN_HW_REQ_SM4_VAES = ZAN_HW_AES | ZAN_HW_SSSE3 | ZAN_HW_AVX2 | ZAN_HW_VAES
-};
-
-static int zan_hw_features_cover(unsigned available, unsigned required) {
-    return (available & required) == required;
-}
-
-static int zan_hw_x86_can(unsigned required) {
+/* CPUID masks can expose crypto without the helper SSE extensions. */
+int zan_hw_x86_can(unsigned required) {
     zan_hw_init_cpu_features();
     unsigned available = (g_has_ssse3 ? ZAN_HW_SSSE3 : 0) |
         (g_has_sse41 ? ZAN_HW_SSE41 : 0) | (g_has_aesni ? ZAN_HW_AES : 0) |

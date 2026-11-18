@@ -126,6 +126,41 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
                                       LLVMValueRef *out) {
     int code = 0;
     if (!zan_refl_typeinfo_member(name, &code)) return false;
+    switch (code) {
+    case ZAN_REFL_M_MRET:
+        g->refl_query_used |= ZAN_REFL_QUERY_METHOD_RETURN;
+        break;
+    case ZAN_REFL_M_MPTYPE:
+        g->refl_query_used |= ZAN_REFL_QUERY_METHOD_PARAMS;
+        break;
+    case ZAN_REFL_M_MATTRS:
+        g->refl_query_used |= ZAN_REFL_QUERY_METHOD_ATTRS;
+        break;
+    case ZAN_REFL_M_CCOUNT:
+    case ZAN_REFL_M_CPCOUNT:
+        g->refl_query_used |= ZAN_REFL_QUERY_CTORS;
+        break;
+    case ZAN_REFL_M_CPTYPE:
+        g->refl_query_used |= ZAN_REFL_QUERY_CTORS | ZAN_REFL_QUERY_CTOR_PARAMS;
+        break;
+    case ZAN_REFL_M_FTYPE:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_TYPE;
+        break;
+    case ZAN_REFL_M_FCUSTOMNAME:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_CUSTOM;
+        break;
+    case ZAN_REFL_M_FDEFAULT:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_DEFAULT;
+        break;
+    case ZAN_REFL_M_FTYPEINFO:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_TYPEINFO;
+        break;
+    case ZAN_REFL_M_FATTRS:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_ATTRS;
+        break;
+    default:
+        break;
+    }
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
@@ -323,27 +358,10 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
-        LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fl");
-        LLVMValueRef count = refl_hdr_i64(g, ti, ZAN_REFL_COUNT_OFF, "refl.fc");
-        LLVMValueRef ok = LLVMBuildAnd(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntSGE, idx,
-                          LLVMConstInt(i64, 0, 0), "refl.ge"),
-            LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
-            "refl.ok");
-        LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
-                                            LLVMConstInt(i64, 0, 0), "refl.si");
-        LLVMValueRef off = LLVMBuildAdd(g->builder,
-            LLVMBuildMul(g->builder, safe,
-                         LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo"),
-            LLVMConstInt(i64, 40, 0), "refl.flgo");
-        LLVMValueRef zero_slot = LLVMBuildAlloca(g->builder, i64, "refl.z");
-        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), zero_slot);
-        LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, fields, &off, 1, "refl.flgp");
-        p = LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), "refl.flgpc");
-        LLVMValueRef live = LLVMBuildAnd(g->builder, ok,
-            LLVMBuildIsNotNull(g->builder, fields, "refl.fl.nn"), "refl.live");
-        p = LLVMBuildSelect(g->builder, live, p, zero_slot, "refl.flgsel");
-        LLVMValueRef flags = LLVMBuildLoad2(g->builder, i64, p, "refl.flgv");
+        LLVMValueRef flags = zan_call2(g->builder,
+            LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
+            refl_field_scalar_fn(g), (LLVMValueRef[]){ ti, idx,
+                LLVMConstInt(i64, 0, 0) }, 3, "refl.flags");
         unsigned long long bit = 1;
         if (code == ZAN_REFL_M_FREQUIRED) bit = 2;
         else if (code == ZAN_REFL_M_FPK) bit = 4;
@@ -358,27 +376,11 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
-        LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fl");
-        LLVMValueRef count = refl_hdr_i64(g, ti, ZAN_REFL_COUNT_OFF, "refl.fc");
-        LLVMValueRef ok = LLVMBuildAnd(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntSGE, idx,
-                          LLVMConstInt(i64, 0, 0), "refl.ge"),
-            LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
-            "refl.ok");
-        LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
-                                            LLVMConstInt(i64, 0, 0), "refl.si");
-        LLVMValueRef off = LLVMBuildAdd(g->builder,
-            LLVMBuildMul(g->builder, safe,
-                         LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo"),
-            LLVMConstInt(i64, 56, 0), "refl.tio");
-        LLVMValueRef zero_slot = LLVMBuildAlloca(g->builder, i8ptr, "refl.zt");
-        LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), zero_slot);
-        LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, fields, &off, 1, "refl.tip");
-        p = LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.tipc");
-        LLVMValueRef live = LLVMBuildAnd(g->builder, ok,
-            LLVMBuildIsNotNull(g->builder, fields, "refl.fl.nn"), "refl.live");
-        p = LLVMBuildSelect(g->builder, live, p, zero_slot, "refl.tsel");
-        *out = LLVMBuildLoad2(g->builder, i8ptr, p, "refl.fti");
+        LLVMValueRef value = zan_call2(g->builder,
+            LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
+            refl_field_scalar_fn(g), (LLVMValueRef[]){ ti, idx,
+                LLVMConstInt(i64, 1, 0) }, 3, "refl.typeinfo");
+        *out = LLVMBuildIntToPtr(g->builder, value, i8ptr, "refl.fti");
         return true;
     }
     case ZAN_REFL_M_HAS: {    /* HasField(name) */
@@ -399,30 +401,47 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
-        LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fl");
-        LLVMValueRef count = refl_hdr_i64(g, ti, ZAN_REFL_COUNT_OFF, "refl.fc");
-        LLVMValueRef ok = LLVMBuildAnd(g->builder,
-            LLVMBuildICmp(g->builder, LLVMIntSGE, idx,
-                          LLVMConstInt(i64, 0, 0), "refl.ge"),
-            LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
-            "refl.ok");
-        LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
-                                            LLVMConstInt(i64, 0, 0), "refl.si");
-        LLVMValueRef off = LLVMBuildAdd(g->builder,
-            LLVMBuildMul(g->builder, safe,
-                         LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo"),
-            LLVMConstInt(i64, 24, 0), "refl.vo");
-        LLVMValueRef zero_slot = LLVMBuildAlloca(g->builder, i64, "refl.z");
-        LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), zero_slot);
-        LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, fields, &off, 1, "refl.vp");
-        p = LLVMBuildBitCast(g->builder, p, LLVMPointerType(i64, 0), "refl.vpc");
-        LLVMValueRef live = LLVMBuildAnd(g->builder, ok,
-            LLVMBuildIsNotNull(g->builder, fields, "refl.fl.nn"), "refl.live");
-        p = LLVMBuildSelect(g->builder, live, p, zero_slot, "refl.vsel");
-        *out = LLVMBuildLoad2(g->builder, i64, p, "refl.mv");
+        *out = zan_call2(g->builder,
+            LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
+            refl_field_scalar_fn(g), (LLVMValueRef[]){ ti, idx,
+                LLVMConstInt(i64, 2, 0) }, 3, "refl.membervalue");
         return true;
     }
     }
+}
+
+static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
+    if (g->refl_invoke_unknown) return;
+    if (name && (name->kind != AST_STRING_LITERAL ||
+                 memchr(name->str_val.str, '\0', name->str_val.len))) {
+        g->refl_invoke_unknown = true;
+        return;
+    }
+    if (!name || !name->str_val.len) return;
+    zan_istr_t text = name->str_val;
+    for (int i = 0; i < g->refl_invoke_name_count; i++) {
+        zan_istr_t known = g->refl_invoke_names[i];
+        if (known.len == text.len && memcmp(known.str, text.str, text.len) == 0) return;
+    }
+    if (g->refl_invoke_name_count == g->refl_invoke_name_cap) {
+        int cap = g->refl_invoke_name_cap ? g->refl_invoke_name_cap * 2 : 8;
+        zan_istr_t *names = zan_arena_alloc(g->arena, (size_t)cap * sizeof(*names));
+        if (!names) {
+            g->refl_invoke_unknown = true;
+            return;
+        }
+        if (g->refl_invoke_name_count)
+            memcpy(names, g->refl_invoke_names,
+                   (size_t)g->refl_invoke_name_count * sizeof(*names));
+        g->refl_invoke_names = names;
+        g->refl_invoke_name_cap = cap;
+    }
+    text.str = zan_arena_strdup(g->arena, text.str, text.len);
+    if (!text.str) {
+        g->refl_invoke_unknown = true;
+        return;
+    }
+    g->refl_invoke_names[g->refl_invoke_name_count++] = text;
 }
 
 /* `obj */
@@ -477,6 +496,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     if (code == ZAN_REFL_M_IVOID || code == ZAN_REFL_M_IINT ||
         code == ZAN_REFL_M_ILONG || code == ZAN_REFL_M_IDOUBLE ||
         code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT) {
+        refl_note_invoke_name(g, arg0);
         LLVMValueRef idx = refl_mfind(g, ti, nm, 0);
         refl_arg_temps_t temps;
         LLVMValueRef slots = refl_pack_args(g, args, argc, 1, locals, &temps);
@@ -573,8 +593,16 @@ bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt,
         emit_release_owned_call_temp(g, args[1], val_tmp, locals);
     return true;
 }
+bool refl_needs_site_meta(zan_irgen_t *g) {
+    /* typeof metadata has its own recursive roots. Only emitted object
+     * reflection needs every allocation site's concrete type; the helper is
+     * shared by GetType and object Get/Set/Invoke, including unknown receivers.
+     * Once emitted, demand stays conservative even if optimization removes it. */
+    return g->refl_used && (!g->publish_reflect_demand || g->fn_refl_obj_type != NULL);
+}
+
 void emit_site_meta_table(zan_irgen_t *g) {
-    if (!g->refl_used || !g->g_site_meta || !g->site_syms) return;
+    if (!refl_needs_site_meta(g) || !g->g_site_meta || !g->site_syms) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     int n = g->leak_site_count;
     if (n <= 0) return;
@@ -604,29 +632,6 @@ void emit_site_meta_table(zan_irgen_t *g) {
         LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
     free(elems);
 }
-bool refl_type_needs_site_meta(zan_irgen_t *g, zan_symbol_t *sym) {
-    /* Erased object reflection needs the concrete allocation type, including
-       plain DTOs reached through nested serialization in publish builds. */
-    if (!g->publish_mode || g->refl_used) return true;
-    if (!sym || !sym->type) return false;
-    /* 1. 带注解特性的类型必须保留 */
-    zan_ast_list_t *attrs = sym->decl ? zan_ast_attributes(sym->decl) : NULL;
-    if (attrs && attrs->count > 0) return true;
-    /* 2. 具备虚方法表的多态类型必须保留（如 Control 控件家族） */
-    if (class_has_virtual_methods(sym)) return true;
-    /* 3. 继承自非 object 复杂基类的派生类必须保留 */
-    if (sym->type->base_type && sym->type->base_type->sym) {
-        zan_symbol_t *bsym = sym->type->base_type->sym;
-        bool is_obj = (bsym->name.len == 6 &&
-                       (memcmp(bsym->name.str, "object", 6) == 0 ||
-                        memcmp(bsym->name.str, "Object", 6) == 0));
-        if (!is_obj) return true;
-    }
-    /* 4. 实现了接口的类型必须保留 */
-    if (sym->type->interface_count > 0) return true;
-    return false;
-}
-
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
     if (!g->desc_hdr || !g->desc_gv) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -656,7 +661,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
             LLVMValueRef idxs[] = { LLVMConstInt(i64, 0, 0),
                                     LLVMConstInt(i64, 0, 0) };
             tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
-            if (g->refl_used && g->site_coll[i] == 1) {
+            if (refl_needs_site_meta(g) && g->site_coll[i] == 1) {
                 zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[i] : NULL;
                 zan_type_t *lt = zan_binder_make_list_type(g->binder, elem_type);
                 meta = refl_meta_for(g, lt, NULL, 0);
@@ -710,7 +715,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                                         LLVMConstInt(i64, 0, 0) };
                 tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
             }
-            if (g->refl_used && sym->type && refl_type_needs_site_meta(g, sym)) {
+            if (refl_needs_site_meta(g) && sym->type) {
                 zan_type_t *t = (g->site_inst && g->site_inst[i])
                     ? g->site_inst[i] : sym->type;
                 meta = refl_meta_for(g, t, NULL, 0);

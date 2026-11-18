@@ -49,13 +49,17 @@ build zanrt_file.o    rt_file.c    -std=c11  -I "$RT" -O2
 build zanrt_decimal.o rt_decimal.c -std=c11  -I "$RT" -O2
 build zanrt_timer.o   rt_timer.c   -std=c11  -I "$RT" -O2
 build zanrt_crash.o    rt_crash.c   -std=c11  -I "$RT" -O2
-# Crypto as an archive member -- a plain zanrt_crypto.o would pull the
-# whole archive into every wasm link; the member form lets the linker
-# drop it for programs without native crypto references (same reason the
-# linux/macos blocks use an archive).
-"$ZIG" cc -target wasm32-wasi -g0 -std=c11 -I "$RT" -I "$ACCEL" -O2 -c "$ACCEL/zan_hw_accel.c" -o "$OUT/zan_crypto.o"
+# Independent feature members keep JSON/CPU users from loading crypto.
+set --
+for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
+    crypto_name=${crypto_src##*/}
+    crypto_obj="$OUT/zan_crypto_${crypto_name%.c}.o"
+    "$ZIG" cc -target wasm32-wasi -g0 -std=c11 -I "$RT" -I "$ACCEL" -O2 -c "$crypto_src" -o "$crypto_obj"
+    set -- "$@" "$crypto_obj"
+done
 rm -f "$OUT/libzancrypto.a"
-"$ZIG" ar rcs "$OUT/libzancrypto.a" "$OUT/zan_crypto.o"
+"$ZIG" ar rcs "$OUT/libzancrypto.a" "$@"
+rm -f "$@"
 # Compressed embedded icons/skins need the same decoder as native targets:
 # no -I "$RT", miniz trim defines + NO_ARCHIVE_WRITERS, -I src/common.
 "$ZIG" cc -target wasm32-wasi -g0 -std=c11 -O2 \

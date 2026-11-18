@@ -1,4 +1,33 @@
 /* rt_hw_json.c: AVX2 向量化 JSON 语法扫描器与极速解析器实现 */
+#include "rt_hw_internal.h"
+
+static inline int zan_ctz64_local(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#elif defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward64(&idx, x);
+    return (int)idx;
+#else
+    int n = 0;
+    while ((x & 1) == 0) { x >>= 1; n++; }
+    return n;
+#endif
+}
+
+static inline int zan_ctz32_local(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctz(x);
+#elif defined(_MSC_VER)
+    unsigned long idx;
+    _BitScanForward(&idx, x);
+    return (int)idx;
+#else
+    int n = 0;
+    while ((x & 1) == 0) { x >>= 1; n++; }
+    return n;
+#endif
+}
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 __attribute__((target("avx2")))
@@ -54,7 +83,7 @@ int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len
     const uint8_t *p = buf;
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_has_avx2 && pos + 32 <= len) {
+    if (pos + 32 <= len && zan_hw_has_avx2()) {
         int64_t new_pos = zan_hw_json_skip_whitespace_avx2(p, pos, len);
         if (new_pos + 32 <= len || (new_pos < len && p[new_pos] != ' ' && p[new_pos] != '\t' && p[new_pos] != '\n' && p[new_pos] != '\r')) {
             return new_pos;
@@ -82,7 +111,7 @@ int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len
         pos += 16;
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_has_neon) {
+    if (zan_hw_has_neon()) {
         uint8x16_t v_sp = vdupq_n_u8(' ');
         uint8x16_t v_tb = vdupq_n_u8('\t');
         uint8x16_t v_nl = vdupq_n_u8('\n');
@@ -123,7 +152,7 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     const uint8_t *p = buf;
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_has_avx2 && pos + 32 <= len) {
+    if (pos + 32 <= len && zan_hw_has_avx2()) {
         int64_t res = zan_hw_json_scan_string_avx2(p, pos, len);
         if (res < 0 || (res < len && (p[res] == '"' || p[res] == '\\'))) {
             return res;
@@ -150,7 +179,7 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
         pos += 16;
     }
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
-    if (g_has_neon) {
+    if (zan_hw_has_neon()) {
         uint8x16_t v_q = vdupq_n_u8('"');
         uint8x16_t v_b = vdupq_n_u8('\\');
         while (pos + 16 <= len) {

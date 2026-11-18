@@ -1,4 +1,9 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param(
+    [switch]$Publish,
+    [switch]$Time
+)
+
+$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -39,8 +44,8 @@ try {
     # 规范模型（Comp/Demo/…）在 5e8baf34 之后住在 Models\ 目录里，
     # 漏掉它们整个示例都编不过（undefined type 'Comp'）。
     $files += (Get-ChildItem (Join-Path $root "examples\gui_gallery\Models") -Filter *.zan).FullName
-    $files += (Join-Path (Get-Location) "examples\gui_gallery\GalleryModel.zan")
-    $files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
+    $files += (Get-ChildItem (Join-Path $root "examples\gui_gallery") -Filter *.zan |
+        Where-Object { $_.FullName -ne $entry }).FullName
     $files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
     $files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
@@ -60,7 +65,9 @@ try {
     # exe; File.ReadAllText falls back to the embedded copy when the loose
     # file is not next to the binary.
     $zanArgs += @("--embed", "examples\gui_gallery\assets=assets")
-    $zanArgs += @("--auto-stdlib", "--link-mode", "static")
+    $zanArgs += @("--auto-stdlib", "--package-project", $root, "--link-mode", "static")
+    if ($Publish) { $zanArgs += "--publish" }
+    if ($Time) { $zanArgs += "--time" }
     # Each selected driver contributes its own system dependency metadata.
     $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")
     $zanArgs += @("--link-lib", "psapi", "--link-lib", "advapi32")
@@ -72,12 +79,15 @@ try {
     # 提升成终止错误（NativeCommandError），一次无害的 warning 就能把构建
     # 打断——只有退出码算数（与 build_ide.ps1 同一处理）。
     $prevEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $out = & build\zanc.exe @zanArgs 2>&1
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prevEap
+    try {
+        $ErrorActionPreference = "Continue"
+        # Stream diagnostics so callers can persist phase output while compiling.
+        & build\zanc.exe @zanArgs 2>&1 | ForEach-Object { Write-Output $_ }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     if ($code -ne 0) {
-        $out | Select-Object -Last 40
         throw "GALLERY_LINK_FAILED code=$code"
     }
 } catch {

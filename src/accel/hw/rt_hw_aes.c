@@ -1,4 +1,5 @@
 /* rt_hw_aes.c: AES-NI / ARM Crypto 基础对称分组密码实现 */
+#include "rt_hw_internal.h"
 
 static uint8_t zan_aes_sbox[256];
 
@@ -31,7 +32,7 @@ static void zan_aes_init_sbox(void) {
     inited = 1;
 }
 
-static void zan_aes_expand_key(const uint8_t *key, int keybits,
+void zan_aes_expand_key(const uint8_t *key, int keybits,
                                uint8_t rk[15][16], int *nr_out) {
     zan_aes_init_sbox();
     int nk = keybits / 32;
@@ -222,8 +223,6 @@ static int64_t zan_aes_ctr_ni(const uint8_t *in, int64_t len,
     return len;
 }
 
-#define ZAN_XSHIFT_R(x, n) _mm_xor_si128(_mm_srli_epi64(x, n), _mm_srli_si128(_mm_slli_epi64(x, 64-(n)), 8))
-#define ZAN_XSHIFT_L(x, n) _mm_xor_si128(_mm_slli_epi64(x, n), _mm_slli_si128(_mm_srli_epi64(x, 64-(n)), 8))
 #endif /* x86 aes */
 
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
@@ -361,7 +360,7 @@ static int64_t zan_aes_ctr_arm(const uint8_t *in, int64_t len,
 
 #endif /* arm aes */
 
-static int zan_aes_kat(void) {
+int zan_aes_kat(void) {
     static const uint8_t pt[16] = {
         0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
     };
@@ -548,7 +547,7 @@ int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 __attribute__((target("aes,sse4.1")))
-static void zan_aes_ecb_block_rk(const uint8_t rkb[15][16], int nr, const uint8_t *in16, uint8_t *out16) {
+void zan_aes_ecb_block_rk(const uint8_t rkb[15][16], int nr, const uint8_t *in16, uint8_t *out16) {
     __m128i b = _mm_loadu_si128((const __m128i*)in16);
     b = _mm_xor_si128(b, _mm_loadu_si128((const __m128i*)rkb[0]));
     for (int r = 1; r < nr; r++) {
@@ -559,7 +558,7 @@ static void zan_aes_ecb_block_rk(const uint8_t rkb[15][16], int nr, const uint8_
 }
 
 __attribute__((target("aes,sse4.1")))
-static void zan_aes_ctr_ni_4way(const uint8_t rkb[15][16], int nr,
+void zan_aes_ctr_ni_4way(const uint8_t rkb[15][16], int nr,
                                 const uint8_t *in, int64_t len,
                                 uint8_t *counter16, uint8_t *out) {
     __m128i rk[15];

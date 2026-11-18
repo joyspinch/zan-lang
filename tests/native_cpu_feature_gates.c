@@ -22,6 +22,33 @@ static int test_requirements(void) {
     return 0;
 }
 
+static int test_json_dispatch(void) {
+    uint8_t text[97];
+    memset(text, ' ', sizeof(text));
+    text[96] = 'x';
+    if (zan_hw_json_skip_whitespace(text, 0, sizeof(text)) != 96) return 13;
+    memset(text, 'x', sizeof(text));
+    text[80] = '"';
+    if (zan_hw_json_scan_string(text, 0, sizeof(text)) != 80) return 14;
+    text[50] = '\\';
+    if (zan_hw_json_scan_string(text, 0, sizeof(text)) != -51) return 15;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
+    /* JSON must initialize its own dispatch; another crypto/CPU call is not
+     * a prerequisite. Its CPU dependency must not evaluate any crypto KAT. */
+    if (g_cpuid_state != 2) return 16;
+#endif
+    for (unsigned i = 0; i < ZAN_HW_GATE_COUNT; ++i) {
+        if (zan_hw_gate_states[i] != 0) return 17;
+    }
+    int avx2 = g_has_avx2, neon = g_has_neon;
+    g_has_avx2 = g_has_neon = 0;
+    int64_t fallback = zan_hw_json_scan_string(text, 0, sizeof(text));
+    g_has_avx2 = avx2;
+    g_has_neon = neon;
+    if (fallback != -51) return 18;
+    return 0;
+}
+
 static int test_pixel_fallback(void) {
     uint32_t src[11], dst[11], expected[11];
     for (unsigned i = 0; i < 11; ++i) {
@@ -69,6 +96,7 @@ static int test_crypto_dispatch(void) {
 
 int main(void) {
     int rc = test_requirements();
+    if (!rc) rc = test_json_dispatch();
     if (!rc) rc = test_pixel_fallback();
     if (!rc) rc = test_crypto_dispatch();
     if (rc) fprintf(stderr, "native CPU gate regression failed: %d\n", rc);

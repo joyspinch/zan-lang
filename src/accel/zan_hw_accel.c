@@ -1,28 +1,7 @@
-/* zan_hw_accel.c: 硬件指令集加速与密码学/SIMD 运行时（组合分发入口） */
-
-#include "zan_hw_accel.h"
-#include <string.h>
-#include <stdlib.h>
-
-#if defined(_WIN32)
-  #include <windows.h>
-#endif
-
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-  #include <immintrin.h>
-  #include <wmmintrin.h>
-  #include <emmintrin.h>
-  #include <tmmintrin.h>
-  #include <smmintrin.h>
-#endif
-#if defined(__aarch64__) || defined(_M_ARM64)
-  #include <arm_neon.h>
-  #if defined(__APPLE__)
-    #include <sys/sysctl.h>
-  #elif !defined(_WIN32)
-    #include <sys/auxv.h>
-  #endif
-#endif
+/* Single-TU compatibility entry for native tests that inspect private CPU
+ * predicates. Production archives compile hw/rt_hw_*.c independently so a
+ * JSON/CRC/etc. reference cannot pull in unrelated algorithm families. */
+#include "hw/rt_hw_internal.h"
 
 /* 1. CPU 特性探针与 KAT 自检门禁 */
 #include "hw/rt_hw_cpu.c"

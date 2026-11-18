@@ -1,0 +1,90 @@
+# Verify the physical ABI before optimization can fold individual metadata reads.
+# Runtime goldens separately check all public operations and ARC/EH behavior.
+if(NOT ZANC OR NOT WORKDIR)
+  message(FATAL_ERROR "run_publish_reflect_compact_ir: ZANC and WORKDIR are required")
+endif()
+execute_process(
+  COMMAND "${ZANC}" "${WORKDIR}/tests/conformance/publish_reflect_compact_sharing.zan"
+    --auto-stdlib --publish -O0 --emit-ir
+  WORKING_DIRECTORY "${WORKDIR}"
+  OUTPUT_VARIABLE _ir ERROR_VARIABLE _err RESULT_VARIABLE _rc)
+if(NOT _rc EQUAL 0)
+  message(FATAL_ERROR "compact reflection: compiler failed (rc=${_rc})\n${_err}")
+endif()
+string(REPLACE "\r" "" _ir "${_ir}")
+foreach(_required "define" "compact sharing PASS" "CompactSharedValue" "OnShared" "OnSecond"
+    "@__zan.refl.compact.fields" "@__zan.refl.compact.methods" "@__zan.refl.compact.values")
+  string(FIND "${_ir}" "${_required}" _pos)
+  if(_pos EQUAL -1)
+    message(FATAL_ERROR "compact reflection: missing positive control ${_required}")
+  endif()
+endforeach()
+foreach(_forbidden "__zan.refl.compact.fields.pending" "__zan.refl.compact.methods.pending"
+    "__zan.refl.compact.values.pending" "COMPACT_DEAD_FIELD_MUST_BE_ABSENT"
+    "COMPACT_DEAD_HOOK_MUST_BE_ABSENT")
+  string(FIND "${_ir}" "${_forbidden}" _pos)
+  if(NOT _pos EQUAL -1)
+    message(FATAL_ERROR "compact reflection: retained ${_forbidden}")
+  endif()
+endforeach()
+# Compiler-only logical arrays must be gone even at -O0, rather than relying on
+# GlobalDCE to hide an incomplete physical representation migration.
+string(REGEX MATCH "@[A-Za-z0-9_.$]*(refl\\.fields\\.|refl\\.enum\\.|refl\\.mtab\\.|refl\\.ctors\\.|refl\\.ctor\\.)[^\n]*=" _legacy "${_ir}")
+if(_legacy)
+  message(FATAL_ERROR "compact reflection: old physical member table survives: ${_legacy}")
+endif()
+string(REGEX MATCH "@__zan\\.refl\\.compact\\.fields = [^\n]*constant \\[([0-9]+) x \\{ i32, i32, i32, i32, i32, i32, i64, i32, i32 \\}\\]" _field_pool "${_ir}")
+if(NOT _field_pool)
+  message(FATAL_ERROR "compact reflection: missing 40-byte field record pool")
+endif()
+set(_field_rows "${CMAKE_MATCH_1}")
+string(REGEX MATCH "@__zan\\.refl\\.compact\\.methods = [^\n]*constant \\[([0-9]+) x \\{ i32, i32, i32, i32, i32, i32, i32, i32 \\}\\]" _method_pool "${_ir}")
+if(NOT _method_pool)
+  message(FATAL_ERROR "compact reflection: missing 32-byte method record pool")
+endif()
+set(_method_rows "${CMAKE_MATCH_1}")
+# Every inherited method must share its callable payload as well as signature.
+# Fresh owner-specific wrappers would prevent record interning.
+foreach(_method OnShared OnSecond)
+  string(REGEX MATCHALL "define internal void @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\(" _thunks "${_ir}")
+  list(LENGTH _thunks _thunk_count)
+  if(NOT _thunk_count EQUAL 1)
+    message(FATAL_ERROR "compact reflection: ${_method} has ${_thunk_count} wrappers, expected one")
+  endif()
+  # A valid pooled thunk can still point at a pruned `dead: unreachable` body.
+  # Require both the direct forwarding edge and an executable field calculation.
+  string(REGEX MATCH "define internal void @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\([^}]*\n\\}" _thunk_body "${_ir}")
+  if(NOT _thunk_body MATCHES "call i32 @CompactSharingBase_${_method}\\(")
+    message(FATAL_ERROR "compact reflection: ${_method} thunk lost its actual callee")
+  endif()
+  string(REGEX MATCH "define [^\n]* @CompactSharingBase_${_method}\\([^\n]*\\{[^}]*\n\\}" _body "${_ir}")
+  if(NOT _body OR _body MATCHES "unreachable|@llvm\\.trap|dead_stub")
+    message(FATAL_ERROR "compact reflection: ${_method} target is missing or a dead body")
+  endif()
+  if(NOT _body MATCHES "load i32" OR NOT _body MATCHES "ret i32")
+    message(FATAL_ERROR "compact reflection: ${_method} target lost its field calculation")
+  endif()
+endforeach()
+# Tables carry native record/payload bases and i32 IDs. Count references to the
+# same method ID pair, proving the eight sibling tables reuse physical rows.
+string(REGEX MATCHALL "constant \\{ ptr, ptr, \\[2 x i32\\] \\} \\{ ptr @__zan\\.refl\\.compact\\.methods, ptr @__zan\\.refl\\.compact\\.values, \\[2 x i32\\] \\[i32 [0-9]+, i32 [0-9]+\\] \\}" _sibling_tables "${_ir}")
+list(LENGTH _sibling_tables _table_count)
+if(_table_count LESS 8)
+  message(FATAL_ERROR "compact reflection: expected eight sibling method index tables, got ${_table_count}")
+endif()
+set(_most_shared 0)
+foreach(_candidate IN LISTS _sibling_tables)
+  set(_same 0)
+  foreach(_table IN LISTS _sibling_tables)
+    if(_table STREQUAL _candidate)
+      math(EXPR _same "${_same} + 1")
+    endif()
+  endforeach()
+  if(_same GREATER _most_shared)
+    set(_most_shared ${_same})
+  endif()
+endforeach()
+if(_most_shared LESS 8)
+  message(FATAL_ERROR "compact reflection: eight siblings do not share one method ID pair")
+endif()
+message(STATUS "publish_reflect_compact_ir: shared ${_field_rows} field/${_method_rows} method records; native table bases and i32 indices; no logical arrays")

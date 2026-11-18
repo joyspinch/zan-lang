@@ -315,8 +315,12 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
             (d->type_decl.modifiers & MOD_PARTIAL)) {
             for (int fi = 0; fi < out; fi++) {
                 zan_ast_node_t *e = decls->items[fi];
+                zan_istr_t e_ns = zan_ast_ns_name(e);
+                zan_istr_t d_ns = zan_ast_ns_name(d);
                 if (e->kind == d->kind &&
                     (e->type_decl.modifiers & MOD_PARTIAL) &&
+                    e_ns.len == d_ns.len &&
+                    (!e_ns.len || memcmp(e_ns.str, d_ns.str, e_ns.len) == 0) &&
                     e->type_decl.name.len == d->type_decl.name.len &&
                     memcmp(e->type_decl.name.str, d->type_decl.name.str,
                            (size_t)d->type_decl.name.len) == 0) {

@@ -1,4 +1,5 @@
 /* rt_hw_sm.c: 国密 SM3、SHA-512 与 SM4 硬件加速指令集向量实现 */
+#include "rt_hw_internal.h"
 
 /* 7 */
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))

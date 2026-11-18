@@ -411,6 +411,7 @@ LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
             int slot = get_virtual_method_index(static_sym, method_sym);
             LLVMTypeRef st = get_struct_llvm_type(g, static_sym);
             if (slot >= 0 && st) {
+                note_virtual_slot_demand(g, static_sym, slot);
                 LLVMBuilderRef b = g->builder;
                 LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                 LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

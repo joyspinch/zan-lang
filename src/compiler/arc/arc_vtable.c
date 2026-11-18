@@ -31,6 +31,47 @@ static void collect_vslot_decls(zan_symbol_t *sym, zan_symbol_t **out, int *n, i
         }
     }
 }
+
+static zan_symbol_t *virtual_slot_decl(zan_symbol_t *owner, int slot) {
+    if (!owner || slot < 0) return NULL;
+    zan_symbol_t *base = owner->type && owner->type->base_type
+                             ? owner->type->base_type->sym : NULL;
+    int inherited = base ? count_virtual_methods(base) : 0;
+    if (slot < inherited) return virtual_slot_decl(base, slot);
+    slot -= inherited;
+    for (int i = 0; i < owner->member_count; i++) {
+        zan_symbol_t *member = owner->members[i];
+        if (!method_introduces_virtual_slot(owner, member)) continue;
+        if (slot-- == 0) return member;
+    }
+    return NULL;
+}
+
+void note_virtual_slot_demand(zan_irgen_t *g, zan_symbol_t *owner, int slot) {
+    if (!g->publish_vslot_demand) return;
+    zan_symbol_t *decl = virtual_slot_decl(owner, slot);
+    if (!decl) return;
+    for (int i = 0; i < g->vslot_demand_count; i++)
+        if (g->vslot_demands[i] == decl) return;
+    if (g->vslot_demand_count == g->vslot_demand_cap) {
+        int cap = g->vslot_demand_cap ? g->vslot_demand_cap * 2 : 32;
+        zan_symbol_t **demands = zan_arena_alloc(g->arena, (size_t)cap * sizeof(*demands));
+        if (g->vslot_demand_count)
+            memcpy(demands, g->vslot_demands,
+                   (size_t)g->vslot_demand_count * sizeof(*demands));
+        g->vslot_demands = demands;
+        g->vslot_demand_cap = cap;
+    }
+    g->vslot_demands[g->vslot_demand_count++] = decl;
+}
+
+static bool virtual_slot_is_demanded(zan_irgen_t *g, zan_symbol_t *decl) {
+    if (!g->publish_vslot_demand) return true;
+    for (int i = 0; i < g->vslot_demand_count; i++)
+        if (g->vslot_demands[i] == decl) return true;
+    return false;
+}
+
 LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
     char name[320];
     snprintf(name, sizeof(name), "__zan_vtable_%.*s",
@@ -114,9 +155,8 @@ static void fill_vtable_inst(zan_irgen_t *g, LLVMValueRef gv,
     LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
     for (int s = 0; s < n; s++) {
         LLVMValueRef e = LLVMConstNull(i8ptr);
-        if (s < nd) {
-            zan_symbol_t *decl = decls[s];
-            zan_symbol_t *impl = vtable_slot_impl(sym, decl);
+        if (s < nd && virtual_slot_is_demanded(g, decls[s])) {
+            zan_symbol_t *impl = vtable_slot_impl(sym, decls[s]);
             LLVMValueRef fn = vtable_slot_fn(g, impl, inst);
             if (fn) e = LLVMConstBitCast(fn, i8ptr);
         }
@@ -139,7 +179,10 @@ LLVMValueRef get_vtable_global_inst(zan_irgen_t *g, zan_symbol_t *sym,
     snprintf(name, sizeof(name), "__zan_vtable_%.*s%s",
              (int)sym->name.len, sym->name.str, suffix);
     LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
-    if (gv) return gv;
+    if (gv) {
+        fill_vtable_inst(g, gv, sym, inst);
+        return gv;
+    }
     int n = count_virtual_methods(sym);
     if (n < 1) n = 1;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -165,9 +208,8 @@ void emit_vtables(zan_irgen_t *g) {
         LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
         for (int s = 0; s < n; s++) {
             LLVMValueRef e = LLVMConstNull(i8ptr);
-            if (s < nd) {
-                zan_symbol_t *decl = decls[s];
-                zan_symbol_t *impl = vtable_slot_impl(sym, decl);
+            if (s < nd && virtual_slot_is_demanded(g, decls[s])) {
+                zan_symbol_t *impl = vtable_slot_impl(sym, decls[s]);
                 LLVMValueRef fn = vtable_slot_fn(g, impl, NULL);
                 if (fn) e = LLVMConstBitCast(fn, i8ptr);
             }

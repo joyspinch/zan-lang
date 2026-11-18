@@ -1,7 +1,10 @@
 /* rt_hw_gcm.c: AES-GCM 认证加密与 GHASH 向量加速实现 */
+#include "rt_hw_internal.h"
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 #define ZAN_BSWAP128 _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
+#define ZAN_XSHIFT_R(x, n) _mm_xor_si128(_mm_srli_epi64(x, n), _mm_srli_si128(_mm_slli_epi64(x, 64-(n)), 8))
+#define ZAN_XSHIFT_L(x, n) _mm_xor_si128(_mm_slli_epi64(x, n), _mm_slli_si128(_mm_srli_epi64(x, 64-(n)), 8))
 
 static const uint64_t g_ghash_s_table[64] = {
     0x0000000000000000ULL, 0xe608000000000000ULL, 0x0e10000000000000ULL, 0xe818000000000000ULL,

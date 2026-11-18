@@ -18,6 +18,12 @@
 /* { i8*, i8*, i64, i64, i8*, i64, i8*, i8*, i8* } */
 #define ZAN_REFL_FIELD_SIZE 72
 #define ZAN_REFL_METHOD_SIZE 64
+/* The sizes/offsets above describe compiler-only logical rows. Final TypeInfo
+ * tables carry two native pool pointers followed by i32 member indices. Shared
+ * physical rows contain payload indices, never target-sized pointers. The
+ * self-hosted compiler owns its separate reflection representation. */
+#define ZAN_REFL_COMPACT_FIELD_SIZE 40
+#define ZAN_REFL_COMPACT_METHOD_SIZE 32
 #define ZAN_REFL_MO_NAME     0
 #define ZAN_REFL_MO_RET      8
 #define ZAN_REFL_MO_RETKIND  16
@@ -93,6 +99,7 @@
 #include "reflect/reflect_fields.c"
 #include "reflect/reflect_thunks.c"
 #include "reflect/reflect_attrs.c"
+#include "reflect/reflect_compact.c"
 #include "reflect/reflect_accessors.c"
 #include "reflect/reflect_invoke.c"
 #include "reflect/reflect_typeinfo.c"

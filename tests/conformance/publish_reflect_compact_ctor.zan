@@ -1,0 +1,101 @@
+using System;
+
+class CompactCtorPayload {
+    public int Value = 17;
+}
+
+class CompactCtorBox<T> {
+    public int Tag = 9;
+}
+
+class CompactCtorOwner {
+    public string Text;
+    public CompactCtorPayload Payload = new CompactCtorPayload();
+    public List<string> Items = new List<string>();
+    public CompactCtorBox<string> Box = new CompactCtorBox<string>();
+    public object ObjectValue { get { return Payload; } }
+    public string TextValue { get { return Text; } }
+
+    public CompactCtorOwner() { Text = "default"; }
+    public CompactCtorOwner(string text) {
+        Text = text;
+        if (text == "reject") throw new Exception("compact ctor rejected");
+    }
+
+    [Description("COMPACT_CALL_SIGNATURE_MUST_STAY")]
+    public string OnEcho(string suffix) { return Text + suffix; }
+    public void OnThrow(string text) { throw new Exception(text); }
+}
+
+class CompactCtorWitness {
+    public weak CompactCtorOwner Owner;
+    public weak CompactCtorPayload Payload;
+}
+
+class Program {
+    static void Check(bool condition, string message) {
+        if (!condition) throw new Exception(message);
+    }
+
+    static object Make(TypeInfo type, string text) { return type.CreateInstance(text); }
+
+    static void CheckScope(CompactCtorWitness witness) {
+        object created = Make(typeof(CompactCtorOwner), "kept-" + "text");
+        Check(created is CompactCtorOwner, "ctor preserves dynamic identity");
+        CompactCtorOwner owner = (CompactCtorOwner)created;
+        witness.Owner = owner;
+        witness.Payload = owner.Payload;
+        Check(created.GetFieldString("TextValue") == "kept-text", "getter owned string");
+        Check(created.GetFieldObject("ObjectValue") == owner.Payload, "getter owned object");
+        Check(created.GetFieldObject("Payload") == owner.Payload, "direct field retained");
+        Check(created.InvokeString("OnEcho", "-" + "tail") == "kept-text-tail", "owned invoke argument");
+        TypeInfo type = created.GetType();
+        Check(type.ConstructorCount == 2 && type.GetCtorParamCount(0) == 0 &&
+        type.GetCtorParamCount(1) == 1 && type.GetCtorParamType(1, 0) == "string",
+        "constructor signature");
+        Check(type.GetCtorParamType(-1, 0) == "" && type.GetCtorParamCount(9999) == 0,
+        "constructor guards");
+        int echo = -1;
+        int items = -1;
+        int box = -1;
+        for (int i = 0; i < type.MethodCount; i++) {
+            if (type.GetMethodName(i) == "OnEcho") echo = i;
+        }
+        for (int i = 0; i < type.FieldCount; i++) {
+            if (type.GetFieldName(i) == "Items") items = i;
+            if (type.GetFieldName(i) == "Box") box = i;
+        }
+        Check(type.GetMethodReturnType(echo) == "string" &&
+        type.GetMethodParamType(echo, 0) == "string" &&
+        type.GetMethodCustomAttributes(echo).Contains("COMPACT_CALL_SIGNATURE_MUST_STAY"),
+        "shared method details");
+        TypeInfo listType = type.GetFieldTypeInfo(items);
+        Check(listType.IsGeneric && listType.TypeArgCount == 1 && listType.GetTypeArg(0).Name == "string" &&
+        listType.ElementType.Name == "string", "closed List metadata");
+        object list = listType.CreateInstance();
+        Check(list.Invoke("Add", "owned-" + "element") && list.GetFieldInt("Count") == 1 &&
+        list.InvokeString("Get", 0) == "owned-element", "closed List ctor and methods");
+        TypeInfo boxType = type.GetFieldTypeInfo(box);
+        Check(boxType.IsGeneric && boxType.GetTypeArg(0).Name == "string", "generic class metadata");
+        object closed = boxType.CreateInstance();
+        Check(closed is CompactCtorBox<string> && closed.GetFieldInt("Tag") == 9,
+        "closed generic ctor identity");
+        bool caught = false;
+        try { created.Invoke("OnThrow", "throw-" + "payload"); }
+        catch (Exception ex) { caught = ex.Message == "throw-payload"; }
+        Check(caught, "indirect call exception");
+    }
+
+    static void Main() {
+        CompactCtorWitness witness = new CompactCtorWitness();
+        CheckScope(witness);
+        Check(witness.Owner == null && witness.Payload == null, "reflected results release owner and payload");
+        bool caught = false;
+        try { Make(typeof(CompactCtorOwner), "re" + "ject"); }
+        catch (Exception ex) { caught = ex.Message == "compact ctor rejected"; }
+        Check(caught, "constructor exception cleanup");
+        object empty = typeof(CompactCtorOwner).CreateInstance();
+        Check(empty.GetFieldString("Text") == "default", "zero argument ctor");
+        Console.WriteLine("compact ctor PASS");
+    }
+}

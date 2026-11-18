@@ -1,6 +1,6 @@
-# Metadata-only reflection must not retain callable constructor thunks.
-# The source also carries a dead CreateInstance helper and a constructor-only
-# string marker, so both dead demand and retained constructor bodies are checked.
+# Metadata-only reflection must not retain callable constructor thunks or
+# allocation-site metadata for unrelated normally allocated classes and Lists.
+# Dead CreateInstance/GetType helpers must not enable either capability.
 #
 # Invoke from any directory with absolute paths:
 #   cmake -DZANC=<zanc> -DSRC=<publish_reflect_ctor_demand_metadata.zan>
@@ -48,13 +48,17 @@ foreach(_required
   endif()
 endforeach()
 
-# Search symbol prefixes, not only definitions: an unresolved constructor thunk
-# declaration/reference is also a regression. Ordinary method/accessor thunks
-# remain outside this constructor-specific contract.
+# Search symbol prefixes, not only definitions: unresolved references are also
+# regressions. Type names remain valid ARC identity data; use the unrelated
+# field-name payload and hook marker to detect metadata and callable retention.
 foreach(_forbidden
     "__zan.refl.thunk.new."
     "__zan.refl.thunk.list_ctor."
-    "CTOR_DEMAND_METADATA_BODY_MUST_BE_DEAD")
+    "__zan_refl_obj_type"
+    "__zan_site_meta_tbl"
+    "c\"SiteMetadataUnrelatedField\\00\""
+    "CTOR_DEMAND_METADATA_BODY_MUST_BE_DEAD"
+    "SITE_METADATA_UNRELATED_HOOK_MUST_BE_DEAD")
   string(FIND "${_ir}" "${_forbidden}" _pos)
   if(NOT _pos EQUAL -1)
     message(FATAL_ERROR
@@ -63,4 +67,4 @@ foreach(_forbidden
 endforeach()
 
 message(STATUS
-  "publish_reflect_ctor_demand_ir: constructor metadata retained; class/List constructor thunks and dead body marker absent")
+  "publish_reflect_ctor_demand_ir: explicit metadata checks retained; constructor thunks, dynamic type helper and unrelated hook absent")

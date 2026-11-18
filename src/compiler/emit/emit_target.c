@@ -92,6 +92,9 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     const char *no_instance_prune = getenv("ZAN_NO_PUBLISH_INSTANCE_PRUNE");
     g->publish_instance_prune = g->publish_mode && !g->emit_debug && !g->emit_lib &&
                                 !(no_instance_prune && strcmp(no_instance_prune, "1") == 0);
+    const char *no_reflect_demand = getenv("ZAN_NO_PUBLISH_REFLECT_DEMAND");
+    g->publish_reflect_demand = g->publish_mode && !g->emit_debug && !g->emit_lib &&
+                               !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
     di_debug_types_reset();
     if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
         char error[4096];
@@ -121,73 +124,29 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
      * local allocation site. Native handles and scalar returns do not do so. */
     if (g->publish_instance_prune && extern_can_supply_instances(g))
         g->publish_instance_prune = false;
+    const char *no_vslot_demand = getenv("ZAN_NO_PUBLISH_VSLOT_DEMAND");
+    g->publish_vslot_demand = g->publish_instance_prune &&
+        !(no_vslot_demand && strcmp(no_vslot_demand, "1") == 0);
 
     bool prune_stdlib_bodies = (g->publish_mode || g->obfuscate_strings) && !g->emit_debug;
-    bool prune_user = prune_stdlib_bodies;
     unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
     for (int w = 0; w < work_count; w++) {
+        zan_ast_node_t *m = work[w].member;
+        if (sinit_is_cctor(m)) continue;
         zan_symbol_t *owner = work[w].type_sym;
-        if (!prune_stdlib_bodies || !owner || !owner->decl) {
-            live[w] = 1;
-            continue;
-        }
-        if (!owner->decl->from_stdlib) {
-            if (!prune_user) {
-                live[w] = 1;
-            } else {
-                zan_ast_node_t *m = work[w].member;
-                bool is_cctor = (m->kind == AST_CONSTRUCTOR_DECL &&
-                                 (m->method_decl.modifiers & MOD_STATIC) != 0);
-                bool is_entry = (m->kind == AST_METHOD_DECL &&
-                                 (m->method_decl.modifiers & MOD_STATIC) != 0 &&
-                                 ((m->method_decl.name.len == 4 &&
-                                   memcmp(m->method_decl.name.str, "Main", 4) == 0) ||
-                                  (m->method_decl.name.len == 12 &&
-                                   memcmp(m->method_decl.name.str, "__DesignMain", 12) == 0)));
-                bool is_lib_export = g->emit_lib &&
-                    ((m->method_decl.modifiers & MOD_PUBLIC) ||
-                     m->kind == AST_CONSTRUCTOR_DECL);
-                bool is_refl_root = false;
-                if (g->refl_used && owner) {
-                    if (g->refl_mtabs) {
-                        for (int k = 0; k < g->refl_mtab_count; k++) {
-                            if (g->refl_mtabs[k].sym == owner) {
-                                is_refl_root = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!is_refl_root && g->refl_metas) {
-                        for (int k = 0; k < g->refl_meta_count; k++) {
-                            if (g->refl_metas[k].sym == owner) {
-                                is_refl_root = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!is_refl_root && g->site_syms) {
-                        for (int k = 0; k < g->leak_site_count; k++) {
-                            if (g->site_syms[k] == owner) {
-                                if (!g->publish_mode || refl_type_needs_site_meta(g, owner)) {
-                                    is_refl_root = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if (is_refl_root && m->kind == AST_CONSTRUCTOR_DECL && !is_cctor)
-                    is_refl_root = refl_ctor_needs_thunk(g);
-                if (is_refl_root && m->kind == AST_METHOD_DECL)
-                    is_refl_root = refl_method_needs_thunk(g, owner, m);
-                bool has_attrs = (m->meta && m->meta->attributes.count > 0);
-                if (is_entry || is_cctor || is_lib_export || is_refl_root || has_attrs) {
-                    live[w] = 1;
-                }
-            }
-        }
+        bool is_entry = m->kind == AST_METHOD_DECL &&
+            (m->method_decl.modifiers & MOD_STATIC) &&
+            owner && owner->decl && owner->decl->type_decl.type_params.count == 0 &&
+            ((m->method_decl.name.len == 4 &&
+              memcmp(m->method_decl.name.str, "Main", 4) == 0) ||
+             (m->method_decl.name.len == 12 &&
+              memcmp(m->method_decl.name.str, "__DesignMain", 12) == 0));
+        bool is_lib_export = g->emit_lib &&
+            ((m->method_decl.modifiers & MOD_PUBLIC) || m->kind == AST_CONSTRUCTOR_DECL);
+        bool has_attrs = m->meta && m->meta->attributes.count > 0;
+        if (is_entry || is_lib_export || has_attrs) live[w] = 1;
     }
-    emit_user_method_bodies(g, work, work_count, live);
+    emit_demanded_method_bodies(g, work, work_count, live);
     emit_pending_method_specs(g);
     discover_generic_insts(g, unit);
     emit_pending_method_specs(g);
@@ -272,13 +231,18 @@ done:
         return ZAN_ERROR;
     }
 
-    if (prune_stdlib_bodies) emit_vtables(g);
+    emit_vtables(g);
     work_fn_index_t work_ix = { .g = g };
     work_fn_index_build(&work_ix, work, work_count);
     int pending;
     do {
         pending = 0;
         bool ctor_used_before = g->refl_ctor_used;
+        const bool site_meta_before = refl_needs_site_meta(g);
+        const bool invoke_unknown_before = g->refl_invoke_unknown;
+        const int invoke_names_before = g->refl_invoke_name_count;
+        const unsigned query_used_before = g->refl_query_used;
+        const int vslots_before = g->vslot_demand_count;
         int metas_before = g->refl_meta_count;
         int mtabs_before = g->refl_mtab_count;
         int sites_before = g->leak_site_count;
@@ -288,6 +252,15 @@ done:
         refl_reserve_thunk_sites(g);
         emit_pending_method_specs(g);
         if (zan_diag_has_errors(g->diag)) break;
+        if (g->publish_vslot_demand) emit_vtables(g);
+        sinit_exec_graph_t static_graph;
+        sinit_graph_build(&static_graph, g, &work_ix);
+        pending += emit_pending_static_initializers(g, unit, work, work_count,
+                                                    live, &static_graph);
+        if (zan_diag_has_errors(g->diag)) {
+            sinit_graph_dispose(&static_graph);
+            break;
+        }
         for (int w = 0; w < work_count; w++) {
             if (live[w]) continue;
             zan_ast_node_t *member = work[w].member;
@@ -310,57 +283,82 @@ done:
                             }
                         }
                     }
-                    if (!is_refl_root && g->site_syms) {
+                    if (!is_refl_root && refl_needs_site_meta(g) && g->site_syms) {
                         for (int m = 0; m < g->leak_site_count; m++) {
                             if (g->site_syms[m] == tsym) {
-                                if (!g->publish_mode || refl_type_needs_site_meta(g, tsym)) {
-                                    is_refl_root = true;
-                                    break;
-                                }
+                                is_refl_root = true;
+                                break;
                             }
                         }
                     }
                 }
             if (!is_refl_root)
                 is_refl_root = reflected_method_has_derived_owner(g, work[w].type_sym, member);
-            /* Body roots share the callable predicates with thunk generation.
-             * Constructor query metadata alone must not retain instance bodies;
-             * cctors keep the existing initialization policy. */
-            if (is_refl_root && member->kind == AST_METHOD_DECL) {
-                is_refl_root = refl_method_needs_thunk(g, work[w].type_sym, member);
+            /* Metadata/thunk retention is not executable type demand. Explicit
+             * CreateInstance/Invoke and established annotated/HTML callbacks
+             * are callable roots; cctors are reached only from activated init. */
+            if (sinit_is_cctor(member)) {
+                is_refl_root = false;
+            } else if (is_refl_root && member->kind == AST_METHOD_DECL) {
+                is_refl_root = refl_method_needs_thunk(g, work[w].type_sym, member) &&
+                    static_init_body_has_live_use(&static_graph, work[w].fn);
+            } else if (is_refl_root && member->kind == AST_CONSTRUCTOR_DECL) {
+                is_refl_root = g->emit_lib || g->static_init_ctor_demand;
             }
-            if (is_refl_root && member->kind == AST_CONSTRUCTOR_DECL &&
-                !(member->method_decl.modifiers & MOD_STATIC)) {
-                is_refl_root = refl_ctor_needs_thunk(g);
-            }
-            bool root = (g->emit_lib &&
-                         ((member->method_decl.modifiers & MOD_PUBLIC) ||
-                          member->kind == AST_CONSTRUCTOR_DECL)) ||
-                        is_refl_root ||
-                        (member->kind == AST_METHOD_DECL &&
-                         refl_is_exact_html_handler_name(g,
-                             (const char *)member->method_decl.name.str,
-                             (size_t)member->method_decl.name.len));
+            bool root = !sinit_is_cctor(member) &&
+                        ((g->emit_lib &&
+                          ((member->method_decl.modifiers & MOD_PUBLIC) ||
+                           member->kind == AST_CONSTRUCTOR_DECL)) ||
+                         is_refl_root ||
+                         (member->kind == AST_METHOD_DECL &&
+                          refl_is_exact_html_handler_name(g,
+                              (const char *)member->method_decl.name.str,
+                              (size_t)member->method_decl.name.len)));
             if (!root)
-                root = body_has_live_use(work[w].fn, live, &work_ix);
+                root = body_has_live_use(work[w].fn, live, &work_ix) &&
+                       static_init_body_has_live_use(&static_graph, work[w].fn);
             if (root) { live[w] = 1; pending++; }
         }
+        sinit_graph_dispose(&static_graph);
         if (pending) {
-            emit_user_method_bodies(g, work, work_count, live);
+            emit_demanded_method_bodies(g, work, work_count, live);
             emit_pending_method_specs(g);
             if (zan_diag_has_errors(g->diag)) break;
         }
-        /* Specializations can emit CreateInstance or discover metadata after
-         * the prewarm, even if no ordinary method body became live. Iterate
-         * again before replacing declarations by dead stubs in that case. */
+        /* Specializations can emit CreateInstance, enable dynamic object
+         * reflection or discover metadata after the prewarm, even if no ordinary
+         * body became live. Reach the fixed point before freezing dead stubs. */
         if (ctor_used_before != g->refl_ctor_used ||
+            site_meta_before != refl_needs_site_meta(g) ||
+            invoke_unknown_before != g->refl_invoke_unknown ||
+            invoke_names_before != g->refl_invoke_name_count ||
+            query_used_before != g->refl_query_used ||
+            vslots_before != g->vslot_demand_count ||
             metas_before != g->refl_meta_count ||
             mtabs_before != g->refl_mtab_count ||
             sites_before != g->leak_site_count) {
             pending++;
         }
     } while (pending);
+    if (!zan_diag_has_errors(g->diag)) {
+        finalize_static_initializers(g, unit, work, work_count, live, &work_ix);
+    }
     free(work_ix.slots);
+    /* Preserve ordinary/debug codegen diagnostics after freezing executable
+     * initialization demand. These bodies cannot add startup roots. */
+    if (!prune_stdlib_bodies && !zan_diag_has_errors(g->diag)) {
+        unsigned char *diagnostic_live = (unsigned char *)calloc((size_t)work_count + 1, 1);
+        for (int w = 0; w < work_count; w++) {
+            if (live[w]) diagnostic_live[w] = 2;
+            else if (!sinit_is_cctor(work[w].member)) diagnostic_live[w] = 1;
+        }
+        emit_demanded_method_bodies(g, work, work_count, diagnostic_live);
+        emit_pending_method_specs(g);
+        for (int w = 0; w < work_count; w++) {
+            if (!live[w] && diagnostic_live[w] == 2) live[w] = 3;
+        }
+        free(diagnostic_live);
+    }
     for (int w = 0; w < work_count; w++) {
         if (live[w]) continue;
         free(work[w].param_types);
@@ -441,6 +439,8 @@ done:
         g->function_compactor = NULL;
         if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
     }
+    sinit_register_library_startup(g, get_static_init_coordinator(g));
+    refl_compact_member_tables(g);
     char *error = NULL;
     if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &error)) {
         const char *culprit = NULL;

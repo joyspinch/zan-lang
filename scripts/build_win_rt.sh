@@ -52,17 +52,17 @@ mkdir -p "$STAGE"
 # rt_crash.h split), so native/cross links need this object next to
 # zanrt_timer.o.
 "$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -c "$RT/rt_crash.c" -o "$STAGE/zanrt_crash.o"
-# Hardware-accelerated crypto, shipped as an ARCHIVE member and not as a bare
-# object: a bare .o on the link line is loaded whole, so every program carried
-# the entire SHA/AES/SM3/SM4 block even when it used none of it. As an archive
-# member the linker pulls it only when the program really references a
-# zan_hw_* symbol.
-# Rebuild this together with zanrt_timer.o: both derive from the same
-# rt_hw_accel.c, and mixing generations would define the same symbol twice
-# (TASKS.md A493).
-"$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -I "$ACCEL" -c "$ACCEL/zan_hw_accel.c" -o "$STAGE/zan_crypto.o"
+# Independent feature members keep JSON/CPU users from loading crypto.
+set --
+for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
+    crypto_name=${crypto_src##*/}
+    crypto_obj="$STAGE/zan_crypto_${crypto_name%.c}.o"
+    "$CC" -O2 -ffunction-sections -fdata-sections -g0 -std=c11 -I "$RT" -I "$ACCEL" -c "$crypto_src" -o "$crypto_obj"
+    set -- "$@" "$crypto_obj"
+done
 rm -f "$STAGE/libzancrypto.a"
-"${AR:-ar}" rcs "$STAGE/libzancrypto.a" "$STAGE/zan_crypto.o"
+"${AR:-ar}" rcs "$STAGE/libzancrypto.a" "$@"
+rm -f "$@"
 # Embedded-resource API + compressed-resource decoder: GUI programs pull
 # skins/icons through the auto-embed path, so the cross link injects these two
 # objects (same flags as the ZAN_INFLATE_OBJ recipe in CMakeLists.txt).
@@ -91,7 +91,7 @@ fi
 # Swap in: every artifact is ready, so the bundle changes generation in one
 # step.
 for f in zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_decimal.o \
-         zanrt_timer.o zanrt_crash.o zan_embed_api.o zan_inflate.o libzancrypto.a zan_crypto.o; do
+         zanrt_timer.o zanrt_crash.o zan_embed_api.o zan_inflate.o libzancrypto.a; do
     rm -f "$OUT/$f"
     mv "$STAGE/$f" "$OUT/$f"
 done

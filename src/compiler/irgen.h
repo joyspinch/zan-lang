@@ -86,6 +86,20 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
  * 一处残留使用（该栈从未被压入，待 wasm EH 落地时一并改动态）。 */
 #define ZAN_MAX_ARMED_TRY 1024
 
+/* Optional member descriptions are independent of lookup and invocation. */
+enum {
+    ZAN_REFL_QUERY_METHOD_RETURN = 1u << 0,
+    ZAN_REFL_QUERY_METHOD_PARAMS = 1u << 1,
+    ZAN_REFL_QUERY_METHOD_ATTRS = 1u << 2,
+    ZAN_REFL_QUERY_CTORS = 1u << 3,
+    ZAN_REFL_QUERY_CTOR_PARAMS = 1u << 4,
+    ZAN_REFL_QUERY_FIELD_TYPE = 1u << 5,
+    ZAN_REFL_QUERY_FIELD_CUSTOM = 1u << 6,
+    ZAN_REFL_QUERY_FIELD_DEFAULT = 1u << 7,
+    ZAN_REFL_QUERY_FIELD_TYPEINFO = 1u << 8,
+    ZAN_REFL_QUERY_FIELD_ATTRS = 1u << 9
+};
+
 typedef struct zan_irgen_pending_scope {
     struct zan_irgen_pending_scope *parent;
     int handler_id;
@@ -405,9 +419,32 @@ struct zan_irgen {
     struct zan_static_field_ref {
         zan_type_t   *type;
         LLVMValueRef  gv;
+        zan_symbol_t *owner;
+        zan_type_t   *inst;
     } *static_fields;
     int static_field_count;
     int static_field_cap;
+    /* Startup initialization follows executable demand, independently of eager
+     * diagnostic body emission and reflection metadata retention. */
+    struct zan_static_init_type {
+        zan_symbol_t *sym;
+        zan_type_t   *inst;
+        LLVMValueRef fn;
+        LLVMValueRef cctor_fn;
+        bool         emitted;
+    } *static_init_types;
+    int static_init_type_count;
+    int static_init_type_cap;
+    struct zan_static_init_use {
+        zan_symbol_t *sym;
+        zan_type_t   *inst;
+        LLVMValueRef caller;
+    } *static_init_uses;
+    int static_init_use_count;
+    int static_init_use_cap;
+    LLVMValueRef static_init_coordinator;
+    LLVMValueRef static_init_cleanup;
+    bool static_init_ctor_demand; /* executable CreateInstance, excluding metadata thunks */
     LLVMValueRef g_live;
     LLVMValueRef g_site_live;
     LLVMValueRef g_site_names;
@@ -438,6 +475,10 @@ struct zan_irgen {
     LLVMValueRef soft_scratch_fn;
     bool         publish_mode;
     bool         publish_instance_prune; /* closed-world instance callable roots */
+    bool         publish_vslot_demand;
+    zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */
+    int          vslot_demand_count;
+    int          vslot_demand_cap;
     char       **html_handlers;      /* publish：设计稿事件处理器名，按名保留反射 */
     int          html_handler_count;
     bool         strict_runtime;
@@ -482,12 +523,19 @@ struct zan_irgen {
         zan_symbol_t *sym;
         const char   *name;
         LLVMValueRef  rec;
+        LLVMValueRef  gv;           /* TypeInfo blob, projected after demand converges */
     } *refl_metas;
     int refl_meta_count;
     int refl_meta_cap;
     int refl_str_count;
-    bool refl_used;               /* 标记已使用 typeof/GetType：需生成分配点记录表 */
+    bool refl_used;               /* explicit or dynamic reflection metadata is required */
+    bool publish_reflect_demand;  /* narrow publish metadata to emitted reflection capabilities */
+    unsigned refl_query_used;     /* emitted signature-query capabilities, monotonic */
     bool refl_ctor_used;          /* live emitted CreateInstance; metadata alone is not callable demand */
+    zan_istr_t *refl_invoke_names; /* emitted literal Invoke names; storage belongs to arena */
+    int refl_invoke_name_count;
+    int refl_invoke_name_cap;
+    bool refl_invoke_unknown;     /* computed Invoke name preserves all callable hooks */
     LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
     LLVMValueRef refl_empty_str;
     LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */
@@ -498,6 +546,9 @@ struct zan_irgen {
     LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
     LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
     LLVMTypeRef  refl_method_type;
+    LLVMValueRef refl_field_pool;  /* compact field records, shared by index tables */
+    LLVMValueRef refl_method_pool; /* compact method/ctor records */
+    LLVMValueRef refl_value_pool;  /* pointer payloads; entry zero is null */
     /* 反射元数据静态记录表 */
     struct {
         LLVMValueRef  gv;

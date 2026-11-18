@@ -1,4 +1,5 @@
 /* rt_hw_crc.c: CRC32 与 CRC32C 硬件切片与指令加速实现 */
+#include "rt_hw_internal.h"
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 __attribute__((target("sse4.2,crc32")))

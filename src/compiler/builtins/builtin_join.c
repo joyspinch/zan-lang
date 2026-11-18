@@ -164,6 +164,7 @@ LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
     }
     /* 泛型类的静态字段按闭合特化类型独立隔离 (如 Stat<int> 与 Stat<string> 拥有独立静态槽) */
     if (!inst && g->cur_inst && g->cur_inst->sym == class_sym) inst = g->cur_inst;
+    irgen_record_static_type_use(g, class_sym, inst);
     char suffix[256];
     suffix[0] = '\0';
     if (inst && inst->sym == class_sym && inst->type_arg_count > 0)
@@ -174,20 +175,23 @@ LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
              (int)fsym->name.len, fsym->name.str, suffix);
     LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
     if (gv) return gv;
-    LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
-                                : LLVMInt64TypeInContext(g->ctx);
+    zan_type_t *field_type = field_store_type(g, fsym, inst);
+    LLVMTypeRef ft = field_type ? map_type(g, field_type)
+                               : LLVMInt64TypeInContext(g->ctx);
     gv = LLVMAddGlobal(g->mod, ft, name);
     LLVMSetLinkage(gv, LLVMInternalLinkage);
     LLVMSetInitializer(gv, LLVMConstNull(ft));
-    if (fsym->type && (is_rc_managed_type(fsym->type) || fsym->type->kind == TYPE_OBJECT)) {
+    if (field_type && (is_rc_managed_type(field_type) || field_type->kind == TYPE_OBJECT)) {
         if (g->static_field_count >= g->static_field_cap) {
             g->static_field_cap = g->static_field_cap ? g->static_field_cap * 2 : 16;
             g->static_fields = (struct zan_static_field_ref *)realloc(
                 g->static_fields,
                 (size_t)g->static_field_cap * sizeof(*g->static_fields));
         }
-        g->static_fields[g->static_field_count].type = fsym->type;
+        g->static_fields[g->static_field_count].type = field_type;
         g->static_fields[g->static_field_count].gv = gv;
+        g->static_fields[g->static_field_count].owner = class_sym;
+        g->static_fields[g->static_field_count].inst = inst;
         g->static_field_count++;
     }
     return gv;

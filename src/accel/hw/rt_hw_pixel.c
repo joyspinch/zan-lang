@@ -1,4 +1,5 @@
 /* rt_hw_pixel.c: SIMD 像素 Alpha 混合、色彩通道交换与栅格化图形加速实现 */
+#include "rt_hw_internal.h"
 
 
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))

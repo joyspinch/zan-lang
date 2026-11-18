@@ -171,6 +171,14 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 return v;
             }
         }
+        /* A declaration/layout/typeof is not executable type demand. Record
+         * construction even when the type has no explicit constructor body. */
+        if (!expr->new_expr.is_array) {
+            zan_type_t *created = resolve_type_ctx(g, expr->new_expr.type);
+            if (created && created->sym)
+                irgen_record_static_type_use(g, created->sym,
+                    created->type_arg_count ? created : NULL);
+        }
         /* new List<T>() 内建动态列表实例分配 */
         if (expr->new_expr.type && expr->new_expr.type->kind == AST_TYPE_REF &&
             !expr->new_expr.is_array) {

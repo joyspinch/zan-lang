@@ -455,13 +455,13 @@ static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
     return g->refl_method_type;
 }
 
-static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
-    if (!sym || !msym || msym->name.len <= 4) return 0;
-    bool is_get = memcmp(msym->name.str, "get_", 4) == 0;
-    bool is_set = memcmp(msym->name.str, "set_", 4) == 0;
+static int refl_accessor_flag(zan_symbol_t *sym, zan_istr_t name) {
+    if (!sym || name.len <= 4) return 0;
+    bool is_get = memcmp(name.str, "get_", 4) == 0;
+    bool is_set = memcmp(name.str, "set_", 4) == 0;
     if (!is_get && !is_set) return 0;
-    const char *pn = msym->name.str + 4;
-    int plen = (int)msym->name.len - 4;
+    const char *pn = name.str + 4;
+    int plen = (int)name.len - 4;
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *p = sym->members[i];
         if (p && p->kind == SYM_PROPERTY && (int)p->name.len == plen &&
@@ -472,7 +472,7 @@ static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
 }
 
 /* 框架按名反射调用的生命周期钩子（Form / ChildWindow 的 OnLoad 等）。
- * 在 publish 模式下默认保留 thunk 与反射导出，避免 HasMethod 返回真而 Invoke 哑火（B-ID160）。 */
+ * 签名保持反射可见，publish 调用桩再按实际发射的 Invoke 名字需求保留。 */
 static bool refl_is_framework_hook_name(const char *s, size_t n) {
     if (!s || n < 3) return false;
     /* 显式常用生命周期与事件钩子 */
@@ -487,8 +487,7 @@ static bool refl_is_framework_hook_name(const char *s, size_t n) {
     if (n == 8 && memcmp(s, "OnResize", 8) == 0) return true;
     if (n == 7 && memcmp(s, "OnPaint", 7) == 0) return true;
     if (n == 8 && memcmp(s, "OnUpdate", 8) == 0) return true;
-    /* 凡是符合 OnPascalCase 规范的方法（如 OnCustomHook 等），
-     * 均作为框架生命周期/事件钩子默认保留 thunk */
+    /* 符合 OnPascalCase 的方法（如 OnCustomHook）属于可调用钩子候选。 */
     if (s[0] == 'O' && s[1] == 'n' && (s[2] >= 'A' && s[2] <= 'Z'))
         return true;
     return false;
@@ -550,10 +549,20 @@ bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
     return false;
 }
 
+static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
+    if (!g->publish_reflect_demand || g->refl_invoke_unknown) return true;
+    for (int i = 0; i < g->refl_invoke_name_count; i++) {
+        zan_istr_t invoked = g->refl_invoke_names[i];
+        if (invoked.len == name.len && memcmp(invoked.str, name.str, name.len) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target body-root 的唯一判定。
  * 非 publish：全部方法（现状不变）。
  * publish：仅 accessor（get_/set_ 且 owner 同名 property）、带注解方法、
- * 设计稿事件处理器与框架生命周期钩子。
+ * 设计稿事件处理器与实际 Invoke 可能选中的框架生命周期钩子。
  * 注意与 refl_method_should_export 的\u533a\u522b：\u672c\u8c13\u8bcd\u4e0d\u770b MOD_PUBLIC\uff08\u79c1\u6709 accessor/\u6ce8\u89e3\u4ecd\u751f thunk，\u4e0e\u73b0\u72b6\u4e00\u81f4）\u3002
  */
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
@@ -563,18 +572,17 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
     if (!(decl->method_decl.modifiers & MOD_STATIC) &&
         !refl_owner_can_have_instance(g, owner))
         return false;
-    zan_symbol_t *msym = NULL;
-    if (owner) {
-        for (int i = 0; i < owner->member_count; i++) {
-            zan_symbol_t *p = owner->members[i];
-            if (p && p->decl == decl) { msym = p; break; }
-        }
-    }
-    if (msym && refl_accessor_flag(owner, msym) != 0) { return true; }
+    /* Inherited accessors are collected from their declaring base, while this
+     * owner is the reflected receiver; its flattened properties retain names. */
+    if (refl_accessor_flag(owner, decl->method_decl.name) != 0) { return true; }
     zan_ast_list_t *attrs = zan_ast_attributes(decl);
     if (attrs && attrs->count > 0) { return true; }
-    return refl_is_html_handler_name(g, (const char *)decl->method_decl.name.str,
-                                    (size_t)decl->method_decl.name.len);
+    zan_istr_t name = decl->method_decl.name;
+    if (refl_is_exact_html_handler_name(g, name.str, name.len)) return true;
+    /* Named hooks are callable only when an emitted Invoke may select them.
+     * HasMethod and member enumeration still retain the unchanged signatures. */
+    return refl_is_framework_hook_name(name.str, name.len) &&
+           refl_invoke_name_demanded(g, name);
 }
 
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t *m) {
@@ -589,7 +597,7 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_sym
      * 2. 带有显式特性注解（attributes）的方法保留
      * 3. 必须是公开方法；私有/内部方法在发布期绝对不暴露反射
      */
-    if (refl_accessor_flag(sym, m) != 0)
+    if (refl_accessor_flag(sym, m->name) != 0)
         return true;
     zan_ast_list_t *attrs = zan_ast_attributes(m->decl);
     if (attrs && attrs->count > 0)

@@ -1,0 +1,97 @@
+using System;
+
+// Loading a declaration, reflecting its shape, or retaining a dead method must
+// not run its initializer. An initializer cannot create its own demand root.
+class StaticDemandDead {
+    public static int Value = Start();
+    static int Start() {
+        Console.WriteLine("STATIC_DEMAND_DEAD_FIELD");
+        return StaticDemandDeadPeer.Value;
+    }
+    static StaticDemandDead() { Console.WriteLine("STATIC_DEMAND_DEAD_CCTOR"); }
+}
+class StaticDemandDeadPeer {
+    public static int Value = StaticDemandDead.Value + 1;
+}
+class StaticDemandMetadata {
+    public int Shape;
+    public int Shaped { get { return StaticDemandMetadataState.Value; } }
+    public static string Label = "STATIC_DEMAND_METADATA_FIELD";
+    static StaticDemandMetadata() { Console.WriteLine("STATIC_DEMAND_METADATA_CCTOR"); }
+    public StaticDemandMetadata() { Console.WriteLine("STATIC_DEMAND_METADATA_CTOR"); }
+}
+
+// Ordinary compilation prewarms this metadata constructor. Its field expression
+// must not enable executable CreateInstance demand for the startup fixed point.
+class StaticDemandMetadataNested {
+    public object Child = typeof(StaticDemandMetadata).CreateInstance();
+}
+class StaticDemandMetadataState {
+    public static int Value = Start();
+    static int Start() {
+        Console.WriteLine("STATIC_DEMAND_METADATA_GETTER_STATE");
+        return 1;
+    }
+}
+
+class StaticDemandLeaf {
+    public static int Value = 20;
+    static StaticDemandLeaf() { Value = Value + 1; }
+}
+class StaticDemandBridge {
+    public static int Read() { return StaticDemandLeaf.Value; }
+}
+class StaticDemandRoot {
+    public static int Value = StaticDemandBridge.Read() * 2;
+    public static string Label = "live" + "-static";
+    static StaticDemandRoot() { Value = Value + 1; }
+}
+class StaticDemandMethod {
+    public static int Value = 7;
+    static StaticDemandMethod() { Value = Value + 1; }
+    public static int Read() { return Value; }
+}
+class StaticDemandConstructed {
+    public static int Seed = 30;
+    static StaticDemandConstructed() { Seed = Seed + 1; }
+    public int Read() { return Seed; }
+}
+class StaticDemandBox<T> {
+    public static int Value = 40;
+    public static string Label = "box" + "-static";
+    static StaticDemandBox() { Value = Value + 1; }
+}
+class StaticDemandCycleA {
+    public static int Value = StaticDemandCycleB.Value + 1;
+}
+class StaticDemandCycleB {
+    public static int Value = StaticDemandCycleA.Value + 1;
+}
+class Program {
+    static int Unused() { return StaticDemandDead.Value; }
+    static object UnusedFactory(TypeInfo type) { return type.CreateInstance(); }
+    static void Require(bool ok, string message) {
+        if (!ok) throw new Exception(message);
+    }
+    static void Main() {
+        Console.WriteLine("static demand begin");
+        Require(StaticDemandRoot.Value == 43, "transitive helper and fields before cctor");
+        Require(StaticDemandRoot.Label == "live-static", "managed static initializer");
+        Require(StaticDemandMethod.Read() == 8, "method demand activates owner");
+        StaticDemandConstructed made = new StaticDemandConstructed();
+        Require(made.Read() == 31, "implicit constructor activates owner");
+        TypeInfo metadata = typeof(StaticDemandMetadata);
+        Require(metadata.FieldCount > 0, "metadata retained without initialization");
+        Require(typeof(StaticDemandMetadataNested).FieldCount > 0,
+        "metadata constructor cannot enable nested reflection demand");
+        Require(StaticDemandBox<int>.Value == 41 && StaticDemandBox<string>.Value == 41,
+        "each closed generic cctor has its own storage");
+        StaticDemandBox<int>.Value = 99;
+        Require(StaticDemandBox<string>.Value == 41, "generic static storage independent");
+        Require(StaticDemandBox<int>.Label == "box-static" &&
+        StaticDemandBox<string>.Label == "box-static", "generic managed cleanup");
+        Require(StaticDemandCycleA.Value == 2 && StaticDemandCycleB.Value == 1,
+        "cyclic initializers terminate with deterministic existing order");
+        Console.WriteLine("static demand PASS");
+    }
+}

@@ -1,4 +1,5 @@
 /* rt_hw_hash.c: SHA-256 与 SHA-1 硬件加速指令集内核与自检实现 */
+#include "rt_hw_internal.h"
 
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))

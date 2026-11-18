@@ -969,6 +969,15 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     free(g->static_fields);
     g->static_fields = NULL;
     g->static_field_count = g->static_field_cap = 0;
+    free(g->static_init_types);
+    g->static_init_types = NULL;
+    g->static_init_type_count = g->static_init_type_cap = 0;
+    free(g->static_init_uses);
+    g->static_init_uses = NULL;
+    g->static_init_use_count = g->static_init_use_cap = 0;
+    g->static_init_coordinator = NULL;
+    g->static_init_cleanup = NULL;
+    g->static_init_ctor_demand = false;
     g->cur_mtps = NULL;
     g->cur_mbind = NULL;
     zan_irgen_shard_buf_free(g);

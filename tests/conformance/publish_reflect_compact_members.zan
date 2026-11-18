@@ -1,0 +1,119 @@
+using System;
+
+[Table(Name = "compact_members")]
+class CompactMembersBase {
+    [Column(Name = "compact_id", IsPrimary = true, IsIdentity = true)]
+    public int Id = 7;
+    [Required]
+    [DefaultValue("seed")]
+    public string Text = "seed";
+    public int Stored;
+    public int Number {
+        get { return Stored + 1; }
+        set { Stored = value - 1; }
+    }
+    public virtual int OnValue(int amount) { return Id + amount; }
+    public int OnInherited(int amount) { return Id * amount; }
+    public static int OnStatic() { return 23; }
+}
+
+class CompactMembersLeft : CompactMembersBase {
+    public int Extra;
+    public override int OnValue(int amount) { return Id + amount + 100; }
+}
+
+class CompactMembersRight : CompactMembersBase {
+    public int Extra;
+}
+
+class CompactMembersEmpty { }
+
+enum CompactMembersBounds {
+    Negative = -2147483648,
+    Positive = 2147483647
+}
+
+class Program {
+    static void Check(bool condition, string message) {
+        if (!condition) throw new Exception(message);
+    }
+
+    static int FindField(TypeInfo type, string name) {
+        for (int i = 0; i < type.FieldCount; i++) {
+            if (type.GetFieldName(i) == name) return i;
+        }
+        return -1;
+    }
+
+    static int FindMethod(TypeInfo type, string name) {
+        for (int i = 0; i < type.MethodCount; i++) {
+            if (type.GetMethodName(i) == name) return i;
+        }
+        return -1;
+    }
+
+    static void CheckOrder(TypeInfo baseType, TypeInfo derivedType) {
+        Check(baseType.FieldCount + 1 == derivedType.FieldCount, "inherited field count");
+        for (int i = 0; i < baseType.FieldCount; i++) {
+            Check(baseType.GetFieldName(i) == derivedType.GetFieldName(i), "inherited field order");
+            Check(baseType.GetFieldType(i) == derivedType.GetFieldType(i), "inherited field type");
+        }
+        Check(derivedType.GetFieldName(derivedType.FieldCount - 1) == "Extra", "own field last");
+    }
+
+    static void Main() {
+        CompactMembersLeft left = new CompactMembersLeft();
+        CompactMembersRight right = new CompactMembersRight();
+        object a = left;
+        object b = right;
+        TypeInfo lt = a.GetType();
+        TypeInfo rt = b.GetType();
+        CheckOrder(typeof(CompactMembersBase), lt);
+        CheckOrder(typeof(CompactMembersBase), rt);
+        Check(lt.GetMethodName(0) == "OnValue", "override remains first");
+        Check(rt.GetMethodName(0) == typeof(CompactMembersBase).GetMethodName(0), "base member order");
+        Check(a.InvokeInt("OnValue", 3) == 110, "override dispatch");
+        Check(b.InvokeInt("OnValue", 3) == 10, "base dispatch");
+        Check(a.InvokeInt("OnInherited", 4) == 28 && b.InvokeInt("OnInherited", 5) == 35,
+        "shared inherited thunk");
+        Check(a.SetFieldInt("Number", 45) && a.GetFieldInt("Number") == 45 && left.Stored == 44,
+        "property accessor and backing value");
+        Check(a.SetFieldString("Text", "new-" + "value") && a.GetFieldString("Text") == "new-value",
+        "string field ownership");
+        int id = FindField(lt, "Id");
+        int text = FindField(lt, "Text");
+        Check(lt.GetFieldCustomName(id) == "compact_id" && lt.IsFieldPk(id) && lt.IsFieldIdentity(id),
+        "shared field annotation flags");
+        Check(lt.IsFieldRequired(text) && lt.GetFieldDefault(text) == "seed", "required and default");
+        Check(lt.GetFieldCustomAttributes(id).Contains("Column"), "field custom attributes");
+        Check(lt.GetFieldTypeInfo(id).Name == "int" && lt.GetFieldTypeInfo(text).Name == "string",
+        "field TypeInfo payload");
+        Check(lt.TableName == "CompactMembersLeft" && rt.TableName == "CompactMembersRight",
+        "derived table names use own short names");
+        Check(lt.GetCustomAttributes().Contains("Table.Name=compact_members;") &&
+        rt.GetCustomAttributes().Contains("Table.Name=compact_members;"),
+        "inherited type annotation payload");
+        int method = FindMethod(lt, "OnInherited");
+        Check(lt.GetMethodReturnType(method) == "int" && lt.GetMethodParamCount(method) == 1 &&
+        lt.GetMethodParamType(method, 0) == "int", "shared method signature");
+        Check(!lt.IsMethodStatic(method), "inherited instance flags");
+        TypeInfo bt = typeof(CompactMembersBase);
+        Check(bt.TableName == "compact_members", "declared table annotation");
+        Check(bt.IsMethodStatic(FindMethod(bt, "OnStatic")), "static flags");
+        Check(bt.HasMethod("OnInherited") && lt.HasMethod("OnInherited") && !lt.HasMethod("Absent"),
+        "lookup preserves names");
+        Check(lt.GetMethodName(-1) == "" && lt.GetMethodReturnType(9999) == "" &&
+        lt.GetMethodParamType(method, -1) == "" && lt.GetMethodParamCount(9999) == 0,
+        "method index guards");
+        Check(lt.GetFieldName(-1) == "" && lt.GetFieldType(9999) == "" &&
+        !lt.IsFieldPk(-1) && !lt.IsFieldRequired(9999) && lt.GetFieldTypeInfo(-1).Name == null &&
+        lt.GetMemberValue(9999) == 0, "field index guards");
+        TypeInfo empty = typeof(CompactMembersEmpty);
+        Check(empty.FieldCount == 0 && empty.GetFieldName(0) == "" && !empty.IsFieldPk(0) &&
+        empty.GetFieldTypeInfo(0).Name == null && empty.GetMemberValue(0) == 0, "empty table guards");
+        TypeInfo bounds = typeof(CompactMembersBounds);
+        Check(bounds.GetMemberValue(0) == -2147483648 && bounds.GetMemberValue(1) == 2147483647,
+        "signed enum boundaries");
+        Console.WriteLine("compact members PASS");
+    }
+}

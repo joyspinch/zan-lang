@@ -35,11 +35,9 @@ static LLVMValueRef refl_mfind_fn(zan_irgen_t *g) {
         LLVMBuildICmp(g->builder, LLVMIntSLT, i, count, "refl.more"), body, miss);
 
     LLVMPositionBuilderAtEnd(g->builder, body);
-    LLVMValueRef off = LLVMBuildMul(g->builder, i,
-        LLVMConstInt(i64, ZAN_REFL_METHOD_SIZE, 0), "refl.mo");
-    LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, methods, &off, 1, "refl.mr");
-    LLVMValueRef mname = refl_hdr_ptr(g, rec, ZAN_REFL_MO_NAME, "refl.mn");
-    LLVMValueRef mflags = refl_hdr_i64(g, rec, ZAN_REFL_MO_FLAGS, "refl.mf");
+    LLVMValueRef rec = refl_member_row(g, methods, i, true);
+    LLVMValueRef mname = refl_method_ptr(g, methods, rec, ZAN_REFL_MO_NAME);
+    LLVMValueRef mflags = refl_method_int(g, rec, ZAN_REFL_MO_FLAGS);
     LLVMValueRef acc = LLVMBuildICmp(g->builder, LLVMIntNE, flags,
                                      LLVMConstInt(i64, 0, 0), "refl.isacc");
     LLVMValueRef four = LLVMBuildSelect(g->builder, acc,
@@ -112,9 +110,7 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, ok, have, bad);
 
     LLVMPositionBuilderAtEnd(g->builder, have);
-    LLVMValueRef off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_METHOD_SIZE, 0), "refl.mo");
-    LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "refl.mr");
+    LLVMValueRef rec = refl_member_row(g, arr, idx, true);
     LLVMBuildCondBr(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_MW_PARAM, 0), "refl.isp"),
@@ -124,23 +120,20 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
     LLVMValueRef sel = LLVMBuildSelect(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_MW_NAME, 0), "refl.isn"),
-        LLVMConstInt(i64, ZAN_REFL_MO_NAME, 0),
+        LLVMConstInt(i64, 0, 0),
         LLVMBuildSelect(g->builder,
             LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                           LLVMConstInt(i64, ZAN_REFL_MW_RET, 0), "refl.isret"),
-            LLVMConstInt(i64, ZAN_REFL_MO_RET, 0),
-            LLVMConstInt(i64, ZAN_REFL_MO_ATTRS, 0), "refl.sel2"),
+            LLVMConstInt(i64, 1, 0),
+            LLVMConstInt(i64, 4, 0), "refl.sel2"),
         "refl.sel");
-    LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8, rec, &sel, 1, "refl.sp");
-    LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
-        LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i8ptr, 0), "refl.spc"),
-        "refl.sv");
+    LLVMValueRef sv = refl_member_ptr(g, arr, rec, true, sel);
     LLVMBuildRet(g->builder, LLVMBuildSelect(g->builder,
         LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.s"));
 
     LLVMPositionBuilderAtEnd(g->builder, par);
-    LLVMValueRef pc = refl_hdr_i64(g, rec, ZAN_REFL_MO_PCOUNT, "refl.pc");
-    LLVMValueRef ptypes = refl_hdr_ptr(g, rec, ZAN_REFL_MO_PTYPES, "refl.pt");
+    LLVMValueRef pc = refl_method_int(g, rec, ZAN_REFL_MO_PCOUNT);
+    LLVMValueRef ptypes = refl_method_ptr(g, arr, rec, ZAN_REFL_MO_PTYPES);
     LLVMValueRef pok = LLVMBuildAnd(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntSGE, k, LLVMConstInt(i64, 0, 0), "refl.kge"),
         LLVMBuildICmp(g->builder, LLVMIntSLT, k, pc, "refl.klt"), "refl.pok");
@@ -207,12 +200,10 @@ static LLVMValueRef refl_mi64_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, ok, ld, zero);
 
     LLVMPositionBuilderAtEnd(g->builder, ld);
-    LLVMValueRef off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_METHOD_SIZE, 0), "refl.mo");
-    LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "refl.mr");
-    LLVMValueRef pc = refl_hdr_i64(g, rec, ZAN_REFL_MO_PCOUNT, "refl.pc");
-    LLVMValueRef fl = refl_hdr_i64(g, rec, ZAN_REFL_MO_FLAGS, "refl.fl");
-    LLVMValueRef rk = refl_hdr_i64(g, rec, ZAN_REFL_MO_RETKIND, "refl.rk");
+    LLVMValueRef rec = refl_member_row(g, arr, idx, true);
+    LLVMValueRef pc = refl_method_int(g, rec, ZAN_REFL_MO_PCOUNT);
+    LLVMValueRef fl = refl_method_int(g, rec, ZAN_REFL_MO_FLAGS);
+    LLVMValueRef rk = refl_method_int(g, rec, ZAN_REFL_MO_RETKIND);
     LLVMValueRef v = LLVMBuildSelect(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, which,
                       LLVMConstInt(i64, ZAN_REFL_MI_PCOUNT, 0), "refl.ispc"),
@@ -266,11 +257,9 @@ static LLVMValueRef refl_invoke_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, ok, have, miss);
 
     LLVMPositionBuilderAtEnd(g->builder, have);
-    LLVMValueRef off = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_METHOD_SIZE, 0), "refl.mo");
-    LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "refl.mr");
-    LLVMValueRef thunk = refl_hdr_ptr(g, rec, ZAN_REFL_MO_THUNK, "refl.th");
-    LLVMValueRef rk = refl_hdr_i64(g, rec, ZAN_REFL_MO_RETKIND, "refl.rk");
+    LLVMValueRef rec = refl_member_row(g, arr, idx, true);
+    LLVMValueRef thunk = refl_method_ptr(g, arr, rec, ZAN_REFL_MO_THUNK);
+    LLVMValueRef rk = refl_method_int(g, rec, ZAN_REFL_MO_RETKIND);
     LLVMBuildCondBr(g->builder,
         LLVMBuildIsNull(g->builder, thunk, "refl.nothunk"), miss, call);
 
@@ -428,11 +417,9 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, slot);
     LLVMValueRef fields = refl_hdr_ptr(g, ti, ZAN_REFL_FIELDS_OFF, "refl.fields");
-    LLVMValueRef foffr = LLVMBuildMul(g->builder, idx,
-        LLVMConstInt(i64, ZAN_REFL_FIELD_SIZE, 0), "refl.fo");
-    LLVMValueRef fe = LLVMBuildGEP2(g->builder, i8, fields, &foffr, 1, "refl.fe");
-    LLVMValueRef fkind = refl_hdr_i64(g, fe, 16, "refl.fkind");
-    LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.foff");
+    LLVMValueRef fe = refl_member_row(g, fields, idx, false);
+    LLVMValueRef fkind = refl_member_u32(g, fe, false, 7);
+    LLVMValueRef foff = refl_field_offset(g, fe);
     LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, obj, &foff, 1, "refl.fslot");
     LLVMValueRef is_fp = LLVMBuildICmp(g->builder, LLVMIntEQ, vkind,
         LLVMConstInt(i64, ZAN_REFL_VK_DOUBLE, 0), "refl.visfp");
@@ -572,11 +559,9 @@ static LLVMValueRef refl_cfind_fn(zan_irgen_t *g) {
         LLVMBuildICmp(g->builder, LLVMIntSLT, i, count, "refl.more"), body, miss);
 
     LLVMPositionBuilderAtEnd(g->builder, body);
-    LLVMValueRef off = LLVMBuildMul(g->builder, i,
-        LLVMConstInt(i64, ZAN_REFL_METHOD_SIZE, 0), "refl.co");
-    LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "refl.cr");
-    LLVMValueRef pc = refl_hdr_i64(g, rec, ZAN_REFL_MO_PCOUNT, "refl.cpc");
-    LLVMValueRef th = refl_hdr_ptr(g, rec, ZAN_REFL_MO_THUNK, "refl.cth");
+    LLVMValueRef rec = refl_member_row(g, arr, i, true);
+    LLVMValueRef pc = refl_method_int(g, rec, ZAN_REFL_MO_PCOUNT);
+    LLVMValueRef th = refl_method_ptr(g, arr, rec, ZAN_REFL_MO_THUNK);
     LLVMBuildCondBr(g->builder, LLVMBuildAnd(g->builder,
         LLVMBuildICmp(g->builder, LLVMIntEQ, pc, want, "refl.cpq"),
         LLVMBuildIsNotNull(g->builder, th, "refl.cthnn"), "refl.chit"),
