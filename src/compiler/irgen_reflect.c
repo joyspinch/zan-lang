@@ -58,6 +58,7 @@
 #define ZAN_REFL_VK_INT      0   /* an integer, sign-extended */
 #define ZAN_REFL_VK_DOUBLE   1   /* a double, bit-cast */
 #define ZAN_REFL_VK_PTR      2   /* a string / reference, as an integer */
+#define ZAN_REFL_VK_TASK     3   /* a task token: Task.IsDone-pollable handle */
 
 #define ZAN_REFL_ARG_SLOTS   64
 

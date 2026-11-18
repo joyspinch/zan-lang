@@ -22,7 +22,7 @@ static LLVMValueRef refl_to_slot(zan_irgen_t *g, LLVMValueRef v) {
 
 static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMTypeRef fn_ty, bool is_static,
-                                    const char *tag) {
+                                    bool is_task, const char *tag) {
     if (!fn || !fn_ty) return NULL;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
@@ -114,6 +114,15 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     LLVMValueRef res = zan_call2(g->builder, fn_ty, fn, call_args, total, "");
     LLVMValueRef slot = LLVMGetTypeKind(rty) == LLVMVoidTypeKind
         ? LLVMConstInt(i64, 0, 0) : refl_to_slot(g, res);
+    if (is_task) {
+        /* async 方法：入口（ramp）只建帧不调度——直接把帧指针塞进槽位，
+         * 协程永远不会跑（没人 co_ready 它，也没人 track，帧会被回收）。
+         * 补齐 spawn 义务：awaiter=reap + token + track + ready，槽位放
+         * Task.IsDone 可轮询的 token。 */
+        LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, res, i8ptr, "refl.taskf");
+        LLVMValueRef tok = emit_detach_async_call(g, sub_i8, false, true);
+        slot = LLVMBuildPtrToInt(g->builder, tok, i64, "refl.tok");
+    }
     LLVMBuildStore(g->builder, slot, LLVMGetParam(th, 2));
     LLVMBuildRetVoid(g->builder);
     g->current_fn = saved_fn;
@@ -164,6 +173,12 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     if (decl->method_decl.modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT))
         flags |= ZAN_REFL_MF_VIRTUAL;
     flags |= refl_accessor_flag(sym, msym->name);
+    /* async 方法：thunk 走 detach spawn 语义，槽位回 task token。
+     * 判据用 MOD_ASYNC 而非 is_task_return——后者只标记声明返回
+     * Task/ValueTask 的方法（desugar_async_task_method），裸 `async long`
+     * 的 ramp 同样返回帧指针，也需要 spawn 义务。 */
+    bool is_task = decl && decl->kind == AST_METHOD_DECL &&
+                   (decl->method_decl.modifiers & MOD_ASYNC) != 0;
     LLVMValueRef thunk = LLVMConstNull(i8ptr);
     if (late) {
         /* 在 publish 模式下，仅为属性访问器（get_/set_）、带注解方法、
@@ -176,7 +191,7 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
             if (fi >= 0) {
                 LLVMValueRef t = refl_make_thunk(g, g->functions[fi].fn,
                                                  g->functions[fi].fn_type,
-                                                 is_static, "m");
+                                                 is_static, is_task, "m");
                 if (t) thunk = t;
             }
         }
@@ -191,7 +206,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         refl_const_string(g, msym->name.str, (int)msym->name.len),
         refl_field_type_name(g, rt),
         LLVMConstInt(i64, (unsigned long long)(
-            rt && rt->kind == TYPE_VOID ? 0 : refl_field_kind(rt)), 0),
+            is_task ? ZAN_REFL_VK_TASK
+            : rt && rt->kind == TYPE_VOID ? 0 : refl_field_kind(rt)), 0),
         LLVMConstInt(i64, (unsigned long long)decl->method_decl.params.count, 0),
         refl_param_names(g, &decl->method_decl.params),
         thunk,

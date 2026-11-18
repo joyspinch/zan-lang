@@ -63,6 +63,7 @@
 #define ZAN_REFL_M_FPK         56   /* TypeInfo.IsFieldPk(i)          -> bool */
 #define ZAN_REFL_M_SETOBJECT   57   /* obj.SetFieldObject(name, v)    -> bool */
 #define ZAN_REFL_M_FTYPEINFO   58   /* TypeInfo.GetFieldTypeInfo(i)   -> TypeInfo */
+#define ZAN_REFL_M_ITASK      63   /* obj.InvokeTask(name[, arg])    -> long (task token) */
 #define ZAN_REFL_M_FIDENT      59   /* TypeInfo.IsFieldIdentity(i)    -> bool */
 #define ZAN_REFL_M_IOBJECT     62   /* obj.InvokeObject(name[, arg])  -> object */
 
@@ -145,6 +146,7 @@ static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
         { "InvokeDouble",   12, ZAN_REFL_M_IDOUBLE },
         { "InvokeString",   12, ZAN_REFL_M_ISTRING },
         { "InvokeObject",   12, ZAN_REFL_M_IOBJECT },
+        { "InvokeTask",     10, ZAN_REFL_M_ITASK },
         { "HasMethod",       9, ZAN_REFL_M_OMHAS },
     };
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++)
@@ -189,6 +191,7 @@ static inline bool zan_refl_member_takes_arg(int code) {
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
     case ZAN_REFL_M_IOBJECT:
+    case ZAN_REFL_M_ITASK:
     case ZAN_REFL_M_OMHAS:
     case ZAN_REFL_M_FATTRS:
     case ZAN_REFL_M_MATTRS:
@@ -216,6 +219,7 @@ static inline int zan_refl_member_max_args(int code) {
     case ZAN_REFL_M_IDOUBLE:
     case ZAN_REFL_M_ISTRING:
     case ZAN_REFL_M_IOBJECT:
+    case ZAN_REFL_M_ITASK:
         return 65;
     case ZAN_REFL_M_CNEW:
         return 64;

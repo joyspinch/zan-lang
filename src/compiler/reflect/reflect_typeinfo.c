@@ -495,7 +495,8 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     }
     if (code == ZAN_REFL_M_IVOID || code == ZAN_REFL_M_IINT ||
         code == ZAN_REFL_M_ILONG || code == ZAN_REFL_M_IDOUBLE ||
-        code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT) {
+        code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT ||
+        code == ZAN_REFL_M_ITASK) {
         refl_note_invoke_name(g, arg0);
         LLVMValueRef idx = refl_mfind(g, ti, nm, 0);
         refl_arg_temps_t temps;
@@ -516,6 +517,14 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
             LLVMValueRef obj_ret = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.iobj");
             *out = LLVMBuildSelect(g->builder, called, obj_ret,
                                    LLVMConstNull(i8ptr), "refl.ires");
+            return true;
+        }
+        if (code == ZAN_REFL_M_ITASK) {
+            /* M1：thunk 对 task-return 方法补齐 spawn 义务后，槽位是
+             * Task.IsDone 可轮询的 token（原始 i64，不按 retkind 重解释）。
+             * 结果值仍在帧 RVAL 槽内，await 化消费属 M2。 */
+            *out = LLVMBuildSelect(g->builder, called, v,
+                                   LLVMConstInt(i64, 0, 0), "refl.itok");
             return true;
         }
         LLVMValueRef k = LLVMBuildSub(g->builder, kv, LLVMConstInt(i64, 1, 0),
