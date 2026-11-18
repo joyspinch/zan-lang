@@ -476,7 +476,7 @@ def main():
                    root / "src/ide_zan/src/editor/LspSession.Editor.zan",
                    root / "src/ide_zan/src/services/DebugSession.zan"]
         compiled = subprocess.run([str(args.zanc.resolve()), *map(str, sources),
-                                   "--auto-stdlib", "-o", str(args.client.resolve())],
+                                   "--auto-stdlib", "-O0", "-o", str(args.client.resolve())],
                                   cwd=root, capture_output=True, text=True, errors="replace", timeout=240)
         output = (compiled.stdout or "") + (compiled.stderr or "")
         assert compiled.returncode == 0 and "error:" not in output.lower() and args.client.exists(), output
