@@ -145,8 +145,7 @@ int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     }
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
-        fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
-        exit(1);
+        zan_host_oom();
     }
     int site_idx = g->leak_site_count++;
     if (g->site_syms) g->site_syms[site_idx] = sym;
@@ -161,8 +160,7 @@ int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
 int reserve_closure_site(zan_irgen_t *g) {
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
-        fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
-        exit(1);
+        zan_host_oom();
     }
     int site_idx = g->leak_site_count++;
     if (g->site_syms) g->site_syms[site_idx] = NULL;
@@ -374,8 +372,7 @@ void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     while (ncap < need) ncap *= 2;
     void *p = realloc(base, (size_t)ncap * elem);
     if (!p) {
-        fprintf(stderr, "zanc: out of memory growing an IR registry\n");
-        exit(1);
+        zan_host_oom();
     }
     *cap = ncap;
     return p;
@@ -405,8 +402,7 @@ static void fn_index_rehash(zan_irgen_t *g, int ncap) {
     struct zan_fn_index_slot *slots =
         calloc((size_t)ncap, sizeof(*g->fn_index));
     if (!slots) {
-        fprintf(stderr, "zanc: out of memory growing the function index\n");
-        exit(1);
+        zan_host_oom();
     }
     free(g->fn_index);
     g->fn_index = slots;
@@ -469,8 +465,7 @@ static uint64_t istr_hash(zan_istr_t s) {
 static void *class_index_alloc(size_t n, size_t elem) {
     void *p = malloc(n * elem);
     if (!p) {
-        fprintf(stderr, "zanc: out of memory building a member index\n");
-        exit(1);
+        zan_host_oom();
     }
     return p;
 }
@@ -514,8 +509,7 @@ static void class_index_table_grow(void) {
     int ncap = g_class_index_cap ? g_class_index_cap * 2 : 256;
     zan_class_index_t *slots = calloc((size_t)ncap, sizeof(*slots));
     if (!slots) {
-        fprintf(stderr, "zanc: out of memory growing the member index table\n");
-        exit(1);
+        zan_host_oom();
     }
     for (int i = 0; i < g_class_index_cap; i++) {
         if (!g_class_indexes[i].owner) continue;

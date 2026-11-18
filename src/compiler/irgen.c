@@ -1,4 +1,5 @@
 #include "irgen_internal.h"
+#include "../common/host_oom.h"
 
 /* Composite Dispatcher Submodules */
 #include "irgen/irgen_di.c"

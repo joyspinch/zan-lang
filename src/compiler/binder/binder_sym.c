@@ -230,8 +230,7 @@ static void midx_catch_up(zan_symbol_t *type,
             member_name_node_t *grown = (member_name_node_t *)realloc(
                 ix->nodes, (size_t)ncap * sizeof(*grown));
             if (!grown) {
-                fprintf(stderr, "error: out of memory tracking member names\n");
-                exit(1);
+                zan_host_oom();
             }
             ix->nodes = grown;
             ix->node_cap = ncap;
