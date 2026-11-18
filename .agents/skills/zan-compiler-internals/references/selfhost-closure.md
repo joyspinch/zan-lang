@@ -3161,8 +3161,9 @@ kernel32、shell32、user32、advapi32、version）。
   spec ctor 克隆的 AST 在入队时已替后）；反射路径
   （EmitTypeInfoMethod.CreateInstance 运行期按名匹配）无静态实例化，
   保持共享助手——**修法的适用边界要跟机制走，不是所有 new 站点都换**。
-- 顺带观察（不修，留档）：CloneSubst 不拷 `arrRanks`（多维数组字面量
-  进克隆体会丢维信息，单维靠默认 1 无碍）；链式泛型基类的字段初始化器
+- `CloneSubst` 须和 `arrDepth` 一并保留 `arrRanks`，使特化体中的多维数组
+  保留每层秩。回归由 `selfhost_generic_array_rank` 覆盖（32e7fe7d4）。
+  链式泛型基类的字段初始化器
   在 spec finit 里仍按开放基类参数擦除（本轮案无此形）。宿主侧镜像
   修法一行：`concretize(g, fsym->type)` 仅在 `g->cur_inst` 活跃时套，
   具体类型透传——**替换必须保非泛型路径逐位等价**（cur_inst==NULL
