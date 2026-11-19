@@ -480,7 +480,6 @@ static zan_istr_t qualified_builtin_name(zan_istr_t name) {
         "System.Threading.Tasks.Task",
         "System.Func",
         "System.Action",
-        "System.Linq.Action", /* Legacy spelling used by Zan.Game.Cards. */
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         const char *full = names[i];

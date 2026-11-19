@@ -83,6 +83,20 @@ foreach(mode IN ITEMS host warning deny clean_deny initializer_clean_deny)
   endif()
 endforeach()
 
+# The isolated stdlib contains one referenced type, one test declaration and
+# three unrelated types that used to be pulled in by MVC naming rules.
+set(_pullin "${_root}/tests/selfhost/pullin")
+set(_pullin_ir "${OUTDIR}/pullin.ll")
+file(REMOVE "${_pullin_ir}")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_STDLIB_PATH=${_pullin}/stdlib"
+  "${GEN1}" -o "${_pullin_ir}" "${_pullin}/main.zan" --auto-stdlib -O0
+  WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
+  OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+file(REMOVE "${_pullin_ir}")
+if(NOT "${rc}" STREQUAL "0" OR NOT stdout MATCHES "Compiled 3 files ->")
+  message(FATAL_ERROR "pull-in: expected the input, the referenced type and the test declaration, rc=${rc}\n${stdout}${stderr}")
+endif()
+
 if(WIN32 AND CLANG)
   set(_exe "${OUTDIR}/driver output.exe")
   execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
