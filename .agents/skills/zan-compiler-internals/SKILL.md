@@ -1113,3 +1113,17 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
      initializer 完整相等是唯一与内容绑定的判据。
    - 边界：已证范围仅限本池命中路径；跨片去重是否完整、反射内容是否泄漏源码字面
      均未验证，不得声称完成；完整 IDE 重发布前不作为整产品验收依据。
+
+63. **async throw 在 catch 前的 finally 清理下界必须取 landing pad 的词法深度**：
+    - 动作：`emit_finallys_left_by_throw` 找到带 `catch_bb` 的目标 try 时，
+      `target_fin` 必须取该 landing pad 的 `finally_depth`。即使目标 try 没有自己的
+      finally（`fin_idx < 0`），也不能把下界归零；该深度只含目标 try 自己的
+      finalizer，不含任何外层 finalizer。
+    - 理由：匹配的 catch 必须先于外层 finally 处理异常。把无 finally 的 catch
+      映射成下界 0 会提前展开外层 finally，令其消费原异常；内层已处理异常随后
+      错误外逃，恢复时 pending pop 失去配对并下溢，最终触发容量守卫 abort。
+      不要在 pending push/pop 加兜底掩盖这个上游清理边界错误。
+    - 判定器：`async_finally_shared_paths` 必须覆盖异常穿越 finally、finally 内
+      嵌套 try/catch 和跨 `await` 恢复，同时保留原异常与内层已处理异常的身份；
+      联跑 `async_finally_paths`、`async_finally_shared_contexts`、
+      `async_finally_pending_owners`、`catch_return_release` 及 focused selfhost diff。

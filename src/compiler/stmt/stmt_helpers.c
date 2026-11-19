@@ -710,7 +710,9 @@ void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
             break;
         }
         if (top->catch_bb) {
-            target_fin = (top->fin_idx >= 0) ? top->fin_idx + 1 : 0;
+            /* Catch handles before outer finally. The lexical depth includes
+             * this try's own finally, but none of its enclosing finalizers. */
+            target_fin = top->finally_depth;
             break;
         }
     }
