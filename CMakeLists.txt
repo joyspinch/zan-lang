@@ -156,7 +156,6 @@ add_executable(zanc
     packages/Zan.Mvc/compiler/mvc_routes.c
     packages/Zan.Mvc/compiler/mvc_synth.c
     packages/Zan.Mvc/compiler/mvc_reflect.c
-    packages/Zan.Data/compiler/orm_adapter.c
     src/compiler/arena.c
     src/compiler/diag.c
     src/compiler/lexer.c
@@ -851,7 +850,6 @@ endif()
 # engine to serve the Language Server Protocol over stdio.
 add_executable(zan-lsp
     packages/Zan.Mvc/compiler/mvc_routes.c
-    packages/Zan.Data/compiler/orm_adapter.c
     src/lsp/lsp_main.c
     src/compiler/nsresolve.c
     src/common/json.c

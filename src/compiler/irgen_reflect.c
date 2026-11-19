@@ -1,12 +1,12 @@
 #include "irgen_internal.h"
-#include "../../packages/Zan.Data/compiler/orm_adapter.h"
+#include "../common/host_oom.h"
 #include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 
 #include <limits.h>
 
 #define ZAN_REFL_FULLNAME_OFF (-112) /* B-ID107：头部 i8ptr，尾部倒数 OFF 不变 */
 #define ZAN_REFL_ATTRS_OFF   (-104)
-#define ZAN_REFL_TABLE_OFF   (-96)
+#define ZAN_REFL_DECLATTRS_OFF (-96)
 #define ZAN_REFL_METHODS_OFF (-88)
 #define ZAN_REFL_MCOUNT_OFF  (-80)
 #define ZAN_REFL_CTORS_OFF   (-72)
@@ -94,8 +94,7 @@
 /* `which` selector of __zan_refl_fname */
 #define ZAN_REFL_WHICH_NAME 0
 #define ZAN_REFL_WHICH_TYPE 1
-#define ZAN_REFL_WHICH_CUSTOM 2
-#define ZAN_REFL_WHICH_DEFAULT 3
+#define ZAN_REFL_WHICH_DECLATTRS 2
 #define ZAN_REFL_WHICH_ATTRS 4
 
 /* Composite Dispatcher Submodules */

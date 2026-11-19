@@ -542,14 +542,8 @@ static LLVMValueRef refl_fname_fn(zan_irgen_t *g) {
             LLVMConstInt(i64, 1, 0),
             LLVMBuildSelect(g->builder,
                 LLVMBuildICmp(g->builder, LLVMIntEQ, which,
-                              LLVMConstInt(i64, ZAN_REFL_WHICH_CUSTOM, 0), "refl.iscust"),
-                LLVMConstInt(i64, 2, 0),
-                LLVMBuildSelect(g->builder,
-                    LLVMBuildICmp(g->builder, LLVMIntEQ, which,
-                                  LLVMConstInt(i64, ZAN_REFL_WHICH_DEFAULT, 0), "refl.isdef"),
-                    LLVMConstInt(i64, 3, 0),
-                    LLVMConstInt(i64, 5, 0), "refl.sel4"),
-                "refl.sel3"),
+                              LLVMConstInt(i64, ZAN_REFL_WHICH_DECLATTRS, 0), "refl.isdeclattrs"),
+                LLVMConstInt(i64, 2, 0), LLVMConstInt(i64, 5, 0), "refl.sel3"),
             "refl.sel2"),
         "refl.sel");
     LLVMValueRef sv = refl_member_ptr(g, fields, row, false, sel);

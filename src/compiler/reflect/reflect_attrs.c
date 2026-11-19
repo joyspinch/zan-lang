@@ -1,3 +1,87 @@
+/* Declaration records preserve attribute and argument order. A starts an
+ * attribute; each argument carries a kind, optional name and text. Lengths
+ * count UTF-8 bytes so delimiters in a literal stay part of its value. */
+static void refl_attr_append(char **data, size_t *len, size_t *cap,
+                             const char *text, size_t count) {
+    if (count > (size_t)INT_MAX - 1 - *len) zan_host_oom();
+    size_t need = *len + count;
+    if (need > *cap) {
+        size_t next = *cap ? *cap * 2 : 128;
+        if (next < need) next = need;
+        char *grown = realloc(*data, next);
+        if (!grown) zan_host_oom();
+        *data = grown;
+        *cap = next;
+    }
+    if (count) memcpy(*data + *len, text, count);
+    *len = need;
+}
+
+static void refl_attr_text(char **data, size_t *len, size_t *cap, zan_istr_t text) {
+    char prefix[16];
+    int n = snprintf(prefix, sizeof(prefix), "%u:", (unsigned)text.len);
+    refl_attr_append(data, len, cap, prefix, (size_t)n);
+    refl_attr_append(data, len, cap, text.str, text.len);
+}
+
+static LLVMValueRef refl_declared_attrs(zan_irgen_t *g, const zan_ast_node_t *decl) {
+    const zan_ast_list_t *attrs = zan_ast_attributes_const(decl);
+    char *data = NULL;
+    size_t len = 0, cap = 0;
+    refl_attr_append(&data, &len, &cap, "!1;", 3);
+    for (int i = 0; i < attrs->count; i++) {
+        const zan_ast_node_t *attr = attrs->items[i];
+        if (!attr || attr->kind != AST_ATTRIBUTE || !attr->attribute.name ||
+            attr->attribute.name->kind != AST_IDENTIFIER) continue;
+        zan_istr_t name = attr->attribute.name->ident.name;
+        if (!name.len) continue;
+        refl_attr_append(&data, &len, &cap, "A", 1);
+        refl_attr_text(&data, &len, &cap, name);
+        for (int j = 0; j < attr->attribute.args.count; j++) {
+            const zan_ast_node_t *arg = attr->attribute.args.items[j];
+            if (!arg) continue;
+            zan_istr_t key = {0};
+            if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+                arg->binary.left->kind == AST_IDENTIFIER && arg->binary.right) {
+                key = arg->binary.left->ident.name;
+                arg = arg->binary.right;
+            }
+            char kind = 'X';
+            char number[64];
+            zan_istr_t value = {0};
+            switch (arg->kind) {
+            case AST_STRING_LITERAL:
+                kind = 'S';
+                value = arg->str_val;
+                break;
+            case AST_BOOL_LITERAL:
+                kind = 'B';
+                value = arg->bool_val ? (zan_istr_t){"true", 4} : (zan_istr_t){"false", 5};
+                break;
+            case AST_INT_LITERAL:
+                kind = 'I';
+                value = (zan_istr_t){number, (uint32_t)snprintf(number, sizeof(number),
+                                                              "%lld", (long long)arg->int_val)};
+                break;
+            case AST_FLOAT_LITERAL:
+                kind = 'F';
+                value = (zan_istr_t){number, (uint32_t)snprintf(number, sizeof(number),
+                                                              "%.17g", arg->float_val)};
+                break;
+            default:
+                break;
+            }
+            refl_attr_append(&data, &len, &cap, &kind, 1);
+            refl_attr_text(&data, &len, &cap, key);
+            refl_attr_text(&data, &len, &cap, value);
+            refl_attr_append(&data, &len, &cap, ";", 1);
+        }
+    }
+    LLVMValueRef out = refl_const_string(g, data, (int)len);
+    free(data);
+    return out;
+}
+
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size) {
     if (!attrs || attrs->count == 0 || buf_size <= 1) {
         if (buf_size > 0) buf[0] = 0;
@@ -136,7 +220,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         disp = namebuf;
         disp_len = n;
     }
-    /* B-ID107：blob 名槽存短名（Name/TableName 兜底），FullName 另存 -112 槽，
+    /* B-ID107：blob 名槽存短名（Name），FullName 另存 -112 槽，
      * 去重键维持全名（metas[].name 仍存 disp） */
     char shortbuf[256];
     int sn = render_type_short(t, shortbuf, sizeof(shortbuf));
@@ -174,15 +258,12 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     }
     LLVMValueRef tattr_val = refl_const_string(g, tattrbuf, (int)strlen(tattrbuf));
 
-    const char *tbl_name = zan_data_orm_reflect_table(sym);
-    LLVMValueRef tbl_val = tbl_name
-        ? refl_const_string(g, tbl_name, (int)strlen(tbl_name))
-        : refl_const_string(g, shortbuf, sn);
+    LLVMValueRef declared_attrs = refl_declared_attrs(g, sym ? sym->decl : NULL);
 
     LLVMTypeRef rec_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){
         i8ptr, /* full_name (-112) B-ID107 */
         i8ptr, /* type_attrs (-104) */
-        i8ptr, /* table_name (-96) */
+        i8ptr, /* declared attributes (-96) */
         i8ptr, i64, i8ptr, i64, i8ptr, i8ptr, i8ptr, i64, i64, i64, i64,
         LLVMArrayType(i8, (unsigned)(sn + 1)) }, 15, 0);
     char nm[128];
@@ -275,7 +356,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     LLVMSetInitializer(gv, LLVMConstNamedStruct(rec_ty, (LLVMValueRef[]){
         refl_const_string(g, disp, disp_len), /* FullName（B-ID107） */
         tattr_val,
-        tbl_val,
+        declared_attrs,
         methods,
         LLVMConstInt(i64, (unsigned long long)method_count, 0),
         ctors,
@@ -400,8 +481,8 @@ static void refl_project_member_metadata(zan_irgen_t *g) {
     unsigned queries = g->refl_query_used;
     unsigned fields = 0, methods = 0, ctors = (1u << 1) | (1u << 7);
     if (!(queries & ZAN_REFL_QUERY_FIELD_TYPE)) fields |= 1u << 1;
-    if (!(queries & ZAN_REFL_QUERY_FIELD_CUSTOM)) fields |= 1u << 4;
-    if (!(queries & ZAN_REFL_QUERY_FIELD_DEFAULT)) fields |= 1u << 6;
+    if (!(queries & ZAN_REFL_QUERY_FIELD_DECLATTRS)) fields |= 1u << 4;
+    fields |= 1u << 6;
     if (!(queries & ZAN_REFL_QUERY_FIELD_TYPEINFO)) fields |= 1u << 7;
     if (!(queries & ZAN_REFL_QUERY_FIELD_ATTRS)) fields |= 1u << 8;
     if (!(queries & ZAN_REFL_QUERY_METHOD_RETURN)) methods |= 1u << 1;

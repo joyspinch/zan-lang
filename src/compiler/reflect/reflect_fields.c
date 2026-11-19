@@ -140,118 +140,7 @@ static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
 static void refl_pack_attrs(zan_ast_list_t *attrs, char *buf, size_t buf_size);
 static LLVMValueRef refl_empty_string(zan_irgen_t *g);
 
-static void refl_extract_field_attrs(zan_symbol_t *m, const char **custom_name,
-                                     unsigned long long *flags, const char **dflt_val) {
-    *custom_name = m && m->name.str ? m->name.str : "";
-    *flags = 0;
-    *dflt_val = "";
-    if (!m || !m->decl) return;
-    zan_ast_list_t *attrs = zan_ast_attributes(m->decl);
-    for (int i = 0; i < attrs->count; i++) {
-        zan_ast_node_t *a = attrs->items[i];
-        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
-        if (a->attribute.name->kind != AST_IDENTIFIER) continue;
-        zan_istr_t n = a->attribute.name->ident.name;
-        const char *s = n.str;
-        int len = (int)n.len;
-        int dot = -1;
-        for (int k = 0; k < len; k++) {
-            if (s[k] == '.') dot = k;
-        }
-        if (dot >= 0) {
-            s += (dot + 1);
-            len -= (dot + 1);
-        }
-
-        if (zan_data_orm_reflect_column(a, (zan_istr_t){s, (uint32_t)len},
-                                        custom_name, flags)) continue;
-        /* 1. Custom Name: JsonProperty, JsonPropertyName */
-        if ((len == 12 && memcmp(s, "JsonProperty", 12) == 0) ||
-            (len == 21 && memcmp(s, "JsonPropertyAttribute", 21) == 0) ||
-            (len == 16 && memcmp(s, "JsonPropertyName", 16) == 0) ||
-            (len == 25 && memcmp(s, "JsonPropertyNameAttribute", 25) == 0)) {
-            for (int j = 0; j < a->attribute.args.count; j++) {
-                zan_ast_node_t *arg = a->attribute.args.items[j];
-                if (!arg) continue;
-                if (arg->kind == AST_STRING_LITERAL) {
-                    *custom_name = arg->str_val.str;
-                } else if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
-                           arg->binary.left->kind == AST_IDENTIFIER && arg->binary.right) {
-                    zan_istr_t an = arg->binary.left->ident.name;
-                    if (an.len == 4 && memcmp(an.str, "Name", 4) == 0) {
-                        if (arg->binary.right->kind == AST_STRING_LITERAL) {
-                            *custom_name = arg->binary.right->str_val.str;
-                        }
-                    } else if (an.len == 6 && memcmp(an.str, "Ignore", 6) == 0) {
-                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
-                            *flags |= 1ULL; /* bit 0 = ignored */
-                        }
-                    } else if (an.len == 10 && memcmp(an.str, "IsIdentity", 10) == 0) {
-                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
-                            *flags |= 8ULL;
-                        }
-                    } else if (an.len == 9 && memcmp(an.str, "IsPrimary", 9) == 0) {
-                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
-                            *flags |= 4ULL; /* bit 2 = pk */
-                        }
-                    } else if (an.len == 8 && memcmp(an.str, "Required", 8) == 0) {
-                        if (arg->binary.right->kind == AST_BOOL_LITERAL && arg->binary.right->bool_val) {
-                            *flags |= 2ULL; /* bit 1 = required */
-                        }
-                    }
-                }
-            }
-        }
-        /* 2. Ignore: JsonIgnore, Ignore, NotMapped */
-        if ((len == 10 && memcmp(s, "JsonIgnore", 10) == 0) ||
-            (len == 19 && memcmp(s, "JsonIgnoreAttribute", 19) == 0) ||
-            (len == 6  && memcmp(s, "Ignore", 6) == 0) ||
-            (len == 15 && memcmp(s, "IgnoreAttribute", 15) == 0) ||
-            (len == 9  && memcmp(s, "NotMapped", 9) == 0) ||
-            (len == 18 && memcmp(s, "NotMappedAttribute", 18) == 0)) {
-            *flags |= 1ULL; /* bit 0 = ignored */
-        }
-        /* 3. Required: JsonRequired, Required */
-        if ((len == 12 && memcmp(s, "JsonRequired", 12) == 0) ||
-            (len == 21 && memcmp(s, "JsonRequiredAttribute", 21) == 0) ||
-            (len == 8  && memcmp(s, "Required", 8) == 0) ||
-            (len == 17 && memcmp(s, "RequiredAttribute", 17) == 0)) {
-            *flags |= 2ULL; /* bit 1 = required */
-        }
-        /* 4. Primary Key: Key, PrimaryKey */
-        if ((len == 3  && memcmp(s, "Key", 3) == 0) ||
-            (len == 12 && memcmp(s, "KeyAttribute", 12) == 0) ||
-            (len == 10 && memcmp(s, "PrimaryKey", 10) == 0) ||
-            (len == 19 && memcmp(s, "PrimaryKeyAttribute", 19) == 0)) {
-            *flags |= 4ULL; /* bit 2 = pk */
-        }
-        /* 5. Default value: JsonDefault, Default, DefaultValue */
-        if ((len == 11 && memcmp(s, "JsonDefault", 11) == 0) ||
-            (len == 20 && memcmp(s, "JsonDefaultAttribute", 20) == 0) ||
-            (len == 12 && memcmp(s, "DefaultValue", 12) == 0) ||
-            (len == 21 && memcmp(s, "DefaultValueAttribute", 21) == 0)) {
-            if (a->attribute.args.count > 0) {
-                zan_ast_node_t *arg = a->attribute.args.items[0];
-                if (arg->kind == AST_ASSIGNMENT && arg->binary.right) {
-                    arg = arg->binary.right;
-                }
-                if (arg->kind == AST_STRING_LITERAL) {
-                    *dflt_val = arg->str_val.str;
-                } else if (arg->kind == AST_BOOL_LITERAL) {
-                    *dflt_val = arg->bool_val ? "true" : "false";
-                } else if (arg->kind == AST_INT_LITERAL) {
-                    char *buf = (char *)malloc(32);
-                    snprintf(buf, 32, "%lld", (long long)arg->int_val);
-                    *dflt_val = buf;
-                } else if (arg->kind == AST_FLOAT_LITERAL) {
-                    char *buf = (char *)malloc(32);
-                    snprintf(buf, 32, "%g", arg->float_val);
-                    *dflt_val = buf;
-                }
-            }
-        }
-    }
-}
+static LLVMValueRef refl_declared_attrs(zan_irgen_t *g, const zan_ast_node_t *decl);
 
 /* 发射the field-record array for a class/struct, or NULL when it has none */
 static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
@@ -308,11 +197,6 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
         else
             off = refl_slot_offset(g, st, slot);
 
-        const char *cname = "";
-        unsigned long long flgs = 0;
-        const char *dflt = "";
-        refl_extract_field_attrs(m, &cname, &flgs, &dflt);
-
         char fattrbuf[512];
         fattrbuf[0] = 0;
         if (m->decl) refl_pack_attrs(zan_ast_attributes(m->decl), fattrbuf, sizeof(fattrbuf));
@@ -322,9 +206,9 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
             refl_field_type_name(g, m->type),
             LLVMConstInt(i64, (unsigned long long)refl_field_kind(m->type), 0),
             off,
-            refl_const_string(g, cname, (int)strlen(cname)),
-            LLVMConstInt(i64, flgs, 0),
-            refl_const_string(g, dflt, (int)strlen(dflt)),
+            refl_declared_attrs(g, m->decl),
+            LLVMConstInt(i64, 0, 0),
+            LLVMConstNull(LLVMTypeOf(refl_empty_string(g))),
             refl_meta_for(g, m->type, NULL, 0),
             refl_const_string(g, fattrbuf, (int)strlen(fattrbuf)) }, 9);
         slot++;
@@ -371,7 +255,7 @@ static LLVMValueRef refl_emit_fields_enum(zan_irgen_t *g, zan_symbol_t *sym,
             refl_const_string(g, sym->name.str, (int)sym->name.len),
             LLVMConstInt(i64, ZAN_REFL_FK_ENUM_MEMBER, 0),
             LLVMConstInt(i64, (unsigned long long)val, 0),
-            refl_const_string(g, m->name.str, (int)m->name.len),
+            refl_declared_attrs(g, m->decl),
             LLVMConstInt(i64, 0, 0),
             refl_const_string(g, "", 0),
             refl_meta_for(g, sym->type, NULL, 0),

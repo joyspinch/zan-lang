@@ -653,8 +653,6 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
 
     int expr_count = 0;
     const char **expr_names = gm_expr_method_names(classes, &expr_count);
-    int table_count = 0;
-    const char **table_names = gm_table_entity_names(classes, &table_count);
 
     gm_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -666,8 +664,6 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
     ctx.pend_cap = 0;
     ctx.expr_names = expr_names;
     ctx.expr_count = expr_count;
-    ctx.table_names = table_names;
-    ctx.table_count = table_count;
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
@@ -685,11 +681,10 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
             }
         }
     }
-    gm_prune_calls(ctx.calls, expr_names, expr_count, table_names, table_count);
+    gm_prune_calls(ctx.calls, expr_names, expr_count);
     json_obj_set(root, "calls", ctx.calls);
 
     free(expr_names);
-    free(table_names);
 
     free(ctx.pend_nodes);
     free(ctx.pend_ids);

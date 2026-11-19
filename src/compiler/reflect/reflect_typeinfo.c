@@ -146,11 +146,8 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     case ZAN_REFL_M_FTYPE:
         g->refl_query_used |= ZAN_REFL_QUERY_FIELD_TYPE;
         break;
-    case ZAN_REFL_M_FCUSTOMNAME:
-        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_CUSTOM;
-        break;
-    case ZAN_REFL_M_FDEFAULT:
-        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_DEFAULT;
+    case ZAN_REFL_M_FDECLATTRS:
+        g->refl_query_used |= ZAN_REFL_QUERY_FIELD_DECLATTRS;
         break;
     case ZAN_REFL_M_FTYPEINFO:
         g->refl_query_used |= ZAN_REFL_QUERY_FIELD_TYPEINFO;
@@ -304,8 +301,8 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     case ZAN_REFL_M_FULLNAME: /* B-ID107：全限定名，-112 槽 */
         *out = refl_hdr_ptr(g, ti, ZAN_REFL_FULLNAME_OFF, "refl.full");
         return true;
-    case ZAN_REFL_M_TABLENAME:
-        *out = refl_hdr_ptr(g, ti, ZAN_REFL_TABLE_OFF, "refl.tbl");
+    case ZAN_REFL_M_DECLATTRS:
+        *out = refl_hdr_ptr(g, ti, ZAN_REFL_DECLATTRS_OFF, "refl.declattrs");
         return true;
     case ZAN_REFL_M_TATTRS:
         *out = refl_hdr_ptr(g, ti, ZAN_REFL_ATTRS_OFF, "refl.tattrs");
@@ -334,42 +331,19 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     case ZAN_REFL_M_FNAME:
     case ZAN_REFL_M_FTYPE:
     case ZAN_REFL_M_FATTRS:
-    case ZAN_REFL_M_FCUSTOMNAME:
-    case ZAN_REFL_M_FDEFAULT: {  /* GetFieldName / GetFieldType / GetFieldCustomName / GetFieldDefault */
+    case ZAN_REFL_M_FDECLATTRS: {
         LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
                                 : LLVMConstInt(i64, 0, 0);
         idx = emit_index_i64(g, idx, "refl.i");
         int which = ZAN_REFL_WHICH_NAME;
         if (code == ZAN_REFL_M_FTYPE) which = ZAN_REFL_WHICH_TYPE;
-        else if (code == ZAN_REFL_M_FCUSTOMNAME) which = ZAN_REFL_WHICH_CUSTOM;
-        else if (code == ZAN_REFL_M_FDEFAULT) which = ZAN_REFL_WHICH_DEFAULT;
+        else if (code == ZAN_REFL_M_FDECLATTRS) which = ZAN_REFL_WHICH_DECLATTRS;
         else if (code == ZAN_REFL_M_FATTRS) which = ZAN_REFL_WHICH_ATTRS;
         *out = zan_call2(g->builder,
             LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
             refl_fname_fn(g), (LLVMValueRef[]){ ti, idx,
                 LLVMConstInt(i64, (unsigned long long)which, 0) },
             3, "refl.fname");
-        return true;
-    }
-    case ZAN_REFL_M_FIGNORED:
-    case ZAN_REFL_M_FREQUIRED:
-    case ZAN_REFL_M_FPK:
-    case ZAN_REFL_M_FIDENT: {    /* IsFieldIgnored / IsFieldRequired / IsFieldPk / IsFieldIdentity */
-        LLVMValueRef idx = arg0 ? emit_expr(g, arg0, locals)
-                                : LLVMConstInt(i64, 0, 0);
-        idx = emit_index_i64(g, idx, "refl.i");
-        LLVMValueRef flags = zan_call2(g->builder,
-            LLVMFunctionType(i64, (LLVMTypeRef[]){ i8ptr, i64, i64 }, 3, 0),
-            refl_field_scalar_fn(g), (LLVMValueRef[]){ ti, idx,
-                LLVMConstInt(i64, 0, 0) }, 3, "refl.flags");
-        unsigned long long bit = 1;
-        if (code == ZAN_REFL_M_FREQUIRED) bit = 2;
-        else if (code == ZAN_REFL_M_FPK) bit = 4;
-        else if (code == ZAN_REFL_M_FIDENT) bit = 8;
-        LLVMValueRef masked = LLVMBuildAnd(g->builder, flags,
-            LLVMConstInt(i64, bit, 0), "refl.masked");
-        *out = LLVMBuildICmp(g->builder, LLVMIntNE, masked,
-            LLVMConstInt(i64, 0, 0), "refl.flagbool");
         return true;
     }
     case ZAN_REFL_M_FTYPEINFO: {  /* GetFieldTypeInfo(idx) -> TypeInfo */

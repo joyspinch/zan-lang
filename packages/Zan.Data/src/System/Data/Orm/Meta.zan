@@ -1,6 +1,8 @@
 using System;
 using System.Text;
 using System.Data;
+using System.Reflection;
+using System.Json;
 namespace System.Data.Orm;
 
 public class Meta {
@@ -42,20 +44,32 @@ public class Meta {
         return cached;
     }
 
+    public static string TableName(TypeInfo type) {
+        AttributeReader attributes = new AttributeReader(type.GetDeclaredAttributeData());
+        while (attributes.MoveNext()) {
+            if (attributes.Name != "Table" && attributes.Name != "TableAttribute") { continue; }
+            while (attributes.MoveNextArgument()) {
+                string key = attributes.ArgumentName;
+                if (attributes.ArgumentKind == 'S' && (key == "" || key == "Name" || key == "TableName")) {
+                    return attributes.ArgumentValue.Length > 0 ? attributes.ArgumentValue : type.Name;
+                }
+            }
+            break;
+        }
+        return type.Name;
+    }
+
     public static Meta BuildFor<T>() {
         TypeInfo ti = typeof(T);
-        string tbl = ti.TableName;
-        if (tbl.Length == 0) {
-            tbl = ti.Name;
-        }
-        Meta meta = new Meta(ti.Name, tbl);
+        Meta meta = new Meta(ti.Name, Meta.TableName(ti));
         meta.Type = ti;
         for (int i = 0; i < ti.FieldCount; i = i + 1) {
-            if (ti.IsFieldIgnored(i)) {
+            FieldMapping mapping = FieldMapping.Read(ti, i);
+            if (mapping.Ignored) {
                 continue;
             }
             string fname = ti.GetFieldName(i);
-            string colName = ti.GetFieldCustomName(i);
+            string colName = mapping.Name;
             if (colName.Length == 0) {
                 colName = fname;
             }
@@ -91,21 +105,21 @@ public class Meta {
             // 位，同时本身就是主键声明——自增列在 SQLite 里只有
             // INTEGER PRIMARY KEY AUTOINCREMENT 一种合法形态，生态既有
             // 实体也只写 IsIdentity 不写 IsPrimary。
-            bool isIdent = ti.IsFieldIdentity(i);
-            bool isPk = isIdent || ti.IsFieldPk(i);
+            bool isIdent = mapping.Identity;
+            bool isPk = isIdent || mapping.Primary;
             int strLen = 255;
             if (kind == 3) {
-                // 反射属性格式为 Column.StringLength=4096;Column.DbType=text;。
-                // text 优先于有界长度，不依赖负数属性的序列化。
                 bool largeText = false;
-                List<string> attrs = ti.GetFieldCustomAttributes(i).Split(";");
-                for (int a = 0; a < attrs.Count; a = a + 1) {
-                    string attr = attrs[a].Trim();
-                    if (attr == "Column.DbType=text") { largeText = true; }
-                    else if (attr.StartsWith("Column.StringLength=")) {
-                        int declaredLength = 0;
-                        if (int.TryParse(attr.Substring(20), out declaredLength)
-                            && declaredLength > 0) { strLen = declaredLength; }
+                AttributeReader attrs = new AttributeReader(ti.GetFieldAttributeData(i));
+                while (attrs.MoveNext()) {
+                    if (attrs.Name != "Column" && attrs.Name != "ColumnAttribute") { continue; }
+                    while (attrs.MoveNextArgument()) {
+                        if (attrs.ArgumentName == "DbType" && attrs.ArgumentKind == 'S'
+                            && attrs.ArgumentValue == "text") { largeText = true; }
+                        else if (attrs.ArgumentName == "StringLength" && attrs.ArgumentKind == 'I') {
+                            int length = 0;
+                            if (int.TryParse(attrs.ArgumentValue, out length) && length > 0) { strLen = length; }
+                        }
                     }
                 }
                 if (largeText) { strLen = -1; }

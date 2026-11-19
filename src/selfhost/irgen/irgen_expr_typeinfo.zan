@@ -4,10 +4,53 @@ namespace Zan;
 
 partial class Irgen {
     ExprVal EmitTypeInfoMethod(ExprVal recv, string mname, Node e) {
-        if (mname == "GetFieldName" || mname == "GetFieldType" || mname == "GetFieldCustomName"
-        || mname == "GetFieldDefault" || mname == "GetFieldTypeInfo" || mname == "GetMemberValue"
-        || mname == "IsFieldIgnored" || mname == "IsFieldRequired" || mname == "IsFieldPk"
-        || mname == "IsFieldIdentity"
+        if (mname == "GetFieldAttributeData") {
+            ExprVal index = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("0", MkType("int"));
+            string idx = ToI64(index);
+            string countSlot = NT();
+            string countPtr = NT();
+            string count = NT();
+            string valid = NT();
+            int check = NL();
+            int load = NL();
+            int empty = NL();
+            int done = NL();
+            string missing = NT();
+            L("  " + missing + " = icmp eq i8* " + recv.op + ", null");
+            L("  br i1 " + missing + ", label %L" + empty + ", label %L" + check);
+            Label(check);
+            L("  " + countSlot + " = getelementptr inbounds i8, i8* " + recv.op + ", i64 -32");
+            L("  " + countPtr + " = bitcast i8* " + countSlot + " to i64*");
+            L("  " + count + " = load i64, i64* " + countPtr);
+            L("  " + valid + " = icmp ult i64 " + idx + ", " + count);
+            L("  br i1 " + valid + ", label %L" + load + ", label %L" + empty);
+            Label(load);
+            string fieldsSlot = NT();
+            string fieldsPtr = NT();
+            string fields = NT();
+            string rowOffset = NT();
+            string attrOffset = NT();
+            string attrSlot = NT();
+            string attrPtr = NT();
+            string attrs = NT();
+            L("  " + fieldsSlot + " = getelementptr inbounds i8, i8* " + recv.op + ", i64 -40");
+            L("  " + fieldsPtr + " = bitcast i8* " + fieldsSlot + " to i8**");
+            L("  " + fields + " = load i8*, i8** " + fieldsPtr);
+            L("  " + rowOffset + " = mul i64 " + idx + ", 72");
+            L("  " + attrOffset + " = add i64 " + rowOffset + ", 32");
+            L("  " + attrSlot + " = getelementptr inbounds i8, i8* " + fields + ", i64 " + attrOffset);
+            L("  " + attrPtr + " = bitcast i8* " + attrSlot + " to i8**");
+            L("  " + attrs + " = load i8*, i8** " + attrPtr);
+            L("  br label %L" + done);
+            Label(empty);
+            L("  br label %L" + done);
+            Label(done);
+            string result = NT();
+            L("  " + result + " = phi i8* [ " + attrs + ", %L" + load + " ], [ " + GenConstStr("") + ", %L" + empty + " ]");
+            return new ExprVal(result, MkType("string"));
+        }
+        if (mname == "GetFieldName" || mname == "GetFieldType"
+        || mname == "GetFieldTypeInfo" || mname == "GetMemberValue"
         || mname == "GetFieldCustomAttributes" || mname == "GetFieldAttrs") {
             ExprVal idxVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("0", MkType("int"));
             string idx64 = ToI64(idxVal);
@@ -47,43 +90,6 @@ partial class Irgen {
                 L("  " + mv + " = load i64, i64* " + mv_p);
                 return new ExprVal(mv, MkType("long"));
             }
-            if (mname == "GetFieldCustomName") {
-                string cn_gep = NT();
-                L("  " + cn_gep + " = getelementptr inbounds i8, i8* " + f_slot + ", i64 32");
-                string cn_p = NT();
-                L("  " + cn_p + " = bitcast i8* " + cn_gep + " to i8**");
-                string cn = NT();
-                L("  " + cn + " = load i8*, i8** " + cn_p);
-                return new ExprVal(cn, MkType("string"));
-            }
-            if (mname == "IsFieldIgnored" || mname == "IsFieldRequired" || mname == "IsFieldPk"
-            || mname == "IsFieldIdentity") {
-                string flg_gep = NT();
-                L("  " + flg_gep + " = getelementptr inbounds i8, i8* " + f_slot + ", i64 40");
-                string flg_p = NT();
-                L("  " + flg_p + " = bitcast i8* " + flg_gep + " to i64*");
-                string flgv = NT();
-                L("  " + flgv + " = load i64, i64* " + flg_p);
-                long bit = mname == "IsFieldIgnored" ? 1
-                : (mname == "IsFieldRequired" ? 2
-                : (mname == "IsFieldPk" ? 4 : 8));
-                string msk = NT();
-                L("  " + msk + " = and i64 " + flgv + ", " + bit);
-                string res = NT();
-                L("  " + res + " = icmp ne i64 " + msk + ", 0");
-                string z = NT();
-                L("  " + z + " = zext i1 " + res + " to i64");
-                return new ExprVal(z, MkType("bool"));
-            }
-            if (mname == "GetFieldDefault") {
-                string df_gep = NT();
-                L("  " + df_gep + " = getelementptr inbounds i8, i8* " + f_slot + ", i64 48");
-                string df_p = NT();
-                L("  " + df_p + " = bitcast i8* " + df_gep + " to i8**");
-                string df = NT();
-                L("  " + df + " = load i8*, i8** " + df_p);
-                return new ExprVal(df, MkType("string"));
-            }
             if (mname == "GetFieldTypeInfo") {
                 string ti_gep = NT();
                 L("  " + ti_gep + " = getelementptr inbounds i8, i8* " + f_slot + ", i64 56");
@@ -103,9 +109,10 @@ partial class Irgen {
                 return new ExprVal(fa, MkType("string"));
             }
         }
-        if (mname == "GetCustomAttributes" || mname == "GetAttrs") {
+        if (mname == "GetCustomAttributes" || mname == "GetAttrs" || mname == "GetDeclaredAttributeData") {
+            int attrOffset = mname == "GetDeclaredAttributeData" ? -96 : -104;
             string ap = NT();
-            L("  " + ap + " = getelementptr inbounds i8, i8* " + recv.op + ", i64 -104");
+            L("  " + ap + " = getelementptr inbounds i8, i8* " + recv.op + ", i64 " + attrOffset);
             string ap_ptr = NT();
             L("  " + ap_ptr + " = bitcast i8* " + ap + " to i8**");
             string av = NT();

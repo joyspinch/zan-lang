@@ -339,10 +339,6 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
     if (name && gm_name_in(name, c->expr_names, c->expr_count))
         return true;
 
-    if (robj && robj->kind == AST_MEMBER_ACCESS && robj->member.name.str &&
-        gm_name_in(robj->member.name.str, c->table_names, c->table_count))
-        return true;
-
     return false;
 }
 
@@ -425,60 +421,6 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     json_arr_add(c->calls, o);
 }
 
-static const char **gm_table_entity_names(json_value *classes, int *out_count) {
-    const char **names = NULL;
-    int count = 0, cap = 0;
-    *out_count = 0;
-    if (!classes || classes->type != JSON_ARR) return NULL;
-    for (int ci = 0; ci < classes->as.arr.count; ci++) {
-        json_value *cls = classes->as.arr.items[ci];
-        json_value *attrs = json_obj_get(cls, "attrs");
-        if (!attrs || attrs->type != JSON_ARR) continue;
-        bool table = false;
-        for (int ai = 0; ai < attrs->as.arr.count; ai++) {
-            const char *an =
-                json_get_str(json_obj_get(attrs->as.arr.items[ai], "name"));
-            if (an && zan_data_orm_is_table_marker((zan_istr_t){an, (uint32_t)strlen(an)})) {
-                table = true;
-                break;
-            }
-        }
-        if (!table) continue;
-        const char *name = json_get_str(json_obj_get(cls, "name"));
-        if (!name || !name[0] || gm_name_in(name, names, count)) continue;
-        if (count >= cap) {
-            int next = cap ? cap * 2 : 8;
-            const char **grown =
-                (const char **)realloc(names,
-                                       sizeof(const char *) * (size_t)next);
-            if (!grown) zan_host_oom();
-            names = grown;
-            cap = next;
-        }
-        names[count++] = name;
-    }
-    *out_count = count;
-    return names;
-}
-
-static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
-                               int expr_count, const char *const *table_names,
-                               int table_count) {
-    const char *name = json_get_str(json_obj_get(call, "name"));
-    if (name && gm_name_in(name, expr_names, expr_count)) return true;
-    {
-        json_value *recvx = json_obj_get(call, "recvx");
-        if (recvx && recvx->type == JSON_OBJ) {
-            const char *k = json_get_str(json_obj_get(recvx, "k"));
-            const char *n = json_get_str(json_obj_get(recvx, "n"));
-            if (k && strcmp(k, "mem") == 0 &&
-                gm_name_in(n, table_names, table_count))
-                return true;
-        }
-    }
-    return false;
-}
-
 static const char **gm_expr_method_names(json_value *classes, int *out_count) {
     const char **names = NULL;
     int count = 0, cap = 0;
@@ -526,8 +468,7 @@ static const char **gm_expr_method_names(json_value *classes, int *out_count) {
 }
 
 static void gm_prune_calls(json_value *calls, const char *const *expr_names,
-                           int expr_count, const char *const *table_names,
-                           int table_count) {
+                           int expr_count) {
     if (!calls || calls->type != JSON_ARR || calls->as.arr.count == 0) return;
     int max_id = 0;
     for (int i = 0; i < calls->as.arr.count; i++) {
@@ -540,8 +481,8 @@ static void gm_prune_calls(json_value *calls, const char *const *expr_names,
     for (int i = 0; i < calls->as.arr.count; i++) {
         json_value *call = calls->as.arr.items[i];
         int id = (int)json_get_num(json_obj_get(call, "id"), 0);
-        if (id > 0 && gm_is_codegen_seed(call, expr_names, expr_count,
-                                         table_names, table_count))
+        if (id > 0 && gm_name_in(json_get_str(json_obj_get(call, "name")),
+                                 expr_names, expr_count))
             keep[id] = true;
     }
 

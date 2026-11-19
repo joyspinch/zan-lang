@@ -45,7 +45,6 @@ MAX_FUNCTION_LINES = 120
 # Package compiler-hook includes tolerated only until B-ID223/224 remove them;
 # anything else (incl. re-adding the removed Zan.Gui one) is rejected.
 COMPILER_PACKAGE_INCLUDE_ALLOWLIST = frozenset((
-    '#include "../../packages/Zan.Data/compiler/orm_adapter.h"',
     '#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"',
 ))
 

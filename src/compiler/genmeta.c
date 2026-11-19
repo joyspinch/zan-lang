@@ -6,7 +6,6 @@
 #include "zan.h"
 #include "diag.h"
 #include "lexer.h"
-#include "../../packages/Zan.Data/compiler/orm_adapter.h"
 #include "../common/json.h"
 
 #include <stdarg.h>
@@ -31,8 +30,6 @@ typedef struct {
     int pend_cap;
     const char *const *expr_names;
     int expr_count;
-    const char *const *table_names;
-    int table_count;
 } gm_ctx_t;
 
 /* Composite Dispatcher Submodules */
