@@ -1,6 +1,5 @@
 #include "irgen_internal.h"
 #include "../common/host_oom.h"
-#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 
 #include <limits.h>
 

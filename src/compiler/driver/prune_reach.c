@@ -605,9 +605,9 @@ static int pi_close_once(const char *stdlib_root) {
         for (int i = 0; i < d->file_count; i++) {
             pi_file_t *f = &d->files[i];
             if (f->included) continue;
-            int hit = f->has_ext || f->has_controller;
+            int hit = f->has_ext || f->has_test;
             const char *why = f->has_ext ? "ext"
-                              : (f->has_controller ? "controller" : NULL);
+                              : (f->has_test ? "test" : NULL);
             for (int k = 0; k < f->top_count && !hit; k++)
                 if (f->top[k]->flagged) { hit = 1; why = f->top[k]->str; }
             if (!hit) continue;

@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Json;
+
+class MvcBuild {
+    static int RunCompiler(string compiler, List<string> args) {
+        int status = Process.RunWithStandardStreams(compiler, args);
+        if (status == -1) { throw new Exception("Cannot start compiler " + compiler); }
+        return status;
+    }
+
+    static int Build(string compiler, bool framework, List<string> args) {
+        string output = "";
+        string bundle = "";
+        List<string> metadataArgs = new List<string>();
+        for (int i = 0; i < args.Count; i++) {
+            string arg = args[i];
+            if (i + 1 < args.Count) {
+                if (arg == "-o") { output = args[i + 1]; }
+                if (arg == "--emit-apk" || arg == "--emit-hap" || arg == "--emit-ipa") { bundle = args[i + 1]; }
+            }
+            metadataArgs.Add(arg);
+        }
+        if (output == "") { output = bundle; }
+        if (output == "") { throw new Exception("Specify a compiler output path"); }
+        string work = Path.Combine(Path.GetDirectoryName(output), ".mvc-" + Convert.ToString(Environment.ProcessId));
+        // Keep the final two path components stable for runtime source locations.
+        string generated = Path.Combine(work, "generated");
+        Directory.CreateDirectoryRecursive(generated);
+        string metadata = Path.Combine(work, "declarations.json");
+        string source = Path.Combine(generated, "MvcRoutes.zan");
+        metadataArgs.Add("--no-pullin-filter");
+        metadataArgs.Add("--gen-meta-bodies");
+        metadataArgs.Add("--gen-meta");
+        metadataArgs.Add(metadata);
+        try {
+            int result = RunCompiler(compiler, metadataArgs);
+            if (result != 0) { return result; }
+            JsonValue unit = JsonValue.Parse(File.ReadAllText(metadata));
+            File.WriteAllText(source, MvcRoutesGenerator.Generate(unit, framework));
+            args.Add(source);
+            return RunCompiler(compiler, args);
+        } finally {
+            File.Delete(metadata);
+            File.Delete(source);
+            Directory.Delete(generated);
+            Directory.Delete(work);
+        }
+    }
+
+    static int Main() {
+        if (Environment.ArgCount() < 3) {
+            Console.WriteLine("usage: zan-mvc <zanc> <app|framework> <zanc arguments including an output path>");
+            return 2;
+        }
+        string mode = Environment.ArgAt(1);
+        if (mode != "app" && mode != "framework") {
+            Console.WriteLine("Unknown MVC build mode: " + mode);
+            return 2;
+        }
+        List<string> args = new List<string>();
+        for (int i = 2; i < Environment.ArgCount(); i++) { args.Add(Environment.ArgAt(i)); }
+        try {
+            return Build(Environment.ArgAt(0), mode == "framework", args);
+        } catch (Exception failure) {
+            Console.WriteLine("MVC build failed: " + failure.Message);
+            return 1;
+        }
+    }
+}

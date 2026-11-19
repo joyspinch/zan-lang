@@ -1,0 +1,166 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+partial class MvcRoutesGenerator {
+    static string Text(JsonValue value, string key) {
+        JsonValue field = value == null ? null : value.Get(key);
+        return field == null ? "" : field.AsString("");
+    }
+
+    static bool Flag(JsonValue value, string key) {
+        JsonValue field = value == null ? null : value.Get(key);
+        return field != null && field.AsBool(false);
+    }
+    static string Quote(string value) { return JsonValue.NewStr(value).ToJson(); }
+
+    static string Qualify(string ns, string name) { return ns == "" ? name : ns + "." + name; }
+
+    static string TypeName(JsonValue type) {
+        string name = Text(type, "orig");
+        return Qualify(Text(type, "ns"), name == "" ? Text(type, "name") : name);
+    }
+
+    static JsonValue FindType(JsonValue types, string name, string ns) {
+        JsonValue fallback = null;
+        for (int i = 0; i < types.Count(); i++) {
+            JsonValue type = types.At(i);
+            string simple = Text(type, "name");
+            string full = TypeName(type);
+            if (full == name || full == Qualify(ns, name) || Qualify(Text(type, "ns"), simple) == name) {
+                return type;
+            }
+            if (simple == name) { fallback = type; }
+        }
+        return fallback;
+    }
+
+    static bool IsController(JsonValue types, JsonValue type, int depth) {
+        if (depth == 0 || Text(type, "kind") != "class") { return false; }
+        JsonValue bases = type.Get("bases");
+        for (int i = 0; i < bases.Count(); i++) {
+            string parent = bases.At(i).AsString("");
+            if (parent == "Controller" || parent == "System.Web.Controller" || parent == "AppController"
+                || parent == "AdminController" || parent == "ApiController") { return true; }
+            JsonValue baseType = FindType(types, parent, Text(type, "ns"));
+            if (baseType != null && IsController(types, baseType, depth - 1)) { return true; }
+        }
+        return false;
+    }
+
+    static string AttrName(JsonValue attr) {
+        string name = Text(attr, "name");
+        return name.EndsWith("Attribute") ? name.Substring(0, name.Length - 9) : name;
+    }
+
+    static bool HasAttr(JsonValue item, string name) {
+        JsonValue attrs = item.Get("attrs");
+        for (int i = 0; i < attrs.Count(); i++) {
+            if (AttrName(attrs.At(i)) == name) { return true; }
+        }
+        return false;
+    }
+
+    static bool IsAction(JsonValue method) {
+        string name = Text(method, "name");
+        if (Flag(method, "ctor") || Flag(method, "private") || Flag(method, "protected")
+            || Flag(method, "abstract") || method.Get("type_params") != null
+            || name.StartsWith("__")) { return false; }
+        if (name == "Index") { return true; }
+        JsonValue attrs = method.Get("attrs");
+        for (int i = 0; i < attrs.Count(); i++) {
+            string attr = AttrName(attrs.At(i));
+            if (attr == "Route" || attr == "Custom" || attr == "Description" || attr == "Action"
+                || attr == "HttpGet" || attr == "HttpPost" || attr == "HttpPut" || attr == "HttpPatch"
+                || attr == "HttpDelete" || attr == "HttpHead" || attr == "HttpOptions") { return true; }
+        }
+        return false;
+    }
+
+    static List<JsonValue> FrameworkControllers(JsonValue types) {
+        List<JsonValue> result = new List<JsonValue>();
+        JsonValue routes = FindType(types, "Zan.Web.__AttrRoutes", "");
+        if (routes == null) { return result; }
+        JsonValue methods = routes.Get("methods");
+        for (int i = 0; i < methods.Count(); i++) {
+            JsonValue method = methods.At(i);
+            if (Text(method, "name") != "RegisterFramework") { continue; }
+            JsonValue body = method.Get("body_expressions");
+            for (int j = 0; j < body.Count(); j++) {
+                JsonValue expr = body.At(j);
+                if (Text(expr, "k") != "typeof") { continue; }
+                string name = Text(expr, "t");
+                JsonValue type = FindType(types, name, "Zan.Web");
+                if (type == null) { throw new Exception("Missing framework controller metadata " + name); }
+                result.Add(type);
+            }
+        }
+        return result;
+    }
+
+    static int EmitGroup(StringBuilder code, JsonValue types, List<JsonValue> controllers,
+                         string group, int id) {
+        StringBuilder dispatch = new StringBuilder();
+        StringBuilder docs = new StringBuilder();
+        StringBuilder actions = new StringBuilder();
+        string registrations = "";
+        for (int i = 0; i < controllers.Count; i++) {
+            JsonValue owner = controllers[i];
+            registrations = registrations + (i == 0 ? "" : ",\n") + "            typeof(" + TypeName(owner) + ")";
+            JsonValue methods = owner.Get("methods");
+            HashSet<string> seen = new HashSet<string>();
+            for (int j = 0; j < methods.Count(); j++) {
+                JsonValue method = methods.At(j);
+                if (!IsAction(method)) { continue; }
+                string name = Text(method, "name");
+                if (seen.Contains(name)) {
+                    throw new Exception("Overloaded MVC action " + TypeName(owner) + "." + name);
+                }
+                seen.Add(name);
+                EmitAction(code, dispatch, docs, actions, types, owner, method, id);
+                id++;
+            }
+        }
+        code.Append("    static async bool Dispatch" + group + "(HttpContext ctx, string actionKey) {\n");
+        code.Append(dispatch.ToString());
+        code.Append("        return false;\n    }\n");
+        code.Append("    static bool Has" + group + "Action(string actionKey) {\n");
+        code.Append(actions.ToString());
+        code.Append("        return false;\n    }\n");
+        code.Append("    static void Parameters" + group + "(Route route, string actionKey) {\n");
+        code.Append(docs.ToString());
+        code.Append("    }\n");
+        if (group == "Framework") {
+            code.Append("    public static void RegisterFramework(WebApp app) {\n"
+                + "        __AttrRoutes.RegisterFramework(app, DispatchFramework, ParametersFramework, HasFrameworkAction);\n    }\n");
+        } else {
+            string array = controllers.Count == 0 ? "new TypeInfo[0]" : "new TypeInfo[] {\n" + registrations + "\n        }";
+            code.Append("    public static void Register(WebApp app) {\n"
+                + "        __AttrRoutes.Register(app, " + array + ", DispatchApp, ParametersApp, HasAppAction);\n    }\n");
+        }
+        return id;
+    }
+
+    static string Generate(JsonValue unit, bool framework) {
+        JsonValue types = unit.Get("classes");
+        if (types == null) { throw new Exception("Missing compiler declaration metadata"); }
+        List<JsonValue> frameworkTypes = framework ? FrameworkControllers(types) : new List<JsonValue>();
+        if (framework && frameworkTypes.Count == 0) { throw new Exception("No framework controllers in metadata"); }
+        List<JsonValue> appTypes = new List<JsonValue>();
+        for (int i = 0; i < types.Count(); i++) {
+            JsonValue type = types.At(i);
+            if (Flag(type, "from_package") || Flag(type, "from_stdlib")
+                || Flag(type, "generic") || Flag(type, "abstract")) { continue; }
+            if (IsController(types, type, 32)) { appTypes.Add(type); }
+        }
+        StringBuilder code = new StringBuilder();
+        code.Append("// Generated by Zan.Mvc.\nusing System;\nusing System.Web;\nusing Zan.Web;\n\n");
+        code.Append("public static class MvcRoutes {\n"
+            + "    static void RequireInput(bool present, string name) {\n"
+            + "        if (!present) { throw new ApiError(400, \"0003\", name + \"不能为空\"); }\n    }\n");
+        int id = EmitGroup(code, types, appTypes, "App", 0);
+        if (framework) { EmitGroup(code, types, frameworkTypes, "Framework", id); }
+        code.Append("}\n");
+        return code.ToString();
+    }
+}

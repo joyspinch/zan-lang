@@ -1,0 +1,94 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+class RouteInput {
+    public string Name;
+    public string Type;
+    public string Source;
+    public bool Required;
+    public string DefaultValue;
+    public string Description;
+
+    public RouteInput(string name, string type, string source, bool required,
+                      string defaultValue = "", string description = "") {
+        this.Name = name;
+        this.Type = type;
+        this.Source = source;
+        this.Required = required;
+        this.DefaultValue = defaultValue;
+        this.Description = description;
+    }
+}
+
+partial class MvcRoutesGenerator {
+    static string Literal(JsonValue expr) {
+        if (Text(expr, "k") == "uni" && Text(expr, "op") == "-") { return "-" + Literal(expr.Get("o")); }
+        if (Text(expr, "k") != "lit") { return ""; }
+        JsonValue value = expr.Get("v");
+        return Text(expr, "t") == "str" ? value.AsString("") : value.ToJson();
+    }
+
+    static bool InputReceiver(JsonValue recv) {
+        string kind = Text(recv, "k");
+        if (kind == "this") { return true; }
+        if (kind == "id") { return Text(recv, "n") == "ctx" || Text(recv, "n") == "c"; }
+        return kind == "call" && Text(recv.Get("f"), "n") == "Ctx";
+    }
+
+    static void AddInput(List<RouteInput> inputs, RouteInput input, bool merge) {
+        for (int i = 0; i < inputs.Count; i++) {
+            RouteInput old = inputs[i];
+            if (old.Name != input.Name) { continue; }
+            if (merge) {
+                old.Required = old.Required || input.Required;
+                if (old.Description == "") { old.Description = input.Description; }
+                if (old.DefaultValue == "") { old.DefaultValue = input.DefaultValue; }
+                if (old.Type == "string") { old.Type = input.Type; }
+            }
+            return;
+        }
+        inputs.Add(input);
+    }
+
+    static void AddBodyInputs(JsonValue method, List<RouteInput> inputs) {
+        JsonValue expressions = method.Get("body_expressions");
+        if (expressions == null) { return; }
+        for (int i = 0; i < expressions.Count(); i++) {
+            JsonValue expression = expressions.At(i);
+            if (Text(expression, "k") != "call") { continue; }
+            JsonValue callee = expression.Get("f");
+            if (Text(callee, "k") != "mem" || !InputReceiver(callee.Get("o"))) { continue; }
+            string reader = Text(callee, "n");
+            JsonValue args = expression.Get("a");
+            int argCount = args == null ? 0 : args.Count();
+            if (reader == "Paged") {
+                string order = argCount > 0 ? Literal(args.At(0)) : "";
+                string limit = argCount > 1 ? Literal(args.At(1)) : "";
+                AddInput(inputs, new RouteInput("page", "int", "query", false, "1", "页码，从 1 开始"), false);
+                AddInput(inputs, new RouteInput("limit", "int", "query", false, limit, "每页条数"), false);
+                AddInput(inputs, new RouteInput("order", "string", "query", false, order, "排序字段"), false);
+                AddInput(inputs, new RouteInput("dir", "string", "query", false, "desc", "排序方向：desc 或 asc"), false);
+                AddInput(inputs, new RouteInput("kw", "string", "query", false, "", "搜索关键词"), false);
+                continue;
+            }
+            if (argCount == 0) { continue; }
+            JsonValue key = args.At(0);
+            string name = Text(key, "t") == "str" ? Text(key, "v") : "";
+            if (name == "") { continue; }
+            bool required = reader == "Param" || reader.StartsWith("Need");
+            string type = "";
+            if (reader == "In" || reader == "InText" || reader == "InRaw"
+                || reader == "Need" || reader == "NeedText" || reader == "Param") { type = "string"; }
+            else if (reader == "InInt" || reader == "NeedInt") { type = "int"; }
+            else if (reader == "InLong" || reader == "NeedLong") { type = "long"; }
+            else if (reader == "InDouble" || reader == "NeedDouble") { type = "number"; }
+            else if (reader == "InBool" || reader == "NeedBool" || reader == "HasIn") { type = "bool"; }
+            if (type == "") { continue; }
+            string extra = argCount > 1 ? Literal(args.At(1)) : "";
+            bool hasDefault = !required && type != "string" && reader != "HasIn";
+            AddInput(inputs, new RouteInput(name, type, reader == "Param" ? "path" : "query", required,
+                hasDefault ? extra : "", required && reader != "Param" ? extra : ""), true);
+        }
+    }
+}

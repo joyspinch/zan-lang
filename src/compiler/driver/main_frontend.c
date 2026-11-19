@@ -173,7 +173,7 @@
         phase("specialize_bases");
 
         if (gen_meta_path && !zan_diag_has_errors(diag)) {
-            char *meta = zan_genmeta_export_files(ast, diag);
+            char *meta = zan_genmeta_export_files(ast, diag, gen_meta_bodies);
             if (!meta) {
                 fprintf(stderr, "error: cannot export metadata\n");
                 zan_arena_free(arena);
@@ -268,11 +268,7 @@
             memset(pi_table, 0, sizeof(pi_table));
             pi_dirs_head = pi_dirs_tail = NULL;
         }
-        /* 约定路由的动作派发器：必须早于最后一次 nsresolve（新声明的类型
-           引用要进解析/裁剪视野），又必须晚于所有输入解析完（控制器齐了）。 */
-        zan_compile_trace("synth action dispatch");
-        zan_mvc_synthesize_dispatch(ast, arena, diag);
-        zan_compile_trace("nsresolve generated");
+        zan_compile_trace("nsresolve final");
         zan_nsresolve_run(ast, arena, diag);
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);

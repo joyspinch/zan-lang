@@ -113,6 +113,14 @@ public class Process {
     private static extern int WinGetTickCount();
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
     private static extern int WinGetCurrentProcessId();
+    [DllImport("kernel32", EntryPoint = "GetConsoleCP")]
+    private static extern int WinGetConsoleCP();
+    [DllImport("kernel32", EntryPoint = "GetStdHandle")]
+    private static extern nint WinGetStdHandle(int stream);
+    [DllImport("kernel32", EntryPoint = "DuplicateHandle")]
+    private static extern int WinDuplicateHandle(nint sourceProcess, nint sourceHandle,
+                                                 nint targetProcess, byte[] targetHandle,
+                                                 int access, int inherit, int options);
     // CaptureSafe 只读取 PeekNamedPipe 已确认就绪的字节，避免 ReadFile 吃掉超时。
     [DllImport("kernel32", EntryPoint = "CreatePipe")]
     private static extern int WinCreatePipe(byte[] hRead, byte[] hWrite, byte[] sa, int nSize);
@@ -587,18 +595,53 @@ public class Process {
         return Process.RunSafe(exe, args, 0 - 1);
     }
 
-    // 支持超时限制的 RunSafe（timeoutMs <= 0 表示无限等待；超时主动终止子进程防止宿主挂死）。
-    public static int RunSafe(string exe, List<string> args, int timeoutMs) {
+    /// Execute an argument vector and preserve stdin, stdout and stderr independently.
+    public static int RunWithStandardStreams(string exe, List<string> args) {
         #if WINDOWS
-        string cmdline = BuildCommandLine(exe, args);
+        return RunWindows(exe, args, 0 - 1, true);
+        #else
+        return RunSafe(exe, args);
+        #endif
+    }
+
+    #if WINDOWS
+    private static int StartWindows(string exe, List<string> args, byte[] pi, bool inheritStreams) {
         byte[] si = new byte[128];
         si[0] = 104;
+        int flags = 134217728; // CREATE_NO_WINDOW
+        int inherit = 0;
+        try {
+            if (inheritStreams) {
+                WinPutInt(si, 60, 256); // STARTF_USESTDHANDLES
+                inherit = 1;
+                if (WinGetConsoleCP() != 0) { flags = 0; }
+                byte[] duplicate = new byte[8];
+                nint currentProcess = 0 - 1;
+                for (int stream = 0; stream < 3; stream++) {
+                    nint handle = WinGetStdHandle(0 - 10 - stream);
+                    if (handle == 0 || handle == 0 - 1) { continue; }
+                    if (WinDuplicateHandle(currentProcess, handle, currentProcess,
+                                           duplicate, 0, 1, 2) == 0) { return 0; }
+                    WinPutHandle(si, 80 + stream * 8, WinHandleAt(duplicate, 0));
+                }
+            }
+            nint command = Wide.Of(BuildCommandLine(exe, args));
+            int ok = WinCreateProcess(0, command, 0, 0, inherit, flags, 0, 0, si, pi);
+            Wide.Free(command);
+            return ok;
+        } finally {
+            if (inheritStreams) {
+                for (int stream = 0; stream < 3; stream++) {
+                    nint handle = WinHandleAt(si, 80 + stream * 8);
+                    if (handle != 0) { WinCloseHandle(handle); }
+                }
+            }
+        }
+    }
+
+    private static int RunWindows(string exe, List<string> args, int timeoutMs, bool inheritStreams) {
         byte[] pi = new byte[32];
-        int CREATE_NO_WINDOW = 134217728;
-        nint wcmd = Wide.Of(cmdline);
-        int ok = WinCreateProcess(0, wcmd, 0, 0, 0, CREATE_NO_WINDOW, 0, 0, si, pi);
-        Wide.Free(wcmd);
-        if (ok == 0) { return 0 - 1; }
+        if (StartWindows(exe, args, pi, inheritStreams) == 0) { return 0 - 1; }
         nint hProc = WinHandleAt(pi, 0);
         nint hThread = WinHandleAt(pi, 8);
         try {
@@ -617,6 +660,13 @@ public class Process {
             WinCloseHandle(hProc);
             WinCloseHandle(hThread);
         }
+    }
+    #endif
+
+    // 支持超时限制的 RunSafe（timeoutMs <= 0 表示无限等待；超时主动终止子进程防止宿主挂死）。
+    public static int RunSafe(string exe, List<string> args, int timeoutMs) {
+        #if WINDOWS
+        return RunWindows(exe, args, timeoutMs, false);
         #elif WASM32
         return 0 - 1;
         #else

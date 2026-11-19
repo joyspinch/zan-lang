@@ -18,8 +18,41 @@ namespace Zan.Web;
    3. 服务器启动时全量装载入跨进程共享内存路由表（RouteTable）。
    4. 请求进入时直接从共享内存表匹配，没有的路由瞬间抛 404（Fail-Fast）。 */
 public async delegate bool RouteDispatchHandler(HttpContext ctx, string actionKey);
+public async delegate void ControllerAction(Controller controller, HttpContext ctx);
+public delegate bool RouteActionFilter(string actionKey);
+public delegate void RouteParameterWriter(Route route, string actionKey);
 
 public class __AttrRoutes {
+
+    public static async void RunAction(Controller controller, HttpContext ctx, string view,
+                                       bool readOnly, bool transaction, ControllerAction action) {
+        controller.Bind(ctx);
+        controller.SetView(view);
+        if (readOnly) { controller.UseReadOnly(); }
+        bool begun = false;
+        try {
+            if (await controller.BeforeAsync()) {
+                if (transaction) {
+                    bool ready = await controller.TxBegin();
+                    if (!ready) { throw new ApiError(503, "0503", "服务不可用"); }
+                    begun = true;
+                }
+                await action(controller, ctx);
+                if (begun) {
+                    await controller.TxCommit();
+                    begun = false;
+                }
+            }
+        } catch (Exception failure) {
+            if (begun) {
+                try { await controller.TxRollback(); }
+                catch (Exception rollbackFailure) { }
+            }
+            throw;
+        } finally {
+            await controller.AfterAsync();
+        }
+    }
 
     private static RouteDispatchHandler CustomDispatcher = null;
     private static RouteDispatchHandler FrameworkDispatcher = null;
@@ -138,9 +171,10 @@ public class __AttrRoutes {
         return "GET";
     }
 
-    static void RegisterController(WebApp app, TypeInfo ti, bool framework = false) {
+    static void RegisterController(WebApp app, TypeInfo ti, RouteParameterWriter parameters,
+                                   RouteActionFilter actions) {
         /* 路径和动作键均取 FullName。不同命名空间可以声明同名控制器，
-           短名无法区分它们；动作键须与编译器合成派发器的完整身份一致。 */
+           短名无法区分它们；动作键须与派发器的完整身份一致。 */
         string fullName = ti.FullName;
         string classAttrs = ti.GetCustomAttributes();
         string basePath = __AttrRoutes.DeriveControllerPath(fullName, classAttrs);
@@ -193,6 +227,7 @@ public class __AttrRoutes {
             string verb = __AttrRoutes.ExtractVerb(mattrs);
             /* 应用和框架使用同一完整身份协议，避免同名控制器派发到其他动作。 */
             string actionKey = fullName + "." + mname;
+            if (actions != null && !actions(actionKey)) { continue; }
 
             Route r = app.Map(verb, actionPath, __AttrRoutes.Dispatch);
             r.Named(actionKey);
@@ -283,38 +318,7 @@ public class __AttrRoutes {
                 braceStart = c + 1;
             }
 
-            /* 特性元数据中的请求参数直录（In/Need/Paged 扫描产物） */
-            int pidx = 0;
-            bool hasCustomParam = false;
-            while (pidx < mattrs.Length) {
-                int found = mattrs.IndexOf("Param=", pidx);
-                if (found < 0) { break; }
-                int start = found + 6;
-                int end = mattrs.IndexOf(";", start);
-                if (end < 0) { end = mattrs.Length; }
-                string pstr = mattrs.Substring(start, end - start);
-                List<string> parts = pstr.Split("\t");
-                if (parts.Count >= 6) {
-                    hasCustomParam = true;
-                    string pname = parts[0];
-                    string ptype = parts[1];
-                    string pwhere = parts[2];
-                    bool preq = parts[3] == "true";
-                    string pdef = parts[4];
-                    string pdesc = parts[5];
-                    r.Param(pname, ptype, preq, pdef, pdesc, pwhere);
-                }
-                pidx = end + 1;
-            }
-
-            /* 兜底：若无元数据参数且有签名参数，按签名参数直录 */
-            if (!hasCustomParam) {
-                int pcount = ti.GetMethodParamCount(m);
-                for (int p = 0; p < pcount; p = p + 1) {
-                    string ptype = ti.GetMethodParamType(m, p);
-                    r.Param("p" + Convert.ToString(p), ptype, true, "", "", "query");
-                }
-            }
+            if (parameters != null) { parameters(r, actionKey); }
 
             /* Index 别名支持：仅对按约定生成的 Index 生成 /index 别名，显式 [Route] 绝不擅自篡改路径 */
             if (isIndex && methodRoute.Length == 0 && !actionPath.EndsWith("/index") && actionPath != "/") {
@@ -326,10 +330,11 @@ public class __AttrRoutes {
         }
     }
 
-    public static void RegisterFramework(WebApp app, RouteDispatchHandler dispatcher = null) {
+    public static void RegisterFramework(WebApp app, RouteDispatchHandler dispatcher,
+                                         RouteParameterWriter parameters = null,
+                                         RouteActionFilter actions = null) {
         if (app == null) { return; }
-        /* 编译器在显式调用点供给框架动作派发器；与应用派发器独立保存，
-           后续 Register(app) 不会覆盖已选择的框架动作。 */
+        /* 框架动作派发器与应用派发器独立保存。 */
         if (dispatcher != null) { FrameworkDispatcher = dispatcher; }
         TypeInfo[] f = new TypeInfo[] {
             typeof(Zan.Web.Admin.LoginController),
@@ -359,19 +364,17 @@ public class __AttrRoutes {
             typeof(Zan.Web.Health.HealthController)
         };
         for (int i = 0; i < f.Length; i = i + 1) {
-            __AttrRoutes.RegisterController(app, f[i], true);
+            __AttrRoutes.RegisterController(app, f[i], parameters, actions);
         }
     }
 
-    public static void Register(WebApp app, TypeInfo[] controllers = null,
-                                RouteDispatchHandler dispatcher = null) {
+    public static void Register(WebApp app, TypeInfo[] controllers,
+                                RouteDispatchHandler dispatcher,
+                                RouteParameterWriter parameters = null,
+                                RouteActionFilter actions = null) {
         if (app == null) { return; }
 
-        /* 0. 动作派发器：约定路由把每条路由的 handler 统一挂到 Dispatch，
-           真正的控制器方法调用按 routeAction 派发。反射 Invoke 拿不到协程
-           句柄（thunk 只回传方法返回值），异步动作无法 await，因此派发器
-           由编译器在 __AttrRoutes.Register 调用点合成后作为第三实参传入
-           （见 src/compiler/main.c 的动作派发合成）。 */
+        /* 约定路由统一进入 Dispatch，由应用提供可等待的动作派发器。 */
         if (dispatcher != null) {
             CustomDispatcher = dispatcher;
         }
@@ -380,7 +383,7 @@ public class __AttrRoutes {
         if (controllers != null) {
             for (int i = 0; i < controllers.Length; i = i + 1) {
                 TypeInfo ti = controllers[i];
-                __AttrRoutes.RegisterController(app, ti);
+                __AttrRoutes.RegisterController(app, ti, parameters, actions);
             }
         }
 

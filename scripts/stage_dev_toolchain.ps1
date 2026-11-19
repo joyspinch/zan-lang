@@ -34,7 +34,7 @@ function Add-StageInput([string]$Source, [string]$Name, [switch]$Directory, [swi
     }
     $actions.Add([pscustomobject]@{ source = $full; name = $Name; directory = [bool]$Directory })
 }
-foreach ($exe in @('zanc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
+foreach ($exe in @('zanc.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
     Add-StageInput (Join-Path $Build $exe) $exe -Required
 }
 Add-StageInput (Join-Path $Build 'mingw') 'mingw' -Directory -Required

@@ -47,11 +47,11 @@ function Read-Kv([string]$path) {
     return $h
 }
 
-function Invoke-Zanc([string[]]$argv, [string]$out, [int]$timeoutMs) {
+function Invoke-Compiler([string]$compiler, [string[]]$argv, [int]$timeoutMs) {
     # .NET Process 直连：PS 5.1 下 Start-Process -PassThru 的 ExitCode 取不到，
     # 且必须显式 UTF-8 解码，否则中文诊断变乱码。
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $Zanc
+    $psi.FileName = $compiler
     $q = foreach ($a in $argv) { if ($a -match '\s') { '"' + ($a.Trim('"')) + '"' } else { $a } }
     $psi.Arguments = ($q -join ' ')
     $psi.UseShellExecute = $false
@@ -158,7 +158,13 @@ foreach ($t in $tpls) {
     # 不用 --deny-warnings：基线不干净时它会把 stdlib 既有告警升成错误，
     # 让每个模板都假红（实测 TaskCompletionSource.zan:101 的闭包捕获告警）。
     $argv = @($inputs) + @('--auto-stdlib', '--emit-lib', '-o', ("`"$out`""))
-    $r = Invoke-Zanc -argv $argv -out $out -timeoutMs ($TimeoutSec * 1000)
+    $compiler = $Zanc
+    if ($proj['mvcRoutes']) {
+        $compiler = Join-Path (Split-Path -Parent $Zanc) ('zan-mvc' + [IO.Path]::GetExtension($Zanc))
+        if (-not (Test-Path -LiteralPath $compiler)) { throw "MVC build tool not found: $compiler" }
+        $argv = @($Zanc, $proj['mvcRoutes']) + $argv
+    }
+    $r = Invoke-Compiler -compiler $compiler -argv $argv -timeoutMs ($TimeoutSec * 1000)
 
     $bad = ($r.exit -ne 0) -or ($r.text -match '\b[1-9]\d*\s+error\(s\)') -or ($r.text -match '(?m)^\S.*?:\d+:\d+:\s*error:')
     $ok = -not $bad

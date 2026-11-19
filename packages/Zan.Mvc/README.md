@@ -287,7 +287,6 @@ int changed = await this.SysUser.ResetPassword(id, salt, hash, now);
 |------------------------------|----------------------|------------------------------|
 | 异步借出（动作内首次取数）   | `await Conn()`       | `await ReadConn()`           |
 | 同步取已借（辅助函数）       | `Held()`             | `HeldRead()`                 |
-| 实体访问器的编译期连接合约 | `__Conn()`（公开） |                    |
 
 `OnBeforeAsync()` 在动作执行前取得请求租约，普通实体链与 DAO 方法都使用
 该租约。`Held*` 用于把已持有的连接交给辅助操作，`ReadConn` 保留只读意图
@@ -521,9 +520,13 @@ batch/delete/options）、服务端下发表格配置、列即表单。借鉴落
 
 Controllers declare routing with **attributes** instead of hand-wiring in the
 composition root (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks).
-A compiler pass scans the compile unit's controllers (package-pulled ones
-included) and synthesizes `__AttrRoutes.Register(app)`, which the composition
-root calls once — no generated file to maintain, no reflection.
+`zan-mvc` reads declarations and method-body expressions from `zanc` metadata,
+then generates the typed dispatch, request parameter descriptions and
+`MvcRoutes.Register(app)` for the application. Build with
+`zan-mvc zanc app src --auto-stdlib -o build/app.exe`. In ZanIDE, set
+`mvcRoutes = app` in `zan.proj` to use the same command for Run, Debug and Publish.
+Use `framework` mode and call `MvcRoutes.RegisterFramework(app)` before
+`MvcRoutes.Register(app)` to include the built-in framework routes.
 
 ```zan
 [Route("api/data/[action]")]
@@ -787,7 +790,7 @@ class Program {
         int _r = await Boot.Run();
     }
     static void RegisterRoutes(WebApp app) {
-        __AttrRoutes.Register(app);   // 属性路由（编译期按单元元数据生成）
+        MvcRoutes.Register(app);   // 由 zan-mvc 生成应用路由注册和动作派发
     }
 }
 ```

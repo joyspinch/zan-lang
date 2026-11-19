@@ -482,7 +482,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
-        zan_mvc_rewrite_route_call(&c->mvc_routes, expr, c->arena);
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         int callee_is_method = 0;

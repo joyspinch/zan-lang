@@ -22,7 +22,7 @@ rm -rf "$stage"
 mkdir -p "$stage/toolchain"
 
 # compiler + companion CLIs
-for exe in zanc zan-lsp zan-dap zanfmt zandoc; do
+for exe in zanc zan-mvc zan-lsp zan-dap zanfmt zandoc; do
     [ -f "build/$exe" ] && cp "build/$exe" "$stage/toolchain/"
 done
 

@@ -82,6 +82,11 @@ endif()
 # the input: it owns the compiler flags, so a change to it invalidates the
 # cached binary (a plain binary reused for an instrumented verdict would
 # silently skip the leak and ARC checks).
+set(_compiler ${ZANC})
+if(MVC_TOOL)
+  set(_compiler ${MVC_TOOL} ${ZANC} ${MVC_MODE})
+endif()
+
 function(zan_artifact_is_current out_var artifact)
   set(${out_var} FALSE PARENT_SCOPE)
   if(NOT EXISTS ${artifact})
@@ -90,7 +95,10 @@ function(zan_artifact_is_current out_var artifact)
   if(${SRC} IS_NEWER_THAN ${artifact})
     return()
   endif()
-  if(${ZANC} IS_NEWER_THAN ${artifact})
+  if("${ZANC}" IS_NEWER_THAN "${artifact}")
+    return()
+  endif()
+  if(MVC_TOOL AND "${MVC_TOOL}" IS_NEWER_THAN "${artifact}")
     return()
   endif()
   if(STDLIB_STAMP AND EXISTS ${STDLIB_STAMP} AND ${STDLIB_STAMP} IS_NEWER_THAN ${artifact})
@@ -159,7 +167,7 @@ if(EXPECTED AND OUT_EXE)
   zan_artifact_is_current(_current ${OUT_EXE})
   if(NOT _current)
     execute_process(
-      COMMAND ${ZANC} ${SRC} -o ${OUT_EXE} --check-leaks --arc-guard ${ZANC_ARGS}
+      COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} --check-leaks --arc-guard ${ZANC_ARGS}
               --package-project ${WORKDIR}
       RESULT_VARIABLE compile_rc
       OUTPUT_VARIABLE compile_out
@@ -229,7 +237,7 @@ if(EXPECTED AND OUT_EXE)
     # The case leaks on purpose: the leak report goes to stdout, so the golden
     # has to come from an uninstrumented build.
     execute_process(
-      COMMAND ${ZANC} ${SRC} -o ${PLAIN_OUT_EXE} ${PLAIN_ZANC_ARGS}
+      COMMAND ${_compiler} ${SRC} -o ${PLAIN_OUT_EXE} ${PLAIN_ZANC_ARGS}
               --package-project ${WORKDIR}
       RESULT_VARIABLE plain_rc
       OUTPUT_VARIABLE plain_out
@@ -276,6 +284,9 @@ if(DET_STAMP)
   get_filename_component(_det_dir "${DET_STAMP}" DIRECTORY)
   file(MAKE_DIRECTORY "${_det_dir}")
   set(_det_marker "ok|args:${ZANC_ARGS}")
+  if(MVC_TOOL)
+    string(APPEND _det_marker "|mvc:${MVC_MODE}")
+  endif()
   set(_det_current FALSE)
   if(EXISTS ${DET_STAMP})
     file(READ ${DET_STAMP} _det_body)
@@ -291,13 +302,20 @@ if(DET_STAMP)
     message(STATUS "deterministic (cached): ${SRC}")
   else()
     function(emit_ir out_var)
+      set(_output_args "")
+      if(MVC_TOOL)
+        set(_output_args -o ${DET_STAMP}.ir)
+      endif()
       execute_process(
-        COMMAND ${ZANC} ${SRC} ${ZANC_ARGS} --emit-ir
+        COMMAND ${_compiler} ${SRC} ${ZANC_ARGS} --emit-ir ${_output_args}
         RESULT_VARIABLE rc
         OUTPUT_VARIABLE ir
         ERROR_VARIABLE  err)
       if(NOT rc EQUAL 0)
-        message(FATAL_ERROR "emit-ir failed for ${SRC} (rc=${rc})\n${err}")
+        message(FATAL_ERROR "emit-ir failed for ${SRC} (rc=${rc})\n${ir}${err}")
+      endif()
+      if(MVC_TOOL AND NOT ir MATCHES "(^|\n)target triple = ")
+        message(FATAL_ERROR "emit-ir produced no LLVM module for ${SRC}\n${ir}${err}")
       endif()
       set(${out_var} "${ir}" PARENT_SCOPE)
     endfunction()

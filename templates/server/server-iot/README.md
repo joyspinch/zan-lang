@@ -3,7 +3,7 @@
 An MQTT 3.1.1 message broker **plus** an attribute-driven web management console,
 in one Zan binary. Devices speak MQTT on `:1883`; operators use the HTTP console
 and JSON API on `:8080`. The web half comes from the **Zan.Mvc package**:
-attribute routing is generated at compile time (`__AttrRoutes`), auth/sessions
+`zan-mvc` generates attribute routes and typed action dispatch, auth/sessions
 use the package services (`AuthToken`/`AuthUser`/`Cfg`), and the console
 account is the package Schema's bootstrap admin — the same stack the other
 server templates consume. The broker itself is `System.Net.Mqtt.MqttBroker`.
@@ -38,7 +38,7 @@ src/controller/IotController.zan        REST API (clients, kick, retained, webho
 
 ```
 # 1. 编译全部源码
-zanc (all src/**/*.zan) --auto-stdlib -o app.exe
+zan-mvc zanc app src --auto-stdlib -o app.exe
 
 # 2. 启动服务 — MQTT 监听 :1883，管理后台监听 http://127.0.0.1:8080
 app.exe

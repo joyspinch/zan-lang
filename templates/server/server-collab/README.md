@@ -69,8 +69,8 @@ the directory path (`View.LoadRec`), so `views/Admin/Oa/Docs.Index.html` is
 
 Controllers declare routing with **attributes** instead of hand-wiring in
 `main.zan` (the Zan equivalent of the PHP `@title/@auth/@rank` docblocks). A
-compiler pass scans the controllers and synthesizes `__AttrRoutes.Register(app)`,
-which `main.zan` calls once — no generated file to maintain, no reflection.
+build tool, `zan-mvc`, reads compiler metadata and generates `MvcRoutes.Register(app)`
+with typed action dispatch. `main.zan` calls it once at startup.
 
 ```zan
 class ApiController {
@@ -330,9 +330,7 @@ Build & run from the IDE (output streams into the terminal panel), or from a
 shell — **build into `build/`, run from the project root**:
 
 ```
-zanc src/main.zan src/**/*.zan \
-     packages/Zan.Mvc/src/ZanWeb/**/*.zan \
-     --auto-stdlib -o build/app.exe
+zan-mvc zanc app src --auto-stdlib -o build/app.exe
 build/app.exe          # cwd = project root, so ./config/app.json and ./wwwroot resolve
 ```
 

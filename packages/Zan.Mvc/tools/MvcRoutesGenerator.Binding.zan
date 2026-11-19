@@ -1,0 +1,161 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+partial class MvcRoutesGenerator {
+    static Dictionary<string, string> Options(JsonValue method) {
+        Dictionary<string, string> result = new Dictionary<string, string>();
+        JsonValue attrs = method.Get("attrs");
+        for (int i = 0; i < attrs.Count(); i++) {
+            JsonValue attr = attrs.At(i);
+            if (AttrName(attr) != "Opt") { continue; }
+            JsonValue args = attr.Get("args");
+            for (int j = 0; j < args.Count(); j++) {
+                JsonValue arg = args.At(j);
+                if (Text(arg, "k") != "lit" || Text(arg, "t") != "str") { continue; }
+                string value = Text(arg, "v");
+                int equals = value.IndexOf("=");
+                string name = equals < 0 ? value : value.Substring(0, equals);
+                if (!result.ContainsKey(name)) { result[name] = equals < 0 ? "" : value.Substring(equals + 1); }
+            }
+        }
+        return result;
+    }
+
+    static string InputSuffix(string type) {
+        if (type == "int") { return "Int"; }
+        if (type == "long") { return "Long"; }
+        if (type == "double") { return "Double"; }
+        if (type == "bool") { return "Bool"; }
+        return "";
+    }
+
+    static bool IsScalar(string type) { return type == "string" || InputSuffix(type) != ""; }
+
+    static string DefaultLiteral(string type, string value) {
+        if (type == "bool") { return value == "true" ? "true" : "false"; }
+        if (value == "") { return "0"; }
+        if (type == "int") {
+            int n = 0;
+            if (int.TryParse(value, out n)) { return Convert.ToString(n); }
+        } else if (type == "long") {
+            long n = 0;
+            if (long.TryParse(value, out n)) { return Convert.ToString(n) + "L"; }
+        } else {
+            double n = 0;
+            if (double.TryParse(value, out n)) {
+                string number = Convert.ToString(n);
+                if (number != "NaN" && number != "Infinity" && number != "-Infinity") { return number; }
+            }
+        }
+        throw new Exception("Invalid MVC " + type + " default " + value);
+    }
+
+    static void BindScalar(StringBuilder code, string type, string name, string local,
+                           string receiver, bool optional, string defaultValue) {
+        string key = Quote(name);
+        string suffix = InputSuffix(type);
+        string declaration = "        " + type + " " + local + " = ";
+        if (!optional && receiver != "ctx") {
+            code.Append(declaration + receiver + ".Need" + suffix + "(" + key + ", " + key + ");\n");
+        } else if (type == "string") {
+            code.Append(declaration + receiver + ".In(" + key + ");\n");
+            if (optional) {
+                code.Append("        if (" + local + ".Length == 0) { " + local + " = " + Quote(defaultValue) + "; }\n");
+            } else {
+                code.Append("        RequireInput(" + local + ".Length != 0, " + key + ");\n");
+            }
+        } else {
+            if (!optional) { code.Append("        RequireInput(ctx.HasIn(" + key + "), " + key + ");\n"); }
+            code.Append(declaration + receiver + ".In" + suffix + "(" + key + ", "
+                + DefaultLiteral(type, defaultValue) + ");\n");
+        }
+    }
+
+    static void BindForm(StringBuilder code, JsonValue form, string local, List<RouteInput> inputs) {
+        string type = TypeName(form);
+        code.Append("        " + type + " " + local + " = new " + type + "();\n");
+        JsonValue fields = form.Get("fields");
+        for (int i = 0; i < fields.Count(); i++) {
+            JsonValue field = fields.At(i);
+            if (Flag(field, "static") || Flag(field, "private") || Flag(field, "protected")) { continue; }
+            string name = Text(field, "name");
+            string fieldType = Text(field, "type");
+            if (!IsScalar(fieldType)) { continue; }
+            string access = local + "." + name;
+            string key = Quote(name);
+            string suffix = InputSuffix(fieldType);
+            string args = suffix == "" ? key : key + ", " + access;
+            code.Append("        if (ctx.HasIn(" + key + ")) { " + access + " = ctx.In" + suffix + "(" + args + "); }\n");
+            inputs.Add(new RouteInput(name, fieldType, "form", false));
+        }
+    }
+
+    static void EmitAction(StringBuilder code, StringBuilder dispatch, StringBuilder docs,
+                           StringBuilder actions, JsonValue types, JsonValue owner, JsonValue method, int id) {
+        string name = Text(method, "name");
+        string type = TypeName(owner);
+        string ownerNs = Text(owner, "ns");
+        string key = "typeof(" + type + ").FullName + " + Quote("." + name);
+        string wrapper = "Action" + Convert.ToString(id);
+        bool isStatic = Flag(method, "static");
+        bool isAsync = Flag(method, "async");
+        bool transaction = HasAttr(owner, "Tx") || HasAttr(method, "Tx");
+        bool readOnly = HasAttr(owner, "ReadOnly") || HasAttr(method, "ReadOnly");
+        string view = type.StartsWith("Zan.Web.") ? type.Substring(8) : type;
+        List<RouteInput> inputs = new List<RouteInput>();
+        JsonValue parameters = method.Get("params");
+        Dictionary<string, string> optional = Options(method);
+        StringBuilder body = new StringBuilder();
+        string args = "";
+        for (int i = 0; i < parameters.Count(); i++) {
+            JsonValue param = parameters.At(i);
+            string paramType = Text(param, "type");
+            string paramName = Text(param, "name");
+            string local = "value" + Convert.ToString(i);
+            bool opt = optional.ContainsKey(paramName);
+            string dflt = opt ? optional[paramName] : "";
+            string error = "Unsupported MVC parameter " + type + "." + name + "(" + paramType + " " + paramName + ")";
+            if (param.Get("by_ref") != null) { throw new Exception(error); }
+            if (IsScalar(paramType)) {
+                BindScalar(body, paramType, paramName, local, isStatic ? "ctx" : "controller", opt, dflt);
+                inputs.Add(new RouteInput(paramName, paramType, "query", !opt, dflt));
+            } else if (paramType == "HttpContext" || paramType == "System.Web.HttpContext") {
+                local = "ctx";
+            } else {
+                JsonValue form = FindType(types, paramType, ownerNs);
+                if (form == null || Text(form, "kind") != "class" || Flag(form, "abstract") || Flag(form, "generic")) {
+                    throw new Exception(error);
+                }
+                BindForm(body, form, local, inputs);
+            }
+            args = args + (i == 0 ? "" : ", ") + local;
+        }
+
+        string signature = isStatic ? "HttpContext ctx" : "Controller baseController, HttpContext ctx";
+        code.Append("    static " + (isAsync || !isStatic ? "async " : "") + "void " + wrapper + "(" + signature + ") {\n");
+        if (!isStatic) { code.Append("        " + type + " controller = (" + type + ")baseController;\n"); }
+        code.Append(body.ToString());
+        code.Append("        " + (isAsync ? "await " : "") + (isStatic ? type : "controller") + "." + name + "(" + args + ");\n    }\n");
+
+        actions.Append("        if (actionKey == " + key + ") { return true; }\n");
+        dispatch.Append("        if (actionKey == " + key + ") {\n");
+        if (isStatic) {
+            dispatch.Append("            " + (isAsync ? "await " : "") + wrapper + "(ctx);\n");
+        } else {
+            dispatch.Append("            await __AttrRoutes.RunAction(new " + type + "(), ctx, " + Quote(view + "." + name)
+                + ", " + (readOnly ? "true" : "false") + ", " + (transaction ? "true" : "false") + ", " + wrapper + ");\n");
+        }
+        dispatch.Append("            return true;\n        }\n");
+        AddBodyInputs(method, inputs);
+        if (inputs.Count == 0) { return; }
+        docs.Append("        if (actionKey == " + key + ") {\n");
+        for (int i = 0; i < inputs.Count; i++) {
+            RouteInput input = inputs[i];
+            docs.Append("            route.Param(" + Quote(input.Name) + ", " + Quote(input.Type) + ", "
+                + (input.Required ? "true" : "false") + ", " + Quote(input.DefaultValue) + ", "
+                + Quote(input.Description) + ", " + Quote(input.Source) + ");\n");
+        }
+        docs.Append("            return;\n        }\n");
+    }
+}

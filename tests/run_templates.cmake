@@ -1,7 +1,7 @@
 # Compile-checks every project template the New Project wizard can scaffold.
 #
 #   cmake -DZANC=<zanc> -DTEMPLATES=<templates dir> -DWORK=<scratch dir>
-#         [-DSTDLIB=<stdlib dir>] [-DEXE_EXT=.exe]
+#         [-DSTDLIB=<stdlib dir>] [-DEXE_EXT=.exe] [-DMVC_TOOL=<zan-mvc>]
 #         [-DFILTER=^gui/] [-DCOMPILE_TIMEOUT=600] -P run_templates.cmake
 #
 # FILTER is a case-sensitive CMake regular expression matched against the
@@ -232,6 +232,17 @@ foreach(_proj IN LISTS _selected)
   else()
     list(APPEND _args --auto-stdlib)
   endif()
+  if(_manifest MATCHES "(^|[;\r\n])[ \t]*gen[.]embed[ \t]*=[ \t]*([^;\r\n]*)")
+    string(REPLACE "," ";" _resources "${CMAKE_MATCH_2}")
+    foreach(_resource IN LISTS _resources)
+      string(STRIP "${_resource}" _resource)
+      if(_resource STREQUAL "")
+        continue()
+      endif()
+      string(REPLACE "{{NAME}}" "${NAME}" _resource "${_resource}")
+      list(APPEND _args --embed "${_out}/${_resource}=${_resource}")
+    endforeach()
+  endif()
   if(_target STREQUAL "dll")
     set(_artifact ${_out}/out.dll)
     list(APPEND _args --emit-lib)
@@ -249,9 +260,18 @@ foreach(_proj IN LISTS _selected)
     endif()
   endif()
 
+  set(_compiler ${ZANC})
+  if(_manifest MATCHES "(^|[;\r\n])[ \t]*mvcRoutes[ \t]*=[ \t]*([^;\r\n]*)")
+    string(STRIP "${CMAKE_MATCH_2}" _mvc_mode)
+    if(NOT MVC_TOOL)
+      get_filename_component(_compiler_dir "${ZANC}" DIRECTORY)
+      set(MVC_TOOL "${_compiler_dir}/zan-mvc${EXE_EXT}")
+    endif()
+    set(_compiler ${MVC_TOOL} ${ZANC} ${_mvc_mode})
+  endif()
   template_result("running" "compiler started")
   execute_process(
-    COMMAND ${ZANC} ${_srcs} -o ${_artifact} ${_args}
+    COMMAND ${_compiler} ${_srcs} -o ${_artifact} ${_args}
     TIMEOUT "${COMPILE_TIMEOUT}"
     RESULT_VARIABLE _rc
     OUTPUT_FILE "${_out}/stdout.log"

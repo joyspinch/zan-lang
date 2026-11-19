@@ -42,13 +42,6 @@ UNDERSCORE_EXEMPT_DIRS = (
 MAX_NEW_FILE_LINES = 1200
 MAX_FUNCTION_LINES = 120
 
-# Package compiler-hook includes tolerated only until B-ID223/224 remove them;
-# anything else (incl. re-adding the removed Zan.Gui one) is rejected.
-COMPILER_PACKAGE_INCLUDE_ALLOWLIST = frozenset((
-    '#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"',
-))
-
-
 def strip_comments_and_strings(line: str) -> str:
     """Remove string literals and line comments from a single line of source code."""
     # Replace escaped quotes first
@@ -79,7 +72,7 @@ def check_double_underscore(rel_path: str, line_num: int, raw_line: str, strippe
         # Exclude common markdown fences or header separators if accidentally matched
         if m.startswith("___"):
             continue
-        # Exclude compiler-synthesized route registration intrinsic and runtime decimal ABI
+        # Keep the legacy MVC registration name and runtime decimal ABI.
         if m == "__AttrRoutes" or (norm_path.startswith("stdlib/System/Decimal.zan") and m.startswith("__zan_decimal_")):
             continue
         return (
@@ -119,8 +112,6 @@ def check_compiler_package_include(rel_path: str, line_num: int, raw_line: str, 
     if not re.match(r'^\s*#include\s+"\.\./\.\./packages/', line_no_comment):
         return None
     inc = line_no_comment.strip()
-    if inc in COMPILER_PACKAGE_INCLUDE_ALLOWLIST:
-        return None
     return (
         f"src/compiler 严禁新增对 packages/*/compiler 钩子头的 #include ('{inc}')。\n"
         f"       包以 C 钩子编进 zanc 的通道已废除（B-ID222，2026-11-19 裁定）："

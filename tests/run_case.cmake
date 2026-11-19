@@ -35,6 +35,11 @@ endif()
 # the artifact is a pure function of the source, compiler, stdlib/packages and any
 # explicit Zan source arguments, so a target newer than all of them is reused.
 # STDLIB_STAMP is touched by the build whenever a stdlib or package source changes.
+set(_compiler ${ZANC})
+if(MVC_TOOL)
+  set(_compiler ${MVC_TOOL} ${ZANC} ${MVC_MODE})
+endif()
+
 function(zan_artifact_is_current out_var artifact)
   set(${out_var} FALSE PARENT_SCOPE)
   if(NOT EXISTS ${artifact})
@@ -43,7 +48,10 @@ function(zan_artifact_is_current out_var artifact)
   if(${SRC} IS_NEWER_THAN ${artifact})
     return()
   endif()
-  if(${ZANC} IS_NEWER_THAN ${artifact})
+  if("${ZANC}" IS_NEWER_THAN "${artifact}")
+    return()
+  endif()
+  if(MVC_TOOL AND "${MVC_TOOL}" IS_NEWER_THAN "${artifact}")
     return()
   endif()
   if(STDLIB_STAMP AND EXISTS ${STDLIB_STAMP} AND ${STDLIB_STAMP} IS_NEWER_THAN ${artifact})
@@ -71,7 +79,7 @@ endfunction()
 zan_artifact_is_current(_current ${OUT_EXE})
 if(NOT _current)
   execute_process(
-    COMMAND ${ZANC} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
+    COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
             --package-project ${WORKDIR}
     RESULT_VARIABLE compile_rc
     OUTPUT_VARIABLE compile_out

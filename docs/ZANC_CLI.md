@@ -232,6 +232,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--dump-ast` | — | 打印语法树后继续编译 |
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
+| `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 
 ### 2.4 打包（Packaging）

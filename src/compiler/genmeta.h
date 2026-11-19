@@ -3,6 +3,7 @@
 #define ZAN_GENMETA_H
 
 #include "arena.h"
+#include <stdbool.h>
 
 struct zan_ast_node;
 struct json_value;
@@ -11,7 +12,7 @@ struct zan_diag;
 char *zan_genmeta_export(struct zan_ast_node *unit);
 
 char *zan_genmeta_export_files(struct zan_ast_node *unit,
-                               struct zan_diag *diag);
+                               struct zan_diag *diag, bool bodies);
 
 struct zan_ast_node *zan_genmeta_find_call(struct zan_ast_node *unit, int id);
 

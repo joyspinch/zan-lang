@@ -39,7 +39,7 @@ class SdkStageTests(unittest.TestCase):
 
     def stage_fixture(self):
         build = self.base / "build"
-        names = ["zanc.exe", "zan-lsp.exe", "zan-dap.exe", "zanfmt.exe", "zandoc.exe", "ld.exe", "ld.lld.exe", "llvm-ar.exe",
+        names = ["zanc.exe", "zan-mvc.exe", "zan-lsp.exe", "zan-dap.exe", "zanfmt.exe", "zandoc.exe", "ld.exe", "ld.lld.exe", "llvm-ar.exe",
                  "zanrt_timer.obj", "zanrt_io.obj", "zanrt_io_mt.obj", "zanrt_sync.obj", "zanrt_file.obj", "zanrt_decimal.obj",
                  "zan_embed_api.obj", "zan_inflate.obj", "libzancrypto.a"]
         names += ["mingw/lib/" + n for n in ("crt2.o", "libmingw32.a", "libkernel32.a")]

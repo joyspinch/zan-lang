@@ -55,6 +55,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     bool do_dump_ast = false;
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
     const char *gen_meta_path = NULL;
+    bool gen_meta_bodies = false;
     bool do_emit_ir = false;
     int check_leaks_opt = -1;
     bool checked_arith = false; /* B-ID76：--checked 全局算术溢出守卫 */
@@ -128,6 +129,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
             gen_meta_path = argv[++i];
+        } else if (strcmp(argv[i], "--gen-meta-bodies") == 0) {
+            gen_meta_bodies = true;
         } else if (strcmp(argv[i], "--emit-ir") == 0) {
             do_emit_ir = true;
         } else if (strcmp(argv[i], "--check-leaks") == 0) {
@@ -453,6 +456,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->do_dump_ast = do_dump_ast;
     opts->emit_symbols_path = emit_symbols_path;
     opts->gen_meta_path = gen_meta_path;
+    opts->gen_meta_bodies = gen_meta_bodies;
     opts->do_emit_ir = do_emit_ir;
     opts->check_leaks_opt = check_leaks_opt;
     opts->checked_arith = checked_arith;

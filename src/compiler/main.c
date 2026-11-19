@@ -11,7 +11,6 @@
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
-#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 #include "irgen.h"
 #include "optimizer.h"
 #include "crosscomp.h"
@@ -631,6 +630,7 @@ int main(int argc, char **argv) {
     bool do_dump_ast = opts.do_dump_ast;
     const char *emit_symbols_path = opts.emit_symbols_path;
     const char *gen_meta_path = opts.gen_meta_path;
+    bool gen_meta_bodies = opts.gen_meta_bodies;
     bool do_emit_ir = opts.do_emit_ir;
     int check_leaks_opt = opts.check_leaks_opt;
     bool checked_arith = opts.checked_arith;

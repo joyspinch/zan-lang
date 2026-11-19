@@ -157,7 +157,21 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
     }
 }
 
-static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
+static zan_walk_action_t gm_export_body_expr(zan_ast_node_t *node, void *output) {
+    if (node->kind == AST_CALL) {
+        json_arr_add(output, gm_expr_tree(node));
+    } else if (node->kind == AST_TYPEOF_EXPR) {
+        char name[256];
+        gm_type_str(node->cast.type, name, sizeof(name));
+        json_value *expr = json_new_obj();
+        json_obj_set(expr, "k", json_new_str("typeof"));
+        json_obj_set(expr, "t", json_new_str(name));
+        json_arr_add(output, expr);
+    }
+    return ZAN_WALK_CONTINUE;
+}
+
+static void gm_export_type(zan_ast_node_t *decl, json_value *classes, bool bodies) {
     json_value *o = json_new_obj();
     switch (decl->kind) {
     case AST_CLASS_DECL:
@@ -190,6 +204,10 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
         if (decl_orig.len)
             json_obj_set(o, "orig", json_new_str(
                 decl_orig.str ? (const char *)decl_orig.str : ""));
+        if (bodies) {
+            json_obj_set(o, "from_package", json_new_bool(decl->from_package));
+            json_obj_set(o, "from_stdlib", json_new_bool(decl->from_stdlib));
+        }
         json_obj_set(o, "file", json_new_num((double)decl->loc.file_id));
         json_obj_set(o, "line", json_new_num((double)decl->loc.line));
         json_value *bases = json_new_arr();
@@ -295,6 +313,11 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 json_value *ma = json_new_arr();
                 gm_attrs_json(zan_ast_attributes(m), ma);
                 json_obj_set(mm, "attrs", ma);
+                if (bodies && m->method_decl.body) {
+                    json_value *expressions = json_new_arr();
+                    zan_ast_walk(m->method_decl.body, gm_export_body_expr, NULL, expressions);
+                    json_obj_set(mm, "body_expressions", expressions);
+                }
                 json_arr_add(methods, mm);
                 if (m->kind == AST_CONSTRUCTOR_DECL) {
                     json_value *co = json_new_obj();
@@ -632,7 +655,7 @@ int zan_genmeta_index_calls(zan_ast_node_t *unit, zan_ast_node_t **nodes,
     return f.seen;
 }
 
-static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
+static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag, bool bodies) {
     if (!unit) return NULL;
     json_value *root = json_new_obj();
     json_obj_set(root, "version", json_new_num(1));
@@ -648,7 +671,7 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
 
     json_value *classes = json_new_arr();
     for (int i = 0; i < unit->comp_unit.decls.count; i++)
-        gm_export_type(unit->comp_unit.decls.items[i], classes);
+        gm_export_type(unit->comp_unit.decls.items[i], classes, bodies);
     json_obj_set(root, "classes", classes);
 
     int expr_count = 0;
@@ -708,11 +731,11 @@ static char *gm_export(zan_ast_node_t *unit, zan_diag_t *diag) {
 }
 
 char *zan_genmeta_export(zan_ast_node_t *unit) {
-    return gm_export(unit, NULL);
+    return gm_export(unit, NULL, false);
 }
 
-char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag) {
-    return gm_export(unit, diag);
+char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag, bool bodies) {
+    return gm_export(unit, diag, bodies);
 }
 
 

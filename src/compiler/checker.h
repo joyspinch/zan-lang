@@ -5,7 +5,6 @@
 #include "zan.h"
 #include "ast.h"
 #include "binder.h"
-#include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 
 struct checker_local;
 struct checker_byref_parameter;
@@ -24,7 +23,6 @@ struct zan_checker {
     int lambda_depth;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
-    zan_mvc_route_state_t mvc_routes;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次

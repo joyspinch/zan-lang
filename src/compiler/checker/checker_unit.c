@@ -478,7 +478,6 @@ static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
 static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file_id) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
-    zan_mvc_collect_controllers(&c->mvc_routes, unit, c->arena);
     check_all_struct_cycles(c, unit);
 
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {

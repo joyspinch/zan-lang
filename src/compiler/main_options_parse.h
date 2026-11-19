@@ -31,6 +31,7 @@ typedef struct zan_options {
     bool do_dump_ast;
     const char *emit_symbols_path;
     const char *gen_meta_path;
+    bool gen_meta_bodies;
     bool do_emit_ir;
     int check_leaks_opt;
     bool checked_arith;

@@ -622,8 +622,6 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
                     ps->items[0]->param.is_this) is_ext_host = true;
             }
             if (is_ext_host) kept[i] = 1;
-
-            if (zan_mvc_keep_namespace_decl(d)) kept[i] = 1;
         }
     }
 

@@ -89,6 +89,7 @@ void print_usage(void) {
     fprintf(stderr, "    --emit-ir       Emit LLVM IR to stdout and exit without linking\n");
     fprintf(stderr, "    --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
     fprintf(stderr, "    --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
+    fprintf(stderr, "    --gen-meta-bodies  Include calls and typeof expressions in method metadata\n");
     fprintf(stderr, "    --api <symbol>   Query member signatures and types from API index\n");
     fprintf(stderr, "  Packaging:\n");
     fprintf(stderr, "    --emit-apk <f>   Build an Android APK (requires --target android-x64|android-arm64):\n");

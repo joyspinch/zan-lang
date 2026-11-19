@@ -93,7 +93,7 @@ views/Admin/Lic/                  管理界面视图
 ```powershell
 New-Item -ItemType Directory -Force build | Out-Null
 $sources = Get-ChildItem src -Recurse -Filter *.zan | ForEach-Object { $_.FullName }
-zanc @sources --auto-stdlib -o build/licensing_server.exe
+zan-mvc zanc app @sources --auto-stdlib -o build/licensing_server.exe
 .\build\licensing_server.exe      # 从项目根运行，config/views/wwwroot 按相对路径解析
 ```
 

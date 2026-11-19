@@ -70,7 +70,7 @@ if (-not (Test-Path -LiteralPath $buildFull)) {
 # build\ 根里必须留下的东西。分类写清楚，改的人能一眼看出为什么。
 $keepExe = @(
     # 真产物（编译器 / 语言服务 / 调试适配器 / IDE）
-    'zanc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zan-pm.exe', 'ZanIDE.exe',
+    'zanc.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zan-pm.exe', 'ZanIDE.exe',
     # 工具链：publish_ide.ps1 / stage_dev_toolchain.ps1 要往 dist 里拷
     'ld.lld.exe', 'ld.exe',
     # 脚本产出的工具（build_repomap / gen_knowledge / build_mge / ...）

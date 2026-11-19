@@ -1,4 +1,4 @@
-# publish_ide.ps1 -- Assemble a self-contained, redistributable Zan IDE into
+﻿# publish_ide.ps1 -- Assemble a self-contained, redistributable Zan IDE into
 # the per-platform release directory  dist\win-x64  (other platforms get their
 # own dist\<platform> when their builds exist, e.g. dist\linux-x64).
 #
@@ -171,6 +171,7 @@ Contents
                  wins, which is how you override one without a rebuild.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
+                   zan-mvc.exe             MVC route generator
                    zan-lsp.exe             language server (for external editors)
                    zan-dap.exe             debug adapter (for external editors)
                    zanfmt/zandoc           format / doc CLIs
@@ -286,6 +287,7 @@ Zan IDE 自包含发布包
                  这就是不重新打包就替换它们的办法。
   toolchain\     Zan 编译器及其链接所需的一切，全部作为同目录的兄弟文件平铺：
                    zanc.exe                编译器
+                   zan-mvc.exe             MVC 路由生成工具
                    zan-lsp.exe             语言服务器（供外部编辑器）
                    zan-dap.exe             调试适配器（供外部编辑器）
                    zanfmt.exe / zandoc.exe 格式化 / 文档生成命令行

@@ -25,7 +25,7 @@ typedef struct pi_file {
     pi_name_t **idents; int ident_count, ident_cap;
     char **usings; int using_count, using_cap;
     int has_ext;
-    int has_controller;         /* 控制器/路由/表等生成器实体 */
+    int has_test;
     int pkg_src;
     int gate_live;
     int included;
@@ -186,6 +186,7 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
     f->idents = NULL; f->ident_count = 0; f->ident_cap = 0;
     f->usings = NULL; f->using_count = 0; f->using_cap = 0;
     f->has_ext = 0;
+    f->has_test = 0;
     f->pkg_src = 0;
     f->included = 0;
     f->parsed = 0;
@@ -471,11 +472,9 @@ static void pi_scan_file(pi_file_t *f) {
                                prev == TK_RBRACE || prev == TK_LBRACE ||
                                prev == TK_RBRACKET)) {
                 zan_token_t next = zan_lexer_peek(&lex);
-                if (next.kind == TK_IDENT) {
-                    if (zan_mvc_is_route_pullin_attribute(next.str_val) ||
-                        (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0)) {
-                        f->has_controller = 1;
-                    }
+                if (next.kind == TK_IDENT && next.str_val.len == 4 &&
+                    memcmp(next.str_val.str, "Test", 4) == 0) {
+                    f->has_test = 1;
                 }
             }
             break;
@@ -508,9 +507,6 @@ static void pi_scan_file(pi_file_t *f) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
                     tok = zan_lexer_next(&lex);
-                    if (zan_mvc_has_controller_suffix(tok.str_val)) {
-                        f->has_controller = 1;
-                    }
                     pi_name_t *name = pi_intern(tok.str_val.str,
                                                 tok.str_val.len);
                     if (name &&
@@ -578,11 +574,6 @@ static void pi_scan_file(pi_file_t *f) {
             }
             pi_name_t *cur_id = pi_intern(tok.str_val.str,
                                           tok.str_val.len);
-            if (prev == TK_COLON) {
-                if (zan_mvc_has_controller_suffix(tok.str_val)) {
-                    f->has_controller = 1;
-                }
-            }
             if (prev != TK_DOT) last_id = cur_id;
             pi_flag_ident(f, tok.str_val.str, tok.str_val.len);
             if (prev == TK_DOT && last_id && last_id->len == 4 &&

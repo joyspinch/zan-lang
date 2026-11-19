@@ -153,9 +153,6 @@ llvm_map_components_to_libnames(LLVM_LIBS ${ZAN_LLVM_COMPONENTS})
 add_executable(zanc
     src/compiler/main.c
     src/compiler/main_options_parse.c
-    packages/Zan.Mvc/compiler/mvc_routes.c
-    packages/Zan.Mvc/compiler/mvc_synth.c
-    packages/Zan.Mvc/compiler/mvc_reflect.c
     src/compiler/arena.c
     src/compiler/diag.c
     src/compiler/lexer.c
@@ -849,7 +846,6 @@ endif()
 # Reuses the compiler front-end (no LLVM dependency) plus the intellisense
 # engine to serve the Language Server Protocol over stdio.
 add_executable(zan-lsp
-    packages/Zan.Mvc/compiler/mvc_routes.c
     src/lsp/lsp_main.c
     src/compiler/nsresolve.c
     src/common/json.c
@@ -3193,6 +3189,15 @@ add_custom_command(OUTPUT ${_stdlib_stamp}
   COMMENT "Stamping stdlib and package sources for the test suite")
 add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
 
+set(_mvc_tool ${CMAKE_BINARY_DIR}/zan-mvc${_exe_ext})
+file(GLOB _mvc_tools CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/tools/*.zan)
+add_custom_command(OUTPUT ${_mvc_tool}
+  COMMAND $<TARGET_FILE:zanc> ${_mvc_tools} --auto-stdlib --codegen-level 0 -o ${_mvc_tool}
+  DEPENDS zanc ${_mvc_tools} ${_stdlib_stamp}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  VERBATIM)
+add_custom_target(zan_mvc_tool ALL DEPENDS ${_mvc_tool})
+
 # AI outbound targets are an exact allowlist, not an arbitrary URL setting.
 # Keep this policy test independent of GUI availability and real providers.
 add_test(NAME policy_server_mvc_ai_endpoint
@@ -3225,16 +3230,28 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
                   security_http_policy verify_code_issuance permission_branches security_csp
                   admin_gate geo_sources data_grant startup_hooks route_verbs)
+  set(_mvc_args "")
+  if(_mvc_case MATCHES "^(admin_gate|security_routes)$")
+    set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=framework)
+  elseif(_mvc_case MATCHES "^(permission_branches|route_verbs)$")
+    set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=app)
+  endif()
   add_test(NAME server_mvc_${_mvc_case}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.zan
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_${_mvc_case}${_exe_ext}
+      ${_mvc_args}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(server_mvc_${_mvc_case} PROPERTIES TIMEOUT 180
+  set(_mvc_timeout 180)
+  if(_mvc_args)
+    # Route generation adds a metadata pass before the executable build.
+    set(_mvc_timeout 360)
+  endif()
+  set_tests_properties(server_mvc_${_mvc_case} PROPERTIES TIMEOUT ${_mvc_timeout}
     LABELS "full;standard;smoke")
 endforeach()
 
@@ -3685,12 +3702,19 @@ foreach(_src ${_conf_srcs})
     set(_case_strict_args ";-g;--strict-runtime;--check-leaks;--arc-guard")
     set(_case_workdir_arg "-DWORKDIR=${CMAKE_SOURCE_DIR}")
   endif()
+  set(_mvc_args "")
+  if(_name STREQUAL "web_framework_dispatch")
+    set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=framework)
+  elseif(_name MATCHES "^web_(api_docs|app_dispatch_identity|controller_origin|list_protocol|menu_attrs|mvc_base_routes|typed_binding)$")
+    set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=app)
+  endif()
   add_test(NAME case_${_name}
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DEXPECTED=${_expected}
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/case_${_name}${_exe_ext}
+      ${_mvc_args}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}${_case_strict_args}"
       ${_case_workdir_arg}
@@ -3749,9 +3773,15 @@ foreach(_src ${_conf_srcs})
       -DSRC=${_src}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DDET_STAMP=${CMAKE_BINARY_DIR}/cases/det/${_name}.stamp
+      ${_mvc_args}
       "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case_modes.cmake)
-  set_tests_properties(case_det_${_name} PROPERTIES TIMEOUT 180)
+  set(_det_timeout 180)
+  if(_mvc_args)
+    # MVC runs a metadata pass before each of the two IR builds.
+    set(_det_timeout 600)
+  endif()
+  set_tests_properties(case_det_${_name} PROPERTIES TIMEOUT ${_det_timeout})
 endforeach()
 
 # B-ID85 钉子的标量强制变体：ZAN_NO_HWACCEL=1 关掉全部硬件加速，SM4 走

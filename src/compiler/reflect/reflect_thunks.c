@@ -198,9 +198,6 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
     }
     char mattrbuf[4096];
     refl_pack_attrs(decl ? zan_ast_attributes(decl) : NULL, mattrbuf, sizeof(mattrbuf));
-    if (decl && decl->kind == AST_METHOD_DECL) {
-        zan_mvc_append_method_params(g->binder, decl, mattrbuf, sizeof(mattrbuf));
-    }
     LLVMValueRef mattrs = refl_const_string(g, mattrbuf, (int)strlen(mattrbuf));
     return LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
         refl_const_string(g, msym->name.str, (int)msym->name.len),
