@@ -488,6 +488,7 @@ static void refl_project_member_metadata(zan_irgen_t *g) {
     if (!(queries & ZAN_REFL_QUERY_METHOD_RETURN)) methods |= 1u << 1;
     if (!(queries & ZAN_REFL_QUERY_METHOD_PARAMS)) methods |= 1u << 4;
     if (!(queries & ZAN_REFL_QUERY_METHOD_ATTRS)) methods |= 1u << 7;
+    if (!(queries & ZAN_REFL_QUERY_METHOD_DECLATTRS)) methods |= 1u << 8;
     if (!(queries & ZAN_REFL_QUERY_CTOR_PARAMS)) ctors |= 1u << 4;
     for (int i = 0; i < g->refl_meta_count; i++) {
         LLVMValueRef gv = g->refl_metas[i].gv;
@@ -497,12 +498,12 @@ static void refl_project_member_metadata(zan_irgen_t *g) {
         for (unsigned j = 0; j < 15; j++)
             values[j] = LLVMGetAggregateElement(init, j);
         refl_project_member_table(g, values[9], refl_field_type(g), 9, fields);
-        refl_project_member_table(g, values[3], refl_method_type(g), 8, methods);
+        refl_project_member_table(g, values[3], refl_method_type(g), 9, methods);
         if (!g->refl_ctor_used && !(queries & ZAN_REFL_QUERY_CTORS)) {
             values[5] = LLVMConstNull(LLVMTypeOf(values[5]));
             values[6] = LLVMConstNull(LLVMTypeOf(values[6]));
         } else {
-            refl_project_member_table(g, values[5], refl_method_type(g), 8, ctors);
+            refl_project_member_table(g, values[5], refl_method_type(g), 9, ctors);
         }
         LLVMSetInitializer(gv, LLVMConstNamedStruct(LLVMGlobalGetValueType(gv), values, 15));
     }

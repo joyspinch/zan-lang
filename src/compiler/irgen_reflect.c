@@ -38,6 +38,7 @@
 #define ZAN_REFL_MF_VIRTUAL  2
 #define ZAN_REFL_MF_PROPGET  4
 #define ZAN_REFL_MF_PROPSET  8
+#define ZAN_REFL_MF_DECLATTRS 16 /* compact table has a declared-attribute ID for this row */
 
 #define ZAN_REFL_TBL_METHOD  0
 #define ZAN_REFL_TBL_CTOR    1
@@ -47,6 +48,7 @@
 #define ZAN_REFL_MW_RET      1
 #define ZAN_REFL_MW_PARAM    2
 #define ZAN_REFL_MW_ATTRS    3
+#define ZAN_REFL_MW_DECLATTRS 4
 
 /* `which` selector of __zan_refl_mi64 */
 #define ZAN_REFL_MI_COUNT    0

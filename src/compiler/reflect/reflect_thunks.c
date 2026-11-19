@@ -209,7 +209,8 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
         refl_param_names(g, &decl->method_decl.params),
         thunk,
         LLVMConstInt(i64, (unsigned long long)flags, 0),
-        mattrs }, 8);
+        mattrs,
+        zan_ast_attributes_const(decl)->count ? refl_declared_attrs(g, decl) : LLVMConstNull(i8ptr) }, 9);
 }
 
 static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
@@ -362,7 +363,7 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
             refl_param_names(g, NULL),
             thunk,
             LLVMConstInt(i64, 0, 0),
-            refl_empty_string(g) }, 8);
+            refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
     }
     if (late) {
         for (int i = 0; i < g->ctor_count; i++) {
@@ -382,7 +383,7 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
         refl_param_names(g, &decl->method_decl.params),
         thunk,
         LLVMConstInt(i64, 0, 0),
-        refl_empty_string(g) }, 8);
+        refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 }
 
 typedef struct {
@@ -475,7 +476,7 @@ static LLVMValueRef refl_builtin_list_ctor_record(zan_irgen_t *g,
         refl_const_string(g, ".ctor", 5), refl_field_type_name(g, t),
         LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), LLVMConstInt(i64, 0, 0),
         LLVMConstNull(i8ptr), thunk,
-        LLVMConstInt(i64, 0, 0), refl_empty_string(g) }, 8);
+        LLVMConstInt(i64, 0, 0), refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 }
 
 static LLVMValueRef refl_emit_ctor_builtin_list(zan_irgen_t *g, zan_type_t *t) {
@@ -718,7 +719,7 @@ static LLVMValueRef refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t
         LLVMConstNull(i8ptr),
         count_thunk,
         LLVMConstInt(i64, 0, 0),
-        refl_empty_string(g) }, 8);
+        refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 
     /* 1: Get(int index) -> elem_type */
     recs[1] = LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
@@ -729,7 +730,7 @@ static LLVMValueRef refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t
         param_names_ptr,
         get_thunk,
         LLVMConstInt(i64, 0, 0),
-        refl_empty_string(g) }, 8);
+        refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 
     /* 2: At(int index) -> elem_type */
     recs[2] = LLVMConstNamedStruct(mrec, (LLVMValueRef[]){
@@ -740,7 +741,7 @@ static LLVMValueRef refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t
         param_names_ptr,
         get_thunk,
         LLVMConstInt(i64, 0, 0),
-        refl_empty_string(g) }, 8);
+        refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 
     LLVMValueRef value_name = refl_field_type_name(g, elem_type);
     snprintf(pnm, sizeof(pnm), "__zan.refl.pnames.list.%d", g->refl_str_count++);
@@ -753,7 +754,7 @@ static LLVMValueRef refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t
         refl_field_type_name(g, g->binder->type_void),
         LLVMConstInt(i64, (unsigned long long)refl_field_kind(g->binder->type_void), 0),
         LLVMConstInt(i64, 1, 0), LLVMConstGEP2(pat, vgv, pidx, 2),
-        add_thunk, LLVMConstInt(i64, 0, 0), refl_empty_string(g) }, 8);
+        add_thunk, LLVMConstInt(i64, 0, 0), refl_empty_string(g), LLVMConstNull(i8ptr) }, 9);
 
     LLVMTypeRef arr_ty = LLVMArrayType(mrec, 4);
     char nm[96];

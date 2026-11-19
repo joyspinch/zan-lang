@@ -329,8 +329,8 @@ static LLVMTypeRef refl_method_type(zan_irgen_t *g) {
     if (!g->refl_method_type) {
         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-        LLVMTypeRef elems[8] = { i8ptr, i8ptr, i64, i64, i8ptr, i8ptr, i64, i8ptr };
-        g->refl_method_type = LLVMStructTypeInContext(g->ctx, elems, 8, 0);
+        LLVMTypeRef elems[] = { i8ptr, i8ptr, i64, i64, i8ptr, i8ptr, i64, i8ptr, i8ptr };
+        g->refl_method_type = LLVMStructTypeInContext(g->ctx, elems, 9, 0);
     }
     return g->refl_method_type;
 }

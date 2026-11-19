@@ -88,6 +88,9 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
 
     LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef table = LLVMAppendBasicBlockInContext(g->ctx, fn, "table");
+    LLVMBasicBlockRef decl  = LLVMAppendBasicBlockInContext(g->ctx, fn, "declattrs");
+    LLVMBasicBlockRef dload = LLVMAppendBasicBlockInContext(g->ctx, fn, "declload");
     LLVMBasicBlockRef have  = LLVMAppendBasicBlockInContext(g->ctx, fn, "have");
     LLVMBasicBlockRef par   = LLVMAppendBasicBlockInContext(g->ctx, fn, "param");
     LLVMBasicBlockRef own   = LLVMAppendBasicBlockInContext(g->ctx, fn, "own");
@@ -100,6 +103,9 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
     LLVMValueRef k = LLVMGetParam(fn, 4);
 
     LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMBuildCondBr(g->builder, LLVMBuildIsNull(g->builder, ti, "refl.noti"), bad, table);
+
+    LLVMPositionBuilderAtEnd(g->builder, table);
     LLVMValueRef arr = NULL, count = NULL;
     refl_table_of(g, ti, tbl, &arr, &count);
     LLVMValueRef ok = LLVMBuildAnd(g->builder,
@@ -111,10 +117,21 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
 
     LLVMPositionBuilderAtEnd(g->builder, have);
     LLVMValueRef rec = refl_member_row(g, arr, idx, true);
+    LLVMValueRef select = LLVMBuildSwitch(g->builder, which, own, 2);
+    LLVMAddCase(select, LLVMConstInt(i64, ZAN_REFL_MW_PARAM, 0), par);
+    LLVMAddCase(select, LLVMConstInt(i64, ZAN_REFL_MW_DECLATTRS, 0), decl);
+
+    LLVMPositionBuilderAtEnd(g->builder, decl);
+    LLVMValueRef flags = refl_method_int(g, rec, ZAN_REFL_MO_FLAGS);
+    LLVMValueRef attr_flag = LLVMBuildAnd(g->builder, flags,
+        LLVMConstInt(i64, ZAN_REFL_MF_DECLATTRS, 0), "refl.attrflag");
     LLVMBuildCondBr(g->builder,
-        LLVMBuildICmp(g->builder, LLVMIntEQ, which,
-                      LLVMConstInt(i64, ZAN_REFL_MW_PARAM, 0), "refl.isp"),
-        par, own);
+        LLVMBuildICmp(g->builder, LLVMIntNE, attr_flag, LLVMConstInt(i64, 0, 0), "refl.hasattrs"),
+        dload, bad);
+
+    LLVMPositionBuilderAtEnd(g->builder, dload);
+    LLVMValueRef attr_idx = LLVMBuildAdd(g->builder, count, idx, "refl.attridx");
+    LLVMBuildRet(g->builder, refl_payload_ptr(g, arr, refl_table_id(g, arr, attr_idx)));
 
     LLVMPositionBuilderAtEnd(g->builder, own);
     LLVMValueRef sel = LLVMBuildSelect(g->builder,
@@ -127,7 +144,7 @@ static LLVMValueRef refl_mstr_fn(zan_irgen_t *g) {
             LLVMConstInt(i64, 1, 0),
             LLVMConstInt(i64, 4, 0), "refl.sel2"),
         "refl.sel");
-    LLVMValueRef sv = refl_member_ptr(g, arr, rec, true, sel);
+    LLVMValueRef sv = refl_member_ptr(g, arr, rec, sel);
     LLVMBuildRet(g->builder, LLVMBuildSelect(g->builder,
         LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.s"));
 

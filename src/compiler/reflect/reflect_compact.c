@@ -23,14 +23,20 @@ static LLVMTypeRef refl_compact_table_type(zan_irgen_t *g, unsigned n) {
         LLVMArrayType(LLVMInt32TypeInContext(g->ctx), n) }, 3, 0);
 }
 
-/* The caller checks index bounds/table presence before emitting this load. */
-static LLVMValueRef refl_member_row(zan_irgen_t *g, LLVMValueRef table,
-                                    LLVMValueRef idx, bool method) {
+/* After the row IDs, method tables may carry one attribute payload ID per row.
+ * Only rows with ZAN_REFL_MF_DECLATTRS can read that optional column. */
+static LLVMValueRef refl_table_id(zan_irgen_t *g, LLVMValueRef table, LLVMValueRef idx) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef header = refl_compact_table_type(g, 0);
     LLVMValueRef ids = LLVMBuildStructGEP2(g->builder, header, table, 2, "refl.ids");
     LLVMValueRef ip = LLVMBuildGEP2(g->builder, i32, ids, &idx, 1, "refl.idp");
-    LLVMValueRef id = LLVMBuildLoad2(g->builder, i32, ip, "refl.id");
+    return LLVMBuildLoad2(g->builder, i32, ip, "refl.id");
+}
+
+/* The caller checks index bounds/table presence before emitting this load. */
+static LLVMValueRef refl_member_row(zan_irgen_t *g, LLVMValueRef table,
+                                    LLVMValueRef idx, bool method) {
+    LLVMValueRef id = refl_table_id(g, table, idx);
     LLVMValueRef pool = refl_hdr_ptr(g, table, 0, "refl.pool");
     LLVMValueRef wide = LLVMBuildZExt(g->builder, id,
         LLVMInt64TypeInContext(g->ctx), "refl.id64");
@@ -48,26 +54,28 @@ static LLVMValueRef refl_member_u32(zan_irgen_t *g, LLVMValueRef row,
         LLVMInt64TypeInContext(g->ctx), "refl.u64");
 }
 
-static LLVMValueRef refl_member_ptr(zan_irgen_t *g, LLVMValueRef table,
-                                    LLVMValueRef row, bool method,
-                                    LLVMValueRef slot) {
-    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+static LLVMValueRef refl_payload_ptr(zan_irgen_t *g, LLVMValueRef table, LLVMValueRef id) {
     LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef header = refl_compact_table_type(g, 0);
     LLVMValueRef pp = LLVMBuildStructGEP2(g->builder, header, table, 1, "refl.vpp");
     LLVMValueRef pool = LLVMBuildLoad2(g->builder, ptr, pp, "refl.values");
-    LLVMValueRef idp = LLVMBuildGEP2(g->builder, i32, row, &slot, 1, "refl.vidp");
-    LLVMValueRef id = LLVMBuildZExt(g->builder,
-        LLVMBuildLoad2(g->builder, i32, idp, "refl.vid"),
+    LLVMValueRef wide = LLVMBuildZExt(g->builder, id,
         LLVMInt64TypeInContext(g->ctx), "refl.vid64");
-    LLVMValueRef p = LLVMBuildGEP2(g->builder, ptr, pool, &id, 1, "refl.valuep");
-    (void)method; /* All payload IDs precede the first non-i32 field. */
+    LLVMValueRef p = LLVMBuildGEP2(g->builder, ptr, pool, &wide, 1, "refl.valuep");
     return LLVMBuildLoad2(g->builder, ptr, p, "refl.value");
+}
+
+static LLVMValueRef refl_member_ptr(zan_irgen_t *g, LLVMValueRef table,
+                                    LLVMValueRef row, LLVMValueRef slot) {
+    /* All payload IDs precede the first non-i32 field. */
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef idp = LLVMBuildGEP2(g->builder, i32, row, &slot, 1, "refl.vidp");
+    return refl_payload_ptr(g, table, LLVMBuildLoad2(g->builder, i32, idp, "refl.vid"));
 }
 
 static LLVMValueRef refl_field_ptr(zan_irgen_t *g, LLVMValueRef table,
                                    LLVMValueRef row, unsigned slot) {
-    return refl_member_ptr(g, table, row, false,
+    return refl_member_ptr(g, table, row,
         LLVMConstInt(LLVMInt64TypeInContext(g->ctx), slot, 0));
 }
 
@@ -92,7 +100,7 @@ static unsigned refl_method_slot(int logical_off) {
 
 static LLVMValueRef refl_method_ptr(zan_irgen_t *g, LLVMValueRef table,
                                     LLVMValueRef row, int logical_off) {
-    return refl_member_ptr(g, table, row, true,
+    return refl_member_ptr(g, table, row,
         LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
                      refl_method_slot(logical_off), 0));
 }
@@ -289,12 +297,14 @@ static bool refl_compact_table(zan_irgen_t *g, LLVMValueRef source, bool method,
         return false;
     }
     unsigned n = LLVMGetArrayLength(type);
-    LLVMValueRef *ids = (LLVMValueRef *)calloc(n ? n : 1, sizeof(*ids));
+    LLVMValueRef *ids = (LLVMValueRef *)calloc(n ? (size_t)n * (method ? 2 : 1) : 1,
+                                               sizeof(*ids));
     if (!ids) return false;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef physical = refl_compact_row_type(g, method);
     const unsigned field_ptrs[] = {0, 1, 4, 6, 7, 8};
     const unsigned method_ptrs[] = {0, 1, 4, 5, 7};
+    bool has_declattrs = false;
     for (unsigned i = 0; i < n; i++) {
         LLVMValueRef row = LLVMGetAggregateElement(init, i);
         LLVMValueRef values[9];
@@ -321,7 +331,16 @@ static bool refl_compact_table(zan_irgen_t *g, LLVMValueRef source, bool method,
         if (method) {
             values[5] = LLVMConstTrunc(LLVMGetAggregateElement(row, 2), i32);
             values[6] = LLVMConstTrunc(LLVMGetAggregateElement(row, 3), i32);
-            values[7] = LLVMConstTrunc(LLVMGetAggregateElement(row, 6), i32);
+            unsigned flags = (unsigned)LLVMConstIntGetZExtValue(LLVMGetAggregateElement(row, 6));
+            LLVMValueRef attrs = LLVMGetAggregateElement(row, 8);
+            unsigned attr_id = 0;
+            if (!LLVMIsNull(attrs)) {
+                if (!refl_compact_intern(payloads, attrs, &attr_id)) goto fail;
+                flags |= ZAN_REFL_MF_DECLATTRS;
+                has_declattrs = true;
+            }
+            ids[n + i] = LLVMConstInt(i32, attr_id, 0);
+            values[7] = LLVMConstInt(i32, flags, 0);
         } else {
             values[6] = refl_compact_offset(g, LLVMGetAggregateElement(row, 3));
             values[7] = LLVMConstTrunc(LLVMGetAggregateElement(row, 2), i32);
@@ -332,13 +351,14 @@ static bool refl_compact_table(zan_irgen_t *g, LLVMValueRef source, bool method,
                 LLVMConstNamedStruct(physical, values, method ? 8 : 9), &id)) goto fail;
         ids[i] = LLVMConstInt(i32, id, 0);
     }
-    LLVMTypeRef table_type = refl_compact_table_type(g, n);
+    unsigned id_count = has_declattrs ? n * 2 : n;
+    LLVMTypeRef table_type = refl_compact_table_type(g, id_count);
     LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef pool = method ? g->refl_method_pool : g->refl_field_pool;
     *result = refl_compact_global(g, table_type,
         LLVMConstNamedStruct(table_type, (LLVMValueRef[]){
             LLVMConstBitCast(pool, ptr), LLVMConstBitCast(g->refl_value_pool, ptr),
-            LLVMConstArray(i32, ids, n) }, 3), "__zan.refl.compact.table");
+            LLVMConstArray(i32, ids, id_count) }, 3), "__zan.refl.compact.table");
     free(ids);
     return true;
 fail:

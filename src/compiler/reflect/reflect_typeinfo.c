@@ -136,6 +136,9 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     case ZAN_REFL_M_MATTRS:
         g->refl_query_used |= ZAN_REFL_QUERY_METHOD_ATTRS;
         break;
+    case ZAN_REFL_M_MDECLATTRS:
+        g->refl_query_used |= ZAN_REFL_QUERY_METHOD_DECLATTRS;
+        break;
     case ZAN_REFL_M_CCOUNT:
     case ZAN_REFL_M_CPCOUNT:
         g->refl_query_used |= ZAN_REFL_QUERY_CTORS;
@@ -177,10 +180,13 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     }
     case ZAN_REFL_M_MNAME:       /* GetMethodName / GetMethodReturnType / GetMethodCustomAttributes */
     case ZAN_REFL_M_MRET:
-    case ZAN_REFL_M_MATTRS: {
+    case ZAN_REFL_M_MATTRS:
+    case ZAN_REFL_M_MDECLATTRS: {
         LLVMValueRef idx = refl_arg_index(g, arg0, locals);
-        int mw = code == ZAN_REFL_M_MNAME ? ZAN_REFL_MW_NAME :
-                 (code == ZAN_REFL_M_MRET ? ZAN_REFL_MW_RET : ZAN_REFL_MW_ATTRS);
+        int mw = ZAN_REFL_MW_NAME;
+        if (code == ZAN_REFL_M_MRET) mw = ZAN_REFL_MW_RET;
+        if (code == ZAN_REFL_M_MATTRS) mw = ZAN_REFL_MW_ATTRS;
+        if (code == ZAN_REFL_M_MDECLATTRS) mw = ZAN_REFL_MW_DECLATTRS;
         *out = refl_mstr(g, ti, ZAN_REFL_TBL_METHOD, idx, mw,
             LLVMConstInt(i64, 0, 0));
         return true;

@@ -96,7 +96,8 @@ enum {
     ZAN_REFL_QUERY_FIELD_TYPE = 1u << 5,
     ZAN_REFL_QUERY_FIELD_DECLATTRS = 1u << 6,
     ZAN_REFL_QUERY_FIELD_TYPEINFO = 1u << 8,
-    ZAN_REFL_QUERY_FIELD_ATTRS = 1u << 9
+    ZAN_REFL_QUERY_FIELD_ATTRS = 1u << 9,
+    ZAN_REFL_QUERY_METHOD_DECLATTRS = 1u << 10
 };
 
 typedef struct zan_irgen_pending_scope {
