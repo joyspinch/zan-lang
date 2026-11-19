@@ -186,8 +186,8 @@ static bool zd_class_is_controller(zan_ast_node_t *unit, zan_ast_node_t *decl,
 
 /* 生成一条动作分支；返回 false 表示签名不可绑定（跳过该动作）。 */
 static bool zd_emit_action(zan_synth_buf_t *b, zan_ast_node_t *unit, zan_ast_node_t *m,
-                           const char *full, const char *view_owner,
-                           bool class_tx, bool class_ro) {
+                           const char *full, const char *type_ref,
+                           const char *view_owner, bool class_tx, bool class_ro) {
     if (!b->buf || !m || !full || !view_owner) return false;
     if (m->kind != AST_METHOD_DECL) return false;
     if (!m->method_decl.name.str || m->method_decl.name.len == 0) return false;
@@ -349,9 +349,9 @@ static bool zd_emit_action(zan_synth_buf_t *b, zan_ast_node_t *unit, zan_ast_nod
 
     if (is_static) {
         zan_synth_putf(b, "%s", binds);
-        zan_synth_putf(b, "            %s%s.%s(%s);\n", aw, full, mname, args);
+        zan_synth_putf(b, "            %s%s.%s(%s);\n", aw, type_ref, mname, args);
     } else {
-        zan_synth_putf(b, "            %s __c = new %s();\n", full, full);
+        zan_synth_putf(b, "            %s __c = new %s();\n", type_ref, type_ref);
         zan_synth_putf(b, "            __c.Bind(ctx);\n");
         zan_synth_putf(b, "            __c.SetView(\"%s.%s\");\n", view_owner, mname);
         if (ro) zan_synth_putf(b, "            __c.UseReadOnly();\n");
@@ -436,9 +436,8 @@ void zan_mvc_synthesize_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
 
             char full[512];
             zan_istr_t ns = zan_ast_ns_name(decl);
-            /* Both the next nsresolve pass and reflection's render_type_full use
-             * the rewritten identity. App and framework keys must both match
-             * TypeInfo.FullName, including namespace-qualified collision names. */
+            /* Routing keys match TypeInfo.FullName. Source references use the
+             * declared name so the next namespace pass can resolve collisions. */
             if (ns.len > 0 && ns.str)
                 snprintf(full, sizeof(full), "%.*s.%.*s", (int)ns.len, ns.str,
                          (int)decl->type_decl.name.len, decl->type_decl.name.str);
@@ -446,11 +445,18 @@ void zan_mvc_synthesize_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                 snprintf(full, sizeof(full), "%.*s", (int)decl->type_decl.name.len,
                          decl->type_decl.name.str);
 
+            zan_istr_t simple = zan_mvc_simple_name(decl);
+            char type_ref[512];
+            if (ns.len > 0 && ns.str)
+                snprintf(type_ref, sizeof(type_ref), "%.*s.%.*s", (int)ns.len, ns.str,
+                         (int)simple.len, simple.str);
+            else
+                snprintf(type_ref, sizeof(type_ref), "%.*s", (int)simple.len, simple.str);
+
             /* View.LoadRec keys use source namespace segments and file stems,
              * not reflection's collision identity. MVC views omit only the
              * conventional Zan.Web prefix and retain the Controller suffix. */
             zan_istr_t view_ns = ns;
-            zan_istr_t simple = zan_mvc_simple_name(decl);
             if (view_ns.len == 7 && memcmp(view_ns.str, "Zan.Web", 7) == 0)
                 view_ns.len = 0;
             else if (view_ns.len > 8 && memcmp(view_ns.str, "Zan.Web.", 8) == 0) {
@@ -472,7 +478,7 @@ void zan_mvc_synthesize_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                 if (!m || m->kind != AST_METHOD_DECL) continue;
                 if (m->method_decl.modifiers & MOD_PRIVATE) continue;
                 if (m->method_decl.modifiers & MOD_ABSTRACT) continue;
-                if (zd_emit_action(&b, unit, m, full, view_owner, class_tx, class_ro))
+                if (zd_emit_action(&b, unit, m, full, type_ref, view_owner, class_tx, class_ro))
                     emitted++;
                 else {
                     bool idx = false;

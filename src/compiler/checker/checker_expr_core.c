@@ -482,15 +482,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
-        zan_type_t *checked_receiver = NULL;
-        if (zan_data_orm_schema_candidate(c, expr)) {
-            zan_ast_node_t *callee = expr->call.callee;
-            checked_receiver = zan_checker_check_expr(c, callee->member.object);
-            if ((!checked_receiver || !checked_receiver->sym ||
-                 !checker_find_method_call(checked_receiver->sym, callee->member.name, 0, 0)) &&
-                zan_data_orm_lower_schema(c, expr, checked_receiver))
-                checked_receiver = NULL;
-        }
         zan_mvc_rewrite_route_call(&c->mvc_routes, expr, c->arena);
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
@@ -515,8 +506,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
-            recv = checked_receiver ? checked_receiver :
-                zan_checker_check_expr(c, expr->call.callee->member.object);
+            recv = zan_checker_check_expr(c, expr->call.callee->member.object);
             if (recv && recv->sym) {
                 zan_symbol_t *m = checker_find_method_call(
                     recv->sym, expr->call.callee->member.name,

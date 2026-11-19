@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Web;
 using Zan.Web.Model;
+using Zan.Web.Model.Blog;
+using Zan.Web.Services;
 using Zan.Web.Dao;
 using Zan.Web.Core;
 using Zan.Web.Security;
@@ -37,7 +39,7 @@ public class Schema {
 
     /* 创建/更新全部表并填充种子数据。数据库不可达或迁移失败时返回
        false，服务器仍启动（探活应答、日志记账，Boot 负责重试与告警）。*/
-    public static async bool Ensure(DbContext ctx) {
+    public static async bool Ensure(DbContext ctx, Meta[] appModels = null) {
         IDbConnection db = await ctx.Acquire();
         if (db == null) { return false; }
         try {
@@ -47,7 +49,7 @@ public class Schema {
                 /* 必须接住 Apply 的结果：种子失败要如实回报未就绪；
                    也绝不能用「await 后丢弃」的裸语句形态——协程改写会
                    丢掉外层返回值（编译器挂账），捕获形态无恙。 */
-                if (!await Apply(db)) { return false; }
+                if (!await Apply(db, appModels)) { return false; }
                 if (afterSchema != null && !await afterSchema(db)) { return false; }
                 return true;
             } finally {
@@ -68,11 +70,11 @@ public class Schema {
        种子。每一步都幂等，等待租约的 worker 轮到后重跑一遍是快速 no-op。
        WAL/CodeFirst/锁表是引导协议，留在引导连接上；种子查询走同一连接
        派生的 ZanSql 门面。*/
-    public static async bool Apply(IDbConnection db) {
+    public static async bool Apply(IDbConnection db, Meta[] appModels = null) {
         /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
         await DbSchema.UseWriteAheadLogAsync(db);
-        /* 编译期已知所有 [Table] 类，一行调用覆盖全部，新模型无需补行。*/
-        await db.SyncStructureAllAsync();
+        if (!await db.SyncStructureAllAsync(FrameworkModels())) { return false; }
+        if (!await db.SyncStructureAllAsync(appModels)) { return false; }
         await BackfillGenFlags(db);
 
         IZanSql fsql = ZanSql.FromConnection(db);
@@ -84,6 +86,38 @@ public class Schema {
         if (!await SeedJobs(fsql)) { return false; }
         if (!await RunSeed(fsql)) { return false; }
         return true;
+    }
+
+    private static Meta[] FrameworkModels() {
+        return new Meta[] {
+            Meta.For<SysDepartment>(),
+            Meta.For<SysDepartmentRole>(),
+            Meta.For<SysDictItem>(),
+            Meta.For<SysDictType>(),
+            Meta.For<SysGenColumn>(),
+            Meta.For<SysGenTable>(),
+            Meta.For<SysJob>(),
+            Meta.For<SysJobLog>(),
+            Meta.For<SysLoginLog>(),
+            Meta.For<SysMediaFile>(),
+            Meta.For<SysOperationLog>(),
+            Meta.For<SysRole>(),
+            Meta.For<SysRoleGrant>(),
+            Meta.For<SysSiteSetting>(),
+            Meta.For<SysUser>(),
+            Meta.For<SysUserRole>(),
+            Meta.For<SysUserScope>(),
+            Meta.For<SysWikiDoc>(),
+            Meta.For<SysWikiRevision>(),
+            Meta.For<SysWikiSpace>(),
+            Meta.For<Category>(),
+            Meta.For<Comment>(),
+            Meta.For<Post>(),
+            Meta.For<MetricError>(),
+            Meta.For<MetricLive>(),
+            Meta.For<MetricMinute>(),
+            Meta.For<MetricSql>()
+        };
     }
 
     /* ---- 迁移互斥租约：每个 worker 进程启动都会跑一遍 Ensure，

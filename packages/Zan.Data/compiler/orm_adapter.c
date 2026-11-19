@@ -14,11 +14,8 @@ struct zan_data_orm_state {
     zan_ast_node_t *unit;
     zan_ast_list_t entities;
     zan_symbol_t *connection;
-    zan_symbol_t *executor;
     zan_symbol_t *repository;
     zan_symbol_t *sql;
-    zan_symbol_t *extensions;
-    zan_symbol_t *meta;
 };
 
 static zan_istr_t istr(const char *text) {
@@ -86,16 +83,10 @@ void zan_data_orm_prepare(zan_checker_t *c, zan_ast_node_t *unit) {
     } types[] = {
         {"IDbConnection", "System.Data", "System/Data/IDbConnection.zan",
          AST_INTERFACE_DECL, &state.connection},
-        {"IDbExecutor", "System.Data", "System/Data/IDbExecutor.zan",
-         AST_INTERFACE_DECL, &state.executor},
         {"BaseRepository", "System.Data.Orm", "System/Data/Orm/BaseRepository.zan",
          AST_CLASS_DECL, &state.repository},
         {"ZanSql", "System.Data.Orm", "System/Data/Orm/ZanSql.zan",
          AST_CLASS_DECL, &state.sql},
-        {"DbExtensions", "System.Data.Orm", "System/Data/Orm/DbExtensions.zan",
-         AST_CLASS_DECL, &state.extensions},
-        {"Meta", "System.Data.Orm", "System/Data/Orm/Meta.zan",
-         AST_CLASS_DECL, &state.meta},
     };
     if (c->data_orm) return;
     const zan_ast_list_t *decls = &unit->comp_unit.decls;
@@ -113,7 +104,7 @@ void zan_data_orm_prepare(zan_checker_t *c, zan_ast_node_t *unit) {
             break;
         }
     }
-    if (!state.connection && !state.executor) return;
+    if (!state.connection) return;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *decl = decls->items[i];
         if (decl->kind == AST_CLASS_DECL && decl->type_decl.name.str &&
@@ -305,70 +296,6 @@ zan_type_t *zan_data_orm_try_accessor(zan_checker_t *c, zan_ast_node_t *expr,
                                           istr("FromConnection"), loc);
     zan_ast_list_push(&factory->call.args, conn, c->arena);
     return accessor_new(c, expr, ref, factory);
-}
-
-bool zan_data_orm_schema_candidate(const zan_checker_t *c,
-                                   const zan_ast_node_t *call) {
-    if (!c->data_orm || !c->data_orm->extensions || !c->data_orm->meta ||
-        !call->call.callee || call->call.callee->kind != AST_MEMBER_ACCESS ||
-        call->call.args.count || call->call.type_args.count) return false;
-    zan_istr_t name = call->call.callee->member.name;
-    return name_eq(name, istr("SyncStructureAll")) ||
-           name_eq(name, istr("SyncStructureAllAsync"));
-}
-
-static zan_ast_node_t *schema_table_array(zan_checker_t *c, zan_loc_t loc) {
-    struct zan_data_orm_state *state = c->data_orm;
-    zan_ast_node_t *ref = type_ref(c->arena, state->meta->name, loc);
-    ref->type_ref.is_array = true;
-    zan_ast_node_t *array = zan_ast_new(c->arena, AST_NEW_EXPR, loc);
-    array->new_expr.type = ref;
-    array->new_expr.is_array = true;
-    array->new_expr.array_init = true;
-    for (int i = 0; i < state->entities.count; i++) {
-        zan_ast_node_t *entity = state->entities.items[i];
-        zan_ast_node_t *call = member_call(c->arena,
-            type_receiver(c->arena, state->meta, loc), istr("For"), loc);
-        zan_ast_list_push(&call->call.type_args,
-                           type_ref(c->arena, entity->type_decl.name, loc), c->arena);
-        zan_ast_list_push(&array->new_expr.args, call, c->arena);
-    }
-    return array;
-}
-
-bool zan_data_orm_lower_schema(zan_checker_t *c, zan_ast_node_t *call,
-                               zan_type_t *receiver) {
-    struct zan_data_orm_state *state = c->data_orm;
-    if (!connection_matches(receiver, state->connection) &&
-        !connection_matches(receiver, state->executor)) return false;
-
-    zan_ast_node_t *old = call->call.callee;
-    bool package_overload = false;
-    for (int i = 0; i < c->binder->ext_method_count; i++) {
-        const zan_ext_method_t *entry = &c->binder->ext_methods[i];
-        zan_symbol_t *method = entry->method;
-        if (!name_eq(method->name, old->member.name)) continue;
-        zan_type_t *target = entry->recv_type;
-        bool matches = target->kind == TYPE_TYPE_PARAM || target->sym == receiver->sym ||
-            (target->kind == TYPE_INTERFACE &&
-             zan_binder_class_implements_iface(receiver->sym, target->sym));
-        if (!matches) continue;
-        /* An ordinary zero-argument extension takes precedence. */
-        if (method->member_count == 1) return false;
-        if (method->parent != state->extensions || method->member_count != 2 ||
-            !(method->modifiers & MOD_STATIC)) continue;
-        zan_type_t *metas = method->members[1]->type;
-        if (metas && metas->kind == TYPE_ARRAY && metas->element_type &&
-            metas->element_type->sym == state->meta) package_overload = true;
-    }
-    if (!package_overload) return false;
-
-    /* Use a static call to keep async calls on the normal overload/await path. */
-    call->call.callee = member_access(c->arena,
-        type_receiver(c->arena, state->extensions, call->loc), old->member.name, call->loc);
-    zan_ast_list_push(&call->call.args, old->member.object, c->arena);
-    zan_ast_list_push(&call->call.args, schema_table_array(c, call->loc), c->arena);
-    return true;
 }
 
 const char *zan_data_orm_reflect_table(const zan_symbol_t *symbol) {

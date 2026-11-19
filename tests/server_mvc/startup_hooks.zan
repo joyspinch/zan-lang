@@ -6,6 +6,17 @@ using System.IO;
 using Zan.Web.Core;
 using Zan.Web.Model;
 
+[Table("app_startup_entity")]
+class StartupEntity {
+    [Column(IsPrimary = true)]
+    public int id;
+}
+
+[Table("app_unregistered_entity")]
+class UnregisteredEntity {
+    public int id;
+}
+
 class Program {
     static int failures;
     static int mode;
@@ -51,6 +62,10 @@ class Program {
         string locks = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_lock WHERE name = 'schema'");
         string users = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE username = 'admin'");
         Program.Check(locks == "1" && users == "1", "after hook follows system seed and retains lease");
+        Program.Check(await DbSchema.TableExistsAsync(db, "app_startup_entity"),
+            "application entity migrated before the after hook");
+        Program.Check(!await DbSchema.TableExistsAsync(db, "app_unregistered_entity"),
+            "unregistered entity stays outside the migration");
         string builtinRoles = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code IN ('admin', 'editor') AND id > 50");
         Program.Check(builtinRoles == "2", "builtin roles added independently after custom roles with fresh identities");
         string bootstrap = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE username = 'admin' AND id > 1 AND isSuper = 1");
@@ -76,9 +91,10 @@ class Program {
         DbContext ctx = DbContext.Of(pool);
         Boot.OnBeforeSchema(Program.BeforeSchema);
         Boot.OnAfterSchema(Program.AfterSchema);
+        Meta[] appModels = new Meta[] { Meta.For<StartupEntity>() };
         try {
             Program.mode = 0;
-            bool ready = await Schema.Ensure(ctx);
+            bool ready = await Schema.Ensure(ctx, appModels);
             Program.Check(!ready && Program.beforeCalls == 1 && Program.afterCalls == 0,
                 "before failure blocks auto schema and after hook");
             Program.held = null;
@@ -90,7 +106,7 @@ class Program {
                 ctx.Release(db);
             }
             Program.mode = 1;
-            ready = await Schema.Ensure(ctx);
+            ready = await Schema.Ensure(ctx, appModels);
             Program.Check(ready && Program.beforeCalls == 2 && Program.afterCalls == 1,
                 "startup succeeds after recoverable before failure");
             db = await ctx.Acquire();
@@ -102,7 +118,7 @@ class Program {
                 ctx.Release(db);
             }
             Program.mode = 2;
-            ready = await Schema.Ensure(ctx);
+            ready = await Schema.Ensure(ctx, appModels);
             Program.Check(!ready && Program.afterCalls == 2, "business seed failure reports not ready");
             Program.held = null;
             db = await ctx.Acquire();
@@ -112,7 +128,7 @@ class Program {
                 ctx.Release(db);
             }
             Program.mode = 1;
-            Program.Check(await Schema.Ensure(ctx), "retry is idempotent after business failure");
+            Program.Check(await Schema.Ensure(ctx, appModels), "retry is idempotent after business failure");
         } finally {
             Schema.OnBeforeSchema(null);
             Schema.OnAfterSchema(null);
