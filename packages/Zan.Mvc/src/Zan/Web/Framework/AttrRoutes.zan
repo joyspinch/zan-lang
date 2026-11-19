@@ -1,5 +1,6 @@
 using System;
 using System.Web;
+using System.Reflection;
 using Zan.Web.Core;
 using Zan.Web.Security;
 using Zan.Web;
@@ -9,7 +10,7 @@ namespace Zan.Web;
 /* 纯净的约定优于配置（Convention over Configuration）路由引擎：
    1. 命名空间与目录层级 1:1 映射为 URL 路由层级，类名剥离尾部 "Controller"（转小写）作为控制器段。
       （若类上声明了显式 [Route]，以自定义路由为准）。
-   2. 方法级特性驱动（基于 TypeInfo.GetMethodCustomAttributes 原生反射）：
+   2. 方法级特性驱动（基于 TypeInfo.GetMethodAttributeData 原生反射）：
       - 显式 [Route] 覆盖优先；
       - 动词由 [HttpPost]/[HttpGet]/[HttpDelete]/[HttpPut] 等特性精确指定，无特性默认 GET；
       - 权限由 [Custom(Perm = ...)]、[Custom(Authorization = ...)] 声明指定；
@@ -159,16 +160,64 @@ public class __AttrRoutes {
         return path;
     }
 
-    static string ExtractVerb(string mattrs) {
-        if (mattrs.Contains("HttpPost=true")) { return "POST"; }
-        if (mattrs.Contains("HttpPut=true")) { return "PUT"; }
-        if (mattrs.Contains("HttpPatch=true")) { return "PATCH"; }
-        if (mattrs.Contains("HttpHead=true")) { return "HEAD"; }
-        if (mattrs.Contains("HttpOptions=true")) { return "OPTIONS"; }
-        if (mattrs.Contains("HttpDelete=true")) {
-            return "DELETE";
+    static StrMap ReadMethodAttributes(string data, out bool isAction) {
+        StrMap values = new StrMap();
+        isAction = false;
+        if (data == "") { return values; }
+        AttributeReader reader = new AttributeReader(data);
+        while (reader.MoveNext()) {
+            string name = reader.Name;
+            if (name.Length > 9 && name.EndsWith("Attribute")) {
+                name = name.Substring(0, name.Length - 9);
+            }
+            if (name == "Route" || name == "Description" || name == "Custom" || name == "Action"
+                || name == "HttpGet" || name == "HttpPost" || name == "HttpPut" || name == "HttpPatch"
+                || name == "HttpDelete" || name == "HttpHead" || name == "HttpOptions") {
+                isAction = true;
+            }
+            bool hasArgument = reader.MoveNextArgument();
+            if (!hasArgument) {
+                if (name == "Authorization" && !values.Has("Authorization")) {
+                    values.Set("Authorization", "Unknown");
+                } else if (!values.Has(name)) {
+                    values.Set(name, "true");
+                }
+                continue;
+            }
+            while (hasArgument) {
+                string key = reader.ArgumentName == "" ? name : name + "." + reader.ArgumentName;
+                string value = reader.ArgumentValue;
+                if (key == "Authorization" || key == "Custom.Authorization") {
+                    if (!values.Has("Authorization")) {
+                        if (value.StartsWith("System.Web.CustomAuthorization.")) {
+                            value = value.Substring("System.Web.CustomAuthorization.".Length);
+                        } else if (value.StartsWith("CustomAuthorization.")) {
+                            value = value.Substring("CustomAuthorization.".Length);
+                        }
+                        values.Set("Authorization", value.Length > 0 ? value : "Unknown");
+                    }
+                } else if (!values.Has(key)) {
+                    values.Set(key, value);
+                }
+                hasArgument = reader.MoveNextArgument();
+            }
         }
+        return values;
+    }
+
+    static string ExtractVerb(StrMap attrs) {
+        if (attrs.Get("HttpPost") == "true") { return "POST"; }
+        if (attrs.Get("HttpPut") == "true") { return "PUT"; }
+        if (attrs.Get("HttpPatch") == "true") { return "PATCH"; }
+        if (attrs.Get("HttpHead") == "true") { return "HEAD"; }
+        if (attrs.Get("HttpOptions") == "true") { return "OPTIONS"; }
+        if (attrs.Get("HttpDelete") == "true") { return "DELETE"; }
         return "GET";
+    }
+
+    static string MethodSetting(StrMap attrs, string name) {
+        string value = attrs.Get("Custom." + name);
+        return value.Length > 0 ? value : attrs.Get(name);
     }
 
     static void RegisterController(WebApp app, TypeInfo ti, RouteParameterWriter parameters,
@@ -196,21 +245,14 @@ public class __AttrRoutes {
             if (mname.StartsWith("__")) {
                 continue;
             }
-            string mattrs = ti.GetMethodCustomAttributes(m);
+            bool hasWebAttr;
+            string data = ti.GetMethodAttributeData(m);
+            if (data == "" && mname != "Index") { continue; }
+            StrMap mattrs = __AttrRoutes.ReadMethodAttributes(data, out hasWebAttr);
+            bool isIndex = mname == "Index";
+            if (!hasWebAttr && !isIndex) { continue; }
 
-            /* 判定是否为 Action：显式声明了 Route/Http 动词/Description/Custom，或者是 Index 约定动作 */
-            bool isIndex = (mname == "Index");
-            bool hasWebAttr = mattrs.Contains("Route=") || mattrs.Contains("HttpGet")
-                || mattrs.Contains("HttpPost") || mattrs.Contains("HttpPut")
-                || mattrs.Contains("HttpPatch") || mattrs.Contains("HttpDelete")
-                || mattrs.Contains("HttpHead") || mattrs.Contains("HttpOptions")
-                || mattrs.Contains("Description=")
-                || mattrs.Contains("Custom.") || mattrs.Contains("Action=") || mattrs.Contains("Action;");
-            if (!hasWebAttr && !isIndex) {
-                continue;
-            }
-
-            string methodRoute = __AttrRoutes.ExtractAttr(mattrs, "Route=");
+            string methodRoute = mattrs.Get("Route");
             string actionPath = "";
             if (methodRoute.Length > 0) {
                 if (methodRoute.StartsWith("/")) {
@@ -233,7 +275,7 @@ public class __AttrRoutes {
             r.Named(actionKey);
 
             /* 标题声明 */
-            string methodDesc = __AttrRoutes.ExtractAttr(mattrs, "Description=");
+            string methodDesc = mattrs.Get("Description");
             if (methodDesc.Length > 0) {
                 r.Title(methodDesc);
             } else if (classDesc.Length > 0) {
@@ -243,7 +285,7 @@ public class __AttrRoutes {
             /* 方法显式声明完整覆盖类默认值；其他 Custom 字段不影响继承。
                None/Auth 不强制登录，Grant/ApiAuth 要权限；未声明或未知值
                按 Login fail-closed。Index 别名复用同一组最终标志。 */
-            string authorization = __AttrRoutes.AuthorizationOf(mattrs);
+            string authorization = mattrs.Get("Authorization");
             if (authorization.Length == 0) { authorization = classAuthorization; }
             bool isNone = authorization == "None" || authorization == "Auth";
             bool needsAuth = authorization == "Grant" || authorization == "ApiAuth";
@@ -257,47 +299,42 @@ public class __AttrRoutes {
 
             /* 导航菜单声明 */
             bool isMenu = false;
-            if (mattrs.Contains("Custom.IsMenu=true") || mattrs.Contains("IsMenu=true")) {
+            if (mattrs.Get("Custom.IsMenu") == "true" || mattrs.Get("IsMenu") == "true") {
                 isMenu = true;
             } else if (isIndex && classIsMenu) {
                 isMenu = true;
             }
-            if (mattrs.Contains("Custom.IsMenu=false") || mattrs.Contains("IsMenu=false")) {
+            if (mattrs.Get("Custom.IsMenu") == "false" || mattrs.Get("IsMenu") == "false") {
                 isMenu = false;
             }
             if (isMenu) { r.Menu(); }
 
             /* 流式文件上传声明 */
-            if (mattrs.Contains("Upload=true") || mattrs.Contains("Upload = true")
-                || mattrs.Contains("Custom.Upload=true") || mattrs.Contains("Custom.Upload = true")
+            if (mattrs.Get("Upload") == "true" || mattrs.Get("Custom.Upload") == "true"
                 || classAttrs.Contains("Upload=true") || classAttrs.Contains("Upload = true")) {
                 r.Upload();
             }
 
-            string methodIcon = __AttrRoutes.ExtractAttr(mattrs, "Custom.Icon=");
-            if (methodIcon.Length == 0) { methodIcon = __AttrRoutes.ExtractAttr(mattrs, "Icon="); }
+            string methodIcon = __AttrRoutes.MethodSetting(mattrs, "Icon");
             string icon = methodIcon.Length > 0 ? methodIcon : (isIndex ? classIcon : "");
             if (icon.Length > 0) { r.Meta("Icon", icon); }
 
-            string methodGroup = __AttrRoutes.ExtractAttr(mattrs, "Custom.Group=");
-            if (methodGroup.Length == 0) { methodGroup = __AttrRoutes.ExtractAttr(mattrs, "Group="); }
+            string methodGroup = __AttrRoutes.MethodSetting(mattrs, "Group");
             string group = methodGroup.Length > 0 ? methodGroup : classGroup;
             if (group.Length > 0) { r.Meta("Group", group); }
 
-            string methodGroupOrder = __AttrRoutes.ExtractAttr(mattrs, "Custom.GroupOrder=");
-            if (methodGroupOrder.Length == 0) { methodGroupOrder = __AttrRoutes.ExtractAttr(mattrs, "GroupOrder="); }
+            string methodGroupOrder = __AttrRoutes.MethodSetting(mattrs, "GroupOrder");
             string groupOrder = methodGroupOrder.Length > 0 ? methodGroupOrder : classGroupOrder;
             if (groupOrder.Length > 0) { r.Meta("GroupOrder", groupOrder); }
 
-            string methodOrder = __AttrRoutes.ExtractAttr(mattrs, "Custom.Order=");
-            if (methodOrder.Length == 0) { methodOrder = __AttrRoutes.ExtractAttr(mattrs, "Order="); }
+            string methodOrder = __AttrRoutes.MethodSetting(mattrs, "Order");
             string order = methodOrder.Length > 0 ? methodOrder : classOrder;
             if (order.Length > 0) { r.Meta("Order", order); }
 
             /* 权限位掩码直录 */
-            string perm = __AttrRoutes.ExtractAttr(mattrs, "Custom.Perm=");
+            string perm = mattrs.Get("Custom.Perm");
             if (perm.Length > 0) {
-                r.Meta("Perm", perm.Replace("PermBit.", ""));
+                r.Meta("Perm", perm.Replace("System.Web.PermBit.", "").Replace("PermBit.", ""));
             }
 
             /* 路由路径中的 {param} 占位符直录为 path 参数 */

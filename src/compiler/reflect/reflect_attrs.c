@@ -24,10 +24,35 @@ static void refl_attr_text(char **data, size_t *len, size_t *cap, zan_istr_t tex
     refl_attr_append(data, len, cap, text.str, text.len);
 }
 
+/* Preserve the spelling of symbolic names and unions of names. Resolution
+ * of those names belongs to the consumer of the attribute. */
+static bool refl_attr_symbol(const zan_ast_node_t *expr, bool allow_union,
+                             char **text, size_t *len, size_t *cap) {
+    if (!expr) return false;
+    if (expr->kind == AST_IDENTIFIER && expr->ident.name.len) {
+        refl_attr_append(text, len, cap, expr->ident.name.str, expr->ident.name.len);
+        return true;
+    }
+    if (expr->kind == AST_MEMBER_ACCESS && !expr->member.null_cond && expr->member.name.len &&
+        refl_attr_symbol(expr->member.object, false, text, len, cap)) {
+        refl_attr_append(text, len, cap, ".", 1);
+        refl_attr_append(text, len, cap, expr->member.name.str, expr->member.name.len);
+        return true;
+    }
+    if (allow_union && expr->kind == AST_BINARY && expr->binary.op == TK_PIPE &&
+        refl_attr_symbol(expr->binary.left, true, text, len, cap)) {
+        refl_attr_append(text, len, cap, "|", 1);
+        return refl_attr_symbol(expr->binary.right, true, text, len, cap);
+    }
+    return false;
+}
+
 static LLVMValueRef refl_declared_attrs(zan_irgen_t *g, const zan_ast_node_t *decl) {
     const zan_ast_list_t *attrs = zan_ast_attributes_const(decl);
     char *data = NULL;
     size_t len = 0, cap = 0;
+    char *symbol = NULL;
+    size_t symbol_cap = 0;
     refl_attr_append(&data, &len, &cap, "!1;", 3);
     for (int i = 0; i < attrs->count; i++) {
         const zan_ast_node_t *attr = attrs->items[i];
@@ -68,8 +93,14 @@ static LLVMValueRef refl_declared_attrs(zan_irgen_t *g, const zan_ast_node_t *de
                 value = (zan_istr_t){number, (uint32_t)snprintf(number, sizeof(number),
                                                               "%.17g", arg->float_val)};
                 break;
-            default:
+            default: {
+                size_t symbol_len = 0;
+                if (refl_attr_symbol(arg, true, &symbol, &symbol_len, &symbol_cap)) {
+                    kind = 'E';
+                    value = (zan_istr_t){symbol, (uint32_t)symbol_len};
+                }
                 break;
+            }
             }
             refl_attr_append(&data, &len, &cap, &kind, 1);
             refl_attr_text(&data, &len, &cap, key);
@@ -78,6 +109,7 @@ static LLVMValueRef refl_declared_attrs(zan_irgen_t *g, const zan_ast_node_t *de
         }
     }
     LLVMValueRef out = refl_const_string(g, data, (int)len);
+    free(symbol);
     free(data);
     return out;
 }

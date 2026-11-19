@@ -36,47 +36,54 @@ public partial class Parser {
 
     bool HasModBit(int mods, int bit) { return (mods / bit) - ((mods / bit) / 2) * 2 == 1; }
 
-    string ParseAttrVal() {
-        if (At(TK.StringLit())) { return Next().text; }
-        if (At(TK.True())) { Next(); return "true"; }
-        if (At(TK.False())) { Next(); return "false"; }
-        if (At(TK.IntLit())) { return "" + Next().intVal; }
-        if (At(TK.FloatLit())) { return Next().text; }
-        if (At(TK.Ident())) {
-            string s = Next().text;
-            while (Eat(TK.Dot())) {
-                if (At(TK.Ident())) { s = s + "." + Next().text; }
-            }
-            if (Eat(TK.Pipe())) {
-                s = s + "|" + ParseAttrVal();
-            }
-            return s;
+    string AttrSymbol(Node expr, bool allowUnion) {
+        if (expr.kind == AK.Ident()) { return expr.sval; }
+        if (expr.kind == AK.MemberAccess() && expr.ival == 0) {
+            string owner = AttrSymbol(expr.a, false);
+            if (owner != "") { return owner + "." + expr.sval; }
         }
-        string fallback = "";
-        while (!At(TK.Comma()) && !At(TK.RParen()) && !At(TK.RBracket()) && !At(TK.Eof())) {
-            fallback = fallback + Next().text;
+        if (allowUnion && expr.kind == AK.Binary() && expr.op == TK.Pipe()) {
+            string left = AttrSymbol(expr.a, true);
+            string right = AttrSymbol(expr.b, true);
+            if (left != "" && right != "") { return left + "|" + right; }
         }
-        return fallback;
+        return "";
     }
 
     string AttrText(string value, int size) {
         return Convert.ToString(size) + ":" + value;
     }
 
-    string DeclaredAttrArg(int tokenKind, string key, string value) {
+    string ParseAttributeArgument(string key, out string legacyValue) {
+        int start = pos;
+        Node expr = ParseExpr();
         string kind = "X";
+        string value = "";
         int size = 0;
-        if (tokenKind == TK.StringLit()) {
+        if (expr.kind == AK.StringLit() && expr.b == null) {
             kind = "S";
+            value = expr.sval;
             size = StrEsc.DecodeBytes(value).Count;
-        } else if (tokenKind == TK.True() || tokenKind == TK.False()) {
-            kind = "B";
-            size = value.Length;
-        } else if (tokenKind == TK.IntLit() || tokenKind == TK.FloatLit()) {
-            kind = tokenKind == TK.IntLit() ? "I" : "F";
-            size = value.Length;
         } else {
-            value = "";
+            if (expr.kind == AK.BoolLit()) {
+                kind = "B";
+                value = expr.ival != 0 ? "true" : "false";
+            } else if (expr.kind == AK.IntLit()) {
+                kind = "I";
+                value = Convert.ToString(expr.ival);
+            } else if (expr.kind == AK.FloatLit()) {
+                kind = "F";
+                value = expr.sval;
+            } else {
+                value = AttrSymbol(expr, true);
+                if (value != "") { kind = "E"; }
+            }
+            size = value.Length;
+        }
+        legacyValue = value;
+        if (kind == "X") {
+            // Preserve the old token text for arguments outside the supported kinds.
+            for (int i = start; i < pos; i = i + 1) { legacyValue = legacyValue + toks[i].text; }
         }
         return kind + AttrText(key, key.Length) + AttrText(value, size) + ";";
     }
@@ -128,19 +135,17 @@ public partial class Parser {
                         if (At(TK.Ident()) && K1() == TK.Eq()) {
                             string k = Next().text;
                             Next(); // =
-                            int valueKind = K();
-                            string v = ParseAttrVal();
+                            string v;
+                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument(k, out v);
                             attrBlob = attrBlob + aShort + "." + k + "=" + v + ";";
-                            attrDeclaredData = attrDeclaredData + DeclaredAttrArg(valueKind, k, v);
                             if (aname == "DllImport") {
                                 if (k == "EntryPoint") { attrEntry = v; }
                                 else if (k == "Variadic" && v == "true") { attrVariadic = true; }
                             }
                         } else {
-                            int valueKind = K();
-                            string v = ParseAttrVal();
+                            string v;
+                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument("", out v);
                             attrBlob = attrBlob + aShort + "=" + v + ";";
-                            attrDeclaredData = attrDeclaredData + DeclaredAttrArg(valueKind, "", v);
                             if (aname == "StaticAddr") { attrStaticAddr = v; }
                             else if (aname == "StructLayout" && v == "LayoutKind.Explicit") { attrLayoutExplicit = true; }
                             else if (aname == "FieldOffset") {
