@@ -169,10 +169,6 @@ static void pi_seed_source(const char *source, size_t len) {
                         if (prev != TK_DOT) {
                             chain = name;
                             zan_token_t next = zan_lexer_peek(&lex);
-                            if (next.kind == TK_LPAREN &&
-                                zan_data_orm_connection_hook(tok.str_val) &&
-                                zan_lexer_peek2(&lex).kind == TK_RPAREN)
-                                zan_data_orm_seed_accessor_types(pi_flag_qualified);
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -289,9 +285,6 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL:
     case AST_DELEGATE_DECL:
-        if (n->kind == AST_METHOD_DECL && n->method_decl.params.count == 0 &&
-            zan_data_orm_connection_hook(n->method_decl.name))
-            zan_data_orm_seed_accessor_types(pi_flag_qualified);
         pi_seed_ast(n->method_decl.return_type);
         pi_seed_list(&n->method_decl.params);
         pi_seed_list(&n->method_decl.type_params);
@@ -501,7 +494,6 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
                 }
             }
             pi_flag_istr(n->member.name);
-            zan_data_orm_seed_member_dao(n->member.name, pi_flag_istr);
         }
         pi_seed_chain(obj, 1);
         return;

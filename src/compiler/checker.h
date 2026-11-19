@@ -24,7 +24,6 @@ struct zan_checker {
     int lambda_depth;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
-    struct zan_data_orm_state *data_orm;
     zan_mvc_route_state_t mvc_routes;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;

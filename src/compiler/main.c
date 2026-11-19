@@ -11,7 +11,6 @@
 #include "ast.h"
 #include "binder.h"
 #include "checker.h"
-#include "../../packages/Zan.Data/compiler/orm_adapter.h"
 #include "../../packages/Zan.Mvc/compiler/mvc_compiler.h"
 #include "irgen.h"
 #include "optimizer.h"

@@ -719,8 +719,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
          obj_type->kind == TYPE_INTERFACE)) {
         if (!in_call_callee) {
-            zan_type_t *accessor = zan_data_orm_try_accessor(c, expr, obj_type);
-            if (accessor) return accessor;
             checker_report_no_member(c, expr, obj_type, expr->member.name, false);
             return c->binder->type_error;
         }

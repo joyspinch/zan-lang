@@ -25,83 +25,84 @@ class Program {
         Cfg.Auth.iter = 1000;
         SqliteConnection db = SqliteConnection.Open(path);
         await db.SyncStructureAllAsync(new Meta[] { Meta.For<SysUser>() });
+        SysUserDao users = new SysUserDao(db);
         Cfg.Auth.bootstrapPassword = "";
         bool refused = false;
         try { bool ok = await SeedAdmin(db); }
         catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
-        Program.Check(refused && await db.SysUser.CountAsync() == 0, "empty database refuses missing password");
+        Program.Check(refused && await users.CountAsync() == 0, "empty database refuses missing password");
         Cfg.Auth.bootstrapPassword = "admin1234";
         refused = false;
         try { bool ok = await SeedAdmin(db); }
         catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
-        Program.Check(refused && await db.SysUser.CountAsync() == 0, "empty database refuses public default");
+        Program.Check(refused && await users.CountAsync() == 0, "empty database refuses public default");
         Cfg.Auth.bootstrapPassword = "too-short";
         refused = false;
         try { bool ok = await SeedAdmin(db); }
         catch (Exception ex) { refused = ex.Message.Contains("bootstrapPassword"); }
-        Program.Check(refused && await db.SysUser.CountAsync() == 0, "empty database refuses short password");
+        Program.Check(refused && await users.CountAsync() == 0, "empty database refuses short password");
 
         Cfg.Auth.bootstrapPassword = "temporary-strong-bootstrap-password";
         Program.Check(await SeedAdmin(db), "strong password bootstraps");
-        SysUser admin = await db.SysUser.ByUsername("admin");
+        SysUser admin = await users.ByUsername("admin");
         Program.Check(admin != null && admin.isSuper == 1
             && AuthUser.Verify("temporary-strong-bootstrap-password", admin.passwordSalt, admin.passwordHash)
             && !AuthUser.Verify("admin1234", admin.passwordSalt, admin.passwordHash),
             "bootstrap password is not public default");
-        int originalCount = await db.SysUser.CountAsync();
-        Program.Check(await SeedAdmin(db) && await db.SysUser.CountAsync() == originalCount,
+        int originalCount = await users.CountAsync();
+        Program.Check(await SeedAdmin(db) && await users.CountAsync() == originalCount,
             "bootstrap is idempotent");
 
         int legacyId = admin.id;
         int beforeVersion = admin.tokenVersion;
-        int n = await db.SysUser.ResetPassword(legacyId, "", AuthUser.NewHash("admin1234"), 1);
+        int n = await users.ResetPassword(legacyId, "", AuthUser.NewHash("admin1234"), 1);
         Program.Check(n == 1, "legacy fixture installed");
         Cfg.Auth.bootstrapPassword = "";
         refused = false;
         try { bool ok = await SeedAdmin(db); }
         catch (Exception ex) { refused = ex.Message.Contains("rotated"); }
-        SysUser legacy = await db.SysUser.ByUsername("admin");
+        SysUser legacy = await users.ByUsername("admin");
         Program.Check(refused && AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash),
             "legacy public password blocks startup without rotation");
         Cfg.Auth.bootstrapPassword = "weak";
         refused = false;
         try { bool ok = await SeedAdmin(db); }
         catch (Exception ex) { refused = ex.Message.Contains("rotated"); }
-        legacy = await db.SysUser.ByUsername("admin");
+        legacy = await users.ByUsername("admin");
         Program.Check(refused && AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash),
             "legacy public password blocks weak rotation");
         Cfg.Auth.bootstrapPassword = "rotated-admin-password-long";
         Program.Check(await SeedAdmin(db), "legacy password rotates");
-        SysUser rotated = await db.SysUser.ByUsername("admin");
+        SysUser rotated = await users.ByUsername("admin");
         Program.Check(rotated.passwordHash.IndexOf("pbkdf2$") == 0
             && AuthUser.Verify("rotated-admin-password-long", rotated.passwordSalt, rotated.passwordHash)
             && !AuthUser.Verify("admin1234", rotated.passwordSalt, rotated.passwordHash)
             && rotated.tokenVersion == beforeVersion + 2,
             "rotation invalidates public credential and old tokens");
         Cfg.Auth.bootstrapPassword = "";
-        Program.Check(await SeedAdmin(db) && await db.SysUser.CountAsync() == originalCount,
+        Program.Check(await SeedAdmin(db) && await users.CountAsync() == originalCount,
             "rotated deployment does not require bootstrap password again");
-        int upgraded = await db.SysUser.UpgradeHash(rotated.id,
+        int upgraded = await users.UpgradeHash(rotated.id,
             AuthUser.NewHash("rotated-admin-password-long"), 2);
-        SysUser afterUpgrade = await db.SysUser.ById(rotated.id);
+        SysUser afterUpgrade = await users.ById(rotated.id);
         Program.Check(upgraded == 1 && afterUpgrade.tokenVersion == rotated.tokenVersion,
             "hash upgrade preserves issued token version");
 
         bool begun = await db.BeginTransactionAsync();
-        int changed = await db.SysUser.ResetPassword(rotated.id, "",
+        int changed = await users.ResetPassword(rotated.id, "",
             AuthUser.NewHash("transaction-password-long"), 3);
-        SysUser inTx = await db.SysUser.ById(rotated.id);
+        SysUser inTx = await users.ById(rotated.id);
         Program.Check(begun && changed == 1
             && inTx.tokenVersion == rotated.tokenVersion + 1
             && AuthUser.Verify("transaction-password-long", inTx.passwordSalt, inTx.passwordHash),
             "DAO password change uses current transaction and increments version once");
         bool rolledBack = await db.RollbackAsync();
-        SysUser afterRollback = await db.SysUser.ById(rotated.id);
+        SysUser afterRollback = await users.ById(rotated.id);
         Program.Check(rolledBack && afterRollback.tokenVersion == rotated.tokenVersion
             && AuthUser.Verify("rotated-admin-password-long", afterRollback.passwordSalt, afterRollback.passwordHash),
             "DAO password and version roll back together");
-        int bumped = await db.SysUser.BumpTokenVersion(rotated.id);
-        SysUser afterBump = await db.SysUser.ById(rotated.id);
+        int bumped = await users.BumpTokenVersion(rotated.id);
+        SysUser afterBump = await users.ById(rotated.id);
         Program.Check(bumped == 1 && afterBump.tokenVersion == rotated.tokenVersion + 1,
             "DAO revocation increments version once");
         db.Close();

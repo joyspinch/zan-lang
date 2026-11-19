@@ -1,6 +1,5 @@
 
 #include "checker.h"
-#include "../../packages/Zan.Data/compiler/orm_adapter.h"
 #include "reflect_api.h"
 #include "definite.h"
 #include "diag.h"

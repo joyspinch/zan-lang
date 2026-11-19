@@ -473,7 +473,6 @@ static void pi_scan_file(pi_file_t *f) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
                     if (zan_mvc_is_route_pullin_attribute(next.str_val) ||
-                        zan_data_orm_is_table_marker(next.str_val) ||
                         (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0)) {
                         f->has_controller = 1;
                     }
@@ -509,8 +508,7 @@ static void pi_scan_file(pi_file_t *f) {
                 zan_token_t next = zan_lexer_peek(&lex);
                 if (next.kind == TK_IDENT) {
                     tok = zan_lexer_next(&lex);
-                    if (zan_mvc_has_controller_suffix(tok.str_val) ||
-                        zan_data_orm_keep_pullin_decl(tok.str_val)) {
+                    if (zan_mvc_has_controller_suffix(tok.str_val)) {
                         f->has_controller = 1;
                     }
                     pi_name_t *name = pi_intern(tok.str_val.str,
@@ -581,8 +579,7 @@ static void pi_scan_file(pi_file_t *f) {
             pi_name_t *cur_id = pi_intern(tok.str_val.str,
                                           tok.str_val.len);
             if (prev == TK_COLON) {
-                if (zan_mvc_has_controller_suffix(tok.str_val) ||
-                    zan_data_orm_keep_pullin_base(tok.str_val)) {
+                if (zan_mvc_has_controller_suffix(tok.str_val)) {
                     f->has_controller = 1;
                 }
             }

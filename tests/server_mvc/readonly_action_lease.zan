@@ -18,7 +18,7 @@ class LeaseActionController : AppController {
         IDbConnection read = await this.ReadConn();
         IDbConnection same = await this.Conn();
         LeaseActionController.reused = held != null && held == read && held == same
-            && this.__Conn() == held && this.DbReady();
+            && this.Held() == held && this.DbReady();
         DbResult result = await held.QueryAsync("SELECT name FROM marker");
         LeaseActionController.observed = result.GetByName(0, "name");
     }
@@ -139,7 +139,7 @@ class Program {
             AppServices.Use(new AppServices(context, null));
             LeaseFaultController ctrl = new LeaseFaultController();
             await ctrl.OnBeforeAsync();
-            Program.Check(ctrl.__Conn() is TracedDbConnection, "failure lease is traced");
+            Program.Check(ctrl.Held() is TracedDbConnection, "failure lease is traced");
             LeaseFaultConnection raw = connector.last;
             raw.beginMode = mode;
             raw.failClose = true;
@@ -152,7 +152,7 @@ class Program {
             } else {
                 Program.Check(error == "injected begin failure", "begin exception survives close failure");
             }
-            Program.Check(ctrl.__Conn() == null && raw.begins == 1
+            Program.Check(ctrl.Held() == null && raw.begins == 1
                 && raw.closes == 1 && raw.IsConnected(), "failed begin quarantined");
             Program.Check(pool.LiveCount() == 0 && pool.IdleCount() == 0,
                 "failed begin frees pool slot");
@@ -215,16 +215,21 @@ class Program {
                 ctrl.failDone = true;
                 string expected = mode == 1 ? "rollback failed" : "injected rollback failure";
                 string error = "";
-                try { await ctrl.TxRollback(); }
-                catch (Exception ex) { error = ex.Message; }
-                Program.Check(error == expected && raw.rollbacks == 1,
-                    "explicit rollback failure propagated");
-                error = "";
+                if (closeMode == 1) {
+                    try { await ctrl.TxRollback(); }
+                    catch (Exception ex) { error = ex.Message; }
+                    Program.Check(error == expected && raw.rollbacks == 1,
+                        "explicit rollback error survives close failure");
+                    Program.Check(raw.closes == 1 && ctrl.Held() == null,
+                        "explicit rollback failure discards the lease");
+                    expected = "injected done failure";
+                    error = "";
+                }
                 try { await ctrl.OnAfterAsync(); }
                 catch (Exception ex) { error = ex.Message; }
-                Program.Check(error == expected, "rollback error survives close and OnDone failures");
-                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && ctrl.done == 1
-                    && ctrl.__Conn() == null, "teardown retries rollback and clears lease");
+                Program.Check(error == expected, "teardown propagates its first failure");
+                Program.Check(raw.rollbacks == 1 && raw.closes == 1 && ctrl.done == 1
+                    && ctrl.Held() == null, "teardown clears the lease without retrying rollback");
                 Program.Check(write.LiveCount() == 0 && write.IdleCount() == 0,
                     "dirty connection removed even when close throws");
                 Program.Check(read.LiveCount() == 1 && read.IdleCount() == 1,
@@ -234,7 +239,7 @@ class Program {
                 await ctrl.OnAfterAsync();
                 await ctrl.TxCommit();
                 await ctrl.TxRollback();
-                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && raw.commits == 0,
+                Program.Check(raw.rollbacks == 1 && raw.closes == 1 && raw.commits == 0,
                     "repeated teardown does not touch discarded lease");
                 if (write.LiveCount() == 0) {
                     IDbConnection replacement = await context.Acquire();
