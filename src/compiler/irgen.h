@@ -487,6 +487,8 @@ struct zan_irgen {
     bool         arc_guard;       /* 释放对象隔离区 (UAF 检测) */
     bool         arc_net;
     bool         fast_codegen;
+    int          codegen_level;   /* --codegen-level；-1 未给（回退 ZAN_CODEGEN_LEVEL env） */
+    bool         shard_opt;       /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
     bool         emit_lib;        /* 库构建模式：保持 public 成员导出链接 */
     bool         emit_shared;     /* 动态共享库模式：发射平台标准入口 (DllMain) */
 

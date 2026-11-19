@@ -172,6 +172,8 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `-fno-opt-<pass>` | 关 | 跳过单个自定义优化 pass（二分定位用）：`early/escape/arc/devirt/constfold/dce/inline/shrink`；未知 pass 名报用法错误 |
 | `--early-passes=<list>` | — | 覆盖早期 LLVM pass 管线（如 `sroa,early-cse`），`none` 跳过整个早期阶段 |
 | `--opt-pipeline=<text>` | — | 覆盖主 LLVM pass 管线文本，`none` 跳过 LLVM 管线 |
+| `--codegen-level <0-3>` | 自动 | 覆盖后端 LLVM codegen 优化档（0=None/1=Less/2=Default/3=Aggressive）；未给时回退读 `ZAN_CODEGEN_LEVEL`（兼容既有脚本），显式 CLI 优先 |
+| `--shard-opt` | 关 | 非 `--publish` 模式也对 shard 模块跑 LLVM pass 管线（`--publish`/`--obfuscate-strings` 下本就开启）；未给时回退读 `ZAN_SHARD_OPT`（逃生口），显式 CLI 优先 |
 | ↳ 环境变量回退 | — | `-fno-opt-*` 未显式给出时回退读 `ZAN_NO_OPT_<PASS>=1`（shrink 回退 `ZAN_NO_UNWIND_SHRINK=1`），`--early-passes`/`--opt-pipeline` 未给出时回退读 `ZAN_EARLY_PASSES`/`ZAN_OPT_PIPELINE`（兼容既有二分脚本）；显式 CLI 优先 |
 | `--target <name>` | 本机 | 交叉编译（§3 全表） |
 | `--list-targets` | — | 列出全部目标后退出 |

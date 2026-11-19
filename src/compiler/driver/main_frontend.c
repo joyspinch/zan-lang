@@ -443,6 +443,8 @@
     irgen.emit_debug = debug_info;
     irgen.strict_runtime = strict_runtime;
     irgen.publish_mode = publish_mode;
+    irgen.codegen_level = opts.codegen_level;
+    irgen.shard_opt = opts.shard_opt;
     if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
         char handler_root[1024];
         zan_design_root_for(input_files[0], handler_root, sizeof(handler_root));

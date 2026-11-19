@@ -62,6 +62,8 @@ typedef struct zan_options {
     zan_pkg_scope_t package_scope;
     int opt_level;
     zan_opt_knobs_t opt_knobs;
+    int codegen_level;     /* --codegen-level <0-3>；-1 未给（回退 ZAN_CODEGEN_LEVEL） */
+    bool shard_opt;        /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
     const char *pp_defines[ZAN_MAX_PP_DEFINES];
     int pp_define_count;
     const char *target_name;

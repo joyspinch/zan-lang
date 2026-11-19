@@ -14,6 +14,8 @@ void print_usage(void) {
     fprintf(stderr, "                     escape, arc, devirt, constfold, dce, inline, shrink\n");
     fprintf(stderr, "    --early-passes=<list>  Override early LLVM pass pipeline (or 'none')\n");
     fprintf(stderr, "    --opt-pipeline=<text>  Override main LLVM pass pipeline (or 'none')\n");
+    fprintf(stderr, "    --codegen-level <0-3>  Override backend LLVM codegen opt level\n");
+    fprintf(stderr, "    --shard-opt     Run pass pipeline on shard modules outside --publish\n");
     fprintf(stderr, "    --no-pullin-filter      Disable stdlib/package pull-in filtering\n");
     fprintf(stderr, "    --target <name>  Cross-compile for target (e.g. linux-x64, linux-musl)\n");
     fprintf(stderr, "    --cpu-profile <baseline|avx2>  x86-64 CPU requirements (default: target default)\n");

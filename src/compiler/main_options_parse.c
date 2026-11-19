@@ -18,6 +18,8 @@ void zan_options_init(zan_options_t *opts) {
     opts->auto_stdlib = true;
     opts->package_scope = ZAN_PKG_SCOPE_PROJECT;
     opts->opt_level = -1;
+    opts->codegen_level = -1;
+    opts->shard_opt = false;
 }
 
 zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opts) {
@@ -85,6 +87,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
     int opt_level = -1;
     zan_opt_knobs_t opt_knobs; memset(&opt_knobs, 0, sizeof(opt_knobs));
+    int codegen_level = -1;
+    bool shard_opt = false;
 #define ZAN_MAX_PP_DEFINES 1024
 #define ZAN_MAX_LINK_INPUTS 1024
 #define ZAN_MAX_EMBED_SPECS 1024
@@ -265,6 +269,26 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             opt_knobs.early_passes = argv[i] + 15;
         } else if (strncmp(argv[i], "--opt-pipeline=", 15) == 0) {
             opt_knobs.pipeline = argv[i] + 15;
+        } else if (strcmp(argv[i], "--codegen-level") == 0 && i + 1 < argc) {
+            const char *cl = argv[++i];
+            char *ep = NULL;
+            long lv = strtol(cl, &ep, 10);
+            if (cl[0] == '\0' || ep == NULL || *ep != '\0' || lv < 0 || lv > 3) {
+                fprintf(stderr, "error: --codegen-level must be 0..3\n");
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
+            }
+            codegen_level = (int)lv;
+        } else if (strncmp(argv[i], "--codegen-level=", 16) == 0) {
+            const char *cl = argv[i] + 16;
+            char *ep = NULL;
+            long lv = strtol(cl, &ep, 10);
+            if (cl[0] == '\0' || ep == NULL || *ep != '\0' || lv < 0 || lv > 3) {
+                fprintf(stderr, "error: --codegen-level must be 0..3\n");
+                opts->exit_code = 1; return ZAN_OPTIONS_ERROR;
+            }
+            codegen_level = (int)lv;
+        } else if (strcmp(argv[i], "--shard-opt") == 0) {
+            shard_opt = true;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
             /* atoi 曾把 "abc" 静默变 0——main.c 以 >=0 判已设置，0 即
              * 抑制全部错误显示；现严格十进制复核，垃圾值按用法错误退出 */
@@ -460,6 +484,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->package_scope = package_scope;
     opts->opt_level = opt_level;
     opts->opt_knobs = opt_knobs;
+    opts->codegen_level = codegen_level;
+    opts->shard_opt = shard_opt;
     for (int k = 0; k < pp_define_count && k < ZAN_MAX_PP_DEFINES; k++) opts->pp_defines[k] = pp_defines[k];
     opts->pp_define_count = pp_define_count;
     opts->target_name = target_name;

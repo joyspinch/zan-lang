@@ -379,7 +379,9 @@ static bool sh_emit_one_file(sh_state_t *st, int shard_idx, const char *frag_pat
         LLVMContextDispose(ctx);
         return false;
     }
-    if (g->publish_mode || g->obfuscate_strings || getenv("ZAN_SHARD_OPT")) {
+    /* --shard-opt 显式开启；未给时回退 ZAN_SHARD_OPT env（逃生口）。 */
+    bool shard_opt = g->shard_opt || getenv("ZAN_SHARD_OPT") != NULL;
+    if (g->publish_mode || g->obfuscate_strings || shard_opt) {
         if (zan_opt_run_passes_on_module(mod, tm,
                 (g->publish_mode || g->obfuscate_strings) ? ZAN_OPT_SIZE : ZAN_OPT_FULL,
                 NULL) != ZAN_OK) {
