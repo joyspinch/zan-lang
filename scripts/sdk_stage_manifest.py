@@ -349,32 +349,63 @@ def run_sdk_probe_step(command, work, env, log, timeout):
     return process.stdout
 
 
-def consume_selfhost(sdk, output):
+def consume_selfhost(sdk, output, version):
     work = output / "selfhost"
     work.mkdir()
-    source = work / "probe.zan"
+    source = sdk / "templates" / CONSOLE_TEMPLATE / "src/main.zan"
     artifact = work / "probe.exe"
     token = "sdk-selfhost-consumption-probe"
-    source.write_text('using System;\nclass Program {\n'
-                      f'    static void Main() {{ Console.WriteLine("{token}"); }}\n'
-                      '}\n', encoding="utf-8")
+    stdlib_args = ["--stdlib-path", str(sdk / "stdlib")]
 
     system = Path(os.environ["SystemRoot"])
     env = {"SystemRoot": str(system), "PATH": os.pathsep.join((str(system / "System32"), str(system))),
            "TEMP": str(work), "TMP": str(work)}
-    compile_log = work / "compile.json"
-    compiler = sdk / "toolchain/zanc-selfhost.exe"
-    run_sdk_probe_step([str(compiler), str(source), "-o", str(artifact)], work, env, compile_log, 120)
-    executable = identity.required_identity(artifact)
-    if not executable["size"]:
-        raise ValueError("Staged self-hosted compiler produced an empty executable")
+    toolchain = sdk / "toolchain"
+    compiler = toolchain / "zanc-selfhost.exe"
+    seed = toolchain / "zanc.exe"
+    disabled_seed = toolchain / "zanc.disabled"
+    bootstrap = sdk / "bootstrap"
+    entries = (bootstrap / "selfhost_sources.txt").read_text(encoding="utf-8").splitlines()
+    sources = [bootstrap / safe_relative(entry.strip() + ".zan") for entry in entries if entry.strip()]
+    if not sources or len(set(sources)) != len(sources) or any(not path.is_file() for path in sources):
+        raise ValueError("Incomplete SDK bootstrap sources")
+    generations = [toolchain / "bootstrap-gen2.exe", toolchain / "bootstrap-gen3.exe"]
+    if any(path.exists() for path in [disabled_seed, *generations]):
+        raise ValueError("SDK contains reserved bootstrap output names")
 
-    runtime_log = work / "runtime.json"
-    stdout = run_sdk_probe_step([str(artifact)], work, env, runtime_log, 30)
-    if stdout.strip() != token:
-        raise ValueError(f"Staged self-hosted compiler probe produced unexpected output; see {runtime_log}")
+    response = work / "bootstrap sources.rsp"
+    response.write_text("".join(f'"{source.as_posix()}"\n' for source in sources), encoding="utf-8")
+    evidence = []
+    seed.rename(disabled_seed)
+    try:
+        for number, binary in enumerate(generations, 2):
+            log = work / f"gen{number}-compile.json"
+            command = [str(compiler), "@" + str(response), *stdlib_args, "-o", str(binary)]
+            run_sdk_probe_step(command, work, env, log, 600)
+            version_log = work / f"gen{number}-version.json"
+            reported_version = run_sdk_probe_step([str(binary), "--version"], work, env, version_log, 30)
+            if reported_version.strip() != f"zanc {version} (gen1)":
+                raise ValueError(f"Unexpected bootstrap compiler identity; see {version_log}")
+            evidence.append({"artifact": identity.required_identity(binary),
+                             "compile_log": identity.required_identity(log),
+                             "version_log": identity.required_identity(version_log)})
+            compiler = binary
+        compile_log = work / "compile.json"
+        command = [str(compiler), str(source), *stdlib_args, "-o", str(artifact)]
+        run_sdk_probe_step(command, work, env, compile_log, 120)
+        executable = identity.required_identity(artifact)
+        if not executable["size"]:
+            raise ValueError("Staged self-hosted compiler produced an empty executable")
+        runtime_log = work / "runtime.json"
+        stdout = run_sdk_probe_step([str(artifact), token], work, env, runtime_log, 30)
+        if not any(line.rstrip().endswith("[0] = " + token) for line in stdout.splitlines()):
+            raise ValueError(f"Staged self-hosted compiler probe produced unexpected output; see {runtime_log}")
+    finally:
+        disabled_seed.rename(seed)
+        for binary in generations:
+            binary.unlink(missing_ok=True)
     return {"artifact": executable, "compile_log": identity.required_identity(compile_log),
-            "runtime_log": identity.required_identity(runtime_log)}
+            "runtime_log": identity.required_identity(runtime_log), "bootstrap": evidence}
 
 
 def consume_templates(sdk, output, compiler, selection, env=None, cmake=None):
@@ -586,7 +617,7 @@ def consume(args):
     if output.exists():
         raise ValueError("Consumption output must be a new directory")
     command, selected, runs = consume_templates(sdk, output, sdk / "toolchain/zanc.exe", args.filter)
-    selfhost = consume_selfhost(sdk, output)
+    selfhost = consume_selfhost(sdk, output, manifest["version"])
     after = verify_sdk(sdk)
     if after != manifest:
         raise ValueError("SDK identity changed during consumption")

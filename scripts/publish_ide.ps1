@@ -13,7 +13,7 @@
 #     ZanIDE.exe           the IDE (skins embedded)
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
 #                           zanc.exe, zanc-selfhost.exe, ld.lld.exe, llvm-nm.exe,
-#                           ld.exe, mingw\, linux-musl\ ...
+#                           opt.exe, llc.exe, ld.exe, mingw\, linux-musl\ ...
 #                         (the IDE finds zanc here; zanc finds its linker next
 #                          to itself in this same folder)
 #     stdlib\             standard library sources (zanc auto-includes from here)
@@ -108,6 +108,12 @@ function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
 foreach ($tree in @('stdlib', 'packages', 'examples', 'templates', 'tools')) {
     Add-SdkCopy (Join-Path $root $tree) $tree -Tree
 }
+$selfhostList = Join-Path $root 'scripts\selfhost_sources.txt'
+Add-SdkCopy $selfhostList 'bootstrap/selfhost_sources.txt'
+foreach ($entry in Get-Content -LiteralPath $selfhostList) {
+    $source = $entry.Trim()
+    if ($source) { Add-SdkCopy (Join-Path $root "src/$source.zan") "bootstrap/$source.zan" }
+}
 Assert-SdkFile (Join-Path $root 'templates\console\console-args\zan.proj')
 Add-SdkCopy (Join-Path $b 'ZanIDE.exe') 'ZanIDE.exe'
 Add-SdkCopy (Join-Path $b 'ZanIDE.deps.txt') 'ZanIDE.deps.txt'
@@ -175,7 +181,9 @@ Contents
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
                    zanc-selfhost.exe       the self-hosted compiler
+                   opt.exe, llc.exe        LLVM optimizer and object emitter
                    llvm-nm.exe             symbol reader used by zanc-selfhost
+                   ld.lld.exe              linker used by zanc-selfhost
                    zan-mvc.exe             MVC route generator
                    zan-lsp.exe             language server (for external editors)
                    zan-dap.exe             debug adapter (for external editors)
@@ -188,6 +196,7 @@ Contents
                  The IDE locates zanc here, and zanc finds its linker / sysroot
                  next to itself in this same folder, so producing an .exe needs
                  no external toolchain. Keep this folder intact.
+  bootstrap\     Self-hosted compiler sources and their ordered input list.
   stdlib\        Standard library sources. zanc auto-includes the .zan files
                  it needs from here; keep this folder next to ZanIDE.exe.
   packages\      Official extension packages ecosystem (Zan.Data, Zan.Gui.Charts, etc.)
@@ -293,7 +302,9 @@ Zan IDE 自包含发布包
   toolchain\     Zan 编译器及其链接所需的一切，全部作为同目录的兄弟文件平铺：
                    zanc.exe                编译器
                    zanc-selfhost.exe       自举编译器
+                   opt.exe, llc.exe        LLVM 优化器与目标文件生成器
                    llvm-nm.exe             自举编译器使用的符号读取工具
+                   ld.lld.exe              自举编译器使用的链接器
                    zan-mvc.exe             MVC 路由生成工具
                    zan-lsp.exe             语言服务器（供外部编辑器）
                    zan-dap.exe             调试适配器（供外部编辑器）
@@ -304,6 +315,7 @@ Zan IDE 自包含发布包
                    zanrt_io*, zanrt_sync*  运行时目标文件
                  IDE 在这里找 zanc，zanc 在自己旁边找链接器 / sysroot / 标准库，
                  生成 .exe 不依赖任何外部工具链。请保持本目录完整。
+  bootstrap\     自举编译器源码及其有序输入清单。
   stdlib\        标准库源码。zanc 自动按需引入；请与 ZanIDE.exe 放在一起。
   packages\      官方扩展包生态池（Zan.Data、Zan.Gui.Charts 等）。
                  由内置 AI 助手或 pkg_install 按需安装至具体项目。

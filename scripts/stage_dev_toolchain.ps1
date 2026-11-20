@@ -39,7 +39,7 @@ foreach ($exe in @('zanc.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zan
     Add-StageInput (Join-Path $Build $exe) $exe -Required
 }
 if ($IncludeSelfhost) {
-    foreach ($exe in @('zanc-selfhost.exe', 'llvm-nm.exe')) {
+    foreach ($exe in @('zanc-selfhost.exe', 'llvm-nm.exe', 'opt.exe', 'llc.exe')) {
         Add-StageInput (Join-Path $Build $exe) $exe -Required
     }
     Assert-SdkFile (Join-Path $Build 'zanrt_crash.obj')
@@ -164,3 +164,5 @@ foreach ($action in $actions) {
 if ($IncludeDebugger) { Test-SdkGdb (Join-Path $destFull 'debugger\bin\gdb.exe') }
 foreach ($obsolete in @('pkg_stub.exe', 'pack_single.ps1')) { Remove-Item -LiteralPath (Join-Path $destFull $obsolete) -Force -ErrorAction SilentlyContinue }
 Write-Output "STAGE_TOOLCHAIN_OK -> $destFull ($copied item(s) updated)"
+# Successful robocopy operations may leave a nonzero native status.
+exit 0

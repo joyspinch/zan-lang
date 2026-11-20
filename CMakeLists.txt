@@ -678,14 +678,30 @@ if(WIN32)
             HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
         find_program(ZAN_LLVM_NM_EXECUTABLE NAMES llvm-nm.exe llvm-nm
             HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
-        if(ZAN_LLVM_NM_EXECUTABLE)
-            set(_bundled_nm "${CMAKE_BINARY_DIR}/llvm-nm.exe")
-            add_custom_command(OUTPUT "${_bundled_nm}"
-                COMMAND ${CMAKE_COMMAND} -E copy "${ZAN_LLVM_NM_EXECUTABLE}" "${_bundled_nm}"
-                DEPENDS "${ZAN_LLVM_NM_EXECUTABLE}"
-                VERBATIM)
-            add_custom_target(bundled_llvm_nm DEPENDS "${_bundled_nm}")
-            add_dependencies(zanc bundled_llvm_nm)
+        find_program(ZAN_LLVM_OPT_EXECUTABLE NAMES opt.exe opt
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+        find_program(ZAN_LLVM_LLC_EXECUTABLE NAMES llc.exe llc
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+        set(_selfhost_llvm_tools)
+        foreach(_llvm_tool llvm-nm opt llc)
+            if(_llvm_tool STREQUAL "llvm-nm")
+                set(_llvm_key NM)
+            else()
+                string(TOUPPER "${_llvm_tool}" _llvm_key)
+            endif()
+            set(_llvm_source "${ZAN_LLVM_${_llvm_key}_EXECUTABLE}")
+            if(_llvm_source)
+                set(_llvm_output "${CMAKE_BINARY_DIR}/${_llvm_tool}.exe")
+                add_custom_command(OUTPUT "${_llvm_output}"
+                    COMMAND ${CMAKE_COMMAND} -E copy "${_llvm_source}" "${_llvm_output}"
+                    DEPENDS "${_llvm_source}"
+                    VERBATIM)
+                list(APPEND _selfhost_llvm_tools "${_llvm_output}")
+            endif()
+        endforeach()
+        if(_selfhost_llvm_tools)
+            add_custom_target(bundled_selfhost_llvm DEPENDS ${_selfhost_llvm_tools})
+            add_dependencies(zanc bundled_selfhost_llvm)
         endif()
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
@@ -4308,7 +4324,7 @@ if(WIN32 AND ZAN_BUNDLE_TOOLCHAIN AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|am
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Building the self-hosted SDK compiler"
     VERBATIM)
-  add_custom_target(selfhost_compiler DEPENDS "${_selfhost_compiler}")
+  add_custom_target(selfhost_compiler DEPENDS "${_selfhost_compiler}" ${_selfhost_llvm_tools})
 endif()
 
 # The selfhost_gen1 test is registered further

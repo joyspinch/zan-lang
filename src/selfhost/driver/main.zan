@@ -13,7 +13,7 @@ namespace Zan;
 //
 // All inputs are concatenated into a single translation unit (they share one
 // namespace), lexed, parsed, bound, checked and lowered to LLVM IR text which
-// is written to <output.ll>. clang then compiles that to a native executable.
+// is written to <output.ll> or passed to the bundled LLVM tools for native output.
 //
 // Like the C host, stdlib modules are auto-included by PATH: every
 // `using X.Y.Z;` directive maps to <stdlib_root>/X/Y/Z, resolved to a
@@ -197,7 +197,8 @@ public partial class Program {
         }
     }
 
-    static string FindStdlibRoot() {
+    static string FindStdlibRoot(string explicitPath) {
+        if (explicitPath != "") { return explicitPath; }
         string envStdlib = Environment.GetEnvironmentVariable("ZAN_STDLIB_PATH");
         if (envStdlib != null && envStdlib.Length > 0 && Directory.ListNames(envStdlib + "/*") != "") {
             return envStdlib;
@@ -382,27 +383,36 @@ public partial class Program {
         #if WINDOWS
         string dir = Environment.ExeDir();
         if (RuntimeInformation.RuntimeIdentifier == "win-x64"
-            && File.Exists(dir + "/zanc.exe") && File.Exists(dir + "/ld.lld.exe")
             && File.Exists(dir + "/mingw/lib/crt2.o")) {
+            if (!File.Exists(dir + "/opt.exe") || !File.Exists(dir + "/llc.exe")
+                || !File.Exists(dir + "/ld.lld.exe")) {
+                throw "zanc: incomplete bundled LLVM toolchain at '" + dir + "' (requires opt.exe, llc.exe and ld.lld.exe)";
+            }
             return dir;
         }
         #endif
         return "";
     }
 
-    static void LinkBundledExe(string dir, string outPath, string llPath, string objPath,
-                               string optLevel, List<string> linkInputs) {
-        List<string> compileArgs = new List<string>();
-        compileArgs.Add("--compile-ir");
-        compileArgs.Add(llPath);
-        compileArgs.Add("--target");
-        compileArgs.Add("x86_64-w64-windows-gnu");
-        compileArgs.Add(optLevel);
-        compileArgs.Add("-o");
-        compileArgs.Add(objPath);
-        int rc = Process.RunWithStandardStreams(dir + "/zanc.exe", compileArgs);
-        if (rc != 0) { throw "zanc: IR compilation failed with exit code " + rc; }
+    static void CompileBundledObject(string dir, string llPath, string bitcodePath,
+                                     string objPath, string optLevel) {
+        string target = "-mtriple=x86_64-w64-windows-gnu";
+        List<string> optimize = new List<string>() {
+            target, "-relocation-model=pic", optLevel == "-O0" ? "-passes=verify" : optLevel,
+            llPath, "-o", bitcodePath
+        };
+        int rc = Process.RunWithStandardStreams(dir + "/opt.exe", optimize);
+        if (rc != 0) { throw "zanc: LLVM optimization failed with exit code " + rc; }
 
+        string codegen = optLevel == "-Os" || optLevel == "-Oz" ? "-O2" : optLevel;
+        List<string> emit = new List<string>() {
+            target, "-relocation-model=pic", "-filetype=obj", codegen, bitcodePath, "-o", objPath
+        };
+        rc = Process.RunWithStandardStreams(dir + "/llc.exe", emit);
+        if (rc != 0) { throw "zanc: LLVM object emission failed with exit code " + rc; }
+    }
+
+    static void LinkBundledExe(string dir, string outPath, string objPath, List<string> linkInputs) {
         string lib = dir + "/mingw/lib";
         List<string> args = new List<string>();
         args.Add("-m"); args.Add("i386pep");
@@ -432,7 +442,7 @@ public partial class Program {
         args.Add("-lws2_32"); args.Add("-lbcrypt"); args.Add("-l:libwinpthread.a");
         args.Add("--end-group");
         args.Add(lib + "/crtend.o");
-        rc = Process.RunWithStandardStreams(dir + "/ld.lld.exe", args);
+        int rc = Process.RunWithStandardStreams(dir + "/ld.lld.exe", args);
         if (rc != 0) { throw "zanc: linking failed with exit code " + rc; }
     }
 
@@ -520,6 +530,7 @@ public partial class Program {
         bool emitLib = false;
         bool denyWarnings = false;
         string metadataPath = "";
+        string explicitStdlib = "";
         bool metadataBodies = false;
         bool allSources = false;
         packageProject = "";
@@ -530,7 +541,7 @@ public partial class Program {
         while (i < argc) {
             string a = Environment.ArgAt(i);
             if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
-                || a == "--gen-meta") {
+                || a == "--gen-meta" || a == "--stdlib-path") {
                 if (i + 1 >= argc || Environment.ArgAt(i + 1) == ""
                     || Environment.ArgAt(i + 1).StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -558,6 +569,14 @@ public partial class Program {
                     throw "zanc: link input file does not exist: '" + input + "'";
                 }
                 linkInputs.Add(input);
+                i = i + 2;
+                continue;
+            }
+            if (a == "--stdlib-path") {
+                explicitStdlib = Path.GetFullPath(Environment.ArgAt(i + 1));
+                if (!Directory.ExistsOnDisk(explicitStdlib)) {
+                    throw "zanc: standard library directory does not exist: '" + explicitStdlib + "'";
+                }
                 i = i + 2;
                 continue;
             }
@@ -625,10 +644,10 @@ public partial class Program {
             ri = ri + 1;
         }
 
+        if (inclPaths.Count == 0) { throw "zanc: no input files"; }
         bool defaultOutput = !exportMetadata && !hasDashO && !legacyOutput;
         if (defaultOutput) {
             if (emitLib) { throw "zanc: --emit-lib requires an output path"; }
-            if (inclPaths.Count == 0) { throw "zanc: no input files"; }
             #if WINDOWS
             string input = first.StartsWith("@") ? inclPaths[0] : Path.GetFullPath(first);
             outPath = input.EndsWith(".zan") ? input.Substring(0, input.Length - 4) + ".exe" : input + ".exe";
@@ -644,8 +663,8 @@ public partial class Program {
         // directories; globbed stdlib files join the parse only when a
         // live name or an extension-method host requires them, to a
         // fixpoint, before anything parses.
-        stdlibRoot = FindStdlibRoot();
-        PiInitPkg(rawInputs[0]);
+        stdlibRoot = FindStdlibRoot(explicitStdlib);
+        PiInitPkg(inclPaths[0]);
             piDb = File.Exists("/tmp/zan_pullin_debug");
             PiInit();
             int pi = 0;
@@ -756,6 +775,7 @@ public partial class Program {
                     throw "zanc: cannot create a staging directory for " + outPath;
                 }
                 string llPath = workDir + "/module.ll";
+                string bitcodePath = workDir + "/module.bc";
                 string objPath = workDir + "/module.obj";
                 string exePath = workDir + "/program.exe";
                 try {
@@ -763,7 +783,8 @@ public partial class Program {
                     if (toolchain == "") {
                         LinkExe(clang, exePath, llPath, optLevel, linkInputs);
                     } else {
-                        LinkBundledExe(toolchain, exePath, llPath, objPath, optLevel, linkInputs);
+                        CompileBundledObject(toolchain, llPath, bitcodePath, objPath, optLevel);
+                        LinkBundledExe(toolchain, exePath, objPath, linkInputs);
                     }
                     StageNativeFiles(bundleFiles, workDir, outputDir, Path.GetFileName(finalPath));
                     if (Nio.ReplaceFile(exePath, finalPath) != 0) {
@@ -771,6 +792,7 @@ public partial class Program {
                     }
                 } finally {
                     File.Delete(llPath);
+                    File.Delete(bitcodePath);
                     File.Delete(objPath);
                     File.Delete(exePath);
                     for (int fi = 0; fi < bundleFiles.Count; fi = fi + 1) {

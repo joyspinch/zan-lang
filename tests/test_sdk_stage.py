@@ -47,7 +47,8 @@ class SdkStageTests(unittest.TestCase):
     def stage_fixture(self):
         build = self.base / "build"
         names = ["zanc.exe", "zanc-selfhost.exe", "zan-mvc.exe", "zan-lsp.exe", "zan-dap.exe", "zanfmt.exe", "zandoc.exe",
-                 "ld.exe", "ld.lld.exe", "llvm-ar.exe", "llvm-nm.exe", "zanrt_timer.obj", "zanrt_io.obj", "zanrt_io_mt.obj", "zanrt_sync.obj", "zanrt_file.obj", "zanrt_decimal.obj",
+                 "ld.exe", "ld.lld.exe", "llvm-ar.exe", "llvm-nm.exe", "opt.exe", "llc.exe",
+                 "zanrt_timer.obj", "zanrt_io.obj", "zanrt_io_mt.obj", "zanrt_sync.obj", "zanrt_file.obj", "zanrt_decimal.obj",
                  "zan_embed_api.obj", "zan_inflate.obj", "zanrt_crash.obj", "libzancrypto.a"]
         names += ["mingw/lib/" + n for n in ("crt2.o", "libmingw32.a", "libkernel32.a")]
         names += ["linux-musl/" + n for n in ("libc.a", "crt1.o", "crti.o", "crtn.o", "zanrt_timer.o", "zanrt_io.o",
@@ -64,7 +65,7 @@ class SdkStageTests(unittest.TestCase):
         build = self.stage_fixture()
         dest = self.base / "stage"
         marker = self.write(dest / "marker", "preserve")
-        for name in ("zan-lsp.exe", "zanc-selfhost.exe", "llvm-nm.exe"):
+        for name in ("zan-lsp.exe", "zanc-selfhost.exe", "llvm-nm.exe", "opt.exe", "llc.exe"):
             with self.subTest(name=name):
                 (build / name).unlink()
                 result = self.call(POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1",
@@ -93,7 +94,7 @@ class SdkStageTests(unittest.TestCase):
                   "-Dest", dest, "-IncludeSelfhost", "-InputList", inputs, env=env)
         self.assertEqual(old.read_bytes(), (build / "zan-lsp.exe").read_bytes())
         mappings = {row["destination"]: Path(row["source"]) for row in SDK.load(inputs)}
-        for name in ("zanc-selfhost.exe", "llvm-nm.exe"):
+        for name in ("zanc-selfhost.exe", "llvm-nm.exe", "opt.exe", "llc.exe"):
             with self.subTest(name=name):
                 self.assertEqual(mappings[name].resolve(), (build / name).resolve())
                 self.assertEqual((dest / name).read_bytes(), (build / name).read_bytes())
@@ -428,8 +429,15 @@ class SdkStageTests(unittest.TestCase):
     def test_consumption_receipt_requires_restricted_selfhost_run(self):
         sdk = self.base / "sdk"
         compiler = self.write(sdk / "toolchain/zanc-selfhost.exe")
+        seed = self.write(sdk / "toolchain/zanc.exe", "C bootstrap seed")
+        self.write(sdk / "bootstrap/selfhost_sources.txt", "selfhost/main\n")
+        bootstrap_source = self.write(sdk / "bootstrap/selfhost/main.zan")
+        template = self.write(sdk / "templates" / SDK.CONSOLE_TEMPLATE / "src/main.zan")
+        stdlib_args = ["--stdlib-path", str(sdk / "stdlib")]
+        gen2 = compiler.with_name("bootstrap-gen2.exe")
+        gen3 = compiler.with_name("bootstrap-gen3.exe")
         manifest = {"schema": SDK.SCHEMA, "phase": "staged", "validation": "local-build-only",
-                    "build_identity_sha256": "a" * 64, "files": SDK.inventory(sdk)}
+                    "version": "1.2.3", "build_identity_sha256": "a" * 64, "files": SDK.inventory(sdk)}
         manifest["manifest_sha256"] = SDK.identity.digest(manifest)
         SDK.identity.atomic_json(sdk / "sdk-manifest.json", manifest)
         receipt = sdk / "sdk-consumption.json"
@@ -446,25 +454,38 @@ class SdkStageTests(unittest.TestCase):
             self.assertEqual(work, args.output / "selfhost")
             self.assertEqual(env["PATH"].split(os.pathsep), [str(system / "System32"), str(system)])
             self.assertNotIn("ZAN_CLANG", env)
+            self.assertFalse(seed.exists())
             artifact = work / "probe.exe"
-            if command[0] == str(compiler):
-                source = work / "probe.zan"
-                self.assertEqual(command[1:], [str(source), "-o", str(artifact)])
-                self.assertIn(token, source.read_text(encoding="utf-8"))
+            if command[1:] == ["--version"]:
+                self.assertIn(Path(command[0]), (gen2, gen3))
+                return subprocess.CompletedProcess(command, 0, "zanc 1.2.3 (gen1)\n", "")
+            if command[0] in (str(compiler), str(gen2)):
+                target = gen2 if command[0] == str(compiler) else gen3
+                response = work / "bootstrap sources.rsp"
+                self.assertEqual(command[1:], ["@" + str(response), *stdlib_args, "-o", str(target)])
+                self.assertEqual(response.read_text(encoding="utf-8"), f'"{bootstrap_source.as_posix()}"\n')
+                self.write(target)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if command[0] == str(gen3):
+                self.assertEqual(command[1:], [str(template), *stdlib_args, "-o", str(artifact)])
                 self.write(artifact)
                 return subprocess.CompletedProcess(command, 0, "", "")
-            self.assertEqual(command, [str(artifact)])
+            self.assertEqual(command, [str(artifact), token])
             return subprocess.CompletedProcess(command, 0, runtime_stdout, "")
 
         with mock.patch.dict(os.environ, {"SystemRoot": str(system), "ZAN_CLANG": "developer-clang.exe"}), \
                 mock.patch.object(SDK.subprocess, "run", side_effect=run):
             args = SimpleNamespace(sdk=sdk, output=self.base / "pass", filter="^console/test$")
-            runtime_stdout = token + "\n"
+            runtime_stdout = "  参数[0] = " + token + "\n"
             SDK.consume(args)
             evidence = SDK.load(receipt)["selfhost"]
             self.assertEqual(SDK.load(evidence["runtime_log"]["path"])["stdout"], runtime_stdout)
             self.assertEqual(Path(evidence["compile_log"]["path"]).parent, args.output / "selfhost")
             self.assertEqual(Path(evidence["artifact"]["path"]).parent, args.output / "selfhost")
+            self.assertEqual([row["artifact"]["path"] for row in evidence["bootstrap"]], [str(gen2), str(gen3)])
+            self.assertEqual(seed.read_text(), "C bootstrap seed")
+            self.assertFalse(gen2.exists())
+            self.assertFalse(gen3.exists())
 
             args.output = self.base / "fail"
             runtime_stdout = "wrong output"
@@ -781,14 +802,15 @@ fi
     def test_windows_workflow_prepares_before_seal_and_packages_platform_root(self):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
         windows = text[text.index("  windows:"):text.index("  release:")]
-        self.assertIn("ZAN_LLVM_NM_EXECUTABLE", windows)
+        self.assertIn("foreach ($key in @('NM', 'OPT', 'LLC'))", windows)
+        self.assertIn("ZAN_LLVM_${key}_EXECUTABLE", windows)
         capture = windows.index("-Action Capture")
         build = windows.index("cmake --build build -j")
         shared_drivers = windows.index("& ./scripts/build_gui_driver.ps1\n")
         static_game = windows.index("& ./scripts/build_gui_driver.ps1 -Static -Drivers zan_game")
         prepare = windows.index("-PrepareOnly -NoBump")
         seal = windows.index("-Action Seal")
-        self.assertLess(windows.index("$releaseNative += $llvmNm"), capture)
+        self.assertLess(windows.index("$releaseNative += $llvmTool"), capture)
         self.assertLess(capture, build)
         self.assertLess(build, shared_drivers)
         self.assertLess(shared_drivers, static_game)
