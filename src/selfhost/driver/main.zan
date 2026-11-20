@@ -378,6 +378,64 @@ public partial class Program {
         }
     }
 
+    static string BundledToolchain() {
+        #if WINDOWS
+        string dir = Environment.ExeDir();
+        if (RuntimeInformation.RuntimeIdentifier == "win-x64"
+            && File.Exists(dir + "/zanc.exe") && File.Exists(dir + "/ld.lld.exe")
+            && File.Exists(dir + "/mingw/lib/crt2.o")) {
+            return dir;
+        }
+        #endif
+        return "";
+    }
+
+    static void LinkBundledExe(string dir, string outPath, string llPath, string objPath,
+                               string optLevel, List<string> linkInputs) {
+        List<string> compileArgs = new List<string>();
+        compileArgs.Add("--compile-ir");
+        compileArgs.Add(llPath);
+        compileArgs.Add("--target");
+        compileArgs.Add("x86_64-w64-windows-gnu");
+        compileArgs.Add(optLevel);
+        compileArgs.Add("-o");
+        compileArgs.Add(objPath);
+        int rc = Process.RunWithStandardStreams(dir + "/zanc.exe", compileArgs);
+        if (rc != 0) { throw "zanc: IR compilation failed with exit code " + rc; }
+
+        string lib = dir + "/mingw/lib";
+        List<string> args = new List<string>();
+        args.Add("-m"); args.Add("i386pep");
+        args.Add("-Bdynamic");
+        args.Add("--stack"); args.Add("268435456");
+        args.Add("--gc-sections");
+        args.Add("-o"); args.Add(outPath);
+        args.Add("-L" + lib);
+        args.Add(lib + "/crt2.o");
+        args.Add(lib + "/crtbegin.o");
+        args.Add(objPath);
+        args.Add(dir + "/zanrt_file.obj");
+        args.Add(dir + "/zanrt_io.obj");
+        args.Add(dir + "/zanrt_timer.obj");
+        args.Add(dir + "/zanrt_sync.obj");
+        args.Add(dir + "/zanrt_decimal.obj");
+        args.Add(dir + "/zan_embed_api.obj");
+        args.Add(dir + "/zanrt_crash.obj");
+        args.Add(dir + "/zan_inflate.obj");
+        args.Add(dir + "/libzancrypto.a");
+        args.Add("--start-group");
+        for (int i = 0; i < linkInputs.Count; i = i + 1) { args.Add(linkInputs[i]); }
+        args.Add("-lmingw32"); args.Add("-lgcc"); args.Add("-lgcc_eh");
+        args.Add("-lsupc++"); args.Add("-lmoldname"); args.Add("-lmingwex");
+        args.Add("-lmsvcrt"); args.Add("-lkernel32"); args.Add("-lshell32");
+        args.Add("-luser32"); args.Add("-ladvapi32"); args.Add("-lversion");
+        args.Add("-lws2_32"); args.Add("-lbcrypt"); args.Add("-l:libwinpthread.a");
+        args.Add("--end-group");
+        args.Add(lib + "/crtend.o");
+        rc = Process.RunWithStandardStreams(dir + "/ld.lld.exe", args);
+        if (rc != 0) { throw "zanc: linking failed with exit code " + rc; }
+    }
+
     static void LinkExe(string clang, string outPath, string llPath, string optLevel, List<string> linkInputs) {
         string exe = Environment.ExeDir();
         string rtDir = exe;
@@ -679,10 +737,18 @@ public partial class Program {
             if (isExe && !emitLib) {
                 string finalPath = Path.GetFullPath(outPath);
                 string outputDir = Path.GetDirectoryName(finalPath);
-                string clang = FindClang();
+                string clang = Environment.GetEnvironmentVariable("ZAN_CLANG");
+                string toolchain = clang != null && File.Exists(clang) ? "" : BundledToolchain();
+                string nm = toolchain + "/llvm-nm.exe";
+                if (toolchain == "") {
+                    clang = FindClang();
+                    string dir = Path.GetDirectoryName(clang);
+                    nm = dir + "/llvm-nm.exe";
+                    if (dir == "" || !File.Exists(nm)) { nm = "llvm-nm.exe"; }
+                }
                 List<string> bundleFiles = new List<string>();
                 List<string> libraries = new List<string>();
-                if (ig.collectNativeImports) { ResolveNativeImports(ig, clang, linkInputs, bundleFiles, libraries); }
+                if (ig.collectNativeImports) { ResolveNativeImports(ig, nm, linkInputs, bundleFiles, libraries); }
                 for (int i = 0; i < libraries.Count; i = i + 1) { linkInputs.Add(libraries[i]); }
                 string suffix = Guid.New();
                 string workDir = outputDir + "/.zanc-" + suffix;
@@ -690,16 +756,22 @@ public partial class Program {
                     throw "zanc: cannot create a staging directory for " + outPath;
                 }
                 string llPath = workDir + "/module.ll";
+                string objPath = workDir + "/module.obj";
                 string exePath = workDir + "/program.exe";
                 try {
                     File.WriteAllText(llPath, ir);
-                    LinkExe(clang, exePath, llPath, optLevel, linkInputs);
+                    if (toolchain == "") {
+                        LinkExe(clang, exePath, llPath, optLevel, linkInputs);
+                    } else {
+                        LinkBundledExe(toolchain, exePath, llPath, objPath, optLevel, linkInputs);
+                    }
                     StageNativeFiles(bundleFiles, workDir, outputDir, Path.GetFileName(finalPath));
                     if (Nio.ReplaceFile(exePath, finalPath) != 0) {
                         throw "zanc: cannot publish executable " + outPath;
                     }
                 } finally {
                     File.Delete(llPath);
+                    File.Delete(objPath);
                     File.Delete(exePath);
                     for (int fi = 0; fi < bundleFiles.Count; fi = fi + 1) {
                         File.Delete(workDir + "/native-" + fi);

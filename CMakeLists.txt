@@ -673,6 +673,17 @@ if(WIN32)
     if(ZAN_BUNDLE_TOOLCHAIN)
         find_program(ZAN_LLD_EXECUTABLE NAMES ld.lld.exe ld.lld lld.exe lld
             HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+        find_program(ZAN_LLVM_NM_EXECUTABLE NAMES llvm-nm.exe llvm-nm
+            HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+        if(ZAN_LLVM_NM_EXECUTABLE)
+            set(_bundled_nm "${CMAKE_BINARY_DIR}/llvm-nm.exe")
+            add_custom_command(OUTPUT "${_bundled_nm}"
+                COMMAND ${CMAKE_COMMAND} -E copy "${ZAN_LLVM_NM_EXECUTABLE}" "${_bundled_nm}"
+                DEPENDS "${ZAN_LLVM_NM_EXECUTABLE}"
+                VERBATIM)
+            add_custom_target(bundled_llvm_nm DEPENDS "${_bundled_nm}")
+            add_dependencies(zanc bundled_llvm_nm)
+        endif()
         add_custom_command(TARGET zanc POST_BUILD
             COMMAND ${CMAKE_COMMAND}
                     -DMINGW_ROOT=${_zan_mingw_root}
@@ -4284,6 +4295,18 @@ foreach(_sh_line IN LISTS _sh_lines)
   endif()
   list(APPEND SELFHOST_SOURCES ${CMAKE_SOURCE_DIR}/src/${_sh_line}.zan)
 endforeach()
+
+if(WIN32 AND ZAN_BUNDLE_TOOLCHAIN AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|x64)$")
+  set(_selfhost_compiler "${CMAKE_BINARY_DIR}/zanc-selfhost.exe")
+  add_custom_command(OUTPUT "${_selfhost_compiler}"
+    COMMAND $<TARGET_FILE:zanc> ${SELFHOST_SOURCES} --auto-stdlib -O0 -o "${_selfhost_compiler}"
+    DEPENDS zanc ${SELFHOST_SOURCES} ${_stdlib_stamp}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building the self-hosted SDK compiler"
+    VERBATIM)
+  add_custom_target(selfhost_compiler DEPENDS "${_selfhost_compiler}")
+endif()
+
 # The selfhost_gen1 test is registered further
 # down, right after the zanrt_selfhost_bundle block: their stage 3 links the
 # emitted IR against the C runtime, so they need the bundle's objects

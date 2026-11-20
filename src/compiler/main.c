@@ -602,6 +602,7 @@ static int zan_write_static_lib(const char *obj, const char *arc,
 
 
 #include "driver/main_options.c"
+#include "driver/main_ir_object.c"
 
 
 int main(int argc, char **argv) {
@@ -614,7 +615,10 @@ int main(int argc, char **argv) {
         LLVMParseCommandLineOptions(2, cl, "");
     }
     expand_arg_files(&argc, &argv);
-        zan_options_t opts;
+    if (argc > 1 && strcmp(argv[1], "--compile-ir") == 0)
+        return compile_ir_object(argc, argv);
+
+    zan_options_t opts;
     zan_options_status_t opt_st = zan_options_parse(argc, argv, &opts);
     if (opt_st != ZAN_OPTIONS_OK) {
         return opts.exit_code;

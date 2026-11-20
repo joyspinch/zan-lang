@@ -46,7 +46,7 @@ build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
 build/zanc src/main.zan --publish -o app.exe
 ```
 
-Windows 自举编译器也支持 `build/selfhost_gen1.exe src/main.zan`，默认生成 `src/main.exe` 并使用 `-O2`。生成可执行文件时，若可达的 `[DllImport]` 声明同目录下有 `drivers/driver.manifest`，自举驱动可按宿主平台选用导入库，并将 `.bundle` 中直接列出的 DLL 放到输出目录。使用 `--link-input <文件>` 时由调用方提供原生链接输入。`-o <文件.ll>` 可显式输出 LLVM IR。
+Windows x64 SDK 自带 `toolchain/zanc-selfhost.exe`。运行 `toolchain/zanc-selfhost.exe src/main.zan` 默认生成 `src/main.exe` 并使用 `-O2`。自举编译器通过同目录的 `zanc.exe` 生成 COFF 对象，由随包的 LLD、MinGW CRT 和 Zan 运行时链接，用户无需安装 Clang。开发环境可通过 `ZAN_CLANG` 显式选择已有的 Clang。生成可执行文件时，若可达的 `[DllImport]` 声明同目录下有 `drivers/driver.manifest`，自举驱动可按宿主平台选用导入库，并将 `.bundle` 中直接列出的 DLL 放到输出目录。使用 `--link-input <文件>` 时由调用方提供原生链接输入。`-o <文件.ll>` 可显式输出 LLVM IR。
 
 ### 1.2 GUI 程序
 
@@ -236,6 +236,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--dump-tokens` | — | 词法 token 后退出 |
 | `--dump-ast` | — | 打印语法树后继续编译 |
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
+| `zanc --compile-ir <input.ll> -o <object>` | `-O2` | 将 LLVM IR 优化并编译为对象文件。可用 `--target <LLVM triple>` 指定目标，以及 `-O0` 至 `-O3`、`-Os`、`-Oz` 选择优化等级 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |

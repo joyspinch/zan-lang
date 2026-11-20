@@ -199,6 +199,44 @@ def verify_sdk(sdk):
     return manifest
 
 
+def run_selfhost_probe_step(command, work, env, log, timeout):
+    process = subprocess.run(command, input="", text=True, encoding="utf-8", errors="replace",
+                             capture_output=True, timeout=timeout, cwd=work, env=env)
+    identity.atomic_json(log, {"command": command, "exit_code": process.returncode,
+                               "stdout": process.stdout, "stderr": process.stderr})
+    if process.returncode != 0:
+        raise ValueError(f"Staged self-hosted compiler probe failed ({process.returncode}); see {log}")
+    return process.stdout
+
+
+def consume_selfhost(sdk, output):
+    work = output / "selfhost"
+    work.mkdir()
+    source = work / "probe.zan"
+    artifact = work / "probe.exe"
+    token = "sdk-selfhost-consumption-probe"
+    source.write_text('using System;\nclass Program {\n'
+                      f'    static void Main() {{ Console.WriteLine("{token}"); }}\n'
+                      '}\n', encoding="utf-8")
+
+    system = Path(os.environ["SystemRoot"])
+    env = {"SystemRoot": str(system), "PATH": os.pathsep.join((str(system / "System32"), str(system))),
+           "TEMP": str(work), "TMP": str(work)}
+    compile_log = work / "compile.json"
+    compiler = sdk / "toolchain/zanc-selfhost.exe"
+    run_selfhost_probe_step([str(compiler), str(source), "-o", str(artifact)], work, env, compile_log, 120)
+    executable = identity.required_identity(artifact)
+    if not executable["size"]:
+        raise ValueError("Staged self-hosted compiler produced an empty executable")
+
+    runtime_log = work / "runtime.json"
+    stdout = run_selfhost_probe_step([str(artifact)], work, env, runtime_log, 30)
+    if stdout.strip() != token:
+        raise ValueError(f"Staged self-hosted compiler probe produced unexpected output; see {runtime_log}")
+    return {"artifact": executable, "compile_log": identity.required_identity(compile_log),
+            "runtime_log": identity.required_identity(runtime_log)}
+
+
 def consume(args):
     sdk = args.sdk.resolve()
     receipt = sdk / "sdk-consumption.json"
@@ -230,13 +268,15 @@ def consume(args):
             raise ValueError("Staged SDK console-args runtime did not preserve the supplied argument")
         runs.append({"template": row["template"], "artifact": identity.required_identity(artifact),
                      "log": identity.required_identity(log)})
+    selfhost = consume_selfhost(sdk, output)
     after = verify_sdk(sdk)
     if after != manifest:
         raise ValueError("SDK identity changed during consumption")
     identity.atomic_json(receipt, {"schema": SCHEMA, "phase": "templates-consumed",
         "manifest_sha256": manifest["manifest_sha256"], "build_identity_sha256": manifest["build_identity_sha256"],
         "validation": manifest["validation"], "command": command,
-        "results": identity.required_identity(output / "results.json"), "selected": results["selected"], "runs": runs})
+        "results": identity.required_identity(output / "results.json"), "selected": results["selected"],
+        "runs": runs, "selfhost": selfhost})
 
 
 def main():
@@ -324,6 +364,6 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print("SDK stage failed: %s" % error, file=sys.stderr)
         raise SystemExit(1)

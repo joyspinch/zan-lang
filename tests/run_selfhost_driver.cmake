@@ -116,6 +116,14 @@ if(WIN32 AND CLANG)
   if(triple MATCHES "^(aarch64|arm64)-")
     set(arch arm64)
   endif()
+  get_filename_component(_gen1_dir "${GEN1}" DIRECTORY)
+  set(_gen1_env "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}")
+  if(arch STREQUAL "x64" AND EXISTS "${_gen1_dir}/mingw/lib/crt2.o")
+    set(_gen1_env "${CMAKE_COMMAND}" -E env --unset=ZAN_CLANG --unset=ZAN_LLVM_ROOT
+      --unset=LLVM_ROOT --unset=LLVM_HOME --unset=USERPROFILE --unset=ProgramFiles
+      --unset=ProgramW6432 "PATH=$ENV{SystemRoot}/System32")
+    set(_bundled_link TRUE)
+  endif()
   set(stdlib "${OUTDIR}/native-stdlib")
   set(stdlib_driver "${stdlib}/Fixture/Nested/drivers")
   file(MAKE_DIRECTORY "${stdlib_driver}/win-${arch}")
@@ -135,7 +143,7 @@ class Program {
 }
 ]=])
   file(REMOVE "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}" "ZAN_STDLIB_PATH=${stdlib}"
+  execute_process(COMMAND ${_gen1_env} "ZAN_STDLIB_PATH=${stdlib}"
     "${GEN1}" "${_default_src}" WORKING_DIRECTORY "${_root}"
     RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}" OR NOT EXISTS "${OUTDIR}/stdlib-payload.dat")
@@ -154,8 +162,7 @@ class Program {
   set(_sqlite_exe "${_sqlite_out}/sqlite_params.exe")
   set(_sqlite_dll "${_sqlite_out}/libsqlite3-0.dll")
   file(REMOVE "${_sqlite_exe}" "${_sqlite_dll}")
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
-    "${GEN1}" "${_sqlite_case}.zan" -o "${_sqlite_exe}" WORKING_DIRECTORY "${_root}"
+  execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_sqlite_case}.zan" -o "${_sqlite_exe}" WORKING_DIRECTORY "${_root}"
     RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
   if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_sqlite_exe}" OR NOT EXISTS "${_sqlite_dll}")
     message(FATAL_ERROR "automatic SQLite link or bundle failed, rc=${rc}\n${stdout}${stderr}")
@@ -170,6 +177,48 @@ class Program {
     message(FATAL_ERROR "automatic SQLite executable failed, rc=${rc}\n${stdout}${stderr}")
   endif()
 
+  if(_bundled_link)
+    set(_ir "${OUTDIR}/module input.ll")
+    set(_obj "${OUTDIR}/module output.obj")
+    set(_backend ${_gen1_env} "${ZANC}" --compile-ir "${_ir}"
+      --target x86_64-w64-windows-gnu -o "${_obj}")
+    file(WRITE "${_ir}" "define i32 @probe() { ret i32 42 }\n")
+    execute_process(COMMAND ${_backend} RESULT_VARIABLE rc
+      OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+    if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_obj}")
+      message(FATAL_ERROR "IR object compilation failed, rc=${rc}\n${stdout}${stderr}")
+    endif()
+    file(SHA256 "${_obj}" _before)
+    file(WRITE "${_ir}" "invalid IR\n")
+    execute_process(COMMAND ${_backend} RESULT_VARIABLE rc
+      OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+    file(SHA256 "${_obj}" _after)
+    file(GLOB _staging "${OUTDIR}/.zanc-*")
+    file(REMOVE "${_ir}" "${_obj}")
+    if("${rc}" STREQUAL "0" OR NOT _before STREQUAL _after OR _staging)
+      message(FATAL_ERROR "invalid IR altered the previous object or retained staging files")
+    endif()
+
+    foreach(_case IN ITEMS async_throw exception_threads)
+      set(_exe "${OUTDIR}/${_case}.exe")
+      execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_root}/tests/conformance/${_case}.zan"
+        -Oz -o "${_exe}" WORKING_DIRECTORY "${_root}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
+      if(NOT "${rc}" STREQUAL "0")
+        message(FATAL_ERROR "bundled ${_case}: compilation failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      execute_process(COMMAND "${_exe}" RESULT_VARIABLE rc OUTPUT_VARIABLE stdout
+        ERROR_VARIABLE stderr TIMEOUT 15)
+      file(REMOVE "${_exe}")
+      file(READ "${_root}/tests/conformance/${_case}.out" expected)
+      string(STRIP "${expected}" expected)
+      string(STRIP "${stdout}" actual)
+      if(NOT "${rc}" STREQUAL "0" OR NOT actual STREQUAL expected)
+        message(FATAL_ERROR "bundled ${_case}: execution failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+    endforeach()
+  endif()
+
   set(_exe "${OUTDIR}/driver output.exe")
   set(_native "${_root}/tests/selfhost/driver_native.zan")
   set(_obj "${OUTDIR}/driver native.obj")
@@ -178,8 +227,7 @@ class Program {
   if(NOT "${rc}" STREQUAL "0")
     message(FATAL_ERROR "native fixture compilation failed, rc=${rc}\n${stdout}${stderr}")
   endif()
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
-    "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0 --link-input "driver native.obj"
+  execute_process(COMMAND ${_gen1_env} "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0 --link-input "driver native.obj"
     WORKING_DIRECTORY "${OUTDIR}" RESULT_VARIABLE rc
     OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_exe}")
@@ -190,8 +238,7 @@ class Program {
     message(FATAL_ERROR "direct executable failed, rc=${rc}")
   endif()
   file(SHA256 "${_exe}" _before)
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
-    "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0
+  execute_process(COMMAND ${_gen1_env} "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0
     WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
     OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   file(REMOVE "${_obj}")
@@ -247,7 +294,7 @@ class Program {
   if(NOT "${rc}" STREQUAL "0")
     message(FATAL_ERROR "second native fixture compilation failed, rc=${rc}\n${stdout}${stderr}")
   endif()
-  set(compile "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}" "${GEN1}"
+  set(compile ${_gen1_env} "${GEN1}"
     "${project}/app.zan" -o "${_exe}" --package-project "${project}")
   set(explicit_inputs --link-input "explicit native.obj" --link-input offset.obj)
   execute_process(COMMAND ${compile} ${explicit_inputs}

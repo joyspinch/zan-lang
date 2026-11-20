@@ -5,7 +5,8 @@ param(
     [string]$Dest = '',
     [switch]$IncludeDebugger,
     [switch]$PreflightOnly,
-    [string]$InputList = ''
+    [string]$InputList = '',
+    [switch]$IncludeSelfhost
 )
 $ErrorActionPreference = 'Stop'
 # pwsh -> Python -> Windows PowerShell can inherit pwsh's incompatible Utility
@@ -36,6 +37,12 @@ function Add-StageInput([string]$Source, [string]$Name, [switch]$Directory, [swi
 }
 foreach ($exe in @('zanc.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
     Add-StageInput (Join-Path $Build $exe) $exe -Required
+}
+if ($IncludeSelfhost) {
+    foreach ($exe in @('zanc-selfhost.exe', 'llvm-nm.exe')) {
+        Add-StageInput (Join-Path $Build $exe) $exe -Required
+    }
+    Assert-SdkFile (Join-Path $Build 'zanrt_crash.obj')
 }
 Add-StageInput (Join-Path $Build 'mingw') 'mingw' -Directory -Required
 Add-StageInput (Find-HostLlvmAr $Build) 'llvm-ar.exe' -Required

@@ -12,7 +12,8 @@
 #   dist\win-x64\
 #     ZanIDE.exe           the IDE (skins embedded)
 #     toolchain\          the Zan compiler + its self-contained linker bundle:
-#                           zanc.exe, ld.exe, mingw\, linux-musl\ ...
+#                           zanc.exe, zanc-selfhost.exe, ld.lld.exe, llvm-nm.exe,
+#                           ld.exe, mingw\, linux-musl\ ...
 #                         (the IDE finds zanc here; zanc finds its linker next
 #                          to itself in this same folder)
 #     stdlib\             standard library sources (zanc auto-includes from here)
@@ -56,6 +57,8 @@ Write-Output "Publishing version $version"
 # All build-producing operations are confined to preparation, under the caller's
 # shared gate. SkipBuild only consumes these outputs; it never invokes zanc.
 if (-not $SkipBuild) {
+    & cmake --build (Join-Path $root 'build') --target selfhost_compiler
+    if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: self-hosted compiler build error' }
     & (Join-Path $root 'scripts\build_ide.ps1') -SkipDesignGeneration:$SkipDesignGeneration
     if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: IDE build error' }
     $buildZanc = Join-Path $root 'build\zanc.exe'
@@ -82,7 +85,7 @@ if (-not $SkipBuild) {
         -RedirectStandardOutput $mcpLog -RedirectStandardError "$mcpLog.err"
     if ($proc.ExitCode -ne 0) { throw "PUBLISH_FAILED: MCP build error ($($proc.ExitCode)); see $mcpLog.err" }
     Assert-SdkFile (Join-Path $root 'build\zan-mcp.exe')
-    if ($PrepareOnly) { Write-Output 'PUBLISH_PREPARE_OK (IDE, MCP, knowledge; no dist mutation)'; return }
+    if ($PrepareOnly) { Write-Output 'PUBLISH_PREPARE_OK (self-hosted compiler, IDE, MCP, knowledge; no dist mutation)'; return }
 }
 
 # ---- complete preflight, before deleting any old output ----
@@ -95,7 +98,7 @@ $toolInputs = Join-Path $work 'sdk-toolchain-inputs.json'
 $planFile = Join-Path $work 'sdk-stage-plan.json'
 $ticket = Join-Path $work 'sdk-stage-preflight.json'
 & (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
-    -IncludeDebugger -PreflightOnly -InputList $toolInputs
+    -IncludeDebugger -IncludeSelfhost -PreflightOnly -InputList $toolInputs
 $copies = [Collections.Generic.List[object]]::new()
 function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
     $kind = if ($Tree) { 'Container' } else { 'Leaf' }
@@ -149,7 +152,7 @@ if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -For
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 & python -I -B $manifestTool copy-sources --plan $planFile --sdk $dist
 if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: SDK source copy failed' }
-& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc -IncludeDebugger
+& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc -IncludeDebugger -IncludeSelfhost
 
 # ---- release readme ---------------------------------------------------------
 Write-Output "[5/6] Writing README.txt + AI entry index ..."
@@ -171,6 +174,8 @@ Contents
                  wins, which is how you override one without a rebuild.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
+                   zanc-selfhost.exe       the self-hosted compiler
+                   llvm-nm.exe             symbol reader used by zanc-selfhost
                    zan-mvc.exe             MVC route generator
                    zan-lsp.exe             language server (for external editors)
                    zan-dap.exe             debug adapter (for external editors)
@@ -287,6 +292,8 @@ Zan IDE 自包含发布包
                  这就是不重新打包就替换它们的办法。
   toolchain\     Zan 编译器及其链接所需的一切，全部作为同目录的兄弟文件平铺：
                    zanc.exe                编译器
+                   zanc-selfhost.exe       自举编译器
+                   llvm-nm.exe             自举编译器使用的符号读取工具
                    zan-mvc.exe             MVC 路由生成工具
                    zan-lsp.exe             语言服务器（供外部编辑器）
                    zan-dap.exe             调试适配器（供外部编辑器）

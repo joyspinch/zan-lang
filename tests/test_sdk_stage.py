@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("sdk_stage", ROOT / "scripts/sdk_stage_manifest.py")
@@ -39,9 +41,9 @@ class SdkStageTests(unittest.TestCase):
 
     def stage_fixture(self):
         build = self.base / "build"
-        names = ["zanc.exe", "zan-mvc.exe", "zan-lsp.exe", "zan-dap.exe", "zanfmt.exe", "zandoc.exe", "ld.exe", "ld.lld.exe", "llvm-ar.exe",
-                 "zanrt_timer.obj", "zanrt_io.obj", "zanrt_io_mt.obj", "zanrt_sync.obj", "zanrt_file.obj", "zanrt_decimal.obj",
-                 "zan_embed_api.obj", "zan_inflate.obj", "libzancrypto.a"]
+        names = ["zanc.exe", "zanc-selfhost.exe", "zan-mvc.exe", "zan-lsp.exe", "zan-dap.exe", "zanfmt.exe", "zandoc.exe",
+                 "ld.exe", "ld.lld.exe", "llvm-ar.exe", "llvm-nm.exe", "zanrt_timer.obj", "zanrt_io.obj", "zanrt_io_mt.obj", "zanrt_sync.obj", "zanrt_file.obj", "zanrt_decimal.obj",
+                 "zan_embed_api.obj", "zan_inflate.obj", "zanrt_crash.obj", "libzancrypto.a"]
         names += ["mingw/lib/" + n for n in ("crt2.o", "libmingw32.a", "libkernel32.a")]
         names += ["linux-musl/" + n for n in ("libc.a", "crt1.o", "crti.o", "crtn.o", "zanrt_timer.o", "zanrt_io.o",
                   "zanrt_io_mt.o", "zanrt_sync.o", "zanrt_file.o", "zanrt_decimal.o", "zan_embed_api.o", "zan_inflate.o", "libzancrypto.a")]
@@ -55,14 +57,17 @@ class SdkStageTests(unittest.TestCase):
     @unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell staging contract")
     def test_missing_cli_fails_before_touching_previous_stage(self):
         build = self.stage_fixture()
-        (build / "zan-lsp.exe").unlink()
         dest = self.base / "stage"
         marker = self.write(dest / "marker", "preserve")
-        result = self.call(POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1",
-                           "-Build", build, "-Dest", dest, success=False)
-        self.assertIn("zan-lsp.exe", result.stdout + result.stderr)
-        self.assertEqual(marker.read_text(), "preserve")
-        self.assertFalse((dest / "zanc.exe").exists())
+        for name in ("zan-lsp.exe", "zanc-selfhost.exe", "llvm-nm.exe"):
+            with self.subTest(name=name):
+                (build / name).unlink()
+                result = self.call(POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1",
+                                   "-Build", build, "-Dest", dest, "-IncludeSelfhost", success=False)
+                self.assertIn(name, result.stdout + result.stderr)
+                self.assertEqual(marker.read_text(), "preserve")
+                self.assertFalse((dest / "zanc.exe").exists())
+                self.write(build / name, "current " + name)
 
     @unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell staging contract")
     def test_future_mtime_stale_cli_is_replaced_by_content(self):
@@ -78,8 +83,15 @@ class SdkStageTests(unittest.TestCase):
                    "@{ ModuleVersion='99.0'; PowerShellVersion='99.0'; RootModule='Utility.psm1'; FunctionsToExport=@('Get-FileHash') }")
         self.write(module / "Utility.psm1", "function Get-FileHash { throw 'Foreign Utility must not be loaded' }")
         env = dict(os.environ, PSModulePath=str(module.parent))
-        self.call(POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1", "-Build", build, "-Dest", dest, env=env)
+        inputs = self.base / "inputs.json"
+        self.call(POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1", "-Build", build,
+                  "-Dest", dest, "-IncludeSelfhost", "-InputList", inputs, env=env)
         self.assertEqual(old.read_bytes(), (build / "zan-lsp.exe").read_bytes())
+        mappings = {row["destination"]: Path(row["source"]) for row in SDK.load(inputs)}
+        for name in ("zanc-selfhost.exe", "llvm-nm.exe"):
+            with self.subTest(name=name):
+                self.assertEqual(mappings[name].resolve(), (build / name).resolve())
+                self.assertEqual((dest / name).read_bytes(), (build / name).read_bytes())
 
     @unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell path contract")
     def test_publish_rejects_shared_output_before_cleaning(self):
@@ -311,9 +323,58 @@ class SdkStageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unlisted"):
             SDK.verify_sdk(sdk)
 
+    def test_consumption_receipt_requires_restricted_selfhost_run(self):
+        sdk = self.base / "sdk"
+        compiler = self.write(sdk / "toolchain/zanc-selfhost.exe")
+        manifest = {"schema": SDK.SCHEMA, "phase": "staged", "validation": "local-build-only",
+                    "build_identity_sha256": "a" * 64, "files": SDK.inventory(sdk)}
+        manifest["manifest_sha256"] = SDK.identity.digest(manifest)
+        SDK.identity.atomic_json(sdk / "sdk-manifest.json", manifest)
+        receipt = sdk / "sdk-consumption.json"
+        system = self.base / "Windows"
+        token = "sdk-selfhost-consumption-probe"
+
+        def run(command, **options):
+            if command[0] == sys.executable:
+                output = Path(command[command.index("--output") + 1])
+                SDK.identity.atomic_json(output / "results.json", {"complete": True, "selected": 1,
+                                         "rows": [{"template": "console/test", "status": "pass"}]})
+                return subprocess.CompletedProcess(command, 0)
+            work, env = options["cwd"], options["env"]
+            self.assertEqual(work, args.output / "selfhost")
+            self.assertEqual(env["PATH"].split(os.pathsep), [str(system / "System32"), str(system)])
+            self.assertNotIn("ZAN_CLANG", env)
+            artifact = work / "probe.exe"
+            if command[0] == str(compiler):
+                source = work / "probe.zan"
+                self.assertEqual(command[1:], [str(source), "-o", str(artifact)])
+                self.assertIn(token, source.read_text(encoding="utf-8"))
+                self.write(artifact)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            self.assertEqual(command, [str(artifact)])
+            return subprocess.CompletedProcess(command, 0, runtime_stdout, "")
+
+        with mock.patch.dict(os.environ, {"SystemRoot": str(system), "ZAN_CLANG": "developer-clang.exe"}), \
+                mock.patch.object(SDK.subprocess, "run", side_effect=run):
+            args = SimpleNamespace(sdk=sdk, output=self.base / "pass", filter="^console/test$")
+            runtime_stdout = token + "\n"
+            SDK.consume(args)
+            evidence = SDK.load(receipt)["selfhost"]
+            self.assertEqual(SDK.load(evidence["runtime_log"]["path"])["stdout"], runtime_stdout)
+            self.assertEqual(Path(evidence["compile_log"]["path"]).parent, args.output / "selfhost")
+            self.assertEqual(Path(evidence["artifact"]["path"]).parent, args.output / "selfhost")
+
+            args.output = self.base / "fail"
+            runtime_stdout = "wrong output"
+            with self.assertRaisesRegex(ValueError, "unexpected output"):
+                SDK.consume(args)
+            self.assertFalse(receipt.exists())
+
     def test_windows_workflow_prepares_before_seal_and_packages_platform_root(self):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
         windows = text[text.index("  windows:"):text.index("  release:")]
+        self.assertIn("ZAN_LLVM_NM_EXECUTABLE", windows)
+        self.assertLess(windows.index("$releaseNative += $llvmNm"), windows.index("-Action Capture"))
         self.assertLess(windows.index("-Action Capture"), windows.index("-PrepareOnly -NoBump"))
         self.assertLess(windows.index("-PrepareOnly -NoBump"), windows.index("-Action Seal"))
         self.assertLess(windows.index("-Action Seal"), windows.index("-P scripts/release_quality_gate.cmake"))
@@ -328,8 +389,10 @@ class SdkStageTests(unittest.TestCase):
         end = text.index("# ---- complete preflight", preparation)
         self.assertIn("gen_knowledge.ps1", text[preparation:end])
         self.assertIn("Start-Process", text[preparation:end])
-        for prohibited in ("gen_knowledge.ps1", "Start-Process", "build_ide.ps1"):
+        self.assertIn("--target selfhost_compiler", text[preparation:end])
+        for prohibited in ("gen_knowledge.ps1", "Start-Process", "build_ide.ps1", "--target selfhost_compiler"):
             self.assertNotIn(prohibited, text[end:])
+        self.assertEqual(text[end:].count("-IncludeSelfhost"), 2)
         self.assertNotIn("PUBLISH_WARN", text)
         self.assertNotIn("STAGE_WARN", (ROOT / "scripts/stage_dev_toolchain.ps1").read_text(encoding="utf-8-sig"))
 
