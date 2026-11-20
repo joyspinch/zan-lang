@@ -110,7 +110,7 @@ partial class Irgen {
     }
 
     // Lower `await <callExpr>`; returns the awaited result (+1 owned if ARC).
-    ExprVal EmitAwait(Node callExpr) {
+    ExprVal EmitAwait(Node callExpr, bool trackResult = false) {
         if (!curAsync && callExpr != null && callExpr.a != null && callExpr.a.kind == AK.MemberAccess()
         && callExpr.a.a != null && callExpr.a.a.sval == "Task") {
             string mn = callExpr.a.sval;
@@ -214,6 +214,7 @@ partial class Irgen {
             if (IsDecimal(resTy)) { rvv = DecimalResultLoad(subh2).op; }
             else { rvv = FromI64(resi, lt); }
             L("  call void @zexc_frame_free(i8* " + fv + ")");
+            if (trackResult) { AddTemp(rvv, resTy); }
             return new ExprVal(rvv, resTy);
         }
         string donep = FrameGep(subh, 3);
@@ -362,7 +363,8 @@ partial class Irgen {
     }
     void GenAsyncReturn(Node s) {
         if (s.a != null) {
-            ExprVal v = GenExpr(s.a);
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            ExprVal v = s.a.kind == AK.AwaitExpr() ? EmitAwait(s.a.a, true) : GenExpr(s.a);
             if (curRetTy != null && curRetTy.sval != "void") {
                 v = ApplyUserConv(curRetTy, v, false);
                 if (!convApplied) { v = StrSlotConv(curRetTy, v); }
@@ -373,12 +375,7 @@ partial class Irgen {
             }
             string lt = MapType(v.ty);
             string rv = v.op;
-            if (!IsConstOperand(rv)) {
-                EmitArcRetain(rv, v.ty);
-                if (v.ty != null && v.ty.ival >= 1) {
-                    EmitArrayRetain(rv, lt, v.ty);
-                }
-            }
+            if (!IsConstOperand(rv)) { EmitArcRetain(rv, v.ty); }
             // Retain the replacement first, including when it aliases the old result.
             EmitAsyncResultRelease(curAsyncRetElem);
             // store the return value into the frame result slot (slot 6) BEFORE
@@ -457,34 +454,14 @@ partial class Irgen {
         }
         if (k == AK.ReturnStmt()) {
             ExprVal res = EmitAwait(s.a.a);
-            if (curAsync) {
-                // await result already +1; transfer as the coroutine result.
-                if (curRetTy != null && curRetTy.sval != "void") {
-                    res = ApplyUserConv(curRetTy, res, false);
-                    if (!convApplied) { res = StrSlotConv(curRetTy, res); }
-                    res = NarrowToDeclared(res, curRetTy);
-                    string declLt = MapType(curRetTy);
-                    string crv = Coerce(res, declLt);
-                    res = new ExprVal(crv, curRetTy);
-                }
-                string lt = MapType(res.ty);
-                EmitAsyncEpilogue();
-                if (IsDecimal(res.ty)) {
-                    DecimalResultStore("%ff", res);
-                    string low = NT();
-                    L("  " + low + " = load i64, i64* " + FrameGep("%ff", 6));
-                    EmitAsyncComplete(low);
-                } else { EmitAsyncComplete(ToI64(res.op, lt)); }
-            } else {
-                ReleaseLocalsFrom(0);
-                if (curRet == "void") { L("  ret void"); }
-                else {
-                    ExprVal src = ApplyUserConv(curRetTy, res, false);
-                    if (!convApplied) { src = StrSlotConv(curRetTy, res); }
-                    L("  ret " + curRet + " " + Coerce(src, curRet));
-                }
-                term = true;
+            ReleaseLocalsFrom(0);
+            if (curRet == "void") { L("  ret void"); }
+            else {
+                ExprVal src = ApplyUserConv(curRetTy, res, false);
+                if (!convApplied) { src = StrSlotConv(curRetTy, src); }
+                L("  ret " + curRet + " " + Coerce(src, curRet));
             }
+            term = true;
             return;
         }
         Node e = s.a;
