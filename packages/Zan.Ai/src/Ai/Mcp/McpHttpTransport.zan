@@ -5,7 +5,7 @@ using System.Net.Http.Client;
 
 namespace Ai.Mcp;
 
-// MCP 的 HTTP 传输（Streamable HTTP 那一半：POST 一段 JSON-RPC）。
+// MCP 的 HTTP 传输（Streamable HTTP：POST JSON-RPC，DELETE 结束会话）。
 //
 // ## 为什么只有 HTTP
 //
@@ -23,12 +23,15 @@ namespace Ai.Mcp;
 // 是很多 MCP 网关的写法。服务端认哪个是服务端的事；两边都发最多是
 // 多一个头。token 为空就都不发（本地无鉴权的服务端）。
 public class McpHttpTransport {
+    private const string SESSION_HEADER = "Mcp-Session-Id";
+
     private HttpClient http;
     private string path;
     private int connectMs;
     private int readMs;
     private int totalMs;
     private bool localEndpoint;
+    private bool hasSession;
 
     public McpHttpTransport(McpEndpoint ep, string token) {
         this.connectMs = 10000;
@@ -87,7 +90,31 @@ public class McpHttpTransport {
     // `lastError`，不会让异常飞到调用方。
     public async McpTransportResult Send(string requestJson) {
         HttpResponse resp = await this.http.SendAsync("POST", this.path, requestJson);
-        return new McpTransportResult(resp.statusCode, resp.body);
+        McpTransportResult result = new McpTransportResult(resp.statusCode, resp.body);
+        result.sessionId = resp.GetHeader(McpHttpTransport.SESSION_HEADER);
+        return result;
+    }
+
+    internal void SetSession(string sessionId) {
+        this.hasSession = sessionId != null && sessionId.Length > 0
+            && HttpResponse.IsValidHeader(McpHttpTransport.SESSION_HEADER, sessionId);
+        if (this.hasSession) {
+            this.http.SetHeader(McpHttpTransport.SESSION_HEADER, sessionId);
+        } else {
+            this.http.RemoveHeader(McpHttpTransport.SESSION_HEADER);
+        }
+    }
+
+    // 返回 null 表示服务端未分配会话。DELETE 完成或失败后都释放本地连接。
+    internal async McpTransportResult EndSession() {
+        try {
+            if (!this.hasSession) { return null; }
+            HttpResponse resp = await this.http.SendAsync("DELETE", this.path, "");
+            return new McpTransportResult(resp.statusCode, resp.body);
+        } finally {
+            this.SetSession("");
+            this.Close();
+        }
     }
 
     // 关闭客户端持有的连接池。

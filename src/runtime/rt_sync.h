@@ -150,6 +150,24 @@ int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args, int32_
 /* Returns the child PID and transfers the parent-side stdin/stdout fds on
  * success. Returns -1 on launch failure with no child or fd left to the caller. */
 int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]);
+/* Managed children become group leaders before exec. Wait signals the group
+ * before reaping the leader. -1 means the caller no longer owns the child;
+ * ZAN_PROC_WAIT_OWNED_ERROR preserves ownership for disposal. */
+#define ZAN_PROC_WAIT_OWNED_ERROR (-259)
+int32_t zan_proc_spawn_managed(char *const argv[], const char *cwd, int32_t fds[2]);
+/* Linux-only managed launch. The caller owns the opaque group on success. */
+int32_t zan_proc_sandbox_available(const char *cgroup_root);
+int32_t zan_proc_spawn_sandboxed(char *const argv[], const char *cwd,
+                                 const char *read_roots, const char *write_root,
+                                 const char *cgroup_root, int32_t fds[2],
+                                 intptr_t *group);
+int32_t zan_proc_sandbox_kill(intptr_t group);
+int32_t zan_proc_sandbox_wait(int32_t pid, int32_t timeout_ms, intptr_t group);
+/* Consumes the group and pipe handles. Pass pid 0 after reaping the child. */
+int32_t zan_proc_sandbox_dispose(intptr_t group, int32_t pid, int32_t input, int32_t output);
+int32_t zan_proc_spawn_managed_kill(int32_t pid);
+int32_t zan_proc_spawn_managed_wait(int32_t pid, int32_t timeout_ms);
+int32_t zan_proc_spawn_managed_dispose(int32_t pid, int32_t input, int32_t output);
 int32_t zan_proc_spawn_available(int32_t fd);
 int32_t zan_proc_spawn_read(int32_t fd, void *buf, int32_t count);
 int32_t zan_proc_spawn_write(int32_t fd, const void *buf, int32_t count);

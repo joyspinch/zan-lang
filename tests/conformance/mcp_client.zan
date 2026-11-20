@@ -1,14 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Json;
+using System.Net.Http;
 using Ai;
 using Ai.Mcp;
 
-// 假传输：把请求按顺序记下来，按队列返回响应。
-//
-// 为什么用假传输而不是真服务器：协议测试要钉的是**请求形状**与
-// **响应处理**——真服务器一次往返就把这些全糊过去了，而且用例还得
-// 依赖一个跑着的服务。假传输让每一步都可断言、可复现。
+// 假传输按顺序记录请求并返回预设响应，供协议层逐条断言请求与错误处理。
 public class FakeMcp {
     // 收到的请求（按顺序）。
     public List<string> requests;
@@ -61,6 +58,98 @@ public class FakeMcp {
     }
 
     public int Count() { return this.requests.Count; }
+}
+
+// 用真实 HTTP 请求检查自建传输的会话与鉴权头。
+public class LoopbackMcp {
+    public const int PORT = 28947;
+    public const string TARGET = "/mcp?fixture=1";
+    public const string TOKEN = "loopback-token";
+    private const string SESSION_HEADER = "Mcp-Session-Id";
+
+    public int requests;
+    public int deletes;
+    public int deleteStatus = 204;
+    public bool issueSession = true;
+    public bool rejectNotification;
+    private string sessionId = "";
+
+    public async HttpResponse Handle(HttpRequest req) {
+        this.requests = this.requests + 1;
+        if (req.path != "/mcp" || req.queryString != "fixture=1"
+            || req.GetHeader("Authorization") != "Bearer " + LoopbackMcp.TOKEN
+            || req.GetHeader("X-Api-Key") != LoopbackMcp.TOKEN
+            || req.GetHeader("MCP-Protocol-Version") != McpClient.ProtocolVersion()) {
+            return LoopbackMcp.Reject("wrong endpoint, auth or protocol");
+        }
+
+        string session = req.GetHeader(LoopbackMcp.SESSION_HEADER);
+        // 空会话头也算已发送。
+        bool hasSessionHeader = ("\n" + req.rawHeaders.ToLower())
+            .Contains("\n" + LoopbackMcp.SESSION_HEADER.ToLower() + ":");
+        if (req.method == "DELETE") {
+            this.deletes = this.deletes + 1;
+            if (session == "" || session != this.sessionId || req.body != "") {
+                return LoopbackMcp.Reject("wrong DELETE session or body");
+            }
+            if (this.deleteStatus == 405) {
+                return HttpResponse.WithStatus(405, "Method Not Allowed", "close unsupported");
+            }
+            this.sessionId = "";
+            if (this.deleteStatus == 404) {
+                return HttpResponse.WithStatus(404, "Not Found", "session expired");
+            }
+            return HttpResponse.WithStatus(204, "No Content", "");
+        }
+        if (req.method != "POST") { return LoopbackMcp.Reject("expected POST or DELETE"); }
+
+        JsonValue rpc = JsonValue.Parse(req.body);
+        if (rpc == null || rpc.Str("jsonrpc", "") != "2.0") {
+            return LoopbackMcp.Reject("invalid JSON-RPC request");
+        }
+        string method = rpc.Str("method", "");
+        int id = rpc.Int("id", 0);
+        if (method == "initialize") {
+            if (id <= 0 || hasSessionHeader) {
+                return LoopbackMcp.Reject("initialize carried a session or lacked an id");
+            }
+            JsonValue info = JsonValue.NewObject();
+            info.PutStr("name", "loopback-mcp");
+            info.PutStr("version", "1.0");
+            JsonValue result = JsonValue.NewObject();
+            result.PutStr("protocolVersion", McpClient.ProtocolVersion());
+            result.Put("capabilities", JsonValue.NewObject());
+            result.Put("serverInfo", info);
+            HttpResponse response = LoopbackMcp.Reply(id, result);
+            this.sessionId = this.issueSession ? "loopback-" + Convert.ToString(id) : "";
+            if (this.sessionId == "") { return response; }
+            return response.SetHeader("mCp-SeSsIoN-Id", this.sessionId);
+        }
+        if (session != this.sessionId || (session == "" && hasSessionHeader)) {
+            return LoopbackMcp.Reject("wrong request session");
+        }
+        if (method == "notifications/initialized" && !rpc.Has("id")) {
+            if (this.rejectNotification) { return LoopbackMcp.Reject("notification rejected"); }
+            return HttpResponse.WithStatus(202, "Accepted", "");
+        }
+        if (method == "ping" && id > 0) {
+            HttpResponse response = LoopbackMcp.Reply(id, JsonValue.NewObject());
+            return response.SetHeader(LoopbackMcp.SESSION_HEADER, "ignored-ping-header");
+        }
+        return LoopbackMcp.Reject("unexpected JSON-RPC request");
+    }
+
+    static HttpResponse Reject(string reason) {
+        return HttpResponse.WithStatus(400, "Bad Request", reason);
+    }
+
+    static HttpResponse Reply(int id, JsonValue result) {
+        JsonValue rpc = JsonValue.NewObject();
+        rpc.PutStr("jsonrpc", "2.0");
+        rpc.PutInt("id", id);
+        rpc.Put("result", result);
+        return HttpResponse.Json(rpc.ToJson());
+    }
 }
 
 public class P {
@@ -163,8 +252,81 @@ public class P {
         Console.WriteLine("ping=" + YN(await client.Ping()));
         Console.WriteLine("reqs=" + Convert.ToString(fake.Count()));
 
+        Check(await client.CloseAsync(), "injected transport close failed");
+        Check(!client.Initialized() && client.serverInfo == null && fake.Count() == 7,
+            "injected close must reset the handshake without using the transport");
         await ErrorCases();
         await BridgeCase();
+        await HttpSessionCase();
+    }
+
+    static async Task HttpSessionCase() {
+        LoopbackMcp remote = new LoopbackMcp();
+        HttpServer server = new HttpServer("127.0.0.1", LoopbackMcp.PORT);
+        server.OnRequest(remote.Handle);
+        McpClient client = new McpClient("http://127.0.0.1:"
+            + Convert.ToString(LoopbackMcp.PORT) + LoopbackMcp.TARGET, LoopbackMcp.TOKEN);
+        client.SetTimeouts(2000, 2000, 4000);
+        List<long> running = new List<long>();
+        running.Add(Task.Spawn(server.Start()));
+        try {
+            for (int i = 0; i < 200 && !server.IsRunning() && Task.IsDone(running[0]) == 0; i = i + 1) {
+                await Task.Delay(10);
+            }
+            Check(server.IsRunning(), "MCP loopback server did not start");
+            Check(await client.CloseAsync() && remote.requests == 0, "close before initialize sent a request");
+
+            Check(await client.Initialize(), "HTTP initialize: " + client.lastError);
+            Check(await client.Ping(), "session ping: " + client.lastError);
+            client.Close();
+            client.Dispose();
+            Check(client.Initialized() && client.serverInfo != null && remote.deletes == 0,
+                "synchronous close changed the MCP session");
+            Check(await client.Ping(), "session ping after synchronous close: " + client.lastError);
+
+            Check(await client.CloseAsync(), "HTTP session close: " + client.lastError);
+            Check(remote.deletes == 1 && client.lastError == "", "expected one successful DELETE");
+            Check(!client.Initialized() && client.serverInfo == null, "close left handshake state");
+            int requests = remote.requests;
+            Check(!await client.Ping() && client.lastError == "还没有握手", "ping after close must require initialize");
+            Check(await client.CloseAsync() && client.lastError == "" && remote.requests == requests,
+                "repeated close or ping after close sent a request");
+
+            remote.deleteStatus = 405;
+            Check(await client.Initialize(), "HTTP reinitialize: " + client.lastError);
+            Check(!await client.CloseAsync(), "405 must report that the server declined to close the session");
+            Check(remote.deletes == 2 && client.lastError.Contains("405")
+                && !client.Initialized() && client.serverInfo == null, "405 close left state or lost the status");
+
+            remote.deleteStatus = 404;
+            Check(await client.Initialize(), "initialize after a rejected close: " + client.lastError);
+            Check(await client.CloseAsync() && remote.deletes == 3 && client.lastError == "",
+                "404 must report an already-ended session");
+
+            remote.deleteStatus = 204;
+            remote.rejectNotification = true;
+            Check(!await client.Initialize() && client.lastError.Contains("notification rejected"),
+                "expected initialize to fail after the session was assigned");
+            Check(await client.CloseAsync() && remote.deletes == 4 && client.serverInfo == null,
+                "close must send DELETE even if the initialized notification failed");
+
+            remote.rejectNotification = false;
+            remote.issueSession = false;
+            Check(await client.Initialize(), "stateless initialize: " + client.lastError);
+            Check(await client.Ping(), "stateless ping: " + client.lastError);
+            requests = remote.requests;
+            Check(await client.CloseAsync() && remote.requests == requests && !client.Initialized(),
+                "stateless close sent a request or kept the handshake");
+        } finally {
+            client.Dispose();
+            server.Stop();
+            await Task.WhenAll(running);
+            Task.Release(running[0]);
+        }
+    }
+
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new InvalidOperationException(message); }
     }
 
     // 七条错误路径：每条都要给出**可读**的原因，不是静默失败。

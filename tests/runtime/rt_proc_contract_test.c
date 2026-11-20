@@ -19,7 +19,9 @@
 #include <time.h>
 #include <unistd.h>
 
-static int64_t zan_monotonic_us(void) {
+#include "../../src/runtime/rt_sync.h"
+
+int64_t zan_monotonic_us(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
     return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;

@@ -1,0 +1,145 @@
+using System;
+using System.Diagnostics;
+using System.Net;
+using System.Security.Cryptography;
+using System.Threading;
+
+// The same tables are attached by every HTTP worker. The lease orders
+// compound updates, including cancellation against request registration.
+class McpHttpSessions : IDisposable {
+    const string SESSION_HANDLE = "MCP_SESSIONS";
+    const string REQUEST_HANDLE = "MCP_REQUESTS";
+    const string LEASE_KEY = "#update";
+    const string OWNER = "owner";
+    const string STATE = "state";
+    const int ACTIVE = 1;
+    const int CANCELLED = 2;
+    const int SESSION_IDLE_MS = 7200000;
+    const int REQUEST_TTL_MS = 86400000;
+    const int REQUEST_CAPACITY = 8192;
+    const int LEASE_MS = 2000;
+
+    SharedTable sessions;
+    SharedTable requests;
+    nint updateLock;
+    int owner;
+
+    public McpHttpSessions() {
+        this.updateLock = Mutex.Create();
+        this.owner = ProcessHost.Pid();
+    }
+
+    public bool Open(bool worker, bool share) {
+        if (worker) {
+            this.sessions = SharedTable.Attach(Worker.InheritedHandle(SESSION_HANDLE));
+            this.requests = SharedTable.Attach(Worker.InheritedHandle(REQUEST_HANDLE));
+            return this.sessions.IsOpen() && this.requests.IsOpen();
+        }
+        this.sessions = new SharedTable("", 1024);
+        this.sessions.ColumnInt(OWNER);
+        this.requests = new SharedTable("", REQUEST_CAPACITY);
+        this.requests.KeySize(128);
+        this.requests.ColumnInt(OWNER);
+        this.requests.ColumnInt(STATE);
+        if (!this.sessions.CreateAnonymous() || !this.requests.CreateAnonymous()) { return false; }
+        if (share) {
+            Worker.ShareHandle(SESSION_HANDLE, this.sessions.OsHandle());
+            Worker.ShareHandle(REQUEST_HANDLE, this.requests.OsHandle());
+        }
+        return true;
+    }
+
+    public void Dispose() {
+        if (this.requests != null) { this.requests.Close(); }
+        if (this.sessions != null) { this.sessions.Close(); }
+        Mutex.Destroy(this.updateLock);
+    }
+
+    public static string RequestKey(string session, string id) {
+        return session + ":" + Convert.ToHexString(Sha256.Hash(id));
+    }
+
+    bool Lock() {
+        Mutex.Lock(this.updateLock);
+        long deadline = Stopwatch.GetMilliseconds() + LEASE_MS + 100;
+        while (!this.requests.TryAcquireLease(LEASE_KEY, this.owner, 0 - 1, LEASE_MS)) {
+            if (Stopwatch.GetMilliseconds() >= deadline) {
+                Mutex.Unlock(this.updateLock);
+                return false;
+            }
+            Thread.Sleep(1);
+        }
+        return true;
+    }
+
+    void Unlock() {
+        this.requests.ReleaseLease(LEASE_KEY, this.owner);
+        Mutex.Unlock(this.updateLock);
+    }
+
+    public string Create() {
+        string session = Guid.New();
+        if (session == "" || !this.Lock()) { return ""; }
+        try {
+            return this.sessions.TryAcquireLease(session, this.owner, 0 - 1, SESSION_IDLE_MS)
+                ? session : "";
+        } finally {
+            this.Unlock();
+        }
+    }
+
+    public bool Touch(string session) {
+        return this.sessions.Expire(session, SESSION_IDLE_MS);
+    }
+
+    public bool End(string session) {
+        if (!this.Lock()) { return false; }
+        try {
+            return this.sessions.Delete(session);
+        } finally {
+            this.Unlock();
+        }
+    }
+
+    public bool BeginRequest(string session, string key) {
+        if (key == "" || !this.Lock()) { return false; }
+        try {
+            // Leave room for the update lease after it is released.
+            if (!this.Touch(session) || this.requests.Count() >= REQUEST_CAPACITY
+                || !this.requests.TryAcquireLease(key, this.owner, 0 - 1, REQUEST_TTL_MS)) {
+                return false;
+            }
+            if (this.requests.SetInt(key, STATE, ACTIVE)) { return true; }
+            this.requests.ReleaseLease(key, this.owner);
+            return false;
+        } finally {
+            this.Unlock();
+        }
+    }
+
+    public void EndRequest(string key) {
+        if (!this.Lock()) { return; }
+        try {
+            this.requests.ReleaseLease(key, this.owner);
+        } finally {
+            this.Unlock();
+        }
+    }
+
+    public void Cancel(string key) {
+        if (!this.Lock()) { return; }
+        try {
+            if (this.requests.GetInt(key, STATE) == ACTIVE) {
+                this.requests.SetInt(key, STATE, CANCELLED);
+            }
+        } finally {
+            this.Unlock();
+        }
+    }
+
+    public bool IsCancelled(string key) {
+        int colon = key.IndexOf(":");
+        if (colon <= 0 || !this.sessions.Exists(key.Substring(0, colon))) { return true; }
+        return this.requests.GetInt(key, STATE) != ACTIVE;
+    }
+}

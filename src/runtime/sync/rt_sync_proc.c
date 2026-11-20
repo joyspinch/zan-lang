@@ -150,7 +150,12 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
 }
 
 #ifndef _WIN32
+#include <stdbool.h>
 #include <sys/ioctl.h>
+#if defined(__linux__)
+#include <stddef.h>
+#include <sys/syscall.h>
+#endif
 
 #if !defined(__linux__)
 static pthread_mutex_t g_proc_pipe_guard = PTHREAD_MUTEX_INITIALIZER;
@@ -201,10 +206,12 @@ failed:
 
 /* argv, PATH and scratch storage are prepared in the parent. Use execv so
  * the child calls only async-signal-safe routines, including on PATH lookup. */
-static void zan_proc_spawn_exec(char *const argv[], const char *path, char *candidate) {
+static void zan_proc_spawn_exec(char *const argv[], const char *path, char *candidate,
+                                char *const env[]) {
     const char *exe = argv[0];
     if (!path) {
-        execv(exe, argv);
+        if (env) execve(exe, argv, env);
+        else execv(exe, argv);
         return;
     }
     size_t exe_len = strlen(exe) + 1;
@@ -217,7 +224,8 @@ static void zan_proc_spawn_exec(char *const argv[], const char *path, char *cand
             memcpy(candidate + len + 1, exe, exe_len);
             file = candidate;
         }
-        execv(file, argv);
+        if (env) execve(file, argv, env);
+        else execv(file, argv);
         if (errno != ENOENT && errno != ENOTDIR && errno != EACCES) return;
         if (!dir[len]) return;
         dir += len + 1;
@@ -229,7 +237,14 @@ static void zan_proc_close_fd(int *fd) {
     *fd = -1;
 }
 
-int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
+#include "rt_sync_proc_sandbox.c"
+
+static int32_t proc_spawn(char *const argv[], const char *cwd, int32_t fds[2],
+                          bool managed, intptr_t sandbox_group, int ruleset) {
+#ifndef ZAN_PROC_SANDBOX_LINUX
+    (void)sandbox_group;
+    (void)ruleset;
+#endif
     if (!argv || !argv[0] || !argv[0][0] || !fds) return -1;
     char *path = NULL, *candidate = NULL;
     int32_t result = -1;
@@ -237,7 +252,7 @@ int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
     int pipes[PIPE_COUNT][2];
     int opened = 0;
     if (!strchr(argv[0], '/')) {
-        const char *env_path = getenv("PATH");
+        const char *env_path = sandbox_group ? "/usr/bin:/bin" : getenv("PATH");
         path = strdup(env_path ? env_path : "/bin:/usr/bin");
         if (!path) goto done;
         candidate = (char *)malloc(strlen(path) + strlen(argv[0]) + 2);
@@ -255,7 +270,8 @@ int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
     if (pid < 0) goto done;
     if (pid == 0) {
         close(launch[0]);
-        if ((!cwd || !cwd[0] || chdir(cwd) == 0) &&
+        if ((!managed || setpgid(0, 0) == 0) &&
+            (!cwd || !cwd[0] || chdir(cwd) == 0) &&
             dup2(input[0], STDIN_FILENO) >= 0 &&
             dup2(output[1], STDOUT_FILENO) >= 0 &&
             dup2(output[1], STDERR_FILENO) >= 0) {
@@ -263,7 +279,17 @@ int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
             close(input[1]);
             close(output[0]);
             close(output[1]);
-            zan_proc_spawn_exec(argv, path, candidate);
+#ifdef ZAN_PROC_SANDBOX_LINUX
+            if (sandbox_group) {
+                if (sandbox_enter((zan_proc_sandbox_group *)sandbox_group, ruleset, launch[1]) == 0) {
+                    char *const env[] = {"PATH=/usr/bin:/bin", "LANG=C", "TMPDIR=.", NULL};
+                    zan_proc_spawn_exec(argv, path, candidate, env);
+                }
+            } else
+#endif
+            {
+                zan_proc_spawn_exec(argv, path, candidate, NULL);
+            }
         }
         /* EOF on this CLOEXEC pipe confirms exec, even if the program exits 127. */
         char failed = 1;
@@ -284,7 +310,10 @@ int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
         input[1] = output[0] = -1;
         result = (int32_t)pid;
     } else {
-        if (received < 0) kill(pid, SIGKILL);
+        if (received < 0) {
+            if (managed) kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+        }
         while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
     }
 
@@ -296,6 +325,49 @@ done:
     free(candidate);
     free(path);
     return result;
+}
+
+int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
+    return proc_spawn(argv, cwd, fds, false, 0, -1);
+}
+
+int32_t zan_proc_spawn_managed(char *const argv[], const char *cwd, int32_t fds[2]) {
+    return proc_spawn(argv, cwd, fds, true, 0, -1);
+}
+
+int32_t zan_proc_sandbox_available(const char *cgroup_root) {
+#ifdef ZAN_PROC_SANDBOX_LINUX
+    return sandbox_unprivileged() && sandbox_cgroup_root(cgroup_root)
+        && syscall(__NR_landlock_create_ruleset, NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
+            >= ZAN_LANDLOCK_ABI;
+#else
+    (void)cgroup_root;
+    return 0;
+#endif
+}
+
+int32_t zan_proc_spawn_sandboxed(char *const argv[], const char *cwd,
+                                 const char *read_roots, const char *write_root,
+                                 const char *cgroup_root, int32_t fds[2], intptr_t *handle) {
+#ifdef ZAN_PROC_SANDBOX_LINUX
+    if (!handle || !zan_proc_sandbox_available(cgroup_root)) return -1;
+    *handle = 0;
+    int ruleset = sandbox_ruleset(read_roots, write_root);
+    if (ruleset < 0) return -1;
+    zan_proc_sandbox_group *group = sandbox_group_create(cgroup_root);
+    int32_t pid = -1;
+    if (group) {
+        pid = proc_spawn(argv, cwd, fds, true, (intptr_t)group, ruleset);
+        if (pid < 0) zan_proc_sandbox_dispose((intptr_t)group, 0, -1, -1);
+        else *handle = (intptr_t)group;
+    }
+    close(ruleset);
+    return pid;
+#else
+    (void)argv; (void)cwd; (void)read_roots; (void)write_root;
+    (void)cgroup_root; (void)fds; (void)handle;
+    return -1;
+#endif
 }
 
 int32_t zan_proc_spawn_available(int32_t fd) {
@@ -346,24 +418,161 @@ int32_t zan_proc_spawn_kill(int32_t pid) {
     return pid > 0 && kill((pid_t)pid, SIGKILL) == 0;
 }
 
-int32_t zan_proc_spawn_wait(int32_t pid, int32_t timeout_ms) {
+static bool proc_signal_group(pid_t pid) {
+    return kill(-pid, SIGKILL) == 0 || errno == ESRCH;
+}
+
+int32_t zan_proc_spawn_managed_kill(int32_t pid) {
+    if (pid <= 0) return 0;
+    siginfo_t info = {0};
+    int observed;
+    do { observed = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT | WNOHANG); }
+    while (observed < 0 && errno == EINTR);
+    return observed == 0 && proc_signal_group((pid_t)pid);
+}
+
+static int32_t proc_wait(int32_t pid, int32_t timeout_ms, bool managed) {
     if (pid <= 0) return -1;
     int64_t deadline = timeout_ms > 0
         ? zan_monotonic_us() + (int64_t)timeout_ms * 1000 : 0;
     for (;;) {
         int status;
-        pid_t waited = waitpid((pid_t)pid, &status, deadline ? WNOHANG : 0);
+        int flags = deadline ? WNOHANG : 0;
+        if (managed) {
+            /* Hold the leader's PID until its group has been signalled. */
+            siginfo_t info = {0};
+            if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT | flags) < 0) {
+                if (errno == EINTR) goto delay;
+                return errno == ECHILD ? -1 : ZAN_PROC_WAIT_OWNED_ERROR;
+            }
+            if (info.si_pid == 0) goto delay;
+            if (!proc_signal_group((pid_t)pid)) return ZAN_PROC_WAIT_OWNED_ERROR;
+            flags = 0;
+        }
+        pid_t waited = waitpid((pid_t)pid, &status, flags);
         if (waited == pid) {
             if (WIFEXITED(status)) return (int32_t)WEXITSTATUS(status);
             if (WIFSIGNALED(status)) return 128 + (int32_t)WTERMSIG(status);
         }
-        if (waited < 0 && errno != EINTR) return -1;
+        if (waited < 0 && errno != EINTR) {
+            return managed && errno != ECHILD ? ZAN_PROC_WAIT_OWNED_ERROR : -1;
+        }
+    delay:
         if (!deadline) continue;
         int64_t left = deadline - zan_monotonic_us();
         if (left <= 0) return -258;
-        struct timespec delay = {0, (long)(left < 1000 ? left : 1000) * 1000};
+        struct timespec sleep_for = {0, (long)(left < 1000 ? left : 1000) * 1000};
+        nanosleep(&sleep_for, NULL);
+    }
+}
+
+int32_t zan_proc_spawn_wait(int32_t pid, int32_t timeout_ms) {
+    return proc_wait(pid, timeout_ms, false);
+}
+
+int32_t zan_proc_spawn_managed_wait(int32_t pid, int32_t timeout_ms) {
+    return proc_wait(pid, timeout_ms, true);
+}
+
+int32_t zan_proc_sandbox_kill(intptr_t handle) {
+#ifdef ZAN_PROC_SANDBOX_LINUX
+    zan_proc_sandbox_group *group = (zan_proc_sandbox_group *)handle;
+    return group && sandbox_write(group->kill, "1", 1) == 0;
+#else
+    (void)handle;
+    return 0;
+#endif
+}
+
+int32_t zan_proc_sandbox_wait(int32_t pid, int32_t timeout_ms, intptr_t handle) {
+#ifdef ZAN_PROC_SANDBOX_LINUX
+    zan_proc_sandbox_group *group = (zan_proc_sandbox_group *)handle;
+    if (!group || pid <= 0) return -1;
+    int64_t deadline = timeout_ms > 0 ? zan_monotonic_us() + (int64_t)timeout_ms * 1000 : 0;
+    for (;;) {
+        siginfo_t info = {0};
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT | WNOHANG) == 0) {
+            if (info.si_pid != 0) {
+                if (!zan_proc_sandbox_kill(handle)) return ZAN_PROC_WAIT_OWNED_ERROR;
+                if (sandbox_group_empty(group)) return proc_wait(pid, 0, false);
+            }
+        } else if (errno != EINTR) {
+            return errno == ECHILD ? -1 : ZAN_PROC_WAIT_OWNED_ERROR;
+        }
+        if (deadline && zan_monotonic_us() >= deadline) return -258;
+        struct timespec delay = {0, 1000000};
         nanosleep(&delay, NULL);
     }
+#else
+    (void)pid; (void)timeout_ms; (void)handle;
+    return -1;
+#endif
+}
+
+#ifdef ZAN_PROC_SANDBOX_LINUX
+static void *proc_sandbox_reap(void *arg) {
+    zan_proc_sandbox_group *group = arg;
+    const struct timespec delay = {0, 100000000};
+    for (int retry = 0; retry < 50; ++retry) {
+        if (sandbox_group_empty(group) && sandbox_group_remove(group)) break;
+        zan_proc_sandbox_kill((intptr_t)group);
+        nanosleep(&delay, NULL);
+    }
+    sandbox_group_free(group);
+    return NULL;
+}
+#endif
+
+int32_t zan_proc_sandbox_dispose(intptr_t handle, int32_t pid, int32_t input, int32_t output) {
+    if (input >= 0) close(input);
+    if (output >= 0) close(output);
+#ifdef ZAN_PROC_SANDBOX_LINUX
+    zan_proc_sandbox_group *group = (zan_proc_sandbox_group *)handle;
+    if (!group) return 0;
+    int32_t reaped = pid <= 0;
+    if (pid > 0) {
+        zan_proc_sandbox_kill(handle);
+        reaped = zan_proc_spawn_managed_dispose(pid, -1, -1);
+    }
+    if (sandbox_group_empty(group) && sandbox_group_remove(group)) {
+        sandbox_group_free(group);
+        return reaped;
+    }
+    pthread_t reaper;
+    if (pthread_create(&reaper, NULL, proc_sandbox_reap, group) == 0) {
+        pthread_detach(reaper);
+    } else {
+        zan_proc_sandbox_kill(handle);
+        sandbox_group_free(group);
+    }
+#else
+    (void)handle;
+    (void)pid;
+#endif
+    return 0;
+}
+
+static void *proc_reap_child(void *arg) {
+    zan_proc_spawn_wait((int32_t)(intptr_t)arg, 0);
+    return NULL;
+}
+
+int32_t zan_proc_spawn_managed_dispose(int32_t pid, int32_t input, int32_t output) {
+    if (input >= 0) close(input);
+    if (output >= 0) close(output);
+    if (pid <= 0) return 1;
+
+    zan_proc_spawn_managed_kill(pid);
+    int32_t code = zan_proc_spawn_managed_wait(pid, 1);
+    if (code >= 0) return 1;
+    if (code == -1) return 0;
+
+    /* Retire the direct child even if group cleanup failed or is still pending. */
+    if (code == ZAN_PROC_WAIT_OWNED_ERROR) zan_proc_spawn_kill(pid);
+    pthread_t reaper;
+    if (pthread_create(&reaper, NULL, proc_reap_child, (void *)(intptr_t)pid) == 0)
+        pthread_detach(reaper);
+    return 0;
 }
 
 void zan_proc_spawn_dispose(int32_t pid, int32_t input, int32_t output) {

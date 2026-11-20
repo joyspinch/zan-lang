@@ -810,11 +810,36 @@ while the child reads. On POSIX a broken input pipe returns `false` without
 changing the host's SIGPIPE handling.
 
 `WaitExitCode(timeoutMs)` waits indefinitely for a nonpositive timeout. A
-positive timeout returns `-258` if the child is still running. On POSIX, a
-completed wait reaps the child and caches its exit code. `Dispose` closes the
-pipes and on POSIX terminates any still-running direct child and reaps it.
-`Kill` and `Dispose` on POSIX act on the direct child only. Use one caller at a
-time per instance.
+bounded wait returns `-258` on timeout or `-1` on a wait error. Use
+`HasExitCode()` to distinguish these statuses from a Windows program that
+returns the same value. On POSIX, a completed wait reaps the child. With
+`Spawn`, `Kill` targets the direct child and `Dispose` closes the pipes. POSIX
+`Dispose` also terminates and reaps the direct child if needed.
+
+`SpawnManaged(exe, args, cwd)` includes descendants in the job lifecycle. On
+Windows it assigns the child to a Job Object at creation. If assignment fails,
+launch returns `null`. `SpawnCommandProcessor(command, cwd, true)` applies the
+same lifecycle to a Windows shell command. Managed waits on Windows terminate
+remaining Job Object members and check that the active process count reaches
+zero. On POSIX, the child creates its own process group before `exec`. Managed
+waits signal surviving group members before reaping the group leader.
+
+Use `Kill()` and `WaitExitCode()` for bounded cancellation. `Close()` closes
+handles and reports whether cleanup was confirmed. Windows also requests job
+termination when the last job handle closes. On POSIX, the managed scope is the
+child's process group. Managed children run with the caller's filesystem and
+network permissions.
+
+`SandboxAvailable(cgroupRoot)` checks the Linux sandbox prerequisites. Use
+`SpawnSandboxed(exe, args, cwd, readRoots, writeRoot, cgroupRoot)` to require
+Landlock, seccomp, and a separate delegated cgroup v2 job. Pass absolute paths
+and separate read roots with `\n`. Any launch failure returns `null`. Each job
+uses a fixed environment and inherits only the standard streams. `Kill()`
+requests termination of its cgroup and `WaitExitCode()` completes after its
+members have stopped and the direct child has been reaped. `Close()` reports
+whether cleanup was confirmed and can transfer pending cleanup to the runtime.
+The service supervisor owns cleanup after host process failure. Use one caller
+at a time per instance.
 
 ### 3.10 Zan.Gui — retained preparation and style contracts
 

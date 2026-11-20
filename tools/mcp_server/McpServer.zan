@@ -31,6 +31,8 @@ class McpServer {
     static string serverName;
     static bool readOnly;
     static bool allowExec;
+    static string sandboxMode;
+    static string sandboxCgroup;
     static int maxRead;
     static int workers;
     static bool stdio;
@@ -62,9 +64,6 @@ class McpServer {
         return v == "2024-11-05" || v == "2025-03-26" || v == "2025-06-18";
     }
 
-    [DllImport("crt", EntryPoint = "getenv")]
-    static extern string PlatGetEnv(string name);
-
     #if WINDOWS
     [DllImport("crt", EntryPoint = "_read")]
     static extern int PlatRead(int fd, nint buf, int count);
@@ -88,10 +87,8 @@ class McpServer {
     static int inPos;       // next unconsumed byte
 
     static string Env(string name, string dflt) {
-        string v = McpServer.PlatGetEnv(name);
-        if (v == null) { return dflt; }
-        if (v == "") { return dflt; }
-        return v;
+        string v = Environment.GetEnvironmentVariable(name);
+        return v == "" ? dflt : v;
     }
 
     static void Main() {
@@ -102,6 +99,8 @@ class McpServer {
         McpServer.serverName = "zan-mcp";
         McpServer.readOnly = false;
         McpServer.allowExec = true;
+        McpServer.sandboxMode = McpServer.Env("MCP_SANDBOX", "required");
+        McpServer.sandboxCgroup = McpServer.Env("MCP_SANDBOX_CGROUP", "");
         McpServer.maxRead = 8388608;
         McpServer.workers = 1;
         McpServer.knowledge = "";
@@ -187,9 +186,18 @@ class McpServer {
             if (a == "--no-exec") {
                 McpServer.allowExec = false; i = i + 1; continue;
             }
+            if (a == "--sandbox") {
+                McpServer.sandboxMode = hasNext ? Environment.ArgAt(i + 1) : "invalid";
+                i = i + 2; continue;
+            }
             if (a.Length >= 2 && a.Substring(0, 2) == "--") { i = i + 1; continue; }
             McpServer.root = a;
             i = i + 1;
+        }
+        if (ProcessHost.IsWorker() && !McpServer.LoadWorkerConfig()) {
+            Console.ErrorWriteLine("MCP worker configuration is missing or invalid");
+            McpServer.PlatExit(1);
+            return;
         }
         if (McpServer.root == "" || McpServer.root == "." || McpServer.root == "./") {
             McpServer.root = Directory.GetCurrentDirectory();
@@ -313,7 +321,8 @@ class McpServer {
         if (McpServer.readOnly) { mode = "read-only"; }
         string exec = "run_command enabled";
         if (!McpServer.CanExec()) { exec = "run_command disabled"; }
-        Console.WriteLine("  mode      : " + mode + ", " + exec);
+        Console.WriteLine("  mode      : " + mode + ", " + exec
+            + ", sandbox=" + McpServer.sandboxMode);
         if (McpServer.token == "") {
             Console.WriteLine("  auth      : none");
             if (!McpServer.IsLoopback(McpServer.host)) {
@@ -329,6 +338,59 @@ class McpServer {
                 + " stdlib=" + McpServer.stdlibPath);
         }
         int rc = await McpServer.Run();
+        if (rc != 0) { McpServer.PlatExit(rc); }
+    }
+
+    const string WORKER_CONFIG = "ZAN_MCP_WORKER_CONFIG";
+
+    static bool PublishWorkerConfig() {
+        JsonValue config = JsonValue.NewObject();
+        config.PutStr("root", McpServer.root);
+        config.PutStr("host", McpServer.host);
+        config.PutInt("port", McpServer.port);
+        config.PutStr("token", McpServer.token);
+        config.PutStr("name", McpServer.serverName);
+        config.PutBool("readOnly", McpServer.readOnly);
+        config.PutBool("allowExec", McpServer.allowExec);
+        config.PutStr("sandbox", McpServer.sandboxMode);
+        config.PutStr("cgroup", McpServer.sandboxCgroup);
+        config.PutInt("maxRead", McpServer.maxRead);
+        config.PutInt("workers", McpServer.workers);
+        config.PutStr("knowledge", McpServer.knowledge);
+        config.PutStr("zanc", McpServer.zancPath);
+        config.PutStr("stdlib", McpServer.stdlibPath);
+        config.PutStr("sdk", McpServer.sdkRoot);
+        config.PutStr("skills", McpServer.skillsDir);
+        config.PutBool("frozenTools", McpServer.frozenTools);
+        string text = config.ToJson();
+        Environment.SetEnvironmentVariable(McpServer.WORKER_CONFIG, text);
+        return Environment.GetEnvironmentVariable(McpServer.WORKER_CONFIG) == text;
+    }
+
+    static bool LoadWorkerConfig() {
+        string text = Environment.GetEnvironmentVariable(McpServer.WORKER_CONFIG);
+        Environment.SetEnvironmentVariable(McpServer.WORKER_CONFIG, "");
+        JsonValue config = McpServer.ParseBody(text);
+        if (config == null || !config.IsObject()) { return false; }
+        McpServer.workers = config.Int("workers", 0);
+        if (McpServer.workers <= 1) { return false; }
+        McpServer.root = config.Str("root", "");
+        McpServer.host = config.Str("host", "");
+        McpServer.port = config.Int("port", 0);
+        McpServer.token = config.Str("token", "");
+        McpServer.serverName = config.Str("name", "");
+        McpServer.readOnly = config.Bool("readOnly", true);
+        McpServer.allowExec = config.Bool("allowExec", false);
+        McpServer.sandboxMode = config.Str("sandbox", "required");
+        McpServer.sandboxCgroup = config.Str("cgroup", "");
+        McpServer.maxRead = config.Int("maxRead", 8388608);
+        McpServer.knowledge = config.Str("knowledge", "");
+        McpServer.zancPath = config.Str("zanc", "");
+        McpServer.stdlibPath = config.Str("stdlib", "");
+        McpServer.sdkRoot = config.Str("sdk", "");
+        McpServer.skillsDir = config.Str("skills", "");
+        McpServer.frozenTools = config.Bool("frozenTools", false);
+        return McpServer.root != "" && McpServer.host != "" && McpServer.port > 0;
     }
 
     static string ExeSuffix() {
@@ -343,8 +405,47 @@ class McpServer {
         return h == "127.0.0.1" || h == "localhost" || h == "::1";
     }
 
+    static bool SandboxRequired() {
+        return McpServer.sandboxMode == "required";
+    }
+
+    static bool SandboxAvailable() {
+        return ProcessSpawn.SandboxAvailable(McpServer.sandboxCgroup);
+    }
+
     static bool CanExec() {
-        return McpServer.allowExec && !McpServer.readOnly;
+        return McpServer.allowExec && !McpServer.readOnly && McpServer.SandboxError() == "";
+    }
+
+    static string SandboxError() {
+        if (McpServer.sandboxMode == "process") { return ""; }
+        if (!McpServer.SandboxRequired()) {
+            return "error: invalid sandbox mode; use required or process";
+        }
+        if (!McpServer.SandboxAvailable()) {
+            return "error: required execution sandbox is unavailable on this host";
+        }
+        return "";
+    }
+
+    static string SandboxReadRoots(string readFile) {
+        string[] candidates = new string[12] {
+            McpServer.root, McpServer.stdlibPath, McpServer.sdkRoot + "/packages",
+            McpServer.ParentOf(McpServer.zancPath), "/bin", "/usr/bin", "/lib",
+            "/lib64", "/usr/lib", "/usr/lib64", "/etc/ld.so.cache", readFile
+        };
+        StringBuilder roots = new StringBuilder();
+        for (int i = 0; i < candidates.Length; i = i + 1) {
+            string candidate = candidates[i];
+            if (candidate == "" || (!Directory.Exists(candidate) && !File.Exists(candidate))) {
+                continue;
+            }
+            string full = Path.GetFullPath(candidate);
+            if (full.IndexOf("\n") >= 0) { throw new IOException("invalid sandbox input path"); }
+            if (roots.Length > 0) { roots.Append("\n"); }
+            roots.Append(full);
+        }
+        return roots.ToString();
     }
 
     static bool ZanToolsAvailable() {
@@ -755,7 +856,18 @@ class McpServer {
         NativeMemory.Free(p);
     }
 
+    static McpHttpSessions httpSessions;
+
     static async int Run() {
+        bool worker = ProcessHost.IsWorker();
+        bool share = McpServer.workers > 1;
+        McpServer.httpSessions = new McpHttpSessions();
+        if (!McpServer.httpSessions.Open(worker, share)
+            || (share && !worker && !McpServer.PublishWorkerConfig())) {
+            Console.ErrorWriteLine("MCP could not set up HTTP worker state");
+            McpServer.httpSessions.Dispose();
+            return 1;
+        }
         Socket.Initialize();
         HttpServer server = new HttpServer(McpServer.host, McpServer.port);
         int bodyCap = McpServer.maxRead + 1048576;
@@ -764,7 +876,11 @@ class McpServer {
         server.SetTimeout(600000);
         if (McpServer.workers > 1) { server.Workers(McpServer.workers); }
         server.OnRequest(McpServer.Handle);
-        await server.Start();
+        try {
+            await server.Start();
+        } finally {
+            McpServer.httpSessions.Dispose();
+        }
         return 0;
     }
 
@@ -807,9 +923,13 @@ class McpServer {
             p = p.Substring(0, p.Length - 1);
         }
         if (req.method == "POST" && (p == "/" || p == "/mcp" || p == "/rpc")) {
-            return await McpServer.Rpc(req.body);
+            return await McpServer.Rpc(req.body, req.GetHeader("Mcp-Session-Id"));
         }
         if (req.method == "DELETE" && (p == "/" || p == "/mcp" || p == "/rpc")) {
+            string session = req.GetHeader("Mcp-Session-Id");
+            if (session != "" && !McpServer.httpSessions.End(session)) {
+                return McpServer.UnknownHttpSession();
+            }
             return McpServer.Cors(HttpResponse.WithStatus(204, "No Content", ""));
         }
         if (req.method == "GET" && (p == "/" || p == "/mcp" || p == "/rpc")) {
@@ -856,6 +976,7 @@ class McpServer {
             "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version");
         r = r.SetHeader("Access-Control-Allow-Methods",
             "GET, POST, DELETE, OPTIONS");
+        r = r.SetHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
         return r;
     }
 
@@ -884,6 +1005,9 @@ class McpServer {
         o.Put("workspace", JsonValue.NewStr(McpServer.root));
         o.Put("readOnly", JsonValue.NewBool(McpServer.readOnly));
         o.Put("exec", JsonValue.NewBool(McpServer.CanExec()));
+        o.Put("sandbox", JsonValue.NewStr(McpServer.sandboxMode));
+        o.Put("sandboxAvailable", JsonValue.NewBool(McpServer.SandboxAvailable()));
+        o.PutInt("worker", ProcessHost.WorkerId());
         o.Put("maxReadBytes", JsonValue.NewNum(Convert.ToString(McpServer.maxRead)));
         o.Put("zanTools", JsonValue.NewBool(McpServer.ZanToolsAvailable()));
         o.Put("frozenTools", JsonValue.NewBool(McpServer.frozenTools));
@@ -1005,7 +1129,10 @@ class McpServer {
 
     // ---- JSON-RPC -----------------------------------------------------------
 
-    static async HttpResponse Rpc(string body) {
+    static async HttpResponse Rpc(string body, string session) {
+        if (session != "" && !McpServer.httpSessions.Touch(session)) {
+            return McpServer.UnknownHttpSession();
+        }
         string parseError = "";
         JsonValue v = McpServer.ParseRpcBody(body, out parseError);
         if (v == null) {
@@ -1014,26 +1141,42 @@ class McpServer {
         if (v.IsArray()) {
             JsonValue outArr = JsonValue.NewArray();
             for (int i = 0; i < v.Count(); i = i + 1) {
-                JsonValue one = await McpServer.RpcOne(v.At(i));
+                JsonValue one = await McpServer.RpcOne(v.At(i), true, session);
                 if (one != null) { outArr.Append(one); }
             }
             if (outArr.Count() == 0) { return McpServer.Accepted(); }
             return McpServer.Cors(HttpResponse.Json(outArr.ToJson()));
         }
-        JsonValue res = await McpServer.RpcOne(v);
+        JsonValue res = await McpServer.RpcOne(v, true, session);
         if (res == null) { return McpServer.Accepted(); }
-        return McpServer.Cors(HttpResponse.Json(res.ToJson()));
+        HttpResponse reply = HttpResponse.Json(res.ToJson());
+        if (session == "" && v.IsObject()
+            && v.Str("method", "") == "initialize") {
+            JsonValue id = v.Get("id");
+            if (id != null && (id.IsNumber() || id.IsString())) {
+                string issued = McpServer.httpSessions.Create();
+                if (issued == "") {
+                    return McpServer.Fail(503, "Service Unavailable", "could not allocate MCP session", "");
+                }
+                reply = reply.SetHeader("Mcp-Session-Id", issued);
+            }
+        }
+        return McpServer.Cors(reply);
     }
 
     static HttpResponse Accepted() {
         return McpServer.Cors(HttpResponse.WithStatus(202, "Accepted", ""));
     }
 
-    static async JsonValue RpcOne(JsonValue v) {
-        return await McpServer.RpcOne(v, true);
+    static HttpResponse UnknownHttpSession() {
+        return McpServer.Fail(404, "Not Found", "MCP session is unknown or expired", "initialize a new session");
     }
 
     static async JsonValue RpcOne(JsonValue v, bool accepted) {
+        return await McpServer.RpcOne(v, accepted, "");
+    }
+
+    static async JsonValue RpcOne(JsonValue v, bool accepted, string session) {
         if (v == null || !v.IsObject()) {
             return McpServer.RpcErrorDoc(JsonValue.NewNull(), 0 - 32600,
                 "invalid request: expected a JSON-RPC object");
@@ -1048,6 +1191,10 @@ class McpServer {
             return McpServer.RpcErrorDoc(id, 0 - 32600, "invalid request: no method");
         }
         if (rpc == "notifications/cancelled") {
+            if (session != "" && isNotification && p != null) {
+                string key = McpServer.RequestKey(p.Get("requestId"), session);
+                if (key != "") { McpServer.httpSessions.Cancel(key); }
+            }
             if (isNotification) { return null; }
             return McpServer.RpcResultDoc(id, JsonValue.NewObject());
         }
@@ -1121,7 +1268,11 @@ class McpServer {
                 targs = p.Get("arguments");
             }
             if (targs == null) { targs = JsonValue.NewObject(); }
-            string requestKey = McpServer.RequestKey(id);
+            string requestKey = McpServer.RequestKey(id, session);
+            if (session != "" && !McpServer.httpSessions.BeginRequest(session, requestKey)) {
+                return McpServer.RpcErrorDoc(id, 0 - 32600,
+                    "session closed, invalid request id, or duplicate active request id");
+            }
             if (!accepted) {
                 return McpServer.RpcErrorDoc(id, 0 - 32600,
                     "duplicate request id while the original call is still active");
@@ -1130,7 +1281,8 @@ class McpServer {
             try {
                 text = await McpServer.CallTool(name, targs, requestKey);
             } finally {
-                McpServer.EndRequest(requestKey);
+                if (session != "") { McpServer.httpSessions.EndRequest(requestKey); }
+                else { McpServer.EndRequest(requestKey); }
             }
             bool bad = text.Length >= 6 && text.Substring(0, 6) == "error:";
             JsonValue r = JsonValue.NewObject();
@@ -2073,7 +2225,7 @@ class McpServer {
     const int MAX_PENDING_PROCESSES = 64;
 
     static async string RunCommand(JsonValue args, string requestKey) {
-        if (!McpServer.CanExec()) {
+        if (!McpServer.allowExec || McpServer.readOnly) {
             return "error: command execution is disabled on this server";
         }
         string cmd = args.Str("command", "");
@@ -2217,8 +2369,13 @@ class McpServer {
     }
 
     static string RequestKey(JsonValue id) {
-        if (!McpServer.stdio || id == null || id.IsNull()) { return ""; }
-        return id.ToJson();
+        return McpServer.RequestKey(id, "");
+    }
+
+    static string RequestKey(JsonValue id, string session) {
+        if (id == null || (!id.IsNumber() && !id.IsString())) { return ""; }
+        if (session != "") { return McpHttpSessions.RequestKey(session, id.ToJson()); }
+        return McpServer.stdio ? id.ToJson() : "";
     }
 
     static bool ContainsText(List<string> values, string value) {
@@ -2231,10 +2388,17 @@ class McpServer {
     static bool BeginRequest(string key) {
         if (key == "") { return true; }
         Mutex.Lock(McpServer.jobLock);
-        bool accepted = !McpServer.ContainsText(McpServer.activeRequests, key);
-        if (accepted) { McpServer.activeRequests.Add(key); }
-        Mutex.Unlock(McpServer.jobLock);
-        return accepted;
+        try {
+            return McpServer.BeginRequestLocked(key);
+        } finally {
+            Mutex.Unlock(McpServer.jobLock);
+        }
+    }
+
+    static bool BeginRequestLocked(string key) {
+        if (McpServer.ContainsText(McpServer.activeRequests, key)) { return false; }
+        McpServer.activeRequests.Add(key);
+        return true;
     }
 
     static void EndRequest(string key) {
@@ -2252,10 +2416,15 @@ class McpServer {
     static void CancelRequest(string key) {
         if (key == "") { return; }
         Mutex.Lock(McpServer.jobLock);
-        if (!McpServer.ContainsText(McpServer.activeRequests, key)) {
+        try {
+            McpServer.CancelRequestLocked(key);
+        } finally {
             Mutex.Unlock(McpServer.jobLock);
-            return;
         }
+    }
+
+    static void CancelRequestLocked(string key) {
+        if (!McpServer.ContainsText(McpServer.activeRequests, key)) { return; }
         if (!McpServer.ContainsText(McpServer.cancelledRequests, key)) {
             McpServer.cancelledRequests.Add(key);
         }
@@ -2264,11 +2433,12 @@ class McpServer {
             if (job.requestKey != key || job.done) { continue; }
             job.cancelRequested = true;
         }
-        Mutex.Unlock(McpServer.jobLock);
     }
 
     static bool CancelledLocked(string key) {
-        return key != "" && McpServer.ContainsText(McpServer.cancelledRequests, key);
+        if (key == "") { return false; }
+        return McpServer.stdio ? McpServer.ContainsText(McpServer.cancelledRequests, key)
+            : McpServer.httpSessions.IsCancelled(key);
     }
 
     static PendingJob NewJob(string exe, List<string> args, string cwd,
@@ -2299,8 +2469,9 @@ class McpServer {
     }
 
     static async PendingJob RunProcessAsync(string exe, List<string> args, string cwd,
-            string requestKey, int timeoutMs, int maxOutputBytes) {
+            string requestKey, int timeoutMs, int maxOutputBytes, string readFile = "") {
         PendingJob job = McpServer.NewJob(exe, args, cwd, requestKey, timeoutMs, maxOutputBytes);
+        job.readFile = readFile;
         Mutex.Lock(McpServer.jobLock);
         McpServer.jobSeq = McpServer.jobSeq + 1;
         job.id = McpServer.jobSeq;
@@ -2365,77 +2536,94 @@ class McpServer {
         }
     }
 
+    static bool JobCancelled(PendingJob job) {
+        Mutex.Lock(McpServer.jobLock);
+        bool cancelled = job.cancelRequested || McpServer.CancelledLocked(job.requestKey);
+        Mutex.Unlock(McpServer.jobLock);
+        return cancelled;
+    }
+
     static void RunPendingJob(PendingJob job) {
+        if (McpServer.JobCancelled(job)) {
+            McpServer.FinishJob(job, "cancelled", "", "error: request cancelled", true);
+            return;
+        }
         ProcessSpawn child = null;
+        StringBuilder output = new StringBuilder();
+        string status = "start-failed";
+        string error = "";
+        bool cleaned = true;
         try {
-            Mutex.Lock(McpServer.jobLock);
-            bool cancelled = job.cancelRequested;
-            Mutex.Unlock(McpServer.jobLock);
-            if (cancelled) {
-                McpServer.FinishJob(job, "cancelled", child, "", "error: request cancelled");
-                return;
-            }
-            #if WINDOWS
-            if (job.exe == "cmd.exe") {
-                child = ProcessSpawn.SpawnCommandProcessor(job.args[0], job.cwd);
-            } else
-            #endif
-            {
-                child = ProcessSpawn.Spawn(job.exe, job.args, job.cwd);
-            }
-            if (child == null) {
-                McpServer.FinishJob(job, "start-failed", child, "",
-                    "error: failed to start executable: " + job.exe);
-                return;
-            }
-            StringBuilder output = new StringBuilder();
-            long deadline = Stopwatch.GetMilliseconds() + job.timeoutMs;
-            string status = "completed";
-            bool terminated = false;
-            int code = 0 - 258;
-            while (true) {
-                McpServer.ReadJobOutput(job, child, output);
-                Mutex.Lock(McpServer.jobLock);
-                cancelled = job.cancelRequested;
-                Mutex.Unlock(McpServer.jobLock);
-                if (cancelled) {
-                    status = "cancelled";
-                    terminated = true;
-                    child.Kill();
-                    break;
+            string sandboxError = McpServer.SandboxError();
+            if (sandboxError != "") {
+                status = "sandbox-unavailable";
+                error = sandboxError;
+            } else if (McpServer.SandboxRequired()) {
+                string workspace = Path.GetFullPath(McpServer.root);
+                string cwd = job.cwd == "" ? workspace : Path.GetFullPath(job.cwd);
+                child = ProcessSpawn.SpawnSandboxed(job.exe, job.args, cwd,
+                    McpServer.SandboxReadRoots(job.readFile), workspace, McpServer.sandboxCgroup);
+            } else {
+                #if WINDOWS
+                if (job.exe == "cmd.exe") {
+                    child = ProcessSpawn.SpawnCommandProcessor(job.args[0], job.cwd, true);
+                } else
+                #endif
+                {
+                    child = ProcessSpawn.SpawnManaged(job.exe, job.args, job.cwd);
                 }
-                if (Stopwatch.GetMilliseconds() >= deadline) {
-                    status = "timeout";
-                    terminated = true;
-                    child.Kill();
-                    break;
+            }
+            if (sandboxError == "" && child == null) {
+                status = McpServer.SandboxRequired() ? "sandbox-start-failed" : "start-failed";
+                error = McpServer.SandboxRequired()
+                    ? "error: failed to establish the required execution sandbox"
+                    : "error: failed to start executable: " + job.exe;
+            } else if (child != null) {
+                status = McpServer.WaitForJob(job, child, output);
+                if (status == "timeout") {
+                    error = "error: process exceeded timeoutMs=" + Convert.ToString(job.timeoutMs);
+                } else if (status == "cancelled") {
+                    error = "error: request cancelled";
+                } else if (status == "execution-failed") {
+                    error = "error: failed to wait for the managed process";
                 }
-                code = child.WaitExitCode(1);
-                if (code != 0 - 258) { break; }
             }
-            if (terminated) {
-                int finalCode = child.WaitExitCode(5000);
-                if (finalCode == 0 - 258) { status = "termination-failed"; }
-            }
-            while (!job.outputTruncated && McpServer.ReadJobOutput(job, child, output)) {
-                // Drain data queued before exit without waiting on descendants.
-            }
-            string error = "";
-            if (status == "timeout") {
-                error = "error: process exceeded timeoutMs=" + Convert.ToString(job.timeoutMs);
-            } else if (status == "cancelled") {
-                error = "error: request cancelled";
-            } else if (status == "termination-failed") {
-                error = "error: child did not exit after termination";
-            }
-            job.result.exitCode = terminated ? 0 - 1 : code;
-            McpServer.FinishJob(job, status, child, output.ToString(), error);
         } catch (Exception e) {
-            if (child != null) {
-                child.Kill();
-                child.WaitExitCode(5000);
+            status = "execution-failed";
+            error = "error: " + e.Message;
+        }
+        if (child != null) {
+            try {
+                if (!child.HasExitCode()) {
+                    child.Kill();
+                    child.WaitExitCode(5000);
+                }
+                while (!job.outputTruncated && McpServer.ReadJobOutput(job, child, output)) {
+                    // Only read already buffered data, within the output budget.
+                }
+            } catch (Exception e) {
+                status = "execution-failed";
+                error = "error: " + e.Message;
+                job.result.exitCode = 0 - 1;
+            } finally {
+                cleaned = child.Close() && child.HasExitCode();
             }
-            McpServer.FinishJob(job, "execution-failed", child, "", "error: " + e.Message);
+        }
+        McpServer.FinishJob(job, status, output.ToString(), error, cleaned);
+    }
+
+    static string WaitForJob(PendingJob job, ProcessSpawn child, StringBuilder output) {
+        long deadline = Stopwatch.GetMilliseconds() + job.timeoutMs;
+        while (true) {
+            McpServer.ReadJobOutput(job, child, output);
+            if (McpServer.JobCancelled(job)) { return "cancelled"; }
+            if (Stopwatch.GetMilliseconds() >= deadline) { return "timeout"; }
+            int code = child.WaitExitCode(1);
+            if (child.HasExitCode()) {
+                job.result.exitCode = code;
+                return "completed";
+            }
+            if (code != 0 - 258) { return "execution-failed"; }
         }
     }
 
@@ -2452,15 +2640,18 @@ class McpServer {
         return true;
     }
 
-    static void FinishJob(PendingJob job, string status, ProcessSpawn child,
-            string output, string error) {
-        if (child != null) { child.Dispose(); }
+    static void FinishJob(PendingJob job, string status, string output, string error, bool cleaned) {
         if (output != "") {
             // A byte budget can end in the middle of a UTF-8 sequence.
             string text = Encoding.GetString(output.ToBytes());
             job.result.lines = Process.SplitLines(text);
         }
         if (error != "") { job.result.lines.Add(error); }
+        if (!cleaned) {
+            status = "termination-failed";
+            job.result.exitCode = 0 - 1;
+            job.result.lines.Add("error: managed process cleanup could not be confirmed");
+        }
         Mutex.Lock(McpServer.jobLock);
         job.status = status;
         job.done = true;
@@ -2689,9 +2880,10 @@ class McpServer {
                 argv.Add("--package-project");
                 argv.Add(project);
             }
-            return await McpServer.RunProcessAsync(McpServer.zancPath, argv, "", requestKey);
+            return await McpServer.RunProcessAsync(McpServer.zancPath, argv, "", requestKey,
+                McpServer.DEFAULT_PROCESS_TIMEOUT_MS, McpServer.DEFAULT_PROCESS_OUTPUT_BYTES, response);
         } finally {
-            if (response != "") { File.Delete(response); }
+            if (response != "" && File.Exists(response)) { File.Delete(response); }
         }
     }
 

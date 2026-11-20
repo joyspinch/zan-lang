@@ -611,6 +611,7 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_ops.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_net.c
             ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc_sandbox.c
     COMMENT "Building atomic/shared-memory runtime object (zanrt_sync)"
     VERBATIM)
 add_custom_target(zanrt_sync ALL DEPENDS ${ZAN_RT_SYNC_OBJ})

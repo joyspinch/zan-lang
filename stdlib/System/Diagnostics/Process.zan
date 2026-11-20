@@ -974,14 +974,19 @@ public class Process {
 /// 活进程管道句柄集：spawn 后子进程 stdin/stdout 保持接线，父进程可随时
 /// 写命令、非阻塞读输出、终止或等待退出。与 CaptureSafe（等子进程死再收
 /// 全部输出）互补，本类面向交互式子进程（REPL、长驻工具）及有界作业执行。
-/// Kill 只保证直接子进程；它不是进程树终止或操作系统安全沙箱。
+/// SpawnManaged 将作业绑定到 Windows Job Object 或 POSIX 进程组。
 public class ProcessSpawn {
     nint hProcess;
     nint hThread;
     int pid;
+    nint hJob;
+    nint sandboxGroup;
+    bool jobTerminating;
+    bool managed;
     nint stdinWrite;   // 子进程 stdin 的父侧写端（子读端已关）
     nint stdoutRead;   // 子进程 stdout 的父侧读端（子写端已关）
     bool disposed;
+    bool closeOk;
     bool exited;
     int exitCode;
 
@@ -1024,7 +1029,35 @@ public class ProcessSpawn {
     private static extern int WinTerminateProcess(nint handle, int code);
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     private static extern int WinCloseHandle(nint handle);
+    [DllImport("kernel32", EntryPoint = "CreateJobObjectW")]
+    private static extern nint WinCreateJobObject(nint attributes, nint name);
+    [DllImport("kernel32", EntryPoint = "SetInformationJobObject")]
+    private static extern int WinSetJobInformation(nint job, int infoClass, byte[] info, int size);
+    [DllImport("kernel32", EntryPoint = "TerminateJobObject")]
+    private static extern int WinTerminateJob(nint job, int code);
+    [DllImport("kernel32", EntryPoint = "QueryInformationJobObject")]
+    private static extern int WinQueryJobInformation(nint job, int infoClass,
+        byte[] info, int size, nint returnedSize);
     #elif LINUX || MACOS
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_managed")]
+    private static extern int PosixSpawnManaged(nint[] argv, string cwd, int[] fds);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_managed_kill")]
+    private static extern int PosixKillManaged(int pid);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_managed_wait")]
+    private static extern int PosixWaitManaged(int pid, int timeoutMs);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_managed_dispose")]
+    private static extern int PosixDisposeManaged(int pid, int stdinFd, int stdoutFd);
+    [DllImport("crt", EntryPoint = "zan_proc_sandbox_available")]
+    private static extern int PosixSandboxAvailable(string cgroupRoot);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_sandboxed")]
+    private static extern int PosixSpawnSandboxed(nint[] argv, string cwd,
+        string readRoots, string writeRoot, string cgroupRoot, int[] fds, nint[] group);
+    [DllImport("crt", EntryPoint = "zan_proc_sandbox_kill")]
+    private static extern int PosixSandboxKill(nint group);
+    [DllImport("crt", EntryPoint = "zan_proc_sandbox_wait")]
+    private static extern int PosixSandboxWait(int pid, int timeoutMs, nint group);
+    [DllImport("crt", EntryPoint = "zan_proc_sandbox_dispose")]
+    private static extern int PosixSandboxDispose(nint group, int pid, int stdinFd, int stdoutFd);
     [DllImport("crt", EntryPoint = "zan_proc_spawn")]
     private static extern int PosixSpawn(nint[] argv, string cwd, int[] fds);
     [DllImport("crt", EntryPoint = "zan_proc_spawn_available")]
@@ -1079,10 +1112,43 @@ public class ProcessSpawn {
     /// 在指定工作目录启动子进程。空 cwd 继承父进程目录；启动、chdir 或 exec
     /// 失败均返回 null，不把 POSIX 的 exec 失败伪装成退出码 127 的已成功作业。
     public static ProcessSpawn Spawn(string exe, List<string> args, string cwd) {
+        return SpawnCore(exe, args, cwd, false);
+    }
+
+    /// 等待受管主进程退出或释放作业时，终止仍在作业或进程组中的后代。
+    /// 受管进程使用父进程的文件和网络权限。
+    public static ProcessSpawn SpawnManaged(string exe, List<string> args, string cwd) {
+        return SpawnCore(exe, args, cwd, true);
+    }
+
+    /// Linux 隔离启动。readRoots 是换行分隔的绝对路径，writeRoot 是可写目录。
+    /// cgroupRoot 须为部署方委派的 cgroup v2 目录。策略或启动失败返回 null。
+    public static ProcessSpawn SpawnSandboxed(string exe, List<string> args, string cwd,
+            string readRoots, string writeRoot, string cgroupRoot) {
+        if (cgroupRoot == null || cgroupRoot == "") { return null; }
+        return SpawnCore(exe, args, cwd, true, readRoots, writeRoot, cgroupRoot);
+    }
+
+    /// 探测内核与委派路径。每次启动仍须成功建立全部隔离策略。
+    public static bool SandboxAvailable(string cgroupRoot) {
+        #if LINUX
+        return cgroupRoot != null && ProcessSpawn.PosixSandboxAvailable(cgroupRoot) != 0;
+        #else
+        return false;
+        #endif
+    }
+
+    private static ProcessSpawn SpawnCore(string exe, List<string> args, string cwd, bool managed) {
+        return SpawnCore(exe, args, cwd, managed, "", "", "");
+    }
+
+    private static ProcessSpawn SpawnCore(string exe, List<string> args, string cwd,
+            bool managed, string readRoots, string writeRoot, string cgroupRoot) {
         if (exe == null || exe == "") { return null; }
         if (cwd == null) { cwd = ""; }
         #if WINDOWS
-        return ProcessSpawn.WinSpawn(Process.BuildCommandLine(exe, args), cwd);
+        if (cgroupRoot != "") { return null; }
+        return ProcessSpawn.WinSpawn(Process.BuildCommandLine(exe, args), cwd, managed);
         #elif LINUX || MACOS
         int argc = args != null ? args.Count : 0;
         nint[] argv = new nint[argc + 2];
@@ -1093,9 +1159,19 @@ public class ProcessSpawn {
                 argv[i] = Marshal.StringToHGlobalUtf8(arg == null ? "" : arg);
             }
             ProcessSpawn child = new ProcessSpawn((nint)0, (nint)0, 0, (nint)0, (nint)0);
-            int processId = ProcessSpawn.PosixSpawn(argv, cwd, fds);
+            int processId;
+            if (cgroupRoot != "") {
+                nint[] group = new nint[1];
+                processId = ProcessSpawn.PosixSpawnSandboxed(argv, cwd, readRoots,
+                    writeRoot, cgroupRoot, fds, group);
+                child.sandboxGroup = group[0];
+            } else {
+                processId = managed ? ProcessSpawn.PosixSpawnManaged(argv, cwd, fds)
+                    : ProcessSpawn.PosixSpawn(argv, cwd, fds);
+            }
             if (processId < 0) { return null; }
             child.pid = processId;
+            child.managed = managed;
             child.stdinWrite = fds[0];
             child.stdoutRead = fds[1];
             return child;
@@ -1122,6 +1198,11 @@ public class ProcessSpawn {
 
     /// 以 cmd.exe /d /s /c 执行完整 shell 命令。调用方负责命令的可信性。
     public static ProcessSpawn SpawnCommandProcessor(string command, string cwd) {
+        return SpawnCommandProcessor(command, cwd, false);
+    }
+
+    /// managed 为 true 时在进程创建时加入 Job Object。
+    public static ProcessSpawn SpawnCommandProcessor(string command, string cwd, bool managed) {
         if (command == null || command == "") { return null; }
         int capacity = 32768;
         nint directory = NativeMemory.Alloc(capacity * 2);
@@ -1131,13 +1212,13 @@ public class ProcessSpawn {
             string exe = Wide.Read(directory) + "\\cmd.exe";
             // /s strips the outer quotes. Inner quotes belong to cmd syntax.
             return ProcessSpawn.WinSpawn(Process.QuoteArg(exe) + " /d /s /c \""
-                + command + "\"", cwd == null ? "" : cwd);
+                + command + "\"", cwd == null ? "" : cwd, managed);
         } finally {
             NativeMemory.Free(directory);
         }
     }
 
-    private static ProcessSpawn WinSpawn(string cmdline, string cwd) {
+    private static ProcessSpawn WinSpawn(string cmdline, string cwd, bool managed) {
         // 双匿名管道：子读端/子写端可继承，父侧两端私有（读端/写端各关
         // 掉继承位，避免句柄泄漏进孙进程）。
         byte[] sa = new byte[24];
@@ -1145,9 +1226,11 @@ public class ProcessSpawn {
         WinPutInt(sa, 16, 1); // bInheritHandle = TRUE
         byte[] inReadB = new byte[8];
         byte[] inWriteB = new byte[8];
-        if (WinCreatePipe(inReadB, inWriteB, sa, 0) == 0) { return null; }
         byte[] outReadB = new byte[8];
         byte[] outWriteB = new byte[8];
+        byte[] pi = new byte[32];
+        ProcessSpawn child = new ProcessSpawn((nint)0, (nint)0, 0, (nint)0, (nint)0);
+        if (WinCreatePipe(inReadB, inWriteB, sa, 0) == 0) { return null; }
         if (WinCreatePipe(outReadB, outWriteB, sa, 0) == 0) {
             WinCloseHandle(WinHandleAt(inReadB, 0));
             WinCloseHandle(WinHandleAt(inWriteB, 0));
@@ -1158,45 +1241,67 @@ public class ProcessSpawn {
         nint outRead = WinHandleAt(outReadB, 0);
         nint outWrite = WinHandleAt(outWriteB, 0);
         int HANDLE_FLAG_INHERIT = 1;
-        byte[] pi = new byte[32];
         int ok = 0;
+        nint job = 0;
         try {
+            if (managed) {
+                int JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 8192;
+                int JobObjectExtendedLimitInformation = 9;
+                byte[] limits = new byte[144]; // JOBOBJECT_EXTENDED_LIMIT_INFORMATION (64-bit)
+                WinPutInt(limits, 16, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+                job = WinCreateJobObject(0, 0);
+                if (job == 0 || WinSetJobInformation(job, JobObjectExtendedLimitInformation,
+                    limits, limits.Length) == 0) { return null; }
+            }
             if (WinSetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0) != 0
                 && WinSetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0) != 0) {
-                ok = ProcessSpawn.WinCreateRedirected(cmdline, cwd, inRead, outWrite, pi);
+                ok = ProcessSpawn.WinCreateRedirected(cmdline, cwd, inRead, outWrite, job, pi);
             }
         } finally {
             WinCloseHandle(inRead);
             WinCloseHandle(outWrite);
             if (ok == 0) {
+                if (job != 0) { WinCloseHandle(job); }
                 WinCloseHandle(inWrite);
                 WinCloseHandle(outRead);
             }
         }
 
         if (ok == 0) { return null; }
-        return new ProcessSpawn(WinHandleAt(pi, 0), WinHandleAt(pi, 8),
-            ReadIntLE(pi, 16), inWrite, outRead);
+        child.hProcess = WinHandleAt(pi, 0);
+        child.hThread = WinHandleAt(pi, 8);
+        child.pid = ReadIntLE(pi, 16);
+        child.stdinWrite = inWrite;
+        child.stdoutRead = outRead;
+        child.hJob = job;
+        return child;
     }
 
     private static int WinCreateRedirected(string cmdline, string cwd, nint inRead,
-            nint outWrite, byte[] pi) {
+            nint outWrite, nint job, byte[] pi) {
         nint[] size = new nint[1];
-        WinInitAttributes(0, 1, 0, size);
+        int count = job == 0 ? 1 : 2;
+        WinInitAttributes(0, count, 0, size);
         if (size[0] <= 0) { return 0; }
-        nint attributes = NativeMemory.Alloc((int)size[0]);
         bool initialized = false;
         nint wcmd = 0;
         nint wcwd = 0;
         nint[] handles = new nint[2];
+        nint[] jobs = new nint[1];
+        jobs[0] = job;
         handles[0] = inRead;
         handles[1] = outWrite;
+        nint attributes = NativeMemory.Alloc((int)size[0]);
         try {
-            initialized = WinInitAttributes(attributes, 1, 0, size) != 0;
+            initialized = WinInitAttributes(attributes, count, 0, size) != 0;
             if (!initialized) { return 0; }
             int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 131074;
             if (WinUpdateAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                 handles, 16, 0, 0) == 0) { return 0; }
+            // The kernel assigns the process before it can create descendants.
+            int PROC_THREAD_ATTRIBUTE_JOB_LIST = 131085;
+            if (job != 0 && WinUpdateAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                jobs, 8, 0, 0) == 0) { return 0; }
 
             byte[] si = new byte[112]; // STARTUPINFOEXW (64-bit Windows)
             WinPutInt(si, 0, 112);
@@ -1275,35 +1380,79 @@ public class ProcessSpawn {
         #endif
     }
 
-    /// 强制终止直接子进程；不承诺终止已脱离或自行建立的进程组/作业的后代。
+    #if WINDOWS
+    private bool WinStopJob() {
+        if (!jobTerminating) { jobTerminating = WinTerminateJob(hJob, 1) != 0; }
+        return jobTerminating;
+    }
+
+    private int WinWaitJob(long deadline) {
+        if (!WinStopJob()) { return 0 - 1; }
+        int JobObjectBasicAccountingInformation = 1;
+        byte[] accounting = new byte[48];
+        while (true) {
+            if (WinQueryJobInformation(hJob, JobObjectBasicAccountingInformation,
+                accounting, accounting.Length, 0) == 0) { return 0 - 1; }
+            if (ReadIntLE(accounting, 40) == 0) { return 0; } // ActiveProcesses
+            if (deadline > 0 && Stopwatch.GetMilliseconds() >= deadline) { return 0 - 258; }
+            Thread.Sleep(1);
+        }
+    }
+    #endif
+
+    /// 终止受管作业或进程组。普通启动仅终止直接子进程。
     public bool Kill() {
-        if (disposed) { return false; }
+        if (disposed || exited) { return false; }
         #if WINDOWS
         if (hProcess == 0) { return false; }
+        if (hJob != 0) { return WinStopJob(); }
         return WinTerminateProcess(hProcess, 1) != 0;
         #elif LINUX || MACOS
-        return !exited && ProcessSpawn.PosixKill(pid) != 0;
+        if (sandboxGroup != 0) { return ProcessSpawn.PosixSandboxKill(sandboxGroup) != 0; }
+        return managed ? ProcessSpawn.PosixKillManaged(pid) != 0 : ProcessSpawn.PosixKill(pid) != 0;
         #else
         return false;
         #endif
     }
 
-    /// 等待退出并返回退出码；timeoutMs <= 0 表示无限等。超时返回 -258
-    /// （WAIT_TIMEOUT 的显式记号，不代杀；调用方自行 Kill 后再收尸）。
+    /// 上次等待是否获得了退出码。Windows 的真实退出码也可能为 -1 或 -258。
+    public bool HasExitCode() {
+        #if WINDOWS
+        return exited;
+        #else
+        return exited && exitCode >= 0;
+        #endif
+    }
+
+    /// 等待退出并返回退出码。timeoutMs <= 0 表示无限等。超时返回 -258，等待失败返回 -1。
     public int WaitExitCode(int timeoutMs) {
         if (disposed) { return 0 - 1; }
+        if (exited) { return exitCode; }
         #if WINDOWS
         if (hProcess == 0) { return 0 - 1; }
-        int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
-        int waited = WinWaitForSingleObject(hProcess, waitMs);
+        long deadline = timeoutMs > 0 && hJob != 0 ? Stopwatch.GetMilliseconds() + timeoutMs : 0;
+        int waited = WinWaitForSingleObject(hProcess, timeoutMs > 0 ? timeoutMs : (0 - 1));
         if (waited == 258) { return 0 - 258; }
         if (waited != 0) { return 0 - 1; }
         byte[] cb = new byte[4];
         if (WinGetExitCodeProcess(hProcess, cb) == 0) { return 0 - 1; }
-        return ReadIntLE(cb, 0);
+        if (hJob != 0) {
+            int cleaned = WinWaitJob(deadline);
+            if (cleaned != 0) { return cleaned; }
+        }
+        exited = true;
+        exitCode = ReadIntLE(cb, 0);
+        return exitCode;
         #elif LINUX || MACOS
-        if (exited) { return exitCode; }
-        int code = ProcessSpawn.PosixWait(pid, timeoutMs);
+        int code;
+        if (sandboxGroup != 0) {
+            code = ProcessSpawn.PosixSandboxWait(pid, timeoutMs, sandboxGroup);
+        } else {
+            code = managed ? ProcessSpawn.PosixWaitManaged(pid, timeoutMs)
+                : ProcessSpawn.PosixWait(pid, timeoutMs);
+        }
+        // ZAN_PROC_WAIT_OWNED_ERROR: retain the PID for Close to finish cleaning up.
+        if (managed && code == 0 - 259) { return 0 - 1; }
         if (code != 0 - 258) {
             exited = true;
             exitCode = code;
@@ -1317,17 +1466,39 @@ public class ProcessSpawn {
     /// 关闭全部句柄。POSIX 上会终止仍在运行的直接子进程并回收退出状态。
     /// 之后 Read/Write/Kill 一律失败。
     public void Dispose() {
-        if (disposed) { return; }
+        Close();
+    }
+
+    /// 释放句柄并报告受管作业的清理结果。调用方应先等待终止确认。
+    public bool Close() {
+        if (disposed) { return closeOk; }
         disposed = true;
+        bool ok = true;
         #if WINDOWS
-        if (stdinWrite != 0) { WinCloseHandle(stdinWrite); stdinWrite = 0; }
-        if (stdoutRead != 0) { WinCloseHandle(stdoutRead); stdoutRead = 0; }
-        if (hThread != 0) { WinCloseHandle(hThread); hThread = 0; }
-        if (hProcess != 0) { WinCloseHandle(hProcess); hProcess = 0; }
+        if (hJob != 0) {
+            // Closing the last Job handle requests termination even after a wait failure.
+            ok = WinCloseHandle(hJob) != 0 && exited;
+            hJob = 0;
+        }
+        if (stdinWrite != 0) { ok = WinCloseHandle(stdinWrite) != 0 && ok; stdinWrite = 0; }
+        if (stdoutRead != 0) { ok = WinCloseHandle(stdoutRead) != 0 && ok; stdoutRead = 0; }
+        if (hThread != 0) { ok = WinCloseHandle(hThread) != 0 && ok; hThread = 0; }
+        if (hProcess != 0) { ok = WinCloseHandle(hProcess) != 0 && ok; hProcess = 0; }
         #elif LINUX || MACOS
-        ProcessSpawn.PosixDispose(exited ? 0 : pid, (int)stdinWrite, (int)stdoutRead);
+        if (sandboxGroup != 0) {
+            ok = ProcessSpawn.PosixSandboxDispose(sandboxGroup, exited ? 0 : pid,
+                (int)stdinWrite, (int)stdoutRead) != 0 && (!exited || exitCode >= 0);
+            sandboxGroup = 0;
+        } else if (managed) {
+            ok = ProcessSpawn.PosixDisposeManaged(exited ? 0 : pid, (int)stdinWrite, (int)stdoutRead) != 0
+                && (!exited || exitCode >= 0);
+        } else {
+            ProcessSpawn.PosixDispose(exited ? 0 : pid, (int)stdinWrite, (int)stdoutRead);
+        }
         stdinWrite = 0;
         stdoutRead = 0;
         #endif
+        closeOk = ok;
+        return ok;
     }
 }
