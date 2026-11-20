@@ -809,7 +809,7 @@ partial class Irgen {
                 }
             }
         }
-        ExprVal obj = GenExpr(e.a);
+        ExprVal obj = GenPlaceReceiver(e.a);
         // Vector128.Low / Vector128.High: the two 64-bit halves of the
         // vector (the C host carries the vector in a { i64, i64 } struct and
         // reads the halves out of it)
@@ -977,6 +977,10 @@ partial class Irgen {
         if (cls != null) {
             Node mg = FindMethodUp(cls, e.sval);
             if (mg != null && !HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                if (ArrayInlineStruct(obj.ty)) {
+                    obj = CopyStructValue(obj);
+                    AddTemp(obj.op, obj.ty);
+                }
                 return EmitInstanceMethodGroup(obj, cls, mg);
             }
         }
@@ -1063,7 +1067,11 @@ partial class Irgen {
     // --strict-runtime / ZAN_RT_HARD=1. The bad value must be computed
     // BEFORE this call: everything it needs has to live in the block that
     // dominates both the report and the skip path.
-    void EmitRuntimeCheckIf(Node at, string bad, string msg) {
+    public bool runtimeChecks = true;
+    public bool strictRuntime;
+
+    void EmitRuntimeCheckIf(Node at, string bad, string msg, bool required = false) {
+        if (!runtimeChecks && !required) { return; }
         // The C host's split-path report (irgen_generics.c emit_runtime_check
         // -> emit_guard_report3 -> zan_rt_guard_fail3 -> zan_rt_soft_note3)
         // appends a newline to the message and then another one when it
@@ -1099,10 +1107,13 @@ partial class Irgen {
         EmitExceptionThrow(tid, msg);
         Label(lnothrow);
         int lhard = NL(); int lsoft = NL();
-        string hd = NT();
-        L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
-        string hz = NT();
-        L("  " + hz + " = icmp ne i32 " + hd + ", 0");
+        string hz = "true";
+        if (!strictRuntime) {
+            string hd = NT();
+            L("  " + hd + " = call i32 @zan_rt_soft_is_hard()");
+            hz = NT();
+            L("  " + hz + " = icmp ne i32 " + hd + ", 0");
+        }
         L("  br i1 " + hz + ", label %L" + lhard + ", label %L" + lsoft);
         Label(lhard);
         L("  call void @zan_rt_soft_note(i8* " + thard + ")");

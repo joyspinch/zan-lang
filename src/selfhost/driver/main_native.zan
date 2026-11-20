@@ -38,14 +38,20 @@ class NativeManifestEntry {
 class NativeDriver {
     public NativeManifestEntry entry;
     public string dir;
-    public List<string> symbols;
+    public bool hasImports;
+    public bool needsArchive;
+    public bool linkResolved;
+    public bool staticLinked;
     public bool visiting;
     public bool bundled;
 
     public NativeDriver(NativeManifestEntry entry, string dir) {
         this.entry = entry;
         this.dir = dir;
-        symbols = new List<string>();
+    }
+
+    public string StaticArchive() {
+        return dir + "/static/lib" + entry.name + ".a";
     }
 
     public string Archive() {
@@ -53,7 +59,7 @@ class NativeDriver {
         if (File.Exists(file)) { return file; }
         file = dir + "/" + entry.name + ".lib";
         if (File.Exists(file)) { return file; }
-        file = dir + "/static/lib" + entry.name + ".a";
+        file = StaticArchive();
         if (File.Exists(file)) { return file; }
         throw "zanc: missing driver link library for '" + entry.name + "' in '" + dir + "'";
     }
@@ -66,11 +72,23 @@ class NativeDriverRegistry {
     private List<string> definitions;
     private string target;
     private string overrideDir;
+    private bool staticDrivers;
+    private List<string> inputs;
+    private List<string> libraries;
+    private HashSet<string> inputPaths = new HashSet<string>();
+    private HashSet<string> seenLibraries = new HashSet<string>();
 
-    public NativeDriverRegistry(List<string> definitions, string target, string overrideDir) {
+    public NativeDriverRegistry(List<string> definitions, string target, string overrideDir,
+                                List<string> inputs, List<string> libraries, bool staticDrivers) {
         this.definitions = definitions;
         this.target = target;
         this.overrideDir = overrideDir;
+        this.inputs = inputs;
+        this.libraries = libraries;
+        this.staticDrivers = staticDrivers;
+        for (int i = 0; i < inputs.Count; i = i + 1) {
+            inputPaths.Add(Path.GetFullPath(inputs[i]).ToLower());
+        }
     }
 
     public void Register(string path) {
@@ -100,12 +118,77 @@ class NativeDriverRegistry {
         }
     }
 
+    public void AddLibrary(string name) {
+        if (seenLibraries.Add(name.ToLower())) { libraries.Add("-l" + name); }
+    }
+
+    private void AddInput(string path) {
+        string full = Path.GetFullPath(path);
+        if (inputPaths.Add(full.ToLower())) { inputs.Add(full); }
+    }
+
+    private void ResolveStaticLibraries(NativeDriver driver) {
+        string dir = driver.dir + "/static";
+        string manifest = dir + "/" + driver.entry.name + ".libs";
+        if (!File.Exists(manifest)) { return; }
+        List<string> rows = File.ReadAllLines(manifest);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            string row = rows[i];
+            int comment = row.IndexOf("#");
+            if (comment >= 0) { row = row.Substring(0, comment); }
+            row = row.Trim();
+            if (row == "" || row.StartsWith("@framework/")) { continue; }
+            string name = row.StartsWith("-l") ? row.Substring(2) : row;
+            if (!NativeManifestEntry.SafeName(name)) {
+                Console.ErrorWriteLine("warning: ignoring unsafe entry '" + row + "' in '" + manifest
+                    + "' (expected a bare library basename)");
+                continue;
+            }
+            if (owners.ContainsKey(name)) {
+                ResolveDriverLink(owners[name], true);
+                continue;
+            }
+            string archive = dir + "/lib" + name + ".a";
+            if (File.Exists(archive)) { AddInput(archive); }
+            else { AddLibrary(name); }
+        }
+    }
+
+    public void ResolveDriverLink(NativeDriver driver, bool required) {
+        if (driver.linkResolved) { return; }
+        if (staticDrivers) {
+            string archive = driver.StaticArchive();
+            // An explicit input of the packaged static archive needs its sidecar too.
+            if ((required || inputPaths.Contains(Path.GetFullPath(archive).ToLower())) && File.Exists(archive)) {
+                driver.linkResolved = true;
+                driver.staticLinked = true;
+                AddInput(archive);
+                ResolveStaticLibraries(driver);
+                return;
+            }
+            if (required) {
+                Console.ErrorWriteLine("note: no static archive for driver '" + driver.entry.name
+                    + "' (expected '" + archive + "'); falling back to the shared driver");
+            }
+        }
+        if (!required) { return; }
+        AddInput(driver.Archive());
+        driver.linkResolved = true;
+    }
+
     public void CollectBundle(NativeDriver driver, List<string> files, string from) {
         string bundle = driver.dir + "/" + driver.entry.name + ".bundle";
         if (driver.bundled) { return; }
         if (driver.visiting) { throw "zanc: cyclic driver bundle reference from '" + from + "' to '" + bundle + "'"; }
         if (!File.Exists(bundle)) {
             if (from != "") { throw "zanc: missing driver bundle '" + bundle + "' referenced by '" + from + "'"; }
+            if (staticDrivers && driver.linkResolved && !driver.staticLinked) {
+                string file = driver.dir + "/" + driver.entry.name + ".dll";
+                if (File.Exists(file)) { files.Add(file); }
+                file = driver.dir + "/lib" + driver.entry.name + ".dll";
+                if (File.Exists(file)) { files.Add(file); }
+                driver.bundled = true;
+            }
             return;
         }
         driver.visiting = true;
@@ -171,11 +254,11 @@ public partial class Program {
     }
 
     static void ResolveNativeImports(Irgen ig, string nm, string overrideDir, List<string> inputs,
-                                     List<string> files, List<string> libraries) {
+                                     List<string> files, List<string> libraries, bool staticDrivers = false) {
         #if WINDOWS
         PiPkgIdxEnsure();
         NativeDriverRegistry registry = new NativeDriverRegistry(ig.liveNativeDefinitions,
-            RuntimeInformation.RuntimeIdentifier, overrideDir);
+            RuntimeInformation.RuntimeIdentifier, overrideDir, inputs, libraries, staticDrivers);
         if (Directory.Exists(stdlibRoot)) { registry.RegisterTree(stdlibRoot, 8); }
         for (int i = 0; i < pkgDriverManifests.Count; i = i + 1) {
             registry.Register(pkgDriverManifests[i]);
@@ -189,30 +272,27 @@ public partial class Program {
 
         HashSet<string> explicitSymbols = new HashSet<string>();
         if (ig.liveNativeExterns.Count > 0 && inputs.Count > 0) { explicitSymbols = ExplicitNativeSymbols(nm, inputs); }
-        HashSet<string> seenLibraries = new HashSet<string>();
         for (int i = 0; i < ig.liveNativeExterns.Count; i = i + 1) {
             NativeImport import = ig.liveNativeExterns[i];
             string name = ImportLibrary(import.method);
+            bool supplied = explicitSymbols.Contains(import.symbol);
             if (registry.owners.ContainsKey(name)) {
-                registry.owners[name].symbols.Add(import.symbol);
-            } else if (name != "" && name != "crt" && !explicitSymbols.Contains(import.symbol)) {
+                NativeDriver driver = registry.owners[name];
+                driver.hasImports = true;
+                if (!supplied) { driver.needsArchive = true; }
+            } else if (name != "" && name != "crt" && !supplied) {
                 if (!NativeManifestEntry.SafeName(name)) { throw "zanc: invalid import library name '" + name + "'"; }
-                if (seenLibraries.Add(name.ToLower())) { libraries.Add("-l" + name); }
+                registry.AddLibrary(name);
             }
-        }
-        HashSet<string> inputPaths = new HashSet<string>();
-        for (int i = 0; i < inputs.Count; i = i + 1) {
-            inputPaths.Add(inputs[i].ToLower());
         }
         for (int i = 0; i < registry.drivers.Count; i = i + 1) {
             NativeDriver driver = registry.drivers[i];
-            for (int j = 0; j < driver.symbols.Count; j = j + 1) {
-                if (explicitSymbols.Contains(driver.symbols[j])) { continue; }
-                string archive = Path.GetFullPath(driver.Archive());
-                if (inputPaths.Add(archive.ToLower())) { inputs.Add(archive); }
-                break;
-            }
-            if (driver.symbols.Count > 0 || (driver.entry.prefix != "" && driver.entry.Active(ig.liveNativeDefinitions))) {
+            if (driver.hasImports) { registry.ResolveDriverLink(driver, driver.needsArchive); }
+        }
+        for (int i = 0; i < registry.drivers.Count; i = i + 1) {
+            NativeDriver driver = registry.drivers[i];
+            if (driver.staticLinked) { continue; }
+            if (driver.hasImports || driver.linkResolved || (driver.entry.prefix != "" && driver.entry.Active(ig.liveNativeDefinitions))) {
                 registry.CollectBundle(driver, files, "");
             }
         }

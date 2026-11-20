@@ -1,0 +1,147 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Platform;
+
+namespace Zan;
+
+class EmbedResource {
+    public string name;
+    public byte[] data;
+
+    public EmbedResource(string name, byte[] data) {
+        this.name = name;
+        this.data = data;
+    }
+}
+
+partial class Irgen {
+    List<EmbedResource> embedResources;
+    string embedRegistration;
+
+    // Called on a fresh Irgen before Gen. The returned count includes empty files.
+    public int PrepareEmbedResources(List<string> specs) {
+        if (specs.Count == 0) { return 0; }
+        List<EmbedResource> resources = new List<EmbedResource>();
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            string spec = specs[i];
+            if (spec == null || spec.Length == 0) { continue; }
+            for (int j = 0; j < spec.Length; j = j + 1) {
+                if (spec[j] == 0) { throw "zanc: --embed paths and names cannot contain NUL"; }
+            }
+            int eq = spec.LastIndexOf("=");
+            string path = eq < 0 ? spec : spec.Substring(0, eq);
+            string name = eq < 0 ? "" : spec.Substring(eq + 1);
+            if (name == "") {
+                // gen0 recognizes both separators when choosing the default name.
+                int slash = path.LastIndexOf("/");
+                int backslash = path.LastIndexOf("\\");
+                name = path.Substring((slash > backslash ? slash : backslash) + 1);
+            }
+            #if WINDOWS
+            path = path.Replace("/", "\\");
+            #endif
+            int before = resources.Count;
+            if (Directory.ExistsOnDisk(path)) {
+                CollectEmbedDirectory(resources, path, name, 1);
+            } else {
+                CollectEmbedFile(resources, path, name);
+            }
+            if (resources.Count == before) {
+                throw "zanc: --embed '" + spec + "' matched no readable file";
+            }
+        }
+        embedResources = resources;
+        return resources.Count;
+    }
+
+    void CollectEmbedDirectory(List<EmbedResource> resources, string dir, string name, int depth) {
+        if (depth > 128) { return; }
+        string prefix = name == "" ? "" : name + "/";
+        // Compiler inputs come from disk, including hidden entries.
+        List<PlatformFileEntry> files = Pal.FileSystem.EnumerateEntries(dir, false, true);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string leaf = files[i].name;
+            string path = Path.Combine(dir, leaf);
+            #if WINDOWS
+            // PAL classifies directory reparse points as files when enumerating.
+            if (Directory.ExistsOnDisk(path)) { continue; }
+            #else
+            if (File.IsReparsePoint(path)) { continue; }
+            #endif
+            CollectEmbedFile(resources, path, prefix + leaf);
+        }
+        List<PlatformFileEntry> dirs = Pal.FileSystem.EnumerateEntries(dir, true, true);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            string leaf = dirs[i].name;
+            string path = Path.Combine(dir, leaf);
+            if (!File.IsReparsePoint(path)) {
+                CollectEmbedDirectory(resources, path, prefix + leaf, depth + 1);
+            }
+        }
+    }
+
+    void CollectEmbedFile(List<EmbedResource> resources, string path, string name) {
+        try {
+            FileStream file = FileStream.OpenRead(path);
+            try {
+                long length = file.Length();
+                if (length < 0) { throw new IOException("Could not size file: " + path); }
+                if (length > 2147483647) { throw "zanc: embedded resource is too large '" + path + "'"; }
+                byte[] data = new byte[(int)length];
+                if (length > 0 && file.ReadInto((nint)data, data.Length) != data.Length) {
+                    throw new IOException("Could not read complete file: " + path);
+                }
+                resources.Add(new EmbedResource(name, data));
+            } finally {
+                file.Close();
+            }
+        } catch (IOException ex) {
+            Console.ErrorWriteLine("warning: cannot embed '" + path + "' (unreadable)");
+        }
+    }
+
+    string EmitEmbedBytes(string symbol, byte[] bytes, string[] escapes) {
+        string arrayType = "[" + ((long)bytes.Length + 1) + " x i8]";
+        StringBuilder literal = new StringBuilder();
+        literal.Append(symbol + " = private unnamed_addr constant " + arrayType + " c\"");
+        for (int i = 0; i < bytes.Length; i = i + 1) {
+            literal.Append(escapes[bytes[i] & 255]);
+        }
+        // The terminator gives an empty payload a stable, non-null byte pointer.
+        literal.Append("\\00\"");
+        H(literal.ToString());
+        return "getelementptr inbounds (" + arrayType + ", " + arrayType + "* " + symbol + ", i64 0, i64 0)";
+    }
+
+    void EmitEmbedResources() {
+        List<EmbedResource> resources = embedResources;
+        embedResources = null;
+        if (resources == null || resources.Count == 0) { return; }
+        string[] escapes = new string[256];
+        for (int i = 0; i < escapes.Length; i = i + 1) { escapes[i] = "\\" + Hex2(i); }
+        string entryType = "{ i8*, i8*, i64 }";
+        string tableType = "[" + resources.Count + " x " + entryType + "]";
+        StringBuilder table = new StringBuilder();
+        table.Append("@zan.embed.tbl = private constant " + tableType + " [\n");
+        for (int i = 0; i < resources.Count; i = i + 1) {
+            EmbedResource resource = resources[i];
+            string name = EmitEmbedBytes("@zan.embed.n" + i, resource.name.ToBytes(), escapes);
+            string data = EmitEmbedBytes("@zan.embed.d" + i, resource.data, escapes);
+            if (i > 0) { table.Append(",\n"); }
+            table.Append("  " + entryType + " { i8* " + name + ", i8* " + data + ", i64 " + resource.data.Length + " }");
+        }
+        table.Append("\n]");
+        H(table.ToString());
+        if (!ExternSeen("zan_embed_register")) {
+            H("declare void @zan_embed_register(i8*, i64)");
+            externDecls.Add("zan_embed_register");
+        }
+        embedRegistration = "  call void @zan_embed_register(i8* bitcast (" + tableType
+            + "* @zan.embed.tbl to i8*), i64 " + resources.Count + ")\n";
+    }
+
+    void AppendEmbedRegistration(StringBuilder result) {
+        if (embedRegistration != null) { result.Append(embedRegistration); }
+    }
+}

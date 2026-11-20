@@ -6,6 +6,16 @@ partial class Irgen {
     // ---- statements ----
     void GenStmt(Node s) {
         if (s == null) { return; }
+        if (!InDebugFunction()) { GenStmtCore(s); return; }
+        string scope = debugScope;
+        string location = debugLocation;
+        SetDebugStatement(s);
+        GenStmtCore(s);
+        debugScope = scope;
+        debugLocation = location;
+    }
+
+    void GenStmtCore(Node s) {
         // A label is a branch target, so it must be emitted even when the
         // current block is already terminated (e.g. code after a goto).
         if (s.kind == AK.LabelStmt()) {
@@ -498,6 +508,7 @@ partial class Irgen {
                 L("  store " + lt + " null, " + lt + "* " + reg);
             }
         }
+        if (InDebugFunction()) { DebugVariable(s, s.sval, ty, lt, reg, 0, true); }
         // multi-declarator: extra declarators ride as VarDecl kids; handled
         // after this declaration's store so `int a = 1, b = a + 1` sees a
         int mdi = 0;
@@ -943,13 +954,10 @@ partial class Irgen {
             L("  " + slot + " = call i64 @zlist_get(i8* " + cv + ", i64 " + iv + ")");
             ev = FromSlot(slot, elemTy);
         } else if (feArr) {
-            if (IsDecimal(elemTy)) {
-                ev = DecimalLoad(DecimalArrayPlace(cv, iv));
-            } else {
-            int esz = ArrElemSize(elemTy);
-            string ep = ArrElemAddr(cv, iv, esz);
-            string raw = ArrElemLoad(ep, esz);
-            ev = FromSlot(raw, elemTy);
+            string storage = ArrayStorage(elemTy);
+            ev = LoadArrayElement(ArrayPlace(cv, iv, storage), elemTy, storage);
+            if (storage.StartsWith("%")) {
+                ev = CopyStructValue(ev);
             }
         } else {
             string cp = NT();
@@ -964,7 +972,7 @@ partial class Irgen {
             string old = NT();
             L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
-            EmitArcRetain(ev.op, elemTy);
+            if (!feArr || !ArrayInlineStruct(elemTy)) { EmitArcRetain(ev.op, elemTy); }
             EmitArcRelease(old, elemTy);
         } else {
             L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);

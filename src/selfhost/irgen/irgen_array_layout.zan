@@ -1,0 +1,314 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    // Standalone structs are boxed in gen1. A struct consisting entirely of
+    // native scalar fields needs neither a box nor an element destructor in
+    // an array. Nested structs still have boxed fields in this backend.
+    bool ArrayInlineStruct(Node ty) {
+        if (!IsStructTy(ty) || IsNullableValue(ty)) { return false; }
+        Node decl = binder.FindType(ty.sval);
+        List<string> names = new List<string>();
+        List<Node> fields = new List<Node>();
+        CollectFields(decl, names, fields);
+        if (fields.Count == 0) { return false; }
+        int i = 0;
+        while (i < fields.Count) {
+            Node field = fields[i];
+            if (field.ival != 0 || IsNullableValue(field) || IsErasedType(field)) { return false; }
+            string native = MapFieldType(field);
+            if (native != "i8" && native != "i16" && native != "i32" && native != "i64"
+                    && native != "float" && native != "double") { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    string ArrayScalarStorage(Node ty) {
+        if (ty == null || ty.ival != 0 || IsNullableValue(ty) || IsErasedType(ty)) { return "i64"; }
+        string n = ty.sval;
+        if (n == "bool" || n == "byte" || n == "sbyte") { return "i8"; }
+        if (n == "short" || n == "ushort") { return "i16"; }
+        if (n == "int" || n == "uint") { return "i32"; }
+        if (n == "float") { return "float"; }
+        return "i64";
+    }
+
+    int ArrElemSize(Node ty) {
+        if (IsDecimal(ty)) { return 16; }
+        string storage = ArrayScalarStorage(ty);
+        if (storage == "i8") { return 1; }
+        if (storage == "i16") { return 2; }
+        if (storage == "i32" || storage == "float") { return 4; }
+        return 8;
+    }
+
+    string ArrayStride(Node ty) {
+        if (ArrayInlineStruct(ty)) {
+            string lt = "%" + ty.sval;
+            return "ptrtoint (" + lt + "* getelementptr (" + lt + ", " + lt + "* null, i32 1) to i64)";
+        }
+        return "" + ArrElemSize(ty);
+    }
+
+    string ArrayStorage(Node ty) {
+        if (ArrayInlineStruct(ty)) { return "%" + ty.sval; }
+        if (IsDecimal(ty)) { return DecimalLL(); }
+        return ArrayScalarStorage(ty);
+    }
+
+    string ArrayPlace(string array, string index, string storage) {
+        string basePtr = array;
+        if (storage != "i64") {
+            basePtr = NT();
+            L("  " + basePtr + " = bitcast i64* " + array + " to " + storage + "*");
+        }
+        string place = NT();
+        L("  " + place + " = getelementptr " + storage + ", " + storage + "* " + basePtr + ", i64 " + index);
+        return place;
+    }
+
+    // Keep an interior address valid while a later argument may replace the
+    // variable that previously owned the array.
+    void HoldArrayPlace(ExprVal array) {
+        if (!TransferTempOwner(array)) { EmitArcRetain(array.op, array.ty); }
+        AddTemp(array.op, array.ty);
+        ArmArgumentTemp(array);
+    }
+
+    string CheckedArrayPlace(Node at, ExprVal array, string index, string storage,
+            bool writable, out string bad) {
+        string nil = NT();
+        L("  " + nil + " = icmp eq i64* " + array.op + ", null");
+        EmitRuntimeCheckIf(at, nil, "null reference where an array is required (element access)");
+        string count = NT();
+        L("  " + count + " = call i64 @zarr_len(i64* " + array.op + ")");
+        string empty = NT();
+        L("  " + empty + " = icmp eq i64 " + count + ", 0");
+        string missing = NT();
+        L("  " + missing + " = or i1 " + nil + ", " + empty);
+        string outside = NT();
+        int rank = ArrRankOf(array.ty);
+        if (rank > 1) {
+            string name = "@.array.null.dims." + rank;
+            string shape = "[" + (rank + 3) + " x i64]";
+            if (!ExternSeen(name)) {
+                externDecls.Add(name);
+                H(name + " = internal constant " + shape + " zeroinitializer");
+            }
+            string basePtr = NT();
+            L("  " + basePtr + " = select i1 " + nil + ", i64* getelementptr ("
+                + shape + ", " + shape + "* " + name + ", i32 0, i32 " + (rank + 3) + "), i64* " + array.op);
+            bool savedTrack = MdTrackOob;
+            string savedOob = MdOobAll;
+            MdTrackOob = writable;
+            MdOobAll = null;
+            index = MdFlatIndex(at, basePtr, rank, index);
+            string dimensionsBad = MdOobAll;
+            MdTrackOob = savedTrack;
+            MdOobAll = savedOob;
+            if (writable) {
+                L("  " + outside + " = or i1 " + missing + ", " + dimensionsBad);
+            } else {
+                outside = missing;
+            }
+        } else {
+            string outOfBounds = NT();
+            L("  " + outOfBounds + " = icmp uge i64 " + index + ", " + count);
+            EmitRuntimeCheckIf(at, outOfBounds, writable ? "index out of bounds: array store" : "array index out of bounds");
+            L("  " + outside + " = or i1 " + missing + ", " + outOfBounds);
+        }
+        string safe = NT();
+        L("  " + safe + " = select i1 " + outside + ", i64 0, i64 " + index);
+        string location = ArrayPlace(array.op, safe, storage);
+        string place = NT();
+        string useScratch = writable ? outside : missing;
+        L("  " + place + " = select i1 " + useScratch + ", " + storage + "* " + ArrayScratch(storage, writable)
+            + ", " + storage + "* " + location);
+        bad = outside;
+        return place;
+    }
+
+    ExprVal LoadArrayElement(string place, Node ty, string storage) {
+        if (storage.StartsWith("%")) { return new ExprVal(place, ty); }
+        if (IsDecimal(ty)) { return DecimalLoad(place); }
+        string raw = NT();
+        L("  " + raw + " = load " + storage + ", " + storage + "* " + place);
+        if (storage == "i64") { return FromSlot(raw, ty); }
+        return WidenArrayScalar(raw, ty, storage);
+    }
+
+    ExprVal WidenArrayScalar(string raw, Node ty, string storage) {
+        string wide = NT();
+        if (storage == "float") {
+            L("  " + wide + " = fpext float " + raw + " to double");
+        } else {
+            L("  " + wide + " = " + (SpanZext(ty) ? "zext" : "sext") + " " + storage + " " + raw + " to i64");
+        }
+        return new ExprVal(wide, ty);
+    }
+
+    string NarrowArrayScalar(ExprVal value, string storage) {
+        string raw = NT();
+        if (storage == "float") {
+            L("  " + raw + " = fptrunc double " + Coerce(value, "double") + " to float");
+        } else {
+            L("  " + raw + " = trunc i64 " + Coerce(value, "i64") + " to " + storage);
+        }
+        return raw;
+    }
+
+    void StoreInlineArrayElement(string place, Node ty, string storage, ExprVal value) {
+        string raw = "zeroinitializer";
+        if (storage.StartsWith("%")) {
+            if (value.op != "null") {
+                raw = NT();
+                L("  " + raw + " = load " + storage + ", " + storage + "* " + value.op);
+            }
+        } else if (IsDecimal(ty)) {
+            raw = ToDecimal(value).op;
+        } else {
+            raw = NarrowArrayScalar(value, storage);
+        }
+        L("  store " + storage + " " + raw + ", " + storage + "* " + place);
+    }
+
+    void InitArrayElement(string array, string index, Node ty, string storage, ExprVal value) {
+        string place = ArrayPlace(array, index, storage);
+        if (storage != "i64") {
+            StoreInlineArrayElement(place, ty, storage, value);
+            return;
+        }
+        string slot = ArrayElementSlot(value, ty);
+        ArrayElementRetain(slot, ty);
+        L("  store i64 " + slot + ", i64* " + place);
+    }
+
+    // Invalid accesses use typed scratch storage. Its size comes from the
+    // element type, so even a large inline value cannot overrun it.
+    string ArrayScratch(string storage, bool writable) {
+        string name = "@.array.scratch." + (writable ? "write." : "read.") + storage.Replace("%", "struct.");
+        if (storage == DecimalLL()) { name = "@.array.scratch." + (writable ? "write.decimal" : "read.decimal"); }
+        if (!ExternSeen(name)) {
+            externDecls.Add(name);
+            H(name + " = internal " + (writable ? "thread_local global " : "constant ") + storage + " zeroinitializer");
+        }
+        return name;
+    }
+    // A managed reference uses the existing pointer-shaped call ABI. A
+    // naturally aligned carrier slot is passed directly. Compact places
+    // carry their byte address shifted left with the low bit set, so even
+    // odd byte addresses and packed fields can round-trip without a copy.
+    bool IsStorageRef(string reg) { return reg.StartsWith("%ref."); }
+
+    string RefStorage(Node ty) {
+        if (ArrayInlineStruct(ty)) { return "%" + ty.sval; }
+        string compact = ArrayScalarStorage(ty);
+        if (compact != "i64") { return compact; }
+        return MapType(ty);
+    }
+
+    string RefAddress(string address, string storage, string carrier, bool native) {
+        if (storage == carrier) { return address; }
+        string result = NT();
+        if (native) {
+            L("  " + result + " = bitcast " + storage + "* " + address + " to " + carrier + "*");
+            return result;
+        }
+        string bits = NT();
+        L("  " + bits + " = ptrtoint " + storage + "* " + address + " to i64");
+        string shifted = NT();
+        L("  " + shifted + " = shl i64 " + bits + ", 1");
+        string tag = NT();
+        L("  " + tag + " = or i64 " + shifted + ", 1");
+        L("  " + result + " = inttoptr i64 " + tag + " to " + carrier + "*");
+        return result;
+    }
+
+    string RefIsCompact(string bits) {
+        string low = NT();
+        L("  " + low + " = and i64 " + bits + ", 1");
+        string test = NT();
+        L("  " + test + " = icmp ne i64 " + low + ", 0");
+        return test;
+    }
+
+    string RefBits(string reg, string carrier) {
+        string bits = NT();
+        L("  " + bits + " = ptrtoint " + carrier + "* " + reg + " to i64");
+        return bits;
+    }
+
+    string DecodeRefAddress(string bits, string storage) {
+        string raw = NT();
+        L("  " + raw + " = lshr i64 " + bits + ", 1");
+        string addr = NT();
+        L("  " + addr + " = inttoptr i64 " + raw + " to " + storage + "*");
+        return addr;
+    }
+
+    string NativeRefAddress(string reg, string carrier) {
+        string bits = RefBits(reg, carrier);
+        string compact = RefIsCompact(bits);
+        string addr = DecodeRefAddress(bits, carrier);
+        string result = NT();
+        L("  " + result + " = select i1 " + compact + ", " + carrier + "* " + addr + ", " + carrier + "* " + reg);
+        return result;
+    }
+
+    ExprVal LoadStorageRef(string reg, Node ty, bool asPlace) {
+        string carrier = MapType(ty);
+        string storage = RefStorage(ty);
+        string bits = RefBits(reg, carrier);
+        int narrow = NL(); int wide = NL(); int merge = NL();
+        L("  br i1 " + RefIsCompact(bits) + ", label %L" + narrow + ", label %L" + wide);
+        Label(narrow);
+        string addr = DecodeRefAddress(bits, storage);
+        string value = addr;
+        if (!IsStructTy(ty)) {
+            string raw = NT();
+            L("  " + raw + " = load " + storage + ", " + storage + "* " + addr + ", align 1");
+            value = WidenArrayScalar(raw, ty, storage).op;
+        }
+        L("  br label %L" + merge);
+        Label(wide);
+        string plain = NT();
+        L("  " + plain + " = load " + carrier + ", " + carrier + "* " + reg);
+        L("  br label %L" + merge);
+        Label(merge);
+        string result = NT();
+        L("  " + result + " = phi " + carrier + " [ " + value + ", %L" + narrow + " ], [ " + plain + ", %L" + wide + " ]");
+        ExprVal read = new ExprVal(result, ty);
+        if (IsStructTy(ty) && !asPlace) {
+            read = CopyStructValue(read);
+            AddTemp(read.op, ty);
+        }
+        return read;
+    }
+
+    void StoreStorageRef(string reg, Node ty, ExprVal value) {
+        string carrier = MapType(ty);
+        string storage = RefStorage(ty);
+        string bits = RefBits(reg, carrier);
+        int narrow = NL(); int wide = NL(); int merge = NL();
+        L("  br i1 " + RefIsCompact(bits) + ", label %L" + narrow + ", label %L" + wide);
+        Label(narrow);
+        string addr = DecodeRefAddress(bits, storage);
+        StoreInlineArrayElement(addr, ty, storage, value);
+        L("  br label %L" + merge);
+        Label(wide);
+        if (IsStructTy(ty)) {
+            ExprVal copy = CopyStructValue(value);
+            string old = NT();
+            L("  " + old + " = load " + carrier + ", " + carrier + "* " + reg);
+            L("  store " + carrier + " " + copy.op + ", " + carrier + "* " + reg);
+            EmitArcRelease(old, ty);
+        } else {
+            string plain = Coerce(NarrowToDeclared(value, ty), carrier);
+            L("  store " + carrier + " " + plain + ", " + carrier + "* " + reg);
+        }
+        L("  br label %L" + merge);
+        Label(merge);
+    }
+}

@@ -688,22 +688,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return op->type;
             }
         }
-        /* 解析作用域内被调函数/方法的返回类型 */
-        if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
-            zan_symbol_t *fsym = called_sym
-                ? called_sym
-                : zan_binder_lookup(c->binder, expr->call.callee->ident.name);
-            if (fsym && (fsym->kind == SYM_METHOD) && fsym->decl) {
-                zan_ast_node_t *m = fsym->decl;
-                if (m->method_decl.return_type) {
-                    zan_type_t *ret = zan_binder_resolve_type(
-                        c->binder, m->method_decl.return_type);
-                    no_runtime_warn_arc_return(c, expr, ret);
-                    return ret;
-                }
-                return c->binder->type_void;
-            }
-        }
         if (called_sym && called_sym->decl &&
             called_sym->decl->kind == AST_METHOD_DECL &&
             expr->call.type_args.count > 0) {
@@ -711,9 +695,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_ast_list_t *tps = &m->method_decl.type_params;
             if (tps->count == expr->call.type_args.count && m->method_decl.return_type) {
                 zan_type_t *ret = zan_binder_resolve_type(c->binder, m->method_decl.return_type);
-                zan_type_t *targs[8] = { NULL };
-                int n = expr->call.type_args.count < 8 ? expr->call.type_args.count : 8;
-                for (int i = 0; i < n; i++) {
+                zan_type_t **targs = zan_arena_alloc(c->arena,
+                    sizeof(*targs) * (size_t)tps->count);
+                for (int i = 0; i < tps->count; i++) {
                     targs[i] = zan_binder_resolve_type(c->binder, expr->call.type_args.items[i]);
                 }
                 /* Close receiver parameters except names shadowed by the
@@ -746,6 +730,22 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 ret = zan_binder_subst_named(c->binder, ret, tps, targs);
                 no_runtime_warn_arc_return(c, expr, ret);
                 return ret;
+            }
+        }
+
+        if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
+            zan_symbol_t *fsym = called_sym
+                ? called_sym
+                : zan_binder_lookup(c->binder, expr->call.callee->ident.name);
+            if (fsym && fsym->kind == SYM_METHOD && fsym->decl) {
+                zan_ast_node_t *m = fsym->decl;
+                if (m->method_decl.return_type) {
+                    zan_type_t *ret = zan_binder_resolve_type(
+                        c->binder, m->method_decl.return_type);
+                    no_runtime_warn_arc_return(c, expr, ret);
+                    return ret;
+                }
+                return c->binder->type_void;
             }
         }
 

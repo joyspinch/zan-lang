@@ -117,7 +117,11 @@ partial class Irgen {
                     L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
                     return p;
                 }
-                return locReg[li];
+                string local = locReg[li];
+                if (native && IsStorageRef(local) && RefStorage(pty) != lt) {
+                    return NativeRefAddress(local, lt);
+                }
+                return local;
             }
             if (curClass != "") {
                 Node scls = binder.FindType(curClass);
@@ -131,7 +135,7 @@ partial class Irgen {
                     Node cls = binder.FindType(curClass);
                     if (cls != null && FieldIndex(cls, place.sval) >= 0) {
                         Node fty = FieldType(cls, place.sval);
-                        return FieldPlacePtr("%this", curClass, place.sval, fty, lt);
+                        return FieldPlacePtr("%this", curClass, place.sval, fty, lt, native);
                     }
                 }
             }
@@ -146,17 +150,11 @@ partial class Irgen {
                     List<Node> inst = ConcreteInstArgs(place, sown);
                     if (inst == null) { inst = CurInstFor(sown); }
                     DemandStaticType(sown, inst);
-                    string gv = StaticGlobal(sown, place.sval, inst);
-                    if (lt != "i64") {
-                        string cast = NT();
-                        L("  " + cast + " = bitcast i64* " + gv + " to " + lt + "*");
-                        return cast;
-                    }
-                    return gv;
+                    return StaticGlobal(sown, place.sval, inst);
                 }
             }
             // obj.field: the address of the field itself
-            ExprVal obj = GenExpr(place.a);
+            ExprVal obj = GenPlaceReceiver(place.a, true);
             string cn = obj.ty != null ? obj.ty.sval : "";
             Node ocls = binder.FindType(cn);
             if (ocls == null || FieldIndex(ocls, place.sval) < 0) {
@@ -164,20 +162,21 @@ partial class Irgen {
                 return "null";
             }
             Node fty = FieldType(ocls, place.sval);
-            return FieldPlacePtr(obj.op, cn, place.sval, fty, lt);
+            return FieldPlacePtr(obj.op, cn, place.sval, fty, lt, native);
         }
         if (place.kind == AK.Index()) {
             // arr[i] / lst[i]: the address of the element.
             ExprVal obj = GenExpr(place.a);
+            if (obj.ty != null && obj.ty.ival >= 1) { HoldArrayPlace(obj); }
             ExprVal idx = GenExpr(place.b);
-            // Native code accesses the span element at its storage width.
-            if (native && IsSpanType(obj.ty) && obj.ty.sval == "Span") {
+            if (IsSpanType(obj.ty) && obj.ty.sval == "Span") {
                 string storage = SpanIty(SpanElem(obj.ty));
                 string element = SpanElemPtr(obj.op, idx.op, storage);
-                if (storage == lt) { return element; }
-                string addr = NT();
-                L("  " + addr + " = bitcast " + storage + "* " + element + " to " + lt + "*");
-                return addr;
+                if (!native && storage != lt && storage != RefStorage(pty)) {
+                    diags.Error("span element storage is incompatible with this reference parameter", place.line, place.col);
+                    return "null";
+                }
+                return RefAddress(element, storage, lt, native);
             }
             if (obj.ty != null && IsListType(obj.ty)) {
                 string lp = NT();
@@ -195,54 +194,27 @@ partial class Irgen {
                 }
                 return ep;
             }
-            Node et = ArrayElemType(obj.ty);
+            Node et = ArrElemOf(obj.ty);
             if (et == null) {
                 diags.Error("[E3049] ref/out argument must be a variable, a field, or an element", place.line, place.col);
                 return "null";
             }
-            if (IsDecimal(et)) { return DecimalArrayPlace(obj.op, idx.op); }
-            if (IsByteArr(obj.ty)) {
-                string ab = NT();
-                L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
-                string p = NT();
-                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
-                return p;
-            }
-            string p2 = NT();
-            L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
-            if (lt != "i64") {
-                string cast = NT();
-                L("  " + cast + " = bitcast i64* " + p2 + " to " + lt + "*");
-                return cast;
-            }
-            return p2;
+            string storage = ArrayStorage(et);
+            string bad;
+            string address = CheckedArrayPlace(place, obj, idx.op, storage, true, out bad);
+            return RefAddress(address, storage, lt, native || storage == "i64");
         }
         diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
         return "null";
     }
 
-    // The address of a class field, typed as the place the caller expects
-    // (`<field type>*`).
-    string FieldPtr(string objOp, string clsName, string field, string wantLt) {
+    string FieldPlacePtr(string obj, string clsName, string field, Node ty, string want, bool native) {
         Node cls = binder.FindType(clsName);
-        int idx = FieldIndex(cls, field);
-        string p = NT();
-        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
-        if (wantLt == "%" + clsName + "*") { return p; }
-        // the GEP yields the struct-typed address; the place wants the
-        // field's own type
-        string b = NT();
-        L("  " + b + " = bitcast %" + clsName + "* " + p + " to " + wantLt);
-        return b;
-    }
-
-    // The address of a field place, typed as the by-ref parameter's slot.
-    string FieldPlacePtr(string objOp, string clsName, string field, Node fty, string wantLt) {
-        string ad = FieldPtr(objOp, clsName, field, MapType(fty) + "*");
-        if (MapType(fty) == wantLt) { return ad; }
-        string b = NT();
-        L("  " + b + " = bitcast " + MapType(fty) + "* " + ad + " to " + wantLt + "*");
-        return b;
+        string storage = cls != null && cls.kind == AK.StructDecl() ? MapFieldType(ty) : MapType(ty);
+        string address = NT();
+        L("  " + address + " = getelementptr %" + clsName + ", %" + clsName + "* " + obj
+            + ", i32 0, i32 " + FieldIndex(cls, field));
+        return RefAddress(address, storage, want, native);
     }
 
     // The element type of an array-typed expression (null when it is not an
@@ -285,61 +257,6 @@ partial class Irgen {
         return null;
     }
 
-    // The width of one array element in the self-hosted layout. The
-    // byte-sized element types are stored one per byte: the standard
-    // library hands a byte[] to the runtime as a raw buffer (Base64, the
-    // digest kernels, the protocol codecs), so a byte array has to be a
-    // byte array -- one byte per element, not one byte per 8-byte slot.
-    // Every other element type keeps an 8-byte slot.
-    int ArrElemSize(Node elemTy) {
-        if (elemTy == null) { return 8; }
-        if (elemTy.ival >= 1) { return 8; }
-        if (IsNullableValue(elemTy)) { return 8; }
-        string n = elemTy.sval;
-        if (n == "byte" || n == "sbyte") { return 1; }
-        if (IsDecimal(elemTy)) { return 16; }
-        return 8;
-    }
-
-    // The address of element `idx` of an array (the array value points at
-    // the first element).
-    string ArrElemAddr(string arrOp, string idxOp, int esz) {
-        if (esz == 1) {
-            string b = NT();
-            L("  " + b + " = bitcast i64* " + arrOp + " to i8*");
-            string p = NT();
-            L("  " + p + " = getelementptr i8, i8* " + b + ", i64 " + idxOp);
-            return p;
-        }
-        string p = NT();
-        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + idxOp);
-        return p;
-    }
-
-    // The element value of an array slot, read at the element's own width.
-    string ArrElemLoad(string addr, int esz) {
-        if (esz == 1) {
-            string v = NT();
-            L("  " + v + " = load i8, i8* " + addr);
-            string z = NT();
-            L("  " + z + " = zext i8 " + v + " to i64");
-            return z;
-        }
-        string v = NT();
-        L("  " + v + " = load i64, i64* " + addr);
-        return v;
-    }
-
-    // Store an element value at the element's own width.
-    void ArrElemStore(string addr, int esz, string val) {
-        if (esz == 1) {
-            string b = NT();
-            L("  " + b + " = trunc i64 " + val + " to i8");
-            L("  store i8 " + b + ", i8* " + addr);
-            return;
-        }
-        L("  store i64 " + val + ", i64* " + addr);
-    }
     // `out T name` at the call site: the callee writes through the address of
     // a fresh local, which stays visible to the caller afterwards (the C
     // host's emit_ref_arg declaration form).

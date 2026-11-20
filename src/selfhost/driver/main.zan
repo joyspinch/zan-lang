@@ -60,6 +60,7 @@ public partial class Program {
 
     static string stdlibRoot;
     static string packageProject;
+    static bool publishing;
     static List<string> inclPaths;
     static List<string> inclSrcs;
 
@@ -411,13 +412,15 @@ public partial class Program {
         if (rc != 0) { throw "zanc: LLVM object emission failed with exit code " + rc; }
     }
 
-    static void LinkBundledExe(string dir, string outPath, string objPath, string subsystem, List<string> linkInputs) {
+    static void LinkBundledExe(string dir, string outPath, string objPath, string subsystem,
+                               List<string> linkInputs, bool stripSymbols) {
         string lib = dir + "/mingw/lib";
         List<string> args = new List<string>();
         args.Add("-m"); args.Add("i386pep");
         args.Add("-Bdynamic");
         args.Add("--stack"); args.Add("268435456");
         args.Add("--gc-sections");
+        if (stripSymbols) { args.Add("-s"); }
         if (subsystem != "") { args.Add("--subsystem"); args.Add(subsystem); }
         args.Add("-o"); args.Add(outPath);
         args.Add("-L" + lib);
@@ -447,7 +450,7 @@ public partial class Program {
     }
 
     static void LinkExe(string clang, string outPath, string llPath, string optLevel, string subsystem,
-                        List<string> linkInputs) {
+                        List<string> linkInputs, bool stripSymbols, bool debug) {
         string exe = Environment.ExeDir();
         string rtDir = exe;
         if (!File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
@@ -460,16 +463,19 @@ public partial class Program {
         List<string> args = new List<string>();
         args.Add(optLevel != null && optLevel.Length > 0 ? optLevel : "-O2");
         args.Add("-Wno-override-module");
-        if (subsystem != "") {
+        if (subsystem != "" || stripSymbols || debug) {
             ProcessResult target = Process.CaptureSafe(clang, new List<string>() { "-print-target-triple" }, 10000);
             if (!target.Ok()) { throw "zanc: cannot determine Clang's Windows target"; }
             List<string> lines = target.Lines();
             if (lines.Count == 0) { throw "zanc: Clang returned no Windows target"; }
             if (lines[0].Contains("-msvc")) {
-                args.Add("-Wl,/subsystem:" + subsystem);
+                if (debug) { args.Add("-Wl,/debug:dwarf"); }
+                if (subsystem != "") { args.Add("-Wl,/subsystem:" + subsystem); }
                 if (subsystem == "windows") { args.Add("-Wl,/entry:mainCRTStartup"); }
             } else {
-                args.Add(subsystem == "windows" ? "-mwindows" : "-mconsole");
+                if (stripSymbols) { args.Add("-s"); }
+                if (debug) { args.Add("-g"); }
+                if (subsystem != "") { args.Add(subsystem == "windows" ? "-mwindows" : "-mconsole"); }
             }
         }
         args.Add(llPath);
@@ -492,6 +498,9 @@ public partial class Program {
             args.Add(rtDir + "/zanrt_timer.obj");
             args.Add(rtDir + "/zanrt_sync.obj");
             args.Add(rtDir + "/zanrt_decimal.obj");
+            if (File.Exists(rtDir + "/zan_embed_api.obj")) {
+                args.Add(rtDir + "/zan_embed_api.obj");
+            }
             if (File.Exists(rtDir + "/zanrt_crash.obj")) {
                 args.Add(rtDir + "/zanrt_crash.obj");
             } else if (File.Exists(rtDir + "/zanrt_crash.o")) {
@@ -535,15 +544,6 @@ public partial class Program {
         return now;
     }
 
-    static void Main() {
-        List<string> args = new List<string>();
-        List<int> directArguments = new List<int>();
-        for (int ai = 0; ai < Environment.ArgCount(); ai++) {
-            string arg = Environment.ArgAt(ai);
-            if (!IsResponseArgument(arg)) { directArguments.Add(args.Count); }
-            ExpandArgument(arg, args, 0);
-        }
-        int argc = args.Count;
     static string Usage() { return "usage: zanc <input.zan|dir|@file> [more ...] [-o output]"; }
 
     static void PrintHelp() {
@@ -553,6 +553,15 @@ public partial class Program {
         Console.ErrorWriteLine("    --diagnostics-format=text   Use human-readable compiler diagnostics (default)");
     }
 
+    static void Main() {
+        List<string> args = new List<string>();
+        List<int> directArguments = new List<int>();
+        for (int ai = 0; ai < Environment.ArgCount(); ai++) {
+            string arg = Environment.ArgAt(ai);
+            if (!IsResponseArgument(arg)) { directArguments.Add(args.Count); }
+            ExpandArgument(arg, args, 0);
+        }
+        int argc = args.Count;
         if (argc >= 1 && args[0] == "--version") {
             Console.WriteLine("zanc " + SelfhostVersion() + " (gen1)");
             return;
@@ -565,6 +574,7 @@ public partial class Program {
         bool hasDashO = false;
         bool emitLib = false;
         bool denyWarnings = false;
+        bool diagnosticsJsonl = false;
         bool reportTime = false;
         string metadataPath = "";
         string explicitStdlib = "";
@@ -574,31 +584,21 @@ public partial class Program {
         bool noIcon = false;
         bool metadataBodies = false;
         bool allSources = false;
-        bool diagnosticsJsonl = false;
         packageProject = "";
-        string optLevel = "-O2";
+        string optLevel = "";
+        bool stripSymbols = false;
+        bool debug = false;
+        bool runtimeChecks = true;
+        bool staticDrivers = false;
+        bool strictRuntime = false;
+        publishing = false;
+        List<string> embedSpecs = new List<string>();
         List<string> rawInputs = new List<string>();
         List<string> linkInputs = new List<string>();
         int firstInputIndex = -1;
         int i = 0;
         while (i < argc) {
             string a = args[i];
-            if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
-                || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir"
-                || a == "--icon") {
-                if (i + 1 >= argc || args[i + 1] == ""
-                    || args[i + 1].StartsWith("-")) {
-                    throw "zanc: option '" + a + "' requires a value";
-                }
-            }
-            if (a == "-o") {
-                outPath = args[i + 1];
-                hasDashO = true;
-                i = i + 2;
-                continue;
-            }
-            if (a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz") {
-                optLevel = a;
             if (a == "--help" || a == "-h") {
                 PrintHelp();
                 return;
@@ -613,11 +613,32 @@ public partial class Program {
                 i = i + 1;
                 continue;
             }
+            if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
+                || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir"
+                || a == "--icon" || a == "--embed" || a == "--link-mode") {
+                if (i + 1 >= argc || args[i + 1] == ""
+                    || args[i + 1].StartsWith("-")) {
+                    throw "zanc: option '" + a + "' requires a value";
+                }
+            }
+            if (a == "-o") {
+                outPath = args[i + 1];
+                hasDashO = true;
+                i = i + 2;
+                continue;
+            }
+            if (a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz") {
+                optLevel = a;
                 i = i + 1;
                 continue;
             }
-            // Do not promise debug metadata or packaging by only changing -O.
-            if (a == "-g" || a == "--debug" || a == "--publish" || a == "-c" || a == "-S") {
+            if (a == "--publish") { publishing = true; i++; continue; }
+            if (a == "--strip-symbols") { stripSymbols = true; i++; continue; }
+            if (a == "--runtime-checks") { runtimeChecks = true; i++; continue; }
+            if (a == "--no-runtime-checks") { runtimeChecks = false; i++; continue; }
+            if (a == "--strict-runtime") { strictRuntime = true; i++; continue; }
+            if (a == "-g" || a == "--debug") { debug = true; i++; continue; }
+            if (a == "-c" || a == "-S") {
                 throw "zanc: option '" + a + "' is not supported by the self-hosted driver";
             }
             if (a == "--link-input") {
@@ -646,11 +667,25 @@ public partial class Program {
                 i = i + 2;
                 continue;
             }
+            if (a == "--link-mode") {
+                string mode = args[i + 1];
+                if (mode != "shared" && mode != "static") {
+                    throw "zanc: --link-mode must be 'static' or 'shared'";
+                }
+                staticDrivers = mode == "static";
+                i = i + 2;
+                continue;
+            }
             if (a == "--driver-dir") {
                 driverDir = Path.GetFullPath(args[i + 1]);
                 if (!Directory.ExistsOnDisk(driverDir)) {
                     throw "zanc: driver directory does not exist: '" + driverDir + "'";
                 }
+                i = i + 2;
+                continue;
+            }
+            if (a == "--embed") {
+                embedSpecs.Add(args[i + 1]);
                 i = i + 2;
                 continue;
             }
@@ -709,6 +744,9 @@ public partial class Program {
             Console.WriteLine(Usage());
             throw "zanc: no input files";
         }
+        if (debug) { optLevel = "-O0"; }
+        if (optLevel == "") { optLevel = publishing ? "-Os" : "-O2"; }
+        stripSymbols = stripSymbols || publishing;
         bool exportMetadata = metadataPath != "";
         if (metadataBodies && !exportMetadata) { throw "zanc: --gen-meta-bodies requires --gen-meta"; }
         string first = rawInputs[0];
@@ -797,7 +835,7 @@ public partial class Program {
             }
             string src = srcSb.ToString();
 
-            Lexer lx = new Lexer(src);
+            Lexer lx = new Lexer(src, publishing);
             List<Token> toks = lx.Run();
             phaseStart = ReportPhase(reportTime, "lex", phaseStart);
 
@@ -848,8 +886,11 @@ public partial class Program {
             ig.libOut = emitLib;
             #if WINDOWS
             ig.collectNativeImports = isExe;
+            ig.runtimeChecks = runtimeChecks;
+            ig.strictRuntime = strictRuntime;
             #endif
-            string ir = ig.Gen(unit, reportTime);
+            ig.PrepareEmbedResources(embedSpecs);
+            string ir = ig.Gen(unit, reportTime, debug);
             phaseStart = ReportPhase(reportTime, "IR generation", phaseStart);
             // The checker phase already reported its own diagnostics; the
             // second flush must start at the irgen phase's first item or
@@ -874,7 +915,7 @@ public partial class Program {
                 }
                 List<string> bundleFiles = new List<string>();
                 List<string> libraries = new List<string>();
-                if (ig.collectNativeImports) { ResolveNativeImports(ig, nm, driverDir, linkInputs, bundleFiles, libraries); }
+                if (ig.collectNativeImports) { ResolveNativeImports(ig, nm, driverDir, linkInputs, bundleFiles, libraries, staticDrivers); }
                 for (int i = 0; i < libraries.Count; i = i + 1) { linkInputs.Add(libraries[i]); }
                 string suffix = Guid.New();
                 string workDir = outputDir + "/.zanc-" + suffix;
@@ -893,10 +934,10 @@ public partial class Program {
                     }
                     File.WriteAllText(llPath, ir);
                     if (toolchain == "") {
-                        LinkExe(clang, exePath, llPath, optLevel, subsystem, linkInputs);
+                        LinkExe(clang, exePath, llPath, optLevel, subsystem, linkInputs, stripSymbols, debug && !stripSymbols);
                     } else {
                         CompileBundledObject(toolchain, llPath, bitcodePath, objPath, optLevel);
-                        LinkBundledExe(toolchain, exePath, objPath, subsystem, linkInputs);
+                        LinkBundledExe(toolchain, exePath, objPath, subsystem, linkInputs, stripSymbols);
                     }
                     StageNativeFiles(bundleFiles, workDir, outputDir, Path.GetFileName(finalPath));
                     if (Nio.ReplaceFile(exePath, finalPath) != 0) {

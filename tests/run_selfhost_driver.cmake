@@ -43,7 +43,8 @@ endif()
 reject_cli(target_flag_value "option '--target' requires a value" --target --auto-stdlib)
 reject_cli(target_cross "target 'wasm32-wasi' is not supported" --target wasm32-wasi)
 reject_cli(target_invalid "target 'batch4-invalid' is not supported" --target batch4-invalid)
-foreach(flag IN ITEMS -c -S -g --debug --publish --emit-ir)
+reject_cli(embed_missing "option '--embed' requires a value" --embed)
+foreach(flag IN ITEMS -c -S --emit-ir)
   string(MAKE_C_IDENTIFIER "${flag}" name)
   if(flag STREQUAL "--emit-ir")
     reject_cli("reject_${name}" "unknown option '${flag}'" "${flag}")
@@ -317,6 +318,49 @@ namespace Fixture {
   endif()
 
   if(_bundled_link)
+    set(_project "${OUTDIR}/publish-resources")
+    set(_source "${_project}/main.zan")
+    set(_release "${_project}/app.exe")
+    file(REMOVE_RECURSE "${_project}")
+    file(MAKE_DIRECTORY "${_project}/input/pack" "${_project}/run")
+    file(WRITE "${_project}/input/pack/note.txt" "res-ok")
+    file(WRITE "${_project}/input/pack/empty.txt" "")
+    file(WRITE "${_source}" [=[
+using System.IO;
+class Program {
+    static string AtStartup = File.ReadAllText("virtual/pack/note.txt");
+    static int Main() {
+#if PUBLISH && RELEASE && !DEBUG
+        if (AtStartup != "res-ok" || File.GetSize("virtual/pack/empty.txt") != 0) { return 1; }
+        byte[] items = File.ReadAllBytes("virtual/pack/note.txt");
+        if (items.Length != 6 || items[5] != 'k') { return 2; }
+        return Directory.GetFiles("virtual/pack").Count == 2 ? 0 : 3;
+#else
+        return 4;
+#endif
+    }
+}
+]=])
+    execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_source}" --publish --no-runtime-checks
+      --embed "${_project}/input=virtual" -o "${_release}" WORKING_DIRECTORY "${_root}"
+      RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 120)
+    if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_release}")
+      message(FATAL_ERROR "embedded release compilation failed, rc=${rc}\n${stdout}${stderr}")
+    endif()
+    execute_process(COMMAND "${_release}" WORKING_DIRECTORY "${_project}/run"
+      RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+    if(NOT "${rc}" STREQUAL "0")
+      message(FATAL_ERROR "embedded release failed, rc=${rc}\n${stdout}${stderr}")
+    endif()
+    file(READ "${_release}" pe_le OFFSET 60 LIMIT 4 HEX)
+    string(REGEX REPLACE "^(..)(..)(..)(..)$" "\\4\\3\\2\\1" pe_be "${pe_le}")
+    math(EXPR symbol_table_offset "0x${pe_be} + 12")
+    file(READ "${_release}" symbols OFFSET ${symbol_table_offset} LIMIT 8 HEX)
+    if(NOT symbols STREQUAL "0000000000000000")
+      message(FATAL_ERROR "published executable retains a COFF symbol table")
+    endif()
+    file(REMOVE_RECURSE "${_project}")
+
     set(_ir "${OUTDIR}/module input.ll")
     set(_obj "${OUTDIR}/module output.obj")
     set(_backend ${_gen1_env} "${ZANC}" --compile-ir "${_ir}"

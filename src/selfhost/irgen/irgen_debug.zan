@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+partial class Irgen {
+    StringBuilder debugMetadata;
+    Dictionary<string, string> debugFiles;
+    Dictionary<string, string> debugTypes;
+    int debugNext;
+    string debugUnit;
+    StringBuilder debugBody;
+    string debugFile;
+    string debugScope;
+    string debugLocation;
+
+    void StartDebugModule() {
+        debugMetadata = new StringBuilder();
+        debugFiles = new Dictionary<string, string>();
+        debugTypes = new Dictionary<string, string>();
+        debugNext = 0;
+        if (hostWin) { H("target triple = \"x86_64-w64-windows-gnu\""); }
+        H("declare void @llvm.dbg.declare(metadata, metadata, metadata)");
+        H("declare void @llvm.dbg.value(metadata, metadata, metadata)");
+        string dwarf = DebugMetadata("!{i32 2, !\"Dwarf Version\", i32 4}");
+        string version = DebugMetadata("!{i32 2, !\"Debug Info Version\", i32 3}");
+        debugMetadata.Append("!llvm.module.flags = !{" + dwarf + ", " + version + "}\n");
+        string file = DebugFile(diags.FileOfLine(1));
+        debugUnit = DebugMetadata("distinct !DICompileUnit(language: DW_LANG_C, file: " + file
+            + ", producer: \"zanc\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)");
+        debugMetadata.Append("!llvm.dbg.cu = !{" + debugUnit + "}\n");
+    }
+
+    string DebugMetadata(string data) {
+        string id = "!" + debugNext;
+        debugNext = debugNext + 1;
+        debugMetadata.Append(id + " = " + data + "\n");
+        return id;
+    }
+
+    string DebugQuote(string text) {
+        StringBuilder quoted = new StringBuilder();
+        quoted.Append("\"");
+        int i = 0;
+        while (i < text.Length) {
+            int b = (int)text[i] & 255;
+            if (b < 32 || b >= 127 || b == 34 || b == 92) { quoted.Append("\\" + Hex2(b)); }
+            else { quoted.Append(text.Substring(i, 1)); }
+            i = i + 1;
+        }
+        quoted.Append("\"");
+        return quoted.ToString();
+    }
+
+    string DebugFile(string path) {
+        if (path == "") { path = "<unknown>.zan"; }
+        if (debugFiles.ContainsKey(path)) { return debugFiles[path]; }
+        string normalized = path.Replace("\\", "/");
+        int slash = normalized.LastIndexOf("/");
+        string name = normalized.Substring(slash + 1, normalized.Length - slash - 1);
+        string dir = "";
+        if (slash >= 0) {
+            int dirLen = slash;
+            if (slash == 0 || (slash == 2 && normalized[1] == ':')) { dirLen = slash + 1; }
+            dir = normalized.Substring(0, dirLen);
+        }
+        string file = DebugMetadata("!DIFile(filename: " + DebugQuote(name) + ", directory: " + DebugQuote(dir) + ")");
+        debugFiles[path] = file;
+        return file;
+    }
+
+    // Use the LLVM storage width and encoding. In particular, gen1's int
+    // and float variables occupy i64 and double slots respectively.
+    string DebugType(Node ty, string llvmType) {
+        if (llvmType == "void") { return "null"; }
+        string name = ty == null ? llvmType : ty.sval;
+        string key = llvmType + ":" + name;
+        if (ty != null && ty.ival > 0) { key = llvmType; }
+        if (debugTypes.ContainsKey(key)) { return debugTypes[key]; }
+        string data;
+        if (IsPtrLL(llvmType)) {
+            string baseType = "null";
+            string pointerName = name;
+            if (ty != null && ty.ival > 0) {
+                baseType = DebugType(null, "i64");
+                pointerName = "";
+            } else if (name == "string") {
+                baseType = DebugType(null, "i8");
+            }
+            data = "!DIDerivedType(tag: DW_TAG_pointer_type, name: " + DebugQuote(pointerName)
+                + ", baseType: " + baseType + ", size: 64)";
+        } else {
+            string encoding = "DW_ATE_signed";
+            if (llvmType == "double" || llvmType == "float") { encoding = "DW_ATE_float"; }
+            else if (llvmType == "i8") { encoding = "DW_ATE_unsigned_char"; }
+            else if (llvmType == "i64") {
+                if (name == "bool") { encoding = "DW_ATE_boolean"; }
+                else if (name == "uint" || name == "ulong" || name == "ushort" || name == "byte" || name == "char") {
+                    encoding = "DW_ATE_unsigned";
+                }
+            } else { return "null"; }
+            data = "!DIBasicType(name: " + DebugQuote(name) + ", size: " + (TypeSizeBytes(llvmType) * 8)
+                + ", encoding: " + encoding + ")";
+        }
+        string id = DebugMetadata(data);
+        debugTypes[key] = id;
+        return id;
+    }
+
+    string StartDebugFunction(Node m, string symbol) {
+        if (debugMetadata == null || m.line <= 0 || m.d == null) { return ""; }
+        debugFile = DebugFile(diags.FileOfLine(m.line));
+        int line = diags.LineInFile(m.line);
+        string types = "!{" + DebugType(m.type, curRet);
+        if (curHasThis) { types = types + ", " + DebugType(MkType(curClass), "%" + curClass + "*"); }
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) { types = types + ", " + DebugType(p.type, MapType(p.type)); }
+            i = i + 1;
+        }
+        string subType = DebugMetadata("!DISubroutineType(types: " + DebugMetadata(types + "}") + ")");
+        debugScope = DebugMetadata("distinct !DISubprogram(name: " + DebugQuote(m.sval)
+            + ", linkageName: " + DebugQuote(symbol) + ", scope: " + debugFile + ", file: " + debugFile
+            + ", line: " + line + ", type: " + subType + ", scopeLine: " + line
+            + ", spFlags: DISPFlagDefinition, unit: " + debugUnit + ")");
+        debugLocation = DebugLocationAt(m);
+        return " !dbg " + debugScope;
+    }
+
+    bool InDebugFunction() { return debugBody != null && body == debugBody; }
+
+    string DebugLocationAt(Node site) {
+        string scope = debugScope;
+        string file = DebugFile(diags.FileOfLine(site.line));
+        if (file != debugFile) {
+            scope = DebugMetadata("!DILexicalBlockFile(scope: " + scope + ", file: " + file + ", discriminator: 0)");
+        }
+        return DebugMetadata("!DILocation(line: " + diags.LineInFile(site.line) + ", column: " + site.col
+            + ", scope: " + scope + ")");
+    }
+
+    void SetDebugStatement(Node s) {
+        if (s == null || s.line <= 0) { return; }
+        if (s.kind == AK.Block() || s.kind == AK.ForStmt() || s.kind == AK.ForeachStmt()) {
+            string file = DebugFile(diags.FileOfLine(s.line));
+            debugScope = DebugMetadata("distinct !DILexicalBlock(scope: " + debugScope + ", file: " + file
+                + ", line: " + diags.LineInFile(s.line) + ", column: " + s.col + ")");
+        }
+        debugLocation = DebugLocationAt(s);
+    }
+
+    void DebugVariable(Node site, string name, Node ty, string llvmType, string operand, int argument, bool address) {
+        if (name == "") { return; }
+        string type = DebugType(ty, llvmType);
+        if (type == "null") { return; }
+        int line = site.line;
+        if (line <= 0) { line = curMethodNode.line; }
+        string arg = "";
+        if (argument > 0) { arg = ", arg: " + argument; }
+        string variable = DebugMetadata("!DILocalVariable(name: " + DebugQuote(name) + arg + ", scope: " + debugScope
+            + ", file: " + DebugFile(diags.FileOfLine(line)) + ", line: " + diags.LineInFile(line)
+            + ", type: " + type + ")");
+        string intrinsic = address ? "declare" : "value";
+        string operandType = address ? llvmType + "*" : llvmType;
+        L("  call void @llvm.dbg." + intrinsic + "(metadata " + operandType + " " + operand
+            + ", metadata " + variable + ", metadata !DIExpression())");
+    }
+}

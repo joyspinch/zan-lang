@@ -674,6 +674,35 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
     if (!bt) return NULL;
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if (bt->kind == TYPE_ARRAY) {
+        LLVMValueRef arr = emit_expr(g, base, locals);
+        LLVMValueRef isnull = LLVMBuildIsNull(g->builder, arr, "ref.array.null");
+        emit_runtime_check(g, isnull, expr->loc,
+            "null reference where an array is required (element access)");
+        arr = emit_soft_base_select(g, arr, isnull, expr->loc);
+        zan_type_t *et = container_elem_type(bt);
+        LLVMTypeRef etl = et ? map_type(g, et) : i64;
+        LLVMValueRef ep, oob;
+        if (bt->array_rank > 1) {
+            ep = emit_mdarray_elem_ptr(g, arr, expr, etl, locals, &oob);
+        } else {
+            LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+            idx = emit_index_i64(g, idx, "ref.index");
+            oob = emit_index_bounds_check(g, idx, zan_array_len(g, arr),
+                                          expr->loc, "array");
+            LLVMValueRef typed = LLVMBuildBitCast(g->builder, arr,
+                LLVMPointerType(etl, 0), "arrp");
+            ep = LLVMBuildGEP2(g->builder, etl, typed, &idx, 1, "ep");
+        }
+        if (g->runtime_checks && g->current_fn) {
+            LLVMValueRef invalid = LLVMBuildOr(g->builder, isnull, oob,
+                                               "ref.array.invalid");
+            LLVMValueRef scratch = emit_entry_alloca(g, etl, "ref.array.scratch");
+            LLVMBuildStore(g->builder, LLVMConstNull(etl), scratch);
+            ep = LLVMBuildSelect(g->builder, invalid, scratch, ep, "ref.array.place");
+        }
+        return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
+    }
     LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
@@ -692,18 +721,6 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2,
                 "df"), "data");
         LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
-        return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
-    }
-    if (bt->kind == TYPE_ARRAY && bt->array_rank == 1) {
-        LLVMValueRef arr = emit_expr(g, base, locals);
-        emit_index_bounds_check(g, idx, zan_array_len(g, arr), expr->loc, "array");
-        idx = emit_index_safe_bounds(g, idx, zan_array_len(g, arr),
-            expr->loc, "array");
-        zan_type_t *et = container_elem_type(bt);
-        LLVMTypeRef etl = et ? map_type(g, et) : i64;
-        LLVMValueRef typed = LLVMBuildBitCast(g->builder, arr,
-            LLVMPointerType(etl, 0), "arrp");
-        LLVMValueRef ep = LLVMBuildGEP2(g->builder, etl, typed, &idx, 1, "ep");
         return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
     }
     if (is_span_type(bt)) {
