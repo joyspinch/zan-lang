@@ -32,6 +32,10 @@ reject_cli(metadata_bodies_without_output "--gen-meta-bodies requires --gen-meta
 reject_cli(link_input_missing "option '--link-input' requires a value" --link-input)
 reject_cli(link_input_absent "link input file does not exist" --link-input "${OUTDIR}/absent.obj")
 reject_cli(link_input_ir "--link-input requires executable output" --link-input "${_clean}")
+reject_cli(subsystem_missing "option '--subsystem' requires a value" --subsystem)
+reject_cli(subsystem_invalid "invalid PE subsystem 'invalid'" --subsystem invalid)
+reject_cli(driver_dir_missing "option '--driver-dir' requires a value" --driver-dir)
+reject_cli(driver_dir_absent "driver directory does not exist" --driver-dir "${OUTDIR}/absent drivers")
 reject_cli(target_flag_value "option '--target' requires a value" --target --auto-stdlib)
 reject_cli(target_cross "target 'wasm32-wasi' is not supported" --target wasm32-wasi)
 reject_cli(target_invalid "target 'batch4-invalid' is not supported" --target batch4-invalid)
@@ -126,34 +130,64 @@ if(WIN32 AND CLANG)
   endif()
   set(stdlib "${OUTDIR}/native-stdlib")
   set(stdlib_driver "${stdlib}/Fixture/Nested/drivers")
-  file(MAKE_DIRECTORY "${stdlib_driver}/win-${arch}")
+  set(driver_override "${stdlib}/override drivers")
+  file(MAKE_DIRECTORY "${stdlib_driver}" "${driver_override}")
   file(WRITE "${stdlib_driver}/driver.manifest" "stdlib_fixture if main\n")
-  file(WRITE "${stdlib_driver}/win-${arch}/stdlib_fixture.bundle" "stdlib-payload.dat\n")
-  file(WRITE "${stdlib_driver}/win-${arch}/stdlib-payload.dat" "standard library driver payload")
+  file(WRITE "${driver_override}/stdlib_fixture.bundle" "stdlib-payload.dat\n")
+  file(WRITE "${driver_override}/stdlib-payload.dat" "standard library driver payload")
   file(WRITE "${_default_src}" [=[
+namespace DriverFixture {
+    class Options {
+        public static int Value = 4;
+        public static int Read() { return Value; }
+    }
+}
+
+class Shadow {
+    public int Value = 1;
+    public int Read() { return Value; }
+}
+
 class Program {
+    Shadow Options = new Shadow();
+    int ReadOptions() {
+        DriverFixture.Options.Value = 37;
+        return DriverFixture.Options.Read() + DriverFixture.Options.Value - Options.Read();
+    }
+
     [DllImport("kernel32")]
     static extern nint GetCurrentProcess();
     [DllImport("psapi")]
     static extern int GetProcessMemoryInfo(nint process, byte[] counters, int size);
     static int Main() {
         byte[] counters = new byte[72];
-        return GetProcessMemoryInfo(GetCurrentProcess(), counters, counters.Length) != 0 ? 37 : 1;
+        return GetProcessMemoryInfo(GetCurrentProcess(), counters, counters.Length) != 0
+            ? new Program().ReadOptions() : 1;
     }
 }
 ]=])
   file(REMOVE "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
   execute_process(COMMAND ${_gen1_env} "ZAN_STDLIB_PATH=${stdlib}"
-    "${GEN1}" "${_default_src}" WORKING_DIRECTORY "${_root}"
-    RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
-  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}" OR NOT EXISTS "${OUTDIR}/stdlib-payload.dat")
-    message(FATAL_ERROR "default executable output or stdlib bundle failed, rc=${rc}\n${stdout}${stderr}")
+    "${GEN1}" "${_default_src}" --time --subsystem windows --driver-dir "${driver_override}"
+    WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  string(FIND "${stderr}" "[time] IR generation:" timing)
+  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}" OR NOT EXISTS "${OUTDIR}/stdlib-payload.dat"
+      OR timing EQUAL -1)
+    message(FATAL_ERROR "default executable output or stdlib bundle override failed, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  # e_lfanew points to the PE signature. Subsystem is 68 bytes into the optional header.
+  file(READ "${_default_exe}" pe_le OFFSET 60 LIMIT 4 HEX)
+  string(REGEX REPLACE "^(..)(..)(..)(..)$" "\\4\\3\\2\\1" pe_be "${pe_le}")
+  math(EXPR subsystem_offset "0x${pe_be} + 24 + 68")
+  file(READ "${_default_exe}" subsystem OFFSET ${subsystem_offset} LIMIT 2 HEX)
+  if(NOT subsystem STREQUAL "0200")
+    message(FATAL_ERROR "expected Windows GUI subsystem, found '${subsystem}'")
   endif()
   execute_process(COMMAND "${_default_exe}" RESULT_VARIABLE rc TIMEOUT 15)
   file(REMOVE "${_default_src}" "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
   file(REMOVE_RECURSE "${stdlib}")
-  if(NOT "${rc}" STREQUAL "37")
-    message(FATAL_ERROR "default executable returned ${rc}, expected 37")
+  if(NOT "${rc}" STREQUAL "73")
+    message(FATAL_ERROR "default executable returned ${rc}, expected 73")
   endif()
 
   set(_sqlite_case "${_root}/tests/conformance/sqlite_params")
