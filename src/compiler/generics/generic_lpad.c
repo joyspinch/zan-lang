@@ -107,6 +107,13 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     }
     if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
         return 1;
+    /* Task<T>.Result transfers the keep-result frame's RVAL owner to the
+     * consumer; emit_task_member zeroes the frame slot without releasing it. */
+    if (e->kind == AST_MEMBER_ACCESS && e->member.name.len == 6 &&
+        memcmp(e->member.name.str, "Result", 6) == 0) {
+        zan_type_t *tt = infer_expr_type(g, e->member.object, locals);
+        if (tt && tt->kind == TYPE_TASK) return 1;
+    }
     if (e->kind == AST_MEMBER_ACCESS) {
         zan_ast_node_t *obj = e->member.object;
         /* weak 弱引用字段读取：尝试提升并向调用方返回 +1 强引用 */

@@ -1127,3 +1127,20 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
       嵌套 try/catch 和跨 `await` 恢复，同时保留原异常与内层已处理异常的身份；
       联跑 `async_finally_paths`、`async_finally_shared_contexts`、
       `async_finally_pending_owners`、`catch_return_release` 及 focused selfhost diff。
+
+64. **Task.Run/Spawn 的 async 实参是协程帧，不是 ARC 临时对象**：
+    - 动作：`Task.Run`/`Task.Spawn` 走 async-call 分支时，`emit_detach_async_call`
+      已把协程帧移交调度器/任务注册表（`Task.Spawn` 为自等待者，`Task.Run`
+      keep-result 为注册表帧），之后不得再按 AST_CALL 的 owned-temp 规则
+      `emit_release_owned_call_temp`。`Task<T>.Result` 则要标成 owned 值——
+      `emit_task_member` 读走 RVAL 槽后把槽清零，所有权转移给消费方。
+    - 理由：async 调用的发射值是帧指针。把它当 ARC 对象释放会在帧前缀
+      （frame-16，即分配器 magic/class）上做引用计数减一，随后任务释放时
+      `co_frame_recycle` magic 校验失败静默 abort；`Task.Result` 不标 owned
+      则帧 RVAL 槽的 +1 永不释放，弱引用观察对象在 `result = null` 后仍存活。
+      自举侧 TaskRun/Result 路径本就无 owned temp 释放并 AddTemp 转移，宿主
+      修正后两版行为一致。
+    - 判定器：`case_task_release_owner`（--check-leaks --arc-guard 下曾 rc=3
+      静默 abort）、`case_task_run_async_bg`、`case_async_spawn_result_release`、
+      `case_task_spawn_indirect`；运行时注册表单元
+      `runtime_task_handle_registry`。

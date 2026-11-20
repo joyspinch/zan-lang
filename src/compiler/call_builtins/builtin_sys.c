@@ -230,7 +230,10 @@
                 !is_call_to(expr, "Task", "Spawn") &&
                 sub_ty && sub_ty->kind != TYPE_VOID;
             LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result, true);
-            emit_release_owned_call_temp(g, sub_arg, sub, locals);
+            /* The async call's value is a coroutine frame, not an ARC object.
+             * Detach transfers that frame to the scheduler/registry; treating
+             * the AST_CALL temp as owned released it through the object header
+             * and corrupted the frame allocator prefix (B-ID227). */
             /* Task */
             if (sub_i8) return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
             return LLVMConstInt(sp_i64, 0, 0);
