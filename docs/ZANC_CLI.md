@@ -13,7 +13,7 @@
 zanc 一条命令 = **编译 + 标准库拉入 + 原生驱动链接**，直接产出可运行文件：
 
 ```bash
-build/zanc <入口和源文件...> [options] -o <输出>
+build/zanc <入口和源文件...> [options] [-o <输出>]
 ```
 
 - 不需要先编 .o 再链接；也不用指定 -I/-l（stdlib 默认自动按需拉入，原生驱动按拉入面自动带出）。
@@ -30,7 +30,10 @@ build/zanc <入口和源文件...> [options] -o <输出>
 ### 1.1 日常开发循环
 
 ```bash
-# 编译 + 运行（默认自动拉入标准库，默认 -O2；-g 才强制 O0）
+# Windows 单文件默认生成 src/main.exe，自动按需拉入标准库
+build/zanc src/main.zan
+
+# 指定输出路径
 build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
 
 # 多文件项目：把目录交给编译器（递归展开 *.zan，按路径排序，命令行恒长）
@@ -42,6 +45,8 @@ build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
 # Release 发布档（strip + 优化，默认 -Os）
 build/zanc src/main.zan --publish -o app.exe
 ```
+
+Windows 自举编译器也支持 `build/selfhost_gen1.exe src/main.zan`，默认生成 `src/main.exe` 并使用 `-O2`。生成可执行文件时，若可达的 `[DllImport]` 声明同目录下有 `drivers/driver.manifest`，自举驱动可按宿主平台选用导入库，并将 `.bundle` 中直接列出的 DLL 放到输出目录。使用 `--link-input <文件>` 时由调用方提供原生链接输入。`-o <文件.ll>` 可显式输出 LLVM IR。
 
 ### 1.2 GUI 程序
 
