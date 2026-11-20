@@ -43,7 +43,6 @@ class McpServer {
     static string callGraphPath;
     static string galleryPath;
     static string formSchemaPath;
-    static string routesIndexPath;
     static string entitiesIndexPath;
     static string indexManifestPath;
     static string knowledgeStatus;
@@ -53,8 +52,6 @@ class McpServer {
     static string sdkRoot;
     static string skillsDir;
     static bool frozenTools;
-    static string workRoot;
-    static int compileSeq;
 
     static string Version() { return "2.0"; }
 
@@ -106,7 +103,6 @@ class McpServer {
         McpServer.knowledge = "";
         McpServer.zancPath = "";
         McpServer.stdlibPath = "";
-        McpServer.compileSeq = 0;
         McpServer.stdio = false;
         McpServer.sdkRoot = "";
         McpServer.skillsDir = McpServer.Env("MCP_SKILLS", "");
@@ -274,16 +270,9 @@ class McpServer {
         }
         McpServer.galleryPath = McpServer.knowledge + "/gallery.json";
         McpServer.formSchemaPath = McpServer.knowledge + "/controls.json";
-        McpServer.routesIndexPath = McpServer.root + "/.zanmap/routes.json";
-        if (!File.Exists(McpServer.routesIndexPath)
-            && File.Exists(McpServer.root + "/.zanmap/routes.approx.json")) {
-            McpServer.routesIndexPath =
-                McpServer.root + "/.zanmap/routes.approx.json";
-        }
         McpServer.entitiesIndexPath = McpServer.root + "/.zanmap/entities.json";
         McpServer.indexManifestPath = McpServer.root + "/.zanmap/index.json";
         McpServer.KnowledgeCheck(false);
-        McpServer.workRoot = McpServer.root + "/_scratch/mcp_compile";
         McpServer.InitJobs();
 
         if (testSemantic) {
@@ -1379,13 +1368,15 @@ class McpServer {
     }
 
     static string RoutesRel() {
-        string p = McpServer.routesIndexPath;
-        string approx = "routes.approx.json";
-        if (p.Length >= approx.Length
-            && p.Substring(p.Length - approx.Length, approx.Length) == approx) {
-            return ".zanmap/" + approx;
-        }
-        return ".zanmap/routes.json";
+        string exact = ".zanmap/routes.json";
+        string approx = ".zanmap/routes.approx.json";
+        if (!File.Exists(McpServer.root + "/" + exact)
+            && File.Exists(McpServer.root + "/" + approx)) { return approx; }
+        return exact;
+    }
+
+    static string RoutesPath() {
+        return McpServer.root + "/" + McpServer.RoutesRel();
     }
 
     static JsonValue ReadResource(JsonValue id, string uri) {
@@ -3260,11 +3251,11 @@ class McpServer {
     }
 
     static string RouteLookup(JsonValue args) {
-        if (!File.Exists(McpServer.routesIndexPath)) {
+        string path = McpServer.RoutesPath();
+        if (!File.Exists(path)) {
             return McpServer.IndexMissingMsg(".zanmap/routes.json");
         }
-        JsonValue all = McpServer.ParseBody(
-            File.ReadAllText(McpServer.routesIndexPath));
+        JsonValue all = McpServer.ParseBody(File.ReadAllText(path));
         if (all == null || !all.IsArray()) {
             return "error: .zanmap/routes.json is not a JSON array";
         }
@@ -3362,7 +3353,7 @@ class McpServer {
             o.Put("generatedBy", man.Get("generatedBy"));
             o.Put("sourceFiles", man.Get("sourceFiles"));
         }
-        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue routes = McpServer.IndexArray(McpServer.RoutesPath());
         JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
         JsonValue mods = JsonValue.NewObject();
         JsonValue verbs = JsonValue.NewObject();
@@ -3456,7 +3447,7 @@ class McpServer {
         o.Put("files", files);
         o.Put("subtypes", rec.Get("subtypes"));
 
-        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue routes = McpServer.IndexArray(McpServer.RoutesPath());
         JsonValue hitRoutes = JsonValue.NewArray();
         int routeTotal = 0;
         for (int i = 0; i < routes.Count(); i = i + 1) {
@@ -3914,24 +3905,30 @@ class McpServer {
             return "error: source file not found: " + srcPath;
         }
 
-        string outDir = McpServer.root + "/_scratch/gui_snapshot";
-        Directory.CreateDirectoryRecursive(outDir);
-        string exePath = outDir + "/app.exe";
-        string scriptPath = outDir + "/script.txt";
-        string lintLogPath = outDir + "/lint.log";
-        string treeJsonPath = outDir + "/tree.json";
-        string regionsJsonPath = outDir + "/regions.json";
-
-        if (File.Exists(exePath)) { File.Delete(exePath); }
-        if (File.Exists(lintLogPath)) { File.Delete(lintLogPath); }
-        if (File.Exists(treeJsonPath)) { File.Delete(treeJsonPath); }
-        if (File.Exists(regionsJsonPath)) { File.Delete(regionsJsonPath); }
-
         string zanc = McpServer.zancPath;
         if (!File.Exists(zanc)) { zanc = "build/zanc.exe"; }
         if (!File.Exists(zanc)) {
             return "error: zanc compiler not found at " + zanc;
         }
+        string outDir = McpServer.CreateToolOutputDir("gui_snapshot");
+        bool keepOutput = false;
+        try {
+            string result = await McpServer.RunGuiSnapshot(srcPath, fullSrc, actionScript,
+                zanc, outDir, requestKey);
+            keepOutput = !result.StartsWith("error:");
+            return result;
+        } finally {
+            if (!keepOutput) { Directory.DeleteRecursive(outDir); }
+        }
+    }
+
+    static async string RunGuiSnapshot(string srcPath, string fullSrc, string actionScript,
+                                       string zanc, string outDir, string requestKey) {
+        string exePath = outDir + "/app.exe";
+        string scriptPath = outDir + "/script.txt";
+        string lintLogPath = outDir + "/lint.log";
+        string treeJsonPath = outDir + "/tree.json";
+        string regionsJsonPath = outDir + "/regions.json";
 
         // 1. 快速构建目标 GUI 程序
         // 若目标为 .html，需作为首参，并自动关联同目录下所有 .zan code-behind 文件
@@ -3994,7 +3991,7 @@ class McpServer {
         StringBuilder sb = new StringBuilder();
         sb.Append("=== [Zan GUI Snapshot & Layout Inspection] ===\n");
         sb.Append("Target: " + srcPath + "\n");
-        sb.Append("Output Dir: _scratch/gui_snapshot\n\n");
+        sb.Append("Output Dir: " + outDir.Substring(McpServer.root.Length + 1) + "\n\n");
 
         if (File.Exists(lintLogPath)) {
             string lintText = File.ReadAllText(lintLogPath);
@@ -4030,6 +4027,26 @@ class McpServer {
 
 
     static async string RefreshIndex(string requestKey) {
+        string scratch = McpServer.root + "/_scratch";
+        Directory.CreateDirectoryRecursive(scratch);
+        long guard = File.TryLock(scratch + "/mcp_index.lock");
+        if (guard == 0) {
+            JsonValue error = JsonValue.NewObject();
+            error.Put("ok", JsonValue.NewBool(false));
+            error.Put("error", JsonValue.NewStr("could not acquire the workspace index refresh lock"));
+            return error.ToJson();
+        }
+        string dir = "";
+        try {
+            dir = McpServer.CreateToolOutputDir("mcp_index");
+            return await McpServer.RunIndexRefresh(dir, requestKey);
+        } finally {
+            File.Unlock(guard);
+            if (dir != "") { Directory.DeleteRecursive(dir); }
+        }
+    }
+
+    static async string RunIndexRefresh(string dir, string requestKey) {
         List<string> srcs = new List<string>();
         string scope = "src";
         if (!Directory.Exists(McpServer.root + "/src")) { scope = ""; }
@@ -4042,14 +4059,13 @@ class McpServer {
                 "no .zan sources found under " + McpServer.root));
             return o.ToJson();
         }
-        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
-        string listPath = McpServer.root + "/_scratch/mcp_index_sources.txt";
+        string listPath = dir + "/sources.rsp";
         StringBuilder list = new StringBuilder();
         for (int i = 0; i < srcs.Count; i = i + 1) {
             list.Append("\"" + McpServer.root + "/" + srcs[i] + "\"\n");
         }
         File.WriteAllText(listPath, list.ToString());
-        string metaPath = McpServer.root + "/_scratch/mcp_index_meta.json";
+        string metaPath = dir + "/meta.json";
         List<string> argv = new List<string>();
         argv.Add("@" + listPath);
         argv.Add("--stdlib-path");
@@ -4073,10 +4089,20 @@ class McpServer {
         }
         // 元数据用绝对路径喂的编译器,索引对外只给工作区相对路径。
         SemanticIndex index = new SemanticIndex(unit, McpServer.root);
-        int routes = index.WriteTo(McpServer.root + "/.zanmap");
-        McpServer.routesIndexPath = McpServer.root + "/.zanmap/routes.json";
-        JsonValue man = McpServer.ParseBody(
-            File.ReadAllText(McpServer.indexManifestPath));
+        string indexDir = McpServer.root + "/.zanmap";
+        string staging = indexDir + "/.mcp-" + Path.GetFileName(dir);
+        int routes = 0;
+        JsonValue man = null;
+        try {
+            routes = index.WriteTo(staging);
+            man = McpServer.ParseBody(File.ReadAllText(staging + "/index.json"));
+            // Move complete files so readers on other workers never see a partial write.
+            File.Move(staging + "/routes.json", indexDir + "/routes.json");
+            File.Move(staging + "/entities.json", indexDir + "/entities.json");
+            File.Move(staging + "/index.json", McpServer.indexManifestPath);
+        } finally {
+            Directory.DeleteRecursive(staging);
+        }
         o.Put("ok", JsonValue.NewBool(true));
         o.Put("sources", JsonValue.NewNum(Convert.ToString(srcs.Count)));
         o.Put("routes", JsonValue.NewNum(Convert.ToString(routes)));
@@ -4208,17 +4234,28 @@ class McpServer {
         return null;
     }
 
+    static string CreateToolOutputDir(string tool) {
+        string id = Guid.New();
+        if (id == "") { throw new IOException("could not allocate MCP tool output directory"); }
+        string dir = McpServer.root + "/_scratch/" + tool + "/" + id;
+        Directory.CreateDirectoryRecursive(dir);
+        return dir;
+    }
+
     static async string Compile(string filename, string content, string requestKey) {
         if (filename == "") { filename = "snippet.zan"; }
         if (!McpServer.IsBareName(filename)) {
             return "error: filename must be a bare file name with no path separators";
         }
-        McpServer.compileSeq = McpServer.compileSeq + 1;
-        string dir = McpServer.workRoot + "/" + Convert.ToString(McpServer.compileSeq);
-        Directory.CreateDirectoryRecursive(dir);
-        File.WriteAllText(dir + "/" + filename, content);
-        return await McpServer.CompileSource(dir + "/" + filename,
-            dir + "/out" + McpServer.ExeSuffix(), requestKey);
+        string dir = McpServer.CreateToolOutputDir("mcp_compile");
+        try {
+            string source = dir + "/" + filename;
+            File.WriteAllText(source, content);
+            return await McpServer.CompileSource(source, dir + "/out" + McpServer.ExeSuffix(),
+                requestKey);
+        } finally {
+            Directory.DeleteRecursive(dir);
+        }
     }
 
     static async string BuildProject(string entry, string requestKey) {
@@ -4229,10 +4266,13 @@ class McpServer {
         string full = McpServer.Resolve(entry);
         if (full == "") { return McpServer.OutsideMsg(entry); }
         if (!File.Exists(full)) { return "error: entry not found: " + entry; }
-        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
-        string outPath = McpServer.root + "/_scratch/mcp_project_out"
-            + McpServer.ExeSuffix();
-        return await McpServer.CompileSource(full, outPath, requestKey);
+        string dir = McpServer.CreateToolOutputDir("mcp_build");
+        try {
+            return await McpServer.CompileSource(full, dir + "/out" + McpServer.ExeSuffix(),
+                requestKey);
+        } finally {
+            Directory.DeleteRecursive(dir);
+        }
     }
 
     const string JSON_DIAGNOSTICS_OPTION = "--diagnostics-format=jsonl";
@@ -4780,7 +4820,7 @@ class McpServer {
                 "Cap for the sample lists (default 40).", false);
             arr.Append(t);
         }
-        if (File.Exists(McpServer.routesIndexPath) || McpServer.frozenTools) {
+        if (File.Exists(McpServer.RoutesPath()) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_route_lookup",
                 "Answer \"which action serves this URL, and what may call"
                 + " it\" without opening a controller: verb, path, action"

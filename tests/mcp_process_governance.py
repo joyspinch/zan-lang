@@ -278,7 +278,7 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
             reader.join(timeout=2)
 
 
-def exercise_http(exe, root, workspace, workers=1):
+def exercise_http(exe, root, workspace, workers=1, zanc=None):
     workspace.mkdir(exist_ok=True)
     host = "127.0.0.1"
     with socket.socket() as listener, socket.socket() as control:
@@ -336,9 +336,23 @@ def exercise_http(exe, root, workspace, workers=1):
         result = json.loads(reply["result"]["content"][0]["text"])
         check(result["status"] == "cancelled" and result["exitCode"] == -1, result)
 
+    def tool(session, connection, name, **arguments):
+        status, _, body = exchange("POST", {"id": f"{name}-{id(connection)}", "method": "tools/call", "params": {
+            "name": name, "arguments": arguments,
+        }}, session, connection=connection)
+        check(status == 200, (status, body))
+        return json.loads(body)["result"]["content"][0]["text"]
+
     args = [str(exe), str(workspace), "--sdk-root", str(root), "--host", host,
             "--port", str(port), "--workers", str(workers), "--token-env", "ZAN_TEST_MCP_TOKEN",
             "--name", "governance", "--max-read", "1234567", "--sandbox", "process"]
+    if zanc:
+        args.extend(("--zanc", str(zanc)))
+        (workspace / "src").mkdir()
+        (workspace / "src/main.zan").write_text(
+            "class Program { static int Main() { return 0; } }\n", encoding="ascii")
+        (workspace / ".zanmap").mkdir()
+        (workspace / ".zanmap/routes.approx.json").write_text('["approximate"]', encoding="ascii")
     env = {**os.environ, "ZAN_TEST_MCP_TOKEN": "test-mcp-governance",
            "ZAN_CTL_PORT": str(control_port), "TMPDIR": str(workspace), "TEMP": str(workspace),
            "TMP": str(workspace)}
@@ -412,6 +426,50 @@ def exercise_http(exe, root, workspace, workers=1):
                     status, _, body = exchange("DELETE", session=delete_session, connection=control_conn)
                     check(status == 204 and not body, (status, body))
                     expect_cancelled(call, "delete")
+            if zanc:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    calls = [pool.submit(tool, first, conn, "zan_compile", filename="same.zan",
+                                         content=f"#error {marker}\n")
+                             for conn, marker in ((run_conn, "first-snippet"),
+                                                  (control_conn, "second-snippet"))]
+                    files = []
+                    for call, marker in zip(calls, ("first-snippet", "second-snippet")):
+                        result = json.loads(call.result())
+                        check(not result["ok"] and marker in result["raw"], result)
+                        files.append(result["diagnostics"][0]["file"])
+                    check(len(set(files)) == 2, files)
+
+                    build = pool.submit(tool, first, run_conn, "zan_build_project")
+                    other_build = pool.submit(tool, first, control_conn, "zan_build_project")
+                    for call in (build, other_build):
+                        result = json.loads(call.result())
+                        check(result["ok"], result)
+
+                    def routes():
+                        status, _, body = exchange("POST", {"id": "routes", "method": "resources/read",
+                            "params": {"uri": "repo://routes"}}, first, connection=control_conn)
+                        check(status == 200, (status, body))
+                        return json.loads(json.loads(body)["result"]["contents"][0]["text"])
+
+                    check(routes() == ["approximate"], "approximate route fallback was skipped")
+                    refresh = json.loads(tool(first, run_conn, "zan_refresh_index"))
+                    check(refresh["ok"] and refresh["sources"] == 1, refresh)
+                    check(routes() == [], "worker kept the approximate route file after refresh")
+
+                    if os.name == "nt":
+                        calls = [pool.submit(tool, first, conn, "zan_gui_snapshot", file="src/main.zan")
+                                 for conn in (run_conn, control_conn)]
+                        outputs = []
+                        for call in calls:
+                            result = call.result()
+                            check("exit code 0" in result, result)
+                            output = result.split("Output Dir: ", 1)[1].splitlines()[0]
+                            check((workspace / output / "script.txt").is_file(), result)
+                            outputs.append(output)
+                        check(len(set(outputs)) == 2, outputs)
+                for tool_dir in ("mcp_compile", "mcp_build", "mcp_index"):
+                    check(not list((workspace / "_scratch" / tool_dir).iterdir()),
+                          f"request files left in {tool_dir}")
         finally:
             try:
                 connections.close()
@@ -515,7 +573,8 @@ def main():
         exercise(args.exe.resolve(), args.root.resolve(), workspace,
                  args.zanc.resolve() if args.zanc else None)
         exercise_http(args.exe.resolve(), args.root.resolve(), workspace)
-        exercise_http(args.exe.resolve(), args.root.resolve(), workspace / "workers", workers=2)
+        exercise_http(args.exe.resolve(), args.root.resolve(), workspace / "workers", workers=2,
+                      zanc=args.zanc.resolve() if args.zanc else None)
         cgroup = os.environ.get("ZAN_TEST_MCP_SANDBOX_CGROUP") if sys.platform == "linux" else None
         if cgroup:
             # WSL's Windows mounts do not support all Landlock write checks.

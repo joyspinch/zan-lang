@@ -79,6 +79,11 @@ and all workers share session and active request state. A worker can cancel a
 job started on another connection by a different worker. Calls without a session
 use stateless HTTP and rely on the process timeout.
 
+Compile and project-build calls use separate temporary directories and return
+compiler diagnostics. A GUI snapshot retains its own output directory under
+`_scratch/gui_snapshot` and returns that path. An index refresh holds a workspace
+lock while rebuilding `.zanmap`; a second refresh can retry if the lock is busy.
+
 The built-in `McpClient` forwards session headers automatically. Use
 `await client.CloseAsync()` to send `DELETE`, release local connections, and
 reset the handshake. A missing or already expired session counts as closed.
