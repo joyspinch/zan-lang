@@ -131,9 +131,8 @@
         int ncatch = stmt->try_stmt.catches.count;
         zan_builder_point_t lpad_pt = zan_builder_save(g);
         LLVMPositionBuilderAtEnd(g->builder, lpad_bb);
-        ensure_function_personality(g, fn);
         LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
-        LLVMValueRef lp_slot = emit_entry_alloca(g, lp_ret_ty, "lp.slot");
+        LLVMValueRef lp_slot = g->target_is_wasm ? NULL : emit_entry_alloca(g, lp_ret_ty, "lp.slot");
         /* Native EH searches the innermost invoke's clauses, not other
          * landing pads in the same function. A finally-only try inside a
          * catch region must advertise that enclosing handler too, or phase
@@ -150,14 +149,7 @@
          * even with no enclosing catch. It must be selected during phase one. */
         bool catches_native = ncatch > 0 || has_enclosing_catch ||
             (!g->current_async_frame && stmt->try_stmt.finally_body);
-        LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty,
-            get_eh_personality_fn(g), catches_native ? 1 : 0, "lp");
-        if (catches_native) {
-            LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
-        }
-        LLVMSetCleanup(lp_val, 1);
-        LLVMBuildStore(g->builder, lp_val, lp_slot);
-        LLVMBuildBr(g->builder, catch_bb);
+        emit_eh_landing_to(g, catch_bb, lp_ret_ty, lp_slot, catches_native);
         zan_builder_restore(g, lpad_pt);
 
         LLVMPositionBuilderAtEnd(g->builder, try_bb);
@@ -417,13 +409,7 @@
                     zan_builder_point_t pt = zan_builder_save(g);
                     LLVMPositionBuilderAtEnd(g->builder, cleanup_lpad);
                     bool catches_cleanup = has_enclosing_catch || fin_idx >= 0;
-                    LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_ret_ty,
-                        get_eh_personality_fn(g), catches_cleanup ? 1 : 0,
-                        "catch.lp");
-                    if (catches_cleanup) LLVMAddClause(lp, LLVMConstNull(i8ptr));
-                    LLVMSetCleanup(lp, 1);
-                    LLVMBuildStore(g->builder, lp, lp_slot);
-                    LLVMBuildBr(g->builder, cleanup_bb);
+                    emit_eh_landing_to(g, cleanup_bb, lp_ret_ty, lp_slot, catches_cleanup);
                     zan_builder_restore(g, pt);
                     zan_lpad_entry_t *entry = &g->lpad_stack[g->lpad_depth++];
                     memset(entry, 0, sizeof(*entry));

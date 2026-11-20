@@ -252,6 +252,9 @@ struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g, zan_symbol_t *typ
 /* --- From irgen.c (82 functions) --- */
 LLVMValueRef get_eh_personality_fn(zan_irgen_t *g);
 void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn);
+void emit_eh_landing_to(zan_irgen_t *g, LLVMBasicBlockRef body,
+                        LLVMTypeRef native_type, LLVMValueRef native_slot,
+                        bool catches_native);
 void emit_raise_exception(zan_irgen_t *g);
 void emit_raise_exception_through_cleanups(zan_irgen_t *g);
 /* 收缩 pass（optimizer.c）的 Zan 函数名注记：irgen 每注册一个 Zan

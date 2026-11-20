@@ -735,14 +735,22 @@ void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
         (LLVMTypeRef[]){ i8ptr, i32t }, 2, 0);
     for (fn_cleanup_variant_t *v = state->variants; v; v = v->next) {
         LLVMPositionBuilderAtEnd(g->builder, v->landing.lpad_bb);
-        ensure_function_personality(g, entry->fn);
-        LLVMValueRef lp = LLVMBuildLandingPad(g->builder, lp_type,
-            get_eh_personality_fn(g), 0, "fn.lp");
-        LLVMSetCleanup(lp, 1);
+        LLVMValueRef lp = NULL;
+        if (g->target_is_wasm) {
+            LLVMBasicBlockRef cleanup = LLVMAppendBasicBlockInContext(g->ctx, entry->fn, "fn.cleanup");
+            emit_eh_landing_to(g, cleanup, NULL, NULL, false);
+            LLVMPositionBuilderAtEnd(g->builder, cleanup);
+        } else {
+            ensure_function_personality(g, entry->fn);
+            lp = LLVMBuildLandingPad(g->builder, lp_type,
+                get_eh_personality_fn(g), 0, "fn.lp");
+            LLVMSetCleanup(lp, 1);
+        }
         LLVMValueRef mark = LLVMBuildLoad2(g->builder, i32t, state->tmp_mark, "fn.tmp.mark.val");
         emit_eh_tmp_unwind_to(g, mark);
         emit_lpad_cleanups(g, &v->landing);
-        LLVMBuildResume(g->builder, lp);
+        if (g->target_is_wasm) emit_raise_exception(g);
+        else LLVMBuildResume(g->builder, lp);
     }
     LLVMDeleteBasicBlock(entry->lpad_bb);
     zan_builder_restore(g, pt);

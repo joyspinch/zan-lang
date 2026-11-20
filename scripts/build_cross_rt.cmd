@@ -115,10 +115,9 @@ rem same pair the linux/macos/android blocks above build.
 echo built toolchain\ios\arm64
 
 rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link
-rem rejects those programs before the object would be needed (see main.c's
-rem wasm_obj_refs_any gates). zanrt_wasm.o holds the libc ABI adapters
-rem (rt_wasm.c) and is compiled by clang from the same sysroot; the file/timer
-rem objects here are what every program links unconditionally.
+rem rejects those programs before the object would be needed (see the
+rem wasm_obj_refs_any gates). The wasm, file and timer runtime objects are
+rem linked into every program.
 rem zanrt_ehtag.o is NOT built here: it needs mozbuild clang's wasm EH backend
 rem (zig's clang fails the same compile). Recipe:
 rem   <mozbuild>\clang\bin\clang.exe --target=wasm32-unknown-wasi ^
@@ -127,6 +126,7 @@ rem     toolchain\wasm32\zanrt_ehtag.c -o toolchain\wasm32\zanrt_ehtag.o
 rem It defines the __cpp_exception tag and __cxa_throw for try/catch programs
 rem (main.c links it only when wasm_eh_used).
 if not exist toolchain\wasm32 mkdir toolchain\wasm32
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_wasm.c  -o toolchain\wasm32\zanrt_wasm.o  || exit /b 1
 "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
 rem 128-bit Decimal runtime: programs that reach System.Numerics reference
 rem __zan_decimal_*, and the wasm link injects this object for them.

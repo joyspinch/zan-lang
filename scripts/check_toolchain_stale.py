@@ -68,8 +68,7 @@ RT_CRASH = ["src/runtime/rt_crash.c", "src/runtime/rt_crash.h"] + \
     _implementation_sources("src/runtime/crash")
 RT_CRYPTO = ["src/accel/zan_hw_accel.c", "src/accel/zan_hw_accel.h"] + \
     _implementation_sources("src/accel/hw")
-RT_WASM = ["src/runtime/rt_wasm.c"]   # zanrt_wasm.o compiles rt_wasm.c only; rt_file.c
-                                     # links alongside as its own object (build_cross_rt.cmd)
+RT_WASM = ["src/runtime/rt_wasm.c", "src/runtime/rt_co.h"]
 RT_GUI_MAC = ["src/drivers/gui/gui_compat_mac.c"]
 RT_GUI_IOS = ["src/drivers/gui/" + name for name in (
     "gui_runtime.c", "gui_runtime_ios.c", "gui_runtime_ios_input.c",

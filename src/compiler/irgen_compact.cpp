@@ -241,11 +241,13 @@ extern "C" void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor) {
     delete compactor;
 }
 
-extern "C" LLVMTargetMachineRef zan_create_emulated_tls_target_machine(
+extern "C" LLVMTargetMachineRef zan_create_target_machine_with_options(
     LLVMTargetRef target, const char *triple, const char *cpu,
-    const char *features, LLVMCodeGenOptLevel level) {
+    const char *features, LLVMCodeGenOptLevel level,
+    LLVMBool emulated_tls, LLVMBool wasm_exceptions) {
     llvm::TargetOptions options;
-    options.EmulatedTLS = true;
+    options.EmulatedTLS = emulated_tls;
+    if (wasm_exceptions) options.ExceptionModel = llvm::ExceptionHandling::Wasm;
 #if LLVM_VERSION_MAJOR >= 18
     auto opt_level = static_cast<llvm::CodeGenOptLevel>(level);
 #else

@@ -268,13 +268,6 @@ void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn) {
 static void emit_raise_exception_impl(zan_irgen_t *g, bool include_cleanups) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    if (!g->fn_cxa_allocate_exception) {
-        LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
-        g->fn_cxa_allocate_exception = LLVMGetNamedFunction(g->mod, "__cxa_allocate_exception");
-        if (!g->fn_cxa_allocate_exception) {
-            g->fn_cxa_allocate_exception = LLVMAddFunction(g->mod, "__cxa_allocate_exception", alloc_ty);
-        }
-    }
     if (!g->fn_cxa_throw) {
         LLVMTypeRef throw_params[] = { i8ptr, i8ptr, i8ptr };
         LLVMTypeRef throw_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), throw_params, 3, 0);
@@ -284,9 +277,18 @@ static void emit_raise_exception_impl(zan_irgen_t *g, bool include_cleanups) {
         }
     }
 
-    LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
-    LLVMValueRef exc_mem = zan_call2(g->builder, alloc_ty, g->fn_cxa_allocate_exception,
-        (LLVMValueRef[]){ LLVMConstInt(i64t, 8, 0) }, 1, "exc.mem");
+    LLVMValueRef exc_mem = LLVMConstNull(i8ptr);
+    if (g->target_is_wasm) {
+        /* The bundled tag shim only signals unwind. Zan's EH state owns the value. */
+        g->wasm_eh_used = true;
+    } else {
+        LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
+        if (!g->fn_cxa_allocate_exception) {
+            g->fn_cxa_allocate_exception = get_libc_fn(g, "__cxa_allocate_exception", alloc_ty);
+        }
+        exc_mem = zan_call2(g->builder, alloc_ty, g->fn_cxa_allocate_exception,
+            (LLVMValueRef[]){ LLVMConstInt(i64t, 8, 0) }, 1, "exc.mem");
+    }
 
     LLVMTypeRef throw_params[] = { i8ptr, i8ptr, i8ptr };
     LLVMTypeRef throw_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), throw_params, 3, 0);

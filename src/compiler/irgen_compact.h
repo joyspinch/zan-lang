@@ -21,10 +21,11 @@ int zan_irgen_compactor_run(zan_irgen_compactor_t *compactor,
 
 void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor);
 
-/* LLVM's C target-machine API does not expose the emulated TLS option. */
-LLVMTargetMachineRef zan_create_emulated_tls_target_machine(
+/* LLVM's C target-machine API lacks these target options. */
+LLVMTargetMachineRef zan_create_target_machine_with_options(
     LLVMTargetRef target, const char *triple, const char *cpu,
-    const char *features, LLVMCodeGenOptLevel level);
+    const char *features, LLVMCodeGenOptLevel level,
+    LLVMBool emulated_tls, LLVMBool wasm_exceptions);
 
 #ifdef __cplusplus
 }

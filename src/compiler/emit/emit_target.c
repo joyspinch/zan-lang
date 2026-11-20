@@ -807,7 +807,8 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
 
     const char *tm_cpu = "generic";
     const char *tm_features = "";
-    if (strncmp(triple, "wasm", 4) == 0) {
+    bool wasm = strncmp(triple, "wasm", 4) == 0;
+    if (wasm) {
         tm_features = "+exception-handling,+reference-types";
     } else if (strncmp(triple, "riscv64", 7) == 0) {
         tm_cpu = "generic-rv64";
@@ -858,9 +859,12 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
        否则消费方（llc 等）用 generic CPU 拿到 256 位向量路径会合法化失败。 */
     snprintf(g->target_cpu, sizeof(g->target_cpu), "%s", tm_cpu);
     snprintf(g->target_features, sizeof(g->target_features), "%s", tm_features);
-    /* Android's API 28 floor predates ELF TLS. Match the NDK's codegen. */
-    LLVMTargetMachineRef tm = strstr(triple, "android")
-        ? zan_create_emulated_tls_target_machine(target, triple, tm_cpu, tm_features, cg)
+    /* Android's API 28 floor predates ELF TLS. Match the NDK's codegen.
+     * Wasm catchpads require the target's native exception model. */
+    bool emulated_tls = strstr(triple, "android") != NULL;
+    LLVMTargetMachineRef tm = (emulated_tls || wasm)
+        ? zan_create_target_machine_with_options(target, triple, tm_cpu, tm_features,
+                                                 cg, emulated_tls, wasm)
         : LLVMCreateTargetMachine(target, triple, tm_cpu, tm_features,
                                   cg, LLVMRelocPIC, LLVMCodeModelDefault);
     if (!tm) {
@@ -996,6 +1000,7 @@ static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage) {
             { "fputs", "ipp" },      { "fgets", "ppip" },
             { "fread", "spssp" },    { "fwrite", "spssp" },
             { "fseek", "ipii" },     { "ftell", "ip" },
+            { "ftello", "jp" },     { "__zan_co_frame_alloc", "ps" },
             { "fflush", "ip" },      { "remove", "ip" },
             { "rename", "ipp" },     { "chdir", "ip" },
             { "getcwd", "pps" },     { "mkdir", "ipi" },

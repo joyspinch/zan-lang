@@ -177,13 +177,9 @@ void emit_async_eh_prologue(zan_irgen_t *g) {
     LLVMBasicBlockRef lpad_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.lpad");
     zan_builder_point_t lpad_pt = zan_builder_save(g);
     LLVMPositionBuilderAtEnd(g->builder, lpad_bb);
-    ensure_function_personality(g, fn);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef lp_ret_ty = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){ i8ptr, i32 }, 2, 0);
-    LLVMValueRef lp_val = LLVMBuildLandingPad(g->builder, lp_ret_ty, get_eh_personality_fn(g), 1, "lp");
-    LLVMAddClause(lp_val, LLVMConstNull(i8ptr));
-    LLVMSetCleanup(lp_val, 1);
-    LLVMBuildBr(g->builder, exc_bb);
+    emit_eh_landing_to(g, exc_bb, lp_ret_ty, NULL, true);
     zan_builder_restore(g, lpad_pt);
 
     if (g->lpad_depth < ZAN_MAX_ARMED_TRY) {

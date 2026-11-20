@@ -81,9 +81,7 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 /* 表达式推导递归深度上限（防止类型循环推导死循环） */
 #define ZAN_MAX_INFER_DEPTH 16384
 
-/* B-ID74：finally 栈与 try 武装栈已改为动态伸缩（finallys/eh_armed +
- * ZAN_TAB_ENSURE），不再有 256/1024 层静态封顶。此常量仅剩 wasm_lpad_stack
- * 一处残留使用（该栈从未被压入，待 wasm EH 落地时一并改动态）。 */
+/* Maximum depth of the native exception landing block stack. */
 #define ZAN_MAX_ARMED_TRY 1024
 
 /* Optional member descriptions are independent of lookup and invocation. */
@@ -304,14 +302,7 @@ struct zan_irgen {
     LLVMValueRef fn_cxa_allocate_exception;
     LLVMValueRef fn_cxa_throw;
 
-    LLVMBasicBlockRef wasm_lpad_stack[ZAN_MAX_ARMED_TRY];
-    int wasm_try_depth;
-    bool in_wasm_throw_op; /* WebAssembly 异常抛出中：禁止 funclet 递归展开 */
-    LLVMValueRef wasm_eh_throw_fn;
-    LLVMValueRef wasm_eh_throw_intrinsic_fn; /* @llvm.wasm.throw(i32, i8*) */
-    LLVMValueRef wasm_eh_personality_fn;/* i32 @__gxx_wasm_personality_v0(...) */
     bool wasm_eh_used;
-    LLVMValueRef wasm_eh_state_fn;      /* 异常状态查询原语：无抛出保证 */
 
     /* constructors */
     struct zan_ctor_entry {

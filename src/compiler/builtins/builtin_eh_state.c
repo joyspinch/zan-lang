@@ -244,7 +244,6 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
 
 static LLVMValueRef get_eh_state_fn(zan_irgen_t *g);
 static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g);
-static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn);
 
 static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
@@ -263,7 +262,6 @@ static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
         return g->eh_state_cached;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef state_fn = get_eh_state_fast_fn(g);
-    wasm_note_state_fn(g, state_fn);
     zan_builder_point_t pt = zan_builder_save(g);
     eh_enter_entry_block(g);
     LLVMValueRef p = zan_call2(g->builder, LLVMFunctionType(i8ptr, NULL, 0, 0),

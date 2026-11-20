@@ -766,6 +766,10 @@ static void emit_eh_propagate_tail_lpad(zan_irgen_t *g,
         if (g->lpad_depth > 0) {
             emit_lpad_cleanups(g, &g->lpad_stack[0]);
         }
+        if (g->target_is_wasm) {
+            emit_raise_exception(g);
+            return;
+        }
         LLVMValueRef cur_lp = LLVMBuildLoad2(g->builder, lp_ret_ty, lp_slot, "lp.prop");
         /* A finally-only catch-all can be the selected native handler even
          * when no Zan catch remains. Resume is only valid during cleanup

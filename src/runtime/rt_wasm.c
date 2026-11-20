@@ -1,4 +1,5 @@
 /* rt_wasm */
+#include "rt_co.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,11 +24,15 @@ void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
 __attribute__((returns_twice))
 int setjmp(void *env) { (void)env; return 0; }
 
-/* __zan_co_frame_free：wasm 单线程、无协程调度器（CPS 驱动直接跑帧），
- * 帧没有调度头可用——裸 free 即语义（A380 的守卫+检疫区属于 mt 驱动
- * 的运行时集；external_async_executor 路径引用本符号，wasm 侧由此提供
- * 定义）。 */
-void __zan_co_frame_free(void *frame) { free(frame); }
+/* The single-threaded CPS executor owns these frames. Retire their task
+ * registrations before the allocator can reuse their addresses. */
+void *__zan_co_frame_alloc(size_t size) {
+    return calloc(1, size ? size : 1);
+}
+
+void __zan_co_frame_free(void *frame) {
+    zan_task_retire(frame, free);
+}
 
 /* __zan_dict_hash（B-ID80）在 zanrt_timer.o 里（rt_timer.c，全链接路径
  * 无条件对象）——wasm 链接同时拉 timer 与本对象，这里不得重复定义。 */

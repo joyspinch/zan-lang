@@ -71,99 +71,35 @@ void emit_eh_longjmp(zan_irgen_t *g, LLVMValueRef bufp) {
 }
 
 
-/* void @llvm */
-static LLVMValueRef get_wasm_throw_intrinsic_fn(zan_irgen_t *g) {
-    if (g->wasm_eh_throw_intrinsic_fn)
-        return g->wasm_eh_throw_intrinsic_fn;
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i32t, i8ptr }, 2, 0);
-    LLVMValueRef fn = LLVMAddFunction(g->mod, "llvm.wasm.throw", ty);
-    add_enum_attr(g, fn, NULL, "noreturn");
-    g->wasm_eh_throw_intrinsic_fn = fn;
-    g->wasm_eh_used = true;
-    return fn;
-}
-
-static LLVMValueRef get_wasm_cxa_throw_fn(zan_irgen_t *g) {
-    if (g->wasm_eh_throw_fn) return g->wasm_eh_throw_fn;
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-        (LLVMTypeRef[]){ i8ptr, i8ptr, i8ptr }, 3, 0);
-    LLVMValueRef fn = LLVMAddFunction(g->mod, "__cxa_throw", ty);
-    add_enum_attr(g, fn, NULL, "noreturn");
-    g->wasm_eh_throw_fn = fn;
-    g->wasm_eh_used = true;
-    return fn;
-}
-
-/* i32 @__gxx_wasm_personality_v0( */
-static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g) {
-    if (g->wasm_eh_personality_fn) return g->wasm_eh_personality_fn;
-    LLVMTypeRef ty = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 1);
-    LLVMValueRef fn = LLVMAddFunction(g->mod, "__gxx_wasm_personality_v0", ty);
-    g->wasm_eh_personality_fn = fn;
-    g->wasm_eh_used = true;
-    return fn;
-}
-
-static void wasm_eh_set_personality(zan_irgen_t *g) {
-    if (!g->target_is_wasm || !g->current_fn) return;
-    LLVMSetPersonalityFn(g->current_fn, get_wasm_personality_fn(g));
-}
-
-static void wasm_note_state_fn(zan_irgen_t *g, LLVMValueRef state_fn) {
-    if (g->target_is_wasm) g->wasm_eh_state_fn = state_fn;
-}
-
-static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef fn = get_wasm_cxa_throw_fn(g);
-    if (LLVMGetTypeKind(LLVMTypeOf(exc_obj)) == LLVMPointerTypeKind &&
-        LLVMTypeOf(exc_obj) != i8ptr)
-        exc_obj = LLVMBuildBitCast(g->builder, exc_obj, i8ptr, "wt.exc");
-    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef lpad = g->wasm_try_depth > 0
-        ? g->wasm_lpad_stack[g->wasm_try_depth - 1] : NULL;
-    if (lpad &&
-        LLVMGetBasicBlockParent(lpad) == LLVMGetBasicBlockParent(cur) &&
-        !LLVMGetBasicBlockTerminator(cur)) {
-        LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx,
-            LLVMGetBasicBlockParent(cur), "wt.cont");
-        LLVMBuildInvoke2(g->builder, LLVMGlobalGetValueType(fn), fn,
-            (LLVMValueRef[]){ exc_obj, LLVMConstNull(i8ptr),
-                              LLVMConstNull(i8ptr) }, 3, cont, lpad, "");
-        LLVMPositionBuilderAtEnd(g->builder, cont);
-        LLVMBuildUnreachable(g->builder);
+void emit_eh_landing_to(zan_irgen_t *g, LLVMBasicBlockRef body,
+                        LLVMTypeRef native_type, LLVMValueRef native_slot,
+                        bool catches_native) {
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    ensure_function_personality(g, fn);
+    LLVMTypeRef ptr = LLVMPointerTypeInContext(g->ctx, 0);
+    if (g->target_is_wasm) {
+        g->wasm_eh_used = true;
+        LLVMBasicBlockRef pad = LLVMAppendBasicBlockInContext(g->ctx, fn, "wasm.pad");
+        LLVMValueRef cs = LLVMBuildCatchSwitch(g->builder, NULL, NULL, 1, "wasm.cs");
+        LLVMAddHandler(cs, pad);
+        LLVMPositionBuilderAtEnd(g->builder, pad);
+        LLVMValueRef args[] = { LLVMConstNull(ptr) };
+        LLVMValueRef cp = LLVMBuildCatchPad(g->builder, cs, args, 1, "wasm.cp");
+        /* Select the C++ exception tag. Zan's value and ownership live in EH state. */
+        const char *name = "llvm.wasm.get.exception";
+        unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
+        LLVMValueRef intrinsic = LLVMGetIntrinsicDeclaration(g->mod, id, NULL, 0);
+        LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(intrinsic), intrinsic,
+                       &cp, 1, "wasm.exception");
+        LLVMBuildCatchRet(g->builder, cp, body);
         return;
     }
-    LLVMValueRef inl = get_wasm_throw_intrinsic_fn(g);
-    LLVMBuildCall2(g->builder,
-        LLVMGlobalGetValueType(inl), inl,
-        (LLVMValueRef[]){ LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
-                          exc_obj }, 2, "");
-    LLVMBuildUnreachable(g->builder);
-}
-
-static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
-                                        LLVMBasicBlockRef catch_bb) {
-    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-    LLVMBasicBlockRef lpad_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, fn, "wtry.lpad");
-    LLVMBasicBlockRef pad_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, fn, "wtry.pad");
-    LLVMValueRef pers = get_wasm_personality_fn(g);
-    LLVMPositionBuilderAtEnd(g->builder, lpad_bb);
-    LLVMValueRef cs = LLVMBuildCatchSwitch(g->builder, NULL, NULL, 1, "wtry.cs");
-    LLVMAddHandler(cs, pad_bb);
-    LLVMPositionBuilderAtEnd(g->builder, pad_bb);
-    LLVMValueRef cpa[1] = { LLVMConstNull(i8ptr) }; /* catch-all */
-    LLVMValueRef cp = LLVMBuildCatchPad(g->builder, cs, cpa, 1, "wtry.cp");
-    LLVMBuildCatchRet(g->builder, cp, catch_bb);
-    (void)pers;
-    return lpad_bb;
+    LLVMValueRef lp = LLVMBuildLandingPad(g->builder, native_type,
+        get_eh_personality_fn(g), catches_native ? 1 : 0, "lp");
+    if (catches_native) LLVMAddClause(lp, LLVMConstNull(ptr));
+    LLVMSetCleanup(lp, 1);
+    if (native_slot) LLVMBuildStore(g->builder, lp, native_slot);
+    LLVMBuildBr(g->builder, body);
 }
 LLVMValueRef get_eh_tmp_top_global(zan_irgen_t *g) {
     return emit_eh_field_ptr(g, EH_F_TMPS_TOP, "eh.tmptopp");
