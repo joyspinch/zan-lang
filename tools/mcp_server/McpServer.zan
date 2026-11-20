@@ -2607,6 +2607,94 @@ class McpServer {
         return o.ToJson();
     }
 
+    static string ReferenceProject(string source, string workspace) {
+        int end = source.LastIndexOf("/");
+        while (end > workspace.Length) {
+            string dir = source.Substring(0, end);
+            string manifest = Path.Combine(dir, "zan.proj");
+            if (File.Exists(manifest) && !File.IsReparsePoint(manifest)) { return dir; }
+            end = dir.LastIndexOf("/");
+        }
+        string manifest = Path.Combine(workspace, "zan.proj");
+        if (File.Exists(manifest) && !File.IsReparsePoint(manifest)) { return workspace; }
+        return "";
+    }
+
+    static bool SkipReferenceDirectory(string name) {
+        #if WINDOWS
+        name = name.ToLower();
+        #endif
+        return name.StartsWith(".") || name == "bin" || name == "obj" || name == "build"
+            || name == "dist" || name == "publish" || name == "out" || name == "target"
+            || name == "node_modules" || name == "packages" || name == "vendor" || name == "_scratch";
+    }
+
+    static string ReferenceSourceList(string project, string source) {
+        List<string> sources = new List<string>();
+        List<string> dirs = new List<string>();
+        dirs.Add(project);
+        while (dirs.Count > 0) {
+            string dir = dirs[dirs.Count - 1];
+            dirs.RemoveAt(dirs.Count - 1);
+            List<string> children = Directory.GetDirectoryPaths(dir);
+            for (int i = 0; i < children.Count; i = i + 1) {
+                string child = children[i];
+                if (!McpServer.SkipReferenceDirectory(Path.GetFileName(child))
+                    && !File.IsReparsePoint(child) && !File.Exists(Path.Combine(child, "zan.proj"))) {
+                    dirs.Add(child);
+                }
+            }
+            List<string> files = Directory.GetFiles(dir, "*.zan");
+            for (int i = 0; i < files.Count; i = i + 1) {
+                string path = files[i];
+                if (!path.EndsWith(".zan") || File.IsReparsePoint(path)) { continue; }
+                path = Path.GetFullPath(path);
+                #if WINDOWS
+                path = path.Replace("\\", "/");
+                if (path.ToLower() == source.ToLower()) { continue; }
+                #else
+                if (path == source) { continue; }
+                #endif
+                sources.Add(path);
+            }
+        }
+        sources.Sort();
+        StringBuilder list = new StringBuilder();
+        for (int i = 0; i < sources.Count; i = i + 1) {
+            string path = sources[i];
+            if (path.Contains("\"")) {
+                throw new IOException("zanc response files cannot represent a double quote in a source path: " + path);
+            }
+            list.Append("\"" + path + "\"\n");
+        }
+        return list.ToString();
+    }
+
+    static async PendingJob RunReferenceQuery(string source, string project, List<string> argv,
+                                               string requestKey) {
+        string response = "";
+        try {
+            argv.Add(source);
+            if (project != "") {
+                string list = McpServer.ReferenceSourceList(project, source);
+                if (list != "") {
+                    string id = Guid.New();
+                    if (id == "") { throw new IOException("could not name the zanc source list"); }
+                    string temp = Path.GetTempPath();
+                    if (temp == "") { throw new IOException("system temporary directory is unavailable"); }
+                    response = Path.Combine(temp, "zan-mcp-refs-" + id + ".rsp");
+                    File.WriteAllText(response, list);
+                    argv.Add("@" + response);
+                }
+                argv.Add("--package-project");
+                argv.Add(project);
+            }
+            return await McpServer.RunProcessAsync(McpServer.zancPath, argv, "", requestKey);
+        } finally {
+            if (response != "") { File.Delete(response); }
+        }
+    }
+
     static async string FindRefsAt(JsonValue args, string requestKey) {
         if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
         if (!McpServer.ZanToolsAvailable()) { return McpServer.NoZancMsg(); }
@@ -2627,8 +2715,15 @@ class McpServer {
             return "error: semantic reference queries require zanc with --semantic-refs";
         }
 
+        string workspace = Path.GetFullPath(McpServer.root);
+        source = Path.GetFullPath(source);
+        #if WINDOWS
+        workspace = workspace.Replace("\\", "/");
+        source = source.Replace("\\", "/");
+        #endif
+        if (!workspace.EndsWith(":/")) { workspace = McpServer.TrimTrailingSep(workspace); }
+        string project = McpServer.ReferenceProject(source, workspace);
         List<string> argv = new List<string>();
-        argv.Add(source);
         argv.Add("--stdlib-path");
         argv.Add(McpServer.stdlibPath);
         if ((capabilities & McpServer.COMPILER_JSON_DIAGNOSTICS) != 0) {
@@ -2638,7 +2733,12 @@ class McpServer {
         argv.Add(source);
         argv.Add(Convert.ToString(line));
         argv.Add(Convert.ToString(col));
-        PendingJob job = await McpServer.RunProcessAsync(McpServer.zancPath, argv, "", requestKey);
+        PendingJob job;
+        try {
+            job = await McpServer.RunReferenceQuery(source, project, argv, requestKey);
+        } catch (IOException e) {
+            return "error: could not prepare semantic reference query: " + e.Message;
+        }
         if (job.status != "completed" || job.result.exitCode != 0 || job.outputTruncated) {
             JsonValue error = JsonValue.NewObject();
             error.Put("ok", JsonValue.NewBool(false));

@@ -24,7 +24,10 @@ def exercise(exe, root, workspace, zanc):
         if help_result.returncode == 0:
             options = {fields[0] for stream in (help_result.stdout, help_result.stderr)
                        for line in stream.splitlines() if (fields := line.split())}
-    with subprocess.Popen(server_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as server:
+    temp = workspace / "process temp"
+    temp.mkdir()
+    env = {**os.environ, "TMPDIR": str(temp), "TEMP": str(temp), "TMP": str(temp)}
+    with subprocess.Popen(server_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env) as server:
         responses = Queue()
 
         def receive():
@@ -145,6 +148,30 @@ def exercise(exe, root, workspace, zanc):
                     first = refs["references"][0]
                     check(first["line"] == 3 and first["col"] == 16
                           and first["length"] == 5 and first["file"].endswith("references.zan"), refs)
+
+                    project = workspace / "reference project"
+                    for directory in (project / "src", project / "build", project / "child"):
+                        directory.mkdir(parents=True)
+                    (project / "zan.proj").write_text('{"entry":"src/Query.zan"}\n', encoding="ascii")
+                    (project / "src/Query.zan").write_text(
+                        "class Query {\n    static int Pick(int value) {\n"
+                        "        return Helper.Keep(value) + value;\n    }\n}\n", encoding="ascii")
+                    (project / "src/Helper implementation.zan").write_text(
+                        "class Helper { public static int Keep(int input) { return input; } }\n",
+                        encoding="ascii")
+                    (project / "build/Generated.zan").write_text("#error generated\n", encoding="ascii")
+                    (project / "child/zan.proj").write_text("{}\n", encoding="ascii")
+                    (project / "child/Other.zan").write_text("#error nested\n", encoding="ascii")
+                    if os.name != "nt":
+                        (project / "src/Linked.zan").symlink_to(project / "child/Other.zan")
+                        (project / "linked-dir").symlink_to(project / "build", target_is_directory=True)
+                    tool("project-refs", "zan_find_refs", file="reference project/src/Query.zan",
+                         line=3, col=28)
+                    refs = result("project-refs")
+                    check(refs["ok"] and refs["symbol"]["name"] == "value"
+                          and refs["refCount"] == 2, refs)
+                    check([ref["col"] for ref in refs["references"]] == [28, 37], refs)
+                    check(not list(temp.glob("zan-mcp-refs-*.rsp")), "reference response file was left behind")
                 else:
                     unavailable = response("refs")
                     check(unavailable["isError"] and "--semantic-refs" in unavailable["content"][0]["text"],

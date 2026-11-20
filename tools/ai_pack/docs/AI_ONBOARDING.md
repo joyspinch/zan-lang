@@ -121,10 +121,13 @@ regenerated separately when it is missing.
 7. **`run_command`** — run the program or the tests.
 
 Use `zan_find_refs {file: "src/App.zan", line: 12, col: 9}` to find reads and
-writes bound to a local variable or parameter in a file that type-checks on its
-own with the SDK dependencies. Coordinates are 1-based and the column counts
-UTF-8 bytes. The server requires a writable session and a compiler that lists
-`--semantic-refs` in `--help`. For repository-wide identifier candidates and
+writes bound to a local variable or parameter. For files under a `zan.proj`
+inside the workspace, the compiler checks the nearest project's on-disk Zan sources
+and its SDK dependencies. Nested projects, build output directories, and symbolic
+links are excluded from source collection. Standalone files are checked individually.
+Coordinates are 1-based and the column counts UTF-8 bytes. The server requires a
+writable session and a compiler that lists `--semantic-refs` in `--help`.
+For repository-wide identifier candidates and
 declared subtypes, use `zan_find_refs {name: "ReadAllText"}` with the RepoMap index.
 
 Resources for whole-project context, no directory walking:
