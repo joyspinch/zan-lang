@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""SDK inventory and consumption evidence, extending the observed-build identity.
+"""SDK inventory, POSIX archives, and consumption evidence.
 
-No build, CTest, lock or scheduler acquisition happens in this helper. Run all
+No toolchain build, CTest, lock or scheduler acquisition happens in this helper. Run all
 compilation/consumption under the caller's existing shared build gate.
 """
 import argparse
+import gzip
 import importlib.util
 import json
 import os
-import shutil
 from pathlib import Path
+import re
+import shutil
+import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
+import unicodedata
 
 _spec = importlib.util.spec_from_file_location("release_source_manifest", Path(__file__).with_name("release_source_manifest.py"))
 identity = importlib.util.module_from_spec(_spec)
@@ -21,6 +27,13 @@ EXCLUDED_DIRS = {".build", "build", "_scratch", "bin", "obj", "logs", ".git", ".
 EXCLUDED_FILES = {".gitignore", ".gitattributes", ".DS_Store", "Thumbs.db"}
 EXCLUDED_SUFFIXES = {".log", ".tmp", ".bak", ".swp", ".pdb", ".ilk", ".exp", ".pyc"}
 
+
+POSIX_SOURCE_DIRS = ("stdlib", "templates", "examples")
+POSIX_COMMANDS = ("zanc", "zan-mvc", "zan-lsp", "zan-dap", "zanfmt", "zandoc", "llvm-ar")
+POSIX_RUNTIME = ("zanrt_timer.o", "zanrt_io.o", "zanrt_io_mt.o", "zanrt_sync.o", "zanrt_file.o",
+                 "zanrt_decimal.o", "zanrt_crash.o", "zanrt_mem.o", "zan_embed_api.o", "zan_inflate.o",
+                 "libzancrypto.a")
+CONSOLE_TEMPLATE = "console/console-args"
 
 GENERATED_DRIVERS = identity.SDK_NATIVE_OWNERS
 
@@ -199,13 +212,140 @@ def verify_sdk(sdk):
     return manifest
 
 
-def run_selfhost_probe_step(command, work, env, log, timeout):
+def stage_posix_sources(repo, sdk):
+    root = Path(os.fsdecode(identity.git(repo, "rev-parse", "--show-toplevel")).rstrip("\r\n")).resolve()
+    if root != repo:
+        raise ValueError("POSIX SDK source root must be the Git worktree root")
+    # Use the same file scope as the observed release build. Keep tracked
+    # scaffold files and native assets even if they match an ignore rule.
+    paths = identity.git(repo, "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+                         "--", "VERSION", *POSIX_SOURCE_DIRS)
+    canonical_paths = {}
+    for raw in sorted(set(paths.split(b"\0")) - {b""}):
+        relative = os.fsdecode(raw)
+        if safe_relative(relative) != relative:
+            raise ValueError("Invalid SDK source path: " + relative)
+        check_posix_path_alias(relative, canonical_paths)
+        source = repo / relative
+        if not stat.S_ISREG(source.lstat().st_mode) or source.resolve(strict=True) != source:
+            raise ValueError("SDK source must be a regular file without symlink ancestors: " + relative)
+        target = sdk / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(source, target)
+
+
+def check_posix_path_alias(relative, canonical_paths):
+    # Canonical caseless comparison also covers paths on case-insensitive APFS.
+    canonical = unicodedata.normalize("NFD", unicodedata.normalize("NFD", relative).casefold())
+    while relative:
+        original = canonical_paths.setdefault(canonical, relative)
+        if original != relative:
+            raise ValueError(f"Aliased SDK archive paths: {original!r} and {relative!r}")
+        # Tar members can imply directories without listing them explicitly.
+        relative = relative.rpartition("/")[0]
+        canonical = canonical.rpartition("/")[0]
+
+
+def posix_archive_metadata(archive):
+    match = re.fullmatch(r"zan-ide-([0-9A-Za-z][0-9A-Za-z.+-]*)-(linux|macos)-(x64|arm64)[.]tar[.]gz",
+                         archive.name)
+    if not match:
+        raise ValueError("Invalid POSIX SDK archive name: " + archive.name)
+    return match[1], match[2]
+
+
+def verify_posix_layout(sdk, version):
+    for name in POSIX_SOURCE_DIRS:
+        if not (sdk / name).is_dir():
+            raise ValueError("Required SDK directory missing: " + name)
+    for name in ("VERSION", "README.txt", *("toolchain/" + name for name in POSIX_COMMANDS + POSIX_RUNTIME)):
+        path = sdk / name
+        if not path.is_file() or not path.stat().st_size:
+            raise ValueError("Required SDK file missing or empty: " + name)
+    if "".join((sdk / "VERSION").read_text(encoding="utf-8").split()) != version:
+        raise ValueError("SDK VERSION does not match the archive name")
+
+
+def posix_checksum(archive, record):
+    return f"{record['sha256']}  {archive.name}\n".encode("ascii")
+
+
+def write_posix_archive(sdk, archive):
+    version, _ = posix_archive_metadata(archive)
+    if sdk.name != archive.name.removesuffix(".tar.gz") or sdk.is_symlink():
+        raise ValueError("SDK directory must match the archive name")
+    verify_posix_layout(sdk, version)
+    epoch = os.environ.get("SOURCE_DATE_EPOCH", "0")
+    if not re.fullmatch(r"[0-9]+", epoch):
+        raise ValueError("SOURCE_DATE_EPOCH must be a nonnegative integer")
+    timestamp = int(epoch)
+    paths = sorted(sdk.rglob("*"), key=lambda path: path.relative_to(sdk).as_posix())
+    canonical_paths = {}
+    with archive.open("xb") as stream, gzip.GzipFile(filename="", fileobj=stream, mode="wb",
+                                                     mtime=0, compresslevel=9) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+            for path in (sdk, *paths):
+                relative = path.relative_to(sdk.parent).as_posix()
+                if safe_relative(relative) != relative:
+                    raise ValueError("Invalid SDK archive member: " + relative)
+                check_posix_path_alias(relative, canonical_paths)
+                info = tarfile.TarInfo(relative)
+                info.mtime = timestamp
+                status = path.lstat()
+                if stat.S_ISDIR(status.st_mode):
+                    info.type, info.mode = tarfile.DIRTYPE, 0o755
+                    tar.addfile(info)
+                elif stat.S_ISREG(status.st_mode):
+                    command = path.parent == sdk / "toolchain" and path.name in POSIX_COMMANDS
+                    executable = status.st_mode & 0o111
+                    if command and os.name == "posix" and not executable:
+                        raise ValueError("SDK command is not executable: " + relative)
+                    info.size = status.st_size
+                    info.mode = 0o755 if command or executable else 0o644
+                    with path.open("rb") as payload:
+                        tar.addfile(info, payload)
+                else:
+                    raise ValueError("Unsupported SDK archive member: " + relative)
+    archive.with_suffix(".gz.sha256").write_bytes(posix_checksum(archive, identity.file_identity(archive)))
+
+
+def extract_posix_archive(archive, destination):
+    version, _ = posix_archive_metadata(archive)
+    record = identity.required_identity(archive)
+    if archive.with_suffix(".gz.sha256").read_bytes() != posix_checksum(archive, record):
+        raise ValueError("SDK archive checksum mismatch: " + archive.name)
+    name = archive.name.removesuffix(".tar.gz")
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        seen = set()
+        canonical_paths = {}
+        for member in members:
+            relative = member.name
+            if (safe_relative(relative) != relative or relative.split("/", 1)[0] != name
+                    or relative in seen or member.type not in (tarfile.REGTYPE, tarfile.DIRTYPE)
+                    or (relative == name and not member.isdir())):
+                raise ValueError("Invalid SDK archive member: " + relative)
+            seen.add(relative)
+            check_posix_path_alias(relative, canonical_paths)
+        if name not in seen:
+            raise ValueError("SDK archive root directory missing: " + name)
+        for command in POSIX_COMMANDS:
+            path = f"{name}/toolchain/{command}"
+            if path in seen and not tar.getmember(path).mode & 0o111:
+                raise ValueError("SDK command is not executable: " + path)
+        tar.extractall(destination, members=members, filter="data")
+    sdk = destination / name
+    verify_posix_layout(sdk, version)
+    return sdk, record
+
+
+def run_sdk_probe_step(command, work, env, log, timeout):
     process = subprocess.run(command, input="", text=True, encoding="utf-8", errors="replace",
                              capture_output=True, timeout=timeout, cwd=work, env=env)
     identity.atomic_json(log, {"command": command, "exit_code": process.returncode,
                                "stdout": process.stdout, "stderr": process.stderr})
     if process.returncode != 0:
-        raise ValueError(f"Staged self-hosted compiler probe failed ({process.returncode}); see {log}")
+        raise ValueError(f"SDK probe failed ({process.returncode}); see {log}")
     return process.stdout
 
 
@@ -224,17 +364,217 @@ def consume_selfhost(sdk, output):
            "TEMP": str(work), "TMP": str(work)}
     compile_log = work / "compile.json"
     compiler = sdk / "toolchain/zanc-selfhost.exe"
-    run_selfhost_probe_step([str(compiler), str(source), "-o", str(artifact)], work, env, compile_log, 120)
+    run_sdk_probe_step([str(compiler), str(source), "-o", str(artifact)], work, env, compile_log, 120)
     executable = identity.required_identity(artifact)
     if not executable["size"]:
         raise ValueError("Staged self-hosted compiler produced an empty executable")
 
     runtime_log = work / "runtime.json"
-    stdout = run_selfhost_probe_step([str(artifact)], work, env, runtime_log, 30)
+    stdout = run_sdk_probe_step([str(artifact)], work, env, runtime_log, 30)
     if stdout.strip() != token:
         raise ValueError(f"Staged self-hosted compiler probe produced unexpected output; see {runtime_log}")
     return {"artifact": executable, "compile_log": identity.required_identity(compile_log),
             "runtime_log": identity.required_identity(runtime_log)}
+
+
+def consume_templates(sdk, output, compiler, selection, env=None, cmake=None):
+    root = Path(__file__).resolve().parents[1]
+    command = [sys.executable, "-I", "-B", str(root / "tests/run_template_acceptance.py"),
+               "--root", str(sdk), "--zanc", str(compiler), "--stdlib", str(sdk / "stdlib"),
+               "--driver-dir", str(sdk / "toolchain"), "--output", str(output), "--filter", selection,
+               "--workers", "1"]
+    if cmake:
+        command.extend(("--cmake", cmake))
+    subprocess.run(command, check=True, env=env)
+    results = load(output / "results.json")
+    rows = results["rows"]
+    if (not results.get("complete") or not rows or results["selected"] != len(rows)
+            or any(row.get("status") != "pass" for row in rows)):
+        raise ValueError("SDK consumption did not execute all selected templates")
+    runs = []
+    for row in rows:
+        if row["template"] != CONSOLE_TEMPLATE:
+            continue
+        artifact = Path(row["result"]["artifact"])
+        token = "sdk-stage-consumption-probe"
+        log = output / "console-args-runtime.json"
+        stdout = run_sdk_probe_step([str(artifact), token], artifact.parent, env, log, 30)
+        if token not in stdout:
+            raise ValueError("SDK console-args runtime did not preserve the supplied argument; see " + str(log))
+        runs.append({"template": row["template"], "artifact": identity.required_identity(artifact),
+                     "log": identity.required_identity(log)})
+    return command, results["selected"], runs
+
+
+def macos_install_names(binary, output, env):
+    log = output / (binary.name + ".json")
+    stdout = run_sdk_probe_step(["/usr/bin/otool", "-arch", "all", "-L", str(binary)],
+                                output, env, log, 30)
+    lines = stdout.splitlines()
+    heading = re.compile(re.escape(str(binary)) + r"(?: \(architecture [^)]+\))?:")
+    if not lines or not heading.fullmatch(lines[0]):
+        raise ValueError(f"Missing Mach-O dependency listing for {binary.name}; see {log}")
+    names = set()
+    for line in lines:
+        if heading.fullmatch(line):
+            continue
+        dependency, marker, _ = line.strip().rpartition(" (compatibility version ")
+        if not marker or not dependency:
+            raise ValueError(f"Unrecognized otool output for {binary.name}; see {log}")
+        names.add(dependency)
+    return sorted(names)
+
+
+def macos_system_library(dependency):
+    return dependency.startswith(("/usr/lib/", "/System/Library/")) and ".." not in dependency.split("/")
+
+
+def resolve_macos_library(dependency, original, library_dirs):
+    name = dependency.rsplit("/", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+[.]dylib", name):
+        raise ValueError(f"Unsupported macOS SDK dylib install name: {dependency}")
+    if Path(dependency).is_absolute():
+        candidates = [Path(dependency)]
+    elif dependency == "@rpath/" + name:
+        candidates = [directory / name for directory in library_dirs]
+    elif dependency.startswith("@loader_path/"):
+        candidates = [original.parent / dependency.removeprefix("@loader_path/")]
+    else:
+        candidates = []
+    sources = {candidate.resolve() for candidate in candidates if candidate.is_file()}
+    if len(sources) == 1:
+        source = sources.pop()
+        if any(source.is_relative_to(directory) for directory in library_dirs):
+            return name, source
+    raise ValueError("macOS SDK dylib must resolve uniquely within the configured library directories: "
+                     f"{original.name} -> {dependency}")
+
+
+def relocate_macos_commands(sdk, build, archiver, library_dirs):
+    toolchain = sdk / "toolchain"
+    lib = toolchain / "lib"
+    library_dirs = {directory.resolve(strict=True) for directory in library_dirs}
+    images = [(archiver.resolve() if name == "llvm-ar" else (build / name).resolve(), toolchain / name)
+              for name in POSIX_COMMANDS]
+    staged_libraries = {}
+    used_library_dirs = set()
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    with tempfile.TemporaryDirectory(prefix="macho-", dir=sdk.parent) as temporary:
+        logs = Path(temporary)
+        for original, binary in images:
+            library = binary.parent == lib
+            relative_prefix = "@loader_path/" if library else "@loader_path/lib/"
+            changes = []
+            for dependency in macos_install_names(binary, logs, env):
+                if macos_system_library(dependency):
+                    continue
+                name, source = resolve_macos_library(dependency, original, library_dirs)
+                if library and source == original:  # otool -L includes LC_ID_DYLIB.
+                    continue
+                if source not in staged_libraries:
+                    target = lib / name
+                    lib.mkdir(exist_ok=True)
+                    if target.exists():
+                        raise ValueError(f"Conflicting macOS SDK dylib name: {name}")
+                    shutil.copy(source, target)
+                    staged_libraries[source] = target
+                    used_library_dirs.update(directory for directory in library_dirs if source.is_relative_to(directory))
+                    images.append((source, target))
+                changes.extend(("-change", dependency, relative_prefix + staged_libraries[source].name))
+            if library:
+                changes.extend(("-id", relative_prefix + binary.name))
+            if changes:
+                # Reclaim the original search-path load commands for longer
+                # loader-relative names. The staged closure uses no rpaths.
+                load_log = logs / (binary.name + ".load.json")
+                loads = run_sdk_probe_step(["/usr/bin/otool", "-arch", "all", "-l", str(binary)],
+                                           logs, env, load_log, 30)
+                rpaths = re.findall(r"(?m)^\s*cmd LC_RPATH\s*\n\s*cmdsize \d+\s*\n\s*path (.+) \(offset \d+\)$", loads)
+                for rpath in sorted(set(rpaths)):
+                    changes.extend(("-delete_rpath", rpath))
+                binary.chmod(binary.stat().st_mode | stat.S_IWUSR)
+                subprocess.run(["/usr/bin/install_name_tool", *changes, str(binary)], env=env, check=True, timeout=30)
+                subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(binary)],
+                               env=env, check=True, timeout=60)
+                subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(binary)],
+                               env=env, check=True, timeout=60)
+        audit_macos_commands(sdk, logs / "audit", env)
+    for directory in sorted(used_library_dirs):
+        prefix = directory.parent
+        notices = [path for path in prefix.iterdir()
+                   if path.is_file() and path.name.upper().startswith(("LICENSE", "COPYING", "NOTICE"))]
+        if not notices:
+            raise ValueError(f"macOS SDK dependency notices missing from {prefix}")
+        # Homebrew's cellar path ends in the version, beneath the formula name.
+        package = prefix.parent.name if prefix.name[:1].isdigit() else prefix.name
+        target = lib / "licenses" / package
+        target.mkdir(parents=True)
+        for notice in notices:
+            shutil.copy(notice, target / notice.name)
+
+
+def audit_macos_commands(sdk, output, env):
+    output.mkdir()
+    toolchain = sdk / "toolchain"
+    lib = toolchain / "lib"
+    images = [toolchain / name for name in POSIX_COMMANDS]
+    seen = set(images)
+    external = set()
+    for binary in images:
+        prefix = "@loader_path/" if binary.parent == lib else "@loader_path/lib/"
+        for dependency in macos_install_names(binary, output, env):
+            if macos_system_library(dependency):
+                continue
+            name = dependency.removeprefix(prefix)
+            target = lib / name
+            if (dependency == prefix + name and re.fullmatch(r"[A-Za-z0-9_.+-]+[.]dylib", name)
+                    and target.is_file() and target.resolve() == target):
+                if target not in seen:
+                    seen.add(target)
+                    images.append(target)
+            else:
+                external.add(f"{binary.relative_to(sdk).as_posix()} -> {dependency}")
+    if external:
+        raise ValueError("macOS SDK commands reference unbundled non-system dylibs:\n  " + "\n  ".join(sorted(external)))
+
+
+def consume_archive(archive, output):
+    _, platform = posix_archive_metadata(archive)
+    output.mkdir(parents=True, exist_ok=False)
+    home, temp = output / "home", output / "tmp"
+    home.mkdir()
+    temp.mkdir()
+    env = {"HOME": str(home), "TMPDIR": str(temp), "PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    acceptance = output / "acceptance"
+    with tempfile.TemporaryDirectory(prefix="extract-", dir=output) as extracted:
+        sdk, record = extract_posix_archive(archive, Path(extracted))
+        if platform == "macos":
+            audit_macos_commands(sdk, output / "macho-dependencies", env)
+        cmake = shutil.which("cmake")
+        if not cmake:
+            raise ValueError("SDK template acceptance requires CMake")
+        compiler = sdk / "toolchain/zanc"
+        command, selected, runs = consume_templates(sdk, acceptance, compiler, "^console/console-args$", env, cmake)
+        if selected != 1 or len(runs) != 1:
+            raise ValueError("SDK console-args template did not compile and run")
+        work = output / "static-library"
+        work.mkdir()
+        source, artifact = work / "library.zan", work / "libsdk-probe.a"
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "tests/emit_lib/lib.zan", source)
+        archiver = sdk / "toolchain/llvm-ar"
+        compile_log, members_log = work / "compile.json", work / "members.json"
+        # Exercise zanc's default discovery of llvm-ar beside the compiler.
+        run_sdk_probe_step([str(compiler), str(source), "--auto-stdlib", "--no-packages", "-o", str(artifact)],
+                           work, env, compile_log, 120)
+        members = run_sdk_probe_step([str(archiver), "t", str(artifact)], work, env, members_log, 30)
+        if not members.strip():
+            raise ValueError("SDK static library has no members; see " + str(members_log))
+    identity.atomic_json(output / "sdk-consumption.json", {"schema": SCHEMA, "phase": "archive-consumed",
+        "archive": record, "command": command, "selected": selected, "runs": runs,
+        "results": identity.required_identity(acceptance / "results.json"),
+        "static_library": {"artifact": identity.required_identity(artifact),
+                           "compile_log": identity.required_identity(compile_log),
+                           "members_log": identity.required_identity(members_log)}})
 
 
 def consume(args):
@@ -245,29 +585,7 @@ def consume(args):
     output = args.output.resolve()
     if output.exists():
         raise ValueError("Consumption output must be a new directory")
-    root = Path(__file__).resolve().parents[1]
-    command = [sys.executable, "-I", "-B", str(root / "tests/run_template_acceptance.py"),
-               "--root", str(sdk), "--zanc", str(sdk / "toolchain/zanc.exe"),
-               "--stdlib", str(sdk / "stdlib"), "--driver-dir", str(sdk / "toolchain"),
-               "--output", str(output), "--filter", args.filter, "--workers", "1"]
-    subprocess.run(command, check=True)
-    results = load(output / "results.json")
-    if not results.get("complete") or not results.get("selected") or any(row.get("status") != "pass" for row in results["rows"]):
-        raise ValueError("SDK consumption did not execute all selected templates")
-    runs = []
-    for row in results["rows"]:
-        if row["template"] != "console/console-args":
-            continue
-        artifact = Path(row["result"]["artifact"])
-        token = "sdk-stage-consumption-probe"
-        process = subprocess.run([str(artifact), token], input="", text=True, encoding="utf-8", errors="replace",
-                                 capture_output=True, timeout=30, cwd=artifact.parent)
-        log = output / "console-args-runtime.json"
-        identity.atomic_json(log, {"exit_code": process.returncode, "stdout": process.stdout, "stderr": process.stderr})
-        if process.returncode != 0 or token not in process.stdout:
-            raise ValueError("Staged SDK console-args runtime did not preserve the supplied argument")
-        runs.append({"template": row["template"], "artifact": identity.required_identity(artifact),
-                     "log": identity.required_identity(log)})
+    command, selected, runs = consume_templates(sdk, output, sdk / "toolchain/zanc.exe", args.filter)
     selfhost = consume_selfhost(sdk, output)
     after = verify_sdk(sdk)
     if after != manifest:
@@ -275,18 +593,22 @@ def consume(args):
     identity.atomic_json(receipt, {"schema": SCHEMA, "phase": "templates-consumed",
         "manifest_sha256": manifest["manifest_sha256"], "build_identity_sha256": manifest["build_identity_sha256"],
         "validation": manifest["validation"], "command": command,
-        "results": identity.required_identity(output / "results.json"), "selected": results["selected"],
+        "results": identity.required_identity(output / "results.json"), "selected": selected,
         "runs": runs, "selfhost": selfhost})
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("gallery-plan", "native-inputs", "inputs", "copy-sources", "preflight", "seal", "verify", "consume"))
+    parser.add_argument("mode", choices=("gallery-plan", "native-inputs", "inputs", "copy-sources",
+                                         "preflight", "seal", "verify", "consume", "stage-posix-sources",
+                                         "relocate-macos", "write-archive", "consume-archive"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--build", type=Path)
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--ticket", type=Path)
     parser.add_argument("--sdk", type=Path)
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--archiver", type=Path)
     parser.add_argument("--local-stage", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--filter", default="^console/console-args$")
@@ -351,6 +673,22 @@ def main():
                         "files": inventory(args.sdk)}
             manifest["manifest_sha256"] = identity.digest(manifest)
             identity.atomic_json(args.sdk / "sdk-manifest.json", manifest)
+    elif args.mode == "stage-posix-sources":
+        if not args.sdk:
+            parser.error("stage-posix-sources requires --sdk")
+        stage_posix_sources(args.repo.resolve(), args.sdk.absolute())
+    elif args.mode == "relocate-macos":
+        if sys.platform != "darwin" or not args.sdk or not args.build or not args.archiver:
+            parser.error("relocate-macos requires macOS and --sdk, --build, --archiver")
+        relocate_macos_commands(args.sdk.resolve(), args.build.resolve(), args.archiver, args.native_dir)
+    elif args.mode == "write-archive":
+        if not args.sdk or not args.archive:
+            parser.error("write-archive requires --sdk --archive")
+        write_posix_archive(args.sdk.absolute(), args.archive.absolute())
+    elif args.mode == "consume-archive":
+        if not args.archive or not args.output:
+            parser.error("consume-archive requires --archive --output")
+        consume_archive(args.archive.absolute(), args.output.resolve())
     elif args.mode == "verify":
         verify_sdk(args.sdk.resolve())
     else:
@@ -364,6 +702,6 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, tarfile.TarError) as error:
         print("SDK stage failed: %s" % error, file=sys.stderr)
         raise SystemExit(1)

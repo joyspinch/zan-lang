@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -470,6 +471,312 @@ class SdkStageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected output"):
                 SDK.consume(args)
             self.assertFalse(receipt.exists())
+
+    def posix_payload(self, sdk, reverse=False):
+        files = {"VERSION": "1.2.3\n", "README.txt": "SDK\n", "stdlib/System/Test.zan": "stdlib fixture",
+                 "templates/console/console-args/zan.proj": "entry = src/main.zan\n",
+                 "examples/html_gallery/zan.proj": "gallery fixture"}
+        files.update({"toolchain/" + name: name for name in SDK.POSIX_COMMANDS + SDK.POSIX_RUNTIME})
+        for name in reversed(files) if reverse else files:
+            path = self.write(sdk / name, files[name])
+            mode = 0o711 if name.removeprefix("toolchain/") in SDK.POSIX_COMMANDS else 0o600
+            path.chmod(mode if reverse else mode | 0o044)
+            timestamp = 1700000000 if reverse else 1650000000
+            os.utime(path, (timestamp, timestamp))
+        (sdk / "templates/empty").mkdir()
+
+    def test_posix_archive_is_reproducible_and_keeps_sdk_layout(self):
+        name = "zan-ide-1.2.3-linux-x64"
+        archives = []
+        for index in (0, 1):
+            sdk = self.base / str(index) / name
+            self.posix_payload(sdk, reverse=bool(index))
+            archive = sdk.with_name(sdk.name + ".tar.gz")
+            with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "12345"}):
+                SDK.write_posix_archive(sdk, archive)
+            archives.append(archive)
+        first, second = archives
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(first.with_suffix(".gz.sha256").read_bytes(), second.with_suffix(".gz.sha256").read_bytes())
+        self.assertEqual(first.read_bytes()[:10], bytes.fromhex("1f8b08000000000002ff"))
+        with tarfile.open(first) as tar:
+            self.assertEqual(tar.getnames(), sorted(tar.getnames()))
+            self.assertTrue(all((m.uid, m.gid, m.uname, m.gname, m.mtime) == (0, 0, "", "", 12345)
+                                for m in tar.getmembers()))
+            self.assertEqual(tar.getmember(name + "/toolchain/zanc").mode, 0o755)
+            self.assertEqual(tar.getmember(name + "/stdlib/System/Test.zan").mode, 0o644)
+        sdk, record = SDK.extract_posix_archive(first, self.base / "unpacked")
+        self.assertEqual(sdk.name, name)
+        self.assertTrue((sdk / "templates/empty").is_dir())
+        self.assertEqual((sdk / "stdlib/System/Test.zan").read_text(), "stdlib fixture")
+        self.assertEqual(record["sha256"], SDK.identity.file_identity(first)["sha256"])
+
+    def test_posix_archive_rejects_bad_checksum_incomplete_payload_and_unsafe_member(self):
+        name = "zan-ide-1.2.3-macos-arm64"
+        sdk = self.base / name
+        archive = self.base / (name + ".tar.gz")
+        self.posix_payload(sdk)
+        runtime = sdk / "toolchain/zan_embed_api.o"
+        runtime.unlink()
+        with self.assertRaisesRegex(ValueError, "zan_embed_api[.]o"):
+            SDK.write_posix_archive(sdk, archive)
+        self.assertFalse(archive.exists())
+        self.write(runtime)
+        compiler = sdk / "toolchain/zanc"
+        compiler.unlink()
+        with self.assertRaisesRegex(ValueError, "toolchain/zanc"):
+            SDK.write_posix_archive(sdk, archive)
+        self.write(compiler).chmod(0o755)
+        SDK.write_posix_archive(sdk, archive)
+        checksum = archive.with_suffix(".gz.sha256")
+        checksum.write_bytes(b"wrong checksum\n")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            SDK.extract_posix_archive(archive, self.base / "bad-checksum")
+        with tarfile.open(archive, "w:gz") as tar:
+            entry = tarfile.TarInfo(name + "/../escaped")
+            tar.addfile(entry)
+        checksum.write_bytes(SDK.posix_checksum(archive, SDK.identity.file_identity(archive)))
+        with self.assertRaisesRegex(ValueError, "Unsafe SDK manifest path"):
+            SDK.extract_posix_archive(archive, self.base / "bad-path")
+        self.assertFalse((self.base / "bad-path/escaped").exists())
+
+    def test_posix_archive_rejects_case_and_unicode_path_aliases(self):
+        name = "zan-ide-1.2.3-macos-arm64"
+        archive = self.base / (name + ".tar.gz")
+        output = self.base / "unpacked"
+        for first, second in (("toolchain/zanc", "toolchain/ZANC"),
+                              ("examples/caf\u00e9.zan", "examples/cafe\u0301.zan"),
+                              ("templates/Console/one", "templates/console/two")):
+            with self.subTest(first=first, second=second):
+                with tarfile.open(archive, "w:gz") as tar:
+                    root = tarfile.TarInfo(name)
+                    root.type = tarfile.DIRTYPE
+                    tar.addfile(root)
+                    for path in (first, second):
+                        tar.addfile(tarfile.TarInfo(f"{name}/{path}"))
+                checksum = archive.with_suffix(".gz.sha256")
+                checksum.write_bytes(SDK.posix_checksum(archive, SDK.identity.file_identity(archive)))
+                with self.assertRaisesRegex(ValueError, "Aliased SDK archive paths"):
+                    SDK.extract_posix_archive(archive, output)
+                self.assertFalse(output.exists())
+
+    def test_macos_archive_audits_every_command_before_running_probes(self):
+        sdk = self.base / "zan-ide-1.2.3-macos-arm64"
+        self.posix_payload(sdk)
+        archive = sdk.with_name(sdk.name + ".tar.gz")
+        SDK.write_posix_archive(sdk, archive)
+        output = self.base / "consumption"
+        version = " (compatibility version 1.0.0, current version 1.0.0)"
+        zstd = "/opt/homebrew/opt/zstd/lib/libzstd.1.dylib"
+        llvm = "@rpath/libLLVM.dylib"
+
+        def run(command, **options):
+            self.assertEqual(command[:4], ["/usr/bin/otool", "-arch", "all", "-L"])
+            self.assertEqual(options["env"]["PATH"], "/usr/bin:/bin")
+            self.assertNotIn("DYLD_LIBRARY_PATH", options["env"])
+            binary = Path(command[4])
+            self.assertEqual(binary.parents[2].parent, output)
+            system = "/usr/lib/libSystem.B.dylib" + version
+            lines = [f"{binary}:", f"\t{system}"]
+            if binary.name == "llvm-ar":
+                lines = [f"{binary} (architecture arm64):", f"\t{system}",
+                         f"{binary} (architecture x86_64):", f"\t{llvm}{version}"]
+            if binary.name == "zanc":
+                lines.append(f"\t{zstd}{version}")
+            return subprocess.CompletedProcess(command, 0, "\n".join(lines) + "\n", "")
+
+        with mock.patch.object(SDK.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {"DYLD_LIBRARY_PATH": "/opt/homebrew/lib"}), \
+                self.assertRaisesRegex(ValueError, "non-system dylibs") as failure:
+            SDK.consume_archive(archive, output)
+        self.assertEqual(str(failure.exception).splitlines()[1:],
+                         [f"  toolchain/llvm-ar -> {llvm}", f"  toolchain/zanc -> {zstd}"])
+        self.assertEqual({log.stem for log in (output / "macho-dependencies").glob("*.json")},
+                         set(SDK.POSIX_COMMANDS))
+        self.assertFalse((output / "acceptance").exists())
+        self.assertFalse((output / "sdk-consumption.json").exists())
+
+    def test_macos_relocation_stages_and_signs_transitive_libraries(self):
+        sdk = self.base / "sdk"
+        self.posix_payload(sdk)
+        archiver = self.write(self.base / "llvm/bin/llvm-ar")
+        llvm = self.write(self.base / "llvm/lib/libLLVM.dylib", "LLVM runtime")
+        zstd = self.write(self.base / "zstd/lib/libzstd.1.dylib", "zstd runtime")
+        self.write(self.base / "llvm/LICENSE.TXT", "LLVM license")
+        self.write(self.base / "zstd/LICENSE", "zstd license")
+        system = "/usr/lib/libSystem.B.dylib"
+        llvm_id = "@rpath/libLLVM.dylib"
+        dependencies = {"llvm-ar": [llvm_id], llvm.name: [llvm_id, zstd.as_posix()], zstd.name: [zstd.as_posix()]}
+        original = {file: file.read_bytes() for file in (archiver, llvm, zstd)}
+        signed, verified = set(), set()
+        compatibility = " (compatibility version 1.0.0, current version 1.0.0)"
+
+        def run(command, **options):
+            binary = Path(command[-1])
+            self.assertTrue(binary.is_relative_to(sdk / "toolchain"))
+            self.assertNotIn("DYLD_LIBRARY_PATH", options["env"])
+            if command[0] == "/usr/bin/otool":
+                if command[3] == "-l":
+                    stdout = ("Load command 0\n          cmd LC_RPATH\n      cmdsize 40\n"
+                              "         path @loader_path/../lib (offset 12)\n")
+                else:
+                    names = [system, *dependencies.get(binary.name, [])]
+                    stdout = f"{binary}:\n" + "".join(f"\t{name}{compatibility}\n" for name in names)
+                return subprocess.CompletedProcess(command, 0, stdout, "")
+            if command[0] == "/usr/bin/install_name_tool":
+                changes = iter(command[1:-1])
+                for flag in changes:
+                    if flag == "-change":
+                        old, new = next(changes), next(changes)
+                        dependencies[binary.name].remove(old)
+                        dependencies[binary.name].append(new)
+                    elif flag == "-id":
+                        dependencies[binary.name][0] = next(changes)
+                    else:
+                        self.assertEqual(flag, "-delete_rpath")
+                        self.assertEqual(next(changes), "@loader_path/../lib")
+            else:
+                self.assertEqual(command[0], "/usr/bin/codesign")
+                if command[1:4] == ["--force", "--sign", "-"]:
+                    signed.add(binary.name)
+                else:
+                    self.assertEqual(command[1:-1], ["--verify", "--strict"])
+                    self.assertIn(binary.name, signed)
+                    verified.add(binary.name)
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.object(SDK.subprocess, "run", side_effect=run):
+            SDK.relocate_macos_commands(sdk, self.base / "build", archiver, [llvm.parent, zstd.parent])
+            lib = sdk / "toolchain/lib"
+            self.assertEqual({file.name: file.read_bytes() for file in lib.glob("*.dylib")},
+                             {llvm.name: original[llvm], zstd.name: original[zstd]})
+            self.assertEqual((lib / "licenses/llvm/LICENSE.TXT").read_text(), "LLVM license")
+            self.assertEqual((lib / "licenses/zstd/LICENSE").read_text(), "zstd license")
+            self.assertEqual(dependencies["llvm-ar"], ["@loader_path/lib/libLLVM.dylib"])
+            self.assertEqual(dependencies[llvm.name], ["@loader_path/libLLVM.dylib", "@loader_path/libzstd.1.dylib"])
+            self.assertEqual(signed, {"llvm-ar", llvm.name, zstd.name})
+            self.assertEqual(verified, signed)
+            self.assertEqual({file: file.read_bytes() for file in original}, original)
+            foreign = self.write(self.base / "unapproved/libForeign.dylib")
+            with self.assertRaisesRegex(ValueError, "configured library directories"):
+                SDK.resolve_macos_library(foreign.as_posix(), llvm, {llvm.parent, zstd.parent})
+            dependencies[zstd.name].append("@loader_path/missing.dylib")
+            with self.assertRaisesRegex(ValueError, "libzstd[.]1[.]dylib -> @loader_path/missing[.]dylib"):
+                SDK.audit_macos_commands(sdk, self.base / "audit", {})
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("cmake"), "POSIX shell and CMake contract")
+    def test_posix_shell_packaging_and_archive_consumption(self):
+        repo = self.base / "fixture"
+        self.posix_payload(repo)
+        scripts = repo / "scripts"
+        scripts.mkdir()
+        for name in ("package_bundle.sh", "sdk_stage_manifest.py", "release_source_manifest.py"):
+            shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+        build = repo / "build"
+        (repo / "toolchain").rename(build)
+        self.write(build / "linux-riscv64/sysroot-marker")
+        template = repo / "templates/console/console-args"
+        self.write(template / "src/main.zan", "template {{NAME}}\n")
+        self.write(repo / ".gitignore", "/build/\n/out/\n*.db\n")
+        self.write(template / ".gitignore", "/scratch/\n")
+        self.write(template / "seed.db", "tracked template asset")
+        self.write(template / "work.db", "ignored local database")
+        self.write(template / "scratch/upload.bin", "ignored local upload")
+        self.call("git", "-C", repo, "init", "-q")
+        self.call("git", "-C", repo, "add", ".gitignore", "VERSION", "stdlib", "templates")
+        self.call("git", "-C", repo, "add", "-f", "templates/console/console-args/seed.db")
+        self.write(build / "llvm-ar", r"""#!/bin/sh
+set -eu
+case "$1" in
+  --format=gnu) test "$2" = rcsD; test -s "$4"; printf 'fixture indexed archive\n' > "$3" ;;
+  t) test -s "$2"; printf 'fixture.o\n' ;;
+  *) exit 1 ;;
+esac
+""").chmod(0o755)
+        compiler = r"""#!/bin/sh
+set -eu
+sdk=$(cd "$(dirname "$0")/.." && pwd)
+test -f "$sdk/stdlib/System/Test.zan"
+test -f "$sdk/toolchain/zanrt_timer.o"
+test "$PATH" = /usr/bin:/bin
+test -z "${ZAN_LLVM_AR:-}${LLVM_AR:-}${LD_LIBRARY_PATH:-}${DYLD_LIBRARY_PATH:-}${ZAN_CLANG:-}"
+test -d "$HOME"
+if [ "$2" = --auto-stdlib ]; then
+    test "$4" = -o
+    "$sdk/toolchain/llvm-ar" --format=gnu rcsD "$5" "$1"
+else
+    test "$2" = -o
+    test "$4" = --stdlib-path
+    test "$5" = "$sdk/stdlib"
+    grep -qx 'template TplProbe' "$1"
+    printf '%s\n' '#!/bin/sh' 'echo "$1"' > "$3"
+    chmod +x "$3"
+fi
+"""
+        self.write(build / "zanc", compiler).chmod(0o755)
+        env = dict(os.environ, LLVM_AR="developer-llvm-ar", ZAN_CLANG="developer-clang",
+                   LD_LIBRARY_PATH="/developer/lib", DYLD_LIBRARY_PATH="/developer/lib", SOURCE_DATE_EPOCH="0")
+        pack = ("bash", scripts / "package_bundle.sh", "linux", "x64")
+        self.call(*pack, env=env)
+        dedicated_build = repo / "existing-build"
+        build.rename(dedicated_build)
+        build = dedicated_build
+        pack += (build,)
+        archive = repo / "out/zan-ide-1.2.3-linux-x64.tar.gz"
+        initial = archive.read_bytes()
+        root = archive.name.removesuffix(".tar.gz")
+        with tarfile.open(archive) as tar:
+            names = set(tar.getnames())
+            self.assertIn(f"{root}/toolchain/linux-riscv64/sysroot-marker", names)
+            self.assertIn(f"{root}/examples/html_gallery/zan.proj", names)
+            self.assertIn(f"{root}/templates/console/console-args/.gitignore", names)
+            self.assertIn(f"{root}/templates/console/console-args/seed.db", names)
+            self.assertNotIn(f"{root}/templates/console/console-args/work.db", names)
+            self.assertNotIn(f"{root}/templates/console/console-args/scratch/upload.bin", names)
+            self.assertNotIn(f"{root}/.gitignore", names)
+        self.write(template / "work.db", "changed ignored database")
+        self.call(*pack, env=env)
+        self.assertEqual(archive.read_bytes(), initial)
+        (build / "zanrt_sync.o").unlink()
+        result = self.call(*pack, env=env, success=False)
+        self.assertIn("zanrt_sync.o", result.stderr)
+        self.assertEqual(archive.read_bytes(), initial)
+        (build / "zanrt_sync.o").write_text("zanrt_sync.o")
+        self.write(build / "zanc", compiler.replace('echo "$1"', 'echo wrong-output')).chmod(0o755)
+        passed_archive_dir = self.base / "passing-sdk"
+        (repo / "out").rename(passed_archive_dir)
+        self.call(*pack, env=env)
+        shutil.rmtree(build)
+        self.call(sys.executable, "-I", "-B", ROOT / "scripts/sdk_stage_manifest.py", "consume-archive",
+                  "--archive", passed_archive_dir / archive.name, "--output", self.base / "passed", env=env)
+        receipt = SDK.load(self.base / "passed/sdk-consumption.json")
+        self.assertEqual(receipt["phase"], "archive-consumed")
+        self.assertEqual(receipt["archive"]["sha256"], SDK.identity.file_identity(passed_archive_dir / archive.name)["sha256"])
+        self.assertEqual(receipt["selected"], 1)
+        self.assertTrue(SDK.load(receipt["runs"][0]["log"]["path"])["stdout"].strip())
+        self.assertEqual(SDK.load(receipt["static_library"]["members_log"]["path"])["stdout"].strip(), "fixture.o")
+        self.assertFalse(list((self.base / "passed").glob("extract-*")))
+        result = self.call(sys.executable, "-I", "-B", ROOT / "scripts/sdk_stage_manifest.py", "consume-archive",
+                           "--archive", archive, "--output", self.base / "failed", env=env, success=False)
+        self.assertIn("did not preserve the supplied argument", result.stderr)
+        self.assertFalse((self.base / "failed/sdk-consumption.json").exists())
+
+    def test_posix_workflows_consume_the_uploaded_archive(self):
+        text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        for platform, next_job in (("linux", "macos"), ("macos", "windows")):
+            with self.subTest(platform=platform):
+                job = text[text.index(f"  {platform}:\n"):text.index(f"  {next_job}:\n")]
+                pack = job.index(f"bash scripts/package_bundle.sh {platform}")
+                consume = job.index("sdk_stage_manifest.py consume-archive")
+                upload = job.index(f"name: zan-ide-{platform}-")
+                self.assertLess(job.index("-P scripts/release_quality_gate.cmake"), pack)
+                self.assertLess(pack, consume)
+                self.assertLess(consume, upload)
+                self.assertIn("SDK_ARCHIVE: ${{ steps.bundle.outputs.archive }}", job)
+                self.assertIn('--archive "$SDK_ARCHIVE"', job)
+                self.assertIn("${{ steps.bundle.outputs.archive }}\n", job[upload:])
+                self.assertIn("${{ steps.bundle.outputs.archive }}.sha256", job[upload:])
+                self.assertNotIn("if: always()", job[job.rindex("      - uses:", 0, upload):upload])
 
     def test_windows_workflow_prepares_before_seal_and_packages_platform_root(self):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")

@@ -214,6 +214,9 @@ elseif(WIN32)
     # libraries explicitly.
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} winhttp)
     set_target_properties(zanc PROPERTIES LINKER_LANGUAGE CXX)
+elseif(APPLE)
+    # The C++ linker driver provides libc++ on macOS.
+    target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS})
 else()
     target_link_libraries(zanc PRIVATE ${LLVM_LIBS} ${LLVM_SYSTEM_LIBS} stdc++ m pthread)
 endif()
@@ -3189,7 +3192,8 @@ add_custom_target(stdlib_stamp ALL DEPENDS ${_stdlib_stamp})
 set(_mvc_tool ${CMAKE_BINARY_DIR}/zan-mvc${_exe_ext})
 file(GLOB _mvc_tools CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/tools/*.zan)
 add_custom_command(OUTPUT ${_mvc_tool}
-  COMMAND $<TARGET_FILE:zanc> ${_mvc_tools} --auto-stdlib --codegen-level 0 -o ${_mvc_tool}
+  COMMAND $<TARGET_FILE:zanc> ${_mvc_tools} --stdlib-path "${CMAKE_SOURCE_DIR}/stdlib"
+    --codegen-level 0 -o ${_mvc_tool}
   DEPENDS zanc ${_mvc_tools} ${_stdlib_stamp}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   VERBATIM)
