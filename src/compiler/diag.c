@@ -15,6 +15,7 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->max_errors = 100;
     d->suppressed_errors = 0;
     d->limit_notice_shown = false;
+    d->jsonl = false;
     d->file_names = NULL;
     d->file_sources = NULL;
     d->file_count = 0;
@@ -228,6 +229,67 @@ static zan_diag_entry_t *diag_capture_entry(zan_diag_t *diag, zan_diag_level_t l
     return e;
 }
 
+/* Source text and POSIX paths can contain malformed UTF-8. Keep valid sequences
+ * verbatim and replace malformed bytes so every tagged line remains valid JSONL. */
+static size_t diag_utf8_width(const unsigned char *p) {
+    unsigned char lead = p[0];
+    if (lead < 0xC2 || lead > 0xF4) return 0;
+
+    size_t width = lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+    for (size_t i = 1; i < width; i++) {
+        if ((p[i] & 0xC0) != 0x80) return 0;
+    }
+    if ((lead == 0xE0 && p[1] < 0xA0) || (lead == 0xED && p[1] >= 0xA0) ||
+        (lead == 0xF0 && p[1] < 0x90) || (lead == 0xF4 && p[1] >= 0x90))
+        return 0;
+    return width;
+}
+
+static void diag_json_string(const char *text) {
+    if (!text) {
+        fputs("null", stderr);
+        return;
+    }
+
+    fputc('"', stderr);
+    const unsigned char *p = (const unsigned char *)text;
+    const unsigned char *start = p;
+    while (*p) {
+        size_t width = *p < 0x80 ? 1 : diag_utf8_width(p);
+        if (width && *p >= 0x20 && *p != '"' && *p != '\\') {
+            p += width;
+            continue;
+        }
+
+        fwrite(start, 1, (size_t)(p - start), stderr);
+        if (!width) fputs("\\ufffd", stderr);
+        else if (*p == '"') fputs("\\\"", stderr);
+        else if (*p == '\\') fputs("\\\\", stderr);
+        else fprintf(stderr, "\\u%04x", (unsigned)*p);
+        start = ++p;
+    }
+    fwrite(start, 1, (size_t)(p - start), stderr);
+    fputc('"', stderr);
+}
+
+static const char *diag_file_name(const zan_diag_t *diag, uint32_t file_id) {
+    return file_id < (uint32_t)diag->file_count && diag->file_names
+        ? diag->file_names[file_id] : NULL;
+}
+
+static void diag_print_jsonl(const char *severity, const char *file,
+                             uint32_t line, uint32_t col, const char *code,
+                             const char *message) {
+    fprintf(stderr, "{\"format\":\"zan-diagnostic-v1\",\"severity\":\"%s\",\"file\":",
+            severity);
+    diag_json_string(file);
+    fprintf(stderr, ",\"line\":%u,\"col\":%u,\"code\":", line, col);
+    diag_json_string(code);
+    fputs(",\"message\":", stderr);
+    diag_json_string(message);
+    fputs("}\n", stderr);
+}
+
 static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
                            zan_loc_t loc, int code, const char *fmt,
                            va_list args);
@@ -245,15 +307,13 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
                            va_list args) {
     if (diag->only_file_id >= 0 && loc.file_id != diag->only_file_id) return;
     char msgbuf[1024];
-    char prefix[16];
+    char code_text[16];
+    int plen = 0;
     if (code > 0) {
-        snprintf(prefix, sizeof(prefix), "[%c%04d] ",
+        snprintf(code_text, sizeof(code_text), "%c%04d",
                  level == DIAG_WARNING ? 'W' : 'E', code);
-    } else {
-        prefix[0] = '\0';
+        plen = snprintf(msgbuf, sizeof(msgbuf), "[%s] ", code_text);
     }
-    int plen = (int)strlen(prefix);
-    memcpy(msgbuf, prefix, (size_t)plen);
     /* msgbuf 从 args 的副本格式化：调用方 va_list 保持未消费，
      * dedup 块还要用它做一次完整串格式化（B-ID206③）。 */
     va_list msg_args;
@@ -370,11 +430,15 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
             diag->suppressed_errors++;
             if (!diag->limit_notice_shown && !diag->capture) {
                 diag->limit_notice_shown = true;
-                fprintf(stderr,
-                        "\033[33mnote\033[0m: too many errors, stopping after %d"
-                        " (further errors are suppressed; use"
-                        " -ferror-limit=0 for all)\n",
-                        diag->max_errors);
+                char notice[128];
+                snprintf(notice, sizeof(notice),
+                         "too many errors, stopping after %d"
+                         " (further errors are suppressed; use -ferror-limit=0 for all)",
+                         diag->max_errors);
+                if (diag->jsonl)
+                    diag_print_jsonl("note", NULL, 0, 0, NULL, notice);
+                else
+                    fprintf(stderr, "\033[33mnote\033[0m: %s\n", notice);
             }
             return;
         }
@@ -395,10 +459,15 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
             diag->dup_line_suppressed++;
             if (!diag->dup_line_notice_shown && !diag->capture) {
                 diag->dup_line_notice_shown = true;
-                fprintf(stderr,
-                        "\033[33mnote\033[0m: line %u: more than %d errors,"
-                        " rest of the line suppressed\n",
-                        loc.line, ZAN_DIAG_MAX_ERRORS_PER_LINE);
+                char notice[128];
+                snprintf(notice, sizeof(notice),
+                         "line %u: more than %d errors, rest of the line suppressed",
+                         loc.line, ZAN_DIAG_MAX_ERRORS_PER_LINE);
+                if (diag->jsonl)
+                    diag_print_jsonl("note", loc.line ? diag_file_name(diag, loc.file_id) : NULL,
+                                     loc.line, 0, NULL, notice);
+                else
+                    fprintf(stderr, "\033[33mnote\033[0m: %s\n", notice);
             }
             return;
         }
@@ -423,12 +492,15 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
         color = "\033[33m"; /* yellow */
     }
 
-    const char *file_name = "<unknown>";
-    if (loc.file_id < (uint32_t)diag->file_count && diag->file_names) {
-        file_name = diag->file_names[loc.file_id];
+    const char *file_name = diag_file_name(diag, loc.file_id);
+    if (diag->jsonl) {
+        diag_print_jsonl(level_str, loc.line ? file_name : NULL, loc.line, loc.col,
+                         code > 0 ? code_text : NULL, msgbuf + plen);
+        return;
     }
 
-    fprintf(stderr, "%s:%u:%u: %s%s\033[0m: %s\n", file_name, loc.line, loc.col,
+    fprintf(stderr, "%s:%u:%u: %s%s\033[0m: %s\n",
+            file_name ? file_name : "<unknown>", loc.line, loc.col,
             color, level_str, msgbuf);
 
     if (loc.file_id < (uint32_t)diag->file_count && diag->file_sources) {

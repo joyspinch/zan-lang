@@ -405,52 +405,83 @@ struct checker_local {
     zan_istr_t name;
     zan_type_t *type;
     zan_symbol_t *null_src;
+    const zan_ast_node_t *decl;
     struct checker_local *next;
 };
 
-static struct checker_local *checker_find_local_slot(zan_checker_t *c,
-                                                     zan_istr_t name) {
+static struct checker_local *checker_lookup_local(zan_checker_t *c, zan_istr_t name,
+                                                  bool include_untyped) {
     for (struct checker_local *l = c->locals; l; l = l->next) {
-        if (l->name.len == name.len &&
+        if ((include_untyped || l->type) && l->name.len == name.len &&
             memcmp(l->name.str, name.str, (size_t)name.len) == 0)
             return l;
     }
     return NULL;
 }
 
+static struct checker_local *checker_find_local_slot(zan_checker_t *c,
+                                                     zan_istr_t name) {
+    return checker_lookup_local(c, name, false);
+}
+
 static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name) {
-    for (struct checker_local *l = c->locals; l; l = l->next) {
-        if (l->name.len == name.len &&
-            memcmp(l->name.str, name.str, (size_t)name.len) == 0)
-            return l->type;
+    struct checker_local *l = checker_find_local_slot(c, name);
+    return l ? l->type : NULL;
+}
+
+static zan_loc_t checker_local_name_loc(const zan_ast_node_t *decl) {
+    switch (decl->kind) {
+    case AST_PARAM: return decl->param.name_loc;
+    case AST_VAR_DECL: return decl->var_decl.name_loc;
+    case AST_FOREACH_STMT: return decl->foreach_stmt.name_loc;
+    case AST_REF_ARG: return decl->ref_arg.expr->loc;
+    default: return (zan_loc_t){0};
     }
-    return NULL;
+}
+
+static void checker_push_local(zan_checker_t *c, zan_istr_t name,
+                               zan_type_t *type, const zan_ast_node_t *decl) {
+    struct checker_local *l = zan_arena_alloc(c->arena, sizeof(*l));
+    l->name = name;
+    l->type = type;
+    l->decl = decl;
+    l->null_src = NULL;
+    l->next = c->locals;
+    c->locals = l;
+
+    if (c->lexical_ref && decl && name.len) {
+        zan_loc_t loc = checker_local_name_loc(decl);
+        if (loc.line)
+            c->lexical_ref(c->lexical_ref_context, name, decl->kind == AST_PARAM,
+                           loc, loc);
+    }
 }
 
 static void checker_add_local(zan_checker_t *c, zan_istr_t name,
-                              zan_type_t *type) {
-    if (!type || type == c->binder->type_error) return;
-    struct checker_local *l = (struct checker_local *)
-        zan_arena_alloc(c->arena, sizeof(struct checker_local));
-    l->name = name;
-    l->type = type;
-    l->null_src = NULL;
-    l->next = c->locals;
-    c->locals = l;
+                              zan_type_t *type, const zan_ast_node_t *decl) {
+    if (!type || type == c->binder->type_error) {
+        if (!c->lexical_ref || !decl) return;
+        /* Untyped declarations still shadow for navigation. Type lookup skips them. */
+        type = NULL;
+    }
+    checker_push_local(c, name, type, decl);
 }
 
-/* 把名字放进作用域，**不**因为类型未知而丢弃：类型未知时记成 error 类型，
- * 让引用它的检查安静降级（而不是落到"同名类字段"上去）。 */
+/* Untyped lambda parameters and inline out variables participate in type lookup. */
 static void checker_add_local_permissive(zan_checker_t *c, zan_istr_t name,
-                                         zan_type_t *type) {
-    struct checker_local *l = (struct checker_local *)
-        zan_arena_alloc(c->arena, sizeof(struct checker_local));
-    l->name = name;
-    l->type = (type && type != c->binder->type_error) ? type
-                                                       : c->binder->type_error;
-    l->null_src = NULL;
-    l->next = c->locals;
-    c->locals = l;
+                                         zan_type_t *type, const zan_ast_node_t *decl) {
+    checker_push_local(c, name, type ? type : c->binder->type_error, decl);
+}
+
+static void checker_record_lexical_ref(zan_checker_t *c, const zan_ast_node_t *use) {
+    if (!use->ident.source_ident || use->ident.ns_decl) return;
+    struct checker_local *l = checker_lookup_local(c, use->ident.name, true);
+    if (!l || !l->decl || !l->name.len) return;
+
+    zan_loc_t name_loc = checker_local_name_loc(l->decl);
+    if (name_loc.line && name_loc.file_id == use->loc.file_id)
+        c->lexical_ref(c->lexical_ref_context, l->name, l->decl->kind == AST_PARAM,
+                       name_loc, use->loc);
 }
 
 static void checker_mark_local_null_src(zan_checker_t *c, zan_ast_node_t *decl) {

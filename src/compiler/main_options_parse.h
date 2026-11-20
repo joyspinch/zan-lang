@@ -30,6 +30,9 @@ typedef struct zan_options {
     bool do_dump_tokens;
     bool do_dump_ast;
     const char *emit_symbols_path;
+    const char *semantic_refs_file;
+    uint32_t semantic_refs_line;
+    uint32_t semantic_refs_col;
     const char *gen_meta_path;
     bool gen_meta_bodies;
     bool do_emit_ir;
@@ -58,6 +61,7 @@ typedef struct zan_options {
     const char *package_project;
     bool package_list_missing;
     bool do_deny_warnings;
+    bool diagnostics_jsonl;
     const char *warn_level_arg;
     const char *suppress_arg;
     zan_pkg_scope_t package_scope;

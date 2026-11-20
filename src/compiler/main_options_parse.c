@@ -22,6 +22,14 @@ void zan_options_init(zan_options_t *opts) {
     opts->shard_opt = false;
 }
 
+static bool parse_source_coordinate(const char *text, uint32_t *value) {
+    if (!*text || text[strspn(text, "0123456789")]) return false;
+    unsigned long long number = strtoull(text, NULL, 10);
+    if (number == 0 || number > UINT32_MAX) return false;
+    *value = (uint32_t)number;
+    return true;
+}
+
 zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opts) {
     zan_options_init(opts);
 
@@ -125,6 +133,16 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             do_dump_ast = true;
         } else if (strcmp(argv[i], "--emit-symbols") == 0 && i + 1 < argc) {
             emit_symbols_path = argv[++i];
+        } else if (strcmp(argv[i], "--semantic-refs") == 0) {
+            if (opts->semantic_refs_file || argc - i < 4 || !argv[i + 1][0] ||
+                !parse_source_coordinate(argv[i + 2], &opts->semantic_refs_line) ||
+                !parse_source_coordinate(argv[i + 3], &opts->semantic_refs_col)) {
+                fprintf(stderr, "error: expected one --semantic-refs <file> <line> <col> query with positive coordinates\n");
+                opts->exit_code = 1;
+                return ZAN_OPTIONS_ERROR;
+            }
+            opts->semantic_refs_file = argv[i + 1];
+            i += 3;
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet = true;
         } else if (strcmp(argv[i], "--gen-meta") == 0 && i + 1 < argc) {
@@ -151,6 +169,17 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             runtime_checks = true;
         } else if (strcmp(argv[i], "--strict-runtime") == 0) {
             strict_runtime = true;
+        } else if (strncmp(argv[i], "--diagnostics-format=", sizeof("--diagnostics-format=") - 1) == 0) {
+            const char *format = argv[i] + sizeof("--diagnostics-format=") - 1;
+            if (strcmp(format, "jsonl") == 0) {
+                opts->diagnostics_jsonl = true;
+            } else if (strcmp(format, "text") == 0) {
+                opts->diagnostics_jsonl = false;
+            } else {
+                fprintf(stderr, "error: --diagnostics-format must be 'text' or 'jsonl'\n");
+                opts->exit_code = 1;
+                return ZAN_OPTIONS_ERROR;
+            }
         } else if (strcmp(argv[i], "--deny-warnings") == 0) {
             do_deny_warnings = true;
         } else if (strncmp(argv[i], "--warn-level=", 13) == 0) {
@@ -410,6 +439,14 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
         }
     }
 
+
+    if (opts->semantic_refs_file &&
+        (do_dump_tokens || do_dump_ast || emit_symbols_path || gen_meta_path ||
+         do_emit_ir || package_list_missing || package_api || package_install_dir)) {
+        fprintf(stderr, "error: --semantic-refs cannot be combined with another query or dump mode\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+    }
 
     if (package_api) {
         char status[256];

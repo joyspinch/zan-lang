@@ -31,7 +31,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 checker_check_assignable(c, dt, iv, stmt->var_decl.initializer,
                                          stmt->loc, "initializer");
             }
-            checker_add_local(c, stmt->var_decl.name, dt);
+            checker_add_local(c, stmt->var_decl.name, dt, stmt);
             checker_mark_local_null_src(c, stmt);
         } else {
             if (stmt->var_decl.initializer) {
@@ -40,7 +40,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                     reject_method_group(c, stmt->var_decl.initializer);
                 }
             }
-            checker_add_local(c, stmt->var_decl.name, iv);
+            checker_add_local(c, stmt->var_decl.name, iv, stmt);
             checker_mark_local_null_src(c, stmt);
         }
         break;
@@ -175,7 +175,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 elem = zan_binder_resolve_type(c->binder,
                                                stmt->foreach_stmt.var_type);
             }
-            checker_add_local(c, stmt->foreach_stmt.var_name, elem);
+            checker_add_local(c, stmt->foreach_stmt.var_name, elem, stmt);
         }
         zan_checker_check_stmt(c, stmt->foreach_stmt.body);
         c->locals = saved_locals;
@@ -266,7 +266,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             if (sc->switch_case.type_pattern && sc->switch_case.var_name.len > 0) {
                 zan_type_t *pt = zan_binder_resolve_type(
                     c->binder, sc->switch_case.type_pattern);
-                checker_add_local(c, sc->switch_case.var_name, pt);
+                checker_add_local(c, sc->switch_case.var_name, pt, NULL);
                 if (sc->switch_case.when_cond == NULL &&
                     (pt->kind == TYPE_OBJECT || pt == sw_type)) {
                     seen_wildcard = true;

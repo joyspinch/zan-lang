@@ -1,6 +1,8 @@
-static void dump_tokens(const char *source, size_t len, const char *filename) {
+static void dump_tokens(const char *source, size_t len, const char *filename,
+                        bool diagnostics_jsonl) {
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
+    diag->jsonl = diagnostics_jsonl;
     zan_diag_add_file(diag, filename, source);
 
     zan_lexer_t lex;
@@ -33,6 +35,7 @@ static void dump_tokens(const char *source, size_t len, const char *filename) {
         printf("\n");
     }
 
+    zan_diag_free_buffers(diag);
     zan_arena_free(arena);
 }
 

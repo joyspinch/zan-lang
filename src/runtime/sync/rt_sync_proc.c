@@ -199,6 +199,187 @@ failed:
     return -1;
 }
 
+/* argv, PATH and scratch storage are prepared in the parent. Use execv so
+ * the child calls only async-signal-safe routines, including on PATH lookup. */
+static void zan_proc_spawn_exec(char *const argv[], const char *path, char *candidate) {
+    const char *exe = argv[0];
+    if (!path) {
+        execv(exe, argv);
+        return;
+    }
+    size_t exe_len = strlen(exe) + 1;
+    for (const char *dir = path; ; ) {
+        size_t len = strcspn(dir, ":");
+        const char *file = exe;
+        if (len > 0) {
+            memcpy(candidate, dir, len);
+            candidate[len] = '/';
+            memcpy(candidate + len + 1, exe, exe_len);
+            file = candidate;
+        }
+        execv(file, argv);
+        if (errno != ENOENT && errno != ENOTDIR && errno != EACCES) return;
+        if (!dir[len]) return;
+        dir += len + 1;
+    }
+}
+
+static void zan_proc_close_fd(int *fd) {
+    if (*fd >= 0) close(*fd);
+    *fd = -1;
+}
+
+int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]) {
+    if (!argv || !argv[0] || !argv[0][0] || !fds) return -1;
+    char *path = NULL, *candidate = NULL;
+    int32_t result = -1;
+    enum { INPUT_PIPE, OUTPUT_PIPE, LAUNCH_PIPE, PIPE_COUNT };
+    int pipes[PIPE_COUNT][2];
+    int opened = 0;
+    if (!strchr(argv[0], '/')) {
+        const char *env_path = getenv("PATH");
+        path = strdup(env_path ? env_path : "/bin:/usr/bin");
+        if (!path) goto done;
+        candidate = (char *)malloc(strlen(path) + strlen(argv[0]) + 2);
+        if (!candidate) goto done;
+    }
+    for (; opened < PIPE_COUNT; opened++) {
+        if (zan_proc_launch_pipe(pipes[opened]) < 0) goto done;
+    }
+    int *input = pipes[INPUT_PIPE], *output = pipes[OUTPUT_PIPE];
+    int *launch = pipes[LAUNCH_PIPE];
+    int flags = fcntl(output[0], F_GETFL);
+    if (flags < 0 || fcntl(output[0], F_SETFL, flags | O_NONBLOCK) < 0) goto done;
+
+    pid_t pid = fork();
+    if (pid < 0) goto done;
+    if (pid == 0) {
+        close(launch[0]);
+        if ((!cwd || !cwd[0] || chdir(cwd) == 0) &&
+            dup2(input[0], STDIN_FILENO) >= 0 &&
+            dup2(output[1], STDOUT_FILENO) >= 0 &&
+            dup2(output[1], STDERR_FILENO) >= 0) {
+            close(input[0]);
+            close(input[1]);
+            close(output[0]);
+            close(output[1]);
+            zan_proc_spawn_exec(argv, path, candidate);
+        }
+        /* EOF on this CLOEXEC pipe confirms exec, even if the program exits 127. */
+        char failed = 1;
+        while (write(launch[1], &failed, 1) < 0 && errno == EINTR) {}
+        _exit(127);
+    }
+
+    zan_proc_close_fd(&input[0]);
+    zan_proc_close_fd(&output[1]);
+    zan_proc_close_fd(&launch[1]);
+    char failed;
+    ssize_t received;
+    do { received = read(launch[0], &failed, 1); }
+    while (received < 0 && errno == EINTR);
+    if (received == 0) {
+        fds[0] = input[1];
+        fds[1] = output[0];
+        input[1] = output[0] = -1;
+        result = (int32_t)pid;
+    } else {
+        if (received < 0) kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
+
+done:
+    for (int i = 0; i < opened; i++) {
+        zan_proc_close_fd(&pipes[i][0]);
+        zan_proc_close_fd(&pipes[i][1]);
+    }
+    free(candidate);
+    free(path);
+    return result;
+}
+
+int32_t zan_proc_spawn_available(int32_t fd) {
+    int count = 0;
+    return ioctl(fd, FIONREAD, &count) == 0 ? count : 0;
+}
+
+int32_t zan_proc_spawn_read(int32_t fd, void *buf, int32_t count) {
+    if (count <= 0) return 0;
+    ssize_t received;
+    do { received = read(fd, buf, (size_t)count); }
+    while (received < 0 && errno == EINTR);
+    return (int32_t)received;
+}
+
+int32_t zan_proc_spawn_write(int32_t fd, const void *buf, int32_t count) {
+    if (count < 0) return 0;
+    sigset_t pipe_signal, previous, pending;
+    sigemptyset(&pipe_signal);
+    sigaddset(&pipe_signal, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &pipe_signal, &previous) != 0) return 0;
+
+    int32_t written = 0;
+    if (sigpending(&pending) == 0) {
+        int was_pending = sigismember(&pending, SIGPIPE);
+        while (written < count) {
+            ssize_t n = write(fd, (const char *)buf + written, (size_t)(count - written));
+            if (n > 0) {
+                written += (int32_t)n;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            /* Consume only the SIGPIPE from this write. If SIGPIPE is ignored,
+             * the signal may not be pending at all. Leave the host policy intact. */
+            if (n < 0 && errno == EPIPE && was_pending == 0 &&
+                sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE) == 1) {
+                int signal_number;
+                while (sigwait(&pipe_signal, &signal_number) == EINTR) {}
+            }
+            break;
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    return written == count;
+}
+
+int32_t zan_proc_spawn_kill(int32_t pid) {
+    return pid > 0 && kill((pid_t)pid, SIGKILL) == 0;
+}
+
+int32_t zan_proc_spawn_wait(int32_t pid, int32_t timeout_ms) {
+    if (pid <= 0) return -1;
+    int64_t deadline = timeout_ms > 0
+        ? zan_monotonic_us() + (int64_t)timeout_ms * 1000 : 0;
+    for (;;) {
+        int status;
+        pid_t waited = waitpid((pid_t)pid, &status, deadline ? WNOHANG : 0);
+        if (waited == pid) {
+            if (WIFEXITED(status)) return (int32_t)WEXITSTATUS(status);
+            if (WIFSIGNALED(status)) return 128 + (int32_t)WTERMSIG(status);
+        }
+        if (waited < 0 && errno != EINTR) return -1;
+        if (!deadline) continue;
+        int64_t left = deadline - zan_monotonic_us();
+        if (left <= 0) return -258;
+        struct timespec delay = {0, (long)(left < 1000 ? left : 1000) * 1000};
+        nanosleep(&delay, NULL);
+    }
+}
+
+void zan_proc_spawn_dispose(int32_t pid, int32_t input, int32_t output) {
+    if (input >= 0) close(input);
+    if (output >= 0) close(output);
+    if (pid <= 0) return;
+
+    int status;
+    pid_t waited;
+    do { waited = waitpid((pid_t)pid, &status, WNOHANG); }
+    while (waited < 0 && errno == EINTR);
+    if (waited < 0 || (waited == pid && (WIFEXITED(status) || WIFSIGNALED(status)))) return;
+    zan_proc_spawn_kill(pid);
+    zan_proc_spawn_wait(pid, 0);
+}
+
 /* The CLOEXEC writer reports failure until the final exec succeeds. Reuse this
  * handshake for both detached APIs: reaping the intermediate fork alone cannot
  * distinguish successful exec from a missing executable/interpreter. */

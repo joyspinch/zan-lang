@@ -9,6 +9,10 @@
 struct checker_local;
 struct checker_byref_parameter;
 
+/* Locations identify identifier tokens. A declaration reports itself as the occurrence. */
+typedef void (*zan_checker_lexical_ref_fn)(void *context, zan_istr_t name,
+    bool is_parameter, zan_loc_t declaration, zan_loc_t occurrence);
+
 struct zan_checker {
     zan_binder_t *binder;
     zan_arena_t *arena;
@@ -18,6 +22,8 @@ struct zan_checker {
     zan_symbol_t *current_type_sym;
     bool in_ctor;
     struct checker_local *locals;
+    zan_checker_lexical_ref_fn lexical_ref;
+    void *lexical_ref_context;
     /* ref/out bindings retain their lexical slot identity across lambdas. */
     struct checker_byref_parameter *byref_parameters;
     int lambda_depth;

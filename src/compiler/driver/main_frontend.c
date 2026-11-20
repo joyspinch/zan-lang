@@ -10,6 +10,7 @@
     zan_arena_t *arena = zan_arena_new();
     g_main_arena = arena;
     zan_diag_t *diag = zan_diag_new(arena);
+    diag->jsonl = opts.diagnostics_jsonl;
     zan_diag_set_deny_warnings(diag, do_deny_warnings);
     /* A382②：--warn-level none|default|error（error 兼容 --deny-warnings）；
      * --suppress 逗号分隔诊断编号（W0003 / 3 皆可，字母仅作文档）。 */
@@ -64,10 +65,11 @@
             free(source);
             return 1;
         }
+        int file_id = diag->file_count;
         zan_diag_add_file(diag, input_files[fi], src);
 
         zan_lexer_t lex;
-        zan_lexer_init(&lex, src, slen, fi, arena, diag);
+        zan_lexer_init(&lex, src, slen, file_id, arena, diag);
 
         zan_apply_lex_defines(&lex, target, pp_defines, pp_define_count,
                               publish_mode);
@@ -91,7 +93,7 @@
                 zan_path_is_under(input_files[fi], resolved_stdlib_root);
             if (parse_failed) {
                 g_scale_stats.throwaway_parse_fallbacks++;
-                pi_seed_source(src, slen);
+                pi_seed_source(src, slen, opts.diagnostics_jsonl);
             } else {
                 pi_seed_parsed_unit(unit, seed_entry);
             }
@@ -234,7 +236,7 @@
                         size_t flen = 0;
                         char *fsrc = read_file(input_files[fi], &flen);
                         if (fsrc) {
-                            pi_seed_source(fsrc, flen);
+                            pi_seed_source(fsrc, flen, opts.diagnostics_jsonl);
                             free(fsrc);
                         }
                     } else {
@@ -325,6 +327,12 @@
 
     zan_checker_t checker;
     zan_checker_init(&checker, &binder, arena, diag);
+    semantic_refs_t semantic_refs = {0};
+    if (opts.semantic_refs_file &&
+        semantic_refs_find_file(&semantic_refs, diag, opts.semantic_refs_file)) {
+        checker.lexical_ref = semantic_refs_record;
+        checker.lexical_ref_context = &semantic_refs;
+    }
     zan_compile_trace("check");
     zan_checker_check(&checker, ast);
 
@@ -335,6 +343,7 @@
         fprintf(stderr, "\n%d error(s) after type checking\n",
                 diag->error_count);
         report_suppressed_errors(diag);
+        free(semantic_refs.items);
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);
         free(source);
@@ -343,6 +352,22 @@
 
     phase("check");
     probe_phase_mem("check");
+
+    if (opts.semantic_refs_file) {
+        int rc = 1;
+        if (checker.lexical_ref) {
+            rc = semantic_refs_print(&semantic_refs, opts.semantic_refs_line,
+                                      opts.semantic_refs_col);
+        } else {
+            fprintf(stderr, "error: --semantic-refs requires one loaded source matching '%s'\n",
+                    opts.semantic_refs_file);
+        }
+        free(semantic_refs.items);
+        zan_diag_free_buffers(diag);
+        zan_arena_free(arena);
+        free(source);
+        return rc;
+    }
 
     zan_irgen_t irgen;
     const char *irgen_triple = NULL;

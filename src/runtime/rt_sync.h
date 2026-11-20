@@ -146,6 +146,18 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
 int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args, int32_t argc,
                                       char **out_buf, int32_t *out_len,
                                       int32_t *exit_code, int32_t timeout_ms);
+
+/* Returns the child PID and transfers the parent-side stdin/stdout fds on
+ * success. Returns -1 on launch failure with no child or fd left to the caller. */
+int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]);
+int32_t zan_proc_spawn_available(int32_t fd);
+int32_t zan_proc_spawn_read(int32_t fd, void *buf, int32_t count);
+int32_t zan_proc_spawn_write(int32_t fd, const void *buf, int32_t count);
+int32_t zan_proc_spawn_kill(int32_t pid);
+/* Returns the exit code, -258 on timeout, or -1 on wait failure. */
+int32_t zan_proc_spawn_wait(int32_t pid, int32_t timeout_ms);
+/* Pass pid 0 if wait already collected the child. Always closes both fds. */
+void zan_proc_spawn_dispose(int32_t pid, int32_t input, int32_t output);
 #endif
 void zan_proc_free_buf(char *buf);
 

@@ -973,8 +973,8 @@ public class Process {
 
 /// 活进程管道句柄集：spawn 后子进程 stdin/stdout 保持接线，父进程可随时
 /// 写命令、非阻塞读输出、终止或等待退出。与 CaptureSafe（等子进程死再收
-/// 全部输出）互补，本类面向交互式子进程（REPL、长驻工具）。
-/// Windows-first：POSIX 侧 Spawn 返回 null，管道版为后续切片。
+/// 全部输出）互补，本类面向交互式子进程（REPL、长驻工具）及有界作业执行。
+/// Kill 只保证直接子进程；它不是进程树终止或操作系统安全沙箱。
 public class ProcessSpawn {
     nint hProcess;
     nint hThread;
@@ -982,6 +982,8 @@ public class ProcessSpawn {
     nint stdinWrite;   // 子进程 stdin 的父侧写端（子读端已关）
     nint stdoutRead;   // 子进程 stdout 的父侧读端（子写端已关）
     bool disposed;
+    bool exited;
+    int exitCode;
 
     ProcessSpawn(nint process, nint thread, int processId,
             nint inWrite, nint outRead) {
@@ -991,8 +993,11 @@ public class ProcessSpawn {
         stdinWrite = inWrite;
         stdoutRead = outRead;
         disposed = false;
+        exited = false;
+        exitCode = 0 - 1;
     }
 
+    #if WINDOWS
     // ---- kernel32：仅本类需要的窄面（部分与 Process 内声明同型） ----
     [DllImport("kernel32", EntryPoint = "CreatePipe")]
     private static extern int WinCreatePipe(byte[] hRead, byte[] hWrite, byte[] sa, int nSize);
@@ -1019,6 +1024,22 @@ public class ProcessSpawn {
     private static extern int WinTerminateProcess(nint handle, int code);
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     private static extern int WinCloseHandle(nint handle);
+    #elif LINUX || MACOS
+    [DllImport("crt", EntryPoint = "zan_proc_spawn")]
+    private static extern int PosixSpawn(nint[] argv, string cwd, int[] fds);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_available")]
+    private static extern int PosixAvailable(int fd);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_read")]
+    private static extern int PosixRead(int fd, byte[] buf, int count);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_write")]
+    private static extern int PosixWrite(int fd, byte[] buf, int count);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_kill")]
+    private static extern int PosixKill(int pid);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_wait")]
+    private static extern int PosixWait(int pid, int timeoutMs);
+    [DllImport("crt", EntryPoint = "zan_proc_spawn_dispose")]
+    private static extern void PosixDispose(int pid, int stdinFd, int stdoutFd);
+    #endif
 
     private static nint WinHandleAt(byte[] pi, int off) {
         nint h = 0;
@@ -1052,8 +1073,72 @@ public class ProcessSpawn {
 
     /// 启动子进程并接好 stdin/stdout 管道；失败返回 null。
     public static ProcessSpawn Spawn(string exe, List<string> args) {
+        return ProcessSpawn.Spawn(exe, args, "");
+    }
+
+    /// 在指定工作目录启动子进程。空 cwd 继承父进程目录；启动、chdir 或 exec
+    /// 失败均返回 null，不把 POSIX 的 exec 失败伪装成退出码 127 的已成功作业。
+    public static ProcessSpawn Spawn(string exe, List<string> args, string cwd) {
+        if (exe == null || exe == "") { return null; }
+        if (cwd == null) { cwd = ""; }
         #if WINDOWS
-        // 双命名管道：子读端/子写端可继承，父侧两端私有（读端/写端各关
+        return ProcessSpawn.WinSpawn(Process.BuildCommandLine(exe, args), cwd);
+        #elif LINUX || MACOS
+        int argc = args != null ? args.Count : 0;
+        nint[] argv = new nint[argc + 2];
+        int[] fds = new int[2];
+        try {
+            for (int i = 0; i <= argc; i = i + 1) {
+                string arg = i == 0 ? exe : args[i - 1];
+                argv[i] = Marshal.StringToHGlobalUtf8(arg == null ? "" : arg);
+            }
+            ProcessSpawn child = new ProcessSpawn((nint)0, (nint)0, 0, (nint)0, (nint)0);
+            int processId = ProcessSpawn.PosixSpawn(argv, cwd, fds);
+            if (processId < 0) { return null; }
+            child.pid = processId;
+            child.stdinWrite = fds[0];
+            child.stdoutRead = fds[1];
+            return child;
+        } finally {
+            for (int i = 0; i <= argc; i = i + 1) {
+                Marshal.FreeHGlobal(argv[i]);
+            }
+        }
+        #else
+        return null;
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("kernel32", EntryPoint = "GetSystemDirectoryW")]
+    private static extern int WinGetSystemDirectory(nint buffer, int capacity);
+    [DllImport("kernel32", EntryPoint = "InitializeProcThreadAttributeList")]
+    private static extern int WinInitAttributes(nint list, int count, int flags, nint[] size);
+    [DllImport("kernel32", EntryPoint = "UpdateProcThreadAttribute")]
+    private static extern int WinUpdateAttribute(nint list, int flags, nint attribute,
+        nint[] handles, nint size, nint previous, nint returnedSize);
+    [DllImport("kernel32", EntryPoint = "DeleteProcThreadAttributeList")]
+    private static extern void WinDeleteAttributes(nint list);
+
+    /// 以 cmd.exe /d /s /c 执行完整 shell 命令。调用方负责命令的可信性。
+    public static ProcessSpawn SpawnCommandProcessor(string command, string cwd) {
+        if (command == null || command == "") { return null; }
+        int capacity = 32768;
+        nint directory = NativeMemory.Alloc(capacity * 2);
+        try {
+            int n = ProcessSpawn.WinGetSystemDirectory(directory, capacity);
+            if (n <= 0 || n >= capacity) { return null; }
+            string exe = Wide.Read(directory) + "\\cmd.exe";
+            // /s strips the outer quotes. Inner quotes belong to cmd syntax.
+            return ProcessSpawn.WinSpawn(Process.QuoteArg(exe) + " /d /s /c \""
+                + command + "\"", cwd == null ? "" : cwd);
+        } finally {
+            NativeMemory.Free(directory);
+        }
+    }
+
+    private static ProcessSpawn WinSpawn(string cmdline, string cwd) {
+        // 双匿名管道：子读端/子写端可继承，父侧两端私有（读端/写端各关
         // 掉继承位，避免句柄泄漏进孙进程）。
         byte[] sa = new byte[24];
         WinPutInt(sa, 0, 24);
@@ -1073,39 +1158,67 @@ public class ProcessSpawn {
         nint outRead = WinHandleAt(outReadB, 0);
         nint outWrite = WinHandleAt(outWriteB, 0);
         int HANDLE_FLAG_INHERIT = 1;
-        WinSetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0);
-        WinSetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
-
-        byte[] si = new byte[128];
-        si[0] = 104; // cb
-        int STARTF_USESTDHANDLES = 256;
-        WinPutInt(si, 60, STARTF_USESTDHANDLES);
-        WinPutHandle(si, 80, inRead);   // hStdInput
-        WinPutHandle(si, 88, outWrite); // hStdOutput
-        WinPutHandle(si, 96, outWrite); // hStdError
-
         byte[] pi = new byte[32];
-        int CREATE_NO_WINDOW = 134217728;
-        string cmdline = Process.BuildCommandLine(exe, args);
-        nint wcmd = Wide.Of(cmdline);
-        int ok = WinCreateProcess(0, wcmd, 0, 0, 1, CREATE_NO_WINDOW, 0, 0, si, pi);
-        Wide.Free(wcmd);
-        // 子侧两端立即关：创建后父进程只持 stdinWrite/stdoutRead
-        WinCloseHandle(inRead);
-        WinCloseHandle(outWrite);
-
-        if (ok == 0) {
-            WinCloseHandle(inWrite);
-            WinCloseHandle(outRead);
-            return null;
+        int ok = 0;
+        try {
+            if (WinSetHandleInformation(inWrite, HANDLE_FLAG_INHERIT, 0) != 0
+                && WinSetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0) != 0) {
+                ok = ProcessSpawn.WinCreateRedirected(cmdline, cwd, inRead, outWrite, pi);
+            }
+        } finally {
+            WinCloseHandle(inRead);
+            WinCloseHandle(outWrite);
+            if (ok == 0) {
+                WinCloseHandle(inWrite);
+                WinCloseHandle(outRead);
+            }
         }
+
+        if (ok == 0) { return null; }
         return new ProcessSpawn(WinHandleAt(pi, 0), WinHandleAt(pi, 8),
             ReadIntLE(pi, 16), inWrite, outRead);
-        #else
-        // POSIX 管道版后续切片；显式失败而非假成功
-        return null;
-        #endif
     }
+
+    private static int WinCreateRedirected(string cmdline, string cwd, nint inRead,
+            nint outWrite, byte[] pi) {
+        nint[] size = new nint[1];
+        WinInitAttributes(0, 1, 0, size);
+        if (size[0] <= 0) { return 0; }
+        nint attributes = NativeMemory.Alloc((int)size[0]);
+        bool initialized = false;
+        nint wcmd = 0;
+        nint wcwd = 0;
+        nint[] handles = new nint[2];
+        handles[0] = inRead;
+        handles[1] = outWrite;
+        try {
+            initialized = WinInitAttributes(attributes, 1, 0, size) != 0;
+            if (!initialized) { return 0; }
+            int PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 131074;
+            if (WinUpdateAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                handles, 16, 0, 0) == 0) { return 0; }
+
+            byte[] si = new byte[112]; // STARTUPINFOEXW (64-bit Windows)
+            WinPutInt(si, 0, 112);
+            WinPutInt(si, 60, 256);     // STARTF_USESTDHANDLES
+            WinPutHandle(si, 80, inRead);
+            WinPutHandle(si, 88, outWrite);
+            WinPutHandle(si, 96, outWrite);
+            WinPutHandle(si, 104, attributes);
+            int CREATE_NO_WINDOW = 134217728;
+            int EXTENDED_STARTUPINFO_PRESENT = 524288;
+            wcmd = Wide.Of(cmdline);
+            if (cwd != "") { wcwd = Wide.Of(cwd); }
+            return WinCreateProcess(0, wcmd, 0, 0, 1,
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, 0, wcwd, si, pi);
+        } finally {
+            if (wcmd != 0) { Wide.Free(wcmd); }
+            if (wcwd != 0) { Wide.Free(wcwd); }
+            if (initialized) { WinDeleteAttributes(attributes); }
+            NativeMemory.Free(attributes);
+        }
+    }
+    #endif
 
     /// 子进程 ID（Spawn 成功后有效）。
     public int Pid() {
@@ -1114,10 +1227,18 @@ public class ProcessSpawn {
 
     /// 非阻塞读取子进程 stdout 当前已就绪的字节；无数据/管道断开返回 ""。
     public string ReadAvailable() {
-        if (disposed || stdoutRead == 0) { return ""; }
+        return this.ReadAvailable(int.MaxValue);
+    }
+
+    /// 非阻塞读取至多 maxBytes 字节。预算调用方可反复读取并丢弃超额输出，
+    /// 既不让子进程阻塞在满管道，也不让宿主的捕获缓冲无限增长。
+    public string ReadAvailable(int maxBytes) {
+        if (disposed || stdoutRead == 0 || maxBytes <= 0) { return ""; }
+        #if WINDOWS
         byte[] avail = new byte[4];
         if (WinPeekNamedPipe(stdoutRead, 0, 0, 0, avail, 0) == 0) { return ""; }
         int n = ReadIntLE(avail, 0);
+        if (n > maxBytes) { n = maxBytes; }
         if (n <= 0) { return ""; }
         byte[] buf = new byte[n];
         byte[] numRead = new byte[4];
@@ -1125,45 +1246,88 @@ public class ProcessSpawn {
         int got = ReadIntLE(numRead, 0);
         if (got <= 0) { return ""; }
         return buf.ToStr(0, got);
+        #elif LINUX || MACOS
+        int n = ProcessSpawn.PosixAvailable((int)stdoutRead);
+        if (n > maxBytes) { n = maxBytes; }
+        if (n > 65536) { n = 65536; }
+        if (n <= 0) { return ""; }
+        byte[] buf = new byte[n];
+        int got = ProcessSpawn.PosixRead((int)stdoutRead, buf, n);
+        if (got <= 0) { return ""; }
+        return buf.ToStr(0, got);
+        #else
+        return "";
+        #endif
     }
 
     /// 向子进程 stdin 写一行（UTF-8 字节 + '\n'）；管道断开返回 false。
     public bool WriteLine(string line) {
-        if (disposed || stdinWrite == 0) { return false; }
-        int len = line.Length;
-        byte[] buf = new byte[len + 1];
-        for (int i = 0; i < len; i = i + 1) {
-            buf[i] = (byte)((int)line[i] & 255);
-        }
-        buf[len] = 10; // '\n'
+        if (disposed || stdinWrite == 0 || line == null) { return false; }
+        byte[] buf = System.Text.Encoding.UTF8.GetBytes(line + "\n");
+        #if WINDOWS
         byte[] numWritten = new byte[4];
-        return WinWriteFile(stdinWrite, buf, len + 1, numWritten, 0) != 0;
+        return WinWriteFile(stdinWrite, buf, buf.Length, numWritten, 0) != 0
+            && ReadIntLE(numWritten, 0) == buf.Length;
+        #elif LINUX || MACOS
+        return ProcessSpawn.PosixWrite((int)stdinWrite, buf, buf.Length) != 0;
+        #else
+        return false;
+        #endif
     }
 
-    /// 强制终止子进程。
+    /// 强制终止直接子进程；不承诺终止已脱离或自行建立的进程组/作业的后代。
     public bool Kill() {
-        if (disposed || hProcess == 0) { return false; }
+        if (disposed) { return false; }
+        #if WINDOWS
+        if (hProcess == 0) { return false; }
         return WinTerminateProcess(hProcess, 1) != 0;
+        #elif LINUX || MACOS
+        return !exited && ProcessSpawn.PosixKill(pid) != 0;
+        #else
+        return false;
+        #endif
     }
 
     /// 等待退出并返回退出码；timeoutMs <= 0 表示无限等。超时返回 -258
     /// （WAIT_TIMEOUT 的显式记号，不代杀；调用方自行 Kill 后再收尸）。
     public int WaitExitCode(int timeoutMs) {
-        if (disposed || hProcess == 0) { return 0 - 1; }
+        if (disposed) { return 0 - 1; }
+        #if WINDOWS
+        if (hProcess == 0) { return 0 - 1; }
         int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
-        if (WinWaitForSingleObject(hProcess, waitMs) == 258) { return 0 - 258; }
-        byte[] cb = new byte[8];
-        WinGetExitCodeProcess(hProcess, cb);
+        int waited = WinWaitForSingleObject(hProcess, waitMs);
+        if (waited == 258) { return 0 - 258; }
+        if (waited != 0) { return 0 - 1; }
+        byte[] cb = new byte[4];
+        if (WinGetExitCodeProcess(hProcess, cb) == 0) { return 0 - 1; }
         return ReadIntLE(cb, 0);
+        #elif LINUX || MACOS
+        if (exited) { return exitCode; }
+        int code = ProcessSpawn.PosixWait(pid, timeoutMs);
+        if (code != 0 - 258) {
+            exited = true;
+            exitCode = code;
+        }
+        return code;
+        #else
+        return 0 - 1;
+        #endif
     }
 
-    /// 关闭全部句柄。之后 Read/Write/Kill 一律失败。
+    /// 关闭全部句柄。POSIX 上会终止仍在运行的直接子进程并回收退出状态。
+    /// 之后 Read/Write/Kill 一律失败。
     public void Dispose() {
         if (disposed) { return; }
         disposed = true;
+        #if WINDOWS
         if (stdinWrite != 0) { WinCloseHandle(stdinWrite); stdinWrite = 0; }
         if (stdoutRead != 0) { WinCloseHandle(stdoutRead); stdoutRead = 0; }
         if (hThread != 0) { WinCloseHandle(hThread); hThread = 0; }
         if (hProcess != 0) { WinCloseHandle(hProcess); hProcess = 0; }
+        #elif LINUX || MACOS
+        ProcessSpawn.PosixDispose(exited ? 0 : pid, (int)stdinWrite, (int)stdoutRead);
+        stdinWrite = 0;
+        stdoutRead = 0;
+        #endif
     }
 }

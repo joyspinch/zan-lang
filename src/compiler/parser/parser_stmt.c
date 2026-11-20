@@ -73,6 +73,7 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
                 init = parse_tuple_decon_body(p, loc, dtype);
             } else {
                 for (;;) {
+                    zan_loc_t name_loc = p->current.loc;
                     zan_istr_t name = {0};
                     if (parser_check(p, TK_IDENT)) {
                         parser_advance(p);
@@ -88,6 +89,7 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
                     zan_ast_node_t *decl = zan_ast_new(p->arena,
                         AST_VAR_DECL, loc);
                     decl->var_decl.name = name;
+                    decl->var_decl.name_loc = name_loc;
                     decl->var_decl.type = dtype;
                     decl->var_decl.initializer = dinit;
                     decl->var_decl.is_const = is_const;
@@ -158,6 +160,7 @@ static zan_ast_node_t *parse_foreach_stmt(zan_parser_t *p) {
         parser_advance(p);
     }
 
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t var_name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -171,6 +174,7 @@ static zan_ast_node_t *parse_foreach_stmt(zan_parser_t *p) {
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_FOREACH_STMT, loc);
     n->foreach_stmt.var_name = var_name;
+    n->foreach_stmt.name_loc = name_loc;
     n->foreach_stmt.var_type = var_type;
     n->foreach_stmt.collection = collection;
     n->foreach_stmt.body = body;
@@ -605,12 +609,14 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_LPAREN);
 
         zan_istr_t name = {NULL, 0};
+        zan_loc_t name_loc = {0};
         zan_ast_node_t *type = NULL;
         zan_ast_node_t *init = NULL;
 
         if (looks_like_var_decl(p)) {
             zan_ast_node_t *tref = parse_type_ref(p);
             type = tref;
+            name_loc = p->current.loc;
             if (parser_check(p, TK_IDENT)) {
                 parser_advance(p);
                 name = p->previous.str_val;
@@ -637,6 +643,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         if (type || !init) {
             zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
             decl->var_decl.name = name;
+            decl->var_decl.name_loc = name_loc;
             decl->var_decl.type = type;
             decl->var_decl.initializer = init;
             decl->var_decl.is_const = false;
@@ -708,6 +715,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_LPAREN);
         zan_ast_node_t *type = parse_type_ref(p);
         parser_match(p, TK_STAR);
+        zan_loc_t name_loc = p->current.loc;
         parser_expect(p, TK_IDENT);
         zan_istr_t vname = p->previous.str_val;
         parser_expect(p, TK_EQ);
@@ -715,6 +723,7 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_RPAREN);
         zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
         decl->var_decl.name = vname;
+        decl->var_decl.name_loc = name_loc;
         decl->var_decl.type = type;
         decl->var_decl.initializer = init;
         decl->var_decl.is_const = false;

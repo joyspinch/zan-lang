@@ -286,7 +286,7 @@
                      * 在使用现场推出来的，检查器这里不知道，error 类型让
                      * 后续检查安静降级（`checker_check_assignable` 见到
                      * error 就直接返回）。 */
-                    checker_add_local_permissive(c, p->param.name, pt);
+                    checker_add_local_permissive(c, p->param.name, pt, p);
                     checker_bind_byref_parameter(c, p);
                 }
             }
@@ -317,7 +317,7 @@
         if (!elem && src_ty && src_ty->type_args && src_ty->type_arg_count > 0)
             elem = src_ty->type_args[0];
         if (!elem) elem = c->binder->type_int;
-        checker_add_local(c, expr->query.var, elem);
+        checker_add_local(c, expr->query.var, elem, NULL);
         for (int ci = 0; ci < expr->query.clauses.count; ci++) {
             zan_ast_node_t *cl = expr->query.clauses.items[ci];
             if (cl->kind == AST_QUERY_JOIN) {
@@ -329,16 +329,16 @@
                     je = jty->type_args[0];
                 if (!je) je = c->binder->type_int;
                 zan_checker_check_expr(c, cl->query_clause.left_key);
-                checker_add_local(c, cl->query_clause.name, je);
+                checker_add_local(c, cl->query_clause.name, je, NULL);
                 zan_checker_check_expr(c, cl->query_clause.right_key);
                 if (cl->query_clause.into.len > 0)
                     checker_add_local(c, cl->query_clause.into,
-                        zan_binder_make_list_type(c->binder, je));
+                        zan_binder_make_list_type(c->binder, je), NULL);
             } else {
                 zan_type_t *ct = zan_checker_check_expr(c,
                     cl->query_clause.expr);
                 if (cl->kind == AST_QUERY_LET)
-                    checker_add_local(c, cl->query_clause.name, ct);
+                    checker_add_local(c, cl->query_clause.name, ct, NULL);
             }
         }
         if (expr->query.group_expr) {
@@ -347,7 +347,7 @@
             zan_checker_check_expr(c, expr->query.group_key);
             zan_type_t *grp = zan_binder_make_grouping_type(c->binder, ge);
             if (expr->query.group_into.len > 0) {
-                checker_add_local(c, expr->query.group_into, grp);
+                checker_add_local(c, expr->query.group_into, grp, NULL);
                 zan_type_t *sel =
                     zan_checker_check_expr(c, expr->query.select);
                 if (!sel) sel = ge;
@@ -414,7 +414,7 @@
             if (arm->switch_arm.type_pattern && arm->switch_arm.var_name.len > 0) {
                 zan_type_t *pt = zan_binder_resolve_type(
                     c->binder, arm->switch_arm.type_pattern);
-                checker_add_local(c, arm->switch_arm.var_name, pt);
+                checker_add_local(c, arm->switch_arm.var_name, pt, NULL);
                 if (arm->switch_arm.when_cond == NULL &&
                     (pt && (pt->kind == TYPE_OBJECT || pt == disc_type))) {
                     seen_wildcard = true;

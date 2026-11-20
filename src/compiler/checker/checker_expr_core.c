@@ -89,7 +89,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
              * check_call_arg_type 里做（check_call_arg_type 拿不到
              * place 的推导结果——REF_ARG 整体定型为 error）。 */
             expr->ref_arg.place_type = dt;
-            checker_add_local_permissive(c, place->ident.name, dt);
+            checker_add_local_permissive(c, place->ident.name, dt, expr);
         } else {
             expr->ref_arg.place_type = zan_checker_check_expr(c, place);
         }
@@ -103,6 +103,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_symbol_t *ts = zan_binder_type_receiver(c->binder, expr);
             return ts && ts->type ? ts->type : c->binder->type_error;
         }
+        if (c->lexical_ref) checker_record_lexical_ref(c, expr);
         checker_reject_byref_capture(c, expr->ident.name);
         zan_type_t *lt = checker_find_local(c, expr->ident.name);
         if (lt) return lt;

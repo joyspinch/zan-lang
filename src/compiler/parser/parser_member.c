@@ -67,6 +67,7 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
 
     zan_ast_node_t *type = parse_type_ref(p);
 
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -83,6 +84,7 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
 
     zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
     param->param.name = name;
+    param->param.name_loc = name_loc;
     param->param.type = type;
     param->param.default_val = default_val;
     param->param.is_params = is_params;

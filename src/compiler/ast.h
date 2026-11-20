@@ -158,6 +158,7 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *inst_type_ref;
             struct zan_type *method_group_target; /* target, never an instance-specific candidate */
+            bool source_ident; /* identifier expression spelled in the source */
             bool is_type_receiver; /* nsresolve proved an explicit qualified type */
             int variance; /* 0: invariant, 1: covariant (out), -1: contravariant (in) */
             const zan_ast_node_t *ns_decl; /* resolved static receiver across nsresolve passes */
@@ -238,6 +239,7 @@ struct zan_ast_node {
         zan_ast_node_t *initializer; /* NULL if none */
         bool is_const;               /* const */
         bool is_let;                 /* let (immutable) */
+        zan_loc_t name_loc;          /* zero line for synthesized declarations */
     } var_decl;
 
     struct {
@@ -289,6 +291,7 @@ struct zan_ast_node {
         struct {
             zan_istr_t var_name;
             zan_ast_node_t *var_type; /* NULL if var */
+            zan_loc_t name_loc;
             zan_ast_node_t *collection;
             zan_ast_node_t *body;
         } foreach_stmt;
@@ -461,6 +464,7 @@ struct zan_ast_node {
             int is_params;
             int by_ref;    /* 0 = by value, 1 = `ref`, 2 = `out` */
             int is_this;
+            zan_loc_t name_loc;
         } param;
 
         struct {

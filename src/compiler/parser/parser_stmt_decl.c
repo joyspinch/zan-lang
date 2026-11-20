@@ -449,6 +449,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
         return parse_tuple_decon_body(p, loc, type);
     }
 
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -464,6 +465,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
 
     zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
     decl->var_decl.name = name;
+    decl->var_decl.name_loc = name_loc;
     decl->var_decl.type = type;
     decl->var_decl.initializer = init;
     decl->var_decl.is_const = is_const;
@@ -471,6 +473,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
 
     zan_ast_list_init(&p->pending_stmts);
     while (parser_match(p, TK_COMMA)) {
+        zan_loc_t more_loc = p->current.loc;
         zan_istr_t more = {0};
         if (parser_check(p, TK_IDENT)) {
             parser_advance(p);
@@ -486,6 +489,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
         }
         zan_ast_node_t *md = zan_ast_new(p->arena, AST_VAR_DECL, loc);
         md->var_decl.name = more;
+        md->var_decl.name_loc = more_loc;
         md->var_decl.type = type;
         md->var_decl.initializer = more_init;
         md->var_decl.is_const = is_const;

@@ -35,7 +35,7 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
         zan_ast_node_t *p = method->method_decl.params.items[j];
         if (p && p->kind == AST_PARAM) {
             zan_type_t *pt = zan_binder_resolve_type(c->binder, p->param.type);
-            checker_add_local(c, p->param.name, pt);
+            checker_add_local(c, p->param.name, pt, p);
             checker_bind_byref_parameter(c, p);
         }
     }

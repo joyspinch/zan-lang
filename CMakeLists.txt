@@ -8853,9 +8853,28 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(tool_lsp_zan_session PROPERTIES TIMEOUT 120)
 endif()
 
+if(Python3_Interpreter_FOUND)
+  add_test(NAME tool_mcp_process_governance
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/mcp_process_governance.py
+      --zanc $<TARGET_FILE:zanc>
+      --exe ${CMAKE_BINARY_DIR}/cases/tool_mcp_process_governance${_exe_ext}
+      --root ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out)
+  set_tests_properties(tool_mcp_process_governance PROPERTIES TIMEOUT 180)
+
+  add_test(NAME tool_zanc_diagnostics_jsonl
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_zanc_diagnostics.py
+      $<TARGET_FILE:zanc>)
+  set_tests_properties(tool_zanc_diagnostics_jsonl PROPERTIES TIMEOUT 120)
+
+  add_test(NAME tool_zanc_semantic_refs
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_zanc_semantic_refs.py
+      --zanc $<TARGET_FILE:zanc>)
+  set_tests_properties(tool_zanc_semantic_refs PROPERTIES TIMEOUT 120)
+endif()
+
 # ---- ProcessSpawn (live-process pipe primitives, B-ID202) ----
-# Interactive: drives cmd.exe over stdin/stdout pipes (echo roundtrip + exit
-# code). POSIX prints the single-line SKIP marker (Windows-first slice).
+# Exercises interactive pipes and exit status on Windows and POSIX.
 add_test(NAME unit_process_spawn
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

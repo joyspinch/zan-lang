@@ -396,6 +396,7 @@ static char *read_file_arena(zan_arena_t *arena, const char *path, size_t *out_l
 }
 
 #include "driver/main_sources.c"
+#include "driver/main_semantic_refs.c"
 
 
 
@@ -857,7 +858,7 @@ int main(int argc, char **argv) {
     char *source = read_file(input_file, &source_len);
     if (!source) return 1;
     if (do_dump_tokens) {
-        dump_tokens(source, source_len, input_file);
+        dump_tokens(source, source_len, input_file, opts.diagnostics_jsonl);
         free(source);
         return 0;
     }

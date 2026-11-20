@@ -316,6 +316,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             zan_ast_list_init(&n->lambda.params);
             zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
             param->param.name = param_name;
+            param->param.name_loc = loc;
             param->param.type = NULL;
             param->param.default_val = NULL;
             zan_ast_list_push(&n->lambda.params, param, p->arena);
@@ -325,6 +326,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
         n->ident.name = p->previous.str_val;
+        n->ident.source_ident = true;
         return n;
     }
     case TK_LPAREN: {
@@ -398,6 +400,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             if (expr->kind == AST_IDENTIFIER) {
                 zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
                 param->param.name = expr->ident.name;
+                param->param.name_loc = expr->loc;
                 param->param.type = NULL;
                 param->param.default_val = NULL;
                 zan_ast_list_push(&n->lambda.params, param, p->arena);

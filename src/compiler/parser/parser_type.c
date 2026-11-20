@@ -452,12 +452,14 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
             parser_advance(p);
             zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
             pn->param.name = p->previous.str_val;
+            pn->param.name_loc = p->previous.loc;
             pn->param.type = NULL;
             pn->param.default_val = NULL;
             return pn;
         }
     }
     zan_ast_node_t *type = parse_type_ref(p);
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -465,6 +467,7 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     }
     zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
     pn->param.name = name;
+    pn->param.name_loc = name_loc;
     pn->param.type = type;
     pn->param.default_val = NULL;
     return pn;

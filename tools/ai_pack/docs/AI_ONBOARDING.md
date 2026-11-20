@@ -120,6 +120,13 @@ regenerated separately when it is missing.
    file/line/column, so the model fixes real errors instead of imagining them.
 7. **`run_command`** — run the program or the tests.
 
+Use `zan_find_refs {file: "src/App.zan", line: 12, col: 9}` to find reads and
+writes bound to a local variable or parameter in a file that type-checks on its
+own with the SDK dependencies. Coordinates are 1-based and the column counts
+UTF-8 bytes. The server requires a writable session and a compiler that lists
+`--semantic-refs` in `--help`. For repository-wide identifier candidates and
+declared subtypes, use `zan_find_refs {name: "ReadAllText"}` with the RepoMap index.
+
 Resources for whole-project context, no directory walking:
 `repo://map` (file map), `repo://symbols` (symbol index), `repo://routes` (HTTP
 routes) — as produced by `tools/repomap` into `.zanmap/`.
@@ -141,6 +148,15 @@ One shared HTTP deployment for every project and client — `scripts\serve-mcp.p
 or `scripts/serve-mcp.sh`, details in `MCP_HOSTING.md`. `--frozen-tools`
 belongs there: a catalog that does not shift per workspace is what keeps the
 client's cached prompt prefix valid.
+
+`run_command` uses the workspace or its requested subdirectory as the shell's
+working directory. `timeoutMs` defaults to 120000 and accepts 1–3600000.
+`maxOutputBytes` defaults to 1048576 and accepts 1–8388608. These budgets apply
+per child process. Read `status`, `exitCode`, and `outputTruncated` to interpret
+the result. On stdio, send `notifications/cancelled` with the original
+`params.requestId` to cancel its pending or running process work. The server
+terminates the direct child. Shell commands have the filesystem and network
+permissions of the server account, so enable execution for trusted clients.
 
 Give `--read-only` to a tool you do not want writing to disk, and always pair a
 non-loopback `--host` with a token (`--token-env` keeps it out of the process

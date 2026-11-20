@@ -319,6 +319,8 @@ TypeInfo 仍是指向类型名的值，15 槽头部及各负偏移保持；公�
 
 POSIX `StartProgram` 用 CLOEXEC 错误管道确认最终 exec，重定向或 exec 失败必须回报启动失败；成功 exec 后程序自行退出 127 仍属启动成功。用 `process_capture_timeout` 和 `rt_proc_contract_test.c` 分别核对 API 与原生边界，覆盖无输出、持续输出、超时快照、后代持管、启动失败及正常退出回收；双平台分别留证，已有断言通过不替代新增边界的验证。
 
+平台专属 `DllImport` 声明与调用都按目标平台加条件。`ProcessSpawn` 曾只保护调用，未保护的 Win32 声明被 Linux MCP 的编译链接收进 `-lkernel32`，导致真实消费者无法构建。将声明并入 `#if WINDOWS` 与 `#elif LINUX || MACOS` 后，Linux MCP 重新编译并通过 stdio 回归。
+
 ## 14. 原生加速归档按功能提取（2026-11-18 Windows 验证）
 
 - **以归档成员作为依赖边界**：`libzancrypto.a` 的 aes/asym/b64/cpu/crc/gcm/hash/json/pixel/sm

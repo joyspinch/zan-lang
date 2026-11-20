@@ -51,6 +51,7 @@ struct zan_diag {
     /* 达到 max_errors 错误上限后丢弃的错误数 */
     int  suppressed_errors;
     bool limit_notice_shown;
+    bool jsonl;
     const char *const *file_names;  /* indexed by file_id */
     const char *const *file_sources; /* indexed by file_id */
     int file_count;

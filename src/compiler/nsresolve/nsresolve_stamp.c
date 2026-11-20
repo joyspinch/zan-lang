@@ -664,6 +664,7 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv,
     recv->ident.name = t->final;
     recv->ident.inst_type_ref = NULL;
     recv->ident.method_group_target = NULL;
+    recv->ident.source_ident = false;
     recv->ident.is_type_receiver = true;
     recv->ident.variance = 0;
     recv->ident.ns_decl = t->decl;

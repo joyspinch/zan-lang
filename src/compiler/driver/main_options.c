@@ -79,6 +79,8 @@ void print_usage(void) {
     fprintf(stderr, "                     OverflowException (C# /checked+); unchecked(){ }\n");
     fprintf(stderr, "                     blocks opt out locally\n");
     fprintf(stderr, "    --strict-runtime  Guard failures exit(70); ZAN_RT_HARD=0 forces soft mode\n");
+    fprintf(stderr, "    --diagnostics-format=jsonl  Emit tagged compiler diagnostics as JSON Lines on stderr\n");
+    fprintf(stderr, "    --diagnostics-format=text   Use human-readable compiler diagnostics (default)\n");
     fprintf(stderr, "    --deny-warnings   Treat compiler warnings as fatal errors\n");
     fprintf(stderr, "    --warn-level <lv> none | default | error (default: default;\n");
     fprintf(stderr, "                     error = --deny-warnings)\n");
@@ -89,6 +91,8 @@ void print_usage(void) {
     fprintf(stderr, "    --emit-ir       Emit LLVM IR to stdout and exit without linking\n");
     fprintf(stderr, "    zanc --compile-ir <input.ll> -o <object> [--target <LLVM triple>] [-O0..-O3/-Os/-Oz]\n");
     fprintf(stderr, "    --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
+    fprintf(stderr, "    --semantic-refs <file> <line> <col>  Check and print local or parameter references as JSON\n");
+    fprintf(stderr, "                       Positions use 1-based lines and UTF-8 byte columns\n");
     fprintf(stderr, "    --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "    --gen-meta-bodies  Include calls and typeof expressions in method metadata\n");
     fprintf(stderr, "    --api <symbol>   Query member signatures and types from API index\n");

@@ -793,8 +793,28 @@ later exits with code `127` is still a successful launch. A nonempty `logPath`
 redirects stdout and stderr to that file. The return value describes startup,
 not the program's eventual exit status.
 
-`Process.Spawn` currently provides live stdin/stdout pipes on Windows; the
-POSIX implementation returns `null`.
+`ProcessSpawn.Spawn(exe, args, cwd)` starts a child with a live stdin pipe and
+one output pipe for stdout and stderr on Windows, Linux, and macOS. An empty
+`cwd` inherits the caller's working directory. On POSIX, executable names without a
+slash are looked up in `PATH`, and arguments are passed directly as argv values.
+Launch failures, including an invalid working directory or a failed `exec`,
+return `null`. A program that launches and exits with code `127` yields a
+`ProcessSpawn` whose `WaitExitCode` returns `127`. Unsupported targets,
+including WebAssembly, return `null`. POSIX cross-compilation requires a
+`zanrt_sync.o` for the target built from the matching runtime source.
+
+`ReadAvailable(maxBytes)` reads up to the requested byte count without blocking
+and returns an empty string if no bytes are available. Each POSIX read is also
+capped at 64 KiB. `WriteLine` writes UTF-8 followed by a newline and can block
+while the child reads. On POSIX a broken input pipe returns `false` without
+changing the host's SIGPIPE handling.
+
+`WaitExitCode(timeoutMs)` waits indefinitely for a nonpositive timeout. A
+positive timeout returns `-258` if the child is still running. On POSIX, a
+completed wait reaps the child and caches its exit code. `Dispose` closes the
+pipes and on POSIX terminates any still-running direct child and reaps it.
+`Kill` and `Dispose` on POSIX act on the direct child only. Use one caller at a
+time per instance.
 
 ### 3.10 Zan.Gui — retained preparation and style contracts
 

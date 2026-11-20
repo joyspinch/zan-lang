@@ -3,10 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 
-/// unit_process_spawn：验证 ProcessSpawn 活进程管道原语。
-/// 交互式驱动 cmd.exe：stdin 写 `echo`，stdout 非阻塞读回，然后 `exit`
-/// 收尸断言退出码 0。POSIX 侧 ProcessSpawn.Spawn 尚未实现（Windows-first），
-/// 按 harness 的 SKIP 约定单行跳过。
+/// unit_process_spawn：验证 ProcessSpawn 的交互管道和退出行为。
 public static class ProcessSpawnCase {
     static string acc = "";
 
@@ -57,11 +54,129 @@ public static class ProcessSpawnCase {
         Console.WriteLine("PASS process_spawn");
     }
 
+    #if LINUX || MACOS
+    [DllImport("crt", EntryPoint = "waitpid")]
+    private static extern int WaitPid(int pid, int[] status, int options);
+
+    [DllImport("crt", EntryPoint = "signal")]
+    private static extern nint SetSignal(int signal, nint handler);
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static ProcessSpawn SpawnShell(string script) {
+        List<string> args = new List<string>();
+        args.Add("-c");
+        args.Add(script);
+        ProcessSpawn child = ProcessSpawn.Spawn("sh", args);
+        if (child == null) { throw new Exception("shell launch failed"); }
+        return child;
+    }
+
+    static void CheckInteractive() {
+        List<string> args = new List<string>();
+        args.Add("-c");
+        args.Add("printf 'cwd=<%s>\\n' \"$(pwd -P)\"; printf 'arg=<%s>\\n' \"$@\" >&2; "
+            + "IFS= read -r line; printf 'line=<%s>\\n' \"$line\"; exit 23");
+        args.Add("zan-spawn"); // sh -c uses the first following value as $0.
+        args.Add("a b;\"$雪");
+        args.Add("");
+        ProcessSpawn child = ProcessSpawn.Spawn("sh", args, "/");
+        if (child == null) { throw new Exception("interactive launch failed"); }
+        try {
+            Check(child.Pid() > 0, "invalid child PID");
+            Check(child.ReadAvailable(0) == "", "zero read budget");
+            Check(child.WriteLine("hello \\pipe"), "stdin write failed");
+            Check(child.WaitExitCode(4000) == 23, "interactive exit code");
+            Check(child.WaitExitCode(0) == 23, "wait must return the same exit code");
+            string output = "";
+            while (true) {
+                string chunk = child.ReadAvailable(3);
+                Check(chunk.Length <= 3, "read exceeded its byte budget");
+                if (chunk == "") { break; }
+                output = output + chunk;
+            }
+            Check(output == "cwd=</>\narg=<a b;\"$雪>\narg=<>\nline=<hello \\pipe>\n",
+                "cwd, argv or combined output mismatch: " + output);
+            Check(WaitPid(child.Pid(), new int[1], 1) == -1, "wait left an unreaped child");
+        } finally {
+            child.Dispose();
+        }
+    }
+
+    static void CheckLifecycle() {
+        string missing = "/zan-process-spawn-test-path-does-not-exist";
+        Check(ProcessSpawn.Spawn(missing, null) == null, "missing executable accepted");
+        Check(ProcessSpawn.Spawn("sh", null, missing) == null, "missing cwd accepted");
+        Check(WaitPid(-1, new int[1], 1) == -1, "launch failure left a child behind");
+
+        ProcessSpawn child = SpawnShell("exit 127");
+        try {
+            Check(child.WaitExitCode(4000) == 127, "exit 127 confused with launch failure");
+            nint previous = SetSignal(13, 0); // SIGPIPE, SIG_DFL
+            Check(previous != -1, "could not install default SIGPIPE behavior");
+            try {
+                Check(!child.WriteLine("closed pipe"), "broken pipe write reported success");
+            } finally {
+                Check(SetSignal(13, previous) == 0, "write changed the SIGPIPE handler");
+            }
+        } finally {
+            child.Dispose();
+        }
+
+        ProcessSpawn killed = SpawnShell("exec sleep 10");
+        try {
+            Check(killed.ReadAvailable(2147483647) == "", "silent pipe must not block or allocate the full budget");
+            Check(killed.WaitExitCode(20) == -258, "wait timeout");
+            Check(killed.Kill(), "kill failed after timeout");
+            Check(killed.WaitExitCode(4000) == 137, "signal exit code");
+        } finally {
+            killed.Dispose();
+        }
+
+        ProcessSpawn disposed = SpawnShell("exec sleep 10");
+        int pid = disposed.Pid();
+        disposed.Dispose();
+        disposed.Dispose();
+        Check(WaitPid(pid, new int[1], 1) == -1, "dispose left an unreaped child");
+        Check(disposed.WaitExitCode(20) == -1 && disposed.ReadAvailable() == ""
+            && !disposed.WriteLine("closed") && !disposed.Kill(), "disposed process remained usable");
+    }
+
+    #if LINUX
+    static void CheckPipeIsolation() {
+        ProcessSpawn first = SpawnShell("IFS= read -r line");
+        try {
+            string fdDir = "/proc/" + Convert.ToString(first.Pid()) + "/fd/";
+            ProcessSpawn second = SpawnShell("input=$(readlink " + fdDir + "0) || exit 2; "
+                + "output=$(readlink " + fdDir + "1) || exit 3; "
+                + "for fd in /proc/$$/fd/*; do link=$(readlink \"$fd\") || continue; "
+                + "[ \"$link\" != \"$input\" ] && [ \"$link\" != \"$output\" ] || exit 4; done");
+            try {
+                Check(second.WaitExitCode(4000) == 0, "unrelated child inherited another job's pipe");
+            } finally {
+                second.Dispose();
+            }
+        } finally {
+            first.Dispose();
+        }
+    }
+    #endif
+    #endif
+
     public static void Main() {
         #if WINDOWS
         RunCase();
+        #elif LINUX || MACOS
+        CheckInteractive();
+        CheckLifecycle();
+        #if LINUX
+        CheckPipeIsolation();
+        #endif
+        Console.WriteLine("PASS process_spawn");
         #else
-        Console.WriteLine("SKIP: ProcessSpawn is Windows-first; POSIX pipes are a later slice");
+        Console.WriteLine("SKIP: ProcessSpawn requires native subprocess support");
         #endif
     }
 }

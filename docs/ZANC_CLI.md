@@ -240,6 +240,25 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
+| `--diagnostics-format=jsonl` / `--diagnostics-format=text` | `text` | C 编译器诊断输出格式。`jsonl` 按行向 stderr 写入 UTF-8 JSON，沿用告警与错误限额策略。 |
+| `--semantic-refs <file> <line> <col>` | — | C 编译器完成类型检查后查询指定位置绑定的局部变量或参数，向 stdout 写一行 JSON。 |
+
+每条 JSON 诊断带有 `format` 值 `zan-diagnostic-v1`。`severity` 为 `error`、`warning` 或
+`note`，`file` 为编译器记录的源文件路径或 `null`，`line` 和 `col` 从 1 起计，未知时为 0，列按字节计。
+`code` 为编号字符串（如 `W0003`，升级为错误时仍保留编号）或 `null`，`message` 为不带编号前缀的消息。
+路径或消息中的非法 UTF-8 字节以 U+FFFD 表示。
+命令行错误、构建摘要及链接器输出沿用原有文本和输出流。调用方应保留 stdout 和 stderr 中的文本以供排查。
+
+工具应对实际选中的编译器执行 `--help`，检查退出码为 0 且任一输出流中有一行以
+`--diagnostics-format=jsonl` 为首个空白分隔的字段。探测失败或缺少该字段时，省略此参数并处理文本输出。
+
+`--semantic-refs` 接收普通编译输入及其标准库、包和目标选项。`file` 对应其中一个源文件，`line`
+和 `col` 分别为从 1 起计的行和 UTF-8 字节列。查询位置可以在声明或使用点的标识符内。
+成功返回 `format` 为 `zan.semantic-refs.v1` 的对象，`symbol` 包含 `kind`（`local` 或
+`parameter`）、`name` 和 `declaration`。`references` 按源码顺序返回去重后的读写位置。
+每个位置含 `file`、`line`、`col` 和 UTF-8 字节长度 `length`，声明位置只出现在 `declaration`。
+未绑定到受支持符号时返回 `symbol: null` 与空 `references`。前端错误沿用编译诊断和非零退出码。
+查询在代码生成前结束。工具可在 `--help` 输出中查找首字段 `--semantic-refs` 来探测支持。
 
 ### 2.4 打包（Packaging）
 | 参数 | 取值 / 默认 | 说明 |
