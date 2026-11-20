@@ -26,8 +26,7 @@ file(REMOVE "${_logs}/passed.txt")
 set(_ext "")
 if(WIN32)
   set(_ext .exe)
-  # Resolve existing driver DLLs in place; never copy DLLs or the stdlib.
-  set(ENV{PATH} "${BUILD_DIR};${_root}/packages/Zan.Data/src/System/Data/Sqlite/drivers/win-x64;$ENV{PATH}")
+  set(ENV{PATH} "${BUILD_DIR};$ENV{PATH}")
 endif()
 set(ENV{ZAN_STDLIB_PATH} "${_root}/stdlib")
 

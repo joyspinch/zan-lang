@@ -329,7 +329,7 @@ public partial class Program {
         return "clang";
     }
 
-    static void LinkExe(string outPath, string llPath, string optLevel) {
+    static void LinkExe(string outPath, string llPath, string optLevel, List<string> linkInputs) {
         string exe = Environment.ExeDir();
         string rtDir = exe;
         if (!File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
@@ -371,6 +371,11 @@ public partial class Program {
                 args.Add(rtDir + "/libzancrypto.a");
             }
         }
+        int i = 0;
+        while (i < linkInputs.Count) {
+            args.Add(linkInputs[i]);
+            i = i + 1;
+        }
         args.Add("-lkernel32");
         args.Add("-lshell32");
         args.Add("-luser32");
@@ -380,7 +385,7 @@ public partial class Program {
         args.Add("-lbcrypt");
         args.Add("-o");
         args.Add(outPath);
-        int rc = Process.RunSafe(FindClang(), args);
+        int rc = Process.RunWithStandardStreams(FindClang(), args);
         if (rc != 0) {
             throw "zanc: linking failed with exit code " + rc;
         }
@@ -410,10 +415,11 @@ public partial class Program {
         packageProject = "";
         string optLevel = "-O2";
         List<string> rawInputs = new List<string>();
+        List<string> linkInputs = new List<string>();
         int i = 0;
         while (i < argc) {
             string a = Environment.ArgAt(i);
-            if (a == "-o" || a == "--target" || a == "--package-project") {
+            if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input") {
                 if (i + 1 >= argc || Environment.ArgAt(i + 1) == ""
                     || Environment.ArgAt(i + 1).StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -433,6 +439,16 @@ public partial class Program {
             // Do not promise debug metadata or packaging by only changing -O.
             if (a == "-g" || a == "--debug" || a == "--publish" || a == "-c" || a == "-S") {
                 throw "zanc: option '" + a + "' is not supported by the self-hosted driver";
+            }
+            if (a == "--link-input") {
+                // An absolute path cannot be interpreted as a clang flag or @response file.
+                string input = Path.GetFullPath(Environment.ArgAt(i + 1));
+                if (!File.Exists(input)) {
+                    throw "zanc: link input file does not exist: '" + input + "'";
+                }
+                linkInputs.Add(input);
+                i = i + 2;
+                continue;
             }
             if (a == "--package-project") {
                 packageProject = Environment.ArgAt(i + 1);
@@ -482,6 +498,10 @@ public partial class Program {
                 Console.WriteLine("usage: zanc -o <output> <input.zan|dir|@file> [more ...]");
                 throw "zanc: no input files";
             }
+        }
+        bool isExe = outPath.Length >= 4 && outPath.Substring(outPath.Length - 4, 4) == ".exe";
+        if (linkInputs.Count > 0 && (!isExe || emitLib)) {
+            throw "zanc: --link-input requires executable output";
         }
         inclPaths = new List<string>();
         inclSrcs = new List<string>();
@@ -570,7 +590,6 @@ public partial class Program {
                 if (!d.HasErrors()) { throw "zanc: compilation failed: warnings denied by --deny-warnings"; }
                 throw "zanc: compilation failed";
             }
-            bool isExe = outPath.Length >= 4 && outPath.Substring(outPath.Length - 4, 4) == ".exe";
             if (isExe && !emitLib) {
                 string finalPath = Path.GetFullPath(outPath);
                 string suffix = Guid.New();
@@ -582,7 +601,7 @@ public partial class Program {
                 string exePath = workDir + "/program.exe";
                 try {
                     File.WriteAllText(llPath, ir);
-                    LinkExe(exePath, llPath, optLevel);
+                    LinkExe(exePath, llPath, optLevel, linkInputs);
                     if (Nio.ReplaceFile(exePath, finalPath) != 0) {
                         throw "zanc: cannot publish executable " + outPath;
                     }

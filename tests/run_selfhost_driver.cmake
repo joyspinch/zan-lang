@@ -27,6 +27,9 @@ reject_cli(unknown_short "unknown option '-Q'" -Q)
 reject_cli(target_missing "option '--target' requires a value" --target)
 reject_cli(output_missing "option '-o' requires a value" -o)
 reject_cli(project_missing "option '--package-project' requires a value" --package-project)
+reject_cli(link_input_missing "option '--link-input' requires a value" --link-input)
+reject_cli(link_input_absent "link input file does not exist" --link-input "${OUTDIR}/absent.obj")
+reject_cli(link_input_ir "--link-input requires executable output" --link-input "${_clean}")
 reject_cli(target_flag_value "option '--target' requires a value" --target --auto-stdlib)
 reject_cli(target_cross "target 'wasm32-wasi' is not supported" --target wasm32-wasi)
 reject_cli(target_invalid "target 'batch4-invalid' is not supported" --target batch4-invalid)
@@ -99,9 +102,16 @@ endif()
 
 if(WIN32 AND CLANG)
   set(_exe "${OUTDIR}/driver output.exe")
+  set(_native "${_root}/tests/selfhost/driver_native.zan")
+  set(_obj "${OUTDIR}/driver native.obj")
+  execute_process(COMMAND "${CLANG}" -c "${_root}/tests/selfhost/driver_native.c" -o "${_obj}"
+    RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "native fixture compilation failed, rc=${rc}\n${stdout}${stderr}")
+  endif()
   execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
-    "${GEN1}" -o "${_exe}" "${_clean}" --auto-stdlib -O0
-    WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
+    "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0 --link-input "driver native.obj"
+    WORKING_DIRECTORY "${OUTDIR}" RESULT_VARIABLE rc
     OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_exe}")
     message(FATAL_ERROR "direct executable link failed, rc=${rc}\n${stdout}${stderr}")
@@ -111,13 +121,13 @@ if(WIN32 AND CLANG)
     message(FATAL_ERROR "direct executable failed, rc=${rc}")
   endif()
   file(SHA256 "${_exe}" _before)
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CMAKE_COMMAND}"
-    "${GEN1}" -o "${_exe}" "${_clean}" --auto-stdlib -O0
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
+    "${GEN1}" -o "${_exe}" "${_native}" --auto-stdlib -O0
     WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
     OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
-  string(FIND "${stdout}${stderr}" "linking failed" _link_failure)
-  if("${rc}" STREQUAL "0" OR _link_failure EQUAL -1)
-    message(FATAL_ERROR "direct driver did not report link failure, rc=${rc}\n${stdout}${stderr}")
+  file(REMOVE "${_obj}")
+  if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "driver_native_twice")
+    message(FATAL_ERROR "expected an unresolved native symbol, rc=${rc}\n${stdout}${stderr}")
   endif()
   file(SHA256 "${_exe}" _after)
   file(GLOB _staging "${OUTDIR}/.zanc-*")
