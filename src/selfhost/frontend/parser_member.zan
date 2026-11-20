@@ -12,6 +12,7 @@ public partial class Parser {
         int fieldOffset = attrFieldOffset;
         string blob = attrBlob;
         string declaredData = attrDeclaredData;
+        List<Node> attributes = parsedAttributes;
         int mods = ParseMods();
         if (attrThreadEntry) { mods = mods + MOD.ThreadEntry(); }
         if (attrAtomicCas) { mods = mods + MOD.AtomicCas(); }
@@ -26,9 +27,11 @@ public partial class Parser {
         // unit top level afterwards (FlattenNested, mirroring the C host's
         // zan_parser_flatten_nested_types)
         int nk = K();
-        if (nk == TK.Class() || nk == TK.Struct()) { return ParseClass(mods, nk); }
-        if (nk == TK.Interface()) { return ParseInterface(mods); }
-        if (nk == TK.Enum()) { return ParseEnum(mods); }
+        Node nested = null;
+        if (nk == TK.Class() || nk == TK.Struct()) { nested = ParseClass(mods, nk); }
+        else if (nk == TK.Interface()) { nested = ParseInterface(mods); }
+        else if (nk == TK.Enum()) { nested = ParseEnum(mods); }
+        if (nested != null) { nested.attributes = attributes; return nested; }
         // nested named delegate type (e.g. a callback slot declared inside
         // the widget that uses it): parse like a top-level delegate and let
         // FlattenNested lift it to the unit
@@ -60,6 +63,7 @@ public partial class Parser {
             Node ctor = new Node(AK.CtorDecl());
             ctor.mods = mods;
             ctor.sval = className;
+            if (metadataMode) { ctor.line = Cur().line; ctor.col = Cur().col; ctor.attributes = attributes; }
             Next();
             ParseParams(ctor);
             // ctor initializer: `: base(args)` stored as a Call node in
@@ -87,6 +91,7 @@ public partial class Parser {
                 && K1() == TK.Ident() && toks[pos + 1].text == "operator") {
             return ParseConversionOperator(mods);
         }
+        Token typeStart = Cur();
         Node type = ParseType();
         Node member = new Node(AK.FieldDecl());
         member.mods = mods;
@@ -95,6 +100,7 @@ public partial class Parser {
         member.attrStaticAddr = attrStaticAddr;
         member.attrBlob = blob;
         member.attrDeclaredData = declaredData;
+        member.attributes = attributes;
         member.line = Cur().line; member.col = Cur().col;
         if (HasModBit(mods, MOD.Weak())) { type.mods = type.mods + MOD.Weak(); }
         if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { member.sval = Next().text; }
@@ -158,13 +164,15 @@ public partial class Parser {
         }
         // field (multi-declarator: `int a, b = 7, c;` -- extra declarators
         // ride as FieldDecl kids; the class-body loop flattens them)
+        if (metadataMode) { member.line = typeStart.line; member.col = typeStart.col; }
         if (Eat(TK.Eq())) { member.b = ParseExpr(); }
         while (At(TK.Comma())) {
             Next();
             Node fd = new Node(AK.FieldDecl());
             fd.mods = mods; fd.type = type; fd.fieldOffset = fieldOffset;
             fd.attrBlob = blob; fd.attrDeclaredData = declaredData;
-            fd.line = Cur().line; fd.col = Cur().col;
+            fd.line = metadataMode ? typeStart.line : Cur().line;
+            fd.col = metadataMode ? typeStart.col : Cur().col;
             if (HasModBit(mods, MOD.Weak())) { fd.type.mods = fd.type.mods + MOD.Weak(); }
             if (At(TK.Ident()) || At(TK.Get()) || At(TK.Set())) { fd.sval = Next().text; }
             if (Eat(TK.Eq())) { fd.b = ParseExpr(); }
@@ -286,22 +294,33 @@ public partial class Parser {
             ret.a = ParseExpr();
             body.Add(ret);
             Expect(TK.Semicolon());
+            if (metadataMode) { member.kind = AK.PropertyDecl(); member.ival = 1; return member; }
             group.Add(MakeGetter(name, type, mods, body));
             return group;
         }
         Expect(TK.LBrace());
         Node getBody = null; Node setBody = null;
+        int accessors = 0;
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             ParseMods(); // accessor-level modifiers, if any
             if (At(TK.Get()) || (At(TK.Ident()) && Cur().text == "get")) {
                 Next();
+                accessors = accessors | 1;
                 if (At(TK.LBrace())) { getBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
             } else if (At(TK.Set()) || (At(TK.Ident()) && Cur().text == "set")) {
                 Next();
+                accessors = accessors | 2;
                 if (At(TK.LBrace())) { setBody = ParseBlock(); } else { Expect(TK.Semicolon()); }
             } else { Next(); }
         }
         Expect(TK.RBrace());
+        if (metadataMode) {
+            member.kind = AK.PropertyDecl();
+            member.ival = accessors;
+            if (Eat(TK.Eq())) { member.b = ParseExpr(); }
+            Eat(TK.Semicolon());
+            return member;
+        }
         // both accessors bodyless => auto-property backing field
         if (getBody == null && setBody == null) {
             Node f = new Node(AK.FieldDecl());

@@ -330,6 +330,25 @@ public partial class Program {
         return "clang";
     }
 
+    static void WriteMetadata(string path, string contents) {
+        string destination = Path.GetFullPath(path);
+        string suffix = Guid.New();
+        string directory = Path.GetDirectoryName(destination) + "/.zanc-" + suffix;
+        if (suffix == "" || !Nio.CreateDirectoryExclusive(directory)) {
+            throw "zanc: cannot create a staging directory for " + path;
+        }
+        string staged = directory + "/declarations.json";
+        try {
+            File.WriteAllText(staged, contents);
+            if (Nio.ReplaceFile(staged, destination) != 0) {
+                throw "zanc: cannot publish metadata " + path;
+            }
+        } finally {
+            File.Delete(staged);
+            Directory.Delete(directory);
+        }
+    }
+
     static void StageNativeFiles(List<string> files, string workDir, string outputDir, string outputName) {
         Dictionary<string, string> staged = new Dictionary<string, string>();
         for (int i = 0; i < files.Count; i = i + 1) {
@@ -442,6 +461,9 @@ public partial class Program {
         bool hasDashO = false;
         bool emitLib = false;
         bool denyWarnings = false;
+        string metadataPath = "";
+        bool metadataBodies = false;
+        bool allSources = false;
         packageProject = "";
         string optLevel = "-O2";
         List<string> rawInputs = new List<string>();
@@ -449,7 +471,8 @@ public partial class Program {
         int i = 0;
         while (i < argc) {
             string a = Environment.ArgAt(i);
-            if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input") {
+            if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
+                || a == "--gen-meta") {
                 if (i + 1 >= argc || Environment.ArgAt(i + 1) == ""
                     || Environment.ArgAt(i + 1).StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -496,6 +519,13 @@ public partial class Program {
                 i = i + 2;
                 continue;
             }
+            if (a == "--gen-meta") {
+                metadataPath = Environment.ArgAt(i + 1);
+                i = i + 2;
+                continue;
+            }
+            if (a == "--gen-meta-bodies") { metadataBodies = true; i = i + 1; continue; }
+            if (a == "--no-pullin-filter") { allSources = true; i = i + 1; continue; }
             if (a == "--emit-lib") {
                 emitLib = true;
                 i = i + 1;
@@ -520,8 +550,10 @@ public partial class Program {
             Console.WriteLine("usage: zanc <input.zan|dir|@file> [more ...] [-o output]");
             throw "zanc: no input files";
         }
+        bool exportMetadata = metadataPath != "";
+        if (metadataBodies && !exportMetadata) { throw "zanc: --gen-meta-bodies requires --gen-meta"; }
         string first = rawInputs[0];
-        bool legacyOutput = !hasDashO && rawInputs.Count > 1 && !first.EndsWith(".zan")
+        bool legacyOutput = !exportMetadata && !hasDashO && rawInputs.Count > 1 && !first.EndsWith(".zan")
             && !first.StartsWith("@") && !Directory.ExistsOnDisk(first);
         if (legacyOutput) {
             outPath = first;
@@ -535,7 +567,7 @@ public partial class Program {
             ri = ri + 1;
         }
 
-        bool defaultOutput = !hasDashO && !legacyOutput;
+        bool defaultOutput = !exportMetadata && !hasDashO && !legacyOutput;
         if (defaultOutput) {
             if (emitLib) { throw "zanc: --emit-lib requires an output path"; }
             if (inclPaths.Count == 0) { throw "zanc: no input files"; }
@@ -547,7 +579,7 @@ public partial class Program {
             #endif
         }
         bool isExe = outPath.EndsWith(".exe") && !emitLib;
-        if (linkInputs.Count > 0 && !isExe) { throw "zanc: --link-input requires executable output"; }
+        if (linkInputs.Count > 0 && !isExe && !exportMetadata) { throw "zanc: --link-input requires executable output"; }
 
         // stdlib auto-include: demand-driven pull-in (mirrors the C
         // host). User sources seed the live-name set and the reached
@@ -563,7 +595,7 @@ public partial class Program {
                 PiSeedSource(inclSrcs[pi]);
                 pi = pi + 1;
             }
-            while (PiCloseOnce() == 1) { }
+            while (PiCloseOnce(allSources) == 1) { }
             PiAppendIncluded();
             if (piDb) { Console.WriteLine("[pullin] total " + inclPaths.Count + " files"); }
 
@@ -601,6 +633,19 @@ public partial class Program {
             }
             Parser ps = new Parser(toks, d);
             ps.SetFileBounds(fileStarts);
+            if (exportMetadata) {
+                List<string> originalNames;
+                Node declarations = ps.ParseMetadata(out originalNames);
+                if (d.HasErrors() || (denyWarnings && d.HasWarnings())) {
+                    d.Report(src, 0);
+                    d.Summary();
+                    throw "zanc: metadata export failed";
+                }
+                if (metadataBodies) { PiPkgIdxEnsure(); }
+                MetadataExporter exporter = new MetadataExporter(inclPaths, fileStarts, stdlibRoot, pkgSourceRoots, metadataBodies);
+                WriteMetadata(metadataPath, exporter.Export(declarations, originalNames));
+                return;
+            }
             Node unit = ps.ParseUnit();
 
             Binder b = new Binder();
@@ -636,7 +681,9 @@ public partial class Program {
                 string outputDir = Path.GetDirectoryName(finalPath);
                 string clang = FindClang();
                 List<string> bundleFiles = new List<string>();
-                if (ig.collectNativeImports) { ResolveNativeImports(ig, clang, linkInputs, bundleFiles); }
+                List<string> libraries = new List<string>();
+                if (ig.collectNativeImports) { ResolveNativeImports(ig, clang, linkInputs, bundleFiles, libraries); }
+                for (int i = 0; i < libraries.Count; i = i + 1) { linkInputs.Add(libraries[i]); }
                 string suffix = Guid.New();
                 string workDir = outputDir + "/.zanc-" + suffix;
                 if (suffix.Length == 0 || !Nio.CreateDirectoryExclusive(workDir)) {

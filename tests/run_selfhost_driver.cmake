@@ -27,6 +27,8 @@ reject_cli(unknown_short "unknown option '-Q'" -Q)
 reject_cli(target_missing "option '--target' requires a value" --target)
 reject_cli(output_missing "option '-o' requires a value" -o)
 reject_cli(project_missing "option '--package-project' requires a value" --package-project)
+reject_cli(metadata_missing "option '--gen-meta' requires a value" --gen-meta)
+reject_cli(metadata_bodies_without_output "--gen-meta-bodies requires --gen-meta" --gen-meta-bodies)
 reject_cli(link_input_missing "option '--link-input' requires a value" --link-input)
 reject_cli(link_input_absent "link input file does not exist" --link-input "${OUTDIR}/absent.obj")
 reject_cli(link_input_ir "--link-input requires executable output" --link-input "${_clean}")
@@ -100,6 +102,8 @@ if(NOT "${rc}" STREQUAL "0" OR NOT stdout MATCHES "Compiled 3 files ->")
   message(FATAL_ERROR "pull-in: expected the input, the referenced type and the test declaration, rc=${rc}\n${stdout}${stderr}")
 endif()
 
+include("${CMAKE_CURRENT_LIST_DIR}/run_selfhost_metadata.cmake")
+
 if(WIN32 AND CLANG)
   set(_default_src "${OUTDIR}/default output.zan")
   set(_default_exe "${OUTDIR}/default output.exe")
@@ -118,7 +122,18 @@ if(WIN32 AND CLANG)
   file(WRITE "${stdlib_driver}/driver.manifest" "stdlib_fixture if main\n")
   file(WRITE "${stdlib_driver}/win-${arch}/stdlib_fixture.bundle" "stdlib-payload.dat\n")
   file(WRITE "${stdlib_driver}/win-${arch}/stdlib-payload.dat" "standard library driver payload")
-  file(WRITE "${_default_src}" "class Program { static int Main() { return 37; } }\n")
+  file(WRITE "${_default_src}" [=[
+class Program {
+    [DllImport("kernel32")]
+    static extern nint GetCurrentProcess();
+    [DllImport("psapi")]
+    static extern int GetProcessMemoryInfo(nint process, byte[] counters, int size);
+    static int Main() {
+        byte[] counters = new byte[72];
+        return GetProcessMemoryInfo(GetCurrentProcess(), counters, counters.Length) != 0 ? 37 : 1;
+    }
+}
+]=])
   file(REMOVE "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
   execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}" "ZAN_STDLIB_PATH=${stdlib}"
     "${GEN1}" "${_default_src}" WORKING_DIRECTORY "${_root}"
@@ -180,8 +195,8 @@ if(WIN32 AND CLANG)
     WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc
     OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   file(REMOVE "${_obj}")
-  if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "driver_native_twice")
-    message(FATAL_ERROR "expected an unresolved native symbol, rc=${rc}\n${stdout}${stderr}")
+  if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "driver_fixture")
+    message(FATAL_ERROR "expected a missing native import library, rc=${rc}\n${stdout}${stderr}")
   endif()
   file(SHA256 "${_exe}" _after)
   file(GLOB _staging "${OUTDIR}/.zanc-*")

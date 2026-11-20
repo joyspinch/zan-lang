@@ -213,6 +213,7 @@ public partial class Program {
     // in several stores. The first store in the search order owns the package.
     static Dictionary<string, string> pkgRoots;
     static List<string> pkgDriverManifests;
+    static List<string> pkgSourceRoots;
     // index every package source once (the C host builds the same index
     // once and answers every namespace query from it)
     static void PiPkgIdxEnsure() {
@@ -221,6 +222,7 @@ public partial class Program {
         pkgNsIdx = new List<PiFile>();
         pkgRoots = new Dictionary<string, string>();
         pkgDriverManifests = new List<string>();
+        pkgSourceRoots = new List<string>();
         PiPkgIdxStore(pkgProjectRoot + "/packages");
         PiPkgIdxStore(pkgProjectRoot + "/.zan-packages");
         if (pkgRepoStore != null && pkgRepoStore.Length > 0) {
@@ -244,11 +246,19 @@ public partial class Program {
             if (nm != "" && nm.Substring(0, 1) != "." && !pkgRoots.ContainsKey(nm)) {
                 string root = store + "/" + nm;
                 pkgRoots[nm] = root;
-                PiPkgIdxAdd(root + "/src");
-                PiPkgIdxAdd(root + "/stdlib");
+                bool hasSrc = Directory.Exists(root + "/src");
+                bool hasStdlib = Directory.Exists(root + "/stdlib");
+                if (hasSrc) { PiPkgIdxAddRoot(root + "/src"); }
+                if (hasStdlib) { PiPkgIdxAddRoot(root + "/stdlib"); }
+                if (!hasSrc && !hasStdlib && Directory.Exists(root)) { PiPkgIdxAddRoot(root); }
             }
             i = i + 1;
         }
+    }
+
+    static void PiPkgIdxAddRoot(string root) {
+        pkgSourceRoots.Add(root);
+        PiPkgIdxAdd(root);
     }
 
     // ---- demand-driven pull-in state ----
@@ -868,7 +878,7 @@ public partial class Program {
 
     // One closure round over every reached directory. Newly reached dirs are
     // appended to the chain as we walk, so the walk covers them in-round.
-    static int PiCloseOnce() {
+    static int PiCloseOnce(bool allSources) {
         int changed = 0;
         PiDir d = piDirs;
         while (d != null) {
@@ -877,10 +887,10 @@ public partial class Program {
             while (i < d.files.Count) {
                 PiFile f = d.files[i];
                 if (f.included == 0) {
-                    int hit = f.hasExt == 1 || f.hasTest == 1 ? 1 : 0;
-                    string why = f.hasExt == 1 ? "ext" : (f.hasTest == 1 ? "test" : "");
+                    int hit = allSources || f.hasExt == 1 || f.hasTest == 1 ? 1 : 0;
+                    string why = allSources ? "unfiltered" : (f.hasExt == 1 ? "ext" : (f.hasTest == 1 ? "test" : ""));
                     int kk = 0;
-                    while (kk < f.top.Count) {
+                    while (hit == 0 && kk < f.top.Count) {
                         if (f.top[kk].flagged == 1) { hit = 1; why = f.top[kk].str; break; }
                         kk = kk + 1;
                     }

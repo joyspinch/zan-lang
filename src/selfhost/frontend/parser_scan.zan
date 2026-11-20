@@ -54,9 +54,19 @@ public partial class Parser {
         return Convert.ToString(size) + ":" + value;
     }
 
-    string ParseAttributeArgument(string key, out string legacyValue) {
+    string ParseAttributeArgument(string key, out string legacyValue, Node attribute) {
         int start = pos;
         Node expr = ParseExpr();
+        if (attribute != null) {
+            if (key != "") {
+                Node named = new Node(AK.Assignment());
+                named.op = TK.Eq();
+                named.a = new Node(AK.Ident());
+                named.a.sval = key;
+                named.b = expr;
+                attribute.Add(named);
+            } else { attribute.Add(expr); }
+        }
         string kind = "X";
         string value = "";
         int size = 0;
@@ -104,6 +114,7 @@ public partial class Parser {
         attrFieldOffset = -1;
         attrBlob = "";
         attrDeclaredData = "";
+        parsedAttributes = metadataMode && At(TK.LBracket()) ? new List<Node>() : null;
         while (At(TK.LBracket())) {
             Next(); // [
             while (!At(TK.RBracket()) && !At(TK.Eof())) {
@@ -114,6 +125,12 @@ public partial class Parser {
                 string aname = Next().text;
                 while (Eat(TK.Dot())) {
                     if (At(TK.Ident())) { aname = Next().text; }
+                }
+                Node attribute = null;
+                if (metadataMode) {
+                    attribute = new Node(AK.Ident());
+                    attribute.sval = aname;
+                    parsedAttributes.Add(attribute);
                 }
                 attrDeclaredData = attrDeclaredData + "A" + AttrText(aname, aname.Length);
                 string aShort = aname;
@@ -136,7 +153,7 @@ public partial class Parser {
                             string k = Next().text;
                             Next(); // =
                             string v;
-                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument(k, out v);
+                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument(k, out v, attribute);
                             attrBlob = attrBlob + aShort + "." + k + "=" + v + ";";
                             if (aname == "DllImport") {
                                 if (k == "EntryPoint") { attrEntry = v; }
@@ -144,7 +161,7 @@ public partial class Parser {
                             }
                         } else {
                             string v;
-                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument("", out v);
+                            attrDeclaredData = attrDeclaredData + ParseAttributeArgument("", out v, attribute);
                             attrBlob = attrBlob + aShort + "=" + v + ";";
                             if (aname == "StaticAddr") { attrStaticAddr = v; }
                             else if (aname == "StructLayout" && v == "LayoutKind.Explicit") { attrLayoutExplicit = true; }
@@ -183,13 +200,27 @@ public partial class Parser {
     }
     int K2() { if (pos + 2 < toks.Count) { return toks[pos + 2].kind; } return TK.Eof(); }
     int K3() { if (pos + 3 < toks.Count) { return toks[pos + 3].kind; } return TK.Eof(); }
-    // `(Name)operand` and `(Name[,][]...)operand` are named casts. Only
-    // empty/comma rank groups belong to a type; `(a[i])` stays an expression.
-    // Keep the operand-start restriction so `(x) + y` stays grouping.
+    // Recognize qualified and generic named types before a cast operand.
+    // Only empty/comma rank groups belong to a type. The operand-start
+    // restriction keeps `(x) + y` and `(a[i])` as grouped expressions.
     bool IsNamedCast() {
-        if (K() != TK.LParen()) { return false; }
-        if (K1() != TK.Ident()) { return false; }
+        if (K() != TK.LParen() || K1() != TK.Ident()) { return false; }
         int i = pos + 2;
+        while (i + 1 < toks.Count && toks[i].kind == TK.Dot() && toks[i + 1].kind == TK.Ident()) {
+            i = i + 2;
+        }
+        if (i < toks.Count && toks[i].kind == TK.Less()) {
+            int depth = 1;
+            i = i + 1;
+            while (i < toks.Count && depth > 0) {
+                int token = toks[i].kind;
+                if (token == TK.Less()) { depth = depth + 1; }
+                else if (token == TK.Greater()) { depth = depth - 1; }
+                else if (token == TK.Eof() || token == TK.Semicolon() || token == TK.LBrace()
+                         || token == TK.RBrace()) { return false; }
+                i = i + 1;
+            }
+        }
         while (i < toks.Count && toks[i].kind == TK.LBracket()) {
             i = i + 1;
             while (i < toks.Count && toks[i].kind == TK.Comma()) { i = i + 1; }
@@ -209,45 +240,6 @@ public partial class Parser {
         if (k == TK.Null()) { return true; }
         if (k == TK.True()) { return true; }
         if (k == TK.False()) { return true; }
-        return false;
-    }
-    // `(Name<...>)operand` — cast to a generic named type (Func<...>/
-    // Action<...>/user delegate instantiations), 缺口五. Same unambiguity
-    // rule as IsNamedCast: the balanced `>` must be followed by ')' and
-    // then a token that can only start an operand ('(' included — a
-    // parenthesised expression is never itself called in Zan, so
-    // `(Func<long, long, long>)(nint)Add` chains without ambiguity).
-    bool IsGenericCast() {
-        if (K() != TK.LParen()) { return false; }
-        if (K1() != TK.Ident()) { return false; }
-        if (K2() != TK.Less()) { return false; }
-        int depth = 0;
-        int i = pos + 2;
-        while (i < toks.Count) {
-            int k = toks[i].kind;
-            if (k == TK.Less()) { depth = depth + 1; }
-            else if (k == TK.Greater()) {
-                depth = depth - 1;
-                if (depth == 0) { break; }
-            }
-            else if (k == TK.Eof() || k == TK.Semicolon() || k == TK.LBrace()
-                     || k == TK.RBrace()) { return false; }
-            i = i + 1;
-        }
-        if (i + 2 >= toks.Count) { return false; }
-        if (toks[i + 1].kind != TK.RParen()) { return false; }
-        int n = toks[i + 2].kind;
-        if (n == TK.Ident()) { return true; }
-        if (n == TK.IntLit()) { return true; }
-        if (n == TK.FloatLit()) { return true; }
-        if (n == TK.StringLit()) { return true; }
-        if (n == TK.CharLit()) { return true; }
-        if (n == TK.This()) { return true; }
-        if (n == TK.New()) { return true; }
-        if (n == TK.LParen()) { return true; }
-        if (n == TK.Null()) { return true; }
-        if (n == TK.True()) { return true; }
-        if (n == TK.False()) { return true; }
         return false;
     }
     // adjacency between the tokens at pos+i and pos+i+1.
@@ -576,6 +568,21 @@ public partial class Parser {
         PrepareDeclarations(unit);
         QualifyTypes(unit);
         workspaceNames = false;
+    }
+
+    bool metadataMode;
+    List<Node> parsedAttributes;
+
+    public Node ParseMetadata(out List<string> originalNames) {
+        metadataMode = true;
+        Node unit = ParseDeclsOnly();
+        originalNames = new List<string>();
+        for (int i = 0; i < unit.kids.Count; i = i + 1) {
+            Node decl = unit.kids[i];
+            originalNames.Add(IsTypeDeclaration(decl) ? NestedPrefix(decl) + decl.sval : decl.sval);
+        }
+        QualifyTypes(unit);
+        return unit;
     }
 
     // ---- top level ----

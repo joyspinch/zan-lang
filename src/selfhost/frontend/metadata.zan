@@ -1,0 +1,412 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+namespace Zan;
+
+// Version 1 declaration metadata, written directly from the resolved source tree.
+class MetadataExporter {
+    private StringBuilder json = new StringBuilder();
+    private bool hasValue;
+    private List<string> files;
+    private List<int> starts;
+    private List<bool> fromStdlib = new List<bool>();
+    private List<bool> fromPackage = new List<bool>();
+    private bool bodies;
+    private List<string> operators = "+ - * / % ++ -- < > <= >= == != ! && || & | ^ = += -= *= /= %= &= |= ^= << >> <<= ?? >>= ??= ? ?. : >>> >>>= ~".Split(" ");
+
+    public MetadataExporter(List<string> files, List<int> starts, string stdlib, List<string> roots, bool bodies) {
+        this.files = files;
+        this.starts = starts;
+        this.bodies = bodies;
+        if (!bodies) { return; }
+        string library = SourcePrefix(stdlib);
+        List<string> packages = new List<string>();
+        for (int i = 0; i < roots.Count; i = i + 1) { packages.Add(SourcePrefix(roots[i])); }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string file = files[i];
+            fromStdlib.Add(library != "" && file.StartsWith(library));
+            bool inPackage = false;
+            for (int j = 0; j < packages.Count; j = j + 1) {
+                if (file.StartsWith(packages[j])) { inPackage = true; break; }
+            }
+            fromPackage.Add(inPackage);
+        }
+    }
+
+    string SourcePrefix(string dir) {
+        if (dir == "") { return ""; }
+        string root = Path.GetFullPath(dir);
+        #if WINDOWS
+        root = root.Replace("\\", "/").ToLower();
+        #endif
+        return root.EndsWith("/") ? root : root + "/";
+    }
+
+    int FileIndex(int line) {
+        int lo = 0;
+        int hi = starts.Count;
+        while (lo + 1 < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (starts[mid] <= line) { lo = mid; } else { hi = mid; }
+        }
+        return lo;
+    }
+
+    void Quote(string value) {
+        json.Append("\"");
+        Encoding.JsonEscapeTo(json, value);
+        json.Append("\"");
+    }
+
+    void Slot(string key) {
+        if (hasValue) { json.Append(","); }
+        if (key != "") { Quote(key); json.Append(":"); }
+        hasValue = true;
+    }
+
+    void Open(string key, string delimiter) {
+        Slot(key);
+        json.Append(delimiter);
+        hasValue = false;
+    }
+
+    void Close(string delimiter) {
+        json.Append(delimiter);
+        hasValue = true;
+    }
+
+    void Text(string key, string value) { Slot(key); Quote(value); }
+    void Number(string key, long value) { Slot(key); json.Append(Convert.ToString(value)); }
+    void Flag(string key, bool value) { Slot(key); json.Append(value ? "true" : "false"); }
+    void Modifier(string key, Node node, int bit) { Flag(key, (node.mods & bit) != 0); }
+
+    void Location(Node node, bool column) {
+        int file = FileIndex(node.line);
+        Number("file", file);
+        Number("line", node.line > 0 ? node.line - starts[file] + 1 : 0);
+        if (column) { Number("col", node.col); }
+    }
+
+    public string Export(Node unit, List<string> originalNames) {
+        Open("", "{");
+        Number("version", 1);
+        Open("files", "[");
+        for (int i = 0; i < files.Count; i = i + 1) { Text("", files[i]); }
+        Close("]");
+        Open("classes", "[");
+        for (int i = 0; i < unit.kids.Count; i = i + 1) { TypeDecl(unit.kids[i], originalNames[i]); }
+        Close("]");
+        Close("}");
+        return json.ToString();
+    }
+
+    string TypeName(Node type) {
+        if (type == null) { return ""; }
+        string name = type.sval;
+        // Version 1 describes an array by its element name and one suffix.
+        if (type.arrRanks != "" || type.ival == 1) { return name + (type.op == 1 ? "[]?" : "[]"); }
+        if (type.kids.Count > 0) {
+            name = name + "<";
+            for (int i = 0; i < type.kids.Count; i = i + 1) {
+                if (i > 0) { name = name + ","; }
+                name = name + TypeName(type.kids[i]);
+            }
+            name = name + ">";
+        }
+        if (type.op == 1) { name = name + "?"; }
+        return name;
+    }
+
+    bool Generic(Node decl) {
+        return decl.kids.Count > 0 && decl.kids[0].kind == AK.TypeParam();
+    }
+
+    void TypeParameters(Node decl) {
+        if (!Generic(decl)) { return; }
+        Open("type_params", "[");
+        for (int i = 0; i < decl.kids.Count; i = i + 1) {
+            Node param = decl.kids[i];
+            if (param.kind == AK.TypeParam()) { Text("", param.sval); }
+        }
+        Close("]");
+    }
+
+    void TypeDecl(Node decl, string original) {
+        bool isEnum = decl.kind == AK.EnumDecl();
+        if (!isEnum && decl.kind != AK.ClassDecl() && decl.kind != AK.StructDecl()) { return; }
+        Open("", "{");
+        Text("name", decl.sval);
+        Text("ns", decl.nsName);
+        if (original != decl.sval) { Text("orig", original); }
+        if (isEnum) {
+            Text("kind", "enum");
+            Open("members", "[");
+            for (int i = 0; i < decl.kids.Count; i = i + 1) {
+                Node member = decl.kids[i];
+                if (member.kind != AK.EnumMember()) { continue; }
+                Open("", "{");
+                Text("name", member.sval);
+                if (member.a != null && member.a.kind == AK.IntLit()) { Number("value", member.a.ival); }
+                Close("}");
+            }
+            Close("]");
+        } else {
+            bool iface = (decl.mods & MOD.Iface()) != 0;
+            Text("kind", iface ? "interface" : (decl.kind == AK.StructDecl() ? "struct" : "class"));
+            Flag("abstract", !iface && (decl.mods & MOD.Abstract()) != 0);
+            Flag("generic", Generic(decl));
+            TypeParameters(decl);
+            Location(decl, false);
+            if (bodies) {
+                int file = FileIndex(decl.line);
+                bool inStdlib = fromStdlib[file];
+                bool inPackage = fromPackage[file];
+                if (decl.partialLines != null) {
+                    for (int i = 0; i < decl.partialLines.Count; i = i + 1) {
+                        file = FileIndex(decl.partialLines[i]);
+                        inStdlib = inStdlib && fromStdlib[file];
+                        inPackage = inPackage && fromPackage[file];
+                    }
+                }
+                Flag("from_stdlib", inStdlib);
+                Flag("from_package", inPackage);
+            }
+            Open("bases", "[");
+            if (decl.type != null) { Text("", TypeName(decl.type)); }
+            if (decl.interfaceRefs != null) {
+                for (int i = 0; i < decl.interfaceRefs.Count; i = i + 1) { Text("", TypeName(decl.interfaceRefs[i])); }
+            }
+            Close("]");
+            Attributes(decl);
+            Members(decl, "fields", AK.FieldDecl());
+            Members(decl, "methods", AK.MethodDecl());
+            Members(decl, "props", AK.PropertyDecl());
+            Members(decl, "ctors", AK.CtorDecl());
+        }
+        Close("}");
+    }
+
+    void Members(Node decl, string key, int kind) {
+        Open(key, "[");
+        for (int i = 0; i < decl.kids.Count; i = i + 1) {
+            Node member = decl.kids[i];
+            if (kind == AK.MethodDecl() && (member.kind == kind || member.kind == AK.CtorDecl())) {
+                Method(member);
+            } else if (member.kind == kind) {
+                if (kind == AK.CtorDecl()) { Constructor(member); }
+                else { FieldOrProperty(member); }
+            }
+        }
+        Close("]");
+    }
+
+    void FieldOrProperty(Node member) {
+        Open("", "{");
+        Text("name", member.sval);
+        Text("type", TypeName(member.type));
+        Modifier("static", member, MOD.Static());
+        if (member.kind == AK.PropertyDecl()) {
+            Flag("get", (member.ival & 1) != 0);
+            Flag("set", (member.ival & 2) != 0);
+            if (member.b != null) { Expression("init", member.b); }
+        } else {
+            Modifier("private", member, MOD.Private());
+            Modifier("protected", member, MOD.Protected());
+            Location(member, true);
+        }
+        Attributes(member);
+        Close("}");
+    }
+
+    void Parameters(Node method, bool includeByRef) {
+        Open("params", "[");
+        for (int i = 0; i < method.kids.Count; i = i + 1) {
+            Node param = method.kids[i];
+            if (param.kind != AK.Param()) { continue; }
+            Open("", "{");
+            Text("name", param.sval);
+            Text("type", TypeName(param.type));
+            if (includeByRef && param.ival != 0) { Number("by_ref", param.ival); }
+            if (param.b != null) { Expression("def", param.b); }
+            Close("}");
+        }
+        Close("]");
+    }
+
+    void Method(Node method) {
+        Open("", "{");
+        Text("name", method.sval);
+        Flag("ctor", method.kind == AK.CtorDecl());
+        Modifier("static", method, MOD.Static());
+        Modifier("async", method, MOD.Async());
+        Modifier("private", method, MOD.Private());
+        Modifier("protected", method, MOD.Protected());
+        Modifier("virtual", method, MOD.Virtual());
+        Modifier("override", method, MOD.Override());
+        Modifier("abstract", method, MOD.Abstract());
+        if (method.type != null) { Text("ret", TypeName(method.type)); }
+        TypeParameters(method);
+        Location(method, false);
+        Parameters(method, true);
+        Attributes(method);
+        if (bodies && method.d != null) {
+            Open("body_expressions", "[");
+            BodyExpressions(method.d);
+            Close("]");
+        }
+        Close("}");
+    }
+
+    void Constructor(Node ctor) {
+        Open("", "{");
+        Parameters(ctor, false);
+        Open("assigns", "[");
+        if (ctor.d != null) {
+            for (int i = 0; i < ctor.d.kids.Count; i = i + 1) {
+                Node stmt = ctor.d.kids[i];
+                if (stmt.kind != AK.ExprStmt() || stmt.a == null || stmt.a.kind != AK.Assignment()) { continue; }
+                Node lhs = stmt.a.a;
+                Node rhs = stmt.a.b;
+                if (rhs.kind != AK.Ident()) { continue; }
+                if (lhs.kind != AK.Ident() && !(lhs.kind == AK.MemberAccess() && lhs.a.kind == AK.ThisExpr())) { continue; }
+                Open("", "{");
+                Text("prop", lhs.sval);
+                Text("param", rhs.sval);
+                Close("}");
+            }
+        }
+        Close("]");
+        Close("}");
+    }
+
+    void Attributes(Node decl) {
+        Open("attrs", "[");
+        if (decl.attributes != null) {
+            for (int i = 0; i < decl.attributes.Count; i = i + 1) {
+                Node attribute = decl.attributes[i];
+                Open("", "{");
+                Text("name", attribute.sval);
+                Arguments("args", attribute.kids);
+                Close("}");
+            }
+        }
+        Close("]");
+    }
+
+    void Arguments(string key, List<Node> args) {
+        Open(key, "[");
+        for (int i = 0; i < args.Count; i = i + 1) { Expression("", args[i]); }
+        Close("]");
+    }
+
+    bool IsTypeOf(Node node) {
+        return node.kind == AK.StringLit() && node.b != null && node.b.kind == AK.TypeRef();
+    }
+
+    void BodyExpressions(Node node) {
+        if (node == null || node.kind == AK.TypeRef()) { return; }
+        if (node.kind == AK.Call() && node.a != null) { Expression("", node); }
+        if (IsTypeOf(node)) {
+            Open("", "{");
+            Text("k", "typeof");
+            Text("t", TypeName(node.b));
+            Close("}");
+        }
+        BodyExpressions(node.a);
+        BodyExpressions(node.b);
+        BodyExpressions(node.c);
+        BodyExpressions(node.d);
+        for (int i = 0; i < node.kids.Count; i = i + 1) { BodyExpressions(node.kids[i]); }
+    }
+
+    string Operator(int op) {
+        int index = op - TK.Plus();
+        return index >= 0 && index < operators.Count ? operators[index] : "";
+    }
+
+    void Literal(string type) {
+        Text("k", "lit");
+        Text("t", type);
+    }
+
+    void FloatLiteral(Node node) {
+        string raw = node.sval.Replace("_", "");
+        if (node.suffix == 2) { Literal("decimal"); Text("v", raw); return; }
+        Literal(node.suffix == 1 ? "float" : "double");
+        // Zan permits leading zeroes. JSON requires a single zero before a fraction or exponent.
+        int start = 0;
+        while (start + 1 < raw.Length && raw[start] == '0' && raw[start + 1] >= '0' && raw[start + 1] <= '9') {
+            start = start + 1;
+        }
+        Slot("v");
+        double value;
+        json.Append(double.TryParse(raw, out value) && value <= double.MaxValue ? raw.Substring(start) : "null");
+    }
+
+    void Expression(string key, Node node) {
+        Open(key, "{");
+        int kind = node == null ? AK.NullLit() : node.kind;
+        if (kind == AK.NullLit()) { Text("k", "null"); }
+        else if (kind == AK.IntLit() || kind == AK.CharLit()) {
+            Literal(kind == AK.IntLit() ? "int" : "char");
+            Number("v", node.ival);
+        } else if (kind == AK.FloatLit()) { FloatLiteral(node); }
+        else if (kind == AK.BoolLit()) { Literal("bool"); Flag("v", node.ival != 0); }
+        else if (IsTypeOf(node)) { Text("k", "other"); }
+        else if (kind == AK.StringLit()) {
+            Literal("str");
+            List<int> decoded = StrEsc.DecodeBytes(node.sval);
+            byte[] bytes = new byte[decoded.Count];
+            for (int i = 0; i < decoded.Count; i = i + 1) { bytes[i] = (byte)decoded[i]; }
+            Text("v", bytes.ToStr(0, bytes.Length));
+        } else if (kind == AK.Ident()) { Text("k", "id"); Text("n", node.sval); }
+        else if (kind == AK.ThisExpr()) { Text("k", "this"); }
+        else if (kind == AK.BaseExpr()) { Text("k", "base"); }
+        else if (kind == AK.Binary() || kind == AK.Assignment()) {
+            Text("k", kind == AK.Binary() ? "bin" : "assign");
+            Text("op", Operator(node.op));
+            Expression("l", node.a);
+            Expression("r", node.b);
+        } else if (kind == AK.Unary() || kind == AK.PostfixUnary() || kind == AK.AwaitExpr() || kind == AK.OutArg()) {
+            Text("k", kind == AK.AwaitExpr() ? "await" : (kind == AK.OutArg() ? "ref" : "uni"));
+            if (kind == AK.Unary() || kind == AK.PostfixUnary()) { Text("op", Operator(node.op)); }
+            Expression("o", node.a);
+        } else if (kind == AK.MemberAccess() || kind == AK.Index()) {
+            Text("k", kind == AK.Index() ? "idx" : "mem");
+            Expression("o", node.a);
+            if (kind == AK.Index()) { Expression("i", node.b); } else { Text("n", node.sval); }
+        } else if (kind == AK.Call()) {
+            Text("k", "call");
+            Expression("f", node.a);
+            Open("a", "[");
+            for (int i = 0; i < node.kids.Count; i = i + 1) {
+                Node arg = node.kids[i];
+                if (arg.argName == "") { Expression("", arg); }
+                else { Open("", "{"); Text("k", "other"); Close("}"); }
+            }
+            Close("]");
+        } else if (kind == AK.Conditional()) {
+            Text("k", "cond");
+            Expression("c", node.a);
+            Expression("t", node.b);
+            Expression("e", node.c);
+        } else if (kind == AK.CastExpr() || kind == AK.IsExpr() || kind == AK.AsExpr()) {
+            Text("k", kind == AK.CastExpr() ? "cast" : "is");
+            Text("t", TypeName(node.type));
+            Expression("e", kind == AK.CastExpr() ? node.b : node.a);
+        } else if (kind == AK.NewExpr()) {
+            Text("k", "new");
+            Text("t", TypeName(node.type));
+            Arguments("a", node.kids);
+        } else if (kind == AK.Lambda()) {
+            Text("k", "lam");
+            Open("p", "[");
+            for (int i = 0; i < node.kids.Count; i = i + 1) { Text("", node.kids[i].sval); }
+            Close("]");
+            Expression("b", node.d != null ? node.d : node.a);
+        } else if (kind == AK.Block()) { Text("k", "block"); }
+        else { Text("k", "other"); }
+        Close("}");
+    }
+}
