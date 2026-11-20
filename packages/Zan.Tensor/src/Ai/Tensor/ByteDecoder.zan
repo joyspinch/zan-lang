@@ -1,0 +1,181 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Text;
+
+namespace Ai.Tensor;
+
+public class ByteDecoder {
+    private const string Architecture = "zan.byte-attention.v1";
+    private const string TokenWeight = "token_embedding.weight";
+    private const string PositionWeight = "position_embedding.weight";
+    private const int MaxWidth = 512;
+    private const int MaxContext = 256;
+    private const int MaxHeaderBytes = 16384;
+    private const int MaxCheckpointBytes = 8 * 1024 * 1024;
+
+    private Tensor tokenEmbedding;
+    private Tensor positionEmbedding;
+    private Tensor query;
+    private Tensor key;
+    private Tensor value;
+    private Tensor attentionOutput;
+    private Tensor output;
+    private float scoreScale;
+
+    public int ContextLength { get { return this.positionEmbedding.Dim(0); } }
+
+    private ByteDecoder(WeightFile weights) {
+        WeightTensorInfo token = ByteDecoder.MatrixInfo(weights, ByteDecoder.TokenWeight);
+        WeightTensorInfo position = ByteDecoder.MatrixInfo(weights, ByteDecoder.PositionWeight);
+        int width = token.shape[1];
+        int context = position.shape[0];
+        if (width < 1 || width > ByteDecoder.MaxWidth || context < 1 || context > ByteDecoder.MaxContext) {
+            throw new ArgumentException("byte decoder width or context length is out of range");
+        }
+        this.tokenEmbedding = ByteDecoder.ReadMatrix(weights, ByteDecoder.TokenWeight, ByteTokenizer.VocabSize, width);
+        this.positionEmbedding = ByteDecoder.ReadMatrix(weights, ByteDecoder.PositionWeight, context, width);
+        this.query = ByteDecoder.ReadMatrix(weights, "attention.query.weight", width, width);
+        this.key = ByteDecoder.ReadMatrix(weights, "attention.key.weight", width, width);
+        this.value = ByteDecoder.ReadMatrix(weights, "attention.value.weight", width, width);
+        this.attentionOutput = ByteDecoder.ReadMatrix(weights, "attention.output.weight", width, width);
+        this.output = ByteDecoder.ReadMatrix(weights, "lm_head.weight", ByteTokenizer.VocabSize, width);
+        this.scoreScale = (float)(1.0 / Math.Sqrt((double)width));
+    }
+
+    public static ByteDecoder Open(string path) {
+        using (FileStream file = FileStream.OpenRead(path)) {
+            long size = file.Length();
+            if (size < 9L || size > ByteDecoder.MaxCheckpointBytes) {
+                throw new ArgumentException("byte decoder checkpoint size is out of range");
+            }
+            byte[] bytes = new byte[(int)size];
+            if (file.ReadBytes(bytes) != bytes.Length || file.ReadByte() >= 0 || !file.EndOfFile()) {
+                throw new IOException("could not read complete byte decoder checkpoint");
+            }
+            return ByteDecoder.Load(bytes);
+        }
+    }
+
+    public static ByteDecoder Load(byte[] bytes) {
+        if (bytes == null || bytes.Length < 9 || bytes.Length > ByteDecoder.MaxCheckpointBytes || bytes[8] != 123) {
+            throw new ArgumentException("expected a byte decoder safetensors checkpoint up to 8 MiB");
+        }
+        BinaryReader header = new BinaryReader(bytes, 0, 8);
+        long headerSize = header.U64();
+        if (headerSize < 1L || headerSize > ByteDecoder.MaxHeaderBytes || headerSize > bytes.Length - 8) {
+            throw new ArgumentException("byte decoder safetensors header length is out of range");
+        }
+        WeightFile weights = WeightFile.Load(bytes);
+        string architecture = "";
+        weights.metadata.TryGetValue("architecture", out architecture);
+        if (architecture != ByteDecoder.Architecture || weights.tensors.Count != 7) {
+            throw new ArgumentException("expected seven tensors for architecture " + ByteDecoder.Architecture);
+        }
+        ByteDecoder.ValidateDataLayout(weights, bytes.Length - 8 - headerSize);
+        return new ByteDecoder(weights);
+    }
+
+    // Row i holds the next-token logits conditioned on tokens[0..i].
+    public Tensor Forward(List<int> tokens) {
+        if (tokens == null || tokens.Count == 0 || tokens.Count > this.ContextLength || tokens[0] != ByteTokenizer.Bos) {
+            throw new ArgumentException("expected a BOS-prefixed context within the model context length");
+        }
+        List<int> positions = new List<int>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            int token = tokens[i];
+            bool misplacedMarker = (token == ByteTokenizer.Bos && i != 0) || (token == ByteTokenizer.Eos && i != tokens.Count - 1);
+            if (token < 0 || token >= ByteTokenizer.VocabSize || misplacedMarker) {
+                throw new ArgumentException("invalid token in byte decoder context at position " + Convert.ToString(i));
+            }
+            positions.Add(i);
+        }
+        Tensor tokenRows = TensorMath.GatherRows(this.tokenEmbedding, tokens);
+        Tensor positionRows = TensorMath.GatherRows(this.positionEmbedding, positions);
+        Tensor hidden = TensorMath.Add(tokenRows, positionRows);
+        Tensor q = TensorMath.MatMulRightTransposed(hidden, this.query);
+        Tensor k = TensorMath.MatMulRightTransposed(hidden, this.key);
+        Tensor v = TensorMath.MatMulRightTransposed(hidden, this.value);
+        Tensor scores = TensorMath.Scale(TensorMath.MatMulRightTransposed(q, k), this.scoreScale);
+        ByteDecoder.RequireFinite(scores, "attention scores");
+        Tensor attended = TensorMath.MatMulCpu(TensorMath.SoftmaxCausal(scores), v);
+        Tensor residual = TensorMath.Add(hidden, TensorMath.MatMulRightTransposed(attended, this.attentionOutput));
+        Tensor logits = TensorMath.MatMulRightTransposed(residual, this.output);
+        ByteDecoder.RequireFinite(logits, "logits");
+        return logits;
+    }
+
+    // Return continuation IDs only. A selected EOS is included and ends generation.
+    public List<int> GenerateTokens(string prompt, int maxNewTokens) {
+        if (maxNewTokens < 0) { throw new ArgumentException("maxNewTokens cannot be negative"); }
+        if (Encoding.GetByteCount(prompt) >= this.ContextLength) {
+            throw new ArgumentException("prompt plus BOS exceeds the model context length");
+        }
+        List<int> context = ByteTokenizer.Encode(prompt);
+        List<int> generated = new List<int>();
+        while (generated.Count < maxNewTokens && context.Count < this.ContextLength) {
+            Tensor logits = this.Forward(context);
+            int row = (context.Count - 1) * ByteTokenizer.VocabSize;
+            int best = 0;
+            for (int id = 1; id < ByteTokenizer.VocabSize; id = id + 1) {
+                if (id != ByteTokenizer.Bos && logits.data[row + id] > logits.data[row + best]) {
+                    best = id;
+                }
+            }
+            generated.Add(best);
+            if (best == ByteTokenizer.Eos) { break; }
+            context.Add(best);
+        }
+        return generated;
+    }
+
+    public string Generate(string prompt, int maxNewTokens) {
+        return ByteTokenizer.Decode(this.GenerateTokens(prompt, maxNewTokens));
+    }
+
+    private static WeightTensorInfo MatrixInfo(WeightFile weights, string name) {
+        WeightTensorInfo info = weights.Info(name);
+        if (info == null) { throw new ArgumentException("missing byte decoder tensor '" + name + "'"); }
+        if (info.dtype != "F32" || info.shape.Count != 2) {
+            throw new ArgumentException("expected an F32 matrix for byte decoder tensor '" + name + "'");
+        }
+        return info;
+    }
+
+    private static Tensor ReadMatrix(WeightFile weights, string name, int rows, int columns) {
+        WeightTensorInfo info = ByteDecoder.MatrixInfo(weights, name);
+        if (info.shape[0] != rows || info.shape[1] != columns || info.byteLength != (long)rows * columns * 4L) {
+            throw new ArgumentException("wrong shape or byte length for byte decoder tensor '" + name + "'");
+        }
+        Tensor matrix = weights.Materialize(info);
+        ByteDecoder.RequireFinite(matrix, name);
+        return matrix;
+    }
+
+    private static void ValidateDataLayout(WeightFile weights, long dataLength) {
+        Dictionary<long, long> ends = new Dictionary<long, long>();
+        for (int i = 0; i < weights.tensors.Count; i = i + 1) {
+            WeightTensorInfo info = weights.tensors[i];
+            if (info.byteLength == 0L || ends.ContainsKey(info.offset)) {
+                throw new ArgumentException("empty or overlapping byte decoder tensor data");
+            }
+            ends[info.offset] = info.offset + info.byteLength;
+        }
+        long cursor = 0L;
+        for (int i = 0; i < weights.tensors.Count; i = i + 1) {
+            if (!ends.ContainsKey(cursor)) {
+                throw new ArgumentException("byte decoder tensor data must be contiguous and nonoverlapping");
+            }
+            cursor = ends[cursor];
+        }
+        if (cursor != dataLength) { throw new ArgumentException("unindexed byte decoder checkpoint data"); }
+    }
+
+    private static void RequireFinite(Tensor tensor, string name) {
+        for (int i = 0; i < tensor.data.Length; i = i + 1) {
+            if ((NativeMemory.AsI32(tensor.data[i]) & 2139095040) == 2139095040) {
+                throw new ArgumentException("non-finite byte decoder value in " + name);
+            }
+        }
+    }
+}

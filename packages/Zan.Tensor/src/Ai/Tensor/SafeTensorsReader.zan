@@ -31,10 +31,12 @@ public class SafeTensorsReader {
         BinaryReader r = new BinaryReader(file);
         long headerLen = r.U64();
         if (headerLen <= 0 || headerLen > file.Length - 8) {
-            throw new Exception("safetensors header length out of range: "
-                + Convert.ToString(headerLen));
+            throw new Exception("safetensors header length out of range: " + Convert.ToString(headerLen));
         }
         string headerText = Encoding.GetString(file, 8, (int)headerLen);
+        if (headerText.Length != headerLen || NativeMemory.Compare((nint)file + 8, (nint)headerText, (int)headerLen) != 0) {
+            throw new Exception("safetensors header is not valid UTF-8");
+        }
         JsonDoc doc = JsonDoc.Parse(headerText);
         if (doc == null || doc.KindAt(doc.root) != 5) {
             throw new Exception("safetensors header is not a JSON object");
@@ -47,70 +49,83 @@ public class SafeTensorsReader {
         s.dataStart = 8 + headerLen;
         s.dataLength = file.Length - s.dataStart;
 
-        int p = (int)(doc.slots[doc.root].a >> 8);
-        while (p >= 0) {
-            JsonPair pair = doc.pairs[p];
-            string key = pair.keyStart < 0 ? doc.escPool[pair.keyLen] : doc.src.Substring(pair.keyStart, pair.keyLen);
-            int entrySlot = pair.valueSlot;
+        Dictionary<string, bool> names = new Dictionary<string, bool>();
+        for (int p = doc.FirstProperty(doc.root); p >= 0; p = doc.NextProperty(p)) {
+            string key = doc.PropertyNameView(p).ToString();
+            int entrySlot = doc.PropertyValue(p);
+            if (names.ContainsKey(key) || doc.KindAt(entrySlot) != 5) {
+                throw new Exception("invalid or duplicate safetensors entry '" + key + "'");
+            }
+            names[key] = true;
             if (key == "__metadata__") {
-                if (entrySlot >= 0 && doc.KindAt(entrySlot) == 5) {
-                    int mp = (int)(doc.slots[entrySlot].a >> 8);
-                    while (mp >= 0) {
-                        JsonPair mPair = doc.pairs[mp];
-                        string mKey = mPair.keyStart < 0 ? doc.escPool[mPair.keyLen] : doc.src.Substring(mPair.keyStart, mPair.keyLen);
-                        s.metadata[mKey] = doc.StrAt(mPair.valueSlot, "");
-                        mp = mPair.nextPair;
+                for (int mp = doc.FirstProperty(entrySlot); mp >= 0; mp = doc.NextProperty(mp)) {
+                    string mKey = doc.PropertyNameView(mp).ToString();
+                    int mValue = doc.PropertyValue(mp);
+                    if (s.metadata.ContainsKey(mKey) || doc.KindAt(mValue) != 3) {
+                        throw new Exception("invalid or duplicate safetensors metadata '" + mKey + "'");
                     }
+                    s.metadata[mKey] = doc.StrAt(mValue, "");
                 }
-            } else if (entrySlot >= 0 && doc.KindAt(entrySlot) == 5) {
+            } else {
                 s.tensors.Add(s.ReadTensor(key, doc, entrySlot));
             }
-            p = pair.nextPair;
         }
         return s;
     }
 
     WeightTensorInfo ReadTensor(string name, JsonDoc doc, int entrySlot) {
+        int dtypeSlot = -1;
+        int shapeSlot = -1;
+        int offsSlot = -1;
+        for (int p = doc.FirstProperty(entrySlot); p >= 0; p = doc.NextProperty(p)) {
+            string key = doc.PropertyNameView(p).ToString();
+            int value = doc.PropertyValue(p);
+            if (key == "dtype" && dtypeSlot < 0) {
+                dtypeSlot = value;
+            } else if (key == "shape" && shapeSlot < 0) {
+                shapeSlot = value;
+            } else if (key == "data_offsets" && offsSlot < 0) {
+                offsSlot = value;
+            } else {
+                throw new Exception("unexpected or duplicate field '" + key + "' in safetensors tensor '" + name + "'");
+            }
+        }
+        if (doc.KindAt(dtypeSlot) != 3 || doc.KindAt(shapeSlot) != 4 || doc.KindAt(offsSlot) != 4 || doc.Count(offsSlot) != 2) {
+            throw new Exception("safetensors tensor '" + name + "' needs dtype, shape and two data_offsets");
+        }
         WeightTensorInfo info = new WeightTensorInfo();
         info.name = name;
-        int dtypeSlot = doc.Get(entrySlot, "dtype");
         info.dtype = doc.StrAt(dtypeSlot, "");
         info.ggmlType = -1;
-
-        int shapeSlot = doc.Get(entrySlot, "shape");
         info.shape = new List<int>();
         long count = 1;
-        if (shapeSlot >= 0 && doc.KindAt(shapeSlot) == 4) {
-            int numDims = doc.Count(shapeSlot);
-            int child = doc.FirstChild(shapeSlot);
-            for (int i = 0; i < numDims; i = i + 1) {
-                long d = doc.LongAt(child, 0L);
-                if (d <= 0 || d > 2147483647) {
-                    throw new Exception("safetensors tensor '" + name
-                        + "' has invalid dim");
-                }
-                info.shape.Add((int)d);
-                count = count * d;
-                child = doc.NextSibling(child);
+        int child = doc.FirstChild(shapeSlot);
+        for (int i = 0; i < doc.Count(shapeSlot); i = i + 1) {
+            long d = SafeTensorsReader.IntegerAt(doc, child);
+            if (d <= 0 || d > 2147483647L || count > 9223372036854775807L / d) {
+                throw new Exception("safetensors tensor '" + name + "' has invalid shape");
             }
+            info.shape.Add((int)d);
+            count = count * d;
+            child = doc.NextSibling(child);
         }
         info.count = count;
 
-        int offsSlot = doc.Get(entrySlot, "data_offsets");
-        if (offsSlot < 0 || doc.KindAt(offsSlot) != 4 || doc.Count(offsSlot) < 2) {
-            throw new Exception("safetensors tensor '" + name
-                + "' has no data_offsets");
-        }
         int firstOff = doc.FirstChild(offsSlot);
         int secondOff = doc.NextSibling(firstOff);
-        long start = doc.LongAt(firstOff, -1L);
-        long end = doc.LongAt(secondOff, -1L);
+        long start = SafeTensorsReader.IntegerAt(doc, firstOff);
+        long end = SafeTensorsReader.IntegerAt(doc, secondOff);
         if (start < 0 || end < start || end > dataLength) {
-            throw new Exception("safetensors tensor '" + name
-                + "' has out-of-range data_offsets");
+            throw new Exception("safetensors tensor '" + name + "' has out-of-range data_offsets");
         }
         info.offset = start;
         info.byteLength = end - start;
         return info;
+    }
+
+    private static long IntegerAt(JsonDoc doc, int slot) {
+        // KindAt groups integer and floating-point JSON numbers. Geometry and offsets require integers.
+        if (slot < 0 || (doc.slots[slot].a & 255L) != 2L) { return -1L; }
+        return doc.LongAt(slot, -1L);
     }
 }

@@ -35,6 +35,68 @@
 | `MatMulRightTransposed(left, right)` | left[m,k]、right[n,k] | left · rightᵀ（自注意力打分） |
 | `MatVec(a, v)` | a[m,k]、v[k] | a · v |
 
+## 进程内 CPU 字节解码器
+
+`ByteDecoder` 和 `ByteTokenizer` 随 `Ai.Tensor` 引入，模型权重由调用方从本地文件
+或内存提供。解码在当前进程使用包内 CPU 算子执行。
+
+```zan
+using Ai.Tensor;
+using System;
+
+public class Program {
+    static void Main() {
+        ByteDecoder model = ByteDecoder.Open("model.safetensors");
+        Console.WriteLine(model.Generate("hello", 16));
+    }
+}
+```
+
+### 检查点契约
+
+使用 safetensors，`__metadata__` 中的 `architecture` 必须为 `zan.byte-attention.v1`。
+头部最多 16 KiB，完整文件最多 8 MiB。数据区由下列七个有限值 F32 张量连续覆盖，
+顺序任意。数组为行主序，矩阵形状按下表填写，`data_offsets` 用相对于数据区起点的
+整数字节区间，不允许重复条目、重叠、空洞或尾随数据。
+
+| 张量 | 形状 |
+|---|---|
+| `token_embedding.weight` | `[258, d]` |
+| `position_embedding.weight` | `[L, d]` |
+| `attention.query.weight` | `[d, d]` |
+| `attention.key.weight` | `[d, d]` |
+| `attention.value.weight` | `[d, d]` |
+| `attention.output.weight` | `[d, d]` |
+| `lm_head.weight` | `[258, d]` |
+
+隐藏宽度 `d` 取自 token 嵌入的列数，范围 `1..512`。上下文长度 `L` 取自位置嵌入的
+行数，范围 `1..256`。单头、单层架构使用可训练绝对位置嵌入和残差注意力。给定 token
+序列，计算如下。
+
+```text
+X = token_embedding[token_ids] + position_embedding[0..sequence_length)
+Q = X Wq^T, K = X Wk^T, V = X Wv^T
+A = causal_softmax(Q K^T / sqrt(d))
+logits = (X + (A V) Wo^T) Wlm^T
+```
+
+第 `i` 行的注意力只取 `j <= i`，logits 第 `i` 行预测紧随该位置的 token。
+此架构仅含上表所列参数。每步贪心生成重算整个前缀，适用于小检查点和短上下文。
+
+### 分词与生成
+
+- `ByteTokenizer.Encode` 将 UTF-8 字节直接映射为 `0..255`。默认前置 BOS `256`，
+  可选追加 EOS `257`。`Decode` 跳过这两个标记，并用 U+FFFD 替换非法或截断的 UTF-8。
+- `ByteDecoder.Open(path)` 读取本地检查点，`Load(bytes)` 从内存加载。`Forward(tokens)`
+  返回 `[序列长度, 258]` 的 logits。序列以 BOS 开头，EOS 如出现必须在末尾。
+- `GenerateTokens(prompt, maxNewTokens)` 返回续写 token ID。每步从最后一行取最高
+  logit，跳过 BOS，同分取最小 ID。选中 EOS 时将其计入预算并结束。
+- UTF-8 prompt 加 BOS 后必须装入上下文。`maxNewTokens` 必须非负，生成最多占用剩余
+  上下文位置。`Generate` 将续写 ID 解码为文本。CPU 计算产生非有限值时抛出异常。
+
+可运行的参考检查点由 `tests/conformance/byte_decoder.zan` 在本地构造。`ax` 和 `bx`
+共享最后一个输入 token `x`，模型根据前文分别生成 `A` 和 `B`，随后生成 EOS。
+
 ## 不在包内
 
 - **GPU 后端的原生实现**：仓库里的 GPU 能力都在外部预编译的 `zan_gui` /

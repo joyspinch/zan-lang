@@ -1,0 +1,195 @@
+using Ai.Tensor;
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Text;
+
+public class ByteDecoderTest {
+    static void Check(bool cond, string name) {
+        if (!cond) { throw new Exception(name); }
+    }
+
+    static void Near(float actual, float expected, string name) {
+        Check(Math.Abs(actual - expected) < 0.00001f, name);
+    }
+
+    static JsonValue Pair(int a, int b) {
+        JsonValue pair = JsonValue.NewArray();
+        pair.AppendInt(a);
+        pair.AppendInt(b);
+        return pair;
+    }
+
+    static JsonValue Matrix(int rows, int columns, int offset) {
+        JsonValue spec = JsonValue.NewObject();
+        spec.PutStr("dtype", "F32");
+        spec.Put("shape", Pair(rows, columns));
+        spec.Put("data_offsets", Pair(offset, offset + rows * columns * 4));
+        return spec;
+    }
+
+    static byte[] MakeCheckpoint(string fault = "") {
+        // d=2, L=5. File layout is independent of model loading code.
+        float[] token = new float[258 * 2];
+        token[97 * 2] = 2.0f;
+        token[98 * 2] = -2.0f;
+        token[120 * 2 + 1] = 1.0f;
+        token[65 * 2 + 1] = 4.0f;
+        token[66 * 2 + 1] = 4.0f;
+        token[102 * 2] = 8.0f;
+        float[] position = new float[] { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.5f, 0.0f, 1.0f, 0.0f, 0.0f };
+        float[] qk = new float[] { 0.0f, 1.0f, 0.0f, 0.0f };
+        float[] swap = new float[] { 0.0f, 1.0f, 1.0f, 0.0f };
+        float[] head = new float[258 * 2];
+        head[65 * 2] = 4.0f;
+        head[66 * 2] = -4.0f;
+        head[256 * 2 + 1] = 2.0f;
+        head[257 * 2 + 1] = 0.2f;
+        string[] names = new string[] {
+            "token_embedding.weight", "position_embedding.weight",
+            "attention.query.weight", "attention.key.weight", "attention.value.weight",
+            "attention.output.weight", "lm_head.weight"
+        };
+        int[] rows = new int[] { 258, 5, 2, 2, 2, 2, 258 };
+        List<float[]> matrices = new List<float[]> { token, position, qk, qk, swap, swap, head };
+
+        JsonValue root = JsonValue.NewObject();
+        JsonValue metadata = JsonValue.NewObject();
+        metadata.PutStr("architecture", fault == "architecture" ? "other" : "zan.byte-attention.v1");
+        metadata.PutStr("note", "é");
+        root.Put("__metadata__", metadata);
+        int offset = 0;
+        for (int i = 0; i < names.Length; i = i + 1) {
+            JsonValue spec = Matrix(rows[i], 2, offset);
+            if (i == 0 && fault == "dtype") { spec.Set("dtype", JsonValue.NewStr("I32")); }
+            if (i == 0 && fault == "vocab") { spec.Set("shape", Pair(259, 2)); }
+            if (i == 1 && fault == "context") { spec.Set("shape", Pair(257, 2)); }
+            if (i == 2 && fault == "fractional shape") {
+                JsonValue shape = JsonValue.NewArray();
+                shape.AppendInt(2);
+                shape.Append(JsonValue.NewDouble(2.5));
+                spec.Set("shape", shape);
+            }
+            if (i == 2 && fault == "fractional offset") {
+                JsonValue offsets = JsonValue.NewArray();
+                offsets.Append(JsonValue.NewDouble((double)offset + 0.5));
+                offsets.AppendInt(offset + 16);
+                spec.Set("data_offsets", offsets);
+            }
+            if (i == 2 && fault == "duplicate field") { spec.PutStr("dtype", "F32"); }
+            if (i == 2 && fault == "overlap") { spec.Set("data_offsets", Pair(offset - 4, offset + 12)); }
+            if (i == 2 && fault == "length") { spec.Set("data_offsets", Pair(offset, offset + 20)); }
+            if (i == 3 && fault == "length") { spec.Set("data_offsets", Pair(offset + 4, offset + 16)); }
+            if (i != 2 || fault != "missing") { root.Put(names[i], spec); }
+            if (i == 2 && fault == "duplicate") { root.Put(names[i], spec); }
+            offset = offset + rows[i] * 8;
+        }
+        byte[] header = Encoding.GetBytes(root.ToJson());
+        int extra = fault == "trailing data" ? 1 : 0;
+        byte[] file = new byte[8 + header.Length + offset + extra];
+        Span<byte> bytes = file.AsSpan();
+        BinaryPrimitives.WriteInt64LittleEndian(bytes.Slice(0, 8), (long)header.Length);
+        if (fault == "header length") { BinaryPrimitives.WriteInt64LittleEndian(bytes.Slice(0, 8), 16385L); }
+        NativeMemory.Copy((nint)file + 8, (nint)header, header.Length);
+        if (fault == "header UTF-8") {
+            bool corrupted = false;
+            for (int i = 0; i < header.Length; i = i + 1) {
+                if (header[i] == 195) {
+                    file[8 + i] = (byte)255;
+                    corrupted = true;
+                    break;
+                }
+            }
+            Check(corrupted, "fixture must contain a UTF-8 sequence to corrupt");
+        }
+        int cursor = 8 + header.Length;
+        for (int i = 0; i < matrices.Count; i = i + 1) {
+            float[] matrix = matrices[i];
+            for (int j = 0; j < matrix.Length; j = j + 1) {
+                BinaryPrimitives.WriteSingleLittleEndian(bytes.Slice(cursor, 4), matrix[j]);
+                cursor = cursor + 4;
+            }
+        }
+        if (fault == "non-finite") {
+            BinaryPrimitives.WriteInt32LittleEndian(bytes.Slice(8 + header.Length, 4), 0x7FC00000);
+        }
+        return file;
+    }
+
+    static void CheckTokenizer() {
+        List<int> tokens = ByteTokenizer.Encode("Aé🐈", true, true);
+        int[] expected = new int[] { 256, 65, 195, 169, 240, 159, 144, 136, 257 };
+        Check(tokens.Count == expected.Length, "byte tokenizer length");
+        for (int i = 0; i < expected.Length; i = i + 1) {
+            Check(tokens[i] == expected[i], "byte tokenizer ID");
+        }
+        Check(ByteTokenizer.Decode(tokens) == "Aé🐈", "UTF-8 round trip");
+        Check(ByteTokenizer.Decode(new List<int> { 240, 257 }) == "�", "incomplete UTF-8 replacement");
+    }
+
+    static void CheckInference(ByteDecoder model) {
+        Check(model.ContextLength == 5, "checkpoint context length");
+        Tensor ax = model.Forward(ByteTokenizer.Encode("ax"));
+        Tensor bx = model.Forward(ByteTokenizer.Encode("bx"));
+        Tensor axf = model.Forward(ByteTokenizer.Encode("axf"));
+        Check(ax.Dim(0) == 3 && ax.Dim(1) == 258, "logit shape");
+        // At x: exp(2.25/sqrt(2)) is the self-attention term; the other two terms are 1.
+        Near(ax.At(2 * 258 + 65), 1.1579758f, "reference A logit");
+        Near(bx.At(2 * 258 + 65), -1.1579758f, "reference B-prefix logit");
+        Near(ax.At(2 * 258 + 257), 0.5131518f, "reference EOS logit");
+        for (int i = 0; i < ax.Count(); i = i + 1) {
+            Near(axf.At(i), ax.At(i), "future token changed a prefix logit");
+        }
+
+        Check(model.Generate("ax", 1) == "A", "prefix ax generates A");
+        Check(model.Generate("bx", 1) == "B", "prefix bx generates B despite the shared final token");
+        List<int> generated = model.GenerateTokens("ax", 9);
+        Check(generated.Count == 2 && generated[0] == 65 && generated[1] == 257, "append and stop on EOS");
+        Check(model.Generate("ax", 9) == "A", "text excludes EOS and prompt");
+        Check(model.GenerateTokens("ax", 0).Count == 0, "zero token budget");
+        Check(model.GenerateTokens("axff", 9).Count == 0, "full context");
+        Check(model.GenerateTokens("axf", 9).Count == 1, "remaining context cap");
+        Check(model.GenerateTokens("", 1)[0] == 0, "lowest ID wins a tie");
+
+        bool rejected = false;
+        try { model.Generate("ééé", 0); } catch (ArgumentException e) { rejected = true; }
+        Check(rejected, "prompt limit counts UTF-8 bytes and BOS");
+        rejected = false;
+        try { model.Generate("", -1); } catch (ArgumentException e) { rejected = true; }
+        Check(rejected, "negative token budget");
+        rejected = false;
+        try { model.Forward(new List<int> { 256, 258 }); } catch (ArgumentException e) { rejected = true; }
+        Check(rejected, "out-of-range token ID");
+    }
+
+    static void Main() {
+        CheckTokenizer();
+        CheckInference(ByteDecoder.Load(MakeCheckpoint()));
+        string path = Path.Combine(Path.GetTempPath(), "zan-byte-decoder-" + Guid.New() + ".safetensors");
+        try {
+            File.WriteAllBytes(path, MakeCheckpoint());
+            Check(ByteDecoder.Open(path).Generate("bx", 9) == "B", "local file inference");
+            File.WriteAllBytes(path, new byte[8]);
+            bool rejected = false;
+            try { ByteDecoder.Open(path); } catch (ArgumentException e) { rejected = true; }
+            Check(rejected, "truncated local checkpoint");
+        } finally {
+            if (File.Exists(path)) { File.Delete(path); }
+        }
+
+        string[] faults = new string[] {
+            "architecture", "dtype", "vocab", "context", "fractional shape", "fractional offset",
+            "duplicate field", "overlap", "length", "missing", "duplicate", "trailing data",
+            "header length", "header UTF-8", "non-finite"
+        };
+        for (int i = 0; i < faults.Length; i = i + 1) {
+            byte[] file = MakeCheckpoint(faults[i]);
+            bool rejected = false;
+            try { ByteDecoder.Load(file); } catch (Exception e) { rejected = true; }
+            Check(rejected, "accepted malformed checkpoint: " + faults[i]);
+        }
+        Console.WriteLine("byte decoder ok");
+    }
+}
