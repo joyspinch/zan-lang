@@ -529,7 +529,7 @@ public partial class Program {
     // when the two drift apart.
     static string SelfhostVersion() { return "0.2.22"; }
 
-    static long ReportPhase(bool enabled, string phase, long start) {
+    internal static long ReportPhase(bool enabled, string phase, long start) {
         if (!enabled) { return 0; }
         long now = Stopwatch.GetMicroseconds();
         Console.ErrorWriteLine("[time] " + phase + ": " + (now - start) / 1000 + " ms");
@@ -555,6 +555,8 @@ public partial class Program {
         string explicitStdlib = "";
         string subsystem = "";
         string driverDir = "";
+        string iconPath = "";
+        bool noIcon = false;
         bool metadataBodies = false;
         bool allSources = false;
         packageProject = "";
@@ -565,7 +567,8 @@ public partial class Program {
         while (i < argc) {
             string a = Environment.ArgAt(i);
             if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
-                || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir") {
+                || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir"
+                || a == "--icon") {
                 if (i + 1 >= argc || Environment.ArgAt(i + 1) == ""
                     || Environment.ArgAt(i + 1).StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -620,6 +623,12 @@ public partial class Program {
                 i = i + 2;
                 continue;
             }
+            if (a == "--icon") {
+                iconPath = Path.GetFullPath(Environment.ArgAt(i + 1));
+                i = i + 2;
+                continue;
+            }
+            if (a == "--no-icon") { noIcon = true; i = i + 1; continue; }
             if (a == "--package-project") {
                 packageProject = Environment.ArgAt(i + 1);
                 if (!Directory.ExistsOnDisk(packageProject)) {
@@ -704,6 +713,15 @@ public partial class Program {
             if (!isExe && !exportMetadata) { throw "zanc: --subsystem and --driver-dir require executable output"; }
             #else
             throw "zanc: --subsystem and --driver-dir require a Windows host";
+            #endif
+        }
+
+        if (!noIcon && iconPath != "" && !exportMetadata) {
+            #if WINDOWS
+            if (!isExe) { throw "zanc: --icon requires Windows executable output"; }
+            if (!File.Exists(iconPath)) { throw "zanc: icon file does not exist: '" + iconPath + "'"; }
+            #else
+            throw "zanc: --icon requires a Windows host";
             #endif
         }
 
@@ -798,7 +816,7 @@ public partial class Program {
             #if WINDOWS
             ig.collectNativeImports = isExe;
             #endif
-            string ir = ig.Gen(unit);
+            string ir = ig.Gen(unit, reportTime);
             phaseStart = ReportPhase(reportTime, "IR generation", phaseStart);
             // The checker phase already reported its own diagnostics; the
             // second flush must start at the irgen phase's first item or
@@ -834,7 +852,12 @@ public partial class Program {
                 string bitcodePath = workDir + "/module.bc";
                 string objPath = workDir + "/module.obj";
                 string exePath = workDir + "/program.exe";
+                string resPath = workDir + "/icon.res";
                 try {
+                    if (!noIcon && iconPath != "") {
+                        WriteIconResource(iconPath, resPath);
+                        linkInputs.Add(resPath);
+                    }
                     File.WriteAllText(llPath, ir);
                     if (toolchain == "") {
                         LinkExe(clang, exePath, llPath, optLevel, subsystem, linkInputs);
@@ -851,6 +874,7 @@ public partial class Program {
                     File.Delete(bitcodePath);
                     File.Delete(objPath);
                     File.Delete(exePath);
+                    File.Delete(resPath);
                     for (int fi = 0; fi < bundleFiles.Count; fi = fi + 1) {
                         File.Delete(workDir + "/native-" + fi);
                     }

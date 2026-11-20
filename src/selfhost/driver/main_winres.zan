@@ -1,0 +1,75 @@
+using System.Buffers.Binary;
+using System.IO;
+namespace Zan;
+
+public partial class Program {
+    static byte[] ReadIconFile(string path) {
+        FileStream file = FileStream.OpenRead(path);
+        try {
+            long length = file.Length();
+            if (length < 6 || length > 2147483647) { throw "zanc: invalid ICO file '" + path + "'"; }
+            byte[] data = new byte[(int)length];
+            if (file.ReadInto((nint)data, data.Length) != data.Length) {
+                throw "zanc: cannot read complete ICO file '" + path + "'";
+            }
+            return data;
+        } finally {
+            file.Close();
+        }
+    }
+
+    static void WriteResourceHeader(BinaryBufferWriter output, int size, int type, int id, int language) {
+        output.WriteUInt32LE(size);
+        output.WriteUInt32LE(32);
+        output.WriteUInt16LE(65535); output.WriteUInt16LE(type);
+        output.WriteUInt16LE(65535); output.WriteUInt16LE(id);
+        output.WriteUInt32LE(0); // DataVersion
+        output.WriteUInt16LE(0); // MemoryFlags
+        output.WriteUInt16LE(language);
+        output.WriteUInt32LE(0); // Version
+        output.WriteUInt32LE(0); // Characteristics
+    }
+
+    static void WriteIconResource(string path, string destination) {
+        byte[] data = ReadIconFile(path);
+        BinaryBufferReader input = new BinaryBufferReader(data);
+        string invalid = "zanc: invalid ICO file '" + path + "'";
+        if (input.ReadUInt16LE() != 0 || input.ReadUInt16LE() != 1) { throw invalid; }
+        int count = input.ReadUInt16LE();
+        int directoryEnd = 6 + count * 16;
+        if (count == 0 || directoryEnd > data.Length) { throw invalid; }
+
+        // ICO entries hold image offsets. The group resource replaces each
+        // offset with the ID of the corresponding RT_ICON record.
+        int groupSize = 6 + count * 14;
+        long resourceSize = 64 + groupSize + (4 - groupSize % 4) % 4;
+        int[] offsets = new int[count];
+        int[] sizes = new int[count];
+        for (int i = 0; i < count; i = i + 1) {
+            input.Seek(6 + i * 16 + 8);
+            long size = input.ReadUInt32LE();
+            long offset = input.ReadUInt32LE();
+            if (size == 0 || offset < directoryEnd || offset + size > data.Length) { throw invalid; }
+            offsets[i] = (int)offset;
+            sizes[i] = (int)size;
+            resourceSize = resourceSize + 32 + size + (4 - size % 4) % 4;
+        }
+        if (resourceSize > 2147483647) { throw "zanc: ICO resource is too large '" + path + "'"; }
+
+        BinaryBufferWriter output = new BinaryBufferWriter((int)resourceSize);
+        WriteResourceHeader(output, 0, 0, 0, 0);
+        for (int i = 0; i < count; i = i + 1) {
+            WriteResourceHeader(output, sizes[i], 3, i + 1, 1033); // RT_ICON
+            output.WriteBytes(data, offsets[i], sizes[i]);
+            while (output.Position() % 4 != 0) { output.WriteUInt8(0); }
+        }
+        WriteResourceHeader(output, groupSize, 14, 1, 1033); // RT_GROUP_ICON
+        output.WriteBytes(data, 0, 6);
+        for (int i = 0; i < count; i = i + 1) {
+            output.WriteBytes(data, 6 + i * 16, 12);
+            output.WriteUInt16LE(i + 1);
+        }
+        while (output.Position() % 4 != 0) { output.WriteUInt8(0); }
+        File.WriteAllBytes(destination, output.ToArray());
+    }
+}

@@ -36,6 +36,10 @@ reject_cli(subsystem_missing "option '--subsystem' requires a value" --subsystem
 reject_cli(subsystem_invalid "invalid PE subsystem 'invalid'" --subsystem invalid)
 reject_cli(driver_dir_missing "option '--driver-dir' requires a value" --driver-dir)
 reject_cli(driver_dir_absent "driver directory does not exist" --driver-dir "${OUTDIR}/absent drivers")
+reject_cli(icon_missing "option '--icon' requires a value" --icon)
+if(WIN32)
+  reject_cli(icon_ir "--icon requires Windows executable output" --icon "${_root}/templates/game/snake/assets/icon.ico")
+endif()
 reject_cli(target_flag_value "option '--target' requires a value" --target --auto-stdlib)
 reject_cli(target_cross "target 'wasm32-wasi' is not supported" --target wasm32-wasi)
 reject_cli(target_invalid "target 'batch4-invalid' is not supported" --target batch4-invalid)
@@ -128,6 +132,12 @@ if(WIN32 AND CLANG)
       --unset=ProgramW6432 "PATH=$ENV{SystemRoot}/System32")
     set(_bundled_link TRUE)
   endif()
+  set(icon_args)
+  set(expected_exit 73)
+  if(_bundled_link OR triple MATCHES "-msvc")
+    list(APPEND icon_args --icon "${_root}/templates/game/snake/assets/icon.ico")
+    set(expected_exit 74)
+  endif()
   set(stdlib "${OUTDIR}/native-stdlib")
   set(stdlib_driver "${stdlib}/Fixture/Nested/drivers")
   set(driver_override "${stdlib}/override drivers")
@@ -159,16 +169,21 @@ class Program {
     static extern nint GetCurrentProcess();
     [DllImport("psapi")]
     static extern int GetProcessMemoryInfo(nint process, byte[] counters, int size);
+    [DllImport("kernel32")]
+    static extern nint FindResourceW(nint module, nint name, nint type);
     static int Main() {
         byte[] counters = new byte[72];
-        return GetProcessMemoryInfo(GetCurrentProcess(), counters, counters.Length) != 0
-            ? new Program().ReadOptions() : 1;
+        if (GetProcessMemoryInfo(GetCurrentProcess(), counters, counters.Length) == 0) { return 1; }
+        bool group = FindResourceW(0, 1, 14) != 0;
+        bool image = FindResourceW(0, 1, 3) != 0;
+        if (group != image) { return 2; }
+        return new Program().ReadOptions() + (group ? 1 : 0);
     }
 }
 ]=])
   file(REMOVE "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
   execute_process(COMMAND ${_gen1_env} "ZAN_STDLIB_PATH=${stdlib}"
-    "${GEN1}" "${_default_src}" --time --subsystem windows --driver-dir "${driver_override}"
+    "${GEN1}" "${_default_src}" --time --subsystem windows --driver-dir "${driver_override}" ${icon_args}
     WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
   string(FIND "${stderr}" "[time] IR generation:" timing)
   if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}" OR NOT EXISTS "${OUTDIR}/stdlib-payload.dat"
@@ -184,11 +199,85 @@ class Program {
     message(FATAL_ERROR "expected Windows GUI subsystem, found '${subsystem}'")
   endif()
   execute_process(COMMAND "${_default_exe}" RESULT_VARIABLE rc TIMEOUT 15)
-  file(REMOVE "${_default_src}" "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
-  file(REMOVE_RECURSE "${stdlib}")
-  if(NOT "${rc}" STREQUAL "73")
-    message(FATAL_ERROR "default executable returned ${rc}, expected 73")
+  if(NOT "${rc}" STREQUAL "${expected_exit}")
+    message(FATAL_ERROR "default executable returned ${rc}, expected ${expected_exit}")
   endif()
+  set(bad_icon "${OUTDIR}/invalid icon.ico")
+  file(WRITE "${bad_icon}" "not an ICO file")
+  file(SHA256 "${_default_exe}" before_bad_icon)
+  execute_process(COMMAND ${_gen1_env} "ZAN_STDLIB_PATH=${stdlib}"
+    "${GEN1}" "${_default_src}" --icon "${bad_icon}"
+    WORKING_DIRECTORY "${_root}" RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  file(SHA256 "${_default_exe}" after_bad_icon)
+  if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "invalid ICO file"
+      OR NOT before_bad_icon STREQUAL after_bad_icon)
+    message(FATAL_ERROR "invalid icon must preserve the previous executable, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  file(REMOVE "${bad_icon}" "${_default_src}" "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
+  file(REMOVE_RECURSE "${stdlib}")
+
+  set(_partial_main "${OUTDIR}/partial-main.zan")
+  set(_partial_contract "${OUTDIR}/partial-contract.zan")
+  set(_partial_base "${OUTDIR}/partial-base.zan")
+  set(_partial_exe "${OUTDIR}/partial-main.exe")
+  file(WRITE "${_partial_main}" [=[
+namespace Other {
+    public interface IAttach<T> { int Attach(T value); }
+}
+namespace Fixture {
+    public partial class Host {
+        public int Start() { return 7; }
+        public int Attach(int value) { return value + BaseValue(); }
+    }
+    class Program {
+        static int Main() {
+            Host host = new Host();
+            Contracts.IStart start = host;
+            Contracts.IAttach<int> attach = host;
+            return start.Start() == 7 && attach.Attach(10) == 42 ? 0 : 1;
+        }
+    }
+}
+]=])
+  file(WRITE "${_partial_contract}" [=[
+using Contracts;
+namespace Contracts {
+    public interface IStart { int Start(); }
+    public interface IAttach<T> { int Attach(T value); }
+}
+namespace Fixture {
+    public partial class Host : IStart, IAttach<int> { }
+}
+]=])
+  file(WRITE "${_partial_base}" [=[
+namespace Fixture {
+    public class Base { public int BaseValue() { return 32; } }
+    public partial class Host : Base, Contracts.IAttach<int> { }
+}
+]=])
+  execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_partial_main}" "${_partial_contract}"
+    "${_partial_base}" -O0 -o "${_partial_exe}" WORKING_DIRECTORY "${_root}"
+    RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "partial interface fixture failed to compile, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  execute_process(COMMAND "${_partial_exe}" RESULT_VARIABLE rc TIMEOUT 15)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "partial interface dispatch failed, rc=${rc}")
+  endif()
+  file(APPEND "${_partial_base}" [=[
+namespace Fixture {
+    public class Incompatible { }
+    public partial class Host : Incompatible { }
+}
+]=])
+  execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_partial_main}" "${_partial_contract}"
+    "${_partial_base}" -o "${OUTDIR}/partial-invalid.ll" WORKING_DIRECTORY "${_root}"
+    RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
+  if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "has conflicting base classes")
+    message(FATAL_ERROR "expected conflicting partial base diagnosis, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  file(REMOVE "${_partial_main}" "${_partial_contract}" "${_partial_base}" "${_partial_exe}")
 
   set(_sqlite_case "${_root}/tests/conformance/sqlite_params")
   set(_sqlite_out "${OUTDIR}/sqlite-default")

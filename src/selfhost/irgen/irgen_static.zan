@@ -2,6 +2,25 @@ using System;
 using System.Collections.Generic;
 namespace Zan;
 
+class StaticInitFunction {
+    public int start;
+    public int end;
+    public bool initBody;
+    public List<string> refs;
+    public List<int> dispatch;
+    public List<int> news;
+    public List<int> edges;
+
+    public StaticInitFunction(int start, int end, bool initBody) {
+        this.start = start;
+        this.end = end;
+        this.initBody = initBody;
+        refs = new List<string>();
+        dispatch = new List<int>();
+        news = new List<int>();
+    }
+}
+
 partial class Irgen {
     // ---- static class fields: backed by internal module globals ----
     Node FindStaticField(Node cls, string name) {
@@ -409,75 +428,70 @@ partial class Irgen {
     // retention, globals (type metadata, vtables, descriptors) are not roots.
     // A function pointer produced by live code remains an executable edge.
     string ResolveStaticInits(string modText) {
-        List<int> starts = new List<int>();
-        List<int> ends = new List<int>();
-        List<Node> refs = new List<Node>();
-        List<Node> dispatch = new List<Node>();
-        List<Node> news = new List<Node>();
+        List<StaticInitFunction> functions = new List<StaticInitFunction>();
         Dictionary<string, int> defs = new Dictionary<string, int>();
+        Dictionary<string, int> typeIds = new Dictionary<string, int>();
+        int i = 0;
+        while (i < sinitSyms.Count) { typeIds[sinitSyms[i]] = i; i = i + 1; }
         int pos = 0;
-        int current = -1;
+        StaticInitFunction current = null;
         while (pos < modText.Length) {
             int nl = modText.IndexOf("\n", pos);
             if (nl < 0) { nl = modText.Length; }
             string line = modText.Substring(pos, nl - pos);
             if (line.StartsWith("define ")) {
-                current = refs.Count;
-                defs[HeadSymbol(line)] = current;
-                starts.Add(pos); ends.Add(modText.Length);
-                refs.Add(new Node(AK.TypeRef()));
-                dispatch.Add(new Node(AK.TypeRef()));
-                news.Add(new Node(AK.TypeRef()));
-            } else if (current >= 0 && line == "}") {
-                ends[current] = nl;
-                current = -1;
-            } else if (current >= 0) {
+                string sym = HeadSymbol(line);
+                defs[sym] = functions.Count;
+                current = new StaticInitFunction(pos, modText.Length, sym.StartsWith("__zan_sinit_"));
+                functions.Add(current);
+            } else if (current != null && line == "}") {
+                current.end = nl;
+                current = null;
+            } else if (current != null) {
                 int dm = line.IndexOf(" ; zan.dispatch ");
                 if (dm >= 0) {
-                    Node d = new Node(AK.TypeRef());
-                    d.ival = int.Parse(line.Substring(dm + 16));
-                    dispatch[current].Add(d);
+                    current.dispatch.Add(int.Parse(line.Substring(dm + 16)));
                 } else {
-                    List<string> names = new List<string>();
-                    CollectHeadRefs(line, names);
-                    int ni = 0;
-                    while (ni < names.Count) {
-                        refs[current].Add(MkType(names[ni]));
-                        ni = ni + 1;
-                    }
+                    CollectHeadRefs(line, current.refs);
                     if (line.StartsWith("  ; zan.new @")) {
-                        int nt = IndexOfStr(sinitSyms, HeadSymbol(line));
-                        if (nt >= 0) {
-                            Node n = new Node(AK.TypeRef()); n.ival = nt;
-                            news[current].Add(n);
-                        }
+                        string sym = HeadSymbol(line);
+                        if (typeIds.ContainsKey(sym)) { current.news.Add(typeIds[sym]); }
                     }
                 }
             }
             pos = nl + 1;
         }
-        List<int> roots = new List<int>();
-        if (defs.ContainsKey("main")) { roots.Add(defs["main"]); }
-        int i = 0;
+        int[] live = new int[functions.Count];
+        List<int> queue = new List<int>();
+        if (defs.ContainsKey("main")) { StaticEnqueue(defs["main"], live, queue, 1); }
+        i = 0;
         while (i < sinitExportRoots.Count) {
-            if (defs.ContainsKey(sinitExportRoots[i])) { roots.Add(defs[sinitExportRoots[i]]); }
+            string sym = sinitExportRoots[i];
+            if (defs.ContainsKey(sym)) { StaticEnqueue(defs[sym], live, queue, 1); }
             i = i + 1;
         }
-        // Keep compiler-discovered order deterministic. References inside
-        // unused initialization functions never become roots of this walk.
-        List<int> liveNew = new List<int>();
-        i = 0;
-        while (i < sinitTypes.Count) { liveNew.Add(0); i = i + 1; }
-        List<int> live = StaticReach(roots, refs, dispatch, news, defs, liveNew);
-        List<int> colors = new List<int>();
-        List<int> order = new List<int>();
-        i = 0;
-        while (i < sinitTypes.Count) { colors.Add(0); i = i + 1; }
+        StaticReach(functions, defs, live, queue);
+
+        // The global fixed point has resolved every dispatch edge that any
+        // live initializer can take. Every type allocated along such a path
+        // is already in the global allocation set.
+        int[] initDefs = new int[sinitSyms.Count];
+        List<int> liveInits = new List<int>();
         i = 0;
         while (i < sinitSyms.Count) {
-            if (defs.ContainsKey(sinitSyms[i]) && live[defs[sinitSyms[i]]] != 0) {
-                StaticInitVisit(i, refs, dispatch, news, defs, colors, order, liveNew, live);
+            string sym = sinitSyms[i];
+            if (defs.ContainsKey(sym)) {
+                int fi = defs[sym];
+                if (live[fi] != 0) { initDefs[i] = fi; liveInits.Add(i); }
             }
+            i = i + 1;
+        }
+        int[] seen = new int[functions.Count];
+        int[] colors = new int[sinitSyms.Count];
+        List<int> order = new List<int>();
+        i = 0;
+        while (i < liveInits.Count) {
+            StaticInitVisit(liveInits[i], functions, initDefs, liveInits, colors, order, seen, queue);
             i = i + 1;
         }
         StringBuilder result = new StringBuilder();
@@ -485,16 +499,14 @@ partial class Irgen {
         // pass must not mistake startup demand for runtime call references.
         pos = 0;
         int di = 0;
+        int nextDef = functions.Count > 0 ? functions[0].start : modText.Length;
         while (pos < modText.Length) {
-            if (di < starts.Count && pos == starts[di]) {
-                string block = modText.Substring(starts[di], ends[di] - starts[di]);
-                string sym = HeadSymbol(block);
-                bool initBody = sym.StartsWith("__zan_sinit_");
-                if (initBody && live[di] == 0) {
-                    pos = ends[di] + 1; di = di + 1;
-                    continue;
-                }
+            if (pos == nextDef) {
+                StaticInitFunction fn = functions[di];
+                bool drop = fn.initBody && live[di] == 0;
                 di = di + 1;
+                nextDef = di < functions.Count ? functions[di].start : modText.Length;
+                if (drop) { pos = fn.end + 1; continue; }
             }
             int nl = modText.IndexOf("\n", pos);
             if (nl < 0) { nl = modText.Length; }
@@ -519,111 +531,163 @@ partial class Irgen {
         return result.ToString();
     }
 
-    List<int> StaticReach(List<int> roots, List<Node> refs, List<Node> dispatch,
-    List<Node> news, Dictionary<string, int> defs, List<int> knownNew) {
-        List<int> seen = new List<int>();
-        List<int> made = knownNew;
-        List<int> queue = new List<int>();
+    void StaticReach(List<StaticInitFunction> functions, Dictionary<string, int> defs,
+    int[] live, List<int> queue) {
+        // Preserve the first match in both metadata lists, even if the
+        // chosen table has no entry or the slot target has no definition.
+        Dictionary<string, string> specializedTables = new Dictionary<string, string>();
         int i = 0;
-        while (i < refs.Count) { seen.Add(0); i = i + 1; }
+        while (i < specVtSyms.Count) {
+            string key = specVtCls[i].sval + "|" + InstTag(specVtArgs[i].kids);
+            if (!specializedTables.ContainsKey(key)) { specializedTables[key] = specVtSyms[i]; }
+            i = i + 1;
+        }
+        Dictionary<string, int> slots = new Dictionary<string, int>();
         i = 0;
-        while (i < roots.Count) { StaticEnqueue(roots[i], seen, queue); i = i + 1; }
+        while (i < sinitDispatchTables.Count) {
+            string key = sinitDispatchTables[i] + "|" + sinitDispatchSlots[i];
+            string sym = sinitVtableTargets[i];
+            if (!slots.ContainsKey(key)) { slots[key] = defs.ContainsKey(sym) ? defs[sym] : -1; }
+            i = i + 1;
+        }
+
+        int[] made = new int[sinitTypes.Count];
+        Node[] classes = new Node[sinitTypes.Count];
+        string[] tables = new string[sinitTypes.Count];
+        List<int> madeTypes = new List<int>();
+        List<int> callers = new List<int>();
+        int[] edgeMarks = new int[functions.Count];
+        int matchedTypes = 0;
         int qi = 0;
-        bool changed = true;
-        while (changed) {
-            changed = false;
+        while (qi < queue.Count) {
+            int priorCallers = callers.Count;
             while (qi < queue.Count) {
                 int fi = queue[qi]; qi = qi + 1;
+                StaticInitFunction fn = functions[fi];
+                fn.edges = new List<int>();
                 int ri = 0;
-                while (ri < refs[fi].kids.Count) {
-                    string refSym = refs[fi].kids[ri].sval;
-                    if (defs.ContainsKey(refSym)) { StaticEnqueue(defs[refSym], seen, queue); }
+                while (ri < fn.refs.Count) {
+                    string sym = fn.refs[ri];
+                    if (defs.ContainsKey(sym)) {
+                        StaticReachEdge(defs[sym], fi, fn.edges, edgeMarks, live, queue);
+                    }
                     ri = ri + 1;
                 }
+                fn.refs = null;
                 ri = 0;
-                while (ri < news[fi].kids.Count) {
-                    made[news[fi].kids[ri].ival] = 1;
+                while (ri < fn.news.Count) {
+                    int ti = fn.news[ri];
+                    if (made[ti] == 0) {
+                        made[ti] = 1;
+                        madeTypes.Add(ti);
+                        Node instTy = sinitTypes[ti];
+                        Node cls = binder.FindType(instTy.sval);
+                        classes[ti] = cls;
+                        if (cls != null) {
+                            string key = cls.sval + "|" + InstTag(instTy.kids);
+                            tables[ti] = specializedTables.ContainsKey(key) ? specializedTables[key] : cls.sval + "_vtable";
+                        }
+                    }
                     ri = ri + 1;
                 }
-                changed = true;
+                fn.news = null;
+                if (fn.dispatch.Count > 0) { callers.Add(fi); }
             }
-            // An indirect call is an edge only for types that can exist. A
-            // metadata-only derived class must not run its override's effects.
-            i = 0;
-            while (i < queue.Count) {
-                int fi = queue[i]; int dj = 0;
-                while (dj < dispatch[fi].kids.Count) {
-                    int dc = dispatch[fi].kids[dj].ival;
+
+            // Each live dispatch sees each allocated type once. Old callers
+            // only need the new types. New callers start with all made types.
+            i = matchedTypes == madeTypes.Count ? priorCallers : 0;
+            while (i < callers.Count) {
+                int fi = callers[i];
+                StaticInitFunction fn = functions[fi];
+                int firstType = i < priorCallers ? matchedTypes : 0;
+                // Reuse one set of marks to keep unique targets per caller.
+                int ri = 0;
+                while (ri < fn.edges.Count) { edgeMarks[fn.edges[ri]] = fi + 1; ri = ri + 1; }
+                int dj = 0;
+                while (dj < fn.dispatch.Count) {
+                    int dc = fn.dispatch[dj]; dj = dj + 1;
                     Node recvTy = sinitDispatchTypes[dc];
                     string directTarget = sinitDispatchTargets[dc];
-                    int ti = 0;
-                    while (ti < made.Count) {
-                        if (made[ti] != 0) {
-                            Node instTy = sinitTypes[ti];
-                            Node cls = binder.FindType(instTy.sval);
-                            bool matches = directTarget == ""
-                                ? binder.IsAssignableFrom(recvTy.sval, instTy.sval)
-                                : binder.SameType(recvTy, instTy);
-                            if (cls != null && matches) {
-                                string target = directTarget;
-                                if (target == "") { target = StaticVtableTarget(cls, instTy, sinitDispatchMethods[dc]); }
-                                if (defs.ContainsKey(target)) { StaticEnqueue(defs[target], seen, queue); }
-                            }
-                        }
-                        ti = ti + 1;
+                    int directDef = -1;
+                    if (directTarget != "") {
+                        if (!defs.ContainsKey(directTarget)) { continue; }
+                        directDef = defs[directTarget];
                     }
-                    dj = dj + 1;
+                    int mi = firstType;
+                    while (mi < madeTypes.Count) {
+                        int ti = madeTypes[mi]; mi = mi + 1;
+                        Node cls = classes[ti];
+                        if (cls == null) { continue; }
+                        Node instTy = sinitTypes[ti];
+                        int target = -1;
+                        if (directDef >= 0) {
+                            if (binder.SameType(recvTy, instTy)) { target = directDef; }
+                        } else if (binder.IsAssignableFrom(recvTy.sval, instTy.sval)) {
+                            target = StaticVtableTarget(cls, sinitDispatchMethods[dc], tables[ti], slots);
+                        }
+                        if (target >= 0) { StaticReachEdge(target, fi, fn.edges, edgeMarks, live, queue); }
+                    }
                 }
                 i = i + 1;
             }
-            if (qi < queue.Count) { changed = true; }
+            matchedTypes = madeTypes.Count;
         }
-        return seen;
     }
 
-    void StaticEnqueue(int at, List<int> seen, List<int> queue) {
-        if (seen[at] == 0) { seen[at] = 1; queue.Add(at); }
+    void StaticReachEdge(int target, int caller, List<int> edges, int[] edgeMarks,
+    int[] live, List<int> queue) {
+        int stamp = caller + 1;
+        if (edgeMarks[target] == stamp) { return; }
+        edgeMarks[target] = stamp;
+        edges.Add(target);
+        StaticEnqueue(target, live, queue, 1);
     }
 
-    string StaticVtableTarget(Node cls, Node instTy, Node method) {
+    void StaticEnqueue(int at, int[] seen, List<int> queue, int stamp) {
+        if (seen[at] != stamp) { seen[at] = stamp; queue.Add(at); }
+    }
+
+    int StaticVtableTarget(Node cls, Node method, string table, Dictionary<string, int> slots) {
         int slot = VSlotIndexM(cls, method);
-        if (slot < 0) { return ""; }
-        string table = cls.sval + "_vtable";
-        int vi = 0;
-        while (vi < specVtSyms.Count) {
-            if (specVtCls[vi].sval == cls.sval
-            && InstTag(specVtArgs[vi].kids) == InstTag(instTy.kids)) {
-                table = specVtSyms[vi]; break;
-            }
-            vi = vi + 1;
-        }
-        vi = 0;
-        while (vi < sinitDispatchTables.Count) {
-            if (sinitDispatchTables[vi] == table && sinitDispatchSlots[vi] == slot) {
-                return sinitVtableTargets[vi];
-            }
-            vi = vi + 1;
-        }
-        return "";
+        if (slot < 0) { return -1; }
+        string key = table + "|" + slot;
+        return slots.ContainsKey(key) ? slots[key] : -1;
     }
 
-    void StaticInitVisit(int at, List<Node> refs, List<Node> dispatch, List<Node> news,
-    Dictionary<string, int> defs, List<int> colors, List<int> order,
-    List<int> liveNew, List<int> live) {
+    void StaticInitVisit(int at, List<StaticInitFunction> functions, int[] initDefs,
+    List<int> liveInits, int[] colors, List<int> order, int[] seen, List<int> queue) {
         if (colors[at] != 0) { return; }
         colors[at] = 1;
-        List<int> roots = new List<int>(); roots.Add(defs[sinitSyms[at]]);
-        List<int> made = new List<int>();
-        int i = 0;
-        while (i < liveNew.Count) { made.Add(liveNew[i]); i = i + 1; }
-        List<int> deps = StaticReach(roots, refs, dispatch, news, defs, made);
-        i = 0;
-        while (i < sinitTypes.Count) {
-            if (i != at && colors[i] != 1 && defs.ContainsKey(sinitSyms[i])
-            && live[defs[sinitSyms[i]]] != 0 && deps[defs[sinitSyms[i]]] != 0) {
-                StaticInitVisit(i, refs, dispatch, news, defs, colors, order, liveNew, live);
+        int root = initDefs[at];
+        if (functions[root].edges.Count > 0) {
+            int stamp = at + 1;
+            queue.Clear();
+            StaticEnqueue(root, seen, queue, stamp);
+            int qi = 0;
+            while (qi < queue.Count) {
+                List<int> edges = functions[queue[qi]].edges;
+                qi = qi + 1;
+                int ei = 0;
+                while (ei < edges.Count) {
+                    StaticEnqueue(edges[ei], seen, queue, stamp);
+                    ei = ei + 1;
+                }
             }
-            i = i + 1;
+            // Capture dependencies before recursive visits reuse the marks.
+            // Enumerating by initializer index preserves the original order.
+            List<int> deps = new List<int>();
+            int i = 0;
+            while (i < liveInits.Count) {
+                int dep = liveInits[i];
+                if (colors[dep] == 0 && seen[initDefs[dep]] == stamp) { deps.Add(dep); }
+                i = i + 1;
+            }
+            i = 0;
+            while (i < deps.Count) {
+                StaticInitVisit(deps[i], functions, initDefs, liveInits, colors, order, seen, queue);
+                i = i + 1;
+            }
         }
         colors[at] = 2; order.Add(at);
     }
