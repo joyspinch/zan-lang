@@ -19,7 +19,7 @@ _spec.loader.exec_module(identity)
 SCHEMA = "zan-sdk-stage-v1"
 EXCLUDED_DIRS = {".build", "build", "_scratch", "bin", "obj", "logs", ".git", ".github", "__pycache__"}
 EXCLUDED_FILES = {".gitignore", ".gitattributes", ".DS_Store", "Thumbs.db"}
-EXCLUDED_SUFFIXES = {".log", ".tmp", ".bak", ".pdb", ".ilk", ".exp", ".pyc"}
+EXCLUDED_SUFFIXES = {".log", ".tmp", ".bak", ".swp", ".pdb", ".ilk", ".exp", ".pyc"}
 
 
 GENERATED_DRIVERS = identity.SDK_NATIVE_OWNERS

@@ -10,11 +10,15 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("sdk_stage", ROOT / "scripts/sdk_stage_manifest.py")
 SDK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SDK)
+WINDOWS_SPEC = importlib.util.spec_from_file_location("sdk_windows_archive", ROOT / "scripts/sdk_windows_archive.py")
+WINDOWS_ARCHIVE = importlib.util.module_from_spec(WINDOWS_SPEC)
+WINDOWS_SPEC.loader.exec_module(WINDOWS_ARCHIVE)
 POWERSHELL = shutil.which("powershell") or shutil.which("pwsh")
 
 
@@ -307,6 +311,103 @@ class SdkStageTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             SDK.preflight(repo, build, plan, True)
 
+    def windows_zip_fixture(self):
+        sdk = self.base / "sdk"
+        self.write(sdk / "templates/console/.gitignore", "*.exe")
+        self.write(sdk / "toolchain/debugger/bin/gdb.exe", "debugger fixture")
+        manifest = {"schema": SDK.SCHEMA, "phase": "staged", "version": "1.2.3", "validation": "local-build-only",
+                    "build_identity_sha256": "a" * 64, "files": SDK.inventory(sdk)}
+        manifest["manifest_sha256"] = SDK.identity.digest(manifest)
+        SDK.identity.atomic_json(sdk / "sdk-manifest.json", manifest)
+        self.write(sdk / "sdk-consumption.json", "previous acceptance")
+        return sdk, self.base / "out/zan-ide-1.2.3-win-x64.zip"
+
+    def test_windows_zip_round_trip_keeps_exact_payload(self):
+        sdk, archive = self.windows_zip_fixture()
+        WINDOWS_ARCHIVE.write_archive(sdk, archive)
+        root = archive.stem
+        with zipfile.ZipFile(archive) as bundle:
+            self.assertCountEqual(bundle.namelist(), [f"{root}/{name}" for name in (
+                "sdk-manifest.json", "templates/console/.gitignore", "toolchain/debugger/bin/gdb.exe")])
+        output = self.base / "consumed"
+
+        def consume(command, *, check, env, cwd):
+            extracted = Path(command[command.index("--sdk") + 1])
+            self.assertEqual(extracted.name, root)
+            self.assertEqual(extracted.parent.parent, output)
+            self.assertEqual(SDK.verify_sdk(extracted), SDK.verify_sdk(sdk))
+            self.assertEqual(command[1:3], ["-I", "-B"])
+            self.assertEqual(command[4], "consume")
+            self.assertEqual(cwd, output)
+            self.assertTrue(check)
+            self.assertNotIn("ZAN_CLANG", env)
+            SDK.identity.atomic_json(extracted / "sdk-consumption.json", {"phase": "templates-consumed"})
+
+        with mock.patch.dict(os.environ, {"SystemRoot": str(self.base / "Windows"), "ZAN_CLANG": "developer-clang"}), \
+                mock.patch.object(WINDOWS_ARCHIVE.shutil, "which", return_value=str(self.base / "cmake.exe")), \
+                mock.patch.object(WINDOWS_ARCHIVE.subprocess, "run", side_effect=consume) as consumer:
+            WINDOWS_ARCHIVE.consume_archive(sdk, archive, output)
+            consumer.assert_called_once()
+        receipt = SDK.load(output / "sdk-consumption.json")
+        self.assertEqual(receipt["phase"], "archive-consumed")
+        self.assertEqual(receipt["archive"], SDK.identity.required_identity(archive))
+        self.assertFalse(list(output.glob("extract-*")))
+        self.assertEqual((sdk / "sdk-consumption.json").read_text(), "previous acceptance")
+
+    def test_windows_zip_rejects_checksum_and_inventory_mismatches(self):
+        sdk, archive = self.windows_zip_fixture()
+        WINDOWS_ARCHIVE.write_archive(sdk, archive)
+        checksum = WINDOWS_ARCHIVE.checksum_file(archive)
+        with zipfile.ZipFile(archive) as bundle:
+            entries = {name: bundle.read(name) for name in bundle.namelist()}
+        gdb = archive.stem + "/toolchain/debugger/bin/gdb.exe"
+        for case, payload, message in (
+                ("checksum", entries, "checksum mismatch"),
+                ("extra", {**entries, archive.stem + "/unlisted.dll": b"extra"}, "entries differ"),
+                ("missing", {name: data for name, data in entries.items() if name != gdb}, "entries differ"),
+                ("wrong-size", {**entries, gdb: b"short"}, "Invalid Windows SDK ZIP entry"),
+                ("wrong-hash", {**entries, gdb: b"X" * len(entries[gdb])}, "payload changed")):
+            with self.subTest(case=case):
+                with zipfile.ZipFile(archive, "w") as bundle:
+                    for name, data in payload.items():
+                        bundle.writestr(name, data)
+                record = SDK.identity.required_identity(archive)
+                checksum.write_text("incorrect" if case == "checksum" else WINDOWS_ARCHIVE.checksum_line(archive, record),
+                                    encoding="ascii")
+
+                def consume(command, **kwargs):
+                    SDK.verify_sdk(Path(command[command.index("--sdk") + 1]))
+
+                output = self.base / case
+                with mock.patch.dict(os.environ, {"SystemRoot": str(self.base / "Windows")}), \
+                        mock.patch.object(WINDOWS_ARCHIVE.shutil, "which", return_value=str(self.base / "cmake.exe")), \
+                        mock.patch.object(WINDOWS_ARCHIVE.subprocess, "run", side_effect=consume) as consumer:
+                    with self.assertRaisesRegex(ValueError, message):
+                        WINDOWS_ARCHIVE.consume_archive(sdk, archive, output)
+                self.assertEqual(consumer.call_count, int(case == "wrong-hash"))
+                self.assertFalse((output / "sdk-consumption.json").exists())
+                self.assertFalse(list(output.glob("extract-*")))
+
+    def test_windows_zip_rejects_path_collisions_and_reserved_names(self):
+        for names in (("Toolchain/a", "toolchain/b"), ("toolchain/bin", "toolchain/bin/file"),
+                      ("templates/file", "templates/file"), ("SDK-MANIFEST.JSON",),
+                      ("toolchain/COM1.txt",), ("templates/name. ",), ("templates/file:stream",),
+                      ("templates\\file",)):
+            with self.subTest(names=names), self.assertRaisesRegex(ValueError, "Windows SDK path|Unsafe SDK manifest path"):
+                WINDOWS_ARCHIVE.member_names({"files": [{"path": name} for name in names]}, "sdk")
+
+    def test_windows_zip_preserves_existing_archive_or_checksum_on_conflict(self):
+        sdk, archive = self.windows_zip_fixture()
+        checksum = self.write(WINDOWS_ARCHIVE.checksum_file(archive), "old checksum")
+        with self.assertRaises(FileExistsError):
+            WINDOWS_ARCHIVE.write_archive(sdk, archive)
+        self.assertFalse(archive.exists())
+        self.assertEqual(checksum.read_text(), "old checksum")
+        self.write(archive, "old archive")
+        with self.assertRaises(FileExistsError):
+            WINDOWS_ARCHIVE.write_archive(sdk, archive)
+        self.assertEqual(archive.read_text(), "old archive")
+
     def test_sdk_inventory_preserves_debugger_bin_and_detects_tampering(self):
         sdk = self.base / "sdk"
         gdb = self.write(sdk / "toolchain/debugger/bin/gdb.exe", "debugger fixture")
@@ -378,10 +479,17 @@ class SdkStageTests(unittest.TestCase):
         self.assertLess(windows.index("-Action Capture"), windows.index("-PrepareOnly -NoBump"))
         self.assertLess(windows.index("-PrepareOnly -NoBump"), windows.index("-Action Seal"))
         self.assertLess(windows.index("-Action Seal"), windows.index("-P scripts/release_quality_gate.cmake"))
-        self.assertIn("publish_ide.ps1 -SkipBuild -NoBump", windows)
-        self.assertIn("sdk_stage_manifest.py consume --sdk dist/win-x64", windows)
-        self.assertIn("$platform = Join-Path $PWD 'dist/win-x64'", windows)
-        self.assertNotIn("Rename-Item dist $name", windows)
+        publish = windows.index("publish_ide.ps1 -SkipBuild -NoBump")
+        package = windows.index("sdk_windows_archive.py write --sdk dist/win-x64")
+        consume = windows.index("sdk_windows_archive.py consume --sdk dist/win-x64")
+        upload = windows.index("name: zan-ide-win-x64")
+        self.assertLess(publish, package)
+        self.assertLess(package, consume)
+        self.assertLess(consume, upload)
+        self.assertIn("SDK_ARCHIVE: ${{ steps.bundle.outputs.archive }}", windows)
+        self.assertIn("--archive $env:SDK_ARCHIVE", windows)
+        self.assertIn("${{ steps.bundle.outputs.archive }}.sha256", windows[upload:])
+        self.assertNotIn("if: always()", windows[windows.rindex("      - uses:", 0, upload):upload])
 
     def test_skip_build_has_no_compilation_calls_after_preparation(self):
         text = (ROOT / "scripts/publish_ide.ps1").read_text(encoding="utf-8-sig")

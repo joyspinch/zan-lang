@@ -33,9 +33,8 @@ def discover(root):
     projects = sorted((root / "templates").glob("*/*/zan.proj"))
     result = [(p.parent.relative_to(root / "templates").as_posix(), p) for p in projects]
     gallery = root / "examples/html_gallery/zan.proj"
-    if not gallery.is_file():
-        raise ValueError(f"required extra project does not exist: {gallery}")
-    result.append(("html_gallery", gallery))
+    if gallery.is_file():
+        result.append(("html_gallery", gallery))
     return result
 
 
@@ -96,7 +95,7 @@ def execute(args, selected, output):
         command = [
             args.cmake, f"-DZANC={args.zanc}",
             f"-DTEMPLATES={(args.root / 'templates').as_posix()}",
-            f"-DEXTRA_PROJECTS={(args.root / 'examples/html_gallery/zan.proj').as_posix()}",
+            f"-DEXTRA_PROJECTS={project.as_posix() if name == 'html_gallery' else ''}",
             f"-DSTDLIB={args.stdlib.as_posix()}", f"-DDRIVER_DIR={args.driver_dir.as_posix()}",
             f"-DWORK={work.as_posix()}", f"-DEXE_EXT={args.exe_ext}",
             f"-DFILTER={exact_cmake_regex(name)}", f"-DCOMPILE_TIMEOUT={args.timeout}",
@@ -110,7 +109,7 @@ def execute(args, selected, output):
         try:
             with log.open("w", encoding="utf-8") as stream:
                 process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT,
-                                           cwd=args.root, start_new_session=os.name != "nt")
+                                           cwd=work, start_new_session=os.name != "nt")
                 deadline = began + args.outer_timeout
                 status = None
                 while process.poll() is None:

@@ -108,7 +108,7 @@ function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
 foreach ($tree in @('stdlib', 'packages', 'examples', 'templates', 'tools')) {
     Add-SdkCopy (Join-Path $root $tree) $tree -Tree
 }
-Assert-SdkFile (Join-Path $root 'examples\html_gallery\zan.proj')
+Assert-SdkFile (Join-Path $root 'templates\console\console-args\zan.proj')
 Add-SdkCopy (Join-Path $b 'ZanIDE.exe') 'ZanIDE.exe'
 Add-SdkCopy (Join-Path $b 'ZanIDE.deps.txt') 'ZanIDE.deps.txt'
 foreach ($dep in (Get-Content -LiteralPath (Join-Path $b 'ZanIDE.deps.txt'))) {

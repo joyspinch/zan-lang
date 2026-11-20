@@ -381,33 +381,41 @@ jobs:
           # ZAN_GDB_DIR is pinned before validation to the tested debugger.
           if (-not (Test-Path -PathType Leaf $env:ZAN_GDB)) { throw "Validated debugger missing: $env:ZAN_GDB" }
           & ./scripts/publish_ide.ps1 -SkipBuild -NoBump
-          python -I -B scripts/sdk_stage_manifest.py consume --sdk dist/win-x64 `
-            --output build/test-out/sdk-consumption --filter '^console/console-args$'
-          if ($LASTEXITCODE -ne 0) { throw 'Staged SDK consumption failed' }
 
       - name: Package archive
+        id: bundle
         shell: pwsh
         run: |
           $v = (Get-Content VERSION).Trim()
-          New-Item -ItemType Directory -Force out | Out-Null
-          $name = "zan-ide-$v-win-x64"
-          # Archive the platform SDK root; renaming dist itself adds an unwanted
-          # win-x64 layer between the archive root and ZanIDE/toolchain.
-          $platform = Join-Path $PWD 'dist/win-x64'
-          $archiveRoot = Join-Path $PWD "dist/$name"
-          Move-Item -LiteralPath $platform -Destination $archiveRoot
-          try {
-            Compress-Archive -LiteralPath $archiveRoot -DestinationPath "out/$name.zip"
-            (Get-FileHash "out/$name.zip" -Algorithm SHA256).Hash + "  $name.zip" |
-              Set-Content "out/$name.zip.sha256"
-          } finally {
-            Move-Item -LiteralPath $archiveRoot -Destination $platform
-          }
+          $archive = "out/zan-ide-$v-win-x64.zip"
+          python -I -B scripts/sdk_windows_archive.py write --sdk dist/win-x64 --archive $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Windows SDK packaging failed' }
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Consume final SDK archive
+        shell: pwsh
+        env:
+          SDK_ARCHIVE: ${{ steps.bundle.outputs.archive }}
+        run: |
+          python -I -B scripts/sdk_windows_archive.py consume --sdk dist/win-x64 `
+            --archive $env:SDK_ARCHIVE --output build/test-out/release-sdk-consumption
+          if ($LASTEXITCODE -ne 0) { throw 'Windows SDK archive consumption failed' }
+
+      - name: Upload SDK consumption evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-consumption-Windows-x64
+          path: build/test-out/release-sdk-consumption
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zan-ide-win-x64
-          path: out/*
+          path: |
+            ${{ steps.bundle.outputs.archive }}
+            ${{ steps.bundle.outputs.archive }}.sha256
+          if-no-files-found: error
 
   # ------------------------------------------------------------- Release ----
   release:

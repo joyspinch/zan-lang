@@ -26,7 +26,7 @@ source = Path(args[0]).read_text(encoding="utf-8")
 print(json.dumps(args), flush=True)
 print("fake compiler stderr", file=sys.stderr, flush=True)
 if "TRACK" in source:
-    trace = Path(__file__).with_name("concurrency.jsonl")
+    trace = Path(args[0]).parents[1] / "concurrency.jsonl"
     with trace.open("a") as stream:
         stream.write(json.dumps({"event": "start", "time": time.time()}) + "\\n")
     time.sleep(0.4)
@@ -111,7 +111,10 @@ class TemplateGateTests(unittest.TestCase):
         self.assertTrue(data["complete"])
         self.assertEqual({r["status"] for r in data["rows"]}, {"pass"})
         self.assertEqual(len({r["work"] for r in data["rows"]}), 5)
-        events = [json.loads(line) for line in (self.base / "concurrency.jsonl").read_text().splitlines()]
+        traces = sorted(self.work.glob("projects/*/*/concurrency.jsonl"))
+        self.assertEqual(len(traces), 4)
+        events = [json.loads(line) for trace in traces for line in trace.read_text().splitlines()]
+        self.assertEqual(len(events), 8)
         active = peak = 0
         for event in sorted(events, key=lambda e: e["time"]):
             active += 1 if event["event"] == "start" else -1
@@ -123,8 +126,9 @@ class TemplateGateTests(unittest.TestCase):
         self.assertEqual(sum(e["status"] == "pass" for e in journal), 5)
 
     def test_acceptance_failures_and_exact_filter(self):
-        self.acceptance_fixtures([("game/snake", "NO_ARTIFACT"),
-                                  ("game/snake-extra", "PASS")])
+        self.templates = self.base / "templates"
+        self.project("game/snake", "NO_ARTIFACT")
+        self.project("game/snake-extra", "PASS")
         self.assert_exit(self.run_acceptance("--filter", "^game/snake$"), False)
         rows = self.results()["rows"]
         self.assertEqual(len(rows), 1)
