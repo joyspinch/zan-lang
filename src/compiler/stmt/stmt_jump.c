@@ -154,7 +154,24 @@
                                sizeof(g->finallys[0]) *
                                    (size_t)(f->fin_depth - lab_fin));
                         g->finally_count = f->fin_depth;
+                        int saved_lpad_depth = g->lpad_depth;
+                        void *saved_lpads = finally_shared_copy(g, g->lpad_stack,
+                            sizeof(g->lpad_stack[0]) * (size_t)saved_lpad_depth);
+                        g->lpad_depth = f->lpad_depth;
+                        for (int d = 0; d < g->lpad_depth; d++) {
+                            zan_lpad_entry_t *entry = &g->lpad_stack[d];
+                            *entry = f->lpad_snap[d];
+                            size_t size = sizeof(*entry->cleanups) * (size_t)entry->cleanup_count;
+                            entry->cleanups = size ? malloc(size) : NULL;
+                            if (entry->cleanups) memcpy(entry->cleanups, f->lpad_snap[d].cleanups, size);
+                            else entry->cleanup_count = 0;
+                            entry->cleanup_cap = entry->cleanup_count;
+                        }
                         emit_pending_finallys(g, &source_locals, lab_fin, false);
+                        for (int d = 0; d < g->lpad_depth; d++) free(g->lpad_stack[d].cleanups);
+                        if (saved_lpad_depth) memcpy(g->lpad_stack, saved_lpads,
+                            sizeof(g->lpad_stack[0]) * (size_t)saved_lpad_depth);
+                        g->lpad_depth = saved_lpad_depth;
                         g->finally_count = lab_fin;
                     } else if (f->fin_depth > lab_fin) {
                         zan_diag_emit_code(g->diag, DIAG_ERROR, f->loc, 3084,
@@ -281,6 +298,17 @@
                 f->from_bb = LLVMGetInsertBlock(g->builder);
                 f->finally_snap_n = g->finally_count;
                 if (f->finally_snap_n > 0) {
+                    /* The destination may be emitted after the source handlers retire. */
+                    f->lpad_depth = g->lpad_depth;
+                    f->lpad_snap = finally_shared_copy(g, g->lpad_stack,
+                        sizeof(*f->lpad_snap) * (size_t)f->lpad_depth);
+                    for (int d = 0; d < f->lpad_depth; d++) {
+                        zan_lpad_entry_t *entry = &f->lpad_snap[d];
+                        entry->cleanups = finally_shared_copy(g, entry->cleanups,
+                            sizeof(*entry->cleanups) * (size_t)entry->cleanup_count);
+                    }
+                }
+                if (f->finally_snap_n > 0) {
                     f->finally_snap = zan_arena_alloc(g->arena,
                         sizeof(*f->finally_snap) * (size_t)f->finally_snap_n);
                     if (f->finally_snap)
@@ -307,9 +335,11 @@
 
     case AST_THROW_STMT: {
         bool rethrow = stmt->throw_stmt.value == NULL;
+        int ci = -1;
         if (rethrow) {
-            LLVMValueRef hslot = g->catch_cleanup_count > 0
-                ? g->catch_cleanups[g->catch_cleanup_count - 1].exc_slot : NULL;
+            ci = lexical_catch(g) - 1;
+            LLVMValueRef hslot = ci >= 0 && ci < g->catch_cleanup_count
+                ? g->catch_cleanups[ci].exc_slot : NULL;
             LLVMBasicBlockRef hbb = hslot ? LLVMGetInstructionParent(hslot) : NULL;
             if (!hbb || LLVMGetBasicBlockParent(hbb) !=
                     LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder))) {
@@ -327,7 +357,6 @@
             LLVMValueRef top_g, bufs_g, exc_g;
             get_eh_globals(g, &top_g, &bufs_g, &exc_g);
             if (rethrow) {
-                int ci = g->catch_cleanup_count - 1;
                 LLVMValueRef exc_slot = g->catch_cleanups[ci].exc_slot;
                 LLVMValueRef own_slot = g->catch_cleanups[ci].owned_slot;
                 LLVMValueRef tid_slot = g->catch_cleanups[ci].tid_slot;
@@ -339,20 +368,18 @@
                     LLVMBuildLoad2(g->builder, i8ptr, tid_slot, "reth.tid"),
                     get_eh_exc_tid_global(g));
                 LLVMValueRef rfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-                if (!g->current_async_frame) {
-                    LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
-                        LLVMConstInt(i32t, 0, 0), "reth.isown");
-                    LLVMBasicBlockRef drop_bb =
-                        LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.drop");
-                    LLVMBasicBlockRef dcont_bb =
-                        LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.dcont");
-                    LLVMBuildCondBr(g->builder, isown, drop_bb, dcont_bb);
-                    LLVMPositionBuilderAtEnd(g->builder, drop_bb);
-                    emit_eh_tmp_drop(g, ev);
-                    LLVMBuildBr(g->builder, dcont_bb);
-                    LLVMPositionBuilderAtEnd(g->builder, dcont_bb);
-                }
-                zan_store_fit(g, LLVMConstInt(i32t, 0, 0), own_slot);
+                /* A nested handler can catch the rethrow and return to this catch. */
+                LLVMValueRef isown = zan_icmp(g->builder, LLVMIntNE, ofl,
+                    LLVMConstInt(i32t, 0, 0), "reth.isown");
+                LLVMBasicBlockRef retain_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.retain");
+                LLVMBasicBlockRef cont_bb =
+                    LLVMAppendBasicBlockInContext(g->ctx, rfn, "reth.cont");
+                LLVMBuildCondBr(g->builder, isown, retain_bb, cont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, retain_bb);
+                emit_arc_retain(g, ev);
+                LLVMBuildBr(g->builder, cont_bb);
+                LLVMPositionBuilderAtEnd(g->builder, cont_bb);
                 goto throw_unwind;
             }
             LLVMValueRef vail = val;

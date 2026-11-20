@@ -1505,6 +1505,12 @@ kernel32、shell32、user32、advapi32、version）。
   仍有效的外层记录及当前接替的控制转移。任务结果槽在完成前也可暂存 I/O 数值，放弃
   未完成的帧时只按记录的析构函数释放待定载荷。回归覆盖 `async_finally_pending_owners`、
   `async_finally_scope_transfers`、`selfhost_decimal_wide` 和发布运行时的 `mt/async_timer.zan`。
+- 内联 `finally` 时按声明点解析名字、循环目标和裸 `throw;`。保留出口侧 ARC 所用的局部槽和
+  异常清理栈，词法重抛只选择异常槽。分派持有独立引用，让捕获并返回的内层处理器可以正常
+  释放自己的异常。前向 `goto` 补发 `finally` 时还原出口侧异常处理器。
+- `goto` 先按函数和最近可见的 `finally` 选择标签，再以 try、各 catch、finally、lock 的
+  词法身份限制入口。克隆用独立标签 ID，前向引用保存源点绑定的 ID。回归
+  `finally_lexical_context` 和 `goto_into_try` 覆盖异常重抛、同名标签和前后向跳转。
 
 ## 73. 泛型擦除必须**按作用域**判定：用户类名不能被同名类型参数击穿
 

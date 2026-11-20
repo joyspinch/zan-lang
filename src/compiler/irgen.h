@@ -108,6 +108,7 @@ typedef struct zan_irgen_pending_context {
     zan_irgen_pending_scope_t *scope;
     zan_irgen_pending_scope_t *break_scope;
     zan_irgen_pending_scope_t *continue_scope;
+    int rethrow_base, rethrow_catch;
 } zan_irgen_pending_context_t;
 
 typedef struct zan_goto_label_rec {
@@ -131,8 +132,19 @@ typedef struct zan_irgen_catch_cleanup {
     LLVMValueRef tid_slot;   /* 当前捕获异常类型描述符，供无参 throw; 原样重抛 */
 } zan_irgen_catch_cleanup_t;
 
+typedef struct zan_finally_lexical_context {
+    LLVMBasicBlockRef break_target, continue_target;
+    zan_irgen_pending_scope_t *break_scope, *continue_scope;
+    int locals_count;
+    int rethrow_catch;
+    int break_locals_base, loop_locals_base, loop_catch_base;
+    int finally_loop_base, eh_armed_loop_base;
+    int checked_depth;
+} zan_finally_lexical_context_t;
+
 typedef struct zan_irgen_finally_entry {
     zan_ast_node_t *body;
+    zan_finally_lexical_context_t lexical;
     LLVMValueRef monitor_obj; /* lock (obj) 锁对象槽位，退出时释放监视器 */
     LLVMValueRef continuation_slot;
     struct zan_irgen_finally_shared *shared;
@@ -161,6 +173,8 @@ typedef struct zan_goto_fixup {
     int catch_snap_n;
     struct zan_irgen_catch_cleanup *catch_snap;
     LLVMValueRef *armed_snap;
+    zan_lpad_entry_t *lpad_snap;
+    int lpad_depth;
     zan_irgen_pending_scope_t *label_owner;
     zan_irgen_pending_context_t pending;
     LLVMBasicBlockRef break_target, continue_target;

@@ -1,4 +1,5 @@
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
+    checker_check_goto_regions(c, method);
     if (!method->method_decl.body) return;
 
     bool saved_ctor = c->in_ctor;
@@ -499,6 +500,7 @@ static void check_unit(zan_checker_t *c, zan_ast_node_t *unit, int64_t only_file
             check_extern_static(c, member);
             if ((member->kind == AST_FIELD_DECL || member->kind == AST_PROPERTY_DECL) &&
                 member->field_decl.initializer) {
+                checker_check_goto_regions(c, member->field_decl.initializer);
                 zan_type_t *target = zan_binder_resolve_type(
                     c->binder, member->field_decl.type);
                 if (target && target->kind == TYPE_DELEGATE) {

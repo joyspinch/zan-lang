@@ -9,8 +9,8 @@ partial class Irgen {
         // A label is a branch target, so it must be emitted even when the
         // current block is already terminated (e.g. code after a goto).
         if (s.kind == AK.LabelStmt()) {
-            DefineGotoLabel(s);
-            int lid = LabelId(s.sval);
+            int lid = LabelId(s.sval, FlowLabelIndex(s));
+            DefineGotoLabel(s, lid);
             if (!term) { L("  br label %L" + lid); }
             Label(lid);
             return;
@@ -143,14 +143,16 @@ partial class Irgen {
         } else if (k == AK.LockStmt()) {
             GenLock(s);
         } else if (k == AK.GotoStmt()) {
-            RecordForwardGoto(s);
-            int targetFin = TargetFinBase(FindFlowLabel(s.sval));
+            int label = FlowLabelIndex(s);
+            Node target = label >= 0 ? syncFlow.labels[label] : null;
+            int gid = LabelId(s.sval, label);
+            RecordForwardGoto(s, target, gid);
+            int targetFin = TargetFinBase(target);
             if (targetFin < finBodies.Count) {
                 EmitExitFins(targetFin);
                 if (term) { return; }
             }
             if (curAsync) {
-                Node target = FindFlowLabel(s.sval);
                 int binding = asyncCatchBindings.Count - 1;
                 while (binding >= 0) {
                     Node clause = asyncCatchBindings[binding];
@@ -159,8 +161,7 @@ partial class Irgen {
                 }
             }
             {
-                Node target = FindFlowLabel(s.sval);
-                int releaseFrom = GotoLocalBase(s.sval);
+                int releaseFrom = GotoLocalBase(gid);
                 if (releaseFrom > locName.Count) { releaseFrom = locName.Count; }
                 int scope = 0;
                 while (scope < syncFlow.localScopes.Count) {
@@ -170,17 +171,18 @@ partial class Irgen {
                     }
                     scope = scope + 1;
                 }
-                int binding = 0;
-                while (binding < syncFlow.catchScopes.Count) {
-                    if (!FlowContains(syncFlow.catchScopes[binding], target)
-                        && syncFlow.catchLocals[binding] < releaseFrom) {
-                        releaseFrom = syncFlow.catchLocals[binding];
+                int binding = syncFlow.catchScopes.Count - 1;
+                while (binding >= 0) {
+                    if (!FlowContains(syncFlow.catchScopes[binding], target)) {
+                        DropExceptionOwner(catchExcOwner[binding]);
+                        if (syncFlow.catchLocals[binding] >= 0 && syncFlow.catchLocals[binding] < releaseFrom) {
+                            releaseFrom = syncFlow.catchLocals[binding];
+                        }
                     }
-                    binding = binding + 1;
+                    binding = binding - 1;
                 }
                 ReleaseLocalsFrom(releaseFrom);
             }
-            int gid = LabelId(s.sval);
             L("  br label %L" + gid);
             term = true;
         } else {
@@ -223,7 +225,7 @@ partial class Irgen {
             EmitExcBranch(EmitExcPush(), body, cleanup);
             Label(body);
         }
-        syncFlow.scopes.Add(s);
+        syncFlow.scopes.Add(CaptureFinallyContext(s));
         finBodies.Add(null);
         finLive.Add(cleanup == 0 ? 0 : 1);
         finMonSlot.Add(slot);

@@ -56,8 +56,8 @@ static bool stmt_contains_label(zan_ast_node_t *st, zan_istr_t name) {
                 return true;
         break;
     case AST_TRY_STMT:
-        if (stmt_contains_label(st->try_stmt.try_body, name) ||
-            stmt_contains_label(st->try_stmt.finally_body, name)) return true;
+        /* A nested finally owns its own labels. */
+        if (stmt_contains_label(st->try_stmt.try_body, name)) return true;
         for (int i = 0; i < st->try_stmt.catches.count; i++)
             if (stmt_contains_label(st->try_stmt.catches.items[i]->catch_clause.body, name))
                 return true;
@@ -309,22 +309,77 @@ static void emit_pending_scope_exit(zan_irgen_t *g,
     else
         emit_async_pending_discard(g, g->current_async_frame, ft, depth);
 }
+static int lexical_catch(zan_irgen_t *g) {
+    return g->catch_cleanup_count > g->pending.rethrow_base
+        ? g->catch_cleanup_count : g->pending.rethrow_catch;
+}
+
+static zan_finally_lexical_context_t finally_lexical_context(
+        zan_irgen_t *g, local_scope_t *locals) {
+    return (zan_finally_lexical_context_t){
+        .break_target = g->break_target,
+        .continue_target = g->continue_target,
+        .break_scope = g->pending.break_scope,
+        .continue_scope = g->pending.continue_scope,
+        .locals_count = locals->count,
+        .rethrow_catch = lexical_catch(g),
+        .break_locals_base = g->break_locals_base,
+        .loop_locals_base = g->loop_locals_base,
+        .loop_catch_base = g->loop_catch_base,
+        .finally_loop_base = g->finally_loop_base,
+        .eh_armed_loop_base = g->eh_armed_loop_base,
+        .checked_depth = g->irgen_checked_depth,
+    };
+}
+
+static void apply_finally_lexical_context(zan_irgen_t *g,
+        const zan_finally_lexical_context_t *context) {
+    g->break_target = context->break_target;
+    g->continue_target = context->continue_target;
+    g->pending.break_scope = context->break_scope;
+    g->pending.continue_scope = context->continue_scope;
+    g->break_locals_base = context->break_locals_base;
+    g->loop_locals_base = context->loop_locals_base;
+    g->loop_catch_base = context->loop_catch_base;
+    g->finally_loop_base = context->finally_loop_base;
+    g->eh_armed_loop_base = context->eh_armed_loop_base;
+    g->irgen_checked_depth = context->checked_depth;
+}
+
 void emit_finally_body(zan_irgen_t *g, local_scope_t *locals,
-                              const zan_irgen_finally_entry_t *entry) {
-    zan_irgen_pending_scope_t *saved = g->pending.scope;
+                       const zan_irgen_finally_entry_t *entry) {
+    zan_irgen_pending_context_t saved = g->pending;
     zan_irgen_pending_scope_t *scope = zan_arena_alloc(g->arena, sizeof(*scope));
     if (g->current_async_frame) {
         *scope = *entry->pending_scope;
     } else {
         memset(scope, 0, sizeof(*scope));
-        scope->parent = saved;
+        scope->parent = entry->pending_parent;
     }
     /* Host finally bodies are cloned at each exit too: their local labels
      * need separate identities, while outward jumps retain the parent scope. */
     scope->body = entry->body;
     g->pending.scope = scope;
+    zan_finally_lexical_context_t origin = finally_lexical_context(g, locals);
+    apply_finally_lexical_context(g, &entry->lexical);
+    /* Catches opened by this body shadow its declaration-site catch. */
+    g->pending.rethrow_base = g->catch_cleanup_count;
+    g->pending.rethrow_catch = entry->lexical.rethrow_catch;
+    /* Hide exit-site names but keep their storage visible to ARC cleanup. */
+    int first = entry->lexical.locals_count;
+    int hidden = origin.locals_count - first;
+    zan_istr_t *names = NULL;
+    if (hidden > 0) {
+        names = zan_arena_alloc(g->arena, sizeof(*names) * (size_t)hidden);
+        for (int i = 0; i < hidden; i++) {
+            names[i] = locals->vars[first + i].name;
+            locals->vars[first + i].name = (zan_istr_t){ .str = "" };
+        }
+    }
     emit_stmt(g, entry->body, locals);
-    g->pending.scope = saved;
+    for (int i = 0; i < hidden; i++) locals->vars[first + i].name = names[i];
+    apply_finally_lexical_context(g, &origin);
+    g->pending = saved;
 }
 
 typedef struct zan_irgen_finally_shared {

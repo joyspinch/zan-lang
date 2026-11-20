@@ -195,31 +195,54 @@ partial class Irgen {
             || FlowContains(scope.c, target) || FlowContains(scope.d, target);
     }
 
-    bool ScopeHasLabel(Node scope, string name) {
-        if (scope == null || scope.kind == AK.Lambda()) { return false; }
-        if (scope.kind == AK.LabelStmt() && scope.sval == name) { return true; }
-        int i = 0;
-        while (i < scope.kids.Count) {
-            if (ScopeHasLabel(scope.kids[i], name)) { return true; }
-            i = i + 1;
-        }
-        return ScopeHasLabel(scope.a, name) || ScopeHasLabel(scope.b, name)
-            || ScopeHasLabel(scope.c, name) || ScopeHasLabel(scope.d, name);
+    int LexicalCatch() {
+        return catchExcVal.Count > syncFlow.rethrowBase ? catchExcVal.Count : syncFlow.rethrowCatch;
     }
 
-    Node FindFlowLabel(string name) {
+    FinallyContext CaptureFinallyContext(Node scope) {
+        FinallyContext context = new FinallyContext();
+        context.scope = scope;
+        context.locals = locName.Count;
+        context.rethrowCatch = LexicalCatch();
+        context.breakLabel = brkTarget; context.continueLabel = contTarget;
+        context.loopLocals = loopScopeBase;
+        context.breakScope = syncFlow.breakScope; context.continueScope = syncFlow.continueScope;
+        return context;
+    }
+
+    void EmitFinallyClone(Node body, FinallyContext context) {
+        FinallyContext saved = CaptureFinallyContext(null);
+        List<string> visible = locName;
+        // Keep exit-site slots available to return, throw and loop cleanup.
+        locName = new List<string>();
         int i = 0;
-        while (i < syncFlow.labels.Count) {
-            if (syncFlow.labels[i].sval == name) { return syncFlow.labels[i]; }
+        while (i < visible.Count) {
+            string name = visible[i];
+            // Borrowed null-conditional slots remain identifiable to cleanup.
+            bool borrowed = name.Length >= 6 && name.Substring(0, 6) == "__qdot";
+            locName.Add(i < context.locals || borrowed ? name : "");
             i = i + 1;
         }
-        return null;
+        brkTarget = context.breakLabel; contTarget = context.continueLabel;
+        loopScopeBase = context.loopLocals;
+        syncFlow.breakScope = context.breakScope; syncFlow.continueScope = context.continueScope;
+        int savedRethrowBase = syncFlow.rethrowBase;
+        int savedRethrowCatch = syncFlow.rethrowCatch;
+        syncFlow.rethrowBase = catchExcVal.Count;
+        syncFlow.rethrowCatch = context.rethrowCatch;
+        GenStmt(body);
+        syncFlow.rethrowBase = savedRethrowBase;
+        syncFlow.rethrowCatch = savedRethrowCatch;
+        locName = visible;
+        brkTarget = saved.breakLabel; contTarget = saved.continueLabel;
+        loopScopeBase = saved.loopLocals;
+        syncFlow.breakScope = saved.breakScope; syncFlow.continueScope = saved.continueScope;
     }
 
     int TargetFinBase(Node target) {
         int i = syncFlow.scopes.Count - 1;
         while (i >= 0) {
-            if (FlowContains(syncFlow.scopes[i], target)) { return i + 1; }
+            if (FlowContains(syncFlow.scopes[i].scope, target)) { return i + 1; }
             i = i - 1;
         }
         return 0;
@@ -356,15 +379,16 @@ partial class Irgen {
             // clause caught. The in-flight globals may have been overwritten
             // by a nested try inside the clause body, so the clause's own
             // copy is the one that is re-raised.
-            if (catchExcVal.Count > 0) {
+            int ci = LexicalCatch() - 1;
+            if (ci >= 0 && ci < catchExcVal.Count) {
                 string rv = NT();
-                L("  " + rv + " = load i8*, i8** " + catchExcVal[catchExcVal.Count - 1]);
+                L("  " + rv + " = load i8*, i8** " + catchExcVal[ci]);
                 L("  store i8* " + rv + ", i8** @__exc_val");
                 string rt = NT();
-                L("  " + rt + " = load i8*, i8** " + catchExcTid[catchExcTid.Count - 1]);
+                L("  " + rt + " = load i8*, i8** " + catchExcTid[ci]);
                 L("  store i8* " + rt + ", i8** @__exc_tid");
-                if (catchExcOwner.Count > 0) {
-                    string owner = LoadExceptionOwner(catchExcOwner[catchExcOwner.Count - 1]);
+                if (ci < catchExcOwner.Count) {
+                    string owner = LoadExceptionOwner(catchExcOwner[ci]);
                     L("  call void @zexc_clone(%zan.exception* @zexc_dispatch, %zan.exception* " + owner + ")");
                 }
             }
@@ -582,7 +606,7 @@ partial class Irgen {
                     active = active + 1;
                 }
                 List<Node> tailBodies = new List<Node>();
-                List<Node> tailScopes = new List<Node>();
+                List<FinallyContext> tailScopes = new List<FinallyContext>();
                 List<int> tailLive = new List<int>();
                 List<string> tailMon = new List<string>();
                 int tail = i + 1;
@@ -615,7 +639,7 @@ partial class Irgen {
                     string mark = FrameGep("%ff", asyncPendingFinallyBase + finActive.Count - 1);
                     L("  store i64 " + depth + ", i64* " + mark);
                 }
-                GenStmt(finBodies[i]);
+                EmitFinallyClone(finBodies[i], syncFlow.scopes[i]);
                 syncPendingReturn = traversalPending;
                 syncFlow.records.RemoveAt(syncFlow.records.Count - 1);
                 syncFlow.boundaries.RemoveAt(syncFlow.boundaries.Count - 1);
@@ -758,7 +782,7 @@ partial class Irgen {
         // the C host. The entry lives until the whole try is emitted, so the
         // catch clauses see it too.
         int mark = finBodies.Count;
-        syncFlow.scopes.Add(s);
+        syncFlow.scopes.Add(CaptureFinallyContext(s));
         finBodies.Add(s.c);
         finLive.Add(1);
         finMonSlot.Add(null);
@@ -915,8 +939,9 @@ partial class Irgen {
                     ArmAsyncExceptionPair(exSlot, tdSlot);
                     asyncCatchBindings.Add(cc); asyncCatchEntries.Add(mark);
                 }
-                if (!curAsync && cc.sval != "" && cc.type != null) {
-                    syncFlow.catchScopes.Add(cc.a); syncFlow.catchLocals.Add(catchScope);
+                if (!curAsync) {
+                    syncFlow.catchScopes.Add(cc.a);
+                    syncFlow.catchLocals.Add(cc.sval != "" && cc.type != null ? catchScope : -1);
                 }
                 GenStmt(cc.a);
                 if (curAsync && cleanup != 0) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
@@ -949,7 +974,7 @@ partial class Irgen {
                 }
                 term = false;
                 TrimLocals(catchScope);
-                if (!curAsync && cc.sval != "" && cc.type != null) {
+                if (!curAsync) {
                     syncFlow.catchScopes.RemoveAt(syncFlow.catchScopes.Count - 1);
                     syncFlow.catchLocals.RemoveAt(syncFlow.catchLocals.Count - 1);
                 }
@@ -995,4 +1020,16 @@ partial class Irgen {
             finMonSlot.RemoveAt(finMonSlot.Count - 1);
         }
     }
+}
+
+// A finally body uses the lexical environment of its enclosing try.
+class FinallyContext {
+    public Node scope;
+    public int locals;
+    public int rethrowCatch;
+    public int breakLabel;
+    public int continueLabel;
+    public int loopLocals;
+    public Node breakScope;
+    public Node continueScope;
 }

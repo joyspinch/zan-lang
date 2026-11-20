@@ -163,6 +163,7 @@
             ZAN_TAB_ENSURE(g->finallys, g->finally_count, g->finally_cap, 16)) {
             fin_idx = g->finally_count++;
             g->finallys[fin_idx].body = stmt->try_stmt.finally_body;
+            g->finallys[fin_idx].lexical = finally_lexical_context(g, locals);
             g->finallys[fin_idx].monitor_obj = NULL;
             g->finallys[fin_idx].continuation_slot = NULL;
             g->finallys[fin_idx].shared = NULL;

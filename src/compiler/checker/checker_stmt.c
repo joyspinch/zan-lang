@@ -1,4 +1,105 @@
 
+struct checker_goto_region {
+    const struct checker_goto_region *parent;
+    const struct checker_goto_region *label_owner;
+    int depth;
+};
+
+struct checker_goto_site {
+    const zan_ast_node_t *node;
+    const struct checker_goto_region *region;
+    struct checker_goto_site *next;
+};
+
+struct checker_goto_sites {
+    struct checker_goto_site *labels;
+    struct checker_goto_site *jumps;
+    struct checker_goto_site **next_jump;
+};
+
+static void checker_check_goto_regions(zan_checker_t *c, const zan_ast_node_t *root);
+
+static void checker_collect_goto_sites(zan_checker_t *c, const zan_ast_node_t *node,
+                                       const struct checker_goto_region *region,
+                                       struct checker_goto_sites *sites) {
+    if (!node) return;
+    if (node->kind == AST_LAMBDA) {
+        checker_check_goto_regions(c, node->lambda.body);
+        return;
+    }
+    if (node->kind == AST_LABEL_STMT || node->kind == AST_GOTO_STMT) {
+        struct checker_goto_site *site = zan_arena_alloc(c->arena, sizeof(*site));
+        site->node = node;
+        site->region = region;
+        if (node->kind == AST_LABEL_STMT) {
+            site->next = sites->labels;
+            sites->labels = site;
+        } else {
+            site->next = NULL;
+            *sites->next_jump = site;
+            sites->next_jump = &site->next;
+        }
+        return;
+    }
+
+    int count = zan_ast_child_count(node);
+    for (int i = 0; i < count; i++) {
+        const zan_ast_node_t *child = zan_ast_child_at(node, i);
+        if (!child) continue;
+        const struct checker_goto_region *child_region = region;
+        /* Each try body, catch clause, finally body, and lock body has its
+         * own identity, even when their runtime cleanup depths coincide. */
+        if (node->kind == AST_TRY_STMT ||
+            (node->kind == AST_LOCK_STMT && child == node->lock_stmt.body)) {
+            struct checker_goto_region *nested = zan_arena_alloc(c->arena, sizeof(*nested));
+            nested->parent = region;
+            nested->depth = region ? region->depth + 1 : 1;
+            nested->label_owner = region ? region->label_owner : NULL;
+            if (node->kind == AST_TRY_STMT && child == node->try_stmt.finally_body)
+                nested->label_owner = nested;
+            child_region = nested;
+        }
+        checker_collect_goto_sites(c, child, child_region, sites);
+    }
+}
+
+static bool checker_goto_region_contains(const struct checker_goto_region *region,
+                                         const struct checker_goto_region *site) {
+    while (site && site != region) site = site->parent;
+    return site == region;
+}
+
+static void checker_check_goto_regions(zan_checker_t *c, const zan_ast_node_t *root) {
+    struct checker_goto_sites sites = {0};
+    sites.next_jump = &sites.jumps;
+    checker_collect_goto_sites(c, root, NULL, &sites);
+    for (const struct checker_goto_site *jump = sites.jumps; jump; jump = jump->next) {
+        zan_istr_t name = jump->node->ident.name;
+        const struct checker_goto_site *target = NULL;
+        bool found_name = false;
+        int best_depth = -1;
+        for (const struct checker_goto_site *label = sites.labels; label; label = label->next) {
+            zan_istr_t label_name = label->node->ident.name;
+            if (label_name.len != name.len || memcmp(label_name.str, name.str, name.len) != 0)
+                continue;
+            found_name = true;
+            const struct checker_goto_region *owner = label->region ? label->region->label_owner : NULL;
+            int depth = owner ? owner->depth : 0;
+            if (depth > best_depth && checker_goto_region_contains(owner, jump->region)) {
+                best_depth = depth;
+                target = label;
+            }
+        }
+        if (found_name && (!target || !checker_goto_region_contains(target->region, jump->region))) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, jump->node->loc, 3082,
+                "goto '%.*s' jumps into a try/catch/finally or lock "
+                "block; C# forbids jumping into one -- restructure "
+                "with break/return",
+                (int)name.len, name.str);
+        }
+    }
+}
+
 void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     if (!stmt) return;
 

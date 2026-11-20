@@ -2800,9 +2800,10 @@ set_tests_properties(diag_access_internal_module PROPERTIES TIMEOUT 60)
 add_test(NAME diag_goto_into_try
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/goto_into_try.zan
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/selfhost/reject/goto_into_try.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_goto_into_try${_exe_ext}
     "-DEXPECT_REGEX=jumps into a try/catch/finally or lock block"
+    -DEXPECT_ERROR_COUNT=7
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_goto_into_try PROPERTIES TIMEOUT 60)
 
