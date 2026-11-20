@@ -434,6 +434,9 @@ static zan_loc_t checker_local_name_loc(const zan_ast_node_t *decl) {
     case AST_PARAM: return decl->param.name_loc;
     case AST_VAR_DECL: return decl->var_decl.name_loc;
     case AST_FOREACH_STMT: return decl->foreach_stmt.name_loc;
+    case AST_IS_EXPR: return decl->type_test.name_loc;
+    case AST_CATCH_CLAUSE: return decl->catch_clause.name_loc;
+    case AST_IDENTIFIER: return decl->loc; /* Tuple deconstruction declaration. */
     case AST_REF_ARG: return decl->ref_arg.expr->loc;
     default: return (zan_loc_t){0};
     }

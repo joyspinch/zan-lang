@@ -525,6 +525,17 @@
         return rt;
     }
 
+    case AST_IS_EXPR:
+    case AST_AS_EXPR: {
+        zan_checker_check_expr(c, expr->type_test.expr);
+        zan_type_t *type = expr->type_test.type
+            ? zan_binder_resolve_type(c->binder, expr->type_test.type) : NULL;
+        if (expr->kind == AST_AS_EXPR) return type ? type : c->binder->type_error;
+        if (expr->type_test.var_name.len)
+            checker_add_local(c, expr->type_test.var_name, type, expr);
+        return c->binder->type_bool;
+    }
+
     case AST_CAST_EXPR: {
         zan_type_t *dst = zan_binder_resolve_type(c->binder, expr->cast.type);
         if (dst && dst->kind != TYPE_DELEGATE && dst->kind != TYPE_TYPE_PARAM &&

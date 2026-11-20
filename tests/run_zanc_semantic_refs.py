@@ -29,6 +29,22 @@ SOURCE = """class Navigation {
         IntOp add = value => value + captured;
         captured = add(value);
     }
+    static void Patterns(object source) {
+        int matched = 0;
+        if (source is Navigation matched) { object witness = matched; }
+        Navigation casted = source as Navigation;
+        matched++;
+    }
+    static int Deconstruct(int input) {
+        var (left, right) = (input, 2);
+        return left + right;
+    }
+    static int Handler() {
+        int caught = 0;
+        try { caught++; }
+        catch (Navigation caught) { object witness = caught; }
+        return caught;
+    }
 }
 delegate int IntOp(int value);
 """
@@ -118,6 +134,25 @@ def check(zanc, work):
         loc(18, "+ captured", "captured"), loc(19, "captured =", "captured"),
     ])
     expect("local", "add", loc(18, "add =", "add"), [loc(19, "add(value)", "add")])
+    expect("parameter", "source", loc(21, "object source", "source"), [
+        loc(23, "source is", "source"), loc(24, "source as", "source"),
+    ])
+    expect("local", "matched", loc(23, "Navigation matched", "matched"), [
+        loc(23, "= matched", "matched"),
+    ])
+    expect("local", "matched", loc(22, "int matched", "matched"), [
+        loc(25, "matched++", "matched"),
+    ])
+    expect("parameter", "input", loc(27, "int input", "input"), [
+        loc(28, "(input,", "input"),
+    ])
+    expect("local", "left", loc(28, "(left,", "left"), [loc(29, "return left", "left")])
+    expect("local", "caught", loc(32, "int caught", "caught"), [
+        loc(33, "caught++", "caught"), loc(35, "return caught", "caught"),
+    ])
+    expect("local", "caught", loc(34, "Navigation caught", "caught"), [
+        loc(34, "= caught", "caught"),
+    ])
     empty = {"format": FORMAT, "symbol": None, "references": []}
     assert query(loc(13, "Navigation.value", "value")) == empty
     assert query(loc(13, "return first", "first"), len("first")) == empty

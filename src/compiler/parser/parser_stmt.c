@@ -300,6 +300,7 @@ static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
 
         zan_ast_node_t *catch_type = NULL;
         zan_istr_t catch_var = {0};
+        zan_loc_t catch_name_loc = {0};
 
         if (parser_check(p, TK_LPAREN)) {
             parser_advance(p);
@@ -307,6 +308,7 @@ static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
             if (parser_check(p, TK_IDENT)) {
                 parser_advance(p);
                 catch_var = p->previous.str_val;
+                catch_name_loc = p->previous.loc;
             }
             parser_expect(p, TK_RPAREN);
         }
@@ -316,6 +318,7 @@ static zan_ast_node_t *parse_try_stmt(zan_parser_t *p) {
         zan_ast_node_t *cc = zan_ast_new(p->arena, AST_CATCH_CLAUSE, catch_loc);
         cc->catch_clause.type = catch_type;
         cc->catch_clause.var_name = catch_var;
+        cc->catch_clause.name_loc = catch_name_loc;
         cc->catch_clause.body = catch_body;
         zan_ast_list_push(&n->try_stmt.catches, cc, p->arena);
     }

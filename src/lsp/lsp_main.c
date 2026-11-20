@@ -10,6 +10,7 @@
 #include "binder.h"
 #include "checker.h"
 #include "nsresolve.h"
+#include "semantic_refs.h"
 
 #include "intellisense.h"
 #include "builtin_api.h"
@@ -2956,6 +2957,182 @@ static void refs_visit(void *ctx, const char *uri, const char *text) {
     add_locations(rc->arr, uri, text, rc->word, -1, -1);
 }
 
+typedef enum { LOCAL_REFERENCES, LOCAL_PREPARE_RENAME, LOCAL_RENAME } local_query_kind_t;
+
+static json_value *local_reference_range(const char *text, zan_loc_t loc, uint32_t length) {
+    int line = (int)loc.line - 1;
+    json_value *range = json_new_obj();
+    json_value *start = json_new_obj();
+    json_value *end = json_new_obj();
+    json_obj_set(start, "line", json_new_num(line));
+    json_obj_set(start, "character", json_new_num(byte_col_to_utf16_char(text, line, (int)loc.col)));
+    json_obj_set(end, "line", json_new_num(line));
+    json_obj_set(end, "character", json_new_num(byte_col_to_utf16_char(text, line, (int)(loc.col + length))));
+    json_obj_set(range, "start", start);
+    json_obj_set(range, "end", end);
+    return range;
+}
+
+static bool local_reference_collision(const semantic_refs_t *refs, const char *name) {
+    for (size_t i = 0; i < refs->count; i++) {
+        const semantic_ref_t *ref = &refs->items[i];
+        if (ref->occurrence.offset == ref->declaration.offset && strcmp(ref->name.str, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void collect_local_references(semantic_refs_t *refs, zan_arena_t *arena,
+                                     const char *uri, const char *text) {
+    zan_diag_t *diag = zan_diag_new(arena);
+    zan_diag_set_capture(diag, true);
+    zan_diag_add_file(diag, uri, text);
+    zan_ast_node_t *ast = parse_diagnostic_source(arena, diag, text, 0);
+    if (ast && !zan_diag_has_errors(diag)) {
+        zan_binder_t binder;
+        zan_binder_init(&binder, arena, diag);
+        zan_binder_bind(&binder, ast);
+        zan_checker_t checker;
+        zan_checker_init(&checker, &binder, arena, diag);
+        checker.lexical_ref = semantic_refs_record;
+        checker.lexical_ref_context = refs;
+        zan_checker_check_file(&checker, ast, 0);
+    }
+    zan_diag_free_buffers(diag);
+    semantic_refs_sort(refs);
+}
+
+static bool local_rename_preserves_binding(const lsp_doc_t *doc, const semantic_refs_t *refs,
+                                           const semantic_ref_t *symbol, const char *new_name) {
+    size_t name_len = strlen(new_name);
+    size_t text_len = strlen(doc->text);
+    size_t count = 0;
+    size_t read = 0;
+    bool ambiguous = false;
+    for (size_t i = 0; i < refs->count;) {
+        const semantic_ref_t *ref = semantic_refs_next(refs, symbol, &i, &ambiguous);
+        if (!ref) continue;
+        size_t offset = ref->occurrence.offset;
+        if (offset < read || offset > text_len || symbol->name.len > text_len - offset ||
+            memcmp(doc->text + offset, symbol->name.str, symbol->name.len) != 0)
+            return false;
+        read = offset + symbol->name.len;
+        count++;
+    }
+    if (ambiguous || count == 0 || count > (SIZE_MAX - text_len - 1) / name_len) return false;
+    char *edited = malloc(text_len + count * name_len + 1);
+    if (!edited) zan_host_oom();
+    size_t *positions = malloc(count * sizeof(*positions));
+    if (!positions) zan_host_oom();
+    size_t write = 0;
+    size_t n = 0;
+    size_t declaration = SIZE_MAX;
+    read = 0;
+    for (size_t i = 0; i < refs->count;) {
+        const semantic_ref_t *ref = semantic_refs_next(refs, symbol, &i, &ambiguous);
+        if (!ref) continue;
+        size_t offset = ref->occurrence.offset;
+        size_t gap = offset - read;
+        memcpy(edited + write, doc->text + read, gap);
+        write += gap;
+        positions[n++] = write;
+        if (offset == symbol->declaration.offset) declaration = write;
+        memcpy(edited + write, new_name, name_len);
+        write += name_len;
+        read = offset + symbol->name.len;
+    }
+    memcpy(edited + write, doc->text + read, text_len - read + 1);
+
+    semantic_refs_t rebound = {0};
+    zan_arena_t *arena = zan_arena_new();
+    collect_local_references(&rebound, arena, doc->uri, edited);
+    const semantic_ref_t *renamed = NULL;
+    for (size_t i = 0; i < rebound.count; i++) {
+        const semantic_ref_t *ref = &rebound.items[i];
+        if (ref->occurrence.offset == declaration && ref->declaration.offset == declaration &&
+            ref->is_parameter == symbol->is_parameter && strcmp(ref->name.str, new_name) == 0) {
+            renamed = ref;
+            break;
+        }
+    }
+    bool preserved = renamed != NULL;
+    n = 0;
+    for (size_t i = 0; preserved && i < rebound.count;) {
+        const semantic_ref_t *ref = semantic_refs_next(&rebound, renamed, &i, &ambiguous);
+        if (ref) preserved = n < count && ref->occurrence.offset == positions[n++];
+    }
+    preserved = preserved && n == count && !ambiguous;
+    free(rebound.items);
+    zan_arena_free(arena);
+    free(positions);
+    free(edited);
+    return preserved;
+}
+
+static bool handle_local_query(lsp_server_t *s, json_value *id, const lsp_doc_t *doc,
+                               int line, int character, local_query_kind_t kind,
+                               bool include_decl, const char *new_name) {
+    size_t offset = pos_to_offset(doc->text, line, character);
+    const char *line_start = line_start_at(doc->text, line);
+    uint32_t col = (uint32_t)(doc->text + offset - line_start) + 1;
+    if (col > 1 && !is_ident_char(doc->text[offset]) && is_ident_char(doc->text[offset - 1])) col--;
+
+    semantic_refs_t refs = {0};
+    zan_arena_t *arena = zan_arena_new();
+    collect_local_references(&refs, arena, doc->uri, doc->text);
+    bool ambiguous = false;
+    const semantic_ref_t *symbol = semantic_refs_select(&refs, (uint32_t)line + 1, col, &ambiguous);
+    json_value *result = NULL;
+    bool collision = false;
+    if (symbol) {
+        if (kind == LOCAL_PREPARE_RENAME) {
+            result = json_new_obj();
+            json_obj_set(result, "range", local_reference_range(doc->text, symbol->occurrence, symbol->name.len));
+            json_obj_set(result, "placeholder", json_new_str(symbol->name.str));
+        } else {
+            collision = kind == LOCAL_RENAME && strcmp(symbol->name.str, new_name) != 0 &&
+                        (local_reference_collision(&refs, new_name) ||
+                         !local_rename_preserves_binding(doc, &refs, symbol, new_name));
+            if (!collision) {
+                json_value *items = json_new_arr();
+                for (size_t i = 0; i < refs.count;) {
+                    const semantic_ref_t *ref = semantic_refs_next(&refs, symbol, &i, &ambiguous);
+                    if (!ref || (!include_decl && ref->occurrence.offset == ref->declaration.offset)) continue;
+                    json_value *item = json_new_obj();
+                    json_obj_set(item, "range", local_reference_range(doc->text, ref->occurrence, ref->name.len));
+                    if (kind == LOCAL_RENAME) json_obj_set(item, "newText", json_new_str(new_name));
+                    else json_obj_set(item, "uri", json_new_str(doc->uri));
+                    json_arr_add(items, item);
+                }
+                result = items;
+                if (kind == LOCAL_RENAME) {
+                    json_value *changes = json_new_obj();
+                    json_obj_set(changes, doc->uri, items);
+                    result = json_new_obj();
+                    json_obj_set(result, "changes", changes);
+                }
+            }
+        }
+    }
+    bool handled = symbol != NULL || ambiguous;
+    free(refs.items);
+    zan_arena_free(arena);
+    if (lsp_cancel_hit(s)) {
+        json_free(result);
+        send_response_error(s, id, -32800, "Request cancelled");
+        return true;
+    }
+    if (collision || ambiguous) {
+        json_free(result);
+        if (kind == LOCAL_REFERENCES) send_response(s, id, json_new_arr());
+        else send_response_error(s, id, -32602, collision ? "newName changes an existing binding" :
+                                 "the local binding is ambiguous");
+        return true;
+    }
+    if (handled) send_response(s, id, result);
+    return handled;
+}
+
 static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -2970,18 +3147,17 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
+    json_value *context = json_obj_get(params, "context");
+    json_value *declaration = json_obj_get(context, "includeDeclaration");
+    bool include_decl = json_get_bool(declaration, json_get_num(declaration, 1) != 0.0);
+    if (handle_local_query(s, id, doc, line, character, LOCAL_REFERENCES, include_decl, NULL)) return;
+
     intellisense_t *is = doc_intel_for(s, uri);
     sym_target_t t;
     bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri, word,
                                        line, character, &t);
     if (resolved) {
         json_value *arr = json_new_arr();
-        bool include_decl = true;
-        json_value *ctxj = json_obj_get(params, "context");
-        if (ctxj) {
-            json_value *idj = json_obj_get(ctxj, "includeDeclaration");
-            if (idj) include_decl = json_get_bool(idj, json_get_num(idj, 1) != 0.0);
-        }
         int od = -1;
         for (int d = 0; d < s->doc_count; d++)
             if (strcmp(s->docs[d].uri, uri) == 0) { od = d; break; }
@@ -3279,22 +3455,16 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     char word[128];
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
+    if (handle_local_query(s, id, doc, line, character, LOCAL_RENAME, true, new_name)) return;
 
     intellisense_t *is = doc_intel_for(s, uri);
     sym_target_t t;
     bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri,
                                        word, line, character, &t);
     if (resolved) {
-        if (t.is_local && strcmp(word, new_name) != 0 && is) {
-            for (int i = 0; i < is->symbol_count; i++) {
-                const isym_t *sym = &is->symbols[i];
-                if ((sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) &&
-                    strcmp(sym->name, new_name) == 0) {
-                    send_response_error(s, id, -32602,
-                                        "newName collides with an existing local");
-                    return;
-                }
-            }
+        if (t.is_local) {
+            send_response(s, id, json_new_null());
+            return;
         }
         json_value *changes = json_new_obj();
         bool decl_open = false;
@@ -3679,6 +3849,7 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     size_t end = off;
     while (doc->text[end] && is_ident_char(doc->text[end])) end++;
     if (end == start) { send_response(s, id, json_new_null()); return; }
+    if (handle_local_query(s, id, doc, line, character, LOCAL_PREPARE_RENAME, true, NULL)) return;
 
     int rl, rc;
     offset_to_linecol(doc->text, (int)start, &rl, &rc);
@@ -3692,7 +3863,7 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     sym_target_t t;
     bool renamable = resolve_sym_target(is, g_project_intel, doc->text, off,
                                         uri, word, line, character, &t);
-    if (!renamable) { send_response(s, id, json_new_null()); return; }
+    if (!renamable || t.is_local) { send_response(s, id, json_new_null()); return; }
 
     json_value *result = json_new_obj();
     json_value *range = json_new_obj();

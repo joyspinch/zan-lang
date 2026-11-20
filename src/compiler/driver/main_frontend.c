@@ -327,11 +327,11 @@
 
     zan_checker_t checker;
     zan_checker_init(&checker, &binder, arena, diag);
-    semantic_refs_t semantic_refs = {0};
+    semantic_query_t semantic_refs = {0};
     if (opts.semantic_refs_file &&
         semantic_refs_find_file(&semantic_refs, diag, opts.semantic_refs_file)) {
         checker.lexical_ref = semantic_refs_record;
-        checker.lexical_ref_context = &semantic_refs;
+        checker.lexical_ref_context = &semantic_refs.refs;
     }
     zan_compile_trace("check");
     zan_checker_check(&checker, ast);
@@ -343,7 +343,7 @@
         fprintf(stderr, "\n%d error(s) after type checking\n",
                 diag->error_count);
         report_suppressed_errors(diag);
-        free(semantic_refs.items);
+        free(semantic_refs.refs.items);
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);
         free(source);
@@ -362,7 +362,7 @@
             fprintf(stderr, "error: --semantic-refs requires one loaded source matching '%s'\n",
                     opts.semantic_refs_file);
         }
-        free(semantic_refs.items);
+        free(semantic_refs.refs.items);
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);
         free(source);

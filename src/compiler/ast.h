@@ -230,6 +230,7 @@ struct zan_ast_node {
             zan_ast_node_t *expr;
             zan_ast_node_t *type;
             zan_istr_t var_name;
+            zan_loc_t name_loc;
             bool is_not;
         } type_test;
 
@@ -311,6 +312,7 @@ struct zan_ast_node {
         struct {
             zan_ast_node_t *type;
             zan_istr_t var_name;
+            zan_loc_t name_loc;
             zan_ast_node_t *body;
         } catch_clause;
 

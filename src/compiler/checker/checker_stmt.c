@@ -147,6 +147,25 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
     }
 
+    case AST_TUPLE_DECON: {
+        zan_type_t *tuple = zan_checker_check_expr(c, stmt->tuple_decon.initializer);
+        for (int i = 0; i < stmt->tuple_decon.names.count; i++) {
+            zan_ast_node_t *name = stmt->tuple_decon.names.items[i];
+            zan_ast_node_t *type = stmt->tuple_decon.types.items[i];
+            zan_type_t *elem = type ? zan_binder_resolve_type(c->binder, type) : NULL;
+            if (!elem && tuple && tuple->sym) {
+                char field_name[16];
+                int len = snprintf(field_name, sizeof field_name, "Item%d", i + 1);
+                zan_symbol_t *field = checker_find_field(tuple->sym,
+                    (zan_istr_t){field_name, (uint32_t)len});
+                if (field) elem = field->type;
+            }
+            if (name && name->kind == AST_IDENTIFIER)
+                checker_add_local(c, name->ident.name, elem, name);
+        }
+        break;
+    }
+
     case AST_EXPR_STMT: {
         zan_symbol_t *mg = expr_method_group(c, stmt->expr_stmt.expr);
         if (mg) {
@@ -181,6 +200,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_IF_STMT: {
+        struct checker_local *saved_locals = c->locals;
         /* A522-③：`if (x = 1)` 曾仅警告、按 C 风格真假运行（C# CS0029 硬错）。
          * 仓库 .zan 全量 4283 处裸标识符条件全是合法 bool——赋值入条件没有
          * 任何合法用例，升级为编译错误。 */
@@ -193,18 +213,30 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             zan_diag_emit_code(c->diag, DIAG_WARNING, stmt->if_stmt.cond->loc, 2074,
                           "condition should be bool, got '%s'", type_name(cond_type));
         }
+        struct checker_local *condition_locals = c->locals;
         zan_checker_check_stmt(c, stmt->if_stmt.then_body);
+        c->locals = condition_locals;
         if (stmt->if_stmt.else_body) {
             zan_checker_check_stmt(c, stmt->if_stmt.else_body);
         }
+        c->locals = saved_locals;
         break;
     }
 
     case AST_WHILE_STMT:
-    case AST_DO_WHILE_STMT:
-        zan_checker_check_expr(c, stmt->while_stmt.cond);
-        zan_checker_check_stmt(c, stmt->while_stmt.body);
+    case AST_DO_WHILE_STMT: {
+        struct checker_local *saved_locals = c->locals;
+        if (stmt->kind == AST_WHILE_STMT) {
+            zan_checker_check_expr(c, stmt->while_stmt.cond);
+            zan_checker_check_stmt(c, stmt->while_stmt.body);
+        } else {
+            zan_checker_check_stmt(c, stmt->while_stmt.body);
+            c->locals = saved_locals;
+            zan_checker_check_expr(c, stmt->while_stmt.cond);
+        }
+        c->locals = saved_locals;
         break;
+    }
 
     case AST_FOR_STMT: {
         struct checker_local *saved_locals = c->locals;
@@ -444,7 +476,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         zan_checker_check_stmt(c, stmt->try_stmt.try_body);
         for (int i = 0; i < stmt->try_stmt.catches.count; i++) {
             zan_ast_node_t *cc = stmt->try_stmt.catches.items[i];
+            struct checker_local *saved_locals = c->locals;
+            if (cc->catch_clause.var_name.len) {
+                zan_type_t *type = zan_binder_resolve_type(c->binder, cc->catch_clause.type);
+                checker_add_local(c, cc->catch_clause.var_name, type, cc);
+            }
             zan_checker_check_stmt(c, cc->catch_clause.body);
+            c->locals = saved_locals;
         }
         if (stmt->try_stmt.finally_body) {
             zan_checker_check_stmt(c, stmt->try_stmt.finally_body);

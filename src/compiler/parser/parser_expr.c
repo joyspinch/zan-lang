@@ -184,6 +184,7 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
                     if (after.kind != TK_IS && after.kind != TK_AS) {
                         parser_advance(p);
                         n->type_test.var_name = p->previous.str_val;
+                        n->type_test.name_loc = p->previous.loc;
                     }
                 }
             }

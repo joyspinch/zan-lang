@@ -828,6 +828,61 @@ static int run_completion_checks(child_t *child) {
               "references: local includeDeclaration false excludes exact declaration");
     json_free(root); free(response);
 
+    const char *many_uri = "file:///lsp_many_local_references.zan";
+    char many_text[16384] = "class ManyLocals {\n    void Noise() { int crowded = 0;\n";
+    size_t many_len = strlen(many_text);
+    for (int i = 0; i < 520; i++) {
+        const char noise[] = "        crowded++;\n";
+        memcpy(many_text + many_len, noise, sizeof(noise) - 1);
+        many_len += sizeof(noise) - 1;
+    }
+    const char body[] = "    }\n    int Target(int crowded) {\n"
+                        "        string emoji = \"\xf0\x9f\x98\x80\"; return crowded;\n    }\n}\n";
+    memcpy(many_text + many_len, body, sizeof(body));
+    completion_document(child, many_uri, many_text, 1, true);
+    for (int pass = 0; pass < 2; pass++) {
+        response = request_at_marker_ex(child, many_uri, many_text, "return ",
+                                         "textDocument/references", NULL, pass == 0);
+        root = response ? json_parse(response) : NULL;
+        json_value *locations = json_obj_get(root, "result");
+        int count = pass == 0 ? 2 : 1;
+        json_value *range = json_obj_get(json_arr_at(locations, count - 1), "range");
+        json_value *first = json_obj_get(range, "start");
+        json_value *last = json_obj_get(range, "end");
+        ext_check(json_arr_count(locations) == count &&
+                  json_get_num(json_obj_get(first, "line"), -1) == 524 &&
+                  json_get_num(json_obj_get(first, "character"), -1) == 36 &&
+                  json_get_num(json_obj_get(last, "character"), -1) == 43,
+                  "references: late binding has complete UTF-16 ranges");
+        json_free(root); free(response);
+    }
+    response = request_at_marker(child, many_uri, many_text, "return cro",
+                                  "textDocument/prepareRename", NULL);
+    root = response ? json_parse(response) : NULL;
+    json_value *prepared = json_obj_get(root, "result");
+    const char *placeholder = json_get_str(json_obj_get(prepared, "placeholder"));
+    json_value *prepared_range = json_obj_get(prepared, "range");
+    ext_check(placeholder && strcmp(placeholder, "crowded") == 0 &&
+              json_get_num(json_obj_get(json_obj_get(prepared_range, "start"), "character"), -1) == 36 &&
+              json_get_num(json_obj_get(json_obj_get(prepared_range, "end"), "character"), -1) == 43,
+              "prepareRename: complete range of the selected occurrence");
+    json_free(root); free(response);
+    char *return_at = strstr(many_text + many_len, "return ");
+    memmove(return_at + 1, return_at, strlen(return_at) + 1);
+    *return_at = ' ';
+    completion_document(child, many_uri, many_text, 2, false);
+    response = request_at_marker(child, many_uri, many_text, "return ",
+                                  "textDocument/rename", "selected");
+    root = response ? json_parse(response) : NULL;
+    changes = json_obj_get(json_obj_get(root, "result"), "changes");
+    json_value *many_edits = json_obj_get(changes, many_uri);
+    json_value *changed_range = json_obj_get(json_arr_at(many_edits, 1), "range");
+    ext_check(json_arr_count(many_edits) == 2 &&
+              json_get_num(json_obj_get(json_obj_get(changed_range, "start"), "character"), -1) == 37 &&
+              json_get_num(json_obj_get(json_obj_get(changed_range, "end"), "character"), -1) == 44,
+              "rename: late binding uses the edited document buffer");
+    json_free(root); free(response);
+
     const char *interp_uri = "file:///lsp_interpolation_identity.zan";
     const char *interp_text =
         "class InterpolationP { void Use() { int interpolated = 1; "
@@ -862,8 +917,8 @@ static int run_completion_checks(child_t *child) {
 
     const char *capture_uri = "file:///lsp_rename_capture.zan";
     const char *capture_text =
-        "class CaptureP { void Use() { int outerValue = 1; "
-        "{ int nestedValue = 2; outerValue += nestedValue; } outerValue++; "
+        "class CaptureP { int fieldValue = 3; void Use() { int outerValue = 1; "
+        "{ int nestedValue = 2; outerValue += nestedValue; } outerValue += fieldValue; "
         "Func<int,int> mapper = (int lambdaValue) => outerValue + lambdaValue; } }\n";
     completion_document(child, capture_uri, capture_text, 1, true);
     response = request_at_marker(child, capture_uri, capture_text, "int outerValue",
@@ -883,6 +938,12 @@ static int run_completion_checks(child_t *child) {
     root = response ? json_parse(response) : NULL;
     ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
               "rename: lambda parameter cannot capture renamed outer references");
+    json_free(root); free(response);
+    response = request_at_marker(child, capture_uri, capture_text, "int outerValue",
+                                  "textDocument/rename", "fieldValue");
+    root = response ? json_parse(response) : NULL;
+    ext_check(root && json_obj_get(root, "error") && !json_obj_get(root, "result"),
+              "rename: local cannot capture a pre-existing unqualified field use");
     json_free(root); free(response);
 
     const char *version_uri = "file:///lsp_version_completion.zan";
