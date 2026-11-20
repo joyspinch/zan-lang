@@ -8934,6 +8934,13 @@ foreach(_t ${_all_tests})
   endif()
   set_property(TEST ${_t} APPEND PROPERTY LABELS ${_labels})
   # A Gui conformance case opens a real window, and on a contended desktop a
+  add_test(NAME tool_selfhost_diagnostics_jsonl
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diagnostics.py
+      ${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext})
+  set_tests_properties(tool_selfhost_diagnostics_jsonl PROPERTIES
+    FIXTURES_REQUIRED selfhost_gen1_diagnostics TIMEOUT 120)
+  set_tests_properties(selfhost_gen1 PROPERTIES FIXTURES_SETUP selfhost_gen1_diagnostics)
+
   # pump can stop returning (observed: two 14-minute stalls on
   # conformance_gui_listview_scrollbar_drag -- idle process, live window,
   # no output). The globbed conformance cases above carry TIMEOUT 120, but the

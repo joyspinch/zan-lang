@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 namespace Zan;
 
 // One diagnostic message with source position. `warn` selects the severity
@@ -87,11 +88,64 @@ public class Diags {
         return r;
     }
 
-    // Render each diagnostic as "file:line:col: error/warning: msg" followed by
-    // the offending source line in a gutter and a caret, matching the C host
-    // shape (warnings yellow, errors red). Prints only entries at index >=
-    // start so a phase can flush just its own.
-    public void Report(string src, int start) {
+    // Selfhost diagnostics currently carry their optional code in the text
+    // prefix. Split it at the wire boundary so text and LSP keep their wording.
+    static int CodePrefixLength(string message) {
+        if (message.Length < 8 || message[0] != '[' || (message[1] != 'E' && message[1] != 'W')) { return 0; }
+        int i = 2;
+        while (i < message.Length && message[i] >= '0' && message[i] <= '9') { i = i + 1; }
+        if (i >= 6 && i + 1 < message.Length && message[i] == ']' && message[i + 1] == ' ') { return i + 2; }
+        return 0;
+    }
+
+    static void AppendJsonString(StringBuilder json, string text) {
+        if (text == null) { json.Append("null"); return; }
+        json.Append("\"");
+        int start = 0;
+        int i = 0;
+        while (i < text.Length) {
+            if ((text[i] & 255) < 128) {
+                i = i + 1;
+                continue;
+            }
+            int width = (int)(Encoding.DecodeCodePointFast(text, i) >> 32);
+            if (width == 1) {
+                // The decoder consumes one byte per malformed sequence step.
+                Encoding.JsonEscapeTo(json, text.Substring(start, i - start));
+                json.Append("\\ufffd");
+                start = i + 1;
+            }
+            i = i + width;
+        }
+        Encoding.JsonEscapeTo(json, start == 0 ? text : text.Substring(start, text.Length - start));
+        json.Append("\"");
+    }
+
+    void ReportJson(Diag entry, bool denyWarnings) {
+        string file = entry.line > 0 ? FileOfLine(entry.line) : "";
+        int line = entry.line > 0 ? LineInFile(entry.line) : 0;
+        int col = entry.col > 0 ? entry.col : 0;
+        int prefix = CodePrefixLength(entry.msg);
+        StringBuilder json = new StringBuilder();
+        json.Append("{\"format\":\"zan-diagnostic-v1\",\"severity\":\"");
+        json.Append(entry.warn && !denyWarnings ? "warning" : "error");
+        json.Append("\",\"file\":");
+        AppendJsonString(json, file == "" ? null : file);
+        json.Append(",\"line\":" + line + ",\"col\":" + col + ",\"code\":");
+        AppendJsonString(json, prefix == 0 ? null : entry.msg.Substring(1, prefix - 3));
+        json.Append(",\"message\":");
+        AppendJsonString(json, prefix == 0 ? entry.msg : entry.msg.Substring(prefix));
+        json.Append("}");
+        Console.ErrorWriteLine(json.ToString());
+    }
+
+    // Print entries at index >= start so each phase can flush its own.
+    public void Report(string src, int start, bool jsonl, bool denyWarnings) {
+        if (jsonl) {
+            for (int i = start; i < items.Count; i = i + 1) { ReportJson(items[i], denyWarnings); }
+            return;
+        }
+        // Text reports keep the colored severity, source gutter and caret.
         string red = Esc() + "[31m";
         string yel = Esc() + "[33m";
         string rst = Esc() + "[0m";

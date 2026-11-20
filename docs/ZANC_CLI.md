@@ -240,14 +240,16 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
-| `--diagnostics-format=jsonl` / `--diagnostics-format=text` | `text` | C 编译器诊断输出格式。`jsonl` 按行向 stderr 写入 UTF-8 JSON，沿用告警与错误限额策略。 |
+| `--diagnostics-format=jsonl` / `--diagnostics-format=text` | `text` | C 宿主和自举编译器均支持。`jsonl` 按行向 stderr 写入 UTF-8 JSON。同一命令中后写的格式生效。 |
 | `--semantic-refs <file> <line> <col>` | — | C 编译器完成类型检查后查询指定位置绑定的局部变量或参数，向 stdout 写一行 JSON。 |
 
 每条 JSON 诊断带有 `format` 值 `zan-diagnostic-v1`。`severity` 为 `error`、`warning` 或
 `note`，`file` 为编译器记录的源文件路径或 `null`，`line` 和 `col` 从 1 起计，未知时为 0，列按字节计。
 `code` 为编号字符串（如 `W0003`，升级为错误时仍保留编号）或 `null`，`message` 为不带编号前缀的消息。
-路径或消息中的非法 UTF-8 字节以 U+FFFD 表示。
-命令行错误、构建摘要及链接器输出沿用原有文本和输出流。调用方应保留 stdout 和 stderr 中的文本以供排查。
+路径或消息中的非法 UTF-8 字节以 U+FFFD 表示。自举编译器默认在 stdout 输出文本诊断，
+选择 `jsonl` 时改为在 stderr 输出 JSON 诊断。JSONL 沿用各编译器的编译结果和告警策略，
+C 宿主的 `-ferror-limit` 与单行限额仍生效。
+命令行错误、构建摘要及链接器输出使用文本。调用方应保留 stdout 和 stderr 中的文本以供排查。
 
 工具应对实际选中的编译器执行 `--help`，检查退出码为 0 且任一输出流中有一行以
 `--diagnostics-format=jsonl` 为首个空白分隔的字段。探测失败或缺少该字段时，省略此参数并处理文本输出。
