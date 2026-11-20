@@ -274,13 +274,6 @@ partial class Irgen {
         L("  store i8* null, i8** " + vp);
     }
 
-    int ThrowFinallyTarget() {
-        if (catchFinDepth.Count > 0) {
-            return catchFinDepth[catchFinDepth.Count - 1];
-        }
-        return 0;
-    }
-
     int AsyncExceptionNesting(Node n) {
         if (n == null || n.kind == AK.Lambda()) { return 0; }
         int depth = 0;
@@ -330,10 +323,10 @@ partial class Irgen {
         asyncExceptionDepth = asyncExceptionDepth + 1;
     }
 
-    void DisarmAsyncExceptionPair(string value, string tid) {
+    void RemoveAsyncCatchSnapshot(string value, string tid, string owner) {
         int i = asyncSlotReg.Count - 1;
         while (i >= 0) {
-            if (asyncSlotReg[i] == value || asyncSlotReg[i] == tid) {
+            if (asyncSlotReg[i] == value || asyncSlotReg[i] == tid || asyncSlotReg[i] == owner) {
                 asyncSlotReg.RemoveAt(i); asyncSlotTy.RemoveAt(i); asyncSlotIdx.RemoveAt(i);
             }
             i = i - 1;
@@ -342,55 +335,22 @@ partial class Irgen {
     }
 
     void EmitPropagationFins(int from) {
-        if (!curAsync || finBodies.Count <= from) { EmitExitFins(from); return; }
-        string value = NT(); string tid = NT();
-        EA(value, "i8*"); EA(tid, "i8*");
-        string v = NT(); string t = NT();
-        L("  " + v + " = load i8*, i8** @__exc_val");
-        L("  " + t + " = load i8*, i8** @__exc_tid");
-        L("  store i8* " + v + ", i8** " + value);
-        L("  store i8* " + t + ", i8** " + tid);
-        string pendingSlot = NT(); EA(pendingSlot, "i8*");
-        string pending = NT(); string pendingRaw = NT();
-        L("  " + pending + " = call %zan.exception* @zexc_push()");
-        L("  " + pendingRaw + " = bitcast %zan.exception* " + pending + " to i8*");
-        L("  store i8* " + pendingRaw + ", i8** " + pendingSlot);
-        asyncSlotReg.Add(pendingSlot); asyncSlotTy.Add(MkType("string"));
-        asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3 + 2);
-        ArmAsyncExceptionPair(value, tid);
-        EmitExitFins(from);
-        if (!term) {
-            string restoredValue = NT(); string restoredTid = NT();
-            L("  " + restoredValue + " = load i8*, i8** " + value);
-            L("  " + restoredTid + " = load i8*, i8** " + tid);
-            L("  store i8* " + restoredValue + ", i8** @__exc_val");
-            L("  store i8* " + restoredTid + ", i8** @__exc_tid");
-        }
-        if (!term) {
-            string pendingOwner = LoadExceptionOwner(pendingSlot);
-            L("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* " + pendingOwner + ")");
-            DropExceptionOwner(pendingSlot);
-            RestoreExceptionDispatch();
-        }
-        DisarmAsyncExceptionPair(value, tid);
-        int pi = asyncSlotReg.Count - 1;
-        while (pi >= 0) {
-            if (asyncSlotReg[pi] == pendingSlot) {
-                asyncSlotReg.RemoveAt(pi); asyncSlotTy.RemoveAt(pi); asyncSlotIdx.RemoveAt(pi);
-            }
-            pi = pi - 1;
-        }
+        string slot = AsyncPendingPayload(true, "@co_pending_drop_exception");
+        string pending = NT();
+        L("  " + pending + " = bitcast i64* " + slot + " to %zan.exception*");
+        L("  store %zan.exception zeroinitializer, %zan.exception* " + pending);
+        L("  call void @zexc_take(%zan.exception* " + pending + ", %zan.exception* @zexc_dispatch)");
+        RestoreExceptionDispatch();
+        EmitExitFins(from, true);
+        if (term) { return; }
+        slot = AsyncPendingPayload(false);
+        pending = NT();
+        L("  " + pending + " = bitcast i64* " + slot + " to %zan.exception*");
+        L("  call void @zexc_take(%zan.exception* @zexc_dispatch, %zan.exception* " + pending + ")");
+        RestoreExceptionDispatch();
     }
 
-    void EmitUnmatchedRaise() {
-        if (curAsync) { EmitPropagationFins(ThrowFinallyTarget()); }
-        if (!term) { EmitRaise(); }
-    }
-
-    // Synchronous throws use the same landing as a throwing callee or guard.
-    // Keep the existing coroutine lowering until its cleanup can live in the frame.
     void GenThrow(Node s) {
-        int target = ThrowFinallyTarget();
         if (s.a == null) {
             // a bare `throw;`: re-raise the exception the enclosing catch
             // clause caught. The in-flight globals may have been overwritten
@@ -411,6 +371,9 @@ partial class Irgen {
             EmitRaise();
             return;
         }
+        List<string> savedTemps = stmtTemps;
+        List<Node> savedTempTypes = stmtTempTypes;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal v = GenExpr(s.a);
         string vt = MapType(v.ty);
         string ev = v.op;
@@ -447,6 +410,8 @@ partial class Irgen {
         string publishTid = NT();
         L("  " + publishTid + " = load i8*, i8** @__exc_tid");
         L("  call void @zexc_publish(i8* " + ev + ", i8* " + publishTid + ", i64 " + kind + ", i64 " + owned + ")");
+        EmitTempReleases();
+        stmtTemps = savedTemps; stmtTempTypes = savedTempTypes;
         EmitRaise();
     }
 
@@ -504,17 +469,44 @@ partial class Irgen {
     // `from` is the index of the innermost finally the exit path leaves: a
     // break/continue out of a loop runs only the finallys opened INSIDE that
     // loop, a return runs all of them.
-    void EmitExitFins(int from) {
+    void EmitExitFins(int from, bool keepPending = false) {
         if (finBodies.Count <= from) { return; }
         // the liveness flags are per-path: the pops below belong to this
         // path only, so the flags are restored afterwards
         List<string> savedRecords = new List<string>();
         int r = 0;
         while (r < syncFlow.records.Count) { savedRecords.Add(syncFlow.records[r]); r = r + 1; }
+        List<Node> savedCatchBindings = asyncCatchBindings;
+        List<int> savedCatchEntries = asyncCatchEntries;
+        List<string> savedCatchValues = catchExcVal;
+        List<string> savedCatchTypes = catchExcTid;
+        List<string> savedCatchOwners = catchExcOwner;
+        List<string> savedSlotRegs = asyncSlotReg;
+        List<Node> savedSlotTypes = asyncSlotTy;
+        List<int> savedSlotIndices = asyncSlotIdx;
+        int savedExceptionDepth = asyncExceptionDepth;
+        List<int> hiddenCatchLocals = new List<int>();
+        List<string> hiddenCatchNames = new List<string>();
         List<int> savedAsyncHandlers = new List<int>();
         if (curAsync) {
             int h = 0;
             while (h < asyncTryLbl.Count) { savedAsyncHandlers.Add(asyncTryLbl[h]); h = h + 1; }
+            asyncCatchBindings = new List<Node>(); asyncCatchEntries = new List<int>();
+            catchExcVal = new List<string>(); catchExcTid = new List<string>(); catchExcOwner = new List<string>();
+            h = 0;
+            while (h < savedCatchBindings.Count) {
+                asyncCatchBindings.Add(savedCatchBindings[h]); asyncCatchEntries.Add(savedCatchEntries[h]);
+                catchExcVal.Add(savedCatchValues[h]); catchExcTid.Add(savedCatchTypes[h]);
+                catchExcOwner.Add(savedCatchOwners[h]);
+                h = h + 1;
+            }
+            asyncSlotReg = new List<string>(); asyncSlotTy = new List<Node>(); asyncSlotIdx = new List<int>();
+            h = 0;
+            while (h < savedSlotRegs.Count) {
+                asyncSlotReg.Add(savedSlotRegs[h]); asyncSlotTy.Add(savedSlotTypes[h]);
+                asyncSlotIdx.Add(savedSlotIndices[h]);
+                h = h + 1;
+            }
         }
         List<int> saved = new List<int>();
         List<string> savedMon = new List<string>();
@@ -535,7 +527,33 @@ partial class Irgen {
                     if (asyncTryLbl.Count > 0) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
                 }
             }
-            if (FinIsActive(i)) { CancelPendingBoundary(i); }
+            if (curAsync) {
+                int last = asyncCatchEntries.Count - 1;
+                if (last >= 0 && asyncCatchEntries[last] == i) {
+                    Node clause = asyncCatchBindings[last];
+                    DropExceptionOwner(catchExcOwner[last]);
+                    ClearAsyncCatchBinding(clause);
+                    if (clause.sval != "" && clause.type != null) {
+                        int local = locReg.Count - 1;
+                        string reg = asyncLocalRegs[clause.ival];
+                        while (local >= 0 && locReg[local] != reg) { local = local - 1; }
+                        if (local >= 0) {
+                            hiddenCatchLocals.Add(local); hiddenCatchNames.Add(locName[local]);
+                            locName[local] = "";
+                        }
+                    }
+                    RemoveAsyncCatchSnapshot(catchExcVal[last], catchExcTid[last], catchExcOwner[last]);
+                    catchExcVal.RemoveAt(last); catchExcTid.RemoveAt(last); catchExcOwner.RemoveAt(last);
+                    asyncCatchBindings.RemoveAt(last); asyncCatchEntries.RemoveAt(last);
+                }
+            }
+            if (FinIsActive(i)) {
+                if (curAsync) {
+                    int active = finActive.Count - 1;
+                    while (finActive[active] != i) { active = active - 1; }
+                    AsyncPendingDiscard(LoadAsyncFrameWord(asyncPendingFinallyBase + active), keepPending);
+                } else { CancelPendingBoundary(i); }
+            }
             if (finMonSlot[i] != null) {
                 string obj = NT();
                 L("  " + obj + " = load i8*, i8** " + finMonSlot[i]);
@@ -587,6 +605,16 @@ partial class Irgen {
                 // but must not register the ambient owner a second time.
                 string traversalPending = syncPendingReturn;
                 syncPendingReturn = "";
+                if (curAsync) {
+                    string depth = AsyncPendingDepth();
+                    if (keepPending) {
+                        string baseDepth = NT();
+                        L("  " + baseDepth + " = sub i64 " + depth + ", 1");
+                        depth = baseDepth;
+                    }
+                    string mark = FrameGep("%ff", asyncPendingFinallyBase + finActive.Count - 1);
+                    L("  store i64 " + depth + ", i64* " + mark);
+                }
                 GenStmt(finBodies[i]);
                 syncPendingReturn = traversalPending;
                 syncFlow.records.RemoveAt(syncFlow.records.Count - 1);
@@ -608,7 +636,18 @@ partial class Irgen {
             }
             i = i - 1;
         }
-        if (curAsync) { asyncTryLbl = savedAsyncHandlers; }
+        if (curAsync) {
+            asyncTryLbl = savedAsyncHandlers;
+            asyncCatchBindings = savedCatchBindings; asyncCatchEntries = savedCatchEntries;
+            catchExcVal = savedCatchValues; catchExcTid = savedCatchTypes; catchExcOwner = savedCatchOwners;
+            asyncSlotReg = savedSlotRegs; asyncSlotTy = savedSlotTypes; asyncSlotIdx = savedSlotIndices;
+            asyncExceptionDepth = savedExceptionDepth;
+            int local = 0;
+            while (local < hiddenCatchLocals.Count) {
+                locName[hiddenCatchLocals[local]] = hiddenCatchNames[local];
+                local = local + 1;
+            }
+        }
         r = 0;
         while (r < savedRecords.Count) { syncFlow.records[r] = savedRecords[r]; r = r + 1; }
         i = 0;
@@ -636,6 +675,8 @@ partial class Irgen {
         string bufp = EmitFrameBuf(sp);
         EmitPendingHandlerMark(sp);
         if (curAsync) {
+            string depth = AsyncPendingDepth();
+            L("  store i64 " + depth + ", i64* " + FrameGep("%ff", asyncPendingHandlerBase + asyncTryLbl.Count));
             string ownerMark = NT();
             L("  " + ownerMark + " = load i8*, i8** @zexc_owners");
             string bits = ToI64(ownerMark, "i8*");
@@ -655,11 +696,15 @@ partial class Irgen {
         L("  br i1 " + c + ", label %L" + landing + ", label %L" + body);
     }
 
+    void DiscardAsyncHandlerTransfers() {
+        AsyncPendingDiscard(LoadAsyncFrameWord(asyncPendingHandlerBase + asyncTryLbl.Count));
+    }
+
     bool ReleaseAsyncCatchLocal(string reg) {
         int i = 0;
         while (i < asyncCatchBindings.Count) {
             Node clause = asyncCatchBindings[i];
-            if (asyncLocalRegs[clause.ival] == reg) { ClearAsyncCatchBinding(clause); return true; }
+            if (clause.sval != "" && clause.type != null && asyncLocalRegs[clause.ival] == reg) { ClearAsyncCatchBinding(clause); return true; }
             i = i + 1;
         }
         return false;
@@ -719,9 +764,7 @@ partial class Irgen {
         finMonSlot.Add(null);
         Label(ltry);
         if (curAsync) { asyncTryLbl.Add(lcatch); }
-        if (curAsync && s.b != null) { catchFinDepth.Add(mark + 1); }
         GenStmt(s.a);
-        if (curAsync && s.b != null) { catchFinDepth.RemoveAt(catchFinDepth.Count - 1); }
         if (curAsync) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
         if (!term) {
             EmitExcPop();
@@ -730,9 +773,7 @@ partial class Irgen {
             // a second time
             finLive[mark] = 0;
             if (s.c != null) {
-                finActive.Add(mark);
-                GenStmt(s.c);
-                finActive.RemoveAt(finActive.Count - 1);
+                EmitExitFins(mark);
             }
             if (!term) { L("  br label %L" + lend); }
         }
@@ -748,6 +789,7 @@ partial class Irgen {
             // overwrite an assignment made after the last suspension with
             // the frame's older copy.
             EmitAsyncHcAdd(-1);
+            DiscardAsyncHandlerTransfers();
         }
         // handler already popped by throw; dispatch to the first clause whose
         // type matches the thrown tid (walking the base chain), rethrowing to
@@ -871,7 +913,7 @@ partial class Irgen {
                     asyncSlotReg.Add(ownerSlot); asyncSlotTy.Add(MkType("string"));
                     asyncSlotIdx.Add(asyncExceptionBase + asyncExceptionDepth * 3 + 2);
                     ArmAsyncExceptionPair(exSlot, tdSlot);
-                    if (cc.sval != "" && cc.type != null) { asyncCatchBindings.Add(cc); }
+                    asyncCatchBindings.Add(cc); asyncCatchEntries.Add(mark);
                 }
                 if (!curAsync && cc.sval != "" && cc.type != null) {
                     syncFlow.catchScopes.Add(cc.a); syncFlow.catchLocals.Add(catchScope);
@@ -879,14 +921,7 @@ partial class Irgen {
                 GenStmt(cc.a);
                 if (curAsync && cleanup != 0) { asyncTryLbl.RemoveAt(asyncTryLbl.Count - 1); }
                 if (curAsync) {
-                    DisarmAsyncExceptionPair(exSlot, tdSlot);
-                    int ownerIndex = asyncSlotReg.Count - 1;
-                    while (ownerIndex >= 0) {
-                        if (asyncSlotReg[ownerIndex] == ownerSlot) {
-                            asyncSlotReg.RemoveAt(ownerIndex); asyncSlotTy.RemoveAt(ownerIndex); asyncSlotIdx.RemoveAt(ownerIndex);
-                        }
-                        ownerIndex = ownerIndex - 1;
-                    }
+                    RemoveAsyncCatchSnapshot(exSlot, tdSlot, ownerSlot);
                 }
                 catchExcVal.RemoveAt(catchExcVal.Count - 1);
                 catchExcTid.RemoveAt(catchExcTid.Count - 1);
@@ -907,6 +942,7 @@ partial class Irgen {
                     DropExceptionOwner(ownerSlot);
                     if (curAsync) {
                         EmitAsyncHcAdd(-1);
+                        DiscardAsyncHandlerTransfers();
                         ClearAsyncCatchBinding(cc);
                     } else { ReleaseLocalsFrom(catchScope); }
                     L("  br label %L" + lrethrow);
@@ -917,8 +953,9 @@ partial class Irgen {
                     syncFlow.catchScopes.RemoveAt(syncFlow.catchScopes.Count - 1);
                     syncFlow.catchLocals.RemoveAt(syncFlow.catchLocals.Count - 1);
                 }
-                if (curAsync && cc.sval != "" && cc.type != null) {
+                if (curAsync) {
                     asyncCatchBindings.RemoveAt(asyncCatchBindings.Count - 1);
+                    asyncCatchEntries.RemoveAt(asyncCatchEntries.Count - 1);
                 }
                 if (sawAll) { cc = null; } else { cc = cc.b; }
                 if (cc != null && lmiss != lrethrow) { Label(lmiss); }
@@ -932,26 +969,21 @@ partial class Irgen {
                     if (s.c != null) { EmitPropagationFins(mark); }
                     if (!term) { EmitRaise(); }
                 } else if (s.c != null) { EmitSyncCleanupFinally(mark); }
-                else { EmitUnmatchedRaise(); }
+                else { EmitRaise(); }
                 term = false;
             }
         } else {
             L("  br label %L" + lfin);
         }
         Label(lfin);
-        if (!curAsync) {
-            if (s.b == null) {
-                EmitSyncCleanupFinally(mark);
-            } else {
-                EmitExitFins(mark);
-                if (!term) { L("  br label %L" + lend); }
-            }
+        if (s.b == null) {
+            if (curAsync) {
+                if (s.c != null) { EmitPropagationFins(mark); }
+                if (!term) { EmitRaise(); }
+            } else { EmitSyncCleanupFinally(mark); }
         } else {
-            EmitPropagationFins(mark);
-            if (!term) {
-                if (s.b == null) { EmitRaise(); term = false; }
-                else { L("  br label %L" + lend); }
-            }
+            EmitExitFins(mark);
+            if (!term) { L("  br label %L" + lend); }
         }
         Label(lend);
         term = false;

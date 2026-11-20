@@ -1500,6 +1500,11 @@ kernel32、shell32、user32、advapi32、version）。
 - 坑（2026-10-21 实测）：finally 体在 try 区域里被**内联复制**到每个退出点上，
   所以 finally 体不能假设"只被发一次"；发两份以上时，局部变量槽位会重复注册，
   作用域要各自收干净。
+- 异步 `finally` 跨 `await` 时，待定返回值与异常由协程帧持有。处理器首次武装时保存
+  待定栈深度，恢复时沿用；退出活动 `finally` 时按它保存的深度释放失效记录，并保留
+  仍有效的外层记录及当前接替的控制转移。任务结果槽在完成前也可暂存 I/O 数值，放弃
+  未完成的帧时只按记录的析构函数释放待定载荷。回归覆盖 `async_finally_pending_owners`、
+  `async_finally_scope_transfers`、`selfhost_decimal_wide` 和发布运行时的 `mt/async_timer.zan`。
 
 ## 73. 泛型擦除必须**按作用域**判定：用户类名不能被同名类型参数击穿
 

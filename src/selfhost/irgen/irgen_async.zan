@@ -298,11 +298,9 @@ partial class Irgen {
             EmitArcRelease("%this", curAsyncThisTy);
         }
     }
-    // Discard an owned result only when its pending return is abandoned.
-    // Normal completion transfers it to the awaiter. Clear before releasing;
-    // callers provide the declared type even in a separate $cleanup function.
+    // Discard a published result whose task has no consumer. Clear it first.
     void EmitAsyncResultRelease(Node retTy) {
-        if (retTy == null || !ArcManaged(retTy)) { return; }
+        if (retTy == null || (!ArcManaged(retTy) && retTy.ival < 1)) { return; }
         string slot = FrameGep("%ff", 6);
         string bits = NT(); L("  " + bits + " = load i64, i64* " + slot);
         L("  store i64 0, i64* " + slot);
@@ -322,7 +320,7 @@ partial class Irgen {
         // B-ID64 镜像：自等待者（Task.Spawn 写 AWAITER=自身）即 fire-and-forget
         // 帧——结果载荷永不经帧读取，唤醒 reap 前按元素类型释放槽 6 并清槽。
         // 与宿主 emit_async_complete_epilogue 的 co.orphan 分支同口径。
-        if (curAsyncRetElem != null && ArcManaged(curAsyncRetElem)) {
+        if (curAsyncRetElem != null && (ArcManaged(curAsyncRetElem) || curAsyncRetElem.ival >= 1)) {
             string selfi = NT(); L("  " + selfi + " = ptrtoint i8* %fp to i64");
             string isself = NT(); L("  " + isself + " = icmp eq i64 " + awi + ", " + selfi);
             int lor = NL(); int lgo = NL();
@@ -357,48 +355,146 @@ partial class Irgen {
         L("  ret void");
         term = true;
     }
+    // Each frame owns a stack of pending transfers. A record has a drop
+    // thunk and four payload words (large enough for %zan.exception).
+    void EmitAsyncPendingRuntime() {
+        H("define internal i64* @co_pending_at(i64* %stack, i64 %index) {");
+        H("entry:");
+        H("  %words = mul i64 %index, 5");
+        H("  %offset = add i64 %words, 1");
+        H("  %record = getelementptr i64, i64* %stack, i64 %offset");
+        H("  ret i64* %record");
+        H("}");
+        H("define internal void @co_pending_discard(i64* %stack, i64 %mark) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %count = load i64, i64* %stack");
+        H("  %more = icmp ugt i64 %count, %mark");
+        H("  br i1 %more, label %pop, label %end");
+        H("pop:");
+        H("  %index = sub i64 %count, 1");
+        H("  store i64 %index, i64* %stack");
+        H("  %record = call i64* @co_pending_at(i64* %stack, i64 %index)");
+        H("  %bits = load i64, i64* %record");
+        H("  %owned = icmp ne i64 %bits, 0");
+        H("  br i1 %owned, label %drop, label %loop");
+        H("drop:");
+        H("  %dtor = inttoptr i64 %bits to void(i8*)*");
+        H("  %slot = getelementptr i64, i64* %record, i64 1");
+        H("  %payload = bitcast i64* %slot to i8*");
+        H("  call void %dtor(i8* %payload)");
+        H("  br label %loop");
+        H("end:");
+        H("  ret void");
+        H("}");
+        H("define internal void @co_pending_keep(i64* %stack, i64 %mark) {");
+        H("entry:");
+        H("  %count = load i64, i64* %stack");
+        H("  %index = sub i64 %count, 1");
+        H("  %move = icmp ugt i64 %index, %mark");
+        H("  br i1 %move, label %replace, label %end");
+        H("replace:");
+        H("  %record = call i64* @co_pending_at(i64* %stack, i64 %index)");
+        H("  %value = bitcast i64* %record to [5 x i64]*");
+        H("  %saved = load [5 x i64], [5 x i64]* %value");
+        H("  store i64 %index, i64* %stack");
+        H("  call void @co_pending_discard(i64* %stack, i64 %mark)");
+        H("  %slot = call i64* @co_pending_at(i64* %stack, i64 %mark)");
+        H("  %dst = bitcast i64* %slot to [5 x i64]*");
+        H("  store [5 x i64] %saved, [5 x i64]* %dst");
+        H("  %next = add i64 %mark, 1");
+        H("  store i64 %next, i64* %stack");
+        H("  br label %end");
+        H("end:");
+        H("  ret void");
+        H("}");
+        H("define internal void @co_pending_drop_exception(i8* %payload) {");
+        H("entry:");
+        H("  %record = bitcast i8* %payload to %zan.exception*");
+        H("  call void @zexc_drop(%zan.exception* %record)");
+        H("  ret void");
+        H("}");
+    }
+
+    string LoadAsyncFrameWord(int index) {
+        string word = NT();
+        L("  " + word + " = load i64, i64* " + FrameGep("%ff", index));
+        return word;
+    }
+
+    string AsyncPendingDepth() {
+        if (asyncPendingBase == 0) { return "0"; }
+        return LoadAsyncFrameWord(asyncPendingBase);
+    }
+
+    void AsyncPendingDiscard(string depth = "0", bool keep = false) {
+        if (asyncPendingBase == 0) { return; }
+        string helper = keep ? "co_pending_keep" : "co_pending_discard";
+        L("  call void @" + helper + "(i64* " + FrameGep("%ff", asyncPendingBase) + ", i64 " + depth + ")");
+    }
+
+    string AsyncPendingPayload(bool push, string dtor = "null") {
+        string stack = FrameGep("%ff", asyncPendingBase);
+        string depth = AsyncPendingDepth();
+        string next = NT();
+        L("  " + next + (push ? " = add i64 " : " = sub i64 ") + depth + ", 1");
+        L("  store i64 " + next + ", i64* " + stack);
+        string index = push ? depth : next;
+        string record = NT();
+        L("  " + record + " = call i64* @co_pending_at(i64* " + stack + ", i64 " + index + ")");
+        if (push) {
+            L("  store i64 ptrtoint (void(i8*)* " + dtor + " to i64), i64* " + record);
+        }
+        return FrameGep(record, 1);
+    }
+
     void GenAsyncReturn(Node s) {
+        Node ty = curAsyncRetElem;
+        ExprVal value = new ExprVal("0", MkType("int"));
         if (s.a != null) {
             stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
-            ExprVal v = s.a.kind == AK.AwaitExpr() ? EmitAwait(s.a.a, true) : GenExpr(s.a);
-            if (curRetTy != null && curRetTy.sval != "void") {
-                v = ApplyUserConv(curRetTy, v, false);
-                if (!convApplied) { v = StrSlotConv(curRetTy, v); }
-                v = NarrowToDeclared(v, curRetTy);
-                string declLt = MapType(curRetTy);
-                string crv = IsNullableValue(curRetTy) ? BoxFor(v, curRetTy) : Coerce(v, declLt);
-                v = new ExprVal(crv, curRetTy);
+            value = s.a.kind == AK.AwaitExpr() ? EmitAwait(s.a.a, true) : GenExpr(s.a);
+            if (ty != null) {
+                value = ApplyUserConv(ty, value, false);
+                if (!convApplied) { value = StrSlotConv(ty, value); }
+                value = NarrowToDeclared(value, ty);
+                string op = IsNullableValue(ty) ? BoxFor(value, ty) : Coerce(value, MapType(ty));
+                value = new ExprVal(op, ty);
             }
-            string lt = MapType(v.ty);
-            string rv = v.op;
-            if (!IsConstOperand(rv)) { EmitArcRetain(rv, v.ty); }
-            // Retain the replacement first, including when it aliases the old result.
-            EmitAsyncResultRelease(curAsyncRetElem);
-            // store the return value into the frame result slot (slot 6) BEFORE
-            // running finally blocks: a finally body may suspend (e.g. await
-            // Task.Yield()) and resume in a new invocation where SSA registers
-            // are dead, and an inner return in a finally will cleanly overwrite it.
-            string rp = FrameGep("%ff", 6);
-            if (IsDecimal(v.ty)) { DecimalResultStore("%ff", v); }
-            else { L("  store i64 " + ToI64(rv, lt) + ", i64* " + rp); }
-            EmitTempReleases();
-            // the finallys of the try statements this return leaves run
-            // BEFORE the locals are released: they may use them (and they
-            // release what the try held -- a lock, a file handle).
-            EmitExitFins(0);
-            if (term) { return; }
-            EmitAsyncEpilogue();
-            string rpAfter = FrameGep("%ff", 6);
-            string resi = NT();
-            L("  " + resi + " = load i64, i64* " + rpAfter);
-            EmitAsyncComplete(resi);
-        } else {
-            EmitAsyncResultRelease(curAsyncRetElem);
-            EmitExitFins(0);
-            if (term) { return; }
-            EmitAsyncEpilogue();
-            EmitAsyncComplete("0");
+            if (IsStructTy(value.ty)) { value = CopyStructValue(value); }
+            else if (!IsConstOperand(value.op)) { EmitArcRetain(value.op, value.ty); }
         }
+        bool pending = finBodies.Count > 0 && asyncPendingBase != 0;
+        string bits = "0";
+        if (pending) {
+            string dtor = "null";
+            if (ty != null && (ArcManaged(ty) || ty.ival >= 1)) {
+                List<Node> types = new List<Node>(); types.Add(ty);
+                List<bool> cells = new List<bool>(); cells.Add(false);
+                dtor = OwnedPayloadDtor(types, cells, false);
+            }
+            string slot = AsyncPendingPayload(true, dtor);
+            if (IsDecimal(ty)) { DecimalFrameStore(slot, 0, value.op); }
+            else { L("  store i64 " + ToI64(value.op, MapType(value.ty)) + ", i64* " + slot); }
+        } else if (IsDecimal(ty)) {
+            DecimalResultStore("%ff", value);
+        } else {
+            bits = ToI64(value.op, MapType(value.ty));
+        }
+        if (s.a != null) { EmitTempReleases(); }
+        EmitExitFins(0, pending);
+        if (term) { return; }
+        if (pending) {
+            string slot = AsyncPendingPayload(false);
+            if (IsDecimal(ty)) { DecimalResultStore("%ff", DecimalFrameLoad(slot, 0)); }
+            else { bits = NT(); L("  " + bits + " = load i64, i64* " + slot); }
+        }
+        if (IsDecimal(ty)) {
+            bits = NT(); L("  " + bits + " = load i64, i64* " + FrameGep("%ff", 6));
+        }
+        EmitAsyncEpilogue();
+        EmitAsyncComplete(bits);
     }
     void GenAwaitStmt(Node s) {
         int k = s.kind;
@@ -570,10 +666,17 @@ partial class Irgen {
         asyncExceptionBase = subBase + subSlots + feCount * 5;
         asyncExceptionDepth = 0;
         asyncCatchBindings = new List<Node>();
-        // A catch snapshot and an outgoing propagation snapshot can both be
-        // active at each nested try. Clones reuse slots after their scope ends.
-        asyncOwnerMarkBase = asyncExceptionBase + 6 * (AsyncExceptionNesting(m.d) + 1);
-        int nfields = asyncOwnerMarkBase + 2 * (AsyncExceptionNesting(m.d) + 1);
+        asyncCatchEntries = new List<int>();
+        int ehDepth = AsyncExceptionNesting(m.d);
+        asyncOwnerMarkBase = asyncExceptionBase + 3 * ehDepth;
+        asyncPendingHandlerBase = asyncOwnerMarkBase + ehDepth + 1;
+        asyncPendingFinallyBase = asyncPendingHandlerBase + ehDepth;
+        int nfields = asyncPendingFinallyBase + ehDepth;
+        asyncPendingBase = 0;
+        if (ehDepth > 0) {
+            asyncPendingBase = nfields;
+            nfields = nfields + 1 + 5 * (ehDepth + 1);
+        }
         asyncForeachBase = subBase + subSlots;
         asyncForeachNext = 0;
         if (m.d != null) { AssignAsyncForeachSlots(m.d); }
@@ -779,7 +882,7 @@ partial class Irgen {
             L("  call void @zexc_take(%zan.exception* " + errorRecord + ", %zan.exception* @zexc_dispatch)");
             L("  store i8* null, i8** @__exc_val");
             L("  store i8* null, i8** @__exc_tid");
-            EmitAsyncResultRelease(curAsyncRetElem);
+            AsyncPendingDiscard();
             EmitAsyncEpilogue();
             EmitAsyncComplete("0");
         }
@@ -787,14 +890,13 @@ partial class Irgen {
         // it owns, marks itself done and wakes its awaiter. The frame itself
         // is NOT freed here: the awaiter reads the result and frees it.
         Label(lCancel);
-        EmitAsyncResultRelease(curAsyncRetElem);
+        AsyncPendingDiscard();
         EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, pr, paramBase, lnames, ltypes, localBase, false);
         EmitAsyncComplete("0");
         L("}");
         obody.Append(entryAllocas.ToString());
         obody.Append(body.ToString());
         body = obody; entryAllocas = oea; eaActive = oact;
-        Node cleanupRetTy = curAsyncRetElem;
         curAsync = false;
         curAsyncThis = false;
         curAsyncThisTy = null;
@@ -808,7 +910,8 @@ partial class Irgen {
         L("define internal void @" + sym + "$cleanup(i8* %fp) {");
         L("entry:");
         L("  %ff = bitcast i8* %fp to i64*");
-        EmitAsyncResultRelease(cleanupRetTy);
+        AsyncPendingDiscard();
+        // An abandoned frame can still have an I/O result in slot 6.
         EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, pr, paramBase, lnames, ltypes, localBase, true);
         L("  ret void");
         L("}");
