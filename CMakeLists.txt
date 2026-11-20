@@ -1447,20 +1447,6 @@ add_custom_target(native_cpu_feature_gates ALL DEPENDS ${ZAN_NATIVE_CPU_GATE_EXE
 add_test(NAME native_cpu_feature_gates COMMAND ${ZAN_NATIVE_CPU_GATE_EXE})
 set_tests_properties(native_cpu_feature_gates PROPERTIES TIMEOUT 30)
 
-if(CMAKE_NM AND NOT CMAKE_CROSSCOMPILING)
-  add_test(NAME native_accel_json_link
-    COMMAND ${CMAKE_COMMAND}
-      "-DCC=${ZAN_RT_IO_CC}" "-DNM=${CMAKE_NM}"
-      "-DCC_DEFS=${ZAN_RT_OBJ_DEFS}"
-      "-DARCHIVE=${ZAN_RT_CRYPTO_ARCHIVE}"
-      "-DSRC=${CMAKE_SOURCE_DIR}/tests/native_accel_json_link.c"
-      "-DOUT_EXE=${CMAKE_BINARY_DIR}/cases/native_accel_json_link${CMAKE_EXECUTABLE_SUFFIX}"
-      "-DHOST_SYSTEM=${CMAKE_SYSTEM_NAME}"
-      "-DHOST_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}"
-      -P ${CMAKE_SOURCE_DIR}/tests/run_native_accel_json_link.cmake)
-  set_tests_properties(native_accel_json_link PROPERTIES TIMEOUT 180)
-endif()
-
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|x64)$")
   add_test(NAME compiler_cpu_profile
     COMMAND ${CMAKE_COMMAND} -DZANC=$<TARGET_FILE:zanc>

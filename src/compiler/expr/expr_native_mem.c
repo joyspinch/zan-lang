@@ -612,53 +612,6 @@ bool emit_native_memory_call(zan_irgen_t *g, zan_ast_node_t *expr,
         }, 5, "nm.sm4_dec");
         return true;
     }
-    if (is_call_to(expr, "NativeMemory", "JsonSkipWhitespace") && expr->call.args.count == 3) {
-        LLVMValueRef ptr = nm_arg(g, expr, 0, locals);
-        LLVMValueRef pos = nm_arg(g, expr, 1, locals);
-        LLVMValueRef len = nm_arg(g, expr, 2, locals);
-        LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i64t }, 3, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_json_skip_whitespace");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_json_skip_whitespace", ty);
-        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, ptr, zero64), pos, len
-        }, 3, "nm.json_ws");
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "JsonScanString") && expr->call.args.count == 3) {
-        LLVMValueRef ptr = nm_arg(g, expr, 0, locals);
-        LLVMValueRef pos = nm_arg(g, expr, 1, locals);
-        LLVMValueRef len = nm_arg(g, expr, 2, locals);
-        LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i64t }, 3, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_json_scan_string");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_json_scan_string", ty);
-        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, ptr, zero64), pos, len
-        }, 3, "nm.json_str");
-        return true;
-    }
-    if (is_call_to(expr, "NativeMemory", "JsonParseFast") && expr->call.args.count == 7) {
-        LLVMValueRef buf = nm_arg(g, expr, 0, locals);
-        LLVMValueRef len = nm_arg(g, expr, 1, locals);
-        LLVMValueRef slots = nm_arg(g, expr, 2, locals);
-        LLVMValueRef slot_cap = nm_arg(g, expr, 3, locals);
-        LLVMValueRef pairs = nm_arg(g, expr, 4, locals);
-        LLVMValueRef pair_cap = nm_arg(g, expr, 5, locals);
-        LLVMValueRef counts = nm_arg(g, expr, 6, locals);
-
-        LLVMTypeRef ty = LLVMFunctionType(i64t,
-            (LLVMTypeRef[]){ i8ptr, i64t, i8ptr, i64t, i8ptr, i64t, i8ptr }, 7, 0);
-        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_hw_json_parse_fast");
-        if (!fn) fn = LLVMAddFunction(g->mod, "zan_hw_json_parse_fast", ty);
-        *out = zan_call2(g->builder, ty, fn, (LLVMValueRef[]){
-            nm_addr(g, buf, zero64), len,
-            nm_addr(g, slots, zero64), slot_cap,
-            nm_addr(g, pairs, zero64), pair_cap,
-            nm_addr(g, counts, zero64)
-        }, 7, "nm.json_parse_fast");
-        return true;
-    }
     /* AtomicInt 核心操作一律内联发射为单指令硬件原子操作，消除 C ABI 跨语言调用开销 */
     #define IS_ATOMIC_INT(m) (is_call_to(expr, "AtomicInt", m) || \
         (expr->kind == AST_CALL && expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER && \

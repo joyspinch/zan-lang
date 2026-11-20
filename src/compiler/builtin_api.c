@@ -190,9 +190,6 @@ static const zan_builtin_member_t members_nativemem[] = {
     { "RsaCrtModPow",  'M', "long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen)" },
     { "Sm4CbcEncrypt",    'M', "long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv)" },
     { "Sm4CbcDecrypt",    'M', "long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv)" },
-    { "JsonSkipWhitespace", 'M', "long JsonSkipWhitespace(nint ptr, long pos, long len)" },
-    { "JsonScanString",     'M', "long JsonScanString(nint ptr, long pos, long len)" },
-    { "JsonParseFast",      'M', "long JsonParseFast(nint buf, long len, nint slots, long slotCap, nint pairs, long pairCap, nint outCounts)" },
     { "X25519",             'M', "long X25519(nint scalar, nint point, nint outBuf)" },
 };
 

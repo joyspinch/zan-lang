@@ -1,0 +1,72 @@
+using System;
+using System.Numerics;
+using System.Runtime.Intrinsics;
+
+namespace System.Json;
+
+internal class JsonScan {
+    private static bool IsWhitespace(byte value) {
+        return value == 32 || value == 9 || value == 10 || value == 13;
+    }
+
+    internal static int SkipWhitespace(nint address, int pos, int end) {
+        if (pos >= end) { return pos; }
+        Span<byte> bytes = new Span<byte>(address, end);
+        if (!JsonScan.IsWhitespace(bytes[pos])) { return pos; }
+        if (end - pos >= 16) {
+            Vector128 space = Vector128.Create((byte)32);
+            Vector128 tab = Vector128.Create((byte)9);
+            Vector128 newline = Vector128.Create((byte)10);
+            Vector128 carriageReturn = Vector128.Create((byte)13);
+            while (end - pos >= 16) {
+                Vector128 chunk = Vector128.Load(address + (nint)pos);
+                Vector128 horizontal = Vector128.Or(Vector128.Equals(chunk, space), Vector128.Equals(chunk, tab));
+                Vector128 vertical = Vector128.Or(Vector128.Equals(chunk, newline), Vector128.Equals(chunk, carriageReturn));
+                Vector128 matched = Vector128.Or(horizontal, vertical);
+                if (matched.Low != -1L) { return pos + (BitOperations.TrailingZeroCount(~matched.Low) >> 3); }
+                if (matched.High != -1L) { return pos + 8 + (BitOperations.TrailingZeroCount(~matched.High) >> 3); }
+                pos = pos + 16;
+            }
+        }
+        while (pos < end && JsonScan.IsWhitespace(bytes[pos])) { pos = pos + 1; }
+        return pos;
+    }
+
+    // Return the closing quote, -(escape position + 1), or end.
+    internal static int StringEnd(nint address, int pos, int end) {
+        if (pos >= end) { return end; }
+        Span<byte> bytes = new Span<byte>(address, end);
+        // Short keys and values often close before a vector load pays off.
+        int prefix = end - pos < 4 ? end : pos + 4;
+        while (pos < prefix) {
+            byte value = bytes[pos];
+            if (value == 34) { return pos; }
+            if (value == 92) { return -1 - pos; }
+            pos = pos + 1;
+        }
+        if (end - pos >= 16) {
+            Vector128 quote = Vector128.Create((byte)34);
+            Vector128 escape = Vector128.Create((byte)92);
+            while (end - pos >= 16) {
+                Vector128 chunk = Vector128.Load(address + (nint)pos);
+                Vector128 matched = Vector128.Or(Vector128.Equals(chunk, quote), Vector128.Equals(chunk, escape));
+                if (matched.Low != 0) {
+                    int hit = pos + (BitOperations.TrailingZeroCount(matched.Low) >> 3);
+                    return bytes[hit] == 34 ? hit : -1 - hit;
+                }
+                if (matched.High != 0) {
+                    int hit = pos + 8 + (BitOperations.TrailingZeroCount(matched.High) >> 3);
+                    return bytes[hit] == 34 ? hit : -1 - hit;
+                }
+                pos = pos + 16;
+            }
+        }
+        while (pos < end) {
+            byte value = bytes[pos];
+            if (value == 34) { return pos; }
+            if (value == 92) { return -1 - pos; }
+            pos = pos + 1;
+        }
+        return end;
+    }
+}

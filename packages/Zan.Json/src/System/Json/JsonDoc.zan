@@ -1,5 +1,5 @@
 // 平面 tape JSON 解析器。热路径是单函数显式栈状态机（ParseCore）：
-// 无递归、无每值调用、buf 尾部 pad 32 字节后 Load64 裸读。
+// 使用类型化数组写入 tape，遇到转义或空间不足时回退到可增长的解析器。
 // 错误 -(位置+1) 为首错位置、MaxDepth 容器封顶、空容器槽编码、escPool 物化保持稳定规范。
 using System;
 using System.Collections.Generic;
@@ -35,9 +35,7 @@ public partial class JsonDoc {
     public List<string> escPool;
     // 源串。零拷贝 token 指向它，因此它随 doc 存活。
     public string src;
-    // 源字节缓冲，下标 < len 与字符串下标一一对应；尾部多 32 字节
-    // 零填充供 Load64 裸读兜越界。键比较走它——数组索引比 string
-    // 索引快约 7 倍。
+    // 源字节缓冲，下标 < len 与字符串下标一一对应。
     public byte[] buf;
     // 根槽位。
     public int root;
@@ -88,12 +86,13 @@ public partial class JsonDoc {
         int pairCap = len / 8 + 16;
         sc.EnsureCapacity(len, slotCap, pairCap);
         NativeMemory.PutString(sc.buf, 0, src, len);
-        long ret = NativeMemory.JsonParseFast(sc.buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);
+        long ret = JsonDoc.ParseTape(sc.buf, len, sc.slots, sc.slots.Length,
+            sc.pairs, sc.pairs.Length, sc.fr, sc.counts);
         if (ret == 0) {
             int slotCount = (int)sc.counts[0];
             int pairCount = (int)sc.counts[1];
             int endPos = (int)sc.counts[2];
-            endPos = (int)NativeMemory.JsonSkipWhitespace(sc.buf, (long)endPos, (long)len);
+            endPos = JsonScan.SkipWhitespace((nint)sc.buf, endPos, len);
             if (endPos >= len && slotCount > 0) {
                 JsonDoc d = new JsonDoc();
                 d.src = src;
@@ -109,7 +108,7 @@ public partial class JsonDoc {
                 d.buf = null;
                 return result;
             }
-        } else if (ret < 0 && ret != -2L && ret != -3L) {
+        } else if (ret < 0) {
             int errPos = (int)(-1 - ret);
             throw new JsonException("Malformed JSON at position " + Convert.ToString(errPos));
         }
@@ -132,12 +131,13 @@ public partial class JsonDoc {
         int pairCap = len / 8 + 16;
         sc.EnsureCapacity(len, slotCap, pairCap);
         NativeMemory.PutString(sc.buf, 0, src, len);
-        long ret = NativeMemory.JsonParseFast(sc.buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);
+        long ret = JsonDoc.ParseTape(sc.buf, len, sc.slots, sc.slots.Length,
+            sc.pairs, sc.pairs.Length, sc.fr, sc.counts);
         if (ret == 0) {
             int slotCount = (int)sc.counts[0];
             int pairCount = (int)sc.counts[1];
             int endPos = (int)sc.counts[2];
-            endPos = (int)NativeMemory.JsonSkipWhitespace(sc.buf, (long)endPos, (long)len);
+            endPos = JsonScan.SkipWhitespace((nint)sc.buf, endPos, len);
             if (endPos >= len && slotCount > 0) {
                 JsonDoc d = new JsonDoc();
                 d.src = src;
@@ -153,7 +153,7 @@ public partial class JsonDoc {
                 d.buf = null;
                 return;
             }
-        } else if (ret < 0 && ret != -2L && ret != -3L) {
+        } else if (ret < 0) {
             int errPos = (int)(-1 - ret);
             throw new JsonException("Malformed JSON at position " + Convert.ToString(errPos));
         }
@@ -169,35 +169,32 @@ public partial class JsonDoc {
         // 会被任何一次后续 Parse 覆写，绝不能交给长命 doc（否则同线程
         // 再解析一次就破坏老 doc 的键查找）。scratch 只复用 slots/pairs
         // 暂存（ParseInternal 会拷出）与 ParseScoped 瞬时场景。
-        byte[] buf = new byte[len + 32];
+        byte[] buf = new byte[len];
         NativeMemory.PutString(buf, 0, src, len);
-        return JsonDoc.ParseInternal(buf, 0, len, src);
+        return JsonDoc.ParseInternal(buf, len, src);
     }
 
-    // 原生字节零拷贝直通解析（适用于底层网络 Socket / 文件缓冲）
+    // Tape offsets are relative to the start of the selected input.
     public static JsonDoc ParseBytes(byte[] buf, int off, int len) {
         if (buf == null) { throw new JsonException("JSON buffer cannot be null"); }
-        if (off < 0 || len < 0 || off + len > buf.Length) {
+        if (off < 0 || len < 0 || off > buf.Length || len > buf.Length - off) {
             throw new JsonException("JSON buffer range out of bounds");
         }
-        byte[] pbuf = buf;
-        int pstart = off;
-        if (buf.Length < off + len + 32) {
-            pbuf = new byte[len + 32];
-            NativeMemory.Copy(pbuf, (nint)buf + (nint)off, len);
-            pstart = 0;
+        byte[] input = buf;
+        if (off != 0) {
+            input = new byte[len];
+            NativeMemory.Copy(input, (nint)buf + (nint)off, len);
         }
-        string src = pbuf.ToStr(pstart, len);
-        return JsonDoc.ParseInternal(pbuf, pstart, len, src);
+        return JsonDoc.ParseInternal(input, len, input.ToStr(0, len));
     }
 
-    private static JsonDoc ParseInternal(byte[] buf, int off, int len, string src) {
+    private static JsonDoc ParseInternal(byte[] buf, int len, string src) {
         JsonScratch sc = JsonDoc.RentScratch();
-        try { return JsonDoc.ParseInternalWithScratch(buf, off, len, src, sc); }
+        try { return JsonDoc.ParseInternalWithScratch(buf, len, src, sc); }
         finally { sc.leased = false; }
     }
 
-    private static JsonDoc ParseInternalWithScratch(byte[] buf, int off, int len, string src, JsonScratch sc) {
+    private static JsonDoc ParseInternalWithScratch(byte[] buf, int len, string src, JsonScratch sc) {
         JsonDoc d = new JsonDoc();
         d.src = src;
         d.buf = buf;
@@ -207,17 +204,18 @@ public partial class JsonDoc {
         int pairCap = len / 8 + 16;
         sc.EnsureCapacity(len, slotCap, pairCap);
 
-        long ret = NativeMemory.JsonParseFast(buf, (long)len, sc.slots, (long)sc.slots.Length, sc.pairs, (long)sc.pairs.Length, sc.counts);
+        long ret = JsonDoc.ParseTape(buf, len, sc.slots, sc.slots.Length,
+            sc.pairs, sc.pairs.Length, sc.fr, sc.counts);
         if (ret == 0) {
             int slotCount = (int)sc.counts[0];
             int pairCount = (int)sc.counts[1];
             int endPos = (int)sc.counts[2];
-            endPos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)endPos, (long)len);
+            endPos = JsonScan.SkipWhitespace((nint)buf, endPos, len);
             if (endPos >= len && slotCount > 0) {
                 JsonSlot[] sl = new JsonSlot[slotCount];
-                Array.Copy(sc.slots, sl, slotCount);
+                for (int i = 0; i < slotCount; i = i + 1) { sl[i] = sc.slots[i]; }
                 JsonPair[] pr = new JsonPair[pairCount];
-                Array.Copy(sc.pairs, pr, pairCount);
+                for (int i = 0; i < pairCount; i = i + 1) { pr[i] = sc.pairs[i]; }
                 d.slots = sl;
                 d.slotCount = slotCount;
                 d.pairs = pr;
@@ -225,7 +223,7 @@ public partial class JsonDoc {
                 d.root = 0;
                 return d;
             }
-        } else if (ret < 0 && ret != -2L && ret != -3L) {
+        } else if (ret < 0) {
             // 语法格式错误 -(位置+1)
             int errPos = (int)(-1 - ret);
             throw new JsonException("Malformed JSON at position " + Convert.ToString(errPos));
@@ -241,7 +239,7 @@ public partial class JsonDoc {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(-1 - pos));
         }
-        pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+        pos = JsonScan.SkipWhitespace((nint)buf, pos, len);
         if (pos < len) {
             throw new JsonException("Malformed JSON at position "
                 + Convert.ToString(pos));
@@ -261,10 +259,23 @@ public partial class JsonDoc {
         return d;
     }
 
-    // 纯 Zan 实现的 GB/s 级极速 Tape 状态机（单函数展开、零中间集合调用、直写扁平数组）
     public static long ParsePureFast(byte[] buf, int len, JsonSlot[] sl, int slotCap, JsonPair[] pr, int pairCap, int[] fr, long[] counts) {
+        long result = JsonDoc.ParseTape(buf, len, sl, slotCap, pr, pairCap, fr, counts);
+        return result > 0 ? -1L - result : result;
+    }
+
+    // 0 = success, 1 = escaped string, 2 = insufficient workspace.
+    // Syntax errors report -(position + 1), with counts published only on success.
+    private static long ParseTape(byte[] buf, int len, JsonSlot[] sl, int slotCap, JsonPair[] pr, int pairCap, int[] fr, long[] counts) {
+        if (buf == null || len < 0 || len > buf.Length || sl == null || pr == null
+            || slotCap < 0 || slotCap > sl.Length || pairCap < 0 || pairCap > pr.Length
+            || fr == null || counts == null || counts.Length < 3) {
+            throw new JsonException("Invalid JSON parse workspace");
+        }
         int slotCount = 0;
         int pairCount = 0;
+        nint input = (nint)buf;
+        int frameCapacity = fr.Length / 4;
         int maxd = JsonDoc.MaxDepth;
         int depth = 0;
         int pbase = -4;
@@ -273,22 +284,21 @@ public partial class JsonDoc {
 
         while (true) {
             if (pos < len && (buf[pos] & 255) <= 32) {
-                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+                pos = JsonScan.SkipWhitespace(input, pos, len);
             }
             if (pos >= len) { break; }
-            long x = NativeMemory.Load64(buf, pos);
-            int c = (int)(x & 255);
+            int c = buf[pos] & 255;
 
             if (wantKey) {
                 if (c != 34) { return (long)(-1 - pos); }
                 int p2 = pos + 1;
                 int start = p2;
-                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
-                if (res < 0) { return -2L; } // 遇到转义字符，回退至物化池
+                int res = JsonScan.StringEnd(input, p2, len);
+                if (res < 0) { return 1L; } // 遇到转义字符，回退至物化池
                 if (res >= len) { return (long)(-1 - len); }
                 int q = (int)res;
 
-                if (pairCount >= pairCap) { return -3L; }
+                if (pairCount >= pairCap) { return 2L; }
                 int pi = pairCount;
                 pairCount = pairCount + 1;
                 pr[pi].keyStart = start;
@@ -303,7 +313,7 @@ public partial class JsonDoc {
                 pos = q + 1;
 
                 if (pos < len && (buf[pos] & 255) <= 32) {
-                    pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+                    pos = JsonScan.SkipWhitespace(input, pos, len);
                 }
                 if (pos >= len || (buf[pos] & 255) != 58) { return (long)(-1 - pos); }
                 pos = pos + 1;
@@ -314,38 +324,32 @@ public partial class JsonDoc {
 
             if (depth > maxd && fr[pbase] == 4) { return (long)(-1 - pos); }
 
-            int vslot = -1;
+            if (slotCount >= slotCap) { return 2L; }
+            int vslot = slotCount;
+            slotCount = slotCount + 1;
             if (c == 34) {
                 int p2 = pos + 1;
                 int start = p2;
-                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
-                if (res < 0) { return -2L; }
+                int res = JsonScan.StringEnd(input, p2, len);
+                if (res < 0) { return 1L; }
                 if (res >= len) { return (long)(-1 - len); }
                 int q = (int)res;
 
-                if (slotCount >= slotCap) { return -3L; }
-                vslot = slotCount;
-                slotCount = slotCount + 1;
                 sl[vslot].a = 3L | ((long)start << 8);
                 sl[vslot].b = (long)(q - start);
                 pos = q + 1;
             } else if (c == 123) {
                 int pk = pos + 1;
                 if (pk < len && (buf[pk] & 255) <= 32) {
-                    pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pk, (long)len);
+                    pk = JsonScan.SkipWhitespace(input, pk, len);
                 }
                 if (pk < len && (buf[pk] & 255) == 125) {
-                    if (slotCount >= slotCap) { return -3L; }
-                    vslot = slotCount;
-                    slotCount = slotCount + 1;
                     sl[vslot].a = -251L;
                     sl[vslot].b = 1L << 31;
                     pos = pk + 1;
                 } else {
                     if (depth > maxd) { return (long)(-1 - pos); }
-                    if (slotCount >= slotCap) { return -3L; }
-                    vslot = slotCount;
-                    slotCount = slotCount + 1;
+                    if (depth >= frameCapacity) { return 2L; }
                     sl[vslot].a = 5L | ((long)pairCount << 8);
 
                     int fo = depth * 4;
@@ -362,20 +366,15 @@ public partial class JsonDoc {
             } else if (c == 91) {
                 int pk = pos + 1;
                 if (pk < len && (buf[pk] & 255) <= 32) {
-                    pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pk, (long)len);
+                    pk = JsonScan.SkipWhitespace(input, pk, len);
                 }
                 if (pk < len && (buf[pk] & 255) == 93) {
-                    if (slotCount >= slotCap) { return -3L; }
-                    vslot = slotCount;
-                    slotCount = slotCount + 1;
                     sl[vslot].a = 4L;
                     sl[vslot].b = 1L << 31;
                     pos = pk + 1;
                 } else {
                     if (depth > maxd) { return (long)(-1 - pos); }
-                    if (slotCount >= slotCap) { return -3L; }
-                    vslot = slotCount;
-                    slotCount = slotCount + 1;
+                    if (depth >= frameCapacity) { return 2L; }
                     sl[vslot].a = 4L;
 
                     int fa = depth * 4;
@@ -390,26 +389,17 @@ public partial class JsonDoc {
                     continue;
                 }
             } else if (c == 116) {
-                if ((int)x != 0x65757274) { return (long)(-1 - pos); }
-                if (slotCount >= slotCap) { return -3L; }
-                vslot = slotCount;
-                slotCount = slotCount + 1;
+                if (len - pos < 4 || buf[pos + 1] != 114 || buf[pos + 2] != 117 || buf[pos + 3] != 101) { return (long)(-1 - pos); }
                 sl[vslot].a = 1L;
                 sl[vslot].b = 0L;
                 pos = pos + 4;
             } else if (c == 102) {
-                if ((x & 0xFFFFFFFFFFL) != 0x65736C6166L) { return (long)(-1 - pos); }
-                if (slotCount >= slotCap) { return -3L; }
-                vslot = slotCount;
-                slotCount = slotCount + 1;
+                if (len - pos < 5 || buf[pos + 1] != 97 || buf[pos + 2] != 108 || buf[pos + 3] != 115 || buf[pos + 4] != 101) { return (long)(-1 - pos); }
                 sl[vslot].a = 6L;
                 sl[vslot].b = 0L;
                 pos = pos + 5;
             } else if (c == 110) {
-                if ((int)x != 0x6C6C756E) { return (long)(-1 - pos); }
-                if (slotCount >= slotCap) { return -3L; }
-                vslot = slotCount;
-                slotCount = slotCount + 1;
+                if (len - pos < 4 || buf[pos + 1] != 117 || buf[pos + 2] != 108 || buf[pos + 3] != 108) { return (long)(-1 - pos); }
                 sl[vslot].a = 0L;
                 sl[vslot].b = 0L;
                 pos = pos + 4;
@@ -422,7 +412,7 @@ public partial class JsonDoc {
                 while (ni < len) {
                     int d = (buf[ni] & 255) - 48;
                     if (d < 0 || d > 9) { break; }
-                    nacc = nacc * 10 + d;
+                    if (ndig < 18) { nacc = nacc * 10 + d; }
                     ndig = ndig + 1;
                     ni = ni + 1;
                 }
@@ -454,9 +444,6 @@ public partial class JsonDoc {
                     if (ned == 0) { nok = false; }
                 }
                 if (!nok) { return (long)(-1 - ni); }
-                if (slotCount >= slotCap) { return -3L; }
-                vslot = slotCount;
-                slotCount = slotCount + 1;
                 if (isInt && ndig <= 18) {
                     if (c == 45) { nacc = 0 - nacc; }
                     sl[vslot].a = 2L;
@@ -483,7 +470,7 @@ public partial class JsonDoc {
 
             while (true) {
                 if (pos < len && (buf[pos] & 255) <= 32) {
-                    pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
+                    pos = JsonScan.SkipWhitespace(input, pos, len);
                 }
                 if (pos >= len) { return (long)(-1 - pos); }
                 c = buf[pos] & 255;
@@ -534,20 +521,17 @@ public partial class JsonDoc {
         bool wantKey = false;  // 对象帧期待键（其余情况恒 false）
         int pos = 0;
         while (true) {
-            // 跳过空白：SIMD 向量化跳过，pad 保证 Load64 恒安全，EOF 时 c=0。
-            pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
-            long x = NativeMemory.Load64(buf, pos);
-            int c = (int)(x & 255);
+            pos = JsonScan.SkipWhitespace((nint)buf, pos, len);
+            if (pos >= len) { return -1 - pos; }
+            int c = buf[pos] & 255;
             if (wantKey) {
                 // ---- 对象键：'"' + SIMD 扫描 + ':' ----
                 if (c != 34) { return -1 - pos; }
                 pos = JsonDoc.ScanKey(sl, pr, pool, src, buf, len, pos,
                     pbase, fr);
                 if (pos < 0) { return pos; }
-                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
-                x = NativeMemory.Load64(buf, pos);
-                c = (int)(x & 255);
-                if (c != 58) { return -1 - pos; }
+                pos = JsonScan.SkipWhitespace((nint)buf, pos, len);
+                if (pos >= len || buf[pos] != 58) { return -1 - pos; }
                 pos = pos + 1;
                 wantKey = false;
                 continue;
@@ -561,7 +545,7 @@ public partial class JsonDoc {
                 // ---- 字符串值：SIMD 向量查找闭引号与转义符 ----
                 int p2 = pos + 1;
                 int start = p2;
-                long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
+                int res = JsonScan.StringEnd((nint)buf, p2, len);
                 if (res >= 0 && res < len) {
                     int q = (int)res;
                     JsonSlot ts = new JsonSlot();
@@ -586,10 +570,8 @@ public partial class JsonDoc {
                 }
             } else if (c == 123) {
                 // ---- '{'：先窥探空对象（免推栈快路径）----
-                int pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)(pos + 1), (long)len);
-                long px = NativeMemory.Load64(buf, pk);
-                int pc = (int)(px & 255);
-                if (pc == 125) {
+                int pk = JsonScan.SkipWhitespace((nint)buf, (pos + 1), len);
+                if (pk < len && buf[pk] == 125) {
                     // 空对象：首对下标 -1（链立即终止，避免串进之后
                     // 别的对象的键），b = 1<<31。
                     JsonSlot te = new JsonSlot();
@@ -618,10 +600,8 @@ public partial class JsonDoc {
                 }
             } else if (c == 91) {
                 // ---- '['：先窥探空数组（免推栈快路径）----
-                int pk = (int)NativeMemory.JsonSkipWhitespace(buf, (long)(pos + 1), (long)len);
-                long px = NativeMemory.Load64(buf, pk);
-                int pc = (int)(px & 255);
-                if (pc == 93) {
+                int pk = JsonScan.SkipWhitespace((nint)buf, (pos + 1), len);
+                if (pk < len && buf[pk] == 93) {
                     JsonSlot te2 = new JsonSlot();
                     te2.a = 4;
                     te2.b = (long)1 << 31;
@@ -645,17 +625,14 @@ public partial class JsonDoc {
                     continue;
                 }
             } else if (c == 116) {
-                // "true"：低 4 字节整字比较（pad 零保证 EOF 时不误配
-                // ——不足 4 字节的 token 高位是 0）。
-                if ((int)x != 0x65757274) { return -1 - pos; }
+                if (len - pos < 4 || buf[pos + 1] != 114 || buf[pos + 2] != 117 || buf[pos + 3] != 101) { return -1 - pos; }
                 JsonSlot tt = new JsonSlot();
                 tt.a = 1;
                 sl.Add(tt);
                 pos = pos + 4;
                 vslot = sl.Count - 1;
             } else if (c == 102) {
-                // "false"：低 5 字节。
-                if ((x & 0xFFFFFFFFFFL) != 0x65736C6166L) {
+                if (len - pos < 5 || buf[pos + 1] != 97 || buf[pos + 2] != 108 || buf[pos + 3] != 115 || buf[pos + 4] != 101) {
                     return -1 - pos;
                 }
                 JsonSlot tf = new JsonSlot();
@@ -664,72 +641,49 @@ public partial class JsonDoc {
                 pos = pos + 5;
                 vslot = sl.Count - 1;
             } else if (c == 110) {
-                // "null"：低 4 字节。
-                if ((int)x != 0x6C6C756E) { return -1 - pos; }
+                if (len - pos < 4 || buf[pos + 1] != 117 || buf[pos + 2] != 108 || buf[pos + 3] != 108) { return -1 - pos; }
                 JsonSlot tn = new JsonSlot();
                 tn.a = 0;
                 sl.Add(tn);
                 pos = pos + 4;
                 vslot = sl.Count - 1;
             } else {
-                // ---- 数字：内联裸读扫描（pad 兜越界，无逐字节检查
-                // 无调用）。语义与 ReadNumber 逐点一致：整数 ≤18 位
-                // 走 numI，其余 DoubleInRange。
                 int ns = pos;
                 int ni = pos;
                 if (c == 45) { ni = ni + 1; }
                 long nacc = 0;
                 int ndig = 0;
-                long x2 = NativeMemory.Load64(buf, ni);
-                int k2 = 0;
-                while (true) {
-                    int d = (int)((x2 >> (8 * k2)) & 255) - 48;
+                while (ni < len) {
+                    int d = (buf[ni] & 255) - 48;
                     if (d < 0 || d > 9) { break; }
-                    nacc = nacc * 10 + d;
+                    if (ndig < 18) { nacc = nacc * 10 + d; }
                     ndig = ndig + 1;
                     ni = ni + 1;
-                    k2 = k2 + 1;
-                    if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
                 }
-                int nc = (int)((x2 >> (8 * k2)) & 255);
                 bool nok = ndig >= 1;
                 bool nisInt = nok;
-                if (nok && nc == 46) {
+                if (nok && ni < len && (buf[ni] & 255) == 46) {
                     nisInt = false;
                     ni = ni + 1;
-                    k2 = k2 + 1;
-                    if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
                     int nfd = 0;
-                    while (true) {
-                        int d = (int)((x2 >> (8 * k2)) & 255) - 48;
+                    while (ni < len) {
+                        int d = (buf[ni] & 255) - 48;
                         if (d < 0 || d > 9) { break; }
                         nfd = nfd + 1;
                         ni = ni + 1;
-                        k2 = k2 + 1;
-                        if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
                     }
-                    nc = (int)((x2 >> (8 * k2)) & 255);
                     if (nfd == 0) { nok = false; }
                 }
-                if (nok && (nc == 101 || nc == 69)) {
+                if (nok && ni < len && ((buf[ni] & 255) == 101 || (buf[ni] & 255) == 69)) {
                     nisInt = false;
                     ni = ni + 1;
-                    k2 = k2 + 1;
-                    if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
-                    nc = (int)((x2 >> (8 * k2)) & 255);
-                    if (nc == 43 || nc == 45) {
-                        ni = ni + 1;
-                        k2 = k2 + 1;
-                        if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
-                    }
+                    if (ni < len && ((buf[ni] & 255) == 43 || (buf[ni] & 255) == 45)) { ni = ni + 1; }
                     int ned = 0;
-                    while (true) {
-                        int d = (int)((x2 >> (8 * k2)) & 255) - 48;
+                    while (ni < len) {
+                        int d = (buf[ni] & 255) - 48;
                         if (d < 0 || d > 9) { break; }
                         ned = ned + 1;
                         ni = ni + 1;
-                        k2 = k2 + 1;
-                        if (k2 == 8) { x2 = NativeMemory.Load64(buf, ni); k2 = 0; }
                     }
                     if (ned == 0) { nok = false; }
                 }
@@ -756,9 +710,9 @@ public partial class JsonDoc {
             }
             // ---- 分隔级联：逗号继续取值/键，收口逐层向上 ----
             while (true) {
-                pos = (int)NativeMemory.JsonSkipWhitespace(buf, (long)pos, (long)len);
-                x = NativeMemory.Load64(buf, pos);
-                c = (int)(x & 255);
+                pos = JsonScan.SkipWhitespace((nint)buf, pos, len);
+                if (pos >= len) { return -1 - pos; }
+                c = buf[pos] & 255;
                 if (c == 44) {
                     pos = pos + 1;
                     if (pos < len && (buf[pos] & 255) == 32) { pos = pos + 1; }
@@ -791,7 +745,7 @@ public partial class JsonDoc {
         int pbase, int[] fr) {
         int p2 = pos + 1;
         int start = p2;
-        long res = NativeMemory.JsonScanString(buf, (long)p2, (long)len);
+        int res = JsonScan.StringEnd((nint)buf, p2, len);
         int q = -1;
         int esc = -1;
         if (res >= 0 && res < len) {
@@ -871,9 +825,8 @@ public partial class JsonDoc {
                 }
                 pos = pos + 2;
             } else {
-                int run2 = (int)NativeMemory.FindNotAnyOf(buf, pos, "\"\\",
-                    len - pos);
-                int stop2 = run2 < 0 ? len : pos + run2;
+                int scan = JsonScan.StringEnd((nint)buf, pos, len);
+                int stop2 = scan < 0 ? -1 - scan : scan;
                 // stop2==pos 说明当前字节是 '\' 但已到末尾（pos+1==len），直接报错收口。
                 if (stop2 == pos) { return -1 - pos; }
                 sb.Append(src.Substring(pos, stop2 - pos));

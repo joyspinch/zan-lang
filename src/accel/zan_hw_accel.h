@@ -139,12 +139,6 @@ int64_t zan_hw_ffi_base64_capacity(int64_t len);
 int64_t zan_hw_ffi_base64_encode(uint64_t src, int64_t len, uint64_t dst);
 int64_t zan_hw_ffi_base64_decode(uint64_t dst, uint64_t src, int64_t len);
 
-int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len);
-int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len);
-int64_t zan_hw_json_parse_fast(const uint8_t *buf, int64_t len,
-                               void *slots, int64_t slot_cap,
-                               void *pairs, int64_t pair_cap,
-                               int64_t *out_counts);
 
 void zan_hw_pixel_blend_over(uint8_t *dst, const uint8_t *src, int64_t count);
 void zan_hw_pixel_swap_rb(uint8_t *dst, const uint8_t *src, int64_t count);

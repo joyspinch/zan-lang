@@ -28,7 +28,6 @@
 #include "hw/rt_hw_b64.c"
 
 /* 9. AVX2 向量化 JSON 扫描器与极速解析器 */
-#include "hw/rt_hw_json.c"
 
 /* 10. X25519 椭圆曲线与 RSA 大数模幂/CRT 运算 */
 #include "hw/rt_hw_asym.c"

@@ -196,7 +196,6 @@ python3 crt-transition/localize_syms.py "$OUT" \
   _zan_hw_rsa_mod_pow _zan_hw_rsa_crt \
   _zan_hw_x25519 _zan_hw_crc32c_update \
   _zan_hw_base64_encode _zan_hw_base64_decode \
-  _zan_hw_json_skip_whitespace _zan_hw_json_scan_string \
   _zan_hw_pixel_blend_over _zan_hw_pixel_swap_rb _zan_hw_pixel_fill_rect \
   _zan_hw_pixel_resample_bilinear_row \
   _zan_hw_aes_encrypt _zan_hw_aes_encrypt_last \
