@@ -277,8 +277,9 @@ static long long timer_add(long long ms, zan_timer_callback_t callback, int repe
         free(entry);
         return 0;
     }
+    long long id = entry->id;
     timer_unlock();
-    return entry->id;
+    return id;
 }
 
 long long zan_timer_tick(long long interval, zan_timer_callback_t callback) {
@@ -308,8 +309,9 @@ long long zan_timer_after_ctx(long long delay, zan_timer_ctx_callback_t callback
         free(entry);
         return 0;
     }
+    long long id = entry->id;
     timer_unlock();
-    return entry->id;
+    return id;
 }
 
 long long zan_timer_next_timeout(void) {

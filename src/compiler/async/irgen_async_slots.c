@@ -229,6 +229,14 @@ LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g) {
     zan_builder_restore(g, pt);
     return g->current_async_cancel_ptr;
 }
+
+LLVMValueRef emit_async_cancel_load(zan_irgen_t *g, LLVMValueRef ptr, const char *name) {
+    LLVMValueRef flag = LLVMBuildLoad2(g->builder, LLVMInt32TypeInContext(g->ctx), ptr, name);
+    LLVMSetAlignment(flag, 4);
+    LLVMSetOrdering(flag, LLVMAtomicOrderingAcquire);
+    return flag;
+}
+
 LLVMValueRef get_async_self_int(zan_irgen_t *g, LLVMTypeRef ptr_int_ty) {
     if (g->current_async_self_int) return g->current_async_self_int;
     LLVMValueRef self_i8 = get_async_self_i8(g);
@@ -325,7 +333,7 @@ void emit_async_cancel_check(zan_irgen_t *g, local_scope_t *locals) {
     if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) return;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
-    LLVMValueRef flag = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "cancelled");
+    LLVMValueRef flag = emit_async_cancel_load(g, cancel_ptr, "cancelled");
     LLVMBasicBlockRef shared_can = get_async_cancel_bb(g, locals);
     LLVMBasicBlockRef can_bb = shared_can ? shared_can
         : LLVMAppendBasicBlockInContext(g->ctx, g->current_async_resume_fn, "co.cancelled");

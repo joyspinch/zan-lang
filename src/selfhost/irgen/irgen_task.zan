@@ -478,12 +478,40 @@ partial class Irgen {
         string r = NT(); L("  " + r + " = zext i32 " + dn + " to i64");
         return r;
     }
+    void TaskJoinDiscard(string entry) {
+        if (!ExternSeen("zjoin_discard")) {
+            externDecls.Add("zjoin_discard");
+            H("declare i8* @zan_join_exc(i64, i8**, i32*)");
+            H("define internal void @zjoin_discard(i64 %entry) {");
+            H("  %owned = alloca i32");
+            H("  store i32 0, i32* %owned");
+            H("  %exc = call i8* @zan_join_exc(i64 %entry, i8** null, i32* %owned)");
+            H("  call void @zan_join_cancel(i64 %entry)");
+            H("  %flag = load i32, i32* %owned");
+            H("  %has_owner = icmp ne i32 %flag, 0");
+            H("  %value = select i1 %has_owner, i8* %exc, i8* null");
+            H("  call void @zref_release(i8* %value)");
+            H("  ret void");
+            H("}");
+        }
+        L("  call void @zjoin_discard(i64 " + entry + ")");
+    }
+    string TaskCancelAddress(string header) {
+        string cancel = NT();
+        L("  " + cancel + " = bitcast i64* " + FrameGep(header, 10) + " to i32*");
+        return cancel;
+    }
+    string TaskCancelValue(string header) {
+        string address = TaskCancelAddress(header);
+        string flag = NT();
+        L("  " + flag + " = load atomic i32, i32* " + address + " acquire, align 4");
+        return flag;
+    }
     void TaskFrameConfig(string frame) {
         string header = TaskFrameHeader(frame);
         string done = NT();
         L("  " + done + " = bitcast i64* " + FrameGep(header, 3) + " to i32*");
-        string cancel = NT();
-        L("  " + cancel + " = bitcast i64* " + FrameGep(header, 10) + " to i32*");
+        string cancel = TaskCancelAddress(header);
         L("  call void @zan_task_frame_config(i8* " + frame + ", i32* " + done + ", i32* " + cancel + ")");
     }
     string TaskRegister(string frame) {
@@ -643,8 +671,8 @@ partial class Irgen {
         int lCatch = NL(); int lCheck = NL();
         L("  br i1 " + exceptional + ", label %L" + lCatch + ", label %L" + lCheck);
         Label(lCheck);
-        string cancel = NT(); L("  " + cancel + " = load i64, i64* " + FrameGep(fph, 10));
-        string cancelled = NT(); L("  " + cancelled + " = icmp ne i64 " + cancel + ", 0");
+        string cancel = TaskCancelValue(fph);
+        string cancelled = NT(); L("  " + cancelled + " = icmp ne i32 " + cancel + ", 0");
         int lRun = NL(); int lFin = NL();
         L("  br i1 " + cancelled + ", label %L" + lFin + ", label %L" + lRun);
         Label(lRun);

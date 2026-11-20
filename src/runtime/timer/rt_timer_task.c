@@ -7,58 +7,129 @@
 #include <string.h>
 #include <limits.h>
 
-typedef struct {
+typedef struct zan_task_entry zan_task_entry;
+struct zan_task_entry {
     uint64_t generation;
     void *frame;
     const volatile int *done;
     volatile int *cancel;
-    void *child;
+    zan_task_entry *child;
+    zan_task_entry *parents;
+    zan_task_entry *parent_next;
+    zan_task_entry **parent_link;
+    zan_task_entry *frame_next;
+    zan_task_entry *token_next;
     size_t pins;
     void (*retire)(void *);
     void (*allocator_release)(void *);
     void (*discard)(void *);
-} zan_task_entry;
-static zan_task_entry *g_task_entries;
+};
+typedef struct {
+    zan_task_entry *frames;
+    zan_task_entry *tokens;
+} zan_task_bucket;
+static zan_task_bucket *g_task_buckets;
+static zan_task_entry *g_task_free;
 static size_t g_task_capacity;
+static size_t g_task_count;
 static uint64_t g_task_generation;
 static volatile int g_task_lock;
 static void task_lock(void) {
     while (__atomic_exchange_n(&g_task_lock, 1, __ATOMIC_ACQUIRE)) { }
 }
 static void task_unlock(void) { __atomic_store_n(&g_task_lock, 0, __ATOMIC_RELEASE); }
+static size_t task_bucket(uint64_t key, size_t capacity) {
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    return (size_t)key & (capacity - 1);
+}
 static zan_task_entry *task_find(uint64_t generation) {
-    if (!generation) return NULL;
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].generation == generation && g_task_entries[i].frame)
-            return &g_task_entries[i];
+    if (!generation || !g_task_capacity) return NULL;
+    for (zan_task_entry *entry = g_task_buckets[task_bucket(generation, g_task_capacity)].tokens;
+         entry; entry = entry->token_next)
+        if (entry->generation == generation) return entry;
     return NULL;
 }
 static zan_task_entry *task_frame(void *frame) {
-    if (!frame) return NULL;
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].frame == frame) return &g_task_entries[i];
+    if (!frame || !g_task_capacity) return NULL;
+    for (zan_task_entry *entry = g_task_buckets[task_bucket((uintptr_t)frame, g_task_capacity)].frames;
+         entry; entry = entry->frame_next)
+        if (entry->frame == frame) return entry;
     return NULL;
+}
+static void task_index_frame(zan_task_entry *entry) {
+    zan_task_bucket *bucket = &g_task_buckets[task_bucket((uintptr_t)entry->frame, g_task_capacity)];
+    entry->frame_next = bucket->frames;
+    bucket->frames = entry;
+}
+static void task_index_token(zan_task_entry *entry) {
+    zan_task_bucket *bucket = &g_task_buckets[task_bucket(entry->generation, g_task_capacity)];
+    entry->token_next = bucket->tokens;
+    bucket->tokens = entry;
+}
+static void task_forget_token(zan_task_entry *entry) {
+    if (!entry->generation) return;
+    zan_task_entry **link = &g_task_buckets[task_bucket(entry->generation, g_task_capacity)].tokens;
+    while (*link != entry) link = &(*link)->token_next;
+    *link = entry->token_next;
+    entry->token_next = NULL;
+    entry->generation = 0;
+}
+static void task_grow(void) {
+    size_t old_capacity = g_task_capacity;
+    size_t capacity = old_capacity ? old_capacity * 2 : 16;
+    if (capacity < old_capacity || capacity > SIZE_MAX / sizeof(zan_task_entry)) abort();
+    zan_task_entry *entries = (zan_task_entry *)calloc(capacity - old_capacity, sizeof(*entries));
+    zan_task_bucket *buckets = (zan_task_bucket *)calloc(capacity, sizeof(*buckets));
+    if (!entries || !buckets) abort();
+
+    zan_task_bucket *old_buckets = g_task_buckets;
+    g_task_buckets = buckets;
+    g_task_capacity = capacity;
+    for (size_t i = 0; i < old_capacity; ++i) {
+        zan_task_entry *entry = old_buckets[i].frames;
+        while (entry) {
+            zan_task_entry *next = entry->frame_next;
+            task_index_frame(entry);
+            if (entry->generation) task_index_token(entry);
+            entry = next;
+        }
+    }
+    free(old_buckets);
+    /* Blocks stay at stable addresses for await edges and the free list. */
+    for (size_t i = 0; i < capacity - old_capacity; ++i) {
+        entries[i].frame_next = g_task_free;
+        g_task_free = &entries[i];
+    }
 }
 static zan_task_entry *task_slot(void *frame) {
     zan_task_entry *entry = task_frame(frame);
     if (entry) return entry;
-    size_t i;
-    for (i = 0; i < g_task_capacity; ++i)
-        if (!g_task_entries[i].frame) break;
-    if (i == g_task_capacity) {
-        size_t next = g_task_capacity ? g_task_capacity * 2 : 16;
-        if (next < g_task_capacity || next > SIZE_MAX / sizeof(zan_task_entry)) abort();
-        zan_task_entry *entries = (zan_task_entry *)realloc(g_task_entries,
-            next * sizeof(zan_task_entry));
-        if (!entries) abort();
-        memset(entries + g_task_capacity, 0,
-            (next - g_task_capacity) * sizeof(zan_task_entry));
-        g_task_entries = entries;
-        g_task_capacity = next;
-    }
-    entry = &g_task_entries[i];
+    if (!g_task_free) task_grow();
+    entry = g_task_free;
+    g_task_free = entry->frame_next;
     entry->frame = frame;
+    task_index_frame(entry);
+    ++g_task_count;
     return entry;
+}
+static void task_recycle(zan_task_entry *entry) {
+    zan_task_entry **link = &g_task_buckets[task_bucket((uintptr_t)entry->frame, g_task_capacity)].frames;
+    while (*link != entry) link = &(*link)->frame_next;
+    *link = entry->frame_next;
+    memset(entry, 0, sizeof(*entry));
+    entry->frame_next = g_task_free;
+    g_task_free = entry;
+    --g_task_count;
+}
+static void task_unlink_child(zan_task_entry *parent) {
+    if (!parent->child) return;
+    *parent->parent_link = parent->parent_next;
+    if (parent->parent_next) parent->parent_next->parent_link = parent->parent_link;
+    parent->child = NULL;
+    parent->parent_next = NULL;
+    parent->parent_link = NULL;
 }
 /* Called before publication. Addresses are supplied by the compiler rather
  * than inferred from a driver-specific frame layout. NULL leaves a field alone. */
@@ -110,6 +181,7 @@ uint64_t zan_task_register(void *frame, const volatile int *done) {
     zan_task_entry *entry = task_slot(frame);
     if (entry->generation || entry->retire) { task_unlock(); abort(); }
     entry->generation = ++g_task_generation;
+    task_index_token(entry);
     entry->done = done;
     uint64_t token = entry->generation;
     task_unlock();
@@ -130,7 +202,7 @@ void *zan_task_acquire(uint64_t token, int consume) {
     if (entry && !entry->retire) {
         ++entry->pins;
         frame = entry->frame;
-        if (consume) entry->generation = 0;
+        if (consume) task_forget_token(entry);
     }
     task_unlock();
     return frame;
@@ -144,18 +216,18 @@ void zan_task_unpin(void *frame) {
     --entry->pins;
     if (!entry->pins && entry->retire) {
         retire = entry->retire;
-        memset(entry, 0, sizeof(*entry));
+        task_recycle(entry);
     }
     task_unlock();
     if (retire) retire(frame);
 }
 static void task_cancel_chain(zan_task_entry *entry) {
-    /* A malformed cycle must not hang cancellation. Valid await edges form
-     * a tree, and every node visited is live under the same retirement lock. */
-    size_t remaining = g_task_capacity;
+    /* Bound traversal even if a malformed await chain contains a cycle.
+     * Every entry remains live under the retirement lock. */
+    size_t remaining = g_task_count;
     while (entry && !entry->retire && remaining--) {
         if (entry->cancel) __atomic_store_n(entry->cancel, 1, __ATOMIC_RELEASE);
-        entry = task_frame(entry->child);
+        entry = entry->child;
     }
 }
 void zan_task_cancel(uint64_t token) {
@@ -175,7 +247,14 @@ void zan_task_child(void *parent, void *child) {
     if (!p || p->retire || (child && (!c || c->retire))) {
         task_unlock(); abort();
     }
-    p->child = child;
+    task_unlink_child(p);
+    if (c) {
+        p->child = c;
+        p->parent_next = c->parents;
+        p->parent_link = &c->parents;
+        if (c->parents) c->parents->parent_link = &p->parent_next;
+        c->parents = p;
+    }
     if (p->cancel && __atomic_load_n(p->cancel, __ATOMIC_ACQUIRE))
         task_cancel_chain(c);
     task_unlock();
@@ -186,25 +265,22 @@ void zan_task_retire(void *frame, void (*release)(void *)) {
     if (!frame) return;
     int deferred = 0;
     task_lock();
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].child == frame) g_task_entries[i].child = NULL;
     zan_task_entry *entry = task_frame(frame);
     if (entry) {
-        entry->generation = 0;
-        entry->child = NULL;
         if (entry->retire) { task_unlock(); return; }
+        while (entry->parents) task_unlink_child(entry->parents);
+        task_unlink_child(entry);
+        task_forget_token(entry);
         if (entry->allocator_release) release = entry->allocator_release;
         if (entry->pins) { entry->retire = release; deferred = 1; }
-        else memset(entry, 0, sizeof(*entry));
+        else task_recycle(entry);
     }
     task_unlock();
     if (!deferred) release(frame);
 }
 size_t zan_task_live_count(void) {
-    size_t count = 0;
     task_lock();
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].frame) ++count;
+    size_t count = g_task_count;
     task_unlock();
     return count;
 }

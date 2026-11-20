@@ -326,17 +326,17 @@
             return bound;
         }
 
-        /* Task */
-        if (is_call_to(expr, "Task", "JoinCancel") && expr->call.args.count == 1) {
+        if (expr->call.args.count == 1 &&
+            (is_call_to(expr, "Task", "JoinCancel") || is_call_to(expr, "Task", "JoinWaitOwned"))) {
+            /* A synchronous JoinWaitOwned consumes the entry and requests polling. */
             LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
-            LLVMTypeRef dvoid = LLVMVoidTypeInContext(g->ctx);
-            LLVMValueRef a0 = emit_expr(g, expr->call.args.items[0], locals);
-            if (LLVMTypeOf(a0) != di64) a0 = LLVMBuildIntCast2(g->builder, a0, di64, 1, "join64");
-            LLVMTypeRef jc_type = LLVMFunctionType(dvoid, (LLVMTypeRef[]){ di64 }, 1, 0);
-            LLVMValueRef jc = LLVMGetNamedFunction(g->mod, "zan_join_cancel");
-            if (!jc) jc = LLVMAddFunction(g->mod, "zan_join_cancel", jc_type);
-            zan_call2(g->builder, jc_type, jc, (LLVMValueRef[]){ a0 }, 1, "");
-            return LLVMConstInt(di64, 0, 0);
+            LLVMValueRef entry = emit_expr(g, expr->call.args.items[0], locals);
+            if (LLVMTypeOf(entry) != di64)
+                entry = LLVMBuildIntCast2(g->builder, entry, di64, 1, "join64");
+            emit_join_discard(g, entry);
+            bool wait = is_call_to(expr, "Task", "JoinWaitOwned");
+            return wait ? LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 2, 0)
+                        : LLVMConstInt(di64, 0, 0);
         }
 
         /* Task */
@@ -344,10 +344,7 @@
             expr->call.args.count == 0) {
             LLVMTypeRef ci32 = LLVMInt32TypeInContext(g->ctx);
             if (!g->current_async_frame) return LLVMConstInt(ci32, 0, 0);
-            return LLVMBuildLoad2(g->builder, ci32,
-                LLVMBuildStructGEP2(g->builder, g->current_async_frame_type,
-                    g->current_async_frame, ASYNC_FRAME_CANCEL, "fr.cancel.p"),
-                "cancel.req");
+            return emit_async_cancel_load(g, get_async_cancel_ptr(g), "cancel.req");
         }
 
         /* StringBuilder */

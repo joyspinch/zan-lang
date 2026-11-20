@@ -159,6 +159,41 @@ static void typed_discard(void) {
     assert(zan_task_acquire(token, 0) == NULL);
     assert(discarded == 1 && zan_task_slot_capacity() == 16);
 }
+static void keep_frame(void *frame) {
+    test_frame *child = (test_frame *)frame;
+    child->cancel = 0;
+}
+static void registry_growth(void) {
+    enum { frame_count = 1024 };
+    test_frame *frames[frame_count];
+    uint64_t tokens[frame_count];
+    test_frame *child = make_frame(-1);
+    zan_task_frame_config(child, &child->done, &child->cancel);
+    for (int i = 0; i < frame_count; ++i) {
+        frames[i] = make_frame(i);
+        zan_task_frame_config(frames[i], &frames[i]->done, &frames[i]->cancel);
+        tokens[i] = zan_task_register(frames[i], &frames[i]->done);
+        zan_task_child(frames[i], child);
+    }
+    assert(zan_task_live_count() == frame_count + 1);
+    for (int i = 0; i < frame_count; ++i) {
+        assert(zan_task_acquire(tokens[i], 0) == frames[i]);
+        zan_task_unpin(frames[i]);
+    }
+    zan_task_cancel(tokens[0]);
+    assert(child->cancel == 1);
+    /* Reuse both the raw frame address and the registry slot. */
+    zan_task_retire(child, keep_frame);
+    zan_task_frame_config(child, &child->done, &child->cancel);
+    for (int i = frame_count - 1; i >= 0; --i) {
+        zan_task_cancel(tokens[i]);
+        zan_task_retire(frames[i], release_frame);
+        assert(zan_task_acquire(tokens[i], 0) == NULL);
+    }
+    assert(child->cancel == 0);
+    zan_task_retire(child, release_frame);
+    assert(zan_task_live_count() == 0);
+}
 int main(void) {
     test_frame *frame = make_frame(7);
     uint64_t first = zan_task_register(frame, &frame->done);
@@ -192,6 +227,7 @@ int main(void) {
     concurrent_queries();
     typed_discard();
     allocator_provenance();
-    puts("task registry: lifetime, consume, stale generations, bounded slots, four query threads, typed discard, allocator provenance passed");
+    registry_growth();
+    puts("task registry: lifetime, consume, stale generations, bounded slots, four query threads, typed discard, allocator provenance, index growth passed");
     return 0;
 }

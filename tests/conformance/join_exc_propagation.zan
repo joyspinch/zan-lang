@@ -18,6 +18,9 @@ class Job {
 }
 
 class Program {
+    static WeakReference<Exception> failureWatch;
+    static bool cancelledWaitReturned;
+
     static void Check(bool condition, string message) {
         if (!condition) { throw new Exception(message); }
     }
@@ -42,6 +45,58 @@ class Program {
         return 0;
     }
 
+    static async int FailWhenSignalled(Gate finish) {
+        await finish.Wait();
+        Exception failure = new Exception("boom gated");
+        failureWatch = new WeakReference<Exception>(failure);
+        throw failure;
+    }
+
+    static async void CancelledWait(long failure, Gate bound) {
+        long entry = Task.JoinNew(1, 0);
+        Check(Task.JoinBind(entry, failure, 0) == 1, "failure was already complete");
+        bound.Signal();
+        await Task.JoinWaitOwned(entry);
+        cancelledWaitReturned = true;
+    }
+
+    static async void CancelProbe() {
+        Gate finish = new Gate();
+        Gate bound = new Gate();
+        long failure = Task.Run(FailWhenSignalled(finish));
+        Task waiter = Task.Run(CancelledWait(failure, bound));
+        await bound.Wait();
+        Task.Cancel(waiter);
+        finish.Signal();
+        while (Task.IsDone(waiter) == 0) { await Task.Yield(); }
+        Task.Release(failure);
+        Task.Release(waiter);
+        Check(!cancelledWaitReturned, "cancelled join returned a result");
+        Check(!failureWatch.IsAlive, "cancelled join retained its exception");
+        bound.Close();
+        finish.Close();
+    }
+
+    static async void AnyProbe() {
+        Gate finish = new Gate();
+        long failure = Task.Run(FailWhenSignalled(finish));
+        List<long> handles = new List<long>();
+        handles.Add(failure);
+        finish.Signal();
+        // A retained, already-completed child gives WhenAny its immediate path.
+        while (Task.IsDone(failure) == 0) { await Task.Yield(); }
+        try {
+            await Task.WhenAny(handles);
+            throw new Exception("WhenAny swallowed its child exception");
+        } catch (Exception e) {
+            Check(e.Message == "boom gated", "WhenAny exc message");
+        } finally {
+            Task.Release(failure);
+            finish.Close();
+        }
+        Check(!failureWatch.IsAlive, "failed join retained its exception");
+    }
+
     static async int Main() {
         try {
             int rc = await ReflectedProbe();
@@ -60,6 +115,10 @@ class Program {
             Check(e.Message == "boom spawn", "spawn exc message");
             Console.WriteLine("spawn propagated");
         }
+        await AnyProbe();
+        Console.WriteLine("whenany propagated");
+        await CancelProbe();
+        Console.WriteLine("cancelled join released");
         Console.WriteLine("join exc propagation passed");
         return 0;
     }

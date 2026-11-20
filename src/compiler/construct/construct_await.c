@@ -580,6 +580,43 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return false;
 }
+
+static LLVMValueRef emit_join_take_exception(zan_irgen_t *g, LLVMValueRef entry,
+        LLVMValueRef tid_slot, LLVMValueRef owned_slot) {
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef args[] = { entry, tid_slot, owned_slot };
+    return emit_task_runtime_call(g, "zan_join_exc", i8ptr, args, 3);
+}
+
+static void emit_join_free(zan_irgen_t *g, LLVMValueRef entry) {
+    emit_task_runtime_call(g, "zan_join_cancel", LLVMVoidTypeInContext(g->ctx), &entry, 1);
+}
+
+static void emit_join_release_exception(zan_irgen_t *g, LLVMValueRef exc,
+        LLVMValueRef tid_slot, LLVMValueRef owned_slot) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef ptr = LLVMTypeOf(exc);
+    LLVMValueRef owned = LLVMBuildLoad2(g->builder, i32, owned_slot, "join.exc.owned");
+    LLVMValueRef value = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, owned, LLVMConstNull(i32), "join.owns.exc"),
+        exc, LLVMConstNull(ptr), "join.drop.exc");
+    /* Match task reaping: a null type ID denotes a string exception. */
+    LLVMValueRef tid = LLVMBuildLoad2(g->builder, ptr, tid_slot, "join.exc.tid");
+    LLVMValueRef release = LLVMBuildSelect(g->builder,
+        zan_icmp(g->builder, LLVMIntNE, tid, LLVMConstNull(ptr), "join.exc.isobject"),
+        g->rt_release_dyn, g->rt_str_release, "join.exc.release");
+    zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_release_dyn), release, &value, 1, "");
+}
+
+void emit_join_discard(zan_irgen_t *g, LLVMValueRef entry) {
+    LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef tid_slot = emit_entry_alloca(g, ptr, "join.xtid");
+    LLVMValueRef owned_slot = emit_entry_alloca(g, LLVMInt32TypeInContext(g->ctx), "join.xown");
+    LLVMValueRef exc = emit_join_take_exception(g, entry, tid_slot, owned_slot);
+    emit_join_free(g, entry);
+    emit_join_release_exception(g, exc, tid_slot, owned_slot);
+}
+
 LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         zan_type_t *public_task = infer_expr_type(g, expr->await_expr.expr, locals);
@@ -740,9 +777,12 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(di64, 0, 0);
         }
 
-        /* await Task.JoinWait(entry): 事件驱动汇合挂起 */
-        if (is_call_to(expr->await_expr.expr, "Task", "JoinWait") &&
+        /* Task.JoinWait borrows the entry. JoinWaitOwned consumes it. */
+        bool owned_join = is_call_to(expr->await_expr.expr, "Task", "JoinWaitOwned");
+        if ((owned_join || is_call_to(expr->await_expr.expr, "Task", "JoinWait")) &&
             expr->await_expr.expr->call.args.count == 1) {
+            if (owned_join && !g->current_async_frame)
+                return emit_expr(g, expr->await_expr.expr, locals);
             LLVMTypeRef di64 = LLVMInt64TypeInContext(g->ctx);
             LLVMTypeRef di32 = LLVMInt32TypeInContext(g->ctx);
             LLVMTypeRef di8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -764,42 +804,69 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     get_async_result_ptr(g));
                 LLVMValueRef must_suspend = zan_icmp(g->builder, LLVMIntEQ, r,
                     LLVMConstInt(di32, 0, 0), "join.susp");
-                /* entry 值不跨 suspend 存活（resume 端支配关系断了）：
-                 * 存进帧 SUB 槽（与 direct await 同一复用纪律），resume 端取回。 */
+                /* Carry the entry through suspension in the frame's scratch slot. */
+                LLVMValueRef slot = get_async_sub_slot_ptr(g);
                 LLVMBuildStore(g->builder,
-                    LLVMBuildIntToPtr(g->builder, entry, di8ptr, "join.entry.p"),
-                    get_async_sub_slot_ptr(g));
-                LLVMValueRef fn = g->current_fn;
+                    LLVMBuildIntToPtr(g->builder, entry, di8ptr, "join.entry.p"), slot);
+                LLVMValueRef fn = g->current_async_resume_fn;
+                LLVMValueRef state = LLVMConstInt(di32, (unsigned)k, 0);
                 LLVMBasicBlockRef susp_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "join.park");
-                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
-                    g->current_async_resume_fn, "co.resume");
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx, fn, "co.resume");
+                LLVMValueRef immediate_cancelled = NULL;
+                if (owned_join) {
+                    LLVMValueRef flag = emit_async_cancel_load(g, get_async_cancel_ptr(g),
+                                                               "join.cancel.flag");
+                    immediate_cancelled = zan_icmp(g->builder, LLVMIntNE, flag,
+                                                    LLVMConstNull(di32), "join.cancel.requested");
+                }
+                LLVMBasicBlockRef immediate = LLVMGetInsertBlock(g->builder);
                 LLVMBuildCondBr(g->builder, must_suspend, susp_bb, rk);
                 LLVMPositionBuilderAtEnd(g->builder, susp_bb);
                 di_set_loc(g, expr->loc);
-                zan_store_fit(g, LLVMConstInt(di32, (unsigned)k, 0), get_async_state_ptr(g));
+                zan_store_fit(g, state, get_async_state_ptr(g));
                 LLVMBuildBr(g->builder, get_async_suspend_ret_bb(g));
-                LLVMAddCase(g->current_async_switch, LLVMConstInt(di32, (unsigned)k, 0), rk);
+                LLVMAddCase(g->current_async_switch, state, rk);
+
+                LLVMValueRef cancel_switch = g->current_async_cancel_switch;
+                if (owned_join) LLVMAddCase(cancel_switch, state, rk);
                 LLVMPositionBuilderAtEnd(g->builder, rk);
                 di_set_loc(g, expr->loc);
+                LLVMValueRef cancelled = NULL;
+                if (owned_join) {
+                    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+                    cancelled = LLVMBuildPhi(g->builder, i1, "join.cancelled");
+                    LLVMValueRef values[] = {
+                        immediate_cancelled, LLVMConstInt(i1, 0, 0), LLVMConstInt(i1, 1, 0)
+                    };
+                    LLVMBasicBlockRef blocks[] = { immediate,
+                        LLVMGetInstructionParent(g->current_async_switch),
+                        LLVMGetInstructionParent(cancel_switch) };
+                    LLVMAddIncoming(cancelled, values, blocks, 3);
+                }
                 LLVMValueRef entry_r = LLVMBuildPtrToInt(g->builder,
-                    LLVMBuildLoad2(g->builder, di8ptr, get_async_sub_slot_ptr(g),
-                                   "join.entry.rl"),
+                    LLVMBuildLoad2(g->builder, di8ptr, slot, "join.entry.rl"),
                     di64, "join.entry.back");
+                LLVMBuildStore(g->builder, LLVMConstNull(di8ptr), slot);
                 /* M2：joiner 唤醒后若 join 快照持有失败子任务的异常对象
                  * （任务结束锁内已从子帧转移所有权），转入 EH 全局并沿
                  * await 链重抛——控制器动作等反射派发的异常因此可达
                  * WebApp 错误处理。 */
                 {
-                    LLVMTypeRef jx_type = LLVMFunctionType(di8ptr,
-                        (LLVMTypeRef[]){ di64,
-                                         LLVMPointerType(di8ptr, 0),
-                                         LLVMPointerType(di32, 0) }, 3, 0);
-                    LLVMValueRef jx = LLVMGetNamedFunction(g->mod, "zan_join_exc");
-                    if (!jx) jx = LLVMAddFunction(g->mod, "zan_join_exc", jx_type);
-                    LLVMValueRef tid_p = LLVMBuildAlloca(g->builder, di8ptr, "join.xtid");
-                    LLVMValueRef own_p = LLVMBuildAlloca(g->builder, di32, "join.xown");
-                    LLVMValueRef jexc = zan_call2(g->builder, jx_type, jx,
-                        (LLVMValueRef[]){ entry_r, tid_p, own_p }, 3, "join.exc");
+                    LLVMValueRef tid_p = emit_entry_alloca(g, di8ptr, "join.xtid");
+                    LLVMValueRef own_p = emit_entry_alloca(g, di32, "join.xown");
+                    LLVMValueRef jexc = emit_join_take_exception(g, entry_r, tid_p, own_p);
+                    if (owned_join) {
+                        emit_join_free(g, entry_r);
+                        LLVMBasicBlockRef discard = LLVMAppendBasicBlockInContext(g->ctx,
+                            fn, "join.discard");
+                        LLVMBasicBlockRef propagate = LLVMAppendBasicBlockInContext(g->ctx,
+                            fn, "join.propagate");
+                        LLVMBuildCondBr(g->builder, cancelled, discard, propagate);
+                        LLVMPositionBuilderAtEnd(g->builder, discard);
+                        emit_join_release_exception(g, jexc, tid_p, own_p);
+                        LLVMBuildBr(g->builder, LLVMGetSwitchDefaultDest(cancel_switch));
+                        LLVMPositionBuilderAtEnd(g->builder, propagate);
+                    }
                     LLVMValueRef top_g, bufs_g, exc_g;
                     get_eh_globals(g, &top_g, &bufs_g, &exc_g);
                     LLVMBasicBlockRef jthr = LLVMAppendBasicBlockInContext(g->ctx,
@@ -818,9 +885,7 @@ LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMBuildStore(g->builder,
                         LLVMBuildLoad2(g->builder, di32, own_p, "join.xown.v"),
                         get_eh_exc_owned_global(g));
-                    emit_raise_exception(g);
-                    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
-                        LLVMBuildUnreachable(g->builder);
+                    emit_raise_exception_through_cleanups(g);
                     LLVMPositionBuilderAtEnd(g->builder, jok);
                 }
                 return LLVMBuildLoad2(g->builder, di64, get_async_result_ptr(g), "join.r2");

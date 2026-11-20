@@ -78,6 +78,46 @@ static void run_case(int count, int close_waiter) {
     drain(count);
     for (int i = 0; i < count; i++) { close(pairs[i][0]); close(pairs[i][1]); }
 }
+static void run_stale_read(void) {
+    int pair[2];
+    char buffers[4] = {0};
+    int64_t output[4] = {-2, -2, -2, -2};
+    zan_co_fhdr frames[4] = {0};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) abort();
+    int fd = pair[0];
+    zan_io_shard_t *sh = io_shard_of_fd(fd);
+    CHECK(zan_io_set_nonblocking(fd) == 0);
+    zan_io_recv_co(fd, &buffers[0], 1, &frames[0], resume, &output[0]);
+    zan_io_recv_to_co(fd, &buffers[1], 1, 60000, &frames[1], resume, &output[1]);
+    zan_io_recv_to_co(fd, &buffers[2], 1, 60000, &frames[2], resume, &output[2]);
+    zan_io_recv_co(fd, &buffers[3], 1, &frames[3], resume, &output[3]);
+    int64_t deadline = sh->rto ? sh->rto->due_ms : -1;
+
+    /* One byte satisfies only the first waiter in this readiness batch. */
+    CHECK(write(pair[1], "x", 1) == 1);
+    CHECK(zan_io_poll(0) == 1);
+    CHECK(output[0] == 1 && buffers[0] == 'x');
+    CHECK(output[1] == -2 && output[2] == -2 && output[3] == -2);
+    CHECK(g_io_count == 3 && co_cnt_outstanding() == 1);
+    CHECK(sh->rto && sh->rto->next && sh->rto->next->frame == &frames[1]);
+
+    CHECK(write(pair[1], "y", 1) == 1);
+    CHECK(zan_io_poll(0) == 1);
+    CHECK(output[1] == 1 && buffers[1] == 'y' && output[2] == -2);
+    CHECK(g_io_count == 2 && co_cnt_outstanding() == 2);
+    CHECK(sh->rto && sh->rto->frame == &frames[2] && sh->rto->due_ms == deadline);
+    if (sh->rto) sh->rto->due_ms = dns_now_ms();
+    CHECK(zan_io_poll(0) == 1);
+    CHECK(output[2] == -1 && output[3] == -2 && sh->rto == NULL);
+
+    CHECK(shutdown(pair[1], SHUT_WR) == 0);
+    CHECK(zan_io_poll(0) == 1);
+    CHECK(output[3] == 0 && g_io_count == 0);
+    zan_io_close_notify(fd);
+    drain(4);
+    close(fd);
+    close(pair[1]);
+}
 static void run_failed_registration(void) {
     zan_co_fhdr frame = {0};
     int fd = open("/dev/null", O_RDONLY);
@@ -105,6 +145,8 @@ int main(void) {
     run_case(4, 1);
     run_failed_registration();
     CHECK(observations >= 8 && resumed == 10);
+    run_stale_read();
+    CHECK(resumed == 14);
     run_owner_checks();
     run_co_sched_checks();
     run_join_checks();

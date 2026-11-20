@@ -336,6 +336,7 @@ static const zan_builtin_member_t members_task[] = {
     { "JoinNew",   'M', "long JoinNew(int npairs, int any)" },
     { "JoinBind",  'M', "int JoinBind(long entry, long handle, int idx)" },
     { "JoinWait",  'M', "await int JoinWait(long entry)" },
+    { "JoinWaitOwned", 'M', "await int JoinWaitOwned(long entry)" },
     { "JoinCancel",'M', "void JoinCancel(long entry)" },
 };
 

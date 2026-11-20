@@ -275,8 +275,10 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         else STRACE("shard%d epoll n=%d", shard, n);
         shard_lock(sh);
         if (n < 0) n = 0;
+        int retry_read = 0;
         if (n != 0) {
             int woke = 0;
+            int interrupted = 0;
             zan_co_task_t ready_batch[256];
             size_t ready_count = 0;
             int completed_count = 0;
@@ -284,9 +286,11 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
                 int fd = events[i].data.fd;
                 if (fd == sh->wake_rfd) {
                     io_shard_wake_consume(sh);
+                    interrupted = 1;
                     continue;
                 }
                 if (fd == g_dns_wake_fd) {
+                    interrupted = 1;
                     dns_wake_read();
                     woke += dns_drain();
                     continue;
@@ -298,7 +302,18 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
 
                 zan_io_waiter_t ready[8];
                 int nr = 0;
-                if ((ev & EPOLLIN) || err)  nr += io_take(s, fd, 1, ready + nr, 8 - nr);
+                if ((ev & EPOLLIN) || err) {
+                    while (s->has_r && nr < 8) {
+                        /* Readiness may be stale after another receiver drains the socket. */
+                        if (!io_deliver_waiter(fd, &s->r)) {
+                            retry_read = 1;
+                            break;
+                        }
+                        ready[nr++] = s->r;
+                        rto_drop(sh, s->r.co);
+                        io_unlink_waiter(s, 1, &s->r);
+                    }
+                }
                 if ((ev & EPOLLOUT) || err) nr += io_take(s, fd, 0, ready + nr, 8 - nr);
 
                 if (s->has_r || s->has_w) {
@@ -306,7 +321,6 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
                 }
 
                 for (int k = 0; k < nr; k++) {
-                    io_deliver_waiter(fd, &ready[k]);
                     completed_count++;
                     if (ready[k].co && ready[k].step && ready_count < 256) {
                         ready_batch[ready_count].frame = ready[k].co;
@@ -318,13 +332,21 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
                     woke++;
                 }
             }
-            shard_unlock(sh);
-            if (ready_count > 0) {
-                zan_co_ready_batch(ready_batch, ready_count);
+            /* An indefinite pump must keep waiting after a stale read event. */
+            if (!retry_read || woke || interrupted || timeout_ms >= 0) {
+                shard_unlock(sh);
+                if (ready_count > 0) {
+                    zan_co_ready_batch(ready_batch, ready_count);
+                }
+                /* Transfer liveness before releasing dequeued IO owners. */
+                if (completed_count) InterlockedExchangeAdd(&g_io_count, -completed_count);
+                return woke;
             }
-            /* Transfer liveness before releasing dequeued IO owners. */
-            InterlockedExchangeAdd(&g_io_count, -completed_count);
-            return woke;
+            if (sh->dead) {
+                int wd = io_flush_dead(sh);
+                shard_unlock(sh);
+                return wd;
+            }
         }
         int w2 = dns_timeout_scan();
         int w3 = w2 ? 0 : dns_drain();
@@ -335,7 +357,7 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         else if (w3) val = w3;
         else if (w4) val = w4;
         else if (w5) val = w5;
-        else if (capped && g_io_count + g_blocking_inflight > 0 && timeout_ms < 0) done = 0;
+        else if ((capped || retry_read) && g_io_count + g_blocking_inflight > 0 && timeout_ms < 0) done = 0;
         shard_unlock(sh);
         if (done) return val;
     }

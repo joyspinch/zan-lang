@@ -461,6 +461,7 @@ zan_type_t * foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct);
 zan_type_t * foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct);
 LLVMBasicBlockRef get_async_cancel_bb(zan_irgen_t *g, local_scope_t *locals);
 LLVMValueRef get_async_cancel_ptr(zan_irgen_t *g);
+LLVMValueRef emit_async_cancel_load(zan_irgen_t *g, LLVMValueRef ptr, const char *name);
 LLVMValueRef get_async_child_ptr(zan_irgen_t *g);
 LLVMBasicBlockRef get_async_requeue_bb(zan_irgen_t *g);
 LLVMValueRef get_async_result_ptr(zan_irgen_t *g);
@@ -814,6 +815,7 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t 
 LLVMValueRef get_co_reap_fn(zan_irgen_t *g);
 LLVMValueRef emit_task_runtime_call(zan_irgen_t *g, const char *name,
     LLVMTypeRef result, LLVMValueRef *args, unsigned count);
+void emit_join_discard(zan_irgen_t *g, LLVMValueRef entry);
 LLVMValueRef emit_task_token(zan_irgen_t *g, LLVMValueRef frame);
 void emit_task_discard_config(zan_irgen_t *g, LLVMValueRef frame, zan_type_t *rt);
 LLVMValueRef get_str_ordinal_cmp_fn(zan_irgen_t *g, zan_loc_t loc);

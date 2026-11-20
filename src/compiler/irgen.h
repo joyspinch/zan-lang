@@ -670,6 +670,7 @@ struct zan_irgen {
     zan_type_t  *current_async_ret_type;
     /* await 协程状态机上下文：状态分发 switch、下一状态编号及恢复块 */
     LLVMValueRef current_async_switch;
+    LLVMValueRef current_async_cancel_switch;
     int          current_async_next_state;
     int          current_async_sub_base;
     int          current_async_sub_next;

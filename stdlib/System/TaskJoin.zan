@@ -9,7 +9,7 @@ namespace System;
 // 普通的 async 标准库代码，像其他被 await 的调用一样挂起与恢复。
 // int n = await Task.WhenAll(hs);      // 全部完成后返回句柄个数
 // int i = await Task.WhenAny(hs);      // 最先完成者的下标
-// 快路径是事件驱动：<c>Task.JoinNew/JoinBind/JoinWait</c> 把
+// 快路径是事件驱动：<c>Task.JoinNew/JoinBind/JoinWaitOwned</c> 把
 // 每个句柄登记进运行时的 join 表，汇合方挂起（Delay 形，不占线程也不
 // 轮询）；任一扇出协程被回收（untrack）时由完成路径精确唤醒——真正的
 // "完成即就绪"，唤醒延迟与批次规模无关。轮询实现保留为
@@ -26,18 +26,27 @@ public class TaskJoin {
     // 任务（IO/定时器），让渡会变成空转烧核，此时退回 Delay 指数退避。
     public static int YIELD_SPINS = 8;
 
+    // 登记期间持有 entry。同步登记不会在循环回边让出后被取消。
+    private static long BindJoin(List<long> handles, int n, int any) {
+        long entry = Task.JoinNew(n, any);
+        try {
+            for (int i = 0; i < n; i = i + 1) {
+                Task.JoinBind(entry, handles[i], i);
+            }
+        } catch {
+            Task.JoinCancel(entry);
+            throw;
+        }
+        return entry;
+    }
+
     // 挂起直到 `handles` 中每个句柄都已完成（或被取消），
     // 返回汇合的句柄个数。空列表立即返回 0，已完成的批次
     // 不会挂起。
     public static async int WhenAll(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return 0; }
-        long entry = Task.JoinNew(n, 0);
-        for (int i = 0; i < n; i = i + 1) {
-            Task.JoinBind(entry, handles[i], i);
-        }
-        int r = await Task.JoinWait(entry);
-        Task.JoinCancel(entry);
+        int r = await Task.JoinWaitOwned(TaskJoin.BindJoin(handles, n, 0));
         if (r == 2) { return await TaskJoin.WhenAllPoll(handles); }
         return n;
     }
@@ -49,12 +58,7 @@ public class TaskJoin {
     public static async int WhenAny(List<long> handles) {
         int n = handles.Count;
         if (n == 0) { return -1; }
-        long entry = Task.JoinNew(n, 1);
-        for (int i = 0; i < n; i = i + 1) {
-            Task.JoinBind(entry, handles[i], i);
-        }
-        int r = await Task.JoinWait(entry);
-        Task.JoinCancel(entry);
+        int r = await Task.JoinWaitOwned(TaskJoin.BindJoin(handles, n, 1));
         if (r == 2) { return await TaskJoin.WhenAnyPoll(handles); }
         for (int i = 0; i < n; i = i + 1) {
             if (Task.IsDone(handles[i]) != 0) { return i; }

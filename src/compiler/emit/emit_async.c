@@ -420,6 +420,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         zan_ast_node_t *saved_async_body = g->current_async_body;
         zan_type_t *saved_async_ret_type = g->current_async_ret_type;
         LLVMValueRef saved_async_switch = g->current_async_switch;
+        LLVMValueRef saved_cancel_switch = g->current_async_cancel_switch;
         int saved_next_state = g->current_async_next_state;
         int saved_sub_base = g->current_async_sub_base;
         int saved_sub_next = g->current_async_sub_next;
@@ -544,7 +545,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         emit_task_runtime_call(g, "zan_task_child", LLVMVoidTypeInContext(g->ctx), clear_edge_args, 2);
 
         LLVMValueRef cancel_ptr = get_async_cancel_ptr(g);
-        LLVMValueRef cancel_val = LLVMBuildLoad2(g->builder, i32, cancel_ptr, "fr.cancelled");
+        LLVMValueRef cancel_val = emit_async_cancel_load(g, cancel_ptr, "fr.cancelled");
         LLVMBasicBlockRef can_bb = get_async_cancel_bb(g, locals);
         if (!can_bb) {
             can_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.cancelled");
@@ -552,15 +553,17 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
             emit_async_complete(g, locals, NULL);
             g->current_async_cancel_bb = can_bb;
         }
+        LLVMValueRef state = LLVMBuildLoad2(g->builder, i32, get_async_state_ptr(g), "state");
         LLVMBasicBlockRef disp_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.dispatch");
+        LLVMBasicBlockRef cancel_dispatch = LLVMAppendBasicBlockInContext(g->ctx,
+            resume_fn, "co.cancel.dispatch");
         LLVMBuildCondBr(g->builder,
             zan_icmp(g->builder, LLVMIntNE, cancel_val, LLVMConstInt(i32, 0, 0), "is.cancelled"),
-            can_bb, disp_bb);
+            cancel_dispatch, disp_bb);
+        LLVMPositionBuilderAtEnd(g->builder, cancel_dispatch);
+        g->current_async_cancel_switch = LLVMBuildSwitch(g->builder, state, can_bb, 0);
 
         LLVMPositionBuilderAtEnd(g->builder, disp_bb);
-        LLVMValueRef state = LLVMBuildLoad2(g->builder, i32,
-            get_async_state_ptr(g),
-            "state");
         LLVMBasicBlockRef body_bb = LLVMAppendBasicBlockInContext(g->ctx, resume_fn, "co.start");
         LLVMValueRef sw = LLVMBuildSwitch(g->builder, state, body_bb, (unsigned)(w->await_count + 1));
         LLVMAddCase(sw, LLVMConstInt(i32, 0, 0), body_bb);
@@ -612,6 +615,7 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_body = saved_async_body;
         g->current_async_ret_type = saved_async_ret_type;
         g->current_async_switch = saved_async_switch;
+        g->current_async_cancel_switch = saved_cancel_switch;
         g->current_async_next_state = saved_next_state;
         g->current_async_sub_base = saved_sub_base;
         g->current_async_sub_next = saved_sub_next;

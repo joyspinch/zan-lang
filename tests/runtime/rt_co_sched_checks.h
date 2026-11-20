@@ -103,11 +103,21 @@ long long zan_join_new(int npairs, int any);
 int zan_join_bind(long long entry, void *frame, int idx);
 int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step);
 void zan_join_cancel(long long entry);
+void *zan_join_exc(long long entry, void **tid_out, int *owned_out);
 void zan_join_complete(void *frame);
 
+/* Match the compiler frame prefix through the exception fields read by join. */
 typedef struct {
     zan_co_fhdr sched;
     int state, done;
+    void *awaiter;
+    zan_timer_step_t awaiter_step;
+    long long result;
+    zan_timer_step_t cleanup;
+    int hcount;
+    zan_timer_step_t self_step;
+    void *exc, *exc_tid;
+    int exc_owned;
 } join_check_source;
 
 typedef struct {
@@ -171,5 +181,33 @@ static void run_join_checks(void) {
         }
         CHECK(zan_co_live_count() == 0);
     }
+    join_check_source failed = {0}, pending = {0};
+    int exception, type_id;
+    failed.exc = &exception;
+    failed.exc_tid = &type_id;
+    failed.exc_owned = 1;
+    zan_co_live_add(&failed);
+    zan_co_live_add(&pending);
+    long long entry = zan_join_new(2, 0);
+    CHECK(zan_join_bind(entry, &failed, 0) == 1);
+    CHECK(zan_join_bind(entry, &pending, 1) == 1);
+    __atomic_store_n(&failed.done, 1, __ATOMIC_RELEASE);
+    zan_join_complete(&failed);
+    void *tid = NULL;
+    int owned = 0;
+    CHECK(zan_join_exc(entry, &tid, &owned) == &exception);
+    CHECK(tid == &type_id && owned == 1);
+    CHECK(failed.exc == NULL && failed.exc_owned == 0);
+    /* Completion between extraction and detach keeps the later exception. */
+    pending.exc = &exception;
+    pending.exc_tid = &type_id;
+    pending.exc_owned = 1;
+    __atomic_store_n(&pending.done, 1, __ATOMIC_RELEASE);
+    zan_join_complete(&pending);
+    CHECK(pending.exc == &exception && pending.exc_owned == 1);
+    zan_join_cancel(entry);
+    zan_co_live_del(&failed);
+    zan_co_live_del(&pending);
+    CHECK(zan_co_live_count() == 0);
     zan_timer_set_ready_hook(zan_co_ready);
 }

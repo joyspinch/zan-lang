@@ -185,7 +185,7 @@ static LLVMValueRef get_task_action_step_fn(zan_irgen_t *g) {
     LLVMValueRef frame = LLVMBuildBitCast(g->builder, arg, LLVMPointerType(ft, 0), "fr");
 
     LLVMValueRef cancel_p = LLVMBuildStructGEP2(g->builder, ft, frame, ASYNC_FRAME_CANCEL, "cancel.p");
-    LLVMValueRef cancel = LLVMBuildLoad2(g->builder, i32, cancel_p, "cancel");
+    LLVMValueRef cancel = emit_async_cancel_load(g, cancel_p, "cancel");
     LLVMValueRef is_cancelled = zan_icmp(g->builder, LLVMIntNE, cancel, LLVMConstInt(i32, 0, 0), "is_cancelled");
     LLVMBuildCondBr(g->builder, is_cancelled, done_bb, exec_bb);
 

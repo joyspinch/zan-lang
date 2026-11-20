@@ -675,8 +675,8 @@ static int io_slots_ensure(int need) {
 }
 
 
-/* 唤醒后执行挂起的接收/接受连接操作 */
-static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
+/* 执行挂起的接收/接受操作；epoll 读仍需等待时返回 0。 */
+static int io_deliver_waiter(int fd, zan_io_waiter_t *w) {
     if (w->out_accept) {
 #if defined(__linux__) && defined(SOCK_NONBLOCK) && defined(SOCK_CLOEXEC)
         *w->out_accept = (intptr_t)accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -694,14 +694,23 @@ static void io_deliver_waiter(int fd, zan_io_waiter_t *w) {
         }
         *w->out_accept = (intptr_t)cfd;
 #endif
-        return;
+        return 1;
     }
-    if (!w->out_n) return;
+    if (!w->out_n) return 1;
     ssize_t rn;
+#if defined(__linux__)
+    const int flags = MSG_DONTWAIT;
+#else
+    const int flags = 0;
+#endif
     do {
-        rn = recv(fd, w->rbuf, (size_t)w->rlen, 0);
+        rn = recv(fd, w->rbuf, (size_t)w->rlen, flags);
     } while (rn < 0 && errno == EINTR);
+#if defined(__linux__)
+    if (rn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+#endif
     *w->out_n = (rn < 0) ? 0 : (int64_t)rn;
+    return 1;
 }
 
 static int io_take(zan_io_slot_t *s, int fd, int read_dir,

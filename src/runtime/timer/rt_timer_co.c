@@ -166,6 +166,7 @@ typedef struct zan_join {
     void            *exc;
     void            *exc_tid;
     int              exc_owned;
+    int              exc_taken;
     int              capacity;
     zan_join_pair_t  pairs[];
 } zan_join_t;
@@ -355,7 +356,7 @@ static void join_on_task_end_locked(void *frame, zan_join_wakes_t *wakes) {
             /* M2：子任务带异常结束时，此刻子帧尚未拆除——把异常对象
              * 所有权从子帧转移到 join 快照（清子帧槽位防二次释放），
              * joiner 唤醒后经 zan_join_exc 取走重抛。仅记首个。 */
-            if (!j->exc) {
+            if (!j->exc_taken && !j->exc) {
                 void *exc = *(void **)((unsigned char *)frame + JOIN_OFF_EXC);
                 if (exc) {
                     j->exc = exc;
@@ -439,7 +440,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
-        if (done && !j->exc) {
+        if (done && !j->exc_taken && !j->exc) {
             /* M2：已完成（甚至已 throw）的子任务在 bind 前就绪时，异常
              * 快照仍要收——否则 join 语义吞掉先于 bind 的失败。帧未 reap
              * 时 EXC 槽位有效（所有权随快照转移）；已 reap 的帧在
@@ -485,7 +486,11 @@ int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
 
 void *zan_join_exc(long long entry, void **tid_out, int *owned_out) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
-    if (!j) return NULL;
+    if (!j) {
+        if (tid_out) *tid_out = NULL;
+        if (owned_out) *owned_out = 0;
+        return NULL;
+    }
     live_lock();
     void *exc = j->exc;
     void *tid = j->exc_tid;
@@ -493,6 +498,9 @@ void *zan_join_exc(long long entry, void **tid_out, int *owned_out) {
     j->exc = NULL;
     j->exc_tid = NULL;
     j->exc_owned = 0;
+    /* An await observes this snapshot once. A later completion leaves its
+     * exception on its own frame while the join is being detached. */
+    j->exc_taken = 1;
     live_unlock();
     if (tid_out) *tid_out = tid;
     if (owned_out) *owned_out = owned;
