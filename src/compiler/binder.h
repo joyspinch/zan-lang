@@ -91,6 +91,9 @@ struct zan_symbol {
     zan_symbol_t *hash_next;
 };
 
+typedef void (*zan_symbol_reference_fn)(void *context, const zan_symbol_t *symbol,
+                                        const zan_ast_node_t *occurrence);
+
 typedef struct zan_scope zan_scope_t;
 struct zan_scope {
     zan_scope_t *parent;
@@ -121,6 +124,8 @@ struct zan_binder {
     zan_arena_t *arena;
     zan_diag_t *diag;
     zan_scope_t *current_scope;
+    zan_symbol_reference_fn symbol_reference;
+    void *symbol_reference_context;
 
     /* built-in types */
     zan_type_t *type_void;
@@ -165,6 +170,12 @@ struct zan_binder {
 
 void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);
 void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit);
+
+static inline void zan_binder_record_reference(zan_binder_t *b, const zan_symbol_t *symbol,
+                                               const zan_ast_node_t *occurrence) {
+    if (b->symbol_reference && symbol && symbol->decl && occurrence)
+        b->symbol_reference(b->symbol_reference_context, symbol, occurrence);
+}
 
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
 /* Overlay declared type parameters; restore the returned scope after use. */

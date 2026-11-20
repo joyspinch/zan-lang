@@ -2,6 +2,8 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     parser_advance(p);
     zan_loc_t dloc = p->current.loc;
     zan_ast_node_t *ret_type = parse_type_ref(p);
+    zan_loc_t name_loc = p->current.loc;
+    uint32_t name_len = parser_check(p, TK_IDENT) ? p->current.str_val.len : 0;
     parser_expect(p, TK_IDENT);
     zan_istr_t dname = p->previous.str_val;
     zan_ast_list_t dtype_params;
@@ -18,6 +20,7 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
                 parser_advance(p);
                 zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
                 tp->ident.name = p->previous.str_val;
+                zan_ast_set_name_span(tp, p->previous.loc, tp->ident.name.len);
                 tp->ident.variance = variance;
                 zan_ast_list_push(&dtype_params, tp, p->arena);
             }
@@ -28,6 +31,7 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     zan_ast_list_t dparams = parse_param_list(p);
     parser_expect(p, TK_SEMICOLON);
     zan_ast_node_t *ddecl = zan_ast_new(p->arena, AST_DELEGATE_DECL, dloc);
+    zan_ast_set_name_span(ddecl, name_loc, name_len);
     ddecl->method_decl.name = dname;
     ddecl->method_decl.return_type = ret_type;
     ddecl->method_decl.params = dparams;
@@ -88,9 +92,15 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
         parser_advance(p);
         parser_expect(p, TK_IDENT);
         zan_istr_t rname = p->previous.str_val;
+        zan_loc_t rname_loc = p->previous.loc;
         zan_ast_list_t rparams = parse_param_list(p);
         parser_expect(p, TK_SEMICOLON);
+        int first_generated = unit->comp_unit.decls.count;
         gen_record_class(unit, rname, &rparams, p->arena, p->diag);
+        if (unit->comp_unit.decls.count > first_generated) {
+            zan_ast_node_t *decl = unit->comp_unit.decls.items[first_generated];
+            zan_ast_set_name_span(decl, rname_loc, rname.len);
+        }
         return true;
     }
 
@@ -119,9 +129,11 @@ static zan_ast_node_t *parse_qualified_name(zan_parser_t *p) {
     zan_ast_node_t *node = zan_ast_new(p->arena, AST_QUALIFIED_NAME, loc);
     zan_ast_list_init(&node->qualified_name.parts);
 
+    bool has_name = parser_check(p, TK_IDENT);
     parser_expect(p, TK_IDENT);
     zan_ast_node_t *part = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
     part->ident.name = p->previous.str_val;
+    if (has_name) zan_ast_set_name_span(part, p->previous.loc, part->ident.name.len);
     zan_ast_list_push(&node->qualified_name.parts, part, p->arena);
 
     while (parser_match(p, TK_DOT)) {
@@ -129,9 +141,11 @@ static zan_ast_node_t *parse_qualified_name(zan_parser_t *p) {
         parser_advance(p);
         part = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
         part->ident.name = p->previous.str_val;
+        zan_ast_set_name_span(part, p->previous.loc, part->ident.name.len);
         zan_ast_list_push(&node->qualified_name.parts, part, p->arena);
     }
 
+    zan_ast_inherit_name_span(node, part);
     return node;
 }
 
@@ -244,6 +258,8 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     }
 
     zan_ast_node_t *type_node = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+    zan_ast_set_name_span(type_node, p->previous.loc,
+                          is_builtin ? name.len : p->previous.str_val.len);
     type_node->type_ref.name = name;
     type_node->type_ref.is_nullable = false;
     type_node->type_ref.is_array = false;
@@ -294,6 +310,7 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         zan_ast_node_t *cur = type_node;
         for (int i = nranks - 1; i >= 0; i--) {
             zan_ast_node_t *w = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+            zan_ast_inherit_name_span(w, cur);
             w->type_ref.name = cur->type_ref.name;
             w->type_ref.is_array = true;
             w->type_ref.array_rank = ranks[i];
@@ -453,6 +470,7 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
             zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
             pn->param.name = p->previous.str_val;
             pn->param.name_loc = p->previous.loc;
+            zan_ast_set_name_span(pn, p->previous.loc, pn->param.name.len);
             pn->param.type = NULL;
             pn->param.default_val = NULL;
             return pn;
@@ -468,6 +486,7 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     zan_ast_node_t *pn = zan_ast_new(p->arena, AST_PARAM, loc);
     pn->param.name = name;
     pn->param.name_loc = name_loc;
+    zan_ast_set_name_span(pn, name_loc, name.len);
     pn->param.type = type;
     pn->param.default_val = NULL;
     return pn;

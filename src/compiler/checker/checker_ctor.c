@@ -140,7 +140,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
         zan_ast_node_t *vg = arg;
         while (vg && vg->kind == AST_CAST_EXPR) vg = vg->cast.expr;
         zan_symbol_t *vmg = expr_method_group(c, vg);
-        if (vmg && !checker_bind_method_group(c, vg, pt)) {
+        if (vmg && !checker_bind_method_group(c, vg, pt, false)) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                 "method '%.*s' cannot be converted to delegate type "
                 "'%s': signature is not compatible",
@@ -173,7 +173,7 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                 reject_method_group(c, vg);
                 return;
             }
-            if (!checker_bind_method_group(c, vg, pt)) {
+            if (!checker_bind_method_group(c, vg, pt, false)) {
                 zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                     "method '%.*s' cannot be converted to delegate type "
                     "'%s': signature is not compatible",
@@ -578,7 +578,7 @@ static void checker_builtin_mg_args(zan_checker_t *c, zan_type_t *recv,
             reject_method_group(c, vg);
             continue;
         }
-        if (!checker_bind_method_group(c, vg, pt)) {
+        if (!checker_bind_method_group(c, vg, pt, false)) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 2098,
                 "method '%.*s' cannot be converted to delegate type "
                 "'%s': signature is not compatible",

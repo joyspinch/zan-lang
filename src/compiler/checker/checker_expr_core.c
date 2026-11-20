@@ -101,22 +101,34 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return zan_binder_resolve_type(c->binder, expr->ident.inst_type_ref);
         if (expr->ident.is_type_receiver) {
             zan_symbol_t *ts = zan_binder_type_receiver(c->binder, expr);
+            zan_binder_record_reference(c->binder, ts, expr);
             return ts && ts->type ? ts->type : c->binder->type_error;
         }
         if (c->lexical_ref) checker_record_lexical_ref(c, expr);
         checker_reject_byref_capture(c, expr->ident.name);
         zan_type_t *lt = checker_find_local(c, expr->ident.name);
+        if (c->binder->symbol_reference) {
+            struct checker_local *local = checker_lookup_local(c, expr->ident.name, true);
+            if (local && !local->type) c->last_unproven_reference_expr = expr;
+        }
         if (lt) return lt;
         if (c->current_type_sym) {
             zan_symbol_t *fsym = checker_find_field(c->current_type_sym,
                                                     expr->ident.name);
             if (fsym) {
+                checker_record_bare_field(c, fsym, expr);
                 return fsym->type ? fsym->type : c->binder->type_error;
             }
         }
         zan_symbol_t *sym = zan_binder_lookup(c->binder, expr->ident.name);
         if (!sym) {
             return c->binder->type_error;
+        }
+        if (c->binder->symbol_reference && expr != c->last_unproven_reference_expr) {
+            if (checker_is_type_symbol(sym))
+                zan_binder_record_reference(c->binder, sym, expr);
+            else if (sym->kind == SYM_FIELD || sym->kind == SYM_PROPERTY)
+                checker_record_bare_field(c, sym, expr);
         }
         return sym->type;
     }
@@ -487,6 +499,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *recv = NULL;
         int callee_is_method = 0;
         bool typed_overload_changed = false;
+        bool exact_method = false;
+        bool null_receiver = false;
+        bool observe = c->binder->symbol_reference != NULL;
+        int errors_before = c->diag->error_count;
+        zan_ast_node_t *callee = expr->call.callee;
+        bool receiver_known = false;
+        bool type_receiver = false;
+        bool unproven_operand = false;
         zan_symbol_t *called_sym = NULL;
         int argc = expr->call.args.count;
         zan_type_t **arg_types = argc > 0 ? (zan_type_t **)zan_arena_alloc(
@@ -507,6 +527,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
             recv = zan_checker_check_expr(c, expr->call.callee->member.object);
+            if (observe) {
+                receiver_known = checker_reference_receiver(c, callee->member.object,
+                    recv, &type_receiver);
+                unproven_operand = callee->member.object == c->last_unproven_reference_expr;
+            }
             if (recv && recv->sym) {
                 zan_symbol_t *m = checker_find_method_call(
                     recv->sym, expr->call.callee->member.name,
@@ -516,7 +541,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         report_inaccessible(c, m, expr->call.callee->loc);
                         return c->binder->type_error;
                     }
-                    checker_reject_null_receiver(c, expr->call.callee);
+                    null_receiver = checker_reject_null_receiver(c, callee, true);
                     called_sym = m;
                     callee_type = m->type ? m->type : c->binder->type_error;
                     callee_is_method = 1;
@@ -539,6 +564,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_ast_node_t *arg = expr->call.args.items[i];
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
+            if (observe && arg && arg == c->last_unproven_reference_expr)
+                unproven_operand = true;
             arg_types[i] = arg_type;
             if (!arg_sig && arg && arg_type == c->binder->type_void &&
                 arg->kind != AST_REF_ARG && !arg_is_spawn_callee(expr)) {
@@ -565,7 +592,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
         if (callee_is_method && recv && recv->sym) {
             zan_symbol_t *typed = checker_find_method_typed(c, recv, recv->sym,
-                expr->call.callee->member.name, expr, arg_types);
+                expr->call.callee->member.name, expr, arg_types, &exact_method);
             if (!typed) {
                 called_sym = NULL;
                 callee_type = c->binder->type_error;
@@ -588,7 +615,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             zan_symbol_t *resolved = checker_find_method_typed(c,
                 c->current_type_sym ? c->current_type_sym->type : NULL,
                 c->current_type_sym, expr->call.callee->ident.name,
-                expr, arg_types);
+                expr, arg_types, &exact_method);
             if (resolved) {
                 called_sym = resolved;
             } else {
@@ -606,11 +633,47 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (!called_sym && arg_sig) {
             called_sym = arg_sig;
         }
-        c->last_call_node = expr;
-        c->last_call_method = called_sym;
         checker_bind_call_intrinsic(c, expr, called_sym, recv);
         check_call_arity(c, expr, recv);
         if (!callee_is_method &&
+        for (int i = 0; exact_method && i < expr->call.type_args.count; i++) {
+            zan_type_t *type_arg = zan_binder_resolve_type(c->binder,
+                expr->call.type_args.items[i]);
+            exact_method = checker_call_type_known(type_arg, 0);
+        }
+        if (exact_method) {
+            bool is_static = (called_sym->modifiers & MOD_STATIC) != 0;
+            if (callee->kind == AST_MEMBER_ACCESS)
+                exact_method = receiver_known && type_receiver == is_static &&
+                    !checker_find_field(recv->sym, callee->member.name);
+            else
+                exact_method = !callee->ident.is_type_receiver && !callee->ident.inst_type_ref &&
+                    !checker_lookup_local(c, callee->ident.name, true) &&
+                    !checker_find_field(c->current_type_sym, callee->ident.name) &&
+                    (is_static || !checker_in_static_method(c));
+            exact_method = exact_method && !null_receiver && !unproven_operand &&
+                c->diag->error_count == errors_before && access_member_allowed(c, called_sym);
+            /* Extension lookup here certifies only the name and receiver.
+             * The checker has no typed result for that competing call path. */
+            if (exact_method && recv && !type_receiver &&
+                zan_binder_has_extension_method(c->binder, recv, callee->member.name))
+                exact_method = false;
+        }
+        if (exact_method && !expr->call.is_intrinsic) {
+            zan_binder_record_reference(c->binder, called_sym, callee);
+            /* The winning outer signature supplies the target. Use the
+             * existing delegate resolver for the actual method-group symbol. */
+            for (int i = 0; i < argc; i++) {
+                zan_ast_node_t *arg = expr->call.args.items[i];
+                zan_type_t *target = zan_binder_method_group_target(arg);
+                if (target) checker_method_group_candidate(c, arg, target, true);
+            }
+        }
+        c->last_call_node = expr;
+        c->last_call_method = called_sym;
+        if (observe && (unproven_operand || c->diag->error_count != errors_before ||
+            (called_sym && called_sym->kind == SYM_METHOD && !exact_method)))
+            c->last_unproven_reference_expr = expr;
             (checker_is_task_call(expr, "Run") || checker_is_task_call(expr, "Spawn"))) {
             zan_type_t *tr = task_run_result_type(c, expr, arg_types);
             if (tr) return tr;
@@ -812,10 +875,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_string;
     }
 
-    case AST_MEMBER_ACCESS:
-        return check_member_access(c, expr,
-                                   zan_checker_check_expr(c, expr->member.object),
-                                   false, NULL);
+    case AST_MEMBER_ACCESS: {
+        int errors_before = c->diag->error_count;
+        zan_type_t *obj_type = zan_checker_check_expr(c, expr->member.object);
+        if (c->binder->symbol_reference && c->diag->error_count != errors_before)
+            c->last_unproven_reference_expr = expr->member.object;
+        return check_member_access(c, expr, obj_type, false, NULL);
+    }
 
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);

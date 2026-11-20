@@ -35,6 +35,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
         n->ident.name = (zan_istr_t){ nm, (int)strlen(nm) };
+        zan_ast_set_name_span(n, loc, n->ident.name.len);
         return n;
     }
 
@@ -317,6 +318,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
             param->param.name = param_name;
             param->param.name_loc = loc;
+            zan_ast_set_name_span(param, loc, param_name.len);
             param->param.type = NULL;
             param->param.default_val = NULL;
             zan_ast_list_push(&n->lambda.params, param, p->arena);
@@ -326,6 +328,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_IDENTIFIER, loc);
         n->ident.name = p->previous.str_val;
+        zan_ast_set_name_span(n, p->previous.loc, n->ident.name.len);
         n->ident.source_ident = true;
         return n;
     }
@@ -401,6 +404,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
                 param->param.name = expr->ident.name;
                 param->param.name_loc = expr->loc;
+                zan_ast_inherit_name_span(param, expr);
                 param->param.type = NULL;
                 param->param.default_val = NULL;
                 zan_ast_list_push(&n->lambda.params, param, p->arena);
@@ -513,6 +517,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                     continue;
                 }
                 zan_ast_node_t *w = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+                zan_ast_inherit_name_span(w, type);
                 w->type_ref.name = type->type_ref.name;
                 w->type_ref.is_array = true;
                 w->type_ref.array_rank = rank;
@@ -522,6 +527,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             }
             if (n->new_expr.array_rank > 0) {
                 zan_ast_node_t *w = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+                zan_ast_inherit_name_span(w, type);
                 w->type_ref.name = type->type_ref.name;
                 w->type_ref.is_array = true;
                 w->type_ref.array_rank = n->new_expr.array_rank;
@@ -611,6 +617,7 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
             parser_advance(p);
             zan_ast_node_t *expr = parse_expression(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_NAMED_ARG, loc);
+            zan_ast_set_name_span(n, loc, name.len);
             n->named_arg.name = name;
             n->named_arg.expr = expr;
             return n;
@@ -629,6 +636,8 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
         n->ref_arg.decl_type = parse_type_ref(p);
         zan_ast_node_t *id = zan_ast_new(p->arena, AST_IDENTIFIER, p->current.loc);
         id->ident.name = p->current.str_val;
+        if (parser_check(p, TK_IDENT))
+            zan_ast_set_name_span(id, p->current.loc, id->ident.name.len);
         parser_expect(p, TK_IDENT);
         n->ref_arg.expr = id;
         return n;
@@ -636,11 +645,13 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
     zan_ast_node_t *e = parse_expression(p);
     if (is_out && e->kind == AST_IDENTIFIER && parser_check(p, TK_IDENT)) {
         zan_ast_node_t *ty = zan_ast_new(p->arena, AST_TYPE_REF, e->loc);
+        zan_ast_inherit_name_span(ty, e);
         ty->type_ref.name = e->ident.name;
         zan_ast_list_init(&ty->type_ref.type_args);
         n->ref_arg.decl_type = ty;
         zan_ast_node_t *id = zan_ast_new(p->arena, AST_IDENTIFIER, p->current.loc);
         id->ident.name = p->current.str_val;
+        zan_ast_set_name_span(id, p->current.loc, id->ident.name.len);
         parser_advance(p);
         e = id;
     }
@@ -799,6 +810,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                         if (parser_match(p, TK_LBRACE)) {
                             field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
                             field_init->coll_init.name = name;
+                            zan_ast_set_name_span(field_init, nloc, name.len);
                             zan_ast_list_init(&field_init->coll_init.items);
                             while (!parser_check(p, TK_RBRACE) &&
                                    !parser_check(p, TK_EOF)) {
@@ -813,6 +825,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                             zan_ast_node_t *lhs =
                                 zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
                             lhs->ident.name = name;
+                            zan_ast_set_name_span(lhs, nloc, name.len);
                             field_init->binary.op = TK_EQ;
                             field_init->binary.left = lhs;
                             field_init->binary.right = parse_expression(p);
@@ -846,6 +859,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                         if (parser_match(p, TK_LBRACE)) {
                             field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
                             field_init->coll_init.name = name;
+                            zan_ast_set_name_span(field_init, nloc, name.len);
                             zan_ast_list_init(&field_init->coll_init.items);
                             while (!parser_check(p, TK_RBRACE) &&
                                    !parser_check(p, TK_EOF)) {
@@ -860,6 +874,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                             zan_ast_node_t *lhs =
                                 zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
                             lhs->ident.name = name;
+                            zan_ast_set_name_span(lhs, nloc, name.len);
                             field_init->binary.op = TK_EQ;
                             field_init->binary.left = lhs;
                             field_init->binary.right = parse_expression(p);
@@ -876,6 +891,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 continue;
             }
             zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
+            zan_ast_inherit_name_span(type, expr);
             if (expr->kind == AST_IDENTIFIER) {
                 type->type_ref.name = expr->ident.name;
             } else {
@@ -898,6 +914,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                     if (parser_match(p, TK_LBRACE)) {
                         field_init = zan_ast_new(p->arena, AST_COLL_INIT, nloc);
                         field_init->coll_init.name = name;
+                        zan_ast_set_name_span(field_init, nloc, name.len);
                         zan_ast_list_init(&field_init->coll_init.items);
                         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
                             zan_ast_node_t *item = parse_expression(p);
@@ -911,6 +928,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                         zan_ast_node_t *lhs =
                             zan_ast_new(p->arena, AST_IDENTIFIER, nloc);
                         lhs->ident.name = name;
+                        zan_ast_set_name_span(lhs, nloc, name.len);
                         field_init->binary.op = TK_EQ;
                         field_init->binary.left = lhs;
                         field_init->binary.right = parse_expression(p);
@@ -938,6 +956,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 break;
             }
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_MEMBER_ACCESS, loc);
+            zan_ast_set_name_span(n, p->previous.loc, mname.len);
             n->member.object = expr;
             n->member.name = mname;
             n->member.null_cond = null_cond;
@@ -982,6 +1001,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                    (looks_like_type_args_before_dot(p) ||
                     looks_like_type_args_before_brace(p))) {
             zan_ast_node_t *tref = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
+            zan_ast_inherit_name_span(tref, expr);
             tref->type_ref.name = expr->ident.name;
             tref->type_ref.is_nullable = false;
             tref->type_ref.is_array = false;
@@ -1061,6 +1081,8 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             n->with_expr.expr = expr;
             zan_ast_list_init(&n->with_expr.assigns);
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
+                zan_loc_t name_loc = p->current.loc;
+                uint32_t name_len = parser_check(p, TK_IDENT) ? p->current.str_val.len : 0;
                 parser_expect(p, TK_IDENT);
                 zan_istr_t fname = p->previous.str_val;
                 parser_expect(p, TK_EQ);
@@ -1070,6 +1092,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 zan_ast_node_t *lhs =
                     zan_ast_new(p->arena, AST_IDENTIFIER, loc);
                 lhs->ident.name = fname;
+                zan_ast_set_name_span(lhs, name_loc, name_len);
                 asg->binary.left = lhs;
                 asg->binary.right = parse_expression(p);
                 zan_ast_list_push(&n->with_expr.assigns, asg, p->arena);

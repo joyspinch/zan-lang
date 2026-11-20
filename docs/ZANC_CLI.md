@@ -241,7 +241,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--gen-meta-bodies` | 关 | 配合 `--gen-meta` 输出类型来源标记 `from_stdlib`、`from_package`，以及方法体中的调用和 `typeof` 表达式 `body_expressions`。元数据在名字解析后、类型检查前导出 |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 | `--diagnostics-format=jsonl` / `--diagnostics-format=text` | `text` | C 宿主和自举编译器均支持。`jsonl` 按行向 stderr 写入 UTF-8 JSON。同一命令中后写的格式生效。 |
-| `--semantic-refs <file> <line> <col>` | — | C 编译器完成类型检查后查询指定位置绑定的局部变量或参数，向 stdout 写一行 JSON。 |
+| `--semantic-refs <file> <line> <col>` | — | C 编译器完成类型检查后查询指定位置的语义绑定，向 stdout 写一行 JSON。 |
 
 每条 JSON 诊断带有 `format` 值 `zan-diagnostic-v1`。`severity` 为 `error`、`warning` 或
 `note`，`file` 为编译器记录的源文件路径或 `null`，`line` 和 `col` 从 1 起计，未知时为 0，列按字节计。
@@ -256,10 +256,12 @@ C 宿主的 `-ferror-limit` 与单行限额仍生效。
 
 `--semantic-refs` 接收普通编译输入及其标准库、包和目标选项。`file` 对应其中一个源文件，`line`
 和 `col` 分别为从 1 起计的行和 UTF-8 字节列。查询位置可以在声明或使用点的标识符内。
-成功返回 `format` 为 `zan.semantic-refs.v1` 的对象，`symbol` 包含 `kind`（`local` 或
-`parameter`）、`name` 和 `declaration`。`references` 按源码顺序返回去重后的读写位置。
-每个位置含 `file`、`line`、`col` 和 UTF-8 字节长度 `length`，声明位置只出现在 `declaration`。
-未绑定到受支持符号时返回 `symbol: null` 与空 `references`。前端错误沿用编译诊断和非零退出码。
+成功返回 `format` 为 `zan.semantic-refs.v1` 的对象，`symbol` 包含 `kind`、`name` 和
+`declaration`。可查询局部变量、参数、类型、字段、属性、枚举成员和已确定目标的方法调用。
+`references` 按编译输入和源码顺序返回去重后的使用位置。partial 类型的其他声明使用可选的
+`symbol.additionalDeclarations` 数组。每个位置含 `file`、`line`、`col` 和 UTF-8 字节长度 `length`。
+缺少已确认的符号绑定或选中位置有多个绑定时，返回 `symbol: null` 与空 `references`。
+前端错误沿用编译诊断和非零退出码。
 查询在代码生成前结束。工具可在 `--help` 输出中查找首字段 `--semantic-refs` 来探测支持。
 
 ### 2.4 打包（Packaging）

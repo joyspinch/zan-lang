@@ -91,7 +91,7 @@ void print_usage(void) {
     fprintf(stderr, "    --emit-ir       Emit LLVM IR to stdout and exit without linking\n");
     fprintf(stderr, "    zanc --compile-ir <input.ll> -o <object> [--target <LLVM triple>] [-O0..-O3/-Os/-Oz]\n");
     fprintf(stderr, "    --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
-    fprintf(stderr, "    --semantic-refs <file> <line> <col>  Check and print local or parameter references as JSON\n");
+    fprintf(stderr, "    --semantic-refs <file> <line> <col>  Check and print bound symbol references as JSON\n");
     fprintf(stderr, "                       Positions use 1-based lines and UTF-8 byte columns\n");
     fprintf(stderr, "    --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "    --gen-meta-bodies  Include calls and typeof expressions in method metadata\n");

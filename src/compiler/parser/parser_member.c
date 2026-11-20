@@ -85,6 +85,7 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
     param->param.name = name;
     param->param.name_loc = name_loc;
+    zan_ast_set_name_span(param, name_loc, name.len);
     param->param.type = type;
     param->param.default_val = default_val;
     param->param.is_params = is_params;
@@ -448,6 +449,8 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
     /* destructor: ~ClassName() { } */
     if (parser_check(p, TK_TILDE)) {
         parser_advance(p);
+        zan_loc_t name_loc = p->current.loc;
+        uint32_t name_len = parser_check(p, TK_IDENT) ? p->current.str_val.len : 0;
         parser_expect(p, TK_IDENT);
         zan_istr_t name = p->previous.str_val;
         parser_expect(p, TK_LPAREN);
@@ -455,6 +458,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         zan_ast_node_t *body = parse_block(p);
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_DESTRUCTOR_DECL, loc);
+        zan_ast_set_name_span(n, name_loc, name_len);
         n->method_decl.name = name;
         n->method_decl.body = body;
         n->method_decl.modifiers = mods;
@@ -486,6 +490,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         }
         const char *conv_name = is_explicit ? "op_explicit" : "op_implicit";
         zan_ast_node_t *cn = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+        zan_ast_set_name_span(cn, loc, kw.len);
         cn->method_decl.name =
             (zan_istr_t){ (char *)conv_name, 11 };
         cn->method_decl.return_type = conv_ret;
@@ -534,6 +539,7 @@ ordinary_member:
         }
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_CONSTRUCTOR_DECL, loc);
+        zan_ast_inherit_name_span(n, type);
         n->method_decl.name = name;
         n->method_decl.params = params;
         n->method_decl.body = body;
@@ -550,6 +556,8 @@ ordinary_member:
 
     if (parser_check(p, TK_OPERATOR)) {
         parser_advance(p);
+        zan_loc_t op_loc = p->current.loc;
+        uint32_t op_token_len = (uint32_t)strlen(zan_token_kind_name(p->current.kind));
         char op_name[32];
         switch (p->current.kind) {
         case TK_PLUS:    snprintf(op_name, sizeof(op_name), "op_add"); break;
@@ -565,7 +573,10 @@ ordinary_member:
         case TK_GREATER_EQ: snprintf(op_name, sizeof(op_name), "op_ge"); break;
         case TK_PLUS_PLUS:  snprintf(op_name, sizeof(op_name), "op_inc"); break;
         case TK_MINUS_MINUS: snprintf(op_name, sizeof(op_name), "op_dec"); break;
-        default:         snprintf(op_name, sizeof(op_name), "op_unknown"); break;
+        default:
+            snprintf(op_name, sizeof(op_name), "op_unknown");
+            op_token_len = 0;
+            break;
         }
         parser_advance(p);
         zan_ast_list_t params = parse_param_list(p);
@@ -576,6 +587,7 @@ ordinary_member:
             parser_expect(p, TK_SEMICOLON);
         }
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+        zan_ast_set_name_span(n, op_loc, op_token_len);
         size_t op_len = strlen(op_name);
         char *op_str = zan_arena_strdup(p->arena, op_name, op_len);
         zan_istr_t iname = { op_str, (int)op_len };
@@ -589,6 +601,7 @@ ordinary_member:
     }
 
     if (parser_check(p, TK_THIS)) {
+        zan_loc_t name_loc = p->current.loc;
         parser_advance(p);
         parser_expect(p, TK_LBRACKET);
         zan_ast_list_t idx_params;
@@ -657,6 +670,7 @@ ordinary_member:
         }
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_PROPERTY_DECL, loc);
+        zan_ast_set_name_span(n, name_loc, sizeof("this") - 1);
         zan_istr_t iname = {(char *)"Item", 4};
         n->field_decl.name = iname;
         n->field_decl.type = type;
@@ -703,6 +717,7 @@ ordinary_member:
         return n;
     }
 
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -731,6 +746,7 @@ ordinary_member:
         zan_istr_t gistr = { gname, (uint32_t)(gn + name.len) };
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_PROPERTY_DECL, loc);
+        zan_ast_set_name_span(n, name_loc, name.len);
         n->field_decl.name = name;
         n->field_decl.type = type;
         n->field_decl.initializer = NULL;
@@ -752,6 +768,7 @@ ordinary_member:
                     parser_advance(p);
                     zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
                     tp->ident.name = p->previous.str_val;
+                    zan_ast_set_name_span(tp, p->previous.loc, tp->ident.name.len);
                     zan_ast_list_push(&type_params, tp, p->arena);
                 }
                 if (!parser_match(p, TK_COMMA)) break;
@@ -781,6 +798,7 @@ ordinary_member:
         }
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+        zan_ast_set_name_span(n, name_loc, name.len);
         n->method_decl.name = name;
         n->method_decl.return_type = type;
         n->method_decl.params = params;
@@ -854,6 +872,7 @@ ordinary_member:
             }
 
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_PROPERTY_DECL, loc);
+            zan_ast_set_name_span(n, name_loc, name.len);
             n->field_decl.name = name;
             n->field_decl.type = type;
             n->field_decl.initializer = init;
@@ -900,11 +919,13 @@ ordinary_member:
     }
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_FIELD_DECL, loc);
+    zan_ast_set_name_span(n, name_loc, name.len);
     n->field_decl.name = name;
     n->field_decl.type = type;
     n->field_decl.initializer = init;
     n->field_decl.modifiers = mods;
     while (parser_match(p, TK_COMMA)) {
+        zan_loc_t extra_loc = p->current.loc;
         zan_istr_t extra = {0};
         if (parser_check(p, TK_IDENT)) {
             parser_advance(p);
@@ -918,6 +939,7 @@ ordinary_member:
             extra_init = parse_expression(p);
         }
         zan_ast_node_t *e = zan_ast_new(p->arena, AST_FIELD_DECL, loc);
+        zan_ast_set_name_span(e, extra_loc, extra.len);
         e->field_decl.name = extra;
         e->field_decl.type = type;
         e->field_decl.initializer = extra_init;

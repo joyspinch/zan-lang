@@ -126,6 +126,13 @@ static void tref_write(char *buf, int cap, int *off, zan_ast_node_t *t) {
     if (t->type_ref.is_nullable) zsrc_append(buf, cap, off, "?");
 }
 
+static zan_walk_action_t clear_generated_name_span(zan_ast_node_t *node, void *user_data) {
+    (void)user_data;
+    node->name_loc = (zan_loc_t){0};
+    node->name_len = 0;
+    return ZAN_WALK_CONTINUE;
+}
+
 static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
                              const char *dname, const char *hname,
                              zan_arena_t *arena, zan_diag_t *diag) {
@@ -212,9 +219,21 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
     zan_parser_t gp;
     zan_parser_init(&gp, &lex, arena, diag);
     zan_ast_node_t *gu = zan_parser_parse(&gp);
+    /* Generated offsets are relative to gsrc, even when file id 0 is real. */
+    zan_ast_walk(gu, clear_generated_name_span, NULL, NULL);
     for (int i = 0; i < gu->comp_unit.decls.count; i++)
         zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
                           arena);
+}
+
+static void inherit_record_type_spans(zan_ast_node_t *generated,
+                                      const zan_ast_node_t *written) {
+    if (!generated || !written || generated->kind != written->kind) return;
+    zan_ast_inherit_name_span(generated, written);
+    int count = zan_ast_child_count(written);
+    if (count != zan_ast_child_count(generated)) return;
+    for (int i = 0; i < count; i++)
+        inherit_record_type_spans(zan_ast_child_at(generated, i), zan_ast_child_at(written, i));
 }
 
 static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
@@ -319,6 +338,21 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
     zan_parser_t gp;
     zan_parser_init(&gp, &lex, arena, diag);
     zan_ast_node_t *gu = zan_parser_parse(&gp);
+    /* Generated offsets are relative to gsrc, even when file id 0 is real. */
+    zan_ast_walk(gu, clear_generated_name_span, NULL, NULL);
+    if (gu->comp_unit.decls.count > 0) {
+        zan_ast_node_t *record = gu->comp_unit.decls.items[0];
+        if (record->kind == AST_CLASS_DECL) {
+            const zan_ast_list_t *members = &record->type_decl.members;
+            for (int i = 0; i < params->count && i < members->count; i++) {
+                zan_ast_node_t *field = members->items[i];
+                if (field->kind != AST_FIELD_DECL) break;
+                zan_ast_node_t *param = params->items[i];
+                zan_ast_inherit_name_span(field, param);
+                inherit_record_type_spans(field->field_decl.type, param->param.type);
+            }
+        }
+    }
     for (int i = 0; i < gu->comp_unit.decls.count; i++)
         zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[i],
                           arena);
@@ -362,6 +396,13 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
             }
         }
         if (first) {
+            zan_ast_list_t *parts = &zan_ast_ensure_decl_meta(first, arena)->partial_decls;
+            zan_ast_list_push(parts, d, arena);
+            if (d->meta) {
+                const zan_ast_list_t *absorbed = &d->meta->partial_decls;
+                for (int pi = 0; pi < absorbed->count; pi++)
+                    zan_ast_list_push(parts, absorbed->items[pi], arena);
+            }
             /* Hoisting puts owners before their children. Reparent a later
              * part's children before comparing or merging those children. */
             for (int ni = di + 1; ni < decls->count; ni++) {
@@ -550,6 +591,7 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node, type_subst_ctx
                 zan_ast_node_t *ta = ctx->targs->items[i];
                 zan_ast_node_t *res = zan_ast_new(ctx->arena, AST_IDENTIFIER, node->loc);
                 *res = *node;
+                zan_ast_inherit_name_span(res, ta);
                 res->ident.name = ta->type_ref.name;
                 res->ident.ns_decl = ta->type_ref.ns_decl;
                 return res;
@@ -1028,6 +1070,8 @@ static void specialize_type_from_base(zan_ast_node_t *derived, zan_ast_node_t *b
 
         zan_ast_node_t *spec = zan_ast_new(arena, AST_METHOD_DECL, m->loc);
         *spec = *m;
+        /* This declaration is synthesized on the derived type. */
+        clear_generated_name_span(spec, NULL);
         spec->method_decl.return_type = clone_ast_subst(m->method_decl.return_type, &ctx);
         zan_ast_list_init(&spec->method_decl.params);
         for (int p = 0; p < m->method_decl.params.count; p++) {

@@ -660,6 +660,8 @@ static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv,
         }
         return;
     }
+    /* The original member token is the terminal type name in the receiver.
+     * Its common name span survives the in-place change of the payload. */
     recv->kind = AST_IDENTIFIER;
     recv->ident.name = t->final;
     recv->ident.inst_type_ref = NULL;

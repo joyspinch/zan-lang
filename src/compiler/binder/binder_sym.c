@@ -908,6 +908,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
+    zan_binder_record_reference(b, base->sym, type_ref);
+
     if (type_ref->type_ref.type_args.count > 0 && base->kind == TYPE_DELEGATE &&
         base->sym && base->sym->decl &&
         base->sym->decl->method_decl.type_params.count ==

@@ -319,6 +319,12 @@
 
     zan_binder_t binder;
     zan_binder_init(&binder, arena, diag);
+    semantic_query_t semantic_refs = {0};
+    if (opts.semantic_refs_file &&
+        semantic_refs_find_file(&semantic_refs, diag, opts.semantic_refs_file)) {
+        binder.symbol_reference = semantic_refs_record_symbol;
+        binder.symbol_reference_context = &semantic_refs.refs;
+    }
     zan_compile_trace("bind");
     zan_binder_bind(&binder, ast);
 
@@ -327,9 +333,7 @@
 
     zan_checker_t checker;
     zan_checker_init(&checker, &binder, arena, diag);
-    semantic_query_t semantic_refs = {0};
-    if (opts.semantic_refs_file &&
-        semantic_refs_find_file(&semantic_refs, diag, opts.semantic_refs_file)) {
+    if (binder.symbol_reference) {
         checker.lexical_ref = semantic_refs_record;
         checker.lexical_ref_context = &semantic_refs.refs;
     }
@@ -356,7 +360,7 @@
     if (opts.semantic_refs_file) {
         int rc = 1;
         if (checker.lexical_ref) {
-            rc = semantic_refs_print(&semantic_refs, opts.semantic_refs_line,
+            rc = semantic_refs_print(&semantic_refs, diag, opts.semantic_refs_line,
                                       opts.semantic_refs_col);
         } else {
             fprintf(stderr, "error: --semantic-refs requires one loaded source matching '%s'\n",

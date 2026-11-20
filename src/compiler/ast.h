@@ -128,18 +128,20 @@ typedef struct {
     zan_istr_t orig_name;
     zan_ast_list_t *ns_usings;
     zan_ast_node_t *delegate_host; /* enclosing type of a hoisted delegate */
+    zan_ast_list_t partial_decls; /* absorbed declarations, for source provenance */
 } zan_decl_meta_t;
 
 struct zan_ast_node {
-    zan_ast_kind_t kind;
     zan_loc_t loc;
+    /* Original simple-name token. A zero byte length means no source name. */
+    zan_loc_t name_loc;
+    uint32_t name_len;
 
-    uint8_t lit_suffix;
-
-    uint8_t lit_radix;
-    /* 声明来源标记（AST 节点有 120 字节预算，两个标志共用一字节）：
-     * from_stdlib = 标准库源文件，from_package = packages/ 下的库代码。
-     * 隐式控制器发现跳过库侧声明，用户项目（含模板/示例）一律参与。 */
+    uint8_t kind; /* zan_ast_kind_t */
+    unsigned char lit_suffix : 2; /* literal suffix code, 0 through 3 */
+    unsigned char lit_radix : 5;  /* literal base, at most 16 */
+    /* Implicit controller discovery skips declarations from the standard
+     * library and packages. */
     unsigned char from_stdlib : 1;
     unsigned char from_package : 1;
     uint8_t in_infer;
@@ -556,6 +558,17 @@ struct zan_ast_node {
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
 size_t zan_ast_node_count(void);
+
+static inline void zan_ast_set_name_span(zan_ast_node_t *n, zan_loc_t loc, uint32_t len) {
+    if (len == 0) return;
+    n->name_loc = loc;
+    n->name_len = len;
+}
+
+static inline void zan_ast_inherit_name_span(zan_ast_node_t *n, const zan_ast_node_t *source) {
+    n->name_loc = source->name_loc;
+    n->name_len = source->name_len;
+}
 
 /* B-ID102 子节点拓扑单一事实源：扁平枚举每个 kind 的子节点（列表展开、
  * NULL 槽计入 count 但 child_at 返 NULL），完整说明见 ast.c 实现头。

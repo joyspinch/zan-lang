@@ -81,6 +81,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
                 name, type, node, node->method_decl.modifiers);
             type->sym = sym;
             scope_add(b->arena, b->current_scope, sym);
+            zan_binder_record_reference(b, sym, node);
             continue;
         }
 
@@ -113,6 +114,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
             type->base_type = NULL;
 
             scope_add(b->arena, b->current_scope, sym);
+            zan_binder_record_reference(b, sym, node);
             syms[i] = sym;
         }
     }
@@ -248,6 +250,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                     resolve_bases(b, base_sym->decl);
                 }
                 if (base_sym->type->bases_resolved != 2) continue;
+                zan_binder_record_reference(b, base_sym, base_ref);
                 if (base_args_resolvable(b, base_ref)) {
                     zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
                     if (inst && (inst->kind == TYPE_CLASS || inst->kind == TYPE_STRUCT) &&
@@ -301,6 +304,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
             } else if (base_sym->kind == SYM_INTERFACE) {
                 if (base_sym->decl) resolve_bases(b, base_sym->decl);
                 if (base_sym->type->bases_resolved != 2) continue;
+                zan_binder_record_reference(b, base_sym, base_ref);
                 if (base_args_resolvable(b, base_ref)) {
                     zan_type_t *inst = zan_binder_resolve_type(b, base_ref);
                     if (inst && inst->kind == TYPE_INTERFACE &&
@@ -693,6 +697,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->field_decl.modifiers);
             scope_add(b->arena, b->current_scope, field_sym);
             symbol_add_member(b->arena, type_sym, field_sym);
+            zan_binder_record_reference(b, field_sym, member);
             check_member_name_clash(b, type_sym, field_sym);
             break;
         }
@@ -716,6 +721,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             b->current_scope = method_scope;
             scope_add(b->arena, b->current_scope, method_sym);
             symbol_add_member(b->arena, type_sym, method_sym);
+            zan_binder_record_reference(b, method_sym, member);
             check_member_name_clash(b, type_sym, method_sym);
             /* 扩展方法（首参带 `this`）登记到 binder 的扩展方法表，
              * 供 checker 判定"调用目标方法不存在"时使用。登记口径与
@@ -743,6 +749,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             }
             scope_add(b->arena, b->current_scope, ctor_sym);
             symbol_add_member(b->arena, type_sym, ctor_sym);
+            zan_binder_record_reference(b, ctor_sym, member);
             check_member_name_clash(b, type_sym, ctor_sym);
             break;
         }
@@ -787,6 +794,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             zan_symbol_t *em_sym = make_symbol(b->arena, SYM_ENUM_MEMBER,
                 member->enum_member.name, type_sym->type, member, MOD_PUBLIC);
             scope_add(b->arena, b->current_scope, em_sym);
+            zan_binder_record_reference(b, em_sym, member);
             symbol_add_member(b->arena, type_sym, em_sym);
             check_member_name_clash(b, type_sym, em_sym);
             break;

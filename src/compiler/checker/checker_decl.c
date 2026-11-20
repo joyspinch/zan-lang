@@ -208,54 +208,59 @@ static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
     }
 }
 
-static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr) {
-    if (!expr || expr->kind != AST_MEMBER_ACCESS) return;
-    if (expr->member.null_cond) return;
+static bool checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr,
+                                         bool report) {
+    if (!expr || expr->kind != AST_MEMBER_ACCESS) return false;
+    if (expr->member.null_cond) return false;
     zan_ast_node_t *obj = expr->member.object;
-    if (!obj) return;
+    if (!obj) return false;
 
     /* 1 */
     zan_ast_node_t *core_obj = obj;
     while (core_obj && core_obj->kind == AST_CAST_EXPR) core_obj = core_obj->cast.expr;
     if (core_obj && core_obj->kind == AST_NULL_LITERAL) {
-        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2082,
-                      "cannot access member '%.*s' on 'null'; null reference dereference faults at runtime",
-                      (int)expr->member.name.len, expr->member.name.str);
-        return;
+        if (report)
+            zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2082,
+                "cannot access member '%.*s' on 'null'; null reference dereference faults at runtime",
+                (int)expr->member.name.len, expr->member.name.str);
+        return true;
     }
 
     zan_symbol_t *m = NULL;
     if (obj->kind == AST_CALL) {
-        if (obj != c->last_call_node) return;
+        if (obj != c->last_call_node) return false;
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
-        if (obj->ident.is_type_receiver) return;
+        if (obj->ident.is_type_receiver) return false;
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
         if (l && l->type && l->type->is_nullable) {
             if (c->current_body && !node_guards_null(c->current_body, obj->ident.name, 0, expr->loc)) {
-                zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2109,
-                              "possible null reference dereference: '%.*s' is a nullable type '%s'; "
-                              "access via '?.' or assert via '!' or check for null first",
-                              (int)obj->ident.name.len, obj->ident.name.str,
-                              type_name(l->type));
-                return;
+                if (report)
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2109,
+                        "possible null reference dereference: '%.*s' is a nullable type '%s'; "
+                        "access via '?.' or assert via '!' or check for null first",
+                        (int)obj->ident.name.len, obj->ident.name.str,
+                        type_name(l->type));
+                return true;
             }
         }
-        if (!l || !l->null_src) return;
-        if (!c->current_body) return;
+        if (!l || !l->null_src) return false;
+        if (!c->current_body) return false;
         if (node_guards_null(c->current_body, obj->ident.name, 0, expr->loc))
-            return;
+            return false;
         m = l->null_src;
     } else {
-        return;
+        return false;
     }
-    if (!method_can_return_null(m)) return;
-    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2083,
-                  "'%.*s' can return null; accessing '%.*s' on its result "
-                  "faults at runtime -- use '?.', or store it and check for "
-                  "null first",
-                  (int)m->name.len, m->name.str,
-                  (int)expr->member.name.len, expr->member.name.str);
+    if (!method_can_return_null(m)) return false;
+    if (report)
+        zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2083,
+            "'%.*s' can return null; accessing '%.*s' on its result "
+            "faults at runtime -- use '?.', or store it and check for "
+            "null first",
+            (int)m->name.len, m->name.str,
+            (int)expr->member.name.len, expr->member.name.str);
+    return true;
 }
 
 static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
@@ -540,7 +545,14 @@ static bool checker_type_is_expr_tree_target(zan_type_t *t) {
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee,
                                        zan_ast_node_t *call) {
-    checker_reject_null_receiver(c, expr);
+    bool null_receiver = checker_reject_null_receiver(c, expr, true);
+    bool type_receiver = false;
+    bool receiver_known = false;
+    if (c->binder->symbol_reference) {
+        receiver_known = !null_receiver && checker_reference_receiver(c,
+            expr->member.object, obj_type, &type_receiver);
+        if (!receiver_known) c->last_unproven_reference_expr = expr;
+    }
     if (expr->member.object) {
         zan_symbol_t *mg = expr_method_group(c, expr->member.object);
         if (mg) {
@@ -649,6 +661,16 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                 if (tps->count == obj_type->type_arg_count) {
                     mt = zan_binder_subst_named(c->binder, mt, tps, obj_type->type_args);
                 }
+            }
+            if (c->binder->symbol_reference &&
+                (hit->kind == SYM_FIELD || hit->kind == SYM_PROPERTY ||
+                 hit->kind == SYM_ENUM_MEMBER)) {
+                bool is_static = hit->kind == SYM_ENUM_MEMBER ||
+                    (hit->modifiers & MOD_STATIC);
+                if (!receiver_known || type_receiver != is_static)
+                    c->last_unproven_reference_expr = expr;
+                else if (!in_call_callee && mt && mt->kind != TYPE_ERROR)
+                    zan_binder_record_reference(c->binder, hit, expr);
             }
             return mt ? mt : c->binder->type_error;
         }

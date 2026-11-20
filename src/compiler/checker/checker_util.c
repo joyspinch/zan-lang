@@ -31,6 +31,12 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
 static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name);
 static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m);
 static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m, zan_loc_t loc);
+static struct checker_local *checker_lookup_local(zan_checker_t *c, zan_istr_t name,
+                                                  bool include_untyped);
+static bool checker_reference_receiver(zan_checker_t *c, zan_ast_node_t *obj,
+                                       zan_type_t *type, bool *is_type);
+static bool checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr,
+                                         bool report);
 
 static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
                                         zan_type_t **arg_types) {
@@ -42,6 +48,7 @@ static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
     zan_type_t *base = zan_binder_make_task_type(c->binder, NULL);
     if (arg->kind == AST_LAMBDA) return base;
     zan_symbol_t *owner = NULL;
+    zan_type_t *receiver_type = NULL;
     zan_istr_t name = {0};
     int receiver = 0;
     if (arg->kind == AST_IDENTIFIER && !checker_find_local(c, arg->ident.name) &&
@@ -50,8 +57,8 @@ static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
         name = arg->ident.name;
     } else if (arg->kind == AST_MEMBER_ACCESS) {
         zan_ast_node_t *obj = arg->member.object;
-        zan_type_t *ot = zan_checker_check_expr(c, obj);
-        owner = ot ? ot->sym : NULL;
+        receiver_type = zan_checker_check_expr(c, obj);
+        owner = receiver_type ? receiver_type->sym : NULL;
         name = arg->member.name;
         receiver = 2;
         if (obj->kind == AST_IDENTIFIER && !checker_find_local(c, obj->ident.name) &&
@@ -66,7 +73,17 @@ static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
     zan_symbol_t *method = zan_binder_task_action_method(c->binder, owner, name,
         receiver, has_this, &action_error);
     if (method) {
-        if (!access_member_allowed(c, method)) report_inaccessible(c, method, arg->loc);
+        bool accessible = access_member_allowed(c, method);
+        if (!accessible) report_inaccessible(c, method, arg->loc);
+        if (c->binder->symbol_reference && accessible && !action_error) {
+            bool is_type;
+            bool known = arg->kind == AST_IDENTIFIER
+                ? !checker_lookup_local(c, arg->ident.name, true)
+                : checker_reference_receiver(c, arg->member.object, receiver_type,
+                    &is_type) && is_type == (receiver == 1) &&
+                    !checker_reject_null_receiver(c, arg, false);
+            if (known) zan_binder_record_reference(c->binder, method, arg);
+        }
         if (action_error)
             zan_diag_emit_code(c->diag, DIAG_ERROR, arg->loc, 3052,
                 action_error == 2 ? "Task method group requires a matching receiver (instance methods need this)" :
@@ -463,7 +480,7 @@ static void checker_push_local(zan_checker_t *c, zan_istr_t name,
 static void checker_add_local(zan_checker_t *c, zan_istr_t name,
                               zan_type_t *type, const zan_ast_node_t *decl) {
     if (!type || type == c->binder->type_error) {
-        if (!c->lexical_ref || !decl) return;
+        if ((!c->lexical_ref && !c->binder->symbol_reference) || !decl) return;
         /* Untyped declarations still shadow for navigation. Type lookup skips them. */
         type = NULL;
     }
@@ -485,6 +502,62 @@ static void checker_record_lexical_ref(zan_checker_t *c, const zan_ast_node_t *u
     if (name_loc.line && name_loc.file_id == use->loc.file_id)
         c->lexical_ref(c->lexical_ref_context, l->name, l->decl->kind == AST_PARAM,
                        name_loc, use->loc);
+}
+
+static bool checker_in_static_method(zan_checker_t *c) {
+    return c->current_method_decl &&
+        (c->current_method_decl->method_decl.modifiers & MOD_STATIC);
+}
+
+static bool checker_is_type_symbol(const zan_symbol_t *sym) {
+    return sym && (sym->kind == SYM_CLASS || sym->kind == SYM_STRUCT ||
+                   sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM ||
+                   sym->kind == SYM_DELEGATE);
+}
+
+/* An untyped local may fall through to a same-named member or global
+ * during recovery. The inferred type alone cannot certify that receiver. */
+static bool checker_reference_receiver(zan_checker_t *c,
+                                       zan_ast_node_t *obj, zan_type_t *type,
+                                       bool *is_type) {
+    *is_type = false;
+    if (!obj || !type || type->kind == TYPE_ERROR ||
+        obj == c->last_unproven_reference_expr) return false;
+    switch (obj->kind) {
+    case AST_IDENTIFIER: {
+        if (obj->ident.is_type_receiver || obj->ident.inst_type_ref) {
+            *is_type = true;
+            return true;
+        }
+        struct checker_local *local = checker_lookup_local(c, obj->ident.name, true);
+        if (local) return local->type && local->type->kind != TYPE_ERROR;
+        zan_symbol_t *field = checker_find_field(c->current_type_sym, obj->ident.name);
+        if (field)
+            return access_member_allowed(c, field) &&
+                ((field->modifiers & MOD_STATIC) || !checker_in_static_method(c));
+        zan_symbol_t *sym = zan_binder_lookup(c->binder, obj->ident.name);
+        *is_type = checker_is_type_symbol(sym);
+        return *is_type || (sym && (sym->kind == SYM_LOCAL || sym->kind == SYM_PARAM));
+    }
+    case AST_THIS_EXPR:
+    case AST_BASE_EXPR:
+        return !checker_in_static_method(c);
+    default:
+        return true;
+    }
+}
+
+static void checker_record_bare_field(zan_checker_t *c, zan_symbol_t *field,
+                                       zan_ast_node_t *expr) {
+    if (!c->binder->symbol_reference) return;
+    if (!access_member_allowed(c, field) ||
+        (!(field->modifiers & MOD_STATIC) && checker_in_static_method(c))) {
+        c->last_unproven_reference_expr = expr;
+        return;
+    }
+    if (field->type && field->type->kind != TYPE_ERROR &&
+        expr != c->last_unproven_reference_expr)
+        zan_binder_record_reference(c->binder, field, expr);
 }
 
 static void checker_mark_local_null_src(zan_checker_t *c, zan_ast_node_t *decl) {

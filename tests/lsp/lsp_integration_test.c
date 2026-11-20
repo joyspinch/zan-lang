@@ -1147,6 +1147,247 @@ static int run_semantic_and_hint_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
+typedef struct {
+    const char *uri;
+    int line, column;
+} workspace_location_t;
+
+static void workspace_uri(const char *path, char *uri) {
+    static const char hex[] = "0123456789ABCDEF";
+    const char *prefix = path[0] == '/' ? "file://" : "file:///";
+    strcpy(uri, prefix);
+    uri += strlen(prefix);
+    for (; *path; path++) {
+        unsigned char c = (unsigned char)*path;
+        if (c == '\\') c = '/';
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || strchr("-_.~/:", c)) {
+            *uri++ = (char)c;
+        } else {
+            *uri++ = '%';
+            *uri++ = hex[c >> 4];
+            *uri++ = hex[c & 15];
+        }
+    }
+    *uri = '\0';
+}
+
+static bool workspace_range_is(json_value *item, workspace_location_t at, int length) {
+    json_value *range = json_obj_get(item, "range");
+    json_value *start = json_obj_get(range, "start");
+    json_value *end = json_obj_get(range, "end");
+    return json_get_num(json_obj_get(start, "line"), -1) == at.line &&
+           json_get_num(json_obj_get(end, "line"), -1) == at.line &&
+           json_get_num(json_obj_get(start, "character"), -1) == at.column &&
+           json_get_num(json_obj_get(end, "character"), -1) == at.column + length;
+}
+
+/* Match the whole set, including the URI and both ends of each range. */
+static bool workspace_locations_exact(json_value *result, const workspace_location_t *expected,
+                                      int count, int length, const char *new_text) {
+    json_value *changes = json_obj_get(result, "changes");
+    if (new_text) {
+        if (!json_is(changes, JSON_OBJ)) return false;
+        int total = 0;
+        for (int i = 0; i < changes->as.obj.count; i++) {
+            int edits = json_arr_count(changes->as.obj.vals[i]);
+            if (edits <= 0) return false;
+            total += edits;
+        }
+        if (total != count) return false;
+    } else if (json_arr_count(result) != count) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        json_value *items = new_text ? json_obj_get(changes, expected[i].uri) : result;
+        int hits = 0;
+        for (int j = 0; j < json_arr_count(items); j++) {
+            json_value *item = json_arr_at(items, j);
+            const char *value = json_get_str(json_obj_get(item, new_text ? "newText" : "uri"));
+            if (value && strcmp(value, new_text ? new_text : expected[i].uri) == 0 &&
+                workspace_range_is(item, expected[i], length)) hits++;
+        }
+        if (hits != 1) return false;
+    }
+    return true;
+}
+
+static void check_workspace_response(bool matches, const char *description, char *response,
+                                     json_value *parsed) {
+    ext_check(matches, description);
+    if (!matches) fprintf(stderr, "LSP response: %s\n", response ? response : "(none)");
+    json_free(parsed);
+    free(response);
+}
+
+static void check_workspace_symbols(child_t *child, const char *fields_uri, const char *part_uri,
+                                    const char *caller_uri, const char *fields_text,
+                                    const char *caller_text) {
+    const workspace_location_t field[] = {
+        {fields_uri, 1, 15}, {fields_uri, 2, 43}, {part_uri, 1, 47}, {caller_uri, 3, 30}
+    };
+    const workspace_location_t method[] = {
+        {fields_uri, 2, 15}, {caller_uri, 4, 19}, {caller_uri, 7, 20}
+    };
+
+    for (int first = 0; first < 2; first++) {
+        char *response = request_at_marker_ex(child, fields_uri, fields_text, "public int ",
+                                              "textDocument/references", NULL, first == 0);
+        json_value *root = response ? json_parse(response) : NULL;
+        check_workspace_response(workspace_locations_exact(json_obj_get(root, "result"),
+                                 field + first, 4 - first, 6, NULL),
+            first == 0 ? "workspace references: declaration and three exact uses across three files"
+                       : "workspace references: includeDeclaration false leaves only the three uses",
+            response, root);
+    }
+
+    char *response = request_at_marker(child, caller_uri, caller_text, "*/ left.",
+                                       "textDocument/prepareRename", NULL);
+    json_value *root = response ? json_parse(response) : NULL;
+    json_value *result = json_obj_get(root, "result");
+    const char *placeholder = json_get_str(json_obj_get(result, "placeholder"));
+    check_workspace_response(placeholder && strcmp(placeholder, "amount") == 0 &&
+                             workspace_range_is(result, field[3], 6),
+                             "workspace prepareRename: unsaved field use at UTF-16 3:30..36",
+                             response, root);
+
+    response = request_at_marker(child, caller_uri, caller_text, "*/ left.",
+                                 "textDocument/rename", "totalAmount");
+    root = response ? json_parse(response) : NULL;
+    check_workspace_response(workspace_locations_exact(json_obj_get(root, "result"),
+                             field, 4, 6, "totalAmount"),
+                             "workspace rename: only the selected field across both partials and the caller",
+                             response, root);
+
+    response = request_at_marker(child, caller_uri, caller_text, "+ left.",
+                                 "textDocument/references", NULL);
+    root = response ? json_parse(response) : NULL;
+    check_workspace_response(workspace_locations_exact(json_obj_get(root, "result"),
+                             method, 3, 4, NULL),
+                             "workspace references: Read(int), its call and its method group",
+                             response, root);
+
+    response = request_at_marker(child, caller_uri, caller_text, "+ left.",
+                                 "textDocument/rename", "ReadNumber");
+    root = response ? json_parse(response) : NULL;
+    check_workspace_response(workspace_locations_exact(json_obj_get(root, "result"),
+                             method, 3, 4, "ReadNumber"),
+                             "workspace rename: only the selected overload declaration and uses",
+                             response, root);
+
+    /* The edited program still type-checks, but the parameter captures the unqualified use. */
+    response = request_at_marker(child, caller_uri, caller_text, "*/ left.",
+                                 "textDocument/rename", "captured");
+    root = response ? json_parse(response) : NULL;
+    check_workspace_response(json_get_num(json_path(root, "error.code"), 0) == -32602 &&
+                             !json_obj_get(root, "result"),
+                             "workspace rename: captured field use rejects all edits with -32602",
+                             response, root);
+}
+
+static int run_workspace_symbol_checks(const char *exe) {
+    static const char *names[] = {"Fields.zan", "Part.zan", "Caller.zan"};
+    static const char *texts[] = {
+        "partial class ProjectLeft {\n"
+        "    public int amount;\n"
+        "    public int Read(int captured) { return amount + captured; }\n"
+        "}\n",
+        "partial class ProjectLeft {\n"
+        "    public int Read(string text) { return this.amount; }\n"
+        "}\n"
+        "class ProjectRight {\n"
+        "    public int amount;\n"
+        "    public int Read(int number) { return this.amount + number; }\n"
+        "}\n",
+        "class ProjectCaller {\n"
+        "    int Total(ProjectLeft left, ProjectRight right) {\n"
+        "        return right.amount + right.Read(2);\n"
+        "    }\n"
+        "}\n"
+    };
+    static const char caller_text[] =
+        "class ProjectCaller {\n"
+        "    int Total(ProjectLeft left, ProjectRight right) {\n"
+        "        // Unsaved references follow.\n"
+        "        return /* \xE4\xB8\xAD\xF0\x9F\x98\x80 */ left.amount + right.amount\n"
+        "            + left.Read(2) + left.Read(\"x\") + right.Read(2);\n"
+        "    }\n"
+        "    ProjectReader Bind(ProjectLeft left) {\n"
+        "        return left.Read;\n"
+        "    }\n"
+        "}\n"
+        "delegate int ProjectReader(int number);\n";
+    char directory[600];
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    DWORD length = GetTempPathA(sizeof(tmp), tmp);
+    if (!length || length >= sizeof(tmp)) return 1;
+    snprintf(directory, sizeof(directory), "%szan_lsp_symbols_%lu", tmp,
+             (unsigned long)GetCurrentProcessId());
+    bool created = CreateDirectoryA(directory, NULL) != 0;
+#else
+    strcpy(directory, "/tmp/zan_lsp_symbols_XXXXXX");
+    bool created = mkdtemp(directory) != NULL;
+#endif
+    if (!created) {
+        ext_check(false, "workspace symbols: create fixture directory");
+        return 1;
+    }
+
+    char paths[3][700] = {{0}};
+    char uris[3][3 * sizeof(paths[0]) + 8];
+    for (int i = 0; i < 3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", directory, names[i]);
+        FILE *file = fopen(paths[i], "wb");
+        if (!file) {
+            ext_check(false, "workspace symbols: open fixture source for writing");
+            goto cleanup;
+        }
+        bool written = fputs(texts[i], file) != EOF;
+        if (fclose(file) != 0 || !written) {
+            ext_check(false, "workspace symbols: write fixture source");
+            goto cleanup;
+        }
+        workspace_uri(paths[i], uris[i]);
+    }
+
+    child_t child;
+    if (!child_spawn(&child, exe)) {
+        ext_check(false, "workspace symbols: spawn zan-lsp");
+        goto cleanup;
+    }
+    char root_uri[3 * sizeof(directory) + 8];
+    workspace_uri(directory, root_uri);
+    json_value *params = json_new_obj();
+    json_obj_set(params, "rootUri", json_new_str(root_uri));
+    send_message(&child, mk_request(1, "initialize", params));
+    char *response = recv_until_id(&child, 1);
+    if (response) {
+        free(response);
+        completion_document(&child, uris[0], texts[0], 1, true);
+        completion_document(&child, uris[2], texts[2], 1, true);
+        completion_document(&child, uris[2], caller_text, 2, false);
+        check_workspace_symbols(&child, uris[0], uris[1], uris[2], texts[0], caller_text);
+        send_message(&child, mk_request(199, "shutdown", json_new_obj()));
+        json_value *msg = json_new_obj();
+        json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
+        json_obj_set(msg, "method", json_new_str("exit"));
+        send_message(&child, msg);
+    } else {
+        ext_check(false, "workspace symbols: receive initialize response");
+    }
+    child_close(&child);
+
+cleanup:
+    for (int i = 0; i < 3; i++) if (paths[i][0]) remove(paths[i]);
+#ifdef _WIN32
+    RemoveDirectoryA(directory);
+#else
+    rmdir(directory);
+#endif
+    return ext_fails ? 1 : 0;
+}
+
 #define CANCEL_FILES 300
 #define CANCEL_FILLER_LINES 1200
 
@@ -1437,6 +1678,9 @@ int main(int argc, char **argv) {
 
     if (rc == 0)
         rc = run_semantic_and_hint_checks(&child);
+
+    if (rc == 0)
+        rc = run_workspace_symbol_checks(argv[1]);
 
     if (rc == 0)
         rc = run_cancel_checks(argv[1]);

@@ -29,6 +29,8 @@ struct zan_checker {
     int lambda_depth;
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
+    /* Immediate consumer must not use a recovery type as navigation evidence. */
+    const zan_ast_node_t *last_unproven_reference_expr;
     zan_ast_node_t *current_body;
     zan_ast_node_t *current_method_decl;
     /* 已经报过"null 绑不上值类型形参"的实参位置：同一个实参只报一次

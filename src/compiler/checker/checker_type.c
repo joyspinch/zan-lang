@@ -860,6 +860,26 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
     return checker_type_assignable(dst, src);
 }
 
+/* Open or erroneous types can pass through a scorer without proving a match. */
+static bool checker_call_type_known(zan_type_t *type, int depth) {
+    if (!type || depth == 32 || type->kind == TYPE_ERROR ||
+        type->kind == TYPE_TYPE_PARAM) return false;
+    if (type->element_type && !checker_call_type_known(type->element_type, depth + 1))
+        return false;
+    if (type->delegate_ret_type &&
+        !checker_call_type_known(type->delegate_ret_type, depth + 1)) return false;
+    for (int i = 0; i < type->delegate_param_count; i++) {
+        if (!type->delegate_param_types ||
+            !checker_call_type_known(type->delegate_param_types[i], depth + 1))
+            return false;
+    }
+    for (int i = 0; i < type->type_arg_count; i++) {
+        if (!type->type_args || !checker_call_type_known(type->type_args[i], depth + 1))
+            return false;
+    }
+    return true;
+}
+
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
 
@@ -881,9 +901,9 @@ static zan_symbol_t *checker_method_group_type_receiver(zan_checker_t *c,
 }
 
 /* Resolve against the actual receiver form; binder owns signature and
- * overload selection. Probing an outer overload must not cache its candidate. */
+ * overload selection. Probing an outer overload must not publish its candidate. */
 static zan_symbol_t *checker_method_group_candidate(zan_checker_t *c,
-        zan_ast_node_t *expr, zan_type_t *target) {
+        zan_ast_node_t *expr, zan_type_t *target, bool record) {
     zan_symbol_t *group = expr_method_group(c, expr);
     if (!group) return NULL;
     zan_type_t *receiver = NULL;
@@ -905,20 +925,35 @@ static zan_symbol_t *checker_method_group_candidate(zan_checker_t *c,
             receiver = zan_checker_check_expr(c, obj);
         }
     }
-    return zan_binder_method_group(c->binder, receiver, group->name, form,
-                                   target, NULL);
+    zan_symbol_t *method = zan_binder_method_group(c->binder, receiver, group->name,
+                                                    form, target, NULL);
+    if (record && method && checker_call_type_known(target, 0) &&
+        access_member_allowed(c, method)) {
+        if (expr->kind == AST_IDENTIFIER) {
+            if (!checker_lookup_local(c, expr->ident.name, true))
+                zan_binder_record_reference(c->binder, method, expr);
+        } else {
+            bool is_type;
+            if (checker_reference_receiver(c, expr->member.object, receiver, &is_type) &&
+                is_type == (form == ZAN_METHOD_GROUP_TYPE) &&
+                !checker_reject_null_receiver(c, expr, false))
+                zan_binder_record_reference(c->binder, method, expr);
+        }
+    }
+    return method;
 }
 
 static bool method_group_matches_delegate(zan_checker_t *c, zan_ast_node_t *expr,
                                          zan_type_t *target) {
-    return checker_method_group_candidate(c, expr, target) != NULL;
+    return checker_method_group_candidate(c, expr, target, false) != NULL;
 }
 
 static bool checker_bind_method_group(zan_checker_t *c, zan_ast_node_t *expr,
-                                      zan_type_t *target) {
-    bool matches = method_group_matches_delegate(c, expr, target);
+                                      zan_type_t *target, bool record) {
+    zan_symbol_t *method = checker_method_group_candidate(c, expr, target,
+        record && c->binder->symbol_reference);
     zan_binder_set_method_group_target(expr, target);
-    return matches;
+    return method != NULL;
 }
 
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
@@ -946,7 +981,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
             }
             /* 方法组 → 委托：签名兼容才放行，不兼容当场报——
              * 静默放行会走到发码侧按错误签名调用（B-ID48）。 */
-            if (!checker_bind_method_group(c, expr, target)) {
+            if (!checker_bind_method_group(c, expr, target, true)) {
                 zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2098,
                     "method '%.*s' cannot be converted to delegate type "
                     "'%s': signature is not compatible",
@@ -1018,7 +1053,6 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee,
                                        zan_ast_node_t *call);
-static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
 static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;

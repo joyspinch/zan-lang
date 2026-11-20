@@ -33,7 +33,28 @@ static json_value *semantic_ref_json_location(const char *file, zan_loc_t loc,
     return value;
 }
 
-static int semantic_refs_print(semantic_query_t *query, uint32_t line, uint32_t col) {
+static const char *semantic_ref_kind_name(zan_sym_kind_t kind) {
+    switch (kind) {
+    case SYM_CLASS: return "class";
+    case SYM_STRUCT: return "struct";
+    case SYM_INTERFACE: return "interface";
+    case SYM_ENUM: return "enum";
+    case SYM_METHOD: return "method";
+    case SYM_CONSTRUCTOR: return "constructor";
+    case SYM_FIELD: return "field";
+    case SYM_PROPERTY: return "property";
+    case SYM_PARAM: return "parameter";
+    case SYM_LOCAL: return "local";
+    case SYM_ENUM_MEMBER: return "enum-member";
+    case SYM_TYPE_PARAM: return "type-parameter";
+    case SYM_DELEGATE: return "delegate";
+    case SYM_NAMESPACE: return "namespace";
+    }
+    return "unknown";
+}
+
+static int semantic_refs_print(semantic_query_t *query, const zan_diag_t *diag,
+                               uint32_t line, uint32_t col) {
     semantic_refs_t *refs = &query->refs;
     semantic_refs_sort(refs);
     const semantic_ref_t *symbol = semantic_refs_select(refs, line, col, NULL);
@@ -42,19 +63,28 @@ static int semantic_refs_print(semantic_query_t *query, uint32_t line, uint32_t 
     json_obj_set(result, "format", json_new_str("zan.semantic-refs.v1"));
     if (symbol) {
         json_value *value = json_new_obj();
-        json_obj_set(value, "kind", json_new_str(symbol->is_parameter ? "parameter" : "local"));
+        json_obj_set(value, "kind", json_new_str(semantic_ref_kind_name(symbol->kind)));
         json_obj_set(value, "name", json_new_str(symbol->name.str));
         json_obj_set(value, "declaration", semantic_ref_json_location(
-            query->file, symbol->declaration, symbol->name.len));
+            diag->file_names[symbol->declaration.file_id], symbol->declaration,
+            symbol->declaration_length));
         json_obj_set(result, "symbol", value);
 
         bool ambiguous = false;
+        json_value *parts = NULL;
         for (size_t i = 0; i < refs->count;) {
             const semantic_ref_t *ref = semantic_refs_next(refs, symbol, &i, &ambiguous);
-            if (ref && ref->occurrence.offset != symbol->declaration.offset)
-                json_arr_add(locations, semantic_ref_json_location(
-                    query->file, ref->occurrence, ref->name.len));
+            if (!ref || semantic_ref_same_location(ref->occurrence, ref->declaration)) continue;
+            json_value *location = semantic_ref_json_location(diag->file_names[ref->occurrence.file_id],
+                                                              ref->occurrence, ref->occurrence_length);
+            if (ref->is_declaration) {
+                if (!parts) parts = json_new_arr();
+                json_arr_add(parts, location);
+            } else {
+                json_arr_add(locations, location);
+            }
         }
+        if (parts) json_obj_set(value, "additionalDeclarations", parts);
     } else {
         json_obj_set(result, "symbol", json_new_null());
     }

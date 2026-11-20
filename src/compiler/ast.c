@@ -4,7 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-_Static_assert(sizeof(zan_ast_node_t) <= 120, "AST node layout regressed");
+_Static_assert(AST__COUNT <= UINT8_MAX + 1u, "AST kind no longer fits in a byte");
+_Static_assert(sizeof(zan_ast_node_t) <= 136, "AST node layout regressed");
 
 static _Thread_local size_t g_ast_node_count;
 
@@ -31,8 +32,10 @@ zan_decl_meta_t *zan_ast_ensure_decl_meta(zan_ast_node_t *n, zan_arena_t *arena)
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc) {
     zan_ast_node_t *node = (zan_ast_node_t *)zan_arena_alloc(arena, sizeof(zan_ast_node_t));
     g_ast_node_count++;
-    node->kind = kind;
+    node->kind = (uint8_t)kind;
     node->loc = loc;
+    node->name_loc = (zan_loc_t){0};
+    node->name_len = 0;
     node->lit_suffix = 0;
     node->meta = NULL;
     if (kind == AST_ASSIGNMENT || kind == AST_BINARY) {

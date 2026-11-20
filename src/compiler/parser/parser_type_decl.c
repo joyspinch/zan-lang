@@ -15,6 +15,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
         return parser_error_node(p);
     }
 
+    zan_loc_t name_loc = p->current.loc;
     zan_istr_t name = {0};
     if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
@@ -37,6 +38,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
                 parser_advance(p);
                 zan_ast_node_t *tp = zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
                 tp->ident.name = p->previous.str_val;
+                zan_ast_set_name_span(tp, p->previous.loc, tp->ident.name.len);
                 tp->ident.variance = variance;
                 zan_ast_list_push(&type_params, tp, p->arena);
             }
@@ -69,6 +71,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
                 parser_advance(p);
                 zan_ast_node_t *em = zan_ast_new(p->arena, AST_ENUM_MEMBER, member_loc);
                 em->enum_member.name = p->previous.str_val;
+                zan_ast_set_name_span(em, p->previous.loc, em->enum_member.name.len);
                 em->enum_member.value = NULL;
                 if (parser_match(p, TK_EQ)) {
                     em->enum_member.value = parse_expression(p);
@@ -101,6 +104,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     }
 
     zan_ast_node_t *n = zan_ast_new(p->arena, kind, loc);
+    zan_ast_set_name_span(n, name_loc, name.len);
     n->type_decl.name = name;
     n->type_decl.type_params = type_params;
     n->type_decl.bases = bases;

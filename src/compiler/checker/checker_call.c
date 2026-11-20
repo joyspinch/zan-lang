@@ -213,9 +213,16 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
                                                 zan_ast_node_t *call,
-                                                zan_type_t **args) {
+                                                zan_type_t **args,
+                                                bool *exact) {
     zan_symbol_t *best = NULL;
     int best_score = -1;
+    bool tied = false;
+    bool incomplete = false;
+    bool observe = c->binder->symbol_reference != NULL;
+    bool interface_dispatch = observe && recv_type && recv_type->kind == TYPE_INTERFACE;
+    int interface_candidates = 0;
+    *exact = false;
     /* null 实参把候选判死的现场：留一份用于报错（见函数末尾）。 */
     zan_type_t *null_bad_type = NULL;
     int null_bad_index = -1;
@@ -232,16 +239,37 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
             int mtps = (m->decl && m->decl->kind == AST_METHOD_DECL)
                 ? m->decl->method_decl.type_params.count : 0;
             if (type_arg_count > 0 && mtps != type_arg_count) continue;
+            /* Interface emission still selects by arity. A typed winner in a
+             * same-arity interface overload set cannot certify that call. */
+            if (interface_dispatch && ++interface_candidates > 1) incomplete = true;
             zan_ast_list_t *ps = &m->decl->method_decl.params;
             int score = 0;
             bool compatible = true;
+            bool checked = (!mtps || type_arg_count == mtps) && argc <= ps->count;
+            if (observe && ((method_is_params_tail(m) && argc >= ps->count) ||
+                (recv_type && recv_type->type_arg_count > 0 && s != recv_type->sym))) {
+                /* The checker only scores one params element and does not
+                 * map a constructed derived receiver to each base owner. */
+                incomplete = true;
+            }
             for (int j = 0; j < argc && j < ps->count; j++) {
                 zan_ast_node_t *arg = call->call.args.items[j];
-                if (!arg || arg->kind == AST_NAMED_ARG ||
-                    arg->kind == AST_REF_ARG) continue;
+                if (!arg || arg->kind == AST_NAMED_ARG || arg->kind == AST_REF_ARG) {
+                    checked = false;
+                    continue;
+                }
                 zan_ast_node_t *param = ps->items[j];
-                if (!param || param->kind != AST_PARAM) continue;
+                if (!param || param->kind != AST_PARAM) {
+                    checked = false;
+                    continue;
+                }
+                if (param->param.by_ref) checked = false;
                 zan_type_t *pt = zan_binder_resolve_type(c->binder, param->param.type);
+                if (observe && mtps && type_mentions_tp_checker(pt,
+                        &m->decl->method_decl.type_params)) {
+                    /* This scorer has no method-level type substitution. */
+                    incomplete = true;
+                }
                 if (param->param.is_params && pt && pt->kind == TYPE_ARRAY)
                     pt = pt->element_type;
                 if (pt && recv_type && recv_type->type_arg_count > 0 && s && s->decl &&
@@ -262,6 +290,8 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                  * 因此绑到了 App 那个重载上，无限自我递归。 */
                 zan_ast_node_t *lam = zan_ast_lambda_source(arg);
                 if (lam) {
+                    /* Shape scoring does not check the whole target conversion. */
+                    checked = false;
                     if (!pt || pt->kind == TYPE_ERROR) continue;
                     if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
                     if (checker_type_is_expr_tree_target(pt)) {
@@ -354,15 +384,20 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                      * 类型），不比签名会全候选同分，退化成"第一个同名
                      * 重载"（B-ID48：On 四重载错绑 Action，运行期腐坏
                      * 形参）。 */
-                    if (!pt || pt->kind == TYPE_ERROR) continue;
-                    if (pt->kind == TYPE_TYPE_PARAM) continue; /* T 可能是委托 */
+                    if (!pt || pt->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM) {
+                        checked = false;
+                        continue;
+                    }
                     if (pt->kind == TYPE_DELEGATE) {
                         if (j < 16 && !mg_delegate_candidates[j])
                             mg_delegate_candidates[j] = pt;
-                        if (!method_group_matches_delegate(c, mg_probe, pt)) {
+                        zan_symbol_t *method = checker_method_group_candidate(c, mg_probe, pt, false);
+                        if (!method) {
                             compatible = false;
                             break;
                         }
+                        if (observe && (!access_member_allowed(c, method) ||
+                                        !checker_call_type_known(pt, 0))) checked = false;
                         score += 4;
                         continue;
                     }
@@ -371,7 +406,14 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 }
                 if (!pt || !at || pt->kind == TYPE_ERROR ||
                     at->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM ||
-                    at->kind == TYPE_TYPE_PARAM) continue;
+                    at->kind == TYPE_TYPE_PARAM) {
+                    checked = false;
+                    continue;
+                }
+                if (observe && checked &&
+                    (!checker_call_type_known(pt, 0) || !checker_call_type_known(at, 0) ||
+                     at->kind == TYPE_VOID))
+                    checked = false;
                 /* null 字面量：只能绑到接得住 null 的形参（与 irgen 同一条
                  * 规则，见 zan_null_arg_score）。 */
                 if (arg->kind == AST_NULL_LITERAL) {
@@ -394,6 +436,9 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 break;
             }
             if (!compatible) continue;
+            if (!checked) incomplete = true;
+            if (score > best_score) tied = false;
+            else if (score == best_score && best != m) tied = true;
             if (score > best_score ||
                 (score == best_score && best &&
                  method_is_params_tail(best) && !method_is_params_tail(m))) {
@@ -441,6 +486,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
         }
     }
     if (best) {
+        *exact = observe && !tied && !incomplete;
         /* Commit only the winning outer signature, so cleanup and untyped
          * value emission see the same target as typed call emission. */
         zan_ast_list_t *ps = &best->decl->method_decl.params;

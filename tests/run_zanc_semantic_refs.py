@@ -1,4 +1,4 @@
-"""Exercise the C checker's local and parameter navigation through zanc."""
+"""Exercise lexical and project-wide binding navigation through zanc."""
 
 import argparse
 import json
@@ -56,7 +56,7 @@ def run(zanc, *args, cwd):
 
 
 def location(path, line, fragment, name):
-    text = SOURCE.splitlines()[line - 1].encode("utf-8")
+    text = path.read_bytes().splitlines()[line - 1]
     fragment = fragment.encode("utf-8")
     token = name.encode("utf-8")
     col = text.index(fragment) + fragment.index(token) + 1
@@ -154,7 +154,9 @@ def check(zanc, work):
         loc(34, "= caught", "caught"),
     ])
     empty = {"format": FORMAT, "symbol": None, "references": []}
-    assert query(loc(13, "Navigation.value", "value")) == empty
+    expect("field", "value", loc(2, "int value", "value"), [
+        loc(13, "Navigation.value", "value"),
+    ])
     assert query(loc(13, "return first", "first"), len("first")) == empty
 
     for args in ((FLAG,), (FLAG, path.name, "0", "1"),
@@ -173,6 +175,81 @@ def check(zanc, work):
     assert b"zan-diagnostic-v1" in invalid.stderr and not output.exists(), invalid
 
 
+def check_project(zanc, work):
+    alpha = work / "Alpha.zan"
+    part = work / "Alpha.Part.zan"
+    beta = work / "Beta.zan"
+    caller = work / "调用.zan"
+    alpha.write_text("""namespace Alpha;
+partial class Meter {
+    public int amount;
+    public int Read(int number) { return amount + number; }
+}
+""", encoding="utf-8")
+    part.write_text("""namespace Alpha;
+partial class Meter {
+    public int Read(string text) { return this.amount; }
+}
+""", encoding="utf-8")
+    beta.write_text("""namespace Beta;
+class Meter {
+    public int amount;
+    public int Read(int number) { return this.amount; }
+}
+""", encoding="utf-8")
+    caller.write_text("""using Alpha;
+class Child : Alpha.Meter {
+    int Total(Meter left, Beta.Meter right) {
+        return /* 中😀 */ left.Read(2) + left.Read("x") + right.Read(2)
+            + left.amount + right.amount + this.amount;
+    }
+}
+""", encoding="utf-8")
+    inputs = (str(alpha), str(part), str(beta), str(caller), "--no-stdlib", "--no-packages")
+
+    def query(at):
+        result = run(zanc, *inputs, FLAG, at["file"], str(at["line"]), str(at["col"]), cwd=work)
+        assert result.returncode == 0, result
+        return json.loads(result.stdout.decode("utf-8"))
+
+    def expect(kind, name, declaration, refs, parts=None):
+        symbol = {"kind": kind, "name": name, "declaration": declaration}
+        if parts:
+            symbol["additionalDeclarations"] = parts
+        expected = {"format": FORMAT, "symbol": symbol, "references": refs}
+        for occurrence in [declaration, *refs, *(parts or [])]:
+            actual = query(occurrence)
+            assert actual == expected, (occurrence, expected, actual)
+
+    expect("class", "Meter", location(alpha, 2, "class Meter", "Meter"), [
+        location(caller, 2, "Alpha.Meter", "Meter"),
+        location(caller, 3, "Meter left", "Meter"),
+    ], [location(part, 2, "class Meter", "Meter")])
+    expect("class", "Meter", location(beta, 2, "class Meter", "Meter"), [
+        location(caller, 3, "Beta.Meter", "Meter"),
+    ])
+    expect("field", "amount", location(alpha, 3, "int amount", "amount"), [
+        location(alpha, 4, "return amount", "amount"),
+        location(part, 3, "this.amount", "amount"),
+        location(caller, 5, "left.amount", "amount"),
+        location(caller, 5, "this.amount", "amount"),
+    ])
+    expect("field", "amount", location(beta, 3, "int amount", "amount"), [
+        location(beta, 4, "this.amount", "amount"),
+        location(caller, 5, "right.amount", "amount"),
+    ])
+    expect("method", "Read", location(alpha, 4, "Read(int", "Read"), [
+        location(caller, 4, "left.Read(2)", "Read"),
+    ])
+    expect("method", "Read", location(part, 3, "Read(string", "Read"), [
+        location(caller, 4, 'left.Read("x")', "Read"),
+    ])
+    expect("method", "Read", location(beta, 4, "Read(int", "Read"), [
+        location(caller, 4, "right.Read(2)", "Read"),
+    ])
+    assert not list(work.glob("*.exe"))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zanc", type=Path, required=True)
@@ -181,4 +258,5 @@ if __name__ == "__main__":
     scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="zanc-semantic-refs-", dir=scratch) as temp:
         check(str(args.zanc.resolve()), Path(temp))
+        check_project(str(args.zanc.resolve()), Path(temp))
     print("zanc semantic references wire contract passed")

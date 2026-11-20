@@ -737,6 +737,7 @@ static void method_call_context(const char *text, size_t offset,
 typedef struct {
     char path[512];
     char *text;
+    char *uri; /* Original URI for an open buffer. */
 } lsp_diag_source_t;
 
 typedef struct {
@@ -746,6 +747,7 @@ typedef struct {
 } lsp_diag_sources_t;
 
 static char *read_file_all(const char *path);
+static bool lsp_cancel_hit(lsp_server_t *s);
 static bool lsp_diag_known_external_type(lsp_server_t *s, const char *message,
                                          const zan_ast_node_t *unit, bool workspace);
 
@@ -758,15 +760,28 @@ static zan_ast_node_t *parse_diagnostic_source(zan_arena_t *arena, zan_diag_t *d
     return zan_parser_parse(&parser);
 }
 
-static void add_diagnostic_sources(zan_ast_node_t *unit, zan_arena_t *arena,
-                                   zan_diag_t *unit_diag, lsp_diag_sources_t *sources) {
-    zan_nsresolve_stamp(unit, arena);
+static void load_diagnostic_sources(lsp_diag_sources_t *sources, lsp_server_t *request) {
     for (int i = 0; i < sources->count; i++) {
+        if (request && lsp_cancel_hit(request)) return;
         lsp_diag_source_t *source = &sources->items[i];
         if (!source->text) source->text = read_file_all(source->path);
+    }
+}
+
+static bool add_diagnostic_sources(zan_ast_node_t *unit, zan_arena_t *arena,
+                                   zan_diag_t *unit_diag, const lsp_diag_sources_t *sources,
+                                   lsp_server_t *request) {
+    bool complete = true;
+    zan_nsresolve_stamp(unit, arena);
+    for (int i = 0; i < sources->count; i++) {
+        if (request && lsp_cancel_hit(request)) return false;
+        const lsp_diag_source_t *source = &sources->items[i];
         /* Keep dependency file IDs aligned with declaration provenance. */
         zan_diag_add_file(unit_diag, source->path, source->text);
-        if (!source->text) continue;
+        if (!source->text) {
+            complete = false;
+            continue;
+        }
 
         zan_diag_t *diag = zan_diag_new(arena);
         zan_diag_set_capture(diag, true);
@@ -774,13 +789,17 @@ static void add_diagnostic_sources(zan_ast_node_t *unit, zan_arena_t *arena,
                                                               (uint32_t)i + 1);
         bool parsed = dependency && !zan_diag_has_errors(diag);
         zan_diag_free_buffers(diag);
-        if (!parsed) continue;
+        if (!parsed) {
+            complete = false;
+            continue;
+        }
 
         zan_nsresolve_stamp(dependency, arena);
         zan_ast_list_t *decls = &dependency->comp_unit.decls;
         for (int j = 0; j < decls->count; j++)
             zan_ast_list_push(&unit->comp_unit.decls, decls->items[j], arena);
     }
+    return complete;
 }
 
 static char *diagnostics_payload(const char *uri, int version, json_value *diagnostics) {
@@ -814,7 +833,8 @@ static json_value *collect_diagnostics(lsp_server_t *s, const char *uri, const c
     if (ast && !zan_diag_has_errors(diag)) {
         if (sources->workspace) {
             zan_diag_only_file(diag, 0);
-            add_diagnostic_sources(ast, arena, diag, sources);
+            load_diagnostic_sources(sources, NULL);
+            add_diagnostic_sources(ast, arena, diag, sources, NULL);
             zan_nsresolve_workspace(ast, arena, diag);
             /* Qualified binder keys separate partial types in different namespaces. */
             zan_parser_merge_partials(ast, arena, diag);
@@ -1457,6 +1477,8 @@ static void ensure_packages_indexed(lsp_server_t *s) {
     index_needed_packages(s);
 }
 
+static bool project_manifest_present(const char *directory);
+
 /* Entries are prepended under doc_lock and live until the worker joins. */
 static void remember_project_directory(void *context, const char *path) {
     lsp_server_t *s = context;
@@ -1467,6 +1489,7 @@ static void remember_project_directory(void *context, const char *path) {
     lsp_project_directory_t *dir = calloc(1, sizeof(*dir) + len + 1);
     if (!dir) return;
     memcpy(dir->path, path, len + 1);
+    dir->has_manifest = project_manifest_present(path);
     dir->next = s->project_directories;
     s->project_directories = dir;
 }
@@ -1794,7 +1817,7 @@ static lsp_diag_sources_t snapshot_diagnostic_sources(lsp_server_t *s, const cha
     const char *root = diagnostic_project_root(s, primary);
     int count = g_project_intel->indexed_file_count;
     sources.items = calloc((size_t)count, sizeof(*sources.items));
-    if (count && !sources.items) return sources;
+    if (count && !sources.items) zan_host_oom();
     sources.workspace = true;
     for (int i = 0; i < count; i++) {
         const char *path = g_project_intel->indexed_files[i];
@@ -1809,13 +1832,23 @@ static lsp_diag_sources_t snapshot_diagnostic_sources(lsp_server_t *s, const cha
         if (!workspace_source_uri(s, doc->uri, path, sizeof(path))) continue;
         for (int j = 0; j < sources.count; j++) {
             lsp_diag_source_t *source = &sources.items[j];
-            if (!source->text && intel_same_file(source->path, path)) {
+            if (!source->uri && intel_same_file(source->path, path)) {
+                source->uri = dup_str(doc->uri);
                 source->text = dup_str(doc->text);
+                if (!source->uri || !source->text) zan_host_oom();
                 break;
             }
         }
     }
     return sources;
+}
+
+static void free_diagnostic_sources(lsp_diag_sources_t *sources) {
+    for (int i = 0; i < sources->count; i++) {
+        free(sources->items[i].text);
+        free(sources->items[i].uri);
+    }
+    free(sources->items);
 }
 
 static bool project_manifest_present(const char *directory) {
@@ -1901,8 +1934,7 @@ static int diag_worker_loop(lsp_server_t *s) {
         }
 
         json_value *diagnostics = collect_diagnostics(s, uri, text, &sources);
-        for (int i = 0; i < sources.count; i++) free(sources.items[i].text);
-        free(sources.items);
+        free_diagnostic_sources(&sources);
         char *payload = diagnostics_payload(uri, version, diagnostics);
         /* The check and write share the lock with didChange and didClose.
          * Clients can reuse an LSP version when reopening the same URI. */
@@ -2927,8 +2959,6 @@ static intellisense_t *unopened_scratch(void) {
 
 typedef void (*project_file_fn)(void *ctx, const char *uri, const char *text);
 
-static bool lsp_cancel_hit(lsp_server_t *s);
-
 static void for_each_unopened_project_file(lsp_server_t *s, void *ctx,
                                            project_file_fn visit) {
     ensure_project_indexed(s);
@@ -2959,7 +2989,7 @@ static void refs_visit(void *ctx, const char *uri, const char *text) {
 
 typedef enum { LOCAL_REFERENCES, LOCAL_PREPARE_RENAME, LOCAL_RENAME } local_query_kind_t;
 
-static json_value *local_reference_range(const char *text, zan_loc_t loc, uint32_t length) {
+static json_value *semantic_reference_range(const char *text, zan_loc_t loc, uint32_t length) {
     int line = (int)loc.line - 1;
     json_value *range = json_new_obj();
     json_value *start = json_new_obj();
@@ -2976,8 +3006,7 @@ static json_value *local_reference_range(const char *text, zan_loc_t loc, uint32
 static bool local_reference_collision(const semantic_refs_t *refs, const char *name) {
     for (size_t i = 0; i < refs->count; i++) {
         const semantic_ref_t *ref = &refs->items[i];
-        if (ref->occurrence.offset == ref->declaration.offset && strcmp(ref->name.str, name) == 0)
-            return true;
+        if (ref->is_declaration && strcmp(ref->name.str, name) == 0) return true;
     }
     return false;
 }
@@ -3049,8 +3078,8 @@ static bool local_rename_preserves_binding(const lsp_doc_t *doc, const semantic_
     const semantic_ref_t *renamed = NULL;
     for (size_t i = 0; i < rebound.count; i++) {
         const semantic_ref_t *ref = &rebound.items[i];
-        if (ref->occurrence.offset == declaration && ref->declaration.offset == declaration &&
-            ref->is_parameter == symbol->is_parameter && strcmp(ref->name.str, new_name) == 0) {
+        if (ref->is_declaration && ref->occurrence.offset == declaration &&
+            ref->kind == symbol->kind && strcmp(ref->name.str, new_name) == 0) {
             renamed = ref;
             break;
         }
@@ -3069,14 +3098,17 @@ static bool local_rename_preserves_binding(const lsp_doc_t *doc, const semantic_
     return preserved;
 }
 
+static uint32_t semantic_reference_column(const char *text, int line, int character) {
+    size_t offset = pos_to_offset(text, line, character);
+    uint32_t col = (uint32_t)(text + offset - line_start_at(text, line)) + 1;
+    if (col > 1 && !is_ident_char(text[offset]) && is_ident_char(text[offset - 1])) col--;
+    return col;
+}
+
 static bool handle_local_query(lsp_server_t *s, json_value *id, const lsp_doc_t *doc,
                                int line, int character, local_query_kind_t kind,
                                bool include_decl, const char *new_name) {
-    size_t offset = pos_to_offset(doc->text, line, character);
-    const char *line_start = line_start_at(doc->text, line);
-    uint32_t col = (uint32_t)(doc->text + offset - line_start) + 1;
-    if (col > 1 && !is_ident_char(doc->text[offset]) && is_ident_char(doc->text[offset - 1])) col--;
-
+    uint32_t col = semantic_reference_column(doc->text, line, character);
     semantic_refs_t refs = {0};
     zan_arena_t *arena = zan_arena_new();
     collect_local_references(&refs, arena, doc->uri, doc->text);
@@ -3087,7 +3119,8 @@ static bool handle_local_query(lsp_server_t *s, json_value *id, const lsp_doc_t 
     if (symbol) {
         if (kind == LOCAL_PREPARE_RENAME) {
             result = json_new_obj();
-            json_obj_set(result, "range", local_reference_range(doc->text, symbol->occurrence, symbol->name.len));
+            json_obj_set(result, "range", semantic_reference_range(doc->text, symbol->occurrence,
+                                                                    symbol->occurrence_length));
             json_obj_set(result, "placeholder", json_new_str(symbol->name.str));
         } else {
             collision = kind == LOCAL_RENAME && strcmp(symbol->name.str, new_name) != 0 &&
@@ -3097,9 +3130,10 @@ static bool handle_local_query(lsp_server_t *s, json_value *id, const lsp_doc_t 
                 json_value *items = json_new_arr();
                 for (size_t i = 0; i < refs.count;) {
                     const semantic_ref_t *ref = semantic_refs_next(&refs, symbol, &i, &ambiguous);
-                    if (!ref || (!include_decl && ref->occurrence.offset == ref->declaration.offset)) continue;
+                    if (!ref || (!include_decl && ref->is_declaration)) continue;
                     json_value *item = json_new_obj();
-                    json_obj_set(item, "range", local_reference_range(doc->text, ref->occurrence, ref->name.len));
+                    json_obj_set(item, "range", semantic_reference_range(doc->text, ref->occurrence,
+                                                                         ref->occurrence_length));
                     if (kind == LOCAL_RENAME) json_obj_set(item, "newText", json_new_str(new_name));
                     else json_obj_set(item, "uri", json_new_str(doc->uri));
                     json_arr_add(items, item);
@@ -3133,6 +3167,171 @@ static bool handle_local_query(lsp_server_t *s, json_value *id, const lsp_doc_t 
     return handled;
 }
 
+typedef struct {
+    lsp_diag_source_t primary;
+    lsp_diag_sources_t sources;
+    zan_arena_t *arena;
+    zan_diag_t *diag;
+    semantic_refs_t refs;
+    bool complete; /* All snapshot sources parsed and checked without errors. */
+    bool declaration_conflict;
+} lsp_project_refs_t;
+
+static const lsp_diag_source_t *project_reference_source(const lsp_project_refs_t *project,
+                                                          uint32_t file_id) {
+    if (file_id == 0) return &project->primary;
+    if (file_id > (uint32_t)project->sources.count) return NULL;
+    return &project->sources.items[file_id - 1];
+}
+
+static void clear_project_reference_analysis(lsp_project_refs_t *project) {
+    free(project->refs.items);
+    if (project->diag) zan_diag_free_buffers(project->diag);
+    if (project->arena) zan_arena_free(project->arena);
+    project->refs = (semantic_refs_t){0};
+    project->diag = NULL;
+    project->arena = NULL;
+    project->complete = false;
+    project->declaration_conflict = false;
+}
+
+static void free_project_references(lsp_project_refs_t *project) {
+    clear_project_reference_analysis(project);
+    free_diagnostic_sources(&project->sources);
+    free(project->primary.uri);
+    free(project->primary.text);
+}
+
+/* Recheck loaded text with the original file IDs. The caller may substitute
+ * edited buffers. Previous symbol pointers expire when this function runs. */
+static void check_project_references(lsp_server_t *s, lsp_project_refs_t *project) {
+    clear_project_reference_analysis(project);
+    project->refs.all_files = true;
+    zan_arena_t *arena = project->arena = zan_arena_new();
+    zan_diag_t *diag = project->diag = zan_diag_new(arena);
+    zan_diag_set_capture(diag, true);
+    zan_diag_add_file(diag, project->primary.uri, project->primary.text);
+    zan_ast_node_t *ast = parse_diagnostic_source(arena, diag, project->primary.text, 0);
+    if (!ast || zan_diag_has_errors(diag) || lsp_cancel_hit(s)) return;
+
+    bool parsed = add_diagnostic_sources(ast, arena, diag, &project->sources, s);
+    if (lsp_cancel_hit(s)) return;
+    zan_nsresolve_workspace(ast, arena, diag);
+    zan_parser_merge_partials(ast, arena, diag);
+    if (lsp_cancel_hit(s)) return;
+
+    zan_binder_t binder;
+    zan_binder_init(&binder, arena, diag);
+    binder.symbol_reference = semantic_refs_record_symbol;
+    binder.symbol_reference_context = &project->refs;
+    zan_binder_bind(&binder, ast);
+    if (lsp_cancel_hit(s)) return;
+    for (int i = 0; i < zan_diag_entry_count(diag); i++) {
+        const zan_diag_entry_t *entry = zan_diag_entry_at(diag, i);
+        if ((entry->code >= 1000 && entry->code <= 1003) || entry->code == 1010)
+            project->declaration_conflict = true;
+    }
+
+    /* The checker can still bind independent expressions when a signature
+     * mentions a missing external type. */
+    zan_checker_t checker;
+    zan_checker_init(&checker, &binder, arena, diag);
+    checker.lexical_ref = semantic_refs_record;
+    checker.lexical_ref_context = &project->refs;
+    zan_checker_check(&checker, ast);
+    if (lsp_cancel_hit(s)) return;
+    semantic_refs_sort(&project->refs);
+    project->complete = parsed && !zan_diag_has_errors(diag);
+}
+
+static void load_project_reference_sources(lsp_server_t *s, lsp_project_refs_t *project) {
+    load_diagnostic_sources(&project->sources, s);
+    for (int i = 0; i < project->sources.count; i++) {
+        if (lsp_cancel_hit(s)) return;
+        lsp_diag_source_t *source = &project->sources.items[i];
+        if (source->uri) continue;
+        char uri[1800];
+        fspath_to_uri(source->path, uri, sizeof(uri));
+        source->uri = dup_str(uri);
+        if (!source->uri) zan_host_oom();
+    }
+}
+
+/* Snapshot open documents and indexed paths with doc_lock held. */
+static void snapshot_project_references(lsp_server_t *s, const lsp_doc_t *doc,
+                                        lsp_project_refs_t *project) {
+    project->sources = snapshot_diagnostic_sources(s, doc->uri);
+    if (!project->sources.workspace) return;
+    project->primary.uri = dup_str(doc->uri);
+    project->primary.text = dup_str(doc->text);
+    if (!project->primary.uri || !project->primary.text) zan_host_oom();
+}
+
+/* Enter and return with doc_lock held. Only the owned snapshot is used while
+ * the diagnostics worker runs. */
+static void collect_project_references(lsp_server_t *s, const lsp_doc_t *doc,
+                                       lsp_project_refs_t *project) {
+    if (lsp_cancel_hit(s)) return;
+    snapshot_project_references(s, doc, project);
+    if (!project->sources.workspace) return;
+
+    lsp_doc_unlock(s);
+    load_project_reference_sources(s, project);
+    if (!lsp_cancel_hit(s)) check_project_references(s, project);
+    lsp_doc_lock(s);
+}
+
+/* The returned symbol and its source buffers live until free_project_references.
+ * Callers producing edits also need a complete snapshot and a safe rebind. */
+static const semantic_ref_t *lookup_project_references(const lsp_project_refs_t *project,
+                                                       int line, int character,
+                                                       bool *ambiguous) {
+    *ambiguous = false;
+    const semantic_refs_t *refs = &project->refs;
+    const lsp_diag_source_t *source = project_reference_source(project, refs->file_id);
+    if (!project->diag || !source || !source->text) return NULL;
+    uint32_t col = semantic_reference_column(source->text, line, character);
+    const semantic_ref_t *symbol = semantic_refs_select(refs, (uint32_t)line + 1, col, ambiguous);
+    if (*ambiguous) return NULL;
+    if (!symbol) {
+        for (int i = 0; i < zan_diag_entry_count(project->diag); i++) {
+            const zan_diag_entry_t *entry = zan_diag_entry_at(project->diag, i);
+            if (entry->code == 1019 && entry->loc.file_id == refs->file_id &&
+                entry->loc.line == (uint32_t)line + 1) {
+                *ambiguous = true;
+                break;
+            }
+        }
+        return NULL;
+    }
+    if (project->declaration_conflict && symbol->kind != SYM_LOCAL && symbol->kind != SYM_PARAM) {
+        *ambiguous = true;
+        return NULL;
+    }
+    for (size_t i = 0; i < refs->count && !*ambiguous;)
+        semantic_refs_next(refs, symbol, &i, ambiguous);
+    return *ambiguous ? NULL : symbol;
+}
+
+static json_value *project_reference_locations(lsp_server_t *s, const lsp_project_refs_t *project,
+                                               const semantic_ref_t *symbol, bool include_decl) {
+    json_value *locations = json_new_arr();
+    bool ambiguous = false;
+    for (size_t i = 0; i < project->refs.count;) {
+        if (lsp_cancel_hit(s)) break;
+        const semantic_ref_t *ref = semantic_refs_next(&project->refs, symbol, &i, &ambiguous);
+        if (!ref || (!include_decl && ref->is_declaration)) continue;
+        const lsp_diag_source_t *source = project_reference_source(project, ref->occurrence.file_id);
+        if (!source || !source->uri || !source->text) continue;
+        json_value *location = json_new_obj();
+        json_obj_set(location, "uri", json_new_str(source->uri));
+        json_obj_set(location, "range", semantic_reference_range(source->text, ref->occurrence,
+                                                                 ref->occurrence_length));
+        json_arr_add(locations, location);
+    }
+    return locations;
+}
+
 static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -3150,12 +3349,48 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     json_value *context = json_obj_get(params, "context");
     json_value *declaration = json_obj_get(context, "includeDeclaration");
     bool include_decl = json_get_bool(declaration, json_get_num(declaration, 1) != 0.0);
-    if (handle_local_query(s, id, doc, line, character, LOCAL_REFERENCES, include_decl, NULL)) return;
+
+    lsp_project_refs_t project = {0};
+    collect_project_references(s, doc, &project);
+    bool workspace = project.sources.workspace;
+    bool ambiguous = false;
+    json_value *exact = NULL;
+    if (!lsp_cancel_hit(s) && workspace) {
+        lsp_doc_unlock(s);
+        const semantic_ref_t *symbol = lookup_project_references(&project, line, character,
+                                                                 &ambiguous);
+        if (symbol) exact = project_reference_locations(s, &project, symbol, include_decl);
+        free_project_references(&project);
+        lsp_doc_lock(s);
+    } else {
+        free_project_references(&project);
+    }
+    if (lsp_cancel_hit(s)) {
+        json_free(exact);
+        send_response_error(s, id, -32800, "Request cancelled");
+        return;
+    }
+    if (exact || ambiguous) {
+        send_response(s, id, exact ? exact : json_new_arr());
+        return;
+    }
+    if (!workspace && handle_local_query(s, id, doc, line, character,
+                                         LOCAL_REFERENCES, include_decl, NULL)) return;
 
     intellisense_t *is = doc_intel_for(s, uri);
     sym_target_t t;
     bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri, word,
                                        line, character, &t);
+    /* Retain read-only compatibility for external declarations. A workspace
+     * binding requires a checker observation, including for overloads. */
+    if (workspace) {
+        char path[1024];
+        if (!resolved || t.is_local || !t.have_decl ||
+            workspace_source_uri(s, t.decl_ref, path, sizeof(path))) {
+            send_response(s, id, json_new_arr());
+            return;
+        }
+    }
     if (resolved) {
         json_value *arr = json_new_arr();
         int od = -1;
@@ -3430,6 +3665,8 @@ static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
     return edits;
 }
 
+#include "lsp_project_rename.inc"
+
 static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     const char *new_name = json_get_str(json_obj_get(params, "newName"));
@@ -3455,6 +3692,7 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     char word[128];
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_null()); return; }
+    if (handle_project_rename(s, id, doc, line, character, new_name)) return;
     if (handle_local_query(s, id, doc, line, character, LOCAL_RENAME, true, new_name)) return;
 
     intellisense_t *is = doc_intel_for(s, uri);
@@ -3849,6 +4087,7 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     size_t end = off;
     while (doc->text[end] && is_ident_char(doc->text[end])) end++;
     if (end == start) { send_response(s, id, json_new_null()); return; }
+    if (handle_project_rename(s, id, doc, line, character, NULL)) return;
     if (handle_local_query(s, id, doc, line, character, LOCAL_PREPARE_RENAME, true, NULL)) return;
 
     int rl, rc;
