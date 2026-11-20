@@ -20,14 +20,13 @@ partial class Irgen {
         H("}");
     }
     void EmitAsyncRuntime() {
-        EmitAsyncUnwindClock();
+        EmitAsyncUnwindIo();
         EmitAsyncPumpReady();
         EmitAsyncSchedRun();
     }
 
-    /// Coroutine unwinder, IO/gate co declares, and the monotonic clock
-    /// (__zan_co_now_ms + zan_io_pump_timeout, platform-branched).
-    void EmitAsyncUnwindClock() {
+    /// Coroutine unwinder, IO/gate declarations and the fallback IO wait.
+    void EmitAsyncUnwindIo() {
         // Exception unwinder for suspended coroutines: a throw longjmps
         // straight to its handler, skipping suspended CPS frames in between.
         // Walk the awaiter chain from the throwing frame calling each frame's
@@ -93,17 +92,14 @@ partial class Irgen {
         H("declare void @zan_io_resolve_sa_co(i8*, i32, i8*, i32, i8*, void(i8*)*, i32*)");
         H("declare void @zan_io_resolve_co(i8*, i8*, void(i8*)*, i32*)");
         if (hostWin) {
-            if (!ExternSeen("GetTickCount64")) { externDecls.Add("GetTickCount64"); H("declare i64 @GetTickCount64()"); }
             if (!ExternSeen("Sleep")) { externDecls.Add("Sleep"); H("declare void @Sleep(i64)"); }
         } else {
-            if (!ExternSeen("gettimeofday")) { externDecls.Add("gettimeofday"); H("declare i32 @gettimeofday(i8*, i8*)"); }
-            if (!ExternSeen("usleep")) { externDecls.Add("usleep"); H("declare i32 @usleep(i32)"); }
+            if (!ExternSeen("poll")) { externDecls.Add("poll"); H("declare i32 @poll(i8*, i64, i32)"); }
         }
         H("%co_node = type { i8*, i8*, i8* }");
-        H("%co_timer = type { i8*, i64, i8*, i8* }");
         H("@co_head = global i8* null");
         H("@co_tail = global i8* null");
-        H("@co_timers = global i8* null");
+        H("@co_fallback_active = internal global i1 false");
         // Coroutine re-entrancy depth: >0 while the scheduler is executing a
         // frame's step function. Task.IsDone consults it to decide whether it
         // may drive the scheduler (see EmitTaskIsDone): a query issued from
@@ -114,60 +110,29 @@ partial class Irgen {
         // stays. Maintained in one place (the scheduler's step call), not in
         // every $resume, so there is no per-resume bookkeeping to get wrong.
         H("@__zan_co_depth = global i32 0");
+        H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
+        H("entry:");
+        H("  %pos = icmp sgt i64 %timeout, 0");
+        H("  br i1 %pos, label %sleep, label %ret");
+        H("sleep:");
         if (hostWin) {
-            H("define internal i64 @__zan_co_now_ms() {");
-            H("entry:");
-            H("  %n = call i64 @GetTickCount64()");
-            H("  ret i64 %n");
-            H("}");
-            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
-            H("entry:");
-            H("  %pos = icmp sgt i64 %timeout, 0");
-            H("  br i1 %pos, label %sleep, label %ret");
-            H("sleep:");
             H("  call void @Sleep(i64 %timeout)");
-            H("  br label %ret");
-            H("ret:");
-            H("  ret i32 0");
-            H("}");
         } else {
-            H("define internal i64 @__zan_co_now_ms() {");
-            H("entry:");
-            H("  %tv = alloca [2 x i64]");
-            H("  %tvp = bitcast [2 x i64]* %tv to i8*");
-            H("  call i32 @gettimeofday(i8* %tvp, i8* null)");
-            H("  %secp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 0");
-            H("  %usecp = getelementptr [2 x i64], [2 x i64]* %tv, i64 0, i64 1");
-            H("  %sec = load i64, i64* %secp");
-            H("  %usec = load i64, i64* %usecp");
-            H("  %ms1 = mul i64 %sec, 1000");
-            H("  %ms2 = sdiv i64 %usec, 1000");
-            H("  %n = add i64 %ms1, %ms2");
-            H("  ret i64 %n");
-            H("}");
-            H("define weak i32 @zan_io_pump_timeout(i64 %timeout) {");
-            H("entry:");
-            H("  %pos = icmp sgt i64 %timeout, 0");
-            H("  br i1 %pos, label %sleep, label %ret");
-            H("sleep:");
-            H("  %us64 = mul i64 %timeout, 1000");
-            H("  %us = trunc i64 %us64 to i32");
-            H("  call i32 @usleep(i32 %us)");
-            H("  br label %ret");
-            H("ret:");
-            H("  ret i32 0");
-            H("}");
+            H("  %ms = trunc i64 %timeout to i32");
+            H("  call i32 @poll(i8* null, i64 0, i32 %ms)");
         }
+        H("  br label %ret");
+        H("ret:");
+        H("  ret i32 0");
+        H("}");
     }
 
-    /// zan_io_pump / zan_co_sched_init / __zan_co_reap / zan_co_ready /
-    /// zan_co_delay.
-    ///
-    /// 这里的协程调度器是「回退实现」：与 C 宿主的 zan_runtime_fallback
-    /// 同法，必须用 weak 链接——链接了 C 运行时（rt_io.o/rt_co.o 提供同名
-    /// 强符号）时由运行时那份生效，未链接运行时时用自带这份。否则两边
-    /// 同时定义会 LNK2005。
+    /// The weak scheduler shares the runtime's timer heap. Its ready hook
+    /// queues timer continuations so the scheduler can run them outside dispatch.
     void EmitAsyncPumpReady() {
+        H("declare void @zan_timer_runtime_reset()");
+        H("declare void @zan_timer_set_ready_hook(void(i8*, void(i8*)*)*)");
+        H("declare void @zan_timer_delay(i64, i8*, void(i8*)*)");
         H("define weak i32 @zan_io_pump() {");
         H("entry:");
         H("  %w = call i32 @zan_io_pump_timeout(i64 -1)");
@@ -177,8 +142,10 @@ partial class Irgen {
         H("entry:");
         H("  store i8* null, i8** @co_head");
         H("  store i8* null, i8** @co_tail");
-        H("  store i8* null, i8** @co_timers");
         H("  store i32 0, i32* @__zan_co_depth");
+        H("  call void @zan_timer_runtime_reset()");
+        H("  call void @zan_timer_set_ready_hook(void(i8*, void(i8*)*)* @zan_co_ready)");
+        H("  store i1 true, i1* @co_fallback_active");
         H("  ret void");
         H("}");
         H("define internal void @__zan_co_reap(i8* %f) {");
@@ -266,47 +233,41 @@ partial class Irgen {
         H("}");
         H("define weak void @zan_co_delay(i64 %ms, i8* %frame, void(i8*)* %step) {");
         H("entry:");
-        H("  %raw = call i8* @malloc(i64 32)");
-        H("  %tn = bitcast i8* %raw to %co_timer*");
-        H("  %old = load i8*, i8** @co_timers");
-        H("  %tnp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 0");
-        H("  store i8* %old, i8** %tnp");
-        H("  %now = call i64 @__zan_co_now_ms()");
-        H("  %pos = icmp sgt i64 %ms, 0");
-        H("  %delay = select i1 %pos, i64 %ms, i64 0");
-        H("  %deadline = add i64 %now, %delay");
-        H("  %tdp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 1");
-        H("  store i64 %deadline, i64* %tdp");
-        H("  %tfp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 2");
-        H("  store i8* %frame, i8** %tfp");
-        H("  %tsp = getelementptr %co_timer, %co_timer* %tn, i32 0, i32 3");
-        H("  %si = bitcast void(i8*)* %step to i8*");
-        H("  store i8* %si, i8** %tsp");
-        H("  store i8* %raw, i8** @co_timers");
+        H("  call void @zan_timer_delay(i64 %ms, i8* %frame, void(i8*)* %step)");
         H("  ret void");
         H("}");
     }
 
-    /// The cooperative scheduler main loop (zan_co_sched_run / zan_co_sched_run_until).
+    /// The fallback scheduler stops on task completion, a sync delay deadline,
+    /// or idle IO with no outstanding timer (when there is no deadline).
     void EmitAsyncSchedRun() {
-        H("define weak void @zan_co_sched_run_until(i32* %done) {");
+        H("declare i64 @zan_timer_dispatch_due_wait()");
+        H("declare i64 @zan_timer_next_timeout()");
+        H("declare i64 @zan_co_precise_us()");
+        H("declare i64 @zan_timer_saturating_due_us(i64, i64)");
+        H("declare void @zan_co_sync_sleep(i64)");
+        H("define internal void @co_sched_drive(i32* %done, i64 %deadline) {");
         H("entry:");
-        H("  %a.best = alloca i8*");
-        H("  %a.bestprev = alloca i8*");
-        H("  %a.cur = alloca i8*");
-        H("  %a.curprev = alloca i8*");
+        H("  %timed = icmp ne i64 %deadline, 0");
         H("  br label %loop");
         H("loop:");
-        H("  %dchk = icmp ne i32* %done, null");
-        H("  br i1 %dchk, label %dtest, label %qcheck");
+        H("  %hasdone = icmp ne i32* %done, null");
+        H("  br i1 %hasdone, label %dtest, label %clock");
         H("dtest:");
         H("  %dv = load i32, i32* %done");
         H("  %disd = icmp ne i32 %dv, 0");
-        H("  br i1 %disd, label %exit, label %qcheck");
+        H("  br i1 %disd, label %exit, label %clock");
+        H("clock:");
+        H("  br i1 %timed, label %deadlinecheck, label %qcheck");
+        H("deadlinecheck:");
+        H("  %now = call i64 @zan_co_precise_us()");
+        H("  %elapsed = icmp sge i64 %now, %deadline");
+        H("  br i1 %elapsed, label %exit, label %qcheck");
         H("qcheck:");
+        H("  call i64 @zan_timer_dispatch_due_wait()");
         H("  %head = load i8*, i8** @co_head");
         H("  %qe = icmp eq i8* %head, null");
-        H("  br i1 %qe, label %timers, label %body");
+        H("  br i1 %qe, label %idle, label %body");
         H("body:");
         H("  %hp = bitcast i8* %head to %co_node*");
         H("  %frpb = getelementptr %co_node, %co_node* %hp, i32 0, i32 1");
@@ -333,97 +294,65 @@ partial class Irgen {
         H("  call void %stfn(i8* %fr)");
         H("  store i32 %dpold, i32* @__zan_co_depth");
         H("  br label %loop");
-        H("timers:");
-        H("  %dchk2 = icmp ne i32* %done, null");
-        H("  br i1 %dchk2, label %dtest2, label %tcheck");
-        H("dtest2:");
-        H("  %dv2 = load i32, i32* %done");
-        H("  %disd2 = icmp ne i32 %dv2, 0");
-        H("  br i1 %disd2, label %exit, label %tcheck");
-        H("tcheck:");
-        H("  %t0 = load i8*, i8** @co_timers");
-        H("  %te = icmp eq i8* %t0, null");
-        H("  br i1 %te, label %iopump, label %scansetup");
-        H("scansetup:");
-        H("  store i8* %t0, i8** %a.best");
-        H("  store i8* null, i8** %a.bestprev");
-        H("  %t0p = bitcast i8* %t0 to %co_timer*");
-        H("  %t0np = getelementptr %co_timer, %co_timer* %t0p, i32 0, i32 0");
-        H("  %t0next = load i8*, i8** %t0np");
-        H("  store i8* %t0next, i8** %a.cur");
-        H("  store i8* %t0, i8** %a.curprev");
-        H("  br label %scancond");
-        H("scancond:");
-        H("  %cur = load i8*, i8** %a.cur");
-        H("  %curnull = icmp eq i8* %cur, null");
-        H("  br i1 %curnull, label %scandone, label %scanbody");
-        H("scanbody:");
-        H("  %curb = load i8*, i8** %a.cur");
-        H("  %bestb = load i8*, i8** %a.best");
-        H("  %curbp = bitcast i8* %curb to %co_timer*");
-        H("  %bestbp = bitcast i8* %bestb to %co_timer*");
-        H("  %curduep = getelementptr %co_timer, %co_timer* %curbp, i32 0, i32 1");
-        H("  %curdue = load i64, i64* %curduep");
-        H("  %bestduep = getelementptr %co_timer, %co_timer* %bestbp, i32 0, i32 1");
-        H("  %bestdue = load i64, i64* %bestduep");
-        H("  %dlt = icmp ult i64 %curdue, %bestdue");
-        H("  br i1 %dlt, label %scantake, label %scannext");
-        H("scantake:");
-        H("  %curt = load i8*, i8** %a.cur");
-        H("  %curprevt = load i8*, i8** %a.curprev");
-        H("  store i8* %curt, i8** %a.best");
-        H("  store i8* %curprevt, i8** %a.bestprev");
-        H("  br label %scannext");
-        H("scannext:");
-        H("  %curn = load i8*, i8** %a.cur");
-        H("  store i8* %curn, i8** %a.curprev");
-        H("  %curnp = bitcast i8* %curn to %co_timer*");
-        H("  %curnextp = getelementptr %co_timer, %co_timer* %curnp, i32 0, i32 0");
-        H("  %curnextv = load i8*, i8** %curnextp");
-        H("  store i8* %curnextv, i8** %a.cur");
-        H("  br label %scancond");
-        H("scandone:");
-        H("  %best = load i8*, i8** %a.best");
-        H("  %bestprev = load i8*, i8** %a.bestprev");
-        H("  %bestp = bitcast i8* %best to %co_timer*");
-        H("  %bestduep2 = getelementptr %co_timer, %co_timer* %bestp, i32 0, i32 1");
-        H("  %bestdued = load i64, i64* %bestduep2");
-        H("  %nowd = call i64 @__zan_co_now_ms()");
-        H("  %duenow = icmp sle i64 %bestdued, %nowd");
-        H("  br i1 %duenow, label %timerdue, label %timerwait");
-        H("timerwait:");
-        H("  %remaining = sub i64 %bestdued, %nowd");
-        H("  call i32 @zan_io_pump_timeout(i64 %remaining)");
-        H("  br label %loop");
-        H("timerdue:");
-        H("  %bestp2 = bitcast i8* %best to %co_timer*");
-        H("  %bestnextp = getelementptr %co_timer, %co_timer* %bestp2, i32 0, i32 0");
-        H("  %bestnextv = load i8*, i8** %bestnextp");
-        H("  %bpnull = icmp eq i8* %bestprev, null");
-        H("  br i1 %bpnull, label %unlinkhead, label %unlinkmid");
-        H("unlinkhead:");
-        H("  store i8* %bestnextv, i8** @co_timers");
-        H("  br label %afterunlink");
-        H("unlinkmid:");
-        H("  %bestprevp = bitcast i8* %bestprev to %co_timer*");
-        H("  %bpnextp = getelementptr %co_timer, %co_timer* %bestprevp, i32 0, i32 0");
-        H("  store i8* %bestnextv, i8** %bpnextp");
-        H("  br label %afterunlink");
-        H("afterunlink:");
-        H("  %bestp3 = bitcast i8* %best to %co_timer*");
-        H("  %bframep = getelementptr %co_timer, %co_timer* %bestp3, i32 0, i32 2");
-        H("  %bframe = load i8*, i8** %bframep");
-        H("  %bstepp = getelementptr %co_timer, %co_timer* %bestp3, i32 0, i32 3");
-        H("  %bstepi8 = load i8*, i8** %bstepp");
-        H("  %bstepfn = bitcast i8* %bstepi8 to void(i8*)*");
-        H("  call void @zan_co_ready(i8* %bframe, void(i8*)* %bstepfn)");
-        H("  call void @free(i8* %best)");
+        H("idle:");
+        H("  %next = call i64 @zan_timer_next_timeout()");
+        H("  %hastimer = icmp sge i64 %next, 0");
+        H("  br i1 %timed, label %bounded, label %unbounded");
+        H("bounded:");
+        // Re-read the clock after dispatching: a public timer may run a callback.
+        H("  %nowidle = call i64 @zan_co_precise_us()");
+        H("  %remain = sub i64 %deadline, %nowidle");
+        H("  %expired = icmp sle i64 %remain, 0");
+        H("  br i1 %expired, label %exit, label %roundup");
+        H("roundup:");
+        H("  %remainminus = sub i64 %remain, 1");
+        H("  %floor = sdiv i64 %remainminus, 1000");
+        H("  %ms = add i64 %floor, 1");
+        H("  %earlier = icmp slt i64 %next, %ms");
+        H("  %usetimer = and i1 %hastimer, %earlier");
+        H("  %boundedms = select i1 %usetimer, i64 %next, i64 %ms");
+        H("  br label %wait");
+        H("unbounded:");
+        H("  br i1 %hastimer, label %wait, label %iopump");
+        H("wait:");
+        H("  %timeout = phi i64 [ %boundedms, %roundup ], [ %next, %unbounded ]");
+        H("  %zeroms = icmp eq i64 %timeout, 0");
+        H("  %positive = select i1 %zeroms, i64 1, i64 %timeout");
+        H("  %large = icmp sgt i64 %positive, 2147483647");
+        H("  %slice = select i1 %large, i64 2147483647, i64 %positive");
+        H("  call i32 @zan_io_pump_timeout(i64 %slice)");
         H("  br label %loop");
         H("iopump:");
         H("  %woke = call i32 @zan_io_pump()");
         H("  %iomore = icmp sgt i32 %woke, 0");
         H("  br i1 %iomore, label %loop, label %exit");
         H("exit:");
+        H("  ret void");
+        H("}");
+        H("define internal void @co_sync_delay(i64 %ms) {");
+        H("entry:");
+        H("  %active = load i1, i1* @co_fallback_active");
+        H("  br i1 %active, label %fallback, label %runtime");
+        H("runtime:");
+        H("  call void @zan_co_sync_sleep(i64 %ms)");
+        H("  ret void");
+        H("fallback:");
+        H("  %pos = icmp sgt i64 %ms, 0");
+        H("  br i1 %pos, label %drive, label %exit");
+        H("drive:");
+        H("  %large = icmp sgt i64 %ms, 9223372036854775");
+        H("  %bounded = select i1 %large, i64 9223372036854775, i64 %ms");
+        H("  %us = mul i64 %bounded, 1000");
+        H("  %now = call i64 @zan_co_precise_us()");
+        H("  %deadline = call i64 @zan_timer_saturating_due_us(i64 %now, i64 %us)");
+        H("  call void @co_sched_drive(i32* null, i64 %deadline)");
+        H("  br label %exit");
+        H("exit:");
+        H("  ret void");
+        H("}");
+        H("define weak void @zan_co_sched_run_until(i32* %done) {");
+        H("entry:");
+        H("  call void @co_sched_drive(i32* %done, i64 0)");
         H("  ret void");
         H("}");
         H("define weak void @zan_co_sched_run() {");

@@ -903,11 +903,14 @@ kernel32、shell32、user32、advapi32、version）。
   8 字节里），自举的扁平数组把它放在偏移 24——所以运行时的 join 路径
   （`rt_timer.c` 的 `JOIN_OFF_DONE`）**不适用于自举帧**；自举自己降级
   `Task.WhenAll`/Join，不走那条路。
-- 门禁：新增 `selfhost_shipped_runtime`（`tests/run_selfhost_mt.cmake` +
-  `tests/selfhost/mt/`）——自举产物链**发行版** mt 运行时
-  （`toolchain/win-x64/zanrt_io_mt.o`），输出与宿主逐字一致。发行版的
-  `zan_co_ready`/`zan_co_sched_init` 是强符号，压过自举的 weak 回退：帧真的
-  被发行版的多 worker 调度器驱动，定时器的 ready hook 也是运行时的。
+- 门禁：`selfhost_shipped_runtime` 把自举产物链接到当前构建的多 worker
+  运行时，与 C 宿主对拍。运行时的强 `zan_co_ready` 和 `zan_co_sched_init`
+  接管帧调度及定时器 ready hook。
+- 同步 `Task.Delay` 由拥有就绪队列的调度器推进。gen1 的 weak 初始化把
+  C 定时器堆的 ready hook 接到本地 FIFO。同步等待与普通调度共用推进循环，
+  每轮检查自己的单调截止时间。强初始化接管时，同步等待交给运行时的
+  `zan_co_sync_sleep`。用 `async_sync_delay_timer` 验证等待中的定时器进展，
+  用单 worker 的 `async_nested_yield` 验证嵌套推进后外层协程仍能让出。
 
 ## 44. 重载分派要按**实参类型**选，不能按名字取
 
