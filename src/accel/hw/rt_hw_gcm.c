@@ -682,3 +682,51 @@ int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
     return zan_hw_aes_gcm_decrypt_ctx((const uint8_t*)&ctx, iv12, aad, aadLen, in, inLen, tag16, out);
 }
 
+int64_t zan_hw_ffi_ghash_block(uint64_t h, uint64_t x, uint64_t y) {
+    return zan_hw_ghash_block((const uint8_t *)(uintptr_t)h, (const uint8_t *)(uintptr_t)x,
+                              (uint8_t *)(uintptr_t)y);
+}
+
+int64_t zan_hw_ffi_ghash_update(uint64_t h, uint64_t data, int64_t len, uint64_t y) {
+    return zan_hw_ghash_update((const uint8_t *)(uintptr_t)h, (const uint8_t *)(uintptr_t)data, len,
+                               (uint8_t *)(uintptr_t)y);
+}
+
+int64_t zan_hw_ffi_aes_gcm_encrypt(uint64_t key, int64_t keybits, uint64_t iv, uint64_t aad,
+                                   int64_t aadLen, uint64_t inBuf, int64_t inLen, uint64_t outBuf,
+                                   uint64_t tag16) {
+    return zan_hw_aes_gcm_encrypt((const uint8_t *)(uintptr_t)key, (int)keybits,
+                                  (const uint8_t *)(uintptr_t)iv, (const uint8_t *)(uintptr_t)aad,
+                                  aadLen, (const uint8_t *)(uintptr_t)inBuf, inLen,
+                                  (uint8_t *)(uintptr_t)outBuf, (uint8_t *)(uintptr_t)tag16);
+}
+
+int64_t zan_hw_ffi_aes_gcm_decrypt(uint64_t key, int64_t keybits, uint64_t iv, uint64_t aad,
+                                   int64_t aadLen, uint64_t inBuf, int64_t inLen, uint64_t tag16,
+                                   uint64_t outBuf) {
+    return zan_hw_aes_gcm_decrypt((const uint8_t *)(uintptr_t)key, (int)keybits,
+                                  (const uint8_t *)(uintptr_t)iv, (const uint8_t *)(uintptr_t)aad,
+                                  aadLen, (const uint8_t *)(uintptr_t)inBuf, inLen,
+                                  (const uint8_t *)(uintptr_t)tag16, (uint8_t *)(uintptr_t)outBuf);
+}
+
+int64_t zan_hw_ffi_aes_gcm_init(uint64_t ctxBuf, int64_t ctxLen, uint64_t key, int64_t keybits) {
+    return zan_hw_aes_gcm_init((uint8_t *)(uintptr_t)ctxBuf, ctxLen, (const uint8_t *)(uintptr_t)key,
+                               (int)keybits);
+}
+
+int64_t zan_hw_ffi_aes_gcm_encrypt_ctx(uint64_t ctxBuf, uint64_t iv, uint64_t aad, int64_t aadLen,
+                                       uint64_t inBuf, int64_t inLen, uint64_t outBuf, uint64_t tag16) {
+    return zan_hw_aes_gcm_encrypt_ctx((const uint8_t *)(uintptr_t)ctxBuf, (const uint8_t *)(uintptr_t)iv,
+                                      (const uint8_t *)(uintptr_t)aad, aadLen,
+                                      (const uint8_t *)(uintptr_t)inBuf, inLen,
+                                      (uint8_t *)(uintptr_t)outBuf, (uint8_t *)(uintptr_t)tag16);
+}
+
+int64_t zan_hw_ffi_aes_gcm_decrypt_ctx(uint64_t ctxBuf, uint64_t iv, uint64_t aad, int64_t aadLen,
+                                       uint64_t inBuf, int64_t inLen, uint64_t tag16, uint64_t outBuf) {
+    return zan_hw_aes_gcm_decrypt_ctx((const uint8_t *)(uintptr_t)ctxBuf, (const uint8_t *)(uintptr_t)iv,
+                                      (const uint8_t *)(uintptr_t)aad, aadLen,
+                                      (const uint8_t *)(uintptr_t)inBuf, inLen,
+                                      (const uint8_t *)(uintptr_t)tag16, (uint8_t *)(uintptr_t)outBuf);
+}

@@ -842,3 +842,12 @@ int64_t zan_hw_sm4_cbc_decrypt(const uint8_t *in, int64_t len,
     return len - pad_val;
 }
 
+int64_t zan_hw_ffi_sm4_cbc_encrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, uint64_t iv) {
+    return zan_hw_sm4_cbc_encrypt((const uint8_t *)(uintptr_t)src, size, (const uint8_t *)(uintptr_t)key,
+                                  (const uint8_t *)(uintptr_t)iv, (uint8_t *)(uintptr_t)dst);
+}
+
+int64_t zan_hw_ffi_sm4_cbc_decrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, uint64_t iv) {
+    return zan_hw_sm4_cbc_decrypt((const uint8_t *)(uintptr_t)src, size, (const uint8_t *)(uintptr_t)key,
+                                  (const uint8_t *)(uintptr_t)iv, (uint8_t *)(uintptr_t)dst);
+}

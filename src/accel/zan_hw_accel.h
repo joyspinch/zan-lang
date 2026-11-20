@@ -123,6 +123,39 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len);
 /* CRC-32 (IEEE 802.3, 多项式 0xEDB88320) 硬件/切片加速计算：基于 ARMv8 CRC 指令 / x86 Slice-by-8 */
 int64_t zan_hw_crc32_update(uint32_t crc, const uint8_t *p, int64_t len);
 
+/* Ordinary Zan FFI entry points share the address ABI of the digests above. */
+int64_t zan_hw_ffi_aes_cbc_encrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key,
+                                   int64_t keybits, uint64_t iv);
+int64_t zan_hw_ffi_aes_cbc_decrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key,
+                                   int64_t keybits, uint64_t iv);
+int64_t zan_hw_ffi_aes_ecb_block(uint64_t key, int64_t keybits, uint64_t in16, uint64_t out16);
+int64_t zan_hw_ffi_aes_ctr_crypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, int64_t keybits,
+                                 uint64_t counter);
+int64_t zan_hw_ffi_ghash_block(uint64_t h, uint64_t x, uint64_t y);
+int64_t zan_hw_ffi_ghash_update(uint64_t h, uint64_t data, int64_t len, uint64_t y);
+int64_t zan_hw_ffi_aes_gcm_encrypt(uint64_t key, int64_t keybits, uint64_t iv, uint64_t aad,
+                                   int64_t aadLen, uint64_t inBuf, int64_t inLen, uint64_t outBuf,
+                                   uint64_t tag16);
+int64_t zan_hw_ffi_aes_gcm_decrypt(uint64_t key, int64_t keybits, uint64_t iv, uint64_t aad,
+                                   int64_t aadLen, uint64_t inBuf, int64_t inLen, uint64_t tag16,
+                                   uint64_t outBuf);
+int64_t zan_hw_ffi_aes_gcm_init(uint64_t ctxBuf, int64_t ctxLen, uint64_t key, int64_t keybits);
+int64_t zan_hw_ffi_aes_gcm_encrypt_ctx(uint64_t ctxBuf, uint64_t iv, uint64_t aad, int64_t aadLen,
+                                       uint64_t inBuf, int64_t inLen, uint64_t outBuf, uint64_t tag16);
+int64_t zan_hw_ffi_aes_gcm_decrypt_ctx(uint64_t ctxBuf, uint64_t iv, uint64_t aad, int64_t aadLen,
+                                       uint64_t inBuf, int64_t inLen, uint64_t tag16, uint64_t outBuf);
+int64_t zan_hw_ffi_rsa_mod_pow(uint64_t baseVal, int64_t bLen, uint64_t exp, int64_t eLen, uint64_t mod,
+                               int64_t mLen, uint64_t outBuf);
+int64_t zan_hw_ffi_rsa_crt(uint64_t msg, int64_t mLen, uint64_t p, int64_t pLen, uint64_t q,
+                           int64_t qLen, uint64_t dp, int64_t dpLen, uint64_t dq, int64_t dqLen,
+                           uint64_t qinv, int64_t qinvLen, uint64_t outBuf, int64_t outLen);
+int64_t zan_hw_ffi_x25519(uint64_t scalar, uint64_t point, uint64_t outBuf);
+int64_t zan_hw_ffi_sm4_cbc_encrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, uint64_t iv);
+int64_t zan_hw_ffi_sm4_cbc_decrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, uint64_t iv);
+int64_t zan_hw_ffi_crc32_update(int64_t crc, uint64_t p, int64_t len);
+int64_t zan_hw_ffi_crc32c_update(int64_t crc, uint64_t p, int64_t len);
+int64_t zan_hw_ffi_crc32c(uint64_t p, int64_t len);
+
 void zan_hw_aes_encrypt(const void *val, const void *key, void *out);
 void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out);
 void zan_hw_aes_decrypt(const void *val, const void *key, void *out);

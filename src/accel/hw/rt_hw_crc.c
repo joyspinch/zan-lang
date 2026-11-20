@@ -75,53 +75,62 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
 }
 
 static uint32_t s_zan_crc32_table[8][256];
-static int s_zan_crc32_inited = 0;
+static uint32_t s_zan_crc32c_table[8][256];
+static int s_zan_crc32_table_state;
+static int s_zan_crc32c_table_state;
 
-static void zan_init_crc32_slice8(void) {
-    if (s_zan_crc32_inited) return;
+static void zan_init_crc_table(uint32_t table[8][256], int *state, uint32_t polynomial) {
+    if (__atomic_load_n(state, __ATOMIC_ACQUIRE) == 2) return;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(state, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(state, __ATOMIC_ACQUIRE) != 2) { }
+        return;
+    }
     for (uint32_t i = 0; i < 256; i++) {
         uint32_t c = i;
         for (int k = 0; k < 8; k++) {
-            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            c = (c & 1) ? (polynomial ^ (c >> 1)) : (c >> 1);
         }
-        s_zan_crc32_table[0][i] = c;
+        table[0][i] = c;
     }
     for (int k = 1; k < 8; k++) {
         for (uint32_t i = 0; i < 256; i++) {
-            s_zan_crc32_table[k][i] = (s_zan_crc32_table[k - 1][i] >> 8) ^
-                                      s_zan_crc32_table[0][s_zan_crc32_table[k - 1][i] & 0xFF];
+            uint32_t c = table[k - 1][i];
+            table[k][i] = (c >> 8) ^ table[0][c & 0xFF];
         }
     }
-    s_zan_crc32_inited = 1;
+    __atomic_store_n(state, 2, __ATOMIC_RELEASE);
 }
 
-static uint32_t zan_crc32_slice8(uint32_t crc, const uint8_t *buf, int64_t len) {
-    zan_init_crc32_slice8();
-    uint32_t c = crc ^ 0xFFFFFFFFu;
+static uint32_t zan_crc_slice8(const uint32_t table[8][256], uint32_t crc,
+                                const uint8_t *buf, int64_t len) {
+    uint32_t c = crc;
     const uint8_t *p = buf;
     while (len > 0 && ((uintptr_t)p & 7)) {
-        c = s_zan_crc32_table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
+        c = table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
         len--;
     }
     while (len >= 8) {
-        uint32_t one = *(const uint32_t*)p ^ c;
-        uint32_t two = *(const uint32_t*)(p + 4);
-        c = s_zan_crc32_table[7][one & 0xFF] ^
-            s_zan_crc32_table[6][(one >> 8) & 0xFF] ^
-            s_zan_crc32_table[5][(one >> 16) & 0xFF] ^
-            s_zan_crc32_table[4][(one >> 24) & 0xFF] ^
-            s_zan_crc32_table[3][two & 0xFF] ^
-            s_zan_crc32_table[2][(two >> 8) & 0xFF] ^
-            s_zan_crc32_table[1][(two >> 16) & 0xFF] ^
-            s_zan_crc32_table[0][(two >> 24) & 0xFF];
+        uint32_t one, two;
+        memcpy(&one, p, sizeof(one));
+        memcpy(&two, p + sizeof(one), sizeof(two));
+        one ^= c;
+        c = table[7][one & 0xFF] ^
+            table[6][(one >> 8) & 0xFF] ^
+            table[5][(one >> 16) & 0xFF] ^
+            table[4][(one >> 24) & 0xFF] ^
+            table[3][two & 0xFF] ^
+            table[2][(two >> 8) & 0xFF] ^
+            table[1][(two >> 16) & 0xFF] ^
+            table[0][(two >> 24) & 0xFF];
         p += 8;
         len -= 8;
     }
     while (len > 0) {
-        c = s_zan_crc32_table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
+        c = table[0][(c ^ *p++) & 0xFF] ^ (c >> 8);
         len--;
     }
-    return c ^ 0xFFFFFFFFu;
+    return c;
 }
 
 int64_t zan_hw_crc32_update(uint32_t crc, const uint8_t *p, int64_t len) {
@@ -131,6 +140,25 @@ int64_t zan_hw_crc32_update(uint32_t crc, const uint8_t *p, int64_t len) {
         return (int64_t)zan_crc32_arm(crc, p, len);
     }
 #endif
-    return (int64_t)zan_crc32_slice8(crc, p, len);
+    zan_init_crc_table(s_zan_crc32_table, &s_zan_crc32_table_state, 0xEDB88320u);
+    return zan_crc_slice8(s_zan_crc32_table, crc ^ UINT32_MAX, p, len) ^ UINT32_MAX;
+}
+
+int64_t zan_hw_ffi_crc32_update(int64_t crc, uint64_t p, int64_t len) {
+    return zan_hw_crc32_update((uint32_t)crc, (const uint8_t *)(uintptr_t)p, len);
+}
+
+int64_t zan_hw_ffi_crc32c_update(int64_t crc, uint64_t p, int64_t len) {
+    return zan_hw_crc32c_update((uint32_t)crc, (const uint8_t *)(uintptr_t)p, len);
+}
+
+int64_t zan_hw_ffi_crc32c(uint64_t p, int64_t len) {
+    if (len <= 0) return 0;
+    if (!p) return -1;
+    const uint8_t *data = (const uint8_t *)(uintptr_t)p;
+    int64_t hw = zan_hw_crc32c_update(UINT32_MAX, data, len);
+    if (hw >= 0) return (uint32_t)hw ^ UINT32_MAX;
+    zan_init_crc_table(s_zan_crc32c_table, &s_zan_crc32c_table_state, 0x82F63B78u);
+    return zan_crc_slice8(s_zan_crc32c_table, UINT32_MAX, data, len) ^ UINT32_MAX;
 }
 

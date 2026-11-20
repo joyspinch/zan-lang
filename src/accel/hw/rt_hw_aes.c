@@ -1071,3 +1071,27 @@ void zan_hw_vec128_store(void *addr, const void *val) {
 
 #endif
 
+int64_t zan_hw_ffi_aes_cbc_encrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key,
+                                   int64_t keybits, uint64_t iv) {
+    return zan_hw_aes_cbc_encrypt((const uint8_t *)(uintptr_t)src, size, (const uint8_t *)(uintptr_t)key,
+                                  (int)keybits, (const uint8_t *)(uintptr_t)iv,
+                                  (uint8_t *)(uintptr_t)dst);
+}
+
+int64_t zan_hw_ffi_aes_cbc_decrypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key,
+                                   int64_t keybits, uint64_t iv) {
+    return zan_hw_aes_cbc_decrypt((const uint8_t *)(uintptr_t)src, size, (const uint8_t *)(uintptr_t)key,
+                                  (int)keybits, (const uint8_t *)(uintptr_t)iv,
+                                  (uint8_t *)(uintptr_t)dst);
+}
+
+int64_t zan_hw_ffi_aes_ecb_block(uint64_t key, int64_t keybits, uint64_t in16, uint64_t out16) {
+    return zan_hw_aes_ecb_block((const uint8_t *)(uintptr_t)key, (int)keybits,
+                                (const uint8_t *)(uintptr_t)in16, (uint8_t *)(uintptr_t)out16);
+}
+
+int64_t zan_hw_ffi_aes_ctr_crypt(uint64_t dst, uint64_t src, int64_t size, uint64_t key, int64_t keybits,
+                                 uint64_t counter) {
+    return zan_hw_aes_ctr_crypt((const uint8_t *)(uintptr_t)src, size, (const uint8_t *)(uintptr_t)key,
+                                (int)keybits, (uint8_t *)(uintptr_t)counter, (uint8_t *)(uintptr_t)dst);
+}

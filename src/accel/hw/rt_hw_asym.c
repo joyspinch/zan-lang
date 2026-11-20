@@ -630,3 +630,22 @@ int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
     return 0;
 }
 
+int64_t zan_hw_ffi_rsa_mod_pow(uint64_t baseVal, int64_t bLen, uint64_t exp, int64_t eLen, uint64_t mod,
+                               int64_t mLen, uint64_t outBuf) {
+    return zan_hw_rsa_mod_pow((const uint8_t *)(uintptr_t)baseVal, bLen, (const uint8_t *)(uintptr_t)exp,
+                              eLen, (const uint8_t *)(uintptr_t)mod, mLen, (uint8_t *)(uintptr_t)outBuf);
+}
+
+int64_t zan_hw_ffi_rsa_crt(uint64_t msg, int64_t mLen, uint64_t p, int64_t pLen, uint64_t q,
+                           int64_t qLen, uint64_t dp, int64_t dpLen, uint64_t dq, int64_t dqLen,
+                           uint64_t qinv, int64_t qinvLen, uint64_t outBuf, int64_t outLen) {
+    return zan_hw_rsa_crt((const uint8_t *)(uintptr_t)msg, mLen, (const uint8_t *)(uintptr_t)p, pLen,
+                          (const uint8_t *)(uintptr_t)q, qLen, (const uint8_t *)(uintptr_t)dp, dpLen,
+                          (const uint8_t *)(uintptr_t)dq, dqLen, (const uint8_t *)(uintptr_t)qinv,
+                          qinvLen, (uint8_t *)(uintptr_t)outBuf, outLen);
+}
+
+int64_t zan_hw_ffi_x25519(uint64_t scalar, uint64_t point, uint64_t outBuf) {
+    return zan_hw_x25519((const uint8_t *)(uintptr_t)scalar, (const uint8_t *)(uintptr_t)point,
+                         (uint8_t *)(uintptr_t)outBuf);
+}

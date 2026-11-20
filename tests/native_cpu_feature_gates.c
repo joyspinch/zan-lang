@@ -67,10 +67,24 @@ static int test_crypto_dispatch(void) {
     return 0;
 }
 
+static int test_crc_fallback(void) {
+    _Alignas(8) uint8_t input[] = "123456789";
+    uint64_t address = (uintptr_t)input;
+    g_gate_crc32 = g_gate_crc32c = -1;
+    if (zan_hw_ffi_crc32_update(0, address, 9) != 0xCBF43926u) return 13;
+    int64_t seed = zan_hw_ffi_crc32_update(0, address, 4);
+    if (zan_hw_ffi_crc32_update(seed, address + 4, 5) != 0xCBF43926u) return 14;
+    if (zan_hw_ffi_crc32c_update(UINT32_MAX, address, 9) != -1) return 15;
+    if (zan_hw_ffi_crc32c(address, 9) != 0xE3069283u) return 16;
+    if (zan_hw_ffi_crc32c(0, 0) != 0) return 17;
+    return 0;
+}
+
 int main(void) {
     int rc = test_requirements();
     if (!rc) rc = test_pixel_fallback();
     if (!rc) rc = test_crypto_dispatch();
+    if (!rc) rc = test_crc_fallback();
     if (rc) fprintf(stderr, "native CPU gate regression failed: %d\n", rc);
     return rc;
 }

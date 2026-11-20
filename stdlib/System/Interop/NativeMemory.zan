@@ -8,8 +8,8 @@ namespace System;
 // 二进制 IO 用的堆外原始内存（ByteBuffer、数据库页、网络
 // 组帧）。地址是普通 nint，不进入 ARC 对象
 // 机制，因此热路径的字节级循环开销与等效的 C 代码相同。
-// 基本内存操作由编译器降低。摘要和 Base64 通过普通 FFI 调用
-// 加速归档，Zan 封装负责构造 ARC 托管字符串。
+// 基本内存操作由编译器降低。密码学、校验和 Base64 通过普通 FFI
+// 调用加速归档，Zan 封装负责构造 ARC 托管字符串。
 // 标量访问是 <c>Span&lt;T&gt;</c> 的职责：<c>new Span&lt;int&gt;(p, n)</c>
 // 将原始地址视图化，并以小端、无对齐要求的
 // 类型化读写进行索引。
@@ -76,18 +76,23 @@ public class NativeMemory {
     public static extern double AsF64(long bits);
 
     // p 处 len 字节的 CRC-32（IEEE，poly 0xEDB88320）。
-    [DllImport("crt")]
-    public static extern int Crc32(nint p, int len);
+    public static long Crc32(nint p, long len) {
+        return NativeMemory.Crc32Update(0, p, len);
+    }
+
+    // 续算使用上一次返回的 CRC-32 作为种子。
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_crc32_update")]
+    public static extern long Crc32Update(long crc, nint p, long len);
 
     // p 处 len 字节的 CRC-32C（Castagnoli，poly 0x82F63B78）。
     // 常用于现代数据库存储页（ZanDB、RocksDB）与网络协议的完整性校验。
-    [DllImport("crt")]
-    public static extern int Crc32C(nint p, int len);
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_crc32c")]
+    public static extern long Crc32C(nint p, long len);
 
     // CRC-32C 续算：把 p 处 len 字节追加到 crc（SSE4.2 crc32/ARMv8 CRC
     // 指令流水线）。返回更新后的 CRC；无硬件路径返回 -1（正常 CRC 值
     // 恒为非负 32 位数，-1 不会歧义）。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_crc32c_update")]
     public static extern long Crc32CUpdate(long crc, nint p, long len);
 
     // 对 p 处 len 字节计算 FIPS 180-4 SHA-256，返回 32 字节原始
@@ -139,71 +144,99 @@ public class NativeMemory {
 
     // 硬件加速 AES-CBC 加密（AES-NI/ARMv8 单周期吞吐），keybits 为
     // 128/192/256，含 PKCS#7 填充，返回密文长度；无硬件路径返回 -1。
-    [DllImport("crt")]
-    public static extern long AesCbcEncrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
+    public static long AesCbcEncrypt(nint dst, nint src, long size, nint key, int keybits, nint iv) {
+        return AesCbcEncryptCore(dst, src, size, key, (long)keybits, iv);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_cbc_encrypt")]
+    private static extern long AesCbcEncryptCore(nint dst, nint src, long size, nint key, long keybits, nint iv);
 
     // 硬件加速 AES-CBC 解密（AES-NI 并行解码），返回明文长度；无硬件路径返回 -1。
-    [DllImport("crt")]
-    public static extern long AesCbcDecrypt(nint dst, nint src, long size, nint key, int keybits, nint iv);
+    public static long AesCbcDecrypt(nint dst, nint src, long size, nint key, int keybits, nint iv) {
+        return AesCbcDecryptCore(dst, src, size, key, (long)keybits, iv);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_cbc_decrypt")]
+    private static extern long AesCbcDecryptCore(nint dst, nint src, long size, nint key, long keybits, nint iv);
 
     // 单块 AES-ECB（FIPS-197）：把 in16 的 16 字节加密写入 out16。
     // 成功返回 0，无硬件路径返回 -1。
-    [DllImport("crt")]
-    public static extern long AesEcbBlock(nint key, int keybits, nint in16, nint out16);
+    public static long AesEcbBlock(nint key, int keybits, nint in16, nint out16) {
+        return AesEcbBlockCore(key, (long)keybits, in16, out16);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_ecb_block")]
+    private static extern long AesEcbBlockCore(nint key, long keybits, nint in16, nint out16);
 
     // AES-CTR keystream 异或（SP 800-38A）：counter 为 128 位大端计数器，
     // 原地前进越过已消耗的块。成功返回 size，无硬件路径返回 -1。
-    [DllImport("crt")]
-    public static extern long AesCtrCrypt(nint dst, nint src, long size, nint key, int keybits, nint counter);
+    public static long AesCtrCrypt(nint dst, nint src, long size, nint key, int keybits, nint counter) {
+        return AesCtrCryptCore(dst, src, size, key, (long)keybits, counter);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_ctr_crypt")]
+    private static extern long AesCtrCryptCore(nint dst, nint src, long size, nint key, long keybits, nint counter);
 
     // GHASH 一步（GCM，SP 800-38D）：y = (y ^ x) * h，三者均为 16 字节块。
     // 成功返回 0，无硬件路径返回 -1。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_ghash_block")]
     public static extern long GhashBlock(nint h, nint x, nint y);
 
     // GHASH 连续流式哈希（GCM，SP 800-38D）：逐块处理 data 的 len 字节并累加到 y16。
     // 成功返回 0，无硬件路径返回 -1。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_ghash_update")]
     public static extern long GhashUpdate(nint h, nint data, long len, nint y);
 
     // 硬件加速一体化 AES-GCM 认证加密（SP 800-38D）。
-    // 支持 原地/独立 缓冲区加密，无跨层 FFI 开销与零堆内存分配。
+    // 支持原地或独立缓冲区加密，使用调用方提供的缓冲区。
     // 成功返回密文长度（等于 inLen），无硬件路径或失败返回 -1。
-    [DllImport("crt")]
-    public static extern long AesGcmEncrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
+    public static long AesGcmEncrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16) {
+        return AesGcmEncryptCore(key, (long)keybits, iv, aad, aadLen, inBuf, inLen, outBuf, tag16);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_gcm_encrypt")]
+    private static extern long AesGcmEncryptCore(nint key, long keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
 
     // 硬件加速一体化 AES-GCM 认证解密（SP 800-38D）。
     // 成功返回明文长度（等于 inLen），MAC 认证失败或无硬件路径返回 -1。
-    [DllImport("crt")]
-    public static extern long AesGcmDecrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
+    public static long AesGcmDecrypt(nint key, int keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf) {
+        return AesGcmDecryptCore(key, (long)keybits, iv, aad, aadLen, inBuf, inLen, tag16, outBuf);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_gcm_decrypt")]
+    private static extern long AesGcmDecryptCore(nint key, long keybits, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
 
     // 初始化 AES-GCM 预计算上下文（预展开密钥编排并预计算 GHASH H 与反射常量）。
     // ctxBuf 建议至少 384 字节，成功返回 0，失败返回 -1。
-    [DllImport("crt")]
-    public static extern long AesGcmInit(nint ctxBuf, long ctxLen, nint key, int keybits);
+    public static long AesGcmInit(nint ctxBuf, long ctxLen, nint key, int keybits) {
+        return AesGcmInitCore(ctxBuf, ctxLen, key, (long)keybits);
+    }
+
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_gcm_init")]
+    private static extern long AesGcmInitCore(nint ctxBuf, long ctxLen, nint key, long keybits);
 
     // 基于预计算上下文的高吞吐 AES-GCM 认证加密，消除每记录重复密钥展开开销。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_gcm_encrypt_ctx")]
     public static extern long AesGcmEncryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint outBuf, nint tag16);
 
     // 基于预计算上下文的高吞吐 AES-GCM 认证解密，消除每记录重复密钥展开开销。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_aes_gcm_decrypt_ctx")]
     public static extern long AesGcmDecryptCtx(nint ctxBuf, nint iv, nint aad, long aadLen, nint inBuf, long inLen, nint tag16, nint outBuf);
 
     // Montgomery 模幂加速 baseVal^exp mod mod（最大 4096 位奇模数）。大端序字节缓冲区。
     // 成功返回 0，无硬件路径或参数不合法返回 -1。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_rsa_mod_pow")]
     public static extern long RsaModPow(nint baseVal, long bLen, nint exp, long eLen, nint mod, long mLen, nint outBuf);
 
     // RSA 中国剩余定理 (CRT) 加速模幂：
     // s1 = msg^dp mod p, s2 = msg^dq mod q, 通过 Garner 算法重构 s = s2 + ((s1 - s2) * qinv mod p) * q。
     // 成功返回 0，失败返回 -1。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_rsa_crt")]
     public static extern long RsaCrtModPow(nint msg, long mLen, nint p, long pLen, nint q, long qLen, nint dp, long dpLen, nint dq, long dqLen, nint qinv, long qinvLen, nint outBuf, long outLen);
 
     // RFC 7748 X25519 常数时间密钥交换：计算 scalar * point 写入 outBuf。
-    // scalar、point、outBuf 均为 32 字节小端序缓冲区，原地夹紧标量。成功返回 0，失败返回 -1。
-    [DllImport("crt")]
+    // scalar、point、outBuf 均为 32 字节小端序缓冲区。成功返回 0，失败返回 -1。
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_x25519")]
     public static extern long X25519(nint scalar, nint point, nint outBuf);
 
     // 高性能流水线国密 SM3 摘要计算（GM/T 0004-2012），返回 32 字节原始
@@ -222,11 +255,11 @@ public class NativeMemory {
     private static extern long Sm3Core(nint p, long len, nint dst);
 
     // 硬件查表流水线 SM4-CBC 加密（GB/T 32907-2016，含 PKCS#7 填充）。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_sm4_cbc_encrypt")]
     public static extern long Sm4CbcEncrypt(nint dst, nint src, long size, nint key, nint iv);
 
     // 硬件查表流水线 SM4-CBC 解密（GB/T 32907-2016，含 PKCS#7 校验去除）。
-    [DllImport("crt")]
+    [DllImport("crt", EntryPoint = "zan_hw_ffi_sm4_cbc_decrypt")]
     public static extern long Sm4CbcDecrypt(nint dst, nint src, long size, nint key, nint iv);
 
     // 高吞吐 SIMD / 流水线 Base64 编码，返回新分配的 ARC 字符串。
