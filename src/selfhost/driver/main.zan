@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Interop;
-using System.Reflection;
 namespace Zan;
 
 
@@ -331,86 +330,13 @@ public partial class Program {
         return "clang";
     }
 
-    static string ImportLibrary(Node method) {
-        AttributeReader attrs = new AttributeReader("!1;" + method.attrDeclaredData);
-        while (attrs.MoveNext()) {
-            if (attrs.Name != "DllImport") { continue; }
-            if (attrs.MoveNextArgument() && attrs.ArgumentName == "" && attrs.ArgumentKind == 'S') {
-                return attrs.ArgumentValue;
-            }
-        }
-        return "";
-    }
-
-    static bool SafeDriverName(string name) {
-        if (name == "" || name.StartsWith(".") || name.StartsWith("-")) { return false; }
-        for (int i = 0; i < name.Length; i = i + 1) {
-            int c = (int)name[i];
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-                || c == '_' || c == '-' || c == '.' || c == '+') { continue; }
-            return false;
-        }
-        return true;
-    }
-
-    static void ResolveNativeImports(Irgen ig, List<string> inputs, List<string> dlls) {
-        #if WINDOWS
-        Dictionary<string, string> manifests = new Dictionary<string, string>();
-        Dictionary<string, string> resolved = new Dictionary<string, string>();
-        for (int i = 0; i < ig.liveNativeExterns.Count; i = i + 1) {
-            Node method = ig.liveNativeExterns[i];
-            string name = ImportLibrary(method);
-            if (!SafeDriverName(name)) { continue; }
-            if (name.StartsWith("lib") && name.Length > 3) { name = name.Substring(3); }
-            if (!SafeDriverName(name)) { continue; }
-            string sourceDir = Path.GetDirectoryName(ig.diags.FileOfLine(method.line));
-            if (sourceDir == "") { continue; }
-            if (!manifests.ContainsKey(sourceDir)) {
-                string manifest = sourceDir + "/drivers/driver.manifest";
-                manifests[sourceDir] = File.Exists(manifest) ? File.ReadAllText(manifest) : "";
-            }
-            string manifestText = manifests[sourceDir];
-            if (manifestText == "" || resolved.ContainsKey(sourceDir + "/" + name)) { continue; }
-            List<string> rows = manifestText.Split("\n");
-            bool ownsDriver = false;
-            for (int j = 0; j < rows.Count; j = j + 1) {
-                if (rows[j].Trim() == name) { ownsDriver = true; break; }
-            }
-            if (!ownsDriver) { continue; }
-            resolved[sourceDir + "/" + name] = name;
-            string dir = sourceDir + "/drivers/" + RuntimeInformation.RuntimeIdentifier;
-            string archive = dir + "/lib" + name + ".dll.a";
-            if (!File.Exists(archive)) { archive = dir + "/" + name + ".lib"; }
-            if (!File.Exists(archive)) { continue; }
-            string bundle = dir + "/" + name + ".bundle";
-            if (!File.Exists(bundle)) { continue; }
-            List<string> entries = File.ReadAllLines(bundle);
-            List<string> files = new List<string>();
-            bool directBundle = true;
-            for (int j = 0; j < entries.Count; j = j + 1) {
-                string entry = entries[j].Trim();
-                if (entry == "" || entry.StartsWith("#")) { continue; }
-                if (!SafeDriverName(entry) || !entry.ToLower().EndsWith(".dll")) {
-                    directBundle = false;
-                    break;
-                }
-                string file = dir + "/" + entry;
-                if (!File.Exists(file)) { throw "zanc: missing driver bundle file '" + file + "'"; }
-                files.Add(file);
-            }
-            if (!directBundle || files.Count == 0) { continue; }
-            inputs.Add(archive);
-            for (int j = 0; j < files.Count; j = j + 1) { dlls.Add(files[j]); }
-        }
-        #endif
-    }
-
-    static void StageNativeFiles(List<string> files, string workDir, string outputDir) {
+    static void StageNativeFiles(List<string> files, string workDir, string outputDir, string outputName) {
         Dictionary<string, string> staged = new Dictionary<string, string>();
         for (int i = 0; i < files.Count; i = i + 1) {
             string name = Path.GetFileName(files[i]);
             string key = name.ToLower();
             string dest = outputDir + "/" + name;
+            if (key == outputName.ToLower()) { throw "zanc: driver bundle file conflicts with executable '" + dest + "'"; }
             string other = staged.ContainsKey(key) ? staged[key] : dest;
             if (File.Exists(other)) {
                 byte[] a = File.ReadAllBytes(files[i]);
@@ -420,7 +346,7 @@ public partial class Program {
                 }
                 continue;
             }
-            string copy = workDir + "/" + name;
+            string copy = workDir + "/native-" + i;
             staged[key] = copy;
             File.Copy(files[i], copy);
         }
@@ -433,7 +359,7 @@ public partial class Program {
         }
     }
 
-    static void LinkExe(string outPath, string llPath, string optLevel, List<string> linkInputs) {
+    static void LinkExe(string clang, string outPath, string llPath, string optLevel, List<string> linkInputs) {
         string exe = Environment.ExeDir();
         string rtDir = exe;
         if (!File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {
@@ -489,7 +415,7 @@ public partial class Program {
         args.Add("-lbcrypt");
         args.Add("-o");
         args.Add(outPath);
-        int rc = Process.RunWithStandardStreams(FindClang(), args);
+        int rc = Process.RunWithStandardStreams(clang, args);
         if (rc != 0) {
             throw "zanc: linking failed with exit code " + rc;
         }
@@ -692,7 +618,9 @@ public partial class Program {
 
             Irgen ig = new Irgen(b, d);
             ig.libOut = emitLib;
-            ig.collectNativeImports = isExe && linkInputs.Count == 0;
+            #if WINDOWS
+            ig.collectNativeImports = isExe;
+            #endif
             string ir = ig.Gen(unit);
             // The checker phase already reported its own diagnostics; the
             // second flush must start at the irgen phase's first item or
@@ -706,8 +634,9 @@ public partial class Program {
             if (isExe && !emitLib) {
                 string finalPath = Path.GetFullPath(outPath);
                 string outputDir = Path.GetDirectoryName(finalPath);
-                List<string> dlls = new List<string>();
-                if (ig.collectNativeImports) { ResolveNativeImports(ig, linkInputs, dlls); }
+                string clang = FindClang();
+                List<string> bundleFiles = new List<string>();
+                if (ig.collectNativeImports) { ResolveNativeImports(ig, clang, linkInputs, bundleFiles); }
                 string suffix = Guid.New();
                 string workDir = outputDir + "/.zanc-" + suffix;
                 if (suffix.Length == 0 || !Nio.CreateDirectoryExclusive(workDir)) {
@@ -717,16 +646,16 @@ public partial class Program {
                 string exePath = workDir + "/program.exe";
                 try {
                     File.WriteAllText(llPath, ir);
-                    LinkExe(exePath, llPath, optLevel, linkInputs);
-                    if (dlls.Count > 0) { StageNativeFiles(dlls, workDir, outputDir); }
+                    LinkExe(clang, exePath, llPath, optLevel, linkInputs);
+                    StageNativeFiles(bundleFiles, workDir, outputDir, Path.GetFileName(finalPath));
                     if (Nio.ReplaceFile(exePath, finalPath) != 0) {
                         throw "zanc: cannot publish executable " + outPath;
                     }
                 } finally {
                     File.Delete(llPath);
                     File.Delete(exePath);
-                    for (int fi = 0; fi < dlls.Count; fi = fi + 1) {
-                        File.Delete(workDir + "/" + Path.GetFileName(dlls[fi]));
+                    for (int fi = 0; fi < bundleFiles.Count; fi = fi + 1) {
+                        File.Delete(workDir + "/native-" + fi);
                     }
                     Directory.Delete(workDir);
                 }

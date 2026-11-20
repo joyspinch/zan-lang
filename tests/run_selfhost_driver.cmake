@@ -103,16 +103,32 @@ endif()
 if(WIN32 AND CLANG)
   set(_default_src "${OUTDIR}/default output.zan")
   set(_default_exe "${OUTDIR}/default output.exe")
+  execute_process(COMMAND "${CLANG}" -print-target-triple OUTPUT_VARIABLE triple
+    OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE rc TIMEOUT 15)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "could not determine Clang target, rc=${rc}")
+  endif()
+  set(arch x64)
+  if(triple MATCHES "^(aarch64|arm64)-")
+    set(arch arm64)
+  endif()
+  set(stdlib "${OUTDIR}/native-stdlib")
+  set(stdlib_driver "${stdlib}/Fixture/Nested/drivers")
+  file(MAKE_DIRECTORY "${stdlib_driver}/win-${arch}")
+  file(WRITE "${stdlib_driver}/driver.manifest" "stdlib_fixture if main\n")
+  file(WRITE "${stdlib_driver}/win-${arch}/stdlib_fixture.bundle" "stdlib-payload.dat\n")
+  file(WRITE "${stdlib_driver}/win-${arch}/stdlib-payload.dat" "standard library driver payload")
   file(WRITE "${_default_src}" "class Program { static int Main() { return 37; } }\n")
-  file(REMOVE "${_default_exe}")
-  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}"
+  file(REMOVE "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}" "ZAN_STDLIB_PATH=${stdlib}"
     "${GEN1}" "${_default_src}" WORKING_DIRECTORY "${_root}"
     RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
-  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}")
-    message(FATAL_ERROR "default executable output failed, rc=${rc}\n${stdout}${stderr}")
+  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${_default_exe}" OR NOT EXISTS "${OUTDIR}/stdlib-payload.dat")
+    message(FATAL_ERROR "default executable output or stdlib bundle failed, rc=${rc}\n${stdout}${stderr}")
   endif()
   execute_process(COMMAND "${_default_exe}" RESULT_VARIABLE rc TIMEOUT 15)
-  file(REMOVE "${_default_src}" "${_default_exe}")
+  file(REMOVE "${_default_src}" "${_default_exe}" "${OUTDIR}/stdlib-payload.dat")
+  file(REMOVE_RECURSE "${stdlib}")
   if(NOT "${rc}" STREQUAL "37")
     message(FATAL_ERROR "default executable returned ${rc}, expected 37")
   endif()
@@ -172,5 +188,90 @@ if(WIN32 AND CLANG)
   if(NOT _before STREQUAL _after OR _staging)
     message(FATAL_ERROR "failed link altered the executable or retained staging files")
   endif()
+  file(REMOVE "${_exe}")
+
+  # Explicit objects jointly cover a registered driver while SQLite still
+  # links automatically. The bundle-only package has no imported namespace.
+  set(project "${OUTDIR}/native-bundles")
+  set(app_driver "${project}/drivers/win-${arch}")
+  set(dep_module "${project}/.zan-packages/Zan.DriverFixture/src/Fixture")
+  set(dep_driver "${dep_module}/drivers/win-${arch}")
+  set(_exe "${project}/app.exe")
+  set(_obj "${project}/explicit native.obj")
+  file(MAKE_DIRECTORY "${app_driver}" "${dep_driver}")
+  file(REMOVE "${_exe}" "${project}/libsqlite3-0.dll" "${project}/payload.dat" "${project}/conditional.dat")
+  file(WRITE "${project}/app.zan" [=[
+using System;
+using System.Data.Sqlite;
+class Program {
+    [DllImport("libdriver_fixture", EntryPoint = "driver_native_twice")]
+    static extern int Twice(int value);
+    [DllImport("libdriver_fixture", EntryPoint = "driver_fixture_offset")]
+    static extern int Offset();
+    static int BundleReady() { return Twice(20) + Offset(); }
+    static int DeadBundle() { return 0; }
+    static int Main() {
+        SqliteConnection db = SqliteConnection.Open(":memory:");
+        db.Close();
+        return BundleReady();
+    }
+}
+]=])
+  file(WRITE "${project}/drivers/driver.manifest" "driver_fixture if Program_DeadBundle\noptional_fixture if Program_BundleReady\n")
+  file(WRITE "${app_driver}/driver_fixture.bundle" "@driver/dep_fixture if Program_BundleReady\nabsent.dat if Program_DeadBundle\n")
+  file(WRITE "${app_driver}/optional_fixture.bundle" "conditional.dat\n")
+  file(WRITE "${app_driver}/conditional.dat" "activated by a retained definition")
+  file(WRITE "${dep_module}/drivers/driver.manifest" "dep_fixture\n")
+  file(WRITE "${dep_driver}/dep_fixture.bundle" "payload.dat\n")
+  file(WRITE "${dep_driver}/payload.dat" "recursive bundle payload")
+  execute_process(COMMAND "${CLANG}" -c "${_root}/tests/selfhost/driver_native.c" -o "${_obj}"
+    COMMAND_ERROR_IS_FATAL ANY TIMEOUT 45)
+  file(WRITE "${project}/offset.c" "int driver_fixture_offset(void) { return 2; }\n")
+  execute_process(COMMAND "${CLANG}" -c "${project}/offset.c" -o "${project}/offset.obj"
+    RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+  if(NOT "${rc}" STREQUAL "0")
+    message(FATAL_ERROR "second native fixture compilation failed, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  set(compile "${CMAKE_COMMAND}" -E env "ZAN_CLANG=${CLANG}" "${GEN1}"
+    "${project}/app.zan" -o "${_exe}" --package-project "${project}")
+  set(explicit_inputs --link-input "explicit native.obj" --link-input offset.obj)
+  execute_process(COMMAND ${compile} ${explicit_inputs}
+    WORKING_DIRECTORY "${project}" RESULT_VARIABLE rc
+    OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
+  if(NOT "${rc}" STREQUAL "0" OR NOT EXISTS "${project}/libsqlite3-0.dll"
+      OR NOT EXISTS "${project}/payload.dat" OR NOT EXISTS "${project}/conditional.dat"
+      OR EXISTS "${project}/absent.dat")
+    message(FATAL_ERROR "combined explicit and automatic dependencies failed, rc=${rc}\n${stdout}${stderr}")
+  endif()
+  execute_process(COMMAND "${_exe}" WORKING_DIRECTORY "${project}" RESULT_VARIABLE rc TIMEOUT 15)
+  if(NOT "${rc}" STREQUAL "42")
+    message(FATAL_ERROR "combined native executable returned ${rc}, expected 42")
+  endif()
+  file(SHA256 "${_exe}" _before)
+  file(REMOVE "${dep_driver}/payload.dat")
+  foreach(failure IN ITEMS library file owner cycle)
+    set(args ${explicit_inputs})
+    if(failure STREQUAL "library")
+      set(args --link-input "explicit native.obj")
+      set(expected "missing driver link library for 'driver_fixture'")
+    elseif(failure STREQUAL "file")
+      set(expected "missing driver bundle file.*payload.dat")
+    elseif(failure STREQUAL "owner")
+      file(WRITE "${dep_driver}/dep_fixture.bundle" "@driver/unregistered_fixture\n")
+      set(expected "no registered owner for '@driver/unregistered_fixture'")
+    else()
+      file(WRITE "${dep_driver}/dep_fixture.bundle" "@driver/driver_fixture\n")
+      set(expected "cyclic driver bundle reference")
+    endif()
+    execute_process(COMMAND ${compile} ${args} WORKING_DIRECTORY "${project}"
+      RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 60)
+    file(SHA256 "${_exe}" _after)
+    file(GLOB _staging "${project}/.zanc-*")
+    if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "${expected}"
+        OR NOT _before STREQUAL _after OR _staging)
+      message(FATAL_ERROR "${failure}: expected '${expected}' and preserved output, rc=${rc}\n${stdout}${stderr}")
+    endif()
+  endforeach()
+  file(REMOVE_RECURSE "${project}")
 endif()
 message(STATUS "selfhost driver option, warning and link contracts passed")
