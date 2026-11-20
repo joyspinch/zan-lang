@@ -372,17 +372,9 @@ partial class Irgen {
                 StoreTo(e.a, new ExprVal(t, MkType("double")));
                 return new ExprVal(t, MkType("double"));
             }
-            string ti = NT();
-            string iop = e.op == TK.PlusPlus() ? "add" : "sub";
-            L("  " + ti + " = " + iop + " i64 " + v.op + ", 1");
-            // the host increments in the PLACE's width: an int counter wraps
-            // at 32 bits, a long one does not
-            int pw = ValWidth(v);
-            if (pw > 0 && pw < 64) { ti = WrapArith(ti, pw, false); }
-            StoreTo(e.a, new ExprVal(ti, MkType("int")));
-            ExprVal pr = new ExprVal(ti, MkType("int"));
-            pr.wbits = pw;
-            return pr;
+            ExprVal result = EmitIntegerUpdate(e, v);
+            StoreTo(e.a, result);
+            return result;
         }
         if (e.op == TK.Bang()) {
             // type-aware: `!SomeAsync()` negates the coroutine frame pointer
@@ -442,12 +434,15 @@ partial class Irgen {
                 L("  " + t + " = fneg double " + v.op);
                 return new ExprVal(t, MkType("double"));
             }
-            string t = NT();
-            L("  " + t + " = sub i64 0, " + v.op);
-            // the host negates in the OPERAND's width: negating the most
-            // negative int wraps back to it
             int nw = ValWidth(v);
-            if (nw > 0 && nw < 64) { t = WrapArith(t, nw, false); }
+            string t;
+            if (e.ival == 1 && nw > 0) {
+                t = EmitCheckedIntArith(e, "sub", "0", v.op, nw, false);
+            } else {
+                t = NT();
+                L("  " + t + " = sub i64 0, " + v.op);
+                t = WrapArith(t, nw, false);
+            }
             ExprVal r = new ExprVal(t, MkType("int"));
             r.wbits = nw;
             return r;
@@ -509,12 +504,25 @@ partial class Irgen {
             StoreTo(e.a, new ExprVal(t, MkType("double")));
             return cur;
         }
-        string t = NT();
-        string opn = "add";
-        if (e.op == TK.MinusMinus()) { opn = "sub"; }
-        L("  " + t + " = " + opn + " i64 " + cur.op + ", 1");
-        StoreTo(e.a, new ExprVal(t, MkType("int")));
+        StoreTo(e.a, EmitIntegerUpdate(e, cur));
         return cur;
+    }
+
+    ExprVal EmitIntegerUpdate(Node e, ExprVal value) {
+        int width = ValWidth(value);
+        bool uns = IntUnsigned(value.ty);
+        string op = e.op == TK.PlusPlus() ? "add" : "sub";
+        string result;
+        if (e.ival == 1 && width > 0) {
+            result = EmitCheckedIntArith(e, op, value.op, "1", width, uns);
+        } else {
+            result = NT();
+            L("  " + result + " = " + op + " i64 " + value.op + ", 1");
+            result = WrapArith(result, width, uns);
+        }
+        ExprVal updated = new ExprVal(result, value.ty);
+        updated.wbits = width;
+        return updated;
     }
 
     string ArithOp(int op) {
@@ -882,9 +890,11 @@ partial class Irgen {
     bool IsConstInt(Node e) {
         if (e == null) { return false; }
         if (e.kind == AK.IntLit()) { return true; }
-        if (e.kind == AK.Unary() && e.op == TK.Minus()) { return IsConstInt(e.a); }
+        if (e.kind == AK.Unary() && e.op == TK.Minus()) {
+            return e.ival != 1 && IsConstInt(e.a);
+        }
         if (e.kind == AK.Binary() && IsFoldOp(e.op)) {
-            if (!IsConstInt(e.a) || !IsConstInt(e.b)) { return false; }
+            if (e.ival == 1 || !IsConstInt(e.a) || !IsConstInt(e.b)) { return false; }
             if (e.op == TK.Slash() || e.op == TK.Percent()) {
                 if (EvalConstInt(e.b) == 0) { return false; }
             }
@@ -992,6 +1002,41 @@ partial class Irgen {
         return s2;
     }
 
+    // Checked arithmetic operates in the language width even though the
+    // self-hosted backend carries integer expressions in i64 slots.
+    string EmitCheckedIntArith(Node at, string op, string left, string right, int width, bool uns) {
+        string ty = "i" + width;
+        if (width < 64) {
+            string lhs = NT();
+            string rhs = NT();
+            L("  " + lhs + " = trunc i64 " + left + " to " + ty);
+            L("  " + rhs + " = trunc i64 " + right + " to " + ty);
+            left = lhs;
+            right = rhs;
+        }
+        string name = "llvm." + (uns ? "u" : "s") + op + ".with.overflow." + ty;
+        string pairTy = "{ " + ty + ", i1 }";
+        if (!ExternSeen(name)) {
+            externDecls.Add(name);
+            H("declare " + pairTy + " @" + name + "(" + ty + ", " + ty + ")");
+        }
+        string pair = NT();
+        L("  " + pair + " = call " + pairTy + " @" + name + "(" + ty + " " + left + ", " + ty + " " + right + ")");
+        string value = NT();
+        string overflow = NT();
+        L("  " + value + " = extractvalue " + pairTy + " " + pair + ", 0");
+        L("  " + overflow + " = extractvalue " + pairTy + " " + pair + ", 1");
+        EmitIntegerOverflow(at, overflow);
+        if (width == 64) { return value; }
+        string result = NT();
+        L("  " + result + " = " + (uns ? "zext " : "sext ") + ty + " " + value + " to i64");
+        return result;
+    }
+
+    void EmitIntegerOverflow(Node at, string overflow) {
+        EmitRuntimeCheckIf(at, overflow, "integer overflow in checked operation");
+    }
+
     // The result of an integer arithmetic operation: the type-level type is
     // `int`/`long` based on width, and the VALUE keeps the width of the
     // operation -- the parent operation sees that width and signedness.
@@ -1025,6 +1070,7 @@ partial class Irgen {
             L("  " + ism1 + " = icmp eq i64 " + b.op + ", -1");
             string ovf = NT();
             L("  " + ovf + " = and i1 " + ismin + ", " + ism1);
+            if (e.ival == 1 && op == TK.Slash()) { EmitIntegerOverflow(e, ovf); }
             string u2 = NT();
             L("  " + u2 + " = or i1 " + isz + ", " + ovf);
             unsf = u2;

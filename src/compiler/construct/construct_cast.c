@@ -191,6 +191,22 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         } else if (llvm_is_nullable(target) && src != target) {
             return coerce_int_to(g, val, target);
         }
+        /* Check the source width before the i64 carrier shortcuts below. */
+        if (g->irgen_checked_depth > 0 &&
+            LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
+            LLVMGetTypeKind(target) == LLVMIntegerTypeKind) {
+            unsigned tw = LLVMGetIntTypeWidth(target);
+            if (tw > 1 && tw < LLVMGetIntTypeWidth(src)) {
+                bool tgt_uns = tt && (tt->kind == TYPE_BYTE || tt->kind == TYPE_USHORT ||
+                                      tt->kind == TYPE_UINT || tt->kind == TYPE_CHAR);
+                LLVMValueRef narrow = LLVMBuildTrunc(g->builder, val, target, "ck.cast.tr");
+                LLVMValueRef back = tgt_uns
+                    ? LLVMBuildZExt(g->builder, narrow, src, "ck.cast.zx")
+                    : LLVMBuildSExt(g->builder, narrow, src, "ck.cast.sx");
+                LLVMValueRef ovf = zan_icmp(g->builder, LLVMIntNE, back, val, "ck.cast.ovf");
+                emit_runtime_check(g, ovf, expr->loc, "integer overflow in checked operation");
+            }
+        }
         /* 无符号整型目标转换保持 64 位寄存器表示 */
         if (tt && LLVMGetTypeKind(src) == LLVMIntegerTypeKind &&
             LLVMGetIntTypeWidth(src) < 64 &&
@@ -333,23 +349,7 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         if (sk == LLVMIntegerTypeKind && tk == LLVMIntegerTypeKind) {
             unsigned sw = LLVMGetIntTypeWidth(src);
             unsigned tw = LLVMGetIntTypeWidth(target);
-            if (tw < sw) {
-                LLVMValueRef narrow = LLVMBuildTrunc(g->builder, val, target, "cast");
-                if (g->irgen_checked_depth > 0 && tw > 1) {
-                    /* checked 下窄化强转越界抛溢出（B-ID76）：按目标符号性回拓宽，
-                     * 与原值不等即丢位。 */
-                    bool tgt_uns = tt && (tt->kind == TYPE_BYTE || tt->kind == TYPE_USHORT ||
-                                          tt->kind == TYPE_UINT || tt->kind == TYPE_ULONG ||
-                                          tt->kind == TYPE_CHAR);
-                    LLVMValueRef back = tgt_uns
-                        ? LLVMBuildZExt(g->builder, narrow, src, "ck.cast.zx")
-                        : LLVMBuildSExt(g->builder, narrow, src, "ck.cast.sx");
-                    LLVMValueRef ovf = zan_icmp(g->builder, LLVMIntNE, back, val, "ck.cast.ovf");
-                    emit_runtime_check(g, ovf, expr->loc,
-                        "integer overflow in checked operation");
-                }
-                return narrow;
-            }
+            if (tw < sw) return LLVMBuildTrunc(g->builder, val, target, "cast");
             if (tw > sw) return zan_iwiden(g->builder, val, target);
             return val;
         }
