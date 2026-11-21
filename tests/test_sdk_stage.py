@@ -568,8 +568,10 @@ class SdkStageTests(unittest.TestCase):
         self.assertTrue(stdlib.is_dir(), stdlib)
 
         system = Path(os.environ["SystemRoot"])
+        temp = self.base / "temp"
+        temp.mkdir()
         env = {"SystemRoot": str(system), "PATH": os.pathsep.join((str(system / "System32"), str(system))),
-               "TEMP": str(self.base), "TMP": str(self.base)}
+               "TEMP": str(temp), "TMP": str(temp)}
         options = {"cwd": self.base, "env": env, "stdin": subprocess.DEVNULL,
                    "capture_output": True, "timeout": 45}
         flag = "--diagnostics-format=jsonl"
@@ -587,7 +589,7 @@ class SdkStageTests(unittest.TestCase):
         result = subprocess.run([str(compiler), str(source), "--stdlib-path", str(stdlib),
                                  flag, "-o", str(artifact)], **options)
         self.assertNotEqual(result.returncode, 0, result)
-        self.assertEqual(set(self.base.iterdir()), {source}, result)
+        self.assertEqual(set(self.base.iterdir()), {source, temp}, result)
 
         wire_format = "zan-diagnostic-v1"
         self.assertNotIn(wire_format.encode("ascii"), result.stdout, result)
