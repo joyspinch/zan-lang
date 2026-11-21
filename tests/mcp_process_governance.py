@@ -1,4 +1,4 @@
-"""Exercise MCP process limits and cancellation over stdio and HTTP."""
+"""Exercise MCP process governance and the compiler diagnostics matrix."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -14,6 +14,9 @@ import sys
 import tempfile
 from threading import Thread
 import time
+
+
+JSONL_OPTION = "--diagnostics-format=jsonl"
 
 
 def check(condition, detail):
@@ -67,7 +70,7 @@ def assert_lock_released(path):
         time.sleep(0.01)
 
 
-def exercise(exe, root, workspace, zanc, cgroup=None):
+def exercise(exe, root, workspace, zanc, cgroup=None, *, diagnostics_format=None):
     server_args = [str(exe), "--stdio", str(workspace), "--sdk-root", str(root),
                    "--sandbox", "required" if cgroup else "process"]
     options = set()
@@ -78,6 +81,12 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
             options = {fields[0] for stream in (help_result.stdout, help_result.stderr)
                        for line in stream.splitlines() if (fields := line.split())}
     workspace.mkdir(exist_ok=True)
+    if diagnostics_format:
+        check((JSONL_OPTION.encode() in options) == (diagnostics_format == "jsonl"),
+              f"{zanc} does not match the expected {diagnostics_format} diagnostics mode")
+        stdlib = workspace / "stdlib"
+        stdlib.mkdir()
+        server_args.extend(("--stdlib", str(stdlib)))
     temp = workspace / "process temp"
     temp.mkdir()
     env = {**os.environ, "TMPDIR": str(temp), "TEMP": str(temp), "TMP": str(temp)}
@@ -117,7 +126,13 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
             tool(request_id, "run_command", command=text, **arguments)
 
         def result(request_id):
-            return json.loads(response(request_id)["content"][0]["text"])
+            reply = response(request_id)
+            check(not reply.get("isError", False), reply)
+            return json.loads(reply["content"][0]["text"])
+
+        def stop():
+            server.stdin.close()
+            check(server.wait(timeout=10) == 0, "server did not shut down cleanly")
 
         # The shell itself blocks on its stdin pipe, so cancellation must reach
         # a running direct child. The marker proves the job has already started.
@@ -126,6 +141,10 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
         try:
             send({"id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
             check(response(1)["protocolVersion"] == "2025-06-18", "initialize")
+            if diagnostics_format:
+                exercise_diagnostics(tool, result, workspace, zanc, stdlib, diagnostics_format)
+                stop()
+                return
 
             command(2, 'echo "ready"' if os.name == "nt" else "echo ready")
             reply = result(2)
@@ -215,7 +234,7 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
                 check(diagnostic and diagnostic["line"] == 1
                       and diagnostic["file"].endswith("diagnostic.zan"), reply)
                 check('message with "quotes"' in diagnostic["message"], diagnostic)
-                if b"--diagnostics-format=jsonl" in options:
+                if JSONL_OPTION.encode() in options:
                     check(diagnostic["format"] == "zan-diagnostic-v1"
                           and diagnostic["code"] == "E0002", diagnostic)
 
@@ -269,13 +288,53 @@ def exercise(exe, root, workspace, zanc, cgroup=None):
                     check(unavailable["isError"] and "--semantic-refs" in unavailable["content"][0]["text"],
                           unavailable)
 
-            server.stdin.close()
-            check(server.wait(timeout=10) == 0, "server did not shut down cleanly")
+            stop()
         finally:
             if server.poll() is None:
                 server.kill()
             server.wait()
             reader.join(timeout=2)
+
+
+def exercise_diagnostics(tool, result, workspace, zanc, stdlib, diagnostics_format):
+    # The shared failure needs no stdlib sources and should precede linking.
+    source = workspace / "Compiler diagnostic.zan"
+    source.write_bytes(b"class Program {\n    static void Main() {\n"
+                       b"        char value = '\\q';\n    }\n}\n")
+    expected_message = "invalid escape sequence '\\q'"
+    jsonl = diagnostics_format == "jsonl"
+
+    tool("diagnostics", "zan_build_project", entry=source.name)
+    reply = result("diagnostics")
+    check(reply["ok"] is False and reply["status"] == "completed"
+          and reply["exitCode"] == 1 and reply["outputTruncated"] is False, reply)
+    check(len(reply["diagnostics"]) == 1, reply)
+    diag = reply["diagnostics"][0]
+    check(diag["severity"] == "error", diag)
+    # gen1 normalizes slash direction and path casing on Windows.
+    check(Path(diag["file"]) == source and diag["line"] == 3, diag)
+    check(diag["location"] == f"{diag['file']}:3:{diag['col']}", diag)
+    if jsonl:
+        check(diag["format"] == "zan-diagnostic-v1" and diag["code"] == "E0017"
+              and diag["message"] == expected_message, diag)
+    else:
+        check("format" not in diag and "code" not in diag
+              and diag["message"] == f"[E0017] {expected_message}", diag)
+    check(f"{diag['location']}: error: [E0017] {expected_message}" in reply["raw"], reply)
+    check(not any((workspace / "_scratch" / "mcp_build").iterdir()),
+          "MCP left compiler request files behind")
+
+    # MCP removes the request directory even if the compiler wrote an output.
+    # Re-run the same failed compilation with a persistent output path to check for that.
+    output = workspace / ("out.exe" if os.name == "nt" else "out")
+    args = [zanc, source, "--stdlib-path", stdlib]
+    if jsonl:
+        args.append(JSONL_OPTION)
+    completed = subprocess.run([*args, "-o", output], cwd=workspace,
+                               capture_output=True, timeout=30)
+    check(completed.returncode == 1, completed)
+    check(not output.exists(), f"failed compilation created {output}")
+    print(f"MCP {diagnostics_format} diagnostics passed for {zanc}")
 
 
 def exercise_http(exe, root, workspace, workers=1, zanc=None):
@@ -554,24 +613,34 @@ Path("sandbox-marker").write_text("started", encoding="ascii")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", type=Path, required=True)
+    parser.add_argument("--exe", type=Path, required=True, help="path to the MCP server executable")
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
-    parser.add_argument("--zanc", type=Path)
+    parser.add_argument("--zanc", type=Path, help="compiler passed to the MCP server")
+    parser.add_argument("--host-zanc", type=Path, help="C compiler used to build the MCP server")
+    parser.add_argument("--diagnostics", choices=("jsonl", "text"),
+                        help="run one diagnostics matrix row, using a prebuilt --exe unless --host-zanc is given")
     args = parser.parse_args()
-    if args.zanc:
+    if args.diagnostics and not args.zanc:
+        parser.error("--diagnostics requires --zanc")
+    host_zanc = args.host_zanc
+    if not args.diagnostics and host_zanc is None:
+        host_zanc = args.zanc  # Preserve the CTest invocation.
+    if host_zanc:
         args.exe.parent.mkdir(parents=True, exist_ok=True)
         source_dirs = ("tools/mcp_server", "tools/shared/gallery", "tools/shared/semantic_index")
         sources = [str(source.resolve()) for directory in source_dirs
                    for source in sorted((args.root / directory).glob("*.zan"))]
-        subprocess.run([str(args.zanc.resolve()), *sources, "--stdlib-path",
+        subprocess.run([str(host_zanc.resolve()), *sources, "--stdlib-path",
                         str((args.root / "stdlib").resolve()), "-o", str(args.exe.resolve())],
                        cwd=args.root, check=True, timeout=120)
     args.work.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mcp-process-", dir=args.work) as directory:
         workspace = Path(directory).resolve()
         exercise(args.exe.resolve(), args.root.resolve(), workspace,
-                 args.zanc.resolve() if args.zanc else None)
+                 args.zanc.resolve() if args.zanc else None, diagnostics_format=args.diagnostics)
+        if args.diagnostics:
+            return
         exercise_http(args.exe.resolve(), args.root.resolve(), workspace)
         exercise_http(args.exe.resolve(), args.root.resolve(), workspace / "workers", workers=2,
                       zanc=args.zanc.resolve() if args.zanc else None)
