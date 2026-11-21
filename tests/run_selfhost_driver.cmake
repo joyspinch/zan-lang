@@ -399,6 +399,63 @@ void ArcReleaseTwice(void) {
     endforeach()
     file(REMOVE_RECURSE "${_arc}")
 
+    set(_lib "${OUTDIR}/native-library")
+    file(MAKE_DIRECTORY "${_lib}")
+    set(_lib_src "${_lib}/library.zan")
+    file(WRITE "${_lib_src}" [=[
+class EmitLib {
+    static int Offset = Init();
+    private static int Init() { return 1; }
+    public static int Add(int a, int b) { return a + b + Offset; }
+}
+]=])
+    set(_consumer "${_root}/tests/emit_lib/consumer.zan")
+    foreach(ext IN ITEMS dll lib a)
+      set(_artifact "${_lib}/emitlib_test.${ext}")
+      execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_lib_src}" --publish -o "${_artifact}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 120)
+      if(NOT "${rc}" STREQUAL "0")
+        message(FATAL_ERROR "Native ${ext} compilation failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      if(ext STREQUAL "dll")
+        file(READ "${_artifact}" _magic LIMIT 2 HEX)
+        if(NOT _magic STREQUAL "4d5a" OR NOT EXISTS "${_lib}/libemitlib_test.dll.a")
+          message(FATAL_ERROR "Missing Windows DLL or import library")
+        endif()
+        set(_consume_args "-L${_lib}")
+      else()
+        file(READ "${_artifact}" _magic LIMIT 8 HEX)
+        if(NOT _magic STREQUAL "213c617263683e0a")
+          message(FATAL_ERROR "Invalid ${ext} archive format: ${_magic}")
+        endif()
+        set(_consume_args --link-input "${_artifact}")
+      endif()
+      execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_consumer}" ${_consume_args} -o "${_lib}/consumer.exe"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 120)
+      if(NOT "${rc}" STREQUAL "0")
+        message(FATAL_ERROR "Native ${ext} consumer compilation failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      execute_process(COMMAND "${_lib}/consumer.exe" WORKING_DIRECTORY "${_lib}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr OUTPUT_STRIP_TRAILING_WHITESPACE TIMEOUT 15)
+      if(NOT "${rc}" STREQUAL "0" OR NOT stdout STREQUAL "8")
+        message(FATAL_ERROR "Native ${ext} consumer or static initialization failed, rc=${rc}\n${stdout}\n${stderr}")
+      endif()
+      if(ext STREQUAL "dll")
+        file(REMOVE "${_artifact}")
+      endif()
+    endforeach()
+    file(MAKE_DIRECTORY "${_lib}/blocked.dll")
+    file(WRITE "${_lib}/libblocked.dll.a" "previous import library")
+    execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_lib_src}" -o "${_lib}/blocked.dll"
+      RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 120)
+    file(READ "${_lib}/libblocked.dll.a" _previous_import)
+    file(GLOB _library_temps "${_lib}/.zanc-*" "${_lib}/*.lock")
+    if("${rc}" STREQUAL "0" OR NOT "${stdout}${stderr}" MATCHES "cannot publish DLL"
+        OR NOT _previous_import STREQUAL "previous import library" OR _library_temps)
+      message(FATAL_ERROR "Failed DLL publication did not restore its import library, rc=${rc}\n${stdout}${stderr}")
+    endif()
+    file(REMOVE_RECURSE "${_lib}")
+
     set(_project "${OUTDIR}/publish-resources")
     set(_source "${_project}/main.zan")
     set(_release "${_project}/app.exe")

@@ -395,12 +395,17 @@ public partial class Program {
     }
 
     static void CompileBundledObject(string dir, string llPath, string bitcodePath,
-                                     string objPath, string optLevel) {
+                                     string objPath, string optLevel, string archiveExports) {
         string target = "-mtriple=x86_64-w64-windows-gnu";
-        List<string> optimize = new List<string>() {
-            target, "-relocation-model=pic", optLevel == "-O0" ? "-passes=verify" : optLevel,
-            llPath, "-o", bitcodePath
-        };
+        List<string> optimize = new List<string>() { target, "-relocation-model=pic" };
+        if (archiveExports == "") {
+            optimize.Add(optLevel == "-O0" ? "-passes=verify" : optLevel);
+        } else {
+            optimize.Add("--internalize-public-api-file=" + archiveExports);
+            optimize.Add(optLevel == "-O0" ? "-passes=internalize,globaldce,verify"
+                : "-passes=internalize,default<" + optLevel.Substring(1) + ">");
+        }
+        optimize.Add(llPath); optimize.Add("-o"); optimize.Add(bitcodePath);
         int rc = Process.RunWithStandardStreams(dir + "/opt.exe", optimize);
         if (rc != 0) { throw "zanc: LLVM optimization failed with exit code " + rc; }
 
@@ -412,19 +417,29 @@ public partial class Program {
         if (rc != 0) { throw "zanc: LLVM object emission failed with exit code " + rc; }
     }
 
-    static void LinkBundledExe(string dir, string outPath, string objPath, string subsystem,
-                               List<string> linkInputs, bool stripSymbols) {
+    static void LinkBundledImage(string dir, string outPath, string objPath, string subsystem,
+                                 List<string> linkInputs, bool stripSymbols,
+                                 string importPath, string exportsPath) {
         string lib = dir + "/mingw/lib";
+        bool dll = importPath != "";
         List<string> args = new List<string>();
         args.Add("-m"); args.Add("i386pep");
         args.Add("-Bdynamic");
-        args.Add("--stack"); args.Add("268435456");
+        if (dll) {
+            args.Add("-shared");
+            args.Add("-e"); args.Add("DllMainCRTStartup");
+            args.Add("--out-implib"); args.Add(importPath);
+            args.Add("--exclude-all-symbols");
+            args.Add(exportsPath);
+        } else {
+            args.Add("--stack"); args.Add("268435456");
+            if (subsystem != "") { args.Add("--subsystem"); args.Add(subsystem); }
+        }
         args.Add("--gc-sections");
         if (stripSymbols) { args.Add("-s"); }
-        if (subsystem != "") { args.Add("--subsystem"); args.Add(subsystem); }
         args.Add("-o"); args.Add(outPath);
         args.Add("-L" + lib);
-        args.Add(lib + "/crt2.o");
+        args.Add(lib + (dll ? "/dllcrt2.o" : "/crt2.o"));
         args.Add(lib + "/crtbegin.o");
         args.Add(objPath);
         args.Add(dir + "/zanrt_file.obj");
@@ -447,6 +462,38 @@ public partial class Program {
         args.Add(lib + "/crtend.o");
         int rc = Process.RunWithStandardStreams(dir + "/ld.lld.exe", args);
         if (rc != 0) { throw "zanc: linking failed with exit code " + rc; }
+    }
+
+    static void PublishDll(string source, string destination, string importSource, string importDestination,
+                           string workDir) {
+        #if WINDOWS
+        nint outputLock = Nio.LockOutput(importDestination + ".lock");
+        if (outputLock == -1) { throw "zanc: cannot lock DLL output '" + destination + "'"; }
+        string backup = workDir + "/previous-import.a";
+        bool keepBackup = false;
+        try {
+            bool hadImport = File.Exists(importDestination);
+            if (hadImport) { File.Copy(importDestination, backup); }
+            if (Nio.ReplaceFile(importSource, importDestination) != 0) {
+                throw "zanc: cannot publish import library '" + importDestination + "'";
+            }
+            if (Nio.ReplaceFile(source, destination) != 0) {
+                if (hadImport) {
+                    if (Nio.ReplaceFile(backup, importDestination) != 0) {
+                        keepBackup = true;
+                        throw "zanc: cannot restore the previous import library '" + importDestination
+                            + "'; backup at '" + backup + "'";
+                    }
+                } else {
+                    File.Delete(importDestination);
+                }
+                throw "zanc: cannot publish DLL '" + destination + "'";
+            }
+        } finally {
+            if (!keepBackup) { File.Delete(backup); }
+            Nio.CloseFileHandle(outputLock);
+        }
+        #endif
     }
 
     static void LinkExe(string clang, string outPath, string llPath, string optLevel, string subsystem,
@@ -597,6 +644,7 @@ public partial class Program {
         List<string> embedSpecs = new List<string>();
         List<string> rawInputs = new List<string>();
         List<string> linkInputs = new List<string>();
+        List<string> libraryOptions = new List<string>();
         int firstInputIndex = -1;
         int i = 0;
         while (i < argc) {
@@ -617,7 +665,8 @@ public partial class Program {
             }
             if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
                 || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir"
-                || a == "--icon" || a == "--embed" || a == "--link-mode") {
+                || a == "--icon" || a == "--embed" || a == "--link-mode" || a == "--link-lib"
+                || a == "-L" || a == "--libpath") {
                 if (i + 1 >= argc || args[i + 1] == ""
                     || args[i + 1].StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -653,6 +702,20 @@ public partial class Program {
                 }
                 linkInputs.Add(input);
                 i = i + 2;
+                continue;
+            }
+            if (a == "--link-lib") {
+                string library = args[i + 1];
+                if (!NativeManifestEntry.SafeName(library)) { throw "zanc: invalid link library name '" + library + "'"; }
+                libraryOptions.Add("-l" + library);
+                i = i + 2;
+                continue;
+            }
+            if (a == "--libpath" || a.StartsWith("-L")) {
+                bool separate = a == "--libpath" || a == "-L";
+                string libraryDir = Path.GetFullPath(separate ? args[i + 1] : a.Substring(2));
+                libraryOptions.Add("-L" + libraryDir);
+                i = i + (separate ? 2 : 1);
                 continue;
             }
             if (a == "--stdlib-path") {
@@ -781,14 +844,26 @@ public partial class Program {
             throw "zanc: native output inference is only supported on Windows; specify an IR output with -o";
             #endif
         }
-        bool isExe = outPath.EndsWith(".exe") && !emitLib;
-        if (linkInputs.Count > 0 && !isExe && !exportMetadata) { throw "zanc: --link-input requires executable output"; }
+        string outputExtension = Path.GetExtension(outPath).ToLower();
+        bool isExe = outputExtension == ".exe" && !emitLib;
+        bool isDll = outputExtension == ".dll" && !exportMetadata;
+        bool isArchive = (outputExtension == ".lib" || outputExtension == ".a") && !exportMetadata;
+        bool linkImage = isExe || isDll;
+        bool nativeLibrary = isDll || isArchive;
+        if ((linkInputs.Count > 0 || libraryOptions.Count > 0) && !linkImage && !exportMetadata) {
+            throw "zanc: --link-input requires executable output or a Windows DLL";
+        }
         if (subsystem != "" || driverDir != "") {
             #if WINDOWS
-            if (!isExe && !exportMetadata) { throw "zanc: --subsystem and --driver-dir require executable output"; }
+            if (!exportMetadata && (subsystem != "" && !isExe || driverDir != "" && !linkImage)) {
+                throw "zanc: --subsystem and --driver-dir require executable output (a DLL also supports --driver-dir)";
+            }
             #else
             throw "zanc: --subsystem and --driver-dir require a Windows host";
             #endif
+        }
+        if (nativeLibrary && BundledToolchain() == "") {
+            throw "zanc: native library output requires the bundled Windows x64 toolchain";
         }
 
         if (!noIcon && iconPath != "" && !exportMetadata) {
@@ -805,6 +880,7 @@ public partial class Program {
         // directories; globbed stdlib files join the parse only when a
         // live name or an extension-method host requires them, to a
         // fixpoint, before anything parses.
+        int explicitSourceCount = inclPaths.Count;
         stdlibRoot = FindStdlibRoot(explicitStdlib);
         PiInitPkg(inclPaths[0]);
             piDb = File.Exists("/tmp/zan_pullin_debug");
@@ -887,9 +963,13 @@ public partial class Program {
             }
 
             Irgen ig = new Irgen(b, d);
-            ig.libOut = emitLib;
+            ig.libOut = emitLib || nativeLibrary;
+            if (nativeLibrary) {
+                ig.nativeLibraryDependencyLine = explicitSourceCount < fileStarts.Count
+                    ? fileStarts[explicitSourceCount] : nextLine;
+            }
             #if WINDOWS
-            ig.collectNativeImports = isExe;
+            ig.collectNativeImports = linkImage;
             ig.runtimeChecks = runtimeChecks;
             ig.strictRuntime = strictRuntime;
             #endif
@@ -908,11 +988,11 @@ public partial class Program {
                 if (!d.HasErrors()) { throw "zanc: compilation failed: warnings denied by --deny-warnings"; }
                 throw "zanc: compilation failed";
             }
-            if (isExe && !emitLib) {
+            if (linkImage || isArchive) {
                 string finalPath = Path.GetFullPath(outPath);
                 string outputDir = Path.GetDirectoryName(finalPath);
                 string clang = Environment.GetEnvironmentVariable("ZAN_CLANG");
-                string toolchain = clang != null && File.Exists(clang) ? "" : BundledToolchain();
+                string toolchain = !nativeLibrary && clang != null && File.Exists(clang) ? "" : BundledToolchain();
                 string nm = toolchain + "/llvm-nm.exe";
                 if (toolchain == "") {
                     clang = FindClang();
@@ -923,7 +1003,8 @@ public partial class Program {
                 List<string> bundleFiles = new List<string>();
                 List<string> libraries = new List<string>();
                 if (ig.collectNativeImports) { ResolveNativeImports(ig, nm, driverDir, linkInputs, bundleFiles, libraries, staticDrivers); }
-                for (int i = 0; i < libraries.Count; i = i + 1) { linkInputs.Add(libraries[i]); }
+                for (int i = 0; i < libraryOptions.Count; i++) { linkInputs.Add(libraryOptions[i]); }
+                for (int i = 0; i < libraries.Count; i++) { linkInputs.Add(libraries[i]); }
                 string suffix = Guid.New();
                 string workDir = outputDir + "/.zanc-" + suffix;
                 if (suffix.Length == 0 || !Nio.CreateDirectoryExclusive(workDir)) {
@@ -932,7 +1013,11 @@ public partial class Program {
                 string llPath = workDir + "/module.ll";
                 string bitcodePath = workDir + "/module.bc";
                 string objPath = workDir + "/module.obj";
-                string exePath = workDir + "/program.exe";
+                string imageName = Path.GetFileName(finalPath);
+                string imagePath = isDll ? workDir + "/image/" + imageName : workDir + "/output" + outputExtension;
+                string importName = "lib" + Path.GetFileNameWithoutExtension(imageName) + ".dll.a";
+                string importPath = isDll ? workDir + "/" + importName : "";
+                string exportsPath = workDir + (isDll ? "/exports.def" : "/exports.txt");
                 string resPath = workDir + "/icon.res";
                 try {
                     if (!noIcon && iconPath != "") {
@@ -941,21 +1026,46 @@ public partial class Program {
                     }
                     File.WriteAllText(llPath, ir);
                     if (toolchain == "") {
-                        LinkExe(clang, exePath, llPath, optLevel, subsystem, linkInputs, stripSymbols, debug && !stripSymbols);
+                        LinkExe(clang, imagePath, llPath, optLevel, subsystem, linkInputs, stripSymbols, debug && !stripSymbols);
                     } else {
-                        CompileBundledObject(toolchain, llPath, bitcodePath, objPath, optLevel);
-                        LinkBundledExe(toolchain, exePath, objPath, subsystem, linkInputs, stripSymbols);
+                        if (nativeLibrary) {
+                            StringBuilder exports = new StringBuilder();
+                            if (isDll) { exports.Append("EXPORTS\n"); }
+                            for (int ei = 0; ei < ig.sinitExportRoots.Count; ei++) {
+                                exports.Append(ig.sinitExportRoots[ei]); exports.Append("\n");
+                            }
+                            File.WriteAllText(exportsPath, exports.ToString());
+                        }
+                        CompileBundledObject(toolchain, llPath, bitcodePath, objPath, optLevel,
+                            isArchive ? exportsPath : "");
+                        if (isArchive) {
+                            string ar = toolchain + "/llvm-ar.exe";
+                            if (!File.Exists(ar)) { throw "zanc: missing bundled archive tool '" + ar + "'"; }
+                            List<string> archiveArgs = new List<string>() { "--format=gnu", "rcsD", imagePath, objPath };
+                            int rc = Process.RunWithStandardStreams(ar, archiveArgs);
+                            if (rc != 0) { throw "zanc: static library creation failed with exit code " + rc; }
+                        } else {
+                            if (isDll && !Nio.CreateDirectoryExclusive(workDir + "/image")) {
+                                throw "zanc: cannot create DLL staging directory";
+                            }
+                            LinkBundledImage(toolchain, imagePath, objPath, subsystem, linkInputs, stripSymbols,
+                                importPath, exportsPath);
+                        }
                     }
-                    StageNativeFiles(bundleFiles, workDir, outputDir, Path.GetFileName(finalPath));
-                    if (Nio.ReplaceFile(exePath, finalPath) != 0) {
-                        throw "zanc: cannot publish executable " + outPath;
+                    StageNativeFiles(bundleFiles, workDir, outputDir, imageName);
+                    if (isDll) {
+                        PublishDll(imagePath, finalPath, importPath, outputDir + "/" + importName, workDir);
+                    } else if (Nio.ReplaceFile(imagePath, finalPath) != 0) {
+                        throw "zanc: cannot publish output " + outPath;
                     }
                 } finally {
                     File.Delete(llPath);
                     File.Delete(bitcodePath);
                     File.Delete(objPath);
-                    File.Delete(exePath);
+                    File.Delete(imagePath);
                     File.Delete(resPath);
+                    File.Delete(exportsPath);
+                    if (isDll) { File.Delete(importPath); Directory.Delete(workDir + "/image"); }
                     for (int fi = 0; fi < bundleFiles.Count; fi = fi + 1) {
                         File.Delete(workDir + "/native-" + fi);
                     }
