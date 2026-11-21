@@ -7,6 +7,7 @@ param(
     [switch]$PreflightOnly,
     [string]$InputList = '',
     [switch]$IncludeSelfhost,
+    [switch]$SelfhostDefault,
     [switch]$BuildLocalDrivers
 )
 $ErrorActionPreference = 'Stop'
@@ -36,11 +37,19 @@ function Add-StageInput([string]$Source, [string]$Name, [switch]$Directory, [swi
     }
     $actions.Add([pscustomobject]@{ source = $full; name = $Name; directory = [bool]$Directory })
 }
-foreach ($exe in @('zanc.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
+if ($SelfhostDefault -and -not $IncludeSelfhost) { throw 'STAGE_FAILED: SelfhostDefault requires IncludeSelfhost' }
+if ($SelfhostDefault) {
+    Add-StageInput (Join-Path $Build 'zanc-selfhost.exe') 'zanc.exe' -Required
+    Add-StageInput (Join-Path $Build 'zanc.exe') 'zanc-seed.exe' -Required
+} else {
+    Add-StageInput (Join-Path $Build 'zanc.exe') 'zanc.exe' -Required
+    if ($IncludeSelfhost) { Add-StageInput (Join-Path $Build 'zanc-selfhost.exe') 'zanc-selfhost.exe' -Required }
+}
+foreach ($exe in @('zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zanfmt.exe', 'zandoc.exe', 'ld.exe', 'ld.lld.exe')) {
     Add-StageInput (Join-Path $Build $exe) $exe -Required
 }
 if ($IncludeSelfhost) {
-    foreach ($exe in @('zanc-selfhost.exe', 'llvm-nm.exe', 'opt.exe', 'llc.exe')) {
+    foreach ($exe in @('llvm-nm.exe', 'opt.exe', 'llc.exe')) {
         Add-StageInput (Join-Path $Build $exe) $exe -Required
     }
     Assert-SdkFile (Join-Path $Build 'zanrt_crash.obj')

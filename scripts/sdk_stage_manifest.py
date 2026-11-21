@@ -372,8 +372,14 @@ def consume_selfhost(sdk, output, version):
     env = {"SystemRoot": str(system), "PATH": os.pathsep.join((str(system / "System32"), str(system))),
            "TEMP": str(work), "TMP": str(work)}
     toolchain = sdk / "toolchain"
-    compiler = toolchain / "zanc-selfhost.exe"
-    seed = toolchain / "zanc.exe"
+    default = toolchain / "zanc.exe"
+    seed = toolchain / "zanc-seed.exe"
+    if seed.is_file():
+        compiler = default
+    else:
+        compiler = toolchain / "zanc-selfhost.exe"
+        seed = default
+    compiler_identity = identity.required_identity(compiler)
     disabled_seed = toolchain / "zanc.disabled"
     bootstrap = sdk / "bootstrap"
     entries = (bootstrap / "selfhost_sources.txt").read_text(encoding="utf-8").splitlines()
@@ -415,7 +421,8 @@ def consume_selfhost(sdk, output, version):
         disabled_seed.rename(seed)
         for binary in generations:
             binary.unlink(missing_ok=True)
-    return {"artifact": executable, "compile_log": identity.required_identity(compile_log),
+    return {"compiler": compiler_identity, "artifact": executable,
+            "compile_log": identity.required_identity(compile_log),
             "runtime_log": identity.required_identity(runtime_log), "bootstrap": evidence}
 
 

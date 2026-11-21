@@ -102,6 +102,26 @@ class SdkStageTests(unittest.TestCase):
                 self.assertEqual(mappings[name].resolve(), (build / name).resolve())
                 self.assertEqual((dest / name).read_bytes(), (build / name).read_bytes())
 
+    @unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell staging contract")
+    def test_selfhost_default_maps_compiler_and_seed_in_plan_and_stage(self):
+        build = self.stage_fixture()
+        dest = self.base / "stage"
+        inputs = self.base / "inputs.json"
+        command = (POWERSHELL, "-NoProfile", "-File", ROOT / "scripts/stage_dev_toolchain.ps1",
+                   "-Build", build, "-Dest", dest, "-IncludeSelfhost", "-SelfhostDefault")
+        expected = {"zanc.exe": (build / "zanc-selfhost.exe").resolve(),
+                    "zanc-seed.exe": (build / "zanc.exe").resolve()}
+
+        self.call(*command, "-PreflightOnly", "-InputList", inputs)
+        self.assertFalse(dest.exists())
+        mappings = {row["destination"]: Path(row["source"]).resolve() for row in SDK.load(inputs)
+                    if row["destination"].startswith("zanc")}
+        self.assertEqual(mappings, expected)
+
+        self.call(*command)
+        self.assertEqual({path.name: path.read_bytes() for path in dest.glob("zanc*.exe")},
+                         {name: path.read_bytes() for name, path in expected.items()})
+
     @unittest.skipUnless(POWERSHELL and os.name == "nt", "Windows PowerShell path contract")
     def test_publish_rejects_shared_output_before_cleaning(self):
         for dest in (ROOT, ROOT / "dist", ROOT / "build", ROOT / "stdlib", ROOT / "_scratch"):
@@ -453,9 +473,18 @@ class SdkStageTests(unittest.TestCase):
             SDK.verify_sdk(sdk)
 
     def test_consumption_receipt_requires_restricted_selfhost_run(self):
+        self.check_selfhost_consumption("zanc-selfhost.exe", "zanc.exe")
+
+    def test_selfhost_default_consumption_uses_zanc_for_templates_and_bootstrap(self):
+        self.check_selfhost_consumption("zanc.exe", "zanc-seed.exe")
+
+    def check_selfhost_consumption(self, compiler_name, seed_name):
         sdk = self.base / "sdk"
-        compiler = self.write(sdk / "toolchain/zanc-selfhost.exe")
-        seed = self.write(sdk / "toolchain/zanc.exe", "C bootstrap seed")
+        toolchain = sdk / "toolchain"
+        default_compiler = toolchain / "zanc.exe"
+        compiler = self.write(toolchain / compiler_name, "selfhost compiler")
+        seed = self.write(toolchain / seed_name, "C bootstrap seed")
+        disabled_seed = toolchain / "zanc.disabled"
         self.write(sdk / "bootstrap/selfhost_sources.txt", "selfhost/main\n")
         bootstrap_source = self.write(sdk / "bootstrap/selfhost/main.zan")
         template = self.write(sdk / "templates" / SDK.CONSOLE_TEMPLATE / "src/main.zan")
@@ -472,6 +501,8 @@ class SdkStageTests(unittest.TestCase):
 
         def run(command, **options):
             if command[0] == sys.executable:
+                self.assertEqual(Path(command[command.index("--zanc") + 1]), default_compiler)
+                self.assertTrue(seed.is_file())
                 output = Path(command[command.index("--output") + 1])
                 SDK.identity.atomic_json(output / "results.json", {"complete": True, "selected": 1,
                                          "rows": [{"template": "console/test", "status": "pass"}]})
@@ -481,6 +512,7 @@ class SdkStageTests(unittest.TestCase):
             self.assertEqual(env["PATH"].split(os.pathsep), [str(system / "System32"), str(system)])
             self.assertNotIn("ZAN_CLANG", env)
             self.assertFalse(seed.exists())
+            self.assertEqual(disabled_seed.read_text(), "C bootstrap seed")
             artifact = work / "probe.exe"
             if command[1:] == ["--version"]:
                 self.assertIn(Path(command[0]), (gen2, gen3))
@@ -505,6 +537,7 @@ class SdkStageTests(unittest.TestCase):
             runtime_stdout = "  参数[0] = " + token + "\n"
             SDK.consume(args)
             evidence = SDK.load(receipt)["selfhost"]
+            self.assertEqual(evidence["compiler"], SDK.identity.required_identity(compiler))
             self.assertEqual(SDK.load(evidence["runtime_log"]["path"])["stdout"], runtime_stdout)
             self.assertEqual(Path(evidence["compile_log"]["path"]).parent, args.output / "selfhost")
             self.assertEqual(Path(evidence["artifact"]["path"]).parent, args.output / "selfhost")

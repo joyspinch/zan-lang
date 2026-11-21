@@ -33,7 +33,7 @@
 
 param([switch]$SkipBuild, [switch]$NoBump, [string]$OutDir,
       [switch]$PrepareOnly, [switch]$LocalStage, [switch]$PreflightOnly, [switch]$PlanOnly,
-      [switch]$SkipDesignGeneration, [switch]$BuildLocalDrivers)
+      [switch]$SkipDesignGeneration, [switch]$BuildLocalDrivers, [switch]$SelfhostDefault)
 
 if ($PrepareOnly -and ($SkipBuild -or -not $NoBump)) {
     throw 'PUBLISH_FAILED: PrepareOnly requires NoBump and cannot use SkipBuild'
@@ -100,7 +100,7 @@ $toolInputs = Join-Path $work 'sdk-toolchain-inputs.json'
 $planFile = Join-Path $work 'sdk-stage-plan.json'
 $ticket = Join-Path $work 'sdk-stage-preflight.json'
 & (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
-    -IncludeDebugger -IncludeSelfhost -BuildLocalDrivers:$BuildLocalDrivers -PreflightOnly -InputList $toolInputs
+    -IncludeDebugger -IncludeSelfhost -SelfhostDefault:$SelfhostDefault -BuildLocalDrivers:$BuildLocalDrivers -PreflightOnly -InputList $toolInputs
 $copies = [Collections.Generic.List[object]]::new()
 function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
     $kind = if ($Tree) { 'Container' } else { 'Leaf' }
@@ -163,10 +163,13 @@ New-Item -ItemType Directory -Path $dist -Force | Out-Null
 & python -I -B $manifestTool copy-sources --plan $planFile --sdk $dist
 if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: SDK source copy failed' }
 & (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
-    -IncludeDebugger -IncludeSelfhost -BuildLocalDrivers:$BuildLocalDrivers
+    -IncludeDebugger -IncludeSelfhost -SelfhostDefault:$SelfhostDefault -BuildLocalDrivers:$BuildLocalDrivers
 
 # ---- release readme ---------------------------------------------------------
 Write-Output "[5/6] Writing README.txt + AI entry index ..."
+$alternateCompiler = if ($SelfhostDefault) { 'zanc-seed.exe' } else { 'zanc-selfhost.exe' }
+$alternateRole = if ($SelfhostDefault) { 'the C11 bootstrap seed' } else { 'the self-hosted compiler' }
+$alternateRoleZh = if ($SelfhostDefault) { 'C11 引导编译器' } else { '自举编译器' }
 $readme = @"
 Zan IDE - self-contained release
 ================================
@@ -185,10 +188,11 @@ Contents
                  wins, which is how you override one without a rebuild.
   toolchain\     The Zan compiler and everything it links with, all as siblings:
                    zanc.exe                the compiler
-                   zanc-selfhost.exe       the self-hosted compiler
+                   $alternateCompiler       $alternateRole
                    opt.exe, llc.exe        LLVM optimizer and object emitter
-                   llvm-nm.exe             symbol reader used by zanc-selfhost
-                   ld.lld.exe              linker used by zanc-selfhost
+                   llvm-ar.exe             static library archiver
+                   llvm-nm.exe             native symbol reader
+                   ld.lld.exe              native linker
                    zan-mvc.exe             MVC route generator
                    zan-lsp.exe             language server (for external editors)
                    zan-dap.exe             debug adapter (for external editors)
@@ -306,10 +310,11 @@ Zan IDE 自包含发布包
                  这就是不重新打包就替换它们的办法。
   toolchain\     Zan 编译器及其链接所需的一切，全部作为同目录的兄弟文件平铺：
                    zanc.exe                编译器
-                   zanc-selfhost.exe       自举编译器
+                   $alternateCompiler       $alternateRoleZh
                    opt.exe, llc.exe        LLVM 优化器与目标文件生成器
-                   llvm-nm.exe             自举编译器使用的符号读取工具
-                   ld.lld.exe              自举编译器使用的链接器
+                   llvm-ar.exe             静态库归档工具
+                   llvm-nm.exe             原生符号读取工具
+                   ld.lld.exe              原生链接器
                    zan-mvc.exe             MVC 路由生成工具
                    zan-lsp.exe             语言服务器（供外部编辑器）
                    zan-dap.exe             调试适配器（供外部编辑器）
