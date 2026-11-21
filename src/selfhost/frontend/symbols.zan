@@ -1,0 +1,489 @@
+using System.Text;
+
+namespace Zan;
+
+public class SymbolIndex {
+    // The unit is the declaration tree returned by Parser.ParseMetadata.
+    public static string Export(Node unit) {
+        StringBuilder text = new StringBuilder();
+        text.Append("# zan-symbols 1\n");
+        AppendBuiltins(text);
+        if (unit != null && unit.kind == AK.CompUnit()) {
+            for (int i = 0; i < unit.kids.Count; i = i + 1) {
+                Node decl = unit.kids[i];
+                if (decl != null) { AppendType(text, decl); }
+            }
+        }
+        return text.ToString();
+    }
+
+    static void AppendType(StringBuilder text, Node decl) {
+        string kind;
+        if (decl.kind == AK.ClassDecl()) {
+            kind = (decl.mods & MOD.Iface()) != 0 ? "interface" : "class";
+        } else if (decl.kind == AK.StructDecl()) {
+            kind = "struct";
+        } else if (decl.kind == AK.EnumDecl()) {
+            kind = "enum";
+        } else {
+            return;
+        }
+
+        text.Append("T\t");
+        text.Append(kind);
+        text.Append("\t");
+        text.Append(decl.nsName == null ? "" : decl.nsName);
+        text.Append("\t");
+        text.Append(decl.sval);
+        text.Append("\t");
+        if (decl.kind != AK.EnumDecl()) {
+            AppendTypeName(text, decl.type);
+            if (decl.interfaceRefs != null) {
+                for (int i = 0; i < decl.interfaceRefs.Count; i = i + 1) {
+                    if (decl.type != null || i > 0) { text.Append(","); }
+                    AppendTypeName(text, decl.interfaceRefs[i]);
+                }
+            }
+        }
+        text.Append("\n");
+
+        for (int i = 0; i < decl.kids.Count; i = i + 1) {
+            Node member = decl.kids[i];
+            if (member != null) { AppendMember(text, decl.sval, member); }
+        }
+    }
+
+    static void AppendMember(StringBuilder text, string owner, Node member) {
+        int kind = member.kind;
+        string name = member.sval;
+        string memberKind;
+        bool isStatic = (member.mods & MOD.Static()) != 0;
+        if (kind == AK.MethodDecl()) {
+            memberKind = "M";
+        } else if (kind == AK.CtorDecl()) {
+            memberKind = "C";
+            name = owner;
+            isStatic = false;
+        } else if (kind == AK.FieldDecl() || kind == AK.PropertyDecl()) {
+            memberKind = kind == AK.PropertyDecl() ? "P" : "F";
+            if ((member.mods & MOD.Event()) != 0) { memberKind = "E"; }
+        } else if (kind == AK.EnumMember()) {
+            memberKind = "F";
+            isStatic = true;
+        } else {
+            return;
+        }
+
+        text.Append("M\t");
+        text.Append(owner);
+        text.Append("\t");
+        text.Append(name);
+        text.Append("\t");
+        text.Append(memberKind);
+        text.Append(isStatic ? "\t1\t" : "\t0\t");
+        if (kind == AK.MethodDecl() || kind == AK.CtorDecl()) {
+            AppendMethodSignature(text, member);
+            if (kind == AK.MethodDecl()) {
+                text.Append(IsExternDeclaration(member) ? "\tx" : "\t");
+            }
+        } else {
+            if (kind == AK.EnumMember()) { text.Append(owner); }
+            else { AppendTypeName(text, member.type); }
+            text.Append(" ");
+            text.Append(name);
+        }
+        text.Append("\n");
+    }
+
+    static bool IsExternDeclaration(Node method) {
+        if (method.d != null) { return false; }
+        if ((method.mods & MOD.Extern()) != 0) { return true; }
+        if (method.attributes == null) { return false; }
+        // C recognizes DllImport on any bodyless method with a positional library string.
+        for (int i = 0; i < method.attributes.Count; i = i + 1) {
+            Node attr = method.attributes[i];
+            int dot = attr.sval.LastIndexOf(".");
+            if (attr.sval.Substring(dot + 1) != "DllImport") { continue; }
+            for (int j = 0; j < attr.kids.Count; j = j + 1) {
+                Node arg = attr.kids[j];
+                if (arg.kind == AK.StringLit() && arg.b == null) { return true; }
+            }
+        }
+        return false;
+    }
+
+    static void AppendMethodSignature(StringBuilder text, Node method) {
+        if (method.type == null) { text.Append("void"); }
+        else { AppendTypeName(text, method.type); }
+        text.Append(" ");
+        text.Append(method.sval);
+        text.Append("(");
+        bool first = true;
+        for (int i = 0; i < method.kids.Count; i = i + 1) {
+            Node param = method.kids[i];
+            if (param.kind != AK.Param()) { continue; }
+            if (!first) { text.Append(", "); }
+            if (first && method.ival == 1) { text.Append("this "); }
+            if (param.ival == 1) { text.Append("ref "); }
+            else if (param.ival == 2) { text.Append("out "); }
+            AppendTypeName(text, param.type);
+            text.Append(" ");
+            text.Append(param.sval);
+            first = false;
+        }
+        text.Append(")");
+    }
+
+    static void AppendTypeName(StringBuilder text, Node type) {
+        // Version 1 renders type references and qualified names. The Zan
+        // parser stores the latter as dotted type names and marks tuples with op 2.
+        if (type == null || type.kind != AK.TypeRef() || type.op == 2) { return; }
+        text.Append(type.sval);
+        // C symbols.c renders only the outer array wrapper.
+        if (type.ival > 0) {
+            text.Append("[]");
+        } else if (type.kids.Count > 0) {
+            text.Append("<");
+            for (int i = 0; i < type.kids.Count; i = i + 1) {
+                if (i > 0) { text.Append(", "); }
+                AppendTypeName(text, type.kids[i]);
+            }
+            text.Append(">");
+        }
+        if (type.op == 1) { text.Append("?"); }
+    }
+
+    // Generated from the builtin_types and member tables in compiler/builtin_api.c.
+    static void AppendBuiltins(StringBuilder text) {
+        text.Append("T\tclass\t*builtin*\tint\t\n");
+        text.Append("M\tint\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tlong\t\n");
+        text.Append("M\tlong\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tshort\t\n");
+        text.Append("M\tshort\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tbyte\t\n");
+        text.Append("M\tbyte\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tsbyte\t\n");
+        text.Append("M\tsbyte\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tuint\t\n");
+        text.Append("M\tuint\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tulong\t\n");
+        text.Append("M\tulong\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tushort\t\n");
+        text.Append("M\tushort\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tfloat\t\n");
+        text.Append("M\tfloat\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tdouble\t\n");
+        text.Append("M\tdouble\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tbool\t\n");
+        text.Append("M\tbool\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tchar\t\n");
+        text.Append("M\tchar\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tnint\t\n");
+        text.Append("M\tnint\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tobject\t\n");
+        text.Append("M\tobject\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tstring\t\n");
+        text.Append("M\tstring\tLength\tP\t0\tint Length\n");
+        text.Append("M\tstring\tSubstring\tM\t0\tstring Substring(int start[, int length])\n");
+        text.Append("M\tstring\tIndexOf\tM\t0\tint IndexOf(string needle[, int startIndex])\n");
+        text.Append("M\tstring\tLastIndexOf\tM\t0\tint LastIndexOf(string needle)\n");
+        text.Append("M\tstring\tContains\tM\t0\tbool Contains(string needle)\n");
+        text.Append("M\tstring\tStartsWith\tM\t0\tbool StartsWith(string prefix)\n");
+        text.Append("M\tstring\tEndsWith\tM\t0\tbool EndsWith(string suffix)\n");
+        text.Append("M\tstring\tReplace\tM\t0\tstring Replace(string from, string to)\n");
+        text.Append("M\tstring\tTrim\tM\t0\tstring Trim()\n");
+        text.Append("M\tstring\tToUpper\tM\t0\tstring ToUpper()\n");
+        text.Append("M\tstring\tToLower\tM\t0\tstring ToLower()\n");
+        text.Append("M\tstring\tSplit\tM\t0\tList<string> Split(string separator[, StringSplitOptions options])\n");
+        text.Append("M\tstring\tEquals\tM\t0\tbool Equals(string other)\n");
+        text.Append("M\tstring\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tList\t\n");
+        text.Append("M\tList\tCount\tP\t0\tint Count\n");
+        text.Append("M\tList\tAdd\tM\t0\tvoid Add(T item)\n");
+        text.Append("M\tList\tReserve\tM\t0\tvoid Reserve(int n)\n");
+        text.Append("M\tList\tAddRange\tM\t0\tvoid AddRange(List<T> items)\n");
+        text.Append("M\tList\tInsert\tM\t0\tvoid Insert(int index, T item)\n");
+        text.Append("M\tList\tRemoveAt\tM\t0\tvoid RemoveAt(int index)\n");
+        text.Append("M\tList\tClear\tM\t0\tvoid Clear()\n");
+        text.Append("M\tList\tContains\tM\t0\tbool Contains(T item)\n");
+        text.Append("M\tList\tIndexOf\tM\t0\tint IndexOf(T item)\n");
+        text.Append("M\tList\tLastIndexOf\tM\t0\tint LastIndexOf(T item)\n");
+        text.Append("M\tList\tReverse\tM\t0\tvoid Reverse()\n");
+        text.Append("M\tList\tToArray\tM\t0\tT[] ToArray()\n");
+
+        text.Append("T\tclass\t*builtin*\tDictionary\t\n");
+        text.Append("M\tDictionary\tCount\tP\t0\tint Count\n");
+        text.Append("M\tDictionary\tKeys\tP\t0\tList<K> Keys\n");
+        text.Append("M\tDictionary\tValues\tP\t0\tList<V> Values\n");
+        text.Append("M\tDictionary\tAdd\tM\t0\tvoid Add(K key, V value)\n");
+        text.Append("M\tDictionary\tRemove\tM\t0\tbool Remove(K key)\n");
+        text.Append("M\tDictionary\tClear\tM\t0\tvoid Clear()\n");
+        text.Append("M\tDictionary\tContainsKey\tM\t0\tbool ContainsKey(K key)\n");
+        text.Append("M\tDictionary\tTryGetValue\tM\t0\tbool TryGetValue(K key, out V value)\n");
+
+        text.Append("T\tclass\t*builtin*\tStringBuilder\t\n");
+        text.Append("M\tStringBuilder\tAppend\tM\t0\tvoid Append(object value)\n");
+        text.Append("M\tStringBuilder\tAppendLine\tM\t0\tvoid AppendLine(object value)\n");
+        text.Append("M\tStringBuilder\tClear\tM\t0\tvoid Clear()\n");
+        text.Append("M\tStringBuilder\tLength\tP\t0\tint Length\n");
+        text.Append("M\tStringBuilder\tBufferPtr\tM\t0\tnint BufferPtr()\n");
+        text.Append("M\tStringBuilder\tToString\tM\t0\tstring ToString()\n");
+
+        text.Append("T\tclass\t*builtin*\tConsole\t\n");
+        text.Append("M\tConsole\tWriteLine\tM\t1\tvoid WriteLine(object value)\n");
+        text.Append("M\tConsole\tErrorWriteLine\tM\t1\tvoid ErrorWriteLine(string value)\n");
+        text.Append("M\tConsole\tWrite\tM\t1\tvoid Write(object value)\n");
+        text.Append("M\tConsole\tPrintLine\tM\t1\tvoid PrintLine(object value)\n");
+        text.Append("M\tConsole\tReadLine\tM\t1\tstring ReadLine()\n");
+        text.Append("M\tConsole\tRead\tM\t1\tint Read()\n");
+        text.Append("M\tConsole\tReadKey\tM\t1\tint ReadKey([bool intercept])\n");
+        text.Append("M\tConsole\tClear\tM\t1\tvoid Clear()\n");
+        text.Append("M\tConsole\tResetColor\tM\t1\tvoid ResetColor()\n");
+        text.Append("M\tConsole\tForegroundColor\tP\t1\tConsoleColor ForegroundColor\n");
+        text.Append("M\tConsole\tBackgroundColor\tP\t1\tConsoleColor BackgroundColor\n");
+        text.Append("M\tConsole\tTitle\tP\t1\tstring Title\n");
+        text.Append("M\tConsole\tIsOutputRedirected\tM\t1\tbool IsOutputRedirected()\n");
+        text.Append("M\tConsole\tIsTerminal\tM\t1\tbool IsTerminal()\n");
+
+        text.Append("T\tclass\t*builtin*\tMath\t\n");
+        text.Append("M\tMath\tAbs\tM\t1\tdouble Abs(double value)\n");
+        text.Append("M\tMath\tMax\tM\t1\tint Max(int a, int b)\n");
+        text.Append("M\tMath\tMax\tM\t1\tlong Max(long a, long b)\n");
+        text.Append("M\tMath\tMax\tM\t1\tuint Max(uint a, uint b)\n");
+        text.Append("M\tMath\tMax\tM\t1\tulong Max(ulong a, ulong b)\n");
+        text.Append("M\tMath\tMax\tM\t1\tnint Max(nint a, nint b)\n");
+        text.Append("M\tMath\tMax\tM\t1\tdouble Max(double a, double b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tint Min(int a, int b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tlong Min(long a, long b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tuint Min(uint a, uint b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tulong Min(ulong a, ulong b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tnint Min(nint a, nint b)\n");
+        text.Append("M\tMath\tMin\tM\t1\tdouble Min(double a, double b)\n");
+        text.Append("M\tMath\tPow\tM\t1\tdouble Pow(double x, double y)\n");
+        text.Append("M\tMath\tSqrt\tM\t1\tdouble Sqrt(double value)\n");
+        text.Append("M\tMath\tRound\tM\t1\tdouble Round(double value)\n");
+        text.Append("M\tMath\tFloor\tM\t1\tdouble Floor(double value)\n");
+        text.Append("M\tMath\tCeiling\tM\t1\tdouble Ceiling(double value)\n");
+        text.Append("M\tMath\tSin\tM\t1\tdouble Sin(double value)\n");
+        text.Append("M\tMath\tCos\tM\t1\tdouble Cos(double value)\n");
+        text.Append("M\tMath\tTan\tM\t1\tdouble Tan(double value)\n");
+        text.Append("M\tMath\tAtan2\tM\t1\tdouble Atan2(double y, double x)\n");
+        text.Append("M\tMath\tAtan\tM\t1\tdouble Atan(double value)\n");
+        text.Append("M\tMath\tAsin\tM\t1\tdouble Asin(double value)\n");
+        text.Append("M\tMath\tAcos\tM\t1\tdouble Acos(double value)\n");
+
+        text.Append("T\tclass\t*builtin*\tConvert\t\n");
+        text.Append("M\tConvert\tToDouble\tM\t1\tdouble ToDouble(string text)\n");
+        text.Append("M\tConvert\tToInt32\tM\t1\tint ToInt32(string text)\n");
+        text.Append("M\tConvert\tToInt64\tM\t1\tlong ToInt64(string text)\n");
+
+        text.Append("T\tclass\t*builtin*\tString\t\n");
+        text.Append("M\tString\tFormat\tM\t1\tstring Format(string format, params object[] args)\n");
+        text.Append("M\tString\tJoin\tM\t1\tstring Join(string separator, List<string> values)\n");
+        text.Append("M\tString\tIsNullOrEmpty\tM\t1\tbool IsNullOrEmpty(string value)\n");
+        text.Append("M\tString\tCompareOrdinal\tM\t1\tint CompareOrdinal(string a, string b)\n");
+
+        text.Append("T\tclass\t*builtin*\tChar\t\n");
+        text.Append("M\tChar\tIsDigit\tM\t1\tbool IsDigit(char c)\n");
+        text.Append("M\tChar\tIsLetter\tM\t1\tbool IsLetter(char c)\n");
+        text.Append("M\tChar\tIsLetterOrDigit\tM\t1\tbool IsLetterOrDigit(char c)\n");
+        text.Append("M\tChar\tIsUpper\tM\t1\tbool IsUpper(char c)\n");
+        text.Append("M\tChar\tIsLower\tM\t1\tbool IsLower(char c)\n");
+        text.Append("M\tChar\tIsWhiteSpace\tM\t1\tbool IsWhiteSpace(char c)\n");
+        text.Append("M\tChar\tToUpper\tM\t1\tchar ToUpper(char c)\n");
+        text.Append("M\tChar\tToLower\tM\t1\tchar ToLower(char c)\n");
+
+        text.Append("T\tclass\t*builtin*\tFile\t\n");
+        text.Append("M\tFile\tExists\tM\t1\tbool Exists(string path)\n");
+        text.Append("M\tFile\tReadAllText\tM\t1\tstring ReadAllText(string path)\n");
+        text.Append("M\tFile\tWriteAllText\tM\t1\tvoid WriteAllText(string path, string text)\n");
+        text.Append("M\tFile\tAppendAllText\tM\t1\tvoid AppendAllText(string path, string text)\n");
+        text.Append("M\tFile\tDelete\tM\t1\tvoid Delete(string path)\n");
+        text.Append("M\tFile\tCopy\tM\t1\tvoid Copy(string from, string to)\n");
+        text.Append("M\tFile\tMove\tM\t1\tvoid Move(string from, string to)\n");
+        text.Append("M\tFile\tGetSize\tM\t1\tlong GetSize(string path)\n");
+
+        text.Append("T\tclass\t*builtin*\tDirectory\t\n");
+        text.Append("M\tDirectory\tExists\tM\t1\tbool Exists(string path)\n");
+        text.Append("M\tDirectory\tCreateDirectory\tM\t1\tvoid CreateDirectory(string path)\n");
+        text.Append("M\tDirectory\tDelete\tM\t1\tvoid Delete(string path)\n");
+        text.Append("M\tDirectory\tListNames\tM\t1\tstring ListNames(string globPattern)\n");
+        text.Append("M\tDirectory\tGetCurrentDirectory\tM\t1\tstring GetCurrentDirectory()\n");
+        text.Append("M\tDirectory\tSetCurrentDirectory\tM\t1\tvoid SetCurrentDirectory(string path)\n");
+
+        text.Append("T\tclass\t*builtin*\tEnvironment\t\n");
+        text.Append("M\tEnvironment\tArgCount\tM\t1\tint ArgCount()\n");
+        text.Append("M\tEnvironment\tArgAt\tM\t1\tstring ArgAt(int index)\n");
+        text.Append("M\tEnvironment\tExeDir\tM\t1\tstring ExeDir()\n");
+
+        text.Append("T\tclass\t*builtin*\tNativeMemory\t\n");
+        text.Append("M\tNativeMemory\tAlloc\tM\t1\tnint Alloc(long size)\n");
+        text.Append("M\tNativeMemory\tFree\tM\t1\tvoid Free(nint ptr)\n");
+        text.Append("M\tNativeMemory\tCopy\tM\t1\tvoid Copy(nint dst, nint src, long size)\n");
+        text.Append("M\tNativeMemory\tCopy2D\tM\t1\tvoid Copy2D(nint dst, long dstStride, nint src, long srcStride, long rowBytes, long height)\n");
+        text.Append("M\tNativeMemory\tFill\tM\t1\tvoid Fill(nint ptr, int value, long size)\n");
+        text.Append("M\tNativeMemory\tCompare\tM\t1\tint Compare(nint a, nint b, long size)\n");
+        text.Append("M\tNativeMemory\tScanNotByte\tM\t1\tlong ScanNotByte(nint ptr, long offset, int byte, long limit)\n");
+        text.Append("M\tNativeMemory\tScanNotAnyOf\tM\t1\tlong ScanNotAnyOf(nint ptr, long offset, string acceptSet, long limit)\n");
+        text.Append("M\tNativeMemory\tFindNotAnyOf\tM\t1\tlong FindNotAnyOf(nint ptr, long offset, string rejectSet, long limit)\n");
+        text.Append("M\tNativeMemory\tLoad64\tM\t1\tlong Load64(nint ptr, long offset)\n");
+        text.Append("M\tNativeMemory\tAsI32\tM\t1\tint AsI32(float value)\n");
+        text.Append("M\tNativeMemory\tAsF32\tM\t1\tfloat AsF32(int bits)\n");
+        text.Append("M\tNativeMemory\tAsI64\tM\t1\tlong AsI64(double value)\n");
+        text.Append("M\tNativeMemory\tAsF64\tM\t1\tdouble AsF64(long bits)\n");
+        text.Append("M\tNativeMemory\tGetString\tM\t1\tstring GetString(nint ptr)\n");
+        text.Append("M\tNativeMemory\tPutString\tM\t1\tvoid PutString(nint ptr, string text)\n");
+
+        text.Append("T\tclass\t*builtin*\tTask\t\n");
+        text.Append("M\tTask\tSpawn\tM\t1\tlong Spawn(asyncCall)\n");
+        text.Append("M\tTask\tRun\tM\t1\tlong Run(asyncCall)\n");
+        text.Append("M\tTask\tDelay\tM\t1\tawait Task.Delay(long ms)\n");
+        text.Append("M\tTask\tYield\tM\t1\tawait Task.Yield()\n");
+        text.Append("M\tTask\tWhenAll\tM\t1\tasync int WhenAll(List<long> handles)\n");
+        text.Append("M\tTask\tWhenAny\tM\t1\tasync int WhenAny(List<long> handles)\n");
+        text.Append("M\tTask\tIsDone\tM\t1\tint IsDone(long handle)\n");
+        text.Append("M\tTask\tRelease\tM\t1\tvoid Release(long handle)\n");
+        text.Append("M\tTask\tCancel\tM\t1\tvoid Cancel(long handle)\n");
+        text.Append("M\tTask\tIsCancellationRequested\tM\t1\tint IsCancellationRequested()\n");
+        text.Append("M\tTask\tJoinNew\tM\t1\tlong JoinNew(int npairs, int any)\n");
+        text.Append("M\tTask\tJoinBind\tM\t1\tint JoinBind(long entry, long handle, int idx)\n");
+        text.Append("M\tTask\tJoinWait\tM\t1\tawait int JoinWait(long entry)\n");
+        text.Append("M\tTask\tJoinWaitOwned\tM\t1\tawait int JoinWaitOwned(long entry)\n");
+        text.Append("M\tTask\tJoinCancel\tM\t1\tvoid JoinCancel(long entry)\n");
+
+        text.Append("T\tclass\t*builtin*\tBitOperations\t\n");
+        text.Append("M\tBitOperations\tPopCount\tM\t1\tint PopCount(int value)\n");
+        text.Append("M\tBitOperations\tLeadingZeroCount\tM\t1\tint LeadingZeroCount(int value)\n");
+        text.Append("M\tBitOperations\tTrailingZeroCount\tM\t1\tint TrailingZeroCount(int value)\n");
+        text.Append("M\tBitOperations\tRotateLeft\tM\t1\tint RotateLeft(int value, int offset)\n");
+        text.Append("M\tBitOperations\tRotateRight\tM\t1\tint RotateRight(int value, int offset)\n");
+        text.Append("M\tBitOperations\tReverseEndianness\tM\t1\tint ReverseEndianness(int value)\n");
+        text.Append("M\tBitOperations\tLog2\tM\t1\tint Log2(int value)\n");
+        text.Append("M\tBitOperations\tIsPow2\tM\t1\tbool IsPow2(int value)\n");
+        text.Append("M\tBitOperations\tRoundUpToPowerOf2\tM\t1\tint RoundUpToPowerOf2(int value)\n");
+        text.Append("M\tBitOperations\tResetLowestSetBit\tM\t1\tint ResetLowestSetBit(int value)\n");
+        text.Append("M\tBitOperations\tExtractLowestSetBit\tM\t1\tint ExtractLowestSetBit(int value)\n");
+
+        text.Append("T\tclass\t*builtin*\tCpu\t\n");
+        text.Append("M\tCpu\tHasPopcnt\tP\t1\tbool HasPopcnt\n");
+        text.Append("M\tCpu\tHasLzcnt\tP\t1\tbool HasLzcnt\n");
+        text.Append("M\tCpu\tHasSse42\tP\t1\tbool HasSse42\n");
+        text.Append("M\tCpu\tHasAvx2\tP\t1\tbool HasAvx2\n");
+        text.Append("M\tCpu\tHasAesNi\tP\t1\tbool HasAesNi\n");
+        text.Append("M\tCpu\tHasNeon\tP\t1\tbool HasNeon\n");
+        text.Append("M\tCpu\tCpuFeature\tM\t1\tint CpuFeature(int id)\n");
+
+        text.Append("T\tclass\t*builtin*\tAes\t\n");
+        text.Append("M\tAes\tEncrypt\tM\t1\tVector128 Encrypt(Vector128 value, Vector128 roundKey)\n");
+        text.Append("M\tAes\tEncryptLast\tM\t1\tVector128 EncryptLast(Vector128 value, Vector128 roundKey)\n");
+        text.Append("M\tAes\tDecrypt\tM\t1\tVector128 Decrypt(Vector128 value, Vector128 roundKey)\n");
+        text.Append("M\tAes\tDecryptLast\tM\t1\tVector128 DecryptLast(Vector128 value, Vector128 roundKey)\n");
+        text.Append("M\tAes\tKeygenAssist\tM\t1\tVector128 KeygenAssist(Vector128 value, byte rcon)\n");
+        text.Append("M\tAes\tInverseMixColumns\tM\t1\tVector128 InverseMixColumns(Vector128 value)\n");
+        text.Append("M\tAes\tIsSupported\tP\t1\tbool IsSupported\n");
+
+        text.Append("T\tclass\t*builtin*\tSse2\t\n");
+        text.Append("M\tSse2\tXor\tM\t1\tVector128 Xor(Vector128 left, Vector128 right)\n");
+        text.Append("M\tSse2\tAnd\tM\t1\tVector128 And(Vector128 left, Vector128 right)\n");
+        text.Append("M\tSse2\tOr\tM\t1\tVector128 Or(Vector128 left, Vector128 right)\n");
+        text.Append("M\tSse2\tCompareEqual\tM\t1\tVector128 CompareEqual(Vector128 left, Vector128 right)\n");
+        text.Append("M\tSse2\tMoveMask\tM\t1\tint MoveMask(Vector128 value)\n");
+        text.Append("M\tSse2\tLoadVector128\tM\t1\tVector128 LoadVector128(nint address)\n");
+        text.Append("M\tSse2\tStore\tM\t1\tvoid Store(nint address, Vector128 source)\n");
+        text.Append("M\tSse2\tIsSupported\tP\t1\tbool IsSupported\n");
+
+        text.Append("T\tclass\t*builtin*\tSse42\t\n");
+        text.Append("M\tSse42\tCrc32\tM\t1\tuint Crc32(uint crc, byte data)\n");
+        text.Append("M\tSse42\tCrc32\tM\t1\tuint Crc32(uint crc, ushort data)\n");
+        text.Append("M\tSse42\tCrc32\tM\t1\tuint Crc32(uint crc, uint data)\n");
+        text.Append("M\tSse42\tCrc32\tM\t1\tulong Crc32(ulong crc, ulong data)\n");
+        text.Append("M\tSse42\tIsSupported\tP\t1\tbool IsSupported\n");
+
+        text.Append("T\tclass\t*builtin*\tVector128\t\n");
+        text.Append("M\tVector128\tCreate\tM\t1\tVector128 Create(byte value)\n");
+        text.Append("M\tVector128\tLoad\tM\t1\tVector128 Load(nint address)\n");
+        text.Append("M\tVector128\tLoad\tM\t1\tVector128 Load(byte[] source)\n");
+        text.Append("M\tVector128\tLoad\tM\t1\tVector128 Load(byte[] source, int offset)\n");
+        text.Append("M\tVector128\tLoad\tM\t1\tVector128 Load(float[] source, int offset)\n");
+        text.Append("M\tVector128\tStore\tM\t1\tvoid Store(nint address, Vector128 source)\n");
+        text.Append("M\tVector128\tStore\tM\t1\tvoid Store(byte[] dest, Vector128 source)\n");
+        text.Append("M\tVector128\tStore\tM\t1\tvoid Store(byte[] dest, int offset, Vector128 source)\n");
+        text.Append("M\tVector128\tStore\tM\t1\tvoid Store(float[] dest, int offset, Vector128 source)\n");
+        text.Append("M\tVector128\tAnd\tM\t1\tVector128 And(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tOr\tM\t1\tVector128 Or(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tXor\tM\t1\tVector128 Xor(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tAndNot\tM\t1\tVector128 AndNot(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tEquals\tM\t1\tVector128 Equals(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tExtractMostSignificantBits\tM\t1\tint ExtractMostSignificantBits(Vector128 value)\n");
+        text.Append("M\tVector128\tShuffle\tM\t1\tVector128 Shuffle(Vector128 value, Vector128 mask)\n");
+        text.Append("M\tVector128\tAdd\tM\t1\tVector128 Add(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tSubtract\tM\t1\tVector128 Subtract(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tAddSaturate\tM\t1\tVector128 AddSaturate(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tSubtractSaturate\tM\t1\tVector128 SubtractSaturate(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tMin\tM\t1\tVector128 Min(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tMax\tM\t1\tVector128 Max(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tAverage\tM\t1\tVector128 Average(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tConditionalSelect\tM\t1\tVector128 ConditionalSelect(Vector128 condition, Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tUnpackLow\tM\t1\tVector128 UnpackLow(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tUnpackHigh\tM\t1\tVector128 UnpackHigh(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tGreaterThan\tM\t1\tVector128 GreaterThan(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tLessThan\tM\t1\tVector128 LessThan(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tPrefetch\tM\t1\tvoid Prefetch(nint address)\n");
+        text.Append("M\tVector128\tPrefetch\tM\t1\tvoid Prefetch(byte[] source, int offset)\n");
+        text.Append("M\tVector128\tCreate\tM\t1\tVector128 Create(float value)\n");
+        text.Append("M\tVector128\tCreate\tM\t1\tVector128 Create(float e0, float e1, float e2, float e3)\n");
+        text.Append("M\tVector128\tAddFloat\tM\t1\tVector128 AddFloat(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tSubtractFloat\tM\t1\tVector128 SubtractFloat(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tMultiply\tM\t1\tVector128 Multiply(Vector128 left, Vector128 right)\n");
+        text.Append("M\tVector128\tMultiplyAdd\tM\t1\tVector128 MultiplyAdd(Vector128 a, Vector128 b, Vector128 c)\n");
+        text.Append("M\tVector128\tSqrt\tM\t1\tVector128 Sqrt(Vector128 value)\n");
+        text.Append("M\tVector128\tReciprocalSqrt\tM\t1\tVector128 ReciprocalSqrt(Vector128 value)\n");
+        text.Append("M\tVector128\tZero\tP\t1\tVector128 Zero\n");
+        text.Append("M\tVector128\tAllBitsSet\tP\t1\tVector128 AllBitsSet\n");
+
+        text.Append("T\tclass\t*builtin*\tVector256\t\n");
+        text.Append("M\tVector256\tCreate\tM\t1\tVector256 Create(byte value)\n");
+        text.Append("M\tVector256\tLoad\tM\t1\tVector256 Load(nint address)\n");
+        text.Append("M\tVector256\tLoad\tM\t1\tVector256 Load(byte[] source)\n");
+        text.Append("M\tVector256\tLoad\tM\t1\tVector256 Load(byte[] source, int offset)\n");
+        text.Append("M\tVector256\tLoad\tM\t1\tVector256 Load(float[] source, int offset)\n");
+        text.Append("M\tVector256\tStore\tM\t1\tvoid Store(nint address, Vector256 source)\n");
+        text.Append("M\tVector256\tStore\tM\t1\tvoid Store(byte[] dest, Vector256 source)\n");
+        text.Append("M\tVector256\tStore\tM\t1\tvoid Store(byte[] dest, int offset, Vector256 source)\n");
+        text.Append("M\tVector256\tStore\tM\t1\tvoid Store(float[] dest, int offset, Vector256 source)\n");
+        text.Append("M\tVector256\tAnd\tM\t1\tVector256 And(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tOr\tM\t1\tVector256 Or(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tXor\tM\t1\tVector256 Xor(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tAndNot\tM\t1\tVector256 AndNot(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tEquals\tM\t1\tVector256 Equals(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tExtractMostSignificantBits\tM\t1\tint ExtractMostSignificantBits(Vector256 value)\n");
+        text.Append("M\tVector256\tAdd\tM\t1\tVector256 Add(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tSubtract\tM\t1\tVector256 Subtract(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tAddSaturate\tM\t1\tVector256 AddSaturate(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tSubtractSaturate\tM\t1\tVector256 SubtractSaturate(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tMin\tM\t1\tVector256 Min(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tMax\tM\t1\tVector256 Max(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tAverage\tM\t1\tVector256 Average(Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tConditionalSelect\tM\t1\tVector256 ConditionalSelect(Vector256 condition, Vector256 left, Vector256 right)\n");
+        text.Append("M\tVector256\tPrefetch\tM\t1\tvoid Prefetch(nint address)\n");
+        text.Append("M\tVector256\tPrefetch\tM\t1\tvoid Prefetch(byte[] source, int offset)\n");
+        text.Append("M\tVector256\tZero\tP\t1\tVector256 Zero\n");
+        text.Append("M\tVector256\tAllBitsSet\tP\t1\tVector256 AllBitsSet\n");
+    }
+}

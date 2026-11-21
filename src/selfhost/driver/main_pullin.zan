@@ -20,6 +20,7 @@ public class PiName {
 
 public class PiFile {
     public string path;
+    public string packageRoot = "";
     public List<PiName> top;     // declared type names
     public List<PiName> idents;  // every identifier
     public List<string> usings;  // dotted subdirs
@@ -42,6 +43,7 @@ public class PiDir {
     public string subdir;        // 'A/B/C' form, as written after `using`
     public List<PiFile> files;
     public int reached;          // globbed + metadata-scanned
+    public bool imported;        // named in a using directive in an included file
     public PiDir next;
     public PiDir(string s) {
         subdir = s; files = new List<PiFile>(); reached = 0; next = null;
@@ -49,6 +51,8 @@ public class PiDir {
 }
 
 public partial class Program {
+    static bool packagesDisabled;
+
     static void PiInitPkg(string firstInput) {
         pkgProjectRoot = NormalizePath(ResolvePkgProjectRoot(firstInput));
         string cwd = NormalizePath(Directory.GetCurrentDirectory());
@@ -83,6 +87,9 @@ public partial class Program {
             pkgRepoStore = "";
         }
 
+        #if WINDOWS
+        pkgGlobalStore = PackageStore.GlobalStore();
+        #else
         string base0 = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
         if (base0 == null || base0.Length == 0) {
             base0 = Environment.GetEnvironmentVariable("HOME");
@@ -92,6 +99,7 @@ public partial class Program {
         } else {
             pkgGlobalStore = base0 + "/.local/share/zan/packages";
         }
+        #endif
     }
 
     // one store: every installed package providing the namespace directory
@@ -115,9 +123,11 @@ public partial class Program {
                     if (pkgRoots.ContainsKey(ecur) && pkgRoots[ecur] == root
                         && (Directory.ListNames(root + "/src/" + seg0 + "/*") != ""
                             || Directory.Exists(root + "/src"))) {
+                        int before = d.files.Count;
                         PiGlobDir(d, root + "/src/" + d.subdir);
                         PiGlobDir(d, root + "/stdlib/" + d.subdir);
                         PiGlobDir(d, root + "/" + d.subdir);
+                        if (d.files.Count > before) { PiNotePackageUsage(root); }
                     }
                 }
                 ecur = "";
@@ -130,6 +140,7 @@ public partial class Program {
 
     // reach the namespace through every package store
     static void PiGlobPkgs(PiDir d) {
+        if (packagesDisabled) { return; }
         PiPkgIdxEnsure();
         PiGlobStore(d, pkgProjectRoot + "/packages");
         PiGlobStore(d, pkgProjectRoot + "/.zan-packages");
@@ -156,12 +167,22 @@ public partial class Program {
     // type came out undefined.
     static List<PiFile> pkgNsIdx;   // the package sources, keyed by their declared namespace
     static bool pkgNsIdxBuilt;
+    static Dictionary<string, bool> pkgUsageSeen;
+
+    static void PiNotePackageUsage(string root) {
+        if (pkgUsageSeen.ContainsKey(root)) { return; }
+        pkgUsageSeen[root] = true;
+        string pluginId = PackageStore.PluginId(root);
+        if (pluginId == "") { return; }
+        string name = root.Substring(root.LastIndexOf("/") + 1);
+        Console.ErrorWriteLine("ZANPKG_USAGE plugin_id=" + pluginId + " package=" + name + " action=build");
+    }
 
     // The namespace a package file declares, in the 'A/B/C' subdir form.
     // (PiProbeNs below does the probing.)
 
     // collect every package source under `dir`, with its declared namespace
-    static void PiPkgIdxAdd(string dir) {
+    static void PiPkgIdxAdd(string dir, string packageRoot) {
         if (dir == null || dir.Length == 0) { return; }
         string names = Directory.ListNames(dir + "/*");
         if (names == null || names.Length == 0) { return; }
@@ -175,12 +196,13 @@ public partial class Program {
                 if (nm.EndsWith(".zan")) {
                     PiFile pf = new PiFile(full);
                     pf.ns = PiProbeNs(full);
+                    pf.packageRoot = packageRoot;
                     pkgNsIdx.Add(pf);
                 } else {
                     if (nm == "drivers" && File.Exists(full + "/driver.manifest")) {
                         pkgDriverManifests.Add(full + "/driver.manifest");
                     }
-                    PiPkgIdxAdd(full);
+                    PiPkgIdxAdd(full, packageRoot);
                 }
             }
             i = i + 1;
@@ -201,8 +223,9 @@ public partial class Program {
                     && ns[want.Length] == '/') {
                     hit = true;
                 }
-                if (hit && !PiDirHasFile(d, f.path)) {
-                    d.files.Add(new PiFile(f.path));
+                if (hit) {
+                    PiNotePackageUsage(f.packageRoot);
+                    if (!PiDirHasFile(d, f.path)) { d.files.Add(new PiFile(f.path)); }
                 }
             }
             i = i + 1;
@@ -221,8 +244,10 @@ public partial class Program {
         pkgNsIdxBuilt = true;
         pkgNsIdx = new List<PiFile>();
         pkgRoots = new Dictionary<string, string>();
+        pkgUsageSeen = new Dictionary<string, bool>();
         pkgDriverManifests = new List<string>();
         pkgSourceRoots = new List<string>();
+        if (packagesDisabled) { return; }
         PiPkgIdxStore(pkgProjectRoot + "/packages");
         PiPkgIdxStore(pkgProjectRoot + "/.zan-packages");
         if (pkgRepoStore != null && pkgRepoStore.Length > 0) {
@@ -248,20 +273,21 @@ public partial class Program {
                 pkgRoots[nm] = root;
                 bool hasSrc = Directory.Exists(root + "/src");
                 bool hasStdlib = Directory.Exists(root + "/stdlib");
-                if (hasSrc) { PiPkgIdxAddRoot(root + "/src"); }
-                if (hasStdlib) { PiPkgIdxAddRoot(root + "/stdlib"); }
-                if (!hasSrc && !hasStdlib && Directory.Exists(root)) { PiPkgIdxAddRoot(root); }
+                if (hasSrc) { PiPkgIdxAddRoot(root + "/src", root); }
+                if (hasStdlib) { PiPkgIdxAddRoot(root + "/stdlib", root); }
+                if (!hasSrc && !hasStdlib && Directory.Exists(root)) { PiPkgIdxAddRoot(root, root); }
             }
             i = i + 1;
         }
     }
 
-    static void PiPkgIdxAddRoot(string root) {
+    static void PiPkgIdxAddRoot(string root, string packageRoot) {
         pkgSourceRoots.Add(root);
-        PiPkgIdxAdd(root);
+        PiPkgIdxAdd(root, packageRoot);
     }
 
     // ---- demand-driven pull-in state ----
+    static List<string> piInputNamespaces;
     static List<PiName> piTable;   // hash buckets, null-filled
     static PiDir piDirs;
     static PiDir piDirsTail;
@@ -298,6 +324,7 @@ public partial class Program {
     }
 
     static void PiInit() {
+        piInputNamespaces = new List<string>();
         piTable = new List<PiName>();
         int i = 0;
         while (i < 16384) { piTable.Add(null); i = i + 1; }
@@ -305,14 +332,18 @@ public partial class Program {
         piDirsTail = null;
     }
 
-    static void PiReach(string subdir) {
+    static void PiReach(string subdir, bool imported = false) {
         if (subdir == "") { return; }
         PiDir d = piDirs;
         while (d != null) {
-            if (d.subdir == subdir) { return; }
+            if (d.subdir == subdir) {
+                d.imported = d.imported || imported;
+                return;
+            }
             d = d.next;
         }
         PiDir nd = new PiDir(subdir);
+        nd.imported = imported;
         if (piDirsTail != null) { piDirsTail.next = nd; } else { piDirs = nd; }
         piDirsTail = nd;
     }
@@ -565,7 +596,7 @@ public partial class Program {
                 else if (k == TK.Using()) {
                     PiReadDotted(toks, i + 1);
                     if (piDotStop == TK.Semicolon() && piDotName != "") {
-                        PiReach(piDotName);
+                        PiReach(piDotName, true);
                         // every segment is a namespace root for pass 2
                         PiMarkSegments(piDotName);
                     }
@@ -579,6 +610,7 @@ public partial class Program {
                     PiReadDotted(toks, i + 1);
                     if ((piDotStop == TK.Semicolon() || piDotStop == TK.LBrace())
                             && piDotName != "") {
+                        if (pass == 0) { piInputNamespaces.Add(piDotName); }
                         PiMarkSegments(piDotName);
                     }
                     prev = piDotStop;
@@ -905,7 +937,7 @@ public partial class Program {
                         }
                         int u = 0;
                         while (u < f.usings.Count) {
-                            PiReach(f.usings[u]);
+                            PiReach(f.usings[u], true);
                             u = u + 1;
                         }
                     }
@@ -915,6 +947,30 @@ public partial class Program {
             d = d.next;
         }
         return changed;
+    }
+
+    static bool PiInputDeclaresNamespace(string subdir) {
+        foreach (string declared in piInputNamespaces) {
+            if (declared == subdir || declared.StartsWith(subdir + "/") || subdir.StartsWith(declared + "/")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int PiReportMissing() {
+        if (packagesDisabled) { return 0; }
+        int missing = 0;
+        PiDir d = piDirs;
+        while (d != null) {
+            if (d.imported && d.files.Count == 0 && !Directory.Exists(stdlibRoot + "/" + d.subdir)
+                && !PiInputDeclaresNamespace(d.subdir)) {
+                Console.ErrorWriteLine("ZANPKG_MISSING namespace=" + d.subdir);
+                missing++;
+            }
+            d = d.next;
+        }
+        return missing;
     }
 
     static void PiAppendIncluded() {

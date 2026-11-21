@@ -1,0 +1,588 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace Zan;
+
+public class PackageInstallResult {
+    public bool Success;
+    public string Status;
+    public string PluginId;
+    public string CleanupPath;
+
+    public PackageInstallResult(string status) {
+        Success = status == "installed";
+        Status = status;
+        PluginId = "";
+        CleanupPath = "";
+    }
+}
+
+class PackageStoreManifest {
+    public string Name = "";
+    public string Version = "";
+    public string PluginId = "";
+}
+
+#if WINDOWS
+class PackageStoreEntry {
+    public string Name;
+    public int Attributes;
+
+    public PackageStoreEntry(string name, int attributes) {
+        Name = name;
+        Attributes = attributes;
+    }
+}
+#endif
+
+public static class PackageStore {
+    // The package index uses the same Windows store as the installer.
+    public static string GlobalStore() {
+        #if WINDOWS
+        string local = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (local != null && local != "") { return Path.Combine(local, "Zan\\packages"); }
+        #endif
+        return "";
+    }
+
+    public static string PluginId(string root) {
+        string path = Path.Combine(root, "zan.pkg");
+        if (!File.Exists(path)) { return ""; }
+        PackageStoreManifest manifest = ReadManifest(path);
+        return manifest == null ? "" : manifest.PluginId;
+    }
+
+    // Status is the value of the C driver's status field. The caller writes the CLI output.
+    public static PackageInstallResult Install(string source, string name, string project, string scope) {
+        if (scope != "project" && scope != "global") { return new PackageInstallResult("invalid_scope"); }
+        if (name == null || name == "") { return new PackageInstallResult("missing_name"); }
+        #if WINDOWS
+        if (!SafeComponent(name) || name.Length > 127) { return new PackageInstallResult("invalid_source"); }
+        string sourcePath = FullDiskPath(source);
+        if (sourcePath == "") { return new PackageInstallResult("invalid_source"); }
+
+        List<nint> sourceGuards = new List<nint>();
+        try {
+            if (!GuardDirectoryPath(sourcePath, false, sourceGuards)) {
+                return new PackageInstallResult("invalid_source");
+            }
+            string manifestPath = Path.Combine(sourcePath, "zan.pkg");
+            nint manifestGuard = OpenPlain(manifestPath, false);
+            if (manifestGuard == -1) { return new PackageInstallResult("invalid_manifest"); }
+            try {
+                PackageStoreManifest manifest = ReadManifest(manifestPath);
+                if (manifest == null || manifest.Name != name) { return new PackageInstallResult("invalid_manifest"); }
+                if (!HasVersion(manifest.Version)) { return new PackageInstallResult("missing_version"); }
+                if (!HasLibraryLayout(sourcePath)) { return new PackageInstallResult("no_stdlib_layout"); }
+
+                string store;
+                if (scope == "global") {
+                    store = GlobalStore();
+                    if (store == "") { return new PackageInstallResult("no_global_store"); }
+                } else {
+                    if (project == null || project == "") { return new PackageInstallResult("no_project"); }
+                    store = Path.Combine(project, ".zan-packages");
+                }
+                return InstallInto(sourcePath, sourceGuards[sourceGuards.Count - 1], name, store, manifest.PluginId);
+            } finally {
+                WinCloseHandle(manifestGuard);
+            }
+        } finally {
+            CloseGuards(sourceGuards);
+        }
+        #else
+        return new PackageInstallResult("unsupported");
+        #endif
+    }
+
+#if WINDOWS
+    private const int ReadOnlyAttribute = 1;
+    private const int DirectoryAttribute = 16;
+    private const int NormalAttribute = 128;
+    private const int ReparseAttribute = 1024;
+    private const int FileNotFound = 2;
+    private const int PathNotFound = 3;
+    private const int NoMoreFiles = 18;
+    private const int FileExists = 80;
+    private const int AlreadyExists = 183;
+    private const int FindDataBytes = 592;       // sizeof(WIN32_FIND_DATAW)
+    private const int FindDataNameOffset = 44;   // offsetof(WIN32_FIND_DATAW, cFileName)
+    private const int MaxTreeDepth = 64;
+    private const string ExtendedPathPrefix = "\\\\?\\";
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    private static extern int WinLastError();
+    [DllImport("kernel32", EntryPoint = "CreateFileW")]
+    private static extern nint WinOpen(nint path, uint access, uint share, nint attributes,
+                                       uint disposition, uint flags, nint templateFile);
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    private static extern int WinCloseHandle(nint handle);
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+    private static extern int WinGetAttributes(nint path);
+    [DllImport("kernel32", EntryPoint = "GetFileInformationByHandleEx")]
+    private static extern int WinGetFileInfo(nint handle, int infoClass, nint info, int bytes);
+    [DllImport("kernel32", EntryPoint = "GetFinalPathNameByHandleW")]
+    private static extern int WinFinalPath(nint handle, nint path, int chars, int flags);
+    [DllImport("kernel32", EntryPoint = "FindFirstFileW")]
+    private static extern nint WinFindFirst(nint pattern, nint data);
+    [DllImport("kernel32", EntryPoint = "FindNextFileW")]
+    private static extern int WinFindNext(nint handle, nint data);
+    [DllImport("kernel32", EntryPoint = "FindClose")]
+    private static extern int WinFindClose(nint handle);
+    [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
+    private static extern int WinCreateDirectory(nint path, nint attributes);
+    [DllImport("kernel32", EntryPoint = "CopyFileW")]
+    private static extern int WinCopy(nint source, nint destination, int failIfExists);
+    [DllImport("kernel32", EntryPoint = "MoveFileExW")]
+    private static extern int WinMove(nint source, nint destination, int flags);
+    [DllImport("kernel32", EntryPoint = "SetFileAttributesW")]
+    private static extern int WinSetAttributes(nint path, int attributes);
+    [DllImport("kernel32", EntryPoint = "DeleteFileW")]
+    private static extern int WinDeleteFile(nint path);
+    [DllImport("kernel32", EntryPoint = "RemoveDirectoryW")]
+    private static extern int WinRemoveDirectory(nint path);
+
+    private static bool HasLibraryLayout(string path) {
+        return Directory.ExistsOnDisk(Path.Combine(path, "src"))
+            || Directory.ExistsOnDisk(Path.Combine(path, "stdlib"));
+    }
+
+    private static PackageInstallResult InstallInto(string source, nint sourceGuard, string name,
+                                                     string storePath, string pluginId) {
+        string store = FullDiskPath(storePath);
+        if (store == "") { return new PackageInstallResult("io_error"); }
+        List<nint> storeGuards = new List<nint>();
+        try {
+            if (!GuardDirectoryPath(store, true, storeGuards)) { return new PackageInstallResult("io_error"); }
+            string destination = Path.Combine(store, name);
+            string destinationStatus = DestinationStatus(destination);
+            if (destinationStatus != "") { return new PackageInstallResult(destinationStatus); }
+
+            string sourceReal = FinalDirectoryPath(sourceGuard);
+            string storeReal = FinalDirectoryPath(storeGuards[storeGuards.Count - 1]);
+            if (sourceReal == "" || storeReal == "") { return new PackageInstallResult("io_error"); }
+            if (Path.IsUnder(sourceReal, storeReal)) { return new PackageInstallResult("unsafe_or_io"); }
+
+            string stage = CreateStage(store);
+            if (stage == "") { return new PackageInstallResult("unsafe_or_io"); }
+            PackageInstallResult result = new PackageInstallResult("unsafe_or_io");
+            try {
+                if (CopyTree(source, stage, 0) && HasLibraryLayout(stage)) {
+                    if (Publish(stage, destination)) {
+                        result.Status = "installed";
+                        result.Success = true;
+                        result.PluginId = pluginId;
+                    } else {
+                        result.Status = DestinationStatus(destination);
+                        if (result.Status == "") { result.Status = "io_error"; }
+                    }
+                }
+            } finally {
+                if (!result.Success && !RemoveTree(stage)) { result.CleanupPath = stage; }
+            }
+            return result;
+        } finally {
+            CloseGuards(storeGuards);
+        }
+    }
+
+    private static string DestinationStatus(string path) {
+        int error = 0;
+        int attributes = Attributes(path, out error);
+        if (attributes != -1 && (attributes & DirectoryAttribute) != 0) { return "exists"; }
+        if (attributes == -1 && (error == FileNotFound || error == PathNotFound)) { return ""; }
+        return "io_error";
+    }
+
+    private static string FullDiskPath(string path) {
+        if (path == null || path == "") { return ""; }
+        string full;
+        try {
+            string normalized = Path.Normalize(path);
+            if (normalized.StartsWith(ExtendedPathPrefix)) {
+                normalized = normalized.Substring(ExtendedPathPrefix.Length);
+                if (normalized.Length < 3 || normalized[1] != ':' || normalized[2] != '\\') { return ""; }
+            }
+            full = Path.Normalize(Path.GetFullPath(normalized));
+        } catch (ArgumentException ex) {
+            return "";
+        } catch (IOException ex) {
+            return "";
+        }
+        if (full.Length < 3 || full[1] != ':' || full[2] != '\\' || !Path.IsPathRooted(full)
+            || full.IndexOf(":", 2) >= 0 || full.Contains("*") || full.Contains("?")) { return ""; }
+        while (full.Length > 3 && full.EndsWith("\\")) { full = full.Substring(0, full.Length - 1); }
+        return ExtendedPathPrefix + full;
+    }
+
+    // Open one component at a time without FILE_SHARE_DELETE or following reparses.
+    // The handles prevent components already checked from being renamed during path-based I/O.
+    private static bool GuardDirectoryPath(string path, bool create, List<nint> guards) {
+        int rootEnd = ExtendedPathPrefix.Length + 3;
+        if (!AddDirectoryGuard(path.Substring(0, rootEnd), false, guards)) { return false; }
+        for (int i = rootEnd; i <= path.Length; i++) {
+            if (i == rootEnd || (i < path.Length && path[i] != '\\')) { continue; }
+            if (!AddDirectoryGuard(path.Substring(0, i), create, guards)) { return false; }
+        }
+        return true;
+    }
+
+    private static bool AddDirectoryGuard(string path, bool create, List<nint> guards) {
+        nint handle = OpenPlain(path, true);
+        if (handle == -1 && create) {
+            int error = CreateDirectory(path);
+            if (error == 0 || error == AlreadyExists) { handle = OpenPlain(path, true); }
+        }
+        if (handle == -1) { return false; }
+        guards.Add(handle);
+        return true;
+    }
+
+    private static void CloseGuards(List<nint> guards) {
+        for (int i = guards.Count - 1; i >= 0; i--) { WinCloseHandle(guards[i]); }
+    }
+
+    private static nint OpenPlain(string path, bool directory) {
+        nint wide = Wide.Of(path);
+        if (wide == 0) { return -1; }
+        uint access = directory ? 129 : 0x80000000;  // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, or GENERIC_READ
+        uint share = directory ? 3 : 1;             // Share read/write on directories, read on files.
+        // OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS
+        nint handle = WinOpen(wide, access, share, 0, 3, 0x02200000, 0);
+        Wide.Free(wide);
+        if (handle == -1) { return -1; }
+
+        // FILE_ATTRIBUTE_TAG_INFO contains two DWORDs, attributes first.
+        nint info = NativeMemory.Alloc(8);
+        bool plain = false;
+        try {
+            if (info != 0 && WinGetFileInfo(handle, 9, info, 8) != 0) {
+                int attrs = Marshal.ReadInt32(info);
+                plain = (attrs & ReparseAttribute) == 0 && ((attrs & DirectoryAttribute) != 0) == directory;
+            }
+        } finally {
+            NativeMemory.Free(info);
+            if (!plain) { WinCloseHandle(handle); }
+        }
+        return plain ? handle : -1;
+    }
+
+    private static string FinalDirectoryPath(nint handle) {
+        // Compare normalized NT paths to catch short-name aliases and substituted drives.
+        int chars = WinFinalPath(handle, 0, 0, 2);  // VOLUME_NAME_NT
+        if (chars <= 0 || chars > 32768) { return ""; }
+        nint buffer = NativeMemory.Alloc(chars * 2);
+        if (buffer == 0) { return ""; }
+        try {
+            int count = WinFinalPath(handle, buffer, chars, 2);
+            if (count <= 0 || count >= chars) { return ""; }
+            string path = Wide.Read(buffer);
+            if (path.EndsWith("\\")) { return path.Substring(0, path.Length - 1); }
+            return path;
+        } finally {
+            NativeMemory.Free(buffer);
+        }
+    }
+
+    private static int Attributes(string path, out int error) {
+        nint wide = Wide.Of(path);
+        error = 0;
+        if (wide == 0) { return -1; }
+        int attrs = WinGetAttributes(wide);
+        if (attrs == -1) { error = WinLastError(); }
+        Wide.Free(wide);
+        return attrs;
+    }
+
+    private static int CreateDirectory(string path) {
+        nint wide = Wide.Of(path);
+        if (wide == 0) { return 8; } // ERROR_NOT_ENOUGH_MEMORY
+        int result = WinCreateDirectory(wide, 0);
+        int error = result == 0 ? WinLastError() : 0;
+        Wide.Free(wide);
+        return error;
+    }
+
+    private static string CreateStage(string store) {
+        // The C index rejects '~' in package names; the self-host index skips leading dots.
+        for (int i = 0; i < 8; i++) {
+            string stage = Path.Combine(store, ".zan-install~" + Guid.New());
+            int error = CreateDirectory(stage);
+            if (error == 0) { return stage; }
+            if (error != AlreadyExists && error != FileExists) { break; }
+        }
+        return "";
+    }
+
+    private static bool ReadEntries(string dir, List<PackageStoreEntry> entries) {
+        nint pattern = Wide.Of(Path.Combine(dir, "*"));
+        if (pattern == 0) { return false; }
+        nint data = NativeMemory.Alloc(FindDataBytes);
+        try {
+            if (data == 0) { return false; }
+            nint find = WinFindFirst(pattern, data);
+            if (find == -1) { return WinLastError() == FileNotFound; }
+            try {
+                do {
+                    string name = Wide.Read(data + FindDataNameOffset);
+                    if (name == null || name == "") { return false; }
+                    if (name != "." && name != "..") {
+                        entries.Add(new PackageStoreEntry(name, Marshal.ReadInt32(data)));
+                    }
+                } while (WinFindNext(find, data) != 0);
+                return WinLastError() == NoMoreFiles;
+            } finally {
+                WinFindClose(find);
+            }
+        } finally {
+            NativeMemory.Free(data);
+            Wide.Free(pattern);
+        }
+    }
+
+    private static bool CopyTree(string source, string destination, int depth) {
+        if (depth > MaxTreeDepth) { return false; }
+        nint sourceGuard = OpenPlain(source, true);
+        if (sourceGuard == -1) { return false; }
+        nint destinationGuard = OpenPlain(destination, true);
+        try {
+            if (destinationGuard == -1) { return false; }
+            List<PackageStoreEntry> entries = new List<PackageStoreEntry>();
+            if (!ReadEntries(source, entries)) { return false; }
+            for (int i = 0; i < entries.Count; i++) {
+                PackageStoreEntry entry = entries[i];
+                if ((entry.Attributes & ReparseAttribute) != 0 || !SafeComponent(entry.Name)) { return false; }
+                string from = Path.Combine(source, entry.Name);
+                string to = Path.Combine(destination, entry.Name);
+                if ((entry.Attributes & DirectoryAttribute) != 0) {
+                    if (CreateDirectory(to) != 0 || !CopyTree(from, to, depth + 1)) { return false; }
+                } else if (!CopyFile(from, to)) {
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            if (destinationGuard != -1) { WinCloseHandle(destinationGuard); }
+            WinCloseHandle(sourceGuard);
+        }
+    }
+
+    private static bool CopyFile(string source, string destination) {
+        nint guard = OpenPlain(source, false);
+        if (guard == -1) { return false; }
+        nint from = Wide.Of(source);
+        nint to = Wide.Of(destination);
+        try {
+            return from != 0 && to != 0 && WinCopy(from, to, 1) != 0;
+        } finally {
+            Wide.Free(to);
+            Wide.Free(from);
+            WinCloseHandle(guard);
+        }
+    }
+
+    private static bool Publish(string stage, string destination) {
+        nint from = Wide.Of(stage);
+        nint to = Wide.Of(destination);
+        try {
+            // MOVEFILE_WRITE_THROUGH only. A same-volume rename fails if the destination exists.
+            return from != 0 && to != 0 && WinMove(from, to, 8) != 0;
+        } finally {
+            Wide.Free(to);
+            Wide.Free(from);
+        }
+    }
+
+    private static bool RemoveTree(string path) {
+        int error = 0;
+        int attrs = Attributes(path, out error);
+        if (attrs == -1) { return error == FileNotFound || error == PathNotFound; }
+        bool directory = (attrs & DirectoryAttribute) != 0;
+        bool reparse = (attrs & ReparseAttribute) != 0;
+        if (directory && !reparse) {
+            nint guard = OpenPlain(path, true);
+            if (guard == -1) { return false; }
+            try {
+                List<PackageStoreEntry> entries = new List<PackageStoreEntry>();
+                ReadEntries(path, entries);
+                for (int i = 0; i < entries.Count; i++) {
+                    RemoveTree(Path.Combine(path, entries[i].Name));
+                }
+            } finally {
+                WinCloseHandle(guard);
+            }
+        }
+        nint wide = Wide.Of(path);
+        if (wide == 0) { return false; }
+        try {
+            if (directory) { return WinRemoveDirectory(wide) != 0; }
+            if (!reparse && (attrs & ReadOnlyAttribute) != 0) {
+                WinSetAttributes(wide, NormalAttribute);
+            }
+            return WinDeleteFile(wide) != 0;
+        } finally {
+            Wide.Free(wide);
+        }
+    }
+
+    private static bool SafeComponent(string name) {
+        if (name == null || name == "" || name.EndsWith(".")) { return false; }
+        for (int i = 0; i < name.Length; i++) {
+            int c = name[i] & 255;
+            bool alnum = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+            if (!alnum && c != '_' && c != '-' && c != '.' && c != '@') { return false; }
+        }
+        int dot = name.IndexOf(".");
+        string stem = (dot >= 0 ? name.Substring(0, dot) : name).ToUpper();
+        if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") { return false; }
+        if (stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT"))) {
+            return stem[3] < '1' || stem[3] > '9';
+        }
+        return true;
+    }
+
+#endif
+
+    private const int MaxManifestBytes = 10 * 1024 * 1024;
+
+    private static PackageStoreManifest ReadManifest(string path) {
+        try {
+            FileStream file = FileStream.OpenRead(path);
+            string text;
+            try {
+                long length = file.Length();
+                if (length <= 0 || length > MaxManifestBytes) { return null; }
+                byte[] bytes = new byte[(int)length];
+                if (file.ReadBytes(bytes) != (int)length || file.ReadByte() != -1 || !file.EndOfFile()) { return null; }
+                text = File.StripBom(bytes.ToStr(0, (int)length));
+            } finally {
+                file.Close();
+            }
+            int start = SkipSpace(text, 0);
+            PackageStoreManifest manifest = new PackageStoreManifest();
+            if (start < text.Length && text[start] == '{') {
+                JsonValue root = JsonValue.Parse(text.Substring(start));
+                if (root == null || !root.IsObject()) { return null; }
+                manifest.Name = JsonString(root, "name");
+                manifest.Version = JsonString(root, "version");
+                manifest.PluginId = JsonString(root, "plugin_id");
+            } else {
+                ReadIni(text, manifest);
+            }
+            if (manifest.PluginId.Length > 63) { manifest.PluginId = manifest.PluginId.Substring(0, 63); }
+            return manifest;
+        } catch (IOException ex) {
+            return null;
+        } catch (JsonException ex) {
+            return null;
+        }
+    }
+
+    private static string JsonString(JsonValue root, string key) {
+        JsonValue value = root.Get(key);
+        if (value == null || !value.IsString()) { return ""; }
+        string text = value.AsString("");
+        int end = 0;
+        while (end < text.Length && (text[end] & 255) != 0) { end++; }
+        return text.Substring(0, end);
+    }
+
+    private static void ReadIni(string text, PackageStoreManifest manifest) {
+        bool metadata = true;
+        bool dependencyArray = false;
+        int start = 0;
+        while (start < text.Length) {
+            int end = start;
+            while (end < text.Length && text[end] != '\r' && text[end] != '\n' && (text[end] & 255) != 0) { end++; }
+            string line = text.Substring(start, end - start).Trim();
+            start = end + 1;
+            if (line != "" && !line.StartsWith("#")) {
+                if (line.StartsWith("[")) {
+                    metadata = !line.StartsWith("[deps]") && !line.StartsWith("[dependencies]")
+                        && !line.StartsWith("[embed]") && !line.StartsWith("[embeds]");
+                    dependencyArray = false;
+                } else if (dependencyArray) {
+                    dependencyArray = !ClosesArray(line);
+                } else if (metadata) {
+                    int keyEnd = 0;
+                    while (keyEnd < line.Length && line[keyEnd] != '=' && !IsSpace(line[keyEnd] & 255)) { keyEnd++; }
+                    string key = line.Substring(0, keyEnd);
+                    int valueAt = SkipSpace(line, keyEnd);
+                    if (valueAt < line.Length && line[valueAt] == '=') { valueAt = SkipSpace(line, valueAt + 1); }
+                    if ((key == "deps" || key == "dependencies") && valueAt < line.Length && line[valueAt] == '[') {
+                        dependencyArray = !ClosesArray(line.Substring(valueAt + 1));
+                    } else if (key == "name" || key == "version" || key == "plugin_id") {
+                        string value = IniValue(line, valueAt);
+                        if (key == "name") { manifest.Name = value; }
+                        else if (key == "version") { manifest.Version = value; }
+                        else { manifest.PluginId = value; }
+                    }
+                }
+            }
+            if (end < text.Length && (text[end] & 255) == 0) { return; }
+        }
+    }
+
+    private static bool ClosesArray(string line) {
+        bool quoted = false;
+        for (int i = 0; i < line.Length; i++) {
+            if (line[i] == '"') { quoted = !quoted; }
+            if (!quoted && line[i] == ']') { return true; }
+        }
+        return false;
+    }
+
+    private static string IniValue(string line, int start) {
+        if (start == line.Length) { return ""; }
+        if (line[start] == '"') {
+            int quote = line.IndexOf("\"", start + 1);
+            int end = quote < 0 ? line.Length : quote;
+            return line.Substring(start + 1, end - start - 1);
+        }
+        int stop = start;
+        while (stop < line.Length && !IsSpace(line[stop] & 255)) { stop++; }
+        return line.Substring(start, stop - start);
+    }
+
+    private static bool IsSpace(int c) { return c == 32 || (c >= 9 && c <= 13); }
+
+    private static int SkipSpace(string text, int start) {
+        while (start < text.Length && IsSpace(text[start] & 255)) { start++; }
+        return start;
+    }
+
+    private static bool HasVersion(string version) {
+        // Like the C manifest loader, accept two or three numeric components and a suffix.
+        int major = 0;
+        int minor = 0;
+        int patch = 0;
+        int next = ScanVersionNumber(version, 0, out major);
+        if (next < 0 || next == version.Length || version[next] != '.' || major < 0) { return false; }
+        next = ScanVersionNumber(version, next + 1, out minor);
+        if (next < 0 || minor < 0) { return false; }
+        if (next < version.Length && version[next] == '.') {
+            int end = ScanVersionNumber(version, next + 1, out patch);
+            if (end >= 0 && patch < 0) { return false; }
+        }
+        return true;
+    }
+
+    private static int ScanVersionNumber(string text, int start, out int number) {
+        int i = SkipSpace(text, start);
+        bool negative = i < text.Length && text[i] == '-';
+        if (i < text.Length && (negative || text[i] == '+')) { i++; }
+        int first = i;
+        long value = 0;
+        number = 0;
+        while (i < text.Length && text[i] >= '0' && text[i] <= '9') {
+            value = value * 10 + (text[i] & 255) - 48;
+            if (value > 2147483647) { number = -1; return i + 1; }
+            i++;
+        }
+        if (i == first) { return -1; }
+        number = negative ? -(int)value : (int)value;
+        return i;
+    }
+}

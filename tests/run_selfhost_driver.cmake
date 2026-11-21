@@ -399,6 +399,8 @@ void ArcReleaseTwice(void) {
     endforeach()
     file(REMOVE_RECURSE "${_arc}")
 
+    include("${CMAKE_CURRENT_LIST_DIR}/run_selfhost_package_symbols.cmake")
+
     set(_lib "${OUTDIR}/native-library")
     file(MAKE_DIRECTORY "${_lib}")
     set(_lib_src "${_lib}/library.zan")

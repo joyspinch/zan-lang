@@ -238,24 +238,19 @@ public partial class Program {
         return p.Substring(0, last);
     }
 
-    // walk up from the input file to find nearest zan.proj or packages directory,
-    // prioritizing the true repository root containing packages/ (resolve_package_project_root)
+    // An installed project store owns its sources even inside a repository checkout.
     static string ResolvePkgProjectRoot(string input) {
         if (packageProject != null && packageProject != "") { return packageProject; }
         string dir = PkgParentDir(input);
-        string foundProj = "";
         for (;;) {
-            if (foundProj == "" && File.Exists(dir + "/zan.proj")) {
-                foundProj = dir;
-            }
-            if (Directory.Exists(dir + "/packages")) {
+            if (File.Exists(dir + "/zan.proj") || Directory.Exists(dir + "/.zan-packages")
+                || Directory.Exists(dir + "/packages")) {
                 return dir;
             }
             string parent = PkgParentDir(dir);
             if (parent == dir || parent == "") { break; }
             dir = parent;
         }
-        if (foundProj != "") { return foundProj; }
         return ".";
     }
 
@@ -598,6 +593,28 @@ public partial class Program {
         Console.ErrorWriteLine("    --help, -h                 Show this help and exit");
         Console.ErrorWriteLine("    --diagnostics-format=jsonl  Emit tagged compiler diagnostics as JSON Lines on stderr");
         Console.ErrorWriteLine("    --diagnostics-format=text   Use human-readable compiler diagnostics (default)");
+        Console.ErrorWriteLine("    --package-install <dir> --package-name <name> [--package-scope project|global]");
+        Console.ErrorWriteLine("    --package-list-missing     Report unresolved imported namespaces without compiling");
+        Console.ErrorWriteLine("    --no-packages               Disable package discovery");
+        Console.ErrorWriteLine("    --emit-symbols <file>       Write the declaration symbol index");
+    }
+
+    static void InstallLocalPackage(string source, string name, string scope) {
+        string project = packageProject == "" ? "." : packageProject;
+        PackageInstallResult result = PackageStore.Install(source, name, project, scope);
+        string status = "ZANPKG_STATUS action=install status=" + result.Status;
+        if (result.Status != "invalid_scope" && result.Status != "missing_name" && result.Status != "invalid_source") {
+            status = status + " package=" + name;
+        }
+        if (result.Success) { status = status + " scope=" + scope; }
+        Console.ErrorWriteLine(status);
+        if (result.Success && result.PluginId != "") {
+            Console.ErrorWriteLine("ZANPKG_USAGE plugin_id=" + result.PluginId + " package=" + name + " scope=" + scope);
+        }
+        if (result.CleanupPath != "") {
+            Console.ErrorWriteLine("zanc: could not remove package staging directory: " + result.CleanupPath);
+        }
+        if (!result.Success) { Environment.Exit(1); }
     }
 
     static void Main() {
@@ -624,6 +641,8 @@ public partial class Program {
         bool diagnosticsJsonl = false;
         bool reportTime = false;
         string metadataPath = "";
+        string symbolsPath = "";
+        bool listMissingPackages = false;
         string explicitStdlib = "";
         string subsystem = "";
         string driverDir = "";
@@ -632,6 +651,10 @@ public partial class Program {
         bool metadataBodies = false;
         bool allSources = false;
         packageProject = "";
+        packagesDisabled = false;
+        string installSource = "";
+        string installName = "";
+        string installScope = "project";
         string optLevel = "";
         bool stripSymbols = false;
         bool debug = false;
@@ -666,7 +689,8 @@ public partial class Program {
             if (a == "-o" || a == "--target" || a == "--package-project" || a == "--link-input"
                 || a == "--gen-meta" || a == "--stdlib-path" || a == "--subsystem" || a == "--driver-dir"
                 || a == "--icon" || a == "--embed" || a == "--link-mode" || a == "--link-lib"
-                || a == "-L" || a == "--libpath") {
+                || a == "-L" || a == "--libpath" || a == "--package-install"
+                || a == "--package-name" || a == "--package-scope" || a == "--emit-symbols") {
                 if (i + 1 >= argc || args[i + 1] == ""
                     || args[i + 1].StartsWith("-")) {
                     throw "zanc: option '" + a + "' requires a value";
@@ -762,14 +786,12 @@ public partial class Program {
                 continue;
             }
             if (a == "--no-icon") { noIcon = true; i = i + 1; continue; }
-            if (a == "--package-project") {
-                packageProject = args[i + 1];
-                if (!Directory.ExistsOnDisk(packageProject)) {
-                    throw "zanc: package project directory does not exist: '" + packageProject + "'";
-                }
-                i = i + 2;
-                continue;
-            }
+            if (a == "--package-project") { packageProject = args[i + 1]; i += 2; continue; }
+            if (a == "--package-install") { installSource = args[i + 1]; i += 2; continue; }
+            if (a == "--package-name") { installName = args[i + 1]; i += 2; continue; }
+            if (a == "--package-scope") { installScope = args[i + 1]; i += 2; continue; }
+            if (a == "--no-packages") { packagesDisabled = true; i++; continue; }
+            if (a == "--package-list-missing") { listMissingPackages = true; i++; continue; }
             if (a == "--target") {
                 string target = args[i + 1];
                 if (target != "host") {
@@ -783,6 +805,7 @@ public partial class Program {
                 i = i + 2;
                 continue;
             }
+            if (a == "--emit-symbols") { symbolsPath = args[i + 1]; i += 2; continue; }
             if (a == "--time") { reportTime = true; i = i + 1; continue; }
             if (a == "--gen-meta-bodies") { metadataBodies = true; i = i + 1; continue; }
             if (a == "--no-pullin-filter") { allSources = true; i = i + 1; continue; }
@@ -807,6 +830,13 @@ public partial class Program {
             rawInputs.Add(a);
             i = i + 1;
         }
+        if (installSource != "") {
+            InstallLocalPackage(installSource, installName, installScope);
+            return;
+        }
+        if (packageProject != "" && !Directory.ExistsOnDisk(packageProject)) {
+            throw "zanc: package project directory does not exist: '" + packageProject + "'";
+        }
         if (rawInputs.Count == 0) {
             Console.WriteLine(Usage());
             throw "zanc: no input files";
@@ -815,10 +845,12 @@ public partial class Program {
         if (optLevel == "") { optLevel = publishing ? "-Os" : "-O2"; }
         stripSymbols = stripSymbols || publishing;
         bool exportMetadata = metadataPath != "";
+        bool exportSymbols = symbolsPath != "" && !exportMetadata;
+        bool declarationOutput = exportMetadata || exportSymbols;
         if (metadataBodies && !exportMetadata) { throw "zanc: --gen-meta-bodies requires --gen-meta"; }
         string first = rawInputs[0];
         bool firstFromResponse = !directArguments.Contains(firstInputIndex);
-        bool legacyOutput = !exportMetadata && !hasDashO && rawInputs.Count > 1 && !first.EndsWith(".zan")
+        bool legacyOutput = !declarationOutput && !listMissingPackages && !hasDashO && rawInputs.Count > 1 && !first.EndsWith(".zan")
             && !firstFromResponse && !first.StartsWith("@") && !Directory.ExistsOnDisk(first);
         if (legacyOutput) {
             outPath = first;
@@ -834,7 +866,7 @@ public partial class Program {
         }
 
         if (inclPaths.Count == 0) { throw "zanc: no input files"; }
-        bool defaultOutput = !exportMetadata && !hasDashO && !legacyOutput;
+        bool defaultOutput = !declarationOutput && !hasDashO && !legacyOutput;
         if (defaultOutput) {
             if (emitLib) { throw "zanc: --emit-lib requires an output path"; }
             #if WINDOWS
@@ -891,6 +923,15 @@ public partial class Program {
                 pi = pi + 1;
             }
             while (PiCloseOnce(allSources) == 1) { }
+            int missingPackages = PiReportMissing();
+            if (listMissingPackages) {
+                Console.ErrorWriteLine("ZANPKG_STATUS action=list-missing status=ok count=" + missingPackages);
+                Environment.Exit(missingPackages == 0 ? 0 : 3);
+            }
+            if (missingPackages > 0) {
+                Console.ErrorWriteLine("error: " + missingPackages + " unresolved imported namespace(s); see ZANPKG_MISSING diagnostics above");
+                Environment.Exit(3);
+            }
             PiAppendIncluded();
             if (piDb) { Console.WriteLine("[pullin] total " + inclPaths.Count + " files"); }
             phaseStart = ReportPhase(reportTime, "source discovery (" + inclPaths.Count + " files)", phaseStart);
@@ -930,7 +971,7 @@ public partial class Program {
             }
             Parser ps = new Parser(toks, d);
             ps.SetFileBounds(fileStarts);
-            if (exportMetadata) {
+            if (declarationOutput) {
                 List<string> originalNames;
                 Node declarations = ps.ParseMetadata(out originalNames);
                 if (d.HasErrors() || (denyWarnings && d.HasWarnings())) {
@@ -938,10 +979,14 @@ public partial class Program {
                     d.Summary();
                     throw "zanc: metadata export failed";
                 }
-                if (metadataBodies) { PiPkgIdxEnsure(); }
-                MetadataExporter exporter = new MetadataExporter(inclPaths, fileStarts, stdlibRoot, pkgSourceRoots, metadataBodies);
-                WriteMetadata(metadataPath, exporter.Export(declarations, originalNames));
-                ReportPhase(reportTime, "metadata", phaseStart);
+                if (exportSymbols) {
+                    WriteMetadata(symbolsPath, SymbolIndex.Export(declarations));
+                } else {
+                    if (metadataBodies) { PiPkgIdxEnsure(); }
+                    MetadataExporter exporter = new MetadataExporter(inclPaths, fileStarts, stdlibRoot, pkgSourceRoots, metadataBodies);
+                    WriteMetadata(metadataPath, exporter.Export(declarations, originalNames));
+                }
+                ReportPhase(reportTime, exportSymbols ? "symbols" : "metadata", phaseStart);
                 return;
             }
             Node unit = ps.ParseUnit();
