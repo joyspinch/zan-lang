@@ -32,6 +32,7 @@ partial class Irgen {
         // B-ID211: live-registry tracking for the GC probe; the hook (and
         // the runtime it calls) exist only when the program probes.
         if (gcProbeUsed) { H("  call void @zan_gc_live_add(i8* %obj, i64 %tot, i8* %cid)"); }
+        EmitArcAllocation();
         H("  ret i8* %obj");
         H("}");
         H("define void @zretain(i8* %p) {");
@@ -50,11 +51,13 @@ partial class Irgen {
         H("go:");
         H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
-        H("  %rc_now = load i64, i64* %rc");
+        H("  %rc_now = load atomic i64, i64* %rc monotonic, align 8");
+        EmitArcFreedCheck("%rc_now", "%p", 1, "object", "retain of");
         H("  %isimm = icmp eq i64 %rc_now, -1");
         H("  br i1 %isimm, label %done, label %doadd");
         H("doadd:");
         H("  %c = atomicrmw add i64* %rc, i64 1 monotonic");
+        EmitArcUnderflowCheck("%c", "%p", 1, "object", "retain of");
         H("  br label %done");
         H("done:");
         H("  ret void");
@@ -75,11 +78,13 @@ partial class Irgen {
         H("go:");
         H("  %hdr = getelementptr i8, i8* %p, i64 -16");
         H("  %rc = bitcast i8* %hdr to i64*");
-        H("  %rc_now = load i64, i64* %rc");
+        H("  %rc_now = load atomic i64, i64* %rc monotonic, align 8");
+        EmitArcFreedCheck("%rc_now", "%p", 2, "object", "release of");
         H("  %isimm = icmp eq i64 %rc_now, -1");
         H("  br i1 %isimm, label %done, label %dosub");
         H("dosub:");
         H("  %c = atomicrmw sub i64* %rc, i64 1 acq_rel");
+        EmitArcUnderflowCheck("%c", "%p", 2, "object", "release of");
         // The count that was there BEFORE the release decides what happens.
         // 1 -> the last strong reference: the weak slots pointing at the
         // object are cleared first, then the object dies.  0 or less -> an
@@ -106,7 +111,7 @@ partial class Irgen {
         // the block starts 24 bytes before the object pointer
         H("  %base = getelementptr i8, i8* %p, i64 -24");
         if (gcProbeUsed) { H("  call void @zan_gc_live_remove(i8* %p)"); }
-        H("  call void @free(i8* %base)");
+        EmitArcFree("%base", "%rc");
         H("  br label %done");
         H("done:");
         H("  ret void");
@@ -752,6 +757,7 @@ partial class Irgen {
         H("  %endp = getelementptr i8, i8* %p, i64 %len");
         H("  store i8 0, i8* %endp");
         if (gcProbeUsed) { H("  call void @zan_gc_live_add(i8* %p, i64 %tot, i8* null)"); }
+        EmitArcAllocation();
         H("  ret i8* %p");
         H("}");
         EmitStrOwnershipRuntime();
@@ -828,11 +834,13 @@ partial class Irgen {
         H("counted:");
         H("  %raw = getelementptr i8, i8* %p, i64 -32");
         H("  %rc = bitcast i8* %raw to i64*");
-        H("  %count = load i64, i64* %rc");
+        H("  %count = load atomic i64, i64* %rc monotonic, align 8");
+        EmitArcFreedCheck("%count", "%p", 3, "string", "retain of");
         H("  %imm = icmp eq i64 %count, -1");
         H("  br i1 %imm, label %done, label %add");
         H("add:");
         H("  %old = atomicrmw add i64* %rc, i64 1 monotonic");
+        EmitArcUnderflowCheck("%old", "%p", 3, "string", "retain of");
         H("  br label %done");
         H("done:");
         H("  ret void");
@@ -850,16 +858,18 @@ partial class Irgen {
         H("counted:");
         H("  %raw = getelementptr i8, i8* %p, i64 -32");
         H("  %rc = bitcast i8* %raw to i64*");
-        H("  %count = load i64, i64* %rc");
+        H("  %count = load atomic i64, i64* %rc monotonic, align 8");
+        EmitArcFreedCheck("%count", "%p", 4, "string", "release of");
         H("  %imm = icmp eq i64 %count, -1");
         H("  br i1 %imm, label %done, label %sub");
         H("sub:");
         H("  %old = atomicrmw sub i64* %rc, i64 1 acq_rel");
+        EmitArcUnderflowCheck("%old", "%p", 4, "string", "release of");
         H("  %last = icmp eq i64 %old, 1");
         H("  br i1 %last, label %free, label %done");
         H("free:");
         if (gcProbeUsed) { H("  call void @zan_gc_live_remove(i8* %p)"); }
-        H("  call void @free(i8* %raw)");
+        EmitArcFree("%raw", "%rc");
         H("  br label %done");
         H("done:");
         H("  ret void");

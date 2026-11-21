@@ -318,6 +318,87 @@ namespace Fixture {
   endif()
 
   if(_bundled_link)
+    set(_arc "${OUTDIR}/arc-diagnostics")
+    file(MAKE_DIRECTORY "${_arc}")
+    file(WRITE "${_arc}/main.zan" [=[
+using System;
+class Link {
+    public Link Next;
+}
+class Program {
+    [DllImport("arc_fixture")]
+    static extern void ArcReleaseTwice();
+
+    static Link Root = new Link();
+    static int Main(string[] args) {
+        if (args.Length != 0 && args[0] == "guard") {
+            ArcReleaseTwice();
+            return 0;
+        }
+        if (args.Length != 0) {
+            Link cycle = new Link();
+            cycle.Next = cycle;
+        }
+        return Root == null ? 1 : 0;
+    }
+}
+]=])
+    file(WRITE "${_arc}/fault.c" [=[
+__declspec(dllimport) unsigned int SetErrorMode(unsigned int mode);
+extern void *zalloc(long long size, void *dtor, void *class_id);
+extern void zrelease(void *object);
+
+void ArcReleaseTwice(void) {
+    SetErrorMode(2); /* SEM_NOGPFAULTERRORBOX */
+    void *object = zalloc(8, 0, 0);
+    zrelease(object);
+    zrelease(object);
+}
+]=])
+    execute_process(COMMAND "${CLANG}" -c "${_arc}/fault.c" -o "${_arc}/fault.obj"
+      RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 45)
+    if(NOT "${rc}" STREQUAL "0")
+      message(FATAL_ERROR "ARC fault fixture compilation failed, rc=${rc}\n${stdout}${stderr}")
+    endif()
+    file(REMOVE "${_arc}/zan_leaks.log")
+    foreach(mode IN ITEMS strict disabled)
+      set(_arc_flags --arc-guard --check-leaks)
+      if(mode STREQUAL "disabled")
+        list(APPEND _arc_flags --no-arc-guard --no-check-leaks)
+      endif()
+      execute_process(COMMAND ${_gen1_env} "${GEN1}" "${_arc}/main.zan"
+        -g --strict-runtime ${_arc_flags} --link-input "${_arc}/fault.obj" -o "${_arc}/app.exe"
+        WORKING_DIRECTORY "${_arc}" RESULT_VARIABLE rc
+        OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 120)
+      if(NOT "${rc}" STREQUAL "0")
+        message(FATAL_ERROR "ARC ${mode} compilation failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      execute_process(COMMAND "${_arc}/app.exe" WORKING_DIRECTORY "${_arc}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+      if(NOT "${rc}" STREQUAL "0" OR stdout MATCHES "memory leak detected" OR EXISTS "${_arc}/zan_leaks.log")
+        message(FATAL_ERROR "ARC ${mode} clean exit failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      execute_process(COMMAND "${_arc}/app.exe" cycle WORKING_DIRECTORY "${_arc}"
+        RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+      if(NOT "${rc}" STREQUAL "0")
+        message(FATAL_ERROR "ARC ${mode} cycle execution failed, rc=${rc}\n${stdout}${stderr}")
+      endif()
+      if(mode STREQUAL "strict")
+        if(NOT stdout MATCHES "memory leak detected: 1 object" OR NOT EXISTS "${_arc}/zan_leaks.log")
+          message(FATAL_ERROR "ARC leak report missing or incorrect\n${stdout}${stderr}")
+        endif()
+        file(REMOVE "${_arc}/zan_leaks.log")
+        execute_process(COMMAND "${_arc}/app.exe" guard WORKING_DIRECTORY "${_arc}"
+          RESULT_VARIABLE rc OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 15)
+        if("${rc}" STREQUAL "0" OR NOT stderr MATCHES "ARC guard: release of an already-freed object")
+          message(FATAL_ERROR "ARC guard failed to diagnose a duplicate release, rc=${rc}\n${stdout}${stderr}")
+        endif()
+      elseif(stdout MATCHES "memory leak detected" OR EXISTS "${_arc}/zan_leaks.log")
+        message(FATAL_ERROR "ARC leak report ignored --no-check-leaks\n${stdout}${stderr}")
+      endif()
+    endforeach()
+    file(REMOVE_RECURSE "${_arc}")
+
     set(_project "${OUTDIR}/publish-resources")
     set(_source "${_project}/main.zan")
     set(_release "${_project}/app.exe")

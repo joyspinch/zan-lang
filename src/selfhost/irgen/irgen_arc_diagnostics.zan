@@ -1,0 +1,116 @@
+namespace Zan;
+
+partial class Irgen {
+    public bool arcGuard;
+    public bool arcNet;
+    public bool checkLeaks;
+
+    void EmitArcDiagnostics() {
+        if (arcGuard || arcNet) { EmitArcFaultRuntime(); }
+        if (checkLeaks) { EmitLeakReporter(); }
+    }
+
+    void EmitArcFaultRuntime() {
+        if (!ExternSeen("zan_rt_soft_note")) {
+            externDecls.Add("zan_rt_soft_note");
+            H("declare void @zan_rt_soft_note(i8*)");
+        }
+        if (arcGuard && hostWin) {
+            externDecls.Add("RaiseException");
+            H("declare void @RaiseException(i32, i32, i32, i64*)");
+        }
+        H("define internal void @zarc_bad(i1 %bad, i32 %code, i8* %object, i64 %count, i8* %message) {");
+        H("entry:");
+        H("  br i1 %bad, label %report, label %done");
+        H("report:");
+        H("  call void @zan_rt_soft_note(i8* %message)");
+        if (arcGuard) {
+            if (hostWin) {
+                H("  %args = alloca [3 x i64], align 8");
+                H("  %a0 = getelementptr [3 x i64], [3 x i64]* %args, i64 0, i64 0");
+                H("  %a1 = getelementptr i64, i64* %a0, i64 1");
+                H("  %a2 = getelementptr i64, i64* %a0, i64 2");
+                H("  %pointer = ptrtoint i8* %object to i64");
+                H("  store i64 %pointer, i64* %a0");
+                H("  store i64 %count, i64* %a1");
+                H("  store i64 0, i64* %a2");
+                H("  call void @RaiseException(i32 %code, i32 0, i32 3, i64* %a0)");
+            }
+            H("  call void @exit(i32 70)");
+            H("  unreachable");
+        } else {
+            H("  br label %done");
+        }
+        H("done:");
+        H("  ret void");
+        H("}");
+    }
+
+    string ArcFreedMark() { return "-2401263022582726656"; }
+
+    void EmitArcFreedCheck(string count, string pointer, int kind, string type, string action) {
+        if (!arcGuard) { return; }
+        EmitArcFaultCheck("freed", "eq", count, ArcFreedMark(), pointer, kind,
+            "ARC guard: " + action + " an already-freed " + type + "\n");
+    }
+
+    void EmitArcUnderflowCheck(string count, string pointer, int kind, string type, string action) {
+        if (!arcNet && (!arcGuard || !runtimeChecks)) { return; }
+        string prefix = arcGuard ? "ARC guard: " : "ARC over-release net: ";
+        EmitArcFaultCheck("underflow", "sle", count, "0", pointer, kind,
+            prefix + action + " " + type + " with a nonpositive reference count\n");
+    }
+
+    void EmitArcFaultCheck(string name, string comparison, string count, string limit,
+            string pointer, int kind, string message) {
+        string failed = "%arc." + name;
+        H("  " + failed + " = icmp " + comparison + " i64 " + count + ", " + limit);
+        H("  call void @zarc_bad(i1 " + failed + ", i32 " + (3768762368L + kind)
+            + ", i8* " + pointer + ", i64 " + count + ", i8* " + RawCString(message, true) + ")");
+    }
+
+    void EmitArcFree(string basePointer, string countPointer) {
+        if (checkLeaks) { H("  atomicrmw sub i64* @zarc.live, i64 1 monotonic"); }
+        if (!arcGuard) {
+            H("  call void @free(i8* " + basePointer + ")");
+            return;
+        }
+        H("  store atomic i64 " + ArcFreedMark() + ", i64* " + countPointer + " release, align 8");
+    }
+
+    void EmitArcAllocation() {
+        if (checkLeaks) { H("  atomicrmw add i64* @zarc.live, i64 1 monotonic"); }
+    }
+
+    void EmitLeakReporter() {
+        if (!ExternSeen("atexit")) {
+            externDecls.Add("atexit");
+            H("declare i32 @atexit(void ()*)");
+        }
+        if (!ExternSeen("fprintf")) {
+            externDecls.Add("fprintf");
+            H("declare i32 @fprintf(i8*, i8*, ...)");
+        }
+        string message = RawCString("zan: memory leak detected: %lld object(s) still reachable at exit\n", true);
+        string path = RawCString("zan_leaks.log", true);
+        string mode = RawCString("ab", true);
+        H("@zarc.live = internal global i64 0, align 8");
+        H("define internal void @zarc_report_leaks() {");
+        H("entry:");
+        H("  %count = load atomic i64, i64* @zarc.live monotonic, align 8");
+        H("  %leaked = icmp sgt i64 %count, 0");
+        H("  br i1 %leaked, label %report, label %done");
+        H("report:");
+        H("  call i32 (i8*, ...) @printf(i8* " + message + ", i64 %count)");
+        H("  %file = call i8* @fopen(i8* " + path + ", i8* " + mode + ")");
+        H("  %opened = icmp ne i8* %file, null");
+        H("  br i1 %opened, label %log, label %done");
+        H("log:");
+        H("  call i32 (i8*, i8*, ...) @fprintf(i8* %file, i8* " + message + ", i64 %count)");
+        H("  call i32 @fclose(i8* %file)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
+    }
+}

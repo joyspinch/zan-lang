@@ -418,8 +418,36 @@ partial class Irgen {
             }
             j = j + 1;
         }
+        if (checkLeaks && !libOut) { GenStaticCleanup(cls, instTy, sym); }
         curThisTy = savedThis; curInstArgs = savedArgs; curInstCls = savedCls;
     }
+
+    void GenStaticCleanup(Node cls, Node inst, string initSym) {
+        StartFn();
+        string scope = typeScopeCls;
+        typeScopeCls = cls.sval;
+        L("define internal void @" + StaticCleanupSymbol(initSym) + "() {");
+        L("entry:");
+        int i = cls.kids.Count - 1;
+        while (i >= 0) {
+            Node field = cls.kids[i];
+            if (field.kind == AK.FieldDecl() && IsStatic(field)
+                && (ArcManaged(field.type) || field.type.ival >= 1)) {
+                string ty = MapType(field.type);
+                string global = StaticGlobal(cls.sval, field.sval, inst.kids);
+                string value = NT();
+                L("  " + value + " = load " + ty + ", " + ty + "* " + global);
+                L("  store " + ty + " null, " + ty + "* " + global);
+                EmitArcRelease(value, field.type);
+            }
+            i = i - 1;
+        }
+        L("  ret void");
+        L("}");
+        typeScopeCls = scope;
+    }
+
+    string StaticCleanupSymbol(string initSym) { return "zarc_drop_" + initSym; }
 
     void EmitStaticInits(Node unit) {
         L("  call void @__zan_static_init()");
@@ -527,6 +555,15 @@ partial class Irgen {
             i = i + 1;
         }
         result.Append("  ret void\n}\n");
+        if (checkLeaks && !libOut) {
+            result.Append("define internal void @zarc_drop_statics() {\nentry:\n");
+            i = order.Count - 1;
+            while (i >= 0) {
+                result.Append("  call void @" + StaticCleanupSymbol(sinitSyms[order[i]]) + "()\n");
+                i = i - 1;
+            }
+            result.Append("  ret void\n}\n");
+        }
         if (libOut) {
             result.Append("@llvm.global_ctors = appending global [1 x { i32, void ()*, i8* }] [{ i32, void ()*, i8* } { i32 65535, void ()* @__zan_static_init, i8* null }]\n");
         }
