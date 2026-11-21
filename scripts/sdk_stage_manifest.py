@@ -652,6 +652,7 @@ def main():
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--archiver", type=Path)
     parser.add_argument("--local-stage", action="store_true")
+    parser.add_argument("--build-local-drivers", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--filter", default="^console/console-args$")
     parser.add_argument("--native-dir", action="append", type=Path, default=[])
@@ -659,7 +660,6 @@ def main():
     parser.add_argument("--native-input", action="append", type=Path, default=[])
     args = parser.parse_args()
     if args.mode == "gallery-plan":
-    parser.add_argument("--build-local-drivers", action="store_true")
         if not args.plan:
             parser.error("gallery-plan requires --plan")
         plan = load(args.plan)

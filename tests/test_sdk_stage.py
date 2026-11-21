@@ -144,26 +144,6 @@ class SdkStageTests(unittest.TestCase):
         for name in ("WebView2Loader.dll", "libcrypto.dll", "static/libfreetype.a"):
             self.assertFalse(SDK.generated_native(owner / name, repo), name)
 
-    def gallery_fixture(self):
-        source = self.base / "gallery-repo"
-        self.write(source / "tests/gui/form_grid.html", "<data-grid></data-grid>")
-        self.write(source / "tests/gui/form_grid_test.zan", "fixture")
-        gallery = source / "knowledge/gallery.json"
-        SDK.identity.atomic_json(gallery, {"entries": [{"files": ["tests/gui/form_grid.html", "tests/gui/form_grid_test.zan"]}]})
-        plan = {"repo": str(source.resolve()), "toolchain": [], "copies": [
-            {"source": str(gallery), "destination": "knowledge/gallery.json"},
-            {"source": str(source / "tests/gui/form_grid.html"), "destination": "tests/gui/form_grid.html"}]}
-        return source, gallery, plan
-
-    def test_gallery_completion_adds_only_missing_exact_payload(self):
-        source, gallery, plan = self.gallery_fixture()
-        SDK.gallery_plan(plan, complete=True)
-        self.assertEqual(len(plan["copies"]), 3)
-        self.assertEqual(plan["copies"][-1]["destination"], "tests/gui/form_grid_test.zan")
-        SDK.gallery_plan(plan, complete=True)
-        self.assertEqual(len(plan["copies"]), 3)
-        SDK.gallery_plan(plan)
-        SDK.verify_gallery(source.resolve())
     def test_build_local_drivers_replace_only_generated_package_files(self):
         repo = self.base.resolve()
         build = repo / "build"
@@ -187,6 +167,26 @@ class SdkStageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Required input is missing"):
             SDK.add_build_local_drivers(plan, build)
 
+    def gallery_fixture(self):
+        source = self.base / "gallery-repo"
+        self.write(source / "tests/gui/form_grid.html", "<data-grid></data-grid>")
+        self.write(source / "tests/gui/form_grid_test.zan", "fixture")
+        gallery = source / "knowledge/gallery.json"
+        SDK.identity.atomic_json(gallery, {"entries": [{"files": ["tests/gui/form_grid.html", "tests/gui/form_grid_test.zan"]}]})
+        plan = {"repo": str(source.resolve()), "toolchain": [], "copies": [
+            {"source": str(gallery), "destination": "knowledge/gallery.json"},
+            {"source": str(source / "tests/gui/form_grid.html"), "destination": "tests/gui/form_grid.html"}]}
+        return source, gallery, plan
+
+    def test_gallery_completion_adds_only_missing_exact_payload(self):
+        source, gallery, plan = self.gallery_fixture()
+        SDK.gallery_plan(plan, complete=True)
+        self.assertEqual(len(plan["copies"]), 3)
+        self.assertEqual(plan["copies"][-1]["destination"], "tests/gui/form_grid_test.zan")
+        SDK.gallery_plan(plan, complete=True)
+        self.assertEqual(len(plan["copies"]), 3)
+        SDK.gallery_plan(plan)
+        SDK.verify_gallery(source.resolve())
 
     def test_gallery_missing_source_or_mapping_is_rejected(self):
         source, gallery, plan = self.gallery_fixture()
@@ -518,39 +518,6 @@ class SdkStageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected output"):
                 SDK.consume(args)
             self.assertFalse(receipt.exists())
-
-    def posix_payload(self, sdk, reverse=False):
-        files = {"VERSION": "1.2.3\n", "README.txt": "SDK\n", "stdlib/System/Test.zan": "stdlib fixture",
-                 "templates/console/console-args/zan.proj": "entry = src/main.zan\n",
-                 "examples/html_gallery/zan.proj": "gallery fixture"}
-        files.update({"toolchain/" + name: name for name in SDK.POSIX_COMMANDS + SDK.POSIX_RUNTIME})
-        for name in reversed(files) if reverse else files:
-            path = self.write(sdk / name, files[name])
-            mode = 0o711 if name.removeprefix("toolchain/") in SDK.POSIX_COMMANDS else 0o600
-            path.chmod(mode if reverse else mode | 0o044)
-            timestamp = 1700000000 if reverse else 1650000000
-            os.utime(path, (timestamp, timestamp))
-        (sdk / "templates/empty").mkdir()
-
-    def test_posix_archive_is_reproducible_and_keeps_sdk_layout(self):
-        name = "zan-ide-1.2.3-linux-x64"
-        archives = []
-        for index in (0, 1):
-            sdk = self.base / str(index) / name
-            self.posix_payload(sdk, reverse=bool(index))
-            archive = sdk.with_name(sdk.name + ".tar.gz")
-            with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "12345"}):
-                SDK.write_posix_archive(sdk, archive)
-            archives.append(archive)
-        first, second = archives
-        self.assertEqual(first.read_bytes(), second.read_bytes())
-        self.assertEqual(first.with_suffix(".gz.sha256").read_bytes(), second.with_suffix(".gz.sha256").read_bytes())
-        self.assertEqual(first.read_bytes()[:10], bytes.fromhex("1f8b08000000000002ff"))
-        with tarfile.open(first) as tar:
-            self.assertEqual(tar.getnames(), sorted(tar.getnames()))
-            self.assertTrue(all((m.uid, m.gid, m.uname, m.gname, m.mtime) == (0, 0, "", "", 12345)
-                                for m in tar.getmembers()))
-            self.assertEqual(tar.getmember(name + "/toolchain/zanc").mode, 0o755)
             self.assertEqual(SDK.verify_sdk(sdk), manifest)
 
     @unittest.skipUnless(os.name == "nt", "Windows SDK diagnostics contract")
@@ -600,6 +567,39 @@ class SdkStageTests(unittest.TestCase):
         self.assertIn((os.path.normcase(str(source)), 2, len(prefix) + 1, "E0017"),
                       [(os.path.normcase(d["file"]), d["line"], d["col"], d["code"])
                        for d in errors if d["file"] is not None], diagnostics)
+
+    def posix_payload(self, sdk, reverse=False):
+        files = {"VERSION": "1.2.3\n", "README.txt": "SDK\n", "stdlib/System/Test.zan": "stdlib fixture",
+                 "templates/console/console-args/zan.proj": "entry = src/main.zan\n",
+                 "examples/html_gallery/zan.proj": "gallery fixture"}
+        files.update({"toolchain/" + name: name for name in SDK.POSIX_COMMANDS + SDK.POSIX_RUNTIME})
+        for name in reversed(files) if reverse else files:
+            path = self.write(sdk / name, files[name])
+            mode = 0o711 if name.removeprefix("toolchain/") in SDK.POSIX_COMMANDS else 0o600
+            path.chmod(mode if reverse else mode | 0o044)
+            timestamp = 1700000000 if reverse else 1650000000
+            os.utime(path, (timestamp, timestamp))
+        (sdk / "templates/empty").mkdir()
+
+    def test_posix_archive_is_reproducible_and_keeps_sdk_layout(self):
+        name = "zan-ide-1.2.3-linux-x64"
+        archives = []
+        for index in (0, 1):
+            sdk = self.base / str(index) / name
+            self.posix_payload(sdk, reverse=bool(index))
+            archive = sdk.with_name(sdk.name + ".tar.gz")
+            with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "12345"}):
+                SDK.write_posix_archive(sdk, archive)
+            archives.append(archive)
+        first, second = archives
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(first.with_suffix(".gz.sha256").read_bytes(), second.with_suffix(".gz.sha256").read_bytes())
+        self.assertEqual(first.read_bytes()[:10], bytes.fromhex("1f8b08000000000002ff"))
+        with tarfile.open(first) as tar:
+            self.assertEqual(tar.getnames(), sorted(tar.getnames()))
+            self.assertTrue(all((m.uid, m.gid, m.uname, m.gname, m.mtime) == (0, 0, "", "", 12345)
+                                for m in tar.getmembers()))
+            self.assertEqual(tar.getmember(name + "/toolchain/zanc").mode, 0o755)
             self.assertEqual(tar.getmember(name + "/stdlib/System/Test.zan").mode, 0o644)
         sdk, record = SDK.extract_posix_archive(first, self.base / "unpacked")
         self.assertEqual(sdk.name, name)

@@ -68,21 +68,21 @@ $owners = @{
     zan_audio = 'packages/Zan.Desktop/src/System/Media/drivers'
     zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
 }
+$driverOutput = if ($BuildLocalDrivers) { Join-Path $Build 'local-drivers' } else { $Build }
 foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
     Add-StageInput (Join-Path $Build "$driver.lib") "$driver.lib"
     Add-StageInput (Join-Path $driverOutput "lib$driver.dll.a") "lib$driver.dll.a" -Required:$BuildLocalDrivers
     $owner = Join-Path (Join-Path $root $owners[$driver]) 'win-x64'
+    $fallback = if ($BuildLocalDrivers) { $driverOutput } else { $owner }
     $name = "$driver.bundle"
     $bundle = Join-Path $driverOutput $name
     if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $fallback $name }
     Add-StageInput $bundle $name -Required
     $runtimeDll = Join-Path $driverOutput "$driver.dll"
     if (-not (Test-Path -LiteralPath $runtimeDll -PathType Leaf)) { $runtimeDll = Join-Path $fallback "$driver.dll" }
-$driverOutput = if ($BuildLocalDrivers) { Join-Path $Build 'local-drivers' } else { $Build }
     Add-StageInput $runtimeDll "$driver.dll" -Required
     if (Test-Path -LiteralPath $bundle -PathType Leaf) {
         foreach ($entry in (Get-Content -LiteralPath $bundle)) {
-    $fallback = if ($BuildLocalDrivers) { $driverOutput } else { $owner }
             if ($entry -match '^\s*([^#@\s]+)(?:\s+if\s+\S+)?\s*$') {
                 $payloadName = $Matches[1]
                 if ([IO.Path]::GetFileName($payloadName) -ne $payloadName) { throw "STAGE_FAILED: unsafe bundle payload: $payloadName" }
