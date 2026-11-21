@@ -1,4 +1,4 @@
-"""Persistent SDK staging contracts. Synthetic byte fixtures never compile Zan."""
+"""SDK staging contracts. Set ZAN_WINDOWS_SDK to probe a staged or unpacked Windows SDK."""
 import importlib.util
 import json
 import os
@@ -37,7 +37,10 @@ class SdkStageTests(unittest.TestCase):
         return path
 
     def call(self, *args, success=True, env=None):
-        result = subprocess.run([str(x) for x in args], capture_output=True, text=True, env=env)
+        # PowerShell and Python children can emit different encodings on Windows.
+        # These assertions use ASCII markers. The JSONL probe decodes UTF-8 strictly.
+        result = subprocess.run([str(x) for x in args], capture_output=True,
+                                encoding="utf-8", errors="replace", env=env)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -161,6 +164,29 @@ class SdkStageTests(unittest.TestCase):
         self.assertEqual(len(plan["copies"]), 3)
         SDK.gallery_plan(plan)
         SDK.verify_gallery(source.resolve())
+    def test_build_local_drivers_replace_only_generated_package_files(self):
+        repo = self.base.resolve()
+        build = repo / "build"
+        owner = repo / "packages/Zan.Gui/src/Gui/drivers/win-x64"
+        old_driver = self.write(owner / "zan_gui.dll", "existing DLL")
+        loader = self.write(owner / "WebView2Loader.dll", "third-party input")
+        plan = {"repo": str(repo), "copies": [{"source": str(repo / "packages"),
+                "destination": "packages", "tree": True}]}
+        for name in SDK.identity.sdk_native_outputs(repo):
+            path = Path(name)
+            relative = Path("static") / path.name if path.parent.name == "static" else Path(path.name)
+            self.write(build / "local-drivers" / relative, path.name)
+
+        SDK.add_build_local_drivers(plan, build)
+        mappings = {row["destination"]: Path(row["source"]) for row in SDK.expand_plan(plan)}
+        self.assertEqual(mappings[old_driver.relative_to(repo).as_posix()],
+                         build / "local-drivers/zan_gui.dll")
+        self.assertEqual(mappings[loader.relative_to(repo).as_posix()], loader)
+        self.assertEqual(old_driver.read_text(), "existing DLL")
+        (build / "local-drivers/static/libzan_gui.a").unlink()
+        with self.assertRaisesRegex(ValueError, "Required input is missing"):
+            SDK.add_build_local_drivers(plan, build)
+
 
     def test_gallery_missing_source_or_mapping_is_rejected(self):
         source, gallery, plan = self.gallery_fixture()
@@ -525,6 +551,55 @@ class SdkStageTests(unittest.TestCase):
             self.assertTrue(all((m.uid, m.gid, m.uname, m.gname, m.mtime) == (0, 0, "", "", 12345)
                                 for m in tar.getmembers()))
             self.assertEqual(tar.getmember(name + "/toolchain/zanc").mode, 0o755)
+            self.assertEqual(SDK.verify_sdk(sdk), manifest)
+
+    @unittest.skipUnless(os.name == "nt", "Windows SDK diagnostics contract")
+    def test_published_selfhost_stderr_diagnostics(self):
+        sdk_path = os.environ.get("ZAN_WINDOWS_SDK")
+        if not sdk_path:
+            self.skipTest("Set ZAN_WINDOWS_SDK to a staged or unpacked Windows SDK")
+        sdk = Path(sdk_path).resolve()
+        self.assertEqual(SDK.verify_sdk(sdk)["phase"], "staged")
+        toolchain = sdk / "toolchain"
+        compiler_name = "zanc.exe" if (toolchain / "zanc-seed.exe").is_file() else "zanc-selfhost.exe"
+        compiler = toolchain / compiler_name
+        stdlib = sdk / "stdlib"
+        self.assertTrue(compiler.is_file(), compiler)
+        self.assertTrue(stdlib.is_dir(), stdlib)
+
+        system = Path(os.environ["SystemRoot"])
+        env = {"SystemRoot": str(system), "PATH": os.pathsep.join((str(system / "System32"), str(system))),
+               "TEMP": str(self.base), "TMP": str(self.base)}
+        options = {"cwd": self.base, "env": env, "stdin": subprocess.DEVNULL,
+                   "capture_output": True, "timeout": 45}
+        flag = "--diagnostics-format=jsonl"
+        help_result = subprocess.run([str(compiler), "--help"], **options)
+        self.assertEqual(help_result.returncode, 0, help_result)
+        help_fields = {line.split()[0] for stream in (help_result.stdout, help_result.stderr)
+                       for line in stream.splitlines() if line.split()}
+        self.assertIn(flag.encode("ascii"), help_fields, help_result)
+
+        # The invalid character escape has a coded lexer diagnostic at the opening quote.
+        prefix = "    char value = "
+        source = self.write(self.base / "invalid escape.zan",
+                            "class Program { static void Main() {\n" + prefix + "'\\q';\n} }\n")
+        artifact = self.base / "invalid escape.exe"
+        result = subprocess.run([str(compiler), str(source), "--stdlib-path", str(stdlib),
+                                 flag, "-o", str(artifact)], **options)
+        self.assertNotEqual(result.returncode, 0, result)
+        self.assertEqual(set(self.base.iterdir()), {source}, result)
+
+        wire_format = "zan-diagnostic-v1"
+        self.assertNotIn(wire_format.encode("ascii"), result.stdout, result)
+        diagnostics = [json.loads(line.decode("utf-8")) for line in result.stderr.splitlines()
+                       if line.lstrip().startswith(b"{")]
+        self.assertTrue(diagnostics, result)
+        for diagnostic in diagnostics:
+            self.assertEqual(diagnostic["format"], wire_format, diagnostic)
+        errors = [d for d in diagnostics if d["severity"] == "error"]
+        self.assertIn((os.path.normcase(str(source)), 2, len(prefix) + 1, "E0017"),
+                      [(os.path.normcase(d["file"]), d["line"], d["col"], d["code"])
+                       for d in errors if d["file"] is not None], diagnostics)
             self.assertEqual(tar.getmember(name + "/stdlib/System/Test.zan").mode, 0o644)
         sdk, record = SDK.extract_posix_archive(first, self.base / "unpacked")
         self.assertEqual(sdk.name, name)

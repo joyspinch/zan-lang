@@ -32,7 +32,8 @@
 #         Add  -OutDir <d> to publish directly to custom path (e.g. D:\Zan).
 
 param([switch]$SkipBuild, [switch]$NoBump, [string]$OutDir,
-      [switch]$PrepareOnly, [switch]$LocalStage, [switch]$PreflightOnly, [switch]$PlanOnly, [switch]$SkipDesignGeneration)
+      [switch]$PrepareOnly, [switch]$LocalStage, [switch]$PreflightOnly, [switch]$PlanOnly,
+      [switch]$SkipDesignGeneration, [switch]$BuildLocalDrivers)
 
 if ($PrepareOnly -and ($SkipBuild -or -not $NoBump)) {
     throw 'PUBLISH_FAILED: PrepareOnly requires NoBump and cannot use SkipBuild'
@@ -59,7 +60,8 @@ Write-Output "Publishing version $version"
 if (-not $SkipBuild) {
     & cmake --build (Join-Path $root 'build') --target selfhost_compiler
     if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: self-hosted compiler build error' }
-    & (Join-Path $root 'scripts\build_ide.ps1') -SkipDesignGeneration:$SkipDesignGeneration
+    & (Join-Path $root 'scripts\build_ide.ps1') -SkipDesignGeneration:$SkipDesignGeneration `
+        -BuildLocalDrivers:$BuildLocalDrivers
     if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: IDE build error' }
     $buildZanc = Join-Path $root 'build\zanc.exe'
     $builtKnowledge = Join-Path $root 'build\knowledge'
@@ -98,7 +100,7 @@ $toolInputs = Join-Path $work 'sdk-toolchain-inputs.json'
 $planFile = Join-Path $work 'sdk-stage-plan.json'
 $ticket = Join-Path $work 'sdk-stage-preflight.json'
 & (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
-    -IncludeDebugger -IncludeSelfhost -PreflightOnly -InputList $toolInputs
+    -IncludeDebugger -IncludeSelfhost -BuildLocalDrivers:$BuildLocalDrivers -PreflightOnly -InputList $toolInputs
 $copies = [Collections.Generic.List[object]]::new()
 function Add-SdkCopy([string]$Source, [string]$Destination, [switch]$Tree) {
     $kind = if ($Tree) { 'Container' } else { 'Leaf' }
@@ -143,7 +145,9 @@ $plan = @{ repo = $root; toolchain = @($toolPlan | ForEach-Object { $_ }); copie
 ConvertTo-Json -InputObject $plan -Depth 8 | Set-Content -LiteralPath $planFile -Encoding UTF8
 # Include exact gallery file references missing from the regular payload trees.
 $manifestTool = Join-Path $PSScriptRoot 'sdk_stage_manifest.py'
-& python -I -B $manifestTool gallery-plan --plan $planFile
+$galleryArgs = @('--plan', $planFile)
+if ($BuildLocalDrivers) { $galleryArgs += @('--build', $b, '--build-local-drivers') }
+& python -I -B $manifestTool gallery-plan @galleryArgs
 if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: gallery payload closure validation failed' }
 if ($PlanOnly) { Write-Output "PUBLISH_PLAN_OK -> $planFile (no identity approval, no output mutation)"; return }
 $manifestArgs = @('--repo', $root, '--build', $b, '--plan', $planFile, '--ticket', $ticket)
@@ -158,7 +162,8 @@ if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -For
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 & python -I -B $manifestTool copy-sources --plan $planFile --sdk $dist
 if ($LASTEXITCODE -ne 0) { throw 'PUBLISH_FAILED: SDK source copy failed' }
-& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc -IncludeDebugger -IncludeSelfhost
+& (Join-Path $PSScriptRoot 'stage_dev_toolchain.ps1') -Build $b -Dest $distTc `
+    -IncludeDebugger -IncludeSelfhost -BuildLocalDrivers:$BuildLocalDrivers
 
 # ---- release readme ---------------------------------------------------------
 Write-Output "[5/6] Writing README.txt + AI entry index ..."

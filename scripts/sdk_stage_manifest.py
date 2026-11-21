@@ -121,6 +121,17 @@ def expand_plan(plan):
     return [{"source": source, "destination": name} for name, source in sorted(result.items())]
 
 
+def add_build_local_drivers(plan, build):
+    repo = Path(plan["repo"]).resolve()
+    output = build / "local-drivers"
+    for path in identity.sdk_native_outputs(repo):
+        destination = Path(path).relative_to(repo)
+        suffix = destination.parts[-2:] if destination.parent.name == "static" else destination.parts[-1:]
+        source = output.joinpath(*suffix)
+        identity.required_identity(source)
+        plan["copies"].append({"source": str(source), "destination": destination.as_posix(), "tree": False})
+
+
 def gallery_refs(gallery):
     entries = gallery.get("entries")
     if not isinstance(entries, list):
@@ -648,9 +659,15 @@ def main():
     parser.add_argument("--native-input", action="append", type=Path, default=[])
     args = parser.parse_args()
     if args.mode == "gallery-plan":
+    parser.add_argument("--build-local-drivers", action="store_true")
         if not args.plan:
             parser.error("gallery-plan requires --plan")
-        identity.atomic_json(args.plan, gallery_plan(load(args.plan), complete=True))
+        plan = load(args.plan)
+        if args.build_local_drivers:
+            if not args.build:
+                parser.error("--build-local-drivers requires --build")
+            add_build_local_drivers(plan, args.build.resolve())
+        identity.atomic_json(args.plan, gallery_plan(plan, complete=True))
     elif args.mode == "native-inputs":
         repo = args.repo.resolve()
         known = {str((repo / os.fsdecode(p)).resolve()) for p in identity.git(repo, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0") if p}

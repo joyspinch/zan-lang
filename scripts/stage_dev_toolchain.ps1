@@ -6,7 +6,8 @@ param(
     [switch]$IncludeDebugger,
     [switch]$PreflightOnly,
     [string]$InputList = '',
-    [switch]$IncludeSelfhost
+    [switch]$IncludeSelfhost,
+    [switch]$BuildLocalDrivers
 )
 $ErrorActionPreference = 'Stop'
 # pwsh -> Python -> Windows PowerShell can inherit pwsh's incompatible Utility
@@ -68,22 +69,25 @@ $owners = @{
     zan_game = 'packages/Zan.Game/src/Game/Graphics/drivers'
 }
 foreach ($driver in @('zan_gui', 'zan_image', 'zan_audio', 'zan_game')) {
-    foreach ($name in @("$driver.dll", "$driver.lib", "lib$driver.dll.a")) { Add-StageInput (Join-Path $Build $name) $name }
+    Add-StageInput (Join-Path $Build "$driver.lib") "$driver.lib"
+    Add-StageInput (Join-Path $driverOutput "lib$driver.dll.a") "lib$driver.dll.a" -Required:$BuildLocalDrivers
     $owner = Join-Path (Join-Path $root $owners[$driver]) 'win-x64'
     $name = "$driver.bundle"
-    $bundle = Join-Path $Build $name
-    if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $owner $name }
+    $bundle = Join-Path $driverOutput $name
+    if (-not (Test-Path -LiteralPath $bundle -PathType Leaf)) { $bundle = Join-Path $fallback $name }
     Add-StageInput $bundle $name -Required
-    $runtimeDll = Join-Path $Build "$driver.dll"
-    if (-not (Test-Path -LiteralPath $runtimeDll -PathType Leaf)) { $runtimeDll = Join-Path $owner "$driver.dll" }
+    $runtimeDll = Join-Path $driverOutput "$driver.dll"
+    if (-not (Test-Path -LiteralPath $runtimeDll -PathType Leaf)) { $runtimeDll = Join-Path $fallback "$driver.dll" }
+$driverOutput = if ($BuildLocalDrivers) { Join-Path $Build 'local-drivers' } else { $Build }
     Add-StageInput $runtimeDll "$driver.dll" -Required
     if (Test-Path -LiteralPath $bundle -PathType Leaf) {
         foreach ($entry in (Get-Content -LiteralPath $bundle)) {
+    $fallback = if ($BuildLocalDrivers) { $driverOutput } else { $owner }
             if ($entry -match '^\s*([^#@\s]+)(?:\s+if\s+\S+)?\s*$') {
                 $payloadName = $Matches[1]
                 if ([IO.Path]::GetFileName($payloadName) -ne $payloadName) { throw "STAGE_FAILED: unsafe bundle payload: $payloadName" }
-                $payload = Join-Path $Build $payloadName
-                if (-not (Test-Path -LiteralPath $payload -PathType Leaf)) { $payload = Join-Path $owner $payloadName }
+                $payload = Join-Path $driverOutput $payloadName
+                if (-not (Test-Path -LiteralPath $payload -PathType Leaf)) { $payload = Join-Path $fallback $payloadName }
                 Add-StageInput $payload $payloadName -Required
             }
         }

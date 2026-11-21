@@ -3,7 +3,8 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$OutputPath = 'build\ZanIDE.exe',
     [string]$Version,
-    [switch]$SkipDesignGeneration
+    [switch]$SkipDesignGeneration,
+    [switch]$BuildLocalDrivers
 )
 
 $ErrorActionPreference = "Stop"
@@ -138,7 +139,13 @@ $clangDir = Split-Path -Parent $clangExe
 # ---- 1) independent native drivers (static, mingw ABI) -------------------
 # zanc selects archives from each module's driver directory by live imports.
 & (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static -Clang $clangExe `
-    -Drivers @("zan_gui", "zan_image", "zan_audio")
+    -Drivers @("zan_gui", "zan_image", "zan_audio") -BuildLocal:$BuildLocalDrivers
+if ($BuildLocalDrivers) {
+    # --driver-dir redirects every driver lookup, including the prebuilt SQLite archive.
+    $driverOutput = Join-Path $root 'build\local-drivers'
+    $sqlite = Join-Path $root 'packages\Zan.Data\src\System\Data\Sqlite\drivers\win-x64\static\libsqlite3.a'
+    Copy-Item -LiteralPath $sqlite -Destination (Join-Path $driverOutput 'static') -Force
+}
 
 # ---- 2) embedded resources (skins, help topics, ide.css) -------------------
 # Everything the IDE reads as data ships inside the exe and is looked up by name
@@ -295,6 +302,7 @@ if ($env:IDE_NO_PUBLISH -eq "1") { $zanArgs = $zanArgs -ne "--publish" }
 # ZAN_IDE_ZANC_ARGS="--arc-guard --check-leaks" when chasing a leak.
 $zanArgs += @("--no-arc-guard", "--no-check-leaks")
 $zanArgs += @("--auto-stdlib", "--link-mode", "static")
+if ($BuildLocalDrivers) { $zanArgs += @('--driver-dir', (Join-Path $root 'build\local-drivers')) }
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
 # Runtime/process system deps; each selected driver adds its own .libs closure.
 $zanArgs += @("--link-lib", "ws2_32", "--link-lib", "mswsock")

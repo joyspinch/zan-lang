@@ -4,6 +4,7 @@
 #         then powershell -File scripts/build_gui_driver.ps1.
 # Static: powershell -File scripts/build_gui_driver.ps1 -Static.
 # -StageRoot additionally creates a common --driver-dir (including /static).
+# -BuildLocal writes the x64 bundles under BuildDir/local-drivers.
 # Driver ownership manifests are maintained with the Zan modules, not here.
 param(
     [switch]$Static,
@@ -11,7 +12,8 @@ param(
     [string[]]$Drivers = @("zan_gui", "zan_image", "zan_audio", "zan_game"),
     [string]$BuildDir = "build",
     [string]$StageRoot = "",
-    [string]$Clang = "clang"
+    [string]$Clang = "clang",
+    [switch]$BuildLocal
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -32,6 +34,7 @@ $syslibs = @{
 foreach ($driver in $Drivers) {
     if (-not $owners.ContainsKey($driver)) { throw "UNKNOWN_NATIVE_DRIVER: $driver" }
 }
+if ($BuildLocal -and $Target -ne 'win-x64') { throw 'BuildLocal requires win-x64' }
 if ($StageRoot -and -not [IO.Path]::IsPathRooted($StageRoot)) { $StageRoot = Join-Path $root $StageRoot }
 
 function Invoke-Native([string]$tool, [string[]]$arguments) {
@@ -39,6 +42,7 @@ function Invoke-Native([string]$tool, [string[]]$arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$tool failed with exit code $LASTEXITCODE" }
 }
 function Driver-Dir([string]$driver) {
+    if ($BuildLocal) { return (Join-Path $build 'local-drivers') }
     Join-Path (Join-Path $root $owners[$driver]) $Target
 }
 function Write-Bundle([string]$driver, [string]$directory) {
@@ -120,14 +124,20 @@ if ($Static) {
         if (($dump -join "`n") -notmatch "file format $format") {
             throw "NATIVE_DLL_TARGET_MISMATCH: $dll must match $Target"
         }
-        Remove-Item -LiteralPath (Join-Path $build "lib$driver.dll.a") -Force -ErrorAction SilentlyContinue
-        $import = Join-Path $build "lib$driver.dll.a"
+        $importDir = if ($BuildLocal) { $directory } else { $build }
+        $import = Join-Path $importDir "lib$driver.dll.a"
+        Remove-Item -LiteralPath $import -Force -ErrorAction SilentlyContinue
         Invoke-Native "cmake" @("-DZAN_OBJDUMP=llvm-objdump", "-DDLL=$dll",
             "-DOUT=$import", "-DDEF_OUT=$(Join-Path $directory "$driver.def")",
             "-P", (Join-Path $root "cmake\zan_dll_import_lib.cmake"))
         if (-not (Test-Path -LiteralPath $import)) { throw "MISSING_NATIVE_IMPORT_LIB: $import" }
-        Copy-Item -LiteralPath $dll, $import -Destination $directory -Force
+        Copy-Item -LiteralPath $dll -Destination $directory -Force
+        if (-not $BuildLocal) { Copy-Item -LiteralPath $import -Destination $directory -Force }
         Write-Bundle $driver $directory
+        if ($BuildLocal -and $driver -eq 'zan_gui') {
+            $loader = Join-Path (Join-Path $root $owners[$driver]) "$Target\WebView2Loader.dll"
+            Copy-Item -LiteralPath $loader -Destination $directory -Force
+        }
         if ($StageRoot) {
             New-Item -ItemType Directory -Force -Path $StageRoot | Out-Null
             Copy-Item -LiteralPath $dll, $import, (Join-Path $directory "$driver.bundle") -Destination $StageRoot -Force

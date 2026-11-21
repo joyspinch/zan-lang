@@ -113,6 +113,12 @@ release.yml 的 LLVM 版本不再写在 workflow 里，而是从 `deps/checksums
   溢出和对象内已定义符号的 `undefined reference`。升级编译器时需连同链接器
   一起更新，只有新的 zanc.exe 而沿用旧工具链并不能修复这类链接失败。
 
+Windows x64 本地 SDK 构建可在共享构建闸内给 `build_gui_driver.ps1` 传入
+`-BuildLocal`，把新驱动写到 `build/local-drivers/`。准备、计划和封装各步都给
+`publish_ide.ps1` 传入 `-BuildLocalDrivers`。捕获构建输入时省略
+`-SdkNativeOutputs`，并用封装计划生成的产物清单封存本次驱动。SDK 的
+`packages/` 驱动束和 `toolchain/` 共享驱动都取自本次构建。
+
 ## Linux / macOS
 
 系统 clang 或 gcc + **LLVM 15 或更新**的开发包，`find_package(LLVM)` 能自动找到：
