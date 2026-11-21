@@ -470,6 +470,7 @@ LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
         LLVMValueRef a = emit_entry_alloca(g, lt, "out");
         zan_store_fit(g, LLVMConstNull(lt), a);
         local_add(locals, tgt->ident.name, a, dt);
+        locals->vars[locals->count - 1].binding_decl = arg;
         return a;
     }
     if (tgt && tgt->kind == AST_IDENTIFIER) {

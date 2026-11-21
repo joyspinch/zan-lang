@@ -201,55 +201,57 @@
         break;
 
     case AST_IF_STMT: {
-        int then_start = locals->count;
+        int condition_start = locals->count;
         LLVMValueRef cond = emit_expr(g, stmt->if_stmt.cond, locals);
         cond = zan_tobool(g->builder, cond, "tobool");
-        /* Pattern bindings belong to the condition on both outgoing edges.
-         * Emitting then cleanup mutates locals, so preserve those bindings
-         * for the false edge (including an if without an else body). */
-        int condition_count = locals->count - then_start;
+        int body_start = locals->count;
+        int condition_count = body_start - condition_start;
+        /* Both branches start with the original condition bindings. */
         local_var_t *condition_vars = NULL;
         if (condition_count > 0) {
-            condition_vars = (local_var_t *)zan_arena_alloc(g->arena,
+            condition_vars = zan_arena_alloc(g->arena,
                 sizeof(local_var_t) * (size_t)condition_count);
-            memcpy(condition_vars, locals->vars + then_start,
+            memcpy(condition_vars, locals->vars + condition_start,
                 sizeof(local_var_t) * (size_t)condition_count);
         }
 
         LLVMBasicBlockRef then_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "then");
-        LLVMBasicBlockRef else_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "else");
+        LLVMBasicBlockRef else_bb = NULL;
+        if (stmt->if_stmt.else_body || condition_count > 0)
+            else_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "else");
         LLVMBasicBlockRef merge_bb = LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "merge");
+        LLVMBuildCondBr(g->builder, cond, then_bb, else_bb ? else_bb : merge_bb);
 
-        LLVMBuildCondBr(g->builder, cond, then_bb,
-            (stmt->if_stmt.else_body || condition_count > 0) ? else_bb : merge_bb);
-
-        LLVMPositionBuilderAtEnd(g->builder, then_bb);
-        emit_stmt(g, stmt->if_stmt.then_body, locals);
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            emit_release_owned_locals_from(g, locals, then_start);
-            LLVMBuildBr(g->builder, merge_bb);
-        } else {
-            emit_release_owned_locals_from(g, locals, then_start);
-        }
-
-        if (condition_count > 0) {
-            memcpy(locals->vars + then_start, condition_vars,
-                sizeof(local_var_t) * (size_t)condition_count);
-            locals->count = then_start + condition_count;
-        }
-        int else_start = then_start;
-        LLVMPositionBuilderAtEnd(g->builder, else_bb);
-        if (stmt->if_stmt.else_body) {
-            emit_stmt(g, stmt->if_stmt.else_body, locals);
-        }
-        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-            emit_release_owned_locals_from(g, locals, else_start);
-            LLVMBuildBr(g->builder, merge_bb);
-        } else {
-            emit_release_owned_locals_from(g, locals, else_start);
+        LLVMBasicBlockRef branches[] = {then_bb, else_bb};
+        zan_ast_node_t *bodies[] = {stmt->if_stmt.then_body, stmt->if_stmt.else_body};
+        for (int branch = 0; branch < 2 && branches[branch]; branch++) {
+            if (branch == 1 && condition_count > 0) {
+                memcpy(locals->vars + condition_start, condition_vars,
+                    sizeof(local_var_t) * (size_t)condition_count);
+                locals->count = body_start;
+            }
+            LLVMPositionBuilderAtEnd(g->builder, branches[branch]);
+            emit_stmt(g, bodies[branch], locals);
+            emit_release_owned_locals_from(g, locals, body_start);
+            while (locals->count > condition_start) {
+                int i = locals->count - 1;
+                zan_ast_node_t *decl = locals->vars[i].binding_decl;
+                /* The enclosing block owns inline out bindings. */
+                if (decl && decl->kind == AST_REF_ARG)
+                    locals->count = i;
+                else
+                    emit_release_owned_locals_from(g, locals, i);
+            }
+            if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+                LLVMBuildBr(g->builder, merge_bb);
         }
 
         LLVMPositionBuilderAtEnd(g->builder, merge_bb);
+        for (int i = 0; i < condition_count; i++) {
+            zan_ast_node_t *decl = condition_vars[i].binding_decl;
+            if (decl && decl->kind == AST_REF_ARG)
+                locals->vars[locals->count++] = condition_vars[i];
+        }
         break;
     }
 

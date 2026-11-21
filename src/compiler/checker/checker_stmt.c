@@ -219,7 +219,16 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         if (stmt->if_stmt.else_body) {
             zan_checker_check_stmt(c, stmt->if_stmt.else_body);
         }
-        c->locals = saved_locals;
+        /* Inline out declarations belong to the enclosing block. */
+        c->locals = condition_locals;
+        struct checker_local **link = &c->locals;
+        while (*link != saved_locals) {
+            struct checker_local *local = *link;
+            if (local->decl && local->decl->kind == AST_REF_ARG)
+                link = &local->next;
+            else
+                *link = local->next;
+        }
         break;
     }
 
