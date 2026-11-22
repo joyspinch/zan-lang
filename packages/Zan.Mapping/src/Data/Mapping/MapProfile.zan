@@ -3,28 +3,7 @@ using System.Collections.Generic;
 
 namespace Data.Mapping;
 
-// **门面层**：显式映射档案——源类型 → 目标类型。
-//
-// 用法：
-// ```zan
-// MapProfile<Order, OrderDto> profile = new MapProfile<Order, OrderDto>(
-//     () => new OrderDto());
-// profile.Member("code", (Order s, OrderDto d) => { d.code = s.code; return d; });
-// profile.Member("customerName", (Order s, OrderDto d) => {
-//     d.customerName = s.customer.name; return d; });
-// OrderDto dto = profile.Map(order);
-// ```
-//
-// **为什么没有"按约定自动映射"**：Zan 没有运行期反射（没有 `typeof`、没有
-// 成员枚举），编译器在运行期拿不到"这个类型有哪些字段"。AutoMapper 那套
-// 靠约定自动匹配的体验，在这里只能放在**生成期**——`GenMapping` 读编译期
-// 导出的实体元数据，按约定配对成员，生成**显式**的映射函数源码。
-//
-// **为什么目标工厂必填**：Zan 目前不能 `new T()`——类型参数实例化会得到
-// null（静默错值，见 `TASKS.md` 记的编译器缺陷）。目标对象由调用方造，
-// 于是构造器怎么选（无参 / 带参 / 工厂方法）都是调用方的事。
-//
-// **非线程安全**：规则表是逐线程读写的状态；一个档案只在一个线程里用。
+// 显式映射档案：源类型 → 目标类型（由调用方提供目标工厂，非线程安全）。
 public class MapProfile<TSource, TTarget> {
     private List<MapRule<TSource, TTarget>> rules = new List<MapRule<TSource, TTarget>>();
     private Func<TTarget> factory;
@@ -34,10 +13,7 @@ public class MapProfile<TSource, TTarget> {
         this.factory = factory;
     }
 
-    // 注册一条成员映射规则（链式）。
-    //
-    // `apply` 吃源与目标、交还新的目标：类目标与结构体目标都能用
-    // （结构体是值语义，就地改会改在副本上）。
+    // 注册一条成员映射规则（链式，兼容类与值类型目标）。
     public MapProfile<TSource, TTarget> Member(string name, Func<TSource, TTarget, TTarget> apply) {
         this.rules.Add(new MapRule<TSource, TTarget>(name, apply));
         return this;
@@ -70,41 +46,38 @@ public class MapProfile<TSource, TTarget> {
         return r.Target;
     }
 
+    private static MappingResult<TTarget> Fail(MappingError err, string msg, string member) {
+        MappingResult<TTarget> res = new MappingResult<TTarget>();
+        res.IsError = true;
+        res.Error = err;
+        res.Message = msg;
+        res.Member = member;
+        return res;
+    }
+
     // 映射一条：不抛，返回结果对象。
     public MappingResult<TTarget> TryMap(TSource source) {
-        MappingResult<TTarget> res = new MappingResult<TTarget>();
         if (source == null) {
-            res.IsError = true;
-            res.Error = MappingError.SourceNull;
-            res.Message = "source is null";
-            return res;
+            return MapProfile<TSource, TTarget>.Fail(MappingError.SourceNull, "source is null", "");
         }
         if (this.factory == null) {
-            res.IsError = true;
-            res.Error = MappingError.InvalidFactory;
-            res.Message = "the profile has no target factory";
-            return res;
+            return MapProfile<TSource, TTarget>.Fail(MappingError.InvalidFactory, "the profile has no target factory", "");
         }
         TTarget target = this.factory();
         for (int i = 0; i < this.rules.Count; i = i + 1) {
             MapRule<TSource, TTarget> rule = this.rules[i];
             if (rule.Apply == null) {
-                res.IsError = true;
-                res.Error = MappingError.MemberFailed;
-                res.Member = rule.Name;
-                res.Message = "member '" + rule.Name + "' has no apply function";
-                return res;
+                return MapProfile<TSource, TTarget>.Fail(MappingError.MemberFailed,
+                    "member '" + rule.Name + "' has no apply function", rule.Name);
             }
             try {
                 target = rule.Apply(source, target);
             } catch (Exception e) {
-                res.IsError = true;
-                res.Error = MappingError.MemberFailed;
-                res.Member = rule.Name;
-                res.Message = "member '" + rule.Name + "' failed: " + e.Message;
-                return res;
+                return MapProfile<TSource, TTarget>.Fail(MappingError.MemberFailed,
+                    "member '" + rule.Name + "' failed: " + e.Message, rule.Name);
             }
         }
+        MappingResult<TTarget> res = new MappingResult<TTarget>();
         res.Target = target;
         return res;
     }
@@ -120,27 +93,22 @@ public class MapProfile<TSource, TTarget> {
 
     // 映射一个列表：不抛，返回结果对象（结果在 `Targets` 里）。
     public MappingResult<TTarget> TryMapList(List<TSource> sources) {
-        MappingResult<TTarget> res = new MappingResult<TTarget>();
         if (sources == null) {
-            res.IsError = true;
-            res.Error = MappingError.InvalidSourceList;
-            res.Message = "source list is null";
-            return res;
+            return MapProfile<TSource, TTarget>.Fail(MappingError.InvalidSourceList, "source list is null", "");
         }
         List<TTarget> outv = new List<TTarget>();
         for (int i = 0; i < sources.Count; i = i + 1) {
             MappingResult<TTarget> one = this.TryMap(sources[i]);
             if (one.IsError) {
-                res.IsError = true;
-                res.Error = one.Error;
-                res.Member = one.Member;
-                res.Message = "item " + i.ToString() + ": " + one.Message;
+                MappingResult<TTarget> res = MapProfile<TSource, TTarget>.Fail(
+                    one.Error, "item " + i.ToString() + ": " + one.Message, one.Member);
                 res.Targets = outv;
                 return res;
             }
             outv.Add(one.Target);
         }
-        res.Targets = outv;
-        return res;
+        MappingResult<TTarget> ok = new MappingResult<TTarget>();
+        ok.Targets = outv;
+        return ok;
     }
 }

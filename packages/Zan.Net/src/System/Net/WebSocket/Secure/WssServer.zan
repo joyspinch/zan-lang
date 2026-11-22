@@ -32,37 +32,29 @@ public class WssConnection : IDisposable {
         this.sendLock = new Mutex();
     }
 
-    // 异步发送文本帧（RFC 6455 Opcode 1）
-    public async int SendAsync(string text) {
-        if (!this.connected || text == null) { return -1; }
-        byte[] payload = text.ToBytes();
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, payload, payload.Length);
+    private async int SendRawFrameAsync(int opcode, byte[] data, int len) {
+        WsFrame frame = WsFrame.RawFrame(opcode, data, len);
         byte[] encoded = frame.Encode();
-        int frameLen = WsFrame.HeaderLen(payload.Length) + payload.Length;
-
+        int frameLen = WsFrame.HeaderLen(len) + len;
         this.sendLock.WaitOne();
         try {
-            int r = await this.stream.SendAsync(encoded, frameLen);
-            return r;
+            return await this.stream.SendAsync(encoded, frameLen);
         } finally {
             this.sendLock.ReleaseMutex();
         }
     }
 
+    // 异步发送文本帧（RFC 6455 Opcode 1）
+    public async int SendAsync(string text) {
+        if (!this.connected || text == null) { return -1; }
+        byte[] payload = text.ToBytes();
+        return await this.SendRawFrameAsync(WsOpcode.Text, payload, payload.Length);
+    }
+
     // 异步发送二进制帧（RFC 6455 Opcode 2）
     public async int SendBytesAsync(byte[] data, int len) {
         if (!this.connected || data == null || len <= 0) { return -1; }
-        WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
-        byte[] encoded = frame.Encode();
-        int frameLen = WsFrame.HeaderLen(len) + len;
-
-        this.sendLock.WaitOne();
-        try {
-            int r = await this.stream.SendAsync(encoded, frameLen);
-            return r;
-        } finally {
-            this.sendLock.ReleaseMutex();
-        }
+        return await this.SendRawFrameAsync(WsOpcode.Binary, data, len);
     }
 
     // 发送 Ping 探活帧（RFC 6455 Opcode 9）
@@ -152,9 +144,7 @@ public class WssServer : IDisposable {
         return server;
     }
 
-    // 注册每消息处理器；其返回值会发回
-    // 客户端。不注册时回退到 <see cref="OnMessage(string)"/>
-    // （子类重写路径，与 Worker 的 onMessage 同款）。
+    // 注册每消息处理器；不注册时回退到可重写的 OnMessage(string)。
     public WssServer OnMessage(WssMessageHandler handler) {
         this.messageHandler = handler;
         return this;
@@ -271,13 +261,8 @@ public class WssServer : IDisposable {
         this.Stop();
     }
 
-    // 单条连接的生命周期：TLS 握手 → WebSocket Upgrade（缺 Upgrade
-    // 或 Sec-WebSocket-Key 时回 400）→ 帧循环（Ping→Pong、Close 应答
-    // 并断开、协议违规回 1002/1009 关闭帧）；每条消息交
-    // OnMessageInternal，返回值按原 opcode 发回。任何退出路径都
-    // 关闭流与 socket 并归还连接计数——清理在 finally 中执行：
-    // 处理器抛出的异常会跳过顺序清理，泄漏 fd/SSL 与计数
-    // （计数漂移会让服务器在 maxConnections 处永久拒绝新连接）。
+    // 单条连接生命周期：TLS 握手 → WebSocket Upgrade → 帧循环（Ping/Pong、Close、异常关闭回 1002/1009）。
+    // finally 中统一关闭流/socket 并归还连接计数，避免泄漏或计数漂移。
     private async void HandleConnection(nint clientSock) {
         try {
             await this.HandleConnectionInner(clientSock);

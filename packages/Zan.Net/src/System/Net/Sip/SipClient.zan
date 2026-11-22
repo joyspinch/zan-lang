@@ -57,9 +57,7 @@ public class SipClient : IDisposable {
         return r;
     }
 
-    // 为 <paramref name="user"/> 发送 REGISTER，使用给定的
-    // 过期时间。响应原样返回：401/407 携带
-    // WWW-Authenticate 质询交由调用方处理。超时返回 null。
+    // 为 user 发送 REGISTER（给定过期时间）；401/407 质询原样返回，超时返回 null。
     public async SipMessage RegisterAsync(string user, int expires) {
         string target = "sip:" + this.host;
         SipMessage req = SipMessage.Request("REGISTER", target);
@@ -94,16 +92,10 @@ public class SipClient : IDisposable {
         call.SetState(SipCallState.Calling);
 
         SipMessage req = SipMessage.Request("INVITE", calleeUri);
-        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+        string branch = this.NewBranch(seq);
         call.SetInviteBranch(branch);
-        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
-        req.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
-        req.Add("Max-Forwards", "70");
-        req.Add("From", "<" + callerUri + ">;tag=" + this.localTag);
-        req.Add("To", "<" + calleeUri + ">");
-        req.Add("Call-ID", callId);
-        req.Add("CSeq", Convert.ToString(seq) + " INVITE");
-        req.Add("Contact", "<sip:" + callerUser + "@" + this.localIp + ":" + portStr + ">");
+        this.FillHeaders(req, branch, callerUri, this.localTag, calleeUri, "", callId, seq, "INVITE");
+        req.Add("Contact", "<sip:" + callerUser + "@" + this.localIp + ":" + this.PortStr() + ">");
         req.Add("Content-Type", "application/sdp");
         string sdpBody = localSdp.Serialize();
         req.SetBody(sdpBody);
@@ -199,17 +191,8 @@ public class SipClient : IDisposable {
     // 发送 ACK 确认请求。
     private async int SendAckAsync(UdpClient udp, SipCall call, string targetUri, string branch) {
         SipMessage ack = SipMessage.Request("ACK", targetUri);
-        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
-        ack.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
-        ack.Add("Max-Forwards", "70");
-        ack.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
-        string toHeader = "<" + call.GetCalleeUri() + ">";
-        if (call.GetRemoteTag().Length > 0) {
-            toHeader = toHeader + ";tag=" + call.GetRemoteTag();
-        }
-        ack.Add("To", toHeader);
-        ack.Add("Call-ID", call.GetCallId());
-        ack.Add("CSeq", Convert.ToString(call.GetCSeq()) + " ACK");
+        this.FillHeaders(ack, branch, call.GetCallerUri(), call.GetLocalTag(),
+            call.GetCalleeUri(), call.GetRemoteTag(), call.GetCallId(), call.GetCSeq(), "ACK");
         string wire = ack.Serialize();
         return await udp.SendToAsync(wire, this.host, this.port);
     }
@@ -221,18 +204,8 @@ public class SipClient : IDisposable {
 
         int seq = call.NextCSeq();
         SipMessage bye = SipMessage.Request("BYE", call.GetCalleeUri());
-        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
-        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
-        bye.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
-        bye.Add("Max-Forwards", "70");
-        bye.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
-        string toHeader = "<" + call.GetCalleeUri() + ">";
-        if (call.GetRemoteTag().Length > 0) {
-            toHeader = toHeader + ";tag=" + call.GetRemoteTag();
-        }
-        bye.Add("To", toHeader);
-        bye.Add("Call-ID", call.GetCallId());
-        bye.Add("CSeq", Convert.ToString(seq) + " BYE");
+        this.FillHeaders(bye, this.NewBranch(seq), call.GetCallerUri(), call.GetLocalTag(),
+            call.GetCalleeUri(), call.GetRemoteTag(), call.GetCallId(), seq, "BYE");
 
         SipMessage r = await TransactAsync(bye);
         call.Close();
@@ -248,19 +221,37 @@ public class SipClient : IDisposable {
         SipMessage cancel = SipMessage.Request("CANCEL", call.GetCalleeUri());
         string branch = call.GetInviteBranch();
         if (branch == null || branch.Length == 0) {
-            branch = "z9hG4bK" + this.localTag + Convert.ToString(call.GetCSeq()) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+            branch = this.NewBranch(call.GetCSeq());
         }
-        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
-        cancel.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
-        cancel.Add("Max-Forwards", "70");
-        cancel.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
-        cancel.Add("To", "<" + call.GetCalleeUri() + ">");
-        cancel.Add("Call-ID", call.GetCallId());
-        cancel.Add("CSeq", Convert.ToString(call.GetCSeq()) + " CANCEL");
+        this.FillHeaders(cancel, branch, call.GetCallerUri(), call.GetLocalTag(),
+            call.GetCalleeUri(), "", call.GetCallId(), call.GetCSeq(), "CANCEL");
 
         SipMessage r = await TransactAsync(cancel);
         call.Close();
         return r != null && r.GetStatus() == 200;
+    }
+
+    private string PortStr() {
+        return Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
+    }
+
+    private string NewBranch(int seq) {
+        return "z9hG4bK" + this.localTag + Convert.ToString(seq)
+            + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+    }
+
+    private void FillHeaders(SipMessage msg, string branch, string fromUri, string fromTag,
+        string toUri, string remoteTag, string callId, int seq, string method) {
+        msg.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + this.PortStr() + ";branch=" + branch);
+        msg.Add("Max-Forwards", "70");
+        msg.Add("From", "<" + fromUri + ">;tag=" + fromTag);
+        string toHeader = "<" + toUri + ">";
+        if (remoteTag != null && remoteTag.Length > 0) {
+            toHeader = toHeader + ";tag=" + remoteTag;
+        }
+        msg.Add("To", toHeader);
+        msg.Add("Call-ID", callId);
+        msg.Add("CSeq", Convert.ToString(seq) + " " + method);
     }
 
     // 填入每个请求都必须包含的头部（RFC 3261 8.1.1）：
@@ -268,16 +259,9 @@ public class SipClient : IDisposable {
     private void AddCommon(SipMessage req, string aor, string method) {
         int seq = this.cseq;
         this.cseq = this.cseq + 1;
-        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq)
-            + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
-        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : NetConstants.PortSip);
-        req.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
-        req.Add("Max-Forwards", "70");
-        req.Add("From", "<" + aor + ">;tag=" + this.localTag);
-        req.Add("To", "<" + aor + ">");
-        req.Add("Call-ID", this.localTag + "-" + Convert.ToString(seq) + "-"
-            + Convert.ToString(Stopwatch.GetMilliseconds()));
-        req.Add("CSeq", Convert.ToString(seq) + " " + method);
+        string callId = this.localTag + "-" + Convert.ToString(seq) + "-"
+            + Convert.ToString(Stopwatch.GetMilliseconds());
+        this.FillHeaders(req, this.NewBranch(seq), aor, this.localTag, aor, "", callId, seq, method);
     }
 
     // 非 INVITE 客户端事务：500ms 起重传并翻倍至 4s，

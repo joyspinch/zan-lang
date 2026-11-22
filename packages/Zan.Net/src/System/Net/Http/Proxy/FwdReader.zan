@@ -11,7 +11,7 @@ public class FwdReader {
     public bool eof;
     public int chunkBytes;
 
-    // <paramref name="chunkBytes"/> 为单批读取与转发的块大小（字节）。
+    // chunkBytes 为单批读取与转发的块大小（字节）。
     public FwdReader(FwdChannel ch, int chunkBytes) {
         this.ch = ch;
         this.buf = ByteBuffer.Alloc(chunkBytes);
@@ -32,58 +32,43 @@ public class FwdReader {
         return true;
     }
 
-    // 读到头块结束（含空行），正文仍留在原始字节缓冲中。
-    public async string ReadHeadAsync(int cap) {
+    private async string ReadUntilCrlfAsync(int cap, bool doubleCrlf) {
+        int tail = doubleCrlf ? 4 : 2;
         int scan = 0;
         while (true) {
             int len = this.buf.Length();
             int idx = this.buf.IndexOfByte(scan, 13);
-            while (idx >= 0 && idx + 3 < len) {
-                if (this.buf.ByteAt(idx + 1) == 10
-                    && this.buf.ByteAt(idx + 2) == 13
-                    && this.buf.ByteAt(idx + 3) == 10) {
+            while (idx >= 0 && idx + tail - 1 < len) {
+                bool match = this.buf.ByteAt(idx + 1) == 10;
+                if (match && doubleCrlf) {
+                    match = this.buf.ByteAt(idx + 2) == 13 && this.buf.ByteAt(idx + 3) == 10;
+                }
+                if (match) {
+                    int end = idx + tail;
                     int nul = this.buf.IndexOfByte(0, 0);
-                    if (idx + 4 > cap || (nul >= 0 && nul < idx + 4)) {
-                        return "";
-                    }
-                    string head = this.buf.Str(0, idx + 4);
-                    this.buf.Discard(idx + 4);
-                    return head;
+                    if (end > cap || (nul >= 0 && nul < end)) { return ""; }
+                    string s = this.buf.Str(0, end);
+                    this.buf.Discard(end);
+                    return s;
                 }
                 idx = this.buf.IndexOfByte(idx + 1, 13);
             }
             if (len >= cap) { return ""; }
-            scan = len - 3;
+            scan = len - (tail - 1);
             if (scan < 0) { scan = 0; }
             if (!await this.FillAsync()) { return ""; }
         }
         return "";
     }
 
+    // 读到头块结束（含空行），正文仍留在原始字节缓冲中。
+    public async string ReadHeadAsync(int cap) {
+        return await this.ReadUntilCrlfAsync(cap, true);
+    }
+
     // 读到行尾（含 CRLF），正文原样保留在缓冲中。
     public async string ReadLineAsync(int cap) {
-        int scan = 0;
-        while (true) {
-            int len = this.buf.Length();
-            int idx = this.buf.IndexOfByte(scan, 13);
-            while (idx >= 0 && idx + 1 < len) {
-                if (this.buf.ByteAt(idx + 1) == 10) {
-                    int nul = this.buf.IndexOfByte(0, 0);
-                    if (idx + 2 > cap || (nul >= 0 && nul < idx + 2)) {
-                        return "";
-                    }
-                    string line = this.buf.Str(0, idx + 2);
-                    this.buf.Discard(idx + 2);
-                    return line;
-                }
-                idx = this.buf.IndexOfByte(idx + 1, 13);
-            }
-            if (len >= cap) { return ""; }
-            scan = len - 1;
-            if (scan < 0) { scan = 0; }
-            if (!await this.FillAsync()) { return ""; }
-        }
-        return "";
+        return await this.ReadUntilCrlfAsync(cap, false);
     }
 
     // 取至多 max 个原始字节，返回真实字节数；0 表示 EOF。
