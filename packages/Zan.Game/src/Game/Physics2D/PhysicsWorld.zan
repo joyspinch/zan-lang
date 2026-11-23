@@ -3,41 +3,17 @@ using System.Collections.Generic;
 
 namespace Game.Physics2D;
 
-// 物理世界：刚体集合 + 宽相 + 窄相 + 顺序冲量求解器。
-//
-// 一个步（Step）内部：
-//   1. 关节的软约束力（弹簧）先累加
-//   2. 速度积分（重力、外力、阻尼）
-//   3. 宽相 → 窄相 → 接触流形（带推测距离）
-//   4. 接触预备（有效质量、力臂、目标法线速度）
-//   5. 热启动（复用上一步的冲量）
-//   6. 速度迭代（法线 + 摩擦）
-//   7. 位置积分
-//   8. 位置迭代（分离冲量修正穿透，不注入能量）
-//   9. 清空外力
-//
-// 确定性：接触顺序、关节顺序、迭代次数全部固定，没有随机数——同一初始
-// 条件 + 同一操作序列必然得到同一结果（回放 / 锁步的前提）。
+// 2D 确定性顺序冲量物理世界（含关节软约束、SAP 宽相、窄相流形与速度/位置迭代）。
 public class PhysicsWorld {
-    // 刚体（加入顺序即遍历顺序）。
     public List<RigidBody> bodies;
-    // 关节。
     public List<Joint> joints;
-    // 重力加速度。
     public Vec2 gravity;
-    // 速度迭代次数。
     public int velocityIterations;
-    // 位置迭代次数。
     public int positionIterations;
-    // 子步数（每步再切几段，数值更稳）。
     public int substepCount;
-    // 允许的穿透容差（小于它不修正，避免抖动）。
     public double linearSlop;
-    // 穿透修正比例（Baumgarte）。
     public double baumgarte;
-    // 推测距离：分离量在这个范围内也建接触，高速物体因此不被穿透。
     public double speculativeMargin;
-    // 弹性触发的接近速度阈值。
     public double restitutionThreshold;
 
     private int nextBodyId;
@@ -297,12 +273,7 @@ public class PhysicsWorld {
             this.contacts.RemoveAt(i);
             removed = true;
         }
-        if (!removed) { return; }
-        this.contactIndex.Clear();
-        for (int j = 0; j < this.contacts.Count; j = j + 1) {
-            long key = PhysicsWorld.ContactKey(this.contacts[j].bodyA.id, this.contacts[j].bodyB.id);
-            this.contactIndex[key] = j;
-        }
+        if (removed) { this.RebuildContactIndex(); }
     }
 
     // 清掉与某个刚体有关的接触。
@@ -314,7 +285,10 @@ public class PhysicsWorld {
             this.contacts.RemoveAt(i);
             removed = true;
         }
-        if (!removed) { return; }
+        if (removed) { this.RebuildContactIndex(); }
+    }
+
+    private void RebuildContactIndex() {
         this.contactIndex.Clear();
         for (int j = 0; j < this.contacts.Count; j = j + 1) {
             long key = PhysicsWorld.ContactKey(this.contacts[j].bodyA.id, this.contacts[j].bodyB.id);
@@ -369,7 +343,7 @@ public class PhysicsWorld {
         }
     }
 
-    // 热启动：把上一步累积的冲量先施加一遍。
+    // 热启动：施加前一步累积的冲量。
     private void WarmStart() {
         for (int i = 0; i < this.contacts.Count; i = i + 1) {
             Contact contact = this.contacts[i];
@@ -378,12 +352,7 @@ public class PhysicsWorld {
             for (int j = 0; j < contact.manifold.points.Count; j = j + 1) {
                 ContactPoint point = contact.manifold.points[j];
                 Vec2 impulseVec = normal * point.normalImpulse + tangent * point.tangentImpulse;
-                contact.bodyA.velocity = contact.bodyA.velocity - impulseVec * contact.bodyA.invMass;
-                contact.bodyA.angularVelocity = contact.bodyA.angularVelocity
-                    - contact.bodyA.invInertia * point.r1.Cross(impulseVec);
-                contact.bodyB.velocity = contact.bodyB.velocity + impulseVec * contact.bodyB.invMass;
-                contact.bodyB.angularVelocity = contact.bodyB.angularVelocity
-                    + contact.bodyB.invInertia * point.r2.Cross(impulseVec);
+                this.ApplyImpulse(contact, point, impulseVec);
             }
         }
     }

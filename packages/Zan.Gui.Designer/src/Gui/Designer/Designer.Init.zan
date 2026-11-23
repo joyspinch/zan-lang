@@ -1,0 +1,376 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Markup;
+
+namespace Gui.Designer;
+
+// Designer 模块：Designer 构造函数与初始交互/编辑状态装配
+partial class Designer {
+    Designer() {
+        this.designerSurface = new DesignerSurface(this);
+        this.designerSurfaceHost = new ControlInputHost(designerSurface);
+        this.designerActions = new List<DesignerCommandAction>();
+        this.fields = new List<FormField>();
+        this.sel = null;
+        this.selPrev = null;
+        this.doc = "";
+        this.msg = Designer.T("click a field type on the left to add a row", "点击左侧组件类型以添加一行");
+        this.inspTab = 0;
+        this.preview = false;
+        this.seq = 0;
+        this.activeContainer = null;
+        this.palFolded = new List<string>();
+        this.layoutMode = 0;
+        // 1000 = 100%：打开设计按真实尺寸编辑，超出视口的部分平移查看；
+        // 「适应」仍是缩放下拉里的一档，要看全貌时手动切。
+        this.winZoom = 1000;
+        this.lastFitPct = 1000;
+        this.zoomMenuOpen = false;
+        this.zoomMenuX = 0;
+        this.zoomMenuY = 0;
+        this.zoomMenuArm = false;
+        this.freeDragging = false;
+        this.freeResizing = false;
+        this.freeResizeH = 4;
+        this.freeDragDx = 0;
+        this.freeDragDy = 0;
+        this.freeDragStartX = 0;
+        this.freeDragStartY = 0;
+        this.freeDragHasMoved = false;
+        this.canvasMenuOpen = false;
+        this.canvasMenuX = 0;
+        this.canvasMenuY = 0;
+        this.canvasMenuArm = false;
+        this.canvasMenuHit = null;
+        this.freeGuideX = 0 - 1;
+        this.freeGuideY = 0 - 1;
+        this.hoverField = null;
+        this.freeSelPX = 0;
+        this.freeSelPY = 0;
+        this.showGrid = true;
+        this.snapGrid = true;
+        this.showRulers = true;
+        this.showGuides = true;
+        this.hGuides = new List<int>();
+        this.vGuides = new List<int>();
+        this.draggingGuideAxis = 0 - 1;
+        this.draggingGuideIdx = 0 - 1;
+        this.draggingGuidePos = 0;
+        this.gridSize = 8;
+        this.freePanX = 0;
+        this.freePanY = 0;
+        this.freePanning = false;
+        this.freeExtra = new List<FormField>();
+        this.palFolded = new List<string>();
+        this.palTab = 0;
+        this.outlineTv = null;
+        this.outlineNodes = new List<TreeNode>();
+        this.outlineFields = new List<FormField>();
+        this.outlineSyncing = false;
+        this.quickInsertOpen = false;
+        this.quickInsertInput = new Input();
+        DesignerCommandAction quickFilter = this.EnsureDesignerAction("quick.filter", 0);
+        DesignerCommandAction quickKeys = this.EnsureDesignerAction("quick.input", 0);
+        this.quickInsertInput.Change.Add(quickFilter.Run);
+        this.quickInsertInput.OnRouted(quickKeys.Pointer);
+        this.quickInsertMatches = new List<int>();
+        this.quickInsertLastQ = "";
+        this.quickInsertSelIdx = 0;
+        this.keymapHelpOpen = false;
+        this.undoStack = new List<DesignerDocumentSnapshot>();
+        this.redoStack = new List<DesignerDocumentSnapshot>();
+        this.undoActionStack = new List<string>();
+        this.redoActionStack = new List<string>();
+        this.pendingUndoAction = "";
+        this.clipFields = new List<string>();
+        this.freeHand = false;
+        this.freeMarquee = false;
+        this.freeMqSX = 0;
+        this.freeMqSY = 0;
+        this.freePanSX = 0;
+        this.freePanSY = 0;
+        this.freePanOX = 0;
+        this.freePanOY = 0;
+        this.winRound = false;
+        this.tabHits = new List<TabHeaderHit>();
+        this.labelPos = 0;
+        this.formSize = 1;
+        this.labelWidth = 92;
+        this.hideStar = false;
+        this.showSubmit = false;
+        this.showReset = false;
+        this.palClickPending = false;
+        this.palClickKind = 0;
+        this.palClickCustom = "";
+        this.dragging = false;
+        this.dragFromPalette = false;
+        this.dragCustomKind = "";
+        this.dragMoved = false;
+        this.dragKind = 0;
+        this.dragIndex = -1;
+        this.dropIndex = -1;
+        this.dropY = 0;
+        this.dragMouseX = 0;
+        this.dragMouseY = 0;
+        this.dropContainer = null;
+        this.dragUserComp = -1;
+        this.hoverFt = -1;
+        this.hoverX = 0;
+        this.hoverY = 0;
+        this.propGrid = new PropertyGrid();
+        WeakReference<Designer> w = new WeakReference<Designer>(this);
+        this.propGrid.OnBeforeChange((string propKey) => {
+            Designer self = w.Target;
+            if (self == null) { return; }
+            if (self.sel != null) {
+                self.GateInspectorUndo("pg|" + self.sel.fname + "|" + propKey);
+                if (propKey == "name") { self.inspectorNameBefore = self.sel.fname; }
+            } else {
+                self.GateInspectorUndo("win|" + propKey);
+            }
+        });
+        this.propGrid.OnChange(() => {
+            Designer self = w.Target;
+            if (self == null) { return; }
+            if (self.sel != null) {
+                string chKey = self.propGrid.ChangedKey();
+                bool isToolStrip = self.sel.ftype == 58 || self.sel.kind == "ToolStrip";
+                bool isStatusBar = self.sel.ftype == 59 || self.sel.kind == "StatusBar";
+                if (chKey == "name") {
+                    string oldName = self.inspectorNameBefore;
+                    string nextName = StyleSheet.Trim(self.sel.fname);
+                    self.inspectorNameBefore = "";
+                    if (nextName == "" || self.UsedFieldName(self.sel, nextName)) {
+                        self.sel.fname = oldName;
+                        self.sel.name = oldName;
+                        self.propGrid.Bind("fld" + Convert.ToString(self.inspKeySeq), self.FieldSpecs(self.sel));
+                        self.msg = Designer.T("A control with that name already exists.", "已有控件使用了该名称。");
+                    } else if (nextName != oldName) {
+                        self.renamedOldField = oldName;
+                        self.renamedNewField = nextName;
+                        self.sel.fname = nextName;
+                        self.sel.name = nextName;
+                        self.msg = Designer.T("Renamed variable: ", "已重命名变量: ") + nextName;
+                    }
+                } else if (chKey == "position") {
+                    if (isToolStrip || isStatusBar) {
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                        if (isStatusBar) { self.sel.dockSide = 2; }
+                        else if (self.sel.dockSide != 2) { self.sel.dockSide = 1; }
+                    } else if (self.sel.position == 1) {
+                        self.sel.dockSide = 0;
+                        if (self.sel.fw <= 0) { self.sel.fw = self.sel.LayoutW() > 0 ? self.sel.LayoutW() : 120; }
+                        if (self.sel.fh <= 0) { self.sel.fh = FormField.DefaultHFor(self.sel.ftype); }
+                    } else if (self.sel.position == 0 && self.sel.dockSide == 0 && self.layoutMode == 1) {
+                        self.sel.dockSide = 1;
+                    }
+                } else if (chKey == "dock") {
+                    if (isToolStrip) {
+                        int idx = self.propGrid.GetInt("dock", 0);
+                        self.sel.dockSide = (idx == 1) ? 2 : 1;
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                    } else if (isStatusBar) {
+                        self.sel.dockSide = 2;
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                    } else {
+                        if (self.sel.dockSide > 0) { self.sel.position = 0; }
+                        else if (self.layoutMode == 1) { self.sel.position = 1; }
+                    }
+                } else if (chKey == "h") {
+                    if (isStatusBar || isToolStrip) {
+                        if (self.sel.fh <= 0) { self.sel.fh = FormField.DefaultHFor(self.sel.ftype); }
+                        self.sel.dockSide = isStatusBar ? 2 : (self.sel.dockSide == 2 ? 2 : 1);
+                        self.sel.position = 0;
+                        self.sel.anchor = 0;
+                        self.sel.fx = 0;
+                    }
+                } else if (chKey == "span") {
+                    int span = self.propGrid.GetInt("span", self.sel.span);
+                    if (span < 1) { span = 1; }
+                    if (span > 24) { span = 24; }
+                    self.sel.span = span;
+                } else if (chKey == "activePage" && self.sel.kind == "Tabs") {
+                    int pages = self.sel.OptionCount();
+                    if (pages < 1) { pages = 1; }
+                    int page = self.propGrid.GetInt("activePage", 0);
+                    if (page < 0) { page = 0; }
+                    if (page >= pages) { page = pages - 1; }
+                    self.sel.uiState.Set(page);
+                } else if (chKey == "of" && (self.sel.ftype == 23 || self.sel.ftype == 41)) {
+                    string entity = StyleSheet.Trim(self.propGrid.Value("of"));
+                    if (entity == "") {
+                        if (self.sel.extra != null) {
+                            self.sel.extra.Remove("of");
+                            if (self.sel.extra.Count() == 0) { self.sel.extra = null; }
+                        }
+                    } else {
+                        if (self.sel.extra == null) { self.sel.extra = JsonValue.NewObject(); }
+                        self.sel.extra.Set("of", JsonValue.NewStr(entity));
+                    }
+                    self.ofEd = entity;
+                } else if (chKey == "bindingPath" || chKey == "bindingProperty") {
+                    string path = StyleSheet.Trim(self.propGrid.Value("bindingPath"));
+                    string property = StyleSheet.Trim(self.propGrid.Value("bindingProperty"));
+                    if (path == "") {
+                        if (self.sel.BindingCount > 0) { self.sel.RemoveBindingAt(0); }
+                    } else if (self.sel.BindingCount == 0) {
+                        if (property == "") { self.sel.BindPath(path); }
+                        else { self.sel.BindPath(path, property); }
+                    } else {
+                        self.sel.SetBindingPath(0, path);
+                        self.sel.SetBindingProperty(0, property);
+                    }
+                } else if (chKey == "flexWrap") {
+                    self.sel.flexWrap = self.propGrid.Value("flexWrap") == "true";
+                } else if (chKey == "w") {
+                }
+                self.DesignDeclareRect(self.sel);
+                if (self.freeExtra != null && self.freeExtra.Count > 0) {
+                    self.SyncBatchProps(self.sel, chKey);
+                }
+            } else {
+                string chKey = self.propGrid.ChangedKey();
+                if (chKey == "width" || chKey == "height") {
+                    int nw = self.propGrid.GetInt("width", self.winW);
+                    int nh = self.propGrid.GetInt("height", self.winH);
+                    self.ApplyDesignSize(nw, nh);
+                } else if (chKey == "device") {
+                    DeviceProfile selected = DeviceProfile.At(self.propGrid.GetInt("device", self.devSelIdx));
+                    self.ApplyDevice(selected);
+                } else if (chKey == "orient") {
+                    self.devOrient = self.propGrid.GetInt("orient", self.devOrient);
+                    self.ApplyDevice(DeviceProfile.ById(self.device));
+                } else if (chKey == "title") {
+                    if (self.winTitleInput != null) {
+                        self.winTitleInput.SetText(self.winTitle);
+                    }
+                } else if (chKey == "layoutMode") {
+                    self.SetLayoutMode(self.layoutMode);
+                }
+            }
+            self.MarkDocDirty();
+        });
+        this.inspKeySeq = 0;
+        this.optInput = new Input(Designer.T("new option", "新选项"));
+        this.optFieldInput = new Input(Designer.T("field", "字段"));
+        this.evtInput = new Input(Designer.T("handler", "处理器"));
+        this.evtEditing = "";
+        this.candidateHandlers = new List<string>();
+        this.activeEventDropdown = "";
+        this.eventEditRowsTarget = "";
+        this.eventEditRows = new List<EventEditRow>();
+        this.formNameInput = new Input(Designer.T("form name", "表单名称"));
+        this.formNameInput.SetText(Designer.T("My form", "我的表单"));
+        this.submitInput = new Input(Designer.T("handler", "处理器"));
+        this.inlineRenaming = false;
+        this.inlineRenameInput = new Input(Designer.T("Rename", "重命名"));
+        this.winTitle = Designer.T("Main Window", "主窗口");
+        this.winTitleInput = new Input(Designer.T("window title", "窗口标题"));
+        this.winTitleInput.Text = this.winTitle;
+        this.pvDocDirty = true;
+        this.winW = 480;
+        this.winH = 360;
+        this.designAppliedW = 480;
+        this.designAppliedH = 360;
+        this.winResizable = true;
+        // 新文档缺省是普通主窗体：winTool 落 true 会生成
+        // SetToolWindow(true)（WS_EX_TOOLWINDOW），窗口从此不进
+        // 任务栏——主程序窗体不在任务栏出现，看起来就是"窗口没
+        // 创建"。真要做工具窗口在检查器里打开这个开关。
+        this.winTool = false;
+        this.winTopMost = false;
+        this.winMinWidth = 0;
+        this.winMinHeight = 0;
+        this.winCenter = true;
+        this.winGlass = false;
+        this.winShape = 0;
+        this.winShapeRadius = 12;
+        this.winShapeSpec = "";
+        this.winChrome = true;
+        this.winOpacity = 100;
+        this.winShadow = 10;
+        this.docRole = "";
+        this.winPosX = 0;
+        this.winPosY = 0;
+        this.device = "";
+        this.devSelIdx = 0;
+        this.devOrient = 0;
+        this.winEvents = new List<EventBinding>();
+        this.winEvtEditing = "";
+        this.filterInput = new Input(Designer.T("filter…", "筛选…"));
+        this.inspFilterInput = new Input(Designer.T("filter properties…", "搜索属性/事件…"));
+        this.inspScroll = 0;
+        this.inspContentH = 0;
+        this.inspCategory = 0;
+        this.bindVars = new List<string>();
+        this.bindPickOpen = false;
+        this.evtRootPrev = false;
+        this.evtSelPrev = null;
+        this.jsonArea = new TextArea(Designer.T("read-only preview of the .html design document", ".html 设计稿只读预览")) { IsReadOnlyProp = true };
+        this.jsonOpen = false;
+        this.userComps = new List<UserComponent>();
+        this.saveCompRequested = false;
+        this.pvCompGen = 0;
+        this.compPropFor = "";
+        this.compPropDecls = new List<CompPropDecl>();
+        this.compPropEditFor = "";
+        this.compPropEditRows = new List<CompPropEditRow>();
+        this.openCompRequested = false;
+        this.openCompName = "";
+        this.rowsEdField = null;
+        this.propsEdField = null;
+        this.rowsEdSel = 0 - 1;
+        this.rowsEdSelPrev = 0 - 1;
+        this.propsEdSel = 0 - 1;
+        this.propsEdSelPrev = 0 - 1;
+        this.rowsEdGen = 0;
+        this.propsEdGen = 0;
+        this.rowsFilter = new Input(Designer.T("filter…", "筛选…"));
+        this.propsFilter = new Input(Designer.T("filter…", "筛选…"));
+        this.rowEdTitle = "";
+        this.rowEdField = "";
+        this.rowEdRight = false;
+        this.rowEdSep = false;
+        this.propEdKey = "";
+        this.propEdVal = "";
+        this.colEdWidth = 0;
+        this.colEdAlign = 0;
+        this.colEdType = 0;
+        this.colEdSortable = true;
+        this.colEdResizable = true;
+        this.colEdEditable = false;
+        this.colEdDecimals = 2;
+        this.colEdMoney = "";
+        this.colEdPercent = false;
+        this.colEdPrefix = "";
+        this.colEdSuffix = "";
+        this.colEdGrouped = false;
+        this.colEdSummary = 0;
+        this.colEdPin = 0;
+        this.colEdBand = "";
+        this.colEdClick = "";
+        this.toolEdClick = "";
+        this.ofEd = "";
+        this.edGridRows = null;
+        this.edGridProps = null;
+        this.iconHolder = new Input("");
+        this.iconPickTarget = null;
+        this.iconPickSearch = new Input(Designer.T("search icons", "搜索图标…"));
+        this.assetPicker = null;
+        this.assetPickTarget = null;
+        this.rowsScroll = 0;
+        this.propsScroll = 0;
+        this.showRulers = true;
+    }
+}

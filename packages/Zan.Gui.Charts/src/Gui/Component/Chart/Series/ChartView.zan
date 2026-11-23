@@ -31,9 +31,9 @@ public partial class ChartView : Control {
 
     // 保留式生命周期通知。图表仍由 Render 驱动，但调用方
     // 可以在创建后订阅，不必改写每个 renderer 的交互分支。
-    UiEvent Resized;
-    UiEvent Updated;
-    UiEvent Disposed;
+    public UiEvent Resized;
+    public UiEvent Updated;
+    public UiEvent Disposed;
     int lastRenderW;
     int lastRenderH;
     int directVersion;
@@ -43,61 +43,15 @@ public partial class ChartView : Control {
     bool disposed;
     ChartEventHub eventHub;
     ChartHit currentHit;
+    internal ChartHit lastHoverHit;
+    internal bool lastHoverOver;
     static ChartView activeEventView;
 
-    // —— 跨帧悬停槽（按 wid）——
-    // Keyed 每帧新建实例，悬停的跨帧状态（上一帧命中、指针是否
-    // 在图上）放在实例字段必然断档：fadeFocus 渐隐读不到上一帧
-    // 命中、enter/leave 每帧重触发。状态搬进 wid 键槽，实例可丢弃。
-    static List<int> hoverSlotWids;
-    static List<ChartHit> hoverSlotHits;
-    static List<int> hoverSlotOvers;
-
-    public static int HoverSlotIdx(int wid) {
-        if (ChartView.hoverSlotWids == null) { return 0 - 1; }
-        for (int i = 0; i < ChartView.hoverSlotWids.Count; i = i + 1) {
-            if (ChartView.hoverSlotWids[i] == wid) { return i; }
-        }
-        return 0 - 1;
-    }
-
-    // wid 槽记录的上一帧悬停命中（无则 null）。
-    public static ChartHit HoverSlotHit(int wid) {
-        int i = ChartView.HoverSlotIdx(wid);
-        return i < 0 ? null : ChartView.hoverSlotHits[i];
-    }
-
-    public static bool HoverSlotOver(int wid) {
-        int i = ChartView.HoverSlotIdx(wid);
-        return i >= 0 && ChartView.hoverSlotOvers[i] != 0;
-    }
-
-    public static void HoverSlotSet(int wid, ChartHit hit, bool over) {
-        if (ChartView.hoverSlotWids == null) {
-            ChartView.hoverSlotWids = new List<int>();
-            ChartView.hoverSlotHits = new List<ChartHit>();
-            ChartView.hoverSlotOvers = new List<int>();
-        }
-        int i = ChartView.HoverSlotIdx(wid);
-        if (i < 0) {
-            // 图表数量有限；换页孤儿槽到量即整表重建。
-            if (ChartView.hoverSlotWids.Count > 64) {
-                ChartView.hoverSlotWids = new List<int>();
-                ChartView.hoverSlotHits = new List<ChartHit>();
-                ChartView.hoverSlotOvers = new List<int>();
-            }
-            ChartView.hoverSlotWids.Add(wid);
-            ChartView.hoverSlotHits.Add(hit);
-            ChartView.hoverSlotOvers.Add(over ? 1 : 0);
-            return;
-        }
-        ChartView.hoverSlotHits[i] = hit;
-        ChartView.hoverSlotOvers[i] = over ? 1 : 0;
-    }
+    public ChartHit LastHoverHit() { return this.lastHoverHit; }
 
     // 初始化保留式生命周期字段（事件、动画/版本跟踪、事件 hub）。
     void InitLifecycle() {
-        this.InitControl("chartView", 0);
+        this.InitControl("chartView");
         this.InitRoutedInput();
         Resized = new UiEvent();
         Updated = new UiEvent();
@@ -111,6 +65,8 @@ public partial class ChartView : Control {
         disposed = false;
         eventHub = new ChartEventHub();
         currentHit = null;
+        lastHoverHit = null;
+        lastHoverOver = false;
         directStatus = "ready";
         directStatusMessage = "";
     }
@@ -139,31 +95,78 @@ public partial class ChartView : Control {
 
     static bool tailHooked;  // App 呈现尾段在准备阶段注册一次。
 
+    void InitWithOption(ChartOption o, int key, bool isStatic) {
+        if (o == null) { o = ChartOption.Create(); }
+        this.InitLifecycle();
+        this.option = o;
+        this.controller = null;
+        this.sourceOption = o;
+        this.initialOption = o.Clone();
+        this.staticFrame = isStatic;
+        this.wid = key;
+    }
+
+    void InitWithController(ChartController ctrl, int key) {
+        this.InitLifecycle();
+        this.controller = ctrl;
+        if (ctrl != null) {
+            this.option = ctrl.Option();
+            this.sourceOption = this.option;
+            this.initialOption = ctrl.GetOption();
+        } else {
+            this.option = ChartOption.Create();
+            this.sourceOption = this.option;
+            this.initialOption = this.option.Clone();
+        }
+        this.staticFrame = false;
+        this.wid = key;
+    }
+
+    public ChartView() {
+        this.InitWithOption(null, WidgetId.Next(), false);
+    }
+
+    public ChartView(ChartOption o) {
+        this.InitWithOption(o, WidgetId.Next(), false);
+    }
+
+    public ChartOption Option {
+        get { return this.controller != null ? this.controller.Option() : this.sourceOption; }
+        set { this.SetOption(value); }
+    }
+
+    public ChartController Controller {
+        get { return this.controller; }
+        set { this.BindController(value); }
+    }
+
+    public bool StaticFrame {
+        get { return this.staticFrame; }
+        set { this.staticFrame = value; }
+    }
+
+    public void BindController(ChartController next) {
+        if (this.disposed) { return; }
+        this.controller = next;
+        if (next != null) {
+            this.option = next.Option();
+            this.sourceOption = this.option;
+            this.initialOption = next.GetOption();
+            this.lastControllerVersion = 0 - 1;
+        }
+        this.Invalidate();
+    }
+
     // 绑定一个选项（内部深复制为 initialOption 供 Restore 用），
     // 动画/交互键取新 WidgetId。
     public static ChartView Of(ChartOption o) {
-        if (o == null) { o = ChartOption.Create(); }
-        ChartView v = new ChartView();
-        v.InitLifecycle();
-        v.option = o;
-        v.sourceOption = o;
-        v.initialOption = o != null ? o.Clone() : null;
-        v.staticFrame = false;
-        v.wid = WidgetId.Next();
-        return v;
+        return new ChartView(o);
     }
 
     // 绑定一个选项及调用方所有的稳定动画键。
     public static ChartView Keyed(ChartOption o, int key) {
-        if (o == null) { o = ChartOption.Create(); }
         ChartView v = new ChartView();
-        v.InitLifecycle();
-        v.option = o;
-        v.controller = null;
-        v.sourceOption = o;
-        v.initialOption = o != null ? o.Clone() : null;
-        v.staticFrame = false;
-        v.wid = key;
+        v.InitWithOption(o, key, false);
         return v;
     }
 
@@ -172,59 +175,68 @@ public partial class ChartView : Control {
     // 虚拟化单元格与滚动路径上的图表用它，避免卡片滚入视口时
     // 入场动画触发数百毫秒的连续重绘突发。
     public static ChartView KeyedStatic(ChartOption o, int key) {
-        ChartView v = ChartView.Keyed(o, key);
-        v.staticFrame = true;
+        ChartView v = new ChartView();
+        v.InitWithOption(o, key, true);
         return v;
     }
 
     // 将 ChartView 绑定到可变 controller。Render 时读取 controller 的当前 option。
     public static ChartView Bind(ChartController controller) {
         ChartView v = new ChartView();
-        v.InitLifecycle();
-        v.controller = controller;
-        if (controller != null) {
-            v.option = controller.Option(); v.sourceOption = v.option;
-            v.initialOption = controller.GetOption();
-        } else {
-            v.option = ChartOption.Create(); v.sourceOption = v.option;
-            v.initialOption = v.option != null ? v.option.Clone() : null;
-        }
-        v.staticFrame = false;
-        v.wid = WidgetId.Next();
+        v.InitWithController(controller, WidgetId.Next());
         return v;
     }
 
     // 带稳定交互键的 controller 绑定，适合列表和虚拟化单元格。
     public static ChartView BindKeyed(ChartController controller, int key) {
-        ChartView v = ChartView.Bind(controller);
-        v.wid = key;
+        ChartView v = new ChartView();
+        v.InitWithController(controller, key);
         return v;
     }
 
     // 生命周期事件：在保留的 ChartView 实例上订阅。
     // 尺寸回调：Render 帧检测到本图表宽高变化时触发。
-    public ChartView OnResize(Action a) { Resized.Add(a); return this; }
+    public void OnResize(Action a) { Resized.Add(a); }
     // 更新回调：Render 帧检测到 option/数据版本变化时触发。
-    public ChartView OnUpdated(Action a) { Updated.Add(a); return this; }
+    public void OnUpdated(Action a) { Updated.Add(a); }
     // 释放回调：Dispose 时触发一次，随后清空全部回调列表。
-    public ChartView OnDisposed(Action a) { Disposed.Add(a); return this; }
+    public void OnDisposed(Action a) { Disposed.Add(a); }
+
+    public override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Resize");
+        e.Add("Updated");
+        e.Add("Disposed");
+        return e;
+    }
+
+    public override void BindEvent(string evt, Action a) {
+        if (evt == "Resize") { Resized.Add(a); return; }
+        if (evt == "Updated") { Updated.Add(a); return; }
+        if (evt == "Disposed") { Disposed.Add(a); return; }
+        base.BindEvent(evt, a);
+    }
+
+    public override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "Resize") { Resized.AddS(a); return; }
+        if (evt == "Updated") { Updated.AddS(a); return; }
+        if (evt == "Disposed") { Disposed.AddS(a); return; }
+        base.BindEventS(evt, a);
+    }
 
     // 注册/移除带载荷的图表交互事件。
-    public ChartView On(ChartEventType type, ChartInteractionHandler handler) {
+    public void On(ChartEventType type, ChartInteractionHandler handler) {
         if (!this.disposed) { this.eventHub.On(type, handler); }
-        return this;
     }
 
     // 注销一个交互事件处理器（按引用匹配最近一个；disposed 后 no-op）。
-    public ChartView Off(ChartEventType type, ChartInteractionHandler handler) {
+    public void Off(ChartEventType type, ChartInteractionHandler handler) {
         if (!this.disposed) { this.eventHub.Off(type, handler); }
-        return this;
     }
 
-    // 注销全部交互事件处理器；disposed 后为 no-op。返回 this 便于链式。
-    public ChartView ClearEvents() {
+    // 注销全部交互事件处理器；disposed 后为 no-op。
+    public void ClearEvents() {
         if (!this.disposed) { this.eventHub.Clear(); }
-        return this;
     }
 
     // 派发交互事件：先发给自身 eventHub 订阅者，controller 绑定
@@ -363,8 +375,8 @@ public partial class ChartView : Control {
             hit.pixelX = this.pointerX;
             hit.pixelY = this.pointerY;
         }
-        bool wasOver = ChartView.HoverSlotOver(this.wid);
-        ChartHit prevHit = ChartView.HoverSlotHit(this.wid);
+        bool wasOver = this.lastHoverOver;
+        ChartHit prevHit = this.lastHoverHit;
         bool entered = over && !wasOver;
         bool left = !over && wasOver;
         bool hitChanged = !ChartHit.Same(prevHit, hit);
@@ -390,34 +402,33 @@ public partial class ChartView : Control {
             ChartEventType.MouseOut, this.wid, this.pointerX, this.pointerY);
             this.RaiseInteraction(me2);
         }
-        ChartView.HoverSlotSet(this.wid,
-        hit == null ? null : ChartHit.Copy(hit), over);
+        this.lastHoverHit = hit == null ? null : ChartHit.Copy(hit);
+        this.lastHoverOver = over;
     }
 
-    // 按事件类型注册交互处理器（Click/Hover/LegendSelected/…），
-    // 组文档覆盖以下 17 个链式方法，各自对应一个 ChartEventType。
-    public ChartView OnClick(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.Click, handler);
+    // 按事件类型注册交互处理器（Click/Hover/LegendSelected/…）。
+    public void OnClick(ChartInteractionHandler handler) {
+        this.On(ChartEventType.Click, handler);
     }
     // 注册 DoubleClick 交互事件：双击时派发，命中元素或整图坐标。
-    public ChartView OnDoubleClick(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.DoubleClick, handler);
+    public void OnDoubleClick(ChartInteractionHandler handler) {
+        this.On(ChartEventType.DoubleClick, handler);
     }
     // 注册 LegendSelected 交互事件：图例项被选中。
-    public ChartView OnLegendSelected(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.LegendSelected, handler);
+    public void OnLegendSelected(ChartInteractionHandler handler) {
+        this.On(ChartEventType.LegendSelected, handler);
     }
     // 注册 Refresh 交互事件。
-    public ChartView OnRefresh(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.Refresh, handler);
+    public void OnRefresh(ChartInteractionHandler handler) {
+        this.On(ChartEventType.Refresh, handler);
     }
     // 注册 Restore 交互事件：还原初始 option 时派发。
-    public ChartView OnRestore(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.Restore, handler);
+    public void OnRestore(ChartInteractionHandler handler) {
+        this.On(ChartEventType.Restore, handler);
     }
     // 注册 DataChanged 交互事件：option/数据版本变化时派发。
-    public ChartView OnDataChanged(ChartInteractionHandler handler) {
-        return this.On(ChartEventType.DataChanged, handler);
+    public void OnDataChanged(ChartInteractionHandler handler) {
+        this.On(ChartEventType.DataChanged, handler);
     }
 
     // 返回 option 快照；controller 绑定和直接 option 两种模式都不暴露
@@ -447,8 +458,8 @@ public partial class ChartView : Control {
     public bool IsDisposed() { return this.disposed; }
 
     // 替换 option；绑定 controller 时保留 controller 身份。
-    public ChartView SetOption(ChartOption next) {
-        if (this.disposed || next == null) { return this; }
+    public void SetOption(ChartOption next) {
+        if (this.disposed || next == null) { return; }
         if (this.controller != null) { this.controller.SetOption(next); }
         else {
             this.sourceOption = next; this.option = next;
@@ -456,17 +467,15 @@ public partial class ChartView : Control {
             this.directStatus = "ready"; this.directStatusMessage = "";
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
-    // 立即模式的显式刷新入口。Render 每帧都会读取最新 option，
-    // 因此这里仅提供与 ECharts refresh() 对齐的可链式语义。
-    public ChartView Refresh() { return this; }
+    // 显式刷新入口。
+    public void Refresh() { this.Invalidate(); }
 
     // 还原为创建/最近一次 SetOption 时的 initialOption 深拷贝，
     // 并触发 Restore 事件（controller 模式转发 controller.Restore）。
-    public ChartView Restore() {
-        if (this.disposed) { return this; }
+    public void Restore() {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.Restore(); }
         else {
             this.sourceOption = this.initialOption != null ? this.initialOption.Clone() : null; this.option = this.sourceOption;
@@ -476,12 +485,11 @@ public partial class ChartView : Control {
             ChartEventType.Restore, this.wid);
             this.RaiseInteraction(re);
         }
-        return this;
     }
 
     // 清空所有系列的 data 列表并把状态置 "empty"（不销毁系列外壳）。
-    public ChartView Clear() {
-        if (this.disposed) { return this; }
+    public void Clear() {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.Clear(); }
         else {
             for (int i = 0; i < this.sourceOption.series.Count; i = i + 1) {
@@ -490,51 +498,46 @@ public partial class ChartView : Control {
             this.directStatus = "empty"; this.directStatusMessage = "";
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
     // 置 "loading" 状态并显示 message（Render 时由状态层覆盖呈现）。
-    public ChartView ShowLoading(string message) {
-        if (this.disposed) { return this; }
+    public void ShowLoading(string message) {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.ShowLoading(message); }
         else {
             this.directStatus = "loading"; this.directStatusMessage = message;
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
     // 结束 loading，恢复 "ready"。
-    public ChartView HideLoading() {
-        if (this.disposed) { return this; }
+    public void HideLoading() {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.HideLoading(); }
         else {
             this.directStatus = "ready"; this.directStatusMessage = "";
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
     // 置 "empty" 状态并自定义空态文案。
-    public ChartView SetEmptyMessage(string message) {
-        if (this.disposed) { return this; }
+    public void SetEmptyMessage(string message) {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.SetEmptyMessage(message); }
         else {
             this.directStatus = "empty"; this.directStatusMessage = message;
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
     // 置 "error" 状态并自定义错误文案。
-    public ChartView SetErrorMessage(string message) {
-        if (this.disposed) { return this; }
+    public void SetErrorMessage(string message) {
+        if (this.disposed) { return; }
         if (this.controller != null) { this.controller.SetErrorMessage(message); }
         else {
             this.directStatus = "error"; this.directStatusMessage = message;
             this.directVersion = this.directVersion + 1;
         }
-        return this;
     }
 
     // 释放 view 的事件订阅并使后续 Render/操作失效。
@@ -544,6 +547,9 @@ public partial class ChartView : Control {
         if (preparedPanel != null) { preparedPanel.Release(this.App); preparedPanel = null; }
         this.disposed = true;
         this.directStatus = "disposed"; this.directStatusMessage = "";
+        this.currentHit = null;
+        this.lastHoverHit = null;
+        this.lastHoverOver = false;
         if (this.Disposed.Count() > 0) { this.Disposed.Raise(); }
         this.Resized.Clear(); this.Updated.Clear();
         if (ChartView.activeEventView == this) { ChartView.activeEventView = null; }

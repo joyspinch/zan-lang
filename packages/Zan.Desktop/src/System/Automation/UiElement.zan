@@ -22,15 +22,8 @@ public delegate void SysFreeStringFn(nint bstr);
 // SysAllocString — 创建 COM BSTR。
 public delegate nint SysAllocStringFn(nint wide);
 
-// MSAA (IAccessible) 无障碍元素:从窗口或屏幕坐标取 UI 元素,遍历子元素,
-// 按名称/角色查找,读名称/值/角色/状态/矩形,执行默认动作/选中/聚焦/设值。
-// UiElement btn = root.FindFirst("保存", UiElement.RolePushButton());
-// btn.Invoke();            // 模拟点击
-// btn.Dispose();
-// 引用语义:每个 UiElement 拥有一个 IAccessible 引用,用完必须 Dispose();
-// Children/Parent/HitTest/FindAll 返回的元素都是新引用,各自 Dispose。
-// 简单元素(无独立 IAccessible 的文本等)借用父对象,仍持有独立引用,安全。
-// Windows 仅;其他平台抛 PlatformNotSupportedException。
+// MSAA (IAccessible) 无障碍元素封装（仅 Windows；其他平台抛 PlatformNotSupportedException）。
+// 每个 UiElement 持有独立 IAccessible 引用，工厂及树遍历/查找返回的新引用均须各自 Dispose()。
 public class UiElement : IDisposable {
     #if WINDOWS
     // ---- IAccessible vtable 槽位(IDispatch 0-6 + IAccessible 7-29) ----
@@ -195,7 +188,7 @@ public class UiElement : IDisposable {
         nint riid = Com.Guid(IID_IACCESSIBLE);
         nint cell = NativeMemory.Alloc(8);
         nint acc = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cell, 1)[0] = 0;
             nint fn = UiElement.FromWindowFn();
@@ -221,8 +214,8 @@ public class UiElement : IDisposable {
         if (acc == 0) { return new UiElement((nint)0, 0); }
         return new UiElement(acc, CHILD_SELF);
         #else
-        throw new PlatformNotSupportedException(
-            "UiElement (MSAA/IAccessible) is only supported on Windows. Linux/macOS requires AT-SPI or Accessibility bindings.");
+        UiElement.ThrowNotSupported();
+        return new UiElement((nint)0, 0);
         #endif
     }
 
@@ -235,7 +228,7 @@ public class UiElement : IDisposable {
         nint vcell = NativeMemory.Alloc(24);
         nint acc = 0;
         int child = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cell, 1)[0] = 0;
             NativeMemory.Fill(vcell, 0, 24);
@@ -257,8 +250,8 @@ public class UiElement : IDisposable {
         if (acc == 0) { return new UiElement((nint)0, 0); }
         return new UiElement(acc, child);
         #else
-        throw new PlatformNotSupportedException(
-            "UiElement (MSAA/IAccessible) is only supported on Windows. Linux/macOS requires AT-SPI or Accessibility bindings.");
+        UiElement.ThrowNotSupported();
+        return new UiElement((nint)0, 0);
         #endif
     }
 
@@ -296,17 +289,16 @@ public class UiElement : IDisposable {
 
     // ---- 属性 ----
 
-    // 无障碍名称(通常就是控件文本)。
-    public string Name() {
-        #if WINDOWS
+    #if WINDOWS
+    private string GetBstrProp(int slot) {
         if (acc == 0) { return ""; }
         nint cell = NativeMemory.Alloc(8);
         nint child = UiElement.ChildVariant(childId);
         nint bstr = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cell, 1)[0] = 0;
-            hr = Com.Call2(acc, SLOT_NAME, child, cell);
+            hr = Com.Call2(acc, slot, child, cell);
             bstr = new Span<long>(cell, 1)[0];
         } finally {
             NativeMemory.Free(child);
@@ -314,6 +306,31 @@ public class UiElement : IDisposable {
         }
         if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
         return UiElement.TakeBstr(bstr);
+    }
+
+    private int GetIntProp(int slot) {
+        if (acc == 0) { return 0; }
+        nint v = NativeMemory.Alloc(24);
+        nint child = UiElement.ChildVariant(childId);
+        int val = 0;
+        try {
+            NativeMemory.Fill(v, 0, 24);
+            int hr = Com.Call2(acc, slot, child, v);
+            if (Com.Ok(hr) && new Span<short>(v, 1)[0] == VT_I4) {
+                val = new Span<int>(v + 8, 1)[0];
+            }
+        } finally {
+            NativeMemory.Free(child);
+            NativeMemory.Free(v);
+        }
+        return val;
+    }
+    #endif
+
+    // 无障碍名称(通常就是控件文本)。
+    public string Name() {
+        #if WINDOWS
+        return this.GetBstrProp(SLOT_NAME);
         #else
         return "";
         #endif
@@ -322,21 +339,7 @@ public class UiElement : IDisposable {
     // 无障碍值(编辑框文本、滚动条位置等);无值返回 ""。
     public string Value() {
         #if WINDOWS
-        if (acc == 0) { return ""; }
-        nint cell = NativeMemory.Alloc(8);
-        nint child = UiElement.ChildVariant(childId);
-        nint bstr = 0;
-        int hr = 0 - 1;
-        try {
-            new Span<long>(cell, 1)[0] = 0;
-            hr = Com.Call2(acc, SLOT_VALUE, child, cell);
-            bstr = new Span<long>(cell, 1)[0];
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(cell);
-        }
-        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
-        return UiElement.TakeBstr(bstr);
+        return this.GetBstrProp(SLOT_VALUE);
         #else
         return "";
         #endif
@@ -345,21 +348,7 @@ public class UiElement : IDisposable {
     // 无障碍描述;无则返回 ""。
     public string Description() {
         #if WINDOWS
-        if (acc == 0) { return ""; }
-        nint cell = NativeMemory.Alloc(8);
-        nint child = UiElement.ChildVariant(childId);
-        nint bstr = 0;
-        int hr = 0 - 1;
-        try {
-            new Span<long>(cell, 1)[0] = 0;
-            hr = Com.Call2(acc, SLOT_DESCRIPTION, child, cell);
-            bstr = new Span<long>(cell, 1)[0];
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(cell);
-        }
-        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
-        return UiElement.TakeBstr(bstr);
+        return this.GetBstrProp(SLOT_DESCRIPTION);
         #else
         return "";
         #endif
@@ -368,21 +357,7 @@ public class UiElement : IDisposable {
     // 角色码(ROLE_SYSTEM_*);无对象返回 0。
     public int Role() {
         #if WINDOWS
-        if (acc == 0) { return 0; }
-        nint v = NativeMemory.Alloc(24);
-        nint child = UiElement.ChildVariant(childId);
-        int role = 0;
-        try {
-            NativeMemory.Fill(v, 0, 24);
-            int hr = Com.Call2(acc, SLOT_ROLE, child, v);
-            if (Com.Ok(hr) && new Span<short>(v, 1)[0] == VT_I4) {
-                role = new Span<int>(v + 8, 1)[0];
-            }
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(v);
-        }
-        return role;
+        return this.GetIntProp(SLOT_ROLE);
         #else
         return 0;
         #endif
@@ -391,21 +366,7 @@ public class UiElement : IDisposable {
     // 状态位(STATE_SYSTEM_* 的组合);无对象返回 0。
     public int State() {
         #if WINDOWS
-        if (acc == 0) { return 0; }
-        nint v = NativeMemory.Alloc(24);
-        nint child = UiElement.ChildVariant(childId);
-        int state = 0;
-        try {
-            NativeMemory.Fill(v, 0, 24);
-            int hr = Com.Call2(acc, SLOT_STATE, child, v);
-            if (Com.Ok(hr) && new Span<short>(v, 1)[0] == VT_I4) {
-                state = new Span<int>(v + 8, 1)[0];
-            }
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(v);
-        }
-        return state;
+        return this.GetIntProp(SLOT_STATE);
         #else
         return 0;
         #endif
@@ -439,21 +400,7 @@ public class UiElement : IDisposable {
     // 默认动作描述(按钮的"Press"等);无则返回 ""。
     public string DefaultAction() {
         #if WINDOWS
-        if (acc == 0) { return ""; }
-        nint cell = NativeMemory.Alloc(8);
-        nint child = UiElement.ChildVariant(childId);
-        nint bstr = 0;
-        int hr = 0 - 1;
-        try {
-            new Span<long>(cell, 1)[0] = 0;
-            hr = Com.Call2(acc, SLOT_DEFAULT_ACTION, child, cell);
-            bstr = new Span<long>(cell, 1)[0];
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(cell);
-        }
-        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
-        return UiElement.TakeBstr(bstr);
+        return this.GetBstrProp(SLOT_DEFAULT_ACTION);
         #else
         return "";
         #endif
@@ -462,21 +409,7 @@ public class UiElement : IDisposable {
     // 快捷键描述(如 "Alt+F");无则返回 ""。
     public string KeyboardShortcut() {
         #if WINDOWS
-        if (acc == 0) { return ""; }
-        nint cell = NativeMemory.Alloc(8);
-        nint child = UiElement.ChildVariant(childId);
-        nint bstr = 0;
-        int hr = 0 - 1;
-        try {
-            new Span<long>(cell, 1)[0] = 0;
-            hr = Com.Call2(acc, SLOT_KEYBOARD_SHORTCUT, child, cell);
-            bstr = new Span<long>(cell, 1)[0];
-        } finally {
-            NativeMemory.Free(child);
-            NativeMemory.Free(cell);
-        }
-        if (!Com.Ok(hr)) { UiElement.FreeBstr(bstr); return ""; }
-        return UiElement.TakeBstr(bstr);
+        return this.GetBstrProp(SLOT_KEYBOARD_SHORTCUT);
         #else
         return "";
         #endif
@@ -492,7 +425,7 @@ public class UiElement : IDisposable {
         nint ch = NativeMemory.Alloc(8);
         nint child = UiElement.ChildVariant(childId);
         WindowRect r = new WindowRect(0, 0, 0, 0);
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cx, 1)[0] = 0;
             new Span<long>(cy, 1)[0] = 0;
@@ -524,7 +457,7 @@ public class UiElement : IDisposable {
         if (acc == 0 || childId != CHILD_SELF) { return 0; }
         nint cell = NativeMemory.Alloc(8);
         int n = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cell, 1)[0] = 0;
             hr = Com.Call1(acc, SLOT_CHILD_COUNT, cell);
@@ -612,7 +545,7 @@ public class UiElement : IDisposable {
         if (acc == 0) { return new UiElement((nint)0, 0); }
         nint cell = NativeMemory.Alloc(8);
         nint pdisp = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             new Span<long>(cell, 1)[0] = 0;
             hr = Com.Call1(acc, SLOT_PARENT, cell);
@@ -637,7 +570,7 @@ public class UiElement : IDisposable {
         nint v = NativeMemory.Alloc(24);
         int vt = 0;
         nint raw = 0;
-        int hr = 0 - 1;
+        int hr = -1;
         try {
             NativeMemory.Fill(v, 0, 24);
             hr = Com.Call3(acc, SLOT_HIT_TEST,
@@ -731,14 +664,20 @@ public class UiElement : IDisposable {
         #endif
     }
 
+    #if WINDOWS
+    private bool SelectWithFlag(nint flags) {
+        if (acc == 0) { return false; }
+        nint child = UiElement.ChildVariant(childId);
+        int hr = Com.Call2(acc, SLOT_SELECT, flags, child);
+        NativeMemory.Free(child);
+        return Com.Ok(hr);
+    }
+    #endif
+
     // 选中并聚焦(SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION)。
     public bool Select() {
         #if WINDOWS
-        if (acc == 0) { return false; }
-        nint child = UiElement.ChildVariant(childId);
-        int hr = Com.Call2(acc, SLOT_SELECT, (nint)3, child);
-        NativeMemory.Free(child);
-        return Com.Ok(hr);
+        return this.SelectWithFlag((nint)3);
         #else
         UiElement.ThrowNotSupported();
         return false;
@@ -748,11 +687,7 @@ public class UiElement : IDisposable {
     // 聚焦(SELFLAG_TAKEFOCUS)。
     public bool Focus() {
         #if WINDOWS
-        if (acc == 0) { return false; }
-        nint child = UiElement.ChildVariant(childId);
-        int hr = Com.Call2(acc, SLOT_SELECT, (nint)1, child);
-        NativeMemory.Free(child);
-        return Com.Ok(hr);
+        return this.SelectWithFlag((nint)1);
         #else
         UiElement.ThrowNotSupported();
         return false;

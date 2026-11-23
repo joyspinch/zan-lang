@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using System.Threading;
 
 namespace System.Input;
@@ -169,10 +170,9 @@ public class Background {
     // 支持中文等多字节 UTF-8 字符;一次一个字符。
     public static bool SendChar(nint hwnd, string ch) {
         #if WINDOWS
-        if (hwnd == 0) { return false; }
-        int w = Background.CharWidth(ch);
-        if (w <= 0) { return false; }
-        int cp = Keyboard.CodeOf(ch);
+        if (hwnd == 0 || ch == null || ch.Length == 0) { return false; }
+        long res = Encoding.DecodeCodePointFast(ch, 0);
+        int cp = (int)(res & 0xFFFFFFFFL);
         return Background.SendCodePoint(hwnd, cp);
         #else
         Background.ThrowNotSupported();
@@ -184,16 +184,15 @@ public class Background {
     // 两个 UTF-16 单元)。返回是否全部投递成功。
     public static bool SendText(nint hwnd, string text) {
         #if WINDOWS
-        if (hwnd == 0) { return false; }
+        if (hwnd == 0 || text == null) { return false; }
         bool ok = true;
         int i = 0;
         while (i < text.Length) {
-            string ch = text.Substring(i, 1);
-            int w = Background.CharWidth(ch);
-            if (w <= 0) { i = i + 1; continue; }
-            if (!Background.SendCodePoint(hwnd, Keyboard.CodeOf(text.Substring(i, w)))) {
-                ok = false;
-            }
+            long res = Encoding.DecodeCodePointFast(text, i);
+            int w = (int)(res >> 32);
+            if (w <= 0) { break; }
+            int cp = (int)(res & 0xFFFFFFFFL);
+            if (!Background.SendCodePoint(hwnd, cp)) { ok = false; }
             i = i + w;
         }
         return ok;
@@ -208,14 +207,15 @@ public class Background {
     // 按键发,其余文本按 WM_CHAR 发。
     public static bool SendMacro(nint hwnd, string macro) {
         #if WINDOWS
-        if (hwnd == 0) { return false; }
+        if (hwnd == 0 || macro == null) { return false; }
         List<int> held = new List<int>();
         bool ok = true;
         int i = 0;
-        while (i < macro.Length) {
-            string ch = macro.Substring(i, 1);
-            if (ch == "{") {
-                int close = Background.IndexOf(macro, "}", i + 1);
+        int len = macro.Length;
+        while (i < len) {
+            int b0 = macro[i] & 255;
+            if (b0 == 123) { // '{'
+                int close = macro.IndexOf("}", i + 1);
                 if (close < 0) { break; }  // 未闭合花括号:停止
                 string name = macro.Substring(i + 1, close - i - 1);
                 int vk = Keyboard.VK(name);
@@ -224,17 +224,23 @@ public class Background {
                     held.Add(vk);
                 }
                 i = close + 1;
-            } else if (ch == "}") {
+            } else if (b0 == 125) { // '}'
                 i = i + 1;  // 孤立右花括号:忽略
             } else {
-                int b = i;
-                while (b < macro.Length && macro.Substring(b, 1) != "{") {
-                    b = b + 1;
+                int b = macro.IndexOf("{", i);
+                if (b < 0) { b = len; }
+                if (b - i == 1) {
+                    int c = macro[i] & 255;
+                    if ((c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A)
+                        || (c >= 0x30 && c <= 0x39)) {
+                        int vk = (c >= 0x61 && c <= 0x7A) ? (c - 0x20) : c;
+                        if (!Background.KeyPress(hwnd, vk)) { ok = false; }
+                        i = b;
+                        continue;
+                    }
                 }
                 string text = macro.Substring(i, b - i);
-                if (text.Length == 1 && Background.IsKeyChar(text)) {
-                    if (!Background.KeyPress(hwnd, Background.CharVK(text))) { ok = false; }
-                } else if (text != "") {
+                if (text != "") {
                     if (!Background.SendText(hwnd, text)) { ok = false; }
                 }
                 i = b;
@@ -395,23 +401,6 @@ public class Background {
         return 0;
     }
 
-    // UTF-8 首字符字节宽度:ASCII 1,双字节 2,汉字 3,四字节 4。
-    private static int CharWidth(string ch) {
-        if (ch.Length == 0) { return 0; }
-        nint buf = NativeMemory.Alloc(8);
-        int c0 = 0;
-        try {
-            NativeMemory.PutString(buf, 0, ch, ch.Length);
-            c0 = new Span<byte>(buf, 4)[0];
-        } finally {
-            NativeMemory.Free(buf);
-        }
-        if ((c0 & 0x80) == 0) { return 1; }
-        if ((c0 & 0xE0) == 0xC0) { return 2; }
-        if ((c0 & 0xF0) == 0xE0) { return 3; }
-        return 4;
-    }
-
     // 码点 → WM_CHAR:BMP 单发,代理对拆两个 UTF-16 单元。
     private static bool SendCodePoint(nint hwnd, int cp) {
         if (cp <= 0) { return false; }
@@ -424,28 +413,6 @@ public class Background {
         bool a = Background.Post(hwnd, Background.WM_CHAR(), hi, 1);
         bool b = Background.Post(hwnd, Background.WM_CHAR(), lo, 1);
         return a && b;
-    }
-
-    // 单字符是否是可打印按键(a-z/A-Z/0-9)。
-    private static bool IsKeyChar(string ch) {
-        int c = Keyboard.CodeOf(ch);
-        return (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A)
-            || (c >= 0x30 && c <= 0x39);
-    }
-
-    // 可打印字符 → VK(字母大写化)。
-    private static int CharVK(string ch) {
-        int c = Keyboard.CodeOf(ch);
-        if (c >= 0x61 && c <= 0x7A) { return c - 0x20; }
-        return c;
-    }
-
-    // `needle` 在 `hay` 中从 `从` 起的首次出现,无则 -1。
-    private static int IndexOf(string hay, string needle, int from) {
-        if (hay == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
     }
     #endif
 }

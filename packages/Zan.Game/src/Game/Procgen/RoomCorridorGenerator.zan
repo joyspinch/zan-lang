@@ -3,28 +3,14 @@ using System.Collections.Generic;
 
 namespace Game.Procgen;
 
-// 房间-走廊关卡生成器（roguelike 经典做法）。
-//
-// 做法：先撒 N 个不重叠的房间，再按**最小生成树**把它们连起来
-// （Prim 式：每次从"已连入的集合"里挑最近的未连房间，用 L 形走廊接），
-// 最后再挖几条**额外回路**，避免整张图退化成一棵树。
-//
-// **为什么用最小生成树而不是"随机连最近"**：后者会产生长短不一的
-// 走廊和大量绕路；MST 保证走廊总长最小、图是树（没有环），
-// 关卡紧凑且不会有多余的回头路。多出来的回路单独加，
-// 给玩家绕行选择。
-//
-// **确定性**：房间撒点与 MST 的遍历顺序都固定，同 seed → 同一张图。
+// 房间-走廊关卡生成器：随机撒不重叠房间 -> Prim 最小生成树连通 -> 可选额外回路 -> 邻接补墙。
+// 撒点与 MST 遍历顺序固定，同 seed 确定性生成同一张图。
 public class RoomCorridorGenerator {
     // 瓦片 id。
     public int floorTile;
     public int wallTile;
     public int emptyTile;
-    // 额外回路数量（-1 = 自动：房间数 / 4）。
-    //
-    // MST 连出来的图是**树**：从任一房间到任一房间只有一条路，玩家
-    // 频繁被迫原路返回。多挖几条回路给玩家绕行选择——回路只增加
-    // 地板、不会拆掉地板，所以连通性不会被破坏。
+    // 额外回路数量（-1 = 自动：房间数 / 4；只补地板不拆地板，不破坏连通性）。
     public int extraLoopCount;
 
     // 矩形（房间）。
@@ -122,12 +108,7 @@ public class RoomCorridorGenerator {
         }
     }
 
-    // MST 连通所有房间。
-    //
-    // 朴素 Prim：维护"已连入"集合，每次找距离最近的
-    // (已连房间, 未连房间) 对并连起来。房间数不大时 O(n²) 完全够。
-    //
-    // 选中的边记进 treeEdges（成对存放），供 AddLoops 避开重复。
+    // Prim 最小生成树连通所有房间，并把树边成对记入 treeEdges 供 AddLoops 避重。
     private void ConnectMst(int[] grid, int width, int height, List<Rect> rooms, Rng rng, List<int> treeEdges) {
         List<bool> inTree = new List<bool>();
         for (int i = 0; i < rooms.Count; i = i + 1) { inTree.Add(false); }
@@ -159,14 +140,7 @@ public class RoomCorridorGenerator {
         }
     }
 
-    // 额外回路：在树之外再连几条走廊。
-    //
-    // **只加地板、不挖地板**，所以连通性一定被保留（往已连通图上加边
-    // 不会把它断开）。回路的代价是走廊变多、关卡不再是最短路径树，
-    // 收益是玩家不必原路返回——纯树的关卡探索体验很差。
-    //
-    // 选边：随机挑一对房间，跳过已经在树里的边，也跳过重复选中的
-    // 边。挑不到就少挖一条，不报错（房间少时本来就没有可用回路）。
+    // 额外回路：随机连非树边只增地板（房间不足或挑不到不报错）。
     private void AddLoops(int[] grid, int width, int height, List<Rect> rooms, Rng rng, List<int> treeEdges) {
         int want = this.extraLoopCount;
         if (want < 0) {
@@ -208,34 +182,23 @@ public class RoomCorridorGenerator {
         int y1 = a.CenterY();
         int x2 = b.CenterX();
         int y2 = b.CenterY();
-        this.CarveH(grid, width, height, x1, x2, y1);
-        this.CarveV(grid, width, height, y1, y2, x2);
-    }
-
-    // 水平走廊。
-    private void CarveH(int[] grid, int width, int height, int x1, int x2, int y) {
-        int lo = x1 < x2 ? x1 : x2;
-        int hi = x1 < x2 ? x2 : x1;
-        for (int x = lo; x <= hi; x = x + 1) {
-            if (x < 0 || y < 0 || x >= width || y >= height) { continue; }
-            grid[y * width + x] = this.floorTile;
+        int xLo = x1 < x2 ? x1 : x2;
+        int xHi = x1 < x2 ? x2 : x1;
+        for (int x = xLo; x <= xHi; x = x + 1) {
+            if (x >= 0 && y1 >= 0 && x < width && y1 < height) {
+                grid[y1 * width + x] = this.floorTile;
+            }
+        }
+        int yLo = y1 < y2 ? y1 : y2;
+        int yHi = y1 < y2 ? y2 : y1;
+        for (int y = yLo; y <= yHi; y = y + 1) {
+            if (x2 >= 0 && y >= 0 && x2 < width && y < height) {
+                grid[y * width + x2] = this.floorTile;
+            }
         }
     }
 
-    // 垂直走廊。
-    private void CarveV(int[] grid, int width, int height, int y1, int y2, int x) {
-        int lo = y1 < y2 ? y1 : y2;
-        int hi = y1 < y2 ? y2 : y1;
-        for (int y = lo; y <= hi; y = y + 1) {
-            if (x < 0 || y < 0 || x >= width || y >= height) { continue; }
-            grid[y * width + x] = this.floorTile;
-        }
-    }
-
-    // 在地板周围补墙。
-    //
-    // 只补**与地板相邻**的空格，不做整圈外扩——外扩一圈会让地图
-    // 边缘多出无意义的墙，浪费空间也影响视觉。
+    // 仅在地板四邻空格补墙，不做整圈外扩。
     private void WallAround(int[] grid, int width, int height) {
         int[] copy = new int[grid.Length];
         for (int i = 0; i < grid.Length; i = i + 1) { copy[i] = grid[i]; }

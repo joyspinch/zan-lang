@@ -143,6 +143,11 @@ $sources = Get-Content .\MyGame\Generated\legend2.sources.txt |
 
 ## Gameplay runtime
 
+`IsoTileMap` and `YSortLayer` share their implementations with `Game.Core`.
+Code importing `Game.Arpg` can keep using its constructors, `Create` factories,
+and `SortedRenderFn` callback. When importing both namespaces, qualify the type
+name, for example `Game.Arpg.IsoTileMap`.
+
 `ArpgWorld` provides the live RPG operations:
 
 ```zan

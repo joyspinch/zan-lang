@@ -1,0 +1,288 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.CodeEditor;
+
+// CodeEditor 分部：缓冲区访问、滚动、诊断映射与自动补全状态查询
+public partial class CodeEditor {
+    // 按 '\n' 把字符串拆分为行（去除 '\r'）。实现移至
+    // TextWrap.SplitLines：输入框/多行框只需文本布局原语，
+    // 不必拖入整个代码编辑器；此处保留委托以稳住内部调用点。
+    public static List<string> SplitLines(string s) {
+        return Gui.TextWrap.SplitLines(s);
+    }
+
+    // 整体替换缓冲区：保证至少一行，光标与滚动复位到开头，
+    // 并强制下一帧重新计算诊断。
+    public void SetLines(List<string> ls) {
+        lines = ls;
+        if (lines.Count == 0) { lines.Add(""); }
+        curLine = 0;
+        curCol = 0;
+        scrollLine = 0;
+        editorScrollY = 0;
+        targetScrollY = 0;
+        ensuredCaretLine = -1;
+        lastDiagLine = -1;  // 强制对新内容重新计算诊断
+        acActive = false;
+        acDot = false;
+        BumpTextVersion();
+    }
+
+    // 标记文本已被修改，递增单调版本号。
+    // 编辑会让折叠区间的行号漂移，因此顺带全部展开，
+    // 由宿主在语义刷新后重新注入区间。
+    public void BumpTextVersion() {
+        CancelSemanticCompletion();
+        textVersion = textVersion + 1;
+        hoverLspMemo = null;
+        signatureLspMemo = null;
+        sigDocLspMemo = null;
+        InvalidateDiagStale();
+        RequestAnalysis();
+        if (foldRegions != null) {
+            for (int i = 0; i < foldRegions.Count; i = i + 1) {
+                foldRegions[i].folded = false;
+            }
+        }
+    }
+
+    // 载入整段文本（SetLines 的字符串版），同时清空 CodeLens、
+    // 签名备忘等派生自旧内容的缓存。
+    public void LoadText(string s) {
+        SetLines(CodeEditor.SplitLines(s));
+        extRefDirty = true;
+        // 其他文件的成员不属于本文件。
+        sigMemoName = "";
+        lensMemos = new List<CeLensMemo>();
+        lensStamp = 0 - 1;
+    }
+
+    // 全部文本（行以 '\n' 连接）。
+    public string GetText() {
+        textMemo = string.Join("\n", lines);
+        textMemoStamp = TextStamp();
+        return textMemo;
+    }
+
+    // O(1) 内容版本号：文本实际变更时才递增，
+    // 彻底消除每帧遍历全文件所有行统计长度的巨大卡顿。
+    public int TextStamp() {
+        return textVersion;
+    }
+
+    // 编辑器列是 UTF-8 字节偏移，LSP 列是 UTF-16 码元数。
+    public static int ByteColumnToUtf16(string text, int byteCol) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && pos < byteCol) {
+            int next = Text.NextCharEnd(text, pos);
+            if (next > byteCol) { break; }
+            units = units + (next - pos == 4 ? 2 : 1);
+            pos = next;
+        }
+        return units;
+    }
+
+    public static int Utf16ColumnToByte(string text, int column) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && units < column) {
+            int next = Text.NextCharEnd(text, pos);
+            int width = next - pos == 4 ? 2 : 1;
+            if (units + width > column) { break; }
+            units = units + width;
+            pos = next;
+        }
+        return pos;
+    }
+
+    // 缓冲区行数。
+    public int LineCount() {
+        return lines.Count;
+    }
+
+    // 当前光标行（0 起）。
+    public int CurLine() { return curLine; }
+    // 当前光标列（0 起）。
+    public int CurCol() { return curCol; }
+
+    // 第 `i` 行的文本（越界返回 ""）。使宿主（查找栏）
+    // 无需每次击键实例化整个文档即可遍历缓冲区。
+    public string LineAt(int i) {
+        if (i < 0 || i >= lines.Count) { return ""; }
+        return lines[i];
+    }
+
+    // 选区激活且包含有效文本范围时返回 true。
+    public bool HasSelection() { return selActive && (selAnchorLine != curLine || selAnchorCol != curCol); }
+
+    // 首个可见行。拥有多个缓冲区的宿主把它与
+    // 光标一起保存，以恢复缓冲区离开时的状态。
+    public int ScrollLine() { return scrollLine; }
+    // 设置首个可见行（钳制到 [0, 行数-1]）。
+    public void SetScrollLine(int line) {
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        if (line < 0) { line = 0; }
+        scrollLine = line;
+        editorScrollY = 0 - 1; // 标记由下一次 Render 转换为精确像素
+        targetScrollY = 0 - 1;
+    }
+
+    // 当前视口垂直像素滚动偏移。
+    public int ScrollY() { return editorScrollY; }
+    // 设置垂直像素滚动偏移。
+    public void SetScrollY(int y) {
+        if (y < 0) { y = 0; }
+        if (maxScrollY > 0 && y > maxScrollY) { y = maxScrollY; }
+        editorScrollY = y;
+        targetScrollY = y;
+    }
+
+    // ---- 自动化 / 自省访问器（供 Gui.UiDriver 使用） ----
+    // 补全弹窗显示期间返回 true。
+    public bool CompletionActive() { return acActive; }
+    // 可见补全候选的数量。
+    public int CompletionCount() { return acItems.Count; }
+    // 高亮候选的索引（从 0 起）。
+    public int CompletionSel() { return acSel; }
+    // 索引 i 处的候选标签（越界返回 ""）。
+    public string CompletionItem(int i) {
+        if (i < 0 || i >= acItems.Count) { return ""; }
+        return acItems[i];
+    }
+    // 索引 i 处的候选种类标签：M/P/T/K/S/F（越界返回 ""）。
+    public string CompletionKind(int i) {
+        if (i < 0 || i >= acKinds.Count) { return ""; }
+        return acKinds[i];
+    }
+
+    // 返回光标下的标识符（无则为空字符串）。
+    public string WordAtCaret() {
+        if (curLine < 0 || curLine >= lines.Count) { return ""; }
+        string s = lines[curLine];
+        int col = curCol;
+        if (col >= s.Length) { col = s.Length - 1; }
+        if (col < 0) { return ""; }
+        return CodeEditor.WordAt(s, col);
+    }
+
+    // Ctrl+点击请求转到定义后返回一次 true，
+    // 并清除标志，使宿主恰好处理一次。
+    public bool ConsumeGotoRequest() {
+        if (gotoRequested) { gotoRequested = false; return true; }
+        return false;
+    }
+
+    // 替换调试变量面板的内容（宿主自己的数据，编辑器只负责显示）。
+    public void SetDebugVars(List<DbgVar> vars) { dbgVars = vars; }
+
+    // 跳到某行行首（钳制行号、清除选区）。
+    public void GoToLine(int line) {
+        CancelSemanticCompletion();
+        if (line < 0) { line = 0; }
+        if (line >= lines.Count) { line = lines.Count - 1; }
+        curLine = line;
+        curCol = 0;
+        selActive = false;
+    }
+
+    // 同步查询缓冲区总大小；诊断失效使用 O(1) 的 TextStamp。
+    public int BufLen() {
+        int n = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) { n = n + lines[i].Length + 1; }
+        return n;
+    }
+
+    // 用上次 Run/Build 针对本文件报告的真实错误
+    // 替换红色下划线 + 提示显示的编译器诊断，并
+    // 把光标跳到第一个错误，使其原因立即可见。
+    // 当编译成功（diagnostics 为空）时，清空快速修复建议，并与编译器结果同步。
+    public void SetCompilerDiagnostics(List<Diagnostic> diagnostics) {
+        compErrors = diagnostics;
+        cErrStamp = TextStamp();
+        diagStaleFrame = 0 - 1;
+        if (compErrors.Count > 0) {
+            GoToLine(compErrors[0].line);
+        } else {
+            fixes = new List<QuickFix>();
+        }
+    }
+
+    // 设置某个文档的语义诊断（语言服务推送）。诊断带精确区间，
+    // 渲染时在出错的那几个字符下面画波浪线（VS 的做法）。
+    // 空诊断表示"这份文档现在没有错误"，直接清掉该路径的记录。
+    public void SetSemanticDiagnostics(string path, List<Diagnostic> diagnostics) {
+        if (path.Length == 0) { return; }
+        if (semDiags == null) { semDiags = new Dict<string, List<Diagnostic>>(); }
+        if (diagnostics == null || diagnostics.Count == 0) {
+            if (semDiags.ContainsKey(path)) { semDiags.Remove(path); }
+            return;
+        }
+        semDiags[path] = diagnostics;
+    }
+
+    // 当前文档在指定行上的语义诊断条数（不做逐帧分配：渲染每个
+    // 可见行都要问一次，分配列表会拖慢每帧）。
+    public int SemanticDiagCount(int line) {
+        if (semDiags == null || documentPath.Length == 0) { return 0; }
+        if (!semDiags.ContainsKey(documentPath)) { return 0; }
+        List<Diagnostic> all = semDiags[documentPath];
+        int n = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].line == line) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 该行第 `idx` 条语义诊断（越界返回 null）。
+    public Diagnostic SemanticDiagAt(int line, int idx) {
+        if (semDiags == null || documentPath.Length == 0) { return null; }
+        if (!semDiags.ContainsKey(documentPath)) { return null; }
+        List<Diagnostic> all = semDiags[documentPath];
+        int n = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].line != line) { continue; }
+            if (n == idx) { return all[i]; }
+            n = n + 1;
+        }
+        return null;
+    }
+
+    // 设置编译器诊断后缓冲区一旦变化即返回 true，
+    // 用户一开始编辑，过期错误即停止绘制。
+    public bool CompilerDiagStale() {
+        if (diagStaleFrame == 0) { return false; }
+        if (diagStaleFrame == 1) { return true; }
+        bool stale = cErrStamp < 0 || TextStamp() != cErrStamp;
+        diagStaleFrame = 0;
+        if (stale) { diagStaleFrame = 1; }
+        return stale;
+    }
+
+    // 丢弃每帧的过期记忆；渲染流程在本帧
+    // 缓冲区不再变化后调用一次。
+    public void InvalidateDiagStale() { diagStaleFrame = 0 - 1; }
+
+    // 某行的编译器诊断消息，无或已过期返回 ""。
+    public string CompilerErrMsg(int ln) {
+        if (CompilerDiagStale()) { return ""; }
+        return CodeEditor.DiagMsg(compErrors, ln);
+    }
+
+    // 第 `ln` 行当前携带有效编译器诊断时返回 true。
+    public bool HasCompilerErr(int ln) {
+        if (CompilerDiagStale()) { return false; }
+        return CodeEditor.DiagHas(compErrors, ln);
+    }
+
+    // 跳到指定行列（列超界时钳到行尾）。
+    public void GoToLineCol(int line, int col) {
+        GoToLine(line);
+        curCol = col;
+        ClampCol();
+    }
+}

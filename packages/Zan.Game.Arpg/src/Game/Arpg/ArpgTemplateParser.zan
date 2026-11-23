@@ -20,32 +20,34 @@ public class ArpgTemplateParser {
 
     // 判断 text 在 position 处是否以 prefix 开头（越界为 false）。
     public static bool StartsAt(string text, int position, string prefix) {
-        if (position < 0 || position + prefix.Length > text.Length) {
+        int n = prefix.Length;
+        if (position < 0 || position + n > text.Length) {
             return false;
         }
-        return text.Substring(position, prefix.Length) == prefix;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((text[position + i] & 255) != (prefix[i] & 255)) { return false; }
+        }
+        return true;
     }
 
     // 去除 text 两端的空格/制表/回车/换行字符。
     public static string Trim(string text) {
         int start = 0;
         int end = text.Length;
-        bool scanning = true;
-        while (start < end && scanning) {
-            string ch = text.Substring(start, 1);
-            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+        while (start < end) {
+            int c = text[start] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
                 start = start + 1;
             } else {
-                scanning = false;
+                break;
             }
         }
-        scanning = true;
-        while (end > start && scanning) {
-            string ch = text.Substring(end - 1, 1);
-            if (ch == " " || ch == "\t" || ch == "\r" || ch == "\n") {
+        while (end > start) {
+            int c = text[end - 1] & 255;
+            if (c == 32 || c == 9 || c == 13 || c == 10) {
                 end = end - 1;
             } else {
-                scanning = false;
+                break;
             }
         }
         return text.Substring(start, end - start);
@@ -53,36 +55,32 @@ public class ArpgTemplateParser {
 
     // 从 start 起查找 token 首次出现的下标；找不到返回 -1。
     public int Find(string token, int start) {
-        int i = start;
-        while (i + token.Length <= this.input.Length) {
-            if (this.input.Substring(i, token.Length) == token) { return i; }
-            i = i + 1;
-        }
-        return -1;
+        if (start < 0) { start = 0; }
+        if (start > this.input.Length) { return -1; }
+        return this.input.IndexOf(token, start);
     }
 
     // 在表达式中查找比较运算符首次出现的下标；找不到返回 -1。
     public static int FindOperator(string expression, string token) {
-        for (int i = 0; i + token.Length <= expression.Length; i = i + 1) {
-            if (expression.Substring(i, token.Length) == token) { return i; }
-        }
-        return -1;
+        return expression.IndexOf(token);
     }
 
     // 判断 text 是否形如数值字面量（可选 +/- 前缀、数字与小数点，
     // 至少含一个数字）。空串为 false。
     public static bool LooksNumeric(string text) {
-        if (text == null || text == "") { return false; }
+        if (text == null || text.Length == 0) { return false; }
         int i = 0;
         bool digit = false;
-        if (text.Substring(0, 1) == "-" || text.Substring(0, 1) == "+") {
+        int c0 = text[0] & 255;
+        if (c0 == 45 || c0 == 43) {
             i = 1;
         }
-        while (i < text.Length) {
-            string ch = text.Substring(i, 1);
-            if (ch >= "0" && ch <= "9") {
+        int n = text.Length;
+        while (i < n) {
+            int c = text[i] & 255;
+            if (c >= 48 && c <= 57) {
                 digit = true;
-            } else if (ch != ".") {
+            } else if (c != 46) {
                 return false;
             }
             i = i + 1;
@@ -95,19 +93,16 @@ public class ArpgTemplateParser {
     // 其余按原文文本处理。
     public ArpgValue Operand(string token) {
         string newValue = Trim(token);
-        if (newValue.Length >= 2
-            && newValue.Substring(0, 1) == "&"
-            && newValue.Substring(newValue.Length - 1, 1) == "&") {
-            ArpgValue resolved = this.source.Resolve(
-                newValue.Substring(1, newValue.Length - 2));
-            if (resolved == null) { return ArpgValue.Null(); }
-            return resolved;
-        }
         if (newValue.Length >= 2) {
-            string first = newValue.Substring(0, 1);
-            string last = newValue.Substring(newValue.Length - 1, 1);
-            if ((first == "'" && last == "'")
-                || (first == "\"" && last == "\"")) {
+            int first = newValue[0] & 255;
+            int last = newValue[newValue.Length - 1] & 255;
+            if (first == 38 && last == 38) {
+                ArpgValue resolved = this.source.Resolve(
+                    newValue.Substring(1, newValue.Length - 2));
+                if (resolved == null) { return ArpgValue.Null(); }
+                return resolved;
+            }
+            if ((first == 39 && last == 39) || (first == 34 && last == 34)) {
                 return ArpgValue.Text(newValue.Substring(1, newValue.Length - 2));
             }
         }
@@ -208,65 +203,90 @@ public class ArpgTemplateParser {
     // 前进 position。
     public ArpgTemplateSection ParseSection() {
         StringBuilder output = new StringBuilder();
-        while (this.position < this.input.Length) {
-            if (StartsAt(this.input, this.position, "{elseif ")) {
-                int close = this.Find("}", this.position + 8);
-                if (close < 0) {
-                    output.Append(this.input.Substring(this.position));
-                    this.position = this.input.Length;
+        int n = this.input.Length;
+        int litStart = this.position;
+        while (this.position < n) {
+            int c = this.input[this.position] & 255;
+            if (c == 123) {
+                if (StartsAt(this.input, this.position, "{elseif ")) {
+                    if (this.position > litStart) {
+                        output.Append(this.input.Substring(litStart, this.position - litStart));
+                    }
+                    int close = this.Find("}", this.position + 8);
+                    if (close < 0) {
+                        output.Append(this.input.Substring(this.position));
+                        this.position = n;
+                        return new ArpgTemplateSection(
+                            output.ToString(),
+                            ArpgTemplateTerminator.None(),
+                            "");
+                    }
+                    string condition = this.input.Substring(
+                        this.position + 8, close - this.position - 8);
+                    this.position = close + 1;
                     return new ArpgTemplateSection(
                         output.ToString(),
-                        ArpgTemplateTerminator.None(),
-                        "");
+                        ArpgTemplateTerminator.ElseIf(),
+                        condition);
                 }
-                string condition = this.input.Substring(
-                    this.position + 8, close - this.position - 8);
-                this.position = close + 1;
-                return new ArpgTemplateSection(
-                    output.ToString(),
-                    ArpgTemplateTerminator.ElseIf(),
-                    condition);
-            }
-            if (StartsAt(this.input, this.position, "{else}")) {
-                this.position = this.position + 6;
-                return new ArpgTemplateSection(
-                    output.ToString(), ArpgTemplateTerminator.Else(), "");
-            }
-            if (StartsAt(this.input, this.position, "{end}")) {
-                this.position = this.position + 5;
-                return new ArpgTemplateSection(
-                    output.ToString(), ArpgTemplateTerminator.End(), "");
-            }
-            if (StartsAt(this.input, this.position, "{if ")) {
-                int close = this.Find("}", this.position + 4);
-                if (close < 0) {
-                    output.Append(this.input.Substring(this.position));
-                    this.position = this.input.Length;
+                if (StartsAt(this.input, this.position, "{else}")) {
+                    if (this.position > litStart) {
+                        output.Append(this.input.Substring(litStart, this.position - litStart));
+                    }
+                    this.position = this.position + 6;
                     return new ArpgTemplateSection(
-                        output.ToString(),
-                        ArpgTemplateTerminator.None(),
-                        "");
+                        output.ToString(), ArpgTemplateTerminator.Else(), "");
                 }
-                string condition = this.input.Substring(
-                    this.position + 4, close - this.position - 4);
-                this.position = close + 1;
-                output.Append(this.ParseConditional(condition));
-            } else if (this.input.Substring(this.position, 1) == "&") {
+                if (StartsAt(this.input, this.position, "{end}")) {
+                    if (this.position > litStart) {
+                        output.Append(this.input.Substring(litStart, this.position - litStart));
+                    }
+                    this.position = this.position + 5;
+                    return new ArpgTemplateSection(
+                        output.ToString(), ArpgTemplateTerminator.End(), "");
+                }
+                if (StartsAt(this.input, this.position, "{if ")) {
+                    if (this.position > litStart) {
+                        output.Append(this.input.Substring(litStart, this.position - litStart));
+                    }
+                    int close = this.Find("}", this.position + 4);
+                    if (close < 0) {
+                        output.Append(this.input.Substring(this.position));
+                        this.position = n;
+                        return new ArpgTemplateSection(
+                            output.ToString(),
+                            ArpgTemplateTerminator.None(),
+                            "");
+                    }
+                    string condition = this.input.Substring(
+                        this.position + 4, close - this.position - 4);
+                    this.position = close + 1;
+                    output.Append(this.ParseConditional(condition));
+                    litStart = this.position;
+                    continue;
+                }
+                this.position = this.position + 1;
+            } else if (c == 38) {
                 int close = this.Find("&", this.position + 1);
                 if (close < 0) {
-                    output.Append("&");
                     this.position = this.position + 1;
                 } else {
+                    if (this.position > litStart) {
+                        output.Append(this.input.Substring(litStart, this.position - litStart));
+                    }
                     string path = this.input.Substring(
                         this.position + 1, close - this.position - 1);
                     ArpgValue resolved = this.source.Resolve(path);
                     if (resolved != null) { output.Append(resolved.AsText()); }
                     this.position = close + 1;
+                    litStart = this.position;
                 }
             } else {
-                output.Append(this.input.Substring(this.position, 1));
                 this.position = this.position + 1;
             }
+        }
+        if (this.position > litStart) {
+            output.Append(this.input.Substring(litStart, this.position - litStart));
         }
         return new ArpgTemplateSection(
             output.ToString(), ArpgTemplateTerminator.None(), "");

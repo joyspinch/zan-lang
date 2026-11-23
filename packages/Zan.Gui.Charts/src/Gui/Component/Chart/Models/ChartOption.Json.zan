@@ -12,6 +12,23 @@ public partial class ChartOption {
     // "yAxis":{"type":"value"},
     // 旧的紧凑结构（labels + series[].values）仍然接受。
     public static ChartOption FromJson(string src) {
+        if (src != null && src.Length >= ChartOptionTape.MinTextBytes && JsonDoc.MaxDepth >= 0
+        && src.IndexOf("\"bar\"") >= 0 && src.IndexOf("\"data\"") >= 0) {
+            bool building = false;
+            try {
+                ChartOption result = JsonDoc.ParseScopedDeferred<ChartOption>(src, (doc) => {
+                    ChartOptionTape tape = new ChartOptionTape(doc);
+                    JsonValue value = tape.ReadOption();
+                    if (value == null) { return null; }
+                    building = true;
+                    return ChartOption.FromJsonValue(value, tape);
+                });
+                if (result != null) { return result; }
+            } catch (JsonException) {
+                if (building) { throw; }
+                // The lenient reader can still recover a partially valid option.
+            }
+        }
         return ChartOption.FromJsonValue(JsonValue.ParseLenient(src));
     }
 
@@ -139,6 +156,10 @@ public partial class ChartOption {
 
 
     public static ChartOption FromJsonValue(JsonValue v) {
+        return ChartOption.FromJsonValue(v, null);
+    }
+
+    private static ChartOption FromJsonValue(JsonValue v, ChartOptionTape tape) {
         ChartOption o = ChartOption.Create();
         if (v == null) { return o; }
         // A383 第一步：解析前先对账——用户 option 里引擎从未读过的键
@@ -251,8 +272,8 @@ public partial class ChartOption {
 
         ChartOption.ParsePolarInto(o, v);
 
-        ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true);
-        ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false);
+        ChartOption.ParseAxis(v.Get("xAxis"), o.xAxes, true, tape);
+        ChartOption.ParseAxis(v.Get("yAxis"), o.yAxes, false, tape);
         ChartOption.ParseVisualMap(v.Get("visualMap"), o.visualMaps);
         ChartOption.SyncRampFromVisualMap(o);
 
@@ -276,7 +297,7 @@ public partial class ChartOption {
         if (parj != null && parj.IsObject()) {
             o.parLayout = parj.Str("layout", o.parLayout);
         }
-        ChartOption.ParseSeriesInto(o, v);
+        ChartOption.ParseSeriesInto(o, v, tape);
 
         // geo 组件合成底图系列：每个 geo 一个 type=Map 的载体系列
         // （isGeoBase）。没有用户 map 系列时插到队首（lead=Map，分发
@@ -290,20 +311,28 @@ public partial class ChartOption {
 
     // 解析 xAxis/yAxis（对象或数组，逐项调 ParseAxisOne）。
     public static void ParseAxis(JsonValue v, List<ChartAxis> into, bool isX) {
+        ChartOption.ParseAxis(v, into, isX, null);
+    }
+
+    private static void ParseAxis(JsonValue v, List<ChartAxis> into, bool isX, ChartOptionTape tape) {
         if (v == null) { return; }
         if (v.IsArray()) {
             for (int i = 0; i < v.Count(); i = i + 1) {
-                ChartOption.ParseAxisOne(v.At(i), into, isX);
+                ChartOption.ParseAxisOne(v.At(i), into, isX, tape);
             }
             return;
         }
-        ChartOption.ParseAxisOne(v, into, isX);
+        ChartOption.ParseAxisOne(v, into, isX, tape);
     }
 
     // 解析单根轴：category 轴读 data[]，数值轴读 min/max；
     // name/inverse/nameLocation 与 axisLabel.rotate（钳 -90..90）、
     // axisLabel.interval 通用。
     public static void ParseAxisOne(JsonValue v, List<ChartAxis> into, bool isX) {
+        ChartOption.ParseAxisOne(v, into, isX, null);
+    }
+
+    private static void ParseAxisOne(JsonValue v, List<ChartAxis> into, bool isX, ChartOptionTape tape) {
         if (v == null || !v.IsObject()) { return; }
         // ECharts 缺省 type（axisModelCreator.ts:143）：option.type ||
         // (option.data ? 'category' : 'value') —— x/y 同一规则，"轴自己
@@ -321,10 +350,15 @@ public partial class ChartOption {
         }
         ChartAxis a;
         if (ty == ChartAxisType.Category) {
-            List<string> cats = new List<string>();
             JsonValue da = v.Get("data");
-            if (da != null && da.IsArray()) {
-                for (int i = 0; i < da.Count(); i = i + 1) { cats.Add(da.At(i).AsString("")); }
+            List<string> cats = tape == null ? null : tape.Categories(da);
+            if (cats == null) {
+                cats = new List<string>();
+                if (da != null && da.IsArray()) {
+                    int count = da.Count();
+                    cats.Reserve(count);
+                    for (int i = 0; i < count; i = i + 1) { cats.Add(da.At(i).AsString("")); }
+                }
             }
             a = ChartAxis.Category(cats);
         } else {

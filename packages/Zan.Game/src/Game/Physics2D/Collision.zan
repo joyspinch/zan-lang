@@ -3,18 +3,7 @@ using System.Collections.Generic;
 
 namespace Game.Physics2D;
 
-// 窄相检测：算出两个形状的接触流形（法线、接触点、分离量）。
-//
-// 三条硬约束：
-//   - **只支持凸多边形**：SAT 需要凸性，凹多边形直接不检测。
-//   - **推测接触（speculative margin）**：分离量在 margin 以内也算接触，
-//     约束里把接近速度限制为 gap/dt——高速物体在"还没撞上"时就被拦住，
-//     这是本包的连续碰撞手段（不做 TOI 扫掠，但常规速度不穿墙）。
-//   - **确定性**：同一对形状的输入产出逐位相同的结果（无随机、无哈希序）。
-//
-// 法线约定：流形法线从 A 指向 B；求解器把 B 沿 +法线推、A 沿 -法线推，
-// 于是"法线"始终是**分离方向**——形状互相嵌进去时，法线取能把两者
-// 分开的那个方向（内含情形见 CirclePolygon 的注释）。
+// 2D 窄相碰撞检测（仅支持凸多边形，确定性输出）：法线始终从 A 指向 B；分离量 <= margin 也计入推测接触。
 public static class Collision {
     // 圆 vs 圆。
     public static Manifold CircleCircle(
@@ -40,12 +29,7 @@ public static class Collision {
         return manifold;
     }
 
-    // 多边形 vs 圆。
-    //
-    // 法线取**多边形 → 圆**：圆在多边形外时，法线由最近点指向圆心；
-    // 圆心落在多边形内部时，法线取该面的外法线（把圆沿它推出去）。
-    // 两种情形下分离量都是"沿法线的表面间隙"：外离时为正（还有多远碰上），
-    // 内含时为负（重叠多深）。
+    // 多边形 vs 圆（法线取 多边形 → 圆；外离分离量为正、内含为负）。
     public static Manifold CirclePolygon(
         PolygonShape polygon,
         Vec2 pp,
@@ -59,10 +43,7 @@ public static class Collision {
 
         List<Vec2> verts = new List<Vec2>();
         List<Vec2> norms = new List<Vec2>();
-        for (int i = 0; i < n; i = i + 1) {
-            verts.Add(pp + polygon.vertices[i].Rotated(angle));
-            norms.Add(polygon.normals[i].Rotated(angle));
-        }
+        Collision.TransformPolygon(polygon, pp, angle, verts, norms);
 
         // 分离量最大的面（圆心离哪张面最远）。
         int bestIndex = 0;
@@ -121,16 +102,10 @@ public static class Collision {
 
         List<Vec2> av = new List<Vec2>();
         List<Vec2> an = new List<Vec2>();
-        for (int i = 0; i < na; i = i + 1) {
-            av.Add(pa + a.vertices[i].Rotated(aa));
-            an.Add(a.normals[i].Rotated(aa));
-        }
+        Collision.TransformPolygon(a, pa, aa, av, an);
         List<Vec2> bv = new List<Vec2>();
         List<Vec2> bn = new List<Vec2>();
-        for (int i = 0; i < nb; i = i + 1) {
-            bv.Add(pb + b.vertices[i].Rotated(ab));
-            bn.Add(b.normals[i].Rotated(ab));
-        }
+        Collision.TransformPolygon(b, pb, ab, bv, bn);
 
         // SAT：两个方向各自的最大分离量（正 = 分离，负 = 侵入）。
         int edgeA = 0;
@@ -185,17 +160,10 @@ public static class Collision {
             return Collision.SpeculativeFallback(manifold, inc0, inc1, refNormal, flip, v1);
         }
 
-        // 接触点取入射点与其在参考面上的投影的中点（对称，位置求解更稳）。
-        Vec2 clip0 = inc0 + (inc1 - inc0) * t0;
-        double separation1 = refNormal.Dot(clip0 - v1);
-        Vec2 facePoint1 = clip0 - refNormal * separation1;
-        manifold.AddPoint((clip0 + facePoint1) * 0.5, separation1);
-
+        // 接触点取入射点与参考面投影的中点。
+        Collision.AddProjectedPoint(manifold, inc0 + (inc1 - inc0) * t0, refNormal, v1);
         if (clipped == 2) {
-            Vec2 clip1 = inc0 + (inc1 - inc0) * t1;
-            double separation2 = refNormal.Dot(clip1 - v1);
-            Vec2 facePoint2 = clip1 - refNormal * separation2;
-            manifold.AddPoint((clip1 + facePoint2) * 0.5, separation2);
+            Collision.AddProjectedPoint(manifold, inc0 + (inc1 - inc0) * t1, refNormal, v1);
         }
 
         // 法线永远从 A 指向 B。
@@ -259,12 +227,32 @@ public static class Collision {
         return a + ab * t;
     }
 
-    // SAT 分离量：沿 poly1 的每个面法线，量 poly2 在该轴上的"最浅点"
-    // （顶点投影的最小值），再取所有面里的最大值。
-    //
-    // 正值 = poly2 完全在 poly1 之外（沿该轴分离），负值 = 侵入。
-    // 必须取顶点投影的**最小**值——用最大值会把"有一个角伸出去"误判成分离，
-    // 旋转多边形的重叠就检测不出来。
+    private static void TransformPolygon(
+        PolygonShape poly,
+        Vec2 pos,
+        double angle,
+        List<Vec2> verts,
+        List<Vec2> norms
+    ) {
+        int n = poly.vertices.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            verts.Add(pos + poly.vertices[i].Rotated(angle));
+            norms.Add(poly.normals[i].Rotated(angle));
+        }
+    }
+
+    private static void AddProjectedPoint(
+        Manifold manifold,
+        Vec2 point,
+        Vec2 refNormal,
+        Vec2 refOrigin
+    ) {
+        double separation = refNormal.Dot(point - refOrigin);
+        Vec2 facePoint = point - refNormal * separation;
+        manifold.AddPoint((point + facePoint) * 0.5, separation);
+    }
+
+    // SAT 分离量：沿 poly1 各面法线量取 poly2 顶点投影最小值，取所有面里的最大值（正=分离，负=侵入）。
     private static double FindMaxSeparation(
         List<Vec2> verts1,
         List<Vec2> norms1,
@@ -356,15 +344,9 @@ public static class Collision {
     ) {
         double s0 = refNormal.Dot(p0 - refOrigin);
         double s1 = refNormal.Dot(p1 - refOrigin);
-        Vec2 point = p0;
-        double separation = s0;
-        if (s1 < s0) {
-            point = p1;
-            separation = s1;
-        }
-        Vec2 facePoint = point - refNormal * separation;
+        Vec2 point = s1 < s0 ? p1 : p0;
         manifold.normal = flip ? refNormal * -1.0 : refNormal;
-        manifold.AddPoint((point + facePoint) * 0.5, separation);
+        Collision.AddProjectedPoint(manifold, point, refNormal, refOrigin);
         return manifold;
     }
 }

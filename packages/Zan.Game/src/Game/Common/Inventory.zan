@@ -4,15 +4,7 @@ using System.Json;
 
 namespace Game.Common;
 
-// 背包格：一个槽位（物品 id + 数量 + 堆叠上限）。
-//
-// **它替代什么**：模板里每个带背包的游戏都自己写一遍"槽位、堆叠、
-// 能不能放进去"。抄一遍就会漏掉"数量为 0 的槽位算不算空"这类边角：
-// 数量 0 但 itemId 非空的槽位在 UI 上显示成一个图标，逻辑上却当空槽
-// 用——两份状态打架。
-//
-// **一条硬取舍**：**空 = 没有物品 id**。数量归零时 id 一并清掉，
-// 槽位只有"空"和"有东西且 count > 0"两种状态，不存在第三种。
+// 背包槽位（物品 id + 数量 + 堆叠上限）：数量归零时一并清空 itemId，保证只有空/非空两种状态。
 public class InventorySlot {
     // 物品 id（空槽为 ""）。
     public string itemId;
@@ -39,10 +31,7 @@ public class InventorySlot {
         return space > 0 ? space : 0;
     }
 
-    // 放东西进去。
-    //
-    // 只接受与本槽相同的物品 id（空槽接受任何 id）。返回实际放进去的
-    // 数量——放不下时是 0 或部分数量，调用方据此决定剩下的怎么办。
+    // 放入物品（仅接受同 id 或空槽），返回实际放入数量。
     public int Add(string id, int amount) {
         if (id == null || id.Length == 0 || amount <= 0) { return 0; }
         if (this.IsEmpty()) {
@@ -77,16 +66,7 @@ public class InventorySlot {
     }
 }
 
-// 背包：固定容量的槽位集合。
-//
-// **两条硬取舍**：
-//
-// 1. **先堆叠、后开新格**：加物品时先把已有同类槽位填满，再用空槽开新的
-//    堆。反过来（每个物品开一格）会让背包早早占满，20 格背包塞 3 种
-//    道具就满了。
-// 2. **堆叠上限以槽位为准**：`Add` 的 `maxStack` 用于**新建**的堆；
-//    已有同类槽位按它自己的上限填——槽位上限是它被创建时定下的，
-//    临时改一次上限会让"这格能装多少"随调用参数漂移。
+// 固定容量的背包：Add 先填已有同类槽位再开新格，maxStack 仅用于新开槽位（已有槽位沿用创建时上限）。
 public class Inventory {
     // 槽位列表。
     private List<InventorySlot> slots;
@@ -96,8 +76,7 @@ public class Inventory {
     public Inventory(int capacity) {
         this.capacity = capacity > 0 ? capacity : 0;
         this.slots = new List<InventorySlot>();
-        // 槽位**预先开满**：容量是硬上限，槽位编号从一开始就是固定的
-        // （UI 上的格子位置不因为物品进出而变）。满了就是满了，不扩容。
+        // 预先开满固定槽位，保持槽位编号稳定，满了不扩容。
         for (int i = 0; i < this.capacity; i = i + 1) {
             this.slots.Add(new InventorySlot(1));
         }
@@ -153,8 +132,7 @@ public class Inventory {
             left = left - s.Add(itemId, left);
         }
 
-        // 第二轮：空槽开新堆。槽位是预先开满的固定集合——满了就是满了，
-        // 背包不扩容（容量是硬上限）。
+        // 第二轮：空槽开新堆（不扩容）。
         for (int i = 0; i < this.slots.Count && left > 0; i = i + 1) {
             InventorySlot s = this.slots[i];
             if (s == null || !s.IsEmpty()) { continue; }
@@ -196,10 +174,7 @@ public class Inventory {
         return arr.ToJson();
     }
 
-    // 从 JSON 文本读回。成功返回 true。
-    //
-    // 读回失败（文本损坏 / 不是数组 / 槽位非法）→ 返回 false 且
-    // **不改动当前背包**：坏存档不该把玩家的背包清空。
+    // 从 JSON 恢复；解析失败或超出容量时返回 false 且不改动当前背包。
     public bool FromJson(string json) {
         if (json == null || json.Length == 0) { return false; }
         JsonValue arr = null;
@@ -225,10 +200,8 @@ public class Inventory {
             loaded.Add(s);
         }
 
-        // 全部合法才替换：读一半失败不能留下半个背包。
+        // 全部合法且未超容量才替换当前背包。
         if (loaded.Count > this.capacity) {
-            // 存档里的槽位比背包还多：这份存档来自别的背包或被改过，
-            // 装不下就不装（不动当前背包）。
             return false;
         }
         // 槽位集合是固定的：把读到的内容填进前 N 个槽，多余的槽清空。

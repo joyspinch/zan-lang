@@ -1,0 +1,425 @@
+using System;
+using System.Json;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartView {
+    // 指针角度（度，0..360，从 12 点方向顺时针——与 FillSector
+    // 的扫掠方向/角度零位一致），通过对 CosDeg/SinDeg 二分查找求解，
+    // 无需浮点运算。dx/dy 是相对圆心的像素偏移。
+    public static int AngleOf(int dx, int dy) {
+        if (dx == 0 && dy == 0) { return 0; }
+        // 轴向量是 Pie 半开角区间的真实边界；先归一化，避免
+        // 整数二分把 12/6/9 点分别落到 359/179/269 度。
+        if (dx == 0) {
+            if (dy < 0) { return 0; }
+            return 180;
+        }
+        if (dy == 0) {
+            if (dx > 0) { return 90; }
+            return 270;
+        }
+        int lo = 0;
+        int hi = 360;
+        for (int i = 0; i < 10; i = i + 1) {
+            int mid = (lo + hi) / 2;
+            int cx2 = ChartView.CosDeg(mid);
+            int cy2 = ChartView.SinDeg(mid);
+            // cross = direction(mid) × pointer；> 0 表示指针在
+            // mid 的顺时针方向（屏幕 Y 轴向下）。
+            int cr = cx2 * dy - cy2 * dx;
+            if (cr > 0) { lo = mid; } else { hi = mid; }
+        }
+        // 二分查找给出从 +x 起算的角度；+90° 换算到 FillSector
+        // 的 12 点零位（扇区/花瓣/弦弧命中统一用同一约定）。
+        return ((lo + hi) / 2 + 90) % 360;
+    }
+
+    // 点到线段距离（像素，定点数）。
+    public static int DistToSeg(int px, int py, int x0, int y0, int x1, int y1) {
+        int dx = x1 - x0;
+        int dy = y1 - y0;
+        int len2 = dx * dx + dy * dy;
+        if (len2 == 0) {
+            int ddx = px - x0;
+            int ddy = py - y0;
+            return ChartView.ISqrt(ddx * ddx + ddy * ddy);
+        }
+        int t = ((px - x0) * dx + (py - y0) * dy) * 1000 / len2;
+        if (t < 0) { t = 0; }
+        if (t > 1000) { t = 1000; }
+        int qx = x0 + dx * t / 1000;
+        int qy = y0 + dy * t / 1000;
+        int ddx = px - qx;
+        int ddy = py - qy;
+        return ChartView.ISqrt(ddx * ddx + ddy * ddy);
+    }
+
+    // 沿折线分段绘制虚线/点线：每边独立按 dash 实 / gap 空
+    // 交替（相位在顶点处重置），整数坐标，确定性。
+    public static void DrawDashed(Canvas c, List<int> px, List<int> py, int color,
+    int width, int dash, int gap) {
+        int n = px.Count;
+        if (n < 2) { return; }
+        int cycle = dash + gap;
+        if (cycle < 1) { cycle = 1; }
+        for (int i = 1; i < n; i = i + 1) {
+            int x0 = px[i - 1];
+            int y0 = py[i - 1];
+            int x1 = px[i];
+            int y1 = py[i];
+            int dx = x1 - x0;
+            int dy = y1 - y0;
+            int len = ChartView.ISqrt(dx * dx + dy * dy);
+            if (len < 1) { continue; }
+            int traveled = 0;
+            while (traveled < len) {
+                int off = traveled % cycle;
+                int take = len - traveled;
+                if (off < dash) {
+                    int rem = dash - off;
+                    if (rem < take) { take = rem; }
+                    int ex = x0 + dx * (traveled + take) / len;
+                    int ey = y0 + dy * (traveled + take) / len;
+                    c.DrawLine(x0 + dx * traveled / len, y0 + dy * traveled / len,
+                    ex, ey, color, width);
+                } else {
+                    int rem = cycle - off;
+                    if (rem < take) { take = rem; }
+                }
+                traveled = traveled + take;
+            }
+        }
+    }
+
+    // 多边形扫描线填充（半透明，用于雷达 areaStyle）。逐行在
+    // 像素中心 (y+0.5) 求边交点（1/256 定点 x）、排序后成对填
+    // 段；段的首末列按小数覆盖率混合——整数交点配硬 FillRect
+    // 会让雷达斜边成整列硬跳的阶梯。顶点数少（雷达 ≤ 十几轴），
+    // O(高×边) 足够。
+    public static void FillPolyAlpha(Canvas c, List<int> px, List<int> py,
+    int color, int alpha) {
+        int n = px.Count;
+        if (n < 3 || py.Count < n) { return; }
+        int y0 = py[0];
+        int y1 = py[0];
+        for (int i = 1; i < n; i = i + 1) {
+            if (py[i] < y0) { y0 = py[i]; }
+            if (py[i] > y1) { y1 = py[i]; }
+        }
+        Chart.renderContext.EnsureScratch();
+        List<int> xs = Chart.renderContext.scratchI7;
+        for (int y = y0; y <= y1; y = y + 1) {
+            xs.Clear();
+            // 采样行中心 y+0.5（2 倍定点避免小数）：t =
+            // (y+0.5-ya)/(yb-ya)，交点 x*256。半开区间 [min,max)
+            // 防止顶点行重复计入。
+            int yc2 = y * 2 + 1;
+            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                int j = i2 + 1;
+                if (j == n) { j = 0; }
+                int ya = py[i2];
+                int yb = py[j];
+                if (ya == yb) { continue; }
+                bool inside = (yc2 >= ya * 2 && yc2 < yb * 2)
+                || (yc2 >= yb * 2 && yc2 < ya * 2);
+                if (!inside) { continue; }
+                xs.Add(px[i2] * 256
+                + (yc2 - ya * 2) * (px[j] - px[i2]) * 256 / (2 * (yb - ya)));
+            }
+            // 插入排序（xs 通常 2~4 个元素）。
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) { xs[b + 1] = xs[b]; b = b - 1; }
+                xs[b + 1] = v;
+            }
+            for (int k = 0; k + 1 < xs.Count; k = k + 2) {
+                FillSpanAlpha(c, xs[k], xs[k + 1], y, color, alpha);
+            }
+        }
+    }
+
+    // 一条水平段的亚像素填充：两端以 1/256 px 给定，首末列按
+    // 小数覆盖率混合，中间整列实铺。
+    public static void FillSpanAlpha(Canvas c, int xF0, int xF1, int y,
+    int color, int alpha) {
+        if (xF1 <= xF0) { return; }
+        int x0 = xF0 / 256;
+        int x1 = (xF1 - 1) / 256;
+        for (int x = x0; x <= x1; x = x + 1) {
+            int cov = 256;
+            if (x == x0) { cov = cov - (xF0 - x0 * 256); }
+            if (x == x1) { cov = cov - ((x1 + 1) * 256 - xF1); }
+            if (cov <= 0) { continue; }
+            c.FillRect(x, y, 1, 1, ChartColor.WithAlpha(color, alpha * cov / 256));
+        }
+    }
+
+    // 非零环绕填充：弦图缎带过圆心自交，偶奇规则会挖空。
+    public static void FillPolyWinding(Canvas c, List<int> px, List<int> py,
+    int color, int alpha) {
+        int n = px.Count;
+        if (n < 3 || py.Count < n) { return; }
+        int y0 = py[0];
+        int y1 = py[0];
+        for (int i = 1; i < n; i = i + 1) {
+            if (py[i] < y0) { y0 = py[i]; }
+            if (py[i] > y1) { y1 = py[i]; }
+        }
+        Chart.renderContext.EnsureScratch();
+        List<int> xs = Chart.renderContext.scratchI7;
+        List<int> ds = Chart.renderContext.scratchI8;
+        for (int y = y0; y <= y1; y = y + 1) {
+            xs.Clear();
+            ds.Clear();
+            // 与 FillPolyAlpha 同款：采样行中心 y+0.5，交点 1/256
+            // 定点，段首末列小数覆盖率混合（FillSpanAlpha）。
+            int yc2 = y * 2 + 1;
+            for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                int j = i2 + 1;
+                if (j == n) { j = 0; }
+                int ya = py[i2];
+                int yb = py[j];
+                if (ya == yb) { continue; }
+                bool inside = (yc2 >= ya * 2 && yc2 < yb * 2)
+                || (yc2 >= yb * 2 && yc2 < ya * 2);
+                if (!inside) { continue; }
+                xs.Add(px[i2] * 256
+                + (yc2 - ya * 2) * (px[j] - px[i2]) * 256 / (2 * (yb - ya)));
+                int dir = 1;
+                if (yb < ya) { dir = 0 - 1; }
+                ds.Add(dir);
+            }
+            for (int a = 1; a < xs.Count; a = a + 1) {
+                int v = xs[a];
+                int d = ds[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > v) {
+                    xs[b + 1] = xs[b];
+                    ds[b + 1] = ds[b];
+                    b = b - 1;
+                }
+                xs[b + 1] = v;
+                ds[b + 1] = d;
+            }
+            int wind = 0;
+            for (int k = 0; k + 1 < xs.Count; k = k + 1) {
+                wind = wind + ds[k];
+                if (wind != 0) {
+                    FillSpanAlpha(c, xs[k], xs[k + 1], y, color, alpha);
+                }
+            }
+        }
+    }
+
+    // ==== 整数 / 三角函数辅助（定点数，*1000） ====
+
+    // 整数平方根（向下取整；v <= 0 返回 0）。
+    public static int ISqrt(int v) {
+        if (v <= 0) { return 0; }
+        return (int)Math.Sqrt((double)v);
+    }
+
+    // sin(deg) × 1000，Bhaskara I 近似（误差 < 0.2%）。
+    public static int SinDeg(int deg) {
+        int d = deg % 360;
+        if (d < 0) { d = d + 360; }
+        int sign = 1;
+        if (d >= 180) { d = d - 180; sign = 0 - 1; }
+        int num = 4 * d * (180 - d);
+        int den = 40500 - d * (180 - d);
+        if (den == 0) { den = 1; }
+        return sign * (num * 1000 / den);
+    }
+
+    // cos(deg) × 1000（借 SinDeg(deg + 90)）。
+    public static int CosDeg(int deg) { return ChartView.SinDeg(deg + 90); }
+
+    // ECharts `radius:'pct%'`：半径 = pct% × min(w,h)/2。
+    // 饼/环/玫瑰/和弦共用，避免撑满绘图区把标签和圆弧裁掉。
+    public static int RadialRadius(int areaW, int areaH, int pct) {
+        int m = areaW;
+        if (areaH < m) { m = areaH; }
+        if (pct < 20) { pct = 20; }
+        if (pct > 90) { pct = 90; }
+        int r = m * pct / 200;
+        if (r < 8) { r = 8; }
+        return r;
+    }
+
+    // 闭合多边形特效描边：坐标放大 ×256 后交给
+    // DrawPolylineFx（首尾点相连），th 为笔触宽。
+    public static void StrokePolyFx(Canvas c, List<int> px, List<int> py,
+    int color, int th) {
+        int n = px.Count;
+        if (n < 2 || py.Count < n) { return; }
+        List<int> fx = new List<int>();
+        List<int> fy = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            fx.Add(px[i] * 256);
+            fy.Add(py[i] * 256);
+        }
+        fx.Add(px[0] * 256);
+        fy.Add(py[0] * 256);
+        c.DrawPolylineFx(fx, fy, color, th);
+    }
+
+    // FillSector 角 `a`（0=12 点顺时针）对应的屏幕方向分量（×1000）。
+    // CosDeg/SinDeg 的 0 在 3 点钟，不能直接当扇区方向用。
+    public static int FillDx(int a) { return ChartView.SinDeg(a); }
+    // 同 FillDx，屏幕 y 方向分量。
+    public static int FillDy(int a) { return ChartView.SinDeg(a + 270); }
+    // 圆心 cx + 半径 r + FillSector 角 a -> 屏幕 x。
+    public static int FillX(int cx, int r, int a) {
+        return cx + ChartView.FillDx(a) * r / 1000;
+    }
+    // 同 FillX，屏幕 y。
+    public static int FillY(int cy, int r, int a) {
+        return cy + ChartView.FillDy(a) * r / 1000;
+    }
+
+    // 把系列图形裁进坐标网格，避免圆点/折线/柱帽画出轴线。
+    public static void PushPlotClip(App app, int plotX, int plotY, int plotW, int plotH) {
+        app.canvas.PushClip(plotX, plotY, plotW, plotH);
+    }
+
+    // 把文本画进 clip 矩形：先平移进框，再用裁剪挡住残余溢出。
+    public static void DrawTextClamped(Canvas c, int x, int y, string text,
+    int color, int fs,
+    int clipX, int clipY, int clipW, int clipH) {
+        if (clipW < 1 || clipH < 1 || text.Length < 1) { return; }
+        int tw = Canvas.MeasureText(text, fs);
+        int th = Canvas.FontHeight(fs);
+        if (x + tw > clipX + clipW) { x = clipX + clipW - tw; }
+        if (y + th > clipY + clipH) { y = clipY + clipH - th; }
+        if (x < clipX) { x = clipX; }
+        if (y < clipY) { y = clipY; }
+        c.PushClip(clipX, clipY, clipW, clipH);
+        c.DrawText(x, y, text, color, fs);
+        c.PopClip();
+    }
+
+    // 极坐标标签：按象限锚定（左半右对齐、右半左对齐），并钳进绘图区。
+    public static void DrawPolarLabel(App app, Canvas c, int cx, int cy, int r, int ang,
+    string lbl, int color, int fs,
+    int boxX, int boxY, int boxW, int boxH) {
+        if (lbl.Length < 1) { return; }
+        int gap = app.Scale(8);
+        int lx = cx + ChartView.CosDeg(ang) * (r + gap) / 1000;
+        int ly = cy + ChartView.SinDeg(ang) * (r + gap) / 1000;
+        int tw = Canvas.MeasureText(lbl, fs);
+        int th = Canvas.FontHeight(fs);
+        int cosv = ChartView.CosDeg(ang);
+        int sinv = ChartView.SinDeg(ang);
+        if (cosv < 0 - 200) { lx = lx - tw; }
+        else if (cosv < 200) { lx = lx - tw / 2; }
+        if (sinv < 0 - 200) { ly = ly - th; }
+        else if (sinv < 200) { ly = ly - th / 2; }
+        else { ly = ly - th / 4; }
+        ChartView.DrawTextClamped(c, lx, ly, lbl, color, fs, boxX, boxY, boxW, boxH);
+    }
+
+    // 环形轮廓：一圈 1px 细圆（仪表盘/水球图的底环描边）。
+    public static void RingOutline(Canvas c, int cx, int cy, int r, int color) {
+        c.DrawCircle(cx, cy, r, color, 1);
+    }
+
+    // visualMap 取色带与值域推导（直角热力图 / 矩阵图共用车道）：
+    // 全局 o.rampColors（显式 continuous 已接线）优先，否则第一条
+    // visualMap 的 rangeColors（continuous 缺省带在解析期已填、
+    // piecewise 的 inRange.color 也在这里）。值域同源：声明过
+    // min/max 用原始值，否则数据包络 eLo/eHi；退化区间强制宽度 1。
+    public static RampDomainResult VisualRampDomain(ChartOption o, double eLo, double eHi) {
+        RampDomainResult r = new RampDomainResult();
+        ChartVisualMap vm = o.visualMaps.Count > 0 ? o.visualMaps[0] : null;
+        r.ramp = o.rampColors;
+        if (vm != null) {
+            if (r.ramp == null || r.ramp.Count < 2) {
+                r.ramp = vm.rangeColors;
+            }
+            if (vm.type == 1) {
+                r.split = vm.splitNumber > 0 ? vm.splitNumber : 5;
+            }
+        }
+        r.dLo = eLo;
+        r.dHi = eHi;
+        if (vm != null) {
+            if (vm.hasMin && vm.minRaw != ChartOption.Auto()) {
+                r.dLo = (double)vm.minRaw;
+            }
+            if (vm.hasMax && vm.maxRaw != ChartOption.Auto()) {
+                r.dHi = (double)vm.maxRaw;
+            }
+        }
+        if (r.dHi - r.dLo < 0.000001) { r.dHi = r.dLo + 1.0; }
+        return r;
+    }
+
+    // 饼图图例候选收集（饼图本体与矩阵内嵌饼共用）：逐数据项、
+    // 跨系列同名去重（取首个）；空名跳过；legend.data 白名单存在
+    // 时按白名单过滤。隐藏系列不过滤（与既有行为一致）。
+    public static List<PieLegendItem> PieLegendCollect(ChartOption o) {
+        List<PieLegendItem> cands = new List<PieLegendItem>();
+        for (int si = 0; si < o.series.Count; si = si + 1) {
+            ChartSeries ps = o.series[si];
+            if (ps.type != ChartType.Pie) { continue; }
+            for (int di = 0; di < ps.data.Count; di = di + 1) {
+                string nmm = PieLayout.SliceName(ps, di);
+                if (nmm.Length < 1) { continue; }
+                bool dup = false;
+                for (int ci = 0; ci < cands.Count; ci = ci + 1) {
+                    if (cands[ci].name == nmm) { dup = true; break; }
+                }
+                if (dup) { continue; }
+                if (o.legendData != null && o.legendData.Count > 0) {
+                    bool white = false;
+                    for (int wl = 0; wl < o.legendData.Count; wl = wl + 1) {
+                        if (o.legendData[wl] == nmm) { white = true; break; }
+                    }
+                    if (!white) { continue; }
+                }
+                cands.Add(new PieLegendItem(si, di, nmm));
+            }
+        }
+        return cands;
+    }
+
+    // 组内定宽收尾（直角柱 / 极角柱共用）：未显式声明宽的列（0）
+    // 用剩余带宽均分值补齐，随后求整组占宽——组间才有缝（每列
+    // 各 +gapPct），组尾那道 barGap 扣掉（barGrid.ts:317-346 /
+    // barPolar.ts:281-300 同一规则）。stackW 就地补齐供绘制续用。
+    public static double BarGroupWidthSum(List<double> stackW, int nStack,
+    double autoW, double gapPct) {
+        double widthSum = 0.0;
+        for (int i = 0; i < nStack; i = i + 1) {
+            if (stackW[i] == 0.0) { stackW[i] = autoW; }
+            widthSum = widthSum + stackW[i] * (1.0 + gapPct);
+        }
+        return widthSum - stackW[nStack - 1] * gapPct;
+    }
+
+    // 快照指纹的声明输入折叠（直角热力图与矩阵图共用，两侧指纹
+    // 必须同演化——否则同一声明在两图上得到不同指纹，悬停缓存
+    // 一边失效一边命中）。折叠：全局色带 + 第一条 visualMap 的
+    // 类型/分片数/值域声明/rangeColors。
+    public static int VisualInputFold(int f, ChartOption o) {
+        if (o.rampColors != null) {
+            for (int i = 0; i < o.rampColors.Count; i = i + 1) {
+                f = (f * 31 + o.rampColors[i]) % 2000000000;
+            }
+        }
+        if (o.visualMaps.Count > 0) {
+            ChartVisualMap vm = o.visualMaps[0];
+            f = (f * 31 + vm.type * 3 + vm.splitNumber * 5
+            + vm.minRaw * 7 + vm.maxRaw * 11
+            + (vm.hasMin ? 1 : 0) + (vm.hasMax ? 2 : 0)) % 2000000000;
+            for (int i = 0; i < vm.rangeColors.Count; i = i + 1) {
+                f = (f * 31 + vm.rangeColors[i]) % 2000000000;
+            }
+        }
+        return f;
+    }
+}

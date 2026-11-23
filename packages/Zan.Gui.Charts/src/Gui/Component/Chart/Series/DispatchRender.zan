@@ -1,0 +1,417 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartView {
+    // OnPaint 的帧内实现：解析 option、按需播放入场动画并分发绘制。
+    // 外部只能把 ChartView 放进 retained Control 树，不能再逐帧传矩形 Render。
+    // Only RenderCached may supply its resolution from the same synchronous call.
+    // Never persist an identity-based model cache: public fields/lists can mutate.
+    void RenderFrame(App app, int x, int y, int w, int h) {
+        if (this.disposed) { return; }
+        if (app == null) { app = App.FrameApp(); }
+        if (app == null) { return; }
+        if (this.resolved == null || this.option == null) { return; }
+        if (this.option.backgroundColor != 0) {
+            if (this.option.backgroundGradStops != null
+            && this.option.backgroundGradStops.Count >= 2) {
+                int cFrom = this.option.backgroundGradStops[0];
+                int cVia = this.option.backgroundGradStops.Count >= 3
+                ? this.option.backgroundGradStops[1] : 0;
+                int cTo = this.option.backgroundGradStops[
+                this.option.backgroundGradStops.Count - 1];
+                app.canvas.FillGradMask(x, y, w, h, 0, 15, 0, cFrom, cVia, cTo);
+            } else {
+                app.canvas.FillRect(x, y, w, h, this.option.backgroundColor);
+            }
+        }
+
+        int g = preparedGrowth;
+
+        ChartOption drawOption = option;
+        Chart.toolReserve = 0;
+        Chart.legendOpt = drawOption;  // 图例 orient/selectedMode/formatter 的帧内来源
+        if (drawOption.toolboxShow) {
+            Chart.toolReserve = ChartToolbox.Width(app, drawOption);
+        }
+        // dataRange 条固定在控件底部：分派前把高度扣掉，面板与
+        // 绘图区只在剩余矩形里布局（同 toolReserve 的帧内约定）。
+        int innerH = bodyHeight;
+        int drH = h - bodyHeight;
+
+        // 把每种图表裁剪到自己的矩形，防止绘图线、柱条、
+        // 轴标签和图例溢出到相邻控件。
+        // emphasis.focus='series' 渐隐的帧内状态源：读 wid 悬停槽里
+        // 上一帧的命中（下面的渲染会重置并重测 currentHit），该系列
+        // 声明 focus:'series' 时渲染器把其余系列乘残透明（官方
+        // bump 图"鼠标经过其余线渐变"的观感）。
+        ChartColor.fadeFocusIdx = -1;
+        ChartHit hoverPrev = this.lastHoverHit;
+        if (hoverPrev != null && hoverPrev.seriesIndex >= 0
+        && hoverPrev.seriesIndex < drawOption.series.Count
+        && drawOption.series[hoverPrev.seriesIndex].emphasisFocus
+        == "series") {
+            ChartColor.fadeFocusIdx = hoverPrev.seriesIndex;
+        }
+        ChartView.activeEventView = this;
+        // ChartView 自身就是根命中节点；图例、工具箱等由 retained
+        // ChartActionControl 子节点优先接收路由事件。
+        app.canvas.PushClip(x, y, w, h);
+        ChartView.PaintPreparedPanel(app, preparedPanel);
+        if (drH > 0) {
+            ChartViewDataRange.Draw(app, x, y + innerH, w, drH, drawOption);
+        }
+        app.canvas.PopClip();
+
+        // ECharts 工具箱：右上角。o.toolboxShow 关闭时不画；外挂控件模式下由宿主托管，跳过 Canvas 自绘。
+        if (drawOption.toolboxShow) {
+            if (!this.suppressCanvasToolbox) {
+                ChartView.DrawToolbox(app, x, y, w, h, this.wid, drawOption);
+            }
+        }
+        ChartView.DrawStatusState(app, x, y, w, h,
+        this.Status(), this.StatusMessage());
+
+        ChartView.activeEventView = null;
+        Chart.EndFrame();
+    }
+
+    // 工具箱「魔法类型」落地：magic 1/2 把全部 Line/Bar 系列的
+    // type 就地改为 Line/Bar（切柱状时关掉 areaStyle）；其余值
+    // 空操作。
+    public static void ApplyMagic(ChartOption o, int magic) {
+        if (magic != 1 && magic != 2) { return; }
+        ChartType t = ChartType.Line;
+        if (magic == 2) { t = ChartType.Bar; }
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (s.type == ChartType.Line || s.type == ChartType.Bar) {
+                s.type = t;
+                if (t == ChartType.Bar) { s.areaStyle = false; }
+            }
+        }
+    }
+
+    // 显式分发：每个 kind 都有一个明确的分支。没有未知
+    // kind 回退为折线图；未知/空 kind 绘制明确空状态。
+    void DispatchRender(App app, int x, int y, int w, int h, int g) {
+        ChartOption option = this.option;
+        // 多 grid 布局（grid[] ≥ 2）全 kind 通用拆分：按 series.
+        // xAxisIndex 分组，每组在自己的 grid 矩形里重入分发链；
+        // 标题/图例只在全局面板坐标画一次。
+        if (option.grids.Count > 1 && !option.overlay) {
+            ChartView.DrawMultiGridPanels(app, x, y, w, h, option, g);
+            return;
+        }
+        ChartView.RenderOrdered(app, x, y, w, h, option, g);
+    }
+
+    // 分发链本体：DispatchRender 与多 grid 子面板共用（子 option
+    // 的 kind 按组内系列重算，蜡烛+成交量、行/列布局混排各自
+    // 落到正确的渲染器）。
+    static void RenderOnce(App app, int x, int y, int w, int h,
+    ChartOption option, int g) {
+        // N7 z/zlevel 绘制序兜底重排（Resolve 主路径已在解析期把
+        // 系列表排成 ZOrder 序，这里的调用覆盖直接以源 option 渲染的
+        // 路径——Keyed 缓存 miss、图例回放、探针直渲）。同键保持声明
+        // 序，本帧排序不回写源 option，声明序恒为准。
+        if (!option.overlay) { ChartView.ZSort(option); }
+        ChartView.RenderOrdered(app, x, y, w, h, option, g);
+    }
+
+    // ResolvedChart already established draw order; retain RenderOnce's sort
+    // for direct callers, while the normal frame avoids a second argsort.
+    static void RenderOrdered(App app, int x, int y, int w, int h,
+    ChartOption option, int g) {
+        ChartPreparedPanel panel = ChartView.PaintPanel(option, x, y, w, h);
+        string kind = panel != null ? panel.kind : ChartView.DispatchKind(option);
+        ChartSeries leadS = ChartView.LeadSeries(option);
+        // 底部图例占位每图清零（不经 DrawPanelI 的视图不背上一图的值）。
+        Chart.legendBottomReserve = 0;
+        ISeriesRenderer renderer = SeriesRendererRegistry.Find(kind);
+        if (renderer != null) {
+            renderer.Render(app, x, y, w, h, option, g);
+        } else if (!ChartView.DispatchBuiltin(app, x, y, w, h, option, g, kind)) {
+            ChartView.DrawEmptyState(app, x, y, w, h, option);
+        }
+        // 同 option 混搭（ECharts 每系列自带坐标系/几何）：面板按
+        // 主导系列画完后，pie / gauge / funnel 系列按自身 center/
+        // radius 叠加绘制（mix2 柱状饼、mix3 地图玫瑰饼、mix11
+        // 仪表盘+双漏斗、mix12 折线饼图）。
+        ChartView.DrawOverlaySeries(app, x, y, w, h, option, g, kind);
+        if (option.graphics != null && option.graphics.Count > 0 && kind != "graphic") {
+            ChartView.DrawGraphic(app, x, y, w, h, option, g);
+        }
+    }
+
+    // 混搭覆盖层：把与面板主导类型不同的 pie/gauge/funnel 系列
+    // 逐条再画一遍。覆盖层 option 置 overlay=true（渲染器跳过
+    // 面板底/头），交互键沿用 o.iwid（悬停/命中与整板一致）。
+    public static void DrawOverlaySeries(App app, int x, int y, int w, int h,
+    ChartOption o, int g, string kind) {
+        ChartPreparedPanel panel = ChartView.PaintPanel(o, x, y, w, h);
+        if (panel == null) { return; }
+        for (int i = 0; i < panel.overlays.Count; i = i + 1) {
+            ChartView.PaintPreparedPanel(app, panel.overlays[i]);
+        }
+    }
+
+    // ---- graphic 原生矢量组件绘制入口 ----
+    public static void DrawGraphic(App app, int x, int y, int w, int h, ChartOption o, int g) {
+        if (o.graphics == null || o.graphics.Count == 0) { return; }
+        Canvas c = app.canvas;
+        int top = ChartView.PanelHead(app, x, y, w, h, o.title);
+        int pad = app.theme.paddingMedium;
+        int areaY = top;
+        int areaH = (y + h - pad) - top;
+        if (areaH < app.Scale(16)) { areaH = app.Scale(16); }
+
+        for (int i = 0; i < o.graphics.Count; i = i + 1) {
+            ChartView.DrawGraphicElement(app, c, x, areaY, w, areaH, o.graphics[i], g);
+        }
+    }
+
+    public static void DrawGraphicElement(App app, Canvas c, int px, int py, int pw, int ph, ChartGraphic el, int g) {
+        if (el == null) { return; }
+        int elX = px + app.Scale(el.x);
+        int elY = py + app.Scale(el.y);
+        if (el.left == "center") {
+            elX = px + pw / 2;
+        } else if (el.left == "right") {
+            elX = px + pw;
+        } else if (el.left.Length > 0 && el.left != "left") {
+            int num = 0;
+            for (int k = 0; k < el.left.Length; k = k + 1) {
+                char ch = el.left[k];
+                if (ch >= '0' && ch <= '9') { num = num * 10 + (ch - '0'); }
+            }
+            if (el.left.EndsWith("%")) {
+                elX = px + pw * num / 100;
+            } else if (num > 0) {
+                elX = px + app.Scale(num);
+            }
+        }
+
+        if (el.top == "center" || el.top == "middle") {
+            elY = py + ph / 2;
+        } else if (el.top == "bottom") {
+            elY = py + ph;
+        } else if (el.top.Length > 0 && el.top != "top") {
+            int num2 = 0;
+            for (int k = 0; k < el.top.Length; k = k + 1) {
+                char ch = el.top[k];
+                if (ch >= '0' && ch <= '9') { num2 = num2 * 10 + (ch - '0'); }
+            }
+            if (el.top.EndsWith("%")) {
+                elY = py + ph * num2 / 100;
+            } else if (num2 > 0) {
+                elY = py + app.Scale(num2);
+            }
+        }
+
+        if (el.type == "group") {
+            for (int ci = 0; ci < el.children.Count; ci = ci + 1) {
+                ChartView.DrawGraphicElement(app, c, elX, elY, pw, ph, el.children[ci], g);
+            }
+            return;
+        }
+
+        if (el.type == "rect") {
+            int rx = elX + app.Scale(el.shapeX);
+            int ry = elY + app.Scale(el.shapeY);
+            int rw = app.Scale(el.shapeW > 0 ? el.shapeW : 10);
+            int rh = app.Scale(el.shapeH > 0 ? el.shapeH : 10);
+            if (el.left == "center") { rx = rx - rw / 2; }
+            if (el.top == "center" || el.top == "middle") { ry = ry - rh / 2; }
+            if (el.hasFill && el.fill != 0) {
+                c.FillRect(rx, ry, rw, rh, el.fill);
+            }
+            if (el.stroke != 0) {
+                c.DrawRect(rx, ry, rw, rh, el.stroke, app.Scale(el.strokeWidth > 0 ? el.strokeWidth : 1));
+            }
+        } else if (el.type == "circle") {
+            int cx = elX;
+            int cy = elY;
+            int cr = app.Scale(el.shapeR > 0 ? el.shapeR : 5);
+            if (el.hasFill && el.fill != 0) {
+                c.FillCircle(cx, cy, cr, el.fill);
+            }
+            if (el.stroke != 0) {
+                c.DrawCircle(cx, cy, cr, el.stroke, app.Scale(el.strokeWidth > 0 ? el.strokeWidth : 1));
+            }
+        } else if (el.type == "text") {
+            if (el.text != null && el.text.Length > 0) {
+                int fs = app.Scale(el.fontSize > 0 ? el.fontSize : 14);
+                int col = el.hasFill && el.fill != 0 ? el.fill : (el.stroke != 0 ? el.stroke : Chart.TitleColor());
+                List<string> lines = el.text.Split("\n");
+                int lineH = Canvas.FontHeight(fs) + app.Scale(4);
+                int totalH = lines.Count * lineH;
+                int startY = elY;
+                if (el.top == "center" || el.top == "middle") {
+                    startY = elY - totalH / 2;
+                }
+                for (int li = 0; li < lines.Count; li = li + 1) {
+                    string line = lines[li];
+                    int tw = Canvas.MeasureText(line, fs);
+                    int lx = elX;
+                    if (el.left == "center") { lx = elX - tw / 2; }
+                    else if (el.left == "right") { lx = elX - tw; }
+                    if (el.fontWeight == "bold") {
+                        c.DrawTextBold(lx, startY + li * lineH, line, col, fs);
+                    } else {
+                        c.DrawText(lx, startY + li * lineH, line, col, fs);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 富文本排版与绘制引擎见 Series/ChartRichText.zan (RichLayout, DrawTextStyled, RichDraw) ----
+
+    // 内置系列类型直通光栅化分发（解耦空壳中转，提高帧率吞吐）
+    public static bool DispatchBuiltin(App app, int x, int y, int w, int h,
+    ChartOption option, int g, string kind) {
+        if (kind == "pie" || kind == "rose") {
+            ChartView.DrawPie(app, x, y, w, h, option, option.pieLabels, g);
+            return true;
+        }
+        if (kind == "bar" || kind == "hbar" || kind == "barStacked" || kind == "barStackedHbar") {
+            bool stacked = kind == "barStacked" || kind == "barStackedHbar";
+            bool hbar = kind == "hbar" || kind == "barStackedHbar";
+            ChartView.DrawBars(app, x, y, w, h, option, g, stacked, hbar);
+            return true;
+        }
+        if (kind == "stackedArea") {
+            ChartView.DrawStackedArea(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "lines") {
+            ChartView.DrawLines(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "scatter") {
+            ChartView.DrawScatter(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "bubbles") {
+            ChartView.DrawBubbles(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "calendar") {
+            ChartView.DrawCalendar(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "matrix") {
+            ChartView.DrawMatrix(app, x, y, w, h, option, g);
+            if (!option.overlay) {
+                ChartView.MatrixHover(app, x, y, w, h, option);
+            }
+            return true;
+        }
+        if (kind == "polarCoord") {
+            ChartView.DrawPolarCoord(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "gauge") {
+            ChartView.DrawGauge(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "radar") {
+            ChartView.DrawPolar(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "heatmap") {
+            ChartView.DrawHeatmap(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "wordCloud") {
+            ChartView.DrawWordCloud(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "funnel") {
+            ChartSeries leadS = ChartView.LeadSeries(option);
+            bool pyramid = false;
+            if (leadS != null && leadS.sort == "ascending") { pyramid = true; }
+            ChartView.DrawFunnel(app, x, y, w, h, option, g, pyramid);
+            return true;
+        }
+        if (kind == "treemap") {
+            ChartView.DrawTreemap(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "tree") {
+            ChartView.DrawTree(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "sankey") {
+            ChartView.DrawSankey(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "sunburst") {
+            ChartView.DrawSunburst(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "k") {
+            ChartView.DrawCandles(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "box") {
+            ChartView.DrawBox(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "error") {
+            ChartView.DrawError(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "waterfall") {
+            ChartView.DrawWaterfall(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "chord") {
+            ChartView.DrawChord(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "force") {
+            ChartView.DrawForce(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "venn") {
+            ChartView.DrawVenn(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "map") {
+            ChartView.DrawMap(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "eventRiver") {
+            ChartView.DrawEventRiver(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "radialBars") {
+            ChartView.DrawRadialBars(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "pictorialBar") {
+            ChartView.DrawPictorialBar(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "parallel") {
+            ChartView.DrawParallel(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "themeRiver") {
+            ChartView.DrawThemeRiver(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "linesCustom") {
+            ChartView.DrawLinesCustom(app, x, y, w, h, option, g);
+            return true;
+        }
+        if (kind == "graphic") {
+            ChartView.DrawGraphic(app, x, y, w, h, option, g);
+            return true;
+        }
+        return false;
+    }
+}

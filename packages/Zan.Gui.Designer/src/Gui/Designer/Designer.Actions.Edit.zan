@@ -1,0 +1,496 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Markup;
+
+namespace Gui.Designer;
+
+// Designer 模块：撤销/重做、剪贴板、微调缩放、成组与层级移动
+partial class Designer {
+    // --- 撤销 / 重做（独立结构化文档快照，同场景设计器） ----------
+
+    // 记录当前设计；在任何修改前调用。当前状态和栈顶相同
+    // （上一次压栈后设计没真正变过）时不重复压栈。
+    public void PushUndo() {
+        this.PushUndoAction("");
+    }
+
+    public void PushUndoAction(string action) {
+        if (undoStack.Count > 0 && this.DocumentMatchesSnapshot(undoStack[undoStack.Count - 1])) {
+            if (action != "" && undoActionStack.Count > 0) {
+                undoActionStack[undoActionStack.Count - 1] = action;
+            }
+            return;
+        }
+        string act = action != "" ? action : (pendingUndoAction != "" ? pendingUndoAction : Designer.T("change", "修改"));
+        pendingUndoAction = "";
+        undoStack.Add(this.CaptureDocumentSnapshot());
+        undoActionStack.Add(act);
+        if (undoStack.Count > 60) {
+            undoStack.RemoveAt(0);
+            if (undoActionStack.Count > 0) { undoActionStack.RemoveAt(0); }
+        }
+        redoStack = new List<DesignerDocumentSnapshot>();
+        redoActionStack = new List<string>();
+        this.MarkDocDirty();
+    }
+
+    // 拖拽/缩放结束（或任何「压了栈但没改成」的操作收尾）时调用：
+    // 设计和栈顶一致说明这次操作没有实际改动，把栈顶退掉，
+    // 免得 Ctrl+Z 第一脚踩空。
+    public void PopUndoIfUnchanged() {
+        if (undoStack.Count > 0 && this.DocumentMatchesSnapshot(undoStack[undoStack.Count - 1])) {
+            undoStack.RemoveAt(undoStack.Count - 1);
+            if (undoActionStack.Count > 0) {
+                undoActionStack.RemoveAt(undoActionStack.Count - 1);
+            }
+        }
+    }
+
+    // 撤销：当前设计压入重做栈，载入撤销栈顶；栈空时仅提示。
+    // Restore copies the model without consuming it or clearing either history stack.
+    public void Undo() {
+        if (undoStack.Count == 0) {
+            msg = Designer.T("nothing to undo", "没有可撤销的操作");
+            return;
+        }
+        redoStack.Add(this.CaptureDocumentSnapshot());
+        string act = Designer.T("change", "修改");
+        if (undoActionStack.Count > 0) {
+            act = undoActionStack[undoActionStack.Count - 1];
+            undoActionStack.RemoveAt(undoActionStack.Count - 1);
+        }
+        redoActionStack.Add(act);
+        DesignerDocumentSnapshot document = undoStack[undoStack.Count - 1];
+        undoStack.RemoveAt(undoStack.Count - 1);
+        this.InstallDocumentSnapshot(document, false, false);
+        this.SyncFreeSelBase();
+        msg = Designer.T("undone: ", "已撤销: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(undoStack.Count) + Designer.T(" steps", " 步") + ")";
+    }
+
+    // 重做：当前设计压入撤销栈，载入重做栈顶；栈空时仅提示。
+    public void Redo() {
+        if (redoStack.Count == 0) {
+            msg = Designer.T("nothing to redo", "没有可重做的操作");
+            return;
+        }
+        undoStack.Add(this.CaptureDocumentSnapshot());
+        string act = Designer.T("change", "修改");
+        if (redoActionStack.Count > 0) {
+            act = redoActionStack[redoActionStack.Count - 1];
+            redoActionStack.RemoveAt(redoActionStack.Count - 1);
+        }
+        undoActionStack.Add(act);
+        DesignerDocumentSnapshot document = redoStack[redoStack.Count - 1];
+        redoStack.RemoveAt(redoStack.Count - 1);
+        this.InstallDocumentSnapshot(document, false, false);
+        this.SyncFreeSelBase();
+        msg = Designer.T("redone: ", "已重做: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(redoStack.Count) + Designer.T(" steps", " 步") + ")";
+    }
+
+    // --- 剪贴板：复制 / 粘贴选中项（容器连子级一起） --------------
+
+    // 复制选中项（含多选）为 FieldJson 片段列表；无选中时仅提示。
+    void CopySel() {
+        if (sel == null) {
+            msg = Designer.T("nothing to copy", "没有可复制的内容");
+            return;
+        }
+        List<FormField> all = new List<FormField>();
+        all.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] != sel) { all.Add(freeExtra[i]); }
+        }
+        clipFields = new List<string>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            clipFields.Add(this.FieldJson(all[i]).PrettyToJson());
+        }
+        msg = Designer.T("copied ", "已复制 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    // 粘贴的组件整组换新名字（含容器子级），避免和原组件、
+    // 以及代码后置里的字段撞名。
+    void RenameFresh(FormField f) {
+        f.fname = FormField.TypeKey(f.ftype) + Convert.ToString(seq);
+        f.name = f.fname;
+        seq = seq + 1;
+        for (int i = 0; i < f.kids.Count; i = i + 1) {
+            this.RenameFresh(f.kids[i]);
+        }
+    }
+
+    // 粘贴到原父容器（没有选中就贴到顶层），整组偏移 16px，
+    // 贴完的组成为新的选中组。
+    void PasteClip() {
+        if (clipFields == null || clipFields.Count == 0) {
+            msg = Designer.T("clipboard is empty", "剪贴板是空的");
+            return;
+        }
+        this.PushUndo();
+        FormField pc = null;
+        if (sel != null) { pc = ParentContainerOf(sel); }
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        this.ClearExtraSel();
+        sel = null;
+        for (int i = 0; i < clipFields.Count; i = i + 1) {
+            JsonValue o = JsonValue.ParseLenient(clipFields[i]);
+            if (o == null || !o.IsObject()) { continue; }
+            FormField nf = this.FieldFromJson(o);
+            nf.fx = nf.fx + 16;
+            nf.fy = nf.fy + 16;
+            this.RenameFresh(nf);
+            list.Add(nf);
+            if (sel == null) { sel = nf; } else { freeExtra.Add(nf); }
+        }
+        if (pc != null) { activeContainer = pc; }
+        inspTab = 0;
+        msg = Designer.T("pasted ", "已粘贴 ")
+            + Convert.ToString(clipFields.Count)
+            + Designer.T(" component(s)", " 个组件");
+    }
+
+    // 方向键微调整个多选组（自由布局；Shift=1px）。
+    void NudgeSel(int dx, int dy) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        this.NudgeOne(sel, dx, dy);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField ef = freeExtra[i];
+            if (ef == null || ef.locked) { continue; }
+            this.NudgeOne(ef, dx, dy);
+        }
+    }
+
+    // 单个组件按像素增量微调并钳制到非负坐标。
+    void NudgeOne(FormField f, int dx, int dy) {
+        if (f == null || f.locked) { return; }
+        this.DesignMakeFloat(f);
+        f.fx = f.fx + dx;
+        f.fy = f.fy + dy;
+        if (f.fx < 0) { f.fx = 0; }
+        if (f.fy < 0) { f.fy = 0; }
+        this.DesignDeclareRect(f);
+        this.MarkDocDirty();
+    }
+
+    void ResizeSelByKey(int dw, int dh) {
+        if (sel == null || sel.locked) { return; }
+        this.PushUndo();
+        this.ResizeOneByKey(sel, dw, dh);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField ef = freeExtra[i];
+            if (ef == null || ef.locked) { continue; }
+            this.ResizeOneByKey(ef, dw, dh);
+        }
+        msg = Designer.T("resized: ", "已调整尺寸: ") + Convert.ToString(sel.fw) + "x" + Convert.ToString(sel.fh);
+    }
+
+    void ResizeOneByKey(FormField f, int dw, int dh) {
+        if (f == null || f.locked) { return; }
+        this.DesignMakeFloat(f);
+        if (dw != 0) {
+            f.fw = f.fw + dw;
+            if (f.fw < 8) { f.fw = 8; }
+        }
+        if (dh != 0) {
+            f.fh = f.fh + dh;
+            if (f.fh < 8) { f.fh = 8; }
+        }
+        this.DesignDeclareRect(f);
+        this.MarkDocDirty();
+    }
+
+    // 锁定/解锁整个多选：以主选中项的状态取反，其余成员跟随，
+    // 这样一组组件的锁定状态始终一致。
+    void ToggleLockSel() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        bool on = !sel.locked;
+        sel.locked = on;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            freeExtra[i].locked = on;
+        }
+        if (on) { msg = Designer.T("locked", "已锁定"); }
+        else { msg = Designer.T("unlocked", "已解锁"); }
+    }
+
+    // 删除整个多选：先删附加项，再删主选中项。
+    // 无论从功能区按钮还是 Delete 键触发，都走这里，
+    // 保证多选里的每一个都被删掉（而不是只删主选中项）。
+    void DeleteSelGroup() {
+        if (sel != null || freeExtra.Count > 0) { this.PushUndo(); }
+        dropContainer = null;
+        activeContainer = null;
+        dragging = false;
+        dragFromPalette = false;
+        dragMoved = false;
+        dragIndex = -1;
+        List<FormField> extra = freeExtra;
+        freeExtra = new List<FormField>();
+        int n = 0;
+        for (int i = 0; i < extra.Count; i = i + 1) {
+            FormField f = extra[i];
+            if (f == null || f == sel) { continue; }
+            FormField pc = ParentContainerOf(f);
+            if (pc == null) { fields = ListRemove(fields, f); }
+            else { pc.kids = ListRemove(pc.kids, f); }
+            n = n + 1;
+        }
+        DeleteSel();
+        if (n > 0) {
+            msg = Designer.T("deleted selection", "已删除选中的组件");
+        }
+    }
+
+    // 一键成组：把多选的所有组件收纳进一个新的 Panel 容器 (Ctrl+G)，智能识别公共宿主容器与层级持久化
+    void GroupSel() {
+        if (sel == null || freeExtra == null || freeExtra.Count == 0) { return; }
+        this.PushUndo();
+        List<FormField> all = new List<FormField>();
+        all.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            all.Add(freeExtra[i]);
+        }
+        FormField commonParent = ParentContainerOf(all[0]);
+        bool sameParent = true;
+        for (int i = 1; i < all.Count; i = i + 1) {
+            if (ParentContainerOf(all[i]) != commonParent) {
+                sameParent = false;
+                break;
+            }
+        }
+        if (!sameParent) {
+            commonParent = null;
+        }
+
+        int minX = 0;
+        int minY = 0;
+        int maxX = 0;
+        int maxY = 0;
+        if (commonParent != null) {
+            minX = all[0].fx;
+            minY = all[0].fy;
+            maxX = all[0].fx + all[0].fw;
+            maxY = all[0].fy + all[0].fh;
+            for (int i = 1; i < all.Count; i = i + 1) {
+                FormField f = all[i];
+                if (f.fx < minX) { minX = f.fx; }
+                if (f.fy < minY) { minY = f.fy; }
+                int r = f.fx + f.fw;
+                int b = f.fy + f.fh;
+                if (r > maxX) { maxX = r; }
+                if (b > maxY) { maxY = b; }
+            }
+        } else {
+            minX = this.DesignWorldX(all[0]);
+            minY = this.DesignWorldY(all[0]);
+            maxX = minX + all[0].fw;
+            maxY = minY + all[0].fh;
+            for (int i = 1; i < all.Count; i = i + 1) {
+                FormField f = all[i];
+                int wx = this.DesignWorldX(f);
+                int wy = this.DesignWorldY(f);
+                if (wx < minX) { minX = wx; }
+                if (wy < minY) { minY = wy; }
+                int r = wx + f.fw;
+                int b = wy + f.fh;
+                if (r > maxX) { maxX = r; }
+                if (b > maxY) { maxY = b; }
+            }
+        }
+
+        int pad = 12;
+        int groupW = maxX - minX + pad * 2;
+        int groupH = maxY - minY + pad * 2;
+        if (groupW < 60) { groupW = 60; }
+        if (groupH < 40) { groupH = 40; }
+
+        FormField grp = FormField.New(15, seq);
+        seq = seq + 1;
+        grp.fname = "panel" + Convert.ToString(seq);
+        grp.name = grp.fname;
+        grp.fx = minX;
+        grp.fy = minY;
+        grp.fw = groupW;
+        grp.fh = groupH;
+        grp.position = 1;
+        grp.kids = new List<FormField>();
+
+        for (int i = 0; i < all.Count; i = i + 1) {
+            FormField f = all[i];
+            FormField pc = ParentContainerOf(f);
+            if (pc == null) { fields = ListRemove(fields, f); }
+            else { pc.kids = ListRemove(pc.kids, f); }
+            if (commonParent != null) {
+                f.fx = f.fx - minX + pad;
+                f.fy = f.fy - minY + pad;
+            } else {
+                f.fx = this.DesignWorldX(f) - minX + pad;
+                f.fy = this.DesignWorldY(f) - minY + pad;
+            }
+            grp.kids.Add(f);
+            this.DesignDeclareRect(f);
+        }
+
+        if (commonParent == null) {
+            fields.Add(grp);
+        } else {
+            commonParent.kids.Add(grp);
+        }
+        this.DesignDeclareRect(grp);
+        this.ClearExtraSel();
+        sel = grp;
+        activeContainer = grp;
+        this.MarkDocDirty();
+        msg = Designer.T("Grouped ", "已成组 ") + Convert.ToString(all.Count) + Designer.T(" components into ", " 个组件至 ") + grp.fname;
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 一键解散成组：把当前选中容器解散，将其子组件提取回上一层 (Ctrl+Shift+G) 并重新声明持久化
+    void UngroupSel() {
+        if (sel == null || !FormField.IsContainerOf(sel.ftype) || sel.kids == null || sel.kids.Count == 0) {
+            return;
+        }
+        this.PushUndo();
+        FormField grp = sel;
+        int baseX = grp.fx;
+        int baseY = grp.fy;
+        List<FormField> children = grp.kids;
+        FormField pc = ParentContainerOf(grp);
+        if (pc == null) { fields = ListRemove(fields, grp); }
+        else { pc.kids = ListRemove(pc.kids, grp); }
+
+        this.ClearExtraSel();
+        sel = null;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            FormField child = children[i];
+            child.fx = baseX + child.fx;
+            child.fy = baseY + child.fy;
+            if (pc == null) { fields.Add(child); }
+            else { pc.kids.Add(child); }
+            this.DesignDeclareRect(child);
+            if (sel == null) { sel = child; }
+            else { freeExtra.Add(child); }
+        }
+        this.MarkDocDirty();
+        msg = Designer.T("Ungrouped ", "已解散成组: ") + grp.fname + " (" + Convert.ToString(children.Count) + ")";
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 删除主选中项，并清掉多选与可能引用它的交互状态
+    // （避免悬空引用崩溃）。
+    void DeleteSel() {
+        if (sel == null) {
+            // 即使没有主选中项，也把残留的多选和交互状态清干净，
+            // 避免后续帧引用已删对象或向 freeExtra 加入 null。
+            freeExtra = new List<FormField>();
+            return;
+        }
+        FormField pc = ParentContainerOf(sel);
+        if (pc == null) {
+            fields = ListRemove(fields, sel);
+        } else {
+            pc.kids = ListRemove(pc.kids, sel);
+        }
+        sel = null;
+        selPrev = null;
+        activeContainer = null;
+        // 清掉可能引用已删组件的交互状态，避免悬空引用崩溃。
+        rowsEdField = null;
+        propsEdField = null;
+        freeExtra = new List<FormField>();
+        freeDragging = false;
+        freeResizing = false;
+        freeMarquee = false;
+        msg = Designer.T("deleted field", "已删除组件");
+    }
+
+    // 剪切选中组件到剪贴板并从画布移除。
+    void CutSel() {
+        if (sel == null) { return; }
+        this.CopySel();
+        this.DeleteSelGroup();
+        msg = Designer.T("cut", "已剪切");
+    }
+
+    // 将选中组件移至其容器/根列表的顶层（最上方绘制）。
+    void BringToFront() {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        int idx = list.IndexOf(sel);
+        if (idx >= 0 && idx < list.Count - 1) {
+            this.PushUndo();
+            list.RemoveAt(idx);
+            list.Add(sel);
+            msg = Designer.T("brought to front", "已置于顶层");
+        }
+    }
+
+    // 将选中组件移至其容器/根列表的底层（最下方绘制）。
+    void SendToBack() {
+        if (sel == null) { return; }
+        FormField pc = ParentContainerOf(sel);
+        List<FormField> list = fields;
+        if (pc != null) { list = pc.kids; }
+        int idx = list.IndexOf(sel);
+        if (idx > 0) {
+            this.PushUndo();
+            list.RemoveAt(idx);
+            list.Insert(0, sel);
+            msg = Designer.T("sent to back", "已置于底层");
+        }
+    }
+
+    // 将选中组件移出容器并提升至窗口顶层（根层）
+    void MoveSelToRoot() {
+        if (sel == null) { return; }
+        FormField curP = ParentContainerOf(sel);
+        if (curP == null) { return; }
+        this.PushUndo();
+        curP.kids = ListRemove(curP.kids, sel);
+        DesignPreviewNode node = this.PreviewNode(sel);
+        if (node != null && node.control != null) {
+            sel.fx = this.DesignLogical(node.control.bx);
+            sel.fy = this.DesignLogical(node.control.by);
+        }
+        fields.Add(sel);
+        this.activeContainer = null;
+        msg = Designer.T("moved to form root", "已移至窗口根层");
+        this.MarkDocDirty();
+    }
+
+    // 将选中组件移入指定容器
+    void MoveSelInto(FormField destContainer) {
+        if (sel == null || destContainer == null || sel == destContainer) { return; }
+        FormField curP = ParentContainerOf(sel);
+        if (curP == destContainer) { return; }
+        this.PushUndo();
+        if (curP == null) {
+            fields = ListRemove(fields, sel);
+        } else {
+            curP.kids = ListRemove(curP.kids, sel);
+        }
+        if (destContainer.kids == null) { destContainer.kids = new List<FormField>(); }
+        DesignPreviewNode pnode = this.PreviewNode(destContainer);
+        DesignPreviewNode snode = this.PreviewNode(sel);
+        if (pnode != null && pnode.control != null && snode != null && snode.control != null) {
+            sel.fx = this.DesignLogical(snode.control.bx - pnode.control.bx);
+            sel.fy = this.DesignLogical(snode.control.by - pnode.control.by);
+            if (sel.fx < 0) { sel.fx = 12; }
+            if (sel.fy < 0) { sel.fy = 12; }
+        }
+        destContainer.kids.Add(sel);
+        this.activeContainer = destContainer;
+        msg = Designer.T("moved into ", "已移入 ") + destContainer.fname;
+        this.MarkDocDirty();
+    }
+}

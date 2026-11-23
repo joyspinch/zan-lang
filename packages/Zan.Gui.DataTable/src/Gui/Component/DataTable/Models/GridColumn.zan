@@ -1,130 +1,313 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 using Gui.Widget;
 
 namespace Gui.Component.DataTable;
 
-// `DataGrid<T>` 的一列：引擎可理解的复用 `DataColumn` 描述符，
-// 配以直接读取该列绑定 `T` 值的访问器，
-// 使网格绑定到真实的
-// 领域对象（`List<User>`），而非按位置排列的字符串单元格。
-// 配置方法镜像 `DataColumn` 的（Money / Percent / Sortable / …），
-// 原地修改描述符，因此可以流畅地链式组合。
-public class GridColumn<T> {
-    // DataTable 引擎读取的描述符（标题、宽度、类型、格式、
-    // 汇总、编辑、冻结、band …）。与网格每帧交给引擎的列表
-    // 按引用共享。
-    public DataColumn desc;
+public delegate Control GridTemplate<T>(T row);
 
-    // 显示文本。为 null 时网格从列持有的类型化
-    // 访问器推导，因此数值 / bool 列无需单独的
-    // 文本读取器。
+public class GridCellTemplateProvider<T> : CellWidgetProvider {
+    private GridTemplate<T> builder;
+    private Dictionary<string, Control> pool;
+
+    public GridCellTemplateProvider(GridTemplate<T> fn) {
+        this.builder = fn;
+        this.pool = new Dictionary<string, Control>();
+    }
+
+    override Control Provide(App app, DataSource src, int row, int col,
+                             int x, int y, int w, int h) {
+        if (this.builder == null || src == null || !(src is GridSource<T>)) { return null; }
+        GridSource<T> gs = (GridSource<T>)src;
+        if (!gs.Row(row)) { return null; }
+        T item = gs.data[row];
+        RowKey rk = src.GetRowKey(row);
+        if (rk == null) { rk = RowKey.Legacy(row); }
+        string k = rk.Canonical() + ":" + Convert.ToString(col);
+        if (this.pool.ContainsKey(k)) {
+            Control cached = this.pool[k];
+            if (cached != null) {
+                cached.DataContext = item;
+                return cached;
+            }
+        }
+        if (this.pool.Count >= 2048) { this.pool.Clear(); }
+        WidgetId.Push("datatable_cell_template");
+        Control built = null;
+        try {
+            built = this.builder(item);
+        } finally {
+            WidgetId.Pop();
+        }
+        if (built != null) {
+            built.DataContext = item;
+            this.pool[k] = built;
+        }
+        return built;
+    }
+
+    override void Reset() {
+        this.pool.Clear();
+    }
+}
+
+// `DataGrid<T>` 的声明式列描述符：直接通过属性与对象初始化器声明列元数据、
+// 类型化实体访问器及单元格组件树模板（`Template = row => new ...`）。
+public class GridColumn<T> {
+    public DataColumn desc;
     public GridText<T> text;
-    // 整数排序/聚合键（数值列）。为 null 时回退为解析
-    // 显示文本。
     public GridInt<T> num;
-    // 数值序列键（组件列）。null 时组件列无数据。
-    public GridNums<T> nums;
-    // 小数排序/聚合键（decimals > 0）。为 null 时回退为解析
-    // 显示文本。
     public GridReal<T> real;
-    // 布尔键（bool 列）。回退为解析显示文本。
     public GridBool<T> truth;
-    // 就地编辑的回写。null 表示该列只读显示。
     public GridSet<T> setter;
+    private GridTemplate<T> template;
 
     public GridColumn(DataColumn d) {
         this.desc = d;
         this.text = null;
         this.num = null;
-        this.nums = null;
         this.real = null;
         this.truth = null;
         this.setter = null;
+        this.template = null;
     }
 
-    // ---- 编辑 ----
-    // 使该列可编辑，并把提交的值通过 `w` 写回
-    // 实体。
-    public GridColumn<T> Editable(GridSet<T> w) {
-        this.setter = w;
-        this.desc.Editable();
-        return this;
+    public GridColumn() : this(new DataColumn("", 100)) { }
+
+    public GridColumn(string title, int width) : this(new DataColumn(title, width)) { }
+
+    public string Title {
+        get { return this.desc.title; }
+        set { this.desc.title = value; }
     }
 
-    // 设置该列的悬浮编辑器（ICellEditor 编辑态宿主）
-    public GridColumn<T> Editor(CellEditor e) {
-        this.desc.Editor(e);
-        return this;
+    public int Width {
+        get { return this.desc.width; }
+        set { this.desc.width = value; }
     }
 
-    // 直接挂载任意 Gui 控件作为该列编辑器（零胶水代码！）
-    public GridColumn<T> ControlEditor(Control widget) {
-        this.desc.ControlEditor(widget);
-        return this;
+    public string FieldName {
+        get { return this.desc.field; }
+        set { this.desc.field = value != null ? value : ""; }
     }
 
-    // 挂载任意 Gui 控件及自定义的 Setter/Getter 数据通道委托
-    public GridColumn<T> ControlEditorCustom(Control widget, CellValueSetter setter, CellValueGetter getter) {
-        this.desc.ControlEditorCustom(widget, setter, getter);
-        return this;
+    public int CellType {
+        get { return this.desc.cellType; }
+        set { this.desc.cellType = value; }
     }
 
-    // 设置该列的自定义享元画笔（ICellRenderer 享元画笔）
-    public GridColumn<T> Renderer(CellRenderer r) {
-        this.desc.Renderer(r);
-        return this;
+    public int Alignment {
+        get { return this.desc.align; }
+        set { this.desc.align = value; }
     }
 
-    // 设置该列挂载的声明式插槽/模板名（对齐基础组件 Slot / Template 机制）
-    public GridColumn<T> Slot(string slotName) {
-        this.desc.Slot(slotName);
-        return this;
+    public bool IsSortable {
+        get { return this.desc.sortable; }
+        set { this.desc.sortable = value; }
     }
 
-    // ---- 描述符透传（修改 desc，返回 this 以便链式调用）----
-    public GridColumn<T> Field(string name) { this.desc.Field(name); return this; }
-    public GridColumn<T> Right() { this.desc.align = 2; return this; }
-    public GridColumn<T> Center() { this.desc.align = 1; return this; }
-    public GridColumn<T> NotSortable() { this.desc.sortable = false; return this; }
-    public GridColumn<T> NotResizable() { this.desc.NotResizable(); return this; }
-    public GridColumn<T> Money(string symbol) { this.desc.Money(symbol); return this; }
-    public GridColumn<T> Percent() { this.desc.Percent(); return this; }
-    public GridColumn<T> Grouped() { this.desc.Grouped(); return this; }
-    public GridColumn<T> Affix(string prefix, string suffix) { this.desc.Affix(prefix, suffix); return this; }
-    public GridColumn<T> Pin() { this.desc.Pin(); return this; }
-    public GridColumn<T> PinRight() { this.desc.PinRight(); return this; }
-    public GridColumn<T> Band(string path) { this.desc.Band(path); return this; }
-    public GridColumn<T> Sum() { this.desc.Sum(); return this; }
-    public GridColumn<T> Avg() { this.desc.Avg(); return this; }
-    public GridColumn<T> Min() { this.desc.Min(); return this; }
-    public GridColumn<T> Max() { this.desc.Max(); return this; }
-    public GridColumn<T> Count() { this.desc.Count(); return this; }
-    // 组件列（cellType 10 select/buttons / 下拉编辑器）选项，逗号分隔。
-    public GridColumn<T> Options(string csv) { this.desc.Options(csv); return this; }
-    // 组件列矩阵形状（cellType 9）/ rate 显数（cellType 10）。
-    public GridColumn<T> Shape(int rows, int cols) { this.desc.Shape(rows, cols); return this; }
+    public bool IsFilterable {
+        get { return this.desc.filterable; }
+        set { this.desc.filterable = value; }
+    }
 
-    // 引擎用于显示、排序
-    // 键和导出的原始（未格式化）单元格字符串。引擎在此基础上应用列的显示格式
-    // （千分位 / 前缀 / 后缀 / 日期 / bool），因此原始
-    // 值保持可解析。未提供文本读取器时，则
-    // 从类型化访问器推导。
+    public bool IsResizable {
+        get { return this.desc.resizable; }
+        set { this.desc.resizable = value; }
+    }
+
+    public bool IsEditable {
+        get { return this.desc.editable; }
+        set { this.desc.editable = value; }
+    }
+
+    public bool IsNumeric {
+        get { return this.desc.numeric; }
+        set { this.desc.numeric = value; }
+    }
+
+    public bool IsBool {
+        get { return this.desc.isBool; }
+        set { this.desc.isBool = value; }
+    }
+
+    public bool IsDate {
+        get { return this.desc.isDate; }
+        set { this.desc.isDate = value; }
+    }
+
+    public int DateOrder {
+        get { return this.desc.dateOrder; }
+        set {
+            this.desc.isDate = true;
+            this.desc.dateOrder = value;
+        }
+    }
+
+    public int Decimals {
+        get { return this.desc.decimals; }
+        set {
+            this.desc.decimals = value;
+            if (value > 0) { this.desc.numeric = true; }
+        }
+    }
+
+    public bool IsGrouped {
+        get { return this.desc.grouped; }
+        set {
+            this.desc.grouped = value;
+            if (value) { this.desc.fmt = 1; }
+        }
+    }
+
+    public string Prefix {
+        get { return this.desc.prefix; }
+        set {
+            this.desc.prefix = value != null ? value : "";
+            if (this.desc.prefix != "" || this.desc.suffix != "") { this.desc.fmt = 1; }
+        }
+    }
+
+    public string Suffix {
+        get { return this.desc.suffix; }
+        set {
+            this.desc.suffix = value != null ? value : "";
+            if (this.desc.prefix != "" || this.desc.suffix != "") { this.desc.fmt = 1; }
+        }
+    }
+
+    public string CurrencySymbol {
+        get { return this.desc.prefix; }
+        set { DataColumn.Money(this.desc, value); }
+    }
+
+    public bool IsPercent {
+        get { return this.desc.suffix == "%"; }
+        set {
+            if (value) { DataColumn.Percent(this.desc); }
+        }
+    }
+
+    public int Freeze {
+        get { return this.desc.freeze; }
+        set { this.desc.freeze = value; }
+    }
+
+    public string BandPath {
+        get { return this.desc.band; }
+        set { this.desc.band = value != null ? value : ""; }
+    }
+
+    public int SummaryKind {
+        get { return this.desc.summary; }
+        set { this.desc.summary = value; }
+    }
+
+    public string ButtonIcon {
+        get { return this.desc.btnIcon; }
+        set { this.desc.btnIcon = value; }
+    }
+
+    public string ButtonClass {
+        get { return this.desc.btnClass; }
+        set { this.desc.btnClass = value; }
+    }
+
+    public bool SparkArea {
+        get { return this.desc.sparkArea; }
+        set { this.desc.sparkArea = value; }
+    }
+
+    public GridText<T> Text {
+        get { return this.text; }
+        set { this.text = value; }
+    }
+
+    public GridInt<T> Num {
+        get { return this.num; }
+        set {
+            this.num = value;
+            if (value != null) {
+                this.desc.numeric = true;
+                this.desc.align = 2;
+            }
+        }
+    }
+
+    public GridReal<T> Real {
+        get { return this.real; }
+        set {
+            this.real = value;
+            if (value != null) {
+                this.desc.numeric = true;
+                this.desc.align = 2;
+                if (this.desc.decimals <= 0) { this.desc.decimals = 2; }
+            }
+        }
+    }
+
+    public GridBool<T> Truth {
+        get { return this.truth; }
+        set {
+            this.truth = value;
+            if (value != null) {
+                this.desc.isBool = true;
+                this.desc.align = 1;
+            }
+        }
+    }
+
+    public GridSet<T> Setter {
+        get { return this.setter; }
+        set {
+            this.setter = value;
+            if (value != null) { this.desc.editable = true; }
+        }
+    }
+
+    public GridTemplate<T> Template {
+        get { return this.template; }
+        set {
+            this.template = value;
+            if (value != null) {
+                this.desc.widgetProvider = new GridCellTemplateProvider<T>(value);
+                this.desc.sortable = false;
+                this.desc.filterable = false;
+                this.desc.editable = false;
+            } else {
+                this.desc.widgetProvider = null;
+            }
+        }
+    }
+
+    public CellEditor CellEditor {
+        get { return this.desc.editor; }
+        set { DataColumn.Editor(this.desc, value); }
+    }
+
+    public Control EditorControl {
+        set { DataColumn.ControlEditor(this.desc, value); }
+    }
+
+    public CellRenderer CellRenderer {
+        get { return this.desc.renderer; }
+        set { this.desc.renderer = value; }
+    }
+
+    public string SlotName {
+        get { return this.desc.slot; }
+        set { this.desc.slot = value != null ? value : ""; }
+    }
+
+    public void SyncDesc() {
+        if (this.template != null && this.desc.widgetProvider == null) {
+            this.desc.widgetProvider = new GridCellTemplateProvider<T>(this.template);
+        }
+    }
+
     public string Raw(T row) {
         if (this.text != null) { return this.text(row); }
-        if (this.nums != null) {
-            // 组件列：类型化序列 → CSV。序列化边界在此，
-            // 引擎与渲染层只见到与迷你图同约定的文本。
-            List<int> v = this.nums(row);
-            string s = "";
-            if (v != null) {
-                for (int i = 0; i < v.Count; i = i + 1) {
-                    if (i > 0) { s = s + ","; }
-                    s = s + Convert.ToString(v[i]);
-                }
-            }
-            return s;
-        }
         if (this.real != null) { return DataTable.FormatReal(this.real(row), this.desc.decimals); }
         if (this.num != null) { return Convert.ToString(this.num(row)); }
         if (this.truth != null) {

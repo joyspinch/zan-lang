@@ -1,0 +1,396 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class ChartView {
+    // ---- 子系列叠加 ----
+
+    // 子系列（coordinateSystem:"calendar"）叠加：按 calendarIndex
+    // 分组，逐组画 heatmap / scatter / effectScatter / graph / pie。
+    public static void DrawCalendarSeries(App app, int ox, int oy, int ow, int oh,
+                                   ChartOption o, int ci, int g) {
+        ChartCalendarSpec spec = o.calendars[ci];
+        int rectX = 0; int rectY = 0; int rectW = 0; int rectH = 0;
+        int cellW = 0; int cellH = 0; int weeks = 0; int fweek = 0; int allDay = 0;
+        ChartView.CalendarGeom(app, o, ci, ox, oy, ow, oh,
+                               out rectX, out rectY, out rectW, out rectH,
+                               out cellW, out cellH, out weeks, out fweek, out allDay);
+        // 两层渲染：先铺底色层（heatmap 填格），再叠装饰层（点/连线/饼/
+        // 文字）。官方 lunar 示例把 heatmap 放在 scatter 之后，但 heatmap
+        // 填的是整格实色——若顺序照抄，后画的格色会把先画的农历日名
+        // 全部盖掉（官方靠图元 z 层级而非声明顺序）。引擎不分 z，改用
+        // 类型分层：填色类先，装饰类后。
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                if (s.hidden) { continue; }
+                if (s.coordSys != "calendar") { continue; }
+                if (s.calIndex != ci) { continue; }
+                bool fillLayer = s.type == ChartType.Heatmap;
+                if (pass == 0 && !fillLayer) { continue; }
+                if (pass == 1 && fillLayer) { continue; }
+                if (s.type == ChartType.Heatmap) {
+                    ChartView.DrawCalendarHeat(app, o, s, si, spec, rectX, rectY,
+                                               cellW, cellH, fweek, allDay);
+                } else if (s.type == ChartType.Scatter) {
+                    bool fx = s.typeName == "effectScatter";
+                    ChartView.DrawCalendarPoints(app, o, s, si, spec, rectX, rectY,
+                                                 cellW, cellH, fweek, allDay, fx);
+                } else if (s.typeName == "graph") {
+                    ChartView.DrawCalendarGraph(app, o, s, si, spec, rectX, rectY,
+                                                cellW, cellH, fweek, allDay);
+                } else if (s.type == ChartType.Pie) {
+                    ChartView.DrawCalendarPies(app, o, s, si, spec, rectX, rectY,
+                                               cellW, cellH, fweek, allDay);
+                }
+            }
+        }
+    }
+
+    // 从 series.data 抽出 [天序, 值] 对。日期优先取 calDay
+    // （解析器已解好），退回 points.x（时间轴值对共用通道）。
+    public static void CalendarPairs(ChartSeries s, List<int> days, List<int> vals) {
+        for (int i = 0; i < s.data.Count; i = i + 1) {
+            ChartData it = s.data[i];
+            if (it == null || it.gap) { continue; }
+            if (it.calDay >= 0) {
+                days.Add(it.calDay);
+                vals.Add(it.val);
+            }
+        }
+        if (days.Count < 1) {
+            for (int j = 0; j < s.points.Count; j = j + 1) {
+                ChartPoint p = s.points[j];
+                days.Add(p.x);
+                vals.Add(Chart.PointV(p.y, s.pointG));
+            }
+        }
+    }
+
+    // 值域下/上界：visualMap 显式给了就用，否则取数据包络。
+    public static int CalendarValLo(ChartOption o, List<int> vals) {
+        if (o.rampLo != ChartOption.Auto()) { return o.rampLo; }
+        if (vals.Count < 1) { return 0; }
+        int lo = vals[0];
+        for (int i = 1; i < vals.Count; i = i + 1) {
+            if (vals[i] < lo) { lo = vals[i]; }
+        }
+        return lo;
+    }
+
+    public static int CalendarValHi(ChartOption o, List<int> vals) {
+        if (o.rampHi != ChartOption.Auto()) { return o.rampHi; }
+        if (vals.Count < 1) { return 1; }
+        int hi = vals[0];
+        for (int i = 1; i < vals.Count; i = i + 1) {
+            if (vals[i] > hi) { hi = vals[i]; }
+        }
+        return hi;
+    }
+
+    // 值 -> 色带颜色（与 heatmap 同一 inten 0..1000 口径）。
+    public static int CalendarRamp(ChartOption o, int v, int dLo, int dHi) {
+        int span = dHi - dLo;
+        if (span < 1) { span = 1; }
+        int inten = (v - dLo) * 1000 / span;
+        if (inten < 0) { inten = 0; }
+        if (inten > 1000) { inten = 1000; }
+        if (o.rampColors == null || o.rampColors.Count < 2) {
+            return 0;
+        }
+        return ChartColor.RampAt(o.rampColors, inten);
+    }
+
+    // calendar + heatmap：逐日填色块；有 visualMap 走色带，否则用序列色。
+    public static void DrawCalendarHeat(App app, ChartOption o, ChartSeries s, int si,
+                                 ChartCalendarSpec spec, int rectX, int rectY,
+                                 int cellW, int cellH, int fweek, int allDay) {
+        Canvas c = app.canvas;
+        ChartRenderContext ctx = Chart.renderContext;
+        if (ctx == null) {
+            Chart.renderContext = new ChartRenderContext();
+            ctx = Chart.renderContext;
+        }
+        ctx.EnsureScratch();
+        List<int> days = ctx.scratchI1;
+        List<int> vals = ctx.scratchI2;
+        days.Clear();
+        vals.Clear();
+        ChartView.CalendarPairs(s, days, vals);
+        if (days.Count < 1) { return; }
+        bool ramp = o.rampColors != null && o.rampColors.Count >= 2;
+        int dLo = ChartView.CalendarValLo(o, vals);
+        int dHi = ChartView.CalendarValHi(o, vals);
+        int baseColor = ChartView.SeriesColorAt(app, o, si);
+        int bw = spec.itemBorderWidth;
+        if (bw > 0) {
+            bw = app.Scale(bw);
+            if (bw < 1) { bw = 1; }
+        }
+        int bc = spec.itemBorderColor;
+        if (bc == 0) { bc = ChartView.CalendarCellBorder(app); }
+        for (int i = 0; i < days.Count; i = i + 1) {
+            int day = days[i];
+            if (day < spec.rangeT0 || day > spec.rangeT1) { continue; }
+            int cx = 0; int cyy = 0;
+            ChartView.CalendarCellTL(spec, rectX, rectY, cellW, cellH, fweek,
+                                     day - spec.rangeT0, out cx, out cyy);
+            int col = baseColor;
+            if (ramp) {
+                int rc = ChartView.CalendarRamp(o, vals[i], dLo, dHi);
+                if (rc != 0) { col = rc; }
+            }
+            // 官方 lunar 的 visualMap.inRange.opacity = 0.3：heatmap 半透明，
+            // 底下的日历格与叠在上面的农历日名都要透出来。
+            int vop = ChartView.CalendarVizOpacity(o, si);
+            if (vop > 0 && vop < 1000) { col = App.ScaleAlpha(col, vop); }
+            c.FillRect(cx, cyy, cellW, cellH, col);
+            if (bw > 0) { c.DrawRect(cx, cyy, cellW, cellH, bc, bw); }
+        }
+    }
+
+    // calendar + scatter/effectScatter：点在格中心；effectScatter 加光晕。
+    public static void DrawCalendarPoints(App app, ChartOption o, ChartSeries s, int si,
+                                   ChartCalendarSpec spec, int rectX, int rectY,
+                                   int cellW, int cellH, int fweek, int allDay,
+                                   bool effect) {
+        Canvas c = app.canvas;
+        ChartRenderContext ctx = Chart.renderContext;
+        if (ctx == null) {
+            Chart.renderContext = new ChartRenderContext();
+            ctx = Chart.renderContext;
+        }
+        ctx.EnsureScratch();
+        List<int> days = ctx.scratchI1;
+        List<int> vals = ctx.scratchI2;
+        days.Clear();
+        vals.Clear();
+        ChartView.CalendarPairs(s, days, vals);
+        if (days.Count < 1) { return; }
+        bool ramp = o.rampColors != null && o.rampColors.Count >= 2;
+        int dLo = ChartView.CalendarValLo(o, vals);
+        int dHi = ChartView.CalendarValHi(o, vals);
+        int baseColor = ChartView.SeriesColorAt(app, o, si);
+        int r = app.Scale(4);
+        // symbolSize: 0 = 官方 lunar 的"纯文字层"（只铺农历日名，不画点）。
+        // 但 effectScatter 的 0 是"用默认大小"，仍要画。
+        bool dot = true;
+        if (s.symbolSize > 0) {
+            r = app.Scale(s.symbolSize) / 2;
+        } else if (s.symbolSize == 0 && !effect) {
+            dot = false;
+        }
+        if (r < 1) { r = 1; }
+        for (int i = 0; i < days.Count; i = i + 1) {
+            int day = days[i];
+            if (day < spec.rangeT0 || day > spec.rangeT1) { continue; }
+            int cx = 0; int cyy = 0;
+            ChartView.CalendarCellTL(spec, rectX, rectY, cellW, cellH, fweek,
+                                     day - spec.rangeT0, out cx, out cyy);
+            int mx = cx + cellW / 2;
+            int my = cyy + cellH / 2;
+            int col = baseColor;
+            if (ramp) {
+                int rc = ChartView.CalendarRamp(o, vals[i], dLo, dHi);
+                if (rc != 0) { col = rc; }
+            }
+            if (!dot && !effect) { continue; }
+            if (effect) {
+                c.FillCircle(mx, my, r + app.Scale(3), App.ScaleAlpha(col, 70));
+            }
+            c.FillCircle(mx, my, r, col);
+        }
+        // 逐格居中写出（官方示例靠它铺满整月农历）。
+        if (s.labelShow) {
+            int fs = ChartView.CalendarLabelFont(app, o, si);
+            int ink = ChartView.CalendarLabelColor(app, o, si);
+            for (int k = 0; k < s.data.Count; k = k + 1) {
+                ChartData di = s.data[k];
+                if (di == null || di.labelText.Length == 0) { continue; }
+                int dk = di.calDay;
+                if (dk < spec.rangeT0 || dk > spec.rangeT1) { continue; }
+                int lx = 0; int ly = 0;
+                ChartView.CalendarCellTL(spec, rectX, rectY, cellW, cellH, fweek,
+                                         dk - spec.rangeT0, out lx, out ly);
+                int tw = Canvas.MeasureText(di.labelText, fs);
+                int th = Canvas.FontHeight(fs);
+                c.DrawText(lx + (cellW - tw) / 2, ly + (cellH - th) / 2,
+                           di.labelText, ink, fs);
+            }
+        }
+    }
+
+    // calendar 子系列 label 字号（series.label.fontSize，缺省走样式层的
+    // 小号字）。字号同颜色一样不能直接读 Theme 语义字段——那是 CSS 债
+    // （tests/run_theme_font_budget.cmake 的预算闸门）。
+    public static int CalendarLabelFont(App app, ChartOption o, int si) {
+        if (si >= 0 && si < o.series.Count && o.series[si].label != null
+            && o.series[si].label.fontSize > 0) {
+            return o.series[si].label.fontSize;
+        }
+        int fs = Style.FontFallback(app, "small");
+        if (fs > 0) { return fs; }
+        return 12;
+    }
+
+    // calendar 子系列 label 颜色（series.label.color，缺省走样式层的
+    // `chart::label`）。颜色必须经 StyleBox 取，不能直接读 Theme 语义色，
+    // 否则皮肤覆盖不了（tests/run_theme_color_budget.cmake 的预算闸门）。
+    public static int CalendarLabelColor(App app, ChartOption o, int si) {
+        if (si >= 0 && si < o.series.Count && o.series[si].label != null
+            && o.series[si].label.color != 0) {
+            return o.series[si].label.color;
+        }
+        return Style.Part(app, "chart", "label", "", "", "",
+                          Style.SNormal()).FgOr(0);
+    }
+
+    // calendar + graph：节点 data 带日期、点在格中心，links 连两端。
+    public static void DrawCalendarGraph(App app, ChartOption o, ChartSeries s, int si,
+                                  ChartCalendarSpec spec, int rectX, int rectY,
+                                  int cellW, int cellH, int fweek, int allDay) {
+        Canvas c = app.canvas;
+        int n = s.data.Count;
+        if (n < 1) { return; }
+        ChartRenderContext ctx = Chart.renderContext;
+        if (ctx == null) {
+            Chart.renderContext = new ChartRenderContext();
+            ctx = Chart.renderContext;
+        }
+        ctx.EnsureScratch();
+        List<int> xs = ctx.scratchI1;
+        List<int> ys = ctx.scratchI2;
+        xs.Clear();
+        ys.Clear();
+        int baseColor = ChartView.SeriesColorAt(app, o, si);
+        for (int i = 0; i < n; i = i + 1) {
+            ChartData it = s.data[i];
+            int px = 0 - 1;
+            int py = 0 - 1;
+            if (it != null && it.calDay >= spec.rangeT0 && it.calDay <= spec.rangeT1) {
+                int cx = 0; int cyy = 0;
+                ChartView.CalendarCellTL(spec, rectX, rectY, cellW, cellH, fweek,
+                                         it.calDay - spec.rangeT0, out cx, out cyy);
+                px = cx + cellW / 2;
+                py = cyy + cellH / 2;
+            }
+            xs.Add(px); ys.Add(py);
+        }
+        // 边：按名字在节点表里定位两端
+        for (int li = 0; li < s.links.Count; li = li + 1) {
+            int a = ChartView.CalendarNodeOf(s, s.links[li].from);
+            int b = ChartView.CalendarNodeOf(s, s.links[li].to);
+            if (a < 0 || b < 0) { continue; }
+            if (xs[a] < 0 || ys[a] < 0 || xs[b] < 0 || ys[b] < 0) { continue; }
+            c.DrawLine(xs[a], ys[a], xs[b], ys[b],
+                       App.ScaleAlpha(baseColor, 60), app.Scale(1));
+        }
+        int r = app.Scale(4);
+        if (s.symbolSize > 0) { r = app.Scale(s.symbolSize) / 2; }
+        if (r < 1) { r = 1; }
+        for (int i2 = 0; i2 < xs.Count; i2 = i2 + 1) {
+            if (xs[i2] < 0) { continue; }
+            c.FillCircle(xs[i2], ys[i2], r, baseColor);
+        }
+    }
+
+    // 按名字找 graph 节点下标（links.from/to 是节点名）。
+    public static int CalendarNodeOf(ChartSeries s, string name) {
+        for (int i = 0; i < s.data.Count; i = i + 1) {
+            ChartData it = s.data[i];
+            if (it != null && it.name == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // calendar + pie：每项在它那天的格中心画一个小圆饼（简化自官方
+    // 的逐日多扇区小饼——本引擎按单值单色圆呈现）。
+    public static void DrawCalendarPies(App app, ChartOption o, ChartSeries s, int si,
+                                 ChartCalendarSpec spec, int rectX, int rectY,
+                                 int cellW, int cellH, int fweek, int allDay) {
+        Canvas c = app.canvas;
+        int n = s.data.Count;
+        if (n < 1) { return; }
+        // 盘面尺寸：series.radius 标量优先（百分比按格边长），
+        // 否则取单元格短边的 45%。
+        int cell = cellW < cellH ? cellW : cellH;
+        int ro = 0;
+        int ri = 0;
+        if (s.radiusInner != null) {
+            // radius:[inner,outer] 写法（calendar-pie 官方未用，留口）
+            ro = ChartView.GaugeScalar(app, s.radius, cell);
+            ri = ChartView.GaugeScalar(app, s.radiusInner, cell);
+        } else if (s.radius != null) {
+            ro = ChartView.GaugeScalar(app, s.radius, cell);
+        }
+        if (ro <= 0) { ro = cell * 45 / 100; }
+        if (ro < app.Scale(2)) { ro = app.Scale(2); }
+        if (ri < 0) { ri = 0; }
+        if (ri >= ro) { ri = 0; }
+        // 扇区角度按 value / 总和分配（ECharts pie 语义），起于 12 点顺时针。
+        double total = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartData it = s.data[i];
+            if (it != null) { total = total + ChartView.CalVal(it); }
+        }
+        if (total <= 0.0) { return; }
+        int baseColor = ChartView.SeriesColorAt(app, o, si);
+        double acc = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            ChartData it = s.data[i];
+            if (it == null) { continue; }
+            int day = it.calDay;
+            if (day < spec.rangeT0 || day > spec.rangeT1) { continue; }
+            // 配色：逐项 itemStyle.color > 逐项 color > 系列色。
+            int col = baseColor;
+            if (it.itemStyle != null && it.itemStyle.normal.color != 0) {
+                col = it.itemStyle.normal.color;
+            } else if (it.color != 0) {
+                col = it.color;
+            }
+            int cx = 0; int cyy = 0;
+            ChartView.CalendarCellTL(spec, rectX, rectY, cellW, cellH, fweek,
+                                     day - spec.rangeT0, out cx, out cyy);
+            int ox = cx + cellW / 2;
+            int oy = cyy + cellH / 2;
+            double span = ChartView.CalVal(it) * 360.0 / total;
+            if (span <= 0.0) { continue; }
+            // FillSector 角度为绝对值（0° 在 12 点，顺时针）。
+            int a0 = (int)acc;
+            int a1 = (int)(acc + span);
+            if (a1 <= a0) { a1 = a0 + 1; }
+            if (a0 < 0) { a0 = 0; }
+            if (a0 > 359) { a0 = 359; }
+            if (a1 > 360) { a1 = 360; }
+            c.FillSector(ox, oy, ri, ro, a0, a1, col);
+            acc = acc + span;
+        }
+    }
+
+    // 取数据项的主值（number 是解析器存下的原值；退化到定点 val）。
+    public static double CalVal(ChartData d) {
+        if (d.numberSet) { return d.number; }
+        if (d.number != 0.0) { return d.number; }
+        return (double)d.val;
+    }
+
+    // 该系列 bind 的 visualMap.inRange.opacity（0..1000）；未声明 = 0。
+    public static int CalendarVizOpacity(ChartOption o, int si) {
+        for (int i = 0; i < o.visualMaps.Count; i = i + 1) {
+            ChartVisualMap vm = o.visualMaps[i];
+            if (vm.seriesIndex != 0 - 1 && vm.seriesIndex != si) { continue; }
+            if (vm.inOpacity > 0) { return vm.inOpacity; }
+        }
+        return 0;
+    }
+
+    // 第 si 条系列的调色板色（显式系列色优先，否则走调色板）。
+    public static int SeriesColorAt(App app, ChartOption o, int si) {
+        if (si >= 0 && si < o.series.Count) {
+            return ChartColor.SeriesPaintColor(o.series[si], app.theme, si);
+        }
+        return ChartColor.Palette(app.theme, si);
+    }
+}

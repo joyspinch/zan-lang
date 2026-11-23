@@ -2,10 +2,7 @@ using System;
 
 namespace Game.Netcode;
 
-// 一个二维位置（延迟补偿的输出载体）。
-//
-// **为什么不用返回值**：回溯查询在射击判定这类热路径上，每次调用分配
-// 一个对象会给 GC 添乱。调用方复用自己的 `NetPoint`，由回溯填进去。
+// 延迟补偿输出载体（调用方复用实例避免热路径分配）。
 public class NetPoint {
     public double x;
     public double y;
@@ -21,18 +18,7 @@ public class NetPoint {
     }
 }
 
-// 位置历史：按帧号记录各实体的位置（服务器侧用）。
-//
-// **它回答什么问题**：客户端在 T 时刻开的枪，子弹到达服务器时是
-// T + 延迟。那时目标的真实位置已经变了——但客户端瞄准的是**它当时
-// 看到的位置**。服务器要判"这一枪打中了吗"，就必须回到客户端看到
-// 那一刻的世界去判定，这就是延迟补偿。
-//
-// **按帧存而不是按实体存**：回溯是"回到某一帧，问某个实体在哪"，
-// 按帧组织正好对上这个问法；按实体存则要先知道帧号再散着找。
-//
-// **环形缓冲**：只保留最近 N 帧——回溯窗口本来就有限（见
-// `LagCompensation.maxRewindFrames`），更早的帧没有意义。
+// 服务端按帧号组织的实体位置环形历史缓冲（保留最近 N 帧用于延迟补偿回溯）。
 public class PositionHistory {
     // 每槽的帧号（-1 = 空）。
     private int[] frames;
@@ -148,16 +134,7 @@ public class PositionHistory {
     }
 }
 
-// 延迟补偿器：决定回溯到哪一帧，并取出那一帧的位置。
-//
-// **两条硬取舍**：
-//
-// 1. **回溯窗口有上限**：`maxRewindFrames` 限制最多往回看多少帧。
-//    不限制的话，一个延迟 10 秒的客户端可以让服务器回到 10 秒前判定
-//    命中——那时的世界早就不是现在的世界了（技能已经放完、门已经关）。
-//    窗口外的请求一律钳到窗口边缘，并让调用方知道（返回的帧号可比较）。
-// 2. **只回溯、不改写历史**：补偿是**判定时**的一次查询，不修改服务器
-//    世界的当前状态。改写历史会让"回溯过的判定"污染后续帧。
+// 延迟补偿器：受 maxRewindFrames 窗口上限钳制，只读回溯历史帧位置，不改写当前世界状态。
 public class LagCompensation {
     // 位置历史。
     private PositionHistory history;
@@ -172,12 +149,7 @@ public class LagCompensation {
     // 位置历史。
     public PositionHistory History() { return this.history; }
 
-    // 解析应该回溯到哪一帧。
-    //
-    // clientFrame：客户端声称的射击帧；serverFrame：服务器当前帧。
-    //
-    // 规则：不能超过服务器当前帧（未来的帧没有历史），也不能早于回溯
-    // 窗口边缘（太老的帧不在缓冲里，强行回溯等于乱判）。
+    // 解析目标回溯帧号：钳制在 [max(0, serverFrame - maxRewindFrames), serverFrame] 内。
     public int ResolveRewindFrame(int clientFrame, int serverFrame) {
         int target = clientFrame;
         if (target > serverFrame) { target = serverFrame; }

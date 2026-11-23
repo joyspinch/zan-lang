@@ -17,10 +17,21 @@ namespace Gui.Component.Chart;
 // GeoJSON 约定记洞。properties.value 存在时作区域值，否则 0，由
 // 调用方按业务赋值。
 public class ChartGeoJson {
+    // A first tape lease reserves roughly 460 KiB even for tiny maps.
+    private const int MinTapeBytes = 16 * 1024;
 
     // 解析 GeoJSON 文本；结构不对或没有可渲染要素时返回空表。
     public static List<ChartMapRegion> ParseText(string json) {
         if (json == null || json.Length == 0) { return new List<ChartMapRegion>(); }
+        if (json.Length >= ChartGeoJson.MinTapeBytes && JsonDoc.MaxDepth >= 0) {
+            try {
+                List<ChartMapRegion> projected = JsonDoc.ParseScopedDeferred<List<ChartMapRegion>>(
+                json, (doc) => ChartGeoJsonTape.Parse(doc));
+                if (projected != null) { return projected; }
+            } catch (JsonException) {
+                // Lenient input can still contain usable features after a syntax error.
+            }
+        }
         return ChartGeoJson.Parse(JsonValue.ParseLenient(json));
     }
 
@@ -29,16 +40,17 @@ public class ChartGeoJson {
     public static List<ChartMapRegion> Parse(JsonValue v) {
         List<ChartMapRegion> outp = new List<ChartMapRegion>();
         if (v == null || !v.IsObject()) { return outp; }
-        List<JsonValue> feats = new List<JsonValue>();
-        JsonValue fs = v.Get("features");
-        if (fs != null && fs.IsArray()) {
-            for (int i = 0; i < fs.Count(); i = i + 1) { feats.Add(fs.At(i)); }
-        } else if (v.Str("type", "") == "Feature") { feats.Add(v); }
         bool encoded = v.Bool("UTF8Encoding", false);
         int scale = v.Int("UTF8Scale", 1024);
         if (scale < 1) { scale = 1024; }
-        for (int i = 0; i < feats.Count; i = i + 1) {
-            ChartGeoJson.Feature(feats[i], encoded, scale, outp);
+        JsonValue features = v.Get("features");
+        if (features != null && features.IsArray()) {
+            int count = features.Count();
+            for (int i = 0; i < count; i++) {
+                ChartGeoJson.Feature(features.At(i), encoded, scale, outp);
+            }
+        } else if (v.Str("type", "") == "Feature") {
+            ChartGeoJson.Feature(v, encoded, scale, outp);
         }
         return outp;
     }

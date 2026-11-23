@@ -71,7 +71,7 @@ pie.data = new List<ChartData>{
 opt.series.Add(pie);
 
 // 在 App 帧绘制中单行呈现
-ChartView.Of(opt).Render(app, x, y, width, height);
+ChartView.Of(opt).RenderInside(app, new Rect(x, y, width, height));
 ```
 
 ### 3. 切换主题
@@ -84,7 +84,17 @@ chart.SetTheme("macarons"); // 或 "dark", "shine", "blue", "echarts6" 等
 ChartSkin.SetCurrent("echarts6");
 ```
 
-### 4. 从表格数据出图（`ChartBridge`）
+### 4. 从 JSON 导入 K 线
+
+| JSON 入口 | 四值顺序 |
+|---|---|
+| `type: "candlestick"` 的 `data` 或 `dataset` 的 `encode.y` | 开盘、收盘、最低、最高 |
+| `type: "k"` 的 `data` 或 `dataset` 的 `encode.y` | 开盘、最高、最低、收盘 |
+| `candles` 数组 | 开盘、最高、最低、收盘 |
+
+`data` 可用四值数组，也可用带 `value` 数组和 `itemStyle` 的对象。`encode.y` 支持列序号和列名。`candles` 也支持通过 `open`、`high`、`low`、`close` 键写明各字段。
+
+### 5. 从表格数据出图（`ChartBridge`）
 
 `ChartBridge` 把 `System.Data` 的 `DataFrame`（列存表格）接到图表上，
 省掉"手写 source 数组 + 类目轴 + 系列数据"这一段。

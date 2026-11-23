@@ -1,0 +1,383 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Backend;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 模块：列表头上下文菜单、合计与条件格式预设菜单构建及派发
+public partial class DataTable {
+    // ---------- 表头（列）上下文菜单 ----------
+    // DevExpress/ag-Grid 风格列菜单，声明式构建给 RichMenu：
+    // 排序（当前方向勾选）、自动列宽、分组、冻结、隐藏/列选择器、
+    // 合计（勾选当前聚合）、筛选，以及条件格式子菜单
+    // （数据条/色阶/高亮规则/前后规则各带色板子菜单 + 清除规则）。
+    // 条件格式预设色板（DevExpress 风格渐变/纯色数据条与色阶）：
+    // 12 组渐变色 + 8 组纯色，用于色板子菜单。
+    public static int[] CfPresetColors() {
+        int[] ps = new int[20];
+        ps[0] = DataTable.Rgb(46, 106, 219);  // blue
+        ps[1] = DataTable.Rgb(64, 158, 255);  // light blue
+        ps[2] = DataTable.Rgb(46, 168, 106);  // green
+        ps[3] = DataTable.Rgb(230, 190, 44);  // yellow
+        ps[4] = DataTable.Rgb(235, 140, 40);  // orange
+        ps[5] = DataTable.Rgb(58, 186, 156);  // mint
+        ps[6] = DataTable.Rgb(142, 96, 214);  // violet
+        ps[7] = DataTable.Rgb(206, 68, 126);  // raspberry
+        ps[8] = DataTable.Rgb(240, 110, 92);  // coral
+        ps[9] = DataTable.Rgb(214, 62, 58);  // red
+        ps[10] = DataTable.Rgb(88, 96, 110);  // gray
+        ps[11] = DataTable.Rgb(84, 62, 168);  // indigo
+        ps[12] = ps[0];
+        ps[13] = ps[1];
+        ps[14] = ps[2];
+        ps[15] = ps[3];
+        ps[16] = ps[4];
+        ps[17] = ps[5];
+        ps[18] = ps[6];
+        ps[19] = ps[7];
+        return ps;
+    }
+
+    // 预设色的显示名（蓝/浅蓝/绿/…）。
+    public static string SwatchName(int i) {
+        if (i == 0) { return DataTable.T("Blue", "蓝"); }
+        if (i == 1) { return DataTable.T("Light Blue", "浅蓝"); }
+        if (i == 2) { return DataTable.T("Green", "绿"); }
+        if (i == 3) { return DataTable.T("Yellow", "黄"); }
+        if (i == 4) { return DataTable.T("Orange", "橙"); }
+        if (i == 5) { return DataTable.T("Mint", "薄荷"); }
+        if (i == 6) { return DataTable.T("Violet", "紫"); }
+        if (i == 7) { return DataTable.T("Raspberry", "梅红"); }
+        if (i == 8) { return DataTable.T("Coral", "珊瑚"); }
+        if (i == 9) { return DataTable.T("Red", "红"); }
+        if (i == 10) { return DataTable.T("Gray", "灰"); }
+        return DataTable.T("Indigo", "靛");
+    }
+
+    // 高亮规则的默认阈值：列数值的平均值（空列回退 0）。
+    public static int MedianThreshold(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, int col) {
+        double sum = 0.0;
+        int n = 0;
+        for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+            double v = src.CellReal(st.order[oi], col);
+            sum = sum + v;
+            n = n + 1;
+        }
+        if (n == 0) { return 0; }
+        return (int)(sum / (double)n + 0.5);
+    }
+
+    // 当前聚合模式名（合计/平均/…），无则为空。
+    public static string AggLabel(int mode) {
+        if (mode == 1) { return DataTable.T("Sum", "合计"); }
+        if (mode == 2) { return DataTable.T("Average", "平均"); }
+        if (mode == 3) { return DataTable.T("Min", "最小"); }
+        if (mode == 4) { return DataTable.T("Max", "最大"); }
+        if (mode == 5) { return DataTable.T("Count", "计数"); }
+        return "";
+    }
+
+    // 合计子菜单：聚合预设，当前模式带勾选（勾选在子项、
+    // 父项只作展开入口）。
+    public static List<MenuItem> BuildAggChildren(int curAgg) {
+        List<MenuItem> kids = new List<MenuItem>();
+        for (int mode = 0; mode <= 5; mode = mode + 1) {
+            string lbl = DataTable.AggLabel(mode);
+            if (mode == 0) { lbl = DataTable.T("No Total", "无汇总"); }
+            string icon = (mode == curAgg) ? "check" : "";
+            kids.Add(MenuItem.Item(lbl, icon, DataTable.HdrActAgg0 + mode));
+        }
+        return kids;
+    }
+
+    // 条件格式子菜单（两级分组，对齐 RichMenu 的两层子菜单
+    // 契约）：高亮规则 / 前·后规则 / 数据条 / 色阶四个孙级面板，
+    // 加清除规则直项。色板项带色块（MenuItem.SwatchItem）——
+    // 数据条单色块，色阶双色对拼；当前生效规则所在叶子行带 ✓
+    // （父项只作展开入口，同合计子菜单）。
+    // 勾选状态读"生效规则"：菜单槽位优先（用户最近通过菜单
+    // 设置的规则，跨每帧列重建持久），槽位为 0 时看列自身的
+    // 工厂预设。
+    public static List<MenuItem> BuildCfChildren(DataColumn dc, DataTableState st, int col) {
+        int[] ps = DataTable.CfPresetColors();
+        // 生效规则快照：槽位（菜单应用）优先，否则列上的预设。
+        int cfMode = dc.cfMode;
+        int cfColor = dc.cfColor;
+        int cfColor2 = dc.cfColor2;
+        bool cfRankPct = dc.cfRankPct;
+        if (st.cfRules != null && col >= 0 && col < st.cfRules.Count && st.cfRules[col].mode != 0) {
+            cfMode = st.cfRules[col].mode;
+            cfColor = st.cfRules[col].color;
+            cfColor2 = st.cfRules[col].color2;
+            cfRankPct = st.cfRules[col].rankPct;
+        }
+        List<MenuItem> kids = new List<MenuItem>();
+
+        // 高亮规则：大于/小于均值；勾选标在对应行（颜色
+        // 用首列蓝，与旧面板默认一致）。
+        List<MenuItem> hl = new List<MenuItem>();
+        hl.Add(MenuItem.Item(DataTable.T("Greater Than Average", "大于均值"),
+        cfMode == 3 ? "check" : "",
+        DataTable.HdrActCfGreater));
+        hl.Add(MenuItem.Item(DataTable.T("Less Than Average", "小于均值"),
+        cfMode == 4 ? "check" : "",
+        DataTable.HdrActCfLess));
+        kids.Add(MenuItem.Submenu(DataTable.T("Highlight Rules", "高亮规则"),
+        "eye", hl));
+
+        // 前/后规则（名次缓存随 Recompute 重建）。
+        List<MenuItem> tb = new List<MenuItem>();
+        tb.Add(MenuItem.Item(DataTable.T("Top 10 Items", "前 10 项"),
+        (cfMode == 5 && !cfRankPct) ? "check" : "",
+        DataTable.HdrActCfTopN));
+        tb.Add(MenuItem.Item(DataTable.T("Top 10 %", "前 10 %"),
+        (cfMode == 5 && cfRankPct) ? "check" : "",
+        DataTable.HdrActCfTopPct));
+        tb.Add(MenuItem.Item(DataTable.T("Bottom 10 Items", "后 10 项"),
+        (cfMode == 6 && !cfRankPct) ? "check" : "",
+        DataTable.HdrActCfBottomN));
+        tb.Add(MenuItem.Item(DataTable.T("Bottom 10 %", "后 10 %"),
+        (cfMode == 6 && cfRankPct) ? "check" : "",
+        DataTable.HdrActCfBottomPct));
+        kids.Add(MenuItem.Submenu(DataTable.T("Top/Bottom Rules", "前/后规则"),
+        "sort", tb));
+        kids.Add(MenuItem.Separator());
+
+        // 数据条：4 组渐变 + 4 组纯色（渐变双端同色由渲染层做
+        // alpha 梯度），每项带单色块；当前列的数据条色带 ✓。
+        List<MenuItem> bars = new List<MenuItem>();
+        for (int i = 0; i < 8; i = i + 1) {
+            int ci = i < 4 ? i : i + 4;
+            string lbl = DataTable.T(i < 4 ? "Gradient Fill" : "Solid Fill",
+            i < 4 ? "渐变" : "纯色")
+            + " " + DataTable.SwatchName(ci);
+            string icon = (cfMode == 1 && cfColor == ps[ci]) ? "check" : "";
+            bars.Add(MenuItem.SwatchItem(lbl, icon, DataTable.HdrActCfBar0 + i,
+            ps[ci], 0));
+        }
+        kids.Add(MenuItem.Submenu(DataTable.T("Data Bars", "数据条"),
+        "chart-bar", bars));
+
+        // 色阶：双色渐变预设对，每项带双色对拼色块。
+        List<MenuItem> scales = new List<MenuItem>();
+        for (int i = 0; i < 8; i = i + 1) {
+            int ci = i < 4 ? i : i + 4;
+            int c0 = ps[ci];
+            int c1 = ps[ci + 4 > 11 ? ci - 4 : ci + 4];
+            string lbl = DataTable.SwatchName(ci);
+            string icon = (cfMode == 2 && cfColor == c0 && cfColor2 == c1) ? "check" : "";
+            scales.Add(MenuItem.SwatchItem(lbl, icon, DataTable.HdrActCfScale0 + i,
+            c0, c1));
+        }
+        kids.Add(MenuItem.Submenu(DataTable.T("Color Scales", "色阶"),
+        "color", scales));
+
+        kids.Add(MenuItem.Separator());
+        // 打开"清除规则"弹窗：全表规则逐条列出，勾选单删/多删。
+        // 直项不带勾选态——它不是开关，是弹窗入口（同筛选…/列选择器…）。
+        kids.Add(MenuItem.Item(DataTable.T("Clear Rules…", "清除规则…"), "close",
+        DataTable.HdrActCfClear));
+        return kids;
+    }
+
+    // 表头菜单 action 执行（RenderHeaderMenu 下一帧统一调用）。
+    public static void DispatchHeaderAction(App app, DataTableState st, List<DataColumn> cols,
+    DataSource src, int col, int act) {
+        // 通过菜单设置新规则 = 撤销显式清除（cfRules[col].off 让位）。
+        bool cfSet = (act >= DataTable.HdrActCfBar0 && act < DataTable.HdrActCfBar0 + 8)
+        || (act >= DataTable.HdrActCfScale0 && act < DataTable.HdrActCfScale0 + 8)
+        || act == DataTable.HdrActCfGreater || act == DataTable.HdrActCfLess
+        || (act >= DataTable.HdrActCfTopN && act <= DataTable.HdrActCfBottomPct);
+        if (cfSet && col >= 0) {
+            if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+            while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
+            st.cfRules[col].off = false;
+        }
+        if (act == DataTable.HdrActSortAsc) {
+            DataTable.SortBy(st, col, 1);
+            st.hitCol = col; st.Sort.Raise();
+        } else if (act == DataTable.HdrActSortDesc) {
+            DataTable.SortBy(st, col, 2);
+            st.hitCol = col; st.Sort.Raise();
+        } else if (act == DataTable.HdrActClearSort) {
+            DataTable.ClearSort(st);
+            st.Sort.Raise();
+        } else if (act == DataTable.HdrActFitCol) {
+            DataTable.AutoFitColumn(app, cols, src, st, col);
+            st.hitCol = col; st.ColumnResize.Raise();
+        } else if (act == DataTable.HdrActFitAll) {
+            DataTable.AutoFitAll(app, cols, src, st);
+            st.ColumnResize.Raise();
+        } else if (act == DataTable.HdrActGroup) {
+            DataTable.GroupBy(st, col);
+            st.hitCol = col; st.GroupChanged.Raise();
+        } else if (act == DataTable.HdrActUngroup) {
+            DataTable.Ungroup(st);
+            st.GroupChanged.Raise();
+        } else if (act == DataTable.HdrActPinLeft) {
+            if (DataTable.FreezeOf(st, col) == 1) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumn(st, col); }
+            st.hitCol = col; st.ColumnResize.Raise();
+        } else if (act == DataTable.HdrActPinRight) {
+            if (DataTable.FreezeOf(st, col) == 2) { DataTable.UnpinColumn(st, col); }
+            else { DataTable.PinColumnRight(st, col); }
+            st.hitCol = col; st.ColumnResize.Raise();
+        } else if (act == DataTable.HdrActHide) {
+            st.colHidden[col] = true;
+        } else if (act == DataTable.HdrActShowAll) {
+            DataTable.ShowAllColumns(st);
+        } else if (act == DataTable.HdrActChooser) {
+            DataTable.SetColumnChooser(st, true);
+        } else if (act == DataTable.HdrActFilter) {
+            DataTable.OpenFilterMenu(st, cols, src, col);
+        } else if (act == DataTable.HdrActResetCols) {
+            DataTable.ResetColumns(st, cols);
+        } else if (act >= DataTable.HdrActAgg0 && act < DataTable.HdrActAgg0 + 6) {
+            DataTable.SetAggregate(st, col, act - DataTable.HdrActAgg0);
+            st.hitCol = col; st.ColumnResize.Raise();
+        } else if (act >= DataTable.HdrActCfBar0 && act < DataTable.HdrActCfBar0 + 8) {
+            // 数据条：前 4 组渐变、后 4 组纯色（双端同色）。
+            // 规则写进状态槽（EnsureColumnSlots 每帧回写列）：
+            // 列对象可能每帧被调用方重建，直接写实例会丢。
+            int[] ps = DataTable.CfPresetColors();
+            int i = act - DataTable.HdrActCfBar0;
+            int ci = i < 4 ? i : i + 4;
+            if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+            while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
+            st.cfRules[col].mode = 1;
+            st.cfRules[col].color = ps[ci];
+            st.dirty = true;
+        } else if (act >= DataTable.HdrActCfScale0 && act < DataTable.HdrActCfScale0 + 8) {
+            int[] ps = DataTable.CfPresetColors();
+            int i = act - DataTable.HdrActCfScale0;
+            int ci = i < 4 ? i : i + 4;
+            if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+            while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
+            st.cfRules[col].mode = 2;
+            st.cfRules[col].color = ps[ci];
+            st.cfRules[col].color2 = ps[ci + 4 > 11 ? ci - 4 : ci + 4];
+            st.dirty = true;
+        } else if (act == DataTable.HdrActCfGreater || act == DataTable.HdrActCfLess) {
+            if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+            while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
+            st.cfRules[col].mode = act == DataTable.HdrActCfGreater ? 3 : 4;
+            st.cfRules[col].threshold = DataTable.MedianThreshold(app, st, cols, src, col);
+            int[] ps = DataTable.CfPresetColors();
+            st.cfRules[col].color = ps[0];
+            st.dirty = true;
+        } else if (act >= DataTable.HdrActCfTopN && act <= DataTable.HdrActCfBottomPct) {
+            int[] ps = DataTable.CfPresetColors();
+            if (st.cfRules == null) { st.cfRules = new List<ColumnCfRule>(); }
+            while (st.cfRules.Count <= col) { st.cfRules.Add(ColumnCfRule.Create()); }
+            if (act == DataTable.HdrActCfTopN) {
+                st.cfRules[col].mode = 5;
+                st.cfRules[col].threshold = 10;
+                st.cfRules[col].rankPct = false;
+            } else if (act == DataTable.HdrActCfTopPct) {
+                st.cfRules[col].mode = 5;
+                st.cfRules[col].threshold = 10;
+                st.cfRules[col].rankPct = true;
+            } else if (act == DataTable.HdrActCfBottomN) {
+                st.cfRules[col].mode = 6;
+                st.cfRules[col].threshold = 10;
+                st.cfRules[col].rankPct = false;
+            } else {
+                st.cfRules[col].mode = 6;
+                st.cfRules[col].threshold = 10;
+                st.cfRules[col].rankPct = true;
+            }
+            st.cfRules[col].color = act >= DataTable.HdrActCfBottomN ? ps[4] : ps[0];
+            // 名次缓存随下一次 Recompute 重建。
+            st.dirty = true;
+        } else if (act == DataTable.HdrActCfClear) {
+            // 清除规则弹窗：全表规则逐条勾选删除（单删/多删）。
+            // 被清列写入 cfRules[col].off 压制工厂预设——只清菜单槽的话，
+            // 每帧重建的列会把工厂预设带回来。
+            DataTable.OpenCfClear(st, cols);
+        }
+    }
+
+    // 表头菜单项由持久 ContextMenu 承载，DataTableMenuSession 在选中时提交操作。
+    public static List<MenuItem> BuildHeaderMenuItems(DataTableState st,
+    List<DataColumn> cols, DataSource src) {
+        int col = st.hdrCtxCol;
+        if (col < 0 || col >= cols.Count) { return new List<MenuItem>(); }
+
+        bool canFilter = cols[col].filterable;
+        bool canAgg = cols[col].numeric;
+        int curAgg = 0;
+        if (col < st.aggMode.Count) { curAgg = st.aggMode[col]; }
+        int sortIdx = DataTable.SortIndexOf(st, col);
+        int sortDir = sortIdx >= 0 ? st.sortKeys[sortIdx].dir : 0;
+        bool canClear = sortIdx >= 0;
+        bool anyHidden = DataTable.HiddenCount(st) > 0;
+        int frz = DataTable.FreezeOf(st, col);
+
+        List<MenuItem> items = new List<MenuItem>();
+        // 排序组：当前方向勾选在对应子项上。
+        items.Add(MenuItem.Item(DataTable.T("Sort Ascending", "升序排序"),
+        sortDir == 1 ? "check" : "",
+        DataTable.HdrActSortAsc));
+        items.Add(MenuItem.Item(DataTable.T("Sort Descending", "降序排序"),
+        sortDir == 2 ? "check" : "",
+        DataTable.HdrActSortDesc));
+        if (canClear) {
+            items.Add(MenuItem.Item(DataTable.T("Clear Sort", "清除排序"), "",
+            DataTable.HdrActClearSort));
+        }
+        items.Add(MenuItem.Separator());
+        items.Add(MenuItem.Item(DataTable.T("Auto-fit Column", "自动列宽"), "",
+        DataTable.HdrActFitCol));
+        items.Add(MenuItem.Item(DataTable.T("Auto-fit All", "自动全部列宽"), "",
+        DataTable.HdrActFitAll));
+        items.Add(MenuItem.Separator());
+        items.Add(MenuItem.Item(DataTable.T("Group by This", "按此列分组"), "",
+        DataTable.HdrActGroup));
+        if (st.groupCols.Count > 0) {
+            items.Add(MenuItem.Item(DataTable.T("Ungroup All", "取消分组"), "",
+            DataTable.HdrActUngroup));
+        }
+        items.Add(MenuItem.Separator());
+        // 冻结：两个明确条目而非循环开关（见旧注释——让用户
+        // 连点两次摸索不如两项都显示）。已冻结侧改为取消冻结。
+        string pinLbl = DataTable.T("Freeze Left", "冻结到左侧");
+        if (frz == 1) { pinLbl = DataTable.T("Unfreeze", "取消冻结"); }
+        items.Add(MenuItem.Item(pinLbl, "", DataTable.HdrActPinLeft));
+        string pinRLbl = DataTable.T("Freeze Right", "冻结到右侧");
+        if (frz == 2) { pinRLbl = DataTable.T("Unfreeze", "取消冻结"); }
+        items.Add(MenuItem.Item(pinRLbl, "", DataTable.HdrActPinRight));
+        items.Add(MenuItem.Item(DataTable.T("Hide Column", "隐藏此列"), "",
+        DataTable.HdrActHide));
+        if (anyHidden) {
+            items.Add(MenuItem.Item(DataTable.T("Show All Columns", "显示所有列"), "",
+            DataTable.HdrActShowAll));
+        }
+        items.Add(MenuItem.Item(DataTable.T("Column Chooser…", "列选择器…"), "",
+        DataTable.HdrActChooser));
+        if (canAgg) {
+            items.Add(MenuItem.Separator());
+            // 合计：子菜单父项只作展开入口，勾选在子项
+            // （父项不该呈选中态）。
+            int aggMode = curAgg >= 1 && curAgg <= 5 ? curAgg : 0;
+            items.Add(MenuItem.Submenu(DataTable.T("Total", "合计"), "calculator",
+            DataTable.BuildAggChildren(aggMode)));
+        }
+        if (canFilter) {
+            items.Add(MenuItem.Separator());
+            items.Add(MenuItem.Item(DataTable.T("Filter…", "筛选…"), "filter",
+            DataTable.HdrActFilter));
+        }
+        if (canAgg) {
+            items.Add(MenuItem.Separator());
+            items.Add(MenuItem.Submenu(DataTable.T("Conditional Formatting", "条件格式"),
+            "flag", DataTable.BuildCfChildren(cols[col], st, col)));
+        }
+        items.Add(MenuItem.Separator());
+        items.Add(MenuItem.Item(DataTable.T("Reset Columns", "重置所有列"), "undo",
+        DataTable.HdrActResetCols));
+
+        return items;
+    }
+}

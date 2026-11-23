@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading;
 
 namespace System.Input;
@@ -103,9 +104,17 @@ public class Keyboard {
     // 对 CJK 和符号安全（使用 KEYEVENTF_UNICODE 而非 VK 码）。
     public static void SendText(string text) {
         #if WINDOWS
-        for (int i = 0; i < text.Length; i = i + 1) {
-            Keyboard.SendUnicode(text.Substring(i, 1), 0);
-            Keyboard.SendUnicode(text.Substring(i, 1), Keyboard.FKeyUp());
+        if (text == null) { return; }
+        int i = 0;
+        int len = text.Length;
+        while (i < len) {
+            long res = Encoding.DecodeCodePointFast(text, i);
+            int w = (int)(res >> 32);
+            if (w <= 0) { break; }
+            int cp = (int)(res & 0xFFFFFFFFL);
+            Keyboard.SendUnicodeCp(cp, 0);
+            Keyboard.SendUnicodeCp(cp, Keyboard.FKeyUp());
+            i = i + w;
         }
         #elif MACOS
         // 文本只进临时 AppleScript 文件，不进命令行
@@ -137,16 +146,18 @@ public class Keyboard {
 
     // 播放按键宏；格式见类文档。
     public static void Send(string macro) {
+        if (macro == null) { return; }
         #if MACOS
         Keyboard.MacSend(macro);
         return;
         #endif
         List<int> held = new List<int>();
         int i = 0;
-        while (i < macro.Length) {
-            string ch = macro.Substring(i, 1);
-            if (ch == "{") {
-                int close = Keyboard.IndexOf(macro, "}", i + 1);
+        int len = macro.Length;
+        while (i < len) {
+            int b0 = macro[i] & 255;
+            if (b0 == 123) { // '{'
+                int close = macro.IndexOf("}", i + 1);
                 if (close < 0) { break; }  // 花括号未闭合：停止
                 string name = macro.Substring(i + 1, close - i - 1);
                 int vk = Keyboard.VK(name);
@@ -155,20 +166,23 @@ public class Keyboard {
                     held.Add(vk);
                 }
                 i = close + 1;
-            } else if (ch == "}") {
+            } else if (b0 == 125) { // '}'
                 i = i + 1;  // 多余的右花括号：忽略
             } else {
                 // 直到下一个花括号（或末尾）的字面文本段。
-                int b = i;
-                while (b < macro.Length && macro.Substring(b, 1) != "{") {
-                    b = b + 1;
+                int b = macro.IndexOf("{", i);
+                if (b < 0) { b = len; }
+                if (b - i == 1) {
+                    int c = macro[i] & 255;
+                    if ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
+                        || (c >= 0x30 && c <= 0x39)) {
+                        Keyboard.Press((c >= 0x61 && c <= 0x7A) ? (c - 0x20) : c);
+                        i = b;
+                        continue;
+                    }
                 }
                 string text = macro.Substring(i, b - i);
-                if (text.Length == 1 && Keyboard.IsKeyChar(text)) {
-                    Keyboard.Press(Keyboard.CharVK(text));
-                } else if (text != "") {
-                    Keyboard.SendText(text);
-                }
+                if (text != "") { Keyboard.SendText(text); }
                 i = b;
             }
         }
@@ -303,7 +317,7 @@ public class Keyboard {
         if (n == "NUMLOCK") { return 0x90; }
         if (n == "SCROLLLOCK") { return 0x91; }
         // F1..F24
-        if (n.Length >= 2 && n.Substring(0, 1) == "F") {
+        if (n.Length >= 2 && (n[0] & 255) == 70) {
             int num = Keyboard.ParseInt(n.Substring(1, n.Length - 1));
             if (num >= 1 && num <= 24) { return 0x6F + num; }
         }
@@ -371,14 +385,25 @@ public class Keyboard {
         }
     }
 
-    // 为 `ch` 发送一个 Unicode（KEYEVENTF_UNICODE）按键事件。
-    private static void SendUnicode(string ch, int flags) {
+    // 为 `cp` 发送一个 Unicode（KEYEVENTF_UNICODE）按键事件；非 BMP 拆代理对。
+    private static void SendUnicodeCp(int cp, int flags) {
+        if (cp <= 0) { return; }
+        if (cp <= 0xFFFF) {
+            Keyboard.SendUnicodeUnit(cp, flags);
+            return;
+        }
+        int cu = cp - 0x10000;
+        Keyboard.SendUnicodeUnit(0xD800 + (cu >> 10), flags);
+        Keyboard.SendUnicodeUnit(0xDC00 + (cu & 0x3FF), flags);
+    }
+
+    // 为 UTF-16 码元发送一个 Unicode（KEYEVENTF_UNICODE）按键事件。
+    private static void SendUnicodeUnit(int unit, int flags) {
         nint input = NativeMemory.Alloc(32);
         try {
             Span<int> w = new Span<int>(input, 8);
             w[0] = 1;  // INPUT 类型：键盘
-            int scan = Keyboard.CodeOf(ch);
-            w[2] = scan * 65536;  // wScan 承载码点（wVk = 0）
+            w[2] = unit * 65536;  // wScan 承载码元（wVk = 0）
             w[3] = flags | Keyboard.FUnicode();
             w[4] = 0;
             WinSendInput(1, input, 32);
@@ -436,22 +461,30 @@ public class Keyboard {
         return tmp;
     }
 
-    // AppleScript 字符串字面量转义（反斜杠和双引号）。
+    // AppleScript 字符串字面量转义（反斜杠和双引号；无特殊字符零分配直返原串）。
     private static string OsaQuote(string s) {
-        string outp = "";
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "\\" || ch == "\"") { outp = outp + "\\"; }
-            outp = outp + ch;
+        if (s == null) { return ""; }
+        int n = s.Length;
+        StringBuilder sb = null;
+        int runStart = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c != 92 && c != 34) { continue; }
+            if (sb == null) { sb = new StringBuilder(); }
+            if (i > runStart) { sb.Append(s.Substring(runStart, i - runStart)); }
+            sb.Append("\\");
+            runStart = i;
         }
-        return outp;
+        if (sb == null) { return s; }
+        if (runStart < n) { sb.Append(s.Substring(runStart, n - runStart)); }
+        return sb.ToString();
     }
 
     // 解析十六进制串（xset 的 LED 掩码）；非法字符处停止。
     private static int ParseHex(string s) {
         int v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
-            int c = Keyboard.CodeOf(s.Substring(i, 1));
+            int c = s[i] & 255;
             int d = -1;
             if (c >= 0x30 && c <= 0x39) { d = c - 0x30; }
             else if (c >= 0x61 && c <= 0x66) { d = c - 0x61 + 10; }
@@ -469,10 +502,11 @@ public class Keyboard {
     private static void MacSend(string macro) {
         List<string> mods = new List<string>();
         int i = 0;
-        while (i < macro.Length) {
-            string ch = macro.Substring(i, 1);
-            if (ch == "{") {
-                int close = Keyboard.IndexOf(macro, "}", i + 1);
+        int len = macro.Length;
+        while (i < len) {
+            int b0 = macro[i] & 255;
+            if (b0 == 123) { // '{'
+                int close = macro.IndexOf("}", i + 1);
                 if (close < 0) { break; }
                 string name = macro.Substring(i + 1, close - i - 1);
                 int vk = Keyboard.VK(name);
@@ -483,13 +517,11 @@ public class Keyboard {
                     Keyboard.MacKey(vk, mods);
                 }
                 i = close + 1;
-            } else if (ch == "}") {
+            } else if (b0 == 125) { // '}'
                 i = i + 1;
             } else {
-                int b = i;
-                while (b < macro.Length && macro.Substring(b, 1) != "{") {
-                    b = b + 1;
-                }
+                int b = macro.IndexOf("{", i);
+                if (b < 0) { b = len; }
                 string text = macro.Substring(i, b - i);
                 if (text != "") { Keyboard.MacText(text, mods); }
                 i = b;
@@ -500,12 +532,14 @@ public class Keyboard {
     // 拼 AppleScript 的 `using {..}` 修饰键子句；无修饰键返回 ""。
     private static string MacUsing(List<string> mods) {
         if (mods.Count == 0) { return ""; }
-        string s = " using {";
+        StringBuilder sb = new StringBuilder();
+        sb.Append(" using {");
         for (int i = 0; i < mods.Count; i = i + 1) {
-            if (i > 0) { s = s + ", "; }
-            s = s + mods[i];
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(mods[i]);
         }
-        return s + "}";
+        sb.Append("}");
+        return sb.ToString();
     }
 
     // 发一次 key code 敲击（带修饰键 using 子句）；VK 无 macOS 键码
@@ -553,17 +587,10 @@ public class Keyboard {
         if (Keyboard.IsToggled(vk) != on) { Keyboard.Press(vk); }
     }
 
-    // 单个字母或数字时为真（在宏中作为 VK 按下输入）。
-    private static bool IsKeyChar(string ch) {
-        if (ch.Length != 1) { return false; }
-        int c = Keyboard.CodeOf(ch);
-        return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
-            || (c >= 0x30 && c <= 0x39);
-    }
-
     // 单个字母/数字对应的 VK 码，否则为 0。
     private static int CharVK(string ch) {
-        int c = Keyboard.CodeOf(ch);
+        if (ch == null || ch.Length != 1) { return 0; }
+        int c = ch[0] & 255;
         if (c >= 0x61 && c <= 0x7A) { return c - 0x20; }  // a-z -> A-Z VK
         if (c >= 0x41 && c <= 0x5A) { return c; }
         if (c >= 0x30 && c <= 0x39) { return c; }
@@ -574,26 +601,7 @@ public class Keyboard {
     // ASCII 快速路径）。空字符串返回 0。
     public static int CodeOf(string ch) {
         if (ch == null || ch.Length == 0) { return 0; }
-        int c0 = ch[0] & 255;
-        if ((c0 & 0x80) == 0) {
-            return c0;
-        } else if ((c0 & 0xE0) == 0xC0 && ch.Length >= 2) {
-            return ((c0 & 0x1F) << 6) | (ch[1] & 0x3F);
-        } else if ((c0 & 0xF0) == 0xE0 && ch.Length >= 3) {
-            return ((c0 & 0x0F) << 12) | ((ch[1] & 0x3F) << 6) | (ch[2] & 0x3F);
-        } else if ((c0 & 0xF8) == 0xF0 && ch.Length >= 4) {
-            return ((c0 & 0x07) << 18) | ((ch[1] & 0x3F) << 12)
-                | ((ch[2] & 0x3F) << 6) | (ch[3] & 0x3F);
-        }
-        return c0;
-    }
-
-    // `needle` 在 `hay` 中从 `from` 起的第一个索引，找不到返回 -1。
-    private static int IndexOf(string hay, string needle, int from) {
-        if (hay == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
+        return (int)(Encoding.DecodeCodePointFast(ch, 0) & 0xFFFFFFFFL);
     }
 
     // 解析非负十进制整数；格式错误返回 -1。

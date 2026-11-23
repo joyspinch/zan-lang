@@ -3,25 +3,14 @@ using System.Diagnostics;
 
 namespace System.Automation;
 
-// Win32 EnumWindows/EnumChildWindows 回调（WINAPI 调用
-// 约定）。返回 0 停止枚举。
+// Win32 EnumWindows/EnumChildWindows 回调；返回 0 停止枚举。
 public delegate int WndEnumProc(nint hwnd, nint lparam);
 
-// DwmGetWindowAttribute 延迟解析，这样即使 DWM 被禁用，模块
-// 也仍能正常工作。
+// DwmGetWindowAttribute 延迟解析（无 DWM 时仍可工作）。
 public delegate int DwmGetAttrFn(nint hwnd, int attr, nint outBuf, int size);
 
-// Win32 窗口自动化：枚举、查找、等待窗口和子控件，
-// （class + title + id 多条件匹配，带超时），
-// 读取/设置文本、点击控件和菜单命令、显示/隐藏/置顶/
-// 前置/最小化、屏幕与客户区坐标互转、所属
-// 线程/进程 ID 及卡死检测。
-// nint wnd = Window.FindWindowByTitle("无标题 - 记事本");
-// Window.ClickMenu(wnd, "文件/保存");
-// Window.Close(wnd);
-// 匹配方式为子串匹配（class 和 title），区分大小写；"" 或 0 表示
-// "任意"。标题通过 SendMessageTimeout 跨进程读取，卡死的
-// 窗口会匹配失败而非阻塞调用方。支持跨平台（Windows、Linux、macOS 原生适配与降级治理）。
+// 跨平台窗口自动化：枚举/匹配/等待窗口与子控件、读写文本、样式/状态/Z 序/几何操作与消息投递。
+// 标题/类名采用区分大小写的子串匹配（"" 或 0 为通配），Win32 跨进程读文本通过 SendMessageTimeout 防止挂起。
 public partial class Window {
     #if WINDOWS
     // ---- user32 导入 ----
@@ -364,19 +353,55 @@ public partial class Window {
         #endif
     }
 
+    #if WINDOWS
+    private static bool ModifyWindowLong(nint hwnd, int index, int remove, int add, int swpFlags) {
+        if (!Window.IsWindow(hwnd)) { return false; }
+        int style = (int)Window.WinGetWindowLongPtrW(hwnd, index);
+        int next = (style & ~remove) | add;
+        if (next == style) { return true; }
+        nint r = Window.WinSetWindowLongPtrW(hwnd, index, (nint)next);
+        if (r == 0 && Window.WinGetWindowLongPtrW(hwnd, index) == 0) { return false; }
+        Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, 0, 0, swpFlags);
+        return true;
+    }
+
+    private static long PackPoint(int x, int y) {
+        nint buf = NativeMemory.Alloc(8);
+        long pt = 0;
+        try {
+            new Span<int>(buf, 1)[0] = x;
+            new Span<int>(buf + 4, 1)[0] = y;
+            pt = new Span<long>(buf, 1)[0];
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        return pt;
+    }
+
+    private static WindowPoint MapPoint(nint hwnd, int x, int y, bool toScreen) {
+        nint pt = NativeMemory.Alloc(8);
+        int mx = 0;
+        int my = 0;
+        try {
+            new Span<int>(pt, 1)[0] = x;
+            new Span<int>(pt + 4, 1)[0] = y;
+            if (toScreen) { Window.WinClientToScreen(hwnd, pt); }
+            else { Window.WinScreenToClient(hwnd, pt); }
+            mx = new Span<int>(pt, 1)[0];
+            my = new Span<int>(pt + 4, 1)[0];
+        } finally {
+            NativeMemory.Free(pt);
+        }
+        return new WindowPoint(mx, my);
+    }
+    #endif
+
     // 增删样式位(GWL_STYLE)并应用 SWP_FRAMECHANGED。
     public static bool ModifyStyle(nint hwnd, int remove, int add) {
         #if WINDOWS
-        if (!Window.IsWindow(hwnd)) { return false; }
-        int style = Window.GetStyle(hwnd);
-        int next = (style & ~remove) | add;
-        if (next == style) { return true; }
-        nint r = Window.WinSetWindowLongPtrW(hwnd, -16, (nint)next);
-        if (r == 0 && Window.WinGetWindowLongPtrW(hwnd, -16) == 0) { return false; }
-        Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, 0, 0,
+        return Window.ModifyWindowLong(hwnd, -16, remove, add,
             0x0020 /* SWP_FRAMECHANGED */ | 0x0001 /* SWP_NOSIZE */ |
             0x0002 /* SWP_NOMOVE */ | 0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */);
-        return true;
         #else
         return false;
         #endif
@@ -385,16 +410,8 @@ public partial class Window {
     // 增删扩展样式位(GWL_EXSTYLE)。
     public static bool ModifyStyleEx(nint hwnd, int remove, int add) {
         #if WINDOWS
-        if (!Window.IsWindow(hwnd)) { return false; }
-        int style = Window.GetStyleEx(hwnd);
-        int next = (style & ~remove) | add;
-        if (next == style) { return true; }
-        nint r = Window.WinSetWindowLongPtrW(hwnd, -20, (nint)next);
-        if (r == 0 && Window.WinGetWindowLongPtrW(hwnd, -20) == 0) { return false; }
-        Window.WinSetWindowPos(hwnd, (nint)0, 0, 0, 0, 0,
-            0x0002 /* SWP_NOMOVE */ | 0x0004 /* SWP_NOZORDER */ |
-            0x0010 /* SWP_NOACTIVATE */);
-        return true;
+        return Window.ModifyWindowLong(hwnd, -20, remove, add,
+            0x0002 /* SWP_NOMOVE */ | 0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */);
         #else
         return false;
         #endif
@@ -699,16 +716,7 @@ public partial class Window {
     // 取屏幕上坐标 (x, y) 处的窗口(WindowFromPoint)。
     public static nint FromPoint(int x, int y) {
         #if WINDOWS
-        nint buf = NativeMemory.Alloc(8);
-        long pt = 0;
-        try {
-            new Span<int>(buf, 1)[0] = x;
-            new Span<int>(buf + 4, 1)[0] = y;
-            pt = new Span<long>(buf, 1)[0];
-        } finally {
-            NativeMemory.Free(buf);
-        }
-        return Window.WinWindowFromPoint(pt);
+        return Window.WinWindowFromPoint(Window.PackPoint(x, y));
         #else
         return (nint)0;
         #endif
@@ -718,16 +726,7 @@ public partial class Window {
     // flags: 0 全部, 1 跳过不可见, 2 跳过禁用, 4 跳过透明。
     public static nint FromClientPoint(nint parent, int x, int y, int flags) {
         #if WINDOWS
-        nint buf = NativeMemory.Alloc(8);
-        long pt = 0;
-        try {
-            new Span<int>(buf, 1)[0] = x;
-            new Span<int>(buf + 4, 1)[0] = y;
-            pt = new Span<long>(buf, 1)[0];
-        } finally {
-            NativeMemory.Free(buf);
-        }
-        return Window.WinChildWindowFromPointEx(parent, pt, flags);
+        return Window.WinChildWindowFromPointEx(parent, Window.PackPoint(x, y), flags);
         #else
         return (nint)0;
         #endif
@@ -946,19 +945,7 @@ public partial class Window {
     // 屏幕坐标 → 客户区坐标(ScreenToClient)。
     public static WindowPoint ToClient(nint hwnd, int x, int y) {
         #if WINDOWS
-        nint pt = NativeMemory.Alloc(8);
-        int cx = 0;
-        int cy = 0;
-        try {
-            new Span<int>(pt, 1)[0] = x;
-            new Span<int>(pt + 4, 1)[0] = y;
-            Window.WinScreenToClient(hwnd, pt);
-            cx = new Span<int>(pt, 1)[0];
-            cy = new Span<int>(pt + 4, 1)[0];
-        } finally {
-            NativeMemory.Free(pt);
-        }
-        return new WindowPoint(cx, cy);
+        return Window.MapPoint(hwnd, x, y, false);
         #else
         return new WindowPoint(0, 0);
         #endif
@@ -967,19 +954,7 @@ public partial class Window {
     // 客户区坐标 → 屏幕坐标(ClientToScreen)。
     public static WindowPoint ToScreen(nint hwnd, int x, int y) {
         #if WINDOWS
-        nint pt = NativeMemory.Alloc(8);
-        int sx = 0;
-        int sy = 0;
-        try {
-            new Span<int>(pt, 1)[0] = x;
-            new Span<int>(pt + 4, 1)[0] = y;
-            Window.WinClientToScreen(hwnd, pt);
-            sx = new Span<int>(pt, 1)[0];
-            sy = new Span<int>(pt + 4, 1)[0];
-        } finally {
-            NativeMemory.Free(pt);
-        }
-        return new WindowPoint(sx, sy);
+        return Window.MapPoint(hwnd, x, y, true);
         #else
         return new WindowPoint(0, 0);
         #endif

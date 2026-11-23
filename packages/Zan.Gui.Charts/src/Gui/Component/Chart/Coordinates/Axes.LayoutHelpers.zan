@@ -1,0 +1,321 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+public partial class Chart {
+    internal static void LayoutGridPlotRect(
+        App app, ChartOption o, int x, int y, int w, int h,
+        int pad, int fs, int fh,
+        ChartAxis x0, ChartAxis y0, ChartAxis y1,
+        List<string> labels, bool catY, bool xValue, bool hasRight,
+        int leftLo, int leftHi, int leftLoF, int leftHiF, bool leftFrac, int ticks,
+        int rightLo, int rightHi, int rightLoF, int rightHiF, bool rightFrac, int rt,
+        bool x0RidesY0, bool x0RidesY1,
+        out int plotX, out int plotY, out int plotW, out int plotH) {
+        // containLabel/outerBounds 用的纯标签宽（官方 labelUnionRect：
+        // 只量文本盒，不加 padding）。
+        int yLblRaw = 0;
+        int leftGut;
+        if (catY && y0.categories.Count > 0) {
+            // 类目 Y：左栏取最宽类目标签（含 formatter 展开）。
+            int mw = 0;
+            for (int cgi = 0; cgi < y0.categories.Count; cgi = cgi + 1) {
+                string cgl = y0.categories[cgi];
+                if (y0.labelFormatter.Length > 0) { cgl = y0.labelFormatter.Replace("{value}", cgl); }
+                int wgi = Canvas.MeasureText(cgl, fs);
+                if (wgi > mw) { mw = wgi; }
+            }
+            yLblRaw = mw;
+            leftGut = mw + app.Scale(12) + app.Scale(y0.labelMargin);
+        } else {
+            yLblRaw = Chart.TickLabelW(leftLo, leftHi, ticks, fs);
+            leftGut = Chart.TickLabelW(leftLo, leftHi, ticks, fs) + app.Scale(12) + app.Scale(y0.labelMargin);
+            if (leftFrac) {
+                // 小数轴标签（"0.5"）比整数影子值（"0"）宽，按定点
+                // 域重估最宽刻度文本。
+                int fw = Chart.TickLabelWF(leftLoF, leftHiF, ticks, fs);
+                if (fw > leftGut) { leftGut = fw + app.Scale(12) + app.Scale(y0.labelMargin); }
+                if (fw > yLblRaw) { yLblRaw = fw; }
+            }
+            if (y0.labelFormatter.Length > 0) {
+                int fx = Chart.FormatterExtraW(y0.labelFormatter, leftHi, fs);
+                leftGut = leftGut + fx;
+                yLblRaw = yLblRaw + fx;
+            }
+        }
+        if (y0.labelInside || !y0.labelShow) {
+            leftGut = pad;
+        }
+        if (y0.offset != 0) {
+            leftGut = leftGut + app.Scale(y0.offset);
+        }
+        int rightGut = pad + app.Scale(y1.labelMargin);
+        if (hasRight) {
+            if (y1.labelInside || !y1.labelShow) {
+                rightGut = pad;
+            } else {
+                rightGut = Chart.TickLabelW(rightLo, rightHi, rt, fs) + app.Scale(12) + app.Scale(y1.labelMargin);
+                if (rightFrac) {
+                    int rw = Chart.TickLabelWF(rightLoF, rightHiF, rt, fs) + app.Scale(12) + app.Scale(y1.labelMargin);
+                    if (rw > rightGut) { rightGut = rw; }
+                }
+            }
+            if (y1.offset != 0) {
+                rightGut = rightGut + app.Scale(y1.offset);
+            }
+        }
+        int botGut = fh + app.Scale(12) + app.Scale(x0.labelMargin);
+        if (x0.labelInside || !x0.labelShow) {
+            botGut = pad;
+        }
+        // x 轴名的垂直落点随 nameLocation 变（AxisNamePos）：end/middle 在
+        // 轴线下方（middle 再多一整个 gap）、start 骑在轴线上。量出名字
+        // 盒底相对"轴线 + 半个行高"多出来的部分补进底栏，否则名字压住
+        // 刻度标签。start 态盒底高于轴线下缘，不补。
+        // onZero 骑线时例外：end/start 名字贴轴线走进绘图区（middle
+        // 留在边界），底部不再需要让位——官方网格从不为轴名留白。
+        if (x0.title.Length > 0 && x0.show && !(x0RidesY0 || x0RidesY1)) {
+            int xTw = Canvas.MeasureText(x0.title, fs);
+            ChartNameBox xb = Chart.AxisNameBoxPx(x0, true, 0, 0, 100, 100,
+            false, Chart.NameGapPx(app, x0), fh, Canvas.CenterTextYAt(0, fs),
+            xTw, 0 - 1);
+            int below = xb.bottom - (fh + fh / 2);
+            if (below > 0) { botGut = botGut + below; }
+        }
+        if (xValue) { botGut = botGut + fh + app.Scale(2); }
+        // 旋转分类标签：按最宽标签的旋转后垂直跨度扩底栏（未旋转
+        // 与旋转都成立——interval>=0 抽稀时贪心不再兜底防重叠）。
+        if (x0.labelRotate != 0 && labels.Count > 0) {
+            int rotMaxW = 0;
+            for (int ri = 0; ri < labels.Count; ri = ri + 1) {
+                int rwi = Canvas.MeasureText(labels[ri], fs);
+                if (rwi > rotMaxW) { rotMaxW = rwi; }
+            }
+            int need = Chart.RotatedLabelH(rotMaxW, fh, x0.labelRotate) + app.Scale(4);
+            int baseNeed = fh + app.Scale(12);
+            if (need > baseNeed) {
+                botGut = botGut - baseNeed + need;
+            }
+        }
+
+        // ---- A16 绘图矩形：ECharts Grid.resize 首遍
+        // getLayoutRect(getBoxLayoutParams())，矩形只由声明的
+        // center/middle/bottom/... 专名语义、width/height 优先锚
+        // 定）。官方网格从不为轴标签/轴名/图例留白——标签溢出由
+        // containLabel / outerBounds 的第二遍收缩处理，图例在
+        // 官方是独立组件浮在画布上、根本不改 grid 矩形。
+        ChartLayoutRect gr = ChartGeometry.GridRawRect(
+        o.gridLeftRaw, o.gridRightRaw, o.gridTopRaw, o.gridBottomRaw,
+        o.gridWidthRaw, o.gridHeightRaw, (double)w, (double)h, false);
+        plotX = x + (int)Math.Round(gr.x);
+        plotY = y + (int)Math.Round(gr.y);
+        plotW = (int)Math.Round(gr.width);
+        plotH = (int)Math.Round(gr.height);
+        // containLabel：legacyContainLabel.ts 语义——x 轴（水平，
+        // bottom 侧）从高度里扣「标签并集高 + margin」并把 y 下推；
+        // y 轴（left 侧）从宽度里扣「标签并集宽 + margin」并把 x
+        // 右推。标签并集用与绘制同一套度量（最宽刻度文本 / 行高）。
+        if (o.containLabel) {
+            // estimateLabelUnionRect（legacyContainLabel.ts）：逐
+            // 标签 getTextRect 取并集——y 轴 = 最宽文本盒宽，x 轴 =
+            // 文本盒高（官方 12px 文本盒高 12，不是行盒 fh；fallback
+            // 度量下 equal font-size）。旋转取旋转后外接盒。
+            // axisLabel.fontSize 声明时并集高随字号（bump-chart 16）。
+            int xLblH = x0.labelFontSize > 0 ? app.Scale(x0.labelFontSize)
+            : (x0.labelSt != null && x0.labelSt.fontSize > 0
+            ? app.Scale(x0.labelSt.fontSize) : app.Scale(12));
+            if (x0.labelRotate != 0 && labels.Count > 0) {
+                int rotMaxW2 = 0;
+                for (int ri2 = 0; ri2 < labels.Count; ri2 = ri2 + 1) {
+                    int rwi2 = Canvas.MeasureText(labels[ri2], fs);
+                    if (rwi2 > rotMaxW2) { rotMaxW2 = rwi2; }
+                }
+                rotMaxW2 = Chart.RotatedLabelH(rotMaxW2, app.Scale(12), x0.labelRotate);
+                if (rotMaxW2 > xLblH) { xLblH = rotMaxW2; }
+            }
+            // axisLabel.margin 官方缺省 8（zan 缺省 0 是画距语义）。
+            int margin = app.Scale(x0.labelMargin > 0 ? x0.labelMargin : 8);
+            int yMargin = app.Scale(y0.labelMargin > 0 ? y0.labelMargin : 8);
+            // x 轴（bottom 侧）只缩高度；y 轴（left 侧）缩宽并把 x
+            // 右推。y 下移仅发生在 x 轴 position top（语料无）。
+            if (x0.show && x0.labelShow) { plotH = plotH - xLblH - margin; }
+            if (y0.show && yLblRaw > 0) {
+                plotW = plotW - yLblRaw - yMargin;
+                plotX = plotX + yLblRaw + yMargin;
+            }
+        }
+        // outerBounds（Grid.ts prepareOuterBounds 'auto'，缺省即跑）：外接矩形
+        // 走 getLayoutRect 且缺省四边 0 = 整个容器。layOutGridBy
+        // OuterBounds：先估轴标签/轴名盒，凡越过外接边界的溢出量
+        // （shrink，noNegative，钳 25%/25% 尺寸）。语料覆盖四类：
+        // - y 标签左溢（grid left 0/2px）：mLeft = 标签左缘溢出；
+        // - x 轴名 end 态右溢（boxplot-light-velocity2）：mRight；
+        // - 外接声明 top/bottom 时标签上下溢出（intraday-breaks-1）。
+        if (o.obDeclared && !o.containLabel) {
+            ChartLayoutRect ob = ChartGeometry.GridRawRect(
+            o.obLeftRaw, o.obRightRaw, o.obTopRaw, o.obBottomRaw,
+            null, null, (double)w, (double)h, true);
+            double mTop = 0.0;
+            double mRight = 0.0;
+            double mBottom = 0.0;
+            double mLeft = 0.0;
+            // 标签盒：官方 labelInfoList.rect（文本盒 + margin 8 的落位）。
+            // y 轴标签行盒：右缘贴 plotX - margin，左缘 = 右缘 - 文本宽。
+            if (y0.show && yLblRaw > 0) {
+                double lblRight = plotX - app.Scale(y0.labelMargin > 0 ? y0.labelMargin : 8);
+                double lblLeft = lblRight - yLblRaw;
+                mLeft = Math.Max(mLeft, ob.x - lblLeft);
+            }
+            // 顶/底溢出（x 维标签与 x 轴名）。x 标签行盒：顶 = plot 底
+            // + margin，高 = 文本盒高（官方 12px → 12）。
+            if (x0.show) {
+                double lblH = app.Scale(12);
+                double lblTop = plotY + plotH + app.Scale(x0.labelMargin > 0 ? x0.labelMargin : 8);
+                mBottom = Math.Max(mBottom, lblTop + lblH - (ob.y + ob.height));
+                // 最顶 y 标签垂直居中于绘图区顶边：盒顶 = plotY - h/2。
+                if (y0.show) {
+                    mTop = Math.Max(mTop, ob.y - (plotY - lblH / 2.0));
+                }
+            }
+            // x 轴名 end 态：名字盒在轴右端外（AxisNameBoxPx anchor 0）。
+            if (x0.title.Length > 0 && x0.show && x0.nameLocation != "middle") {
+                int xTw = Canvas.MeasureText(x0.title, fs);
+                ChartNameBox xb = Chart.AxisNameBoxPx(x0, true, plotX, plotY,
+                plotW, plotH, false, Chart.NameGapPx(app, x0), fh,
+                Canvas.CenterTextYAt(0, fs), xTw, 0 - 1);
+                mRight = Math.Max(mRight, xb.right - (ob.x + ob.width));
+                mBottom = Math.Max(mBottom, (double)(xb.bottom - (ob.y + ob.height)));
+            }
+            // y 轴名 end/start 态在绘图区上/下方溢出（intraday 类）。
+            if (y0.title.Length > 0 && y0.show) {
+                ChartNameBox yb = Chart.AxisNameBoxPx(y0, false, plotX, plotY,
+                plotW, plotH, false, Chart.NameGapPx(app, y0), fh,
+                Canvas.CenterTextYAt(0, fs), 0, 0 - 1);
+                mTop = Math.Max(mTop, (double)(ob.y - yb.top));
+            }
+            gr.Shrink(mTop, mRight, mBottom, mLeft,
+            gr.width * 0.25, gr.height * 0.25);
+            plotX = x + (int)Math.Round(gr.x);
+            plotY = y + (int)Math.Round(gr.y);
+            plotW = (int)Math.Round(gr.width);
+            plotH = (int)Math.Round(gr.height);
+            if (plotW < app.Scale(20)) { plotW = app.Scale(20); }
+        }
+        if (plotH < app.Scale(20)) { plotH = app.Scale(20); }
+    }
+
+    internal static void ResolveAxisBreaks(
+        ChartFrame f, ChartAxis y0, ChartAxis y1, ChartAxis x0,
+        bool hasRight, bool leftFrac, bool rightFrac, bool isTime, bool catY,
+        int leftLo, int leftHi, double brkIvL,
+        int rightLo, int rightHi, double brkIvR,
+        int xLo, int xHi, int tMin, int tMax) {
+        // ---- A15 断轴 gapReal 解算 + 挂框 ----
+        // 量程（含 nice 与 markPad 外扩）定型后解：占比断带按
+        // G = P·S/(1-P) 分摊（S = 最终外层跨度 − Σ断带跨度）；
+        // 只挂与最终界相交的断带。X 数值/时间轴同式。
+        if (y0.breaks != null && y0.breaks.Count > 0 && !leftFrac) {
+            List<ChartBreak> act = new List<ChartBreak>();
+            for (int bi = 0; bi < y0.breaks.Count; bi = bi + 1) {
+                ChartBreak b = y0.breaks[bi];
+                if (Chart.BrkActive(b, (double)leftLo, (double)leftHi)) { act.Add(b); }
+            }
+            if (act.Count > 0) {
+                f.brkL = act;
+                f.brkIvL = brkIvL;
+                f.brkGapL = Chart.BrkGapReals(act, (double)leftLo, (double)leftHi);
+                f.resolvedBrkL = new List<ChartBreakResolved>();
+                for (int bi = 0; bi < act.Count; bi = bi + 1) {
+                    f.resolvedBrkL.Add(new ChartBreakResolved(act[bi], f.brkGapL[bi]));
+                }
+                double sp = (double)(leftHi - leftLo);
+                double bsp = 0.0;
+                for (int bi = 0; bi < act.Count; bi = bi + 1) {
+                    bsp = bsp + (act[bi].endD - act[bi].startD);
+                }
+                double gs = 0.0;
+                for (int bi = 0; bi < f.brkGapL.Count; bi = bi + 1) { gs = gs + f.brkGapL[bi]; }
+                f.brkSpanL = sp - bsp + gs;
+                if (f.brkSpanL < 1.0) { f.brkSpanL = 1.0; }
+            }
+        }
+        if (hasRight && y1.breaks != null && y1.breaks.Count > 0 && !rightFrac) {
+            List<ChartBreak> act2 = new List<ChartBreak>();
+            for (int bi = 0; bi < y1.breaks.Count; bi = bi + 1) {
+                ChartBreak b2 = y1.breaks[bi];
+                if (Chart.BrkActive(b2, (double)rightLo, (double)rightHi)) { act2.Add(b2); }
+            }
+            if (act2.Count > 0) {
+                f.brkR = act2;
+                f.brkIvR = brkIvR;
+                f.brkGapR = Chart.BrkGapReals(act2, (double)rightLo, (double)rightHi);
+                f.resolvedBrkR = new List<ChartBreakResolved>();
+                for (int bi = 0; bi < act2.Count; bi = bi + 1) {
+                    f.resolvedBrkR.Add(new ChartBreakResolved(act2[bi], f.brkGapR[bi]));
+                }
+                double sp2 = (double)(rightHi - rightLo);
+                double bsp2 = 0.0;
+                for (int bi = 0; bi < act2.Count; bi = bi + 1) {
+                    bsp2 = bsp2 + (act2[bi].endD - act2[bi].startD);
+                }
+                double gs2 = 0.0;
+                for (int bi = 0; bi < f.brkGapR.Count; bi = bi + 1) { gs2 = gs2 + f.brkGapR[bi]; }
+                f.brkSpanR = sp2 - bsp2 + gs2;
+                if (f.brkSpanR < 1.0) { f.brkSpanR = 1.0; }
+            }
+        }
+        if (!isTime && x0.breaks != null && x0.breaks.Count > 0 && !catY) {
+            List<ChartBreak> act3 = new List<ChartBreak>();
+            for (int bi = 0; bi < x0.breaks.Count; bi = bi + 1) {
+                ChartBreak b3 = x0.breaks[bi];
+                if (Chart.BrkActive(b3, (double)xLo, (double)xHi)) { act3.Add(b3); }
+            }
+            if (act3.Count > 0) {
+                f.brkX = act3;
+                f.brkGapX = Chart.BrkGapReals(act3, (double)xLo, (double)xHi);
+                f.resolvedBrkX = new List<ChartBreakResolved>();
+                for (int bi = 0; bi < act3.Count; bi = bi + 1) {
+                    f.resolvedBrkX.Add(new ChartBreakResolved(act3[bi], f.brkGapX[bi]));
+                }
+                double sp3 = (double)(xHi - xLo);
+                double bsp3 = 0.0;
+                for (int bi = 0; bi < act3.Count; bi = bi + 1) {
+                    bsp3 = bsp3 + (act3[bi].endD - act3[bi].startD);
+                }
+                double gs3 = 0.0;
+                for (int bi = 0; bi < f.brkGapX.Count; bi = bi + 1) { gs3 = gs3 + f.brkGapX[bi]; }
+                f.brkSpanX = sp3 - bsp3 + gs3;
+                if (f.brkSpanX < 1.0) { f.brkSpanX = 1.0; }
+            }
+        } else if (isTime && x0.breaks != null && x0.breaks.Count > 0) {
+            // 时间轴断带：breaks.startD/endD（epoch 毫秒）与帧的
+            // timeMin/timeMax 同空间直接比较。
+            List<ChartBreak> act4 = new List<ChartBreak>();
+            double tLo = (double)tMin;
+            double tHi = (double)tMax;
+            for (int bi = 0; bi < x0.breaks.Count; bi = bi + 1) {
+                ChartBreak b4 = x0.breaks[bi];
+                if (Chart.BrkActive(b4, tLo, tHi)) { act4.Add(b4); }
+            }
+            if (act4.Count > 0) {
+                f.brkX = act4;
+                f.brkGapX = Chart.BrkGapReals(act4, tLo, tHi);
+                f.resolvedBrkX = new List<ChartBreakResolved>();
+                for (int bi = 0; bi < act4.Count; bi = bi + 1) {
+                    f.resolvedBrkX.Add(new ChartBreakResolved(act4[bi], f.brkGapX[bi]));
+                }
+                double sp4 = tHi - tLo;
+                double bsp4 = 0.0;
+                for (int bi = 0; bi < act4.Count; bi = bi + 1) {
+                    bsp4 = bsp4 + (act4[bi].endD - act4[bi].startD);
+                }
+                double gs4 = 0.0;
+                for (int bi = 0; bi < f.brkGapX.Count; bi = bi + 1) { gs4 = gs4 + f.brkGapX[bi]; }
+                f.brkSpanX = sp4 - bsp4 + gs4;
+                if (f.brkSpanX < 1.0) { f.brkSpanX = 1.0; }
+            }
+        }
+    }
+}

@@ -15,7 +15,7 @@ toolchain-relative `packages/` store).
 
 Both components are opt-in: a program that never references them pulls
 nothing from this package. `App` registers the `<a href>` link navigator at
-run time via `WebViewBootstrap.Install()`, so the stdlib Gui core has no
+run time via `WebViewRuntime.EnableLinks()`, so the stdlib Gui core has no
 build-time dependency on this package.
 
 Build the CEF driver with `cmake --build build --target zan_cef`

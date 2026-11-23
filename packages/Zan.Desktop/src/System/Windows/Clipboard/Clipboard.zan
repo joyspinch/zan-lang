@@ -8,16 +8,8 @@ using System.Json;
 
 namespace System.Windows.Clipboard;
 
-// 剪贴板访问：Unicode 文本、文件列表（CF_HDROP / text/uri-list）、
-// 格式探测与枚举。
-// Windows 走 user32 剪贴板 API。Linux 上 X11 的剪贴板是“谁拥有
-// 选区谁就要活着响应请求”的协议，进程退出内容就没了，因此
-// 这里委托给平台自己的剪贴板工具（Wayland 用 wl-copy/wl-paste，
-// X11 用 xclip 或 xsel）；工具会自己 fork 持有进程。macOS 文本用
-// pbcopy/pbpaste，文件列表由系统 JXA 桥接 AppKit NSURL 对象。
-// 内容走临时文件，脚本与数据分离，因此任意文本（包括
-// 引号、换行、shell 元字符）都不会被解释。文本工具不存在时抛出
-// PlatformNotSupportedException，而不是假装成功。
+// 跨平台剪贴板：Unicode 文本、文件列表（CF_HDROP / text/uri-list）与格式枚举。
+// Windows 走 user32（含竞争退避重试）；Linux 委托 wl-copy/wl-paste 或 xclip/xsel；macOS 文本走 pbcopy/pbpaste、文件走 JXA。
 public class Clipboard {
     #if WINDOWS
     [DllImport("user32", EntryPoint = "OpenClipboard")]
@@ -67,32 +59,11 @@ public class Clipboard {
 
     [DllImport("shell32", EntryPoint = "DragFinish")]
     private static extern void WinDragFinish(nint hdrop);
-    #endif
 
-    // ---- 争用重试（Windows 剪贴板是全局独占资源）--------------------
-    //
-    // OpenClipboard 在剪贴板被别人占着时**直接失败**，而争用是**瞬时**
-    // 的：别的应用复制/粘贴、剪贴板管理器轮询、输入法取词，都可能正好
-    // 占着。Windows 官方的用法就是重试若干次再放弃。
-    //
-    // 独占是**按窗口句柄**判的（实测）：持有者挂真实窗口（资源管理器/
-    // IDE/输入法都是这样）时，别人的 OpenClipboard(NULL) 会被拒；两边都
-    // 传 NULL 则互不排斥。所以"造争用"来验证重试时，持有方必须挂真实
-    // 窗口句柄——两边都传 NULL 是撞不上的。
-    //
-    // 不重试的代价是实打实的：一次"写-读"往返要开关剪贴板十几次，
-    // 撞上一次就整条失败——用户看到的是"复制偶尔没反应"，测试看到的
-    // 是"用例偶发红"（本仓库的 conformance_clipboard_roundtrip 就这样
-    // 在别的进程复制东西时红过）。
-    //
-    // 退避：10ms 一拍、最多 30 拍（合计 ~300ms）。超过这个窗口还拿不到，
-    // 就认为剪贴板真的不可用（无交互窗口站点的会话、剪贴板服务被关），
-    // 按老路返回失败/空串。
+    // Windows 全局独占争用重试（约 300ms 退避窗口）。
     private static int openAttempts = 30;
     private static int openRetryMs = 10;
 
-    // 打开剪贴板；被别的进程占着就退避重试。成功返回 1（调用方负责
-    // CloseClipboard），彻底拿不到返回 0。
     private static int WinOpenClipboardRetry() {
         for (int i = 0; i < Clipboard.openAttempts; i = i + 1) {
             if (Clipboard.WinOpenClipboard(0) != 0) { return 1; }
@@ -101,12 +72,23 @@ public class Clipboard {
         return 0;
     }
 
-    // 当前会话是否有可用的剪贴板（能打开就说明有）。
-    //
-    // 无交互窗口站点的会话（服务/CI/部分 agent 环境）没有剪贴板：那里
-    // 的读写只会拿到空串，调用方分不清"内容为空"和"根本没有剪贴板"。
-    // 这个探针把两者分开——"真去读剪贴板"的操作可以据此跳过，而不是
-    // 把环境缺失误报成功能坏了。
+    private static bool WinCommitClipboardMem(int format, nint mem) {
+        if (Clipboard.WinOpenClipboardRetry() == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        Clipboard.WinEmptyClipboard();
+        nint ok = Clipboard.WinSetClipboardData(format, mem);
+        Clipboard.WinCloseClipboard();
+        if (ok == 0) {
+            Clipboard.WinGlobalFree(mem);
+            return false;
+        }
+        return true;
+    }
+    #endif
+
+    // 当前会话是否有可用剪贴板（区分“内容为空”与“无窗口站/工具缺失”）。
     public static bool IsAvailable() {
         #if WINDOWS
         if (Clipboard.WinOpenClipboardRetry() == 0) { return false; }
@@ -397,18 +379,7 @@ public class Clipboard {
         } finally {
             Wide.Free(wide);
         }
-        if (Clipboard.WinOpenClipboardRetry() == 0) {
-            Clipboard.WinGlobalFree(mem);
-            return false;
-        }
-        Clipboard.WinEmptyClipboard();
-        nint ok = Clipboard.WinSetClipboardData(13, mem);   // CF_UNICODETEXT
-        Clipboard.WinCloseClipboard();
-        if (ok == 0) {
-            Clipboard.WinGlobalFree(mem);
-            return false;
-        }
-        return true;
+        return Clipboard.WinCommitClipboardMem(13, mem);
         #else
         return Clipboard.PosixWrite(Clipboard.PosixTool(),
                                     Clipboard.MimeText(), text);
@@ -429,7 +400,7 @@ public class Clipboard {
             args.Add("--clear");
             Process.RunSafe("wl-copy", args);
         } else if (tool == Clipboard.ToolXsel()) {
-            // X11 没有“清空”这个操作：放弃选区所有权就是清空，xsel -c 即如此
+            // X11 放弃选区所有权即清空。
             List<string> args = new List<string>();
             args.Add("-bc");
             Process.RunSafe("xsel", args);
@@ -439,12 +410,10 @@ public class Clipboard {
         #endif
     }
 
-    // 将文件列表（CF_HDROP）放入剪贴板。成功
-    // 返回 true。
+    // 将文件列表（CF_HDROP）放入剪贴板。成功返回 true。
     public static bool SetFiles(List<string> paths) {
         #if WINDOWS
-        // DROPFILES：pFiles(4) pt(8) fNC(4) fWide(4) 共 20 字节，其后是
-        // UTF-16 文件列表，每项以 NUL 结尾，末尾双 NUL 结束。
+        // DROPFILES 头 20 字节 + UTF-16 NUL 分隔路径列表 + 结尾双 NUL。
         int total = 20;
         int i = 0;
         for (; i < paths.Count; i = i + 1) {
@@ -452,7 +421,7 @@ public class Clipboard {
             total = total + (Wide.Length(w) + 1) * 2;
             Wide.Free(w);
         }
-        total = total + 2;   // 末尾的双 NUL
+        total = total + 2;
         nint mem = Clipboard.WinGlobalAlloc(2, total);
         if (mem == 0) { return false; }
         nint dst = Clipboard.WinGlobalLock(mem);
@@ -460,8 +429,8 @@ public class Clipboard {
             Clipboard.WinGlobalFree(mem);
             return false;
         }
-        new Span<int>(dst, 1)[0] = 20;        // DROPFILES.pFiles
-        new Span<int>(dst + 16, 1)[0] = 1;    // DROPFILES.fWide = TRUE
+        new Span<int>(dst, 1)[0] = 20;
+        new Span<int>(dst + 16, 1)[0] = 1;
         int offset = 20;
         i = 0;
         while (i < paths.Count) {
@@ -472,20 +441,9 @@ public class Clipboard {
             offset = offset + (units + 1) * 2;
             i = i + 1;
         }
-        new Span<ushort>(dst + offset, 1)[0] = 0;   // 末尾的双 NUL
+        new Span<ushort>(dst + offset, 1)[0] = 0;
         Clipboard.WinGlobalUnlock(mem);
-        if (Clipboard.WinOpenClipboardRetry() == 0) {
-            Clipboard.WinGlobalFree(mem);
-            return false;
-        }
-        Clipboard.WinEmptyClipboard();
-        nint ok = Clipboard.WinSetClipboardData(15, mem);   // CF_HDROP
-        Clipboard.WinCloseClipboard();
-        if (ok == 0) {
-            Clipboard.WinGlobalFree(mem);
-            return false;
-        }
-        return true;
+        return Clipboard.WinCommitClipboardMem(15, mem);
         #elif MACOS
         return Clipboard.MacSetFiles(paths);
         #else
