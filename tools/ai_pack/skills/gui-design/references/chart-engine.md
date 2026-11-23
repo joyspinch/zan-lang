@@ -204,7 +204,7 @@
   `void Render(App,int,int,int)`，转发共享 RenderAt，不负责安装输入所有权。
   编辑槽高须受行内可用高度约束，不能让默认自然高度撑破紧凑行或覆盖下一行。
 - **长属性检查器的分组折叠走 retained children 与 routed Click**：
-  `PropSpec.Section`（`kind == 5`）对应真实分组 Button，经标准 Click 调用
+  `PropSpec.Section`（`PropKind.Section`）对应真实分组 Button，经标准 Click 调用
   `ToggleSection`；折叠状态同时更新可见行、`ContentHeight` 与滚动量程。
   移出可见集合的编辑器经树操作退休输入；需要拦截冒泡时在路由处理器调用
   `e.Handle()`，不用 `Ui.ClickedIn` 几何轮询，图标继续使用标准 IconView。

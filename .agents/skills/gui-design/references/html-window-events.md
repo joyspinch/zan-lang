@@ -21,6 +21,12 @@
      `[Event] public UiEvent RowClick { get { return this.st.RowClick; } }`；state 持有 `weak Control host`，
      触发处写 `st.RowClick.Raise(st.host)`，sender 处理器才拿到正确控件。
    - `TriggerEvent` 仅在需要附带交互语义（禁用门控、切换状态、焦点副作用）时覆写。
+   - **属性声明（DefineProps）**：`Field("Name")` 不带值类型参数，值类型由字段/属性的声明类型
+     （string/int/bool 或对应 `Binding<T>`）反射推断；键与标签可由字段名派生时用
+     `PropSpec.TextField/IntField/BoolField/ColorField("CheckedText")`（键 `checkedText`、标签
+     `Checked text`），否则 `PropSpec.Text("key", "Label").Field("Name")`；一条属性一个链式表达式
+     `ps.Add(…)`，不再声明临时变量。编辑器种类与值类型用 `PropKind` / `PropValueKind` 枚举比较，
+     禁止 `kind == 3` 之类魔法数。
 3. **表格等大型组件的多维丰富事件（Row / Cell / Column / Grid）**：
    - 行级：`RowClick`、`RowDoubleClick`、`RowRightClick`（别名 `RowContext`）、`RowInserted`、`RowDeleted`。
    - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
@@ -144,7 +150,7 @@
        4. `BEHAVIOR`（行为与状态）：`required`（必填校验）、`wrap`（自动折行）、`orient`（Tab方向）及 `defOn`（默认开启）。
      - 分类过滤（`inspCategory`）只在选择“全部 (All)”时渲染 Section 分组栏；在单项分类下隐去分组头直接展示过滤后的紧凑属性。
    - **PropertyGrid Section Bar 视觉质感**：
-     - `PropertyGrid` 渲染 `PropSpec.kind == 5`（Section 头）时，必须画出专属条带（`t.bgSecondary` 背景、左侧垂直强调色条 `t.primary`、高亮分类文字），与普通属性行形成鲜明视觉阶梯。
+     - `PropertyGrid` 渲染 `PropSpec.kind == PropKind.Section`（分组头）时，必须画出专属条带（`t.bgSecondary` 背景、左侧垂直强调色条 `t.primary`、高亮分类文字），与普通属性行形成鲜明视觉阶梯。
    - **快捷工具栏卡片行高计算与垂直呼吸律（Anti-Card-Overflow）**：
      - 快捷按钮（`SmallBtn`）的高度约为 24px。卡片内部放 N 行按钮时，行间步进距必须保持至少 28px~30px（例如 `row1: 8px`、`row2: 36px`、`row3: 66px`），卡片总高度必须为 `app.Scale(96~130)` 并留足底边距，严禁卡片高度不足 78px 强塞 3 行导致按钮垂直重叠、文字压盖与溢出边界。
      - 快捷卡片与卡片之间统一保持 10px 间距；快捷操作区与下方的 `PropertyGrid` 之间必须保持 12px 留白；多选批量卡片（3行按钮+双行文字）必须保留 126px 充足纵深。
