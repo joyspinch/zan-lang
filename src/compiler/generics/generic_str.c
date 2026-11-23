@@ -269,11 +269,15 @@ LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v) {
 }
 LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_size) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    LLVMValueRef thirty_one = LLVMConstInt(i64, 31, 0);
-    LLVMValueRef padded = zan_add(g->builder, payload_size, thirty_one, "str.pad");
+    /* 负载按 16 取整、下限 16：头 16 + 负载恰是 malloc 的 16 字节档，不留
+     * 尾巴。原先按 32 取整且下限 32——"k1" 这样的短串也占 48 字节，
+     * 40 字节的请求被抬到 64。没有任何路径依赖这段富余（无原地增长、无
+     * 按块越读），写入一律以请求尺寸为界。 */
+    LLVMValueRef fifteen = LLVMConstInt(i64, 15, 0);
+    LLVMValueRef padded = zan_add(g->builder, payload_size, fifteen, "str.pad");
     LLVMValueRef aligned = zan_and(g->builder, padded,
-        LLVMConstInt(i64, ~UINT64_C(31), 0), "str.align");
-    LLVMValueRef min_payload = LLVMConstInt(i64, 32, 0);
+        LLVMConstInt(i64, ~UINT64_C(15), 0), "str.align");
+    LLVMValueRef min_payload = LLVMConstInt(i64, 16, 0);
     LLVMValueRef payload = LLVMBuildSelect(g->builder,
         zan_icmp(g->builder, LLVMIntULT, aligned, min_payload, "str.small"),
         min_payload, aligned, "str.payload");
@@ -660,14 +664,10 @@ LLVMValueRef emit_to_cstr_u(zan_irgen_t *g, LLVMValueRef val,
         return buf;
     }
     if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
-        LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 40, 0));
-        emit_dbl_str(g, buf, LLVMConstInt(i64, 40, 0), val);
-        return buf;
+        return emit_dbl_string(g, val);
     }
-    LLVMValueRef ibuf = emit_string_alloc_rc(g, LLVMConstInt(i64, 24, 0));
-    emit_itoa_into(g, ibuf, emit_widen_i64_for_print(g, val),
-                   is_unsigned ? 1 : 0);
-    return ibuf;
+    return emit_itoa_string(g, emit_widen_i64_for_print(g, val),
+                            is_unsigned ? 1 : 0);
 }
 LLVMValueRef emit_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
     return emit_to_cstr_u(g, val, false);

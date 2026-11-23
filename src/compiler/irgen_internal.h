@@ -282,6 +282,8 @@ LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name)
 LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym, LLVMTypeRef st, LLVMValueRef base, int fi, const char *name);
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb);
 LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v, int is_unsigned);
+LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned);
+LLVMValueRef emit_dbl_string(zan_irgen_t *g, LLVMValueRef v);
 void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta);
 void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes);
 LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v, zan_type_t *elem_type, LLVMTypeRef slot_ty);

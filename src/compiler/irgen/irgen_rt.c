@@ -791,7 +791,10 @@ void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), rc_iptr);
-    LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
+    /* 不再往 obj[0] 写 0xDD 毒字节：零负载对象（无字段实例、头即全部的块）
+     * 的 obj[0] 已在分配之外，正好是相邻块的 RC 低字节——邻居 RC 被改成
+     * 0xDD-1=220 永不归零，--arc-guard 下凭空"泄漏"。没有任何代码读这个
+     * 毒字节；失效检测只靠 FREED_MARK 与下面记录的释放点。 */
     LLVMTypeRef ra_ty = NULL;
     LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
     LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);

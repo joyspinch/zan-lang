@@ -1072,6 +1072,50 @@ LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
     LLVMValueRef args[] = { buf, v, LLVMConstInt(i32, is_unsigned ? 1 : 0, 0) };
     return zan_call2(g->builder, fn_ty, fn, args, 3, "itoa");
 }
+/* 整数 → 托管串，按实际位数精确分配。旧路径先分配固定 24/40 字节缓冲再
+ * itoa 进去，串的整个寿命都背着这块空闲尾巴（1e6 个 int.ToString() 在 Mac
+ * 上 ~86 B/串，精确分配后 ~32 B）。__zan_itoa64 本就先在栈上出数字再拷贝，
+ * 这里把"分配"挪到知道长度之后：栈上出数字 → 分配 len+1 → 拷贝 → 记长度。 */
+LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i32 }, 2, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_itoa_str");
+    if (!fn) {
+        LLVMValueRef itoa = get_itoa64_fn(g);
+        fn = LLVMAddFunction(g->mod, "__zan_itoa_str", fn_ty);
+        LLVMSetLinkage(fn, LLVMInternalLinkage);
+        LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+        LLVMValueRef saved_fn = g->current_fn;
+        g->current_fn = fn;
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+        LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8,
+            LLVMConstInt(i64, 24, 0), "itoa.s.tmp");
+        LLVMTypeRef itoa_ty = LLVMFunctionType(i64,
+            (LLVMTypeRef[]){ i8ptr, i64, i32 }, 3, 0);
+        LLVMValueRef len = zan_call2(g->builder, itoa_ty, itoa,
+            (LLVMValueRef[]){ tmp, LLVMGetParam(fn, 0), LLVMGetParam(fn, 1) },
+            3, "itoa.s.len");
+        LLVMValueRef n1 = LLVMBuildAdd(g->builder, len,
+            LLVMConstInt(i64, 1, 0), "itoa.s.n1");
+        LLVMValueRef str = emit_string_alloc_rc(g, n1);
+        LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+        LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+        if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_ty);
+        zan_call2(g->builder, memcpy_ty, memcpy_fn,
+                  (LLVMValueRef[]){ str, tmp, n1 }, 3, "");
+        emit_string_len_set(g, str, len);
+        LLVMBuildRet(g->builder, str);
+        g->current_fn = saved_fn;
+        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    }
+    LLVMValueRef args[] = { v, LLVMConstInt(i32, is_unsigned ? 1 : 0, 0) };
+    return zan_call2(g->builder, fn_ty, fn, args, 2, "itoa.str");
+}
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
                          LLVMValueRef v) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1090,6 +1134,51 @@ void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
     }
     LLVMValueRef args[] = { buf, cap_val, arg };
     zan_call2(g->builder, fn_ty, fn, args, 3, "");
+}
+/* 浮点 → 托管串，按实际长度精确分配（同 emit_itoa_string）：栈上 40 字节
+ * 出最短往返文本 → strlen → 分配 len+1 → 拷贝 → 记长度。float 沿用
+ * zan_rt_dbl_str 的 cap 高位标记。 */
+LLVMValueRef emit_dbl_string(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+    bool is_flt = LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMFloatTypeKind;
+    const char *name = is_flt ? "__zan_ftoa_str" : "__zan_dtoa_str";
+    LLVMTypeRef vt = is_flt ? LLVMFloatTypeInContext(g->ctx) : dbl;
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8ptr, &vt, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+    if (!fn) {
+        fn = LLVMAddFunction(g->mod, name, fn_ty);
+        LLVMSetLinkage(fn, LLVMInternalLinkage);
+        LLVMBasicBlockRef save = LLVMGetInsertBlock(g->builder);
+        LLVMValueRef saved_fn = g->current_fn;
+        g->current_fn = fn;
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+        LLVMValueRef tmp = LLVMBuildArrayAlloca(g->builder, i8,
+            LLVMConstInt(i64, 40, 0), "dtoa.s.tmp");
+        emit_dbl_str(g, tmp, LLVMConstInt(i64, 40, 0), LLVMGetParam(fn, 0));
+        LLVMTypeRef strlen_ty = LLVMFunctionType(i64, &i8ptr, 1, 0);
+        LLVMValueRef strlen_fn = LLVMGetNamedFunction(g->mod, "strlen");
+        if (!strlen_fn) strlen_fn = LLVMAddFunction(g->mod, "strlen", strlen_ty);
+        LLVMValueRef len = zan_call2(g->builder, strlen_ty, strlen_fn, &tmp, 1,
+                                     "dtoa.s.len");
+        LLVMValueRef n1 = LLVMBuildAdd(g->builder, len,
+            LLVMConstInt(i64, 1, 0), "dtoa.s.n1");
+        LLVMValueRef str = emit_string_alloc_rc(g, n1);
+        LLVMTypeRef memcpy_ty = LLVMFunctionType(i8ptr,
+            (LLVMTypeRef[]){ i8ptr, i8ptr, i64 }, 3, 0);
+        LLVMValueRef memcpy_fn = LLVMGetNamedFunction(g->mod, "memcpy");
+        if (!memcpy_fn) memcpy_fn = LLVMAddFunction(g->mod, "memcpy", memcpy_ty);
+        zan_call2(g->builder, memcpy_ty, memcpy_fn,
+                  (LLVMValueRef[]){ str, tmp, n1 }, 3, "");
+        emit_string_len_set(g, str, len);
+        LLVMBuildRet(g->builder, str);
+        g->current_fn = saved_fn;
+        if (save) LLVMPositionBuilderAtEnd(g->builder, save);
+    }
+    return zan_call2(g->builder, fn_ty, fn, &v, 1, "dtoa.str");
 }
 void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     if (!g->function_compactor || zan_diag_has_errors(g->diag)) return;
