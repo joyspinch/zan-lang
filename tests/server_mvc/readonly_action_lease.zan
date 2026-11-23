@@ -36,6 +36,44 @@ class LeaseActionController : AppController {
         LeaseActionController.observed = "plain";
     }
 
+    /* 渲染前提前归还（OnRender）：查完库再渲染，渲染期间连接已回池；
+       渲染后的语句重新惰性借出。 */
+    static DbPool probe;
+
+    static string Idle() {
+        return Convert.ToString(LeaseActionController.probe.IdleCount());
+    }
+
+    [HttpGet]
+    async void Render() {
+        DbResult before = await this.Held().QueryAsync("SELECT name FROM marker");
+        string held = LeaseActionController.Idle();
+        this.ViewOf("lease.page", new ViewData());
+        string rendered = LeaseActionController.Idle();
+        DbResult after = await this.Held().QueryAsync("SELECT name FROM marker");
+        LeaseActionController.observed = held + "/" + rendered + "/"
+            + LeaseActionController.Idle() + " " + after.GetByName(0, "name");
+    }
+
+    /* 事务中渲染：连接必须留在请求上，提交仍在同一连接。 */
+    [HttpGet]
+    async void RenderTx() {
+        bool begun = await this.TxBegin();
+        int n = await this.Held().ExecuteAsync("UPDATE marker SET name='tx-render'");
+        this.ViewOf("lease.page", new ViewData());
+        string rendered = LeaseActionController.Idle();
+        await this.TxCommit();
+        LeaseActionController.observed = Convert.ToString(begun) + " " + rendered;
+    }
+
+    /* 带会话状态的语句（PRAGMA/SET/BEGIN…）钉住连接，渲染时不归还。 */
+    [HttpGet]
+    async void RenderPinned() {
+        int n = await this.Held().ExecuteAsync("  pragma cache_size = 200");
+        this.ViewOf("lease.page", new ViewData());
+        LeaseActionController.observed = LeaseActionController.Idle();
+    }
+
     [HttpPost]
     [Tx]
     async void Save() {
@@ -266,6 +304,27 @@ class Program {
         Console.WriteLine("transaction failure cases=8");
     }
 
+    /* 会话语句判定（钉住连接、渲染时不提前归还）：整词、忽略大小写与前导空白。 */
+    static void SessionStatements() {
+        string[] pin = new string[] { "BEGIN", "  begin transaction", "\nSET NAMES utf8",
+            "start transaction", "SAVEPOINT a", "lock tables t", "DECLARE x",
+            "pragma cache_size=1", "PREPARE s FROM 'x'", "use db", "CREATE TEMPORARY TABLE t",
+            "attach 'x' as y", "create temp table t(a)", "CREATE LOCAL TEMP TABLE t",
+            "Create Global Temp table t" };
+        string[] free = new string[] { "SELECT 1", "select * from setting",
+            "INSERT INTO t VALUES (1)", "UPDATE t SET a=1", "DELETE FROM t",
+            "CREATE TABLE t(a)", "", "   ", "SE", "S", "with x as (select 1) select * from x",
+            "useful", "settings", "BEGINNING" };
+        bool ok = true;
+        for (int i = 0; i < pin.Length; i = i + 1) {
+            if (!RequestDbConnection.SessionBound(pin[i])) { ok = false; }
+        }
+        for (int i = 0; i < free.Length; i = i + 1) {
+            if (RequestDbConnection.SessionBound(free[i])) { ok = false; }
+        }
+        Program.Check(ok, "session-bound statements are recognised by whole keyword");
+    }
+
     static async void Dispatch(HttpContext ctx, int which) {
         LeaseActionController c = new LeaseActionController();
         c.Bind(ctx);
@@ -275,6 +334,9 @@ class Program {
             else if (which == 1) { await c.MutatingGet(); }
             else if (which == 2) { await c.Save(); }
             else if (which == 3) { await c.Plain(); }
+            else if (which == 4) { await c.Render(); }
+            else if (which == 5) { await c.RenderTx(); }
+            else if (which == 6) { await c.RenderPinned(); }
         }
         await c.AfterAsync();
     }
@@ -305,6 +367,22 @@ class Program {
         Program.Check(LeaseActionController.observed == "1", "transaction wrote primary");
         Program.Check(write.IdleCount() == 1 && read.IdleCount() == 1,
             "transaction primary returned");
+        LeaseActionController.probe = write;
+        await Program.Dispatch(Program.Ctx("GET", "/lease/render"), 4);
+        Program.Check(LeaseActionController.observed == "0/1/0 updated"
+            && write.LiveCount() == 1 && write.IdleCount() == 1,
+            "render returns the lease early and later SQL re-borrows");
+        await Program.Dispatch(Program.Ctx("GET", "/lease/rendertx"), 5);
+        Program.Check(LeaseActionController.observed == "true 0"
+            && write.IdleCount() == 1, "render inside a transaction keeps the lease");
+        await Program.Dispatch(Program.Ctx("GET", "/lease/renderpinned"), 6);
+        Program.Check(LeaseActionController.observed == "0"
+            && write.IdleCount() == 1, "session-bound statement pins the lease through render");
+        SqliteConnection check = SqliteConnection.Open(writePath);
+        Program.Check(check.ExecuteScalar("SELECT name FROM marker") == "tx-render",
+            "transaction around render committed");
+        check.Execute("UPDATE marker SET name='updated'");
+        check.Close();
         AppServices.Use(new AppServices(DbContext.Of(write, null), null));
         await Program.Dispatch(Program.Ctx("GET", "/lease/list"), 0);
         Program.Check(LeaseActionController.observed == "updated", "no-replica fallback to primary");
@@ -321,6 +399,7 @@ class Program {
         AppServices.Use(null);
         File.Delete(writePath); File.Delete(readPath);
         await Program.TransactionFailures();
+        Program.SessionStatements();
         Console.WriteLine("failures=" + Convert.ToString(Program.failures));
     }
 }

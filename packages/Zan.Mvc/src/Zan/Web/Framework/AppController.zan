@@ -248,6 +248,29 @@ public abstract class AppController : Controller {
         if (failure != null && !this.commitFailed) { throw failure; }
     }
 
+    /* 渲染前提前归还请求连接：动作一般在查完库后才渲染，而渲染只读 ViewData。
+       原先连接一直持到 OnAfterAsync——渲染、拼行、排队等 CPU 都算在池位上，
+       并发超过池大小时持有时长随排队拉长（list 压测 32 连接吞吐反低于 8 连接）。
+       事务中或连接带会话状态（RequestDbConnection 钉住）时不还；代理保留，
+       渲染后若还有语句会重新惰性借出。 */
+    override public void OnRender() {
+        if (this.inTx || this.lease == null) { return; }
+        IDbConnection db = this.lease.DetachIfIdle();
+        if (db == null) { return; }
+        DbContext ctx = this.Db();
+        try {
+            if (ctx == null) { db.Close(); }
+            else if (this.lease.IsRead()) { ctx.ReleaseRead(db); }
+            else { ctx.Release(db); }
+        } catch (Exception releaseError) {
+            // 归还失败的连接状态不明：弃用它，渲染照常进行
+            try {
+                if (ctx != null) { ctx.Discard(db); }
+            } catch (Exception _discardError) {
+            }
+        }
+    }
+
     /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */
     virtual void OnDone() { }
 

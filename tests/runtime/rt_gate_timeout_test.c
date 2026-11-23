@@ -11,8 +11,20 @@ static void zan_co_ready(void *frame, zan_co_step_t step) {
     (void)step;
     (*(int *)frame)++;
 }
+/* zan_gate_arm_ms registers its timeout here; tests fire it by hand. */
+static void (*pending_cb)(void *);
+static void *pending_ctx;
+static int timer_fail;
 static long long zan_timer_after_ctx(long long ms, void (*cb)(void *), void *ctx) {
-    (void)ms; (void)cb; (void)ctx; return 1;
+    (void)ms;
+    if (timer_fail) return 0;
+    pending_cb = cb; pending_ctx = ctx; return 1;
+}
+static void fire_pending(void) {
+    void (*cb)(void *) = pending_cb;
+    void *ctx = pending_ctx;
+    pending_cb = NULL; pending_ctx = NULL;
+    if (cb) cb(ctx);
 }
 static int zan_timer_clear(long long id) { (void)id; return 1; }
 static int live_allocations;
@@ -127,6 +139,46 @@ static void signal_all_pending(void) {
     check(a == 1 && b == 1 && c == 0, "SignalAll includes pending waits without extra surplus");
     zan_gate_free(h);
 }
+/* Runtime-timer watchdog (zan_gate_arm_ms): no coroutine, the timer callback
+ * releases the registration. */
+static void armed_timer_paths(void) {
+    int a = 0, b = 0, c = 0;
+    long long h = zan_gate_new();
+    long long ta = zan_gate_arm_ms(h, 250);
+    park_timed(h, ta, &a);
+    zan_gate_signal(h);
+    check(a == 1, "arm_ms waiter woken by signal");
+    fire_pending();
+    check(a == 1, "late arm_ms timer does not wake twice");
+    long long tb = zan_gate_arm_ms(h, 250);
+    park_timed(h, tb, &b);
+    fire_pending();
+    check(b == 1, "arm_ms timer wakes an unsignalled waiter");
+    zan_gate_park(h, &c, step);
+    check(c == 0, "arm_ms timeout leaves no surplus");
+    zan_gate_signal(h);
+    check(c == 1, "plain park still signalled");
+    long long tc = zan_gate_arm_ms(h, 250);
+    fire_pending();
+    int d = 0;
+    park_timed(h, tc, &d);
+    check(d == 1, "arm_ms timeout before park resumes on park");
+    timer_fail = 1;
+    int e = 0;
+    long long td = zan_gate_arm_ms(h, 250);
+    park_timed(h, td, &e);
+    zan_gate_signal(h);
+    timer_fail = 0;
+    check(e == 1, "arm_ms without a timer degrades to an untimed wait");
+    long long te = zan_gate_arm_ms(h, 250);
+    int f = 0;
+    park_timed(h, te, &f);
+    zan_gate_free(h);
+    check(f == 1, "close wakes an arm_ms waiter");
+    fire_pending();
+    check(f == 1, "timer after close is harmless");
+}
+
 int main(void) {
     interleaved_tickets();
     timeout_before_park();
@@ -135,6 +187,7 @@ int main(void) {
     close_pending();
     untimed_and_counting();
     signal_all_pending();
+    armed_timer_paths();
     check(live_allocations == 0, "all native gate allocations released");
     printf("failures: %d\n", failures);
     return failures ? 1 : 0;

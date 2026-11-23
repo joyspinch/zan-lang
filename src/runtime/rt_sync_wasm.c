@@ -369,6 +369,12 @@ long zan_gate_prepare(long h) {
     return 0;
 }
 
+long long zan_gate_arm_ms(long long h, long long ms) {
+    (void)h;
+    (void)ms;
+    return 0;
+}
+
 void zan_gate_signal(long h) {
     (void)h;
 }

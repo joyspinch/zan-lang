@@ -40,8 +40,8 @@ public class Gate : IDisposable {
     }
 
     // 带超时的等待：至多 <paramref name="timeoutMs"/> 毫秒后必然恢复。
-    // 超时看门狗仅捕获标量票据与句柄（零托管对象捕获、零 ARC 泄露）；
-    // 到期后运行时核对等待队列票据精准唤醒，绝不向 surplus 写入幽灵盈余信号。
+    // 超时由运行时定时器回调完成（zan_gate_arm_ms）：不再每次等待派生一个
+    // 看门狗协程；到期后按票据精准唤醒，绝不向 surplus 写入幽灵盈余信号。
     // timeoutMs <= 0 时退化为无超时等待。
     public async bool Wait(int timeoutMs) {
         long h = 0;
@@ -50,24 +50,14 @@ public class Gate : IDisposable {
             h = this.handle;
             if (h == 0) { return false; }
             if (timeoutMs > 0) {
-                ticket = Gate.zan_gate_arm(h);
+                ticket = Gate.zan_gate_arm_ms(h, timeoutMs);
             } else {
                 ticket = Gate.zan_gate_prepare(h);
             }
         }
         if (ticket == 0) { return false; }
-        if (timeoutMs > 0) {
-            Task.Spawn(Gate.Watchdog(h, ticket, timeoutMs));
-        }
         await Gate.Park(h, ticket);
         return true;
-    }
-
-    // 超时看门狗：仅捕获纯标量（句柄、票据、毫秒），不持有任何托管对象引用，
-    // 零 ARC 泄露；到期后由运行时核对票据精准唤醒对应等待者，无等待者时不注入盈余信号。
-    private static async void Watchdog(long handle, long ticket, int timeoutMs) {
-        await Task.Delay(timeoutMs);
-        Gate.zan_gate_ticket_signal_and_release(handle, ticket);
     }
 
     // 唤醒一个等待者；无等待者时暂存一次信号（计数语义）。
@@ -118,6 +108,8 @@ public class Gate : IDisposable {
     public static extern long zan_gate_new();
     [DllImport("crt", EntryPoint = "zan_gate_arm")]
     public static extern long zan_gate_arm(long h);
+    [DllImport("crt", EntryPoint = "zan_gate_arm_ms")]
+    internal static extern long zan_gate_arm_ms(long h, long ms);
     [DllImport("crt", EntryPoint = "zan_gate_prepare")]
     internal static extern long zan_gate_prepare(long h);
     [DllImport("crt", EntryPoint = "zan_gate_signal")]

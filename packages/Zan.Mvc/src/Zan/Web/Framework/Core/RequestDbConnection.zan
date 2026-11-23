@@ -22,12 +22,16 @@ public class RequestDbConnection : IDbConnection {
     bool read;
     IDbConnection inner;
     bool failed;
+    /* 连接带上了会话状态（事务、SET、临时表、锁……）：本请求内不得提前归还，
+       见 DetachIfIdle。只升不降，保守。 */
+    bool pinned;
 
     public RequestDbConnection(DbContext db, bool read) {
         this.db = db;
         this.read = read;
         this.inner = null;
         this.failed = false;
+        this.pinned = false;
     }
 
     /* 已借出的真实连接（未借出时为 null）。 */
@@ -41,6 +45,69 @@ public class RequestDbConnection : IDbConnection {
 
     /* 是否借用失败过（数据库不可达）；失败后不再重试，同一请求内快速 503。 */
     public bool Failed() { return this.failed; }
+
+    /* 渲染前提前归还用：未钉住时取走内层连接（同 Detach），代理仍可用——
+       之后再有语句会重新惰性借出。钉住或未借出时答 null。 */
+    public IDbConnection DetachIfIdle() {
+        if (this.pinned || this.inner == null) { return null; }
+        return this.Detach();
+    }
+
+    /* 语句是否把状态留在连接上（下一条语句必须落在同一连接）：事务控制、
+       会话变量、临时对象、显式锁。按首个关键字判定，宁可多钉。每条语句都会
+       走这里，所以原地比字节、不分配：SELECT/INSERT 等常见语句一两个字节就出结论。 */
+    public static bool SessionBound(string sql) {
+        int n = sql.Length;
+        int i = 0;
+        while (i < n && (sql[i] == 32 || sql[i] == 9 || sql[i] == 10 || sql[i] == 13)) {
+            i = i + 1;
+        }
+        if (i >= n) { return false; }
+        int c = RequestDbConnection.Upper(sql[i]);
+        if (c == 66) { return RequestDbConnection.KeyAt(sql, i, "BEGIN"); }
+        if (c == 83) {
+            return RequestDbConnection.KeyAt(sql, i, "SET")
+                || RequestDbConnection.KeyAt(sql, i, "START")
+                || RequestDbConnection.KeyAt(sql, i, "SAVEPOINT");
+        }
+        if (c == 76) { return RequestDbConnection.KeyAt(sql, i, "LOCK"); }
+        if (c == 68) { return RequestDbConnection.KeyAt(sql, i, "DECLARE"); }
+        if (c == 80) {
+            return RequestDbConnection.KeyAt(sql, i, "PRAGMA")
+                || RequestDbConnection.KeyAt(sql, i, "PREPARE");
+        }
+        if (c == 85) { return RequestDbConnection.KeyAt(sql, i, "USE"); }
+        if (c == 65) { return RequestDbConnection.KeyAt(sql, i, "ATTACH"); }
+        if (c == 67) {
+            return RequestDbConnection.KeyAt(sql, i, "CREATE TEMP")
+                || RequestDbConnection.KeyAt(sql, i, "CREATE TEMPORARY")
+                || RequestDbConnection.KeyAt(sql, i, "CREATE LOCAL TEMP")
+                || RequestDbConnection.KeyAt(sql, i, "CREATE GLOBAL TEMP");
+        }
+        return false;
+    }
+
+    static int Upper(int b) {
+        if (b >= 97 && b <= 122) { return b - 32; }
+        return b;
+    }
+
+    /* sql 从 at 起（忽略大小写）是否是整词大写关键字 kw（后面不接标识符字符，
+       USE 不吃 useful、SET 不吃 settings）。 */
+    static bool KeyAt(string sql, int at, string kw) {
+        int k = kw.Length;
+        if (at + k > sql.Length) { return false; }
+        for (int j = 0; j < k; j = j + 1) {
+            if (RequestDbConnection.Upper(sql[at + j]) != kw[j]) { return false; }
+        }
+        if (at + k == sql.Length) { return true; }
+        int next = RequestDbConnection.Upper(sql[at + k]);
+        return !((next >= 65 && next <= 90) || (next >= 48 && next <= 57) || next == 95);
+    }
+
+    private void Track(string sql) {
+        if (!this.pinned && RequestDbConnection.SessionBound(sql)) { this.pinned = true; }
+    }
 
     /* 取走内层连接并清空代理：调用方负责把它还给池或弃用。 */
     public IDbConnection Detach() {
@@ -105,34 +172,40 @@ public class RequestDbConnection : IDbConnection {
         return c;
     }
 
-    public DbResult Query(string sql) { return this.EnsureNow().Query(sql); }
-    public DbResult Query(string sql, DbParams prms) { return this.EnsureNow().Query(sql, prms); }
-    public int Execute(string sql) { return this.EnsureNow().Execute(sql); }
-    public int Execute(string sql, DbParams prms) { return this.EnsureNow().Execute(sql, prms); }
-    public string ExecuteScalar(string sql) { return this.EnsureNow().ExecuteScalar(sql); }
-    public string ExecuteScalar(string sql, DbParams prms) { return this.EnsureNow().ExecuteScalar(sql, prms); }
+    public DbResult Query(string sql) { this.Track(sql); return this.EnsureNow().Query(sql); }
+    public DbResult Query(string sql, DbParams prms) { this.Track(sql); return this.EnsureNow().Query(sql, prms); }
+    public int Execute(string sql) { this.Track(sql); return this.EnsureNow().Execute(sql); }
+    public int Execute(string sql, DbParams prms) { this.Track(sql); return this.EnsureNow().Execute(sql, prms); }
+    public string ExecuteScalar(string sql) { this.Track(sql); return this.EnsureNow().ExecuteScalar(sql); }
+    public string ExecuteScalar(string sql, DbParams prms) { this.Track(sql); return this.EnsureNow().ExecuteScalar(sql, prms); }
 
     public async DbResult QueryAsync(string sql) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.QueryAsync(sql);
     }
     public async DbResult QueryAsync(string sql, DbParams prms) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.QueryAsync(sql, prms);
     }
     public async int ExecuteAsync(string sql) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.ExecuteAsync(sql);
     }
     public async int ExecuteAsync(string sql, DbParams prms) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.ExecuteAsync(sql, prms);
     }
     public async string ExecuteScalarAsync(string sql) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.ExecuteScalarAsync(sql);
     }
     public async string ExecuteScalarAsync(string sql, DbParams prms) {
+        this.Track(sql);
         IDbConnection c = await this.Ensure();
         return await c.ExecuteScalarAsync(sql, prms);
     }
@@ -155,11 +228,12 @@ public class RequestDbConnection : IDbConnection {
     }
     public void Dispose() { this.Close(); }
 
-    public void BeginTransaction() { this.EnsureNow().BeginTransaction(); }
+    public void BeginTransaction() { this.pinned = true; this.EnsureNow().BeginTransaction(); }
     public void Commit() { if (this.inner != null) { this.inner.Commit(); } }
     public void Rollback() { if (this.inner != null) { this.inner.Rollback(); } }
 
     public async bool BeginTransactionAsync() {
+        this.pinned = true;
         IDbConnection c = await this.Ensure();
         return await c.BeginTransactionAsync();
     }
