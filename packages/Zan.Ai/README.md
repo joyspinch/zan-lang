@@ -1,7 +1,7 @@
 # Zan.Ai
 
-AI 应用管线的**组装线**。Zan 原本已有零件（`Zan.Text/TextTokenizer`
-分词器、`Zan.Text/Bm25Index` 全文检索、`Zan.Data/ZanDb/VectorIndex`
+AI 应用管线的**组装线**。Zan 原本已有零件（`Zan.Data/Search/TextTokenizer`
+分词器、`Zan.Data/Search/Bm25Index` 全文检索、`Zan.Data/ZanDb/VectorIndex`
 HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文档 →
 分块 → 向量化 → 检索 → 拼提示词 → 生成"的链条——零件全有，组装线
 没有。本包补的就是这条组装线。
