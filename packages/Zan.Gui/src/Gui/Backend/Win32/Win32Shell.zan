@@ -1,22 +1,11 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui.Backend;
-
 public partial class Win32Shell {
-
-    // 一次性类注册、DPI 感知和共享临时缓冲区。
     static void Init() {
         if (Win32Shell.ready) { return; }
         Win32Shell.ready = true;
-        // 动画节奏依赖毫秒级唤醒：系统默认时钟中断约 15.6ms 一拍，
-        // MsgWaitForMultipleObjects / Sleep 的超时都会拖到下一拍才醒，
-        // 16ms 的动画截止实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替
-        // 正是"动画一卡一卡"的来源。提到 1ms（对齐 QPC 时钟的精度）。
-        // macOS/Linux 的事件等待本就纳秒级精度，无需同等处理。
-        // GUI 进程空闲时本就阻塞等事件，不空转，
-        // 1ms 时钟中断的功耗代价可接受（Chrome 同款取舍）。
         Win32Shell.TimeBeginPeriod(1);
         Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
         Win32Shell.fixedHwnd = new List<nint>();
@@ -34,59 +23,38 @@ public partial class Win32Shell {
         Win32Shell.lastSurface = 0 - 1;
         Win32Shell.bgColor = 0;
         Win32Shell.winOpacityPercent = 100;
-
         Win32Shell.injectCs = NativeMemory.Alloc(64);
         Win32Shell.InitializeCriticalSection(Win32Shell.injectCs);
         Win32Shell.scratchRect = NativeMemory.Alloc(16);
         Win32Shell.scratchRects = NativeMemory.Alloc(2048 * 4);
         Win32Shell.scratchMsg = NativeMemory.Alloc(64);
         Win32Shell.bitmapInfo = NativeMemory.Alloc(48);
-
         Win32Shell.EnableDpiAwareness();
-
         Win32Shell.instance = Win32Shell.GetModuleHandleW(0);
         Win32Shell.className = Wide.Of("ZanGuiApp");
-        // 窗口类图标用程序自己的图标（zanc 写进 exe 资源的那份），
-        // 任务栏与 Alt+Tab 才会显示程序图标而不是系统占位图标。
         Win32Shell.LoadAppIcon();
         nint wc = NativeMemory.Alloc(80);
         NativeMemory.Fill(wc, 0, 80);
         new Span<int>(wc, 1)[0] = 80;
         new Span<int>(wc + 4, 1)[0] = 0x0020 | 0x0008;  // CS_OWNDC | CS_DBLCLKS
-        // 注册护栏包装的入口：某条消息里的硬故障记日志后丢掉这条消息，
-        // 而不是让进程消失，也不会跨过 Win32 自己的消息分发往外跳。
         new Span<long>(wc + 8, 1)[0] =
             Win32Shell.zan_gui_guard_wndproc((nint)Win32Shell.OnMessage);
         new Span<long>(wc + 24, 1)[0] = Win32Shell.instance;
-        // hIcon：程序大图标（取不到退回系统默认应用图标）。
         new Span<long>(wc + 32, 1)[0] = Win32Shell.appIconBig != 0
             ? Win32Shell.appIconBig
             : Win32Shell.LoadIconW(Win32Shell.instance, 1);
         new Span<long>(wc + 40, 1)[0] = Win32Shell.LoadCursorW(0, 32512);
         new Span<long>(wc + 64, 1)[0] = Win32Shell.className;
-        // hIconSm：小图标；没有小图标时退回大图标。
         new Span<long>(wc + 72, 1)[0] = Win32Shell.appIconSmall != 0
             ? Win32Shell.appIconSmall
             : new Span<long>(wc + 32, 1)[0];
         Win32Shell.RegisterClassExW(wc);
         NativeMemory.Free(wc);
     }
-
-    // ---- 程序图标 -----------------------------------------------------
-    //
-    // zanc 编译时把图标（--icon 指定的 .ico，或内置默认图标）写进
-    // Windows 资源，因此运行中的进程能取回"程序自己的图标"：
-    //   · appIconBig/appIconSmall —— 窗口类图标（任务栏、Alt+Tab）；
-    //   · appIconPixels/appIconSide —— 像素（0xAARRGGBB，顶行优先），
-    //     供自绘标题栏画程序图标。
-    // 取不到时全部保持 0，调用方回落到占位字形。
     static nint appIconBig;
     static nint appIconSmall;
     static int[] appIconPixels;
     static int appIconSide;
-
-    // 有 Shcore 时按显示器感知，否则按系统感知，
-    // 保证二进制在 Windows 7 上仍可加载。
     static void EnableDpiAwareness() {
         nint fn = Interop.Entry("Shcore.dll", "SetProcessDpiAwareness");
         if (fn != 0) {
@@ -99,7 +67,4 @@ public partial class Win32Shell {
         SetProcessDpiAwareFn system = (SetProcessDpiAwareFn)fn;
         system();
     }
-
-    // ---- 窗口过程 ---------------------------------------------------
-
 }

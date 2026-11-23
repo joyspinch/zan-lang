@@ -2,176 +2,81 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-
 namespace Gui;
-
-// 并驱动帧循环，每帧在标题栏装饰之下
-// 布局并渲染整棵树。
 public partial class Form : Control {
     App app;
     string title;
-    // 周期任务（见 Every），在事件循环中按期触发。
     List<FormTask> tasks;
-    // 设计出的 `on<Event>` 绑定的 Name -> Action 表（与
-    // UiDoc/HandlerRegistry 契约相同）：设计文档存储处理器名，
-    // 业务文件用 On() 注册 Action，Run() 前的 WireDocEvents 整树
-    // 解析把每个控件的声明订阅到处理器。从未注册的处理器自然
-    // 不会触发。
     HandlerRegistry handlers;
-    // WireDocEvents 已跑过（Run 只进一次，重复解析会叠加订阅）。
     bool docWired;
-
-    // 构建底层窗口和 app。树可以在 Run() 之前
-    // 组装并布局好。
+    private bool localAnimation;
+    private bool reusePaintLayout;
     Form(string title, int width, int height) {
         InitForm(title, width, height, false);
     }
-
     Form(string title, int width, int height, bool offscreen) {
         InitForm(title, width, height, offscreen);
     }
-
-    // 声明式子类（B-ID147：class App : Form）的隐式构造链：真正的
-    // 初始化由 Show()/ShowOffscreen() 的 assembleDoc 按文档窗口键做
-    // （InitForm 在那时调用），这里不预置任何状态。
     public Form() {
     }
-
     void InitForm(string title, int width, int height, bool offscreen) {
-        this.InitControl(title, 5);
+        this.InitControl(title);
         this.title = title;
         this.app = offscreen ? App.CreateOffscreen(title, width, height)
                              : new App(title, width, height);
         this.handlers = new HandlerRegistry();
         this.tasks = new List<FormTask>();
     }
-
-    // 独立画布、样式和命中环境，不创建系统窗口。
     static Form CreateOffscreen(string title, int width, int height) {
         return new Form(title, width, height, true);
     }
-
-    // 浅色主题的窗口（默认外观）；标题栏的皮肤选择器仍可
-    // 切换浅色/深色与已打包的皮肤。
-    static Form Create(string title, int width, int height) {
-        return new Form(title, width, height);
-    }
-
-    // 深色主题的窗口，且关闭皮肤切换（EnableSkins(0)）：
-    // 外观锁定为内置深色主题。
+    static Form Create(string title, int width, int height) { return new Form(title, width, height); }
     static Form CreateDark(string title, int width, int height) {
         Form f = new Form(title, width, height);
         f.app.SetDark(true);
         f.app.EnableSkins(0);
         return f;
     }
-
-    // 底层 App（画布、主题、事件泵、时钟）。
-    App GetApp() {
-        return app;
-    }
-
-    // 运行时改写窗口标题：自绘标题栏下一帧就用新文字，
-    // 同时同步操作系统窗口标题（任务栏/Alt-Tab）。
+    App GetApp() { return app; }
     void SetTitle(string text) {
         if (this.title == text) { return; }
         this.title = text;
         app.SetWindowTitle(text);
         app.RequestRedraw();
     }
-
-    // 当前窗口标题。
     string Title() { return this.title; }
-
-    // 编程式关闭窗口。
     void Close() {
         if (app != null) { app.RequestClose(); }
     }
-
-    // 最小化窗口。
     void Minimize() {
         if (app != null) { app.MinimizeWindow(); }
     }
-
-    // 在最大化与还原之间切换。
     void ToggleMaximize() {
         if (app != null) { app.ToggleMaximizeWindow(); }
     }
-
-
-    // 设置窗口保持置顶（TopMost）。
     void SetTopmost(bool on) {
         if (app != null) { app.SetTopmost(on); }
     }
-
-    // 窗口当前是否处于置顶状态。
     bool IsTopmost() {
         if (app != null) { return app.IsTopmost(); }
         return false;
     }
-
-    // 设置窗口最小允许尺寸（逻辑像素）。
     void SetMinSize(int w, int h) {
         if (app != null) { app.SetMinSize(w, h); }
     }
-
-    // 窗口根不是一张卡片：它就是客户区本身。因此它按
-    // `window` 解析样式（base.css 里无边框、无阴影、内边距 0），
-    // 而不是落到"未知类型"的通用表面默认值上——那会给整个
-    // 设计加上一圈外边框，并把内容往里缩 paddingLarge。
     override string StyleType() { return "window"; }
-    // 客户区提供确定的尺寸；文档根与代码控件共用标准纵向 flex，
-    // Grow() 消费剩余高度，百分比尺寸按真实客户区解析。
     override int StyleDisplay() { return computedStyle == null ? 1 : base.StyleDisplay(); }
     override int StyleFlexDir() { return computedStyle == null ? 1 : base.StyleFlexDir(); }
-
-    // ---- 每帧钩子 ----
-
-    // 每帧回调（在事件处理之后、周期任务与渲染之前执行）。
-    // 供宿主在保留模式循环中泵其它窗口 / 驱动动画 / 轮询
-    // 后台任务（IDE 的多窗口 pump、向导等）。覆盖旧值。
     Action frameHook;
-
-    // 安装每帧回调（覆盖旧值；回调时机见 frameHook 字段说明）。
-    void FrameHook(Action a) {
-        frameHook = a;
-    }
-
-    // ---- 退出钩子 ----
-
-    // 事件循环结束（窗口关闭）后调用一次的回调，
-    // 供宿主保存状态 / 清理。
+    void FrameHook(Action a) { frameHook = a; }
     Action exitHook;
-
-    // 注册退出回调（事件循环结束、窗口关闭后调用一次；见 exitHook）。
-    void OnExit(Action a) {
-        exitHook = a;
-    }
-
-    // ---- 周期任务 ----
-
-    // 每 `ms` 毫秒跑一次 `a`，由事件循环驱动（采集、报警
-    // 扫描、趋势取点都用它）。任务跑完就请求重绘，因此
-    // 它改的信号会在下一帧体现。
+    void OnExit(Action a) { exitHook = a; }
     FormTask Every(int ms, Action a) {
         FormTask t = new FormTask(ms, a);
         t.Schedule(app.nowMs + t.Period());
         tasks.Add(t);
         return t;
     }
-
-    // 到期的周期任务全部跑一遍，并把下一个到期时刻告知
-    // 事件循环（以便在无输入时也能醒过来）。手写循环可
-    // 直接调用它。
-    // 时钟取 `Window.GetTickMs()` 而不是 `app.nowMs`：后者只在
-    // **渲染了一帧**的 BeginFrame 里推进，而"没到期"的那一圈恰恰
-    // 不渲染（`if (!app.needsRedraw) continue;`）。用缓存时钟的后果是
-    // 任务放完第一炮就再也不响——第二圈算出 `due` 还没到，于是按
-    // 120ms 重新排一次唤醒，唤醒回来读到的还是上一帧的旧时间，循环
-    // 往复，直到鼠标划过窗口触发一次真渲染才补跑一拍。实机上表现
-    // 为"空闲窗口 Every(120) 每几秒才跑一拍"（传奇模板页 31 的挂机
-    // 动画就是这么静止的）。GetTickMs 是真实单调时钟，冻结时钟时
-    // 仍返回冻结值，确定性截图不受影响。
     void PumpTasks() {
         if (tasks.Count == 0) { return; }
         int now = Window.GetTickMs();
@@ -189,9 +94,6 @@ public partial class Form : Control {
         }
         if (soonest >= 0) { app.RequestWakeIn(soonest); }
     }
-
-    // 在帧渲染呈现后（BeginFrame 清空了 wakeNextMs 之后）重新武装 Form 周期任务的唤醒时钟，
-    // 确保空闲无输入状态下事件循环仍能准时唤醒执行下一拍任务，彻底消除"必须晃动鼠标才刷新"的死锁。
     void FoldTaskDeadlines() {
         if (tasks.Count == 0) { return; }
         int now = Window.GetTickMs();
@@ -203,62 +105,19 @@ public partial class Form : Control {
         }
         if (soonest >= 0) { app.RequestWakeIn(soonest); }
     }
-
-    // ---- 动态控件通道 ----
-    // 类型化的控件字段是访问控件的主要、经编译检查的方式。
-    // 这些按名查找是次要通道，供
-    // 编译期不知道类型的代码使用（数据驱动 UI、设计器
-    // 脚本、插件胶水）：Ctl()/Get<T>() 遍历实时树。
-
-    // 第一个（深度优先）名为 `name` 的控件，或 null。
-    // 设计器总是为每个字段分配唯一名称，因此实际中它是精确的；
-    // 但你自己写的代码永远不要假定结果非空。
-    Control Ctl(string name) {
-        return this.Find(name);
-    }
-
-    // 类型化按名查找：`Checkbox c = form.Get<Checkbox>("agree");`
-    // 名称不存在或控件不是该类型时返回 null。
+    Control Ctl(string name) { return this.Find(name); }
     T Get<T>(string name) {
         Control c = this.Find(name);
         if (c == null) { return null; }
         if (c is T) { return (T)c; }
         return null;
     }
-
-    // ---- 设计的事件绑定 ----
-
-    // 注册（或替换）绑定到设计处理器名的 Action。
-    // 生成代码通过此表解析每个控件的 `on<Event>` 值，
-    // 因此设计中的处理器名必须与此处一致。
-    void On(string name, Action a) {
-        handlers.Set(name, a);
-    }
-
-    void On(string name, Action<string> a) {
-        handlers.SetArg(name, a);
-    }
-
-    void On(string name, ControlEvent a) {
-        handlers.SetSender(name, a);
-    }
-
-    void On(string name, ControlItemEvent a) {
-        handlers.SetItem(name, a);
-    }
-
-    void HandleItem(string name, ControlItemEvent a) {
-        handlers.SetItem(name, a);
-    }
-
-    // 为 `name` 注册的 Action；未注册时为 null。
-    Action Handle(string name) {
-        return handlers.Get(name);
-    }
-
-    // 运行为 `name` 注册的 Action（若有）。对未注册的名称
-    // 安全（空操作）。让设计器和数据驱动代码无需持有
-    // 控件引用即可触发处理器。
+    void On(string name, Action a) { handlers.Set(name, a); }
+    void On(string name, Action<string> a) { handlers.SetArg(name, a); }
+    void On(string name, ControlEvent a) { handlers.SetSender(name, a); }
+    void On(string name, ControlItemEvent a) { handlers.SetItem(name, a); }
+    void HandleItem(string name, ControlItemEvent a) { handlers.SetItem(name, a); }
+    Action Handle(string name) { return handlers.Get(name); }
     void Call(string name) {
         Action a = handlers.Get(name);
         if (a != null) { a(); }
@@ -267,7 +126,6 @@ public partial class Form : Control {
         Action<string> aa = handlers.GetArg(name);
         if (aa != null) { aa(""); }
     }
-
     void Call(string name, Control sender) {
         Action a = handlers.Get(name);
         if (a != null) { a(); }
@@ -276,7 +134,6 @@ public partial class Form : Control {
         ControlEvent s = handlers.GetSender(name);
         if (s != null) { s(sender); }
     }
-
     void Call(string name, Control sender, object item) {
         Action a = handlers.Get(name);
         if (a != null) { a(); }
@@ -285,34 +142,20 @@ public partial class Form : Control {
         ControlEvent s = handlers.GetSender(name);
         if (s != null) { s(sender); }
     }
-
     void Call(string name, string arg) {
         Action a = handlers.Get(name);
         if (a != null) { a(); }
         Action<string> aa = handlers.GetArg(name);
         if (aa != null) { aa(arg); }
     }
-
-    // ---- 文档事件接线 ----
-
-    // 把整树控件声明的 `on<Event>` 处理器名解析到 On() 注册的
-    // Action 并 BindEvent 成真正的订阅。投影（FormBuilder）只落
-    // 处理器名元数据；GenForm 时代这条解析在生成的 __Dispatch 里，
-    // 生成器删除后由运行期窗口统一承担——ModelBinder.WireNode 对
-    // 模型绑定树做的正是同一件事。在 Run() 进循环前调用一次，
-    // 因此 Wire(form) 的注册必须先于 Run()（模板样板即此顺序）。
     void WireDocEvents() {
         if (this.docWired) { return; }
         this.docWired = true;
         for (int i = 0; i < this.ChildCount(); i = i + 1) {
-            this.WireDocNode(this.ChildAt(i));
+            Form.WireDocNode(this.ChildAt(i), this.handlers);
         }
     }
-
-    // 解析顺序与 ModelBinder.WireNode 一致：Item → Sender →
-    // handlerArg+Arg → 无参。未注册的名字静默跳过（与生成器
-    // 时代一致——设计里允许留尚未实现的处理器）。
-    void WireDocNode(Control c) {
+    private static void WireDocNode(Control c, HandlerRegistry handlers) {
         for (int i = 0; i < c.events.Count; i = i + 1) {
             string evt = c.events[i].key;
             string hname = c.events[i].val;
@@ -338,19 +181,13 @@ public partial class Form : Control {
                 }
             }
             Action a = handlers.Get(hname);
-            if (a != null) {
-                c.BindEvent(evt, a);
-            }
+            if (a != null) { c.BindEvent(evt, a); }
         }
         for (int j = 0; j < c.ChildCount(); j = j + 1) {
-            this.WireDocNode(c.ChildAt(j));
+            Form.WireDocNode(c.ChildAt(j), handlers);
         }
     }
-
-    // 在当前帧中一次性测量、布局并绘制整棵树，
-    // 位于装饰之下。公开以便手写循环可以组合调用它。
     internal AppLoopRegistration hostLayoutRegistration;
-
     private bool HostLayoutCurrent(App a, AppLoopRegistration ticket, AppPreparationProof proof,
             int revision, int phase, long sequence, bool forInput) {
         Control root = a.rootControl;
@@ -360,7 +197,6 @@ public partial class Form : Control {
             && a.PreparationInputCurrent(phase, sequence)
             && a.HostPhaseCurrent(ticket, proof, revision);
     }
-
     internal bool SyncHostLayout(App a, bool forInput) {
         AppLoopRegistration ticket = hostLayoutRegistration;
         if (a != app || ticket == null || !a.LiveLoopRegistration(ticket) || ticket.host != a) { return false; }
@@ -376,14 +212,12 @@ public partial class Form : Control {
             a.ClientWidth(), a.ClientHeight() - a.ContentTop());
         return HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput);
     }
-
     private bool ContinueFormFrame(App a, AppLoopRegistration ticket, string boundary = "form") {
         if (app == a && hostLayoutRegistration == ticket && a.HostLayoutPrepared(ticket)) { return true; }
         a.TracePreparationFailure(boundary);
         a.AbortPreparationFrame();
         return false;
     }
-
     internal void RenderPreparedFrame(App a) {
         AppLoopRegistration ticket = hostLayoutRegistration;
         if (!ContinueFormFrame(a, ticket)) { return; }
@@ -401,13 +235,8 @@ public partial class Form : Control {
         if (!ContinueFormFrame(a, ticket, "form-after-writeback")) { return; }
         a.PhaseEnd(3);
     }
-
-    // 标准保留模式循环：处理事件、泵子窗口、布局、渲染树、绘制
-    // 装饰、呈现。子窗口（ChildWindow）与共享文件选择器由
-    // ChildWindows 注册表在此自动泵送，宿主无需手写任何泵逻辑。
-    // 输入根和尺寸重绘回调只在本次循环作用域内持有窗口。
     protected void RunScoped(Action loop) {
-        App prior = App.frameApp;
+        App prior = App.FrameApp();
         Control priorInputRoot = app.rootControl;
         FrameBody priorBody = app.frameBody;
         AppLoopRegistration priorLayout = hostLayoutRegistration;
@@ -416,6 +245,7 @@ public partial class Form : Control {
         try {
             App scopeApp = app;
             scopeApp.SetFrameBody(() => {
+                scopeApp.BeginFormRegionCapture(localAnimation);
                 this.RenderPreparedFrame(scopeApp);
                 if (!this.ContinueFormFrame(scopeApp, scopeLayout)) { return; }
                 scopeApp.RenderChrome(title);
@@ -428,19 +258,35 @@ public partial class Form : Control {
             if (hostLayoutRegistration == scopeLayout) { hostLayoutRegistration = priorLayout; }
             app.SetRootControl(priorInputRoot);
             app.SetFrameBody(priorBody);
-            App.frameApp = prior;
+            App.SetFrameApp(prior);
         }
     }
-
+    public void SetLocalAnimation(bool on) {
+        if (localAnimation == on) { return; }
+        localAnimation = on;
+        if (app != null) { app.RequestRedraw(); }
+    }
+    public void SetReusePaintLayout(bool on) {
+        if (reusePaintLayout == on) { return; }
+        reusePaintLayout = on;
+        if (app != null) { app.RequestRedraw(); }
+    }
+    protected bool RenderPendingFormFrame() {
+        if (app.PresentFormRegion()) { return true; }
+        if (!app.needsRedraw) { return false; }
+        app.TraceFullPresent(10, false);
+        app.TraceFullPresent(12, true);
+        app.SafeFrame(app.frameBody, reusePaintLayout ? hostLayoutRegistration : null);
+        app.TraceFullPresent(12, false);
+        return true;
+    }
     void Run() {
         this.WireDocEvents();
         app.Show();
         this.RunScoped(() => {
             while (app.isRunning) {
                 app.TraceFullPresent(5, true);
-                if (!app.ProcessEvent()) {
-                    break;
-                }
+                if (!app.ProcessEvent()) { break; }
                 app.TraceFullPresent(5, false);
                 app.TraceFullPresent(6, true);
                 if (frameHook != null) { frameHook(); }
@@ -460,23 +306,16 @@ public partial class Form : Control {
                 app.PerfMark("sh.tasks");
                 app.PerfMark("sh.framegate");
                 app.TraceFullPresent(10, true);
-                if (!app.needsRedraw) {
+                if (!this.RenderPendingFormFrame()) {
                     app.TraceFullPresent(11, true);
                     continue;
                 }
-                app.TraceFullPresent(10, false);
-                app.TraceFullPresent(12, true);
-                app.SafeFrame(app.frameBody);
-                app.TraceFullPresent(12, false);
                 ChildWindows.FoldDeadlines(app);
                 this.FoldTaskDeadlines();
             }
         });
         if (exitHook != null) { exitHook(); }
     }
-
-    // Input and snapshots borrow the same host layout and input root. A callback may
-    // replace either registration; only this scope's unchanged generation is restored.
     private void WithOffscreenHost(Action<AppLoopRegistration> body) {
         App a = this.app;
         if (a == null || !a.isRunning || a.window.GetHandle() != 0) { return; }
@@ -487,14 +326,12 @@ public partial class Form : Control {
         int generation = ticket.generation;
         int rootGeneration = a.inputRootGeneration;
         bool changedRoot = priorRoot == null;
-
         try {
             if (changedRoot) {
                 rootGeneration = rootGeneration + 1;
                 a.SetRootControl(this);
             }
             Control scopeRoot = changedRoot ? this : priorRoot;
-
             if (app == a && a.isRunning && hostLayoutRegistration == ticket
                     && ticket.active && ticket.generation == generation
                     && a.rootControl == scopeRoot && a.inputRootGeneration == rootGeneration) {
@@ -502,7 +339,6 @@ public partial class Form : Control {
             }
         } finally {
             bool ownsTicket = app == a && hostLayoutRegistration == ticket;
-
             bool current = ownsTicket && a.isRunning && ticket.active && ticket.generation == generation;
             if (hostLayoutRegistration == ticket) {
                 hostLayoutRegistration = current && priorLayout != null
@@ -515,11 +351,7 @@ public partial class Form : Control {
             }
         }
     }
-
     private ControlInputHost offscreenInputHost;
-
-    // Keep gesture ownership across input turns. The adapter borrows this Form
-    // weakly so App -> input root cannot retain Form -> App in an ARC cycle.
     public void ProcessOffscreenInput(int kind, int x, int y, int button,
             int key, int mods, int flag) {
         App a = this.app;
@@ -537,8 +369,6 @@ public partial class Form : Control {
             a.ProcessOffscreenInput(kind, x, y, button, key, mods, flag);
         });
     }
-
-    // Snapshot rendering uses the standard host preparation without replaying input.
     Canvas CaptureSnapshot() {
         App a = this.app;
         if (a == null) { return null; }

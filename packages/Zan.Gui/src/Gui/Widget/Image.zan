@@ -1,39 +1,15 @@
 using System;
 using System.IO;
 using Gui;
-
 namespace Gui.Widget;
-
-// 图片：传一个地址即可渲染。`Src` 支持四类来源，按前缀自动识别：
-// 1. 文件路径 —— PNG/JPEG/BMP/GIF/TGA/PNM/PSD/WebP 直接解码，
-// `.svg` 文件按矢量光栅化；
-// 2. `http://` / `https://` 网络地址 —— 后台线程取回（见
-// ImageHttp），完成前后都是占位，不阻塞 UI；
-// 3. `data:image/...;base64,...` 数据 URI —— base64 解码后内存
-// 解码，不落盘；
-// 4. SVG（上述任意来源指向 SVG，或 mime 带 `svg` 的 data URI）——
-// 以固有尺寸光栅化，首帧绘制后再按盒子尺寸重光栅一次。
-// `Fit` 控制缩放方式：contain（默认，等比留白）、cover（等比裁剪
-// 铺满）、fill（拉伸铺满）、none（原始尺寸居中裁剪）。加载中与失败
-// 由 `image` CSS 规则画的底色加 `Alt` 文本占位；`Loaded` / `Error`
-// 事件通知结果。
-// 圆角：CSS `border-radius` 作用于背景与边框；位图内容本身按矩形
-// 裁剪（当前光栅器只有矩形剪裁路径）。
+[GuiKind("Image")]
 public class Image : Control {
-    // 图片地址（可双向绑定）：文件路径 / http(s) URL /
-    // data URI / SVG，按前缀自动识别（见类 doc 四类来源）。
+    public override Control CreateCloneShell() { return new Image(); }
     public Binding<string> Src;
-    // 替代文本：加载中/失败时显示在占位框里（也供无障碍用途）。
     public string Alt;
-    // 缩放方式：contain / cover / fill / none。
     public string Fit;
-
-    // 图片就绪（已解码并缓存）。工作线程触发时自动封送回 UI 线程。
     public UiEvent Loaded;
-    // 解码失败、URL 取回失败或超时。
     public UiEvent Error;
-
-    // ---- 解析状态（只在 UI 线程触碰） ------------------------------
     private string resolvedSrc;  // 已解析过的 Src；null = 尚未解析
     private string imgKey;  // 绘制用 key：文件路径或 mem: 注册 key
     private int imgW;  // 已知像素尺寸
@@ -47,12 +23,8 @@ public class Image : Control {
     private string svgRasterKey;  // 当前按盒子尺寸光栅的注册 key
     private int svgRasterW;
     private int svgRasterH;
-
-    // 公共初始化（各构造共用）。
     public void InitImage(string src, string alt, string fit) {
-        this.InitControl("image", 1);
-        // 占位框与图片都由 OnPaint 自绘，框架不要再铺样式表面
-        // （否则行高盒会被样式表面铺成整框，参见 Avatar 的说明）。
+        this.InitControl("image");
         styleSurfaceOwned = true;
         Src = src;
         Alt = alt;
@@ -73,27 +45,16 @@ public class Image : Control {
         svgRasterW = 0;
         svgRasterH = 0;
     }
-    // 空图（之后设 Src）。
     public Image() { InitImage("", "", ""); }
-    // 只给来源，Fit 用默认 contain。
     public Image(string src) { InitImage(src, "", ""); }
-    // 来源 + 替代文本。
     public Image(string src, string alt) { InitImage(src, alt, ""); }
-    // 全参构造：来源、替代文本、Fit（contain/cover/fill/none）。
     public Image(string src, string alt, string fit) { InitImage(src, alt, fit); }
-
-    // 归一化缩放方式（脏值回 contain）。
     public string FitMode() {
         if (Fit == "cover") { return "cover"; }
         if (Fit == "fill") { return "fill"; }
         if (Fit == "none") { return "none"; }
         return "contain";
     }
-
-    // ---- 来源解析 ---------------------------------------------------
-
-    // Src 变化时重新解析来源并（重）注册内存图像。每帧Measure/Paint
-    // 调用，未变化的 Src 直接返回。
     private void Resolve(App app) {
         string src = "";
         if (Src != null) { src = Src.Get(); }
@@ -110,8 +71,6 @@ public class Image : Control {
         if (src.ToLower().EndsWith(".svg")) { this.ResolveSvgFile(src); return; }
         this.ResolveFile(src);
     }
-
-    // 清空解析状态（Src 变化换源时）。
     private void ResetState() {
         loadState = 0;
         imgW = 0;
@@ -126,16 +85,12 @@ public class Image : Control {
         svgRasterW = 0;
         svgRasterH = 0;
     }
-
-    // 加载成功：记录像素尺寸、置状态 1 并 Post Loaded。
     private void MarkLoaded(int w, int h) {
         imgW = w;
         imgH = h;
         loadState = 1;
         Loaded.PostS(this);
     }
-
-    // 普通图片文件：路径即绘制 key，能读到宽度即视为加载成功。
     private void ResolveFile(string src) {
         imgKey = src;
         int w = Canvas.ImageWidth(src);
@@ -145,8 +100,6 @@ public class Image : Control {
             loadState = 2;
         }
     }
-
-    // .svg 文件：读源文本并以固有尺寸光栅化。
     private void ResolveSvgFile(string path) {
         string text = File.ReadAllText(path);
         if (text == null || text.Length == 0) {
@@ -158,16 +111,12 @@ public class Image : Control {
         svgBaseKey = "mem:s" + StrHash(path);
         this.RasterSvg(0, 0);
     }
-
-    // data URI：mime 带 svg 走 SVG（base64 或文本载荷），否则按
-    // base64 位图解码进内存注册表。
     private void ResolveDataUri(string src) {
         int comma = src.IndexOf(",");
         if (comma < 0) { loadState = 2; return; }
         string head = src.Substring(0, comma).ToLower();
         string payload = src.Substring(comma + 1);
         if (head.Contains("svg")) {
-            // SVG：base64 载荷解码成字节，文本载荷直接用。
             isSvg = true;
             svgBaseKey = "mem:d" + StrHash(src);
             if (head.Contains(";base64")) {
@@ -194,43 +143,31 @@ public class Image : Control {
             loadState = 2;
         }
     }
-
-    // http(s) URL：内存缓存命中直接用，否则交远端取回通道后台
-    // 取回（Gui.ImageHttp 经 SetUrlFetcher 注册）。未安装时远端图
-    // 直接进失败态——桌面程序极少用 http 源，网络栈整个不进编译图。
     private void ResolveUrl(App app, string src) {
         imgKey = "mem:u" + StrHash(src);
-        // 同一 URL 已注册过（列表复用、页面回退）就直接用缓存。
         int w = Canvas.ImageWidth(imgKey);
         if (w > 0) {
             this.MarkLoaded(w, Canvas.ImageHeight(imgKey));
             return;
         }
         loadState = 0;
-        if (Image.urlFetcher != null) {
-            Image.urlFetcher(app, this, src, imgKey);
+        UrlFetchFn fetcher = GuiWidgetState.Current().urlFetcher;
+        if (fetcher != null) {
+            fetcher(app, this, src, imgKey);
         } else {
             loadState = 2;
         }
     }
-
-    // 远端取回通道槽：Gui.ImageHttp.Install() 注册 Fetch（后台
-    // 线程取回、经 App.Post 封送回 UI 线程调 OnFetched 等回调）。
     public delegate void UrlFetchFn(App app, Image img, string src, string key);
-    public static UrlFetchFn urlFetcher;
-    public static void SetUrlFetcher(UrlFetchFn fn) { urlFetcher = fn; }
-
-    // 远端 URL 槽通道：供无独立控件场景（例如表格图片单元格）调用排队取回实现。
+    public static bool HasUrlFetcher() { return GuiWidgetState.Current().urlFetcher != null; }
+    public static void SetUrlFetcher(UrlFetchFn fn) { GuiWidgetState.Current().urlFetcher = fn; }
     public delegate string UrlEnsureFn(App app, string url);
-    public static UrlEnsureFn urlEnsurer;
-    public static void SetUrlEnsurer(UrlEnsureFn fn) { urlEnsurer = fn; }
+    public static void SetUrlEnsurer(UrlEnsureFn fn) { GuiWidgetState.Current().urlEnsurer = fn; }
     public static string EnsureUrl(App app, string url) {
-        if (urlEnsurer == null) { return null; }
-        return urlEnsurer(app, url);
+        UrlEnsureFn ensurer = GuiWidgetState.Current().urlEnsurer;
+        if (ensurer == null) { return null; }
+        return ensurer(app, url);
     }
-
-    // 把 SVG 源光栅化到 imgKey。boxW/boxH > 0 时按盒子尺寸光栅
-    // （key 加 @WxH 后缀），否则用文档固有尺寸。
     private void RasterSvg(int boxW, int boxH) {
         string key = svgBaseKey;
         if (boxW > 0 && boxH > 0) { key = svgBaseKey + "@" + boxW + "x" + boxH; }
@@ -241,10 +178,7 @@ public class Image : Control {
             w = Canvas.ImageLoadSvg(key, svgText, boxW, boxH);
         }
         if (w <= 0) { loadState = 2; return; }
-        // 尺寸变化后丢掉上一份光栅，注册表不积垃圾。
-        if (svgRasterKey != "" && svgRasterKey != key) {
-            Canvas.EvictImage(svgRasterKey);
-        }
+        if (svgRasterKey != "" && svgRasterKey != key) { Canvas.EvictImage(svgRasterKey); }
         svgRasterKey = key;
         svgRasterW = w;
         svgRasterH = Canvas.ImageHeight(key);
@@ -253,16 +187,10 @@ public class Image : Control {
         imgH = svgRasterH;
         loadState = 1;
     }
-
-    // ---- ImageHttp 回调（已封送回 UI 线程） ------------------------
-
-    // ImageHttp 完成回调：key 不匹配（已换源）或已加载时忽略。
     public void OnFetched(string key, int w, int h) {
         if (key != imgKey || loadState == 1) { return; }
         this.MarkLoaded(w, h);
     }
-
-    // ImageHttp 取回 SVG 源的回调：光栅化成功后补发 Loaded。
     public void OnSvgFetched(string text) {
         if (loadState == 1) { return; }
         isSvg = true;
@@ -271,26 +199,15 @@ public class Image : Control {
         this.RasterSvg(0, 0);
         if (loadState == 1) { Loaded.PostS(this); }
     }
-
-    // ImageHttp 失败回调：置失败态并 Post Error。
     public void OnFetchFailed() {
         if (loadState == 1) { return; }
         loadState = 2;
         Error.PostS(this);
     }
-
-    // 丢弃解析状态并重新加载当前 Src：URL 失败重试、源文件或
-    // 远端内容变化后刷新。真正的工作在下一次绘制时发生。
-    // 典型用法：`img.Error += () => img.Reload();`
     public void Reload() {
-        if (imgKey != "" && (imgKey.StartsWith("mem:u") || svgRasterKey != "")) {
-            Canvas.EvictImage(imgKey);
-        }
+        if (imgKey != "" && (imgKey.StartsWith("mem:u") || svgRasterKey != "")) { Canvas.EvictImage(imgKey); }
         resolvedSrc = null;
     }
-
-    // FNV-1a 变体（djb2 取模）：内存图像 key 由源地址派生，同一
-    // 地址稳定复用缓存，长 int 运算避免 32 位回绕的歧义。
     public static long StrHash(string s) {
         long h = 5381;
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -298,16 +215,10 @@ public class Image : Control {
         }
         return h;
     }
-
-    // 按 num/den 四舍五入缩放 v（den ≤ 0 时原样返回）。
     public static int ScaleTo(int v, int num, int den) {
         if (den <= 0) { return v; }
-        // 四舍五入而不是截断：contain/cover 的居中留白靠它对称，
-        // 截断会让奇数差的盒子上下留白差出一像素。
         return (v * num * 2 + den) / (den * 2);
     }
-
-    // 覆写：设置属性。src / fit / alt 属性动态落控件。
     public override void SetProp(string key, string val) {
         if (key == "src") {
             if (Src != null) {
@@ -328,11 +239,6 @@ public class Image : Control {
         }
         base.SetProp(key, val);
     }
-
-    // ---- 保留模式钩子（Control）-------------------------------------
-
-    // 测量：CSS 尺寸优先，缺一边时按已加载图片的纵横比补齐，
-    // 未加载时兜底 96x96。
     public override void OnMeasure(App app) {
         this.Resolve(app);
         StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
@@ -344,7 +250,6 @@ public class Image : Control {
             dw = cssW;
             dh = cssH;
         } else if (loadState == 1 && imgW > 0 && imgH > 0) {
-            // 已知图片尺寸：CSS 只给一边时按纵横比补另一边。
             if (cssW > 0) {
                 dw = cssW;
                 dh = this.ScaleTo(cssW, imgH, imgW);
@@ -362,8 +267,6 @@ public class Image : Control {
         prefW = dw;
         prefH = dh;
     }
-
-    // 绘制：样式表面 + 按自适应模式 blit 图像；未加载完成时画占位。
     public override void OnPaint(App app) {
         this.Resolve(app);
         if (bw <= 0 || bh <= 0) { return; }
@@ -371,10 +274,7 @@ public class Image : Control {
         StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
         s.Paint(app, bx, by, bw, bh);
         if (loadState == 1 && imgW > 0 && imgH > 0) {
-            if (isSvg && (bw != svgRasterW || bh != svgRasterH)) {
-                // 首帧拿到真实盒子后按盒子尺寸重光栅一次。
-                this.RasterSvg(bw, bh);
-            }
+            if (isSvg && (bw != svgRasterW || bh != svgRasterH)) { this.RasterSvg(bw, bh); }
             if (loadState == 1) {
                 this.BlitFitted(app, c);
                 return;
@@ -382,8 +282,6 @@ public class Image : Control {
         }
         this.DrawPlaceholder(app, c, s);
     }
-
-    // 按 Fit 把已加载图像 blit 进盒子（contain/cover/fill/none）。
     private void BlitFitted(App app, Canvas c) {
         c.PushClip(bx, by, bw, bh);
         string fit = this.FitMode();
@@ -395,26 +293,19 @@ public class Image : Control {
             c.BlitImage(imgKey, bx + (bw - dw) / 2, by + (bh - dh) / 2,
                         dw, dh, 0, 0, 0, 0);
         } else if (fit == "cover") {
-            // 等比铺满：scale = max(bw/imgW, bh/imgH)，可见源矩形 =
-            // 盒子/scale，居中裁掉另一轴。比例失衡时另一支算出的
-            // sw/sh 会超过源尺寸（负 sx 让 blit 整体被守卫跳过，
-            // cover 就只剩背景了）——所以两个分支各自只裁一个轴。
             int sw = imgW;
             int sh = imgH;
             int sx = 0;
             int sy = 0;
             if (bw * imgH >= bh * imgW) {
-                // 盒子相对更宽：满宽绘制，按 bw/bh 比裁上下。
                 sh = this.ScaleTo(imgW, bh, bw);
                 sy = (imgH - sh) / 2;
             } else {
-                // 盒子相对更高：满高绘制，按 bh/bw 比裁左右。
                 sw = this.ScaleTo(imgH, bw, bh);
                 sx = (imgW - sw) / 2;
             }
             c.BlitImage(imgKey, bx, by, bw, bh, sx, sy, sw, sh);
         } else {
-            // contain：等比缩进盒子，居中（Wizard 预览的 contain 数学）。
             int dw = bw;
             int dh = bh;
             if (bw * imgH <= bh * imgW) {
@@ -427,8 +318,6 @@ public class Image : Control {
         }
         c.PopClip();
     }
-
-    // 占位文本：Alt（加载中/失败时显示）；失败且无 Alt 时为 "..."。
     private void DrawPlaceholder(App app, Canvas c, StyleBox s) {
         string label = Alt;
         if (label == null) { label = ""; }
@@ -437,68 +326,35 @@ public class Image : Control {
         c.DrawTextCentered(bx, by, bw, bh, label, s.FgOr(0),
                            s.FontOr(app.Scale(13)));
     }
-
-    // ---- 设计器 / 序列化模型 ---------------------------------------
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Image"; }
-
-    // 设计器属性面：src / alt / fit / class。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec src = PropSpec.Text("src", "Src").DefaultBinding();
-        src.Field("Src", 0);
-        ps.Add(src);
-        PropSpec alt = PropSpec.Text("alt", "Alt");
-        alt.Field("Alt", 0);
-        ps.Add(alt);
+        ps.Add(PropSpec.Text("src", "Src").DefaultBinding().Field("Src", 0));
+        ps.Add(PropSpec.Text("alt", "Alt").Field("Alt", 0));
         PropSpec fit = PropSpec.Enum("fit", "Fit",
             new List<string>{ "contain", "cover", "fill", "none" });
-        // 实时绑定 Fit 字段本身（选项文本即取值）。此前绑的是
-        // FitIndex() 方法返回值的快照——SetProp 经 PropOf 命中这张
-        // 游离 spec，写入永远落不到控件（SetExtra 的活路被
-        // PropOf-first 管线挡住）。
         fit.Field("Fit", 0);
         ps.Add(fit);
         return ps;
     }
-
-    // 覆写：公共事件之外提供 "Loaded"/"Error"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Loaded");
         e.Add("Error");
         return e;
     }
-
-    // 覆写："Loaded"/"Error" 各挂对应 UiEvent，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Loaded") { Loaded.Add(a); return; }
         if (evt == "Error") { Error.Add(a); return; }
         base.BindEvent(evt, a);
     }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Loaded") { Loaded.AddS(a); return; }
         if (evt == "Error") { Error.AddS(a); return; }
         base.BindEventS(evt, a);
     }
-
-
-    // 设计器额外键：`fit` 收发 contain/cover/fill/none。
-    public override string GetExtra(string key) {
-        return "";
-    }
-
-    // 设计器写入 `fit`；其他键返回 false 交给基类。
-    public override bool SetExtra(string key, string val) {
-        return false;
-    }
-
-    // FitMode 的枚举序号（设计器 fit 下拉用）：0 contain / 1 cover /
-    // 2 fill / 3 none。
+    public override string GetExtra(string key) { return ""; }
+    public override bool SetExtra(string key, string val) { return false; }
     public int FitIndex() {
         string f = this.FitMode();
         if (f == "cover") { return 1; }

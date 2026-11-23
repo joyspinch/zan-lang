@@ -2,58 +2,33 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-
 namespace Gui;
-
-// 通用元素容器（WEB_GUI_ROADMAP P0/P5）：kind 即 CSS type 选择器
-// 匹配的标签名（div/p/span/section/...）。HTML 声明层（P5）建树的
-// 容器节点直接落成 Element；代码里也可以用它写 web 风格的布局
-// 容器。纯文本内容经 SetText 提供——块容器里是匿名文本块，
-// 行内级（span）里被父容器拆成 run 排进行盒。
+[GuiKind("Element")]
 public class Element : Control {
     string elTag;
     string elText;
     List<ElementRun> elRuns;
     bool elRunsFresh;  // 本帧行盒是否落位过（防陈旧 run 重画）
     List<FlowEntry> elOrder;  // 文档序（AddText/AddKid 交错记录）
-    // 原始属性表（HTML 声明层留下的 type/data-*/href 等），
-    // CSS 属性选择器（`[type="text"]`）的取值源。
     Dict<string, string> elAttrs;
-    // ::before/::after 的 content 文本（宿主样式解析时刷新，
-    // "" = 无伪元素）。参与本元素的流内容：inline 走 FlowText 拼接，
-    // 块容器在 FlowEntries 首尾各占一段匿名文本。
     string elBefore;
     string elAfter;
-    // HTML `title` 属性（悬停提示文本，"" = 无）。非空时 OnPaint
-    // 每帧问一次 tipPainter——悬停停稳即向帧末提示队列登记。
-    // 绘制实现在 Gui.Html（经 SetTipPainter 注册）；elTitle 只在
-    // HTML 声明层赋值，未安装时恒空串，钩子不会被走到。
     string elTitle;
-
-    // title 提示原生绘制槽（Gui.Html.Install() 注册 Html.PaintTip）。
     public delegate void TipPaintFn(Control el, string title);
-    public static TipPaintFn tipPainter;
-    public static void SetTipPainter(TipPaintFn fn) { tipPainter = fn; }
-
+    public static TipPaintFn TipPainter() { return GuiCoreState.Current().tipPainter; }
+    public static void SetTipPainter(TipPaintFn fn) { GuiCoreState.Current().tipPainter = fn; }
     void InitElement(string tag, string nodeName) {
-        this.InitControl(nodeName, 0);
+        this.InitControl(nodeName);
         elTag = tag;
         elRuns = new List<ElementRun>();
     }
-
-    // 记录一个原始属性（树构建期逐个喂入；同名覆盖；键折小写）。
-    Element SetAttr(string k, string v) {
+    void SetAttr(string k, string v) {
         string key = Css.Lower(k);
         if (elAttrs == null) { elAttrs = new Dict<string, string>(); }
         if (elAttrs.ContainsKey(key)) { elAttrs.Remove(key); }
         elAttrs.Add(key, v);
-        // Attribute selectors read this table. Ancestor/sibling/:has users are
-        // evaluated live by Style; the local inline-owned box is stale too.
         computedStyle = null;
-        return this;
     }
-
-    // CSS 属性选择器取值源：先查属性表，缺了落基类（id → name）。
     override string CssAttr(string key) {
         if (elAttrs != null) {
             string v = "";
@@ -61,57 +36,35 @@ public class Element : Control {
         }
         return base.CssAttr(key);
     }
-
-    // 表里有就算存在——值为空串的布尔属性（`<div hidden>`）也要让
-    // `[hidden]` 命中；不进表的手搭节点回落按 name 判 id。
     override bool CssHasAttr(string key) {
-        if (elAttrs != null && elAttrs.ContainsKey(Css.Lower(key))) {
-            return true;
-        }
+        if (elAttrs != null && elAttrs.ContainsKey(Css.Lower(key))) { return true; }
         if (key == "id") { return name != ""; }
         return false;
     }
-
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Text("text", "Text").DefaultBinding());
         return ps;
     }
-
-    // 绑定通道的文本投影："text" 经
-    // GetExtra/SetExtra 落到 SetText/Text——模板行里的
-    // `<span bind="name">` 由 ModelBinder 按 Element 的缺省
-    // 绑定属性 text 推送/读回。没有这条通道，SetProp("text")
-    // 会掉进"非空值当样式类"的基类兜底。
-    // 投影文本 = SetText 的整块 + AddText 的裸文本段（生成的建树
-    // 代码与运行时 Html.Parse 都走 AddText——它只记 FlowEntry，
-    // 不写 elText；只读 elText 会把静态文档读成空串）。
     override string GetExtra(string key) {
         if (key == "text") {
             string t = this.Text();
             if (elOrder != null) {
                 for (int i = 0; i < elOrder.Count; i = i + 1) {
-                    if (elOrder[i].text != null) {
-                        t = t + elOrder[i].text;
-                    }
+                    if (elOrder[i].text != null) { t = t + elOrder[i].text; }
                 }
             }
             return t;
         }
         return "";
     }
-
     override bool SetExtra(string key, string val) {
         if (key == "text") { this.SetText(val); return true; }
         return false;
     }
-
-    // 从同类元素拷贝原始属性表（Html.Clone 的 template 行展开用：
-    // data-for/data-if 等声明随行复制）。src 无表时本元素
-    // 保持原状；键已折小写，直接平移。
-    Element CopyAttrsFrom(Element src) {
+    void CopyAttrsFrom(Element src) {
         if (src.elTitle != "") { elTitle = src.elTitle; }
-        if (src.elAttrs == null) { return this; }
+        if (src.elAttrs == null) { return; }
         if (elAttrs == null) { elAttrs = new Dict<string, string>(); }
         List<string> ks = src.elAttrs.Keys;
         for (int i = 0; i < ks.Count; i = i + 1) {
@@ -119,13 +72,7 @@ public class Element : Control {
             src.elAttrs.TryGetValue(ks[i], out v);
             elAttrs.Add(ks[i], v);
         }
-        return this;
     }
-
-    // 宿主样式解析后顺带解析 ::before/::after 伪盒，取出 content
-    // 文本。伪盒经 Style.Part 按键缓存，这里只是字典查询 + 短串
-    // 解析；伪盒里 content 之外的声明 v1 不消费（伪元素自身的
-    // 颜色/字号等是后续工作），文本沿用宿主样式绘制。
     override StyleBox ResolveStyle(App app, int state) {
         if (computedStyle != null && computedStyleState == state
             && this.ComputedStyleCurrent(app)) {
@@ -140,51 +87,34 @@ public class Element : Control {
         elAfter = Css.PseudoContent(pa == null ? "" : pa.contentRaw, this);
         return sb;
     }
-
-    // 标签名（StyleType() 折小写后与 CSS type 选择器匹配）。
     override string Kind() { return elTag; }
-
-    // 元素的纯文本内容：块流布局（P2）把它排进行盒参与排版。
-    // 替换语义：文档序里的裸文本段一并清掉——HTML 解析的静态
-    // 文本走 AddText 记 elOrder（不写 elText），只改 elText 的话
-    // FlowEntries 会把静态文本与 SetText 的整块都排出来（同屏
-    // 双影）。控件子项保留；行内级 FlowText 本就只认 elText。
-    public Element SetText(string t) {
+    protected override string PropertySchemaId() { return "Element"; }
+    public string TextContent {
+        get { return this.elText; }
+        set { this.SetText(value); }
+    }
+    public void SetText(string t) {
         if (elOrder != null) {
             for (int i = elOrder.Count - 1; i >= 0; i = i - 1) {
                 if (elOrder[i].kid == null) { elOrder.RemoveAt(i); }
             }
         }
         elText = t;
-        return this;
     }
-
-    // 元素的纯文本内容。
     public string Text() { return elText; }
-
-    // 文档序追加一段裸文本（P2 行内混排："text " + span + " more"）。
-    // 与 AddKid 的交错顺序即行盒的分段顺序。
-    public Element AddText(string t) {
+    public void AddText(string t) {
         if (elOrder == null) { elOrder = new List<FlowEntry>(); }
         FlowEntry e = new FlowEntry();
         e.text = t;
         elOrder.Add(e);
-        return this;
     }
-
-    // 文档序追加子项（同 Add，但记录与 AddText 的交错顺序）。
-    public Element AddKid(Control c) {
+    public void AddKid(Control c) {
         this.Add(c);
         if (elOrder == null) { elOrder = new List<FlowEntry>(); }
         FlowEntry e = new FlowEntry();
         e.kid = c;
         elOrder.Add(e);
-        return this;
     }
-
-    // 从文档序与子列表里一并摘除 `c`（运行时行撤除用：普通 Remove
-    // 会在 elOrder 留陈旧条目，FlowEntries 仍按它占位——幽灵布局）。
-    // 没有文档序记录时回落普通 Remove。
     public void DropKid(Control c) {
         if (elOrder != null) {
             for (int i = 0; i < elOrder.Count; i = i + 1) {
@@ -193,26 +123,15 @@ public class Element : Control {
         }
         this.Remove(c);
     }
-
-    // 清空所有子节点与文档序（数据驱动模板列表重绘用）
     public void ClearKids() {
-        if (elOrder != null) {
-            elOrder.Clear();
-        }
+        if (elOrder != null) { elOrder.Clear(); }
         this.RemoveAll();
     }
-
-    // 一段匿名文本的流条目。
     FlowEntry TextEntry(string t) {
         FlowEntry e = new FlowEntry();
         e.text = t;
         return e;
     }
-
-    // 块流内容序列（Control.FlowEntries 覆写）：::before 伪文本
-    // 最先、::after 最后（CSS 生成内容语义），中间是 SetText 的
-    // 整块文本与 elOrder 文档序；从未用 AddText/AddKid 记录顺序时
-    // 子项照旧按 FlexKids 序追加（P0/P1 代码零改动）。
     override List<FlowEntry> FlowEntries() {
         List<FlowEntry> es = new List<FlowEntry>();
         if (elBefore != "") { es.Add(this.TextEntry(elBefore)); }
@@ -235,9 +154,7 @@ public class Element : Control {
         for (int i = 0; i < elOrder.Count; i = i + 1) {
             FlowEntry o = elOrder[i];
             if (o.kid != null) {
-                if (!o.kid.StyleVisible() || o.kid.StylePosition() == 2) {
-                    continue;
-                }
+                if (!o.kid.StyleVisible() || o.kid.StylePosition() == 2) { continue; }
                 tracked.Add(o.kid);
             }
             es.Add(o);
@@ -256,21 +173,12 @@ public class Element : Control {
         if (elAfter != "") { es.Add(this.TextEntry(elAfter)); }
         return es;
     }
-
     int ElFontSize() {
         StyleBox sb = computedStyle;
         if (sb == null) { return 14; }
         if (sb.fontPx > 0) { return sb.fontPx; }
         return sb.envRemPx > 0 ? sb.envRemPx : 14;
     }
-
-    // 行内内容（Control.FlowText 覆写）。elText 之外，**纯文本的
-    // elOrder**（AddText 记录、无控件子项）也算行内内容——
-    // display:inline 的元素按文本 run 参与父级行盒（web 语义），
-    // 而不是原子盒坐基线把行高撑爆（P5 html oracle 实证：span 里的
-    // "beta" 走原子盒让 20px 行涨到 24）。混排（有控件子项）的仍
-    // 走原子盒路径，行为与 P2 一致。::before/::after 文本按 CSS
-    // 生成内容语义拼在首尾。
     override string FlowText() {
         if (elText != "") { return elBefore + elText + elAfter; }
         if (elOrder == null || elOrder.Count == 0) {
@@ -285,13 +193,10 @@ public class Element : Control {
         }
         return elBefore + joined + elAfter;
     }
-
-    // 行盒排布期：清上一帧的 run 缓存并标记本帧 fresh。
     override void InlineRunsBegin() {
         elRuns.Clear();
         elRunsFresh = true;
     }
-
     override void InlineRunPlace(int x, int topY, int w, int h, int drawOff,
                                  int fs, string text) {
         ElementRun r = new ElementRun();
@@ -304,7 +209,6 @@ public class Element : Control {
         r.fs = fs;
         elRuns.Add(r);
     }
-
     override void ShiftTree(int dx, int dy) {
         base.ShiftTree(dx, dy);
         if (elRuns != null && (dx != 0 || dy != 0)) {
@@ -315,14 +219,9 @@ public class Element : Control {
             }
         }
     }
-
-    // 保留模式绘制：背景/边框由基类 PaintStyleBox 完成。块容器里
-    // 画落位好的 run（text-align/折行由行盒决定）；非 fresh 的
-    // 缓存（上帧行内、本帧没被行盒排到）直接丢弃。
     override void OnPaint(App app) {
-        if (elTitle != "" && Element.tipPainter != null) {
-            Element.tipPainter(this, elTitle);
-        }
+        TipPaintFn tipPainter = Element.TipPainter();
+        if (elTitle != "" && tipPainter != null) { tipPainter(this, elTitle); }
         if (elRuns.Count == 0) { return; }
         if (!elRunsFresh) { elRuns.Clear(); return; }
         StyleBox sb = computedStyle;
@@ -334,7 +233,6 @@ public class Element : Control {
         }
         elRunsFresh = false;
     }
-
     override string GetProp(string key) {
         if (key == "title" || key == "tip") { return elTitle; }
         if (elAttrs != null) {
@@ -343,7 +241,6 @@ public class Element : Control {
         }
         return base.GetProp(key);
     }
-
     override void SetProp(string key, string val) {
         if (key == "title" || key == "tip") {
             elTitle = val;

@@ -1,0 +1,81 @@
+using System;
+using System.Json;
+using Gui.Markup;
+namespace Gui;
+public partial class ChildWindow {
+    private HtmlDoc FindDesign(WindowDocumentLoader load) {
+        if (this.root != null) { return null; }
+        string tname = this.DesignName();
+        if (tname == "") { tname = this.GetType().Name; }
+        string html = Form.FindDoc(tname);
+        return html != null ? load(html) : null;
+    }
+    private void AssembleDesign(Func<HtmlDoc> load) {
+        if (this.designAssembled) { return; }
+        HtmlDoc doc = load != null ? load() : null;
+        this.designAssembled = true;
+        if (doc != null && doc.root != null) {
+            this.designCss = doc.css;
+            this.SetView(doc.root, this);
+        }
+        this.OnCreate();
+        if (this.root == null) { return; }
+        object vm = this.ViewModel();
+        if (vm != null) { this.SetView(this.root, vm); }
+        DocWire.MountSlots(this.root, this);
+    }
+    void AssembleDoc() { this.AssembleDoc(false); }
+    private void AssembleDoc(bool explicitHandlers) {
+        if (this.root == null) { return; }
+        if (this.designCss != null && this.designCss != "") {
+            string scope = host.NextLoadScope();
+            host.ApplyScopedTree(this.root, HtmlScope.Styles(this.designCss, scope), scope);
+        }
+        ModelBinder b = this.Binder();
+        if (b.Model() == null) { b.SetRoot(this.root, this); }
+        object bm = b.Model();
+        if (!explicitHandlers) { DocWire.AutoWire(this.root, this, b); }
+        if (!(bm is JsonValue) && !(bm is JsonDoc)) {
+            DocWire.CheckBinds(this.root, bm, this.GetType().Name);
+        }
+        host.RegisterModelHost(b);
+        b.Wire();
+        if (this.HasMethod("OnLoad")) { this.Invoke("OnLoad", this); }
+    }
+    void OpenHost(App parent) {
+        this.AssembleDesign(() => this.FindDesign(Html.ParseComponent));
+        this.OpenHostView(parent, false);
+    }
+    public void OpenHostWith(App parent, ControlFactoryFn factory) {
+        this.AssembleDesign(() => this.FindDesign((string html) => Html.ParseWith(html, "", null, factory)));
+        this.OpenHostView(parent, false);
+    }
+    public void OpenHostWith(App parent, string document, ControlFactoryFn factory,
+                             Action<ModelBinder> register) {
+        this.AssembleEmbeddedDesign(document, factory, register);
+        this.OpenHostView(parent, true);
+    }
+    internal void OpenPreparedHost(App parent) {
+        this.AssembleDesign(null);
+        this.OpenHostView(parent, false);
+    }
+    void OpenStandalone() {
+        this.AssembleDesign(() => this.FindDesign(Html.ParseComponent));
+        this.OpenStandaloneView(false);
+    }
+    public void OpenStandaloneWith(ControlFactoryFn factory) {
+        this.AssembleDesign(() => this.FindDesign((string html) => Html.ParseWith(html, "", null, factory)));
+        this.OpenStandaloneView(false);
+    }
+    public void OpenStandaloneWith(string document, ControlFactoryFn factory, Action<ModelBinder> register) {
+        this.AssembleEmbeddedDesign(document, factory, register);
+        this.OpenStandaloneView(true);
+    }
+    private void AssembleEmbeddedDesign(string document, ControlFactoryFn factory, Action<ModelBinder> register) {
+        if (register == null) { throw new ArgumentNullException("register"); }
+        this.AssembleDesign(() => Html.ParseEmbedded(document, factory));
+        ModelBinder current = this.Binder();
+        register(current);
+        if (this.root != null) { DocWire.CheckHandlers(this.root, current, this.GetType().Name); }
+    }
+}

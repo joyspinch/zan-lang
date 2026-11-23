@@ -1,32 +1,17 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui;
-
-// 尚未迁移的绘制区域投影。真实输入由当前对象树路由，区域不参与目标重绑定。
 public class HitTester {
     List<HitRegion> regions;
-    // 阻挡区域（widgetType == -1，通过 App.BlockHitsRect 注册），
-    // 会吞掉矩形下方空间内的所有控件。`blockers` 累积
-    // 本帧的阻挡区域；`prevBlockers` 是上一帧的集合。页面内容
-    // 在本帧覆盖层注册之前渲染，因此必须查询
-    // `prevBlockers` 以判断自己位于模态框/弹出层/浮动窗口之下；而
-    // 阻挡层自身的内容在铺设遮罩之后渲染，因此读取 `blockers`
-    // 来确认自己位于阻挡之上并保持可用。
     List<HitRegion> blockers;
     List<HitRegion> prevBlockers;
     List<HitRegion> blockersA;
     List<HitRegion> blockersB;
-    // 命中区对象池。每帧每个控件注册一个命中区，一个稠密
-    // 界面一秒就要新建上万个 HitRegion；池化后只在控件数
-    // 创新高时才分配。两个池交替使用，因为 prevBlockers 还
-    // 引用着上一帧的对象，不能被本帧就地改写。
     List<HitRegion> poolA;
     List<HitRegion> poolB;
     bool useA;
     int used;
-    // 构造：初始化双复用池与阻挡区表。
     HitTester() {
         poolA = new List<HitRegion>();
         poolB = new List<HitRegion>();
@@ -38,9 +23,6 @@ public class HitTester {
         blockers = blockersA;
         prevBlockers = blockersB;
     }
-
-    // 开启新的一帧：当前阻挡区转为 prevBlockers，切换到另一个
-    // 复用池并把已用计数清零（上一帧对象留待就地改写）。
     void Clear() {
         useA = !useA;
         if (useA) {
@@ -55,20 +37,11 @@ public class HitTester {
         blockers.Clear();
         used = 0;
     }
-
-    // 本帧已注册的命中区数量（`regions` 是复用池，末尾
-    // 可能残留上一帧的对象，遍历要以此为界）。
     int RegionCount() { return used; }
-    // 第 i 个已注册的命中区（i < RegionCount()）。
     HitRegion RegionAt(int i) { return regions[i]; }
-
-    // 注册一个命中区，复用池中的对象（首选形式：不分配）。
     void RegisterRect(int id, int x, int y, int w, int h, int wtype) {
         this.RegisterRectL(id, x, y, w, h, wtype, "");
     }
-
-    // 带语义标签的注册：标签随后写入 HitRegion，dump hitregions
-    // 原样投影（无障碍/自动化读名，命中解析不用它）。
     void RegisterRectL(int id, int x, int y, int w, int h, int wtype, string label) {
         HitRegion r;
         if (used < regions.Count) {
@@ -82,16 +55,10 @@ public class HitTester {
         used = used + 1;
         if (wtype == -1) { blockers.Add(r); }
     }
-
-    // 按现成的 HitRegion 注册本帧命中区（字段展开转发 RegisterRect）。
     void Register(HitRegion region) {
         this.RegisterRect(region.id, region.x, region.y,
             region.width, region.height, region.widgetType);
     }
-
-    // 当本帧已注册的阻挡层覆盖该点时返回 true——即
-    // 查询方表面已铺设自己的遮罩，正处于阻挡层
-    // 主体（阻挡之上），而非其下方的内容。
     bool BlockerAt(int px, int py) {
         int i = blockers.Count - 1;
         while (i >= 0) {
@@ -101,10 +68,6 @@ public class HitTester {
         }
         return false;
     }
-
-    // 当上一帧的阻挡层覆盖该点时返回 true。供
-    // 页面内容（在本帧覆盖层注册前渲染）
-    // 判断自身是否位于模态框/弹出层/浮动窗口之下。
     bool PrevBlockerAt(int px, int py) {
         int i = prevBlockers.Count - 1;
         while (i >= 0) {
@@ -114,25 +77,15 @@ public class HitTester {
         }
         return false;
     }
-
-    // 本帧命中区中最顶层（最后注册）覆盖 (px, py) 的控件 id，
-    // 无命中时 -1。（内联 Contains 避免每帧高频调用函数调用栈与分支开销）
     int HitTest(int px, int py) {
         int i = used - 1;
         while (i >= 0) {
             HitRegion r = regions[i];
-            if (px >= r.x && px < r.x + r.width && py >= r.y && py < r.y + r.height) {
-                return r.id;
-            }
+            if (px >= r.x && px < r.x + r.width && py >= r.y && py < r.y + r.height) { return r.id; }
             i = i - 1;
         }
         return -1;
     }
-
-    // 与 HitTest 相同，但跳过阻挡区域，返回其**下方**的控件。
-    // 供右键使用：上下文菜单打开时它的遮罩会吞掉一切，于是
-    // 在别处右键什么也不会发生（必须先关掉菜单）；右键改为
-    // 解析到遮罩下的控件后，菜单就直接换到新位置重开。
     int HitTestBelowBlockers(int px, int py) {
         int i = used - 1;
         while (i >= 0) {
@@ -144,27 +97,6 @@ public class HitTester {
         }
         return -1;
     }
-
-    // 与 HitTestBelowBlockers 相同，但只匹配 `from` 下标**之后**
-    // 注册的区域（跳过阻挡区）。弹层在覆盖阶段用它识别「自己
-    // 内部注册的控件」——内嵌滚动条、搜索框等，它们在弹层
-    // blocker 之后才注册；而不带基线时，弹层正下方的内容控件
-    // 早在内容帧就注册在前，会被误当成弹层内部控件，令弹层把
-    // 本该选中选项的释放点击整个吞掉（SelectBox 弹层盖住滑杆/
-    // 输入框/表格行时选项选不中）。
-    int HitTestFrom(int px, int py, int from) {
-        int i = used - 1;
-        while (i >= from) {
-            HitRegion r = regions[i];
-            if (r.widgetType != -1 && px >= r.x && px < r.x + r.width && py >= r.y && py < r.y + r.height) {
-                return r.id;
-            }
-            i = i - 1;
-        }
-        return -1;
-    }
-
-    // 零分配获取 `id` 注册的区域。返回 true 表示找到，false 表示未拥有区域。
     bool TryGetRect(int id, out int rx, out int ry, out int rw, out int rh) {
         rx = 0; ry = 0; rw = 0; rh = 0;
         if (id < 0) { return false; }
@@ -177,10 +109,6 @@ public class HitTester {
         }
         return false;
     }
-
-    // 上一帧为 `id` 注册的区域，以扁平的 [x,y,w,h] 列表表示；
-    // 若该 id 未拥有区域则为 null。让框架只重绘
-    // 状态变化的控件，而不是整个窗口。
     List<int> RectOf(int id) {
         if (id < 0) { return null; }
         for (int i = 0; i < used; i = i + 1) {
@@ -196,15 +124,10 @@ public class HitTester {
         }
         return null;
     }
-
-    // id 注册的控件类型（HitRegion.widgetType），未注册时 -1。
     int GetWidgetType(int id) {
         for (int i = 0; i < used; i = i + 1) {
-            if (regions[i].id == id) {
-                return regions[i].widgetType;
-            }
+            if (regions[i].id == id) { return regions[i].widgetType; }
         }
         return -1;
     }
 }
-

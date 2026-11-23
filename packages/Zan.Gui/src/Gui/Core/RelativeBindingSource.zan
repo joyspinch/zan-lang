@@ -1,0 +1,380 @@
+using System;
+using System.Collections.Generic;
+namespace Gui;
+public delegate bool AncestorMatchFn(Control candidate);
+public class RelativeBindingSource {
+    public int Mode;
+    public int AncestorLevel;
+    public string AncestorTypeName;
+    public AncestorMatchFn Matcher;
+    public Control ExplicitSource;
+    public RelativeBindingSource() {
+        Mode = 2;
+        AncestorLevel = 1;
+        AncestorTypeName = "";
+    }
+    public static RelativeBindingSource Self() {
+        RelativeBindingSource s = new RelativeBindingSource();
+        s.Mode = 0;
+        return s;
+    }
+    public static RelativeBindingSource Parent() {
+        RelativeBindingSource s = new RelativeBindingSource();
+        s.Mode = 1;
+        s.AncestorLevel = 1;
+        return s;
+    }
+    public static RelativeBindingSource Ancestor<T>() {
+        return RelativeBindingSource.Ancestor<T>(1);
+    }
+    public static RelativeBindingSource Ancestor<T>(int level) {
+        RelativeBindingSource s = new RelativeBindingSource();
+        s.Mode = 2;
+        s.AncestorLevel = level > 1 ? level : 1;
+        s.AncestorTypeName = typeof(T).Name;
+        s.Matcher = (Control candidate) => candidate is T;
+        return s;
+    }
+    public Control Resolve(Control target) {
+        if (target == null) { return null; }
+        if (ExplicitSource != null) { return ExplicitSource; }
+        if (Mode == 0) { return target; }
+        if (Mode == 1) { return target.Parent(); }
+        int level = AncestorLevel > 1 ? AncestorLevel : 1;
+        int matched = 0;
+        Control cur = target.Parent();
+        while (cur != null) {
+            bool hit = false;
+            if (Matcher != null && Matcher(cur)) { hit = true; }
+            else if (AncestorTypeName != "" && cur.Kind() == AncestorTypeName) { hit = true; }
+            if (hit) {
+                matched = matched + 1;
+                if (matched >= level) { return cur; }
+            }
+            cur = cur.Parent();
+        }
+        return null;
+    }
+}
+class ControlBindingTargetHook {
+    private weak ControlBinding binding;
+    private weak Control target;
+    public ControlBindingTargetHook(ControlBinding b, Control t) {
+        this.binding = b;
+        this.target = t;
+    }
+    public void OnTargetChanged(Control sender) {
+        ControlBinding b = this.binding;
+        Control t = this.target;
+        if (b == null || t == null || b.IsSyncing()) { return; }
+        b.PushToSource(t);
+        App a = t.FindApp();
+        if (a != null) { a.RequestRedraw(); }
+    }
+}
+public class ControlBinding {
+    public string TargetProperty = "";
+    public RelativeBindingSource Source;
+    public string SourcePropertyName = "";
+    public object ConverterParameter;
+    public Func<Control, bool> SourceGetter;
+    public Action<Control, bool> SourceSetter;
+    public Func<bool, string> BoolConvert;
+    public Func<string, bool> BoolConvertBack;
+    public bool TwoWay = false;
+    protected string lastTargetValue = "";
+    protected bool hasSnapshot = false;
+    protected bool syncing = false;
+    protected object lastSource;
+    private weak Control wiredTarget;
+    public bool IsSyncing() { return this.syncing; }
+    public virtual bool IsTwoWay() {
+        return this.TwoWay || this.SourceSetter != null;
+    }
+    protected void EnsureTargetWired(Control target) {
+        if (target == null || !this.IsTwoWay() || this.wiredTarget == target) { return; }
+        this.wiredTarget = target;
+        ControlBindingTargetHook hook = new ControlBindingTargetHook(this, target);
+        target.BindEventS("Change", hook.OnTargetChanged);
+        target.BindEventS("Toggle", hook.OnTargetChanged);
+        target.BindEventS("Select", hook.OnTargetChanged);
+    }
+    protected string ReadTargetValue(Control target) {
+        if (target == null || TargetProperty == "") { return ""; }
+        if (TargetProperty == "ClassName" || TargetProperty == "class") {
+            return target.ClassName;
+        }
+        if (TargetProperty == "Visible" || TargetProperty == "visible") {
+            return PropSpec.Flag(target.Visible);
+        }
+        if (TargetProperty == "Disabled" || TargetProperty == "disabled") {
+            return PropSpec.Flag(target.Disabled.Get());
+        }
+        if (TargetProperty == "IsExpanded" || TargetProperty == "isexpanded" || TargetProperty == "expanded") {
+            return target.GetProp("expanded");
+        }
+        string key = Css.Lower(TargetProperty);
+        return target.GetProp(key);
+    }
+    protected void ApplyTargetValue(Control target, string val) {
+        if (target == null || TargetProperty == "") { return; }
+        bool prevSync = this.syncing;
+        this.syncing = true;
+        try {
+            if (TargetProperty == "ClassName" || TargetProperty == "class") {
+                if (target.ClassName != val) {
+                    target.ClassName = val;
+                    target.computedStyle = null;
+                    target.Invalidate();
+                }
+                return;
+            }
+            if (TargetProperty == "Visible" || TargetProperty == "visible") {
+                bool nextVis = PropSpec.IsOn(val);
+                if (target.Visible != nextVis) {
+                    target.Visible = nextVis;
+                    target.Invalidate();
+                }
+                return;
+            }
+            if (TargetProperty == "Disabled" || TargetProperty == "disabled") {
+                bool nextDis = PropSpec.IsOn(val);
+                if (target.Disabled.Get() != nextDis) {
+                    target.Disabled.Set(nextDis);
+                    target.Invalidate();
+                }
+                return;
+            }
+            if (TargetProperty == "IsExpanded" || TargetProperty == "isexpanded" || TargetProperty == "expanded") {
+                if (target.GetProp("expanded") != val) {
+                    target.SetProp("expanded", val);
+                }
+                return;
+            }
+            string key = Css.Lower(TargetProperty);
+            if (target.GetProp(key) != val) {
+                target.SetProp(key, val);
+            }
+        } finally {
+            this.syncing = prevSync;
+        }
+    }
+    public virtual void PushToSource(Control target) {
+        if (target == null || this.syncing || !this.IsTwoWay()) { return; }
+        string cur = this.ReadTargetValue(target);
+        if (this.hasSnapshot && cur == this.lastTargetValue) { return; }
+        this.lastTargetValue = cur;
+        this.hasSnapshot = true;
+        Control src = Source != null ? Source.Resolve(target) : target;
+        if (src == null) { return; }
+        bool prevSync = this.syncing;
+        this.syncing = true;
+        try {
+            if (SourceSetter != null) {
+                bool b = BoolConvertBack != null ? BoolConvertBack(cur) : PropSpec.IsOn(cur);
+                SourceSetter(src, b);
+            } else if (SourcePropertyName != "") {
+                src.SetProp(Css.Lower(SourcePropertyName), cur);
+            }
+        } finally {
+            this.syncing = prevSync;
+        }
+    }
+    public virtual void Apply(Control target) {
+        if (target == null) { return; }
+        this.EnsureTargetWired(target);
+        if (this.IsTwoWay() && this.hasSnapshot) {
+            string curTarget = this.ReadTargetValue(target);
+            if (curTarget != this.lastTargetValue) {
+                this.PushToSource(target);
+                return;
+            }
+        }
+        Control src = Source != null ? Source.Resolve(target) : target;
+        if (src == null) { return; }
+        if (SourceGetter != null) {
+            bool b = SourceGetter(src);
+            string mapped = BoolConvert != null ? BoolConvert(b) : (b ? "true" : "false");
+            this.ApplyTargetValue(target, mapped);
+            this.lastTargetValue = this.ReadTargetValue(target);
+            this.hasSnapshot = true;
+            return;
+        }
+        if (SourcePropertyName != "") {
+            string raw = src.GetProp(Css.Lower(SourcePropertyName));
+            if (BoolConvert != null) {
+                this.ApplyTargetValue(target, BoolConvert(PropSpec.IsOn(raw)));
+            } else {
+                this.ApplyTargetValue(target, raw);
+            }
+            this.lastTargetValue = this.ReadTargetValue(target);
+            this.hasSnapshot = true;
+        }
+    }
+}
+public class PropertyBinding<TSource> : ControlBinding {
+    public TSource DataSource;
+    public Func<TSource, bool> SourceProperty;
+    public Action<TSource, bool> SetSource;
+    public Func<TSource, string> SourceText;
+    public Action<TSource, string> SetSourceText;
+    public Func<bool, string> Convert;
+    public Func<string, bool> ConvertBack;
+    public override bool IsTwoWay() {
+        return this.TwoWay || this.SetSource != null || this.SetSourceText != null || base.IsTwoWay();
+    }
+    protected TSource ResolveTypedSource(Control target) {
+        if (this.DataSource != null) { return this.DataSource; }
+        if (target != null && this.Source != null) {
+            Control srcCtl = this.Source.Resolve(target);
+            if (srcCtl != null) {
+                if (srcCtl is TSource) { return (TSource)(object)srcCtl; }
+                object dc = srcCtl.ResolveDataContext();
+                if (dc != null && dc is TSource) { return (TSource)dc; }
+            }
+        }
+        if (target != null) {
+            object ctx = target.ResolveDataContext();
+            if (ctx != null && ctx is TSource) { return (TSource)ctx; }
+            Control cur = target;
+            while (cur != null) {
+                if (cur is TSource) { return (TSource)(object)cur; }
+                cur = cur.Parent();
+            }
+        }
+        return null;
+    }
+    public override void PushToSource(Control target) {
+        if (target == null || this.syncing || !this.IsTwoWay()) { return; }
+        string cur = this.ReadTargetValue(target);
+        if (this.hasSnapshot && cur == this.lastTargetValue) { return; }
+        this.lastTargetValue = cur;
+        this.hasSnapshot = true;
+        TSource src = this.ResolveTypedSource(target);
+        if (src == null) {
+            base.PushToSource(target);
+            return;
+        }
+        bool prevSync = this.syncing;
+        this.syncing = true;
+        try {
+            if (this.SetSourceText != null) {
+                this.SetSourceText(src, cur);
+            } else if (this.SetSource != null) {
+                Func<string, bool> back = this.ConvertBack != null ? this.ConvertBack : this.BoolConvertBack;
+                bool b = back != null ? back(cur) : PropSpec.IsOn(cur);
+                this.SetSource(src, b);
+            } else if (this.SourcePropertyName != "" && src is Control) {
+                ((Control)(object)src).SetProp(Css.Lower(this.SourcePropertyName), cur);
+            }
+        } finally {
+            this.syncing = prevSync;
+        }
+    }
+    public override void Apply(Control target) {
+        if (target == null) { return; }
+        this.EnsureTargetWired(target);
+        TSource src = this.ResolveTypedSource(target);
+        if ((object)src != this.lastSource) {
+            this.lastSource = (object)src;
+            this.hasSnapshot = false;
+        }
+        if (this.IsTwoWay() && this.hasSnapshot) {
+            string curTarget = this.ReadTargetValue(target);
+            if (curTarget != this.lastTargetValue) {
+                this.PushToSource(target);
+                return;
+            }
+        }
+        if (src != null) {
+            if (this.SourceText != null) {
+                string txt = this.SourceText(src);
+                this.ApplyTargetValue(target, txt != null ? txt : "");
+                this.lastTargetValue = this.ReadTargetValue(target);
+                this.hasSnapshot = true;
+                return;
+            }
+            if (this.SourceProperty != null) {
+                bool val = this.SourceProperty(src);
+                Func<bool, string> conv = this.Convert != null ? this.Convert : this.BoolConvert;
+                string mapped = conv != null ? conv(val) : (val ? "true" : "false");
+                this.ApplyTargetValue(target, mapped);
+                this.lastTargetValue = this.ReadTargetValue(target);
+                this.hasSnapshot = true;
+                return;
+            }
+        }
+        base.Apply(target);
+    }
+}
+public class PropertyBindingValue<TSource, TValue> : ControlBinding {
+    public TSource DataSource;
+    public Func<TSource, TValue> SourceProperty;
+    public Action<TSource, TValue> SetSource;
+    public Func<TValue, string> Convert;
+    public Func<string, TValue> ConvertBack;
+    public override bool IsTwoWay() {
+        return this.TwoWay || this.SetSource != null || base.IsTwoWay();
+    }
+    protected TSource ResolveTypedSource(Control target) {
+        if (this.DataSource != null) { return this.DataSource; }
+        if (target != null && this.Source != null) {
+            Control srcCtl = this.Source.Resolve(target);
+            if (srcCtl != null) {
+                if (srcCtl is TSource) { return (TSource)(object)srcCtl; }
+                object dc = srcCtl.ResolveDataContext();
+                if (dc != null && dc is TSource) { return (TSource)dc; }
+            }
+        }
+        if (target != null) {
+            object ctx = target.ResolveDataContext();
+            if (ctx != null && ctx is TSource) { return (TSource)ctx; }
+            Control cur = target;
+            while (cur != null) {
+                if (cur is TSource) { return (TSource)(object)cur; }
+                cur = cur.Parent();
+            }
+        }
+        return null;
+    }
+    public override void PushToSource(Control target) {
+        if (target == null || this.syncing || !this.IsTwoWay()) { return; }
+        string cur = this.ReadTargetValue(target);
+        if (this.hasSnapshot && cur == this.lastTargetValue) { return; }
+        this.lastTargetValue = cur;
+        this.hasSnapshot = true;
+        TSource src = this.ResolveTypedSource(target);
+        if (src == null || this.SetSource == null || this.ConvertBack == null) { return; }
+        bool prevSync = this.syncing;
+        this.syncing = true;
+        try {
+            this.SetSource(src, this.ConvertBack(cur));
+        } finally {
+            this.syncing = prevSync;
+        }
+    }
+    public override void Apply(Control target) {
+        if (target == null) { return; }
+        this.EnsureTargetWired(target);
+        TSource src = this.ResolveTypedSource(target);
+        if ((object)src != this.lastSource) {
+            this.lastSource = (object)src;
+            this.hasSnapshot = false;
+        }
+        if (this.IsTwoWay() && this.hasSnapshot) {
+            string curTarget = this.ReadTargetValue(target);
+            if (curTarget != this.lastTargetValue) {
+                this.PushToSource(target);
+                return;
+            }
+        }
+        if (src != null && this.SourceProperty != null && this.Convert != null) {
+            TValue val = this.SourceProperty(src);
+            this.ApplyTargetValue(target, this.Convert(val));
+            this.lastTargetValue = this.ReadTargetValue(target);
+            this.hasSnapshot = true;
+            return;
+        }
+        base.Apply(target);
+    }
+}

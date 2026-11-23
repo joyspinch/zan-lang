@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+namespace Gui;
+public class WindowShapeDescription {
+    public List<WindowShapeRegion> regions;
+    public int shadow;
+    public int offsetX;
+    public int offsetY;
+    public WindowShapeDescription() {
+        this.regions = new List<WindowShapeRegion>();
+        this.shadow = 0;
+        this.offsetX = 0;
+        this.offsetY = 0;
+    }
+    public WindowShapeDescription(List<WindowShapeRegion> regions, int shadow) {
+        this.regions = regions != null ? regions : new List<WindowShapeRegion>();
+        this.shadow = shadow >= 0 ? shadow : 0;
+        this.offsetX = 0;
+        this.offsetY = 0;
+        this.RecalculateOffsets();
+    }
+    public static WindowShapeDescription Empty() { return new WindowShapeDescription(); }
+    public static WindowShapeDescription FromRoundedRect(int width, int height, int radius) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (width > 0 && height > 0) {
+            desc.regions.Add(new WindowShapeRegion(
+                WindowShapeKind.RoundedRect,
+                0,
+                0,
+                width,
+                height,
+                radius > 0 ? radius : 0
+            ));
+        }
+        return desc;
+    }
+    public static WindowShapeDescription FromEllipse(int width, int height) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (width > 0 && height > 0) {
+            desc.regions.Add(new WindowShapeRegion(
+                WindowShapeKind.Ellipse,
+                0,
+                0,
+                width,
+                height,
+                0
+            ));
+        }
+        return desc;
+    }
+    public static WindowShapeDescription ParseSpec(string spec) {
+        WindowShapeDescription desc = new WindowShapeDescription();
+        if (spec == null || spec.Length == 0) { return desc; }
+        List<string> parts = spec.Split(";");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string part = parts[i];
+            if (part.Length == 0) { continue; }
+            List<string> nums = part.Split(",");
+            if (nums.Count >= 6) {
+                int k = Convert.ToInt32(nums[0]);
+                int x = Convert.ToInt32(nums[1]);
+                int y = Convert.ToInt32(nums[2]);
+                int w = Convert.ToInt32(nums[3]);
+                int h = Convert.ToInt32(nums[4]);
+                int r = Convert.ToInt32(nums[5]);
+                desc.regions.Add(new WindowShapeRegion(k, x, y, w, h, r));
+            }
+        }
+        desc.RecalculateOffsets();
+        return desc;
+    }
+    public void AddRegion(int kind, int x, int y, int width, int height, int radius) {
+        if (width <= 0 || height <= 0) { return; }
+        this.regions.Add(new WindowShapeRegion(kind, x, y, width, height, radius));
+        this.RecalculateOffsets();
+    }
+    public bool IsEmpty() { return this.regions.Count == 0; }
+    public bool HasShadowBand() {
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (this.regions[i].kind == WindowShapeKind.ShadowBand) { return true; }
+        }
+        return false;
+    }
+    public int GetEffectiveRadius() {
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            WindowShapeRegion r = this.regions[i];
+            if (r.kind != WindowShapeKind.ShadowBand && r.radius > 0) { return r.radius; }
+        }
+        return 0;
+    }
+    public void RecalculateOffsets() {
+        this.offsetX = 0;
+        this.offsetY = 0;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            WindowShapeRegion r = this.regions[i];
+            if (r.kind == WindowShapeKind.ShadowBand) {
+                this.offsetX = r.radius;
+                this.offsetY = r.radius;
+                this.shadow = r.radius;
+                return;
+            }
+        }
+    }
+    public WindowShapeDescription WithShadow(int px) {
+        if (px <= 0) { return this.Clone(); }
+        if (this.HasShadowBand()) {
+            WindowShapeDescription existing = this.Clone();
+            existing.shadow = px;
+            existing.offsetX = px;
+            existing.offsetY = px;
+            return existing;
+        }
+        int minX = 2147483647;
+        int minY = 2147483647;
+        int maxX = 0 - 2147483647 - 1;
+        int maxY = 0 - 2147483647 - 1;
+        for (int ri = 0; ri < this.regions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = this.regions[ri];
+            if (reg.kind != WindowShapeKind.ShadowBand) {
+                int x = reg.x;
+                int y = reg.y;
+                int x2 = x + reg.width;
+                int y2 = y + reg.height;
+                if (x < minX) { minX = x; }
+                if (y < minY) { minY = y; }
+                if (x2 > maxX) { maxX = x2; }
+                if (y2 > maxY) { maxY = y2; }
+            }
+        }
+        if (minX > maxX || minY > maxY) { return this.Clone(); }
+        WindowShapeDescription res = new WindowShapeDescription();
+        res.shadow = px;
+        res.offsetX = px;
+        res.offsetY = px;
+        int bandW = maxX - minX + px * 2;
+        int bandH = maxY - minY + px * 2;
+        res.regions.Add(new WindowShapeRegion(WindowShapeKind.ShadowBand, 0, 0, bandW, bandH, px));
+        for (int ri = 0; ri < this.regions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = this.regions[ri];
+            if (reg.kind == WindowShapeKind.ShadowBand) { continue; }
+            res.regions.Add(new WindowShapeRegion(
+                reg.kind,
+                reg.x - minX + px,
+                reg.y - minY + px,
+                reg.width,
+                reg.height,
+                reg.radius
+            ));
+        }
+        return res;
+    }
+    public string ToSpec() {
+        if (this.regions.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (i > 0) { sb.Append(";"); }
+            sb.Append(this.regions[i].ToSpecPart());
+        }
+        return sb.ToString();
+    }
+    public WindowShapeDescription Clone() {
+        WindowShapeDescription copy = new WindowShapeDescription();
+        copy.shadow = this.shadow;
+        copy.offsetX = this.offsetX;
+        copy.offsetY = this.offsetY;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            copy.regions.Add(this.regions[i].Clone());
+        }
+        return copy;
+    }
+}

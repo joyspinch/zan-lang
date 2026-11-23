@@ -1,32 +1,56 @@
 using System;
 using Gui;
-
 namespace Gui;
-
-// 效果通过小型 FxOptions 包（见下）配置，使组件能够
-// 以与 ChartOptions 相同的声明式方式暴露“开启了哪些效果”。
 public class Fx {
-
-    // ---- 周期时间基准（整数，无三角函数） --------------------------
-
-    // 在 `periodMs` 内重复 0..1000 的锯齿波（线性斜坡，归零循环）。
-    static int Saw(App app, int periodMs) {
+    static int Ease(int p) {
+        if (p <= 0) { return 0; }
+        if (p >= 1000) { return 1000; }
+        int t2 = p * p / 1000;
+        int t3 = t2 * p / 1000;
+        return 3 * t2 - 2 * t3;
+    }
+    static int WithAlpha(int color, int alpha) {
+        int a = alpha;
+        if (a < 0) { a = 0; }
+        if (a > 255) { a = 255; }
+        return (color & 16777215) | (a << 24);
+    }
+    static int ScaleAlpha(int color, int p) {
+        if (p >= 1000) { return color; }
+        if (p <= 0) { return color & 16777215; }
+        int a = (((color >> 24) & 255) * p) / 1000;
+        return (color & 16777215) | (a << 24);
+    }
+    static int LerpColor(int c0, int c1, int p) {
+        if (c0 == c1) { return c0; }
+        if (p <= 0) { return c0; }
+        if (p >= 1000) { return c1; }
+        int a0 = (c0 >> 24) & 255;
+        int r0 = (c0 >> 16) & 255;
+        int g0 = (c0 >> 8) & 255;
+        int b0 = c0 & 255;
+        int a1 = (c1 >> 24) & 255;
+        int r1 = (c1 >> 16) & 255;
+        int g1 = (c1 >> 8) & 255;
+        int b1 = c1 & 255;
+        int a = a0 + (a1 - a0) * p / 1000;
+        int r = r0 + (r1 - r0) * p / 1000;
+        int g = g0 + (g1 - g0) * p / 1000;
+        int b = b0 + (b1 - b0) * p / 1000;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    static int Saw(RenderHost app, int periodMs) {
         if (periodMs <= 0) { return 0; }
-        int m = app.nowMs % periodMs;
+        int m = app.HostNowMs() % periodMs;
         if (m < 0) { m = m + periodMs; }
         return m * 1000 / periodMs;
     }
-
-    // 在 `periodMs` 内平滑的 0..1000..0 “呼吸”脉冲（缓动三角波）。
-    static int Pulse(App app, int periodMs) {
+    static int Pulse(RenderHost app, int periodMs) {
         int s = Fx.Saw(app, periodMs);
         int tri = s * 2;
         if (tri > 1000) { tri = 2000 - tri; }
-        return App.Ease(tri);
+        return Fx.Ease(tri);
     }
-
-    // 整数平方根（向下取整）。用于计算光标到边框的距离，
-    // 使高光边缘光随真实距离平滑衰减。
     static int Isqrt(int n) {
         if (n <= 0) { return 0; }
         int x = n;
@@ -37,48 +61,32 @@ public class Fx {
         }
         return x;
     }
-
-    // ---- 柔和点光晕（多层圆盘近似径向衰减） ----
-
-    // 以 (cx,cy) 为中心的柔和发光：平滑的径向光晕（原生
-    // FillRadial），从核心的 `maxAlpha`（0..255）衰减到 `r` 处的 0。
     static void PointGlow(Canvas c, int cx, int cy, int r, int color, int maxAlpha) {
         if (r <= 0 || maxAlpha <= 0) { return; }
         c.FillRadial(cx, cy, r, color, maxAlpha);
     }
-
-    // ---- 边框辉光（reactbits “border-glow”）：一道光彗星沿
-    // 圆角矩形移动，留下渐隐的尾迹，叠在一圈微弱的静态边缘光之上。
-
-    // 沿圆角矩形边框移动的光彗星：明亮扫描带经 FillRadial 逐点绘制，
-    // 两侧平滑淡出，底下叠一圈微弱常驻边缘光。按 periodMs 循环，
-    // 自行调度 33ms 动画帧；所有绘制裁剪在边框光点内，不改布局。
-    static void BorderGlow(App app, int x, int y, int w, int h,
+    static void BorderGlow(RenderHost app, int x, int y, int w, int h,
                            int radius, int color, int periodMs, int intensity) {
-        Canvas c = app.canvas;
+        Canvas c = app.HostCanvas();
         int per = 2 * (w + h);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
-        int gr = app.Scale(3);  // 细：约为边框线宽
-        // 整个边框带有微弱的常驻边缘光；一条长而柔和的光带
-        // 环绕扫描，在其中心两侧都平滑淡出，
-        // 呈现出滑动的光，而不是一段实心光条在爬行。
+        int gr = app.HostScale(3);  // 细：约为边框线宽
         int half = per / 2;
         int reach = per * 30 / 100;  // 明亮扫描带的半长
         if (reach < 1) { reach = 1; }
         int rim = intensity * 12 / 100;  // 微弱常驻边缘光
-        int steps = per / app.Scale(4);
+        int steps = per / app.HostScale(4);
         if (steps < 48) { steps = 48; }
         if (steps > 200) { steps = 200; }
         for (int i = 0; i < steps; i = i + 1) {
             int d = i * per / steps;
-            // 距扫描中心的对称周长距离，0..half（减法折叠消除昂贵的双重取模）
             int dd = d - head;
             if (dd < 0) { dd = dd + per; }
             if (dd > half) { dd = per - dd; }
             int a = rim;
             if (dd < reach) {
-                int p = App.Ease((reach - dd) * 1000 / reach);
+                int p = Fx.Ease((reach - dd) * 1000 / reach);
                 a = rim + (intensity - rim) * p / 1000;
             }
             if (a > 0) {
@@ -97,31 +105,22 @@ public class Fx {
         }
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // ---- 盒模型之外的外观签名 -----------------------------
-
-    // 拟物风格的凸起（按压时内凹）阴影对：左上浅阴影
-    // 和右下深阴影，绘制在控件自身填充之后。
-    static void Emboss(App app, int x, int y, int w, int h, int radius,
-                       bool pressed) {
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        int off = app.Scale(4);
-        int lite = App.LerpColor(t.bgPrimary, (int)4294967295, 70);
-        int dark = App.LerpColor(t.bgPrimary, (int)4278190080, 45);
+    static void Emboss(RenderHost app, int x, int y, int w, int h, int radius,
+                       bool pressed, int bgPrimary) {
+        Canvas c = app.HostCanvas();
+        int off = app.HostScale(4);
+        int lite = Fx.LerpColor(bgPrimary, (int)4294967295, 70);
+        int dark = Fx.LerpColor(bgPrimary, (int)4278190080, 45);
         int up = lite;
         int down = dark;
         if (pressed) { up = dark; down = lite; }
         c.FillRoundRect(x - off, y - off, w, h, radius, up);
         c.FillRoundRect(x + off, y + off, w, h, radius, down);
     }
-
-    // 在已绘制的盒子上描出虚线边框（渲染器没有
-    // 虚线图案），供 `dashed` 变体使用。
-    static void DashedBorder(App app, int x, int y, int w, int h, int color) {
-        Canvas c = app.canvas;
-        int dl = app.Scale(6);
-        int step = dl + app.Scale(4);
+    static void DashedBorder(RenderHost app, int x, int y, int w, int h, int color) {
+        Canvas c = app.HostCanvas();
+        int dl = app.HostScale(6);
+        int step = dl + app.HostScale(4);
         if (step < 1) { step = 1; }
         int hx = x;
         while (hx < x + w) {
@@ -140,27 +139,14 @@ public class Fx {
             vy = vy + step;
         }
     }
-
-    // ---- 高光 / 聚光（reactbits “specular-button” 与 magic-bento）：
-    // 控件内跟随光标的柔和高光，其透明度由
-    // 缓动的悬停程度决定，可平滑淡入淡出。裁剪在矩形内。
-
-    // 悬停时跟随光标的边框高光对：悬停等级（App.StyleHoverLevelIn，
-    // 0..1000）经缓动驱动 SpecularBorderHv，靠近光标的弧段与对角
-    // 对称弧随悬停平滑淡入淡出；不自行调度动画帧。
-    static void Specular(App app, int id, int x, int y, int w, int h,
+    static void Specular(RenderHost app, int id, int x, int y, int w, int h,
                          int radius, int color) {
         int hv = app.StyleHoverLevelIn(id, 0, x, y, w, h);
         Fx.SpecularBorderHv(app, x, y, w, h, radius, color, hv);
     }
-
-    // 高光“流动光”（reactbits specular-button）：一个紧凑的亮点
-    // 拖着短小的发光尾迹，持续沿边框滑动，叠在
-    // 微弱的常驻边缘光上。裁剪在矩形内，使其落在边框上
-    // 不会溢出到相邻控件或盖住标签。
-    static void SpecularRun(App app, int x, int y, int w, int h,
+    static void SpecularRun(RenderHost app, int x, int y, int w, int h,
                             int radius, int color, int periodMs) {
-        Canvas c = app.canvas;
+        Canvas c = app.HostCanvas();
         int per = 2 * (w + h);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
@@ -168,8 +154,8 @@ public class Fx {
         int reach = per * 11 / 100;  // 短促紧凑的亮点
         if (reach < 1) { reach = 1; }
         int rim = 20;  // 微弱常驻边缘光
-        int gr = app.Scale(7);
-        int steps = per / app.Scale(5);
+        int gr = app.HostScale(7);
+        int steps = per / app.HostScale(5);
         if (steps < 40) { steps = 40; }
         if (steps > 260) { steps = 260; }
         c.PushClip(x, y, w, h);
@@ -180,7 +166,7 @@ public class Fx {
             if (dd > half) { dd = per - dd; }
             int a = rim;
             if (dd < reach) {
-                int p = App.Ease((reach - dd) * 1000 / reach);
+                int p = Fx.Ease((reach - dd) * 1000 / reach);
                 a = rim + (215 - rim) * p / 1000;
             }
             if (a > 0) {
@@ -197,37 +183,29 @@ public class Fx {
                 c.FillRadial(px, py, gr, color, a);
             }
         }
-        // 前端白热的亮点。
         int hx = x; int hy = y;
         if (head < w) { hx = x + head; hy = y; }
         else if (head < w + h) { hx = x + w; hy = y + (head - w); }
         else if (head < w + h + w) { hx = x + w - (head - w - h); hy = y + h; }
         else { hx = x; hy = y + h - (head - w - h - w); }
-        c.FillRadial(hx, hy, gr * 6 / 10, App.LerpColor(color, (int)4294967295, 700), 235);
+        c.FillRadial(hx, hy, gr * 6 / 10, Fx.LerpColor(color, (int)4294967295, 700), 235);
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 跟随光标的高光（reactbits “specular-button”）：靠近光标的一小段
-    // 边框亮起，同时在对角相对侧出现对称弧段，
-    // 两侧都平滑淡出。`hv`（0..1000）
-    // 在悬停时缓动显现这对弧段。裁剪在矩形内，使光
-    // 落在边框上，不会溢出到相邻控件或标签。
-    static void SpecularBorderHv(App app, int x, int y, int w, int h,
+    static void SpecularBorderHv(RenderHost app, int x, int y, int w, int h,
                                  int radius, int color, int hv) {
         if (hv <= 0) { return; }
-        Canvas c = app.canvas;
-        int mx = app.mouseX; int my = app.mouseY;
+        Canvas c = app.HostCanvas();
+        int mx = app.HostMouseX(); int my = app.HostMouseY();
         int per = 2 * (w + h);
         if (per <= 0) { return; }
         int half = per / 2;
         int reach = per * 15 / 100;  // 弧段半长
         if (reach < 1) { reach = 1; }
-        int gr = app.Scale(5);  // 小而紧凑的点
-        int steps = per / app.Scale(5);
+        int gr = app.HostScale(5);  // 小而紧凑的点
+        int steps = per / app.HostScale(5);
         if (steps < 48) { steps = 48; }
         if (steps > 260) { steps = 260; }
-        // 距离光标最近的周界点位置（1D 坐标短路测试）。
         int md = 0; int best = per * per;
         for (int j = 0; j < steps; j = j + 1) {
             int d = j * per / steps;
@@ -252,14 +230,12 @@ public class Fx {
             int e1 = d - md;
             if (e1 < 0) { e1 = e1 + per; }
             if (e1 > half) { e1 = per - e1; }
-
             int e2 = d - opp;
             if (e2 < 0) { e2 = e2 + per; }
             if (e2 > half) { e2 = per - e2; }
-
             int near = e1; if (e2 < near) { near = e2; }
             if (near < reach) {
-                int p = App.Ease((reach - near) * 1000 / reach);
+                int p = Fx.Ease((reach - near) * 1000 / reach);
                 a = 210 * p / 1000 * hv / 1000;
             }
             if (a > 0) {
@@ -272,18 +248,12 @@ public class Fx {
             }
         }
         c.PopClip();
-        // 仅由光标驱动：不自行调度帧，因此指针静止时
-        // 零重绘。光随指针移动事件更新。
     }
-
-    // 受缓动等级 `hv`（0..1000）控制的跟随光标聚光。作用范围与
-    // 峰值透明度随 hv 缩放；静止时不绘制任何内容。裁剪在矩形内，
-    // 使靠近边缘的光晕不会溢出到相邻控件。
-    static void SpotlightHv(App app, int x, int y, int w, int h,
+    static void SpotlightHv(RenderHost app, int x, int y, int w, int h,
                             int color, int reach, int maxAlpha, int hv) {
         if (hv <= 0) { return; }
-        Canvas c = app.canvas;
-        int mx = app.mouseX; int my = app.mouseY;
+        Canvas c = app.HostCanvas();
+        int mx = app.HostMouseX(); int my = app.HostMouseY();
         if (mx < x) { mx = x; } if (mx > x + w) { mx = x + w; }
         if (my < y) { my = y; } if (my > y + h) { my = y + h; }
         int a = maxAlpha * hv / 1000;
@@ -293,20 +263,14 @@ public class Fx {
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // ---- 卡片动效变体（可选，在裁剪矩形内绘制，因此不会
-    // 改变布局、遮住标题/正文，或溢出到相邻控件） ---
-
-    // 光泽：一条柔和的斜向光带在卡片上循环滑过，
-    // 如同玻璃上的反光。在内容之前绘制。
-    static void CardSheen(App app, int x, int y, int w, int h, int color, int periodMs) {
-        Canvas c = app.canvas;
+    static void CardSheen(RenderHost app, int x, int y, int w, int h, int color, int periodMs) {
+        Canvas c = app.HostCanvas();
         c.PushClip(x, y, w, h);
         int span = w + h + h;  // 行程包含屏幕外的两端
         int pos = Fx.Saw(app, periodMs) * span / 1000 - h;  // 45 度扫描
-        int gr = app.Scale(22);
-        int col = App.LerpColor(color, (int)4294967295, 600);
-        int steps = h / app.Scale(18);
+        int gr = app.HostScale(22);
+        int col = Fx.LerpColor(color, (int)4294967295, 600);
+        int steps = h / app.HostScale(18);
         if (steps < 5) { steps = 5; }
         for (int i = 0; i <= steps; i = i + 1) {
             int yy = y + h * i / steps;
@@ -316,34 +280,28 @@ public class Fx {
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 极光：几个大而柔和的色块在内容后方漂浮并呼吸，
-    // ——平静流动的渐变。透明度极低；在内容之前绘制。
-    static void CardAurora(App app, int x, int y, int w, int h, int color) {
-        Canvas c = app.canvas;
+    static void CardAurora(RenderHost app, int x, int y, int w, int h, int color) {
+        Canvas c = app.HostCanvas();
         c.PushClip(x, y, w, h);
         int r = (w + h) / 6;
         int n = 3;
         for (int i = 0; i < n; i = i + 1) {
             int px = x + w * ((Fx.Saw(app, 11000 + i * 2600) + i * 300) % 1000) / 1000;
             int py = y + h * Fx.Pulse(app, 7000 + i * 1900) / 1000;
-            int col = App.LerpColor(color, (int)4294967295, i * 250);
+            int col = Fx.LerpColor(color, (int)4294967295, i * 250);
             int a = 24 + 22 * Fx.Pulse(app, 5200 + i * 800) / 1000;
             Fx.PointGlow(c, px, py, r, col, a);
         }
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 呼吸边缘光：整个边框的亮度轻柔脉动（不移动），
-    // 如缓慢的吸气/呼气。光只在边框上，裁剪在内部。
-    static void CardBreath(App app, int x, int y, int w, int h, int color, int periodMs) {
-        Canvas c = app.canvas;
+    static void CardBreath(RenderHost app, int x, int y, int w, int h, int color, int periodMs) {
+        Canvas c = app.HostCanvas();
         int per = 2 * (w + h);
         if (per <= 0) { return; }
-        int gr = app.Scale(4);
+        int gr = app.HostScale(4);
         int a = 26 + 96 * Fx.Pulse(app, periodMs) / 1000;
-        int steps = per / app.Scale(5);
+        int steps = per / app.HostScale(5);
         if (steps < 48) { steps = 48; }
         if (steps > 200) { steps = 200; }
         c.PushClip(x, y, w, h);
@@ -359,14 +317,11 @@ public class Fx {
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 上升微尘：细小的柔光点缓慢向上漂移并循环回绕，如同余烬
-    // 或光中的尘埃。裁剪在卡片内部；装饰性背景。
-    static void CardMotes(App app, int x, int y, int w, int h, int color) {
-        Canvas c = app.canvas;
+    static void CardMotes(RenderHost app, int x, int y, int w, int h, int color) {
+        Canvas c = app.HostCanvas();
         c.PushClip(x, y, w, h);
         int n = 7;
-        int gr = app.Scale(4);
+        int gr = app.HostScale(4);
         for (int i = 0; i < n; i = i + 1) {
             int cx = x + w * (i * 1000 / n + 500 / n) / 1000;
             int rise = (Fx.Saw(app, 6000 + i * 1300) + i * 140) % 1000;
@@ -377,61 +332,43 @@ public class Fx {
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 在矩形内渲染 `o` 中启用的所有效果（裁剪在其中），
-    // 使组件可以将可配置动效作为数据提供：表面动效
-    // （极光、光泽、微尘）加上边缘光（呼吸、边框辉光）再加上
-    // 跟随光标聚光。在表面填充之后立即调用，使
-    // 动效位于内容之后。
-    static void Apply(App app, int x, int y, int w, int h, int radius, FxOptions o) {
+    static void Apply(RenderHost app, int x, int y, int w, int h, int radius,
+                      FxOptions o, int defaultColor) {
         if (o == null) { return; }
-        Theme t = app.theme;
         int col = o.glowColor;
-        if (col == 0) { col = t.primary; }
+        if (col == 0) { col = defaultColor; }
         if (o.aurora) { Fx.CardAurora(app, x, y, w, h, col); }
         if (o.sheen) { Fx.CardSheen(app, x, y, w, h, col, o.glowPeriodMs * 2); }
         if (o.motes) { Fx.CardMotes(app, x, y, w, h, col); }
         if (o.breath) { Fx.CardBreath(app, x, y, w, h, col, o.glowPeriodMs); }
-        if (o.borderGlow) {
-            Fx.BorderGlow(app, x, y, w, h, radius, col, o.glowPeriodMs, 220);
-        }
+        if (o.borderGlow) { Fx.BorderGlow(app, x, y, w, h, radius, col, o.glowPeriodMs, 220); }
         if (o.spotlight) {
-            int mx = app.mouseX; int my = app.mouseY;
+            int mx = app.HostMouseX(); int my = app.HostMouseY();
             if (mx >= x && mx < x + w && my >= y && my < y + h) {
                 Fx.SpotlightHv(app, x, y, w, h, col, (w + h) / 4, 46, 1000);
             }
         }
     }
-
-    // ---- 动画外观背景 --------------------------------------
-
-    // 光柱：几根柔和的竖直光柱在区域内缓慢漂移并
-    // 呼吸。以竖直渐变绘制在填充之上。
-    static void BgLightPillar(App app, int x, int y, int w, int h, int color) {
-        Canvas c = app.canvas;
+    static void BgLightPillar(RenderHost app, int x, int y, int w, int h, int color) {
+        Canvas c = app.HostCanvas();
         c.PushClip(x, y, w, h);
         int n = 5;
         for (int i = 0; i < n; i = i + 1) {
-            // 每根光柱以各自的相位/速度漂移，并在透明度上呼吸。
             int ph = Fx.Saw(app, 9000 + i * 1700);
             int cx = x + w * ((ph + i * 1000 / n) % 1000) / 1000;
             int pw = w / 7;
             int breathe = Fx.Pulse(app, 4200 + i * 900);
             int a = 22 + 42 * breathe / 1000;
-            int col = App.WithAlpha(color, a);
-            // 三角柱：通过 3 个条带在边缘渐变为透明。
-            c.FillVGrad(cx - pw / 2, y, pw, h, App.WithAlpha(color, 0), col);
+            int col = Fx.WithAlpha(color, a);
+            c.FillVGrad(cx - pw / 2, y, pw, h, Fx.WithAlpha(color, 0), col);
         }
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
-
-    // 浮动线条：细斜向丝线缓慢向上滚动并循环，
-    // 环绕整个区域——宁静的动画背景。
-    static void BgFloatingLines(App app, int x, int y, int w, int h, int color) {
-        Canvas c = app.canvas;
+    static void BgFloatingLines(RenderHost app, int x, int y, int w, int h, int color) {
+        Canvas c = app.HostCanvas();
         c.PushClip(x, y, w, h);
-        int gap = app.Scale(46);
+        int gap = app.HostScale(46);
         if (gap < 12) { gap = 12; }
         int span = h + w;
         int drift = Fx.Saw(app, 7000) * gap / 1000;
@@ -440,10 +377,9 @@ public class Fx {
             int off = d + drift;
             int breathe = Fx.Pulse(app, 5200);
             int a = 14 + 26 * breathe / 1000;
-            // 从顶边延伸到左边对角（45°）的斜线。
             int x0 = x + off; int y0 = y;
             int x1 = x + off - h; int y1 = y + h;
-            c.DrawLine(x0, y0, x1, y1, App.WithAlpha(color, a), 1);
+            c.DrawLine(x0, y0, x1, y1, Fx.WithAlpha(color, a), 1);
             d = d + gap;
         }
         c.PopClip();

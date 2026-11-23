@@ -2,40 +2,27 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-
 namespace Gui.Widget;
-
-// 为虚拟列表构建第 `index` 行的控件子树；数据由调用方的
-// 闭包持有，行只在进入视口时才会被构建。
 public delegate Control RowAt(int index);
-
-// 保留模式等高虚拟列表。模板行是实际 children；布局维护可见区间，
-// 路由输入直接修改共享滚动状态，绘制只读。行内状态应保存在数据模型中；
-// 滚动时仍可见的行保留实例，离开视口的行释放输入状态并移除。
+[GuiKind("VirtualList")]
 public class VirtualList : Control {
-
+    public override Control CreateCloneShell() { return new VirtualList(); }
     private List<string> items;
     private int selected;
     private int rowH;
     public UiEvent Select;
     public UiEvent Activate;
-    // 模板模式的行构建器；null = 字符串行模式。
     private RowAt rowAt;
     private int rowCount;
-    // 模板行待重建标记；可见区间变化时也会重建。
     private bool rowsStale;
     private int builtFirst;
     private int builtLast;
     private VisibleRowHost rowHost;
     private bool arrangingRows;
-    // 视口矩形缓存，消除每帧 Render 中的堆分配
     private Rect viewportArea;
     private int layoutScrollY;
-
-    // 空列表（字符串行模式，之后 SetItems/SetRows）。
     public VirtualList() {
-        this.InitControl("virtualList", 5);
-
+        this.InitControl("virtualList");
         this.rowHost = new VisibleRowHost(this, this);
         this.items = new List<string>();
         this.selected = 0 - 1;
@@ -49,11 +36,7 @@ public class VirtualList : Control {
         this.builtLast = 0 - 1;
         this.viewportArea = new Rect(0, 0, 0, 0);
     }
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "VirtualList"; }
-
-    // 覆写：返回设计器属性清单（rowHeight）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         PropSpec rh = PropSpec.Int("rowHeight", "Row height");
@@ -63,19 +46,15 @@ public class VirtualList : Control {
         ps.Add(rh);
         return ps;
     }
-
-    // 覆写：默认 240x160 的逻辑尺寸（实际占宿主给的矩形）。
     public override void OnMeasure(App app) {
         prefW = app.Scale(240);
         prefH = app.Scale(160);
     }
-
     public override StyleBox ResolveStyle(App app, int state) {
         StyleBox box = base.ResolveStyle(app, state);
         if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
         return box;
     }
-
     public override void Arrange(int x, int y, int w, int h) {
         bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
         if (arrangingRows) { return; }
@@ -109,39 +88,28 @@ public class VirtualList : Control {
         }
         } finally { arrangingRows = false; }
     }
-
-    // Input may arrive several times before the next paint/layout pass.
     protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         this.Arrange(bx, by, bw, bh);
         return base.HitTestCore(x, y, pointerType, excludedSubtrees);
     }
-
     public override void OnWheel(RoutedEventArgs e) {
         this.ScrollWheel(e);
         if (layoutScrollY != scrollY) { this.Arrange(bx, by, bw, bh); }
     }
-
     public override void CollectInputFocus(App app, List<Control> controls) {
         if (layoutScrollY != scrollY) { this.Arrange(bx, by, bw, bh); }
         base.CollectInputFocus(app, controls);
     }
-
     public override Control FindInputFocus(App app) {
         if (layoutScrollY != scrollY) { this.Arrange(bx, by, bw, bh); }
         return base.FindInputFocus(app);
     }
-
-    // 绘制不重建模板、不布局子树，也不消费输入。
     public override void OnPaint(App app) { /* retained children paint in RenderTree */ }
-
     private void ReleaseRows(App app) {
         rowsStale = true;
         rowHost.Reset();
     }
-
-    // 整体替换字符串行数据（模板模式之外的最简用法）；
-    // 行数变化后选中行号自动夹回范围内。
     public void SetItems(List<string> rows) {
         items = rows != null ? rows : new List<string>();
         rowAt = null;
@@ -149,14 +117,7 @@ public class VirtualList : Control {
         if (selected >= items.Count) { selected = items.Count - 1; }
         this.ReleaseRows(this.App);
     }
-
-    // 追加一行字符串数据。
-    public void Add(string row) {
-        items.Add(row);
-    }
-
-    // UI-thread data update. Replacing a builder/count immediately retires
-    // old editors so queued input cannot continue into detached data.
+    public void Add(string row) { items.Add(row); }
     public void SetRows(int count, RowAt build) {
         if (count < 0) { count = 0; }
         if (build != rowAt || count != rowCount) {
@@ -167,56 +128,37 @@ public class VirtualList : Control {
             this.ReleaseRows(this.App);
         }
     }
-
-    // UI-thread refresh; obsolete editors lose focus/capture immediately.
     public void Refresh() {
         this.ReleaseRows(this.App);
         rowsStale = true;
     }
-
-    // 固定行高（逻辑 px）；0 = 用主题的 heightLarge。
-    public void SetRowHeight(int h) {
-        rowH = h;
-    }
-
-    // 当前行数：模板模式返回 SetRows 给的 count，
-    // 字符串模式返回 items 数。
+    public void SetRowHeight(int h) { rowH = h; }
     public int Count() {
         if (rowAt != null) { return rowCount; }
         return items.Count;
     }
-
-    // 当前选中行号（无选中为 -1）。
-    public int Selected() {
-        return selected;
-    }
-
-    // 选中行的文本；模板模式无文本概念，恒返回 ""。
+    public int Selected() { return selected; }
     public string SelectedText() {
         if (rowAt != null) { return ""; }
         if (selected < 0 || selected >= items.Count) { return ""; }
         return items[selected];
     }
-
     public override List<string> Events() {
         List<string> events = base.Events();
         events.Add("Select");
         events.Add("Activate");
         return events;
     }
-
     public override void BindEvent(string evt, Action handler) {
         if (evt == "Select") { Select.Add(handler); return; }
         if (evt == "Activate") { Activate.Add(handler); return; }
         base.BindEvent(evt, handler);
     }
-
     public override void BindEventS(string evt, ControlEvent handler) {
         if (evt == "Select") { Select.AddS(handler); return; }
         if (evt == "Activate") { Activate.AddS(handler); return; }
         base.BindEventS(evt, handler);
     }
-
     internal void SelectStringRow(Control row, int index) {
         if (rowAt != null || index < 0 || index >= items.Count || rowHost.Row(index) != row) { return; }
         App app = this.FindApp();
@@ -231,7 +173,6 @@ public class VirtualList : Control {
                 || app.inputRootGeneration != generation || this.FindApp() != app))) { return; }
         Activate.RaiseS(this);
     }
-
     private void SyncStringRows() {
         if (rowAt != null) { return; }
         for (int i = builtFirst; i < builtLast; i = i + 1) {
@@ -244,24 +185,18 @@ public class VirtualList : Control {
             }
         }
     }
-
-    // 实际使用的行高：显式 SetRowHeight 优先，否则主题值。
     public int ResolveRowH() { return this.ResolveRowH(this.App); }
     public int ResolveRowH(App app) {
         app = this.ResolveApp(app);
         if (rowH > 0) { return app != null ? app.Scale(rowH) : rowH; }
         return app != null ? app.theme.heightLarge : 32;
     }
-
-    // Keep the overlap alive: scrolling one row must not destroy an editor
-    // still visible on screen, or steal its focus/capture.
     private Control CreateRow(int index) {
         RowAt build = rowAt;
         if (build == null) { return new VirtualListStringRow(this, index, items[index]); }
         Control row = build(index);
         return row != null ? row : Panel.Root("vrow");
     }
-
     private bool BuildVisible(App app, int first, int last) {
         if (!rowsStale && first == builtFirst && last == builtLast
             && this.ChildCount() == rowHost.Count()) {

@@ -1,0 +1,157 @@
+using System;
+using System.IO;
+using System.Json;
+using Gui.Markup;
+namespace Gui;
+public partial class Form {
+    private AppModelHost docBinder;
+    public Control docRoot;
+    public void Show() {
+        this.assembleDoc(false, Html.ParseComponent);
+        this.Run();
+    }
+    public void ShowWith(ControlFactoryFn factory) {
+        this.assembleDoc(false, (string html) => Html.ParseWith(html, "", null, factory));
+        this.Run();
+    }
+    public void ShowWith(ControlFactoryFn factory, Action<ModelBinder> register) {
+        if (register == null) { throw new ArgumentNullException("register"); }
+        string name = this.GetType().Name;
+        string html = Form.FindDoc(name);
+        if (html == null) { throw new FileNotFoundException("Window document not found: " + name); }
+        this.assembleDoc(false, Html.ParseWith(html, "", null, factory), register);
+        this.RunWiredDocument();
+    }
+    public void ShowWith(string document, ControlFactoryFn factory, Action<ModelBinder> register) {
+        this.assembleEmbeddedDoc(false, document, factory, register);
+        this.RunWiredDocument();
+    }
+    private void RunWiredDocument() {
+        bool wasWired = this.docWired;
+        this.docWired = true;
+        try {
+            this.Run();
+        } finally {
+            this.docWired = wasWired;
+        }
+    }
+    public void ShowOffscreen() { this.assembleDoc(true, Html.ParseComponent); }
+    public void ShowOffscreenWith(ControlFactoryFn factory) {
+        this.assembleDoc(true, (string html) => Html.ParseWith(html, "", null, factory));
+    }
+    public void ShowOffscreenWith(string document, ControlFactoryFn factory, Action<ModelBinder> register) {
+        this.assembleEmbeddedDoc(true, document, factory, register);
+    }
+    public Form owner;
+    public void ShowDialog() { this.ShowDialogDocument(Html.ParseComponent); }
+    public void ShowDialogWith(ControlFactoryFn factory) {
+        this.ShowDialogDocument((string html) => Html.ParseWith(html, "", null, factory));
+    }
+    public void ShowDialogWith(string document, ControlFactoryFn factory, Action<ModelBinder> register) {
+        this.assembleEmbeddedDoc(false, document, factory, register);
+        this.RunWiredDocument();
+        this.RefreshDialogOwner();
+    }
+    private void ShowDialogDocument(WindowDocumentLoader load) {
+        this.assembleDoc(false, load);
+        this.Run();
+        this.RefreshDialogOwner();
+    }
+    private void RefreshDialogOwner() {
+        Form host = this.owner;
+        if (host != null && host.app != null) {
+            host.app.RequestRedraw();
+            host.app.Wake();
+        }
+    }
+    protected virtual object ViewModel() { return null; }
+    void assembleDoc(bool offscreen, WindowDocumentLoader load) {
+        string html = Form.FindDoc(this.GetType().Name);
+        HtmlDoc doc = html != null ? load(html) : null;
+        this.assembleDoc(offscreen, doc, null);
+    }
+    private void assembleEmbeddedDoc(bool offscreen, string document, ControlFactoryFn factory,
+                                     Action<ModelBinder> register) {
+        if (register == null) { throw new ArgumentNullException("register"); }
+        this.assembleDoc(offscreen, Html.ParseEmbedded(document, factory), register);
+    }
+    private void assembleDoc(bool offscreen, HtmlDoc doc, Action<ModelBinder> register) {
+        ModelBinder binder = new ModelBinder();
+        if (register != null) {
+            register(binder);
+            DocWire.CheckHandlers(doc.root, binder, this.GetType().Name);
+        }
+        Control tree = this.MountDocument(offscreen, doc);
+        App app = this.GetApp();
+        this.docBinder = binder;
+        app.RegisterModelHost(binder);
+        if (register != null || this.AutoWireDoc(binder)) {
+            object boundModel = this.ViewModel();
+            if (boundModel == null) { boundModel = this; }
+            binder.SetRoot(tree, boundModel);
+            if (register != null && !(boundModel is JsonValue) && !(boundModel is JsonDoc)) {
+                DocWire.CheckBinds(tree, boundModel, this.GetType().Name);
+            }
+            binder.Wire();
+        }
+        if (register == null) { this.CheckBindsDoc(tree); }
+        if (this.HasMethod("OnLoad")) { this.Invoke("OnLoad", this); }
+    }
+    private Control MountDocument(bool offscreen, HtmlDoc doc) {
+        if (this.docBinder != null) {
+            App previousApp = this.docBinder.HostApp();
+            if (previousApp != null) { previousApp.UnregisterModelHost(this.docBinder); }
+            this.docBinder = null;
+        }
+        if (this.docRoot != null) {
+            this.Remove(this.docRoot);
+            this.docRoot = null;
+        }
+        Html.InstallDocument();
+        string title = this.GetType().Name;
+        int winW = 480;
+        int winH = 520;
+        Control tree = doc != null ? doc.root : null;
+        if (tree != null) {
+            string t = Form.WinKey(tree, "data-win-title");
+            if (t != "") { title = t; }
+            string w = Form.WinKey(tree, "data-win-w");
+            if (w != "") { winW = Convert.ToInt32(w); }
+            string h = Form.WinKey(tree, "data-win-h");
+            if (h != "") { winH = Convert.ToInt32(h); }
+        }
+        this.InitForm(title, winW, winH, offscreen);
+        App app = this.GetApp();
+        if (tree != null) {
+            string center = Form.WinKey(tree, "data-win-center");
+            if (center == "true" || center == "1") { app.CenterWindow(); }
+            string chrome = Form.WinKey(tree, "data-win-chrome");
+            if (chrome == "false" || chrome == "0") { app.SetChromeVisible(false); }
+            string round = Form.WinKey(tree, "data-win-round");
+            if (round == "true" || round == "1") {
+                app.SetWindowShape(WindowShapeDescription.FromEllipse(winW, winH));
+            }
+            if (doc.css != "") {
+                string zs = app.NextLoadScope();
+                app.ApplyScopedTree(tree, HtmlScope.Styles(doc.css, zs), zs);
+            }
+            if (tree is Element) { ((Element)tree).Grow(); }
+        } else {
+            tree = new Panel();
+        }
+        this.Add(tree);
+        this.docRoot = tree;
+        return tree;
+    }
+    static string WinKey(Control tree, string key) {
+        string v = tree.CssAttr(key);
+        if (v != "") { return v; }
+        for (int i = 0; i < tree.ChildCount(); i = i + 1) {
+            v = tree.ChildAt(i).CssAttr(key);
+            if (v != "") { return v; }
+        }
+        return "";
+    }
+    bool AutoWireDoc(ModelBinder binder) { return DocWire.AutoWire(this, this, binder); }
+    void CheckBindsDoc(Control tree) { DocWire.CheckBinds(tree, this, this.GetType().Name); }
+}

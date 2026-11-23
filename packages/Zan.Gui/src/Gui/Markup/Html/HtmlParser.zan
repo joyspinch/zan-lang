@@ -2,29 +2,18 @@ using System;
 using System.IO;
 using System.Json;
 using System.Text;
-
 namespace Gui.Markup;
-
 public class HtmlParser {
-    // head 的 data-* 属性暂存（head 是透明容器；P7 设计器文档把
-    // 文档级元数据放 body 属性，head 侧只透传 data- 键）。
     private JsonValue pendingHeadAttr;
-    // 解析游标是否在 <head> 区内（head 透明，子元素按 head 语义
-    // 处理：不建节点、不触发隐式 body；</head> 之后当正文）。
     private bool inHead;
-
     public HtmlParser() {
         this.pendingHeadAttr = JsonValue.NewObject();
         this.inHead = false;
     }
-
-    // 解析 `html`（整文档或片段）为声明记录。`baseDir` 是 `<link>`
-    // 相对路径的基目录（空 = 不解析 link）。
     public static WDoc Parse(string html, string baseDir) {
         HtmlParser parser = new HtmlParser();
         return parser.ParseDoc(html, baseDir);
     }
-
     public WDoc ParseDoc(string html, string baseDir) {
         WDoc doc = new WDoc();
         doc.css = "";
@@ -37,20 +26,17 @@ public class HtmlParser {
         int i = 0;
         while (i < n) {
             if (html[i] == 60) {  // '<'
-                // 注释 <!-- -->
                 if (i + 3 < n && html[i + 1] == 33 && html[i + 2] == 45
                     && html[i + 3] == 45) {
                     int end = HtmlText.FindFrom(html, "-->", i + 4);
                     i = end < 0 ? n : end + 3;
                     continue;
                 }
-                // <!doctype ...>
                 if (i + 1 < n && html[i + 1] == 33) {
                     int gt = HtmlText.FindFrom(html, ">", i);
                     i = gt < 0 ? n : gt + 1;
                     continue;
                 }
-                // </close>
                 if (i + 1 < n && html[i + 1] == 47) {
                     int j = i + 2;
                     int ns = j;
@@ -61,7 +47,6 @@ public class HtmlParser {
                     HtmlParser.CloseTag(st, doc, name);
                     continue;
                 }
-                // 开标签
                 if (i + 1 < n && HtmlText.IsAlpha(html[i + 1])) {
                     List<string> an = new List<string>();
                     List<string> av = new List<string>();
@@ -72,7 +57,6 @@ public class HtmlParser {
                     continue;
                 }
             }
-            // 原文模式（style/script/title）：读到对应闭标签为止
             if (st.Count > 0) {
                 WFrame top = st[st.Count - 1];
                 if (top.mode == 2 || top.mode == 3) {
@@ -85,7 +69,6 @@ public class HtmlParser {
                     if (i < n) { continue; }
                 }
             }
-            // 文本 run
             int lt = i;
             while (lt < n && html[lt] != 60) { lt = lt + 1; }
             if (lt > i) {
@@ -95,7 +78,6 @@ public class HtmlParser {
                 i = i + 1;  // 游离 '<'：按文本丢弃，防死循环
             }
         }
-        // 未显式闭合的帧全部收口
         while (st.Count > 0) { HtmlParser.CloseTop(st, doc); }
         if (doc.nodes.Count == 0) {
             HtmlParser.PushNode(doc, "body", 0 - 1,
@@ -103,8 +85,6 @@ public class HtmlParser {
         }
         return doc;
     }
-
-    // 扫开标签：名字 + 属性表 + 自闭合标记，返回游标。
     public static WOpenResult OpenTag(string html, int i,
                                       List<string> an, List<string> av) {
         WOpenResult r = new WOpenResult();
@@ -162,9 +142,6 @@ public class HtmlParser {
         r.next = j;
         return r;
     }
-
-    // ---- 建记录 ----------------------------------------------------------
-
     private void HandleOpen(List<WFrame> st, WDoc doc, string name,
                             List<string> an, List<string> av, bool selfClose,
                             string baseDir) {
@@ -176,8 +153,6 @@ public class HtmlParser {
         }
         if (name == "html") { return; }  // 透明容器
         if (name == "head") {
-            // head 透明，但它的属性要保真（设计器文档的
-            // <title> 等经 head 属性透传——title 元素本身丢弃）。
             for (int hi = 0; hi < an.Count; hi = hi + 1) {
                 if (HtmlText.StartsWith(an[hi], "data-")) {
                     this.pendingHeadAttr.Put(an[hi], JsonValue.NewStr(av[hi]));
@@ -186,8 +161,6 @@ public class HtmlParser {
             this.inHead = true;
             return;
         }
-        // body——否则整文档的真 body 到来时已被占位当"迟到"丢弃。
-        // head 之后的第一个正文级标签恢复正常语义。
         if (this.inHead) {
             if (name == "meta" || name == "base") {
                 WNode hn = new WNode();
@@ -258,16 +231,12 @@ public class HtmlParser {
             return;
         }
         if (doc.nodes.Count == 0) {
-            // 片段：包一层隐式 body
             HtmlParser.PushNode(doc, "body", 0 - 1,
                           new List<string>(), new List<string>());
             st.Add(HtmlParser.Frame(doc, doc.nodes.Count - 1, "body", 0));
         }
         WFrame parent = st[st.Count - 1];
         bool isInl = HtmlText.IsInlineTag(name);
-
-        // 原文/捕获/void 的特殊 tag。凡进父容器的节点：先 Flush 父的
-        // pending 文本再记子节点——文档序不能颠倒。
         if (name == "style") {
             HtmlParser.Flush(doc, parent, false);
             parent.prevInline = false;
@@ -294,8 +263,6 @@ public class HtmlParser {
             return;
         }
         if (name == "meta" || name == "base") { return; }
-
-        // 捕获控件（关闭时才回填 label）
         if (name == "button" || name == "textarea" || name == "label") {
             HtmlParser.Flush(doc, parent, true);
             parent.prevInline = true;
@@ -315,8 +282,6 @@ public class HtmlParser {
             parent.prevInline = name == "br";
             return;
         }
-
-        // 容器（select 等未映射 tag 也落这里占位）
         HtmlParser.Flush(doc, parent, isInl);
         int crec = HtmlParser.PushNode(doc, name, parent.rec, an, av);
         if (!selfClose && !HtmlText.IsVoidTag(name)) {
@@ -325,7 +290,6 @@ public class HtmlParser {
             parent.prevInline = isInl;
         }
     }
-
     public static WFrame Frame(WDoc doc, int rec, string tag, int mode) {
         WFrame f = new WFrame();
         f.rec = rec;
@@ -336,7 +300,6 @@ public class HtmlParser {
         f.label = "";
         return f;
     }
-
     public static int PushNode(WDoc doc, string tag, int parent,
                                List<string> an, List<string> av) {
         WNode n = new WNode();
@@ -352,9 +315,6 @@ public class HtmlParser {
         }
         doc.nodes.Add(n);
         if (parent >= 0) {
-            // 子链接也进父的 items（文档序内容表）：每条进父路径都
-            // 先 Flush 了 pending 文本再 PushNode，文本片与子节点的
-            // 交错顺序在这里定格，混排行盒靠它保真。
             WItem it = new WItem();
             it.kid = doc.nodes.Count - 1;
             it.text = "";
@@ -362,21 +322,16 @@ public class HtmlParser {
         }
         return doc.nodes.Count - 1;
     }
-
     public static void CloseTag(List<WFrame> st, WDoc doc, string name) {
         int at = 0 - 1;
         for (int k = st.Count - 1; k >= 0; k = k - 1) {
             if (st[k].tag == name) { at = k; break; }
         }
         if (at < 0) { return; }  // 游离闭标签忽略
-        // 隐式闭合中间帧（未写 </li> 之类）
         while (st.Count - 1 > at) { HtmlParser.CloseTop(st, doc); }
         HtmlParser.CloseTop(st, doc);
-        if (st.Count > 0) {
-            st[st.Count - 1].prevInline = HtmlText.IsInlineTag(name);
-        }
+        if (st.Count > 0) { st[st.Count - 1].prevInline = HtmlText.IsInlineTag(name); }
     }
-
     public static void CloseTop(List<WFrame> st, WDoc doc) {
         WFrame f = st[st.Count - 1];
         st.RemoveAt(st.Count - 1);
@@ -402,7 +357,6 @@ public class HtmlParser {
         }
         HtmlParser.Flush(doc, f, HtmlText.IsInlineTag(f.tag));
     }
-
     public static void FeedText(List<WFrame> st, string raw) {
         if (st.Count == 0) { return; }
         WFrame top = st[st.Count - 1];
@@ -413,15 +367,9 @@ public class HtmlParser {
         if (top.mode != 0) { return; }
         string s = HtmlText.CollapseSpace(HtmlText.DecodeEntities(raw));
         if (s == "") { return; }
-        // 行内级前驱才配保留 run 的前导空格（块边界空白丢弃）
-        if (top.pending == "" && !top.prevInline && s[0] == 32) {
-            s = HtmlText.TrimLead(s);
-        }
+        if (top.pending == "" && !top.prevInline && s[0] == 32) { s = HtmlText.TrimLead(s); }
         top.pending = top.pending + s;
     }
-
-    // 结算 pending 文本。`nextInline`：紧随其后的节点是否行内级——
-    // 尾随空格只在后面还是行内内容时保留（HTML 空白语义）。
     public static void Flush(WDoc doc, WFrame f, bool nextInline) {
         string s = f.pending;
         f.pending = "";
@@ -430,7 +378,6 @@ public class HtmlParser {
         if (!nextInline) { s = HtmlText.TrimTrail(s); }
         if (s == "") { return; }  // 纯空白且块边界：整体丢
         if (s == " ") {
-            // 单空格只在两个行内级兄弟之间才有意义
             if (wasPrev && nextInline && f.rec >= 0) {
                 WItem it = new WItem();
                 it.kid = 0 - 1;

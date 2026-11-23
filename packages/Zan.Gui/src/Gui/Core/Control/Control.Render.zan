@@ -2,28 +2,25 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-
 namespace Gui;
-
-// Control.Render.zan - 控件树绘制管线、渲染调度、视口裁剪与滚动条绘制
 public partial class Control {
-    // Composite controls that paint their retained childNodes inside content clips
-    // keep normal tree ownership/input, while suppressing a second paint traversal.
     public virtual bool ChildControlsRenderedByOwner() { return false; }
-
-    protected void PaintContentMask(App host, int color) {
-        host.PaintContentMask(bx, by, bw, bh, color);
+    protected virtual bool PaintWithinBounds() { return false; }
+    private bool SkipBoundedPaint(App host) {
+        if (!host.SkipFormPaintBounds(bx, by, bw, bh) || childNodes.Count != 0
+            || Tip != "" || this.StyleOverflowX() > 1 || this.StyleOverflowY() > 1 || surfaceFrom != null
+            || host.paintOffsetX != 0 || host.paintOffsetY != 0 || host.canvas.opacityPm != 1000
+            || (extra != null && ((extra.Paint != null && extra.Paint.CountAll() > 0)
+                || extra.surfaceTransitionKey != 0)) || !this.PaintWithinBounds()) { return false; }
+        StyleBox style = computedStyle;
+        return style != null && this.SurfaceState(host) == computedStyleState
+            && style.shadow == 0 && style.blur == 0 && style.tx == 0 && style.ty == 0
+            && style.scale <= 1000 && style.anim == 0;
     }
-
-    // 在 `area` 内布局并绘制此子树：宿主只需这一句
-    // 即可把矩形交给保留组件（测量、停靠、绘制）。
+    protected void PaintContentMask(App host, int color) { host.PaintContentMask(bx, by, bw, bh, color); }
     void RenderInside(App app, Rect area) {
         if (area == null || area.width <= 0 || area.height <= 0 || area.x <= -1000 || area.y <= -1000) { return; }
         this.MeasureTree(app, area.width);
-        // 视口模型（P1）：Chrome 里塌陷链逃出 body 后成为 html 的
-        // 外边距，把内容从视口顶部推下来。窗口渲染入口等价于
-        // html/视口，根的塌陷链在这里落地为内容偏移（legacy/
-        // flex 根与 BFC 根 escT= 0，不受影响）。
         int escT = 0;
         StyleBox sbR = computedStyle;
         if (sbR != null && sbR.display == 3 && !this.FlowSepT()) {
@@ -34,27 +31,18 @@ public partial class Control {
         this.Arrange(area.x, area.y + escT, area.width, area.height - escT);
         this.RenderTree(app);
     }
-
-    // 渲染子树：先自身，再裁剪到本节点矩形内的子节点，
-    // 子节点不能画到父节点之外（原生裁剪栈）。命名为
-    // RenderTree（而非 Paint），因为一些控件已声明了静态
-    // Paint，而编译器仅按名称解析方法调用。
     void RenderTree(App app) {
-        // Owner-painted composites may call another child after a callback retired the frame.
-        // Fence before InheritApp can transfer that child back to the obsolete host.
         if (!app.ContinuePreparedFrame()) { return; }
-        // 本节点渲染期间它是 CSS 组合器/结构性伪类的匹配上下文
-        // （app.styleCtx，Style.Full 读取）；退出时恢复，异常也不泄漏。
         Control prevCtx = app.styleCtx;
         app.styleCtx = this;
         try {
+            if (this.app == app && this.SkipBoundedPaint(app)) { return; }
             this.RenderTreeInner(app);
         } finally {
             paintedStyle = null;
             app.styleCtx = prevCtx;
         }
     }
-
     private bool PaintNodeCurrent(App host, Control ownerParent, int revision, Control root,
     int generation, long sequence, int phase, int frame) {
         return host.ContinuePreparedFrame() && host.isRunning
@@ -62,88 +50,102 @@ public partial class Control {
         && this.LayoutNodeCurrent(host, ownerParent, revision) && this.StyleVisible()
         && (ownerParent == null || ownerParent.OwnsLayoutChild(this));
     }
-
     void RenderTreeInner(App app) {
         if (app != null && this.app != app) { this.InheritApp(app); }
-        if (!this.ComputedStyleCurrent(app)) {
-            this.ResolveStyle(app, Style.SNormal());
-        }
+        if (!this.ComputedStyleCurrent(app)) { this.ResolveStyle(app, Style.SNormal()); }
         if (!this.StyleVisible()) { return; }
-        Control ownerParent = parent;
-        int revision = this.LayoutRevision();
-        Control root = app.rootControl;
-        int generation = app.inputRootGeneration;
-        long sequence = app.window.EventSeq();
-        int phase = app.inputPreparationTicket;
-        int frame = app.frameSeq;
-        // 卡顿归因：分析器开着时取本节点自己那段绘制（不含子树）
-        // 的耗时，由 App 留住本帧最贵的那一个。整帧只有几毫秒而
-        // 尖尖那一帧到二十多毫秒时，需要知道是哪个控件在花钱。
-        int selfT0 = 0;
-        bool selfProf = App.PerfOn();
-        if (selfProf) { selfT0 = Window.GetTickUs(); }
-        // 自段哈希（）：置换累加器、计本节点自己的命令流，
-        // OnPaint 出口比对——与上面卡顿归因同一段（不含子树，
-        // 子树在下方递归里自成一段自算自比）。
-        PaintHashToken hashSeg = app.PaintHashBeginScope();
+        int origX = bx;
+        int origY = by;
+        int prevOffX = app.paintOffsetX;
+        int prevOffY = app.paintOffsetY;
+        int prevOpacity = app.canvas.opacityPm;
+        bool prevCompositing = treeCompositing;
+        treeCompositing = true;
+        StyleBox surface = this.ResolvePaintedSurface(app);
+        int localDx = surface != null ? surface.tx : 0;
+        int localDy = surface != null ? surface.ty + surface.FloatOffset(app, origX + prevOffX, origY + prevOffY, bw, bh) : 0;
+        int offX = prevOffX + localDx;
+        int offY = prevOffY + localDy;
+        int localOpacity = surface != null ? surface.opacity : 1000;
+        int effOpacity = localOpacity >= 1000 ? prevOpacity : (prevOpacity * localOpacity) / 1000;
+        app.paintOffsetX = offX;
+        app.paintOffsetY = offY;
+        app.canvas.opacityPm = effOpacity;
+        bx = origX + offX;
+        by = origY + offY;
         try {
-            PaintStyleBox(app);
-            OnPaint(app);
-            if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
-            app.PaintHashEndSelf(hashSeg, this.CommonId(), bx, by, bw, bh);
-        } finally {
-            App.PaintHashRestore(hashSeg);
-        }
-        if (selfProf) {
-            app.PerfNode(this.Kind(), name, Window.GetTickUs() - selfT0);
-        }
-        if (Tip != "" && (app.StyleHoverLevelIn(this.CommonId(), 0, bx, by, bw, bh) >= 900
-        || app.HoldTip(this))) {
-            int place = Widget.Tooltip.Bottom();
-            if (TipSide == "top") { place = Widget.Tooltip.Top(); }
-            else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
-            else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
-            Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
-        }
-        if (this.extra != null && this.extra.Paint != null && this.extra.Paint.CountAll() > 0) {
-            this.extra.Paint.RaiseS(this);
-            if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
-        }
-        bool scrollC = this.IsScrollContainer();
-        if (childNodes.Count > 0 && !this.ChildControlsRenderedByOwner()) {
-            // overflow：引擎缺省裁剪（子节点不画出界）；显式
-            // `overflow: visible` 放行溢出内容。hidden/scroll/auto
-            // 与缺省同义地裁剪；滚动容器额外在 padding box 裁剪
-            // （CSS：滚动内容被 border 内侧矩形收口）。
-            bool clipKids = computedStyle == null
-            || computedStyle.overflow != 0;
-            int clipX = bx;
-            int clipY = by;
-            int clipW = bw;
-            int clipH = bh;
-            if (scrollC && computedStyle != null) {
-                clipX = bx + computedStyle.BorderLeftPx();
-                clipY = by + computedStyle.BorderTopPx();
-                clipW = bw - computedStyle.BorderLeftPx()
-                - computedStyle.BorderRightPx();
-                clipH = bh - computedStyle.BorderTopPx()
-                - computedStyle.BorderBottomPx();
-            }
-            if (clipKids) {
-                app.canvas.PushClip(clipX, clipY, clipW, clipH);
-            }
+            if (effOpacity <= 0) { return; }
+            Control ownerParent = parent;
+            int revision = this.LayoutRevision();
+            Control root = app.rootControl;
+            int generation = app.inputRootGeneration;
+            long sequence = app.window.EventSeq();
+            int phase = app.inputPreparationTicket;
+            int frame = app.frameSeq;
+            int selfT0 = 0;
+            bool selfProf = App.PerfOn();
+            if (selfProf) { selfT0 = Window.GetTickUs(); }
+            PaintHashToken hashSeg = app.PaintHashBeginScope();
             try {
-                // Same stable z-index plan as HitTest; CSS order is layout only.
-                List<Control> ordered = this.PaintChildren();
-                for (int i = 0; i < ordered.Count; i = i + 1) {
-                    Control child = ordered[i];
-                    if (!this.OwnsLayoutChild(child) || !this.ChildInViewport(child)) { continue; }
-                    child.RenderTree(app);
-                    if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                PaintStyleBox(app);
+                OnPaint(app);
+                if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                app.PaintHashEndSelf(hashSeg, this.CommonId(), bx, by, bw, bh);
+            } finally {
+                App.PaintHashRestore(hashSeg);
+            }
+            if (selfProf) { app.PerfNode(this.Kind(), name, Window.GetTickUs() - selfT0); }
+            if (Tip != "" && (app.StyleHoverLevelIn(this.CommonId(), 0, bx, by, bw, bh) >= 900
+            || app.HoldTip(this))) {
+                int place = Widget.Tooltip.Bottom();
+                if (TipSide == "top") { place = Widget.Tooltip.Top(); }
+                else if (TipSide == "left") { place = Widget.Tooltip.Left(); }
+                else if (TipSide == "right") { place = Widget.Tooltip.Right(); }
+                Widget.Tooltip.RequestBox(app, bx, by, bw, bh, this.TipText(), place, app.Scale(260));
+            }
+            if (this.extra != null && this.extra.Paint != null && this.extra.Paint.CountAll() > 0) {
+                this.extra.Paint.RaiseS(this);
+                if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+            }
+            bool scrollC = this.IsScrollContainer();
+            if (childNodes.Count > 0 && !this.ChildControlsRenderedByOwner()) {
+                bool clipKids = scrollC || computedStyle == null || computedStyle.overflow != 0;
+                if (clipKids) {
+                    if (scrollC) {
+                        Rect viewport = this.ScrollViewport();
+                        app.canvas.PushClip(viewport.x, viewport.y, viewport.width, viewport.height);
+                    } else {
+                        app.canvas.PushClip(bx, by, bw, bh);
+                    }
                 }
-            } finally { if (clipKids) { app.canvas.PopClip(); } }
+                try {
+                    int count = childNodes.Count;
+                    Control onlyChild = count == 1 ? childNodes[0] : null;
+                    List<Control> ordered = count > 1 ? this.PaintChildren() : null;
+                    for (int i = 0; i < count; i = i + 1) {
+                        Control child = ordered != null ? ordered[i] : onlyChild;
+                        if (!this.OwnsLayoutChild(child)) { continue; }
+                        bx = origX;
+                        by = origY;
+                        bool inView = this.ChildInViewport(child);
+                        bx = origX + offX;
+                        by = origY + offY;
+                        if (!inView) { continue; }
+                        child.RenderTree(app);
+                        if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
+                    }
+                } finally { if (clipKids) { app.canvas.PopClip(); } }
+            }
+            if (scrollC) { this.PaintScrollBars(app); }
+        } finally {
+            if (surface != null) { surface.treeComposite = false; }
+            if (paintedStyle != null) { paintedStyle.treeComposite = false; }
+            treeCompositing = prevCompositing;
+            bx = origX;
+            by = origY;
+            app.paintOffsetX = prevOffX;
+            app.paintOffsetY = prevOffY;
+            app.canvas.opacityPm = prevOpacity;
         }
-        // Overlay chrome uses the same geometry as routed pointer input.
-        if (scrollC) { this.PaintScrollBars(app); }
     }
 }

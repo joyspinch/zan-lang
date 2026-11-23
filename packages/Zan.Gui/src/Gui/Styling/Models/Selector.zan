@@ -1,61 +1,30 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui;
-
-
 public class Selector {
     public string type;
-    // `*` 通配：匹配任意类型（权重 0）。
     public bool universal;
     public string classes;   // 以空格分隔，无类时为 ""
-    // classes 的预切分形式（匹配热路径上不再分配）。
     public List<string> classList;
     public string id;
     public string part;
-    // 以空格分隔的伪类名（`:hover:selected` -> "hover selected"），
-    // 无状态时为 ""。多个伪类是与关系，因此"选中且悬停"
-    // 这类组合外观能写在 CSS 里，而不必回到代码里分支。
     public string state;
-    // `[class*="frag"]` 里的 frag：class 属性原文的子串匹配，
-    // 用于 `custom-{hex}` 这类复合 class 片段（无该条件时为 ""）。
-    // 大小写敏感的子串条件才走这个快路径，其余走 attrs。
     public string clsContains;
-    // class 上的属性条件（`[class^="x"]` 等）。
     public List<AttrCond> attrs;
-    // 必须置位的状态位（`:hover`、`[disabled]`）。
     public int reqMask;
-    // 必须清零的状态位（`:enabled`、`[disabled="false"]`）。
     public int forbidMask;
-    // `:not(...)`：其中任一命中则本选择器不匹配。
     public List<Selector> nots;
-    // `:is(...)` / `:where(...)`：任一命中即命中（前者计特异性，后者不计）。
     public List<Selector> ises;
     public List<Selector> wheres;
-    // `:has(...)`：宿主的相对范围内存在候选命中内层选择器即命中。
     public List<HasCond> hasList;
-    // 主体左侧的复合块（null = 没有链，主体就是整个选择器）。
-    // 链上的状态/伪类按被匹配祖先自身最近一次解析的状态求值。
     public Selector up;
-    // `up` 与本块之间的连接器：0 后代（空隙）、1 子（`>`）、
-    // 2 相邻兄弟（`+`）、3 通用兄弟（`~`）。
     public int combo;
-    // 结构性伪类码（StructCode：1 first-child … 12 root），0 无。
-    // 要兄弟/父子信息，仅在带树上下文的匹配里可判定。
     public int structCode;
-    // `:nth-child(an+b)` 系参数（结构码 4/5/9/10 时有效）。
     public int anbA;
     public int anbB;
-    // 语法接受但引擎无法判定（行级伪元素、无法求值的 `:not()`、
-    // `:lang()` 等）时置位，永不匹配。
     public bool never;
-    // never 的原因（Lint 用它把"写了没反应"说清楚）。
     public string why;
-
-    // 解析一个选择器：先按组合器切成复合块序列（从右往左挂链），
-    // 再逐块走 ParseCompound。引擎无法建模的块按约定返回 null
-    // （丢弃整条规则）或置 never（永不匹配），二者都不静默。
     static Selector Parse(string sel) {
         string s = Css.Trim(sel);
         if (s == "" || s == ":root") { return null; }
@@ -88,9 +57,6 @@ public class Selector {
         }
         return subject;
     }
-
-    // 解析单个复合选择器（不含组合器）：`button.ghost.primary::icon:hover`。
-    // 引擎不建模的形式按约定返回 null 或置 never。
     static Selector ParseCompound(string sel) {
         string s = Css.Trim(sel);
         if (s == "" || s == ":root") { return null; }
@@ -124,9 +90,6 @@ public class Selector {
             int tStart = i;
             while (i < n && Selector.NameCharByte(s[i] & 255)) { i = i + 1; }
             if (i > tStart) { p.type = s.Substring(tStart, i - tStart); }
-            // type 选择器大小写不敏感地匹配控件类型：StyleType()
-            // 给的是 Kind() 的小写形式，CSS 侧同样折到小写
-            // （class/id 仍严格区分大小写）。
             p.type = p.type.ToLower();
         }
         while (i < n) {
@@ -134,9 +97,7 @@ public class Selector {
             if (ch == 91) { // '['
                 int close = Css.IndexFrom(s, "]", i);
                 if (close < 0) { return null; }
-                if (!p.AddAttr(Css.Trim(s.Substring(i + 1, close - i - 1)))) {
-                    return null;
-                }
+                if (!p.AddAttr(Css.Trim(s.Substring(i + 1, close - i - 1)))) { return null; }
                 i = close + 1;
                 continue;
             }
@@ -168,10 +129,6 @@ public class Selector {
         }
         return p;
     }
-
-    // 处理 `at` 处的 `:`：`::part`、`:state`、`[pseudo-element]`、
-    // `:not()/:is()/:where()` 或结构性伪类（`:nth-child()` 等）。
-    // 返回下一个下标，硬错误（无法配对）返回 -1。
     int Pseudo(string s, int at) {
         int n = s.Length;
         int start = at + 1;
@@ -186,16 +143,10 @@ public class Selector {
         string name = s.Substring(nameStart, j - nameStart);
         if (isPart) {
             if (Selector.IsGenerated(name)) {
-                // `::first-line`/`::first-letter` 是行级伪元素，行盒
-                // 模型没有对应绘制原语：按永不匹配报出（Lint 点名）。
                 never = true;
                 why = "pseudo-element '" + name + "' is not supported";
                 return j;
             }
-            // `::before`/`::after` 走部件通道：宿主以 part="before"/
-            // "after" 解析出伪盒（Style.Part），content 文本由
-            // Element 合成进流内容。部件本身不匹配宿主盒
-            // （part != ""），不会串到普通规则里。
             part = name;
             return j;
         }
@@ -211,9 +162,6 @@ public class Selector {
                 for (int q = 0; q < sub.Count; q = q + 1) {
                     if (sub[q] == null || sub[q].never) { determinate = false; }
                 }
-                // 内层带树条件（`:not(:first-child)`）时不再保守置 never：
-                // 匹配期的 MatchNodeCtx 会带上下文递归求值。只有解析不出
-                // 或内层永不匹配（`:not(#nope)` 恒真除外）才落 never。
                 if (!determinate) {
                     never = true;
                     why = "':not()' argument cannot be evaluated";
@@ -236,9 +184,6 @@ public class Selector {
                     why = "':" + lo + "()' has no matchable alternative";
                 }
             } else if (lo == "has") {
-                // :has(相对选择器)：逗号分隔多个候选条件，任一成立即
-                // 命中。内层解析不出、含伪元素部件、再嵌 :has()（防
-                // 组合爆炸）或本身永不匹配的，整体落 never。
                 List<string> alts = Css.SplitTopTrim(inner, ",");
                 bool ok = alts.Count > 0;
                 for (int h = 0; h < alts.Count && ok; h = h + 1) {
@@ -267,8 +212,6 @@ public class Selector {
             } else {
                 int sc = Selector.StructCode(name);
                 if (sc == 0) {
-                    // `:lang()` 等：语法接受，但本引擎没有对应信息
-                    // 可判定，永不匹配。
                     never = true;
                     why = "functional pseudo-class ':" + name
                         + "()' cannot be evaluated";
@@ -287,16 +230,10 @@ public class Selector {
         }
         if (Selector.IsPseudoElement(name)) {
             if (Selector.IsGenerated(name)) {
-                // `::first-line`/`::first-letter`（含单冒号旧拼写）要
-                // 行级盒，retained/immediate 控件模型没有对应绘制
-                // 原语，语法接受但永不匹配（Lint 报出来）。
                 never = true;
                 why = "pseudo-element '" + name + "' is not supported";
                 return j;
             }
-            // `::before`/`::after` 与其余标准伪元素（`:placeholder` 是
-            // `::placeholder` 的旧拼写）统一归到部件：部件存在就命中，
-            // 伪元素内容按部件通道单独解析。
             part = name;
             return j;
         }
@@ -314,19 +251,13 @@ public class Selector {
         }
         int sc2 = Selector.StructCode(name);
         if (sc2 != 0) {
-            // 结构性伪类（`:first-child`/`:last-child`/`:empty`…）：
-            // 要兄弟/父子信息，匹配期在 retained 树上求值。
             structCode = sc2;
             return j;
         }
-        // 拼错的伪类：无信息可判定，标记 never（而不是当无状态规则
-        // 误命中）。
         never = true;
         why = "pseudo-class ':" + name + "' cannot be evaluated";
         return j;
     }
-
-    // 结构性伪类名 -> 码。0 = 不是结构性伪类。
     static int StructCode(string name) {
         if (name == "first-child") { return 1; }
         if (name == "last-child") { return 2; }
@@ -342,8 +273,6 @@ public class Selector {
         if (name == "root") { return 12; }
         return 0;
     }
-
-    // 解析 `an+b` 参数（空格容忍）：odd/even/`3`/`n`/`-n+3`/`2n-1`。
     bool SetAnB(string arg) {
         string s = Css.Lower(Css.Trim(arg));
         string t = "";
@@ -376,8 +305,6 @@ public class Selector {
         anbB = b;
         return true;
     }
-
-    // 带符号十进制整数（`-3`/`+7`/`12`），坏文本返回 false。
     static bool SignedInt(string s, out int v) {
         v = 0;
         if (s.Length == 0) { return false; }
@@ -395,16 +322,12 @@ public class Selector {
         v = sign * StyleSheet.Num(t);
         return true;
     }
-
-    // 1 基序号是否落在 `anA*n + anbB` 的序列里（n = 0,1,2,…）。
     bool MatchAnB(int idx) {
         if (anbA == 0) { return idx == anbB; }
         int d = idx - anbB;
         if (anbA > 0) { return d >= 0 && d % anbA == 0; }
         return d <= 0 && d % anbA == 0;
     }
-
-    // 逗号分隔的选择器列表（`:not(a, b)` 内层）；无法解析的项留 null。
     static List<Selector> ParseList(string text) {
         List<Selector> outR = new List<Selector>();
         List<string> parts = Css.SplitTopTrim(text, ",");
@@ -413,16 +336,11 @@ public class Selector {
         }
         return outR;
     }
-
-    // 解析 `[...]` 的内容并记入本选择器；不建模的属性返回 false
-    // （调用方因此丢弃整条规则，与旧行为一致）。
     bool AddAttr(string inner) {
         if (inner == null) { return false; }
         int k = 0;
         int m = inner.Length;
         int nameStart = k;
-        // 属性名不能吃到运算符字符（`^`/`$`/`|` 也是合法名字符，
-        // 但在 `[...]` 里它们是 `^=`/`$=`/`|=` 的开头）。
         while (k < m) {
             int c0 = inner[k] & 255;
             if (Css.IsSpaceByte(c0) || c0 == 61 || c0 == 126 || c0 == 124
@@ -483,16 +401,8 @@ public class Selector {
             if (op == "*=" && !nocase && clsContains == "") { clsContains = val; }
             return true;
         }
-        // 布尔属性映射到已有状态位：`[disabled]` 就是 `:disabled`，
-        // `[checked]` / `[selected]` 同理。这让网页 CSS 里最常见的
-        // 属性选择器直接生效，而不是整条规则被丢弃。
         int bit = Selector.AttrState(name);
         if (bit == 0) {
-            // 其余属性查节点属性表（Control.CssAttr）：带属性表的
-            // 节点（HTML 层 Element）上 `[type="text"]`/`[data-x]`/
-            // `[href]` 都能判；无属性表的控件与 immediate 路径一律
-            // 取 ""（不命中），与组合器链"没有树上下文就不命中"
-            // 同一约定，Lint 汇总点名。
             AttrCond a = new AttrCond();
             a.name = name;
             a.op = op;
@@ -513,22 +423,16 @@ public class Selector {
         else { forbidMask = forbidMask | bit; }
         return true;
     }
-
-    // 布尔属性名对应的状态位（无对应返回 0）。
     static int AttrState(string name) {
         if (name == "disabled") { return Style.SDisabled(); }
         if (name == "checked") { return Style.SChecked(); }
         if (name == "selected") { return Style.SSelected(); }
         return 0;
     }
-
-    // 是否为 CSS 标准伪元素名（单冒号旧拼写也要认成部件）。
     static bool IsPseudoElement(string name) {
         if (name == "before" || name == "after") { return true; }
         if (name == "first-line" || name == "first-letter") { return true; }
-        if (name == "placeholder" || name == "selection" || name == "marker") {
-            return true;
-        }
+        if (name == "placeholder" || name == "selection" || name == "marker") { return true; }
         if (name == "backdrop" || name == "file-selector-button") { return true; }
         if (name == "caret" || name == "scrollbar" || name == "track"
             || name == "thumb") {
@@ -536,36 +440,22 @@ public class Selector {
         }
         return false;
     }
-
-    // 行级伪元素：行盒模型没有对应绘制原语，语法接受但永不匹配。
-    // `::before`/`::after` 已支持——content 文本按宿主流内容合成
-    // （Element 伪文本），不再落 here。
-    static bool IsGenerated(string name) {
-        return name == "first-line" || name == "first-letter";
-    }
-
-    // 规则 `i` 是否选中给定的节点（无树上下文版本：组合器链与
-    // 结构性伪类整体不命中——immediate 路径没有节点可看）。
+    static bool IsGenerated(string name) { return name == "first-line" || name == "first-letter"; }
     bool MatchNode(string nodeType, List<string> classes, string cls, string nodeId,
                    string nodePart, int stateBits) {
         return this.MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
                                  stateBits, null);
     }
-
-    // 带树上下文的匹配：`node` 是主体控件（retained 树的节点），
-    // 组合器沿 parent/children 求值，结构性伪类按兄弟信息求值。
     bool MatchNodeCtx(string nodeType, List<string> classes, string cls,
                       string nodeId, string nodePart, int stateBits,
-                      Control node) {
+                      StyleNode node) {
         if (never) { return false; }
         if (part != nodePart) { return false; }
         if (type != "" && type != nodeType) { return false; }
         if (id != "" && (nodeId == "" || id != nodeId)) { return false; }
         if ((stateBits & reqMask) != reqMask) { return false; }
         if ((stateBits & forbidMask) != 0) { return false; }
-        if (clsContains != "" && (cls == "" || Css.IndexFrom(cls, clsContains, 0) < 0)) {
-            return false;
-        }
+        if (clsContains != "" && (cls == "" || Css.IndexFrom(cls, clsContains, 0) < 0)) { return false; }
         if (classList.Count > 0) {
             if (classes == null || classes.Count == 0) {
                 if (cls == "") { return false; }
@@ -603,9 +493,7 @@ public class Selector {
             }
         }
         for (int a = 0; a < attrs.Count; a = a + 1) {
-            if (!Selector.MatchAttr(attrs[a], classes, cls, node)) {
-                return false;
-            }
+            if (!Selector.MatchAttr(attrs[a], classes, cls, node)) { return false; }
         }
         for (int t = 0; t < nots.Count; t = t + 1) {
             if (nots[t].MatchNodeCtx(nodeType, classes, cls, nodeId, nodePart,
@@ -640,71 +528,51 @@ public class Selector {
         }
         return true;
     }
-
-    // 组合器连接：`up` 复合块要能在 `node` 的对应近邻上命中。
-    // 链上的状态位按近邻控件最近一次解析的状态求值（未解析过
-    // 视为常态）——不是完全实时，但比一律按常态强。
-    bool MatchChain(Selector up, Control node) {
-        Control par = node.parent;
+    bool MatchChain(Selector up, StyleNode node) {
+        StyleNode par = node.StyleParentNode();
         if (combo == 1) {
             if (par == null) { return false; }
             return Selector.SelHit(up, par);
         }
         if (combo == 2) {
-            Control prev = Selector.SiblingAt(par, node, 1);
+            StyleNode prev = Selector.SiblingAt(par, node, 1);
             if (prev == null) { return false; }
             return Selector.SelHit(up, prev);
         }
         if (combo == 3) {
             int back = 1;
             while (true) {
-                Control sib = Selector.SiblingAt(par, node, back);
+                StyleNode sib = Selector.SiblingAt(par, node, back);
                 if (sib == null) { return false; }
-                if (Selector.SelHit(up, sib)) {
-                    return true;
-                }
+                if (Selector.SelHit(up, sib)) { return true; }
                 back = back + 1;
             }
         }
-        // 后代：任一祖先命中即可。
-        Control anc = par;
+        StyleNode anc = par;
         while (anc != null) {
-            if (Selector.SelHit(up, anc)) {
-                return true;
-            }
-            anc = anc.parent;
+            if (Selector.SelHit(up, anc)) { return true; }
+            anc = anc.StyleParentNode();
         }
         return false;
     }
-
-    // `node` 往前数第 `back` 个兄弟（1 = 紧邻的前一个），越界为 null。
-    // 负值往后数（-1 = 紧邻的后一个）。兄弟关系只看 children
-    // （与 CSS 的元素兄弟一致，不区分可见性）。
-    static Control SiblingAt(Control par, Control node, int back) {
+    static StyleNode SiblingAt(StyleNode par, StyleNode node, int back) {
         if (par == null) { return null; }
-        int idx = par.IndexOf(node);
+        int idx = par.StyleIndexOfNode(node);
         int at = idx - back;
-        if (idx < 0 || at < 0 || at >= par.ChildCount()) { return null; }
-        return par.ChildAt(at);
+        if (idx < 0 || at < 0 || at >= par.StyleChildCount()) { return null; }
+        return par.StyleChildNodeAt(at);
     }
-
-    // :has() 求值：候选 = 宿主按 lead 组合器取的相对范围
-    // （0 严格后代、1 直接子、2 紧邻后兄弟、3 全部后兄弟），任一
-    // 候选命中内层选择器即成立。内层自身的组合器链从候选向上正常
-    // 求值，链的最左块可能落在宿主子树之外（`:scope div img` 的
-    // 严格辖域）——`div img` 这类嵌套链是已知近似，常见形如
-    // `:has(> img)`/`:has(img)`/`:has(+ p)` 均精确。
-    static bool HasMatch(Control host, HasCond hc) {
+    static bool HasMatch(StyleNode host, HasCond hc) {
         if (host == null || hc == null || hc.inner == null) { return false; }
         if (hc.lead == 2) {
-            Control nxt = Selector.SiblingAt(host.parent, host, 0 - 1);
+            StyleNode nxt = Selector.SiblingAt(host.StyleParentNode(), host, 0 - 1);
             if (nxt == null) { return false; }
             return Selector.SelHit(hc.inner, nxt);
         }
         if (hc.lead == 3) {
             int fwd = 1;
             while (true) {
-                Control sib = Selector.SiblingAt(host.parent, host, 0 - fwd);
+                StyleNode sib = Selector.SiblingAt(host.StyleParentNode(), host, 0 - fwd);
                 if (sib == null) { return false; }
                 if (Selector.SelHit(hc.inner, sib)) { return true; }
                 fwd = fwd + 1;
@@ -712,44 +580,37 @@ public class Selector {
         }
         return Selector.ScanSubtree(hc.inner, host, hc.lead == 1 ? 1 : 0);
     }
-
-    // 子树扫描：depth 0 = 全部严格后代，1 = 仅直接子。
-    static bool ScanSubtree(Selector inner, Control host, int depth) {
-        for (int i = 0; i < host.ChildCount(); i = i + 1) {
-            Control k = host.ChildAt(i);
+    static bool ScanSubtree(Selector inner, StyleNode host, int depth) {
+        for (int i = 0; i < host.StyleChildCount(); i = i + 1) {
+            StyleNode k = host.StyleChildNodeAt(i);
             if (Selector.SelHit(inner, k)) { return true; }
             if (depth == 0 && Selector.ScanSubtree(inner, k, 0)) { return true; }
         }
         return false;
     }
-
-    // 候选节点是否命中（部件位恒空：:has 内层不允许伪元素部件）。
-    static bool SelHit(Selector s, Control c) {
+    static bool SelHit(Selector s, StyleNode c) {
         string cls = c.EffectiveClass();
         return s.MatchNodeCtx(c.StyleType(), Style.Classes(cls),
-                              cls, c.name, "", Style.NodeState(c), c);
+                              cls, c.StyleNodeName(), "", Style.NodeState(c), c);
     }
-
-    // 结构性伪类在真实节点上的求值。没有父节点的根视为
-    // 首子 + 末子 + 唯一子（CSS 里根元素同样如此）。
-    bool MatchStruct(Control node) {
-        Control par = node.parent;
-        int idx = par == null ? 0 : par.IndexOf(node);
-        int count = par == null ? 1 : par.ChildCount();
+    bool MatchStruct(StyleNode node) {
+        StyleNode par = node.StyleParentNode();
+        int idx = par == null ? 0 : par.StyleIndexOfNode(node);
+        int count = par == null ? 1 : par.StyleChildCount();
         if (structCode == 1) { return idx == 0; }
         if (structCode == 2) { return idx == count - 1; }
         if (structCode == 3) { return count == 1; }
         if (structCode == 4) { return this.MatchAnB(idx + 1); }
         if (structCode == 5) { return this.MatchAnB(count - idx); }
-        if (structCode == 11) { return node.ChildCount() == 0; }
+        if (structCode == 11) { return node.StyleChildCount() == 0; }
         if (structCode == 12) { return par == null; }
         if (structCode >= 6 && structCode <= 10) {
             string ty = node.StyleType();
             int before = 0;
             int after = 0;
             for (int i = 0; i < count; i = i + 1) {
-                Control sib = par.ChildAt(i);
-                if (sib == node || sib.StyleType() != ty) { continue; }
+                StyleNode sib = par.StyleChildNodeAt(i);
+                if (sib == null || sib == node || sib.StyleType() != ty) { continue; }
                 if (i < idx) { before = before + 1; }
                 else { after = after + 1; }
             }
@@ -761,11 +622,6 @@ public class Selector {
         }
         return false;
     }
-
-    // 此选择器是否依赖树上下文（组合器链、结构性伪类、:has()，或
-    // 需要查节点属性表的非 class 属性条件）：immediate 路径不会
-    // 命中，且表里有它时样式缓存键要并节点位置签名（同型不同属性
-    // 的兄弟节点不得共用缓存），Lint 按它汇总"只在 retained 树生效"。
     bool Relational() {
         if (up != null || structCode != 0) { return true; }
         if (hasList != null && hasList.Count > 0) { return true; }
@@ -783,10 +639,6 @@ public class Selector {
         }
         return false;
     }
-
-    // The ancestor path represents type/class/id/state, but cannot represent
-    // arbitrary virtual CssAttr values, sibling sets, or descendant queries.
-    // Those selectors must be evaluated live rather than cached by path.
     bool NeedsLiveContext() {
         if (structCode != 0 || combo == 2 || combo == 3) { return true; }
         if (hasList != null && hasList.Count > 0) { return true; }
@@ -805,26 +657,16 @@ public class Selector {
         }
         return false;
     }
-
-    // 一个属性条件是否成立。`class` 条件对 class 原文/词表求值
-    // （immediate 路径也可判）；其余条件查 `node` 的属性表
-    // （Control.CssAttr），node 为 null（immediate 路径）或无表时
-    // 保守不命中。存在性条件走 CssHasAttr——布尔属性值为空串
-    // （`<div hidden>`）也算存在，与"在不在表里"分开。
     static bool MatchAttr(AttrCond a, List<string> classes, string cls,
-                          Control node) {
+                          StyleNode node) {
         if (a.name != "class") {
-            if (a.op == "") {
-                return node != null && node.CssHasAttr(a.name);
-            }
+            if (a.op == "") { return node != null && node.CssHasAttr(a.name); }
             string v = node == null ? "" : node.CssAttr(a.name);
             string hay = v;
             string val = a.val;
             if (a.nocase) { hay = Css.Lower(hay); val = Css.Lower(val); }
             if (val == "") { return false; }
-            if (a.op == "~=") {
-                return Style.Has(hay, val);
-            }
+            if (a.op == "~=") { return Style.Has(hay, val); }
             return Selector.HayOp(a.op, hay, val);
         }
         if (a.op == "") { return cls != ""; }
@@ -838,8 +680,6 @@ public class Selector {
         }
         return Selector.HayOp(a.op, chay, cval);
     }
-
-    // `=`/`^=`/`$=`/`|=`/`*=` 对原文串求值（nocase 已在两参上生效）。
     static bool HayOp(string op, string hay, string val) {
         if (op == "=") { return hay == val; }
         int hl = hay.Length;
@@ -853,17 +693,12 @@ public class Selector {
         }
         return Css.IndexFrom(hay, val, 0) >= 0;
     }
-
-    // 大小写不敏感的类 token 命中（类名已在调用前转小写）。
     static bool HoldsCI(List<string> classes, string name) {
         for (int i = 0; i < classes.Count; i = i + 1) {
             if (Css.Lower(classes[i]) == name) { return true; }
         }
         return false;
     }
-
-    // `:not()`/`:is()`/`:has()` 取内层最大权重；组合器链按 CSS
-    // 逐块累加。
     int Specificity() {
         int spec = 0;
         if (type != "") { spec = spec + 1; }
@@ -889,19 +724,13 @@ public class Selector {
         if (up != null) { spec = spec + up.Specificity(); }
         return spec;
     }
-
-    // 可作为类型/类/id/部件名称字符时为 true（字节判定避免字符串分配）。
     static bool NameCharByte(int b) {
         if (b == 46 || b == 35 || b == 58 || b == 42) { return false; }
-        if (b == 44 || b == 62 || b == 43 || b == 126 || b == 91) {
-            return false;
-        }
+        if (b == 44 || b == 62 || b == 43 || b == 126 || b == 91) { return false; }
         if (b == 40 || b == 41 || b == 93 || b == 61) { return false; }
         if (b == 34 || b == 39) { return false; }
         return !Css.IsSpaceByte(b);
     }
-
-    // 可作为类型/类/id/部件名称字符时为 true。
     static bool NameChar(string ch) {
         if (ch == null || ch.Length == 0) { return false; }
         return Selector.NameCharByte(ch[0] & 255);

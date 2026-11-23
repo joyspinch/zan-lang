@@ -19,6 +19,7 @@ Namespaces today (the per-layer split is phase P7 of the architecture plan):
 - `Gui.Widget`, `Gui.Component` — the control library (buttons, inputs, tabs,
   VirtualList, ChatView, ConsoleView, Ribbon, Wizard, ...).
 - `Gui.Markup` — HTML parsing and markup-to-control-tree building.
+- `Gui` in `src/Gui/Forms/` — HTML document assembly for `Form`.
 - `Gui.Animation` — tweens and transitions.
 - `Gui.Backend` — the Zan-side half of the native window shells (Win32/X11/
   Cocoa) whose native halves live in the compiler's `zan_gui` runtime driver.
@@ -83,11 +84,103 @@ service into every window. `UiDriver.Begin(app)` remains the explicit start
 entry for automation clients whose window is already shown. Enabling UiDriver
 also opts into the frame profiler when `ZAN_FRAME_PROF=1` is set.
 
+For remote images in an application that uses the scoped HTML or code-built
+entry points, call `ImageHttp.Install()` before creating the view. Local and
+embedded images work without this setup. The compatibility HTML entry points
+install the remote image service automatically.
+
+Use `Html.LoadWith` or `Html.ParseWith` when the application owns the set of
+controls that a document can use. The factory receives the normalized kind
+(`Button` for `<button>`, `InputNumber` for `<input type="number">`). It
+returns a fresh control, or `null` to render the tag as an ordinary `Element`.
+The document uses the same factory for includes and template row clones. For
+custom components, register their definitions with
+`UserComponentRegistry.RegisterDefinition(name, doc)` and have the factory call
+`UserComponentRegistry.BuildWith(name, factory)` for the component kinds it supports.
+
+```zan
+static Control CreateControl(string kind) {
+    if (kind == "Button") { return new Button(); }
+    if (kind == "Label") { return new Label(); }
+    return null;
+}
+
+// Inside the application entry point, after creating the host:
+Control view = Html.LoadWith(app, "<label>Ready</label><button>Save</button>",
+    handlers, "", CreateControl);
+app.SetRootControl(view);
+```
+
+Named window documents accept the same factory through `Form.ShowWith`,
+`ShowOffscreenWith`, `ShowDialogWith`, `ChildWindow.OpenHostWith`, and
+`OpenStandaloneWith`. `Html.Load` and `Html.Parse` retain the standard HTML
+vocabulary and resolve extensions through `ControlFactory`. `Form.Show` and
+the original child window entry points install the standard design factory
+when they find a matching document.
+
+Published forms accept the `document`, `factory`, and `register` arguments in
+`ShowWith`, `ShowOffscreenWith`, and `ShowDialogWith`. Child windows accept the
+same arguments in `OpenStandaloneWith` and after the parent in `OpenHostWith`.
+Pass the exact resource name from `--embed path=resource-name`. Project
+publishers can forward each `gen.embed` entry in `zan.proj` as an `--embed`
+argument. Applications that relied on automatic window resource discovery
+must declare those documents and fragments when publishing. Each
+`<include src="…">` also uses its full embedded resource name. Register document
+actions with `ModelBinder.Handle` and `HandleArg` in the `register` callback.
+For a button declared as `@click="save"`, register `binder.Handle("save", this.Save)`.
+The window checks for missing resource names and unregistered actions before
+opening. The explicit entry points support template and two-way model bindings
+and run the existing window lifecycle hooks.
+
+For documents with explicit events and no model directives, use
+`Form.ShowStaticWith(document, factory, register, onLoad)` or
+`ShowOffscreenStaticWith`. Register actions through `HandlerRegistry.Set` and
+`SetArg`. The optional `onLoad` callback receives the assembled form after
+event wiring. The development overload omits `document` and looks it up by
+class name. The static entry points reject missing actions and model
+directives before opening the window. Use `ShowWith` for `bind`, `:prop`,
+and `data-for`. The `gui-empty` template uses the static entry point and
+enables the settings drawer and UI automation only in development builds.
+
 `Form.Show`, `ChildWindow.SetView` and `UiViewScope.Bind` assemble the real
 `ModelBinder` for model paths, template rows and two-way binding. Hand-built
 windows can register their binder through `App.RegisterModelHost`; layout and
 writeback consume only the `AppModelHost` lifecycle contract and existing loop
 registration. Plain typed `Binding<T>` controls do not install a model engine.
+
+## Local Progress animation
+
+Call `form.SetLocalAnimation(true)` before running a Form to enable local
+updates for a single processing bar Progress on the Windows x64 CPU renderer.
+The Form paints normally to establish the background. During a phase-only
+update it restores that background, redraws the stripe, and submits the clipped
+fill rectangle in client device pixels.
+
+A processing stripe moves one device pixel every 33 ms. Use
+`progress.Processing(true).DisplayCadence(true)` to sample intermediate
+positions at the window's display cadence in both ordinary frames and local
+updates. On Win32 the monitor rate sets the timer cadence. Use
+`DisplayCadence(false)` to restore the default integer-pixel updates.
+Reduced motion keeps the stripe stationary in either mode.
+
+Input, scrolling, layout or DPI changes, model polling, and later paint that touches the
+stripe use the ordinary Form frame. For custom paint, keep state changes outside
+paint callbacks and request a redraw when state changes. The option defaults to
+false and can be turned off with `form.SetLocalAnimation(false)`.
+
+Enable ordinary partial frames with `form.GetApp().SetPartialFrames(true)` and
+call `form.SetReusePaintLayout(true)` to reuse committed layout when only a
+paint animation is due. A processing Progress with
+a non-live value can use this path. The Form composites the damage rectangle in
+paint order, including any overlapping translucent controls. The paint clip and
+native dirty rectangle use the same client device pixels. Input, scroll and DPI
+changes use normal layout and input preparation.
+
+Request a redraw after changing layout or style through public fields or after
+changing custom paint state. Keep paint callbacks free of layout mutations. A
+custom leaf can opt in to culling through `PaintWithinBounds()` if its paint is
+confined to its arranged box. Layout reuse defaults to off and can be disabled
+with `form.SetReusePaintLayout(false)`.
 
 ## Native platform contracts
 

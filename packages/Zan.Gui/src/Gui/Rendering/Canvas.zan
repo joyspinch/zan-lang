@@ -2,10 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Drawing.Imaging;
 using Gui.Backend;
-
 namespace Gui;
-
-public class Canvas {
+public partial class Canvas {
     [DllImport("zan_gui")]
     static extern int zan_gui_create_surface(int width, int height);
     [DllImport("zan_gui")]
@@ -115,7 +113,6 @@ public class Canvas {
     static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
     [DllImport("zan_gui")]
     static extern nint zan_gui_get_pixels(int surfaceId);
-    // 已有图片注册 ABI 会同步复制并替换 key；不借用或改写 surface。
     [DllImport("zan_image")]
     static extern int zan_image_register_argb(string key, nint pixels, int width, int height, int stride);
     [DllImport("zan_gui")]
@@ -128,107 +125,49 @@ public class Canvas {
     static extern int zan_gui_set_render_backend(int mode);
     [DllImport("zan_gui")]
     static extern string zan_gui_render_backend();
-
-    // 把本进程的光栅器切到 `mode`（见 <see cref="RenderBackend"/>），
-    // 返回实际装上的后端：1 = GPU，0 = CPU。要了 GPU 而拿到 0 就是这台
-    // 机器给不出 GL 上下文（远程桌面、虚拟机、CI），画面照旧由 CPU 光栅
-    // 出来，不是失败。已存在的 surface 会带着当前内容一起搬过去，切换
-    // 不会让窗口闪白。
-    static int SetBackend(int mode) {
-        return zan_gui_set_render_backend(mode);
-    }
-
-    // 当前生效的光栅器名字（"cpu" / "gl"），供设置页与日志显示。
-    static string Backend() {
-        return zan_gui_render_backend();
-    }
-
+    static int SetBackend(int mode) { return zan_gui_set_render_backend(mode); }
+    static string Backend() { return zan_gui_render_backend(); }
     int surfaceId;
-
-    // 本画布的 zan_gui surface id。
-    public int SurfaceId() { return surfaceId; }
-
+    internal int opacityPm;
+    public int SurfaceId() { surfaceIdExposed = true; return surfaceId; }
+    private bool surfaceIdExposed;
+    internal bool SurfaceIdExposed() { return surfaceIdExposed; }
     Canvas(int width, int height) {
         this.surfaceId = zan_gui_create_surface(width, height);
+        this.opacityPm = 1000;
     }
-
-    void Destroy() {
-        zan_gui_destroy_surface(surfaceId);
+    internal int ApplyOpacity(int color) {
+        if (opacityPm >= 1000 || color == 0) { return color; }
+        if (opacityPm <= 0) { return 0; }
+        int a = (((color >> 24) & 255) * opacityPm) / 1000;
+        if (a <= 0) { return 0; }
+        return (a << 24) | (color & 0x00FFFFFF);
     }
-
+    void Destroy() { zan_gui_destroy_surface(surfaceId); }
     public int Width() { return zan_gui_surface_width(surfaceId); }
     public int Height() { return zan_gui_surface_height(surfaceId); }
     int WritePixels(string path, int x, int y, int w, int h) {
         return zan_gui_write_pixels(surfaceId, path, x, y, w, h);
     }
-
-    // 把整张画布保存为 24 位 BMP。当前忽略矩形参数；
-    // 需要指定矩形的 BGRA 原始像素时用 WritePixels。
-    // 返回 1=成功，0=错误。
-    int DumpRaw(string path, int x, int y, int w, int h) {
-        return zan_gui_surface_dump(surfaceId, path);
-    }
-
-    // 用颜色（0xAARRGGBB）清空整个 surface。
-    void Clear(int color) {
-        zan_gui_clear(surfaceId, color);
-    }
-
-    // 只清空一个矩形：与 <see cref="Clear"/> 一样*存入*颜色
-    // （含 alpha），不与已有像素混合。损伤裁剪帧用它在损伤区内重建
-    // 窗口底色——换成 FillRect 就是把半透明底色又叠一遍上一帧，
-    // 玻璃皮肤下每来一个局部帧就深一点。
+    int DumpRaw(string path, int x, int y, int w, int h) { return zan_gui_surface_dump(surfaceId, path); }
+    void Clear(int color) { zan_gui_clear(surfaceId, color); }
     void ClearRect(int x, int y, int w, int h, int color) {
-        App.PaintHashOp(25, x, y, w, h);
-        App.PaintHashOp(0, color, 0, 0, 0);
+        Canvas.PaintHashOp(25, x, y, w, h);
+        Canvas.PaintHashOp(0, color, 0, 0, 0);
         zan_gui_clear_rect(surfaceId, x, y, w, h, color);
     }
-
-    // 一个栅格化工作计数器：`kind` 0 = 调用次数，1 = 接触
-    // 像素数（千为单位；读 kind 1 会清零计数器）。`idx` 选择
-    // 图元：0 不透明填充，1 混合填充，2 渐变，3 圆角
-    // 矩形，4 径向，5 模糊计算，6 模糊缓存命中，7 图像 blit，
-    // 8 快照，9 恢复，10 字形，11 混合填充走 4 宽路径的像素，
-    // 12 混合填充逐像素处理的像素。供 App 的帧分析器使用。
-    static int RasterStat(int idx, int kind) {
-        return zan_gui_stat_read(idx, kind);
-    }
-
+    static int RasterStat(int idx, int kind) { return zan_gui_stat_read(idx, kind); }
     static void TextStatEnable(bool enabled) {
         if (enabled) { zan_gui_text_stat_enable(1); }
         else { zan_gui_text_stat_enable(0); }
     }
-
-    // 开关文本栅格化统计（配合 <see cref="TextStat"/>）。
-    // 读取文本栅格化统计：`idx` 选择指标（0=字形数，
-    // 1=光栅耗时等，与 TextStatEnable 配套）。供帧分析使用。
-    static int TextStat(int idx) {
-        return zan_gui_text_stat_read(idx);
-    }
-
-    // 本帧面积最大的半透明填充，按面积排名：`field` 0 = 面积（千像素），
-    // 1 = x，2 = y，3 = w，4 = h（读 4 会清除该
-    // 条目）。指出主导混合的图层。
-    static int RasterTopBlend(int rank, int field) {
-        return zan_gui_stat_top(rank, field);
-    }
-
-    // 本帧面积最大的不透明填充，字段同 RasterTopBlend。被后面
-    // 图层再次覆盖的不透明填充就是纯重复绘制，这里指出是哪几块。
-    static int RasterTopFill(int rank, int field) {
-        return zan_gui_stat_top_fill(rank, field);
-    }
-
+    static int TextStat(int idx) { return zan_gui_text_stat_read(idx); }
+    static int RasterTopBlend(int rank, int field) { return zan_gui_stat_top(rank, field); }
+    static int RasterTopFill(int rank, int field) { return zan_gui_stat_top_fill(rank, field); }
     #if ANDROID || OHOS
     [DllImport("zan_gui")]
     static extern string zan_gui_mem_report();
     #endif
-
-    // 栅格化缓存构成（单行，MB）：字形图集/覆盖池/解码
-    // 图片/surface/模糊槽/快照槽/纹理。把进程内存归因到具体
-    // 缓存用——进程 RSS 混进了共享代码页和驱动缓冲，说不清
-    // 这笔账。Android 与 OHOS 驱动带此导出（桌面驱动重建时
-    // 再放开门控），其余平台返回空串。
     static string MemReport() {
         #if ANDROID || OHOS
         return zan_gui_mem_report() + " " + ImageCodec.MemReport();
@@ -236,177 +175,116 @@ public class Canvas {
         return "";
         #endif
     }
-
-    // 用纯色（0xAARRGGBB）填充矩形。与 ClearRect 不同，
-    // alpha 小于 255 时与已有像素混合，适合玻璃/叠加层。
     void FillRect(int x, int y, int w, int h, int color) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(1, x, y, w, h);
-        App.PaintHashOp(0, color, 0, 0, 0);
+        Canvas.PaintHashOp(1, x, y, w, h);
+        Canvas.PaintHashOp(0, color, 0, 0, 0);
         zan_gui_fill_rect(surfaceId, x, y, w, h, color);
     }
-
-    // 将后续绘制限制在当前裁剪区与
-    // (x,y,w,h) 的交集中。嵌套 push 只会缩小区域。需与
-    // PopClip 配对。裁剪区在每帧开始时（Clear）重置为整个 surface，
-    // 因此容器无需手动重置。
-    void PushClip(int x, int y, int w, int h) {
-        zan_gui_push_clip(surfaceId, x, y, w, h);
-    }
-
-    // 恢复最近一次 PushClip 保存的裁剪区。
-    void PopClip() {
-        zan_gui_pop_clip(surfaceId);
-    }
-
-    // 丢弃所有裁剪区，重新在整个 surface 上绘制。
-    void ResetClip() {
-        zan_gui_reset_clip(surfaceId);
-    }
-
-    // 绘制矩形轮廓。
+    void PushClip(int x, int y, int w, int h) { zan_gui_push_clip(surfaceId, x, y, w, h); }
+    void PopClip() { zan_gui_pop_clip(surfaceId); }
+    void ResetClip() { zan_gui_reset_clip(surfaceId); }
     void DrawRect(int x, int y, int w, int h, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(2, x, y, w, h);
-        App.PaintHashOp(0, color, thickness, 0, 0);
+        Canvas.PaintHashOp(2, x, y, w, h);
+        Canvas.PaintHashOp(0, color, thickness, 0, 0);
         zan_gui_draw_rect(surfaceId, x, y, w, h, color, thickness);
     }
-
-    // 填充圆角矩形。
     void FillRoundRect(int x, int y, int w, int h, int radius, int color) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(3, x, y, w, h);
-        App.PaintHashOp(0, radius, color, 0, 0);
+        Canvas.PaintHashOp(3, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, color, 0, 0);
         zan_gui_fill_rounded_rect(surfaceId, x, y, w, h, radius, color);
     }
-
-    // 仅供背景首层使用：透明目标直接写 straight ARGB，已有像素仍
-    // source-over。原圆角覆盖率及语义 hash 与普通填充完全相同。
     internal void FillInitialShape(int x, int y, int w, int h, int radius, int color) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
         if (radius > 0) {
-            App.PaintHashOp(3, x, y, w, h);
-            App.PaintHashOp(0, radius, color, 0, 0);
+            Canvas.PaintHashOp(3, x, y, w, h);
+            Canvas.PaintHashOp(0, radius, color, 0, 0);
         } else {
-            App.PaintHashOp(1, x, y, w, h);
-            App.PaintHashOp(0, color, 0, 0, 0);
+            Canvas.PaintHashOp(1, x, y, w, h);
+            Canvas.PaintHashOp(0, color, 0, 0, 0);
         }
         zan_gui_fill_initial_shape(surfaceId, x, y, w, h, radius, color);
     }
-
-    // 绘制抗锯齿圆角矩形轮廓，其圆角
-    // 紧贴同几何的 FillRoundRect（带边框的圆角表面请用它
-    // 代替 DrawRect）。
     void DrawRoundRect(int x, int y, int w, int h, int radius, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(4, x, y, w, h);
-        App.PaintHashOp(0, radius, color, thickness, 0);
+        Canvas.PaintHashOp(4, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, color, thickness, 0);
         zan_gui_draw_rounded_rect(surfaceId, x, y, w, h, radius, color, thickness);
     }
-
-    // 填充圆角矩形，只圆化 `corners` 指定的角
-    // （Corner.TL|TR|BR|BL，四角全圆用 Corner.All）。焊接
-    // 相邻元素——一组按钮、紧贴面板的标签页——会这样
-    // 把共享接缝修成直角，而不是留下两个圆角
-    // 挤在一起。
     void FillRoundRectIn(int x, int y, int w, int h, int radius, int corners, int color) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(5, x, y, w, h);
-        App.PaintHashOp(0, radius, corners, color, 0);
+        Canvas.PaintHashOp(5, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, corners, color, 0);
         zan_gui_fill_rounded_rect_mask(surfaceId, x, y, w, h, radius, corners, color);
     }
-
-    // 描边 FillRoundRectIn 形状的轮廓。
     void DrawRoundRectIn(int x, int y, int w, int h, int radius, int corners,
     int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(6, x, y, w, h);
-        App.PaintHashOp(0, radius, corners, color, thickness);
+        Canvas.PaintHashOp(6, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, corners, color, thickness);
         zan_gui_draw_rounded_rect_mask(surfaceId, x, y, w, h, radius, corners, color, thickness);
     }
-
-    // 一次调用同时填充圆角矩形并描边其轮廓：
-    // 边框先与填充色合成，再一次应用圆角覆盖率，避免外沿重复混合。
-    // 边框向内扩展，厚度小于等于 0 时只填充；透明边框保留填充。
-    // 这是卡片、弹窗、提示框和 chip 等共用的带边框表面惯用法。
-    // 此操作不裁剪后续子控件绘制。
     void SurfaceRoundRect(int x, int y, int w, int h, int radius,
     int fill, int border, int borderThickness) {
         if (w <= 0 || h <= 0) { return; }
+        fill = this.ApplyOpacity(fill);
+        border = this.ApplyOpacity(border);
         if (fill == 0 && (border == 0 || borderThickness <= 0)) { return; }
-        App.PaintHashOp(26, x, y, w, h);
-        App.PaintHashOp(0, radius, fill, border, borderThickness);
+        Canvas.PaintHashOp(26, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, fill, border, borderThickness);
         zan_gui_surface_rounded_rect(surfaceId, x, y, w, h, radius, fill, border, borderThickness);
     }
-
-    // SurfaceRoundRect 的指定圆角版本；覆盖率只合成一次。
     void SurfaceRoundRectIn(int x, int y, int w, int h, int radius, int corners,
     int fill, int border, int borderThickness) {
         if (w <= 0 || h <= 0) { return; }
+        fill = this.ApplyOpacity(fill);
+        border = this.ApplyOpacity(border);
         if (fill == 0 && (border == 0 || borderThickness <= 0)) { return; }
-        App.PaintHashOp(27, x, y, w, h);
-        App.PaintHashOp(0, radius, corners, 0, 0);
-        App.PaintHashOp(0, fill, border, borderThickness, 0);
+        Canvas.PaintHashOp(27, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, corners, 0, 0);
+        Canvas.PaintHashOp(0, fill, border, borderThickness, 0);
         zan_gui_surface_rounded_rect_mask(surfaceId, x, y, w, h, radius, corners,
         fill, border, borderThickness);
     }
-
-    // 圆角矩形的柔和投影：以圆角 SDF（外轮廓到形状的
-    // 有符号距离）在整个 blur 带上做 smoothstep 衰减，而非逐圈扩张
-    // 描边。几何连续，角部不会出现楔形缝或同心弧；每个像素只写一次，
-    // 半透明阴影色合成到标称 alpha，不随层叠变黑。radius <= 0 退化为
-    // 矩形阴影；blur <= 0 退化为硬填充。
     void ShadowRoundRect(int x, int y, int w, int h, int radius, int blur, int color) {
+        color = this.ApplyOpacity(color);
         if (w <= 0 || h <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(28, x, y, w, h);
-        App.PaintHashOp(0, radius, blur, color, 0);
+        Canvas.PaintHashOp(28, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, blur, color, 0);
         zan_gui_shadow_rounded_rect(surfaceId, x, y, w, h, radius, blur, color);
     }
-
-    // 就地盒式模糊一个矩形区域（毛玻璃
-    // 背景）。先画背景，再模糊，然后叠一层半透明
-    // 色调。`radius` 为模糊强度（px，上限 40）。
     void BlurRect(int x, int y, int w, int h, int radius) {
-        App.PaintHashOp(34, x, y, w, h);
-        App.PaintHashOp(0, radius, 0, 0, 0);
+        Canvas.PaintHashOp(34, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, 0, 0, 0);
         zan_gui_blur_rect(surfaceId, x, y, w, h, radius);
     }
-
-    // 与 BlurRect 相同的毛玻璃模糊，但将模糊输出缓存到
-    // `slot`。当 `dirty` 为 false 且区域几何
-    // 未变时，直接用普通拷贝恢复缓存像素，而不是
-    // 重算（昂贵的）高斯模糊——因此屏幕上的动画
-    // （spinner、toast）不再每帧重模糊静态背景。
-    // 每个玻璃表面传一个稳定的 slot，并在玻璃后内容
-    // 可能已变化时（输入、滚动、缩放、换肤）传 dirty=true。
     void BlurRectCached(int x, int y, int w, int h, int radius,
     int slot, bool dirty) {
         int d = 0;
         if (dirty) { d = 1; }
-        App.PaintHashOp(35, x, y, w, h);
-        App.PaintHashOp(0, radius, slot, d, 0);
+        Canvas.PaintHashOp(35, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, slot, d, 0);
         zan_gui_blur_rect_cached(surfaceId, x, y, w, h, radius, slot, d);
     }
-
-    // 缓存毛玻璃模糊并裁剪到圆角矩形：
-    // 模糊输出只写入圆角半径遮罩内，使玻璃
-    // 面板的边角保留清晰背景，并与其上覆盖的半透明
-    // 圆角色调对齐（方形模糊盖在圆角色调下会留下
-    // 色调永远无法重绘的模糊边角）。`cornerMask` 是 Corner
-    // 位集（四角全圆用 Corner.All()）。
     void BlurRoundCached(int x, int y, int w, int h, int radius,
     int slot, bool dirty, int cornerRadius, int cornerMask) {
         int d = 0;
         if (dirty) { d = 1; }
-        App.PaintHashOp(36, x, y, w, h);
-        App.PaintHashOp(0, radius, slot, d, 0);
-        App.PaintHashOp(0, cornerRadius, cornerMask, 0, 0);
+        Canvas.PaintHashOp(36, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, slot, d, 0);
+        Canvas.PaintHashOp(0, cornerRadius, cornerMask, 0, 0);
         zan_gui_blur_round_cached(surfaceId, x, y, w, h, radius, slot, d,
         cornerRadius, cornerMask);
     }
-
-    // Full-clip CPU static composition only; a miss always requires normal
-    // drawing followed by EndStaticGlass before any child foreground.
     bool BeginStaticGlass(int slot, int x, int y, int w, int h, int blur,
     int radius, int corners, int fill, int sheen, int sheenColor, int sheenCap, bool dirty) {
         int d = 0;
@@ -414,184 +292,134 @@ public class Canvas {
         return zan_gui_glass_begin(surfaceId, slot, x, y, w, h, blur, radius,
         corners, fill, sheen, sheenColor, sheenCap, d) != 0;
     }
-
     void EndStaticGlass(int slot) { zan_gui_glass_end(surfaceId, slot); }
-
-    // 自上次调用以来，有多少块玻璃是在「源背景只有一部分是
-    // 本帧新画的」情况下重新模糊的（损伤裁剪帧里跨出条带的面板）：
-    // 卷积会把条带外上一帧的*已合成*像素（面板色调、文字）混进来，
-    // 结果与整帧渲染不再等价。调用方据此把下一帧升级成整窗帧。
-    // 读取即清零。
-    static int TakeBlurPartialMiss() {
-        return zan_gui_blur_partial_miss_take();
-    }
-
-    // 把区域像素快照进 `slot`，便于之后用
-    // RestoreRect 无需重绘即可恢复。用于缓存静态
-    // 背景（如壁纸），使纯动画帧跳过
-    // 重绘。
+    static int TakeBlurPartialMiss() { return zan_gui_blur_partial_miss_take(); }
     void SnapshotRect(int x, int y, int w, int h, int slot) {
-        App.PaintHashOp(37, x, y, w, h);
-        App.PaintHashOp(0, slot, 0, 0, 0);
+        Canvas.PaintHashOp(37, x, y, w, h);
+        Canvas.PaintHashOp(0, slot, 0, 0, 0);
         zan_gui_snapshot_rect(surfaceId, x, y, w, h, slot);
     }
-
-    // 把 [x,y,w,h] 的当前像素补进 `slot` 里已有的快照
-    // （不改变槽的几何）：损伤条带帧只重画了条带，用它把条带的
-    // 新基面折回整窗快照，之后的整窗恢复（如特效拍的
-    // RestoreRect(0,0,W,H)）继续几何匹配。槽里没有本表面的有效
-    // 快照、或矩形越出快照范围时为空操作。
     void SnapshotPatchRect(int x, int y, int w, int h, int slot) {
-        App.PaintHashOp(38, x, y, w, h);
-        App.PaintHashOp(0, slot, 0, 0, 0);
+        Canvas.PaintHashOp(38, x, y, w, h);
+        Canvas.PaintHashOp(0, slot, 0, 0, 0);
         zan_gui_snapshot_patch_rect(surfaceId, x, y, w, h, slot);
     }
-
-    // 恢复先前由 SnapshotRect 捕获的区域。
-    // 若快照存在且几何匹配（说明区域现已绘制）
-    // 则返回 true；若调用方必须正常绘制它
-    // 则返回 false。
     bool RestoreRect(int x, int y, int w, int h, int slot) {
-        App.PaintHashOp(39, x, y, w, h);
-        App.PaintHashOp(0, slot, 0, 0, 0);
+        Canvas.PaintHashOp(39, x, y, w, h);
+        Canvas.PaintHashOp(0, slot, 0, 0, 0);
         return zan_gui_restore_rect(surfaceId, x, y, w, h, slot) != 0;
     }
-
-    // 只恢复 `slot` 中与 [x,y,w,h] 相交的部分；
-    // 矩形无需匹配快照几何，因此许多小块受损
-    // 区域无需整体拷贝回快照即可被修复。
-    // slot 中无有效快照时返回 false。
     bool RestoreSubRect(int x, int y, int w, int h, int slot) {
-        App.PaintHashOp(40, x, y, w, h);
-        App.PaintHashOp(0, slot, 0, 0, 0);
+        Canvas.PaintHashOp(40, x, y, w, h);
+        Canvas.PaintHashOp(0, slot, 0, 0, 0);
         return zan_gui_restore_sub_rect(surfaceId, x, y, w, h, slot) != 0;
     }
-
-    // 调试：把表面像素写成 24 位 BMP（无压缩），
-    // 供无头环境比对画布内容与屏幕实际显示。
-    bool Dump(string path) {
-        return zan_gui_surface_dump(surfaceId, path) != 0;
-    }
-
-    // 释放快照 slot 拥有的像素缓冲并使其失效，
-    // 把内存归还而不是在整个会话期间保留。当
-    // 缓存的区域滚出视野时使用（如嵌在
-    // 网格单元格中的图表）。对空闲 slot 调用安全，空操作。
-    void ReleaseSlot(int slot) {
-        zan_gui_surface_release(surfaceId, slot);
-    }
-
-    // 用自上而下线性渐变填充矩形
-    // （0xAARRGGBB 端点，不透明）。用于渐变壁纸。
+    bool Dump(string path) { return zan_gui_surface_dump(surfaceId, path) != 0; }
+    void ReleaseSlot(int slot) { zan_gui_surface_release(surfaceId, slot); }
     void FillVGrad(int x, int y, int w, int h, int colorTop, int colorBottom) {
-        App.PaintHashOp(7, x, y, w, h);
-        App.PaintHashOp(0, colorTop, colorBottom, 0, 0);
+        colorTop = this.ApplyOpacity(colorTop);
+        colorBottom = this.ApplyOpacity(colorBottom);
+        if (w <= 0 || h <= 0) { return; }
+        if ((colorTop & 0xFF000000) == 0 && (colorBottom & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashOp(7, x, y, w, h);
+        Canvas.PaintHashOp(0, colorTop, colorBottom, 0, 0);
+        if (((colorTop >> 24) & 255) < 255 || ((colorBottom >> 24) & 255) < 255) {
+            zan_gui_fill_grad_mask(surfaceId, x, y, w, h, 0, 0, 0, colorTop, 0, colorBottom);
+            return;
+        }
         zan_gui_fill_vgrad(surfaceId, x, y, w, h, colorTop, colorBottom);
     }
-
-    // 用自上而下线性渐变填充圆角矩形。
-    // 圆角弧已抗锯齿（1px 混合边缘），轮廓与
-    // FillRoundRect 相同——在 FillRoundRect 上平铺 FillVGrad 会
-    // 用不透明渐变替换弧的混合像素，使
-    // 边角锯齿化。mask 与 FillRoundRect 的角位掩码相同。
     void FillVGradMask(int x, int y, int w, int h, int radius, int mask,
     int colorTop, int colorBottom) {
-        App.PaintHashOp(8, x, y, w, h);
-        App.PaintHashOp(0, radius, mask, 0, 0);
-        App.PaintHashOp(0, colorTop, colorBottom, 0, 0);
+        colorTop = this.ApplyOpacity(colorTop);
+        colorBottom = this.ApplyOpacity(colorBottom);
+        Canvas.PaintHashOp(8, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, mask, 0, 0);
+        Canvas.PaintHashOp(0, colorTop, colorBottom, 0, 0);
         zan_gui_fill_vgrad_mask(surfaceId, x, y, w, h, radius, mask,
         colorTop, colorBottom);
     }
-
-    // 用线性渐变填充圆角矩形：`dir` 0 = 自上而下、
-    // 1 = 自左向右、2 = 向右下对角、3 = 向左下对角，
-    // `colorVia` 非 0 时作为 50% 处的中间色停靠点。
-    // 端点可带 alpha（逐像素混合），圆角弧抗锯齿且与 FillRoundRect
-    // 同一轮廓，因此渐变面板/按钮的圆角不会出现阶梯毛刺。
-    // mask 与 FillRoundRect 的角位掩码相同。
     void FillGradMask(int x, int y, int w, int h, int radius, int mask, int dir,
     int colorFrom, int colorVia, int colorTo) {
-        App.PaintHashOp(9, x, y, w, h);
-        App.PaintHashOp(0, radius, mask, dir, 0);
-        App.PaintHashOp(0, colorFrom, colorVia, colorTo, 0);
+        colorFrom = this.ApplyOpacity(colorFrom);
+        colorVia = this.ApplyOpacity(colorVia);
+        colorTo = this.ApplyOpacity(colorTo);
+        Canvas.PaintHashOp(9, x, y, w, h);
+        Canvas.PaintHashOp(0, radius, mask, dir, 0);
+        Canvas.PaintHashOp(0, colorFrom, colorVia, colorTo, 0);
         zan_gui_fill_grad_mask(surfaceId, x, y, w, h, radius, mask, dir,
         colorFrom, colorVia, colorTo);
     }
-
-    // 填充圆。
     void FillCircle(int cx, int cy, int radius, int color) {
+        color = this.ApplyOpacity(color);
         if (radius <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(10, cx, cy, radius, color);
+        Canvas.PaintHashOp(10, cx, cy, radius, color);
         zan_gui_fill_circle(surfaceId, cx, cy, radius, color);
     }
-
-    // 以给定粗细描边圆轮廓，
-    // 圆心在半径处（抗锯齿）。
     void DrawCircle(int cx, int cy, int radius, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (radius <= 0 || thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(11, cx, cy, radius, color);
-        App.PaintHashOp(0, thickness, 0, 0, 0);
+        Canvas.PaintHashOp(11, cx, cy, radius, color);
+        Canvas.PaintHashOp(0, thickness, 0, 0, 0);
         zan_gui_draw_circle(surfaceId, cx, cy, radius, color, thickness);
     }
-
-    // 填充柔和径向辉光：alpha 从中心的 innerAlpha
-    // （0..255）平滑衰减到半径处的 0，用于发光效果。仅用 color 的
-    // RGB。
     void FillRadial(int cx, int cy, int radius, int color, int innerAlpha) {
+        if (opacityPm < 1000) { innerAlpha = innerAlpha * opacityPm / 1000; }
         if (radius <= 0 || innerAlpha <= 0 || color == 0) { return; }
-        App.PaintHashOp(12, cx, cy, radius, color);
-        App.PaintHashOp(0, innerAlpha, 0, 0, 0);
+        Canvas.PaintHashOp(12, cx, cy, radius, color);
+        Canvas.PaintHashOp(0, innerAlpha, 0, 0, 0);
         zan_gui_fill_radial(surfaceId, cx, cy, radius, color, innerAlpha);
     }
-
-    // 绘制线段。
     void DrawLine(int x0, int y0, int x1, int y1, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (thickness <= 0 || color == 0 || (color & 0xFF000000) == 0 || (x0 == x1 && y0 == y1)) { return; }
-        App.PaintHashOp(13, x0, y0, x1, y1);
-        App.PaintHashOp(0, color, thickness, 0, 0);
+        Canvas.PaintHashOp(13, x0, y0, x1, y1);
+        Canvas.PaintHashOp(0, color, thickness, 0, 0);
         zan_gui_draw_line(surfaceId, x0, y0, x1, y1, color, thickness);
     }
-
+    void DrawLineFx(int x0, int y0, int x1, int y1, int color, int thickness) {
+        color = this.ApplyOpacity(color);
+        if (thickness <= 0 || (color & 0xFF000000) == 0 || (x0 == x1 && y0 == y1)) { return; }
+        Canvas.PaintHashOp(15, x0, y0, x1, y1);
+        Canvas.PaintHashOp(0, color, thickness, 0, 0);
+        nint buf = Canvas.EnsurePolyScratch(16);
+        Span<int> points = new Span<int>(buf, 4);
+        points[0] = x0;
+        points[1] = y0;
+        points[2] = x1;
+        points[3] = y1;
+        zan_gui_draw_polyline_fx(surfaceId, buf, 2, color, thickness);
+    }
     static nint scratchPolyBuf;
     static int scratchPolyCap;
     static nint scratchCountBuf;
     static int scratchCountCap;
-
     static nint EnsurePolyScratch(int bytes) {
         if (Canvas.scratchPolyCap < bytes) {
-            if (Canvas.scratchPolyBuf != 0) {
-                NativeMemory.Free(Canvas.scratchPolyBuf);
-            }
+            if (Canvas.scratchPolyBuf != 0) { NativeMemory.Free(Canvas.scratchPolyBuf); }
             int newCap = bytes < 4096 ? 4096 : bytes * 2;
             Canvas.scratchPolyBuf = NativeMemory.Alloc(newCap);
             Canvas.scratchPolyCap = newCap;
         }
         return Canvas.scratchPolyBuf;
     }
-
     static nint EnsureCountScratch(int bytes) {
         if (Canvas.scratchCountCap < bytes) {
-            if (Canvas.scratchCountBuf != 0) {
-                NativeMemory.Free(Canvas.scratchCountBuf);
-            }
+            if (Canvas.scratchCountBuf != 0) { NativeMemory.Free(Canvas.scratchCountBuf); }
             int newCap = bytes < 1024 ? 1024 : bytes * 2;
             Canvas.scratchCountBuf = NativeMemory.Alloc(newCap);
             Canvas.scratchCountCap = newCap;
         }
         return Canvas.scratchCountBuf;
     }
-
-    // 将整条折线作为一条抗锯齿笔划绘制。路径
-    // 单次扫描按覆盖率栅格化，因此段接缝圆滑，
-    // 且没有像素被混合两次（拐角无亮缝）——
-    // 不同于用 DrawLine 逐段绘制同一路径。
     void DrawPolyline(List<int> xs, List<int> ys, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
         int n = xs.Count;
         if (n < 2) { return; }
-        App.PaintHashOp(14, n, ys.Count, color, thickness);
-        App.PaintHashList(xs);
-        App.PaintHashList(ys);
+        Canvas.PaintHashOp(14, n, ys.Count, color, thickness);
+        Canvas.PaintHashList(xs);
+        Canvas.PaintHashList(ys);
         nint buf = Canvas.EnsurePolyScratch(n * 8);
         Span<int> sp = new Span<int>(buf, n * 2);
         for (int i = 0; i < n; i = i + 1) {
@@ -600,20 +428,14 @@ public class Canvas {
         }
         zan_gui_draw_polyline(surfaceId, buf, n, color, thickness);
     }
-
-    // 绘制顶点坐标为 16.8 定点数（1/256 px）的折线。
-    // 亚像素精度构造的平滑曲线在栅格化时保持
-    // 真实形状——距离场采样理想几何，
-    // 而非整数取整的阶梯，这正是
-    // 圆看起来平滑的原因：每个像素度量真实曲线，而非
-    // 量化轮廓。
     void DrawPolylineFx(List<int> xs, List<int> ys, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
         int n = xs.Count;
         if (n < 2) { return; }
-        App.PaintHashOp(15, n, ys.Count, color, thickness);
-        App.PaintHashList(xs);
-        App.PaintHashList(ys);
+        Canvas.PaintHashOp(15, n, ys.Count, color, thickness);
+        Canvas.PaintHashList(xs);
+        Canvas.PaintHashList(ys);
         nint buf = Canvas.EnsurePolyScratch(n * 8);
         Span<int> sp = new Span<int>(buf, n * 2);
         for (int i = 0; i < n; i = i + 1) {
@@ -622,20 +444,15 @@ public class Canvas {
         }
         zan_gui_draw_polyline_fx(surfaceId, buf, n, color, thickness);
     }
-
-    // 一次覆盖缓冲周期绘制 N 条互不相连、同色的折线。
-    // xs 为全体路径顶点的扁平交错数组，counts[i] 为第 i 条路径的
-    // 顶点数。密集多行图（数千行的平行坐标）逐行调用 DrawPolyline
-    // 会为每行付出一次完整的 GL 覆盖缓冲清除+合成；分桶后每帧
-    // 每色仅一次，是大数据图表不卡的关键。
     void DrawPolyBatch(List<int> xs, List<int> counts, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (thickness <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
         int total = 0;
         for (int i = 0; i < counts.Count; i = i + 1) { total = total + counts[i]; }
         if (total < 2 || counts.Count < 1) { return; }
-        App.PaintHashOp(16, total, counts.Count, color, thickness);
-        App.PaintHashList(xs);
-        App.PaintHashList(counts);
+        Canvas.PaintHashOp(16, total, counts.Count, color, thickness);
+        Canvas.PaintHashList(xs);
+        Canvas.PaintHashList(counts);
         nint buf = Canvas.EnsurePolyScratch(total * 8);
         nint cbuf = Canvas.EnsureCountScratch(counts.Count * 4);
         Span<int> sp = new Span<int>(buf, total * 2);
@@ -644,24 +461,18 @@ public class Canvas {
         for (int i = 0; i < counts.Count; i = i + 1) { cp[i] = counts[i]; }
         zan_gui_draw_polybatch(surfaceId, buf, cbuf, counts.Count, color, thickness);
     }
-
-    // 填充环扇区（饼/甜甜圈切片）。角度为度，0 在
-    // 12 点钟方向，顺时针。rInner=0 得实心饼切片。
     void FillSector(int cx, int cy, int rInner, int rOuter, int a0Deg, int a1Deg, int color) {
+        color = this.ApplyOpacity(color);
         if (rOuter <= 0 || rOuter <= rInner || a0Deg == a1Deg || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(17, cx, cy, rInner, rOuter);
-        App.PaintHashOp(0, a0Deg, a1Deg, color, 0);
+        Canvas.PaintHashOp(17, cx, cy, rInner, rOuter);
+        Canvas.PaintHashOp(0, a0Deg, a1Deg, color, 0);
         zan_gui_fill_sector(surfaceId, cx, cy, rInner, rOuter, a0Deg, a1Deg, color);
     }
-
-    // 描边环扇区弧（饼/甜甜圈切片的轮廓）。
-    // 角度为度，0 在 12 点钟方向，顺时针。画成外缘一圈细填充
-    // 环，无需单独的原生描边图元；
-    // 粗细以设备像素计。
     void DrawArc(int cx, int cy, int rInner, int rOuter, int a0Deg, int a1Deg, int color, int thickness) {
+        color = this.ApplyOpacity(color);
         if (thickness <= 0 || rOuter <= 0 || a0Deg == a1Deg || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(18, cx, cy, rInner, rOuter);
-        App.PaintHashOp(0, a0Deg, a1Deg, color, thickness);
+        Canvas.PaintHashOp(18, cx, cy, rInner, rOuter);
+        Canvas.PaintHashOp(0, a0Deg, a1Deg, color, thickness);
         int r0 = rInner;
         int r1 = rOuter;
         if (r1 < r0) { int tmp = r0; r0 = r1; r1 = tmp; }
@@ -669,550 +480,4 @@ public class Canvas {
         if (s0 < r0) { s0 = r0; }
         zan_gui_fill_sector(surfaceId, cx, cy, s0, r1, a0Deg, a1Deg, color);
     }
-
-    // 在指定位置绘制文本。
-    void DrawText(int x, int y, string text, int color, int fontSize) {
-        if (text == null || text == "" || fontSize <= 0) { return; }
-        App.PaintHashText(19, x, y, color, fontSize, text);
-        zan_gui_draw_text(surfaceId, x, y, text, color, fontSize);
-    }
-
-    // 粗体文本（ECharts title 默认 textStyle.fontWeight 'bold'）。
-    // 字形图集按 (文本, 字号, 字重) 分键，与常规文本互不干扰。
-    void DrawTextBold(int x, int y, string text, int color, int fontSize) {
-        if (text == null || text == "" || fontSize <= 0) { return; }
-        App.PaintHashText(20, x, y, color, fontSize, text);
-        zan_gui_draw_text_bold(surfaceId, x, y, text, color, fontSize);
-    }
-
-    // 绘制绕锚点旋转的文本。`(x, y)` 是未旋转行盒的左上角，
-    // 整行文本绕它刚性旋转；`angleDeg` 为度，正 = 顺时针（CSS
-    // `transform: rotate()` 约定），钳制在 [-90, 90]。颜色 alpha 参与
-    // 混合（0 视为不透明，同 DrawText）。旋转后的整行作为一块覆盖度
-    // 贴片缓存，同一 (文本, 字号, 角度) 只光栅一次。水印等倾斜平铺
-    // 文本用它与 MeasureText 自己算包围盒。
-    void DrawTextRot(int x, int y, string text, int color, int fontSize,
-    int angleDeg) {
-        if (text == null || text == "" || fontSize <= 0) { return; }
-        App.PaintHashText(21, x, y, color, fontSize, text);
-        App.PaintHashOp(0, angleDeg, 0, 0, 0);
-        zan_gui_draw_text_rot(surfaceId, x, y, text, color, fontSize, angleDeg);
-    }
-
-    // 在矩形内居中绘制文本。
-    void DrawTextCentered(int rx, int ry, int rw, int rh, string text, int color, int fontSize) {
-        if (text == null || text == "" || rw <= 0 || rh <= 0 || fontSize <= 0) { return; }
-        App.PaintHashOp(22, rx, ry, rw, rh);
-        App.PaintHashText(0, color, fontSize, 0, 0, text);
-        int tw = Canvas.MeasureText(text, fontSize);
-        int tx = rx + ((rw - tw) >> 1);
-        int ty = Canvas.CenterTextY(ry, rh, fontSize);
-        if (tx < rx) { tx = rx; }
-        if (ty < ry) { ty = ry; }
-        zan_gui_draw_text(surfaceId, tx, ty, text, color, fontSize);
-    }
-
-    // ASCII 字符度量缓存表（字号范围 8..48，字符 32..126 共 95 字符）。
-    // 在语法高亮、单字切分与 TextWrap 中频繁调用单字符测量，
-    // 查表短路可规避跨 P/Invoke 封送与底层 C 文本哈希开销。
-    static int[] asciiCharWidths;
-    static string[] measCacheStr;
-    static int[] measCacheSize;
-    static int[] measCacheW;
-    static int[] fontHeightCache;
-    static int[] fontAscentCache;
-
-    static int TextMeasHash(string s, int size) {
-        int h = size * 397;
-        int len = s.Length;
-        if (len > 8) { len = 8; }
-        for (int i = 0; i < len; i = i + 1) {
-            h = (h * 31) + s[i];
-        }
-        int slot = h & 255;
-        if (slot < 0) { slot = 0 - slot; }
-        return slot;
-    }
-
-    // 测量单字符宽度（像素），专供 TextWrap、词法高亮与单字切分热路径使用，
-    // ASCII 字符直接命中查表，彻底消除逐字符生成 1 字节临时 string 对象的堆分配开销。
-    static int MeasureChar(int ch, int fontSize) {
-        if (fontSize >= 8 && fontSize <= 48 && ch >= 32 && ch <= 126) {
-            if (asciiCharWidths == null) {
-                asciiCharWidths = new int[41 * 95];
-            }
-            int idx = (fontSize - 8) * 95 + (ch - 32);
-            int cached = asciiCharWidths[idx];
-            if (cached > 0) { return cached; }
-            string s = Text.CharStr(ch);
-            int w = zan_gui_measure_text(s, fontSize);
-            if (w > 0) { asciiCharWidths[idx] = w; }
-            return w;
-        }
-        return Canvas.MeasureText(Text.CharStr(ch), fontSize);
-    }
-
-    // 测量文本宽度（像素）。
-    static int MeasureText(string text, int fontSize) {
-        if (text == null || text == "") { return 0; }
-        int len = text.Length;
-        if (len == 1 && fontSize >= 8 && fontSize <= 48) {
-            int ch = text[0];
-            if (ch >= 32 && ch <= 126) {
-                if (asciiCharWidths == null) {
-                    asciiCharWidths = new int[41 * 95];
-                }
-                int idx = (fontSize - 8) * 95 + (ch - 32);
-                int cached = asciiCharWidths[idx];
-                if (cached > 0) { return cached; }
-                int w = zan_gui_measure_text(text, fontSize);
-                if (w > 0) { asciiCharWidths[idx] = w; }
-                return w;
-            }
-        }
-        if (len <= 48) {
-            if (measCacheStr == null) {
-                measCacheStr = new string[256];
-                measCacheSize = new int[256];
-                measCacheW = new int[256];
-            }
-            int slot = Canvas.TextMeasHash(text, fontSize);
-            if (measCacheSize[slot] == fontSize && measCacheStr[slot] == text) {
-                return measCacheW[slot];
-            }
-            int w2 = zan_gui_measure_text(text, fontSize);
-            measCacheStr[slot] = text;
-            measCacheSize[slot] = fontSize;
-            measCacheW[slot] = w2;
-            return w2;
-        }
-        return zan_gui_measure_text(text, fontSize);
-    }
-
-    // 返回字体高度（像素）。字号查表缓存规避高频排版与测量布局跨语言 P/Invoke 开销。
-    static int FontHeight(int fontSize) {
-        if (fontSize >= 0 && fontSize < 128) {
-            if (fontHeightCache == null) {
-                fontHeightCache = new int[128];
-            }
-            int h = fontHeightCache[fontSize];
-            if (h > 0) { return h; }
-            h = zan_gui_font_height(fontSize);
-            if (h > 0) { fontHeightCache[fontSize] = h; }
-            return h;
-        }
-        return zan_gui_font_height(fontSize);
-    }
-
-    // 基线上方的高度（GDI tmAscent / FreeType ascender）。行盒
-    // baseline 数学用：同一系统字体在 Chrome 的行布局要逐像素
-    // 对上，inline 盒必须按真基线放。异常度量时回退整格高。
-    static int FontAscent(int fontSize) {
-        if (fontSize >= 0 && fontSize < 128) {
-            if (fontAscentCache == null) {
-                fontAscentCache = new int[128];
-            }
-            int a = fontAscentCache[fontSize];
-            if (a > 0) { return a; }
-            int raw = zan_gui_font_ascent(fontSize);
-            int fh = Canvas.FontHeight(fontSize);
-            if (raw <= 0 || raw > fh) { a = fh; } else { a = raw; }
-            if (a > 0) { fontAscentCache[fontSize] = a; }
-            return a;
-        }
-        int a2 = zan_gui_font_ascent(fontSize);
-        int fh2 = Canvas.FontHeight(fontSize);
-        if (a2 <= 0 || a2 > fh2) {
-            return fh2;
-        }
-        return a2;
-    }
-
-    // 栅格化器在 FontHeight 内字形墨迹上方留下的空行
-    // （字体的内部 leading / 行距）。
-    // 由各后端已导出的两个度量推导，而非
-    // 单独调用度量：`fontSize` 是所请求的 em 尺寸，
-    // `FontHeight` 是栅格化器为其报告的行盒，
-    // 二者之差正是它加的 leading。将此逻辑留在 Zan 中也
-    // 使原生 ABI 不变——用户项目链接的预编译
-    // 各平台驱动中没有新的 `zan_gui` 导出。
-    static int FontPadTop(int fontSize) {
-        int pad = Canvas.FontHeight(fontSize) - fontSize;
-        if (pad < 0) { pad = 0; }
-        return pad;
-    }
-
-    // 在 [rectY, rectY+rectH] 内光学居中一行文本的顶部 y：
-    // 居中墨迹盒而非整个字体盒，因此
-    // 文本不会因半个内部 leading 而偏低。所有
-    // 垂直文本居中都应走此函数。
-    static int CenterTextY(int rectY, int rectH, int fontSize) {
-        return rectY
-        + ((rectH - Canvas.FontHeight(fontSize)
-        - Canvas.FontLeadTop(fontSize)) >> 1);
-    }
-
-    // 字体内部 leading 位于字形墨迹上方的部分。
-    // 栅格器按基线放置字形：墨迹顶部在 y 之下约一整个
-    // leading（ascent 头部空间盖过它的只剩一点），但
-    // 墨迹盒也比 fontSize 矮（大写字母不含下延部），两者
-    // 方向相反、大部分相抵——实测（Windows GDI Segoe/微软雅黑、
-    // Android FreeType Roboto/Noto CJK，48px 按钮探针）只补
-    // 四分之一 leading 时大写拉丁与 CJK 标签都落在 ±1px 内；
-    // 补一半（旧值）文本整体偏高 2~3px，全补则偏低。
-    static int FontLeadTop(int fontSize) {
-        return Canvas.FontPadTop(fontSize) >> 2;
-    }
-
-    // 以 `centerY` 为中心光学居中一行文本的顶部 y（
-    // 刻度、节点、切片标签——任何按中线而非
-    // 按盒子定位的东西）。墨迹盒横跨 `centerY`，因此文本不会
-    // 因半个内部 leading 而偏低，与 CenterTextY 一致。
-    static int CenterTextYAt(int centerY, int fontSize) {
-        return centerY - ((Canvas.FontHeight(fontSize)
-        + Canvas.FontLeadTop(fontSize)) >> 1);
-    }
-
-    // 在盒子内以矢量图元绘制图标字形（Unicode 码点），
-    // 使其在所有平台外观一致。
-    // 形状见 Gui.IconVector。
-    void DrawIcon(int x, int y, int box, int color, int codepoint) {
-        IconVector.Draw(this, x, y, box, color, codepoint);
-    }
-
-    // 以已解析样式携带的颜色和字号绘制文本，
-    // CSS 未设置的内容回退到调用方的值。
-    // 调用方自行解析样式（Style.Of / Style.Part），因此文本
-    // 绘制无需中间控件。
-    void DrawStyledText(StyleBox s, int x, int y, string text,
-    int fallbackColor, int fallbackFont) {
-        int fs = s.FontOr(fallbackFont);
-        int fg = s.FgOr(fallbackColor);
-        App.PaintHashText(19, x, y, fg, fs, text);
-        zan_gui_draw_text(surfaceId, x, y, text, fg, fs);
-    }
-
-    // DrawGlyph/DrawGlyphIn 共用的 SVG 候选名解析：语义名先过
-    // Icon.SvgName 差异映射与 IconSvg 别名，命中 IconSvgData 才返回，
-    // 否则返回 ""（调用方回退 IconVector 手绘，行为同从前）。
-    static string GlyphSvg(string name) {
-        string svg = Icon.SvgName(name);
-        if (svg == "") { svg = name; }
-        svg = IconSvg.Alias(svg);
-        if (IconSvgData.IndexOf(svg) >= 0) { return svg; }
-        return "";
-    }
-
-    // 在 (x,y) 的 `size` 盒子内绘制 `name` 代表的图标
-    // （图标集见 Gui.Icon）。优先画 SVG 图标集（跨平台一致、不依赖
-    // 系统字体），SVG 里没有的名字回退 IconVector 矢量图元；
-    // 两者都不认识时什么都不画。
-    void DrawGlyph(string name, int x, int y, int size, int color) {
-        string svg = Canvas.GlyphSvg(name);
-        if (svg != "") {
-            IconSvg.Draw(this, svg, x, y, size, color);
-            return;
-        }
-        int cp = Icon.Codepoint(name);
-        if (cp == 0) { return; }
-        IconVector.Draw(this, x, y, size, color, cp);
-    }
-
-    // 在矩形内居中绘制 `name` 代表的图标，这正是
-    // 控件内图标无论控件高度
-    // 如何都保持对齐的原因。SVG 优先、IconVector 回退，同 DrawGlyph。
-    void DrawGlyphIn(string name, int rx, int ry, int rw, int rh,
-    int size, int color) {
-        string svg = Canvas.GlyphSvg(name);
-        if (svg != "") {
-            IconSvg.Draw(this, svg, rx + (rw - size) / 2,
-            ry + (rh - size) / 2, size, color);
-            return;
-        }
-        int cp = Icon.Codepoint(name);
-        if (cp == 0) { return; }
-        IconVector.Draw(this, rx + (rw - size) / 2, ry + (rh - size) / 2,
-        size, color, cp);
-    }
-
-    // 图像文件（PNG/JPEG/BMP/GIF/TGA/PNM/PSD，WebP）或已注册
-    // 的内存图像 key 的像素宽度，首次使用时解码并缓存。无法加载时
-    // 返回 0。
-    static int ImageWidth(string path) {
-        return ImageCodec.Width(path);
-    }
-
-    // 图像文件或内存图像 key 的像素高度。参见 ImageWidth。
-    static int ImageHeight(string path) {
-        return ImageCodec.Height(path);
-    }
-
-    // 丢弃缓存的解码图像（文件路径或 ImageLoadMem /
-    // ImageLoadSvg 注册的内存 key），使下次绘制重新加载源。
-    static void EvictImage(string path) {
-        ImageCodec.Evict(path);
-    }
-
-    // 把一段原始图像字节注册到 `key` 下并返回图像宽度，失败
-    // 返回 0。解码支持 PNG/JPEG/BMP/GIF/TGA/PNM/PSD（stb_image）与
-    // WebP（内置 libwebp，按 RIFF 头识别）。注册后这个 key 可以像
-    // 文件路径一样传给 ImageWidth/ImageHeight/BlitImage/EvictImage；
-    // 重复注册同一个活跃 key 是无操作。key 约定用 `mem:` 前缀。
-    static int ImageLoadMem(string key, string data, int len) {
-        return ImageCodec.LoadMem(key, data, len);
-    }
-
-    // byte[] 重载，参见 ImageLoadMem(string, string, int)。
-    static int ImageLoadMem(string key, byte[] data, int len) {
-        return ImageCodec.LoadMem(key, data, len);
-    }
-
-    // 把 SVG 文本光栅化到 `key` 下并返回光栅宽度，失败返回
-    // 0。rasterW/rasterH 是目标盒：文档保持纵横比 contain 适配；
-    // <= 0 时用文档固有尺寸。之后这个 key 同样可以像文件路径一样
-    // 使用（key 约定用 `mem:` 前缀）。
-    static int ImageLoadSvg(string key, string svg, int rasterW, int rasterH) {
-        return ImageCodec.LoadSvg(key, svg, rasterW, rasterH);
-    }
-
-    // 把已有的 ARGB32 像素（0xAARRGGBB，顶行优先）注册到 `key`
-    // 下并返回宽度，失败返回 0。key 约定用 `mem:` 前缀；注册后这个
-    // key 同样可以像文件路径一样用于 BlitImage/DrawImage 等。
-    // 用于"像素不是某个文件格式、但要当图贴"的场合——例如从 exe
-    // 资源里取出的程序图标。
-    static int ImageRegisterArgb(string key, int[] pixels, int width, int height) {
-        if (key == null || !key.StartsWith("mem:")) { return 0; }
-        if (pixels == null || width <= 0 || height <= 0) { return 0; }
-        long count = (long)width * (long)height;
-        if (count > pixels.Length || count > 16777216) { return 0; }
-        nint buf = NativeMemory.Alloc((int)count * 4);
-        if (buf == 0) { return 0; }
-        try {
-            Span<int> view = new Span<int>(buf, (int)count);
-            for (int i = 0; i < (int)count; i = i + 1) {
-                view[i] = pixels[i];
-            }
-            return zan_image_register_argb(key, buf, width, height, width);
-        } finally {
-            NativeMemory.Free(buf);
-        }
-    }
-
-    // byte[] 重载（二进制安全的 SVG 源，例如 base64 data URI
-    // 解出的字节），参见 ImageLoadSvg(string, string, int, int)；
-    // `len` 是字节数。
-    static int ImageLoadSvg(string key, byte[] svg, int len, int rasterW,
-    int rasterH) {
-        return ImageCodec.LoadSvg(key, svg, len, rasterW, rasterH);
-    }
-
-    // 读一帧里的一个像素（0xAARRGGBB），越界返回 -1。
-    // 供测试断言采样结果，应用代码一般不需要。
-    int GetPixel(int x, int y) {
-        return zan_gui_read_pixel(surfaceId, x, y);
-    }
-
-    // 只读捕获已绘制的整表面，按最终窗口轮廓注册 straight-alpha
-    // 内存图片到稳定的 mem: key。mask 由调用方跨帧保活；regions 为已平移
-    // 好的逻辑窗形，dpiScale 为百分比。GPU 会先 flush/readback。
-    // 返回 false 时不得绘制 key（它可能仍是上一帧）；空轮廓直接走
-    // BlitSurfaceScaled。成功后可 BlitImage，销毁预览时 EvictImage(key)。
-    // 不修改原表面，也不裁切 retained tree 中途的绘制。
-    bool SnapshotWindowShape(string key, WindowShapeMask mask,
-    List<WindowShapeRegion> regions, int dpiScale) {
-        return this.SnapshotWindowShape(key, mask, regions, dpiScale, 100);
-    }
-
-    // 窗口整体透明度与系统 SourceConstantAlpha 使用同一 0..255 取整。
-    // 无轮廓而透明度低于 100 时捕获完整矩形。
-    bool SnapshotWindowShape(string key, WindowShapeMask mask,
-    List<WindowShapeRegion> regions, int dpiScale,
-    int opacityPercent) {
-        bool shaped = regions != null && regions.Count > 0;
-        if (mask == null || (!shaped && opacityPercent >= 100)
-        || !key.StartsWith("mem:")) { return false; }
-        if (opacityPercent < 10) { opacityPercent = 10; }
-        if (opacityPercent > 100) { opacityPercent = 100; }
-        int opacity = opacityPercent * 255 / 100;
-        int width = this.Width();
-        int height = this.Height();
-        long count = (long)width * height;
-        if (width <= 0 || height <= 0 || count > 536870911) { return false; }
-        byte[] coverage = shaped ? mask.Coverage(width, height, dpiScale, regions) : null;
-        if (shaped && coverage == null) { return false; }
-        nint source = zan_gui_get_pixels(surfaceId);
-        if (source == 0) { return false; }
-        int n = (int)count;
-        nint copy = NativeMemory.Alloc(n * 4);
-        if (copy == 0) { return false; }
-        try {
-            NativeMemory.Copy(copy, source, n * 4);
-            Span<int> pixels = new Span<int>(copy, n);
-            bool shadowBand = shaped && mask.HasShadowBand();
-
-            // 针对 100% 不透明且无特殊阴影带的绝大多数常规场景（99.9%），
-            // 绝大部分内部像素 (cov == 255) 与源缓冲完全一致，直接跳过计算与 Span 回写；
-            // 外部像素 (cov == 0) 直接置零，仅边缘过渡像素缩放 Alpha。
-            if (opacity >= 255 && !shadowBand) {
-                for (int i = 0; i < n; i = i + 1) {
-                    int cov = shaped ? (int)coverage[i] : 255;
-                    if (cov == 255) { continue; }
-                    if (cov <= 0) {
-                        pixels[i] = 0;
-                    } else {
-                        int p = pixels[i];
-                        int a = (((p >> 24) & 255) * cov) / 255;
-                        pixels[i] = (a << 24) | (p & 0x00FFFFFF);
-                    }
-                }
-            } else {
-                for (int i = 0; i < n; i = i + 1) {
-                    int cov = shaped ? (int)coverage[i] : 255;
-                    int pixel = WindowShapeMask.SnapshotStraightArgb(pixels[i], cov, shadowBand);
-                    int alpha = ((pixel >> 24) & 255) * opacity / 255;
-                    pixels[i] = (alpha << 24) | (pixel & 0x00FFFFFF);
-                }
-            }
-            return zan_image_register_argb(key, copy, width, height, width) == width;
-        } finally {
-            NativeMemory.Free(copy);
-        }
-    }
-
-    // 把图像文件的矩形区域绘制到画布（按路径解码一次并
-    // 缓存）并缩放到 (dw,dh)：缩小时对覆盖到的源像素做面积平均
-    // （box filter，避免 nearest 丢列/丢行的闪烁），放大或 1:1 时
-    // 按目标像素中心最近邻采样。传 sw=0,sh=0 以整幅图像为源。
-    void BlitImage(string path, int dx, int dy, int dw, int dh,
-    int sx, int sy, int sw, int sh) {
-        App.PaintHashText(23, dx, dy, dw, dh, path);
-        App.PaintHashOp(0, sx, sy, sw, sh);
-        // View 返回借用描述符，仅供本次同步绘制使用。
-        zan_gui_blit_pixels(surfaceId, ImageCodec.View(path),
-        dx, dy, dw, dh, sx, sy, sw, sh);
-    }
-
-    // 在 (x,y) 处不缩放地绘制整幅图像文件。
-    void DrawImage(string path, int x, int y) {
-        int w = Canvas.ImageWidth(path);
-        int h = Canvas.ImageHeight(path);
-        this.BlitImage(path, x, y, w, h, 0, 0, 0, 0);
-    }
-
-    // 绘制水平分隔线（1px 高）。
-    void DrawDivider(int x, int y, int width, int color) {
-        if (width <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(24, x, y, width, color);
-        zan_gui_fill_rect(surfaceId, x, y, width, 1, color);
-    }
-
-    // FillRect 的 Color 对象重载。
-    void FillRectColor(int x, int y, int w, int h, Color col) {
-        if (w <= 0 || h <= 0) { return; }
-        int argb = col.ToARGB();
-        if (argb == 0 || (argb & 0xFF000000) == 0) { return; }
-        App.PaintHashOp(1, x, y, w, h);
-        App.PaintHashOp(0, argb, 0, 0, 0);
-        zan_gui_fill_rect(surfaceId, x, y, w, h, argb);
-    }
-
-    // ---- 批量原语与表面合成（/ ） --------------------------
-
-    [DllImport("zan_gui")]
-    static extern void zan_gui_fill_rects(int surfaceId, nint data, int count);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_fill_circles(int surfaceId, nint data, int count);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_fill_radials(int surfaceId, nint data, int count);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_blit_surface(int dstId, int srcId, int dstX,
-    int dstY, int srcX, int srcY, int w, int h);
-    [DllImport("zan_gui")]
-    static extern void zan_gui_blit_surface_scaled(int dstId, int srcId,
-    int dstX, int dstY, int dstW, int dstH,
-    int srcX, int srcY, int srcW, int srcH);
-
-    // 批量原语的哈希喂入口：内容逐条折入——与逐原语路径同敏感度，
-    // 同条数不同内容也判得出变化（漏喂的后果是局部帧下内容变化不声明
-    // 损伤、画面静默冻结）。关闭 partialFrames 的 App 由 PaintHashArmed
-    // 整段跳过，不为批量提交付循环钱。
-    void PaintHashBatch(int op, nint data, int count, int stride) {
-        Span<int> items = new Span<int>(data, count * stride);
-        for (int i = 0; i < count; i = i + 1) {
-            int b = i * stride;
-            App.PaintHashOp(op, items[b], items[b + 1],
-            items[b + 2], items[b + 3]);
-            if (stride == 5) {
-                App.PaintHashOp(0, items[b + 4], 0, 0, 0);
-            }
-        }
-    }
-
-    // 批量纯色矩形：`data` 为打包 i32 缓冲，每条 x,y,w,h,argb。
-    // 一次 FFI 提交整组（命令缓冲类调用方的每类型一次提交通道）。
-    void FillRects(nint data, int count) {
-        if (count <= 0 || data == 0) { return; }
-        if (App.PaintHashArmed()) { PaintHashBatch(29, data, count, 5); }
-        zan_gui_fill_rects(surfaceId, data, count);
-    }
-
-    // 批量实心圆盘：`data` 每条 cx,cy,r,argb。
-    void FillCircles(nint data, int count) {
-        if (count <= 0 || data == 0) { return; }
-        if (App.PaintHashArmed()) { PaintHashBatch(30, data, count, 4); }
-        zan_gui_fill_circles(surfaceId, data, count);
-    }
-
-    // 批量径向光晕：`data` 每条 cx,cy,r,argb,innerAlpha。
-    void FillRadials(nint data, int count) {
-        if (count <= 0 || data == 0) { return; }
-        if (App.PaintHashArmed()) { PaintHashBatch(31, data, count, 5); }
-        zan_gui_fill_radials(surfaceId, data, count);
-    }
-
-    // 把 `src` 表面的 (srcX,srcY,w,h) 不透明地整块贴到本画布的
-    // (dstX,dstY)。行级 memcpy，遵守本画布当前裁剪窗（局部帧条带对
-    // 贴图合成同样生效）。供 GameViewport 离屏位图合成等使用。
-    // 哈希折几何与源表面 id；源内容的变化由"同段内的离屏渲染原语
-    // 折叠"承载（GameViewport 的 Scene.Render(off) 就在本控件自段里，
-    // 世界变了折出来的哈希自然变）。
-    void BlitSurface(Canvas src, int dstX, int dstY, int srcX, int srcY,
-    int w, int h) {
-        if (src == null || w <= 0 || h <= 0) { return; }
-        App.PaintHashOp(32, dstX, dstY, w, h);
-        App.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
-        zan_gui_blit_surface(surfaceId, src.surfaceId, dstX, dstY,
-        srcX, srcY, w, h);
-    }
-
-    // 将离屏表面的源矩形缩放合成到本画布，采样与裁剪遵循 BlitImage。
-    // 源 Canvas 由调用方保活；直接使用 surface，不注册图片或游戏贴图。
-    // 与 BlitSurface 一样，源内容变化由同段内的离屏绘制哈希承载。
-    void BlitSurfaceScaled(Canvas src, int dstX, int dstY, int dstW, int dstH,
-    int srcX, int srcY, int srcW, int srcH) {
-        if (src == null || dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0) { return; }
-        App.PaintHashOp(33, dstX, dstY, dstW, dstH);
-        App.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
-        App.PaintHashOp(0, srcW, srcH, 0, 0);
-        zan_gui_blit_surface_scaled(surfaceId, src.surfaceId,
-        dstX, dstY, dstW, dstH, srcX, srcY, srcW, srcH);
-    }
-
-    // DrawText 的 Color 对象重载。
-    void DrawTextColor(int x, int y, string text, Color col, int fontSize) {
-        if (text == null || text == "" || fontSize <= 0) { return; }
-        int argb = col.ToARGB();
-        if (argb == 0 || (argb & 0xFF000000) == 0) { return; }
-        App.PaintHashText(19, x, y, argb, fontSize, text);
-        zan_gui_draw_text(surfaceId, x, y, text, argb, fontSize);
-    }
-
-    // 当前显示器的 DPI 缩放倍数（100%=1，150%=1.5）。
-    // 所有逻辑坐标→设备像素的换算都应乘以它；
-    // 控件布局一般不必手动调用（App 层已统一处理），
-    // 自绘贴图/光标等直接按像素落笔的场景才需要。
-    static int GetDpiScale() {
-        return Gui.Backend.Platform.Shell().DpiScale();
-    }
 }
-

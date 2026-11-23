@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Gui.Backend;
-
 namespace Gui;
-
 public partial class App {
     int perfFrames;
     int perfRenderMs;
@@ -73,26 +71,15 @@ public partial class App {
     int lastInputMs;
     int lastInX;
     int lastInY;
-
-    static bool paintHashOn;
-    static long paintHashAcc;
     List<PaintHashToken> paintHashLegacy;
     Dictionary<int, long> paintHashStore;
-    static int perfMode;
     AppFrameDiagnostics frameDiagnostics;
-
     public void SetFrameDiagnostics(AppFrameDiagnostics sink) {
         frameDiagnostics = sink;
-        if (sink != null) { App.perfMode = 1; }
+        if (sink != null) { Gui.Diagnostics.GuiFrameProfiler.SetPerfOn(true); }
     }
-
     public AppFrameDiagnostics FrameDiagnostics() { return frameDiagnostics; }
-
-    // 启用可选帧分析器（ZAN_FRAME_PROF=1）时为真。
-    public static bool PerfOn() { return App.perfMode == 1; }
-
-    // 帧分析器的空闲侧：记一圈事件循环走了哪条等待路径、被什么
-    // 唤醒、在循环体外花了多少毫秒，每 2 秒往同一个日志追一行。
+    public static bool PerfOn() { return Gui.Diagnostics.GuiFrameProfiler.PerfOn(); }
     void PerfLoopTick(int t0, int path) {
         int now = Window.GetTickMs();
         perfLoops = perfLoops + 1;
@@ -106,18 +93,10 @@ public partial class App {
         else { perfEvOther = perfEvOther + 1; }
         this.PerfMaybeFlushLoop(now);
     }
-
-    // 把累计的循环/特效计数按 2 秒窗口落盘。除了事件循环本身，
-    // 纯特效 tick（FxPresent 在等待循环内就地呈现，不经过
-    // PerfLoopTick）也调用这里，否则安静的效果层会让日志整段
-    // 缺行，看起来像循环根本没在跑。
     void PerfMaybeFlushLoop(int now) {
         AppFrameDiagnostics sink = frameDiagnostics;
         if (sink != null) { sink.FlushLoop(this, now); }
     }
-
-    // 宿主在一大段绘制里埋的标记点：把自上一个标记以来的时间
-    // 记到 `name` 头上（空名字只重置起点），分析器关着时不做事。
     public void PerfMark(string name) {
         if (!App.PerfOn()) { return; }
         int now = Window.GetTickUs();
@@ -131,13 +110,11 @@ public partial class App {
             phaseMarkTop = name;
         }
     }
-
     public void PerfScopeBegin(int id) {
         if (!App.PerfOn()) { return; }
         scopeId = id;
         scopeAtUs = Window.GetTickUs();
     }
-
     public void PerfScopeEnd(int id) {
         if (!App.PerfOn()) { return; }
         int now = Window.GetTickUs();
@@ -148,7 +125,6 @@ public partial class App {
         phaseSecTopUs = d;
         phaseSecTop = Convert.ToString(id);
     }
-
     public void NoteRedrawWhy(string why) {
         if (!App.PerfOn()) { return; }
         if (redrawWhy == "") {
@@ -160,7 +136,6 @@ public partial class App {
             redrawCount = redrawCount + 1;
         }
     }
-
     void NoteFullFrameWhy() {
         if (!App.PerfOn()) { return; }
         if (fullWhy == null) { fullWhy = new List<WhyTally>(); }
@@ -175,7 +150,6 @@ public partial class App {
         WhyTally t = new WhyTally(key);
         fullWhy.Add(t);
     }
-
     string FullFrameWhyTop(int top) {
         if (fullWhy == null || fullWhy.Count == 0) { return "-"; }
         List<int> left = new List<int>();
@@ -200,18 +174,15 @@ public partial class App {
         if (outp == "") { return "-"; }
         return outp;
     }
-
     public void PerfNode(string kind, string nm, int us) {
         if (us <= phaseTopUs) { return; }
         phaseTopUs = us;
         phaseTopNode = kind + "#" + nm;
     }
-
     public void PhaseBegin() {
         if (!App.PerfOn()) { return; }
         phaseAtUs = Window.GetTickUs();
     }
-
     public void PhaseEnd(int slot) {
         if (!App.PerfOn()) { return; }
         int now = Window.GetTickUs();
@@ -223,24 +194,20 @@ public partial class App {
         else if (slot == 2) { phaseArrUs = phaseArrUs + d; }
         else { phaseTreeUs = phaseTreeUs + d; }
     }
-
     public static string UsAvg(int us, int n) {
         if (n <= 0) { n = 1; }
         int tenths = us / n / 100;
         return Convert.ToString(tenths / 10) + "."
             + Convert.ToString(tenths % 10);
     }
-
     public static string MsAvg(int total, int n) {
         if (n <= 0) { n = 1; }
         int tenths = total * 10 / n;
         return Convert.ToString(tenths / 10) + "."
             + Convert.ToString(tenths % 10);
     }
-
     public bool ForceFullFrames() { return !partialFrames; }
     public bool PartialFrames() { return partialFrames; }
-
     public void SetPartialFrames(bool on) {
         this.partialFrames = on;
         if (!on) {
@@ -248,31 +215,22 @@ public partial class App {
             needsRedraw = true;
         }
     }
-
-    // A segment owns only its direct commands. Nested retained or non-tree
-    // painters restore the parent's prefix instead of feeding it child commands.
     public PaintHashToken PaintHashBeginScope() {
         PaintHashToken token;
-        token.armed = paintHashOn;
-        token.accumulator = paintHashAcc;
-        if (token.armed) { paintHashAcc = 5381; }
+        token.armed = Canvas.paintHashOn;
+        token.accumulator = Canvas.paintHashAcc;
+        if (token.armed) { Canvas.paintHashAcc = 5381; }
         return token;
     }
-
     public static void PaintHashRestore(PaintHashToken token) {
-        paintHashOn = token.armed;
-        paintHashAcc = token.accumulator;
+        Canvas.paintHashOn = token.armed;
+        Canvas.paintHashAcc = token.accumulator;
     }
-
-    // End commits only a successfully painted segment. Always Restore in finally;
-    // an exceptional segment must not replace its last successful fingerprint.
     public void PaintHashEndSelf(PaintHashToken token, int id, int x, int y, int w, int h) {
-        long cur = paintHashAcc;
+        long cur = Canvas.paintHashAcc;
         App.PaintHashRestore(token);
         if (!token.armed) { return; }
-        if (paintHashStore == null) {
-            paintHashStore = new Dictionary<int, long>();
-        }
+        if (paintHashStore == null) { paintHashStore = new Dictionary<int, long>(); }
         long prev = 0;
         bool had = paintHashStore.TryGetValue(id, out prev);
         if (had && prev == cur) { return; }
@@ -281,17 +239,13 @@ public partial class App {
         if (!partialFrame || this.FrameDamageContains(x, y, w, h)) { return; }
         this.NoteDamage(x, y, w, h);
     }
-
-    // Compatibility for existing SDK callers. New callers use value tokens so
-    // finally can also unwind an incomplete paint without committing its hash.
     public bool PaintHashBegin() {
-        if (!paintHashOn) { return false; }
+        if (!Canvas.paintHashOn) { return false; }
         PaintHashToken token = this.PaintHashBeginScope();
         if (paintHashLegacy == null) { paintHashLegacy = new List<PaintHashToken>(); }
         paintHashLegacy.Add(token);
         return true;
     }
-
     public void PaintHashEndSelf(int id, int x, int y, int w, int h) {
         if (paintHashLegacy == null || paintHashLegacy.Count == 0) { return; }
         int last = paintHashLegacy.Count - 1;
@@ -299,63 +253,16 @@ public partial class App {
         paintHashLegacy.RemoveAt(last);
         this.PaintHashEndSelf(token, id, x, y, w, h);
     }
-
-    public static bool PaintHashSuspend() {
-        bool armed = paintHashOn;
-        paintHashOn = false;
-        return armed;
-    }
-
-    public static void PaintHashResume(bool armed) {
-        paintHashOn = armed;
-    }
-
-    public static void PaintHashOp(int op, int a, int b, int c, int d) {
-        if (!paintHashOn) { return; }
-        long h = paintHashAcc;
-        h = (h * 1099511628211) ^ op;
-        h = (h * 1099511628211) ^ a;
-        h = (h * 1099511628211) ^ b;
-        h = (h * 1099511628211) ^ c;
-        h = (h * 1099511628211) ^ d;
-        paintHashAcc = h;
-    }
-
+    public static bool PaintHashSuspend() { return Canvas.PaintHashSuspend(); }
+    public static void PaintHashResume(bool armed) { Canvas.PaintHashResume(armed); }
+    public static void PaintHashOp(int op, int a, int b, int c, int d) { Canvas.PaintHashOp(op, a, b, c, d); }
     public static void PaintHashText(int op, int a, int b, int c, int d, string text) {
-        if (!paintHashOn) { return; }
-        long h = paintHashAcc;
-        h = (h * 1099511628211) ^ op;
-        h = (h * 1099511628211) ^ a;
-        h = (h * 1099511628211) ^ b;
-        h = (h * 1099511628211) ^ c;
-        h = (h * 1099511628211) ^ d;
-        int n = text.Length;
-        h = (h * 1099511628211) ^ n;
-        for (int i = 0; i < n; i = i + 1) {
-            h = (h * 1099511628211) ^ text[i];
-        }
-        paintHashAcc = h;
+        Canvas.PaintHashText(op, a, b, c, d, text);
     }
-
-    public static void PaintHashList(List<int> xs) {
-        if (!paintHashOn) { return; }
-        long h = paintHashAcc;
-        int n = xs.Count;
-        h = (h * 1099511628211) ^ n;
-        for (int i = 0; i < n; i = i + 1) {
-            h = (h * 1099511628211) ^ xs[i];
-        }
-        paintHashAcc = h;
-    }
-
-    public static bool PaintHashArmed() {
-        return paintHashOn;
-    }
-
+    public static void PaintHashList(List<int> xs) { Canvas.PaintHashList(xs); }
+    public static bool PaintHashArmed() { return Canvas.PaintHashArmed(); }
     public int RenderBackendMode() { return renderBackendMode; }
-
     public string RenderBackendName() { return Canvas.Backend(); }
-
     public int SetRenderBackend(int mode) {
         this.renderBackendMode = mode;
         int got = Canvas.SetBackend(mode);
@@ -363,9 +270,7 @@ public partial class App {
         needsRedraw = true;
         return got;
     }
-
     public static int FxSnapSlot() { return 384; }
-
     public static string RasterLine(int frames) {
         List<string> names = new List<string>{
             "fill",
@@ -424,17 +329,14 @@ public partial class App {
         }
         return line;
     }
-
     void RecordFramePerf(int perfBeginMs, int perfPreMs, int endMs, bool partialFrame) {
         AppFrameDiagnostics sink = frameDiagnostics;
         if (sink != null) { sink.RecordFrame(this, perfBeginMs, perfPreMs, endMs, partialFrame); }
     }
 }
-
 public class WhyTally {
     public string why;
     public int n;
-
     public WhyTally(string why) {
         this.why = why;
         this.n = 1;

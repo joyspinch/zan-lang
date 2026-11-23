@@ -1,77 +1,34 @@
 using System.Collections.Generic;
 using System;
 using Gui;
-
 namespace Gui.Widget;
-
-// 滑块（对齐 Naive UI n-slider）：响应式 int 绑定与实时拖拽 / 点击定位，
-// 双柄范围（range）、垂直（vertical）、倒转（reverse）、标记刻度
-// （marks，AddMark(值, 文案)）、限取标记值（stepMark，即 step="mark"）、
-// 拖拽值气泡（tooltip / showTooltip / tipFormat 模板）、键盘微调
-// （keyboard）与 Disabled 禁用态（皮肤 `slider:disabled`）。
-// 所有尺寸均按 DPI 缩放。
-// C# 风格保留式实例：
-// vol.Change += () => { ... };   // 拖动过程中值变化时触发
-// 范围模式（值 = [Low, High] 区间，Naive UI range）：
-// rg.range = true;
-// rg.Value = rangeModel.lo;       // 低值双向绑定
-// rg.HighValue = rangeModel.hi;   // 高值双向绑定
-// rg.Low(); rg.High(); rg.SetRange(20, 70);
-// 标记刻度（Naive UI marks / step="mark"）：
-// sl.AddMark(20, "20°C"); sl.AddMark(37, "37°C");
-// sl.stepMark = true;            // 只能停在标记值上
-// 垂直（Naive UI vertical）：布局里给足高度（Grow/Prefer），
-// 立即模式直接调用请用 RenderIn 显式给 height。
+[GuiKind("Slider")]
 public class Slider : Control {
-    // 量程端点；构造时 maxVal < minVal 会归一为相等。
+    public override Control CreateCloneShell() { return new Slider(); }
     public int minVal;
     public int maxVal;
-    // 单值模式的值；range 模式下是低值（Naive UI value[0]）。
     public Binding<int> Value;
     public Binding<int> HighValue;
     public Control trackNode;
     public Control fillNode;
     public Control thumbNode;
     public Control hiThumbNode;
-    // 值变化时触发（C# 风格：`s.Change += h;`）。
     public UiEvent Change;
-    // 拖拽/定位手势正常松开时触发（捕获允许在控件外完成；取消不触发）。
     public UiEvent DragEnd;
-    // 拖动步长（Naive UI step prop）。0 = 任意（默认）。
     public int step;
-    // 范围模式（Naive UI range）：双滑块钮，值是 [Low, High] 区间。
     public bool range;
-    // 垂直模式（Naive UI vertical）：轨道竖放，min 在下、值向上增长。
     public bool vertical;
-    // 倒转（Naive UI reverse）：轨道调头，min 落在右端 / 顶端。
     public bool reverse;
-    // 拖拽 / 悬停圆钮时显示值气泡（Naive UI tooltip，默认开）。
     public bool tooltip;
-    // 始终显示值气泡（Naive UI show-tooltip）。
     public bool showTooltip;
-    // 气泡文案模板（Naive UI format-tooltip）："{v}" 替换为当前值，
-    // 如 "{v}%"。空 = 直接显示数字。
     public string tipFormat;
-    // 只能取标记值（Naive UI step="mark"）。
     public bool stepMark;
-    // 键盘方向键微调（Naive UI keyboard prop，默认开）。
     public bool keyboard;
-    // 标记刻度：AddMark(值, 文案)，按值升序保持（以 SliderMarkItem 实体承载，消除平行列表）。
     public List<SliderMarkItem> marks;
-    // designer 往返串："20=20°C|37=37°C"（GetExtra/SetExtra("marks")）。
     public string marksSpec;
-    // 正在拖拽的钮：0 无 / 1 低（单值）/ 2 高。按住期间保持，
-    // 松开清零——按轨道选中"最近的钮"只在按下那一刻决定。
     public int dragThumb;
-    // range 模式里最近一次编辑的钮，键盘微调作用于它。
     public int lastEdited;
-
-    // id 段（WidgetId.Block(32)）：wid = 轨道（焦点/键盘/点击定位），
-    // wid+1 = 低值钮，wid+2 = 高值钮，wid+8+i = 第 i 个标记（上限 24）。
     public static int MarkCap() { return 24; }
-
-    // 将任意值量化到 `step` 整数倍 / 最近的标记值，再夹回
-    // `[min, max]`——先量化后夹，max 端点永远可达。
     public int Quantize(int v) {
         if (stepMark && marks.Count > 0) {
             v = this.NearestMarkVal(v);
@@ -83,8 +40,6 @@ public class Slider : Control {
         if (v > maxVal) { v = maxVal; }
         return v;
     }
-
-    // 离 `v` 最近的标记值（marks 已升序，等距取更小者）。
     public int NearestMarkVal(int v) {
         int best = marks[0].value;
         int bd = 2000000000;
@@ -95,8 +50,6 @@ public class Slider : Control {
         }
         return best;
     }
-
-    // 下一个 / 上一个标记值；没有更远的标记时夹到 max / min。
     public int NextMarkVal(int v, bool up) {
         int best = up ? maxVal : minVal;
         for (int i = 0; i < marks.Count; i = i + 1) {
@@ -109,38 +62,27 @@ public class Slider : Control {
         }
         return best;
     }
-
-    // 键盘步进 +1 档：stepMark 时在标记间跳，否则按 step（缺省 1）。
     public int StepUpVal(int v) {
         if (stepMark && marks.Count > 0) { return this.NextMarkVal(v, true); }
         int s = step > 0 ? step : 1;
         return v + s;
     }
-
-    // 键盘步进 -1 档。
     public int StepDownVal(int v) {
         if (stepMark && marks.Count > 0) { return this.NextMarkVal(v, false); }
         int s = step > 0 ? step : 1;
         return v - s;
     }
-
-    // 量程宽度（min == max 时按 1，防除零）。
     public int Span() {
         int r = maxVal - minVal;
         if (r < 1) { r = 1; }
         return r;
     }
-
-    // 值 → 千分比（0..1000）。
     public int FracOf(int v) {
         int f = (v - minVal) * 1000 / Span();
         if (f < 0) { f = 0; }
         if (f > 1000) { f = 1000; }
         return f;
     }
-
-    // 千分比 → 轨道上的像素位置。默认：横向 min 在左、竖向 min 在下；
-    // reverse 把起点换到右端 / 顶端。
     public int PxAt(int f, int pos, int len) {
         int off = f * len / 1000;
         if (vertical) {
@@ -150,30 +92,22 @@ public class Slider : Control {
         if (reverse) { return pos + len - off; }
         return pos + off;
     }
-
-    // 轨道上的指针位置 → 量化后的值（横向/竖向、reverse 通吃）。
     public int ValAt(int p, int pos, int len) {
         int rel = p - pos;
         if (rel < 0) { rel = 0; }
         if (rel > len) { rel = len; }
-        // 横向默认 min 在左（rel 即进度）；竖向默认 min 在下
-        // （要翻一次）。reverse 再翻一次 → 恰好是 vertical != reverse。
         if (vertical != reverse) { rel = len - rel; }
         if (len <= 0) { return this.Quantize(minVal); }
         int delta = (int)(((long)rel * this.Span() + len / 2) / len);
         return this.Quantize(minVal + delta);
     }
-
-    // 气泡文案：tipFormat 里的 "{v}" 替换为值（Naive UI format-tooltip）。
     public string TipText(int v) {
         string num = Convert.ToString(v);
         if (tipFormat == null || tipFormat == "") { return num; }
         return tipFormat.Replace("{v}", num);
     }
-
-    // 公共初始化（各构造共用）。
     private void InitSlider(int lo, int hi) {
-        this.InitControl("slider", 1);
+        this.InitControl("slider");
         if (hi < lo) { hi = lo; }
         minVal = lo;
         maxVal = hi;
@@ -195,7 +129,6 @@ public class Slider : Control {
         marksSpec = "";
         dragThumb = 0;
         lastEdited = 1;
-
         this.ClassName = "slider";
         trackNode = new Control { ClassName = "slider-track" };
         fillNode = new Control { ClassName = "slider-fill" };
@@ -204,31 +137,54 @@ public class Slider : Control {
         this.Add(trackNode);
         this.Add(thumbNode);
     }
-
     public Slider() : this(0, 100) { }
-
-    // 自持绑定：`Slider vol = new Slider(0, 100);`，之后通过 `.Value` 双向绑定，
-    // 调用点无需任何信号接线。
-    public Slider(int lo, int hi) {
-        InitSlider(lo, hi);
+    public Slider(int lo, int hi) { InitSlider(lo, hi); }
+    public int Minimum {
+        get { return minVal; }
+        set { minVal = value; }
     }
-
-    // 当前值（单值模式即值，range 模式为低值）。
-
-    // range 模式的低值（单值模式与 Value() 相同）。
+    public int Maximum {
+        get { return maxVal; }
+        set { maxVal = value; }
+    }
+    public int Step {
+        get { return step; }
+        set { step = value; }
+    }
+    public bool IsRange {
+        get { return range; }
+        set { range = value; }
+    }
+    public bool IsVertical {
+        get { return vertical; }
+        set { vertical = value; }
+    }
+    public bool IsReverse {
+        get { return reverse; }
+        set { reverse = value; }
+    }
+    public bool ShowTooltip {
+        get { return showTooltip; }
+        set { showTooltip = value; }
+    }
+    public string TooltipFormat {
+        get { return tipFormat; }
+        set { tipFormat = value != null ? value : ""; }
+    }
+    public bool StepOnMarks {
+        get { return stepMark; }
+        set { stepMark = value; }
+    }
+    public string MarksSpec {
+        get { return this.MarksText(); }
+        set { this.SetMarksText(value); }
+    }
     public int Low() { return Value.Get(); }
-
-    // range 模式的高值（单值模式返回同一个值）。
     public int High() { return range ? HighValue.Get() : Value.Get(); }
-
-    // 写入当前值（量化 + 同步双向绑定）。不触发 Change——
-    // 程序化赋值不算用户手势。
     public void SetValue(int v) {
         v = this.Quantize(v);
         Value.Set(v);
     }
-
-    // 一次写入区间两端（各自量化并保持 low <= high）。
     public void SetRange(int lo, int hi) {
         lo = this.Quantize(lo);
         hi = this.Quantize(hi);
@@ -236,9 +192,6 @@ public class Slider : Control {
         Value.Set(lo);
         HighValue.Set(hi);
     }
-
-    // 加一枚标记刻度（Naive UI marks 的成员）。同值重复添加覆盖
-    // 文案；列表保持按值升序。
     public void AddMark(int v, string label) {
         List<SliderMarkItem> ms = new List<SliderMarkItem>();
         bool placed = false;
@@ -258,23 +211,13 @@ public class Slider : Control {
         marks = ms;
         marksSpec = this.MarksText();
     }
-
-    // 清空全部标记刻度。
     public void ClearMarks() {
         marks = new List<SliderMarkItem>();
         marksSpec = "";
     }
-
-    // 标记数。
     public int MarkCount() { return marks.Count; }
-
-    // 第 i 个标记的值（不查越界）。
     public int MarkValueAt(int i) { return marks[i].value; }
-
-    // 第 i 个标记的文案（不查越界）。
     public string MarkLabelAt(int i) { return marks[i].label; }
-
-    // designer 往返串："20=20°C|37=37°C|100=100°C"。
     public string MarksText() {
         string s = "";
         for (int i = 0; i < marks.Count; i = i + 1) {
@@ -283,8 +226,6 @@ public class Slider : Control {
         }
         return s;
     }
-
-    // 解析 MarksText 往返串并整体重建标记。
     public void SetMarksText(string spec) {
         marks = new List<SliderMarkItem>();
         marksSpec = "";
@@ -302,24 +243,14 @@ public class Slider : Control {
             }
         }
     }
-
-    // 设计器挂钩：marks 不是单个字段，走 "20=20°C|37=37°C" 串往返。
-    public override string GetExtra(string key) {
-        return "";
-    }
-
-    // 覆写：写回扩展属性，"marks" 走 SetMarksText 往返串。
-    public override bool SetExtra(string key, string val) {
-        return false;
-    }
-
+    public override string GetExtra(string key) { return ""; }
+    public override bool SetExtra(string key, string val) { return false; }
     public override string EffectiveClass() {
         string classes = base.EffectiveClass();
         if (vertical) { classes = classes + " vertical"; }
         if (this.IsDisabled()) { classes = classes + " disabled"; }
         return classes;
     }
-
     public override void SyncBinding() {
         base.SyncBinding();
         if (range && hiThumbNode == null) {
@@ -328,7 +259,6 @@ public class Slider : Control {
         }
         if (hiThumbNode != null) { hiThumbNode.SetShown(range); }
     }
-
     public override void Arrange(int x, int y, int width, int height) {
         base.Arrange(x, y, width, height);
         int innerX = bx + this.StyleInsetL();
@@ -366,45 +296,22 @@ public class Slider : Control {
             }
         }
     }
-
-    // 覆写：公共事件之外提供 "Change" 与 "DragEnd"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
         e.Add("DragEnd");
         return e;
     }
-
-    // 控件类型标识（序列化/设计器用）。
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
-        // Constructor and property replay recreate the generated parts.
     }
-
     public override string Kind() { return "Slider"; }
-
-    // 覆写：返回设计器属性清单（量程 / 值与高值 / 步长 / range、vertical、
-    // reverse、标记与气泡等选项）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec lo = PropSpec.Int("min", "Minimum");
-        lo.Field("minVal", 1);
-        ps.Add(lo);
-        PropSpec hi = PropSpec.Int("max", "Maximum");
-        hi.Field("maxVal", 1);
-        ps.Add(hi);
-        PropSpec val = PropSpec.Int("value", "Value").DefaultBinding();
-        // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        val.Field("Value", 1);
-        val.Also("data");
-        ps.Add(val);
-        PropSpec valHi = PropSpec.Int("valueHigh", "High value");
-        valHi.Field("HighValue", 1);
-        valHi.WithTip("Range mode's high thumb (Naive UI range value[1]).");
-        ps.Add(valHi);
-        PropSpec stp = PropSpec.Int("step", "Step");
-        stp.Field("step", 1);
-        stp.WithTip("Drag/keyboard increment. 0 = any value (Naive UI step prop).");
-        ps.Add(stp);
+        ps.Add(PropSpec.Int("min", "Minimum").Field("minVal", 1));
+        ps.Add(PropSpec.Int("max", "Maximum").Field("maxVal", 1));
+        ps.Add(PropSpec.Int("value", "Value").DefaultBinding().Field("Value", 1).Also("data"));
+        ps.Add(PropSpec.Int("valueHigh", "High value").Field("HighValue", 1).WithTip("Range mode's high thumb (Naive UI range value[1])."));
+        ps.Add(PropSpec.Int("step", "Step").Field("step", 1).WithTip("Drag/keyboard increment. 0 = any value (Naive UI step prop)."));
         PropSpec rng = PropSpec.Bool("range", "Range");
         rng.Field("range", 2);
         rng.WithTip("Dual thumbs; value = [Low, High] (Naive UI range).");
@@ -413,22 +320,10 @@ public class Slider : Control {
         vert.Field("vertical", 2);
         vert.WithTip("Track stands up; needs a real height (Grow/Prefer).");
         ps.Add(vert);
-        PropSpec rev = PropSpec.Bool("reverse", "Reverse");
-        rev.Field("reverse", 2);
-        rev.WithTip("Flip the track: min sits at the right / top end.");
-        ps.Add(rev);
-        PropSpec sm = PropSpec.Bool("stepMark", "Step on marks");
-        sm.Field("stepMark", 2);
-        sm.WithTip("Restrict selectable values to marks (Naive UI step=\"mark\").");
-        ps.Add(sm);
-        PropSpec tip = PropSpec.Bool("tooltip", "Tooltip");
-        tip.Field("tooltip", 2);
-        tip.WithTip("Show the value bubble while dragging / hovering a thumb.");
-        ps.Add(tip);
-        PropSpec stiff = PropSpec.Bool("showTooltip", "Always tooltip");
-        stiff.Field("showTooltip", 2);
-        stiff.WithTip("Keep the value bubble visible (Naive UI show-tooltip).");
-        ps.Add(stiff);
+        ps.Add(PropSpec.Bool("reverse", "Reverse").Field("reverse", 2).WithTip("Flip the track: min sits at the right / top end."));
+        ps.Add(PropSpec.Bool("stepMark", "Step on marks").Field("stepMark", 2).WithTip("Restrict selectable values to marks (Naive UI step=\"mark\")."));
+        ps.Add(PropSpec.Bool("tooltip", "Tooltip").Field("tooltip", 2).WithTip("Show the value bubble while dragging / hovering a thumb."));
+        ps.Add(PropSpec.Bool("showTooltip", "Always tooltip").Field("showTooltip", 2).WithTip("Keep the value bubble visible (Naive UI show-tooltip)."));
         PropSpec kb = PropSpec.Bool("keyboard", "Keyboard");
         kb.Field("keyboard", 2);
         kb.WithTip("Arrow keys nudge the focused slider; Home/End jump.");
@@ -444,46 +339,34 @@ public class Slider : Control {
         ps.Add(mk);
         return ps;
     }
-
-    // 面板直改 `marks` 必须走重建入口（直写字段不会重建标记）。
     public override void SetProp(string key, string val) {
         if (key == "marks") { this.SetMarksText(val); return; }
         base.SetProp(key, val);
     }
-
-    // 覆写："Change"/"DragEnd" 挂对应事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "DragEnd") { DragEnd.Add(a); return; }
         base.BindEvent(evt, a);
     }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "DragEnd") { DragEnd.AddS(a); return; }
         base.BindEventS(evt, a);
     }
-
     public override void TriggerEvent(string evt) {
         if (evt == "Change") { Change.RaiseS(this); return; }
         if (evt == "DragEnd") { DragEnd.RaiseS(this); return; }
         base.TriggerEvent(evt);
     }
-
-    // 覆写：测量首选尺寸。
     public override void OnMeasure(App app) {
+        this.SyncBinding();
         prefH = vertical ? 160 : 32;
         prefW = vertical ? 32 : 160;
     }
-
-    // Decorative children share the slider's input owner and focus.
     protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         return this;
     }
-
     private void EditValue(App app, int thumb, int value) {
         bool high = range && thumb == 2;
         if (value < minVal) { value = minVal; }
@@ -497,15 +380,11 @@ public class Slider : Control {
         Change.RaiseS(this);
         app.RequestRedraw();
     }
-
     private void EditPointer(App app, RoutedEventArgs e) {
         int start = vertical ? trackNode.by : trackNode.bx;
         int length = vertical ? trackNode.bh : trackNode.bw;
-        if (length > 0) {
-            this.EditValue(app, dragThumb, this.ValAt(vertical ? e.y : e.x, start, length));
-        }
+        if (length > 0) { this.EditValue(app, dragThumb, this.ValAt(vertical ? e.y : e.x, start, length)); }
     }
-
     public override void OnPointerDown(RoutedEventArgs e) {
         App app = this.FindApp();
         if (e.handled || this.IsDisabled() || app == null || app.window.EventButton() != 0) { return; }
@@ -529,7 +408,6 @@ public class Slider : Control {
         app.RequestRedraw();
         e.Handle();
     }
-
     public override void OnPointerMove(RoutedEventArgs e) {
         App app = this.FindApp();
         if (e.handled || dragThumb == 0 || app == null || app.GetCapturedPointer() != this) { return; }
@@ -538,7 +416,6 @@ public class Slider : Control {
         this.EditPointer(app, e);
         e.Handle();
     }
-
     public override void OnPointerUp(RoutedEventArgs e) {
         App app = this.FindApp();
         if (e.handled || dragThumb == 0 || app == null || app.window.EventButton() != 0) { return; }
@@ -555,7 +432,6 @@ public class Slider : Control {
         app.RequestRedraw();
         e.Handle();
     }
-
     public override void OnPointerCancel(RoutedEventArgs e) {
         base.OnPointerCancel(e);
         dragThumb = 0;
@@ -565,7 +441,6 @@ public class Slider : Control {
             app.RequestRedraw();
         }
     }
-
     public override void OnKeyDown(RoutedEventArgs e) {
         App app = this.FindApp();
         if (e.handled || this.IsDisabled() || !keyboard || app == null || !this.IsFocused(app)) { return; }
@@ -581,10 +456,7 @@ public class Slider : Control {
         this.EditValue(app, thumb, value);
         e.Handle();
     }
-
-    // Retained children paint the track, fill and thumbs; input precedes paint.
     public override int InputFocusCapabilities() { return 1; }
-
     public override void OnPaint(App app) {
     }
 }

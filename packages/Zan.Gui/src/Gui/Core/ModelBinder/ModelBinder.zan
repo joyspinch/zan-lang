@@ -2,35 +2,21 @@ using System;
 using System.Collections.Generic;
 using System.Json;
 using Gui;
-
 namespace Gui;
-
-// Owns event and value declarations for one retained control tree. POCO,
-// JsonValue and dictionaries share the same dotted-path accessor protocol;
-// JsonDoc is a read-only source and rejects two-way declarations.
-// Value synchronization visits flat records. Structural edits rebuild those
-// records on a generation change instead of rescanning the tree every frame.
 public partial class ModelBinder : AppLoopOwner, AppModelHost {
     internal AppLoopRegistration hostRegistration;
     Control root;
     object model;
     HandlerRegistry handlers;
     List<ModelBindingAction> wiredActions;
-    // Value declarations are collected when the tree is wired or structurally
-    // expanded. Steady-state synchronization visits only this flat list.
     List<ModelValueBinding> valueBindings;
     int collectedStructureRevision;
-    // 宿主 App（可空）：用于 AutoLink 扫描与变更后的重绘唤醒。
     weak App app;
-    // `<template data-for>` 原型展开状态列表。
     List<ChildTemplateMeta> tmplMetas;
-    // 已展开的行根（原型子项克隆）及其归属模板。
     List<ChildExpandedRow> expandedRows;
     List<ChildExpandedRow> retiringRows;
     bool retiringRowsBusy;
-    // 行内绑定作用域（行内声明了值绑定的控件 → 本项数据对象）。
     List<ChildScopeBinding> scopeBindings;
-    // 构造：全部字段置空/默认。
     public ModelBinder() {
         this.root = null;
         this.model = null;
@@ -42,13 +28,8 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         this.expandedRows = null;
         this.scopeBindings = null;
     }
-
-    // 挂树与模型。支持 POCO 强类型实体、JsonDoc 以及 JsonValue。
     public void SetRoot(Control tree, object m) {
         if (this.root == tree && this.model != m && this.tmplMetas != null) {
-            // Replacing an immutable document is a data update, not a request to
-            // destroy keyed rows. Reconcile their scopes against the new model;
-            // fresh flat records still initialize from that model before writeback.
             this.model = m;
             this.valueBindings = null;
             this.collectedStructureRevision = -1;
@@ -59,31 +40,21 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             App host = this.app;
             bool registered = this.hostRegistration != null && this.hostRegistration.active;
             this.Detach();
-            // Cancellation may already have installed a newer binding.
             if (this.root != null || this.model != null || this.hostRegistration != null) { return; }
             this.handlers = registry;
             this.app = host;
-            // A new root gets a new existing-loop ticket; in-flight callbacks
-            // keep the retired generation and cannot finish against this root.
             if (registered && host != null && host.isRunning) { host.RegisterModelHost(this); }
         }
         this.root = tree;
         this.model = m;
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
     }
-
-    public void SetRoot(Control tree, JsonValue m) {
-        this.SetRoot(tree, (object)m);
-    }
-
-    // 破环解绑：清空内部控件引用与展开节点，杜绝 ARC 闭包循环引用泄漏。
+    public void SetRoot(Control tree, JsonValue m) { this.SetRoot(tree, (object)m); }
     public void Detach() {
         this.RetireHostRegistration();
         List<ModelBindingAction> actions = this.wiredActions;
         List<ChildExpandedRow> rows = this.expandedRows;
         List<ChildScopeBinding> scopes = this.scopeBindings;
-        // Publish the empty binding before Remove can invoke cancellation code.
-        // Cleanup below owns only the retired snapshots, never the new fields.
         this.wiredActions = null;
         this.expandedRows = null;
         this.scopeBindings = null;
@@ -112,7 +83,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         this.DrainRetiringRows();
     }
-
     private void DrainRetiringRows() {
         if (retiringRowsBusy || retiringRows == null) { return; }
         retiringRowsBusy = true;
@@ -121,31 +91,23 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
                 int index = retiringRows.Count - 1;
                 ChildExpandedRow row = retiringRows[index];
                 this.DetachRow(row.rowRoot);
-                // Remove can throw before structural commit. Keep that row for
-                // the next explicit teardown instead of losing its ownership.
                 retiringRows.RemoveAt(index);
             }
             retiringRows = null;
         } finally { retiringRowsBusy = false; }
     }
-
-    // 宿主 App（AutoLink 扫描 / 获焦判定用；可后设）。
     public void SetApp(App a) {
         if (this.app != a) { this.RetireHostRegistration(); }
         this.app = a;
     }
-
     public App HostApp() { return this.app; }
     public AppLoopRegistration HostRegistration() { return this.hostRegistration; }
-
     public void Attach(App host) {
         if (host == null) { this.Detach(); return; }
         host.CheckLoopThread();
         if (!host.isRunning) { throw new InvalidOperationException("App loop has stopped"); }
         AppLoopRegistration old = this.hostRegistration;
         if (old != null && old.host == host && host.LiveLoopRegistration(old)) { return; }
-        // Retire before transferring ownership so the old App cannot detach
-        // an engine that has already moved into another App.
         this.RetireHostRegistration();
         this.SetApp(host);
         ModelHostParticipant participant = new ModelHostParticipant();
@@ -153,7 +115,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         this.hostRegistration = host.RegisterLoopParticipant(this, participant);
         host.hostLayoutRevision = host.hostLayoutRevision + 1;
     }
-
     internal void RetireHostRegistration() {
         AppLoopRegistration previous = this.hostRegistration;
         this.hostRegistration = null;
@@ -162,7 +123,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (previous.active && host != null) { host.hostLayoutRevision = host.hostLayoutRevision + 1; }
         previous.Invalidate();
     }
-
     private bool HostBindingCurrent(AppLoopRegistration ticket, int generation, Control tree, object state) {
         if (this.root != tree || this.model != state || this.hostRegistration != ticket) { return false; }
         if (ticket == null) { return true; }
@@ -170,44 +130,30 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         return host != null && host.isRunning && ticket.active && ticket.generation == generation
             && ticket.host == host && ticket.owner != null;
     }
-
-    // 根树与模型（宿主要遍历/回写时用）。
     public Control Root() { return this.root; }
     public object Model() { return this.model; }
     public JsonValue JsonModel() { return this.model is JsonValue ? (JsonValue)this.model : null; }
-
-    // 注册处理器（事件 → 处理器注册表）。
     public void Handle(string name, Action a) {
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
         this.handlers.Set(name, a);
     }
-
-    // 带参处理器：实参经 data-arg 声明，以值快照闭包捕获。
     public void HandleArg(string name, Action<string> a) {
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
         this.handlers.SetArg(name, a);
     }
-
-    // 注册带 item 处理器：绑定到具体的行作用域对象（如 users 里的每一项）。
     public void HandleItem(string name, ControlItemEvent a) {
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
         this.handlers.SetItem(name, a);
     }
-
-    // 注册绑定到 `name` 的带 sender 处理器（平行通道）。
     public void HandleSender(string name, ControlEvent a) {
         if (this.handlers == null) { this.handlers = new HandlerRegistry(); }
         this.handlers.SetSender(name, a);
     }
-
-    // Explicit registrations take precedence over reflected document handlers.
     public bool HasHandler(string name) {
         return this.handlers != null && (this.handlers.Get(name) != null
             || this.handlers.GetArg(name) != null || this.handlers.GetSender(name) != null
             || this.handlers.GetItem(name) != null);
     }
-
-    // 接线：解析事件声明 + 登记模板原型 + 首帧同步。
     public void Wire() {
         if (this.root == null) { return; }
         AppLoopRegistration ticket = this.hostRegistration;
@@ -223,14 +169,11 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
         this.SyncFromModel();
     }
-
-    // 递归解析控件树上的 `on<Event>` 处理器名并绑定到已注册的 Action。
     public void WireNode(Control c) {
         AppLoopRegistration ticket = this.hostRegistration;
         this.WireNodeCurrent(c, ticket, ticket != null ? ticket.generation : 0, this.root, this.model);
         this.CollectValueBindings(c);
     }
-
     private bool RefreshStructure(AppLoopRegistration ticket, int generation, Control tree, object state) {
         if (tree == null || this.collectedStructureRevision == Control.BindingStructureRevision()) { return true; }
         this.PruneDetachedTemplates(tree);
@@ -243,7 +186,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         this.collectedStructureRevision = Control.BindingStructureRevision();
         return this.HostBindingCurrent(ticket, generation, tree, state);
     }
-
     private void RebuildValueBindings(Control tree) {
         List<ModelValueBinding> previous = this.valueBindings;
         this.valueBindings = null;
@@ -262,7 +204,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
         }
     }
-
     private bool InRoot(Control control, Control tree) {
         Control current = control;
         while (current != null) {
@@ -271,7 +212,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return false;
     }
-
     private void PruneDetachedActions(Control tree) {
         if (this.wiredActions == null) { return; }
         for (int i = this.wiredActions.Count - 1; i >= 0; i = i - 1) {
@@ -282,7 +222,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
         }
     }
-
     private void PruneDetachedTemplates(Control tree) {
         if (this.tmplMetas == null) { return; }
         for (int i = this.tmplMetas.Count - 1; i >= 0; i = i - 1) {
@@ -290,12 +229,10 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             if (template == null || !this.InRoot(template, tree)) { this.tmplMetas.RemoveAt(i); }
         }
     }
-
     private void CollectValueBindings(Control tree) {
         if (tree == null) { return; }
         this.CollectValueBindingsCurrent(tree);
     }
-
     private void CollectValueBindingsCurrent(Control c) {
         if (c == null || c.Kind() == "template") { return; }
         if (c.bindings != null) {
@@ -313,7 +250,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             this.CollectValueBindingsCurrent(c.ChildAt(j));
         }
     }
-
     private void ValidateValueBinding(ModelValueBinding binding) {
         Control c = binding.control;
         object scope = this.ScopeItemOf(c);
@@ -354,7 +290,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         binding.resolvedProperty = resolved;
         binding.valueKind = valueKind;
     }
-
     private ModelValueBinding FindValueBinding(Control c, string path, string property) {
         if (this.valueBindings == null) { return null; }
         for (int i = 0; i < this.valueBindings.Count; i = i + 1) {
@@ -363,7 +298,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return null;
     }
-
     private void WireNodeCurrent(Control c, AppLoopRegistration ticket, int generation, Control tree, object state) {
         if (c == null || !this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
         for (int i = 0; i < c.events.Count; i = i + 1) {
@@ -399,8 +333,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
         }
     }
-
-    // Resolve registrations at dispatch time; subscriptions retain only a weak token.
     void InvokeBindingAction(ModelBindingAction token) {
         Control c = token.control;
         if (!token.active || c == null || this.handlers == null || token.hname == "") { return; }
@@ -416,10 +348,11 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (!token.active) { return; }
         if (this.app != null) { this.app.RequestRedraw(); this.app.Wake(); }
     }
-
-    // Steady-state value synchronization visits only flat binding records.
-    // Template records are the sole structural polling path; the control tree
-    // itself is revisited only when its structure generation changes.
+    internal bool NeedsFrameSync() {
+        return this.root != null && (this.collectedStructureRevision != Control.BindingStructureRevision()
+            || (this.valueBindings != null && this.valueBindings.Count > 0)
+            || (this.tmplMetas != null && this.tmplMetas.Count > 0));
+    }
     public void SyncFromModel() {
         if (this.model == null || this.root == null) { return; }
         AppLoopRegistration ticket = this.hostRegistration;
@@ -433,11 +366,7 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (!this.RefreshStructure(ticket, generation, tree, state)) { return; }
         this.SyncValuesFromModel(ticket, generation, tree, state);
     }
-
-    // 把发生语义工变化的绑定读回模型。参数保留到本批消费方迁移完成；
-    // 实现不再从传入根递归扫描。
     public void SyncChangedNode(Control c) { this.SyncChangedValues(); }
-
     public void SyncChangedValues() {
         AppLoopRegistration ticket = this.hostRegistration;
         int generation = ticket != null ? ticket.generation : 0;
@@ -450,8 +379,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             ModelValueBinding binding = this.valueBindings[i];
             Control c = binding.control;
             if (c == null || !binding.twoWay) { continue; }
-            // A newly wired or re-pathed declaration takes its first value from
-            // the model; otherwise the previous path's UI value would leak into it.
             if (!binding.hasSnapshot) { continue; }
             string value = this.BoundValue(binding);
             if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
@@ -461,7 +388,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
                     }
         }
     }
-
     private void SyncValuesFromModel(AppLoopRegistration ticket, int generation, Control tree, object state) {
         if (this.valueBindings == null) { return; }
         for (int i = 0; i < this.valueBindings.Count; i = i + 1) {
@@ -487,16 +413,10 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
         }
     }
-
-    // 去除作用域别名前缀（如 "row.name" 在 alias 为 "row" 时脱糖为 "name"）
     public static string StripAlias(string path, string alias) {
-        if (alias != "" && path.StartsWith(alias + ".")) {
-            return path.Substring(alias.Length + 1);
-        }
+        if (alias != "" && path.StartsWith(alias + ".")) { return path.Substring(alias.Length + 1); }
         return path;
     }
-
-    // 字符串列表 → JSON 数组文本（选择类控件 options 属性的输入格式）。
     static string StrListJson(List<string> items) {
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < items.Count; i++) {
@@ -504,30 +424,18 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return arr.ToJson();
     }
-
     public object ScopeItemOf(Control c) {
-        if (c != null && c.item != null) {
-            return c.item;
-        }
+        if (c != null && c.item != null) { return c.item; }
         ChildScopeBinding sb = this.ScopeBindingOf(c);
-        if (sb != null && sb.item != null) {
-            return sb.item;
-        }
+        if (sb != null && sb.item != null) { return sb.item; }
         return this.model;
     }
-
     public string ScopeAliasOf(Control c) {
-        if (c != null && c.itemAlias != "") {
-            return c.itemAlias;
-        }
+        if (c != null && c.itemAlias != "") { return c.itemAlias; }
         ChildScopeBinding sb = this.ScopeBindingOf(c);
-        if (sb != null) {
-            return sb.alias;
-        }
+        if (sb != null) { return sb.alias; }
         return "";
     }
-
-    // 解析嵌套对象路径（如 "user.addr.city"），返回最内层承载对象与叶子字段名。
     static object ResolveFieldScope(object scope, string path, out string leafField) {
         leafField = path;
         if (scope == null || path == "") { return null; }
@@ -546,17 +454,13 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         leafField = path.Substring(start);
         return cur;
     }
-
-    // 从任意多态模型（JsonValue、JsonDocCursor、JsonDoc 或强类型 POCO 实体）解析字符串
     public bool TryResolveString(Control c, string path, out string result) {
         result = "";
         if (path == "") { return false; }
         object scope = this.ScopeItemOf(c);
         string alias = this.ScopeAliasOf(c);
         string actualPath = ModelBinder.StripAlias(path, alias);
-
         if (scope == null) { return false; }
-
         if (scope is JsonValue) {
             JsonValue jv = ((JsonValue)scope).PathGet(actualPath);
             if (jv != null) {
@@ -580,7 +484,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             return false;
         }
-
         if (scope is JsonDocCursor) {
             JsonDocCursor cur = (JsonDocCursor)scope;
             int slot = cur.doc.Path(cur.slot, actualPath);
@@ -595,7 +498,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             return false;
         }
-
         if (scope is JsonDoc) {
             JsonDoc doc = (JsonDoc)scope;
             int slot = doc.Path(doc.root, actualPath);
@@ -610,8 +512,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             return false;
         }
-
-        // 字典模型高性能直读（零 JSON 堆分配）
         if (scope is Dictionary<string, string>) {
             Dictionary<string, string> dict = (Dictionary<string, string>)scope;
             if (dict.ContainsKey(actualPath)) {
@@ -627,7 +527,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             return false;
         }
-
         if (scope is Dictionary<string, double>) {
             Dictionary<string, double> dict = (Dictionary<string, double>)scope;
             if (!dict.ContainsKey(actualPath)) { return false; }
@@ -640,8 +539,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             result = PropSpec.Flag(dict[actualPath]);
             return true;
         }
-
-        // POCO 强类型实体反射（支持点号级联导航如 user.addr.city）
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
         if (target != null && target.HasField(leaf)) {
@@ -656,10 +553,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             result = target.GetFieldString(leaf);
             if (result == "") {
-                // 集合字段（:options="names" 绑 List<string>、JsonValue 数组）
-                // 序列化成 JSON 数组，选择类控件的 options 属性直接吃。此前
-                // 落到数值/布尔分支得空串，SetProp("options", "") 把下拉清空。
-                // GetFieldObject 只对引用/字符串字段取值，值类型字段返回 null。
                 object fo = target.GetFieldObject(leaf);
                 if (fo != null && fo is List<string>) {
                     result = ModelBinder.StrListJson((List<string>)fo);
@@ -679,7 +572,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             }
             return true;
         }
-
         if (scope != this.model && this.model != null) {
             string mleaf = "";
             object mtarget = ModelBinder.ResolveFieldScope(this.model, path, out mleaf);
@@ -690,7 +582,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return false;
     }
-
     static int TypeNameKind(string name) {
         if (name == "bool") { return 2; }
         if (name == "int" || name == "long" || name == "double"
@@ -698,14 +589,10 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
             || name == "uint" || name == "ulong" || name == "ushort") { return 1; }
         return 0;
     }
-
-    // Reflection reports computed properties as methods rather than fields.
     static int FieldValueKind(object target, string leaf) {
         TypeInfo type = target.GetType();
         for (int i = 0; i < type.FieldCount; i = i + 1) {
-            if (type.GetFieldName(i) == leaf) {
-                return ModelBinder.TypeNameKind(type.GetFieldType(i));
-            }
+            if (type.GetFieldName(i) == leaf) { return ModelBinder.TypeNameKind(type.GetFieldType(i)); }
         }
         for (int i = 0; i < type.MethodCount; i = i + 1) {
             if (type.GetMethodName(i) == "get_" + leaf) {
@@ -714,7 +601,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return 0;
     }
-
     static bool WritableField(object target, string leaf) {
         TypeInfo type = target.GetType();
         bool getter = false;
@@ -729,7 +615,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         }
         return false;
     }
-
     int ModelValueKind(Control c, string bindingPath) {
         object scope = this.ScopeItemOf(c);
         if (scope == null) { return 0; }
@@ -762,28 +647,18 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (scope is Dictionary<string, string>) { return 0; }
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
-        if (target != null && target.HasField(leaf)) {
-            return ModelBinder.FieldValueKind(target, leaf);
-        }
+        if (target != null && target.HasField(leaf)) { return ModelBinder.FieldValueKind(target, leaf); }
         if (scope != this.model && this.model != null) {
             target = ModelBinder.ResolveFieldScope(this.model, bindingPath, out leaf);
-            if (target != null && target.HasField(leaf)) {
-                return ModelBinder.FieldValueKind(target, leaf);
-            }
+            if (target != null && target.HasField(leaf)) { return ModelBinder.FieldValueKind(target, leaf); }
         }
         return 0;
     }
-
-    string BoundProperty(ModelValueBinding binding) {
-        return binding.resolvedProperty;
-    }
-
+    string BoundProperty(ModelValueBinding binding) { return binding.resolvedProperty; }
     string BoundValue(ModelValueBinding binding) {
         Control c = binding.control;
         return c != null ? c.GetProp(this.BoundProperty(binding)) : "";
     }
-
-    // 把字符串值写回模型节点：支持 JsonValue 与 POCO 实体强类型双向写回。
     void WriteBoundValue(ModelValueBinding binding, string s) {
         Control c = binding.control;
         if (c == null) { return; }
@@ -804,11 +679,9 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         if (boolInput && s != "true" && s != "false") {
             throw new ArgumentException("Invalid Boolean value for binding '" + binding.path + "'");
         }
-
         object scope = this.ScopeItemOf(c);
         string alias = this.ScopeAliasOf(c);
         string actualPath = ModelBinder.StripAlias(binding.path, alias);
-
         if (scope != null) {
             if (scope is JsonValue) {
                 JsonValue jscope = (JsonValue)scope;
@@ -822,7 +695,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
                     jscope.PathSet(actualPath, s);
                 }
             } else if (scope is JsonDocCursor || scope is JsonDoc) {
-                // JsonDoc 为只读零分配数据源，不参与回写
             } else if (scope is Dictionary<string, string>) {
                 Dictionary<string, string> dict = (Dictionary<string, string>)scope;
                 dict[actualPath] = s;
@@ -833,7 +705,6 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
                 Dictionary<string, bool> dict = (Dictionary<string, bool>)scope;
                 dict[actualPath] = (s == "true");
             } else {
-                // POCO 强类型实体双向写回（支持嵌套字段）
                 string leaf = "";
                 object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
                 if (target != null) {

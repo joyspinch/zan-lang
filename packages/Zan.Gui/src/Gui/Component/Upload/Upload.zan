@@ -1,0 +1,397 @@
+using System;
+using System.IO;
+using Gui;
+namespace Gui.Widget;
+public delegate bool UploadBeforeFn(UploadFile item);
+public delegate void UploadRequestFn(UploadFile item);
+[GuiKind("Upload")]
+public partial class Upload : Control {
+    public override Control CreateCloneShell() { return new Upload(); }
+    public List<UploadFile> Files;
+    public bool AutoUpload;
+    public bool Multiple;
+    public int Max;
+    public bool Dragger;
+    public string DragText;
+    public string TriggerText;
+    public bool ShowTrigger;
+    public bool ShowRemoveButton;
+    public bool ShowDownloadButton;
+    public bool PictureCard;
+    public bool Thumbnail;
+    public string Accept;
+    public UploadBeforeFn BeforeUpload;
+    public UploadRequestFn CustomRequest;
+    public UiEvent Change;
+    public UiEvent UploadStart;
+    public UiEvent Finish;
+    public UiEvent Error;
+    public UiEvent Remove;
+    public UiEvent Download;
+    public UiEvent Exceed;
+    public UploadFile LastItem;
+    private int uidCounter;
+    public weak App uiApp;
+    private FilePicker picker;
+    private int dropX;
+    private int dropY;
+    private int dropW;
+    private int dropH;
+    public override int StyleDisplay() { return 1; } // Flex
+    public override int StyleFlexDir() { return 1; } // Column
+    public void InitUpload() {
+        this.InitControl("upload");
+        this.ClassName = "upload";
+        this.SetProp("style", "display:flex;flex-direction:column");
+        uidCounter = 1;
+        wiresOwnEvents = true;
+        Files = new List<UploadFile>();
+        AutoUpload = true;
+        Multiple = false;
+        Max = 0;
+        Dragger = false;
+        DragText = "点击或者拖动文件到该区域来上传";
+        Tip = "";
+        TriggerText = "上传文件";
+        ShowTrigger = true;
+        ShowRemoveButton = true;
+        ShowDownloadButton = false;
+        PictureCard = false;
+        Thumbnail = false;
+        Accept = "";
+        BeforeUpload = null;
+        CustomRequest = null;
+        Change = new UiEvent();
+        UploadStart = new UiEvent();
+        Finish = new UiEvent();
+        Error = new UiEvent();
+        Remove = new UiEvent();
+        Download = new UiEvent();
+        Exceed = new UiEvent();
+        LastItem = null;
+        picker = null;
+        dropX = 0;
+        dropY = 0;
+        dropW = 0;
+        dropH = 0;
+    }
+    public Upload() { this.InitUpload(); }
+    public void WithBeforeUpload(UploadBeforeFn f) { this.BeforeUpload = f; }
+    public void WithCustomRequest(UploadRequestFn f) { this.CustomRequest = f; }
+    public override string Kind() { return "Upload"; }
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec acc = PropSpec.Text("accept", "Accept");
+        acc.Field("Accept", 0);
+        acc.WithTip("Comma-separated extensions (e.g. \"png,jpg\"); empty = all.");
+        ps.Add(acc);
+        ps.Add(PropSpec.Int("max", "Max files").Field("Max", 1).Step(1, 0, 999));
+        ps.Add(PropSpec.Bool("autoUpload", "Auto upload").Field("AutoUpload", 2));
+        ps.Add(PropSpec.Bool("multiple", "Multiple").Field("Multiple", 2));
+        ps.Add(PropSpec.Text("triggerText", "Trigger text").Field("TriggerText", 0));
+        ps.Add(PropSpec.Bool("showTrigger", "Show trigger").Field("ShowTrigger", 2));
+        ps.Add(PropSpec.Bool("showRemoveButton", "Remove button").Field("ShowRemoveButton", 2));
+        ps.Add(PropSpec.Bool("showDownloadButton", "Download button").Field("ShowDownloadButton", 2));
+        ps.Add(PropSpec.Bool("dragger", "Dragger").Field("Dragger", 2));
+        ps.Add(PropSpec.Text("dragText", "Drag text").Field("DragText", 0));
+        ps.Add(PropSpec.Text("tip", "Tip").Field("Tip", 0));
+        ps.Add(PropSpec.Bool("pictureCard", "Picture card").Field("PictureCard", 2));
+        ps.Add(PropSpec.Bool("thumbnail", "Thumbnail").Field("Thumbnail", 2));
+        return ps;
+    }
+    public override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        e.Add("Upload");
+        e.Add("Finish");
+        e.Add("Error");
+        e.Add("Remove");
+        e.Add("Download");
+        e.Add("Exceed");
+        return e;
+    }
+    public override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        if (evt == "Upload" || evt == "UploadStart") { UploadStart.Add(a); return; }
+        if (evt == "Finish") { Finish.Add(a); return; }
+        if (evt == "Error") { Error.Add(a); return; }
+        if (evt == "Remove") { Remove.Add(a); return; }
+        if (evt == "Download") { Download.Add(a); return; }
+        if (evt == "Exceed") { Exceed.Add(a); return; }
+        base.BindEvent(evt, a);
+    }
+    public override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "Change") { Change.AddS(a); return; }
+        if (evt == "Upload" || evt == "UploadStart") { UploadStart.AddS(a); return; }
+        if (evt == "Finish") { Finish.AddS(a); return; }
+        if (evt == "Error") { Error.AddS(a); return; }
+        if (evt == "Remove") { Remove.AddS(a); return; }
+        if (evt == "Download") { Download.AddS(a); return; }
+        if (evt == "Exceed") { Exceed.AddS(a); return; }
+        base.BindEventS(evt, a);
+    }
+    public override void TriggerEvent(string evt) {
+        if (evt == "Change") { Change.RaiseS(this); return; }
+        if (evt == "Upload" || evt == "UploadStart") { UploadStart.RaiseS(this); return; }
+        if (evt == "Finish") { Finish.RaiseS(this); return; }
+        if (evt == "Error") { Error.RaiseS(this); return; }
+        if (evt == "Remove") { Remove.RaiseS(this); return; }
+        if (evt == "Download") { Download.RaiseS(this); return; }
+        if (evt == "Exceed") { Exceed.RaiseS(this); return; }
+        base.TriggerEvent(evt);
+    }
+    public void SetFiles(List<UploadFile> files) {
+        if (files == null) { return; }
+        Files = files;
+        int i = 0;
+        while (i < files.Count) {
+            UploadFile f = files[i];
+            if (f.id >= uidCounter) { uidCounter = f.id + 1; }
+            i = i + 1;
+        }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public int AddPaths(List<string> paths) {
+        if (paths == null) { return 0; }
+        if (this.IsDisabled()) { return 0; }
+        if (Files == null) { Files = new List<UploadFile>(); }
+        int added = 0;
+        int i = 0;
+        while (i < paths.Count) {
+            string p = paths[i];
+            if (p != null && p != "" && this.TryAddPath(p)) { added = added + 1; }
+            i = i + 1;
+        }
+        return added;
+    }
+    public bool TryAddPath(string path) {
+        string name = Path.GetFileName(path);
+        if (name == "") { name = path; }
+        UploadFile f = new UploadFile();
+        f.name = name;
+        f.path = path;
+        f.ext = UploadFile.ExtOf(name);
+        if (path != "" && File.Exists(path)) { f.size = File.GetSize(path); }
+        return this.Admit(f);
+    }
+    public UploadFile AddFile(string name, string path, string url) {
+        if (Files == null) { Files = new List<UploadFile>(); }
+        UploadFile f = new UploadFile();
+        f.name = name;
+        f.path = path;
+        f.url = url;
+        f.ext = UploadFile.ExtOf(name);
+        if (path != "" && File.Exists(path)) { f.size = File.GetSize(path); }
+        f.id = uidCounter;
+        f.owner = this;
+        uidCounter = uidCounter + 1;
+        if (url != "") {
+            f.status = UploadStatus.Success();
+            f.percent = 100;
+        } else {
+            f.status = UploadStatus.Pending();
+        }
+        Files.Add(f);
+        LastItem = f;
+        Change.RaiseS(this);
+        if (f.status == UploadStatus.Pending() && AutoUpload) { this.StartItem(f); }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return f;
+    }
+    public bool Admit(UploadFile f) {
+        if (this.IsDisabled()) { return false; }
+        if (Files == null) { Files = new List<UploadFile>(); }
+        f.id = uidCounter;
+        f.owner = this;
+        uidCounter = uidCounter + 1;
+        if (Accept != "" && !this.AcceptAllows(f.ext)) { return false; }
+        if (Max > 0 && Files.Count >= Max) {
+            LastItem = f;
+            Exceed.RaiseS(this);
+            return false;
+        }
+        if (BeforeUpload != null && !BeforeUpload(f)) { return false; }
+        Files.Add(f);
+        LastItem = f;
+        Change.RaiseS(this);
+        if (AutoUpload) { this.StartItem(f); }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return true;
+    }
+    public bool AcceptAllows(string ext) {
+        if (ext == "") { return true; }
+        if (Accept == null || Accept.Length == 0) { return true; }
+        string acc = Accept.ToLower();
+        int start = 0;
+        int len = acc.Length;
+        for (int i = 0; i <= len; i = i + 1) {
+            if (i == len || (acc[i] & 255) == 44 || (acc[i] & 255) == 59) {
+                if (i > start) {
+                    string tok = acc.Substring(start, i - start).Trim();
+                    if (tok != "") {
+                        if (tok.StartsWith("*.")) { tok = tok.Substring(2); }
+                        else if (tok.StartsWith(".")) { tok = tok.Substring(1); }
+                        if (tok == "*" || tok == ext) { return true; }
+                    }
+                }
+                start = i + 1;
+            }
+        }
+        return false;
+    }
+    public static bool IsImageExt(string ext) {
+        return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "bmp" || ext == "webp" || ext == "ico" || ext == "svg";
+    }
+    public void Submit() {
+        if (Files == null) { return; }
+        int i = 0;
+        while (i < Files.Count) {
+            UploadFile f = Files[i];
+            if (f.status == UploadStatus.Pending()) { this.StartItem(f); }
+            i = i + 1;
+        }
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public void StartItem(UploadFile f) {
+        if (f == null) { return; }
+        if (CustomRequest == null) { return; }
+        f.status = UploadStatus.Uploading();
+        f.percent = 0;
+        f.message = "";
+        LastItem = f;
+        UploadStart.RaiseS(this);
+        CustomRequest(f);
+    }
+    public void FailItem(UploadFile f, string message) {
+        if (f == null) { return; }
+        f.status = UploadStatus.Error();
+        f.message = message;
+        LastItem = f;
+        Error.RaiseS(this);
+        Change.RaiseS(this);
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public UploadFile Find(int id) {
+        if (Files == null) { return null; }
+        int i = 0;
+        while (i < Files.Count) {
+            if (Files[i].id == id) { return Files[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+    public void SetItemPercent(int id, int percent) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        if (percent < 0) { percent = 0; }
+        if (percent > 100) { percent = 100; }
+        f.percent = percent;
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public void SetItemStatus(int id, int status, string message) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.status = status;
+        if (message != null) { f.message = message; }
+        if (status == UploadStatus.Success()) {
+            f.percent = 100;
+            LastItem = f;
+            Finish.RaiseS(this);
+        } else if (status == UploadStatus.Error()) {
+            LastItem = f;
+            Error.RaiseS(this);
+        }
+        Change.RaiseS(this);
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public void SetItemUrl(int id, string url) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.url = url;
+        Change.RaiseS(this);
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public void SetItemThumb(int id, string thumb) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return; }
+        f.thumb = thumb;
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public bool RemoveItem(int id) {
+        UploadFile f = this.Find(id);
+        if (f == null) { return false; }
+        int idx = Files.IndexOf(f);
+        if (idx < 0) { return false; }
+        Files.RemoveAt(idx);
+        LastItem = f;
+        Remove.RaiseS(this);
+        Change.RaiseS(this);
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+        return true;
+    }
+    public void Clear() {
+        if (Files != null) { Files.Clear(); }
+        Change.RaiseS(this);
+        if (uiApp != null) { uiApp.RequestRedraw(); }
+    }
+    public bool WantsDropAt(int x, int y) {
+        if (dropW <= 0 || dropH <= 0) { return false; }
+        return x >= dropX && x < dropX + dropW && y >= dropY && y < dropY + dropH;
+    }
+    public int AcceptDropped(List<string> paths) { return this.AddPaths(paths); }
+    public int StyleGap() { return this.StyleGap(this.App); }
+    public int StyleGap(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return 4; }
+        StyleBox s = this.ResolveStyleAs(app, "upload", Class, Style.SNormal());
+        return s.GapOr(app.theme.paddingTiny);
+    }
+    public int RowH() { return this.RowH(this.App); }
+    public int RowH(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return Thumbnail ? 44 : 34; }
+        if (Thumbnail) { return app.Scale(44); }
+        return app.Scale(34);
+    }
+    public StyleBox TriggerStyle(bool off) { return this.TriggerStyle(this.App, off); }
+    public StyleBox TriggerStyle(App app, bool off) {
+        app = this.ResolveApp(app);
+        bool hover = !off && triggerControl != null && triggerControl.IsHovered(app);
+        int st = off ? Style.SDisabled() : (hover ? Style.SHover() : Style.SNormal());
+        return this.ResolvePartAs(app, "upload", "trigger", "", Class, st);
+    }
+    public int TriggerH() { return this.TriggerH(this.App); }
+    public int TriggerH(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return 32; }
+        return this.TriggerStyle(app, true).HeightOr(app.theme.heightMedium);
+    }
+    public int TriggerW() { return this.TriggerW(this.App); }
+    public int TriggerW(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return 80; }
+        StyleBox s = this.TriggerStyle(app, true);
+        int fs = s.FontOr(Style.FontFallback(app, "medium"));
+        string txt = TriggerText == "" ? "上传文件" : TriggerText;
+        return Canvas.MeasureText(txt, fs)
+            + s.PadLOr(app.theme.paddingLarge) + s.PadROr(app.theme.paddingLarge);
+    }
+    public int DraggerH() { return this.DraggerH(this.App); }
+    public int DraggerH(App app) {
+        app = this.ResolveApp(app);
+        if (app == null) { return 120; }
+        int fs = Style.FontFallback(app, "medium");
+        int h = app.Scale(22) + app.Scale(40) + app.Scale(12) + Canvas.FontHeight(fs)
+            + app.Scale(22);
+        if (Tip != "") { h = h + app.Scale(4) + Canvas.FontHeight(Style.FontFallback(app, "small")); }
+        return h;
+    }
+    public static string Ellipsize(string s, int maxW, int fs) {
+        if (s == "" || maxW <= 0) { return s; }
+        if (Canvas.MeasureText(s, fs) <= maxW) { return s; }
+        string fitted = Ellipsis.FitOverflow(s, maxW, fs, "…", true);
+        if (fitted == "…") { return Text.Left(s, Text.NextCharEnd(s, 0)) + "…"; }
+        return fitted;
+    }
+}

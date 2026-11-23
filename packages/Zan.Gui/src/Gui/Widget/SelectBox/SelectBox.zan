@@ -1,153 +1,63 @@
 using System;
 using Gui;
-
 namespace Gui.Widget;
-
-// 高层、自包含的 select / 下拉框。
-// 创建一次并挂入 retained Children 树；父容器负责 CSS 布局。
-// 控件自持开/关、选项列表、单选或多选、可选清除按钮、尺寸和状态变体，
-// 长选项列表的弹出层复用统一 OverlayHost 与路由输入：
-// SelectBox city = new SelectBox("Pick a city");
-// form.Children.Add(city);
-// int i = city.Value.Get();          // 无选中时为 -1
-// 多选：SelectBox.Multi(hint) + IsChosen(i)。流畅配置：
-// 尺寸档另行赋值：`box.Size = "large";`（"small"/"medium"/"large"）。
-// 绑定：`sel.Value = form.color;` 将选中索引双向绑定到
-// 普通字段；`SelectBox.FromOptions(options, hint)` 从标签列表构建，
-// 且 `sel.Change += h;` 在每次选择变化时触发。
 public partial class SelectBox : Control {
-    // 全部选项（平铺：分组标题、禁用项、级联子级都在此列）。
     public List<SelectOption> opts;
     public Control customPopup;
     public Card defaultPopupCard;
-    // 单选索引，-1 表示无选择；多选集合由选项维护。
     public Binding<int> Value;
-    // 选择变化时触发（`sel.Change += h;`）。
     public UiEvent Change;
-    // 选项列表打开/关闭时触发，无论由哪种方式
-    // 触发（点击触发控件、选择、外部按压、Esc）。
     public UiEvent Open;
     public UiEvent Close;
-    // 无选中时显示的占位文字。
     public string hint;
-    // 多选模式（取值为勾选集合）。
     public bool multi;
-    // 有值且悬停时显示清除按钮。
     public bool clearable;
-    // 弹层展开状态。
     public bool open;
-    // 弹层列表滚动偏移（像素）。
     public int scrollY;
-    // 尺寸档："small" / "medium" / "large"（§6.4 尺寸档统一 string）。
-    // Binding<string> 使属性面板的 size 行真正写回；渲染时映射为
-    // select.* 档位 class（base.css 的 --height-* token 规则）。
     public Binding<string> Size;
-
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
     public override Binding<string> SizeOf() { return Size; }
-
-    // 校验状态（Normal/Success/Warning/Error），经 StyleClass 映射为状态 class。
     public int status;
-    // 弹层最多直接可见的行数，超出滚动（也决定多选自动分列行数）。
     public int maxVisible;
-    // 弹出层位置：0 自动（触发控件下方，超出则反向），1 仅下方，2 仅上方。
-    // Naive UI `placement` prop。
     public int placement;
-    // 可搜索：弹出层顶部加搜索框，键入时过滤选项（Naive UI `filterable` prop）。
     public bool filterable;
-    // 当前搜索关键词。
     public string filterText;
-    // 筛选搜索框：弹层顶部内嵌的真 Input 组件（不是自绘的假输入条），
-    // 焦点、光标、选区、Ctrl+A/C/X/V、清除按钮全部由 Input 自持。
-    // 打开弹层期间焦点锁定在它上面，键入才不需要先点一下搜索框。
     public Input filterBox;
-    // 级联模式：选项带子级，弹层逐列展开（省市区这类层级）。
     public bool cascade;
-    // 级联当前展开链：每列已展开选项的平铺下标（flatIdx）。
     public List<int> cascadePath;
-    // 级联顶层选项（AddBranch 建立的那些），弹层第一列渲染它们。
     public List<SelectOption> cascRoots;
-    // 级联过滤的命中下标（filterable + 关键词非空时重建）：平铺所有
-    // 层级里标签命中的节点，行上显示完整路径。
     public List<int> cascadeFilter;
-    // 级联父子联动（Naive UI `cascade` prop，默认开）：勾选父级带动
-    // 全部子孙，父级的勾/半勾由子孙推导；关掉后任何层级的选项都可
-    // 独立勾选，单选下也允许直接选中带子级的分支。
     public bool cascadeLink;
-    // 勾选策略（Naive UI check-strategy）：0 all 全部勾选节点、
-    // 1 parent 只算没被更深勾选祖先盖住的节点（完整勾选子树的顶）、
-    // 2 child 只算勾选的叶子。
     public int checkStrategy;
-    // 触发器/标签显示完整路径（"浙江 / 杭州 / 西湖区"，
-    // Naive UI show-path）；关掉只显示末级短标签。
     public bool showPath;
-    // 悬停即展开下一列（Naive UI hover-trigger）；默认点击展开。
     public bool hoverExpand;
-    // 从过滤结果选中后清掉搜索词（默认清）。
     public bool clearFilterAfter;
-    // 级联各列的滚动状态实体集合（唯一主表示，彻底消除平行列表反模式）。
     public List<CascadeColumnScroll> cascadeCols;
-    // 树形模式：弹层内嵌一颗真 TreeView，展开/折叠、滚动、悬停
-    // 全部由 TreeView 自持，SelectBox 只负责摆位与收值。
     public bool treeMode;
     public TreeView treeBox;
-    // 树形模式上次见到的选中下标（-1 无），用于每帧轮询选中变化。
     public int treeSelSeen;
-    // 级联/树形选中的完整路径文本（"浙江 / 杭州"），供 Text() 显示。
     public string pathText;
-    // 过滤后的选项索引列表（null = 不启用过滤）。每帧根据 filterText 重建。
     public List<int> filteredIdx;
-    // 每帧暂存锚点几何，使延迟弹出层（OnPaintOverlay、
-    // 在覆盖阶段运行）能在触发控件下方自行布局。
     public int trigX;
     public int trigY;
     public int trigW;
-    // 稳定控件 id：触发控件注册它，使悬停/按压/焦点（及读取它们的
-    // 缓动样式过渡）与任何其他控件一样工作。
     public int wid;
-    // 上一帧实际绘制的头部高度（尊重显式 RenderIn
-    // 高度）；延迟弹出层读取它，使其正好位于触发控件下方。
     public int lastH;
-    // 上一帧指针悬停的选项（无则 -1）。弹出层在覆盖阶段绘制
-    // 且未按行注册命中区域，因此没有其他机制
-    // 会请求重绘光标下那行的帧。
     public int hoverRow;
-    // 悬停的选项变化时触发（`sel.Hover += h;`，用 Hovered() 读是哪一条）。
-    // 没有它，调用方就只能靠自己在弹层几何上重算一遍鼠标位置 —— 而弹层
-    // 的位置是框架翻转后决定的，外面根本算不准。
     public UiEvent Hover;
-    // 弹层列数：0 = 自动（多选框选项多于一屏时分成等宽多列，
-    // 而不是拉成一条长条），否则固定列数。
     public int cols;
-    // 表格式下拉列定义实体列表（强类型实体承载，消除平行列表反模式）。
     public List<SelectBoxColumn> tableColumns;
-    // 搜索框里的提示文字（filterable）。空则用 "Search"。
     public string filterHint;
-    // 弹层宽度缓存。量一次即可：逐帧测量每条标签在上万条选项时
-    // 就是每帧上万次文本测量，比真正的绘制还贵。
     public int popupW;
-    // 弹层宽度缓存是否失效（选项集 / 过滤词 / 列数变化时置位）。
     public bool popupWDirty;
-    // 选项原始文本或 JSON 串（防帧级频繁重复解析）。
     public string optionsRaw;
-
-    // 校验状态常量（Status 的取值）。
     public static int Normal() { return 0; }
-    // 校验通过状态。
     public static int Success() { return 1; }
-    // 校验警告状态。
     public static int Warning() { return 2; }
-    // 校验错误状态。
     public static int Error() { return 3; }
-
     public SelectBox() : this("", false) { }
-
-    // 单选下拉框（多选用 `new SelectBox(hint, true)`）。
     public SelectBox(string hintText) : this(hintText, false) { }
-
-    // 主构造：占位提示 + 是否多选；默认弹层最多显示 6 行，级联联动开。
     public SelectBox(string hintText, bool isMulti) {
-        this.InitControl("selectbox", 0);
+        this.InitControl("selectbox");
         styleSurfaceOwned = true;
         this.opts = new List<SelectOption>();
         Value = -1;
@@ -192,8 +102,58 @@ public partial class SelectBox : Control {
         this.Close = new UiEvent();
         this.Hover = new UiEvent();
     }
-
-    // 当前选中项的数据值（无显式值时返回 label；未选中时返回 ""）。
+    public List<SelectOption> Options {
+        get { return opts; }
+        set { opts = value != null ? value : new List<SelectOption>(); popupWDirty = true; }
+    }
+    public string OptionsSource {
+        get { return this.OptionsText(); }
+        set { this.SetOptionsText(value); }
+    }
+    public string Placeholder {
+        get { return hint; }
+        set { hint = value != null ? value : ""; }
+    }
+    public int SelectedIndex {
+        get { return Value.Get(); }
+        set { this.SetIndex(value); }
+    }
+    public string SelectedValueText {
+        get { return this.SelectedValue(); }
+        set { this.Select(value); }
+    }
+    public bool IsMultiSelect {
+        get { return multi; }
+        set { multi = value; }
+    }
+    public bool IsClearable {
+        get { return clearable; }
+        set { clearable = value; }
+    }
+    public bool IsFilterable {
+        get { return filterable; }
+        set { this.Filterable(value); }
+    }
+    public string FilterPlaceholder {
+        get { return filterHint; }
+        set { this.FilterHint(value); }
+    }
+    public int MaxVisibleRows {
+        get { return maxVisible; }
+        set { maxVisible = value; }
+    }
+    public int PopupPlacement {
+        get { return placement; }
+        set { this.Placement(value); }
+    }
+    public int ValidationStatus {
+        get { return status; }
+        set { status = value; }
+    }
+    public Control PopupContent {
+        get { return customPopup; }
+        set { this.SetPopupContent(value); }
+    }
     public string SelectedValue() {
         if (Value.Get() >= 0 && Value.Get() < opts.Count) {
             string v = opts[Value.Get()].val;
@@ -201,8 +161,6 @@ public partial class SelectBox : Control {
         }
         return "";
     }
-
-    // 从普通标签列表构建选择框（JSON / 设计器 / 单行场景使用）。
     public static SelectBox FromOptions(List<string> options, string hint) {
         SelectBox s = new SelectBox(hint, false);
         for (int i = 0; i < options.Count; i = i + 1) {
@@ -210,8 +168,6 @@ public partial class SelectBox : Control {
         }
         return s;
     }
-
-    // 选项以 `a|b|c` 字符串表示（设计器 / 设计文档属性往返）。
     public string OptionsText() {
         string outp = "";
         for (int i = 0; i < opts.Count; i = i + 1) {
@@ -220,8 +176,6 @@ public partial class SelectBox : Control {
         }
         return outp;
     }
-
-    // "a|b|c" 文本或 JSON 数组 → 选项列表（SetExtra 反序列化；滚动复位）。
     public void SetOptionsText(string text) {
         if (text == optionsRaw && opts != null && opts.Count > 0) { return; }
         optionsRaw = text != null ? text : "";
@@ -269,24 +223,16 @@ public partial class SelectBox : Control {
         List<string> parts = text.Split("|");
         for (int i = 0; i < parts.Count; i = i + 1) {
             string p = parts[i].Trim();
-            if (p != "") {
-                opts.Add(new SelectOption(p, p, false));
-            }
+            if (p != "") { opts.Add(new SelectOption(p, p, false)); }
         }
         if (Value.Get() >= opts.Count) { Value.Set(opts.Count - 1); }
         scrollY = 0;
     }
-
-    // 过滤后参与显示的行数。
     public int DisplayCount() {
         List<int> vis = this.VisibleOpts();
         if (vis == null) { return opts.Count; }
         return vis.Count;
     }
-
-    // 显示行 -> 真实选项下标。过滤开着时经过滤表转换，否则同一个数。
-    // 渲染、命中和悬停三处原本各自内联这段映射，任何一处写歪都表现为
-    // 「点中的不是看到的那条」。
     public int RowToOpt(int row) {
         List<int> vis = this.VisibleOpts();
         if (vis == null) {
@@ -296,20 +242,11 @@ public partial class SelectBox : Control {
         if (row < 0 || row >= vis.Count) { return 0 - 1; }
         return vis[row];
     }
-
-    // 悬停中的选项下标，没有则 -1（配合 `Hover` 事件读取）。
     public int Hovered() { return hoverRow; }
-
-    // 第 `i` 个选项的标签（越界返回空串）。悬停/选择事件给出的是下标，
-    // 调用方要显示的是文字。
     public string OptionLabel(int i) {
         if (i < 0 || i >= opts.Count) { return ""; }
         return opts[i].label;
     }
-
-    // 本次开层实际的列数。自动时：单选保持单列（下拉就该是
-    // 一条列表）；多选超过一屏时按 maxVisible 分列，最多 4 列，
-    // 这样一屏就能成行成列地看完。表格模式恒为一列（列在行内部）。
     public int ColumnCount() {
         if (this.IsTable()) { return 1; }
         if (cols > 0) { return cols; }
@@ -320,24 +257,17 @@ public partial class SelectBox : Control {
         if (n > 4) { n = 4; }
         return n;
     }
-
-    // 当前列数下每列的行数。
     public int RowCount() {
         int n = this.ColumnCount();
         int rows = (this.DisplayCount() + n - 1) / n;
         if (rows < 1) { rows = 1; }
         return rows;
     }
-
-    // 外部设定选中下标（钳制到有效范围，-1 = 无选择）。
-    // 程序化赋值不触发 Change；弹出层与渲染下一帧读到新值。
     public void SetIndex(int idx) {
         if (idx >= opts.Count) { idx = opts.Count - 1; }
         if (idx < 0) { idx = 0 - 1; }
         Value.Set(idx);
     }
-
-    // 按选项文本或值匹配并选中
     public void Select(string text) {
         if (text == "" || opts == null) { this.ClearSelection(); return; }
         for (int i = 0; i < opts.Count; i = i + 1) {
@@ -347,15 +277,8 @@ public partial class SelectBox : Control {
             }
         }
     }
-
-    // 清除选择
-    public void ClearSelection() {
-        this.SetIndex(0 - 1);
-    }
-
-    // 弹层当前是否打开。
+    public void ClearSelection() { this.SetIndex(0 - 1); }
     public bool IsOpen() { return open; }
-
     private static void OnOptionButtonClick(Control sender) {
         if (sender == null) { return; }
         Control cur = sender.Parent();
@@ -371,7 +294,6 @@ public partial class SelectBox : Control {
             cur = cur.Parent();
         }
     }
-
     public Card EnsurePopupCard() { return this.EnsurePopupCard(this.App); }
     public Card EnsurePopupCard(App app) {
         app = this.ResolveApp(app);
@@ -390,8 +312,7 @@ public partial class SelectBox : Control {
         for (int i = 0; i < opts.Count; i = i + 1) {
             SelectOption op = opts[i];
             if (op.grp) {
-                Label grp = new Label(op.label).Small();
-                grp.AddClass("muted");
+                Label grp = new Label(op.label) { ClassName = "small muted" };
                 col.Add(grp);
             } else {
                 SelectBoxOptionButton item = new SelectBoxOptionButton(this, i, op, opts, inputSession);
@@ -406,15 +327,9 @@ public partial class SelectBox : Control {
             }
         }
         defaultPopupCard.Content(col);
-        if (app != null) {
-            defaultPopupCard.OnMeasure(app);
-        }
+        if (app != null) { defaultPopupCard.OnMeasure(app); }
         return defaultPopupCard;
     }
-
-    // 打开/关闭列表，并在实际切换时触发 Open/Close，
-    // 使每个入口（触发控件、选择、外部按压、Esc、代码）以相同方式
-    // 报告。
     public void SetOpen(bool v) {
         if (open == v) { return; }
         inputSession = inputSession + 1;
@@ -449,7 +364,6 @@ public partial class SelectBox : Control {
         }
         if (this.InputSessionCurrent(app, session, options) && app != null) { app.RequestRedraw(); }
     }
-
     public override void OnPopupDismissed() {
         if (!open) { return; }
         inputSession = inputSession + 1;
@@ -457,12 +371,8 @@ public partial class SelectBox : Control {
         open = false; popupApp = null; inputPopup = null;
         Close.RaiseS(this);
     }
-
-    // 应用弹出层作出的选择：将绑定和 Change
-    // 事件集中在一处，使所有入口行为一致。
     public void Choose(int idx) {
         if (idx < 0 || idx >= opts.Count) { return; }
-        // 分组标题与禁用项不是可选项。
         if (opts[idx].grp || opts[idx].disabled) { return; }
         if (multi) {
             opts[idx].chosen = !opts[idx].chosen;
@@ -472,19 +382,11 @@ public partial class SelectBox : Control {
         }
         Change.RaiseS(this);
     }
-
-    // 工厂：多选下拉框。
-    public static SelectBox Multi(string hintText) {
-        return new SelectBox(hintText, true);
-    }
-
-    // 追加一个普通选项。
+    public static SelectBox Multi(string hintText) { return new SelectBox(hintText, true); }
     public void AddOption(string label) {
         opts.Add(new SelectOption(label, false));
         popupWDirty = true;
     }
-
-    // 加一个禁用项：占正常位置、置灰显示，但不响应悬停与点击。
     public void AddOption(string label, bool disabled) {
         SelectOption o = new SelectOption(label, false);
         o.flatIdx = opts.Count;
@@ -492,10 +394,6 @@ public partial class SelectBox : Control {
         opts.Add(o);
         popupWDirty = true;
     }
-
-    // 加一个分组标题：随后 AddOption 的条目在视觉上归属该组。
-    // 标题行本身不可悬停、不可选择；键入筛选时若组内没有命中
-    // 项，标题随组一起隐藏。
     public void AddGroup(string title) {
         SelectOption o = new SelectOption(title, false);
         o.flatIdx = opts.Count;
@@ -503,54 +401,26 @@ public partial class SelectBox : Control {
         opts.Add(o);
         popupWDirty = true;
     }
-
-    // 是否显示清除按钮（有值且悬停时）。
-    public SelectBox Clearable(bool v) {
-        clearable = v;
-        return this;
-    }
-
-    // 设校验状态（Normal/Success/Warning/Error 常量）。
-    public SelectBox Status(int v) {
-        status = v;
-        return this;
-    }
-
-    // 弹出位置：0=自动（默认），1=下方（Naive UI placement="bottom"），2=上方。
-    public SelectBox Placement(int v) {
+    public void Clearable(bool v) { clearable = v; }
+    public void Status(int v) { status = v; }
+    public void Placement(int v) {
         if (v >= 0 && v <= 2) { placement = v; }
-        return this;
     }
-
-    // 启用搜索过滤（Naive UI filterable）。
-    public SelectBox Filterable(bool v) {
+    public void Filterable(bool v) {
         filterable = v;
         if (v) { filterText = ""; }
-        return this;
     }
-
-    // 搜索框的提示文字。不设则用 "Search"。
-    public SelectBox FilterHint(string s) {
+    public void FilterHint(string s) {
         filterHint = s;
         if (filterBox != null) { filterBox.SetHint(s); }
-        return this;
     }
-
-    // 当前搜索关键词（供调用方回显 / 远程搜索用）。
     public string FilterText() { return filterText; }
-
-    // 以编程方式设置关键词并重建过滤结果。
     public void SetFilterText(string s) {
         filterText = s;
         if (filterBox != null) { filterBox.SetText(s); }
         scrollY = 0;
         this.RebuildFilter();
     }
-
-    // 根据 filterText 重建过滤索引列表（空文本/未启用 → 全量）。
-    // 级联模式下平铺所有层级、按标签匹配（行上显示完整路径）；
-    // 表格模式匹配整行的所有单元格，否则只匹配 label：一张表里
-    // 按代码搜和按名称搜同样自然，只认首列会让另一半列形同虚设。
     public void RebuildFilter() {
         popupWDirty = true;
         if (!filterable || filterText == "") {
@@ -561,8 +431,6 @@ public partial class SelectBox : Control {
         List<int> r = new List<int>();
         string q = filterText.ToLower();
         if (cascade) {
-            // 级联过滤：所有层级的节点都参与匹配，命中项平铺单列展示，
-            // 行文本是完整路径。分组标题不参与。
             for (int i = 0; i < opts.Count; i = i + 1) {
                 if (opts[i].grp) { continue; }
                 if (opts[i].label.ToLower().Contains(q)) { r.Add(i); }
@@ -572,8 +440,6 @@ public partial class SelectBox : Control {
             return;
         }
         bool tbl = this.IsTable();
-        // 分组标题不参与匹配：只有当它后面（到下一个标题前）有
-        // 命中项时才保留，孤立的标题随组一起隐藏。
         int pendingGrp = 0 - 1;
         for (int i = 0; i < opts.Count; i = i + 1) {
             if (opts[i].grp) { pendingGrp = i; continue; }
@@ -590,28 +456,10 @@ public partial class SelectBox : Control {
         }
         filteredIdx = r;
     }
-
-    // 当前选中下标（-1 无）。
-    public int Selected() {
-        return Value.Get();
-    }
-
-    // 选项总数（程序化灌入/对账用）。
-    public int SelectCount() {
-        return opts.Count;
-    }
-
-    // 当前选中项的标签（未选中返回空串）。
-    public string SelectedLabel() {
-        return this.OptionLabel(Value.Get());
-    }
-
-    // 返回当前选中项的文本标签（与 VirtualList 接口一致）。
-    public string SelectedText() {
-        return this.SelectedLabel();
-    }
-
-    // 按文本标签设置选中项
+    public int Selected() { return Value.Get(); }
+    public int SelectCount() { return opts.Count; }
+    public string SelectedLabel() { return this.OptionLabel(Value.Get()); }
+    public string SelectedText() { return this.SelectedLabel(); }
     public void SetSelectedByText(string txt) {
         if (txt == "") {
             this.Select(0 - 1);
@@ -624,14 +472,10 @@ public partial class SelectBox : Control {
             }
         }
     }
-
-    // 多选模式下第 i 项是否被勾选。
     public bool IsChosen(int i) {
         if (i < 0 || i >= opts.Count) { return false; }
         return opts[i].chosen;
     }
-
-    // 是否有有效取值（单选已选 / 多选有勾选 / 级联树形有路径文本）。
     public bool HasValue() {
         if (multi) {
             for (int i = 0; i < opts.Count; i = i + 1) {
@@ -642,17 +486,11 @@ public partial class SelectBox : Control {
         if (pathText != "") { return true; }
         return Value.Get() >= 0 && Value.Get() < opts.Count;
     }
-
-    // 以编程方式设置选中索引（-1 清除）。保持绑定的
-    // model/data 同步，但不触发 Change（调用方发起的更新）。
     public void Select(int idx) {
         if (idx < 0) { Value.Set(0 - 1); return; }
         if (idx >= opts.Count) { return; }
         Value.Set(idx);
     }
-
-    // 清除取值：单选/级联复位选中与路径，多选清全部勾选，
-    // 树形清 TreeView 选中（选项列表保留）。
     public void Clear() {
         Value.Set(0 - 1);
         pathText = "";
@@ -663,9 +501,6 @@ public partial class SelectBox : Control {
             opts[i].chosen = false;
         }
     }
-
-    // 清空选项集（连同过滤结果与宽度缓存）。远程搜索每次换一批
-    // 候选项时需要它。
     public void ClearOptions() {
         opts = new List<SelectOption>();
         Value.Set(0 - 1);
@@ -673,15 +508,9 @@ public partial class SelectBox : Control {
         filteredIdx = null;
         popupWDirty = true;
     }
-
-    // 选项总数（含分组标题与禁用项）。
     public int Count() { return opts.Count; }
-
-    // 触发器显示文本：多选逗号拼接勾选值；级联按当前 showPath
-    // 出完整路径或末级短标签；树形用收值时缓存的 payload 文本。
     public string Text() {
         if (multi) {
-            // 级联多选：按勾选策略取值集合，显示路径或短标签。
             if (cascade) {
                 List<string> labs = this.ValueLabels();
                 string acc = "";
@@ -700,20 +529,14 @@ public partial class SelectBox : Control {
             }
             return acc;
         }
-        // 级联按当前 showPath 动态出路径/短标签（选择后切换设置也
-        // 立即生效）；树形仍用收值时缓存的 payload 文本。
         if (cascade) {
-            if (Value.Get() >= 0 && Value.Get() < opts.Count) {
-                return this.ValueText(Value.Get());
-            }
+            if (Value.Get() >= 0 && Value.Get() < opts.Count) { return this.ValueText(Value.Get()); }
             return pathText;
         }
         if (pathText != "") { return pathText; }
         if (Value.Get() >= 0 && Value.Get() < opts.Count) { return opts[Value.Get()].label; }
         return "";
     }
-
-    // 触发器高度（按尺寸档取主题行高）。
     public int HeadHeight(Theme t) {
         string cls = this.SizeClassIn(Class);
         if (Style.Has(cls, "tiny")) { return t.heightTiny; }
@@ -721,8 +544,6 @@ public partial class SelectBox : Control {
         if (Style.Has(cls, "large")) { return t.heightLarge; }
         return t.heightMedium;
     }
-
-    // 触发器字号（按尺寸档取 small/medium/large 档）。
     public int FontSize(StyleBox s) { return this.FontSize(this.App, s); }
     public int FontSize(App app, StyleBox s) {
         app = this.ResolveApp(app);
@@ -731,21 +552,14 @@ public partial class SelectBox : Control {
         if (sz == 2) { return s.FontOr(Style.FontFallback(app, "large")); }
         return s.FontOr(Style.FontFallback(app, "medium"));
     }
-
-    // 尺寸档 string → 渲染下标（0 small / 1 medium / 2 large）。
     public int SizeIdx() {
         string cls = this.SizeClassIn(Class);
         if (Style.Has(cls, "tiny") || Style.Has(cls, "small")) { return 0; }
         if (Style.Has(cls, "large")) { return 2; }
         return 1;
     }
-
-    // 校验状态以额外 class 的形式进入样式层（base.css 的
-    // `select.success/.warning/.error` 规则），绘制代码不再直接
-    // 覆盖边框颜色。
     public override string StyleType() { return "select"; }
     public override string EffectiveClass() { return this.StyleClass(); }
-
     public string StyleClass() {
         string cls = this.SizeClassIn(Class);
         string extra = "";
@@ -755,19 +569,16 @@ public partial class SelectBox : Control {
         if (extra == "") { return cls; }
         return cls == "" ? extra : cls + " " + extra;
     }
-
     public override void OnMeasure(App app) {
         this.SyncBinding();
         StyleBox normal = this.Box(app);
         prefH = normal.HeightOr(this.HeadHeight(app.theme));
         prefW = normal.WidthOr(app.Scale(200));
     }
-
     private int ArrowSize(App app, Rect content) {
         StyleBox arrow = this.ResolvePart(app, "arrow", "", Style.SNormal());
         return DropdownChrome.SlotSize(content, arrow.FontOr(app.theme.iconSizeSmall));
     }
-
     private Rect ClearBounds(App app, Rect content, int arrowSize) {
         StyleBox clear = this.ResolvePart(app, "clear", "", Style.SNormal());
         int size = DropdownChrome.SlotSize(content, clear.FontOr(app.theme.iconSizeSmall));
@@ -775,8 +586,6 @@ public partial class SelectBox : Control {
         if (left < content.x) { size = 0; }
         return new Rect(left, content.y, size, content.height);
     }
-
-    // 触发器使用布局分配的盒。常态内容槽也用于绘制前的输入命中。
     public override void OnPaint(App app) {
         app = this.ResolveApp(app);
         if (app == null || app.canvas == null || bw <= 0 || bh <= 0) { return; }
@@ -796,8 +605,7 @@ public partial class SelectBox : Control {
         StyleBox box = this.ResolveEasedStyleAsIn(
             app, wid, "select", cls, this.IsDisabled(), open, bx, by, bw, bh);
         box.Paint(app, bx, by, bw, bh);
-
-        int state = Style.StateOf(app, wid, this.IsDisabled());
+        int state = this.WidgetState(app);
         if (open) { state = state | Style.SSelected(); }
         string shown = this.Text();
         if (multi && cascade && shown != "") {
@@ -809,7 +617,6 @@ public partial class SelectBox : Control {
         } else {
             DropdownChrome.PaintLabel(app.canvas, content, textWidth, shown, font, box.fg);
         }
-
         if (clear != null && clear.width > 0) {
             int clearState = state & ~(Style.SHover() | Style.SActive());
             if (clear.Contains(app.mouseX, app.mouseY)) { clearState = state; }
@@ -820,14 +627,6 @@ public partial class SelectBox : Control {
         StyleBox arrow = this.ResolvePart(app, "arrow", "", state);
         DropdownChrome.PaintArrow(app.canvas, content, arrowSize, arrow.FgOr(box.fg));
     }
-
-    // 弹层宽度：不窄于触发器，但至少能放下最长的一条；
-    // 多列时按列数等宽扩开。按触发器宽度开弹层会把每一条
-    // 都截成同一个前缀，选项之间看不出区别。
-    // 结果缓存在 popupW 里，只有选项集或过滤词变了才重新量：这段
-    // 要遍历全部标签，而它每帧都被调用一次。一万条选项时那是每帧
-    // 一万次 MeasureText —— 比画出来的十几行本身贵上三个数量级，
-    // 也是长列表下拉「一开就卡」的真正来源（虚表只省了绘制）。
     public int PopupWidth(App app, Theme t, int trigWidth, int fs, int arrowSlot) {
         if (this.IsTable()) {
             int sum = t.paddingSmall * 2;
@@ -859,25 +658,18 @@ public partial class SelectBox : Control {
         popupWDirty = false;
         return w;
     }
-
-    // 搜索框高度（filterable=true 时占用的顶部空间）。
     public int FilterBarH() { return this.FilterBarH(this.App); }
     public int FilterBarH(App app) {
         if (!filterable) { return 0; }
         app = this.ResolveApp(app);
         return app != null ? app.Scale(32) : 32;
     }
-
-    // 过滤后参与渲染的选项索引（filterable + 关键词非空才过滤）。
     public List<int> VisibleOpts() {
         if (!filterable || filterText == "") { return null; }
         if (filteredIdx == null) { this.RebuildFilter(); }
         if (filteredIdx == null) { return null; }
         return filteredIdx;
     }
-
-    // 延迟弹层：在 App.RunOverlays 中、所有内容绘制完成后绘制并派发事件。
-    // 插槽支持：允许在 HTML 或代码中为 SelectBox 注入任意自定义弹层组件（如 Table、TreeView、Card）
     public override bool MountSlot(string slot, Control c) {
         if (slot == "popup" || slot == "dropdown" || slot == "content") {
             this.SetPopupContent(c);
@@ -885,7 +677,6 @@ public partial class SelectBox : Control {
         }
         return base.MountSlot(slot, c);
     }
-
     public void SetPopupContent(Control c) {
         Control previous = customPopup;
         if (previous == c) { return; }
@@ -903,12 +694,7 @@ public partial class SelectBox : Control {
         if (!this.InputSessionCurrent(app, session, options) || open || customPopup != c) { return; }
         if (reopen) { this.SetOpen(true); }
     }
-
-    public Control GetPopupContent() {
-        return this.customPopup;
-    }
-
-    // 覆盖层绘制：所有弹层（普通列表、树形选择、级联多列及自定义插槽）均已完全接入 OverlayHost 统一 RenderTree 调度。
+    public Control GetPopupContent() { return this.customPopup; }
     public override void OnPaintOverlay(App app) {
     }
 }

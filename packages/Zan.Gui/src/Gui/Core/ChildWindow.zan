@@ -3,11 +3,8 @@ using System.Collections.Generic;
 using System.Json;
 using Gui;
 using Gui.Backend;
-using Gui.Widget;
-
 namespace Gui;
-
-public class ChildWindow : AppLoopOwner {
+public partial class ChildWindow : AppLoopOwner {
     internal AppLoopRegistration hostLayoutRegistration;
     App host;
     weak App parentApp;
@@ -16,10 +13,10 @@ public class ChildWindow : AppLoopOwner {
     bool open;
     bool destroyed;
     bool designAssembled;
+    string designCss;
     int idBase;
     Action renderCb;
     long lastRenderUs = 0;
-
     ChildWindow() {
         host = null;
         root = null;
@@ -29,40 +26,20 @@ public class ChildWindow : AppLoopOwner {
         idBase = WidgetId.Block(1000);
         renderCb = null;
     }
-
     virtual string Title() { return "Zan"; }
-
     virtual int Width() { return 560; }
-    // 初始客户区高度（未缩放像素）。
     virtual int Height() { return 560; }
-
-    // 子窗口标题栏按钮集合（子窗口默认禁用皮肤选择与固顶操作；不可调整尺寸的对话框自动隐藏最大化按钮）。
     virtual bool ShowTheme() { return false; }
     virtual bool ShowPin() { return false; }
     virtual bool ShowMinimize() { return true; }
-    // 是否保留最大化按钮。
     virtual bool ShowMaximize() { return true; }
-
-    // 子窗口控件 ID 分配基线，避免跨窗口 ID 冲突。
     virtual int IdBase() { return this.idBase; }
-
-    // 底层宿主应用实例句柄，供即时渲染模式分发帧。
     App Host() { return host; }
-
-    // 即时渲染模式回调；设置后主循环直接分发绘制回调而非遍历控件树。
-    void SetRender(Action a) {
-        renderCb = a;
-    }
-
-    // 模型宿主（惰性建）：Zan 的子类构造不跑父构造，父构造里的字段
-    // 初始化在子类实例上不生效——首次用到时再补，否则 binder 是 null。
+    void SetRender(Action a) { renderCb = a; }
     private ModelBinder Binder() {
         if (binder == null) { binder = new ModelBinder(); }
         return (ModelBinder)binder;
     }
-
-    // Install one retained view and, optionally, its independent model. The
-    // framework performs event wiring and synchronization during host assembly.
     public void SetView(Control tree, object m) {
         root = tree;
         ModelBinder current = this.Binder();
@@ -75,113 +52,18 @@ public class ChildWindow : AppLoopOwner {
             }
         }
     }
-
     public Control View() { return root; }
-
-    // 运行期装载设计稿（B-ID149：Html.Parse 单跳管线，与 Form.Show 同源）。
-    // 名字解析与 Form.Show 同一约定：DesignName() 覆写优先（自定义名），
-    // 否则按"类名 ↔ 同名 .html"走 Form.FindDoc（内嵌 VFS → 工作目录 →
-    // 工程 src 树，歧义 fail-fast）。模型默认挂窗自身（实例字段即
-    // ViewModel、方法即事件处理器）。
-    // 装载是框架的事（与 Form.Show 零装载语句同一契约）：只由
-    // AssembleDesign 调用，private 让窗代码里的装载调用编译期即报错。
-    // 已 SetView 手搭树的窗（无同名设计稿）这里是 no-op。
-    private void EnsureDesign() {
-        if (this.root != null) { return; }
-        string tname = this.DesignName();
-        if (tname == "") { tname = this.GetType().Name; }
-        string html = Form.FindDoc(tname);
-        if (html != null) {
-            ControlBootstrap.InstallDesign();
-            HtmlDoc doc = Html.Parse(html, "", null);
-            if (doc.root != null) {
-                this.SetView(doc.root, this);
-            }
-        }
-    }
-
-    // 业务初始化钩子：框架在设计稿装载后、宿主创建与声明式接线之前
-    // 调用一次（时序同旧"先 Build 再 OpenHost"，Title()/IdBase() 能看到
-    // 这里算出的状态）。在这里算绑定字段的初值、建 z-mount 要挂的
-    // 复合控件；不装载、不 Find、不手工接线。
     protected virtual void OnCreate() { }
-
-    // bind 模型覆写：默认 null = 窗自身（或 SetView 指定的模型）；
-    // JsonValue 等外部模型的窗覆写返回之。事件处理器恒解析窗方法。
     protected virtual object ViewModel() { return null; }
-
-    // 设计稿装配序（只跑一次，OpenHost/OpenStandalone 最先调用）：
-    // 装载 → OnCreate → 换挂 ViewModel → z-mount 挂载。
-    private void AssembleDesign() {
-        if (this.designAssembled) { return; }
-        this.designAssembled = true;
-        this.EnsureDesign();
-        this.OnCreate();
-        if (this.root == null) { return; }
-        object vm = this.ViewModel();
-        if (vm != null) { this.SetView(this.root, vm); }
-        DocWire.MountSlots(this.root, this);
-    }
-
-    // 声明式装配（子窗收官，与 Form.assembleDoc 同一语义）：事件按名
-    // 对账接线（缺失 fail-fast exit 1）、bind 路径启动期对账、OnLoad
-    // 钩子（publish 形态钩子须带 [Custom] 注解，见 B-ID160 契约）。
-    // 必须在 host 就绪后调用——Wire 的 SetApp 与触发闭包都要 host。
-    // 事件处理器恒解析窗实例方法；bind 模型用 binder 当前模型
-    // （装载默认挂的 this，或 ViewModel() 换挂的 JsonValue 等）。JsonValue
-    // 模型的键不是反射字段，bind 对账跳过（运行期 binder 自会软兜底）。
-    void AssembleDoc() {
-        if (this.root == null) { return; }
-        ModelBinder b = this.Binder();
-        if (b.Model() == null) { b.SetRoot(this.root, this); }
-        object bm = b.Model();
-        DocWire.AutoWire(this.root, this, b);
-        if (!(bm is JsonValue)) {
-            DocWire.CheckBinds(this.root, bm, this.GetType().Name);
-        }
-        host.RegisterModelHost(b);
-        b.Wire();
-        if (this.HasMethod("OnLoad")) {
-            this.Invoke("OnLoad", this);
-        }
-    }
-
     public virtual string DesignName() { return ""; }
-
-    void Handle(string name, Action a) {
-        this.Binder().Handle(name, a);
-    }
-
-    // passed as the argument (Html.WireArg / WireNode 闭包捕获)。
-    void HandleArg(string name, Action<string> a) {
-        this.Binder().HandleArg(name, a);
-    }
-
-    // 注册绑定到 `name` 的带 sender 处理器（平行通道）：Wire() 解析到
-    // 具体控件时，把该控件作为实参交给处理器——一个 HandleSender
-    // 可以服务整棵树上的多个绑定，处理器按 sender 区分来源。
-    // 与 Handle 相互独立；同名两槽都注册时各建一条订阅（多播）。
-    void HandleSender(string name, ControlEvent a) {
-        this.Binder().HandleSender(name, a);
-    }
-
-    // 注册带 item 处理器：绑定到具体的行作用域对象（如 users 里的每一项）。
-    void HandleItem(string name, ControlItemEvent a) {
-        this.Binder().HandleItem(name, a);
-    }
-
+    void Handle(string name, Action a) { this.Binder().Handle(name, a); }
+    void HandleArg(string name, Action<string> a) { this.Binder().HandleArg(name, a); }
+    void HandleSender(string name, ControlEvent a) { this.Binder().HandleSender(name, a); }
+    void HandleItem(string name, ControlItemEvent a) { this.Binder().HandleItem(name, a); }
     virtual bool Pending() { return false; }
-
     virtual void AfterFrame() { }
-
-    // 语言切换广播：宿主把 UI 语言切到 `lang`（"zh" / "en" 语言码）后，
-    // 对每个开着的子窗口调用一次。子类在这里重填设计文档的设计期
-    // 文案（ApplyTexts 模式）并刷新依赖语言的静态扇出字段；窗口
-    // 标题由基类重取 Title() 处理，子类无需关心。
     virtual void OnLanguageChanged(string lang) { }
-
-    void OpenHost(App parent) {
-        this.AssembleDesign();
+    private void OpenHostView(App parent, bool explicitHandlers) {
         this.parentApp = parent;
         open = true;
         idBase = this.IdBase();
@@ -195,13 +77,9 @@ public class ChildWindow : AppLoopOwner {
             } else {
                 host.ApplySkin(parent.ThemeMenuIndex());
             }
-            if (parent.Density() != host.Density()) {
-                host.SetDensity(parent.Density());
-            }
+            if (parent.Density() != host.Density()) { host.SetDensity(parent.Density()); }
             string parentCss = parent.AppCss();
-            if (parentCss != "") {
-                host.UseAppCss(parentCss);
-            }
+            if (parentCss != "") { host.UseAppCss(parentCss); }
         }
         host.SetChromeButtons(this.ShowTheme(), this.ShowPin(), this.ShowMinimize(),
                               this.ShowMaximize());
@@ -211,7 +89,7 @@ public class ChildWindow : AppLoopOwner {
             host.SetUserWallpaper(parent.UserWallpaperPath(),
                                   parent.UserWallpaperOpacity());
         }
-        this.AssembleDoc();
+        this.AssembleDoc(explicitHandlers);
         this.EnsureHostLayoutRegistration();
         host.Show();
         host.RequestRedraw();
@@ -220,15 +98,9 @@ public class ChildWindow : AppLoopOwner {
             parent.RequestRedraw();
             parent.Wake();
         }
-        // 就地出首帧：避免主事件循环停在 WaitEvent/GetMessage 导致子窗口白屏挂起；
-        // 窗口显示的瞬间第一帧就已绘制并呈现，组件秒出。
-        if (root != null) {
-            this.Render();
-        }
+        if (root != null) { this.Render(); }
     }
-
-    void OpenStandalone() {
-        this.AssembleDesign();
+    private void OpenStandaloneView(bool explicitHandlers) {
         open = true;
         idBase = this.IdBase();
         host = App.CreateDark(this.Title(), this.Width(), this.Height());
@@ -237,26 +109,14 @@ public class ChildWindow : AppLoopOwner {
         host.ApplySkinName(this.StandaloneSkin());
         host.SetChromeButtons(this.ShowTheme(), this.ShowPin(), this.ShowMinimize(),
                               this.ShowMaximize());
-        this.AssembleDoc();
+        this.AssembleDoc(explicitHandlers);
         this.EnsureHostLayoutRegistration();
         host.Show();
         host.RequestRedraw();
     }
-
     virtual string StandaloneSkin() { return "light"; }
-
-    // 注意：仅用于无主窗口循环的单机独立控制台场景；在包含 App.Run 的 GUI 程序中
-    // 请优先使用普通子窗口或协程 await 驱动，禁止使用嵌套独立泵打断主界面渲染。
-    void PumpStandaloneUntil(ChildWindowStop stop) {
-        this.PumpStandaloneUntilMode(stop, true);
-    }
-
-    void PumpStandaloneUntilKeepOpen(ChildWindowStop stop) {
-        this.PumpStandaloneUntilMode(stop, false);
-    }
-
-    // 独立事件泵的公共实现：泵宿主事件并逐帧渲染，直到窗口关闭
-    // 或 stop() 为真；closeWhenDone 决定结束时是否顺带 Close()。
+    void PumpStandaloneUntil(ChildWindowStop stop) { this.PumpStandaloneUntilMode(stop, true); }
+    void PumpStandaloneUntilKeepOpen(ChildWindowStop stop) { this.PumpStandaloneUntilMode(stop, false); }
     void PumpStandaloneUntilMode(ChildWindowStop stop, bool closeWhenDone) {
         while (this.IsOpen() && (stop == null || !stop())) {
             if (!host.PumpSafe()) {
@@ -267,7 +127,6 @@ public class ChildWindow : AppLoopOwner {
         }
         if (closeWhenDone && this.IsOpen()) { this.Close(); }
     }
-
     void Render() {
         this.lastRenderUs = 0;
         if (!this.NeedsRedraw()) { return; }
@@ -275,14 +134,9 @@ public class ChildWindow : AppLoopOwner {
         this.RenderContent();
         long us = Stopwatch.GetMicroseconds() - t0;
         this.lastRenderUs = us;
-        // 单个子窗就慢到能顶掉一帧（甚至几帧）时自己报出来：告警格式
-        // 与 UiWatchdog 一致，同一套 grep 规则就能捞出"谁把帧堵死了"。
         ChildWindows.ReportRenderCost(this, (int)(us / 1000));
     }
-
-    // 本帧该子窗的渲染耗时（微秒）。
     long LastRenderUs() { return this.lastRenderUs; }
-
     internal void EnsureHostLayoutRegistration() {
         if (host == null || !open) { return; }
         if (root != null && binder != null) { host.RegisterModelHost(binder); }
@@ -292,7 +146,6 @@ public class ChildWindow : AppLoopOwner {
         if (previous != null) { previous.Invalidate(); }
         hostLayoutRegistration = host.RegisterLoopParticipant(this, new ChildHostLayout(this));
     }
-
     private bool ChildLayoutCurrent(App app, Control tree, AppLoopRegistration ticket,
             AppPreparationProof proof, int revision, int phase, long sequence, bool forInput) {
         bool member = !forInput || tree == null || (app.rootControl != null && app.rootControl.ContainsInputControl(tree));
@@ -300,7 +153,6 @@ public class ChildWindow : AppLoopOwner {
             && hostLayoutRegistration == ticket && app.PreparationInputCurrent(phase, sequence)
             && app.HostPhaseCurrent(ticket, proof, revision);
     }
-
     internal bool SyncHostLayout(App app, bool forInput) {
         if (renderCb != null) { return true; }
         AppLoopRegistration ticket = hostLayoutRegistration;
@@ -320,17 +172,13 @@ public class ChildWindow : AppLoopOwner {
             app.ClientWidth() - pad * 2, app.ClientHeight() - app.ContentTop() - pad * 2);
         return ChildLayoutCurrent(app, tree, ticket, proof, revision, phase, sequence, forInput);
     }
-
     private bool ContinueChildFrame(App app, Control tree, AppLoopRegistration ticket) {
         if (open && !destroyed && host == app && root == tree && renderCb == null
             && hostLayoutRegistration == ticket && app.HostLayoutPrepared(ticket)) { return true; }
         app.AbortPreparationFrame();
         return false;
     }
-
-    // 真正的绘制（Render 的计时包装之外的部分）。
     void RenderContent() {
-        // WidgetId.Push/Pop are stateless compatibility no-ops in the pinned base.
         WidgetId.Push("child_window");
         bool pushedId = idBase != 0;
         if (pushedId) { WidgetId.Push(idBase); }
@@ -344,8 +192,6 @@ public class ChildWindow : AppLoopOwner {
                 AppLoopRegistration ticket = hostLayoutRegistration;
                 Control tree = root;
                 if (!ContinueChildFrame(frameHost, tree, ticket)) { return; }
-                // 异形宿主在 BeginFrame 中清为透明，形状底色和阴影带
-                // 与 Form 共用背景阶段，不能依赖子控件恰好铺满轮廓。
                 if (frameHost.shapeMode != 0) {
                     frameHost.RenderBackground(0, 0, frameHost.canvas.Width(),
                     frameHost.canvas.Height(), 0);
@@ -371,8 +217,6 @@ public class ChildWindow : AppLoopOwner {
         }
         this.AfterFrame();
     }
-
-    // 窗口开着且有帧要出（宿主标脏、Pending() 或动画时钟到期）时为 true。
     bool NeedsRedraw() {
         if (!open) { return false; }
         if (host.needsRedraw || this.Pending()) { return true; }
@@ -382,15 +226,8 @@ public class ChildWindow : AppLoopOwner {
         if (host.wakeFrameNextMs >= 0 && now >= host.wakeFrameNextMs) { return true; }
         return false;
     }
-
-    // 窗口是否仍开着。
     bool IsOpen() { return open; }
-
-    // 该 OS 窗口句柄是否归本窗口所有。
-    bool OwnsWindow(nint hwnd) {
-        return open && hwnd == host.WindowHandle();
-    }
-
+    bool OwnsWindow(nint hwnd) { return open && hwnd == host.WindowHandle(); }
     void ApplyEvent(nint hwnd) {
         if (!this.OwnsWindow(hwnd)) { return; }
         if (host.EventKind() == 8) {
@@ -399,23 +236,15 @@ public class ChildWindow : AppLoopOwner {
         }
         host.ApplyEvent(hwnd);
     }
-
     virtual void OnCloseRequested() { }
-
-    // 关闭窗口：向 OS 发送关闭请求、标记关闭并立即 Teardown
-    // （幂等，见 Teardown）。open 先置 false 再回调：覆写里再调
-    // Close() 走 !open 早退，Close↔OnCloseRequested 不会互递归爆栈。
     void Close() {
         if (!open) { return; }
         open = false;
         this.OnCloseRequested();
         host.window.Close();
         this.Teardown();
-        if (this.parentApp != null) {
-            this.parentApp.RequestRedraw();
-        }
+        if (this.parentApp != null) { this.parentApp.RequestRedraw(); }
     }
-
     void Teardown() {
         if (destroyed) { return; }
         destroyed = true;
@@ -423,9 +252,7 @@ public class ChildWindow : AppLoopOwner {
         hostLayoutRegistration = null;
         if (oldLayout != null) { oldLayout.Invalidate(); }
         renderCb = null;
-        if (binder != null) {
-            binder.Detach();
-        }
+        if (binder != null) { binder.Detach(); }
         if (host != null) {
             host.StopLoop();
             host.SetRootControl(null);
@@ -433,14 +260,9 @@ public class ChildWindow : AppLoopOwner {
         root = null;
         if (host != null) {
             if (host.window != null) { host.window.Destroy(); }
-            // 光栅 surface 与 OS 窗口是两份资源：销毁窗口只释放
-            // X11/Win32 侧，surface 槽位（及其模糊/快照缓存）要
-            // 显式归还，否则每开关一个副窗口就漏一块帧缓冲。
             if (host.canvas != null) { host.canvas.Destroy(); }
         }
     }
-
-    // 请求宿主重绘（窗口开着时）。
     void RequestRedraw() {
         if (open) {
             host.RequestRedraw();
@@ -450,53 +272,34 @@ public class ChildWindow : AppLoopOwner {
             }
         }
     }
-
-
-    // 转发给宿主换肤（窗口开着时）。
     void ApplySkin(int i) {
         if (open) { host.ApplySkin(i); }
     }
-
-    // 转发给宿主设置窗口不透明度（0-100，窗口开着时）。
     void SetWindowOpacity(int percent) {
         if (open) { host.SetWindowOpacity(percent); }
     }
-
-    // 转发给宿主设置用户壁纸与不透明度（窗口开着时）。
     void SetUserWallpaper(string path, int opacity) {
         if (open) { host.SetUserWallpaper(path, opacity); }
     }
-
-    // 宿主窗口的 OS 句柄。
     nint WindowHandle() { return host.WindowHandle(); }
-
-    // 主窗口换肤后同步本副窗口并重绘。
     void FollowSkin(int i) {
         if (!open) { return; }
         host.ApplySkin(i);
         host.RequestRedraw();
     }
-
-    // 主窗口换了界面语言：已经开着的副窗口的标题提示也得跟上。
     void FollowCaptionTips(App src) {
         if (!open) { return; }
         host.FollowCaptionTips(src);
         host.RequestRedraw();
     }
-
-    // 主窗口调不透明度后同步本副窗口。
     void FollowOpacity(int percent) {
         if (!open) { return; }
         host.SetWindowOpacity(percent);
     }
-
-    // 主窗口换壁纸后同步本副窗口。
     void FollowWallpaper(string path, int opacity) {
         if (!open) { return; }
         host.SetUserWallpaper(path, opacity);
     }
-
-    // 宿主的下一次动画截止时刻（毫秒时钟；窗口关闭返回 -1）。
     int AnimNextMs() {
         if (!open) { return 0 - 1; }
         int due = host.animNextMs;
@@ -507,12 +310,9 @@ public class ChildWindow : AppLoopOwner {
         }
         return due;
     }
-
     void TickInputGestures() {
         if (open) { host.TickRoutedLongPress(); }
     }
-
-    // 宿主的下一次特效截止时刻（毫秒时钟；窗口关闭返回 -1）。
     int FxNextMs() {
         if (!open) { return 0 - 1; }
         return host.fxNextMs;

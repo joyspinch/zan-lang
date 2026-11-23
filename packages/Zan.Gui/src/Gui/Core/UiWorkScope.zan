@@ -1,12 +1,6 @@
 using System;
 using System.Threading;
-
 namespace Gui;
-
-// One UI owner and one latest-result lane. Start/Cancel/Close/Drain are UI-owned
-// (Drain may resume in a worker after Close). Snapshot/result are reference
-// types. Compute only reads its independent immutable snapshot and token.
-// UI callbacks receive the owner explicitly: never capture it in a callback.
 public class UiWorkScope<TOwner, TSnapshot, TResult> : IDisposable {
     private weak TOwner owner;
     private weak App host;
@@ -14,17 +8,11 @@ public class UiWorkScope<TOwner, TSnapshot, TResult> : IDisposable {
     private List<UiWorkScopeJob<TOwner, TSnapshot, TResult>> workers = new List<UiWorkScopeJob<TOwner, TSnapshot, TResult>>();
     private bool closed;
     private int generation;
-
     public UiWorkScope(App host, TOwner owner) {
         this.host = host;
         this.owner = owner;
     }
-
     public bool IsClosed { get { return this.closed; } }
-
-    // Every attempt retires the previous job, including already posted results.
-    // A cancellation callback may reenter: the newer attempt wins; the outer
-    // attempt throws rather than overwriting its successor or a closed scope.
     public UiWorkScopeJob<TOwner, TSnapshot, TResult> StartLatest(TSnapshot snapshot,
         Func<TSnapshot, CancellationToken, TResult> compute, Func<TOwner, bool> current,
         Action<TOwner, TResult> apply, Action<TOwner, Exception> failed) {
@@ -46,30 +34,24 @@ public class UiWorkScope<TOwner, TSnapshot, TResult> : IDisposable {
             this, this.host, snapshot, compute, current, apply, failed);
         this.latest = job;
         this.workers.Add(job);
-        // Class-level generic weak/delegate/Task.Run shape passed the strict
-        // stdlib language probe (2026-11-13); no async delegates are involved.
         job.Start();
         return job;
     }
-
     private void RetireLatest() {
         UiWorkScopeJob<TOwner, TSnapshot, TResult> job = this.latest;
         this.latest = null;
         if (job != null) { job.Retire(); }
     }
-
     public void CancelLatest() {
         this.generation = this.generation + 1;
         this.RetireLatest();
     }
-
     internal void Deliver(UiWorkScopeJob<TOwner, TSnapshot, TResult> job) {
         TOwner target = this.owner;
         try {
             if (this.closed || this.latest != job || target == null || job.IsRetired) { return; }
             Func<TOwner, bool> current = job.CopyCurrent();
             if (current == null || !current(target)) { return; }
-            // Predicate is arbitrary business code; revalidate after reentry.
             if (this.closed || this.latest != job || this.owner != target || job.IsRetired) { return; }
             this.latest = null;
             job.ApplyTo(target);
@@ -78,9 +60,6 @@ public class UiWorkScope<TOwner, TSnapshot, TResult> : IDisposable {
             job.Retire();
         }
     }
-
-    // Close retires UI callbacks/results immediately. Await DrainAsync for all
-    // worker exits. Neither cancellation nor drain requires a UI message pump.
     public void Close() {
         if (this.closed) { return; }
         this.closed = true;
@@ -89,13 +68,9 @@ public class UiWorkScope<TOwner, TSnapshot, TResult> : IDisposable {
         this.host = null;
         for (int i = 0; i < this.workers.Count; i = i + 1) { this.workers[i].Retire(); }
     }
-
     public void Dispose() { this.Close(); }
-
     public async void DrainAsync() {
         this.Close();
-        // Capture on the UI caller, including drains reentered during Close.
-        // Continuations may run on workers and only touch their private list.
         List<UiWorkScopeJob<TOwner, TSnapshot, TResult>> pending = new List<UiWorkScopeJob<TOwner, TSnapshot, TResult>>();
         for (int i = 0; i < this.workers.Count; i = i + 1) { pending.Add(this.workers[i]); }
         for (int i = 0; i < pending.Count; i = i + 1) {

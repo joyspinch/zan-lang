@@ -1,12 +1,9 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui;
-
 public class LineBox {
-    // 文本 piece：按样式折算字号/行高/基线（半行距模型）。
-    static InlinePiece MakeText(Control owner, StyleBox st, string text,
+    static InlinePiece MakeText(StyleNode owner, StyleBox st, string text,
                                 bool space) {
         InlinePiece p = new InlinePiece();
         p.owner = owner;
@@ -25,8 +22,6 @@ public class LineBox {
         int cellAsc = Canvas.FontAscent(p.fs);
         int cellDesc = Canvas.FontHeight(p.fs) - cellAsc;
         int lead = p.lh - cellAsc - cellDesc;
-        // Chrome 的半行距分配对负 lead 向下取整（lead=-1 时 asc 也减 1，
-        // 基线探针实测），C 风格的 / 向零截断会把基线整体抬高 1px。
         int half = lead / 2;
         if (lead < 0 && lead % 2 != 0) { half = half - 1; }
         p.asc = cellAsc + half;
@@ -34,13 +29,7 @@ public class LineBox {
         p.ascOff = p.asc - cellAsc;
         return p;
     }
-
-    // 原子盒 piece（inline-block 等）：基线对齐时下 margin 边坐在
-    // 基线上（CSS 10.8.1），asc = margin-top + 盒高、desc = margin-bottom。
-    // va:middle 时盒中点对到基线向上半个 x 高（浏览器实测语义，
-    // CSS 原文的 "baseline + 半 x 高" 是排版向上方向的加法），
-    // 行内 A/D 贡献改为盒相对基线上下伸出的部分。
-    static InlinePiece MakeBox(Control kid, int w, int h,
+    static InlinePiece MakeBox(StyleNode kid, int w, int h,
                                int ml, int mr, int mt, int mb, StyleBox st,
                                int xhHalf) {
         InlinePiece p = new InlinePiece();
@@ -63,17 +52,12 @@ public class LineBox {
         p.lh = p.asc + p.desc;
         return p;
     }
-
-    // 容器支柱（strut）：块的字体/行高参与每一行的 A/D 竞争。
     static InlinePiece MakeStrut(StyleBox st) {
         InlinePiece p = MakeText(null, st, "", false);
         p.isStrut = true;
         p.w = 0;
         return p;
     }
-
-    // [yTop, yBot) 带与 float 入侵的相交查询：左 float 把行左缘
-    // 抬到 x1，右 float 把右边界压到 x0（同一带内取最窄者）。
     static LineSpan LineAvail(List<FloatIntrusion> floats, int availW,
                               int yTop, int yBot) {
         LineSpan sp = new LineSpan();
@@ -91,9 +75,6 @@ public class LineBox {
         }
         return sp;
     }
-
-    // clear 要求块顶边 ≥ 相关侧 float 的最低底边（side 1 左 / 2 右
-    // / 3 双侧）；无相关 float 时原 y 返回。
     static int ClearY(List<FloatIntrusion> floats, int side, int y) {
         int r = y;
         if (floats == null) { return r; }
@@ -105,9 +86,6 @@ public class LineBox {
         }
         return r;
     }
-
-    // 严格大于 y 的最低 float 底边（下一搁架）；没有则返回 y，
-    // 调用方据此停止下坠、行在原地溢出（防呆不挂死）。
     static int NextShelf(List<FloatIntrusion> floats, int y) {
         int r = 0 - 1;
         if (floats != null) {
@@ -119,12 +97,7 @@ public class LineBox {
         if (r < 0) { r = y; }
         return r;
     }
-
-    // 把一段文本拆成 piece 序列。white-space：
-    // 0 normal / 1 nowrap——空白折叠成单空格 piece、按词可断；
-    // 2 pre / 3 pre-wrap——按 \n 硬分段，空白原样保留、段内不断
-    // （空段也给 piece，保住空行的高度）。
-    static void PushText(List<InlinePiece> sink, Control owner, StyleBox st,
+    static void PushText(List<InlinePiece> sink, StyleNode owner, StyleBox st,
                          string text) {
         int mode = st.whiteSpace;
         if (mode == 2 || mode == 3) {
@@ -164,10 +137,6 @@ public class LineBox {
             }
         }
     }
-
-    // 排版：贪心填行。nowrap 的 piece 自身不引发行首断行
-    // （white-space 是逐 owner 的）；pre 的硬断行永远生效。
-    // strut 参与（但不属于）每一行。
     static void Layout(List<InlinePiece> items, InlinePiece strut,
                        int availW, List<InlineLine> sink) {
         if (availW <= 0) { availW = 1; }
@@ -178,9 +147,7 @@ public class LineBox {
         for (int i = 0; i < items.Count; i = i + 1) {
             InlinePiece p = items[i];
             bool canBreak = true;
-            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) {
-                canBreak = false;
-            }
+            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) { canBreak = false; }
             if (p.isSpace) {
                 if (cur.pieces.Count == 0) { continue; }
                 if (x + p.w > availW) { continue; }
@@ -207,13 +174,6 @@ public class LineBox {
         }
         Flush(cur, x, strut, sink, yy);
     }
-
-    // float 感知排版（P3）：与 Layout 同一贪心骨架，但每行的可用
-    // 区在行顶处与 float 入侵带相交查询（yStart = 本段在流里的起
-    // 点）。行宽只在行顶处查询（Chrome 同款：float 贴着行底擦过
-    // 不收窄本行）；piece 放不下且行顶查询显示 xOff 已越过可用右
-    // 缘，就整行下坠到下一搁架、从行首重排（CSS 9.5"line box 放
-    // 不下就移到 float 之下"）。行几何随行记录，排布端据此绕排。
     static void LayoutF(List<InlinePiece> items, InlinePiece strut,
                         int availW, List<InlineLine> sink,
                         List<FloatIntrusion> floats, int yStart) {
@@ -233,9 +193,7 @@ public class LineBox {
         for (int i = 0; i < items.Count; i = i + 1) {
             InlinePiece p = items[i];
             bool canBreak = true;
-            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) {
-                canBreak = false;
-            }
+            if (p.st != null && p.st.whiteSpace == 1 && !p.hardBreak) { canBreak = false; }
             if (p.isSpace) {
                 if (cur.pieces.Count == 0) { continue; }
                 if (x + p.w > limit) { continue; }
@@ -244,8 +202,6 @@ public class LineBox {
                 cur.pieces.Add(p);
                 continue;
             }
-            // 非空格 piece 放不下且可断：先按行顶规则复查，要下坠
-            // 就把已放入的 piece 全部回退、从行首重来。
             if (canBreak && cur.pieces.Count > 0 && x + p.w > limit) {
                 bool restart = false;
                 for (int mv = 0; mv < 8; mv = mv + 1) {
@@ -282,7 +238,6 @@ public class LineBox {
             p.x = x;
             x = x + p.w;
             cur.pieces.Add(p);
-            // pre 硬断行：断行在它之后，同样按行顶规则复查/下坠。
             if (p.hardBreak) {
                 bool restart2 = false;
                 for (int mv = 0; mv < 8; mv = mv + 1) {
@@ -317,7 +272,6 @@ public class LineBox {
                 lineStart = i + 1;
             }
         }
-        // 末行：装不下就整行下坠（不再取词，piece 相对位置不变）。
         for (int mv = 0; mv < 8; mv = mv + 1) {
             if (cur.pieces.Count == 0) { break; }
             if (sp.xOff + x <= sp.availW) { break; }
@@ -330,9 +284,6 @@ public class LineBox {
         cur.availW = sp.availW;
         Flush(cur, x, strut, sink, y);
     }
-
-    // 结束当前行（裁掉行尾空白，行高 = strut 与 pieces 的 A/D 竞争）。
-    // yOff 记入行盒；返回行高（asc+desc，空行 0）供调用方推进 y。
     static int Flush(InlineLine cur, int width, InlinePiece strut,
                      List<InlineLine> sink, int yOff) {
         while (cur.pieces.Count > 0) {

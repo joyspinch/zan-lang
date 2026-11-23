@@ -1,10 +1,6 @@
 using System;
 using System.Threading;
-
 namespace Gui;
-
-// A worker completion ticket. UI links are weak. Queued Post only keeps the
-// ticket alive; Retire releases callbacks/result without dispatching that Post.
 public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
     private weak UiWorkScope<TOwner, TSnapshot, TResult> scope;
     private weak App host;
@@ -22,20 +18,16 @@ public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
     private bool resourcesReleased;
     private CancellationTokenSource cancellation = new CancellationTokenSource();
     private long worker;
-
     internal UiWorkScopeJob(UiWorkScope<TOwner, TSnapshot, TResult> scope, App host, TSnapshot snapshot,
         Func<TSnapshot, CancellationToken, TResult> compute, Func<TOwner, bool> current,
         Action<TOwner, TResult> apply, Action<TOwner, Exception> failed) {
         this.scope = scope; this.host = host; this.snapshot = snapshot;
         this.compute = compute; this.current = current; this.apply = apply; this.failed = failed;
     }
-
     public bool IsWorkerDrained { get { return this.worker != 0 && Task.IsDone(this.worker) != 0; } }
     public bool IsRetired { get { lock (this) { return this.retired; } } }
     public Exception Error { get { lock (this) { return this.error; } } }
-
     internal void Start() { this.worker = Task.Run(this.Run()); }
-
     private async void Run() {
         try {
             bool run = false;
@@ -57,17 +49,14 @@ public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
             } else { this.Retire(); }
         }
     }
-
     private void Deliver() {
         UiWorkScope<TOwner, TSnapshot, TResult> target = this.scope;
         if (target != null) { target.Deliver(this); }
         else { this.Retire(); }
     }
-
     internal Func<TOwner, bool> CopyCurrent() {
         lock (this) { return this.retired ? null : this.current; }
     }
-
     internal void ApplyTo(TOwner target) {
         Action<TOwner, TResult> apply = null;
         Action<TOwner, Exception> failed = null;
@@ -79,12 +68,9 @@ public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
             prepared = this.result; failure = this.error;
             this.result = null;
         }
-        // Delegate snapshots are protected from worker-side retirement. Never
-        // invoke user code under lock; UI exceptions propagate to App's caller.
         if (failure != null) { failed(target, failure); }
         else { apply(target, prepared); }
     }
-
     internal void Retire() {
         bool cancel = false;
         lock (this) {
@@ -99,7 +85,6 @@ public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
                 cancel = true;
             }
         }
-        // Token registrations can reenter UI code. Run them outside job lock.
         if (cancel) {
             try { this.cancellation.Cancel(); }
             finally {
@@ -110,23 +95,17 @@ public class UiWorkScopeJob<TOwner, TSnapshot, TResult> {
             }
         }
     }
-
-    // Task.WhenAll uses the existing event-driven JoinWait path. Direct await
-    // of a public Task pumps synchronously; do not replace this with await Task.
-    // No TCS is needed, and no completion source can be closed during Signal.
     public async void WaitForWorkerAsync() {
         List<long> handles = new List<long>();
         handles.Add(this.worker);
         await Task.WhenAll(handles);
     }
-
     internal void ReleaseResources() {
         lock (this) {
             this.releaseRequested = true;
             this.ReleaseResourcesLocked();
         }
     }
-
     private void ReleaseResourcesLocked() {
         if (!this.releaseRequested || this.cancellationInProgress || this.resourcesReleased) { return; }
         this.resourcesReleased = true;

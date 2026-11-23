@@ -1,60 +1,23 @@
 using System;
 using System.Json;
-
 namespace Gui;
-
-// 样式解析器：把（控件类型、类、状态）解析为一个
-// StyleBox——依次叠加当前主题的默认值、当前皮肤的
-// 样式表以及控件自身的 inline 样式，并在状态之间
-// 交叉淡入淡出，从而支持 `transition`。
-// // 这正是控件无需携带各皮肤绘制代码即可换肤的关键。
-// 控件的整个视觉层变成：
-//
-// s.Paint(app, x, y, w, h);
-// s.DrawLabel(app, x, y, w, h, label);
-// // 选择器遵循 CSS：`button`、`.primary`、`button.primary`、`#save` 以及
-// 它们的 `:hover / :active / :focus / :disabled / :checked / :selected` 状态
-// 变体，按特异性升序解析（type、class、type.class、id）。
-// 主题 token 提供默认值，皮肤只需声明差异，
-// 没有 skin.css 的应用外观与内置主题完全一致。
 public partial class Style {
-
-    // 常态（0，无任何状态位）。
     public static int SNormal()   { return 0; }
-    // 悬停位（1）。
     public static int SHover()    { return 1; }
-    // 按下位（2）；StateOf 只在悬停中按下才置位。
     public static int SActive()   { return 2; }
-    // 焦点位（4）。
     public static int SFocus()    { return 4; }
-    // 禁用位（8）；StateOf 置位它时屏蔽其余交互状态。
     public static int SDisabled() { return 8; }
-    // 选中位（16）；锁定状态，先于 hover/press 淡入淡出叠加。
     public static int SSelected() { return 16; }
-    // 勾选位（32）；与 SSelected 相同的锁定语义。
     public static int SChecked()  { return 32; }
-
-
-    // 无动画（0）。
     public static int AnimNone()    { return 0; }
-    // `spin`：持续旋转（StyleBox.SpinDeg 消费）。
     public static int AnimSpin()    { return 1; }
-    // `pulse`：盒内呼吸填充（StyleBox.PaintAnim 消费）。
     public static int AnimPulse()   { return 2; }
-    // `breath`：卡片呼吸光泽（Fx.CardBreath）。
     public static int AnimBreath()  { return 3; }
-    // `shimmer`：扫过的斜向高光（Fx.CardSheen）。
     public static int AnimShimmer() { return 4; }
-    // `float`：上下浮动偏移（StyleBox.FloatOffset 消费）。
     public static int AnimFloat()   { return 5; }
-    // `glow`：边框辉光（Fx.BorderGlow）。
     public static int AnimGlow()    { return 6; }
-    // `aurora`：极光渐变（Fx.CardAurora）。
     public static int AnimAurora()  { return 7; }
-    // `motes`：漂浮微粒（Fx.CardMotes）。
     public static int AnimMotes()   { return 8; }
-
-    // 把 CSS 动画名映射为 Anim* 种类（未知返回 0）。
     public static int AnimKind(string name) {
         if (name == "spin") { return Style.AnimSpin(); }
         if (name == "pulse") { return Style.AnimPulse(); }
@@ -66,8 +29,6 @@ public partial class Style {
         if (name == "motes") { return Style.AnimMotes(); }
         return 0;
     }
-
-    // 某个状态位对应的 CSS 伪类名（基础状态返回 ""）。
     public static string StateName(int bit) {
         if (bit == Style.SHover()) { return "hover"; }
         if (bit == Style.SActive()) { return "active"; }
@@ -77,8 +38,6 @@ public partial class Style {
         if (bit == Style.SChecked()) { return "checked"; }
         return "";
     }
-
-    // CSS 伪类名对应的状态位（不代表任何状态时返回 0）。
     public static int StateBit(string name) {
         if (name == "hover") { return Style.SHover(); }
         if (name == "active") { return Style.SActive(); }
@@ -88,56 +47,12 @@ public partial class Style {
         if (name == "checked") { return Style.SChecked(); }
         return 0;
     }
-
-    // 控件 `id` 的实时交互状态，以状态位掩码表示。
-    public static int StateOf(App app, int id, bool disabled) {
-        if (app == null) { return disabled ? Style.SDisabled() : 0; }
-        if (disabled) { return Style.SDisabled(); }
-        int st = 0;
-        bool hovered = app.focus.IsHovered(id);
-        if (hovered) {
-            st = Style.SHover();
-            if (app.focus.IsPressed(id)) {
-                st = st | Style.SActive();
-            }
-        }
-        if (app.focus.IsFocused(id)) { st = st | Style.SFocus(); }
-        return st;
-    }
-    public static int StateOf(int id, bool disabled) {
-        return Style.StateOf(null, id, disabled);
-    }
-    public static int StateOf(int id) {
-        return Style.StateOf(null, id, false);
-    }
-
-    // 解析需要遍历 sheet 的选择器表，因此结果按（type, class, state）
-    // 记忆化，并在主题/皮肤代次变化时清空。
-    // 控件每帧都要解析；缓存让这件事保持廉价。
-
-    // 键 -> 解析结果的哈希表。线性表在一屏几百个控件、每个控件
-    // 每帧解析数次时会退化：每次命中都要逐个比较字符串键，而一旦
-    // 键数超过上限，整张表被清空，于是接下来的每一次解析都要重新
-    // 走一遍 sheet 的选择器表——功能区换页、树展开这类整窗重绘因此
-    // 变成 CPU 峰值。哈希表让命中是常数时间，容量也不再需要
-    // 靠清空来控制（键的数量由界面里的 类型/类/id/状态 组合决定，
-    // 本就有限，且皮肤代次一变就整体作废）。
-    // 存储在 App 实例上（app.styleCache / app.styleCacheGen）：缓存的是
-    // 本窗口皮肤+appCss 的解析结果，避免多窗口应用中主窗/子窗相互击穿缓存。
-
-    // 解析次数与命中次数（帧分析器读它们）。缓存命中不等于不花钱：
-    // 命中一次也要拼一把键字符串、查一次哈希、克隆一个 StyleBox，
-    // 所以“每帧解析了多少次”本身就是一个得盯的量。
     static int statResolve;
     static int statHit;
-
-    // 读解析计数但不清零，供按帧算差值（0 = 解析次数，1 = 命中次数）。
     public static int StatPeek(int idx) {
         if (idx == 0) { return Style.statResolve; }
         return Style.statHit;
     }
-
-    // 取走并清零解析计数（0 = 解析次数，1 = 缓存命中次数）。
     public static int StatRead(int idx) {
         if (idx == 0) {
             int v = Style.statResolve;
@@ -148,90 +63,73 @@ public partial class Style {
         Style.statHit = 0;
         return h;
     }
-
     static string[] s_stateStrs = new string[] {
         "0", "1", "2", "3", "4", "5", "6", "7", "8"
     };
-
     public static string StateStr(int state) {
-        if (state >= 0 && state <= 8) {
-            return s_stateStrs[state];
-        }
+        if (state >= 0 && state <= 8) { return s_stateStrs[state]; }
         return Convert.ToString(state);
     }
-
     static int cachedDpiScale = -1;
     static int cachedMetricsScale = -1;
     static string cachedScaleTag = "";
-
-    public static string ScaleTag(App app) {
+    public static string ScaleTag(StyleHost app) {
         if (app == null) { return ""; }
-        if (app.dpiScale == Style.cachedDpiScale && app.metricsScale == Style.cachedMetricsScale) {
+        int dpi = app.HostDpiScale();
+        int metrics = app.HostMetricsScale();
+        if (dpi == Style.cachedDpiScale && metrics == Style.cachedMetricsScale) {
             return Style.cachedScaleTag;
         }
-        Style.cachedDpiScale = app.dpiScale;
-        Style.cachedMetricsScale = app.metricsScale;
-        Style.cachedScaleTag = "@" + Convert.ToString(app.dpiScale) + "/" + Convert.ToString(app.metricsScale);
+        Style.cachedDpiScale = dpi;
+        Style.cachedMetricsScale = metrics;
+        Style.cachedScaleTag = "@" + Convert.ToString(dpi) + "/" + Convert.ToString(metrics);
         return Style.cachedScaleTag;
     }
-
-    // 查解析缓存（每次调用计入解析统计，命中计入命中统计）；
-    // 缓存为空或主题代次不符时重建并返回 null（未命中）。
-    public static StyleBox CacheGet(App app, string key) {
+    public static StyleBox CacheGet(StyleHost app, string key) {
         if (app == null) { return null; }
         Style.statResolve = Style.statResolve + 1;
-        int gen = app.bgThemeGen;
-        if (app.styleCache == null || app.styleCacheGen != gen) {
-            app.styleCache = new Dict<string, StyleBox>();
-            app.styleCacheGen = gen;
+        int gen = app.HostBgThemeGen();
+        Dict<string, StyleBox> cache = app.HostStyleCache();
+        if (cache == null || app.HostStyleCacheGen() != gen) {
+            app.HostSetStyleCache(new Dict<string, StyleBox>(), gen);
             return null;
         }
         StyleBox hit;
-        if (app.styleCache.TryGetValue(key, out hit)) {
+        if (cache.TryGetValue(key, out hit)) {
             Style.statHit = Style.statHit + 1;
             return hit;
         }
         return null;
     }
-
-    // 把解析结果放入缓存；同键已存在时保留先到的。
-    public static void CachePut(App app, string key, StyleBox box) {
-        if (app == null || app.styleCache == null) { return; }
-        if (app.styleCache.ContainsKey(key)) { return; }
-        app.styleCache.Add(key, box);
+    public static void CachePut(StyleHost app, string key, StyleBox box) {
+        if (app == null) { return; }
+        Dict<string, StyleBox> cache = app.HostStyleCache();
+        if (cache == null) { return; }
+        if (cache.ContainsKey(key)) { return; }
+        cache.Add(key, box);
     }
-
-    // ---- resolution --------------------------------------------------------
-
-    // 解析 `type`.`cls` 在 `state` 下的样式（主题默认值 + 皮肤）。
-    public static StyleBox Of(App app, string type, string cls, int state) {
+    public static StyleBox Of(StyleHost app, string type, string cls, int state) {
         return Style.Full(app, type, cls, "", state);
     }
-    public static StyleBox Of(string type, string cls, int state) {
-        return Style.Of(null, type, cls, state);
-    }
-    public static StyleBox Of(string type, int state) {
-        return Style.Of(null, type, "", state);
-    }
-    public static StyleBox Of(string type) {
-        return Style.Of(null, type, "", Style.SNormal());
-    }
-
-    // 包含 id 选择器（`#name`）的解析，即特异性最高的一层。
-    public static StyleBox Full(App app, string type, string cls, string id, int state) {
+    public static StyleBox Of(string type, string cls, int state) { return Style.Of(null, type, cls, state); }
+    public static StyleBox Of(string type, int state) { return Style.Of(null, type, "", state); }
+    public static StyleBox Of(string type) { return Style.Of(null, type, "", Style.SNormal()); }
+    public static StyleBox Full(StyleHost app, string type, string cls, string id, int state) {
         if (app == null) {
             StyleBox fallback = new StyleBox();
             Style.Defaults(null, fallback, type, cls, state);
             return fallback;
         }
         StyleSheet basef = Style.BaseSheet(app);
-        StyleSheet chartf = app.chartSheet;
-        StyleSheet sheet = app.sheet;
+        StyleSheet chartf = app.HostChartSheet();
+        bool isolateApp = app.HostIsolateAppSheet();
+        StyleSheet sheet = isolateApp ? null : app.HostSheet();
         int dependency = Style.ContextDependency(basef, chartf, sheet);
-        Control ctxNode = dependency == 0 ? null : app.styleCtx;
+        StyleNode ctxNode = dependency == 0 ? null : app.HostStyleCtx();
         bool cacheable = dependency < 2 || ctxNode == null;
         string sig = Style.ContextSig(app, dependency);
         string key = type + "|" + cls + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
+        if (isolateApp) { key = key + "|sys"; }
         if (sig != "") { key = key + "#" + sig; }
         if (cacheable) {
             StyleBox hit = Style.CacheGet(app, key);
@@ -239,21 +137,11 @@ public partial class Style {
         } else {
             Style.statResolve = Style.statResolve + 1;
         }
-
         StyleBox b = new StyleBox();
         Style.Defaults(app, b, type, cls, state);
-        if (basef != null) {
-            Style.ApplySheetCtx(basef, b, type, cls, id, state, ctxNode);
-        }
-        // 图表主题包（Gui.Component.Chart/themes）是独立的一块样式表，
-        // 垫在内置基线之上、Gui 皮肤（app.sheet）之下：皮肤包对 chart
-        // 写过的规则优先于主题包，主题包只补基线没定义的部分。
-        if (chartf != null) {
-            Style.ApplySheetCtx(chartf, b, type, cls, id, state, ctxNode);
-        }
-        if (sheet != null) {
-            Style.ApplySheetCtx(sheet, b, type, cls, id, state, ctxNode);
-        }
+        if (basef != null) { Style.ApplySheetCtx(basef, b, type, cls, id, state, ctxNode); }
+        if (chartf != null) { Style.ApplySheetCtx(chartf, b, type, cls, id, state, ctxNode); }
+        if (sheet != null) { Style.ApplySheetCtx(sheet, b, type, cls, id, state, ctxNode); }
         Style.Shell(app, b, type, cls, state);
         Style.ScaleLayout(app, b);
         if (cacheable) { Style.CachePut(app, key, b); }
@@ -262,12 +150,7 @@ public partial class Style {
     public static StyleBox Full(string type, string cls, string id, int state) {
         return Style.Full(null, type, cls, id, state);
     }
-
-    // 解析 `type::part` 部件样式（`menu::item` 一类）：fallbackType
-    // 非空时先按它走整套主题默认值与皮肤规则，再叠加 base 与应用
-    // sheet 的 `type::part` 选择器，最后应用 Shell 与度量缩放。
-    // 结果同样按键缓存并返回克隆。
-    public static StyleBox Part(App app, string type, string part, string fallbackType,
+    public static StyleBox Part(StyleHost app, string type, string part, string fallbackType,
                          string cls, string id, int state) {
         if (app == null) {
             StyleBox fallback = new StyleBox();
@@ -275,14 +158,16 @@ public partial class Style {
             return fallback;
         }
         StyleSheet basef = Style.BaseSheet(app);
-        StyleSheet chartf = app.chartSheet;
-        StyleSheet sheet = app.sheet;
+        StyleSheet chartf = app.HostChartSheet();
+        bool isolateApp = app.HostIsolateAppSheet();
+        StyleSheet sheet = isolateApp ? null : app.HostSheet();
         int dependency = Style.ContextDependency(basef, chartf, sheet);
-        Control ctxNode = dependency == 0 ? null : app.styleCtx;
+        StyleNode ctxNode = dependency == 0 ? null : app.HostStyleCtx();
         bool cacheable = dependency < 2 || ctxNode == null;
         string sig = Style.ContextSig(app, dependency);
         string key = type + "::" + part + "|" + fallbackType + "|" + cls
             + "|" + id + "|" + Style.StateStr(state) + Style.ScaleTag(app);
+        if (isolateApp) { key = key + "|sys"; }
         if (sig != "") { key = key + "#" + sig; }
         if (cacheable) {
             StyleBox hit = Style.CacheGet(app, key);
@@ -290,29 +175,19 @@ public partial class Style {
         } else {
             Style.statResolve = Style.statResolve + 1;
         }
-
         StyleBox b = new StyleBox();
-        if (fallbackType != "") {
-            Style.Defaults(app, b, fallbackType, cls, state);
-        }
+        if (fallbackType != "") { Style.Defaults(app, b, fallbackType, cls, state); }
         if (fallbackType == "") { Style.UnitEnvironment(app, b); }
         if (basef != null) {
-            if (fallbackType != "") {
-                Style.ApplySheetCtx(basef, b, fallbackType, cls, "", state, ctxNode);
-            }
+            if (fallbackType != "") { Style.ApplySheetCtx(basef, b, fallbackType, cls, "", state, ctxNode); }
             Style.ApplyPartSheetCtx(basef, b, type, part, cls, id, state, ctxNode);
         }
-        // 图表主题包：独立一块，同样垫在 Gui 皮肤（app.sheet）之下。
         if (chartf != null) {
-            if (fallbackType != "") {
-                Style.ApplySheetCtx(chartf, b, fallbackType, cls, "", state, ctxNode);
-            }
+            if (fallbackType != "") { Style.ApplySheetCtx(chartf, b, fallbackType, cls, "", state, ctxNode); }
             Style.ApplyPartSheetCtx(chartf, b, type, part, cls, id, state, ctxNode);
         }
         if (sheet != null) {
-            if (fallbackType != "") {
-                Style.ApplySheetCtx(sheet, b, fallbackType, cls, "", state, ctxNode);
-            }
+            if (fallbackType != "") { Style.ApplySheetCtx(sheet, b, fallbackType, cls, "", state, ctxNode); }
             Style.ApplyPartSheetCtx(sheet, b, type, part, cls, id, state, ctxNode);
         }
         if (fallbackType != "") { Style.Shell(app, b, fallbackType, cls, state); }
@@ -327,98 +202,38 @@ public partial class Style {
     public static StyleBox Part(string type, string part, string fallbackType, int state) {
         return Style.Part(null, type, part, fallbackType, "", "", state);
     }
-
-    // 布局/文字长度按各标量自己的来源换算，不能比较主题数值。
-    // 百分比和行高倍数不进入此通道；阴影/模糊仍在绘制时换算。
-    public static void ScaleLayout(App app, StyleBox b) {
-        if (app != null) {
-            b.envDpiScale = app.dpiScale;
-        }
+    public static void ScaleLayout(StyleHost app, StyleBox b) {
+        if (app != null) { b.envDpiScale = app.HostDpiScale(); }
         Style.ScaleBox(b);
     }
-    public static void ScaleLayout(StyleBox b) {
-        Style.ScaleLayout(null, b);
-    }
-
+    public static void ScaleLayout(StyleBox b) { Style.ScaleLayout(null, b); }
     public static void ScaleBox(StyleBox b) {
-        if (b.width >= 0) {
-            b.width = b.ResolveLength(b.width, StyleBox.SourceWidth());
-        }
-        if (b.height >= 0) {
-            b.height = b.ResolveLength(b.height, StyleBox.SourceHeight());
-        }
-        if (b.minW >= 0) {
-            b.minW = b.ResolveLength(b.minW, StyleBox.SourceMinW());
-        }
-        if (b.minH >= 0) {
-            b.minH = b.ResolveLength(b.minH, StyleBox.SourceMinH());
-        }
-        if (b.maxW >= 0) {
-            b.maxW = b.ResolveLength(b.maxW, StyleBox.SourceMaxW());
-        }
-        if (b.maxH >= 0) {
-            b.maxH = b.ResolveLength(b.maxH, StyleBox.SourceMaxH());
-        }
-        if (b.basis >= 0) {
-            b.basis = b.ResolveLength(b.basis, StyleBox.SourceBasis());
-        }
-        if (b.gap >= 0) {
-            b.gap = b.ResolveLength(b.gap, StyleBox.SourceGap());
-        }
-        if (b.rowGap >= 0) {
-            b.rowGap = b.ResolveLength(b.rowGap, StyleBox.SourceRowGap());
-        }
-        if (b.colGap >= 0) {
-            b.colGap = b.ResolveLength(b.colGap, StyleBox.SourceColGap());
-        }
-        if (b.fontPx > 0) {
-            b.fontPx = b.ResolveLength(b.fontPx, StyleBox.SourceFont());
-        }
-        if (b.radius >= 0) {
-            b.radius = b.ResolveLength(b.radius, StyleBox.SourceRadius());
-        }
-        if (b.radiusTL >= 0) {
-            b.radiusTL = b.ResolveLength(b.radiusTL, StyleBox.SourceRadiusTL());
-        }
-        if (b.radiusTR >= 0) {
-            b.radiusTR = b.ResolveLength(b.radiusTR, StyleBox.SourceRadiusTR());
-        }
-        if (b.radiusBR >= 0) {
-            b.radiusBR = b.ResolveLength(b.radiusBR, StyleBox.SourceRadiusBR());
-        }
-        if (b.radiusBL >= 0) {
-            b.radiusBL = b.ResolveLength(b.radiusBL, StyleBox.SourceRadiusBL());
-        }
-        if (b.padL >= 0) {
-            b.padL = b.ResolveLength(b.padL, StyleBox.SourcePadL());
-        }
-        if (b.padT >= 0) {
-            b.padT = b.ResolveLength(b.padT, StyleBox.SourcePadT());
-        }
-        if (b.padR >= 0) {
-            b.padR = b.ResolveLength(b.padR, StyleBox.SourcePadR());
-        }
-        if (b.padB >= 0) {
-            b.padB = b.ResolveLength(b.padB, StyleBox.SourcePadB());
-        }
-        if (b.marL != StyleBox.Unset()) {
-            b.marL = b.ResolveLength(b.marL, StyleBox.SourceMarL());
-        }
-        if (b.marT != StyleBox.Unset()) {
-            b.marT = b.ResolveLength(b.marT, StyleBox.SourceMarT());
-        }
-        if (b.marR != StyleBox.Unset()) {
-            b.marR = b.ResolveLength(b.marR, StyleBox.SourceMarR());
-        }
-        if (b.marB != StyleBox.Unset()) {
-            b.marB = b.ResolveLength(b.marB, StyleBox.SourceMarB());
-        }
-        if (b.borderW >= 0) {
-            b.borderW = b.ResolveLength(b.borderW, StyleBox.SourceBorder());
-        }
-        if (b.borderTopW >= 0) {
-            b.borderTopW = b.ResolveLength(b.borderTopW, StyleBox.SourceBorderTop());
-        }
+        if (b.width >= 0) { b.width = b.ResolveLength(b.width, StyleBox.SourceWidth()); }
+        if (b.height >= 0) { b.height = b.ResolveLength(b.height, StyleBox.SourceHeight()); }
+        if (b.minW >= 0) { b.minW = b.ResolveLength(b.minW, StyleBox.SourceMinW()); }
+        if (b.minH >= 0) { b.minH = b.ResolveLength(b.minH, StyleBox.SourceMinH()); }
+        if (b.maxW >= 0) { b.maxW = b.ResolveLength(b.maxW, StyleBox.SourceMaxW()); }
+        if (b.maxH >= 0) { b.maxH = b.ResolveLength(b.maxH, StyleBox.SourceMaxH()); }
+        if (b.basis >= 0) { b.basis = b.ResolveLength(b.basis, StyleBox.SourceBasis()); }
+        if (b.gap >= 0) { b.gap = b.ResolveLength(b.gap, StyleBox.SourceGap()); }
+        if (b.rowGap >= 0) { b.rowGap = b.ResolveLength(b.rowGap, StyleBox.SourceRowGap()); }
+        if (b.colGap >= 0) { b.colGap = b.ResolveLength(b.colGap, StyleBox.SourceColGap()); }
+        if (b.fontPx > 0) { b.fontPx = b.ResolveLength(b.fontPx, StyleBox.SourceFont()); }
+        if (b.radius >= 0) { b.radius = b.ResolveLength(b.radius, StyleBox.SourceRadius()); }
+        if (b.radiusTL >= 0) { b.radiusTL = b.ResolveLength(b.radiusTL, StyleBox.SourceRadiusTL()); }
+        if (b.radiusTR >= 0) { b.radiusTR = b.ResolveLength(b.radiusTR, StyleBox.SourceRadiusTR()); }
+        if (b.radiusBR >= 0) { b.radiusBR = b.ResolveLength(b.radiusBR, StyleBox.SourceRadiusBR()); }
+        if (b.radiusBL >= 0) { b.radiusBL = b.ResolveLength(b.radiusBL, StyleBox.SourceRadiusBL()); }
+        if (b.padL >= 0) { b.padL = b.ResolveLength(b.padL, StyleBox.SourcePadL()); }
+        if (b.padT >= 0) { b.padT = b.ResolveLength(b.padT, StyleBox.SourcePadT()); }
+        if (b.padR >= 0) { b.padR = b.ResolveLength(b.padR, StyleBox.SourcePadR()); }
+        if (b.padB >= 0) { b.padB = b.ResolveLength(b.padB, StyleBox.SourcePadB()); }
+        if (b.marL != StyleBox.Unset()) { b.marL = b.ResolveLength(b.marL, StyleBox.SourceMarL()); }
+        if (b.marT != StyleBox.Unset()) { b.marT = b.ResolveLength(b.marT, StyleBox.SourceMarT()); }
+        if (b.marR != StyleBox.Unset()) { b.marR = b.ResolveLength(b.marR, StyleBox.SourceMarR()); }
+        if (b.marB != StyleBox.Unset()) { b.marB = b.ResolveLength(b.marB, StyleBox.SourceMarB()); }
+        if (b.borderW >= 0) { b.borderW = b.ResolveLength(b.borderW, StyleBox.SourceBorder()); }
+        if (b.borderTopW >= 0) { b.borderTopW = b.ResolveLength(b.borderTopW, StyleBox.SourceBorderTop()); }
         if (b.borderRightW >= 0) {
             b.borderRightW = b.ResolveLength(b.borderRightW, StyleBox.SourceBorderRight());
         }
@@ -428,25 +243,16 @@ public partial class Style {
         if (b.borderLeftW >= 0) {
             b.borderLeftW = b.ResolveLength(b.borderLeftW, StyleBox.SourceBorderLeft());
         }
-        if (b.posT != StyleBox.Unset()) {
-            b.posT = b.ResolveLength(b.posT, StyleBox.SourcePosT());
-        }
-        if (b.posR != StyleBox.Unset()) {
-            b.posR = b.ResolveLength(b.posR, StyleBox.SourcePosR());
-        }
-        if (b.posB != StyleBox.Unset()) {
-            b.posB = b.ResolveLength(b.posB, StyleBox.SourcePosB());
-        }
-        if (b.posL != StyleBox.Unset()) {
-            b.posL = b.ResolveLength(b.posL, StyleBox.SourcePosL());
-        }
+        if (b.posT != StyleBox.Unset()) { b.posT = b.ResolveLength(b.posT, StyleBox.SourcePosT()); }
+        if (b.posR != StyleBox.Unset()) { b.posR = b.ResolveLength(b.posR, StyleBox.SourcePosR()); }
+        if (b.posB != StyleBox.Unset()) { b.posB = b.ResolveLength(b.posB, StyleBox.SourcePosB()); }
+        if (b.posL != StyleBox.Unset()) { b.posL = b.ResolveLength(b.posL, StyleBox.SourcePosL()); }
         if (b.lineHeightKind == 1) {
             b.lineHeight = b.ResolveLength(b.lineHeight, StyleBox.SourceLineHeight());
         }
         b.letterSpacing = b.ResolveLength(b.letterSpacing, StyleBox.SourceLetterSpacing());
         b.tx = b.ResolveLength(b.tx, StyleBox.SourceTx());
         b.ty = b.ResolveLength(b.ty, StyleBox.SourceTy());
-        // 圆角总半径是各角的派生值，混合来源必须先换算各角再求最大。
         if (b.radiusTL >= 0 || b.radiusTR >= 0 || b.radiusBR >= 0 || b.radiusBL >= 0) {
             int r = b.radiusTL;
             if (b.radiusTR > r) { r = b.radiusTR; }
@@ -456,71 +262,41 @@ public partial class Style {
             b.SetPrescaled(StyleBox.SourceRadius(), true);
         }
     }
-
-    // 把 sheet 中选中该控件的每条规则叠加到 `b` 上，
-    // 按从弱到强的顺序（参见 StyleSheet.ApplyMatch）。
-    // // 别名类型先应用：浮动按钮就是一颗圆按钮，它要吃到整套
-    // `button` 规则（角色、变体、状态），但皮肤仍能用
-    // `floatbutton` 只改它自己——因此是别名在前、本名在后，
-    // 而不是把上百条按钮规则在 CSS 里复制一遍。
     public static void ApplySheet(StyleSheet sheet, StyleBox b, string type, string cls,
                            string id, int state) {
         Style.ApplySheetCtx(sheet, b, type, cls, id, state, null);
     }
-
-    // ApplySheet 的树上下文版本：`node` 是主体控件，组合器链与
-    // 结构性伪类按真实树求值（immediate 路径传 null，规则不命中）。
     public static void ApplySheetCtx(StyleSheet sheet, StyleBox b, string type,
-                              string cls, string id, int state, Control node) {
+                              string cls, string id, int state, StyleNode node) {
         string alias = Style.SheetAlias(type);
-        if (alias != "") {
-            sheet.ApplyMatchCtx(b, alias, cls, id, "", state, node);
-        }
+        if (alias != "") { sheet.ApplyMatchCtx(b, alias, cls, id, "", state, node); }
         sheet.ApplyMatchCtx(b, type, cls, id, "", state, node);
     }
-
-    // 该控件族借用哪个类型的 CSS 规则（"" = 不借）。
     public static string SheetAlias(string type) {
         if (type == "floatbutton") { return "button"; }
         return "";
     }
-
-    // 控件某个 `type::part` 的同样处理（`menu::item`、`card::title`）。
     public static void ApplyPartSheet(StyleSheet sheet, StyleBox b, string type,
                                string part, string cls, string id, int state) {
         Style.ApplyPartSheetCtx(sheet, b, type, part, cls, id, state, null);
     }
-
-    // ApplyPartSheet 的树上下文版本。
     public static void ApplyPartSheetCtx(StyleSheet sheet, StyleBox b, string type,
                                   string part, string cls, string id, int state,
-                                  Control node) {
+                                  StyleNode node) {
         sheet.ApplyMatchCtx(b, type, cls, id, part, state, node);
     }
-
-    // Combinators use the live endpoint state even while its surface is in transition.
-    public static int NodeState(Control c) {
-        return c == null ? Style.SNormal() : c.SurfaceState(c.App);
-    }
-
-    // 媒体环境的缓存键签名：媒体规则的求值结果随窗口尺寸/主题
-    // 暗色/减少动效变化，任一活跃样式表带 @media 时把它并进键。
-    public static string MediaSig(App app) {
+    public static int NodeState(StyleNode c) { return c == null ? Style.SNormal() : c.StyleSurfaceState(); }
+    public static string MediaSig(StyleHost app) {
         return "m" + Convert.ToString(app.CssViewportWidth()) + "x"
             + Convert.ToString(app.CssViewportHeight())
-            + (app.isDark ? "d" : "l")
-            + (app.reducedMotion ? "r" : "n");
+            + (app.HostIsDark() ? "d" : "l")
+            + (app.HostReducedMotion() ? "r" : "n");
     }
-
-    // 活跃样式表里是否有需要运行期求值的 @media 规则。
     public static bool AnyMedia(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
         return (basef != null && basef.HasMedia())
             || (chartf != null && chartf.HasMedia())
             || (sheet != null && sheet.HasMedia());
     }
-
-    // This classification is cached with each sheet's parsed index. It does
-    // not scan selectors or the tree on the steady no-context path.
     public static int ContextDependency(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
         int dependency = basef == null ? 0 : basef.ContextDependency();
         int chartDependency = chartf == null ? 0 : chartf.ContextDependency();
@@ -529,46 +305,38 @@ public partial class Style {
         if (sheetDependency > dependency) { dependency = sheetDependency; }
         return dependency;
     }
-
-    public static int ContextDependency(App app) {
+    public static int ContextDependency(StyleHost app) {
         if (app == null) { return 0; }
-        return Style.ContextDependency(Style.BaseSheet(app), app.chartSheet, app.sheet);
+        StyleSheet sheet = app.HostIsolateAppSheet() ? null : app.HostSheet();
+        return Style.ContextDependency(Style.BaseSheet(app), app.HostChartSheet(), sheet);
     }
-
     public static bool AnyRelational(StyleSheet basef, StyleSheet chartf, StyleSheet sheet) {
         return Style.ContextDependency(basef, chartf, sheet) != 0;
     }
-
-    // Full/Part and Control use the same dependency/environment decision.
-    // A path is deliberately not offered as a key for live-only selectors.
-    public static string ContextSig(App app) {
-        return Style.ContextSig(app, Style.ContextDependency(app));
-    }
-
-    public static string ContextSig(App app, int dependency) {
+    public static string ContextSig(StyleHost app) { return Style.ContextSig(app, Style.ContextDependency(app)); }
+    public static string ContextSig(StyleHost app, int dependency) {
         if (app == null) { return ""; }
-        string sig = dependency == 1 ? Style.CtxSig(app.styleCtx) : "";
-        if (dependency == 2 && app.styleCtx != null) { sig = "live"; }
-        if (Style.AnyMedia(Style.BaseSheet(app), app.chartSheet, app.sheet)) {
+        StyleNode ctxNode = app.HostStyleCtx();
+        string sig = dependency == 1 ? Style.CtxSig(ctxNode) : "";
+        if (dependency == 2 && ctxNode != null) { sig = "live"; }
+        StyleSheet sheet = app.HostIsolateAppSheet() ? null : app.HostSheet();
+        if (Style.AnyMedia(Style.BaseSheet(app), app.HostChartSheet(), sheet)) {
             sig = sig + "#" + Style.MediaSig(app);
         }
         return sig;
     }
-
-    // Length prefixes prevent names/classes containing separators from
-    // aliasing another path. The host's explicit state is already a cache
-    // dimension; only ancestors use their last resolved NodeState.
-    public static string CtxSig(Control node) {
+    public static string CtxSig(StyleNode node) {
         string sig = "";
-        Control anc = node;
+        StyleNode anc = node;
         while (anc != null) {
             string type = anc.StyleType();
             string cls = anc.EffectiveClass();
+            string nm = anc.StyleNodeName();
             string piece = Convert.ToString(type.Length) + ":" + type
                 + Convert.ToString(cls.Length) + ":" + cls
-                + Convert.ToString(anc.name.Length) + ":" + anc.name;
-            Control par = anc.parent;
-            int index = par == null ? 0 : par.IndexOf(anc);
+                + Convert.ToString(nm.Length) + ":" + nm;
+            StyleNode par = anc.StyleParentNode();
+            int index = par == null ? 0 : par.StyleIndexOfNode(anc);
             int state = anc == node ? 0 : Style.NodeState(anc);
             piece = piece + "/" + Convert.ToString(index) + "/" + Style.StateStr(state);
             sig = sig == "" ? piece : piece + ">" + sig;
@@ -576,17 +344,12 @@ public partial class Style {
         }
         return sig;
     }
-
     static List<string> emptyClasses = new List<string>();
     static Dict<string, List<string>> classesCache = new Dict<string, List<string>>();
-
-    // 拆分以空格分隔的类列表（"primary ghost" -> [primary, ghost]），带不可变解析缓存。
     public static List<string> Classes(string cls) {
         if (cls == "") { return Style.emptyClasses; }
         List<string> cached;
-        if (Style.classesCache.TryGetValue(cls, out cached)) {
-            return cached;
-        }
+        if (Style.classesCache.TryGetValue(cls, out cached)) { return cached; }
         List<string> outp = new List<string>();
         if (cls.IndexOf(" ") < 0) {
             outp.Add(cls);
@@ -597,248 +360,35 @@ public partial class Style {
                 if (p != "") { outp.Add(p); }
             }
         }
-        if (Style.classesCache.Count < 512) {
-            Style.classesCache.Add(cls, outp);
-        }
+        if (Style.classesCache.Count < 512) { Style.classesCache.Add(cls, outp); }
         return outp;
     }
-
-    // `cls` 包含给定类 token 时返回 true（零堆分配快速路径）。
     public static bool Has(string cls, string name) {
         if (cls == "" || name == "") { return false; }
         if (cls == name) { return true; }
         int nlen = name.Length;
         int clen = cls.Length;
         if (nlen > clen) { return false; }
-        if (cls.IndexOf(" ") < 0) {
-            return false;
-        }
+        if (cls.IndexOf(" ") < 0) { return false; }
         int idx = cls.IndexOf(name, 0);
         while (idx >= 0) {
             bool leftOk = (idx == 0 || (cls[idx - 1] & 255) == 32);
             bool rightOk = (idx + nlen == clen || (cls[idx + nlen] & 255) == 32);
-            if (leftOk && rightOk) {
-                return true;
-            }
+            if (leftOk && rightOk) { return true; }
             if (idx + nlen >= clen) { break; }
             idx = cls.IndexOf(name, idx + 1);
         }
         return false;
     }
-
-    // ---- eased (transitioned) resolution -----------------------------------
-
-    // 解析控件样式，并在基础、悬停和按下三种外观之间
-    // 用缓动后的交互程度做交叉淡入淡出——取代
-    // 所有控件手写的 hover/press 颜色插值。
-    // 获得焦点的控件会在最上层叠加其 `:focus` 规则（同样缓动），
-    // 禁用控件则直接采用 `:disabled` 外观。
-    public static StyleBox Eased(App app, int id, string type, string cls, bool disabled) {
-        return Style.EasedId(app, id, type, cls, "", disabled, false);
-    }
-    public static StyleBox Eased(int id, string type, string cls, bool disabled) {
-        return Style.Eased(null, id, type, cls, disabled);
-    }
-    public static StyleBox Eased(int id, string type, string cls) {
-        return Style.Eased(null, id, type, cls, false);
-    }
-
-    // 带 id 选择器以及显式 selected/checked 标志的缓动解析
-    // （标签页、列表行、开关：选中是锁定状态而非
-    // 交互，所以在 hover/press 淡入淡出之前叠加）。
-    public static StyleBox EasedId(App app, int id, string type, string cls, string name,
-                            bool disabled, bool selected) {
-        int latched = 0;
-        if (selected) { latched = Style.SSelected(); }
-        return Style.EasedStateId(app, id, type, cls, name, disabled, latched);
-    }
-    public static StyleBox EasedId(int id, string type, string cls, string name,
-                            bool disabled, bool selected) {
-        return Style.EasedId(null, id, type, cls, name, disabled, selected);
-    }
-    public static StyleBox EasedId(int id, string type, string cls, string name) {
-        return Style.EasedId(null, id, type, cls, name, false, false);
-    }
-
-    // EasedId 的按矩形版本：缓动重绘限定在控件的已排列矩形内。
-    public static StyleBox EasedIdIn(App app, int id, string type, string cls, string name,
-                              bool disabled, bool selected,
-                              int x, int y, int w, int h) {
-        int latched = 0;
-        if (selected) { latched = Style.SSelected(); }
-        return Style.EasedStateIdIn(app, id, type, cls, name, disabled, latched,
-                                    x, y, w, h);
-    }
-
-    // 缓动解析的核心：禁用时直接返回 `:disabled`（+latched）外观；
-    // 否则以常态为基础，按 hover/press/focus 的缓动程度分别叠加
-    // 对应状态外观并混合，过渡时长取常态样式的 `transition`。
-    // latched 是选中/勾选一类锁定状态位，先于交互状态叠加；
-    // 返回的 box 带上 fxId 供高光跟踪悬停。
-    public static StyleBox EasedStateId(App app, int id, string type, string cls,
-                                 string name, bool disabled, int latched) {
-        if (disabled) {
-            return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
-        }
-        if (app == null) { app = App.FrameApp(); }
-        StyleBox base0 = Style.Full(app, type, cls, name, latched);
-        base0.fxId = id;
-        int ms = base0.TransitionOr(0 - 1);
-        int hv = app != null ? app.StyleHoverLevel(id, ms) : 0;
-        int pv = app != null ? app.StylePressLevel(id, ms) : 0;
-        int fv = app != null ? app.StyleFocusLevel(id, ms) : 0;
-        StyleBox cur = base0;
-        if (hv > 0) {
-            StyleBox hover = Style.Full(app, type, cls, name, latched + Style.SHover());
-            cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
-        }
-        if (pv > 0) {
-            StyleBox act = Style.Full(app, type, cls, name,
-                                      latched + Style.SHover() + Style.SActive());
-            cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
-        }
-        if (fv > 0) {
-            StyleBox foc = Style.Full(app, type, cls, name, latched + Style.SFocus());
-            cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
-        }
-        cur.fxId = id;
-        return cur;
-    }
-
-    // EasedStateId 的按矩形版本（交互程度按 (x, y, w, h) 测量）。
-    public static StyleBox EasedStateIdIn(App app, int id, string type, string cls,
-                                   string name, bool disabled, int latched,
-                                   int x, int y, int w, int h) {
-        if (disabled) {
-            return Style.Full(app, type, cls, name, Style.SDisabled() + latched);
-        }
-        if (app == null) { app = App.FrameApp(); }
-        StyleBox base0 = Style.Full(app, type, cls, name, latched);
-        base0.fxId = id;
-        int ms = base0.TransitionOr(0 - 1);
-        int hv = app != null ? app.StyleHoverLevelIn(id, ms, x, y, w, h) : 0;
-        int pv = app != null ? app.StylePressLevelIn(id, ms, x, y, w, h) : 0;
-        int fv = app != null ? app.StyleFocusLevelIn(id, ms, x, y, w, h) : 0;
-        StyleBox cur = base0;
-        if (hv > 0) {
-            StyleBox hover = Style.Full(app, type, cls, name,
-                                         latched + Style.SHover());
-            cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
-        }
-        if (pv > 0) {
-            StyleBox act = Style.Full(app, type, cls, name,
-                                      latched + Style.SHover() + Style.SActive());
-            cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
-        }
-        if (fv > 0) {
-            StyleBox foc = Style.Full(app, type, cls, name,
-                                      latched + Style.SFocus());
-            cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
-        }
-        cur.fxId = id;
-        return cur;
-    }
-
-    // 部件版 EasedId：解析 `type::part`（fallbackType 提供回退规则）
-    // 的三态缓动样式，selected 为锁定选中位。
-    public static StyleBox EasedPartId(App app, int id, string type, string part,
-                                string fallbackType, string cls, string name,
-                                bool disabled, bool selected) {
-        int latched = 0;
-        if (selected) { latched = Style.SSelected(); }
-        return Style.EasedPartStateId(app, id, type, part, fallbackType, cls,
-                                      name, disabled, latched);
-    }
-
-    // 部件版 EasedIdIn。
-    public static StyleBox EasedPartIdIn(App app, int id, string type, string part,
-                                  string fallbackType, string cls, string name,
-                                  bool disabled, bool selected,
-                                  int x, int y, int w, int h) {
-        int latched = 0;
-        if (selected) { latched = Style.SSelected(); }
-        return Style.EasedPartStateIdIn(
-            app, id, type, part, fallbackType, cls, name, disabled, latched,
-            x, y, w, h);
-    }
-
-    // 部件版 EasedStateId：`type::part` 的禁用直返与三态交叉淡入淡出。
-    public static StyleBox EasedPartStateId(App app, int id, string type, string part,
-                                     string fallbackType, string cls, string name,
-                                     bool disabled, int latched) {
-        if (disabled) {
-            return Style.Part(app, type, part, fallbackType, cls, name,
-                              Style.SDisabled() + latched);
-        }
-        if (app == null) { app = App.FrameApp(); }
-        StyleBox base0 = Style.Part(app, type, part, fallbackType, cls, name, latched);
-        int ms = base0.TransitionOr(0 - 1);
-        int hv = app != null ? app.StyleHoverLevel(id, ms) : 0;
-        int pv = app != null ? app.StylePressLevel(id, ms) : 0;
-        int fv = app != null ? app.StyleFocusLevel(id, ms) : 0;
-        StyleBox cur = base0;
-        if (hv > 0) {
-            StyleBox hover = Style.Part(app, type, part, fallbackType, cls, name,
-                                        latched + Style.SHover());
-            cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
-        }
-        if (pv > 0) {
-            StyleBox act = Style.Part(app, type, part, fallbackType, cls, name,
-                                      latched + Style.SHover() + Style.SActive());
-            cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
-        }
-        if (fv > 0) {
-            StyleBox foc = Style.Part(app, type, part, fallbackType, cls, name,
-                                      latched + Style.SFocus());
-            cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
-        }
-        return cur;
-    }
-
-    // 部件版 EasedStateIdIn。
-    public static StyleBox EasedPartStateIdIn(App app, int id, string type, string part,
-                                       string fallbackType, string cls, string name,
-                                       bool disabled, int latched,
-                                       int x, int y, int w, int h) {
-        if (disabled) {
-            return Style.Part(app, type, part, fallbackType, cls, name,
-                              Style.SDisabled() + latched);
-        }
-        if (app == null) { app = App.FrameApp(); }
-        StyleBox base0 = Style.Part(app, type, part, fallbackType, cls, name, latched);
-        int ms = base0.TransitionOr(0 - 1);
-        int hv = app != null ? app.StyleHoverLevelIn(id, ms, x, y, w, h) : 0;
-        int pv = app != null ? app.StylePressLevelIn(id, ms, x, y, w, h) : 0;
-        int fv = app != null ? app.StyleFocusLevelIn(id, ms, x, y, w, h) : 0;
-        StyleBox cur = base0;
-        if (hv > 0) {
-            StyleBox hover = Style.Part(app, type, part, fallbackType, cls, name,
-                                         latched + Style.SHover());
-            cur = StyleBox.Blend(cur, hover, Style.Curve(base0.easing, hv));
-        }
-        if (pv > 0) {
-            StyleBox act = Style.Part(app, type, part, fallbackType, cls, name,
-                                      latched + Style.SHover() + Style.SActive());
-            cur = StyleBox.Blend(cur, act, Style.Curve(base0.easing, pv));
-        }
-        if (fv > 0) {
-            StyleBox foc = Style.Part(app, type, part, fallbackType, cls, name,
-                                      latched + Style.SFocus());
-            cur = StyleBox.Blend(cur, foc, Style.Curve(base0.easing, fv));
-        }
-        return cur;
-    }
-
-    // 对线性的 0..1000 进度应用 CSS 缓动函数。
     public static int Curve(int easing, int p) {
+        if (p <= 0) { return 0; }
+        if (p >= 1000) { return 1000; }
         if (easing == 1) { return p; }
         if (easing == 2) { return p * p / 1000; }
         if (easing == 3) {
             int q = 1000 - p;
             return 1000 - q * q / 1000;
         }
-        return App.Ease(p);
+        return p * p * (3000 - 2 * p) / 1000000;
     }
-
-
 }

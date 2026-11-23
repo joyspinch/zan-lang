@@ -1,48 +1,32 @@
 using System;
 using Gui;
 using Gui.Backend;
-
 namespace Gui.Widget;
-
-// 统一的 overlay 层——单个组件满足所有弹层需求
-// （layui `layer` 风格）：可拖动的页面窗口、模态 alert/confirm/prompt
-// 对话框、顶部居中的消息 toast 队列、角落通知、加载
-// 遮罩、锚定提示和全屏图片轮播。打开/关闭时均有动画，
-// 并在延迟的 overlay 绘制阶段渲染，因此浮在
-// 页面内容之上。
 public partial class Layer {
-    // ---- App 实例隔离与多窗口运行上下文 ----
-    private static AppLayerContext fallbackContext;
-
+    private static AppLayerContext FallbackContext() {
+        GuiWidgetState state = GuiWidgetState.Current();
+        if (state.layerFallbackContext == null) { state.layerFallbackContext = new AppLayerContext(); }
+        return state.layerFallbackContext;
+    }
     public static AppLayerContext Context(App app) {
         if (app != null) {
-            if (app.layerContext == null) {
-                app.layerContext = new AppLayerContext();
-            }
+            if (app.layerContext == null) { app.layerContext = new AppLayerContext(); }
             return (AppLayerContext)app.layerContext;
         }
         App frame = App.FrameApp();
         if (frame != null) {
-            if (frame.layerContext == null) {
-                frame.layerContext = new AppLayerContext();
-            }
+            if (frame.layerContext == null) { frame.layerContext = new AppLayerContext(); }
             return (AppLayerContext)frame.layerContext;
         }
-        if (Layer.fallbackContext == null) {
-            Layer.fallbackContext = new AppLayerContext();
-        }
-        return Layer.fallbackContext;
+        return Layer.FallbackContext();
     }
-
     private static void EnsureZorder(AppLayerContext ctx) {
         if (ctx.zorder == null) { ctx.zorder = new List<LayerState>(); }
     }
-
     internal static void Open(App app, LayerState s) {
         if (s == null) { return; }
         s.Open(); Layer.RegisterOpen(app, s);
     }
-
     static void BindInput(App app, LayerState s) {
         AppLayerContext ctx = Layer.Context(app);
         if (ctx.inputRoot == null) { ctx.inputRoot = new LayerInputRoot(ctx); }
@@ -51,7 +35,6 @@ public partial class Layer {
         ctx.inputRoot.Bind(app);
         if (added && s.open) { ctx.inputRoot.Activate(s); }
     }
-
     public static void RegisterOpen(App app, LayerState s) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.EnsureZorder(ctx);
@@ -70,19 +53,13 @@ public partial class Layer {
                 if (ctx.windowHost == null) {
                     ctx.windowHost = new LayerWindowHost(app);
                     ctx.inputRoot.SetWindowHost(ctx.windowHost);
+                    Layer.UpdateRetainedRoots(app, ctx);
                 }
                 ctx.windowHost.Sync(app, ctx.zorder);
             }
         }
     }
-
-    public static void RegisterOpen(LayerState s) {
-        Layer.RegisterOpen(null, s);
-    }
-
-    // 关闭项在准备阶段收口。尚未启动出场（wasOpen）和仍在出场
-    // （closing）的项继续留在堆叠中，供 retained 宿主准备淡出快照；
-    // 超时项最终释放，避免不再驱动的宿主永久占用注册表。
+    public static void RegisterOpen(LayerState s) { Layer.RegisterOpen(null, s); }
     private static void PruneZorder(AppLayerContext ctx) {
         Layer.EnsureZorder(ctx);
         int now = Window.GetTickMs();
@@ -94,8 +71,6 @@ public partial class Layer {
             ctx.zorder.RemoveAt(i);
         }
     }
-
-    // 最上层打开中的对话框（kind 1/2），无则 null。
     public static LayerState TopmostDialog(App app) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.EnsureZorder(ctx);
@@ -105,8 +80,8 @@ public partial class Layer {
             if (s.open && s.kind != 0) { return s; }
             i = i - 1;
         }
-        if (ctx != Layer.fallbackContext && Layer.fallbackContext != null) {
-            AppLayerContext fb = Layer.fallbackContext;
+        AppLayerContext fb = GuiWidgetState.Current().layerFallbackContext;
+        if (ctx != fb && fb != null) {
             Layer.EnsureZorder(fb);
             int fi = fb.zorder.Count - 1;
             while (fi >= 0) {
@@ -117,13 +92,7 @@ public partial class Layer {
         }
         return null;
     }
-
-    public static LayerState TopmostDialog() {
-        return Layer.TopmostDialog(null);
-    }
-
-    // `s` 是否是当前最上层打开中的 layer（渲染路径里避免同一键
-    // 事件被多个对话框重复消费）。
+    public static LayerState TopmostDialog() { return Layer.TopmostDialog(null); }
     public static bool IsTopmost(App app, LayerState s) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.EnsureZorder(ctx);
@@ -132,8 +101,8 @@ public partial class Layer {
             if (ctx.zorder[i].open) { return ctx.zorder[i] == s; }
             i = i - 1;
         }
-        if (ctx != Layer.fallbackContext && Layer.fallbackContext != null) {
-            AppLayerContext fb = Layer.fallbackContext;
+        AppLayerContext fb = GuiWidgetState.Current().layerFallbackContext;
+        if (ctx != fb && fb != null) {
             Layer.EnsureZorder(fb);
             int fi = fb.zorder.Count - 1;
             while (fi >= 0) {
@@ -143,17 +112,7 @@ public partial class Layer {
         }
         return false;
     }
-
-    public static bool IsTopmost(LayerState s) {
-        return Layer.IsTopmost(null, s);
-    }
-
-    // 规范关闭入口（layui isOutAnim:true 的等价物）：open 立即为
-    // false（宿主状态机、Esc 往返立刻稳定），层进入 closing 态——
-    // 渲染沿还会把它在屏幕上淡出+上滑收场。Closed 仍在关闭沿立即
-    // 触发（回调时序与无出场动画时完全一致，出场纯粹是收场动画）。
-    // 直接置 open=false 的宿主走同一条路（关闭沿在渲染时启动出场，
-    // 并在那里补触发 Closed）。
+    public static bool IsTopmost(LayerState s) { return Layer.IsTopmost(null, s); }
     public static void Close(App app, LayerState s) {
         if (!s.open) { return; }
         int generation = s.inputGeneration + 1;
@@ -169,12 +128,7 @@ public partial class Layer {
         }
         Layer.Context(app).requestRedraw = true;
     }
-
-    public static void Close(LayerState s) {
-        Layer.Close(null, s);
-    }
-
-    // 关闭沿（!open 且 wasOpen）的第一帧：启动出场动画。
+    public static void Close(LayerState s) { Layer.Close(null, s); }
     public static void BeginExit(LayerState s) {
         s.wasOpen = false;
         s.closing = true;
@@ -182,30 +136,17 @@ public partial class Layer {
         s.dragging = false;
         s.sizing = false;
     }
-
-    // 弹出完成回调：入场进度到 1000（或无入场）的第一帧触发一次。
-    // 渲染路径在算完 Entrance 后调用。
     public static void NotifyOpened(LayerState s) {
         if (s.wasOpen && !s.openedRaised) {
             s.openedRaised = true;
             s.Opened.Raise();
         }
     }
-
-    // Esc 的语义：最上层对话框报告取消（action 2，由调用方关闭；
-    // 与 X 的 action 3、按钮的 1/2 一致）。photos 在屏时请求关闭。
     public static bool CloseTopmostDialog(App app) {
         AppLayerContext ctx = Layer.Context(app);
         LayerState top = Layer.TopmostDialog(app);
         if (top != null) {
             top.action = 2;
-            // action 由调用方在同一帧的渲染沿读走并置 open=false，但很多
-            // 宿主（gallery 的对话框 pass、IDE 的 RenderDocDialogs）只翻
-            // open 标志、不请求重绘。Esc 帧本身渲染时对话框还开着（键盘
-            // 消费在 RenderDialog 画遮罩之前，遮罩照画上屏），下一帧若没
-            // 人请求，事件循环就睡到 fx 拍——恢复的快照又把遮罩钉在屏上，
-            // 直到 500ms 后 HUD/动画拍才真正擦掉，正是「Esc 后蒙版滞留」。
-            // 这里置位交 FlushCloseRedraw 兑现。
             ctx.requestRedraw = true;
             return true;
         }
@@ -215,13 +156,7 @@ public partial class Layer {
         }
         return false;
     }
-
-    public static bool CloseTopmostDialog() {
-        return Layer.CloseTopmostDialog(null);
-    }
-
-    // 关闭最上层打开中的 layer（直接置 open=false，不产生 action）。
-    // kind 0 窗口 / 1 对话框 / 2 提示框，-1 不限。无则返回 false。
+    public static bool CloseTopmostDialog() { return Layer.CloseTopmostDialog(null); }
     public static bool CloseLast(App app, int kind) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.PruneZorder(ctx);
@@ -230,9 +165,6 @@ public partial class Layer {
             LayerState s = ctx.zorder[i];
             if (s.open && (kind < 0 || s.kind == kind)) {
                 s.open = false;
-                // 关闭沿必须有人重绘：遮罩/窗口的像素只会在下一帧的渲染
-                // 里消失，这里不请求的话事件循环睡到 fx 拍，快照把旧画面
-                // 钉在屏上（与 Close/CloseTopmostDialog 同因）。
                 ctx.requestRedraw = true;
                 return true;
             }
@@ -244,12 +176,7 @@ public partial class Layer {
         }
         return false;
     }
-
-    public static bool CloseLast(int kind) {
-        return Layer.CloseLast(null, kind);
-    }
-
-    // 关闭全部打开中的 layer（不产生 action），含显式打开的照片预览。
+    public static bool CloseLast(int kind) { return Layer.CloseLast(null, kind); }
     public static void CloseAll(App app, int kind) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.PruneZorder(ctx);
@@ -264,16 +191,7 @@ public partial class Layer {
         if (any) { ctx.requestRedraw = true; }
         if (kind < 0) { Layer.ClosePhotos(app); }
     }
-
-    public static void CloseAll(int kind) {
-        Layer.CloseAll(null, kind);
-    }
-
-    // 键盘语义（宿主在 key-down 事件里调用；对话框与 photos 的渲染
-    // 路径也经此消费）。Esc 关最上层（对话框优先、photos 次之），
-    // Enter 确认最上层对话框（多行 prompt 除外——Enter 是换行），
-    // ←/→ 在 photos 里翻页。有下拉/菜单等框架弹层打开时让位
-    // （框架自己收 Esc）。返回 true 表示本次按键已被层消费。
+    public static void CloseAll(int kind) { Layer.CloseAll(null, kind); }
     public static bool Key(App app, int code) {
         PhotoViewer photos = Layer.Context(app).photoViewer;
         bool ownsPhotos = photos != null && photos.Active && app.overlayHost.ActiveRoot() == photos;
@@ -295,8 +213,6 @@ public partial class Layer {
             LayerState top = Layer.TopmostDialog(app);
             if (top != null && top.promptFormType != 2) {
                 top.action = 1;
-                // 与 Esc 同理：Enter 确认沿宿主可能只翻 open 标志，
-                // 这里替它把下一帧的整窗重绘挂上，遮罩不当屏。
                 app.RequestRedraw();
                 return true;
             }
@@ -304,25 +220,12 @@ public partial class Layer {
         }
         return false;
     }
-
-    // 历史兼容空操作：现代保留式对象树控件自带唯一生命周期与实例绑定，无需静态发号器。
-    public static void BeginBody(App app) { }
-    public static void BeginBody() { }
-    public static void EndBody(App app) { }
-    public static void EndBody() { }
-
     private static void EnsureQueues(AppLayerContext ctx) {
         if (ctx.toasts == null) { ctx.toasts = new List<ToastItem>(); }
         if (ctx.notifs == null) { ctx.notifs = new List<ToastItem>(); }
         if (ctx.toastPrev == null) { ctx.toastPrev = new Rect(0, 0, 0, 0); }
         if (ctx.notifPrev == null) { ctx.notifPrev = new Rect(0, 0, 0, 0); }
     }
-
-    // 声明这条队列这一帧的脏区，并把上一帧的脏区一起交上去。
-    // 队列里的东西一直在动（滑入、淡出、幸存者上移收拢），只声明「它现在
-    // 在哪」的话，上一帧它占过、这一帧已经离开的那几行像素没人重画，留在
-    // 屏幕上就是残影；最后一条消失的那一帧更是连一次重绘都不会请求，于是
-    // 那条 toast 会一直挂在屏幕上直到下一次整窗重绘。
     internal static void MarkQueueDirty(App app, Rect prev, bool any,
             int rx, int ry, int rw, int rh) {
         if (any) { app.RequestAnimationFrameIn(rx, ry, rw, rh); }
@@ -337,23 +240,17 @@ public partial class Layer {
             }
         }
     }
-
-    // 对话框操作按钮宽度：取标签自然宽度，不低于
-    // 标准对话框按钮宽度，使一排按钮保持齐整。
     private static int ActionWidth(App app, Button b, int minW) {
         b.OnMeasure(app);
         int w = b.prefW;
         if (w < minW) { w = minW; }
         return w;
     }
-
     public static int Clamp01(int v) {
         if (v < 0) { return 0; }
         if (v > 1000) { return 1000; }
         return v;
     }
-
-    // toast/notification/dialog 类型到 CSS 角色类（1/默认无类）。
     public static string RoleClass(int mtype) {
         if (mtype == 2) { return "info"; }
         if (mtype == 3) { return "success"; }
@@ -361,18 +258,12 @@ public partial class Layer {
         if (mtype == 5) { return "error"; }
         return "";
     }
-
     public static string RoleIcon(int mtype) {
         if (mtype == 3) { return "success"; }
         if (mtype == 4) { return "warning"; }
         if (mtype == 5) { return "error"; }
         return "info";
     }
-
-    // 消息 toast 队列（顶部居中、自动消失、向上收拢）
-
-    // 入队一条短暂的顶部居中 toast。type：1 默认，2 信息，
-    // 3 成功，4 警告，5 错误。
     public static void Msg(App app, string text, int type) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.EnsureQueues(ctx);
@@ -387,79 +278,27 @@ public partial class Layer {
         ctx.toasts.Add(new ToastItem(text, type, 3000));
         Layer.EnsureQueueHost(app);
     }
-
-    public static void Msg(string text, int type) {
-        Layer.Msg(null, text, type);
-    }
-
-    public static void Msg(string text) {
-        Layer.Msg(null, text, 1);
-    }
-
-    // 通知队列（右上角、自动消失、向上收拢）
-
-    // 入队一条角落通知。type：1 默认，2 信息，3 成功，
-    // 4 警告，5 错误。
+    public static void Msg(string text, int type) { Layer.Msg(null, text, type); }
+    public static void Msg(string text) { Layer.Msg(null, text, 1); }
     public static void Notify(App app, string title, int type) {
         AppLayerContext ctx = Layer.Context(app);
         Layer.EnsureQueues(ctx);
         ctx.notifs.Add(new ToastItem(title, type, 4000));
         Layer.EnsureQueueHost(app);
     }
-
-    public static void Notify(string title, int type) {
-        Layer.Notify(null, title, type);
-    }
-
-    public static void Notify(string title) {
-        Layer.Notify(null, title, 1);
-    }
-
-    // 单条通知 / 内联横幅卡片的高度。
-    public static int NotifyH(App app) {
-        return app.theme.heightLarge + app.theme.paddingSmall;
-    }
-
-    // 加载遮罩 + 锚定提示
-
-    // 覆盖某区域的加载遮罩：变暗的圆角面板，中央是
-    // 旋转指示器和可选的说明文字。
-    public static void RenderLoad(App app, int x, int y, int w, int h, string tip) {
-        if (app == null || app.canvas == null) { return; }
-        Canvas c = app.canvas;
-        Theme t = app.theme;
-        StyleBox mask = Style.Part(app, "layer", "mask", "", "", "",
-                                   Style.SNormal());
-        c.FillRoundRect(x, y, w, h, t.borderRadiusLarge, mask.bg);
-        app.BlockHitsRect(x, y, w, h);
-        int d = app.Scale(36);
-        int cy = y + h / 2 - app.Scale(10);
-        new Spin(36).RenderInside(app,
-            new Rect(x + (w - d) / 2, cy - d / 2, d, d));
-        if (tip == "") { return; }
-        StyleBox ls = Style.Part(app, "layer", "load-label", "", "", "",
-                                 Style.SNormal());
-        int fs = ls.FontOr(Style.FontFallback(app, "small"));
-        c.DrawTextCentered(x, cy + app.Scale(30), w, Canvas.FontHeight(fs), tip,
-                           ls.FgOr(0), fs);
-    }
-
-    // 小型的锚定提示气泡（入队 Tooltip 悬停请求）。
+    public static void Notify(string title, int type) { Layer.Notify(null, title, type); }
+    public static void Notify(string title) { Layer.Notify(null, title, 1); }
+    public static int NotifyH(App app) { return app.theme.heightLarge + app.theme.paddingSmall; }
     public static void Tips(App app, int anchorX, int anchorY, string text) {
         if (app == null) { app = App.FrameApp(); }
         Tooltip.Request(app, anchorX, anchorY, text, 0, 0);
     }
-
     public static void Tips(int anchorX, int anchorY, string text) {
         Layer.Tips(null, anchorX, anchorY, text);
     }
-
     public static void Tips(string text, int anchorX, int anchorY) {
         Layer.Tips(null, anchorX, anchorY, text);
     }
-
-    // Explicit retained photo lifetime; callers retain the returned viewer and
-    // observe Dismissed instead of polling input while painting.
     public static PhotoViewer OpenPhotos(App app, List<string> slides, Binding<int> idx,
             CarouselAnim animation) {
         if (app == null) { app = App.FrameApp(); }
@@ -468,49 +307,27 @@ public partial class Layer {
         viewer.Show(app);
         return viewer;
     }
-
     public static void ClosePhotos(App app) {
         if (app == null) { app = App.FrameApp(); }
         if (app == null) { return; }
         PhotoViewer viewer = Layer.Context(app).photoViewer;
         if (viewer != null) { viewer.Close(); }
     }
-
-    // 可拖动的页面窗口 + 模态对话框
-
-    public static int BarH(App app) {
-        return app.theme.heightLarge;
-    }
-
-    public static int FooterH(App app) {
-        return app.theme.heightMedium + app.Scale(20);
-    }
-
-    public static int BtnW(App app) {
-        return app.Scale(46);
-    }
-
-    // 状态 `s` 下，调用方正文内容应开始的绝对 Y 坐标。
+    public static int BarH(App app) { return app.theme.heightLarge; }
+    public static int FooterH(App app) { return app.theme.heightMedium + app.Scale(20); }
+    public static int BtnW(App app) { return app.Scale(46); }
     public static int BodyTop(App app, LayerState s) {
         int top = app.titlebarH;
         if (s.state == 1) { return top + Layer.BarH(app) + app.Scale(16); }
         return s.y + Layer.BarH(app) + app.Scale(16);
     }
-
-    // 正文内容应开始的绝对 X 坐标。
     public static int BodyLeft(App app, LayerState s) {
         if (s.state == 1) { return app.Scale(20); }
         return s.x + app.Scale(20);
     }
-
     public static bool Inside(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx < x + w && my >= y && my < y + h;
     }
-
-    // 缩放拖拽的几何推导：从 rStart* 起始几何与当前鼠标位推出新的
-    // x/y/w/h（含最小尺寸与客户区钳制）。dir 与 s.rDir 同义：
-    // 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角。渲染拖动与
-    // 无窗口回归共用这一份推导。
     public static void ApplyResize(App app, LayerState s, int mx, int my) {
         int W = app.canvas.Width();
         int H = app.canvas.Height();
@@ -520,7 +337,6 @@ public partial class Layer {
         int dx = mx - s.grabDx;
         int dy = my - s.grabDy;
         if (dir == 1 || dir == 5) {
-            // 左缘：x/w 联动，最小宽度时钉住左缘，钳到客户区左界。
             int nx = s.rStartX + dx;
             int nw = s.rStartW - dx;
             if (nw < minW) {
@@ -535,24 +351,18 @@ public partial class Layer {
             s.w = nw;
         }
         if (dir == 2 || dir == 4) {
-            // 右缘：只动宽度，最小宽度与客户区右界钳制。
             int nw = s.rStartW + dx;
             if (nw < minW) { nw = minW; }
             if (s.rStartX + nw > W) { nw = W - s.rStartX; }
             s.w = nw;
         }
         if (dir >= 3) {
-            // 下缘/两角：只动高度，最小高度与客户区底界钳制。
             int nh = s.rStartH + dy;
             if (nh < minH) { nh = minH; }
             if (s.rStartY + nh > H) { nh = H - s.rStartY; }
             s.h = nh;
         }
     }
-
-    // 最小化窗口在左下角任务条上的位置（仅剩一条标题栏，宽 260）：
-    // 槽位从左往右横排，一行放不下向上折行。命中区（Bounds）与
-    // 绘制（RenderActive）都从这里取位，保证两者始终一致。
     public static void MinPos(App app, LayerState s, List<int> outv) {
         int mw = app.Scale(260);
         int gap = app.Scale(8);
@@ -567,9 +377,6 @@ public partial class Layer {
         outv.Add(margin + col * (mw + gap));
         outv.Add(H - margin - bar - row * (bar + gap));
     }
-
-    // `s` 实际在屏幕上的边界（考虑最大化 / 最小化），
-    // 写入 4 元素 int 列表 [x, y, w, h]。
     public static void Bounds(App app, LayerState s, List<int> outv) {
         int top = app.titlebarH;
         int bar = Layer.BarH(app);
@@ -584,15 +391,11 @@ public partial class Layer {
         }
         outv.Add(ex); outv.Add(ey); outv.Add(ew); outv.Add(eh);
     }
-
     public static bool Contains(App app, LayerState s, int mx, int my) {
         List<int> b = new List<int>();
         Layer.Bounds(app, s, b);
         return Layer.Inside(mx, my, b[0], b[1], b[2], b[3]);
     }
-
-    // layer 打开以来的入场进度（千分比）；仍在缓入时
-    // 会重新启动动画计时。
     public static int Entrance(App app, LayerState s) {
         if (s.openMs <= 0) { return 1000; }
         int el = Window.GetTickMs() - s.openMs;
@@ -600,34 +403,20 @@ public partial class Layer {
         if (p < 1000) {
             List<int> b = new List<int>();
             Layer.Bounds(app, s, b);
-            // 损伤区要盖住整个入场行程：窗口/对话框从终点上方 10/12px（DPI 缩放后更大）滑下来，
-            // 只申终点矩形的话，动画帧按矩形并集局部出图，顶部会留下一条谁也不再重画的残影条。
             app.RequestAnimationFrameIn(b[0], b[1] - app.Scale(16),
                 b[2], b[3] + app.Scale(16));
         }
         return p;
     }
-
-    // 入场动画当前的竖直上移量（px）：外框（RenderWindow）画的时候把窗口 y 上移这么多，宿主自绘正文的窗口（设计器大编辑器）必须用同一偏移定位正文，否则入场那 180ms 只有外框在动、内容停在终点不动。
     public static int EntranceDy(App app, LayerState s) {
         return (1000 - Layer.Entrance(app, s)) * app.Scale(10) / 1000;
     }
-
-    // 出场动画时长（layui isOutAnim ~300ms 的量级）。
     public static int ExitMs() { return 240; }
-
-    // 出场进度（0..1000）：closing 层在关闭沿之后的淡出/位移进度，
-    // 非 closing 层恒 1000。渲染路径用它衰减 shade 与表面。
     public static int ExitP(LayerState s) {
         if (!s.closing || s.closeMs <= 0) { return 1000; }
         return App.Ease(Layer.Clamp01((Window.GetTickMs() - s.closeMs)
             * 1000 / Layer.ExitMs()));
     }
-
-    // 出场衰减：按 a‰ 乘法衰减颜色的既有 alpha（a=1000 原样返回）。
-    // Style.Fade 是「设为 a‰」的绝对语义，对 0x22000000 阴影、遮罩
-    // ov.bg 这类预透明色，a=1000 时会跳成全不透明——淡出必须用
-    // 乘法衰减。
     public static int MulAlpha(int color, int a) {
         if (a >= 1000) { return color; }
         if (a <= 0) { return 0; }
@@ -636,12 +425,6 @@ public partial class Layer {
         int al = (color - rgb) / 16777216 + 256;
         return (al * a / 1000) * 16777216 + rgb;
     }
-
-    // !open 层的关闭沿：第一帧启动出场并补触发 Closed（Layer.Close
-    // 路径已在 Close 里触发过，closedRaised 拦住二次触发），其后画
-    // 淡出/上滑收场帧（模态对话框走整屏遮罩+表面，页面窗口走窗口
-    // 自身），走完请求整帧重绘擦净。返回 true 表示本帧处理了该层
-    // （调用方不必再画它）。
     public static bool ClosingFrame(App app, LayerState s) {
         if (s.wasOpen) {
             Layer.BeginExit(s);
@@ -654,8 +437,6 @@ public partial class Layer {
         int outP = Layer.ExitP(s);
         if (outP < 1000) {
             if (!s.modal) { Layer.RenderClosing(app, s, outP); }
-            // 遮罩淡出覆盖整屏，动画损伤区按整画布申请（窗口矩形
-            // 不够——下一帧遮罩变浅的每一处像素都要重画）。
             app.RequestAnimationFrameIn(0, 0,
                                         app.canvas.Width(), app.canvas.Height());
             return true;
@@ -664,10 +445,6 @@ public partial class Layer {
         app.RequestRedraw();
         return true;
     }
-
-    // CloseLast/CloseAll 翻开 open 标志时没有 App 可请求重绘；渲染沿
-    // 结束后在这里兑现（无论该层走的是哪条渲染路径——宿主可能只渲染
-    // 这一个层就返回）。CloseTopmostDialog/Key/Close 已就地请求。
     public static void FlushCloseRedraw(App app) {
         AppLayerContext ctx = Layer.Context(app);
         if (ctx.requestRedraw) {
@@ -675,5 +452,4 @@ public partial class Layer {
             app.RequestRedraw();
         }
     }
-
 }

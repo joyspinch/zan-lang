@@ -1,17 +1,7 @@
 using System;
 using System.Collections.Generic;
-
 namespace Gui;
-
-// 声明式文档装配的共享底座：Form.Show 与 ChildWindow 的同一装配语义——
-// 树上处理器名收集、按名对账接线（缺失 fail-fast）、bind 路径启动期对账。
-// vm 同时是处理器方法与 bind 路径的解析对象；ModelBinder 在事件返回后统一标脏。
-// FieldExists 校验 POCO 字段与受支持字典键；JsonValue 模型的键不是
-// 反射字段——调用方须对 JsonValue 模型跳过 CheckBinds。
 public class DocWire {
-    // 按名自动接线：树上处理器名逐个对 vm HasMethod（缺失即 exit 1 列出），
-    // 注册 plain + arg 双槽（arg 槽只在控件声明 handlerArg 时被选中），
-    // 每次触发后由 ModelBinder 统一标脏。返回值恒 true（对账失败不返回）。
     public static bool AutoWire(Control tree, object vm, ModelBinder b) {
         List<string> names = new List<string>();
         DocWire.CollectHandlers(tree, names);
@@ -25,18 +15,24 @@ public class DocWire {
             b.HandleArg(h, (string s) => { vm.Invoke(evt, s); });
         }
         if (missing.Count > 0) {
-            string list = "";
-            for (int i = 0; i < missing.Count; i++) {
-                list = list + (i > 0 ? ", " : "") + missing[i];
-            }
             Console.WriteLine("WINDOW: handlers declared in doc but missing on " +
-                              vm.GetType().Name + ": " + list);
+                              vm.GetType().Name + ": " + string.Join(", ", missing));
             Environment.Exit(1);
         }
         return true;
     }
-
-    // 启动期绑定对账：bind 路径解析不到 vm 字段的，开窗前一次性列出 exit 1。
+    internal static void CheckHandlers(Control tree, ModelBinder binder, string ownerName) {
+        List<string> names = new List<string>();
+        DocWire.CollectHandlers(tree, names);
+        List<string> missing = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            if (!binder.HasHandler(names[i])) { missing.Add(names[i]); }
+        }
+        if (missing.Count > 0) {
+            throw new InvalidOperationException("WINDOW: handlers declared in doc but unregistered on " +
+                ownerName + ": " + string.Join(", ", missing));
+        }
+    }
     public static void CheckBinds(Control tree, object vm, string ownerName) {
         List<string> bad = new List<string>();
         DocWire.CollectBinds(tree, vm, bad);
@@ -50,7 +46,6 @@ public class DocWire {
             Environment.Exit(1);
         }
     }
-
     public static void CollectHandlers(Control c, List<string> names) {
         for (int i = 0; i < c.events.Count; i++) {
             string h = c.events[i].val;
@@ -60,9 +55,7 @@ public class DocWire {
             DocWire.CollectHandlers(c.ChildAt(j), names);
         }
     }
-
     public static void CollectBinds(Control c, object vm, List<string> bad) {
-        // 模板行内绑定以行项为作用域，对根模型校验会假失败——子树跳过。
         if (c.Kind() == "template") { return; }
         if (c.bindings != null) {
             for (int i = 0; i < c.bindings.Count; i = i + 1) {
@@ -74,12 +67,6 @@ public class DocWire {
             DocWire.CollectBinds(c.ChildAt(j), vm, bad);
         }
     }
-
-    // z-mount 挂载：声明 z-mount="field" 的节点，把 owner 同名字段（须为
-    // 非空 Control——在 OnCreate 里建好）挂进该节点。字段缺失、为空或
-    // 不是 Control 的，开窗前一次性列出 exit 1（与缺失处理器同语义）。
-    // 先收齐槽位再挂，不会走进刚挂上的代码建子树；模板子树跳过（行克隆
-    // 没有单一字段可挂）。
     public static void MountSlots(Control tree, object owner) {
         List<Control> slots = new List<Control>();
         DocWire.CollectMounts(tree, slots);
@@ -104,7 +91,6 @@ public class DocWire {
             Environment.Exit(1);
         }
     }
-
     static void CollectMounts(Control c, List<Control> slots) {
         if (c.Kind() == "template") { return; }
         if (c.bindMount != "") { slots.Add(c); }
@@ -112,35 +98,20 @@ public class DocWire {
             DocWire.CollectMounts(c.ChildAt(j), slots);
         }
     }
-
-    // 字段引用：纯路径且首字符是字母/下划线，排除 true/false/null 字面量。
     public static bool IsFieldRef(string s) {
         if (!DocWire.IsPlainPath(s)) { return false; }
         char ch = s[0];
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_')) {
-            return false;
-        }
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_')) { return false; }
         return s != "true" && s != "false" && s != "null";
     }
-
     public static bool FieldExists(object vm, string path) {
-        // Match ModelBinder's scalar dictionary contract: a key is the whole
-        // binding path, including dots; it is not a reflected POCO field.
-        if (vm is Dictionary<string, string>) {
-            return ((Dictionary<string, string>)vm).ContainsKey(path);
-        }
-        if (vm is Dictionary<string, double>) {
-            return ((Dictionary<string, double>)vm).ContainsKey(path);
-        }
-        if (vm is Dictionary<string, bool>) {
-            return ((Dictionary<string, bool>)vm).ContainsKey(path);
-        }
+        if (vm is Dictionary<string, string>) { return ((Dictionary<string, string>)vm).ContainsKey(path); }
+        if (vm is Dictionary<string, double>) { return ((Dictionary<string, double>)vm).ContainsKey(path); }
+        if (vm is Dictionary<string, bool>) { return ((Dictionary<string, bool>)vm).ContainsKey(path); }
         string leaf = "";
         object target = ModelBinder.ResolveFieldScope(vm, path, out leaf);
         return target != null && target.HasField(leaf);
     }
-
-    // 纯路径（ident[.ident]*）才校验；带运算符的是表达式，归 binder 语义。
     public static bool IsPlainPath(string s) {
         if (s == null || s == "") { return false; }
         for (int i = 0; i < s.Length; i++) {

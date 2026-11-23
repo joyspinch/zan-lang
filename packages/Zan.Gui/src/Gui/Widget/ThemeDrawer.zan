@@ -1,0 +1,312 @@
+using System;
+using System.Collections.Generic;
+using Gui.Widget;
+namespace Gui;
+internal class ThemeDrawer : Drawer, AppLoopOwner {
+    private weak App owner;
+    private AppLoopRegistration ticket;
+    private List<string> skinLabels;
+    private Panel skinGrid;
+    private List<Button> skinButtons;
+    private List<Button> accentButtons;
+    private List<Button> densityButtons;
+    private List<Button> effectButtons;
+    private Button styleTab;
+    private Button motionTab;
+    internal ScrollColumn styleScroll;
+    internal ScrollColumn motionScroll;
+    internal Slider opacity;
+    internal Slider wallpaperOpacity;
+    internal Button wallpaperPick;
+    internal Button wallpaperClear;
+    internal Checkbox animations;
+    private Label opacityLabel;
+    private Label wallpaperOpacityLabel;
+    private int tab;
+    private bool retired;
+    private int session;
+    private List<ThemeDrawerRelay> actions;
+    private List<Label> sectionLabels;
+    internal ThemeDrawer(App app) : base("外观设置") {
+        owner = app;
+        skinLabels = new List<string>();
+        skinButtons = new List<Button>();
+        accentButtons = new List<Button>();
+        densityButtons = new List<Button>();
+        effectButtons = new List<Button>();
+        actions = new List<ThemeDrawerRelay>();
+        sectionLabels = new List<Label>();
+        this.name = "theme-drawer";
+        closeBtn.name = "theme-drawer-close";
+        drawerBox.name = "theme-drawer-surface";
+        drawerBox.AddClass("theme-drawer-surface");
+        closeBtn.Tip = "关闭";
+        contentBox.flexFlow = 1;
+        contentBox.SetProp("style", "padding:0; gap:var(--gap-small);");
+        headerRow.Prefer(0, WidgetSize.Medium);
+        ThemeDrawerRelay relay = this.Relay("", 0);
+        this.Close.Add(relay.Closed);
+        closeBtn.Click.Clear();
+        this.BindAction(closeBtn.Click, "close", 0);
+        Panel tabs = Panel.Row();
+        tabs.SetProp("style", "gap:var(--gap-small);");
+        styleTab = this.Command("样式", "tab", 0);
+        motionTab = this.Command("动效", "tab", 1);
+        styleTab.Grow();
+        motionTab.Grow();
+        tabs.Add(styleTab);
+        tabs.Add(motionTab);
+        contentBox.Add(tabs);
+        styleScroll = new ScrollColumn();
+        styleScroll.name = "theme-style-scroll";
+        styleScroll.Grow();
+        styleScroll.SetProp("style", "gap:var(--gap-medium);");
+        motionScroll = new ScrollColumn();
+        motionScroll.name = "theme-motion-scroll";
+        motionScroll.Grow();
+        motionScroll.SetProp("style", "gap:var(--gap-small);");
+        contentBox.Add(styleScroll);
+        contentBox.Add(motionScroll);
+        this.Section(styleScroll, "皮肤");
+        skinGrid = Panel.Column();
+        skinGrid.SetProp("style", "gap:var(--gap-medium);");
+        styleScroll.Add(skinGrid);
+        this.Section(styleScroll, "强调色");
+        Panel accents = this.OptionsRow();
+        List<string> accentNames = new List<string>{ "默认", "蓝", "紫", "粉", "绿", "琥珀", "红" };
+        for (int i = 0; i < accentNames.Count; i = i + 1) {
+            Button button = this.Command(accentNames[i], "accent", i);
+            button.Grow();
+            accents.Add(button);
+            accentButtons.Add(button);
+        }
+        styleScroll.Add(accents);
+        this.Section(styleScroll, "密度");
+        Panel densities = this.OptionsRow();
+        List<string> densityNames = new List<string>{ "小", "中", "大" };
+        for (int i = 0; i < densityNames.Count; i = i + 1) {
+            Button button = this.Command(densityNames[i], "density", i);
+            button.Grow();
+            densities.Add(button);
+            densityButtons.Add(button);
+        }
+        styleScroll.Add(densities);
+        opacityLabel = this.Section(styleScroll, "窗口不透明度");
+        opacity = this.LevelSlider("opacity");
+        styleScroll.Add(opacity);
+        this.Section(styleScroll, "壁纸");
+        Panel wallpaper = this.OptionsRow();
+        wallpaperPick = this.Command("选择图片…", "wallpaper-pick", 0);
+        wallpaperPick.Grow();
+        wallpaperClear = this.Command("清除", "wallpaper-clear", 0);
+        wallpaper.Add(wallpaperPick);
+        wallpaper.Add(wallpaperClear);
+        styleScroll.Add(wallpaper);
+        wallpaperOpacityLabel = this.Section(styleScroll, "壁纸混合强度");
+        wallpaperOpacity = this.LevelSlider("wallpaper-opacity");
+        styleScroll.Add(wallpaperOpacity);
+        animations = new Checkbox("启用动画");
+        animations.name = "theme-animations";
+        animations.Prefer(0, WidgetSize.Medium);
+        this.BindAction(animations.Change, "animations", 0);
+        motionScroll.Add(animations);
+        this.Section(motionScroll, "背景效果");
+        Panel effectsGrid = Panel.Root("theme-effects-grid");
+        effectsGrid.SetProp("style", "display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--gap-small);");
+        List<string> effects = new List<string>{ "跟随皮肤", "星空", "极光", "流星", "水墨", "花瓣", "数字雨", "光斑", "网格" };
+        for (int i = 0; i < effects.Count; i = i + 1) {
+            Button button = this.Command(effects[i], "effect", i == 0 ? -1 : i);
+            effectButtons.Add(button);
+            effectsGrid.Add(button);
+        }
+        motionScroll.Add(effectsGrid);
+        ticket = app.RegisterLoopParticipant(this, relay);
+    }
+    private ThemeDrawerRelay Relay(string command, int value) {
+        ThemeDrawerRelay relay = new ThemeDrawerRelay();
+        relay.owner = owner;
+        relay.drawer = this;
+        relay.command = command;
+        relay.value = value;
+        return relay;
+    }
+    private void BindAction(UiEvent actionEvent, string command, int value) {
+        ThemeDrawerRelay action = this.Relay(command, value);
+        action.session = session;
+        action.actionEvent = actionEvent;
+        actions.Add(action);
+        actionEvent.Add(action.Invoke);
+    }
+    private void BeginSession() {
+        session = session + 1;
+        for (int i = 0; i < actions.Count; i = i + 1) {
+            ThemeDrawerRelay previous = actions[i];
+            UiEvent actionEvent = previous.actionEvent;
+            if (actionEvent == null) { continue; }
+            actionEvent.Remove(previous.Invoke);
+            ThemeDrawerRelay action = this.Relay(previous.command, previous.value);
+            action.actionEvent = actionEvent;
+            action.session = session;
+            actions[i] = action;
+            actionEvent.Add(action.Invoke);
+        }
+    }
+    internal bool IsSession(int expected) { return !retired && this.IsOpen() && session == expected; }
+    private Button Command(string text, string command, int value) {
+        Button button = new Button(text) { ClassName = "small theme-choice" };
+        button.name = "theme-" + command + "-" + Convert.ToString(value);
+        this.BindAction(button.Click, command, value);
+        return button;
+    }
+    private Panel OptionsRow() {
+        Panel row = Panel.Row();
+        row.SetProp("style", "gap:var(--gap-small);");
+        return row;
+    }
+    private Label Section(Control parent, string text) {
+        Label label = new Label(text) { ClassName = "small secondary" };
+        label.Prefer(0, WidgetSize.Small);
+        sectionLabels.Add(label);
+        parent.Add(label);
+        return label;
+    }
+    private Slider LevelSlider(string command) {
+        Slider slider = new Slider(50, 100);
+        slider.name = "theme-" + command;
+        slider.step = 10;
+        slider.tipFormat = "{v}%";
+        slider.Prefer(0, WidgetSize.Medium);
+        this.BindAction(slider.Change, command, 0);
+        return slider;
+    }
+    private void SyncSkins(App app) {
+        bool changed = skinLabels.Count != app.themeNames.Count;
+        for (int i = 0; !changed && i < skinLabels.Count; i = i + 1) {
+            if (skinLabels[i] != app.themeNames[i]) { changed = true; }
+        }
+        if (!changed) { return; }
+        skinGrid.RemoveAll();
+        skinLabels.Clear();
+        skinButtons.Clear();
+        Panel row = null;
+        for (int i = 0; i < app.themeNames.Count; i = i + 1) {
+            if (i % 3 == 0) {
+                row = this.OptionsRow();
+                skinGrid.Add(row);
+            }
+            string text = app.themeNames[i];
+            skinLabels.Add(text);
+            Button button = this.Command(text, "skin", i);
+            button.Grow();
+            button.Class = "theme-choice theme-skin-card stacked";
+            if (app.autoSkins) {
+                Theme preview = app.SkinThemeAt(i);
+                Panel sample = Panel.Row();
+                sample.name = "theme-skin-preview-" + Convert.ToString(i);
+                sample.Class = "theme-skin-preview";
+                sample.Bg(preview.bgPrimary);
+                Panel rail = new Panel();
+                rail.Bg(preview.bgSecondary);
+                rail.Prefer(12, 16);
+                Panel content = new Panel();
+                content.Bg(preview.bgActive);
+                content.Grow();
+                Panel accent = new Panel();
+                accent.Bg(preview.primary);
+                accent.Prefer(12, 16);
+                sample.Add(rail);
+                sample.Add(content);
+                sample.Add(accent);
+                button.InsertAt(0, sample);
+            }
+            skinButtons.Add(button);
+            row.Add(button);
+        }
+    }
+    private void Select(Button button, bool selected) {
+        if (button.Checked.Get() != selected) { button.Checked.Set(selected); }
+        if (button.HasClass("selected") != selected) {
+            button.SetClassIn("selected", selected ? "selected" : "");
+        }
+    }
+    internal void SelectTab(int next) {
+        if (tab == next) { return; }
+        tab = next == 1 ? 1 : 0;
+        styleScroll.SetScrollTop(0);
+        motionScroll.SetScrollTop(0);
+        App app = owner;
+        if (app != null) { this.Prepare(app); app.RequestRedraw(); }
+    }
+    internal void Present(App app) {
+        if (retired || app != owner) { return; }
+        styleScroll.SetScrollTop(0);
+        motionScroll.SetScrollTop(0);
+        this.BeginSession();
+        this.Show();
+        this.Prepare(app);
+        app.overlayHost.Show(app, null, this);
+    }
+    internal void Prepare(App app) {
+        if (retired || app != owner || !this.IsOpen()) { return; }
+        this.SyncSkins(app);
+        headerRow.Prefer(0, app.theme.heightMedium);
+        opacity.Prefer(0, app.theme.heightMedium);
+        wallpaperOpacity.Prefer(0, app.theme.heightMedium);
+        animations.Prefer(0, app.theme.heightMedium);
+        for (int i = 0; i < sectionLabels.Count; i = i + 1) {
+            sectionLabels[i].Prefer(0, app.theme.heightSmall);
+        }
+        for (int i = 0; i < skinButtons.Count; i = i + 1) {
+            Button button = skinButtons[i];
+            if (app.autoSkins && button.ChildCount() > 1) {
+                Control preview = button.ChildAt(0);
+                preview.ChildAt(0).Prefer(app.Scale(12), app.Scale(16));
+                preview.ChildAt(2).Prefer(app.Scale(12), app.Scale(16));
+            }
+        }
+        this.Select(styleTab, tab == 0);
+        this.Select(motionTab, tab == 1);
+        styleScroll.SetShown(tab == 0);
+        motionScroll.SetShown(tab == 1);
+        for (int i = 0; i < skinButtons.Count; i = i + 1) { this.Select(skinButtons[i], i == app.ThemeMenuIndex()); }
+        for (int i = 0; i < accentButtons.Count; i = i + 1) { this.Select(accentButtons[i], app.accentOverride == app.ThemeDrawerAccent(i)); }
+        for (int i = 0; i < densityButtons.Count; i = i + 1) { this.Select(densityButtons[i], i == app.Density()); }
+        for (int i = 0; i < effectButtons.Count; i = i + 1) { this.Select(effectButtons[i], app.fxKindOverride == (i == 0 ? -1 : i)); }
+        opacity.SetValue(app.WindowOpacity());
+        opacityLabel.Text.Set("窗口不透明度 " + Convert.ToString(app.WindowOpacity()) + "%");
+        wallpaperOpacity.SetValue(app.WallpaperOpacity());
+        wallpaperOpacityLabel.Text.Set("壁纸混合强度 " + Convert.ToString(app.WallpaperOpacity()) + "%");
+        string wallpaper = app.WallpaperPath();
+        string filename = wallpaper.Replace("\\", "/");
+        int slash = filename.LastIndexOf("/");
+        if (slash >= 0) { filename = filename.Substring(slash + 1); }
+        string wallpaperText = wallpaper == "" ? "选择图片…" : filename;
+        if (wallpaperPick.Label() != wallpaperText) { wallpaperPick.SetText(wallpaperText); }
+        wallpaperClear.Disabled.Set(!app.HasUserWallpaper());
+        wallpaperOpacity.Disabled.Set(wallpaper == "");
+        animations.SetChecked(app.fxEnabled);
+        drawerSize = app.Scale(360);
+        this.InheritApp(app);
+        this.MeasureTree(app);
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+        app.ContentBounds(out x, out y, out width, out height);
+        this.Arrange(x, y, width, height);
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!this.IsOpen() || !this.StyleVisible()) { return null; }
+        if (!drawerBox.ContainsPoint(x, y, 0)) { return null; }
+        return drawerBox.HitTest(x, y, pointerType, excludedSubtrees);
+    }
+    internal void Retire() {
+        if (retired) { return; }
+        retired = true;
+        App app = owner;
+        if (app != null && app.overlayHost != null) { app.overlayHost.Hide(this); }
+        if (this.IsOpen()) { this.Hide(); }
+        if (ticket != null) { ticket.Retire(); ticket = null; }
+        owner = null;
+    }
+}

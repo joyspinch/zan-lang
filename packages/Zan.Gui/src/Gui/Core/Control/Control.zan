@@ -2,113 +2,82 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-using Gui.Widget;
-
 namespace Gui;
-
-// 保留模式现代组件树。
-// 每个节点都是一个 `Control`：有稳定的 `name`、父节点、有序的
-// 子节点列表与已解析的边界矩形。容器用 `Add` 追加
-// 子节点；任何节点都可用 `Find(name)` 定位后代。
-// 布局完全由现代声明式标准排版驱动（CSS Flexbox / CSS Grid /
-// 标准 Flow 块级流与行内行盒流，见 `Arrange`）。绘制由
-// 渲染管道递归——子类重写 `OnPaint`，框架通过 `Paint` 递归裁剪
-// 并装配图元，内容不会溢出（复用原生裁剪栈）。
-public partial class Control : AppLoopOwner {
+public partial class Control : StyleNode, AppLoopOwner {
+    public const string ClassNameProperty = "ClassName";
+    public const string TextProperty = "Text";
+    public const string ValueProperty = "Value";
+    public const string CheckedProperty = "Checked";
+    public const string VisibleProperty = "Visible";
+    public const string DisabledProperty = "Disabled";
+    public const string ContentProperty = "Content";
+    public const string IsExpandedProperty = "IsExpanded";
     string name;
-    // 容器流式标记（兼容 Flex 方向判定：0 无，1 列，2 行）
-    int layout;
-    // 为 true 时，此节点增长以填满流式父节点的剩余主轴空间（flex-grow: 1）
     bool grow;
-    // 控件 OnMeasure 或样式计算出的首选尺寸
     int prefW;
     int prefH;
-    // 手动绝对定位偏移（由 CSS position: absolute 统摄）
     int mx;
     int my;
     int padL;
     int padT;
     int padR;
     int padB;
-    // 由 Pad()/Padding() 设置：调用方固定了内边距，因此控件的
-    // OnMeasure 不得用其主题默认值覆盖它。
     bool padSet;
     int marL;
     int marT;
     int marR;
     int marB;
     bool marSet;
-    // 由 Prefer()（以及 UiDoc 的 `width`/`height`）设置：调用方固定了
-    // 首选尺寸，因此根据子节点自测量的容器
-    // 会保留给定的那个轴。
     bool prefSet;
-    // 该轴的 prefW/prefH 是容器按内容补齐的（MeasureDocked /
-    // MeasureFlexContent），不是作者或控件自定的。这类值每帧
-    // 先清零再重算：首帧样式或缩放还没就位时算出的错值，靠
-    // 钉死在 20px，33px 的徽标被行裁掉底部）。
     bool fillW;
     bool fillH;
     int gap;
     ControlExtra extra;
-
-    // Value-type generation only: no process-lifetime RC state. Binders rebuild
-    // their flat records after structural edits, never by scanning every frame.
-    static int bindingStructureRevision;
-    internal static int BindingStructureRevision() { return Control.bindingStructureRevision; }
-    static void NoteBindingStructureChanged() { Control.bindingStructureRevision = Control.bindingStructureRevision + 1; }
-
+    internal static int BindingStructureRevision() { return GuiHostState.BindingStructureRevision(); }
+    static void NoteBindingStructureChanged() { GuiHostState.NextBindingStructureRevision(); }
     ControlExtra EnsureExtra() {
-        if (this.extra == null) {
-            this.extra = new ControlExtra();
-        }
+        if (this.extra == null) { this.extra = new ControlExtra(); }
         return this.extra;
     }
-
+    internal bool HasExtra() { return this.extra != null; }
     public bool layoutFlow {
         get { return this.extra != null ? this.extra.layoutFlow : false; }
-        set { this.EnsureExtra().layoutFlow = value; }
+        set { if (!value && this.extra == null) { return; } this.EnsureExtra().layoutFlow = value; }
     }
     public int flexWrapMain {
         get { return this.extra != null ? this.extra.flexWrapMain : 0; }
-        set { this.EnsureExtra().flexWrapMain = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().flexWrapMain = value; }
     }
     public int flexMeasMain {
         get { return this.extra != null ? this.extra.flexMeasMain : 0; }
-        set { this.EnsureExtra().flexMeasMain = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().flexMeasMain = value; }
     }
     public int hintWrapW {
         get { return this.extra != null ? this.extra.hintWrapW : 0; }
-        set { this.EnsureExtra().hintWrapW = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().hintWrapW = value; }
     }
     public List<FloatIntrusion> hostFloats {
         get { return this.extra != null ? this.extra.hostFloats : null; }
-        set { this.EnsureExtra().hostFloats = value; }
+        set { if (value == null && this.extra == null) { return; } this.EnsureExtra().hostFloats = value; }
     }
     bool visible;
-    // 画布坐标下的已解析边界（由 Arrange 设置）。
     int bx;
     int by;
     int bw;
     int bh;
-    // CSS 滚动容器（P6）：当前滚动偏移与最近一次排布出的内容延伸
-    // （padding-box 坐标，px）。偏移在 Arrange 期按延伸钳制并把
-    // 子树平移 -scrollY / -scrollX；交互状态（滚轮/拖动）惰性建。
     int scrollY;
     int scrollExtent;
-    // 水平轴（P6 横滚）：overflow-x auto/scroll 与纵向同语义。
     int scrollX;
     int scrollExtentX;
     ScrollState scroll;
     weak Control parent;
     weak App app;
-    // 显式上下文覆盖与树继承分开：重挂子树只更新继承值。
     bool explicitApp;
     public App App {
         get { return this.ResolveApp(null); }
         set { this.UseApp(value); }
     }
     private List<Control> childNodes;
-    // Collection initializers and direct edits share adoption and input retirement.
     public ControlChildren Children {
         get {
             ControlExtra state = this.EnsureExtra();
@@ -117,31 +86,16 @@ public partial class Control : AppLoopOwner {
         }
     }
     private static List<EventBinding> emptyEvents = new List<EventBinding>();
-    // 供设计器/序列化器使用的事件处理器绑定：把事件名
-    // （见 Events()）映射到处理器标识符。未绑定时为空。
     public List<EventBinding> events {
         get {
-            if (this.extra != null && this.extra.events != null) {
-                return this.extra.events;
-            }
+            if (this.extra != null && this.extra.events != null) { return this.extra.events; }
             return Control.emptyEvents;
         }
         set { this.EnsureExtra().events = value; }
     }
-    // 每个控件通用的事件包（指针/焦点/键盘/触摸/拖拽），
-    // 所有控件继承。拥有稳定 id 的交互控件
-    // 自行接线路由事件的旧标记，仅用于判定通用绘制行为；
-    // 其余控件由 RenderTree 通过 FireCommon 接线。
     WidgetEvents On;
-    // 为不自持 id 的控件（容器和仅显示控件）提供支撑 `On` 的稳定 id。
-    // 首次使用时分配；0 = 从未需要。
     int commonId;
-    // 由自行注册命中区域并调用 On.Fire 的控件（Button、Input 等）设置，
-    // 这样 RenderTree 就不会在另一个 id 上第二次
-    // 触发该事件包。
     bool wiresOwnEvents;
-    // 由 RenderTree 触发的生命周期事件：Paint 在节点每帧绘制时触发，
-    // Resize 在解析尺寸变化时触发，Show/Hide 在可见性翻转时触发。
     public UiEvent Paint {
         get {
             ControlExtra e = this.EnsureExtra();
@@ -174,7 +128,6 @@ public partial class Control : AppLoopOwner {
         }
         set { this.EnsureExtra().Hide = value; }
     }
-    // HTML、按名称接线和代码订阅共用的点击事件，由输入路由触发。
     public UiEvent Click {
         get {
             ControlExtra e = this.EnsureExtra();
@@ -183,9 +136,6 @@ public partial class Control : AppLoopOwner {
         }
         set { this.EnsureExtra().Click = value; }
     }
-    // 可见性开关（HTML `hidden` 属性的同一真相）：false 时本控件不
-    // 测量、不绘制、不命中（与 CSS display:none 在 StyleVisible 合流）。
-    // 包内既有代码直接读写 visible 字段，公开面统一走本属性。
     public bool Visible {
         get { return visible; }
         set { visible = value; }
@@ -197,45 +147,100 @@ public partial class Control : AppLoopOwner {
     internal List<ModelBindingDeclaration> bindings {
         get { return this.extra != null ? this.extra.bindings : null; }
     }
+    public List<ControlBinding> Binding {
+        get {
+            ControlExtra state = this.EnsureExtra();
+            if (state.declarativeBindings == null) {
+                state.declarativeBindings = new List<ControlBinding>();
+            }
+            return state.declarativeBindings;
+        }
+        set {
+            this.EnsureExtra().declarativeBindings = value;
+        }
+    }
     public string handlerArg {
         get { return this.extra != null ? this.extra.handlerArg : ""; }
-        set { this.EnsureExtra().handlerArg = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().handlerArg = value; }
     }
     public string slotName {
         get { return this.extra != null ? this.extra.slotName : ""; }
-        set { this.EnsureExtra().slotName = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().slotName = value; }
     }
-    // z-mount="field" 挂载槽：装配期把宿主窗同名 Control 字段挂进本节点。
     public string bindMount {
         get { return this.extra != null ? this.extra.bindMount : ""; }
-        set { this.EnsureExtra().bindMount = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().bindMount = value; }
     }
-    // 控件关联的原生业务对象/行项实例（由模板循环展开自动注入，供 @click 处理器与业务直接消费）
     public object item;
-    // 循环展开作用域别名（如 "row"，O(1) 直通寻址）
     public string itemAlias;
+    public object DataContext {
+        get { return this.ResolveDataContext(); }
+        set { this.item = value; }
+    }
+    public object ResolveDataContext() {
+        Control cur = this;
+        while (cur != null) {
+            if (cur.item != null) { return cur.item; }
+            cur = cur.parent;
+        }
+        return null;
+    }
     public string baseClass {
         get { return this.extra != null ? this.extra.baseClass : ""; }
-        set { this.EnsureExtra().baseClass = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().baseClass = value; }
+    }
+    public string ControlId {
+        get { return this.name; }
+        set { this.Named(value); }
+    }
+    public int GapPx {
+        get { return this.gap; }
+        set { this.Gap(value); }
+    }
+    public bool GrowFill {
+        get { return this.grow; }
+        set {
+            this.grow = value;
+            this.computedStyle = null;
+            this.Invalidate();
+        }
+    }
+    public int PreferredWidth {
+        get { return this.prefW; }
+        set { this.Width(value); }
+    }
+    public int PreferredHeight {
+        get { return this.prefH; }
+        set { this.Height(value); }
+    }
+    public string InlineCss {
+        get { return this.inlineStyleCss; }
+        set { this.InlineStyle(value); }
+    }
+    public string A11yRole {
+        get { return this.a11yRole; }
+        set { this.a11yRole = value; }
+    }
+    public string A11yLabel {
+        get { return this.a11yLabel; }
+        set { this.a11yLabel = value; }
+    }
+    public int HintWrapPx {
+        get { return this.hintWrapW; }
+        set { this.HintWrapWidth(value); }
     }
     public string a11yRole {
         get { return this.extra != null ? this.extra.a11yRole : ""; }
-        set { this.EnsureExtra().a11yRole = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().a11yRole = value; }
     }
     public string a11yLabel {
         get { return this.extra != null ? this.extra.a11yLabel : ""; }
-        set { this.EnsureExtra().a11yLabel = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().a11yLabel = value; }
     }
-
-    // 声明式无障碍与自动化测试语义绑定（可链式调用）。
-    public Control A11y(string role, string label) {
+    public void A11y(string role, string label) {
         this.a11yRole = role;
         this.a11yLabel = label;
-        return this;
     }
-
-    // 精细化局部失效：仅将本控件当前占用的屏幕绝对矩形登记为脏区，
-    // 激活局部帧条带管线（partialFrame），避免 3K/折叠大屏整窗无效重绘。
     public void Invalidate() {
         if (!visible || bw <= 0 || bh <= 0) { return; }
         App app = App.FrameApp();
@@ -243,8 +248,6 @@ public partial class Control : AppLoopOwner {
         int outset = (this.extra != null && this.extra.styleShadow > 0) ? 8 : 2;
         app.NoteDamage(bx - outset, by - outset, bw + outset * 2, bh + outset * 2);
     }
-
-    // 控件内部局部区域失效（例如长列表某一单元格或光标闪烁）
     public void InvalidateRect(int rx, int ry, int rw, int rh) {
         if (!visible || rw <= 0 || rh <= 0) { return; }
         App app = App.FrameApp();
@@ -253,118 +256,79 @@ public partial class Control : AppLoopOwner {
         int y = by + ry;
         app.NoteDamage(x - 2, y - 2, rw + 4, rh + 4);
     }
-
-    // 解析有效无障碍角色
     public string EffectiveA11yRole(string fallback) {
-        if (this.extra != null && this.extra.a11yRole.Length > 0) {
-            return this.extra.a11yRole;
-        }
+        if (this.extra != null && this.extra.a11yRole.Length > 0) { return this.extra.a11yRole; }
         return fallback;
     }
-
-    // 解析有效无障碍标签
     public string EffectiveA11yLabel(string fallback) {
-        if (this.extra != null && this.extra.a11yLabel.Length > 0) {
-            return this.extra.a11yLabel;
-        }
+        if (this.extra != null && this.extra.a11yLabel.Length > 0) { return this.extra.a11yLabel; }
         return fallback;
     }
-    // 可选样式类（JSON `class`），供 StyleSheet 通过 `.class` 选择器
-    // 把声明级联到此控件。空 = 无。
-    // 以空格分隔的 CSS 类：`btn.Class = "primary small";`（直接赋值，
-    // 无 setter）——控件拥有的每个视觉变体都对应其中一个类。
     string Class;
     public string ClassName { get { return Class; } set { Class = value; } }
-    // 悬停气泡提示文本（"" = 无提示）与对齐侧（"top"/"bottom"/"left"/"right"）
     public string Tip;
     public string TipSide;
-
-    // 默认悬停提示内容（子类如 Button 可覆写以追加快捷键或说明）
-    public virtual string TipText() {
-        return this.Tip;
-    }
-    // 双向禁用标志，沿树向下继承：`grp.Disabled = vm.busy;`
-    // 会置灰并禁用整个子树（见 IsDisabled）。
+    public virtual string TipText() { return this.Tip; }
     Binding<bool> Disabled;
     StyleBox computedStyle;
     int computedStyleGen;
-    // computedStyle 是在哪个主题度量缩放下解析的（App.metricsScale）：
-    // 设计器预览会临时整体缩放度量，换了缩放的缓存不能复用。
     int computedStyleScale;
     string computedStyleType;
     string computedStyleClass;
-    // 解析时**实际传入**的类（借用别的组件外观时与控件自身的 Class
-    // 不同）。旧实现只记控件自身的 Class，缓存键里因此少了这一维：
-    // 同一控件用同一个类型、两个不同类各解析一次，第二次会拿到第一次
-    // 的盒子。
     string computedStyleCls;
     string computedStyleId;
-    // 记住 computedStyle 是按哪个状态解析出来的（-1 = 由
-    // 悬停/按下插值出的过渡态，不可复用）。测量按常态进行，
-    // 有了它，一帧里没有变化的节点就不必重新走一遍样式解析。
     int computedStyleState;
-    // computedStyle 是在哪个树上下文签名（Style.CtxSig）下解析的：
-    // 组合器/结构性伪类让样式随节点位置变化，控件被挪到别的容器后
-    // 必须重解析。"" = 无树上下文（immediate 或表内无此类规则）。
     string computedStyleCtx;
-    // Kind() 的小写形式（默认的类型选择器）。每帧每节点都要问
-    // 好几次，现算就是每次一个新字符串。
     string styleTypeLower;
     bool styleSurfaceOwned;
-
-    // --- 类 CSS 样式层（全 0 = 未设置）。PaintStyleBox 对表面生效，
-    // 文本控件对颜色/字体生效。可通过流式的
-    // StyleSheet/皮肤级联。颜色打包为 0xAARRGGBB 整数（同 Theme）。
     public int styleBg {
         get { return this.extra != null ? this.extra.styleBg : 0; }
-        set { this.EnsureExtra().styleBg = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleBg = value; }
     }
     public int styleBgTo {
         get { return this.extra != null ? this.extra.styleBgTo : 0; }
-        set { this.EnsureExtra().styleBgTo = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleBgTo = value; }
     }
     public int styleRadius {
         get { return this.extra != null ? this.extra.styleRadius : 0; }
-        set { this.EnsureExtra().styleRadius = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleRadius = value; }
     }
     public int styleCorners {
         get { return this.extra != null ? this.extra.styleCorners : 0; }
-        set { this.EnsureExtra().styleCorners = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleCorners = value; }
     }
     public int styleBorderColor {
         get { return this.extra != null ? this.extra.styleBorderColor : 0; }
-        set { this.EnsureExtra().styleBorderColor = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleBorderColor = value; }
     }
     public int styleBorderWidth {
         get { return this.extra != null ? this.extra.styleBorderWidth : 0; }
-        set { this.EnsureExtra().styleBorderWidth = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleBorderWidth = value; }
     }
     public int styleShadow {
         get { return this.extra != null ? this.extra.styleShadow : 0; }
-        set { this.EnsureExtra().styleShadow = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleShadow = value; }
     }
     public int styleShadowDy {
         get { return this.extra != null ? this.extra.styleShadowDy : 0; }
-        set { this.EnsureExtra().styleShadowDy = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleShadowDy = value; }
     }
     public int styleColor {
         get { return this.extra != null ? this.extra.styleColor : 0; }
-        set { this.EnsureExtra().styleColor = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleColor = value; }
     }
     public int styleFontPx {
         get { return this.extra != null ? this.extra.styleFontPx : 0; }
-        set { this.EnsureExtra().styleFontPx = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleFontPx = value; }
     }
     public int styleTransitionMs {
         get { return this.extra != null ? this.extra.styleTransitionMs : 0; }
-        set { this.EnsureExtra().styleTransitionMs = value; }
+        set { if (value == 0 && this.extra == null) { return; } this.EnsureExtra().styleTransitionMs = value; }
     }
     public string inlineStyleCss {
         get { return this.extra != null ? this.extra.inlineStyleCss : ""; }
-        set { this.EnsureExtra().inlineStyleCss = value; }
+        set { if ((value == null || value == "") && this.extra == null) { return; } this.EnsureExtra().inlineStyleCss = value; }
     }
-
-    // 所有子类在工厂/构造函数中调用的基础初始化方法。
     void InitControl(string n) {
         name = n;
         Class = "";
@@ -400,7 +364,6 @@ public partial class Control : AppLoopOwner {
         lastBh = 0;
         lastVisible = false;
         everLaidOut = false;
-        layout = 0;
         grow = false;
         Class = "";
         Disabled = false;
@@ -416,26 +379,9 @@ public partial class Control : AppLoopOwner {
         styleTypeLower = "";
         styleSurfaceOwned = false;
     }
-
-    void InitControl(string n, int d) {
-        this.InitControl(n);
-    }
-
-    public Control() {
-        this.InitControl("");
-    }
-
-    public Control(string n) {
-        this.InitControl(n);
-    }
-
-    // 追加一个子节点并返回该子节点，如 `Button b = panel.Add(save)`。
-    // Add 与 With（含 Children 集合初始化器）走相同的虚拟业务挂载入口，
-    // 布局由 CSS 与父容器决定；二者只在返回 child / container 上有区别。
+    public Control() { this.InitControl(""); }
+    public Control(string n) { this.InitControl(n); }
     public virtual Control Add(Control c) {
-        // Declarative assembly may encounter the same retained node again.
-        // Re-adding it to its current parent is not a removal: preserve order,
-        // focus, pointer capture and all business state.
         if (c != null && c.parent == this && this.IndexOf(c) >= 0) { return c; }
         if (!this.Adoptable(c)) { return c; }
         if (!this.Adopt(c)) { return c; }
@@ -444,38 +390,15 @@ public partial class Control : AppLoopOwner {
         this.Invalidate();
         return c;
     }
-
-    // 添加 `c` 并返回 THIS 容器，支持 `panel.With(a).With(b)` 链式追加。
-    // 调用虚拟 Add 保持普通子节点与组件业务插槽的挂载协议一致。
-    Control With(Control c) {
-        this.Add(c);
-        return this;
-    }
-
-    // 批量追加子节点（流式追加，自动维护父子拓扑与作用域）。
-    Control AddChildren(List<Control> list) {
-        if (list == null) { return this; }
+    void With(Control c) { this.Add(c); }
+    void AddChildren(List<Control> list) {
+        if (list == null) { return; }
         for (int i = 0; i < list.Count; i = i + 1) {
             this.With(list[i]);
         }
-        return this;
     }
-
-    // 快捷固定首选宽度（逻辑像素）。
-    Control Width(int w) {
-        return this.Prefer(w, prefH);
-    }
-
-    // 快捷固定首选高度（逻辑像素）。
-    Control Height(int h) {
-        return this.Prefer(prefW, h);
-    }
-
-    // 一个控件在树里只能有一个位置。宿主保留控件（画廊、文档预览、
-    // 设计出来的静态字段）会在重建时被挂到新的父节点上，旧父节点若还
-    // 留着它，同一个节点就出现在两处；把祖先挂进自己的后代更糟——树
-    // 成环，任何递归遍历（Wire/RenderTree/Measure）都会无限递归，栈溢
-    // 出表现为读非法地址的崩溃。因此收养前先判断能不能收养。
+    void Width(int w) { this.Prefer(w, prefH); }
+    void Height(int h) { this.Prefer(prefW, h); }
     bool Adoptable(Control c) {
         if (c == null || c == this) { return false; }
         /* c 是本节点的祖先：挂进去就成环 */
@@ -486,13 +409,9 @@ public partial class Control : AppLoopOwner {
         }
         return true;
     }
-
-    // 收养一个子节点：先从原父节点摘下（含本节点，重复 Add 不会让
-    // 同一个控件在 childNodes 里出现两次），再指向本节点。
     bool Adopt(Control c) {
         if (c.parent == this) { return true; }
         if (c.parent != null) { c.parent.Remove(c); }
-        // A cancellation handler may have moved the child elsewhere.
         if (c.parent != null || !this.Adoptable(c)) { return false; }
         c.parent = this;
         c.InheritApp(this.FindApp());
@@ -500,9 +419,6 @@ public partial class Control : AppLoopOwner {
         this.SpreadScopeTo(c);
         return true;
     }
-
-    // 提取作用域类（HTML scoping 约定的 `zs-*` 类标记）：
-    // 若本节点（或祖先链）携带有 `zs-*` 作用域，子树被收养时自动继承。
     string ScopeClass() {
         Control cur = this;
         while (cur != null) {
@@ -510,23 +426,19 @@ public partial class Control : AppLoopOwner {
                 List<string> parts = Style.Classes(cur.Class);
                 for (int i = 0; i < parts.Count; i = i + 1) {
                     string p = parts[i];
-                    if (p.Length >= 3 && p[0] == 122 && p[1] == 115 && p[2] == 45) {
-                        return p;
-                    }
+                    if (p.Length >= 3 && p[0] == 122 && p[1] == 115 && p[2] == 45) { return p; }
                 }
             }
             cur = cur.parent;
         }
         return "";
     }
-
     void SpreadScopeTo(Control c) {
         if (c == null) { return; }
         string zs = this.ScopeClass();
         if (zs == "") { return; }
         c.InheritScope(zs);
     }
-
     void InheritScope(string zs) {
         if (this.Class != "" && Style.Has(this.Class, zs)) { return; }
         bool hasOtherScope = false;
@@ -540,15 +452,11 @@ public partial class Control : AppLoopOwner {
                 }
             }
         }
-        if (!hasOtherScope) {
-            this.AddClass(zs);
-        }
+        if (!hasOtherScope) { this.AddClass(zs); }
         for (int i = 0; i < childNodes.Count; i = i + 1) {
             childNodes[i].InheritScope(zs);
         }
     }
-
-    // 本节点所在的窗口，尚未挂到任何窗口下时为 null。
     Form HostForm() {
         Control up = this;
         for (int guard = 0; up != null && guard < 4096; guard = guard + 1) {
@@ -557,13 +465,7 @@ public partial class Control : AppLoopOwner {
         }
         return null;
     }
-
-    // 类 C# WinForms / WPF 风格的窗口与应用上下文上溯：挂树控件直接通过
-    // this.FindForm() / this.FindApp() 访问宿主，无需外界手动 UseApp(app) 传递。
-    Form FindForm() {
-        return this.HostForm();
-    }
-
+    Form FindForm() { return this.HostForm(); }
     App FindApp() {
         if (this.app != null) { return this.app; }
         Control up = this.parent;
@@ -577,7 +479,6 @@ public partial class Control : AppLoopOwner {
         }
         return null;
     }
-
     public App ResolveApp(App fallback) {
         if (fallback != null) { return fallback; }
         if (this.app != null) { return this.app; }
@@ -585,45 +486,35 @@ public partial class Control : AppLoopOwner {
         if (a != null) { return a; }
         return App.FrameApp();
     }
-
-    public Control UseApp(App host) {
+    public void UseApp(App host) {
         this.explicitApp = host != null;
         App inherited = host;
-        if (inherited == null && this.parent != null) {
-            inherited = this.parent.FindApp();
-        }
+        if (inherited == null && this.parent != null) { inherited = this.parent.FindApp(); }
         this.SetHostApp(inherited);
-        return this;
     }
-
     void SetHostApp(App host) {
         if (this.app != host) {
             this.app = host;
             this.computedStyle = null;
-            this.surfaceHover = null;
-            this.surfacePress = null;
-            this.surfaceFocus = null;
+            this.paintedStyle = null;
+            this.surfaceNormal = null;
+            this.surfaceTarget = null;
+            this.surfaceFrom = null;
+            this.surfaceBlend = null;
+            this.surfaceState = 0;
         }
         for (int i = 0; i < childNodes.Count; i = i + 1) {
             childNodes[i].InheritApp(host);
         }
     }
-
     void InheritApp(App host) {
         if (this.explicitApp) { return; }
         if (this.parent != null) { host = this.parent.FindApp(); }
         this.SetHostApp(host);
     }
-
-    // 挂到窗口树上时同步自动继承的上下文；显式覆盖由 UseApp 管理。
     public virtual void OnHostForm(Form f) {
-        if (f != null && this.app == null) {
-            this.InheritApp(f.GetApp());
-        }
+        if (f != null && this.app == null) { this.InheritApp(f.GetApp()); }
     }
-
-    // 把宿主窗口沿子树发下去（收养时自动调用，一棵先建好的子树在
-    // 挂上来的那一刻整棵都收到宿主）。
     void SpreadHostForm(Form f) {
         if (f == null) { return; }
         this.OnHostForm(f);
@@ -631,40 +522,22 @@ public partial class Control : AppLoopOwner {
             childNodes[i].SpreadHostForm(f);
         }
     }
-
-    // 给定父节点剩余空间时，此子节点停靠的主轴尺寸：
-    // 由样式表决定，因此停靠面板上的 `width: 34%; min-width: 260px`
-    // 与浏览器中的行为完全一致；没有样式尺寸的子节点
-    // 标记此节点填满其流式父节点的剩余主轴空间。
-    Control Grow() {
+    void Grow() {
         grow = true;
         computedStyle = null;
         this.Invalidate();
-        return this;
     }
-
-    // 现代 Float / Absolute 绝对定位原语。
-    Control Float(int left, int top) {
-        return this.Place(left, top);
-    }
-
-    // 流式 id 设置器，内联构建的节点之后仍可用
-    // Find() 定位，或被设计器/序列化器定位。
-    Control Named(string n) {
+    void Float(int left, int top) { this.Place(left, top); }
+    void Named(string n) {
         name = n;
         computedStyle = null;
-        return this;
     }
-
-    // `c` 在 childNodes 中的下标；不是本节点的子节点时返回 -1。
     int IndexOf(Control c) {
         for (int i = 0; i < childNodes.Count; i = i + 1) {
             if (childNodes[i] == c) { return i; }
         }
         return -1;
     }
-
-    // Cancellation can reparent a child; only the current owner may commit removal.
     private bool DetachChildIfOwned(Control c) {
         int idx = IndexOf(c);
         if (idx < 0 || c.parent != this) { return false; }
@@ -675,8 +548,6 @@ public partial class Control : AppLoopOwner {
         this.Invalidate();
         return true;
     }
-
-    // Retirement observers run after structural commit, so a same-parent renewal survives.
     void Remove(Control c) {
         if (c == null || c.parent != this || IndexOf(c) < 0) { return; }
         App host = this.FindApp();
@@ -689,9 +560,6 @@ public partial class Control : AppLoopOwner {
             host.NotifyInputRetirements(retiring, 0, false);
         }
     }
-
-    // Snapshot every old member before Cancel can renew another member's registration.
-    // Cancel failure or a superseded owner aborts before this batch changes the tree.
     public void RemoveChildren(List<Control> selected, Func<bool> canCommit) {
         List<Control> previous = new List<Control>();
         List<List<InputRetirementToken>> snapshots = new List<List<InputRetirementToken>>();
@@ -717,13 +585,7 @@ public partial class Control : AppLoopOwner {
             host.NotifyInputRetirements(retiring, 0, false);
         }
     }
-
-    // 移除所有子节点：数据驱动的容器在按数据重填前调用。
-    void RemoveAll() {
-        this.RemoveChildren(childNodes, null);
-    }
-
-    // 在某个位置插入子节点，索引被钳制在范围内。会重新父化 `c`。
+    void RemoveAll() { this.RemoveChildren(childNodes, null); }
     void InsertAt(int idx, Control c) {
         if (c != null && c.parent == this && this.IndexOf(c) >= 0) {
             this.MoveChild(c, idx);
@@ -738,8 +600,6 @@ public partial class Control : AppLoopOwner {
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
-
-    // 把已有子节点移动到新索引（供设计器拖拽排序用）。
     void MoveChild(Control c, int to) {
         int idx = IndexOf(c);
         if (idx < 0) { return; }
@@ -751,8 +611,6 @@ public partial class Control : AppLoopOwner {
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
-
-    // Reordering is a permutation of current children; it never retires input owners.
     public void ReorderChildren(List<Control> ordered) {
         if (ordered == null || ordered.Count != childNodes.Count) {
             throw new ArgumentException("Child order must contain every current child once.");
@@ -775,35 +633,17 @@ public partial class Control : AppLoopOwner {
         Control.NoteBindingStructureChanged();
         this.Invalidate();
     }
-
-    // Viewport eligibility is separate from authored visibility and measurement.
-    // The argument is always a direct child, including ancestor focus checks.
     public virtual bool ChildInViewport(Control child) { return true; }
-
-    // 其已解析边界包含该点的最深层可见后代，
-    // 优先选择更靠后（最上层）的子节点。用于设计器命中选择与 Visual Tree 事件路由。
-    // 子项带非零 z-index 时按绘制序的逆序试命中（值大的先试，
-    // 同值保持文档序靠后者优先），与 RenderTree 的绘制顺序一致。
-    public Control HitTest(int x, int y) {
-        return this.HitTest(x, y, 0, null);
-    }
-
-    public Control HitTest(int x, int y, int pointerType) {
-        return this.HitTest(x, y, pointerType, null);
-    }
-
+    public Control HitTest(int x, int y) { return this.HitTest(x, y, 0, null); }
+    public Control HitTest(int x, int y, int pointerType) { return this.HitTest(x, y, pointerType, null); }
     public Control HitTest(int x, int y, List<Control> excludedSubtrees) {
         return this.HitTest(x, y, 0, excludedSubtrees);
     }
-
-    // One query carries exclusions through retained and borrowed input roots.
-    // It never changes authored visibility, ownership or live input state.
     public Control HitTest(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (Control.HitTestExcluded(this, excludedSubtrees)) { return null; }
         Control hit = this.HitTestCore(x, y, pointerType, excludedSubtrees);
         return Control.HitTestExcluded(hit, excludedSubtrees) ? null : hit;
     }
-
     protected static bool HitTestExcluded(Control control, List<Control> excludedSubtrees) {
         if (control == null || excludedSubtrees == null || excludedSubtrees.Count == 0) { return false; }
         Control node = control;
@@ -813,23 +653,21 @@ public partial class Control : AppLoopOwner {
         }
         return false;
     }
-
-    // pointerType: 0 = exact mouse hit, 1 = expanded touch target.
     protected virtual Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible()) { return null; }
         if (!this.ContainsPoint(x, y, pointerType)) { return null; }
         if (this.ScrollBarHit(x, y) != 0) { return this; }
-        List<Control> ordered = this.PaintChildren();
-        for (int i = ordered.Count - 1; i >= 0; i = i - 1) {
-            Control child = ordered[i];
+        int count = childNodes.Count;
+        Control onlyChild = count == 1 ? childNodes[0] : null;
+        List<Control> ordered = count > 1 ? this.PaintChildren() : null;
+        for (int i = count - 1; i >= 0; i = i - 1) {
+            Control child = ordered != null ? ordered[i] : onlyChild;
             if (!this.ChildInViewport(child)) { continue; }
             Control hit = child.HitTest(x, y, pointerType, excludedSubtrees);
             if (hit != null) { return hit; }
         }
         return this;
     }
-
-    // 按名称快速深度优先搜索，包括本节点。仅比对控件标识名，不触发属性反射/字典查询。
     public Control FindByName(string n) {
         if (n == "" || n == null) { return null; }
         if (name == n) { return this; }
@@ -839,17 +677,12 @@ public partial class Control : AppLoopOwner {
         }
         return null;
     }
-
-    // 按名称或标题文本深度优先搜索，包括本节点。找不到返回 null。
-    // 优先快速按 name 匹配（零属性查询开销）；仅当整树未按名称命中时，
-    // 才回退穿透按标题文本匹配（兼顾无 name 控件的文本寻址）。
     public Control Find(string n) {
         if (n == "" || n == null) { return null; }
         Control byName = this.FindByName(n);
         if (byName != null) { return byName; }
         return this.FindByText(n);
     }
-
     Control FindByText(string t) {
         if (this.GetProp("text") == t) { return this; }
         for (int i = 0; i < childNodes.Count; i = i + 1) {
@@ -858,61 +691,25 @@ public partial class Control : AppLoopOwner {
         }
         return null;
     }
-
-    // 子节点数。
     public int ChildCount() { return childNodes.Count; }
-
     public Control ChildAt(int index) { return childNodes[index]; }
-
     public List<Control> SnapshotChildren() {
         List<Control> snapshot = new List<Control>();
         snapshot.AddRange(childNodes);
         return snapshot;
     }
-
-    // 返回父控件（顶层控件或未挂树时返回 null）。
-    public Control Parent() {
-        return parent;
-    }
-
-    // 绘制此节点自身的视觉。基类不绘制；子类重写。
-    public virtual void OnPaint() {
-        this.OnPaint(this.App);
-    }
+    public Control Parent() { return parent; }
+    public virtual void OnPaint() { this.OnPaint(this.App); }
     public virtual void OnPaint(App app) {
     }
-
-    // 在延迟的覆盖层阶段绘制此控件的浮动/覆盖层（弹出菜单、选项列表、
-    // 提示），使其绘制在所有页面内容之上
-    // 并注册最顶层的命中区域——永不被遮挡，
-    // 也绝不把点击漏给其后绘制的控件。基类
-    // 不绘制；浮动控件重写此方法，打开期间用
-    // `app.AddOverlay(OverlayPopup.Host(this))` 延迟自身，
-    // 而不是在主阶段内联绘制弹窗。
-    public virtual void OnPaintOverlay() {
-        this.OnPaintOverlay(this.App);
-    }
+    public virtual void OnPaintOverlay() { this.OnPaintOverlay(this.App); }
     public virtual void OnPaintOverlay(App app) {
     }
-
-    // Return true when this popup handled Escape without the host's default dismissal.
-    // Called only for the current host session; blur keeps its normal retirement.
     public virtual bool OnPopupEscape(App app) { return false; }
-
-    // 浮层（下拉列表、日历卡片、颜色面板等）被外部点击或 Esc 关闭时的回调通知。
     public virtual void OnPopupDismissed() {
     }
-
-    // 是否允许外部点击时自动关闭浮层（模态对话框可通过 maskClosable 覆写为 false）。
-    public virtual bool DismissOnOutsideClick() {
-        return true;
-    }
-
-    // 根据内容/主题设置 prefW/prefH。基类为空操作；叶节点重写。
-    public virtual void OnMeasure() {
-        this.OnMeasure(this.App);
-    }
+    public virtual bool DismissOnOutsideClick() { return true; }
+    public virtual void OnMeasure() { this.OnMeasure(this.App); }
     public virtual void OnMeasure(App app) {
     }
 }
-

@@ -1,9 +1,6 @@
 using System;
 using Gui;
-
 namespace Gui;
-
-// 同一 App 的单个活动弹层；绘制、命中与遮挡共用同一份登记。
 public class OverlayHost {
     private Control activePopup;
     private weak Control activeAnchor;
@@ -13,10 +10,10 @@ public class OverlayHost {
     private int pointX;
     private int pointY;
     private int revision;
-
+    private long openedEventSeq;
+    private bool openedEventValid;
     public OverlayHost() {
     }
-
     private bool VisibleTree(Control control) {
         if (control == null || control.bw <= 0 || control.bh <= 0) { return false; }
         Control node = control;
@@ -26,25 +23,16 @@ public class OverlayHost {
         }
         return true;
     }
-
     public bool HasActive() {
         return ownerApp != null && this.VisibleTree(activePopup)
             && (!anchored || this.VisibleTree(activeAnchor));
     }
-
-    public bool IsAnchorActive(Control anchor) {
-        return this.HasActive() && activeAnchor == anchor;
-    }
-
-    public Control ActiveRoot() {
-        return this.HasActive() ? activePopup : null;
-    }
-
+    public bool IsAnchorActive(Control anchor) { return this.HasActive() && activeAnchor == anchor; }
+    public Control ActiveRoot() { return this.HasActive() ? activePopup : null; }
     public Control HitTest(int x, int y, int pointerType) {
         if (!this.HasActive()) { return null; }
         return activePopup.HitTest(x, y, pointerType);
     }
-
     private bool PopupLayoutCurrent(App app, Control popup, Control anchor, int ticket,
     Control root, int generation, long sequence, int phase, int frame) {
         return app.isRunning && ownerApp == app && app.overlayHost == this
@@ -53,7 +41,6 @@ public class OverlayHost {
         && app.window.EventSeq() == sequence && app.inputPreparationTicket == phase
         && app.frameSeq == frame;
     }
-
     private bool ArrangePopup(App app) {
         if (activePopup == null) { return true; }
         Control popup = activePopup;
@@ -110,27 +97,19 @@ public class OverlayHost {
         }
         return this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame);
     }
-
     public void Show(App app, Control anchor, Control popup) {
         this.ShowCore(app, anchor, popup, false, 0, 0);
     }
-
-    public void ShowAt(App app, Control popup, int x, int y) {
-        this.ShowCore(app, null, popup, true, x, y);
-    }
-
-    // Positioned layout with the same weak anchor retirement as Show.
+    public void ShowAt(App app, Control popup, int x, int y) { this.ShowCore(app, null, popup, true, x, y); }
     public void ShowAtAnchor(App app, Control anchor, Control popup, int x, int y) {
         this.ShowCore(app, anchor, popup, true, x, y);
     }
-
     private void ShowCore(App app, Control anchor, Control popup, bool atPoint, int x, int y) {
         if (app == null || popup == null) { return; }
         if (activePopup != null && (activePopup != popup || activeAnchor != anchor || ownerApp != app)) {
             bool sameAnchor = activeAnchor == anchor && ownerApp == app;
             int before = revision;
             this.CloseActive(!sameAnchor);
-            // A close/cancel callback that opened a new popup owns the host now.
             if (revision != before + 1) { return; }
         }
         revision = revision + 1;
@@ -145,37 +124,28 @@ public class OverlayHost {
         positioned = atPoint;
         pointX = x;
         pointY = y;
+        openedEventValid = app.window != null;
+        openedEventSeq = openedEventValid ? app.window.EventSeq() : 0;
         this.ArrangePopup(app);
         app.RequestRedraw();
     }
-
     public void Hide(Control popup) {
         if (popup != null && popup == activePopup) { this.Dismiss(); }
     }
-
-    // Root replacement preserves anchored overlays reachable through input adapters.
-    // Point popups have no anchor and keep their explicit caller-owned lifetime.
     internal void RetireAnchorOutside(Control nextRoot, int expectedRevision) {
         if (revision != expectedRevision) { return; }
         Control anchor = activeAnchor;
         if (activePopup == null || !anchored || anchor == null) { return; }
-        if (nextRoot == null || !nextRoot.ContainsInputControl(anchor)) {
-            this.CloseActive(true);
-        }
+        if (nextRoot == null || !nextRoot.ContainsInputControl(anchor)) { this.CloseActive(true); }
     }
-
     internal int RetirementRevision() { return revision; }
-
-    // Only the registration snapshotted before input retirement may be closed.
     internal void RetireAnchorIn(Control retiredRoot, int expectedRevision) {
         if (revision != expectedRevision) { return; }
         Control anchor = activeAnchor;
         if (activePopup == null || !anchored || anchor == null || retiredRoot == null) { return; }
         if (retiredRoot.ContainsInputControl(anchor)) { this.CloseActive(true); }
     }
-
     public void Dismiss() { this.CloseActive(true); }
-
     private void CloseActive(bool notifyAnchor) {
         Control anchor = activeAnchor;
         App app = ownerApp;
@@ -189,7 +159,6 @@ public class OverlayHost {
         anchored = false;
         positioned = false;
         revision = revision + 1;
-        // 先注销再通知：关闭回调允许重入；只释放旧弹层内的输入状态。
         if (hadPopup && app != null) {
             app.ReleaseInputSubtree(popup);
             app.RequestRedraw();
@@ -197,14 +166,11 @@ public class OverlayHost {
         if (hadPopup && activePopup != popup && popup.extra.popupEpoch == popupEpoch) {
             popup.OnPopupDismissed();
         }
-        // Cancellation or popup notification may have reopened the same anchor.
         if (hadPopup && notifyAnchor && anchor != null && anchor != popup && activeAnchor != anchor
                 && anchor.extra.popupEpoch == anchorEpoch) {
             anchor.OnPopupDismissed();
         }
     }
-
-    // true 表示本次关闭或遮罩已消费输入，调用方不得继续派发给底层树。
     public bool HandleInput(App app, int kind, int x, int y, int key) {
         if (app == null || ownerApp != app || activePopup == null) { return false; }
         if (!this.HasActive()) {
@@ -221,8 +187,6 @@ public class OverlayHost {
             App popupApp = popup.App;
             App sessionApp = ownerApp;
             bool handled = popup.OnPopupEscape(app);
-            // A callback may close/reopen, replace the popup, or move it to another App.
-            // The old Escape is consumed but cannot dismiss the callback's new session.
             if (revision != ticket || activePopup != popup || ownerApp != sessionApp
                     || sessionApp != app || popup.App != popupApp || app.overlayHost != this) {
                 return true;
@@ -237,28 +201,26 @@ public class OverlayHost {
         }
         return false;
     }
-
     public void Update(App app) {
         if (app != null && app.snapshotInputSilenceDepth > 0) { return; }
         if (app == null || ownerApp != app || activePopup == null) { return; }
         int kind = app.EventKind();
         int key = app.window != null ? app.window.EventKeyCode() : 0;
         if (this.HandleInput(app, kind, app.mouseX, app.mouseY, key)) {
-            if (kind == 4) { app.ClaimKey(); }
-            if (kind == 2) { app.ClaimClick(); }
+            if (kind == 4) { app.MarkKeyHandled(); }
+            if (kind == 2) { app.MarkClickHandled(); }
             return;
         }
-        // 即时表面的既有释放点击也走相同关闭状态；不另存一套事件仲裁。
-        if (!this.HasActive() || !app.ClickAvailable()) { return; }
+        if (openedEventValid && app.window != null && app.window.EventSeq() == openedEventSeq) { return; }
+        if (!this.HasActive() || !app.CanDismissOverlayOnClick()) { return; }
         Control anchor = activeAnchor;
         if (anchor != null && !anchor.DismissOnOutsideClick()) { return; }
         bool inAnchor = anchor != null && anchor.ContainsPoint(app.mouseX, app.mouseY, app.GetPointerDeviceType());
         if (!inAnchor && this.HitTest(app.mouseX, app.mouseY, app.GetPointerDeviceType()) == null) {
             this.Dismiss();
-            app.ClaimClick();
+            app.MarkClickHandled();
         }
     }
-
     internal bool PrepareLayout(App app) {
         if (app == null || ownerApp != app || activePopup == null) { return true; }
         int ticket = revision;
@@ -278,39 +240,26 @@ public class OverlayHost {
         && popup.PrepareLayoutEvents(app, true)
         && this.PopupLayoutCurrent(app, popup, anchor, ticket, root, generation, sequence, phase, frame);
     }
-
     public void RenderAll(App app) {
         if (app == null || ownerApp != app || !this.HasActive()) { return; }
         Control popup = activePopup;
         popup.RenderTree(app);
     }
-
     public static void ShowPopup(App app, Control anchor, Control popup) {
         if (app == null) { app = App.FrameApp(); }
-        if (app != null && app.overlayHost != null) {
-            app.overlayHost.Show(app, anchor, popup);
-        }
+        if (app != null && app.overlayHost != null) { app.overlayHost.Show(app, anchor, popup); }
     }
-
     public static void DismissPopup() {
         App app = App.FrameApp();
-        if (app != null && app.overlayHost != null) {
-            app.overlayHost.Dismiss();
-        }
+        if (app != null && app.overlayHost != null) { app.overlayHost.Dismiss(); }
     }
-
     public static void DismissPopupFor(App app) {
         if (app == null) { app = App.FrameApp(); }
-        if (app != null && app.overlayHost != null) {
-            app.overlayHost.Dismiss();
-        }
+        if (app != null && app.overlayHost != null) { app.overlayHost.Dismiss(); }
     }
-
     public static bool IsActiveAnchor(App app, Control anchor) {
         if (app == null) { app = App.FrameApp(); }
-        if (app != null && app.overlayHost != null) {
-            return app.overlayHost.IsAnchorActive(anchor);
-        }
+        if (app != null && app.overlayHost != null) { return app.overlayHost.IsAnchorActive(anchor); }
         return false;
     }
 }

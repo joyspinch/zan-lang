@@ -1,11 +1,9 @@
 using System;
 using Gui;
-
 namespace Gui.Widget;
-
-// Action menu or entity picker backed by one retained RichMenu. Custom content
-// uses the same OverlayHost lifetime, independent from trigger painting.
+[GuiKind("Dropdown", typeof(Dropdown<string>))]
 public class Dropdown<T> : Control {
+    public override Control CreateCloneShell() { return new Dropdown<T>(); }
     private Control customPopup;
     private List<MenuItem> menuItems;
     private List<T> data;
@@ -25,9 +23,8 @@ public class Dropdown<T> : Control {
     public UiEvent Change;
     public UiEvent Opened;
     public UiEvent Closed;
-
     private void InitDropdown() {
-        this.InitControl("dropdown", 0);
+        this.InitControl("dropdown");
         styleSurfaceOwned = true;
         wiresOwnEvents = true;
         hint = "";
@@ -44,30 +41,59 @@ public class Dropdown<T> : Control {
     }
     public Dropdown() { this.InitDropdown(); }
     public Dropdown(CellOf<T> text) { this.InitDropdown(); textOf = text; }
+    public List<T> ItemsSource {
+        get { return this.data; }
+        set { this.Bind(value); }
+    }
+    public List<MenuItem> MenuItems {
+        get { return this.menuItems; }
+        set { this.BindMenu(value); }
+    }
+    public CellOf<T> TextSelector {
+        get { return this.textOf; }
+        set { this.textOf = value; }
+    }
+    public string Placeholder {
+        get { return this.hint; }
+        set { this.hint = value; }
+    }
+    public int MaxVisibleRows {
+        get { return this.maxRows; }
+        set { if (value > 0) { this.maxRows = value; } }
+    }
+    public int SelectedIndexValue {
+        get { return this.selIndex; }
+        set { this.SelectIndex(value); }
+    }
+    public Control PopupContent {
+        get { return this.customPopup; }
+        set { this.SetPopupContent(value); }
+    }
+    public bool IsOpened {
+        get { return this.opened; }
+        set { this.SetOpen(value); }
+    }
     public override string Kind() { return "Dropdown"; }
     public override string StyleType() { return "select"; }
     public override int InputFocusCapabilities() { return 1; }
     public override bool ChildControlsRenderedByOwner() { return true; }
-
-    public Dropdown<T> Bind(List<T> source) {
+    public void Bind(List<T> source) {
         data = source;
         menuItems = null;
         selIndex = -1;
-        return this;
     }
-    public Dropdown<T> BindMenu(List<MenuItem> value) {
+    public void BindMenu(List<MenuItem> value) {
         menuItems = value;
         data = null;
         selIndex = -1;
         lastAction = -1;
-        return this;
     }
-    public Dropdown<T> OnChange(Action callback) { Change.Add(callback); return this; }
-    public Dropdown<T> OnOpen(Action callback) { Opened.Add(callback); return this; }
-    public Dropdown<T> OnClose(Action callback) { Closed.Add(callback); return this; }
-    public Dropdown<T> Hint(string text) { hint = text; return this; }
-    public Dropdown<T> Label(CellOf<T> text) { textOf = text; return this; }
-    public Dropdown<T> Rows(int count) { if (count > 0) { maxRows = count; } return this; }
+    public void OnChange(Action callback) { Change.Add(callback); }
+    public void OnOpen(Action callback) { Opened.Add(callback); }
+    public void OnClose(Action callback) { Closed.Add(callback); }
+    public void Hint(string text) { hint = text; }
+    public void Label(CellOf<T> text) { textOf = text; }
+    public void Rows(int count) { if (count > 0) { maxRows = count; } }
     public int Count() {
         if (menuItems != null) { return menuItems.Count; }
         return data != null ? data.Count : 0;
@@ -77,15 +103,22 @@ public class Dropdown<T> : Control {
     public T Selected() { return selItem; }
     public int Action() { return lastAction; }
     public void SelectIndex(int row) {
+        if (menuItems != null && row >= 0 && row < menuItems.Count) {
+            selIndex = row;
+            lastAction = menuItems[row].action;
+            Change.RaiseS(this);
+            return;
+        }
         if (data == null || row < 0 || row >= data.Count) { return; }
+        if (selIndex == row) { return; }
         selIndex = row;
         selItem = data[row];
+        Change.RaiseS(this);
     }
     public void Clear() { selIndex = -1; lastAction = -1; }
     public bool IsOpen() { return opened; }
     public int Session() { return generation; }
     public RichMenu MenuControl() { return retainedMenu; }
-
     public void SetOpen(bool want) {
         if (want == opened) { return; }
         if (!want) {
@@ -116,17 +149,13 @@ public class Dropdown<T> : Control {
         if (app.overlayHost.ActiveRoot() != popup) { this.OnPopupDismissed(); return; }
         sessionBridge.session = session;
         registration = app.RegisterLoopParticipant(this, sessionBridge);
-        app.ClaimClick();
         app.RequestRedraw();
         Opened.RaiseS(this);
     }
     public void Open() { this.SetOpen(true); }
     public void Close() { this.SetOpen(false); }
-
     public override void OnPopupDismissed() {
         if (!opened) { return; }
-        // RichMenu selection retires its registration before notifying its action.
-        // The anchor sees that retirement first; selection commits Change/Closed.
         if (activePopup == retainedMenu && retainedMenu.IsSelecting()) { return; }
         this.CommitClosed();
         Closed.RaiseS(this);
@@ -167,20 +196,21 @@ public class Dropdown<T> : Control {
         return hint;
     }
     public override void OnMeasure(App app) {
+        this.SyncBinding();
         StyleBox normal = this.Box(app);
         prefH = normal.HeightOr(app.theme.heightMedium);
         prefW = normal.WidthOr(app.Scale(160));
     }
     public override void OnPaint(App app) {
+        this.SyncBinding();
         app = this.ResolveApp(app);
         if (app == null || app.canvas == null || bw <= 0 || bh <= 0) { return; }
         StyleBox normal = this.Box(app);
-        int state = Style.StateOf(app, this.WidgetId(), this.IsDisabled());
+        int state = this.WidgetState(app);
         if (opened || isHovered) { state = state | Style.SHover(); }
         if (opened) { state = state | Style.SSelected(); }
         StyleBox box = this.BoxState(app, state);
         box.Paint(app, bx, by, bw, bh);
-
         Rect content = DropdownChrome.ContentBounds(this, normal, app.theme.paddingMedium);
         StyleBox arrowNormal = this.ResolvePart(app, "arrow", "", Style.SNormal());
         StyleBox arrow = this.ResolvePart(app, "arrow", "", state);
@@ -209,7 +239,6 @@ public class Dropdown<T> : Control {
         base.OnPointerLeave(e);
         if (this.App != null) { this.App.RequestRedraw(); }
     }
-
     public List<MenuItem> SyncItems() { return this.SyncItems(this.App); }
     public List<MenuItem> SyncItems(App app) {
         if (menuItems != null) { return menuItems; }
@@ -218,7 +247,32 @@ public class Dropdown<T> : Control {
         for (int i = 0; i < data.Count; i = i + 1) { result.Add(MenuItem.Item(textOf(data[i]), "", i)); }
         return result;
     }
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Int("value", "Selected Index").DefaultBinding().ViaExtra().Also("data").Also("sel").Also("selected"));
+        ps.Add(PropSpec.Text("options", "Options").ViaExtra());
+        ps.Add(PropSpec.Text("placeholder", "Placeholder").Field("hint", 0).Also("hint"));
+        return ps;
+    }
+    public override string GetProp(string key) {
+        if (key == "value" || key == "data" || key == "sel" || key == "selected") {
+            return Convert.ToString(this.selIndex);
+        }
+        if (key == "placeholder" || key == "hint") { return this.hint; }
+        return base.GetProp(key);
+    }
+    public override void SetProp(string key, string val) {
+        if (key == "value" || key == "data" || key == "sel" || key == "selected") {
+            this.SelectIndex(Convert.ToInt32(val));
+            return;
+        }
+        if (key == "placeholder" || key == "hint") { this.hint = val; return; }
+        base.SetProp(key, val);
+    }
     public override string GetExtra(string key) {
+        if (key == "value" || key == "data" || key == "sel" || key == "selected") {
+            return Convert.ToString(this.selIndex);
+        }
         if (key != "options" || menuItems == null) { return ""; }
         string result = "";
         for (int i = 0; i < menuItems.Count; i = i + 1) {
@@ -228,6 +282,10 @@ public class Dropdown<T> : Control {
         return result;
     }
     public override bool SetExtra(string key, string value) {
+        if (key == "value" || key == "data" || key == "sel" || key == "selected") {
+            this.SelectIndex(Convert.ToInt32(value));
+            return true;
+        }
         if (key != "options") { return false; }
         List<MenuItem> result = new List<MenuItem>();
         if (value != null && value.Length > 0) {

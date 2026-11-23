@@ -2,108 +2,30 @@ using System;
 using System.Json;
 using System.Collections.Generic;
 using Gui;
-using Gui.Markup;
-
 namespace Gui;
-
-// 用户组件的运行期注册表。编译期展开已移除；声明式用法走
-// Html.Parse 统一单跳管线，这里是动态一侧：
-// 应用不重编译就能按名实例化 components/*.zcomp（WinForms
-// UserControl 的动态加载形态）。构建走 Html.Parse，
-// 属性应用与设计器预览共用同一语义：
-// 实例值优先，缺省取声明的 def，落到声明的目标控件上。
-public class UserComponentRegistry {
-    static List<UserComponent> components;
-    private static List<string> building;
-
-    private static Control CreateRegistered(string kind) { return Build(kind); }
-
-    private static void RegisterFactory(string name) {
-        ControlFactory.Register(name, CreateRegistered);
+public partial class UserComponentRegistry {
+    static List<UserComponent> Components() {
+        GuiCoreState state = GuiCoreState.Current();
+        if (state.userComponents == null) { state.userComponents = new List<UserComponent>(); }
+        return state.userComponents;
     }
-
-    static void EnsureInit() {
-        if (components == null) {
-            components = new List<UserComponent>();
-        }
-    }
-
-    // 注册/替换一个组件文档（.zcomp 原文，支持 HTML 或 JSON）。
-    static void Register(string name, string json) {
-        EnsureInit();
+    public static void RegisterDefinition(string name, string doc) {
+        List<UserComponent> components = UserComponentRegistry.Components();
         for (int i = 0; i < components.Count; i = i + 1) {
             if (components[i].name.ToLower() == name.ToLower()) {
-                components[i].json = json;
-                RegisterFactory(name);
+                components[i].json = doc;
                 return;
             }
         }
-        components.Add(new UserComponent(name, json));
-        RegisterFactory(name);
+        components.Add(new UserComponent(name, doc));
     }
-
-    // 批量装载（与 Designer.SetUserComponents 同源）。
-    static void SetAll(List<UserComponent> comps) {
-        EnsureInit();
-        components.Clear();
-        for (int i = 0; i < comps.Count; i = i + 1) {
-            components.Add(new UserComponent(comps[i].name, comps[i].json));
-            RegisterFactory(comps[i].name);
-        }
-    }
-
-    // 组件名对应的文档原文；未注册返回 ""。
     static string JsonOf(string name) {
-        EnsureInit();
+        List<UserComponent> components = UserComponentRegistry.Components();
         for (int i = 0; i < components.Count; i = i + 1) {
             if (components[i].name.ToLower() == name.ToLower()) { return components[i].json; }
         }
         return "";
     }
-
-    // 实例化：按组件文档经 Html.Parse 建整棵控件树并应用声明
-    // 属性（无实例值时用默认值）。未注册/解析
-    // 失败返回 null。instanceProps 键 = 声明的 key，可为 null。
-    static Control Build(string name, JsonValue instanceProps) {
-        string doc = JsonOf(name);
-        if (doc == "") { return null; }
-        if (building == null) { building = new List<string>(); }
-        string key = name.ToLower();
-        for (int i = 0; i < building.Count; i = i + 1) {
-            if (building[i] == key) {
-                throw new InvalidOperationException("Circular user component reference: " + name);
-            }
-        }
-        building.Add(key);
-        try {
-            string html = doc.Trim();
-            JsonValue root = null;
-            if (html.StartsWith("<")) {
-                root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(html, "")));
-            } else {
-                root = JsonValue.ParseLenient(doc);
-                if (root == null || !root.IsObject()) { return null; }
-                html = DesignerHtml.FromJsonDoc(doc);
-            }
-            if (root == null || !root.IsObject()) { return null; }
-            HtmlDoc parsed = Html.Parse(html, "", null);
-            if (parsed == null || parsed.root == null) { return null; }
-            Control control = new UserComponentControl(name, root, parsed);
-            ApplyProps(control, root, instanceProps);
-            return control;
-        } finally {
-            building.RemoveAt(building.Count - 1);
-        }
-    }
-
-    static Control Build(string name) {
-        return Build(name, null);
-    }
-
-    // 属性应用：遍历组件文档根的 "props" 声明，
-    // 实例值优先，缺省取 def，SetProp 到目标控件
-    // （按组件文档里的原始名查找）。与设计器预览
-    // 同用此入口。
     static void ApplyProps(Control root, JsonValue compRoot,
                            JsonValue instanceProps) {
         JsonValue decls = compRoot.Get("props");

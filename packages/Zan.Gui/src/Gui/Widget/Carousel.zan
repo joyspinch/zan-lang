@@ -1,59 +1,31 @@
 using System;
 using Gui;
 using Gui.Backend;
-
 namespace Gui.Widget;
-
-// 轮播图控件：文字页（AddSlide）与控件页（AddSlideView）混排，当前页
-// 经 Index 双向绑定；上一张/下一张箭头与指示点由覆盖层 CarouselChrome
-// 绘制并处理点击，autoplay / dotPlacement / direction 见各字段。
+[GuiKind("Carousel")]
 public class Carousel : Control {
-    // 文字页标题（与 AddSlideView 的控件页共用一个列表，
-    // 控件页标题为空串）。
+    public override Control CreateCloneShell() { return new Carousel(); }
     public List<string> slides;
-    // 当前页索引（0 基；越界绘制时钳到首/尾页）。
-
-    // 双向绑定的当前页索引。
     public Binding<int> Index;
-    // 过渡状态（Animate 传入）；null = 直接切换不滑动。autoplay
-    // 计时也寄存在它里面。
     public CarouselAnim anim;
-    // 当前页变化时触发（点击、GoTo、autoplay）。
     public UiEvent Change;
-    // 自动播放：每 intervalMs 毫秒翻到下一页（Naive UI autoplay）。
     public bool autoplay;
-    // 自动播放间隔（毫秒）。默认 3000。
     public int intervalMs;
-    // 指示点位置：bottom / top / left / right（Naive UI dot-placement）。
     public string dotPlacement;
-    // 滑动方向：horizontal（默认，左右滑）/ vertical（上下滑，
-    // Naive UI direction）。
     public string direction;
-    // 上次翻页时刻（autoplay 用）；有 anim 时寄存在 CarouselAnim.tickMs，
-    // 随宿主持有的状态跨帧存活。
     private int lastTickMs;
     private bool autoplayClockReady;
     private int autoplayDeadline;
     private int animationDeadline;
-    // 循环参与者票据：autoplay 计时与过渡推进在 App 循环阶段完成，
-    // 绘制不再推进任何状态。
     internal AppLoopRegistration driverRegistration;
-    // Arrange 阶段算好的过渡快照，Paint 只消费。
     private int prepFrom;
     private int prepTo;
     private int prepShift;
     private int prepDir;
-    // 箭头/指示点覆盖层：始终是最后一个子控件，见 CarouselChrome。
     public CarouselChrome chrome;
-    // 控件页（AddSlideView 加入）：与 slides 平行的子控件列表。页面
-    // 就是真正的控件（典型是 Gui.Widget.Image——文件路径 / data URI /
-    // http(s) URL / SVG 的地址语义全部由 Image 承担），由轮播负责
-    // 排布、可见性与过渡。null = 全部是文字页。
     public List<Control> slideViews;
-
-    // 初始化：置默认值（autoplay 关、间隔 3000ms、圆点在底部、横向滑动）。
     private void InitCarousel(Binding<int> index) {
-        this.InitControl("carousel", 1);
+        this.InitControl("carousel");
         slides = new List<string>();
         Index = 0;
         if (index != null) { Index = index; }
@@ -74,46 +46,44 @@ public class Carousel : Control {
         prepTo = 0;
         prepShift = 0;
         prepDir = 1;
-        // chrome 惰性挂载：首次 Arrange 时滑片都已 Add 完，把它追加为
-        // 最后一个子控件，绘制顺序才能压在控件页（如 Image）之上。
         chrome = null;
     }
-
-    // 空轮播（之后 AddSlide/AddSlideView）。
     public Carousel() { InitCarousel(0); }
-
-    // 共享当前页信号。
     public Carousel(Binding<int> index) { InitCarousel(index); }
-
-    // 纵向轮播？上下滑动、箭头朝上/下。
+    public string DirectionMode {
+        get { return direction; }
+        set { direction = value != null ? value : "horizontal"; }
+    }
+    public bool IsAutoplay {
+        get { return autoplay; }
+        set { autoplay = value; }
+    }
+    public int IntervalMs {
+        get { return intervalMs; }
+        set { if (value > 0) { intervalMs = value; } }
+    }
+    public string DotPlacement {
+        get { return dotPlacement; }
+        set { dotPlacement = value != null ? value : "bottom"; }
+    }
+    public CarouselAnim AnimState {
+        get { return anim; }
+        set { anim = value; }
+    }
     public bool Vert() { return direction == "vertical"; }
-
-    // 设定滑动方向："horizontal"（默认）/ "vertical"。返回自身便于链式。
-    public Carousel Direction(string d) { direction = d; return this; }
-
-    // 命名为 AddSlide（而非 Add），以免遮蔽 Control.Add(Control)。
-    // 追加一个纯文字页。
+    public void Direction(string d) { direction = d; }
     public void AddSlide(string label) {
         slides.Add(label);
         if (slideViews != null) { slideViews.Add(null); }
     }
-
-    // 加入一个控件页：v 成为轮播的子控件并占满整个轮播框，裁剪与
-    // 过渡动画由轮播管理。与 AddSlide 可混用（控件页的标题留空）。
-    // chrome 已挂载时把它挪回末位——晚加的页不能排到覆盖层之后，
-    // 否则又会被页盖住。
     public void AddSlideView(Control v) {
         if (slideViews == null) { slideViews = new List<Control>(); }
         while (slideViews.Count < slides.Count) { slideViews.Add(null); }
         slides.Add("");
         slideViews.Add(v);
         this.Add(v);
-        if (chrome != null) {
-            this.MoveChild(chrome, this.ChildCount() - 1);
-        }
+        if (chrome != null) { this.MoveChild(chrome, this.ChildCount() - 1); }
     }
-
-    // 从标题列表构建文字页轮播构造器。
     public Carousel(List<string> labels, Binding<int> index) : this(index) {
         if (labels != null) {
             for (int i = 0; i < labels.Count; i = i + 1) {
@@ -121,37 +91,13 @@ public class Carousel : Control {
             }
         }
     }
-
-    // 开启页面过渡：`state` 由宿主持有（可每帧重建控件），
-    // 传 null 关闭过渡（直接切换）。
-    public Carousel Animate(CarouselAnim state) {
-        anim = state;
-        return this;
-    }
-
-    // 当前页下标（0-based）。
-    public int CurrentIndex() {
-        return Index.Get();
-    }
-
-    // 翻页（编程入口）：越界回绕到头/尾，变化时触发 Change。
-    public void Prev() {
-        this.GoTo(this.App, Index.Get() - 1);
-    }
-    public void Next() {
-        this.GoTo(this.App, Index.Get() + 1);
-    }
-    public void Prev(App app) {
-        this.GoTo(app, Index.Get() - 1);
-    }
-    public void Next(App app) {
-        this.GoTo(app, Index.Get() + 1);
-    }
-
-    public void GoTo(int i) {
-        this.GoTo(this.App, i);
-    }
-
+    public void Animate(CarouselAnim state) { anim = state; }
+    public int CurrentIndex() { return Index.Get(); }
+    public void Prev() { this.GoTo(this.App, Index.Get() - 1); }
+    public void Next() { this.GoTo(this.App, Index.Get() + 1); }
+    public void Prev(App app) { this.GoTo(app, Index.Get() - 1); }
+    public void Next(App app) { this.GoTo(app, Index.Get() + 1); }
+    public void GoTo(int i) { this.GoTo(this.App, i); }
     public void GoTo(App app, int i) {
         app = this.ResolveApp(app);
         int count = slides.Count;
@@ -165,16 +111,9 @@ public class Carousel : Control {
         this.PrepareDeadlines(Window.GetTickMs());
         if (driverRegistration != null) { driverRegistration.Reschedule(); }
         Change.RaiseS(this);
-        if (app != null) {
-            app.RequestRedraw();
-        }
+        if (app != null) { app.RequestRedraw(); }
     }
-
-    // 过渡时长（毫秒）：旧实现按 10 帧推进，60Hz 下约 160ms。
     internal int TransitionMs() { return 160; }
-
-    // Index 变化后启动过渡（GoTo 与准备阶段共用）：纯状态机推进，无绘制
-    // 副作用；过渡进行中再次翻页维持原方向，与旧绘制探测的行为一致。
     void UpdateTransition(App app, int cur) {
         if (anim == null || anim.animating || anim.shown == cur) { return; }
         int count = slides.Count;
@@ -186,14 +125,12 @@ public class Carousel : Control {
         else { anim.dir = 1; }
         if (app != null) { app.RequestRedraw(); }
     }
-
     bool HostedBy(App app) {
         if (app == null || !app.isRunning || this.FindApp() != app) { return false; }
         if (app.rootControl != null && app.rootControl.ContainsInputControl(this)) { return true; }
         Control popup = app.overlayHost != null ? app.overlayHost.ActiveRoot() : null;
         return popup != null && popup.ContainsInputControl(this);
     }
-
     void PrepareDeadlines(int now) {
         if (autoplay && slides.Count > 1) {
             if (!autoplayClockReady) {
@@ -209,7 +146,6 @@ public class Carousel : Control {
         animationDeadline = anim != null && anim.animating
             ? Math.Min(now + 16, anim.startMs + TransitionMs()) : -1;
     }
-
     void EnsureDriver(App app) {
         if (app == null || !app.isRunning) { return; }
         if (driverRegistration != null && driverRegistration.active) {
@@ -218,7 +154,6 @@ public class Carousel : Control {
         }
         driverRegistration = app.RegisterLoopParticipant(this, new CarouselDriver(this));
     }
-
     internal void LoopTick(App app, int now) {
         if (!this.HostedBy(app)) {
             if (driverRegistration != null && driverRegistration.host == app) {
@@ -244,8 +179,6 @@ public class Carousel : Control {
         }
         this.PrepareDeadlines(now);
     }
-
-    // Pure read: querying a deadline never restarts either clock.
     internal int LoopDeadline() {
         App app = driverRegistration != null ? driverRegistration.host : null;
         if (!this.HostedBy(app)) { return -1; }
@@ -253,10 +186,6 @@ public class Carousel : Control {
         if (animationDeadline < 0) { return autoplayDeadline; }
         return Math.Min(autoplayDeadline, animationDeadline);
     }
-
-    // 覆写：占满给定矩形，按准备好的过渡快照摆控件页（首绘/首输入前
-    // 就有正确几何与可见性）；首次排布时把覆盖层惰性挂载为最后一个
-    // 子控件（压在所有页之上）。
     public override void Arrange(int px, int py, int pw, int ph) {
         if (pw < 0) { pw = 0; }
         if (ph < 0) { ph = 0; }
@@ -273,8 +202,6 @@ public class Carousel : Control {
         if (cur < 0) { cur = 0; }
         if (cur >= count) { cur = count - 1; }
         this.UpdateTransition(app, cur);
-        // 过渡快照：静止帧位移为 0；过渡帧给出离开/进入页的位置参数，
-        // 摆页与绘制共用同一份数据。
         prepFrom = cur;
         prepTo = cur;
         prepShift = 0;
@@ -289,9 +216,7 @@ public class Carousel : Control {
             prepShift = span * prog / 1000;
             prepDir = anim.dir;
         }
-        if (slideViews != null) {
-            this.ShowSlides(prepFrom, prepTo, prepShift, prepDir);
-        }
+        if (slideViews != null) { this.ShowSlides(prepFrom, prepTo, prepShift, prepDir); }
         if (chrome == null) {
             chrome = new CarouselChrome(this);
             this.Add(chrome);
@@ -302,12 +227,8 @@ public class Carousel : Control {
             driverRegistration.Reschedule();
         }
     }
-
-    // 覆写：把 dotPlacement/纵向映射为 Class 片段后量取样式，
-    // 未指定时兜底 320x160。
     public override void OnMeasure(App app) {
         string origClass = Class;
-        // 等规则移动指示点位置。
         if (dotPlacement == "top") { this.AddClass("dots-top"); }
         else if (dotPlacement == "left") { this.AddClass("dots-left"); }
         else if (dotPlacement == "right") { this.AddClass("dots-right"); }
@@ -318,10 +239,6 @@ public class Carousel : Control {
         prefH = s.HeightOr(app.Scale(160));
         Class = origClass;
     }
-
-    // 覆写：绘制只消费 Arrange 准备好的过渡快照（文字页按快照位置
-    // 绘制；控件页由子树自绘，位置与可见性已在 ShowSlides 摆好）。
-    // autoplay 计时与过渡推进都在循环阶段完成，这里不推进任何状态。
     public override void OnPaint(App app) {
         Canvas c = app.canvas;
         if (slides.Count == 0) { return; }
@@ -344,15 +261,7 @@ public class Carousel : Control {
             this.PaintSlide(app, bx, by, prepTo);
         }
         c.PopClip();
-
-        // 箭头/指示点由覆盖层子控件在子树绘制阶段画，天然位于
-        // 控件页（图片页）之上；命中处理也在覆盖层里。
     }
-
-    // 让控件页与过渡快照一致：静止帧只有当前页可见（占满轮播框）；
-    // 过渡帧离开页沿滑动轴停在 bx/by - dir*shift、进入页从进入位
-    // bx/by + dir*(span - shift) 一同滑入，其余页隐藏。与文字页的
-    // 绘制位置保持同一几何，控件页和文字页过渡行为一致。
     public void ShowSlides(int from, int to, int shift, int dir) {
         if (slideViews == null) { return; }
         int span = this.Vert() ? bh : bw;
@@ -375,10 +284,6 @@ public class Carousel : Control {
             }
         }
     }
-
-    // 在任意位置绘制一张文字页（主体 + 居中标签），过渡时可并排
-    // 绘制离开和进入的面板。控件页自己会画（RenderTree 的子树
-    // 遍历），这里只负责文字页。
     private void PaintSlide(App app, int x, int y, int i) {
         if (slideViews != null && i < slideViews.Count
             && slideViews[i] != null) {
@@ -396,7 +301,6 @@ public class Carousel : Control {
                                         Class + " " + role, Style.SNormal());
         StyleBox caption = this.ResolvePartAs(app, "carousel", "caption", "",
                                               Class, Style.SNormal());
-        // 裁剪到幻灯片区域，防止长标签溢出边界。
         c.PushClip(x, y, bw, bh);
         c.FillRoundRect(x, y, bw, bh, s.RadiusOr(t.borderRadiusLarge), s.BgOr(0));
         int fs = caption.FontOr(
@@ -406,29 +310,13 @@ public class Carousel : Control {
                    slides[i], caption.FgOr(0), fs);
         c.PopClip();
     }
-
-    // ---- 设计器 / 序列化模型 ----
-
-    // 控件类型标识（序列化/设计器用）。
     public override string Kind() { return "Carousel"; }
-
-    // 覆写：返回设计器属性清单（slides/index/autoplay/interval/
-    // dotPlacement/direction）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
         ps.Add(PropSpec.Text("slides", "Slide labels (comma separated)"));
-        PropSpec idx = PropSpec.Int("index", "Active slide");
-        // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        idx.Field("Index", 1);
-        ps.Add(idx);
-        PropSpec ap = PropSpec.Bool("autoplay", "Autoplay");
-        ap.Field("autoplay", 2);
-        ap.WithTip("Auto-advance every intervalMs (Naive UI autoplay).");
-        ps.Add(ap);
-        PropSpec iv = PropSpec.Int("interval", "Interval (ms)");
-        iv.Field("intervalMs", 1);
-        iv.Step(100, 500, 60000);
-        ps.Add(iv);
+        ps.Add(PropSpec.Int("index", "Active slide").Field("Index", 1));
+        ps.Add(PropSpec.Bool("autoplay", "Autoplay").Field("autoplay", 2).WithTip("Auto-advance every intervalMs (Naive UI autoplay)."));
+        ps.Add(PropSpec.Int("interval", "Interval (ms)").Field("intervalMs", 1).Step(100, 500, 60000));
         PropSpec dp = PropSpec.Enum("dotPlacement", "Dot placement",
             new List<string>{ "bottom", "top", "left", "right" });
         dp.Field("dotPlacement", 0);
@@ -439,38 +327,25 @@ public class Carousel : Control {
         ps.Add(dr);
         return ps;
     }
-
-    // 幻灯片是列表，因此以逗号分隔的值序列化
-    // （`slides` 键；页索引走 Props 的 index 属性）。
     public override string GetExtra(string key) {
         if (key == "slides") { return string.Join(",", slides); }
         return "";
     }
-
-    // 设计器写入 `slides`（逗号分隔标题）；其他键返回 false。
     public override bool SetExtra(string key, string val) {
         if (key == "slides") { slides = val.Split(","); return true; }
         return false;
     }
-
-    // 覆写：公共事件之外提供 "Change"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
         return e;
     }
-
-    // 覆写："Change" 挂 Change 事件，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         base.BindEvent(evt, a);
     }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         base.BindEventS(evt, a);
     }
-
 }

@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using Gui.Backend;
 namespace Gui;
-
 public partial class App {
     internal int snapshotInputSilenceDepth;
     internal int preparingInputDepth;
@@ -24,12 +23,10 @@ public partial class App {
     private long preparedEventSequence;
     private int preparedRootGeneration;
     private weak Control preparedRoot;
-
     internal bool HostPhaseCurrent(AppLoopRegistration ticket, AppPreparationProof proof, int revision) {
         return hostLayoutRevision == revision && this.CurrentHostLayout() == ticket
             && (ticket == null || (proof != null && proof.Current(this)));
     }
-
     private bool PreparationProofsCurrent(List<AppPreparationProof> proofs) {
         if (proofs == null) { return true; }
         for (int i = 0; i < proofs.Count; i = i + 1) {
@@ -37,7 +34,6 @@ public partial class App {
         }
         return true;
     }
-
     private List<AppLoopRegistration> PreparationTickets() {
         List<AppLoopRegistration> snapshot = new List<AppLoopRegistration>();
         if (loopParticipants != null) {
@@ -47,17 +43,13 @@ public partial class App {
         }
         return snapshot;
     }
-
     internal bool PreparationInputCurrent(int ticket, long sequence) {
         return isRunning && inputPreparationTicket == ticket && window.EventSeq() == sequence;
     }
-
-    // A participant's callback superseded its prepared work; stop this turn's tail.
     public void InvalidatePreparation() {
         this.CheckLoopThread();
         inputPreparationTicket = inputPreparationTicket + 1;
     }
-
     internal AppLoopRegistration CurrentHostLayout() {
         if (loopParticipants == null) { return null; }
         for (int i = loopParticipants.Count - 1; i >= 0; i = i - 1) {
@@ -66,10 +58,8 @@ public partial class App {
         }
         return null;
     }
-
     private bool SyncPreparationHostLayout(bool forInput) {
         AppLoopRegistration ticket = this.CurrentHostLayout();
-        // Custom hosts share the same model phase before optional view layout.
         if (ticket == null) { return this.SyncModelHosts(); }
         int revision = hostLayoutRevision;
         AppPreparationProof proof = new AppPreparationProof(ticket);
@@ -77,7 +67,6 @@ public partial class App {
         bool complete = ((AppHostLayout)participant).SyncLayout(this, forInput);
         return complete && this.HostPhaseCurrent(ticket, proof, revision);
     }
-
     private bool PrepareRetainedLayout() {
         Control root = rootControl;
         int generation = inputRootGeneration;
@@ -91,7 +80,6 @@ public partial class App {
         return rootControl == root && inputRootGeneration == generation && window.EventSeq() == sequence
             && inputPreparationTicket == phase && frameSeq == frame;
     }
-
     internal bool PrepareInputParticipants(int kind, long sequence) {
         this.CheckLoopThread();
         inputPreparationTicket = inputPreparationTicket + 1;
@@ -104,7 +92,6 @@ public partial class App {
         AppPreparationProof hostProof = hostTicket != null ? new AppPreparationProof(hostTicket) : null;
         List<AppPreparationProof> visited = new List<AppPreparationProof>();
         try {
-            // Root installation is legal here: no target/focus/capture snapshot exists yet.
             if (!this.PrepareChromeTree() || !this.PreparationInputCurrent(phase, sequence)
                 || generation != loopGeneration
                 || !this.HostPhaseCurrent(hostTicket, hostProof, revision)) { return false; }
@@ -133,14 +120,12 @@ public partial class App {
                 && this.PreparationProofsCurrent(visited);
         } finally { preparingInputDepth = preparingInputDepth - 1; }
     }
-
     private bool PaintPreparationCurrent(int generation, int inputTicket, long sequence,
             int frame, int rootGeneration, Control root) {
         return isRunning && generation == loopGeneration && inputTicket == inputPreparationTicket
             && sequence == window.EventSeq() && frame == frameSeq
             && rootGeneration == inputRootGeneration && root == rootControl;
     }
-
     private bool PreparePaintParticipants() {
         this.CheckLoopThread();
         if (preparingPaintParticipants) { throw new InvalidOperationException("frame preparation during preparation"); }
@@ -154,13 +139,17 @@ public partial class App {
         int frame = frameSeq;
         int rootGeneration = inputRootGeneration;
         Control root = rootControl;
-        List<AppLoopRegistration> tickets = this.PreparationTickets();
+        List<AppLoopRegistration> tickets = formPaintFrame ? null : this.PreparationTickets();
         AppLoopRegistration hostTicket = this.CurrentHostLayout();
         int revision = hostLayoutRevision;
         AppPreparationProof hostProof = hostTicket != null ? new AppPreparationProof(hostTicket) : null;
-        List<AppPreparationProof> visited = new List<AppPreparationProof>();
+        List<AppPreparationProof> visited = formPaintFrame ? null : new List<AppPreparationProof>();
         try {
-            // Chrome may install its borrowed input adapter before the frame proof.
+            if (formPaintFrame) {
+                this.SavePaintPreparation(hostTicket, hostProof, visited, revision, generation,
+                    inputTicket, sequence, frame, rootGeneration, root);
+                return true;
+            }
             if (!this.PrepareChromeTree()
                 || !this.PaintPreparationCurrent(generation, inputTicket, sequence, frame,
                     inputRootGeneration, rootControl)
@@ -191,23 +180,28 @@ public partial class App {
                 && this.HostPhaseCurrent(hostTicket, hostProof, revision)
                 && this.PreparationProofsCurrent(visited);
             if (complete) {
-                preparedHostFrameValid = true;
-                preparedHostFrame = frame;
-                preparedHostTicket = hostTicket;
-                preparedHostGeneration = hostTicket != null ? hostTicket.generation : 0;
-                preparedHostRevision = revision;
-                preparedHostProof = hostProof;
-                preparedPaintProofs = visited;
-                preparedLoopGeneration = generation;
-                preparedInputTicket = inputTicket;
-                preparedEventSequence = sequence;
-                preparedRootGeneration = rootGeneration;
-                preparedRoot = root;
+                this.SavePaintPreparation(hostTicket, hostProof, visited, revision, generation,
+                    inputTicket, sequence, frame, rootGeneration, root);
             }
             return complete;
         } finally { preparingPaintParticipants = false; }
     }
-
+    private void SavePaintPreparation(AppLoopRegistration ticket, AppPreparationProof proof,
+            List<AppPreparationProof> visited, int revision, int generation, int inputTicket,
+            long sequence, int frame, int rootGeneration, Control root) {
+        preparedHostFrameValid = true;
+        preparedHostFrame = frame;
+        preparedHostTicket = ticket;
+        preparedHostGeneration = ticket != null ? ticket.generation : 0;
+        preparedHostRevision = revision;
+        preparedHostProof = proof;
+        preparedPaintProofs = visited;
+        preparedLoopGeneration = generation;
+        preparedInputTicket = inputTicket;
+        preparedEventSequence = sequence;
+        preparedRootGeneration = rootGeneration;
+        preparedRoot = root;
+    }
     internal bool HostLayoutPrepared(AppLoopRegistration ticket) {
         return ticket != null && preparedHostFrameValid && !preparationFrameAborted
             && preparedHostFrame == frameSeq && preparedHostTicket == ticket
@@ -217,9 +211,6 @@ public partial class App {
             && this.PaintPreparationCurrent(preparedLoopGeneration, preparedInputTicket,
                 preparedEventSequence, preparedHostFrame, preparedRootGeneration, preparedRoot);
     }
-
-    // After each host render callback, continue only while the saved preparation proofs hold.
-    // False abandons the frame tail and presentation; an unprepared manual frame stays compatible.
     public bool ContinuePreparedFrame() {
         if (preparationFrameAborted) { return false; }
         if (!preparedHostFrameValid) { return true; }
@@ -232,15 +223,11 @@ public partial class App {
         this.AbortPreparationFrame();
         return false;
     }
-
-    // Custom hosts call after BeginFrame and before drawing, after business updates.
-    // Runs optional owner layout; false abandons this frame, including presentation.
     public bool PrepareStandardHostFrame() {
         if (this.PreparePaintParticipants()) { return true; }
         this.AbortPreparationFrame();
         return false;
     }
-
     internal void TracePreparationFailure(string boundary) {
         if (!preparedHostFrameValid || preparationFrameAborted
             || !this.AutomationPreparationPending()) { return; }
@@ -259,8 +246,8 @@ public partial class App {
             + " rootSame=" + Convert.ToString(preparedRoot == rootControl));
         } catch (Exception ex) { }
     }
-
     internal void AbortPreparationFrame() {
+        this.ResetFormRegion();
         this.TracePreparationFailure("abort");
         preparationFrameAborted = true;
         preparedHostFrameValid = false;
@@ -271,7 +258,6 @@ public partial class App {
         this.RequestRedraw();
         if (offscreenFrameActive) { this.CancelOffscreenFrame(); }
     }
-
     internal void CheckPreparationFrameEntry() {
         if (preparingPaintParticipants) { throw new InvalidOperationException("reentrant BeginFrame during preparation"); }
         preparationFrameAborted = false;
@@ -280,7 +266,6 @@ public partial class App {
         preparedHostProof = null;
         preparedPaintProofs = null;
     }
-
     internal void RecoverPreparationFault() {
         preparingPaintParticipants = false;
         preparingInputDepth = 0;

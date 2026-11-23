@@ -1,23 +1,7 @@
 using System;
 using Gui.Backend;
-
 namespace Gui;
-
-// App.Offscreen.zan - 离屏视口渲染管线与外部输入事件转发
 public partial class App {
-    bool ReplayOffscreenWheel() {
-        if (window.GetHandle() != 0 || !offscreenWheelPending) { return false; }
-        // Ownership replay paints the original event again; routing it again
-        // duplicates Wheel callbacks and rewinding localSeq aliases the next input.
-        window.SetLocalEvent(0, offscreenWheelX, offscreenWheelY, 0,
-            offscreenWheelKey, offscreenWheelMods, offscreenWheelFlag);
-        window.localKind = 13;
-        offscreenWheelPending = false;
-        wheelReplayArmed = true;
-        return true;
-    }
-
-    // 离屏输入直接命中当前对象树，本实例不泵或重写 OS 事件。
     void ProcessOffscreenInput(int kind, int x, int y, int button,
             int key, int mods, int flag) {
         if (window.GetHandle() != 0) { return; }
@@ -25,14 +9,10 @@ public partial class App {
         int loopTurn = this.BeginLoopTurn();
         App currentLoopRoot = this.loopTurnRoot;
         try {
-            offscreenWheelPending = false;
-            wheelReplayArmed = false;
             window.SetLocalEvent(kind, x, y, button, key, mods, flag);
-
             long dispatchSequence = window.EventSeq();
             if (!this.DispatchWindowInput(kind) || window.EventSeq() != dispatchSequence) { return; }
             if (this.ConsumeRoutedInput(kind)) { return; }
-
             if (kind == 4 && key == 9) {
                 if (!this.HasOverlays() && !blocksInputBelow) {
                     focus.FocusStep(Modifiers.HasShift(mods) ? 0 - 1 : 1);
@@ -45,20 +25,15 @@ public partial class App {
             finally { this.loopTurnRoot = previousLoopRoot; }
         }
     }
-
-    // 离屏帧只重置本 App 的登记和表面，不泵系统事件或同步平台外壳。
     long offscreenOpenedEventSequence;
     int offscreenForwardedFrameMs = -1;
-
     internal void BeginSnapshotFrame() { this.BeginOffscreenFrameCore(false); }
-
     void BeginOffscreenFrame() { this.BeginOffscreenFrameCore(true); }
-
     private void BeginOffscreenFrameCore(bool serviceInput) {
         this.CheckPreparationFrameEntry();
         if (window.GetHandle() != 0) { return; }
-        offscreenFrameParent = App.frameApp;
-        App.frameApp = this;
+        offscreenFrameParent = App.FrameApp();
+        App.SetFrameApp(this);
         offscreenFrameActive = true;
         offscreenOpenedEventSequence = window.EventSeq();
         offscreenTooltip = Widget.Tooltip.Suspend();
@@ -73,21 +48,12 @@ public partial class App {
             frameSeq = frameSeq + 1;
             blurSlotSeq = 0;
             clickClaimed = false;
-            wheelConsumed = false;
-            wheelClaimSeen = false;
-            wheelOwnerOrder = wheelCapOrder;
-            wheelClaimSeq = 0;
-            wheelCapOrder = 0;
-            wheelCapW = 0;
-            wheelCapH = 0;
             inputBlockPrevious = blocksInputBelow;
             blocksInputBelow = false;
-            menuBlockPrevious = menuBlock;
-            menuBlock = false;
             this.SyncSkin();
             partialFrame = false;
             partialPending = false;
-            paintHashOn = false;
+            Canvas.paintHashOn = false;
             glassDeferred = false;
             focus.ResetIds();
             glassRects.Clear();
@@ -109,19 +75,17 @@ public partial class App {
             throw ex;
         }
     }
-
     void CancelOffscreenFrame() {
         if (!offscreenFrameActive) { return; }
         Widget.Tooltip.Restore(offscreenTooltip);
         offscreenTooltip = null;
-        App.frameApp = offscreenFrameParent;
+        App.SetFrameApp(offscreenFrameParent);
         offscreenFrameParent = null;
         offscreenFrameActive = false;
         if (!preparedHostFrameValid && window.EventSeq() == offscreenOpenedEventSequence) {
             window.SetLocalEvent(0, mouseX, mouseY, 0, 0, 0, 0);
         }
     }
-
     void EndOffscreenFrame() {
         if (!this.ContinuePreparedFrame()) { return; }
         if (window.GetHandle() != 0 || !offscreenFrameActive) { return; }
@@ -133,24 +97,13 @@ public partial class App {
                 BackdropFx.TakeDamage();
             }
             focus.UpdateImeSession();
-            if (this.EventKind() == 13 && wheelClaimSeen && !wheelConsumed && !wheelReplayArmed) {
-                offscreenWheelPending = true;
-                offscreenWheelX = window.EventX();
-                offscreenWheelY = window.EventY();
-                offscreenWheelKey = window.EventKeyCode();
-                offscreenWheelMods = window.EventMods();
-                offscreenWheelFlag = window.EventFlag();
-            }
         } finally {
             this.CancelOffscreenFrame();
         }
     }
-
     bool HasDueOffscreenFrame() {
         return needsRedraw || (offscreenForwardedFrameMs >= 0 && Window.GetTickMs() >= offscreenForwardedFrameMs);
     }
-
-    // 宿主可能在到期前因其他工作重绘。保留截止时间，直到离屏表面实际开帧。
     void ForwardOffscreenFrameRequests(App host) {
         if (window.GetHandle() != 0 || host == null || host == this) { return; }
         int now = Window.GetTickMs();
@@ -169,5 +122,4 @@ public partial class App {
         animNextMs = -1;
         wakeNextMs = -1;
     }
-
 }

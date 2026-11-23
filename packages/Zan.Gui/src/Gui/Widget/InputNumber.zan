@@ -1,105 +1,68 @@
 using System;
 using Gui;
 using Gui.Backend;
-
 namespace Gui.Widget;
-
-// 展示串的格式化钩子（Naive UI `format`）：在分组/小数之后对
-// 数值文本再加工，如 s => s + " ¥"。
 public delegate string NumFormatter(string text);
-
-// 展示串的解析钩子（Naive UI `parse`）：提交前把展示串还原成
-// 原始数值串，如 s => Text.Replace(s, " ¥", "")。
 public delegate string NumParser(string text);
-
-// 自定义验证（Naive UI `validator`）：对将要写入的新值投票，
-// false 时值仍会写入，但整框标 error（红描边）并触发 Invalid。
 public delegate bool NumValidator(int value);
-
-// 数字输入框（Naive UI n-input-number）：内嵌 −/+ 步进按钮，
-// 中间是可编辑的数字区。通过 Value 绑定双向同步；
-// min/max 钳制，step 定步长；聚焦后 ↑/↓ 键同样加减，回车提交。
-// age.Change += () => { ... };
-// age.Prefix = "¥";             // 前缀
-// age.Render(app, 40, 40, 160, 34);
-// Naive UI 对齐的能力：
-// - `Prefix` / `Suffix`：常显前后缀（"¥ 0"、"0 %"）；
-// - `Placement`：步进钮位置 "both"（默认左右各一）/ "right"
-// （两枚并排收在右侧，Naive UI button-placement）；
-// - `Loading`：加载态——整框落灰、步进钮换成旋转圆点、输入忽略；
-// - `GroupDigits`：千分位分组展示（"1,075"），编辑缓冲仍存原始串；
-// - `Precision`：小数位数（定点数：模型值 = 显示值 × 10^Precision，
-// step/min/max 同按缩放单位计）；
-// - `Formatter` / `Parser`：自定义展示/解析钩子（Naive UI
-// format/parse，设了 format 通常就要设 parse）；
-// - `Check`：自定义验证——未通过时红描边 + `Invalid` 事件；
-// - `Submit`：回车提交事件。
-// 外观走 `input` 类型规则（尺寸档 input.small/.large 直接生效），
-// 步进按钮颜色取 `input::icon` part、前后缀取 `input::prefix` /
-// `input::suffix` part——代码只留几何与交互，不直读主题语义色。
+[GuiKind("InputNumber")]
 public class InputNumber : Control {
-    // 值信号：立即模式与保留模式共用一条真值来源。
+    public override Control CreateCloneShell() { return new InputNumber(); }
     public Binding<int> Value;
-    // 空值占位提示（值为 0 且不在编辑时显示 hint 而非 "0" 的场景
-    // 由 hint != "" 决定；默认 "" 直接显示数值）。
     public string hint;
-    // 取值范围（写入与绑定拉取都钳到 [minV, maxV]）。
     public int minV;
     public int maxV;
-    // 步进量：按钮/↑↓ 每次 ±step。0 视为 1。带小数时按缩放单位计
-    // （Precision=2 时 step=1 即 0.01）。
     public int stepV;
-    // 聚焦编辑中的文本缓冲（原始串，不含分组逗号）；失焦、回车或
-    // 点击步进时提交。
     public string editBuf;
-    // 上一帧是否聚焦（进入聚焦灌缓冲、离开聚焦提交的跳变沿）。
     public bool hadFocus;
     public Button minusBtn;
     public Input inputNode;
     public Button plusBtn;
-
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
-
-    // 值被用户改变时触发（C# 风格：`n.Change += h;`）。
     public UiEvent Change;
-    // 回车提交编辑缓冲时触发（Naive UI 的键盘提交沿）。
     public UiEvent Submit;
-    // 自定义验证未通过时触发（值已写入，仅标记 error 状态）。
     public UiEvent Invalid;
-    // 尺寸变体：对应 Class = "small" / "large"（Naive UI size prop）。
     public Binding<string> Size;
-
-    // 前缀文本（Naive UI prefix）：画在数值左侧的常显文字，如 "¥"。
     public Binding<string> Prefix;
-    // 后缀文本（Naive UI suffix）：画在数值右侧的常显文字，如 "%"。
     public Binding<string> Suffix;
-    // 步进按钮位置（Naive UI button-placement）："both"（默认，左右
-    // 各一）| "right"（两枚并排收在右侧）。
     public Binding<string> Placement;
-    // 加载状态（Naive UI loading）：置真时整框落灰、步进钮换成旋转
-    // 圆点、指针与键盘都不响应（远端校验/取数进行中的典型形态）。
-    public bool Loading;
-    // 小数位数（Naive UI precision）：钳制到 0..6。值模型仍是 int，
-    // 按定点数解释——模型存显示值 × 10^Precision（2 位小数时 1079
-    // 显示 "10.79"）。
+    private bool loading;
+    private Spin minusSpin;
+    private Spin plusSpin;
+    private Binding<bool> editorDisabled;
+    public bool Loading {
+        get { return loading; }
+        set {
+            if (loading == value) { return; }
+            loading = value;
+            if (loading) {
+                minusSpin.Visible = minusBtn.Visible;
+                plusSpin.Visible = plusBtn.Visible;
+                minusBtn.Visible = false;
+                plusBtn.Visible = false;
+                editorDisabled = inputNode.Disabled;
+                inputNode.Disabled = true;
+            } else {
+                minusBtn.Visible = minusSpin.Visible;
+                plusBtn.Visible = plusSpin.Visible;
+                minusSpin.Visible = false;
+                plusSpin.Visible = false;
+                inputNode.Disabled = editorDisabled;
+                editorDisabled = null;
+            }
+            App host = this.FindApp();
+            if (host != null) { host.RequestRedraw(); }
+        }
+    }
     public int Precision;
-    // 千分位分组：整数部分每三位插一个逗号（"1,079"）。编辑缓冲
-    // 始终存原始串，分组只作用于展示与提交解析。
     public bool GroupDigits;
-    // 自定义展示钩子（Naive UI format）；null 走内置展示。
     public NumFormatter Formatter;
-    // 自定义解析钩子（Naive UI parse）；null 走内置解析。
     public NumParser Parser;
-    // 自定义验证（Naive UI validator）；null 恒过。
     public NumValidator Check;
-    // 最近一次提交/步进是否未通过 Check：置真时画 `input::error`
-    // 描边，下一次通过验证的写入清除。
     public bool invalidFlag;
-
-    // 公共初始化（各构造共用）。
     private void InitNumber(int lo, int hi) {
-        this.InitControl("inputNumber", 1);
+        this.InitControl("inputNumber");
         Value = lo;
         minV = lo;
         maxV = hi;
@@ -115,7 +78,6 @@ public class InputNumber : Control {
         Prefix = "";
         Suffix = "";
         Placement = "both";
-        Loading = false;
         Precision = 0;
         GroupDigits = false;
         Formatter = null;
@@ -123,92 +85,52 @@ public class InputNumber : Control {
         Check = null;
         invalidFlag = false;
         this.ClassName = "input-number row align-center";
-
         minusBtn = new Button("-");
         minusBtn.Class = "input-number-btn";
         inputNode = new Input();
         inputNode.Class = "input-number-input flex-1";
         plusBtn = new Button("+");
         plusBtn.Class = "input-number-btn";
-
+        minusSpin = new Spin(WidgetSize.Medium);
+        minusSpin.Class = "input-number-btn";
+        minusSpin.Visible = false;
+        plusSpin = new Spin(WidgetSize.Medium);
+        plusSpin.Class = "input-number-btn";
+        plusSpin.Visible = false;
         InputNumberAction action = new InputNumberAction(this);
         minusBtn.Click.Add(() => { action.StepDown(); });
         plusBtn.Click.Add(() => { action.StepUp(); });
         inputNode.Change.Add(() => { action.InputChange(); });
         inputNode.Submit.Add(() => { action.InputSubmit(); });
-
         this.Add(minusBtn);
+        this.Add(minusSpin);
         this.Add(inputNode);
         this.Add(plusBtn);
+        this.Add(plusSpin);
     }
-
-    // Default design-time constructor（范围 0..100）。
-    public InputNumber() {
-        InitNumber(0, 100);
-    }
-
-    // `new InputNumber(0, 120)` —— 带取值范围。
-    public InputNumber(int lo, int hi) {
-        InitNumber(lo, hi);
-    }
-
-    // 控件类型标识（序列化/设计器用）。
+    public InputNumber() { InitNumber(0, 100); }
+    public InputNumber(int lo, int hi) { InitNumber(lo, hi); }
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
-        // Constructor and property replay recreate the generated parts.
     }
-
     public override string Kind() { return "InputNumber"; }
-    // 覆写：CSS 类型选择器名（"input"，与单行输入框共用皮肤规则）。
     public override string StyleType() { return "input"; }
-    // 覆写：返回 Size 绑定字段（设计器经它发现尺寸档位绑定）。
     public override Binding<string> SizeOf() { return Size; }
-
-    // 设空值占位提示。
     public void Hint(string text) { hint = text; }
-
-    // 订阅值变化（链式）。
-    public InputNumber OnChange(Action a) {
-        Change.Add(a);
-        return this;
-    }
-
-    // 订阅回车提交（链式）。
-    public InputNumber OnSubmit(Action a) {
-        Submit.Add(a);
-        return this;
-    }
-
-    // 订阅验证失败（链式）。
-    public InputNumber OnInvalid(Action a) {
-        Invalid.Add(a);
-        return this;
-    }
-
-    // 设自定义展示钩子（链式）。
-    public InputNumber WithFormatter(NumFormatter f) { Formatter = f; return this; }
-    // 设自定义解析钩子（链式）。
-    public InputNumber WithParser(NumParser p) { Parser = p; return this; }
-    // 设自定义验证（链式）。
-    public InputNumber WithValidator(NumValidator v) { Check = v; return this; }
-
-    // 生效步长（<1 视为 1）。
+    public void OnChange(Action a) { Change.Add(a); }
+    public void OnSubmit(Action a) { Submit.Add(a); }
+    public void OnInvalid(Action a) { Invalid.Add(a); }
+    public void WithFormatter(NumFormatter f) { Formatter = f; }
+    public void WithParser(NumParser p) { Parser = p; }
+    public void WithValidator(NumValidator v) { Check = v; }
     public int Step() {
         if (stepV < 1) { return 1; }
         return stepV;
     }
-
-    // 生效的小数位数（钳到 0..6，与展示/解析共用一条口径）。
     public int Decimals() {
         if (Precision < 0) { return 0; }
         if (Precision > 6) { return 6; }
         return Precision;
     }
-
-    // 当前值（经绑定解析）。
-
-    // ---- 定点数数学（纯函数，无窗口可测） ------------------------------
-
-    // 10^n（n 钳到 0..6）。
     public static int Pow10(int n) {
         if (n < 0) { n = 0; }
         if (n > 6) { n = 6; }
@@ -216,9 +138,6 @@ public class InputNumber : Control {
         for (int i = 0; i < n; i = i + 1) { acc = acc * 10; }
         return acc;
     }
-
-    // 把缩放整数值写成定长小数的数值文本：1079@2 -> "10.79"、
-    // -5@2 -> "-0.05"、1234@0 -> "1234"。
     public static string NumberText(int scaled, int decimals) {
         int scale = InputNumber.Pow10(decimals);
         string sign = "";
@@ -230,9 +149,6 @@ public class InputNumber : Control {
         while (fp.Length < decimals) { fp = "0" + fp; }
         return sign + ip + "." + fp;
     }
-
-    // 整数部分加千分位逗号（只认首个 '.' 前的部分；已含逗号则原样
-    // 返回，供编辑缓冲的分组展示复用）。"-1234.5" -> "-1,234.5"。
     public static string GroupThousands(string s) {
         if (s == "") { return s; }
         if (s.IndexOf(",") >= 0) { return s; }
@@ -265,23 +181,13 @@ public class InputNumber : Control {
         }
         return sign + outp.ToString() + tail;
     }
-
-    // 展示用的原始数值文本（含小数，未分组未套钩子）。
-    public string PlainText(int scaled) {
-        return InputNumber.NumberText(scaled, this.Decimals());
-    }
-
-    // 当前完整展示串（分组 + Formatter），即字段里显示的那段数字。
+    public string PlainText(int scaled) { return InputNumber.NumberText(scaled, this.Decimals()); }
     public string DisplayText() {
         string s = this.PlainText(Value.Get());
         if (GroupDigits) { s = InputNumber.GroupThousands(s); }
         if (Formatter != null) { s = Formatter(s); }
         return s;
     }
-
-    // 把编辑缓冲（或任意展示串）解析为缩放整数：先过 Parser 钩子，
-    // 再剥分组逗号，按小数点拆分、多余小数四舍五入到 Precision 位。
-    // 非法/空串回退 def。"-1,0.795"@2 -> -108（795 舍入为 80 进位）。
     public static int ParseScaled(string text, int decimals, int def, NumParser parser) {
         if (parser != null) { text = parser(text); }
         if (text == null) { return def; }
@@ -310,7 +216,6 @@ public class InputNumber : Control {
         for (int i = 0; i < fp.Length; i = i + 1) {
             int c = fp[i] & 255;
             if (c < 48 || c > 57) {
-                // 尾随小数点（"10."）合法：按已读位数继续。
                 if (c == 46 && i == fp.Length - 1) { break; }
                 return def;
             }
@@ -318,7 +223,6 @@ public class InputNumber : Control {
         }
         int extra = fp.Length - decimals;
         if (extra > 0) {
-            // 多余位折回：(f + div/2) / div 四舍五入，满 scale 进整。
             long div = InputNumber.Pow10(extra);
             long r = (fpart + div / 2) / div;
             if (r >= scale) { r = r - scale; ipart = ipart + 1; }
@@ -332,46 +236,35 @@ public class InputNumber : Control {
         if (total < 0 - 2147483647) { total = 0 - 2147483647; }
         return Convert.ToInt32(total);
     }
-
-    // 先提升再运算，避免完整 int 范围的步进溢出；min/max 仍由 SetRaw 钳制。
     public int StepUpVal(int v) {
         long next = v;
         next = next + this.Step();
         if (next > int.MaxValue) { return int.MaxValue; }
         return Convert.ToInt32(next);
     }
-
     public int StepDownVal(int v) {
         long next = v;
         next = next - this.Step();
         if (next < int.MinValue) { return int.MinValue; }
         return Convert.ToInt32(next);
     }
-
-    // 钳制到 [min, max]（公开供测试与宿主复用）。
     public int Clamp(int v) {
         if (v < minV) { v = minV; }
         if (v > maxV) { v = maxV; }
         return v;
     }
-
-    // 对将要写入的值跑一次 Check，刷新 invalidFlag，返回该值。
     private void RunValidator(int v) {
         bool ok = true;
         if (Check != null) { ok = Check(v); }
         invalidFlag = !ok;
         if (!ok) { Invalid.RaiseS(this); }
     }
-
-    // 编辑缓冲的即时展示串（分组 + Formatter）。
     public string EditDisplay() {
         string s = editBuf;
         if (GroupDigits) { s = InputNumber.GroupThousands(s); }
         if (Formatter != null) { s = Formatter(s); }
         return s;
     }
-
-    // 内部写值：钳制、写回绑定、跑验证并触发 Change（值未变时静默）。
     public void SetRaw(int v) {
         v = this.Clamp(v);
         if (Value.Get() == v) { return; }
@@ -379,14 +272,10 @@ public class InputNumber : Control {
         this.RunValidator(v);
         Change.RaiseS(this);
     }
-
-    // 程序化写值（与用户输入同一条校验/事件路径）。
     public void SetValue(int v) {
         this.CommitBuffer();
         this.SetRaw(v);
     }
-
-    // 宽松整数解析（非法/溢出回 def）。
     public static int ParseInt(string s, int def) {
         if (s == null) { return def; }
         int i = 0;
@@ -407,108 +296,61 @@ public class InputNumber : Control {
         if (neg) { acc = -acc; }
         return Convert.ToInt32(acc);
     }
-
-    // 解析编辑缓冲为数值并提交（空缓冲/非法串还原当前值）。
     public void CommitBuffer() {
         if (editBuf == "") { return; }
         int v = ParseScaled(editBuf, this.Decimals(), Value.Get(), Parser);
         editBuf = "";
         this.SetRaw(v);
     }
-
     public void StepDown() {
         if (this.IsDisabled() || Loading) { return; }
         this.SetRaw(this.StepDownVal(Value.Get()));
     }
-
     public void StepUp() {
         if (this.IsDisabled() || Loading) { return; }
         this.SetRaw(this.StepUpVal(Value.Get()));
     }
-
     public void OnInputChange() {
-        if (inputNode == null) { return; }
+        if (Loading || inputNode == null) { return; }
         string t = inputNode.GetText();
-        if (t != "") {
-            this.SetRaw(Convert.ToInt32(t));
-        }
+        if (t != "") { this.SetRaw(Convert.ToInt32(t)); }
     }
-
     public void OnInputSubmit() {
+        if (Loading) { return; }
         OnInputChange();
         if (Submit != null) { Submit.RaiseS(this); }
     }
-
-    // ---- 设计器 / 序列化模型 -------------------------------------------
-
-    // 覆写：返回设计器属性清单（值 / 尺寸档 / 前后缀 / 按钮位置）；
-    // 设计期常量键（min/max/step 等）经 GetExtra/SetExtra 应答。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        // 值通道指向活的外部绑定（§6.1 单协议，snum 直写 model、
-        // precision/group 是设计期常量：普通字段直赋即实时绑定
-        // （PropSpec 合成访问器对，与 Progress.fillColor 同一惯用法）。
-        // value/text 的读写经 GetProp/SetProp 覆写走 ParseScaled 与
-        // DisplayText（见下）。
-        PropSpec val = PropSpec.Int("value", "Value").DefaultBinding();
-        // 属性通道优先指向活的外部绑定（§6.1 单协议）。
-        val.Field("Value", 1);
-        val.Also("text");
-        ps.Add(val);
+        ps.Add(PropSpec.Int("value", "Value").DefaultBinding().Field("Value", 1).Also("text"));
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
         sz.Field("Size", 0);
         ps.Add(sz);
-        PropSpec pfx = PropSpec.Text("prefix", "Prefix");
-        pfx.Field("Prefix", 0);
-        ps.Add(pfx);
-        PropSpec sfx = PropSpec.Text("suffix", "Suffix");
-        sfx.Field("Suffix", 0);
-        ps.Add(sfx);
+        ps.Add(PropSpec.Text("prefix", "Prefix").Field("Prefix", 0));
+        ps.Add(PropSpec.Text("suffix", "Suffix").Field("Suffix", 0));
         PropSpec plc = PropSpec.Enum("placement", "Button Placement",
             new List<string>{ "both", "right" });
         plc.Field("Placement", 0);
         ps.Add(plc);
-        PropSpec mn = PropSpec.Int("min", "Min");
-        mn.Field("minV", 1);
-        ps.Add(mn);
-        PropSpec mx = PropSpec.Int("max", "Max");
-        mx.Field("maxV", 1);
-        ps.Add(mx);
+        ps.Add(PropSpec.Int("min", "Min").Field("minV", 1));
+        ps.Add(PropSpec.Int("max", "Max").Field("maxV", 1));
         PropSpec stp = PropSpec.Int("step", "Step");
         stp.Field("stepV", 1);
         stp.StepBy(1);
         stp.WithTip("Increment of the +/- buttons, in display units "
                     + "(scaled by precision).");
         ps.Add(stp);
-        PropSpec hnt = PropSpec.Text("hint", "Placeholder");
-        hnt.Field("hint", 0);
-        hnt.Also("placeholder");
-        ps.Add(hnt);
-        PropSpec pre = PropSpec.Int("precision", "Precision");
-        pre.Field("Precision", 1);
-        pre.Step(1, 0, 6);
-        pre.WithTip("Decimal places (fixed-point model: value * 10^precision).");
-        ps.Add(pre);
-        PropSpec grp = PropSpec.Bool("group", "Group digits");
-        grp.Field("GroupDigits", 2);
-        grp.Also("groupDigits");
-        grp.WithTip("Show thousands separators while displaying.");
-        ps.Add(grp);
+        ps.Add(PropSpec.Text("hint", "Placeholder").Field("hint", 0).Also("placeholder"));
+        ps.Add(PropSpec.Int("precision", "Precision").Field("Precision", 1).Step(1, 0, 6).WithTip("Decimal places (fixed-point model: value * 10^precision)."));
+        ps.Add(PropSpec.Bool("group", "Group digits").Field("GroupDigits", 2).Also("groupDigits").WithTip("Show thousands separators while displaying."));
         return ps;
     }
-
-    // 覆写：value/text 应答 DisplayText（格式化取值文本，原 GetExtra
-    // 臂语义），precision 应答钳位后的 Decimals（spec 读裸 Precision）。
     public override string GetProp(string key) {
         if (key == "value" || key == "text") { return this.DisplayText(); }
         if (key == "precision") { return Convert.ToString(this.Decimals()); }
         return base.GetProp(key);
     }
-
-    // 覆写：value/text 截写走 ParseScaled（"2,300" 千分位与按
-    // precision 缩放的展示文本都能进模型，spec 裸 Convert 只认纯
-    // 整数），再经 SetRaw 收口钳制/校验/事件。
     public override void SetProp(string key, string val) {
         if (key == "value" || key == "text") {
             this.SetRaw(ParseScaled(val, this.Decimals(), Value.Get(), Parser));
@@ -516,18 +358,10 @@ public class InputNumber : Control {
         }
         base.SetProp(key, val);
     }
-
-    // 覆写：应答扩展属性键。loading 无 spec（extra-only），是这里
-    // 的唯一存留键；value/precision 等走上面的 GetProp 覆写，其余
-    // 键（min/max/step/hint/group/prefix/suffix/placement）spec 活
-    // 绑字段，管线直读。
     public override string GetExtra(string key) {
         if (key == "loading") { return Loading ? "true" : "false"; }
         return "";
     }
-
-    // 覆写：写回扩展属性键。loading（extra-only）之外全部交
-    // SetProp 管线；未知键返回 false。
     public override bool SetExtra(string key, string val) {
         if (key == "loading") {
             Loading = (val == "true");
@@ -535,8 +369,6 @@ public class InputNumber : Control {
         }
         return false;
     }
-
-    // 覆写：公共事件之外提供 "Change"、"Submit" 与 "Invalid"。
     public override List<string> Events() {
         List<string> e = Control.CommonEvents();
         e.Add("Change");
@@ -544,27 +376,18 @@ public class InputNumber : Control {
         e.Add("Invalid");
         return e;
     }
-
-    // 覆写：三个语义事件挂对应 UiEvent，其余按名称走通用路由。
     public override void BindEvent(string evt, Action a) {
         if (evt == "Change") { Change.Add(a); return; }
         if (evt == "Submit") { Submit.Add(a); return; }
         if (evt == "Invalid") { Invalid.Add(a); return; }
         base.BindEvent(evt, a);
     }
-
-    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
-    // 特化事件接本控件的 UiEvent，通用事件按名路由。
     public override void BindEventS(string evt, ControlEvent a) {
         if (evt == "Change") { Change.AddS(a); return; }
         if (evt == "Submit") { Submit.AddS(a); return; }
         if (evt == "Invalid") { Invalid.AddS(a); return; }
         base.BindEventS(evt, a);
     }
-
-
-    // ---- 保留模式钩子 ---------------------------------------------------
-
     public override void SyncBinding() {
         base.SyncBinding();
         int current = Value.Get();
@@ -572,10 +395,7 @@ public class InputNumber : Control {
         if (current != clamped) { Value.Set(clamped); }
         if (inputNode != null) {
             string expected = this.DisplayText();
-            if (inputNode.GetText() != expected) {
-                inputNode.SetText(expected);
-            }
+            if (inputNode.GetText() != expected) { inputNode.SetText(expected); }
         }
     }
-
 }

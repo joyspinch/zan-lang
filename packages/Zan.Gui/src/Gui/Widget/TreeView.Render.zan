@@ -1,0 +1,460 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+namespace Gui.Widget;
+public partial class TreeView {
+    public bool Templated() { return tpl != null || this.HasExtraNodes(); }
+    public int RowHeight() { return this.RowHeight(this.App); }
+    public int RowHeight(App app) {
+        app = this.ResolveApp(app);
+        if (fixedRowHeight > 0) { return app != null ? app.Scale(fixedRowHeight) : fixedRowHeight; }
+        if (app == null) { return 24; }
+        StyleBox s = computedStyle;
+        if (computedStyleState != Style.SNormal()
+        || !this.ComputedStyleCurrentAs(app, "tree", Class)) {
+            s = this.UncachedStyleAs(app, "tree", Class, Style.SNormal());
+        }
+        return s.HeightOr(app.theme.heightSmall);
+    }
+    public int FilterHeight() { return this.FilterHeight(this.App); }
+    public int FilterHeight(App app) {
+        if (filter == null) { return 0; }
+        app = this.ResolveApp(app);
+        if (app == null) { return 26; }
+        return app.Scale(26);
+    }
+    public bool Shown(int row) {
+        int d = data[row].depth;
+        int j = row - 1;
+        while (j >= 0) {
+            if (data[j].depth < d) {
+                if (data[j].isDir && !data[j].expanded) { return false; }
+                d = data[j].depth;
+            }
+            j = j - 1;
+        }
+        return true;
+    }
+    public int ContentHeight() { return this.ContentHeight(this.App); }
+    public int ContentHeight(App app) {
+        app = this.ResolveApp(app);
+        int rowH = this.RowHeight(app);
+        int h = 0;
+        int hideDepth = 0 - 1;
+        for (int k = 0; k < data.Count; k = k + 1) {
+            TreeNode n = data[k];
+            bool shown = true;
+            if (hideDepth >= 0) {
+                if (n.depth > hideDepth) { shown = false; }
+                else { hideDepth = 0 - 1; }
+            }
+            if (shown) {
+                Control row = this.DataRow(k);
+                if (row != null) {
+                    h = h + this.RowExtent(app, row);
+                } else {
+                    h = h + rowH;
+                }
+                if (n.isDir && !n.expanded) { hideDepth = n.depth; }
+            }
+        }
+        return h;
+    }
+    public int RowExtent(Control row) { return this.RowExtent(this.App, row); }
+    public int RowExtent(App app, Control row) {
+        app = this.ResolveApp(app);
+        if (fixedRowHeight > 0) { return this.RowHeight(app); }
+        int h = row.prefH;
+        if (h <= 0) { h = this.RowHeight(app); }
+        return h;
+    }
+    public void BuildRows() { this.BuildRows(this.App); }
+    private Control CreateRow(int index) {
+        TreeNode node = data[index];
+        if (tpl != null) { return tpl(node); }
+        if (node.extra == null) { return null; }
+        Row row = new Row {
+            AlignItems = "center",
+            Gap = 6,
+            Children = [
+                new Label(node.label),
+                new Spacer(),
+                node.extra
+            ]
+        };
+        return row;
+    }
+    public void BuildRows(App app) {
+        if (buildingRows || (fixedRowHeight <= 0 && !rowsStale && builtFor == data.Count)) { return; }
+        buildingRows = true;
+        try {
+            App host = this.FindApp();
+            Control ownerParent = parent;
+            Control root = host != null ? host.rootControl : null;
+            int expectedRevision = rowsRevision;
+            if (rowsStale || builtFor != data.Count) {
+                expectedRevision = expectedRevision + 1;
+                this.RetireRows();
+            }
+            if (rowsRevision != expectedRevision || this.FindApp() != host || parent != ownerParent
+                || (host != null && host.rootControl != root)) { return; }
+            int ticket = rowsRevision;
+            List<int> wanted = new List<int>();
+            int n = data.Count;
+            if (this.Templated()) {
+                int hideDepth = -1;
+                int top = 0;
+                int height = this.RowHeight(app);
+                int offset = scroll.Get();
+                Rect view = this.ScrollViewport();
+                for (int i = 0; i < n; i = i + 1) {
+                    TreeNode node = data[i];
+                    if (fixedRowHeight <= 0) { wanted.Add(i); continue; }
+                    if (hideDepth >= 0 && node.depth > hideDepth) { continue; }
+                    hideDepth = -1;
+                    if (top + height > offset && top < offset + view.height + height) { wanted.Add(i); }
+                    top = top + height;
+                    if (node.isDir && !node.expanded) { hideDepth = node.depth; }
+                }
+            }
+            if (!rowHost.Reconcile(wanted, this.CreateRow, app) || ticket != rowsRevision) { return; }
+            rowsStale = false;
+            builtFor = n;
+        } finally { buildingRows = false; }
+    }
+    public Rect PaintFilter() { return this.PaintFilter(this.App); }
+    public Rect PaintFilter(App app) {
+        int barH = this.FilterHeight(app);
+        Rect rows = this.ScrollViewport();
+        if (barH == 0) { return rows; }
+        app = this.ResolveApp(app);
+        if (app == null || app.canvas == null) { return rows; }
+        Theme t = app.theme;
+        StyleBox search = Style.Part(app, "treeview", "search", "", Class, "",
+                                     Style.SNormal());
+        int pad = app.Scale(6);
+        int glyph = app.Scale(12);
+        app.canvas.DrawGlyphIn("search", bx + pad, by, glyph, barH,
+            glyph, search.FgOr(0));
+        int inX = bx + pad * 2 + glyph;
+        int inW = bw - (inX - bx) - pad;
+        int inH = barH - app.Scale(4);
+        return rows;
+    }
+    private void NoteSelfDamage(App app) {
+        app.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
+    }
+    private bool PaintCheck(App app, int row, int cx, int rowY, int rowH, int box) {
+        int cy = rowY + (rowH - box) / 2;
+        int state = TreeView.CheckState(data, row);
+        Checkbox cb = this.TreeCheck();
+        cb.Indeterminate = state == 2;
+        cb.SetChecked(state == 1);
+        cb.SyncBinding();
+        cb.MeasureTree(app);
+        cb.Arrange(cx, cy, box, box);
+        cb.RenderTree(app);
+        return false;
+    }
+    public void PaintRow(int row, Rect box, int checkCol, bool active) {
+        this.PaintRow(this.App, row, box, checkCol, active);
+    }
+    public void PaintRow(App app, int row, Rect box, int checkCol, bool active) {
+        app = this.ResolveApp(app);
+        if (app == null || app.canvas == null) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        TreeNode n = data[row];
+        StyleBox arrow = Style.Part(app, "treeview", "arrow", "", Class, "",
+                                    Style.SNormal());
+        string iconCls = Class;
+        if (n.isDir) { iconCls = iconCls + " dir"; }
+        StyleBox icon = Style.Part(app, "treeview", "icon", "", iconCls, "",
+                                   Style.SNormal());
+        int labelState = Style.SNormal();
+        if (active) { labelState = Style.SSelected(); }
+        StyleBox label = Style.Part(app, "treeview", "label", "", Class, "",
+                                    labelState);
+        int fontSize = label.FontOr(Style.FontFallback(app, "medium"));
+        int indent = app.Scale(14);
+        int x0 = box.x + t.paddingSmall + checkCol + n.depth * indent;
+        if (n.isDir) {
+            string chev = "chevron-right";
+            if (n.expanded) { chev = "chevron-down"; }
+            c.DrawGlyphIn(chev, x0, box.y, fontSize, box.height,
+                fontSize - 4, arrow.FgOr(0));
+        }
+        int iconX = x0 + fontSize + t.gapSmall / 2;
+        string ic = n.icon;
+        if (ic == "") {
+            if (n.isDir) { ic = "folder"; } else { ic = "file"; }
+        }
+        c.DrawGlyphIn(ic, iconX, box.y, fontSize, box.height, fontSize, icon.FgOr(0));
+        int textX = iconX + fontSize + t.gapSmall;
+        int textY = Canvas.CenterTextY(box.y, box.height, fontSize);
+        int labelMaxW = box.x + box.width - t.paddingSmall - textX;
+        c.DrawText(textX, textY, Ellipsis.Fit(n.label, labelMaxW, fontSize),
+            label.FgOr(0), label.FontOr(fontSize));
+    }
+    public int ScrollOffset(Rect rows, int contentH) { return this.ScrollOffset(this.App, rows, contentH); }
+    public int ScrollOffset(App app, Rect rows, int contentH) {
+        return rowsBody != null ? rowsBody.ScrollTop() : 0;
+    }
+    private void UpdateDrag(App app, Rect rows) {
+        if (!reorder || !pressed || dragRow < 0) { return; }
+        int ek = app.EventKind();
+        if (ek == 1) {
+            if (!dragging && app.mouseY >= rows.y
+                && app.mouseY < rows.y + rows.height) {
+                dragging = true;
+            }
+            if (dragging) { this.NoteSelfDamage(app); }
+            return;
+        }
+        if (ek != 3) { return; }
+        bool moved = dragging && dropAt >= 0 && dropAt != dragRow
+            && dropAt != dragRow + 1;
+        if (moved) {
+            dropDone = true;
+            Move.PostS(this);
+            rowsStale = true;
+        }
+        dragging = false;
+        pressed = false;
+        this.NoteSelfDamage(app);
+    }
+    private void PaintDropLine(App app, Rect rows, int y) {
+        int h = app.Scale(2);
+        int py = y - h / 2;
+        if (py < rows.y) { py = rows.y; }
+        if (py > rows.y + rows.height - h) { py = rows.y + rows.height - h; }
+        StyleBox indicator = Style.Part(app, "treeview", "indicator", "", Class, "",
+                                        Style.SNormal());
+        app.canvas.FillRect(rows.x, py, rows.width, h, indicator.BgOr(0));
+    }
+    public void PaintRows(Rect rows) { this.PaintRows(this.App, rows); }
+    public void PaintRows(App app, Rect rows) {
+        app = this.ResolveApp(app);
+        if (app == null || app.canvas == null) { return; }
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox rowSelected = this.BareBox(app, "row", Style.SSelected());
+        StyleBox rowHover = this.BareBox(app, "row", Style.SHover());
+        StyleBox indicator = Style.Part(app, "treeview", "indicator", "", Class, "",
+                                        Style.SNormal());
+        int rowH = this.RowHeight(app);
+        if (rows.height <= 0 || rowH <= 0) { return; }
+        bool dragNow = reorder && dragging;
+        int dropY = 0 - 1;
+        int contentH = this.ContentHeight(app);
+        int off = this.ScrollOffset(app, rows, contentH);
+        bool overflow = contentH > rows.height;
+        int barW = app.Scale(6);
+        int rowW = rows.width;
+        if (overflow) { rowW = rows.width - barW; }
+        int box = app.Scale(16);
+        int checkCol = 0;
+        if (checks) { checkCol = box + app.Scale(6); }
+        int selRow = Value.Get();
+        bool checkClick = false;
+        int hideDepth = 0 - 1;
+        int y = rows.y - off;
+        c.PushClip(rows.x, rows.y, rows.width, rows.height);
+        for (int k = 0; k < data.Count; k = k + 1) {
+            TreeNode n = data[k];
+            bool shown = true;
+            if (hideDepth >= 0) {
+                if (n.depth > hideDepth) { shown = false; }
+                else { hideDepth = 0 - 1; }
+            }
+            if (shown) {
+                int rh = rowH;
+                Control child = null;
+                child = this.DataRow(k);
+                if (child != null) { rh = this.RowExtent(app, child); }
+                bool onscreen = y + rh > rows.y && y < rows.y + rows.height;
+                if (this.rowBuf == null) {
+                    this.rowBuf = new Rect(rows.x, y, rowW, rh);
+                } else {
+                    this.rowBuf.Set(rows.x, y, rowW, rh);
+                }
+                Rect rb = this.rowBuf;
+                if (dragNow && dropY < 0 && dropAt == k) { dropY = y; }
+                if (onscreen) {
+                    bool active = k == selRow || (multi && this.IsMarked(k));
+                    int id = 0 - 1;
+                    id = this.CommonId() + k;
+                    if (active) {
+                        c.FillRect(rb.x, rb.y, rowW, rh, rowSelected.BgOr(0));
+                        c.FillRect(rb.x, rb.y, app.Scale(3), rh, indicator.BgOr(0));
+                    } else if (this.IsRowHovered(k)) {
+                        c.FillRect(rb.x, rb.y, rowW, rh, rowHover.BgOr(0));
+                    }
+                    if (checks) {
+                        if (this.PaintCheck(app, k, rb.x + t.paddingSmall,
+                                            rb.y, rh, box)) {
+                            checkClick = true;
+                        }
+                    }
+                    if (child == null) { this.PaintRow(app, k, rb, checkCol, active); }
+                }
+                y = y + rh;
+                if (n.isDir && !n.expanded) { hideDepth = n.depth; }
+            }
+        }
+        if (dragNow) {
+            if (dropY < 0) { dropY = y; }
+            this.PaintDropLine(app, rows, dropY);
+        }
+        c.PopClip();
+    }
+    public override void OnMeasure(App app) {
+        this.SyncBinding();
+        if (this.Templated()) { this.BuildRows(app); }
+        prefH = this.ContentHeight(app) + this.FilterHeight(app);
+    }
+    public override void OnPaint(App app) {
+        this.SyncBinding();
+        Rect rows = this.PaintFilter(app);
+        if (data.Count == 0) {
+            this.PaintEmpty(app, rows);
+            return;
+        }
+    }
+    public void PaintEmpty(Rect rows) { this.PaintEmpty(this.App, rows); }
+    public void PaintEmpty(App app, Rect rows) {
+        if (Empty == "") { return; }
+        app = this.ResolveApp(app);
+        if (app == null || app.canvas == null) { return; }
+        Theme t = app.theme;
+        StyleBox empty = Style.Part(app, "treeview", "empty", "", Class, "",
+                                    Style.SNormal());
+        StyleBox emptyStyle = this.ResolveStyleAs(app, "label", "hint small", Style.SNormal());
+        emptyStyle.DrawText(
+            app.canvas,
+            rows.x + t.paddingMedium, rows.y + t.paddingSmall, Empty,
+            empty.FgOr(0), empty.FontOr(Style.FontFallback(app, "medium")));
+    }
+    public override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Select");
+        e.Add("Change");
+        e.Add("NodeClick");
+        e.Add("Activate");
+        e.Add("Expand");
+        e.Add("Collapse");
+        e.Add("Context");
+        e.Add("Check");
+        e.Add("Press");
+        e.Add("Move");
+        return e;
+    }
+    public override void BindEvent(string evt, Action a) {
+        if (evt == "Select" || evt == "Change" || evt == "NodeClick") { Select.Add(a); return; }
+        if (evt == "Activate") { Activate.Add(a); return; }
+        if (evt == "Expand") { Expand.Add(a); return; }
+        if (evt == "Collapse") { Collapse.Add(a); return; }
+        if (evt == "Context") { Context.Add(a); return; }
+        if (evt == "Check") { Check.Add(a); return; }
+        if (evt == "Press") { Press.Add(a); return; }
+        if (evt == "Move") { Move.Add(a); return; }
+        base.BindEvent(evt, a);
+    }
+    public override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "Select" || evt == "Change" || evt == "NodeClick") { Select.AddS(a); return; }
+        if (evt == "Activate") { Activate.AddS(a); return; }
+        if (evt == "Expand") { Expand.AddS(a); return; }
+        if (evt == "Collapse") { Collapse.AddS(a); return; }
+        if (evt == "Context") { Context.AddS(a); return; }
+        if (evt == "Check") { Check.AddS(a); return; }
+        if (evt == "Press") { Press.AddS(a); return; }
+        if (evt == "Move") { Move.AddS(a); return; }
+        base.BindEventS(evt, a);
+    }
+    public override void TriggerEvent(string evt) {
+        if (evt == "Select" || evt == "NodeClick") { Select.Raise(); return; }
+        if (evt == "Activate") { Activate.Raise(); return; }
+        if (evt == "Expand") { Expand.Raise(); return; }
+        if (evt == "Collapse") { Collapse.Raise(); return; }
+        if (evt == "Context") { Context.Raise(); return; }
+        if (evt == "Check") { Check.Raise(); return; }
+        if (evt == "Press") { Press.Raise(); return; }
+        if (evt == "Move") { Move.Raise(); return; }
+        base.TriggerEvent(evt);
+    }
+    public static int SubtreeEnd(List<TreeNode> nodes, int idx) {
+        int d = nodes[idx].depth;
+        int j = idx + 1;
+        while (j < nodes.Count && nodes[j].depth > d) { j = j + 1; }
+        return j;
+    }
+    public static int CheckState(List<TreeNode> nodes, int idx) {
+        TreeNode n = nodes[idx];
+        if (!n.isDir) {
+            if (n.checked) { return 1; }
+            return 0;
+        }
+        int end = TreeView.SubtreeEnd(nodes, idx);
+        int total = 0;
+        int on = 0;
+        int j = idx + 1;
+        while (j < end) {
+            if (!nodes[j].isDir) {
+                total = total + 1;
+                if (nodes[j].checked) { on = on + 1; }
+            }
+            j = j + 1;
+        }
+        if (total == 0) {
+            if (n.checked) { return 1; }
+            return 0;
+        }
+        if (on == 0) { return 0; }
+        if (on == total) { return 1; }
+        return 2;
+    }
+    public static void ToggleCheck(List<TreeNode> nodes, int idx) {
+        TreeNode n = nodes[idx];
+        if (!n.isDir) {
+            n.checked = !n.checked;
+            return;
+        }
+        bool target = TreeView.CheckState(nodes, idx) != 1;
+        n.checked = target;
+        int end = TreeView.SubtreeEnd(nodes, idx);
+        int j = idx + 1;
+        while (j < end) { nodes[j].checked = target; j = j + 1; }
+    }
+}
+class TreeRefreshAction {
+    private weak TreeView owner;
+    public TreeRefreshAction(TreeView value) { owner = value; }
+    public void Run() {
+        TreeView target = owner;
+        if (target != null) { target.Refresh(); }
+    }
+}
+class TreeRowsPanel : Panel {
+    private weak TreeView owner;
+    public TreeRowsPanel(TreeView value) { owner = value; }
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflow = 1;
+        box.overflowX = 0;
+        box.overflowY = 2;
+        return box;
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (owner != null) { owner.LayoutBody(); }
+    }
+    public override void OnScrollChanged() {
+        if (owner != null) { owner.BodyScrolled(); }
+    }
+    public override void OnPaint(App app) {
+        if (owner == null) { return; }
+        owner.PaintRows(app, this.ScrollViewport());
+    }
+}

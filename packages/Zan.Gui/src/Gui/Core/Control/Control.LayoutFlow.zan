@@ -1,0 +1,338 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+namespace Gui;
+public partial class Control {
+    void ArrangeFlow(int cx, int cy, int cw, int ch, int gapPx) {
+        int y = cy;
+        bool sepT = this.FlowSepT();
+        bool sepB = this.FlowSepB();
+        int chKids = (this.fillH && !this.StyleDeclaresHeight()) ? 0 : ch;
+        int pending = 0 - 1;
+        int placed = 0;
+        List<FloatIntrusion> floats = null;
+        int ownFloats = 0;
+        if (this.hostFloats != null && this.hostFloats.Count > 0) {
+            floats = new List<FloatIntrusion>();
+            for (int fi = 0; fi < this.hostFloats.Count; fi = fi + 1) {
+                floats.Add(this.hostFloats[fi]);
+            }
+            ownFloats = floats.Count;
+        }
+        int segY = 0;
+        int align = computedStyle != null ? computedStyle.align : 0;
+        this.InlineRunsBegin();
+        List<FlowEntry> es = this.FlowEntries();
+        if (es.Count == 0) { return; }
+        List<FlowEntry> seg = null;
+        for (int i = 0; i <= es.Count; i = i + 1) {
+            FlowEntry e = i < es.Count ? es[i] : null;
+            Control c = e != null ? e.kid : null;
+            if (e != null && (c == null || c.StyleInlineLevel() == 1)) {
+                if (c != null) { c.InlineRunsBegin(); }
+                if (seg == null) {
+                    seg = new List<FlowEntry>();
+                    segY = (y - cy) + (pending > 0 ? pending : 0);
+                }
+                seg.Add(e);
+                continue;
+            }
+            if (seg != null && seg.Count > 0) {
+                FlowSegment fs2 = this.FlowLayoutSegment(seg, cw, cw,
+                floats, segY);
+                if (fs2.lines.Count > 0) {
+                    if (pending >= 0) {
+                        y = y + CollapseMargins(pending, 0);
+                        if (placed > 0) { y = y + gapPx; }
+                    }
+                    pending = 0;
+                    this.FlowSegmentPlace(fs2, cx, y, cw, align);
+                    y = y + fs2.height;
+                    placed = placed + 1;
+                }
+                seg = null;
+            }
+            if (c == null) { break; }
+            if (c.StyleFloat() != 0) {
+                if (floats == null) { floats = new List<FloatIntrusion>(); }
+                int fy = (y - cy) + (pending > 0 ? pending : 0);
+                for (int oi = ownFloats; oi < floats.Count; oi = oi + 1) {
+                    if (floats[oi].yTop > fy) { fy = floats[oi].yTop; }
+                }
+                this.PlaceFloatKid(floats, c, cw, fy, cx, cy, true);
+                continue;
+            }
+            bool empty = this.IsEmptyFlowBlock(c);
+            int kmt = empty ? c.StyleMarT() : this.FlowMarT(c);
+            int kmb = empty ? c.StyleMarB() : this.FlowMarB(c);
+            int clr = c.StyleClear();
+            int clear = 0;
+            if (clr != 0) {
+                int clearY = LineBox.ClearY(
+                floats, clr, (y - cy) + (pending > 0 ? pending : 0));
+                int need = clearY - (y - cy);
+                if (need > 0) { clear = need; }
+            }
+            if (empty) {
+                int withMt = pending < 0 ? kmt : CollapseMargins(pending, kmt);
+                int dy = (pending < 0 && !sepT) ? 0 : withMt;
+                StyleBox sbE = c.computedStyle;
+                int mlE = c.StyleMarL();
+                int mrE = c.StyleMarR();
+                int wE = 0;
+                if (c.StyleDeclaresWidth()) { wE = c.StyleWidthIn(cw); }
+                else { wE = cw - mlE - mrE; }
+                if (wE < 0) { wE = 0; }
+                int xE = cx + mlE;
+                if (sbE != null && sbE.marL == 0 - 1 && sbE.marR == 0 - 1) { xE = cx + (cw - wE) / 2; }
+                c.Arrange(xE, y + dy, wE, 0);
+                pending = CollapseMargins(withMt, kmb);
+                continue;
+            }
+            int h = 0;
+            if (c.StyleDeclaresHeight()) { h = c.StyleHeightIn(chKids); }
+            else { h = c.prefH; }
+            if (h < 0) { h = 0; }
+            if (pending < 0) {
+                if (sepT) { y = y + kmt; }
+            } else {
+                y = y + CollapseMargins(pending, kmt);
+                if (placed > 0) { y = y + gapPx; }
+            }
+            pending = kmb;
+            StyleBox sb = c.computedStyle;
+            int ml = c.StyleMarL();
+            int mr = c.StyleMarR();
+            int w = 0;
+            if (c.StyleDeclaresWidth()) { w = c.StyleWidthIn(cw); }
+            else { w = cw - ml - mr; }
+            if (w < 0) { w = 0; }
+            int x = cx + ml;
+            if (sb != null && sb.marL == 0 - 1 && sb.marR == 0 - 1) {
+                x = cx + (cw - w) / 2;
+            } else if (sb != null && sb.marL == 0 - 1) {
+                x = cx + cw - mr - w;
+            }
+            if (floats != null && floats.Count > 0) {
+                this.SetHostFloats(c, floats,
+                x - cx + c.StyleInsetL(),
+                (y - cy) + c.StyleInsetT());
+                if (!c.StyleDeclaresHeightAbs()) {
+                    c.prefH = 0;
+                    c.fillH = false;
+                    c.MeasureFlow(null);
+                    h = c.prefH;
+                    if (h < 0) { h = 0; }
+                }
+            } else {
+                c.hostFloats = null;
+            }
+            y = y + clear;
+            c.Arrange(x, y, w, h);
+            y = y + h;
+            placed = placed + 1;
+        }
+        if (pending > 0 && sepB) { y = y + pending; }
+    }
+    void SetHostFloats(Control c, List<FloatIntrusion> src, int dx, int dy) {
+        if (src == null || src.Count == 0) {
+            c.hostFloats = null;
+            return;
+        }
+        List<FloatIntrusion> shifted = new List<FloatIntrusion>();
+        for (int i = 0; i < src.Count; i = i + 1) {
+            FloatIntrusion f = src[i];
+            FloatIntrusion s = new FloatIntrusion();
+            s.side = f.side;
+            s.x0 = f.x0 - dx;
+            s.x1 = f.x1 - dx;
+            s.yTop = f.yTop - dy;
+            s.yBot = f.yBot - dy;
+            shifted.Add(s);
+        }
+        c.hostFloats = shifted;
+    }
+    void PlaceFloatKid(List<FloatIntrusion> floats, Control c, int frameW,
+    int yFlow, int cx, int cy, bool place) {
+        int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(frameW) : c.prefW;
+        int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+        if (w < 0) { w = 0; }
+        if (h < 0) { h = 0; }
+        int ml = c.StyleMarL();
+        int mr = c.StyleMarR();
+        int mt = c.StyleMarT();
+        int mb = c.StyleMarB();
+        int side = c.StyleFloat();
+        int clear = c.StyleClear();
+        if (frameW <= 0) { frameW = 1; }
+        int y = yFlow;
+        if (clear == 1 || clear == 3) { y = LineBox.ClearY(floats, 1, y); }
+        if (clear == 2 || clear == 3) { y = LineBox.ClearY(floats, 2, y); }
+        int x0 = 0;
+        int yBot = y + mt + h + mb;
+        for (int guard = 0; guard < 16; guard = guard + 1) {
+            yBot = y + mt + h + mb;
+            LineSpan sp = LineBox.LineAvail(floats, frameW, y, yBot);
+            bool fits;
+            if (side == 1) {
+                x0 = sp.xOff;
+                fits = x0 + ml + w + mr <= sp.availW;
+            } else {
+                x0 = sp.availW - ml - w - mr;
+                fits = x0 >= sp.xOff;
+            }
+            if (fits) { break; }
+            int shelf = LineBox.NextShelf(floats, y);
+            if (shelf <= y) { break; }  // 无处下坠：原地溢出
+            y = shelf;
+        }
+        FloatIntrusion f = new FloatIntrusion();
+        f.side = side;
+        f.x0 = x0;
+        f.x1 = x0 + ml + w + mr;
+        f.yTop = y;
+        f.yBot = yBot;
+        floats.Add(f);
+        if (place) { c.Arrange(cx + x0 + ml, cy + y + mt, w, h); }
+    }
+    StyleBox InheritText(StyleBox parent, StyleBox own) {
+        int pfs = parent.fontPx > 0 ? parent.fontPx
+        : (parent.envRemPx > 0 ? parent.envRemPx : 14);
+        bool need = own.fontPx <= 0
+        || (own.lineHeightKind == 0 && parent.lineHeightKind != 0)
+        || (own.whiteSpace == 0 && parent.whiteSpace != 0);
+        if (!need) { return own; }
+        StyleBox d = own.Clone();
+        if (d.fontPx <= 0) { d.fontPx = pfs; }
+        if (d.lineHeightKind == 0) {
+            d.lineHeight = parent.lineHeight;
+            d.lineHeightKind = parent.lineHeightKind;
+        }
+        if (d.whiteSpace == 0 && parent.whiteSpace != 0) { d.whiteSpace = parent.whiteSpace; }
+        return d;
+    }
+    FlowSegment FlowLayoutSegment(List<FlowEntry> seg,
+    int wrapW, int wAvail,
+    List<FloatIntrusion> floats, int segY) {
+        FlowSegment fs2 = new FlowSegment();
+        List<InlinePiece> items = new List<InlinePiece>();
+        StyleBox sb = computedStyle;
+        if (sb == null) { sb = new StyleBox(); }
+        InlinePiece strut = LineBox.MakeStrut(sb);
+        int pf = sb.fontPx > 0 ? sb.fontPx : (sb.envRemPx > 0 ? sb.envRemPx : 14);
+        int xhHalf = Canvas.FontHeight(pf) * 5 / 24;
+        for (int i = 0; i < seg.Count; i = i + 1) {
+            FlowEntry en = seg[i];
+            if (en.kid == null) {
+                LineBox.PushText(items, this, sb, en.text);
+                continue;
+            }
+            Control c = en.kid;
+            StyleBox cs = c.computedStyle;
+            if (cs == null) { cs = new StyleBox(); }
+            if (c.FlexKids().Count == 0 && c.FlowText() != "") {
+                LineBox.PushText(items, c, this.InheritText(sb, cs), c.FlowText());
+                continue;
+            }
+            int w = c.StyleDeclaresWidth() ? c.StyleWidthIn(wAvail) : c.prefW;
+            int h = c.StyleDeclaresHeightAbs() ? c.StyleHeightIn(0) : c.prefH;
+            if (w < 0) { w = 0; }
+            if (h < 0) { h = 0; }
+            items.Add(LineBox.MakeBox(c, w, h, c.StyleMarL(), c.StyleMarR(),
+            c.StyleMarT(), c.StyleMarB(), cs, xhHalf));
+        }
+        List<InlineLine> lines = new List<InlineLine>();
+        if (floats != null && floats.Count > 0) {
+            LineBox.LayoutF(items, strut, wrapW, lines, floats, segY);
+        } else {
+            LineBox.Layout(items, strut, wrapW, lines);
+        }
+        int hh = 0;
+        int ww = 0;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            int bot = lines[i].yOff + lines[i].asc + lines[i].desc;
+            if (bot > hh) { hh = bot; }
+            int lw = lines[i].xOff + lines[i].width;
+            if (lw > ww) { ww = lw; }
+        }
+        fs2.lines = lines;
+        fs2.height = hh;
+        fs2.width = ww;
+        return fs2;
+    }
+    void FlowSegmentPlace(FlowSegment fs2, int cx, int y0, int availW, int align) {
+        List<Control> owners = null;
+        List<int> uL = null;
+        List<int> uT = null;
+        List<int> uR = null;
+        List<int> uB = null;
+        int y = y0;
+        for (int li = 0; li < fs2.lines.Count; li = li + 1) {
+            InlineLine ln = fs2.lines[li];
+            y = y0 + ln.yOff;
+            int baseline = y + ln.asc;
+            int lineW = ln.availW > 0 ? ln.availW : availW;
+            int free = lineW - ln.width;
+            int dx = 0;
+            if (align == 1 && free > 0) { dx = free / 2; }
+            else if (align == 2 && free > 0) { dx = free; }
+            for (int pi = 0; pi < ln.pieces.Count; pi = pi + 1) {
+                InlinePiece p = ln.pieces[pi];
+                if (p.isStrut) { continue; }
+                int px = cx + ln.xOff + dx + p.x;
+                Control pieceOwner = p.owner != null ? (Control)p.owner : null;
+                if (p.isBox) {
+                    StyleBox bs = p.st;
+                    int topY = baseline - p.boxH;  // baseline：下 margin 边坐基线
+                    if (bs.vaInline == 2) {
+                        topY = y;
+                    } else if (bs.vaInline == 3) {
+                        topY = y + ln.asc + ln.desc - p.boxH;
+                    } else if (bs.vaInline == 1) {
+                        StyleBox sbp = computedStyle;
+                        int pfp = sbp != null && sbp.fontPx > 0 ? sbp.fontPx
+                        : (sbp != null && sbp.envRemPx > 0 ? sbp.envRemPx : 14);
+                        int xh2 = Canvas.FontHeight(pfp) * 5 / 24;
+                        topY = baseline - xh2 - p.boxH / 2;
+                    }
+                    pieceOwner.Arrange(px + p.ml, topY, p.w - p.ml - p.mr, p.boxH);
+                    continue;
+                }
+                if (p.isSpace) { continue; }
+                int topY2 = baseline - p.asc;
+                pieceOwner.InlineRunPlace(px, topY2, p.w, p.lh, p.ascOff, p.fs, p.text);
+                if (pieceOwner == this) { continue; }
+                if (owners == null) {
+                    owners = new List<Control>();
+                    uL = new List<int>();
+                    uT = new List<int>();
+                    uR = new List<int>();
+                    uB = new List<int>();
+                }
+                int cellTop = topY2 + p.ascOff;
+                int cellBot = cellTop + Canvas.FontHeight(p.fs);
+                int oi = -1;
+                for (int k = 0; k < owners.Count; k = k + 1) {
+                    if (owners[k] == pieceOwner) { oi = k; break; }
+                }
+                if (oi < 0) {
+                    owners.Add(pieceOwner);
+                    uL.Add(px); uT.Add(cellTop); uR.Add(px + p.w); uB.Add(cellBot);
+                } else {
+                    if (px < uL[oi]) { uL[oi] = px; }
+                    if (cellTop < uT[oi]) { uT[oi] = cellTop; }
+                    if (px + p.w > uR[oi]) { uR[oi] = px + p.w; }
+                    if (cellBot > uB[oi]) { uB[oi] = cellBot; }
+                }
+            }
+        }
+        if (owners == null) { return; }
+        for (int k = 0; k < owners.Count; k = k + 1) {
+            Control o = owners[k];
+            o.bx = uL[k];
+            o.by = uT[k];
+            o.bw = uR[k] - uL[k];
+            o.bh = uB[k] - uT[k];
+        }
+    }
+}

@@ -1,0 +1,391 @@
+using System;
+using System.Json;
+using System.Text;
+using Gui;
+namespace Gui.Markup;
+public partial class DesignerHtml {
+    public static JsonValue FieldJson(WDoc doc, WNode n) {
+        JsonValue o = JsonValue.NewObject();
+        string kind = n.tag == "template" ? "Element" : TagKind(n.tag);
+        if (kind == "Input" && n.tag == "input") {
+            kind = DesignerHtml.InputTypeKind(
+                HtmlText.NodeAttr(n.attrs, "type"));
+        }
+        o.Put("kind", JsonValue.NewStr(kind));
+        string id = HtmlText.NodeAttr(n.attrs, "id");
+        if (id != "") { o.Put("name", JsonValue.NewStr(id)); }
+        if (kind == "Element") { o.Put("tag", JsonValue.NewStr(n.tag)); }
+        else if (TagKind(n.tag) == "Panel" && !HtmlText.StartsWith(n.tag, "zan-")) {
+            o.Put("htmlTag", JsonValue.NewStr(n.tag));
+        }
+        string pgV = "";
+        string pgM = "";
+        for (int i = 0; i < n.attrs.Count; i = i + 1) {
+            string a = n.attrs[i].name;
+            string v = n.attrs[i].val;
+            if (a == "id" || a == "data-kind" || a == "data-html-tag"
+                || a == "data-x-html-tag") { continue; }
+            if (a == "class") {
+                if (v != "") { o.Put("class", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (a == "style") {
+                if (v != "") { o.Put("style", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (a == "bind" || HtmlText.StartsWith(a, "bind:")) {
+                string property = a == "bind" ? "" : a.Substring(5);
+                if (property == "" && a != "bind") { throw new ArgumentException("bind: requires a component property"); }
+                DesignerHtml.AddBinding(o, v, property, true);
+                continue;
+            }
+            if (a.Length > 1 && a[0] == 58) {
+                DesignerHtml.AddBinding(o, v, a.Substring(1), false);
+                continue;
+            }
+            if (a == "z-show" || a == "v-show") {
+                if (v != "") { o.Put("zShow", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (a == "z-hide" || a == "v-hide") {
+                if (v != "") { o.Put("zHide", JsonValue.NewStr(v)); }
+                continue;
+            }
+            string eventVal = v;
+            int evParen = v.IndexOf("(");
+            if (evParen >= 0 && v.EndsWith(")")) {
+                eventVal = v.Substring(0, evParen).Trim();
+                string innerArg = v.Substring(evParen + 1, v.Length - evParen - 2).Trim();
+                if (!o.Has("arg") && innerArg != "") { o.Put("arg", JsonValue.NewStr(innerArg)); }
+            }
+            if (a.Length > 1 && a[0] == 64) { // '@'
+                string ev = NormalizeEventName(a.Substring(1));
+                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
+                continue;
+            }
+            if (a.Length > 5 && (HtmlText.StartsWith(a, "v-on:") || HtmlText.StartsWith(a, "z-on:"))) {
+                string ev = NormalizeEventName(a.Substring(5));
+                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
+                continue;
+            }
+            if (a.Length > 2 && HtmlText.StartsWith(a, "z-")) {
+                if (a == "z-show" || a == "z-hide") { continue; }
+                string ev = NormalizeEventName(a.Substring(2));
+                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
+                continue;
+            }
+            if (a.Length > 2 && a[0] == 111 && a[1] == 110) { // "on"
+                string ev = NormalizeEventName(a.Substring(2));
+                if (ev != "") { o.Put("on" + ev, JsonValue.NewStr(eventVal)); }
+                continue;
+            }
+            if ((kind == "Checkbox" || kind == "Radio") && a == "value") {
+                if (v != "") { o.Put("label", JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (kind == "Checkbox" && a == "checked") {
+                if (v == "" || v == "checked" || v == "true") { o.Put("defOn", JsonValue.NewBool(true)); }
+                continue;
+            }
+            if (kind == "Progress" && (a == "value" || a == "max")) {
+                if (a == "value") { pgV = v; }
+                else { pgM = v; }
+                continue;
+            }
+            if (a == "src" || a == "alt" || a == "placeholder"
+                || a == "value" || a == "min" || a == "max"
+                || a == "step" || a == "href" || a == "target"
+                || a == "title" || a == "icon") {
+                if (v != "" && !o.Has(a)) { o.Put(a, JsonValue.NewStr(v)); }
+                continue;
+            }
+            if (a == "data-text") {
+                o.Set("text", JsonValue.NewStr(v));
+                continue;
+            }
+            if (a.Length > 5 && HtmlText.StartsWith(a, "data-")) {
+                if (a == "data-arg") { continue; }  // 循环后统一折 "arg"
+                PutAttr(o, a.Substring(5), v);
+            }
+        }
+        string darg = HtmlText.NodeAttr(n.attrs, "data-arg");
+        if (darg != "") { o.Put("arg", JsonValue.NewStr(darg)); }
+        if (kind == "Progress" && pgV != "") {
+            int pv = Convert.ToInt32(pgV);
+            int pm = Convert.ToInt32(pgM != "" ? pgM : "100");
+            if (pm <= 0) { pm = 100; }
+            int pct = pv * 100 / pm;
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+            o.Put("percent", JsonValue.NewNum(Convert.ToString(pct)));
+        }
+        if (kind == "SelectBox") {
+            string opts = "";
+            int selIdx = 0 - 1;
+            int oi = 0;
+            for (int i = 0; i < n.items.Count; i = i + 1) {
+                WItem it = n.items[i];
+                if (it.kid < 0) { continue; }
+                WNode cn = doc.nodes[it.kid];
+                if (cn.tag != "option") { continue; }
+                string ot = cn.text;
+                if (ot == "") {
+                    for (int k = 0; k < cn.items.Count; k = k + 1) {
+                        WItem cit = cn.items[k];
+                        if (cit.kid >= 0 || cit.text == "") { continue; }
+                        ot = ot + cit.text;
+                    }
+                }
+                ot = ot.Trim();
+                for (int q = 0; q < cn.attrs.Count; q = q + 1) {
+                    if (cn.attrs[q].name == "selected") { selIdx = oi; }
+                }
+                if (ot != "") {
+                    if (oi > 0) { opts = opts + "|"; }
+                    opts = opts + ot;
+                }
+                oi = oi + 1;
+            }
+            if (opts != "") { o.Put("options", JsonValue.NewStr(opts)); }
+            if (selIdx < 0 && opts != "") { selIdx = 0; }
+            if (selIdx >= 0) { o.Put("value", JsonValue.NewNum(Convert.ToString(selIdx))); }
+        }
+        if (kind == "SelectBox") { return o; }
+        JsonValue kids = JsonValue.NewArray();
+        JsonValue content = JsonValue.NewArray();
+        string txt = n.text;
+        bool hasText = false;
+        for (int i = 0; i < n.items.Count; i = i + 1) {
+            WItem it = n.items[i];
+            if (it.kid < 0) {
+                if (it.text != "") {
+                    content.Append(JsonValue.NewStr(it.text));
+                    txt = txt + it.text;
+                    hasText = true;
+                }
+            } else {
+                content.Append(JsonValue.NewNum(Convert.ToString(kids.Count())));
+                kids.Append(FieldJson(doc, doc.nodes[it.kid]));
+            }
+        }
+        if (hasText && kids.Count() > 0) {
+            o.Set("htmlContent", content);
+        } else {
+            if (kind != "Element" && !o.Has("htmlTag")) { txt = txt.Trim(); }
+            if (txt != "" && !o.Has("text")) { o.Put("text", JsonValue.NewStr(txt)); }
+        }
+        if (kids.Count() > 0) { o.Put("kids", kids); }
+        return o;
+    }
+    public static string NormalizeEventName(string raw) { return HtmlText.EventName(raw); }
+    public static void PutAttr(JsonValue o, string suffix, string v) {
+        if (HtmlText.StartsWith(suffix, "on-")) {
+            string ev = NormalizeEventName(suffix.Substring(3));
+            o.Put("on" + ev, JsonValue.NewStr(v));
+            return;
+        }
+        if (HtmlText.StartsWith(suffix, "x-")) {
+            string key = Unkebab(suffix.Substring(2));
+            if (v != "" && (v[0] == 123 || v[0] == 91)) {
+                JsonValue parsed = null;
+                try { parsed = JsonValue.Parse(v); } catch (Exception ex) {
+                    parsed = null;
+                }
+                if (parsed != null) { o.Put(key, parsed); return; }
+            }
+            o.Put(key, JsonValue.NewStr(v));
+            return;
+        }
+        string key2 = Unkebab(suffix);
+        if (v == "true" || v == "false") {
+            o.Put(key2, JsonValue.NewBool(v == "true"));
+            return;
+        }
+        if (IsNumeric(v)) { o.Put(key2, JsonValue.NewNum(v)); return; }
+        o.Put(key2, JsonValue.NewStr(v));
+    }
+    static void AddBinding(JsonValue o, string path, string property, bool twoWay) {
+        if (!ModelBindingDeclaration.ValidPath(path)) {
+            throw new ArgumentException("Binding path must be a dotted identifier path");
+        }
+        if (property == "" && !twoWay) { throw new ArgumentException("One-way binding requires a component property"); }
+        JsonValue bindings = o.Get("bindings");
+        if (bindings == null || !bindings.IsArray()) {
+            bindings = JsonValue.NewArray();
+            o.Set("bindings", bindings);
+        }
+        JsonValue item = JsonValue.NewObject();
+        item.PutStr("path", path);
+        item.PutStr("property", property);
+        item.PutBool("twoWay", twoWay);
+        bindings.Append(item);
+    }
+    public static void AppendKey(StringBuilder b, JsonValue v, string key,
+                                 int mode) {
+        if (key == "bindings") {
+            if (!v.IsArray()) { return; }
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                JsonValue item = v.At(i);
+                if (item == null || !item.IsObject()) { continue; }
+                string path = item.Str("path", "");
+                string property = item.Str("property", "");
+                bool twoWay = item.Bool("twoWay", true);
+                string attribute = twoWay ? (property == "" ? "bind" : "bind:" + property) : ":" + property;
+                b.Append(" " + attribute + "=\"" + EscapeAttr(path) + "\"");
+            }
+            return;
+        }
+        if (v.IsBool()) {
+            b.Append(" data-" + KebabKey(key) + "=\""
+                + (v.AsBool(false) ? "true" : "false") + "\"");
+            return;
+        }
+        if (v.IsNumber()) {
+            string t = v.ToJson();
+            if (t != "0" || key == "winZoom" || key == "layoutMode"
+                || key == "pad" || key == "gap") {
+                b.Append(" data-" + KebabKey(key) + "=\"" + t + "\"");
+            }
+            return;
+        }
+        if (v.IsString()) {
+            string s = v.AsString("");
+            if (key == "zShow" || key == "zHide") {
+                if (s != "") { b.Append(" " + KebabKey(key) + "=\"" + EscapeAttr(s) + "\""); }
+                return;
+            }
+            if (s != "" || key == "label" || key == "placeholder") {
+                b.Append(" data-" + KebabKey(key) + "=\""
+                         + EscapeAttr(s) + "\"");
+            }
+            return;
+        }
+        b.Append(" data-x-" + KebabKey(key) + "=\""
+                 + EscapeAttr(v.ToJson()) + "\"");
+    }
+    public static string KebabKey(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c >= 65 && c <= 90) {
+                if (i > 0) { outp = outp + "-"; }
+                outp = outp + (char)(c + 32);
+            } else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+                       || c == 45) {
+                outp = outp + s.Substring(i, 1);
+            }
+        }
+        return outp;
+    }
+    public static string Unkebab(string s) { return HtmlText.UnkebabKey(s); }
+    public static bool IsNumeric(string s) {
+        if (s == "") { return false; }
+        int i = s[0] == 45 ? 1 : 0;
+        int digits = 0;
+        int dots = 0;
+        while (i < s.Length) {
+            int c = s[i];
+            if (c >= 48 && c <= 57) { digits = digits + 1; }
+            else if (c == 46) { dots = dots + 1; }
+            else { return false; }
+            i = i + 1;
+        }
+        return digits > 0 && dots <= 1;
+    }
+    public static string EscapeAttr(string s) {
+        string outp = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "&") { outp = outp + "&amp;"; }
+            else if (ch == "<") { outp = outp + "&lt;"; }
+            else if (ch == ">") { outp = outp + "&gt;"; }
+            else if (ch == "\"") { outp = outp + "&quot;"; }
+            else if (ch == "'") { outp = outp + "&#39;"; }
+            else if (ch == "\n") { outp = outp + "&#10;"; }
+            else if (ch == "\r") { outp = outp + "&#13;"; }
+            else if (ch == "\t") { outp = outp + "&#9;"; }
+            else { outp = outp + ch; }
+        }
+        return outp;
+    }
+    public static bool TextIsHtmlSafe(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c == 10 || c == 13 || c == 9) { return false; }
+        }
+        int c0 = s[0];
+        int cl = s[s.Length - 1];
+        if (c0 == 32 || cl == 32) { return false; }
+        return true;
+    }
+    public static bool IsTagName(string s) {
+        if (s.Length == 0) { return false; }
+        if (!HtmlText.IsAlpha(s[0])) { return false; }
+        for (int i = 1; i < s.Length; i = i + 1) {
+            if (!HtmlText.IsNameChar(s[i])) { return false; }
+        }
+        return true;
+    }
+    public static string KindTag(string kind) {
+        if (kind == "Label") { return "label"; }
+        if (kind == "Button") { return "button"; }
+        if (kind == "Input") { return "input"; }
+        if (kind == "TextArea") { return "textarea"; }
+        if (kind == "Image") { return "img"; }
+        if (kind == "Divider") { return "hr"; }
+        if (kind == "Progress") { return "progress"; }
+        if (kind == "SelectBox") { return "select"; }
+        if (kind == "Typography") { return "p"; }
+        if (kind == "Checkbox") { return "input"; }
+        if (kind == "Radio") { return "input"; }
+        if (kind == "Slider") { return "input"; }
+        if (kind == "ColorPicker") { return "input"; }
+        if (kind == "InputNumber") { return "input"; }
+        if (kind == "DatePicker") { return "input"; }
+        if (kind == "Upload") { return "input"; }
+        if (kind == "Panel") { return "zan-panel"; }
+        return "zan-" + KebabKey(kind);
+    }
+    public static string TagKind(string tag) {
+        string k = Html.TagToKind(tag);
+        if (k != tag) { return k; }  // 表内命中
+        if (tag == "button") { return "Button"; }
+        if (tag == "textarea") { return "TextArea"; }
+        if (tag == "img") { return "Image"; }
+        if (tag == "select") { return "SelectBox"; }
+        if (tag == "progress") { return "Progress"; }
+        if (tag == "input") { return "Input"; }
+        if (tag == "p" || tag == "h1" || tag == "h2" || tag == "h3"
+            || tag == "h4" || tag == "h5" || tag == "h6") { return "Typography"; }
+        if (tag == "div") { return "Panel"; }
+        if (tag == "table") { return "Table"; }
+        if (tag == "tr") { return "TableRow"; }
+        if (tag == "td" || tag == "th") { return "TableCell"; }
+        if (tag == "tab-pane" || tag == "tabpane") { return "TabPane"; }
+        if (tag == "breadcrumb-item") { return "BreadcrumbItem"; }
+        if (tag == "timeline-item") { return "TimelineItem"; }
+        return "Element";
+    }
+    public static string InputTypeKind(string ty) {
+        if (ty == "checkbox") { return "Checkbox"; }
+        if (ty == "radio") { return "Radio"; }
+        if (ty == "range") { return "Slider"; }
+        if (ty == "color") { return "ColorPicker"; }
+        if (ty == "number") { return "InputNumber"; }
+        if (ty == "date" || ty == "month" || ty == "week"
+            || ty == "time") { return "DatePicker"; }
+        if (ty == "file") { return "Upload"; }
+        return "Input";
+    }
+    public static string KindInputType(string kind) {
+        if (kind == "Checkbox") { return "checkbox"; }
+        if (kind == "Radio") { return "radio"; }
+        if (kind == "Slider") { return "range"; }
+        if (kind == "ColorPicker") { return "color"; }
+        if (kind == "InputNumber") { return "number"; }
+        if (kind == "DatePicker") { return "date"; }
+        if (kind == "Upload") { return "file"; }
+        return "";
+    }
+}

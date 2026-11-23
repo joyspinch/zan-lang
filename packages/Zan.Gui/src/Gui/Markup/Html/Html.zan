@@ -1,77 +1,49 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Json;
 using Gui.Markup;
-// 控件映射用的是裸 Button/TextArea/Checkbox/Input/Image——这些类型在
-// Gui.Widget 命名空间里，必须显式 import；不写的话只靠 binder 的全局
-// 唯一简单名兜底才能编过，一旦用户项目定义了同名全局类（如 class
-// TextArea）这里就会编译报错。
 using Gui.Widget;
-// 链接的系统浏览器回落通道（ShellOpenUrl）在 Gui.Backend。
 using Gui.Backend;
-
 namespace Gui;
-
-// WEB_GUI_ROADMAP P5：HTML 声明层的 Gui 侧——把 Gui.Markup.HtmlParser
-// 的声明记录构建成控件树。解析/空白/实体/记录全在纯层（Designer
-// 导入也吃同一份记录，设计器与运行期同构）；本文件只负责
-// tag→控件映射与属性协议（事件接线、绑定路径、样式类）。
-// // tag 映射：容器 tag → Element（UA 样式表给 web 缺省语义），
-// img → Image；select 等未映射 tag 落 Element 占位。
-// // 属性协议：id → 选择器名（nodeName），class → AddClass，
-// style → 合成 .zgen-N 规则（复用整套级联与 !important 机制），
-// data-on-<evt>="名" 经 HtmlHandlers 注册表接 BindEvent，
-// bind / :prop → bindings。其余属性（Element 进原始属性表；真控件忽略）。
-// // 与 App 的解耦（auto-stdlib 按需拉取，活名才入编译图）：装载入口
-// Html.Load(app, ...) 在本文件，内部经 Parse→Install 自动装声明层；
-// App 只做组合根，不背 HTML 装载职责。拼写了任何 Html.* 入口的程序
-// 会被自动拉入本层；不用的程序 App 编译图不背解析器/渲染器/Gui.Markup。
-// Install 另向 App 注册链接扫描/模板克隆两个委托槽（Core 的 ModelBinder
-// 经 App.AutoLinkTree/CloneTree 反转调用，不向上认识 Markup）。
+internal delegate HtmlDoc WindowDocumentLoader(string html);
 public partial class Html {
     private static bool loaderInstalled;
-
-    // 向 App 注册链接扫描与模板行克隆两个委托槽（ModelBinder.WireNode
-    // /For 经 App.AutoLinkTree/CloneTree 反转调用），并补齐 Element 的
-    // title 提示与远端图片通道。动态组件由应用装配入口显式注册。
+    private static ControlFactoryFn cloneFallback;
+    internal static void SetCloneFallback(ControlFactoryFn fn) {
+        if (fn != null) { cloneFallback = fn; }
+    }
     public static void Install() {
+        Html.InstallDocument();
+        ImageHttp.Install();
+    }
+    internal static void InstallDocument() {
         if (loaderInstalled) { return; }
         loaderInstalled = true;
         App.SetLinkScanner(AutoLinkTree);
         Element.SetTipPainter(Html.PaintTip);
         App.SetCloneTree(Html.Clone);
-        ImageHttp.Install();
     }
-
-    // HTML 装载入口（范式一）：解析建树 → 领作用域类 → 作用域 CSS
-    // 并进 appCss 链、整树补类 → <a href> 缺省导航接线。App 只做组合
-    // 根，装载职责归本层（Gui.Markup）；宿主拼 `Html.Load(app, ...)`
-    // 即自动拉入声明层（Parse 内部 Install）。app 为发起装载的宿主。
-    public static Control Load(App app, string html) {
-        return Html.Load(app, html, null, "");
-    }
-
-    // 完整形态：带处理器注册表与 `<link>` 的基目录。
+    public static Control Load(App app, string html) { return Html.Load(app, html, null, ""); }
     public static Control Load(App app, string html, HtmlHandlers handlers,
                               string baseDir) {
-        HtmlDoc doc = Html.Parse(html, baseDir, handlers);
+        return Html.ApplyDocument(app, Html.Parse(html, baseDir, handlers));
+    }
+    public static Control LoadWith(App app, string html, HtmlHandlers handlers,
+                                   string baseDir, ControlFactoryFn factory) {
+        return Html.ApplyDocument(app, Html.ParseWith(html, baseDir, handlers, factory));
+    }
+    private static Control ApplyDocument(App app, HtmlDoc doc) {
         string zs = app.NextLoadScope();
         string scoped = doc.css == "" ? "" : HtmlScope.Styles(doc.css, zs);
         app.ApplyScopedTree(doc.root, scoped, zs);
         Html.AutoLinkTree(doc.root, app);
         return doc.root;
     }
-
-    // ---- <include> 组合（B-ID149②）：把一个窗口拆成多份 html 复用 ----
-    //
-    // html 是数据：组合发生在装载期，`<include src="Views/Nav.html" />`
-    // 装载前展开为被引文件内容（整文档取 body 内层，片段原样），递归
-    // 展开（深度 8 封顶防环）。查找口与窗口文档同源（Form.ReadDoc：
-    // 工程根直引 → 裸名 → src/），发布态走同一份内嵌 VFS。注释、
-    // <style>、<script> 内不展开——那里出现 include 字样是文案不是
-    // 组合指令。
-
     public static string ExpandIncludes(string html, int depth) {
+        return Html.ExpandIncludes(html, depth, Form.ReadDoc);
+    }
+    private static string ExpandIncludes(string html, int depth, Func<string, string> readInclude) {
         if (depth > 8) { return html; }
         string outp = "";
         int i = 0;
@@ -103,7 +75,7 @@ public partial class Html {
                 }
                 scan = scan + 1;
             }
-            if (kind == 0 || nxt <= i) {
+            if (kind == 0 || nxt < i || (kind != 1 && nxt == i)) {
                 outp = outp + html.Substring(i);
                 break;
             }
@@ -123,20 +95,17 @@ public partial class Html {
             if (srcVal == "") {
                 Console.WriteLine("HTML include without src");
             } else {
-                string frag = Form.ReadDoc(srcVal);
+                string frag = readInclude(srcVal);
                 if (frag == null) {
                     Console.WriteLine("HTML include not found: " + srcVal);
                 } else {
-                    outp = outp + Html.ExpandIncludes(Html.BodyInner(frag), depth + 1);
+                    outp = outp + Html.ExpandIncludes(Html.BodyInner(frag), depth + 1, readInclude);
                 }
             }
             i = gt + 1;
         }
         return outp;
     }
-
-    // include 标签文本里的 src 属性（引号用字符码 34/39——Zan 字符串
-    // 不吃反斜杠转义）。
     public static string IncludeSrc(string tag) {
         int a = tag.IndexOf("src=");
         if (a < 0) { return ""; }
@@ -156,8 +125,6 @@ public partial class Html {
         }
         return tag.Substring(vs, e - vs).Trim();
     }
-
-    // 整文档取 body 内层；片段原样返回。
     public static string BodyInner(string html) {
         int bs = html.IndexOf("<body");
         if (bs < 0) { return html; }
@@ -166,12 +133,33 @@ public partial class Html {
         if (contentStart < 0 || be < 0) { return html; }
         return html.Substring(contentStart + 1, be - contentStart - 1);
     }
-
-    // 解析 `html`（整文档或片段）并建树。`baseDir` 是 `<link>`
-    // 相对路径的基目录（空 = 不解析 link）。`handlers` 可为 null。
+    internal static HtmlDoc ParseComponent(string html) { return Html.Parse(html, "", null); }
     public static HtmlDoc Parse(string html, string baseDir, HtmlHandlers handlers) {
-        Install();
-        html = Html.ExpandIncludes(html, 0);
+        Html.Install();
+        Html.SetCloneFallback(ControlFactory.Create);
+        return Html.ParseDocument(html, baseDir, handlers, ControlFactory.Create, Form.ReadDoc);
+    }
+    public static HtmlDoc ParseWith(string html, string baseDir, HtmlHandlers handlers,
+                                    ControlFactoryFn factory) {
+        if (factory == null) { throw new ArgumentNullException("factory"); }
+        return Html.ParseDocument(html, baseDir, handlers, factory, Form.ReadDoc);
+    }
+    internal static HtmlDoc ParseEmbedded(string document, ControlFactoryFn factory) {
+        if (factory == null) { throw new ArgumentNullException("factory"); }
+        return Html.ParseDocument(Html.ReadEmbeddedDoc(document), "", null, factory,
+                                  Html.ReadEmbeddedDoc);
+    }
+    private static string ReadEmbeddedDoc(string path) {
+        if (!File.EmbedExists(path)) {
+            throw new FileNotFoundException("Embedded window document not found: " + path);
+        }
+        return File.ReadAllText(path);
+    }
+    private static HtmlDoc ParseDocument(string html, string baseDir, HtmlHandlers handlers,
+                                          ControlFactoryFn factory,
+                                          Func<string, string> readInclude) {
+        Html.InstallDocument();
+        html = Html.ExpandIncludes(html, 0, readInclude);
         WDoc wd = HtmlParser.Parse(html, baseDir);
         HtmlDoc doc = new HtmlDoc();
         doc.css = wd.css;
@@ -192,88 +180,24 @@ public partial class Html {
         doc.sizeClass = sizeClass;
         List<Control> built = new List<Control>();
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
-            built.Add(Html.Build(wd, wd.nodes[i], doc, handlers));
+            built.Add(Html.BuildNode(wd, wd.nodes[i], doc, handlers, factory));
         }
-        // 装配：逐父按 items 文档序走一遍——AddText 与 AddChild 的
-        // 交错顺序就是 HTML 的行内内容顺序（混排行盒依赖）。
+        bool[] consumed = new bool[wd.nodes.Count];
         for (int i = 0; i < wd.nodes.Count; i = i + 1) {
+            if (consumed[i]) { continue; }
             WNode n = wd.nodes[i];
             Control c = built[i];
-            if (n.tag == "option" || n.tag == "thead" || n.tag == "tbody" || n.tag == "tfoot") {
-                continue;
-            }
             FbFlow fieldFlow = null;
             for (int k = 0; k < n.items.Count; k = k + 1) {
                 WItem it = n.items[k];
                 if (it.kid < 0) {
                     if (it.text.Trim() != "") { fieldFlow = null; }
-                    if (c is Element) {
-                        ((Element)c).AddText(it.text);
-                    } else if (c is TableCell) {
-                        string t = it.text.Trim();
-                        if (t != "") {
-                            ((TableCell)c).SetText(t);
-                        }
-                    } else if (c is TabPane) {
-                        string t = it.text.Trim();
-                        if (t != "" && ((TabPane)c).Label() == "") {
-                            ((TabPane)c).SetLabel(t);
-                        }
-                    } else if (c is BreadcrumbItem) {
-                        string t = it.text.Trim();
-                        if (t != "" && ((BreadcrumbItem)c).Text() == "") {
-                            ((BreadcrumbItem)c).SetText(t);
-                        }
-                    } else if (c is TimelineItem) {
-                        string t = it.text.Trim();
-                        if (t != "" && ((TimelineItem)c).title == "") {
-                            ((TimelineItem)c).title = t;
-                        }
-                    }
+                    Html.AddDocumentText(c, it.text);
                 } else {
                     WNode kidNode = wd.nodes[it.kid];
-                    if (IsMetaChild(n.tag, kidNode.tag)) {
+                    if (!(c is Element) && IsMetaChild(n.tag, kidNode.tag)) {
                         fieldFlow = null;
-                        // 若父容器是 Table 且子项是 thead/tbody/tfoot 元节点，把内部 tr 扁平转挂到 Table
-                        if (c is Table && (kidNode.tag == "thead" || kidNode.tag == "tbody" || kidNode.tag == "tfoot")) {
-                            for (int ti = 0; ti < kidNode.items.Count; ti = ti + 1) {
-                                WItem tit = kidNode.items[ti];
-                                if (tit.kid >= 0) {
-                                    Control grandKid = built[tit.kid];
-                                    if (grandKid != null) {
-                                        if (kidNode.tag == "thead" && grandKid is TableRow) {
-                                            ((TableRow)grandKid).SetHeader(true);
-                                        }
-                                        Html.AddChild(c, grandKid);
-                                    }
-                                }
-                            }
-                        }
-                        // 若父容器是 Tabs 且子项是 tab/tab-pane 元节点，把 tab 内部的子控件转挂到对应标签页
-                        if (c is Tabs && (kidNode.tag == "tab" || kidNode.tag == "tab-pane" || kidNode.tag == "tabpane")) {
-                            string tTitle = HtmlText.NodeAttr(kidNode.attrs, "title");
-                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "label"); }
-                            if (tTitle == "") { tTitle = HtmlText.NodeAttr(kidNode.attrs, "name"); }
-                            Control tabControl = built[it.kid];
-                            if (tabControl is TabPane) {
-                                TabPane tp = (TabPane)tabControl;
-                                if (tp.Label() == "" && tTitle != "") { tp.SetLabel(tTitle); }
-                                ((Tabs)c).AddPane(tp);
-                            } else {
-                                for (int ti = 0; ti < kidNode.items.Count; ti = ti + 1) {
-                                    WItem tit = kidNode.items[ti];
-                                    if (tit.kid >= 0) {
-                                        Control grandKid = built[tit.kid];
-                                        if (grandKid != null) {
-                                            if (grandKid.slotName == "" && tTitle != "") {
-                                                grandKid.slotName = tTitle;
-                                            }
-                                            Html.AddChild(c, grandKid);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        consumed[it.kid] = Html.AddMetaChild(c, kidNode, built[it.kid], built);
                         continue;
                     }
                     Control kidCtl = built[it.kid];
@@ -287,12 +211,51 @@ public partial class Html {
         doc.built = built;
         return doc;
     }
-
-    // 设计半件直挂（DesignedControl.Design 用）：body 子节点按标准文档序
-    // 直接挂进宿主控件——宿主自己就是设计根，不经 body 占位包装。
-    // 统一通过 Html.AddChild 挂载，彻底终结双轨分裂。
+    private static void AddDocumentText(Control c, string text) {
+        if (c is Element) {
+            ((Element)c).AddText(text);
+            return;
+        }
+        string value = text.Trim();
+        if (value == "") { return; }
+        switch (c.Kind()) {
+            case "TableCell": c.SetProp("text", value); break;
+            case "TabPane":
+            case "BreadcrumbItem":
+                if (c.GetProp("text") == "") { c.SetProp("text", value); }
+                break;
+            case "TimelineItem":
+                if (c.GetProp("title") == "") { c.SetProp("title", value); }
+                break;
+        }
+    }
+    private static bool AddMetaChild(Control parent, WNode node, Control child, List<Control> built) {
+        string tag = node.tag;
+        if (parent.Kind() == "Table" && (tag == "thead" || tag == "tbody" || tag == "tfoot")) {
+            for (int i = 0; i < node.items.Count; i = i + 1) {
+                int index = node.items[i].kid;
+                if (index < 0) { continue; }
+                Control row = built[index];
+                if (tag == "thead" && row.Kind() == "TableRow") { row.SetProp("header", "true"); }
+                Html.AddChild(parent, row);
+            }
+        } else if (parent.Kind() == "Tabs" && (tag == "tab" || tag == "tab-pane" || tag == "tabpane")) {
+            string title = HtmlText.NodeAttr(node.attrs, "title");
+            if (title == "") { title = HtmlText.NodeAttr(node.attrs, "label"); }
+            if (title == "") { title = HtmlText.NodeAttr(node.attrs, "name"); }
+            if (parent.MountDocumentPane(child, title)) { return false; }
+            for (int i = 0; i < node.items.Count; i = i + 1) {
+                int index = node.items[i].kid;
+                if (index < 0) { continue; }
+                Control content = built[index];
+                if (content.slotName == "" && title != "") { content.slotName = title; }
+                Html.AddChild(parent, content);
+            }
+        }
+        return true;
+    }
     public static void ProjectBody(Control host, HtmlDoc doc) {
-        Install();
+        Html.InstallDocument();
         if (host == null || doc == null || doc.root == null
             || doc.src == null || doc.built == null) { return; }
         WDoc wd = doc.src;
@@ -314,27 +277,15 @@ public partial class Html {
             Html.AddChild(host, kids[i]);
         }
     }
-
-    // 整数字面量（可选负号 + 纯数字）。
     public static bool HasSizeClass(string classes) {
         if (classes == null || classes == "") { return false; }
         List<string> xs = classes.Split(" ");
         for (int i = 0; i < xs.Count; i = i + 1) {
             string x = xs[i].Trim();
-            if (x == "tiny" || x == "small" || x == "medium" || x == "large") {
-                return true;
-            }
+            if (x == "tiny" || x == "small" || x == "medium" || x == "large") { return true; }
         }
         return false;
     }
-
-    // title 属性的渲染期轮询（Element.OnPaint 每帧调用）：本元素
-    // 正被悬停且停稳达 DefaultDelayMs 时，向帧末提示队列登记
-    // （Request 幂等，重复登记无害）。指针挪走/悬停目标一变即
-    // 失效——气泡生命周期与浏览器一致。命中矩形来自 FireCommon
-    // （链接/带事件的元素）或宿主注册；纯展示容器无人监听时没有
-    // 命中区，也就无提示（不给静态内容开指针）。App 从静态
-    // FrameApp 取（渲染帧内即当前 App；无帧体的探针直接跳过）。
     public static void PaintTip(Control c, string tip) {
         App app = App.FrameApp();
         if (app == null) { return; }
@@ -346,7 +297,6 @@ public partial class Html {
         Tooltip.RequestBox(app, c.bx, c.by, c.bw, c.bh, tip,
             Tooltip.Bottom(), app.Scale(260));
     }
-
     public static void AddInlineCss(HtmlDoc doc, Control c, string decl) {
         if (c == null || decl == "") { return; }
         if (doc != null) {
@@ -358,12 +308,6 @@ public partial class Html {
             c.inlineStyleCss = c.inlineStyleCss + "; " + decl;
         }
     }
-
-    // 挂子节点：支持 slot 具名插槽路由分发；Element 父走 AddKid（与 AddText 的文档序交错，
-    // 行盒混排依赖），控件父走普通 Add。
-    // Design field metadata composes the existing flow/caption panels at assembly.
-    // Native HTML and positioned children retain the ordinary mounting path.
-    // The returned flow belongs only to this Parse assembly run and contiguous segment.
     public static FbFlow AddFieldChild(Control parent, Control c, WNode node, FbFlow flow) {
         string spanText = HtmlText.NodeAttr(node.attrs, "data-span");
         string caption = HtmlText.NodeAttr(node.attrs, "data-label");
@@ -384,7 +328,6 @@ public partial class Html {
             Control slot = parent.NamedSlotHost("default");
             if (slot != null) { host = slot; }
         }
-        // Positioned design fields use the same authored slot as flow fields.
         if (position == "1" || position == "Float" || c.StylePosition() == 2
             || !Html.IsIntText(spanText)) {
             Html.AddChild(host, c);
@@ -398,37 +341,26 @@ public partial class Html {
         if (span < 1) { span = 1; }
         if (span > 24) { span = 24; }
         Control cell = c;
-        // These controls render their own label; other fields use a caption above.
-        if (caption != "" && !(c is Label) && !(c is Button)
-            && !(c is Checkbox) && !(c is Radio)) {
-            FbStack stack = new FbStack();
-            stack.Add(new Label(caption));
+        string kind = c.Kind();
+        if (caption != "" && kind != "Label" && kind != "Button"
+            && kind != "Checkbox" && kind != "Radio" && kind != "RadioButton") {
+            FbStack stack = new FbStack(caption);
             stack.Add(c);
             cell = stack;
         }
         flow.AddCell(cell, span);
         return flow;
     }
-
     public static void AddChild(Control parent, Control c) {
-        if (c.slotName != "" && parent.MountSlot(c.slotName, c)) {
-            return;
-        }
+        if (c.slotName != "" && parent.MountSlot(c.slotName, c)) { return; }
         if (parent is Element) {
             ((Element)parent).AddKid(c);
             return;
         }
         parent.Add(c);
     }
-
-    // 深拷贝一棵控件树（`<template data-for>` 行展开用）。Element
-    // 走同构克隆——Props() 没有覆写、Serialize 无法往返，标签/文本/
-    // 原始属性表必须特判搬运；Class 原样带上（行内 style 的 zgen-N
-    // 规则已在应用样式表里，克隆件挂同名类即生效）。其余控件按注册
-    // kind 重建（未注册返回 null，调用侧跳过不占位），Props 声明槽
-    // 与事件名照搬；几何与绑定声明逐项复制，子树递归。
     public static Control Clone(Control c) {
-        Install();
+        Html.InstallDocument();
         if (c is Element) {
             Element src = (Element)c;
             Element el = new Element();
@@ -450,7 +382,6 @@ public partial class Html {
             for (int ei = 0; ei < src.events.Count; ei = ei + 1) {
                 el.SetHandler(src.events[ei].key, src.events[ei].val);
             }
-            // 文档序重放（AddText/AddKid 交错是行盒混排的依据）
             if (src.elOrder != null) {
                 for (int i = 0; i < src.elOrder.Count; i = i + 1) {
                     FlowEntry o = src.elOrder[i];
@@ -470,14 +401,18 @@ public partial class Html {
             }
             return el;
         }
-        Control n = ControlFactory.Create(c.Kind());
+        ControlFactoryFn factory = c.DocumentFactory();
+        string kind = factory != null ? c.DocumentFactoryKind() : c.Kind();
+        Control n = factory != null ? factory(kind) : c.CreateCloneShell();
+        if (n == null && factory == null && cloneFallback != null) {
+            n = cloneFallback(kind);
+        }
         if (n == null) { return null; }
+        n.SetDocumentFactory(factory, kind);
         List<PropSpec> ps = c.Props();
         for (int i = 0; i < ps.Count; i = i + 1) {
             n.SetProp(ps[i].key, c.GetProp(ps[i].key));
         }
-        // Property setters may synchronize name or rebuild style classes.
-        // Preserve the source metadata after replaying those setters.
         n.name = c.name;
         n.Class = c.Class;
         n.prefW = c.prefW;
@@ -497,53 +432,35 @@ public partial class Html {
         c.CloneContentTo(n, Html.Clone);
         return n;
     }
-
-    static Action WrapModifier(Action a, string mod) {
-        if (mod == "") { return a; }
+    static ControlEvent WrapModifier(Action a, string mod) {
         bool hasStop = mod.IndexOf("stop") >= 0;
         bool hasEnter = mod.IndexOf("enter") >= 0;
-        return () => {
-            App app = App.FrameApp();
+        return (Control sender) => {
+            App app = sender != null ? sender.FindApp() : App.FrameApp();
             if (hasEnter && app != null && app.window != null) {
-                if (app.window.EventKeyCode() != 13) {
-                    return;
-                }
+                if (app.window.EventKeyCode() != 13) { return; }
             }
-            if (hasStop && app != null) {
-                app.ClaimClick();
-            }
+            if (hasStop && sender != null) { sender.StopPropagation(); }
             a();
         };
     }
-
-    static Action<string> WrapModifierArg(Action<string> a, string mod) {
-        if (mod == "") { return a; }
+    static ControlEvent WrapModifierArg(Action<string> a, string arg, string mod) {
         bool hasStop = mod.IndexOf("stop") >= 0;
         bool hasEnter = mod.IndexOf("enter") >= 0;
-        return (arg) => {
-            App app = App.FrameApp();
+        string captured = arg;
+        return (Control sender) => {
+            App app = sender != null ? sender.FindApp() : App.FrameApp();
             if (hasEnter && app != null && app.window != null) {
-                if (app.window.EventKeyCode() != 13) {
-                    return;
-                }
+                if (app.window.EventKeyCode() != 13) { return; }
             }
-            if (hasStop && app != null) {
-                app.ClaimClick();
-            }
-            a(arg);
+            if (hasStop && sender != null) { sender.StopPropagation(); }
+            a(captured);
         };
     }
-
-    // data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
-    // 由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
-    // 把事件路由到专属槽位的差异（BindEvent 多态分派）。名字无论
-    // 有没有注册表都落控件（SetHandler）——与 FormBuilder 挂载
-    // 同一契约，ChildWindow.Wire 等宿主才能二次解析。
     public static void Wire(HtmlHandlers handlers, Control c, string evt,
                      string name) {
         Wire(handlers, c, evt, name, "");
     }
-
     public static void Wire(HtmlHandlers handlers, Control c, string evt,
                      string name, string mod) {
         if (evt == "") { return; }
@@ -551,27 +468,17 @@ public partial class Html {
         if (handlers == null) { return; }
         Action a = handlers.Find(name);
         if (a != null) {
-            Action wrapped = WrapModifier(a, mod);
-            c.BindEvent(evt, wrapped);
+            if (mod == "") { c.BindEvent(evt, a); }
+            else { c.BindEventS(evt, WrapModifier(a, mod)); }
         } else {
-            // 名字没注册 = 处理器漏写/拼错（宿主侧）——同一“点了没
-            // 反应”家族，同样一行警告点名。注册表晚于装载补充的
-            // 二次接线（ChildWindow.WireNode）不受影响：名字已落
-            // 控件，那路命中照样接。
             Console.WriteLine("HTML_WIRE_WARN handler '" + name
                 + "' not registered (" + evt + " on " + c.name + ")");
         }
     }
-
-    // 带参接线（`data-arg`）：按名查带参槽，把实参闭包进无参
-    // Action 再 BindEvent（实参是只读捕获的局部——创建时值快照，
-    // 语义即"这个控件永远带着它的参数"）。名字照落控件；带参槽
-    // 未命中时静默不接（与 Wire 同一契约）。
     public static void WireArg(HtmlHandlers handlers, Control c, string evt,
                         string name, string arg) {
         WireArg(handlers, c, evt, name, arg, "");
     }
-
     public static void WireArg(HtmlHandlers handlers, Control c, string evt,
                         string name, string arg, string mod) {
         if (evt == "") { return; }
@@ -580,24 +487,13 @@ public partial class Html {
         if (handlers == null) { return; }
         Action<string> a = handlers.FindArg(name);
         if (a == null) { return; }
-        string captured = arg;
-        Action<string> wrapped = WrapModifierArg(a, mod);
-        c.BindEvent(evt, () => { wrapped(captured); });
+        if (mod == "") {
+            string captured = arg;
+            c.BindEvent(evt, () => { a(captured); });
+        } else {
+            c.BindEventS(evt, WrapModifierArg(a, arg, mod));
+        }
     }
-
-    // ---- <a> 链接导航（P5 链接语义） --------------------------------
-    // 桌面映射：<a href="http..."> 缺省路由到 Html.linkNavigator（
-    // WebView 家族经 WebViewBootstrap.Install 注册：宿主经
-    // WebViewBootstrap.UseAsLinkTarget 登记的就地图优先，没有就
-    // App 级链接窗口；未安装 WebView 家族的程序直开系统浏览器），
-    // target="_blank"（新弹窗）直接弹系统浏览器。三个入口共用
-    // AutoLink：Html.Load 装载扫描、ModelBinder.WireNode 二次
-    // 接线（模板行克隆等）、宿主对手搭/生成树的 AutoLinkTree。
-
-    // 给一个元素接上缺省导航。已有 Click 监听（data-on-click 或
-    // 宿主程序化 OnClick）即宿主接管，不再叠加；app 为 null 不接
-    // （编译期生成的树没有 App 上下文，由挂载它的窗口 WireNode
-    // 或宿主 AutoLinkTree 补）。幂等：已接 Click 的元素跳过。
     public static void AutoLink(Control c, App app) {
         if (app == null) { return; }
         if (!(c is Element)) { return; }
@@ -607,34 +503,20 @@ public partial class Html {
         bool blank = c.CssAttr("target") == "_blank";
         c.BindEvent("Click", () => { Html.OpenLink(app, href, blank); });
     }
-
-    // 对一棵树做链接扫描（Html.Load / 宿主自挂的手搭或生成树）。
     public static void AutoLinkTree(Control root, App app) {
-        Install();
+        Html.InstallDocument();
         if (root == null) { return; }
         Html.AutoLink(root, app);
         for (int i = 0; i < root.ChildCount(); i = i + 1) {
             Html.AutoLinkTree(root.ChildAt(i), app);
         }
     }
-
-    // href 可路由：仅 http/https（大小写不敏感）。相对路径没有
-    // base 可解析；# 锚在保留树上无滚动目标；javascript:/mailto:
-    // 等其它 scheme 涉及脚本执行或 shell 关联程序——本版一律
-    // 不路由（宁缺毋滥，AI 生成的 UI 不至于误触系统处理器）。
     public static bool Navigable(string href) {
         if (href == "") { return false; }
         string low = href.ToLower();
         return HtmlText.StartsWith(low, "http://")
             || HtmlText.StartsWith(low, "https://");
     }
-
-    // <a href> 的缺省路由（P5 链接语义）。newWindow（target="_blank"
-    // 新弹窗）直接弹系统浏览器；否则优先走内嵌导航器——安装了 WebView
-    // 家族的程序由 WebViewBootstrap.Install() 注册（宿主就地图 Navigate，
-    // 没有就懒建 App 级链接窗口全程复用；WebView 运行时不可用时首帧
-    // 回落系统浏览器）。未安装 WebView 家族的程序一律系统浏览器，
-    // 编译图因此不背 WebView。app 为发起导航的宿主。
     public static void OpenLink(App app, string url, bool newWindow) {
         if (!newWindow && linkNavigator != null) {
             linkNavigator(app, url);
@@ -642,27 +524,8 @@ public partial class Html {
         }
         Html.OpenInSystemBrowser(url);
     }
-
-    // 系统关联程序打开 URI（内嵌导航不可用时的回落通道）。
-    // 平台选择与参数封送由 Process.OpenUrl 统一处理，不经 shell 解释 URI。
-    public static void OpenInSystemBrowser(string url) {
-        Process.OpenUrl(url);
-    }
-
-    // <a href> 内嵌导航器槽：WebView 就地图与 App 级链接窗口都住在
-    // Gui.Component.WebView 侧，由 WebViewBootstrap.Install() 经
-    // SetLinkNavigator 注册进来。未注册 = 链接一律直开系统浏览器。
+    public static void OpenInSystemBrowser(string url) { Process.OpenUrl(url); }
     static LinkNavigateFn linkNavigator;
-
-    // WebView 家族向声明层注册 <a href> 内嵌导航的入口，由
-    // Gui.Component.WebView.WebViewBootstrap.Install() 调用；业务代码
-    // 不要直接调。
     public static void SetLinkNavigator(LinkNavigateFn fn) { linkNavigator = fn; }
-
 }
-
-// <a href> 内嵌导航器（Html.linkNavigator）：由 WebView 家族经
-// Html.SetLinkNavigator 注册；app=发起导航的宿主。返回 true =
-// 已处理（含 WebView 不可用时转交系统浏览器的内部回落）。
 public delegate bool LinkNavigateFn(App app, string url);
-

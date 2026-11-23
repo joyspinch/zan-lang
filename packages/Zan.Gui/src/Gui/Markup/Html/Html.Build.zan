@@ -1,12 +1,7 @@
 using System;
-using System.Diagnostics;
 using System.Json;
 using Gui.Markup;
-using Gui.Widget;
-using Gui.Backend;
-
 namespace Gui;
-
 public partial class Html {
     public static bool IsIntText(string s) {
         if (s == null || s == "") { return false; }
@@ -20,22 +15,7 @@ public partial class Html {
         }
         return true;
     }
-
-    // data-<kebab> → camelCase 属性键（row-factory → rowFactory）。
-    public static string UnkebabKey(string s) {
-        string outp = "";
-        bool up = false;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            char ch = s[i];
-            if (ch == 45) { up = true; continue; }
-            if (up && ch >= 97 && ch <= 122) { outp = outp + (char)(ch - 32); }
-            else { outp = outp + ch; }
-            up = false;
-        }
-        return outp;
-    }
-
-    // 设计方言结构键：语义在构造/装配层消费，不落属性表。
+    public static string UnkebabKey(string s) { return HtmlText.UnkebabKey(s); }
     public static bool IsDialectKey(string k) {
         switch (k) {
             case "kind":
@@ -56,10 +36,6 @@ public partial class Html {
                 return false;
         }
     }
-
-    // data-x-<key> 复合值（PutAttr 同语义）：options 数组拼 "a|b|c"，
-    // columns 数组拼 "width,title|..."，props 对象逐键落属性，其余
-    // JSON 序列化直落。
     public static void ApplyXProp(Control c, string key, string v) {
         if (v == "" || (v[0] != 123 && v[0] != 91)) { c.SetProp(key, v); return; }
         JsonValue parsed = null;
@@ -89,7 +65,6 @@ public partial class Html {
         }
         c.SetProp(key, parsed.ToJson());
     }
-
     public static string JsonJoinOpts(JsonValue opts) {
         if (opts.IsString()) { return opts.AsString(""); }
         if (!opts.IsArray() || opts.Count() == 0) { return ""; }
@@ -99,7 +74,6 @@ public partial class Html {
         }
         return outp;
     }
-
     public static string JsonGridSpec(JsonValue cols) {
         string spec = "";
         for (int i = 0; i < cols.Count(); i = i + 1) {
@@ -113,290 +87,39 @@ public partial class Html {
         }
         return spec;
     }
-
-    // 一条记录 → 一个控件（构造 + 属性协议）。容器自己的文本不在这
-    // 里加——装配阶段按 items 文档序与子控件交错加入。
     public static Control Build(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers) {
         Install();
+        SetCloneFallback(ControlFactory.Create);
+        return Html.BuildNode(wd, n, doc, handlers, ControlFactory.Create);
+    }
+    private static Control BuildNode(WDoc wd, WNode n, HtmlDoc doc, HtmlHandlers handlers,
+                                     ControlFactoryFn factory) {
         string tag = n.tag;
         string id = HtmlText.NodeAttr(n.attrs, "id");
         string type = HtmlText.NodeAttr(n.attrs, "type").ToLower();
-        Control c = null;
-
-        switch (tag) {
-            case "label": {
-                // 与设计器导入路径 TagKind("label")→Label 同语义（A546①）：
-                // 普通路径此前建成裸 Element，无 display 归类，文字一字不画。
-                // 文本三通道：设计稿 data-label / 精确文本 data-text / 正文。
-                Label lb = new Label();
-                string lt = HtmlText.NodeAttr(n.attrs, "data-label");
-                if (lt == "") { lt = HtmlText.NodeAttr(n.attrs, "data-text"); }
-                if (lt == "") { lt = n.text; }
-                lb.InitLabel(lt);
-                c = lb;
-                break;
+        string nativeKind = Html.NativeKind(tag, type);
+        string kind = nativeKind != "" ? nativeKind : TagToKind(tag);
+        Control c = factory != null ? factory(kind) : null;
+        if (c == null) {
+            Element el = new Element();
+            el.InitElement(tag, id);
+            if (n.text != "") { el.AddText(n.text); }
+            for (int i = 0; i < n.attrs.Count; i = i + 1) {
+                el.SetAttr(n.attrs[i].name, n.attrs[i].val);
             }
-            case "button": {
-                Button b = new Button(n.text);
-                c = b;
-                break;
-            }
-            case "textarea": {
-                TextArea ta = new TextArea();
-                ta.InitTextArea(n.text, "");
-                c = ta;
-                break;
-            }
-            case "input": {
-                if (type == "checkbox") {
-                    Checkbox cb = new Checkbox();
-                    c = cb;
-                } else if (type == "radio") {
-                    Radio rb = new Radio();
-                    c = rb;
-                } else if (type == "number") {
-                    InputNumber inpn = new InputNumber();
-                    c = inpn;
-                } else if (type == "range") {
-                    Slider sl = new Slider();
-                    c = sl;
-                } else if (type == "color") {
-                    ColorPicker cp = new ColorPicker();
-                    c = cp;
-                } else if (type == "date" || type == "datetime-local") {
-                    DatePicker dp = new DatePicker();
-                    c = dp;
-                } else if (type == "file") {
-                    Upload up = new Upload();
-                    c = up;
-                } else {
-                    Input inp = new Input();
-                    inp.InitInput(
-                        HtmlText.NodeAttr(n.attrs, "value"),
-                        HtmlText.NodeAttr(n.attrs, "placeholder"));
-                    if (type == "password") {
-                        inp.SetProp("password", "true");
-                    }
-                    c = inp;
-                }
-                break;
-            }
-            case "img": {
-                Image img = new Image();
-                img.InitImage(HtmlText.NodeAttr(n.attrs, "src"),
-                              HtmlText.NodeAttr(n.attrs, "alt"),
-                              "cover");
-                c = img;
-                break;
-            }
-            case "select":
-            case "selectbox":
-            case "select-box":
-            case "zan-select-box": {
-                SelectBox sb = new SelectBox();
-                string opts = "";
-                int selIdx = 0 - 1;
-                int oi = 0;
-                bool hasCustomVal = false;
-                for (int i = 0; i < n.items.Count; i = i + 1) {
-                    WItem it = n.items[i];
-                    if (it.kid < 0) { continue; }
-                    WNode cn = wd.nodes[it.kid];
-                    if (cn.tag != "option") { continue; }
-                    string vAttr = HtmlText.NodeAttr(cn.attrs, "value");
-                    if (vAttr != "") { hasCustomVal = true; break; }
-                }
-                if (hasCustomVal) {
-                    JsonValue arr = JsonValue.NewArray();
-                    for (int i = 0; i < n.items.Count; i = i + 1) {
-                        WItem it = n.items[i];
-                        if (it.kid < 0) { continue; }
-                        WNode cn = wd.nodes[it.kid];
-                        if (cn.tag != "option") { continue; }
-                        string ot = cn.text;
-                        if (ot == "") {
-                            for (int k = 0; k < cn.items.Count; k = k + 1) {
-                                WItem cit = cn.items[k];
-                                if (cit.kid >= 0 || cit.text == "") { continue; }
-                                ot = ot + cit.text;
-                            }
-                        }
-                        ot = ot.Trim();
-                        string valAttr = HtmlText.NodeAttr(cn.attrs, "value");
-                        if (valAttr == "") { valAttr = ot; }
-                        for (int q = 0; q < cn.attrs.Count; q = q + 1) {
-                            if (cn.attrs[q].name == "selected") { selIdx = oi; }
-                        }
-                        JsonValue optObj = JsonValue.NewObject();
-                        optObj.Set("label", JsonValue.NewStr(ot));
-                        optObj.Set("value", JsonValue.NewStr(valAttr));
-                        arr.Append(optObj);
-                        oi = oi + 1;
-                    }
-                    if (arr.Count() > 0) {
-                        sb.SetProp("options", arr.ToJson());
-                    }
-                } else {
-                    for (int i = 0; i < n.items.Count; i = i + 1) {
-                        WItem it = n.items[i];
-                        if (it.kid < 0) { continue; }
-                        WNode cn = wd.nodes[it.kid];
-                        if (cn.tag != "option") { continue; }
-                        string ot = cn.text;
-                        if (ot == "") {
-                            for (int k = 0; k < cn.items.Count; k = k + 1) {
-                                WItem cit = cn.items[k];
-                                if (cit.kid >= 0 || cit.text == "") { continue; }
-                                ot = ot + cit.text;
-                            }
-                        }
-                        ot = ot.Trim();
-                        for (int q = 0; q < cn.attrs.Count; q = q + 1) {
-                            if (cn.attrs[q].name == "selected") { selIdx = oi; }
-                        }
-                        if (ot != "") {
-                            if (oi > 0) { opts = opts + "|"; }
-                            opts = opts + ot;
-                        }
-                        oi = oi + 1;
-                    }
-                    if (opts != "") { sb.SetProp("options", opts); }
-                }
-                if (selIdx < 0 && (opts != "" || hasCustomVal)) { selIdx = 0; }
-                if (selIdx >= 0) { sb.Select(selIdx); }
-                c = sb;
-                break;
-            }
-            case "progress":
-            case "zan-progress": {
-                Progress p = new Progress();
-                string maxVal = HtmlText.NodeAttr(n.attrs, "max");
-                if (maxVal != "") { p.SetProp("max", maxVal); }
-                string curVal = HtmlText.NodeAttr(n.attrs, "value");
-                if (curVal != "") { p.SetProp("value", curVal); }
-                c = p;
-                break;
-            }
-            case "tabs":
-            case "tab-control":
-            case "zan-tabs": {
-                Tabs tb = new Tabs();
-                string opts = "";
-                for (int i = 0; i < n.items.Count; i = i + 1) {
-                    WItem it = n.items[i];
-                    if (it.kid < 0) { continue; }
-                    WNode cn = wd.nodes[it.kid];
-                    if (cn.tag != "tab" && cn.tag != "tab-pane" && cn.tag != "tabpane") { continue; }
-                    string tTitle = HtmlText.NodeAttr(cn.attrs, "title");
-                    if (tTitle == "") { tTitle = HtmlText.NodeAttr(cn.attrs, "label"); }
-                    if (tTitle == "") { tTitle = HtmlText.NodeAttr(cn.attrs, "name"); }
-                    if (tTitle == "") { tTitle = cn.text.Trim(); }
-                    if (tTitle != "") {
-                        if (opts != "") { opts = opts + "|"; }
-                        opts = opts + tTitle;
-                    }
-                }
-                if (opts != "") { tb.SetProp("options", opts); }
-                c = tb;
-                break;
-            }
-            case "table": {
-                Table tbl = new Table();
-                c = tbl;
-                break;
-            }
-            case "tr": {
-                TableRow tr = new TableRow();
-                c = tr;
-                break;
-            }
-            case "th": {
-                TableCell th = new TableCell();
-                th.SetHeader(true);
-                c = th;
-                break;
-            }
-            case "td": {
-                TableCell td = new TableCell();
-                c = td;
-                break;
-            }
-            case "tab-pane":
-            case "tabpane": {
-                TabPane tp = new TabPane();
-                string t = HtmlText.NodeAttr(n.attrs, "label");
-                if (t == "") { t = HtmlText.NodeAttr(n.attrs, "title"); }
-                if (t != "") { tp.SetLabel(t); }
-                c = tp;
-                break;
-            }
-            case "breadcrumb-item": {
-                BreadcrumbItem bi = new BreadcrumbItem();
-                string href = HtmlText.NodeAttr(n.attrs, "href");
-                if (href != "") { bi.SetHref(href); }
-                c = bi;
-                break;
-            }
-            case "timeline-item": {
-                TimelineItem ti = new TimelineItem();
-                string tm = HtmlText.NodeAttr(n.attrs, "time");
-                if (tm != "") { ti.time = tm; }
-                string ttl = HtmlText.NodeAttr(n.attrs, "title");
-                if (ttl != "") { ti.title = ttl; }
-                c = ti;
-                break;
-            }
-            case "collapse-item":
-            case "collapseitem":
-            case "collapse-panel": {
-                CollapseItem ci = new CollapseItem();
-                string ttl = HtmlText.NodeAttr(n.attrs, "title");
-                if (ttl == "") { ttl = HtmlText.NodeAttr(n.attrs, "header"); }
-                if (ttl != "") { ci.Title = ttl; }
-                string bd = HtmlText.NodeAttr(n.attrs, "body");
-                if (bd != "") {
-                    Label bodyLbl = new Label(bd);
-                    bodyLbl.ClassName = "collapse-item-body";
-                    ci.Content = bodyLbl;
-                }
-                c = ci;
-                break;
-            }
-            default: {
-                // 通用动态解析：优先通过 ControlFactory 与已注册组件族（ControlBootstrap,
-                // DataTableBootstrap, ChartBootstrap 等）实例化，杜绝死硬编码
-                // 控件 kind 一律由标签承载（映射表 + zan-<kebab> 帕斯卡
-                // 还原 + 自定义族标签直通），没有属性旁路。
-                string kind = TagToKind(tag);
-                Control created = ControlFactory.Create(kind);
-                if (created != null) {
-                    c = created;
-                } else {
-                    Element el = new Element();
-                    el.InitElement(tag, id);
-                    for (int i = 0; i < n.attrs.Count; i = i + 1) {
-                        el.SetAttr(n.attrs[i].name, n.attrs[i].val);
-                    }
-                    c = el;
-                }
-                break;
-            }
+            c = el;
+        } else {
+            c.SetDocumentFactory(factory, kind);
+            if (nativeKind != "") { Html.InitializeNative(wd, n, c, nativeKind, type); }
         }
-        // Node IDs are metadata; widget properties named "name" keep their defaults.
         if (id != "" && !(c is Element)) { c.name = id; }
-        // data-arg 预扫：属性顺序不保证（data-arg 可写在 data-on-*
-        // 之后），先取出来供本节点全部事件共用；同时落 handlerArg
-        // 字段，ChildWindow.WireNode 的二次接线同源。
         string darg = HtmlText.NodeAttr(n.attrs, "data-arg");
         if (darg != "") { c.handlerArg = darg; }
-        // 属性协议（与 Designer 导入的建树代码同一套语义）
         for (int i = 0; i < n.attrs.Count; i = i + 1) {
             string k = n.attrs[i].name;
             string v = n.attrs[i].val;
-            // 只跳过当前标签确已消费的构造参数；注册控件的同名
-            // 属性必须经 SetProp（ChartHost.type/title、Slider.value 等）。
             if (k == "id" || (tag == "input" && k == "type")
-                || (tag == "input" && c is Input && (k == "value" || k == "placeholder"))
+                || (tag == "input" && nativeKind == "Input" && (k == "value" || k == "placeholder"))
                 || (tag == "img" && (k == "src" || k == "alt"))
                 || ((tag == "progress" || tag == "zan-progress") && k == "value")) {
                 continue;
@@ -418,7 +141,6 @@ public partial class Html {
                 continue;
             }
             if (k == "data-child-tab") {
-                // Designer page indices use the same mounting path as numeric slots.
                 if (c.slotName == "") { c.slotName = v; }
                 continue;
             }
@@ -434,12 +156,10 @@ public partial class Html {
                 c.DeclareBinding(v, boundProperty, true);
                 continue;
             }
-            // One-way declarations use a dotted model path, never an expression.
             if (k.Length > 1 && k[0] == 58) { // ':'
                 c.DeclareBinding(v, k.Substring(1), false);
                 continue;
             }
-            // 事件语法糖解析（data-on-*, @*, v-on:*, z-on:*, on*）
             string evt = "";
             string suffix = "";
             if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
@@ -458,17 +178,13 @@ public partial class Html {
             if (evt != "") {
                 string mod = "";
                 int dotIdx = suffix.IndexOf(".");
-                if (dotIdx >= 0) {
-                    mod = suffix.Substring(dotIdx + 1);
-                }
+                if (dotIdx >= 0) { mod = suffix.Substring(dotIdx + 1); }
                 string hname = v;
                 int pOpen = v.IndexOf("(");
                 if (pOpen >= 0 && v.EndsWith(")")) {
                     hname = v.Substring(0, pOpen).Trim();
                     string argExpr = v.Substring(pOpen + 1, v.Length - pOpen - 2).Trim();
-                    if (darg == "" && argExpr != "") {
-                        darg = argExpr;
-                    }
+                    if (darg == "" && argExpr != "") { darg = argExpr; }
                 }
                 if (darg != "") {
                     Html.WireArg(handlers, c, evt, hname, darg, mod);
@@ -485,9 +201,6 @@ public partial class Html {
             string klow = k.ToLower();
             switch (klow) {
                 case "icon": {
-                    if (c is Button) {
-                        ((Button)c).Icon = v;
-                    }
                     c.SetProp("icon", v);
                     continue;
                 }
@@ -496,33 +209,24 @@ public partial class Html {
                     continue;
                 }
                 case "title": {
-                    // Button 的 HTML title 沿用悬停提示；其他控件
-                    // 自己解释 title，不能把 ChartHost/Card 的标题改成 tip。
-                    c.SetProp(c is Button ? "tip" : "title", v);
+                    c.SetProp(c.Kind() == "Button" ? "tip" : "title", v);
                     continue;
                 }
                 case "tip-side":
                 case "tipside":
                 case "tip-pos": {
-                    if (c is Button) {
-                        ((Button)c).TipSide = v;
-                    }
-                    c.SetProp("tip-side", v);
+                    c.SetProp(c.Kind() == "Button" ? "tipSide" : "tip-side", v);
                     continue;
                 }
                 case "data-label": {
-                    // 设计稿标题通道：控件自画或装配层补标题行
-                    //（FormBuilder.WrapCell 同语义）。
                     if (!(c is Element)) { c.SetDesignText(v); }
                     continue;
                 }
                 case "data-text": {
-                    // 设计稿精确文案：防空白塌缩，直落控件 text。
                     if (!(c is Element)) { c.SetProp("text", v); }
                     continue;
                 }
                 case "data-layout-mode": {
-                    // 自由画布（旧管线 layoutMode=1 同语义）。
                     if (v == "1") { c.FreeLayout(); }
                     continue;
                 }
@@ -536,7 +240,6 @@ public partial class Html {
                     continue;
                 }
                 case "readonly": {
-                    // 裸布尔属性：readonly 出现即生效，与 disabled 同语义。
                     c.SetProp("readonly", "true");
                     continue;
                 }
@@ -565,18 +268,13 @@ public partial class Html {
                 }
                 default: {
                     if (c is Element) { break; }
-                    // 设计稿复合值：data-x-options/x-props/x-columns（JSON
-                    // 直落 options/columns/props，PutAttr 同语义）。
                     if (k.Length > 7 && HtmlText.StartsWith(k, "data-x-")) {
                         Html.ApplyXProp(c, Html.UnkebabKey(k.Substring(7)), v);
                         break;
                     }
                     if (k.Length > 5 && HtmlText.StartsWith(k, "data-")) {
                         string dkey = k.Substring(5);
-                        // 方言结构键：语义在构造/装配层消费，不落属性表。
                         if (Html.IsDialectKey(dkey)) { break; }
-                        // 其余 data-<kebab> 解包成 camelCase 属性键
-                        // （data-placeholder → placeholder）。
                         c.SetProp(Html.UnkebabKey(dkey), v);
                         break;
                     }
@@ -585,17 +283,12 @@ public partial class Html {
                 }
             }
         }
-        if (id != "" && !(c is Element)) {
-            // HTML IDs name nodes, independently of widget properties named "name".
-            c.name = id;
-        }
+        if (id != "" && !(c is Element)) { c.name = id; }
         if (!(c is Element) && doc != null && doc.sizeClass != "" && !Html.HasSizeClass(c.Class)) {
             c.AddClass(doc.sizeClass);
         }
         return c;
     }
-
-
     public static bool IsMetaChild(string ptag, string ctag) {
         switch (ptag) {
             case "table":
@@ -619,9 +312,6 @@ public partial class Html {
                 return false;
         }
     }
-
-
-    // zan-<kebab> → PascalCase kind（ide-surface → IdeSurface）。
     public static string ZanKind(string kebab) {
         string outp = "";
         bool up = true;
@@ -634,15 +324,11 @@ public partial class Html {
         }
         return outp;
     }
-
-    // HTML 标签到控件 Kind 类型的归一化映射
     public static string TagToKind(string tag) {
         if (tag == "") { return ""; }
         string t = tag.ToLower();
         bool zan = HtmlText.StartsWith(t, "zan-");
-        if (zan) {
-            t = t.Substring(4, t.Length - 4);
-        }
+        if (zan) { t = t.Substring(4, t.Length - 4); }
         switch (t) {
             case "datatable":
             case "grid":
@@ -686,9 +372,6 @@ public partial class Html {
                 return "InputNumber";
             case "choicegroup":
             case "choice-group":
-                // ChoiceGroup 是无表面的流布局基类（CheckboxGroup/
-                // RadioGroup 的父），工厂不注册裸基类——标签不进表，
-                // 落 Element 兜底即诚实。
                 return "ChoiceGroup";
             case "radiogroup":
             case "radio-group":
@@ -827,10 +510,8 @@ public partial class Html {
             case "select-box":
                 return "SelectBox";
             default:
-                // zan-<kebab> 自定义族：还原 PascalCase kind 供工厂查表。
                 if (zan) { return ZanKind(t); }
                 return tag;
         }
     }
-
 }

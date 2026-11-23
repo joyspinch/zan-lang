@@ -1,23 +1,13 @@
 using System;
 using System.Collections.Generic;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
-
 namespace Gui.Component;
-
-// 单元格着色委托（BandedGrid 的 RowCellStyle 等位）：返回单元格
-// 底色 0xAARRGGBB；返回 0 表示用默认底色。
 public delegate int BandGridColorOf(int row, int col, string text, int num);
-
-// BandGrid：带分组表头的通用单元格网格（DevExpress BandedGrid
-// 的轻量等位）。每格一个显示文本 + 一个可选数值；支持单元格级
-// 着色回调、格内数据条、点选 / 拖选矩形 / 右键 / 双击，选中格
-// 可批量赋值。结合 CSS Grid 列轨与 VirtualList 视口行复用，数据变更后调 Poke()。
-// 用法：
-// .ColorOf(MyColorOf);
-// g.SetNum(r, c, 100);            // 逐格赋值（数值+文本）
-// g.SetSelectedNum(30);           // 选中格批量设值
+[GuiKind("BandGrid")]
 public class BandGrid : Control {
+    public override Control CreateCloneShell() { return new BandGrid(); }
     private int rows;
     private int cols;
     private List<BandGridCell> cells;
@@ -36,6 +26,9 @@ public class BandGrid : Control {
     private int ctxC;
     private int actR;
     private int actC;
+    private int lastUpMs;
+    private int lastUpR;
+    private int lastUpC;
     private int barMax;
     private int accent;
     private int heatDeep;
@@ -43,9 +36,8 @@ public class BandGrid : Control {
     public UiEvent Changed;
     public UiEvent Context;
     public UiEvent CellActivate;
-
     public BandGrid() {
-        this.InitControl("bandgrid", 1);
+        this.InitControl("bandgrid");
         rows = 0;
         cols = 0;
         cells = new List<BandGridCell>();
@@ -64,10 +56,11 @@ public class BandGrid : Control {
         ctxC = 0 - 1;
         actR = 0 - 1;
         actC = 0 - 1;
+        lastUpMs = 0;
+        lastUpR = 0 - 1;
+        lastUpC = 0 - 1;
         barMax = 0;
         heatDeep = 0;
-        // accent 默认为 0（未指定）；有 App 时由 OnPaint 先经
-        // bandgrid::accent / 主题主色解析覆盖；无 App 独立测试时兜底。
         accent = 0;
         viewportArea = new Rect(0, 0, 0, 0);
         Changed = new UiEvent();
@@ -75,13 +68,8 @@ public class BandGrid : Control {
         CellActivate = new UiEvent();
         wiresOwnEvents = true;
     }
-
     public override string Kind() { return "BandGrid"; }
-
-    // ---- 配置（fluent）------------------------------------------
-
-    // 行列数；单元格为空文本、无数值（-1）。
-    public BandGrid Bind(int r, int c) {
+    public void Bind(int r, int c) {
         App app = this.App;
         if (app != null) { app.ReleaseInputSubtree(this); }
         anchorR = 0 - 1; anchorC = 0 - 1;
@@ -92,93 +80,40 @@ public class BandGrid : Control {
         for (int i = 0; i < r * c; i = i + 1) {
             cells.Add(new BandGridCell("", 0 - 1, 0));
         }
-        return this;
     }
-
-    // 行列数 + 全部单元格初始化为同一数值（文本同值）。
-    public BandGrid BindInit(int r, int c, int initNum) {
+    public void BindInit(int r, int c, int initNum) {
         this.Bind(r, c);
         string initText = Convert.ToString(initNum);
         for (int i = 0; i < cells.Count; i = i + 1) {
             cells[i].num = initNum;
             cells[i].text = initText;
         }
-        return this;
     }
-
-    // 左侧行标签（每行一个，绘制在行首）。
-    public BandGrid RowLabels(List<string> labels) {
-        rowLabels = labels;
-        return this;
-    }
-
-    // 顶部分组表头：每段标签横跨 span 列。
-    public BandGrid BandLabels(List<string> labels, int span) {
+    public void RowLabels(List<string> labels) { rowLabels = labels; }
+    public void BandLabels(List<string> labels, int span) {
         bandLabels = labels;
         bandSpan = span;
-        return this;
     }
-
-    // 单元格级着色回调（返回 0 用默认底色）。
-    public BandGrid ColorOf(BandGridColorOf d) { colorOf = d; return this; }
-
-    // 热力色带（深端锚色，0xAARRGGBB）：数值 1..5 映射为
-    // 表面色→锚色的梯度。浅端在绘制时从当前皮肤的表面色
-    // 派生（亮色皮肤得粉彩、暗色皮肤得暗色调），深端保留
-    // 声明色相，换皮肤即换梯度。显式 ColorOf 优先于本接口。
-    public BandGrid Heat(int deepColor) { heatDeep = deepColor; return this; }
-
-    // 逻辑像素格尺寸（绘制时按 DPI 缩放）。
-    public BandGrid CellSize(int w, int h) { cellW = w; cellH = h; return this; }
-
-    // 数据条满格值（0 关闭数据条，默认关）。
-    public BandGrid BarMax(int v) { barMax = v; return this; }
-
-    // 选中描边与数据条颜色（0xAARRGGBB）。
-    public BandGrid Accent(int argb) { accent = argb; return this; }
-
-    // 值/选中变化（含拖选批量赋值）后触发。
-    public BandGrid OnChanged(Action a) { Changed.Add(a); return this; }
-
-    // 右键单元格（读 ContextRow/ContextCol）。
-    public BandGrid OnContext(Action a) { Context.Add(a); return this; }
-
-    // 双击单元格（读 CellRow/CellCol）。
-    public BandGrid OnCellActivate(Action a) { CellActivate.Add(a); return this; }
-
-    // ---- 状态读取 ------------------------------------------------
-
-    // 最近右键命中的行号（无命中 -1）。
+    public void ColorOf(BandGridColorOf d) { colorOf = d; }
+    public void Heat(int deepColor) { heatDeep = deepColor; }
+    public void CellSize(int w, int h) { cellW = w; cellH = h; }
+    public void BarMax(int v) { barMax = v; }
+    public void Accent(int argb) { accent = argb; }
+    public void OnChanged(Action a) { Changed.Add(a); }
+    public void OnContext(Action a) { Context.Add(a); }
+    public void OnCellActivate(Action a) { CellActivate.Add(a); }
     public int ContextRow() { return ctxR; }
-
-    // 最近右键命中的列号（无命中 -1）。
     public int ContextCol() { return ctxC; }
-
-    // 最近双击命中的行号（无命中 -1）。
     public int CellRow() { return actR; }
-
-    // 最近双击命中的列号（无命中 -1）。
     public int CellCol() { return actC; }
-
-    // ---- 取值赋值 ------------------------------------------------
-
-    // 读单元格文本。
     public string TextAt(int r, int c) { return cells[r * cols + c].text; }
-
-    // 写单元格文本（改后需 Poke() 刷新）。
     public void SetText(int r, int c, string s) { cells[r * cols + c].text = s != null ? s : ""; }
-
-    // 读单元格数值（未绑定返回 -1）。
     public int NumAt(int r, int c) { return cells[r * cols + c].num; }
-
-    // 数值 + 文本一并写（文本即数值十进制串）。
     public void SetNum(int r, int c, int v) {
         int idx = r * cols + c;
         cells[idx].num = v;
         cells[idx].text = Convert.ToString(v);
     }
-
-    // 全部单元格写同一数值并刷新。
     public void SetAllNum(int v) {
         string s = Convert.ToString(v);
         for (int i = 0; i < cells.Count; i = i + 1) {
@@ -187,8 +122,6 @@ public class BandGrid : Control {
         }
         this.Poke();
     }
-
-    // 当前选中格数量。
     public int SelectedCount() {
         if (cells == null) { return 0; }
         int n = 0;
@@ -197,22 +130,16 @@ public class BandGrid : Control {
         }
         return n;
     }
-
-    // 全选。
     public void SelectAll() {
         if (cells == null) { return; }
         for (int i = 0; i < cells.Count; i = i + 1) { cells[i].mark = 1; }
         this.Poke();
     }
-
-    // 清空选区。
     public void ClearMarks() {
         if (cells == null) { return; }
         for (int i = 0; i < cells.Count; i = i + 1) { cells[i].mark = 0; }
         this.Poke();
     }
-
-    // 对所有选中格批量写数值（文本同值）。
     public void SetSelectedNum(int v) {
         if (cells == null) { return; }
         string s = Convert.ToString(v);
@@ -224,8 +151,6 @@ public class BandGrid : Control {
         }
         this.Poke();
     }
-
-    // 对所有选中格批量写文本（不改数值）。
     public void SetSelectedText(string s) {
         if (cells == null) { return; }
         string val = s != null ? s : "";
@@ -234,22 +159,16 @@ public class BandGrid : Control {
         }
         this.Poke();
     }
-
-    // 值或选区在窗体侧变更后调用：请求下一帧重画。
     public void Poke() {
         App app = this.App;
         if (app != null) { app.RequestRedraw(); }
     }
-
-    // ---- 布局与绘制 ----------------------------------------------
-
     public override void OnMeasure(App app) {
         int bandH = this.BandH(app);
         int labW = this.LabelW(app);
         prefW = labW + cols * app.Scale(cellW) + app.Scale(2);
         prefH = bandH + rows * app.Scale(cellH) + app.Scale(2);
     }
-
     public int BandH() { return this.BandH(this.App); }
     public int BandH(App app) {
         if (bandLabels.Count == 0) { return 0; }
@@ -258,7 +177,6 @@ public class BandGrid : Control {
         int sc8 = app != null ? app.Scale(8) : 8;
         return Canvas.FontHeight(sc11) + sc8;
     }
-
     public int LabelW() { return this.LabelW(this.App); }
     public int LabelW(App app) {
         app = this.ResolveApp(app);
@@ -271,8 +189,6 @@ public class BandGrid : Control {
         int sc12 = app != null ? app.Scale(12) : 12;
         return w + sc12;
     }
-
-    // 选区或悬停变化只伤矩阵自身矩形。
     private void Damage() { this.Damage(this.App); }
     private void Damage(App app) {
         app = this.ResolveApp(app);
@@ -281,31 +197,14 @@ public class BandGrid : Control {
             if (app.window != null) { app.window.Wake(); }
         }
     }
-
-    // 覆写：设计器属性（几何与强调色；数据经 Bind/Data 面在代码侧给）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec bs = PropSpec.Int("bandSpan", "Band span");
-        bs.Field("bandSpan", 1);
-        bs.StepBy(1);
-        bs.WithTip("Rows per band (0 = auto from the band labels).");
-        ps.Add(bs);
-        PropSpec cw = PropSpec.Int("cellW", "Cell width");
-        cw.Field("cellW", 1);
-        cw.Step(1, 4, 96);
-        ps.Add(cw);
-        PropSpec ch = PropSpec.Int("cellH", "Cell height");
-        ch.Field("cellH", 1);
-        ch.Step(1, 4, 96);
-        ps.Add(ch);
-        PropSpec acc = PropSpec.Color("accent", "Accent");
-        acc.Field("accent", 1);
-        acc.WithTip("Band / selection accent colour. 0 = skin default.");
-        ps.Add(acc);
+        ps.Add(PropSpec.Int("bandSpan", "Band span").Field("bandSpan", 1).StepBy(1).WithTip("Rows per band (0 = auto from the band labels)."));
+        ps.Add(PropSpec.Int("cellW", "Cell width").Field("cellW", 1).Step(1, 4, 96));
+        ps.Add(PropSpec.Int("cellH", "Cell height").Field("cellH", 1).Step(1, 4, 96));
+        ps.Add(PropSpec.Color("accent", "Accent").Field("accent", 1).WithTip("Band / selection accent colour. 0 = skin default."));
         return ps;
     }
-
-    // 属性协议（动态宿主与范式二绑定）
     public override string GetProp(string name) {
         if (name == "bandSpan") { return Convert.ToString(bandSpan); }
         if (name == "cellW") { return Convert.ToString(cellW); }
@@ -314,7 +213,6 @@ public class BandGrid : Control {
         if (name == "accent") { return Convert.ToString(accent); }
         return base.GetProp(name);
     }
-
     public override void SetProp(string name, string val) {
         if (name == "bandSpan") { bandSpan = Convert.ToInt32(val); return; }
         if (name == "cellW") { cellW = Convert.ToInt32(val); return; }
@@ -323,20 +221,17 @@ public class BandGrid : Control {
         if (name == "accent") { accent = Convert.ToInt32(val); return; }
         base.SetProp(name, val);
     }
-
     public override StyleBox ResolveStyle(App app, int state) {
         StyleBox box = base.ResolveStyle(app, state);
         if (box.overflowCss == 0 - 1) { box.overflowY = 2; box.overflow = 1; }
         return box;
     }
-
     public override Rect ScrollViewport() {
         Rect view = base.ScrollViewport();
         int header = this.BandH(this.App);
         if (header > view.height) { header = view.height; }
         return new Rect(view.x, view.y + header, view.width, view.height - header);
     }
-
     public override void Arrange(int x, int y, int w, int h) {
         bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
         App app = this.App;
@@ -351,7 +246,6 @@ public class BandGrid : Control {
         if (scrollY < 0) { scrollY = 0; }
         viewportArea.Set(view.x, view.y, view.width, view.height);
     }
-
     private int ColumnWidth(App app) {
         int cw = app.Scale(cellW);
         int labW = this.LabelW(app);
@@ -361,7 +255,6 @@ public class BandGrid : Control {
         }
         return cw;
     }
-
     private bool LocateCell(int x, int y) {
         App app = this.App;
         hoverR = 0 - 1; hoverC = 0 - 1;
@@ -377,7 +270,6 @@ public class BandGrid : Control {
         hoverR = r; hoverC = c;
         return true;
     }
-
     private void ExtendSelection(int x, int y) {
         if (anchorR < 0 || !this.LocateCell(x, y)) { return; }
         int loR = anchorR < hoverR ? anchorR : hoverR;
@@ -391,7 +283,6 @@ public class BandGrid : Control {
         }
         this.Damage();
     }
-
     public override void OnPointerDown(RoutedEventArgs e) {
         App app = this.App;
         if (app == null || this.IsDisabled() || !this.LocateCell(e.x, e.y)) { return; }
@@ -410,7 +301,6 @@ public class BandGrid : Control {
         this.Damage();
         e.Handle();
     }
-
     public override void OnPointerMove(RoutedEventArgs e) {
         if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
         App app = this.App;
@@ -423,21 +313,25 @@ public class BandGrid : Control {
             this.Damage();
         }
     }
-
     public override void OnPointerLeave(RoutedEventArgs e) {
         hoverR = 0 - 1; hoverC = 0 - 1;
         this.Damage();
     }
-
     public override void OnPointerUp(RoutedEventArgs e) {
         App app = this.App;
         if (app == null || app.window.EventButton() != 0 || anchorR < 0
             || app.GetCapturedPointer() != this) { return; }
         if (this.IsDisabled()) { this.OnPointerCancel(e); return; }
         this.ExtendSelection(e.x, e.y);
-        if (this.LocateCell(e.x, e.y) && app.DoubleClickNow()) {
-            actR = hoverR; actC = hoverC;
-            CellActivate.PostS(this);
+        if (this.LocateCell(e.x, e.y)) {
+            int now = Window.GetTickMs();
+            if (hoverR == lastUpR && hoverC == lastUpC && lastUpMs > 0 && (now - lastUpMs) <= 400) {
+                actR = hoverR; actC = hoverC;
+                CellActivate.PostS(this);
+                lastUpMs = 0; lastUpR = 0 - 1; lastUpC = 0 - 1;
+            } else {
+                lastUpMs = now; lastUpR = hoverR; lastUpC = hoverC;
+            }
         }
         anchorR = 0 - 1; anchorC = 0 - 1;
         app.ReleasePointerCapture();
@@ -445,18 +339,14 @@ public class BandGrid : Control {
         this.Damage();
         e.Handle();
     }
-
     public override void OnPointerCancel(RoutedEventArgs e) {
         anchorR = 0 - 1; anchorC = 0 - 1;
         App app = this.App;
         if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
         this.Damage();
     }
-
     public override void OnPaint(App app) {
-        if (rows <= 0 || cols <= 0 || cells.Count < rows * cols) {
-            return;
-        }
+        if (rows <= 0 || cols <= 0 || cells.Count < rows * cols) { return; }
         Canvas c = app.canvas;
         int labW = this.LabelW(app);
         int cw = this.ColumnWidth(app);
@@ -466,7 +356,6 @@ public class BandGrid : Control {
         int bandH = this.BandH(app);
         Rect frame = base.ScrollViewport();
         int ox = frame.x + labW;
-
         StyleBox head = Style.Part(app, "bandgrid", "head", "panel",
                                    "", "", Style.SNormal());
         StyleBox body = Style.Part(app, "bandgrid", "body", "panel",
@@ -485,13 +374,8 @@ public class BandGrid : Control {
             themedAccent = themed != 0 ? themed : app.theme.primary;
         }
         int heatLo = 0;
-        if (heatDeep != 0 && colorOf == null) {
-            heatLo = App.LerpColor(bodyBg, heatDeep, 160);
-        }
-
+        if (heatDeep != 0 && colorOf == null) { heatLo = App.LerpColor(bodyBg, heatDeep, 160); }
         c.FillRect(frame.x, frame.y, frame.width, frame.height, bodyBg);
-
-        // 顶部分组表头（固定在顶部，不随内容纵向滚动）
         if (bandH > 0) {
             c.FillRect(frame.x, frame.y, labW, bandH, headBg);
             for (int i = 0; i < bandLabels.Count; i = i + 1) {
@@ -503,35 +387,24 @@ public class BandGrid : Control {
             }
             c.DrawLine(frame.x, frame.y + bandH - 1, frame.x + frame.width, frame.y + bandH - 1, app.theme.divider, 1);
         }
-
-        // 视口与行虚拟化（VirtualList 视口复用范式）
         int viewX = viewportArea.x;
         int viewY = viewportArea.y;
         int viewW = viewportArea.width;
         int viewH = viewportArea.height;
         if (viewH <= 0) { return; }
-
         c.PushClip(viewX, viewY, viewW, viewH);
-
         int r0 = scrollY / ch;
         if (r0 < 0) { r0 = 0; }
         int r1 = (scrollY + viewH) / ch + 1;
         if (r1 > rows) { r1 = rows; }
-
         bool showText = cw >= app.Scale(22);
         for (int r = r0; r < r1; r = r + 1) {
             int y0 = viewY + r * ch - scrollY;
-            // 行首标签
             c.FillRect(viewX, y0, labW, ch, headBg);
-            if (r < rowLabels.Count) {
-                c.DrawTextCentered(viewX, y0, labW, ch, rowLabels[r], fg, fs);
-            }
-
-            // 行内单元格
+            if (r < rowLabels.Count) { c.DrawTextCentered(viewX, y0, labW, ch, rowLabels[r], fg, fs); }
             for (int k = 0; k < cols; k = k + 1) {
                 int idx = r * cols + k;
                 int x0 = ox + k * cw;
-
                 int colBg = bodyBg;
                 if (colorOf != null) {
                     colBg = colorOf(r, k, cells[idx].text, cells[idx].num);
@@ -543,7 +416,6 @@ public class BandGrid : Control {
                         colBg = App.LerpColor(heatLo, heatDeep, hv * 200);
                     }
                 }
-
                 c.FillRect(x0, y0, cw - 1, ch - 1, colBg);
                 int nv = cells[idx].num;
                 if (nv > 0 && barMax > 0) {
@@ -557,17 +429,13 @@ public class BandGrid : Control {
                     c.DrawTextCentered(x0, y0, cw - 1, ch - 1,
                                        cells[idx].text, fg, fs);
                 }
-
                 if (cells[idx].mark != 0) {
                     c.DrawRect(x0, y0, cw - 1, ch - 1, themedAccent, 2);
                 } else if (hoverR == r && hoverC == k) {
                     c.DrawRect(x0, y0, cw - 1, ch - 1, fg, 1);
                 }
-
-
             }
         }
-
         c.PopClip();
     }
 }

@@ -1,71 +1,37 @@
 using System;
 using Gui.Backend;
-
 namespace Gui;
-
 public partial class App {
     Window window;
     Canvas canvas;
     FocusManager focus;
     HitTester hitTester;
     bool isRunning;
-    // Native queue delegates own the work; the App only indexes pending work.
     weak AppPostWork postHead;
     weak AppPostWork postTail;
     bool needsRedraw;
-    // 「别阻塞等事件，这一圈就回来」——与 needsRedraw 不同，它不
-    // 声称有像素变了。自动化驱动、外部泵这类需要循环持续转的
-    // 场景用它，避免为了轮询而把每一帧都升级成整窗重绘。
     bool pollPending;
     int lastPollResult;
-    // 被 SafeFrame/PumpSafe 捕下的帧异常计数与最后一条消息：
-    // 界面可以把它当状态显示（“本次运行有 N 个错误”）。
     int frameErrors;
     string lastFrameError;
-    // 注册的帧绘制体（SetFrameBody）。窗口过程在系统模态
-    // 尺寸调整循环里用它就地画帧，见 PaintFromWndProc。
     FrameBody frameBody;
-    // 最后一个注册了帧体的 App。窗口过程回调是普通函数
-    // 指针，拿不到实例，因此在这里存一份。
-    static App frameApp;
-
-    // 最近一次注册过帧体的 App（主窗口）。纯静态助手拿不到控件
-    // 树上的 app 时用它回落——帧绘制路径上（本进程只有一个主窗）
-    // 它就是当前正在画的 App；ChildWindow 树渲染时 app 由宿主
-    // 显式传递，不走这里。无帧体的控制台探针返回 null。
-    public static App FrameApp() { return App.frameApp; }
-    public static App Current { get { return App.frameApp; } }
-    // 窗口过程画帧时置位。呈现会改窗口状态（分层窗口的
-    // UpdateLayeredWindow 就带尺寸），系统可能就地再投一条尺寸
-    // 消息进来：不拦住就会在上一帧还没呈现完时开始画下一帧，
-    // 两帧共用同一块表面。
-    static bool wndProcPainting;
+    public static App FrameApp() { return GuiCoreState.Current().frameApp; }
+    public static void SetFrameApp(App app) { GuiCoreState.Current().frameApp = app; }
+    public static App Current { get { return GuiCoreState.Current().frameApp; } }
+    internal static bool WndProcPainting() { return GuiHostState.WndProcPainting(); }
+    internal static void SetWndProcPainting(bool value) { GuiHostState.SetWndProcPainting(value); }
     int frameCount;
     int mouseX;
     int mouseY;
-    int scrollY;
-    int contentHeight;
     int scrollSpeed;
     int dpiScale;
-    // 构造期请求的逻辑设计尺寸。全屏宿主（Android 上全屏表面）
-    // 不会按请求给窗口尺寸，Show() 依靠
-    // 这两个值把 dpiScale 重新拟合到「设计整页放进客户区」。
     int designW;
     int designH;
-    // 游戏舞台窗口（CreateDarkStage）：客户区 = 设计尺寸的物理 1:1，
-    // chrome 度量仍跟随设备 DPI（见 Show 的拟合豁免）。
     bool physicalStage;
     int titlebarH;
     int captionBtnW;
-    // 品牌图标字形名（默认空 = 用程序自己的图标；应用显式设置时
-    // 画图标库里的字形，如 "rocket"）。大小/颜色走
-    // CSS `titlebar::brand`。
     string chromeBrandIcon;
-    // 程序图标注册到图片模块后的 mem: key（空 = 还没取到）。
     string chromeBrandImageKey;
-    int splitX;
-    int sidebarScrollY;
-    int sidebarContentHeight;
     bool isDark;
     bool isChildWindow;
     bool isTopmost;
@@ -73,8 +39,6 @@ public partial class App {
     bool showMinimizeButton;
     bool showMaximizeButton;
     bool showCloseButton;
-    // 上一帧画出来的那条标题提示（它的按钮 id 与提示区左边）；
-    // 0 = 上一帧没有提示。
     int capTipId;
     int capTipX;
     string pinTipText;
@@ -85,377 +49,113 @@ public partial class App {
     int fxKindOverride;
     Dict<int, StyleSheet> baseSheets;
     int baseSheetGen;
-    // 运行期 HTML 装载的作用域序号：每次 Html.Load 递增，造出
-    // zs-load-<n> 文档作用域类（与 Gui.Designer 设计器通道同一
-    // scoping 语义，变换器共用 Gui.Markup.HtmlScope）。
     int htmlLoadSeq;
-    // 用户偏好"减少动态效果"（对应 CSS `prefers-reduced-motion:
-    // reduce`）。默认 false；宿主可按系统无障碍设置打开。
     bool reducedMotion;
-    // retained 渲染树正在绘制/解析样式的节点（RenderTree 进入时推入、
-    // 退出时恢复）。组合器链（`panel > button`）与结构性伪类
-    // （`:first-child`）用它作匹配上下文；immediate 路径为 null，
-    // 这类选择器不命中但规则不丢。
     Control styleCtx;
-    // 当操作系统正在合成真实的半透明背景（Win11
-    // 亚克力 / macOS 毛玻璃 / Linux 合成器模糊）时为此窗口后面置 true。
-    // 当玻璃皮肤激活时由 ApplyTheme 设置。开启时，帧被
-    // 清除为透明，并跳过应用内壁纸，使模糊的
-    // 桌面从缝隙中透出。
+    internal int paintOffsetX;
+    internal int paintOffsetY;
     bool glassNative;
-    // 窗口外轮廓圆角开关（SetWindowRoundCorners）：true 时在
-    // Windows 11 上经 DWMWA_WINDOW_CORNER_PREFERENCE 请求 DWM 圆角
-    // （抗锯齿、含系统投影，零绘制成本）；异形窗口互斥——
-    // SetWindowShape("") 恢复矩形后重新按需应用。旧系统为无操作。
     bool windowRound;
     bool windowRoundSet;
-
-    // 上次通过 SetWindowOpacity 设置的整窗不透明度百分比（0 = 从未设置，
-    // 视为 100/不透明）。
     int windowOpacity;
-    // 用户能否拖边框 / 最大化改变窗口大小（设计里的 resizable）。
     bool windowResizable;
-    // 窗口轮廓：0 = 矩形，1 = 异形。非零值窗口按
-    // 逐像素 alpha（分层窗口）合成；当
-    // DWM 关闭时使用经典区域：BeginFrame 将表面完全清除为透明，控件树
-    // 绘制形状，操作系统负责合成。shapeSpec 保存联合
-    // 规格（"t,x,y,w,h,r;..." 逻辑像素），shapeRadius 保存第一个区域的
-    // 圆角半径（供 WindowShapeRadius() 使用）。
     int shapeMode;
     int shapeRadius;
     string shapeSpec;
-    // 异形轮廓投影（逻辑像素扩散量，0 = 无）：系统表面会向四周
-    // 外扩 shapeShadow 逻辑像素（Win32 FitShapeWindow / 非 Windows
-    // 后端 zan_gui_set_shape 各自负责），RenderBackground 在控件树
-    // 之前把柔和投影画进轮廓外的这圈扩展带。设计中的 winShadow
-    // 还会让 formgen 前置追加一个 type-3 "阴影带"区域（全窗口
-    // 圆角矩形）到规格中，标记外扩后的表面边界。shapeRects 以
-    // 逻辑像素镜像已解析的规格，使 App 无需接触后端即可绘制阴影。
     int shapeShadow;
     WindowShapeDescription shapeDescription; // 强类型窗口几何协议唯一真理源
     WindowShapeDescription maxSavedShapeDesc;
     List<WindowShapeRegion> shapeRegions;  // 强类型窗口轮廓区域实体集合（唯一主表示）
-    // SetWindowShadow 外扩时整份规格被平移 (px, px)（FitShapeWindow
-    // 拒绝负坐标包围盒，见 SetWindowShadow 注释），因此画布上的内容
-    // 轮廓相对窗口左上角偏移了 (px, px)：阴影、填充与自绘标题栏
-    // 都要按这个偏移定位，否则整幅画面会"缩"进窗口右下角。
     int shapeOffX;
     int shapeOffY;
     string maxSavedShapeSpec;
     int maxSavedShapeShadow;
-    // 是否绘制自定义标题栏装饰（品牌区 + 标题按钮）。
-    // 对于设计自带头部区域的异形/无边框窗口保持隐藏；
-    // 无论哪种方式，操作系统都会保持顶部 TitlebarHeight() 条带可拖动。
     bool showChrome;
-    // 标题栏上应用自己写入的动态信息（登录/授权、性能指标等），
-    // 画在标题文字之后、标题按钮之前。chromeStatus 用常规文本色，
-    // chromeAccent 用强调色，见 SetChromeStatus。
     string chromeStatus;
     string chromeAccent;
-    // 本帧内希望消费鼠标滚轮事件的矩形区域（画布坐标）
-    // —— 例如带自身内部行滚动的 DataTable 主体。当
-    // 指针位于其中时，ProcessEvent 会抑制页面滚动，使滚轮
-    // 转而驱动该控件。每帧在 BeginFrame 中重置。
-    int wheelCapX;
-    int wheelCapY;
-    int wheelCapW;
-    int wheelCapH;
-    int wheelClaimSeq;
-    int wheelCapOrder;
-    int wheelOwnerOrder;
-    // 滚轮两段式认领的第二段（消费回放）：所有权=上一帧认领，
-    // 指针刚跨入滚动区时上一帧无人认领（ownerOrder=0），第一格
-    // 滚轮在渲染期被所有声明者拒绝。wheelClaimSeen 记"本帧有滚轮
-    // 且有声明者认领"，wheelConsumed 记"有人真消费了"；PresentFrame
-    // 见到"有认领、无消费"就把同一格滚轮回灌事件队列，下一帧
-    // 认领已武装，由正确声明者（嵌套时最内层）消费——第一格从
-    // 静默丢失变为一帧延迟。wheelReplayArmed 保证每条事件链至多
-    // 回放一次：回放格再无人消费（渲染树抖动致序号错位）就维持
-    // 旧行为丢弃，绝不循环回放。每帧在 BeginFrame 中重置前两者。
-    bool wheelClaimSeen;
-    bool wheelConsumed;
-    bool wheelReplayArmed;
     bool blocksInputBelow;
     bool inputBlockPrevious;
-    // 本帧/上一帧的全窗口阻挡是否来自上下文菜单
-    // （BlockHitsMenu）。菜单只拥有主键：右键要能穿到它下面，
-    // 否则菜单一开，在别处右键什么也不会发生，必须先把它关掉。
-    bool menuBlock;
-    bool menuBlockPrevious;
-    int menuHoverRow;
-    int scrollbarGrabId;
-    int scrollbarGrabDy;
     string tooltipText;
     int tooltipX;
     int tooltipY;
     int tooltipPlace;
     int tooltipMaxW;
-    // 当前主键点击已在本次帧的剩余部分被消费 ——
-    // 当模态遮罩在帧中途首次出现时自动设置（打开它的那次点击
-    // 已被消耗），或通过 ClaimClick() 显式设置。读取原始点击事件的
-    // 界面必须测试 ClickAvailable() 而不是直接读取窗口
-    // 事件，这样点击永远不会穿透到它自己刚刚打开的模态框
-    // 中。每帧在 BeginFrame 中重置。
     bool clickClaimed;
-    // 一次释放只投递给一帧：持续动画（星空、spinner）会在下个
-    // 事件到来前反复出帧，而 EventKind 停留在 3；没有此锁定时
-    // 按钮等会在每个动画帧重新触发（通知连发、点击计数暴涨）。
-    // frameSeq 由 BeginFrame 递增；clickSeenSeq 记录当前释放
-    // 首次被读到的帧（-1 = 新释放尚未绑定）。
-    // 解除绑定只认"没见过的新释放事件"：自定义循环的动画分支
-    // 可以不泵事件就出帧，此时 EventKind 回读上一次的旧值，
-    // 单看 kind==3 会把同一次释放每帧都当成新的（点击每帧
-    // 重触发）。clickEvSeq 记录已解除绑定的事件序号。
     int frameSeq;
     int clickSeenSeq;
     long clickEvSeq;
-
-    // --- 事件分发 ---
-    // 当前鼠标事件的目标，在 ProcessEvent 中每事件解析一次，
-    // 依据上一帧完整的命中区域（其中
-    // 已包含顶部的弹窗/浮层）。控件通过 Ui.Clicked/Pressed
-    // 询问自己是否是该目标，这样一次点击只投递给一个
-    // 控件 —— 指针下的最顶层控件 —— 而不是每个
-    // 在自身渲染时碰巧重新读取原始事件的控件。
     int clickTargetId;
     int pressTargetId;
     bool pointerDown;  // 按住左键（控件外的拖拽需要移动重绘）
-    // 按下（左键）落点是否为阻挡区/空白（上一帧命中快照里该点
-    // 只被 BlockHitsRect/BlockHitsBelow 的遮罩或什么都没有覆盖）。
-    // 弹层「按外部关闭」正是把这样一下按下当作关闭指令；若随后
-    // 的释放仍照常发布点击目标，新弹层不存在的下一帧里该点解析
-    // 到其下的真实控件——同一次手势先关弹层又点穿到下面的内容。
-    // 释放路径据此抑制点击发布（与触摸拖拽 EventFlag==1 同一道
-    // 防线）。见 ProcessEvent/ApplyEvent 的 kind==3 分支。
     bool pressOnBlocker;
-    // 次要（右键）鼠标按钮目标，解析方式与
-    // 主键点击/按下目标相同，但保持独立，这样右键永远不会
-    // 触发 Ui.Clicked 或抢占键盘焦点。通过 RightClickTarget()
-    // / RightPressTarget() 读取（参见 Ui.RightClicked）。
     int rightClickTargetId;
     int rightPressTargetId;
-    // 双击 / 双点检测。lastClickId + lastClickMs 记录
-    // 最近一次完成的点击；doubleClickNow 是一个单帧标志，当
-    // 第二次点击在双击时间窗口内落在同一 id 上时置位。通过
-    // DoubleClickNow() / Ui.DoubleClicked 读取。
     int lastClickId;
     int lastClickMs;
+    int lastClickX;
+    int lastClickY;
     bool doubleClickNow;
-    // 触摸/指针手势状态。按下时我们快照目标 id、
-    // 指针位置和墙钟时间；释放时根据移动距离推导出滑动
-    // 方向，按住期间 PollLongPress() 在
-    // 按住时间超过阈值且移动不多时报告一次长按。
-    // 单指触摸以合成的鼠标序列到达，因此这些
-    // 无需任何运行时改动即可在触摸屏上工作（多点触控/捏合则需要
-    // C 运行时中的真实 WM_TOUCH / XInput2 支持）。
     int pressStartX;
     int pressStartY;
     int pressStartMs;
     int pressStartId;
     bool longPressFired;
-    int swipeDir;
-    // 本次按压认领拖拽的控件 id（ClaimDrag）。触摸手势分扬用：
-    // 按住期间到达的滚轮只有归认领者（或文本/缩放光标类型的
-    // 命中区）时才重标为移动，其余放行为滚动。每次按压复位。
     int dragClaimId;
-    // 延迟的浮层弹窗（Select/SelectBox/Dropdown/Menu 选项列表）。
-    // 它们在主内容阶段之后运行，因此既绘制在其上方，又
-    // 最后注册命中区域（使它们成为最顶层目标）。数据
-    // 而非回调，因为 Zan 委托无法捕获局部变量 / 绑定 `this`。
-    // 在帧内收集，由 RunOverlays 排空，在 BeginFrame 中清除。
     List<OverlayPopup> overlays;
     public OverlayHost overlayHost;
     public object layerContext;
-
-    // 本帧登记的原生浮层（WebView 等 OS 兄弟层）与遮挡区。原生视图
-    // 永远画在软件画布之上，所以它们不自己决定可见性，而是登记
-    // 想占的矩形，由 PresentFrame 在弹层之后统一算出可见区域并
-    // 下发裁剪（见 NativeLayer）。同样在 BeginFrame 中清除。
     List<NativeLayerReq> nativeLayers;
     List<int> nativeOccluders;
-    // 只吞点击、不画任何像素的全窗口拦截区（BlockHitsBelow）。菜单/
-    // 下拉铺它是为了让外部点击关掉自己，画的只有那一小块菜单体，
-    // 因此它不能算作原生浮层的遮挡区——否则一开右键菜单，整页网页
-    // 就被裁成空区域消失。真正遮住整窗的变暗遮罩自己调
-    // NativeLayer.Occlude 声明。
     List<int> hitOnlyBlockers;
-    // 最近下发给外壳的缩放填充色（-1 = 尚未下发）。
     int lastResizeBg;
-
     int nowMs;
     int lastFrameMs;
-    // 可选帧分析器（ZAN_FRAME_PROF=1）：累计每帧的渲染和
-    // 提交成本，每 120 帧追加一行平均值
-    // 到进程目录下的 zan_frame_perf.log。0 = 尚未读取环境变量，
-    // 1 = 开启，2 = 关闭。
-    static int perfMode;
-    // 局部帧（悬停条带、动画矩形、纯特效就地呈现）的总开关，默认
-    // 关闭：每一帧都整窗重绘并整窗上传。见 SetPartialFrames。
     bool partialFrames;
-    // 刚处理过滚轮（kind 13）：滚动把内容挪到了指针底下，而悬停
-    // 目标按旧内容解析的，需要在出帧（命中区已按新位置重注册）之后
-    // 重算一次。见 RefreshScrollHover。
     bool scrollHoverDirty;
-    // 本应用要求的光栅器：RenderBackend.Cpu/Gpu/Auto。默认 CPU，见
-    // SetRenderBackend。
     int renderBackendMode;
     int wakeNextMs;
     int wakeFrameNextMs;
-    // 自上一帧以来收到过需要重绘的真实输入事件（按下/释放/按键/滚轮）。
-    // 这类事件改变哪些像素只有控件自己在渲染中读到 Ui.Clicked/焦点
-    // 之后才知道，控件不可能提前声明；裁剪到动画声明范围的帧又只
-    // 渲染条带内的控件——点击目标不在条带里就既读不到点击也画不出
-    // 状态，直到某次偶然覆盖它的帧（表现为点击迟钝甚至丢失）。所以
-    // 输入帧必须整帧：partialPending 只允许纯动画/唤醒帧设置。
-    // 滚轮入列的原因不同：滚轮同样在渲染期才被消费（CaptureWheel
-    // 仲裁），但它的损伤条带按「谁先声明」累计——连续滚动时上一帧
-    // 的条带只盖住上一帧的位移量，本帧多滚出的那一段沿用陈旧像素
-    // （概率性花屏 + 滚动条与内容短暂错位，感知为滚动条回跳）。
-    // 见 wheelScrollInput：滚轮把本帧收窄为「上一帧认领视口」条带，
-    // 而不是和按下/按键一样整帧。
     bool inputNeedsFrame;
-    // 本批事件里有滚轮（kind 13）：滚轮的消费与损伤都发生在渲染期
-    // （CaptureWheel 仲裁 + 声明者 NoteScrollDamage），而声明者几何
-    // 就是上一帧的 wheelCap 矩形——滚轮不改变控件布局，矩形跨帧稳定。
-    // 因此滚轮帧不必整窗：本帧裁剪到「上一帧认领的视口 ∪ 页面滚动
-    // 声明区 ∪ 指针邻域」（见 TakeDueWheelRect），条带外的控件不重
-    // 绘但也毫无变化，命中区沿用上一帧快照。判定保留下列整帧情形：
-    // 按住拖拽/弹层/模态拥有滚轮（wheel-pressed/wheel-blocked 分支，
-    // 改的像素不止滚动区）、上一帧没有任何认领（指针刚进入滚动区，
-    // cap 过期——整帧兜底，见 wheel-unclaimed）、无认领但 contentHeight
-    // 页面滚动（滚动区=除侧栏外整页，条带近似整窗，直接整帧更省）。
-    // 这正是 commit d59d7149f「滚轮列入 inputNeedsFrame」的继续：
-    // 那次修的是「条带只盖住上一帧位移量」的错位——如今条带直接
-    // 取上一帧认领视口，位移量天然被包含，错位不再可能。
     bool wheelScrollInput;
-
-    // 当前帧处理了真实操作系统事件（输入、缩放、
-    // 等）时为 true。纯动画重绘（转圈、缓动步进）在没有
-    // 事件时唤醒，使玻璃后面的背景保持不变，从而其模糊/壁纸
-    // 可以从缓存提供。参见 BackdropDirty()。
     bool backdropDirty;
-
-    // 匿名玻璃表面的逐帧序号（按绘制顺序编身份）。
-    // 在 BeginFrame 中重置；由 NextBlurSlot() 递增。
     int blurSlotSeq;
-
-    // 模糊缓存槽的常驻分配表：每项记录占用该槽的元素身份（0=空槽）、
-    // 最后使用的帧号以及最后一次换手的帧号（以 BlurSlot 实体承载，消除平行列表）。
-    // 槽位过去按绘制顺序逐帧发放，于是某一帧多画/少画一个玻璃
-    // 面板，它后面所有面板都会平移一格，各自捡到别人的缓存——
-    // 几何不符 => 全部重新模糊。改为按身份查表后，同一元素每帧
-    // 拿回同一槽，与绘制顺序和邻居的出现/消失无关；表满时淘汰
-    // 最久未用的槽。
     List<BlurSlot> blurSlots;
     int bgSnapGen;
-    // 本窗口的样式解析缓存（Style.CacheGet/CachePut 的存储）。
-    // 缓存的是本窗口自己的皮肤+appCss 解析结果，必须每窗口一份，
-    // 避免多窗口应用中主窗/子窗相互击穿缓存导致帧率骤降。
     Dict<string, StyleBox> styleCache;
     int styleCacheGen;
-
-    // 主题度量（字号/高度/内边距/圆角……）当前被临时缩放到的千分比：
-    // 1000 = 主题原始度量。设计器渲染真控件预览时按画布缩放整体改写
-    // 主题度量（见 Designer.BeginCtrlZoom），解析出来的样式随之不同，
-    // 必须把它算进键里。它不是“代次”而是“状态”：在缩放与原始度量之间
-    // 来回切换时两份缓存并存，不像递增 bgThemeGen 那样每个控件都把
-    // 整张表连 base.css 的解析结果一起作废。
     int metricsScale;
-
-    // 动态背景效果（Theme.fx / Gui.BackdropFx）。默认开启；
-    // SetBackdropFx(false) 会关闭窗口的皮肤动态效果。当当前
-    // 皮肤带有效果时，RenderBackground 将其叠加在静态
-    // 壁纸快照之上，并重新装备一个节流动画帧。
     bool fxEnabled;
-
-    // 动态背景快速路径。效果层在 PresentFrame 中被合成到
-    // 完成帧的顶部，同时在不带效果的情况下快照该帧
-    // （槽位 7）。这样一次纯效果跳动只需
-    // 一次全帧恢复 + 几十次小型填充 + 提交 —— 无需
-    // 控件重渲染，也无需玻璃重新模糊。fxNextMs 是下一次跳动的截止时间（-1 =
-    // 无）；fxSnapValid 表示槽位 7 保存着当前帧。
     int fxNextMs;
     bool fxSnapValid;
-    // 上一次整窗合成特效所用的时间点：损伤裁剪帧以同一
-    // 相位重新合成，使重绘的条带与周围的背景动画对齐。
     int fxFrameMs;
-    // 同拍页面帧前已推进 Fx，损伤等待该页面的唯一一次呈现。
     bool fxPagePending;
-
-    // ---- 脏区裁剪（部分）帧 ------------------------------------
-    // 纯悬停移动只会改变指针离开的控件和它进入的
-    // 控件，但过去它会重绘（并重新混合）整个窗口。当
-    // 没有其他变化时，下一帧被裁剪到这两个
-    // 控件矩形的并集：每个控件仍会运行，但绘制被裁剪掉，
-    // 因此成本降到脏区条带，Present 只上传这些部分。
     bool partialPending;
     bool partialFrame;
-    // 本帧出现了未声明范围的重绘请求（RequestRedraw）：下一帧
-    // 整窗重绘，声明过范围的损伤区不再生效。
     bool partialBlocked;
-    // 下一帧必须是整窗帧（不得裁剪）。上一帧结束时发现屏上的像素
-    // 不再可信时置位（玻璃面板跨出损伤条带，模糊只能拿旧缓存充数）。
-    // partialBlocked 拦不住它：那个标志在下一次 BeginFrame 开头就被清掉，
-    // 而局部帧是在 BeginFrame 之前的事件处理里武装的，于是一边移鼠标一
-    // 边就把「下一帧整窗重绘」吃掉了，不一致的像素就一直挂在屏上。
-    // 这个标志跨帧留存，只在真正画出一帧整窗帧时才消。
     bool forceFullNext;
     int dmgX;
     int dmgY;
     int dmgW;
     int dmgH;
-    // 本帧 PushClip 时锁定的上传矩形。dmg 在渲染期间还可能增长
-    // （渲染中的 NoteDamage、PresentFrame 的 WidenDamageToGlass），
-    // 但那些区域本帧没渲染过，画布上是上一帧的旧像素——上传它们
-    // 就是拖影。PresentDirty 只许用这里锁定的值。
     int presentX;
     int presentY;
     int presentW;
     int presentH;
-    // 本帧画过的玻璃面板矩形（glassPanels 强类型 Rect 实体列表为主表示，NoteGlassRect 记录，
-    // BeginFrame 清空；glassRects 为扁平四元组整数视图）。损伤条带跨出某块玻璃时（模糊只能拿条带外
-    // 的旧合成像素充数），下一帧把裁剪扩到相交面板的并集：模糊从
-    // 一整块本帧新画的背景重算，比整窗重绘便宜一个量级。
     List<Rect> glassPanels;
     List<int> glassRects;
-    // 滚动串里玻璃模糊的延迟刷新：最近一次滚动损伤的截止时刻
-    // （nowMs < 它 = 串还在进行）、本帧是否有面板暂用了旧模糊、
-    // 是否欠着一帧扩展刷新、欠账面板矩形与武装刷新的帧号。
-    // 见 BackdropDirtyIn / NoteScrollDamage / EndFrame 的还账块。
     int scrollBusyUntilMs;
     bool glassDeferred;
     bool glassRefreshOwe;
     int glassRefreshArmedAt;
     List<Rect> glassDeferredPanels;
     List<int> glassDeferredRects;
-    // 损伤裁剪帧玻璃模糊连续 miss 的帧数。扩裁剪（widen）重算过
-    // 的帧若仍报 miss，说明模糊核的采样边缘超出了任何条带，widen
-    // 救不回来——按 g_blur_partial_miss 的契约升级整窗帧，否则
-    // 滚动串里每一帧都在欠账，整帧永远排不上。
     int blurMissStreak;
-    // 效果层在最后一次合成帧中触及的像素矩形（x,y,w,h 四边形）
-    // 下一次效果跳动只从
-    // 槽位 7 的快照修复这些区域，而不是恢复整个帧。null = 未知
-    // （修复会回退为一次全帧恢复）。
     List<int> fxDamage;
-
-    // 自快照以来效果层触及过的全部矩形的累计（并集清单）。效果
-    // 跳动只修复"上一拍"的矩形是不够的：光斑在移动，更早各拍
-    // 画下的像素若不被修复，就会作为幽灵残留在画布和屏幕上
-    // （大光斑皮肤下是一团越积越亮的色块）。每次纯效果跳动把
-    // 新损伤并入这份清单，修复与上传都以它为准；累计面积超过
-    // 半窗或矩形过多时退回全帧恢复（fxTouchedFull）。
     List<int> fxTouched;
     bool fxTouchedFull;
-
     public App(string title, int width, int height) : this(title, width, height, false) { }
-
-    // physicalStage=true 时不做显示器 DPI 放大，窗口客户区
-    // 物理像素 == 请求尺寸（游戏舞台契约，画布逻辑尺寸恒等于请求
-    // 值）；普通 Gui 应用保持按 DPI 放大、控件度量随 DPI 缩放。
     public App(string title, int width, int height, bool physicalStage)
         : this(title, width, height, physicalStage, false) { }
-
     public static App CreateOffscreen(string title, int width, int height) {
         App app = new App(title, width, height, false, true);
         app.SetOffscreenViewport(width, height, 100);
@@ -463,8 +163,6 @@ public partial class App {
         app.mouseY = 0 - 100000;
         return app;
     }
-
-    // 目标逻辑 viewport 与设备 DPI 独立于设计器的视图缩放。
     public void SetOffscreenViewport(int width, int height, int scale) {
         if (window.GetHandle() != 0) { return; }
         if (scale < 1) { scale = 100; }
@@ -504,7 +202,6 @@ public partial class App {
             bgThemeGen = bgThemeGen + 1;
         }
     }
-
     public App(string title, int width, int height, bool physicalStage, bool offscreen) {
         if (!offscreen) { Dispatcher.EnsureInitialized(); }
         this.physicalStage = physicalStage;
@@ -531,32 +228,12 @@ public partial class App {
         this.frameCount = 0;
         this.mouseX = 0;
         this.mouseY = 0;
-        this.scrollY = 0;
-        this.contentHeight = 0;
         this.scrollSpeed = 40;
         this.dpiScale = 100;
         this.titlebarH = 32;
         this.captionBtnW = 32;
-        this.splitX = 0;
-        this.sidebarScrollY = 0;
-        this.sidebarContentHeight = 0;
-        this.wheelCapX = 0;
-        this.wheelCapY = 0;
-        this.wheelCapW = 0;
-        this.wheelCapH = 0;
-        this.wheelClaimSeq = 0;
-        this.wheelCapOrder = 0;
-        this.wheelOwnerOrder = 0;
-        this.wheelClaimSeen = false;
-        this.wheelConsumed = false;
-        this.wheelReplayArmed = false;
         this.blocksInputBelow = false;
         this.inputBlockPrevious = false;
-        this.menuBlock = false;
-        this.menuBlockPrevious = false;
-        this.menuHoverRow = -1;
-        this.scrollbarGrabId = -1;
-        this.scrollbarGrabDy = 0;
         this.tooltipText = "";
         this.tooltipX = 0;
         this.tooltipY = 0;
@@ -573,13 +250,14 @@ public partial class App {
         this.rightPressTargetId = -1;
         this.lastClickId = -1;
         this.lastClickMs = 0;
+        this.lastClickX = 0;
+        this.lastClickY = 0;
         this.doubleClickNow = false;
         this.pressStartX = 0;
         this.pressStartY = 0;
         this.pressStartMs = 0;
         this.pressStartId = -1;
         this.longPressFired = false;
-        this.swipeDir = 0;
         this.overlays = new List<OverlayPopup>();
         this.overlayHost = new OverlayHost();
         this.layerContext = null;
@@ -607,10 +285,6 @@ public partial class App {
         this.isChildWindow = false;
         this.showThemeButton = false;
         #if ANDROID || OHOS || IOS
-        // 手机上固顶/最小化/最大化没有意义（窗口恒为全屏表面，
-        // 最小化/退出由系统手势与返回键承担）；标题栏只留皮肤按钮，
-        // 关闭键同样隐藏——AC_BACK 已经是应用可感的退出通道。
-        // 鸿蒙同安卓：XComponent 全屏表面 + 系统手势承担退出。
         this.showPinButton = false;
         this.showMinimizeButton = false;
         this.showMaximizeButton = false;
@@ -726,21 +400,12 @@ public partial class App {
             this.blurSlots.Add(new BlurSlot());
             bs = bs + 1;
         }
-        // gen != snapGen 时壁纸只绘制（并快照）一次，
-        // 之后从缓存恢复，直到皮肤/尺寸变化。
         this.bgSnapGen = 0;
         this.metricsScale = 1000;
         this.canvas = new Canvas(width, height);
-        // 每个窗口默认在标题栏获得内置皮肤选择器
-        // （浅色窗口 -> 预选"Light"）。id 块
-        // 现在分配，早于任何应用的 WidgetId.Mark，使选项 id 保持
-        // 稳定。持久化过皮肤的应用只需调用 EnableSkins(index)。
         this.EnableSkins(1);
-        if (App.frameApp == null) {
-            App.frameApp = this;
-        }
+        if (App.FrameApp() == null) { App.SetFrameApp(this); }
     }
-
     public static App CreateDark(string title, int width, int height) {
         App app = new App(title, width, height);
         app.theme = Theme.Dark();
@@ -751,39 +416,16 @@ public partial class App {
         #endif
         return app;
     }
-
-    // 游戏舞台变体：窗口客户区物理像素 == 请求尺寸，不做
-    // 显示器 DPI 放大。画布逻辑尺寸恒等于请求尺寸——任何 DPI 的
-    // 显示器、拖到哪块屏都不变，鼠标/键盘坐标 1:1。GuiHost 主循环
-    // 用它创建窗口，游戏模板因此可以按固定逻辑分辨率绘制整个画布
-    // （普通 CreateDark 的窗口客户区随 DPI 放大，控件用 dpiScale
-    // 度量自适应；固定分辨率的游戏舞台不适应该方案）。
     public static App CreateDarkStage(string title, int width, int height) {
         App app = new App(title, width, height, true);
         app.theme = Theme.Dark();
         app.isDark = true;
         app.EnableSkins(0);
-        // 游戏默认禁用标题栏皮肤选择按钮（皮肤抽屉会盖住游戏画面，
-        // 且游戏不换肤）；置顶/最小化/最大化/关闭照常。
         app.showThemeButton = false;
-        // 游戏舞台由场景全权负责背景与光栅绘制，默认关闭皮肤动态背景动画（如星场漂移/飘屑），
-        // 避免画面污染及多余渲染开销。
         app.SetBackdropFx(false);
         #if ANDROID || OHOS || IOS
-        // 手机是全屏表面，没有"窗口"家具：Gui 标题栏/主屏按钮不画，
-        // 舞台即整块画布（ContentTop()==0）；退出走系统返回键，
-        // 外壳已把它转成 Close。
         app.SetChromeVisible(false);
         #endif
         return app;
     }
-
-    // 安装应用自身的样式表：用于页面布局
-    // （`display: flex`、宽度、间距）并样式化自有元素类的 CSS。
-    // 与 UseCss 不同，它不随皮肤切换而失效——它会重新叠加到每个
-    // 皮肤的样式表之上，应用未指定的内容仍以皮肤外观为准。
-    // WEB_GUI_ROADMAP P5：装载 HTML 声明，返回 body 根（调用方
-    // Add 到宿主/窗口）。`<style>`/`<link rel=stylesheet>` 收集的
-    // CSS 并进 appCss。`data-on-*` 经 handlers 接线；无事件需求用
-    // LoadHtml。
 }

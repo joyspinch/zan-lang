@@ -1,0 +1,78 @@
+using System;
+using System.Json;
+using System.Collections.Generic;
+using Gui;
+using Gui.Markup;
+namespace Gui;
+public partial class UserComponentRegistry {
+    private static Control CreateRegistered(string kind) { return Build(kind); }
+    private static void RegisterFactory(string name) { ControlFactory.Register(name, CreateRegistered); }
+    static void Register(string name, string json) {
+        UserComponentRegistry.RegisterDefinition(name, json);
+        RegisterFactory(name);
+    }
+    static void SetAll(List<UserComponent> comps) {
+        List<UserComponent> components = UserComponentRegistry.Components();
+        components.Clear();
+        for (int i = 0; i < comps.Count; i = i + 1) {
+            components.Add(new UserComponent(comps[i].name, comps[i].json));
+            RegisterFactory(comps[i].name);
+        }
+    }
+    static Control Build(string name, JsonValue instanceProps) {
+        return UserComponentRegistry.BuildDocument(name, instanceProps, Html.ParseComponent);
+    }
+    public static Control BuildWith(string name, ControlFactoryFn factory) {
+        Control control = UserComponentRegistry.BuildDocument(name, null,
+            (string html) => Html.ParseWith(html, "", null, factory));
+        if (control != null) {
+            control.SetDocumentFactory((string kind) => UserComponentRegistry.BuildWith(kind, factory), name);
+        }
+        return control;
+    }
+    private static Control BuildDocument(string name, JsonValue instanceProps, WindowDocumentLoader load) {
+        string doc = JsonOf(name);
+        if (doc == "") { return null; }
+        GuiCoreState state = GuiCoreState.Current();
+        if (state.userComponentBuilding == null) { state.userComponentBuilding = new List<string>(); }
+        List<string> building = state.userComponentBuilding;
+        string key = name.ToLower();
+        for (int i = 0; i < building.Count; i = i + 1) {
+            if (building[i] == key) {
+                throw new InvalidOperationException("Circular user component reference: " + name);
+            }
+        }
+        building.Add(key);
+        try {
+            string html = doc.Trim();
+            JsonValue root = null;
+            if (html.StartsWith("<")) {
+                root = JsonValue.ParseLenient(DesignerHtml.DocOf(HtmlParser.Parse(html, "")));
+            } else {
+                root = JsonValue.ParseLenient(doc);
+                if (root == null || !root.IsObject()) { return null; }
+                html = DesignerHtml.FromJsonDoc(doc);
+            }
+            if (root == null || !root.IsObject()) { return null; }
+            HtmlDoc parsed = load(html);
+            if (parsed == null || parsed.root == null) { return null; }
+            Control control = new UserComponentControl(name, root, parsed.root, parsed.css);
+            ApplyProps(control, root, instanceProps);
+            return control;
+        } finally {
+            building.RemoveAt(building.Count - 1);
+        }
+    }
+    static Control Build(string name) { return Build(name, null); }
+}
+internal partial class UserComponentControl {
+    public override StyleBox ResolveStyle(App app, int state) {
+        if (app != null && styledApp != app) {
+            styledApp = app;
+            string scope = app.NextLoadScope();
+            app.ApplyScopedTree(document, documentCss == "" ? "" : HtmlScope.Styles(documentCss, scope), scope);
+            Html.AutoLinkTree(document, app);
+        }
+        return base.ResolveStyle(app, state);
+    }
+}

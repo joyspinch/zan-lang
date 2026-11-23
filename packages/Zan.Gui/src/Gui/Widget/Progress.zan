@@ -2,43 +2,29 @@ using System;
 using System.Numerics;
 using Gui;
 using Gui.Backend;
-
 namespace Gui.Widget;
-
+[GuiKind("Progress")]
 public class Progress : Control {
+    public override Control CreateCloneShell() { return new Progress(); }
     public Binding<int> Value;
-    // 颜色变体：1=default 2=info 3=success 4=warning 5=error。
     public int ptype;
-    // 0 = 线性条，1 = 圆环，2 = 多圆环，3 = 仪表盘。
     public int shape;
-    // 显示百分比文本（Naive UI show-indicator）。默认 true。
     public bool showIndicator;
-    // 轨道条高度 / 圆环厚度（Naive UI stroke-width）。0 = 用皮肤默认。
     public int strokeWidth;
-    // 处理中（Naive UI processing）：线性条填充上叠加流动斜纹。
     public bool processing;
-    // 自定义填充色（Naive UI color）。0 = 跟随皮肤。
+    internal bool displayCadence;
     public int fillColor;
-    // 自定义轨道色（Naive UI rail-color）。0 = 跟随皮肤。
     public int railColor;
-    // 指示文本模板（Naive UI indicator）：`{0}` 换成百分比，
-    // 如 `"已完成 {0}%"`；空 = 默认 `"N%"`。
     public string format;
-    // 圆环直径（CSS px，ring/multi/dashboard）。0 = 跟随布局与皮肤。
     public int ringSize;
-    // 多圆环各环的百分比与颜色变体。`AddCircle` 填充；设计器 /
-    // 设计文档经 `circles` 额外属性按 `"72:0,45:2"` 原样回填。
     public List<ProgressRing> rings;
     public Control trackNode;
     public Control fillNode;
     public Label labelNode;
-
     public override int StyleDisplay() { return shape == 0 ? 1 : 0; } // CSS display: flex for bar
     public override int StyleFlexDir() { return 0; } // flex-direction: row
-
-    // 初始化：置百分比/变体并清零其余字段（条形、显示指示文本）。
     private void InitProgress(int pct, int pt) {
-        this.InitControl("progress", 1);
+        this.InitControl("progress");
         Value = pct;
         ptype = pt;
         shape = 0;
@@ -52,111 +38,85 @@ public class Progress : Control {
         rings = new List<ProgressRing>();
         this.ClassName = "progress align-center";
         trackNode = new Control { ClassName = "progress-track flex-1" };
-        fillNode = new Control { ClassName = "progress-fill" };
+        fillNode = new ProgressFill(this) { ClassName = "progress-fill" };
         trackNode.Add(fillNode);
         labelNode = new Label { ClassName = "progress-text" };
         this.Add(trackNode);
         this.Add(labelNode);
     }
-
     public Progress() : this(0, 1) { }
-
-    // 有状态模式构造函数：`Progress p = new Progress(60, 3);`
-    public Progress(int pct, int pt) {
-        InitProgress(pct, pt);
+    public Progress(int pct, int pt) { InitProgress(pct, pt); }
+    public int ShapeKind {
+        get { return shape; }
+        set { shape = value; }
     }
-
-    // 设置百分比并同步到绑定（data 非空时写回模型字段）；不做
-    // 钳制，绘制时钳到 0..100。
-    public void SetPercent(int pct) {
-        Value.Set(pct);
+    public int StrokePx {
+        get { return strokeWidth; }
+        set { strokeWidth = value; }
     }
-
-    // 当前百分比：设置了绑定时返回绑定的模型值。
-    public int Percent() {
-        return Value.Get();
+    public int FillArgb {
+        get { return fillColor; }
+        set { fillColor = value; }
     }
-
-    // 将此实例切换为圆环形状（可链式调用）。
-    public Progress Ring() {
-        shape = 1;
-        return this;
+    public int RailArgb {
+        get { return railColor; }
+        set { railColor = value; }
     }
-
-    // 切换为多圆环：每个 `AddCircle` 的值一圈，从外到内排布。
-    public Progress Multi() {
-        shape = 2;
-        return this;
+    public string FormatText {
+        get { return format; }
+        set { format = value != null ? value : ""; }
     }
-
-    // 切换为仪表盘：起于左下、止于右下的 270° 弧，底部留缺口。
-    public Progress Dashboard() {
-        shape = 3;
-        return this;
+    public int RingPx {
+        get { return ringSize; }
+        set { ringSize = value; }
     }
-
-    // 多圆环追加一环（百分比 + 颜色变体），返回自身供链式调用。
-    public Progress AddCircle(int pct, int pt) {
-        if (rings == null) {
-            rings = new List<ProgressRing>();
-        }
+    public bool IsShowText {
+        get { return showIndicator; }
+        set { showIndicator = value; }
+    }
+    public bool IsProcessing {
+        get { return processing; }
+        set { this.Processing(value); }
+    }
+    public void SetPercent(int pct) { Value.Set(pct); }
+    public int Percent() { return Value.Get(); }
+    public void Ring() { shape = 1; }
+    public void Multi() { shape = 2; }
+    public void Dashboard() { shape = 3; }
+    public void AddCircle(int pct, int pt) {
+        if (rings == null) { rings = new List<ProgressRing>(); }
         shape = 2;
         rings.Add(new ProgressRing(pct, pt));
-        return this;
     }
-
-    // 处理中开关（可链式调用）：线性条填充上叠加滚动斜纹。
-    public Progress Processing(bool on) {
+    public void Processing(bool on) {
+        if (processing == on) { return; }
         processing = on;
-        return this;
+        if (shape == 0 && fillNode != null && fillNode.bw > 0 && fillNode.bh > 0) {
+            App host = this.App;
+            if (host != null) {
+                host.NoteDamage(fillNode.bx, fillNode.by, fillNode.bw, fillNode.bh);
+                host.Wake();
+            }
+        }
     }
-
-    // 轨道条高度 / 圆环厚度（Naive UI stroke-width），可链式调用；
-    // 0 恢复皮肤默认。
-    public Progress StrokeWidth(int px) {
-        strokeWidth = px;
-        return this;
+    public void DisplayCadence(bool on) {
+        if (displayCadence == on) { return; }
+        displayCadence = on;
+        App host = this.App;
+        if (processing && shape == 0 && host != null) {
+            host.RequestRedraw();
+            host.Wake();
+        }
     }
-
-    // 覆盖填充色（0 恢复皮肤），可链式调用。
-    public Progress FillColor(int argb) {
-        fillColor = argb;
-        return this;
-    }
-
-    // 覆盖轨道色（0 恢复皮肤），可链式调用。
-    public Progress RailColor(int argb) {
-        railColor = argb;
-        return this;
-    }
-
-    // 自定义指示文本模板，`{0}` 为百分比，可链式调用。
-    public Progress Format(string tmpl) {
-        format = tmpl;
-        return this;
-    }
-
-    // 圆环直径（CSS px），可链式调用。
-    public Progress Size(int px) {
-        ringSize = px;
-        return this;
-    }
-
-    // 开关百分比文本，可链式调用。
-    public Progress ShowText(bool on) {
-        showIndicator = on;
-        return this;
-    }
-
-    // 控件类型标识（序列化/设计器用）。
+    public void StrokeWidth(int px) { strokeWidth = px; }
+    public void FillColor(int argb) { fillColor = argb; }
+    public void RailColor(int argb) { railColor = argb; }
+    public void Format(string tmpl) { format = tmpl; }
+    public void Size(int px) { ringSize = px; }
+    public void ShowText(bool on) { showIndicator = on; }
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
-        // Constructor and property replay recreate the generated parts.
     }
-
     public override string Kind() { return "Progress"; }
-
-    // 变体号 → 皮肤类：2=info 3=success 4=warning 5=error，
-    // 其余为 default（返回 ""）。
     public static string TypeClass(int pt) {
         if (pt == 2) { return "info"; }
         if (pt == 3) { return "success"; }
@@ -164,34 +124,15 @@ public class Progress : Control {
         if (pt == 5) { return "error"; }
         return "";
     }
-
-    // 当前实例变体对应的皮肤类。
-    public string VariantClass() {
-        return Progress.TypeClass(ptype);
-    }
-
-    // 部件选择器（`::track`/`::fill`/`::label`/`::ring-label`）用的类串：
-    // 控件自己的类 + 变体类，两者都能命中——`.el-bar::track` 与
-    // `progress.info::fill` 各按各的写。Checkbox 一直把 `Class` 交给部件
-    // 解析（`.st-check::box` 就是这么生效的），Progress 原来只传变体类，
-    // 于是给条挂了用户类后 `::track` 选不中、轨道色悄悄退回皮肤默认
-    // （实测：五行修炼页的空槽按原版取 #171e29，渲染出来还是主题灰）。
+    public string VariantClass() { return Progress.TypeClass(ptype); }
     public string PartCls() {
         string c = VariantClass();
         if (Class.Length > 0) { c = c.Length > 0 ? c + " " + Class : Class; }
         return c;
     }
-
-    // 覆写：返回设计器属性清单（percent/type/shape/showIndicator/
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        // percent 是快照显示（有效值可能来自绑定）；应答/写入走
-        // GetProp/SetProp 覆写。
-        PropSpec pc = PropSpec.Int("percent", "Percent").DefaultBinding();
-        pc.Field("Value", 1);
-        pc.Also("value");
-        pc.Also("data");
-        ps.Add(pc);
+        ps.Add(PropSpec.Int("percent", "Percent").DefaultBinding().Field("Value", 1).Also("value").Also("data"));
         PropSpec ty = PropSpec.Enum("type", "Type", new List<string>());
         ty.Option("default"); ty.Option("info"); ty.Option("success");
         ty.Option("warning"); ty.Option("error");
@@ -202,34 +143,16 @@ public class Progress : Control {
         sh.Option("dashboard");
         sh.Field("shape", 1);
         ps.Add(sh);
-        PropSpec si = PropSpec.Bool("showIndicator", "Show indicator");
-        si.Field("showIndicator", 2);
-        si.WithTip("Draw the percent label (Naive UI show-indicator).");
-        ps.Add(si);
-        PropSpec sw = PropSpec.Int("strokeWidth", "Stroke width");
-        sw.Field("strokeWidth", 1);
-        sw.WithTip("Track height / ring thickness in px (Naive UI stroke-width). 0 = skin default.");
-        ps.Add(sw);
-        PropSpec pr = PropSpec.Bool("processing", "Processing");
-        pr.Field("processing", 2);
-        pr.WithTip("Roll animated stripes over the fill (Naive UI processing).");
-        ps.Add(pr);
-        PropSpec fc = PropSpec.Color("color", "Fill color");
-        fc.Field("fillColor", 1);
-        fc.WithTip("Custom fill colour (Naive UI color). 0 = skin.");
-        ps.Add(fc);
-        PropSpec rc = PropSpec.Color("railColor", "Rail color");
-        rc.Field("railColor", 1);
-        rc.WithTip("Custom track colour (Naive UI rail-color). 0 = skin.");
-        ps.Add(rc);
+        ps.Add(PropSpec.Bool("showIndicator", "Show indicator").Field("showIndicator", 2).WithTip("Draw the percent label (Naive UI show-indicator)."));
+        ps.Add(PropSpec.Int("strokeWidth", "Stroke width").Field("strokeWidth", 1).WithTip("Track height / ring thickness in px (Naive UI stroke-width). 0 = skin default."));
+        ps.Add(PropSpec.Bool("processing", "Processing").Field("processing", 2).WithTip("Roll animated stripes over the fill (Naive UI processing)."));
+        ps.Add(PropSpec.Color("color", "Fill color").Field("fillColor", 1).WithTip("Custom fill colour (Naive UI color). 0 = skin."));
+        ps.Add(PropSpec.Color("railColor", "Rail color").Field("railColor", 1).WithTip("Custom track colour (Naive UI rail-color). 0 = skin."));
         PropSpec fm = PropSpec.Text("format", "Indicator format");
         fm.Field("format", 0);
         fm.WithTip("Indicator text template; {0} becomes the percent (Naive UI indicator). Empty = \"N%\".");
         ps.Add(fm);
-        PropSpec rs = PropSpec.Int("ringSize", "Ring size");
-        rs.Field("ringSize", 1);
-        rs.WithTip("Ring diameter in px (ring / multi / dashboard). 0 = default.");
-        ps.Add(rs);
+        ps.Add(PropSpec.Int("ringSize", "Ring size").Field("ringSize", 1).WithTip("Ring diameter in px (ring / multi / dashboard). 0 = default."));
         PropSpec cc = PropSpec.Text("circles", "Circles");
         cc.ViaExtra();
         cc.WithTip("Multi-ring values \"72:0,45:2\" (percent:variant, "
@@ -238,17 +161,11 @@ public class Progress : Control {
         ps.Add(cc);
         return ps;
     }
-
-    // 覆写：percent 的应答是有效值（可能来自绑定），circles 的
-    // 应答是环值序列化——都不落 Props() 快照；其余键交基类。
     public override string GetProp(string key) {
         if (key == "percent" || key == "data" || key == "value") { return Convert.ToString(this.Percent()); }
         if (key == "circles") { return this.CirclesSpec(); }
         return base.GetProp(key);
     }
-
-    // 覆写：percent 只写本地字段（有效值可能来自绑定），circles
-    // 走 SetCircles 重建环列表；其余键交基类。
     public override void SetProp(string key, string val) {
         if (key == "percent" || key == "data" || key == "value") {
             int v = Convert.ToInt32(val);
@@ -258,20 +175,8 @@ public class Progress : Control {
         if (key == "circles") { this.SetCircles(val); return; }
         base.SetProp(key, val);
     }
-
-    // 显示的百分比与多圆环环值可能来自绑定 / 列表，
-    // 因此 percent 只写本地字段，circles 是列表属性。
-    public override string GetExtra(string key) {
-        return "";
-    }
-
-    // 设计器写入 `percent` 与 `circles`（多圆环 "72:0,45:2"）；
-    // 其他键返回 false 交给基类。
-    public override bool SetExtra(string key, string val) {
-        return false;
-    }
-
-    // 多圆环环值序列化为 `"72:0,45:2,30:3"`（百分比:变体）。
+    public override string GetExtra(string key) { return ""; }
+    public override bool SetExtra(string key, string val) { return false; }
     public string CirclesSpec() {
         string r = "";
         if (rings == null) { return r; }
@@ -281,8 +186,6 @@ public class Progress : Control {
         }
         return r;
     }
-
-    // 按 `"72:0,45:2"` 文本重建多圆环环值（缺失的变体按 0）。
     public void SetCircles(string spec) {
         rings = new List<ProgressRing>();
         shape = 2;
@@ -296,9 +199,6 @@ public class Progress : Control {
             rings.Add(new ProgressRing(Convert.ToInt32(kv[0]), pt));
         }
     }
-
-    // 指示文本：`format` 为空时是默认的 `"N%"`，否则把模板里的
-    // 每个 `{0}` 换成百分比数字。
     public string IndicatorText(int pct) {
         if (format == null || format == "") { return Convert.ToString(pct) + "%"; }
         List<string> parts = format.Split("{0}");
@@ -307,7 +207,6 @@ public class Progress : Control {
         for (int i = 1; i < parts.Count; i = i + 1) { r = r + parts[i]; }
         return r;
     }
-
     public override void SyncBinding() {
         base.SyncBinding();
         if (shape == 0) {
@@ -318,7 +217,6 @@ public class Progress : Control {
             }
         }
     }
-
     public override void Arrange(int x, int y, int width, int height) {
         base.Arrange(x, y, width, height);
         if (shape == 0 && trackNode != null && fillNode != null) {
@@ -326,10 +224,6 @@ public class Progress : Control {
             fillNode.Arrange(trackNode.bx, trackNode.by, trackNode.bw * pct / 100, trackNode.bh);
         }
     }
-
-    // 圆环通用绘制：`startDeg`/`totalDeg` 传入 0/360 即圆环，
-    // 135/270 即仪表盘（起于左下、底部留缺口；角从 12 点
-    // 方向顺时针，与 Canvas.FillSector 一致）。
     private void PaintRing(App app, int pct, int startDeg, int totalDeg) {
         Canvas c = app.canvas;
         string variant = this.PartCls();
@@ -361,7 +255,6 @@ public class Progress : Control {
             c.FillSector(cx, cy, inner, radius, startDeg, startDeg + sweep,
                          fillCol);
         }
-        // showIndicator 控制圆环中心的百分比文字。
         if (showIndicator && ringLabelStyle.display != 2
                 && ringLabelStyle.visible != 0) {
             int fs = ringLabelStyle.FontOr(Style.FontFallback(app, "medium"));
@@ -369,9 +262,6 @@ public class Progress : Control {
                                ringLabelStyle.FgOr(0), fs);
         }
     }
-
-    // 多圆环：每环一值，从外到内排布，中心逐环显示各自的
-    // 百分比（颜色跟随该环填充色）。
     private void PaintMulti(App app) {
         Canvas c = app.canvas;
         int n = 0;
@@ -386,8 +276,6 @@ public class Progress : Control {
         int radius = size / 2;
         int cx = bx + bw / 2;
         int cy = by + bh / 2;
-        // 中心指示块先量：环带只画在指示块之外的圆环区域，多环时
-        // 弧线不再压住中心的百分比文字（Naive UI multiple-circle）。
         StyleBox ringLabelStyle = this.ResolvePartAs(app, "progress",
                                                      "ring-label", "", "",
                                                      Style.SNormal());
@@ -409,8 +297,6 @@ public class Progress : Control {
         } else if (step >= app.Scale(3)) {
             thick = step - app.Scale(2);
         } else {
-            // 指示块几乎占满直径（环太小或环数太多）：退回整半径
-            // 均分的铺满式，宁可压线也不画成一像素细线。
             step = radius / n;
             if (step < 2) { step = 2; }
             thick = step - app.Scale(2);
@@ -440,7 +326,6 @@ public class Progress : Control {
                 c.FillSector(cx, cy, ri, ro, 0, sweep, fillCol);
             }
         }
-        // 中心逐环指示：每环一行"N%"，颜色跟随该环。
         if (showIndicator) {
             int y = by + (bh - totalH) / 2;
             for (int i = 0; i < n; i = i + 1) {
@@ -458,20 +343,12 @@ public class Progress : Control {
             }
         }
     }
-
-    // 第 i 环的颜色变体（越界按 default）。
     private int CircleType(int i) {
-        if (rings != null && i >= 0 && i < rings.Count) {
-            return rings[i].ringType;
-        }
+        if (rings != null && i >= 0 && i < rings.Count) { return rings[i].ringType; }
         return 0;
     }
-
-    // 覆写：圆环族取直径（ringSize 优先），条形取轨道高与指示
-    // 文本行高的较大者。
     public override void OnMeasure(App app) {
-        StyleBox root = this.ResolveStyleAs(app, "progress", Class,
-                                            Style.SNormal());
+        StyleBox root = this.ResolveStyleCached(app, "progress", Class, Style.SNormal());
         if (shape == 1 || shape == 2 || shape == 3) {
             int def = app.Scale(72);
             if (shape == 2) { def = app.Scale(88); }
@@ -487,24 +364,18 @@ public class Progress : Control {
         }
         StyleBox trackStyle = this.ResolvePartAs(app, "progress", "track", "",
                                                  Class, Style.SNormal());
-        StyleBox labelStyle = this.ResolvePartAs(app, "progress", "label", "",
-                                                 Class, Style.SNormal());
         int contentH = trackStyle.HeightOr(app.Scale(8));
         if (strokeWidth > 0) { contentH = strokeWidth; }
-        // 指示文本与 PaintBar 取同一条 FontOr 回退路径：控件矩形就是
-        // 绘制裁剪框，细条（StrokeWidth 4/8）上 ~20px 的百分比文字若
-        // 不计入行高会被竖向裁成一条缝。
-        if (showIndicator && labelStyle.display != 2
-                && labelStyle.visible != 0) {
-            int labelH = Canvas.FontHeight(
-                labelStyle.FontOr(Style.FontFallback(app, "small")));
-            if (labelH > contentH) { contentH = labelH; }
+        if (showIndicator) {
+            StyleBox labelStyle = this.ResolvePartAs(app, "progress", "label", "", Class, Style.SNormal());
+            if (labelStyle.display != 2 && labelStyle.visible != 0) {
+                int labelH = Canvas.FontHeight(labelStyle.FontOr(Style.FontFallback(app, "small")));
+                if (labelH > contentH) { contentH = labelH; }
+            }
         }
         prefH = root.HeightOr(contentH);
         prefW = root.WidthOr(app.Scale(200));
     }
-
-    // 覆写：按 shape 分派到多圆环/仪表盘/圆环的绘制（条形由子节点树自动渲染）。
     public override void OnPaint(App app) {
         int pct = MathUtil.Clamp(Percent(), 0, 100);
         if (shape == 2) {
@@ -515,9 +386,6 @@ public class Progress : Control {
             this.PaintRing(app, pct, 0, 360);
         }
     }
-
-    // 把颜色向白色混合 num%（0..100），用于处理中斜纹高光。
-    // 颜色按 0xAARRGGBB 存（int 为 64 位，各字节非负）。
     public static int MixWhite(int c, int num) {
         int a = c / 16777216;
         if (a < 1) { a = 255; }
@@ -529,22 +397,93 @@ public class Progress : Control {
         b = b + (255 - b) * num / 100;
         return a * 16777216 + r * 65536 + g * 256 + b;
     }
-
-    // 矩形与窗口表面重叠时返回 true；处理中斜纹只在
-    // 真正可见时驱动重绘，屏幕外不空转。
-    // 保持每 33ms 一像素的速度，按真实毫秒推进；仅在 DrawLine 的
-    // 整数坐标边界取整，避免把相位本身量化为整帧步进。
+    internal const int StripeStepMs = 33;
     public static double StripePhase(int nowMs, int period) {
         if (period < 1) { return 0.0; }
-        long cycle = (long)period * 33;
+        long cycle = (long)period * StripeStepMs;
         long elapsed = (long)nowMs % cycle;
         if (elapsed < 0) { elapsed = elapsed + cycle; }
-        return (double)elapsed / 33.0;
+        return (double)elapsed / StripeStepMs;
     }
-
     public static bool RectOnScreen(App app, int x, int y, int w, int h) {
         int cw = app.canvas.Width();
         int ch = app.canvas.Height();
         return x + w >= 0 && x <= cw && y + h >= 0 && y <= ch;
+    }
+}
+class ProgressFill : Control {
+    private weak Progress owner;
+    ProgressFill(Progress progress) { owner = progress; }
+    public override void OnPaint(App app) {
+        Progress progress = owner;
+        if (progress == null || !progress.processing || progress.shape != 0
+            || bw <= 0 || bh <= 0 || !Progress.RectOnScreen(app, bx, by, bw, bh)) { return; }
+        int period = Math.Max(1, app.Scale(12));
+        int thickness = Math.Max(2, app.Scale(4));
+        bool displayCadence = progress.displayCadence;
+        StyleBox style = paintedStyle != null ? paintedStyle : this.Box(app);
+        int stripe = Progress.MixWhite(style.BgOr(0), 45);
+        Canvas canvas = app.canvas;
+        int left = bx;
+        int top = by;
+        int width = bw;
+        int height = bh;
+        canvas.PushClip(left, top, width, height);
+        try {
+            bool capture = !app.reducedMotion && progress.Value != null && !progress.Value.IsLive()
+                && progress.fillNode == this && app.CaptureFormRegion(left, top, width, height);
+            int now = app.reducedMotion ? 0 : app.nowMs;
+            ProgressFill.PaintStripe(canvas, left, top, width, height, period, thickness, stripe, now, displayCadence);
+            if (capture) {
+                int value = progress.Value.Get();
+                app.WatchFormRegion(Progress.StripeStepMs, displayCadence, (Canvas target, int tick) => {
+                    ProgressFill.PaintStripe(target, left, top, width, height, period, thickness, stripe, tick, displayCadence);
+                }, () => this.StripeCurrent(app, left, top, width, height, value, displayCadence));
+            }
+        } finally { canvas.PopClip(); }
+        if (app.reducedMotion) { return; }
+        bool paintOnly = progress.Value != null && !progress.Value.IsLive();
+        if (displayCadence) {
+            app.RequestAnimationFrameAt(app.DisplayFrameDueMs(), bx, by, bw, bh, paintOnly);
+        } else {
+            int elapsed = app.nowMs % Progress.StripeStepMs;
+            if (elapsed < 0) { elapsed = elapsed + Progress.StripeStepMs; }
+            int dueMs = app.nowMs + (Progress.StripeStepMs - elapsed);
+            app.RequestAnimationFrameAt(dueMs, bx, by, bw, bh, paintOnly);
+        }
+    }
+    private bool StripeCurrent(App app, int x, int y, int w, int h, int value, bool displayCadence) {
+        Progress progress = owner;
+        if (progress == null || !progress.processing || progress.shape != 0
+            || progress.fillNode != this || progress.Value == null || progress.Value.IsLive()
+            || progress.Value.Get() != value || progress.displayCadence != displayCadence
+            || bx != x || by != y || bw != w || bh != h) { return false; }
+        if (app.rootControl == null || !app.rootControl.ContainsInputControl(this)) { return false; }
+        Control node = this;
+        while (node != null) {
+            if (node.App != app || !node.StyleVisible()) { return false; }
+            node = node.parent;
+        }
+        return true;
+    }
+    private static void PaintStripe(Canvas canvas, int x, int y, int w, int h,
+        int period, int thickness, int color, int now, bool displayCadence) {
+        double phase = Progress.StripePhase(now, period);
+        if (displayCadence) {
+            int phaseFx = (int)(phase * 256.0);
+            int heightFx = h * 256;
+            int bottom = (y + h) * 256;
+            int top = y * 256;
+            int step = period * 256;
+            int start = (x - h - thickness) * 256 - phaseFx;
+            int end = (x + w + thickness) * 256;
+            for (int left = start; left < end; left = left + step) {
+                canvas.DrawLineFx(left, bottom, left + heightFx, top, color, thickness);
+            }
+        } else {
+            for (int left = x - h - (int)phase; left < x + w; left = left + period) {
+                canvas.DrawLine(left, y + h, left + h, y, color, thickness);
+            }
+        }
     }
 }

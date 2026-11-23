@@ -1,86 +1,32 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui;
-
 public partial class StyleSheet {
     JsonValue rules;
-    // 解析后保留的 `:root` 自定义属性（`--name` -> 值），这样
-    // 皮肤除了控件规则外，也能供给语义化 Theme token。
     JsonValue vars;
-    // 下次 Apply 在普通选择器之外还要解析的伪状态
-    // （“hover”、“active”、“focus”、“disabled”；“” = 仅基础外观）。
     string state;
-
-    // ---- 选择器索引（级联）----
-    // 选择器一次性解析为各组成部分，解析就是真正的匹配
-    // （“这条规则是否适用于这个控件？”），而不是查少数几个
-    // 解析器认为值得尝试的选择器拼写。这正是
-    // 复合选择器（`button.ghost.primary:hover`）能生效，以及
-    // 组件默认外观可以放在样式表而非代码中的原因。
     List<StyleRuleEntry> ruleEntries;
     int indexedCount;
-    // 按类型名分桶的规则下标（升序，因此与 anyType 归并后仍是级联顺序）。
-    // 一个控件只需看自己类型那一桶加上无类型的那些规则，
-    // 而不是每次解析都扫全表——冷解析（首帧、换肤）的主要成本在此。
     Dict<string, List<int>> byType;
-    // 没有类型选择器的规则下标（`.primary`、`#save`、`::option`）。
     List<int> anyType;
-    // 无类型且无 class/id 要求的规则下标（通配符 `*`、仅部件 `::thumb` 或纯伪状态 `:hover`）。
-    // 控件在 cls=="" 且 id=="" 时（如多数容器/基础标签）直接与此桶归并，
-    // 旁路扫全表数百条类选择器的沉重开销。
     List<int> anyUniversal;
-
-    // 解析时被跳过的 at-rule 块数（`@media` / `@keyframes` / …）。
-    // 跳过是浏览器行为，但"跳过了多少"必须能看见——否则一整块
-    // 响应式样式消失时，皮肤作者只会以为引擎支持它。
     int atRulesDropped;
-    // 被跳过的 at-rule 按名字计数（`media` -> 3），供 Lint 说明丢的是什么。
     Dict<string, int> atRuleKinds;
-    // 因 `@supports` 守卫在本引擎上判假而跳过的块数（守卫成立时块会
-    // 展开，所以这不是"不支持 @supports"，Lint 里与 atRulesDropped 分开报）。
     int atGuardsSkipped;
-    // 判假的守卫条件原文计数（`(display: grid)` -> 2）。
     Dict<string, int> atRuleGuards;
-
-    // 词法上认不出（选择器含组合器/伪元素等）而被丢弃的规则文本。
-    // 与 atRulesDropped 一起供 StyleSheet.Lint 报告。
     List<string> lintDropped;
-    // 语法接受、但引擎判定永不匹配的选择器（结构性伪类、未知伪类、
-    // `::before`/`::after`、无法求值的 `:not()`），形如
-    // `sel  [never: 原因]`。这些以前是静默的——Lint 现在把它们列出来。
     List<string> lintNever;
-    // 声明了、但 Decl 一条都没消费掉的规则文本。
     List<string> lintUnused;
-    // 值里带了引擎解析不了的长度单位（`em`/`rem`/`pt`/`calc()` 等），
-    // 会被当裸数字用：形如 `sel  [unit: key: value]`。这是审计里
-    // "最危险的一类"静默失败，Lint 把它点名。
     List<string> lintValue;
-    // 规则里出现了"收了但不生效"的属性（box-sizing / float），
-    // 形如 `sel  [inert: float]`。
     List<string> lintInert;
-    // lintDropped/lintUnused 已收集到的 rules 代数。
     int lintGen;
-    // 索引建立时置位：表里存在依赖树上下文的选择器（组合器链或
-    // 结构性伪类）。这类规则只在 retained 控件树上命中，且命中结果
-    // 随节点位置变化——Style.Resolve 因此把位置签名加进缓存键。
     bool relational;
-    // 标记表中是否存在 !important 规则；绝大部分样式表无此类规则，
-    // 置 false 时 ApplyImportantCtx 可在 O(1) 彻底旁路，免除二次全规则遍历。
     bool hasImportant;
     bool hasMediaImportant;
     List<int> importantRules;
-
-    // ---- @media 规则（运行期按窗口/主题求值）----
-    // 与 rules 分开存：同一选择器可能同时有守卫/无守卫两份声明，
-    // 键控表无法表达；按文档序线性扫，只在 HasMedia 时付出代价。
     List<StyleMediaEntry> mediaEntries;
-    // 收到的媒体块数（含内层规则展开前的块数口径不好对齐，
-    // 这里计"带条件的规则条数"）。
     int mediaCount;
-
-    // 构造空表（规则/变量为空 JSON 对象，索引延迟建立）。
     StyleSheet() {
         this.rules = JsonValue.NewObject();
         this.vars = JsonValue.NewObject();
@@ -96,8 +42,6 @@ public partial class StyleSheet {
         this.importantRules = new List<int>();
         this.anyUniversal = new List<int>();
     }
-
-    // 记下一条被跳过的 at-rule（Css 解析器调用）。
     void NoteAtRule(string name) {
         this.atRulesDropped = this.atRulesDropped + 1;
         if (this.atRuleKinds == null) { this.atRuleKinds = new Dict<string, int>(); }
@@ -108,10 +52,6 @@ public partial class StyleSheet {
             this.atRuleKinds.Add(name, 1);
         }
     }
-
-    // 记下一条 `@supports` 守卫判假而跳过的块（条件原文作键）。
-    // 守卫成立时块是会展开的，所以这条不走 NoteAtRule——否则 Lint
-    // 会把它说成"@supports 不支持"，而作者明明写对了语法。
     void NoteGuard(string cond) {
         this.atGuardsSkipped = this.atGuardsSkipped + 1;
         if (this.atRuleGuards == null) { this.atRuleGuards = new Dict<string, int>(); }
@@ -123,16 +63,7 @@ public partial class StyleSheet {
             this.atRuleGuards.Add(name, 1);
         }
     }
-
-    // 解析以 CSS 文本编写的样式表（见 Css）。皮肤以 `.css` 文件发布，
-    // 以便在不重新构建应用的情况下编写和替换。
-    static StyleSheet FromCss(string src) {
-        return Css.Parse(src);
-    }
-
-    // 收一条带媒体条件的规则（Css 解析 @media 时调用）。同一选择器
-    // 的媒体规则按文档顺序追加（后写的胜出）；选择器解析失败按
-    // CSS 语义整条丢弃，但同时报进 lintDropped。
+    static StyleSheet FromCss(string src) { return Css.Parse(src); }
     void AddMediaRule(string sel, JsonValue block, MediaCond cond) {
         Selector p = Selector.Parse(sel);
         if (p == null) {
@@ -141,27 +72,15 @@ public partial class StyleSheet {
             return;
         }
         if (p.Relational()) { this.relational = true; }
-        if (this.mediaEntries == null) {
-            this.mediaEntries = new List<StyleMediaEntry>();
-        }
+        if (this.mediaEntries == null) { this.mediaEntries = new List<StyleMediaEntry>(); }
         JsonValue imp = block == null ? null : block.Get("__zan_important");
-        if (imp != null && imp.IsObject() && imp.Count() > 0) {
-            this.hasMediaImportant = true;
-        }
+        if (imp != null && imp.IsObject() && imp.Count() > 0) { this.hasMediaImportant = true; }
         this.mediaEntries.Add(new StyleMediaEntry(p, block, imp, cond));
         this.mediaCount = this.mediaCount + 1;
     }
-
-    // 表里是否有需要运行期求值的媒体规则。
-    bool HasMedia() {
-        return this.mediaEntries != null && this.mediaEntries.Count > 0;
-    }
-
-    // 在 ApplyCascade/ApplyImportant 的主循环之后套用媒体规则：
-    // 守卫成立且选择器命中才生效。媒体规则整体排在常驻规则之后
-    // （近似文档序，与 @layer 摊平同一档的简化）。
+    bool HasMedia() { return this.mediaEntries != null && this.mediaEntries.Count > 0; }
     void ApplyMedia(StyleBox b, string type, List<string> want, string cls,
-                    string id, string part, int stateBits, Control node,
+                    string id, string part, int stateBits, StyleNode node,
                     bool importantPass) {
         if (this.mediaEntries == null) { return; }
         for (int i = 0; i < this.mediaEntries.Count; i = i + 1) {
@@ -183,10 +102,6 @@ public partial class StyleSheet {
             }
         }
     }
-
-    // 将另一张表的规则和自定义属性叠加到当前表上
-    // （另一张表优先），这样应用样式表可以重新应用
-    // 到当前激活的皮肤之上，而不会被其替换。
     void MergeSheet(StyleSheet other) {
         if (other == null) { return; }
         for (int i = 0; i < other.rules.Count(); i = i + 1) {
@@ -226,9 +141,7 @@ public partial class StyleSheet {
             }
         }
         if (other.mediaEntries != null && other.mediaEntries.Count > 0) {
-            if (this.mediaEntries == null) {
-                this.mediaEntries = new List<StyleMediaEntry>();
-            }
+            if (this.mediaEntries == null) { this.mediaEntries = new List<StyleMediaEntry>(); }
             for (int m = 0; m < other.mediaEntries.Count; m = m + 1) {
                 StyleMediaEntry me = other.mediaEntries[m];
                 this.mediaEntries.Add(new StyleMediaEntry(me.selector, me.block, me.important, me.condition));
@@ -238,49 +151,26 @@ public partial class StyleSheet {
         }
         this.indexedCount = 0 - 1;
     }
-
-    // 从 JSON 源字符串解析样式表。格式错误 / 非对象的
-    // 文档会产生空样式表，因此坏文件永远不会中断加载。
     static StyleSheet FromJson(string src) {
         StyleSheet s = new StyleSheet();
         JsonValue v = JsonValue.ParseLenient(src);
         if (v != null && v.IsObject()) { s.rules = v; }
         return s;
     }
-
-    // 样式表完全没有规则时为 true（应用未加载皮肤）。
-    bool IsEmpty() {
-        return rules == null || rules.Count() == 0;
-    }
-
-    // 解析/合并这张表时丢掉了什么，人话列表；空 = 全部生效。
-    // 见 CollectLint 的判定口径。
-    List<string> Audit() {
-        return this.Lint();
-    }
-
-    // `:root` 自定义属性的值（`Var("--accent")`），不存在时返回“”。
+    bool IsEmpty() { return rules == null || rules.Count() == 0; }
+    List<string> Audit() { return this.Lint(); }
     string Var(string name) {
         if (vars == null) { return ""; }
         JsonValue v = vars.Get(name);
         if (v == null) { return ""; }
         return v.AsString("");
     }
-
-    // 单个选择器的声明块（选择器不存在时为 null）。
     JsonValue Block(string selector) {
         if (rules == null) { return null; }
         JsonValue block = rules.Get(selector);
         if (block == null || !block.IsObject()) { return null; }
         return block;
     }
-
-    // ---- StyleBox 应用（皮肤路径）----
-
-    // 将一个选择器的声明叠加到已解析的样式盒上。未知
-    // 属性在此忽略（它们是控件属性，由
-    // ApplySelector 处理）。`!important` 的声明放在最后再套一遍，
-    // 与 StyleSheet.ApplyMatch 的级联顺序一致。
     void ApplyBox(StyleBox b, string selector) {
         JsonValue block = this.Block(selector);
         if (block == null) { return; }
@@ -299,47 +189,28 @@ public partial class StyleSheet {
         }
         StyleSheet.ResolveCurrentColor(b);
     }
-
-    // ---- 级联 -----
-
-    // 将匹配控件的每条规则应用到 `b`，最弱的匹配优先，
-    // 因此最具体的声明胜出。`classes` 是控件的 class
-    // 列表，`part` 选择 `type::part` 规则（“”表示控件本身），
-    // `stateBits` 是 Style.S* 掩码。
-    // 排序以状态为主：所有无状态规则先应用（按 CSS
-    // 特异性：type < class < class chain < id），然后是每个
-    // 活动状态的规则，因此无论作者把 `:hover` 放在文件
-    // 何处，它都只需注明变化的部分。
     void ApplyMatch(StyleBox b, string type, string cls, string id, string part,
                     int stateBits) {
         this.ApplyMatchCtx(b, type, cls, id, part, stateBits, null);
     }
-
-    // ApplyMatch 的树上下文版本：`node` 是主体控件（retained 树），
-    // 组合器链与结构性伪类按真实树求值；immediate 路径传 null，
-    // 这类选择器不命中（规则不丢）。
     void ApplyMatchCtx(StyleBox b, string type, string cls, string id,
-                       string part, int stateBits, Control node) {
+                       string part, int stateBits, StyleNode node) {
         this.Index();
         this.ApplyCascadeCtx(b, type, cls, id, part, stateBits, node);
         this.ApplyImportantCtx(b, type, cls, id, part, stateBits, node);
         StyleSheet.ResolveCurrentColor(b);
     }
-
-    // 普通声明（不含 `!important`）的级联。
     void ApplyCascade(StyleBox b, string type, string cls, string id, string part,
                       int stateBits) {
         this.ApplyCascadeCtx(b, type, cls, id, part, stateBits, null);
     }
-
     void ApplyCascadeCtx(StyleBox b, string type, string cls, string id,
-                         string part, int stateBits, Control node) {
+                         string part, int stateBits, StyleNode node) {
         List<int> typed = null;
         if (type != "") { this.byType.TryGetValue(type, out typed); }
         int aLen = typed != null ? typed.Count : 0;
         List<int> candidateAny = (cls == "" && id == "") ? this.anyUniversal : this.anyType;
         int cLen = candidateAny != null ? candidateAny.Count : 0;
-
         if (aLen == 0 && cLen == 0) {
             if (this.mediaEntries != null && this.mediaEntries.Count > 0) {
                 List<string> wantMedia = Style.Classes(cls);
@@ -347,9 +218,7 @@ public partial class StyleSheet {
             }
             return;
         }
-
         List<string> want = Style.Classes(cls);
-
         if (aLen == 0) {
             for (int c = 0; c < cLen; c = c + 1) {
                 int i = candidateAny[c];
@@ -396,36 +265,22 @@ public partial class StyleSheet {
             this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, false);
         }
     }
-
-    // 把匹配规则里 `!important` 的声明再套一遍。`!important` 的
-    // 权重高于一切——包括宿主写下的 inline 样式——所以它必须跑在
-    // 普通级联（以及 inline）之后，而不是像以前那样被剥掉标记、
-    // 混在普通声明里按顺序碰运气。
     void ApplyImportant(StyleBox b, string type, string cls, string id,
                         string part, int stateBits) {
         this.ApplyImportantCtx(b, type, cls, id, part, stateBits, null);
     }
-
     void ApplyImportantCtx(StyleBox b, string type, string cls, string id,
-                           string part, int stateBits, Control node) {
-        if (!this.hasImportant && !this.hasMediaImportant) {
-            return;
-        }
+                           string part, int stateBits, StyleNode node) {
+        if (!this.hasImportant && !this.hasMediaImportant) { return; }
         int impCount = (this.hasImportant && this.importantRules != null)
             ? this.importantRules.Count : 0;
-        if (impCount == 0 && !this.hasMediaImportant) {
-            return;
-        }
+        if (impCount == 0 && !this.hasMediaImportant) { return; }
         List<string> want = Style.Classes(cls);
         if (impCount > 0) {
             for (int idx = 0; idx < impCount; idx = idx + 1) {
                 int i = this.importantRules[idx];
-                if (this.ruleEntries == null || i >= this.ruleEntries.Count) {
-                    continue;
-                }
-                if (!this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) {
-                    continue;
-                }
+                if (this.ruleEntries == null || i >= this.ruleEntries.Count) { continue; }
+                if (!this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) { continue; }
                 JsonValue imp = this.ruleEntries[i].important;
                 JsonValue blk = this.ruleEntries[i].block;
                 if (imp == null || !imp.IsObject()) { continue; }
@@ -435,13 +290,8 @@ public partial class StyleSheet {
                 }
             }
         }
-        if (this.hasMediaImportant) {
-            this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, true);
-        }
+        if (this.hasMediaImportant) { this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, true); }
     }
-
-    // 把已经取到的声明块叠加到样式盒上（`!important` 由
-    // ApplyImportant 另行处理，这里跳过）。
     void ApplyDecls(StyleBox b, JsonValue block) {
         if (block == null) { return; }
         for (int i = 0; i < block.Count(); i = i + 1) {
@@ -450,40 +300,25 @@ public partial class StyleSheet {
             StyleSheet.DeclBlock(b, block, k, false);
         }
     }
-
-    // 规则 `i` 是否选中给定的控件/部件/状态。选择器的全部条件
-    // （类型/类/id/部件/伪状态/属性/`:not()`）都交给 Selector 求值。
     bool Matches(int i, string type, List<string> classes, string id,
                  string part, int stateBits, string cls) {
         return this.MatchesCtx(i, type, classes, id, part, stateBits, cls, null);
     }
-
-    // Matches 的树上下文版本（组合器链/结构性伪类在 retained 树上求值）。
     bool MatchesCtx(int i, string type, List<string> classes, string id,
-                    string part, int stateBits, string cls, Control node) {
+                    string part, int stateBits, string cls, StyleNode node) {
         if (this.ruleEntries != null && i < this.ruleEntries.Count) {
             return this.ruleEntries[i].selector.MatchNodeCtx(type, classes, cls, id, part,
                                                             stateBits, node);
         }
         return false;
     }
-
-    // 表里是否有依赖树上下文的选择器（首次调用建立索引）。
-    bool HasRelational() {
-        this.Index();
-        return this.relational;
-    }
-
-    // 类名列表中是否含 name。
+    bool HasRelational() { this.Index(); return this.relational; }
     static bool Holds(List<string> list, string name) {
         for (int i = 0; i < list.Count; i = i + 1) {
             if (list[i] == name) { return true; }
         }
         return false;
     }
-
-    // 一次性解析每个选择器，并按权重保持规则有序，因此
-    // 匹配就是对已排序表的扫描。
     void Index() {
         if (rules == null) { return; }
         if (indexedCount == rules.Count()) { return; }
@@ -498,7 +333,6 @@ public partial class StyleSheet {
             if (p == null) { continue; }
             if (p.Relational()) { this.relational = true; }
             int spec = p.Specificity();
-            // 在权重相同的规则中插入到最后（保持文档顺序）。
             int at = selSpecs.Count;
             while (at > 0 && selSpecs[at - 1] > spec) { at = at - 1; }
             JsonValue blk = this.rules.ValAt(i - 1);
@@ -506,7 +340,6 @@ public partial class StyleSheet {
             ruleEntries.Insert(at, new StyleRuleEntry(sel, p, blk, imp));
             selSpecs.Insert(at, spec);
         }
-        // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
         this.byType = new Dict<string, List<int>>();
         this.anyType = new List<int>();
         this.anyUniversal = new List<int>();
@@ -535,19 +368,9 @@ public partial class StyleSheet {
         }
         indexedCount = rules.Count();
     }
-
-    // ---- 诊断（lint）--------------------------------------------------------
-
-
-    // ---- Control 应用（retained mode / UiDoc）----
-
-    // ApplySelector 的主体：一个声明块（JsonValue 对象）落到
-    // 控件上。内联 style 原文由 ApplyInline 保存并在解析时重放。
-    static void ApplyBlock(Control c, JsonValue block) {
+    static void ApplyBlock(StyleNode c, JsonValue block) {
         StyleBox box = new StyleBox();
         bool visual = false;
-        // `!important` 的声明先收进 box、最后套（与 StyleBox 路径同一
-        // 语义），不走 SetProp——否则它们会被当成 class 名加到控件上。
         JsonValue imp = block.Get("__zan_important");
         int i = 0;
         while (i < block.Count()) {
@@ -556,14 +379,14 @@ public partial class StyleSheet {
             i = i + 1;
             if (StyleSheet.InternalKey(k)) { continue; }
             if (k == "pad" || k == "padding") {
-                c.Pad(StyleSheet.Num(StyleSheet.ValStr(v)));
+                c.SetStylePad(StyleSheet.Num(StyleSheet.ValStr(v)));
                 continue;
             }
-            if (k == "gap") { c.gap = v.AsInt(0); continue; }
-            if (k == "x") { c.mx = v.AsInt(0); continue; }
-            if (k == "y") { c.my = v.AsInt(0); continue; }
-            if (k == "width") { c.prefW = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
-            if (k == "height") { c.prefH = StyleSheet.Num(StyleSheet.ValStr(v)); continue; }
+            if (k == "gap") { c.SetStyleGap(v.AsInt(0)); continue; }
+            if (k == "x") { c.SetStyleX(v.AsInt(0)); continue; }
+            if (k == "y") { c.SetStyleY(v.AsInt(0)); continue; }
+            if (k == "width") { c.SetStylePrefW(StyleSheet.Num(StyleSheet.ValStr(v))); continue; }
+            if (k == "height") { c.SetStylePrefH(StyleSheet.Num(StyleSheet.ValStr(v))); continue; }
             if (StyleSheet.DeclBlock(box, block, k, false)) {
                 visual = true;
                 continue;
@@ -573,40 +396,28 @@ public partial class StyleSheet {
         if (imp != null && imp.IsObject()) {
             for (int j = 0; j < imp.Count(); j = j + 1) {
                 string k = imp.KeyAt(j);
-                if (StyleSheet.DeclBlock(box, block, k, true)) {
-                    visual = true;
-                }
+                if (StyleSheet.DeclBlock(box, block, k, true)) { visual = true; }
             }
         }
         if (visual) { StyleSheet.CopyToControl(box, c); }
     }
-
-    // 内联 style 原文由 Control 持有，在 Style.Inline 使用当前 DPI、
-    // 字号和主题令牌重放，复用缩写键/颜色/函数/!important 解析。
-    // 视觉键不写 style* 的第二份副本：替换或清空原文后，未声明的
-    // 属性自然回到样式表和显式 fluent 设置器的值。
-    //
-    // 宽高与间距兼容旧槽位布局；padding 由解析后的样式盒参与布局，
-    // 不得调用 Pad()：那会截断四边简写、丢失单位并残留显式优先级。
-    static void ApplyInline(Control c, string decls) {
+    static void ApplyInline(StyleNode c, string decls) {
         if (c == null || decls == null) { return; }
-        c.inlineStyleCss = StyleSheet.Trim(decls);
-        c.computedStyle = null;
-        if (c.inlineStyleCss == "") { return; }
-        StyleSheet sheet = Css.Parse(".zan-inline { " + c.inlineStyleCss + " }");
+        string inlineCss = StyleSheet.Trim(decls);
+        c.SetInlineStyleCss(inlineCss);
+        if (inlineCss == "") { return; }
+        StyleSheet sheet = Css.Parse(".zan-inline { " + inlineCss + " }");
         JsonValue block = sheet.Block(".zan-inline");
         if (block == null) { return; }
         JsonValue w = block.Get("width");
-        if (w != null) { c.prefW = StyleSheet.Num(StyleSheet.ValStr(w)); }
+        if (w != null) { c.SetStylePrefW(StyleSheet.Num(StyleSheet.ValStr(w))); }
         JsonValue h = block.Get("height");
-        if (h != null) { c.prefH = StyleSheet.Num(StyleSheet.ValStr(h)); }
+        if (h != null) { c.SetStylePrefH(StyleSheet.Num(StyleSheet.ValStr(h))); }
         JsonValue gap = block.Get("gap");
-        if (gap != null) { c.gap = gap.AsInt(0); }
+        if (gap != null) { c.SetStyleGap(gap.AsInt(0)); }
     }
-
-    // 解析后的盒已有 App/DPI 环境；重放只修改声明的字段。
-    static void ReplayInline(StyleBox b, Control c, int resolvedFont, bool fontPhysical) {
-        string decls = c.inlineStyleCss;
+    static void ReplayInline(StyleBox b, StyleNode c, int resolvedFont, bool fontPhysical) {
+        string decls = c.InlineStyleCss();
         if (decls == null || decls == "") { return; }
         List<CssVarDecl> vars = b.envTheme == null ? new List<CssVarDecl>()
             : Css.CollectVarDecls(Style.RootFromTheme(b.envTheme));
@@ -622,9 +433,7 @@ public partial class StyleSheet {
         if (block == null) { return; }
         JsonValue imp = block.Get("__zan_important");
         bool setsFont = block.Get("font-size") != null || block.Get("font") != null;
-        if (imp != null) {
-            setsFont = setsFont || imp.Get("font-size") != null || imp.Get("font") != null;
-        }
+        if (imp != null) { setsFont = setsFont || imp.Get("font-size") != null || imp.Get("font") != null; }
         if (setsFont) {
             b.fontPx = resolvedFont;
             b.SetPrescaled(StyleBox.SourceFont(), fontPhysical);
@@ -632,39 +441,17 @@ public partial class StyleSheet {
         sheet.ApplyBox(b, ".zan-inline");
         Style.ScaleBox(b);
     }
-
-    // 复制控件内联携带的视觉属性（Control 只保留
-    // 一小部分；其余在绘制时存于解析后的 StyleBox 上）。
-    static void CopyToControl(StyleBox b, Control c) {
-        if (b.bg != 0) { c.styleBg = b.bg; }
-        if (b.bgTo != 0) { c.styleBgTo = b.bgTo; }
-        if (b.radius >= 0) { c.styleRadius = b.radius; }
-        if (b.borderColor != 0) { c.styleBorderColor = b.borderColor; }
-        if (b.borderW >= 0) { c.styleBorderWidth = b.borderW; }
-        if (b.shadow != 0) {
-            c.styleShadow = b.shadow;
-            c.styleShadowDy = b.shadowDy;
-            if (c.styleShadowDy == 0) { c.styleShadowDy = 2; }
-        }
-        if (b.fg != 0) { c.styleColor = b.fg; }
-        if (b.fontPx > 0) { c.styleFontPx = b.fontPx; }
-        if (b.transitionMs >= 0) { c.styleTransitionMs = b.transitionMs; }
+    static void CopyToControl(StyleBox b, StyleNode c) {
+        if (c != null) { c.ApplyVisualStyleBox(b); }
     }
-
-    // 在控件上设置纯色填充或 `linear-gradient(a,b)`。
-    static void ApplyBackground(Control c, string val) {
+    static void ApplyBackground(StyleNode c, string val) {
         StyleBox b = new StyleBox();
         StyleSheet.DeclBackground(b, StyleSheet.Trim(val));
-        c.styleBg = b.bg;
-        c.styleBgTo = b.bgTo;
+        if (c != null) { c.SetInlineBg(b.bg, b.bgTo); }
     }
-
-    // 解析 `border: <width> <color>`（宽度可选，默认为 1）。
-    static void ApplyBorder(Control c, string val) {
+    static void ApplyBorder(StyleNode c, string val) {
         StyleBox b = new StyleBox();
         StyleSheet.DeclBorder(b, StyleSheet.Trim(val), 0);
-        c.styleBorderWidth = b.borderW;
-        c.styleBorderColor = b.borderColor;
+        if (c != null) { c.SetInlineBorder(b.borderW, b.borderColor); }
     }
-
 }

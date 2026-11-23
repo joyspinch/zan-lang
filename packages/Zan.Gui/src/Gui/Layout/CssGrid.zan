@@ -1,12 +1,8 @@
 using System;
 using System.Collections.Generic;
 using Gui;
-
 namespace Gui;
-
 public class CssGrid {
-    // "1 / 3"、"span 2"、"2 / span 3"、"auto"、"3"。命名线/负线号
-    // 不认（负线号按 auto 兜底）。
     static GridLine ParseLine(string v) {
         GridLine gl = new GridLine();
         List<string> t = StyleSheet.Tokens(v);
@@ -33,8 +29,6 @@ public class CssGrid {
         if (gl.span <= 0) { gl.span = 0; }  // 0 = 未声明（消费端按 1）
         return gl;
     }
-
-    // 轨道列表：顶层按空白切（括号内不切），repeat(N, …) 展开。
     static List<GridTrack> ParseTracks(string v) {
         List<GridTrack> out2 = new List<GridTrack>();
         if (v == null || v == "") { return out2; }
@@ -73,8 +67,6 @@ public class CssGrid {
         }
         return out2;
     }
-
-    // 单条轨道。
     static GridTrack ParseOne(string w) {
         GridTrack tr = new GridTrack();
         if (w == "auto") { tr.kind = 2; return tr; }
@@ -111,15 +103,12 @@ public class CssGrid {
             tr.maxKind = hi.kind; tr.maxVal = hi.val;
             return tr;
         }
-        // <length>：带 px 后缀或裸数字都按 px（CSS 裸 0 常见）。
         tr.kind = 0;
         string num = CssGrid.EndsWith(w, "px")
             ? w.Substring(0, w.Length - 2) : w;
         tr.val = StyleSheet.ParseInt(num);
         return tr;
     }
-
-    // 括号感知的顶层切分（"minmax(100px, 1fr) 2fr" → 2 段）。
     static List<string> SplitTop(string v) {
         List<string> out2 = new List<string>();
         int depth = 0;
@@ -137,26 +126,17 @@ public class CssGrid {
         if (v.Length > start) { out2.Add(v.Substring(start)); }
         return out2;
     }
-
     static bool StartsWith(string s, string pre) {
         if (s == null || pre == null || s.Length < pre.Length) { return false; }
         return s.StartsWith(pre);
     }
-
     static bool EndsWith(string s, string suf) {
         if (s == null || suf == null || s.Length < suf.Length) { return false; }
         return s.EndsWith(suf);
     }
-
-    // 放置（CSS 8.5 简化）：显式位置先落，再"行定列自"、"列定行自"，
-    // 最后全 auto 的稀疏行主序游标。expCols/expRows 是模板声明的
-    // 显式轨道数（空轨道也占位）。隐式列/行按需扩展（列扩展要按
-    // 行主序重建占用表）。
-    static GridPlace Place(List<Control> items, int expCols, int expRows) {
+    static GridPlace Place(List<StyleBox> itemStyles, int expCols, int expRows) {
         GridPlace pl = new GridPlace();
-        pl.items = items;
-        // 输出按 items 文档序对位（下标 = 条目序号），各相直接写入。
-        int n = items.Count;
+        int n = itemStyles.Count;
         pl.slots = new List<GridItemSlot>();
         for (int i = 0; i < n; i = i + 1) {
             pl.slots.Add(new GridItemSlot(-1, 0, -1, 0));
@@ -168,7 +148,7 @@ public class CssGrid {
         int nCols = expCols > 0 ? expCols : 1;
         int nRows = expRows > 0 ? expRows : 1;
         for (int i = 0; i < n; i = i + 1) {
-            StyleBox sb = items[i].computedStyle;
+            StyleBox sb = itemStyles[i];
             int cs = sb != null ? sb.gColStart : 0;
             int ce = sb != null ? sb.gColEnd : 0;
             int cp = sb != null && sb.gColSpan > 0 ? sb.gColSpan : 1;
@@ -181,19 +161,12 @@ public class CssGrid {
             cN.Add(cp);
             r0.Add(rs - 1);
             rN.Add(rp);
-            if (c0[i] >= 0 && c0[i] + cN[i] > nCols) {
-                nCols = c0[i] + cN[i];
-            }
-            if (r0[i] >= 0 && r0[i] + rN[i] > nRows) {
-                nRows = r0[i] + rN[i];
-            }
+            if (c0[i] >= 0 && c0[i] + cN[i] > nCols) { nCols = c0[i] + cN[i]; }
+            if (r0[i] >= 0 && r0[i] + rN[i] > nRows) { nRows = r0[i] + rN[i]; }
         }
-        // 占用表（行主序平铺）按终态行列数一次分配，行按需扩展；
-        // 扩列单独重建。
         List<bool> occ = new List<bool>();
         int capRows = nRows;
         for (int k = 0; k < nCols * capRows; k = k + 1) { occ.Add(false); }
-        // 1）行列都显式。
         for (int i = 0; i < n; i = i + 1) {
             if (c0[i] < 0 || r0[i] < 0) { continue; }
             GridItemSlot slot = pl.slots[i];
@@ -201,7 +174,6 @@ public class CssGrid {
             slot.rowStart = r0[i]; slot.rowSpan = rN[i];
             CssGrid.Mark(occ, nCols, c0[i], r0[i], cN[i], rN[i]);
         }
-        // 2）行定列自：该行扫空闲列，放不下扩列（隐式列）。
         for (int i = 0; i < n; i = i + 1) {
             if (r0[i] < 0 || c0[i] >= 0) { continue; }
             int c = CssGrid.FindFreeInRow(occ, nCols, r0[i], cN[i]);
@@ -215,7 +187,6 @@ public class CssGrid {
             slot.rowStart = r0[i]; slot.rowSpan = rN[i];
             CssGrid.Mark(occ, nCols, c, r0[i], cN[i], rN[i]);
         }
-        // 3）列定行自：该列扫空闲行，放不下扩行（隐式行）。
         for (int i = 0; i < n; i = i + 1) {
             if (c0[i] < 0 || r0[i] >= 0) { continue; }
             int r = CssGrid.FindFreeInCol(occ, nCols, capRows, c0[i], rN[i]);
@@ -232,7 +203,6 @@ public class CssGrid {
             slot.rowStart = r; slot.rowSpan = rN[i];
             CssGrid.Mark(occ, nCols, c0[i], r, cN[i], rN[i]);
         }
-        // 4）全 auto：稀疏行主序游标（只进不退）。
         int cr = 0;
         int cc = 0;
         for (int i = 0; i < n; i = i + 1) {
@@ -260,7 +230,6 @@ public class CssGrid {
         pl.nRows = nRows;
         return pl;
     }
-
     static bool Free(List<bool> occ, int nCols, int c, int r, int cs, int rs) {
         for (int rr = r; rr < r + rs; rr = rr + 1) {
             for (int cx = c; cx < c + cs; cx = cx + 1) {
@@ -269,7 +238,6 @@ public class CssGrid {
         }
         return true;
     }
-
     static void Mark(List<bool> occ, int nCols, int c, int r, int cs, int rs) {
         for (int rr = r; rr < r + rs; rr = rr + 1) {
             for (int cx = c; cx < c + cs; cx = cx + 1) {
@@ -277,14 +245,12 @@ public class CssGrid {
             }
         }
     }
-
     static int FindFreeInRow(List<bool> occ, int nCols, int r, int cs) {
         for (int c = 0; c + cs <= nCols; c = c + 1) {
             if (CssGrid.Free(occ, nCols, c, r, cs, 1)) { return c; }
         }
         return 0 - 1;
     }
-
     static int FindFreeInCol(List<bool> occ, int nCols, int capRows,
                              int c, int rs) {
         for (int r = 0; r + rs <= capRows; r = r + 1) {
@@ -292,8 +258,6 @@ public class CssGrid {
         }
         return 0 - 1;
     }
-
-    // 扩列：行主序平铺表在每行尾补 (newCols-oldCols) 个空位。
     static List<bool> Widen(List<bool> occ, int oldCols, int rows,
                             int newCols) {
         List<bool> out2 = new List<bool>();
@@ -307,12 +271,6 @@ public class CssGrid {
         }
         return out2;
     }
-
-    // 定尺寸（CSS 12 简化）：基尺寸 → 非弹性轨道均分放大（钉在增长
-    // 上限）→ fr 按比例吃掉剩余 → 无 fr 时剩余均分给 auto（stretch，
-    // Chrome 对 align-content: normal 的行为）。avail < 0（auto 容器）
-    // 只给基尺寸。contentOf(i, track) 回调不可用，调用方直接把每条
-    // 轨道的"跨 1 格条目最大外围尺寸"传进来。
     static List<int> SizeTracks(List<GridTrack> defs, List<GridTrack> auto,
                                 int n, List<int> span1At, List<int> span1Sz,
                                 int avail, int gap) {
@@ -325,14 +283,10 @@ public class CssGrid {
         for (int i = 0; i < n; i = i + 1) {
             GridTrack d = null;
             if (i < defs.Count) { d = defs[i]; }
-            else if (auto != null && auto.Count > 0) {
-                d = auto[(i - defs.Count) % auto.Count];
-            }
+            else if (auto != null && auto.Count > 0) { d = auto[(i - defs.Count) % auto.Count]; }
             int content = 0;
             for (int k = 0; k < span1At.Count; k = k + 1) {
-                if (span1At[k] == i && span1Sz[k] > content) {
-                    content = span1Sz[k];
-                }
+                if (span1At[k] == i && span1Sz[k] > content) { content = span1Sz[k]; }
             }
             int b = content;
             int lim = big;
@@ -346,9 +300,7 @@ public class CssGrid {
                 fx = true; fv = d.val;
             } else if (d.kind == 4) {
                 if (d.minKind == 0) { b = d.minVal; }
-                else if (d.minKind == 1 && avail >= 0) {
-                    b = d.minVal * avail / 1000;
-                }
+                else if (d.minKind == 1 && avail >= 0) { b = d.minVal * avail / 1000; }
                 if (d.maxKind == 0) { lim = d.maxVal; }
                 else if (d.maxKind == 1 && avail >= 0) {
                     lim = d.maxVal * avail / 1000;
@@ -366,7 +318,6 @@ public class CssGrid {
             int used = gap * (n > 0 ? n - 1 : 0);
             for (int i = 0; i < n; i = i + 1) { used = used + size[i]; }
             int free = avail - used;
-            // 非弹性轨道均分放大（冻结在增长上限）。
             int rounds = 0;
             while (free > 0 && rounds < 64) {
                 int cand = 0;
@@ -391,24 +342,19 @@ public class CssGrid {
                 if (!grew) { break; }
                 rounds = rounds + 1;
             }
-            // fr 按比例分剩余；auto 轨道在有 fr 时保留自然尺寸。
             if (frTotal > 0) {
                 used = gap * (n > 0 ? n - 1 : 0);
                 for (int i = 0; i < n; i = i + 1) { used = used + size[i]; }
                 int free2 = avail - used;
                 if (free2 > 0) {
                     for (int i = 0; i < n; i = i + 1) {
-                        if (flex[i]) {
-                            size[i] = size[i] + free2 * frVal[i] / frTotal;
-                        }
+                        if (flex[i]) { size[i] = size[i] + free2 * frVal[i] / frTotal; }
                     }
                 }
             }
         }
         return size;
     }
-
-    // Σ 轨道 + 间距（span 个格子从第 start 条起）。
     static int SpanSum(List<int> size, int gap, int start, int span) {
         if (span <= 0) { return 0; }
         int s = 0;
@@ -418,9 +364,6 @@ public class CssGrid {
         }
         return s + gap * (span - 1);
     }
-
-    // 第 start 条轨道的起点到第 0 条起点的距离：前 start 条尺寸 +
-    // start 道 gap（SpanSum 的"跨内 gap"是 span-1 道，语义不同）。
     static int TrackOffset(List<int> size, int gap, int start) {
         if (start <= 0) { return 0; }
         int s = 0;

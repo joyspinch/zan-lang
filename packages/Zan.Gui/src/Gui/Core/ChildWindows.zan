@@ -2,105 +2,61 @@ using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
-
 namespace Gui;
-
+internal class ChildWindowManager {
+    internal List<ChildWindow> wins;
+    internal IModalWindow picker;
+    internal long routedSeq;
+    internal bool routedHandled;
+    internal List<IModalWindow> pickers;
+    internal int renderBudgetMs = 50;
+    internal int slowRenderWarnMs = 200;
+    internal Action<string> slowSink = null;
+    internal int renderCursor = 0;
+    internal int lastRenderMs = 0;
+    internal int slowRenderCount = 0;
+    internal int lastDeferred = 0;
+}
 public class ChildWindows {
-    static List<ChildWindow> wins;
-    static IModalWindow picker;
-    // 最近一次已路由的事件序号与结果（`RouteEvent` 幂等）。标准循环
-    // `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
-    // 同一事件经两处必然把一次按压/释放重放一遍——双击计数、长按
-    // 计时、拖拽起点都会被算两遍。事件序号是"每投递一个新事件 +1"，
-    // 正好是那件事件的身份证；它同时挡住动画帧里 `EventKind()` 的
-    // 陈旧回读（没有新事件时序号不变）。
-    static long routedSeq;
-    static bool routedHandled;
-    // 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
-    // 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
-    // 由组件按需登记，数量不限。PumpAll/RouteEvent/Wants 统一照顾两处。
-    static List<IModalWindow> pickers;
-    // 单帧内**子窗渲染**的总预算（毫秒）。0 = 不限。
-    //
-    // 为什么需要：子窗是在**主线程的主帧内同步渲染**的，单帧总时长
-    // ≈ Σ(各子窗渲染)。子窗一多、或某个子窗内容重（大表格/长列表），
-    // 单帧就能顶过 Windows 的 5 秒未响应阈值——进程其实一直在跑、
-    // 只是没泵消息，外部看就是"未响应"。预算用满就把剩下的脏子窗
-    // 留给下一帧：宁可晚一帧出画，也不能让 UI 线程在主帧里连续堵住
-    // 几秒。默认 50ms：正常规模（20 个子窗 × 4ms ≈ 80ms）会被削到
-    // 一帧 50ms，主窗口拿回自己的帧预算；单个重子窗仍可能超预算，
-    // 那种由耗时告警点名（见 ReportRenderCost）。
-    static int renderBudgetMs = 50;
-    // 单个子窗渲染的耗时告警阈值（毫秒）。0 = 不告警。
-    static int slowRenderWarnMs = 200;
-    // 告警出口：非空时消息交给它（测试/宿主自接管），不再打控制台。
-    static Action<string> slowSink = null;
-    // 轮转游标：预算用尽时从下一个子窗继续，保证没有子窗被饿死。
-    static int renderCursor = 0;
-    // 统计：最近一次子窗渲染耗时（毫秒）、超阈值告警次数、最近一帧
-    // 因预算用尽而推迟的子窗数。
-    static int lastRenderMs = 0;
-    static int slowRenderCount = 0;
-    static int lastDeferred = 0;
-
-    // 单帧子窗渲染总预算（毫秒）。0 = 不限（回退到"每帧全画"）。
-    public static void SetRenderBudgetMs(int ms) {
-        ChildWindows.renderBudgetMs = ms < 0 ? 0 : ms;
+    static ChildWindowManager Mgr() {
+        GuiCoreState state = GuiCoreState.Current();
+        if (state.childWindows == null) { state.childWindows = new ChildWindowManager(); }
+        return state.childWindows;
     }
-    // 当前单帧子窗渲染预算（毫秒）。
-    public static int RenderBudgetMs() { return ChildWindows.renderBudgetMs; }
-    // 单个子窗渲染的耗时告警阈值（毫秒）。0 = 不告警。
-    public static void SetSlowRenderWarnMs(int ms) {
-        ChildWindows.slowRenderWarnMs = ms < 0 ? 0 : ms;
-    }
-    // 当前耗时告警阈值（毫秒）。
-    public static int SlowRenderWarnMs() { return ChildWindows.slowRenderWarnMs; }
-    // 接管告警出口（传 null 恢复打控制台）。
-    public static void SetSlowRenderSink(Action<string> s) { ChildWindows.slowSink = s; }
-    // 最近一次子窗渲染耗时（毫秒）。
-    public static int LastRenderMs() { return ChildWindows.lastRenderMs; }
-    // 超阈值告警累计次数。
-    public static int SlowRenderCount() { return ChildWindows.slowRenderCount; }
-    // 最近一帧因预算用尽而推迟的子窗数。
-    public static int LastDeferredCount() { return ChildWindows.lastDeferred; }
-
-    // 子窗渲染耗时记账 + 超阈值告警。告警格式与 UiWatchdog 一致，
-    // 同一套 grep 规则就能把"谁把帧堵死了"捞出来。
+    public static void SetRenderBudgetMs(int ms) { ChildWindows.Mgr().renderBudgetMs = ms < 0 ? 0 : ms; }
+    public static int RenderBudgetMs() { return ChildWindows.Mgr().renderBudgetMs; }
+    public static void SetSlowRenderWarnMs(int ms) { ChildWindows.Mgr().slowRenderWarnMs = ms < 0 ? 0 : ms; }
+    public static int SlowRenderWarnMs() { return ChildWindows.Mgr().slowRenderWarnMs; }
+    public static void SetSlowRenderSink(Action<string> s) { ChildWindows.Mgr().slowSink = s; }
+    public static int LastRenderMs() { return ChildWindows.Mgr().lastRenderMs; }
+    public static int SlowRenderCount() { return ChildWindows.Mgr().slowRenderCount; }
+    public static int LastDeferredCount() { return ChildWindows.Mgr().lastDeferred; }
     static void ReportRenderCost(ChildWindow w, int ms) {
-        ChildWindows.lastRenderMs = ms;
-        int warn = ChildWindows.slowRenderWarnMs;
+        ChildWindowManager m = ChildWindows.Mgr();
+        m.lastRenderMs = ms;
+        int warn = m.slowRenderWarnMs;
         if (warn <= 0 || ms < warn) { return; }
-        ChildWindows.slowRenderCount = ChildWindows.slowRenderCount + 1;
+        m.slowRenderCount = m.slowRenderCount + 1;
         string title = "";
         if (w != null) { title = w.Title(); }
         string msg = "UIWATCHDOG stall stage=child-window blocked=" + "" + ms
             + "ms title=" + title;
-        if (ChildWindows.slowSink != null) { ChildWindows.slowSink(msg); return; }
+        if (m.slowSink != null) { m.slowSink(msg); return; }
         Console.WriteLine(msg);
     }
-
-    // 注册表（惰性创建）。
     static List<ChildWindow> All() {
-        if (ChildWindows.wins == null) {
-            ChildWindows.wins = new List<ChildWindow>();
-        }
-        return ChildWindows.wins;
+        ChildWindowManager m = ChildWindows.Mgr();
+        if (m.wins == null) { m.wins = new List<ChildWindow>(); }
+        return m.wins;
     }
-
-    // 把窗口加入主循环驱动队列（OpenHost 自动调用）。
     static void Register(ChildWindow w) {
         if (!ChildWindows.All().Contains(w)) {
             List<ChildWindow> next = new List<ChildWindow>();
             foreach (ChildWindow current in ChildWindows.All()) { next.Add(current); }
             next.Add(w);
-            ChildWindows.wins = next;
+            ChildWindows.Mgr().wins = next;
         }
     }
-
-    // 语言切换广播：对每个开着的子窗口调用 OnLanguageChanged，并把
-    // 自绘标题栏的文字按新语言的 Title() 重设。宿主（IDE 外壳）在
-    // 设置窗回报语言变更时调用一次（lang 为 "zh"/"en" 语言码）；
-    // 之后开的新窗口自然用新语言。
     static void ApplyLanguage(string lang) {
         foreach (ChildWindow w in ChildWindows.All()) {
             if (!w.IsOpen()) { continue; }
@@ -108,23 +64,14 @@ public class ChildWindows {
             if (w.host != null) { w.host.SetWindowTitle(w.Title()); }
         }
     }
-
-    static void RegisterPicker(IModalWindow p) {
-        ChildWindows.picker = p;
-    }
-
-    // 登记一个组件自建的选择器（Upload 内建弹窗）。同一实例重复登记
-    // 是无操作；`PrunePickers` 在它关闭后移出，因此宿主应在每次打开
-    // 时重新登记（组件复用同一 picker 实例）。返回 true = 首次登记。
+    static void RegisterPicker(IModalWindow p) { ChildWindows.Mgr().picker = p; }
     static bool RegisterComponentPicker(IModalWindow p) {
-        if (ChildWindows.pickers == null) {
-            ChildWindows.pickers = new List<IModalWindow>();
-        }
-        if (ChildWindows.pickers.Contains(p)) { return false; }
-        ChildWindows.pickers.Add(p);
+        ChildWindowManager m = ChildWindows.Mgr();
+        if (m.pickers == null) { m.pickers = new List<IModalWindow>(); }
+        if (m.pickers.Contains(p)) { return false; }
+        m.pickers.Add(p);
         return true;
     }
-
     static void Prune() {
         List<ChildWindow> all = ChildWindows.All();
         List<ChildWindow> keep = new List<ChildWindow>();
@@ -132,18 +79,14 @@ public class ChildWindows {
             if (w.IsOpen()) { keep.Add(w); }
             else { w.Teardown(); }
         }
-        ChildWindows.wins = keep;
+        ChildWindows.Mgr().wins = keep;
     }
-
-    // 是否还有开着的子窗口。
     static bool AnyOpen() {
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.IsOpen()) { return true; }
         }
         return false;
     }
-
-    // instead of blocking).
     static bool Wants() {
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.NeedsRedraw()) { return true; }
@@ -151,35 +94,27 @@ public class ChildWindows {
         if (ChildWindows.AnyPickerWants()) { return true; }
         return false;
     }
-
-    // 任一组件选择器开着且要求重绘（轮询判据；FilePicker 文档约定：
-    // 弹窗开着时主循环不得阻塞在 WaitEvent 上）。
     static bool AnyPickerWants() {
-        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
+        ChildWindowManager m = ChildWindows.Mgr();
+        if (m.picker != null && m.picker.IsOpen() && m.picker.NeedsRedraw()) {
             return true;
         }
-        if (ChildWindows.pickers == null) { return false; }
-        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            IModalWindow p = ChildWindows.pickers[i];
+        if (m.pickers == null) { return false; }
+        for (int i = 0; i < m.pickers.Count; i = i + 1) {
+            IModalWindow p = m.pickers[i];
             if (p.IsOpen() && p.NeedsRedraw()) { return true; }
         }
         return false;
     }
-
-    // 任一组件选择器开着（主循环用它收紧阻塞等待）。
     static bool AnyPickerOpen() {
-        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen()) {
-            return true;
-        }
-        if (ChildWindows.pickers == null) { return false; }
-        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            if (ChildWindows.pickers[i].IsOpen()) { return true; }
+        ChildWindowManager m = ChildWindows.Mgr();
+        if (m.picker != null && m.picker.IsOpen()) { return true; }
+        if (m.pickers == null) { return false; }
+        for (int i = 0; i < m.pickers.Count; i = i + 1) {
+            if (m.pickers[i].IsOpen()) { return true; }
         }
         return false;
     }
-
-    // Register and Prune replace the registry rather than mutate active views.
-    // Local references therefore remain stable across lifecycle callbacks.
     static App LoopRoot(App app) {
         foreach (ChildWindow child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != app || child.parentApp == null) { continue; }
@@ -187,8 +122,6 @@ public class ChildWindows {
         }
         return app;
     }
-
-    // Loop service is independent of paint budget and BeginFrame wake clearing.
     static int LoopDeadline(App parent, int deadline) {
         foreach (ChildWindow child in ChildWindows.All()) {
             if (!child.IsOpen() || child.parentApp != parent) { continue; }
@@ -198,7 +131,6 @@ public class ChildWindows {
         }
         return deadline;
     }
-
     static void WakeLoopParent(App childApp) {
         foreach (ChildWindow child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != childApp) { continue; }
@@ -207,7 +139,6 @@ public class ChildWindows {
             return;
         }
     }
-
     static void ServiceLoopParticipants(App parent, int turn, int now) {
         List<ChildWindow> snapshot = ChildWindows.All();
         foreach (ChildWindow child in snapshot) {
@@ -219,7 +150,6 @@ public class ChildWindows {
             if (child.IsOpen()) { ChildWindows.ServiceLoopParticipants(child.host, turn, now); }
         }
     }
-
     static int Deadline(int deadline) {
         foreach (ChildWindow w in ChildWindows.All()) {
             int a = w.AnimNextMs();
@@ -229,20 +159,18 @@ public class ChildWindows {
         }
         return deadline;
     }
-
-    // 组件选择器开着时把它的重绘需求折叠进主应用：轮询判据（开着时
-    // 不得阻塞在 WaitEvent 上）+ 弹窗要出帧时唤醒主循环。
     static bool PumpPickers(App main) {
+        ChildWindowManager m = ChildWindows.Mgr();
         bool woken = false;
-        if (ChildWindows.picker != null && ChildWindows.picker.IsOpen()) {
-            if (ChildWindows.picker.NeedsRedraw()) {
+        if (m.picker != null && m.picker.IsOpen()) {
+            if (m.picker.NeedsRedraw()) {
                 main.RequestRedraw();
                 woken = true;
             }
         }
-        if (ChildWindows.pickers == null) { return woken; }
-        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            IModalWindow p = ChildWindows.pickers[i];
+        if (m.pickers == null) { return woken; }
+        for (int i = 0; i < m.pickers.Count; i = i + 1) {
+            IModalWindow p = m.pickers[i];
             if (!p.IsOpen()) { continue; }
             if (p.NeedsRedraw() && !woken) {
                 main.RequestRedraw();
@@ -251,78 +179,58 @@ public class ChildWindows {
         }
         return woken;
     }
-
     static void PrunePickers() {
-        if (ChildWindows.pickers == null) { return; }
+        ChildWindowManager m = ChildWindows.Mgr();
+        if (m.pickers == null) { return; }
         List<IModalWindow> keep = new List<IModalWindow>();
-        for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            IModalWindow p = ChildWindows.pickers[i];
+        for (int i = 0; i < m.pickers.Count; i = i + 1) {
+            IModalWindow p = m.pickers[i];
             if (p.IsOpen()) { keep.Add(p); }
         }
-        ChildWindows.pickers = keep;
+        m.pickers = keep;
     }
-
-    static bool TickDue(int now) {
-        bool due = false;
+    static void TickDue(int now) {
         foreach (ChildWindow w in ChildWindows.All()) {
             w.TickInputGestures();
             int a = w.AnimNextMs();
             int f = w.FxNextMs();
-            if (a >= 0 && now >= a) { due = true; w.RequestRedraw(); }
-            if (f >= 0 && now >= f) { due = true; w.RequestRedraw(); }
+            if ((a >= 0 && now >= a) || (f >= 0 && now >= f)) { w.host.RequestRedraw(); }
         }
-        return due;
     }
-
-    // 把事件交给它所属的那扇顶层窗口（子窗口 / 共享选择器 / 组件
-    // 选择器）；都不属于时返回 false（那是主窗口自己的事件）。
-    // 由事件泵 `App.ProcessEvent` 对每一件非本窗口事件调用一次，
-    // 宿主循环因此不必知道 hwnd 路由这回事。幂等（按事件序号）：
-    // 自带循环/帧钩子的宿主若再调一次，同一件事件不会被送第二遍。
     static bool RouteEvent(nint hwnd) {
-        // 幂等：同一件事件（序号相同）只交付一次，重复调用返回上次结果。
+        ChildWindowManager m = ChildWindows.Mgr();
         long seq = Window.EventSeqGlobal();
-        if (seq == ChildWindows.routedSeq) { return ChildWindows.routedHandled; }
-        ChildWindows.routedSeq = seq;
-        ChildWindows.routedHandled = false;
+        if (seq == m.routedSeq) { return m.routedHandled; }
+        m.routedSeq = seq;
+        m.routedHandled = false;
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.ApplyEvent(hwnd);
-                ChildWindows.routedHandled = true;
-                // 正常窗口交互：事件到达并处理后，若窗口产生重绘需求，立即就地渲染出帧
-                if (w.NeedsRedraw()) {
-                    w.Render();
-                }
+                m.routedHandled = true;
+                if (w.NeedsRedraw()) { w.Render(); }
                 return true;
             }
         }
-        // 共享文件选择器（应用外壳注册的 pathPicker）：它的弹窗也是
-        // 独立顶层窗口，路由由这里一并负责，外壳不必自己再判断一遍。
-        if (ChildWindows.picker != null
-            && ChildWindows.picker.OwnsWindow(hwnd)) {
-            ChildWindows.picker.ApplyEvent(hwnd);
-            ChildWindows.routedHandled = true;
-            if (ChildWindows.picker.NeedsRedraw()) {
-                ChildWindows.picker.RenderWindow();
-            }
+        if (m.picker != null
+            && m.picker.OwnsWindow(hwnd)) {
+            m.picker.ApplyEvent(hwnd);
+            m.routedHandled = true;
+            if (m.picker.NeedsRedraw()) { m.picker.RenderWindow(); }
             return true;
         }
-        if (ChildWindows.pickers != null) {
-            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-                IModalWindow p = ChildWindows.pickers[i];
+        if (m.pickers != null) {
+            for (int i = 0; i < m.pickers.Count; i = i + 1) {
+                IModalWindow p = m.pickers[i];
                 if (p.OwnsWindow(hwnd)) {
                     p.ApplyEvent(hwnd);
-                    ChildWindows.routedHandled = true;
-                    if (p.NeedsRedraw()) {
-                        p.RenderWindow();
-                    }
+                    m.routedHandled = true;
+                    if (p.NeedsRedraw()) { p.RenderWindow(); }
                     return true;
                 }
             }
         }
         return false;
     }
-
     static bool PaintForResize(nint hwnd) {
         foreach (ChildWindow w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
@@ -333,44 +241,34 @@ public class ChildWindows {
         }
         return false;
     }
-
     static void PumpAll() {
+        ChildWindowManager m = ChildWindows.Mgr();
         int now = Window.GetTickMs();
         ChildWindows.TickDue(now);
         ChildWindows.PumpChildren();
-        if (ChildWindows.picker != null) {
-            if (ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
-                ChildWindows.picker.RenderWindow();
+        if (m.picker != null) {
+            if (m.picker.IsOpen() && m.picker.NeedsRedraw()) {
+                m.picker.RenderWindow();
             }
         }
-        // 组件自建的选择器（Upload 内建弹窗）：开着就出一帧。RenderWindow
-        // 内部自会跳过不需要重绘的帧。
-        if (ChildWindows.pickers != null) {
-            for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-                IModalWindow p = ChildWindows.pickers[i];
+        if (m.pickers != null) {
+            for (int i = 0; i < m.pickers.Count; i = i + 1) {
+                IModalWindow p = m.pickers[i];
                 if (p.IsOpen()) { p.RenderWindow(); }
             }
         }
         ChildWindows.Prune();
         ChildWindows.PrunePickers();
     }
-
-    // 渲染所有开着的子窗，但**单帧总时长受预算约束**：预算用尽就把
-    // 剩下的脏子窗留给下一帧（它们仍然是脏的，下一帧继续画），并从
-    // 下一个子窗起轮转，保证没有子窗被饿死。
-    //
-    // 预算只约束"这一帧画多少个子窗"，切不开单个子窗自己的渲染——
-    // 单个子窗就慢到 3 秒的情形由耗时告警点名（ReportRenderCost）。
     static void PumpChildren() {
+        ChildWindowManager m = ChildWindows.Mgr();
         List<ChildWindow> all = ChildWindows.All();
         int n = all.Count;
-        ChildWindows.lastDeferred = 0;
+        m.lastDeferred = 0;
         if (n == 0) { return; }
-        int start = ChildWindows.renderCursor;
+        int start = m.renderCursor;
         if (start < 0 || start >= n) { start = 0; }
-        // 用 long 乘：毫秒→微秒的乘法在 int 里会溢出成一个负数，
-        // 负预算会被 `budgetUs > 0` 判成"不限"，把上限悄悄弄丢。
-        long budgetUs = (long)ChildWindows.renderBudgetMs * 1000;
+        long budgetUs = (long)m.renderBudgetMs * 1000;
         long spentUs = 0;
         bool deferred = false;
         for (int k = 0; k < n; k = k + 1) {
@@ -378,78 +276,45 @@ public class ChildWindows {
             ChildWindow w = all[i];
             if (w == null || !w.IsOpen()) { continue; }
             if (budgetUs > 0 && spentUs >= budgetUs) {
-                // 预算用尽：剩下的子窗留给下一帧，从当前这个接着画。
-                ChildWindows.renderCursor = i;
+                m.renderCursor = i;
                 int left = 0;
                 for (int j = k; j < n; j = j + 1) {
                     ChildWindow rest = all[(start + j) % n];
                     if (rest != null && rest.IsOpen()) { left = left + 1; }
                 }
-                ChildWindows.lastDeferred = left;
+                m.lastDeferred = left;
                 deferred = true;
                 break;
             }
             w.Render();
             spentUs = spentUs + w.LastRenderUs();
         }
-        if (!deferred) { ChildWindows.renderCursor = 0; }
+        if (!deferred) { m.renderCursor = 0; }
     }
-
-    // deadline).
     static void FoldDeadlines(App main) {
         int dl = ChildWindows.Deadline(-1);
-        if (dl >= 0) {
-            main.RequestWakeFrameAt(dl);
-            main.RequestWakeAt(dl);
-        }
+        if (dl >= 0) { main.RequestWakeAt(dl); }
         int now = Window.GetTickMs();
-        if (ChildWindows.TickDue(now)) { main.RequestRedraw(); }
-        // 任何子窗口有帧要画时唤醒主循环并保持出帧，所有窗口画完自然休眠
-        if (ChildWindows.Wants()) {
-            main.RequestRedraw();
-            main.Wake();
-        }
-        // 组件选择器开着时保持主循环轮询（needsRedraw 常挂），否则
-        // Form.Run 会阻塞在 WaitEvent 上，弹窗永远出不了帧。
-        if (ChildWindows.AnyPickerOpen()) {
-            main.RequestRedraw();
-            main.Wake();
-        }
-        // 任一子窗口或弹窗开着时保持主循环心跳（16ms 帧节拍），避免主事件循环在 WaitEvent
-        // 处因等待主窗口事件而无限期挂起（陷入5秒心跳才唤醒）；只要有子窗口或弹窗存活，
-        // 主循环小睡至多 16ms 便唤醒泵送子窗口，保证首帧排版与组件即时上屏；
-        // 所有子窗口/弹窗关闭后自动回退到 WaitEvent 零 CPU 休眠。
-        if (ChildWindows.AnyOpen() || ChildWindows.AnyPickerOpen()) {
-            main.RequestWakeFrameAt(now + 16);
-        }
+        if (ChildWindows.AnyOpen() || ChildWindows.AnyPickerOpen()) { main.RequestWakeAt(now + 16); }
     }
-
-    // 主窗口换肤时同步每个开着的子窗口。
     static void FollowSkin(int i) {
         foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
     }
-
-    // 主窗口调整不透明度时同步每个开着的子窗口。
     static void FollowOpacity(int percent) {
         foreach (ChildWindow w in ChildWindows.All()) {
             w.FollowOpacity(percent);
         }
     }
-
-    // 把主窗口当前的标题提示文案推给每个开着的副窗口。
     static void FollowCaptionTips(App main) {
         foreach (ChildWindow w in ChildWindows.All()) {
             w.FollowCaptionTips(main);
         }
     }
-
-    // 主窗口更换用户壁纸时同步每个开着的子窗口。
     static void FollowWallpaper(string path, int opacity) {
         foreach (ChildWindow w in ChildWindows.All()) {
             w.FollowWallpaper(path, opacity);
         }
     }
-
     static void RequestRedrawAll() {
         foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
     }

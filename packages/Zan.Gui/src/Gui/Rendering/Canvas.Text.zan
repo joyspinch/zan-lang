@@ -1,0 +1,375 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing.Imaging;
+using Gui.Backend;
+namespace Gui;
+public partial class Canvas {
+    void DrawText(int x, int y, string text, int color, int fontSize) {
+        color = this.ApplyOpacity(color);
+        if (text == null || text == "" || fontSize <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashText(19, x, y, color, fontSize, text);
+        zan_gui_draw_text(surfaceId, x, y, text, color, fontSize);
+    }
+    void DrawTextBold(int x, int y, string text, int color, int fontSize) {
+        color = this.ApplyOpacity(color);
+        if (text == null || text == "" || fontSize <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashText(20, x, y, color, fontSize, text);
+        zan_gui_draw_text_bold(surfaceId, x, y, text, color, fontSize);
+    }
+    void DrawTextRot(int x, int y, string text, int color, int fontSize,
+    int angleDeg) {
+        color = this.ApplyOpacity(color);
+        if (text == null || text == "" || fontSize <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashText(21, x, y, color, fontSize, text);
+        Canvas.PaintHashOp(0, angleDeg, 0, 0, 0);
+        zan_gui_draw_text_rot(surfaceId, x, y, text, color, fontSize, angleDeg);
+    }
+    void DrawTextCentered(int rx, int ry, int rw, int rh, string text, int color, int fontSize) {
+        color = this.ApplyOpacity(color);
+        if (text == null || text == "" || rw <= 0 || rh <= 0 || fontSize <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashOp(22, rx, ry, rw, rh);
+        Canvas.PaintHashText(0, color, fontSize, 0, 0, text);
+        int tw = Canvas.MeasureText(text, fontSize);
+        int tx = rx + ((rw - tw) >> 1);
+        int ty = Canvas.CenterTextY(ry, rh, fontSize);
+        if (tx < rx) { tx = rx; }
+        if (ty < ry) { ty = ry; }
+        zan_gui_draw_text(surfaceId, tx, ty, text, color, fontSize);
+    }
+    static int[] asciiCharWidths;
+    static string[] measCacheStr;
+    static int[] measCacheSize;
+    static int[] measCacheW;
+    static int[] fontHeightCache;
+    static int[] fontAscentCache;
+    static int TextMeasHash(string s, int size) {
+        int h = size * 397;
+        int len = s.Length;
+        if (len > 8) { len = 8; }
+        for (int i = 0; i < len; i = i + 1) {
+            h = (h * 31) + s[i];
+        }
+        int slot = h & 255;
+        if (slot < 0) { slot = 0 - slot; }
+        return slot;
+    }
+    static int MeasureChar(int ch, int fontSize) {
+        if (fontSize >= 8 && fontSize <= 48 && ch >= 32 && ch <= 126) {
+            if (asciiCharWidths == null) { asciiCharWidths = new int[41 * 95]; }
+            int idx = (fontSize - 8) * 95 + (ch - 32);
+            int cached = asciiCharWidths[idx];
+            if (cached > 0) { return cached; }
+            string s = Text.CharStr(ch);
+            int w = zan_gui_measure_text(s, fontSize);
+            if (w > 0) { asciiCharWidths[idx] = w; }
+            return w;
+        }
+        return Canvas.MeasureText(Text.CharStr(ch), fontSize);
+    }
+    static int MeasureText(string text, int fontSize) {
+        if (text == null || text == "") { return 0; }
+        int len = text.Length;
+        if (len == 1 && fontSize >= 8 && fontSize <= 48) {
+            int ch = text[0];
+            if (ch >= 32 && ch <= 126) {
+                if (asciiCharWidths == null) { asciiCharWidths = new int[41 * 95]; }
+                int idx = (fontSize - 8) * 95 + (ch - 32);
+                int cached = asciiCharWidths[idx];
+                if (cached > 0) { return cached; }
+                int w = zan_gui_measure_text(text, fontSize);
+                if (w > 0) { asciiCharWidths[idx] = w; }
+                return w;
+            }
+        }
+        if (len <= 48) {
+            if (measCacheStr == null) {
+                measCacheStr = new string[256];
+                measCacheSize = new int[256];
+                measCacheW = new int[256];
+            }
+            int slot = Canvas.TextMeasHash(text, fontSize);
+            if (measCacheSize[slot] == fontSize && measCacheStr[slot] == text) { return measCacheW[slot]; }
+            int w2 = zan_gui_measure_text(text, fontSize);
+            measCacheStr[slot] = text;
+            measCacheSize[slot] = fontSize;
+            measCacheW[slot] = w2;
+            return w2;
+        }
+        return zan_gui_measure_text(text, fontSize);
+    }
+    static int FontHeight(int fontSize) {
+        if (fontSize >= 0 && fontSize < 128) {
+            if (fontHeightCache == null) { fontHeightCache = new int[128]; }
+            int h = fontHeightCache[fontSize];
+            if (h > 0) { return h; }
+            h = zan_gui_font_height(fontSize);
+            if (h > 0) { fontHeightCache[fontSize] = h; }
+            return h;
+        }
+        return zan_gui_font_height(fontSize);
+    }
+    static int FontAscent(int fontSize) {
+        if (fontSize >= 0 && fontSize < 128) {
+            if (fontAscentCache == null) { fontAscentCache = new int[128]; }
+            int a = fontAscentCache[fontSize];
+            if (a > 0) { return a; }
+            int raw = zan_gui_font_ascent(fontSize);
+            int fh = Canvas.FontHeight(fontSize);
+            if (raw <= 0 || raw > fh) { a = fh; } else { a = raw; }
+            if (a > 0) { fontAscentCache[fontSize] = a; }
+            return a;
+        }
+        int a2 = zan_gui_font_ascent(fontSize);
+        int fh2 = Canvas.FontHeight(fontSize);
+        if (a2 <= 0 || a2 > fh2) { return fh2; }
+        return a2;
+    }
+    static int FontPadTop(int fontSize) {
+        int pad = Canvas.FontHeight(fontSize) - fontSize;
+        if (pad < 0) { pad = 0; }
+        return pad;
+    }
+    static int CenterTextY(int rectY, int rectH, int fontSize) {
+        return rectY
+        + ((rectH - Canvas.FontHeight(fontSize)
+        - Canvas.FontLeadTop(fontSize)) >> 1);
+    }
+    static int FontLeadTop(int fontSize) { return Canvas.FontPadTop(fontSize) >> 2; }
+    static int CenterTextYAt(int centerY, int fontSize) {
+        return centerY - ((Canvas.FontHeight(fontSize)
+        + Canvas.FontLeadTop(fontSize)) >> 1);
+    }
+    void DrawIcon(int x, int y, int box, int color, int codepoint) {
+        IconVector.Draw(this, x, y, box, color, codepoint);
+    }
+    static string GlyphSvg(string name) {
+        string svg = Icon.SvgName(name);
+        if (svg == "") { svg = name; }
+        svg = IconSvg.Alias(svg);
+        if (IconSvgData.IndexOf(svg) >= 0) { return svg; }
+        return "";
+    }
+    void DrawGlyph(string name, int x, int y, int size, int color) {
+        string svg = Canvas.GlyphSvg(name);
+        if (svg != "") {
+            IconSvg.Draw(this, svg, x, y, size, color);
+            return;
+        }
+        int cp = Icon.Codepoint(name);
+        if (cp == 0) { return; }
+        IconVector.Draw(this, x, y, size, color, cp);
+    }
+    void DrawGlyphIn(string name, int rx, int ry, int rw, int rh,
+    int size, int color) {
+        string svg = Canvas.GlyphSvg(name);
+        if (svg != "") {
+            IconSvg.Draw(this, svg, rx + (rw - size) / 2,
+            ry + (rh - size) / 2, size, color);
+            return;
+        }
+        int cp = Icon.Codepoint(name);
+        if (cp == 0) { return; }
+        IconVector.Draw(this, rx + (rw - size) / 2, ry + (rh - size) / 2,
+        size, color, cp);
+    }
+    static int ImageWidth(string path) { return ImageCodec.Width(path); }
+    static int ImageHeight(string path) { return ImageCodec.Height(path); }
+    static void EvictImage(string path) { ImageCodec.Evict(path); }
+    static int ImageLoadMem(string key, string data, int len) { return ImageCodec.LoadMem(key, data, len); }
+    static int ImageLoadMem(string key, byte[] data, int len) { return ImageCodec.LoadMem(key, data, len); }
+    static int ImageLoadSvg(string key, string svg, int rasterW, int rasterH) {
+        return ImageCodec.LoadSvg(key, svg, rasterW, rasterH);
+    }
+    static int ImageRegisterArgb(string key, int[] pixels, int width, int height) {
+        if (key == null || !key.StartsWith("mem:")) { return 0; }
+        if (pixels == null || width <= 0 || height <= 0) { return 0; }
+        long count = (long)width * (long)height;
+        if (count > pixels.Length || count > 16777216) { return 0; }
+        nint buf = NativeMemory.Alloc((int)count * 4);
+        if (buf == 0) { return 0; }
+        try {
+            Span<int> view = new Span<int>(buf, (int)count);
+            for (int i = 0; i < (int)count; i = i + 1) {
+                view[i] = pixels[i];
+            }
+            return zan_image_register_argb(key, buf, width, height, width);
+        } finally {
+            NativeMemory.Free(buf);
+        }
+    }
+    static int ImageLoadSvg(string key, byte[] svg, int len, int rasterW,
+    int rasterH) {
+        return ImageCodec.LoadSvg(key, svg, len, rasterW, rasterH);
+    }
+    int GetPixel(int x, int y) { return zan_gui_read_pixel(surfaceId, x, y); }
+    bool SnapshotWindowShape(string key, WindowShapeMask mask,
+    List<WindowShapeRegion> regions, int dpiScale) {
+        return this.SnapshotWindowShape(key, mask, regions, dpiScale, 100);
+    }
+    bool SnapshotWindowShape(string key, WindowShapeMask mask,
+    List<WindowShapeRegion> regions, int dpiScale,
+    int opacityPercent) {
+        bool shaped = regions != null && regions.Count > 0;
+        if (mask == null || (!shaped && opacityPercent >= 100)
+        || !key.StartsWith("mem:")) { return false; }
+        if (opacityPercent < 10) { opacityPercent = 10; }
+        if (opacityPercent > 100) { opacityPercent = 100; }
+        int opacity = opacityPercent * 255 / 100;
+        int width = this.Width();
+        int height = this.Height();
+        long count = (long)width * height;
+        if (width <= 0 || height <= 0 || count > 536870911) { return false; }
+        byte[] coverage = shaped ? mask.Coverage(width, height, dpiScale, regions) : null;
+        if (shaped && coverage == null) { return false; }
+        nint source = zan_gui_get_pixels(surfaceId);
+        if (source == 0) { return false; }
+        int n = (int)count;
+        nint copy = NativeMemory.Alloc(n * 4);
+        if (copy == 0) { return false; }
+        try {
+            NativeMemory.Copy(copy, source, n * 4);
+            Span<int> pixels = new Span<int>(copy, n);
+            bool shadowBand = shaped && mask.HasShadowBand();
+            if (opacity >= 255 && !shadowBand) {
+                for (int i = 0; i < n; i = i + 1) {
+                    int cov = shaped ? (int)coverage[i] : 255;
+                    if (cov == 255) { continue; }
+                    if (cov <= 0) {
+                        pixels[i] = 0;
+                    } else {
+                        int p = pixels[i];
+                        int a = (((p >> 24) & 255) * cov) / 255;
+                        pixels[i] = (a << 24) | (p & 0x00FFFFFF);
+                    }
+                }
+            } else {
+                for (int i = 0; i < n; i = i + 1) {
+                    int cov = shaped ? (int)coverage[i] : 255;
+                    int pixel = WindowShapeMask.SnapshotStraightArgb(pixels[i], cov, shadowBand);
+                    int alpha = ((pixel >> 24) & 255) * opacity / 255;
+                    pixels[i] = (alpha << 24) | (pixel & 0x00FFFFFF);
+                }
+            }
+            return zan_image_register_argb(key, copy, width, height, width) == width;
+        } finally {
+            NativeMemory.Free(copy);
+        }
+    }
+    void BlitImage(string path, int dx, int dy, int dw, int dh,
+    int sx, int sy, int sw, int sh) {
+        Canvas.PaintHashText(23, dx, dy, dw, dh, path);
+        Canvas.PaintHashOp(0, sx, sy, sw, sh);
+        zan_gui_blit_pixels(surfaceId, ImageCodec.View(path),
+        dx, dy, dw, dh, sx, sy, sw, sh);
+    }
+    void DrawImage(string path, int x, int y) {
+        int w = Canvas.ImageWidth(path);
+        int h = Canvas.ImageHeight(path);
+        this.BlitImage(path, x, y, w, h, 0, 0, 0, 0);
+    }
+    void DrawDivider(int x, int y, int width, int color) {
+        color = this.ApplyOpacity(color);
+        if (width <= 0 || color == 0 || (color & 0xFF000000) == 0) { return; }
+        Canvas.PaintHashOp(24, x, y, width, color);
+        zan_gui_fill_rect(surfaceId, x, y, width, 1, color);
+    }
+    [DllImport("zan_gui")]
+    static extern void zan_gui_fill_rects(int surfaceId, nint data, int count);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_fill_circles(int surfaceId, nint data, int count);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_fill_radials(int surfaceId, nint data, int count);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_blit_surface(int dstId, int srcId, int dstX,
+    int dstY, int srcX, int srcY, int w, int h);
+    [DllImport("zan_gui")]
+    static extern void zan_gui_blit_surface_scaled(int dstId, int srcId,
+    int dstX, int dstY, int dstW, int dstH,
+    int srcX, int srcY, int srcW, int srcH);
+    void PaintHashBatch(int op, nint data, int count, int stride) {
+        Span<int> items = new Span<int>(data, count * stride);
+        for (int i = 0; i < count; i = i + 1) {
+            int b = i * stride;
+        Canvas.PaintHashOp(op, items[b], items[b + 1],
+            items[b + 2], items[b + 3]);
+            if (stride == 5) { Canvas.PaintHashOp(0, items[b + 4], 0, 0, 0); }
+        }
+    }
+    internal static bool paintHashOn;
+    internal static long paintHashAcc;
+    public static bool PaintHashSuspend() {
+        bool armed = Canvas.paintHashOn;
+        Canvas.paintHashOn = false;
+        return armed;
+    }
+    public static void PaintHashResume(bool armed) { Canvas.paintHashOn = armed; }
+    public static void PaintHashOp(int op, int a, int b, int c, int d) {
+        if (!Canvas.paintHashOn) { return; }
+        long h = Canvas.paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        Canvas.paintHashAcc = h;
+    }
+    public static void PaintHashText(int op, int a, int b, int c, int d, string text) {
+        if (!Canvas.paintHashOn) { return; }
+        long h = Canvas.paintHashAcc;
+        h = (h * 1099511628211) ^ op;
+        h = (h * 1099511628211) ^ a;
+        h = (h * 1099511628211) ^ b;
+        h = (h * 1099511628211) ^ c;
+        h = (h * 1099511628211) ^ d;
+        int n = text.Length;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ text[i];
+        }
+        Canvas.paintHashAcc = h;
+    }
+    public static void PaintHashList(List<int> xs) {
+        if (!Canvas.paintHashOn) { return; }
+        long h = Canvas.paintHashAcc;
+        int n = xs.Count;
+        h = (h * 1099511628211) ^ n;
+        for (int i = 0; i < n; i = i + 1) {
+            h = (h * 1099511628211) ^ xs[i];
+        }
+        Canvas.paintHashAcc = h;
+    }
+    public static bool PaintHashArmed() { return Canvas.paintHashOn; }
+    void FillRects(nint data, int count) {
+        if (count <= 0 || data == 0) { return; }
+        if (Canvas.PaintHashArmed()) { PaintHashBatch(29, data, count, 5); }
+        zan_gui_fill_rects(surfaceId, data, count);
+    }
+    void FillCircles(nint data, int count) {
+        if (count <= 0 || data == 0) { return; }
+        if (Canvas.PaintHashArmed()) { PaintHashBatch(30, data, count, 4); }
+        zan_gui_fill_circles(surfaceId, data, count);
+    }
+    void FillRadials(nint data, int count) {
+        if (count <= 0 || data == 0) { return; }
+        if (Canvas.PaintHashArmed()) { PaintHashBatch(31, data, count, 5); }
+        zan_gui_fill_radials(surfaceId, data, count);
+    }
+    void BlitSurface(Canvas src, int dstX, int dstY, int srcX, int srcY,
+    int w, int h) {
+        if (src == null || w <= 0 || h <= 0) { return; }
+        Canvas.PaintHashOp(32, dstX, dstY, w, h);
+        Canvas.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
+        zan_gui_blit_surface(surfaceId, src.surfaceId, dstX, dstY,
+        srcX, srcY, w, h);
+    }
+    void BlitSurfaceScaled(Canvas src, int dstX, int dstY, int dstW, int dstH,
+    int srcX, int srcY, int srcW, int srcH) {
+        if (src == null || dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0) { return; }
+        Canvas.PaintHashOp(33, dstX, dstY, dstW, dstH);
+        Canvas.PaintHashOp(0, src.surfaceId, srcX, srcY, 0);
+        Canvas.PaintHashOp(0, srcW, srcH, 0, 0);
+        zan_gui_blit_surface_scaled(surfaceId, src.surfaceId,
+        dstX, dstY, dstW, dstH, srcX, srcY, srcW, srcH);
+    }
+    static int GetDpiScale() { return Gui.Backend.Platform.Shell().DpiScale(); }
+}

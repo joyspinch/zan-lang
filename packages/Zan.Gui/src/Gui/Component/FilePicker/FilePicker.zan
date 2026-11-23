@@ -4,25 +4,15 @@ using System.IO;
 using Gui;
 using Gui.Backend;
 using Gui.Widget;
-
 namespace Gui.Component;
-
-// 可复用路径选择器：独立窗口或显式绑定的宿主内模态视图。
 public partial class FilePicker : IModalWindow {
-    public static string lang = "zh";
-
-    // Android 上应用私有 files 目录（由原生运行时 Activity 导出）。
-    // 进程 cwd 是 "/" 且列根目录被 SELinux 拒绝，这里作为默认浏览起点。
     #if ANDROID || OHOS
     [DllImport("zan_gui")]
     private static extern string zan_gui_android_files_dir();
     #endif
-
     private Input pathInput;
     private Input nameInput;
     private Input folderInput;
-    // 列表上方的筛选框：按子串缩小当前目录里的文件夹和文件，
-    // 两种模式都有（选文件夹时也要能在几百个目录里找）。
     private Input searchInput;
     private SignalInt treeScroll;
     private SignalInt listScroll;
@@ -34,10 +24,6 @@ public partial class FilePicker : IModalWindow {
         if (app != null) { return app; }
         return this.App;
     }
-    // Android 降级标志：移动端单 Activity 窗口模式下，第二个 OS 窗口
-    // 创建后不可见，对话框无法以独立子窗口弹起。inlineMode=true 时选择器改由
-    // 宿主窗口内的全屏模态承载。BeginInline/BindInline 在输入前绑定宿主，
-    // RenderOverlay 只绘制已准备的树；OwnsWindow 恒 false。
     private Button acceptBtn;
     private Button cancelBtn;
     private Flex footerBar;
@@ -57,47 +43,29 @@ public partial class FilePicker : IModalWindow {
     private string title;
     private string suffix;
     private string selectedPath;
-    // 多选模式（BeginOpenFileMulti / BeginOpenFileFiltersMulti）：
-    // Ctrl+点击把文件行加入/移出本集合，Shift+点击从锚点行扩展；
-    // 确认后经 SelectedPaths() 读回（升序、与列表同序）。单选模式
-    // 恒空。
     private List<string> selectedPaths;
-    // Shift+点击范围选择的锚点（列表索引，-1 = 无锚点）。
     private int anchorIdx;
     private bool allowMulti;
-    // 多选数量上限（0 = 不限）：Ctrl+点击加选与 Shift+点击范围扩展
-    // 在达到上限后拒绝新增并提示；窗口内状态区实时显示「已选 x/N」。
     private int maxSelect;
     private string statusText;
     private string lastFilter;
-    // 上一次浏览的目录：Begin 未给 initial 时从这里续起，生命周期内
-    // 连续打开不再每次回到默认目录。Begin 解析出有效目录与 Navigate
-    // 成功时更新。
     private string lastDir;
     private List<string> expanded;
-    // 底部下拉框中显示的扩展名过滤器。每个 FileFilter 将一个
-    // 人类可读标签（如 "Zan source (*.zan)"）与 ";" 分隔的扩展名
-    // 模式配对（"" = 所有文件）。filterSel 是选中的索引；filterOpen
-    // 跟踪下拉弹窗状态。
     private List<FileFilter> filters;
     private SignalInt filterSel;
     private bool filterOpen;
     private bool filtersCustom;
-
-    // 事件机制，宿主无需每帧轮询 TakeResult()。
     public UiEvent Accepted;      // 用户已确认（读取 SelectedPath()）
     public UiEvent Cancelled;     // 对话框被关闭
     public UiEvent Closed;        // 对话框已关闭，无论何种方式
     public UiEvent PathChanged;   // 浏览的目录已改变
     public UiEvent FilterChanged; // 扩展名过滤器已改变
-
     public void MarkDirty() {
         this.dirty = true;
         this.viewRevision = this.viewRevision + 1;
         if (inputHost != null) { inputHost.MarkDirty(); }
         else if (popup != null) { popup.RequestRedraw(); }
     }
-
     public FilePicker() {
         this.pathInput = new Input("path");
         this.pathInput.Submit.Add(new FilePickerAction(this).SubmitPath);
@@ -150,17 +118,11 @@ public partial class FilePicker : IModalWindow {
         this.PathChanged = new UiEvent();
         this.FilterChanged = new UiEvent();
     }
-
-    // 为下一次打开提供显式扩展名过滤器。每个条目将
-    // 显示标签与 ";" 分隔的扩展名模式配对（"" 匹配全部），
-    // });
     public void SetFilters(List<FileFilter> items) {
         filters = items;
         filtersCustom = true;
         filterSel.Set(0);
     }
-
-    // 筛选框，首次准备时按当前界面语言建好并复用。
     public Input SearchBox() {
         if (searchInput == null) {
             searchInput = new Input(
@@ -169,14 +131,7 @@ public partial class FilePicker : IModalWindow {
         }
         return searchInput;
     }
-
-    // 双语文案改走键式查找（System.Globalization.Lang）：英文原文
-    // 作键、内置中文为缺省串。宿主已 Lang.LoadDir 时语言包整句
-    // 覆盖；未加载（code 空）回退缺省串，行为与之前一致。
-    public static string T(string en, string zh) {
-        return Lang.Tr(en, zh);
-    }
-
+    public static string T(string en, string zh) { return Lang.Tr(en, zh); }
     public static string Normalize(string path) {
         if (path == null) { return ""; }
         string resultText = path.Replace("\\", "/");
@@ -186,27 +141,21 @@ public partial class FilePicker : IModalWindow {
         }
         return resultText;
     }
-
     public static string LowerAscii(string text) {
         if (text == null) { return ""; }
         return text.ToLower();
     }
-
     public static bool EndsWith(string text, string ending) {
         if (ending == null || ending == "") { return true; }
         if (text == null) { return false; }
         return text.ToLower().EndsWith(ending.ToLower());
     }
-
     public static string Join(string dir, string name) {
         if (dir == null) { return name == null ? "" : name; }
         if (name == null) { return dir; }
-        if (dir.Length > 0 && (dir[dir.Length - 1] & 255) == 47) {
-            return dir + name;
-        }
+        if (dir.Length > 0 && (dir[dir.Length - 1] & 255) == 47) { return dir + name; }
         return dir + "/" + name;
     }
-
     public static string ParentDirectory(string dir) {
         string parent = FilePicker.Normalize(Path.GetDirectoryName(dir));
         if (parent.Length == 2
@@ -215,84 +164,22 @@ public partial class FilePicker : IModalWindow {
         }
         return parent;
     }
-
     public static string ValidDirectory(string initial) {
         string dir = FilePicker.Normalize(initial);
-        if (Directory.FileExistsUtf8(dir)) {
-            dir = FilePicker.ParentDirectory(dir);
-        }
+        if (Directory.FileExistsUtf8(dir)) { dir = FilePicker.ParentDirectory(dir); }
         if (Directory.ExistsUtf8(dir)) { return dir; }
         if (Directory.ExistsUtf8(".")) {
-            // 回落必须给绝对 cwd，不能给 "."：Begin 的兜底告警把
-            // "." 当「不可列」误报（cwd 明明列得出来，桌面每次无
-            // 初始目录打开都挂红字）。ReadPath 帮不上忙——它对
-            // cwd 里已存在的路径只回空串。
             string cwd = Directory.GetCurrentDirectory();
             return cwd == "" ? "." : FilePicker.Normalize(cwd);
         }
         return "";
     }
-
     public static string RootOf(string dir) {
         dir = FilePicker.Normalize(dir);
-        if (dir.Length >= 3 && (dir[1] & 255) == 58 && (dir[2] & 255) == 47) {
-            return dir.Substring(0, 3);
-        }
+        if (dir.Length >= 3 && (dir[1] & 255) == 58 && (dir[2] & 255) == 47) { return dir.Substring(0, 3); }
         if (dir.Length > 0 && (dir[0] & 255) == 47) { return "/"; }
         return dir;
     }
-
-    public bool Inside(int x, int y, int w, int h) {
-        return FilePicker.Inside(this.App, x, y, w, h);
-    }
-    public static bool Inside(App app, int x, int y, int w, int h) {
-        if (app == null) { return false; }
-        // 内嵌模式（Android）下本组件在宿主帧里铺了全屏遮罩：
-        // PointerCaptured 因 inputBlockPrevious 恒为真，Ui.Over
-        // 会把遮罩自身内容的几何判定全部否决（OverlayPopup 的
-        // 滚轮注释同款问题——桌面窗口模式没有遮罩，不受影响）。
-        // 遮罩已铺设（blocksInputBelow 置位，BeginFrame 每帧
-        // 复位）之后的查询必然来自本次渲染段即遮罩所有者，
-        // 直接按原始几何判定；其余表面维持 PointerCaptured
-        // 约束，点击不得穿透遮罩。
-        if (!app.blocksInputBelow && app.PointerCaptured()) {
-            return false;
-        }
-        return app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
-    }
-
-    public bool Clicked(int x, int y, int w, int h) {
-        return FilePicker.Clicked(this.App, x, y, w, h);
-    }
-    public static bool Clicked(App app, int x, int y, int w, int h) {
-        if (app == null || !app.ClickAvailable()) { return false; }
-        return FilePicker.Inside(app, x, y, w, h);
-    }
-
-    public bool Pressed(int x, int y, int w, int h) {
-        return FilePicker.Pressed(this.App, x, y, w, h);
-    }
-    public static bool Pressed(App app, int x, int y, int w, int h) {
-        if (app == null) { return false; }
-        return app.EventKind() == 2
-            && FilePicker.Inside(app, x, y, w, h);
-    }
-
-    public int WheelStep() {
-        return FilePicker.WheelStep(this.App);
-    }
-    public static int WheelStep(App app) {
-        if (app == null || app.window == null) { return 0; }
-        int delta = app.window.EventKeyCode();
-        int step = delta / 120;
-        if (step == 0) {
-            if (delta > 0) { step = 1; }
-            else if (delta < 0) { step = 0 - 1; }
-        }
-        return step;
-    }
-
     public static bool ValidFolderName(string name) {
         if (name == null || name == "" || name == "." || name == "..") { return false; }
         for (int i = 0; i < name.Length; i = i + 1) {
@@ -301,36 +188,25 @@ public partial class FilePicker : IModalWindow {
         }
         return true;
     }
-
-    // 同一个目录在不同来源下大小写并不一致：树根来自
-    // `Directory.GetRootsUtf8()`（`D:/`），展开集是从初始目录一路取父
-    // 目录得到的（`d:/project/...`）。逐字符比较会让 `D:/` 永远不算已
-    // 展开，于是左侧树只剩两个盘符、点不开当前目录。
     public static bool SamePath(string a, string b) {
         return FilePicker.LowerAscii(a) == FilePicker.LowerAscii(b);
     }
-
     public bool IsExpanded(string path) {
         for (int i = 0; i < expanded.Count; i = i + 1) {
             if (FilePicker.SamePath(expanded[i], path)) { return true; }
         }
         return false;
     }
-
     public void Expand(string path) {
         if (!IsExpanded(path)) { expanded.Add(path); }
     }
-
     public void Collapse(string path) {
         List<string> keep = new List<string>();
         for (int i = 0; i < expanded.Count; i = i + 1) {
-            if (!FilePicker.SamePath(expanded[i], path)) {
-                keep.Add(expanded[i]);
-            }
+            if (!FilePicker.SamePath(expanded[i], path)) { keep.Add(expanded[i]); }
         }
         expanded = keep;
     }
-
     public void ExpandAncestors(string dir) {
         string current = FilePicker.Normalize(dir);
         for (int guard = 0; current != "" && guard < 128; guard = guard + 1) {
@@ -340,7 +216,6 @@ public partial class FilePicker : IModalWindow {
             current = parent;
         }
     }
-
     public static List<FilePickerItem> QuickAccessItems() {
         List<FilePickerItem> items = new List<FilePickerItem>();
         AddQuickIfValid(items, FilePicker.T("Desktop", "桌面"), KnownFolders.Desktop(), "device-desktop");
@@ -354,13 +229,11 @@ public partial class FilePicker : IModalWindow {
         AddQuickIfValid(items, FilePicker.T("Home", "主目录"), home, "home");
         return items;
     }
-
     public static void AddQuickIfValid(List<FilePickerItem> items, string label, string path, string icon) {
         if (path != null && path != "" && Directory.ExistsUtf8(path)) {
             items.Add(new FilePickerItem(label, FilePicker.Normalize(path), 2, icon));
         }
     }
-
     public static string FileIconFor(string name) {
         if (name == null) { return "file"; }
         string lower = name.ToLower();
@@ -377,7 +250,6 @@ public partial class FilePicker : IModalWindow {
         }
         return "file";
     }
-
     public void BuildTree(
         string dir,
         int depth,
@@ -386,7 +258,6 @@ public partial class FilePicker : IModalWindow {
         if (nodes.Count >= 400 || !Directory.ExistsUtf8(dir)) { return; }
         nodes.Add(new FilePickerTreeNode(dir, depth));
         if (!IsExpanded(dir)) { return; }
-
         List<string> dirs = Directory.GetDirectoriesFiltered(
             dir, showHidden.Get());
         for (int i = 0; i < dirs.Count && nodes.Count < 400; i = i + 1) {
@@ -394,7 +265,6 @@ public partial class FilePicker : IModalWindow {
             BuildTree(child, depth + 1, nodes);
         }
     }
-
     public void Begin(
         int pickerMode,
         string initial,
@@ -405,7 +275,6 @@ public partial class FilePicker : IModalWindow {
         App host = inlineMode && inputHost != null ? inputHost.HostApp() : App.FrameApp();
         this.BeginCore(pickerMode, initial, extension, defaultName, dialogTitle, host, false);
     }
-
     private void BeginCore(int pickerMode, string initial, string extension,
             string defaultName, string dialogTitle, App host, bool forceInline) {
         int session = inputSession + 1; inputSession = session;
@@ -431,13 +300,7 @@ public partial class FilePicker : IModalWindow {
         listDragging = false;
         filterOpen = false;
         filterSel.Set(0);
-        // 每次打开时重建自动过滤器（通过 SetFilters 设置的自定义过滤器会
-        // 保留）。未设置显式过滤器时，从
-        // `extension` 合成一个，外加 "All files" 兜底，保证底部始终有
-        // 过滤器下拉框。
-        if (!filtersCustom) {
-            filters = new List<FileFilter>();
-        }
+        if (!filtersCustom) { filters = new List<FileFilter>(); }
         if (pickerMode != 0 && filters.Count == 0) {
             if (extension != "") {
                 filters.Add(new FileFilter(FilePicker.T("Files", "文件")
@@ -447,17 +310,10 @@ public partial class FilePicker : IModalWindow {
                 + " (*.*)", ""));
         }
         result = 0;
-        // 初始目录的优先级：宿主显式给的 initial > 上一次浏览的目录
-        // （生命周期内连续打开不再回到默认目录）> 工作目录。ValidDirectory
-        // 对空串/失效路径会内部回落 "."，所以先按参数分档、最后统一兜底。
         string dir = "";
         if (initial != "") { dir = FilePicker.ValidDirectory(initial); }
         if (dir == "" && lastDir != "") { dir = FilePicker.ValidDirectory(lastDir); }
         #if ANDROID || OHOS
-        // Android/鸿蒙上进程工作目录是 "/"，列根目录被 SELinux 拒绝
-        // （空列表）。依次尝试：应用私有 files 目录（驱动导出，
-        // 必可读写）→ 随包解包目录 → $HOME。都拿不到就留空，
-        // 由状态条提示手输路径。
         if (dir == "" || dir == "." || dir == "/") {
             string filesDir = zan_gui_android_files_dir();
             if (filesDir != null && filesDir != ""
@@ -474,16 +330,12 @@ public partial class FilePicker : IModalWindow {
         }
         if (dir == "" || dir == "." || dir == "/") {
             string home = KnownFolders.Home();
-            if (home != "" && Directory.ExistsUtf8(home)) {
-                dir = FilePicker.Normalize(home);
-            }
+            if (home != "" && Directory.ExistsUtf8(home)) { dir = FilePicker.Normalize(home); }
         }
         #else
         if (dir == "") { dir = FilePicker.ValidDirectory(""); }
         #endif
         if (dir == "" || dir == "." || dir == "/") {
-            // 兜底目录不可列（SELinux/无权限）时状态条给出提示，
-            // 用户仍可手输路径后按「转到」。
             statusText = FilePicker.T(
                 "Cannot list the working folder — type a path above.",
                 "无法列出当前目录——请在上方输入路径。");
@@ -500,21 +352,12 @@ public partial class FilePicker : IModalWindow {
         expanded = new List<string>();
         ExpandAncestors(dir);
         #if ANDROID || OHOS
-        // Android/鸿蒙只有一个原生窗口（OHOS 驱动的 create_window
-        // 恒返回主窗口句柄，"第二个窗口"与宿主同句柄同表面——popup
-        // 的事件泵会和宿主双消费同一事件流，渲染还互相抢 EGL 表面，
-        // 表现为对话框"打不开"）。降级为宿主窗口内的全屏模态
-        // （RenderOverlay），事件随宿主走。
         inlineMode = true;
         popup = null;
         #else
         inlineMode = forceInline;
         popup = forceInline ? null : App.CreateDark(dialogTitle, 760, 500);
-        if (popup == null) {
-            // 平台拿不到第二窗口（无头/受限环境）时同样走内嵌模态，
-            // 按钮至少有响应。
-            inlineMode = true;
-        }
+        if (popup == null) { inlineMode = true; }
         #endif
         if (popup != null) {
             popup.ApplySkin(skinIndex);
@@ -527,16 +370,10 @@ public partial class FilePicker : IModalWindow {
         this.InstallInputHost(popup != null ? popup : host);
         this.MarkDirty();
     }
-
-    public void BeginFolder(string initial, string dialogTitle) {
-        Begin(0, initial, "", "", dialogTitle);
-    }
-
+    public void BeginFolder(string initial, string dialogTitle) { Begin(0, initial, "", "", dialogTitle); }
     public void BeginOpenFile(string initial, string extension, string dialogTitle) {
         Begin(1, initial, extension, "", dialogTitle);
     }
-
-    // 带显式扩展名过滤器集合的打开文件对话框。
     public void BeginOpenFileFilters(
         string initial,
         List<FileFilter> items,
@@ -550,25 +387,15 @@ public partial class FilePicker : IModalWindow {
         }
         Begin(1, initial, first, "", dialogTitle);
     }
-
-    // 多选打开文件对话框：Ctrl+点击切换选中，Shift+点击范围选择，
-    // 确认后经 SelectedPaths() 读回全部选中路径。
     public void BeginOpenFileMulti(string initial, string extension, string dialogTitle) {
         allowMulti = true;
         Begin(1, initial, extension, "", dialogTitle);
     }
-
-    // 多选数量上限（0 = 不限）。达到上限后再点新行拒绝加入并在
-    // 状态区提示；宿主（如 Upload 的 Max）用它把上限透传进弹窗。
     public void SetMaxSelect(int n) {
         maxSelect = n;
         if (maxSelect < 0) { maxSelect = 0; }
     }
-
-    // 当前多选数量上限（0 = 不限）。测试钉语义用。
     public int MaxSelect() { return maxSelect; }
-
-    // 多选 + 显式扩展名过滤器集合的打开文件对话框。
     public void BeginOpenFileFiltersMulti(
         string initial,
         List<FileFilter> items,
@@ -577,26 +404,17 @@ public partial class FilePicker : IModalWindow {
         allowMulti = true;
         BeginOpenFileFilters(initial, items, dialogTitle);
     }
-
-    // ";" 分隔模式中的第一个扩展名（模式为空则为 ""）。
     public static string FirstExt(string pattern) {
         if (pattern == null || pattern == "") { return ""; }
         int semi = pattern.IndexOf(";");
         if (semi >= 0) { return pattern.Substring(0, semi); }
         return pattern;
     }
-
-    // 名称过滤框的不区分大小写子串测试（"" 匹配所有）。
     public static bool ContainsText(string text, string needle) {
         if (needle == null || needle == "") { return true; }
         if (text == null) { return false; }
         return text.ToLower().IndexOf(needle.ToLower()) >= 0;
     }
-
-    // 模式 token → 可做字面后缀比较的形态：剥掉通配 "*"
-    // （"*.png"→".png"、"png"→".png"、"."→"."）。EndsWith 是字面
-    // 比较，"*" 留在里面会让每个文件都匹配不上——过滤器一选
-    // 「接受的文件」列表就全空，即此根因。
     public static string FilterTokenToSuffix(string ext) {
         string t = ext.Trim();
         while (t.StartsWith("*")) { t = t.Substring(1, t.Length - 1); }
@@ -604,20 +422,12 @@ public partial class FilePicker : IModalWindow {
         if (!t.StartsWith(".")) { t = "." + t; }
         return t;
     }
-
-    // `name` 通过当前所选过滤器时为 true。空模式
-    // （所有文件）匹配一切；否则 ";" 分隔的
-    // 任一扩展名匹配即可。
     public bool MatchesCurrentFilter(string name) {
-        if (filters.Count == 0) {
-            return this.PatternMatches(name, suffix);
-        }
+        if (filters.Count == 0) { return this.PatternMatches(name, suffix); }
         int sel = filterSel.Get();
         if (sel < 0 || sel >= filters.Count) { return true; }
         return this.PatternMatches(name, filters[sel].pattern);
     }
-
-    // ";" 分隔模式的任一 token 命中即 true；空模式匹配一切。
     public bool PatternMatches(string name, string pattern) {
         if (pattern == null || pattern == "") { return true; }
         int start = 0;
@@ -627,15 +437,12 @@ public partial class FilePicker : IModalWindow {
             if (end || (pattern[i] & 255) == 59) {
                 string ext = FilePicker.FilterTokenToSuffix(
                     pattern.Substring(start, i - start));
-                if (ext != "" && FilePicker.EndsWith(name, ext)) {
-                    return true;
-                }
+                if (ext != "" && FilePicker.EndsWith(name, ext)) { return true; }
                 start = i + 1;
             }
         }
         return false;
     }
-
     public void BeginSaveFile(
         string initial,
         string extension,
@@ -644,54 +451,26 @@ public partial class FilePicker : IModalWindow {
     ) {
         Begin(2, initial, extension, defaultName, dialogTitle);
     }
-
     public void ApplySkin(int index) {
         if (skinIndex == index) { return; }
         skinIndex = index;
         if (popup != null) { popup.ApplySkin(index); }
     }
-    // 当前皮肤索引（0 = 默认暗色）。测试与宿主同步检查用。
     public int SkinIndex() { return skinIndex; }
-
     public bool IsOpen() { return open; }
-    // 弹窗是否以独立 OS 窗口承载。inlineMode（Android/无第二窗口环境）
-    // 时恒 false：OS 窗口从未创建，内容随宿主帧经 RenderOverlay 绘制，
-    // 宿主事件泵不应为它改变轮询/阻塞节奏（对照 IsOpen，后者在两种
-    // 模式下都为 true）。
-    public bool WindowModeOpen() {
-        return open && popup != null;
-    }
-    public bool NeedsRedraw() {
-        return open && popup != null && popup.needsRedraw;
-    }
-    public bool OwnsWindow(nint hwnd) {
-        return popup != null && hwnd == popup.WindowHandle();
-    }
-
-    // 弹窗的原生窗口句柄（未开为 0）。宿主焦点管理与路由测试用；
-    // 非属主判定请用 OwnsWindow（0 不与任何真实句柄冲突）。
-    public nint PopupWindowHandle() {
-        return popup != null ? popup.WindowHandle() : 0;
-    }
+    public bool WindowModeOpen() { return open && popup != null; }
+    public bool NeedsRedraw() { return open && popup != null && popup.needsRedraw; }
+    public bool OwnsWindow(nint hwnd) { return popup != null && hwnd == popup.WindowHandle(); }
+    public nint PopupWindowHandle() { return popup != null ? popup.WindowHandle() : 0; }
     public string SelectedPath() { return selectedPath; }
-    // 多选确认后的全部选中路径（升序、与列表展示同序）。单选模式
-    // 返回空列表；单选宿主请继续读 SelectedPath()。
     public List<string> SelectedPaths() { return selectedPaths; }
-    // 生命周期内记住的上一次浏览目录（Begin 未传 initial 时续用）。
-    // 测试钉住「连续打开不再回到默认目录」的语义。
     public string LastDirectory() { return lastDir; }
-    public string CurrentDirectory() {
-        return FilePicker.Normalize(pathInput.GetText());
-    }
-
+    public string CurrentDirectory() { return FilePicker.Normalize(pathInput.GetText()); }
     public void RaiseFilterChanged() { FilterChanged.Raise(); }
-
     public void Finish(int action) {
         if (!open) { return; }
         result = action;
         if (action == 1 && allowMulti) {
-            // 多选确认：快照选中集合。没有 Ctrl/Shift 叠选但点过一行时
-            // selectedPaths 已含该行；直接双击/单选后确认也有一条。
             if (selectedPaths.Count == 0 && selectedPath != ""
                     && Directory.FileExistsUtf8(selectedPath)) {
                 selectedPaths.Add(selectedPath);
@@ -701,8 +480,6 @@ public partial class FilePicker : IModalWindow {
         }
         open = false;
         closing = true;
-        // Retire input synchronously. Native destruction remains with ApplyEvent
-        // or SweepClosed so callers may safely finish an in-progress frame.
         int session = inputSession + 1; inputSession = session;
         App previous = popup;
         if (!this.RetireInputHost(session)) { return; }
@@ -711,16 +488,10 @@ public partial class FilePicker : IModalWindow {
         if (inputSession != session) { return; }
         Closed.Raise();
     }
-
-    // `idx` 行在多选集合里时为 true。列表快照在准备期重建，
-    // 多选集合按路径比较，旧行的动作保持创建时的快照语义。
     public bool InMultiSelection(int idx, List<FilePickerItem> items) {
         if (idx < 0 || idx >= items.Count) { return false; }
         return selectedPaths.Contains(items[idx].path);
     }
-
-    // 从多选集合摘除一条路径（List<string> 无 Remove 成员，
-    // 手写摘除保持索引连续）。
     public void RemoveSelectedPath(string path) {
         int i = 0;
         while (i < selectedPaths.Count) {
@@ -728,19 +499,16 @@ public partial class FilePicker : IModalWindow {
             i = i + 1;
         }
     }
-
     public void Close() {
         selectedPath = "";
         Finish(2);
     }
-
     public bool ApplyEvent(nint evHwnd) {
         if (!OwnsWindow(evHwnd)) { return true; }
         App app = popup;
         int kind = app.EventKind();
         if (kind == 8) {
             if (open && !closing) { this.Close(); }
-            // Close callbacks may already have opened a different window.
             if (popup != app) { return false; }
             popup = null;
             app.StopLoop();
@@ -752,9 +520,6 @@ public partial class FilePicker : IModalWindow {
         if (kind == 13 && popup == app) { app.RequestRedraw(); }
         return keep;
     }
-
-    // The host may sweep a programmatically closed native window after reading
-    // TakeResult. Publish the empty slot before releasing the old App.
     public void SweepClosed() {
         if (popup != null && !open) {
             App previous = popup; popup = null;
@@ -762,13 +527,11 @@ public partial class FilePicker : IModalWindow {
             previous.window.Destroy();
         }
     }
-
     public int TakeResult() {
         int resultCode = result;
         result = 0;
         return resultCode;
     }
-
     public void Navigate(string dir) {
         dir = FilePicker.Normalize(dir);
         if (!Directory.ExistsUtf8(dir)) {
@@ -787,11 +550,7 @@ public partial class FilePicker : IModalWindow {
         ExpandAncestors(dir);
         this.MarkDirty();
     }
-
-    public void OnPathSubmit() {
-        this.Navigate(pathInput.GetText());
-    }
-
+    public void OnPathSubmit() { this.Navigate(pathInput.GetText()); }
     public void OnFolderSubmit() {
         if (!creatingFolder) { return; }
         string dir = FilePicker.Normalize(pathInput.GetText());
@@ -807,9 +566,7 @@ public partial class FilePicker : IModalWindow {
                 "请输入有效的文件夹名称。");
         } else {
             string created = FilePicker.Join(dir, folderName);
-            if (!Directory.ExistsUtf8(created)) {
-                Directory.CreateDirectoryUtf8(created);
-            }
+            if (!Directory.ExistsUtf8(created)) { Directory.CreateDirectoryUtf8(created); }
             if (Directory.ExistsUtf8(created)) {
                 creatingFolder = false;
                 Navigate(created);
@@ -821,7 +578,6 @@ public partial class FilePicker : IModalWindow {
         }
         this.MarkDirty();
     }
-
     public void TryAccept() {
         string dir = FilePicker.Normalize(pathInput.GetText());
         bool valid = Directory.ExistsUtf8(dir);
@@ -831,8 +587,6 @@ public partial class FilePicker : IModalWindow {
         } else if (mode == 1 && (Directory.FileExistsUtf8(selectedPath) || (allowMulti && selectedPaths.Count > 0))) {
             Finish(1);
         } else if (mode == 1) {
-            // 名称框兼作选择器：输入完整名称（或要进入的
-            // 文件夹名）后按 Open 即可确定。
             string typed = nameInput.GetText();
             if (typed != "") {
                 string typedPath = FilePicker.Join(dir, typed);
@@ -860,12 +614,9 @@ public partial class FilePicker : IModalWindow {
             } else {
                 wantSuffix = FilePicker.FilterTokenToSuffix(FilePicker.FirstExt(suffix));
             }
-            if (wantSuffix != "" && !this.MatchesCurrentFilter(name)) {
-                name = name + wantSuffix;
-            }
+            if (wantSuffix != "" && !this.MatchesCurrentFilter(name)) { name = name + wantSuffix; }
             selectedPath = FilePicker.Join(dir, name);
             Finish(1);
         }
     }
-
 }
