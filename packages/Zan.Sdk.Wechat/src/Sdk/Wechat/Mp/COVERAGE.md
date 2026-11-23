@@ -2,7 +2,7 @@
 
 本目录迁移自 `WeiXinMPSDK-master/src/Senparc.Weixin.MP/.../AdvancedAPIs`。
 映射代码由 `scripts/generate_wechat_mp.py` 从仓库内固定的 C# 源码快照生成。
-这里保留公开 API 名称、方法专属请求/响应契约和微信 HTTP 端点；495 个可复用业务实体按原 C# 类型身份集中到 `../Models/Mp/WechatMpModels.zan`，统一复用 Zan 标准库 HTTP / JSON / 加密能力，不复制 C# 的 DI、MVC 和反射基础设施。
+这里保留公开 API 名称和微信 HTTP 端点；方法专属 `*Request` / `*Response` 契约分别位于 `../Requests/Mp/` 与 `../Responses/Mp/`，495 个可复用业务实体按原 C# 类型身份与业务域集中到 `../Models/Mp/*.zan`，统一复用 Zan 标准库 HTTP / JSON / 加密能力，不复制 C# 的 DI、MVC 和反射基础设施。
 
 ## 当前覆盖
 

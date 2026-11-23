@@ -4,14 +4,13 @@ using System.Security.Cryptography;
 
 namespace Sdk.Wechat;
 
-// AES 解密后的明文消息 + 尾部 appId。
+// 微信安全模式消息加解密（AES-256-CBC + 32 字节 PKCS#7）。
 public class WXBizMsgCrypt {
     string token;
     string appId;
-    byte[] aesKey;  // 32 个原始字节
-    byte[] aesIv;  // 16 个原始字节（= key[0..15]）
+    byte[] aesKey;
+    byte[] aesIv;
 
-    // <paramref 名称="encodingAesKey"/> 必须是公众平台上配置的 43 字符 EncodingAESKey。
     public WXBizMsgCrypt(string token, string encodingAesKey, string appId) {
         this.token = token;
         this.appId = appId;
@@ -32,8 +31,6 @@ public class WXBizMsgCrypt {
         this.aesIv = iv;
     }
 
-    // 校验并解密微信推送的加密 XML，返回明文 XML。
-    // 签名错误 / AES 失败 / appId 不匹配一律抛 <see cref="WechatException"/>。
     public string DecryptMsg(string msgSignature, string timestamp, string nonce, string postData) {
         string encrypt = XmlUtil.GetTag(postData, "Encrypt");
         if (encrypt.Length == 0) {
@@ -43,7 +40,7 @@ public class WXBizMsgCrypt {
             throw new WechatException("-40001", "签名校验失败（签名或 token 为空）", postData);
         }
         string expect = WXBizMsgCrypt.MsgSignature(this.token, timestamp, nonce, encrypt);
-        // 常数时间比较，防逐字节探测签名
+        // 常数时间比对，防逐字节探测。
         if (!Jwt.fixedEquals(msgSignature, msgSignature.Length, expect, expect.Length)) {
             throw new WechatException("-40001", "签名校验失败", postData);
         }
@@ -54,8 +51,6 @@ public class WXBizMsgCrypt {
         return plain.Msg;
     }
 
-    // 加密回复 XML，返回可直接写给微信的加密 XML
-    // （含 Encrypt / MsgSignature / TimeStamp / Nonce）。
     public string EncryptMsg(string replyMsg, string timestamp, string nonce) {
         string encrypt = this.AesEncrypt(replyMsg);
         string sig = WXBizMsgCrypt.MsgSignature(this.token, timestamp, nonce, encrypt);
@@ -69,35 +64,19 @@ public class WXBizMsgCrypt {
         return sb.ToString();
     }
 
-    // 四参数消息签名：token、timestamp、nonce、encrypt 字典序拼接后 SHA-1 小写 hex。
     public static string MsgSignature(string token, string timestamp, string nonce, string encrypt) {
         string joined = WXBizMsgCrypt.JoinSorted4(token, timestamp, nonce, encrypt);
         byte[] digest = Sha1.Hash(joined, joined.Length);
         return Hex.Encode(digest, 20);
     }
 
-    // 四个字符串字典序排序后拼接。
-    public static string JoinSorted4(string a, string b, string c, string d) {
-        List<string> xs = new List<string>{
-            a, b, c, d };
-        // 插入排序（n=4）
-        int i = 1;
-        while (i < 4) {
-            string cur = xs[i];
-            int j = i;
-            while (j > 0) {
-                if (String.CompareOrdinal(xs[j - 1], cur) <= 0) { break; }
-                xs[j] = xs[j - 1];
-                j = j - 1;
-            }
-            xs[j] = cur;
-            i = i + 1;
-        }
+    private static string JoinSorted4(string a, string b, string c, string d) {
+        List<string> xs = new List<string>{ a, b, c, d };
+        xs.Sort();
         return xs[0] + xs[1] + xs[2] + xs[3];
     }
 
-    // AES-256-CBC 解密 Base64 密文，按 32 字节 PKCS#7 去垫，拆出 msg 与 appId。
-    public WXBizPlain AesDecrypt(string cipherB64) {
+    private WXBizPlain AesDecrypt(string cipherB64) {
         List<int> clen = new List<int>();
         clen.Add(0);
         byte[] cipher = Base64.Decode(cipherB64, clen);
@@ -106,31 +85,27 @@ public class WXBizMsgCrypt {
             throw new WechatException("-40007", "AES 密文长度非法", "");
         }
         byte[] raw = WXBizMsgCrypt.CbcDecryptNoPad(this.aesKey, 32, this.aesIv, cipher, n);
-        // 32 字节 PKCS#7 去垫
         int pad = raw[n - 1] & 255;
         if (pad < 1 || pad > 32) { pad = 0; }
         int plen = n - pad;
         if (plen < 20) {
             throw new WechatException("-40007", "AES 明文过短", "");
         }
-        // 网络序 4 字节长度 @ 偏移 16
         int msgLen = ((raw[16] & 255) << 24)
                    | ((raw[17] & 255) << 16)
                    | ((raw[18] & 255) << 8)
                    | (raw[19] & 255);
-        // 减法形式比较：20+msgLen 在 msgLen 接近 2^31 时会 i32 上溢成
-        // 负数绕过边界检查，先比 msgLen 与 plen-20（plen 已保证 >= 20）。
+        // 用减法比较避免 20+msgLen i32 上溢绕过边界检查。
         if (msgLen < 0 || msgLen > plen - 20) {
             throw new WechatException("-40007", "AES 明文长度字段非法", "");
         }
         WXBizPlain result = new WXBizPlain();
-        result.Msg = WXBizMsgCrypt.BytesToString(raw, 20, msgLen);
-        result.AppId = WXBizMsgCrypt.BytesToString(raw, 20 + msgLen, plen - 20 - msgLen);
+        result.Msg = raw.ToStr(20, msgLen);
+        result.AppId = raw.ToStr(20 + msgLen, plen - 20 - msgLen);
         return result;
     }
 
-    // 构造 16 随机 + 4 长度 + msg + appId，32 字节 PKCS#7 补位后 AES-CBC 加密并 Base64。
-    public string AesEncrypt(string plain) {
+    private string AesEncrypt(string plain) {
         string rand = WXBizMsgCrypt.RandAscii(16);
         int msgLen = plain.Length;
         int appLen = this.appId.Length;
@@ -141,7 +116,6 @@ public class WXBizMsgCrypt {
         byte[] buf = new byte[total + 1];
         int i = 0;
         for (; i < 16; i = i + 1) { buf[i] = (byte)(rand[i] & 255); }
-        // 网络序长度
         buf[16] = (byte)((msgLen >> 24) & 255);
         buf[17] = (byte)((msgLen >> 16) & 255);
         buf[18] = (byte)((msgLen >> 8) & 255);
@@ -157,8 +131,7 @@ public class WXBizMsgCrypt {
         return Base64.Encode(cipher, total);
     }
 
-    // AES-CBC 加密，不做额外填充（调用方保证 len % 16 == 0）。
-    public static byte[] CbcEncryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
+    private static byte[] CbcEncryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
         byte[] outb = new byte[len + 1];
         byte[] prev = new byte[17];
         for (int i = 0; i < 16; i = i + 1) { prev[i] = iv[i]; }
@@ -181,8 +154,7 @@ public class WXBizMsgCrypt {
         return outb;
     }
 
-    // AES-CBC 解密，不去垫（调用方处理 32 字节 PKCS#7）。
-    public static byte[] CbcDecryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
+    private static byte[] CbcDecryptNoPad(string key, int keyLen, byte[] iv, byte[] data, int len) {
         byte[] outb = new byte[len + 1];
         byte[] prev = new byte[17];
         for (int i = 0; i < 16; i = i + 1) { prev[i] = iv[i]; }
@@ -203,31 +175,25 @@ public class WXBizMsgCrypt {
         return outb;
     }
 
-    // 把 raw 字节缓冲的一段解释为 Latin-1/UTF-8 字节透传字符串（微信 XML 按字节）。
-    public static string BytesToString(byte[] raw, int off, int len) {
-        return raw.ToStr(off, len);
-    }
-
-    // 生成 n 字节可打印随机前缀（与官方 CreateRandCode 字符集一致）。
-    // 失败时退回固定可重复填充（仍满足长度），加密结果可解密。
-    public static string RandAscii(int n) {
+    private static string RandAscii(int n) {
+        if (n <= 0) { return ""; }
         string alphabet = "234567acdefhijkmnprstACDEFGHJKMNPQRSUVWXYZ";
         int alen = alphabet.Length;
         byte[] rnd = RandomNumberGenerator.GetBytes(n);
-        StringBuilder sb = new StringBuilder();
+        byte[] outBytes = new byte[n];
         int i = 0;
         if (rnd != null) {
             while (i < n) {
                 int idx = (rnd[i] & 255) % alen;
-                sb.Append(alphabet.Substring(idx, 1));
+                outBytes[i] = alphabet[idx];
                 i = i + 1;
             }
         } else {
             while (i < n) {
-                sb.Append(alphabet.Substring(i % alen, 1));
+                outBytes[i] = alphabet[i % alen];
                 i = i + 1;
             }
         }
-        return sb.ToString();
+        return outBytes.ToStr(0, n);
     }
 }

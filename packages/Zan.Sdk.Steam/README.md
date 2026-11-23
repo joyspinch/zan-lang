@@ -36,15 +36,15 @@ class SteamServer {
         // 1. 查询游戏当前全网在线人数
         SteamResponse r = await steam.GetNumberOfCurrentPlayersAsync();
         int onlineCount = r.Int("response.player_count", 0);
-        Console.WriteLine("当前在线玩家: " + onlineCount);
+        Console.WriteLine("当前在线玩家: " + Convert.ToString(onlineCount));
 
-        // 2. 玩家登录时：核验客户端发来的登录票据
+        // 2. 玩家登录时：核验客户端发来的登录票据（失败抛 SteamException）
         string clientTicketHex = "1400000028e357...";
-        SteamTicketResult auth = await steam.AuthenticateUserTicketAsync(clientTicketHex);
-        if (auth.Success) {
+        try {
+            SteamTicketResult auth = await steam.AuthenticateUserTicketAsync(clientTicketHex, "mygame");
             Console.WriteLine("登录成功，SteamID: " + auth.SteamId);
-        } else {
-            Console.WriteLine("鉴权失败，票据无效或已过期！");
+        } catch (SteamException e) {
+            Console.WriteLine("鉴权失败: " + e.Code + " / " + e.Message);
         }
     }
 }

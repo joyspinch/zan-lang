@@ -28,9 +28,9 @@ WechatWorkAppApiGetAppInfoResponse result = await api.GetAppInfoAsync(
 ```
 
 Request setter 自动映射 path/query/body，Response 包含强类型字段、嵌套对象和列表。
-可复用 DTO 不跟随方法重复生成，而是按 C# 命名空间、外层类型链和类型名去重，分别位于
+可复用 DTO 不跟随方法重复生成，而是按 C# 命名空间、外层类型链和类型名去重，按业务域存放在
 `Models/Work`（516）、`Models/WxOpen`（525）、`Models/Open`（190）和
-`Models/TenPay`（631），命名空间为 `Sdk.Wechat.Models.*`。客户端依据
+`Models/TenPay`（631），而方法专属 `*Request` / `*Response` 契约分别独立存放在 `Requests/*` 与 `Responses/*`（统一保持 `Sdk.Wechat.Models.*` 命名空间兼容）。客户端依据
 `WechatCredentialKind` 自动补充自身管理的 token，调用方不传 token 名称或拼接 token query。
 每个生成方法保留显式 `*RawAsync(...)` 逃生口，用于协议新增字段尚未进入 vendored C# 快照的场景。
 
@@ -225,7 +225,7 @@ Request setter 自动映射 path/query/body，Response 包含强类型字段、�
 - `WechatPayLegacyTenPayV3Api` / `WechatPayLegacyTenpayV3PayBankApi`：旧版 XML 支付；
 - `WechatPayLegacyTenPayApi` / `WechatPayLegacyTenPayRightsApi`：早期公众号支付和维权；
 - 共 45 个生成模块、344 个按源文件去重的方法，覆盖 384 个公开异步声明；
-- 631 个支付实体按原 C# 类型身份集中到 `Models/TenPay/WechatPayModels.zan`，多个支付接口共享同一实体；
+- 631 个支付实体按原 C# 类型身份与业务域集中到 `Models/TenPay/*.zan`，`*Request` / `*Response` 契约分置于 `Requests/TenPay/` 与 `Responses/TenPay/`，多个支付接口共享同一实体；
 - 20 个 multipart、7 个下载/二进制接口、GET/POST/PATCH/PUT/DELETE 均保留；
 - 固定端点和模板变量从 Request 字段自动生成，普通调用不传 path；仅两个由微信账单响应返回的签名下载 URL 使用 `RequestPath(downloadUrl)`。
 

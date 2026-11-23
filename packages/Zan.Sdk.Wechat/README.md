@@ -14,9 +14,15 @@
 | **微信开放平台 (Open)** | 24 个模块，覆盖第三方平台代公众号/小程序发起业务、开放平台账号绑定 |
 | **微信支付 (TenPay)** | 45 个模块，覆盖 Native/JSAPI/H5/App 统一下单、退款、分账、合单支付及证书加验签 |
 
-当前原生 TLS 引擎尚未实现客户端证书认证（mTLS）。配置客户端证书时会抛出
-`NotSupportedException`；依赖 mTLS 的微信支付 V2 退款、撤销等接口目前不可用。
-接口封装和证书验签能力不代表已支持 TLS 客户端认证。
+已基于 `Zan.Net` / `Zan.Security` 原生支持 TLS 1.2 / 1.3 客户端证书认证（mTLS）、SPKI 公钥钉扎（`PinPublicKey`）及证书策略回调（`SetCertPolicy`）。通过 `WechatPayV2Config.SetClientCertificate(certPemPath, keyPemPath)` 配置 PEM 客户端证书和私钥后，`WechatPayV2Client` 会对需要双向认证的退款、撤销、转账等接口自动启用 mTLS。
+
+## 分层目录架构
+
+源码按职责拆分在 `src/Sdk/Wechat/` 下（对外仍保持 `Sdk.Wechat.Models.<Product>` 等原命名空间兼容）：
+- `Models/<Product>/`：按业务域拆分的纯 DTO 实体与枚举（零 Request/Response 契约）
+- `Requests/<Product>/`：强类型 `*Request` 传输契约（按业务域与子域拆分）
+- `Responses/<Product>/`：强类型 `*Response` 响应契约（按业务域拆分）
+- `<Product>/`：`*Api` 业务门面、`*Client`、`*Config` 及运行时内部配置模型
 
 ---
 
@@ -25,20 +31,25 @@
 ```zan
 using System;
 using Sdk.Wechat;
-using Sdk.Wechat.Mp.Custom;
+using Sdk.Wechat.Mp;
+using Sdk.Wechat.Models.Mp;
 
 class Program {
     static async void Main() {
-        // 1. 初始化客户端（配置凭据，内部自动处理 access_token 缓存与刷新）
+        // 1. 初始化客户端（内部自动缓存并提前刷新 access_token）
         WechatClient client = new WechatClient("wx_your_app_id", "your_app_secret");
 
-        // 2. 发送客服文本消息
-        CustomApi customApi = new CustomApi(client);
-        SendTextCustomRequest req = new SendTextCustomRequest();
-        req.ToUser("OPENID_123456").Content("欢迎体验 Zan 微信 SDK！");
-
-        CustomResponse resp = await customApi.SendTextAsync(req);
-        Console.WriteLine("发送结果: " + resp.ErrorCode.ToString() + " / " + resp.ErrorMessage);
+        // 2. 发起强类型业务调用（失败一律抛 WechatException）
+        try {
+            WechatMpCustomApi customApi = new WechatMpCustomApi(client);
+            WechatMpCustomApiSendTextRequest req = new WechatMpCustomApiSendTextRequest()
+                .OpenId("OPENID_123456")
+                .Content("欢迎体验 Zan 微信 SDK！");
+            WechatMpCustomApiSendTextResponse resp = await customApi.SendTextAsync(req);
+            Console.WriteLine("发送成功: " + resp.Raw);
+        } catch (WechatException e) {
+            Console.WriteLine("调用失败: " + e.Code + " / " + e.Message);
+        }
     }
 }
 ```

@@ -1,0 +1,118 @@
+using System;
+using System.Json;
+
+namespace Sdk.Jushuitan;
+
+// 聚水潭接口响应解包模式。
+public enum JushuitanResponseMode {
+    // 常规信封：{"code": 0, "msg": "...", "data": ...}，Data 指向 data。
+    DataEnvelope,
+    // 根信封：分页/datas/result/level_data/状态字段直接位于根对象，或无外层 code。
+    RootEnvelope
+}
+
+public class JushuitanResponse {
+    public JsonValue Value;
+    public JsonValue Data;
+    public int StatusCode;
+    public string Message;
+    public string RawBody;
+
+    public JushuitanResponse(JsonValue value, JsonValue data, int statusCode, string message, string rawBody) {
+        this.Value = value;
+        this.Data = data;
+        this.StatusCode = statusCode;
+        this.Message = message;
+        this.RawBody = rawBody;
+    }
+
+    // 返回可直接传给 Json.Deserialize<T> 的有效载荷 JSON 文本。
+    public string DataJson {
+        get { return this.Data == null ? "null" : this.Data.ToJson(); }
+    }
+
+    public static JushuitanResponse Parse(int statusCode, string body) {
+        return JushuitanResponse.Parse(statusCode, body, JushuitanResponseMode.DataEnvelope);
+    }
+
+    public static JushuitanResponse Parse(int statusCode, string body, JushuitanResponseMode mode) {
+        if (statusCode < 200 || statusCode >= 300) {
+            throw new JushuitanException("http." + Convert.ToString(statusCode), "聚水潭 HTTP 请求失败", statusCode, body);
+        }
+        JsonValue value;
+        try {
+            value = JsonValue.Parse(body);
+        } catch (Exception e) {
+            throw new JushuitanException("client.invalidResponse", "聚水潭响应不是有效 JSON", statusCode, body);
+        }
+        if (value == null || !value.IsObject()) {
+            throw new JushuitanException("client.invalidResponse", "聚水潭响应必须是 JSON 对象", statusCode, body);
+        }
+
+        string message = JushuitanResponse.ReadMessage(value);
+        JsonValue code = value.Get("code");
+        if (code != null && !code.IsNull()) {
+            string codeText = JushuitanResponse.CodeAsText(code);
+            if (codeText.Length == 0) {
+                throw new JushuitanException("client.invalidResponse", "聚水潭响应 code 无效", statusCode, body);
+            }
+            if (codeText != "0") {
+                throw new JushuitanException(codeText, message, statusCode, body);
+            }
+            if (mode == JushuitanResponseMode.RootEnvelope) {
+                JsonValue wrappedData = value.Get("data");
+                if (wrappedData != null && !wrappedData.IsNull()
+                    && !value.Has("datas") && !value.Has("level_data")
+                    && !value.Has("result") && !value.Has("page_index")) {
+                    return new JushuitanResponse(value, wrappedData, statusCode, message, body);
+                }
+                return new JushuitanResponse(value, value, statusCode, message, body);
+            }
+            JsonValue data = value.Get("data");
+            if ((data == null || data.IsNull())
+                && (value.Has("datas") || value.Has("level_data") || value.Has("result"))) {
+                data = value;
+            }
+            return new JushuitanResponse(value, data == null ? JsonValue.NewNull() : data, statusCode, message, body);
+        }
+
+        // 部分接口（如 625/1246/1247/532/802）成功时不返回 code，直接返回业务/分页对象。
+        bool directPayload = JushuitanResponse.HasDirectPayload(value);
+        if (mode == JushuitanResponseMode.RootEnvelope || directPayload) {
+            if (JushuitanResponse.HasFailedSuccessFlag(value)) {
+                throw new JushuitanException("biz.failed", message.Length > 0 ? message : "聚水潭接口返回 issuccess=false", statusCode, body);
+            }
+            if (directPayload) {
+                return new JushuitanResponse(value, value, statusCode, message, body);
+            }
+        }
+
+        throw new JushuitanException("client.invalidResponse", "聚水潭响应缺少 code", statusCode, body);
+    }
+
+    private static string ReadMessage(JsonValue obj) {
+        JsonValue msg = obj.Get("msg");
+        if (msg == null || msg.IsNull()) { return ""; }
+        return msg.AsString("");
+    }
+
+    private static string CodeAsText(JsonValue code) {
+        if (code.IsString()) { return code.AsString(""); }
+        if (code.IsInt()) { return Convert.ToString(code.AsLong(0)); }
+        return "";
+    }
+
+    private static bool HasFailedSuccessFlag(JsonValue obj) {
+        JsonValue flag = obj.Get("issuccess");
+        if (flag == null) { flag = obj.Get("is_success"); }
+        if (flag == null || flag.IsNull()) { return false; }
+        if (flag.IsBool()) { return !flag.AsBool(true); }
+        if (flag.IsString()) { return flag.AsString("").ToLower() == "false"; }
+        return false;
+    }
+
+    private static bool HasDirectPayload(JsonValue obj) {
+        return obj.Has("datas") || obj.Has("data") || obj.Has("level_data")
+            || obj.Has("result") || obj.Has("page_index") || obj.Has("issuccess") || obj.Has("is_success");
+    }
+}

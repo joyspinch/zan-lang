@@ -8,25 +8,28 @@ namespace Sdk.Wechat.Work;
 // 企业微信 JSON API 客户端，自动缓存 corp access_token。
 public class WechatWorkClient {
     WechatApiTransport transport;
+    WechatTokenCache tokenCache;
     string corpId;
     string corpSecret;
-    string accessToken;
-    long accessTokenExpireUnix;
     string providerAccessToken;
     string suiteAccessToken;
 
     public WechatWorkClient(string corpId, string corpSecret) {
         this.transport = new WechatApiTransport("qyapi.weixin.qq.com");
+        this.tokenCache = new WechatTokenCache();
         this.corpId = corpId;
         this.corpSecret = corpSecret;
-        this.accessToken = "";
-        this.accessTokenExpireUnix = 0;
         this.providerAccessToken = "";
         this.suiteAccessToken = "";
     }
 
     public WechatWorkClient Server(string host, int port) {
         this.transport.Server(host, port);
+        return this;
+    }
+
+    public WechatWorkClient PlainHttpMode() {
+        this.transport.PlainHttpMode();
         return this;
     }
 
@@ -45,10 +48,7 @@ public class WechatWorkClient {
     }
 
     public WechatWorkClient SetAccessToken(string token, int expiresIn) {
-        this.accessToken = token;
-        int life = expiresIn - 300;
-        if (life < 0) { life = 0; }
-        this.accessTokenExpireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+        this.tokenCache.Set(token, expiresIn);
         return this;
     }
 
@@ -63,25 +63,17 @@ public class WechatWorkClient {
     }
 
     public async string GetAccessTokenAsync() {
-        if (this.accessToken.Length > 0
-            && DateTime.UtcNow().ToUnixSeconds() < this.accessTokenExpireUnix) {
-            return this.accessToken;
-        }
+        string cached = this.tokenCache.Current();
+        if (cached.Length > 0) { return cached; }
         if (this.corpId.Length == 0 || this.corpSecret.Length == 0) {
             throw new WechatException("work.paramError", "corpId / corpSecret 不能为空", "");
         }
         string path = "/cgi-bin/gettoken?corpid=" + Encoding.UrlEncode(this.corpId)
             + "&corpsecret=" + Encoding.UrlEncode(this.corpSecret);
-        WechatResponse response = await this.transport.RequestJsonAsync("GET", path, "");
-        string token = response.Str(WechatCredential.QueryName(WechatCredentialKind.AccessToken), "");
-        if (token.Length == 0) {
-            throw new WechatException("work.badResponse", "响应缺少 access_token", response.Data);
-        }
-        this.SetAccessToken(token, response.Int("expires_in", 7200));
-        return this.accessToken;
+        return await this.tokenCache.GetOrFetchAsync(this.transport, path, "work");
     }
 
-    public async string CredentialAsync(WechatCredentialKind kind) {
+    private async string CredentialAsync(WechatCredentialKind kind) {
         if (kind == WechatCredentialKind.None) { return ""; }
         if (kind == WechatCredentialKind.AccessToken) { return await this.GetAccessTokenAsync(); }
         if (kind == WechatCredentialKind.ProviderAccessToken) {
@@ -99,31 +91,37 @@ public class WechatWorkClient {
         throw new WechatException("work.tokenUnsupported", "当前客户端不支持此凭证类型", "");
     }
 
-    async WechatResponse RequestAsync(string method, string path, string query,
-                                      string jsonBody, WechatCredentialKind credential) {
-        string target = WechatApiTransport.BuildPath(path, query);
+    private async string BuildTargetAsync(string path, string query, WechatCredentialKind credential) {
         string token = await this.CredentialAsync(credential);
-        target = WechatApiTransport.AppendQuery(target, WechatCredential.QueryName(credential), token);
+        return WechatApiTransport.BuildTarget(path, query, credential, token);
+    }
+
+    public async WechatResponse RequestAsync(string method, string path, string query,
+                                             string jsonBody, WechatCredentialKind credential) {
+        string target = await this.BuildTargetAsync(path, query, credential);
         return await this.transport.RequestJsonAsync(method, target, jsonBody);
     }
 
-    async WechatRawResponse RequestRawAsync(string method, string path,
-                                             string query, string body,
-                                             string contentType,
-                                             WechatCredentialKind credential) {
-        string target = WechatApiTransport.BuildPath(path, query);
-        string token = await this.CredentialAsync(credential);
-        target = WechatApiTransport.AppendQuery(target, WechatCredential.QueryName(credential), token);
-        return await this.transport.RequestSimpleRawAsync(method, target, body, contentType);
+    public async WechatRawResponse RequestRawAsync(string method, string path,
+                                                   string query, string body,
+                                                   string contentType,
+                                                   WechatCredentialKind credential) {
+        string target = await this.BuildTargetAsync(path, query, credential);
+        return await this.transport.RequestRawAsync(method, target, body, contentType, null);
     }
 
-    async WechatRawResponse RequestMultipartAsync(string method, string path,
-                                                   string query,
-                                                   WechatMultipart multipart,
-                                                   WechatCredentialKind credential) {
-        string target = WechatApiTransport.BuildPath(path, query);
-        string token = await this.CredentialAsync(credential);
-        target = WechatApiTransport.AppendQuery(target, WechatCredential.QueryName(credential), token);
+    public async WechatRawResponse RequestMultipartAsync(string method, string path,
+                                                         string query,
+                                                         WechatMultipart multipart,
+                                                         WechatCredentialKind credential) {
+        string target = await this.BuildTargetAsync(path, query, credential);
         return await this.transport.RequestMultipartAsync(method, target, multipart);
+    }
+
+    public async WechatResponse UploadJsonAsync(string path, string query,
+                                                WechatMultipart multipart,
+                                                WechatCredentialKind credential) {
+        string target = await this.BuildTargetAsync(path, query, credential);
+        return await this.transport.UploadJsonAsync(target, multipart);
     }
 }

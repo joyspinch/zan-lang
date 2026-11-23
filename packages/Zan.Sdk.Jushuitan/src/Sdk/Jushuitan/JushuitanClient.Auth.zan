@@ -1,0 +1,68 @@
+using System;
+using System.Json;
+
+namespace Sdk.Jushuitan;
+
+public partial class JushuitanClient {
+    private static const string AuthorizationUrl = "https://openweb.jushuitan.com/auth";
+    private static const string InitTokenPath = "/openWeb/auth/getInitToken";
+    private static const string RefreshTokenPath = "/openWeb/auth/refreshToken";
+    private static const string AccessTokenPath = "/openWeb/auth/accessToken";
+
+    public string BuildAuthorizationUrl(string state) {
+        Dictionary<string, string> fields = this.CommonFields();
+        if (state != null && state.Length > 0) { fields.Add("state", state); }
+        fields.Add("sign", JushuitanSign.Compute(fields, this.appSecret));
+        return JushuitanClient.AuthorizationUrl + "?" + JushuitanSign.FormEncode(fields);
+    }
+
+    // 传入解码后的 GET 查询参数以及本次授权请求保存的预期 state。
+    public string VerifyAuthorizationCallback(Dictionary<string, string> fields, string expectedState) {
+        JushuitanClient.RequireValue(expectedState, "state");
+        string app = "";
+        string code = "";
+        string state = "";
+        if (fields == null || !fields.TryGetValue("app_key", out app) || app != this.appKey
+            || !fields.TryGetValue("state", out state) || state != expectedState
+            || !fields.TryGetValue("code", out code) || code == null || code.Length == 0
+            || !JushuitanSign.Verify(fields, this.appSecret)) {
+            throw new JushuitanException("auth.invalidCallback", "授权回调的应用、状态或签名无效", 0, "");
+        }
+        return code;
+    }
+
+    // 服务商授权回调成功确认响应（官方文档 25：数值 {"code":0}，不同于消息回调的字符串 "0"）。
+    public static string AuthorizationCallbackSuccessResponse() {
+        JsonValue ack = JsonValue.NewObject();
+        ack.PutInt("code", 0);
+        return ack.ToJson();
+    }
+
+    public async JushuitanToken GetInitTokenAsync(string code) {
+        JushuitanClient.RequireValue(code, "code");
+        if (code.Length != 6) {
+            throw new JushuitanException("client.invalidArguments", "自研授权 code 必须为六位随机字符串", 0, "");
+        }
+        return await this.RequestTokenAsync(JushuitanClient.InitTokenPath, "authorization_code", "code", code);
+    }
+
+    public async JushuitanToken RefreshTokenAsync(string refreshToken) {
+        JushuitanClient.RequireValue(refreshToken, "refresh_token");
+        return await this.RequestTokenAsync(JushuitanClient.RefreshTokenPath, "refresh_token", "refresh_token", refreshToken);
+    }
+
+    public async JushuitanToken ExchangeAccessTokenAsync(string code) {
+        JushuitanClient.RequireValue(code, "code");
+        return await this.RequestTokenAsync(JushuitanClient.AccessTokenPath, "authorization_code", "code", code);
+    }
+
+    private async JushuitanToken RequestTokenAsync(string path, string grantType, string field, string value) {
+        Dictionary<string, string> fields = new Dictionary<string, string>();
+        fields.Add("grant_type", grantType);
+        fields.Add(field, value);
+        if (grantType == "refresh_token") { fields.Add("scope", "all"); }
+        JushuitanResponse response = await this.PostFormWithRetryAsync(
+            JushuitanClient.ProductionGateway, path, fields, JushuitanResponseMode.DataEnvelope);
+        return JushuitanToken.Parse(response);
+    }
+}

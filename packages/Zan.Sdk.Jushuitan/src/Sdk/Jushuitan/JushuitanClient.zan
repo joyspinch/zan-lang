@@ -1,0 +1,210 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+namespace Sdk.Jushuitan;
+
+// 聚水潭开放平台客户端（单实例或 WithAccessToken 多租户会话）。
+public partial class JushuitanClient {
+    public static const string ProductionGateway = "https://openapi.jushuitan.com";
+    public static const string HangzhouGateway = "https://openapi-hz.jushuitan.com";
+    private static const string FormContentType = "application/x-www-form-urlencoded;charset=UTF-8";
+
+    private string appKey;
+    private string appSecret;
+    private string accessToken;
+    private ExternalTarget gatewayOverride;
+    private ExternalCallPolicy policy;
+    private int timeoutMs;
+    private int maxRetries;
+    private bool plainHttp;
+
+    public JushuitanClient(string appKey, string appSecret)
+        : this(appKey, appSecret, "", ExternalCallPolicy.Default()) {}
+
+    public JushuitanClient(string appKey, string appSecret, string gateway, ExternalCallPolicy policy) {
+        JushuitanClient.RequireValue(appKey, "app_key");
+        JushuitanClient.RequireValue(appSecret, "app_secret");
+        this.appKey = appKey;
+        this.appSecret = appSecret;
+        this.accessToken = "";
+        this.timeoutMs = 30000;
+        this.maxRetries = 2;
+        this.plainHttp = false;
+        this.WithCallPolicy(policy);
+        if (gateway != null && gateway.Length > 0) {
+            this.Server(gateway);
+        }
+    }
+
+    public string AccessToken {
+        get { return this.accessToken; }
+    }
+
+    public JushuitanClient SetAccessToken(string token) {
+        this.accessToken = token == null ? "" : token;
+        return this;
+    }
+
+    // 派生携带独立 access_token 的轻量会话实例，共享底层应用配置与策略。
+    public JushuitanClient WithAccessToken(string token) {
+        JushuitanClient.RequireValue(token, "access_token");
+        JushuitanClient session = new JushuitanClient(this.appKey, this.appSecret);
+        session.gatewayOverride = this.gatewayOverride;
+        session.policy = this.policy;
+        session.timeoutMs = this.timeoutMs;
+        session.maxRetries = this.maxRetries;
+        session.plainHttp = this.plainHttp;
+        session.accessToken = token;
+        return session;
+    }
+
+    public JushuitanClient Server(string gateway) {
+        if (gateway == null || gateway.Length == 0) {
+            this.gatewayOverride = null;
+            return this;
+        }
+        ExternalTarget target = ExternalTarget.Parse(gateway);
+        if (target == null || target.Path() != "/" || target.Query() != "") {
+            throw new JushuitanException("client.invalidGateway", "聚水潭网关地址格式无效", 0, "");
+        }
+        if (!target.IsTls() && !target.IsLoopback()) {
+            throw new JushuitanException("client.invalidGateway", "非环回地址必须使用 HTTPS 网关", 0, "");
+        }
+        this.gatewayOverride = target;
+        return this;
+    }
+
+    public JushuitanClient UseHangzhouGateway() {
+        return this.Server(JushuitanClient.HangzhouGateway);
+    }
+
+    public JushuitanClient Timeout(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+        return this;
+    }
+
+    // 聚水潭限流错误码（199/200）最大重试次数，默认 2；设 0 关闭重试。
+    public JushuitanClient MaxRetries(int count) {
+        this.maxRetries = count < 0 ? 0 : count;
+        return this;
+    }
+
+    public JushuitanClient PlainHttpMode() {
+        this.plainHttp = true;
+        return this;
+    }
+
+    public JushuitanClient WithCallPolicy(ExternalCallPolicy callPolicy) {
+        ExternalCallPolicy next = callPolicy == null ? ExternalCallPolicy.Default() : callPolicy;
+        if (next.MaxRedirects() != 0 || next.RetryAttempts() != 0) {
+            throw new JushuitanException("client.invalidPolicy", "聚水潭请求需要关闭重定向和传输层自动重试", 0, "");
+        }
+        this.policy = next;
+        return this;
+    }
+
+    public async JushuitanResponse CallAsync(string path, JsonValue biz) {
+        return await this.CallAsync(
+            JushuitanClient.ProductionGateway, path, biz, this.accessToken, JushuitanResponseMode.DataEnvelope);
+    }
+
+    public async JushuitanResponse CallAsync(string path, JsonValue biz, string accessToken) {
+        return await this.CallAsync(
+            JushuitanClient.ProductionGateway, path, biz, accessToken, JushuitanResponseMode.DataEnvelope);
+    }
+
+    public async JushuitanResponse CallAsync(string gateway, string path, JsonValue biz,
+                                             string accessToken, JushuitanResponseMode mode) {
+        if ((gateway != JushuitanClient.ProductionGateway && gateway != JushuitanClient.HangzhouGateway)
+            || path == null || !path.StartsWith("/open/") || path.Contains("?") || path.Contains("#")) {
+            throw new JushuitanException("client.invalidEndpoint", "请使用聚水潭开放平台业务接口路径", 0, "");
+        }
+        JushuitanClient.RequireValue(accessToken, "access_token");
+        string json = "{}";
+        if (biz != null) {
+            if (!biz.IsObject() && !biz.IsArray()) {
+                throw new JushuitanException("client.invalidArguments", "biz 必须是 JSON 对象或数组", 0, "");
+            }
+            json = biz.ToJson();
+        }
+        Dictionary<string, string> bizFields = new Dictionary<string, string>();
+        bizFields.Add("access_token", accessToken);
+        bizFields.Add("version", "2");
+        bizFields.Add("biz", json);
+        return await this.PostFormWithRetryAsync(gateway, path, bizFields, mode);
+    }
+
+    private Dictionary<string, string> CommonFields() {
+        Dictionary<string, string> fields = new Dictionary<string, string>();
+        fields.Add("app_key", this.appKey);
+        fields.Add("charset", "utf-8");
+        fields.Add("timestamp", Convert.ToString(DateTime.UtcNow().ToUnixSeconds()));
+        return fields;
+    }
+
+    private async JushuitanResponse PostFormWithRetryAsync(string gateway, string path,
+                                                            Dictionary<string, string> extraFields,
+                                                            JushuitanResponseMode mode) {
+        if (this.policy.MaxRedirects() != 0 || this.policy.RetryAttempts() != 0) {
+            throw new JushuitanException("client.invalidPolicy", "聚水潭请求需要关闭重定向和传输层自动重试", 0, "");
+        }
+        ExternalTarget target = this.gatewayOverride != null ? this.gatewayOverride : ExternalTarget.Parse(gateway);
+        if (target == null || target.Path() != "/" || target.Query() != ""
+            || ExternalTarget.Parse(target.Canonical() + path.Substring(1)) == null) {
+            throw new JushuitanException("client.invalidGateway", "聚水潭网关地址格式无效", 0, "");
+        }
+        if (!target.IsTls() && (!target.IsLoopback() || !this.policy.AllowsLoopback() || (!this.plainHttp && !this.policy.AllowsHttp()))) {
+            throw new JushuitanException("client.invalidGateway", "请提供 HTTPS 网关地址，或使用 PlainHttpMode 并放行环回策略", 0, "");
+        }
+
+        int attempt = 0;
+        while (true) {
+            Dictionary<string, string> fields = this.CommonFields();
+            if (extraFields != null) {
+                List<string> extraKeys = extraFields.Keys;
+                for (int i = 0; i < extraKeys.Count; i = i + 1) {
+                    fields.Add(extraKeys[i], extraFields[extraKeys[i]]);
+                }
+            }
+            fields.Add("sign", JushuitanSign.Compute(fields, this.appSecret));
+            string body = JushuitanSign.FormEncode(fields);
+
+            try {
+                using (HttpClient http = new HttpClient(target.Host(), target.Port())) {
+                    if (target.IsTls() && !this.plainHttp) { http.UseTls(); }
+                    http.SetTimeout(this.timeoutMs);
+                    http.SetCallPolicy(this.policy);
+                    http.SetHeader("Content-Type", JushuitanClient.FormContentType);
+                    HttpResponse response;
+                    try {
+                        response = await http.SendAsync("POST", path, body);
+                    } catch (Exception e) {
+                        throw new JushuitanException("client.networkError", e.Message, 0, "");
+                    }
+                    if (response == null || response.statusCode == 0) {
+                        throw new JushuitanException("client.networkError", "聚水潭未返回 HTTP 响应", 0, "");
+                    }
+                    using (response) {
+                        return JushuitanResponse.Parse(response.statusCode, response.body, mode);
+                    }
+                }
+            } catch (JushuitanException e) {
+                if (!e.IsRateLimited || attempt >= this.maxRetries) {
+                    throw e;
+                }
+            }
+            attempt = attempt + 1;
+            await Task.Delay(attempt * 500);
+        }
+    }
+
+    private static void RequireValue(string value, string field) {
+        if (value == null || value.Length == 0) {
+            throw new JushuitanException("client.invalidArguments", field + " 不能为空", 0, "");
+        }
+    }
+}

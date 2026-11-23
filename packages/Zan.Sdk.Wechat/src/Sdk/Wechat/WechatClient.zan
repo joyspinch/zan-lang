@@ -1,190 +1,79 @@
 using System;
 using System.Text;
-using System.Json;
-using System.Net.Http.Client;
 using System.Net.External;
+using System.Net.Tls;
 
 namespace Sdk.Wechat;
 
-// 微信公众号（MP）客户端。
-// 用法：
-// <code>
-// </code>
-// AccessToken 在实例内缓存：未过期直接返回，过期才重新请求
-// <c>/cgi-bin/token</c>。客服消息走 <c>/cgi-bin/message/custom/send</c>。
-// 依赖标准库：
-// - <see cref="HttpClient"/> 发 HTTPS；
-// - <see cref="JsonValue"/> 组请求 / 解析响应；
-// - <see cref="Encoding.UrlEncode"/> 拼 query；
-// 不重复封装 HTTP / 摘要 / JSON。
-// 相对 Senparc 原版的改动：
-// - 去掉 AccessTokenContainer / DI / 中间件，一个实例管一个公众号；
-// - 失败一律抛 <see cref="WechatException"/>，不返回带 errcode 的空结果；
-// - Token 过期提前 5 分钟刷新（微信官方有效期 7200 秒）。
+// 微信公众号（MP）客户端；access_token 实例内缓存（提前 300 秒刷新），失败一律抛 WechatException。
 public class WechatClient {
     static string DEFAULT_HOST = "api.weixin.qq.com";
-    static int DEFAULT_PORT = 443;
-    // 官方 access_token 7200 秒；提前 300 秒刷新，避免边界失效。
-    static int TOKEN_SKEW_SECONDS = 300;
 
+    WechatApiTransport transport;
+    WechatTokenCache tokenCache;
     string appId;
     string appSecret;
-    string host;
-    int port;
-    int timeoutMs;
-    ExternalCallPolicy callPolicy;
 
-    string accessToken;
-    long accessTokenExpireUnix;
-
-    // 用 appId / appSecret 创建客户端，默认指向正式网关。
     public WechatClient(string appId, string appSecret) {
         this.appId = appId;
         this.appSecret = appSecret;
-        this.host = DEFAULT_HOST;
-        this.port = DEFAULT_PORT;
-        this.timeoutMs = 30000;
-        this.callPolicy = ExternalCallPolicy.Default();
-        this.accessToken = "";
-        this.accessTokenExpireUnix = 0;
+        this.transport = new WechatApiTransport(DEFAULT_HOST);
+        this.tokenCache = new WechatTokenCache();
     }
 
-    // 指向另一个网关（沙箱 / 自建代理）。
     public WechatClient Server(string host, int port) {
-        this.host = host;
-        this.port = port;
+        this.transport.Server(host, port);
         return this;
     }
 
-    // 请求超时（毫秒），默认 30000。
+    public WechatClient PlainHttpMode() {
+        this.transport.PlainHttpMode();
+        return this;
+    }
+
     public WechatClient Timeout(int ms) {
-        this.timeoutMs = ms;
+        this.transport.Timeout(ms);
         return this;
     }
 
     public WechatClient SetCallPolicy(ExternalCallPolicy policy) {
-        this.callPolicy = policy == null ? ExternalCallPolicy.Default() : policy;
+        this.transport.SetCallPolicy(policy);
         return this;
     }
 
     public ExternalCallPolicy CallPolicy() {
-        return this.callPolicy;
+        return this.transport.CallPolicy();
     }
 
-    // 手动注入已有 access_token（例如从外部缓存读入），并设置剩余有效秒数。
-    // expiresIn 按微信返回的 expires_in 理解；内部会扣掉 TOKEN_SKEW_SECONDS。
-    public WechatClient SetAccessToken(string token, int expiresIn) {
-        this.accessToken = token;
-        int life = expiresIn - TOKEN_SKEW_SECONDS;
-        if (life < 0) { life = 0; }
-        this.accessTokenExpireUnix = DateTime.UtcNow().ToUnixSeconds() + life;
+    public WechatClient PinPublicKey(string spkiSha256Base64) {
+        this.transport.PinPublicKey(spkiSha256Base64);
         return this;
     }
 
-    // 获取可用的 access_token。缓存未过期则直接返回；否则请求
+    public WechatClient SetCertPolicy(CertPolicyFn fn) {
+        this.transport.SetCertPolicy(fn);
+        return this;
+    }
+
+    // 手动注入外部缓存的 access_token；内部自动扣减 300 秒提前刷新。
+    public WechatClient SetAccessToken(string token, int expiresIn) {
+        this.tokenCache.Set(token, expiresIn);
+        return this;
+    }
+
     public async string GetAccessTokenAsync() {
+        string cached = this.tokenCache.Current();
+        if (cached.Length > 0) { return cached; }
         if (this.appId.Length == 0 || this.appSecret.Length == 0) {
             throw new WechatException("client.paramError", "appId / appSecret 不能为空", "");
         }
-        long now = DateTime.UtcNow().ToUnixSeconds();
-        if (this.accessToken.Length > 0 && now < this.accessTokenExpireUnix) {
-            return this.accessToken;
-        }
-
         string path = "/cgi-bin/token?grant_type=client_credential"
             + "&appid=" + Encoding.UrlEncode(this.appId)
             + "&secret=" + Encoding.UrlEncode(this.appSecret);
-
-        string raw = "";
-        try {
-            HttpClient http = this.NewHttp();
-            raw = await http.GetAsync(path);
-        } catch (Exception e) {
-            throw new WechatException("client.networkError", e.Message, "");
-        }
-
-        WechatResponse resp = WechatResponse.Parse(raw);
-        string token = resp.Str(WechatCredential.QueryName(WechatCredentialKind.AccessToken), "");
-        int expiresIn = resp.Int("expires_in", 0);
-        if (token.Length == 0) {
-            throw new WechatException("client.badResponse", "响应缺少 access_token", raw);
-        }
-        this.SetAccessToken(token, expiresIn);
-        return this.accessToken;
+        return await this.tokenCache.GetOrFetchAsync(this.transport, path, "client");
     }
 
-    // 发送客服文本消息：
-    // body 为 <c>{"touser":"...","msgtype":"text","text":{"content":"..."}}</c>。
-    public async WechatResponse SendTextAsync(string openId, string content) {
-        if (openId.Length == 0) {
-            throw new WechatException("client.paramError", "openId 不能为空", "");
-        }
-        JsonValue text = JsonValue.NewObject();
-        text.Put("content", JsonValue.NewStr(content));
-        JsonValue body = JsonValue.NewObject();
-        body.Put("touser", JsonValue.NewStr(openId));
-        body.Put("msgtype", JsonValue.NewStr("text"));
-        body.Put("text", text);
-        string json = body.ToJson();
-
-        string token = await this.GetAccessTokenAsync();
-        string path = this.WithToken("/cgi-bin/message/custom/send", token);
-
-        string raw = "";
-        try {
-            HttpClient http = this.NewHttp();
-            http.SetHeader("Content-Type", "application/json");
-            raw = await http.PostAsync(path, json);
-        } catch (Exception e) {
-            throw new WechatException("client.networkError", e.Message, "");
-        }
-        return WechatResponse.Parse(raw);
-    }
-
-    // 通用 GET：路径 已含 query（可含或不含 access_token）。
-    // 需要 token 时先调 <see cref="GetAccessTokenAsync"/> 自行拼进 path。
-    public async WechatResponse GetAsync(string path) {
-        string raw = "";
-        try {
-            HttpClient http = this.NewHttp();
-            raw = await http.GetAsync(path);
-        } catch (Exception e) {
-            throw new WechatException("client.networkError", e.Message, "");
-        }
-        return WechatResponse.Parse(raw);
-    }
-
-    // 通用 JSON POST。自动带 <c>Content-Type: application/json</c>。
-    public async WechatResponse PostJsonAsync(string path, string jsonBody) {
-        string raw = "";
-        try {
-            HttpClient http = this.NewHttp();
-            http.SetHeader("Content-Type", "application/json");
-            raw = await http.PostAsync(path, jsonBody);
-        } catch (Exception e) {
-            throw new WechatException("client.networkError", e.Message, "");
-        }
-        return WechatResponse.Parse(raw);
-    }
-
-    // 自动附带 access_token 的 GET（路径 不含 token，以 ? 或 &amp; 开头皆可）。
-    public async WechatResponse GetWithTokenAsync(string path) {
-        string token = await this.GetAccessTokenAsync();
-        return await this.GetAsync(this.WithToken(path, token));
-    }
-
-    // 自动附带 access_token 的 JSON POST。
-    public async WechatResponse PostJsonWithTokenAsync(string path, string jsonBody) {
-        string token = await this.GetAccessTokenAsync();
-        return await this.PostJsonAsync(this.WithToken(path, token), jsonBody);
-    }
-
-    public string WithToken(string path, string token) {
-        return WechatApiTransport.AppendQuery(path,
-            WechatCredential.QueryName(WechatCredentialKind.AccessToken), token);
-    }
-
-    public async string CredentialAsync(WechatCredentialKind kind) {
+    private async string CredentialAsync(WechatCredentialKind kind) {
         if (kind == WechatCredentialKind.None) { return ""; }
         if (kind == WechatCredentialKind.AccessToken) {
             return await this.GetAccessTokenAsync();
@@ -193,117 +82,42 @@ public class WechatClient {
             "公众号客户端只支持 access token", "");
     }
 
+    private async string BuildTargetAsync(string path, string query, WechatCredentialKind credential) {
+        string token = await this.CredentialAsync(credential);
+        return WechatApiTransport.BuildTarget(path, query, credential, token);
+    }
+
+    // 供 Mp 模块直连的统一 JSON 请求入口（自动附加 access_token）。
+    public async WechatResponse RequestAsync(string method, string path, string query, string jsonBody) {
+        string target = await this.BuildTargetAsync(path, query, WechatCredentialKind.AccessToken);
+        return await this.transport.RequestJsonAsync(method, target, jsonBody);
+    }
+
     public async WechatRawResponse RequestRawAsync(string method, string path,
                                              string query, string body,
                                              string contentType,
                                              WechatCredentialKind credential) {
-        string target = WechatApiTransport.BuildPath(path, query);
-        string token = await this.CredentialAsync(credential);
-        target = WechatApiTransport.AppendQuery(target,
-            WechatCredential.QueryName(credential), token);
-        return await this.NewTransport().RequestSimpleRawAsync(method, target,
-            body, contentType);
+        string target = await this.BuildTargetAsync(path, query, credential);
+        return await this.transport.RequestRawAsync(method, target, body, contentType, null);
     }
 
     public async WechatRawResponse RequestMultipartAsync(string method, string path,
                                                    string query,
                                                    WechatMultipart multipart,
                                                    WechatCredentialKind credential) {
-        string target = WechatApiTransport.BuildPath(path, query);
-        string token = await this.CredentialAsync(credential);
-        target = WechatApiTransport.AppendQuery(target,
-            WechatCredential.QueryName(credential), token);
-        return await this.NewTransport().RequestMultipartAsync(method, target,
-            multipart);
+        string target = await this.BuildTargetAsync(path, query, credential);
+        return await this.transport.RequestMultipartAsync(method, target, multipart);
     }
 
-    // ---- 菜单 ----------------------------------------------------------------
-
-    // 创建自定义菜单。body 为完整 JSON，如 <c>{"button":[...]}</c>。
-    public async WechatResponse CreateMenuAsync(string menuJson) {
-        return await this.PostJsonWithTokenAsync("/cgi-bin/menu/create", menuJson);
+    public async WechatResponse UploadJsonAsync(string path, string query,
+                                                WechatMultipart multipart,
+                                                WechatCredentialKind credential) {
+        string target = await this.BuildTargetAsync(path, query, credential);
+        return await this.transport.UploadJsonAsync(target, multipart);
     }
 
-    // 查询当前自定义菜单。
-    public async WechatResponse GetMenuAsync() {
-        return await this.GetWithTokenAsync("/cgi-bin/menu/get");
-    }
+    // ---- 网页 OAuth（使用用户授权 code/oauth token，不走公众号实例 tokenCache） ----
 
-    // 删除全部自定义菜单。
-    public async WechatResponse DeleteMenuAsync() {
-        return await this.GetWithTokenAsync("/cgi-bin/menu/delete");
-    }
-
-    // ---- 用户 ----------------------------------------------------------------
-
-    // 获取用户基本信息（UnionID 机制）。
-    public async WechatResponse GetUserInfoAsync(string openId, string lang) {
-        if (openId.Length == 0) {
-            throw new WechatException("client.paramError", "openId 不能为空", "");
-        }
-        string l = lang;
-        if (l.Length == 0) { l = "zh_CN"; }
-        string path = "/cgi-bin/user/info?openid=" + Encoding.UrlEncode(openId)
-            + "&lang=" + Encoding.UrlEncode(l);
-        return await this.GetWithTokenAsync(path);
-    }
-
-    // 获取帐号的关注者列表。nextOpenId 空串表示从头拉取。
-    public async WechatResponse GetUserListAsync(string nextOpenId) {
-        string path = "/cgi-bin/user/get";
-        if (nextOpenId.Length > 0) {
-            path = path + "?next_openid=" + Encoding.UrlEncode(nextOpenId);
-        }
-        return await this.GetWithTokenAsync(path);
-    }
-
-    // ---- 二维码 / 票据 --------------------------------------------------------
-
-    // 创建二维码票据。actionName 如 <c>QR_SCENE</c> / <c>QR_LIMIT_STR_SCENE</c>；
-    // sceneJson 是 action_info.scene 对象，例如 <c>{"scene_str":"test"}</c>。
-    public async WechatResponse CreateQrCodeAsync(string actionName, int expireSeconds, string sceneJson) {
-        JsonValue body = JsonValue.NewObject();
-        if (expireSeconds > 0) {
-            body.Put("expire_seconds", JsonValue.NewNum(Convert.ToString(expireSeconds)));
-        }
-        body.Put("action_name", JsonValue.NewStr(actionName));
-        JsonValue actionInfo = JsonValue.NewObject();
-        actionInfo.Put("scene", JsonValue.Parse(sceneJson));
-        body.Put("action_info", actionInfo);
-        return await this.PostJsonWithTokenAsync("/cgi-bin/qrcode/create", body.ToJson());
-    }
-
-    // 获取 jsapi_ticket（type=jsapi）或 wx_card ticket。
-    public async WechatResponse GetTicketAsync(string type) {
-        string t = type;
-        if (t.Length == 0) { t = "jsapi"; }
-        return await this.GetWithTokenAsync(
-            "/cgi-bin/ticket/getticket?type=" + Encoding.UrlEncode(t));
-    }
-
-    // ---- 模板消息 ------------------------------------------------------------
-
-    // 发送模板消息。dataJson 是 数据 对象，例如
-    // <c>{"first":{"value":"hi","color":"#173177"}}</c>。
-    public async WechatResponse SendTemplateAsync(string openId, string templateId,
-                                           string url, string dataJson) {
-        if (openId.Length == 0 || templateId.Length == 0) {
-            throw new WechatException("client.paramError",
-                "openId / templateId 不能为空", "");
-        }
-        JsonValue body = JsonValue.NewObject();
-        body.Put("touser", JsonValue.NewStr(openId));
-        body.Put("template_id", JsonValue.NewStr(templateId));
-        if (url.Length > 0) { body.Put("url", JsonValue.NewStr(url)); }
-        body.Put("data", JsonValue.Parse(dataJson));
-        return await this.PostJsonWithTokenAsync(
-            "/cgi-bin/message/template/send", body.ToJson());
-    }
-
-    // ---- 网页 OAuth ----------------------------------------------------------
-
-    // 用 code 换网页授权 access_token（sns/oauth2）。
-    // 不走公众号 access_token 缓存——这是用户授权 token。
     public async WechatResponse OAuthAccessTokenAsync(string code) {
         if (code.Length == 0) {
             throw new WechatException("client.paramError", "code 不能为空", "");
@@ -312,55 +126,39 @@ public class WechatClient {
             + "&secret=" + Encoding.UrlEncode(this.appSecret)
             + "&code=" + Encoding.UrlEncode(code)
             + "&grant_type=authorization_code";
-        return await this.GetAsync(path);
+        return await this.transport.RequestJsonAsync("GET", path, "");
     }
 
-    // 刷新网页授权 access_token。
     public async WechatResponse OAuthRefreshTokenAsync(string refreshToken) {
+        if (refreshToken.Length == 0) {
+            throw new WechatException("client.paramError", "refreshToken 不能为空", "");
+        }
         string path = "/sns/oauth2/refresh_token?appid=" + Encoding.UrlEncode(this.appId)
             + "&grant_type=refresh_token"
             + "&refresh_token=" + Encoding.UrlEncode(refreshToken);
-        return await this.GetAsync(path);
+        return await this.transport.RequestJsonAsync("GET", path, "");
     }
 
-    // 拉取用户信息（需 snsapi_userinfo 授权）。
     public async WechatResponse OAuthUserInfoAsync(string oauthAccessToken, string openId, string lang) {
-        string l = lang;
-        if (l.Length == 0) { l = "zh_CN"; }
+        if (oauthAccessToken.Length == 0 || openId.Length == 0) {
+            throw new WechatException("client.paramError", "oauthAccessToken / openId 不能为空", "");
+        }
+        string l = lang.Length == 0 ? "zh_CN" : lang;
         string path = "/sns/userinfo?openid=" + Encoding.UrlEncode(openId)
             + "&lang=" + Encoding.UrlEncode(l);
         path = WechatApiTransport.AppendQuery(path,
             WechatCredential.QueryName(WechatCredentialKind.AccessToken),
             oauthAccessToken);
-        return await this.GetAsync(path);
+        return await this.transport.RequestJsonAsync("GET", path, "");
     }
 
-    // 拼网页授权跳转 URL（开在浏览器里让用户点）。
-    // scope 通常 <c>snsapi_base</c> 或 <c>snsapi_userinfo</c>。
     public string BuildOAuthUrl(string redirectUri, string scope, string state) {
-        string s = scope;
-        if (s.Length == 0) { s = "snsapi_base"; }
+        string s = scope.Length == 0 ? "snsapi_base" : scope;
         return "https://open.weixin.qq.com/connect/oauth2/authorize?appid="
             + Encoding.UrlEncode(this.appId)
             + "&redirect_uri=" + Encoding.UrlEncode(redirectUri)
             + "&response_type=code&scope=" + Encoding.UrlEncode(s)
             + "&state=" + Encoding.UrlEncode(state)
             + "#wechat_redirect";
-    }
-
-    public WechatApiTransport NewTransport() {
-        WechatApiTransport transport = new WechatApiTransport(this.host);
-        transport.Server(this.host, this.port);
-        transport.Timeout(this.timeoutMs);
-        transport.SetCallPolicy(this.callPolicy);
-        return transport;
-    }
-
-    public HttpClient NewHttp() {
-        HttpClient http = new HttpClient(this.host, this.port);
-        http.UseTls();
-        http.SetTimeout(this.timeoutMs);
-        http.SetCallPolicy(this.callPolicy);
-        return http;
     }
 }

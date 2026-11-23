@@ -1,0 +1,161 @@
+using System;
+using System.Json;
+using System.Net.Http;
+using System.Text;
+using Sdk.Jushuitan;
+
+namespace Sdk.Jushuitan.Messages;
+
+// 聚水潭开放平台新版消息接收协议（官方文档 28）。
+public static class JushuitanMessageCallback {
+    public const string SubscriptionCheck = "epaas_subscribe";
+    public const string Shipment = "sync_shipped";
+    public const string Inventory = "business_sku_syn";
+    public const string AfterSale = "trade_after_sale";
+    public const string Receipt = "receipt_action";
+
+    private const string FormMediaType = "application/x-www-form-urlencoded";
+    private const string Utf8 = "utf-8";
+    private const string ProtocolVersion = "2";
+    private const int TimestampDigits = 10;
+    private const string AppKeyField = "app_key";
+    private const string ActionCodeField = "action_code";
+    private const string TimestampField = "timestamp";
+    private const string VersionField = "version";
+    private const string CharsetField = "charset";
+    private const string BizField = "biz";
+    private const string SignField = "sign";
+
+    public static JushuitanMessage Parse(HttpRequest request, string appKey, string appSecret) {
+        return JushuitanMessageCallback.Parse(request, appKey, appSecret, 0L);
+    }
+
+    // maxAgeSeconds > 0 时额外校验回调 timestamp 与本机 UTC 时间差，防止重放。
+    public static JushuitanMessage Parse(HttpRequest request, string appKey, string appSecret, long maxAgeSeconds) {
+        if (request == null || !request.IsPost()) {
+            throw new JushuitanException("callback.invalidMethod", "消息回调要求 POST 请求", 0, "");
+        }
+        string contentType = request.contentType;
+        if (contentType == null) { contentType = ""; }
+        int separator = contentType.IndexOf(";");
+        if (separator >= 0) { contentType = contentType.Substring(0, separator); }
+        if (contentType.Trim().ToLower() != JushuitanMessageCallback.FormMediaType) {
+            throw new JushuitanException("callback.invalidContentType", "消息回调要求 URL 编码表单", 0, "");
+        }
+        int pairCount = JushuitanMessageCallback.ValidateForm(request.body);
+        Dictionary<string, string> fields = request.GetFormFields();
+        // 表单 API 会覆盖重复键，解码后按字段数识别重复键（含编码不同的同名键）。
+        if (fields.Count != pairCount) {
+            throw new JushuitanException("callback.invalidForm", "消息回调表单含有重复字段", 0, "");
+        }
+        return JushuitanMessageCallback.ParseFields(fields, appKey, appSecret, maxAgeSeconds);
+    }
+
+    // 框架已解析表单时，传入 UTF-8 解码后的全部单值字段，保留原始值。
+    public static JushuitanMessage ParseFields(Dictionary<string, string> fields, string appKey, string appSecret) {
+        return JushuitanMessageCallback.ParseFields(fields, appKey, appSecret, 0L);
+    }
+
+    public static JushuitanMessage ParseFields(Dictionary<string, string> fields, string appKey,
+                                               string appSecret, long maxAgeSeconds) {
+        if (String.IsNullOrEmpty(appKey) || String.IsNullOrEmpty(appSecret)) {
+            throw new JushuitanException("callback.invalidCredentials", "消息回调需要应用 app_key 和 app_secret", 0, "");
+        }
+        if (fields == null) {
+            throw new JushuitanException("callback.invalidForm", "消息回调缺少表单", 0, "");
+        }
+        string receivedAppKey = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.AppKeyField);
+        string actionCode = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.ActionCodeField);
+        string timestamp = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.TimestampField);
+        string version = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.VersionField);
+        string charset = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.CharsetField);
+        string biz = JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.BizField);
+        JushuitanMessageCallback.RequireField(fields, JushuitanMessageCallback.SignField);
+        if (receivedAppKey != appKey) {
+            throw new JushuitanException("callback.invalidAppKey", "消息回调 app_key 与当前应用不一致", 0, "");
+        }
+        if (version != JushuitanMessageCallback.ProtocolVersion || charset.ToLower() != JushuitanMessageCallback.Utf8) {
+            throw new JushuitanException("callback.invalidField", "消息回调要求 version=2 和 charset=utf-8", 0, "");
+        }
+        if (!JushuitanMessageCallback.IsTimestamp(timestamp)) {
+            throw new JushuitanException("callback.invalidField", "消息回调 timestamp 必须为 10 位秒级时间戳", 0, "");
+        }
+        if (maxAgeSeconds > 0L) {
+            long ts = Convert.ToInt64(timestamp);
+            long diff = DateTime.UtcNow().ToUnixSeconds() - ts;
+            if (diff < 0L) { diff = 0L - diff; }
+            if (diff > maxAgeSeconds) {
+                throw new JushuitanException("callback.expiredTimestamp", "消息回调 timestamp 超出允许时间窗口", 0, "");
+            }
+        }
+        // 签名覆盖全部实际字段。biz 的空白、字段顺序和转义形式都参与验签。
+        if (!JushuitanSign.Verify(fields, appSecret)) {
+            throw new JushuitanException("callback.invalidSignature", "消息回调签名无效", 0, "");
+        }
+        JsonValue payload;
+        try {
+            payload = JsonValue.Parse(biz);
+        } catch (JsonException) {
+            throw new JushuitanException("callback.invalidPayload", "消息回调 biz 不是有效的 JSON", 0, "");
+        }
+        return new JushuitanMessage(receivedAppKey, actionCode, timestamp, version, charset, payload, biz);
+    }
+
+    public static string SuccessResponse() {
+        return JushuitanMessageCallback.Response("0", "执行成功");
+    }
+
+    public static string FailureResponse() {
+        return JushuitanMessageCallback.Response("-1", "执行失败");
+    }
+
+    private static string Response(string code, string message) {
+        JsonValue result = JsonValue.NewObject();
+        result.PutStr("code", code);
+        result.PutStr("msg", message);
+        return result.ToJson();
+    }
+
+    private static string RequireField(Dictionary<string, string> fields, string name) {
+        string value = "";
+        if (!fields.TryGetValue(name, out value) || value == null || value.Trim().Length == 0) {
+            throw new JushuitanException("callback.missingField", "消息回调缺少必填字段 " + name, 0, "");
+        }
+        return value;
+    }
+
+    private static bool IsTimestamp(string timestamp) {
+        if (timestamp.Length != JushuitanMessageCallback.TimestampDigits) { return false; }
+        for (int i = 0; i < timestamp.Length; i = i + 1) {
+            if (timestamp[i] < '0' || timestamp[i] > '9') { return false; }
+        }
+        return true;
+    }
+
+    private static int ValidateForm(string body) {
+        if (String.IsNullOrEmpty(body)) {
+            throw new JushuitanException("callback.invalidForm", "消息回调缺少表单", 0, "");
+        }
+        // 解码器不报告非法转义，截断的百分号转义也无法保证向前推进。
+        for (int mark = body.IndexOf("%"); mark >= 0; mark = body.IndexOf("%", mark + 3)) {
+            if (body.Length - mark < 3 || Encoding.HexDigit(body[mark + 1] & 255) < 0
+                || Encoding.HexDigit(body[mark + 2] & 255) < 0) {
+                throw new JushuitanException("callback.invalidForm", "消息回调表单含有非法百分号转义", 0, "");
+            }
+        }
+        int count = 0;
+        int start = 0;
+        while (start < body.Length) {
+            int stop = body.IndexOf("&", start);
+            if (stop < 0) { stop = body.Length; }
+            int equals = body.IndexOf("=", start);
+            if (equals <= start || equals >= stop) {
+                throw new JushuitanException("callback.invalidForm", "消息回调表单要求非空字段名及等号", 0, "");
+            }
+            count = count + 1;
+            if (stop == body.Length) { break; }
+            start = stop + 1;
+        }
+        return count;
+    }
+}

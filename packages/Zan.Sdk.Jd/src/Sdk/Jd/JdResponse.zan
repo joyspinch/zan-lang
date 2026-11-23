@@ -3,19 +3,10 @@ using System.Json;
 
 namespace Sdk.Jd;
 
-// 一次成功调用的返回结果。
-// 京东网关的响应是一层信封：
-// <code>{"jingdong_area_province_get_responce": { ...业务数据... }}</code>
-// 本类已把信封剥掉：<c>Data</c> 是业务数据本身，<c>Raw</c> 保留原始报文。
-// 失败不会走到这里：网关返回错误码时 JdClient 直接抛 <see cref="JdException"/>。
+// 京东网关响应（已剥除外层 *_responce 信封；网关/业务错误直接抛 JdException）。
 public class JdResponse {
-    // 剥掉信封后的业务数据 JSON 文本，可直接喂 Json.Deserialize。
     public string Data;
-
-    // 网关返回的完整原始报文。
     public string Raw;
-
-    // 已解析的业务数据树，需要动态取值时用。
     public JsonValue Value;
 
     public JdResponse(string data, string raw, JsonValue v) {
@@ -24,10 +15,6 @@ public class JdResponse {
         this.Value = v;
     }
 
-    // 解析网关响应：剥信封、识别错误。
-    // 错误有两种形态，都抛 JdException：
-    // 1. <c>{"error_response":{"code":"...","zh_desc":"..."}}</c> 网关级错误；
-    // 2. 信封内业务数据带非 "0" 的 code 字段。
     public static JdResponse Parse(string body) {
         JsonValue root = null;
         try {
@@ -41,9 +28,9 @@ public class JdResponse {
 
         JsonValue err = root.Get("error_response");
         if (err != null && err.IsObject()) {
-            string code = JdResponse.Field(err, "code", "unknown");
-            string msg = JdResponse.Field(err, "zh_desc", "");
-            if (msg.Length == 0) { msg = JdResponse.Field(err, "en_desc", "网关返回错误"); }
+            string code = err.Str("code", "unknown");
+            string msg = err.Str("zh_desc", "");
+            if (msg.Length == 0) { msg = err.Str("en_desc", "网关返回错误"); }
             throw new JdException(code, msg, body);
         }
 
@@ -51,26 +38,19 @@ public class JdResponse {
             throw new JdException("client.badResponse", "响应信封为空", body);
         }
 
-        // 信封只有一个键，键名形如 jingdong_xxx_responce。
+        // 信封只有一个键（形如 jingdong_xxx_responce）。
         JsonValue data = root.ValAt(0);
         if (data == null || !data.IsObject()) {
             throw new JdException("client.badResponse", "响应信封内不是对象", body);
         }
 
-        // 业务层错误码：京东各接口不统一，"0" / "" 视为成功。
-        string bizCode = JdResponse.Field(data, "code", "");
+        string bizCode = data.Str("code", "");
         if (bizCode.Length > 0 && bizCode != "0") {
-            string bizMsg = JdResponse.Field(data, "zh_desc", "");
-            if (bizMsg.Length == 0) { bizMsg = JdResponse.Field(data, "msg", "业务返回错误"); }
+            string bizMsg = data.Str("zh_desc", "");
+            if (bizMsg.Length == 0) { bizMsg = data.Str("msg", "业务返回错误"); }
             throw new JdException(bizCode, bizMsg, body);
         }
 
         return new JdResponse(data.ToJson(), body, data);
-    }
-
-    private static string Field(JsonValue obj, string key, string dflt) {
-        JsonValue v = obj.Get(key);
-        if (v == null) { return dflt; }
-        return v.AsString(dflt);
     }
 }

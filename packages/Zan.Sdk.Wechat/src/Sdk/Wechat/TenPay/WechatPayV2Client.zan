@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Security.Cryptography;
+using System.Net.External;
+using System.Net.Tls;
+using Sdk.Wechat;
 
 namespace Sdk.Wechat.TenPay;
 
@@ -25,40 +28,102 @@ public class WechatPayV2Client {
         this.transport.Server(host, port); this.mutualTransport.Server(host, port);
         return this;
     }
+
+    public WechatPayV2Client PlainHttpMode() {
+        this.transport.PlainHttpMode(); this.mutualTransport.PlainHttpMode();
+        return this;
+    }
+
     public WechatPayV2Client Timeout(int ms) {
         this.transport.Timeout(ms); this.mutualTransport.Timeout(ms); return this;
     }
+
     public WechatPayV2Client SetCallPolicy(ExternalCallPolicy policy) {
         this.transport.SetCallPolicy(policy);
         this.mutualTransport.SetCallPolicy(policy);
         return this;
     }
+
     public ExternalCallPolicy CallPolicy() {
         return this.transport.CallPolicy();
     }
 
-    async WechatRawResponse RequestAsync(string path, WechatPayV2Request request,
-                                         bool requireClientCertificate) {
+    public WechatPayV2Client PinPublicKey(string spkiSha256Base64) {
+        this.transport.PinPublicKey(spkiSha256Base64);
+        this.mutualTransport.PinPublicKey(spkiSha256Base64);
+        return this;
+    }
+
+    public WechatPayV2Client SetCertPolicy(CertPolicyFn fn) {
+        this.transport.SetCertPolicy(fn);
+        this.mutualTransport.SetCertPolicy(fn);
+        return this;
+    }
+
+    public async WechatRawResponse RequestAsync(string path, WechatPayV2Request request,
+                                                bool requireClientCertificate) {
         string xml = request.ToSignedXml(this.config);
         return await this.RequestXmlAsync(path, xml, requireClientCertificate);
     }
 
-    async WechatRawResponse RequestXmlAsync(string path, string signedXml,
-                                            bool requireClientCertificate) {
+    public async WechatRawResponse RequestXmlAsync(string path, string signedXml,
+                                                   bool requireClientCertificate) {
+        WechatRawResponse raw;
         if (requireClientCertificate) {
             if (this.config.ClientCertificateFile.Length == 0
                 || this.config.ClientPrivateKeyFile.Length == 0) {
                 throw new InvalidOperationException("此微信支付 V2 接口需要配置 PEM 客户端证书和私钥");
             }
-            return await this.mutualTransport.RequestSimpleRawAsync("POST", path,
-                signedXml, "text/xml; charset=utf-8");
+            raw = await this.mutualTransport.RequestRawAsync("POST", path,
+                signedXml, "text/xml; charset=utf-8", null);
+        } else {
+            raw = await this.transport.RequestRawAsync("POST", path, signedXml,
+                "text/xml; charset=utf-8", null);
         }
-        return await this.transport.RequestSimpleRawAsync("POST", path, signedXml,
-                                                     "text/xml; charset=utf-8");
+        if (!raw.IsSuccess()) {
+            throw new WechatException("http." + Convert.ToString(raw.StatusCode),
+                "微信支付 V2 HTTP 请求失败: " + Convert.ToString(raw.StatusCode), raw.Body);
+        }
+        if (XmlUtil.IndexOf(raw.Body, "<xml", 0) >= 0) {
+            this.ValidateXmlResponse(raw.Body);
+        }
+        return raw;
+    }
+
+    private void ValidateXmlResponse(string xml) {
+        WechatPayV2Request parsed = WechatPayV2Request.ParseXml(xml);
+        string returnCode = parsed.Get("return_code", "");
+        if (returnCode.Length > 0 && returnCode != "SUCCESS") {
+            throw new WechatException(returnCode,
+                parsed.Get("return_msg", "微信支付 V2 返回失败"), xml);
+        }
+        string sign = parsed.Get("sign", "");
+        if (sign.Length > 0
+            && !parsed.VerifyWithDefaultSignType(this.config.MerchantKey, this.config.SignType)) {
+            throw new WechatException("tenpay.signatureInvalid",
+                "微信支付 V2 响应签名验证失败", xml);
+        }
+        string resultCode = parsed.Get("result_code", "");
+        if (resultCode.Length > 0 && resultCode != "SUCCESS") {
+            string errCode = parsed.Get("err_code", resultCode);
+            string errDesc = parsed.Get("err_code_des",
+                parsed.Get("return_msg", "微信支付 V2 业务返回失败"));
+            throw new WechatException(errCode, errDesc, xml);
+        }
     }
 
     public bool VerifyResponse(string xml) {
-        return WechatPayV2Request.ParseXml(xml).Verify(this.config.MerchantKey);
+        return WechatPayV2Request.ParseXml(xml)
+            .VerifyWithDefaultSignType(this.config.MerchantKey, this.config.SignType);
+    }
+
+    public WechatPayV2Request VerifyNotification(string xml) {
+        WechatPayV2Request parsed = WechatPayV2Request.ParseXml(xml);
+        if (!parsed.VerifyWithDefaultSignType(this.config.MerchantKey, this.config.SignType)) {
+            throw new WechatException("tenpay.signatureInvalid",
+                "微信支付 V2 通知签名验证失败", xml);
+        }
+        return parsed;
     }
 
     public string DecodeRefundReqInfo(string encryptedBase64) {

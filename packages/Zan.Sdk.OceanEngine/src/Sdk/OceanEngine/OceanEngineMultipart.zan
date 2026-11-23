@@ -1,0 +1,71 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace Sdk.OceanEngine;
+
+// 字节安全的 multipart/form-data 请求构造器（防止 NUL 字节截断与头部注入）。
+public class OceanEngineMultipart {
+    private string boundary = "ZanOceanEngine" + Hex.Encode(RandomNumberGenerator.GetBytes(16));
+    private List<byte[]> parts = new List<byte[]>();
+
+    public string ContentType() { return "multipart/form-data; boundary=" + this.boundary; }
+
+    public static string ComputeMd5Hex(byte[] bytes) {
+        if (bytes == null) { throw new ArgumentException("字节数组不能为空"); }
+        return Md5.HashToHex(bytes).ToLower();
+    }
+
+    public OceanEngineMultipart AddField(string name, string value) {
+        string header = this.PartHeader(name) + "\"\r\n\r\n";
+        this.parts.Add(Encoding.GetBytes(header + value + "\r\n"));
+        return this;
+    }
+
+    public OceanEngineMultipart AddFile(string name, string fileName, string mediaType, byte[] bytes) {
+        if (bytes == null) { throw new ArgumentException("上传文件字节不能为空"); }
+        OceanEngineMultipart.ValidatePartHeader(fileName);
+        OceanEngineMultipart.ValidatePartHeader(mediaType);
+        string header = this.PartHeader(name) + "\"; filename=\"" + fileName
+            + "\"\r\nContent-Type: " + mediaType + "\r\n\r\n";
+        byte[] file = new byte[bytes.Length];
+        Array.Copy(bytes, file, bytes.Length);
+        this.parts.Add(Encoding.GetBytes(header));
+        this.parts.Add(file);
+        this.parts.Add(Encoding.GetBytes("\r\n"));
+        return this;
+    }
+
+    internal byte[] Body(int requestLimit) {
+        byte[] end = Encoding.GetBytes("--" + this.boundary + "--\r\n");
+        long length = end.Length;
+        for (int i = 0; i < this.parts.Count; i = i + 1) {
+            length = length + this.parts[i].Length;
+        }
+        if (length > requestLimit) { throw new ArgumentException("multipart 正文超过请求字节预算"); }
+        byte[] body = new byte[(int)length];
+        int offset = 0;
+        for (int i = 0; i < this.parts.Count; i = i + 1) {
+            byte[] part = this.parts[i];
+            Array.Copy(part, 0, body, offset, part.Length);
+            offset = offset + part.Length;
+        }
+        Array.Copy(end, 0, body, offset, end.Length);
+        return body;
+    }
+
+    private string PartHeader(string name) {
+        OceanEngineMultipart.ValidatePartHeader(name);
+        return "--" + this.boundary + "\r\nContent-Disposition: form-data; name=\"" + name;
+    }
+
+    private static void ValidatePartHeader(string value) {
+        if (value == null || value.Length == 0) { throw new ArgumentException("multipart 部分头不能为空"); }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            if (c < 32 || c == 127 || c == 34 || c == 92) {
+                throw new ArgumentException("multipart 部分头包含非法字符");
+            }
+        }
+    }
+}

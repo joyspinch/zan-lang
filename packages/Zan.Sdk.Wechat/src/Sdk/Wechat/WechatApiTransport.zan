@@ -1,28 +1,35 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Net.Http;
 using System.Net.Http.Client;
 using System.Net.External;
+using System.Net.Tls;
 
 namespace Sdk.Wechat;
 
-// 微信各产品线共用的 HTTPS 传输层。支持 JSON、XML、multipart、二进制响应、
-// 任意请求头以及需要 PEM 客户端证书的双向 TLS。
+// 微信各产品线共用的 HTTP/HTTPS 传输层。
 public class WechatApiTransport {
     string host;
     int port;
     int timeoutMs;
+    bool plainHttp;
     string clientCertificateFile;
     string clientPrivateKeyFile;
     ExternalCallPolicy callPolicy;
+    List<string> tlsPins;
+    CertPolicyFn certPolicy;
 
     public WechatApiTransport(string host) {
         this.host = host;
         this.port = 443;
         this.timeoutMs = 30000;
+        this.plainHttp = false;
         this.clientCertificateFile = "";
         this.clientPrivateKeyFile = "";
         this.callPolicy = ExternalCallPolicy.Default();
+        this.tlsPins = null;
+        this.certPolicy = null;
     }
 
     public WechatApiTransport Server(string host, int port) {
@@ -31,10 +38,19 @@ public class WechatApiTransport {
         return this;
     }
 
-    public WechatApiTransport Timeout(int ms) {
-        this.timeoutMs = ms;
+    public WechatApiTransport PlainHttpMode() {
+        this.plainHttp = true;
         return this;
     }
+
+    public bool IsPlainHttp() { return this.plainHttp; }
+
+    public WechatApiTransport Timeout(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+        return this;
+    }
+
+    public int TimeoutMs() { return this.timeoutMs; }
 
     public WechatApiTransport SetClientCertificate(string certFile, string keyFile) {
         this.clientCertificateFile = certFile;
@@ -51,6 +67,19 @@ public class WechatApiTransport {
         return this.callPolicy;
     }
 
+    public WechatApiTransport PinPublicKey(string spkiSha256Base64) {
+        if (spkiSha256Base64 != null && spkiSha256Base64.Length > 0) {
+            if (this.tlsPins == null) { this.tlsPins = new List<string>(); }
+            this.tlsPins.Add(spkiSha256Base64);
+        }
+        return this;
+    }
+
+    public WechatApiTransport SetCertPolicy(CertPolicyFn fn) {
+        this.certPolicy = fn;
+        return this;
+    }
+
     public static string BuildPath(string path, string query) {
         if (query.Length == 0) { return path; }
         if (query.StartsWith("?")) { return path + query; }
@@ -59,49 +88,65 @@ public class WechatApiTransport {
 
     public static string AppendQuery(string path, string name, string tokenValue) {
         if (name.Length == 0 || tokenValue.Length == 0) { return path; }
-        string sep = "?";
-        for (int i = 0; i < path.Length; i = i + 1) {
-            if ((path[i] & 255) == 63) { sep = "&"; break; }
-        }
+        string sep = path.IndexOf("?") >= 0 ? "&" : "?";
         return path + sep + name + "=" + Encoding.UrlEncode(tokenValue);
     }
 
-    async WechatRawResponse RequestRawAsync(string method, string path,
+    public static string BuildTarget(string path, string query,
+                                     WechatCredentialKind credential, string token) {
+        string target = WechatApiTransport.BuildPath(path, query);
+        return WechatApiTransport.AppendQuery(target,
+            WechatCredential.QueryName(credential), token);
+    }
+
+    public async WechatRawResponse RequestRawAsync(string method, string path,
                                              string body, string contentType,
                                              List<string> headers) {
         try {
-            HttpClient http = HttpClient.CreateHttps(this.host, this.port);
-            http.SetTimeout(this.timeoutMs);
-            http.SetCallPolicy(this.callPolicy);
-            if (this.clientCertificateFile.Length > 0
-                && this.clientPrivateKeyFile.Length > 0) {
-                http.SetClientCertificate(this.clientCertificateFile,
-                                          this.clientPrivateKeyFile);
-            }
-            if (contentType.Length > 0) { http.SetHeader("Content-Type", contentType); }
-            for (int i = 0; i < headers.Count; i = i + 1) {
-                string line = headers[i];
-                int colon = WechatRawResponse.IndexOf(line, ":", 0);
-                if (colon > 0) {
-                    string name = line.Substring(0, colon);
-                    int start = colon + 1;
-                    while (start < line.Length && (line[start] & 255) == 32) {
-                        start = start + 1;
+            using (HttpClient http = new HttpClient(this.host, this.port)) {
+                if (!this.plainHttp) {
+                    http.UseTls();
+                    if (this.tlsPins != null) {
+                        for (int pi = 0; pi < this.tlsPins.Count; pi = pi + 1) {
+                            http.PinPublicKey(this.tlsPins[pi]);
+                        }
                     }
-                    http.SetHeader(name, line.Substring(start));
+                    if (this.certPolicy != null) { http.SetCertPolicy(this.certPolicy); }
+                }
+                http.SetTimeout(this.timeoutMs);
+                http.SetCallPolicy(this.callPolicy);
+                if (!this.plainHttp
+                    && this.clientCertificateFile.Length > 0
+                    && this.clientPrivateKeyFile.Length > 0) {
+                    http.SetClientCertificate(this.clientCertificateFile,
+                                              this.clientPrivateKeyFile);
+                }
+                if (contentType.Length > 0) { http.SetHeader("Content-Type", contentType); }
+                if (headers != null) {
+                    for (int i = 0; i < headers.Count; i = i + 1) {
+                        string line = headers[i];
+                        int colon = line.IndexOf(":");
+                        if (colon > 0) {
+                            string name = line.Substring(0, colon);
+                            int start = colon + 1;
+                            while (start < line.Length && (line[start] & 255) == 32) {
+                                start = start + 1;
+                            }
+                            http.SetHeader(name, line.Substring(start));
+                        }
+                    }
+                }
+                using (HttpResponse response = await http.SendAsync(method, path, body)) {
+                    return WechatRawResponse.FromHttp(response);
                 }
             }
-            HttpResponse response = await http.SendAsync(method, path, body);
-            return WechatRawResponse.FromHttp(response);
+        } catch (WechatException e) {
+            throw e;
+        } catch (NotSupportedException e) {
+            throw e;
         } catch (Exception e) {
             throw new WechatException("client.networkError", e.Message, "");
         }
-    }
-
-    async WechatRawResponse RequestSimpleRawAsync(string method, string path,
-                                                   string body, string contentType) {
-        return await this.RequestRawAsync(method, path, body, contentType,
-                                          new List<string>());
     }
 
     public async WechatResponse RequestJsonAsync(string method, string path, string body) {
@@ -109,14 +154,19 @@ public class WechatApiTransport {
         if (method != "GET" && method != "DELETE" && payload.Length == 0) {
             payload = "{}";
         }
-        WechatRawResponse raw = await this.RequestSimpleRawAsync(method, path, payload,
-                                                                  "application/json");
-        return WechatResponse.Parse(raw.Body);
+        WechatRawResponse raw = await this.RequestRawAsync(method, path, payload,
+                                                           "application/json", null);
+        return WechatResponse.FromRaw(raw);
     }
 
-    async WechatRawResponse RequestMultipartAsync(string method, string path,
+    public async WechatRawResponse RequestMultipartAsync(string method, string path,
                                                    WechatMultipart multipart) {
-        return await this.RequestSimpleRawAsync(method, path, multipart.Body(),
-                                                multipart.ContentType());
+        return await this.RequestRawAsync(method, path, multipart.Body(),
+                                          multipart.ContentType(), null);
+    }
+
+    public async WechatResponse UploadJsonAsync(string path, WechatMultipart multipart) {
+        WechatRawResponse raw = await this.RequestMultipartAsync("POST", path, multipart);
+        return WechatResponse.FromRaw(raw);
     }
 }

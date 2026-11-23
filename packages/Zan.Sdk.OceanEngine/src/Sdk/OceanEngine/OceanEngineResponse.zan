@@ -1,0 +1,70 @@
+using System;
+using System.Json;
+
+namespace Sdk.OceanEngine;
+
+// 巨量引擎统一 HTTP/JSON 应答封装，保留原始 JSON 树与 int64 精度。
+public class OceanEngineResponse {
+    private int statusCode;
+    public int StatusCode { get { return this.statusCode; } }
+    private string requestId;
+    public string RequestId { get { return this.requestId; } }
+    private string raw;
+    public string Raw { get { return this.raw; } }
+    private JsonValue value;
+    public JsonValue Value { get { return this.value; } }
+    private JsonValue? data;
+    public JsonValue? Data { get { return this.data; } }
+
+    private OceanEngineResponse(int statusCode, string requestId, string raw, JsonValue value, JsonValue? data) {
+        this.statusCode = statusCode;
+        this.requestId = requestId;
+        this.raw = raw;
+        this.value = value;
+        this.data = data;
+    }
+
+    internal static OceanEngineResponse Parse(int statusCode, string body, string headerRequestId, string directArray) {
+        JsonValue? root = null;
+        try {
+            root = JsonValue.Parse(body);
+        } catch (Exception e) {
+            // 网关错误可能返回 HTML 或空正文。
+        }
+        string requestId = headerRequestId;
+        if (root != null && root.IsObject()) {
+            string bodyRequestId = root.PathStr("request_id", "");
+            if (bodyRequestId.Length > 0) { requestId = bodyRequestId; }
+        }
+        if (statusCode < 200 || statusCode >= 300) {
+            throw new OceanEngineException("http." + Convert.ToString(statusCode),
+                "巨量引擎返回 HTTP " + Convert.ToString(statusCode), statusCode, requestId);
+        }
+        if (root == null || !root.IsObject()) {
+            throw new OceanEngineException("client.badResponse", "响应应为 JSON 对象",
+                statusCode, requestId);
+        }
+        JsonValue? code = root.Get("code");
+        if (code == null && directArray.Length > 0) {
+            JsonValue? items = root.Get(directArray);
+            if (items != null && items.IsArray()) {
+                return new OceanEngineResponse(statusCode, requestId, body, (JsonValue)root, root);
+            }
+        }
+        if (code == null || (!code.IsNumber() && !code.IsString())) {
+            throw new OceanEngineException("client.badResponse", "响应缺少有效业务 code",
+                statusCode, requestId);
+        }
+        string codeText = code.IsString() ? code.AsString("") : code.ToJson();
+        if (codeText != "0") {
+            throw new OceanEngineException(codeText, root.PathStr("message", root.PathStr("msg", "")),
+                statusCode, requestId);
+        }
+        JsonValue? data = root.Get("data");
+        if (data == null && directArray.Length > 0) {
+            JsonValue? items = root.Get(directArray);
+            if (items != null && items.IsArray()) { data = root; }
+        }
+        return new OceanEngineResponse(statusCode, requestId, body, (JsonValue)root, data);
+    }
+}

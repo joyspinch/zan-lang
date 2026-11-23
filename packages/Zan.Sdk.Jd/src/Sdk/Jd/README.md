@@ -1,6 +1,6 @@
 # Sdk.Jd —— 京东开放平台（JOS）客户端
 
-`stdlib/Sdk/Jd` 是京东官方 `jos-net-open-api-sdk-2.0`（C#）快照的 Zan 版本。
+`src/Sdk/Jd` 是京东官方 `jos-net-open-api-sdk-2.0`（C#）快照的 Zan 版本。
 当前覆盖原版全部 212 个 Domain 实体、211 个 Request、211 个 Response 和 44 个 API 模块；
 普通调用直接返回强类型 Response，不需要调用方再次处理 `JdResponse.Data`。
 
@@ -46,20 +46,21 @@ try {
 
 ## 接口层
 
-由 `scripts/generate_jd_sdk.py` 从原版 C# 源码生成，改动接口请改生成器后重跑，
-不要直接编辑生成的文件：
+生成的接口分为共享实体与模块契约两层（请勿手改生成文件）：
 
 ```text
-stdlib/Sdk/Jd/Models/        212 个共享业务实体（Sdk.Jd.Models，每个 C# Domain 只生成一次）
-stdlib/Sdk/Jd/Api/<模块>/    211 组方法 Request/Response 契约 + 44 个 Jd*Api 模块客户端
+src/Sdk/Jd/Models/        212 个共享业务实体（Sdk.Jd.Models，每个 C# Domain 只生成一次）
+src/Sdk/Jd/Api/<模块>/    211 组方法 Request/Response 契约 + 44 个 Jd*Api 模块客户端
 ```
 
 按模块分目录是必需的：auto-stdlib 以命名空间目录为单位整体拉取，所有文件挤在一个目录
 会让任何用到它的程序全量编译。
 
-`Domain/` 是共享实体层；`Api/<模块>/` 中的 Request/Response 只是方法传输契约。
+`Models/` 是共享实体层；`Api/<模块>/` 中的 Request/Response 只是方法传输契约。
 多个接口引用同一个 C# Domain 时都指向同一个 `Sdk.Jd.Models` 类型，不重复生成实体。
 模块客户端负责执行、解包和反序列化，并把完整网关信封保存在 Response 的 `Raw` 字段。
+
+多店铺并发可使用 `client.WithAccessToken(token)` 派生轻量会话，或使用 `client.CallAsync(apiName, jsonValue)` 发起未收录接口兜底调用。
 
 每个 Request 类携带自己的 API 名，参数是强类型链式 setter：
 
@@ -172,7 +173,7 @@ client.Timeout(15000)                                   // 超时，默认 30000
 | `JdResponse.zan` | 响应：剥信封、识别网关/业务错误 |
 | `JdSign.zan` | 京东签名规则（排序拼接 + MD5） |
 | `JdException.zan` | 统一失败类型，携带错误码和原始报文 |
-| `Domain/`、`Api/` | 生成的接口层（`scripts/generate_jd_sdk.py` 产出，勿手改） |
+| `Models/`、`Api/` | 生成的接口层（勿手改） |
 
 ## 测试
 

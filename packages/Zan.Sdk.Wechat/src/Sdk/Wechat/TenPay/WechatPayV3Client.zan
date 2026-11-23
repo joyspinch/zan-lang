@@ -2,6 +2,7 @@ using System;
 using System.Json;
 using System.Security.Cryptography;
 using System.Net.External;
+using System.Net.Tls;
 using Sdk.Wechat;
 
 namespace Sdk.Wechat.TenPay;
@@ -12,6 +13,8 @@ public class WechatPayV3Client {
     WechatApiTransport transport;
     RsaKey merchantKey;
     WechatPayPlatformKeyStore platformKeys;
+    string defaultPlatformSerial;
+    bool requireResponseSignature;
 
     public WechatPayV3Client(WechatPayV3Config config) {
         this.config = config;
@@ -21,6 +24,8 @@ public class WechatPayV3Client {
             throw new ArgumentException("MerchantPrivateKeyPem 不是有效的 RSA 私钥");
         }
         this.platformKeys = new WechatPayPlatformKeyStore();
+        this.defaultPlatformSerial = config.PlatformSerialNumber;
+        this.requireResponseSignature = config.RequireResponseSignature;
         if (config.PlatformSerialNumber.Length > 0
             && config.PlatformPublicKeyPem.Length > 0) {
             this.platformKeys.Add(config.PlatformSerialNumber,
@@ -31,17 +36,39 @@ public class WechatPayV3Client {
     public WechatPayV3Client Server(string host, int port) {
         this.transport.Server(host, port); return this;
     }
-    WechatPayV3Client Timeout(int ms) { this.transport.Timeout(ms); return this; }
+
+    public WechatPayV3Client PlainHttpMode() {
+        this.transport.PlainHttpMode(); return this;
+    }
+
+    public WechatPayV3Client Timeout(int ms) {
+        this.transport.Timeout(ms); return this;
+    }
+
     public WechatPayV3Client SetCallPolicy(ExternalCallPolicy policy) {
         this.transport.SetCallPolicy(policy); return this;
     }
 
-    WechatPayV3Client SetPlatformPublicKey(string serial,
-                                           string publicKeyOrCertificatePem) {
+    public ExternalCallPolicy CallPolicy() {
+        return this.transport.CallPolicy();
+    }
+
+    public WechatPayV3Client PinPublicKey(string spkiSha256Base64) {
+        this.transport.PinPublicKey(spkiSha256Base64);
+        return this;
+    }
+
+    public WechatPayV3Client SetCertPolicy(CertPolicyFn fn) {
+        this.transport.SetCertPolicy(fn);
+        return this;
+    }
+
+    // 仅更新当前客户端实例的平台证书缓存，不反向修改传入的 config。
+    public WechatPayV3Client SetPlatformPublicKey(string serial,
+                                                  string publicKeyOrCertificatePem) {
         this.platformKeys.Add(serial, publicKeyOrCertificatePem);
-        this.config.PlatformSerialNumber = serial;
-        this.config.PlatformPublicKeyPem = publicKeyOrCertificatePem;
-        this.config.RequireResponseSignature = true;
+        this.defaultPlatformSerial = serial;
+        this.requireResponseSignature = true;
         return this;
     }
 
@@ -53,8 +80,8 @@ public class WechatPayV3Client {
         return this.platformKeys.Pem(serial);
     }
 
-    string BuildAuthorization(string method, string target, string body,
-                              long timestamp, string nonce) {
+    public string BuildAuthorization(string method, string target, string body,
+                                     long timestamp, string nonce) {
         string message = method + "\n" + target + "\n"
             + Convert.ToString(timestamp) + "\n" + nonce + "\n" + body + "\n";
         string signature = this.merchantKey.SignSha256(message);
@@ -65,9 +92,9 @@ public class WechatPayV3Client {
             + signature + "\"";
     }
 
-    async WechatRawResponse RequestAsync(string method, string path,
-                                          string query, string body,
-                                          string contentType) {
+    public async WechatRawResponse RequestAsync(string method, string path,
+                                                string query, string body,
+                                                string contentType) {
         string target = WechatApiTransport.BuildPath(path, query);
         long timestamp = DateTime.UtcNow().ToUnixSeconds();
         byte[] nonceBytes = RandomNumberGenerator.GetBytes(16);
@@ -84,18 +111,21 @@ public class WechatPayV3Client {
             throw new WechatException("tenpay.signatureInvalid",
                 "微信支付响应签名验证失败", response.Body);
         }
+        if (!response.IsSuccess()) {
+            WechatPayV3Client.ThrowHttpError(response);
+        }
         return response;
     }
 
-    async WechatRawResponse RequestJsonAsync(string method, string path,
-                                              string query, string jsonBody) {
+    public async WechatRawResponse RequestJsonAsync(string method, string path,
+                                                    string query, string jsonBody) {
         return await this.RequestAsync(method, path, query, jsonBody,
                                        "application/json");
     }
 
-    async WechatRawResponse RequestMultipartAsync(string method, string path,
-                                                   string query,
-                                                   WechatMultipart multipart) {
+    public async WechatRawResponse RequestMultipartAsync(string method, string path,
+                                                         string query,
+                                                         WechatMultipart multipart) {
         string body = multipart.Body();
         return await this.RequestAsync(method, path, query, body,
                                        multipart.ContentType());
@@ -104,15 +134,43 @@ public class WechatPayV3Client {
     // 下载微信返回的短期签名 URL；此请求不附加商户 Authorization。
     public async WechatRawResponse DownloadAsync(string url) {
         ExternalTarget target = ExternalTarget.Parse(url);
+        bool allowPlain = this.transport.IsPlainHttp();
         if (target == null || !ExternalTargetPolicy.IsAllowedTarget(
-                target, false, false)) {
+                target, allowPlain, allowPlain)) {
             throw new ArgumentException("微信支付下载地址不是允许的外部 HTTPS 目标");
         }
         string path = target.Path() + target.Query();
         WechatApiTransport downloader = new WechatApiTransport(target.Host());
         downloader.Server(target.Host(), target.Port());
+        if (allowPlain && !target.IsTls()) { downloader.PlainHttpMode(); }
+        downloader.Timeout(this.transport.TimeoutMs());
         downloader.SetCallPolicy(this.transport.CallPolicy());
-        return await downloader.RequestSimpleRawAsync("GET", path, "", "");
+        WechatRawResponse raw = await downloader.RequestRawAsync("GET", path, "", "", null);
+        if (!raw.IsSuccess()) {
+            WechatPayV3Client.ThrowHttpError(raw);
+        }
+        return raw;
+    }
+
+    private static void ThrowHttpError(WechatRawResponse response) {
+        string code = "";
+        string message = "";
+        try {
+            JsonValue err = JsonValue.Parse(response.Body);
+            if (err != null && err.IsObject()) {
+                code = err.Str("code", "");
+                message = err.Str("message", "");
+            }
+        } catch (Exception e) {
+            code = "";
+        }
+        if (code.Length == 0) {
+            code = "http." + Convert.ToString(response.StatusCode);
+        }
+        if (message.Length == 0) {
+            message = "微信支付 V3 HTTP 请求失败: " + Convert.ToString(response.StatusCode);
+        }
+        throw new WechatException(code, message, response.Body);
     }
 
     public bool VerifyResponse(WechatRawResponse response) {
@@ -121,10 +179,10 @@ public class WechatPayV3Client {
         string signature = response.Header("Wechatpay-Signature");
         string serial = response.Header("Wechatpay-Serial");
         if (timestamp.Length == 0 || nonce.Length == 0 || signature.Length == 0) {
-            return !this.config.RequireResponseSignature;
+            return !this.requireResponseSignature;
         }
         RsaKey key = this.PlatformKey(serial);
-        if (key == null) { return !this.config.RequireResponseSignature; }
+        if (key == null) { return !this.requireResponseSignature; }
         string message = timestamp + "\n" + nonce + "\n" + response.Body + "\n";
         return key.VerifySha256(message, signature);
     }
@@ -145,8 +203,8 @@ public class WechatPayV3Client {
         return diff <= 300;
     }
 
-    bool VerifyNotification(string timestamp, string nonce, string body,
-                            string signature, string serial) {
+    public bool VerifyNotification(string timestamp, string nonce, string body,
+                                   string signature, string serial) {
         if (!WechatPayV3Client.TimestampFresh(timestamp)) { return false; }
         RsaKey key = this.PlatformKey(serial);
         if (key == null) { return false; }
@@ -167,18 +225,28 @@ public class WechatPayV3Client {
         return key.VerifySha256(message, signature);
     }
 
+    // 验签并解密微信支付 V3 异步通知；任何校验失败均抛出 WechatException。
+    public string VerifyAndDecryptNotification(string timestamp, string nonce, string body,
+                                               string signature, string serial) {
+        if (!this.VerifyNotification(timestamp, nonce, body, signature, serial)) {
+            throw new WechatException("tenpay.signatureInvalid",
+                "微信支付通知签名或时间戳校验失败", body);
+        }
+        WechatPayNotification notice = WechatPayNotification.Parse(body);
+        return notice.DecryptResource(this);
+    }
+
     public RsaKey PlatformKey(string serial) {
         if (serial.Length > 0) { return this.platformKeys.Get(serial); }
-        if (this.config.PlatformSerialNumber.Length > 0) {
-            RsaKey configured = this.platformKeys.Get(
-                this.config.PlatformSerialNumber);
+        if (this.defaultPlatformSerial.Length > 0) {
+            RsaKey configured = this.platformKeys.Get(this.defaultPlatformSerial);
             if (configured != null) { return configured; }
         }
         return this.platformKeys.First();
     }
 
-    string DecryptResource(string ciphertextBase64, string nonce,
-                           string associatedData) {
+    public string DecryptResource(string ciphertextBase64, string nonce,
+                                  string associatedData) {
         return WechatPayV3Client.DecryptResourceWithKey(this.config.ApiV3Key,
             ciphertextBase64, nonce, associatedData);
     }
@@ -206,8 +274,7 @@ public class WechatPayV3Client {
     }
 
     public string EncryptSensitive(string plaintext) {
-        return this.EncryptSensitiveWithSerial(plaintext,
-                                                this.config.PlatformSerialNumber);
+        return this.EncryptSensitiveWithSerial(plaintext, this.defaultPlatformSerial);
     }
 
     public string EncryptSensitiveWithSerial(string plaintext, string serial) {
@@ -218,11 +285,46 @@ public class WechatPayV3Client {
         return key.EncryptOaepSha1(plaintext);
     }
 
-    string SignAppMessage(string appId, string packageValue,
-                          long timestamp, string nonce) {
+    public string SignAppMessage(string appId, string packageValue,
+                                 long timestamp, string nonce) {
         string message = appId + "\n" + Convert.ToString(timestamp) + "\n"
             + nonce + "\n" + packageValue + "\n";
         return this.merchantKey.SignSha256(message);
+    }
+
+    // 生成小程序/JSAPI 调起微信支付（wx.requestPayment / WeixinJSBridge）所需 JSON 参数。
+    public string BuildJsapiPayParams(string appId, string prepayId) {
+        string useAppId = appId.Length > 0 ? appId : this.config.AppId;
+        long ts = DateTime.UtcNow().ToUnixSeconds();
+        string nonce = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        string pkg = "prepay_id=" + prepayId;
+        string paySign = this.SignAppMessage(useAppId, pkg, ts, nonce);
+        JsonValue obj = JsonValue.NewObject();
+        obj.Put("appId", JsonValue.NewStr(useAppId));
+        obj.Put("timeStamp", JsonValue.NewStr(Convert.ToString(ts)));
+        obj.Put("nonceStr", JsonValue.NewStr(nonce));
+        obj.Put("package", JsonValue.NewStr(pkg));
+        obj.Put("signType", JsonValue.NewStr("RSA"));
+        obj.Put("paySign", JsonValue.NewStr(paySign));
+        return obj.ToJson();
+    }
+
+    // 生成原生 App 调起微信支付所需 JSON 参数。
+    public string BuildAppPayParams(string appId, string partnerId, string prepayId) {
+        string useAppId = appId.Length > 0 ? appId : this.config.AppId;
+        string usePartner = partnerId.Length > 0 ? partnerId : this.config.MerchantId;
+        long ts = DateTime.UtcNow().ToUnixSeconds();
+        string nonce = Hex.Encode(RandomNumberGenerator.GetBytes(16), 16);
+        string sign = this.SignAppMessage(useAppId, prepayId, ts, nonce);
+        JsonValue obj = JsonValue.NewObject();
+        obj.Put("appid", JsonValue.NewStr(useAppId));
+        obj.Put("partnerid", JsonValue.NewStr(usePartner));
+        obj.Put("prepayid", JsonValue.NewStr(prepayId));
+        obj.Put("package", JsonValue.NewStr("Sign=WXPay"));
+        obj.Put("noncestr", JsonValue.NewStr(nonce));
+        obj.Put("timestamp", JsonValue.NewStr(Convert.ToString(ts)));
+        obj.Put("sign", JsonValue.NewStr(sign));
+        return obj.ToJson();
     }
 
     // 下载微信支付平台证书；algorithmType 为 RSA、SM2 或 ALL。
@@ -284,7 +386,7 @@ public class WechatPayV3Client {
         return loaded;
     }
 
-    public int LoadPublicKeyItem(JsonValue item) {
+    private int LoadPublicKeyItem(JsonValue item) {
         if (item == null || !item.IsObject()) { return 0; }
         string serial = item.Str("public_key_id", item.Str("serial_no", ""));
         string pem = item.Str("public_key", item.Str("pem", ""));

@@ -1,25 +1,14 @@
 using System;
+using System.Json;
 using System.Text;
+using System.Net.Http;
 using System.Net.Http.Client;
+using System.Net.External;
 
 namespace Sdk.Jd;
 
-// 京东开放平台（JOS）客户端。
-// 用法（一行可用）：
-// <code>
-// </code>
-// 可选配置一律链式，均有合理默认值：
-// 相对 C# 原版的改动（原版设计缺陷，未照搬）：
-// - 原版 <c>goto retry</c> + <c>Thread.Sleep</c> 阻塞整个线程重试
-// → 这里用 <c>await Task.Delay</c> 指数退避，真正挂起到 reactor；
-// - 原版把校验/网关错误吞成一个字段被填好的空 Response 返回
-// → 这里一律抛 <see cref="JdException"/>，失败无法被静默忽略；
-// - 原版残留 XML 分支和自造 JdDictionary → 删除，只留 JSON + 标准 Dictionary；
-// - 原版手拼签名与业务 JSON 字符串 → 业务参数走 JsonValue，签名走 JdSign。
-// 线程/协程安全：单个实例的配置在构造后只读，可被多个协程并发用于
-// <c>ExecuteAsync</c>；<c>SetAccessToken</c> 等 setter 应在并发调用前完成。
+// 京东开放平台（JOS）客户端（支持 WithAccessToken 多租户派生与限流退避重试）。
 public class JdClient {
-    // 协议级参数名（京东网关约定）。
     static string PARAM_JSON = "360buy_param_json";
     static string PARAM_METHOD = "method";
     static string PARAM_APP_KEY = "app_key";
@@ -40,8 +29,8 @@ public class JdClient {
     int timeoutMs;
     int maxRetries;
     int tzOffsetMinutes;
+    ExternalCallPolicy callPolicy;
 
-    // 用 appKey / appSecret 创建客户端，默认指向正式网关
     public JdClient(string appKey, string appSecret) {
         this.appKey = appKey;
         this.appSecret = appSecret;
@@ -53,15 +42,31 @@ public class JdClient {
         this.timeoutMs = 30000;
         this.maxRetries = 3;
         this.tzOffsetMinutes = 480;
+        this.callPolicy = null;
     }
 
-    // 设置 OAuth access_token（调用需授权的接口时必填）。
+    public string AccessToken { get { return this.accessToken; } }
+
     public JdClient SetAccessToken(string token) {
-        this.accessToken = token;
+        this.accessToken = token == null ? "" : token;
         return this;
     }
 
-    // 指向另一个网关地址（沙箱 / 自建代理）。
+    // 派生携带独立 access_token 的轻量会话（适合多店铺并发复用配置）。
+    public JdClient WithAccessToken(string token) {
+        JdClient copy = new JdClient(this.appKey, this.appSecret);
+        copy.accessToken = token == null ? "" : token;
+        copy.host = this.host;
+        copy.port = this.port;
+        copy.path = this.path;
+        copy.useTls = this.useTls;
+        copy.timeoutMs = this.timeoutMs;
+        copy.maxRetries = this.maxRetries;
+        copy.tzOffsetMinutes = this.tzOffsetMinutes;
+        copy.callPolicy = this.callPolicy;
+        return copy;
+    }
+
     public JdClient Server(string host, int port, string path, bool useTls) {
         this.host = host;
         this.port = port;
@@ -70,31 +75,40 @@ public class JdClient {
         return this;
     }
 
-    // 时间戳使用的时区偏移（分钟），默认 480（<c>+0800</c>，京东网关所在时区）。
-    // 例：印度 <c>TimeZoneOffset(330)</c>（+0530）、UTC <c>TimeZoneOffset(0)</c>。
-    // 这里按网关时区显式配置而不是跟随运行机器：同一套签名参数在不同机器上
-    // 必须稳定，服务端也不能因为部署地时区变化而改变请求时间戳。
+    // 时间戳时区偏移（分钟），默认 480（+0800）。
     public JdClient TimeZoneOffset(int minutes) {
         this.tzOffsetMinutes = minutes;
         return this;
     }
 
-    // 请求超时（毫秒），默认 30000。
     public JdClient Timeout(int ms) {
         this.timeoutMs = ms;
         return this;
     }
 
-    // 网关限流（错误码 66）时的最大重试次数，默认 3；设 0 关闭重试。
-    // 退避是 <c>await Task.Delay</c>，不占线程。
+    // 网关限流（错误码 66）最大重试次数，默认 3；0 关闭重试。
     public JdClient MaxRetries(int n) {
         if (n < 0) { n = 0; }
         this.maxRetries = n;
         return this;
     }
 
-    // 执行一次调用。成功返回已剥掉信封的 <see cref="JdResponse"/>；
-    // 任何失败（本地校验、网络、网关错误码、业务错误码）都抛
+    public JdClient WithCallPolicy(ExternalCallPolicy policy) {
+        this.callPolicy = policy;
+        return this;
+    }
+
+    // 原始 JSON 参数兜底调用（未收录接口或自定义参数用）。
+    public async JdResponse CallAsync(string apiName, JsonValue param) {
+        JdRequest req = new JdRequest(apiName);
+        if (param != null && param.IsObject()) {
+            for (int i = 0; i < param.Count(); i = i + 1) {
+                req.SetValue(param.KeyAt(i), param.ValAt(i));
+            }
+        }
+        return await this.ExecuteAsync(req);
+    }
+
     public async JdResponse ExecuteAsync(JdRequest request) {
         if (request == null) {
             throw new JdException("client.paramError", "request 不能为空", "");
@@ -106,25 +120,36 @@ public class JdClient {
             throw new JdException("client.paramError", "appKey / appSecret 不能为空", "");
         }
 
-        string body = this.BuildBody(request);
-
-        HttpClient http = this.NewHttp();
         int attempt = 0;
         while (true) {
+            // 每次尝试重算 timestamp 与 sign，避免跨退避窗口签名过期。
+            string body = this.BuildBody(request);
             string raw = "";
+            int statusCode = 200;
             try {
-                raw = await http.PostAsync(this.path, body);
+                using (HttpClient http = this.NewHttp()) {
+                    http.SetHeader("Content-Type", "application/x-www-form-urlencoded");
+                    using (HttpResponse httpResp = await http.SendAsync("POST", this.path, body)) {
+                        statusCode = httpResp.statusCode;
+                        raw = httpResp.body;
+                    }
+                }
             } catch (Exception e) {
                 throw new JdException("client.networkError", e.Message, "");
             }
 
-            // 解析成功就返回；只有网关限流（错误码 66）才继续循环重试退避。
             JdResponse resp = null;
             JdException failure = null;
             try {
                 resp = JdResponse.Parse(raw);
             } catch (JdException e) {
                 failure = e;
+            }
+            if (statusCode < 200 || statusCode >= 300) {
+                if (resp != null || failure.Code == "client.badResponse") {
+                    throw new JdException("http." + Convert.ToString(statusCode),
+                        "HTTP " + Convert.ToString(statusCode), raw);
+                }
             }
             if (resp != null) { return resp; }
             if (failure.Code != "66" || attempt >= this.maxRetries) {
@@ -135,15 +160,15 @@ public class JdClient {
         }
     }
 
-    public HttpClient NewHttp() {
+    private HttpClient NewHttp() {
         HttpClient http = new HttpClient(this.host, this.port);
         if (this.useTls) { http.UseTls(); }
         http.SetTimeout(this.timeoutMs);
+        if (this.callPolicy != null) { http.SetCallPolicy(this.callPolicy); }
         return http;
     }
 
-    // 组装协议参数、算签名，编码成 form-urlencoded 请求体。
-    public string BuildBody(JdRequest request) {
+    private string BuildBody(JdRequest request) {
         Dictionary<string, string> p = new Dictionary<string, string>();
         p.Add(PARAM_JSON, request.ParamJson());
         p.Add(PARAM_METHOD, request.ApiName);
@@ -157,16 +182,11 @@ public class JdClient {
         return JdClient.FormEncode(p);
     }
 
-    // 京东要求的时间戳格式：<c>yyyy-MM-dd HH:mm:ss+0800</c>。
-    // 墙钟时间由 UTC 加上 <see cref="TimeZoneOffset"/> 得到，后缀就是同一个偏移，
-    // 两者永远自洽（原版 C# 取本机时区，这里改成显式配置，见 TimeZoneOffset）。
-    // 精度到秒；原版多带的 <c>.fff</c> 网关不要求，标准库 DateTime 也只到秒。
-    public string Timestamp() {
+    private string Timestamp() {
         return JdClient.FormatTimestamp(DateTime.UtcNow().ToUnixSeconds(),
                                         this.tzOffsetMinutes);
     }
 
-    // 把 Unix 秒按给定分钟偏移格式化成网关要求的时间戳。
     public static string FormatTimestamp(long unixSeconds, int offsetMinutes) {
         DateTime wall = DateTime.FromUnixSeconds(unixSeconds + offsetMinutes * 60);
         string sign = "+";
@@ -177,13 +197,17 @@ public class JdClient {
         return wall.ToString() + sign + hh + mm;
     }
 
-    public static string Pad2(int n) {
-        if (n < 10 && n >= 0) { return "0" + Convert.ToString(n); }
+    private static string Pad2(int n) {
+        if (n >= 0 && n < 100) {
+            byte[] buf = new byte[2];
+            buf[0] = (byte)(48 + n / 10);
+            buf[1] = (byte)(48 + n % 10);
+            return buf.ToStr(0, 2);
+        }
         return Convert.ToString(n);
     }
 
-    // 把参数字典编码成 application/x-www-form-urlencoded 请求体。
-    public static string FormEncode(Dictionary<string, string> p) {
+    private static string FormEncode(Dictionary<string, string> p) {
         StringBuilder sb = new StringBuilder();
         List<string> ks = p.Keys;
         int n = ks.Count;

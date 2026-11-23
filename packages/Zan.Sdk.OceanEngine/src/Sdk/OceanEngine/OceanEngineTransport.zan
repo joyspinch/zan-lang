@@ -1,0 +1,259 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Tls;
+using System.Text;
+
+namespace Sdk.OceanEngine;
+
+// 巨量引擎各平台共享的 HTTP/HTTPS 传输、令牌与限流退避层。
+public class OceanEngineTransport {
+    private string serverHost;
+    private int serverPort;
+    private bool useTls;
+    private int timeoutMs;
+    private int maxRetries;
+    private string accessToken;
+    private string appAccessToken;
+    private ExternalCallPolicy callPolicy;
+    private List<string>? tlsPins;
+    private CertPolicyFn? certPolicy;
+    private string clientCertificateFile;
+    private string clientPrivateKeyFile;
+
+    public OceanEngineTransport() {
+        this.serverHost = "";
+        this.serverPort = 443;
+        this.useTls = true;
+        this.timeoutMs = 30000;
+        this.maxRetries = 0;
+        this.accessToken = "";
+        this.appAccessToken = "";
+        this.callPolicy = ExternalCallPolicy.Default();
+        this.tlsPins = null;
+        this.certPolicy = null;
+        this.clientCertificateFile = "";
+        this.clientPrivateKeyFile = "";
+    }
+
+    public string AccessToken { get { return this.accessToken; } }
+    public string AppAccessToken { get { return this.appAccessToken; } }
+
+    public OceanEngineTransport CloneWithTokens(string newAccessToken, string newAppAccessToken) {
+        OceanEngineTransport copy = new OceanEngineTransport();
+        copy.serverHost = this.serverHost;
+        copy.serverPort = this.serverPort;
+        copy.useTls = this.useTls;
+        copy.timeoutMs = this.timeoutMs;
+        copy.maxRetries = this.maxRetries;
+        copy.accessToken = newAccessToken;
+        copy.appAccessToken = newAppAccessToken;
+        copy.callPolicy = this.callPolicy;
+        copy.tlsPins = this.tlsPins;
+        copy.certPolicy = this.certPolicy;
+        copy.clientCertificateFile = this.clientCertificateFile;
+        copy.clientPrivateKeyFile = this.clientPrivateKeyFile;
+        return copy;
+    }
+
+    public void SetAccessToken(string token) {
+        this.accessToken = token == null ? "" : token;
+    }
+
+    public void SetAppAccessToken(string token) {
+        this.appAccessToken = token == null ? "" : token;
+    }
+
+    public void Server(string host, int port, bool useTls = true) {
+        if (host == null || host.Length == 0 || port < 1 || port > 65535) {
+            throw new ArgumentException("网关必须有有效的 host 和 port");
+        }
+        this.serverHost = host;
+        this.serverPort = port;
+        this.useTls = useTls;
+    }
+
+    public void Timeout(int ms) {
+        if (ms > 0) { this.timeoutMs = ms; }
+    }
+
+    public void MaxRetries(int n) {
+        this.maxRetries = n < 0 ? 0 : n;
+    }
+
+    public void WithCallPolicy(ExternalCallPolicy policy) {
+        if (policy == null) {
+            this.callPolicy = ExternalCallPolicy.Default();
+            return;
+        }
+        if (policy.MaxRedirects() > 0) {
+            throw new ArgumentException("巨量引擎请求不允许重定向");
+        }
+        this.callPolicy = policy;
+    }
+
+    public void PinPublicKey(string spkiSha256Base64) {
+        if (spkiSha256Base64 != null && spkiSha256Base64.Length > 0) {
+            if (this.tlsPins == null) { this.tlsPins = new List<string>(); }
+            this.tlsPins.Add(spkiSha256Base64);
+        }
+    }
+
+    public void SetCertPolicy(CertPolicyFn fn) {
+        this.certPolicy = fn;
+    }
+
+    public void SetClientCertificate(string certFile, string keyFile) {
+        this.clientCertificateFile = certFile == null ? "" : certFile;
+        this.clientPrivateKeyFile = keyFile == null ? "" : keyFile;
+    }
+
+    public async OceanEngineResponse GetAsync(OceanEngineGateway gateway, string path, JsonValue? query,
+        OceanEngineCredential credential, string tokenOverride = "", string directArray = "") {
+        OceanEngineTransport.ValidatePath(path);
+        string target = OceanEngineTransport.EncodeQuery(path, query);
+        return await this.SendWithRetryAsync(gateway, "GET", target, "", "", credential,
+            tokenOverride, directArray, null);
+    }
+
+    public async OceanEngineResponse PostJsonAsync(OceanEngineGateway gateway, string path, JsonValue? body,
+        OceanEngineCredential credential, string tokenOverride = "", string directArray = "") {
+        OceanEngineTransport.ValidatePath(path);
+        JsonValue payload = body == null ? JsonValue.NewObject() : (JsonValue)body;
+        if (!payload.IsObject()) { throw new ArgumentException("JSON 请求体必须是对象"); }
+        return await this.SendWithRetryAsync(gateway, "POST", path, "application/json", payload.ToJson(),
+            credential, tokenOverride, directArray, null);
+    }
+
+    public async OceanEngineResponse PostMultipartAsync(OceanEngineGateway gateway, string path,
+        OceanEngineMultipart form, OceanEngineCredential credential, string tokenOverride = "",
+        string directArray = "") {
+        OceanEngineTransport.ValidatePath(path);
+        byte[] payload = form.Body(this.callPolicy.MaxRequestBytes());
+        return await this.SendWithRetryAsync(gateway, "POST", path, form.ContentType(), "",
+            credential, tokenOverride, directArray, payload);
+    }
+
+    private string ResolveToken(OceanEngineCredential credential, string tokenOverride) {
+        if (credential == OceanEngineCredential.None) { return ""; }
+        if (tokenOverride != null && tokenOverride.Length > 0) { return tokenOverride; }
+        if (credential == OceanEngineCredential.AccessToken) { return this.accessToken; }
+        if (credential == OceanEngineCredential.AppAccessToken) { return this.appAccessToken; }
+        return "";
+    }
+
+    private static string Host(OceanEngineGateway gateway) {
+        if (gateway == OceanEngineGateway.Api) { return "api.oceanengine.com"; }
+        if (gateway == OceanEngineGateway.Ad) { return "ad.oceanengine.com"; }
+        if (gateway == OceanEngineGateway.Open) { return "open.oceanengine.com"; }
+        throw new ArgumentException("未知的巨量引擎网关");
+    }
+
+    private static string CredentialHeader(OceanEngineCredential credential, string token) {
+        if (credential == OceanEngineCredential.None && token.Length == 0) { return ""; }
+        if (token.Length > 0) {
+            if (credential == OceanEngineCredential.AccessToken) { return "Access-Token"; }
+            if (credential == OceanEngineCredential.AppAccessToken) { return "App-Access-Token"; }
+        }
+        throw new ArgumentException("令牌与鉴权方式不匹配：请传入或配置对应类型的令牌");
+    }
+
+    private static void ValidatePath(string path) {
+        if (path == null || !path.StartsWith("/open_api/") || path.IndexOf("?") >= 0 || path.IndexOf("#") >= 0) {
+            throw new ArgumentException("path 须为 /open_api/ 下的路径，查询参数请单独传入");
+        }
+    }
+
+    private static string EncodeQuery(string path, JsonValue? query) {
+        if (query == null) { return path; }
+        if (!query.IsObject()) { throw new ArgumentException("查询参数必须是 JSON 对象"); }
+        StringBuilder target = new StringBuilder();
+        target.Append(path);
+        string separator = "?";
+        for (int i = 0; i < query.Count(); i = i + 1) {
+            JsonValue? value = query.ValAt(i);
+            if (value == null || value.IsNull()) { continue; }
+            target.Append(separator);
+            target.Append(Encoding.UrlEncode(query.KeyAt(i)));
+            target.Append("=");
+            target.Append(Encoding.UrlEncode(value.IsString() ? value.AsString("") : value.ToJson()));
+            separator = "&";
+        }
+        return target.ToString();
+    }
+
+    private async OceanEngineResponse SendWithRetryAsync(OceanEngineGateway gateway, string method, string target,
+        string contentType, string body, OceanEngineCredential credential, string tokenOverride,
+        string directArray, byte[]? binaryBody) {
+        string token = this.ResolveToken(credential, tokenOverride);
+        string authHeader = OceanEngineTransport.CredentialHeader(credential, token);
+        int attempt = 0;
+        while (true) {
+            try {
+                return await this.SendOnceAsync(gateway, method, target, contentType, body,
+                    authHeader, token, directArray, binaryBody);
+            } catch (OceanEngineException e) {
+                bool retryable = e.StatusCode == 429 || e.StatusCode == 503;
+                if (!retryable || attempt >= this.maxRetries) { throw e; }
+                attempt = attempt + 1;
+                int backoffMs = 100 * attempt;
+                await Task.Delay(backoffMs);
+            }
+        }
+    }
+
+    private async OceanEngineResponse SendOnceAsync(OceanEngineGateway gateway, string method, string target,
+        string contentType, string body, string authHeader, string token,
+        string directArray, byte[]? binaryBody) {
+        string host = OceanEngineTransport.Host(gateway);
+        if (this.serverHost.Length > 0) { host = this.serverHost; }
+        int status = 0;
+        string responseBody = "";
+        string requestId = "";
+        try {
+            using (HttpClient http = new HttpClient(host, this.serverPort)) {
+                if (this.useTls) {
+                    http.UseTls();
+                    if (this.tlsPins != null) {
+                        for (int pi = 0; pi < this.tlsPins.Count; pi = pi + 1) {
+                            http.PinPublicKey(this.tlsPins[pi]);
+                        }
+                    }
+                    if (this.certPolicy != null) { http.SetCertPolicy((CertPolicyFn)this.certPolicy); }
+                    if (this.clientCertificateFile.Length > 0 && this.clientPrivateKeyFile.Length > 0) {
+                        http.SetClientCertificate(this.clientCertificateFile, this.clientPrivateKeyFile);
+                    }
+                }
+                http.SetTimeout(this.timeoutMs);
+                http.SetCallPolicy(this.callPolicy);
+                if (http.CallPolicy().MaxRedirects() > 0) {
+                    throw new ArgumentException("巨量引擎请求不允许重定向");
+                }
+                if (contentType.Length > 0) { http.SetHeader("Content-Type", contentType); }
+                if (authHeader.Length > 0) { http.SetHeader(authHeader, token); }
+                HttpResponse received;
+                if (binaryBody != null) {
+                    byte[] rawBytes = (byte[])binaryBody;
+                    received = await http.SendBytesAsync(method, target, rawBytes, rawBytes.Length);
+                } else {
+                    received = await http.SendAsync(method, target, body);
+                }
+                using (HttpResponse response = received) {
+                    status = response.statusCode;
+                    responseBody = response.body;
+                    requestId = response.GetHeader("X-Tt-Logid");
+                    string headerId = response.GetHeader("X-Request-Id");
+                    if (headerId.Length > 0) { requestId = headerId; }
+                }
+            }
+        } catch (ArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            // 某些接口的 URL 包含令牌，传输错误不回显请求细节。
+            throw new OceanEngineException("client.networkError", "巨量引擎请求未完成", 0, "");
+        }
+        return OceanEngineResponse.Parse(status, responseBody, requestId, directArray);
+    }
+}
