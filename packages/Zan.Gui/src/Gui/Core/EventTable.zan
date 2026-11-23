@@ -1,0 +1,107 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui;
+
+// 每个控件类型一张事件表：事件名（含别名）→ UiEvent 成员名，以及设计器
+// 可见名单。由反射一次性构建并按类型缓存，控件不再逐个重写
+// BindEvent / TriggerEvent / Events 做字符串分派。
+//
+// 声明方式（字段或属性均可）：
+//   [Event] public UiEvent Close;                         // 设计器可见
+//   [Event(Alias = "Toggle")] public UiEvent Change;      // 可见，别名也列出
+//   [Event(Hidden = true, Alias = "NodeClick")] ...       // 不列入设计器
+//   [Event(Display = "Upload")] public UiEvent UploadStart; // 设计器以 Upload 列出
+// 未标注的 UiEvent 成员仍可按自身名字 BindEvent，只是不列入 Events()。
+// 生命周期四事件（Click/Resize/Show/Hide）由 Control 直接处理，不入表。
+public class EventTable {
+    private static Dict<string, EventTable> cache;
+
+    private Dict<string, string> members;
+    private List<string> listed;
+
+    private EventTable() {
+        members = new Dict<string, string>();
+        listed = new List<string>();
+    }
+
+    public static EventTable Of(Control c) {
+        TypeInfo t = c.GetType();
+        string key = t.FullName;
+        if (cache == null) { cache = new Dict<string, EventTable>(); }
+        if (cache.ContainsKey(key)) { return cache[key]; }
+        EventTable table = EventTable.Build(t);
+        cache[key] = table;
+        return table;
+    }
+
+    // 名称或别名对应的成员名；未知返回 ""。
+    public string MemberOf(string evt) {
+        if (members.ContainsKey(evt)) { return members[evt]; }
+        return "";
+    }
+
+    // 设计器可见的事件名（声明顺序）。返回独立副本。
+    public List<string> Listed() {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < listed.Count; i = i + 1) { copy.Add(listed[i]); }
+        return copy;
+    }
+
+    private static bool IsLifecycle(string name) {
+        return name == "Click" || name == "Resize" || name == "Show" || name == "Hide";
+    }
+
+    private static EventTable Build(TypeInfo t) {
+        EventTable table = new EventTable();
+        for (int i = 0; i < t.FieldCount; i = i + 1) {
+            string type = t.GetFieldType(i);
+            if (type != "Gui.UiEvent" && type != "UiEvent") { continue; }
+            string name = t.GetFieldName(i);
+            if (EventTable.IsLifecycle(name)) { continue; }
+            table.members[name] = name;
+            string attrs = t.GetFieldCustomAttributes(i);
+            bool marked = false;
+            bool hidden = false;
+            string display = name;
+            string aliases = "";
+            int start = 0;
+            while (start < attrs.Length) {
+                int end = attrs.IndexOf(";", start);
+                if (end < 0) { end = attrs.Length; }
+                string entry = attrs.Substring(start, end - start);
+                start = end + 1;
+                if (entry == "Event=true") { marked = true; }
+                else if (entry == "Event.Hidden=true") { marked = true; hidden = true; }
+                else if (entry.StartsWith("Event.Display=")) {
+                    marked = true;
+                    display = entry.Substring(14);
+                    table.members[display] = name;
+                }
+                else if (entry.StartsWith("Event.Alias=")) {
+                    marked = true;
+                    aliases = entry.Substring(12);
+                }
+            }
+            if (aliases != "") { table.AddAliases(aliases, name, !hidden); }
+            if (marked && !hidden) { table.listed.Add(display); }
+        }
+        return table;
+    }
+
+    // 别名表是空格分隔的名字列表。
+    // 可见事件的别名同样列入设计器名单（设计器字段类型按别名承诺事件）。
+    private void AddAliases(string list, string member, bool visible) {
+        int start = 0;
+        while (start < list.Length) {
+            int end = list.IndexOf(" ", start);
+            if (end < 0) { end = list.Length; }
+            if (end > start) {
+                string alias = list.Substring(start, end - start);
+                members[alias] = member;
+                if (visible) { listed.Add(alias); }
+            }
+            start = end + 1;
+        }
+    }
+}

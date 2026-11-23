@@ -2,7 +2,8 @@ using System;
 using Gui;
 using Gui.Widget;
 
-// 单一事件槽支持无参与 sender 订阅，触发顺序先无参后 sender。
+// 单一订阅通道：Add/+=/On*/BindEvent 按处理器形状重载，无参与 sender
+// 处理器共用一个 UiEvent，触发顺序先无参后 sender，Count() 计全部。
 // Click 仅由 Control 持有；按名称接线、链式订阅与直接访问共用此槽。
 // WidgetEvents 仅保留其余路由事件，sender-only 订阅也计入 Any()。
 // 期望输出：ALL PASS。
@@ -25,71 +26,70 @@ class SenderChannelTest {
         Control a = new Button();
         Control b = new Button();
 
-        // UiEvent 双通道：RaiseS 先无参后带 sender，RaiseIfS 门控。
+        // 单通道：Raise 先无参后带 sender，RaiseIf 门控。
         UiEvent ev = new UiEvent();
         ev.Add(() => { oldHits = oldHits + 1; });
-        ev.AddS((Control s) => { sHits = sHits + 1; lastS = s; });
-        ev.RaiseS(a);
-        ev.RaiseIfS(false, b);
-        ev.RaiseIfS(true, b);
+        ev.Add((Control s) => { sHits = sHits + 1; lastS = s; });
+        ev.Raise(a);
+        ev.RaiseIf(false, b);
+        ev.RaiseIf(true, b);
         Check("old channel fired 2x", oldHits == 2);
         Check("sender channel fired 2x", sHits == 2);
         Check("last sender is b", lastS == b);
-        Check("CountS==1", ev.CountS() == 1);
-        Check("CountAll==2", ev.CountAll() == 2);
+        Check("Count counts both shapes", ev.Count() == 2);
 
-        // RemoveS 只摘 sender 通道最近一个相同注册项。
+        // Remove(ControlEvent) 只摘最近一个相同注册项。
         UiEvent ev2 = new UiEvent();
         ControlEvent h = (Control s) => { };
-        ev2.AddS(h);
-        ev2.AddS(h);
-        ev2.RemoveS(h);
-        Check("RemoveS removes one", ev2.CountS() == 1);
-        ev2.RemoveS(h);
-        Check("RemoveS removes again", ev2.CountS() == 0);
+        ev2.Add(h);
+        ev2.Add(h);
+        ev2.Remove(h);
+        Check("Remove removes one", ev2.Count() == 1);
+        ev2.Remove(h);
+        Check("Remove removes again", ev2.Count() == 0);
 
         // WidgetEvents 的 sender-only 订阅计入门控，Click 不再有第二个槽。
         WidgetEvents w = new WidgetEvents();
         Check("Any empty", w.Any() == false);
-        Check("unknown name rejected", w.AddByNameS("Nope", (Control s) => { }) == false);
-        Check("Click belongs to Control", w.AddByNameS("Click", (Control s) => { }) == false);
-        Check("AddByNameS DoubleClick", w.AddByNameS("DoubleClick", (Control s) => { }) == true);
+        Check("unknown name rejected", w.Named("Nope") == null);
+        Check("Click belongs to Control", w.Named("Click") == null);
+        UiEvent dbl = w.Named("DoubleClick");
+        if (dbl != null) { dbl.Add((Control s) => { }); }
         Check("Any after sender-only", w.Any() == true);
-        Check("DoubleClick CountS==1", w.DoubleClick.CountS() == 1);
+        Check("DoubleClick Count==1", w.DoubleClick.Count() == 1);
 
-        // Panel 与 Button 的链式接线都经过基类 BindEventS。
+        // Panel 与 Button 的链式接线都经过基类 BindEvent。
         Control c = new Panel();
-        c.OnClickS((Control s) => { sHits = sHits + 100; lastS = s; });
-        Check("OnClickS routed to Click", c.Click.CountS() == 1);
-        c.OnChangeS((Control s) => { });
-        Check("OnChangeS ignored on base (no Change channel)", c.Click.CountS() == 1);
+        c.OnClick((Control s) => { sHits = sHits + 100; lastS = s; });
+        Check("OnClick(sender) routed to Click", c.Click.Count() == 1);
+        c.OnChange((Control s) => { });
+        Check("OnChange ignored on base (no Change event)", c.Click.Count() == 1);
 
-        // 旧通道不受影响：OnClick/+= 继续可用且与 sender 通道共存。
+        // 无参形状与 sender 形状共存于同一事件。
         c.OnClick(() => { oldHits = oldHits + 100; });
         c.Click.Add(() => { oldHits = oldHits + 1000; });
-        Check("old OnClick registered", c.Click.Count() == 2);
-        Check("both channels coexist", c.Click.CountAll() == 3);
+        Check("both shapes coexist", c.Click.Count() == 3);
 
-        // RaiseS 全链路：两通道都触发，sender 正确。
-        c.Click.RaiseIfS(true, c);
-        Check("RaiseS old channel", oldHits == 1102);
-        Check("RaiseS sender channel", sHits == 102);
-        Check("RaiseS sender is c", lastS == c);
+        // Raise 全链路：两种处理器都触发，sender 正确。
+        c.Click.RaiseIf(true, c);
+        Check("Raise plain handlers", oldHits == 1102);
+        Check("Raise sender handlers", sHits == 102);
+        Check("Raise sender is c", lastS == c);
 
-        // Button 特化：OnClickS/OnClick 都路由进 Button 的语义 Click。
+        // Button：两种形状的 OnClick 都路由进同一个 Click。
         Button btn = new Button();
-        btn.OnClickS((Control s) => { sHits = sHits + 1; lastS = s; });
-        Check("Button OnClickS routes to semantic Click", btn.Click.CountS() == 1);
+        btn.OnClick((Control s) => { sHits = sHits + 1; lastS = s; });
+        Check("Button OnClick(sender) routes to Click", btn.Click.Count() == 1);
         btn.OnClick(() => { oldHits = oldHits + 1; });
-        Check("Button OnClick routes to semantic Click", btn.Click.Count() == 1);
+        Check("Button OnClick routes to Click", btn.Click.Count() == 2);
 
-        // 生命周期 OnShowS/OnHideS 走 AddS。
+        // 生命周期 OnShow/OnHide 的 sender 形状。
         Control d = new Button();
-        d.OnShowS((Control s) => { lastS = s; sHits = sHits + 1; });
-        d.OnHideS((Control s) => { lastS = s; sHits = sHits + 1; });
-        d.BindEventS("Resize", (Control s) => { lastS = s; sHits = sHits + 1; });
-        Check("OnShowS", d.Show.CountS() == 1);
-        Check("OnHideS", d.Hide.CountS() == 1);
+        d.OnShow((Control s) => { lastS = s; sHits = sHits + 1; });
+        d.OnHide((Control s) => { lastS = s; sHits = sHits + 1; });
+        d.BindEvent("Resize", (Control s) => { lastS = s; sHits = sHits + 1; });
+        Check("OnShow(sender)", d.Show.Count() == 1);
+        Check("OnHide(sender)", d.Hide.Count() == 1);
         d.TriggerEvent("Show");
         d.TriggerEvent("Hide");
         d.TriggerEvent("Resize");

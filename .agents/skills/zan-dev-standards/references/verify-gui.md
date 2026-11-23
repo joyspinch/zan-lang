@@ -51,7 +51,7 @@
 
 - **先分清事件通道，再声明"路径已被点击验证"**：控件事件是双通道。Button
   这类控件有专属 `UiEvent Click` 字段（Button.zan:64），处理器经重载的
-  AddByName 路由进专属字段，点击在 `Ui.Activate` 命中后 `Click.PostS(this)`
+  EventTable 路由进专属字段，点击在 `Ui.Activate` 命中后 `Click.Post(this)`
   直发（:248）；`On.Fire(app, wid, this)`（:262）只广播通用 hub
   （WidgetEvents），对 Button 永远空转——hub 里没有订阅者。走 hub 的是
   FireCommon 自动接线、FireOn，以及 Checkbox/Dropdown/Input/InputNumber/
