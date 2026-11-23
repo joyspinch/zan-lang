@@ -1,0 +1,101 @@
+using System;
+using System.Net;
+
+/* 聊天室：在线会话表 + 命令解释器。
+ * Worker 的回调都跑在同一调度器的协程里，这里的静态表无需加锁；
+ * 若改成多 Worker 进程（SetCount > 1），在线表要换成共享存储。 */
+public class ChatRoom {
+    static List<Session> sessions = new List<Session>();
+    static int guestSeq = 0;
+
+    public static Session Join(Connection conn) {
+        guestSeq = guestSeq + 1;
+        Session s = new Session(conn, "guest" + Convert.ToString(guestSeq));
+        ChatRoom.Broadcast(s, "* " + s.nick + " 进入了聊天室");
+        sessions.Add(s);
+        return s;
+    }
+
+    public static Session Leave(Connection conn) {
+        Session s = ChatRoom.Find(conn);
+        if (s == null) { return null; }
+        sessions.Remove(s);
+        ChatRoom.Broadcast(s, "* " + s.nick + " 离开了聊天室");
+        return s;
+    }
+
+    public static Session Find(Connection conn) {
+        for (int i = 0; i < sessions.Count; i++) {
+            if (sessions[i].conn.GetId() == conn.GetId()) { return sessions[i]; }
+        }
+        return null;
+    }
+
+    /* 执行一行命令，返回要回给发送者的文本（每行以 \n 结尾；空串 = 不回复）。 */
+    public static string Execute(Session s, string line) {
+        string text = line.Trim();
+        if (text == "") { return ""; }
+        string cmd = text;
+        string arg = "";
+        int sp = text.IndexOf(" ");
+        if (sp > 0) {
+            cmd = text.Substring(0, sp);
+            arg = text.Substring(sp + 1).Trim();
+        }
+        cmd = cmd.ToUpper();
+
+        if (cmd == "HELP") {
+            return "命令：HELP | PING | TIME | ECHO <文本> | NICK <昵称> | SAY <文本> | WHO | QUIT\n";
+        }
+        if (cmd == "PING") { return "PONG\n"; }
+        if (cmd == "TIME") { return DateTime.LocalNow().ToString() + "\n"; }
+        if (cmd == "ECHO") { return arg + "\n"; }
+        if (cmd == "WHO") { return ChatRoom.Who(); }
+        if (cmd == "NICK") { return ChatRoom.Rename(s, arg); }
+        if (cmd == "SAY") {
+            if (arg == "") { return "ERR 用法：SAY <文本>\n"; }
+            int n = ChatRoom.Broadcast(s, "[" + s.nick + "] " + arg);
+            return "OK 已发送给 " + Convert.ToString(n) + " 人\n";
+        }
+        if (cmd == "QUIT") {
+            s.quitting = true;
+            return "BYE\n";
+        }
+        if (cmd.Length > 16) { cmd = cmd.Substring(0, 16) + "…"; }
+        return "ERR 未知命令 " + cmd + "，输入 HELP 查看\n";
+    }
+
+    static string Rename(Session s, string nick) {
+        if (nick == "" || nick.Length > 20 || nick.IndexOf(" ") >= 0) {
+            return "ERR 昵称需为 1~20 个字符且不含空格\n";
+        }
+        for (int i = 0; i < sessions.Count; i++) {
+            if (sessions[i] != s && sessions[i].nick == nick) { return "ERR 昵称已被占用\n"; }
+        }
+        string old = s.nick;
+        s.nick = nick;
+        ChatRoom.Broadcast(s, "* " + old + " 改名为 " + nick);
+        return "OK 你现在是 " + nick + "\n";
+    }
+
+    static string Who() {
+        string r = "在线 " + Convert.ToString(sessions.Count) + " 人：";
+        for (int i = 0; i < sessions.Count; i++) {
+            if (i > 0) { r = r + ", "; }
+            r = r + sessions[i].nick;
+        }
+        return r + "\n";
+    }
+
+    /* 发给除 from 以外的所有在线会话，返回送达人数。 */
+    static int Broadcast(Session from, string message) {
+        int sent = 0;
+        for (int i = 0; i < sessions.Count; i++) {
+            Session other = sessions[i];
+            if (other == from || other.conn.IsClosed()) { continue; }
+            other.conn.Send(message + "\n");
+            sent = sent + 1;
+        }
+        return sent;
+    }
+}

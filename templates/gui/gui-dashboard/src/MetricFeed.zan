@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+
+/* 仪表板的数据源：一组指标 + 每个指标的最新值、上一次的值与历史窗口。
+ * 这里用随机游走模拟采样；接真实系统时只改 Sample() —— 换成读接口、
+ * 数据库或设备，界面代码一行不用动。界面只认 Metric 的公开字段。 */
+public class Metric {
+    public string Name;
+    public string Unit;
+    // 数值统一按"十分之一"存整数（123 = 12.3），避免浮点格式化的尾巴。
+    public int Tenths;
+    public int PrevTenths;
+    // 进度条用的目标值（同为十分之一单位）。
+    public int GoalTenths;
+    // 显示几位小数（0 或 1）：台数、条数这类计数量不该带小数。
+    public int Decimals;
+    // 越大越好（吞吐、产量）还是越小越好（报警、能耗）：决定涨跌配色。
+    public bool HigherIsBetter;
+    int lo;
+    int hi;
+    int step;
+
+    // ---- 卡片视图字段：HTML 行模板里的 bind / :class 直接绑这些名字 ----
+    public string ValueText = "";
+    public string GoalText = "";
+    public string TrendText = "";
+    // :class 绑定会整串替换 class，所以这里写全。
+    public string TrendClass = "small";
+    public int Completion = 0;
+
+    public Metric(string name, string unit, int decimals, int start, int lo, int hi, int step, int goal, bool higherIsBetter) {
+        Name = name;
+        Decimals = decimals;
+        Unit = unit;
+        Tenths = start;
+        PrevTenths = start;
+        GoalTenths = goal;
+        HigherIsBetter = higherIsBetter;
+        this.lo = lo;
+        this.hi = hi;
+        this.step = step;
+    }
+
+    // 有界随机游走：每拍在 ±step 内漂移，碰边界反弹。
+    public void Walk(Random rng) {
+        PrevTenths = Tenths;
+        int next = Tenths + rng.Between(0 - step, step + 1);
+        if (next < lo) { next = lo + (lo - next); }
+        if (next > hi) { next = hi - (next - hi); }
+        Tenths = next;
+    }
+
+    // "12.3 单位" / "1,260 台"
+    public string Display() {
+        return Format(Tenths) + " " + Unit;
+    }
+
+    // 按本指标的小数位格式化一个十分之一单位的值。
+    public string Format(int tenths) {
+        if (Decimals == 1) { return MetricFeed.Fixed1(tenths); }
+        return Convert.ToString(tenths / 10);
+    }
+
+    // 相对上一拍的变化，形如 "▲ 1.2%"；没变化给 "— 0.0%"。
+    public string Trend() {
+        if (PrevTenths == 0) { return "— 0.0%"; }
+        int permille = (Tenths - PrevTenths) * 1000 / PrevTenths;
+        if (permille > 0) { return "▲ " + MetricFeed.Fixed1(permille) + "%"; }
+        if (permille < 0) { return "▼ " + MetricFeed.Fixed1(0 - permille) + "%"; }
+        return "— 0.0%";
+    }
+
+    // 本拍是向好还是向坏（持平算向好）。
+    public bool Improving() {
+        if (HigherIsBetter) { return Tenths >= PrevTenths; }
+        return Tenths <= PrevTenths;
+    }
+
+    // 把当前值投影成卡片上显示的文字与样式。
+    public void UpdateView() {
+        ValueText = Display();
+        GoalText = (HigherIsBetter ? "目标 " : "上限 ") + Format(GoalTenths) + " " + Unit;
+        TrendText = Trend();
+        // 涨跌配色看"向好/向坏"，不看数值方向：报警数下降是好事。
+        TrendClass = Improving() ? "small success" : "small error";
+        Completion = Percent();
+    }
+
+    // 相对目标的完成度 0..100。
+    public int Percent() {
+        if (GoalTenths <= 0) { return 0; }
+        int p = Tenths * 100 / GoalTenths;
+        if (p < 0) { return 0; }
+        if (p > 100) { return 100; }
+        return p;
+    }
+}
+
+public class MetricFeed {
+    public List<Metric> Metrics;
+    // 第一个指标（吞吐量）的历史窗口，喂给折线图。
+    public List<int> History;
+    public int HistoryLimit;
+    public int Samples;
+    Random rng;
+
+    public MetricFeed() {
+        rng = new Random(20261123);
+        Metrics = new List<Metric>();
+        // 数值均为"十分之一"单位：84200 = 8420.0。
+        //                      名称          单位     小数 初值    下限    上限    步长  目标    越大越好
+        Metrics.Add(new Metric("吞吐量",     "req/s", 0, 84200, 60000, 98000, 2600, 90000, true));
+        Metrics.Add(new Metric("在线设备",   "台",    0, 12600, 11000, 13200, 120,  13200, true));
+        Metrics.Add(new Metric("未处理报警", "条",    0, 60,    0,     180,   20,   200,   false));
+        Metrics.Add(new Metric("能耗",       "kW",    1, 3215,  2800,  3900,  60,   4000,  false));
+        Metrics.Add(new Metric("今日产量",   "件",    0, 51200, 48000, 99000, 900,  90000, true));
+        Metrics.Add(new Metric("队列积压",   "条",    0, 2400,  0,     9000,  700,  10000, false));
+        HistoryLimit = 30;
+        History = new List<int>();
+        for (int i = 0; i < HistoryLimit; i = i + 1) {
+            Sample();
+        }
+        Samples = 0;
+    }
+
+    // 采一拍：所有指标前进一步，历史窗口右移。
+    public void Sample() {
+        for (int i = 0; i < Metrics.Count; i = i + 1) {
+            Metrics[i].Walk(rng);
+        }
+        // 产量只增不减：用当前值与上次值的较大者，模拟累计量。
+        Metric output = Metrics[4];
+        if (output.Tenths < output.PrevTenths) { output.Tenths = output.PrevTenths + 100; }
+        for (int i = 0; i < Metrics.Count; i = i + 1) {
+            Metrics[i].UpdateView();
+        }
+        History.Add(Metrics[0].Tenths / 10);
+        while (History.Count > HistoryLimit) { History.RemoveAt(0); }
+        Samples = Samples + 1;
+    }
+
+    // 1234 -> "123.4"；-5 -> "-0.5"。
+    public static string Fixed1(int tenths) {
+        string sign = "";
+        int v = tenths;
+        if (v < 0) { sign = "-"; v = 0 - v; }
+        return sign + Convert.ToString(v / 10) + "." + Convert.ToString(v % 10);
+    }
+}
