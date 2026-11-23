@@ -11,7 +11,7 @@ function read(file) { return fs.readFileSync(path.join(repo, file), 'utf8'); }
 for (const root of [mvc, 'templates/server/server-collab', 'templates/server/server-licensing']) {
   const layout = read(root + '/views/Admin/layout.html');
   assert.match(layout, /\/static\/js\/admin-request-traces\.js\?v=6" defer/);
-  assert.match(layout, /\/static\/css\/admin-request-traces\.css\?v=4"/);
+  assert.match(layout, /\/static\/css\/admin-request-traces\.css\?v=5"/);
   const view = read(root + '/views/Admin/Monitor/MonitorController.Index.html');
   assert.match(view, /<zan-request-traces[^>]*data-source="\/admin\/monitor\/request-traces"/);
   assert.match(view, /data-stream="\/admin\/monitor\/monitor\/stream"/);

@@ -252,7 +252,7 @@
       if (!scrollHost) { return; }
       var need = table.offsetWidth > scrollHost.clientWidth + 1;
       scrollHost.style.overflowX = need ? 'auto' : 'visible';
-      scrollHost.style.overflowY = 'visible';
+      scrollHost.style.overflowY = need ? 'clip' : 'visible';
     }
     fitScrollX();
     window.addEventListener('resize', fitScrollX);

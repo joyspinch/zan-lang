@@ -951,8 +951,8 @@
       if (opts.drawer || window.innerWidth <= 768) { return; }
       var w = box.offsetWidth;
       var h = box.offsetHeight;
-      var left = Math.max(8, (window.innerWidth - w) / 2);
-      var top = Math.max(16, (window.innerHeight - h) / 2.6);
+      var left = Math.max(16, (window.innerWidth - w) / 2);
+      var top = Math.max(24, (window.innerHeight - h) / 2.4);
       box.style.left = Math.round(left) + 'px';
       box.style.top = Math.round(top) + 'px';
     }
@@ -1034,16 +1034,16 @@
       },
       confirm: function (text, onOk, title, opts) {
         opts = opts || {};
-        var w = shell({ title: title || '确认', width: '340px', bare: true,
+        var w = shell({ title: title || '确认', bare: true,
                         maskClose: false });
         w.box.classList.add('ask');
         w.body.innerHTML = '';
         w.body.appendChild(node('p', 'ask-text', text));
         var foot = node('div', 'ask-ops');
-        var no = node('button', 'btn sm', opts.cancelText || '取消');
+        var no = node('button', 'btn', opts.cancelText || '取消');
         no.type = 'button';
         no.onclick = function () { Layer.close(w.id); };
-        var yes = node('button', 'btn sm ' + (opts.danger ? 'danger solid' : 'primary'),
+        var yes = node('button', 'btn ' + (opts.danger ? 'danger solid' : 'primary'),
                        opts.okText || '确定');
         yes.type = 'button';
         yes.onclick = function () { Layer.close(w.id); onOk(); };
@@ -1170,7 +1170,7 @@
   function dialog(url, wide, title, width) {
     return Layer.open({ url: url, title: title || '编辑',
                         wide: !!wide,
-                        width: width || (wide ? '840px' : '580px') });
+                        width: width || undefined });
   }
 
   function closeDialog() { Layer.closeTop(); }
@@ -1320,7 +1320,7 @@
       ev.preventDefault();
       Layer.drawer({ url: dr.getAttribute('href') || dr.getAttribute('data-drawer'),
                      title: dr.getAttribute('data-title') || dr.textContent.trim(),
-                     width: dr.getAttribute('data-width') || '420px' });
+                     width: dr.getAttribute('data-width') || undefined });
       return;
     }
     var ft = ev.target.closest('.form-tab');
