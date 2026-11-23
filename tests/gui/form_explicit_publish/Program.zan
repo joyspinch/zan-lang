@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+class PresetRow {
+    public string label = "Quick preset";
+}
+
+class PublishedEditorBase : Form {
+    public string draftText = "draft";
+    public int presetCalls;
+
+    public void ApplyPreset(string preset) {
+        this.presetCalls = this.presetCalls + 1;
+        this.draftText = preset;
+    }
+}
+
+class PublishedEditor : PublishedEditorBase {
+    public List<object> rows = new List<object>();
+    public string status = "starting";
+    public int saveCalls;
+    public int loadCalls;
+    public bool loadedWithDocument;
+    public bool closeAfterLoad;
+
+    public void Register(ModelBinder binder) {
+        binder.Handle("save", this.Save);
+        binder.HandleArg("apply-preset", this.ApplyPreset);
+    }
+
+    void Save() {
+        this.saveCalls = this.saveCalls + 1;
+        this.status = "Saved " + this.draftText;
+    }
+
+    void OnLoad(Form window) {
+        this.loadCalls = this.loadCalls + 1;
+        this.loadedWithDocument = window == this && window.docRoot.Find("save") != null;
+        this.status = "Ready";
+        this.rows.Add(new PresetRow());
+        if (this.closeAfterLoad) {
+            window.GetApp().Post(() => {
+                try {
+                    ((Button)window.docRoot.Find("save")).Click.Raise();
+                } finally {
+                    window.Close();
+                }
+            });
+        }
+    }
+}
+
+class PublishedChild : ChildWindow {
+    public List<object> rows = new List<object>();
+    public string draftText = "child draft";
+    public string status = "Starting";
+    public int saveCalls;
+    public bool createdWithView;
+
+    protected override void OnCreate() {
+        this.createdWithView = this.View().Find("save") is Button;
+        this.status = "Child ready";
+        this.rows.Add(new PresetRow());
+    }
+
+    public void Register(ModelBinder binder) {
+        binder.Handle("save", this.Save);
+        binder.HandleArg("apply-preset", this.ApplyPreset);
+    }
+
+    void Save() {
+        this.saveCalls = this.saveCalls + 1;
+        this.status = "Child saved";
+    }
+
+    void ApplyPreset(string preset) {
+        this.draftText = preset;
+    }
+}
+
+class PublishCase {
+    static Control CreateControl(string kind) {
+        switch (kind) {
+            case "Button": return new Button();
+            case "Input": return new Input();
+            case "Label": return new Label();
+            default: return null;
+        }
+    }
+
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static void CheckMissingDocument(PublishedEditor window) {
+        Control root = window.docRoot;
+        try {
+            window.ShowOffscreenWith("editor.html", CreateControl, window.Register);
+        } catch (FileNotFoundException ex) {
+            Require(ex.Message == "Embedded window document not found: editor.html", "missing document diagnostic");
+            Require(window.docRoot == root && window.loadCalls == 1, "missing document replaced the live tree");
+            return;
+        }
+        throw new Exception("missing logical name unexpectedly resolved");
+    }
+
+    static void CheckMissingHandler(PublishedEditor window, string document) {
+        Control root = window.docRoot;
+        try {
+            window.ShowOffscreenWith(document, CreateControl, (ModelBinder binder) => { });
+        } catch (InvalidOperationException ex) {
+            Require(ex.Message.Contains("save") && ex.Message.Contains("apply-preset"), "missing handler diagnostic");
+            Require(window.docRoot == root && window.loadCalls == 1, "invalid registration replaced the live tree");
+            return;
+        }
+        throw new Exception("missing registrations unexpectedly resolved");
+    }
+
+    static void CheckChild(string document, App parent) {
+        PublishedChild child = new PublishedChild();
+        if (parent != null) {
+            child.OpenHostWith(parent, document, CreateControl, child.Register);
+        } else {
+            child.OpenStandaloneWith(document, CreateControl, child.Register);
+        }
+        try {
+            Require(child.IsOpen() && child.createdWithView, "child view was missing during OnCreate");
+            Control view = child.View();
+            Control input = view.Find("name");
+            Control status = view.Find("status");
+            Require(input != null && input.GetProp("value") == "child draft", "child input not bound");
+            Require(status != null && status.GetProp("text") == "Child ready", "child status not bound");
+            Button save = (Button)view.Find("save");
+            int background = save.ResolvedStyle(child.Host()).BgOr(0);
+            Require(background == Color.FromRGB(16, 32, 48).ToARGB(), "child document CSS not applied");
+            save.Click.Raise();
+            Require(child.saveCalls == 1, "child save handler did not fire once");
+            Control actions = view.Find("actions");
+            Require(actions.ChildCount() == 3, "child template did not expand");
+            ((Button)actions.ChildAt(2).ChildAt(1)).Click.Raise();
+            Require(child.draftText == "quick", "child template handler lost its argument");
+        } finally {
+            child.Close();
+        }
+    }
+
+    static int Main() {
+        string document = "publish-fixture/views/editor.html";
+        string fragment = "publish-fixture/fragments/actions.html";
+        bool aliasesOnDisk = Directory.FileExistsUtf8(document) || Directory.FileExistsUtf8(fragment);
+        bool sourcesOnDisk = Directory.FileExistsUtf8("main.html") || Directory.FileExistsUtf8("actions.html");
+        Require(!aliasesOnDisk && !sourcesOnDisk, "working directory contains loose HTML fixtures");
+
+        PublishedEditor window = new PublishedEditor();
+        window.ShowOffscreenWith(document, CreateControl, window.Register);
+        App app = window.GetApp();
+        try {
+            Require(window.loadCalls == 1 && window.loadedWithDocument, "OnLoad did not receive the assembled form");
+            Require(window.Title() == "Published editor", "embedded window title missing");
+            window.CaptureSnapshot();
+
+            Control input = window.docRoot.Find("name");
+            Control status = window.docRoot.Find("status");
+            Control actions = window.docRoot.Find("actions");
+            Control save = window.docRoot.Find("save");
+            Require(input is Input && status is Label, "main document controls missing");
+            Require(save is Button && actions != null, "embedded fragment controls missing");
+            Require(input.GetProp("value") == "draft" && status.GetProp("text") == "Ready", "initial binding failed");
+
+            input.SetProp("value", "typed draft");
+            window.CaptureSnapshot();
+            Require(window.draftText == "typed draft", "input did not write back");
+
+            app.needsRedraw = false;
+            ((Button)save).Click.Raise();
+            Require(window.saveCalls == 1 && app.needsRedraw, "Save did not fire once and request a redraw");
+            window.CaptureSnapshot();
+            Require(status.GetProp("text") == "Saved typed draft", "Save did not update the bound label");
+
+            Require(actions.ChildCount() == 3, "template did not clone a row into the fragment");
+            Control row = actions.ChildAt(2);
+            Require(row.ChildCount() == 2 && row.ChildAt(0).GetProp("text") == "Quick preset", "cloned row lost its scope");
+            Control preset = row.ChildAt(1);
+            Require(preset is Button, "cloned row lost its factory-created button");
+            ((Button)preset).Click.Raise();
+            Require(window.presetCalls == 1 && window.draftText == "quick", "inherited handler lost its argument or fired twice");
+            window.CaptureSnapshot();
+            Require(input.GetProp("value") == "quick", "model change did not reach the input");
+
+            CheckMissingDocument(window);
+            CheckMissingHandler(window, document);
+            CheckChild(document, app);
+            CheckChild(document, null);
+
+            PublishedEditor dialog = new PublishedEditor();
+            dialog.owner = window;
+            dialog.closeAfterLoad = true;
+            app.needsRedraw = false;
+            dialog.ShowDialogWith(document, CreateControl, dialog.Register);
+            Require(dialog.loadedWithDocument && dialog.saveCalls == 1, "dialog did not wire its save action once");
+            Require(app.needsRedraw, "dialog did not request a redraw of its owner");
+        } finally {
+            app.StopLoop();
+            app.canvas.Destroy();
+        }
+        Console.WriteLine("GUI_FORM_EXPLICIT_PUBLISH_OK");
+        return 0;
+    }
+}

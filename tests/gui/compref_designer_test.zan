@@ -3,12 +3,14 @@ using System.Json;
 using System.Collections.Generic;
 using Gui;
 using Gui.Widget;
+#if !GUI_SCOPED_COMPONENTS
 using Gui.Designer;
 
 class CompRefClickProbe {
     public int clicks;
     public void OnClick(Control sender) { clicks = clicks + 1; }
 }
+#endif
 
 class CompRefDesignerTest {
     static int fails;
@@ -70,12 +72,54 @@ class CompRefDesignerTest {
             + "}";
     }
 
+    static Control CreateScopedChild(string kind) {
+        if (kind == "Button") { return new Button(); }
+        return null;
+    }
+
+    static Control CreateScoped(string kind) {
+        if (kind.ToLower() == "badgecard") {
+            return UserComponentRegistry.BuildWith(kind, CreateScoped);
+        }
+        return CreateScopedChild(kind);
+    }
+
+    static void TestScopedComponents() {
+        UserComponentRegistry.RegisterDefinition("BadgeCard", CompDoc());
+        Ok("component definition leaves the global factory unregistered", !ControlFactory.Has("BadgeCard"));
+
+        Control direct = UserComponentRegistry.BuildWith("BadgeCard", CreateScopedChild);
+        Ok("direct scoped component uses its widget factory", direct != null && direct.Find("InnerBtn") is Button);
+        Ok("omitted scoped widget is an Element", direct != null && direct.Find("InnerTitle") is Element);
+        if (direct != null) {
+            direct.SetProp("btnText", "Direct value");
+            Control directClone = Html.Clone(direct);
+            Ok("direct scoped clone rebuilds its supplied widget",
+                directClone != null && directClone != direct && directClone.Find("InnerBtn") is Button);
+            Ok("direct scoped clone keeps omitted widget as Element",
+                directClone != null && directClone.Find("InnerTitle") is Element);
+            Eq("direct scoped clone preserves instance property",
+                directClone == null ? "" : directClone.GetProp("btnText"), "Direct value");
+        }
+
+        App markupApp = App.CreateOffscreen("scoped component markup", 320, 200);
+        Control scoped = Html.LoadWith(markupApp, "<BadgeCard id='scoped-card' btnText='Scoped value'></BadgeCard>",
+            null, "", CreateScoped);
+        Control card = scoped == null ? null : scoped.Find("scoped-card");
+        Control clone = card == null ? null : Html.Clone(card);
+        Ok("HTML scoped clone rebuilds its supplied widget", clone != null && clone.Find("InnerBtn") is Button);
+        Eq("HTML scoped clone preserves instance property", clone == null ? "" : clone.GetProp("btnText"), "Scoped value");
+        markupApp.canvas.Destroy();
+    }
+
     static void Main() {
         fails = 0;
-
+        TestScopedComponents();
+#if GUI_SCOPED_COMPONENTS
+        if (fails == 0) { Console.WriteLine("GUI_SCOPED_COMPONENTS_OK"); }
+#else
         // 控件重建走 ControlFactory→HeavyControls 注册表（拉入收编后
         // 标准控件不再内联构造分支），先装注册表再动设计器。
-        ControlBootstrap.Install();
 
         Designer d = new Designer();
         List<UserComponent> comps = new List<UserComponent>();
@@ -264,5 +308,6 @@ class CompRefDesignerTest {
         editor.canvas.Destroy();
         UserComponentRegistry.SetAll(new List<UserComponent>());
         if (fails == 0) { Console.WriteLine("COMPREF_DESIGNER_OK"); }
+#endif
     }
 }

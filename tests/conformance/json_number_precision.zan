@@ -4,7 +4,68 @@ using System.Json;
 namespace Conf;
 
 class Prog {
+    static void CheckReaderNumbers() {
+        string[] tokens = new string[] {
+            "0", "-0", "001", "-7", "999999999999999999", "-999999999999999999",
+            "9223372036854775807", "-9223372036854775808", "-0.0", "1E+2", "-.5",
+            "+123", "12+34", "-1-2", "1e", "-", "e", "?", ""
+        };
+        int[] ends = new int[] { 1, 2, 3, 2, 18, 19, 19, 20, 4, 4, 3, 4, 5, 4, 2, 1, 1, 0, 0 };
+        for (int i = 0; i < tokens.Length; i++) {
+            string source = "[" + tokens[i] + "]";
+            JsonReader reader = JsonReader.Of(source);
+            reader.pos = 1;
+            JsonValue actual = reader.ReadNumber();
+            JsonValue expected = JsonValue.ParseNumberToken(source, 1, 1 + ends[i]);
+            if (reader.pos != 1 + ends[i] || actual.numIsInt != expected.numIsInt
+            || actual.numI != expected.numI || actual.numRaw != expected.numRaw
+            || NativeMemory.AsI64(actual.numD) != NativeMemory.AsI64(expected.numD)) {
+                throw new Exception("Lenient numeric token changed: " + tokens[i]);
+            }
+        }
+
+        JsonReader strict = JsonReader.OfStrict("[-999999999999999999,12+34]");
+        JsonValue partial = strict.ReadValue();
+        if (!strict.Failed() || strict.errPos != 26 || partial.Count() != 1
+        || partial.At(0).AsLong(0L) != -999999999999999999L) {
+            throw new Exception("Strict reader changed its numeric error or partial array");
+        }
+    }
+
+    static void CheckArrayNumbers() {
+        JsonValue ordinary = JsonValue.Parse("[2,3,4,5,6,7,8,9007199254740993]");
+        JsonValue item = ordinary.At(7);
+        if (item != ordinary.At(7) || item != ordinary.items[7]
+        || item.AsLong(0L) != 9007199254740993L) {
+            throw new Exception("Integer array lost exact values or stable nodes");
+        }
+        item.numI = 9007199254740995L;
+        if (ordinary.At(7).AsLong(0L) != 9007199254740995L) {
+            throw new Exception("Integer array node mutation no longer reaches the array");
+        }
+
+        string wide = "[9223372036854775807,-9223372036854775808,123456789012345678901,"
+        + "-123456789012345678901,1000000000000000000,1000000000000000001,"
+        + "1000000000000000002,1000000000000000003]";
+        JsonValue integers = JsonValue.Parse(wide);
+        if (integers.Count() != 8 || integers.numArr != null || integers.ToJson() != wide
+        || integers.At(1).AsLong(0L) != -9223372036854775807L - 1L || !integers.At(2).IsInt()) {
+            throw new Exception("Long integer array lost its original tokens");
+        }
+
+        string mixed = "[1.25,2e-2,3.5,4.125,5.5,6.5,7.5,9223372036854775807]";
+        if (JsonValue.Parse(mixed).ToJson() != mixed) {
+            throw new Exception("Floating array compacted a long integer token");
+        }
+        JsonValue floats = JsonValue.Parse("[1.25,2e-2,3.5,4.125,5.5,6.5,7.5,0.1250000000000000000]");
+        if (floats.numArr == null || floats.Count() != 8 || floats.At(7).AsDouble(0.0) != 0.125) {
+            throw new Exception("Floating array lost compact storage");
+        }
+    }
+
     static void Main() {
+        Prog.CheckReaderNumbers();
+        Prog.CheckArrayNumbers();
         int bad = 0;
         JsonValue v = JsonValue.Parse(
             "{\"a\":3.14159,\"b\":0.1,\"c\":1e-3,\"d\":1.25e3,"

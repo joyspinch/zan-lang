@@ -1,0 +1,115 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.External;
+using Sdk.Steam;
+
+class Program {
+    static int PORT = 9521;
+    static string lastStatsBody = "";
+
+    static async HttpResponse Handle(HttpRequest req) {
+        if (req.path.StartsWith("/ISteamUserStats/GetNumberOfCurrentPlayers/v1")) {
+            return HttpResponse.Json("{\"response\":{\"player_count\":12345,\"result\":1}}");
+        }
+        if (req.path.StartsWith("/ISteamUser/GetPlayerSummaries/v0002")) {
+            if (req.queryString.IndexOf("key=bad-key") >= 0) {
+                return HttpResponse.WithStatus(403, "Forbidden", "<html>Forbidden</html>");
+            }
+            return HttpResponse.Json("{\"response\":{\"players\":[{\"steamid\":\"76561198000000001\",\"personaname\":\"Alice\",\"personastate\":1,\"communityvisibilitystate\":3}]}}");
+        }
+        if (req.path.StartsWith("/ISteamUserStats/GetSchemaForGame/v2")) {
+            return HttpResponse.Json("{\"game\":{\"availableGameStats\":{\"achievements\":[{\"name\":\"ACH_WIN\",\"displayName\":\"Winner\",\"hidden\":1}]}}}");
+        }
+        if (req.path.StartsWith("/ISteamUserStats/SetUserStatsForGame/v1")) {
+            lastStatsBody = req.body;
+            return HttpResponse.Json("{\"response\":{\"result\":1}}");
+        }
+        if (req.path.StartsWith("/ISteamUserAuth/AuthenticateUserTicket/v1")) {
+            if (req.body.IndexOf("ticket=bad") >= 0) {
+                return HttpResponse.Json("{\"response\":{\"params\":{\"result\":101}}}");
+            }
+            return HttpResponse.Json("{\"response\":{\"params\":{\"result\":\"OK\",\"steamid\":\"76561198000000001\",\"ownersteamid\":\"76561198000000002\",\"vacbanned\":false,\"publisherbanned\":1}}}");
+        }
+        if (req.path.StartsWith("/IPlayerService/GetOwnedGames/v0001")) {
+            return HttpResponse.Json("{\"response\":{\"game_count\":1,\"games\":[{\"appid\":480,\"name\":\"Spacewar\",\"playtime_forever\":90,\"rtime_last_played\":1700000000}]}}");
+        }
+        return HttpResponse.WithStatus(404, "Not Found", "{}");
+    }
+
+    static SteamClient NewClient(string key) {
+        return new SteamClient(key, 480)
+            .PlainHttpMode()
+            .Server("127.0.0.1", PORT)
+            .WithCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp())
+            .Timeout(5000);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        try {
+            SteamClient steam = NewClient("steam-key");
+
+            SteamResponse online = await steam.GetNumberOfCurrentPlayersAsync();
+            Console.WriteLine("players=" + Convert.ToString(online.Int("response.player_count", 0)));
+
+            List<string> ids = new List<string>();
+            ids.Add("76561198000000001");
+            List<SteamPlayerSummary> players = await steam.GetPlayersAsync(ids);
+            Console.WriteLine("p0=" + players[0].SteamId + "/" + players[0].PersonaName);
+
+            List<SteamAchievement> achs = await steam.GetAchievementsSchemaAsync("english");
+            Console.WriteLine("ach0=" + achs[0].Name + "/" + Convert.ToString(achs[0].Hidden));
+
+            JsonValue stats = JsonValue.NewObject();
+            stats.Set("achieved", JsonValue.NewNum("1"));
+            stats.Set("kills", JsonValue.NewNum("42"));
+            SteamResponse setResp = await steam.SetUserStatsForGameAsync(stats, 2);
+            Console.WriteLine("statsOk=" + Convert.ToString(setResp.Int("response.result", 0))
+                + " hasKills=" + Convert.ToString(lastStatsBody.IndexOf("stats[kills]=42") >= 0));
+
+            SteamTicketResult ticket = await steam.AuthenticateUserTicketAsync("hex-ok", "mygame");
+            Console.WriteLine("auth=" + ticket.SteamId + "/" + ticket.OwnerSteamId
+                + "/" + Convert.ToString(ticket.VacBanned) + "/" + Convert.ToString(ticket.PublisherBanned));
+
+            try {
+                SteamTicketResult _bad = await steam.AuthenticateUserTicketAsync("bad", "mygame");
+                Console.WriteLine("badTicket=NOT THROWN");
+            } catch (SteamException e) {
+                Console.WriteLine("badTicket=" + e.Code);
+            }
+
+            List<SteamOwnedGame> games = await steam.GetOwnedGameListAsync("76561198000000001", true, true);
+            Console.WriteLine("game0=" + Convert.ToString(games[0].AppId) + "/" + games[0].Name
+                + "/" + Convert.ToString(games[0].PlaytimeForeverMinutes));
+
+            SteamClient badKey = NewClient("bad-key");
+            try {
+                List<SteamPlayerSummary> _p = await badKey.GetPlayersAsync(ids);
+                Console.WriteLine("http403=NOT THROWN");
+            } catch (SteamException e) {
+                Console.WriteLine("http403=" + e.Code);
+            }
+
+            try {
+                SteamTicketResult _empty = await steam.AuthenticateUserTicketAsync("", "");
+                Console.WriteLine("paramErr=NOT THROWN");
+            } catch (SteamException e) {
+                Console.WriteLine("paramErr=" + e.Code);
+            }
+        } finally {
+            server.Stop();
+        }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

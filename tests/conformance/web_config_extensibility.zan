@@ -1,0 +1,179 @@
+using System;
+using System.Json;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+using Zan.Web.Services;
+
+namespace Demo.Web;
+
+[Route("/v2/orders")]
+[Custom(Authorization = CustomAuthorization.None, IsMenu = true)]
+class OrdersController : Controller {
+    [HttpGet]
+    [Description("订单列表")]
+    [Custom(Badge = "NEW", Rank = "5")]
+    public void Index() {
+        this.Ok("[]");
+    }
+
+    [HttpGet]
+    [Custom(IsMenu = true, Hidden = true)]
+    [Description("隐藏视图")]
+    public void Secret() {
+        this.Ok("null");
+    }
+
+    [HttpGet]
+    [Custom(ResponseKind = "stream")]
+    [Description("事件流")]
+    public void Events() {
+        this.Text("ok");
+    }
+
+    [HttpGet]
+    [NonAction]
+    [Description("非动作辅助方法")]
+    public void Helper() {
+        this.Text("ignored");
+    }
+}
+
+[Route("/v2/ignored-controller")]
+[NonController]
+class IgnoredController : Controller {
+    [HttpGet]
+    public void Index() {
+        this.Text("ignored");
+    }
+}
+
+[Route("/manage/gate-exempt")]
+[Custom(Authorization = CustomAuthorization.None, AdminExempt = true)]
+class ManageExemptController : Controller {
+    [HttpGet]
+    public void Index() {
+        this.Text("exempt");
+    }
+}
+
+[Route("/manage/gate-protected")]
+[Custom(Authorization = CustomAuthorization.None)]
+class ManageProtectedController : Controller {
+    [HttpGet]
+    public void Index() {
+        this.Text("protected");
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static async void Main() {
+        WebApp app = new WebApp("127.0.0.1", 0);
+        WebHost.Use(app);
+
+        app.SessionCookie("custom_sid");
+        app.AuthHeader("X-Api-Token", "Token ");
+        app.ApiPrefix("/v2");
+        app.AddApiPrefix("/rpc");
+        app.Error(404, "E404_HTTP", "missing custom");
+
+        Program.Check(app.GetSessionCookie() == "custom_sid", "SessionCookie");
+        Program.Check(app.GetAuthHeader() == "X-Api-Token", "AuthHeader");
+        Program.Check(app.GetAuthScheme() == "Token ", "AuthScheme");
+        Program.Check(app.IsApiPath("/v2/orders"), "IsApiPath /v2/orders");
+        Program.Check(!app.IsApiPath("/v20/orders"), "IsApiPath segment boundary");
+        Program.Check(app.IsApiPath("/rpc/ping"), "AddApiPrefix /rpc/ping");
+
+        HttpRequest req404 = HttpRequest.Parse("GET /v2/does-not-exist HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpResponse resp404 = await app.DispatchRequest(req404);
+        Program.Check(resp404.statusCode == 404 && resp404.body == "{\"code\":\"E404_HTTP\",\"msg\":\"missing custom\"}", "Custom Error 404 dispatch");
+        resp404.Dispose();
+
+        Csrf.Configure("my_csrf", "X-My-Csrf", "_my_csrf");
+        Program.Check(Csrf.CookieName == "my_csrf" && Csrf.HeaderName == "X-My-Csrf" && Csrf.FormName == "_my_csrf", "Csrf.Configure");
+
+        StaticFiles.RegisterMime(".toml", "application/toml; charset=utf-8");
+        Program.Check(StaticFiles.ContentType("config.TOML") == "application/toml; charset=utf-8", "StaticFiles.RegisterMime");
+        Program.Check(StaticFiles.ContentType("site.css") == "text/css; charset=utf-8", "StaticFiles default css");
+
+        __AttrRoutes.StripNamespace("demo");
+        __AttrRoutes.StripNamespace("web");
+        MvcRoutes.Register(app);
+
+        List<Route> all = app.Router().All();
+        Route ordersRoute = null;
+        Route helperRoute = null;
+        Route ignoredCtrlRoute = null;
+        Route customLockRoute = app.Map("GET", "/v2/lock-test", null).Named("LockTest").Lock("tenant");
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].Pattern() == "/v2/orders") { ordersRoute = all[i]; }
+            if (all[i].Pattern() == "/v2/orders/helper") { helperRoute = all[i]; }
+            if (all[i].Pattern() == "/v2/ignored-controller") { ignoredCtrlRoute = all[i]; }
+        }
+        Program.Check(ordersRoute != null, "ordersRoute registered");
+        Program.Check(helperRoute == null, "NonAction suppresses route generation");
+        Program.Check(ignoredCtrlRoute == null, "NonController suppresses controller discovery");
+        Program.Check(__AttrRoutes.PathOf(app, typeof(OrdersController), "Index", "") == "/v2/orders", "AttrRoutes.PathOf resolves canonical Index route");
+        Program.Check(__AttrRoutes.PathOf(app, typeof(OrdersController), "Events", "") == "/v2/orders/events", "AttrRoutes.PathOf resolves action route");
+        Program.Check(__AttrRoutes.PathOf(app, typeof(OrdersController), "Missing", "/fallback") == "/fallback", "AttrRoutes.PathOf uses fallback for missing action");
+        Program.Check(__AttrRoutes.ActionKey(typeof(OrdersController), "Events") == typeof(OrdersController).FullName + ".Events", "AttrRoutes.ActionKey resolves full action key");
+        if (ordersRoute != null) {
+            Program.Check(ordersRoute.MetaGet("Badge") == "NEW", "Custom attr passthrough Badge");
+            Program.Check(ordersRoute.MetaGet("Rank") == "5", "Custom attr passthrough Rank");
+        }
+        Program.Check(LockManager.KeyFor(customLockRoute, "u42") == "tenant:u42:GET /v2/lock-test", "Custom Lock scope");
+
+        MenuBuilder.ClearStripPrefixes();
+        MenuBuilder.StripPrefix("v2");
+        MenuBuilder.DefaultIcon("mdi:circle");
+        MenuBuilder.Section("orders", "订单管理");
+        List<MenuNode> menu = await MenuBuilder.ForUser(app, "", "/v2/orders");
+        Program.Check(menu.Count == 1, "MenuBuilder filters Hidden=true");
+        if (menu.Count == 1) {
+            Program.Check(menu[0].Group() == "订单管理", "MenuBuilder StripPrefix v2");
+            Program.Check(menu[0].Icon() == "mdi:circle", "MenuBuilder DefaultIcon");
+        }
+
+        ApiDocs.ConfigureError(404, "E404", "missing item");
+        string spec = ApiDocs.SpecJson(app);
+        Program.Check(spec.Contains("\"E404\"") && spec.Contains("text/event-stream"), "ApiDocs custom prefix/error/ResponseKind");
+
+        Cfg.Apply(JsonDoc.Parse("{\"server\":{\"staticMaxAge\":3600},\"security\":{\"adminPrefixes\":\"/manage,/api/manage\",\"adminExemptPaths\":\"/manage/login\"}}"));
+        Program.Check(Cfg.Server.staticMaxAge == 3600, "Cfg.Server.staticMaxAge");
+        Program.Check(Boot.AdminPath("/manage/users") && !Boot.AdminPath("/management"), "Boot.AdminPath segment boundary");
+
+        Route manageLoginRoute = app.Map("GET", "/manage/login", null).Named("ManageLogin");
+        int raised = Boot.AdminGate(app);
+        Route exemptRoute = null;
+        Route protectedRoute = null;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].Pattern() == "/manage/gate-exempt") { exemptRoute = all[i]; }
+            if (all[i].Pattern() == "/manage/gate-protected") { protectedRoute = all[i]; }
+        }
+        Program.Check(raised == 2 && exemptRoute != null && !exemptRoute.NeedsLogin() && protectedRoute != null && protectedRoute.NeedsLogin() && !manageLoginRoute.NeedsLogin(), "Boot.AdminGate exempts AdminExempt=true and adminExemptPaths while protecting /manage/gate-protected");
+
+        RobotsTxt robots = await Geo.BuildRobots();
+        string robotsText = robots.ToText();
+        Program.Check(robotsText.Contains("Disallow: /manage/") && robotsText.Contains("Disallow: /api/manage/"), "Geo.BuildRobots reads adminPrefixes");
+
+        StrMap sm = new StrMap();
+        sm.Set(SettingKeys.SiteTitle, "Acme");
+        sm.Set(SettingKeys.SiteSubtitle, "Fast");
+        Settings.Prime(sm);
+        ViewData vd = new ViewData();
+        await Settings.Apply(vd);
+        Program.Check(vd.Vars().Get("siteTitle") == "Acme" && vd.Vars().Get("siteSubtitle") == "Fast", "Settings.Apply table mapping");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("web_config_extensibility failed"); }
+    }
+}

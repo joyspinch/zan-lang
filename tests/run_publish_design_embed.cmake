@@ -1,14 +1,8 @@
-# Published design html auto-embed, end to end:
-#   1. stage a mini project (<workdir>/pub_design/proj) with a zan.proj and
-#      src/page.html plus an html under the skipped src/docs subtree; the
-#      probe source carries the DesignDoc. token, which is the auto-embed
-#      gate signal,
-#   2. compile --publish with an explicit alias for page.html: the compiler
-#      must also discover src/page.html on its own and share its payload,
-#   3. assert the exe carries NO plaintext of the design (publish bakes are
-#      encrypted),
-#   4. run it from a directory that does NOT contain src/, so the read goes
-#      through the embedded copy, and require the golden output.
+# Check explicit HTML resources in a published executable.
+# Stage the page and an undeclared src/docs/hidden.html in a mini project.
+# Publish the page under two aliases that share a payload, then check the
+# executable for plaintext and compare the VFS reads against the golden output
+# from a working directory without loose HTML files.
 #
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<golden> -DOUT_EXE=<path>
@@ -31,6 +25,7 @@ configure_file(${SRC} ${proj_dir}/app.zan COPYONLY)
 
 execute_process(
   COMMAND ${ZANC} ${proj_dir}/app.zan --publish
+    --embed "${proj_dir}/src/page.html=src/page.html"
     --embed "${proj_dir}/src/page.html=views/start.html" -o ${OUT_EXE}
   RESULT_VARIABLE compile_rc
   OUTPUT_VARIABLE compile_out
@@ -68,4 +63,4 @@ if(NOT actual STREQUAL expected)
 endif()
 
 file(REMOVE_RECURSE ${WORKDIR}/pub_design)
-message(STATUS "publish_design_embed: auto-discovery, encryption and embedded-VFS read all verified")
+message(STATUS "publish_design_embed: explicit aliases, encryption and embedded-VFS reads verified")

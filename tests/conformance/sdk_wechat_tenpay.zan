@@ -1,4 +1,6 @@
 using System;
+using System.Json;
+using System.Security.Cryptography;
 using Sdk.Wechat;
 using Sdk.Wechat.TenPay;
 using Sdk.Wechat.Models.TenPay;
@@ -861,6 +863,55 @@ class Program {
         WechatPayConfigRegistry registry = new WechatPayConfigRegistry();
         registry.AddV2("v2", v2cfg).AddV3("v3", v3cfg);
         Console.WriteLine("registry=" + Convert.ToString(registry.GetV3("v3") != null));
+
+        // 1. SetPlatformPublicKey 不篡改传入 config
+        v3.SetPlatformPublicKey("platform-2", CertificatePem());
+        Console.WriteLine("cfgIsolated=" + Convert.ToString(v3cfg.PlatformSerialNumber == "platform-1" && v3.HasPlatformPublicKey("platform-2")));
+
+        // 2. BuildJsapiPayParams / BuildAppPayParams
+        JsonValue jsParams = JsonValue.Parse(v3.BuildJsapiPayParams("", "prepay_xyz"));
+        Console.WriteLine("jsapiParams=" + Convert.ToString(jsParams.Str("appId", "") == "wx" && jsParams.Str("package", "") == "prepay_id=prepay_xyz" && jsParams.Str("signType", "") == "RSA" && jsParams.Str("paySign", "").Length > 20));
+        JsonValue appParams = JsonValue.Parse(v3.BuildAppPayParams("", "", "prepay_xyz"));
+        Console.WriteLine("appParams=" + Convert.ToString(appParams.Str("appid", "") == "wx" && appParams.Str("partnerid", "") == "mch" && appParams.Str("package", "") == "Sign=WXPay" && appParams.Str("sign", "").Length > 20));
+
+        // 3. 完整 AES-GCM 加密 + 签名 + VerifyAndDecryptNotification
+        string apiV3Key = "0123456789abcdef0123456789abcdef";
+        string gcmNonce = "123456789012";
+        string gcmAad = "transaction";
+        string plainNotice = "{\"trade_state\":\"SUCCESS\",\"out_trade_no\":\"ORD1001\"}";
+        byte[] tag = new byte[17];
+        byte[] ct = AesGcm.Encrypt(apiV3Key, 32, gcmNonce, gcmAad, gcmAad.Length,
+                                   plainNotice, plainNotice.Length, tag);
+        if (ct == null) { throw new Exception("encrypt failed"); }
+        byte[] combined = new byte[plainNotice.Length + 16];
+        for (int idx = 0; idx < plainNotice.Length; idx = idx + 1) { combined[idx] = ct[idx]; }
+        for (int tidx = 0; tidx < 16; tidx = tidx + 1) { combined[plainNotice.Length + tidx] = tag[tidx]; }
+        string ctB64 = Convert.ToBase64String(combined);
+        string fullNoticeBody = "{\"id\":\"n-enc\",\"event_type\":\"TRANSACTION.SUCCESS\",\"resource\":{\"algorithm\":\"AEAD_AES_256_GCM\",\"ciphertext\":\"" + ctB64 + "\",\"nonce\":\"" + gcmNonce + "\",\"associated_data\":\"" + gcmAad + "\"}}";
+        long nowTs = DateTime.UtcNow().ToUnixSeconds();
+        string tsStr = Convert.ToString(nowTs);
+        string msgToSign = tsStr + "\nnonce-enc\n" + fullNoticeBody + "\n";
+        RsaKey signKey = RsaKey.FromPrivatePem(PrivatePem());
+        if (signKey == null) { throw new Exception("key parse failed"); }
+        string goodNoticeSig = signKey.SignSha256(msgToSign);
+        string decrypted = v3.VerifyAndDecryptNotification(tsStr, "nonce-enc", fullNoticeBody, goodNoticeSig, "platform-2");
+        Console.WriteLine("v3Decrypt=" + Convert.ToString(decrypted == plainNotice));
+        try {
+            v3.VerifyAndDecryptNotification(tsStr, "nonce-enc", fullNoticeBody, "bad-sig", "platform-2");
+            Console.WriteLine("v3BadSig=NOT THROWN");
+        } catch (WechatException e) {
+            Console.WriteLine("v3BadSig=" + e.Code);
+        }
+
+        // 4. V2 HMAC-SHA256 无 sign_type 回传时的验签 + VerifyNotification
+        WechatPayV2Config hmacCfg = new WechatPayV2Config("wx", "mch", "key").UseHmacSha256();
+        WechatPayV2Client v2Hmac = new WechatPayV2Client(hmacCfg);
+        WechatPayV2Request v2Resp = new WechatPayV2Request();
+        v2Resp.Set("return_code", "SUCCESS").Set("result_code", "SUCCESS").Set("nonce_str", "n1");
+        v2Resp.Set("sign", v2Resp.Sign("key", "HMAC-SHA256"));
+        WechatPayV2Request verifiedV2 = v2Hmac.VerifyNotification(v2Resp.ToXml());
+        Console.WriteLine("v2HmacVerify=" + Convert.ToString(verifiedV2.Get("nonce_str", "") == "n1"));
+
         Console.WriteLine("generated=45");
     }
 }

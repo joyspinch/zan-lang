@@ -7,7 +7,7 @@ class RoutedKeyProbe : Control {
     public int ups;
     public int texts;
     public int lastKey;
-    public RoutedKeyProbe() { this.InitControl("routed-key-probe", 0); }
+    public RoutedKeyProbe() { this.InitControl("routed-key-probe"); }
     public override void OnKeyDown(RoutedEventArgs e) { downs = downs + 1; lastKey = e.keyCode; e.Handle(); }
     public override void OnKeyUp(RoutedEventArgs e) { ups = ups + 1; e.Handle(); }
     public override void OnTextInput(RoutedEventArgs e) { texts = texts + 1; lastKey = e.keyCode; e.Handle(); }
@@ -16,7 +16,7 @@ class RoutedKeyProbe : Control {
 class RoutedParentProbe : Control {
     public Control childSource;
     public int childEvents;
-    public RoutedParentProbe() { this.InitControl("routed-parent-probe", 0); }
+    public RoutedParentProbe() { this.InitControl("routed-parent-probe"); }
     public override void OnChildEvent(Control child, string evt) {
         childSource = child;
         childEvents = childEvents + 1;
@@ -69,7 +69,7 @@ class WindowInputRoutingTest {
         App app = App.CreateOffscreen("window input routing", 360, 240);
         Panel root = Panel.Column();
         Button button = new Button("Click");
-        SignalInt clicks = new SignalInt(0);
+        Binding<int> clicks = 0;
         button.Click.Add(() => { clicks.Set(clicks.Get() + 1); });
         root.Add(button);
         RoutedKeyProbe key = new RoutedKeyProbe();
@@ -99,18 +99,72 @@ class WindowInputRoutingTest {
         app.ApplyEvent(app.window.GetHandle());
         Check("same character not replayed", key.texts == 1);
         Check("handled character unavailable to paint input", app.EventKind() == 0);
+        app.focus.SetFocused(button.WidgetId());
+        Apply(app, 4, 0, 0, 13);
+        Drain();
+        Check("focused Button activates with Enter", clicks.Get() == 2);
+        Apply(app, 5, 0, 0, 13);
+        Drain();
+        Check("Enter release does not repeat Button click", clicks.Get() == 2);
+        root.OnPreviewRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "Click") { e.Handle(); }
+        });
+        Apply(app, 4, 0, 0, 13);
+        Drain();
+        Check("parent can cancel keyboard Click through preview", clicks.Get() == 2);
+        root.OnPreviewRouted(null);
+        RoutedEventArgs childKey = new RoutedEventArgs("KeyDown", button.ChildAt(0));
+        childKey.keyCode = 13;
+        Control.RouteEvent(childKey.originalSource, childKey);
+        Drain();
+        Check("descendant KeyDown does not activate Button", clicks.Get() == 2);
+        Apply(app, 4, 0, 0, 32);
+        Drain();
+        Check("focused Button activates with Space", clicks.Get() == 3);
+        button.Disabled = true;
+        Apply(app, 4, 0, 0, 13);
+        Drain();
+        Check("disabled Button ignores keyboard activation", clicks.Get() == 3);
+        button.Disabled = false;
+        app.focus.ClearFocus();
+        Check("button starts unfocused before pointer down", !button.IsFocused(app));
         Apply(app, 2, x, y, 0);
         Check("button label focuses button ancestor", button.IsFocused(app));
         Apply(app, 9, 0, 0, 0);
         Check("blur cancels capture and press", app.GetCapturedPointer() == null && !button.IsPressed(app));
         Apply(app, 3, x, y, 0);
         Drain();
-        Check("blur prevents pending click", clicks.Get() == 1);
+        Check("blur prevents pending click", clicks.Get() == 3);
         Apply(app, 2, x, y, 0);
         Panel replacement = Panel.Column();
         child.SetView(replacement, null);
         Check("changing child root changes input root", app.rootControl == replacement);
         Check("changing child root cancels old capture", app.GetCapturedPointer() == null);
+
+        child.SetView(root, null);
+        Paint(app, root);
+        app.focus.SetFocused(button.WidgetId());
+        root.OnPreviewRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "Click") { app.focus.SetFocused(key.WidgetId()); }
+        });
+        Apply(app, 4, 0, 0, 13);
+        Drain();
+        Check("focus transfer within the live tree preserves the keyboard click", clicks.Get() == 4);
+
+        int buttonPreviews = 0;
+        button.OnPreviewRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "Click") { buttonPreviews = buttonPreviews + 1; }
+        });
+        app.focus.SetFocused(button.WidgetId());
+        root.OnPreviewRouted((Control sender, RoutedEventArgs e) => {
+            if (e.eventName == "Click") { child.SetView(replacement, null); }
+        });
+        Apply(app, 4, 0, 0, 13);
+        Drain();
+        Check("Click preview replaced the input root", app.rootControl == replacement);
+        Check("retired button receives neither Click preview nor subscriber", buttonPreviews == 0 && clicks.Get() == 4);
+        root.OnPreviewRouted(null);
+        button.OnPreviewRouted(null);
         app.SetRootControl(null);
         app.ReleasePointerCapture();
         app.canvas.Destroy();

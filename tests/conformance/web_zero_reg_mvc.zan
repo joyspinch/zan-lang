@@ -1,0 +1,78 @@
+using System;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Threading;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+
+namespace Conf;
+
+[Route("/api/hello")]
+[Custom(Authorization = CustomAuthorization.None)]
+class HelloController : AppController {
+    [HttpGet]
+    void Ping(string who) {
+        this.Json("{\"hello\":\"" + who + "\"}");
+    }
+}
+
+[Custom(Authorization = CustomAuthorization.None)]
+class StatusController : AppController {
+    [HttpGet]
+    void Ok() {
+        this.Text("alive");
+    }
+}
+
+class Program {
+    static int failures;
+    static const int Port = 23593;
+    static AtomicInt served = new AtomicInt(0);
+
+    static void Check(bool ok, string label) {
+        Console.WriteLine((ok ? "ok " : "FAIL ") + label);
+        if (!ok) { failures = failures + 1; }
+    }
+
+    static async void Serve(WebApp app, TcpListener listener) {
+        nint socket = await listener.AcceptAsync();
+        if (socket >= 0) { await app.HandleConnection(socket); }
+        long done = served.Increment();
+    }
+
+    static async string Request(WebApp app, TcpListener listener, string path) {
+        long before = served.Load();
+        Task.Spawn(Serve(app, listener));
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", Program.Port, 3000);
+        int sent = await client.SendAsync("GET " + path + " HTTP/1.1\r\nHost: local.test\r\nConnection: close\r\n\r\n");
+        string response = "";
+        for (int i = 0; i < 32; i = i + 1) {
+            string chunk = await client.RecvAsync(8192, 3000);
+            if (chunk.Length == 0) { break; }
+            response = response + chunk;
+        }
+        client.Close();
+        for (int i = 0; i < 100 && served.Load() == before; i = i + 1) { await Task.Delay(10); }
+        return response;
+    }
+
+    static async int Main() {
+        Socket.Initialize();
+        WebApp app = new WebApp("127.0.0.1", Program.Port);
+        __AttrRoutes.ApplyAutoRoutes(app);
+        TcpListener listener = new TcpListener("127.0.0.1", Program.Port);
+        listener.Start();
+
+        string r1 = await Request(app, listener, "/api/hello/ping?who=zan");
+        Check(r1.StartsWith("HTTP/1.1 200 ") && r1.Contains("\"hello\":\"zan\""), "explicit route zero-reg");
+
+        string r2 = await Request(app, listener, "/conf/status/ok");
+        Check(r2.StartsWith("HTTP/1.1 200 ") && r2.Contains("alive"), "convention route zero-reg");
+
+        await listener.StopAsync();
+        app.Dispose();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+}

@@ -3,6 +3,7 @@
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSRC=<file.zan> -DEXPECTED=<file.out> \
 #         -DOUT_EXE=<exe path> [-DZANC_ARGS=<extra;args>] [-DRUN_ARGS=<args>] \
+#         [-DINPUT_DEPENDS=<extra;input;paths>] \
 #         [-DWORKDIR=<dir>] \
 #         -P run_case.cmake
 #
@@ -57,6 +58,14 @@ function(zan_artifact_is_current out_var artifact)
   if(STDLIB_STAMP AND EXISTS ${STDLIB_STAMP} AND ${STDLIB_STAMP} IS_NEWER_THAN ${artifact})
     return()
   endif()
+  if(CMAKE_SCRIPT_MODE_FILE AND ${CMAKE_SCRIPT_MODE_FILE} IS_NEWER_THAN ${artifact})
+    return()
+  endif()
+  foreach(_input IN LISTS INPUT_DEPENDS)
+    if(NOT EXISTS "${_input}" OR "${_input}" IS_NEWER_THAN "${artifact}")
+      return()
+    endif()
+  endforeach()
   foreach(_arg IN LISTS ZANC_ARGS)
     if(_arg MATCHES "\\.(zan|html|zcomp)$" AND EXISTS "${_arg}"
        AND "${_arg}" IS_NEWER_THAN "${artifact}")
@@ -76,10 +85,15 @@ function(zan_drop_artifact)
 endfunction()
 
 # ---- compile ----
+set(_default_opt_args)
+if((OUT_EXE MATCHES "[/\\\\](conf_gui_|diag_cw_|server_mvc_|policy_server_mvc_)" OR MVC_TOOL)
+   AND NOT ";${ZANC_ARGS};" MATCHES ";(--publish|-O0|-O1|-O2|-O3|-Os|-Oz|-g);")
+  set(_default_opt_args -O0)
+endif()
 zan_artifact_is_current(_current ${OUT_EXE})
 if(NOT _current)
   execute_process(
-    COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS}
+    COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} ${ZANC_ARGS} ${_default_opt_args}
             --package-project ${WORKDIR}
     RESULT_VARIABLE compile_rc
     OUTPUT_VARIABLE compile_out

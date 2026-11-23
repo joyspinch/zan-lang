@@ -11,6 +11,66 @@ class TypedListRow {
 struct TypedListPair {
     public long Left;
     public long Right;
+    public TypedListPair(long left, long right) {
+        Left = left;
+        Right = right;
+    }
+    public long Sum() { return Left + Right; }
+}
+
+[StructLayout(LayoutKind.Explicit)]
+struct TypedListExplicit {
+    [FieldOffset(0)] public long Raw;
+}
+
+struct TypedBoxedArc {
+    public TypedListRow Row;
+    public decimal Price;
+    public TypedBoxedArc(TypedListRow row, decimal price) {
+        Row = row;
+        Price = price;
+    }
+}
+
+class ValueReflectionHolder {
+    public static decimal StaticPrice = (decimal)12.5;
+    public static TypedListPair StaticPair = new TypedListPair(10L, 20L);
+    public static int? StaticOpt = 42;
+
+    public TypedListPair Pair = new TypedListPair(1L, 2L);
+    public decimal Amount = (decimal)3.25;
+    public int? OptInt = null;
+    public decimal? OptDec = (decimal)7.5;
+    public TypedListPair? OptPair = null;
+    public TypedBoxedArc ArcStruct;
+
+    public decimal PropAmount {
+        get { return Amount; }
+        set { Amount = value; }
+    }
+    public TypedListPair PropPair {
+        get { return Pair; }
+        set { Pair = value; }
+    }
+    public int? PropOpt {
+        get { return OptInt; }
+        set { OptInt = value; }
+    }
+
+    public decimal Scale(decimal factor, int? bias) {
+        int b = bias != null ? (int)bias : 0;
+        return Amount * factor + (decimal)b;
+    }
+    public TypedListPair MakePair(long a, long b) {
+        return new TypedListPair(a, b);
+    }
+    public TypedListPair? MaybePair(bool make) {
+        if (!make) return null;
+        return new TypedListPair(100L, 200L);
+    }
+    public static decimal StaticDouble(decimal x) {
+        return x + StaticPrice;
+    }
 }
 
 class TypedListFieldChild {
@@ -172,13 +232,133 @@ class Program {
 
     static void AggregateBoundary() {
         object list = typeof(List<TypedListPair>).CreateInstance();
-        Require(list is List<TypedListPair>, "aggregate constructor identity");
+        Require(list is List<TypedListPair>, "boxed struct constructor identity");
         Require(list.HasMethod("Add") && list.HasMethod("Get"), "aggregate metadata");
-        Require(!list.Invoke("Add", (object)null), "aggregate Add is unavailable in single-slot ABI");
-        Require(!list.Invoke("Get", 0), "aggregate Get is unavailable in single-slot ABI");
+        Require(list.Invoke("Add", new TypedListPair(7L, 11L)), "boxed struct List Add");
+        object fetched = list.InvokeObject("Get", 0);
+        Require(fetched is TypedListPair, "boxed struct List Get identity");
+        TypedListPair gp = (TypedListPair)fetched;
+        Require(gp.Left == 7L && gp.Right == 11L, "boxed struct List Get payload");
         List<TypedListPair> pairs = (List<TypedListPair>)list;
-        Require(pairs.Count == 0, "unsupported reflection does not mutate collection");
+        Require(pairs.Count == 1 && pairs[0].Left == 7L && pairs[0].Right == 11L,
+            "boxed struct List typed readback");
+
+        object expList = typeof(List<TypedListExplicit>).CreateInstance();
+        Require(expList is List<TypedListExplicit>, "explicit struct constructor identity");
+        Require(!expList.Invoke("Add", (object)null), "explicit layout Add is unavailable");
+        Require(!expList.Invoke("Get", 0), "explicit layout Get is unavailable");
+        List<TypedListExplicit> exps = (List<TypedListExplicit>)expList;
+        Require(exps.Count == 0, "unsupported reflection does not mutate collection");
         Console.WriteLine("aggregate PASS");
+    }
+
+    static void ValueTypeReflection() {
+        object boxed = typeof(TypedListPair).CreateInstance(3L, 4L);
+        Require(boxed is TypedListPair, "struct CreateInstance identity");
+        Require(boxed.GetFieldLong("Left") == 3L && boxed.GetFieldLong("Right") == 4L,
+            "boxed struct GetFieldLong");
+        Require(boxed.InvokeLong("Sum") == 7L, "boxed struct InvokeLong");
+        Require(boxed.SetFieldLong("Left", 15L) && boxed.GetFieldLong("Left") == 15L,
+            "boxed struct SetFieldLong");
+        TypedListPair unboxed = (TypedListPair)boxed;
+        Require(unboxed.Left == 15L && unboxed.Right == 4L, "struct unboxing");
+
+        ValueReflectionHolder holder = new ValueReflectionHolder();
+        object h = holder;
+        Require(h.GetFieldDouble("Amount") == 3.25, "decimal GetFieldDouble");
+        Require(h.SetFieldObject("Amount", (decimal)9.5) && holder.Amount == (decimal)9.5,
+            "decimal SetFieldObject");
+        Require(h.GetFieldDouble("PropAmount") == 9.5, "decimal property getter");
+        Require(h.SetFieldObject("PropAmount", (decimal)4.5) && holder.Amount == (decimal)4.5,
+            "decimal property setter");
+        Require(h.InvokeDouble("Scale", (decimal)2.0, (int?)3) == 12.0,
+            "decimal + Nullable<int> InvokeDouble");
+        Require(h.InvokeDouble("Scale", (decimal)2.0, (int?)null) == 9.0,
+            "decimal + null Nullable<int> InvokeDouble");
+
+        Require(h.SetFieldObject("Pair", new TypedListPair(5L, 6L)) &&
+            holder.Pair.Left == 5L && holder.Pair.Right == 6L,
+            "struct SetFieldObject");
+        object pf = h.GetFieldObject("Pair");
+        Require(pf is TypedListPair && ((TypedListPair)pf).Right == 6L, "struct GetFieldObject");
+        Require(h.SetFieldObject("PropPair", new TypedListPair(8L, 9L)) &&
+            holder.Pair.Left == 8L, "struct property setter");
+        object ppf = h.GetFieldObject("PropPair");
+        Require(ppf is TypedListPair && ((TypedListPair)ppf).Right == 9L,
+            "struct property getter");
+
+        Require(h.GetFieldInt("OptInt") == 0, "null Nullable<int> GetFieldInt");
+        Require(h.SetFieldInt("OptInt", 77) && holder.OptInt == 77 &&
+            h.GetFieldInt("OptInt") == 77, "Nullable<int> SetFieldInt/GetFieldInt");
+        Require(h.SetFieldObject("OptInt", (object)null) && holder.OptInt == null,
+            "Nullable<int> SetFieldObject(null)");
+        Require(h.SetFieldObject("PropOpt", (int?)99) && holder.OptInt == 99 &&
+            h.GetFieldInt("PropOpt") == 99, "Nullable<int> property");
+        Require(h.GetFieldDouble("OptDec") == 7.5 &&
+            h.SetFieldDouble("OptDec", 1.5) && holder.OptDec == (decimal)1.5,
+            "Nullable<decimal> Get/Set");
+        Require(h.GetFieldObject("OptPair") == null &&
+            h.SetFieldObject("OptPair", (TypedListPair?)new TypedListPair(21L, 22L)) &&
+            holder.OptPair != null && ((TypedListPair)holder.OptPair).Left == 21L,
+            "Nullable<Struct> Set/Get");
+        object opf = h.GetFieldObject("OptPair");
+        Require(opf is TypedListPair && ((TypedListPair)opf).Right == 22L,
+            "Nullable<Struct> GetFieldObject");
+
+        object made = h.InvokeObject("MakePair", 33L, 44L);
+        Require(made is TypedListPair && ((TypedListPair)made).Left == 33L, "struct return InvokeObject");
+        Require(h.InvokeVoid("MakePair", 1L, 2L), "discarded struct return InvokeVoid");
+        Require(h.InvokeObject("MaybePair", false) == null, "null Nullable<Struct> return");
+        object maybe = h.InvokeObject("MaybePair", true);
+        Require(maybe is TypedListPair && ((TypedListPair)maybe).Right == 200L,
+            "some Nullable<Struct> return");
+        Require(h.InvokeVoid("MaybePair", true), "discarded Nullable<Struct> return");
+
+        TypeInfo hti = typeof(ValueReflectionHolder);
+        Require(hti.GetStaticFieldDouble("StaticPrice") == 12.5, "static decimal get");
+        Require(hti.SetStaticFieldDouble("StaticPrice", 2.5) &&
+            ValueReflectionHolder.StaticPrice == (decimal)2.5, "static decimal set");
+        Require(hti.InvokeStaticDouble("StaticDouble", (decimal)3.0) == 5.5,
+            "static decimal InvokeStaticDouble");
+        Require(hti.GetStaticFieldInt("StaticOpt") == 42 &&
+            hti.SetStaticFieldObject("StaticOpt", (object)null) &&
+            ValueReflectionHolder.StaticOpt == null, "static Nullable<int> get/set");
+        object sp = hti.GetStaticFieldObject("StaticPair");
+        Require(sp is TypedListPair && ((TypedListPair)sp).Left == 10L &&
+            hti.SetStaticFieldObject("StaticPair", new TypedListPair(50L, 60L)) &&
+            ValueReflectionHolder.StaticPair.Right == 60L, "static struct get/set");
+
+        object declist = typeof(List<decimal>).CreateInstance();
+        Require(declist.Invoke("Add", (decimal)1.25) && declist.Invoke("Add", (decimal)2.75),
+            "List<decimal> Add");
+        Require(declist.InvokeDouble("Get", 0) == 1.25 && declist.InvokeDouble("At", 1) == 2.75,
+            "List<decimal> Get/At");
+
+        object optlist = typeof(List<int?>).CreateInstance();
+        Require(optlist.Invoke("Add", (int?)19) && optlist.Invoke("Add", (object)null),
+            "List<int?> Add");
+        Require(optlist.InvokeInt("Get", 0) == 19 && optlist.InvokeInt("At", 1) == 0,
+            "List<int?> Get/At");
+
+        object nplist = typeof(List<TypedListPair?>).CreateInstance();
+        Require(nplist.Invoke("Add", (TypedListPair?)new TypedListPair(2L, 3L)) &&
+            nplist.Invoke("Add", (object)null), "List<TypedListPair?> Add");
+        Require(((TypedListPair)nplist.InvokeObject("Get", 0)).Right == 3L &&
+            nplist.InvokeObject("At", 1) == null, "List<TypedListPair?> Get/At");
+
+        TypedListRow arcRow = new TypedListRow();
+        arcRow.Name = "boxed-arc-" + 5;
+        WeakReference<TypedListRow> arcWitness = new WeakReference<TypedListRow>(arcRow);
+        object arcBox = typeof(TypedBoxedArc).CreateInstance(arcRow, (decimal)6.5);
+        Require(h.SetFieldObject("ArcStruct", arcBox), "ARC struct SetFieldObject");
+        arcRow = null;
+        arcBox = null;
+        Require(arcWitness.IsAlive, "ARC struct field retains RC payload");
+        Require(h.SetFieldObject("ArcStruct", new TypedBoxedArc(null, (decimal)0)),
+            "ARC struct overwrite releases old RC payload");
+        Require(!arcWitness.IsAlive, "overwritten ARC struct releases witness");
+
+        Console.WriteLine("value reflection PASS");
     }
 
     static T NullLocal<T>() {
@@ -301,5 +481,6 @@ class Program {
         Scalars();
         FloatingPoint();
         AggregateBoundary();
+        ValueTypeReflection();
     }
 }

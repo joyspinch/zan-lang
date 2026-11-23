@@ -1,6 +1,16 @@
 using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.Json;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Threading;
 using System.Web;
 using Zan.Web;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web.Services;
 
 namespace Zan.Web.CompilerRegression;
 
@@ -14,7 +24,52 @@ class HealthController : AppController {
     }
 }
 
+[Route("/compiler-profile")]
+class ProfileFixtureController : AppController {
+    [HttpGet]
+    public async void Query() {
+        IDbConnection db = this.Held();
+        DbParams args = new DbParams();
+        args.Add("fixture-bound-value");
+        await db.ExecuteAsync("CREATE TABLE IF NOT EXISTS fixture_profile_sql (value TEXT)");
+        int inserted = await db.ExecuteAsync("INSERT INTO fixture_profile_sql (value) VALUES (?)", args);
+        DbResult result = await db.QueryAsync("SELECT value FROM fixture_profile_sql WHERE value = ?", args);
+        string count = db.ExecuteScalar("SELECT count(*) FROM fixture_profile_sql");
+        bool caught = false;
+        try {
+            await db.QueryAsync("SELECT value FROM fixture_profile_missing");
+        } catch (DbException failure) {
+            caught = true;
+        }
+        bool ok = inserted == 1 && result.GetByName(0, "value") == "fixture-bound-value"
+            && count == "1" && caught;
+        this.Text(ok ? "sqlite-observed" : "sqlite-failed");
+    }
+
+    [HttpGet]
+    public async void Bulk() {
+        IDbConnection db = this.Held();
+        for (int i = 0; i < 52; i = i + 1) {
+            if (db.ExecuteScalar("SELECT 1") != "1") { throw new Exception("fixture scalar failed"); }
+        }
+        try {
+            await db.QueryAsync("SELECT value FROM fixture_profile_missing");
+        } catch (DbException failure) {
+            this.Text("bulk-sql");
+        }
+    }
+}
+
 class Program {
+    static const string MonitorPath = "/admin/monitor/request-traces";
+    static const string SqlPath = "/compiler-profile/query";
+    static const string BulkPath = "/compiler-profile/bulk";
+    static const string DiagnosticsPath = "/admin/monitor/route-diagnostics";
+    static const string ProfileCapacity = "ZAN_REQUEST_PROFILE_CAPACITY";
+    static const string ProfileHeader = "X-Zan-Request-Profile";
+    static const string Viewer = "42";
+    static const string DeniedUser = "43";
+
     static void Check(bool ok, string label) {
         if (!ok) { throw new Exception(label); }
         Console.WriteLine(label);
@@ -64,5 +119,245 @@ class Program {
             "framework async dispatch awaited");
     }
 
-    static void Main() { await Program.Run(); }
+    static async HttpResponse Get(WebApp app, TcpListener listener, string path, string session = "", string method = "GET") {
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", listener.GetPort(), 3000);
+        if (client == null) { throw new Exception("profile fixture connect failed"); }
+        try {
+            string request = method + " " + path + " HTTP/1.1\r\nHost: test\r\n"
+                + "Accept: application/json\r\nConnection: close\r\n";
+            if (session.Length > 0) { request = request + "Cookie: zsession=" + session + "\r\n"; }
+            request = request + "\r\n";
+            int sent = await client.SendAsync(request);
+            if (sent != request.Length) { throw new Exception("profile fixture send failed"); }
+            nint socket = await listener.AcceptAsync();
+            if (socket < 0) { throw new Exception("profile fixture accept failed"); }
+            Task server = Task.Run(app.HandleConnection(socket));
+            StringBuilder response = new StringBuilder();
+            while (true) {
+                string part = await client.RecvAsync(4096, 8000);
+                if (part.Length == 0) { break; }
+                response.Append(part);
+            }
+            await server;
+            return HttpResponse.Parse(response.ToString());
+        } finally {
+            client.Close();
+        }
+    }
+
+    static async void GrantMonitorView(WebApp app) {
+        Route route = Program.Match(app, MonitorPath);
+        Program.Check(route != null && route.Method() == "GET" && route.NeedsLogin()
+            && route.NeedsAuth() && !route.InMenu()
+            && route.MetaGet("Perm") == "View", "request trace export has the monitor View grant");
+        Perm.Index(app);
+        if (!PermTable.Open()) { throw new Exception("profile fixture permission table failed"); }
+        SysRole role = new SysRole();
+        role.id = 7;
+        role.status = 1;
+        SysRoleGrant grant = new SysRoleGrant();
+        grant.roleId = role.id;
+        grant.action = Perm.ScreenOf(route.Action());
+        grant.mask = (int)PermBit.View;
+        List<SysRole> roles = new List<SysRole>();
+        roles.Add(role);
+        List<SysRoleGrant> grants = new List<SysRoleGrant>();
+        grants.Add(grant);
+        await PermTable.LoadRoles(roles, grants);
+        PermTable.SetUser(Viewer, false, ",7,");
+        PermTable.SetUser(DeniedUser, false, ",8,");
+        app.ScopedPermissionResolver(AuthUser.AllowInScope);
+    }
+
+    static bool HasStage(JsonDoc doc, string name, string failure = "") {
+        int row = doc.At(doc.Get("requests"), 0);
+        int stages = doc.Get(row, "stages");
+        for (int i = 0; i < doc.Count(stages); i = i + 1) {
+            int stage = doc.At(stages, i);
+            if (doc.StrAt(doc.Get(stage, "name"), "") == name
+                && doc.StrAt(doc.Get(stage, "failure"), "") == failure
+                && doc.LongAt(doc.Get(stage, "elapsed_us"), -1) >= 0) { return true; }
+        }
+        return false;
+    }
+
+    static async void CheckConfigured(WebApp app, TcpListener listener, DbPool pool,
+                                      string granted, string denied) {
+        HttpResponse anonymousResponse = await Program.Get(app, listener, MonitorPath);
+        HttpResponse deniedResponse = await Program.Get(app, listener, MonitorPath, denied);
+        Program.Check(anonymousResponse.statusCode == 401 && deniedResponse.statusCode == 403
+            && !anonymousResponse.body.Contains("\"requests\"") && !deniedResponse.body.Contains("\"requests\""),
+            "request trace export denies anonymous and ungranted sessions");
+
+        HttpResponse sql = await Program.Get(app, listener, SqlPath, granted);
+        Program.Check(sql.statusCode == 200 && sql.body == "sqlite-observed"
+            && sql.GetHeader(ProfileHeader).Length > 0 && pool.IdleCount() == 1,
+            "profiled MVC action runs SQLite and returns its connection");
+
+        HttpResponse export = await Program.Get(app, listener, MonitorPath + "?limit=1", granted);
+        JsonDoc page = JsonDoc.Parse(export.body);
+        long cursor = page.GetLong("next_before");
+        if (export.statusCode != 200 || export.GetHeader("Cache-Control") != "no-store"
+            || !export.GetHeader("Content-Type").StartsWith("application/json")) {
+            throw new Exception("configured trace export HTTP status=" + Convert.ToString(export.statusCode)
+                + " no-store=" + Convert.ToString(export.GetHeader("Cache-Control") == "no-store")
+                + " JSON=" + Convert.ToString(export.GetHeader("Content-Type").StartsWith("application/json")));
+        }
+        long completed = page.GetLong("completed");
+        int rows = page.Count(page.Get("requests"));
+        bool sqlRoute = page.GetString("requests[0].route") == SqlPath;
+        int status = page.GetInt("requests[0].status");
+        if (completed != 3 || cursor <= 0 || rows != 1 || !sqlRoute || status != 200) {
+            throw new Exception("configured trace export completed=" + Convert.ToString(completed)
+                + " cursor=" + Convert.ToString(cursor) + " rows=" + Convert.ToString(rows)
+                + " SQL route=" + Convert.ToString(sqlRoute) + " request status=" + Convert.ToString(status));
+        }
+        Console.WriteLine("configured trace export returns completed requests and a cursor");
+        Program.Check(Program.HasStage(page, "db_borrow") && Program.HasStage(page, "sql_execute")
+            && Program.HasStage(page, "sql_query") && Program.HasStage(page, "sql_scalar")
+            && Program.HasStage(page, "sql_query", "exception") && Program.HasStage(page, "db_release")
+            && !export.body.Contains("fixture_profile_") && !export.body.Contains("fixture-bound-value")
+            && !export.body.Contains(granted) && !export.body.Contains(denied),
+            "SQL observer records safe operation and failure stages on the request");
+
+        HttpResponse older = await Program.Get(app, listener,
+            MonitorPath + "?limit=1&before=" + Convert.ToString(cursor), granted);
+        JsonDoc previous = JsonDoc.Parse(older.body);
+        Program.Check(older.statusCode == 200 && previous.Count(previous.Get("requests")) == 1
+            && previous.GetString("requests[0].route") == MonitorPath && previous.GetInt("requests[0].status") == 403
+            && !Program.HasStage(previous, "sql_query"), "trace export binds the before cursor");
+
+        HttpResponse again = await Program.Get(app, listener, MonitorPath + "?limit=1", granted);
+        JsonDoc latest = JsonDoc.Parse(again.body);
+        Program.Check(again.statusCode == 200 && latest.GetLong("completed", -1) == completed
+            && latest.GetLong("overwritten", -1) == 0 && latest.GetLong("next_before") == cursor
+            && latest.GetLong("requests[0].id") == page.GetLong("requests[0].id"),
+            "authorized export reads leave a full trace history intact");
+    }
+
+    static async void NoSql(HttpContext ctx) { ctx.Text("no-sql"); }
+
+    static int DiagnosticRow(JsonDoc doc, string method) {
+        int rows = doc.Get("routes");
+        for (int i = 0; i < doc.Count(rows); i = i + 1) {
+            int row = doc.At(rows, i);
+            if (doc.StrAt(doc.Get(row, "method"), "") == method
+                && doc.StrAt(doc.Get(row, "route"), "") == BulkPath) { return row; }
+        }
+        throw new Exception("missing route diagnostics for " + method);
+    }
+
+    static long DiagnosticCount(JsonDoc doc, int row, string field) {
+        return doc.LongAt(doc.Get(row, field), -1);
+    }
+
+    static async void CheckRouteDiagnostics(WebApp app, TcpListener listener, string granted, string denied) {
+        Cfg.Metrics.enabled = true;
+        Cfg.Metrics.path = ":memory:";
+        if (!await MetricsStore.Start()) { throw new Exception("metrics fixture start failed"); }
+        app.UseRequestDiagnostics(1, MetricsStore.RecordRouteDiagnostics);
+        app.Post(BulkPath, Program.NoSql);
+        HttpResponse anonymous = await Program.Get(app, listener, DiagnosticsPath);
+        HttpResponse forbidden = await Program.Get(app, listener, DiagnosticsPath, denied);
+        Program.Check(anonymous.statusCode == 401 && forbidden.statusCode == 403,
+            "route diagnostics require the monitor View grant");
+        HttpResponse bulk = await Program.Get(app, listener, BulkPath, granted);
+        HttpResponse noSql = await Program.Get(app, listener, BulkPath, granted, "POST");
+        Program.Check(bulk.statusCode == 200 && bulk.body == "bulk-sql"
+            && bulk.GetHeader(ProfileHeader).Length == 0 && noSql.statusCode == 200 && noSql.body == "no-sql",
+            "route sampling runs independently of trace retention");
+
+        HttpResponse routes = await Program.Get(app, listener, DiagnosticsPath, granted);
+        JsonDoc list = JsonDoc.Parse(routes.body);
+        int post = Program.DiagnosticRow(list, "POST");
+        string query = DiagnosticsPath + "?hours=1&method=GET&route=" + BulkPath;
+        HttpResponse live = await Program.Get(app, listener, query, granted);
+        JsonDoc doc = JsonDoc.Parse(live.body);
+        int getRow = Program.DiagnosticRow(doc, "GET");
+        Program.Check(live.statusCode == 200 && live.GetHeader("Cache-Control") == "no-store"
+            && doc.Count(doc.Get("routes")) == 1 && Program.DiagnosticCount(doc, getRow, "samples") == 1
+            && Program.DiagnosticCount(list, post, "samples") == 1
+            && Program.DiagnosticCount(doc, getRow, "sql_calls") == 53 && Program.DiagnosticCount(doc, getRow, "sql_completed") == 53
+            && Program.DiagnosticCount(doc, getRow, "sql_failed") == 1 && Program.DiagnosticCount(doc, getRow, "incomplete") == 1
+            && Program.DiagnosticCount(list, post, "sql_calls") == 0 && !live.body.Contains("fixture_profile_missing"),
+            "live route diagnostics split methods and count SQL beyond the timeline limit");
+
+        long elapsed = Program.DiagnosticCount(doc, getRow, "elapsed_us");
+        long unattributed = -1;
+        long action = -1;
+        int stages = doc.Get("stages");
+        for (int i = 0; i < doc.Count(stages); i = i + 1) {
+            int stage = doc.At(stages, i);
+            string name = doc.StrAt(doc.Get(stage, "name"), "");
+            if (name == "unattributed") { unattributed = Program.DiagnosticCount(doc, stage, "elapsed_us"); }
+            if (name == "mvc_action") { action = Program.DiagnosticCount(doc, stage, "elapsed_us"); }
+        }
+        Program.Check(action > 0 && unattributed >= 0 && unattributed + action <= elapsed,
+            "unattributed time excludes the union of completed nested stages");
+        int writes = await MetricsStore.Flush();
+        HttpResponse history = await Program.Get(app, listener,
+            DiagnosticsPath + "?hours=24&method=GET&route=" + BulkPath, granted);
+        JsonDoc past = JsonDoc.Parse(history.body);
+        getRow = Program.DiagnosticRow(past, "GET");
+        Program.Check(writes > 0 && history.statusCode == 200 && past.GetInt("series[0].samples") == 1
+            && Program.DiagnosticCount(past, getRow, "samples") == 1 && Program.DiagnosticCount(past, getRow, "elapsed_us") == elapsed,
+            "historical route diagnostics preserve committed samples without replay");
+    }
+
+    static async void CheckMonitorTraces() {
+        Socket.Initialize();
+        // A dedicated loopback port follows the transport conformance fixtures.
+        int port = 23632;
+        TcpListener listener = new TcpListener("127.0.0.1", port);
+        DbPool pool = SqliteConnector.Pool(":memory:", 1);
+        string saved = Environment.GetEnvironmentVariable(ProfileCapacity);
+        WebApp app = null;
+        string granted = "";
+        string denied = "";
+        try {
+            listener.Start();
+            AppServices.Use(new AppServices(DbContext.Of(pool), null));
+            Environment.SetEnvironmentVariable(ProfileCapacity, "3");
+            app = new WebApp("127.0.0.1", port);
+            MvcRoutes.RegisterFramework(app);
+            MvcRoutes.Register(app);
+            await Program.GrantMonitorView(app);
+            int now = WebApp.NowSeconds();
+            granted = app.Sessions().Issue(Viewer, now);
+            denied = app.Sessions().Issue(DeniedUser, now);
+            await Program.CheckConfigured(app, listener, pool, granted, denied);
+            app.Sessions().Remove(granted);
+            app.Sessions().Remove(denied);
+            app.Dispose();
+
+            Environment.SetEnvironmentVariable(ProfileCapacity, "0");
+            app = new WebApp("127.0.0.1", port);
+            MvcRoutes.RegisterFramework(app);
+            MvcRoutes.Register(app);
+            app.ScopedPermissionResolver(AuthUser.AllowInScope);
+            granted = app.Sessions().Issue(Viewer, WebApp.NowSeconds());
+            denied = app.Sessions().Issue(DeniedUser, WebApp.NowSeconds());
+            HttpResponse disabled = await Program.Get(app, listener, MonitorPath, granted);
+            JsonDoc body = JsonDoc.Parse(disabled.body);
+            Program.Check(disabled.statusCode == 503 && disabled.GetHeader("Cache-Control") == "no-store"
+                && disabled.GetHeader(ProfileHeader).Length == 0 && body.GetString("code") == "0503"
+                && !body.Has("requests"), "disabled trace export returns 503 without a snapshot");
+            await Program.CheckRouteDiagnostics(app, listener, granted, denied);
+        } finally {
+            Environment.SetEnvironmentVariable(ProfileCapacity, saved);
+            AppServices.Use(null);
+            if (app != null) {
+                app.Sessions().Remove(granted);
+                app.Sessions().Remove(denied);
+                app.Dispose();
+            }
+            await listener.StopAsync();
+            pool.Close();
+        }
+    }
+
+    static void Main() {
+        await Program.Run();
+        await Program.CheckMonitorTraces();
+    }
 }

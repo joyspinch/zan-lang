@@ -1,8 +1,244 @@
 using System;
 using System.Json;
+using System.Text;
 
 class Program {
+    static void CheckDeferred(JsonDoc doc) {
+        if (doc.escPool.Count != 1 || doc.escPool[0] != "id" || doc.PathInt("id", 0) != 7) {
+            throw new Exception("Deferred parsing must eagerly resolve keys in source order");
+        }
+        int text = doc.Get("text");
+        if (doc.KindAt(text) != 3) { throw new Exception("Deferred value lost its string kind"); }
+        StringView view = doc.ViewAt(text);
+        string nested = JsonDoc.ParseScopedDeferred<string>("\"inner\\u0021\"", (inner) => inner.StrOfSlot(inner.root));
+        if (nested != "inner!" || doc.PathInt("number", 0) != 42
+        || !doc.StrEquals(doc.Get("flag"), "true") || doc.PathStr("last", "") != "�tail") {
+            throw new Exception("Deferred accessor semantics changed");
+        }
+        string value = doc.StrAt(text, "");
+        if (view.Length != 6 || value.Length != 6 || value[0] != 97 || value[1] != 0
+        || value.Substring(2, 4) != "😀" || !view.Equals(StringView.FromString(value)) || doc.escPool.Count != 5) {
+            throw new Exception("Deferred view lifetime or cache semantics changed");
+        }
+    }
+
+    static string ParseError(string source, bool deferred) {
+        try {
+            if (deferred) { JsonDoc.ParseScopedDeferred<int>(source, (doc) => 1); }
+            else { JsonDoc.ParseScoped<int>(source, (doc) => 1); }
+        } catch (JsonException e) {
+            return e.Message;
+        }
+        return "";
+    }
+
+    static void CheckErrorParity(string source) {
+        string eager = Program.ParseError(source, false);
+        if (eager.Length == 0 || Program.ParseError(source, true) != eager) {
+            throw new Exception("Deferred parsing must report errors before the callback");
+        }
+    }
+
+    static void CheckLargeDeferredEscape() {
+        StringBuilder input = new StringBuilder();
+        input.Append("[\"head\\n");
+        for (int i = 0; i < 8000; i++) { input.Append("0123456789"); }
+        input.Append("\",\"tail\\t\"]");
+        JsonDoc.ParseScopedDeferred(input.ToString(), (doc) => {
+            int first = doc.FirstChild(doc.root);
+            StringView view = doc.ViewAt(first);
+            int second = doc.NextSibling(first);
+            if (doc.StrAt(second, "") != "tail\t" || view.Length != 80005
+            || !view.Equals(StringView.FromString(doc.StrAt(first, "")))) {
+                throw new Exception("Large deferred value lost its cached view");
+            }
+        });
+    }
+
+    static void CheckDeferredPaths() {
+        string source = "{\"\\u0069d\":7,\"id\":8,\"text\":\"a\\u0000\\ud83d\\ude00\",\"number\":\"\\u00342\",\"flag\":\"tr\\u0075e\",\"last\":\"\\ud800tail\",\"unread\":\"\\n\"}";
+        JsonDoc.ParseScopedDeferred(source, (doc) => Program.CheckDeferred(doc));
+
+        // A dense array fills the fixed tape after its first object has been scanned.
+        StringBuilder dense = new StringBuilder();
+        dense.Append("[");
+        dense.Append(source);
+        for (int i = 0; i < 18000; i++) { dense.Append(",0"); }
+        string densePrefix = dense.ToString();
+        JsonDoc.ParseScopedDeferred(densePrefix + "]", (doc) => {
+            doc.root = doc.FirstChild(doc.root);
+            Program.CheckDeferred(doc);
+        });
+
+        string wire = JsonDoc.ParseScopedDeferred<string>(source, (doc) => doc.ToJson());
+        if (wire != JsonDoc.Parse(source).ToJson()) { throw new Exception("Deferred serialization changed"); }
+        JsonValue dom = JsonDoc.ParseScopedDeferred<JsonValue>("{\"s\":\"\\ttext\"}", (doc) => JsonValue.FromDoc(doc));
+        if (dom.Str("s", "") != "\ttext") { throw new Exception("Deferred DOM conversion changed"); }
+
+        string shortEscapes = "\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"";
+        if (JsonDoc.ParseScopedDeferred<string>(shortEscapes, (doc) => doc.StrOfSlot(doc.root))
+        != "\"\\/\u0008\u000c\n\r\t") {
+            throw new Exception("Deferred parsing changed short escapes");
+        }
+
+        Program.CheckErrorParity("{\"unread\":\"\\q\"}");
+        Program.CheckErrorParity("\"\\ud800\\uZZZZ\"");
+        Program.CheckErrorParity("{\"unread\":\"\\u12\"}");
+        Program.CheckErrorParity("{\"\\q\":1}");
+        Program.CheckErrorParity("\"tail" + Encoding.CharFromCode(92));
+        Program.CheckErrorParity("\"\\n\" true");
+        Program.CheckErrorParity(densePrefix + ",\"\\uZZZZ\"]");
+
+        bool callbackThrew = false;
+        try {
+            JsonDoc.ParseScopedDeferred("\"\\n\"", (doc) => {
+                doc.StrOfSlot(doc.root);
+                throw new JsonException("deferred callback");
+            });
+        } catch (JsonException e) {
+            callbackThrew = e.Message == "deferred callback";
+        }
+        if (!callbackThrew || JsonDoc.ParseScopedDeferred<string>("\"\\t\"", (doc) => doc.StrOfSlot(doc.root)) != "\t") {
+            throw new Exception("Deferred scope did not recover after an exception");
+        }
+    }
+
+    static void CheckPairGrowth() {
+        StringBuilder input = new StringBuilder();
+        input.Append("{\"\\u0078\":1");
+        for (int i = 0; i < 9000; i = i + 1) { input.Append(",\"x\":0"); }
+        input.Append(",\"end\":{\"text\":\"tail\\n\"}}");
+        string source = input.ToString();
+
+        JsonDoc.ParseScoped(source, (doc) => {
+            if (doc.Count(doc.root) != 9002 || doc.PathInt("x", -1) != 1
+            || doc.PathStr("end.text", "") != "tail\n" || doc.escPool.Count != 2) {
+                throw new Exception("Pair growth lost property order, links, or escaped text");
+            }
+            JsonDoc.ParseScoped("{\"x\":99}", (inner) => {
+                if (inner.PathInt("x", -1) != 99) { throw new Exception("Nested parse after pair growth"); }
+            });
+            if (doc.PathInt("x", -1) != 1 || doc.PathStr("end.text", "") != "tail\n") {
+                throw new Exception("Nested parse overwrote grown tape");
+            }
+        });
+        JsonDoc owned = JsonDoc.Parse(source);
+        if (owned.slots.Length != owned.slotCount || owned.pairs.Length != owned.pairCount) {
+            throw new Exception("Persistent tape must own exactly its used entries");
+        }
+        JsonDoc.ParseScoped("{\"x\":99}", (doc) => {
+            if (doc.PathInt("x", -1) != 99) { throw new Exception("Reuse after pair growth"); }
+        });
+        if (owned.PathInt("x", -1) != 1 || owned.PathStr("end.text", "") != "tail\n") {
+            throw new Exception("Later parses overwrote the persistent tape");
+        }
+    }
+
+    static void CheckFrameGrowth() {
+        int previousDepth = JsonDoc.MaxDepth;
+        StringBuilder input = new StringBuilder();
+        for (int i = 0; i < previousDepth + 3; i++) { input.Append("["); }
+        input.Append("{\"value\":42}");
+        for (int i = 0; i < previousDepth + 3; i++) { input.Append("]"); }
+        string source = input.ToString();
+        Program.CheckErrorParity(source);
+        try {
+            JsonDoc.MaxDepth = previousDepth + 4;
+            JsonDoc.ParseScoped(source, (doc) => {
+                int slot = doc.root;
+                for (int i = 0; i < previousDepth + 3; i++) { slot = doc.FirstChild(slot); }
+                if (doc.KindAt(slot) != 5 || doc.IntAt(doc.FirstChild(slot), -1) != 42) {
+                    throw new Exception("Frame growth lost the nested value");
+                }
+            });
+        } finally {
+            JsonDoc.MaxDepth = previousDepth;
+        }
+    }
+
+    static void CheckFixedTape() {
+        byte[] input = Encoding.GetBytes("[1,2]");
+        JsonSlot[] slots = new JsonSlot[3];
+        JsonPair[] pairs = new JsonPair[0];
+        int[] frames = new int[4];
+        long[] counts = new long[3];
+        counts[0] = 99L;
+        if (JsonDoc.ParsePureFast(input, input.Length, slots, 2, pairs, 0, frames, counts) != -3L
+        || counts[0] != 99L) {
+            throw new Exception("Fixed workspace reported success or published partial counts");
+        }
+        if (JsonDoc.ParsePureFast(input, input.Length, slots, 3, pairs, 0, frames, counts) != 0L
+        || counts[0] != 3L || counts[1] != 0L || counts[2] != input.Length
+        || slots[1].b != 1L || slots[2].b != 2L) {
+            throw new Exception("Fixed workspace did not produce the expected tape");
+        }
+    }
+
+    static void CheckSparseWorkspace() {
+        StringBuilder input = new StringBuilder();
+        input.Append("{\"blob\":\"");
+        for (int i = 0; i < 24000; i++) { input.Append("abcdefghijklmnop"); }
+        input.Append("\",\"id\":42}");
+        string source = input.ToString();
+        JsonScratch scratch = JsonDoc.GetScratch();
+        JsonSlot[] slots = scratch.slots;
+        JsonPair[] pairs = scratch.pairs;
+        JsonDoc.ParseScoped(source, (doc) => {
+            if (doc.slots != slots || doc.pairs != pairs || doc.slotCount != 3 || doc.pairCount != 2
+            || doc.ViewAt(doc.Get("blob")).Length != 384000 || doc.PathInt("id", 0) != 42) {
+                throw new Exception("Sparse input reserved tape by text length");
+            }
+        });
+        JsonDoc doc = JsonDoc.Parse(source);
+        if (doc.slots.Length != 3 || doc.pairs.Length != 2 || doc.PathInt("id", 0) != 42
+        || scratch.slots != slots || scratch.pairs != pairs) {
+            throw new Exception("Owned sparse document replaced the workspace tape");
+        }
+    }
+
+    static void CheckDensePrefixWorkspace() {
+        StringBuilder input = new StringBuilder();
+        input.Append("[");
+        for (int i = 0; i < 18000; i++) { input.Append("0,"); }
+        input.Append("\"");
+        for (int i = 0; i < 70000; i++) { input.Append("abcdefghijklmnop"); }
+        input.Append("\"]");
+        JsonDoc.ParseScoped(input.ToString(), (doc) => {
+            int last = doc.At(doc.root, 18000);
+            if (doc.slotCount != 18002 || doc.slots.Length > 524289
+            || doc.ViewAt(last).Length != 1120000) {
+                throw new Exception("Dense prefix overestimated the tape for a large string");
+            }
+        });
+    }
+
+    static void CheckOversizedSource() {
+        JsonScratch scratch = JsonDoc.GetScratch();
+        byte[] retained = scratch.buf;
+        string padding = "".PadLeft(4 * 1024 * 1024 + 1);
+        JsonDoc.ParseScopedDeferred(padding + "{\"n\":1}", (doc) => {
+            if (doc.buf == retained || doc.PathInt("n", 0) != 1) {
+                throw new Exception("Oversized scoped source did not use its own buffer");
+            }
+        });
+        bool failed = false;
+        try {
+            JsonDoc.ParseScopedDeferred(padding + "[", (doc) => { });
+        } catch (JsonException) { failed = true; }
+        if (!failed || scratch.buf != retained) {
+            throw new Exception("Oversized source replaced the reusable buffer");
+        }
+    }
+
     static void Main() {
+        Program.CheckOversizedSource();
+        Program.CheckSparseWorkspace();
+        Program.CheckDensePrefixWorkspace();
+        Program.CheckDeferredPaths();
+        Program.CheckPairGrowth();
+        Program.CheckFrameGrowth();
+        Program.CheckFixedTape();
+        Program.CheckLargeDeferredEscape();
         string json = "{\"status\":\"ok\",\"code\":200,\"data\":{\"user\":\"alice\",\"role\":\"admin\",\"tags\":[\"dev\",\"qa\"]}}";
 
         // Scoped generic return

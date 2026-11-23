@@ -2,17 +2,15 @@ using System;
 using Gui;
 using Gui.Widget;
 
-// Gui.Widget.Menu v2（树形菜单）conformance：
-// 1. 纯模型——KeyOf/IsGroup、先序展平（收起组跳过子树）、
-// MenuExpandState 集合语义、defaultExpandedKeys 与「自动展开
-// 选中项全部父级」两条首次展开策略（且只套一次）。
-// 2. 帧级——一次 new App 渲染：交互行注册命中矩形、分隔线/表头/
-// disabled 行不注册；三个批量渲染钩子逐行被调用且返回值被消费
-// （委托不能捕获局部变量，用静态计数器/最近入参记录）。
-// 3. 点击内核——ClickTree：组行 toggle 不动 selected、叶子写
-// selectedKey、disabled 无响应、越界 id 安全。
+// Gui.Widget.Menu 保留式树形菜单 conformance：
+// 1. MenuExpandState 集合语义（Expand / Collapse / Toggle / Contains）。
+// 2. 树形构建与组行展开/收起（不改选中状态，子级按需出现/消失）。
+// 3. 保留式点击交互：点组行 toggle expandState；点叶子写回 selectedKey；
+//    disabled 行点击不触发 Select 且不修改 selectedKey；SelectKey/SelectIndex
+//    及 SetProp/GetProp 与 Binding<string> 双向同步。
 class MenuTest {
     static int fails;
+    static int selectEvents;
 
     static void Eq(string what, int got, int want) {
         if (got == want) { return; }
@@ -34,47 +32,14 @@ class MenuTest {
         Console.WriteLine("FAIL " + what);
     }
 
-    // ---- 批量渲染钩子探针（静态记录：委托不能捕获局部变量） ----------
-    static int labelCalls;
-    static int iconCalls;
-    static int expandCalls;
-    static string lastExpandKey;
-    static bool lastExpanded;
-
-    static string CapLabel(MenuItem m) {
-        labelCalls = labelCalls + 1;
-        return "«" + m.label + "»";
-    }
-
-    static string PickIcon(MenuItem m) {
-        iconCalls = iconCalls + 1;
-        return "bookmark";
-    }
-
-    static string PickArrow(MenuItem m, bool expanded) {
-        expandCalls = expandCalls + 1;
-        lastExpandKey = MenuTest.KeyOf(m);
-        lastExpanded = expanded;
-        if (expanded) { return "chevron-down"; }
-        return "chevron-right";
-    }
-
-    // 现行契约：显式 key 优先，空串退化为 label；kind==3 或有子项即组。
-    static string KeyOf(MenuItem m) {
-        if (m.key != null && m.key != "") { return m.key; }
-        return m.label;
-    }
-
-    static bool IsGroup(MenuItem m) {
-        if (m.kind == 3) { return true; }
-        return m.children != null && m.children.Count > 0;
+    static void OnMenuSelect() {
+        selectEvents = selectEvents + 1;
     }
 
     static MenuItem Leaf(string label, string icon) {
         return MenuItem.Item(label, icon, 0);
     }
 
-    // 一棵两层树：hdr / home / sep / grp[a, b, 禁用 c]
     static List<MenuItem> MakeTree(out MenuItem grp) {
         MenuItem a = MenuTest.Leaf("a", "");
         MenuItem b = MenuTest.Leaf("b", "");
@@ -93,43 +58,41 @@ class MenuTest {
         return items;
     }
 
-    static string RowLabels(List<MenuRow> rows) {
-        string s = "";
-        int i = 0;
-        while (i < rows.Count) {
-            if (i > 0) { s = s + ","; }
-            string lb = rows[i].item.label;
-            if (lb == "") { lb = "sep"; }
-            s = s + lb + "@" + Convert.ToString(rows[i].depth);
-            i = i + 1;
+    static Button FindMenuButton(Control root, string label) {
+        if (root == null) { return null; }
+        if (root is Button) {
+            for (int i = 0; i < root.ChildCount(); i = i + 1) {
+                Control ch = root.ChildAt(i);
+                if (ch is Label && ch.GetProp("text") == label) {
+                    return (Button)root;
+                }
+                for (int j = 0; j < ch.ChildCount(); j = j + 1) {
+                    Control gch = ch.ChildAt(j);
+                    if (gch is Label && gch.GetProp("text") == label) {
+                        return (Button)root;
+                    }
+                }
+            }
         }
-        return s;
+        for (int i = 0; i < root.ChildCount(); i = i + 1) {
+            Button found = MenuTest.FindMenuButton(root.ChildAt(i), label);
+            if (found != null) { return found; }
+        }
+        return null;
     }
 
     static void Main() {
+        Dispatcher.Init();
         fails = 0;
+        selectEvents = 0;
         MenuItem grp;
         List<MenuItem> items = MenuTest.MakeTree(out grp);
 
-        // ---- KeyOf / IsGroup -------------------------------------------
-        Str("KeyOf explicit", MenuTest.KeyOf(grp), "g1");
-        MenuItem plain = MenuTest.Leaf("home", "");
-        Str("KeyOf falls back to label", MenuTest.KeyOf(plain), "home");
-        True("IsGroup kind3", MenuTest.IsGroup(grp));
-        MenuItem withKids = MenuTest.Leaf("k", "");
-        withKids.children.Add(MenuTest.Leaf("kk", ""));
-        True("IsGroup children on kind0", MenuTest.IsGroup(withKids));
-        True("leaf not group", !MenuTest.IsGroup(plain));
-
-        // ---- 先序展平 ---------------------------------------------------
+        // ---- MenuExpandState 集合语义 ------------------------------------
         MenuExpandState st = new MenuExpandState();
-        List<MenuRow> rows = Menu.BuildVisibleRows(items, st);
-        Str("collapsed order", MenuTest.RowLabels(rows),
-            "nav@0,home@0,sep@0,grp@0");
+        True("initially collapsed", !st.Contains("g1"));
         st.Expand("g1");
-        rows = Menu.BuildVisibleRows(items, st);
-        Str("expanded order", MenuTest.RowLabels(rows),
-            "nav@0,home@0,sep@0,grp@0,a@1,b@1,c@1");
+        True("Expand adds key", st.Contains("g1"));
         st.Toggle("g1");
         True("Toggle off", !st.Contains("g1"));
         st.Toggle("g1");
@@ -137,97 +100,65 @@ class MenuTest {
         st.Collapse("nope");
         True("Collapse absent is no-op", st.Contains("g1"));
 
-        // ---- 首次展开：defaultExpandedKeys -------------------------------
-        MenuExpandState st1 = new MenuExpandState();
-        List<string> dflt = new List<string>();
-        dflt.Add("b");          // 深层叶子 key：父级组 g1 被展开
-        Menu.InitDefaults(items, st1, dflt, "");
-        True("default key expands parent chain", st1.Contains("g1"));
-        True("initialized latched", st1.initialized);
-        st1.Collapse("g1");
-        Menu.InitDefaults(items, st1, null, "b");
-        True("InitDefaults runs once", !st1.Contains("g1"));
+        // ---- 保留式 Menu 建树与点击 --------------------------------------
+        Binding<string> sel = "b";
+        Menu menu = new Menu(items, sel);
+        menu.Select.Add(MenuTest.OnMenuSelect);
 
-        // ---- 首次展开：无 default 时按选中项的父级 -----------------------
-        MenuExpandState st2 = new MenuExpandState();
-        Menu.InitDefaults(items, st2, null, "b");
-        True("selected ancestors auto-expand", st2.Contains("g1"));
-        MenuExpandState st3 = new MenuExpandState();
-        Menu.InitDefaults(items, st3, null, "home");
-        True("top-level selection expands nothing", st3.keys.Count == 0);
-        MenuExpandState st4 = new MenuExpandState();
-        Menu.InitDefaults(items, st4, null, "");
-        True("empty selection expands nothing", st4.keys.Count == 0);
+        App app = App.CreateOffscreen("menu", 320, 480);
+        app.SetRootControl(menu);
+        app.BeginOffscreenFrame();
+        menu.MeasureTree(app, 220);
+        menu.Arrange(0, 0, 220, 480);
+        app.EndOffscreenFrame();
 
-        // ---- 帧级：命中注册与钩子消费 ------------------------------------
-        App app = new App("menu", 800, 600);
-        SignalString sel = new SignalString("b");
-        MenuExpandState rst = new MenuExpandState();
-        labelCalls = 0; iconCalls = 0; expandCalls = 0;
-        int first = Menu.RenderTree(app, 10, 10, 220, 500, 30, items, sel, rst,
-                                    MenuTest.CapLabel, MenuTest.PickIcon,
-                                    MenuTest.PickArrow, null, 0);
-        // 选中 'b'（深层叶子）⇒ 自动展开 g1：可见 7 行。钩子逐行调用
-        // （分隔线除外）：label 6 行、icon 5 行（叶子+组）、expand 仅组行。
-        Str("visible rows", MenuTest.RowLabels(Menu.BuildVisibleRows(items, rst)),
-            "nav@0,home@0,sep@0,grp@0,a@1,b@1,c@1");
-        Eq("renderLabel batch calls", labelCalls, 6);
-        Eq("renderIcon batch calls", iconCalls, 5);
-        Eq("expandIcon per group", expandCalls, 1);
-        True("expandIcon got expanded", lastExpanded);
-        Str("expandIcon key", lastExpandKey, "g1");
+        // 初始收起：只见 grp，不见子项 a/b/c。
+        Button grpBtn = MenuTest.FindMenuButton(menu, "grp");
+        True("group button built", grpBtn != null);
+        True("child hidden when collapsed", MenuTest.FindMenuButton(menu, "a") == null);
 
-        List<int> rectHome = app.hitTester.RectOf(first + 1);
-        True("home registered", rectHome != null);
-        True("group registered", app.hitTester.RectOf(first + 3) != null);
-        True("child registered", app.hitTester.RectOf(first + 4) != null);
-        True("disabled not registered", app.hitTester.RectOf(first + 6) == null);
-        True("header not registered", app.hitTester.RectOf(first) == null);
-        True("separator not registered", app.hitTester.RectOf(first + 2) == null);
-        if (rectHome != null) {
-            Eq("row rect y", rectHome[1], 10 + 30);
-            Eq("row height", rectHome[3], 30);
-        }
-
-        // ---- 滚动剔除 ----------------------------------------------------
-        app.hitTester.Clear();
-        int first2 = Menu.RenderTree(app, 10, 10, 220, 70, 30, items, sel, rst,
-                                     null, null, null, null, 150);
-        // 行 0..4 滚出上沿（含组行），行 5 仍在视口内。
-        True("scrolled row out", app.hitTester.RectOf(first2 + 3) == null);
-        True("scrolled row still in", app.hitTester.RectOf(first2 + 5) != null);
-
-        // ---- ClickTree 内核 ----------------------------------------------
-        // 组行：toggle 收起，selectedKey 不动。
-        bool changed = Menu.ClickTree(app, first, items, rst, sel, first + 3);
-        True("group click reports change", changed);
-        True("group click collapsed it", !rst.Contains("g1"));
+        // 点击组行：展开 g1，不改 selectedKey，也不触发 Select。
+        if (grpBtn != null) { grpBtn.Click.Raise(); }
+        True("group click expands g1", menu.expandState.Contains("g1"));
         Str("group click keeps selection", sel.Get(), "b");
-        // 再点组行：重新展开；然后点其子 'a' 选中。
-        app.hitTester.Clear();
-        int f4 = Menu.RenderTree(app, 10, 10, 220, 500, 30, items, sel, rst,
-                                 null, null, null, null, 0);
-        Menu.ClickTree(app, f4, items, rst, sel, f4 + 3);
-        True("re-expanded", rst.Contains("g1"));
-        app.hitTester.Clear();
-        int f5 = Menu.RenderTree(app, 10, 10, 220, 500, 30, items, sel, rst,
-                                 null, null, null, null, 0);
-        changed = Menu.ClickTree(app, f5, items, rst, sel, f5 + 4);
-        True("child click changes", changed);
-        Str("child selected", sel.Get(), "a");
-        // 同键再点：无变化。
-        True("re-click same leaf no change",
-             !Menu.ClickTree(app, f5, items, rst, sel, f5 + 4));
-        // disabled 行（c 在 idx 6）：即便显式喂 id 也无响应。
+        Eq("group click does not fire Select", selectEvents, 0);
+
+        Button childA = MenuTest.FindMenuButton(menu, "a");
+        Button childB = MenuTest.FindMenuButton(menu, "b");
+        Button childC = MenuTest.FindMenuButton(menu, "c");
+        True("child a visible after expand", childA != null);
+        True("child b active class", childB != null && childB.ClassName.Contains("active"));
+        True("disabled child marked disabled", childC != null && childC.IsDisabled());
+
+        // 点击禁用项：忽略。
         int ver = sel.Version();
-        True("disabled click no change",
-             !Menu.ClickTree(app, f5, items, rst, sel, f5 + 6));
+        if (childC != null) { childC.Click.Raise(); }
         Eq("disabled click keeps version", sel.Version(), ver);
-        // 表头行（kind2）与越界 id：安全无操作。
-        True("header click no change",
-             !Menu.ClickTree(app, f5, items, rst, sel, f5));
-        True("out of range safe",
-             !Menu.ClickTree(app, f5, items, rst, sel, f5 + 99));
+        Eq("disabled click keeps Select count", selectEvents, 0);
+
+        // 点击叶子 a：更新 Binding<string> 并触发 Select。
+        if (childA != null) { childA.Click.Raise(); }
+        Str("child selected", sel.Get(), "a");
+        Eq("child click fires Select", selectEvents, 1);
+
+        // 再次点击组行：收起 g1，子项移除但选中保持 "a"。
+        Button grpBtn2 = MenuTest.FindMenuButton(menu, "grp");
+        if (grpBtn2 != null) { grpBtn2.Click.Raise(); }
+        True("group click collapses g1", !menu.expandState.Contains("g1"));
+        True("child removed after collapse", MenuTest.FindMenuButton(menu, "a") == null);
+        Str("collapse keeps selection", sel.Get(), "a");
+
+        // SetProp / GetProp / SyncBinding
+        menu.SetProp("selectedKey", "home");
+        Str("GetProp selectedKey", menu.GetProp("selectedKey"), "home");
+        sel.Set("b");
+        menu.SyncBinding();
+        Str("SyncBinding reflects external write", menu.GetProp("selectedKey"), "b");
+
+        app.StopLoop();
+        app.SetRootControl(null);
+        app.canvas.Destroy();
+        Dispatcher.Clear();
 
         if (fails == 0) { Console.WriteLine("menu_test: OK"); }
         else {

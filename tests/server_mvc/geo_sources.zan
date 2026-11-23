@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Web;
-using Zan.Web.Blog;
 using Zan.Web.Core;
 using Zan.Web.Security;
 using Zan.Web.Services;
@@ -64,6 +64,16 @@ class Program {
         m.Set("site.description", desc);
         Settings.Prime(m);
     }
+    static async bool ContributeArticles(GeoBuilder b) {
+        string root = await Geo.SiteUrl();
+        if (root.Length == 0) { return true; }
+        b.Url(root + "/articles", "", "daily", "0.8");
+        b.Link("站点导航", "专栏", root + "/articles", "最新文章与专栏");
+        return true;
+    }
+    static async bool ThrowingContributor(GeoBuilder b) {
+        throw new Exception("db unavailable");
+    }
     static async void Main() {
         AppServices.Use(null);
         Settings.Forget();
@@ -96,39 +106,45 @@ class Program {
             "llms-full.txt answers as markdown");
 
         /* ---- 配好公开地址：绝对地址与导航都跟着变 ---- */
-        Program.PrimeSettings("https://blog.test", "Probe Blog", "probe site");
+        Program.PrimeSettings("https://site.test", "Probe Site", "probe site");
         sitemap = await Program.Fetch(app, "/sitemap.xml");
-        Program.Check(sitemap.Contains("<loc>https://blog.test/</loc>")
-            && sitemap.Contains("<loc>https://blog.test/blog</loc>"),
-            "sitemap lists home and blog with absolute addresses");
+        Program.Check(sitemap.Contains("<loc>https://site.test/</loc>")
+            && !sitemap.Contains("/blog"),
+            "sitemap lists home with absolute address and no hardcoded blog route");
         robots = await Program.Fetch(app, "/robots.txt");
-        Program.Check(robots.Contains("Sitemap: https://blog.test/sitemap.xml")
-            && robots.Contains("llms.txt: https://blog.test/.well-known/llms.txt"),
+        Program.Check(robots.Contains("Sitemap: https://site.test/sitemap.xml")
+            && robots.Contains("llms.txt: https://site.test/.well-known/llms.txt"),
             "robots points at the absolute sitemap and llms.txt");
         llms = await Program.Fetch(app, "/llms.txt");
-        Program.Check(llms.Contains("# Probe Blog") && llms.Contains("> probe site")
-            && llms.Contains("## 站点导航") && llms.Contains("[博客](https://blog.test/blog)"),
-            "llms.txt carries the site summary and its navigation");
+        Program.Check(llms.Contains("# Probe Site") && llms.Contains("> probe site")
+            && llms.Contains("## 站点导航") && llms.Contains("[首页](https://site.test/)"),
+            "llms.txt carries the site summary and home navigation");
 
         /* ---- 规范地址：只认受信任的设置，绝不回退 Host ---- */
-        Program.Check(Geo.CanonicalUrl("https://blog.test/base///") == "https://blog.test/base"
+        Program.Check(Geo.CanonicalUrl("https://site.test/base///") == "https://site.test/base"
             && Geo.CanonicalUrl("javascript:evil") == ""
             && Geo.CanonicalUrl("https://user@evil.test") == ""
-            && Geo.CanonicalUrl("https://blog.test/?q=x") == "",
+            && Geo.CanonicalUrl("https://site.test/?q=x") == "",
             "canonical rejects anything but a plain public address");
-        Program.Check(await Geo.Canonical("/blog") == "https://blog.test/blog",
+        Program.Check(await Geo.Canonical("/articles") == "https://site.test/articles",
             "canonical is absolute once the public address is known");
         Settings.Forget();
-        Program.Check(await Geo.Canonical("/blog") == "/blog",
+        Program.Check(await Geo.Canonical("/articles") == "/articles",
             "canonical falls back to a relative path, never the Host header");
 
-        /* ---- 模块贡献者：数据库不可用时安静降级，不拖垮整张站点地图 ---- */
-        Program.PrimeSettings("https://blog.test", "Probe Blog", "probe site");
-        BlogGeo.Register();
+        /* ---- 模块贡献者：异常安静降级，不拖垮整张站点地图 ---- */
+        Program.PrimeSettings("https://site.test", "Probe Site", "probe site");
+        Geo.AddContributor(Program.ThrowingContributor);
+        Geo.AddContributor(Program.ContributeArticles);
+        Log.SetMinLevel(Log.ERROR);
         sitemap = await Program.Fetch(app, "/sitemap.xml");
-        Program.Check(sitemap.Contains("<loc>https://blog.test/</loc>")
-            && sitemap.Contains("<loc>https://blog.test/blog</loc>"),
-            "blog contributor degrades quietly without a database");
+        Program.Check(sitemap.Contains("<loc>https://site.test/</loc>")
+            && sitemap.Contains("<loc>https://site.test/articles</loc>"),
+            "failing contributor degrades quietly while healthy contributor populates sitemap");
+        llms = await Program.Fetch(app, "/llms.txt");
+        Log.SetMinLevel(Log.INFO);
+        Program.Check(llms.Contains("[专栏](https://site.test/articles)"),
+            "module contributor populates llms.txt navigation");
 
         /* ---- 路由只挂一次 ---- */
         int robotsRoutes = 0;

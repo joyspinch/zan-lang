@@ -1,0 +1,326 @@
+using System;
+using System.Json;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Threading;
+using System.Web;
+
+class Program {
+    static int port = 23630;
+    static int failures;
+    static string profileHeader = "X-Zan-Request-Profile";
+    static Gate entered = new Gate();
+    static Gate release = new Gate();
+
+    static void Check(bool valid, string name) {
+        Console.WriteLine((valid ? "ok " : "FAIL ") + name);
+        if (!valid) { failures = failures + 1; }
+    }
+
+    static string Identity(HttpContext ctx) {
+        RequestTrace trace = ctx.Trace;
+        return trace == null ? "disabled" : Convert.ToString(trace.Id());
+    }
+
+    static async void Reply(HttpContext ctx) { ctx.Text(Identity(ctx)); }
+
+    static async int AllocateInChild() {
+        await Task.Delay(20);
+        int[] allocation = new int[262144];
+        allocation[262143] = 7;
+        return allocation[262143];
+    }
+
+    static async void Slow(HttpContext ctx) {
+        RequestTrace trace = ctx.Trace;
+        string id = Identity(ctx);
+        int stage = trace == null ? -1 : trace.Begin("fixture.work");
+        if (await AllocateInChild() != 7) { throw new Exception("fixture allocation failed"); }
+        entered.Signal();
+        // CheckOverlap controls release. A timed wait would leave a watchdog task in the profile.
+        await release.Wait();
+        if (trace != null) {
+            trace.Fail(stage, "fixture_fallback");
+            trace.End(stage);
+        }
+        ctx.Text(id == Identity(ctx) ? id : "trace changed");
+    }
+
+    static async void Throwing(HttpContext ctx) { throw new Exception("profile-private-exception"); }
+
+    static async void Accept(WebApp app, TcpListener listener) {
+        while (listener.IsRunning()) {
+            nint sock = await listener.AcceptAsync();
+            if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
+        }
+    }
+
+    static string Get(string path) {
+        return "GET " + path + " HTTP/1.1\r\nHost: local.test\r\nConnection: close\r\n\r\n";
+    }
+
+    static async string ReadResponses(TcpClient client) {
+        StringBuilder response = new StringBuilder();
+        while (true) {
+            string part = await client.RecvAsync(4096, 8000);
+            if (part.Length == 0) { break; }
+            response.Append(part);
+        }
+        return response.ToString();
+    }
+
+    static async string Exchange(int serverPort, string wire) {
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", serverPort, 3000);
+        if (client == null) { return ""; }
+        try {
+            int sent = await client.SendAsync(wire);
+            if (sent != wire.Length) { return ""; }
+            return await ReadResponses(client);
+        } finally {
+            client.Close();
+        }
+    }
+
+    static int Row(JsonDoc doc, int index) { return doc.At(doc.Get("requests"), index); }
+
+    static int Stage(JsonDoc doc, int row, string name) {
+        int stages = doc.Get(row, "stages");
+        for (int i = 0; i < doc.Count(stages); i = i + 1) {
+            int stage = doc.At(stages, i);
+            if (doc.StrAt(doc.Get(stage, "name"), "") == name) { return stage; }
+        }
+        return -1;
+    }
+
+    static bool FinalStages(JsonDoc doc, int row) {
+        int send = Stage(doc, row, "send");
+        int cleanup = Stage(doc, row, "cleanup");
+        long sendAt = doc.LongAt(doc.Get(send, "offset_us"), -1);
+        long sendTime = doc.LongAt(doc.Get(send, "elapsed_us"), -1);
+        long cleanupAt = doc.LongAt(doc.Get(cleanup, "offset_us"), -1);
+        long cleanupTime = doc.LongAt(doc.Get(cleanup, "elapsed_us"), -1);
+        return sendAt >= 0 && sendTime >= 0 && cleanupAt >= sendAt + sendTime && cleanupTime >= 0
+        && doc.LongAt(doc.Get(row, "elapsed_us"), -1) >= cleanupAt + cleanupTime
+        && !doc.Has(send, "failure") && !doc.Has(cleanup, "failure");
+    }
+
+    static bool ReplyMatches(HttpResponse response, long id) {
+        return id > 0 && response.statusCode == 200 && response.body == Convert.ToString(id);
+    }
+
+    static async void CheckOverlap(RequestProfiler profiler, Route slowRoute) {
+        string body = "payload=profile-private-body";
+        string first = "POST /slow/profile-private-path?q=profile-private-query HTTP/1.1\r\nHost: local.test\r\n"
+        + "Authorization: Bearer profile-private-auth\r\nCookie: a=profile-private-cookie\r\n"
+        + "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: "
+        + Convert.ToString(body.Length) + "\r\n\r\n" + body;
+        // Send two requests on the first socket while keeping its first handler parked.
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", port, 3000);
+        if (client == null) { throw new Exception("slow connection failed"); }
+        HttpResponse fast = null;
+        JsonDoc during = null;
+        string wire = "";
+        try {
+            string requests = first + Get("/next");
+            int sent = await client.SendAsync(requests);
+            if (sent != requests.Length || !await entered.Wait(3000)) {
+                throw new Exception("slow handler failed to start");
+            }
+            fast = HttpResponse.Parse(await Exchange(port, Get("/fast")));
+            during = JsonDoc.Parse(profiler.SnapshotJson());
+            release.Signal();
+            wire = await ReadResponses(client);
+        } finally {
+            client.Close();
+        }
+        HttpResponse slow = HttpResponse.Parse(wire);
+        HttpResponse next = HttpResponse.Parse("");
+        int split = wire.IndexOf("\r\n\r\n") + 4 + slow.framingLength;
+        if (slow.statusCode == 200 && split <= wire.Length) {
+            next = HttpResponse.Parse(wire.Substring(split));
+            slow.body = slow.body.Substring(0, slow.framingLength);
+        }
+
+        string json = profiler.SnapshotJson(2);
+        JsonDoc page = JsonDoc.Parse(json);
+        long before = page.GetLong("next_before");
+        JsonDoc older = JsonDoc.Parse(profiler.SnapshotJson(2, before));
+        long nextId = page.GetLong("requests[0].id");
+        long slowId = page.GetLong("requests[1].id");
+        long fastId = older.GetLong("requests[0].id");
+        string slowHeader = slow.GetHeader(profileHeader);
+        string nextHeader = next.GetHeader(profileHeader);
+        string fastHeader = fast.GetHeader(profileHeader);
+        Check(ReplyMatches(slow, slowId) && ReplyMatches(next, nextId) && ReplyMatches(fast, fastId)
+        && slowId < fastId && fastId < nextId && slowHeader.Length > 0 && nextHeader.Length > 0
+        && fastHeader.Length > 0 && slowHeader != nextHeader && slowHeader != fastHeader && nextHeader != fastHeader,
+        "keep-alive and overlapping requests have distinct identities");
+        Check(during.GetLong("completed") == 1 && during.GetLong("requests[0].id") == fastId
+        && page.GetLong("completed") == 3 && page.Count(page.Get("requests")) == 2
+        && before > 0 && older.Count(older.Get("requests")) == 1 && older.GetLong("next_before", -1) == 0,
+        "cursor pages by completion order across overlapping requests");
+
+        int slowRow = Row(page, 1);
+        int custom = Stage(page, slowRow, "fixture.work");
+        Check(page.GetString("requests[1].protocol") == "HTTP/1" && page.GetString("requests[1].method") == "POST"
+        && page.GetString("requests[1].route") == slowRoute.Pattern()
+        && page.GetString("requests[1].action") == slowRoute.Action()
+        && page.GetInt("requests[1].status") == 200 && page.GetString("requests[1].outcome") == "sent"
+        && page.StrAt(page.Get(custom, "failure"), "") == "fixture_fallback"
+        && page.LongAt(page.Get(custom, "elapsed_us"), -1) >= 0
+        && Stage(page, Row(page, 0), "fixture.work") < 0 && Stage(older, Row(older, 0), "fixture.work") < 0,
+        "custom stage stays with its request across await");
+        Check(FinalStages(page, slowRow) && FinalStages(page, Row(page, 0)) && FinalStages(older, Row(older, 0)),
+        "send and cleanup finish before publication");
+        Check(!json.Contains("profile-private-"), "profile omits headers, query, path parameter and body");
+        long slowBytes = page.GetLong("requests[1].resources.allocated_bytes", -1);
+        long fastBytes = older.GetLong("requests[0].resources.allocated_bytes", -1);
+        long nextBytes = page.GetLong("requests[0].resources.allocated_bytes", -1);
+        long slices = page.GetLong("requests[1].resources.slices", 0);
+        long unfinished = page.GetLong("requests[1].resources.unfinished_tasks", -1);
+        bool isolated = slowBytes >= 1048576 && fastBytes >= 0 && fastBytes < 1048576
+            && nextBytes >= 0 && nextBytes < 1048576 && slices > 1 && unfinished == 0;
+        if (!isolated) {
+            Console.WriteLine("allocation bytes slow=" + Convert.ToString(slowBytes)
+                + " fast=" + Convert.ToString(fastBytes) + " next=" + Convert.ToString(nextBytes)
+                + " slices=" + Convert.ToString(slices) + " unfinished=" + Convert.ToString(unfinished));
+        }
+        Check(isolated, "allocation from resumed child stays with the originating request");
+        bool timer = false;
+        int waits = page.Get(slowRow, "waits");
+        for (int i = 0; i < page.Count(waits); i++) {
+            int wait = page.At(waits, i);
+            if (page.StrAt(page.Get(wait, "kind"), "") == "timer"
+                && page.StrAt(page.Get(wait, "file"), "").EndsWith("web_request_profile.zan")
+                && page.IntAt(page.Get(wait, "line"), 0) > 0
+                && page.LongAt(page.Get(wait, "elapsed_us"), -1) >= 10000) { timer = true; }
+        }
+        Check(timer, "actual timer suspension includes source and elapsed time");
+        Check(ExecutionMatches(page, slowRow, slices, slowBytes), "execution slices identify the process and account for request allocations");
+        Check(StageResourcesMatch(page, slowRow) && StageResourcesMatch(page, Row(page, 0))
+            && StageResourcesMatch(older, Row(older, 0))
+            && page.LongAt(page.Get(custom, "allocated_bytes"), -1) >= 1048576,
+            "stage resources account for nested child allocations and the request residual");
+    }
+
+    static bool StageResourcesMatch(JsonDoc page, int row) {
+        int resources = page.Get(row, "resources");
+        long bytes = page.LongAt(page.Get(resources, "residual_allocated_bytes"), -1);
+        long cpu = page.LongAt(page.Get(resources, "residual_cpu"), -1);
+        long totalCpu = page.LongAt(page.Get(resources, "cpu"), -1);
+        int head = Stage(page, row, "receive_head");
+        int deadline = Stage(page, row, "request_deadline");
+        if (bytes < 0 || (totalCpu >= 0 && cpu < 0)
+            || page.StrAt(page.Get(resources, "coverage"), "") != "read-loop-to-cleanup"
+            || page.LongAt(page.Get(head, "allocated_bytes"), -1) < 0
+            || page.LongAt(page.Get(deadline, "allocated_bytes"), -1) < 0) { return false; }
+        int stages = page.Get(row, "stages");
+        for (int i = 0; i < page.Count(stages); i = i + 1) {
+            int stage = page.At(stages, i);
+            long stageBytes = page.LongAt(page.Get(stage, "allocated_bytes"), -1);
+            long stageCpu = page.LongAt(page.Get(stage, "cpu"), -1);
+            if (stageBytes < 0 || (totalCpu >= 0 && stageCpu < 0)) { return false; }
+            bytes += stageBytes;
+            cpu += stageCpu;
+        }
+        return bytes == page.LongAt(page.Get(resources, "allocated_bytes"), -1)
+            && (totalCpu < 0 || cpu == totalCpu);
+    }
+
+    static bool ExecutionMatches(JsonDoc page, int row, long slices, long allocated) {
+        if (!OperatingSystem.IsWindows()) { return !page.Has(row, "execution_slices"); }
+        int execution = page.Get(row, "execution_slices");
+        int count = page.Count(execution);
+        long omitted = page.LongAt(page.Get(row, "omitted_execution_slices"), -1);
+        if (page.GetLong("process_start_unix_ms") <= 0 || count <= 0 || count > 64
+            || omitted < 0 || count + omitted != slices || (omitted > 0 && count != 64)) { return false; }
+        long requestStart = page.LongAt(page.Get(row, "start_us"), -1);
+        long requestEnd = requestStart + page.LongAt(page.Get(row, "elapsed_us"), -1);
+        long total = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int slice = page.At(execution, i);
+            long start = page.LongAt(page.Get(slice, "start_us"), -1);
+            long elapsed = page.LongAt(page.Get(slice, "elapsed_us"), -1);
+            long bytes = page.LongAt(page.Get(slice, "allocated_bytes"), -1);
+            if (page.LongAt(page.Get(slice, "tid"), 0) <= 0 || start < requestStart
+                || elapsed < 0 || start + elapsed > requestEnd || bytes < 0) { return false; }
+            total = total + bytes;
+        }
+        return omitted == 0 ? total == allocated : total <= allocated;
+    }
+
+    static async void CheckErrors(RequestProfiler profiler) {
+        HttpResponse error = HttpResponse.Parse(await Exchange(port, Get("/throw")));
+        HttpResponse malformed = HttpResponse.Parse(await Exchange(port,
+        "POST /body HTTP/1.1\r\nHost: local.test\r\nConnection: close\r\n"
+        + "Transfer-Encoding: chunked\r\n\r\nprofile-private-chunk\r\n"));
+        HttpResponse missing = HttpResponse.Parse(await Exchange(port, Get("/profile-private-missing")));
+        string json = profiler.SnapshotJson();
+        JsonDoc page = JsonDoc.Parse(json);
+        int handler = Stage(page, Row(page, 2), "handler");
+        Check(error.statusCode == 500 && !error.body.Contains("profile-private-")
+        && page.GetInt("requests[2].status") == 500 && page.GetString("requests[2].route") == "/throw"
+        && page.StrAt(page.Get(handler, "failure"), "") == "Exception" && FinalStages(page, Row(page, 2)),
+        "handler exception sends and records a sanitized 500");
+        int receive = Stage(page, Row(page, 1), "receive_body");
+        Check(malformed.statusCode == 400 && page.GetInt("requests[1].status") == 400
+        && page.GetString("requests[1].outcome") == "rejected" && page.GetString("requests[1].route") == "/body"
+        && page.StrAt(page.Get(receive, "failure"), "") == "invalid_body"
+        && Stage(page, Row(page, 1), "handler") < 0 && FinalStages(page, Row(page, 1)),
+        "malformed body records rejection before dispatch");
+        Check(missing.statusCode == 404 && page.GetInt("requests[0].status") == 404
+        && page.GetString("requests[0].route", "missing field") == ""
+        && Stage(page, Row(page, 0), "handler") < 0 && !json.Contains("profile-private-"),
+        "route miss records 404 without exposing the target");
+        Check(page.GetLong("completed") == 6 && page.GetLong("overwritten") == 2
+        && page.Count(page.Get("requests")) == 4 && page.GetLong("next_before", -1) == 0
+        && page.GetString("requests[3].route") == "/next", "retention evicts the oldest completions");
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Environment.SetEnvironmentVariable("ZAN_REQUEST_PROFILE_RESOURCES", "1");
+        Environment.SetEnvironmentVariable("ZAN_REQUEST_PROFILE_EXECUTION", "1");
+        Environment.SetEnvironmentVariable("ZAN_REQUEST_PROFILE_STAGES", "1");
+        RequestProfiler profiler = new RequestProfiler(4);
+        WebApp app = new WebApp("127.0.0.1", port);
+        app.UseRequestProfiler(profiler).Timeout(8000);
+        Route slow = app.Post("/slow/{key}", Slow);
+        app.Get("/next", Reply);
+        app.Get("/fast", Reply);
+        app.Get("/throw", Throwing);
+        app.Post("/body", Reply);
+        TcpListener listener = new TcpListener("127.0.0.1", port);
+        listener.Start();
+        Task.Spawn(Accept(app, listener));
+        try {
+            await CheckOverlap(profiler, slow);
+            await CheckErrors(profiler);
+        } finally {
+            await listener.StopAsync();
+            app.Dispose();
+            entered.Close();
+            release.Close();
+        }
+
+        int disabledPort = port + 1;
+        WebApp disabled = new WebApp("127.0.0.1", disabledPort);
+        disabled.Get("/next", Reply);
+        TcpListener disabledListener = new TcpListener("127.0.0.1", disabledPort);
+        disabledListener.Start();
+        Task.Spawn(Accept(disabled, disabledListener));
+        try {
+            string wire = await Exchange(disabledPort, Get("/next"));
+            HttpResponse response = HttpResponse.Parse(wire);
+            Check(response.statusCode == 200 && response.body == "disabled"
+            && !wire.ToLower().Contains("\r\n" + profileHeader.ToLower() + ":"), "disabled profiler adds no header");
+        } finally {
+            await disabledListener.StopAsync();
+            disabled.Dispose();
+        }
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return failures;
+    }
+
+    static int Main() { return await Run(); }
+}

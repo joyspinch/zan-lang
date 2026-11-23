@@ -87,6 +87,18 @@ if(MVC_TOOL)
   set(_compiler ${MVC_TOOL} ${ZANC} ${MVC_MODE})
 endif()
 
+# Plain conformance runs at -O0 (see CMakeLists.txt); cases needing optimization
+# pass -O1 / --publish / -g explicitly. Defaulting heavy packages (Zan.Gui,
+# Zan.Web, Zan.Mvc, Zan.Data) to -O0 avoids multi-minute LLVM O2 passes.
+set(_default_opt_args)
+if(NOT ";${ZANC_ARGS};" MATCHES ";(--publish|-O0|-O1|-O2|-O3|-Os|-Oz|-g);")
+  set(_default_opt_args -O0)
+endif()
+set(_plain_default_opt_args)
+if(NOT ";${PLAIN_ZANC_ARGS};" MATCHES ";(--publish|-O0|-O1|-O2|-O3|-Os|-Oz|-g);")
+  set(_plain_default_opt_args -O0)
+endif()
+
 function(zan_artifact_is_current out_var artifact)
   set(${out_var} FALSE PARENT_SCOPE)
   if(NOT EXISTS ${artifact})
@@ -167,7 +179,7 @@ if(EXPECTED AND OUT_EXE)
   zan_artifact_is_current(_current ${OUT_EXE})
   if(NOT _current)
     execute_process(
-      COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} --check-leaks --arc-guard ${ZANC_ARGS}
+      COMMAND ${_compiler} ${SRC} -o ${OUT_EXE} --check-leaks --arc-guard ${ZANC_ARGS} ${_default_opt_args}
               --package-project ${WORKDIR}
       RESULT_VARIABLE compile_rc
       OUTPUT_VARIABLE compile_out
@@ -237,7 +249,7 @@ if(EXPECTED AND OUT_EXE)
     # The case leaks on purpose: the leak report goes to stdout, so the golden
     # has to come from an uninstrumented build.
     execute_process(
-      COMMAND ${_compiler} ${SRC} -o ${PLAIN_OUT_EXE} ${PLAIN_ZANC_ARGS}
+      COMMAND ${_compiler} ${SRC} -o ${PLAIN_OUT_EXE} ${PLAIN_ZANC_ARGS} ${_plain_default_opt_args}
               --package-project ${WORKDIR}
       RESULT_VARIABLE plain_rc
       OUTPUT_VARIABLE plain_out
@@ -307,7 +319,7 @@ if(DET_STAMP)
         set(_output_args -o ${DET_STAMP}.ir)
       endif()
       execute_process(
-        COMMAND ${_compiler} ${SRC} ${ZANC_ARGS} --emit-ir ${_output_args}
+        COMMAND ${_compiler} ${SRC} ${ZANC_ARGS} ${_default_opt_args} --emit-ir ${_output_args}
         RESULT_VARIABLE rc
         OUTPUT_VARIABLE ir
         ERROR_VARIABLE  err)

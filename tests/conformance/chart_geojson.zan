@@ -1,4 +1,5 @@
 using System;
+using System.Json;
 using Gui.Component.Chart;
 
 namespace Conf;
@@ -49,6 +50,82 @@ class Program {
             + "\"properties\":{\"name\":\"E\"},\"geometry\":{\"type\":\"Polygon\","
             + "\"coordinates\":[[[1.0,2.0],[3.0,4.0]]]}}]}").Count));
         Console.WriteLine("bad4:" + Convert.ToString(ChartGeoJson.ParseText("").Count));
+        CheckTextCompatibility();
+    }
+
+    static void CheckTextCompatibility() {
+        string coordinates = "[[[0,0],[1,0],[1,0],[true,\"1.005\"],[178.125,-1.125]]]";
+        string feature = "\"type\":\"Feature\",\"properties\":{\"n\\u0061me\":\"\\u4e2d\\n\\ud83d\\ude00\","
+        + "\"name\":\"ignored\",\"value\":1e2,\"value\":42},\"geometry\":{\"type\":\"Polyg\\u006fn\","
+        + "\"coordinates\":" + coordinates + "}";
+        string encoded = "{\"type\":\"Feature\",\"UTF8Encoding\":\"true\",\"UTF8Scale\":1.024e3,"
+        + "\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[\"T@@XS@@W\",[null,[],[0,0],[2,0],[0,2]]],"
+        + "\"encodeOffsets\":[[1e2,\"5.9\"]]}}";
+        string[] samples = new string[] {
+            "{" + feature + "}",
+            "{" + feature + ",\"features\":[],\"features\":[{" + feature + "}]}",
+            "{" + feature + ",\"features\":{}}",
+            "{\"features\":[null,{\"geometry\":null},{" + feature + "}],\"features\":[]}",
+            "{" + feature + ",\"extras\":[],\"missing\":",
+            "{" + feature + "} trailing",
+            "{" + feature.Replace("\\n", "\\q") + "}",
+            "{" + feature.Replace("[1,0]", "[-.5,0]") + "}",
+            encoded,
+            encoded.Replace("\"true\"", "1e-2").Replace("1.024e3", "\"\""),
+            encoded.Replace("\"true\"", "0e2"),
+            encoded.Replace("\"Polygon\"", "\"Unknown\""),
+            encoded.Replace("[[1e2,\"5.9\"]]", "{\"offset\":[0,0]}"),
+            encoded.Replace("T@@XS@@W", "\\u0054@@X\\u0053@@W"),
+            "{\"type\":\"Feature\",\"UTF8Encoding\":true,\"geometry\":{\"type\":\"MultiPolygon\","
+            + "\"coordinates\":[null,[\"bad\",\"T@@XS@@W\"],[\"T@@XW@\"],[\"T@@XW@\"]],"
+            + "\"encodeOffsets\":[null,[null,[10240,5120]],[[20480,10240]]]}}"
+        };
+        // Leading JSON whitespace puts the same document on either side of the tape threshold.
+        string padding = "".PadLeft(16384);
+        for (int i = 0; i < samples.Length; i++) {
+            string label = Convert.ToString(i);
+            CheckText(samples[i], label);
+            CheckText(padding + samples[i], "tape " + label);
+        }
+
+        int depth = JsonReader.MaxDepth;
+        try {
+            // An over-depth value ahead of geometry can stop the lenient reader early.
+            JsonReader.MaxDepth = 5;
+            CheckText(padding + "{\"other\":[[[[[5]]]]]," + feature + "}", "over-depth value");
+            CheckText(padding + "{\"other\":[[[[[]]]]]," + feature + "}", "empty boundary container");
+        } finally { JsonReader.MaxDepth = depth; }
+
+        int tapeDepth = JsonDoc.MaxDepth;
+        try {
+            JsonDoc.MaxDepth = -1;
+            CheckText(padding + samples[0], "negative tape depth");
+        } finally { JsonDoc.MaxDepth = tapeDepth; }
+    }
+
+    static void CheckText(string json, string label) {
+        List<ChartMapRegion> want = ChartGeoJson.Parse(JsonValue.ParseLenient(json));
+        List<ChartMapRegion> got = ChartGeoJson.ParseText(json);
+        if (want.Count != got.Count) { throw new Exception("GeoJSON regions " + label); }
+        for (int i = 0; i < want.Count; i++) {
+            ChartMapRegion a = want[i];
+            ChartMapRegion b = got[i];
+            if (a.name != b.name || a.value != b.value || a.rings.Count != b.rings.Count) {
+                throw new Exception("GeoJSON region " + label);
+            }
+            for (int j = 0; j < a.rings.Count; j++) {
+                ChartMapRing x = a.rings[j];
+                ChartMapRing y = b.rings[j];
+                if (x.hole != y.hole || x.points.Count != y.points.Count) {
+                    throw new Exception("GeoJSON ring " + label);
+                }
+                for (int k = 0; k < x.points.Count; k++) {
+                    if (x.points[k].x != y.points[k].x || x.points[k].y != y.points[k].y) {
+                        throw new Exception("GeoJSON point " + label);
+                    }
+                }
+            }
+        }
     }
 
     // 每区域一行 name:value:rings，每环一行 点数:hole:首点x:y:末点x:y。

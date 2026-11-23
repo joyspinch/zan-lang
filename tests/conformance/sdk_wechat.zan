@@ -68,9 +68,52 @@ class Program {
 
     static void TestClientBuilt() {
         WechatClient client = new WechatClient("app", "secret");
-        client.Timeout(5000).Server("api.weixin.qq.com", 443);
+        client.Timeout(5000).Server("api.weixin.qq.com", 443).PlainHttpMode();
         client.SetAccessToken("cached-token", 7200);
         Console.WriteLine("clientBuilt=ok");
+    }
+
+    static void TestHardenedPrimitives() {
+        // 1. WechatResponse.FromRaw 非 2xx 状态码校验
+        WechatRawResponse rawOk = new WechatRawResponse(200, "OK", "application/json",
+            "{\"errcode\":0,\"errmsg\":\"ok\",\"openid\":\"u1\"}", new List<string>());
+        Console.WriteLine("fromRawOk=" + rawOk.Json().Str("openid", ""));
+
+        WechatRawResponse raw502 = new WechatRawResponse(502, "Bad Gateway", "text/html",
+            "<html>bad gateway</html>", new List<string>());
+        try {
+            raw502.Json();
+            Console.WriteLine("fromRaw502=NOT THROWN");
+        } catch (WechatException e) {
+            Console.WriteLine("fromRaw502=" + e.Code);
+        }
+
+        WechatRawResponse raw400Json = new WechatRawResponse(400, "Bad Request", "application/json",
+            "{\"errcode\":40013,\"errmsg\":\"invalid appid\"}", new List<string>());
+        try {
+            raw400Json.Json();
+            Console.WriteLine("fromRaw400=NOT THROWN");
+        } catch (WechatException e) {
+            Console.WriteLine("fromRaw400=" + e.Code);
+        }
+
+        // 2. WechatTypedRequest 延迟分配（空对象不额外分配，写入后正常输出）
+        WechatTypedRequest emptyReq = new WechatTypedRequest();
+        Console.WriteLine("typedEmpty=" + emptyReq.JsonBody() + "|" + Convert.ToString(emptyReq.QueryText().Length));
+        emptyReq.BodyString("touser", "o1").QueryString("type", "image");
+        Console.WriteLine("typedFilled=" + emptyReq.QueryText() + "|" + Convert.ToString(emptyReq.JsonBody().IndexOf("o1") >= 0));
+
+        // 3. WechatTokenCache 命中与提前 300s 过期
+        WechatTokenCache cache = new WechatTokenCache();
+        cache.Set("tok-valid", 7200);
+        Console.WriteLine("cacheHit=" + cache.Current());
+        cache.Set("tok-expired", 100);
+        Console.WriteLine("cacheSkewEmpty=" + Convert.ToString(cache.Current().Length == 0));
+
+        // 4. WechatMultipart.ForFile
+        WechatMultipart mp = WechatMultipart.ForFile("media", "a.txt", "text/plain", "hello");
+        Console.WriteLine("multipartCt=" + Convert.ToString(mp.ContentType().StartsWith("multipart/form-data; boundary=")));
+        Console.WriteLine("multipartBody=" + Convert.ToString(mp.Body().IndexOf("filename=\"a.txt\"") >= 0));
     }
 
     static void Main() {
@@ -81,5 +124,6 @@ class Program {
         TestMalformed();
         TestSendTextBody();
         TestClientBuilt();
+        TestHardenedPrimitives();
     }
 }

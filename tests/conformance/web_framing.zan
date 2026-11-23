@@ -27,6 +27,13 @@ class Program {
         ctx.Text(ctx.Path() + " " + Convert.ToString(n) + " " + Convert.ToString(sum));
     }
 
+    static async void Empty(HttpContext ctx) {
+        HttpRequest request = ctx.Request();
+        bool framed = request.body == "" && request.bodyLength == 0
+            && ctx.Framer().RequestBytes() == request.bodyStart;
+        ctx.Text(framed ? "empty-body-ok" : "empty-body-invalid");
+    }
+
     static string BodyOf(string resp) {
         int len = resp.Length;
         for (int i = 0; i + 3 < len; i = i + 1) {
@@ -68,12 +75,13 @@ class Program {
 
     static async int Run() {
         Socket.Initialize();
-        WebApp app = new WebApp("127.0.0.1", PORT);
+        WebApp app = new WebApp("127.0.0.1", PORT).MaxBody(256);
         Route _r1 = app.Post("/bin", Echo);
         Route _r2 = app.Post("/split", Echo);
         Route _r3 = app.Post("/one", Echo);
         Route _r4 = app.Post("/two", Echo);
         Route _r5 = app.Post("/chunk", Echo);
+        Route _r6 = app.Post("/empty", Empty);
         // 直接驱动被测的连接循环，而不是 app.Start()：启动横幅会打印
         // pid，输出就不再可复现（determinism 用例要求两次运行逐字节
         // 相同）。accept 之后走的是同一个 HandleConnection。
@@ -150,6 +158,35 @@ class Program {
             int _c3 = await c.SendAsync("\r\n0\r\nX-Trace: t\r\n\r\n");
             string resp = await c.RecvAsync(4096, 2000);
             Check(BodyOf(resp) == "/chunk 9 909", "mvc chunked body decoded");
+            c.Close();
+        }
+
+        // Preserve the next request and update RequestBytes after a buffered body.
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _p = await c.SendAsync(
+                "POST /one HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"
+                + "POST /empty HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+                + "POST /chunk HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trace: t\r\n\r\n"
+                + "POST /two HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\nde");
+            string resp = "";
+            while (true) {
+                string part = await c.RecvAsync(4096, 1000);
+                if (part.Length == 0) { break; }
+                resp = resp + part;
+            }
+            Check(Count(resp, "/one 3 294") == 1 && Count(resp, "empty-body-ok") == 1
+                && Count(resp, "/chunk 0 0") == 1 && Count(resp, "/two 2 201") == 1,
+                "mvc fixed, empty and chunked bodies preserve the pipeline");
+            c.Close();
+        }
+
+        {
+            TcpClient c = await TcpClient.ConnectAsync("127.0.0.1", PORT, 3000);
+            int _h = await c.SendAsync(
+                "POST /bin HTTP/1.1\r\nHost: t\r\nContent-Length: 257\r\nConnection: close\r\n\r\n");
+            string resp = await c.RecvAsync(4096, 2000);
+            Check(resp.StartsWith("HTTP/1.1 413 "), "mvc rejects oversized fixed body before reading it");
             c.Close();
         }
 

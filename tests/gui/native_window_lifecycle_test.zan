@@ -22,6 +22,30 @@ class NativeWindowLifecycleTest {
     static extern int GetCurrentThreadId();
     [DllImport("user32", EntryPoint = "PostThreadMessageW")]
     static extern int PostThreadMessageW(int threadId, int message, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "SetWindowPos")]
+    static extern int SetWindowPos(nint hwnd, nint after, int x, int y, int w, int h, int flags);
+    [DllImport("user32", EntryPoint = "GetDC")]
+    static extern nint GetDC(nint hwnd);
+    [DllImport("user32", EntryPoint = "ReleaseDC")]
+    static extern int ReleaseDC(nint hwnd, nint dc);
+    [DllImport("user32", EntryPoint = "InvalidateRect")]
+    static extern int InvalidateRect(nint hwnd, nint rect, int erase);
+    [DllImport("user32", EntryPoint = "UpdateWindow")]
+    static extern int UpdateWindow(nint hwnd);
+    [DllImport("gdi32", EntryPoint = "SaveDC")]
+    static extern int SaveDC(nint dc);
+    [DllImport("gdi32", EntryPoint = "IntersectClipRect")]
+    static extern int IntersectClipRect(nint dc, int left, int top, int right, int bottom);
+    [DllImport("gdi32", EntryPoint = "RestoreDC")]
+    static extern int RestoreDC(nint dc, int saved);
+    [DllImport("gdi32", EntryPoint = "PtVisible")]
+    static extern int PtVisible(nint dc, int x, int y);
+    [DllImport("gdi32", EntryPoint = "GetPixel")]
+    static extern int GetPixel(nint dc, int x, int y);
+    [DllImport("gdi32", EntryPoint = "SetPixelV")]
+    static extern int SetPixelV(nint dc, int x, int y, int color);
+    [DllImport("zan_gui", EntryPoint = "zan_gui_gdi_present")]
+    static extern int GdiPresent(nint hwnd, int surfaceId, nint rects, int rectCount);
     static App waitingOwner;
     static App waitingPeer;
     static bool waitCallbackRan;
@@ -290,6 +314,75 @@ class NativeWindowLifecycleTest {
     }
     #endif
 
+    #if WINDOWS
+    static int PresentedPixel(nint hwnd, int x, int y) {
+        nint dc = NativeWindowLifecycleTest.GetDC(hwnd);
+        Check(dc != 0, "window DC is available");
+        try { return NativeWindowLifecycleTest.GetPixel(dc, x, y); }
+        finally { NativeWindowLifecycleTest.ReleaseDC(hwnd, dc); }
+    }
+
+    static void CheckPresentRepair() {
+        App app = new App("Native GDI frame repair", 240, 160);
+        try {
+            nint hwnd = app.window.GetHandle();
+            CheckNative(app, "GDI window");
+            app.Show();
+            Check(NativeWindowLifecycleTest.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x13) != 0,
+            "GDI test client stays visible");
+            PumpLive(app, "GDI window", false);
+            Check(app.SafeFrame(() => {
+                app.canvas.FillRect(132, 72, 16, 16, 0xFF102030);
+            }), "initial GDI frame");
+            Check(PresentedPixel(hwnd, 140, 80) == 0x302010, "initial frame reaches the client");
+            if (Interop.EnvVar("ZAN_TILE_DIFF") == "1") {
+                Check(NativeWindowLifecycleTest.GdiPresent(hwnd, app.canvas.SurfaceId(), 0, 0) == 0,
+                "identical frame skips GDI upload");
+            }
+
+            app.window.PresentDirty(16, 72, 16, 16);
+            Check(app.SafeFrame(() => {
+                app.canvas.FillRect(132, 72, 16, 16, 0xFF506070);
+            }), "second complete frame");
+            Check(PresentedPixel(hwnd, 140, 80) == 0x706050,
+            "complete frame includes changes outside a queued rectangle");
+
+            nint dc = NativeWindowLifecycleTest.GetDC(hwnd);
+            Check(dc != 0, "repair DC is available");
+            try {
+                Check(NativeWindowLifecycleTest.SetPixelV(dc, 140, 80, 0x123456) != 0,
+                "client pixel can be overwritten independently of the canvas");
+            } finally { NativeWindowLifecycleTest.ReleaseDC(hwnd, dc); }
+            Check(PresentedPixel(hwnd, 140, 80) == 0x123456, "stale client pixel is observable");
+            app.window.PresentDirty(16, 72, 16, 16);
+            Check(NativeWindowLifecycleTest.InvalidateRect(hwnd, 0, 0) != 0, "client invalidated");
+            Check(NativeWindowLifecycleTest.UpdateWindow(hwnd) != 0, "WM_PAINT delivered");
+            Check(PresentedPixel(hwnd, 140, 80) == 0x706050,
+            "WM_PAINT repairs pixels outside the queued rectangle");
+
+            dc = NativeWindowLifecycleTest.GetDC(hwnd);
+            Check(dc != 0, "clipped DC is available");
+            try {
+                int saved = NativeWindowLifecycleTest.SaveDC(dc);
+                Check(saved != 0, "window DC state saved");
+                try {
+                    Check(NativeWindowLifecycleTest.IntersectClipRect(dc, 0, 0, 100, 100) != 0
+                    && NativeWindowLifecycleTest.PtVisible(dc, 140, 80) == 0,
+                    "DC excludes the updated rectangle");
+                    app.canvas.FillRect(132, 72, 16, 16, 0xFF90A0B0);
+                    Check(NativeWindowLifecycleTest.GdiPresent(hwnd, app.canvas.SurfaceId(), 0, 0) >= 0,
+                    "GDI present returns successfully");
+                } finally { NativeWindowLifecycleTest.RestoreDC(dc, saved); }
+            } finally { NativeWindowLifecycleTest.ReleaseDC(hwnd, dc); }
+            Check(PresentedPixel(hwnd, 140, 80) == 0x706050, "clipped upload leaves the old pixel");
+            Check(NativeWindowLifecycleTest.GdiPresent(hwnd, app.canvas.SurfaceId(), 0, 0) >= 0,
+                    "GDI present returns successfully");
+            Check(PresentedPixel(hwnd, 140, 80) == 0xB0A090, "next frame repairs the clipped upload");
+        } finally { Dispose(app, false); }
+        Console.WriteLine("NATIVE_LIFECYCLE_PRESENT_REPAIR_OK");
+    }
+    #endif
+
     static int Main() {
         #if WINDOWS
         Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
@@ -297,13 +390,14 @@ class NativeWindowLifecycleTest {
         string selected = Interop.EnvVar("ZAN_NATIVE_LIFECYCLE_CASE");
         if (selected == null || selected == "") { selected = "all"; }
         Check(selected == "all" || selected == "child" || selected == "restart"
-        || selected == "request-close" || selected == "external-quit" || selected == "nested-wait",
-        "known scratch probe case");
+        || selected == "request-close" || selected == "external-quit" || selected == "nested-wait"
+        || selected == "present-repair", "known native lifecycle case");
         if (selected == "all" || selected == "child") { CheckChildClose(); }
         if (selected == "all" || selected == "restart") { CheckRestartWithOldAppPending(); }
         if (selected == "all" || selected == "request-close") { CheckRequestClose(); }
         if (selected == "all" || selected == "external-quit") { CheckExternalQuit(); }
         if (selected == "all" || selected == "nested-wait") { CheckCloseDuringWait(); }
+        if (selected == "all" || selected == "present-repair") { CheckPresentRepair(); }
         Console.WriteLine("NATIVE_WINDOW_LIFECYCLE_OK");
         return 0;
         #else

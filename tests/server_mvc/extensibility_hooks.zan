@@ -1,0 +1,494 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web.Services;
+
+[Table("app_ext_item")]
+class ExtItem {
+    [Column(IsIdentity = true)]
+    public int id;
+
+    [Column(StringLength = 64)]
+    public string name;
+}
+
+[Route("/admin/dashboard")]
+[Custom(Authorization = CustomAuthorization.Login, IsMenu = true, Group = "租户工作台", GroupOrder = 1, Order = 1, Icon = "mdi:domain")]
+[Description("租户总览")]
+class TenantDashboardOverrideController : AdminController {
+    [HttpGet]
+    public void Index() {
+        this.Ctx().Text("tenant-dashboard-override");
+    }
+}
+
+[Route("/admin/content/categories")]
+[Custom(Authorization = CustomAuthorization.Grant, IsMenu = true, Group = "租户内容", GroupOrder = 2, Order = 1, Icon = "mdi:tag")]
+[Description("租户分类")]
+class TenantCategoriesOverrideController : AdminController {
+    [HttpGet]
+    [Custom(Perm = System.Web.PermBit.View)]
+    public void Index() {
+        this.Ctx().Text("tenant-categories-override");
+    }
+}
+
+[Route("/ext-probe")]
+[Custom(Authorization = CustomAuthorization.Login)]
+class ExtClaimProbeController : AppController {
+    [HttpGet]
+    public async void ReadAndSwitch() {
+        string before = this.Claim("activeCompanyId", "");
+        AdminSession sess = new AdminSession(this);
+        string fromSess = sess.Claim("activeCompanyId", "");
+        Dictionary<string, string> next = new Dictionary<string, string>();
+        next["activeCompanyId"] = "205";
+        next["tenantTier"] = "pro";
+        string refreshed = await this.RefreshAuthClaims(next);
+        string after = this.Claim("activeCompanyId", "");
+        this.Ctx().Text(before + "|" + fromSess + "|" + after + "|" + (refreshed.Length > 0 ? "ok" : "err"));
+    }
+}
+
+class Program {
+    static int failures;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static async void InjectClaims(IDbConnection db, SysUser user, Dictionary<string, string> claims) {
+        claims["activeCompanyId"] = user != null && user.id > 0 ? "102" : "0";
+        claims["tenantTier"] = "enterprise";
+    }
+
+    static async void FilterMenu(IDbConnection db, string uid, string activePath, List<MenuNode> nodes) {
+        for (int i = nodes.Count - 1; i >= 0; i = i - 1) {
+            if (nodes[i].Path() == "/admin/dashboard") {
+                nodes.RemoveAt(i);
+            }
+        }
+        MenuNode tenantHome = new MenuNode();
+        tenantHome.SetTitle("租户工作台");
+        tenantHome.SetPath("/admin/tenant/home");
+        tenantHome.SetGroup("租户工作台");
+        tenantHome.SetGroupOrder(0);
+        tenantHome.SetOrder("00001|/admin/tenant/home");
+        tenantHome.SetIcon("mdi:office-building");
+        tenantHome.SetActive(activePath == "/admin/tenant/home");
+        nodes.Add(tenantHome);
+    }
+
+    static async void ResolveCompanyScope(IDbConnection db, SysUser user, DataScope scope) {
+        if (scope.Tag("activeCompanyId") == "102") {
+            List<int> allowed = new List<int>();
+            allowed.Add(10);
+            allowed.Add(20);
+            scope.NarrowToDepts(allowed);
+        }
+    }
+
+    static async void ResolveCompanyGrant(IDbConnection db, int userId, string key, DataScope dept, RowScope scope) {
+        if (key == "company" && dept != null && dept.Tag("activeCompanyId") == "102") {
+            scope.all = false;
+            scope.ids.Clear();
+            scope.ids.Add(102);
+        }
+    }
+
+    static async void CollectSummary(IDbConnection db, DataScope scope, Dictionary<string, string> metrics) {
+        metrics["activeTenants"] = "12";
+        metrics["scopeCompany"] = scope != null ? scope.Tag("activeCompanyId") : "";
+    }
+
+    static async void CheckRouteAndMenuOverride(WebApp app, IZanSql orm) {
+        __AttrRoutes.ApplyAutoRoutes(app);
+        HttpRequest req = HttpRequest.Parse("GET /admin/dashboard HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        try {
+            Route hit = app.Router().Match(ctx);
+            Program.Check(hit != null && hit.Action() == "TenantDashboardOverrideController.Index",
+                "app route overrides framework route on /admin/dashboard");
+            if (hit != null) {
+                HttpHandler h = hit.Handler();
+                await h(ctx);
+                Program.Check(ctx.ResponseBody() == "tenant-dashboard-override",
+                    "app override handler executes instead of framework handler");
+            }
+        } finally {
+            ctx.Dispose();
+        }
+
+        Perm.Index(app);
+        string title = Perm.TitleOf("TenantCategoriesOverrideController");
+        Program.Check(title == "租户分类"
+            && Perm.BitOf("TenantCategoriesOverrideController.Index") == System.Web.PermBit.View,
+            "perm index indexes overriding app grant action");
+
+        bool synced = await MenuService.SyncRoutes(app);
+        Program.Check(synced, "menu service syncs routes cleanly");
+        int dashMenus = await orm.Select<SysMenu>().Where(a => a.path == "/admin/dashboard").CountAsync();
+        SysMenu dashRow = await orm.Select<SysMenu>().Where(a => a.path == "/admin/dashboard").FirstAsync();
+        Program.Check(dashMenus == 1 && dashRow != null && dashRow.title == "租户总览",
+            "menu sync deduplicates overridden /admin/dashboard route");
+
+        MvcHooks.OnMenu(Program.FilterMenu);
+        List<MenuNode> nodes = await MenuService.ForUser(app, "1", "/admin/tenant/home");
+        bool hasDash = false;
+        bool hasTenantHome = false;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            if (nodes[i].Path() == "/admin/dashboard") { hasDash = true; }
+            if (nodes[i].Path() == "/admin/tenant/home") { hasTenantHome = true; }
+        }
+        Program.Check(!hasDash && hasTenantHome, "MenuService.ForUser applies MenuHook in DB mode");
+        string landing = await MenuService.LandingFor(app, "probe");
+        Program.Check(landing == "/admin/tenant/home",
+            "MenuService.LandingFor shares MenuHook filtering and ordering with ForUser");
+    }
+
+    static async void CheckClaimsAndTokens(IZanSql orm, string adminId) {
+        MvcHooks.OnTokenClaims(Program.InjectClaims);
+        SysUser user = await orm.Select<SysUser>().WherePk(Filter.ToInt(adminId, 0)).FirstAsync();
+        Program.Check(user != null, "admin user present");
+        Dictionary<string, string> issuedClaims = new Dictionary<string, string>();
+        await MvcHooks.RunTokenClaims(null, user, issuedClaims);
+        string tok = AuthToken.Issue(adminId, user.tokenVersion, WebApp.NowSeconds(), issuedClaims);
+        Program.Check(tok.Length > 40, "signed token with claims issued");
+
+        Dictionary<string, string> parsed = new Dictionary<string, string>();
+        bool ok = AuthToken.ParseClaims(tok, adminId, parsed);
+        string cid = "";
+        string tier = "";
+        parsed.TryGetValue("activeCompanyId", out cid);
+        parsed.TryGetValue("tenantTier", out tier);
+        Program.Check(ok && cid == "102" && tier == "enterprise",
+            "AuthToken.ParseClaims decrypts and verifies signed claims");
+
+        Dictionary<string, string> resolved = new Dictionary<string, string>();
+        string resolvedUid = await AuthToken.ResolveClaims(tok, resolved);
+        string rcid = "";
+        resolved.TryGetValue("activeCompanyId", out rcid);
+        Program.Check(resolvedUid == adminId && rcid == "102",
+            "AuthToken.ResolveClaims verifies tokenVersion and returns claims");
+
+        string badTok = tok.Substring(0, tok.Length - 2) + (tok.EndsWith("AA") ? "BB" : "AA");
+        Dictionary<string, string> badOut = new Dictionary<string, string>();
+        Program.Check(!AuthToken.ParseClaims(badTok, adminId, badOut) && badOut.Count == 0,
+            "tampered token claim payload is rejected");
+
+        HttpRequest req = HttpRequest.Parse("GET /ext-probe HTTP/1.1\r\nHost: test\r\nCookie: "
+            + Cfg.Auth.cookieName + "=" + tok + "\r\n\r\n");
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        ctx.SetUid(adminId);
+        ExtClaimProbeController ctrl = new ExtClaimProbeController();
+        ctrl.Bind(ctx);
+        try {
+            if (!await ctrl.BeforeAsync()) {
+                Program.Check(false, "probe controller before failed");
+            } else {
+                await ctrl.ReadAndSwitch();
+                Program.Check(ctx.ResponseBody() == "102|102|205|ok",
+                    "AppController and AdminSession read and refresh signed claims");
+                string setCookie = ctx.BuildResponse(false);
+                Program.Check(setCookie.Contains("Set-Cookie: " + Cfg.Auth.cookieName + "="),
+                    "RefreshAuthClaims emits refreshed auth cookie");
+            }
+        } finally {
+            await ctrl.AfterAsync();
+            ctx.Dispose();
+        }
+    }
+
+    static async void CheckTenantIsolationAndSummary(IDbConnection db, IZanSql orm) {
+        /* 1. DataGrant.Define defaults to strict isolation: RoleAll non-super cannot bypass strict domain. */
+        DataGrant.Define("company", "公司", "sys_department", "name");
+        DataGrant.Define("shop", "店铺", "sys_department", "name", false);
+        Program.Check(PermTable.Open(), "PermTable opened for scope test");
+
+        SysRole roleAll = new SysRole();
+        roleAll.id = 91;
+        roleAll.status = 1;
+        roleAll.dataScope = DataScope.RoleAll;
+        List<SysRole> roles = new List<SysRole>();
+        roles.Add(roleAll);
+        await PermTable.LoadRoles(roles, new List<SysRoleGrant>());
+        PermTable.SetUser("77", false, ",91,");
+
+        SysUser normalMgr = new SysUser();
+        normalMgr.id = 77;
+        normalMgr.status = AuthUser.Active;
+        normalMgr.departmentId = 2;
+        DataScope mgrScope = await DataScope.Of(db, normalMgr, new List<SysDepartment>());
+        Program.Check(mgrScope.Any() && !mgrScope.IsSuper(),
+            "RoleAll user has Any() == true but IsSuper() == false");
+
+        RowScope shopScope = await DataGrant.Of(db, 77, "shop", mgrScope);
+        RowScope strictScope = await DataGrant.Of(db, 77, "company", mgrScope);
+        Program.Check(shopScope.all && !strictScope.all && strictScope.Empty(),
+            "strict Define blocks RoleAll bypass while opt-out strict=false preserves open behavior");
+
+        DataScope superScope = DataScope.Everything(1);
+        RowScope superStrict = await DataGrant.Of(db, 1, "company", superScope);
+        Program.Check(superScope.IsSuper() && superStrict.all,
+            "platform superuser (IsSuper) bypasses strict domain");
+
+        /* 2. NarrowToDepts + OnScopeResolve + OnGrantResolve + OnSummary. */
+        DataScope narrow = DataScope.Everything(1);
+        List<int> first = new List<int>();
+        first.Add(10);
+        first.Add(20);
+        narrow.NarrowToDepts(first);
+        Program.Check(narrow.ByDept() && narrow.Covers(0, 10) && narrow.Covers(0, 20) && !narrow.Covers(0, 30),
+            "NarrowToDepts narrows All to ByDepts");
+        List<int> second = new List<int>();
+        second.Add(20);
+        second.Add(30);
+        narrow.NarrowToDepts(second);
+        Program.Check(!narrow.Covers(0, 10) && narrow.Covers(0, 20) && !narrow.Covers(0, 30),
+            "NarrowToDepts intersects existing department scope");
+
+        MvcHooks.OnScopeResolve(Program.ResolveCompanyScope);
+        MvcHooks.OnGrantResolve(Program.ResolveCompanyGrant);
+        Dictionary<string, string> reqClaims = new Dictionary<string, string>();
+        reqClaims["activeCompanyId"] = "102";
+        DataScope hookScope = DataScope.Everything(1);
+        hookScope.ApplyTags(reqClaims);
+        await MvcHooks.RunScopeResolvers(db, normalMgr, hookScope);
+        Program.Check(hookScope.Covers(0, 10) && !hookScope.Covers(0, 99),
+            "OnScopeResolve reads claim tag and narrows DataScope");
+
+        RowScope dynCompany = await DataGrant.Of(db, 77, "company", hookScope);
+        Program.Check(!dynCompany.all && dynCompany.Allows(102) && !dynCompany.Allows(103),
+            "OnGrantResolve dynamically resolves RowScope for activeCompanyId");
+
+        MvcHooks.OnSummary(Program.CollectSummary);
+        Dictionary<string, string> metrics = new Dictionary<string, string>();
+        await MvcHooks.RunSummaryHooks(db, hookScope, metrics);
+        string m1 = "";
+        string m2 = "";
+        metrics.TryGetValue("activeTenants", out m1);
+        metrics.TryGetValue("scopeCompany", out m2);
+        Program.Check(m1 == "12" && m2 == "102",
+            "OnSummary populates extensible dashboard metrics");
+    }
+
+    static async void CheckLayeredAssets(string fixtureDir) {
+        string baseViews = Path.Combine(fixtureDir, "base-views");
+        string appViews = Path.Combine(fixtureDir, "app-views");
+        string baseStatic = Path.Combine(fixtureDir, "base-static");
+        string appStatic = Path.Combine(fixtureDir, "app-static");
+        Directory.CreateDirectoryRecursive(Path.Combine(baseViews, "Admin"));
+        Directory.CreateDirectoryRecursive(Path.Combine(appViews, "Admin"));
+        Directory.CreateDirectoryRecursive(baseStatic);
+        Directory.CreateDirectoryRecursive(appStatic);
+
+        File.WriteAllText(Path.Combine(baseViews, "layout.html"), "BASE_LAYOUT:{{content}}");
+        File.WriteAllText(Path.Combine(Path.Combine(baseViews, "Admin"), "BaseOnly.html"), "<p>from-base</p>");
+        File.WriteAllText(Path.Combine(Path.Combine(baseViews, "Admin"), "Override.html"), "<p>old-base</p>");
+        File.WriteAllText(Path.Combine(Path.Combine(appViews, "Admin"), "Override.html"), "<p>new-app</p>");
+
+        File.WriteAllText(Path.Combine(baseStatic, "base.txt"), "static-from-base");
+        File.WriteAllText(Path.Combine(baseStatic, "logo.txt"), "old-logo");
+        File.WriteAllText(Path.Combine(appStatic, "logo.txt"), "new-logo");
+
+        Cfg.Server.baseViewsDir = baseViews;
+        Cfg.Server.viewsDir = appViews;
+        Cfg.Server.baseStaticDir = baseStatic;
+        Cfg.Server.staticDir = appStatic;
+        Cfg.Server.staticUrl = "/static";
+
+        WebApp assetApp = new WebApp("127.0.0.1", 0);
+        try {
+            Boot.MountLayeredViews(assetApp);
+            string baseRendered = assetApp.GetViews().RenderPage("Admin.BaseOnly", new ViewData());
+            string overRendered = assetApp.GetViews().RenderPage("Admin.Override", new ViewData());
+            Program.Check(baseRendered.Contains("from-base") && baseRendered.Contains("BASE_LAYOUT:")
+                && overRendered.Contains("new-app") && !overRendered.Contains("old-base"),
+                "MountLayeredViews overlays app views on top of base views");
+
+            Boot.MountLayeredStatic(assetApp);
+            HttpContext c1 = new HttpContext(HttpRequest.Parse("GET /static/base.txt HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            HttpContext c2 = new HttpContext(HttpRequest.Parse("GET /static/logo.txt HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            try {
+                bool r1 = Boot.LayeredStaticHook(c1);
+                bool r2 = Boot.LayeredStaticHook(c2);
+                string b1 = c1.BodyBytes() != null ? c1.BodyBytes().ToStr(0, c1.BodyLength()) : "";
+                string b2 = c2.BodyBytes() != null ? c2.BodyBytes().ToStr(0, c2.BodyLength()) : "";
+                Program.Check(!r1 && c1.GetStatus() == 200 && b1 == "static-from-base"
+                    && !r2 && c2.GetStatus() == 200 && b2 == "new-logo",
+                    "MountLayeredStatic serves app static first and falls back to base static");
+            } finally {
+                c1.Dispose();
+                c2.Dispose();
+            }
+        } finally {
+            assetApp.Dispose();
+        }
+    }
+
+    static async void CheckAdminShellAndCrudMenu(IDbConnection db, WebApp app) {
+        /* 1. AdminShell default slots, permission filtering, asset URL sanitization, and custom overrides. */
+        PermTable.SetUser("1", true, "");
+        AdminShell.ResetDefaults();
+        string defaultBellDenied = await AdminShell.RenderTopWidgets(db, "77", new ViewData());
+        string defaultBellAdmin = await AdminShell.RenderTopWidgets(db, "1", new ViewData());
+        string defaultFab = await AdminShell.RenderFabWidgets(db, "77", new ViewData());
+        Program.Check(!defaultBellDenied.Contains("id=\"ad-bell\"")
+            && defaultBellAdmin.Contains("id=\"ad-bell\"")
+            && defaultFab.Contains("data-ai-btn"),
+            "AdminShell renders default bell by Monitor.Index permission and default AI fab");
+
+        AdminShell.AddStyle("/static/css/custom.css?v=1");
+        AdminShell.AddStyle("javascript:alert(1)");
+        AdminShell.AddScript("/static/js/custom.js?v=1");
+        AdminShell.AddScript("\" onclick=\"evil()");
+        AdminShell.AddModule("[data-canvas-app]", "/static/js/canvas.js?v=1", "/static/css/canvas.css?v=1", "/admin/canvas", "id");
+        AdminShell.AddModule("[data-evil]", "javascript:alert(1)", "javascript:alert(2)");
+        AdminShell.AddTopWidget("tenant-badge", "<span class=\"badge\">T</span>");
+        AdminShell.RemoveFabWidget("admin-ai-fab");
+
+        string stylesHtml = AdminShell.RenderStyles();
+        string scriptsHtml = AdminShell.RenderScripts();
+        string modulesHtml = AdminShell.RenderModules();
+        string topHtml = await AdminShell.RenderTopWidgets(db, "77", new ViewData());
+        string fabHtml = await AdminShell.RenderFabWidgets(db, "77", new ViewData());
+        Program.Check(stylesHtml.Contains("/static/css/custom.css?v=1")
+            && !stylesHtml.Contains("javascript:")
+            && scriptsHtml.Contains("/static/js/custom.js?v=1")
+            && !scriptsHtml.Contains("evil()")
+            && modulesHtml.Contains("id=\"ad-shell-modules\"")
+            && modulesHtml.Contains("[data-canvas-app]")
+            && modulesHtml.Contains("/static/js/canvas.js?v=1")
+            && modulesHtml.Contains("/static/css/canvas.css?v=1")
+            && modulesHtml.Contains("/admin/canvas")
+            && !modulesHtml.Contains("<script")
+            && !modulesHtml.Contains("javascript:")
+            && topHtml.Contains("tenant-badge") == false
+            && topHtml.Contains("<span class=\"badge\">T</span>")
+            && !fabHtml.Contains("data-ai-btn"),
+            "AdminShell supports custom assets/modules/widgets, removes built-ins cleanly, and blocks unsafe URLs");
+
+        AdminShell.RemoveModule("[data-canvas-app]");
+        Program.Check(AdminShell.RenderModules().Length == 0,
+            "AdminShell.RemoveModule clears registered lazy modules");
+        AdminShell.ResetDefaults();
+
+        /* 2. CrudMenu.AppendDesigned runs via MvcHooks.OnMenu without AdminController coupling. */
+        SysGenTableDao genDao = new SysGenTableDao(db);
+        SysGenTable tbl = new SysGenTable();
+        tbl.tableName = "biz_orders";
+        tbl.title = "订单管理";
+        tbl.migrated = 1;
+        tbl.generatedAt = 0;
+        int tblId = await genDao.Insert(tbl).ExecuteIdentityAsync();
+        Program.Check(tblId > 0, "inserted migrated designed table");
+        List<MenuNode> adminNodes = await MenuService.ForUser(app, "1", "/admin/monitor/data?t=biz_orders", db);
+        bool foundDesigned = false;
+        for (int i = 0; i < adminNodes.Count; i = i + 1) {
+            if (adminNodes[i].Path() == "/admin/monitor/data?t=biz_orders" && adminNodes[i].Active()) {
+                foundDesigned = true;
+            }
+        }
+        Program.Check(foundDesigned, "CrudMenu contributes migrated designed tables and preserves active query state");
+        int _delTbl = await genDao.Delete().Where(a => a.id == tblId).ExecuteAffrowsAsync();
+
+        /* 3. ListPage.PagerHtml renders page-size selector, ellipsis page window, and jump form while preserving filters. */
+        ListPage lp = ListPage.Of();
+        List<OrmCond> conds = new List<OrmCond>();
+        OrmCond cond = new OrmCond();
+        cond.name = "kw";
+        cond.col = "name";
+        cond.kind = "like";
+        cond.value = "alice";
+        conds.Add(cond);
+        ListQuery lq = new ListQuery().SetPage(5).SetLimit(20);
+        string pagerHtml = lp.PagerHtml("/admin/system/users", conds, lq, 200);
+        Program.Check(pagerHtml.Contains("data-pager-limit")
+            && pagerHtml.Contains("data-pager-base=\"/admin/system/users?kw=alice\"")
+            && pagerHtml.Contains("<span class=\"btn sm pager-cur\" aria-current=\"page\">5</span>")
+            && pagerHtml.Contains("<span class=\"pager-dots\">…</span>")
+            && pagerHtml.Contains("data-pager-jump")
+            && pagerHtml.Contains("上一页") && pagerHtml.Contains("下一页"),
+            "ListPage.PagerHtml emits page-size selector, windowed page numbers, and jump form");
+    }
+
+    static async void Main() {
+        string cwd = Directory.GetCurrentDirectory();
+        string fixture = Path.Combine(cwd, "_scratch/server-mvc-extensibility");
+        if (Directory.Exists(fixture)) {
+            Directory.DeleteRecursive(fixture);
+        }
+        Directory.CreateDirectoryRecursive(fixture);
+        string dbPath = Path.Combine(fixture, "ext.db");
+
+        Cfg.Auth.secret = "0123456789abcdef0123456789abcdef";
+        Cfg.Auth.iter = 1000;
+        Cfg.Auth.bootstrapPassword = "extensibility-bootstrap-password";
+
+        DbPool pool = SqliteConnector.Pool(dbPath, 1);
+        DbContext dbCtx = DbContext.Of(pool);
+        WebApp app = new WebApp("127.0.0.1", 0);
+        try {
+            bool ready = await Schema.Ensure(dbCtx);
+            Program.Check(ready, "Schema.Ensure initializes core tables");
+            AppServices services = new AppServices(dbCtx, null);
+            AppServices.Use(services);
+            IZanSql orm = services.Orm();
+
+            IDbConnection conn = await dbCtx.Acquire();
+            try {
+                /* Application models stay outside Schema.FrameworkModels() until Schema.AddModel is called. */
+                Program.Check(!await DbSchema.TableExistsAsync(conn, "app_ext_item"),
+                    "app extension table is absent from core FrameworkModels by default");
+
+                Schema.AddModel(Meta.For<ExtItem>());
+                bool syncedExt = await Schema.Apply(conn);
+                Program.Check(syncedExt && await DbSchema.TableExistsAsync(conn, "app_ext_item"),
+                    "Schema.AddModel opts app extension tables in cleanly");
+            } finally {
+                dbCtx.Release(conn);
+            }
+
+            string adminId = await orm.ExecuteScalarAsync("SELECT id FROM sys_user WHERE username = 'admin'");
+            await Program.CheckRouteAndMenuOverride(app, orm);
+            await Program.CheckClaimsAndTokens(orm, adminId);
+
+            IDbConnection isoConn = await dbCtx.Acquire();
+            try {
+                await Program.CheckTenantIsolationAndSummary(isoConn, orm);
+            } finally {
+                dbCtx.Release(isoConn);
+            }
+
+            await Program.CheckLayeredAssets(fixture);
+
+            IDbConnection shellConn = await dbCtx.Acquire();
+            try {
+                await Program.CheckAdminShellAndCrudMenu(shellConn, app);
+            } finally {
+                dbCtx.Release(shellConn);
+            }
+        } finally {
+            MvcHooks.Clear();
+            AppServices.Use(null);
+            pool.Close();
+            if (Directory.Exists(fixture)) {
+                Directory.DeleteRecursive(fixture);
+            }
+        }
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("extensibility hooks regression"); }
+    }
+}

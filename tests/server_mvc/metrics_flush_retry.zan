@@ -109,7 +109,7 @@ class Program {
         b.row.bytes = 20;
         b.hist = new long[System.Diagnostics.ServerMetrics.HIST_BINS];
         b.hist[System.Diagnostics.ServerMetrics.HistBin(us)] = b.row.calls;
-        MetricsStore.buckets.Add(b);
+        MetricsStore.EnqueueBucket(b);
         MinuteBucket unique = new MinuteBucket();
         unique.row = new MetricMinute();
         unique.row.minute = minute;
@@ -118,7 +118,7 @@ class Program {
         unique.row.calls = 1;
         unique.hist = new long[System.Diagnostics.ServerMetrics.HIST_BINS];
         unique.hist[0] = 1;
-        MetricsStore.buckets.Add(unique);
+        MetricsStore.EnqueueBucket(unique);
         for (int i = 0; i < 2; i = i + 1) {
             MetricSql sql = new MetricSql();
             sql.day = day;
@@ -127,38 +127,33 @@ class Program {
             sql.slow = batch == 0 ? 1 : 0;
             sql.totalUs = batch == 0 ? 40 : 10;
             sql.maxUs = sql.totalUs;
-            MetricsStore.sqlBuckets.Add(sql);
+            MetricsStore.EnqueueSql(sql);
         }
         MetricsStore.Failed(minute + batch, "backlog", Convert.ToString(batch));
     }
 
     static async void BoundedRetry(string path, long now) {
-        int oldBuckets = MetricsStore.MaxBuckets;
-        int oldErrors = MetricsStore.MaxErrors;
-        int oldShapes = MetricsStore.MaxSqlShapes;
-        MetricsStore.MaxBuckets = 4;
-        MetricsStore.MaxErrors = 3;
-        MetricsStore.MaxSqlShapes = 2;
+        MetricsStore.SetCapsForTest(4, 3, 2);
         long minute = MetricsStore.Minute(now);
         long day = MetricsStore.Day(now);
         for (int i = 0; i < 20; i = i + 1) {
             Program.BacklogBatch(i, minute, day);
             Check(await MetricsStore.Flush() == 0, "backlog-failed-flush");
-            Check(MetricsStore.retryBuckets.Count <= 4
-                && MetricsStore.retrySqlBuckets.Count <= 3
-                && MetricsStore.retryErrors.Count <= 3, "backlog-bounded");
-            Check(MetricsStore.buckets.Count == 0 && MetricsStore.sqlBuckets.Count == 0
-                && MetricsStore.errors.Count == 0, "backlog-active-detached");
+            Check(MetricsStore.RetryBucketCount() <= 4
+                && MetricsStore.RetrySqlCount() <= 3
+                && MetricsStore.RetryErrorCount() <= 3, "backlog-bounded");
+            Check(MetricsStore.ActiveBucketCount() == 0 && MetricsStore.ActiveSqlCount() == 0
+                && MetricsStore.ActiveErrorCount() == 0, "backlog-active-detached");
         }
-        Check(MetricsStore.retryBuckets.Count == 4
-            && MetricsStore.retryBuckets[0].row.path == "/unique-16"
-            && MetricsStore.retryBuckets[3].row.path == "/unique-19",
+        Check(MetricsStore.RetryBucketCount() == 4
+            && MetricsStore.RetryBucketAt(0).row.path == "/unique-16"
+            && MetricsStore.RetryBucketAt(3).row.path == "/unique-19",
             "backlog-minute-cap-oldest-evicted");
-        Check(MetricsStore.retrySqlBuckets.Count == 3, "backlog-sql-overflow-slot");
-        Check(MetricsStore.retryErrors.Count == 3
-            && MetricsStore.retryErrors[0].detail == "17"
-            && MetricsStore.retryErrors[2].detail == "19", "backlog-newest-errors");
-        MetricsStore.pool = SqliteConnector.Pool(path, 1);
+        Check(MetricsStore.RetrySqlCount() == 3, "backlog-sql-overflow-slot");
+        Check(MetricsStore.RetryErrorCount() == 3
+            && MetricsStore.RetryErrorAt(0).detail == "17"
+            && MetricsStore.RetryErrorAt(2).detail == "19", "backlog-newest-errors");
+        MetricsStore.UsePool(SqliteConnector.Pool(path, 1));
         Check(await MetricsStore.Flush() == 10, "backlog-recovery-row-count");
         Check(Program.Value(path, "SELECT calls FROM metrics_sql_day WHERE sql='SELECT backlog'") == 20,
             "backlog-sql-merged-calls");
@@ -173,14 +168,14 @@ class Program {
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error WHERE origin='backlog'") == 3,
             "backlog-errors-persisted-bounded");
         Check(await MetricsStore.Flush() == 0, "backlog-no-replay");
-        MetricsStore.pool.Close();
+        MetricsStore.Pool().Close();
 
         for (int i = 0; i < 3; i = i + 1) {
             Program.BacklogBatch(i, minute + 60, day + 86400);
             Check(await MetricsStore.Flush() == 0, "merge-failed-flush");
         }
-        Check(MetricsStore.retryBuckets.Count == 4, "merge-one-row-per-minute-key");
-        MinuteBucket merged = MetricsStore.retryBuckets[0];
+        Check(MetricsStore.RetryBucketCount() == 4, "merge-one-row-per-minute-key");
+        MinuteBucket merged = MetricsStore.RetryBucketAt(0);
         Check(merged.row.calls == 201 && merged.row.errors == 1
             && merged.row.totalUs == 1020000 && merged.row.maxUs == 1000000
             && merged.row.frames == 6 && merged.row.bytes == 60, "merge-minute-fields");
@@ -192,34 +187,32 @@ class Program {
             merged.row.maxUs), "merge-p95-max-not-recomputed");
         Check(await MetricsStore.Flush() == 0 && merged.row.p95Us == p95,
             "merge-empty-retry-preserves-p95");
-        MetricsStore.pool = SqliteConnector.Pool(path, 1);
+        MetricsStore.UsePool(SqliteConnector.Pool(path, 1));
         Check(await MetricsStore.Flush() == 10, "merge-recovery-row-count");
         Check(Program.Value(path, "SELECT MAX(calls) FROM metrics_minute WHERE path='/backlog'") == 201,
             "merge-minute-persisted-once");
         Check(Program.Value(path, "SELECT MAX(p95_us) FROM metrics_minute WHERE path='/backlog'") == p95,
             "merge-p95-persisted");
-        Check(MetricsStore.retryBuckets.Count == 0 && MetricsStore.retrySqlBuckets.Count == 0
-            && MetricsStore.retryErrors.Count == 0, "backlog-recovery-cleared");
-        MetricsStore.pool.Close();
+        Check(MetricsStore.RetryBucketCount() == 0 && MetricsStore.RetrySqlCount() == 0
+            && MetricsStore.RetryErrorCount() == 0, "backlog-recovery-cleared");
+        MetricsStore.Pool().Close();
 
         for (int i = 0; i < 20; i = i + 1) {
             MetricSql sql = new MetricSql();
             sql.day = day + (long)i * 86400;
             sql.sql = "SELECT rollover";
             sql.calls = 1;
-            MetricsStore.sqlBuckets.Add(sql);
+            MetricsStore.EnqueueSql(sql);
             Check(await MetricsStore.Flush() == 0, "rollover-failed-flush");
-            Check(MetricsStore.retrySqlBuckets.Count <= 3, "rollover-sql-bounded");
+            Check(MetricsStore.RetrySqlCount() <= 3, "rollover-sql-bounded");
         }
-        Check(MetricsStore.retrySqlBuckets[2].day == day + 19 * 86400,
+        Check(MetricsStore.RetrySqlAt(2).day == day + 19 * 86400,
             "rollover-newest-day-retained");
-        MetricsStore.pool = SqliteConnector.Pool(path, 1);
+        MetricsStore.UsePool(SqliteConnector.Pool(path, 1));
         Check(await MetricsStore.Flush() == 3, "rollover-recovery");
         Check(await MetricsStore.Flush() == 0, "rollover-no-replay");
-        MetricsStore.pool.Close();
-        MetricsStore.MaxBuckets = oldBuckets;
-        MetricsStore.MaxErrors = oldErrors;
-        MetricsStore.MaxSqlShapes = oldShapes;
+        MetricsStore.Pool().Close();
+        MetricsStore.ResetCaps();
         Console.WriteLine("bounded retry regression complete");
     }
 
@@ -236,16 +229,16 @@ class Program {
         MetricsStore.RecordSql("SELECT lease", 40, true);
         long now = (long)System.Web.WebApp.NowSeconds();
         MetricsStore.Failed(now, "lease", "lost connection");
-        MetricsStore.pool.Close();
+        MetricsStore.Pool().Close();
         Check(await MetricsStore.Flush() == 0, "lease-failure-result");
-        Check(MetricsStore.retryBuckets.Count == 1
-            && MetricsStore.retrySqlBuckets.Count == 1
-            && MetricsStore.retryErrors.Count == 1, "lease-failure-retained");
-        MetricsStore.pool = SqliteConnector.Pool(path, 1);
+        Check(MetricsStore.RetryBucketCount() == 1
+            && MetricsStore.RetrySqlCount() == 1
+            && MetricsStore.RetryErrorCount() == 1, "lease-failure-retained");
+        MetricsStore.UsePool(SqliteConnector.Pool(path, 1));
         Check(await MetricsStore.Flush() == 3, "lease-retry-result");
-        Check(MetricsStore.retryBuckets.Count == 0
-            && MetricsStore.retrySqlBuckets.Count == 0
-            && MetricsStore.retryErrors.Count == 0, "lease-retry-cleared");
+        Check(MetricsStore.RetryBucketCount() == 0
+            && MetricsStore.RetrySqlCount() == 0
+            && MetricsStore.RetryErrorCount() == 0, "lease-retry-cleared");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 1,
             "lease-retry-minute");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_sql_day") == 1,
@@ -266,9 +259,9 @@ class Program {
         MetricsStore.RecordSql("SELECT tx", 50, true);
         MetricsStore.Failed(now, "tx", "failed insert");
         Check(await MetricsStore.Flush() == 0, "transaction-failure-result");
-        Check(MetricsStore.retryBuckets.Count == 1
-            && MetricsStore.retrySqlBuckets.Count == 1
-            && MetricsStore.retryErrors.Count == 1, "transaction-failure-retained");
+        Check(MetricsStore.RetryBucketCount() == 1
+            && MetricsStore.RetrySqlCount() == 1
+            && MetricsStore.RetryErrorCount() == 1, "transaction-failure-retained");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 1,
             "transaction-rolled-back-minute");
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 1,
@@ -277,25 +270,25 @@ class Program {
         control.Execute("DROP TRIGGER fail_sql");
         control.Close();
 
-        IDbConnection held = await MetricsStore.pool.AcquireAsync();
+        IDbConnection held = await MetricsStore.Pool().AcquireAsync();
         Program.done = false;
         Task.Spawn(Program.BlockedFlush());
-        for (int i = 0; i < 100 && !MetricsStore.flushActive; i = i + 1) {
+        for (int i = 0; i < 100 && !MetricsStore.IsFlushActive(); i = i + 1) {
             await Task.Delay(1);
         }
-        Check(MetricsStore.flushActive, "flush-suspended");
+        Check(MetricsStore.IsFlushActive(), "flush-suspended");
         MetricsStore.Record("POST", "/tx", 200, 300);
         MetricsStore.RecordSql("SELECT tx", 70, false);
         MetricsStore.Failed(now, "new", "while flushing");
         Check(await MetricsStore.Flush() == 0, "overlap-guard");
-        MetricsStore.pool.Release(held);
+        MetricsStore.Pool().Release(held);
         for (int i = 0; i < 1000 && !Program.done; i = i + 1) {
             await Task.Delay(1);
         }
         Check(Program.done && Program.inFlight == 3, "in-flight-result");
-        Check(MetricsStore.buckets.Count == 1
-            && MetricsStore.sqlBuckets.Count == 1
-            && MetricsStore.errors.Count == 1, "arrivals-pending");
+        Check(MetricsStore.ActiveBucketCount() == 1
+            && MetricsStore.ActiveSqlCount() == 1
+            && MetricsStore.ActiveErrorCount() == 1, "arrivals-pending");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 2,
             "in-flight-minute-once");
         Check(await MetricsStore.Flush() == 3, "arrivals-flush");
@@ -306,24 +299,24 @@ class Program {
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 3,
             "no-lost-or-duplicate-error");
 
-        MetricsStore.pool.Close();
+        MetricsStore.Pool().Close();
         FaultConnector fault = new FaultConnector(path);
-        MetricsStore.pool = new DbPool(fault, 1);
+        MetricsStore.UsePool(new DbPool(fault, 1));
         MetricsStore.Record("GET", "/commit", 500, 80);
         MetricsStore.RecordSql("SELECT commit", 20, true);
         MetricsStore.Failed(now, "commit", "rollback throws");
         Check(await MetricsStore.Flush() == 0, "commit-rollback-failure-result");
         Check(fault.last != null && !fault.last.IsConnected(),
             "broken-connection-closed");
-        Check(MetricsStore.retryBuckets.Count == 1
-            && MetricsStore.retrySqlBuckets.Count == 1
-            && MetricsStore.retryErrors.Count == 1, "commit-rollback-retained");
+        Check(MetricsStore.RetryBucketCount() == 1
+            && MetricsStore.RetrySqlCount() == 1
+            && MetricsStore.RetryErrorCount() == 1, "commit-rollback-retained");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 3,
             "commit-rollback-no-partial-minute");
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 3,
             "commit-rollback-no-partial-error");
-        MetricsStore.pool.Close();
-        MetricsStore.pool = SqliteConnector.Pool(path, 1);
+        MetricsStore.Pool().Close();
+        MetricsStore.UsePool(SqliteConnector.Pool(path, 1));
         Check(await MetricsStore.Flush() == 3, "commit-rollback-retry");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 4,
             "commit-rollback-minute-once");
@@ -331,25 +324,25 @@ class Program {
             "commit-rollback-sql-once");
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 4,
             "commit-rollback-error-once");
-        MetricsStore.pool.Close();
+        MetricsStore.Pool().Close();
 
         FaultConnector closeFault = new FaultConnector(path);
         closeFault.failClose = true;
-        MetricsStore.pool = new DbPool(closeFault, 1);
+        MetricsStore.UsePool(new DbPool(closeFault, 1));
         MetricsStore.Record("GET", "/close", 500, 90);
         MetricsStore.RecordSql("SELECT close", 30, true);
         MetricsStore.Failed(now, "close", "close throws before disconnect");
         Check(await MetricsStore.Flush() == 0, "close-failure-result");
-        Check(!MetricsStore.flushActive, "close-failure-guard-reset");
+        Check(!MetricsStore.IsFlushActive(), "close-failure-guard-reset");
         FaultConnection dirty = closeFault.last;
         Check(dirty.IsConnected() && dirty.closeCalls == 1,
             "close-failure-left-connection-alive");
-        Check(MetricsStore.pool.IdleCount() == 0
-            && MetricsStore.pool.LiveCount() == 0,
+        Check(MetricsStore.Pool().IdleCount() == 0
+            && MetricsStore.Pool().LiveCount() == 0,
             "close-failure-discarded-and-slot-freed");
-        Check(MetricsStore.retryBuckets.Count == 1
-            && MetricsStore.retrySqlBuckets.Count == 1
-            && MetricsStore.retryErrors.Count == 1, "close-failure-retained");
+        Check(MetricsStore.RetryBucketCount() == 1
+            && MetricsStore.RetrySqlCount() == 1
+            && MetricsStore.RetryErrorCount() == 1, "close-failure-retained");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 4,
             "close-failure-no-partial-minute");
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 4,
@@ -363,17 +356,17 @@ class Program {
         Check(await MetricsStore.Flush() == 3, "close-failure-retry");
         Check(closeFault.opened == 2 && closeFault.last != dirty,
             "close-failure-retry-new-connection");
-        Check(!MetricsStore.flushActive
-            && MetricsStore.retryBuckets.Count == 0
-            && MetricsStore.retrySqlBuckets.Count == 0
-            && MetricsStore.retryErrors.Count == 0, "close-failure-retry-cleared");
+        Check(!MetricsStore.IsFlushActive()
+            && MetricsStore.RetryBucketCount() == 0
+            && MetricsStore.RetrySqlCount() == 0
+            && MetricsStore.RetryErrorCount() == 0, "close-failure-retry-cleared");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_minute") == 5,
             "close-failure-minute-once");
         Check(Program.Value(path, "SELECT SUM(calls) FROM metrics_sql_day") == 5,
             "close-failure-sql-once");
         Check(Program.Value(path, "SELECT COUNT(*) FROM metrics_error") == 5,
             "close-failure-error-once");
-        MetricsStore.pool.Close();
+        MetricsStore.Pool().Close();
         await Program.BoundedRetry(path, now);
         File.Delete(path);
         Console.WriteLine(Program.bad == 0 ? "OK" : "FAIL");

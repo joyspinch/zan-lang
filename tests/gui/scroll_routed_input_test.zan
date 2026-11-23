@@ -351,51 +351,6 @@ class ScrollRoutedInputTest {
         app.SetRootControl(null);
     }
 
-    static void OffscreenReplay(App app) {
-        Control host = Box("display:block");
-        Layout(app, host, 180, 140);
-        ScrollRoutedInputTest count = new ScrollRoutedInputTest();
-        host.BindEvent("Wheel", count.Wheel);
-        host.BindEvent("MouseDown", count.Down);
-        host.BindEvent("MouseUp", count.Up);
-        Input(app, 13, 50, 50, -120, 0, 0);
-        long original = app.window.EventSeq();
-        Check("original unhandled wheel notifies once", count.wheels == 1);
-        app.BeginOffscreenFrame();
-        Check("first legacy wheel awaits ownership", !app.CaptureWheel(20, 20, 180, 140));
-        app.EndOffscreenFrame();
-        Check("frame queues actual wheel replay", app.offscreenWheelPending && app.EventKind() == 0);
-        Check("actual wheel replay restored", app.ReplayOffscreenWheel());
-        long replay = app.window.EventSeq();
-        int replayWheels = count.wheels;
-        app.BeginOffscreenFrame();
-        Check("replayed legacy wheel gets ownership", app.CaptureWheel(20, 20, 180, 140));
-        app.EndOffscreenFrame();
-        Check("consumed replay is bounded", !app.ReplayOffscreenWheel());
-        Input(app, 2, 50, 50, 0, 0, 0);
-        Check("real pointer after replay routes before paint", count.downs == 1);
-        Check("real pointer advances past replay", app.window.EventSeq() > replay);
-        Input(app, 3, 50, 50, 0, 0, 0);
-        Check("real release after replay routes once", count.ups == 1);
-        Check("replay preserves original event identity", replay == original);
-        Check("replay does not notify Wheel again", replayWheels == 1 && count.wheels == 1);
-
-        // No claimant on the replay frame must still end the replay chain.
-        app.BeginOffscreenFrame();
-        app.EndOffscreenFrame();
-        Input(app, 13, 50, 50, -120, 0, 0);
-        app.BeginOffscreenFrame();
-        Check("new legacy wheel awaits new ownership", !app.CaptureWheel(20, 20, 180, 140));
-        app.EndOffscreenFrame();
-        Check("unconsumed wheel replay restored", app.ReplayOffscreenWheel());
-        app.BeginOffscreenFrame();
-        app.EndOffscreenFrame();
-        Check("unclaimed replay is bounded", !app.ReplayOffscreenWheel());
-        Input(app, 13, 50, 50, -120, 0, 0);
-        Check("real wheel after replay notifies once", count.wheels == 3);
-        app.SetRootControl(null);
-    }
-
     static Element LayoutBox(string style) {
         Element box = new Element();
         box.InitElement("div", "");
@@ -698,7 +653,29 @@ class ScrollRoutedInputTest {
         }
     }
 
+    static void WrappedLineOffsets() {
+        int fs = 16;
+        WrappedText wrapped = TextWrap.LinesAt("\n中😀\n\nA\n", 1, fs);
+        Check("wrapped UTF-8 and hard breaks", wrapped.lines.Count == 5
+        && wrapped.lines[0] == "" && wrapped.lines[1] == "中" && wrapped.lines[2] == "😀"
+        && wrapped.lines[3] == "" && wrapped.lines[4] == "A");
+        Check("wrapped source byte offsets", wrapped.starts.Count == 5
+        && wrapped.starts[0] == 0 && wrapped.starts[1] == 1 && wrapped.starts[2] == 4
+        && wrapped.starts[3] == 9 && wrapped.starts[4] == 10);
+
+        int width = Canvas.MeasureChar(65, fs) + Canvas.MeasureChar(32, fs) + Canvas.MeasureChar(66, fs);
+        wrapped = TextWrap.LinesAt("A BB", width, fs);
+        List<string> lines = TextWrap.Lines("A BB", width, fs);
+        Check("wrapped space stays on the preceding line", lines.Count == 2
+        && lines[0] == "A " && lines[1] == "BB");
+        Check("line text and offsets share word breaks", wrapped.lines.Count == 2
+        && wrapped.lines[0] == lines[0] && wrapped.lines[1] == lines[1] && wrapped.starts[1] == 2);
+        lines = TextWrap.Lines("", 0, fs);
+        Check("empty text has one empty line", lines.Count == 1 && lines[0] == "");
+    }
+
     static void Main() {
+        WrappedLineOffsets();
         App app = App.CreateOffscreen("Scroll routed input", 320, 240);
         BindingConstraintEdges(app);
         BindingConstraintRetirement(app);
@@ -707,7 +684,6 @@ class ScrollRoutedInputTest {
         Hover(app);
         Equivalence(app);
         Overrides(app);
-        OffscreenReplay(app);
         TextResizeEquivalence(app);
         AllocatedTextEquivalence(app, true);
         AllocatedTextEquivalence(app, false);

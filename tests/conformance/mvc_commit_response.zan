@@ -78,6 +78,7 @@ class CommitController : AppController {
         c.SetHeader("Content-Disposition", "attachment; filename=success.txt");
         c.SetHeader("X-Success", "prepared");
         c.SetCookie("prepared-session", "fixture", 60);
+        if (kind == "missing") { return; }
         if (kind == "redirect") { c.Redirect("/uncommitted-success"); }
         else if (kind == "html") { c.Html("<h1>uncommitted-success</h1>"); }
         else { c.Json("{\"success\":\"uncommitted-success\"}"); }
@@ -89,6 +90,7 @@ class CommitController : AppController {
 
 class Program {
     static int failures;
+    static const int Port = 23591;
     static AtomicInt served = new AtomicInt(0);
     static void Check(bool ok, string label) {
         Console.WriteLine((ok ? "ok " : "FAIL ") + label);
@@ -102,7 +104,7 @@ class Program {
     static async string Request(WebApp app, TcpListener listener, string kind) {
         long before = served.Load();
         Task.Spawn(Serve(app, listener));
-        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", 19591, 3000);
+        TcpClient client = await TcpClient.ConnectAsync("127.0.0.1", Program.Port, 3000);
         int sent = await client.SendAsync("GET /api/commit/save?kind=" + kind
             + " HTTP/1.1\r\nHost: local.test\r\nConnection: close\r\n\r\n");
         string response = "";
@@ -122,7 +124,8 @@ class Program {
         CommitController.cleanupFails = rollbackFails;
         string label = kind + " mode=" + Convert.ToString(mode) + (rollbackFails ? " rollback-fails" : "");
         string response = await Request(app, listener, kind);
-        if (mode == 0) {
+        bool success = mode == 0 && kind != "missing";
+        if (success) {
             string status = kind == "redirect" ? "302" : "200";
             Check(response.StartsWith("HTTP/1.1 " + status + " "), label + " success status");
             Check(response.Contains("uncommitted-success") && response.Contains("prepared-session="), label + " success payload");
@@ -141,7 +144,7 @@ class Program {
                     && connection.closed && pool.LiveCount() == 0, label + " primary error and discard");
             }
         }
-        if (mode == 0) { Check(connection.db.ExecuteScalar("SELECT COUNT(*) FROM writes") == "1", label + " database committed"); }
+        if (success) { Check(connection.db.ExecuteScalar("SELECT COUNT(*) FROM writes") == "1", label + " database committed"); }
         AppServices.Use(null);
         ZanSql.SetProvider(null);
         ZanSql.SetDefault(null);
@@ -153,17 +156,17 @@ class Program {
         await commit.Save(commit.Need("kind", "kind"));
     }
 
-    static async bool DispatchAction(HttpContext ctx, string actionKey) {
-        if (actionKey != typeof(CommitController).FullName + ".Save") { return false; }
+    static async void DispatchSave(HttpContext ctx) {
         await __AttrRoutes.RunAction(new CommitController(), ctx, "CommitController.Save", false, true, RunSave);
-        return true;
     }
 
     static async int Main() {
         Socket.Initialize();
-        WebApp app = new WebApp("127.0.0.1", 19591);
-        __AttrRoutes.Register(app, new TypeInfo[] { typeof(CommitController) }, DispatchAction);
-        TcpListener listener = new TcpListener("127.0.0.1", 19591);
+        WebApp app = new WebApp("127.0.0.1", Program.Port);
+        string actionKey = typeof(CommitController).FullName + ".Save";
+        app.Map("GET", "/api/commit/save", DispatchSave).Named(actionKey);
+        app.Router().InitRouteTableShared();
+        TcpListener listener = new TcpListener("127.0.0.1", Program.Port);
         listener.Start();
         for (int mode = 0; mode < 3; mode = mode + 1) {
             await Case(app, listener, "json", mode, false);
@@ -171,6 +174,7 @@ class Program {
             await Case(app, listener, "html", mode, false);
         }
         await Case(app, listener, "json", 2, true);
+        await Case(app, listener, "missing", 0, false);
         await listener.StopAsync();
         app.Dispose();
         Console.WriteLine("failures=" + Convert.ToString(failures));

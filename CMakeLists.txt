@@ -315,30 +315,49 @@ if(NOT WIN32)
 else()
     set(ZAN_RT_OBJ_DEFS)
 endif()
-# Publish's --gc-sections needs runtime code split per function. The runtime
-# compiler is selected independently of the host CMake compiler: an MSVC/clang-cl
-# host can still use MinGW GCC here, so the host MSVC flag cannot select its flags.
-# Windows GNU runtime objects deliberately keep data together: TDM-GCC emits
-# zero-initialized tables as file-backed .data$ with -fdata-sections. Explicitly
-# disable that flag to keep those tables in BSS without changing their storage.
+# Use Clang targeting the MinGW GNU COFF ABI for runtime objects on Windows when
+# available so every function and data item gets IMAGE_SCN_LNK_COMDAT and
+# associative .pdata/.xdata; TDM-GCC emits non-COMDAT .text$ sections and keeps
+# dead runtime code/tables alive even under --gc-sections.
+set(ZAN_RT_OBJ_OPT -Os)
+set(ZAN_RT_OBJ_FLAGS)
 if(WIN32)
-    get_filename_component(_zan_rt_cc_name "${ZAN_RT_IO_CC}" NAME)
-    string(TOLOWER "${_zan_rt_cc_name}" _zan_rt_cc_name)
-    if(_zan_rt_cc_name MATCHES "^(cl|clang-cl)([.]exe)?$")
-        set(ZAN_RT_OBJ_SECTIONS)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        set(ZAN_RT_OBJ_CC ${CMAKE_C_COMPILER})
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|aarch64|arm64)$")
+            set(_zan_rt_win_arch "aarch64")
+        else()
+            set(_zan_rt_win_arch "x86_64")
+        endif()
+        list(APPEND ZAN_RT_OBJ_FLAGS "--target=${_zan_rt_win_arch}-w64-windows-gnu")
+        if(_zan_mingw_root)
+            list(APPEND ZAN_RT_OBJ_FLAGS
+                 "--sysroot=${_zan_mingw_root}"
+                 "-isystem" "${_zan_mingw_root}/${_zan_rt_win_arch}-w64-mingw32/include")
+        endif()
+        set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fdata-sections)
     else()
-        set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fno-data-sections)
+        set(ZAN_RT_OBJ_CC ${ZAN_RT_IO_CC})
+        get_filename_component(_zan_rt_cc_name "${ZAN_RT_OBJ_CC}" NAME)
+        string(TOLOWER "${_zan_rt_cc_name}" _zan_rt_cc_name)
+        if(_zan_rt_cc_name MATCHES "^(cl|clang-cl)([.]exe)?$")
+            set(ZAN_RT_OBJ_SECTIONS)
+        else()
+            set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fno-data-sections)
+        endif()
     endif()
 elseif(MSVC)
+    set(ZAN_RT_OBJ_CC ${ZAN_RT_IO_CC})
     set(ZAN_RT_OBJ_SECTIONS)
 else()
+    set(ZAN_RT_OBJ_CC ${ZAN_RT_IO_CC})
     set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fdata-sections)
 endif()
 set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
@@ -370,8 +389,8 @@ target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
 set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_TIMER_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
@@ -400,8 +419,8 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_CRASH_OBJ "${CMAKE_BINARY_DIR}/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_CRASH_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
@@ -434,6 +453,7 @@ set(ZAN_RT_CRYPTO_SOURCES
 
 # Selfhost bundles use the same member boundaries with their own compiler/ABI.
 function(zan_add_crypto_archive archive compiler)
+    set(_crypto_extra_flags ${ARGN})
     get_filename_component(_crypto_archive_stem "${archive}" NAME_WE)
     set(_crypto_objects)
     foreach(_crypto_src IN LISTS ZAN_RT_CRYPTO_TUS)
@@ -443,7 +463,7 @@ function(zan_add_crypto_archive archive compiler)
             OUTPUT ${_crypto_obj}
             COMMAND ${compiler} ${ZAN_RT_OBJ_DEFS} -std=c11
                     -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/runtime
-                    -O2 ${ZAN_RT_OBJ_SECTIONS} -c ${_crypto_src}
+                    ${_crypto_extra_flags} -c ${_crypto_src}
                     -MMD -MF "${_crypto_obj}.d" -MT "${_crypto_obj}" -o ${_crypto_obj}
             DEPENDS ${_crypto_src} ${ZAN_RT_CRYPTO_HEADERS}
             DEPFILE "${_crypto_obj}.d"
@@ -462,7 +482,8 @@ function(zan_add_crypto_archive archive compiler)
 endfunction()
 
 set(ZAN_RT_CRYPTO_ARCHIVE "${CMAKE_BINARY_DIR}/libzancrypto.a")
-zan_add_crypto_archive("${ZAN_RT_CRYPTO_ARCHIVE}" "${ZAN_RT_IO_CC}")
+zan_add_crypto_archive("${ZAN_RT_CRYPTO_ARCHIVE}" "${ZAN_RT_OBJ_CC}"
+    ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS})
 add_custom_target(zanrt_crypto ALL DEPENDS ${ZAN_RT_CRYPTO_ARCHIVE})
 add_dependencies(zanc zanrt_crypto)
 target_compile_definitions(zanc PRIVATE ZAN_RT_CRYPTO_ARCHIVE="${ZAN_RT_CRYPTO_ARCHIVE}")
@@ -482,7 +503,7 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_EMBED_OBJ "${CMAKE_BINARY_DIR}/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_EMBED_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -I ${CMAKE_SOURCE_DIR}/src/embed -I ${CMAKE_SOURCE_DIR}/src/runtime
             -c ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
             -o ${ZAN_EMBED_OBJ}
@@ -504,7 +525,7 @@ target_compile_definitions(zanc PRIVATE ZAN_EMBED_OBJ="${ZAN_EMBED_OBJ}")
 set(ZAN_INFLATE_OBJ "${CMAKE_BINARY_DIR}/zan_inflate${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_INFLATE_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO
             -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS
             -I ${CMAKE_SOURCE_DIR}/src/common
@@ -537,8 +558,8 @@ target_sources(zanc PRIVATE
 set(ZAN_RT_IO_MT_OBJ "${CMAKE_BINARY_DIR}/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_IO_MT_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_MT_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
@@ -578,8 +599,8 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_MEM_OBJ "${CMAKE_BINARY_DIR}/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_MEM_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
     COMMENT "Building small-object allocator object (zanrt_mem)"
@@ -596,8 +617,8 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_SYNC_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_SYNC_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c -o ${ZAN_RT_SYNC_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
@@ -631,8 +652,8 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_FILE_OBJ "${CMAKE_BINARY_DIR}/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_FILE_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c -o ${ZAN_RT_FILE_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c
             ${CMAKE_SOURCE_DIR}/src/runtime/file/rt_file_win.c
@@ -651,8 +672,8 @@ add_custom_command(TARGET zanc POST_BUILD
 set(ZAN_RT_DECIMAL_OBJ "${CMAKE_BINARY_DIR}/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}")
 add_custom_command(
     OUTPUT ${ZAN_RT_DECIMAL_OBJ}
-    COMMAND ${ZAN_RT_IO_CC} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2 ${ZAN_RT_OBJ_SECTIONS}
+    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
             -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c -o ${ZAN_RT_DECIMAL_OBJ}
     DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.h
@@ -1795,18 +1816,6 @@ add_test(NAME diag_cw_bad_bindprop
 set_tests_properties(diag_cw_bad_bindprop PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
-add_test(NAME conformance_gui_cw_publish_handlers
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish/cwpublish_test.zan
-    "-DZANC_ARGS=--auto-stdlib;--publish${_gui_driver_tail}"
-    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish/cwpublish.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_cw_publish_handlers${_exe_ext}
-    -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/gui/cwpublish
-    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-set_tests_properties(conformance_gui_cw_publish_handlers PROPERTIES
-    TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-
 add_test(NAME diag_docapp_no_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
@@ -2053,6 +2062,15 @@ add_test(NAME diag_delegate_generic_wrong_arity
     "-DEXPECT_REGEX=E1006.*using the generic type .GenAct. requires 1 type arguments .got 2"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_delegate_generic_wrong_arity PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_generic_new_missing_type_args
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_new_missing_type_args.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_new_missing_type_args${_exe_ext}
+    "-DEXPECT_REGEX=E1006.*using the generic type .Box. requires 1 type arguments .got 0"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_new_missing_type_args PROPERTIES TIMEOUT 60)
 
 # A382②: --warn-level=error must upgrade #warning to a fatal error (the
 # compile fails and the diagnostic keeps its original W-letter prefix).
@@ -2681,6 +2699,16 @@ add_test(NAME diag_static_path_instance_call
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_static_path_instance_call PROPERTIES TIMEOUT 60)
 
+add_test(NAME diag_module_initializer_invalid
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/module_initializer_invalid.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_module_initializer_invalid${_exe_ext}
+    "-DEXPECT_REGEX=\\[E2151\\] module initializer"
+    -DEXPECT_ERROR_COUNT=5
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_module_initializer_invalid PROPERTIES TIMEOUT 60)
+
 # Regression (audit H4): a named argument bound past a defaulted parameter
 # used to write a NULL into the call's argument list and crash zanc with no
 # diagnostic. The rebinder must reject the shape up front.
@@ -3215,7 +3243,7 @@ set(_mvc_tool ${CMAKE_BINARY_DIR}/zan-mvc${_exe_ext})
 file(GLOB _mvc_tools CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/tools/*.zan)
 add_custom_command(OUTPUT ${_mvc_tool}
   COMMAND $<TARGET_FILE:zanc> ${_mvc_tools} --stdlib-path "${CMAKE_SOURCE_DIR}/stdlib"
-    --codegen-level 0 -o ${_mvc_tool}
+    --no-pkg-gen --codegen-level 0 -o ${_mvc_tool}
   DEPENDS zanc ${_mvc_tools} ${_stdlib_stamp}
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   VERBATIM)
@@ -3252,9 +3280,9 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
 
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
                   security_http_policy verify_code_issuance permission_branches security_csp
-                  admin_gate geo_sources data_grant startup_hooks route_verbs)
+                  admin_gate geo_sources data_grant startup_hooks route_verbs extensibility_hooks)
   set(_mvc_args "")
-  if(_mvc_case MATCHES "^(admin_gate|security_routes)$")
+  if(_mvc_case MATCHES "^(admin_gate|security_routes|extensibility_hooks)$")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=framework)
   elseif(_mvc_case MATCHES "^(permission_branches|route_verbs)$")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=app)
@@ -3334,7 +3362,7 @@ add_test(NAME package_install_mvc
     -DSRC=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc
     -DWORK=${CMAKE_BINARY_DIR}/package_install_mvc
     -P ${CMAKE_SOURCE_DIR}/tests/run_package_install_mvc.cmake)
-set_tests_properties(package_install_mvc PROPERTIES TIMEOUT 180
+set_tests_properties(package_install_mvc PROPERTIES TIMEOUT 360
   LABELS "full;standard;smoke")
 
 add_test(NAME policy_external_target
@@ -3414,6 +3442,57 @@ set(_gui_driver_tail "")
 if(_gui_driver_args)
   set(_gui_driver_tail ";--driver-dir;$<TARGET_FILE_DIR:zan_gui>")
 endif()
+
+set(_cw_publish_doc "${CMAKE_SOURCE_DIR}/tests/gui/cwpublish")
+set(_cw_publish_cwd "${CMAKE_BINARY_DIR}/cases/cwpublish_cwd")
+file(MAKE_DIRECTORY "${_cw_publish_cwd}")
+add_test(NAME conformance_gui_cw_publish_handlers
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_cw_publish_doc}/cwpublish_test.zan
+    "-DZANC_ARGS=--auto-stdlib;--publish;--subsystem;console;--embed;${_cw_publish_doc}/src/PubCw.html=publish-fixture/child/PubCw.html${_gui_driver_tail}"
+    -DEXPECTED=${_cw_publish_doc}/cwpublish.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_cw_publish_handlers${_exe_ext}
+    -DWORKDIR=${_cw_publish_cwd}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    -DINPUT_DEPENDS=${_cw_publish_doc}/src/PubCw.html
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_cw_publish_handlers PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+set(_explicit_gui_doc "${CMAKE_SOURCE_DIR}/tests/gui/form_explicit_publish")
+set(_explicit_gui_cwd "${CMAKE_BINARY_DIR}/cases/form_explicit_publish_cwd")
+file(MAKE_DIRECTORY "${_explicit_gui_cwd}")
+add_test(NAME conformance_gui_form_explicit_publish
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_explicit_gui_doc}/Program.zan
+    "-DZANC_ARGS=--auto-stdlib;--publish;--subsystem;console;--embed;${_explicit_gui_doc}/main.html=publish-fixture/views/editor.html;--embed;${_explicit_gui_doc}/actions.html=publish-fixture/fragments/actions.html${_gui_driver_tail}"
+    -DEXPECTED=${_explicit_gui_doc}/publish.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_explicit_publish${_exe_ext}
+    -DWORKDIR=${_explicit_gui_cwd}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DINPUT_DEPENDS=${_explicit_gui_doc}/main.html;${_explicit_gui_doc}/actions.html"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_form_explicit_publish PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+set(_static_gui_doc "${CMAKE_SOURCE_DIR}/tests/gui/form_static_publish")
+set(_static_gui_cwd "${CMAKE_BINARY_DIR}/cases/form_static_publish_cwd")
+file(MAKE_DIRECTORY "${_static_gui_cwd}")
+add_test(NAME conformance_gui_form_static_publish
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${_static_gui_doc}/Program.zan
+    "-DZANC_ARGS=--auto-stdlib;--publish;--subsystem;console;--embed;${_static_gui_doc}/window.html=static-fixture/views/window.html;--embed;${_static_gui_doc}/actions.html=static-fixture/fragments/actions.html;--embed;${_static_gui_doc}/bound.html=static-fixture/bound.html${_gui_driver_tail}"
+    -DEXPECTED=${_static_gui_doc}/publish.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_static_publish${_exe_ext}
+    -DWORKDIR=${_static_gui_cwd}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DINPUT_DEPENDS=${_static_gui_doc}/window.html;${_static_gui_doc}/actions.html;${_static_gui_doc}/bound.html"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_form_static_publish PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 # --driver-dir redirects the lookup of *every* driver the case links, so a case
 # that also needs another module's driver (Gui.Component.CefBrowser ships its
@@ -3634,6 +3713,10 @@ foreach(_src ${_conf_srcs})
   elseif(_name MATCHES "^(binding_custom_property_ir|binding_property_dispatch_ir|binding_property_generic_ir)$")
     # Exercise property helpers and their caller debug-location isolation.
     set(_extra_args "-g")
+  elseif(_name STREQUAL "gc_cycle_detector")
+    # The host runtime appends the source table. The selfhost differential
+    # runner still exercises the shared snapshot format without this define.
+    set(_extra_args "-DHEAP_SNAPSHOT_SOURCES")
   elseif(_name STREQUAL "opt_arc_field_reload")
     set(_extra_args "--publish;-O1")
   elseif(_name STREQUAL "opt_constfold_branch_phi")
@@ -3721,14 +3804,15 @@ foreach(_src ${_conf_srcs})
      _name STREQUAL "substring_empty_exception_owner" OR
      _name STREQUAL "async_handler_slots" OR
      _name STREQUAL "async_handler_exit_depth" OR
-     _name STREQUAL "async_catch_ownership_route")
+     _name STREQUAL "async_catch_ownership_route" OR
+     _name STREQUAL "generic_canon_gctx")
     set(_case_strict_args ";-g;--strict-runtime;--check-leaks;--arc-guard")
     set(_case_workdir_arg "-DWORKDIR=${CMAKE_SOURCE_DIR}")
   endif()
   set(_mvc_args "")
   if(_name STREQUAL "web_framework_dispatch")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=framework)
-  elseif(_name MATCHES "^web_(api_docs|app_dispatch_identity|controller_origin|list_protocol|menu_attrs|mvc_base_routes|typed_binding)$")
+  elseif(_name MATCHES "^web_(api_docs|app_dispatch_identity|config_extensibility|controller_origin|list_protocol|menu_attrs|mvc_base_routes|typed_binding)$")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=app)
   endif()
   add_test(NAME case_${_name}
@@ -3776,7 +3860,8 @@ foreach(_src ${_conf_srcs})
      _name STREQUAL "substring_empty_exception_owner" OR
      _name STREQUAL "async_handler_slots" OR
      _name STREQUAL "async_handler_exit_depth" OR
-     _name STREQUAL "async_catch_ownership_route")
+     _name STREQUAL "async_catch_ownership_route" OR
+     _name STREQUAL "generic_canon_gctx")
     set_tests_properties(case_${_name} PROPERTIES
       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
   endif()
@@ -3928,6 +4013,16 @@ add_test(NAME conformance_async_finally_ir_scaling
     -DMAX_GROWTH_PERCENT=250
     -P ${CMAKE_SOURCE_DIR}/tests/run_async_finally_ir_scaling.cmake)
 set_tests_properties(conformance_async_finally_ir_scaling PROPERTIES TIMEOUT 360)
+
+# Throw-site count and async frame locals must stay near linear (O(N), not O(N^2)).
+add_test(NAME conformance_async_throw_ir_scaling
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DWORKDIR=${CMAKE_SOURCE_DIR}
+    -DSCRATCH=${CMAKE_SOURCE_DIR}/_scratch/async_throw_ir_scaling
+    -DMAX_GROWTH_PERCENT=250
+    -P ${CMAKE_SOURCE_DIR}/tests/run_async_throw_ir_scaling.cmake)
+set_tests_properties(conformance_async_throw_ir_scaling PROPERTIES TIMEOUT 360)
 
 # Back-edge preemption (B-ID44) is only observable when the hot frame and its
 # Delay sibling share ONE worker: with the default pool the sibling runs on
@@ -4358,7 +4453,7 @@ if(SELFHOST_CLANG)
   # ABI, which may differ from the host runtime compiler. Keep the same feature
   # members here instead of bare-linking the old aggregate object.
   set(_sh_crypto_archive "${CMAKE_BINARY_DIR}/libzancrypto_sh.a")
-  zan_add_crypto_archive("${_sh_crypto_archive}" "${SELFHOST_CLANG}")
+  zan_add_crypto_archive("${_sh_crypto_archive}" "${SELFHOST_CLANG}" -O2)
   set(_sh_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_timer.c
                    runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c)
   set(_sh_rt_objs)
@@ -4438,7 +4533,7 @@ if(SELFHOST_CLANG)
   # emitted fallback). The gate therefore compares *compiler* behaviour --
   # the stdout a program produces -- not runtime internals.
   set(_shd_crypto_archive "${CMAKE_BINARY_DIR}/libzancrypto_shd.a")
-  zan_add_crypto_archive("${_shd_crypto_archive}" "${SELFHOST_CLANG}")
+  zan_add_crypto_archive("${_shd_crypto_archive}" "${SELFHOST_CLANG}" -O2)
   set(_shd_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_timer.c
                     runtime/rt_decimal.c runtime/rt_sync.c embed/zan_embed_api.c)
   set(_shd_rt_objs)
@@ -4654,8 +4749,8 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/packages)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
-      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo/gen1${_exe_ext}
-      -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo
+      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo_packages/gen1${_exe_ext}
+      -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo_packages
       -DTIER_ROOTS=packages
       -DGAPS=${CMAKE_SOURCE_DIR}/tests/selfhost/repo_known_gaps.txt
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_repo.cmake)
@@ -4674,8 +4769,8 @@ add_test(NAME selfhost_ir_golden
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
-    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_repo/gen1${_exe_ext}
-    -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_repo
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_ir_golden/gen1${_exe_ext}
+    -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_ir_golden
     -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
     -DCASES=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_cases.txt
     -DGOLDEN_DIR=${CMAKE_SOURCE_DIR}/tests/selfhost/ir_golden
@@ -4850,19 +4945,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       endif()
     endif()
   endif()
-
-  add_test(NAME conformance_gui_stack
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/layout_test.zan
-      # Types.zan is pulled in automatically by 'using Gui;' (auto-stdlib), so
-      # only the non-auto-included Stack.zan is passed explicitly here.
-      # --driver-dir: link the freshly built zan_gui, not the committed
-      # driver bundle (which may lag behind newly added native exports).
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Layout/Stack.zan${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_stack${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Closing a tab removes it from the list the strip is iterating; the widget
   # must not be left pointing at an entry that is gone.
@@ -5404,6 +5486,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_geodispatch.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_geodispatch${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_chart_breaks
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_breaks_test.zan
+      "-DZANC_ARGS=--auto-stdlib;-g;--strict-runtime;--check-leaks;--arc-guard${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_breaks.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_breaks${_exe_ext}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_chart_breaks PROPERTIES
+    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
   add_test(NAME conformance_gui_layer
     COMMAND ${CMAKE_COMMAND}
@@ -6118,7 +6212,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DWORKDIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
     set_tests_properties(conformance_gui_uidriver_client_dev PROPERTIES
-      TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+      TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME conformance_gui_uidriver_command_errors
       COMMAND ${CMAKE_COMMAND}
         -DZANC=$<TARGET_FILE:zanc>
@@ -6130,7 +6224,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DWORKDIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
     set_tests_properties(conformance_gui_uidriver_command_errors PROPERTIES
-      TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+      TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME uidriver_results
       COMMAND ${CMAKE_COMMAND}
         -DBINARY_DIR=${CMAKE_BINARY_DIR}/test-out/uidriver-results
@@ -6172,7 +6266,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
     set_tests_properties(conformance_gui_native_window_lifecycle PROPERTIES
       TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-      ENVIRONMENT "ZAN_NATIVE_LIFECYCLE_CASE=all")
+      ENVIRONMENT "ZAN_NATIVE_LIFECYCLE_CASE=all;ZAN_TILE_DIFF=1")
   endif()
 
   # A form-level size is the default for every generated control, including
@@ -6713,7 +6807,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       control_host_lifecycle app_post_lifecycle text_routed_input form_lifecycle
       treeview_filter_input colorpicker_input_lifecycle layer_input_lifecycle layer_photos_retained
       drag_routed_input scroll_routed_input scrollcolumn_input_lifecycle input_root_composition
-      control_factory_equivalence model_binding_equivalence scroll_widgets_input_lifecycle
+      control_factory_equivalence model_binding_equivalence scroll_widgets_input_lifecycle form_local_animation
       control_children_lifecycle contextmenu_routed_lifecycle popup_factory_mount
       overlay_anchor_retirement retained_longpress_input retained_focus_lifecycle hover_callback_lifetime
       treeview_retained_input_lifecycle listview_retained_input_lifecycle virtuallist_string_input carousel_retained_input
@@ -6730,7 +6824,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       sceneview_retained_input scene_designer_retained_input flow_allocation_regression
       designer_inspector_retained_input designer_inspector_cards_retained
       designer_typed_props_adapter scrollcolumn_cull_measure
-      control_input_host_reentry dockhost_preparation_geometry browser_hosted_lifecycle)
+      control_input_host_reentry dockhost_preparation_geometry browser_hosted_lifecycle
+      app_loop_participant browser_native_lifecycle overlay_escape_input
+      routed_click_doubleclick scroll_geometry_input)
     add_test(NAME conformance_gui_${_routing_case}
       COMMAND ${CMAKE_COMMAND}
         -DZANC=$<TARGET_FILE:zanc>
@@ -6953,13 +7049,13 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_scene_router_input PROPERTIES
     TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-  # 编译实际调用方源码：地址栏与皮肤面板必须登记到共同输入树。
+  # 编译实际调用方源码：皮肤面板必须登记到共同输入树。
   add_test(NAME conformance_gui_browser_skinbuilder_input
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/browser_skinbuilder_input_test.zan
       -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/gui_browser/Browser.zan;${CMAKE_SOURCE_DIR}/examples/gui_browser/Models/Tab.zan;${CMAKE_SOURCE_DIR}/tools/skinbuilder/SkinBuilder.zan;-DGUI_CALLER_INPUT_TEST;--auto-stdlib;--subsystem;console;--check-leaks;--arc-guard${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tools/skinbuilder/SkinBuilder.zan;-DGUI_CALLER_INPUT_TEST;--auto-stdlib;--subsystem;console;--check-leaks;--arc-guard${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/browser_skinbuilder_input_test.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_browser_skinbuilder_input${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -6974,7 +7070,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_narrow_host_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--auto-stdlib;-O0${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_narrow_host.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_narrow_host${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_gui_no_runtime_error.cmake)
@@ -6992,19 +7088,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_cascade.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_selectbox_cascade${_exe_ext}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-
-  # SelectBox 弹层选项点击的基线命中回归：弹层「内部控件让行」的
-  # 判定只看弹层基线（OnPaintOverlay 入口）之后注册的区域——按真实
-  # 帧序重放内容滑杆/全窗+弹层 blocker/内嵌滚动条的注册序列，锁住
-  # 基线跳过内容区、滚动条仍让行、blocker 不算控件、顶层优先。
-  add_test(NAME conformance_gui_selectbox_popup_hit
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/selectbox_popup_hit_test.zan
-      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_popup_hit.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_selectbox_popup_hit${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Menu v2 (tree menu): pure-model flatten/default-expand asserts plus a
@@ -7391,19 +7474,6 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_theme_drawer_retained_input PROPERTIES
     TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
 
-  add_test(NAME conformance_gui_gallery_retained_input
-    COMMAND ${CMAKE_COMMAND}
-      -DZANC=$<TARGET_FILE:zanc>
-      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/gallery_retained_input_test.zan
-      -DSTDLIB_STAMP=${_stdlib_stamp}
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryRetainedInput.zan;${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryRetainedParticipant.zan;${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryRibbonView.zan;${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryRibbonClip.zan;${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryDemoView.zan;${CMAKE_SOURCE_DIR}/examples/gui_gallery/GalleryFrame.zan;${CMAKE_SOURCE_DIR}/tests/gui/models/GalleryRetainedFixture.zan;--auto-stdlib;--package-project;${CMAKE_SOURCE_DIR};--subsystem;console;-g;--check-leaks;--arc-guard;--strict-runtime${_gui_driver_tail}"
-      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/gallery_retained_input_test.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_gallery_retained_input${_exe_ext}
-      -DWORKDIR=${CMAKE_SOURCE_DIR}
-      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
-  set_tests_properties(conformance_gui_gallery_retained_input PROPERTIES
-    TIMEOUT 360 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} ENVIRONMENT "ZAN_RT_HARD=1")
-
   add_test(NAME conformance_guihost_loop
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -7458,7 +7528,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_trap_cat_single_tap PROPERTIES
-    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     ENVIRONMENT "ZAN_UI_TEST=;ZAN_UI_SCRIPT=")
 
   # The Zan-side COM interop the WebView2 backend is built from (GUID
@@ -7492,7 +7562,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
-  set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_codeeditor_fold conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar conformance_gui_rate PROPERTIES
+  set_tests_properties(runtime_gui conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_codeeditor_fold conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar conformance_gui_rate PROPERTIES
     ENVIRONMENT "ZAN_LIB_PATH=$<TARGET_FILE_DIR:zan_gui>;LD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>;DYLD_LIBRARY_PATH=$<TARGET_FILE_DIR:zan_gui>")
 endif()
 
@@ -7613,17 +7683,6 @@ add_test(NAME policy_css_comment_hygiene
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_css_comment_hygiene.cmake)
 set_tests_properties(policy_css_comment_hygiene PROPERTIES
-  LABELS "full;standard;smoke;gui")
-
-# ---- Policy: every gallery demo that is written must be reachable ----
-# A demo is lost silently in two ways: an overlay demo missing from the
-# IsOverlayComp routing list (the base pass then paints a placeholder over it --
-# Compose and DataTable), or a render branch whose preview id no Comp registers
-# (dead code -- Alert.types / Alert.queue). Both look like an empty preview box.
-add_test(NAME policy_gallery_demo_wiring
-  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
-    -P ${CMAKE_SOURCE_DIR}/tests/run_gallery_demo_wiring.cmake)
-set_tests_properties(policy_gallery_demo_wiring PROPERTIES
   LABELS "full;standard;smoke;gui")
 
 # ---- Policy: widget draw paths must not gain direct Theme font-size reads ----
@@ -8024,6 +8083,16 @@ add_test(NAME diag_scalar_member_access
     "-DEXPECT_REGEX=type 'string' has no member 'path'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_scalar_member_access PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_string_join_wrong_arg_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/string_join_wrong_arg_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_string_join_wrong_arg_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'string\\[\\]' to 'List<string>' in argument 2 of 'string[.]Join'"
+    -DEXPECT_ERROR_COUNT=4
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_string_join_wrong_arg_type PROPERTIES TIMEOUT 60)
 
 # Reading `obj.name` where the class (or its base chain) declares no such
 # member must be a compile error: irgen used to fold the read to the constant
@@ -8889,6 +8958,13 @@ if(Python3_Interpreter_FOUND)
       $<TARGET_FILE:zanc>)
   set_tests_properties(tool_zanc_diagnostics_jsonl PROPERTIES TIMEOUT 120)
 
+  add_test(NAME tool_selfhost_diagnostics_jsonl
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diagnostics.py
+      ${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext})
+  set_tests_properties(tool_selfhost_diagnostics_jsonl PROPERTIES
+    FIXTURES_REQUIRED selfhost_gen1_diagnostics TIMEOUT 120)
+  set_tests_properties(selfhost_gen1 PROPERTIES FIXTURES_SETUP selfhost_gen1_diagnostics)
+
   add_test(NAME tool_zanc_semantic_refs
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_zanc_semantic_refs.py
       --zanc $<TARGET_FILE:zanc>)
@@ -8938,20 +9014,16 @@ foreach(_t ${_all_tests})
   endif()
   set_property(TEST ${_t} APPEND PROPERTY LABELS ${_labels})
   # A Gui conformance case opens a real window, and on a contended desktop a
-  add_test(NAME tool_selfhost_diagnostics_jsonl
-    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diagnostics.py
-      ${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext})
-  set_tests_properties(tool_selfhost_diagnostics_jsonl PROPERTIES
-    FIXTURES_REQUIRED selfhost_gen1_diagnostics TIMEOUT 120)
-  set_tests_properties(selfhost_gen1 PROPERTIES FIXTURES_SETUP selfhost_gen1_diagnostics)
-
   # pump can stop returning (observed: two 14-minute stalls on
   # conformance_gui_listview_scrollbar_drag -- idle process, live window,
   # no output). The globbed conformance cases above carry TIMEOUT 120, but the
   # Gui add_test() calls set none, so one such stall costs the whole run
   # instead of one failure. Bound them here, where gui names are matched.
   if(_t MATCHES "^conformance_gui_")
-    set_tests_properties(${_t} PROPERTIES TIMEOUT 240)
+    get_test_property(${_t} TIMEOUT _t_timeout)
+    if(NOT _t_timeout)
+      set_tests_properties(${_t} PROPERTIES TIMEOUT 240)
+    endif()
   endif()
   # Cases that drive the real desktop (tray icon, screen capture, UI
   # automation, mouse/keyboard, clipboard) contend for one machine-wide

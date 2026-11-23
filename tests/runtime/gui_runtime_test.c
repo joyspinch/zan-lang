@@ -10,8 +10,8 @@ typedef uint32_t u32;
 extern i64 zan_gui_create_surface(i64 width, i64 height);
 extern i64 zan_gui_destroy_surface(i64 id);
 extern void zan_gui_clear(i64 surface_id, i64 color);
-extern void zan_gui_draw_text(i64 surface_id, i64 x, i64 y,
-                              const char *text, i64 color, i64 font_size);
+extern void zan_gui_draw_text(i64 surface_id, i64 x, i64 y, const char *text,
+                              i64 color, i64 font_size);
 extern i64 zan_gui_measure_text(const char *text, i64 font_size);
 extern void zan_gui_draw_line(i64 surface_id, i64 x0, i64 y0, i64 x1, i64 y1,
                               i64 color, i64 thickness);
@@ -20,109 +20,148 @@ extern void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h,
                               i32 color);
 extern void zan_gui_push_clip(i32 surface_id, i32 x, i32 y, i32 w, i32 h);
 extern void zan_gui_pop_clip(i32 surface_id);
-extern void zan_gui_blur_rect_cached(i32 surface_id, i32 x, i32 y, i32 w,
-                                     i32 h, i32 radius, i32 slot, i32 dirty);
+extern void zan_gui_blur_rect_cached(i32 surface_id, i32 x, i32 y, i32 w, i32 h,
+                                     i32 radius, i32 slot, i32 dirty);
 extern i32 zan_gui_stat_read(i32 idx, i32 kind);
+extern i32 zan_gui_region_capture(i32 id, i32 x, i32 y, i32 w, i32 h, i32 *left,
+                                  i32 *top, i32 *width, i32 *height);
+extern void zan_gui_region_watch(i32 id);
+extern i32 zan_gui_region_seal(i32 id);
+extern i32 zan_gui_region_restore(i32 id);
 
 static int changed(const u32 *pixels, int count, u32 background) {
-    for (int i = 0; i < count; i++)
-        if (pixels[i] != background) return 1;
-    return 0;
+  for (int i = 0; i < count; i++)
+    if (pixels[i] != background)
+      return 1;
+  return 0;
 }
 
-#define CHECK(cond) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "gui runtime: %s failed (line %d)\n", #cond, __LINE__); \
-        exit(1); \
-    } \
-} while (0)
+#define CHECK(cond)                                                            \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      fprintf(stderr, "gui runtime: %s failed (line %d)\n", #cond, __LINE__);  \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)
 
 static i32 blur_calls(void) { return zan_gui_stat_read(5, 0); }
 static i32 blur_hits(void) { return zan_gui_stat_read(6, 0); }
 static void blur_stats_reset(void) {
-    zan_gui_stat_read(5, 1);
-    zan_gui_stat_read(6, 1);
+  zan_gui_stat_read(5, 1);
+  zan_gui_stat_read(6, 1);
 }
 
 static void paint_backdrop(i32 sid, i32 tint) {
-    zan_gui_clear(sid, 0xFF203040);
-    zan_gui_fill_rect(sid, 8, 8, 96, 40, tint);
-    zan_gui_fill_rect(sid, 24, 60, 72, 40, 0xFF806040);
+  zan_gui_clear(sid, 0xFF203040);
+  zan_gui_fill_rect(sid, 8, 8, 96, 40, tint);
+  zan_gui_fill_rect(sid, 24, 60, 72, 40, 0xFF806040);
 }
 
 static void test_blur_cache_clip(void) {
-    const i32 bx = 16, by = 16, bw = 64, bh = 64, br = 12, slot = 3;
-    i64 surface = zan_gui_create_surface(128, 128);
-    CHECK(surface >= 0);
-    const i32 sid = (i32)surface;
-    u32 *px = (u32 *)zan_gui_get_pixels(surface);
-    CHECK(px);
+  const i32 bx = 16, by = 16, bw = 64, bh = 64, br = 12, slot = 3;
+  i64 surface = zan_gui_create_surface(128, 128);
+  CHECK(surface >= 0);
+  const i32 sid = (i32)surface;
+  u32 *px = (u32 *)zan_gui_get_pixels(surface);
+  CHECK(px);
 
-    paint_backdrop(sid, 0xFF4080C0);
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
-    CHECK(blur_calls() == 1);
-    CHECK(blur_hits() == 0);
+  paint_backdrop(sid, 0xFF4080C0);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
+  CHECK(blur_calls() == 1);
+  CHECK(blur_hits() == 0);
 
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
-    CHECK(blur_calls() == 0);
-    CHECK(blur_hits() == 1);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
+  CHECK(blur_calls() == 0);
+  CHECK(blur_hits() == 1);
 
-    u32 before[128 * 128];
-    for (int i = 0; i < 128 * 128; i++) before[i] = px[i];
-    zan_gui_push_clip(sid, 0, 0, 128, 8);
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
-    CHECK(blur_calls() == 0);
-    CHECK(blur_hits() == 0);
-    for (int i = 0; i < 128 * 128; i++) CHECK(px[i] == before[i]);
-    zan_gui_pop_clip(sid);
+  u32 before[128 * 128];
+  for (int i = 0; i < 128 * 128; i++)
+    before[i] = px[i];
+  zan_gui_push_clip(sid, 0, 0, 128, 8);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
+  CHECK(blur_calls() == 0);
+  CHECK(blur_hits() == 0);
+  for (int i = 0; i < 128 * 128; i++)
+    CHECK(px[i] == before[i]);
+  zan_gui_pop_clip(sid);
 
-    zan_gui_push_clip(sid, 0, 0, 128, 48);
-    zan_gui_fill_rect(sid, bx, by, bw, 16, 0xFFC02040);
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
-    CHECK(blur_calls() == 1);
-    zan_gui_pop_clip(sid);
+  zan_gui_push_clip(sid, 0, 0, 128, 48);
+  zan_gui_fill_rect(sid, bx, by, bw, 16, 0xFFC02040);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 1);
+  CHECK(blur_calls() == 1);
+  zan_gui_pop_clip(sid);
 
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
-    CHECK(blur_calls() == 1);
-    CHECK(blur_hits() == 0);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
+  CHECK(blur_calls() == 1);
+  CHECK(blur_hits() == 0);
 
-    blur_stats_reset();
-    zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
-    CHECK(blur_calls() == 0);
-    CHECK(blur_hits() == 1);
+  blur_stats_reset();
+  zan_gui_blur_rect_cached(sid, bx, by, bw, bh, br, slot, 0);
+  CHECK(blur_calls() == 0);
+  CHECK(blur_hits() == 1);
 
-    CHECK(zan_gui_destroy_surface(surface) == 0);
+  CHECK(zan_gui_destroy_surface(surface) == 0);
+}
+
+static void test_region_clip(void) {
+  i32 sid = (i32)zan_gui_create_surface(32, 32);
+  CHECK(sid >= 0);
+  const u32 background = 0xFF202020u;
+  const u32 stripe = 0xFF123456u;
+  zan_gui_clear(sid, background);
+  zan_gui_push_clip(sid, 4, 8, 12, 8);
+  zan_gui_push_clip(sid, 8, 4, 16, 16);
+  i32 x, y, w, h;
+  CHECK(zan_gui_region_capture(sid, 8, 4, 16, 16, &x, &y, &w, &h));
+  CHECK(x == 8 && y == 8 && w == 8 && h == 8);
+  zan_gui_fill_rect(sid, 8, 4, 16, 16, stripe);
+  zan_gui_region_watch(sid);
+  CHECK(!zan_gui_region_seal(sid));
+  zan_gui_pop_clip(sid);
+  zan_gui_pop_clip(sid);
+  zan_gui_fill_rect(sid, 16, 8, 8, 8, stripe);
+  CHECK(zan_gui_region_seal(sid));
+  CHECK(zan_gui_region_restore(sid));
+  const u32 *pixels = (const u32 *)zan_gui_get_pixels(sid);
+  CHECK(pixels && pixels[8 * 32 + 8] == background &&
+        pixels[8 * 32 + 16] == stripe);
+  zan_gui_region_watch(sid);
+  zan_gui_fill_rect(sid, 15, 8, 2, 8, stripe);
+  CHECK(!zan_gui_region_seal(sid));
+  CHECK(!zan_gui_region_restore(sid));
+  CHECK(zan_gui_destroy_surface(sid) == 0);
 }
 
 int main(void) {
-    const u32 background = 0xFFFFFFFFu;
-    i64 surface = zan_gui_create_surface(64, 64);
-    assert(surface >= 0);
-    u32 *pixels = (u32 *)zan_gui_get_pixels(surface);
-    assert(pixels);
+  const u32 background = 0xFFFFFFFFu;
+  i64 surface = zan_gui_create_surface(64, 64);
+  assert(surface >= 0);
+  u32 *pixels = (u32 *)zan_gui_get_pixels(surface);
+  assert(pixels);
 
-    zan_gui_clear(surface, background);
-    zan_gui_draw_line(surface, 8, 8, 40, 40, 0xFF112233u, 2);
-    assert(changed(pixels, 64 * 64, background));
+  zan_gui_clear(surface, background);
+  zan_gui_draw_line(surface, 8, 8, 40, 40, 0xFF112233u, 2);
+  assert(changed(pixels, 64 * 64, background));
 
-    i64 one = zan_gui_measure_text("\xC3\xA9", 14);
-    i64 two = zan_gui_measure_text("\xC3\xA9\xC3\xA9", 14);
-    assert(one > 0);
-    assert(two > one);
+  i64 one = zan_gui_measure_text("\xC3\xA9", 14);
+  i64 two = zan_gui_measure_text("\xC3\xA9\xC3\xA9", 14);
+  assert(one > 0);
+  assert(two > one);
 
-    zan_gui_clear(surface, background);
-    zan_gui_draw_text(surface, 2, 2, "\xC3\xA9", 0xFF334455u, 14);
-    assert(changed(pixels, 64 * 64, background));
+  zan_gui_clear(surface, background);
+  zan_gui_draw_text(surface, 2, 2, "\xC3\xA9", 0xFF334455u, 14);
+  assert(changed(pixels, 64 * 64, background));
 
-    assert(zan_gui_destroy_surface(surface) == 0);
+  assert(zan_gui_destroy_surface(surface) == 0);
 
-    test_blur_cache_clip();
+  test_blur_cache_clip();
+  test_region_clip();
 
-    puts("gui runtime ok");
-    return 0;
+  puts("gui runtime ok");
+  return 0;
 }

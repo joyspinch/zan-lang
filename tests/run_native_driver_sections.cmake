@@ -136,21 +136,48 @@ foreach(_driver zan_gui zan_image zan_audio zan_game)
   endforeach()
 endforeach()
 
-# The independent Windows runtime compiler can be TDM-GCC even with a Clang
-# host. Its zero tables must occupy BSS, while function GC remains available.
+# The independent Windows runtime compiler can be TDM-GCC (-fno-data-sections,
+# monolithic .bss) or Clang targeting GNU COFF (-fdata-sections, COMDAT .bss$).
+# In either case zero tables must occupy unbacked BSS, while function GC remains
+# available.
 read_sections("${RUNTIME_OBJECT}" _runtime)
 if(NOT _runtime MATCHES "[ \t][.]text[$.][^ \t\r\n]+[ \t]")
   message(FATAL_ERROR "native_driver_sections: runtime lost per-function sections")
 endif()
-if(_runtime MATCHES "[ \t][.](data|bss)[$.][^ \t\r\n]+[ \t]")
-  message(FATAL_ERROR "native_driver_sections: runtime still uses per-data sections\n${_runtime}")
-endif()
-if(NOT _runtime MATCHES "[ \t][.]bss[ \t]+([0-9a-fA-F]+)[ \t]")
-  message(FATAL_ERROR "native_driver_sections: runtime has no BSS section")
-endif()
-math(EXPR _bss_size "0x${CMAKE_MATCH_1}")
-if(_bss_size EQUAL 0)
-  message(FATAL_ERROR "native_driver_sections: runtime zero tables have no BSS storage")
+if(_runtime MATCHES "[ \t][.]bss[$][^ \t\r\n]+[ \t]")
+  read_coff("${RUNTIME_OBJECT}" _runtime_coff)
+  string(REGEX MATCHALL "  Section [{][^}]*[}]" _rt_sections "${_runtime_coff}")
+  set(_rt_bss_count 0)
+  set(_rt_comdat_text 0)
+  foreach(_rt_section IN LISTS _rt_sections)
+    if(_rt_section MATCHES "Name: [.]text[$][^ \t\r\n]+ [(]")
+      if(_rt_section MATCHES "IMAGE_SCN_LNK_COMDAT")
+        math(EXPR _rt_comdat_text "${_rt_comdat_text} + 1")
+      endif()
+    elseif(_rt_section MATCHES "Name: [.]bss[$][^ \t\r\n]+ [(]")
+      math(EXPR _rt_bss_count "${_rt_bss_count} + 1")
+      if(NOT _rt_section MATCHES "IMAGE_SCN_CNT_UNINITIALIZED_DATA" OR
+         _rt_section MATCHES "IMAGE_SCN_CNT_INITIALIZED_DATA" OR
+         NOT _rt_section MATCHES "IMAGE_SCN_LNK_COMDAT" OR
+         NOT _rt_section MATCHES "PointerToRawData: 0x0[\r\n]")
+        message(FATAL_ERROR "native_driver_sections: split runtime BSS section is not unbacked COMDAT BSS\n${_rt_section}")
+      endif()
+    endif()
+  endforeach()
+  if(_rt_bss_count LESS 1 OR _rt_comdat_text LESS 1)
+    message(FATAL_ERROR "native_driver_sections: split runtime lacks COMDAT code or unbacked .bss$ sections")
+  endif()
+else()
+  if(_runtime MATCHES "[ \t][.](data|bss)[$.][^ \t\r\n]+[ \t]")
+    message(FATAL_ERROR "native_driver_sections: runtime still uses per-data sections\n${_runtime}")
+  endif()
+  if(NOT _runtime MATCHES "[ \t][.]bss[ \t]+([0-9a-fA-F]+)[ \t]")
+    message(FATAL_ERROR "native_driver_sections: runtime has no BSS section")
+  endif()
+  math(EXPR _bss_size "0x${CMAKE_MATCH_1}")
+  if(_bss_size EQUAL 0)
+    message(FATAL_ERROR "native_driver_sections: runtime zero tables have no BSS storage")
+  endif()
 endif()
 if(DEFINED MEMORY_OBJECT)
   if(NOT EXISTS "${MEMORY_OBJECT}")
@@ -160,16 +187,20 @@ if(DEFINED MEMORY_OBJECT)
   # Match the actual table symbol, then its indexed section. An unrelated BSS
   # section must not hide g_slab_set in file-backed .data$g_slab_set.
   string(REGEX MATCH "  Symbol [{][^}]*Name: g_slab_set[\r\n][^}]*[}]" _slab_symbol "${_memory}")
-  if(NOT _slab_symbol MATCHES "Section: [.]bss [(]([0-9]+)[)]")
+  if(NOT _slab_symbol MATCHES "Section: ([.]bss|[.]bss[$]g_slab_set) [(]([0-9]+)[)]")
     message(FATAL_ERROR "native_driver_sections: g_slab_set is missing or is not in .bss\n${_slab_symbol}")
   endif()
-  set(_slab_section_number "${CMAKE_MATCH_1}")
+  set(_slab_section_name "${CMAKE_MATCH_1}")
+  set(_slab_section_number "${CMAKE_MATCH_2}")
   string(REGEX MATCH "  Section [{][\r\n]+    Number: ${_slab_section_number}[\r\n][^}]*[}]" _slab_section "${_memory}")
-  if(NOT _slab_section MATCHES "Name: [.]bss [(]" OR
+  if(NOT _slab_section MATCHES "Name: ([.]bss|[.]bss[$]g_slab_set) [(]" OR
      NOT _slab_section MATCHES "IMAGE_SCN_CNT_UNINITIALIZED_DATA" OR
      _slab_section MATCHES "IMAGE_SCN_CNT_INITIALIZED_DATA" OR
      NOT _slab_section MATCHES "PointerToRawData: 0x0[\r\n]")
     message(FATAL_ERROR "native_driver_sections: g_slab_set section is not unbacked BSS\n${_slab_section}")
+  endif()
+  if(_slab_section_name MATCHES "[$]" AND NOT _slab_section MATCHES "IMAGE_SCN_LNK_COMDAT")
+    message(FATAL_ERROR "native_driver_sections: split g_slab_set section is not COMDAT\n${_slab_section}")
   endif()
   message(STATUS "native_driver_sections: g_slab_set is in unbacked, uninitialized .bss")
 endif()

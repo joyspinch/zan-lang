@@ -48,7 +48,7 @@ class NestedTreeCancel {
 
 class NestedTreePaint : Control {
     public int paints;
-    public NestedTreePaint() { this.InitControl("nested-paint", 0); }
+    public NestedTreePaint() { this.InitControl("nested-paint"); }
     public override void OnPaint(App app) {
         this.paints = this.paints + 1;
         // FillRect uses ARGB; the opaque marker deliberately overflows so only
@@ -82,21 +82,6 @@ class NestedTreeCellRebindProvider : CellWidgetProvider {
     }
 }
 
-class NestedTreeRebindComp : CellComp {
-    public weak DataTableControl table;
-    public NestedTreePaint stale;
-    public DataSource next;
-    public int fills;
-    public NestedTreeRebindComp() : base("nested-tree-rebind") { }
-    public override Control Acquire(App app, DataSource src, int row, int col, RowKey key,
-    int x, int y, int w, int h, int rows, int cols) { return this.stale; }
-    public override void FillStr(Control ctl, string val, DataColumn col, DataSource src, int row) {
-        this.fills = this.fills + 1;
-        this.table.Bind(this.table.columns, this.next);
-    }
-    public override void Reset() { this.stale = null; this.next = null; }
-}
-
 class NestedTreeCustomRenderer : CellRenderer {
     public bool covered;
     public int paints;
@@ -116,6 +101,22 @@ class NestedTreeCustomRenderer : CellRenderer {
     }
 }
 
+class WideTableRenderer : CellRenderer {
+    public List<int> columns = new List<int>();
+
+    public static int Color(int col) { return unchecked((int)0xFF004000) + col; }
+
+    public override bool OwnsCell(DataSource src, int row, int col) {
+        if (row == 0) { this.columns.Add(col); }
+        return true;
+    }
+
+    public override void Paint(App app, Canvas canvas, DataSource src, int row, int col,
+    int x, int y, int w, int h, bool selected, bool hovered) {
+        canvas.FillRect(x, y, w, h, WideTableRenderer.Color(col));
+    }
+}
+
 class NestedTreeCustomStyler : CellStyler {
     public bool covered;
     public int paints;
@@ -124,21 +125,6 @@ class NestedTreeCustomStyler : CellStyler {
     int x, int y, int w, int h) {
         this.paints = this.paints + 1;
     }
-}
-
-class NestedTreeCustomComp : CellComp {
-    public Input editor;
-    public int acquisitions;
-    public NestedTreeCustomComp() : base("nested-tree-custom") {
-        this.editor = new Input("Custom fallback");
-        this.editor.SetProp("style", "height: 16px");
-    }
-    public override Control Acquire(App app, DataSource src, int row, int col, RowKey key,
-    int x, int y, int w, int h, int rows, int cols) {
-        this.acquisitions = this.acquisitions + 1;
-        return row == 0 ? this.editor : null;
-    }
-    public override void Reset() { this.editor = null; }
 }
 
 class NestedTreeView : UiViewOwner {
@@ -340,10 +326,13 @@ public class DataTableNestedVisualTreeTest {
     }
 
     static void GridLifecycle(App app) {
-        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
-        grid.Col("Name", 180, item => item.name);
         List<NestedTreeTestItem> rows = Items("first");
-        grid.Bind(rows);
+        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem> {
+            ItemsSource = rows,
+            Columns = [
+                new GridColumn<NestedTreeTestItem> { Title = "Name", Width = 180, Text = item => item.name }
+            ]
+        };
         Configure(grid.st);
         Panel detail = Panel.Column();
         Input editor = new Input("Grid detail");
@@ -429,9 +418,16 @@ public class DataTableNestedVisualTreeTest {
     }
 
     static void WidgetColumns(App app) {
-        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
-        grid.WidgetCol("Active", 180, "switch", item => "true");
-        grid.Bind(Items("widgets"));
+        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem> {
+            ItemsSource = Items("widgets"),
+            Columns = [
+                new GridColumn<NestedTreeTestItem> {
+                    Title = "Active",
+                    Width = 180,
+                    Template = item => new Switch()
+                }
+            ]
+        };
         Configure(grid.st);
         app.SetRootControl(grid);
         grid.UseApp(app);
@@ -452,8 +448,6 @@ public class DataTableNestedVisualTreeTest {
         grid.Bind(null);
         Check(grid.ChildCount() == 0, "component column binding retires the visible set");
         app.SetRootControl(null);
-        CellComp comp = CellComp.Find("switch");
-        if (comp != null) { comp.Reset(); }
     }
 
     static void OwnerPaintAndClip(App app, Control table, DataTableState state, DataSource source) {
@@ -533,35 +527,14 @@ public class DataTableNestedVisualTreeTest {
         app.SetRootControl(null);
     }
 
-    static void ComponentCallbackInvalidation(App app) {
-        List<DataColumn> cols = new List<DataColumn>();
-        cols.Add(DataColumn.WidgetCol("Callback", 180, "nested-tree-rebind"));
-        DataTableControl table = new DataTableControl(cols, new NestedTreeSource());
-        Configure(table.state);
-        NestedTreeRebindComp comp = new NestedTreeRebindComp();
-        comp.table = table;
-        comp.next = new NestedTreeSource();
-        NestedTreePaint stale = new NestedTreePaint();
-        comp.stale = stale;
-        CellComp.Register(comp);
-        app.SetRootControl(table);
-        table.UseApp(app);
-        table.Arrange(10, 10, 600, 320);
-        PaintOnly(app, table);
-        Check(comp.fills == 1 && table.source == comp.next && stale.paints == 0
-        && stale.parent == null && table.ChildCount() == 0,
-        "component fill rebind invalidates stale adoption and paint");
-        app.SetRootControl(null);
-        comp.Reset();
-    }
-
     static void CustomPainterCompatibility(App app, int mode) {
+        NestedTreeCellProvider comp = new NestedTreeCellProvider();
+        comp.editor = new Input("Custom fallback");
+        comp.editor.SetProp("style", "height: 16px");
         List<DataColumn> columns = new List<DataColumn>();
-        columns.Add(DataColumn.WidgetCol("Custom", 180, "nested-tree-custom"));
+        columns.Add(DataColumn.WidgetSlot("Custom", 180, comp));
         DataTableControl table = new DataTableControl(columns, new NestedTreeSource());
         Configure(table.state);
-        NestedTreeCustomComp comp = new NestedTreeCustomComp();
-        CellComp.Register(comp);
         NestedTreeCustomRenderer renderer = new NestedTreeCustomRenderer();
         NestedTreeCustomStyler styler = new NestedTreeCustomStyler();
         renderer.covered = true; styler.covered = true;
@@ -574,11 +547,11 @@ public class DataTableNestedVisualTreeTest {
         int py = 10 + app.theme.heightMedium + 8;
         app.ProcessOffscreenInput(2, px, py, 0, 0, 0, 0);
         app.ProcessOffscreenInput(3, px, py, 0, 0, 0, 0);
-        Check(comp.acquisitions == 0 && renderer.paints == 0 && styler.paints == 0
+        Check(comp.calls == 0 && renderer.paints == 0 && styler.paints == 0
         && comp.editor.parent == null && !comp.editor.IsFocused(app),
         "custom cell preparation neither paints nor creates an invisible default editor");
         PaintOnly(app, table);
-        Check(comp.editor.parent == null && comp.acquisitions == 0,
+        Check(comp.editor.parent == null && comp.calls == 0,
         "owning custom painter suppresses the default component input tree");
         renderer.covered = false; styler.covered = false;
         table.Arrange(10, 10, 600, 320);
@@ -815,8 +788,65 @@ public class DataTableNestedVisualTreeTest {
         app.SetRootControl(null);
     }
 
+    static void CheckWideCell(App app, DataTableControl table, int x, int y, int col, int pixelOffset = 0) {
+        Check((app.canvas.GetPixel(x + pixelOffset, y) & 0xFFFFFF) == (WideTableRenderer.Color(col) & 0xFFFFFF),
+        "wide table pixel shows column " + Convert.ToString(col));
+        app.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        app.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+        Check(table.state.hitRow == 0 && table.state.hitCol == col,
+        "the same wide table pixel hits column " + Convert.ToString(col));
+    }
+
+    static void WideTableViewport(App app) {
+        int count = 512;
+        int width = 50;
+        int first = 250;
+        int partial = 15;
+        int oldDpi = app.dpiScale;
+        List<DataColumn> columns = new List<DataColumn>();
+        for (int i = 0; i < count; i = i + 1) {
+            columns.Add(new DataColumn(Convert.ToString(i), width));
+        }
+        columns[0].freeze = 1;
+        columns[count - 1].freeze = 2;
+        DataTableControl table = new DataTableControl(columns, new NestedTreeSource());
+        Configure(table.state);
+        table.state.showSelect = false;
+        table.state.scrollX = (first - 1) * width + partial;
+        WideTableRenderer renderer = new WideTableRenderer();
+        table.state.cellRenderer = renderer;
+        table.UseApp(app);
+        app.SetRootControl(table);
+
+        for (int scale = 100; scale <= 150; scale = scale + 50) {
+            app.dpiScale = scale;
+            renderer.columns.Clear();
+            table.state.hitCol = -1;
+            table.Arrange(10, 10, 360, 200);
+            PaintOnly(app, table);
+            int bandLeft = table.bx + app.Scale(46) + width;
+            int bandRight = table.bx + table.bw - app.Scale(12) - width;
+            int middle = (bandRight - bandLeft + partial + width - 1) / width;
+            Check(renderer.columns.Count == middle + 2 && renderer.columns[0] == 0
+            && renderer.columns[middle + 1] == count - 1, "prepare visits only viewport and frozen columns");
+            for (int i = 0; i < middle; i = i + 1) {
+                Check(renderer.columns[i + 1] == first + i, "prepare preserves visible column order");
+            }
+            int y = table.by + app.theme.heightMedium + app.Scale(table.state.rowH) / 2;
+            CheckWideCell(app, table, bandLeft - 1, y, 0);
+            // The frozen-band separators cover a few pixels of the scrolling cells.
+            CheckWideCell(app, table, bandLeft, y, first, app.Scale(2));
+            CheckWideCell(app, table, bandLeft + width - partial, y, first + 1);
+            CheckWideCell(app, table, bandRight - 1, y, first + middle - 1, -app.Scale(2));
+            CheckWideCell(app, table, bandRight, y, count - 1);
+        }
+        app.SetRootControl(null);
+        app.dpiScale = oldDpi;
+    }
+
     public static void Main() {
         App app = App.CreateOffscreen("Nested table tree", 800, 480);
+        WideTableViewport(app);
         RetainedChrome(app);
         InputPreparation(app);
         for (int mode = 0; mode < 3; mode = mode + 1) { CustomPainterCompatibility(app, mode); }
@@ -829,13 +859,15 @@ public class DataTableNestedVisualTreeTest {
         WidgetColumns(app);
         DataTableControl table = new DataTableControl(Columns(), new NestedTreeSource());
         OwnerPaintAndClip(app, table, table.state, table.source);
-        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem>();
-        grid.Col("Name", 180, item => item.name);
-        grid.Bind(Items("paint"));
+        DataGrid<NestedTreeTestItem> grid = new DataGrid<NestedTreeTestItem> {
+            ItemsSource = Items("paint"),
+            Columns = [
+                new GridColumn<NestedTreeTestItem> { Title = "Name", Width = 180, Text = item => item.name }
+            ]
+        };
         OwnerPaintAndClip(app, grid, grid.st, grid.source);
         CallbackInvalidation(app);
         CellCallbackInvalidation(app);
-        ComponentCallbackInvalidation(app);
         app.canvas.Destroy();
         Console.WriteLine("ALL NESTED VISUAL TREE TESTS PASSED.");
     }

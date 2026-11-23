@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Json;
 using System.Net.Http;
 using System.Net.Http.Client;
 using System.Net.Http.Http2;
@@ -119,7 +120,10 @@ class Program {
         File.WriteAllText("_scratch/web_tls_cert.pem", Program.SERVER_CERT);
         File.WriteAllText("_scratch/web_tls_key.pem", Program.SERVER_KEY);
 
+        Environment.SetEnvironmentVariable("ZAN_REQUEST_PROFILE_RESOURCES", "1");
         WebApp app = new WebApp("127.0.0.1", Program.PORT);
+        RequestProfiler profiler = new RequestProfiler(16);
+        app.UseRequestProfiler(profiler);
         app.UseHttps("_scratch/web_tls_cert.pem", "_scratch/web_tls_key.pem");
 
         app.Router().Get("/hello", Program.HandleHello);
@@ -162,6 +166,14 @@ class Program {
         app.Dispose();
         for (int i = 0; i < 25; i = i + 1) { await Task.Delay(10); }
 
+        string traces = profiler.SnapshotJson();
+        Check(traces.Contains("\"protocol\":\"HTTP/2\"") && traces.Contains("\"name\":\"dispatch_queue\"")
+            && traces.Contains("\"name\":\"send\"") && traces.Contains("\"outcome\":\"sent\""), "http2 request trace reaches send");
+        JsonDoc snapshot = JsonDoc.Parse(traces);
+        Check(snapshot.GetString("requests[0].protocol") == "HTTP/2"
+            && snapshot.GetLong("requests[0].resources.allocated_bytes", -1) > 0
+            && snapshot.GetLong("requests[0].resources.unfinished_tasks", -1) == 0,
+            "http2 application resources are settled before stream publication");
         HpackStaticTable.Teardown();
         HpackHuffman.Teardown();
         Socket.Cleanup();

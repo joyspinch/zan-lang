@@ -470,6 +470,7 @@ def main():
                    *sorted((root / "src/ide_zan/src/models/lsp").glob("*.zan")),
                    *sorted((root / "src/ide_zan/src/models/dap").glob("*.zan")),
                    root / "src/ide_zan/src/services/LspSession.zan",
+                   root / "src/ide_zan/src/services/LspSession.Requests.zan",
                    root / "src/ide_zan/src/services/LspSession.Transport.zan",
                    root / "src/ide_zan/src/services/LspSession.Protocol.zan",
                    root / "src/ide_zan/src/services/LspSession.Diagnostics.zan",

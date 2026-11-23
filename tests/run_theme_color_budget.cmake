@@ -27,7 +27,7 @@ set(_budget
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
 
-file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
+file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui*/src/Gui/*.zan")
 
 set(_fail "")
 foreach(_f ${_sources})

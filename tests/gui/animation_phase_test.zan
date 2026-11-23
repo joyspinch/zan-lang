@@ -1,5 +1,7 @@
 using System;
 using Gui;
+using Gui.Backend;
+using Gui.Animation;
 using Gui.Widget;
 
 class AnimationPhaseTest {
@@ -70,8 +72,319 @@ class AnimationPhaseTest {
         app.canvas.Destroy();
     }
 
+    static int PaintProgress(App app, Progress progress, int ms) {
+        app.FreezeAnimClock(ms);
+        app.BeginOffscreenFrame();
+        progress.RenderInside(app, new Rect(10, 12, 100, 32));
+        app.EndOffscreenFrame();
+        int checksum = 0;
+        Control fill = progress.fillNode;
+        for (int i = 0; i < 14; i = i + 1) {
+            checksum = checksum * 31 + app.canvas.GetPixel(fill.bx + 3 + i, fill.by + fill.bh / 2);
+        }
+        return checksum;
+    }
+
+    static void CheckProcessingProgress() {
+        App app = App.CreateOffscreen("processing progress", 120, 72);
+        Progress progress = new Progress(75, 1);
+        progress.showIndicator = false;
+        app.sheet = Css.Parse(".progress-track { flex-grow: 1; height: 8px; background: #101010; }"
+            + ".progress-fill { height: 8px; background: #303030; }");
+        int idle = AnimationPhaseTest.PaintProgress(app, progress, 0);
+        AnimationPhaseTest.Check("progress fixture has a visible fill", progress.fillNode.bw >= 20 && progress.fillNode.bh >= 4);
+        progress.Processing(true);
+        int first = AnimationPhaseTest.PaintProgress(app, progress, 0);
+        AnimationPhaseTest.Check("processing stripes are drawn", first != idle);
+        Control fill = progress.fillNode;
+        int pad = app.Scale(6);
+        AnimationPhaseTest.Check("processing schedules the clipped fill damage",
+            app.animNextMs >= 0 && app.animRectValid && !app.animRectAll
+            && app.animRX == Math.Max(0, fill.bx - pad) && app.animRY == Math.Max(0, fill.by - pad)
+            && app.animRX + app.animRW == Math.Min(app.canvas.Width(), fill.bx + fill.bw + pad)
+            && app.animRY + app.animRH == Math.Min(app.canvas.Height(), fill.by + fill.bh + pad));
+        AnimationPhaseTest.Eq("processing waits for the next stripe pixel", app.animNextMs, 33);
+        int beforeBoundary = AnimationPhaseTest.PaintProgress(app, progress, 32);
+        AnimationPhaseTest.Eq("processing has the same pixels before the boundary", beforeBoundary, first);
+        AnimationPhaseTest.Eq("early paint preserves the stripe deadline", app.animNextMs, 33);
+        int nextPixel = AnimationPhaseTest.PaintProgress(app, progress, 33);
+        AnimationPhaseTest.Check("processing advances exactly at the stripe boundary", nextPixel != first);
+        AnimationPhaseTest.Eq("processing schedules the following pixel", app.animNextMs, 66);
+
+        app.FreezeAnimClock(33);
+        app.BeginOffscreenFrame();
+        Window.FreezeTick(70);
+        progress.RenderInside(app, new Rect(10, 12, 100, 32));
+        app.EndOffscreenFrame();
+        AnimationPhaseTest.Eq("slow paint keeps the already due pixel deadline", app.animNextMs, 66);
+
+        app.FreezeAnimClock(33);
+        app.BeginOffscreenFrame();
+        app.RequestAnimationFrameIn(8, 2, 2, 4, 4);
+        progress.RenderInside(app, new Rect(10, 12, 100, 32));
+        app.EndOffscreenFrame();
+        AnimationPhaseTest.Eq("processing preserves an earlier animation deadline", app.animNextMs, 41);
+        AnimationPhaseTest.Check("processing preserves the other animation damage", app.animRY == 0);
+
+        app.reducedMotion = true;
+        int staticStripe = AnimationPhaseTest.PaintProgress(app, progress, 132);
+        AnimationPhaseTest.Eq("reduced motion holds the initial stripe phase", staticStripe, first);
+        AnimationPhaseTest.Check("reduced motion schedules no stripe deadline", app.animNextMs < 0);
+        app.reducedMotion = false;
+        progress.Processing(false);
+        AnimationPhaseTest.Eq("processing off restores the fill", AnimationPhaseTest.PaintProgress(app, progress, 132), idle);
+        AnimationPhaseTest.Check("processing off stops the animation deadline", app.animNextMs < 0);
+        app.UnfreezeAnimClock();
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
+    static int PaintChoice(App app, Control root, Control part, int ms) {
+        app.FreezeAnimClock(ms);
+        app.BeginOffscreenFrame();
+        root.RenderInside(app, new Rect(16, 16, 192, 48));
+        app.EndOffscreenFrame();
+        Check("choice part has a visible surface", part.bw >= 8 && part.bh >= 8);
+        return app.canvas.GetPixel(part.bx + 2, part.by + 2);
+    }
+
+    static int ThumbLeft(App app, Control track) {
+        int y = track.by + track.bh / 2;
+        for (int x = track.bx; x < track.bx + track.bw; x = x + 1) {
+            if (app.canvas.GetPixel(x, y) == 0xffffffff) { return x; }
+        }
+        return -1;
+    }
+
+    static void CheckChoice(string label, Control root, Control part, Action<bool> select) {
+        App app = App.CreateOffscreen(label, 232, 80);
+        app.sheet = Css.Parse(".checkbox-indicator,.radio-indicator,.switch-track"
+            + " { width:36px; height:32px; border:0; border-radius:0; background:#202020; transition:100ms linear; }"
+            + " .checkbox-indicator.checked,.radio-indicator.selected,.switch.on .switch-track { background:#606060; }"
+            + " .checkbox-check { color:#ffffff; }"
+            + " .radio-dot { width:8px; height:8px; border-radius:0; background:#ffffff; }"
+            + " .switch-track { display:flex; width:72px; padding:2px; align-items:center; }"
+            + " .switch-track.justify-start { justify-content:flex-start; }"
+            + " .switch-track.justify-end { justify-content:flex-end; }"
+            + " .switch-thumb { width:14px; height:14px; border-radius:0; background:#ffffff; box-shadow:none; }");
+        app.SetRootControl(root);
+        int idle = PaintChoice(app, root, part, 1000);
+        Eq(label + " idle surface", idle, 0xff202020);
+        bool isSwitch = root is Switch;
+        int idleThumb = isSwitch ? ThumbLeft(app, part) : -1;
+        if (isSwitch) { Eq("switch thumb is painted at its idle position", idleThumb, ((Switch)root).thumbNode.bx); }
+        select(true);
+        Eq(label + " starts at idle surface", PaintChoice(app, root, part, 1000), idle);
+        Check(label + " schedules local damage", app.animNextMs >= 0 && app.animRectValid && !app.animRectAll);
+        if (isSwitch) { Eq("switch thumb starts at idle position", ThumbLeft(app, part), idleThumb); }
+        int mid = PaintChoice(app, root, part, 1050);
+        Check(label + " draws an intermediate surface", mid > idle && mid < 0xff606060);
+        int midThumb = isSwitch ? ThumbLeft(app, part) : -1;
+        if (isSwitch) { Check("switch thumb moves between endpoints", midThumb > idleThumb && midThumb < ((Switch)root).thumbNode.bx); }
+        select(false);
+        Eq(label + " reverses from the current surface", PaintChoice(app, root, part, 1050), mid);
+        if (isSwitch) { Eq("switch thumb reverses from the current position", ThumbLeft(app, part), midThumb); }
+        Eq(label + " returns to idle surface", PaintChoice(app, root, part, 1150), idle);
+        Check(label + " stops after the transition", app.animNextMs < 0);
+        app.reducedMotion = true;
+        select(true);
+        Eq(label + " snaps to selected surface", PaintChoice(app, root, part, 1150), 0xff606060);
+        if (isSwitch) { Eq("switch thumb snaps to the selected position", ThumbLeft(app, part), ((Switch)root).thumbNode.bx); }
+        Check(label + " reduced motion has no deadline", app.animNextMs < 0);
+        app.SetRootControl(null);
+        app.UnfreezeAnimClock();
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
+    static int PaintInputNumber(App app, InputNumber number, Control part, int ms) {
+        app.FreezeAnimClock(ms);
+        app.BeginOffscreenFrame();
+        number.RenderInside(app, new Rect(16, 16, 192, 40));
+        app.EndOffscreenFrame();
+        int checksum = 0;
+        for (int y = part.by; y < part.by + part.bh; y = y + 1) {
+            for (int x = part.bx; x < part.bx + part.bw; x = x + 1) {
+                checksum = checksum * 31 + app.canvas.GetPixel(x, y);
+            }
+        }
+        return checksum;
+    }
+
+    static void CheckTimelinePump() {
+        Dispatcher.Init();
+        App app = App.CreateOffscreen("timeline pump", 120, 72);
+        Control root = new Control("timeline root");
+        root.UseApp(app);
+        app.SetRootControl(root);
+        app.FreezeAnimClock(0);
+        AnimationTimeline timeline = new AnimationTimeline();
+        timeline.BindApp(app);
+        float current = 0.0f;
+        int updates = 0;
+        Tween tween = timeline.ObtainTween(0.0f, 100.0f, 200, EaseType.Linear, (float value) => {
+            current = value;
+            updates = updates + 1;
+        });
+        tween.Play();
+        timeline.Add(tween);
+        AnimationPhaseTest.Check("active timeline sets an App loop deadline", app.MinLoopDeadline() > 0);
+        app.BeginOffscreenFrame();
+        app.EndOffscreenFrame();
+        int initialUpdates = updates;
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        AnimationPhaseTest.Check("unchanged clock leaves tween and paint idle",
+            updates == initialUpdates && !app.HasDueOffscreenFrame());
+        app.FreezeAnimClock(100);
+        Tween late = timeline.ObtainTween(0.0f, 1.0f, 40, EaseType.Linear, null);
+        AnimationPhaseTest.Check("App accepts late tween start", app.TryPost(() => { late.Play(); timeline.Add(late); }));
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        AnimationPhaseTest.Check("bound timeline advances from App loop", current > 49.9f && current < 50.1f);
+        AnimationPhaseTest.Check("same turn does not advance a newly added tween", late.active && late.elapsedMs == 0);
+        app.FreezeAnimClock(125);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        AnimationPhaseTest.Check("late tween advances by time since enrollment", late.active && late.elapsedMs == 25);
+        app.BeginOffscreenFrame();
+        app.EndOffscreenFrame();
+        app.FreezeAnimClock(250);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        AnimationPhaseTest.Check("bound timeline reaches endpoint", current == 100.0f && !timeline.HasActive());
+        AnimationPhaseTest.Check("completion requests a final frame", app.HasDueOffscreenFrame());
+        AnimationPhaseTest.Check("completion removes the App loop deadline", app.MinLoopDeadline() == -1);
+        app.BeginOffscreenFrame();
+        app.EndOffscreenFrame();
+        app.FreezeAnimClock(300);
+        app.ProcessOffscreenInput(0, 0, 0, 0, 0, 0, 0);
+        AnimationPhaseTest.Check("finished timeline leaves no further frame", !app.HasDueOffscreenFrame());
+        timeline.Clear();
+        app.SetRootControl(null);
+        app.UnfreezeAnimClock();
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
+    static void CheckTimelineCallbacks() {
+        AnimationTimeline timeline = new AnimationTimeline();
+        Tween old = timeline.ObtainTween(0.0f, 1.0f, 50, EaseType.Linear, null);
+        Tween follow = timeline.ObtainTween(0.0f, 1.0f, 50, EaseType.Linear, null);
+        Tween trigger = Tween.Create(0.0f, 1.0f, 50, EaseType.Linear, (float value) => {
+            if (value <= 0.0f) { return; }
+            timeline.Remove(old);
+            follow.Play();
+            timeline.Add(follow);
+            timeline.Tick(50);
+        });
+        old.Play();
+        timeline.Add(old);
+        trigger.Play();
+        timeline.Add(trigger);
+        timeline.Tick(50);
+        AnimationPhaseTest.Check("callbacks cancel earlier entries and defer new entries",
+            old.elapsedMs == 0 && follow.elapsedMs == 0 && timeline.HasActive());
+        Tween replacement = timeline.ObtainTween(0.0f, 1.0f, 50, EaseType.Linear, null);
+        follow.OnComplete(() => {
+            timeline.Clear();
+            replacement.Play();
+            timeline.Add(replacement);
+        });
+        timeline.Tick(50);
+        old.Stop();
+        AnimationPhaseTest.Check("clearing during completion preserves the replacement and old handles stay independent",
+            replacement.elapsedMs == 0 && timeline.HasActive());
+        timeline.Tick(50);
+        AnimationPhaseTest.Check("replacement plays on the next tick", replacement.finished && !timeline.HasActive());
+        trigger.updateAction = null;
+        follow.completeAction = null;
+    }
+
+    static void CheckInputNumberLoading() {
+        App app = App.CreateOffscreen("input number loading", 232, 80);
+        app.sheet = Css.Parse(".input-number-btn { width:32px; height:32px; flex-shrink:0; background:#101010; }"
+            + " .input-number-input { flex-grow:1; }"
+            + " spin::accent { color:#ffffff; } spin::rest { background:#202020; }"
+            + " spin::tail { color:#808080; } spin::ring { color:#404040; }");
+        InputNumber number = new InputNumber();
+        number.SetValue(7);
+        Input editor = number.inputNode;
+        Control left = number.ChildAt(1);
+        Control right = number.ChildAt(4);
+        int changes = 0;
+        int submits = 0;
+        number.Change.Add(() => { changes = changes + 1; });
+        number.Submit.Add(() => { submits = submits + 1; });
+        app.SetRootControl(number);
+        int idle = PaintInputNumber(app, number, number.minusBtn, 0);
+        int leftX = number.minusBtn.bx;
+        int rightX = number.plusBtn.bx;
+        int editorWidth = editor.bw;
+        Check("input number starts with step buttons", number.minusBtn.Visible && number.plusBtn.Visible
+            && left is Spin && right is Spin && !left.Visible && !right.Visible && editorWidth > 0);
+
+        editor.Focus(app);
+        Check("input number fixture has a focused editor", editor.HasFocus(app));
+        number.Loading = true;
+        Check("input number direct loading assignment", number.GetProp("loading") == "true"
+            && !number.minusBtn.Visible && !number.plusBtn.Visible && left.Visible && right.Visible && editor.Disabled.Get());
+        app.ProcessOffscreenInput(6, 0, 0, 0, 56, 0, 0);
+        Check("input number loading blocks routed text", editor.GetText() == "7");
+        app.focus.ClearFocus();
+        number.plusBtn.Click.RaiseS(number.plusBtn);
+        editor.SetText("9");
+        editor.Change.RaiseS(editor);
+        editor.Submit.RaiseS(editor);
+        Check("input number loading blocks step, change and submit", number.Value.Get() == 7 && changes == 0 && submits == 0);
+
+        int first = PaintInputNumber(app, number, left, 0);
+        Check("input number loading keeps step slots", left.bx == leftX && right.bx == rightX && editor.bw == editorWidth);
+        Check("input number loading displays the indicator", first != idle);
+        Check("input number loading schedules bounded animation", app.animNextMs >= 0 && app.animRectValid && !app.animRectAll);
+        Check("input number loading advances the indicator", PaintInputNumber(app, number, left, 45) != first);
+        app.reducedMotion = true;
+        Eq("input number reduced motion keeps the indicator static", PaintInputNumber(app, number, left, 90), first);
+        Check("input number reduced motion stops the animation deadline", app.animNextMs < 0);
+
+        app.reducedMotion = false;
+        number.SetProp("loading", "false");
+        Eq("input number loading off restores the step surface", PaintInputNumber(app, number, number.minusBtn, 90), idle);
+        Check("input number loading off restores interaction", !number.Loading && number.minusBtn.Visible && number.plusBtn.Visible
+            && !left.Visible && !right.Visible && !editor.Disabled.Get() && app.animNextMs < 0);
+        number.plusBtn.Click.RaiseS(number.plusBtn);
+        editor.SetText("9");
+        editor.Submit.RaiseS(editor);
+        Check("input number steps and submits after loading", number.Value.Get() == 9 && changes == 2 && submits == 1);
+
+        number.minusBtn.Visible = false;
+        Binding<bool> disabled = editor.Disabled;
+        number.SetProp("loading", "true");
+        Check("input number SetProp loading preserves hidden step slot", number.Loading && !left.Visible && right.Visible);
+        Check("input number loading leaves the original disabled binding alone", !disabled.Get());
+        disabled.Set(true);
+        number.Loading = true;
+        number.Loading = false;
+        Check("input number restores prior visibility and disabled binding", !number.minusBtn.Visible
+            && number.plusBtn.Visible && editor.Disabled == disabled && editor.Disabled.Get());
+        app.SetRootControl(null);
+        app.UnfreezeAnimClock();
+        app.StopLoop();
+        app.canvas.Destroy();
+    }
+
     static void Main() {
         AnimationPhaseTest.CheckRetainedSurface();
+        AnimationPhaseTest.CheckTimelinePump();
+        AnimationPhaseTest.CheckTimelineCallbacks();
+        AnimationPhaseTest.CheckProcessingProgress();
+        AnimationPhaseTest.CheckInputNumberLoading();
+        Checkbox checkbox = new Checkbox();
+        CheckChoice("checkbox", checkbox, checkbox.ChildAt(0), checkbox.SetChecked);
+        Radio radio = new Radio(1, "");
+        Radio otherRadio = new Radio(radio.Value, 0, "");
+        CheckChoice("radio", radio, radio.ChildAt(0), (bool selected) => {
+            if (selected) { radio.Select(); }
+            else { otherRadio.Select(); }
+        });
+        Switch toggle = new Switch();
+        CheckChoice("switch", toggle, toggle.trackNode, toggle.SetOn);
         AnimationPhaseTest.Eq("start phase", Spin.DotPhase(0), 0);
         AnimationPhaseTest.Eq("mid-dot phase", Spin.DotPhase(45), 500);
         AnimationPhaseTest.Eq("next dot phase", Spin.DotPhase(90), 1000);

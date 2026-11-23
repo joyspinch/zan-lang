@@ -1,0 +1,342 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using Sdk.OceanEngine;
+using Sdk.OceanEngine.Marketing;
+using Sdk.OceanEngine.Marketing.Api.Project;
+using Sdk.OceanEngine.Marketing.Models.Project;
+using Sdk.OceanEngine.Marketing.Api.FileImage;
+using Sdk.OceanEngine.Marketing.Models.FileImage;
+using Sdk.OceanEngine.Qianchuan;
+using Sdk.OceanEngine.Qianchuan.Api.Report;
+using Sdk.OceanEngine.Qianchuan.Models.Report;
+using Sdk.OceanEngine.Qianchuan.Api.File;
+using Sdk.OceanEngine.Qianchuan.Models.File;
+using Sdk.OceanEngine.Qianchuan.Api.User;
+using Sdk.OceanEngine.Qianchuan.Models.User;
+using Sdk.OceanEngine.LocalPush;
+using Sdk.OceanEngine.LocalPush.Api.Qualification;
+using Sdk.OceanEngine.LocalPush.Models.Qualification;
+using Sdk.OceanEngine.StarMap;
+using Sdk.OceanEngine.StarMap.Api.Info;
+using Sdk.OceanEngine.StarMap.Models.Info;
+using Sdk.OceanEngine.ServeMarket;
+using Sdk.OceanEngine.ServeMarket.Api.ActiveFunc;
+using Sdk.OceanEngine.ServeMarket.Models.ActiveFunc;
+using Sdk.OceanEngine.Spi;
+
+class Program {
+    static int Port = 9896;
+    static long Id = 9007199254740993L;
+    static string Method = "";
+    static string Path = "";
+    static string Query = "";
+    static string Body = "";
+    static int BodyLength;
+    static string ContentType = "";
+    static string AccessToken = "";
+    static string AppAccessToken = "";
+    static int RetryCount = 0;
+
+    static void Check(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    static async HttpResponse Handle(HttpRequest request) {
+        Program.Method = request.method;
+        Program.Path = request.path;
+        Program.Query = Encoding.UrlDecode(request.queryString);
+        Program.Body = request.body;
+        Program.BodyLength = request.bodyLength;
+        Program.ContentType = request.GetHeader("Content-Type");
+        Program.AccessToken = request.GetHeader("Access-Token");
+        Program.AppAccessToken = request.GetHeader("App-Access-Token");
+        if (request.path == "/open_api/test/retry-once/") {
+            Program.RetryCount = Program.RetryCount + 1;
+            if (Program.RetryCount == 1) {
+                HttpResponse busy = HttpResponse.WithStatus(429, "Too Many Requests", "busy");
+                busy.SetHeader("X-Request-Id", "retry-id");
+                return busy;
+            }
+            return HttpResponse.Json("{\"code\":0,\"message\":\"OK\",\"request_id\":\"recovered-id\",\"data\":{\"ok\":true}}");
+        }
+        if (request.path == "/open_api/test/http/") {
+            HttpResponse response = HttpResponse.WithStatus(429, "Too Many Requests", "busy");
+            response.SetHeader("X-Request-Id", "http-id");
+            return response;
+        }
+        if (request.path == "/open_api/test/malformed/") {
+            return HttpResponse.Json("{\"code\":0");
+        }
+        if (request.path == "/open_api/test/missing-code/") {
+            return HttpResponse.Json("{\"data\":{}}");
+        }
+        if (request.path == "/open_api/test/business/") {
+            return HttpResponse.Json("{\"code\":40001,\"message\":\"denied\",\"request_id\":\"business-id\"}");
+        }
+        if (request.path == "/open_api/v3.0/project/list/") {
+            return HttpResponse.Json("{\"code\":0,\"message\":\"OK\",\"request_id\":\"proj-id\",\"data\":{"
+            + "\"list\":[{\"project_id\":9007199254740993,\"advertiser_id\":9007199254740993,\"name\":\"主项目\"}],"
+            + "\"page_info\":{\"page\":2,\"page_size\":20,\"total_page\":1,\"total_number\":1}}}");
+        }
+        if (request.path == "/open_api/v1.0/serve_market/active_func/get" && Program.Query.Contains("use_uid=1")) {
+            return HttpResponse.Json("{\"func_list\":[{\"key\":\"reports\",\"name\":\"报表\",\"desc\":\"已购\"}]}");
+        }
+        if (request.path == "/open_api/2/file/image/ad/") {
+            return HttpResponse.Json("{\"code\":0,\"message\":\"OK\",\"request_id\":\"img-id\",\"data\":{"
+            + "\"id\":\"img-1\",\"material_id\":9007199254740993,\"signature\":\"99eb3ea29447db6011d3f5eb9d1ba147\"}}");
+        }
+        return HttpResponse.Json("{\"code\":0,\"message\":\"OK\",\"request_id\":\"ok-id\","
+        + "\"data\":{\"id\":9007199254740993,\"func_list\":[{\"key\":\"reports\",\"name\":\"报表\",\"desc\":\"已购\"}]}}");
+    }
+
+    static void CheckRequest(string method, string path, string accessToken, string appAccessToken) {
+        Program.Check(Program.Method == method && Program.Path == path, "请求方法或路径错误: " + Program.Path);
+        Program.Check(Program.AccessToken == accessToken && Program.AppAccessToken == appAccessToken,
+        "鉴权请求头错误: " + Program.Path);
+    }
+
+    static async void CheckOAuthAndMultiTenant(OceanEngineMarketingClient marketing,
+    OceanEngineQianchuanClient qianchuan, OceanEngineServeMarketClient market) {
+        OceanEngineResponse response = await marketing.ExchangeTokenAsync(Program.Id, "secret", "code");
+        Program.CheckRequest("POST", "/open_api/oauth2/access_token/", "", "");
+        Program.Check(Program.ContentType == "application/json" && Program.Body.Contains("\"auth_code\":\"code\"")
+        && Program.Body.Contains("\"app_id\":9007199254740993") && !Program.Body.Contains("grant_type"), "营销 OAuth");
+        JsonValue? id = response.Value.PathGet("data.id");
+        Program.Check(id != null && id.AsLong(0) == Program.Id && response.RequestId == "ok-id"
+        && response.StatusCode == 200, "响应 int64 和请求 ID");
+
+        await marketing.RefreshTokenAsync(Program.Id, "secret", "refresh");
+        Program.CheckRequest("POST", "/open_api/oauth2/refresh_token/", "", "");
+        Program.Check(Program.Body.Contains("\"refresh_token\":\"refresh\"")
+        && !Program.Body.Contains("grant_type"), "营销刷新令牌");
+
+        await marketing.GetAuthorizedAccountsAsync("t+& /");
+        Program.CheckRequest("GET", "/open_api/oauth2/advertiser/get/", "", "");
+        Program.Check(Program.Query == "access_token=t+& /" && Program.Body == "", "营销账户查询令牌编码");
+
+        await qianchuan.ExchangeTokenAsync(Program.Id, "secret", "code");
+        Program.CheckRequest("POST", "/open_api/oauth2/access_token/", "", "");
+        Program.Check(Program.Body.Contains("\"grant_type\":\"auth_code\""), "千川 OAuth");
+
+        await qianchuan.RefreshTokenAsync(Program.Id, "secret", "refresh");
+        Program.CheckRequest("POST", "/open_api/oauth2/refresh_token/", "", "");
+        Program.Check(Program.Body.Contains("\"grant_type\":\"refresh_token\""), "千川刷新令牌");
+
+        await market.GetAppAccessTokenAsync(Program.Id, "secret");
+        Program.CheckRequest("POST", "/open_api/oauth2/app_access_token/", "", "");
+        Program.Check(Program.Body.Contains("\"app_id\":9007199254740993"), "群峰应用令牌");
+
+        OceanEngineMarketingClient tenantA = marketing.WithAccessToken("tenant-a");
+        OceanEngineMarketingClient tenantB = marketing.WithAccessToken("tenant-b");
+        Program.Check(marketing.AccessToken == "" && tenantA.AccessToken == "tenant-a"
+        && tenantB.AccessToken == "tenant-b", "多租户令牌隔离");
+    }
+
+    static async void CheckTypedPlatforms(OceanEngineMarketingClient marketing,
+    OceanEngineQianchuanClient qianchuan, OceanEngineLocalPushClient local,
+    OceanEngineStarMapClient star, OceanEngineServeMarketClient market) {
+        OceanEngineMarketingProjectApi projApi = new OceanEngineMarketingProjectApi(marketing.WithAccessToken("mkt-tok"));
+        List<string> projFields = new List<string>();
+        projFields.Add("name");
+        MarketingProjectListRequest projReq = new MarketingProjectListRequest()
+        .AdvertiserId(Program.Id)
+        .Fields(projFields)
+        .Filtering(JsonValue.Parse("{\"ids\":[9007199254740993]}"))
+        .Page(2L)
+        .PageSize(20L);
+        MarketingProjectListResponse projResp = await projApi.ListAsync(projReq);
+        Program.CheckRequest("GET", "/open_api/v3.0/project/list/", "mkt-tok", "");
+        Program.Check(Program.Query == "advertiser_id=9007199254740993&fields=[\"name\"]"
+        + "&filtering={\"ids\":[9007199254740993]}&page=2&page_size=20", "营销项目列表强类型查询");
+        Program.Check(projResp.Data != null && projResp.Data.List.Count == 1
+        && projResp.Data.List[0].ProjectId == Program.Id
+        && projResp.Data.List[0].Name == "主项目"
+        && projResp.Data.PageInfo != null && projResp.Data.PageInfo.TotalNumber == 1L,
+        "营销项目强类型响应与 int64 精度");
+
+        OceanEngineQianchuanReportApi qcReportApi = new OceanEngineQianchuanReportApi(qianchuan.WithAccessToken("qc-tok"));
+        List<string> dims = new List<string>();
+        dims.Add("stat_time_day");
+        List<string> metrics = new List<string>();
+        metrics.Add("stat_cost");
+        QianchuanReportUniPromotionDataGetRequest repReq = new QianchuanReportUniPromotionDataGetRequest()
+        .AdvertiserId(Program.Id)
+        .DataTopic("SITE_PROMOTION_PRODUCT_AD")
+        .StartTime("2026-10-05 00:00:00")
+        .EndTime("2026-10-05 23:59:59")
+        .Dimensions(dims)
+        .Metrics(metrics)
+        .Filters(JsonValue.Parse("[{\"field\":\"project_id\",\"operator\":7,\"values\":[\"9007199254740993\"]}]"))
+        .OrderBy(JsonValue.Parse("[{\"type\":2,\"field\":\"stat_cost\"}]"))
+        .PageSize(50L);
+        await qcReportApi.UniPromotionDataGetAsync(repReq);
+        Program.CheckRequest("GET", "/open_api/v1.0/qianchuan/report/uni_promotion/data/get/", "qc-tok", "");
+        Program.Check(Program.Query == "advertiser_id=9007199254740993&data_topic=SITE_PROMOTION_PRODUCT_AD"
+        + "&start_time=2026-10-05 00:00:00&end_time=2026-10-05 23:59:59&dimensions=[\"stat_time_day\"]"
+        + "&metrics=[\"stat_cost\"]&filters=[{\"field\":\"project_id\",\"operator\":7,\"values\":[\"9007199254740993\"]}]"
+        + "&order_by=[{\"type\":2,\"field\":\"stat_cost\"}]&page_size=50", "千川强类型报表查询");
+
+        OceanEngineQianchuanUserApi qcUserApi = new OceanEngineQianchuanUserApi(qianchuan.WithAccessToken("qc-tok"));
+        await qcUserApi.GetInfoAsync();
+        Program.CheckRequest("GET", "/open_api/2/user/info/", "qc-tok", "");
+        await qcUserApi.GetInfoDoc1806175583735835Async();
+        Program.CheckRequest("GET", "/open_api/2/user/info/", "qc-tok", "");
+
+        OceanEngineLocalPushQualificationApi localApi = new OceanEngineLocalPushQualificationApi(local.WithAccessToken("loc-tok"));
+        await localApi.GetAsync(new LocalPushQualificationGetRequest().LocalAccountId(Program.Id));
+        Program.CheckRequest("GET", "/open_api/v3.0/local/qualification/get/", "loc-tok", "");
+        Program.Check(Program.Query == "local_account_id=9007199254740993", "本地推强类型查询");
+
+        OceanEngineStarMapInfoApi starApi = new OceanEngineStarMapInfoApi(star.WithAccessToken("star-tok"));
+        List<long> starIds = new List<long>();
+        starIds.Add(Program.Id);
+        await starApi.InfoAsync(new StarMapInfoInfoRequest().StarIds(starIds));
+        Program.CheckRequest("GET", "/open_api/2/star/info/", "star-tok", "");
+        Program.Check(Program.Query == "star_ids=[9007199254740993]", "星图强类型查询");
+
+        OceanEngineServeMarketActiveFuncApi funcApi = new OceanEngineServeMarketActiveFuncApi(
+        market.WithAppAccessToken("app-tok"));
+        ServeMarketActiveFuncGetResponse wrapped = await funcApi.GetAsync(
+        new ServeMarketActiveFuncGetRequest().AppId(Program.Id).UseUid(2L));
+        Program.CheckRequest("GET", "/open_api/v1.0/serve_market/active_func/get", "", "app-tok");
+        Program.Check(Program.Query == "app_id=9007199254740993&use_uid=2", "群峰查询参数");
+        ServeMarketActiveFuncGetResponse direct = await funcApi.GetAsync(
+        new ServeMarketActiveFuncGetRequest().AppId(Program.Id).UseUid(1L));
+        Program.Check(wrapped.FuncList.Count == 1 && wrapped.FuncList[0].Key == "reports"
+        && direct.FuncList.Count == 1 && direct.FuncList[0].Key == "reports", "群峰强类型应答信封");
+    }
+
+    static async void CheckCrossPlatformUploads(OceanEngineMarketingClient marketing,
+    OceanEngineQianchuanClient qianchuan) {
+        byte[] file = new byte[5];
+        file[0] = 0;
+        file[1] = 255;
+        file[2] = 13;
+        file[3] = 10;
+        file[4] = 128;
+
+        OceanEngineQianchuanFileApi qcFile = new OceanEngineQianchuanFileApi(qianchuan.WithAccessToken("qc-up"));
+        QianchuanFileImageAdResponse qcRes = await qcFile.ImageAdAsync(new QianchuanFileImageAdRequest()
+        .AdvertiserId(Program.Id)
+        .UploadType("UPLOAD_BY_FILE")
+        .ImageFile("image.png", "image/png", file)
+        .Filename("千川素材")
+        .IsAigc(false));
+        Program.CheckRequest("POST", "/open_api/2/file/image/ad/", "qc-up", "");
+        Program.Check(qcRes.Data != null && qcRes.Data.MaterialId == Program.Id, "千川图片响应 int64");
+
+        string prefix = "multipart/form-data; boundary=";
+        Program.Check(Program.ContentType.StartsWith(prefix), "multipart 类型");
+        string boundary = Program.ContentType.Substring(prefix.Length);
+        string marker = "name=\"image_file\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\n";
+        int start = Program.Body.IndexOf(marker);
+        Program.Check(start >= 0, "multipart 文件段");
+        start = start + marker.Length;
+        string tail = "\r\n--" + boundary + "--\r\n";
+        Program.Check(Program.BodyLength == start + file.Length + tail.Length, "multipart 正文字节数");
+        for (int i = 0; i < file.Length; i = i + 1) {
+            Program.Check((Program.Body[start + i] & 255) == file[i], "multipart 文件原始字节");
+        }
+        for (int i = 0; i < tail.Length; i = i + 1) {
+            Program.Check(Program.Body[start + file.Length + i] == tail[i], "multipart 结束边界");
+        }
+        Program.Check(Program.Body.Contains("name=\"image_signature\"\r\n\r\n99eb3ea29447db6011d3f5eb9d1ba147\r\n")
+        && Program.Body.Contains("name=\"advertiser_id\"\r\n\r\n9007199254740993\r\n")
+        && Program.Body.Contains("name=\"upload_type\"\r\n\r\nUPLOAD_BY_FILE\r\n")
+        && Program.Body.Contains("name=\"is_aigc\"\r\n\r\nfalse\r\n"), "multipart 文件字段和 MD5");
+
+        OceanEngineMarketingFileImageApi mktFile = new OceanEngineMarketingFileImageApi(marketing.WithAccessToken("mkt-up"));
+        MarketingFileImageAdResponse mktRes = await mktFile.AdAsync(new MarketingFileImageAdRequest()
+        .AdvertiserId(Program.Id)
+        .UploadType("UPLOAD_BY_URL")
+        .ImageUrl("https://example.com/image.png?a=1&b=2"));
+        Program.CheckRequest("POST", "/open_api/2/file/image/ad/", "mkt-up", "");
+        Program.Check(Program.Body.Contains("name=\"upload_type\"\r\n\r\nUPLOAD_BY_URL\r\n")
+        && Program.Body.Contains("name=\"image_url\"\r\n\r\nhttps://example.com/image.png?a=1&b=2\r\n")
+        && !Program.Body.Contains("image_signature")
+        && mktRes.Data != null && mktRes.Data.MaterialId == Program.Id, "营销同路径隔离与 URL 模式");
+    }
+
+    static async void CheckError(OceanEngineMarketingClient client, string operation, string code, int status, string id) {
+        try {
+            await client.GetAsync(OceanEngineGateway.Api, "/open_api/test/" + operation + "/", null,
+            OceanEngineCredential.None);
+            throw new Exception("未抛出预期错误 " + code);
+        } catch (OceanEngineException e) {
+            Program.Check(e.Code == code && e.StatusCode == status && e.RequestId == id,
+            "错误信封 " + operation + ": " + e.Message);
+        }
+    }
+
+    static async void Main() {
+        Socket.Initialize();
+        using (HttpServer server = new HttpServer("127.0.0.1", Program.Port)) {
+            server.OnRequest(Program.Handle);
+            Task.Spawn(server.Start());
+            await Task.Delay(50);
+            try {
+                ExternalCallPolicy policy = ExternalCallPolicy.Default().AllowLocalHttp().TotalTimeout(5000);
+                OceanEngineMarketingClient marketing = new OceanEngineMarketingClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy);
+                OceanEngineQianchuanClient qianchuan = new OceanEngineQianchuanClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy);
+                OceanEngineLocalPushClient local = new OceanEngineLocalPushClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy);
+                OceanEngineStarMapClient star = new OceanEngineStarMapClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy);
+                OceanEngineServeMarketClient market = new OceanEngineServeMarketClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy);
+
+                await Program.CheckOAuthAndMultiTenant(marketing, qianchuan, market);
+                Console.WriteLine("oauth and multi-tenant ok");
+                await Program.CheckTypedPlatforms(marketing, qianchuan, local, star, market);
+                Console.WriteLine("five platforms typed ok");
+                await Program.CheckCrossPlatformUploads(marketing, qianchuan);
+                Console.WriteLine("cross-platform multipart ok");
+
+                OceanEngineMarketingClient retryClient = new OceanEngineMarketingClient()
+                .Server("127.0.0.1", Program.Port, false).WithCallPolicy(policy).MaxRetries(1);
+                OceanEngineResponse recovered = await retryClient.CallAsync(OceanEngineGateway.Api, "GET",
+                "/open_api/test/retry-once/", null, OceanEngineCredential.None);
+                Program.Check(recovered.RequestId == "recovered-id" && Program.RetryCount == 2, "429 退避重试");
+
+                await Program.CheckError(marketing, "http", "http.429", 429, "http-id");
+                await Program.CheckError(marketing, "business", "40001", 200, "business-id");
+                await Program.CheckError(marketing, "malformed", "client.badResponse", 200, "");
+                await Program.CheckError(marketing, "missing-code", "client.badResponse", 200, "");
+                OceanEngineMarketingClient blocked = new OceanEngineMarketingClient()
+                .Server("127.0.0.1", Program.Port, false);
+                await Program.CheckError(blocked, "http", "client.networkError", 0, "");
+                Console.WriteLine("errors and retry ok");
+            } finally {
+                server.Stop();
+            }
+        }
+
+        byte[] raw = Encoding.GetBytes("{\"name\":\"订单\"}\n");
+        string signature = "e6e20011983a5e090fbb58ae2635c49a6688ad9c5fe20f1363f240b134ba8f80";
+        Program.Check(OceanEngineSpi.VerifySignature("spi-secret", raw, signature), "SPI 标准签名");
+        Program.Check(!OceanEngineSpi.VerifySignature("spi-secret", Encoding.GetBytes("{\"name\":\"订单\"}"), signature)
+        && !OceanEngineSpi.VerifySignature("wrong-key", raw, signature)
+        && !OceanEngineSpi.VerifySignature("spi-secret", raw, "invalid"), "SPI 篡改与非法签名");
+
+        string spiPayload = "{\"message_id\":\"m1\",\"subscribe_task_id\":9007199254740993,"
+        + "\"service_label\":\"settings.project.realtime\",\"publish_time\":1700000000,"
+        + "\"app_id\":9007199254740993,\"account_relation\":{\"core_user_ids\":[9007199254740993]},"
+        + "\"data\":{\"account_id\":9007199254740993,\"account_type\":\"ADVERTISER\","
+        + "\"content\":{\"project_id\":[9007199254740993]}}}";
+        Program.Check(OceanEngineSpi.ExtractServiceLabel(spiPayload) == "settings.project.realtime", "SPI 标签解析");
+        Program.Check(OceanEngineSpi.TryBuildChallengeResponse("{\"challenge\":12345}") == "{\"challenge\":12345}", "SPI challenge");
+        OceanEngineSpiMarketingEvent1835682865797211? spiEvt =
+        OceanEngineSpiMarketingEvent1835682865797211.FromJson(JsonValue.Parse(spiPayload));
+        Program.Check(spiEvt != null && spiEvt.SubscribeTaskId == Program.Id
+        && spiEvt.AccountRelation != null && spiEvt.AccountRelation.CoreUserIds[0] == Program.Id
+        && spiEvt.Data != null && spiEvt.Data.Content != null
+        && spiEvt.Data.Content.ProjectId[0] == Program.Id, "SPI 强类型事件解析");
+        Console.WriteLine("spi ok");
+    }
+}

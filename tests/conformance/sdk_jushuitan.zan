@@ -1,0 +1,327 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using Sdk.Jushuitan;
+using Sdk.Jushuitan.Api.Basic;
+using Sdk.Jushuitan.Api.Logistics;
+using Sdk.Jushuitan.Api.Order;
+using Sdk.Jushuitan.Api.Wms;
+using Sdk.Jushuitan.Messages;
+
+class Program {
+    static int PORT = 9518;
+    static string APPKEY = "testkey";
+    static string SECRET = "testsecret";
+
+    static int rateHits = 0;
+    static int wmsVariant = 0;
+    static string lastPath = "";
+    static string lastToken = "";
+    static string lastBiz = "";
+    static string lastGrantType = "";
+    static string lastSignOk = "unchecked";
+
+    static List<string> formKeys;
+    static List<string> formVals;
+
+    static void ParseForm(string body) {
+        formKeys = new List<string>();
+        formVals = new List<string>();
+        if (body == null || body.Length == 0) { return; }
+        List<string> pairs = body.Split("&");
+        for (int i = 0; i < pairs.Count; i = i + 1) {
+            string p = pairs[i];
+            int eq = p.IndexOf("=");
+            if (eq > 0) {
+                formKeys.Add(Encoding.UrlDecode(p.Substring(0, eq)));
+                formVals.Add(Encoding.UrlDecode(p.Substring(eq + 1)));
+            }
+        }
+    }
+
+    static string FormGet(string key) {
+        for (int i = 0; i < formKeys.Count; i = i + 1) {
+            if (formKeys[i] == key) { return formVals[i]; }
+        }
+        return "";
+    }
+
+    static bool VerifyRequestSign() {
+        string got = FormGet("sign");
+        if (got.Length == 0) { return false; }
+        Dictionary<string, string> rest = new Dictionary<string, string>();
+        for (int i = 0; i < formKeys.Count; i = i + 1) {
+            if (formKeys[i] != "sign") { rest.Add(formKeys[i], formVals[i]); }
+        }
+        return JushuitanSign.Compute(rest, SECRET) == got;
+    }
+
+    static string BuildSignedCallbackBody(string actionCode, string ts, string biz) {
+        Dictionary<string, string> fields = new Dictionary<string, string>();
+        fields.Add("app_key", APPKEY);
+        fields.Add("action_code", actionCode);
+        fields.Add("timestamp", ts);
+        fields.Add("version", "2");
+        fields.Add("charset", "utf-8");
+        fields.Add("biz", biz);
+        fields.Add("sign", JushuitanSign.Compute(fields, SECRET));
+        return JushuitanSign.FormEncode(fields);
+    }
+
+    static HttpRequest MakeCallbackHttpRequest(string query, string body) {
+        HttpRequest req = new HttpRequest();
+        req.method = "POST";
+        req.path = "/push/callback";
+        req.queryString = query;
+        req.contentType = "application/x-www-form-urlencoded;charset=UTF-8";
+        req.body = body;
+        return req;
+    }
+
+    static async HttpResponse Handle(HttpRequest req) {
+        lastPath = req.path;
+        ParseForm(req.body);
+        lastSignOk = VerifyRequestSign() ? "yes" : "NO";
+        lastToken = FormGet("access_token");
+        lastBiz = FormGet("biz");
+        lastGrantType = FormGet("grant_type");
+
+        if (req.path == "/openWeb/auth/getInitToken") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"access_token\":\"init-tok-1\",\"refresh_token\":\"init-ref-1\",\"expires_in\":2592000,\"scope\":\"all\"}}");
+        }
+        if (req.path == "/openWeb/auth/refreshToken") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"access_token\":\"refreshed-tok-2\",\"refresh_token\":\"refreshed-ref-2\",\"expires_in\":2592000,\"scope\":\"all\"}}");
+        }
+        if (req.path == "/openWeb/auth/accessToken") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"access_token\":\"isv-tok-3\",\"refresh_token\":\"\",\"expires_in\":2592000,\"scope\":\"all\"}}");
+        }
+        if (req.path == "/open/orders/single/query") {
+            if (lastToken == "tok-ratelimit") {
+                rateHits = rateHits + 1;
+                if (rateHits <= 2) {
+                    return HttpResponse.Json("{\"code\":199,\"msg\":\"触发限流\"}");
+                }
+                return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"page_index\":1,\"page_size\":20,\"has_next\":false,\"orders\":[]}}");
+            }
+            if (lastToken == "tok-expired") {
+                return HttpResponse.Json("{\"code\":100,\"msg\":\"access_token 已过期\"}");
+            }
+            if (lastToken == "tok-http500") {
+                return HttpResponse.ServerError("internal");
+            }
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"page_index\":1,\"page_size\":20,\"data_count\":1,\"page_count\":1,\"has_next\":false,\"orders\":[{\"o_id\":9001,\"so_id\":\"SO-100\",\"items\":[{\"sku_id\":\"SKU-A\",\"qty\":2,\"price\":12.5}]}]}}");
+        }
+        if (req.path == "/open/express/register/upload") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"ok\":true}}");
+        }
+        if (req.path == "/open/jushuitan/inout/water/query") {
+            wmsVariant = wmsVariant + 1;
+            if (wmsVariant == 1) {
+                return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"issuccess\":\"true\",\"page_index\":1,\"datas\":[{\"io_id\":6433143,\"items\":[{\"sku_id\":\"260011\",\"qty\":1}]}]}");
+            }
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"page_index\":2,\"datas\":[{\"io_id\":7777,\"items\":[{\"sku_id\":\"SKU-W\",\"qty\":3}]}]}}");
+        }
+        if (req.path == "/open/orders/modifywms/upload") {
+            return HttpResponse.Json("{\"code\":0,\"issuccess\":\"true\",\"msg\":\"ok\"}");
+        }
+        if (req.path == "/open/api/drp/inneropen/partner/supplier/querymychannel") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"total\":1,\"channel_vos\":[{\"co_name\":\"DistA\"}]}}");
+        }
+        if (req.path == "/open/custom/ping") {
+            return HttpResponse.Json("{\"code\":0,\"msg\":\"执行成功\",\"data\":{\"pong\":true}}");
+        }
+        return HttpResponse.Json("{\"code\":999,\"msg\":\"unexpected path\"}");
+    }
+
+    static JushuitanClient NewLocalClient() {
+        return new JushuitanClient(APPKEY, SECRET)
+            .Server("http://127.0.0.1:" + Convert.ToString(PORT))
+            .PlainHttpMode()
+            .WithCallPolicy(ExternalCallPolicy.Default().AllowLocalHttp())
+            .Timeout(5000)
+            .MaxRetries(2);
+    }
+
+    static void TestOfflineAndMessages() {
+        Dictionary<string, string> signVec = new Dictionary<string, string>();
+        signVec.Add("app_key", APPKEY);
+        signVec.Add("charset", "utf-8");
+        signVec.Add("timestamp", "1700000000");
+        signVec.Add("version", "2");
+        signVec.Add("biz", "{\"a\":1}");
+        string sig = JushuitanSign.Compute(signVec, SECRET);
+        signVec.Add("sign", sig);
+        Console.WriteLine("signLen=" + Convert.ToString(sig.Length) + " verify=" + Convert.ToString(JushuitanSign.Verify(signVec, SECRET)));
+        signVec["biz"] = "{\"a\":2}";
+        Console.WriteLine("tamperVerify=" + Convert.ToString(JushuitanSign.Verify(signVec, SECRET)));
+
+        JushuitanClient authClient = new JushuitanClient(APPKEY, SECRET);
+        string authUrl = authClient.BuildAuthorizationUrl("state-99");
+        Console.WriteLine("authUrlPrefix=" + Convert.ToString(authUrl.StartsWith("https://openweb.jushuitan.com/auth?"))
+            + " hasState=" + Convert.ToString(authUrl.Contains("state=state-99")));
+
+        Dictionary<string, string> cbFields = new Dictionary<string, string>();
+        cbFields.Add("app_key", APPKEY);
+        cbFields.Add("code", "code-abc");
+        cbFields.Add("state", "state-99");
+        cbFields.Add("timestamp", "1700000000");
+        cbFields.Add("sign", JushuitanSign.Compute(cbFields, SECRET));
+        Console.WriteLine("authCbCode=" + authClient.VerifyAuthorizationCallback(cbFields, "state-99"));
+        Console.WriteLine("authAck=" + JushuitanClient.AuthorizationCallbackSuccessResponse());
+        try {
+            string _bad = authClient.VerifyAuthorizationCallback(cbFields, "wrong-state");
+            Console.WriteLine("authBadState=NOT_THROWN");
+        } catch (JushuitanException e) {
+            Console.WriteLine("authBadState=" + e.Code);
+        }
+
+        string nowTs = Convert.ToString(DateTime.UtcNow().ToUnixSeconds());
+        string subBody = BuildSignedCallbackBody(JushuitanMessageCallback.SubscriptionCheck, nowTs, "{}");
+        JushuitanMessage subMsg = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("tenant=t1&src=jst", subBody), APPKEY, SECRET, 600L);
+        Console.WriteLine("msgSubCheck=" + Convert.ToString(subMsg.IsSubscriptionCheck) + " ack=" + JushuitanMessageCallback.SuccessResponse());
+
+        string shipBiz = "{\"o_id\":1001,\"l_id\":\"SF999\",\"so_id\":\"SO-1\",\"is_send_all\":true,\"items\":[{\"oi_id\":55,\"sku_id\":\"SKU-1\",\"qty\":2.5,\"name\":\"Tea\"}]}";
+        JushuitanMessage shipMsg = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("", BuildSignedCallbackBody(JushuitanMessageCallback.Shipment, nowTs, shipBiz)), APPKEY, SECRET, 600L);
+        ShipmentPushMessage ship = shipMsg.AsShipment();
+        Console.WriteLine("msgShip=" + ship.l_id + "/" + Convert.ToString(ship.is_send_all) + "/" + ship.items[0].sku_id);
+
+        string invBiz = "{\"skuId\":\"SKU-INV\",\"qty\":88,\"coid\":12345}";
+        InventoryPushMessage inv = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("", BuildSignedCallbackBody(JushuitanMessageCallback.Inventory, nowTs, invBiz)), APPKEY, SECRET, 600L).AsInventory();
+        Console.WriteLine("msgInv=" + inv.skuId + "/" + Convert.ToString(inv.qty) + "/" + Convert.ToString(inv.coid));
+
+        string asBiz = "{\"asId\":7788,\"action\":1,\"soId\":\"SO-AS\",\"items\":[{\"sku_id\":\"SKU-AS\",\"qty\":1,\"r_qty\":1}]}";
+        AfterSalePushMessage afterSale = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("", BuildSignedCallbackBody(JushuitanMessageCallback.AfterSale, nowTs, asBiz)), APPKEY, SECRET, 600L).AsAfterSale();
+        Console.WriteLine("msgAs=" + Convert.ToString(afterSale.asId) + "/" + Convert.ToString(afterSale.action) + "/" + afterSale.items[0].sku_id);
+
+        string rcptBiz = "{\"invoiceid\":\"INV-1\",\"seller\":{\"sellerName\":\"SellerCo\"},\"buyer\":{\"title\":\"BuyerCo\"},\"details\":[{\"skuName\":\"Cup\",\"qty\":1}],\"relateinvoiceid\":\"BLUE-0\"}";
+        ReceiptPushMessage rcpt = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("", BuildSignedCallbackBody(JushuitanMessageCallback.Receipt, nowTs, rcptBiz)), APPKEY, SECRET, 600L).AsReceipt();
+        Console.WriteLine("msgRcpt=" + rcpt.invoiceid + "/" + rcpt.seller.sellerName + "/" + rcpt.buyer.title + "/" + rcpt.details[0].skuName + "/" + rcpt.relateinvoiceid);
+
+        try {
+            JushuitanMessage _expired = JushuitanMessageCallback.Parse(MakeCallbackHttpRequest("", BuildSignedCallbackBody(JushuitanMessageCallback.Shipment, "1700000000", shipBiz)), APPKEY, SECRET, 600L);
+            Console.WriteLine("msgReplay=NOT_THROWN");
+        } catch (JushuitanException e) {
+            Console.WriteLine("msgReplay=" + e.Code);
+        }
+    }
+
+    static async int Run() {
+        TestOfflineAndMessages();
+
+        Socket.Initialize();
+        HttpServer server = new HttpServer("127.0.0.1", PORT);
+        server.OnRequest(Handle);
+        Task.Spawn(server.Start());
+        await Task.Delay(50);
+
+        try {
+            JushuitanClient baseClient = NewLocalClient();
+            try {
+                baseClient.WithCallPolicy(ExternalCallPolicy.Default().Redirects(1));
+                Console.WriteLine("policyCheck=NOT_THROWN");
+            } catch (JushuitanException e) {
+                Console.WriteLine("policyCheck=" + e.Code);
+            }
+
+            // 1. Token flows
+            JushuitanToken initTok = await baseClient.GetInitTokenAsync("a1b2c3");
+            Console.WriteLine("initTok=" + initTok.AccessToken + " expired=" + Convert.ToString(initTok.IsExpired()) + " soon=" + Convert.ToString(initTok.IsExpiringSoon(9999999999L)));
+            JushuitanToken refTok = await baseClient.RefreshTokenAsync(initTok.RefreshToken);
+            Console.WriteLine("refTok=" + refTok.AccessToken + " grant=" + lastGrantType);
+            JushuitanToken isvTok = await baseClient.ExchangeAccessTokenAsync("auth-xyz");
+            Console.WriteLine("isvTok=" + isvTok.AccessToken);
+
+            // 2. Multi-tenant isolation & sparse Request Builder serialization
+            JushuitanClient tenantA = baseClient.WithAccessToken("tok-tenant-a");
+            OrderApi orderA = new OrderApi(tenantA);
+            QueryOrdersRequest orderReq = new QueryOrdersRequest().PageIndex(1).PageSize(20).IsGetTotal(false);
+            QueryOrdersResponse orderResp = await orderA.QueryOrdersAsync(orderReq);
+            Console.WriteLine("orderSign=" + lastSignOk + " tokA=" + lastToken + " biz=" + lastBiz);
+            Console.WriteLine("orderDto=" + Convert.ToString(orderResp.orders.Count) + "/" + orderResp.orders[0].so_id + "/" + orderResp.orders[0].items[0].sku_id);
+
+            QueryOrdersResponse orderRespB = await orderA.QueryOrdersAsync("tok-tenant-b", orderReq);
+            Console.WriteLine("tokB=" + lastToken + " ok=" + Convert.ToString(orderRespB.orders.Count));
+
+            // 3. Top-level JSON Array request + preflight required validation
+            LogisticsApi logApi = new LogisticsApi(tenantA);
+            BatchRegisterExpressShipmentsRequest arrReq = new BatchRegisterExpressShipmentsRequest()
+                .AddItem(new BatchRegisterExpressShipmentsItemParam().LId("SF123").LName("顺丰"));
+            BatchRegisterExpressShipmentsResponse arrResp = await logApi.BatchRegisterExpressShipmentsAsync(arrReq);
+            JsonValue okVal = arrResp.Data.Get("ok");
+            Console.WriteLine("arrBiz=" + lastBiz + " ok=" + Convert.ToString(okVal != null && okVal.AsBool(false)));
+
+            try {
+                BatchRegisterExpressShipmentsRequest badArrReq = new BatchRegisterExpressShipmentsRequest()
+                    .AddItem(new BatchRegisterExpressShipmentsItemParam().LId("ONLY_LID"));
+                Console.WriteLine("missingParam=NOT_THROWN");
+            } catch (JushuitanException e) {
+                Console.WriteLine("missingParam=" + e.Code);
+            }
+
+            // 4. Hangzhou endpoint (doc 955) + raw CallAsync escape hatch
+            BasicApi basicApi = new BasicApi(tenantA);
+            QueryDistributorsResponse distResp = await basicApi.QueryDistributorsAsync(
+                new QueryDistributorsRequest().PageNum(1).PageSize(20));
+            Console.WriteLine("hz=" + distResp.channel_vos[0].co_name);
+
+            JsonValue rawBiz = JsonValue.NewObject();
+            rawBiz.PutStr("ping", "1");
+            JushuitanResponse rawResp = await tenantA.CallAsync("/open/custom/ping", rawBiz);
+            JsonValue pongVal = rawResp.Data.Get("pong");
+            Console.WriteLine("rawCall=" + Convert.ToString(pongVal != null && pongVal.AsBool(false)));
+
+            // 5. RootEnvelope variants (54: root datas + wrapped data.datas)
+            WmsApi wmsApi = new WmsApi(tenantA);
+            QueryWarehouseMovementsRequest wmsReq = new QueryWarehouseMovementsRequest().PageIndex(1).PageSize(50);
+            QueryWarehouseMovementsResponse wms1 = await wmsApi.QueryWarehouseMovementsAsync(wmsReq);
+            QueryWarehouseMovementsResponse wms2 = await wmsApi.QueryWarehouseMovementsAsync(wmsReq);
+            Console.WriteLine("wms1=" + Convert.ToString(wms1.page_index) + "/" + Convert.ToString(wms1.datas[0].io_id) + "/" + wms1.datas[0].items[0].sku_id);
+            Console.WriteLine("wms2=" + Convert.ToString(wms2.page_index) + "/" + Convert.ToString(wms2.datas[0].io_id) + "/" + wms2.datas[0].items[0].sku_id);
+
+            // 6. Confirmation API without data (362)
+            SetFulfillmentWarehouseRequest fwReq = new SetFulfillmentWarehouseRequest()
+                .AddItem(new SetFulfillmentWarehouseItemParam().OId(9001).WmsCoId(100));
+            SetFulfillmentWarehouseResponse fwResp = await orderA.SetFulfillmentWarehouseAsync(fwReq);
+            Console.WriteLine("confirm=" + fwResp.code + "/" + fwResp.issuccess + "/" + fwResp.msg);
+
+            // 7. Rate-limit retry (199) + MaxRetries(0)
+            rateHits = 0;
+            QueryOrdersResponse rlResp = await orderA.QueryOrdersAsync("tok-ratelimit", orderReq);
+            Console.WriteLine("rateHits=" + Convert.ToString(rateHits) + " rlSign=" + lastSignOk + " page=" + Convert.ToString(rlResp.page_index));
+
+            rateHits = 0;
+            JushuitanClient noRetry = NewLocalClient().MaxRetries(0);
+            try {
+                QueryOrdersResponse _nr = await new OrderApi(noRetry).QueryOrdersAsync("tok-ratelimit", orderReq);
+                Console.WriteLine("noRetry=NOT_THROWN");
+            } catch (JushuitanException e) {
+                Console.WriteLine("noRetry=" + e.Code + " rl=" + Convert.ToString(e.IsRateLimited) + " hits=" + Convert.ToString(rateHits));
+            }
+
+            // 8. Business token-expired error & HTTP 500 error
+            try {
+                QueryOrdersResponse _exp = await orderA.QueryOrdersAsync("tok-expired", orderReq);
+                Console.WriteLine("bizErr=NOT_THROWN");
+            } catch (JushuitanException e) {
+                Console.WriteLine("bizErr=" + e.Code + " expired=" + Convert.ToString(e.IsTokenExpired));
+            }
+
+            try {
+                QueryOrdersResponse _h5 = await orderA.QueryOrdersAsync("tok-http500", orderReq);
+                Console.WriteLine("httpErr=NOT_THROWN");
+            } catch (JushuitanException e) {
+                Console.WriteLine("httpErr=" + e.Code + " status=" + Convert.ToString(e.StatusCode));
+            }
+        } finally {
+            server.Stop();
+        }
+        return 0;
+    }
+
+    static async void Main() {
+        int _rc = await Run();
+    }
+}

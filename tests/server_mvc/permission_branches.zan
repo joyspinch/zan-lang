@@ -40,10 +40,11 @@ class Program {
         return ctx;
     }
 
-    static async void RoleFor(int mask, string screen) {
+    static async void RoleFor(int mask, string screen, int dataScope = DataScope.RoleSelf) {
         SysRole r = new SysRole();
         r.id = 7;
         r.status = 1;
+        r.dataScope = dataScope;
         SysRoleGrant g = new SysRoleGrant();
         g.roleId = 7;
         g.action = screen;
@@ -54,6 +55,43 @@ class Program {
         grants.Add(g);
         await PermTable.LoadRoles(roles, grants);
         PermTable.SetUser("42", false, ",7,");
+    }
+
+    static async void DepartmentTreeScope(SysUser account) {
+        SysRole tree = new SysRole();
+        tree.id = 7;
+        tree.status = 1;
+        tree.dataScope = DataScope.RoleDeptTree;
+        SysRole custom = new SysRole();
+        custom.id = 8;
+        custom.status = 1;
+        custom.dataScope = DataScope.RoleCustom;
+        custom.scopeDepts = ",2,4,";
+        List<SysRole> roles = new List<SysRole>();
+        roles.Add(tree);
+        roles.Add(custom);
+        await PermTable.LoadRoles(roles, new List<SysRoleGrant>());
+        PermTable.SetUser("42", false, ",7,8,");
+        PermTable.SetUser("43", false, ",8,");
+        account.departmentId = 1;
+        List<SysDepartment> departments = new List<SysDepartment>();
+        SysDepartment child = new SysDepartment();
+        child.id = 2;
+        child.parentId = 1;
+        departments.Add(child);
+        SysDepartment grandchild = new SysDepartment();
+        grandchild.id = 3;
+        grandchild.parentId = 2;
+        departments.Add(grandchild);
+        DataScope scope = await DataScope.Of(account, departments);
+        Program.Check(scope.Covers(0, 1) && scope.Covers(0, 2) && scope.Covers(0, 3)
+            && scope.Covers(0, 4) && !scope.Covers(0, 5),
+            "custom department inclusion preserves traversal of its descendants");
+        PermTable.Forget("42");
+        Program.Check(PermTable.UserRoles("42") == "" && PermTable.UserScope("42") == 0
+            && PermTable.UserRoles("43") == ",8,", "account invalidation leaves other cache groups warm");
+        PermTable.ForgetAll();
+        Program.Check(PermTable.UserRoles("43") == "", "global invalidation reaches all groups");
     }
 
     static async void Role(int mask) {
@@ -104,6 +142,19 @@ class Program {
         await Program.Role((int)PermBit.Create);
         Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Save"),
             "create-only role passes Save route gate");
+        PermTable.SetUser("42", false, ",7,999,");
+        SysUser account = new SysUser();
+        account.id = 42;
+        account.status = AuthUser.Active;
+        List<SysDepartment> departments = new List<SysDepartment>();
+        DataScope scope = await DataScope.Of(account, departments);
+        Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Save")
+            && scope.Mine() && scope.Covers(42, 0) && !scope.Covers(43, 0),
+            "unavailable role contributes no permissions to a valid self-scoped role");
+        await Program.RoleFor((int)PermBit.Create, "PermissionBranchController", 0);
+        scope = await DataScope.Of(account, departments);
+        Program.Check(!scope.Any() && !scope.Covers(42, 0), "role with zero scope fails closed");
+        await Program.DepartmentTreeScope(account);
         await Program.Role((int)PermBit.Update);
         Program.Check(await AuthUser.Allow("42", "PermissionBranchController.Save")
             && await AuthUser.Allow("42", "PermissionBranchController.Batch"),

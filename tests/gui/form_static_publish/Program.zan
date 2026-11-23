@@ -1,0 +1,90 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+class StaticWindow : Form {
+    int clicks;
+    string preset = "";
+    int loads;
+
+    static Control CreateControl(string kind) {
+        if (kind == "Button") { return new Button(); }
+        if (kind == "Label") { return new Label(); }
+        return null;
+    }
+
+    void Register(HandlerRegistry handlers) {
+        handlers.Set("save", this.Save);
+        handlers.SetArg("preset", (string value) => { this.preset = value; });
+    }
+
+    void Save() {
+        this.clicks = this.clicks + 1;
+        ((Label)this.docRoot.Find("status")).Text = "Saved";
+    }
+
+    void Loaded(Form window) {
+        Require(window == this && window.docRoot.Find("save") is Button, "load callback ran before assembly");
+        this.loads = this.loads + 1;
+    }
+
+    static void Require(bool ok, string message) {
+        if (!ok) { throw new Exception(message); }
+    }
+
+    void Reject(string document, Action<HandlerRegistry> register, string diagnostic) {
+        Control root = this.docRoot;
+        App app = this.GetApp();
+        try {
+            this.ShowOffscreenStaticWith(document, CreateControl, register, this.Loaded);
+        } catch (InvalidOperationException ex) {
+            Require(ex.Message.Contains(diagnostic), "invalid document diagnostic: " + ex.Message);
+            Require(this.docRoot == root && this.GetApp() == app && this.loads == 1, "invalid document replaced the window");
+            return;
+        }
+        throw new Exception("invalid document accepted");
+    }
+
+    void ClickButton(Button button) {
+        Require(button != null && button.bw > 0 && button.bh > 0, "button has no hit region");
+        int x = button.bx + button.bw / 2;
+        int y = button.by + button.bh / 2;
+        this.ProcessOffscreenInput(2, x, y, 0, 0, 0, 0);
+        this.ProcessOffscreenInput(3, x, y, 0, 0, 0, 0);
+    }
+
+    static int Main() {
+        string document = "static-fixture/views/window.html";
+        Require(!Directory.FileExistsUtf8(document), "HTML alias exists on disk");
+        StaticWindow window = new StaticWindow();
+        window.ShowOffscreenStaticWith(document, CreateControl, window.Register, window.Loaded);
+        App app = window.GetApp();
+        try {
+            Require(window.loads == 1 && app.ModelHostCount() == 0, "static document installed a model host");
+            Require(window.Title() == "Static editor", "document title was lost");
+            window.CaptureSnapshot();
+            Button save = (Button)window.docRoot.Find("save");
+            Require(save.GetProp("text") == "Save" && save.bw > 0, "included button was not laid out");
+            Require(save.ResolvedStyle(app).BgOr(0) == Color.FromRGB(16, 32, 48).ToARGB(), "document CSS was lost");
+            window.ClickButton(save);
+            window.ClickButton((Button)window.docRoot.Find("preset"));
+            Require(window.clicks == 1 && window.preset == "quick", "document events did not fire exactly once");
+            Control status = window.docRoot.Find("status");
+            Require(status != null && status.GetProp("text") == "Saved", "handler did not update the label");
+            window.Reject(document, (HandlerRegistry handlers) => { }, "unregistered: save");
+            window.Reject("static-fixture/bound.html", window.Register, "model directives require ShowWith");
+            try {
+                window.ShowOffscreenStaticWith("window.html", CreateControl, window.Register, window.Loaded);
+                throw new Exception("missing logical name unexpectedly resolved");
+            } catch (FileNotFoundException ex) {
+                Require(ex.Message.Contains("window.html") && window.loads == 1, "missing document diagnostic");
+            }
+        } finally {
+            app.StopLoop();
+            app.canvas.Destroy();
+        }
+        Console.WriteLine("GUI_FORM_STATIC_PUBLISH_OK");
+        return 0;
+    }
+}

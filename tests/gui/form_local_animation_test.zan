@@ -1,0 +1,471 @@
+using System;
+using Gui;
+using Gui.Animation;
+using Gui.Backend;
+using Gui.Widget;
+
+#if WINDOWS && X86_64
+class RegionLabel : Label {
+    public int measures;
+    public int arranges;
+    public int paints;
+    public Control cover;
+    public bool bounded;
+
+    RegionLabel() : base("Static label") { }
+    protected override bool PaintWithinBounds() { return bounded && cover == null; }
+    public override void OnMeasure(App app) { measures = measures + 1; base.OnMeasure(app); }
+    public override void Arrange(int x, int y, int w, int h) {
+        arranges = arranges + 1;
+        base.Arrange(x, y, w, h);
+    }
+    public override void OnPaint(App app) {
+        paints = paints + 1;
+        if (bounded && cover == null) {
+            app.canvas.PushClip(bx, by, bw, bh);
+            try { base.OnPaint(app); }
+            finally { app.canvas.PopClip(); }
+        } else { base.OnPaint(app); }
+        if (cover != null) { app.canvas.FillRect(cover.bx + 3, cover.by, 12, cover.bh, 0xCC202020); }
+    }
+}
+
+class LocalAnimationForm : Form {
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("user32", EntryPoint = "GetWindowRect")]
+    static extern int GetWindowRect(nint hwnd, nint rect);
+    private Progress progress;
+    private RegionLabel label;
+    private Button button;
+    private int clicks;
+    private int now;
+
+    LocalAnimationForm() : base("Form local animation", 430, 340) {
+        Panel body = Panel.Column();
+        body.Grow();
+        progress = new Progress(70, 3) {
+            IsShowText = false,
+            IsProcessing = true
+        };
+        progress.SetProp("style", "width:160px;height:26px");
+        label = new RegionLabel();
+        button = new Button("Input target");
+        button.SetProp("style", "width:130px;height:24px;transition:none");
+        button.BindEvent("Click", () => { clicks = clicks + 1; });
+        body.Add(progress);
+        body.Add(label);
+        body.Add(button);
+        this.Add(body);
+    }
+
+    static void Check(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    void Pump() {
+        for (int i = 0; i < 256; i = i + 1) {
+            int result = app.PollOneEvent();
+            Check(result >= 0, "window remains running");
+            this.RenderPendingFormFrame();
+            if (result == 0) { return; }
+        }
+        Check(false, "native event queue did not drain");
+    }
+
+    void NormalFrame() {
+        app.RequestRedraw();
+        Check(this.RenderPendingFormFrame(), "standard frame committed");
+    }
+
+    void Dpi(int dpi) {
+        Canvas previous = app.canvas;
+        int w = previous.Width();
+        int h = previous.Height();
+        nint hwnd = app.WindowHandle();
+        bool changed = app.window.GetDpiScale() != dpi * 100 / 96;
+        nint rect = NativeMemory.Alloc(16);
+        nint screenPoint = 0;
+        try {
+            Check(LocalAnimationForm.GetWindowRect(hwnd, rect) != 0, "native window rectangle exists");
+            Span<int> edges = new Span<int>(rect, 4);
+            int x = edges[0] + 32;
+            int y = edges[1] + 20;
+            screenPoint = (nint)((x & 65535) | ((y & 65535) << 16));
+        } finally { NativeMemory.Free(rect); }
+        Check(LocalAnimationForm.SendMessageW(hwnd, 0x0084, 0, screenPoint) == 2,
+            "screen point starts in the draggable caption");
+        LocalAnimationForm.SendMessageW(hwnd, 0x02E0, (nint)(dpi | (dpi << 16)), 0);
+        if (changed) {
+            Check(LocalAnimationForm.SendMessageW(hwnd, 0x0084, 0, screenPoint) == 1,
+                "caption routes through client input while DPI geometry is pending");
+        }
+        this.Pump();
+        rect = NativeMemory.Alloc(16);
+        try {
+            Check(LocalAnimationForm.GetWindowRect(hwnd, rect) != 0, "updated native window rectangle exists");
+            Span<int> edges = new Span<int>(rect, 4);
+            int x = edges[0] + 32;
+            int y = edges[1] + 20;
+            screenPoint = (nint)((x & 65535) | ((y & 65535) << 16));
+        } finally { NativeMemory.Free(rect); }
+        Check(LocalAnimationForm.SendMessageW(hwnd, 0x0084, 0, screenPoint) == 2,
+            "caption hit testing resumes after presentation");
+        Check(app.dpiScale == dpi * 100 / 96, "application observes native DPI");
+        Check(app.canvas == previous && app.canvas.Width() == w && app.canvas.Height() == h,
+            "DPI transition preserves surface and device dimensions");
+    }
+
+    void AdvanceClock(int stepMs) {
+        now = now + stepMs;
+        Window.FreezeTick(now);
+    }
+
+    void Tick(int stepMs = 33) {
+        this.AdvanceClock(stepMs);
+        Win32Shell.ClearEvent();
+        app.PumpDueFrame();
+        this.RenderPendingFormFrame();
+    }
+
+    void Click(int x, int y) {
+        app.window.InjectEvent(2, x, y, 0, 0, 0);
+        app.window.InjectEvent(3, x, y, 0, 0, 0);
+        this.Pump();
+    }
+
+    void VerifyReplay(Rect viewport = null, bool displayCadence = false) {
+        if (displayCadence) {
+            now = now + (33 - now % 33);
+            Window.FreezeTick(now);
+        }
+        this.NormalFrame();
+        int measured = label.measures;
+        int arranged = label.arranges;
+        int painted = label.paints;
+        int frame = app.frameCount;
+        Canvas actual = app.canvas;
+        Control fill = progress.fillNode;
+        int w = actual.Width();
+        int h = actual.Height();
+        Canvas replay = new Canvas(w, h);
+        try {
+            replay.BlitSurface(actual, 0, 0, 0, 0, w, h);
+            int delay = 33;
+            if (displayCadence) {
+                this.CheckDisplayDeadline();
+                delay = app.animNextMs - now;
+                // Sample inside one legacy pixel, independently of the real cadence clock.
+                if (delay >= 33) { app.animNextMs = now + 32; }
+                delay = Math.Max(1, Math.Min(32, delay));
+            }
+            this.Tick(delay);
+            if (displayCadence) { this.CheckDisplayDeadline(); }
+            Check(app.frameCount == frame + 1, "stripe tick commits one frame");
+            Check(label.measures == measured && label.arranges == arranged && label.paints == painted,
+                "static callbacks at DPI " + Convert.ToString(app.dpiScale)
+                + ", measure=" + Convert.ToString(label.measures - measured)
+                + ", arrange=" + Convert.ToString(label.arranges - arranged)
+                + ", paint=" + Convert.ToString(label.paints - painted)
+                + ", bounded=" + Convert.ToString(label.bounded)
+                + ", partial=" + Convert.ToString(app.partialFrame));
+            int changed = 0;
+            for (int y = app.ContentTop(); y < h; y = y + 1) {
+                for (int x = 0; x < w; x = x + 1) {
+                    if (actual.GetPixel(x, y) == replay.GetPixel(x, y)) { continue; }
+                    Check(x >= fill.bx && x < fill.bx + fill.bw && y >= fill.by && y < fill.by + fill.bh,
+                        "stripe changes pixels only inside the arranged fill");
+                    Check(viewport == null || viewport.Contains(x, y),
+                        "stripe changes pixels only inside the scroll viewport");
+                    changed = changed + 1;
+                }
+            }
+            Check(changed > 0, "stripe advances to a different phase");
+            replay.BlitSurface(actual, 0, 0, 0, 0, w, h);
+            this.NormalFrame();
+            for (int y = app.ContentTop(); y < h; y = y + 1) {
+                for (int x = 0; x < w; x = x + 1) {
+                    Check(actual.GetPixel(x, y) == replay.GetPixel(x, y), "local and ordinary content pixels agree");
+                }
+            }
+        } finally { replay.Destroy(); }
+    }
+
+    void CheckDisplayDeadline() {
+        int delay = app.animNextMs - now;
+        int periodMs = (int)Math.Ceiling(1000.0 / app.RefreshRate());
+        Check(app.animRequestCount == 1 && delay >= 0 && delay <= periodMs,
+            "display cadence rearms one stripe within a refresh period");
+    }
+
+    public void Verify() {
+        now = 330;
+        Window.FreezeTick(now);
+        app.SetRenderBackend(0);
+        app.SetBackdropFx(false);
+        try {
+            app.Show();
+            // A launcher can override the first Win32 ShowWindow call.
+            if (!app.window.IsVisible()) { app.window.Show(); }
+            Check(app.window.IsVisible(), "native window is visible for presentation checks");
+            this.SetLocalAnimation(true);
+            this.RunScoped(() => {
+                ModelBinder binder = new ModelBinder();
+                binder.SetRoot(this, (object)this);
+                app.RegisterModelHost(binder);
+                binder.Wire();
+                try {
+                    this.VerifyFrames();
+                    this.VerifyPaintLayout();
+                    this.VerifyTweenGeometry();
+                } finally { app.UnregisterModelHost(binder); }
+            });
+        } finally {
+            Window.UnfreezeTick();
+            button.Click.Clear();
+            app.StopLoop();
+            app.window.Destroy();
+            app.canvas.Destroy();
+        }
+    }
+
+    void VerifyFrames() {
+        this.Pump();
+        this.Dpi(96);
+        this.VerifyReplay();
+        int painted = label.paints;
+        now = now + 33;
+        Window.FreezeTick(now);
+        Check(!app.TakeDueFrame(now), "phase-only tick is queued for local presentation");
+        app.RequestWakeFrameIn(0);
+        Check(this.RenderPendingFormFrame() && label.paints > painted,
+            "late frame wake runs the ordinary frame");
+
+        int oldX = button.bx + button.bw / 2;
+        int oldY = button.by + button.bh / 2;
+        int oldFillHeight = progress.fillNode.bh;
+        this.Click(oldX, oldY);
+        Check(clicks == 1, "old DPI input matches the button");
+
+        int before = label.paints;
+        this.Dpi(144);
+        Check(label.paints > before, "DPI invalidates replay and paints the static scene");
+        Check(progress.fillNode.bh > oldFillHeight, "stripe geometry is rebuilt at new DPI");
+        // The click at the old DPI can leave a focus or hover transition
+        // scheduled. Let it finish before testing a stripe-only tick.
+        for (int i = 0; i < 30 && app.animRequestCount > 1; i = i + 1) {
+            this.Tick();
+        }
+        this.VerifyReplay();
+        this.Click(oldX, oldY);
+        Check(clicks == 1, "old button location no longer hits");
+        this.Click(button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(clicks == 2, "new button location hits once after replay");
+
+        for (int i = 0; i < 30 && app.animRequestCount > 1; i = i + 1) {
+            this.Tick();
+        }
+        label.cover = progress.fillNode;
+        this.NormalFrame();
+        Check(app.animRequestCount == 1, "only the stripe is scheduled under later paint");
+        before = label.paints;
+        this.Tick();
+        Check(label.paints > before, "later intersecting paint requires an ordinary frame");
+        Check(clicks == 2, "ordinary fallback preserves click count");
+        this.VerifyScrolledReplay();
+        this.VerifyPartialRecovery();
+        Check(app.FrameErrorCount() == 0, "frame replay remains valid");
+    }
+
+    void VerifyPaintLayout() {
+        this.SetLocalAnimation(false);
+        this.SetReusePaintLayout(true);
+        label.bounded = true;
+        ScrollColumn scroll = (ScrollColumn)progress.parent.parent;
+        Control body = label.parent;
+        body.Remove(label);
+        label.SetProp("style", "margin-top:24px");
+        body.Add(label);
+        this.VerifyReplay();
+        int oldX = button.bx + button.bw / 2;
+        int oldY = button.by + button.bh / 2;
+        int measured = label.measures;
+        this.Dpi(144);
+        Check(label.measures > measured, "same-surface DPI discards committed paint geometry");
+        int before = clicks;
+        this.Click(oldX, oldY);
+        Check(clicks == before, "old DPI coordinates cannot click after paint-only frames");
+        this.Click(button.bx + button.bw / 2, button.by + button.bh / 2);
+        Check(clicks == before + 1, "new DPI coordinates click once after paint-only frames");
+        for (int i = 0; i < 30 && app.animRequestCount > 1; i = i + 1) { this.Tick(); }
+
+        Rect viewport = scroll.ScrollViewport();
+        Control fill = progress.fillNode;
+        scroll.SetScrollTop(fill.by - viewport.y + fill.bh / 2);
+        this.NormalFrame();
+        this.VerifyReplay(viewport);
+        int clippedTop = fill.by;
+        measured = label.measures;
+        now = app.animNextMs;
+        Window.FreezeTick(now);
+        Win32Shell.ClearEvent();
+        Check(app.TakeDueFrame(now), "ordinary paint-only frame is queued");
+        scroll.SetScrollTop(0);
+        Check(this.RenderPendingFormFrame() && label.measures > measured && fill.by > clippedTop,
+            "scroll invalidates queued ordinary paint geometry");
+
+        label.cover = fill;
+        this.NormalFrame();
+        measured = label.measures;
+        int painted = label.paints;
+        Canvas reference = new Canvas(app.canvas.Width(), app.canvas.Height());
+        try {
+            this.Tick();
+            Check(label.measures == measured && label.paints == painted + 1,
+                "unbounded later paint composes without measuring again");
+            int width = app.canvas.Width();
+            int height = app.canvas.Height();
+            reference.BlitSurface(app.canvas, 0, 0, 0, 0, width, height);
+            this.NormalFrame();
+            for (int y = app.ContentTop(); y < height; y = y + 1) {
+                for (int x = 0; x < width; x = x + 1) {
+                    Check(app.canvas.GetPixel(x, y) == reference.GetPixel(x, y),
+                        "ordinary paint-only overlap agrees with full painting");
+                }
+            }
+        } finally { reference.Destroy(); }
+        Check(app.FrameErrorCount() == 0, "ordinary paint-only frames remain valid");
+    }
+
+    void VerifyTweenGeometry() {
+        progress.Processing(false);
+        label.cover = null;
+        button.parent.Remove(progress);
+        button.SetText("");
+        this.Dpi(96);
+        AnimationTimeline timeline = new AnimationTimeline();
+        timeline.BindApp(app);
+        Tween motion = Tween.Create(0.0f, 100.0f, 120, EaseType.Linear, (float offset) => {
+            button.SetProp("style", "width:42px;height:24px;transition:none;background:#3476ac;margin-left:"
+                + Convert.ToString((int)offset) + "px");
+        });
+        motion.Play();
+        timeline.Add(motion);
+        this.AdvanceClock(60);
+        this.Pump();
+        this.Dpi(144);
+        int x = button.bx + button.bw / 2;
+        int y = button.by + button.bh / 2;
+        int targetX = x + app.Scale(50);
+        int buttonPixel = app.canvas.GetPixel(x, y);
+        int outsidePixel = app.canvas.GetPixel(targetX, y);
+        Check(buttonPixel != outsidePixel, "midpoint and endpoint are visually distinguishable after DPI change");
+
+        this.AdvanceClock(60);
+        this.Pump();
+        Check(!timeline.HasActive() && button.bx + button.bw / 2 == targetX,
+            "completion commits scaled button geometry");
+        Check(app.canvas.GetPixel(targetX, y) == buttonPixel && app.canvas.GetPixel(x, y) == outsidePixel,
+            "completion paints the button at the new location and clears the old location");
+        int before = clicks;
+        this.Click(x, y);
+        Check(clicks == before, "previous animated position no longer hits after DPI change");
+        this.Click(targetX, y);
+        Check(clicks == before + 1, "painted endpoint receives one click after DPI change");
+    }
+
+    void VerifyPartialRecovery() {
+        app.SetPartialFrames(true);
+        progress.Processing(false);
+        this.NormalFrame();
+        progress.Processing(true);
+        Check(this.RenderPendingFormFrame() && app.partialFrame,
+            "ordinary partial frame covers the stripe");
+        int painted = label.paints;
+        int frame = app.frameCount;
+        this.Tick();
+        Check(app.frameCount == frame + 1 && label.paints == painted,
+            "stripe resumes replay after a covering partial frame");
+    }
+
+    void VerifyScrolledReplay() {
+        label.cover = null;
+        Panel body = (Panel)progress.parent;
+        body.Remove(progress);
+        body.Remove(button);
+        ScrollColumn scroll = new ScrollColumn();
+        scroll.SetProp("style", "height:76px");
+        Panel row = Panel.Row();
+        row.SetProp("style", "height:26px;align-items:center");
+        button.SetProp("style", "width:100px;height:26px;transition:none");
+        row.Add(progress);
+        row.Add(button);
+        scroll.Add(row);
+        Label tail = new Label("Below the fold");
+        tail.SetProp("style", "height:160px");
+        scroll.Add(tail);
+        body.Add(scroll);
+
+        this.VerifyClippedRow(scroll);
+        this.Dpi(96);
+        this.VerifyClippedRow(scroll);
+    }
+
+    void VerifyClippedRow(ScrollColumn scroll) {
+        scroll.SetScrollTop(0);
+        this.NormalFrame();
+        Rect viewport = scroll.ScrollViewport();
+        Control fill = progress.fillNode;
+        scroll.SetScrollTop(fill.by - viewport.y + fill.bh / 2);
+        this.NormalFrame();
+        Check(fill.by < viewport.y && fill.by + fill.bh > viewport.y,
+            "scroll viewport cuts through the stripe at DPI scale " + Convert.ToString(app.dpiScale));
+        this.VerifyReplay(viewport);
+        progress.DisplayCadence(true);
+        this.VerifyReplay(viewport, true);
+
+        int beforeToggle = label.paints;
+        now = app.animNextMs;
+        Window.FreezeTick(now);
+        Check(!app.TakeDueFrame(now), "display tick is queued for local presentation");
+        progress.DisplayCadence(false);
+        Check(this.RenderPendingFormFrame() && label.paints > beforeToggle,
+            "switching cadence invalidates a queued stripe replay");
+        Check(app.animNextMs == now + (33 - now % 33), "switching back restores the legacy deadline");
+
+        int x = button.bx + button.bw / 2;
+        Check(button.by < viewport.y && button.by + button.bh > viewport.y,
+            "scroll viewport cuts through the button");
+        int before = clicks;
+        this.Click(x, viewport.y - 1);
+        Check(clicks == before, "clipped portion of button cannot receive the click");
+        this.Click(x, viewport.y + (button.by + button.bh - viewport.y) / 2);
+        Check(clicks == before + 1, "visible portion of clipped button receives one click");
+        for (int i = 0; i < 30 && app.animRequestCount > 1; i = i + 1) {
+            this.Tick();
+        }
+
+        this.NormalFrame();
+        int painted = label.paints;
+        int clippedTop = fill.by;
+        now = app.animNextMs;
+        Window.FreezeTick(now);
+        Win32Shell.ClearEvent();
+        Check(!app.TakeDueFrame(now), "clipped stripe has a queued replay");
+        scroll.SetScrollTop(0);
+        Check(this.RenderPendingFormFrame() && label.paints > painted && fill.by > clippedTop,
+            "changed scroll offset rebuilds geometry before presenting the queued frame");
+    }
+}
+#endif
+
+class FormLocalAnimationTest {
+    static void Main() {
+        #if WINDOWS && X86_64
+        App previous = App.FrameApp();
+        try { (new LocalAnimationForm()).Verify(); }
+        finally { App.SetFrameApp(previous); }
+        #endif
+        Console.WriteLine("form local animation ok");
+    }
+}

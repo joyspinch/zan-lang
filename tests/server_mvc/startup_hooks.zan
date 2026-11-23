@@ -3,8 +3,15 @@ using System.Data;
 using System.Data.Orm;
 using System.Data.Sqlite;
 using System.IO;
+using System.Json;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Admin.Media;
+using Zan.Web.Admin.System;
 using Zan.Web.Core;
 using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web.Services;
 
 [Table("app_startup_entity")]
 class StartupEntity {
@@ -46,7 +53,7 @@ class Program {
             bool rolesReady = await db.SyncStructureAsync<SysRole>();
             bool grantsReady = await db.SyncStructureAsync<SysRoleGrant>();
             Program.Check(usersReady && rolesReady && grantsReady, "identity fixture schema ready");
-            changed = await db.ExecuteAsync("INSERT INTO sys_user(id, username, passwordHash, passwordSalt, isSuper) VALUES(1, 'legacy-seller', 'retained-hash', '', 0)");
+            changed = await db.ExecuteAsync("INSERT INTO sys_user(id, username, passwordHash, isSuper) VALUES(1, 'legacy-seller', 'retained-hash', 0)");
             Program.Check(changed == 1, "legacy user identity imported");
             changed = await db.ExecuteAsync("INSERT INTO sys_role(id, name, code, rank, status) VALUES(50, '商家', 'mall.seller', 2, 1)");
             Program.Check(changed == 1, "custom role identity imported");
@@ -66,8 +73,8 @@ class Program {
             "application entity migrated before the after hook");
         Program.Check(!await DbSchema.TableExistsAsync(db, "app_unregistered_entity"),
             "unregistered entity stays outside the migration");
-        string builtinRoles = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code IN ('admin', 'editor') AND id > 50");
-        Program.Check(builtinRoles == "2", "builtin roles added independently after custom roles with fresh identities");
+        string builtinRoles = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code = 'admin' AND id > 50");
+        Program.Check(builtinRoles == "1", "builtin admin role added independently after custom roles with fresh identity");
         string bootstrap = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE username = 'admin' AND id > 1 AND isSuper = 1");
         string migrated = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_user WHERE id = 1 AND username = 'legacy-seller' AND passwordHash = 'retained-hash' AND isSuper = 0");
         Program.Check(bootstrap == "1" && migrated == "1", "admin identity allocated without changing migrated user");
@@ -76,14 +83,297 @@ class Program {
         Program.Check(custom == "1" && grants == "1", "custom role and grants survive initial and repeated seeds");
         if (Program.afterCalls > 1) {
             string retained = await db.ExecuteScalarAsync("SELECT COUNT(*) FROM sys_role WHERE code = 'admin' AND name = 'retained-admin-name' AND rank = 17 AND status = 0");
-            Program.Check(retained == "1", "missing editor repaired without rewriting existing admin role");
+            Program.Check(retained == "1", "existing admin role customization retained across repeated seeds");
         }
         return Program.mode != 2;
     }
 
+    static async bool MediaAction(string action, string query, string uid, string spool = "", long size = 0, WebApp app = null) {
+        HttpRequest req = HttpRequest.Parse("POST /admin/media/" + action + "?" + query + " HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext request = new HttpContext(req, "127.0.0.1");
+        request.SetApp(app);
+        request.SetUid(uid);
+        request.SetRouteAction(action == "upload" ? "Media.Upload" : "Media.Delete");
+        if (spool.Length > 0) { request.SetUpload(spool, size); }
+        MediaController controller = new MediaController();
+        controller.Bind(request);
+        try {
+            if (!await controller.BeforeAsync()) { throw new Exception("media fixture preflight failed"); }
+            if (action == "upload") { await controller.Upload(); }
+            else { await controller.Delete(); }
+            JsonValue body = JsonValue.ParseLenient(request.ResponseBody());
+            return request.GetStatus() == 200 && body != null && body.PathStr("code", "") == "0000";
+        } finally {
+            try {
+                await controller.AfterAsync();
+                if (spool.Length > 0) {
+                    Program.Check(!File.Exists(spool), "upload action consumed its spool");
+                }
+            } finally {
+                request.Dispose();
+            }
+        }
+    }
+
+    static async void MediaChecks(IZanSql orm, string uid) {
+        string mediaDir = "wwwroot/media";
+        string spool = "note.upload";
+        string content = "media fixture";
+        File.WriteAllText(spool, content);
+        Program.Check(await Program.MediaAction("upload", "name=note.txt", uid, spool, content.Length),
+            "media upload returns success");
+        SysMediaFile upload = await orm.Select<SysMediaFile>().Where(a => a.name == "note.txt").FirstAsync();
+        Program.Check(upload != null, "media upload persists a row");
+        if (upload != null) {
+            string disk = Path.Combine(mediaDir, upload.path);
+            Program.Check(upload.size == content.Length && upload.ext == "txt" && upload.path != upload.name,
+                "media upload persists metadata and a separate storage name");
+            Program.Check(File.Exists(disk) && File.ReadAllText(disk) == content, "media upload publishes file contents");
+        }
+
+        int publishedFiles = Directory.GetFiles(mediaDir, "*", true).Count;
+        // Ignore one insert after publication, so the upload must roll back and remove its file.
+        await orm.ExecuteAsync("CREATE TRIGGER fixture_skip_media_insert BEFORE INSERT ON sys_media_file "
+            + "BEGIN SELECT RAISE(IGNORE); END");
+        File.WriteAllText(spool, content);
+        string failure = "";
+        try { await Program.MediaAction("upload", "name=retry.txt", uid, spool, content.Length); }
+        catch (Exception ex) { failure = ex.Message; }
+        Program.Check(failure == "媒体记录未写入", "upload reached the injected insert failure");
+        int mediaRows = await orm.Select<SysMediaFile>().CountAsync();
+        Program.Check(mediaRows == 1 && Directory.GetFiles(mediaDir, "*", true).Count == publishedFiles,
+            "failed upload leaves no new row or published file");
+        await orm.ExecuteAsync("DROP TRIGGER fixture_skip_media_insert");
+
+        // Older rows could share the original filename on disk.
+        SysMediaFile legacy = new SysMediaFile();
+        legacy.name = "legacy-note.txt";
+        legacy.path = legacy.name;
+        legacy.ext = "txt";
+        legacy.size = content.Length;
+        legacy.uploadedBy = "admin";
+        string legacyDisk = Path.Combine(mediaDir, legacy.path);
+        File.WriteAllText(legacyDisk, content);
+        int firstId = await orm.Insert<SysMediaFile>(legacy).ExecuteIdentityAsync();
+        int lastId = await orm.Insert<SysMediaFile>(legacy).ExecuteIdentityAsync();
+        Program.Check(firstId > 0 && lastId > firstId, "two legacy rows share the same file");
+        Program.Check(await Program.MediaAction("delete", "id=" + Convert.ToString(firstId), uid),
+            "delete one legacy reference succeeds");
+        SysMediaFile first = await orm.Select<SysMediaFile>().WherePk(firstId).FirstAsync();
+        SysMediaFile last = await orm.Select<SysMediaFile>().WherePk(lastId).FirstAsync();
+        Program.Check(first == null && last != null && File.Exists(legacyDisk) && File.ReadAllText(legacyDisk) == content,
+            "other legacy reference and file survive first deletion");
+
+        await orm.ExecuteAsync("CREATE TRIGGER fixture_skip_media_delete BEFORE DELETE ON sys_media_file "
+            + "BEGIN SELECT RAISE(IGNORE); END");
+        int status = 0;
+        string lastQuery = "id=" + Convert.ToString(lastId);
+        try { await Program.MediaAction("delete", lastQuery, uid); }
+        catch (ApiError ex) { status = ex.Status(); }
+        last = await orm.Select<SysMediaFile>().WherePk(lastId).FirstAsync();
+        Program.Check(status == 409 && last != null && File.Exists(legacyDisk) && File.ReadAllText(legacyDisk) == content,
+            "failed final deletion preserves the row and file");
+        await orm.ExecuteAsync("DROP TRIGGER fixture_skip_media_delete");
+
+        // The last-reference DELETE and file move succeed, then the deferred constraint rejects COMMIT.
+        await orm.ExecuteAsync("PRAGMA foreign_keys = ON");
+        Program.Check(await orm.ExecuteScalarAsync("PRAGMA foreign_keys") == "1", "media constraint enforcement enabled");
+        await orm.ExecuteAsync("CREATE TABLE fixture_media_reference (media_id INTEGER "
+            + "REFERENCES sys_media_file(id) DEFERRABLE INITIALLY DEFERRED)");
+        DbParams reference = new DbParams();
+        reference.AddInt(lastId);
+        int referenced = await orm.ExecuteAsync("INSERT INTO fixture_media_reference (media_id) VALUES (?)", reference);
+        Program.Check(referenced == 1, "media constraint fixture persisted");
+        bool constraintFailed = false;
+        try { await Program.MediaAction("delete", lastQuery, uid); }
+        catch (DbException ex) {
+            constraintFailed = ex.Provider == DbProvider.SQLite && (ex.Code & 255) == 19;
+            if (!constraintFailed) { Console.WriteLine(ex.Message); }
+        }
+        Program.Check(constraintFailed, "deferred constraint rejects media commit");
+        last = await orm.Select<SysMediaFile>().WherePk(lastId).FirstAsync();
+        Program.Check(last != null, "failed media commit leaves its row");
+        Program.Check(File.Exists(legacyDisk) && File.ReadAllText(legacyDisk) == content,
+            "failed commit restores the referenced file");
+        Program.Check(Directory.GetFiles(mediaDir, "*", true).Count == publishedFiles + 1,
+            "failed commit leaves no staged copy");
+        await orm.ExecuteAsync("DROP TABLE fixture_media_reference");
+        Program.Check(await Program.MediaAction("delete", lastQuery, uid), "delete final legacy reference succeeds");
+        last = await orm.Select<SysMediaFile>().WherePk(lastId).FirstAsync();
+        Program.Check(last == null && !File.Exists(legacyDisk) && Directory.GetFiles(mediaDir, "*", true).Count == publishedFiles,
+            "final deletion removes the row and leaves no copy of the legacy file");
+
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.Mount("/static", "wwwroot", 0);
+        int limit = StaticFiles.MaxFileBytes;
+        byte[] bytes = new byte[limit];
+        bytes[limit - 1] = 91;
+        File.WriteAllBytes(spool, bytes);
+        Program.Check(await Program.MediaAction("upload", "name=limit.txt", uid, spool, limit, app),
+            "built-in media mount accepts a file at its static limit");
+        SysMediaFile boundary = await orm.Select<SysMediaFile>().Where(a => a.name == "limit.txt").FirstAsync();
+        if (boundary != null) {
+            HttpRequest request = HttpRequest.Parse("GET /static/media/" + boundary.path + " HTTP/1.1\r\nHost: test\r\n\r\n");
+            HttpContext download = new HttpContext(request, "127.0.0.1");
+            try {
+                Program.Check(!app.ServeStatic(download) && download.GetStatus() == 200 && download.BodyLength() == limit
+                    && download.BodyBytes()[limit - 1] == 91, "boundary upload is retrievable via the built-in mount");
+            } finally {
+                download.Dispose();
+            }
+        } else {
+            Program.Check(false, "boundary upload persists its row");
+        }
+
+        File.WriteAllBytes(spool, bytes);
+        File.AppendAllText(spool, "x");
+        status = 0;
+        try { await Program.MediaAction("upload", "name=big.txt", uid, spool, limit + 1, app); }
+        catch (ApiError ex) { status = ex.Status(); }
+        Program.Check(status == 413 && !await orm.Select<SysMediaFile>().Where(a => a.name == "big.txt").AnyAsync()
+            && Directory.GetFiles(mediaDir, "*", true).Count == publishedFiles + 1,
+            "oversized upload for built-in static publishes neither a row nor a file");
+
+        File.WriteAllBytes(spool, bytes);
+        File.AppendAllText(spool, "x");
+        WebApp external = new WebApp("127.0.0.1", 0);
+        Program.Check(await Program.MediaAction("upload", "name=big.txt", uid, spool, limit + 1, external),
+            "external-only media hosting retains the configured upload allowance");
+    }
+
+    static async void JobChecks(IZanSql orm) {
+        // A persisted job whose kind is no longer available fails in the real executor.
+        SysJob job = new SysJob();
+        job.name = "Retired job fixture";
+        job.kind = "retired-fixture-job";
+        job.param = "";
+        job.lastOk = 1;
+        job.lastMessage = "previous success";
+        int id = await orm.Insert<SysJob>(job).ExecuteIdentityAsync();
+        SysJob first = await orm.Select<SysJob>().WherePk(id).FirstAsync();
+        SysJob stale = await orm.Select<SysJob>().WherePk(id).FirstAsync();
+        Program.Check(first != null && stale != null, "job fixture loaded two claim snapshots");
+        if (first == null || stale == null) { return; }
+
+        JobRunResult failed = await JobHost.RunNowResult(orm, first);
+        Program.Check(failed.claimed && !failed.ok && failed.message == "未知任务类型 " + job.kind,
+            "real executor failure is a claimed failed run");
+        JobRunResult conflict = await JobHost.RunNowResult(orm, stale);
+        Program.Check(!conflict.claimed && !conflict.ok && conflict.message.Length > 0,
+            "stale snapshot loses the claim");
+
+        SysJob summary = await orm.Select<SysJob>().WherePk(id).FirstAsync();
+        List<SysJobLog> history = await orm.Select<SysJobLog>().Where(a => a.jobId == id).ToListAsync();
+        Program.Check(summary != null && history.Count == 1, "only the claimed run writes summary and history");
+        if (summary != null && history.Count == 1) {
+            SysJobLog entry = history[0];
+            Program.Check(summary.runCount == 1 && entry.ok == 0 && summary.lastOk == entry.ok
+                && summary.lastRunAt == entry.startedAt && entry.startedAt > 0
+                && summary.lastMs == entry.ms && entry.jobName == job.name
+                && summary.lastMessage == entry.message && entry.message == failed.message,
+                "failed-run result, persisted summary and history agree after the claim conflict");
+        }
+        await Program.JobHistoryAbort(orm);
+    }
+
+    static async void JobHistoryAbort(IZanSql orm) {
+        SysJob seed = new SysJob();
+        seed.name = "Job history rollback fixture";
+        seed.kind = "ping";
+        seed.param = "";
+        seed.lastRunAt = 1;
+        seed.runCount = 7;
+        seed.lastOk = 0;
+        seed.lastMs = 123;
+        seed.lastMessage = "previous failure";
+        int id = await orm.Insert<SysJob>(seed).ExecuteIdentityAsync();
+        SysJob pending = await orm.Select<SysJob>().WherePk(id).FirstAsync();
+        Program.Check(pending != null, "job history rollback fixture loaded");
+        if (pending == null) { return; }
+
+        await orm.ExecuteAsync("CREATE TRIGGER fixture_abort_job_log BEFORE INSERT ON sys_job_log "
+            + "WHEN NEW.jobId = " + Convert.ToString(id)
+            + " BEGIN SELECT RAISE(ABORT, 'fixture job history insert failed'); END");
+        string failure = "";
+        try {
+            JobRunResult _unexpected = await JobHost.RunNowResult(orm, pending);
+        } catch (DbException ex) {
+            failure = ex.Message;
+        } finally {
+            await orm.ExecuteAsync("DROP TRIGGER fixture_abort_job_log");
+        }
+        Program.Check(failure.Contains("fixture job history insert failed"), "run reports the injected history insert failure");
+
+        SysJob saved = await orm.Select<SysJob>().WherePk(id).FirstAsync();
+        Program.Check(saved != null && saved.lastRunAt > seed.lastRunAt, "history insert failure preserves the claim timestamp");
+        Program.Check(saved != null && saved.runCount == seed.runCount && saved.lastOk == seed.lastOk
+            && saved.lastMs == seed.lastMs && saved.lastMessage == seed.lastMessage,
+            "history insert failure rolls back the run summary");
+        int historyCount = await orm.Select<SysJobLog>().Where(a => a.jobId == id).CountAsync();
+        Program.Check(historyCount == 0, "history insert failure leaves no new history");
+    }
+
+    static async string ListPage(WebApp app, AdminController controller, string page, string query, string uid) {
+        HttpRequest req = HttpRequest.Parse("GET /admin/system/" + page + "?" + query
+            + " HTTP/1.1\r\nHost: test\r\nX-Fragment: 1\r\n\r\n");
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        ctx.SetApp(app);
+        ctx.SetUid(uid);
+        controller.Bind(ctx);
+        try {
+            if (!await controller.BeforeAsync()) { throw new Exception("list fixture preflight failed"); }
+            if (page == "roles") {
+                controller.SetView("Admin.System.RolesController.Index");
+                await ((RolesController)controller).Index();
+            } else {
+                controller.SetView("Admin.System.DepartmentsController.Index");
+                await ((DepartmentsController)controller).Index();
+            }
+            Program.Check(ctx.GetStatus() == 200, "list response prepared");
+            return ctx.ResponseBody();
+        } finally {
+            await controller.AfterAsync();
+            ctx.Dispose();
+        }
+    }
+
+    static async void ListChecks(IZanSql orm, string uid) {
+        int adminId = Filter.ToInt(uid, 0);
+        SysDepartment dept = new SysDepartment();
+        dept.name = "list-fixture-department";
+        dept.code = "list-fixture";
+        dept.status = 1;
+        int deptId = await orm.Insert<SysDepartment>(dept).ExecuteIdentityAsync();
+        int changed = await orm.Update<SysUser>().WherePk(adminId)
+            .Set(a => a.departmentId, deptId).ExecuteAffrowsAsync();
+        SysUserRole link = new SysUserRole();
+        link.userId = adminId;
+        link.roleId = 50;
+        int assigned = await orm.Insert<SysUserRole>(link).ExecuteAffrowsAsync();
+        Program.Check(deptId > 0 && changed == 1 && assigned == 1 && PermTable.Open(), "list fixture seeded");
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.Views("packages/Zan.Mvc/views");
+        WebHost.Use(app);
+        try {
+            string roles = await Program.ListPage(app, new RolesController(), "roles", "", uid);
+            Program.Check(roles.Contains("商家") && roles.Contains("<td class=\"num\">1</td>"),
+                "role list renders persisted grant and assigned user counts");
+            string departments = await Program.ListPage(app, new DepartmentsController(), "departments",
+                "id=" + Convert.ToString(deptId), uid);
+            Program.Check(departments.Contains("list-fixture-department") && departments.Contains("成员 1")
+                && departments.Contains("<td class=\"mono\">admin</td>") && departments.Contains("商家")
+                && !departments.Contains("legacy-seller"), "department list renders the selected roster and role names");
+        } finally {
+            WebHost.Use(null);
+            app.Dispose();
+        }
+    }
+
     static async void Main() {
-        Directory.CreateDirectoryRecursive("_scratch/server-mvc-startup");
-        string path = "_scratch/server-mvc-startup/hooks.db";
+        string cwd = Directory.GetCurrentDirectory();
+        string fixture = Path.Combine(cwd, "_scratch/server-mvc-startup");
+        Directory.CreateDirectoryRecursive(fixture);
+        string path = Path.Combine(fixture, "hooks.db");
         if (File.Exists(path)) { File.Delete(path); }
         Cfg.Auth.iter = 1000;
         Cfg.Auth.bootstrapPassword = "startup-hook-bootstrap-password";
@@ -113,8 +403,6 @@ class Program {
             if (db != null) {
                 int changed = await db.ExecuteAsync("UPDATE sys_role SET name = 'retained-admin-name', rank = 17, status = 0 WHERE code = 'admin'");
                 Program.Check(changed == 1, "existing builtin customization installed");
-                changed = await db.ExecuteAsync("DELETE FROM sys_role WHERE code = 'editor'");
-                Program.Check(changed == 1, "partial builtin fixture installed");
                 ctx.Release(db);
             }
             Program.mode = 2;
@@ -128,8 +416,30 @@ class Program {
                 ctx.Release(db);
             }
             Program.mode = 1;
-            Program.Check(await Schema.Ensure(ctx, appModels), "retry is idempotent after business failure");
+            bool migrated = await Schema.Ensure(ctx, appModels);
+            Program.Check(migrated, "retry is idempotent after business failure");
+            if (migrated) {
+                AppServices services = new AppServices(ctx, null);
+                AppServices.Use(services);
+                IZanSql orm = services.Orm();
+                string uid = await orm.ExecuteScalarAsync("SELECT id FROM sys_user WHERE username = 'admin'");
+                string mediaRoot = Path.Combine(fixture, "media-actions");
+                if (Directory.Exists(mediaRoot) && !Directory.DeleteRecursive(mediaRoot)) {
+                    throw new Exception("media fixture directory is not clean");
+                }
+                Directory.CreateDirectoryRecursive(mediaRoot);
+                try {
+                    Directory.SetCurrentDirectory(mediaRoot);
+                    await Program.MediaChecks(orm, uid);
+                } finally {
+                    Directory.SetCurrentDirectory(cwd);
+                    Program.Check(Directory.DeleteRecursive(mediaRoot), "media fixture directory cleaned up");
+                }
+                await Program.JobChecks(orm);
+                await Program.ListChecks(orm, uid);
+            }
         } finally {
+            AppServices.Use(null);
             Schema.OnBeforeSchema(null);
             Schema.OnAfterSchema(null);
             Program.held = null;

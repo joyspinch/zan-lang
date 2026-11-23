@@ -21,16 +21,15 @@
 cmake_policy(SET CMP0007 NEW)
 
 set(_budget
-  "packages/Zan.Gui/src/Gui/Styling/Style/Style.Defaults.zan=15"
+  "packages/Zan.Gui/src/Gui/Styling/Style/Style.Defaults.zan=14"
   "packages/Zan.Gui/src/Gui/Styling/Theme.zan=15"
-  "packages/Zan.Gui/src/Gui/Styling/StyleBox/StyleBox.zan=1"
   "packages/Zan.Gui/src/Gui/Core/Automation/UiDriver.zan=5"
-  "packages/Zan.Gui.Charts/src/Gui/Component/Chart/ResolvedChart.zan=1"
+  "packages/Zan.Gui.Charts/src/Gui/Component/Chart/Models/ResolvedSeries.zan=1"
   "packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan=1"
 )
 set(_members "fontSizeTiny|fontSizeSmall|fontSizeMedium|fontSizeLarge|fontSizeHuge")
-set(_total_budget 38)
-file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui/src/Gui/*.zan")
+set(_total_budget 36)
+file(GLOB_RECURSE _sources "${ROOT}/packages/Zan.Gui*/src/Gui/*.zan")
 
 set(_fail "")
 set(_total 0)

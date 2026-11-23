@@ -12,9 +12,77 @@ class Program {
         return sb.ToString();
     }
 
+    static void CheckTapeEscapes(JsonDoc doc) {
+        string value = doc.PathStr("first", "");
+        if (value.Length != 9 || Program.Hex(value) != "61 00 e9 9b aa f0 9f 98 80") {
+            throw new Exception("Escaped value bytes changed");
+        }
+        if (doc.PathStr("b", "") != "\u0008\u000c" || doc.PathStr("last", "") != "�tail") {
+            throw new Exception("Escaped key or value changed");
+        }
+        if (doc.escPool.Count != 4 || doc.escPool[0] != value || doc.escPool[1] != "b"
+        || doc.escPool[2] != "\u0008\u000c" || doc.escPool[3] != "�tail") {
+            throw new Exception("Escaped pool order changed");
+        }
+    }
+
+    static void CheckTapePaths() {
+        string source = "{\"first\":\"a\\u0000雪\\ud83d\\ude00\",\"\\u0062\":\"\\b\\f\",\"last\":\"\\ud800tail\"}";
+        Program.CheckTapeEscapes(JsonDoc.Parse(source));
+        Program.CheckTapeEscapes(JsonDoc.ParseBytes(Encoding.GetBytes(source), 0, source.Length));
+        JsonDoc.ParseScoped(source, (doc) => {
+            string inner = JsonDoc.ParseScoped<string>("{\"s\":\"inner\\t\\u96ea\"}", (nested) => nested.PathStr("s", ""));
+            if (inner != "inner\t雪") { throw new Exception("Nested scoped escape changed"); }
+            Program.CheckTapeEscapes(doc);
+        });
+
+        // The growing tape must rebuild the pool after the fixed tape fills.
+        StringBuilder dense = new StringBuilder();
+        dense.Append("[");
+        dense.Append(source);
+        for (int i = 0; i < 18000; i++) { dense.Append(",0"); }
+        dense.Append("]");
+        JsonDoc fallback = JsonDoc.Parse(dense.ToString());
+        fallback.root = fallback.FirstChild(fallback.root);
+        Program.CheckTapeEscapes(fallback);
+    }
+
+    static void CheckLargeEscape() {
+        StringBuilder source = new StringBuilder();
+        source.Append("{\"large\":\"");
+        for (int i = 0; i < 5000; i++) { source.Append("abcdefghijklmnop"); }
+        source.Append("\\nend\",\"small\":\"\\tlast\"}");
+        string json = source.ToString();
+        JsonDoc doc = JsonDoc.Parse(json);
+        string large = doc.PathStr("large", "");
+        if (large.Length != 80004 || !large.EndsWith("\nend") || doc.PathStr("small", "") != "\tlast") {
+            throw new Exception("Escape decoding after a large token changed");
+        }
+        JsonValue lenient = JsonValue.ParseLenient(json);
+        if (lenient.Str("large", "") != large || lenient.Str("small", "") != "\tlast") {
+            throw new Exception("Lenient escape decoding after a large token changed");
+        }
+    }
+
     static void Main() {
-        JsonValue doc = JsonValue.Parse(
-            "{\"ascii\":\"\\u0041\",\"zh\":\"\\u4e2d\\u6587\",\"emoji\":\"\\ud83d\\ude00\"}");
+        Program.CheckTapePaths();
+        Program.CheckLargeEscape();
+        string unicode = "{\"ascii\":\"\\u0041\",\"zh\":\"\\u4e2d\\u6587\",\"emoji\":\"\\ud83d\\ude00\"}";
+        JsonValue doc = JsonValue.Parse(unicode);
+        JsonValue lenient = JsonValue.ParseLenient(unicode);
+        JsonValue malformed = JsonValue.ParseLenient("{\"s\":\"\\u12\"}");
+        JsonValue repeated = JsonValue.ParseLenient("{\"\\u0078\":[\"first\\n\",\"second\\t\"],\"x\":[\"later\"]}");
+        JsonValue first = repeated.Get("x");
+        if (repeated.Count() != 2 || first == null || first.Count() != 2
+        || first.At(0).AsString("") != "first\n" || first.At(1).AsString("") != "second\t") {
+            throw new Exception("Lenient parsing changed duplicate keys or reused a returned string buffer");
+        }
+        if (lenient.Str("ascii", "") != doc.Str("ascii", "")
+        || lenient.Str("zh", "") != doc.Str("zh", "")
+        || lenient.Str("emoji", "") != doc.Str("emoji", "")
+        || malformed.Str("s", "") != "u12") {
+            throw new Exception("Unexpected lenient Unicode escape handling");
+        }
         Console.WriteLine("ascii=" + doc.Str("ascii", ""));
         Console.WriteLine("zh=" + doc.Str("zh", ""));
         Console.WriteLine("zh.bytes=" + Program.Hex(doc.Str("zh", "")));

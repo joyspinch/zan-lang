@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Json;
 using System.Text;
 namespace Conf;
@@ -52,8 +53,63 @@ class Program {
         Check(scanned.StrAt(scanned.root, "") == run, "durable tape reused scratch slots");
     }
 
+    static void CheckProperties() {
+        string source = "{\"\\u0069d\":1,\"id\":2,\"child\":{\"x\":3},\"\\u0065\":\"a\\nb\"}";
+        JsonDoc.ParseScoped(source, (doc) => {
+            Check(doc.PathInt("id", -1) == 1, "first duplicate escape key");
+            Check(doc.StrAt(doc.Get("e"), "") == "a\nb", "escaped key and value");
+            int key = doc.FirstProperty(doc.root);
+            Check(doc.PropertyNameView(key).Equals("id"), "decoded property name");
+            key = doc.NextProperty(key);
+            Check(doc.PropertyNameView(key).Equals("id"), "duplicate in source order");
+            Check(doc.IntAt(doc.PropertyValue(key), -1) == 2, "duplicate value");
+            key = doc.NextProperty(key);
+            Check(doc.PropertyNameView(key).Equals("child"), "nested property");
+            key = doc.NextProperty(key);
+            Check(doc.PropertyNameView(key).Equals("e") && doc.NextProperty(key) < 0, "property chain stops at owner");
+        });
+        Check(JsonDoc.Parse(source).PathInt("id", -1) == 1, "owned escape key");
+        Check(Caught("{\"s\":\"bad\\q\"}") == 1, "invalid escape after fast prefix");
+    }
+
+    static void CheckObjectIndex() {
+        string source = "{\"object\":{\"\\u0069d\":1,\"id\":2,\"\":3,\"雪\":4,\"n\\u0000a\":5,\"n\\u0000b\":6,\"a\":7,\"b\":8,\"c\":9,\"d\":10},\"empty\":{}}";
+        JsonDoc.ParseScopedDeferred(source, (doc) => {
+            int at = doc.Get("object");
+            JsonObjectIndex index = doc.IndexObject(at);
+            Check(index != null, "index nested object");
+            for (int p = doc.FirstProperty(at); p >= 0; p = doc.NextProperty(p)) {
+                string key = doc.PropertyName(p);
+                Check(doc.PropertyNameView(p).Equals(key) && index.Get(key) == doc.Get(at, key), "indexed key matches tape");
+            }
+            Check(doc.IntAt(index.Get("id"), -1) == 1, "indexed duplicate finds first value");
+            Check(doc.IntAt(index.Get("n\u0000b"), -1) == 6, "indexed key preserves embedded NUL");
+            Check(index.Get("missing") == -1 && index.Get(null) == -1, "indexed misses");
+            Check(doc.IndexObject(doc.Get("empty")).Get("") == -1, "empty object index");
+            Check(doc.IndexObject(index.Get("id")) == null && doc.IndexObject(-1) == null, "reject non-object slots");
+        });
+    }
+
+    static void CheckIndexCollisions() {
+        // All 33 names hash to the same initial bucket in this 128-bucket table.
+        List<string> keys = "key0025 key0042 key0092 key0115 key0172 key0199 key0247 key0337 key0632 key0643 key0657 key0666 key0685 key0712 key0726 key0775 key0796 key0925 key1018 key1168 key1239 key1322 key1371 key1421 key1681 key1898 key2170 key2181 key2266 key2356 key2382 key2456 key2526".Split(' ');
+        JsonWriter writer = new JsonWriter();
+        writer.WriteStartObject();
+        for (int i = 0; i < keys.Count; i++) { writer.WritePropertyName(keys[i]).WriteInt(i); }
+        writer.WriteEndObject();
+        JsonDoc doc = JsonDoc.Parse(writer.ToString());
+        JsonObjectIndex index = doc.IndexObject(doc.root);
+        for (int i = 0; i < keys.Count; i++) {
+            Check(doc.IntAt(index.Get(keys[i]), -1) == i, "collision index returns the right value");
+        }
+        Check(index.Get("missing") == -1, "collision index miss");
+    }
+
     static void Main() {
         CheckSliceBounds();
+        CheckProperties();
+        CheckObjectIndex();
+        CheckIndexCollisions();
         // a"b\c<newline><tab>你好
         string src = "{\"s\":\"a\\\"b\\\\c\n\t\u4F60\u597D\",\"i\":42,\"neg\":-17,\"big\":9007199254740993,\"f\":3.5,\"e\":1e3,\"t\":true,\"fa\":false,\"nul\":null,\"arr\":[1,[2,3],{\"k\":\"v\"},[],{}],\"obj\":{\"a\":{\"b\":{\"c\":1}}}}";
         JsonDoc doc = JsonDoc.Parse(src);

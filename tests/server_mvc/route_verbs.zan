@@ -14,6 +14,39 @@ class VerbProbeController : Controller {
     public void Create() { this.Ctx().Text("POST action"); }
 }
 
+[Route("/route-options/{id}")]
+[Description("Route options; configured at class level")]
+[Custom(Authorization = CustomAuthorization.Grant, ApiMax = 12, Lock = "user", Upload = true,
+    IsMenu = true, Group = "Routing", GroupOrder = 3, Order = 4, Icon = "mdi:routes", Component = "RoutePanel")]
+class RouteOptionsController : Controller {
+    [Custom(Perm = System.Web.PermBit.View)]
+    public void Index(int id) { this.Ctx().Text(Convert.ToString(id)); }
+
+    [HttpPatch]
+    [Description("Method settings")]
+    [Custom(Authorization = CustomAuthorization.Login, ApiMax = 5, Upload = false, Group = "Actions")]
+    [Lock("global")]
+    public void Update() { this.Ctx().Text("updated"); }
+
+    [HttpGet]
+    [Custom(ApiMax = 0, Lock = "")]
+    public void ClearDefaults() { this.Ctx().Text("defaults cleared"); }
+}
+
+[Route("/bindings")]
+class RouteBindingsController : Controller {
+    [HttpGet]
+    [Route("read/{id:long}/{ratio:double}")]
+    public static void Read(HttpContext ctx, long id, double ratio, int count, bool active) {
+        ctx.Text(Convert.ToString(id) + "/" + Convert.ToString(ratio) + "/"
+            + Convert.ToString(count) + "/" + (active ? "true" : "false"));
+    }
+
+    [HttpGet]
+    [Route("landing")]
+    public void Index() { this.Ctx().Text("landing"); }
+}
+
 class Program {
     static int failures;
     static void Check(bool ok, string label) {
@@ -38,6 +71,65 @@ class Program {
             Program.Check(app.Router().Match(wrong) == null, verb + " is not aliased to POST");
         }
     }
+    static void CheckPathParam(Route route, int index, string name, string type) {
+        List<ApiParam> parameters = route.DocParams();
+        if (index >= parameters.Count) {
+            Program.Check(false, "path parameter exists " + name);
+            return;
+        }
+        ApiParam param = parameters[index];
+        Program.Check(param.Name() == name && param.Type() == type && param.Source() == "path"
+            && param.Required() && param.Default() == "", "path parameter metadata " + name);
+    }
+    static void CheckRouteOptions(WebApp app) {
+        Route primary = app.Router().Match(Program.Ctx("GET", "/route-options/42"));
+        Route alias = app.Router().Match(Program.Ctx("GET", "/route-options/42/index"));
+        Program.Check(primary != null && alias != null, "conventional Index and alias are registered");
+        if (primary == null || alias == null) { return; }
+        Program.Check(primary.Action() == alias.Action() && primary.Key() == alias.Key()
+            && primary.Idx() != alias.Idx(), "Index alias shares policy identity and has its own route index");
+        Program.Check(primary.InMenu() && !alias.InMenu(), "Index appears once in navigation");
+        Program.Check(primary.GetTitle() == "Route options; configured at class level"
+            && alias.GetTitle() == primary.GetTitle(), "class description and alias title");
+        Program.Check(primary.NeedsAuth() && alias.NeedsAuth() && primary.NeedsLogin() && alias.NeedsLogin()
+            && primary.MetaGet("Perm") == "View" && alias.MetaGet("Perm") == "View", "Index authorization and permission");
+        Program.Check(primary.RateLimit() == 12 && alias.RateLimit() == 12
+            && primary.LockScope() == "user" && alias.LockScope() == "user"
+            && primary.StreamUpload() && alias.StreamUpload(), "Index request policies");
+        Program.Check(alias.MetaGet("Group") == "Routing" && alias.MetaGet("GroupOrder") == "3"
+            && alias.MetaGet("Order") == "4" && alias.MetaGet("Icon") == "mdi:routes"
+            && alias.MetaGet("Component") == "RoutePanel", "Index metadata inherited by alias");
+        Program.CheckPathParam(primary, 0, "id", "int");
+        Program.CheckPathParam(alias, 0, "id", "int");
+
+        Route update = app.Router().Match(Program.Ctx("PATCH", "/route-options/42/update"));
+        Program.Check(update != null && update.GetTitle() == "Method settings"
+            && update.NeedsLogin() && !update.NeedsAuth() && update.RateLimit() == 5
+            && update.LockScope() == "global" && !update.StreamUpload() && !update.InMenu()
+            && update.MetaGet("Group") == "Actions" && update.MetaGet("GroupOrder") == "3",
+            "method settings override individual class defaults");
+        Route cleared = app.Router().Match(Program.Ctx("GET", "/route-options/42/cleardefaults"));
+        Program.Check(cleared != null && cleared.RateLimit() == 0 && cleared.LockScope() == "",
+            "explicit values clear inherited limit and lock");
+    }
+    static async void CheckBindings(WebApp app) {
+        HttpContext ctx = Program.Ctx("GET", "/bindings/read/4294967296/1.5?count=7&active=yes");
+        Route route = app.Router().Match(ctx);
+        Program.Check(route != null, "typed route matches");
+        if (route != null) {
+            Program.Check(route.Pattern() == "/bindings/read/{id}/{ratio}" && ctx.Param("id") == "4294967296"
+                && ctx.Param("ratio") == "1.5", "typed placeholders use their parameter names");
+            Program.CheckPathParam(route, 0, "id", "long");
+            Program.CheckPathParam(route, 1, "ratio", "number");
+            ctx.SetRoute(route.Action(), route.Pattern(), route.Idx());
+            HttpHandler handler = route.Handler();
+            await handler(ctx);
+            Program.Check(ctx.BuildResponse(false).Contains("4294967296/1.5/7/true"), "static action receives typed inputs");
+        }
+        Program.Check(app.Router().Match(Program.Ctx("GET", "/bindings/landing")) != null
+            && app.Router().Match(Program.Ctx("GET", "/bindings/landing/index")) == null,
+            "explicit Index only uses its declared route");
+    }
     static async void Main() {
         WebApp app = new WebApp("127.0.0.1", 0);
         MvcRoutes.Register(app);
@@ -45,6 +137,8 @@ class Program {
         await Program.Action(app, "PATCH", "/verbs/update", "PATCH action");
         await Program.Action(app, "DELETE", "/verbs/remove", "DELETE action");
         await Program.Action(app, "POST", "/verbs/create", "POST action");
+        Program.CheckRouteOptions(app);
+        await Program.CheckBindings(app);
         Console.WriteLine("failures=" + Convert.ToString(Program.failures));
         if (Program.failures != 0) { throw new Exception("attribute verb regression"); }
     }

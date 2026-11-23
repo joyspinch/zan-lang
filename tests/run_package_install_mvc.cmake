@@ -69,6 +69,30 @@ execute_process(COMMAND "${WORK}/project/automatic.exe"
 if(NOT _rc EQUAL 0 OR NOT _out STREQUAL "installed\n")
   message(FATAL_ERROR "installed MVC automatic namespace import did not run (${_rc}): ${_out}${_err}")
 endif()
+# Exercise the installed package through both stages of the MVC build wrapper.
+get_filename_component(_tool_dir "${ZANC}" DIRECTORY)
+get_filename_component(_tool_ext "${ZANC}" LAST_EXT)
+set(_mvc_tool "${_tool_dir}/zan-mvc${_tool_ext}")
+file(MAKE_DIRECTORY "${WORK}/project/args")
+file(WRITE "${WORK}/project/src/response probe.zan"
+  "using System; using System.Web; class Program { static void Main() { MvcRoutes.Register(new WebApp(\"127.0.0.1\", 0)); Console.WriteLine(\"mvc-response\"); } }\n")
+string(ASCII 239 187 191 _bom)
+file(WRITE "${WORK}/project/args/outer.rsp"
+  "${_bom}# -o ignored.exe\n\"src/response probe.zan\" -o zan.proj/ignored.exe @\"output flags.rsp\"\n")
+file(WRITE "${WORK}/project/output flags.rsp" "-o \"response output.exe\"\n")
+execute_process(
+  COMMAND "${_mvc_tool}" "${ZANC}" app -o zan.proj/ignored-cli.exe @args/outer.rsp ${_stdlib_args}
+  WORKING_DIRECTORY "${WORK}/project"
+  RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT "${_rc}" STREQUAL "0" OR NOT EXISTS "${WORK}/project/response output.exe")
+  message(FATAL_ERROR "MVC response-file output build failed (${_rc}): ${_out}${_err}")
+endif()
+execute_process(COMMAND "${WORK}/project/response output.exe"
+  RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT "${_rc}" STREQUAL "0" OR NOT _out STREQUAL "mvc-response\n")
+  message(FATAL_ERROR "MVC response-file output did not run (${_rc}): ${_out}${_err}")
+endif()
+
 # A sibling package can provide the same namespace without making MVC's
 # physical Framework/Ai directory invisible or repeating the same source.
 file(WRITE "${WORK}/shadow/zan.pkg" "name = \"Shadow\"\nversion = \"1.0.0\"\n")

@@ -29,19 +29,20 @@ typedef pthread_t thread_t;
 static int checks;
 static int failures;
 
-#define CHECK(cond, ...) do {                                                \
-    checks++;                                                                \
-    if (!(cond)) {                                                           \
-        failures++;                                                          \
-        fprintf(stderr, "FAIL: ");                                           \
-        fprintf(stderr, __VA_ARGS__);                                        \
-        fprintf(stderr, "\n");                                               \
-    }                                                                        \
-} while (0)
+#define CHECK(cond, ...)                                                       \
+  do {                                                                         \
+    checks++;                                                                  \
+    if (!(cond)) {                                                             \
+      failures++;                                                              \
+      fprintf(stderr, "FAIL: ");                                               \
+      fprintf(stderr, __VA_ARGS__);                                            \
+      fprintf(stderr, "\n");                                                   \
+    }                                                                          \
+  } while (0)
 
 typedef struct {
-    int64_t atomic;
-    int iterations;
+  int64_t atomic;
+  int iterations;
 } atomic_worker_args;
 
 #ifdef _WIN32
@@ -49,66 +50,67 @@ static DWORD WINAPI atomic_worker(LPVOID arg) {
 #else
 static void *atomic_worker(void *arg) {
 #endif
-    atomic_worker_args *args = (atomic_worker_args *)arg;
-    for (int i = 0; i < args->iterations; i++) {
-        zan_atomic_int_add(args->atomic, 1);
-    }
-    return 0;
+  atomic_worker_args *args = (atomic_worker_args *)arg;
+  for (int i = 0; i < args->iterations; i++) {
+    zan_atomic_int_add(args->atomic, 1);
+  }
+  return 0;
 }
 
 static void test_atomic_int(void) {
-    int64_t atomic = zan_atomic_int_create(0);
-    CHECK(atomic != 0, "could not create atomic integer");
-    if (!atomic) return;
+  int64_t atomic = zan_atomic_int_create(0);
+  CHECK(atomic != 0, "could not create atomic integer");
+  if (!atomic)
+    return;
 
-    enum { THREAD_COUNT = 4, ITERATIONS = 10000 };
-    atomic_worker_args args = {atomic, ITERATIONS};
-    thread_t threads[THREAD_COUNT];
-    memset(threads, 0, sizeof(threads));
-    for (int i = 0; i < THREAD_COUNT; i++) {
+  enum { THREAD_COUNT = 4, ITERATIONS = 10000 };
+  atomic_worker_args args = {atomic, ITERATIONS};
+  thread_t threads[THREAD_COUNT];
+  memset(threads, 0, sizeof(threads));
+  for (int i = 0; i < THREAD_COUNT; i++) {
 #ifdef _WIN32
-        threads[i] = CreateThread(NULL, 0, atomic_worker, &args, 0, NULL);
+    threads[i] = CreateThread(NULL, 0, atomic_worker, &args, 0, NULL);
 #else
-        pthread_create(&threads[i], NULL, atomic_worker, &args);
+    pthread_create(&threads[i], NULL, atomic_worker, &args);
 #endif
-    }
-    for (int i = 0; i < THREAD_COUNT; i++) {
+  }
+  for (int i = 0; i < THREAD_COUNT; i++) {
 #ifdef _WIN32
-        if (threads[i]) {
-            WaitForSingleObject(threads[i], INFINITE);
-            CloseHandle(threads[i]);
-        }
-#else
-        pthread_join(threads[i], NULL);
-#endif
+    if (threads[i]) {
+      WaitForSingleObject(threads[i], INFINITE);
+      CloseHandle(threads[i]);
     }
+#else
+    pthread_join(threads[i], NULL);
+#endif
+  }
 
-    CHECK(zan_atomic_int_load(atomic) == THREAD_COUNT * ITERATIONS,
-          "atomic add lost updates");
-    CHECK(zan_atomic_int_exchange(atomic, 7) == THREAD_COUNT * ITERATIONS,
-          "atomic exchange returned wrong previous value");
-    CHECK(zan_atomic_int_compare_exchange(atomic, 7, 11) == 7,
-          "successful compare-exchange returned wrong previous value");
-    CHECK(zan_atomic_int_load(atomic) == 11,
-          "successful compare-exchange did not update value");
-    CHECK(zan_atomic_int_compare_exchange(atomic, 7, 13) == 11,
-          "failed compare-exchange returned wrong observed value");
-    zan_atomic_int_store(atomic, 23);
-    CHECK(zan_atomic_int_load(atomic) == 23, "atomic store failed");
-    zan_atomic_int_destroy(atomic);
+  CHECK(zan_atomic_int_load(atomic) == THREAD_COUNT * ITERATIONS,
+        "atomic add lost updates");
+  CHECK(zan_atomic_int_exchange(atomic, 7) == THREAD_COUNT * ITERATIONS,
+        "atomic exchange returned wrong previous value");
+  CHECK(zan_atomic_int_compare_exchange(atomic, 7, 11) == 7,
+        "successful compare-exchange returned wrong previous value");
+  CHECK(zan_atomic_int_load(atomic) == 11,
+        "successful compare-exchange did not update value");
+  CHECK(zan_atomic_int_compare_exchange(atomic, 7, 13) == 11,
+        "failed compare-exchange returned wrong observed value");
+  zan_atomic_int_store(atomic, 23);
+  CHECK(zan_atomic_int_load(atomic) == 23, "atomic store failed");
+  zan_atomic_int_destroy(atomic);
 }
 
 typedef struct {
-    void *obj;
-    volatile int *counter;
-    int iterations;
+  void *obj;
+  volatile int *counter;
+  int iterations;
 } monitor_worker_args;
 
 typedef struct {
-    void *o1;
-    void *o2;
-    volatile int *counter;
-    int iterations;
+  void *o1;
+  void *o2;
+  volatile int *counter;
+  int iterations;
 } nested_monitor_worker_args;
 
 #ifdef _WIN32
@@ -116,13 +118,13 @@ static DWORD WINAPI monitor_worker(LPVOID arg) {
 #else
 static void *monitor_worker(void *arg) {
 #endif
-    monitor_worker_args *m = (monitor_worker_args *)arg;
-    for (int i = 0; i < m->iterations; i++) {
-        zan_monitor_enter(m->obj);
-        (*m->counter)++;
-        zan_monitor_exit(m->obj);
-    }
-    return 0;
+  monitor_worker_args *m = (monitor_worker_args *)arg;
+  for (int i = 0; i < m->iterations; i++) {
+    zan_monitor_enter(m->obj);
+    (*m->counter)++;
+    zan_monitor_exit(m->obj);
+  }
+  return 0;
 }
 
 #ifdef _WIN32
@@ -130,87 +132,88 @@ static DWORD WINAPI nested_monitor_worker(LPVOID arg) {
 #else
 static void *nested_monitor_worker(void *arg) {
 #endif
-    nested_monitor_worker_args *m = (nested_monitor_worker_args *)arg;
-    for (int i = 0; i < m->iterations; i++) {
-        zan_monitor_enter(m->o1);
-        zan_monitor_enter(m->o2);
-        (*m->counter)++;
-        zan_monitor_exit(m->o2);
-        zan_monitor_exit(m->o1);
-    }
-    return 0;
+  nested_monitor_worker_args *m = (nested_monitor_worker_args *)arg;
+  for (int i = 0; i < m->iterations; i++) {
+    zan_monitor_enter(m->o1);
+    zan_monitor_enter(m->o2);
+    (*m->counter)++;
+    zan_monitor_exit(m->o2);
+    zan_monitor_exit(m->o1);
+  }
+  return 0;
 }
 
 static void test_monitor(void) {
-    int dummy_obj = 42;
-    zan_monitor_enter(&dummy_obj);
-    zan_monitor_enter(&dummy_obj);
-    zan_monitor_exit(&dummy_obj);
-    zan_monitor_exit(&dummy_obj);
-    CHECK(1, "recursive monitor enter/exit succeeded");
+  int dummy_obj = 42;
+  zan_monitor_enter(&dummy_obj);
+  zan_monitor_enter(&dummy_obj);
+  zan_monitor_exit(&dummy_obj);
+  zan_monitor_exit(&dummy_obj);
+  CHECK(1, "recursive monitor enter/exit succeeded");
 
-    enum { M_THREADS = 4, M_ITERS = 10000 };
-    volatile int counter = 0;
-    monitor_worker_args margs = {&dummy_obj, &counter, M_ITERS};
-    thread_t threads[M_THREADS];
-    memset(threads, 0, sizeof(threads));
-    for (int i = 0; i < M_THREADS; i++) {
+  enum { M_THREADS = 4, M_ITERS = 10000 };
+  volatile int counter = 0;
+  monitor_worker_args margs = {&dummy_obj, &counter, M_ITERS};
+  thread_t threads[M_THREADS];
+  memset(threads, 0, sizeof(threads));
+  for (int i = 0; i < M_THREADS; i++) {
 #ifdef _WIN32
-        threads[i] = CreateThread(NULL, 0, monitor_worker, &margs, 0, NULL);
+    threads[i] = CreateThread(NULL, 0, monitor_worker, &margs, 0, NULL);
 #else
-        pthread_create(&threads[i], NULL, monitor_worker, &margs);
+    pthread_create(&threads[i], NULL, monitor_worker, &margs);
 #endif
-    }
-    for (int i = 0; i < M_THREADS; i++) {
+  }
+  for (int i = 0; i < M_THREADS; i++) {
 #ifdef _WIN32
-        if (threads[i]) {
-            WaitForSingleObject(threads[i], INFINITE);
-            CloseHandle(threads[i]);
-        }
-#else
-        pthread_join(threads[i], NULL);
-#endif
+    if (threads[i]) {
+      WaitForSingleObject(threads[i], INFINITE);
+      CloseHandle(threads[i]);
     }
-    CHECK(counter == M_THREADS * M_ITERS,
-          "striped monitor failed mutual exclusion: counter=%d expected=%d",
-          counter, M_THREADS * M_ITERS);
+#else
+    pthread_join(threads[i], NULL);
+#endif
+  }
+  CHECK(counter == M_THREADS * M_ITERS,
+        "striped monitor failed mutual exclusion: counter=%d expected=%d",
+        counter, M_THREADS * M_ITERS);
 
-    int obj1 = 1, obj2 = 2;
-    zan_monitor_enter(&obj1);
-    zan_monitor_enter(&obj2);
-    zan_monitor_exit(&obj2);
-    zan_monitor_exit(&obj1);
-    CHECK(1, "nested monitor enter/exit succeeded");
+  int obj1 = 1, obj2 = 2;
+  zan_monitor_enter(&obj1);
+  zan_monitor_enter(&obj2);
+  zan_monitor_exit(&obj2);
+  zan_monitor_exit(&obj1);
+  CHECK(1, "nested monitor enter/exit succeeded");
 
-    enum { N_THREADS = 4, N_ITERS = 5000 };
-    volatile int ncounter = 0;
-    nested_monitor_worker_args nargs = {&obj1, &obj2, &ncounter, N_ITERS};
-    thread_t nthreads[N_THREADS];
-    memset(nthreads, 0, sizeof(nthreads));
-    for (int i = 0; i < N_THREADS; i++) {
+  enum { N_THREADS = 4, N_ITERS = 5000 };
+  volatile int ncounter = 0;
+  nested_monitor_worker_args nargs = {&obj1, &obj2, &ncounter, N_ITERS};
+  thread_t nthreads[N_THREADS];
+  memset(nthreads, 0, sizeof(nthreads));
+  for (int i = 0; i < N_THREADS; i++) {
 #ifdef _WIN32
-        nthreads[i] = CreateThread(NULL, 0, nested_monitor_worker, &nargs, 0, NULL);
+    nthreads[i] = CreateThread(NULL, 0, nested_monitor_worker, &nargs, 0, NULL);
 #else
-        pthread_create(&nthreads[i], NULL, nested_monitor_worker, &nargs);
+    pthread_create(&nthreads[i], NULL, nested_monitor_worker, &nargs);
 #endif
-    }
-    for (int i = 0; i < N_THREADS; i++) {
+  }
+  for (int i = 0; i < N_THREADS; i++) {
 #ifdef _WIN32
-        if (nthreads[i]) {
-            WaitForSingleObject(nthreads[i], INFINITE);
-            CloseHandle(nthreads[i]);
-        }
-#else
-        pthread_join(nthreads[i], NULL);
-#endif
+    if (nthreads[i]) {
+      WaitForSingleObject(nthreads[i], INFINITE);
+      CloseHandle(nthreads[i]);
     }
-    CHECK(ncounter == N_THREADS * N_ITERS,
-          "concurrent nested monitor failed: counter=%d expected=%d",
-          ncounter, N_THREADS * N_ITERS);
+#else
+    pthread_join(nthreads[i], NULL);
+#endif
+  }
+  CHECK(ncounter == N_THREADS * N_ITERS,
+        "concurrent nested monitor failed: counter=%d expected=%d", ncounter,
+        N_THREADS * N_ITERS);
 
-    zan_ui_thread_set();
-    CHECK(zan_ui_thread_check() == 1, "UI thread check should succeed on registered UI thread");
-    zan_ui_thread_assert("test on UI thread");
+  zan_ui_thread_set();
+  CHECK(zan_ui_thread_check() == 1,
+        "UI thread check should succeed on registered UI thread");
+  zan_ui_thread_assert("test on UI thread");
 }
 
 static const int64_t shared_policy_now = INT64_C(4102444800000);
@@ -218,418 +221,432 @@ static const int64_t shared_policy_now = INT64_C(4102444800000);
 enum { SHARED_WORKER_ITERATIONS = 1000, SHARED_RATE_LIMIT = 1500 };
 
 static int shared_table_worker(int64_t table, int64_t owner) {
-    zan_shared_table_increment(table, "workers", "ready", 1);
-    int64_t deadline = zan_monotonic_us() + 5000000;
-    while (zan_shared_table_get_int(table, "workers", "ready") < 2) {
-        if (zan_monotonic_us() >= deadline) return 0;
+  zan_shared_table_increment(table, "workers", "ready", 1);
+  int64_t deadline = zan_monotonic_us() + 5000000;
+  while (zan_shared_table_get_int(table, "workers", "ready") < 2) {
+    if (zan_monotonic_us() >= deadline)
+      return 0;
 #ifdef _WIN32
-        Sleep(1);
+    Sleep(1);
 #else
-        const struct timespec pause = {0, 1000000};
-        nanosleep(&pause, NULL);
+    const struct timespec pause = {0, 1000000};
+    nanosleep(&pause, NULL);
 #endif
-    }
+  }
 
-    int acquired = zan_shared_table_lock_acquire(
-        table, "cross-lease", owner, shared_policy_now, 1000);
-    zan_shared_table_increment(table, "workers", "acquired", acquired);
-    int64_t allowed = 0;
-    for (int i = 0; i < SHARED_WORKER_ITERATIONS; i++) {
-        zan_shared_table_increment(table, "workers", "count", 1);
-        allowed += zan_shared_table_rate_allow(
-            table, "cross-rate", shared_policy_now, 1000, SHARED_RATE_LIMIT);
-    }
-    zan_shared_table_increment(table, "workers", "admitted", allowed);
-    return 1;
+  int acquired = zan_shared_table_lock_acquire(table, "cross-lease", owner,
+                                               shared_policy_now, 1000);
+  zan_shared_table_increment(table, "workers", "acquired", acquired);
+  int64_t allowed = 0;
+  for (int i = 0; i < SHARED_WORKER_ITERATIONS; i++) {
+    zan_shared_table_increment(table, "workers", "count", 1);
+    allowed += zan_shared_table_rate_allow(
+        table, "cross-rate", shared_policy_now, 1000, SHARED_RATE_LIMIT);
+  }
+  zan_shared_table_increment(table, "workers", "admitted", allowed);
+  return 1;
 }
 
 static int shared_table_child(const char *name) {
-    int64_t table = zan_shared_table_open(name);
-    if (!table) return 2;
-    int ready = shared_table_worker(table, 22);
-    zan_shared_table_set_float(table, "workers", "load", 2.5);
-    zan_shared_table_set_string(table, "workers", "label", "child");
-    zan_shared_table_close(table);
-    return ready ? 0 : 3;
+  int64_t table = zan_shared_table_open(name);
+  if (!table)
+    return 2;
+  int ready = shared_table_worker(table, 22);
+  zan_shared_table_set_float(table, "workers", "load", 2.5);
+  zan_shared_table_set_string(table, "workers", "label", "child");
+  zan_shared_table_close(table);
+  return ready ? 0 : 3;
 }
 
 static void test_shared_table(void) {
-    char name[96];
+  char name[96];
 #ifdef _WIN32
-    snprintf(name, sizeof(name), "rt_sync_%lu_%lld",
-             (unsigned long)GetCurrentProcessId(), (long long)time(NULL));
+  snprintf(name, sizeof(name), "rt_sync_%lu_%lld",
+           (unsigned long)GetCurrentProcessId(), (long long)time(NULL));
 #else
-    snprintf(name, sizeof(name), "rt_sync_%ld_%lld",
-             (long)getpid(), (long long)time(NULL));
+  snprintf(name, sizeof(name), "rt_sync_%ld_%lld", (long)getpid(),
+           (long long)time(NULL));
 #endif
-    int64_t table = zan_shared_table_create(
-        name, 64, 32,
-        "i:count;i:window_start;i:owner;i:ready;i:admitted;i:acquired;f:load;s:32:label;");
-    CHECK(table != 0, "could not create shared table");
-    if (!table) return;
+  int64_t table =
+      zan_shared_table_create(name, 64, 32,
+                              "i:count;i:window_start;i:owner;i:ready;i:"
+                              "admitted;i:acquired;f:load;s:32:label;");
+  CHECK(table != 0, "could not create shared table");
+  if (!table)
+    return;
 
-    CHECK(zan_shared_table_set_int(table, "workers", "count", 0) == 1,
-          "could not set integer column");
-    CHECK(zan_shared_table_set_float(table, "workers", "load", 1.25) == 1,
-          "could not set float column");
-    CHECK(zan_shared_table_set_string(table, "workers", "label", "parent") == 1,
-          "could not set string column");
-    CHECK(zan_shared_table_exists(table, "workers") == 1,
-          "inserted row is missing");
-    CHECK(zan_shared_table_count(table) == 1, "shared table count is wrong");
+  CHECK(zan_shared_table_set_int(table, "workers", "count", 0) == 1,
+        "could not set integer column");
+  CHECK(zan_shared_table_set_float(table, "workers", "load", 1.25) == 1,
+        "could not set float column");
+  CHECK(zan_shared_table_set_string(table, "workers", "label", "parent") == 1,
+        "could not set string column");
+  CHECK(zan_shared_table_exists(table, "workers") == 1,
+        "inserted row is missing");
+  CHECK(zan_shared_table_count(table) == 1, "shared table count is wrong");
 
-    int child_status = -1;
+  int child_status = -1;
 #ifdef _WIN32
-    char executable[MAX_PATH];
-    char command[512];
-    STARTUPINFOA startup;
-    PROCESS_INFORMATION process;
-    memset(&startup, 0, sizeof(startup));
-    memset(&process, 0, sizeof(process));
-    startup.cb = sizeof(startup);
-    GetModuleFileNameA(NULL, executable, MAX_PATH);
-    snprintf(command, sizeof(command), "\"%s\" --shared-child %s", executable, name);
-    if (CreateProcessA(
-            NULL, command, NULL, NULL, FALSE, 0, NULL, NULL,
-            &startup, &process)) {
-        CHECK(shared_table_worker(table, 11), "shared-table workers did not rendezvous");
-        WaitForSingleObject(process.hProcess, INFINITE);
-        DWORD exit_code = 1;
-        GetExitCodeProcess(process.hProcess, &exit_code);
-        child_status = (int)exit_code;
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-    }
+  char executable[MAX_PATH];
+  char command[512];
+  STARTUPINFOA startup;
+  PROCESS_INFORMATION process;
+  memset(&startup, 0, sizeof(startup));
+  memset(&process, 0, sizeof(process));
+  startup.cb = sizeof(startup);
+  GetModuleFileNameA(NULL, executable, MAX_PATH);
+  snprintf(command, sizeof(command), "\"%s\" --shared-child %s", executable,
+           name);
+  if (CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup,
+                     &process)) {
+    CHECK(shared_table_worker(table, 11),
+          "shared-table workers did not rendezvous");
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    child_status = (int)exit_code;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+  }
 #else
-    pid_t child = fork();
-    if (child == 0) {
-        _exit(shared_table_child(name));
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(shared_table_child(name));
+  }
+  if (child > 0) {
+    CHECK(shared_table_worker(table, 11),
+          "shared-table workers did not rendezvous");
+    int status = 0;
+    if (waitpid(child, &status, 0) == child && WIFEXITED(status)) {
+      child_status = WEXITSTATUS(status);
     }
-    if (child > 0) {
-        CHECK(shared_table_worker(table, 11), "shared-table workers did not rendezvous");
-        int status = 0;
-        if (waitpid(child, &status, 0) == child && WIFEXITED(status)) {
-            child_status = WEXITSTATUS(status);
-        }
-    }
+  }
 #endif
 
-    CHECK(child_status == 0, "shared-table child failed: %d", child_status);
-    CHECK(zan_shared_table_get_int(table, "workers", "count") ==
-              2 * SHARED_WORKER_ITERATIONS,
-          "cross-process increments were not atomic");
-    CHECK(zan_shared_table_get_int(table, "workers", "admitted") == SHARED_RATE_LIMIT,
-          "processes did not share one rate limit");
-    CHECK(zan_shared_table_get_int(table, "cross-rate", "count") == SHARED_RATE_LIMIT,
-          "rate limit and stored count disagree across processes");
-    CHECK(zan_shared_table_get_int(table, "workers", "acquired") == 1,
-          "processes did not share exclusive lease ownership");
-    int64_t owner = zan_shared_table_get_int(table, "cross-lease", "owner");
-    CHECK(owner == 11 || owner == 22, "cross-process lease owner is missing");
-    int64_t other_owner = owner == 11 ? 22 : 11;
-    CHECK(zan_shared_table_lock_release(table, "cross-lease", other_owner) == 0,
-          "cross-process lease released by the losing owner");
-    CHECK(zan_shared_table_lock_release(table, "cross-lease", owner) == 1,
-          "cross-process lease could not be released by its owner");
-    CHECK(zan_shared_table_delete(table, "cross-rate") == 1,
-          "could not delete cross-process rate row");
-    CHECK(zan_shared_table_get_float(table, "workers", "load") == 2.5,
-          "cross-process float update was not visible");
-    CHECK(strcmp(
-              zan_shared_table_get_string(table, "workers", "label"),
-              "child") == 0,
-          "cross-process string update was not visible");
+  CHECK(child_status == 0, "shared-table child failed: %d", child_status);
+  CHECK(zan_shared_table_get_int(table, "workers", "count") ==
+            2 * SHARED_WORKER_ITERATIONS,
+        "cross-process increments were not atomic");
+  CHECK(zan_shared_table_get_int(table, "workers", "admitted") ==
+            SHARED_RATE_LIMIT,
+        "processes did not share one rate limit");
+  CHECK(zan_shared_table_get_int(table, "cross-rate", "count") ==
+            SHARED_RATE_LIMIT,
+        "rate limit and stored count disagree across processes");
+  CHECK(zan_shared_table_get_int(table, "workers", "acquired") == 1,
+        "processes did not share exclusive lease ownership");
+  int64_t owner = zan_shared_table_get_int(table, "cross-lease", "owner");
+  CHECK(owner == 11 || owner == 22, "cross-process lease owner is missing");
+  int64_t other_owner = owner == 11 ? 22 : 11;
+  CHECK(zan_shared_table_lock_release(table, "cross-lease", other_owner) == 0,
+        "cross-process lease released by the losing owner");
+  CHECK(zan_shared_table_lock_release(table, "cross-lease", owner) == 1,
+        "cross-process lease could not be released by its owner");
+  CHECK(zan_shared_table_delete(table, "cross-rate") == 1,
+        "could not delete cross-process rate row");
+  CHECK(zan_shared_table_get_float(table, "workers", "load") == 2.5,
+        "cross-process float update was not visible");
+  CHECK(strcmp(zan_shared_table_get_string(table, "workers", "label"),
+               "child") == 0,
+        "cross-process string update was not visible");
 
-    int64_t expiry_base = shared_policy_now;
-    CHECK(zan_shared_table_set_int(table, "ttl-a", "count", 1) == 1,
-          "could not create first expiring row");
-    CHECK(zan_shared_table_set_int(table, "ttl-b", "count", 2) == 1,
-          "could not create second expiring row");
-    CHECK(zan_shared_table_expire_at(table, "ttl-a", expiry_base + 2000) == 1,
-          "could not set first expiration");
-    CHECK(zan_shared_table_expire_at(table, "ttl-b", expiry_base + 1000) == 1,
-          "could not set earlier expiration");
-    CHECK(zan_shared_table_expires_at(table, "ttl-a") == expiry_base + 2000,
-          "expiration timestamp was not retained");
-    CHECK(zan_shared_table_purge_expired(table, expiry_base + 999) == 0,
-          "row expired before its deadline");
-    CHECK(zan_shared_table_purge_expired(table, expiry_base + 1000) == 1,
-          "heap did not remove its earliest row");
-    CHECK(zan_shared_table_exists(table, "ttl-b") == 0,
-          "expired row remains visible");
-    CHECK(zan_shared_table_exists(table, "ttl-a") == 1,
-          "later row was removed with heap root");
-    CHECK(zan_shared_table_expire_at(table, "ttl-a", 0) == 1,
-          "persist could not remove row from expiration heap");
-    CHECK(zan_shared_table_purge_expired(table, expiry_base + 3000) == 0,
-          "persisted row was removed");
-    CHECK(zan_shared_table_expires_at(table, "ttl-a") == 0,
-          "persisted row still has an expiration");
-    CHECK(zan_shared_table_set_int(table, "ttl-c", "count", 3) == 1,
-          "expired tombstone slot was not reusable");
+  int64_t expiry_base = shared_policy_now;
+  CHECK(zan_shared_table_set_int(table, "ttl-a", "count", 1) == 1,
+        "could not create first expiring row");
+  CHECK(zan_shared_table_set_int(table, "ttl-b", "count", 2) == 1,
+        "could not create second expiring row");
+  CHECK(zan_shared_table_expire_at(table, "ttl-a", expiry_base + 2000) == 1,
+        "could not set first expiration");
+  CHECK(zan_shared_table_expire_at(table, "ttl-b", expiry_base + 1000) == 1,
+        "could not set earlier expiration");
+  CHECK(zan_shared_table_expires_at(table, "ttl-a") == expiry_base + 2000,
+        "expiration timestamp was not retained");
+  CHECK(zan_shared_table_purge_expired(table, expiry_base + 999) == 0,
+        "row expired before its deadline");
+  CHECK(zan_shared_table_purge_expired(table, expiry_base + 1000) == 1,
+        "heap did not remove its earliest row");
+  CHECK(zan_shared_table_exists(table, "ttl-b") == 0,
+        "expired row remains visible");
+  CHECK(zan_shared_table_exists(table, "ttl-a") == 1,
+        "later row was removed with heap root");
+  CHECK(zan_shared_table_expire_at(table, "ttl-a", 0) == 1,
+        "persist could not remove row from expiration heap");
+  CHECK(zan_shared_table_purge_expired(table, expiry_base + 3000) == 0,
+        "persisted row was removed");
+  CHECK(zan_shared_table_expires_at(table, "ttl-a") == 0,
+        "persisted row still has an expiration");
+  CHECK(zan_shared_table_set_int(table, "ttl-c", "count", 3) == 1,
+        "expired tombstone slot was not reusable");
 
-    CHECK(zan_shared_table_rate_allow(
-              table, "rate", expiry_base + 10000, 1000, 2) == 1,
-          "rate limiter rejected first request");
-    CHECK(zan_shared_table_rate_allow(
-              table, "rate", expiry_base + 10500, 1000, 2) == 1,
-          "rate limiter rejected request within limit");
-    CHECK(zan_shared_table_rate_allow(
-              table, "rate", expiry_base + 10999, 1000, 2) == 0,
-          "rate limiter allowed request over limit");
-    CHECK(zan_shared_table_rate_allow(
-              table, "rate", expiry_base + 11000, 1000, 2) == 1,
-          "rate limiter did not reset at window boundary");
+  CHECK(zan_shared_table_rate_allow(table, "rate", expiry_base + 10000, 1000,
+                                    2) == 1,
+        "rate limiter rejected first request");
+  CHECK(zan_shared_table_rate_allow(table, "rate", expiry_base + 10500, 1000,
+                                    2) == 1,
+        "rate limiter rejected request within limit");
+  CHECK(zan_shared_table_rate_allow(table, "rate", expiry_base + 10999, 1000,
+                                    2) == 0,
+        "rate limiter allowed request over limit");
+  CHECK(zan_shared_table_rate_allow(table, "rate", expiry_base + 11000, 1000,
+                                    2) == 1,
+        "rate limiter did not reset at window boundary");
 
-    CHECK(zan_shared_table_lock_acquire(
-              table, "lease", 11, expiry_base + 20000, 1000) == 1,
-          "lease lock could not be acquired");
-    CHECK(zan_shared_table_lock_acquire(
-              table, "lease", 22, expiry_base + 20500, 1000) == 0,
-          "lease lock admitted a second owner");
-    CHECK(zan_shared_table_lock_release(table, "lease", 22) == 0,
-          "lease lock accepted wrong owner release");
-    CHECK(zan_shared_table_lock_release(table, "lease", 11) == 1,
-          "lease lock rejected owner release");
-    CHECK(zan_shared_table_lock_acquire(
-              table, "lease", 22, expiry_base + 21000, 1000) == 1,
-          "released lease lock could not be reacquired");
-    CHECK(zan_shared_table_lock_acquire(
-              table, "lease", 33, expiry_base + 22000, 1000) == 1,
-          "expired lease lock was not reclaimable");
+  CHECK(zan_shared_table_lock_acquire(table, "lease", 11, expiry_base + 20000,
+                                      1000) == 1,
+        "lease lock could not be acquired");
+  CHECK(zan_shared_table_lock_acquire(table, "lease", 22, expiry_base + 20500,
+                                      1000) == 0,
+        "lease lock admitted a second owner");
+  CHECK(zan_shared_table_lock_release(table, "lease", 22) == 0,
+        "lease lock accepted wrong owner release");
+  CHECK(zan_shared_table_lock_release(table, "lease", 11) == 1,
+        "lease lock rejected owner release");
+  CHECK(zan_shared_table_lock_acquire(table, "lease", 22, expiry_base + 21000,
+                                      1000) == 1,
+        "released lease lock could not be reacquired");
+  CHECK(zan_shared_table_lock_acquire(table, "lease", 33, expiry_base + 22000,
+                                      1000) == 1,
+        "expired lease lock was not reclaimable");
 
-    int64_t second = zan_shared_table_open(name);
-    CHECK(second != 0, "could not open second table handle");
-    if (second) {
-        CHECK(zan_shared_table_increment(second, "workers", "count", -1) ==
-                  2 * SHARED_WORKER_ITERATIONS - 1,
-              "second handle could not update shared row");
-        zan_shared_table_close(second);
-    }
-    CHECK(zan_shared_table_delete(table, "workers") == 1,
-          "could not delete shared row");
-    CHECK(zan_shared_table_delete(table, "ttl-a") == 1,
-          "could not delete persisted ttl row");
-    CHECK(zan_shared_table_delete(table, "ttl-c") == 1,
-          "could not delete replacement ttl row");
-    CHECK(zan_shared_table_exists(table, "rate") == 0,
-          "expired rate-limit row was not reclaimed");
-    CHECK(zan_shared_table_lock_release(table, "lease", 33) == 1,
-          "could not release final lease row");
-    CHECK(zan_shared_table_count(table) == 0, "delete did not update count");
-    CHECK(zan_shared_table_destroy(table) == 1, "could not destroy shared table");
-    CHECK(zan_shared_table_open(name) == 0,
-          "destroyed shared table can still be opened");
+  int64_t second = zan_shared_table_open(name);
+  CHECK(second != 0, "could not open second table handle");
+  if (second) {
+    CHECK(zan_shared_table_increment(second, "workers", "count", -1) ==
+              2 * SHARED_WORKER_ITERATIONS - 1,
+          "second handle could not update shared row");
+    zan_shared_table_close(second);
+  }
+  CHECK(zan_shared_table_delete(table, "workers") == 1,
+        "could not delete shared row");
+  CHECK(zan_shared_table_delete(table, "ttl-a") == 1,
+        "could not delete persisted ttl row");
+  CHECK(zan_shared_table_delete(table, "ttl-c") == 1,
+        "could not delete replacement ttl row");
+  CHECK(zan_shared_table_exists(table, "rate") == 0,
+        "expired rate-limit row was not reclaimed");
+  CHECK(zan_shared_table_lock_release(table, "lease", 33) == 1,
+        "could not release final lease row");
+  CHECK(zan_shared_table_count(table) == 0, "delete did not update count");
+  CHECK(zan_shared_table_destroy(table) == 1, "could not destroy shared table");
+  CHECK(zan_shared_table_open(name) == 0,
+        "destroyed shared table can still be opened");
 }
 
 typedef struct {
-    zan_table_edit_action action;
-    int64_t expiry;
-    int calls;
-    int existed;
+  zan_table_edit_action action;
+  int64_t expiry;
+  int calls;
+  int existed;
 } table_edit_probe;
 
-static zan_table_edit_action apply_table_edit(
-    void *context, int exists, int64_t *values, int64_t *expires_at) {
-    table_edit_probe *probe = (table_edit_probe *)context;
-    probe->calls++;
-    probe->existed = exists;
-    values[0] += 3;
-    values[1] += 5;
-    *expires_at = probe->expiry;
-    return probe->action;
+static zan_table_edit_action apply_table_edit(void *context, int exists,
+                                              int64_t *values,
+                                              int64_t *expires_at) {
+  table_edit_probe *probe = (table_edit_probe *)context;
+  probe->calls++;
+  probe->existed = exists;
+  values[0] += 3;
+  values[1] += 5;
+  *expires_at = probe->expiry;
+  return probe->action;
 }
 
 static void test_shared_table_edit(void) {
-    int64_t table = zan_shared_table_create_anon(8, 16, "i:a;i:b;");
-    CHECK(table != 0, "could not create generic row-edit table");
-    if (!table) return;
+  int64_t table = zan_shared_table_create_anon(8, 16, "i:a;i:b;");
+  CHECK(table != 0, "could not create generic row-edit table");
+  if (!table)
+    return;
 
-    const char *const columns[] = {"b", "a"};
-    const char *const duplicate_columns[] = {"a", "a"};
-    const int64_t now = shared_policy_now;
-    const int64_t deadline = now + 1000;
-    table_edit_probe probe = {ZAN_TABLE_EDIT_KEEP, deadline, 0, 0};
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, duplicate_columns, 2,
-                                    apply_table_edit, &probe) == 0 && probe.calls == 0,
-          "duplicate columns invoked the row editor");
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
-                                    apply_table_edit, &probe) == 0 && probe.calls == 1 &&
-              !probe.existed && zan_shared_table_count(table) == 0,
-          "keeping a missing row created it or skipped the callback");
+  const char *const columns[] = {"b", "a"};
+  const char *const duplicate_columns[] = {"a", "a"};
+  const int64_t now = shared_policy_now;
+  const int64_t deadline = now + 1000;
+  table_edit_probe probe = {ZAN_TABLE_EDIT_KEEP, deadline, 0, 0};
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, duplicate_columns, 2,
+                                   apply_table_edit, &probe) == 0 &&
+            probe.calls == 0,
+        "duplicate columns invoked the row editor");
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                   apply_table_edit, &probe) == 0 &&
+            probe.calls == 1 && !probe.existed &&
+            zan_shared_table_count(table) == 0,
+        "keeping a missing row created it or skipped the callback");
 
-    probe.action = ZAN_TABLE_EDIT_WRITE;
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
-                                    apply_table_edit, &probe) == 1 && !probe.existed,
-          "generic row edit did not create a missing row");
-    CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
-              zan_shared_table_get_int(table, "row", "a") == 5 &&
-              zan_shared_table_expires_at(table, "row") == deadline,
-          "generic insert did not store columns in callback order with expiry");
+  probe.action = ZAN_TABLE_EDIT_WRITE;
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                   apply_table_edit, &probe) == 1 &&
+            !probe.existed,
+        "generic row edit did not create a missing row");
+  CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
+            zan_shared_table_get_int(table, "row", "a") == 5 &&
+            zan_shared_table_expires_at(table, "row") == deadline,
+        "generic insert did not store columns in callback order with expiry");
 
-    probe.expiry = -1;
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
-                                    apply_table_edit, &probe) == 0 && probe.existed,
-          "negative expiry was committed");
-    CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
-              zan_shared_table_get_int(table, "row", "a") == 5 &&
-              zan_shared_table_expires_at(table, "row") == deadline,
-          "failed edit changed the row");
+  probe.expiry = -1;
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                   apply_table_edit, &probe) == 0 &&
+            probe.existed,
+        "negative expiry was committed");
+  CHECK(zan_shared_table_get_int(table, "row", "b") == 3 &&
+            zan_shared_table_get_int(table, "row", "a") == 5 &&
+            zan_shared_table_expires_at(table, "row") == deadline,
+        "failed edit changed the row");
 
-    probe.expiry = deadline + 1000;
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
-                                    apply_table_edit, &probe) == 1 && probe.existed,
-          "generic update did not find the existing row");
-    CHECK(zan_shared_table_get_int(table, "row", "b") == 6 &&
-              zan_shared_table_get_int(table, "row", "a") == 10 &&
-              zan_shared_table_expires_at(table, "row") == probe.expiry &&
-              zan_shared_table_purge_expired(table, deadline) == 0,
-          "generic update did not extend expiry along with the values");
+  probe.expiry = deadline + 1000;
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                   apply_table_edit, &probe) == 1 &&
+            probe.existed,
+        "generic update did not find the existing row");
+  CHECK(zan_shared_table_get_int(table, "row", "b") == 6 &&
+            zan_shared_table_get_int(table, "row", "a") == 10 &&
+            zan_shared_table_expires_at(table, "row") == probe.expiry &&
+            zan_shared_table_purge_expired(table, deadline) == 0,
+        "generic update did not extend expiry along with the values");
 
-    probe.action = ZAN_TABLE_EDIT_DELETE;
-    CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
-                                    apply_table_edit, &probe) == 1 && probe.existed &&
-              zan_shared_table_count(table) == 0 &&
-              zan_shared_table_purge_expired(table, probe.expiry) == 0,
-          "generic delete did not remove the row and its expiry");
-    zan_shared_table_close(table);
+  probe.action = ZAN_TABLE_EDIT_DELETE;
+  CHECK(zan_shared_table_edit_ints(table, "row", now, 0, columns, 2,
+                                   apply_table_edit, &probe) == 1 &&
+            probe.existed && zan_shared_table_count(table) == 0 &&
+            zan_shared_table_purge_expired(table, probe.expiry) == 0,
+        "generic delete did not remove the row and its expiry");
+  zan_shared_table_close(table);
 }
 
 static void test_file_handle(void) {
-    char path[160];
+  char path[160];
 #ifdef _WIN32
-    snprintf(path, sizeof(path), "rt_sync_fh_%lu_%lld.tmp",
-             (unsigned long)GetCurrentProcessId(), (long long)time(NULL));
+  snprintf(path, sizeof(path), "rt_sync_fh_%lu_%lld.tmp",
+           (unsigned long)GetCurrentProcessId(), (long long)time(NULL));
 #else
-    snprintf(path, sizeof(path), "rt_sync_fh_%ld_%lld.tmp",
-             (long)getpid(), (long long)time(NULL));
+  snprintf(path, sizeof(path), "rt_sync_fh_%ld_%lld.tmp", (long)getpid(),
+           (long long)time(NULL));
 #endif
 
-    long long h = zan_file_open(path, "w+b");
-    CHECK(h != 0, "could not open scratch file");
-    if (!h) return;
+  long long h = zan_file_open(path, "w+b");
+  CHECK(h != 0, "could not open scratch file");
+  if (!h)
+    return;
 
-    const char *msg = "handle-table";
-    const long long n = (long long)strlen(msg);
-    char buf[32];
-    memset(buf, 0, sizeof(buf));
+  const char *msg = "handle-table";
+  const long long n = (long long)strlen(msg);
+  char buf[32];
+  memset(buf, 0, sizeof(buf));
 
-    CHECK(zan_file_write(h, (long long)(intptr_t)msg, n) == n,
-          "could not write to open handle");
-    CHECK(zan_file_seek(h, 0, 0) == 0, "could not rewind handle");
-    CHECK(zan_file_read(h, (long long)(intptr_t)buf, n) == n,
-          "could not read back from handle");
-    CHECK(memcmp(buf, msg, (size_t)n) == 0, "read-back data mismatch");
-    CHECK(zan_file_tell(h) == n, "tell after read is wrong");
-    CHECK(zan_file_flush(h) == 1, "flush failed on open handle");
+  CHECK(zan_file_write(h, (long long)(intptr_t)msg, n) == n,
+        "could not write to open handle");
+  CHECK(zan_file_seek(h, 0, 0) == 0, "could not rewind handle");
+  CHECK(zan_file_read(h, (long long)(intptr_t)buf, n) == n,
+        "could not read back from handle");
+  CHECK(memcmp(buf, msg, (size_t)n) == 0, "read-back data mismatch");
+  CHECK(zan_file_tell(h) == n, "tell after read is wrong");
+  CHECK(zan_file_flush(h) == 1, "flush failed on open handle");
 
-    CHECK(zan_file_read(12345, (long long)(intptr_t)buf, 4) == 0,
-          "forged handle accepted by read");
-    CHECK(zan_file_write(12345, (long long)(intptr_t)msg, 4) == 0,
-          "forged handle accepted by write");
-    CHECK(zan_file_seek(12345, 0, 0) == -1, "forged handle accepted by seek");
-    CHECK(zan_file_tell(12345) == -1, "forged handle accepted by tell");
-    CHECK(zan_file_flush(12345) == -1, "forged handle accepted by flush");
-    CHECK(zan_file_close(12345) == 0, "forged handle accepted by close");
-    CHECK(zan_file_read(0, (long long)(intptr_t)buf, 4) == 0,
-          "zero handle accepted by read");
+  CHECK(zan_file_read(12345, (long long)(intptr_t)buf, 4) == 0,
+        "forged handle accepted by read");
+  CHECK(zan_file_write(12345, (long long)(intptr_t)msg, 4) == 0,
+        "forged handle accepted by write");
+  CHECK(zan_file_seek(12345, 0, 0) == -1, "forged handle accepted by seek");
+  CHECK(zan_file_tell(12345) == -1, "forged handle accepted by tell");
+  CHECK(zan_file_flush(12345) == -1, "forged handle accepted by flush");
+  CHECK(zan_file_close(12345) == 0, "forged handle accepted by close");
+  CHECK(zan_file_read(0, (long long)(intptr_t)buf, 4) == 0,
+        "zero handle accepted by read");
 
-    CHECK(zan_file_read(h ^ (1LL << 32), (long long)(intptr_t)buf, 4) == 0,
-          "wrong-generation handle accepted by read");
-    CHECK(zan_file_close(h ^ (1LL << 32)) == 0,
-          "wrong-generation handle accepted by close");
+  CHECK(zan_file_read(h ^ (1LL << 32), (long long)(intptr_t)buf, 4) == 0,
+        "wrong-generation handle accepted by read");
+  CHECK(zan_file_close(h ^ (1LL << 32)) == 0,
+        "wrong-generation handle accepted by close");
 
-    CHECK(zan_file_close(h) == 1, "first close failed");
-    CHECK(zan_file_close(h) == 0, "double close not detected");
-    CHECK(zan_file_read(h, (long long)(intptr_t)buf, 4) == 0,
-          "use-after-close handle accepted by read");
+  CHECK(zan_file_close(h) == 1, "first close failed");
+  CHECK(zan_file_close(h) == 0, "double close not detected");
+  CHECK(zan_file_read(h, (long long)(intptr_t)buf, 4) == 0,
+        "use-after-close handle accepted by read");
 
-    long long h2 = zan_file_open(path, "rb");
-    CHECK(h2 != 0, "could not reopen scratch file");
-    if (h2) {
-        CHECK(zan_file_close(h) == 0, "stale handle closed the reopened file");
-        CHECK(zan_file_read(h2, (long long)(intptr_t)buf, 4) == 4,
-              "reopened handle unusable after stale-handle close attempt");
-        CHECK(zan_file_close(h2) == 1, "could not close reopened file");
-        CHECK(zan_file_close(h2) == 0, "double close of reopened file accepted");
-    }
+  long long h2 = zan_file_open(path, "rb");
+  CHECK(h2 != 0, "could not reopen scratch file");
+  if (h2) {
+    CHECK(zan_file_close(h) == 0, "stale handle closed the reopened file");
+    CHECK(zan_file_read(h2, (long long)(intptr_t)buf, 4) == 4,
+          "reopened handle unusable after stale-handle close attempt");
+    CHECK(zan_file_close(h2) == 1, "could not close reopened file");
+    CHECK(zan_file_close(h2) == 0, "double close of reopened file accepted");
+  }
 
-    remove(path);
+  remove(path);
 }
 
 #ifndef _WIN32
 static void test_file_no_follow_symlink(void) {
-    char dir[192], target[192], link[192];
-    snprintf(dir, sizeof(dir), "/tmp/rt_sync_b2_%ld_%lld",
-             (long)getpid(), (long long)time(NULL));
-    snprintf(target, sizeof(target), "%s/target", dir);
-    snprintf(link, sizeof(link), "%s/link", dir);
-    if (mkdir(dir, 0700) != 0) {
-        CHECK(0, "could not create scratch dir %s", dir);
-        return;
-    }
-    FILE *f = fopen(target, "w");
-    int ready = 0;
-    if (f) {
-        fputs("b2", f);
-        fclose(f);
-        ready = 1;
-    }
-    if (!ready || symlink(target, link) != 0) {
-        CHECK(0, "could not create B2 scratch files in %s", dir);
-        remove(target);
-        remove(link);
-        rmdir(dir);
-        return;
-    }
-
-    struct stat st_before, st_after;
-    CHECK(stat(target, &st_before) == 0, "could not stat target before");
-    mode_t mode_before = st_before.st_mode & 07777;
-    time_t mtime_before = st_before.st_mtime;
-
-    CHECK(zan_file_set_readonly(link, 1) == 0,
-          "set_readonly followed a symlink");
-    CHECK(zan_file_set_time(link, 0, (long long)(mtime_before + 3600)) == 0,
-          "set_time followed a symlink");
-    CHECK(stat(target, &st_after) == 0, "could not stat target after");
-    CHECK((st_after.st_mode & 07777) == mode_before,
-          "symlink set_readonly changed the target's permissions");
-    CHECK(st_after.st_mtime == mtime_before,
-          "symlink set_time changed the target's mtime");
-
-    CHECK(zan_file_set_readonly(target, 1) == 1,
-          "set_readonly failed on the real file");
-    CHECK(stat(target, &st_after) == 0, "could not restat target");
-    CHECK((st_after.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0,
-          "set_readonly did not clear write bits on the real file");
-    CHECK(zan_file_set_readonly(target, 0) == 1,
-          "set_readonly(false) failed on the real file");
-    CHECK(zan_file_set_time(target, 0, (long long)(mtime_before + 3600)) == 1,
-          "set_time failed on the real file");
-    CHECK(stat(target, &st_after) == 0, "could not restat target (time)");
-    CHECK(st_after.st_mtime == mtime_before + 3600,
-          "set_time did not update the real file's mtime");
-
-    remove(link);
+  char dir[192], target[192], link[192];
+  snprintf(dir, sizeof(dir), "/tmp/rt_sync_b2_%ld_%lld", (long)getpid(),
+           (long long)time(NULL));
+  snprintf(target, sizeof(target), "%s/target", dir);
+  snprintf(link, sizeof(link), "%s/link", dir);
+  if (mkdir(dir, 0700) != 0) {
+    CHECK(0, "could not create scratch dir %s", dir);
+    return;
+  }
+  FILE *f = fopen(target, "w");
+  int ready = 0;
+  if (f) {
+    fputs("b2", f);
+    fclose(f);
+    ready = 1;
+  }
+  if (!ready || symlink(target, link) != 0) {
+    CHECK(0, "could not create B2 scratch files in %s", dir);
     remove(target);
+    remove(link);
     rmdir(dir);
+    return;
+  }
+
+  struct stat st_before, st_after;
+  CHECK(stat(target, &st_before) == 0, "could not stat target before");
+  mode_t mode_before = st_before.st_mode & 07777;
+  time_t mtime_before = st_before.st_mtime;
+
+  CHECK(zan_file_set_readonly(link, 1) == 0, "set_readonly followed a symlink");
+  CHECK(zan_file_set_time(link, 0, (long long)(mtime_before + 3600)) == 0,
+        "set_time followed a symlink");
+  CHECK(stat(target, &st_after) == 0, "could not stat target after");
+  CHECK((st_after.st_mode & 07777) == mode_before,
+        "symlink set_readonly changed the target's permissions");
+  CHECK(st_after.st_mtime == mtime_before,
+        "symlink set_time changed the target's mtime");
+
+  CHECK(zan_file_set_readonly(target, 1) == 1,
+        "set_readonly failed on the real file");
+  CHECK(stat(target, &st_after) == 0, "could not restat target");
+  CHECK((st_after.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)) == 0,
+        "set_readonly did not clear write bits on the real file");
+  CHECK(zan_file_set_readonly(target, 0) == 1,
+        "set_readonly(false) failed on the real file");
+  CHECK(zan_file_set_time(target, 0, (long long)(mtime_before + 3600)) == 1,
+        "set_time failed on the real file");
+  CHECK(stat(target, &st_after) == 0, "could not restat target (time)");
+  CHECK(st_after.st_mtime == mtime_before + 3600,
+        "set_time did not update the real file's mtime");
+
+  remove(link);
+  remove(target);
+  rmdir(dir);
 }
 #endif
 
 int main(int argc, char **argv) {
-    if (argc == 3 && strcmp(argv[1], "--shared-child") == 0) {
-        return shared_table_child(argv[2]);
-    }
+  if (argc == 3 && strcmp(argv[1], "--shared-child") == 0) {
+    return shared_table_child(argv[2]);
+  }
 
-    test_atomic_int();
-    test_monitor();
-    test_shared_table();
-    test_shared_table_edit();
-    test_file_handle();
+  test_atomic_int();
+  test_monitor();
+  test_shared_table();
+  test_shared_table_edit();
+  test_file_handle();
 #ifndef _WIN32
-    test_file_no_follow_symlink();
+  test_file_no_follow_symlink();
 #endif
-    printf("%d checks, %d failures\n", checks, failures);
-    return failures == 0 ? 0 : 1;
+  printf("%d checks, %d failures\n", checks, failures);
+  return failures == 0 ? 0 : 1;
 }

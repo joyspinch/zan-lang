@@ -5,9 +5,9 @@
 #include "../../src/common/zan_abi.h"
 
 typedef struct {
-    const char *name;
-    const unsigned char *data;
-    long long len;
+  const char *name;
+  const unsigned char *data;
+  long long len;
 } embed_entry;
 extern void zan_embed_register(const embed_entry *, long long);
 extern const char *zan_embed_read(const char *);
@@ -15,46 +15,57 @@ extern const unsigned char *zan_embed_bytes(const char *, int *);
 extern int64_t zan_embed_list_alloc(const char *);
 
 static int valid(const char *text, uint32_t len) {
-    uint64_t rc, word;
-    if (!text || ((uintptr_t)text & 7)) return 0;
-    memcpy(&rc, text - 16, 8);
-    memcpy(&word, text - 8, 8);
-    return rc == ZAN_STRING_SENTINEL_RC && word == ZAN_STR_HDR_WORD(len);
+  uint64_t rc, word;
+  if (!text || ((uintptr_t)text & 7))
+    return 0;
+  memcpy(&rc, text - 16, 8);
+  memcpy(&word, text - 8, 8);
+  return rc == ZAN_STRING_SENTINEL_RC && word == ZAN_STR_HDR_WORD(len);
 }
 
 int main(void) {
-    /* Source is deliberately not a Zan string, and binary has an interior NUL. */
-    static const unsigned char raw[] = { 'A', 0, 0xff, 'Z' };
-    static const unsigned char text[] = { 't', 'e', 'x', 't' };
-    static const embed_entry entries[] = {
-        { "binary", raw, sizeof(raw) }, { "text", text, sizeof(text) },
-        { "empty", NULL, 0 }
-    };
-    if (!valid(zan_embed_read("missing"), 0)) return 1;
-    zan_embed_register(entries, 3);
-    const char *a = zan_embed_read("text");
-    if (!valid(a, 4) || strcmp(a, "text")) return 2;
-    for (int i = 0; i < 64; ++i)
-        if (zan_embed_read("text") != a) return 3;
-    const char *b = zan_embed_read("binary");
-    if (!valid(b, 1) || memcmp(b, raw, sizeof(raw)) || b[4]) return 4;
-    int len = -1;
-    if (zan_embed_bytes("binary", &len) != raw || len != 4) return 5;
-    if (!valid(zan_embed_read("empty"), 0) ||
-        !valid(zan_embed_read("missing"), 0)) return 6;
-    char *names = (char *)(uintptr_t)zan_embed_list_alloc(NULL);
-    char *filtered = (char *)(uintptr_t)zan_embed_list_alloc("text");
-    char *again = (char *)(uintptr_t)zan_embed_list_alloc("text");
-    zan_embed_register(NULL, 0);
-    if (strcmp(a, "text") || !valid(a, 4)) return 7;
-    if (zan_embed_bytes("missing", &len) || len != 0) return 8;
-    if (!names || strcmp(names, "binary\ntext\nempty\n")) return 9;
-    if (!filtered || !again || strcmp(filtered, "text\n")) return 10;
-    filtered[0] = 'T';
-    free(filtered);
-    if (strcmp(again, "text\n") || zan_embed_list_alloc("") != 0) return 11;
-    free(again);
-    free(names);
-    puts("PASS embed_string_abi");
-    return 0;
+  /* Source is deliberately not a Zan string, and binary has an interior NUL. */
+  static const unsigned char raw[] = {'A', 0, 0xff, 'Z'};
+  static const unsigned char text[] = {'t', 'e', 'x', 't'};
+  static const embed_entry entries[] = {{"binary", raw, sizeof(raw)},
+                                        {"text", text, sizeof(text)},
+                                        {"empty", NULL, 0}};
+  if (!valid(zan_embed_read("missing"), 0))
+    return 1;
+  zan_embed_register(entries, 3);
+  const char *a = zan_embed_read("text");
+  if (!valid(a, 4) || strcmp(a, "text"))
+    return 2;
+  for (int i = 0; i < 64; ++i)
+    if (zan_embed_read("text") != a)
+      return 3;
+  const char *b = zan_embed_read("binary");
+  if (!valid(b, 1) || memcmp(b, raw, sizeof(raw)) || b[4])
+    return 4;
+  int len = -1;
+  if (zan_embed_bytes("binary", &len) != raw || len != 4)
+    return 5;
+  if (!valid(zan_embed_read("empty"), 0) ||
+      !valid(zan_embed_read("missing"), 0))
+    return 6;
+  char *names = (char *)(uintptr_t)zan_embed_list_alloc(NULL);
+  char *filtered = (char *)(uintptr_t)zan_embed_list_alloc("text");
+  char *again = (char *)(uintptr_t)zan_embed_list_alloc("text");
+  zan_embed_register(NULL, 0);
+  if (strcmp(a, "text") || !valid(a, 4))
+    return 7;
+  if (zan_embed_bytes("missing", &len) || len != 0)
+    return 8;
+  if (!names || strcmp(names, "binary\ntext\nempty\n"))
+    return 9;
+  if (!filtered || !again || strcmp(filtered, "text\n"))
+    return 10;
+  filtered[0] = 'T';
+  free(filtered);
+  if (strcmp(again, "text\n") || zan_embed_list_alloc("") != 0)
+    return 11;
+  free(again);
+  free(names);
+  puts("PASS embed_string_abi");
+  return 0;
 }

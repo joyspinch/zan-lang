@@ -6,7 +6,7 @@ using System.Net.Sockets;
 using System.Web;
 
 class Program {
-    static int port = 19567;
+    static int port = 23567;
     static int failures = 0;
     static int beforeCalls = 0;
     static int handlerCalls = 0;
@@ -28,9 +28,18 @@ class Program {
         return Csrf.OriginGuard(ctx);
     }
 
+    static void BrokenAfter(HttpContext ctx, long elapsedUs) {
+        if (ctx.Path() == "/auth" && ctx.GetStatus() == 200) {
+            throw new Exception("controlled after hook failure");
+        }
+    }
+
     static void After(HttpContext ctx, long elapsedUs) { afterCalls = afterCalls + 1; }
 
-    static async string Authenticate(string token) { return token; }
+    static async string Authenticate(string token) {
+        if (token == "unavailable") { throw new Exception("controlled session lookup failure"); }
+        return token;
+    }
     static async bool Permit(string uid, string action) { return uid == "admin"; }
 
     static async void Upload(HttpContext ctx) {
@@ -45,11 +54,8 @@ class Program {
     }
 
     static async void Accept(WebApp app) {
-        TcpListener l = new TcpListener("127.0.0.1", port);
-        l.Start();
-        listener = l;
         while (listening) {
-            nint sock = await l.AcceptAsync();
+            nint sock = await listener.AcceptAsync();
             if (sock >= 0) { Task.Spawn(app.HandleConnection(sock)); }
         }
     }
@@ -80,6 +86,7 @@ class Program {
         WebApp app = new WebApp("127.0.0.1", port);
         app.UploadDir(directory);
         app.Before(Before);
+        app.After(BrokenAfter);
         app.After(After);
         app.AuthResolver(Authenticate);
         app.PermissionResolver(Permit);
@@ -90,8 +97,9 @@ class Program {
         Route reject = app.Post("/reject", Upload).Upload().Login();
         Route gateError = app.Post("/gate-error", Upload).Upload().Login();
         Route gateUnknown = app.Post("/gate-unknown", Upload).Upload().Login();
+        listener = new TcpListener("127.0.0.1", port);
+        listener.Start();
         Task.Spawn(Accept(app));
-        await Task.Delay(100);
 
         // Send no body: these replies must arrive before any upload bytes,
         // and before any spool is opened, even with an advertised body length.
@@ -115,9 +123,15 @@ class Program {
         Check(unknownResponse.Contains("500 Internal Server Error") && !unknownResponse.Contains("gate failure")
             && Spools() == 0 && afterCalls == 5, "gate exception returns fixed 500 and runs after hooks");
 
+        string unavailable = await Request("/login", "Authorization: Bearer unavailable\r\n", "", false);
+        Check(unavailable.Contains("500 Internal Server Error") && unavailable.Contains("Connection: close")
+            && !unavailable.Contains("controlled session lookup failure") && Spools() == 0 && afterCalls == 6,
+            "session lookup failure replies before body read");
+
         int before = beforeCalls;
         string success = await Request("/auth", "Authorization: Bearer admin\r\n", "payload", true);
         Check(success.Contains("body-ok") && handlerCalls == 1, "authorized upload reaches handler intact");
+        Check(afterCalls == 7, "after hook failure preserves response and later hooks");
         Check(beforeCalls == before + 1, "upload before hook executes exactly once");
         Check(Spools() == 0, "successful request cleans unclaimed spool");
         string rejected = await Request("/reject", "Authorization: Bearer admin\r\n", "payload", true);

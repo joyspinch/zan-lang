@@ -54,7 +54,7 @@ if(WIN32)
 endif()
 file(REMOVE "${GEN1}")
 execute_process(COMMAND "${ZANC}" ${_sources} --auto-stdlib
-  --stdlib-path "${STDLIB_ROOT}" --no-packages -O0 -o "${GEN1}"
+  --stdlib-path "${STDLIB_ROOT}" -O0 -o "${GEN1}"
   WORKING_DIRECTORY "${OWNERSHIP_WORKDIR}"
   RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err TIMEOUT 300)
 file(WRITE "${OUTDIR}/build.exit" "${_rc}\n")

@@ -1,10 +1,23 @@
 using System;
 using System.Data;
+using System.Data.Orm;
 using System.Data.Sqlite;
 using System.IO;
+using System.Threading;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web.Services;
+
+class AdminLeaseController : AdminController {
+    async void Screen() {
+        ViewData data = await this.Layout("fixture");
+        DataScope scope = await this.Scope();
+        this.Ctx().Text(data.Vars().Get("brand") + (scope.Any() ? ":all" : ":restricted"));
+    }
+}
 
 [Route("/lease")]
 class LeaseActionController : AppController {
@@ -272,6 +285,74 @@ class Program {
         await c.AfterAsync();
     }
 
+    static async int RestoreRoleSchema(IDbConnection db) {
+        bool failed = false;
+        try { await AuthUser.RolesChanged(db); }
+        catch (Exception error) { failed = true; }
+        Program.Check(failed, "role refresh sees missing schema");
+        bool synced = await db.SyncStructureAllAsync(new Meta[] { Meta.For<SysRole>(), Meta.For<SysRoleGrant>() });
+        Program.Check(synced, "role schema restored");
+        SysRole row = new SysRole();
+        row.name = "recovered";
+        row.code = "recovered";
+        row.status = 1;
+        row.dataScope = DataScope.RoleSelf;
+        return await ZanSql.FromConnection(db).Insert<SysRole>(row).ExecuteIdentityAsync();
+    }
+
+    static async void AdminLease(string path) {
+        SqliteConnection db = SqliteConnection.Open(path);
+        bool synced = await db.SyncStructureAllAsync(new Meta[] {
+            Meta.For<SysUser>(), Meta.For<SysGenTable>(), Meta.For<SysSiteSetting>()
+        });
+        Program.Check(synced, "admin fixture schema");
+        SysUser user = new SysUser();
+        user.username = "lease-admin";
+        user.passwordHash = "fixture";
+        user.status = AuthUser.Active;
+        user.isSuper = 1;
+        int id = await ZanSql.FromConnection(db).Insert<SysUser>(user).ExecuteIdentityAsync();
+        SysSiteSetting title = new SysSiteSetting();
+        title.name = SettingKeys.SiteTitle;
+        title.value = "lease-site";
+        int setting = await ZanSql.FromConnection(db).Insert<SysSiteSetting>(title).ExecuteIdentityAsync();
+        db.Close();
+        Program.Check(id > 0 && setting > 0 && PermTable.Open(), "admin fixture identity");
+        Settings.Forget();
+        DbPool pool = SqliteConnector.Pool(path, 1);
+        DbContext context = DbContext.Of(pool);
+        AppServices.Use(new AppServices(context, null));
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.ScopedPermissionResolver(AuthUser.AllowInScope);
+        WebHost.Use(app);
+        HttpContext ctx = Program.Ctx("GET", "/admin/dashboard");
+        ctx.SetUid(Convert.ToString(id));
+        AdminLeaseController ctrl = new AdminLeaseController();
+        ctrl.Bind(ctx);
+        bool ready = await ctrl.BeforeAsync();
+        try {
+            Program.Check(ready, "admin preflight");
+            if (ready) { await ctrl.Screen(); }
+            Program.Check(ctx.ResponseBody() == "lease-site:all",
+                "super admin gets full scope without querying the absent department table");
+            int recoveredRole = await Program.RestoreRoleSchema(ctrl.Held());
+            await ctrl.AfterAsync();
+            for (int i = 0; i < 30 && PermTable.RoleScope(Convert.ToString(recoveredRole)) == 0; i = i + 1) {
+                await Task.Delay(200);
+            }
+            Program.Check(recoveredRole > 0 && PermTable.RoleScope(Convert.ToString(recoveredRole)) == DataScope.RoleSelf,
+                "standalone role snapshot reloads after the failed read and request lease release");
+        } finally {
+            await ctrl.AfterAsync();
+            ctx.Dispose();
+            WebHost.Use(null);
+            app.Dispose();
+            AppServices.Use(null);
+            Program.Check(pool.LiveCount() == 1 && pool.IdleCount() == 1, "admin lease returned once");
+            pool.Close();
+        }
+    }
+
     static async void Main() {
         Directory.CreateDirectoryRecursive("_scratch/readonly-action-lease");
         string writePath = "_scratch/readonly-action-lease/write.db";
@@ -310,6 +391,10 @@ class Program {
         AppServices.Use(null);
         File.Delete(writePath); File.Delete(readPath);
         await Program.TransactionFailures();
+        string adminPath = "_scratch/readonly-action-lease/admin.db";
+        if (File.Exists(adminPath)) { File.Delete(adminPath); }
+        try { await Program.AdminLease(adminPath); }
+        finally { if (File.Exists(adminPath)) { File.Delete(adminPath); } }
         Console.WriteLine("failures=" + Convert.ToString(Program.failures));
     }
 }
