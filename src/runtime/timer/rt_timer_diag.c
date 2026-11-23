@@ -58,15 +58,22 @@ static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
 static int g_soft_seen_count;
 static int g_soft_strict;
 
+/* 结果一经算出即不变：无锁快路径读已发布的值，只有首次计算才进锁。
+ * 曾每次调用都拿全局 timer_lock——与定时器调度同一把锁，热路径上的
+ * 软失败判定会把多 worker 串行化。 */
+static int g_soft_hard = -1;
+
 static int zan_soft_is_hard(void) {
+    int v = __atomic_load_n(&g_soft_hard, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v;
     timer_lock();
-    static int hard = -1;
-    if (hard < 0) {
+    v = g_soft_hard;
+    if (v < 0) {
         const char *env = getenv("ZAN_RT_HARD");
-        hard = (env && *env && *env != '0') ? 1 : 0;
-        if (!hard && !env) hard = g_soft_strict;
+        v = (env && *env && *env != '0') ? 1 : 0;
+        if (!v && !env) v = g_soft_strict;
+        __atomic_store_n(&g_soft_hard, v, __ATOMIC_RELEASE);
     }
-    int v = hard;
     timer_unlock();
     return v;
 }
@@ -87,18 +94,25 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
     for (int i = 0; i < 8; i++) { p[i] = (unsigned char)(v >> (8 * i)); }
 }
 
+/* 编译器在大量普通函数里插这条调用取软失败暂存区：返回的是常量指针，
+ * 只需首次初始化。曾每次都拿全局 timer_lock——Web 压测下多 worker 在这把锁
+ * 上排队，锁等待占 CPU 采样的四成以上（psynch_mutexwait 归因 ~6000/19000）。
+ * 改为 acquire 读快路径；未发布时进锁双检、初始化后 release 发布。 */
 unsigned char *zan_rt_soft_scratch(void) {
+    unsigned char *scratch = __atomic_load_n(&g_soft_scratch, __ATOMIC_ACQUIRE);
+    if (scratch) return scratch;
     timer_lock();
-    if (!g_soft_scratch) {
+    scratch = g_soft_scratch;
+    if (!scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
         store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc */
         store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);
         store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc */
         store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
-        g_soft_scratch = hdr + 32;
+        scratch = hdr + 32;
+        __atomic_store_n(&g_soft_scratch, scratch, __ATOMIC_RELEASE);
     }
-    unsigned char *scratch = g_soft_scratch;
     timer_unlock();
     return scratch;
 }

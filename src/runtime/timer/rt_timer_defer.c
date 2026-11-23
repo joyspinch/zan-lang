@@ -60,15 +60,17 @@ void zan_rt_defer_push(void *fn, void *obj) {
     }
     n->next = g_defer_head;
     g_defer_head = n;
-    g_defer_count++;
+    __atomic_add_fetch(&g_defer_count, 1, __ATOMIC_RELEASE);
     ZAN_DEFER_UNLOCK();
 }
 
+/* 编译器在 release 最外层出口逐次调用；绝大多数时候队列为空。曾每次都拿
+ * 全局 g_defer_lock 只为读计数——Web 压测下多 worker 在这把锁上排队
+ * （psynch_mutexwait 归因 ~3900/16000 采样）。计数由写方在锁内原子增减，
+ * 这里无锁 acquire 读。读到旧值只会让排空晚一个出口发生（上文已述：最坏
+ * drain 晚触发，atexit 兜底），不丢释放。 */
 int zan_rt_defer_pending(void) {
-    ZAN_DEFER_LOCK_W();
-    int pend = g_defer_count > 0;
-    ZAN_DEFER_UNLOCK();
-    return pend;
+    return __atomic_load_n(&g_defer_count, __ATOMIC_ACQUIRE) > 0;
 }
 
 void zan_rt_defer_drain(void) {
@@ -82,7 +84,7 @@ void zan_rt_defer_drain(void) {
             return;
         }
         g_defer_head = n->next;
-        g_defer_count--;
+        __atomic_sub_fetch(&g_defer_count, 1, __ATOMIC_RELEASE);
         ZAN_DEFER_UNLOCK();
         fn = n->fn;
         obj = n->obj;

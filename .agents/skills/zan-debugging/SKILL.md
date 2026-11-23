@@ -69,6 +69,15 @@ writes to stdout, so it must not replace stderr in protocols or golden-output te
 通道（kqueue/select）读端登记轮询器、**写端**才可写；写读端 EBADF 静默失败。eventfd
 （Linux）一个 fd 读写皆可，IOCP 用投递包，均不受这类错影响——只在 macOS/BSD 复现。
 
+### 多 worker 吞吐上不去、CPU 却很高：先看锁等待归因（Web 压测实测，2026-11-23）
+
+`sample <pid> 5` 的「Sort by top of stack」里 `__psynch_mutexwait` 占大头时，把调用图里
+`pthread_mutex_lock` 的上一帧按采样数聚合，直接得出是谁在抢锁。本仓库实测两例：只返回
+常量指针的 `zan_rt_soft_scratch`、只读计数的 `zan_rt_defer_pending`，都在每次调用时拿全局
+锁，而它们被编译器插进几乎所有函数/release 出口——单把锁吃掉 40% CPU。修法：已发布值
+acquire 无锁读，写方锁内原子更新。另：对比基准务必用干净树（HEAD + 自己的改动）构建，
+共享 build/zanc 会带上并行会话未提交的运行时改动，热点会被别人的半成品改写。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =
