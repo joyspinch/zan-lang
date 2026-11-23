@@ -91,6 +91,7 @@ try {
 
 try {
     & clang --target=x86_64-w64-windows-gnu -O2 -DNDEBUG `
+        -ffunction-sections -fdata-sections `
         -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_RTREE `
         -c (Join-Path $sqliteSourceDir "sqlite3.c") -o $sqliteObj
     if ($LASTEXITCODE -ne 0) {

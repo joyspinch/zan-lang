@@ -60,8 +60,9 @@ foreach ($mf in $manifests) {
     #    src/App.zan + src/App.html to the project name (same as the gate and
     #    the IDE), then resolve the entry the way the gate does.
     Copy-TemplateTree $tplDir $proj $name
-    if (!(Test-Path (Join-Path $proj "zan.proj"))) {
-        Set-Content -Path (Join-Path $proj "zan.proj") -Encoding UTF8 -Value @(
+    $projectManifest = Join-Path $proj "zan.proj"
+    if (!(Test-Path $projectManifest)) {
+        Set-Content -Path $projectManifest -Encoding UTF8 -Value @(
             "name = $name", "type = $type", "entry = $entry",
             "target = $target", "platform = windows-x64")
     }
@@ -70,7 +71,9 @@ foreach ($mf in $manifests) {
             $app = Join-Path $proj "src\App.$ext"
             if (Test-Path $app) { Move-Item -Path $app -Destination (Join-Path $proj "src\$name.$ext") -Force }
         }
-        if (Test-Path (Join-Path $proj "src\$name.html")) { $entry = "src/$name.html" }
+        if ($entry -eq "src/App.zan" -and (Test-Path (Join-Path $proj "src\$name.zan"))) {
+            $entry = "src/$name.zan"
+        }
     }
     $entryFull = Join-Path $proj ($entry -replace "/", "\")
     if (!(Test-Path $entryFull)) {
@@ -78,20 +81,16 @@ foreach ($mf in $manifests) {
         continue
     }
 
-    # 2) build: the entry is ALWAYS the first input (zanc emits Main from the
-    #    first input); side design documents (.html/.htm next to the
-    #    entry, e.g. gui-wechat's runtime windows) ride the same command line
-    #    or their Build() references fail to resolve; then every other src
-    #    .zan. Same input order as tests/run_templates.cmake.
+    # 2) build: put the Zan entry first so zanc emits its Main, then add
+    #    every other Zan source under src/. HTML is loaded at runtime.
     $srcDir = Join-Path $proj "src"
     if (!(Test-Path $srcDir)) {
         $results += "SKIP [$tplId]: no src\ tree (nothing to compile)"
         continue
     }
     $inputs = @($entryFull)
-    $inputs += @(Get-ChildItem $srcDir -Recurse -File -Include "*.html", "*.htm" |
-        Where-Object { $_.FullName -ne $entryFull } | ForEach-Object { $_.FullName })
-    $inputs += @(Get-ChildItem $srcDir -Recurse -File -Filter "*.zan" | ForEach-Object { $_.FullName })
+    $inputs += @(Get-ChildItem $srcDir -Recurse -File -Filter "*.zan" | Sort-Object FullName |
+        ForEach-Object { $_.FullName })
     $inputs = @($inputs | Select-Object -Unique)
     $sub = @()
     if ($type -eq "gui") {
@@ -131,10 +130,20 @@ foreach ($mf in $manifests) {
         }
     }
 
-    # 4) publish: optimized/stripped build into publish\ (mirrors the IDE)
+    # 4) publish: map each resource from the scaffolded manifest to its
+    #    project-relative VFS name.
+    $publishResources = @()
+    $projectSettings = Read-Manifest $projectManifest
+    foreach ($resource in ($projectSettings["gen.embed"] -split ",")) {
+        $resource = $resource.Trim()
+        if ($resource) {
+            $resourcePath = Join-Path $proj $resource
+            $publishResources += @("--embed", "$resourcePath=$resource")
+        }
+    }
     New-Item -ItemType Directory -Force -Path (Join-Path $proj "publish") | Out-Null
     $pubExe = Join-Path $proj "publish\$name.exe"
-    & $zanc --stdlib-path $stdlib --publish @inputs -o $pubExe @sub 2>&1 | Select-Object -Last 3
+    & $zanc --stdlib-path $stdlib --publish @inputs -o $pubExe @sub @publishResources 2>&1 | Select-Object -Last 3
     if ($LASTEXITCODE -ne 0 -or !(Test-Path $pubExe)) {
         $results += "FAIL publish [$tplId] exit=$LASTEXITCODE"
         continue

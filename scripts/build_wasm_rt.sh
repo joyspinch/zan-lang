@@ -44,17 +44,17 @@ build() {
 
 # file/timer/wasm: -std=c11 (the .cmd's wasm block; a gnu dialect shifts
 # every byte vs the committed objects).
-build zanrt_wasm.o    rt_wasm.c    -std=c11  -I "$RT" -O2
-build zanrt_file.o    rt_file.c    -std=c11  -I "$RT" -O2
-build zanrt_decimal.o rt_decimal.c -std=c11  -I "$RT" -O2
-build zanrt_timer.o   rt_timer.c   -std=c11  -I "$RT" -O2
-build zanrt_crash.o    rt_crash.c   -std=c11  -I "$RT" -O2
+build zanrt_wasm.o    rt_wasm.c    -std=c11  -I "$RT" -O2 -ffunction-sections -fdata-sections
+build zanrt_file.o    rt_file.c    -std=c11  -I "$RT" -O2 -ffunction-sections -fdata-sections
+build zanrt_decimal.o rt_decimal.c -std=c11  -I "$RT" -O2 -ffunction-sections -fdata-sections
+build zanrt_timer.o   rt_timer.c   -std=c11  -I "$RT" -O2 -ffunction-sections -fdata-sections
+build zanrt_crash.o    rt_crash.c   -std=c11  -I "$RT" -O2 -ffunction-sections -fdata-sections
 # Independent feature members keep JSON/CPU users from loading crypto.
 set --
 for crypto_src in "$ACCEL"/hw/rt_hw_*.c; do
     crypto_name=${crypto_src##*/}
     crypto_obj="$OUT/zan_crypto_${crypto_name%.c}.o"
-    "$ZIG" cc -target wasm32-wasi -g0 -std=c11 -I "$RT" -I "$ACCEL" -O2 -c "$crypto_src" -o "$crypto_obj"
+    "$ZIG" cc -target wasm32-wasi -g0 -std=c11 -I "$RT" -I "$ACCEL" -O2 -ffunction-sections -fdata-sections -c "$crypto_src" -o "$crypto_obj"
     set -- "$@" "$crypto_obj"
 done
 rm -f "$OUT/libzancrypto.a"
@@ -62,12 +62,12 @@ rm -f "$OUT/libzancrypto.a"
 rm -f "$@"
 # Compressed embedded icons/skins need the same decoder as native targets:
 # no -I "$RT", miniz trim defines + NO_ARCHIVE_WRITERS, -I src/common.
-"$ZIG" cc -target wasm32-wasi -g0 -std=c11 -O2 \
+"$ZIG" cc -target wasm32-wasi -g0 -std=c11 -O2 -ffunction-sections -fdata-sections \
     -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO \
     -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS \
     -I src/common -c "$EMBED/zan_inflate.c" -o "$OUT/zan_inflate.o"
 # Single-threaded sync equivalents (threads run bodies synchronously,
 # atomics are plain cells): gnu11 exposes what the wasm shells need.
-build zanrt_syncw.o   rt_sync_wasm.c -std=gnu11 -I "$RT" -O2
+build zanrt_syncw.o   rt_sync_wasm.c -std=gnu11 -I "$RT" -O2 -ffunction-sections -fdata-sections
 
 echo "built $OUT (console bundle)"

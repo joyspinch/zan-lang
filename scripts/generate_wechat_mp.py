@@ -14,12 +14,13 @@ import re, json
 
 from wechat_typed_codegen import (
     ModelIndex, SharedModelRegistry, emit_typed_classes,
-    parse_params, unwrap_task,
+    parse_params, unwrap_task, write_layered_contracts,
 )
 
 ROOT = Path.cwd()
+PKG_WECHAT = ROOT / 'packages/Zan.Sdk.Wechat/src/Sdk/Wechat'
 src = (ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.MP/Senparc.Weixin.MP/AdvancedAPIs').resolve()
-out = ROOT / 'stdlib/Sdk/Wechat/Mp'
+out = PKG_WECHAT / 'Mp'
 out.mkdir(parents=True, exist_ok=True)
 
 MARKER = 'Generated from Senparc.Weixin.MP.AdvancedAPIs'
@@ -302,14 +303,29 @@ for p in files:
     if not emitted:
         continue
     cls = class_name(rel)
-    typed = []
+    req_blocks = []
+    resp_blocks = []
     meta = []
     for entry in emitted:
-        req, resp, declarations = emit_typed_classes(
+        req, resp, req_lines, resp_lines = emit_typed_classes(
             cls, entry['method'], entry['endpoint'], entry['verb'],
             'access_token', model_index, entry['method']['source'], models)
-        typed.extend(declarations)
+        if req_lines:
+            req_blocks.append(req_lines)
+        if resp_lines:
+            resp_blocks.append(resp_lines)
         meta.append((entry, req, resp))
+    dom_stem = cls[len('WechatMp'):-len('Api')] or 'Common'
+    if req_blocks:
+        write_layered_contracts(
+            PKG_WECHAT / 'Requests/Mp', f'{dom_stem}Requests.zan',
+            'Sdk.Wechat.Models.Mp', ['using Sdk.Wechat;'], MARKER,
+            'scripts/generate_wechat_mp.py', req_blocks)
+    if resp_blocks:
+        write_layered_contracts(
+            PKG_WECHAT / 'Responses/Mp', f'{dom_stem}Responses.zan',
+            'Sdk.Wechat.Models.Mp', ['using Sdk.Wechat;'], MARKER,
+            'scripts/generate_wechat_mp.py', resp_blocks)
     lines = [
         'using System;',
         'using System.Json;',
@@ -318,9 +334,8 @@ for p in files:
         '',
         'namespace Sdk.Wechat.Mp;',
         '',
-        '/// <summary>Method request/response contracts; reusable DTO entities live in Sdk.Wechat.Models.Mp.</summary>',
+        '/// <summary>Strong-typed API facade; Request/Response/DTO contracts live in Requests/Mp, Responses/Mp, Models/Mp.</summary>',
     ]
-    lines.extend(typed)
     lines += [
         '/// <summary>',
         f'/// {rel_text} 的 Zan 强类型 JSON 接口。',
@@ -370,14 +385,9 @@ for p in files:
     })
     total += len(emitted)
 
-models_dir = ROOT / 'stdlib/Sdk/Wechat/Models/Mp'
-models_dir.mkdir(parents=True, exist_ok=True)
-for old in models_dir.glob('*.zan'):
-    if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
-        old.unlink()
-(models_dir / 'WechatMpModels.zan').write_text(
-    models.render('Sdk.Wechat.Models.Mp', MARKER, 'scripts/generate_wechat_mp.py'),
-    encoding='utf-8', newline='\n')
+models.render_domains(
+    PKG_WECHAT / 'Models/Mp', 'Sdk.Wechat.Models.Mp', MARKER,
+    'scripts/generate_wechat_mp.py', lambda name: 'Common')
 
 (ROOT / '_scratch/wechat_mp_generated_manifest.json').write_text(
     json.dumps({'modules': manifest, 'skipped': skipped,

@@ -72,7 +72,7 @@ $keepExe = @(
     # 真产物（编译器 / 语言服务 / 调试适配器 / IDE）
     'zanc.exe', 'zanc-selfhost.exe', 'zan-mvc.exe', 'zan-lsp.exe', 'zan-dap.exe', 'zan-pm.exe', 'ZanIDE.exe',
     # 工具链：publish_ide.ps1 / stage_dev_toolchain.ps1 要往 dist 里拷
-    'ld.lld.exe', 'ld.exe', 'llvm-nm.exe', 'opt.exe', 'llc.exe',
+    'ld.lld.exe', 'ld.exe', 'llvm-nm.exe', 'opt.exe', 'llc.exe', 'llvm-ar.exe',
     # 脚本产出的工具（build_repomap / gen_knowledge / build_mge / ...）
     'repomap.exe', 'zan-lsp-client.exe', 'zan-mcp.exe', 'zandoc.exe',
     'zanfmt.exe', 'genknowledge.exe', 'mge.exe', 'tool_genindex.exe',

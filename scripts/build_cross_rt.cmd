@@ -26,26 +26,26 @@ where %ZIG% >nul 2>nul || if not exist "%ZIG%" (
 for %%P in (linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64) do (
   for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
     if not exist toolchain\%%A mkdir toolchain\%%A
-    "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
-    "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\%%A\zanrt_io_mt.o || exit /b 1
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c -o toolchain\%%A\zanrt_io_mt.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     rem 128-bit Decimal runtime: programs that reach System.Numerics reference
     rem __zan_decimal_*, and the cross link injects this object for them.
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
-"%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
     rem One archive member per feature, matching the host and POSIX recipes.
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
     for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
-      "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
+      "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       "%ZIG%" ar rcs toolchain\%%A\libzancrypto.a toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       del /q toolchain\%%A\zan_crypto_%%~nC.o
     )
     rem Embedded-resource API + decoder: GUI programs pull skins/icons through
     rem the auto-embed path, so the cross link injects these two objects.
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
-    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    "%ZIG%" cc -target %%B-linux-musl -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     echo built toolchain\%%A
   )
 )
@@ -55,26 +55,26 @@ rem -platform_version zanc passes to ld64.lld.
 for %%P in (arm64:aarch64 x64:x86_64) do (
   for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
     if not exist toolchain\macos\%%A mkdir toolchain\macos\%%A
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\macos\%%A\zanrt_io.o || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\macos\%%A\zanrt_io_mt.o || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\macos\%%A\zanrt_sync.o  || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
-"%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\macos\%%A\zanrt_crash.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c -o toolchain\macos\%%A\zanrt_io.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c -o toolchain\macos\%%A\zanrt_io_mt.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\macos\%%A\zanrt_sync.o  || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\macos\%%A\zanrt_file.o  || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\macos\%%A\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\macos\%%A\zanrt_crash.o || exit /b 1
     rem 128-bit Decimal runtime: programs that reach System.Numerics reference
     rem __zan_decimal_*, and the cross link injects this object for them.
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\macos\%%A\zanrt_decimal.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_decimal.c -o toolchain\macos\%%A\zanrt_decimal.o || exit /b 1
     rem One archive member per feature, matching the host and POSIX recipes.
     if exist toolchain\macos\%%A\libzancrypto.a del /q toolchain\macos\%%A\libzancrypto.a
     for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
-      "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\macos\%%A\zan_crypto_%%~nC.o || exit /b 1
+      "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\macos\%%A\zan_crypto_%%~nC.o || exit /b 1
       "%ZIG%" ar rcs toolchain\macos\%%A\libzancrypto.a toolchain\macos\%%A\zan_crypto_%%~nC.o || exit /b 1
       del /q toolchain\macos\%%A\zan_crypto_%%~nC.o
     )
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %DRV% -I %TP% -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_compat_mac.c -o toolchain\macos\%%A\zanrt_gui.o || exit /b 1
     rem Embedded-resource API + decoder for the auto-embed path (GUI skins/icons).
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -c %EMBED%\zan_embed_api.o || exit /b 1
-    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\macos\%%A\zan_inflate.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_embed_api.c -o toolchain\macos\%%A\zan_embed_api.o || exit /b 1
+    "%ZIG%" cc -target %%B-macos.11.0 -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\macos\%%A\zan_inflate.o || exit /b 1
     echo built toolchain\macos\%%A
   )
 )
@@ -92,26 +92,26 @@ if not exist "%IOSHDR%\pthread.h" (
   exit /b 1
 )
 "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -DZAN_GUI_IOS -DZAN_GUI_STATIC -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_runtime.c -o toolchain\ios\arm64\zanrt_gui.o || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\ios\arm64\zanrt_file.o  || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c    -o toolchain\ios\arm64\zanrt_io.o    || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c -o toolchain\ios\arm64\zanrt_io_mt.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\ios\arm64\zanrt_sync.o  || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\ios\arm64\zanrt_file.o  || exit /b 1
 rem 128-bit Decimal runtime: programs that reach System.Numerics reference
 rem __zan_decimal_*, and the iOS link injects this object for them.
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\ios\arm64\zanrt_decimal.o || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\ios\arm64\zanrt_crash.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_decimal.c -o toolchain\ios\arm64\zanrt_decimal.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\ios\arm64\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\ios\arm64\zanrt_crash.o || exit /b 1
 rem One archive member per feature, including the iOS Mach-O target.
 if exist toolchain\ios\arm64\libzancrypto.a del /q toolchain\ios\arm64\libzancrypto.a
 for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
-  "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\ios\arm64\zan_crypto_%%~nC.o || exit /b 1
+  "%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\ios\arm64\zan_crypto_%%~nC.o || exit /b 1
   "%ZIG%" ar rcs toolchain\ios\arm64\libzancrypto.a toolchain\ios\arm64\zan_crypto_%%~nC.o || exit /b 1
   del /q toolchain\ios\arm64\zan_crypto_%%~nC.o
 )
 rem Embedded-resource API + decoder for the auto-embed path (GUI skins/icons),
 rem same pair the linux/macos/android blocks above build.
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -c %EMBED%\zan_embed_api.c -o toolchain\ios\arm64\zan_embed_api.o || exit /b 1
-"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\ios\arm64\zan_inflate.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_embed_api.c -o toolchain\ios\arm64\zan_embed_api.o || exit /b 1
+"%ZIG%" cc -target aarch64-ios.14.0 -I "%IOSHDR%" -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\ios\arm64\zan_inflate.o || exit /b 1
 echo built toolchain\ios\arm64
 
 rem wasm32 (WASI): single-threaded, so no rt_io / rt_sync -- the wasm link
@@ -126,22 +126,22 @@ rem     toolchain\wasm32\zanrt_ehtag.c -o toolchain\wasm32\zanrt_ehtag.o
 rem It defines the __cpp_exception tag and __cxa_throw for try/catch programs
 rem (main.c links it only when wasm_eh_used).
 if not exist toolchain\wasm32 mkdir toolchain\wasm32
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_wasm.c  -o toolchain\wasm32\zanrt_wasm.o  || exit /b 1
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_wasm.c  -o toolchain\wasm32\zanrt_wasm.o  || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\wasm32\zanrt_file.o  || exit /b 1
 rem 128-bit Decimal runtime: programs that reach System.Numerics reference
 rem __zan_decimal_*, and the wasm link injects this object for them.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\wasm32\zanrt_decimal.o || exit /b 1
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\wasm32\zanrt_crash.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_decimal.c -o toolchain\wasm32\zanrt_decimal.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\wasm32\zanrt_timer.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\wasm32\zanrt_crash.o || exit /b 1
 rem One archive member per feature, matching the host and POSIX recipes.
 if exist toolchain\wasm32\libzancrypto.a del /q toolchain\wasm32\libzancrypto.a
 for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
-  "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\wasm32\zan_crypto_%%~nC.o || exit /b 1
+  "%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\wasm32\zan_crypto_%%~nC.o || exit /b 1
   "%ZIG%" ar rcs toolchain\wasm32\libzancrypto.a toolchain\wasm32\zan_crypto_%%~nC.o || exit /b 1
   del /q toolchain\wasm32\zan_crypto_%%~nC.o
 )
 rem Compressed embedded icons/skins need the same decoder as native targets.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -O2 -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\wasm32\zan_inflate.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=c11 -O2 -ffunction-sections -fdata-sections -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS -I src\common -c %EMBED%\zan_inflate.c -o toolchain\wasm32\zan_inflate.o || exit /b 1
 rem GUI core for wasm32: software drawing/text plus the browser window shell
 rem (gui_runtime_wasm.c, included under __wasm__). The independent feature
 rem objects below are selected by main.c from emitted symbol references;
@@ -167,26 +167,26 @@ if "%FT_INC%"=="" if exist "%HOME%\firefox\modules\freetype2\include\ft2build.h"
 if "%FT_INC%"=="" if exist "%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include\ft2build.h" set FT_INC=%USERPROFILE%\.mozbuild\firefox\modules\freetype2\include
 if "%FT_INC%"=="" echo note: FreeType headers not found; set FREETYPE_INC or ZAN_FREETYPE_ROOT for proportional text on wasm32 (bitmap fallback otherwise)
 if exist "%FT_INC%\ft2build.h" if exist toolchain\wasm32\libfreetype.a goto ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 goto gui_done
 :ft_gui
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I "%FT_INC%" -I toolchain\wasm32\freetype-shim -O2 -ffunction-sections -fdata-sections -c %DRV%\gui\gui_runtime.c -DZAN_GUI_WASM -DZAN_GUI_STATIC -DZAN_GUI_FREETYPE -o toolchain\wasm32\zanrt_gui.o || exit /b 1
 :gui_done
 rem Decoder/cache owns stb_image, the vendored libwebp TU and gui_image_svg.c;
 rem it has no window, FreeType or GUI dependency.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I %TP%\libwebp\src -O2 -c %DRV%\image\zan_image.c -DZAN_IMAGE_STATIC -o toolchain\wasm32\zanrt_image.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -I %TP%\libwebp\src -O2 -ffunction-sections -fdata-sections -c %DRV%\image\zan_image.c -DZAN_IMAGE_STATIC -o toolchain\wasm32\zanrt_image.o || exit /b 1
 rem Game consumes the shared graphics context and image cache via their headers.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -O2 -c %DRV%\game\zan_game.c -DZAN_GAME_STATIC -o toolchain\wasm32\zanrt_game.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -O2 -ffunction-sections -fdata-sections -c %DRV%\game\zan_game.c -DZAN_GAME_STATIC -o toolchain\wasm32\zanrt_game.o || exit /b 1
 rem WASI keeps offline WAV/Vorbis APIs and the existing no-device result;
 rem zan_audio.c's WASI path must not require desktop pthread/dlopen backends.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -c %DRV%\audio\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -I %DRV% -I %TP% -O2 -ffunction-sections -fdata-sections -c %DRV%\audio\zan_audio.c -DZAN_AUDIO_STATIC -o toolchain\wasm32\zanrt_audio.o || exit /b 1
 rem Single-threaded sync equivalents for wasm32 GUI programs (rt_sync_wasm.c):
 rem threads run their body synchronously, atomics are plain cells, the shared
 rem table degrades to "unavailable", clocks are real. main.c links this next to
 rem zanrt_gui.o so GUI-sized stdlib pull-ins (DataTable export, HttpClient
 rem timeout plumbing) satisfy zan_thread_/zan_atomic_int_/zan_monotonic_/
 rem zan_shared_table_ references without rt_sync.o.
-"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -c %RT%\rt_sync_wasm.c -o toolchain\wasm32\zanrt_syncw.o || exit /b 1
+"%ZIG%" cc -target wasm32-wasi -g0 -std=gnu11 -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync_wasm.c -o toolchain\wasm32\zanrt_syncw.o || exit /b 1
 echo built toolchain\wasm32
 
 rem Android (bionic): zig cc has no bionic target, so this block needs the
@@ -214,21 +214,21 @@ set NDKBIN=%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin
 for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
   for /f "tokens=1,2 delims=:" %%A in ("%%P") do (
     if not exist toolchain\%%A mkdir toolchain\%%A
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
-"%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+"%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || exit /b 1
     rem One archive member per feature, matching the host and POSIX recipes.
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
     for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
-      "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
+      "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       "%NDKBIN%\llvm-ar.exe" rcs toolchain\%%A\libzancrypto.a toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       del /q toolchain\%%A\zan_crypto_%%~nC.o
     )
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -I src\common -O2 -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
-    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -I src\common -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     for %%L in (libc++abi.a libunwind.a) do (
       call :copy_android_archive %%B-linux-android28 %%L "toolchain\%%A" || exit /b 1
     )
@@ -278,33 +278,33 @@ for %%P in (ohos-x64:x86_64-linux-ohos ohos-arm64:aarch64-linux-ohos) do (
     for %%L in (libdl.a libpthread.a) do (
       copy /y "%OHOSSYS%\usr\lib\%%B\%%L" "toolchain\%%A\%%L" >nul || exit /b 1
     )
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -DZAN_IO_STACKLESS_ONLY -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_io.c    -o toolchain\%%A\zanrt_io.o    || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     rem arm64: OHOS clang 15's arm_neon.h declares the FEAT_SHA2 intrinsics
     rem (rt_hw_accel.c's SHA-256 kernel) only under a TU-level feature macro
     rem -- the target("sha2") attribute enables codegen but not the header
     rem guard -- so the timer object needs -march. Handled after the loop;
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%A"=="ohos-x64" exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || if "%%A"=="ohos-x64" exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || if "%%A"=="ohos-x64" exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -O2 -ffunction-sections -fdata-sections -c %RT%\rt_crash.c -o toolchain\%%A\zanrt_crash.o || if "%%A"=="ohos-x64" exit /b 1
     rem One archive member per feature. OHOS clang 15 needs its ARM crypto
     rem header macro only for the hash implementation, never for CPU dispatch.
     if exist toolchain\%%A\libzancrypto.a del /q toolchain\%%A\libzancrypto.a
     for %%C in ("%ACCEL%\hw\rt_hw_*.c") do (
       if "%%A/%%~nC"=="ohos-arm64/rt_hw_hash" (
-        "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
+        "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -march=armv8-a+crypto -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       ) else (
-        "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
+        "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I %ACCEL% -O2 -ffunction-sections -fdata-sections -c "%%~fC" -o toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       )
       "%OHOSBIN%\llvm-ar.exe" rcs toolchain\%%A\libzancrypto.a toolchain\%%A\zan_crypto_%%~nC.o || exit /b 1
       del /q toolchain\%%A\zan_crypto_%%~nC.o
     )
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -I src\common -O2 -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -I %RT% -I %EMBED% -I src\common -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -ffunction-sections -fdata-sections -c %EMBED%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     rem zap_main.o is the HAP XComponent shell adapter zanc puts at the head
     rem of every ohos -shared link; the source is arch-independent and lives
     rem next to the x64 subset (the first arch that shipped it).
-    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -O2 -c toolchain\ohos-x64\zap_main.c -o toolchain\%%A\zap_main.o || exit /b 1
+    "%OHOSBIN%\clang.exe" --sysroot="%OHOSSYS%" -target %%B -g0 -std=c11 -fPIC -O2 -ffunction-sections -fdata-sections -c toolchain\ohos-x64\zap_main.c -o toolchain\%%A\zap_main.o || exit /b 1
     rem The OHOS GUI driver is a prebuilt archive that calls EGL/GLES and
     rem FreeType directly, so the link needs the NDK's own libraries. Copy
     rem them out of the sysroot -- the device supplies the real ones at run

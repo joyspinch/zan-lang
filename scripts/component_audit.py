@@ -4,7 +4,7 @@
 约定（每条都对应一次真实返工，见 TASKS.md 与 git 历史）：
 
 R1 名单一致   同一份"控件 kind 名单"在三处副本里必须对得上：
-              ① 运行期重建注册表（ControlBootstrap.Names + 各族 bootstrap）
+              ① 编译器 [GuiKind] 清单（各包控件类/工厂方法上的 [GuiKind("...")]）
               ② 编译期限定名单（GenForm.IsStdWidgetKind / IsHmiKind）
               ③ 控件自己声明的 Kind()
               两个方向都要对：
@@ -35,8 +35,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUI = os.path.join(ROOT, 'packages/Zan.Gui/src/Gui')
 INDUSTRIAL = os.path.join(ROOT, 'packages/Zan.Industrial/src/Gui/Hmi')
-BASE_CSS = os.path.join(GUI, 'skins/base.css')
-BOOTSTRAP = os.path.join(GUI, 'Core/ControlBootstrap.zan')
+BASE_CSS = os.path.join(ROOT, 'packages/Zan.Gui/skins/base.css')
 GENFORM = os.path.join(ROOT, 'stdlib/System/Compiler/GenForm.zan')
 
 # 审计范围：核心控件库（Widget/Component/Core/Layout）+ 工控件。
@@ -51,8 +50,8 @@ INTERNAL = {
     'Popover', 'Prompt', 'Ellipsis', 'Layer', 'Ribbon', 'ScrollView',
     'Split', 'Table',
 }
-# 尺寸档不在自己身上、而是转给子控件的容器。
-SIZE_PASSED_DOWN = {'RadioGroup', 'RadioButtonGroup'}
+# 尺寸档不在自己身上、而是转给子控件/派生类的容器与抽象基类。
+SIZE_PASSED_DOWN = {'RadioGroup', 'RadioButtonGroup', 'InteractiveControl', 'ToggleControl'}
 
 # 借用其他类型外观的控件：它自己的 Kind 不是 CSS 类型，档位规则要查
 # 借用的那一族。key=控件名，value=借用的 CSS 类型。
@@ -89,10 +88,8 @@ RE_GENFORM_QUALIFY = re.compile(
     r'public static string QualifyKind\(string kind\)\s*\{(.*?)\n    \}', re.S)
 RE_NONCONSTRUCTIBLE = re.compile(
     r'static List<string> NonConstructibleKinds\(\)\s*\{(.*?)\n\}', re.S)
-# 各族 bootstrap 的注册点（运行期可重建的 kind）
-RE_REGISTER = re.compile(r'HeavyControls\.Register\(\s*"([A-Za-z0-9]+)"')
-RE_NAMES = re.compile(r'static List<string> Names\(\)\s*\{(.*?)\n    \}', re.S)
-RE_MAKE_BRANCH = re.compile(r'if \(kind == "([A-Za-z0-9]+)"\)')
+# 编译器 [GuiKind] 清单标注点
+RE_GUI_KIND = re.compile(r'\[GuiKind(?:Attribute)?\(\s*"([A-Za-z0-9_]+)"')
 
 
 def read(path):
@@ -118,10 +115,16 @@ def widget_files():
     return out
 
 
-def strip_code(text):
-    """去掉注释与字符串字面量——括号配对不能被它们里的花括号带偏。"""
+def strip_comments(text):
+    """去掉注释但保留字符串字面量，供 [GuiKind("...")] 提取。"""
     text = re.sub(r'/\*.*?\*/', lambda m: ' ' * len(m.group(0)), text, flags=re.S)
     text = re.sub(r'//[^\n]*', lambda m: ' ' * len(m.group(0)), text)
+    return text
+
+
+def strip_code(text):
+    """去掉注释与字符串字面量——括号配对不能被它们里的花括号带偏。"""
+    text = strip_comments(text)
     text = re.sub(r'"(?:[^"\\]|\\.)*"', lambda m: ' ' * len(m.group(0)), text)
     return text
 
@@ -193,20 +196,14 @@ def css_types():
 
 
 def registered_kinds():
-    """运行期可重建的 kind 集合（主注册表 + 各族 bootstrap 的注册点）。"""
+    """编译器 [GuiKind] 清单发现的 kind 集合。"""
     out = set()
-    text = read(BOOTSTRAP)
-    m = RE_NAMES.search(text)
-    if m:
-        out |= set(re.findall(r'"([A-Za-z0-9]+)"', m.group(1)))
     for root, _dirs, names in os.walk(os.path.join(ROOT, 'packages')):
         for name in names:
             if not name.endswith('.zan'):
                 continue
             path = os.path.join(root, name)
-            if not os.path.basename(path).endswith('Bootstrap.zan'):
-                continue
-            out |= set(RE_REGISTER.findall(read(path)))
+            out |= set(RE_GUI_KIND.findall(strip_comments(read(path))))
     return out
 
 
@@ -317,7 +314,7 @@ def main():
     for path in files:
         text = read(path)
         name = os.path.basename(path)[:-4]
-        if name == 'Control':      # 基类就是入口本身
+        if name == 'Control' or name.startswith('Control.'):      # 基类就是入口本身
             continue
         spans = method_spans(text)
         for m in RE_STYLE_DIRECT.finditer(text):

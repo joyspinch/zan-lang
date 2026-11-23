@@ -18,10 +18,10 @@
 - **窗口属性**：`data-win-title/win-w/win-h/win-chrome/win-center` 等
   文档键由 `Form.Show` 装配读取和应用；显式 `Html.Load` 页面入口不创建窗口，
   不消费宿主窗口键。
-- **组件显式注册**：标准组件由 `ControlBootstrap.Install()` 幂等安装，
-  在同一处维护70项 kind→构造器注册，包含 `RadioButton`；HTML 与代码工厂
-  查询同一运行期注册表。扩展组件在自己的显式安装入口调用 `HeavyControls.Register`
-  或 `ControlFactory.Register`，宿主负责安装；不依赖扫描 `.html` 生成第二份注册名单。
+- **组件编译期静态清单**：标准控件与已引入扩展控件统一由 `[GuiKind("...")]`
+  标注，编译器 `[GuiKindManifest]` Pass 在编译期合成 `ControlFactory` 静态分派表
+  （含 `RadioButton` 等别名，无需运行期 `*Bootstrap.Install()`）；HTML 与代码工厂
+  查询同一编译器合成清单。运行期动态扩充仍可调用 `ControlFactory.Register`，但禁止手写第二份静态注册名单。
 - **运行时装载 + `ModelBinder` = 主窗口内的数据驱动页面**：文档负责
   结构与样式，code-behind 负责数据与事件，`data-bind`/`data-if`/
   `data-for` 照常生效（不必把页面做成独立子窗口）。

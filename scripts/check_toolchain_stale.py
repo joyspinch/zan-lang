@@ -524,7 +524,8 @@ def rebuild_cmd(artifact, zig, ndk):
             return None
         if name == "zan_inflate.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=c11",
-                    "-O2", "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
+                    "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
                     "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
                     "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
                     "-c", f"{embed}/zan_inflate.c"]
@@ -539,7 +540,8 @@ def rebuild_cmd(artifact, zig, ndk):
                              and os.path.isfile("toolchain/wasm32/libfreetype.a"))
             if with_freetype:
                 cmd += ["-I", ft_inc, "-I", "toolchain/wasm32/freetype-shim"]
-            cmd += ["-O2", "-c", f"{drv}/gui/gui_runtime.c", "-DZAN_GUI_WASM",
+            cmd += ["-O2", "-ffunction-sections", "-fdata-sections", "-c",
+                    f"{drv}/gui/gui_runtime.c", "-DZAN_GUI_WASM",
                     "-DZAN_GUI_STATIC"]
             if with_freetype:
                 cmd += ["-DZAN_GUI_FREETYPE"]
@@ -555,15 +557,18 @@ def rebuild_cmd(artifact, zig, ndk):
                    "-I", rt, "-I", drv, "-I", tp]
             if name == "zanrt_image.o":
                 cmd += ["-I", f"{tp}/libwebp/src"]
-            return cmd + ["-O2", "-c", source, f"-D{static_macro}"]
+            return cmd + ["-O2", "-ffunction-sections", "-fdata-sections", "-c",
+                          source, f"-D{static_macro}"]
         if name == "zanrt_syncw.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
-                    "-I", rt, "-O2", "-c", f"{rt}/rt_sync_wasm.c"]
+                    "-I", rt, "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-c", f"{rt}/rt_sync_wasm.c"]
         # c11, not `std` (only bound in the linux/macos branches below --
         # NameError'd the moment a wasm object went date-stale): the .cmd's
         # wasm block builds file/timer/wasm with -std=c11.
         return ([zig, "cc", "-target", "wasm32-wasi", "-g0"] + c11
-                + ["-I", rt, "-O2", "-c", f"{rt}/{src}"])
+                + ["-I", rt, "-O2", "-ffunction-sections", "-fdata-sections",
+                   "-c", f"{rt}/{src}"])
     elif d.startswith("linux-"):
         arch = {"linux-musl": "x86_64", "linux-arm64": "aarch64",
                 "linux-riscv64": "riscv64"}[d]
@@ -582,20 +587,26 @@ def rebuild_cmd(artifact, zig, ndk):
         if name == "zan_embed_api.o":
             return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
                     "-g0", "-std=c11", "-fPIC", "-I", rt, "-I", embed, "-I", "src/common",
-                    "-O2", "-c", f"{embed}/zan_embed_api.c"]
+                    "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-c", f"{embed}/zan_embed_api.c"]
         if name == "zan_inflate.o":
             return [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28",
                     "-g0", "-std=c11", "-fPIC", "-DMINIZ_NO_ARCHIVE_APIS",
                     "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
-                    "-I", rt, "-I", "src/common", "-O2", "-c", f"{embed}/zan_inflate.c"]
+                    "-I", rt, "-I", "src/common", "-O2",
+                    "-ffunction-sections", "-fdata-sections",
+                    "-c", f"{embed}/zan_inflate.c"]
         base = [clang, "--sysroot", sysroot, "-target", f"{arch}-linux-android28"]
         if src == "rt_io.c":
             # io_mt compiles rt_io.c (+ZAN_CO_DRIVER), never rt_io_mt.c.
-            cmd = base + ["-g0", "-fPIC", "-I", rt, "-O2", "-DZAN_IO_STACKLESS_ONLY"]
+            cmd = base + ["-g0", "-fPIC", "-I", rt, "-O2",
+                          "-ffunction-sections", "-fdata-sections",
+                          "-DZAN_IO_STACKLESS_ONLY"]
             if name == "zanrt_io_mt.o":
                 cmd += ["-DZAN_CO_DRIVER"]
             return cmd + ["-c", f"{rt}/rt_io.c"]
-        return (base + ["-g0", "-fPIC", "-I", rt, "-O2"] + c11
+        return (base + ["-g0", "-fPIC", "-I", rt, "-O2",
+                        "-ffunction-sections", "-fdata-sections"] + c11
                 + ["-c", f"{rt}/{src}"])
     elif d.startswith("ohos-"):
         # Mirror scripts/build_ohos_rt_zig.sh flag for flag (the NDK path in
@@ -609,7 +620,8 @@ def rebuild_cmd(artifact, zig, ndk):
         if name == "zap_main.o":
             # HAP shell adapter: no -D__OHOS__, no runtime includes.
             return [zig, "cc", "-target", f"{arch}-linux-musl", "-g0", "-std=c11",
-                    "-fPIC", "-O2", "-c", "toolchain/ohos-x64/zap_main.c"]
+                    "-fPIC", "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-c", "toolchain/ohos-x64/zap_main.c"]
         table = {
             "zanrt_io.o":
                 (["-DZAN_IO_STACKLESS_ONLY", "-I", rt, "-c", f"{rt}/rt_io.c"]),
@@ -631,7 +643,8 @@ def rebuild_cmd(artifact, zig, ndk):
             return None  # the OHOS NDK's libEGL/libGLESv3/libfreetype: copied
                          # out of the SDK by build_cross_rt.cmd, not repo-built
         return ([zig, "cc", "-target", f"{arch}-linux-musl", "-D__OHOS__",
-                 "-g0", "-fPIC", "-O2"] + table[name])
+                 "-g0", "-fPIC", "-O2", "-ffunction-sections", "-fdata-sections"]
+                + table[name])
     elif d.startswith("ios/"):
         # zig's ios os-tag wires no libc include dir; the Darwin headers ship
         # as any-macos-any, so hand them in (-I). Same flags as the macos
@@ -641,7 +654,8 @@ def rebuild_cmd(artifact, zig, ndk):
         zroot = os.path.dirname(zig)
         base = [zig, "cc", "-target", "aarch64-ios.14.0",
                 "-I", os.path.join(zroot, "lib", "libc", "include", "any-macos-any"),
-                "-g0", "-fPIC", "-I", rt, "-O2"]
+                "-g0", "-fPIC", "-I", rt, "-O2",
+                "-ffunction-sections", "-fdata-sections"]
         if name == "zanrt_io.o":
             return base + ["-DZAN_IO_STACKLESS_ONLY", "-c", f"{rt}/rt_io.c"]
         if name == "zanrt_io_mt.o":
@@ -650,7 +664,6 @@ def rebuild_cmd(artifact, zig, ndk):
         if name == "zanrt_gui.o":
             # Same UIKit translation unit as both explicit cross-build scripts.
             return base + c11 + ["-DZAN_GUI_IOS", "-DZAN_GUI_STATIC", "-I", drv,
-                                 "-ffunction-sections", "-fdata-sections",
                                  "-c", f"{drv}/gui/gui_runtime.c"]
         if name == "zan_embed_api.o":
             return base + c11 + ["-I", embed, "-c", f"{embed}/zan_embed_api.c"]
@@ -660,6 +673,7 @@ def rebuild_cmd(artifact, zig, ndk):
             return ([zig, "cc", "-target", "aarch64-ios.14.0",
                      "-I", os.path.join(zroot, "lib", "libc", "include", "any-macos-any"),
                      "-g0", "-std=c11", "-fPIC", "-O2",
+                     "-ffunction-sections", "-fdata-sections",
                      "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS",
                      "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME",
                      "-DMINIZ_NO_ARCHIVE_WRITERS",
@@ -679,18 +693,24 @@ def rebuild_cmd(artifact, zig, ndk):
     if d.startswith("macos/") and name == "zanrt_gui.o":
         # macOS GUI shim object compiles gui_compat_mac.c, not rt_gui.c.
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
-                "-I", rt, "-I", drv, "-O2", "-c", f"{drv}/gui/gui_compat_mac.c"]
+                "-I", rt, "-I", drv, "-O2",
+                "-ffunction-sections", "-fdata-sections",
+                "-c", f"{drv}/gui/gui_compat_mac.c"]
     if name == "zan_embed_api.o":
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC",
-                "-I", rt, "-I", embed, "-O2", "-c", f"{embed}/zan_embed_api.c"]
+                "-I", rt, "-I", embed, "-O2",
+                "-ffunction-sections", "-fdata-sections",
+                "-c", f"{embed}/zan_embed_api.c"]
     if name == "zan_inflate.o":
         return [zig, "cc", "-target", target, "-g0", "-std=c11", "-fPIC", "-O2",
+                "-ffunction-sections", "-fdata-sections",
                 "-DMINIZ_NO_ARCHIVE_APIS", "-DMINIZ_NO_ZIP_APIS", "-DMINIZ_NO_STDIO",
                 "-DMINIZ_NO_TIME", "-DMINIZ_NO_ARCHIVE_WRITERS", "-I", "src/common",
                 "-c", f"{embed}/zan_inflate.c"]
     if not zig:
         return None
-    cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2"]
+    cmd = [zig, "cc", "-target", target, "-g0", "-fPIC", "-I", rt, "-O2",
+           "-ffunction-sections", "-fdata-sections"]
     if name in ("zanrt_io.o", "zanrt_io_mt.o"):
         # io/io_mt compile rt_io.c with the default gnu dialect -- -std=c11
         # hides the POSIX decls (sigemptyset, clock_gettime) and shifts every

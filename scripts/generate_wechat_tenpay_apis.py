@@ -15,11 +15,13 @@ from generate_wechat_product_apis import (
 )
 from wechat_typed_codegen import (
     ModelIndex, Field, SharedModelRegistry, build_request_fields, response_fields, map_type,
-    setter_call, parse_params, filtered_params, safe, simple_type,
+    setter_call, parse_params, filtered_params, safe, simple_type, write_layered_contracts,
 )
 
+ROOT = Path.cwd()
+PKG_WECHAT = ROOT / 'packages/Zan.Sdk.Wechat/src/Sdk/Wechat'
 VENDORED = ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.TenPay'
-OUTPUT = ROOT / 'stdlib/Sdk/Wechat/TenPay'
+OUTPUT = PKG_WECHAT / 'TenPay'
 MARKER = 'Generated from Senparc WeChat Pay APIs'
 
 SOURCE_GROUPS = [
@@ -232,7 +234,8 @@ def typed_request_parts(api_class, entry, index, mode, models):
     base = api_class + re.sub(r'Async$', '', entry['name'])
     request_name = base + 'Request'
     response_name = base + 'Response'
-    lines = [f'class {request_name} {{']
+    req_lines = [f'class {request_name} {{']
+    lines = req_lines
     if mode == 'v2':
         lines += ['    WechatPayV2Request request;', '']
         lines += [f'    public {request_name}() {{ this.request = new WechatPayV2Request(); }}', '']
@@ -283,14 +286,15 @@ def typed_request_parts(api_class, entry, index, mode, models):
             lines += [f'        result = result.Replace("{{{placeholder}}}", Encoding.UrlEncode(this.request.ValueText("{key}")));']
         lines += ['        return result;', '    }', '    string QueryText() { return this.request.QueryText(); }', '    string JsonBody() { return this.request.JsonBody(); }', '']
     else:
-        lines += ['    WechatPayV2Request Inner() { return this.request; }', '']
-    lines += ['}', '']
+        req_lines += ['    WechatPayV2Request Inner() { return this.request; }', '']
+    req_lines += ['}', '']
+    resp_lines = []
     response_cs, rfields = response_fields(method, index, method['source'])
     shared_base = '' if mode == 'v2' else models.model_type(response_cs, method['source'])
     if shared_base:
-        lines += [f'class {response_name} : {shared_base} {{', '    public string Raw;', '}', '']
+        resp_lines += [f'class {response_name} : {shared_base} {{', '    public string Raw;', '}', '']
     else:
-        lines += [f'class {response_name} {{', '    public string Raw;']
+        resp_lines += [f'class {response_name} {{', '    public string Raw;']
         used = {'Raw'}
         for field in rfields:
             name = safe(field.key)
@@ -299,10 +303,10 @@ def typed_request_parts(api_class, entry, index, mode, models):
             ztype = models.type(field.cs_type, field.source_path or method['source'])
             # V2 XML values stay strings so identifiers keep leading zeroes.
             if mode == 'v2' and ztype != 'JsonValue': ztype = 'string'
-            lines.append(f'    public {ztype} {name};')
-        if not rfields: lines.append('    public JsonValue Value;')
-        lines += ['}', '']
-    return request_name, response_name, lines, rfields
+            resp_lines.append(f'    public {ztype} {name};')
+        if not rfields: resp_lines.append('    public JsonValue Value;')
+        resp_lines += ['}', '']
+    return request_name, response_name, req_lines, resp_lines, rfields
 
 
 def raw_method_lines(entry, mode):
@@ -351,12 +355,28 @@ def render_module(group, root, path, mode, index, models):
         f'/// {MARKER}; regenerate with scripts/generate_wechat_tenpay_apis.py.',
         '/// </summary>',
     ]
-    declarations = []; typed = []
+    req_blocks = []
+    resp_blocks = []
+    typed = []
     for entry in entries:
-        req, resp, model_lines, rfields = typed_request_parts(cls, entry, index, mode, models)
-        declarations += model_lines
+        req, resp, req_lines, resp_lines, rfields = typed_request_parts(cls, entry, index, mode, models)
+        if req_lines:
+            req_blocks.append(req_lines)
+        if resp_lines:
+            resp_blocks.append(resp_lines)
         typed.append((entry, req, resp, rfields))
-    lines += declarations
+    dom_stem = re.sub(r'^(?:WechatPayV3|WechatPayLegacy)', '', cls)
+    dom_stem = re.sub(r'Api$', '', dom_stem) or 'TenPay'
+    if req_blocks:
+        write_layered_contracts(
+            PKG_WECHAT / 'Requests/TenPay', f'{dom_stem}Requests.zan',
+            'Sdk.Wechat.Models.TenPay', ['using System.Text;', 'using Sdk.Wechat;', 'using Sdk.Wechat.TenPay;'],
+            MARKER, 'scripts/generate_wechat_tenpay_apis.py', req_blocks)
+    if resp_blocks:
+        write_layered_contracts(
+            PKG_WECHAT / 'Responses/TenPay', f'{dom_stem}Responses.zan',
+            'Sdk.Wechat.Models.TenPay', ['using Sdk.Wechat;', 'using Sdk.Wechat.TenPay;'],
+            MARKER, 'scripts/generate_wechat_tenpay_apis.py', resp_blocks)
     lines += [f'class {cls} {{', f'    {client} client;', '', f'    public {cls}({client} client) {{ this.client = client; }}', '']
     for entry, req, resp, rfields in typed:
         shown_path = entry['path'] if entry['path'] else '(request.RequestPath 指定)'
@@ -408,15 +428,9 @@ def main():
             modules.append({'group': group, 'source': path.relative_to(root).as_posix(),
                             'file': filename, 'class': target.stem, 'mode': mode,
                             'methods': [{k: v for k, v in entry.items() if not k.startswith('_')} for entry in entries]})
-    models_dir = ROOT / 'stdlib/Sdk/Wechat/Models/TenPay'
-    models_dir.mkdir(parents=True, exist_ok=True)
-    for old in models_dir.glob('*.zan'):
-        if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
-            old.unlink()
-    (models_dir / 'WechatPayModels.zan').write_text(
-        models.render('Sdk.Wechat.Models.TenPay', MARKER,
-                      'scripts/generate_wechat_tenpay_apis.py'),
-        encoding='utf-8', newline='\n')
+    models.render_domains(
+        PKG_WECHAT / 'Models/TenPay', 'Sdk.Wechat.Models.TenPay', MARKER,
+        'scripts/generate_wechat_tenpay_apis.py', lambda name: 'Common')
 
     manifest = {
         'modules': modules,

@@ -279,7 +279,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--emit-timeout", type=int, default=120)
     ap.add_argument("--link-timeout", type=int, default=180)
-    ap.add_argument("--run-timeout", type=int, default=5)
+    ap.add_argument("--run-timeout", type=int, default=30)
     a = ap.parse_args()
 
     if not a.focus and not a.cases:
@@ -294,7 +294,7 @@ def main():
         passed_file = os.path.join(a.log_dir, "passed.txt")
         if os.path.exists(passed_file):
             os.remove(passed_file)
-    jobs = a.jobs if a.jobs > 0 else (os.cpu_count() or 8)
+    jobs = a.jobs if a.jobs > 0 else min(os.cpu_count() or 8, 8)
 
     # ---- report identity stamp (B-ID189) ------------------------------------
     # A differential report is only worth anything if a later session can

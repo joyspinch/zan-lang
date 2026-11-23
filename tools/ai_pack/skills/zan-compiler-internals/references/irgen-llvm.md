@@ -342,7 +342,7 @@
   掩盖裁剪错误。验收同时检查 thunk、实际 callee 非死桩及真实调用；表/payload 正确
   不能证明 callee body 可执行。host 反射初始化 probe 与相关 IR 门已通过；不外推自举。
 - **主对象与分片对象共用发布分节策略**：对象写出前统一准备可回收节，不能只在主对象路径设置；准备时机须晚于分片规划，避免 COMDAT 改变可移动性。Windows COFF 强定义使用独立 `$` 子节和 NODUPLICATES COMDAT，保留重复强定义报错；弱运行时后备函数、既有 ODR 组、TLS 与显式特殊节保留原契约。MinGW 函数节须带 `$函数名`，才能生成独立展开信息。验证必须检查最终链接的活/死函数与数据符号，并实际运行；未定义符号可能在 GC 前报错，不能用其消失与否代替裁剪验证。
-- **方法名形似事件不等于独立保留根**：精确扫描到的 HTML handler 可独立保留；发布模式通用 `On*` 调用桩与 body root 共用实际发射的 `Invoke*` 名字需求。字面量精确去重，计算名字与含 NUL 名字保守回退；死方法不贡献需求，晚发现名字须继续固定点。成员签名与 HasMethod 不随调用桩裁剪，属性和注解保留既有契约。派生反射表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；继承访问器须按派生 owner 中的属性名识别，不能要求其声明也出现在派生成员表。`publish_reflect_invoke_demand_literal/dynamic` 与 IR 门禁共同验证死 hook 裁剪、动态回退、继承调用、晚发现调用及属性读写；冻结站点表和生成死桩的时序不变。
+- **方法名形似事件不等于独立保留根**：发布模式通用 `On*` 调用桩与 body root 共用实际发射的 `Invoke*` 名字需求。字面量精确去重，计算名字与含 NUL 名字保守回退；死方法不贡献需求，晚发现名字须继续固定点。成员签名与 HasMethod 不随调用桩裁剪，属性和注解保留既有契约。派生反射表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；继承访问器须按派生 owner 中的属性名识别，不能要求其声明也出现在派生成员表。`publish_reflect_invoke_demand_literal/dynamic` 与 IR 门禁共同验证死 hook 裁剪、动态回退、继承调用、晚发现调用及属性读写；冻结站点表和生成死桩的时序不变。
 - **字段 TypeInfo 不证明实例方法体可达**：保留字段与方法签名查询，把实例 hook/thunk 的接收者资格另行判断；派生分配可接收基类声明的方法，动态 CreateInstance、库导出和托管 extern 返回/ref/out 维持保守契约；extern 数组元素与结构体字段须递归检查并替换闭合泛型实参，string、byte[] 和纯数值结构体不应误关裁剪。运行时 guard 的 site=0 对象仍有真实虚表 store，不能仅凭普通分配站点缺失认定无实例。回归同时验证 metadata-only 的 HasMethod 以及字段 TypeInfo 构造派生实例并调用继承 hook。
 - **接口候选不能给自身制造保留证据**：发射候选时保存具体类型与闭合虚表的 instruction metadata；活性固定点只在独立分配站点、真实虚表 store 或保守回退存在时启用候选调用边。候选的 tag 比较属于观察，不能当构造证据；普通调用、委托和未知 metadata 保守处理。不能在发射时按尚未完整的 sites 提前过滤，也不能等候选 body 发出并 new 自己后再判断。用 late allocation、继承实现、闭合泛型正例和自分配死实现负例联合验证。
 - **ARC 抵消只认同一 SSA 对象**：同一字段地址的两次 load 可在中间回调改写后得到不同对象，不能据地址相等抵消 retain/release；仅剥离 pointer cast 后的 SSA identity 足够。若要跨 load 优化，必须先证明内存没有被改写。分片在自定义 ARC 优化之前提取，裁剪改变函数所在模块会暴露旧优化缺陷；用弱引用生命周期与正常优化 GUI 运行验收，不能靠关闭 ARC 优化交付。
@@ -567,6 +567,12 @@
 - `emit_async.c` 的 `async_scan_stmt` 之前，安装当前 work item 的方法类型形参、实参和接收者实例（`w->mtps`、`w->mbind`、`w->cur_inst`）；扫描结束恢复调用者环境。帧槽类型和 ARC owner 分类必须与写入该槽的 resume 体一致。
 - 扫描留在开放泛型环境时，恢复体仍可能正确写入具体引用值，却没有为该槽生成释放路径。典型形状是泛型转发器 `return await factory.Open()`，以及等价的命名局部与 `try/finally` 形状；返回值正确不代表 owner 已回收。
 - 用 `case_async_generic_frame_owner` 检查结果与泄漏。独立探针使用未优化构建配合 `--check-leaks --arc-guard --strict-runtime`，三种形状都应返回 42 且无运行时诊断。
+
+## 22. 500+ 实体 EH `-O2` 扩展性与未限定泛型静态接收者推导（2026-11-23 实证）
+
+- **EH helper `noinline`、冷 `try.lpad` volatile release 与 guard outlining 消除 `-O2` 组合爆炸**：单函数 N 个顺序 `try` + 引用局部时，内联 `__zan_eh_tmp_push` / `__zan_eh_tmp_pop` / `__zan_eh_state_fast` 叠加 `try.lpad` 清理把 CFG 块与 TLS/SSA 数据流放大到 PassBuilder / InstCombine / CodeGen 超时（500 实体 `-O2` >120s、Peak RAM 2,246 MB）。`builtin_eh_state.c` / `builtin_eh_unwind.c` 对这 3 个 helper 标 `noinline`（Windows `tls_fallback` 也设 `noinline`）；`generic_lpad.c` 在 `cleanup_count > 8` 时保持 `try.lpad` release 为 `volatile` 防跨百块重排；`generic_guard.c` 将空指针/边界校验诊断外提为 `__zan_guard_report_merged`（`noinline` + `cold`）和 `__zan_throw_guard`；`arc_ops.c` 按 64-entry 步长做 `volatile` 屏障，并在 `optimizer.c` 给 `InstCombine` 传保守选项。实测 500 实体 EH+ARC 探针 `-O2 --check-leaks` 降至 ~39s（`optimize` 16.4s、`write obj` 20.4s、Peak RAM 501 MB），输出 `500` 且零泄漏。
+- **未限定泛型静态接收者（`Box.Create(8)`）必须同时覆盖 checker 与 irgen**：`nsresolve_stamp.c` 仅在非当前命名空间时设置 `ident.is_type_receiver = true`，同命名空间 `Box.Create(8)` 的 `is_type_receiver` 为 `false`。`checker_expr_core.c` 的 `uninstantiated_generic_type_recv` 须改用 `checker_method_group_type_receiver(c, obj) == recv->sym`（同时保留泛型类体内 `Box<T>` 开放性与 `diag_host_generic_invariant_return` 的 E2024 校验）。irgen 侧 `call_dispatch.c`、`expr_infer.c` 与 `generic_discover.c` 不能因 `ident_inst_type == NULL` 回退到擦除 `abort()` 桩 `@Box_Create`：需在发码实参前调用 `infer_generic_static_recv_inst`（`lambda_infer.c`）从实参类型推导闭合泛型实例（`locals == NULL` 时用空 `local_scope_t` 兜底避免 `local_find(NULL, ...)` 解引用空指针），并在 `generic_discover.c` 用带作用域 `collect_inst_expr_scoped` 追踪局部变量/`var`/循环变量类型以收集闭合泛型实例。
+- 实证：`case_generic_static_member_access`、`diag_host_generic_invariant_return`、`case_generic_open_call_template`、`case_selfhost_local_exception_owner` 及 76 项 generic/selfhost/EH/async 回归通过；未限定 `Box.Create(x)` / `var b = Box.Create("hello")` / `Pair.Of(42, "ok")` 边界探针 `--check-leaks` 零泄漏。
 
 
 ## 22. 异常态 finally 的原异常拥有者与离开入口（2026-11-11 实证）

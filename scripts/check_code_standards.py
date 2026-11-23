@@ -12,6 +12,7 @@ Validates code changes against core quality baselines:
      no new upward dependencies inside Zan.Gui, no new immediate-mode entry points or
      arbitration calls, no new legacy layout attributes, no new Signal* outside Zan.Gui.
   6. src/compiler must never gain new #include of packages/*/compiler hooks (B-ID222).
+  7. Non-GUI packages (e.g. Zan.Hardware, Zan.Web, Zan.Data, Zan.Desktop) must never depend on Gui.* / Zan.Gui.*.
 
 Usage:
     python scripts/check_code_standards.py --staged      # Check staged git changes (pre-commit)
@@ -95,6 +96,41 @@ def check_stdlib_dependency(rel_path: str, line_num: int, raw_line: str, strippe
         return (
             f"标准库严禁反向依赖 packages ('{m.group(0).strip()}')。\n"
             f"       stdlib 是语言基石，反向引用扩展包会破坏编译闭包与 --no-packages 纯净环境。"
+        )
+    return None
+
+
+# Packages explicitly allowed to reference Gui.* / Zan.Gui.* namespaces
+GUI_ALLOWED_PACKAGES = {
+    "Zan.Browser.Firefox",
+    "Zan.Industrial",
+}
+
+
+def check_non_gui_package_dependency(rel_path: str, line_num: int, raw_line: str, stripped_line: str) -> Optional[str]:
+    """Rule 7: Non-GUI packages must never depend on Gui.* / Zan.Gui.*."""
+    norm_path = rel_path.replace("\\", "/")
+    if not (norm_path.startswith("packages/") and norm_path.endswith(".zan")):
+        return None
+    parts = norm_path.split("/")
+    if len(parts) < 3:
+        return None
+    pkg_name = parts[1]
+    if (
+        pkg_name == "Zan.Gui"
+        or pkg_name.startswith("Zan.Gui.")
+        or pkg_name == "Zan.Game"
+        or pkg_name.startswith("Zan.Game.")
+        or pkg_name in GUI_ALLOWED_PACKAGES
+    ):
+        return None
+
+    m = re.match(r'^\s*using\s+(?:Gui|Zan\.Gui)(?:\.[a-zA-Z0-9_.]+)?\s*;', stripped_line)
+    if m:
+        return (
+            f"非 GUI 包 '{pkg_name}' 严禁依赖 GUI 命名空间 ('{m.group(0).strip()}')。\n"
+            f"       在基础/硬件/服务端包中引入 Gui.* 会将 800+ UI 文件、zan_gui 驱动及窗口子系统拖入服务端编译闭包；"
+            f"请使用依赖倒置接口（如 IHardwareHost）由上层宿主注入。"
         )
     return None
 
@@ -240,6 +276,10 @@ def check_staged() -> int:
             if err:
                 violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
 
+            err = check_non_gui_package_dependency(rel_path, line_num, raw_line, stripped)
+            if err:
+                violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
+
             err = check_compiler_package_include(rel_path, line_num, raw_line, stripped)
             if err:
                 violations.append(f"[FAIL] {rel_path}:{line_num} - {err}")
@@ -287,6 +327,10 @@ def check_files(paths: List[str]) -> int:
                 violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
 
             err = check_stdlib_dependency(rel_path, idx, raw_line, stripped)
+            if err:
+                violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
+
+            err = check_non_gui_package_dependency(rel_path, idx, raw_line, stripped)
             if err:
                 violations.append(f"[FAIL] {rel_path}:{idx} - {err}")
 

@@ -167,9 +167,8 @@ $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x6
 Write-Output "[zanc] $zanc"
 
 $files = @()
-# IDE sources (the standard project's own code). The IDE's own components
-# register their kinds into HeavyControls at startup (IdeBootstrap.Install),
-# so no build-time component registry is generated any more.
+# IDE sources (the standard project's own code). Component kinds are discovered
+# automatically from [GuiKind] attributes by the compiler's [GuiKindManifest] pass.
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer); recurse so every part is compiled.
@@ -258,14 +257,13 @@ $designs | ForEach-Object {
     $script:embedArgs += @("--embed", "$_=ide/$rel")
 }
 
-# ---- 2.5) 设计稿半件 + 组件注册表（自发现）---------------------------------
-# 扫描 .html 设计稿：生成 <Name>.design.zan 半件与 IdeDesignedRegistry.zan。
-# 新增组件 = 新增 .html(+code-behind)，下次构建自动进表——没有手工清单。
+# ---- 2.5) 设计稿半件（自发现）-----------------------------------------------
+# 扫描 .html 设计稿：生成带 [GuiKind] 的 <Name>.design.zan 半件。
 if (-not $SkipDesignGeneration) {
     python scripts/gen_design_halves.py
     if ($LASTEXITCODE -ne 0) { Write-Output "DESIGN_HALVES_FAILED"; exit 1 }
 } else {
-    Write-Output '[designs] using existing generated halves and registry'
+    Write-Output '[designs] using existing generated halves'
 }
 
 # The source list goes through a zanc @file response file: the explicit list

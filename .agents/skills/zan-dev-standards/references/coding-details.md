@@ -21,13 +21,13 @@
      原因：漏接布局曾使 `style="width:88px"` 无效；将 padding 简写首数
      写入 Pad 又会丢失四边和单位，并在替换样式后残留 padSet。回归同时检查
      实际槽位、替换样式和 DPI，不以样式字段正确代替布局正确。
-  ③ **控件 kind 与构造注册保持同一事实源**：`ControlBootstrap.Install()`
-     对 70 个核心 kind 各写一条 `ControlFactory.Register(kind, constructor)`，
-     不再维护独立 Names/Make 名单；可选包仍由各自显式 Install 注册，
-     应用组件继续自声明 Install 走 HeavyControls 自发现。注册键必须与
-     实例 `Kind()` 一致（含 RadioButton 形态），HTML 别名保持原映射。
-     新增或调整 kind 时验证自然构造、工厂、HTML、Html.Clone 及弱引用
-     释放等价；复合控件通过 CloneContentTo 复制业务内容并重建生成部件。
+  ③ **控件 kind 与构造注册保持同一事实源**：各包/应用控件直接在类上标注
+     `[GuiKind("...")]`（泛型控件标注默认实参 `[GuiKind("Transfer", typeof(Transfer<string>))]`），
+     由编译器 `[GuiKindManifest]` Pass 合成 `ControlFactory` 静态分派，不再手写
+     `ControlBootstrap.Install()`、`*Bootstrap.Install()` 或 `HeavyControls` 重复清单。
+     注册键必须与实例 `Kind()` 一致（含 RadioButton 形态），HTML 别名保持原映射。
+     新增或调整 kind 时验证自然构造、工厂、HTML、Html.Clone 及弱引用释放等价；
+     复合控件通过 CloneContentTo 复制业务内容并重建生成部件。
      编译期 GenForm 限定名单已删除，不恢复重复清单。
 - **Win32 资源所有权必须分开记账，程序默认图标取自身 exe**：
   ① **系统共享图标不能销毁**：`LoadIcon(0, IDI_APPLICATION)` 这类是系统资源，

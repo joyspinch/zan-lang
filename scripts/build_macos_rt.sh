@@ -110,7 +110,7 @@ if [ ! -f "$IOSHDR/pthread.h" ]; then
 fi
 mkdir -p "$ios_out"
 "$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
-    -I "$RT" -O2 -c "$RT/rt_crash.c" -o "$ios_out/zanrt_crash.o"
+    -I "$RT" -O2 -ffunction-sections -fdata-sections -c "$RT/rt_crash.c" -o "$ios_out/zanrt_crash.o"
 "$ZIG" cc -target aarch64-ios.14.0 -I "$IOSHDR" -g0 -std=c11 -fPIC \
     -DZAN_GUI_IOS -DZAN_GUI_STATIC -I "$RT" -I "$DRV" -O2 -ffunction-sections -fdata-sections \
     -c "$DRV/gui/gui_runtime.c" -o "$ios_out/zanrt_gui.o"

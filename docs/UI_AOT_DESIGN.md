@@ -53,17 +53,17 @@ partial class X : Form {
 - **静态属性 → `SetProp` 直调**；`data-x-<key>` JSON 复合值预解析成
   `ApplyXProp` 的现成参数（运行期不再拼串）。
 - **事件接线静态化**：`@click="OnOk"` 生成
-  `c.SetHandler("click", vm.OnOk)` 形态的方法组直调——按名 `Invoke` 反射与
-  publish 的 `zan_embed_collect_html_handlers` 扫描补洞（main_frontend.c:446）
-  对 AOT 页面双双消失。副作用（有意的行为变更）：handler 缺失/拼错从运行期
-  exit 1 前移为编译错误，诊断面更优；`DocWire.AutoWire` 对 AOT 页面跳过。
+  `c.SetHandler("click", vm.OnOk)` 形态的方法组直调。当前运行期文档可通过
+  `ModelBinder.Handle` 和 `HandleArg` 显式注册方法组。仅包含事件的窗口使用
+  `Form.ShowStaticWith`，通过 `HandlerRegistry.Set` 和 `SetArg` 注册。
+  两种入口都在开窗前对账。规划中的 AOT 生成器将处理器缺失或拼写错误提前到生成或编译阶段。
 - **`bind`/`:prop` → `DeclareBinding` 直调**；`z-mount`/`slot` → `MountSlot` 直调。
 - **`data-for` 模板行**：行子树保留运行期构建——生成物只落
   "原型子树构建委托"（`RegisterTemplates` 的注册参数从"HTML 片段字符串"换成
   "构建委托"），keyed diff/`ScopeRow`/`Clone` 机制原样复用。
-- **`<include>`**：编译期按同一 VFS 口径（publish 加密 VFS / 开发态散盘，
-  `Form.Show.zan:184-199`）展开 8 层封顶，语义与 `Html.ExpandIncludes` 对齐，
-  金标回归锁往返。
+- **`<include>`**：规划中的生成器沿用 `Html.ExpandIncludes` 的递归规则。
+  显式发布入口按完整 VFS 资源名读取片段，开发入口通过 `Form.ReadDoc` 查找片段。
+  金标回归覆盖展开结果。
 
 ## 3. 静态样式：预解析 + 预索引，级联匹配器不动
 
@@ -99,8 +99,8 @@ StyleBox 缓存命中免 Clone）。AOT 管的是"每次装载/换页"的一次�
   耗与树规模解耦；金标 `gui_layout_*` 布局树全绿。
 - **P2 AOT 结构与接线**：验收 = ① 全部 gui 模板走 AOT 通道，金标 = 同页面
   运行期解析建树 vs 生成建树的 CaptureSnapshot 布局树逐字节一致；②
-  handler 拼错在编译期报错（新 conformance 用例）；③ 发布产物不再含
-  html_handlers 反射保留段（AOT 页面）；④ 尺寸门禁沿 B-ID218 预算——
+  handler 拼错在编译期报错（新 conformance 用例）；③ 发布产物通过生成的
+  方法组调用页面处理器；④ 尺寸门禁沿 B-ID218 预算——
   同界面 AOT 前后 exe 对照，膨胀即设计错。
 - **P3 静态样式预索引**：验收 = `Html.Load` 动态页回落运行期通道回归全绿；
   装载耗时（Parse 段）对照下降；样式缓存键与命中行为不变（现有

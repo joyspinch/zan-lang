@@ -51,6 +51,12 @@ if ($ctestPid -le 0) {
     Write-Host '[gate] 认不出 ctest 进程（拿不到父进程），本次不参与排队'
     exit 0
 }
+$ctestProc = Get-CimInstance Win32_Process -Filter "ProcessId = $ctestPid" -ErrorAction SilentlyContinue
+$ctestCmdLine = if ($ctestProc) { [string]$ctestProc.CommandLine } else { '' }
+# `--show-only` / `-N` 只做用例枚举，不执行任何测试；绝不能加锁或向 stdout 输出提示，否则会破坏 `--show-only=json-v1`。
+if ($ctestCmdLine -match '(?:^|\s)(?:-N|--show-only(?:=|\s|$))') {
+    exit 0
+}
 
 $lockName = 'build'
 $lease = & $sched lock-status -Name $lockName -Json | ConvertFrom-Json

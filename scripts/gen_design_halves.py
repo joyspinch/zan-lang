@@ -7,9 +7,9 @@
 以 accessor 属性暴露（code-behind 的 this.Tree 等引用零改动）。
 
 设计稿改动（增删命名控件、换 kind）后重跑本脚本即可；手工逻辑写在
-code-behind（<Name>.zan），半件只承载投影声明。
+code-behind（<Name>.zan），半件只承载投影声明，并标注 `[GuiKind("<Name>")]`
+由编译器合成静态工厂清单。
 """
-import argparse
 import os
 import re
 import glob
@@ -25,63 +25,6 @@ GENERIC = {'ListView': 'ListView<{of}>', 'DataGrid': 'DataGrid<{of}>'}
 HEADER = """// <auto-design> {doc}.html 的运行期投影半件（B-ID44）——由
 // scripts/gen_design_halves.py 生成，勿手改；逻辑写在 code-behind
 // {doc}.zan。设计稿改动后重跑生成脚本。
-"""
-
-# 组件自注册约定（零清单扩展）：被任何文档引用的 kind，其同名类
-# 要么是设计类（本脚本发工厂），要么在自己的类文件里声明
-# `static void Install()`（注册表发一条调用）。两者都不满足的
-# （内置控件、泛型容器）不进注册表——它们由包级 Bootstrap 覆盖。
-def source_roots(project_dir=None, repo_dir=None):
-    """Mirror local compiler package stores and src/stdlib/root precedence.
-
-    Require zan.pkg for component discovery; unrelated directories and user-global
-    packages must not alter the IDE's generated registration table.
-    """
-    project_dir = SRC if project_dir is None else project_dir
-    repo_dir = ROOT if repo_dir is None else repo_dir
-    roots = [project_dir]
-    seen = {os.path.normcase(os.path.realpath(project_dir))}
-    for base in (os.path.dirname(project_dir), repo_dir):
-        for store_name in ('packages', '.zan-packages'):
-            store = os.path.join(base, store_name)
-            if not os.path.isdir(store):
-                continue
-            for name in sorted(os.listdir(store)):
-                package = os.path.join(store, name)
-                if (os.path.islink(package) or not os.path.isdir(package)
-                        or not os.path.isfile(os.path.join(package, 'zan.pkg'))):
-                    continue
-                root = next((os.path.join(package, part)
-                             for part in ('src', 'stdlib')
-                             if os.path.isdir(os.path.join(package, part))), package)
-                key = os.path.normcase(os.path.realpath(root))
-                if key not in seen:
-                    roots.append(root)
-                    seen.add(key)
-    return roots
-
-REGISTRY = """// <auto-design> IDE 组件注册表（B-ID44）——由
-// scripts/gen_design_halves.py 扫描全部 .html 设计稿的 kind 引用
-// 生成：设计类发 HeavyControls 工厂；类文件声明了 static void
-// Install() 的组件类发一条调用。新增组件只需新增文档（或带
-// Install 的组件类）后重新构建，本表自动更新。勿手改。
-using Gui;
-using Gui.Widget;
-using Gui.Component;
-
-public static class IdeDesignedRegistry {{
-    static bool installed;
-
-    // 注册文档实际引用的全部 kind（幂等）。未注册的 kind 显式
-    // 失败（节点为 null），拼错的名字不会静默变型。
-    public static void Install() {{
-        if (installed) {{ return; }}
-        installed = true;
-        Gui.ControlBootstrap.Install();
-        Gui.Component.DataTable.DataTableBootstrap.Install();
-{lines}
-    }}
-}}
 """
 
 
@@ -213,7 +156,8 @@ def named_fields(html):
 def code_behind(doc_dir, name):
     """找同名 code-behind，返回 (路径, 是否有 OnInit, using 行列表)。"""
     for p in glob.glob(os.path.join(SRC, '**', name + '.zan'), recursive=True):
-        s = open(p, encoding='utf-8').read()
+        with open(p, encoding='utf-8') as f:
+            s = f.read()
         has_init = re.search(r'\bvoid OnInit\s*\(\s*\)', s) is not None
         usings = re.findall(r'^using\s+[A-Za-z0-9_.]+;$', s, re.M)
         return p, has_init, usings
@@ -223,7 +167,8 @@ def code_behind(doc_dir, name):
 def emit(doc_path):
     name = os.path.basename(doc_path)[:-5]
     rel = os.path.relpath(doc_path, SRC).replace(os.sep, '/')
-    html = open(doc_path, encoding='utf-8').read()
+    with open(doc_path, encoding='utf-8') as f:
+        html = f.read()
     fields = named_fields(html)
     cb, has_init, cb_usings = code_behind(os.path.dirname(doc_path), name)
 
@@ -235,8 +180,11 @@ def emit(doc_path):
             usings.append(u)
     out.extend(usings)
     out.append('')
-    out.append('partial class %s : DesignedControl {' % name)
-    out.append('    %s() {' % name)
+    out.append('[GuiKind("%s")]' % name)
+    out.append('public partial class %s : DesignedControl {' % name)
+    out.append('    public override Control CreateCloneShell() { return new %s(); }' % name)
+    out.append('')
+    out.append('    public %s() {' % name)
     out.append('        this.Design("%s", "ide/%s");' % (name, rel))
     if has_init:
         out.append('        this.OnInit();')
@@ -257,72 +205,16 @@ def emit(doc_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--registry-only', action='store_true',
-                        help='refresh registrations without rewriting design halves')
-    args = parser.parse_args()
     docs = sorted(glob.glob(os.path.join(SRC, '**', '*.html'), recursive=True))
     written = 0
-    designed = set()
-    refs = set()
     for d in docs:
-        html = open(d, encoding='utf-8').read()
-        for m in re.finditer(r'<([a-zA-Z-]+)\b([^>]*?)(/?)>', html):
-            k = tag_kind(m.group(1), m.group(2))
-            if k:
-                refs.add(k)
         if os.path.basename(d) == 'IdeForm.html':
             continue  # 窗口文档：入口手工投影，不生成半件
-        designed.add(os.path.basename(d)[:-5])
-        if not args.registry_only:
-            dst, n, has_init = emit(d)
-            print('%s fields=%d onInit=%s' % (os.path.relpath(dst, ROOT), n, has_init))
-            written += 1
-    lines = registry_lines(refs, designed)
-    reg = os.path.join(SRC, 'IdeDesignedRegistry.zan')
-    with open(reg, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(REGISTRY.format(lines='\n'.join(lines)))
-    print('wrote %d halves, registry kinds=%d' % (written, len(lines)))
+        dst, n, has_init = emit(d)
+        print('%s fields=%d onInit=%s' % (os.path.relpath(dst, ROOT), n, has_init))
+        written += 1
+    print('wrote %d halves' % written)
     return 0
-
-
-def registry_lines(refs, designed):
-    """文档引用的 kind → 注册表行。设计类发工厂；声明了 Install 的
-    组件类发调用；其余（内置/泛型容器/拼错名）不进表。"""
-    lines = []
-    roots = source_roots()
-    for k in sorted(refs):
-        qual = k
-        if k not in designed:
-            cf = class_file(k, roots)
-            if cf is None:
-                continue
-            text = open(cf, encoding='utf-8').read()
-            if 'static void Install()' not in text:
-                continue
-            ns = re.search(r'^namespace\s+([A-Za-z0-9_.]+);', text, re.M)
-            qual = ns.group(1) + '.' + k if ns else k
-            lines.append('        %s.Install();' % qual)
-            continue
-        ns = ''
-        cf = class_file(k, roots)
-        if cf is not None:
-            ns = re.search(r'^namespace\s+([A-Za-z0-9_.]+);',
-                           open(cf, encoding='utf-8').read(), re.M)
-            ns = ns.group(1) if ns else ''
-        full = ns + '.' + k if ns else k
-        lines.append('        ControlFactory.Register("%s", (string k) => new %s());'
-                     % (k, full))
-    return lines
-
-
-def class_file(name, roots=None):
-    for root in source_roots() if roots is None else roots:
-        for p in sorted(glob.glob(os.path.join(root, '**', name + '.zan'), recursive=True)):
-            if p.endswith('.design.zan'):
-                continue
-            return p
-    return None
 
 
 if __name__ == '__main__':

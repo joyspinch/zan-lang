@@ -49,12 +49,12 @@
   "点系列→lines"的判定若排在堆叠判定之前,stack+time 图永远走不到
   堆叠面积渲染器,两条同名 stack 系列各自按原始值画(真实案例:
   line-tooltip-touch 粉带不堆叠,DispatchKind 里换两行顺序即修)。
-- **Keyed 每帧新建实例,图表跨帧悬停状态必须放 wid 悬停槽**:宿主
-  每帧 `ChartView.Keyed(o, key).Render(...)`,实例随帧丢弃;
-  previousHit/pointerWasOver 这类状态放实例字段时,fadeFocus 渐隐读
-  "上一帧命中"永远是空。实测的坑:无头探针复用同一实例渲染三帧全绿,
-  活窗口光标钉在数据点上却死活不渐隐——两种用法行为分裂,探针测不出
-  实例生命周期的坑。跨帧状态进 `ChartView.HoverSlot*`(按 wid 键)。
+- **Keyed 复用保留式 ChartView 实例,跨帧悬停状态归属实例字段**:宿主
+  通过 `ChartView.CachedOwner(key, ...)` 或持久持有的 `ChartView` 实例跨帧
+  渲染,`lastHoverHit`/`lastHoverOver` 等悬停状态直接保存在 `ChartView`
+  实例上(并在 `Dispose()` 中清理),不再使用全局 `HoverSlot*` 静态槽表。
+  注意:若每帧直接 `new ChartView(o)` 而不保留/缓存实例,fadeFocus 渐隐
+  读"上一帧命中"仍会丢失,必须复用保留实例或通过 `CachedOwner` 按 key 持有。
 - **GUI 重绘是按需的:hitTester hover 变化才调度,图表内部悬停要自己
   补帧**:App 的 mousemove 只在 hitTester hover id 变化时置
   needsRedraw,而系列命中(currentHit)不在 hitTester 里——光标停在

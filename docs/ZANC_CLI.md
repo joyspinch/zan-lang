@@ -162,6 +162,100 @@ ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点�
 file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
 trace 的事件序为准，不要顺着报表的站点名硬找。
 
+### 1.6 Windows 进程性能采集
+
+[`profile_process.ps1`](../scripts/profile_process.ps1) 需要 Windows 和 PowerShell 7.2 或更新版本。它在进程外采样，适用于已运行的 Zan 服务和其他原生程序。多进程服务应选择实际执行请求的 worker PID。
+
+| 档位 | 采集内容 | 环境 |
+|---|---|---|
+| `Counters` | 目标 PID 的用户态和内核态 CPU 时间、工作集、私有字节、虚拟字节、线程数和句柄数 | 普通终端可采集有权读取的进程 |
+| `CPU`（默认） | 进程计数，加系统 ETW CPU 栈、线程切换和就绪事件 | 提升权限的 PowerShell、WPR |
+| `CPU+VirtualAllocation` | 加采虚拟地址空间的保留与提交事件 | 同上，跟踪体积可能更大 |
+
+```powershell
+# 定时采集，替换为实际 PID
+pwsh -File scripts/profile_process.ps1 -TargetPid 1234 -DurationSec 30 -Profile Counters
+
+# 在提升权限的 PowerShell 中按负载采集，参数由已有的负载程序解释
+./scripts/profile_process.ps1 -TargetPid $workerId -Profile CPU `
+  -WorkloadExe $loadExe -WorkloadArgs @('-n', '100000', '-c', '4')
+```
+
+先预热服务。负载程序继承采集器的权限，退出前须将 UTF-8 JSON 写入子进程环境变量 `ZAN_PROFILE_RESULT` 指定的路径。`completed` 和 `errors` 是非负整数且至少有一次尝试，`elapsed_ms` 是大于零的实际请求窗口毫秒数。可以附带延迟分位数或直方图。
+
+```json
+{"completed":100000,"errors":0,"elapsed_ms":5000.0}
+```
+
+吞吐取自客户端窗口。进程 CPU 增量覆盖发起负载前到退出后的窗口，包含负载启动、收尾和目标进程同时间段的后台工作。只有全部请求成功时才计算每次完成的 CPU 成本。采样间隔由 `-SampleMs` 指定，默认 250 ms。失败退出时保留已采集的原始计数。
+
+报告默认保存在 `build/profile/<id>`，可用 `-OutputDir` 指定输出根目录。
+
+- `summary.json` 保存采样窗口、吞吐、CPU 时间及采到的内存峰值和私有字节变化。`process-resources.csv` 保存带时间戳的原始计数。工作集反映驻留页，私有字节反映私有提交，虚拟字节包括保留空间。进程内存峰值无法折算为每次请求的分配量。
+- `workload.json` 保留客户端统计。`trace.etl` 保存系统范围的事件，可在 WPA 中同时查看 worker、数据库和负载客户端。
+- 安装 Windows Performance Toolkit 的 `xperf.exe` 后，`trace-stats.txt` 提供事件及缓冲区丢失计数，`system-cpu.txt` 和 `system-scheduling.txt` 提供整个 ETL 的系统摘要。出现丢失时，重新采集后再比较热点。
+- `target-cpu-stacks.html` 按 PID 和首尾资源采样的 UTC 时间筛选 CPU 栈。函数自身命中用于定位 CPU 热点，包含子调用的命中可查看调用路径，父子函数的包含命中会重叠。若没有命中，检查所选 PID、窗口和跟踪是否含 CPU 栈事件。
+- `virtualalloc.txt` 在虚拟内存档提供同一 PID 和窗口的提交热点。应用分配器会复用已提交页，虚拟内存事件只记录操作系统看到的变动。
+
+通过 `_NT_SYMBOL_PATH` 指定匹配的符号，通过 `_NT_SYMCACHE_PATH` 指定 xperf 缓存。在 WPA 的 **CPU Usage (Sampled)** 查看函数采样，在 **CPU Usage (Precise)** 查看切换、就绪延迟和等待相关栈。Zan `--publish` 会剥离符号，`-g` 会强制 `-O0`。保留采集用的原始优化构建和对应符号，比较时注明无法解析的帧。用同一构建、数据和负载比较采样开关下的吞吐和延迟，可测量采样扰动。
+
+外部采样用于定位实际运行的 CPU 栈、线程等待和提交热点。要把跨线程、跨协程的工作归到一条请求，并取得每一步的精确起止时间或对象分配，需要可传递的请求 ID 及相应的请求、协程或分配事件。
+
+### 1.7 Zan.Web 请求诊断
+
+设置 `ZAN_REQUEST_PROFILE_CAPACITY=100000` 后启动服务，或在初始化 `WebApp` 时调用 `app.UseRequestProfiler(new RequestProfiler(100000))`。默认关闭。每个 worker 独立保留最近 1–100,000 条已完成请求，每条最多记录 48 个阶段。容量决定可导出的历史长度，覆盖和超限由 `overwritten` 和 `omitted_stages` 报告。采集会消耗 CPU 和内存，适合在预热后选取一个负载窗口进行详细诊断。删除环境变量或移除初始化调用后重启即可关闭。
+
+常规 HTTP/1 采集从应用读到请求首批字节开始，记录接收、解析、路由、认证、限流、处理、发送和清理中实际走到的阶段。HTTP/2 从解码请求头后开始，额外记录正文接收和进入 Web 处理前的排队。HTTP/2 在进入 Web 处理器之前被重置或拒绝的流没有请求记录。MVC 还记录控制器钩子、业务动作、连接租借与释放、事务和经该连接 API 发出的 SQL 调用。`send` 的结束时间以服务端写入完成为准。
+
+应用可在 `HttpContext.Trace` 上标记自己的阶段。请求未被抽样且未开启完整追踪时，该属性为 `null`。阶段名与失败代码用固定标签，避免写入请求内容、用户数据或异常原文。
+
+```zan
+RequestTrace trace = ctx.Trace;
+int stage = trace == null ? -1 : trace.Begin("orders.lookup");
+try {
+    await LoadOrders(ctx);
+} catch (Exception failure) {
+    if (trace != null) { trace.Fail(stage, "lookup_failed"); }
+    throw;
+} finally {
+    if (trace != null) { trace.End(stage); }
+}
+```
+
+MVC 后台可在 **运行监控 → 请求诊断** 读取每个 worker 最近保留的请求。每页最多 100 条，支持按接口、动作和结果筛选，按总耗时排序，点击记录查看接收、路由、业务动作、SQL、发送和清理的实际时间线。**读取最新** 手动刷新，**更早记录** 使用当前采集的游标。若负载均衡转到其他 worker，页面保留原记录并提示重新读取。CPU 和 RSS 图表记录的是进程指标，阶段时间线使用实际经过时间。
+
+MVC 启用 `[metrics]` 后，接口诊断默认每个 worker 约抽样 1/64，按注册方法与路由模板汇总已完成请求。启动前设置 `ZAN_ROUTE_DIAGNOSTICS_EVERY=0` 关闭接口抽样，设置为 `1` 抽样每次请求。该开关与完整追踪环独立，已写入的接口历史仍可查询。后台的 **接口诊断** 支持实时一小时和最长 30 天的滚动历史窗口，实际历史保留受 `[metrics].keepDays` 控制。
+
+`GET /admin/monitor/route-diagnostics` 需要监控查看权限。`hours` 支持 `1`、`6`、`24`、`168`、`720`，省略过滤时返回有样本的接口目录。传入 `method` 和 `route` 可查询指定接口的阶段与趋势。窗口以 UTC Unix 分钟表示，包含 `from_minute`，到 `to_minute` 之前结束。实时查询合并共享指标库已提交的数据和应答 worker 的待刷新样本。样本数是实际记录数，`sample_every` 是当前 worker 的抽样配置。`local_dropped_samples` 记录应答 worker 的累计容量丢弃量。
+
+阶段总耗时包含内嵌操作。**未覆盖耗时** 是请求总耗时减去已结束记录区间的并集，省略或尚未结束的阶段会影响覆盖。SQL 计数涵盖经过请求绑定连接的语句调用，独立于阶段容量，累计耗时包含驱动与 I/O，并行时可以超过请求总耗时。
+
+启动前设置 `ZAN_REQUEST_PROFILE_RESOURCES=1`，可为入选请求采集 CPU 和分配字节。默认 HTTP/1 从读完请求头采到清理结束（`header-to-cleanup`），HTTP/2 从应用回调开始采到响应交还传输层（`application`）。Windows CPU 使用线程周期，支持线程 CPU 时钟的 POSIX 平台使用纳秒，请求总计缺测为 `-1`。分配字节是编译器插桩记录的分配流量。进程 RSS、存活对象和原生驱动分配有各自的统计口径。接口诊断按 `coverage` 和 `cpu_unit` 汇总请求级资源历史。
+
+同时打开请求历史环和 `ZAN_REQUEST_PROFILE_STAGES=1` 可在请求诊断中查看各实际执行阶段的 CPU 和分配。阶段模式将 HTTP/1 的窗口提前到每轮读请求头之前（`read-loop-to-cleanup`），包括 `request_deadline` 和 `receive_head`。长连接等待下一次请求的空闲时间可能进入 `receive_head` 的墙钟。TCP 接入、TLS 握手、客户端完整接收和诊断发布在此窗口之外。HTTP/2 的正文接收和排队沿用事后记录的墙钟，应用窗口内的实时阶段可采集资源。
+
+运行时将增量记到当前任务最内层的活动阶段。阶段随采集期间创建的子任务跨 worker 传播，子任务可以进入自己的阶段。已采集的阶段在 JSON 中包含 `cpu`、`allocated_bytes`，实际的零也会导出，缺省表示缺测。`resources.stage_resources` 表示阶段计量可用，`resources.residual_cpu` 和 `resources.residual_allocated_bytes` 记录域内未归属阶段的执行。阶段总计和残余可与请求总计核对。未走 Zan 任务计量入口的原生线程或阻塞作业存在覆盖缺口。阶段模式默认关闭，开启后需要额外结算和存储。
+
+单条追踪最多保留 32 个实际挂起的 `await`，报告操作类型、源码位置、起点和恢复耗时，超限计入 `omitted_waits`。挂起到恢复包含调度排队，父任务等待可以和子任务的 I/O 或定时等待重叠。`unfinished_tasks` 记录收尾时尚未结束的继承任务数。其他 worker 正在运行的子任务可能来不及结算当前片段，CPU 和分配总量可能偏低。离线接口汇总用 `requests_with_unfinished_tasks` 报告受此限制的请求数。缺少 `elapsed_us` 表示采集结束时该等待尚未恢复。宿主编译器使用 `--hide-diagnostics` 构建时，仅在生成站点映射的情况下记录可离线解析的站点编号。删除资源开关后重启即可恢复常规采集。
+
+调用 `app.RequestProfile().SnapshotJson(1000)` 导出首批记录。MVC 管理端也提供 `GET /admin/monitor/request-traces?limit=1000&before=0`，要求登录及监控查看权限。关闭时返回 HTTP 503。导出按完成顺序从新到旧返回，每页最多 1,000 条。将 `next_before` 作为下页 `before`，直到游标为 0。全程应访问同一个 worker 并核对页的 `pid` 和 `clock_mono_us`。已授权的导出请求不进入历史，分页期间其他流量仍可能覆盖旧记录。自定义导出处理器可以调用 `ctx.ExcludeRequestProfile()` 获得同样的行为。响应上的 `X-Zan-Request-Profile` 在有该响应头的路径上可关联服务端请求 ID，同一 ID 需要结合 worker 和采集时钟识别。记录在清理后才可导出。
+
+[`analyze_request_profile.ps1`](../scripts/analyze_request_profile.ps1) 接受 JSON 页或每行一页的 JSONL，按采集时钟、进程实例和请求 ID 去重。累积测量时，在固定配置下重复发送同一个请求，导出完整窗口，再核对报告中的 `observed_requests`、`duplicate_rows` 和 `unobserved_requests`。在 `routes[].stages` 查看每个阶段的调用数、覆盖请求数、墙钟总计与均值，以及实测 CPU 和分配的样本数、总计与均值。`inclusive_total_us` 含嵌套阶段，`exclusive_total_us` 只计可唯一归属的墙钟。`routes[].stage_wall` 单列归属有歧义、未覆盖的时间，两者与全部独占时间相加等于请求墙钟。
+
+```powershell
+pwsh -NoProfile -File scripts/analyze_request_profile.ps1 -SnapshotPath pages.jsonl > report.json
+```
+
+报告的 `waits` 按源码等待点给出 `total_us`、`mean_us` 和记录数。父子任务的等待可能重叠，各点的累计时间不能直接相加为请求总耗时。可用 `request_key` 选取实际请求。省略 `-RequestKey` 时，`-TracePath` 导出最慢的一条，可载入 Perfetto 查看各阶段的真实相对位置和重叠关系。
+
+`-ProcessSummaryPath` 为可选参数，按 PID 和时钟锚点估算请求与 §1.6 进程采样窗口的重叠。
+
+在 Windows 宿主构建上，同时打开请求历史环、`ZAN_REQUEST_PROFILE_RESOURCES=1` 和 `ZAN_REQUEST_PROFILE_EXECUTION=1`，可为单条请求保留最多 64 个实际执行片段。每个片段包含 OS 线程 ID、QPC 换算的单调微秒起点和时长、CPU 周期及分配字节。超过上限的片段计入 `omitted_execution_slices`，请求总计仍包含它们。快照根字段 `process_start_unix_ms` 记录 Windows 进程的创建时间，供区分复用的 PID。该额外采集默认关闭。
+
+`-CpuSamplePath` 接受外部采样器导出的 JSONL。每行需提供 `pid`、`process_start_unix_ms`、真实 `tid`、同一 QPC 时基的 `mono_us` 和从叶函数到根的 `stack`。同一进程实例和线程内的时间戳须单调不减。分析器仅将落在唯一执行片段内的样本计入接口和所选请求的函数热点，并报告未匹配与归属冲突的数量。执行片段含可能的 OS 抢占，函数热点取决于外部采样器给出的 on-CPU 样本。§1.6 的 WPR/xperf 入口仍导出进程级报告，接入 `-CpuSamplePath` 需要把采样事件和符号转换为上述格式。
+
+排查内存增长时，可在同一 `--check-leaks` 构建的预热后、等量负载后及空闲期分别调用 `System.GC.WriteHeapSnapshot(path)`，比较各类型和源码分配点的存活数量、字节数。没有源码标签的分配记为 `<unknown>`。跨轮持续增长可以定位仍存活对象的分配位置，保留它们的引用仍需结合对象生命周期调查。短时锁住对象跟踪表的开销应计入诊断窗口。请求追踪的环形缓冲也会在填满前增长，排查业务内存时可关闭采集或先让缓冲区达到稳态。`System.GC.DetectCycles()` 能发现孤儿循环，仍被全局缓存等根对象引用的数据需要另查其生命周期。
+
 ## 2. 全参数表（与 `zanc --help` 同源）
 
 > 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。
@@ -284,8 +378,14 @@ C 宿主的 `-ferror-limit` 与单行限额仍生效。
 | `--package-name <name>` | — | 安装包名（内部/未稳定） |
 | `--package-scope <project\|global>` | `project` | 安装作用域（内部/未稳定） |
 | `--package-project <dir>` | `.` | 包发现/项目级安装的工程根（内部/未稳定）；不改变默认业务资源的归属 |
+| `--no-pkg-gen` | 关 | 跳过 `zan.pkg` 的 `generator` 自动生成钩子（供外层包装器调用时防重入）（内部/未稳定） |
 
 默认 `assets/` 归第一个用户输入所属工程：从入口目录向上找到最近的 `zan.proj`，遇到 SDK 的 `packages/` 边界即停止；没有工程清单时只取入口同目录的 `assets/`。自动引入的包源码目录和包搜索根不作为业务资源候选，因此包内 `Game/Assets/*.zan` 或 SDK 根目录的图片不会自动混入应用。需要其他目录时显式使用 `--embed <目录>=assets`；显式 `assets` 别名优先，包清单声明的资源和 Gui 皮肤仍按各自契约内嵌。
+
+GUI 窗口 HTML 与片段在发布时逐项声明。直接调用 zanc 时传入
+`--embed src/Editor.html=src/Editor.html`，项目发布入口可把 `zan.proj` 的
+`gen.embed` 转换为同样的参数。用 `Form.ShowWith` 或 `ChildWindow.OpenHostWith`
+的显式资源重载加载对应逻辑名，并通过 `ModelBinder` 注册文档处理器。
 
 ## 3. 交叉编译目标（--list-targets）
 
@@ -367,8 +467,9 @@ stamp，并发构建会让无关用例成批假红）。
 1. 复制模板树到 build/templates_build/<tpl>/，文本文件内容替换 `{{NAME}}`
    → `TplProbe`；
 2. gui 模板把 `src/App.zan`/`src/App.html` 改名为同名的 `TplProbe.zan` / `TplProbe.html`；
-3. 编译命令 = **设计稿 html 在第一个参数** + 全部 src/**/*.zan（排序）+
-   `--stdlib-path stdlib` + `--subsystem windows` + `--driver-dir <新编 zan_gui 目录>`。
+3. 先传入口 Zan 文件，再传其余排序后的 `src/**/*.zan`。每项 `gen.embed`
+   传入 `--embed <脚手架文件路径>=<项目相对路径>`。GUI 构建还使用
+   `--subsystem windows` 和 `--driver-dir <新编 zan_gui 目录>`。
 
 手工复刻单模板验证时照抄以上配方；只想要"源码能不能编过"的快速信号，
 直接 `zanc $(find src -name '*.zan') --auto-stdlib -o out.exe` 也行，

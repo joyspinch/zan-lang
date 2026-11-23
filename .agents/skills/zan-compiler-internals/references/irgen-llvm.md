@@ -342,7 +342,7 @@
   掩盖裁剪错误。验收同时检查 thunk、实际 callee 非死桩及真实调用；表/payload 正确
   不能证明 callee body 可执行。host 反射初始化 probe 与相关 IR 门已通过；不外推自举。
 - **主对象与分片对象共用发布分节策略**：对象写出前统一准备可回收节，不能只在主对象路径设置；准备时机须晚于分片规划，避免 COMDAT 改变可移动性。Windows COFF 强定义使用独立 `$` 子节和 NODUPLICATES COMDAT，保留重复强定义报错；弱运行时后备函数、既有 ODR 组、TLS 与显式特殊节保留原契约。MinGW 函数节须带 `$函数名`，才能生成独立展开信息。验证必须检查最终链接的活/死函数与数据符号，并实际运行；未定义符号可能在 GC 前报错，不能用其消失与否代替裁剪验证。
-- **方法名形似事件不等于独立保留根**：精确扫描到的 HTML handler 可独立保留；发布模式通用 `On*` 调用桩与 body root 共用实际发射的 `Invoke*` 名字需求。字面量精确去重，计算名字与含 NUL 名字保守回退；死方法不贡献需求，晚发现名字须继续固定点。成员签名与 HasMethod 不随调用桩裁剪，属性和注解保留既有契约。派生反射表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；继承访问器须按派生 owner 中的属性名识别，不能要求其声明也出现在派生成员表。`publish_reflect_invoke_demand_literal/dynamic` 与 IR 门禁共同验证死 hook 裁剪、动态回退、继承调用、晚发现调用及属性读写；冻结站点表和生成死桩的时序不变。
+- **方法名形似事件不等于独立保留根**：发布模式通用 `On*` 调用桩与 body root 共用实际发射的 `Invoke*` 名字需求。字面量精确去重，计算名字与含 NUL 名字保守回退；死方法不贡献需求，晚发现名字须继续固定点。成员签名与 HasMethod 不随调用桩裁剪，属性和注解保留既有契约。派生反射表包含继承实例方法，声明基类即使没有自己的 metadata/site 也须参与闭包；继承访问器须按派生 owner 中的属性名识别，不能要求其声明也出现在派生成员表。`publish_reflect_invoke_demand_literal/dynamic` 与 IR 门禁共同验证死 hook 裁剪、动态回退、继承调用、晚发现调用及属性读写；冻结站点表和生成死桩的时序不变。
 - **字段 TypeInfo 不证明实例方法体可达**：保留字段与方法签名查询，把实例 hook/thunk 的接收者资格另行判断；派生分配可接收基类声明的方法，动态 CreateInstance、库导出和托管 extern 返回/ref/out 维持保守契约；extern 数组元素与结构体字段须递归检查并替换闭合泛型实参，string、byte[] 和纯数值结构体不应误关裁剪。运行时 guard 的 site=0 对象仍有真实虚表 store，不能仅凭普通分配站点缺失认定无实例。回归同时验证 metadata-only 的 HasMethod 以及字段 TypeInfo 构造派生实例并调用继承 hook。
 - **接口候选不能给自身制造保留证据**：发射候选时保存具体类型与闭合虚表的 instruction metadata；活性固定点只在独立分配站点、真实虚表 store 或保守回退存在时启用候选调用边。候选的 tag 比较属于观察，不能当构造证据；普通调用、委托和未知 metadata 保守处理。不能在发射时按尚未完整的 sites 提前过滤，也不能等候选 body 发出并 new 自己后再判断。用 late allocation、继承实现、闭合泛型正例和自分配死实现负例联合验证。
 - **ARC 抵消只认同一 SSA 对象**：同一字段地址的两次 load 可在中间回调改写后得到不同对象，不能据地址相等抵消 retain/release；仅剥离 pointer cast 后的 SSA identity 足够。若要跨 load 优化，必须先证明内存没有被改写。分片在自定义 ARC 优化之前提取，裁剪改变函数所在模块会暴露旧优化缺陷；用弱引用生命周期与正常优化 GUI 运行验收，不能靠关闭 ARC 优化交付。
@@ -527,6 +527,11 @@
 ## 17. Async pending return：撤销 owner 与最终结果缓存必须同源（2026-11-11 实证）
 
 - Selfhost 返回值先 retain 并写 frame slot6，再执行可挂起 finally；finally 逃逸异常、下一次 resume 取消或 frame cleanup 必须 load → clear → 按声明类型 release。helper 显式传 retTy，独立 cleanup 生成前保存类型；正常 completion 将 owner 转给 awaiter，不能在每次 throw 时撤销，finally 内部 catch 后仍可能继续返回。替换 return 先 retain 新值再释放旧值，允许两者别名。
+
+## 18. 异步 throw 清理 O(N²) 抑制与空 `__zan_sinit_` 裁剪（2026-11-23 实证）
+
+- **异步 `throw` 与 `emit_async_complete` 禁止重复清理预分配帧局部及其别名**：`emit_async.c` 在进入函数体前把全部帧局部预填在 `locals[0 .. current_async_frame_local_count - 1]`，并在 `irgen_async_coops.c` 将协程根 landing pad（`catch_bb = current_async_exc_bb`、`throw_locals_base = 0`）压入 `lpad_stack`。当异步 `throw` 无更内层用户 `catch_bb`（排除 `top->catch_bb == g->current_async_exc_bb`）或走 `emit_async_complete` 时，控制流必经 `co.exc` → `co.complete` (`emit_async_complete_epilogue`) 一次性释放并清零全部帧局部；此时 `stmt_jump.c` 与 `irgen_async_pending.c` 必须以 `current_async_frame_local_count` 为 `rel_base` 下界并跳过 `frame_owner >= 0` 的帧别名释放（保留非别名局部及局部 `try/catch` 内清理）。否则 N 局部 + N `throw` 退化为 O(N²) IR（`conformance_async_throw_ir_scaling` 32→64 从 325% 降至 196%）。
+- **无 `cctor` 与静态初始化器的类型省略 `__zan_sinit_` 函数但保留 `static_init_types` 登记**：`finalize_static_rc_cleanup`（`irgen_stmt.c`）依赖 `g->static_init_types` 判断哪些活跃类型/泛型实例需要在退出时释放未初始化静态 RC 字段（如 `static T Cached;`）。因此 `sinit_activate`（`emit_static_init.c`）仍登记活跃 `(sym, inst)`，仅当 `sinit_type_has_init_work` 为真时才创建/发射/调用 `__zan_sinit_*`（否则 `fn = NULL, emitted = true`），`GCTX_SLOT_SINIT_FN` 已兼容 `NULL`。定向回归 `case_generic_static_rc_cleanup` 与 33 项定向 suite（含 `publish_static_init_demand_ir` 等）全过，500 实体单函数异步+`throw` 探针 `-O0`/`-O2` 均 `--check-leaks` 零泄漏。
 - 宿主 typed RVAL 还兼作 pending return 缓存。pending discard 已释放 owner 后，RVAL 可能残留旧指针；orphan 清理必须以最终 RESULT 是否交付值为准，先清 RVAL，指针结果从 RESULT 解码，聚合只在实际交付时按类型释放。不得用旧 RVAL 再 release，也不得关 arcguard 掩盖错误。
 - 实证：selfhost_async_pending_result_owner 的旧 gen1 异常及取消两处 WeakReference 错误为 true；修后四路径（正常跨 Yield、finally 内部 catch、异常终结、取消）均匹配 golden。修后 gen1 c7614f9ab367a98983898b7b5e05ecd0a3d8ad07fbafec11145c49e9af7f0454，另 3 项 focused 通过。宿主普通 probe 虽绿，正式 CTest arcguard 首次报 stale release；修 RVAL/RESULT 后原 fixture 与 async_spawn_result_release 的 arcguard+check-leaks probe 和两条正式 CTest 均通过（4.79 秒）。
 - 边界：独立 cleanup callback 与 finally 第二次 return 只有生成/链接覆盖；最新改动未重跑 fixedpoint 或完整 production driver。前一 checkpoint 的 fixedpoint+24行为+10拒绝通过不可冒充本次新源码结果。证据 _scratch/async-pending-owner。
@@ -561,6 +566,13 @@
 - 实例接收者必须在含 await 的实参求值前暂存，保持原接收者及语言求值顺序；静态类型名不能提升成值。原生内建静态类型可能没有普通 binder 声明，应在没有 binder 符号且没有已解析用户调用符号时查询 `zan_builtin_types` 的 `is_static` 元数据，不能只凭名字或缺失符号猜测。
 - 同名局部实例仍须按实例处理。回归同时覆盖 `Console.WriteLine(await Number())` 和局部 `Sink Console`：await 实参将该变量改为 replacement 时，本次调用仍写入 original，下一次调用才使用 replacement。
 - 2026-11-11：`case_async_builtin_static_receiver` 与未改写的 `case_async_generic_method` 定向通过（2/2，2.81 秒）；前者完整输出为 `42`、`original:7`、`replacement:9`。这证明本次静态接收者分类与实例求值顺序，不代表所有异步降级路径已验收。
+
+## 22. 500+ 实体 EH `-O2` 扩展性与未限定泛型静态接收者推导（2026-11-23 实证）
+
+- **EH helper `noinline`、冷 `try.lpad` volatile release 与 guard outlining 消除 `-O2` 组合爆炸**：单函数 N 个顺序 `try` + 引用局部时，内联 `__zan_eh_tmp_push` / `__zan_eh_tmp_pop` / `__zan_eh_state_fast` 叠加 `try.lpad` 清理把 CFG 块与 TLS/SSA 数据流放大到 PassBuilder / InstCombine / CodeGen 超时（500 实体 `-O2` >120s、Peak RAM 2,246 MB）。`builtin_eh_state.c` / `builtin_eh_unwind.c` 对这 3 个 helper 标 `noinline`（Windows `tls_fallback` 也设 `noinline`）；`generic_lpad.c` 在 `cleanup_count > 8` 时保持 `try.lpad` release 为 `volatile` 防跨百块重排；`generic_guard.c` 将空指针/边界校验诊断外提为 `__zan_guard_report_merged`（`noinline` + `cold`）和 `__zan_throw_guard`；`arc_ops.c` 按 64-entry 步长做 `volatile` 屏障，并在 `optimizer.c` 给 `InstCombine` 传保守选项。实测 500 实体 EH+ARC 探针 `-O2 --check-leaks` 降至 ~39s（`optimize` 16.4s、`write obj` 20.4s、Peak RAM 501 MB），输出 `500` 且零泄漏。
+- **未限定泛型静态接收者（`Box.Create(8)`）必须同时覆盖 checker 与 irgen**：`nsresolve_stamp.c` 仅在非当前命名空间时设置 `ident.is_type_receiver = true`，同命名空间 `Box.Create(8)` 的 `is_type_receiver` 为 `false`。`checker_expr_core.c` 的 `uninstantiated_generic_type_recv` 须改用 `checker_method_group_type_receiver(c, obj) == recv->sym`（同时保留泛型类体内 `Box<T>` 开放性与 `diag_host_generic_invariant_return` 的 E2024 校验）。irgen 侧 `call_dispatch.c`、`expr_infer.c` 与 `generic_discover.c` 不能因 `ident_inst_type == NULL` 回退到擦除 `abort()` 桩 `@Box_Create`：需在发码实参前调用 `infer_generic_static_recv_inst`（`lambda_infer.c`）从实参类型推导闭合泛型实例（`locals == NULL` 时用空 `local_scope_t` 兜底避免 `local_find(NULL, ...)` 解引用空指针），并在 `generic_discover.c` 用带作用域 `collect_inst_expr_scoped` 追踪局部变量/`var`/循环变量类型以收集闭合泛型实例。
+- 实证：`case_generic_static_member_access`、`diag_host_generic_invariant_return`、`case_generic_open_call_template`、`case_selfhost_local_exception_owner` 及 76 项 generic/selfhost/EH/async 回归通过；未限定 `Box.Create(x)` / `var b = Box.Create("hello")` / `Pair.Of(42, "ok")` 边界探针 `--check-leaks` 零泄漏。
+
 
 ## 21. 泛型异步帧扫描与恢复体必须使用同一组类型绑定
 

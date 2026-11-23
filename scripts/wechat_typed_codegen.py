@@ -408,6 +408,60 @@ class SharedModelRegistry:
             lines += ['}', '']
         return '\n'.join(lines).rstrip() + '\n'
 
+    def render_domains(self, models_dir, namespace, marker, generator, domain_resolver, max_lines=950):
+        """Emit pure DTO entities into semantic domain files (never .PartXX)."""
+        models_dir.mkdir(parents=True, exist_ok=True)
+        for old in models_dir.glob('*.zan'):
+            if marker in old.read_text(encoding='utf-8', errors='ignore'):
+                old.unlink()
+        buckets = {}
+        for key in sorted(self.models, key=lambda k: self.names[k]):
+            name = self.names[key]
+            dom = domain_resolver(name) or 'Common'
+            block = [f'class {name} {{']
+            fields = self.typed_fields.get(key, [])
+            if fields:
+                for ztype, fname in fields:
+                    block.append(f'    public {ztype} {fname};')
+            else:
+                block.append('    public JsonValue Value;')
+            block += ['}', '']
+            buckets.setdefault(dom, []).append((name, block))
+        for dom, entries in sorted(buckets.items()):
+            lines = [
+                'using System;',
+                'using System.Json;',
+                '',
+                f'namespace {namespace};',
+                '',
+                '/// <summary>',
+                f'/// {dom} domain shared DTO entities ({marker}; regenerate with {generator}).',
+                '/// </summary>',
+            ]
+            for _, block in entries:
+                lines.extend(block)
+            text = '\n'.join(lines).rstrip() + '\n'
+            (models_dir / f'{dom}.zan').write_text(text, encoding='utf-8', newline='\n')
+
+
+def write_layered_contracts(out_dir, filename, namespace, extra_usings, marker, generator, blocks):
+    """Write Request or Response contract classes into Requests/<Product>/ or Responses/<Product>/."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    lines = ['using System;', 'using System.Json;']
+    for u in extra_usings:
+        if u not in ('using System;', 'using System.Json;'):
+            lines.append(u)
+    lines += [
+        '',
+        f'namespace {namespace};',
+        '',
+        f'/// <summary>{marker}; regenerate with {generator}.</summary>',
+        '',
+    ]
+    for block in blocks:
+        lines.extend(block)
+    (out_dir / filename).write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8', newline='\n')
+
 
 # Kept as an alias for generator extensions that imported the old name.
 TypeEmitter = SharedModelRegistry
@@ -529,9 +583,10 @@ def emit_typed_classes(api_class, method, endpoint, verb, credential, index,
     req=base+'Request'; resp=base+'Response'
     fields,placement=build_request_fields(method,endpoint,verb,credential,index,source_path)
     response_cs,rfields=response_fields(method,index,source_path)
-    lines=[]
+    req_lines=[]
+    resp_lines=[]
     if fields:
-        lines += [f'class {req} {{','    WechatTypedRequest request;','',f'    public {req}() {{ this.request = new WechatTypedRequest(); }}','']
+        req_lines += [f'class {req} {{','    WechatTypedRequest request;','',f'    public {req}() {{ this.request = new WechatTypedRequest(); }}','']
         seen=set()
         for f in fields:
             mname=pascal(f.name)
@@ -539,31 +594,31 @@ def emit_typed_classes(api_class, method, endpoint, verb, credential, index,
             seen.add(mname)
             zt=models.type(f.cs_type, f.source_path or source_path)
             place=placement.get(f.key,'body')
-            lines += [f'    {req} {mname}({zt} fieldValue) {{']
+            req_lines += [f'    {req} {mname}({zt} fieldValue) {{']
             if zt.startswith('List<') and zt[5:-1] in ('string','int','long','double','bool'):
                 inner=zt[5:-1]
                 suffix={'string':'Strings','int':'Ints','long':'Longs','double':'Doubles','bool':'Bools'}[inner]
-                lines += [f'        this.request.{("Query" if place=="query" else "Body")}{suffix}("{f.key}", fieldValue);']
+                req_lines += [f'        this.request.{("Query" if place=="query" else "Body")}{suffix}("{f.key}", fieldValue);']
             elif zt in ('string','int','long','double','bool','JsonValue'):
                 call=setter_call(zt,place)
-                lines += [f'        this.request.{call}("{f.key}", fieldValue);']
+                req_lines += [f'        this.request.{call}("{f.key}", fieldValue);']
             else:
                 prefix='Query' if place=='query' else 'Body'
-                lines += [f'        this.request.{prefix}Json("{f.key}", Json.Serialize<{zt}>(fieldValue));']
-            lines += ['        return this;','    }','']
-        lines += ['    string QueryText() { return this.request.QueryText(); }','    string JsonBody() { return this.request.JsonBody(); }','}','']
+                req_lines += [f'        this.request.{prefix}Json("{f.key}", Json.Serialize<{zt}>(fieldValue));']
+            req_lines += ['        return this;','    }','']
+        req_lines += ['    string QueryText() { return this.request.QueryText(); }','    string JsonBody() { return this.request.JsonBody(); }','}','']
     shared_base=models.model_type(response_cs, source_path)
     if shared_base:
-        lines += [f'class {resp} : {shared_base} {{','    public string Raw;','}','']
+        resp_lines += [f'class {resp} : {shared_base} {{','    public string Raw;','}','']
     else:
-        lines += [f'class {resp} {{','    public string Raw;']
+        resp_lines += [f'class {resp} {{','    public string Raw;']
         seen={'Raw'}
         for f in rfields:
             name=safe(f.key)
             if name in seen:continue
             seen.add(name)
-            lines.append(f'    public {models.type(f.cs_type, f.source_path or source_path)} {name};')
+            resp_lines.append(f'    public {models.type(f.cs_type, f.source_path or source_path)} {name};')
         if not rfields:
-            lines.append('    public JsonValue Value;')
-        lines += ['}','']
-    return req if fields else '',resp,lines
+            resp_lines.append('    public JsonValue Value;')
+        resp_lines += ['}','']
+    return req if fields else '',resp,req_lines,resp_lines

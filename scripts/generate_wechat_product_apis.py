@@ -15,29 +15,33 @@ from urllib.parse import urlsplit
 import json
 import re
 
-from wechat_typed_codegen import ModelIndex, SharedModelRegistry, credential_enum, emit_typed_classes
+from wechat_typed_codegen import (
+    ModelIndex, SharedModelRegistry, credential_enum, emit_typed_classes,
+    write_layered_contracts,
+)
 
 ROOT = Path.cwd()
+PKG_WECHAT = ROOT / 'packages/Zan.Sdk.Wechat/src/Sdk/Wechat'
 MARKER = 'Generated from Senparc WeChat product APIs'
 
 PRODUCTS = {
     'Work': {
         'source': ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.Work/Senparc.Weixin.Work/AdvancedAPIs',
-        'output': ROOT / 'stdlib/Sdk/Wechat/Work',
+        'output': PKG_WECHAT / 'Work',
         'namespace': 'Sdk.Wechat.Work',
         'prefix': 'WechatWork',
         'client': 'WechatWorkClient',
     },
     'WxOpen': {
         'source': ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.WxOpen/src/Senparc.Weixin.WxOpen/Senparc.Weixin.WxOpen/AdvancedAPIs',
-        'output': ROOT / 'stdlib/Sdk/Wechat/WxOpen',
+        'output': PKG_WECHAT / 'WxOpen',
         'namespace': 'Sdk.Wechat.WxOpen',
         'prefix': 'WechatWxOpen',
         'client': 'WechatWxOpenClient',
     },
     'Open': {
         'source': ROOT / 'stdlib/Sdk/WeiXinMPSDK-master/src/Senparc.Weixin.Open/Senparc.Weixin.Open',
-        'output': ROOT / 'stdlib/Sdk/Wechat/Open',
+        'output': PKG_WECHAT / 'Open',
         'namespace': 'Sdk.Wechat.Open',
         'prefix': 'WechatOpen',
         'client': 'WechatOpenClient',
@@ -417,14 +421,29 @@ def generate_product(product, config):
         if not emitted:
             continue
         cls = class_name(config['prefix'], rel)
-        typed = []
+        req_blocks = []
+        resp_blocks = []
         typed_meta = []
         for entry in emitted:
-            req, resp, declarations = emit_typed_classes(
+            req, resp, req_lines, resp_lines = emit_typed_classes(
                 cls, entry['method'], entry['endpoint'], entry['verb'],
                 entry['credential'], model_index, entry['source_path'], models)
-            typed.extend(declarations)
+            if req_lines:
+                req_blocks.append(req_lines)
+            if resp_lines:
+                resp_blocks.append(resp_lines)
             typed_meta.append((entry, req, resp))
+        dom_stem = cls[len(config['prefix']):-len('Api')] or 'Common'
+        if req_blocks:
+            write_layered_contracts(
+                PKG_WECHAT / 'Requests' / product, f'{dom_stem}Requests.zan',
+                f'Sdk.Wechat.Models.{product}', ['using Sdk.Wechat;'], MARKER,
+                'scripts/generate_wechat_product_apis.py', req_blocks)
+        if resp_blocks:
+            write_layered_contracts(
+                PKG_WECHAT / 'Responses' / product, f'{dom_stem}Responses.zan',
+                f'Sdk.Wechat.Models.{product}', ['using Sdk.Wechat;'], MARKER,
+                'scripts/generate_wechat_product_apis.py', resp_blocks)
         lines = [
             'using System;',
             'using System.Json;',
@@ -433,9 +452,8 @@ def generate_product(product, config):
             '',
             f'namespace {config["namespace"]};',
             '',
-            f'/// <summary>Method request/response contracts; reusable DTO entities live in Sdk.Wechat.Models.{product}.</summary>',
+            f'/// <summary>Strong-typed API facade; Request/Response/DTO contracts live in Requests/{product}, Responses/{product}, Models/{product}.</summary>',
         ]
-        lines.extend(typed)
         lines += [
             '/// <summary>',
             f'/// {rel_text} 的 Zan 强类型接口。',
@@ -492,15 +510,9 @@ def generate_product(product, config):
         })
         total += len(emitted)
 
-    models_dir = ROOT / 'stdlib/Sdk/Wechat/Models' / product
-    models_dir.mkdir(parents=True, exist_ok=True)
-    for old in models_dir.glob('*.zan'):
-        if MARKER in old.read_text(encoding='utf-8', errors='ignore'):
-            old.unlink()
-    (models_dir / ('Wechat' + product + 'Models.zan')).write_text(
-        models.render('Sdk.Wechat.Models.' + product, MARKER,
-                      'scripts/generate_wechat_product_apis.py'),
-        encoding='utf-8', newline='\n')
+    models.render_domains(
+        PKG_WECHAT / 'Models' / product, 'Sdk.Wechat.Models.' + product, MARKER,
+        'scripts/generate_wechat_product_apis.py', lambda name: 'Common')
 
     return {'modules': manifest, 'skipped': skipped, 'method_count': total,
             'shared_model_count': len(models.models)}
