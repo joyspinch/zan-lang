@@ -97,3 +97,50 @@ static bool local_init_can_borrow(zan_irgen_t *g, zan_ast_node_t *stmt,
     zan_ast_walk(g->current_fn_body, borrow_scan_visit, NULL, &scan);
     return !scan.bad && scan.q_decls == 1 && scan.p_decls <= 1;
 }
+
+/* —— 方法调用接收者免钉住 ——
+ * 调用点对局部/参数接收者曾一律 retain + EH 临时栈压入，调用后弹出 + release
+ * （expr_pred.c emit_hold_call_receiver），理由是实参里的 ref 可能在派发前清空
+ * 该槽。Mac 实测：对参数做虚调用/接口调用比 C++ 慢 ~10 倍、Queue 操作慢 11 倍，
+ * 大头就是这对钉住。
+ *
+ * 只要接收者是**自己持有引用**的局部或参数（arc_owned，非 foreach/别名借用——
+ * 被调者可能清空它所借的集合），且在整个函数里从不被重新赋值/ref-out/重名声明、
+ * 函数无 lambda/await/yield/goto、也非装箱/byref/协程帧/结构体局部，则调用
+ * 期间没有任何途径让它的那份引用消失，钉住纯属多余。判定复用上面的全函数
+ * 扫描；按（函数体, 名字）缓存，避免大函数里每个调用点重扫。 */
+typedef struct { zan_ast_node_t *body; zan_istr_t name; bool ok; } recv_cache_t;
+static recv_cache_t g_recv_cache[32];
+static int g_recv_cache_n;
+static zan_ast_node_t *g_recv_cache_body;
+
+bool zan_local_never_reassigned(zan_irgen_t *g, zan_istr_t name) {
+    zan_ast_node_t *body = g->current_fn_body;
+    if (!body || g->current_async_frame) return false;
+    if (body != g_recv_cache_body) { g_recv_cache_body = body; g_recv_cache_n = 0; }
+    for (int i = 0; i < g_recv_cache_n; i++)
+        if (borrow_name_eq(g_recv_cache[i].name, name)) return g_recv_cache[i].ok;
+    borrow_scan_t scan;
+    memset(&scan, 0, sizeof scan);
+    scan.q = name;
+    scan.p = name;
+    zan_ast_walk(body, borrow_scan_visit, NULL, &scan);
+    bool ok = !scan.bad && scan.q_decls <= 1;
+    if (g_recv_cache_n < 32) {
+        g_recv_cache[g_recv_cache_n].body = body;
+        g_recv_cache[g_recv_cache_n].name = name;
+        g_recv_cache[g_recv_cache_n].ok = ok;
+        g_recv_cache_n++;
+    }
+    return ok;
+}
+
+bool zan_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
+                               local_scope_t *locals) {
+    if (!object || object->kind != AST_IDENTIFIER || !locals) return false;
+    local_var_t *v = local_find(locals, object->ident.name);
+    if (!v || !v->arc_owned || v->box_cell || v->byref_slot || v->async_decl ||
+        v->frame_owner >= 0 || v->struct_rc || v->obj_rc_flag)
+        return false;
+    return zan_local_never_reassigned(g, object->ident.name);
+}
