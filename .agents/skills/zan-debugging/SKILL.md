@@ -69,6 +69,10 @@ writes to stdout, so it must not replace stderr in protocols or golden-output te
 通道（kqueue/select）读端登记轮询器、**写端**才可写；写读端 EBADF 静默失败。eventfd
 （Linux）一个 fd 读写皆可，IOCP 用投递包，均不受这类错影响——只在 macOS/BSD 复现。
 
+**代价补充：** 卸载本身不是免费的——旧运行时每个阻塞作业新建一个 OS 线程，SQLite
+`QueryAsync` 又每行 await 一次 `sqlite3_step`，20 行一页 = 21 次建线程 + 线程往返。逐行
+FFI 不要逐次卸载：首个（重活）卸载、后续按时间片内联，并让作业复用常驻线程。
+
 ### 多 worker 吞吐上不去、CPU 却很高：先看锁等待归因（Web 压测实测，2026-11-23）
 
 `sample <pid> 5` 的「Sort by top of stack」里 `__psynch_mutexwait` 占大头时，把调用图里

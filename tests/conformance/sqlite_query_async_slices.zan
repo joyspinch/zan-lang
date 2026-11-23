@@ -1,0 +1,45 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+
+// SqliteConnection.QueryAsync：首个 step 卸载，后续 step 在协程线程按时间片
+// 内联、超片或单步过慢时重新卸载。5000 行结果必然跨多片、在内联与卸载间
+// 切换；逐行核对行数、列值与顺序，确保切换不丢行、不串行、不重复。
+class Program {
+    static async void Main() {
+        Directory.CreateDirectoryRecursive("_scratch/sqlite-slices");
+        string path = "_scratch/sqlite-slices/t.db";
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)");
+        db.Execute("BEGIN");
+        for (int i = 1; i <= 5000; i = i + 1) {
+            DbParams p = new DbParams();
+            p.Add(Convert.ToString(i * 3));
+            p.Add("row-" + Convert.ToString(i));
+            db.Execute("INSERT INTO t (v, s) VALUES (?, ?)", p);
+        }
+        db.Execute("COMMIT");
+
+        DbResult r = await db.QueryAsync("SELECT id, v, s FROM t ORDER BY id");
+        bool ordered = true;
+        long sum = 0;
+        for (int i = 0; i < r.RowCount(); i = i + 1) {
+            if (r.GetLong(i, 0) != (long)(i + 1)) { ordered = false; }
+            if (r.GetString(i, 2) != "row-" + Convert.ToString(i + 1)) { ordered = false; }
+            sum = sum + r.GetLong(i, 1);
+        }
+        Console.WriteLine(r.RowCount() == 5000 ? "ok row count" : "FAIL row count " + Convert.ToString(r.RowCount()));
+        Console.WriteLine(ordered ? "ok order and text" : "FAIL order");
+        Console.WriteLine(sum == (long)3 * 5000 * 5001 / 2 ? "ok sum" : "FAIL sum");
+
+        DbResult few = await db.QueryAsync("SELECT id FROM t WHERE v % 997 = 0 ORDER BY id");
+        Console.WriteLine(few.RowCount() == 5 && few.GetLong(0, 0) == 997 ? "ok filtered" : "FAIL filtered");
+
+        DbResult none = await db.QueryAsync("SELECT id FROM t WHERE id < 0");
+        Console.WriteLine(none.RowCount() == 0 ? "ok empty" : "FAIL empty");
+        db.Close();
+        File.Delete(path);
+    }
+}

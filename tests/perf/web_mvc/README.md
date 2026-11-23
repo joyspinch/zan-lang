@@ -52,10 +52,14 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
   大量普通函数里，只返回常量指针）与 `zan_rt_defer_pending`（release 出口读计数）每次都
   拿全局互斥锁；多 worker 在锁上排队。改为无锁快路径后 plain 12.4k → 30.9k rps（8 连接），
   p99 1.8 → 0.75 ms。list 不变（瓶颈在逐行阻塞卸载，见下）。
-- **已知瓶颈：list 场景每行一次阻塞卸载、每次卸载新建一个 OS 线程。**
-  `SqliteConnection.QueryAsync` 每个 `sqlite3_step` 都 `await` 卸载，运行时每个阻塞作业
-  `pthread_create` 一个线程（`rt_io_dns.c` blocking_spawn）。整条查询应一次卸载，作业应走
-  常驻线程池。
+- **已修（2026-11-23）：list 场景每行一次阻塞卸载、每次卸载新建一个 OS 线程。**
+  运行时阻塞作业改为线程复用（跑完的线程挂起等下一个移交，空闲 2 s 退出）；
+  `SqliteConnection.QueryAsync` 只有首个 `sqlite3_step` 卸载，后续 step 在协程线程按
+  1 ms 时间片内联（单步 > 200 µs 或超片即重新卸载）。list 8 连接 3.7k → 10.9k rps，
+  p99 3.2 → 2.1 ms；32 连接受 8 条连接池限制（4.2k）。回归用例
+  `conformance/blocking_pool_stress`、`conformance/sqlite_query_async_slices`。
+- **未解（间歇）：压测端一次 "out of memory" 退出。** 同环境 11 次未复现；HEAD 同期合入了
+  macOS 小对象分配器（bf700ebbf），未能归因。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
   指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
   路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。

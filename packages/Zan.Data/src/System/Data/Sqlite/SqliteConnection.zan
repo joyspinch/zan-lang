@@ -13,6 +13,10 @@ namespace System.Data.Sqlite;
 // sqlite3_errmsg 文本；因此空结果集总意味着「无行」。
 // 失败不会中断连接，后续语句照常执行。
 public class SqliteConnection : IDbConnection {
+    // QueryAsync 内联 step 的让出阈值（微秒），见 QueryAsync。
+    public static const long InlineSliceUs = 1000;
+    public static const long InlineStepUs = 200;
+
     public nint handle;
     public bool connected;
     // 单语句准备缓存：同一条 SQL 的 prepare 只做一次，之后每次执行
@@ -492,7 +496,15 @@ public class SqliteConnection : IDbConnection {
             result.AddColumnName(CopyText(sqlite3_column_name(stmt, c)));
         }
 
+        // 首个 step 卸载到阻塞线程（排序/索引定位等重活通常在这一步）；之后
+        // 游标已就位，后续 step 多为微秒级——曾每行都 await 卸载，20 行一页
+        // 就是 21 次线程往返。现在后续 step 在协程线程内联执行，按时间片
+        // 让出：一片内联累计超过 InlineSliceUs、或单个 step 超过
+        // InlineStepUs（如过滤扫描跨大量行），下一个 step 重新卸载。最坏
+        // 情况阻塞 reactor 一个 step + 一片。
         int step = await sqlite3_step(stmt);
+        long sliceStart = Stopwatch.GetMicroseconds();
+        bool inline = true;
         while (step == 100) {
             List<DbCell> cells = new List<DbCell>();
             List<string> texts = new List<string>();
@@ -514,7 +526,19 @@ public class SqliteConnection : IDbConnection {
                 c = c + 1;
             }
             result.AddRowCells(cells, texts);
-            step = await sqlite3_step(stmt);
+            if (inline) {
+                long t0 = Stopwatch.GetMicroseconds();
+                step = sqlite3_step(stmt);
+                long t1 = Stopwatch.GetMicroseconds();
+                if (t1 - t0 > SqliteConnection.InlineStepUs
+                    || t1 - sliceStart > SqliteConnection.InlineSliceUs) {
+                    inline = false;
+                }
+            } else {
+                step = await sqlite3_step(stmt);
+                sliceStart = Stopwatch.GetMicroseconds();
+                inline = true;
+            }
         }
         this.ReleaseStmt(sql, stmt, cached);
         if (step != 101) {  // SQLITE_DONE = 101

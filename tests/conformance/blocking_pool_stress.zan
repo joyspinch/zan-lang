@@ -1,0 +1,39 @@
+using System;
+using System.Threading;
+
+// 阻塞卸载作业改为线程复用后（跑完的线程挂起等下一个移交，空闲超时才退出），
+// 高并发下不得丢作业、串结果或卡死：64 个协程各 await 100 次原生调用，结果
+// 逐次核对。旧实现每作业新建一个线程，语义相同但慢；本用例钉移交语义。
+class Program {
+    [DllImport("sqlite3")]
+    static extern int sqlite3_libversion_number();
+
+    static int expected;
+    static AtomicInt ok;
+    static AtomicInt bad;
+    static AtomicInt done;
+
+    static async void Worker() {
+        for (int i = 0; i < 100; i = i + 1) {
+            int v = await sqlite3_libversion_number();
+            if (v == Program.expected) { Program.ok.Add(1); } else { Program.bad.Add(1); }
+        }
+        Program.done.Add(1);
+    }
+
+    static async void Main() {
+        Program.expected = sqlite3_libversion_number();
+        Program.ok = new AtomicInt(0);
+        Program.bad = new AtomicInt(0);
+        Program.done = new AtomicInt(0);
+        for (int w = 0; w < 64; w = w + 1) { Task.Spawn(Program.Worker()); }
+        int spins = 0;
+        while (Program.done.Load() < 64 && spins < 3000) { await Task.Delay(10); spins = spins + 1; }
+        Console.WriteLine(Program.done.Load() == 64 ? "ok all workers finished" : "FAIL stalled");
+        Console.WriteLine(Program.ok.Load() == 6400 && Program.bad.Load() == 0 ? "ok results" : "FAIL results");
+        // 空闲线程挂起后再来一轮：移交给已挂起线程的路径。
+        await Task.Delay(50);
+        int again = await sqlite3_libversion_number();
+        Console.WriteLine(again == Program.expected ? "ok reuse after idle" : "FAIL reuse");
+    }
+}

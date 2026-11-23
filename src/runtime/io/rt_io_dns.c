@@ -101,15 +101,92 @@ static void blocking_finish_worker(zan_blocking_job_t *job) {
     if (next) blocking_spawn(next);
 }
 
-/* 工作线程调度跳板入口 */
+/* ---- 阻塞作业线程复用 ----
+ * 曾经每个作业 pthread_create/CreateThread 一个线程、跑完即退：SQLite 的
+ * QueryAsync 每行一次 sqlite3_step 卸载，列表页 ~4k rps 就是每秒 ~8 万次建
+ * 线程。现在跑完作业的线程不退出，挂起等待下一个移交作业（最多
+ * ZAN_BLOCKING_IDLE_MS），超时才退出；blocking_spawn 有空闲线程时直接移交，
+ * 没有才新建。作业的计数/排队/超时语义完全不变：started 与 g_blocking_active
+ * 仍按作业记，线程只是执行载体。移交链表复用 queue_next（已开始的作业不在
+ * g_blocking_queued 里）。全部状态受 dns_lock 保护。 */
+#define ZAN_BLOCKING_IDLE_MS 2000
+
+static zan_blocking_job_t *g_blocking_handoff; /* started jobs awaiting a parked worker */
+static int32_t g_blocking_idle;                /* parked workers not yet claimed */
+#if defined(_WIN32)
+static CONDITION_VARIABLE g_blocking_cv = CONDITION_VARIABLE_INIT;
+#else
+static pthread_cond_t g_blocking_cv = PTHREAD_COND_INITIALIZER;
+#endif
+
+/* 已持 dns_lock：挂起至多 ms 毫秒等移交。返回 0 表示超时。 */
+static int blocking_park_locked(int64_t ms) {
+#if defined(_WIN32)
+    return SleepConditionVariableSRW(&g_blocking_cv, &g_dns_srw, (DWORD)ms, 0) ? 1 : 0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(ms / 1000);
+    ts.tv_nsec += (long)((ms % 1000) * 1000000L);
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    return pthread_cond_timedwait(&g_blocking_cv, &g_dns_mx, &ts) == 0 ? 1 : 0;
+#endif
+}
+
+static void blocking_wake_parked(void) {
+#if defined(_WIN32)
+    WakeConditionVariable(&g_blocking_cv);
+#else
+    pthread_cond_signal(&g_blocking_cv);
+#endif
+}
+
+/* 有空闲线程就把作业移交给它（返回 1），否则返回 0 由调用方新建线程。 */
+static int blocking_handoff(zan_blocking_job_t *job) {
+    int taken = 0;
+    dns_lock();
+    if (g_blocking_idle > 0) {
+        g_blocking_idle--;
+        job->queue_next = g_blocking_handoff;
+        g_blocking_handoff = job;
+        taken = 1;
+        blocking_wake_parked();
+    }
+    dns_unlock();
+    return taken;
+}
+
+/* 工作线程调度跳板入口：跑完一个作业后挂起等下一个移交，空闲超时退出。 */
 #if defined(_WIN32)
 static DWORD WINAPI blocking_worker(void *arg) {
 #else
 static void *blocking_worker(void *arg) {
 #endif
     zan_blocking_job_t *job = (zan_blocking_job_t *)arg;
-    job->run(job);
-    blocking_finish_worker(job);
+    while (job) {
+        job->run(job);
+        blocking_finish_worker(job);
+        job = NULL;
+        dns_lock();
+        g_blocking_idle++;
+        int64_t deadline = dns_now_ms() + ZAN_BLOCKING_IDLE_MS;
+        for (;;) {
+            if (g_blocking_handoff) {
+                /* 移交方已替本线程扣过 g_blocking_idle。 */
+                job = g_blocking_handoff;
+                g_blocking_handoff = job->queue_next;
+                job->queue_next = NULL;
+                break;
+            }
+            int64_t left = deadline - dns_now_ms();
+            if (left <= 0) {
+                g_blocking_idle--;
+                break;
+            }
+            (void)blocking_park_locked(left);
+        }
+        dns_unlock();
+    }
 #if defined(_WIN32)
     return 0;
 #else
@@ -141,6 +218,7 @@ static void blocking_start_failed(zan_blocking_job_t *job) {
 }
 
 static void blocking_spawn(zan_blocking_job_t *job) {
+    if (blocking_handoff(job)) return;
 #if defined(_WIN32)
     HANDLE h = CreateThread(NULL, 0, blocking_worker, job, 0, NULL);
     if (!h) {
