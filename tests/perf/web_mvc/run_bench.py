@@ -19,6 +19,7 @@ import platform
 import subprocess
 import sys
 import time
+import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 HERE = os.path.join(ROOT, "tests", "perf", "web_mvc")
@@ -62,9 +63,20 @@ def compile_all(zanc, outdir):
     return server, load
 
 
+def server_answers(port):
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 绕开 http_proxy
+        with opener.open("http://127.0.0.1:%d/bench/plain" % port, timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
 def start_server(server, port, pool, log_path):
     """服务端输出写日志文件而非管道：管道没人读时写满会把服务端堵住，
-    整轮表现为成片连接失败；日志也留作失败现场。"""
+    整轮表现为成片连接失败；日志也留作失败现场。
+    就绪以"能应答 HTTP"为准：stdout 重定向到普通文件时运行时整块缓冲
+    （ae4e71463），常驻服务端的 BENCH_READY 行可能一直留在缓冲里。"""
     os.makedirs(os.path.join(ROOT, "_scratch"), exist_ok=True)
     log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -78,6 +90,8 @@ def start_server(server, port, pool, log_path):
         with open(log_path, encoding="utf-8", errors="replace") as f:
             if "BENCH_READY" in f.read():
                 return proc, log
+        if server_answers(port):
+            return proc, log
         time.sleep(0.2)
     proc.kill()
     raise SystemExit("server did not report BENCH_READY; see " + log_path)

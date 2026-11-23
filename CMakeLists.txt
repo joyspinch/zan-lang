@@ -1316,6 +1316,17 @@ add_test(NAME runtime_task_handle_registry COMMAND zanrt_task_handle_registry_te
 set_tests_properties(runtime_task_handle_registry PROPERTIES TIMEOUT 60)
 add_dependencies(zanc zanrt_task_handle_registry_test)
 
+add_executable(zanrt_timer_delay_cancel_index_test tests/runtime/timer_delay_cancel_index.c)
+set_target_properties(zanrt_timer_delay_cancel_index_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+if(NOT WIN32)
+  target_link_libraries(zanrt_timer_delay_cancel_index_test PRIVATE Threads::Threads)
+endif()
+add_test(NAME runtime_timer_delay_cancel_index COMMAND zanrt_timer_delay_cancel_index_test)
+set_tests_properties(runtime_timer_delay_cancel_index PROPERTIES TIMEOUT 60)
+add_dependencies(zanc zanrt_timer_delay_cancel_index_test)
+
 add_executable(zanrt_task_frame_allocator_test
   tests/runtime/task_frame_allocator.c src/runtime/rt_io.c
   src/runtime/rt_crash.c src/runtime/rt_timer.c)

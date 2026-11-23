@@ -29,8 +29,19 @@ static void co_stats_dump(void);
  *
  * 次序：完成方"发布 DONE → 读 g_co_ext_waiters"之间隔着 g_co_running 的
  * 全屏障 RMW，等待方"g_co_ext_waiters++（seq_cst）→ 持锁读 DONE"，两边必有
- * 一方看见对方；限时等待只作兜底，不承担正确性。 */
+ * 一方看见对方；限时等待只作兜底，不承担正确性。
+ *
+ * 只唤醒等的那一帧：服务端主线程整个生命期都挂在这里等根任务，原先每个协程
+ * 步都要拿 g_co_ext_mx 广播一次（还把主线程叫醒复查），多 worker 在这把锁上
+ * 排队。等待方在登记 waiters **之前**把 done 指针写进槽位；done 是被等帧帧头
+ * 第 4 个字段（ASYNC_FRAME_DONE），co_run 跑完帧 F 的一步后只在某个槽位的
+ * done 落在 [F, F+SPAN) 时才广播——只比地址、不解引用（等待方可能已返回并
+ * 释放帧）。DONE 只在该帧自己的步内发布，所以不会漏；槽位满时退回逢步广播。 */
 static volatile LONG g_co_ext_waiters;
+#define ZAN_CO_EXT_SLOTS     8
+#define ZAN_CO_EXT_DONE_SPAN 64
+static const volatile int *volatile g_co_ext_slot[ZAN_CO_EXT_SLOTS];
+static volatile LONG g_co_ext_overflow;
 #if defined(_WIN32)
 static SRWLOCK            g_co_ext_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_co_ext_cv   = CONDITION_VARIABLE_INIT;
@@ -47,8 +58,16 @@ static pthread_cond_t  g_co_ext_cv = PTHREAD_COND_INITIALIZER;
 #endif
 #endif
 
-static void co_ext_wake(void) {
+static void co_ext_wake(const void *frame) {
     if (__atomic_load_n(&g_co_ext_waiters, __ATOMIC_SEQ_CST) <= 0) return;
+    if (__atomic_load_n(&g_co_ext_overflow, __ATOMIC_SEQ_CST) <= 0) {
+        int hit = 0;
+        for (int i = 0; i < ZAN_CO_EXT_SLOTS && !hit; i++) {
+            const volatile int *d = __atomic_load_n(&g_co_ext_slot[i], __ATOMIC_SEQ_CST);
+            hit = d && (uintptr_t)d - (uintptr_t)frame < ZAN_CO_EXT_DONE_SPAN;
+        }
+        if (!hit) return;
+    }
 #if defined(_WIN32)
     AcquireSRWLockExclusive(&g_co_ext_lock);
     WakeAllConditionVariable(&g_co_ext_cv);
@@ -68,6 +87,16 @@ static void co_ext_wait(const volatile int *done) {
         if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
         co_cpu_relax();
     }
+    int slot = -1;
+    for (int i = 0; i < ZAN_CO_EXT_SLOTS; i++) {
+        const volatile int *empty = NULL;
+        if (__atomic_compare_exchange_n(&g_co_ext_slot[i], &empty, done, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) __atomic_add_fetch(&g_co_ext_overflow, 1, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&g_co_ext_waiters, 1, __ATOMIC_SEQ_CST);
 #if defined(_WIN32)
     AcquireSRWLockExclusive(&g_co_ext_lock);
@@ -92,6 +121,8 @@ static void co_ext_wait(const volatile int *done) {
     pthread_mutex_unlock(&g_co_ext_mx);
 #endif
     __atomic_sub_fetch(&g_co_ext_waiters, 1, __ATOMIC_SEQ_CST);
+    if (slot >= 0) __atomic_store_n(&g_co_ext_slot[slot], NULL, __ATOMIC_SEQ_CST);
+    else __atomic_sub_fetch(&g_co_ext_overflow, 1, __ATOMIC_SEQ_CST);
 }
 
 void zan_co_sched_init(void) {
@@ -292,7 +323,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             break;
     }
     InterlockedDecrement(&g_co_running);
-    co_ext_wake();
+    co_ext_wake(t->frame);
     co_cnt_add(w, +1, -1);
 }
 

@@ -79,6 +79,15 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
   等不到。之前"新建连接首请求不应答"的描述不准确，实为 keep-alive 后续请求。改调运行时
   的非变参 C 包装 `zan_io_set_nonblocking`。回归用例 `conformance/socket_nonblocking_accept`。
   修后整轮 errors=0、stuck=0，基线重录。
+- **已修（2026-11-23）：list 32 连接吞吐反比 8 连接低一半。** 两处"每协程步/每帧完成都拿
+  全局锁"的运行时路径，代价随在途量上涨：① 编译器在每个异步帧完成处调
+  `zan_timer_cancel_delay`，它持全局定时器锁全堆扫描 + 重建堆；连接池排队时每次门等挂一个
+  250 ms 看门狗，堆常驻上千条。改为帧 → 条目索引 + 惰性删除（死条目过半再压缩）。
+  ② `co_run` 每步末尾只要有非 worker 线程在 `co_ext_wait`（服务端主线程终身在等根任务）
+  就拿 `g_co_ext_mx` 广播；改为只在刚跑的帧正是被等的帧时广播。同 HEAD A/B：list 8 连接
+  9.7k → 13.5k rps（p99 1.45 → 0.99 ms），32 连接 4.1k → 8.3k（p99 19 → 10 ms）。回归用例
+  `runtime_timer_delay_cancel_index`。剩余差距在连接池等待路径（每次门等的 Gate 锁、
+  派生看门狗协程、`PoolCore.IsClosed` 加锁）。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
   指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
   路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。

@@ -2,13 +2,16 @@ using System;
 using System.Data;
 using System.Data.TDengine;
 using System.Net.Sockets;
+using System.Threading;
 
 
 class Fake {
     static int PORT = 9509;
-    static int served = 0;      // statements answered
-    static int inFlight = 0;    // requests being handled right now
-    static int peak = 0;        // high-water mark of inFlight
+    // Serve coroutines run on several scheduler threads: plain `x = x + 1`
+    // loses updates (Program.done stuck below 4 hung the test ~5% of runs).
+    static AtomicInt served = new AtomicInt(0);    // statements answered
+    static AtomicInt inFlight = new AtomicInt(0);  // requests being handled right now
+    static AtomicInt peak = new AtomicInt(0);      // high-water mark of inFlight
 
     static string Body(string sql) {
         if (sql.Contains("SERVER_VERSION")) {
@@ -25,9 +28,10 @@ class Fake {
 
     static async void Serve(nint client) {
         string req = await AsyncSocket.Receive(client, 65536);
-        Fake.inFlight = Fake.inFlight + 1;
-        if (Fake.inFlight > Fake.peak) {
-            Fake.peak = Fake.inFlight;
+        long now = Fake.inFlight.Increment();
+        long seen = Fake.peak.Load();
+        while (now > seen && Fake.peak.CompareExchange(seen, now) != seen) {
+            seen = Fake.peak.Load();
         }
         int cut = req.IndexOf("\r\n\r\n");
         string sql = "";
@@ -40,8 +44,8 @@ class Fake {
             + "Content-Length: " + Convert.ToString(body.Length)
             + "\r\nConnection: close\r\n\r\n" + body;
         int sent = await AsyncSocket.SendString(client, resp);
-        Fake.inFlight = Fake.inFlight - 1;
-        Fake.served = Fake.served + 1;
+        Fake.inFlight.Decrement();
+        Fake.served.Increment();
         Socket.Close(client);
     }
 
@@ -67,7 +71,7 @@ class Fake {
 class Program {
     static int passed = 0;
     static int failed = 0;
-    static int done = 0;
+    static AtomicInt done = new AtomicInt(0);
 
     static void Check(string name, bool ok) {
         if (ok) {
@@ -81,12 +85,12 @@ class Program {
     static async void Worker(TDenginePool pool) {
         TDengineConnection db = await pool.AcquireAsync();
         if (db == null) {
-            Program.done = Program.done + 1;
+            Program.done.Increment();
             return;
         }
         DbResult r = await db.QueryAsync("SELECT ts, v FROM meters LIMIT 1");
         if (r.RowCount() == 1 && r.GetInt(0, 1) == 7) {
-            Program.done = Program.done + 1;
+            Program.done.Increment();
         }
         pool.Release(db);
     }
@@ -115,16 +119,16 @@ class Program {
         TDenginePool pool = new TDenginePool("127.0.0.1", Fake.PORT, "root",
                                                 "taosdata", "", "power", 2);
         Program.Check("pool max size", pool.MaxSize() == 2);
-        Fake.peak = 0;
+        Fake.peak.Store(0);
         for (int i = 0; i < 4; i = i + 1) {
             Task.Spawn(Program.Worker(pool));
         }
-        while (Program.done < 4) {
+        while (Program.done.Load() < 4) {
             await Task.Delay(5);
         }
-        Program.Check("every pooled worker finished", Program.done == 4);
+        Program.Check("every pooled worker finished", Program.done.Load() == 4);
         Program.Check("pool never exceeds its size", pool.LiveCount() <= 2);
-        Program.Check("statements really overlap", Fake.peak >= 2);
+        Program.Check("statements really overlap", Fake.peak.Load() >= 2);
         Program.Check("connections are reused", pool.IdleCount() == 2);
         Program.Check("no waiters left", pool.WaitingCount() == 0);
 
