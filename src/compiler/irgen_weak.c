@@ -477,7 +477,8 @@ void emit_weak_runtime(zan_irgen_t *g) {
  * 静态链（bionic 上 --wrap=malloc 崩，刻意不链）与 selfhost 对象束都拿
  * 不到它，B-ID78 后这些形态全部断链（emit_lib 门 2026-11-03 实锤：
  * dll/dylib undefined reference to zan_rt_defer_*）。这里对 release_dyn
- * 已建好的三个声明补弱链路 + 函数体：链入 rt_mem.o 的形态由强定义覆盖
+ * 已建好的三个声明补弱链路 + 函数体：真队列现在 rt_timer.o（2026-11-23
+ * 从 rt_mem.o 迁出，hosted 原生 exe 含 macOS 全覆盖），链入它的形态由强定义覆盖
  * （真队列语义不变，与 zan_io_pump 的弱覆盖先例同款）；未链入的形态
  * 退化为 push 即同步调析构——与真实现自身节点分配失败的 fail-open 路径
  * 同语义，不泄漏、不挂队列，深树级联在该形态回到 B-ID78 前的同步递归。
@@ -520,7 +521,7 @@ void emit_defer_fallback(zan_irgen_t *g) {
 }
 
 /* B-ID89 活对象注册表与 GC 探测器的弱符号兜底：
- * 当 rt_mem.o 未链入时（如 DLL / macOS / 未开启 fast-alloc），
+ * 实现在 rt_timer.o（timer/rt_timer_gc.c）；wasm/bare 等不含它的形态里，
  * 注册/反注册降级为空操作，探测与快照返回 0，确保符号完备不报链接错误。 */
 static void emit_live_registry_fallback(zan_irgen_t *g) {
     if (!g->rt_live_register || !g->rt_live_unregister) return;

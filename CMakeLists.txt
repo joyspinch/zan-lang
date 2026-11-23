@@ -381,6 +381,7 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
@@ -3396,9 +3397,9 @@ set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label)
 # Native ABI fixture deliberately supplies its own descriptors/headers, outside
 # leak-site registration. Keep one uninstrumented binary and a precise verdict.
 list(APPEND _conf_skip_cases arc_deferred_stack)
-# The pending/drain assertions require rt_mem's real queue. Apple targets use
-# synchronous weak fallbacks because the native linker does not include rt_mem.
-if(NOT APPLE AND TARGET zanrt_mem)
+# The pending/drain assertions need the real queue, which lives in zanrt_timer
+# (linked on every hosted target, Apple included).
+if(TARGET zanrt_timer)
   set(_arc_fixture_cc "${CMAKE_C_COMPILER}")
   if(WIN32)
     set(_arc_fixture_cc "${ZAN_RT_IO_CC}")
