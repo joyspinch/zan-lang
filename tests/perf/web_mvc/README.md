@@ -66,8 +66,14 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
 - **待查：HEAD 自上一基线后 plain 8 连接 33.6k → 26.7k。** 期间唯一运行时相关提交是
   66b32700e（读串头前的可读性守卫）；剖析中其慢路径 `zan_rt_hdr_readable`→`vm_read_overwrite`
   约占 1% 采样，不足以解释，机器负载波动大，未定论。
-- **未解（间歇）：压测端一次 "out of memory" 退出。** 同环境 11 次未复现；HEAD 同期合入了
-  macOS 小对象分配器（bf700ebbf），未能归因。
+- **已查明（2026-11-23）：压测端偶发 "out of memory"/SIGSEGV/double free 是 load.zan 自身的数据竞争。**
+  连接协程跑在多个调度线程上，曾共用一个 List 记延迟、用普通 int 计数；并发扩容时分配器
+  报 double free。已改为每连接独立结果槽、结束时合并（`connect_fail`/`send_fail`/`recv_fail`
+  分项）。
+- **未解（服务端，严重）：新建连接的首个请求偶发永不应答。** 8 条连接同时建立时常有 1–3 条
+  首个请求 0 字节、直到客户端 10 s 时限断开（`recv_fail`，均发生在测量开始处）。在
+  659d83c44 与当前 HEAD 上同样复现，疑为新 socket 的读就绪唤醒丢失（运行时 IO 层）。它使
+  小连接数场景的吞吐/延迟严重失真（list 8 连接一轮可跌到 ~200 rps）；修复前不重录基线。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
   指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
   路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。
