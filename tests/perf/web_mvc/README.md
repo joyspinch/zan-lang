@@ -35,11 +35,14 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
 - `run_bench.py`：编译、起服务、跑矩阵、写 / 比对基线。
 - `baselines/`：各机器的基线 JSON（含提交号、机器信息、负载）。
 
-## 已知：list 场景被运行时阻塞卸载延迟主导（macOS，2026-11-22）
+## 历史与已知问题
 
-`SqliteConnection.QueryAsync` 每个 `sqlite3_step`（每行一次）都 `await` 过运行时
-的阻塞卸载边界；在 macOS 上每次往返约 10–40 ms（同步 `Query` 只要几十微秒），
-20 行一页 ≈ 200 ms。根因在运行时调度：kqueue/epoll 下阻塞完成的唤醒 fd 只注册在
-shard 0，且单 shard 时也要等 20 ms 扫描（`ZAN_IO_SWEEP_MS`）才被收割；Windows 走
-IOCP、向全部 shard 投递，未在本机验证。修复后该场景吞吐应有数量级变化，届时
-重录基线。
+- **已修（2026-11-23）：list 场景曾被运行时阻塞卸载唤醒主导。**
+  kqueue / select 后端把阻塞调用的完成唤醒写进 pipe 的**读端**（EBADF，唤醒全丢），
+  每个 `await` 原生阻塞调用（SQLite 每行一次 `sqlite3_step`、DNS）都要等 20 ms
+  扫描（`ZAN_IO_SWEEP_MS`）才被收割，单次往返 10–40 ms。修复后 list 从 31 → ~3.9k
+  rps（8 连接），p99 从 314 ms → ~2.8 ms。回归用例 `conformance/await_extern_wake_latency`。
+  Linux（eventfd）与 Windows（IOCP）不受影响。
+- **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
+  指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
+  路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。

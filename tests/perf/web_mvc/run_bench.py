@@ -62,21 +62,25 @@ def compile_all(zanc, outdir):
     return server, load
 
 
-def start_server(server, port, pool):
+def start_server(server, port, pool, log_path):
+    """服务端输出写日志文件而非管道：管道没人读时写满会把服务端堵住，
+    整轮表现为成片连接失败；日志也留作失败现场。"""
     os.makedirs(os.path.join(ROOT, "_scratch"), exist_ok=True)
+    log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
         [server, "--port=%d" % port, "--pool=%d" % pool,
          "--db=_scratch/bench_web_mvc.db", "--views=tests/perf/web_mvc/views"],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     deadline = time.time() + 60
     while time.time() < deadline:
-        line = proc.stdout.readline()
-        if not line:
+        if proc.poll() is not None:
             break
-        if line.startswith("BENCH_READY"):
-            return proc
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            if "BENCH_READY" in f.read():
+                return proc, log
+        time.sleep(0.2)
     proc.kill()
-    raise SystemExit("server did not report BENCH_READY")
+    raise SystemExit("server did not report BENCH_READY; see " + log_path)
 
 
 def run_load(load, port, path, conns, seconds, warmup):
@@ -92,9 +96,16 @@ def run_load(load, port, path, conns, seconds, warmup):
 
 
 def git_head():
+    """HEAD 短哈希；影响数字的源码（运行时/编译器/包/标准库/本基准）有未提交
+    改动时加 -dirty——基线必须能追溯到真正被测的代码。"""
     try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
                               capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--", "src/runtime", "src/compiler",
+             "packages", "stdlib", "tests/perf"],
+            cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        return head + ("-dirty" if dirty else "")
     except OSError:
         return ""
 
@@ -140,7 +151,8 @@ def main():
             print("WARNING: machine busy (1-min load %.1f on %d cpus); numbers will be noisy"
                   % (load_avg, os.cpu_count() or 1))
     server, load = compile_all(zanc_path(a.zanc), os.path.join(ROOT, "build", "perf"))
-    proc = start_server(server, a.port, a.pool)
+    log_path = os.path.join(ROOT, "_scratch", "bench_web_mvc_server.log")
+    proc, log = start_server(server, a.port, a.pool, log_path)
     results = []
     try:
         for name, path in SCENARIOS:
@@ -152,9 +164,12 @@ def main():
                 print("%-6s conns=%-3d rps=%-7d p50=%-6dus p99=%-6dus errors=%d non200=%d stuck=%d" %
                       (name, conns, r["rps"], r["p50_us"], r["p99_us"], r["errors"],
                        r["non200"], r.get("stuck", 0)))
+            if proc.poll() is not None:
+                raise SystemExit("server exited during %s; see %s" % (name, log_path))
     finally:
         proc.kill()
         proc.wait()
+        log.close()
 
     doc = {
         "bench": "web_mvc",

@@ -60,6 +60,15 @@ writes to stdout, so it must not replace stderr in protocols or golden-output te
   再读 `.Length` 或调用字符串方法；仅在业务契约允许时把缺席映射为空串或默认值。
   历史行与 ORM 可空列可能保留 null，构造时赋过默认值也不能证明读回后非空。
 
+### `await` 原生调用每次 10–40ms：先怀疑完成唤醒丢了，不是调用本身慢（rt_io_dns 实测，2026-11-23）
+
+`await extern(...)` 走运行时阻塞卸载：工作线程跑完后经唤醒通道通知 reactor。唤醒
+丢了不会挂死——20ms 扫描（`ZAN_IO_SWEEP_MS`）照样收割——只表现为每次往返稳定的
+十几毫秒，极易被当成「SQLite/驱动慢」。判据：同一调用同步版只要微秒级。最小探针
+`await getpid()`（或跨平台的 `sqlite3_libversion_number`）应在几十微秒内。pipe 型唤醒
+通道（kqueue/select）读端登记轮询器、**写端**才可写；写读端 EBADF 静默失败。eventfd
+（Linux）一个 fd 读写皆可，IOCP 用投递包，均不受这类错影响——只在 macOS/BSD 复现。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =

@@ -1,0 +1,30 @@
+using System;
+using System.Threading;
+
+// await 原生阻塞调用的完成唤醒必须即时送达。kqueue/select 后端曾把唤醒写进
+// pipe 的读端（EBADF、唤醒全丢），每次往返都要等 20ms 扫描才收割：SQLite 的
+// QueryAsync 每行一次 step，20 行一页 ≈ 200ms。50 次往返给 250ms 宽限
+// （修复后约 1–2ms；旧行为 ≥ 350ms），负载抖动也不至于误报。
+class Program {
+    [DllImport("sqlite3")]
+    static extern int sqlite3_libversion_number();
+
+    static async void Main() {
+        int direct = sqlite3_libversion_number();
+        int first = await sqlite3_libversion_number();
+        Console.WriteLine(first == direct && first > 3000000 ? "ok result" : "FAIL result");
+
+        long start = Stopwatch.GetMicroseconds();
+        int same = 0;
+        for (int i = 0; i < 50; i = i + 1) {
+            if (await sqlite3_libversion_number() == direct) { same = same + 1; }
+        }
+        long totalUs = Stopwatch.GetMicroseconds() - start;
+        Console.WriteLine(same == 50 ? "ok results stable" : "FAIL results");
+        if (totalUs < 250000) {
+            Console.WriteLine("ok wake latency");
+        } else {
+            Console.WriteLine("FAIL wake latency: 50 awaits took " + Convert.ToString(totalUs) + "us");
+        }
+    }
+}

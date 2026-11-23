@@ -301,8 +301,12 @@ static void dns_wake_notify(void) {
     ssize_t r = write(g_dns_wake_fd, &one, sizeof(one));
     (void)r;
 #else
+    /* kqueue / select 后端的唤醒通道是 pipe：g_dns_wake_fd 是读端（登记在
+     * 轮询器里），必须写写端 g_dns_wake_wfd。曾写读端——EBADF、唤醒全丢，
+     * 每个 await 原生阻塞调用（SQLite 每行一次 step、DNS）都要等
+     * ZAN_IO_SWEEP_MS 扫描才收割，单次往返 10–40ms。 */
     char c = 1;
-    ssize_t r = write(g_dns_wake_fd, &c, 1);
+    ssize_t r = write(g_dns_wake_wfd, &c, 1);
     (void)r;
 #endif
 }
