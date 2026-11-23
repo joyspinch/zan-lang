@@ -1014,26 +1014,51 @@ static bool zan_module_calls(LLVMModuleRef m, const char *name) {
  * 101 早于静态初始化（65535），不漏登记。注册表在 rt_timer.o 里（hosted 全覆盖）；wasm/bare
  * 拿到弱空实现，与注册/探测函数的弱回退同口径。 */
 static void zan_request_live_registry(zan_irgen_t *g) {
-    if (!zan_module_calls(g->mod, "zan_gc_detect_cycles") &&
-        !zan_module_calls(g->mod, "zan_gc_collect_cycles") &&
-        !zan_module_calls(g->mod, "zan_gc_write_heap_snapshot"))
-        return;
+    bool uses = zan_module_calls(g->mod, "zan_gc_detect_cycles") ||
+                zan_module_calls(g->mod, "zan_gc_collect_cycles") ||
+                zan_module_calls(g->mod, "zan_gc_write_heap_snapshot");
+    /* 分配/释放处的注册表调用先内联读模块内开关 __zan_live_on（irgen_weak.c）。
+     * 用 GC API 的程序编译期置 1；否则启动构造器按 ZAN_DETECT_LEAKS 置位，
+     * 保留"不重编、靠环境变量开泄漏检测"的能力。 */
+    LLVMValueRef flag = LLVMGetNamedGlobal(g->mod, "__zan_live_on");
+    if (uses && flag)
+        LLVMSetInitializer(flag, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0));
+    if (!uses && !flag) return;
     LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
     LLVMTypeRef vfn = LLVMFunctionType(voidt, NULL, 0, 0);
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef en = LLVMGetNamedFunction(g->mod, "zan_rt_live_enable");
-    if (!en) {
-        en = LLVMAddFunction(g->mod, "zan_rt_live_enable", vfn);
-        LLVMSetLinkage(en, LLVMWeakAnyLinkage);
-        LLVMPositionBuilderAtEnd(g->builder,
-            LLVMAppendBasicBlockInContext(g->ctx, en, "entry"));
-        LLVMBuildRetVoid(g->builder);
-    }
     LLVMValueRef ctor = LLVMAddFunction(g->mod, "__zan_live_registry_ctor", vfn);
     LLVMSetLinkage(ctor, LLVMInternalLinkage);
-    LLVMPositionBuilderAtEnd(g->builder,
-        LLVMAppendBasicBlockInContext(g->ctx, ctor, "entry"));
-    LLVMBuildCall2(g->builder, vfn, en, NULL, 0, "");
+    if (uses) {
+        LLVMValueRef en = LLVMGetNamedFunction(g->mod, "zan_rt_live_enable");
+        if (!en) {
+            en = LLVMAddFunction(g->mod, "zan_rt_live_enable", vfn);
+            LLVMSetLinkage(en, LLVMWeakAnyLinkage);
+            LLVMPositionBuilderAtEnd(g->builder,
+                LLVMAppendBasicBlockInContext(g->ctx, en, "entry"));
+            LLVMBuildRetVoid(g->builder);
+        }
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, ctor, "entry"));
+        LLVMBuildCall2(g->builder, vfn, en, NULL, 0, "");
+    } else {
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef i8p = LLVMPointerType(i8, 0);
+        LLVMTypeRef genv_ty = LLVMFunctionType(i8p, &i8p, 1, 0);
+        LLVMValueRef genv = LLVMGetNamedFunction(g->mod, "getenv");
+        if (!genv) genv = LLVMAddFunction(g->mod, "getenv", genv_ty);
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, ctor, "entry"));
+        LLVMValueRef name = LLVMBuildGlobalStringPtr(g->builder,
+            "ZAN_DETECT_LEAKS", "live.env");
+        LLVMValueRef v = LLVMBuildCall2(g->builder, genv_ty, genv, &name, 1, "live.env.v");
+        LLVMValueRef on = LLVMBuildZExt(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntNE, v, LLVMConstNull(i8p), "live.env.on"),
+            i8, "live.env.b");
+        LLVMValueRef st = LLVMBuildStore(g->builder, on, flag);
+        LLVMSetAlignment(st, 1);
+        LLVMSetOrdering(st, LLVMAtomicOrderingMonotonic);
+    }
     LLVMBuildRetVoid(g->builder);
     if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
 

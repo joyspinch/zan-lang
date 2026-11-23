@@ -204,8 +204,12 @@
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
         LLVMBuildCondBr(g->builder, is_zero, free_bb, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, free_bb);
-        zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_weak_nil_all),
-                  g->rt_weak_nil_all, &obj, 1, "");
+        {
+            LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
+            void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                                  LLVMValueRef *, unsigned);
+            zan_emit_call_if(g, zan_emit_weak_any(g), g->rt_weak_nil_all, &obj, 1);
+        }
         LLVMValueRef freefn = get_arc_free_decl(g);
         zan_call2(g->builder, LLVMGlobalGetValueType(freefn), freefn, &obj, 1, "");
         LLVMBuildBr(g->builder, ret_bb);
@@ -439,8 +443,11 @@
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->rt_live_register) {
-            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
-                g->rt_live_register, (LLVMValueRef[]){ user_ptr, total }, 2, "");
+            LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+            void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                                  LLVMValueRef *, unsigned);
+            zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_register,
+                             (LLVMValueRef[]){ user_ptr, total }, 2);
         }
         if (g->check_leaks) {
             emit_leak_counter_add(g, g->g_live, 1);
@@ -481,8 +488,11 @@
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->rt_live_register) {
-            zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_live_register),
-                g->rt_live_register, (LLVMValueRef[]){ user_ptr, total }, 2, "");
+            LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+            void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                                  LLVMValueRef *, unsigned);
+            zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_register,
+                             (LLVMValueRef[]){ user_ptr, total }, 2);
         }
         if (g->check_leaks) {
             emit_leak_counter_add(g, g->g_live, 1);

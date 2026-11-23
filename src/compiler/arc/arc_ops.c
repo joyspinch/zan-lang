@@ -867,8 +867,10 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         emit_leak_counter_add(g, sc_ptr, -1);
     }
     if (g->rt_live_unregister) {
-        zan_call2(b, LLVMGlobalGetValueType(g->rt_live_unregister),
-            g->rt_live_unregister, &obj, 1, "");
+        LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+        void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                              LLVMValueRef *, unsigned);
+        zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_unregister, &obj, 1);
     }
     if (g->arc_guard) {
         LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);

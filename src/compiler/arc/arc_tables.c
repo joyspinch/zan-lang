@@ -30,6 +30,11 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBasicBlockRef begin_bb = LLVMAppendBasicBlockInContext(c, fn, "begin");
     LLVMBuildCondBr(b, is1, begin_bb, ret);
     LLVMPositionBuilderAtEnd(b, begin_bb);
+    /* 弱引用表为空时 destroy_begin 恒返回真：内联判空，不付调用 */
+    LLVMValueRef zan_emit_weak_any(zan_irgen_t *);
+    LLVMBasicBlockRef wcall_bb = LLVMAppendBasicBlockInContext(c, fn, "weak.begin.call");
+    LLVMBuildCondBr(b, zan_emit_weak_any(g), wcall_bb, relf);
+    LLVMPositionBuilderAtEnd(b, wcall_bb);
     LLVMValueRef weak_ok = zan_call2(b,
         LLVMGlobalGetValueType(g->rt_weak_destroy_begin),
         g->rt_weak_destroy_begin, &obj, 1, "weak.begin");

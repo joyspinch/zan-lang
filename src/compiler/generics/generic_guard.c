@@ -575,27 +575,15 @@ LLVMValueRef emit_string_base_guard(zan_irgen_t *g, LLVMValueRef payload,
     return phi;
 }
 
+/* 软失败暂存区只在真的遇到空引用时才用到。曾在函数入口无条件取一次（入口
+ * 缓存），递归/热调用函数每次进入都白付一次运行时调用（对象树基准 ~3% 采样）。
+ * 现在只在冷的空值分支里就地调用。 */
 static LLVMValueRef emit_soft_scratch_cached(zan_irgen_t *g) {
-    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    if (!g->soft_scratch_slot || g->soft_scratch_fn != fn) {
-        g->soft_scratch_slot = emit_entry_alloca(g, i8p, "soft.scratch.slot");
-        zan_builder_point_t pt = zan_builder_save(g);
-        LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
-        LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
-        if (term) LLVMPositionBuilderBefore(g->builder, term);
-        else LLVMPositionBuilderAtEnd(g->builder, entry);
-        LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
-        LLVMValueRef sf = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
-        if (!sf) sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
-        LLVMValueRef scratch = zan_call2(g->builder, fn_ty, sf, NULL, 0,
-                                         "soft.scratch.init");
-        LLVMBuildStore(g->builder, scratch, g->soft_scratch_slot);
-        zan_builder_restore(g, pt);
-        g->soft_scratch_fn = fn;
-    }
-    return LLVMBuildLoad2(g->builder, i8p, g->soft_scratch_slot, "soft.scratch");
+    LLVMTypeRef fn_ty = LLVMFunctionType(i8p, NULL, 0, 0);
+    LLVMValueRef sf = LLVMGetNamedFunction(g->mod, "zan_rt_soft_scratch");
+    if (!sf) sf = LLVMAddFunction(g->mod, "zan_rt_soft_scratch", fn_ty);
+    return zan_call2(g->builder, fn_ty, sf, NULL, 0, "soft.scratch");
 }
 LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                           LLVMValueRef isnull, zan_loc_t loc);
@@ -625,10 +613,24 @@ LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
                                           LLVMValueRef isnull, zan_loc_t loc) {
     if (!g->runtime_checks || !g->current_fn) return base;
     if (LLVMGetTypeKind(LLVMTypeOf(base)) != LLVMPointerTypeKind) return base;
-    LLVMValueRef scratch = emit_soft_scratch_cached(g);
-    scratch = LLVMBuildBitCast(g->builder, scratch, LLVMTypeOf(base),
-                               "soft.scratch.bc");
-    return LLVMBuildSelect(g->builder, isnull, scratch, base, "soft.base");
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    if (!fn) return base;
+    (void)loc;
+    LLVMBasicBlockRef fast_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.null");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft.done");
+    LLVMBuildCondBr(g->builder, isnull, slow_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+    LLVMValueRef scratch = LLVMBuildBitCast(g->builder, emit_soft_scratch_cached(g),
+                                            LLVMTypeOf(base), "soft.scratch.bc");
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, LLVMTypeOf(base), "soft.base");
+    LLVMValueRef vals[2] = { base, scratch };
+    LLVMBasicBlockRef bbs[2] = { fast_bb, slow_end };
+    LLVMAddIncoming(phi, vals, bbs, 2);
+    return phi;
 }
 
 static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
