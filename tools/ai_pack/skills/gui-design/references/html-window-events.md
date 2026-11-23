@@ -27,6 +27,14 @@
      `Checked text`），否则 `PropSpec.Text("key", "Label").Field("Name")`；一条属性一个链式表达式
      `ps.Add(…)`，不再声明临时变量。编辑器种类与值类型用 `PropKind` / `PropValueKind` 枚举比较，
      禁止 `kind == 3` 之类魔法数。
+   - **属性读写一律声明，不重写 SetProp/GetProp/GetExtra/SetExtra**（`ViaExtra` 已删除）：
+     字段型 `Field("X")`（声明类型可以是属性，setter 里写副作用）；读字段写方法
+     `Field("x").Setter("SetX")`（按字段类型收 string/int/bool）；计算属性
+     `Accessor("XText", "SetXText")`（一对文本方法，与 Field 并用时 Field 提供模型绑定身份）；
+     转发到子控件 `ForwardTo(child, "text")`；「任一属性写入即重建」覆写
+     `OnPropertyChanged(PropSpec)`（不按 key 分派）。方法名在 `Props()` 构建时校验。
+     唯一保留按名重写的是通用 HTML `Element`（开放属性袋）。未声明的键经通用协议写入会被当成样式类，
+     所以凡是可写的键都必须声明。
 3. **表格等大型组件的多维丰富事件（Row / Cell / Column / Grid）**：
    - 行级：`RowClick`、`RowDoubleClick`、`RowRightClick`（别名 `RowContext`）、`RowInserted`、`RowDeleted`。
    - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
