@@ -2,28 +2,41 @@ using System;
 using System.Net;
 using System.Net.Http;
 
-/* {{NAME}} -- Worker 统一宿主上的最小 HTTP 服务器。 */
-/* accept、keep-alive、请求头解析、超时保护全部由 Worker 内建；业务只写 onHttpRequest 回调（HttpRequest -> HttpResponse）。 */
-/* 每个连接在独立协程上服务；如需完整框架（路由/{param}、限流、认证、钩子、内存视图），改用 "Web MVC Framework" 模板。 */
+/*
+ * {{NAME}} —— 基于 Worker 统一宿主的 HTTP/JSON 服务骨架。
+ *
+ * Worker 内建 accept、keep-alive、请求解析、超时保护，每个连接一个协程；
+ * 业务只写一个回调：HttpRequest → HttpResponse（见 Handle）。
+ *
+ *   src/main.zan          启动：读配置、起 Worker、请求日志与统一异常出口（本文件）
+ *   src/Routes.zan        路由：方法 + 路径 → 处理函数
+ *   src/Api/Todo.zan      模型：待办事项 + 请求体
+ *   src/Api/TodoStore.zan 存储：内存版（换数据库时只改这一个类）
+ *   src/Api/TodoApi.zan   接口：参数校验、状态码、JSON 编解码
+ *
+ * 接口一览（启动后访问 / 也能看到）：
+ *   GET    /health              健康检查
+ *   GET    /api/todos           列表（?done=true|false 过滤）
+ *   GET    /api/todos/{id}      单条
+ *   POST   /api/todos           新建，body: {"title":"买牛奶"}
+ *   PUT    /api/todos/{id}      更新，body: {"title":"...","done":true}
+ *   DELETE /api/todos/{id}      删除
+ *
+ * 配置走环境变量：HOST（默认 127.0.0.1）、PORT（默认 8083）。
+ * 试一试：
+ *   curl localhost:8083/api/todos
+ *   curl -X POST localhost:8083/api/todos -d '{"title":"写周报"}'
+ *
+ * 需要 MVC 控制器、中间件、认证、限流等完整框架时，改用 "Web MVC Framework" 模板。
+ */
 public class Program {
-    static HttpRouter router;
-
     static async int Run() {
-        router = new HttpRouter();
-        router.Get("/", "<h1>{{NAME}}</h1><p>Hello from Zan!</p>");
-        router.Get("/ping", "pong");
-        /* GEO (Generative Engine Optimization) 大模型搜索引擎站点索引 */
-        router.Get("/.well-known/llms.txt", "# {{NAME}}\n\n> Minimal Zan HTTP Server\n\n- [Ping](/ping): Health check heartbeat\n");
-        router.Get("/llms.txt", "# {{NAME}}\n\n> Minimal Zan HTTP Server\n\n- [Ping](/ping): Health check heartbeat\n");
-
-        string host = ProcessHost.Env("HOST");
-        if (host == "") { host = "127.0.0.1"; }
+        string host = Program.Env("HOST", "127.0.0.1");
         int port = 8083;
-        string portEnv = ProcessHost.Env("PORT");
-        if (portEnv != "") {
-            int p = Convert.ToInt32(portEnv);
-            if (p > 0 && p < 65536) { port = p; }
-        }
+        int p = 0;
+        if (int.TryParse(Program.Env("PORT", ""), out p) && p > 0 && p < 65536) { port = p; }
+
+        Routes.Register();
 
         Worker server = new Worker("http", host, port);
         server.onHttpRequest = Program.Handle;
@@ -33,9 +46,28 @@ public class Program {
         return 0;
     }
 
-    /* 返回 HttpResponse；Worker 负责 keep-alive、序列化与超时。 */
+    /* 每个请求的统一入口：计时 → 分派 → 兜底异常 → 打一行访问日志。 */
     static async HttpResponse Handle(HttpRequest req) {
-        return router.Match(req);
+        long start = Stopwatch.GetMicroseconds();
+        HttpResponse resp = null;
+        try {
+            resp = Routes.Dispatch(req);
+        } catch (Exception e) {
+            /* 处理函数里没接住的异常不外泄细节，只记日志、回 500。 */
+            Console.ErrorWriteLine("[error] " + req.method + " " + req.path + ": " + e.Message);
+            resp = TodoApi.Error(500, "Internal Server Error", "服务器内部错误");
+        }
+        long us = Stopwatch.GetMicroseconds() - start;
+        Console.WriteLine(req.method + " " + req.path + " -> "
+            + Convert.ToString(resp.statusCode) + " (" + Convert.ToString(us) + "us)");
+        return resp;
+    }
+
+    /* 读环境变量，未设置或为空时取默认值。 */
+    static string Env(string name, string fallback) {
+        string v = Environment.GetEnvironmentVariable(name);
+        if (v == null || v == "") { return fallback; }
+        return v;
     }
 
     static void Main() {

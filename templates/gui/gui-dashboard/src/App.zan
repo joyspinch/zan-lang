@@ -1,27 +1,101 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using Gui;
 using Gui.Widget;
+using Gui.Component.Chart;
 
-/* {{NAME}} 业务逻辑：HTML 模板直接声明 @item-click="OnToolClick" 绑定，
- * 后台类专注处理数据与状态（B-ID149 窗口即对象：事件 @click 按名接线）。 */
+/* {{NAME}}：实时仪表板。窗口即对象 —— 字段是界面的数据模型，方法是事件处理器。
+ *
+ *   - {{NAME}}.html 声明布局：工具条按钮 @click 接到本类同名方法；
+ *     指标卡用 <template data-for="cards"> 按 cards 列表逐项克隆，卡片里的
+ *     bind="ValueText" 等直接读 Metric 的字段；状态文字 bind="status"。
+ *   - MetricFeed（MetricFeed.zan）是数据源，现在是模拟数据，接真实系统只改它。
+ *   - 字段改了，下一帧界面自动同步；只有折线图这种需要整份 option 的控件
+ *     才在代码里取控件（Get<ChartHost>）喂数据。 */
 partial class {{NAME}} : Form {
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
-    static Form ui;
+    // ---- 视图模型 ----
+    List<object> cards = new List<object>();
+    string status = "";
+    string pauseText = "暂停自动刷新";
+    string pauseIcon = "pause";
 
-    static void OnLoad(Form form) {
+    MetricFeed feed;
+    bool autoRefresh = true;
+
+    void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
-        ui = form;        Refresh();
+        feed = new MetricFeed();
+        for (int i = 0; i < feed.Metrics.Count; i = i + 1) {
+            cards.Add(feed.Metrics[i]);
+        }
+        Refresh();
+        // 定时采样：Every 由窗口事件循环驱动，回调在界面线程执行，可以直接改字段。
+        // 真实数据源若要走网络 / 数据库，应在后台取数后用 app.Post 回界面线程再 Refresh。
+        form.Every(2000, () => {
+            if (!autoRefresh) { return; }
+            feed.Sample();
+            Refresh();
+        });
     }
 
-    static void OnToolClick() {
-        ToolStrip tools = (ToolStrip)ui.Ctl("MainToolStrip");
-        int index = tools.LastIndex();
-        if (index == 0) { Refresh(); }
+    void OnRefresh() {
+        feed.Sample();
+        Refresh();
     }
 
-    static void Refresh() {
-        StatusBar sb = (StatusBar)ui.Ctl("MainStatusBar");
-        sb.SetText(0, "已刷新");
+    void OnTogglePause() {
+        autoRefresh = !autoRefresh;
+        pauseText = autoRefresh ? "暂停自动刷新" : "继续自动刷新";
+        pauseIcon = autoRefresh ? "pause" : "play";
+        UpdateStatus("");
+    }
+
+    // 导出当前快照为 CSV（程序所在目录）。
+    void OnExport() {
+        string csv = "指标,当前值,单位,完成度%\n";
+        for (int i = 0; i < feed.Metrics.Count; i = i + 1) {
+            Metric m = feed.Metrics[i];
+            csv = csv + m.Name + "," + m.Format(m.Tenths) + "," + m.Unit + "," + Convert.ToString(m.Percent()) + "\n";
+        }
+        string path = Environment.ExeDir() + "/dashboard-snapshot.csv";
+        try {
+            File.WriteAllText(path, csv);
+            UpdateStatus("已导出 " + path);
+        } catch (Exception e) {
+            UpdateStatus("导出失败：" + e.Message);
+        }
+    }
+
+    // 卡片字段在 MetricFeed.Sample 里已更新；这里刷新折线图与状态文字。
+    void Refresh() {
+        UpdateChart();
+        UpdateStatus("");
+    }
+
+    // 折线图：每次给一份新 option；关掉入场动画，避免每拍重播。
+    void UpdateChart() {
+        ChartHost chart = this.Get<ChartHost>("TrendChart");
+        if (chart == null) { return; }
+        List<string> cats = new List<string>();
+        List<int> values = new List<int>();
+        for (int i = 0; i < feed.History.Count; i = i + 1) {
+            cats.Add(Convert.ToString(i - feed.History.Count + 1));
+            values.Add(feed.History[i]);
+        }
+        ChartOption option = ChartOption.Line("", cats);
+        option.animation = false;
+        option.animate = false;
+        option.showLegend = false;
+        option.Add(ChartSeries.Area("吞吐量", values));
+        chart.SetOption(option);
+    }
+
+    void UpdateStatus(string message) {
+        string now = DateTime.Now().ToString().Substring(11);
+        string head = message != "" ? message : "已刷新 " + now;
+        status = head + " · 采样 " + Convert.ToString(feed.Samples) + " 次 · "
+            + (autoRefresh ? "每 2 秒自动刷新" : "自动刷新已暂停");
     }
 }

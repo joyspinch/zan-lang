@@ -1,0 +1,90 @@
+using System;
+using System.Json;
+using System.Net;
+using System.Net.Http;
+
+/* Todo 接口：校验输入 → 调存储 → 选状态码 → 序列化 JSON。
+ * 错误统一成 {"error":"..."}，客户端只需看状态码 + error 字段。 */
+public class TodoApi {
+    const int MaxTitle = 200;
+
+    public static HttpResponse List(HttpRequest req) {
+        string filter = req.GetQueryParam("done");
+        List<Todo> result = new List<Todo>();
+        List<Todo> all = TodoStore.All();
+        for (int i = 0; i < all.Count; i++) {
+            Todo t = all[i];
+            if (filter == "true" && !t.done) { continue; }
+            if (filter == "false" && t.done) { continue; }
+            result.Add(t);
+        }
+        return HttpResponse.Json(Json.Serialize<List<Todo>>(result));
+    }
+
+    public static HttpResponse Get(string idText) {
+        Todo t = TodoApi.Lookup(idText);
+        if (t == null) { return TodoApi.Error(404, "Not Found", "待办不存在：" + idText); }
+        return HttpResponse.Json(Json.Serialize<Todo>(t));
+    }
+
+    public static HttpResponse Create(HttpRequest req) {
+        TodoInput input = TodoApi.ParseInput(req);
+        string problem = TodoApi.CheckTitle(input);
+        if (problem != "") { return TodoApi.Error(400, "Bad Request", problem); }
+        Todo t = TodoStore.Add(input.title.Trim());
+        HttpResponse resp = HttpResponse.Created("/api/todos/" + Convert.ToString(t.id), Json.Serialize<Todo>(t));
+        resp.SetContentType("application/json");
+        return resp;
+    }
+
+    public static HttpResponse Update(string idText, HttpRequest req) {
+        Todo t = TodoApi.Lookup(idText);
+        if (t == null) { return TodoApi.Error(404, "Not Found", "待办不存在：" + idText); }
+        TodoInput input = TodoApi.ParseInput(req);
+        string problem = TodoApi.CheckTitle(input);
+        if (problem != "") { return TodoApi.Error(400, "Bad Request", problem); }
+        t.title = input.title.Trim();
+        t.done = input.done;
+        return HttpResponse.Json(Json.Serialize<Todo>(t));
+    }
+
+    public static HttpResponse Delete(string idText) {
+        Todo t = TodoApi.Lookup(idText);
+        if (t == null || !TodoStore.Remove(t.id)) {
+            return TodoApi.Error(404, "Not Found", "待办不存在：" + idText);
+        }
+        return HttpResponse.NoContent();
+    }
+
+    /* JSON 错误响应：{"error":"..."}。 */
+    public static HttpResponse Error(int status, string statusText, string message) {
+        JsonValue o = JsonValue.NewObject();
+        o.PutStr("error", message);
+        HttpResponse resp = HttpResponse.WithStatus(status, statusText, JsonSerializer.Serialize(o));
+        resp.SetContentType("application/json");
+        return resp;
+    }
+
+    static Todo Lookup(string idText) {
+        int id = 0;
+        if (!int.TryParse(idText, out id)) { return null; }
+        return TodoStore.Find(id);
+    }
+
+    /* 请求体解析失败（空体 / 非法 JSON）时返回 null，由 CheckTitle 报 400。 */
+    static TodoInput ParseInput(HttpRequest req) {
+        if (req.body == null || req.body.Trim() == "") { return null; }
+        try {
+            return Json.Deserialize<TodoInput>(req.body);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static string CheckTitle(TodoInput input) {
+        if (input == null) { return "请求体必须是 JSON，例如 {\"title\":\"买牛奶\"}"; }
+        if (input.title == null || input.title.Trim() == "") { return "title 不能为空"; }
+        if (input.title.Length > MaxTitle) { return "title 不能超过 " + Convert.ToString(MaxTitle) + " 个字符"; }
+        return "";
+    }
+}

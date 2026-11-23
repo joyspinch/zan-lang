@@ -1,19 +1,31 @@
 using System;
 using System.Net;
 
-/* {{NAME}} -- Worker 统一宿主上的最小 TCP 服务器。 */
-/* accept、一连接一协程、断线检测全部由 Worker 内建；业务只写 onConnect/onMessage/onClose 回调。 */
-/* 如需完整框架（路由、限流、认证、内存视图），改用 "Web MVC Framework" 模板。 */
+/*
+ * {{NAME}} —— 基于 Worker 统一宿主的 TCP 行协议服务器（迷你聊天室）。
+ *
+ * Worker 内建 accept、一连接一协程、断线检测；业务只写三个回调：
+ *   onConnect  新连接：登记会话、发欢迎语
+ *   onMessage  收到字节：按行切分，逐行交给 ChatRoom 执行命令；返回值回给本连接
+ *   onClose    断开：注销会话、通知其他人
+ *
+ *   src/main.zan      启动与回调接线（本文件）
+ *   src/Session.zan   每连接状态：昵称 + 未成行的半截缓冲
+ *   src/ChatRoom.zan  协议与广播：命令解析、在线表
+ *
+ * 协议：一行一条命令（\n 结尾，\r 自动去掉），回复同样一行一条。
+ *   HELP | PING | TIME | ECHO <文本> | NICK <昵称> | SAY <文本> | WHO | QUIT
+ *
+ * 配置走环境变量：HOST（默认 127.0.0.1）、PORT（默认 9000）。
+ * 试一试（开两个终端模拟两个用户）：
+ *   nc 127.0.0.1 9000
+ */
 public class Program {
     static async int Run() {
-        string host = ProcessHost.Env("HOST");
-        if (host == "") { host = "127.0.0.1"; }
+        string host = Program.Env("HOST", "127.0.0.1");
         int port = 9000;
-        string portEnv = ProcessHost.Env("PORT");
-        if (portEnv != "") {
-            int p = Convert.ToInt32(portEnv);
-            if (p > 0 && p < 65536) { port = p; }
-        }
+        int p = 0;
+        if (int.TryParse(Program.Env("PORT", ""), out p) && p > 0 && p < 65536) { port = p; }
 
         Worker server = new Worker("tcp", host, port);
         server.onConnect = Program.OnConnect;
@@ -26,17 +38,43 @@ public class Program {
     }
 
     static async void OnConnect(Connection conn) {
-        Console.WriteLine("[open] client#" + Convert.ToString(conn.GetId()));
-        conn.Send("welcome, client#" + Convert.ToString(conn.GetId()) + "\n");
+        Session s = ChatRoom.Join(conn);
+        Console.WriteLine("[open] " + s.nick);
+        conn.Send("欢迎来到 {{NAME}}，你是 " + s.nick + "。输入 HELP 查看命令。\n");
     }
 
-    /* 返回值即回显给对端的内容；返回 "" 不回复。 */
+    /* TCP 是字节流：一次收到的可能是半行，也可能是好几行。
+     * Session 攒住半截，凑够整行才执行；所有回复拼在一起一次发回。 */
     static async string OnMessage(Connection conn, string data) {
-        return data;
+        Session s = ChatRoom.Find(conn);
+        if (s == null) { return ""; }
+        string reply = "";
+        List<string> lines = s.Feed(data);
+        if (s.overflowed) {
+            s.overflowed = false;
+            reply = "ERR 行太长（上限 4096 字符），已丢弃\n";
+        }
+        for (int i = 0; i < lines.Count; i++) {
+            reply = reply + ChatRoom.Execute(s, lines[i]);
+            if (s.quitting) { break; }
+        }
+        if (s.quitting) {
+            conn.Send(reply);
+            conn.Close();
+            return "";
+        }
+        return reply;
     }
 
     static async void OnClose(Connection conn) {
-        Console.WriteLine("[close] client#" + Convert.ToString(conn.GetId()));
+        Session s = ChatRoom.Leave(conn);
+        if (s != null) { Console.WriteLine("[close] " + s.nick); }
+    }
+
+    static string Env(string name, string fallback) {
+        string v = Environment.GetEnvironmentVariable(name);
+        if (v == null || v == "") { return fallback; }
+        return v;
     }
 
     static void Main() {
