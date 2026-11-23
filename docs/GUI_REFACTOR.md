@@ -36,6 +36,8 @@ Control/PropSpec 基类，并行必冲突）。
 | 2c-1 ✅ | 属性协议声明化基础：`PropSpec.Accessor(getter, setter)`、`.Setter(name)`（按字段类型收参）、`.ForwardTo(target, prop)`，`Control.OnPropertyChanged(spec)` 写后钩子；40 个类删除 SetProp/GetProp/GetExtra/SetExtra 重写；修反射 Invoke 丢弃返回值泄漏 | ~600 行重写 |
 | 2c-2 ✅ | 余下 21 个类迁移；删除 `ViaExtra`/`ExtraAccess` 与基类 `GetExtra`/`SetExtra`；仅通用 `Element` 保留开放属性袋重写 | 合计删除 ~140 处字符串重写 |
 | 3 | 拆包：`Zan.Gui`（控件树/布局/样式/渲染/标记/后端）、`Zan.Gui.Widgets`（控件目录）、设计器逻辑归 `Zan.Gui.Designer`、UiDriver 归 `Zan.Gui.Automation` | 包依赖与模板/IDE 引用 |
+| 4a ✅ | `Control.RequestRedraw()` 收拢 23 处「找宿主再判空重绘」样板；主题设置抽屉从 App 拆为 `ThemeMenuService`（`App.ThemeMenu`），App 去掉 6 个方法与 1 个字段。Automation 已是可插拔会话，无需拆 | — |
+| 4b | 余下（被并行会话未提交的 App.Render/Lifecycle 等阻塞）：Diagnostics 拆为 PerfMonitor 服务 + PaintHash 静态工具；Glass/Animation/Skinning 同法 | — |
 | 4 | App 服务化：Automation/Glass/ThemeDrawer/Offscreen/Diagnostics 抽成服务；控件经 `this.RequestRedraw()` 而非 `FindApp().RequestRedraw()` | App 146 个方法 |
 | 5 | Control 组件化：滚动、命中测试、布局检查等能力拆为可挂载组件 | Control 176 个方法 |
 
