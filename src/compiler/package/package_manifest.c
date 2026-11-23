@@ -357,6 +357,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
             else if (strcmp(key, "license") == 0) strncpy(pkg->license, val, sizeof(pkg->license) - 1);
             else if (strcmp(key, "entry") == 0) strncpy(pkg->entry_point, val, sizeof(pkg->entry_point) - 1);
             else if (strcmp(key, "plugin_id") == 0) strncpy(pkg->plugin_id, val, sizeof(pkg->plugin_id) - 1);
+            else if (strcmp(key, "catalog") == 0) strncpy(pkg->catalog, val, sizeof(pkg->catalog) - 1);
             else if (strcmp(key, "subsystem") == 0) {
                 strncpy(pkg->subsystem, val, sizeof(pkg->subsystem) - 1);
                 while (*lp) {

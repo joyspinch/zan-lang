@@ -26,6 +26,7 @@ typedef struct pi_file {
     char **usings; int using_count, using_cap;
     int has_ext;
     int has_controller;         /* 控制器/路由/表等生成器实体 */
+    int catalog;                /* 位于包声明的控件目录命名空间（zan.pkg catalog） */
     int pkg_src;
     int gate_live;
     int included;

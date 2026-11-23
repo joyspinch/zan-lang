@@ -265,12 +265,16 @@
             zan_arena_free(pi_arena);
             pi_arena = NULL;
             memset(pi_table, 0, sizeof(pi_table));
+            pi_live_ns_count = 0;
             pi_dirs_head = pi_dirs_tail = NULL;
         }
         /* 约定路由的动作派发器：必须早于最后一次 nsresolve（新声明的类型
            引用要进解析/裁剪视野），又必须晚于所有输入解析完（控制器齐了）。 */
         zan_compile_trace("synth action dispatch");
         zan_synth_action_dispatch(ast, arena, diag);
+        /* 控件目录：同一窗口期合成 __ZanControlCatalog（控件类型已全部拉入）。 */
+        zan_compile_trace("synth control catalog");
+        zan_synth_control_catalog(ast, arena, diag);
         /* 框架化窗口入口：同一窗口期合成 __ZanDocMain（零参 Bootstrap
            调用点驱动，见 zan_synth_docapp_main 注释）。 */
         zan_compile_trace("synth docapp main");

@@ -73,7 +73,7 @@ def check_double_underscore(rel_path: str, line_num: int, raw_line: str, strippe
         if m.startswith("___"):
             continue
         # Exclude compiler-synthesized route registration intrinsic and runtime decimal ABI
-        if m == "__AttrRoutes" or (norm_path.startswith("stdlib/System/Decimal.zan") and m.startswith("__zan_decimal_")):
+        if m in ("__AttrRoutes", "__ZanControlCatalog") or (norm_path.startswith("stdlib/System/Decimal.zan") and m.startswith("__zan_decimal_")):
             continue
         return (
             f"手写代码严禁定义或使用 '__' 前缀标识符 ('{m}')。\n"
