@@ -76,7 +76,6 @@ static CRITICAL_SECTION g_co_lock;
 static volatile LONG    g_co_running;
 static volatile LONG    g_co_parked;
 static volatile LONG    g_co_searching;
-static volatile LONG    g_co_wake;
 static volatile LONG    g_co_stop;
 static int              g_co_inited;
 static int              g_co_workers;
@@ -134,19 +133,45 @@ static int co_worker_shard(int worker) {
 
 static zan_co_worker_t *co_self(void);
 
+/* 停泊登记：worker 先 g_co_parked++ 再置 w->parked=1，然后**复查**可运行
+ * 任务才真正阻塞；唤醒方先发布任务，再 CAS 认领一个 parked=1 的 worker
+ *（1→0，同时 g_co_parked--）并写它分片的 wake fd。两边都用 seq_cst，
+ * 于是"发布任务 / 读 parked"与"置 parked / 读任务"必有一方看见对方：
+ * 要么唤醒方认领到 worker，要么 worker 复查时看见任务而不停泊。
+ *
+ * 曾用 g_co_wake 计数"已发出未消费的唤醒"并在 wake >= parked 时不再唤醒：
+ * 认领与消费不成对（worker 走 park-skip 不经 co_wait_io、超时醒来也扣减），
+ * 计数一漂高，后续提交全被当成"已有唤醒在途"吞掉，任务只能等停泊超时
+ *（下一个定时器截止）才被取走。认领式唤醒没有可漂的计数。 */
+static void co_park_begin(zan_co_worker_t *w) {
+    __atomic_add_fetch(&g_co_parked, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w->parked, 1, __ATOMIC_SEQ_CST);
+}
+
+/* 停泊结束：若唤醒方已认领（parked 已被清 0）则它已扣过 g_co_parked。 */
+static void co_park_end(zan_co_worker_t *w) {
+    if (__atomic_exchange_n(&w->parked, 0, __ATOMIC_SEQ_CST))
+        __atomic_sub_fetch(&g_co_parked, 1, __ATOMIC_SEQ_CST);
+}
+
 static void co_notify(void) {
-    if (co_load(&g_co_searching) > 0) return;
-    if (co_load(&g_co_parked) <= 0) return;
-    if (InterlockedIncrement(&g_co_wake) > co_load(&g_co_parked)) {
-        InterlockedDecrement(&g_co_wake);
-        return;
-    }
+    if (__atomic_load_n(&g_co_searching, __ATOMIC_SEQ_CST) > 0) return;
+    if (__atomic_load_n(&g_co_parked, __ATOMIC_SEQ_CST) <= 0) return;
     zan_co_worker_t *self = co_self();
-    if (self) self->st.wake_post++;
-    for (int i = 0; i < g_co_workers; i++) {
-        if (co_load(&g_wk[i].parked)) { co_wake_shard(co_worker_shard(i)); return; }
+    int n = g_co_workers;
+    int start = self ? self->index + 1 : 0;
+    for (int k = 0; k < n; k++) {
+        int i = (start + k) % n;
+        LONG one = 1;
+        if (!__atomic_load_n(&g_wk[i].parked, __ATOMIC_RELAXED)) continue;
+        if (__atomic_compare_exchange_n(&g_wk[i].parked, &one, 0, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+            __atomic_sub_fetch(&g_co_parked, 1, __ATOMIC_SEQ_CST);
+            if (self) self->st.wake_post++;
+            co_wake_shard(co_worker_shard(i));
+            return;
+        }
     }
-    co_wake_shard(0);
 }
 
 static zan_co_worker_t *co_self(void) {

@@ -246,7 +246,10 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
     return woke;
 }
 
-static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
+/* park=1：worker 空闲停泊。即使本分片没有登记 I/O 也要阻塞在 poll fd 上——
+ * co_notify 的唤醒走分片 wake pipe（已登记在 poll fd 里），裸 nanosleep
+ * 收不到它，跨线程提交的任务会被搁到下一个定时器截止才被取走。 */
+static int32_t io_poll_shard_ex(int shard, int64_t timeout_ms, int park) {
     zan_io_shard_t *sh = &g_ioshard[shard];
     shard_lock(sh);
     if (sh->dead) {
@@ -263,11 +266,12 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
     }
     int empty = (g_io_count == 0 && g_blocking_inflight == 0);
     shard_unlock(sh);
-    if (empty) return 0;
+    if (empty && !park) return 0;
     struct epoll_event events[256];
     for (;;) {
         int64_t wait = dns_wait_ms(timeout_ms);
-        int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
+        /* 空闲停泊无需按扫描周期醒来：没有登记的 I/O 可扫。 */
+        int capped = (wait < 0 || (wait > ZAN_IO_SWEEP_MS && !(park && empty)));
         if (capped) wait = ZAN_IO_SWEEP_MS;
         STRACE("shard%d epoll wait=%lld to=%lld", shard, (long long)wait, (long long)timeout_ms);
         int n = epoll_wait(sh->poll_fd, events, 256, (int)wait);
@@ -339,6 +343,10 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         shard_unlock(sh);
         if (done) return val;
     }
+}
+
+static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
+    return io_poll_shard_ex(shard, timeout_ms, 0);
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {

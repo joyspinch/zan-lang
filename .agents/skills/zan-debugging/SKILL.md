@@ -85,6 +85,19 @@ acquire 无锁读，写方锁内原子更新。另：对比基准务必用干净
 O(活跃协程数) × 每次创建/销毁，并发越高越慢；自旋时间算在调用方自身采样里（如
 `zan_task_child`），sample 里看不到 mutexwait，要看调用方 self time 异常高。
 
+### 同步上下文 `await` 每次 ~1ms、有定时器在途时卡到定时器截止：worker 停泊收不到唤醒（rt_io_co_sched 实测，2026-11-23）
+
+M:N 调度器 worker 空闲停泊必须阻塞在**可被 `co_notify` 叫醒**的原语上：POSIX 是本分片
+kqueue/epoll（wake fd 登记其中），Windows 是 IOCP。曾在无登记 I/O 时退化成裸
+`nanosleep(下一个定时器截止)`——主线程注入的任务要等定时器到期才被取走（Delay(60000)
+在途时同步 await 像挂死 60s）；空闲判停的观察窗口用 `Sleep(1)` 同理。非 worker 线程
+`zan_co_sched_run_until` 等 DONE 用 `Sleep(1)` 轮询，每个 await 固定 ~1ms，现改条件变量
+（`co_run` 每步后有登记等待者才广播）。最小探针：主线程循环 100 次 await 两层 async，
+起 0/4/32 个 `Task.Delay` 后台协程，应都在 ~1ms 量级且与定时器无关。另：任何"唤醒在途"
+计数（曾有 `g_co_wake`）都会漂——改认领式（CAS `w->parked` 1→0 再写它的 wake fd）。
+池重启计数 `g_co_pool_out` 不可在建线程后整体改写（先起的 worker 可能已 retire 扣过），
+否则池子标着 live 却无线程：lldb 看 `g_co_pool_live=1 g_co_pool_out>0 g_inj_len>0` 且无 worker 线程即此症。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =

@@ -16,6 +16,84 @@ int zan_co_poll(void) {
 
 static void co_stats_dump(void);
 
+/* ---- 非 worker 线程的根驱动等待（zan_co_sched_run_until） ----
+ *
+ * 主线程 / 同步代码 await 一个 async 调用时，子协程交给 worker 跑，调用线程
+ * 只能等 DONE。曾用 Sleep(0)×512 + Sleep(1) 轮询：子协程几微秒就跑完，
+ * 等待者却要睡满 1ms 才看见——同步上下文里每个 await 固定 ~1ms。
+ *
+ * 现在：等待者短暂自旋后登记 g_co_ext_waiters 并阻塞在条件变量上；co_run
+ * 每跑完一步，若有登记的等待者就广播一次（DONE 只在协程步内发布，而协程步
+ * 都经 co_run 执行）。等待者被唤醒后自己复查 DONE。没有等待者时 co_run 只
+ * 多一次原子读。
+ *
+ * 次序：完成方"发布 DONE → 读 g_co_ext_waiters"之间隔着 g_co_running 的
+ * 全屏障 RMW，等待方"g_co_ext_waiters++（seq_cst）→ 持锁读 DONE"，两边必有
+ * 一方看见对方；限时等待只作兜底，不承担正确性。 */
+static volatile LONG g_co_ext_waiters;
+#if defined(_WIN32)
+static SRWLOCK            g_co_ext_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_co_ext_cv   = CONDITION_VARIABLE_INIT;
+#define co_cpu_relax() YieldProcessor()
+#else
+static pthread_mutex_t g_co_ext_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_co_ext_cv = PTHREAD_COND_INITIALIZER;
+#if defined(__aarch64__) || defined(__arm__)
+#define co_cpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
+#define co_cpu_relax() __builtin_ia32_pause()
+#else
+#define co_cpu_relax() __asm__ __volatile__("" ::: "memory")
+#endif
+#endif
+
+static void co_ext_wake(void) {
+    if (__atomic_load_n(&g_co_ext_waiters, __ATOMIC_SEQ_CST) <= 0) return;
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&g_co_ext_lock);
+    WakeAllConditionVariable(&g_co_ext_cv);
+    ReleaseSRWLockExclusive(&g_co_ext_lock);
+#else
+    pthread_mutex_lock(&g_co_ext_mx);
+    pthread_cond_broadcast(&g_co_ext_cv);
+    pthread_mutex_unlock(&g_co_ext_mx);
+#endif
+}
+
+#define ZAN_CO_EXT_SPIN      2048
+#define ZAN_CO_EXT_BACKSTOP_MS 20
+
+static void co_ext_wait(const volatile int *done) {
+    for (int i = 0; i < ZAN_CO_EXT_SPIN; i++) {
+        if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
+        co_cpu_relax();
+    }
+    __atomic_add_fetch(&g_co_ext_waiters, 1, __ATOMIC_SEQ_CST);
+#if defined(_WIN32)
+    AcquireSRWLockExclusive(&g_co_ext_lock);
+    while (__atomic_load_n(done, __ATOMIC_SEQ_CST) == 0)
+        SleepConditionVariableSRW(&g_co_ext_cv, &g_co_ext_lock,
+                                  ZAN_CO_EXT_BACKSTOP_MS, 0);
+    ReleaseSRWLockExclusive(&g_co_ext_lock);
+#else
+    pthread_mutex_lock(&g_co_ext_mx);
+    while (__atomic_load_n(done, __ATOMIC_SEQ_CST) == 0) {
+#if defined(__APPLE__)
+        struct timespec rel = { 0, ZAN_CO_EXT_BACKSTOP_MS * 1000000L };
+        pthread_cond_timedwait_relative_np(&g_co_ext_cv, &g_co_ext_mx, &rel);
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += ZAN_CO_EXT_BACKSTOP_MS * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&g_co_ext_cv, &g_co_ext_mx, &ts);
+#endif
+    }
+    pthread_mutex_unlock(&g_co_ext_mx);
+#endif
+    __atomic_sub_fetch(&g_co_ext_waiters, 1, __ATOMIC_SEQ_CST);
+}
+
 void zan_co_sched_init(void) {
     if (!g_co_inited) {
         InitializeCriticalSection(&g_co_lock);
@@ -36,7 +114,6 @@ void zan_co_sched_init(void) {
     g_co_running = 0;
     g_co_parked = 0;
     g_co_searching = 0;
-    g_co_wake = 0;
     InterlockedExchange(&g_co_stop, 0);
     InterlockedExchange(&g_co_pool_live, 0);
     g_co_pool_gen = 0;
@@ -215,6 +292,7 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
             break;
     }
     InterlockedDecrement(&g_co_running);
+    co_ext_wake();
     co_cnt_add(w, +1, -1);
 }
 
@@ -256,8 +334,7 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     }
     BOOL ok = GetQueuedCompletionStatusEx(io_shard(co_worker_shard(w->index)),
                                           entries, 64, &removed, to, FALSE);
-    InterlockedExchange(&w->parked, 0);
-    InterlockedDecrement(&g_co_parked);
+    co_park_end(w);
     if (!ok) {
         /* Timeout or error */
         dns_timeout_scan();
@@ -270,11 +347,7 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
     size_t completed_count = 0;
     for (ULONG i = 0; i < removed; i++) {
         if (entries[i].lpOverlapped == NULL) {
-            if (entries[i].lpCompletionKey == ZAN_WAKE_KEY) {
-                if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
-            } else {
-                dns_drain();
-            }
+            if (entries[i].lpCompletionKey != ZAN_WAKE_KEY) dns_drain();
             continue;
         }
         zan_io_op_t *op = CONTAINING_RECORD(entries[i].lpOverlapped,
@@ -305,11 +378,19 @@ static void co_wait_io(zan_co_worker_t *w, long long timeout_ms) {
 #else
     (void)w;
     STRACE("w%d waitio enter to=%lld haspend=%d", w->index, (long long)to, zan_io_has_pending());
-    int polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
+    /* 停泊在本分片的 poll fd 上（wake fd 已登记其中），没有登记的 I/O 时也
+     * 一样——co_notify 写 wake fd 才能把它叫醒。分片未开（poll fd 无效）时
+     * 退回定时睡眠，免得 kevent/epoll_wait 立即失败空转。 */
+    int shard = io_thread_shard();
+    int polled;
+    if (g_ioshard[shard].poll_fd >= 0) {
+        g_io_fast_budget = ZAN_IO_FAST_BURST;
+        polled = io_poll_shard_ex(shard, to == INFINITE ? -1 : (int64_t)to, 1);
+    } else {
+        polled = zan_io_pump_timeout(to == INFINITE ? -1 : (int64_t)to);
+    }
     BOOL ok = (polled >= 0);
-    if (co_load(&g_co_wake) > 0) InterlockedDecrement(&g_co_wake);
-    InterlockedExchange(&w->parked, 0);
-    InterlockedDecrement(&g_co_parked);
+    co_park_end(w);
     STRACE("w%d waitio ret=%d ok=%d", w->index, polled, (int)ok);
     if (!ok) {
         dns_timeout_scan();
@@ -428,6 +509,7 @@ static void co_worker(int worker) {
     w->bg_gen = g_co_pool_gen;
     if (g_co_tls != TLS_OUT_OF_INDEXES) TlsSetValue(g_co_tls, w);
     LONG idle_seen = -1;
+    long long idle_since_us = 0;
     for (;;) {
         if (co_load(&g_co_stop)) { co_pool_retire(w); return; }
         /* 队列繁忙时持续推进到期定时器 */
@@ -449,15 +531,23 @@ static void co_worker(int worker) {
         co_search_end(w, 0);
         if (co_all_idle()) {
             LONG seq = co_cnt_activity();
-            if (idle_seen == seq) {
+            long long now_us = zan_co_precise_us();
+            /* 判停要求整整 1ms 无活动：下面的停泊可被唤醒（含残留的 wake
+             * 字节），提前醒来不能算作"观察满一个窗口"。 */
+            if (idle_seen == seq && now_us - idle_since_us >= 1000) {
                 InterlockedExchange(&g_co_stop, 1);
                 for (int i = 0; i < g_co_workers; i++)
                     co_wake_shard(co_worker_shard(i));
                 co_pool_retire(w);
                 return;
             }
-            idle_seen = seq;
-            Sleep(1);
+            if (idle_seen != seq) { idle_seen = seq; idle_since_us = now_us; }
+            /* 观察窗口也要可唤醒：裸 Sleep(1) 期间 worker 不算停泊，外部线程
+             * 此刻提交的任务没人叫醒，只能等这 1ms 睡完（同步上下文里连续
+             * await 时每次都撞上）。 */
+            co_park_begin(w);
+            if (co_has_runnable()) co_park_end(w);
+            else co_wait_io(w, 1);
             continue;
         }
         idle_seen = -1;
@@ -475,14 +565,12 @@ static void co_worker(int worker) {
             if (rw >= 0 && rw < to) to = rw;
         }
 #endif
-        InterlockedIncrement(&g_co_parked);
-        InterlockedExchange(&w->parked, 1);
+        co_park_begin(w);
         w->st.park++;
         long long tnow = zan_timer_next_timeout();
         if (tnow >= 0 && tnow < to) to = tnow;
         if (tnow == 0 || co_has_runnable()) {
-            InterlockedExchange(&w->parked, 0);
-            InterlockedDecrement(&g_co_parked);
+            co_park_end(w);
             STRACE("w%d park-skip tnow=%lld runnable=%d", w->index, tnow, co_has_runnable());
             continue;
         }
@@ -574,9 +662,14 @@ static void co_pool_start_background(void) {
         }
 #endif
     }
-    g_co_pool_out = made;
-    if (made == 0) {
+    /* 只扣掉没建成的名额，不能整体改写成 made：先建成的 worker 可能已经
+     * 判空闲并 retire 扣过一次，改写会把计数抬高，最后一个 retire 永远等
+     * 不到 0——池子标着 live 却一个线程都没有，之后注入的任务无人认领。 */
+    if (made < w &&
+        InterlockedExchangeAdd(&g_co_pool_out, -(LONG)(w - made)) == (LONG)(w - made)) {
+        EnterCriticalSection(&g_inj_lock);
         InterlockedExchange(&g_co_pool_live, 0);
+        LeaveCriticalSection(&g_inj_lock);
     }
 }
 
@@ -683,8 +776,8 @@ void zan_co_sched_run_until(const volatile int *done) {
          * 起来（同 co_run_ready_tasks 的思路，A470 的 zan_co_sync_sleep
          * 就是这么等的）。子协程跑完，done 置位，等待结束。
          *
-         * 非 worker 线程（主线程）进来时没有自己的队列，自旋是对的：
-         * 子协程会被别的 worker 跑掉。 */
+         * 非 worker 线程（主线程）进来时没有自己的队列：子协程会被别的
+         * worker 跑掉，这里阻塞等它发布 DONE（见 co_ext_wait）。 */
         zan_co_worker_t *w = co_self();
         if (w) {
             int spins = 0;
@@ -704,11 +797,7 @@ void zan_co_sched_run_until(const volatile int *done) {
                 else Sleep(1);
             }
         }
-        int spins = 0;
-        while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {
-            if (spins < 512) { Sleep(0); spins++; }
-            else Sleep(1);
-        }
+        co_ext_wait(done);
         return;
     }
     (void)done;
