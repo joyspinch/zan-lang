@@ -18,8 +18,7 @@
             (LLVMTypeRef[]){ arc_i8p }, 1, 0);
         LLVMValueRef arc_getenv = LLVMGetNamedFunction(g->mod, "getenv");
         if (!arc_getenv) arc_getenv = LLVMAddFunction(g->mod, "getenv", arc_getenv_ty);
-        arc_ra_ty = LLVMFunctionType(arc_i8p, (LLVMTypeRef[]){ arc_i32t }, 1, 0);
-        LLVMValueRef arc_returnaddr = LLVMAddFunction(g->mod, "llvm.returnaddress", arc_ra_ty);
+        (void)zan_irgen_returnaddress_fn(g, &arc_ra_ty);
         LLVMTypeRef arc_ev_args[] = { arc_i8p, arc_i8p, arc_i64, arc_i64, arc_i8p };
         arc_ev_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), arc_ev_args, 5, 0);
         arc_trace_ev = LLVMAddFunction(g->mod, "__zan_arc_trace_ev", arc_ev_ty);

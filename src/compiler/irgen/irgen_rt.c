@@ -716,17 +716,28 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     emit_arc_fault_report(g, obj, LLVMConstInt(i64t, 0, 0), freed_by, code, what);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
+/* llvm.returnaddress 是按返回指针类型重载的 intrinsic：新版 LLVM（≥23）的
+ * verifier 要求名字带类型后缀（llvm.returnaddress.p0），裸名 LLVMAddFunction
+ * 声明会被拒。统一经 LLVM 自己的 intrinsic 表取声明，名字由 LLVM 按当前
+ * 版本修饰（老版本 p0i8/裸名、新版本 p0），同一模块重复调用返回同一声明。 */
+LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
+    static const char nm[] = "llvm.returnaddress";
+    unsigned id = LLVMLookupIntrinsicID(nm, sizeof(nm) - 1);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    size_t np = LLVMIntrinsicIsOverloaded(id) ? 1 : 0;
+    LLVMValueRef fn = LLVMGetIntrinsicDeclaration(g->mod, id, &i8p, np);
+    if (out_ty) *out_ty = LLVMGlobalGetValueType(fn);
+    return fn;
+}
 void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
                                LLVMValueRef rc_iptr) {
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-    LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), rc_iptr);
     LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
-    LLVMTypeRef ra_ty = LLVMFunctionType(i8p, &i32t, 1, 0);
-    LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
-    if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
+    LLVMTypeRef ra_ty = NULL;
+    LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
     LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
     LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &zero, 1, "retaddr");
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8t, obj,
@@ -749,16 +760,14 @@ static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 const char *tag, LLVMValueRef obj,
                                 LLVMValueRef rc, LLVMValueRef site) {
     if (!ev_fn) return;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMTypeRef ra_ty = LLVMFunctionType(i8p, (LLVMTypeRef[]){ i32t }, 1, 0);
+    LLVMTypeRef ra_ty = NULL;
     /* 声明而不是只查：只查的话，查不到就整段 return——ARC trace 事件被
      * 静默丢弃，而编译一个字都不说。当前靠「调用点都在 check_leaks 分支
      * 里、那里已声明过该 intrinsic」才不出事，但那是跨函数的隐式耦合：
      * 将来把调用点挪到别处，trace 就会无声地少一串记录。 */
-    LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
-    if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
+    LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
     LLVMValueRef ra_arg = LLVMConstInt(i32t, 0, 0);
     LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &ra_arg, 1, "tra");
     LLVMValueRef tagc = zan_irgen_intern_string(g, tag);
