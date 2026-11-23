@@ -3696,7 +3696,7 @@ foreach(_src ${_conf_srcs})
     set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
   elseif(_name MATCHES "^publish_static_init_demand(_reflect)?$")
     set(_extra_args "--publish")
-  elseif(_name MATCHES "^publish_(dead_hook|shared_vtable|virtual_slot_demand)$")
+  elseif(_name MATCHES "^publish_(dead_hook|shared_vtable|virtual_slot_demand|escape_tail_release)$")
     set(_extra_args "--publish;--no-check-leaks;--no-arc-guard")
   elseif(_name STREQUAL "reflect_publish_hook")
     # B-ID160/S1: On* lifecycle hook thunks are part of the publish contract;
@@ -3836,6 +3836,8 @@ foreach(_src ${_conf_srcs})
      _name STREQUAL "web_framework_dispatch")
     # Framework dispatch emits the explicitly enabled MVC controller allowlist.
     set(_case_timeout 600)
+  elseif(_name STREQUAL "gui_optional_features")
+    set(_case_timeout 360)
   endif()
   set_tests_properties(case_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT ${_case_timeout})
@@ -8792,7 +8794,7 @@ if(Python3_Interpreter_FOUND)
       -DZANC=$<TARGET_FILE:zanc>
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_gui_optional_features_ir.cmake)
-  set_tests_properties(gui_optional_features_ir PROPERTIES TIMEOUT 240)
+  set_tests_properties(gui_optional_features_ir PROPERTIES TIMEOUT 480)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

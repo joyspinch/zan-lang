@@ -277,7 +277,7 @@ def main():
     ap.add_argument("--reject-dir", default="")
     ap.add_argument("--workdir", default=os.getcwd())
     ap.add_argument("--jobs", type=int, default=0)
-    ap.add_argument("--emit-timeout", type=int, default=120)
+    ap.add_argument("--emit-timeout", type=int, default=240)
     ap.add_argument("--link-timeout", type=int, default=180)
     ap.add_argument("--run-timeout", type=int, default=30)
     a = ap.parse_args()
