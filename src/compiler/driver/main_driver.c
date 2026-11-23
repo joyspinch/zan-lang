@@ -1068,9 +1068,32 @@ static void zan_request_live_registry(zan_irgen_t *g) {
     }
 }
 
+/* 分配字节计数（A464，GC.GetAllocatedBytes* / GetTotalMemory）只在程序读它
+ * 时才有意义，却在每次对象/字符串分配上调一次 zan_rt_alloc_add：线程局部加法
+ * （macOS 上 TLS 每次经 _tlv_get_addr 函数调用）+ 一次全局原子加（多线程下
+ * 同一缓存行在所有分配线程间来回）。Mac 上子串循环 17% 的时间耗在这里。
+ * 程序（本模块）没调读取端时，删掉全部计数调用——它们是无返回值的纯副作用。
+ * 库（DLL/dylib）保留：宿主可能读进程级总数。 */
+static void zan_strip_alloc_counter(zan_irgen_t *g) {
+    if (g->emit_lib) return;
+    if (zan_module_calls(g->mod, "zan_rt_alloc_bytes_thread") ||
+        zan_module_calls(g->mod, "zan_rt_alloc_bytes_total"))
+        return;
+    LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_alloc_add");
+    if (!f) return;
+    LLVMUseRef u = LLVMGetFirstUse(f);
+    while (u) {
+        LLVMValueRef user = LLVMGetUser(u);
+        u = LLVMGetNextUse(u);
+        if (LLVMIsACallInst(user) && LLVMGetCalledValue(user) == f)
+            LLVMInstructionEraseFromParent(user);
+    }
+}
+
 static void zan_prepare_static_runtime(zan_irgen_t *g,
                                         const zan_target_t *target) {
     zan_request_live_registry(g);
+    zan_strip_alloc_counter(g);
     if (g->emit_lib && g->emit_shared) return;
     bool use_comdat = target->os != ZAN_OS_MACOS && target->os != ZAN_OS_IOS;
 
