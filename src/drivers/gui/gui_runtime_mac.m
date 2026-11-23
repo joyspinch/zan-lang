@@ -1319,6 +1319,13 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
+/* Canvas.DrawTextBold ABI: same regular-weight fallback as the shared
+ * renderer (gui_runtime_font.c), which the Cocoa build does not compile. */
+EXPORT void zan_gui_draw_text_bold(
+    i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size) {
+    zan_gui_draw_text(surface_id, x, y, utf8, color, font_size);
+}
+
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size,
     i32 angle_deg) {

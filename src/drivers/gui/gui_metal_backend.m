@@ -5,6 +5,7 @@
 
 #if defined(__APPLE__)
 
+#include <stddef.h>
 #include "gui_metal_backend.h"
 #include "gui_backend.h"
 
@@ -160,6 +161,7 @@ const zan_gui_backend zan_metal_backend = {
 
 #else
 
+#include <stddef.h>
 #include "gui_metal_backend.h"
 
 int zan_gui_internal_metal_supported(void) { return 0; }
