@@ -865,7 +865,34 @@ zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRe
     return zan_bind_target_layout(g, out_tm);
 }
 
+/* Apple --fast-alloc: point every allocation call this module makes at the
+ * small-object allocator. Runs on the main and every shard module right
+ * before object emission, i.e. after the LLVM pipeline has had its look at
+ * the libc names (heap-to-stack, malloc/free pair elision). Only bodiless
+ * declarations are renamed; rt_mem.c's zone makes any pointer that still
+ * crosses to libc (C runtime, drivers, cached objects) safe either way. */
+static void zan_irgen_route_fast_alloc(zan_irgen_t *g, LLVMModuleRef mod) {
+    if (!g->route_fast_alloc) return;
+    static const char *const names[][2] = {
+        { "malloc", "zan_mem_malloc" }, { "free", "zan_mem_free" },
+        { "calloc", "zan_mem_calloc" }, { "realloc", "zan_mem_realloc" },
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(mod, names[i][0]);
+        if (!fn || !LLVMIsDeclaration(fn)) continue;
+        LLVMValueRef have = LLVMGetNamedFunction(mod, names[i][1]);
+        if (have) {
+            /* Both spellings declared (a DllImport of zan_mem_*): fold. */
+            LLVMReplaceAllUsesWith(fn, have);
+            LLVMDeleteFunction(fn);
+            continue;
+        }
+        LLVMSetValueName2(fn, names[i][1], strlen(names[i][1]));
+    }
+}
+
 void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
+    zan_irgen_route_fast_alloc(g, mod);
     /* Main and shard objects need the same GC granularity. COFF '$' suffixes
      * merge into ordinary output sections. Preserve special runtime sections,
      * TLS and weak/ODR groups when making strong definitions discardable. */

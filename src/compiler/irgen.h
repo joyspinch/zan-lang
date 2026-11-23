@@ -474,6 +474,10 @@ struct zan_irgen {
     LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
     LLVMValueRef soft_scratch_fn;
     bool         publish_mode;
+    /* Apple --fast-alloc: ld64 has no --wrap, so object emission renames the
+     * module's malloc/free/calloc/realloc declarations to rt_mem.c's
+     * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
+    bool         route_fast_alloc;
     bool         publish_instance_prune; /* closed-world instance callable roots */
     bool         publish_vslot_demand;
     zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */

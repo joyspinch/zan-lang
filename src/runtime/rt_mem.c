@@ -72,6 +72,32 @@ static void *zan_mem_crt_realloc(void *p, size_t n) {
 #define __real_free zan_mem_crt_free
 #define __real_calloc zan_mem_crt_calloc
 #define __real_realloc zan_mem_crt_realloc
+#elif defined(__APPLE__)
+/* ld64 has no --wrap. The allocator instead exports zan_mem_malloc/free/
+ * calloc/realloc and the compiler points every allocation call it emits at
+ * them (zan_irgen_route_fast_alloc), so system libraries and C runtime
+ * objects keep libc malloc. Ownership still crosses that line both ways:
+ *   - zan_mem_free/realloc of a libc block: zan_mem_owns() is false, so it
+ *     is forwarded to libc exactly like the ELF __wrap_free fallback;
+ *   - libc free/realloc/malloc_size of a Zan block (a C driver or runtime
+ *     object releasing a buffer Zan code handed it): the block is claimed
+ *     by a registered malloc zone (zan_mem_zone_register below), whose
+ *     size() answers for our slabs, so libmalloc dispatches it back here. */
+#include <malloc/malloc.h>
+#include <pthread.h>
+#define __real_malloc malloc
+#define __real_free free
+#define __real_calloc calloc
+#define __real_realloc realloc
+#define __wrap_malloc zan_mem_malloc
+#define __wrap_free zan_mem_free
+#define __wrap_calloc zan_mem_calloc
+#define __wrap_realloc zan_mem_realloc
+void *zan_mem_malloc(size_t n);
+void zan_mem_free(void *p);
+void *zan_mem_calloc(size_t n, size_t m);
+void *zan_mem_realloc(void *p, size_t n);
+static void zan_mem_zone_register(void);
 #else
 /* ELF's real allocator symbols are supplied by the linker wrap. */
 void *__real_malloc(size_t n);
@@ -422,6 +448,11 @@ static int zan_mem_new_slab(zan_mem_cache *c) {
     (void)c;
     return 0;
 #else
+#if defined(__APPLE__)
+    /* Before the first Zan block exists, and with no allocator lock held
+     * (libmalloc's fork handlers take its lock, then our force_lock). */
+    zan_mem_zone_register();
+#endif
     size_t span = (size_t)ZAN_MEM_SLAB * 2;
     char *raw = (char *)mmap(NULL, span, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -656,6 +687,108 @@ void *__wrap_realloc(void *p, size_t n) {
 }
 
 
+#if defined(__APPLE__)
+/* Size of a live Zan block, 0 for anything else. libmalloc asks every
+ * registered zone this about pointers it does not recognise (free, realloc,
+ * malloc_size, malloc_zone_from_ptr), so it must be cheap and never fault:
+ * only slab-resident addresses past the slab's first header are inspected. */
+static size_t zan_mem_block_size(const void *p) {
+    if (!p || !zan_mem_owns(p)) return 0;
+    if (((uintptr_t)p & (uintptr_t)(ZAN_MEM_SLAB - 1)) < ZAN_MEM_HDR) return 0;
+    const zan_mem_hdr_t *h = (const zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
+    if (__atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) != ZAN_MEM_MAGIC) return 0;
+    uint32_t cls = __atomic_load_n(&h->cls, __ATOMIC_ACQUIRE);
+    return cls < (uint32_t)ZAN_MEM_NCLASS ? k_class_size[cls] : 0;
+}
+
+static size_t zz_size(malloc_zone_t *z, const void *p) {
+    (void)z; return zan_mem_block_size(p);
+}
+static void *zz_malloc(malloc_zone_t *z, size_t n) { (void)z; return zan_mem_malloc(n); }
+static void *zz_calloc(malloc_zone_t *z, size_t n, size_t m) {
+    (void)z; return zan_mem_calloc(n, m);
+}
+static void *zz_valloc(malloc_zone_t *z, size_t n) { (void)z; return valloc(n); }
+static void zz_free(malloc_zone_t *z, void *p) { (void)z; zan_mem_free(p); }
+static void zz_free_definite(malloc_zone_t *z, void *p, size_t n) {
+    (void)z; (void)n; zan_mem_free(p);
+}
+static void *zz_realloc(malloc_zone_t *z, void *p, size_t n) {
+    (void)z; return zan_mem_realloc(p, n);
+}
+static void *zz_memalign(malloc_zone_t *z, size_t align, size_t n) {
+    (void)z;
+    void *p = NULL;
+    return posix_memalign(&p, align, n) == 0 ? p : NULL;
+}
+static void zz_destroy(malloc_zone_t *z) { (void)z; }
+static kern_return_t zz_enumerator(task_t task, void *ctx, unsigned type,
+                                   vm_address_t zone, memory_reader_t reader,
+                                   vm_range_recorder_t recorder) {
+    (void)task; (void)ctx; (void)type; (void)zone; (void)reader; (void)recorder;
+    return KERN_SUCCESS;
+}
+static size_t zz_good_size(malloc_zone_t *z, size_t n) {
+    (void)z;
+    if (n == 0) n = 1;
+    if (n > ZAN_MEM_MAX_SMALL) return n;
+    zan_mem_ensure_classes();
+    return k_class_size[g_size_class[n]];
+}
+static boolean_t zz_check(malloc_zone_t *z) { (void)z; return 1; }
+static void zz_print(malloc_zone_t *z, boolean_t verbose) { (void)z; (void)verbose; }
+static void zz_log(malloc_zone_t *z, void *addr) { (void)z; (void)addr; }
+/* libmalloc brackets fork() with these for every registered zone, so a fork
+ * never snapshots g_slab_lock held by a thread that will not exist in the
+ * child. */
+static void zz_force_lock(malloc_zone_t *z) { (void)z; zan_mem_lock(); }
+static void zz_force_unlock(malloc_zone_t *z) { (void)z; zan_mem_unlock(); }
+static void zz_reinit_lock(malloc_zone_t *z) { (void)z; __sync_lock_release(&g_slab_lock); }
+static void zz_statistics(malloc_zone_t *z, malloc_statistics_t *st) {
+    (void)z;
+    memset(st, 0, sizeof *st);
+    size_t slabs = __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
+    st->size_allocated = slabs * (size_t)ZAN_MEM_SLAB;
+}
+static boolean_t zz_locked(malloc_zone_t *z) {
+    (void)z; return __atomic_load_n(&g_slab_lock, __ATOMIC_RELAXED) != 0;
+}
+
+static malloc_introspection_t g_zan_zone_introspect = {
+    .enumerator = zz_enumerator,
+    .good_size = zz_good_size,
+    .check = zz_check,
+    .print = zz_print,
+    .log = zz_log,
+    .force_lock = zz_force_lock,
+    .force_unlock = zz_force_unlock,
+    .statistics = zz_statistics,
+    .zone_locked = zz_locked,
+    .reinit_lock = zz_reinit_lock,
+};
+
+static malloc_zone_t g_zan_zone = {
+    .size = zz_size,
+    .malloc = zz_malloc,
+    .calloc = zz_calloc,
+    .valloc = zz_valloc,
+    .free = zz_free,
+    .realloc = zz_realloc,
+    .destroy = zz_destroy,
+    .zone_name = "zan_mem",
+    .introspect = &g_zan_zone_introspect,
+    .version = 9,
+    .memalign = zz_memalign,
+    .free_definite_size = zz_free_definite,
+};
+
+static pthread_once_t g_zan_zone_once = PTHREAD_ONCE_INIT;
+static void zan_mem_zone_register_once(void) { malloc_zone_register(&g_zan_zone); }
+static void zan_mem_zone_register(void) {
+    pthread_once(&g_zan_zone_once, zan_mem_zone_register_once);
+}
+#endif
+
 /* B-ID78 延迟释放队列已移至 timer/rt_timer_defer.c（随 rt_timer.o 全 hosted
  * 链接；曾只在本对象里，Apple 拿到同步弱兜底，深树释放照样爆栈）。 */
 
@@ -665,9 +798,15 @@ void *__wrap_realloc(void *p, size_t n) {
 
 /* Keep native bridge aliases local to this implementation when included by
  * allocator unit tests that supply their own linker-ABI shims afterwards. */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
 #undef __real_malloc
 #undef __real_free
 #undef __real_calloc
 #undef __real_realloc
+#endif
+#if defined(__APPLE__)
+#undef __wrap_malloc
+#undef __wrap_free
+#undef __wrap_calloc
+#undef __wrap_realloc
 #endif

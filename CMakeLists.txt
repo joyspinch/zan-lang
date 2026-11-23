@@ -3135,6 +3135,19 @@ if(NOT WIN32 AND NOT APPLE)
   set_tests_properties(runtime_mem_musl_calloc PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
 
+# Apple has no --wrap: Zan code calls zan_mem_* by name and a registered
+# malloc zone hands libc free/realloc of Zan blocks back to rt_mem.c.
+if(APPLE)
+  add_executable(zan_rt_mem_apple_zone_test
+    tests/runtime/rt_mem_apple_zone_test.c
+    src/runtime/rt_mem.c src/runtime/rt_timer.c src/runtime/rt_crash.c)
+  target_include_directories(zan_rt_mem_apple_zone_test PRIVATE ${CMAKE_SOURCE_DIR})
+  set_target_properties(zan_rt_mem_apple_zone_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED YES)
+  add_test(NAME runtime_mem_apple_zone COMMAND zan_rt_mem_apple_zone_test)
+  set_tests_properties(runtime_mem_apple_zone PROPERTIES TIMEOUT 30)
+endif()
+
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
