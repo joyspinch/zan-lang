@@ -1,0 +1,41 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+// Socket.SetNonBlocking 必须真的生效：非阻塞监听套接字上没有待接连接时
+// accept 立即返回 -1。macOS arm64 上它曾经调用变参 fcntl 当三参普通函数，
+// 返回 0 却没设上 O_NONBLOCK——监听套接字仍阻塞，WebApp 的 accept 卡死一个
+// 调度 worker，keep-alive 连接约 1/4 的后续请求永不应答。accept 放在独立线程，
+// 2 秒内没返回即判失败（不让用例本身挂死）。
+class Program {
+    static nint listener;
+    static AtomicInt done;
+    static AtomicInt result;
+
+    static void TryAccept() {
+        nint c = Socket.Accept(Program.listener);
+        long _r = Program.result.Exchange((long)c);
+        long _d = Program.done.Add(1);
+    }
+
+    static void Main() {
+        Socket.Initialize();
+        Program.done = new AtomicInt(0);
+        Program.result = new AtomicInt(-2);
+        nint s = Socket.CreateTcp();
+        Socket.SetReuseAddr(s);
+        bool bound = Socket.Bind(s, "127.0.0.1", 19777) == 0 && Socket.Listen(s, 16) == 0;
+        Console.WriteLine(bound ? "ok listening" : "FAIL bind/listen");
+        Console.WriteLine(Socket.SetNonBlocking(s) == 0 ? "ok set nonblocking" : "FAIL set nonblocking");
+        Program.listener = s;
+        bool started = Thread.Start(Program.TryAccept);
+        int waited = 0;
+        while (Program.done.Load() == 0 && waited < 2000) { Thread.Sleep(10); waited = waited + 10; }
+        if (Program.done.Load() == 0) {
+            Console.WriteLine("FAIL accept blocked on a non-blocking listener");
+            return;
+        }
+        Console.WriteLine(Program.result.Load() < 0 ? "ok accept returned immediately" : "FAIL unexpected connection");
+        Socket.Close(s);
+    }
+}

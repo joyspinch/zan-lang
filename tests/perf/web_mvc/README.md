@@ -70,10 +70,15 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
   连接协程跑在多个调度线程上，曾共用一个 List 记延迟、用普通 int 计数；并发扩容时分配器
   报 double free。已改为每连接独立结果槽、结束时合并（`connect_fail`/`send_fail`/`recv_fail`
   分项）。
-- **未解（服务端，严重）：新建连接的首个请求偶发永不应答。** 8 条连接同时建立时常有 1–3 条
-  首个请求 0 字节、直到客户端 10 s 时限断开（`recv_fail`，均发生在测量开始处）。在
-  659d83c44 与当前 HEAD 上同样复现，疑为新 socket 的读就绪唤醒丢失（运行时 IO 层）。它使
-  小连接数场景的吞吐/延迟严重失真（list 8 连接一轮可跌到 ~200 rps）；修复前不重录基线。
+- **已修（2026-11-23）：keep-alive 连接约 1/4 的后续请求永不应答（macOS arm64）。**
+  根因：`PosixNetwork.SetNonBlocking` 把变参 `fcntl(int, int, ...)` 当三参普通 extern
+  调用；Apple arm64 变参走栈，第三参落在寄存器里被忽略——返回 0 却没设上 `O_NONBLOCK`，
+  所有经它的套接字一直阻塞。WebApp 的监听套接字因此在一个调度 worker 上阻塞 `accept()`，
+  该 worker 负责轮询的 IO 分片（`fd % 分片数`，默认 4 片即 1/4 的连接）就绪事件无人收割：
+  首个请求的字节通常已在缓冲区、非阻塞读直接拿到，之后的请求要等 kqueue 事件——永远
+  等不到。之前"新建连接首请求不应答"的描述不准确，实为 keep-alive 后续请求。改调运行时
+  的非变参 C 包装 `zan_io_set_nonblocking`。回归用例 `conformance/socket_nonblocking_accept`。
+  修后整轮 errors=0、stuck=0，基线重录。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
   指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
   路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。

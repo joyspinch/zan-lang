@@ -98,6 +98,15 @@ kqueue/epoll（wake fd 登记其中），Windows 是 IOCP。曾在无登记 I/O 
 池重启计数 `g_co_pool_out` 不可在建线程后整体改写（先起的 worker 可能已 retire 扣过），
 否则池子标着 live 却无线程：lldb 看 `g_co_pool_live=1 g_co_pool_out>0 g_inj_len>0` 且无 worker 线程即此症。
 
+### `[DllImport]` 绑定变参 C 函数（fcntl/ioctl/open/printf…）：Apple arm64 上静默错参（套接字阻塞实测，2026-11-23）
+
+Apple arm64 ABI 的变参一律走栈；按普通 N 参 extern 声明调用时实参放在寄存器里，被调方
+从栈上读到垃圾。`fcntl(fd, F_SETFL, flags|O_NONBLOCK)` 照样返回 0，`O_NONBLOCK` 却没设上——
+x86-64/Linux 上同样写法恰好能跑，所以只在 macOS/iOS arm64 现形。症状绕得很远：监听套接字
+阻塞 accept 卡死一个调度 worker → 它负责的 IO 分片事件无人收割 → keep-alive 连接 1/4 的后续
+请求永不应答。判据：调用后用无变参的 `F_GETFL` 读回校验。修法：变参函数只经运行时 C 包装
+调用（如 `zan_io_set_nonblocking`），Zan 侧绝不直接 DllImport 变参 libc 函数。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =

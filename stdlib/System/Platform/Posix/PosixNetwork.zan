@@ -58,8 +58,15 @@ public class PosixNetwork : IPlatformNetwork {
     [DllImport("crt")]
     private static extern int setsockopt(int fd, int level, int optname, string optval, int optlen);
 
-    [DllImport("crt")]
-    private static extern int fcntl(int fd, int cmd, int arg);
+    // fcntl 是变参函数（int fcntl(int, int, ...)）：Apple arm64 ABI 变参走栈，
+    // 按普通三参 extern 调用时第三参放在寄存器里，fcntl 从栈上读到垃圾——
+    // F_SETFL 返回 0 却没设上 O_NONBLOCK。所有经 Socket.SetNonBlocking 的套接字
+    // 在 macOS arm64 上一直是阻塞的：监听套接字的 accept 把一个调度 worker
+    // 卡死在阻塞 accept() 里，它负责轮询的 IO 分片（fd % 分片数，默认 1/4）的
+    // 就绪事件无人收割，keep-alive 连接的后续请求永不应答。改调运行时的非变参
+    // C 包装（zan_io_ 前缀会让链接器带上 IO 运行时）。
+    [DllImport("crt", EntryPoint = "zan_io_set_nonblocking")]
+    private static extern int zan_io_set_nonblocking(nint fd);
 
     [DllImport("crt")]
     private static extern int sendto(int fd, string buf, int len, int flags, string to, int tolen);
@@ -122,15 +129,7 @@ public class PosixNetwork : IPlatformNetwork {
     }
 
     public int SetNonBlocking(nint s) {
-        int fd = (int)s;
-        int flags = PosixNetwork.fcntl(fd, 3, 0); // F_GETFL = 3
-        #if MACOS || IOS
-        // macOS O_NONBLOCK = 4
-        return PosixNetwork.fcntl(fd, 4, flags | 4); // F_SETFL = 4
-        #else
-        // Linux O_NONBLOCK = 2048 (0x800)
-        return PosixNetwork.fcntl(fd, 4, flags | 2048);
-        #endif
+        return PosixNetwork.zan_io_set_nonblocking(s);
     }
 
     public void CancelPendingIo(nint s) {}
