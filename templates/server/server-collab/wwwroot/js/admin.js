@@ -1,18 +1,77 @@
-/* Admin 外壳行为：标签、弹窗、写操作与实时指标流。规则全部在标记中，屏幕即模板。 */
+/* Admin 外壳内核：标签工作区、碎片面板加载、Layer 弹层、通用写操作与生命周期总线。
+   业务部件（表单/表格挂件、实时监控图表、AI 助手）通过 window.ZanAdmin 扩展总线接入。 */
 (function () {
-  var panel, tabs, toasts;
+  var panelHost, panel, tabs, toasts;
+  var panes = {};
+  var activePane = null;
   var state = { tabs: [], active: '' };
   var KEY = 'zanweb.admin.tabs.v2';
-  var stream = null;
-  var streamGen = 0;
   var loadSeq = 0;
   var loadController = null;
   var ctxMenu = null;
   var paneMemo = {};
 
+  // ---- lifecycle & command bus (window.ZanAdmin) --------------------------
+  var initHooks = [];
+  var mountHooks = [];
+  var unmountHooks = [];
+  var activateHooks = [];
+  var deactivateHooks = [];
+  var dirtyGuards = [];
+  var moduleRegistry = [];
+  var tabKeyRules = [{ prefix: '/admin/monitor/data', param: 't' }];
+  var commandProviders = [];
+  var initialized = false;
+
+  var pre = window.ZanAdmin && window.ZanAdmin._q ? window.ZanAdmin._q : null;
+
+  function emitInit(ctx) {
+    initialized = true;
+    for (var i = 0; i < initHooks.length; i++) {
+      try { initHooks[i](ctx); } catch (e) { /* isolate plugin errors */ }
+    }
+  }
+
+  function emitMount(root, ctx) {
+    if (!root) { return; }
+    for (var i = 0; i < mountHooks.length; i++) {
+      try { mountHooks[i](root, ctx); } catch (e) { /* isolate plugin errors */ }
+    }
+  }
+
+  function emitUnmount(root) {
+    if (!root) { return; }
+    for (var i = 0; i < unmountHooks.length; i++) {
+      try { unmountHooks[i](root); } catch (e) { /* isolate plugin errors */ }
+    }
+  }
+
+  function emitActivate(root, ctx) {
+    if (!root) { return; }
+    for (var i = 0; i < activateHooks.length; i++) {
+      try { activateHooks[i](root, ctx || {}); } catch (e) { /* isolate plugin errors */ }
+    }
+  }
+
+  function emitDeactivate(root, ctx) {
+    if (!root) { return; }
+    for (var i = 0; i < deactivateHooks.length; i++) {
+      try { deactivateHooks[i](root, ctx || {}); } catch (e) { /* isolate plugin errors */ }
+    }
+  }
+
   function el(id) { return document.getElementById(id); }
 
+  function panelEl() { return activePane ? activePane.el : (panel || document.getElementById('ad-panel')); }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
   function toast(msg, kind) {
+    if (!toasts) { return; } /* SPA host without the shell: nowhere to show */
     var t = document.createElement('div');
     t.className = 'toast ' + (kind || 'ok');
     t.textContent = msg;
@@ -39,7 +98,6 @@
       (keepHash ? (u.hash || '') : '');
   }
 
-  // A hash selects a pane inside the resource; it is not a second tab.
   function normalize(path) { return pathOf(path, false); }
 
   function rememberPane(path) {
@@ -58,7 +116,26 @@
     state.tabs = state.tabs.map(function (t) {
       return { path: normalize(t.path), title: t.title || t.path };
     });
+    state.tabs = state.tabs.filter(function (t) {
+      return base(t.path).indexOf('/admin') === 0 &&
+        normalize(t.path) !== '/admin/monitor/data';
+    });
+    var byScreen = {};
+    var merged = [];
+    for (var i = 0; i < state.tabs.length; i++) {
+      var key = tabKey(state.tabs[i].path);
+      if (!byScreen[key]) { merged.push(byScreen[key] = state.tabs[i]); }
+      else { byScreen[key].path = state.tabs[i].path; }
+    }
+    state.tabs = merged;
     state.active = state.active ? normalize(state.active) : '';
+    if (state.active && find(state.active) < 0) {
+      var activeKey = tabKey(state.active);
+      for (var j = 0; j < state.tabs.length; j++) {
+        if (tabKey(state.tabs[j].path) === activeKey) { state.active = state.tabs[j].path; break; }
+      }
+    }
+    if (find(state.active) < 0) { state.active = ''; }
   }
 
   function find(path) {
@@ -70,27 +147,37 @@
   }
 
   function paint() {
+    if (!tabs) { return; }
     tabs.innerHTML = '';
     state.tabs.forEach(function (t) {
+      var key = tabKey(t.path);
       var b = document.createElement('span');
       b.className = 'ad-tab' + (t.path === state.active ? ' active' : '');
+      b.setAttribute('data-tab-key', key);
+      if (hasPaneDirty(panes[key])) { b.classList.add('dirty'); }
       b.title = t.path;
-      var label = document.createElement('span');
+      var label = document.createElement('button');
+      label.type = 'button';
+      label.className = 'ad-tab-label';
+      if (t.path === state.active) { label.setAttribute('aria-current', 'page'); }
       label.textContent = t.title || t.path;
       b.appendChild(label);
       if (state.tabs.length > 1) {
-        var x = document.createElement('span');
+        var x = document.createElement('button');
+        x.type = 'button';
         x.className = 'x';
         x.textContent = '×';
+        x.setAttribute('aria-label', '关闭 ' + (t.title || t.path));
         x.onclick = function (ev) { ev.stopPropagation(); close(t.path); };
         b.appendChild(x);
       }
-      b.onclick = function () { open(t.path, t.title); };
+      label.onclick = function () { open(t.path, t.title); };
       b.oncontextmenu = function (ev) { ev.preventDefault(); tabMenu(ev, t); };
       tabs.appendChild(b);
     });
     document.querySelectorAll('.ad-side a.mi').forEach(function (a) {
-      a.classList.toggle('active', a.getAttribute('href') === base(state.active));
+      var href = a.getAttribute('href');
+      a.classList.toggle('active', tabKey(href) === tabKey(state.active));
     });
     if (window._ensureActiveMenuGroupOpen) { window._ensureActiveMenuGroupOpen(); }
     save();
@@ -98,9 +185,17 @@
     paintTabNav();
   }
 
-  // The strip scrolls under two arrows rather than a scrollbar, so a long
-  // session does not squash the tabs or leave the active one off-screen.
+  function paintTabDirty() {
+    if (!tabs) { return; }
+    var nodes = tabs.querySelectorAll('.ad-tab[data-tab-key]');
+    for (var i = 0; i < nodes.length; i++) {
+      var key = nodes[i].getAttribute('data-tab-key');
+      nodes[i].classList.toggle('dirty', hasPaneDirty(panes[key]));
+    }
+  }
+
   function paintTabNav() {
+    if (!tabs) { return; }
     var bar = tabs.parentNode;
     if (!bar) { return; }
     var arrows = bar.querySelectorAll('[data-tabnav]');
@@ -109,6 +204,7 @@
   }
 
   function showActiveTab() {
+    if (!tabs) { return; }
     var a = tabs.querySelector('.ad-tab.active');
     if (!a) { return; }
     var left = a.offsetLeft;
@@ -124,15 +220,43 @@
     return u.pathname;
   }
 
-  // Right-click on a tab: the usual workspace menu. Closing is deliberate --
-  // a left click never closes anything but the tab's own ×.
+  function tabKey(path) {
+    var u = new URL(path || '/admin', location.origin);
+    for (var i = tabKeyRules.length - 1; i >= 0; i--) {
+      var r = tabKeyRules[i];
+      if (r.fn) {
+        try {
+          var custom = r.fn(u);
+          if (custom) { return String(custom); }
+        } catch (e) { /* isolate plugin errors */ }
+        continue;
+      }
+      if (u.pathname === r.prefix || u.pathname.indexOf(r.prefix + '/') === 0) {
+        return r.param
+          ? (u.pathname + '?' + r.param + '=' + encodeURIComponent(u.searchParams.get(r.param) || ''))
+          : u.pathname;
+      }
+    }
+    return u.pathname;
+  }
+
+  function registerTabKey(prefixOrFn, paramName) {
+    if (typeof prefixOrFn === 'function') {
+      tabKeyRules.push({ fn: prefixOrFn });
+      return;
+    }
+    if (typeof prefixOrFn === 'string' && prefixOrFn) {
+      tabKeyRules.push({ prefix: prefixOrFn, param: paramName || '' });
+    }
+  }
+
   function tabMenu(ev, t) {
     hideTabMenu();
     var i = find(t.path);
     var m = document.createElement('div');
     m.className = 'ad-ctx';
     var items = [
-      ['刷新', function () { open(t.path, t.title); }, false],
+      ['刷新', function () { open(t.path, t.title, { forceLoad: true }); }, false],
       ['关闭', function () { close(t.path); }, state.tabs.length < 2],
       ['关闭其他', function () { closeOthers(t.path); }, state.tabs.length < 2],
       ['关闭右侧', function () { closeRight(t.path); }, i >= state.tabs.length - 1],
@@ -159,64 +283,297 @@
     if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; }
   }
 
-  function closeOthers(path) {
-    state.tabs = state.tabs.filter(function (o) { return o.path === path; });
-    var keep = state.tabs[0];
-    open(keep.path, keep.title);
+  function hasAnyDirtyTab(list) {
+    for (var i = 0; i < list.length; i++) {
+      if (hasPaneDirty(panes[tabKey(list[i].path)])) { return true; }
+    }
+    return false;
   }
 
-  function closeRight(path) {
+  function destroyTabPanes(list) {
+    for (var i = 0; i < list.length; i++) {
+      destroyPane(tabKey(list[i].path));
+    }
+  }
+
+  function closeOthers(path, skipDirty) {
+    var removed = state.tabs.filter(function (o) { return o.path !== path; });
+    if (!skipDirty && hasAnyDirtyTab(removed)) {
+      Layer.confirm('其他标签页中有未保存的修改，确定全部关闭并放弃吗？', function () {
+        closeOthers(path, true);
+      }, '未保存修改', { danger: true, okText: '确认关闭' });
+      return;
+    }
+    destroyTabPanes(removed);
+    state.tabs = state.tabs.filter(function (o) { return o.path === path; });
+    var keep = state.tabs[0];
+    if (keep) { open(keep.path, keep.title, { skipDirty: true }); }
+  }
+
+  function closeRight(path, skipDirty) {
     var i = find(path);
     if (i < 0) { return; }
+    var removed = state.tabs.slice(i + 1);
+    if (!skipDirty && hasAnyDirtyTab(removed)) {
+      Layer.confirm('右侧标签页中有未保存的修改，确定关闭并放弃吗？', function () {
+        closeRight(path, true);
+      }, '未保存修改', { danger: true, okText: '确认关闭' });
+      return;
+    }
+    destroyTabPanes(removed);
     state.tabs = state.tabs.slice(0, i + 1);
-    if (find(state.active) < 0) { open(path, state.tabs[i].title); return; }
+    if (find(state.active) < 0) { open(path, state.tabs[i].title, { skipDirty: true }); return; }
     paint();
   }
 
-  // The last tab stays: an empty workspace has nothing to show.
-  function closeAllTabs() {
-    var home = { path: '/admin', title: '仪表盘' };
+  function closeAllTabs(skipDirty) {
+    var removed = state.tabs.filter(function (o) { return tabKey(o.path) !== '/admin'; });
+    if (!skipDirty && hasAnyDirtyTab(removed)) {
+      Layer.confirm('标签页中有未保存的修改，确定全部关闭并放弃吗？', function () {
+        closeAllTabs(true);
+      }, '未保存修改', { danger: true, okText: '确认关闭' });
+      return;
+    }
+    destroyTabPanes(removed);
+    var existingHome = null;
+    for (var i = 0; i < state.tabs.length; i++) {
+      if (tabKey(state.tabs[i].path) === '/admin') { existingHome = state.tabs[i]; break; }
+    }
+    var home = existingHome || { path: '/admin', title: '仪表盘' };
     state.tabs = [home];
-    open(home.path, home.title);
+    open(home.path, home.title, { skipDirty: true });
   }
 
-  function close(path) {
+  function close(path, skipDirty) {
     var i = find(path);
     if (i < 0) { return; }
+    var key = tabKey(path);
+    if (!skipDirty && hasPaneDirty(panes[key])) {
+      Layer.confirm('标签“' + (state.tabs[i].title || path) + '”有未保存的修改，确定关闭并放弃吗？', function () {
+        close(path, true);
+      }, '未保存修改', { danger: true, okText: '确认关闭' });
+      return;
+    }
     state.tabs.splice(i, 1);
+    destroyPane(key);
     if (state.active === path) {
       var next = state.tabs[Math.min(i, state.tabs.length - 1)];
-      if (next) { open(next.path, next.title); return; }
+      if (next) { open(next.path, next.title, { skipDirty: true }); return; }
       state.active = '';
     }
     paint();
   }
 
-  function open(path, title, replace) {
-    rememberPane(path);
-    path = normalize(path);
-    var same = state.active === path;
-    var i = find(path);
-    if (i < 0) {
-      /* Same screen, different query (pager / filter / detail link) reuses
-         its tab in place: the tab strip stays one-per-screen and the URL
-         still tracks what the panel shows. */
-      var root = base(path);
+  function hasDirtyForm(root) {
+    return !!(root && root.querySelector('form[data-submit][data-dirty="1"], [data-dirty="1"]'));
+  }
+
+  function hasPaneDirty(pane) {
+    if (!pane || !pane.el || !pane.loaded) { return false; }
+    if (hasDirtyForm(pane.el)) { return true; }
+    for (var i = 0; i < dirtyGuards.length; i++) {
+      try {
+        if (dirtyGuards[i](pane.el, pane.path)) { return true; }
+      } catch (e) { /* isolate plugin errors */ }
+    }
+    return false;
+  }
+
+  function clearDirtyForms(root) {
+    if (!root) { return; }
+    var dirty = root.querySelectorAll('[data-dirty]');
+    for (var i = 0; i < dirty.length; i++) { dirty[i].removeAttribute('data-dirty'); }
+    paintTabDirty();
+  }
+
+  function ensurePane(key, path) {
+    var pane = panes[key];
+    if (pane) { return pane; }
+    var node = document.createElement('div');
+    node.className = 'ad-pane';
+    node.setAttribute('data-pane-key', key);
+    node.hidden = true;
+    if (panelHost) { panelHost.appendChild(node); }
+    pane = {
+      key: key,
+      path: path,
+      el: node,
+      loaded: false,
+      loading: false,
+      seq: 0,
+      controller: null,
+      scrollTop: 0,
+      scrollLeft: 0
+    };
+    panes[key] = pane;
+    return pane;
+  }
+
+  function deactivatePane(pane) {
+    if (!pane || !pane.el) { return; }
+    pane.scrollTop = pane.el.scrollTop || 0;
+    pane.scrollLeft = pane.el.scrollLeft || 0;
+    if (pane.loaded) {
+      emitDeactivate(pane.el, { kind: 'panel', path: pane.path, key: pane.key });
+    }
+    pane.el.classList.remove('active');
+    pane.el.hidden = true;
+  }
+
+  function activatePane(pane) {
+    if (!pane || !pane.el) { return; }
+    if (activePane && activePane !== pane) { deactivatePane(activePane); }
+    activePane = pane;
+    panel = pane.el;
+    pane.el.hidden = false;
+    pane.el.classList.add('active');
+    pane.el.scrollTop = pane.scrollTop || 0;
+    pane.el.scrollLeft = pane.scrollLeft || 0;
+    if (pane.loaded) {
+      emitActivate(pane.el, { kind: 'panel', path: pane.path, key: pane.key });
+    }
+  }
+
+  function destroyPane(key) {
+    var pane = panes[key];
+    if (!pane) { return; }
+    pane.seq++;
+    if (pane.controller) {
+      try { pane.controller.abort(); } catch (e) {}
+      pane.controller = null;
+    }
+    if (activePane === pane) {
+      if (pane.loaded) {
+        emitDeactivate(pane.el, { kind: 'panel', path: pane.path, key: pane.key });
+      }
+      activePane = null;
+      panel = panelHost;
+    }
+    if (pane.loaded) {
+      emitUnmount(pane.el);
+    }
+    if (pane.el && pane.el.parentNode) { pane.el.remove(); }
+    delete panes[key];
+  }
+
+  function isDangerConfirm(el, text) {
+    if (el && (el.classList.contains('danger') || el.hasAttribute('data-danger'))) {
+      return true;
+    }
+    return /(删除|清空|移除|注销|销毁)/.test(text || '');
+  }
+
+  function focusablesIn(container) {
+    if (!container) { return []; }
+    var all = container.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), ' +
+      'select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var n = all[i];
+      if (n.offsetParent !== null || n.getClientRects().length > 0) { out.push(n); }
+    }
+    return out;
+  }
+
+  function trapFocus(container, ev) {
+    if (!container || ev.key !== 'Tab') { return false; }
+    var list = focusablesIn(container);
+    if (!list.length) {
+      ev.preventDefault();
+      if (container.focus) { container.focus(); }
+      return true;
+    }
+    var first = list[0];
+    var last = list[list.length - 1];
+    var cur = document.activeElement;
+    if (ev.shiftKey) {
+      if (cur === first || !container.contains(cur)) {
+        ev.preventDefault();
+        last.focus();
+      }
+    } else if (cur === last || !container.contains(cur)) {
+      ev.preventDefault();
+      first.focus();
+    }
+    return true;
+  }
+
+  function open(path, title, optsOrReplace, skipDirty) {
+    var opts = (optsOrReplace && typeof optsOrReplace === 'object')
+      ? optsOrReplace
+      : { replace: !!optsOrReplace, skipDirty: !!skipDirty };
+    if (skipDirty) { opts.skipDirty = true; }
+
+    var rawPath = path || '/admin';
+    rememberPane(rawPath);
+    var normPath = normalize(rawPath);
+    var key = tabKey(normPath);
+
+    var existingIdx = find(normPath);
+    if (existingIdx < 0) {
       for (var j = 0; j < state.tabs.length; j++) {
-        if (base(state.tabs[j].path) === root) {
-          i = j;
-          state.tabs[j].path = path;
-          if (title) { state.tabs[j].title = title; }
+        if (tabKey(state.tabs[j].path) === key) {
+          existingIdx = j;
           break;
         }
       }
     }
-    if (i < 0) { state.tabs.push({ path: path, title: title || path }); }
-    state.active = path;
+
+    if (opts.fromTabLink && existingIdx >= 0 && normPath === normalize(key)) {
+      normPath = state.tabs[existingIdx].path;
+    }
+
+    var pane = tabs ? ensurePane(key, normPath) : null;
+    var needLoad = !pane || !pane.loaded || pane.path !== normPath || !!opts.forceLoad;
+
+    if (needLoad && !opts.skipDirty && pane && hasPaneDirty(pane)) {
+      Layer.confirm('当前页面有未保存的表单修改，确定离开吗？', function () {
+        clearDirtyForms(pane.el);
+        open(normPath, title, {
+          replace: !!opts.replace,
+          skipDirty: true,
+          forceLoad: !!opts.forceLoad,
+          quiet: !!opts.quiet
+        });
+      }, '未保存修改', { danger: true, okText: '确认离开' });
+      return;
+    }
+    if (!pane && !opts.skipDirty && panel && hasDirtyForm(panel) && normPath !== state.active) {
+      Layer.confirm('当前页面有未保存的表单修改，确定离开吗？', function () {
+        clearDirtyForms(panel);
+        open(normPath, title, { replace: !!opts.replace, skipDirty: true, forceLoad: !!opts.forceLoad });
+      }, '未保存修改', { danger: true, okText: '确认离开' });
+      return;
+    }
+
+    if (existingIdx >= 0) {
+      state.tabs[existingIdx].path = normPath;
+      if (title && !opts.fromTabLink) { state.tabs[existingIdx].title = title; }
+      else if (title && !state.tabs[existingIdx].title) { state.tabs[existingIdx].title = title; }
+    } else {
+      state.tabs.push({ path: normPath, title: title || normPath });
+    }
+
+    var same = state.active === normPath;
+    state.active = normPath;
     paint();
-    if (replace || same) { history.replaceState({ path: path }, '', path); }
-    else { history.pushState({ path: path }, '', path); }
-    load(path);
+    if (opts.replace || same) { history.replaceState({ path: normPath }, '', normPath); }
+    else { history.pushState({ path: normPath }, '', normPath); }
+
+    if (pane) {
+      var wasLoaded = pane.loaded;
+      var wasActive = activePane === pane;
+      activatePane(pane);
+      if (needLoad) {
+        loadPane(pane, normPath, !!opts.quiet);
+      } else if (wasLoaded && !wasActive) {
+        /* activatePane already emitted onActivate when switching back to cached pane */
+      }
+    } else {
+      load(normPath, !!opts.quiet);
+    }
   }
 
   function restoreHistory() {
@@ -224,17 +581,255 @@
     var path = normalize(location.pathname + location.search + location.hash);
     var i = find(path);
     var title = i >= 0 ? state.tabs[i].title : path;
-    open(path, title, true);
+    open(path, title, { replace: true });
   }
 
   // ---- panel --------------------------------------------------------------
+
+  function markRequired(root) {
+    root.querySelectorAll('.form input[required], .form select[required], .form textarea[required]').forEach(function (inp) {
+      var prev = inp.previousElementSibling;
+      while (prev && prev.tagName !== 'LABEL') {
+        prev = prev.previousElementSibling;
+      }
+      if (prev && prev.tagName === 'LABEL') {
+        prev.classList.add('req');
+      }
+    });
+  }
+
+  /* innerHTML does not execute <script>, and a screen may carry one. */
+  function runScripts(root) {
+    root.querySelectorAll('script').forEach(function (old) {
+      var s = document.createElement('script');
+      s.textContent = old.textContent;
+      old.replaceWith(s);
+    });
+  }
+
+  function ensureStyle(href) {
+    if (!href || !document.head) { return; }
+    var links = document.head.querySelectorAll('link[rel="stylesheet"]');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].getAttribute('href') === href) { return; }
+    }
+    var lk = document.createElement('link');
+    lk.setAttribute('rel', 'stylesheet');
+    lk.setAttribute('href', href);
+    document.head.appendChild(lk);
+  }
+
+  function matchesModule(root, selector) {
+    if (!root || !selector) { return false; }
+    if (root.matches && root.matches(selector)) { return true; }
+    return !!(root.querySelector && root.querySelector(selector));
+  }
+
+  function registerModule(selector, spec) {
+    if (!selector || typeof selector !== 'string') { return; }
+    var entry = typeof spec === 'string' ? { script: spec }
+      : (typeof spec === 'function' ? { loader: spec } : (spec || {}));
+    for (var i = 0; i < moduleRegistry.length; i++) {
+      if (moduleRegistry[i].selector === selector) {
+        if (entry.script) { moduleRegistry[i].script = entry.script; }
+        if (entry.style) { moduleRegistry[i].style = entry.style; }
+        if (entry.loader) { moduleRegistry[i].loader = entry.loader; }
+        return;
+      }
+    }
+    var mod = {
+      selector: selector,
+      script: entry.script || '',
+      style: entry.style || '',
+      loader: typeof entry.loader === 'function' ? entry.loader : null,
+      hooks: {
+        mount: typeof entry.mount === 'function' ? entry.mount : null,
+        unmount: typeof entry.unmount === 'function' ? entry.unmount : null,
+        activate: typeof entry.activate === 'function' ? entry.activate : null,
+        deactivate: typeof entry.deactivate === 'function' ? entry.deactivate : null
+      },
+      wired: false,
+      loaded: false,
+      promise: null
+    };
+    moduleRegistry.push(mod);
+  }
+
+  function wireModuleHooks(mod) {
+    if (mod.wired) { return; }
+    mod.wired = true;
+    var h = mod.hooks;
+    if (h.mount) {
+      mountHooks.push(function (root, ctx) {
+        if (matchesModule(root, mod.selector)) { h.mount(root, ctx); }
+      });
+    }
+    if (h.unmount) {
+      unmountHooks.push(function (root) {
+        if (matchesModule(root, mod.selector)) { h.unmount(root); }
+      });
+    }
+    if (h.activate) {
+      activateHooks.push(function (root, ctx) {
+        if (matchesModule(root, mod.selector)) { h.activate(root, ctx); }
+      });
+    }
+    if (h.deactivate) {
+      deactivateHooks.push(function (root, ctx) {
+        if (matchesModule(root, mod.selector)) { h.deactivate(root, ctx); }
+      });
+    }
+  }
+
+  function ensureModulesFor(root, ctx) {
+    if (!root || !moduleRegistry.length) { return; }
+    for (var i = 0; i < moduleRegistry.length; i++) {
+      (function (mod) {
+        if (!matchesModule(root, mod.selector)) { return; }
+        if (mod.style) { ensureStyle(mod.style); }
+        if (mod.loaded) { return; }
+        function runInitial() {
+          if (root.isConnected !== false && matchesModule(root, mod.selector)) {
+            if (mod.hooks.mount) {
+              try { mod.hooks.mount(root, ctx || {}); } catch (e) {}
+            }
+          }
+        }
+        if (!mod.promise) {
+          var p = mod.loader ? Promise.resolve().then(mod.loader)
+            : (mod.script ? import(mod.script) : Promise.resolve(null));
+          mod.promise = p.then(function (ns) {
+            mod.loaded = true;
+            var api = (ns && ns.default && typeof ns.default === 'object') ? ns.default : ns;
+            if (api && typeof api === 'object') {
+              if (!mod.hooks.mount && typeof api.mount === 'function') { mod.hooks.mount = api.mount; }
+              if (!mod.hooks.unmount && typeof api.unmount === 'function') { mod.hooks.unmount = api.unmount; }
+              if (!mod.hooks.activate && typeof api.activate === 'function') { mod.hooks.activate = api.activate; }
+              if (!mod.hooks.deactivate && typeof api.deactivate === 'function') { mod.hooks.deactivate = api.deactivate; }
+            }
+            wireModuleHooks(mod);
+            return api;
+          }).catch(function () {
+            mod.promise = null;
+          });
+        }
+        mod.promise.then(function () { if (mod.loaded) { runInitial(); } });
+      })(moduleRegistry[i]);
+    }
+  }
+
+  function bootShellModules() {
+    var host = el('ad-shell-modules');
+    if (!host) { return; }
+    var raw = host.getAttribute('data-modules');
+    if (!raw) { return; }
+    try {
+      var list = JSON.parse(raw);
+      if (!Array.isArray(list)) { return; }
+      for (var i = 0; i < list.length; i++) {
+        var item = list[i];
+        if (!item) { continue; }
+        if (item.tabPrefix) { registerTabKey(item.tabPrefix, item.tabParam || ''); }
+        if (item.selector && (item.script || item.style)) {
+          registerModule(item.selector, { script: item.script || '', style: item.style || '' });
+        }
+      }
+    } catch (e) { /* ignore malformed module manifest */ }
+  }
+
+  function isPaneInteractive(target, ev) {
+    if (Layer.any() || document.querySelector('.cmdk-mask')) { return false; }
+    var cur = panelEl();
+    if (!cur) { return false; }
+    if (target && target !== cur && (!cur.contains || !cur.contains(target))) { return false; }
+    var act = (ev && ev.target) || document.activeElement;
+    if (act && act.closest && act.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]')) {
+      return false;
+    }
+    return true;
+  }
+
+  function mountFragment(root, ctx) {
+    if (!root) { return; }
+    markRequired(root);
+    emitMount(root, ctx || {});
+    ensureModulesFor(root, ctx || {});
+    runScripts(root);
+  }
+
+  function loadPane(pane, path, quiet) {
+    path = normalize(path);
+    var seq = ++pane.seq;
+    if (pane.controller) { pane.controller.abort(); }
+    pane.controller = window.AbortController ? new AbortController() : null;
+    pane.path = path;
+    pane.loading = true;
+    pane.el.setAttribute('aria-busy', 'true');
+    if (!pane.loaded && !pane.el.innerHTML) {
+      pane.el.innerHTML = '<div class="panel-loading muted">加载中…</div>';
+    }
+    var opts = { headers: { 'X-Fragment': '1' }, credentials: 'same-origin' };
+    if (pane.controller) { opts.signal = pane.controller.signal; }
+    return fetch(path, opts)
+      .then(function (r) {
+        if (seq !== pane.seq) { return ''; }
+        if (r.status === 401) { location.href = '/admin/login'; return ''; }
+        if (!r.ok) { throw new Error('http ' + r.status); }
+        var t = r.headers.get('X-Tab-Title');
+        if (t) {
+          var i = find(path);
+          if (i >= 0) { state.tabs[i].title = decodeURIComponent(t); paint(); }
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        if (seq !== pane.seq) { return; }
+        if (html === '') { throw new Error('empty fragment'); }
+        if (pane.loaded) { emitUnmount(pane.el); }
+        pane.el.innerHTML = html;
+        pane.el.removeAttribute('aria-busy');
+        pane.loading = false;
+        pane.loaded = true;
+        if (!quiet) {
+          pane.scrollTop = 0;
+          pane.scrollLeft = 0;
+          pane.el.scrollTop = 0;
+          pane.el.scrollLeft = 0;
+        } else {
+          pane.el.scrollTop = pane.scrollTop || 0;
+          pane.el.scrollLeft = pane.scrollLeft || 0;
+        }
+        mountFragment(pane.el, {
+          kind: 'panel',
+          path: path,
+          key: pane.key,
+          quiet: !!quiet,
+          active: activePane === pane
+        });
+        paintTabDirty();
+      })
+      .catch(function (err) {
+        if (seq !== pane.seq || (err && err.name === 'AbortError')) { return; }
+        pane.loading = false;
+        pane.el.removeAttribute('aria-busy');
+        if (pane.loaded) { emitUnmount(pane.el); }
+        pane.loaded = false;
+        pane.el.innerHTML = '<div class="panel-error" role="alert"><h2>页面加载失败</h2>' +
+          '<p>当前页面暂时无法显示，请检查网络或稍后重试。</p>' +
+          '<button type="button" class="btn primary" data-refresh>重新加载</button></div>';
+        pane.scrollTop = 0;
+        pane.el.scrollTop = 0;
+        paintTabDirty();
+      });
+  }
 
   function load(path, quiet) {
     path = normalize(path);
     var seq = ++loadSeq;
     if (loadController) { loadController.abort(); }
     loadController = window.AbortController ? new AbortController() : null;
-    stopStream();
+    if (panel) { emitUnmount(panel); }
+    if (!panel) { return Promise.resolve(''); }
     panel.setAttribute('aria-busy', 'true');
     var opts = { headers: { 'X-Fragment': '1' }, credentials: 'same-origin' };
     if (loadController) { opts.signal = loadController.signal; }
@@ -251,116 +846,35 @@
         return r.text();
       })
       .then(function (html) {
-        if (html === '' || seq !== loadSeq) { return; }
+        if (seq !== loadSeq) { return; }
+        if (html === '') { throw new Error('empty fragment'); }
         panel.innerHTML = html;
         panel.removeAttribute('aria-busy');
-        // A quiet refresh (after a dialog write) is in place: the list the
-        // user is looking at updates where it stands -- no scroll jump.
         if (!quiet) { panel.scrollTop = 0; }
-        startStream();
-        runScripts(panel);
-        restorePane(path);
-        wireModelPick(panel);
+        mountFragment(panel, { kind: 'panel', path: path, quiet: !!quiet, active: true });
       })
       .catch(function (err) {
-        if (seq !== loadSeq || err.name === 'AbortError') { return; }
+        if (seq !== loadSeq || (err && err.name === 'AbortError')) { return; }
         panel.removeAttribute('aria-busy');
-        toast('页面加载失败', 'bad');
+        panel.innerHTML = '<div class="panel-error" role="alert"><h2>页面加载失败</h2>' +
+          '<p>当前页面暂时无法显示，请检查网络或稍后重试。</p>' +
+          '<button type="button" class="btn primary" data-refresh>重新加载</button></div>';
+        panel.scrollTop = 0;
       });
-  }
-
-  /* innerHTML does not execute <script>, and a screen may carry one. */
-  function runScripts(root) {
-    if (window.applyFragmentWidgets) { window.applyFragmentWidgets(root); }
-    root.querySelectorAll('.form input[required], .form select[required], .form textarea[required]').forEach(function (inp) {
-      var prev = inp.previousElementSibling;
-      while (prev && prev.tagName !== 'LABEL') {
-        prev = prev.previousElementSibling;
-      }
-      if (prev && prev.tagName === 'LABEL') {
-        prev.classList.add('req');
-      }
-    });
-    root.querySelectorAll('script').forEach(function (old) {
-      var s = document.createElement('script');
-      s.textContent = old.textContent;
-      old.replaceWith(s);
-    });
   }
 
   function reload(quiet) {
-    if (state.active) { load(state.active, quiet); }
-  }
-
-  // Re-open the sub-pane this screen was on before its panel was rebuilt.
-  function restorePane(path) {
-    var name = paneMemo[base(path)];
-    if (!name) { return; }
-    var btn = panel.querySelector('[data-setting-tabs] [data-pane="' + name + '"]');
-    if (btn) { btn.click(); }
-  }
-
-  // The AI model is fetched, not typed: given the base URL and key already on
-  // the form, ask the provider what it offers and let the operator pick. The
-  // key is only posted to our own endpoint, which uses it server-side and never
-  // returns it. Providers with no /models endpoint keep the plain text field.
-  function wireModelPick(root) {
-    var input = root.querySelector('[name="ai.model"]');
-    if (!input || input.getAttribute('data-model-wired')) { return; }
-    input.setAttribute('data-model-wired', '1');
-    var list = document.createElement('datalist');
-    list.id = 'ai-model-options';
-    input.setAttribute('list', list.id);
-    input.parentNode.insertBefore(list, input.nextSibling);
-    var btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn sm';
-    btn.textContent = '获取模型';
-    btn.style.marginLeft = '8px';
-    input.parentNode.insertBefore(btn, list.nextSibling);
-    btn.addEventListener('click', function () {
-      var url = root.querySelector('[name="ai.baseUrl"]');
-      var key = root.querySelector('[name="ai.apiKey"]');
-      if (!url || !url.value.trim()) { Layer.msg('请先填写接口地址'); return; }
-      btn.disabled = true;
-      btn.textContent = '获取中…';
-      fetch('/admin/dev/ai/models', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ baseUrl: url.value.trim(),
-                                    apiKey: key ? key.value : '' }).toString()
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        var models = (j && j.code === '0000' && j.data && j.data.models) || [];
-        if (!models.length) { Layer.notify('没有获取到模型', '确认接口地址和 Key 是否正确，或该服务不支持模型列表', 'bad'); return; }
-        list.innerHTML = '';
-        for (var i = 0; i < models.length; i++) {
-          var o = document.createElement('option');
-          o.value = models[i];
-          list.appendChild(o);
-        }
-        if (!input.value) { input.value = models[0]; }
-        input.focus();
-        Layer.msg('已获取 ' + models.length + ' 个模型，点输入框选择');
-      }).catch(function () {
-        Layer.notify('获取失败', '请求未完成', 'bad');
-      }).then(function () {
-        btn.disabled = false; btn.textContent = '获取模型';
-      });
-    });
+    if (activePane) {
+      if (quiet) {
+        activePane.scrollTop = activePane.el.scrollTop || 0;
+        activePane.scrollLeft = activePane.el.scrollLeft || 0;
+      }
+      return loadPane(activePane, activePane.path, quiet);
+    }
+    if (state.active) { return load(state.active, quiet); }
   }
 
   // ---- layer: windows, drawers, prompts and notices ------------------------
-  //
-  // One primitive, five shapes. A layer is a positioned box over the shell:
-  //   Layer.open({url|content})     a draggable, resizable-by-maximise window
-  //   Layer.drawer({url|content})   the same panel, docked to the right edge
-  //   Layer.confirm(text, onOk)     a question with two buttons
-  //   Layer.msg(text, kind)         a short line in the middle of the screen
-  //   Layer.notify(title, text)     a card in the corner that stacks
-  //   Layer.tip(el, text)           a bubble anchored to an element
-  // They stack: opening a form from a form is one more window, and Escape or
-  // the close button always dismisses the topmost one.
-
   var Layer = (function () {
     var seq = 0;
     var zTop = 200;
@@ -375,24 +889,35 @@
 
     function shell(opts) {
       var id = ++seq;
+      var opener = document.activeElement;
       var mask = node('div', 'lay-mask');
       var box = node('div', 'lay-box' + (opts.drawer ? ' drawer' : '')
         + (opts.wide ? ' wide' : '')
         + (opts.kind ? ' ' + opts.kind : ''));
+      box.setAttribute('role', 'dialog');
+      box.setAttribute('aria-modal', 'true');
+      box.setAttribute('tabindex', '-1');
       box.style.zIndex = ++zTop;
       mask.style.zIndex = zTop;
       if (opts.width && window.innerWidth > 768) {
-        var want = parseInt(opts.width, 10) || 0;
-        box.style.width = Math.min(want, window.innerWidth - 24) + 'px';
+        var want = String(opts.width).trim();
+        box.style.width = /^\d+(?:\.\d+)?px$/.test(want)
+          ? Math.min(parseFloat(want), window.innerWidth - 24) + 'px'
+          : want;
       }
 
       var head = node('header');
       head.appendChild(node('span', 'title', opts.title || ''));
       var ops = node('span', 'ops');
       if (!opts.drawer && !opts.bare) {
-        var max = node('button', 'wbtn', '□');
+        var max = node('button', 'wbtn');
         max.type = 'button';
         max.title = '最大化 / 还原';
+        max.setAttribute('aria-label', '最大化或还原');
+        max.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"'
+          + ' stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">'
+          + '<rect x="1.6" y="1.6" width="6.6" height="6.6" rx="1"/>'
+          + '<path d="M4 10.4h5.4a1 1 0 0 0 1-1V4"/></svg>';
         max.onclick = function () {
           box.classList.toggle('max');
           if (!box.classList.contains('max')) { place(box, opts); }
@@ -402,7 +927,8 @@
       var x = node('button', 'wbtn', '×');
       x.type = 'button';
       x.title = '关闭';
-      x.onclick = function () { Layer.close(id); };
+      x.setAttribute('aria-label', '关闭弹窗');
+      x.onclick = function () { Layer.requestClose(id); };
       ops.appendChild(x);
       head.appendChild(ops);
 
@@ -415,13 +941,12 @@
       if (!opts.drawer) { drag(box, head); }
       box.addEventListener('mousedown', function () { box.style.zIndex = ++zTop; });
       if (opts.maskClose !== false) {
-        mask.onclick = function () { Layer.close(id); };
+        mask.onclick = function () { Layer.requestClose(id); };
       }
-      stack.push({ id: id, box: box, mask: mask });
+      stack.push({ id: id, box: box, mask: mask, opener: opener });
       return { id: id, box: box, body: body, head: head };
     }
 
-    // Centred on first paint, then wherever the user drags it.
     function place(box, opts) {
       if (opts.drawer || window.innerWidth <= 768) { return; }
       var w = box.offsetWidth;
@@ -487,7 +1012,7 @@
     }
 
     function ready(w, opts) {
-      runScripts(w.body);
+      mountFragment(w.body, { kind: 'dialog', url: opts.url || '' });
       var ft = w.body.querySelector('footer, form > footer');
       if (ft) { ft.classList.add('lay-footer'); }
       if (!opts.drawer) {
@@ -507,23 +1032,25 @@
         var w = shell(opts);
         return fill(w, opts);
       },
-      confirm: function (text, onOk, title) {
-        var w = shell({ title: title || '确认', width: '320px', bare: true,
+      confirm: function (text, onOk, title, opts) {
+        opts = opts || {};
+        var w = shell({ title: title || '确认', width: '340px', bare: true,
                         maskClose: false });
         w.box.classList.add('ask');
         w.body.innerHTML = '';
         w.body.appendChild(node('p', 'ask-text', text));
         var foot = node('div', 'ask-ops');
-        var no = node('button', 'btn sm', '取消');
+        var no = node('button', 'btn sm', opts.cancelText || '取消');
         no.type = 'button';
         no.onclick = function () { Layer.close(w.id); };
-        var yes = node('button', 'btn sm primary', '确定');
+        var yes = node('button', 'btn sm ' + (opts.danger ? 'danger solid' : 'primary'),
+                       opts.okText || '确定');
         yes.type = 'button';
         yes.onclick = function () { Layer.close(w.id); onOk(); };
         foot.appendChild(no);
         foot.appendChild(yes);
         w.body.appendChild(foot);
-        yes.focus();
+        if (opts.danger) { no.focus(); } else { yes.focus(); }
         return w.id;
       },
       msg: function (text, kind) {
@@ -538,7 +1065,9 @@
         var card = node('div', 'notice ' + (kind || 'ok'));
         card.appendChild(node('div', 'nt', title));
         if (text) { card.appendChild(node('div', 'nb', text)); }
-        var x = node('span', 'x', '×');
+        var x = node('button', 'x', '×');
+        x.type = 'button';
+        x.setAttribute('aria-label', '关闭通知');
         x.onclick = function () { card.remove(); };
         card.appendChild(x);
         host.appendChild(card);
@@ -563,20 +1092,43 @@
       close: function (id) {
         for (var i = stack.length - 1; i >= 0; i--) {
           if (stack[i].id !== id) { continue; }
-          stack[i].box.remove();
-          stack[i].mask.remove();
+          var entry = stack[i];
+          var body = entry.box.querySelector('.body');
+          if (body) { emitUnmount(body); }
+          entry.box.remove();
+          entry.mask.remove();
           stack.splice(i, 1);
+          if (entry.opener && entry.opener.isConnected && entry.opener.focus) {
+            try { entry.opener.focus(); } catch (e) {}
+          }
           return;
         }
       },
-      // The topmost URL-loaded dialog entry, for in-window navigation.
+      requestClose: function (id) {
+        for (var i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].id !== id) { continue; }
+          var entry = stack[i];
+          if (!entry.box.classList.contains('ask') && !entry.forceClose && hasDirtyForm(entry.box)) {
+            Layer.confirm('当前表单有未保存的修改，确定放弃并关闭吗？', function () {
+              entry.forceClose = true;
+              Layer.close(id);
+            }, '未保存修改', { danger: true, okText: '放弃修改' });
+            return false;
+          }
+          Layer.close(id);
+          return true;
+        }
+        return false;
+      },
+      topBox: function () {
+        return stack.length ? stack[stack.length - 1].box : null;
+      },
       topUrl: function () {
         for (var i = stack.length - 1; i >= 0; i--) {
           if (stack[i].url) { return stack[i]; }
         }
         return null;
       },
-      // Image viewer: a bare frame around one picture, closed by click.
       img: function (src, title) {
         var w = shell({ title: title || '预览', width: 'min(90vw, 860px)',
                         bare: true, maskClose: true });
@@ -588,8 +1140,6 @@
         w.body.appendChild(im);
         return w.id;
       },
-      // Every URL-loaded dialog entry, bottom-up: a write inside a stacked
-      // dialog refreshes the ones beneath it (the list a form came from).
       urlEntries: function () {
         var out = [];
         for (var i = 0; i < stack.length; i++) {
@@ -603,6 +1153,12 @@
         Layer.close(top.id);
         return true;
       },
+      requestCloseTop: function () {
+        if (!stack.length) { return false; }
+        var top = stack[stack.length - 1];
+        Layer.requestClose(top.id);
+        return true;
+      },
       any: function () { return stack.length > 0; }
     };
   })();
@@ -611,25 +1167,18 @@
 
   // ---- dialogs ------------------------------------------------------------
 
-  function dialog(url, wide, title) {
+  function dialog(url, wide, title, width) {
     return Layer.open({ url: url, title: title || '编辑',
                         wide: !!wide,
-                        width: wide ? '840px' : '580px' });
+                        width: width || (wide ? '840px' : '580px') });
   }
 
-  // Writes launched from INSIDE a dialog (row delete, form save opened over a
-  // dialog list) must not close that dialog: afterWrite() refreshes it. Only
-  // close the top window when the write was NOT itself a dialog interaction --
-  // i.e. when the confirming layer was ours, the dialog stack is unchanged.
   function closeDialog() { Layer.closeTop(); }
+  function requestCloseDialog() { Layer.requestCloseTop(); }
 
-  // A dialog whose body is itself a screen (pager, filter, forms -- e.g. the
-  // generic data manager). Its own [data-load]/[data-search]/[data-dialog]
-  // links must stay INSIDE the window: the page's handlers would otherwise
-  // swap the panel or move the tab underneath. Every filled dialog remembers
-  // its URL; this re-fetches and repaints just that body.
   function dialogLoad(entry, url) {
     if (url) { entry.url = url; }
+    if (entry.body) { emitUnmount(entry.body); }
     return fetch(entry.url, {
       headers: { 'X-Fragment': '1' }, credentials: 'same-origin'
     }).then(function (r) {
@@ -639,22 +1188,10 @@
       entry.body.innerHTML = html;
       var t = entry.body.querySelector('[data-title]');
       if (t) { entry.head.querySelector('.title').textContent = t.getAttribute('data-title'); }
-      if (window.applyFragmentWidgets) { window.applyFragmentWidgets(entry.body); }
-      if (window.wireModelPick) { window.wireModelPick(entry.body); }
-      entry.body.querySelectorAll('script').forEach(function (old) {
-        var s = document.createElement('script');
-        s.textContent = old.textContent;
-        old.replaceWith(s);
-      });
+      mountFragment(entry.body, { kind: 'dialog', url: entry.url || '' });
     }).catch(function (e) {
       Layer.msg(e.message || '加载失败', 'bad');
     });
-  }
-
-  // The topmost dialog that came from a URL (an entry loaded from `content`
-  // has nothing to reload).
-  function topDialog() {
-    return Layer.topUrl();
   }
 
   // ---- writes -------------------------------------------------------------
@@ -670,14 +1207,22 @@
       body: body || ''
     }).then(function (r) {
       if (r.status === 401) { location.href = '/admin/login'; return null; }
-      return r.json();
+      return r.text().then(function (raw) {
+        var j = null;
+        if (raw) {
+          try { j = JSON.parse(raw); } catch (e) { j = null; }
+        }
+        if (!r.ok) {
+          var detail = j && j.msg ? j.msg : (raw || '服务器未返回错误详情');
+          if (detail.length > 240) { detail = detail.slice(0, 240) + '…'; }
+          throw new Error('HTTP ' + r.status + '：' + detail);
+        }
+        if (!j) { throw new Error('服务器返回了无法解析的响应'); }
+        return j;
+      });
     });
   }
 
-  // After a successful write: close the form window, then refresh whatever
-  // the write happened over. The write's own dialog (if URL-loaded) is gone by
-  // now, so every remaining URL entry is a list beneath it -- refresh them all,
-  // then the panel quietly (rows update in place, no scroll jump).
   function afterWrite() {
     var subs = Layer.urlEntries();
     for (var i = 0; i < subs.length; i++) { dialogLoad(subs[i]); }
@@ -687,8 +1232,6 @@
   function submit(form) {
     var data = new FormData(form);
     var parts = [];
-    // Checkbox groups arrive as one comma-joined field: the server reads a
-    // single value and does not have to care about repeated names.
     var groups = {};
     data.forEach(function (v, k) {
       if (k.slice(-2) === '[]') {
@@ -712,491 +1255,30 @@
       if (btn) { btn.disabled = false; btn.textContent = originText || '保存'; }
       if (!j) { return; }
       if (j.code === '0000') {
+        form.removeAttribute('data-dirty');
+        paintTabDirty();
         toast(j.msg || '已保存', 'ok');
         closeDialog();
         afterWrite();
         return;
       }
       toast(j.msg || '保存失败', 'bad');
-    }).catch(function () {
+    }).catch(function (e) {
       if (btn) { btn.disabled = false; btn.textContent = originText || '保存'; }
-      toast('请求失败', 'bad');
+      toast(e && e.message ? e.message : '请求失败', 'bad');
     });
   }
-
-  // ---- live metrics -------------------------------------------------------
-
-  function stopStream() {
-    streamGen++;
-    if (stream) { stream.close(); stream = null; }
-    if (dayTimer) { clearInterval(dayTimer); dayTimer = null; }
-    dayPts = {};
-    dayDay = '';
-    topDay = {};
-    topLive = {};
-    topTotal = 0;
-  }
-
-  function startStream() {
-    var host = panel.querySelector('[data-stream]');
-    if (!host) { return; }
-    var gen = ++streamGen;
-    var url = host.getAttribute('data-stream');
-    stream = new EventSource(url);
-    stream.addEventListener('metrics', function (ev) {
-      if (gen !== streamGen) { return; }
-      try { paintSnapshot(JSON.parse(ev.data)); } catch (e) { toast('实时数据格式错误', 'bad'); }
-    });
-    stream.addEventListener('series', function (ev) {
-      if (gen !== streamGen) { return; }
-      try { paintSeries(JSON.parse(ev.data)); } catch (e) { toast('实时序列格式错误', 'bad'); }
-    });
-    stream.onerror = function () { /* EventSource retries by itself */ };
-    wireTopSort();
-    startDay(host.getAttribute('data-day'), gen);
-  }
-
-  // ---- today, cumulative --------------------------------------------------
-
-  // The day's figures come from the metrics database, not from the live
-  // stream: a worker's counters restart with the worker, so anything drawn
-  // from them walks backwards whenever the fleet changes. Polled slowly on
-  // purpose -- it is a whole day of five-minute buckets, and it only grows.
-  var dayTimer = null;
-  var dayPts = {};      // bucket second -> point, so history is merged, not replaced
-  var dayDay = '';
-
-  function startDay(url, gen) {
-    if (!url) { return; }
-    var tick = function () {
-      fetch(url, { credentials: 'same-origin' })
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (j) { if (j && gen === streamGen) { paintDay(j); } })
-        .catch(function () { /* the next tick tries again */ });
-    };
-    tick();
-    dayTimer = setInterval(tick, 60000);
-  }
-
-  function paintDay(d) {
-    // Midnight: the day being drawn has changed, so yesterday's buckets are
-    // not the start of this one.
-    if (d.day !== dayDay) { dayPts = {}; dayDay = d.day || ''; }
-    put('day_calls', d.calls || 0);
-    put('day_errors', d.errors || 0);
-    put('day_avg_us', dur(d.avg_us));
-    put('day_max_us', dur(d.max_us));
-    put('day_total_us', dur(d.total_us));
-    put('day_label', d.day || '');
-
-    // Merged, not assigned: a bucket already on screen is updated by a later
-    // answer and never removed by one, so a partial or failed read cannot
-    // shorten the chart.
-    (d.points || []).forEach(function (p) { dayPts[p.t] = p; });
-    var pts = Object.keys(dayPts).map(function (k) { return dayPts[k]; })
-      .sort(function (a, b) { return a.t - b.t; })
-      .map(function (p) {
-        return { t: p.t, label: clock(p.t), calls: p.calls || 0,
-                 errors: p.errors || 0, avg_us: p.avg_us || 0,
-                 max_us: p.max_us || 0 };
-      });
-    draw('chart-day-req', [
-      { color: '#1f6feb', label: '请求', values: pts.map(function (p) { return p.calls; }) },
-      { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.errors; }) }
-    ], pts, '');
-    draw('chart-day-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
-      { color: '#d97706', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
-    ], pts, ' ms');
-
-    topTotal = d.calls || 0;
-    topDay = {};
-    (d.top || []).forEach(function (s) { topDay[s.req] = s; });
-    paintTop();
-  }
-
-  // ---- one interface ranking ----------------------------------------------
-
-  // One row per interface, sorted by whichever column was clicked. The three
-  // tables this replaces were the same interfaces ordered three ways, which is
-  // what sorting a table already does.
-  //
-  // Two sources, because neither answers the whole question: the day's counts
-  // and durations come from the database (they survive a worker restart and
-  // include the workers that are gone), while `failed` and `rejected` are only
-  // counted live, in the processes that are up. An interface the live snapshot
-  // has but the database has not yet (another worker's minute is not flushed)
-  // is still listed, with its cumulative columns blank rather than as zeros.
-  var topDay = {};       // req -> today's row, from the metrics database
-  var topLive = {};      // req -> live row, from the snapshot stream
-  var topTotal = 0;      // today's calls, for the share column
-  var topSort = { key: 'calls', dir: -1 };
-
-  function wireTopSort() {
-    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
-      if (!th.getAttribute('data-label')) {
-        th.setAttribute('data-label', th.textContent);
-      }
-      th.style.cursor = 'pointer';
-      th.addEventListener('click', function () {
-        var key = th.getAttribute('data-sort');
-        // Same column again reverses it; a new column starts descending,
-        // except the name, which reads better A-Z.
-        if (topSort.key === key) { topSort.dir = -topSort.dir; }
-        else { topSort = { key: key, dir: key === 'req' ? 1 : -1 }; }
-        paintTop();
-      });
-    });
-    paintTopHead();
-  }
-
-  function paintTopHead() {
-    panel.querySelectorAll('[data-toptable] th[data-sort]').forEach(function (th) {
-      var label = th.getAttribute('data-label') || th.textContent;
-      var on = th.getAttribute('data-sort') === topSort.key;
-      th.textContent = label + (on ? (topSort.dir < 0 ? ' \u2193' : ' \u2191') : '');
-    });
-  }
-
-  function paintTop() {
-    var tb = panel.querySelector('[data-daytop]');
-    if (!tb) { return; }
-    var rows = [];
-    var keys = {};
-    Object.keys(topDay).forEach(function (k) { keys[k] = 1; });
-    Object.keys(topLive).forEach(function (k) { keys[k] = 1; });
-    Object.keys(keys).forEach(function (req) {
-      var d = topDay[req], l = topLive[req] || {};
-      rows.push({
-        req: req,
-        day: !!d,
-        calls: d ? (d.calls || 0) : 0,
-        errors: d ? (d.errors || 0) : 0,
-        avg_us: d ? (d.avg_us || 0) : 0,
-        max_us: d ? (d.max_us || 0) : 0,
-        total_us: d ? (d.total_us || 0) : 0,
-        failed: l.failed || 0,
-        rejected: l.rejected || 0
-      });
-    });
-    // The share column is the call count as a percentage, so it sorts by it.
-    var k = topSort.key === 'share' ? 'calls' : topSort.key, dir = topSort.dir;
-    rows.sort(function (a, b) {
-      if (k === 'req') { return a.req < b.req ? -dir : (a.req > b.req ? dir : 0); }
-      return (a[k] - b[k]) * dir;
-    });
-    paintTopHead();
-    tb.innerHTML = rows.length
-      ? rows.map(function (s) {
-          var share = s.day && topTotal > 0
-            ? (s.calls * 100 / topTotal).toFixed(1) + '%' : '—';
-          var num = function (v) { return s.day ? String(v) : '—'; };
-          var d2 = function (v) { return s.day ? dur(v) : '—'; };
-          return '<tr><td class="ellip mono" title="' + esc(s.req) + '">' +
-                 esc(s.req) + '</td><td class="num">' + num(s.calls) +
-                 '</td><td class="num muted">' + share +
-                 '</td><td class="num">' + num(s.errors) +
-                 '</td><td class="num">' + d2(s.avg_us) +
-                 '</td><td class="num">' + d2(s.max_us) +
-                 '</td><td class="num">' + d2(s.total_us) +
-                 '</td><td class="num">' + s.failed +
-                 '</td><td class="num">' + s.rejected + '</td></tr>';
-        }).join('')
-      : '<tr><td colspan="9" class="muted">今天还没有请求</td></tr>';
-  }
-
-  // A bucket's wall clock as "hh:mm", for a chart whose x axis is one day.
-  function clock(sec) {
-    var d = new Date(sec * 1000);
-    var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p2(d.getHours()) + ':' + p2(d.getMinutes());
-  }
-
-  function put(name, value) {
-    panel.querySelectorAll('[data-metric="' + name + '"]').forEach(function (n) {
-      n.textContent = value;
-    });
-  }
-
-  function bytes(v) {
-    if (v < 0) { return 'n/a'; }
-    if (v < 1024) { return v + ' B'; }
-    if (v < 1048576) { return (v / 1024).toFixed(0) + ' KB'; }
-    return (v / 1048576).toFixed(1) + ' MB';
-  }
-
-  // Every duration the server publishes is MICROSECONDS (*_us). The unit is
-  // picked per value because the range spans four orders of magnitude: a served
-  // request is hundreds of microseconds, a stuck one is seconds -- and the
-  // millisecond integers this replaces showed every fast endpoint as "0 ms".
-  function dur(us) {
-    us = us || 0;
-    if (us < 0) { return 'n/a'; }
-    if (us < 1000) { return us + ' \u00b5s'; }
-    if (us < 1000000) { return (us / 1000).toFixed(2) + ' ms'; }
-    return (us / 1000000).toFixed(2) + ' s';
-  }
-
-  // Microseconds as fractional milliseconds, for a chart whose axis is one
-  // unit: 890us plots as 0.89, not as a flat 0.
-  function ms(us) { return Math.round((us || 0) / 10) / 100; }
-
-  // Uptime in the same shape the server-rendered fields use (Fmt.Uptime):
-  // "d hh:mm:ss" once it has been up for a day.
-  function upt(msv) {
-    var t = Math.floor((msv || 0) / 1000);
-    var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
-    var clock = p2(Math.floor((t % 86400) / 3600)) + ':' +
-                p2(Math.floor((t % 3600) / 60)) + ':' + p2(t % 60);
-    var d = Math.floor(t / 86400);
-    return d > 0 ? d + 'd ' + clock : clock;
-  }
-
-  // One row per server process. Everything else on the page is the merge of
-  // every worker, so this table is where an uneven or dead worker shows up:
-  // `live` is 0 once a worker has stopped publishing, and its last totals stay
-  // on screen (marked stale) instead of silently leaving the table.
-  function paintProcs(rows) {
-    var tb = panel.querySelector('[data-procs]');
-    if (!tb) { return; }
-    rows = rows || [];
-    tb.innerHTML = rows.length
-      ? rows.map(function (p) {
-          var stale = !p.live;
-          return '<tr' + (stale ? ' class="muted"' : '') + '><td class="mono">' +
-                 (p.worker || 0) + '</td><td class="mono">' + (p.pid || 0) +
-                 '</td><td class="mono">' + upt(p.uptime_ms) +
-                 '</td><td class="num">' + (p.requests || 0) +
-                 '</td><td class="num">' + (p.errors || 0) +
-                 '</td><td class="num">' + dur(p.avg_us) +
-                 '</td><td class="num">' + dur(p.max_us) +
-                 '</td><td class="num">' + (p.concurrent || 0) +
-                 '</td><td class="num">' + (p.streams || 0) +
-                 '</td><td class="num">' + (p.queries || 0) +
-                 '</td><td class="num">' + (p.cpu_percent < 0 ? 'n/a' : p.cpu_percent + '%') +
-                 '</td><td class="num">' + bytes(p.mem_rss_bytes) +
-                 '</td><td class="num">' + (stale ? (p.age || 0) + 's 未上报' : '正常') +
-                 '</td></tr>';
-        }).join('')
-      : '<tr><td colspan="13" class="muted">等待数据…</td></tr>';
-  }
-
-  function paintSnapshot(m) {
-    var r = m.requests || {}, q = m.queries || {};
-    put('requests', r.count || 0);
-    put('errors', r.errors || 0);
-    put('failed', r.failed || 0);
-    put('rejected', r.rejected || 0);
-    put('avg_us', dur(r.avg_us));
-    put('max_us', dur(r.max_us));
-    put('queries', q.count || 0);
-    put('query_avg_us', dur(q.avg_us));
-    put('cpu', m.cpu_percent < 0 ? 'n/a' : m.cpu_percent + '%');
-    put('mem', bytes(m.mem_rss_bytes));
-    paintProcs(m.processes);
-    topLive = {};
-    (m.top_requests || []).forEach(function (s) { topLive[s.req] = s; });
-    paintTop();
-    var top = panel.querySelector('[data-topsql]');
-    if (top) {
-      var ts = m.top_sql || [];
-      top.innerHTML = ts.length
-        ? ts.map(function (s) {
-            return '<tr><td class="ellip mono" title="' + esc(s.sql) + '">' +
-                   esc(s.sql) + '</td><td class="num">' + (s.count || 0) +
-                   '</td><td class="num">' + dur(s.avg_us) +
-                   '</td><td class="num">' + dur(s.max_us) +
-                   '</td><td class="num">' + dur(s.total_us) + '</td></tr>';
-          }).join('')
-        : '<tr><td colspan="5" class="muted">暂无 SQL 记录</td></tr>';
-    }
-  }
-
-  function esc(s) {
-    return String(s).replace(/[&<>"]/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
-    });
-  }
-
-  function paintSeries(s) {
-    var pts = s.points || [];
-    draw('chart-req', [
-      { color: '#1f6feb', label: '请求', values: pts.map(function (p) { return p.req; }) },
-      { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.err; }) }
-    ], pts, '');
-    draw('chart-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
-      { color: '#d97706', label: 'P95', values: pts.map(function (p) { return ms(p.p95_us); }) }
-    ], pts, ' ms');
-    draw('chart-db', [
-      { color: '#0f766e', label: '查询数', values: pts.map(function (p) { return p.queries; }) },
-      { color: '#0891b2', label: '平均 ms', values: pts.map(function (p) { return ms(p.query_avg_us); }) }
-    ], pts, '');
-    draw('chart-sys', [
-      { color: '#15803d', label: 'CPU %', values: pts.map(function (p) { return Math.max(p.cpu_percent, 0); }) },
-      { color: '#6b7280', label: '内存 MB', values: pts.map(function (p) {
-          return Math.round(Math.max(p.mem_rss_bytes, 0) / 1048576); }) }
-    ], pts, '');
-  }
-
-  // One shared floating tooltip for every chart; position:fixed so it is never
-  // clipped by a card's overflow.
-  function monTip() {
-    var t = document.getElementById('mon-tip');
-    if (!t) {
-      t = document.createElement('div');
-      t.id = 'mon-tip';
-      t.style.cssText = 'position:fixed;z-index:9999;pointer-events:none;display:none;'
-        + 'background:rgba(17,24,39,.92);color:#fff;font:12px/1.5 system-ui,sans-serif;'
-        + 'padding:6px 8px;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.25);white-space:nowrap';
-      document.body.appendChild(t);
-    }
-    return t;
-  }
-
-  /* A line chart is a polyline over a scaled array; a charting library would be
-   * a lot of bytes for that. */
-  function draw(id, series, pts, unit) {
-    var c = panel.querySelector('#' + id);
-    if (!c) { return; }
-    var dpr = window.devicePixelRatio || 1;
-    var w = c.clientWidth, h = c.clientHeight;
-    c.width = w * dpr; c.height = h * dpr;
-    var g = c.getContext('2d');
-
-    var max = 1;
-    series.forEach(function (s) {
-      s.values.forEach(function (v) { if (v > max) { max = v; } });
-    });
-
-    // Redraws the whole chart; `hover` >= 0 overlays a guide line and a dot on
-    // each series at that sample, so the tooltip has a visible anchor.
-    function render(hover) {
-      g.setTransform(dpr, 0, 0, dpr, 0, 0);
-      g.clearRect(0, 0, w, h);
-      g.strokeStyle = '#eef0f3';
-      g.lineWidth = 1;
-      for (var i = 1; i < 4; i++) {
-        var gy = Math.round(h * i / 4) + .5;
-        g.beginPath(); g.moveTo(0, gy); g.lineTo(w, gy); g.stroke();
-      }
-      series.forEach(function (s) {
-        var n = s.values.length;
-        if (n < 2) { return; }
-        g.beginPath();
-        for (var i = 0; i < n; i++) {
-          var x = w * i / (n - 1);
-          var y = h - (h - 4) * (s.values[i] / max);
-          if (i === 0) { g.moveTo(x, y); } else { g.lineTo(x, y); }
-        }
-        g.strokeStyle = s.color;
-        g.lineWidth = 1.5;
-        g.stroke();
-      });
-      var nn = series[0] ? series[0].values.length : 0;
-      if (hover >= 0 && nn >= 2) {
-        var hx = w * hover / (nn - 1);
-        g.strokeStyle = '#94a3b8';
-        g.lineWidth = 1;
-        g.beginPath(); g.moveTo(hx + .5, 0); g.lineTo(hx + .5, h); g.stroke();
-        series.forEach(function (s) {
-          var y = h - (h - 4) * (s.values[hover] / max);
-          g.fillStyle = s.color;
-          g.beginPath(); g.arc(hx, y, 3, 0, Math.PI * 2); g.fill();
-        });
-      }
-    }
-    render(-1);
-
-    c._render = render;
-    c._series = series;
-    c._pts = pts;
-    c._unit = unit || '';
-    if (!c._tipBound) {
-      c._tipBound = true;
-      c.addEventListener('mousemove', function (ev) {
-        var sv = c._series;
-        if (!sv || !sv[0] || sv[0].values.length < 2) { return; }
-        var rect = c.getBoundingClientRect();
-        var n = sv[0].values.length;
-        var idx = Math.round((ev.clientX - rect.left) / rect.width * (n - 1));
-        if (idx < 0) { idx = 0; }
-        if (idx > n - 1) { idx = n - 1; }
-        c._render(idx);
-        var sp = c._pts, un = c._unit;
-        // A live sample counts seconds back from now; a day bucket carries the
-        // clock time it stands for.
-        var when = (sp && sp[idx] && sp[idx].label) ? sp[idx].label
-          : ((sp && sp[idx] && typeof sp[idx].t === 'number')
-              ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '');
-        var html = when ? '<b>' + when + '</b>' : '';
-        sv.forEach(function (s) {
-          html += '<div><i class="tipdot" data-c="' + s.color + '"></i>'
-            + esc(s.label || '') + ' ' + s.values[idx] + un + '</div>';
-        });
-        var tip = monTip();
-        tip.innerHTML = html;
-        /* CSP：色点颜色走 CSSOM（innerHTML 注入的 style 属性会被 style-src 拦） */
-        var dots = tip.querySelectorAll('.tipdot');
-        for (var di = 0; di < dots.length; di++) {
-          dots[di].style.background = dots[di].getAttribute('data-c');
-        }
-        tip.style.display = 'block';
-        tip.style.left = (ev.clientX + 12) + 'px';
-        tip.style.top = (ev.clientY + 12) + 'px';
-      });
-      c.addEventListener('mouseleave', function () {
-        c._render(-1);
-        var tip = document.getElementById('mon-tip');
-        if (tip) { tip.style.display = 'none'; }
-      });
-    }
-
-    var label = panel.querySelector('[data-max="' + id + '"]');
-    if (label) { label.textContent = '峰值 ' + max; }
-  }
-
-
-  // A template cannot write `selected` on the right <option>, so a select that
-  // carries its current value in data-value applies it after the fragment is
-  // in the DOM. Same for the code preview's tabs, which are markup only.
-  function applyFragmentWidgets(root) {
-    var sels = root.querySelectorAll('select[data-value]');
-    for (var i = 0; i < sels.length; i++) {
-      var v = sels[i].getAttribute('data-value');
-      if (v) { sels[i].value = v; }
-    }
-    var tabs = root.querySelectorAll('[data-code]');
-    for (var t = 0; t < tabs.length; t++) {
-      tabs[t].addEventListener('click', function () {
-        var box = this.closest('.code-preview');
-        var name = this.getAttribute('data-code');
-        var all = box.querySelectorAll('[data-code]');
-        for (var k = 0; k < all.length; k++) { all[k].classList.remove('on'); }
-        this.classList.add('on');
-        var bodies = box.querySelectorAll('[data-code-body]');
-        for (var b = 0; b < bodies.length; b++) {
-          bodies[b].classList.toggle('open',
-            bodies[b].getAttribute('data-code-body') === name);
-        }
-      });
-    }
-  }
-  window.applyFragmentWidgets = applyFragmentWidgets;
 
   // ---- wiring -------------------------------------------------------------
 
   document.addEventListener('click', function (ev) {
     hideTabMenu();
-    // A link inside a URL-loaded dialog navigates that dialog, not the page:
-    // pager / filter / drill-down links keep their window and never touch the
-    // tab strip or the panel underneath.
     var top = Layer.topUrl();
     var inBox = top && top.body.contains(ev.target);
     var a = ev.target.closest('[data-tab]');
     if (a && !inBox) {
       ev.preventDefault();
-      open(a.getAttribute('href'), a.getAttribute('data-title') || a.textContent.trim());
+      open(a.getAttribute('href'), a.getAttribute('data-title') || a.textContent.trim(), { fromTabLink: true });
       document.body.classList.remove('side-open');
       return;
     }
@@ -1213,12 +1295,24 @@
       open(path, l.getAttribute('data-title') || l.textContent.trim());
       return;
     }
+    var preview = ev.target.closest('[data-sql-preview], [data-text-preview]');
+    if (preview) {
+      ev.preventDefault();
+      var text = preview.getAttribute('data-sql-preview') ||
+                 preview.getAttribute('data-text-preview') || '';
+      var content = '<div class="text-preview"><pre class="sql-detail-code mono">' +
+                    esc(text) + '</pre><p class="hint">内容仅来自当前已脱敏的监控快照，不含请求参数。</p></div>';
+      Layer.open({ title: preview.hasAttribute('data-text-preview') ? '错误详情' : 'SQL 模板详情',
+                   content: content, wide: true });
+      return;
+    }
     var d = ev.target.closest('[data-dialog]');
     if (d) {
       ev.preventDefault();
       dialog(d.getAttribute('href') || d.getAttribute('data-dialog'),
              d.hasAttribute('data-wide'),
-             d.getAttribute('data-title') || d.textContent.trim());
+             d.getAttribute('data-title') || d.textContent.trim(),
+             d.getAttribute('data-width'));
       return;
     }
     var dr = ev.target.closest('[data-drawer]');
@@ -1229,8 +1323,37 @@
                      width: dr.getAttribute('data-width') || '420px' });
       return;
     }
-    // Exports download in place: confirm (if asked), fetch to a blob so the
-    // SPA shell never navigates away, then toast. No new tab, no reload.
+    var ft = ev.target.closest('.form-tab');
+    if (ft) {
+      ev.preventDefault();
+      var fbox = ft.closest('form');
+      if (fbox) {
+        var ftabs = fbox.querySelectorAll('.form-tab');
+        for (var fi = 0; fi < ftabs.length; fi++) {
+          ftabs[fi].classList.toggle('active', ftabs[fi] === ft);
+        }
+        var fpanes = fbox.querySelectorAll('.form-pane');
+        for (var fp = 0; fp < fpanes.length; fp++) {
+          fpanes[fp].classList.toggle('active',
+            fpanes[fp].getAttribute('data-pane') === ft.getAttribute('data-pane'));
+        }
+      }
+      return;
+    }
+    var gt = ev.target.closest('.gen-tab');
+    if (gt) {
+      ev.preventDefault();
+      var bar = gt.closest('.gen-tabbar');
+      var col = bar ? bar.getAttribute('data-tab-col') : '';
+      if (col) {
+        var u = new URL(state.active || location.href, location.origin);
+        var val = gt.getAttribute('data-tab-val') || '';
+        if (val) { u.searchParams.set(col, val); } else { u.searchParams.delete(col); }
+        u.searchParams.delete('page');
+        open(u.pathname + (u.search ? u.search : ''), gt.textContent.trim());
+      }
+      return;
+    }
     var x = ev.target.closest('[data-export]');
     if (x) {
       ev.preventDefault();
@@ -1259,16 +1382,88 @@
           .catch(function () { toast('导出失败', 'bad'); });
       };
       var exportConfirm = x.getAttribute('data-confirm');
-      if (exportConfirm) { Layer.confirm(exportConfirm, runExport); } else { runExport(); }
+      if (exportConfirm) {
+        Layer.confirm(exportConfirm, runExport, '确认', { danger: isDangerConfirm(x, exportConfirm) });
+      } else { runExport(); }
+      return;
+    }
+    var up = ev.target.closest('[data-upload]');
+    if (up) {
+      ev.preventDefault();
+      var pick = document.createElement('input');
+      pick.type = 'file';
+      pick.hidden = true;
+      document.body.appendChild(pick);
+      pick.addEventListener('change', function () {
+        var f = pick.files && pick.files[0];
+        pick.remove();
+        if (!f) { return; }
+        fetch(up.getAttribute('data-upload') + '?name=' + encodeURIComponent(f.name), {
+          method: 'POST',
+          credentials: 'same-origin',
+          body: f
+        }).then(function (r) {
+          if (r.status === 401) { location.href = '/admin/login'; return null; }
+          return r.json();
+        }).then(function (j) {
+          if (!j) { return; }
+          var okFlag = j.code === '0000';
+          toast(j.msg || (okFlag ? '已上传' : '上传失败'), okFlag ? 'ok' : 'bad');
+          if (okFlag) { reload(true); }
+        }).catch(function () { toast('上传失败', 'bad'); });
+      });
+      pick.click();
+      return;
+    }
+    var bt = ev.target.closest('[data-batch]');
+    if (bt) {
+      ev.preventDefault();
+      var scope = bt.closest('.card') || document;
+      var ids = [];
+      var checked = scope.querySelectorAll('tr[data-id] td.zt-cell input[type="checkbox"]');
+      for (var bi = 0; bi < checked.length; bi++) {
+        if (checked[bi].checked) {
+          var tr = checked[bi].closest('tr[data-id]');
+          if (tr) { ids.push(tr.getAttribute('data-id')); }
+        }
+      }
+      if (!ids.length) { toast('请先选择数据', 'bad'); return; }
+      var runBatch = function () {
+        var args = 'ids=' + encodeURIComponent(ids.join(','));
+        var val = bt.getAttribute('data-value');
+        if (val !== null && val !== '') { args += '&value=' + encodeURIComponent(val); }
+        post(bt.getAttribute('data-batch'), args)
+          .then(function (j) {
+            if (!j) { return; }
+            toast(j.msg || '完成', j.code === '0000' ? 'ok' : 'bad');
+            if (j.code !== '0000') { return; }
+            closeDialog();
+            reload(true);
+          })
+          .catch(function (e) { toast(e && e.message ? e.message : '请求失败', 'bad'); });
+      };
+      var batchConfirm = bt.getAttribute('data-confirm');
+      if (batchConfirm) {
+        Layer.confirm(batchConfirm, runBatch, '确认', { danger: isDangerConfirm(bt, batchConfirm) });
+      } else { runBatch(); }
+      return;
+    }
+    var pc = ev.target.closest('[data-pick-clear]');
+    if (pc) {
+      ev.preventDefault();
+      var wrap = pc.closest('.pick');
+      if (wrap) {
+        var hid = wrap.querySelector('input[type="hidden"]');
+        var txt = wrap.querySelector('input[type="search"]');
+        if (hid) { hid.value = ''; }
+        if (txt) { txt.value = ''; txt.focus(); }
+      }
       return;
     }
     var p = ev.target.closest('[data-post]');
     if (p) {
       ev.preventDefault();
       var run = function () {
-        // The confirm layer is the top window; remember how many URL dialogs
-        // were beneath it. After the write those are the lists to refresh --
-        // none of them should be closed, whatever kind of write this was.
         var overDialog = Layer.topUrl() != null;
         post(p.getAttribute('data-post'), p.getAttribute('data-args') || '')
           .then(function (j) {
@@ -1279,10 +1474,12 @@
             closeDialog();
             reload(true);
           })
-          .catch(function () { toast('请求失败', 'bad'); });
+          .catch(function (e) { toast(e && e.message ? e.message : '请求失败', 'bad'); });
       };
       var confirmText = p.getAttribute('data-confirm');
-      if (confirmText) { Layer.confirm(confirmText, run); } else { run(); }
+      if (confirmText) {
+        Layer.confirm(confirmText, run, '确认', { danger: isDangerConfirm(p, confirmText) });
+      } else { run(); }
       return;
     }
     var nav = ev.target.closest('[data-tabnav]');
@@ -1292,9 +1489,19 @@
       tabs.scrollLeft = tabs.scrollLeft + dir * Math.max(120, tabs.clientWidth * 0.7);
       return;
     }
-    if (ev.target.closest('[data-close]')) { ev.preventDefault(); closeDialog(); }
-    if (ev.target.closest('[data-refresh]')) { ev.preventDefault(); reload(); }
-    // On a phone the sidebar is a drawer; anywhere else this button is hidden.
+    if (ev.target.closest('[data-close]')) { ev.preventDefault(); requestCloseDialog(); }
+    if (ev.target.closest('[data-refresh]')) {
+      ev.preventDefault();
+      var dirtyRefresh = activePane ? hasPaneDirty(activePane) : (panel && hasDirtyForm(panel));
+      if (dirtyRefresh) {
+        Layer.confirm('当前页面有未保存的表单修改，确定刷新并丢弃吗？', function () {
+          clearDirtyForms(panelEl());
+          reload();
+        }, '未保存修改', { danger: true, okText: '确认刷新' });
+      } else {
+        reload();
+      }
+    }
     if (ev.target.closest('[data-side]')) {
       ev.preventDefault();
       document.body.classList.toggle('side-open');
@@ -1309,9 +1516,6 @@
   document.addEventListener('submit', function (ev) {
     var search = ev.target.closest('[data-search]');
     if (search) {
-      // A filter bar is a GET: it changes which rows the panel shows, so it
-      // reloads its surface in place -- the dialog it lives in, else the
-      // panel (the tab stays where it is either way).
       ev.preventDefault();
       var parts = [];
       new FormData(search).forEach(function (v, k) {
@@ -1339,7 +1543,6 @@
     submit(form);
   });
 
-  // A tip is markup, not a component: data-tip on anything shows a bubble.
   document.addEventListener('mouseover', function (ev) {
     var a = ev.target.closest('[data-tip]');
     if (a) { Layer.tip(a, a.getAttribute('data-tip')); }
@@ -1348,8 +1551,6 @@
     if (ev.target.closest('[data-tip]')) { Layer.untip(); }
   });
 
-  // An image URL clicked with data-img opens the photo viewer; plain links
-  // and buttons carry it, so views decide per-element which images preview.
   document.addEventListener('click', function (ev) {
     var im = ev.target.closest('[data-img]');
     if (!im) { return; }
@@ -1357,37 +1558,83 @@
     Layer.img(im.getAttribute('data-img'), im.getAttribute('data-title'));
   });
 
+  function markDirtyEvent(ev) {
+    var t = ev.target;
+    if (!t || (t.getAttribute && t.getAttribute('data-quick-field'))) { return; }
+    var form = t.closest ? t.closest('form[data-submit]') : null;
+    if (form) {
+      form.setAttribute('data-dirty', '1');
+      paintTabDirty();
+    }
+  }
+  document.addEventListener('input', markDirtyEvent);
+  document.addEventListener('change', markDirtyEvent);
+
   document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Escape') { Layer.untip(); hideTabMenu(); Layer.closeTop(); }
+    if (ev.key === 'Tab') {
+      var cmdk = document.querySelector('.cmdk-mask');
+      if (cmdk) { trapFocus(cmdk, ev); return; }
+      var top = Layer.topBox();
+      if (top) { trapFocus(top, ev); }
+      return;
+    }
+    if (ev.key === 'Escape') {
+      if (window._closeCmdK && window._closeCmdK()) { return; }
+      Layer.untip(); hideTabMenu(); Layer.requestCloseTop();
+    }
   });
 
-  document.addEventListener('DOMContentLoaded', function () {
-    panel = el('ad-panel');
-    tabs = el('ad-tabs');
-    toasts = el('ad-toasts');
-    restore();
-    var here = normalize(location.pathname + location.search + location.hash);
-    rememberPane(location.pathname + location.search + location.hash);
-    var title = document.body.getAttribute('data-tab-title') || here;
-    if (find(here) < 0) { state.tabs.push({ path: here, title: title }); }
-    state.active = here;
-    history.replaceState({ path: here }, '', here);
-    paint();
-    window.addEventListener('resize', paintTabNav);
-    // A wheel over the strip pages it sideways, like a browser's tab bar.
-    tabs.addEventListener('wheel', function (ev) {
-      if (tabs.scrollWidth <= tabs.clientWidth) { return; }
-      ev.preventDefault();
-      tabs.scrollLeft = tabs.scrollLeft + (ev.deltaY || ev.deltaX);
-    }, { passive: false });
-    // The first screen is already in the panel, server-rendered.
-    startStream();
-    wireModelPick(panel);
-    window.addEventListener('popstate', restoreHistory);
-  });
+  // ---- sidebar icons -------------------------------------------------------
+  var ICONS = {
+    'mdi:account': '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+    'mdi:account-circle': '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.66V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.66"/>',
+    'mdi:alert-circle-outline': '<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',
+    'mdi:antenna': '<path d="M2 12 7 2"/><path d="m7 12 5-10"/><path d="m12 12 5-10"/><path d="m17 12 5-10"/><path d="M4.5 7h15"/><path d="M12 16v6"/>',
+    'mdi:menu': '<line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/>',
+    'mdi:package-variant': '<path d="m12 2 9 5v10l-9 5-9-5V7l9-5Z"/><path d="m3 7 9 5 9-5"/><path d="M12 12v10"/>',
+    'mdi:store': '<path d="M3 9h18l-1.5-4.5h-15L3 9Z"/><path d="M4 9v11h16V9"/><path d="M9 20v-6h6v6"/>',
+    'mdi:api': '<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>',
+    'mdi:book-multiple': '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
+    'mdi:book-open': '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
+    'mdi:chart-line': '<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
+    'mdi:chart-bar': '<line x1="6" x2="6" y1="20" y2="14"/><line x1="12" x2="12" y1="20" y2="8"/><line x1="18" x2="18" y1="20" y2="4"/>',
+    'mdi:chart-timeline-variant': '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    'mdi:clock-outline': '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    'mdi:cog': '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+    'mdi:comment-multiple': '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    'mdi:database-search': '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
+    'mdi:file-document': '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+    'mdi:gauge': '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+    'mdi:history': '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+    'mdi:image-area': '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+    'mdi:login': '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+    'mdi:memory': '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/>',
+    'mdi:shield-account': '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+    'mdi:sitemap': '<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',
+    'mdi:table-cog': '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>',
+    'mdi:table': '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M12 3v18"/>',
+    'mdi:tag': '<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/>',
+    'mdi:web': '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
+    '_': '<circle cx="12" cy="12" r="3.5"/>'
+  };
 
+  function renderIcons(root) {
+    var nodes = (root || document).querySelectorAll('[data-icon]');
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (node.querySelector('.mi-ic')) { continue; }
+      var body = ICONS[node.getAttribute('data-icon')] || ICONS['_'];
+      var ic = document.createElement('span');
+      ic.className = 'mi-ic';
+      ic.setAttribute('aria-hidden', 'true');
+      ic.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"'
+        + ' stroke="currentColor" stroke-width="2" stroke-linecap="round"'
+        + ' stroke-linejoin="round">' + body + '</svg>';
+      node.insertBefore(ic, node.firstChild);
+    }
+  }
 
-  // Account menu in the top-right corner.
+  // ---- account menu --------------------------------------------------------
   (function account() {
     var box = document.querySelector('[data-account]');
     if (!box) { return; }
@@ -1402,9 +1649,6 @@
     });
   })();
 
-  // Ctrl+K filters the sidebar. Chinese entries also match their pinyin
-  // initials ("wzgl" -> 文章管理): the first letter of a han character is
-  // found by collating it against the 26 boundary characters of the zh-CN
   // ---- collapsible sidebar menu groups -------------------------------------
   (function sideMenuGroups() {
     var side = document.querySelector('.ad-side');
@@ -1447,6 +1691,7 @@
     function applyState(info) {
       var isCollapsed = !!savedCollapsed[info.name];
       info.el.classList.toggle('collapsed', isCollapsed);
+      info.el.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
       for (var i = 0; i < info.items.length; i++) {
         info.items[i].classList.toggle('collapsed-by-group', isCollapsed);
       }
@@ -1454,17 +1699,14 @@
 
     function findActiveGroup() {
       for (var i = 0; i < groupList.length; i++) {
-        var hasActive = groupList[i].items.some(function (el) {
-          return el.classList.contains('active');
+        var hasActive = groupList[i].items.some(function (item) {
+          return item.classList.contains('active');
         });
         if (hasActive) { return groupList[i]; }
       }
       return null;
     }
 
-    // Default strategy on first open (when user has not customized collapse state):
-    // If there are more than 2 groups, collapse all except the active group (or first group)
-    // to prevent an overwhelmingly long menu.
     var activeGrp = findActiveGroup();
     if (!hasSaved && groupList.length > 2) {
       var defaultOpen = activeGrp || groupList[0];
@@ -1514,18 +1756,19 @@
     };
   })();
 
-  // order, which needs no lookup table.
+  // ---- Ctrl+K sidebar filter & command palette -----------------------------
   (function menuFilter() {
     var box = document.getElementById('ad-find');
     if (!box) { return; }
-    var kbd = document.querySelector('.ad-find-kbd');
-    if (kbd && /Mac|iPod|iPhone|iPad/.test(navigator.platform || '')) {
-      kbd.textContent = '⌘K';
-    }
     var side = document.querySelector('.ad-side');
     var bounds = '阿八嚓咑妸发旮铪丌咔垃妈拏噢妑七呥仨他屲夕丫帀';
     var letters = 'abcdefghjklmnopqrstwxyz';
     var cache = {};
+
+    var kbd = document.querySelector('.ad-find-kbd');
+    if (kbd && /Mac|iPod|iPhone|iPad/.test(navigator.platform || '')) {
+      kbd.textContent = '⌘K';
+    }
 
     function initial(ch) {
       if (cache[ch] !== undefined) { return cache[ch]; }
@@ -1548,21 +1791,21 @@
 
     function apply() {
       var q = box.value.trim().toLowerCase();
-      side.classList.toggle('filtering', !!q);
+      if (side) { side.classList.toggle('filtering', !!q); }
       var items = side.querySelectorAll('a.mi');
       var first = null;
       for (var i = 0; i < items.length; i++) {
-        var el = items[i];
-        var text = el.textContent.trim();
+        var item = items[i];
+        var text = item.textContent.trim();
         var hit = !q || text.toLowerCase().indexOf(q) >= 0 || initials(text).indexOf(q) >= 0;
-        el.classList.toggle('filtered', !hit);
-        if (hit && !first) { first = el; }
+        item.classList.toggle('filtered', !hit);
+        if (hit && !first) { first = item; }
       }
       var groups = side.querySelectorAll('.ad-group');
       for (var g = 0; g < groups.length; g++) {
         var any = false;
         var n = groups[g].nextElementSibling;
-        while (n && !n.classList.contains('ad-group')) {
+        while (n && !n.classList.contains('ad-group') && !n.classList.contains('ad-foot')) {
           if (n.classList.contains('mi') && !n.classList.contains('filtered')) { any = true; }
           n = n.nextElementSibling;
         }
@@ -1579,477 +1822,342 @@
         if (first) { first.click(); }
       }
     });
+
+    var cmdkMask = null;
+    var cmdkOpener = null;
+    function collectCommands() {
+      var list = [];
+      var links = side ? side.querySelectorAll('a.mi[href]') : [];
+      var group = '';
+      var nodes = side ? side.children : [];
+      for (var i = 0; i < nodes.length; i++) {
+        var nd = nodes[i];
+        if (nd.classList.contains('ad-group')) { group = nd.textContent.trim(); continue; }
+        if (nd.matches && nd.matches('a.mi[href]')) {
+          var title = (nd.getAttribute('data-title') || nd.textContent || '').trim();
+          var href = nd.getAttribute('href') || '';
+          var icon = nd.getAttribute('data-icon') || '_';
+          list.push({
+            title: title,
+            meta: group || href,
+            icon: icon,
+            search: (title + ' ' + initials(title) + ' ' + group + ' ' + href).toLowerCase(),
+            run: (function (link) { return function () { link.click(); }; })(nd)
+          });
+        }
+      }
+      if (!list.length && links.length) {
+        for (var j = 0; j < links.length; j++) {
+          var lk = links[j];
+          var t = (lk.getAttribute('data-title') || lk.textContent || '').trim();
+          list.push({
+            title: t,
+            meta: lk.getAttribute('href') || '',
+            icon: lk.getAttribute('data-icon') || '_',
+            search: (t + ' ' + initials(t)).toLowerCase(),
+            run: (function (link) { return function () { link.click(); }; })(lk)
+          });
+        }
+      }
+      list.push({
+        title: '刷新当前页面',
+        meta: '操作',
+        icon: 'mdi:history',
+        search: '刷新 reload refresh sx',
+        run: function () { reload(); }
+      });
+      var themeBtn = document.querySelector('[data-theme-toggle]');
+      if (themeBtn) {
+        list.push({
+          title: '切换深浅色主题',
+          meta: '外观',
+          icon: 'mdi:cog',
+          search: '主题 深色 浅色 theme dark light zt',
+          run: function () { themeBtn.click(); }
+        });
+      }
+      var densityBtn = document.querySelector('[data-density-toggle]');
+      if (densityBtn) {
+        list.push({
+          title: '切换界面密度（紧凑/舒适）',
+          meta: '外观',
+          icon: 'mdi:table',
+          search: '密度 紧凑 舒适 density compact comfortable md',
+          run: function () { densityBtn.click(); }
+        });
+      }
+      for (var p = 0; p < commandProviders.length; p++) {
+        try {
+          var extra = commandProviders[p]();
+          if (Array.isArray(extra)) {
+            for (var k = 0; k < extra.length; k++) { list.push(extra[k]); }
+          }
+        } catch (e) { /* isolate plugin errors */ }
+      }
+      return list;
+    }
+
+    function closeCmdK() {
+      if (!cmdkMask) { return false; }
+      cmdkMask.remove();
+      cmdkMask = null;
+      if (cmdkOpener && cmdkOpener.isConnected && cmdkOpener.focus) {
+        try { cmdkOpener.focus(); } catch (e) {}
+      }
+      cmdkOpener = null;
+      return true;
+    }
+    window._closeCmdK = closeCmdK;
+
+    function openCmdK() {
+      if (cmdkMask) {
+        var inp0 = cmdkMask.querySelector('.cmdk-input');
+        if (inp0) { inp0.focus(); inp0.select(); }
+        return;
+      }
+      cmdkOpener = document.activeElement;
+      var all = collectCommands();
+      var activeIdx = 0;
+      var shown = all.slice(0, 12);
+
+      var mask = document.createElement('div');
+      mask.className = 'cmdk-mask';
+      mask.setAttribute('role', 'dialog');
+      mask.setAttribute('aria-modal', 'true');
+      mask.setAttribute('aria-label', '快速跳转与命令面板');
+
+      var modal = document.createElement('div');
+      modal.className = 'cmdk-box';
+
+      var head = document.createElement('div');
+      head.className = 'cmdk-head';
+      var inp = document.createElement('input');
+      inp.type = 'search';
+      inp.className = 'cmdk-input';
+      inp.placeholder = '搜索菜单、拼音首字母（如 cdgl）或快捷命令…';
+      inp.autocomplete = 'off';
+      var escKbd = document.createElement('span');
+      escKbd.className = 'cmdk-kbd';
+      escKbd.textContent = 'ESC';
+      head.appendChild(inp);
+      head.appendChild(escKbd);
+
+      var listEl = document.createElement('div');
+      listEl.className = 'cmdk-list';
+
+      var foot = document.createElement('div');
+      foot.className = 'cmdk-foot';
+      foot.innerHTML = '<span>↑↓ 选择</span><span>↵ 执行</span><span>Esc 关闭</span>';
+
+      modal.appendChild(head);
+      modal.appendChild(listEl);
+      modal.appendChild(foot);
+      mask.appendChild(modal);
+      document.body.appendChild(mask);
+      cmdkMask = mask;
+
+      function paintList() {
+        listEl.innerHTML = '';
+        if (!shown.length) {
+          var emp = document.createElement('div');
+          emp.className = 'cmdk-empty';
+          emp.textContent = '没有匹配的页面或命令';
+          listEl.appendChild(emp);
+          return;
+        }
+        if (activeIdx >= shown.length) { activeIdx = 0; }
+        if (activeIdx < 0) { activeIdx = shown.length - 1; }
+        for (var i = 0; i < shown.length; i++) {
+          (function (it, idx) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'cmdk-item' + (idx === activeIdx ? ' active' : '');
+            var ic = document.createElement('span');
+            ic.className = 'mi-ic';
+            ic.setAttribute('aria-hidden', 'true');
+            ic.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none"'
+              + ' stroke="currentColor" stroke-width="2" stroke-linecap="round"'
+              + ' stroke-linejoin="round">' + (ICONS[it.icon] || ICONS['_']) + '</svg>';
+            var ttl = document.createElement('span');
+            ttl.className = 'cmdk-item-title';
+            ttl.textContent = it.title;
+            var meta = document.createElement('span');
+            meta.className = 'cmdk-item-meta';
+            meta.textContent = it.meta || '';
+            btn.appendChild(ic);
+            btn.appendChild(ttl);
+            btn.appendChild(meta);
+            btn.addEventListener('mouseenter', function () {
+              activeIdx = idx;
+              var cur = listEl.querySelector('.cmdk-item.active');
+              if (cur) { cur.classList.remove('active'); }
+              btn.classList.add('active');
+            });
+            btn.addEventListener('click', function () {
+              closeCmdK();
+              it.run();
+            });
+            listEl.appendChild(btn);
+          })(shown[i], i);
+        }
+        var actEl = listEl.querySelector('.cmdk-item.active');
+        if (actEl && actEl.scrollIntoView) { actEl.scrollIntoView({ block: 'nearest' }); }
+      }
+
+      inp.addEventListener('input', function () {
+        var q = inp.value.trim().toLowerCase();
+        shown = !q ? all.slice(0, 12) : all.filter(function (it) {
+          return (it.search || '').indexOf(q) >= 0;
+        }).slice(0, 20);
+        activeIdx = 0;
+        paintList();
+      });
+
+      inp.addEventListener('keydown', function (ev) {
+        if (ev.key === 'ArrowDown') {
+          ev.preventDefault();
+          if (shown.length) { activeIdx = (activeIdx + 1) % shown.length; paintList(); }
+        } else if (ev.key === 'ArrowUp') {
+          ev.preventDefault();
+          if (shown.length) { activeIdx = (activeIdx - 1 + shown.length) % shown.length; paintList(); }
+        } else if (ev.key === 'Enter') {
+          ev.preventDefault();
+          if (shown[activeIdx]) {
+            var target = shown[activeIdx];
+            closeCmdK();
+            target.run();
+          }
+        }
+      });
+
+      mask.addEventListener('click', function (ev) {
+        if (ev.target === mask) { closeCmdK(); }
+      });
+
+      paintList();
+      inp.focus();
+    }
+
+    if (kbd) {
+      kbd.title = '打开命令面板';
+      kbd.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openCmdK();
+      });
+    }
+
     document.addEventListener('keydown', function (ev) {
       if ((ev.ctrlKey || ev.metaKey) && (ev.key === 'k' || ev.key === 'K')) {
         ev.preventDefault();
-        document.body.classList.add('side-open');
-        box.focus();
-        box.select();
+        openCmdK();
       }
     });
   })();
 
-
-  // Settings screen: one pane per group, the SMTP test button and the AI
-  // presets. The screen arrives as a fragment, so every handler is delegated
-  // from the document instead of bound to the elements at load time.
-  document.addEventListener('click', function (ev) {
-    var paneBtn = ev.target.closest('[data-setting-tabs] [data-pane]');
-    if (paneBtn) {
-      var name = paneBtn.getAttribute('data-pane');
-      paneMemo[base(state.active)] = name;
-      var tabs = paneBtn.closest('[data-setting-tabs]');
-      var all = tabs.querySelectorAll('[data-pane]');
-      for (var i = 0; i < all.length; i++) { all[i].classList.toggle('on', all[i] === paneBtn); }
-      var panes = document.querySelectorAll('[data-pane-body]');
-      for (var p = 0; p < panes.length; p++) {
-        panes[p].classList.toggle('open', panes[p].getAttribute('data-pane-body') === name);
-      }
-      // Cards that belong to one group only (the AI presets) follow the pane.
-      var extras = document.querySelectorAll('[data-pane-extra]');
-      for (var e = 0; e < extras.length; e++) {
-        extras[e].hidden = extras[e].getAttribute('data-pane-extra') !== name;
-      }
-      return;
-    }
-
-    // A preset fills the two fields that differ between providers and moves
-    // the form to the AI pane; the key is still typed by hand.
-    var preset = ev.target.closest('[data-preset]');
-    if (preset) {
-      var set = function (n, v) {
-        var f = document.querySelector('[name="' + n + '"]');
-        if (f) { f.value = v; }
-      };
-      set('ai.provider', preset.getAttribute('data-preset'));
-      set('ai.baseUrl', preset.getAttribute('data-url'));
-      set('ai.model', preset.getAttribute('data-model'));
-      var aiTab = document.querySelector('[data-setting-tabs] [data-pane="AI 助手"]');
-      if (aiTab) { aiTab.click(); }
-      var key = document.querySelector('[name="ai.apiKey"]');
-      if (key) { key.focus(); }
-      Layer.msg('已填入 ' + preset.parentNode.parentNode.querySelector('.vendor-name').textContent);
-      return;
-    }
-
-    var test = ev.target.closest('[data-mail-test]');
-    if (test) {
-      var to = document.getElementById('mail-to');
-      if (!to || !to.value) { if (to) { to.focus(); } return; }
-      test.disabled = true;
-      fetch('/admin/system/settings/mailtest', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ to: to.value }).toString()
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        if (j && j.code === '0000') { Layer.msg(j.msg || '测试邮件已发送'); }
-        else { Layer.notify('发送失败', (j && j.msg) || '请检查邮件配置', 'bad'); }
-      }).catch(function () {
-        Layer.notify('发送失败', '请求未完成', 'bad');
-      }).then(function () { test.disabled = false; });
-    }
-  });
-
-  // ---- assistant ----------------------------------------------------------
-
-  // A docked chat, WeChat-style: the agents down the left, one conversation per
-  // agent on the right. The corner button toggles it; closing only hides it, so
-  // the threads, the open agent and the scroll position all survive until the
-  // page itself is left. Each agent keeps its own thread in localStorage and the
-  // whole thread is sent back on every turn, so the model has the conversation
-  // and not just the last line. An unconfigured assistant offers to open the
-  // settings screen rather than a chat that could not answer.
-  (function assistant() {
-    var STORE = 'zanweb.ai';
-    var state = { ready: false, agents: [], agent: '', dock: null, built: false };
-    var mem = load();
-
-    function load() {
-      try {
-        var raw = localStorage.getItem(STORE);
-        if (raw) { return JSON.parse(raw); }
-      } catch (e) { /* private mode: the thread just does not persist */ }
-      return { agent: '', sessions: {} };
-    }
-    function persist() {
-      try { localStorage.setItem(STORE, JSON.stringify(mem)); } catch (e) {}
-    }
-    function thread(code) {
-      if (!mem.sessions[code]) { mem.sessions[code] = []; }
-      return mem.sessions[code];
-    }
-    function agentOf(code) {
-      for (var i = 0; i < state.agents.length; i++) {
-        if (state.agents[i].code === code) { return state.agents[i]; }
-      }
-      return state.agents[0] || null;
-    }
-
-    // The one and only <style> and dock, injected once so nothing here depends
-    // on admin.css.
-    function styles() {
-      if (document.getElementById('ai-dock-css')) { return; }
-      var s = document.createElement('style');
-      s.id = 'ai-dock-css';
-      s.textContent =
-        '.ai-dock{position:fixed;right:20px;bottom:84px;width:720px;max-width:calc(100vw - 40px);'
-        + 'height:520px;max-height:calc(100vh - 120px);display:none;flex-direction:column;'
-        + 'background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.22);'
-        + 'z-index:1200;overflow:hidden}'
-        + '.ai-dock.on{display:flex}'
-        + '.ai-dock-top{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #eee;background:#f7f8fa}'
-        + '.ai-dock-top b{font-size:14px}.ai-dock-top .sp{flex:1}'
-        + '.ai-dock-top button{border:0;background:transparent;cursor:pointer;font-size:16px;color:#6b7280;padding:2px 6px;border-radius:6px}'
-        + '.ai-dock-top button:hover{background:#eceef1;color:#111}'
-        + '.ai-dock-body{flex:1;display:flex;min-height:0}'
-        + '.ai-side{width:190px;border-right:1px solid #eee;overflow:auto;background:#fafbfc}'
-        + '.ai-agent{display:flex;flex-direction:column;gap:2px;padding:10px 12px;cursor:pointer;border-bottom:1px solid #f1f2f4}'
-        + '.ai-agent:hover{background:#f0f2f5}.ai-agent.on{background:#e7f0ff}'
-        + '.ai-agent .n{font-size:13px;font-weight:600;color:#1f2937}'
-        + '.ai-agent .h{font-size:11px;color:#8a94a6;line-height:1.4}'
-        + '.ai-main{flex:1;display:flex;flex-direction:column;min-width:0}'
-        + '.ai-log{flex:1;overflow:auto;padding:14px;background:#f2f3f5}'
-        + '.ai-row{display:flex;margin-bottom:12px}.ai-row.me{justify-content:flex-end}'
-        + '.ai-bubble{max-width:78%;padding:8px 11px;border-radius:10px;font-size:13px;line-height:1.55;'
-        + 'white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #e6e8eb;color:#1f2937}'
-        + '.ai-row.me .ai-bubble{background:#95ec69;border-color:#86df5c}'
-        + '.ai-bubble.bad{background:#fde8e8;border-color:#f5c2c2;color:#b42318}'
-        + '.ai-apply{margin-top:8px}'
-        + '.ai-apply button{border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:6px;'
-        + 'padding:4px 10px;font-size:12px;cursor:pointer}'
-        + '.ai-apply button:disabled{opacity:.6;cursor:default}'
-        + '.ai-send{display:flex;gap:8px;padding:10px;border-top:1px solid #eee;background:#fff}'
-        + '.ai-send textarea{flex:1;resize:none;border:1px solid #d7dbe0;border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit}'
-        + '.ai-send button{border:0;background:#2563eb;color:#fff;border-radius:8px;padding:0 16px;cursor:pointer;font-size:13px}'
-        + '.ai-empty{color:#9aa3b2;font-size:12px;text-align:center;margin-top:40px}';
-      document.head.appendChild(s);
-    }
-
-    function esc(t) {
-      return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-    // The first ```sql fenced block, or the first fenced block that looks like a
-    // CREATE TABLE -- the confirm button runs exactly this text.
-    function sqlOf(text) {
-      var m = /```sql\s*([\s\S]*?)```/i.exec(text);
-      if (m) { return m[1].trim(); }
-      m = /```\s*([\s\S]*?)```/i.exec(text);
-      if (m && /create\s+table/i.test(m[1])) { return m[1].trim(); }
-      return '';
-    }
-
-    function build() {
-      styles();
-      var dock = document.createElement('div');
-      dock.className = 'ai-dock';
-      dock.innerHTML =
-        '<div class="ai-dock-top"><b>AI 助手</b><span class="sp"></span>'
-        + '<button type="button" data-ai-clear title="清空当前会话">清空</button>'
-        + '<button type="button" data-ai-hide title="收起">—</button></div>'
-        + '<div class="ai-dock-body"><div class="ai-side" data-ai-side></div>'
-        + '<div class="ai-main"><div class="ai-log" data-ai-log></div>'
-        + '<div class="ai-send"><textarea rows="2" data-ai-input '
-        + 'placeholder="说说你要做什么，Enter 发送，Shift+Enter 换行"></textarea>'
-        + '<button type="button" data-ai-go>发送</button></div></div></div>';
-      document.body.appendChild(dock);
-      state.dock = dock;
-      state.built = true;
-
-      dock.querySelector('[data-ai-hide]').addEventListener('click', hide);
-      dock.querySelector('[data-ai-clear]').addEventListener('click', function () {
-        Layer.confirm('清空「' + (agentOf(state.agent) || {}).name + '」的对话记录？', function () {
-          mem.sessions[state.agent] = [];
-          persist();
-          renderLog();
-        });
-      });
-      var input = dock.querySelector('[data-ai-input]');
-      dock.querySelector('[data-ai-go]').addEventListener('click', send);
-      input.addEventListener('keydown', function (ev) {
-        if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); send(); }
-      });
-      dock.querySelector('[data-ai-side]').addEventListener('click', function (ev) {
-        var row = ev.target.closest('[data-agent]');
-        if (!row) { return; }
-        pick(row.getAttribute('data-agent'));
-      });
-      renderSide();
-      renderLog();
-    }
-
-    function renderSide() {
-      if (!state.dock) { return; }
-      var side = state.dock.querySelector('[data-ai-side]');
-      var h = '';
-      for (var i = 0; i < state.agents.length; i++) {
-        var a = state.agents[i];
-        h += '<div class="ai-agent' + (a.code === state.agent ? ' on' : '')
-          + '" data-agent="' + a.code + '"><span class="n">' + esc(a.name)
-          + '</span><span class="h">' + esc(a.hint) + '</span></div>';
-      }
-      side.innerHTML = h;
-    }
-
-    function renderLog() {
-      if (!state.dock) { return; }
-      var log = state.dock.querySelector('[data-ai-log]');
-      log.innerHTML = '';
-      var msgs = thread(state.agent);
-      if (!msgs.length) {
-        var a = agentOf(state.agent);
-        log.innerHTML = '<div class="ai-empty">' + esc(a ? a.hint : '开始对话') + '</div>';
+  // ---- expose ZanAdmin extension bus --------------------------------------
+  var ZanAdmin = {
+    Layer: Layer,
+    panel: panelEl,
+    panelHost: function () { return panelHost || el('ad-panel'); },
+    activePath: function () { return state.active; },
+    openTab: open,
+    navigate: function (path, title, anchor) {
+      var top = Layer.topUrl();
+      if (top && anchor && top.body.contains(anchor)) {
+        dialogLoad(top, path);
         return;
       }
-      for (var i = 0; i < msgs.length; i++) { paint(log, msgs[i]); }
-      log.scrollTop = log.scrollHeight;
-    }
+      open(path, title);
+    },
+    reload: reload,
+    post: post,
+    toast: toast,
+    base: base,
+    esc: esc,
+    getPaneMemo: function (basePath) { return paneMemo[basePath] || ''; },
+    setPaneMemo: function (basePath, name) { if (basePath && name) { paneMemo[basePath] = name; } },
+    onInit: function (fn) {
+      if (typeof fn !== 'function') { return; }
+      initHooks.push(fn);
+      if (initialized) { try { fn({ panel: panelEl(), shell: ZanAdmin }); } catch (e) {} }
+    },
+    onMount: function (fn) {
+      if (typeof fn !== 'function') { return; }
+      mountHooks.push(fn);
+    },
+    onUnmount: function (fn) {
+      if (typeof fn !== 'function') { return; }
+      unmountHooks.push(fn);
+    },
+    onActivate: function (fn) {
+      if (typeof fn !== 'function') { return; }
+      activateHooks.push(fn);
+    },
+    onDeactivate: function (fn) {
+      if (typeof fn !== 'function') { return; }
+      deactivateHooks.push(fn);
+    },
+    registerDirtyGuard: function (fn) {
+      if (typeof fn === 'function') { dirtyGuards.push(fn); }
+    },
+    registerModule: registerModule,
+    registerTabKey: registerTabKey,
+    isPaneInteractive: isPaneInteractive,
+    refreshTabDirty: paintTabDirty,
+    registerCommand: function (provider) {
+      if (typeof provider === 'function') { commandProviders.push(provider); }
+    },
+    mount: mountFragment,
+    unmount: emitUnmount
+  };
+  window.ZanAdmin = ZanAdmin;
 
-    function paint(log, msg) {
-      var row = document.createElement('div');
-      row.className = 'ai-row ' + (msg.who === 'me' ? 'me' : 'ai');
-      var bubble = document.createElement('div');
-      bubble.className = 'ai-bubble' + (msg.bad ? ' bad' : '');
-      bubble.textContent = msg.text;
-      row.appendChild(bubble);
-      // A proposal from an agent that may act gets a confirm button; the SQL is
-      // only ever run after this second, explicit click.
-      var a = agentOf(state.agent);
-      if (msg.who === 'ai' && !msg.bad && a && a.apply) {
-        var sql = sqlOf(msg.text);
-        if (sql) { bubble.appendChild(applyBtn(sql)); }
-      }
-      log.appendChild(row);
-      return bubble;
-    }
-
-    function applyBtn(sql) {
-      var wrap = document.createElement('div');
-      wrap.className = 'ai-apply';
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = '确认建表';
-      btn.addEventListener('click', function () {
-        Layer.confirm('确认执行下面的建表语句？\n\n' + sql, function () {
-          btn.disabled = true;
-          btn.textContent = '执行中…';
-          fetch('/admin/dev/ai/apply', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ sql: sql, confirm: '1' }).toString()
-          }).then(function (r) { return r.json(); }).then(function (j) {
-            if (j && j.code === '0000') { Layer.msg('建表成功'); btn.textContent = '已建表'; }
-            else { Layer.notify('建表失败', (j && j.msg) || '请稍后再试', 'bad'); btn.disabled = false; btn.textContent = '确认建表'; }
-          }).catch(function () {
-            Layer.notify('建表失败', '请求未完成', 'bad');
-            btn.disabled = false; btn.textContent = '确认建表';
-          });
-        });
-      });
-      wrap.appendChild(btn);
-      return wrap;
-    }
-
-    function pick(code) {
-      state.agent = code;
-      mem.agent = code;
-      persist();
-      renderSide();
-      renderLog();
-      if (state.dock) { state.dock.querySelector('[data-ai-input]').focus(); }
-    }
-
-    function send() {
-      var input = state.dock.querySelector('[data-ai-input]');
-      var text = input.value.trim();
-      if (!text) { return; }
-      input.value = '';
-      var msgs = thread(state.agent);
-      msgs.push({ who: 'me', text: text });
-      persist();
-      var log = state.dock.querySelector('[data-ai-log]');
-      if (log.querySelector('.ai-empty')) { log.innerHTML = ''; }
-      paint(log, { who: 'me', text: text });
-      var pending = paint(log, { who: 'ai', text: '思考中…' });
-      log.scrollTop = log.scrollHeight;
-
-      var history = [];
-      for (var i = 0; i < msgs.length - 1; i++) {
-        history.push({ role: msgs[i].who === 'me' ? 'user' : 'assistant', content: msgs[i].text });
-      }
-      // The answer is streamed: /admin/dev/ai/stream replies with a
-      // text/event-stream and the bubble grows as the deltas land, so the
-      // operator sees the model writing instead of a spinner. The stream is
-      // read with fetch (not EventSource) because the request is a POST that
-      // carries the thread.
-      stream(text, history, msgs, log, pending);
-    }
-
-    // Reads an event stream of `delta` / `done` / `error` frames off a POST and
-    // paints each delta into the pending bubble. One connection, no polling.
-    function stream(text, history, msgs, log, pending) {
-      var body = new URLSearchParams({ agent: state.agent, q: text,
-                                       history: JSON.stringify(history) }).toString();
-      var answer = '';
-      var failed = '';
-      function finish() {
-        msgs.push({ who: 'ai', text: failed || answer || '（空回复）',
-                    bad: !!failed });
-        persist();
-        renderLog();
-      }
-      fetch('/admin/dev/ai/stream', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body
-      }).then(function (r) {
-        if (!r.body || !r.body.getReader) {
-          // No streaming in this browser: the non-streaming endpoint answers
-          // the same conversation in one shot.
-          return fetch('/admin/dev/ai/chat', {
-            method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: body
-          }).then(function (r2) { return r2.json(); }).then(function (j) {
-            var ok = j && j.code === '0000' && j.data;
-            if (ok) { answer = j.data.text || ''; }
-            else { failed = (j && j.msg) || '请求失败'; }
-            finish();
-          });
-        }
-        var reader = r.body.getReader();
-        var dec = new TextDecoder();
-        var buf = '';
-        function frame(block) {
-          var ev = 'message';
-          var data = '';
-          var lines = block.split('\n');
-          for (var i = 0; i < lines.length; i++) {
-            var ln = lines[i];
-            if (ln.indexOf('event:') === 0) { ev = ln.slice(6).trim(); }
-            else if (ln.indexOf('data:') === 0) { data += ln.slice(5).trim(); }
-          }
-          if (!data) { return; }
-          var d = null;
-          try { d = JSON.parse(data); } catch (e) { return; }
-          if (ev === 'delta') {
-            answer += d.text || '';
-            pending.textContent = answer;
-            log.scrollTop = log.scrollHeight;
-          } else if (ev === 'done') {
-            answer = d.text || answer;
-          } else if (ev === 'error') {
-            failed = d.text || '请求失败';
-          }
-        }
-        function pump() {
-          return reader.read().then(function (res) {
-            if (res.done) { finish(); return; }
-            buf += dec.decode(res.value, { stream: true });
-            var at = buf.indexOf('\n\n');
-            while (at >= 0) {
-              frame(buf.slice(0, at));
-              buf = buf.slice(at + 2);
-              at = buf.indexOf('\n\n');
-            }
-            return pump();
-          });
-        }
-        return pump();
-      }).catch(function () {
-        pending.textContent = '请求失败';
-        pending.classList.add('bad');
-        msgs.push({ who: 'ai', text: '请求失败', bad: true });
-        persist();
-      });
-    }
-
-    function show() {
-      if (!state.built) { build(); }
-      if (!state.agent || !agentOf(state.agent)) {
-        state.agent = (mem.agent && agentOf(mem.agent)) ? mem.agent
-          : (state.agents[0] ? state.agents[0].code : '');
-      }
-      renderSide();
-      renderLog();
-      state.dock.classList.add('on');
-      var input = state.dock.querySelector('[data-ai-input]');
-      if (input) { input.focus(); }
-    }
-    function hide() { if (state.dock) { state.dock.classList.remove('on'); } }
-
-    function refresh() {
-      return fetch('/admin/dev/ai/state', { credentials: 'same-origin' })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          if (j && j.code === '0000' && j.data) {
-            state.ready = !!j.data.ready;
-            state.agents = j.data.agents || [];
-          }
-        }).catch(function () {});
-    }
-
-    document.addEventListener('click', function (ev) {
-      if (!ev.target.closest('[data-ai-btn]')) { return; }
-      if (state.dock && state.dock.classList.contains('on')) { hide(); return; }
-      refresh().then(function () {
-        if (!state.ready) {
-          Layer.confirm('AI 助手还没有配置，现在去填服务商和 API Key？', function () {
-            var a = document.querySelector('.ad-side a[href="/admin/system/settings"]');
-            if (a) { a.click(); } else { location.href = '/admin/system/settings'; }
-          });
-          return;
-        }
-        show();
-      });
-    });
-
-    document.addEventListener('DOMContentLoaded', refresh);
-  })();
-
-  // 公告登录弹窗（T12）：有未读公告时 Dashboard 渲染挂点，首次登录
-  // 自动弹详情；同日不重弹（day 相同），同一条公告历史日已弹不重弹
-  // （key 相同），换 key（新公告）次日再弹。
-  (function announcePopup() {
-    document.addEventListener('DOMContentLoaded', function () {
-      var host = document.querySelector('[data-announce-popup]');
-      if (!host || !window.Layer) { return; }
-      var key = host.getAttribute('data-announce-key') || '';
-      var url = host.getAttribute('data-announce-url') || '';
-      if (!key || !url) { return; }
-      var now = new Date();
-      var day = now.getFullYear() + '-' + (now.getMonth() + 1) + '-' + now.getDate();
-      var seenKey = '';
-      var seenDay = '';
-      try {
-        seenKey = localStorage.getItem('ann_popup_key') || '';
-        seenDay = localStorage.getItem('ann_popup_day') || '';
-      } catch (e) { /* 隐私模式等异常直接放弃弹窗 */ }
-      if (seenDay === day || seenKey === key) { return; }
-      try {
-        localStorage.setItem('ann_popup_key', key);
-        localStorage.setItem('ann_popup_day', day);
-      } catch (e) { /* ignore */ }
-      Layer.open({ url: url, title: '公告', width: '560px' });
-    });
-  })();
-
-})();
-
-/* ---- CSP：动态宽高经 data-w/data-h 以 CSSOM 回填（内联 style 会被 style-src 拦） ---- */
-(function () {
-  function refill(root) {
-    var els = (root || document).querySelectorAll('[data-w],[data-h]');
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i], v;
-      v = el.getAttribute('data-w');
-      if (v !== null && v !== '') { el.style.width = v + '%'; }
-      v = el.getAttribute('data-h');
-      if (v !== null && v !== '') { el.style.height = v + '%'; }
+  if (pre && Array.isArray(pre)) {
+    for (var qi = 0; qi < pre.length; qi++) {
+      var item = pre[qi];
+      if (item && ZanAdmin[item[0]]) { ZanAdmin[item[0]](item[1], item[2]); }
     }
   }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { refill(document); });
-  } else { refill(document); }
-  document.addEventListener('htmx:afterSwap', function (e) { refill(e.target); });
+
+  document.addEventListener('DOMContentLoaded', function () {
+    panelHost = el('ad-panel');
+    panel = panelHost;
+    tabs = el('ad-tabs');
+    toasts = el('ad-toasts');
+    bootShellModules();
+    renderIcons(document);
+    if (tabs) { restore(); }
+    if (tabs) {
+      var here = normalize(location.pathname + location.search + location.hash);
+      rememberPane(location.pathname + location.search + location.hash);
+      var title = document.body.getAttribute('data-tab-title') || here;
+      if (find(here) < 0) { state.tabs.push({ path: here, title: title }); }
+      state.active = here;
+      if (panelHost) {
+        panelHost.classList.add('has-panes');
+        var initPane = ensurePane(tabKey(here), here);
+        while (panelHost.firstChild && panelHost.firstChild !== initPane.el) {
+          initPane.el.appendChild(panelHost.firstChild);
+        }
+        if (initPane.el.parentNode !== panelHost) { panelHost.appendChild(initPane.el); }
+        activatePane(initPane);
+        initPane.loaded = true;
+      }
+      history.replaceState({ path: here }, '', here);
+      paint();
+      window.addEventListener('resize', paintTabNav);
+      tabs.addEventListener('wheel', function (ev) {
+        if (tabs.scrollWidth <= tabs.clientWidth) { return; }
+        ev.preventDefault();
+        tabs.scrollLeft = tabs.scrollLeft + (ev.deltaY || ev.deltaX);
+      }, { passive: false });
+    }
+    emitInit({ panel: panelEl(), shell: ZanAdmin });
+    var initRoot = panelEl();
+    if (initRoot) {
+      mountFragment(initRoot, { kind: 'initial', path: state.active, active: true });
+    }
+    if (tabs) { window.addEventListener('popstate', restoreHistory); }
+  });
 })();

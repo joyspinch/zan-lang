@@ -25,16 +25,26 @@ public class Customers : AdminController {
 
         ListQuery q = this.Paged("id", 20);
         string kw = q.Kw();
-        /* 租户硬边（#34）：列表只出本租户行。 */
-        List<CrmCustomer> rows = await this.CrmCustomer
-            .Where(a => a.tenantId == Tenant.Cur())
-            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
-            .OrderByDescending(a => a.id)
-            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
-        int total = await this.CrmCustomer
-            .Where(a => a.tenantId == Tenant.Cur())
-            .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
-            .CountAsync();
+        /* 租户硬边（#34）：列表与计数复用同一 SQL 条件。 */
+        SelectQuery<CrmCustomer> query = this.CrmCustomer.Select()
+            .WhereEq(nameof(Zan.Web.Model.Crm.CrmCustomer.tenantId), Tenant.Cur());
+        Select sql = query.inner;
+        if (kw.Length > 0) {
+            string name = sql.RequireCol(nameof(Zan.Web.Model.Crm.CrmCustomer.name));
+            int provider = sql.Provider();
+            // 保留 string.Contains 的区分大小写、按字面搜索语义。
+            if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
+                sql.Where("INSTR(CAST(CONVERT(" + name + " USING utf8mb4) AS BINARY), CAST(? AS BINARY)) > 0");
+            } else if (provider == DbProvider.PostgreSQL) {
+                sql.Where("strpos(" + name + " COLLATE \"C\", ?) > 0");
+            } else {
+                sql.Where("instr(" + name + ", ?) > 0");
+            }
+            sql.P(kw);
+        }
+        sql.OrderBySafeDesc(nameof(Zan.Web.Model.Crm.CrmCustomer.id));
+        List<CrmCustomer> rows = await query.Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await query.CountAsync();
 
         List<StrMap> items = d.AddList("rows");
         for (int i = 0; i < rows.Count; i = i + 1) {

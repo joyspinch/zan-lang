@@ -782,7 +782,7 @@
       { color: '#b42318', label: '错误', values: pts.map(function (p) { return p.errors; }) }
     ], pts, '');
     draw('chart-day-lat', [
-      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
+      { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return p.req > 0 ? ms(p.avg_us) : null; }) },
       { color: '#d97706', label: '最慢', values: pts.map(function (p) { return ms(p.max_us); }) }
     ], pts, ' ms');
 
@@ -843,7 +843,7 @@
     Object.keys(topDay).forEach(function (k) { keys[k] = 1; });
     Object.keys(topLive).forEach(function (k) { keys[k] = 1; });
     Object.keys(keys).forEach(function (req) {
-      var d = topDay[req], l = topLive[req] || {};
+      var d = topDay[req], l = topLive[req];
       rows.push({
         req: req,
         day: !!d,
@@ -852,14 +852,16 @@
         avg_us: d ? (d.avg_us || 0) : 0,
         max_us: d ? (d.max_us || 0) : 0,
         total_us: d ? (d.total_us || 0) : 0,
-        failed: l.failed || 0,
-        rejected: l.rejected || 0
+        failed: l ? l.failed : null,
+        rejected: l ? l.rejected : null
       });
     });
     // The share column is the call count as a percentage, so it sorts by it.
     var k = topSort.key === 'share' ? 'calls' : topSort.key, dir = topSort.dir;
     rows.sort(function (a, b) {
       if (k === 'req') { return a.req < b.req ? -dir : (a.req > b.req ? dir : 0); }
+      if (a[k] == null) { return b[k] == null ? 0 : 1; }
+      if (b[k] == null) { return -1; }
       return (a[k] - b[k]) * dir;
     });
     paintTopHead();
@@ -876,17 +878,17 @@
                  '</td><td class="num">' + d2(s.avg_us) +
                  '</td><td class="num">' + d2(s.max_us) +
                  '</td><td class="num">' + d2(s.total_us) +
-                 '</td><td class="num">' + s.failed +
-                 '</td><td class="num">' + s.rejected + '</td></tr>';
+                 '</td><td class="num">' + (s.failed == null ? '—' : s.failed) +
+                 '</td><td class="num">' + (s.rejected == null ? '—' : s.rejected) + '</td></tr>';
         }).join('')
-      : '<tr><td colspan="9" class="muted">今天还没有请求</td></tr>';
+      : '<tr><td colspan="10" class="muted">所选日期暂无接口统计</td></tr>';
   }
 
   // A bucket's wall clock as "hh:mm", for a chart whose x axis is one day.
   function clock(sec) {
     var d = new Date(sec * 1000);
     var p2 = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p2(d.getHours()) + ':' + p2(d.getMinutes());
+    return p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes());
   }
 
   function put(name, value) {
@@ -896,10 +898,10 @@
   }
 
   function bytes(v) {
-    if (v < 0) { return 'n/a'; }
+    if (!Number.isFinite(v) || v < 0) { return '—'; }
     if (v < 1024) { return v + ' B'; }
-    if (v < 1048576) { return (v / 1024).toFixed(0) + ' KB'; }
-    return (v / 1048576).toFixed(1) + ' MB';
+    if (v < 1048576) { return (v / 1024).toFixed(0) + ' KiB'; }
+    return (v / 1048576).toFixed(1) + ' MiB';
   }
 
   // Every duration the server publishes is MICROSECONDS (*_us). The unit is
@@ -950,8 +952,8 @@
                  '</td><td class="num">' + (p.concurrent || 0) +
                  '</td><td class="num">' + (p.streams || 0) +
                  '</td><td class="num">' + (p.queries || 0) +
-                 '</td><td class="num">' + (p.cpu_percent < 0 ? 'n/a' : p.cpu_percent + '%') +
-                 '</td><td class="num">' + bytes(p.mem_rss_bytes) +
+                 '</td><td class="num">' + (Number.isFinite(p.cpu_percent) && p.cpu_percent >= 0 ? p.cpu_percent + '%' : '—') +
+                 '</td><td class="num">' + bytes(p.mem_rss_bytes > 0 ? p.mem_rss_bytes : -1) +
                  '</td><td class="num">' + (stale ? (p.age || 0) + 's 未上报' : '正常') +
                  '</td></tr>';
         }).join('')
@@ -968,8 +970,20 @@
     put('max_us', dur(r.max_us));
     put('queries', q.count || 0);
     put('query_avg_us', dur(q.avg_us));
-    put('cpu', m.cpu_percent < 0 ? 'n/a' : m.cpu_percent + '%');
-    put('mem', bytes(m.mem_rss_bytes));
+    var root = panel;
+    var live = (m.processes || []).filter(function (p) { return p.live; });
+    function resource(key, unit, format, min) {
+      var values = live.map(function (p) { return p[key]; }).filter(function (v) {
+        return Number.isFinite(v) && v >= min;
+      });
+      var value = values.length ? format(values.reduce(function (sum, v) { return sum + v; }, 0)) : '—';
+      if (values.length && values.length < live.length) { value += '（' + values.length + '/' + live.length + '）'; }
+      put(unit, value);
+      var node = root && root.querySelector('[data-metric="' + unit + '"]');
+      if (node) { node.title = '在线进程采样覆盖 ' + values.length + ' / ' + live.length; }
+    }
+    resource('cpu_percent', 'cpu', function (v) { return v + '%'; }, 0);
+    resource('mem_rss_bytes', 'mem', bytes, 1);
     paintProcs(m.processes);
     topLive = {};
     (m.top_requests || []).forEach(function (s) { topLive[s.req] = s; });
@@ -1003,17 +1017,21 @@
     ], pts, '');
     draw('chart-lat', [
       { color: '#7c3aed', label: '平均', values: pts.map(function (p) { return ms(p.avg_us); }) },
-      { color: '#d97706', label: 'P95', values: pts.map(function (p) { return ms(p.p95_us); }) }
+      { color: '#d97706', label: 'Worker P95 最大值', values: pts.map(function (p) { return p.req > 0 ? ms(p.p95_us) : null; }) }
     ], pts, ' ms');
     draw('chart-db', [
-      { color: '#0f766e', label: '查询数', values: pts.map(function (p) { return p.queries; }) },
-      { color: '#0891b2', label: '平均 ms', values: pts.map(function (p) { return ms(p.query_avg_us); }) }
-    ], pts, '');
-    draw('chart-sys', [
-      { color: '#15803d', label: 'CPU %', values: pts.map(function (p) { return Math.max(p.cpu_percent, 0); }) },
-      { color: '#6b7280', label: '内存 MB', values: pts.map(function (p) {
-          return Math.round(Math.max(p.mem_rss_bytes, 0) / 1048576); }) }
-    ], pts, '');
+      { color: '#0f766e', cls: 'c-teal', label: 'SQL 调用', values: pts.map(function (p) { return p.queries; }) }
+    ], pts, ' 次/s');
+    draw('chart-db-lat', [
+      { color: '#d97706', cls: 'c-amber', label: '平均', values: pts.map(function (p) { return p.queries > 0 ? ms(p.query_avg_us) : null; }) }
+    ], pts, ' ms');
+    draw('chart-cpu', [
+      { color: '#15803d', cls: 'c-green', label: '进程 CPU', values: pts.map(function (p) { return p.cpu_percent >= 0 ? p.cpu_percent : null; }) }
+    ], pts, '%');
+    draw('chart-rss', [
+      { color: '#6b7280', cls: 'c-gray', label: '进程 RSS', values: pts.map(function (p) {
+          return p.mem_rss_bytes > 0 ? Math.round(p.mem_rss_bytes / 10485.76) / 100 : null; }) }
+    ], pts, ' MiB');
   }
 
   // One shared floating tooltip for every chart; position:fixed so it is never
@@ -1041,10 +1059,13 @@
     c.width = w * dpr; c.height = h * dpr;
     var g = c.getContext('2d');
 
-    var max = 1;
+    var peak = null;
     series.forEach(function (s) {
-      s.values.forEach(function (v) { if (v > max) { max = v; } });
+      s.values.forEach(function (v) {
+        if (Number.isFinite(v) && (peak == null || v > peak)) { peak = v; }
+      });
     });
+    var max = Math.max(peak || 0, 1);
 
     // Redraws the whole chart; `hover` >= 0 overlays a guide line and a dot on
     // each series at that sample, so the tooltip has a visible anchor.
@@ -1059,12 +1080,19 @@
       }
       series.forEach(function (s) {
         var n = s.values.length;
-        if (n < 2) { return; }
         g.beginPath();
+        var drawing = false;
         for (var i = 0; i < n; i++) {
-          var x = w * i / (n - 1);
+          if (!Number.isFinite(s.values[i])) { drawing = false; continue; }
+          var x = n === 1 ? w / 2 : w * i / (n - 1);
           var y = h - (h - 4) * (s.values[i] / max);
-          if (i === 0) { g.moveTo(x, y); } else { g.lineTo(x, y); }
+          if (drawing) {
+            g.lineTo(x, y);
+          } else {
+            g.moveTo(x, y);
+            if (!Number.isFinite(s.values[i + 1])) { g.lineTo(x + 1, y); }
+          }
+          drawing = true;
         }
         g.strokeStyle = s.color;
         g.lineWidth = 1.5;
@@ -1077,6 +1105,7 @@
         g.lineWidth = 1;
         g.beginPath(); g.moveTo(hx + .5, 0); g.lineTo(hx + .5, h); g.stroke();
         series.forEach(function (s) {
+          if (!Number.isFinite(s.values[hover])) { return; }
           var y = h - (h - 4) * (s.values[hover] / max);
           g.fillStyle = s.color;
           g.beginPath(); g.arc(hx, y, 3, 0, Math.PI * 2); g.fill();
@@ -1105,11 +1134,11 @@
         // clock time it stands for.
         var when = (sp && sp[idx] && sp[idx].label) ? sp[idx].label
           : ((sp && sp[idx] && typeof sp[idx].t === 'number')
-              ? (sp[idx].t === 0 ? '现在' : (-sp[idx].t) + ' 秒前') : '');
+              ? (sp[idx].t === 0 ? '本秒（汇总中）' : (-sp[idx].t) + ' 秒前') : '');
         var html = when ? '<b>' + when + '</b>' : '';
         sv.forEach(function (s) {
           html += '<div><i class="tipdot" data-c="' + s.color + '"></i>'
-            + esc(s.label || '') + ' ' + s.values[idx] + un + '</div>';
+            + esc(s.label || '') + ' ' + (Number.isFinite(s.values[idx]) ? s.values[idx] + un : '—') + '</div>';
         });
         var tip = monTip();
         tip.innerHTML = html;
@@ -1130,7 +1159,7 @@
     }
 
     var label = panel.querySelector('[data-max="' + id + '"]');
-    if (label) { label.textContent = '峰值 ' + max; }
+    if (label) { label.textContent = peak == null ? '暂无采样' : '峰值 ' + peak + (unit || ''); }
   }
 
 

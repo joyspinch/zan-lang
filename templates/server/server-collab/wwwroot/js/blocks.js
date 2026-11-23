@@ -16,6 +16,28 @@
 (function () {
   function draftKey(docId) { return 'oa_doc_draft_' + docId; }
 
+  /* 全局只注册一次脏检查钩子，避免多标签反复打开块编辑器时向 dirtyGuards 泄漏闭包。 */
+  function registerDirtyGuard() {
+    var fn = function (paneEl) {
+      return !!(paneEl && paneEl.querySelector('.be-wrap[data-be-dirty="1"]'));
+    };
+    if (window.ZanAdmin && typeof ZanAdmin.registerDirtyGuard === 'function') {
+      ZanAdmin.registerDirtyGuard(fn);
+    } else {
+      window.ZanAdmin = window.ZanAdmin || {};
+      window.ZanAdmin._q = window.ZanAdmin._q || [];
+      window.ZanAdmin._q.push(['registerDirtyGuard', fn]);
+    }
+  }
+  registerDirtyGuard();
+
+  function syncDirtyUi(root, dirty) {
+    if (root) { root.setAttribute('data-be-dirty', dirty ? '1' : '0'); }
+    if (window.ZanAdmin && typeof ZanAdmin.refreshTabDirty === 'function') {
+      ZanAdmin.refreshTabDirty();
+    }
+  }
+
   document.addEventListener('alpine:init', function () {
     Alpine.data('blockEditor', function () {
       return {
@@ -119,7 +141,9 @@
 
         /* ---- 输入路径：只 mark，零状态重写 ---- */
         mark() {
+          var wasDirty = this.dirty;
           this.dirty = true;
+          if (!wasDirty) { syncDirtyUi(this.$el, true); }
           if (this.composing) { return; }
           var self = this;
           if (this.draftTimer) { clearTimeout(this.draftTimer); }
@@ -200,6 +224,7 @@
           }).then(function (res) {
             if (res && res.ok && res.j && res.j.code === '0000') {
               self.dirty = false; self.conflict = false;
+              syncDirtyUi(self.$el, false);
               self.baseVersion = self.baseVersion + 1;
               localStorage.removeItem(draftKey(self.docId));
               if (self.docId > 0) {
@@ -207,7 +232,12 @@
                 if (manual) { self.say('已保存 v' + self.baseVersion); }
               } else {
                 self.say('文档已创建');
-                window.location.href = '/admin/oa/docs?spaceId=' + self.spaceId;
+                var nextUrl = '/admin/oa/docs?spaceId=' + self.spaceId;
+                if (window.ZanAdmin && typeof ZanAdmin.openTab === 'function') {
+                  ZanAdmin.openTab(nextUrl, '文档中心', { replace: true, skipDirty: true });
+                } else {
+                  window.location.href = nextUrl;
+                }
               }
             } else if (res && res.st === 409) {
               self.conflict = true;

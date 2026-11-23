@@ -1,0 +1,447 @@
+/* zan-table —— 管理后台表格增强组件（原生 JS，无框架依赖）。
+ *
+ * 服务端模板照常输出 <table class="table">（thead/tbody 静态行），组件
+ * 按 data-table 属性渐进增强，不重渲染 DOM：操作列的 data-post/data-dialog
+ * 等 admin.js 委托、行内 <a> 全部原样生效。增强四件事：
+ *
+ *   1. 列排序      th 加 data-sort="auto|num|text"（auto 按单元格文本智能
+ *                  判断数字/日期/文本）。客户端排序当前页数据——数据已在
+ *                  浏览器，交互零请求。
+ *   2. 列即时筛选  data-table="filter" 时表头上方出现一行列内搜索框，
+ *                  输入即过滤行（仅当前页）。
+ *   3. 行选择      data-table="select" 出现首列复选框与全选；选中行数在
+ *                  状态条显示，行加 .on 高亮。
+ *   4. 密度切换    状态条上紧凑/舒适两档，记忆在 localStorage。
+ *
+ * 开关约定（服务端模板只写属性，不做 JS）：
+ *   <table class="table" data-table="sort filter select">  空串 = 全开
+ *   th[data-nosort]                                        该列不可排序
+ *
+ * 状态条（.zt-bar）由组件插入表格上方：左侧命中行数/选中数，右侧密度
+ * 切换。排序与筛选状态在面板重载后自然复位（服务端分页语义下，跨页
+ * 排序应回服务端做，这里明确只管当前页）。
+ *
+ * 供 admin.js 的 applyFragmentWidgets 在每个面板/弹窗载入后调用：
+ *   ZanTable.wire(root)   —— root 内所有 [data-table] 尚未增强的表格
+ *   ZanTable.wireAll()    —— 整个文档（首屏服务端渲染面板）
+ */
+(function () {
+  'use strict';
+
+  var DENSITY_KEY = 'zanweb.zantable.density';
+  var ARROW_DESC = ' \u2193';
+  var ARROW_ASC = ' \u2191';
+  /* 当前打开的列显隐菜单：一次只开一个，document 级监听只注册一次，
+     面板重载不会累积监听器。 */
+  var openMenu = null;
+
+  document.addEventListener('click', function (ev) {
+    if (!openMenu) { return; }
+    if (openMenu.menu.contains(ev.target) || openMenu.btn.contains(ev.target)) { return; }
+    openMenu.menu.hidden = true;
+    openMenu = null;
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape' || !openMenu) { return; }
+    openMenu.menu.hidden = true;
+    openMenu = null;
+  });
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text !== undefined) { n.textContent = text; }
+    return n;
+  }
+
+  /* 单元格值的排序类型：纯数字（含 %、千分位、单位后缀）按数值，
+     日期样（2026-09-15、2026-09-15 10:20:30）按字符串（同格式字典序
+     即时间序），其余按 localeCompare。µ 同时收微符号(U+00B5)与希腊
+     小写 mu(U+03BC) 两个码位，防字体/来源差异漏判。 */
+  var MU = '[µμ]';
+  function kindOf(text) {
+    var t = text.trim();
+    if (t === '') { return 'empty'; }
+    if (new RegExp('^-?[\\d,]+(\\.\\d+)?\\s*(%|ms|us|' + MU + 's|s|KB|MB|GB)?$').test(t)) { return 'num'; }
+    if (/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(t)) { return 'date'; }
+    return 'text';
+  }
+
+  /* 数值排序按单位归一（时长到 ms、容量到字节），否则 721 µs 会被
+     当成 721 ms 压过 275.00 ms。裸数与 % 原值参与比较。 */
+  function sortValue(cell, kind) {
+    var t = cell.textContent.trim();
+    if (kind !== 'num') { return t; }
+    var m = new RegExp('^(-?[\\d,]+(?:\\.\\d+)?)\\s*(%|ms|us|' + MU + 's|s|KB|MB|GB)?$').exec(t);
+    if (!m) { return parseFloat(t.replace(/[,\s]/g, '')) || 0; }
+    var v = parseFloat(m[1].replace(/,/g, ''));
+    var u = m[2] || '';
+    if (u === 'us' || u === 'µs' || u === 'μs') { return v / 1000; }
+    if (u === 's') { return v * 1000; }
+    if (u === 'KB') { return v * 1024; }
+    if (u === 'MB') { return v * 1048576; }
+    if (u === 'GB') { return v * 1073741824; }
+    return v;
+  }
+
+  function enhance(table) {
+    if (table.getAttribute('data-zt')) { return; }
+    table.setAttribute('data-zt', '1');
+
+    var modes = (table.getAttribute('data-table') || 'sort filter select').split(/\s+/);
+    var canSort = modes.indexOf('sort') >= 0;
+    var canFilter = modes.indexOf('filter') >= 0;
+    var canSelect = modes.indexOf('select') >= 0;
+
+    var thead = table.tHead;
+    var tbody = table.tBodies[0];
+    if (!thead || !tbody) { return; }
+    var headRow = thead.rows[0];
+    if (!headRow) { return; }
+
+    var state = { sortCol: -1, sortDir: 1, query: '', selected: 0, hiddenByFilter: 0 };
+
+    /* ---- 收集列元数据 -------------------------------------------- */
+    var cols = [];
+    for (var c = 0; c < headRow.cells.length; c++) {
+      var th = headRow.cells[c];
+      var sortable = canSort && !th.hasAttribute('data-nosort')
+        && !th.classList.contains('ops');
+      cols.push({
+        th: th,
+        label: th.textContent,
+        sortable: sortable,
+        kind: null              // 首次排序时按数据判定
+      });
+      if (sortable) { th.classList.add('zt-sortable'); }
+    }
+
+    /* ---- 状态条 --------------------------------------------------- */
+    var bar = el('div', 'zt-bar');
+    var info = el('span', 'zt-info');
+    bar.appendChild(info);
+    var sp = el('span', 'sp');
+    bar.appendChild(sp);
+
+    if (canFilter) {
+      var find = el('input', 'input zt-find');
+      find.type = 'search';
+      find.placeholder = '在当前页内筛选…';
+      find.setAttribute('aria-label', '表格内筛选');
+      find.addEventListener('input', function () {
+        state.query = find.value.trim().toLowerCase();
+        apply();
+      });
+      bar.appendChild(find);
+    }
+
+    if (canSelect) {
+      var selInfo = el('span', 'zt-selinfo');
+      var clear = el('button', 'btn sm zt-clear', '取消选择');
+      clear.type = 'button';
+      clear.hidden = true;
+      clear.addEventListener('click', function () {
+        rows().forEach(function (tr) { setRow(tr, false); });
+        apply();
+      });
+      bar.appendChild(selInfo);
+      bar.appendChild(clear);
+    }
+
+    /* ---- 列显隐 --------------------------------------------------- */
+    /* 宽表按需藏列，按 表格身份（data-table-key 或 路径+#序号）记忆。 */
+    var colKey = table.getAttribute('data-table-key') ||
+      (location.pathname + '#' +
+        Array.prototype.indexOf.call(document.querySelectorAll('table[data-table]'), table));
+    var colStore = 'zanweb.zantable.cols.' + colKey;
+    var hiddenCols = {};
+    try {
+      JSON.parse(localStorage.getItem(colStore) || '[]').forEach(function (i) {
+        if (i >= 0 && i < cols.length) { hiddenCols[i] = true; }
+      });
+    } catch (e) { /* 坏数据当全可见 */ }
+
+    var colsBtn = el('button', 'btn sm zt-colsbtn', '列');
+    colsBtn.type = 'button';
+    var colsBox = el('div', 'zt-menu');
+    colsBox.hidden = true;
+    cols.forEach(function (col, i) {
+      var lab = el('label');
+      var box = el('input');
+      box.type = 'checkbox';
+      box.checked = !hiddenCols[i];
+      box.addEventListener('change', function () {
+        if (!box.checked) {
+          /* 至少留一列：取消最后一个可见列时回弹 */
+          var visibleLeft = cols.filter(function (c, j) {
+            return j !== i && !hiddenCols[j];
+          }).length;
+          if (visibleLeft === 0) { box.checked = true; return; }
+          hiddenCols[i] = true;
+        } else {
+          delete hiddenCols[i];
+        }
+        applyCols();
+        try {
+          localStorage.setItem(colStore,
+            JSON.stringify(cols.map(function (c, j) { return hiddenCols[j] ? j : -1; })
+              .filter(function (j) { return j >= 0; })));
+        } catch (e) { /* private mode */ }
+      });
+      lab.appendChild(box);
+      lab.appendChild(el('span', undefined, col.label || ('列 ' + (i + 1))));
+      colsBox.appendChild(lab);
+    });
+    colsBtn.addEventListener('click', function () {
+      if (openMenu && openMenu !== api) { openMenu.menu.hidden = true; }
+      openMenu = openMenu === api ? null : api;
+      colsBox.hidden = openMenu !== api;
+    });
+    var api = { menu: colsBox, btn: colsBtn };
+    var colsWrap = el('span', 'zt-cols');
+    colsWrap.appendChild(colsBtn);
+    colsWrap.appendChild(colsBox);
+    bar.insertBefore(colsWrap, density);
+
+    /* 隐藏/恢复一列：直接改该列 th 与每行 td 的 display——排序、筛选读的
+       是 textContent，藏起来的列照常参与。 */
+    function applyCols() {
+      var off = canSelect ? 1 : 0;
+      cols.forEach(function (col, i) {
+        var hide = !!hiddenCols[i];
+        col.th.classList.toggle('zt-col-hidden', hide);
+        for (var r = 0; r < tbody.rows.length; r++) {
+          var td = tbody.rows[r].cells[i + off];
+          if (td) { td.classList.toggle('zt-col-hidden', hide); }
+        }
+      });
+    }
+    applyCols();
+
+    var density = el('button', 'btn sm zt-density');
+    density.type = 'button';
+    density.addEventListener('click', function () {
+      var next = table.classList.contains('zt-compact') ? 'cozy' : 'compact';
+      setDensity(next);
+      try { localStorage.setItem(DENSITY_KEY, next); } catch (e) { /* private mode */ }
+    });
+    bar.appendChild(density);
+
+    /* 状态条插到表格元素之前（表格常直接躺在 .card 里，同级即视觉上位）；
+       表格包在滚动容器里时锚滚动容器，否则状态条跟着横向滚动滚出视野。
+       无包裹时必须锚表格本身——锚 parentNode 会把状态条插成卡的兄弟位，
+       卡若躺在 .grid 里就成了多余网格子项，把整页挤成错误自动流。
+       卡内已有标题/动作行（div.toolbar / header）时并入该行，不再自占一行：
+       筛选/列/紧凑与页面按钮同排，页顶按钮堆叠从三排降到两排以内。
+       不并进 form——表单里点按钮会触发提交语义。 */
+    var barHost = table.closest('.table-scroll') || table;
+    var mergeInto = barHost.previousElementSibling;
+    if (mergeInto && mergeInto.matches('div.toolbar, div.tbar, header, div.list-head')) {
+      mergeInto.appendChild(bar);
+      bar.classList.add('zt-merged');
+    } else {
+      barHost.parentNode.insertBefore(bar, barHost);
+    }
+
+    /* 横向滚动按需启用：容器一旦 overflow 非 visible 就成为滚动容器，
+       sticky 表头只能锚它（滚动容器陷阱）——表格不超宽时把容器放开成
+       visible，表头随页面滚动钉在面板顶；超宽时恢复 auto，钉住首列/
+       操作列与横向滚动照常。CSS 里的 auto 只是禁 JS 时的兜底。 */
+    var scrollHost = table.closest('.table-scroll');
+    function fitScrollX() {
+      if (!scrollHost) { return; }
+      var need = table.offsetWidth > scrollHost.clientWidth + 1;
+      scrollHost.style.overflowX = need ? 'auto' : 'visible';
+      scrollHost.style.overflowY = 'visible';
+    }
+    fitScrollX();
+    window.addEventListener('resize', fitScrollX);
+    table._ztFitScrollX = fitScrollX;
+    table._ztDispose = function () {
+      window.removeEventListener('resize', fitScrollX);
+      table._ztFitScrollX = null;
+      table._ztDispose = null;
+    };
+
+    function setDensity(mode) {
+      var compact = mode === 'compact';
+      table.classList.toggle('zt-compact', compact);
+      density.textContent = compact ? '舒适' : '紧凑';
+    }
+    var saved = 'cozy';
+    try { saved = localStorage.getItem(DENSITY_KEY) || 'cozy'; } catch (e) { /* */ }
+    setDensity(saved === 'compact' ? 'compact' : 'cozy');
+
+    /* ---- 行选择 --------------------------------------------------- */
+    function rows() {
+      return Array.prototype.slice.call(tbody.rows);
+    }
+
+    function setRow(tr, on) {
+      var box = tr.querySelector('td.zt-cell input[type="checkbox"]');
+      if (box) { box.checked = on; }
+      tr.classList.toggle('on', on);
+    }
+
+    if (canSelect) {
+      var headCell = el('th', 'zt-cell');
+      var all = el('input');
+      all.type = 'checkbox';
+      all.setAttribute('aria-label', '全选');
+      all.addEventListener('change', function () {
+        rows().forEach(function (tr) {
+          if (!tr.classList.contains('zt-row-hidden')) { setRow(tr, all.checked); }
+        });
+        apply();
+      });
+      headCell.appendChild(all);
+      headRow.insertBefore(headCell, headRow.cells[0]);
+
+      rows().forEach(function (tr) {
+        var td = el('td', 'zt-cell');
+        var box = el('input');
+        box.type = 'checkbox';
+        box.setAttribute('aria-label', '选择本行');
+        box.addEventListener('change', function () {
+          tr.classList.toggle('on', box.checked);
+          apply();
+        });
+        td.appendChild(box);
+        tr.insertBefore(td, tr.cells[0]);
+      });
+    }
+
+    /* ---- 排序 ----------------------------------------------------- */
+    if (canSort) {
+      cols.forEach(function (col, i) {
+        if (!col.sortable) { return; }
+        col.th.addEventListener('click', function () {
+          if (!col.kind) {
+            /* 用第一非空行判定该列类型，整列同一种才有意义 */
+            var kind = 'text';
+            for (var r = 0; r < tbody.rows.length; r++) {
+              var cell = tbody.rows[r].cells[i + (canSelect ? 1 : 0)];
+              if (!cell) { continue; }
+              var k = kindOf(cell.textContent);
+              if (k !== 'empty') { kind = k; break; }
+            }
+            col.kind = kind;
+          }
+          if (state.sortCol === i) { state.sortDir = -state.sortDir; }
+          else { state.sortCol = i; state.sortDir = col.kind === 'text' ? 1 : -1; }
+          apply();
+        });
+      });
+    }
+
+    function paintHead() {
+      cols.forEach(function (col, i) {
+        if (!col.sortable) { return; }
+        var on = state.sortCol === i;
+        col.th.textContent = col.label + (on ? (state.sortDir < 0 ? ARROW_DESC : ARROW_ASC) : '');
+        col.th.classList.toggle('zt-sorted', on);
+      });
+    }
+
+    /* ---- 应用：筛选 → 排序 → 计数 --------------------------------- */
+    function apply() {
+      var list = rows();
+      var visible = 0;
+
+      /* 筛选：整行文本包含即命中（大小写不敏感） */
+      list.forEach(function (tr) {
+        var hit = state.query === '' ||
+          tr.textContent.toLowerCase().indexOf(state.query) >= 0;
+        tr.classList.toggle('zt-row-hidden', !hit);
+        if (hit) { visible++; }
+      });
+
+      /* 排序：对可见行重排（display:none 的行也在 tbody 里，一并排），
+         直接移动 DOM 节点——委托事件不依赖行位置，安全。 */
+      if (state.sortCol >= 0) {
+        var col = cols[state.sortCol];
+        var off = canSelect ? 1 : 0;
+        var kind = col.kind || 'text';
+        var dir = state.sortDir;
+        var ordered = list.slice().sort(function (a, b) {
+          var ca = a.cells[state.sortCol + off];
+          var cb = b.cells[state.sortCol + off];
+          if (!ca || !cb) { return 0; }
+          var va = sortValue(ca, kind);
+          var vb = sortValue(cb, kind);
+          if (va < vb) { return -dir; }
+          if (va > vb) { return dir; }
+          return 0;
+        });
+        ordered.forEach(function (tr) { tbody.appendChild(tr); });
+      }
+
+      /* 计数与状态条 */
+      state.selected = rows().filter(function (tr) {
+        var box = tr.querySelector('td.zt-cell input[type="checkbox"]');
+        return box && box.checked;
+      }).length;
+
+      var parts = [];
+      if (state.query !== '') {
+        parts.push('命中 ' + visible + ' / ' + list.length + ' 行');
+      }
+      info.textContent = parts.join('　');
+      info.hidden = parts.length === 0;
+
+      if (canSelect) {
+        selInfo.textContent = state.selected > 0 ? '已选 ' + state.selected + ' 行' : '';
+        selInfo.hidden = state.selected === 0;
+        clear.hidden = state.selected === 0;
+        var boxes = rows().filter(function (tr) { return !tr.classList.contains('zt-row-hidden'); });
+        var checked = boxes.filter(function (tr) {
+          var b = tr.querySelector('td.zt-cell input[type="checkbox"]');
+          return b && b.checked;
+        }).length;
+        var allBox = headRow.querySelector('th.zt-cell input[type="checkbox"]');
+        if (allBox) {
+          allBox.checked = boxes.length > 0 && checked === boxes.length;
+          allBox.indeterminate = checked > 0 && checked < boxes.length;
+        }
+      }
+
+      paintHead();
+    }
+
+    table.ztApply = apply;
+  }
+
+  function wire(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var tables = scope.querySelectorAll('table[data-table]');
+    for (var i = 0; i < tables.length; i++) { enhance(tables[i]); }
+    /* root 自身就是一张表时（弹窗主体直接是表格的场景） */
+    if (scope !== document && scope.matches && scope.matches('table[data-table]')) {
+      enhance(scope);
+    }
+  }
+
+  function unwire(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var tables = scope.querySelectorAll('table[data-table]');
+    for (var i = 0; i < tables.length; i++) {
+      if (tables[i]._ztDispose) { tables[i]._ztDispose(); }
+    }
+    if (scope !== document && scope.matches && scope.matches('table[data-table]') && scope._ztDispose) {
+      scope._ztDispose();
+    }
+  }
+
+  function reflow(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var tables = scope.querySelectorAll('table[data-table]');
+    for (var i = 0; i < tables.length; i++) {
+      if (tables[i]._ztFitScrollX) { tables[i]._ztFitScrollX(); }
+    }
+    if (scope !== document && scope.matches && scope.matches('table[data-table]') && scope._ztFitScrollX) {
+      scope._ztFitScrollX();
+    }
+  }
+
+  window.ZanTable = { wire: wire, unwire: unwire, reflow: reflow, enhance: enhance };
+})();

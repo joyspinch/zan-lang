@@ -74,11 +74,11 @@ zanc tools/PackWeb.zan --run
 2. 否则自动回退打包 `web/` 下的静态资源并排除开发工程文件；
 3. 将静态资源按安全掩码加密并输出至 `src/WebAssets.zan`。
 
-接着编译主程序：
+在生成的项目根目录发布主程序：
 ```bash
-zanc src/App.html --auto-stdlib -o myapp.exe
+zanc src/{{NAME}}.zan src --auto-stdlib --publish --embed src/{{NAME}}.html=src/{{NAME}}.html -o myapp.exe
 ```
-即可生成单一、加密内嵌、防逆向的 4.6MB 独立可执行文件！
+入口 `.zan` 排在首位，`src` 递归纳入其余 Zan 源码。发布产物内嵌窗口设计稿和打包后的 Web 资源。
 
 ## 跨平台版本自更新机制
 

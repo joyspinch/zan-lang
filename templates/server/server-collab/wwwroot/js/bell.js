@@ -37,12 +37,12 @@
   function renderItems(items) {
     if (!list) { return; }
     if (!items || !items.length) {
-      list.innerHTML = '<div class="ad-bell-empty">暂无未读</div>';
+      list.innerHTML = '<div class="collab-bell-empty">暂无未读</div>';
       return;
     }
     var html = '';
     for (var i = 0; i < items.length; i++) {
-      html += '<a class="ad-bell-item" href="' + esc(items[i].link || PAGE)
+      html += '<a class="collab-bell-item" href="' + esc(items[i].link || PAGE)
         + '" data-tab data-title="通知">' + esc(items[i].content) + '</a>';
     }
     list.innerHTML = html;
@@ -74,10 +74,10 @@
     var cur = badge && !badge.hidden ? parseInt(badge.textContent, 10) || 0 : 0;
     setBadge(cur + 1);
     if (menu && !menu.hidden && list) {
-      var empty = list.querySelector('.ad-bell-empty');
+      var empty = list.querySelector('.collab-bell-empty');
       if (empty) { empty.remove(); }
       var a = document.createElement('a');
-      a.className = 'ad-bell-item';
+      a.className = 'collab-bell-item';
       a.href = esc(n.link || PAGE);
       a.setAttribute('data-tab', '');
       a.setAttribute('data-title', '通知');

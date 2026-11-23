@@ -3,12 +3,6 @@
 (function () {
   "use strict";
 
-  // 每次 htmx 请求携带 CSRF 令牌。
-  document.addEventListener("htmx:configRequest", function (e) {
-    var meta = document.querySelector('meta[name="csrf-token"]');
-    if (meta) { e.detail.headers["X-CSRF-Token"] = meta.content; }
-  });
-
   // 服务端错误显示 toast，避免按钮看起来卡死。
   document.addEventListener("htmx:responseError", function (e) {
     flash(e.detail.xhr.status + " " + (e.detail.xhr.statusText || "request failed"), "bad");

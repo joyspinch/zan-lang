@@ -26,24 +26,29 @@
       + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
 
-  /* Chat 页：追加一条对端来信（DOM 结构对齐 Messages.Chat.html 服务端行）。 */
+  function activeRoot() {
+    if (window.ZanAdmin && typeof ZanAdmin.panel === 'function') {
+      return ZanAdmin.panel() || document;
+    }
+    return document;
+  }
+
+  /* Chat 页：追加一条对端来信（DOM 结构对齐 Messages.Chat.html 服务端行，走语义类以兼容 CSP）。 */
   function appendRow(box, m) {
     var scroll = box.querySelector('[data-chat-scroll]');
     if (!scroll) { return; }
     var emptyEl = scroll.querySelector('.empty');
     if (emptyEl) { emptyEl.remove(); }
     var wrap = document.createElement('div');
-    wrap.style.cssText = 'display:flex;margin:4px 0';
+    wrap.className = 'chatrow';
     var bubble = document.createElement('div');
-    bubble.style.cssText = 'max-width:72%;padding:6px 10px;border-radius:8px;'
-      + 'border:1px solid #eef0f3';
+    bubble.className = 'bubble';
     var meta = document.createElement('div');
-    meta.className = 'muted';
-    meta.style.fontSize = '11px';
+    meta.className = 'muted fs11';
     meta.textContent = (box.getAttribute('data-chat-name') || '对方')
       + ' · ' + stamp(m.createdAt);
     var body = document.createElement('div');
-    body.style.cssText = 'white-space:pre-wrap;line-height:1.6';
+    body.className = 'pretext';
     body.textContent = m.content || '';
     bubble.appendChild(meta);
     bubble.appendChild(body);
@@ -54,8 +59,8 @@
 
   /* 会话列表页：更新对端行未读徽标（+1 落库口径旁路，仅本次在线增量）
      与最近消息摘要（对齐 Messages.Index.html 服务端单元格结构）。 */
-  function bumpRow(m) {
-    var tr = document.querySelector('tr[data-peer="' + String(m.fromId) + '"]');
+  function bumpRow(root, m) {
+    var tr = (root || document).querySelector('tr[data-peer="' + String(m.fromId) + '"]');
     if (!tr) { return; }
     var cell = tr.querySelector('[data-unread]');
     if (cell) {
@@ -113,26 +118,27 @@
 
   function onFrame(m) {
     if (!m) { return; }
+    var root = activeRoot();
     if (m.type === 'message') {
       var from = String(m.fromId == null ? '' : m.fromId);
       if (!from) { return; }
-      var box = document.querySelector('[data-chat-peer]');
+      var box = root.querySelector('[data-chat-peer]');
       if (box && from === box.getAttribute('data-chat-peer')) {
         appendRow(box, m);
         readUp(from);
         return;
       }
-      if (document.querySelector('tr[data-peer]')) { bumpRow(m); }
+      if (root.querySelector('tr[data-peer]')) { bumpRow(root, m); }
       ack(m.id);
       return;
     }
     if (m.type === 'ack') {
-      var b1 = document.querySelector('[data-chat-peer]');
+      var b1 = root.querySelector('[data-chat-peer]');
       if (b1) { markBubble(b1, m.msgId, ' · 已送达'); }
       return;
     }
     if (m.type === 'read') {
-      var b2 = document.querySelector('[data-chat-peer]');
+      var b2 = root.querySelector('[data-chat-peer]');
       if (b2 && String(m.by) === b2.getAttribute('data-chat-peer')) {
         markUpTo(b2, m.msgId, ' · 已读');
       }

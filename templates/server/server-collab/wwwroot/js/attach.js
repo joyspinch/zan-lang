@@ -99,7 +99,18 @@
     load();
   }
 
-  // 片段注入点：admin.js 在每次面板/弹窗内容就位后调用此钩子。
+  // 片段注入点：接入 ZanAdmin.onMount（Keep-Alive 面板与弹窗），并保留 applyFragmentWidgets 兼容。
+  if (window.ZanAdmin && typeof ZanAdmin.onMount === 'function') {
+    ZanAdmin.onMount(function (root) {
+      try { mount(root); } catch (e) { /* 附件区失败不拖累屏幕本身 */ }
+    });
+  } else {
+    window.ZanAdmin = window.ZanAdmin || {};
+    window.ZanAdmin._q = window.ZanAdmin._q || [];
+    window.ZanAdmin._q.push(['onMount', function (root) {
+      try { mount(root); } catch (e) { /* 附件区失败不拖累屏幕本身 */ }
+    }]);
+  }
   var prev = window.applyFragmentWidgets;
   window.applyFragmentWidgets = function (root) {
     if (prev) { prev(root); }

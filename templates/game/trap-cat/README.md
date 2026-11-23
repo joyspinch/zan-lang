@@ -17,19 +17,19 @@
 
 ```powershell
 New-Item -ItemType Directory -Force build | Out-Null
-zanc src/TrapCat.html src/{{NAME}}.zan src/TrapCatBoard.zan src/TrapCatSprite.zan --auto-stdlib -o build/{{NAME}}.exe
+zanc src/{{NAME}}.zan src --auto-stdlib -o build/{{NAME}}.exe
 .\build\{{NAME}}.exe
 ```
 
 Android ARM64 APK 构建（需要 Android SDK、NDK 和 JDK）：
 
 ```powershell
-zanc src/TrapCat.html src/{{NAME}}.zan src/TrapCatBoard.zan src/TrapCatSprite.zan --auto-stdlib --publish --target android-arm64 --emit-apk build/{{NAME}}.apk --apk-package com.zan.trapcat --apk-label "围住神经猫" -o build/{{NAME}}.so
+zanc src/{{NAME}}.zan src --auto-stdlib --publish --embed src/TrapCat.html=src/TrapCat.html --target android-arm64 --emit-apk build/{{NAME}}.apk --apk-package com.zan.trapcat --apk-label "围住神经猫" -o build/{{NAME}}.so
 ```
 
 Android 使用竖屏实际客户区，隐藏桌面标题栏；字体跟随设备 DPI，棋盘按屏幕逻辑宽高切换尺寸。`Form.Create` 的 600×760 用于桌面初始尺寸和 Android 竖屏方向，不会把手机表面限制为 600×760。APK 使用工具链自动生成的调试签名。
 
-HTML 是第一个编译输入，兄弟 `.zan` 文件须一起传入。`TrapCat.html` 保留固定文件名，使生成的 `TrapCatHtml` 类不受项目名影响。
+入口 `.zan` 排在首位，`src` 递归纳入其余 Zan 源码。`TrapCat.html` 在开发时从项目目录读取，发布时以程序读取的逻辑名 `src/TrapCat.html` 内嵌。
 
 **底图怎么接的**（`src/App.zan` 的 `SetupBoardArt`）：`assets/board.jpg` 用
 `Game.Kit.Assets.Find` 定位（以 exe 目录为锚向上找 4 级），找到就写进
