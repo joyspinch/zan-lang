@@ -1,0 +1,182 @@
+using System;
+using System.Collections.Generic;
+using Gui.Backend;
+
+namespace Gui;
+
+// 帧统计：可选帧分析器（ZAN_FRAME_PROF / GuiFrameProfiler）读写的计数与耗时。
+// 从 App 拆出——这些是诊断数据，不是窗口/渲染状态；App 只持有一个 Stats 实例。
+public class FrameStats {
+    public int Frames;
+    public int RenderMs;
+    public int PresentMs;
+    public int PartFrames;
+    public int PartRenderMs;
+    public int PartPresentMs;
+    public int WorstMs;
+    public int SlowFrames;
+    public int StyleAt;
+    public int StyleMissAt;
+    public int PxFillAt;
+    public int PxBlendAt;
+    public int PxBlurAt;
+    public int PxGlyphAt;
+    public int PxSnapAt;
+    public int PhaseAtUs;
+    public int PhaseBgUs;
+    public int PhaseMeasUs;
+    public int PhaseArrUs;
+    public int PhaseTreeUs;
+    public int ScopeId;
+    public int ScopeAtUs;
+    public int ScopeEndUs;
+    public int ScopeEndId;
+    public string PhaseSecTop;
+    public int PhaseSecTopUs;
+    public int MarkAtUs;
+    public string PhaseMarkTop;
+    public int PhaseMarkTopUs;
+    public string MarkNow;
+    public string RedrawWhy;
+    public int RedrawCount;
+    public string FrameWhy;
+    public int FrameWhyN;
+    public List<WhyTally> FullWhy;
+    public string PhaseTopNode;
+    public int PhaseTopUs;
+    public int BgUs;
+    public int MeasUs;
+    public int ArrUs;
+    public int TreeUs;
+    public int BeginMs;
+    public int FxMs;
+    public int OverlayMs;
+    public int LoopAt;
+    public int Loops;
+    public int PollPath;
+    public int AnimPath;
+    public int WaitPath;
+    public int EvNone;
+    public int EvMove;
+    public int EvOther;
+    public int LoopMs;
+    public int FxTicks;
+    public int FxOnlyTicks;
+    public int FxTickMs;
+    public int FxTickUs;
+    public int FxRestoreUs;
+    public int FxRenderUs;
+    public int FxPresentUs;
+
+    // 宿主在一大段绘制里埋的标记点：把自上一个标记以来的时间
+    // 记到 `name` 头上（空名字只重置起点），分析器关着时不做事。
+    public void Mark(string name) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - MarkAtUs;
+        bool first = MarkAtUs == 0;
+        MarkAtUs = now;
+        if (name != "") { MarkNow = name; }
+        if (name == "" || first) { return; }
+        if (d > PhaseMarkTopUs) {
+            PhaseMarkTopUs = d;
+            PhaseMarkTop = name;
+        }
+    }
+    public void ScopeBegin(int id) {
+        if (!App.PerfOn()) { return; }
+        ScopeId = id;
+        ScopeAtUs = Window.GetTickUs();
+    }
+    public void ScopeEnd(int id) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - ScopeAtUs;
+        ScopeEndUs = now;
+        ScopeEndId = id;
+        if (d <= PhaseSecTopUs) { return; }
+        PhaseSecTopUs = d;
+        PhaseSecTop = Convert.ToString(id);
+    }
+    public void NoteRedrawWhy(string why) {
+        if (!App.PerfOn()) { return; }
+        if (RedrawWhy == "") {
+            string ctx = MarkNow;
+            if (ctx == "") { ctx = "ev"; }
+            RedrawWhy = ctx + ":" + why;
+            RedrawCount = 1;
+        } else {
+            RedrawCount = RedrawCount + 1;
+        }
+    }
+    public void NoteFullFrameWhy() {
+        if (!App.PerfOn()) { return; }
+        if (FullWhy == null) { FullWhy = new List<WhyTally>(); }
+        string key = FrameWhy;
+        if (key == "") { key = "unspecified"; }
+        for (int i = 0; i < FullWhy.Count; i = i + 1) {
+            if (FullWhy[i].why == key) {
+                FullWhy[i].n = FullWhy[i].n + 1;
+                return;
+            }
+        }
+        WhyTally t = new WhyTally(key);
+        FullWhy.Add(t);
+    }
+    public string FullFrameWhyTop(int top) {
+        if (FullWhy == null || FullWhy.Count == 0) { return "-"; }
+        List<int> left = new List<int>();
+        for (int i = 0; i < FullWhy.Count; i = i + 1) {
+            left.Add(FullWhy[i].n);
+        }
+        string outp = "";
+        int taken = 0;
+        while (taken < top) {
+            int best = 0 - 1;
+            for (int i = 0; i < left.Count; i = i + 1) {
+                if (left[i] <= 0) { continue; }
+                if (best < 0 || left[i] > left[best]) { best = i; }
+            }
+            if (best < 0) { break; }
+            if (outp != "") { outp = outp + ","; }
+            outp = outp + FullWhy[best].why + ":"
+                + Convert.ToString(FullWhy[best].n);
+            left[best] = 0;
+            taken = taken + 1;
+        }
+        if (outp == "") { return "-"; }
+        return outp;
+    }
+    public void Node(string kind, string nm, int us) {
+        if (us <= PhaseTopUs) { return; }
+        PhaseTopUs = us;
+        PhaseTopNode = kind + "#" + nm;
+    }
+    public void PhaseBegin() {
+        if (!App.PerfOn()) { return; }
+        PhaseAtUs = Window.GetTickUs();
+    }
+    public void PhaseEnd(int slot) {
+        if (!App.PerfOn()) { return; }
+        int now = Window.GetTickUs();
+        int d = now - PhaseAtUs;
+        PhaseAtUs = now;
+        if (d < 0) { return; }
+        if (slot == 0) { PhaseBgUs = PhaseBgUs + d; }
+        else if (slot == 1) { PhaseMeasUs = PhaseMeasUs + d; }
+        else if (slot == 2) { PhaseArrUs = PhaseArrUs + d; }
+        else { PhaseTreeUs = PhaseTreeUs + d; }
+    }
+    public static string UsAvg(int us, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = us / n / 100;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
+    }
+    public static string MsAvg(int total, int n) {
+        if (n <= 0) { n = 1; }
+        int tenths = total * 10 / n;
+        return Convert.ToString(tenths / 10) + "."
+            + Convert.ToString(tenths % 10);
+    }
+}
