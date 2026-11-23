@@ -317,6 +317,25 @@
         LLVMPositionBuilderAtEnd(g->builder, calld);
         LLVMTypeRef dfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
         LLVMValueRef dfn = LLVMBuildBitCast(g->builder, dpp, LLVMPointerType(dfnty, 0), "dfn");
+        /* 快路径：入口读到的计数 > 1 时这次释放只是减一，不会析构——直接调
+         * 类释放函数（它自己做原子减），跳过下面的线程局部深度记账与延迟队列
+         * 询问。Mac 上每次 TLS 访问都是一次 _tlv_get_addr 调用：集合析构逐元素
+         * release_dyn，特化后的 List<类> 拆除里它占采样的近一成。与并发释放赛跑
+         * 到 0 的罕见情形照常析构，只是这一层不计深度（深度只防极深级联）。 */
+        if (!g->target_is_wasm) {
+            LLVMBasicBlockRef fast_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_release_dyn, "rel.fast");
+            LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx,
+                g->rt_release_dyn, "rel.slow");
+            LLVMBuildCondBr(g->builder,
+                zan_icmp(g->builder, LLVMIntSGT, sent_rc,
+                         LLVMConstInt(i64, 1, 0), "rel.shared"),
+                fast_bb, slow_bb);
+            LLVMPositionBuilderAtEnd(g->builder, fast_bb);
+            zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
+            LLVMBuildBr(g->builder, ret_bb);
+            LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+        }
         /* B-ID78 深树级联析构防护：类释放深度超过阈值时不再同步下钻，
          * 把 (释放函数, 死对象) 交给延迟队列，最外层出口迭代排空，
          * 数千层链表/树的释放不再耗尽线程栈 */

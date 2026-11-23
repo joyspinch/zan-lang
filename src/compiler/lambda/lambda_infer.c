@@ -82,6 +82,18 @@ zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
     return nt;
 }
 
+/* 接收者表达式是否占第 0 个实参：只有**扩展方法**（static + 首参 `this`）。
+ * 早先按「static 且有接收者表达式」判：`Meta.BuildFor<T>()` 写在有同名字段
+ * `Meta` 的类里（C# 的 Color Color 情形），接收者被当成实参 0，形参数对不上，
+ * 特化被拒、退回擦除版——T 丢失，ORM 元数据为空（SELECT  FROM）。 */
+bool method_recv_is_arg0(zan_symbol_t *msym, zan_ast_node_t *recv_expr) {
+    if (!recv_expr || !msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL)
+        return false;
+    if (!(msym->decl->method_decl.modifiers & MOD_STATIC)) return false;
+    zan_ast_list_t *ps = &msym->decl->method_decl.params;
+    return ps->count > 0 && ps->items[0]->param.is_this;
+}
+
 /* 泛型方法调用点推导类型实参绑定 */
 void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_ast_node_t *call,
@@ -104,8 +116,7 @@ void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
      * this，不是声明形参之一。早期这里写成 recv_expr ? 1 : 0，导致实例泛型方法
      * 拿接收者去合一形参类型，真正的实参没参与绑定 → bind 为空 → 退化成擦除版
      * → 形参里的 `is T` 被折成常量 false。 */
-    bool m_static = (msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
-    int arg_base = (recv_expr && m_static) ? 1 : 0;
+    int arg_base = method_recv_is_arg0(msym, recv_expr) ? 1 : 0;
     for (int j = 0; j < params->count; j++) {
         zan_ast_node_t *aexpr = NULL;
         if (arg_base == 1 && j == 0) aexpr = recv_expr;

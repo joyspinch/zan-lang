@@ -701,6 +701,7 @@ LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
 LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg, local_scope_t *locals);
 LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt, local_scope_t *locals);
 void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym, zan_ast_node_t *call, zan_ast_node_t *recv_expr, local_scope_t *locals, zan_type_t **bind);
+bool method_recv_is_arg0(zan_symbol_t *msym, zan_ast_node_t *recv_expr);
 bool irgen_is_tree_lambda(zan_irgen_t *g, zan_ast_node_t *expr);
 bool irgen_type_is_tree_target(zan_type_t *t);
 int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals, zan_ast_node_t *body, zan_ast_node_t *decl);

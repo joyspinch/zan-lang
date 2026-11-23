@@ -128,7 +128,7 @@ int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     zan_ast_list_t *tps = &msym->decl->method_decl.type_params;
     if (tps->count == 0 || tps->count > 8) return -1;
     bool m_static = (msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
-    int recv_params = (recv_expr && m_static) ? 1 : 0;
+    int recv_params = method_recv_is_arg0(msym, recv_expr) ? 1 : 0;
     if (msym->decl->method_decl.params.count !=
         call->call.args.count + recv_params) return -1;
     zan_type_t *owner_inst = NULL;
@@ -168,7 +168,7 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     int pcount = sp.msym->decl->method_decl.params.count;
     bool m_static = (sp.msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
     int this_off = m_static ? 0 : 1;
-    int arg_base = (recv_expr && m_static) ? 1 : 0;
+    int arg_base = method_recv_is_arg0(sp.msym, recv_expr) ? 1 : 0;
     int total = pcount + this_off;
     LLVMValueRef *call_args = (LLVMValueRef *)calloc(
         (size_t)(total > 0 ? total : 1), sizeof(LLVMValueRef));
