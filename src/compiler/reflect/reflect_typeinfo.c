@@ -511,6 +511,50 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
         LLVMValueRef kv = LLVMBuildLoad2(g->builder, i64, kout, "refl.ikv");
         LLVMValueRef called = LLVMBuildICmp(g->builder, LLVMIntNE, kv,
             LLVMConstInt(i64, 0, 0), "refl.icalled");
+        /* 被调方法的引用型返回值（字符串/对象）由 thunk 以 +1 交回。除
+         * InvokeObject 与「确为字符串」的 InvokeString 把它交给调用方外，
+         * 其余形状丢弃返回值，须在此释放：Invoke 调用 fluent 方法
+         * （返回 this）曾因此每次泄漏一个引用。 */
+        if (code != ZAN_REFL_M_IOBJECT) {
+            LLVMValueRef kret = LLVMBuildSub(g->builder, kv,
+                LLVMConstInt(i64, 1, 0), "refl.ikr");
+            LLVMValueRef isref = LLVMBuildOr(g->builder,
+                LLVMBuildICmp(g->builder, LLVMIntEQ, kret,
+                    LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.ikref"),
+                LLVMBuildICmp(g->builder, LLVMIntEQ, kret,
+                    LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.ikstr"),
+                "refl.ikown");
+            if (code == ZAN_REFL_M_ISTRING) {
+                isref = LLVMBuildAnd(g->builder, isref,
+                    LLVMBuildICmp(g->builder, LLVMIntNE, kret,
+                        LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.iknots"),
+                    "refl.ikdrop");
+            }
+            LLVMValueRef drop = LLVMBuildAnd(g->builder,
+                LLVMBuildAnd(g->builder, called, isref, "refl.idrop0"),
+                LLVMBuildICmp(g->builder, LLVMIntNE, v,
+                    LLVMConstInt(i64, 0, 0), "refl.inz"), "refl.idrop");
+            LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+            LLVMBasicBlockRef rel_b = LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irel");
+            LLVMBasicBlockRef cont_b = LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.icont");
+            LLVMBuildCondBr(g->builder, drop, rel_b, cont_b);
+            LLVMPositionBuilderAtEnd(g->builder, rel_b);
+            LLVMValueRef rp = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.irelp");
+            LLVMTypeRef rel_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                (LLVMTypeRef[]){ i8ptr }, 1, 0);
+            /* 字符串没有对象头，走普通释放；对象按动态类型析构。 */
+            LLVMBasicBlockRef str_b = LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irels");
+            LLVMBasicBlockRef obj_b = LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irelo");
+            LLVMBuildCondBr(g->builder, LLVMBuildICmp(g->builder, LLVMIntEQ, kret,
+                LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0), "refl.irelisstr"), str_b, obj_b);
+            LLVMPositionBuilderAtEnd(g->builder, str_b);
+            zan_call2(g->builder, rel_ty, g->rt_str_release, &rp, 1, "");
+            LLVMBuildBr(g->builder, cont_b);
+            LLVMPositionBuilderAtEnd(g->builder, obj_b);
+            zan_call2(g->builder, rel_ty, g->rt_release_dyn, &rp, 1, "");
+            LLVMBuildBr(g->builder, cont_b);
+            LLVMPositionBuilderAtEnd(g->builder, cont_b);
+        }
         if (code == ZAN_REFL_M_IVOID) { *out = called; return true; }
         if (code == ZAN_REFL_M_IOBJECT) {
             LLVMValueRef obj_ret = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.iobj");

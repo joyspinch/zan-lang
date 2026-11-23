@@ -43,9 +43,49 @@ public class PropSpec {
         return this;
     }
 
-    // 按宿主类型解析字段的值类型与存储形态；Control.Props() 构建后立即调用。
+    // 计算属性：经宿主上的一对访问器方法读写文本值（`string Getter()` /
+    // `void Setter(string)`），按名反射调用，不捕获宿主（无引用环）。
+    // 取代逐控件重写 GetExtra/SetExtra 的字符串分派。
+    private string getter;
+    private string setter;
+
+    public PropSpec Accessor(string getterName, string setterName) {
+        if (getterName == null || getterName == "" || setterName == null || setterName == "") {
+            throw new ArgumentException("A property accessor requires getter and setter method names.");
+        }
+        getter = getterName;
+        setter = setterName;
+        return this;
+    }
+
+    // 转发属性：读写另一个控件（通常是复合组件内部的子控件）的同名或指定属性。
+    // 目标弱引用：规格缓存在宿主上，子控件本就由宿主的树持有。
+    private weak Control forwardTarget;
+    private string forwardProp;
+
+    public PropSpec ForwardTo(Control target, string prop) {
+        forwardTarget = target;
+        forwardProp = prop != null ? prop : "";
+        return this;
+    }
+
+    // 读走字段、写走宿主的 `void Setter(string)`（写入需要重建内部结构的
+    // 文本属性：标签、项列表串等）。
+    public PropSpec Setter(string setterName) {
+        if (setterName == null || setterName == "") {
+            throw new ArgumentException("A property setter requires a method name.");
+        }
+        setter = setterName;
+        return this;
+    }
+
+    // 按宿主类型解析字段的值类型与存储形态、校验访问器方法存在；
+    // Control.Props() 构建后立即调用，拼错名字在首次取属性表时就抛出。
     public void Resolve(Control owner) {
         if (member != "" && memberStorage < 0) { this.Storage(owner); }
+        if ((getter != "" && !owner.HasMethod(getter)) || (setter != "" && !owner.HasMethod(setter))) {
+            throw new InvalidOperationException("Property accessor does not exist: " + getter + "/" + setter);
+        }
     }
 
     private int Storage(Control owner) {
@@ -75,6 +115,8 @@ public class PropSpec {
 
     public string ReadFrom(Control owner) {
         if (ExtraAccess) { return owner.GetProp(key); }
+        if (forwardProp != "") { return forwardTarget != null ? forwardTarget.GetProp(forwardProp) : ""; }
+        if (getter != "") { return owner.InvokeString(getter); }
         if (member == "") { return this.Read(); }
         bool binding = this.Storage(owner) == 1;
         if (memberKind == 0) {
@@ -94,6 +136,23 @@ public class PropSpec {
 
     public void WriteTo(Control owner, string val) {
         if (ExtraAccess) { owner.SetProp(key, val); return; }
+        if (forwardProp != "") {
+            if (forwardTarget != null) { forwardTarget.SetProp(forwardProp, val); }
+            return;
+        }
+        if (setter != "") {
+            // 字段型属性的 setter 按字段声明类型收参（string/int/bool）；访问器对收文本。
+            if (member == "") { owner.Invoke(setter, val); return; }
+            this.Storage(owner);
+            if (memberKind == 1) {
+                if (this.AcceptNumber(val)) { owner.Invoke(setter, this.NumberValue(val)); }
+            } else if (memberKind == 2) {
+                owner.Invoke(setter, PropSpec.IsOn(val));
+            } else {
+                owner.Invoke(setter, val);
+            }
+            return;
+        }
         if (member == "") { this.Write(val); return; }
         bool binding = this.Storage(owner) == 1;
         if (memberKind == 0) {
@@ -201,6 +260,9 @@ public class PropSpec {
         options = new List<string>();
         str = null;
         member = "";
+        getter = "";
+        setter = "";
+        forwardProp = "";
         memberKind = 0;
         memberStorage = -1;
         tip = "";
@@ -234,7 +296,7 @@ public class PropSpec {
     }
 
     bool IsBound() {
-        return member != "" || str != null || num != null || flag != null;
+        return member != "" || getter != "" || forwardProp != "" || str != null || num != null || flag != null;
     }
 
     // 当 `key` 命名该属性（自身键或某个别名）时为 true。
