@@ -173,7 +173,6 @@ partial class Irgen {
     public List<Node> specVtCls;
     public List<Node> specVtArgs;
     public List<string> specVtSyms;
-    List<ClosedInterfaceDispatch> closedInterfaceDispatches = new List<ClosedInterfaceDispatch>();
     // the symbol of the constructor being emitted ("" = the shared one)
     public string curCtorSym;
     // the instantiations of generic classes the program uses: the class name
@@ -661,6 +660,18 @@ partial class Irgen {
         if (replace) { EmitArcRelease(old, ty); }
     }
 
+    // errno 访问器按宿主取名（对齐 C 宿主 emit_errno_preset）：gen1 产出的
+    // IR 在构建它的同一宿主上链接；Mac 上一律 `_errno` 会让 gen2 链接失败。
+    static string ErrnoSym() {
+        #if WINDOWS
+        return "_errno";
+        #elif MACOS
+        return "__error";
+        #else
+        return "__errno_location";
+        #endif
+    }
+
     // ---- driver ----
     public string Gen(Node unit) {
         string exeDir = Environment.ExeDir();
@@ -830,9 +841,8 @@ partial class Irgen {
         int fp = 0;
         int vp = 0;
         int si = 0;
-        bool pendingInterfaceDispatch = closedInterfaceDispatches.Count > 0;
         while (sp < specMs.Count || cp < specCtors.Count || fp < specFinitSyms.Count
-        || vp < specVtSyms.Count || si < sinitTypes.Count || pendingInterfaceDispatch) {
+        || vp < specVtSyms.Count || si < sinitTypes.Count) {
             while (si < sinitTypes.Count) {
                 GenStaticInit(sinitTypes[si], sinitSyms[si]);
                 si = si + 1;
@@ -904,13 +914,7 @@ partial class Irgen {
                 EmitVtableAs(specVtCls[vp], specVtArgs[vp], specVtSyms[vp]);
                 vp = vp + 1;
             }
-            // Interface targets can queue more concrete bodies, and those
-            // bodies can allocate further implementors. Close both queues
-            // before emitting the final dispatch helpers.
-            QueueClosedInterfaceTargets();
-            pendingInterfaceDispatch = false;
         }
-        EmitClosedInterfaceDispatches();
         // The coroutine runtime is emitted unconditionally, not only when the
         // program awaits something: the C runtime object the program links
         // against references zan_co_ready (zan_io_recv_co), so the symbol has

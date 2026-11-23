@@ -111,7 +111,7 @@ if(REJECTS AND NOT EXISTS ${REJECTS})
   message(FATAL_ERROR "run_selfhost_diff.cmake: the reject list '${REJECTS}' does not exist (pass an absolute path)")
 endif()
 
-find_program(PYTHON_EXE python)
+find_program(PYTHON_EXE NAMES python3 python)
 if(NOT PYTHON_EXE)
   message(FATAL_ERROR "run_selfhost_diff.cmake: python is required for the parallel differential loop (scripts/run_diff_parallel.py)")
 endif()

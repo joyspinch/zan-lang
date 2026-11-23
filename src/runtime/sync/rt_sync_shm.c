@@ -222,8 +222,20 @@ long long zan_exe_dir_into(char *out, long long cap) {
     return (long long)n;
 #else
     char buf[1024];
+#ifdef __APPLE__
+    /* macOS 没有 /proc：Environment.ExeDir() 曾在 Mac 上恒为空串，
+     * 依赖它定位 stdlib 的工具（自举 gen1）只能碰巧靠 cwd 找到。 */
+    char raw[1024];
+    uint32_t rsz = (uint32_t)sizeof(raw);
+    ssize_t n = 0;
+    if (_NSGetExecutablePath(raw, &rsz) == 0) {
+        if (realpath(raw, buf)) n = (ssize_t)strlen(buf);
+        else { n = (ssize_t)strlen(raw); memcpy(buf, raw, (size_t)n + 1); }
+    }
+#else
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n < 0) n = 0;
+#endif
     while (n > 0 && buf[n - 1] != '/') n--;
     if (n > 0) n--;
     if ((long long)n >= cap) n = (ssize_t)(cap - 1);
