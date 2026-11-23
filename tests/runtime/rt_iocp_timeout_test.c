@@ -126,8 +126,27 @@ static DWORD WINAPI observe_idle(LPVOID arg) {
   *(int *)arg = co_all_idle();
   return 0;
 }
+static LONG io_pending_count(void) {
+  LONG total = 0;
+  int n = (int)g_shards;
+  if (n < 1)
+    n = 1;
+  for (int i = 0; i < n; i++)
+    total += g_io_shard_cnt[i].v;
+  return total;
+}
+static int is_io_shard_counter(volatile LONG *counter) {
+  int n = (int)g_shards;
+  if (n < 1)
+    n = 1;
+  for (int i = 0; i < n; i++) {
+    if (counter == (volatile LONG *)&g_io_shard_cnt[i].v)
+      return 1;
+  }
+  return 0;
+}
 static void check_completion_handoff(volatile LONG *counter) {
-  if (!handoff_active || (counter != (volatile LONG *)&g_io_count &&
+  if (!handoff_active || (!is_io_shard_counter(counter) &&
                           counter != (volatile LONG *)&g_blocking_inflight))
     return;
   /* Pause the completion consumer exactly after releasing its pending IO
@@ -167,7 +186,7 @@ static void run_handoff(int worker_path, int count) {
     CHECK(zan_io_poll(0) == count);
   }
   handoff_active = 0;
-  CHECK(g_io_count == 0);
+  CHECK(io_pending_count() == 0);
   CHECK(co_cnt_outstanding() == count);
   for (int i = 0; i < count; i++) {
     CHECK(out[i] == 7);
@@ -233,7 +252,7 @@ static void run_case(int worker_path, int error, int expire) {
   cancel_error = error;
   zan_io_recv_to_co((intptr_t)INVALID_SOCKET, buf, sizeof(buf), 60000, &frame,
                     NULL, &out);
-  CHECK(submitted != NULL && g_io_count == 1 && g_rto != NULL);
+  CHECK(submitted != NULL && io_pending_count() == 1 && g_rto != NULL);
   zan_io_op_t *op = CONTAINING_RECORD(submitted, zan_io_op_t, ov);
   if (expire) {
     EnterCriticalSection(&g_rto_lock);
@@ -242,7 +261,7 @@ static void run_case(int worker_path, int error, int expire) {
     CHECK(rto_timeout_scan() == 0);
     CHECK(cancel_calls == cancels + 1);
     CHECK(out == 1234); /* no early result publication or wake */
-    CHECK(g_io_count == 1 && op->rto == 2 && g_rto == NULL);
+    CHECK(io_pending_count() == 1 && op->rto == 2 && g_rto == NULL);
     CHECK(rto_timeout_scan() == 0 && cancel_calls == cancels + 1);
   }
   completion = submitted;
@@ -255,7 +274,7 @@ static void run_case(int worker_path, int error, int expire) {
     CHECK(zan_io_poll(0) == 1);
   }
   CHECK(out == (expire ? -1 : 7));
-  CHECK(g_io_count == 0 && g_rto == NULL);
+  CHECK(io_pending_count() == 0 && g_rto == NULL);
   CHECK(completion == NULL);
 }
 #include "rt_co_sched_checks.h"

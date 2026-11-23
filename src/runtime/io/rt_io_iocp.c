@@ -862,7 +862,8 @@ static void io_complete_op(zan_io_op_t *op, DWORD transferred,
                    (const char *)&op->sock, (int)sizeof(op->sock)) == 0) {
       u_long mode = 1;
       ioctlsocket(accepted, FIONBIO, &mode);
-      (void)ensure_assoc(accepted);
+      /* Do not bind `accepted` to IOCP here: Master hands it off via
+       * WSADuplicateSocket, and first-IO ensure_assoc binds it in the worker. */
       result = (int64_t)accepted;
     } else {
       closesocket(accepted);
