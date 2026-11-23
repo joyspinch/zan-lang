@@ -1,0 +1,61 @@
+using System;
+using System.Net.Http;
+using System.Web;
+
+// ForwardedHeaders 只信受托代理跳：曾无条件取 X-Forwarded-For 最左项且
+// 从不看名单，任何客户端伪造一行头即可换限流桶、绕过按 IP 的节流。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool cond, string name) {
+        if (cond) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static string Ip(ForwardedHeaders fh, string peer, string headers) {
+        HttpRequest req = HttpRequest.Parse("GET / HTTP/1.1\r\nHost: t\r\n" + headers + "\r\n");
+        HttpContext ctx = new HttpContext(req, peer);
+        return fh.ResolveClientIp(ctx);
+    }
+
+    static void Main() {
+        ForwardedHeaders off = new ForwardedHeaders();
+        Check(Ip(off, "192.0.2.9", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.9", "disabled ignores XFF");
+
+        ForwardedHeaders none = new ForwardedHeaders();
+        none.Enable();
+        Check(Ip(none, "192.0.2.9", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.9",
+            "enabled without trusted proxies ignores XFF");
+
+        ForwardedHeaders fh = new ForwardedHeaders();
+        fh.Enable();
+        fh.AddTrustedProxies("192.0.2.40, 192.0.2.41, ::1");
+        Check(Ip(fh, "192.0.2.42", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.42", "untrusted peer spoof ignored");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "198.51.100.1", "trusted proxy client");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: 203.0.113.99, 198.51.100.1\r\n") == "198.51.100.1",
+            "spoofed leftmost ignored");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: 203.0.113.99, 198.51.100.1, 192.0.2.41\r\n") == "198.51.100.1",
+            "trusted multi-hop suffix");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: 198.51.100.1, 192.0.2.42\r\n") == "192.0.2.42",
+            "stop at untrusted intermediate");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\nx-forwarded-for: 198.51.100.2\r\n") == "192.0.2.40",
+            "duplicate XFF rejected");
+        Check(Ip(fh, "192.0.2.40", "X-Forwarded-For: not-an-ip\r\n") == "192.0.2.40", "malformed hop rejected");
+        Check(Ip(fh, "192.0.2.40", "X-Real-IP: 198.51.100.7\r\nForwarded: for=198.51.100.8\r\n") == "192.0.2.40",
+            "no alternate forwarding headers");
+        Check(Ip(fh, "0:0:0:0:0:0:0:1", "X-Forwarded-For: 2001:DB8::a\r\n") == "2001:0db8:0000:0000:0000:0000:0000:000a",
+            "IPv6 trusted peer canonical client");
+        Check(Ip(fh, "", "X-Forwarded-For: 198.51.100.1\r\n") == "unknown", "missing peer fixed bucket");
+
+        ForwardedHeaders bad = new ForwardedHeaders();
+        bad.Enable();
+        bad.AddTrustedProxies("192.0.2.40,*");
+        Check(Ip(bad, "192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.40", "invalid entry voids trust");
+        ForwardedHeaders cidr = new ForwardedHeaders();
+        cidr.Enable();
+        cidr.AddTrustedProxy("192.0.2.0/24");
+        Check(Ip(cidr, "192.0.2.40", "X-Forwarded-For: 198.51.100.1\r\n") == "192.0.2.40", "CIDR not implicitly trusted");
+
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+    }
+}

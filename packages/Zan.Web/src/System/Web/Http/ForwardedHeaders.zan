@@ -1,15 +1,35 @@
 using System;
+using System.Net.External;
+using System.Net.Http;
 
 namespace System.Web;
 
-// 反向代理（Nginx / Envoy / HAProxy / K8s Ingress）标头还原处理器
+// 反向代理（Nginx / Envoy / HAProxy / K8s Ingress）标头还原处理器。
+//
+// 只信受托跳：对端（套接字 peer）不在受托代理名单里时一律回答对端本身，
+// 任何客户端自带的 X-Forwarded-For 都不生效。对端受托时从 XFF 链右端
+// 往左走，跳过受托代理，第一个非受托地址即真实客户端——从不盲取最左项
+// （最左项是客户端自己写的，经受托代理追加后照样可被伪造）。
+//
+// 曾经的实现启用后无条件取 XFF 最左项且从不看名单：任何客户端伪造一行
+// X-Forwarded-For 即可换一个限流桶、绕过按 IP 的限流与登录节流。
+//
+// 名单为空 = 不信任任何代理（启用但未配置代理时 XFF 被忽略）。名单里
+// 任一项不是合法 IP 字面量（含 "*"、CIDR）时整份名单作废——宁可退回
+// 对端，也不让一条手误把信任面放大。
 public class ForwardedHeaders {
     private bool enabled;
     private List<string> trustedProxies;
+    private bool trustInvalid;
+
+    // 头值与链长上限：超出视为畸形，退回对端。
+    public static const int MaxHeaderLength = 2048;
+    public static const int MaxHops = 32;
 
     public ForwardedHeaders() {
         this.enabled = false;
         this.trustedProxies = new List<string>();
+        this.trustInvalid = false;
     }
 
     public void Enable() {
@@ -20,40 +40,144 @@ public class ForwardedHeaders {
         return this.enabled;
     }
 
+    // 登记受托代理（单个 IPv4/IPv6 字面量，按规范拼写比较）。
     public void AddTrustedProxy(string proxyIp) {
-        if (proxyIp != null && proxyIp.Length > 0) {
-            this.trustedProxies.Add(proxyIp);
+        if (proxyIp == null) { return; }
+        string ip = ForwardedHeaders.Canonical(proxyIp.Trim());
+        if (ip.Length == 0) {
+            this.trustInvalid = true;
+            return;
+        }
+        if (!this.trustedProxies.Contains(ip)) { this.trustedProxies.Add(ip); }
+    }
+
+    // 逗号分隔的受托代理名单（配置文件口径）；空串不登记任何代理。
+    public void AddTrustedProxies(string csv) {
+        if (csv == null || csv.Trim().Length == 0) { return; }
+        if (csv.Length > 4096) { this.trustInvalid = true; return; }
+        List<string> entries = csv.Split(",");
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            this.AddTrustedProxy(entries[i]);
         }
     }
 
-    // 从 HttpContext 提取并还原真实客户端 IP
+    public List<string> TrustedProxies() { return this.trustedProxies; }
+
+    // 从 HttpContext 还原真实客户端 IP（规范拼写；对端缺失时答 "unknown"）。
     public string ResolveClientIp(HttpContext ctx) {
         if (ctx == null) { return ""; }
-        if (!this.enabled) {
-            return ctx.RemoteIp();
-        }
+        if (!this.enabled) { return ctx.RemoteIp(); }
+        List<string> trusted = this.trustedProxies;
+        if (this.trustInvalid) { trusted = new List<string>(); }
+        return ForwardedHeaders.Resolve(ctx.RemoteIp(), ctx.Request(), trusted);
+    }
 
-        // 1. 优先读取 X-Forwarded-For（取首个非空 IP）
-        string xff = ctx.Header("X-Forwarded-For");
-        if (xff != null && xff.Length > 0) {
-            int commaIdx = xff.IndexOf(",");
-            string firstIp = commaIdx >= 0 ? xff.Substring(0, commaIdx) : xff;
-            firstIp = firstIp.Trim();
-            if (firstIp.Length > 0) {
-                return firstIp;
+    // 纯函数口径（WebApp 与 MVC ClientIp 共用）：peer 为套接字对端，
+    // trusted 为规范拼写的受托代理名单。
+    public static string Resolve(string remoteIp, HttpRequest request, List<string> trusted) {
+        string peer = ForwardedHeaders.Canonical(remoteIp);
+        if (peer.Length == 0) { return "unknown"; }
+        if (trusted == null || trusted.Count == 0 || !trusted.Contains(peer)) { return peer; }
+        if (request == null || request.parseStatus != 0) { return peer; }
+        // 多行同名 XFF 拼接语义不一（各代理各取一行），出现即不信；
+        // 折行（obs-fold）同理。
+        int fields = 0;
+        List<string> lines = request.rawHeaders.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t')) { return peer; }
+            int colon = line.IndexOf(":");
+            if (colon >= 0 && line.Substring(0, colon).Trim().ToLower() == "x-forwarded-for") {
+                fields = fields + 1;
             }
         }
+        // 只认 X-Forwarded-For 一种转发头：X-Real-IP / Forwarded 不并行
+        // 采信（多一种头就多一处代理配置可漏改的伪造面）。
+        if (fields != 1) { return peer; }
+        string forwarded = request.GetHeader("X-Forwarded-For");
+        if (forwarded.Length == 0 || forwarded.Length > ForwardedHeaders.MaxHeaderLength) { return peer; }
+        List<string> hops = forwarded.Split(",");
+        if (hops.Count > ForwardedHeaders.MaxHops) { return peer; }
+        List<string> addresses = new List<string>();
+        for (int i = 0; i < hops.Count; i = i + 1) {
+            string hop = ForwardedHeaders.Canonical(hops[i].Trim());
+            if (hop.Length == 0) { return peer; }
+            addresses.Add(hop);
+        }
+        string current = peer;
+        for (int i = addresses.Count - 1; i >= 0; i = i - 1) {
+            if (!trusted.Contains(current)) { return current; }
+            current = addresses[i];
+        }
+        return current;
+    }
 
-        // 2. 备选读取 X-Real-IP
-        string xRealIp = ctx.Header("X-Real-IP");
-        if (xRealIp != null && xRealIp.Length > 0) {
-            string rip = xRealIp.Trim();
-            if (rip.Length > 0) {
-                return rip;
+    // IPv4/IPv6 字面量的唯一拼写：等价文本不得制造额外限流桶或绕过名单
+    // （IPv6 展开为 8 组 4 位小写十六进制，IPv4-mapped 还原为 IPv4）。
+    // 非法输入答 ""。
+    public static string Canonical(string ip) {
+        if (ip == null || ip.Length == 0 || ip.Length > 45) { return ""; }
+        if (ExternalTarget.ValidIPv4(ip)) { return ip; }
+        if (!ip.Contains(":")) { return ""; }
+        if (ip.Contains(".")) {
+            int tail = ip.LastIndexOf(":") + 1;
+            string v4 = ip.Substring(tail);
+            if (!ExternalTarget.ValidIPv4(v4)) { return ""; }
+            List<string> octets = v4.Split(".");
+            int high = Convert.ToInt32(octets[0]) * 256 + Convert.ToInt32(octets[1]);
+            int low = Convert.ToInt32(octets[2]) * 256 + Convert.ToInt32(octets[3]);
+            ip = ip.Substring(0, tail) + ForwardedHeaders.IpHex(high) + ":"
+                + ForwardedHeaders.IpHex(low);
+        }
+        int gap = ip.IndexOf("::");
+        if (gap >= 0 && ip.IndexOf("::", gap + 2) >= 0) { return ""; }
+        string left = ip;
+        string right = "";
+        if (gap >= 0) { left = ip.Substring(0, gap); right = ip.Substring(gap + 2); }
+        List<int> before = new List<int>();
+        List<int> after = new List<int>();
+        if (!ForwardedHeaders.IpGroups(left, before) || !ForwardedHeaders.IpGroups(right, after)) {
+            return "";
+        }
+        int count = before.Count + after.Count;
+        if ((gap < 0 && count != 8) || (gap >= 0 && count >= 8)) { return ""; }
+        List<int> words = new List<int>();
+        for (int i = 0; i < before.Count; i = i + 1) { words.Add(before[i]); }
+        for (int i = count; i < 8; i = i + 1) { words.Add(0); }
+        for (int i = 0; i < after.Count; i = i + 1) { words.Add(after[i]); }
+        if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0
+            && words[4] == 0 && words[5] == 65535) {
+            return Convert.ToString(words[6] / 256) + "." + Convert.ToString(words[6] % 256)
+                + "." + Convert.ToString(words[7] / 256) + "." + Convert.ToString(words[7] % 256);
+        }
+        string result = "";
+        for (int i = 0; i < 8; i = i + 1) {
+            if (i > 0) { result = result + ":"; }
+            result = result + ForwardedHeaders.IpHex(words[i]);
+        }
+        return result;
+    }
+
+    private static bool IpGroups(string part, List<int> words) {
+        if (part.Length == 0) { return true; }
+        int start = 0;
+        for (int i = 0; i <= part.Length; i = i + 1) {
+            if (i == part.Length || part[i] == ':') {
+                int word = ExternalTarget.ParseHex(part.Substring(start, i - start));
+                if (word < 0 || words.Count >= 8) { return false; }
+                words.Add(word);
+                start = i + 1;
             }
         }
+        return true;
+    }
 
-        // 3. 回退为底层套接字对端 IP
-        return ctx.RemoteIp();
+    private static string IpHex(int word) {
+        string digits = "0123456789abcdef";
+        string result = "";
+        for (int shift = 12; shift >= 0; shift = shift - 4) {
+            result = result + digits.Substring((word >> shift) & 15, 1);
+        }
+        return result;
     }
 }
