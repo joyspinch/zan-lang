@@ -268,14 +268,19 @@ class Program {
                 catch (Exception ex) { error = ex.Message; }
                 Program.Check(error == expected && raw.rollbacks == 1,
                     "explicit rollback failure propagated");
+                /* 回滚失败即弃用状态不明的连接（不留给收尾重试）：[Tx] 蹦床在
+                   finally 里跑 AfterAsync，收尾再抛回滚错会盖掉动作的原异常。 */
+                Program.Check(raw.closes == 1 && ctrl.__Conn() == null,
+                    "rollback failure discards lease immediately");
+                Program.Check(write.LiveCount() == 0 && write.IdleCount() == 0,
+                    "dirty connection removed even when close throws");
                 error = "";
                 try { await ctrl.OnAfterAsync(); }
                 catch (Exception ex) { error = ex.Message; }
-                Program.Check(error == expected, "rollback error survives close and OnDone failures");
-                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && ctrl.done == 1
-                    && ctrl.__Conn() == null, "teardown retries rollback and clears lease");
-                Program.Check(write.LiveCount() == 0 && write.IdleCount() == 0,
-                    "dirty connection removed even when close throws");
+                Program.Check(error == "injected done failure",
+                    "teardown does not re-raise delivered rollback error");
+                Program.Check(raw.rollbacks == 1 && raw.closes == 1 && ctrl.done == 1
+                    && ctrl.__Conn() == null, "teardown skips rollback on discarded lease");
                 Program.Check(read.LiveCount() == 1 && read.IdleCount() == 1,
                     "secondary lease returned despite rollback failure");
                 if (closeMode == 1) { Program.Check(raw.IsConnected(), "close throws before disconnect"); }
@@ -283,7 +288,7 @@ class Program {
                 await ctrl.OnAfterAsync();
                 await ctrl.TxCommit();
                 await ctrl.TxRollback();
-                Program.Check(raw.rollbacks == 2 && raw.closes == 1 && raw.commits == 0,
+                Program.Check(raw.rollbacks == 1 && raw.closes == 1 && raw.commits == 0,
                     "repeated teardown does not touch discarded lease");
                 if (write.LiveCount() == 0) {
                     IDbConnection replacement = await context.Acquire();
@@ -298,6 +303,31 @@ class Program {
                 raw.Close();
                 write.Close(); read.Close();
             }
+        }
+
+        /* 按 [Tx] 蹦床的形状：动作抛错 → 回滚失败（吞掉）→ finally 收尾，
+           调用方看到的必须仍是动作的原异常。 */
+        for (int mode = 1; mode <= 2; mode = mode + 1) {
+            LeaseFaultConnector connector = new LeaseFaultConnector();
+            DbPool pool = new DbPool(connector, 1);
+            AppServices.Use(new AppServices(DbContext.Of(pool), null));
+            LeaseFaultController ctrl = new LeaseFaultController();
+            Program.Check(await ctrl.TxBegin(), "trampoline transaction began");
+            LeaseFaultConnection raw = connector.last;
+            raw.rollbackMode = mode;
+            string error = "";
+            try {
+                try { throw new Exception("action failure"); }
+                catch (Exception actionError) {
+                    try { await ctrl.TxRollback(); } catch (Exception _rollbackError) { }
+                    throw;
+                } finally {
+                    await ctrl.OnAfterAsync();
+                }
+            } catch (Exception ex) { error = ex.Message; }
+            Program.Check(error == "action failure" && raw.rollbacks == 1 && raw.closes == 1
+                && pool.LiveCount() == 0, "action error survives failed rollback and teardown");
+            pool.Close();
         }
         DbTrace.Sink(null);
         AppServices.Use(null);
