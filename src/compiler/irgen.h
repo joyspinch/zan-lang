@@ -243,6 +243,10 @@ struct zan_irgen {
     unsigned long *field_offsets;
     LLVMTypeRef *field_llvm;
     int field_count;
+    int base_struct_idx;
+    bool devirt_abstract;
+    bool devirt_generic;
+    const char *vtable_name;
   } *struct_types;
   int struct_type_count;
   int struct_type_cap;
@@ -525,6 +529,7 @@ struct zan_irgen {
   int codegen_level; /* --codegen-level；-1 未给（回退 ZAN_CODEGEN_LEVEL env）
                       */
   bool shard_opt;   /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
+  bool sharded_module; /* zan_irgen_shard_run 已拆出分片（非封闭整模块） */
   bool emit_lib;    /* 库构建模式：保持 public 成员导出链接 */
   bool emit_shared; /* 动态共享库模式：发射平台标准入口 (DllMain) */
 

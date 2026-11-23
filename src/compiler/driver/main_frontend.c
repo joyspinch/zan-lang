@@ -117,7 +117,7 @@ for (;;) {
         if (unit->comp_unit.decls.items[k])
           unit->comp_unit.decls.items[k]->from_stdlib = 1;
     }
-    if (fi >= explicit_input_count && input_files[fi] &&
+    if ((gen_meta_path || fi >= explicit_input_count) && input_files[fi] &&
         zan_path_is_package_source(input_files[fi])) {
       for (int k = 0; k < unit->comp_unit.decls.count; k++)
         if (unit->comp_unit.decls.items[k])

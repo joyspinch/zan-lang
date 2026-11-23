@@ -1130,14 +1130,16 @@ int main(int argc, char **argv) {
   phase("link");
   probe_phase_mem("link");
 
-  generated_object_vec_keep_or_remove(
-      &generated_objects, obj_tmp,
-      link_ret != 0 && getenv("ZAN_KEEP_FAILED_OBJ") != NULL);
+  bool keep_failed_obj =
+      link_ret != 0 && getenv("ZAN_KEEP_FAILED_OBJ") != NULL;
+  generated_object_vec_keep_or_remove(&generated_objects, obj_tmp,
+                                      keep_failed_obj);
 
   bool publish_failed = link_ret == 0 && !emit_lib && !apk_path && !ipa_path &&
                         !publish_link_output(obj_path, final_link_path);
   if (link_ret != 0 || publish_failed) {
-    clear_link_work_dir();
+    if (!keep_failed_obj)
+      clear_link_work_dir();
     if (publish_failed)
       fprintf(stderr, "error: cannot publish linked output '%s'\n",
               final_link_path);

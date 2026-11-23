@@ -541,7 +541,8 @@ static LLVMValueRef refl_pget_fn(zan_irgen_t *g) {
 
   LLVMPositionBuilderAtEnd(g->builder, call);
   LLVMValueRef slots = LLVMBuildArrayAlloca(
-      g->builder, i64, LLVMConstInt(i64, ZAN_REFL_ARG_SLOTS, 0), "refl.gargs");
+      g->builder, i64, LLVMConstInt(i64, 2 * ZAN_REFL_ARG_SLOTS, 0),
+      "refl.gargs");
   LLVMValueRef kout = LLVMBuildAlloca(g->builder, i64, "refl.gk");
   LLVMValueRef v = zan_call2(
       g->builder,
@@ -613,7 +614,8 @@ static LLVMValueRef refl_spget_fn(zan_irgen_t *g) {
 
   LLVMPositionBuilderAtEnd(g->builder, call);
   LLVMValueRef slots = LLVMBuildArrayAlloca(
-      g->builder, i64, LLVMConstInt(i64, ZAN_REFL_ARG_SLOTS, 0), "refl.gargs");
+      g->builder, i64, LLVMConstInt(i64, 2 * ZAN_REFL_ARG_SLOTS, 0),
+      "refl.gargs");
   LLVMValueRef kout = LLVMBuildAlloca(g->builder, i64, "refl.gk");
   LLVMValueRef v = zan_call2(
       g->builder,

@@ -102,9 +102,12 @@ def main():
             require(len(owners) == 1,
                     "Live and Unused must be global definitions in one shard")
             shard = owners[0]
-            coordinator = Path(str(work / "retain.exe") + ".o")
-            require(coordinator in [Path(path) for path in retained],
+            coordinators = [Path(path) for path in retained
+                            if Path(path).name in ("module.o", "retain.exe.o",
+                                                   "linked-retain.exe.o")]
+            require(len(coordinators) == 1,
                     "expected the coordinator with generated EH support")
+            coordinator = coordinators[0]
             run([objcopy, "--redefine-sym", "main=ShardGc_ZanEntry", coordinator],
                 env, work, log)
             headers = run([objdump, "-x", shard],

@@ -173,8 +173,18 @@ LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (vt == target) return v;
     if (llvm_is_nullable(target)) {
-        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
-            return LLVMIsNull(v) ? nullable_none(target) : v;
+        if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind) {
+            if (LLVMIsNull(v))
+                return nullable_none(target);
+            LLVMTypeRef pl = nullable_payload_type(target);
+            if (LLVMGetTypeKind(pl) == LLVMStructTypeKind) {
+                LLVMValueRef loaded =
+                    LLVMBuildLoad2(g->builder, pl, v, "nv.struct");
+                LLVMValueRef wrapped = nullable_some(g, target, loaded);
+                return wrapped ? wrapped : v;
+            }
+            return v;
+        }
         if (llvm_is_nullable(vt)) {
             LLVMTypeRef pl = nullable_payload_type(target);
             LLVMValueRef fit = coerce_int_to(g, nullable_get_payload(g, v), pl);

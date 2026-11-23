@@ -5,7 +5,7 @@
  *   native_arch, publish_mode, binder
  * defines: generated_objects, obj_tmp, obj_path, driver_reg, driver_prefixes,
  * mf （链接与清理阶段在同一 main() 作用域继续消费。） */
-zan_prepare_static_runtime(&irgen, &target);
+zan_prepare_static_runtime(&irgen, &target, extra_link_input_count > 0);
 
 phase("irgen");
 probe_phase_mem("irgen");
@@ -100,6 +100,40 @@ if (arena) {
     ir_diag->pragma_count = ir_diag->pragma_cap = 0;
   }
   irgen.diag = ir_diag;
+  for (int i = 0; i < irgen.struct_type_count; i++) {
+    zan_symbol_t *cur = irgen.struct_types[i].sym;
+    irgen.struct_types[i].base_struct_idx = -1;
+    irgen.struct_types[i].devirt_abstract = false;
+    irgen.struct_types[i].devirt_generic = false;
+    irgen.struct_types[i].vtable_name = NULL;
+    if (!cur)
+      continue;
+    irgen.struct_types[i].devirt_abstract = (cur->modifiers & MOD_ABSTRACT) != 0;
+    irgen.struct_types[i].devirt_generic =
+        cur->decl && cur->decl->type_decl.type_params.count > 0;
+    char vt_buf[320];
+    int vtn = snprintf(vt_buf, sizeof(vt_buf), "__zan_vtable_%.*s",
+                       (int)cur->name.len, cur->name.str);
+    if (vtn > 0 && vtn < (int)sizeof(vt_buf))
+      irgen.struct_types[i].vtable_name =
+          zan_arena_strdup(ir_arena, vt_buf, (size_t)vtn);
+    for (zan_type_t *bt = (cur->type ? cur->type->base_type : NULL); bt;
+         bt = bt->base_type) {
+      if (!bt->sym || bt->sym == cur)
+        continue;
+      for (int j = 0; j < irgen.struct_type_count; j++) {
+        if (irgen.struct_types[j].sym == bt->sym) {
+          irgen.struct_types[i].base_struct_idx = j;
+          break;
+        }
+      }
+      if (irgen.struct_types[i].base_struct_idx >= 0)
+        break;
+    }
+  }
+  for (int i = 0; i < irgen.struct_type_count; i++) {
+    irgen.struct_types[i].sym = NULL;
+  }
   zan_diag_free_buffers(diag);
   zan_arena_free(arena);
   arena = NULL;
@@ -254,8 +288,10 @@ if (!do_emit_ir && want_shard && mf_built) {
     return 1;
   }
 }
-if (shard_n > 0)
+if (shard_n > 0) {
+  irgen.sharded_module = true;
   phase("shard emit");
+}
 probe_phase_mem("shard emit");
 if (mf_built) {
   zan_irgen_manifest_free(&mf);

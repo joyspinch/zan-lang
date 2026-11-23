@@ -46,14 +46,14 @@ set(_method_rows "${CMAKE_MATCH_1}")
 # Every inherited method must share its callable payload as well as signature.
 # Fresh owner-specific wrappers would prevent record interning.
 foreach(_method OnShared OnSecond)
-  string(REGEX MATCHALL "define internal void @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\(" _thunks "${_ir}")
+  string(REGEX MATCHALL "define internal (void|i64) @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\(" _thunks "${_ir}")
   list(LENGTH _thunks _thunk_count)
   if(NOT _thunk_count EQUAL 1)
     message(FATAL_ERROR "compact reflection: ${_method} has ${_thunk_count} wrappers, expected one")
   endif()
   # A valid pooled thunk can still point at a pruned `dead: unreachable` body.
   # Require both the direct forwarding edge and an executable field calculation.
-  string(REGEX MATCH "define internal void @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\([^}]*\n\\}" _thunk_body "${_ir}")
+  string(REGEX MATCH "define internal (void|i64) @[^ (\n]*__zan\\.refl\\.thunk\\.[^ (\n]*CompactSharingBase_${_method}[^ (\n]*\\([^}]*\n\\}" _thunk_body "${_ir}")
   if(NOT _thunk_body MATCHES "call i32 @CompactSharingBase_${_method}\\(")
     message(FATAL_ERROR "compact reflection: ${_method} thunk lost its actual callee")
   endif()

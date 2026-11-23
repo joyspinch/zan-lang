@@ -86,8 +86,118 @@ static LLVMValueRef refl_arg_str(zan_irgen_t *g, zan_ast_node_t *arg,
 
 typedef struct {
   LLVMValueRef values[ZAN_REFL_ARG_SLOTS];
+  LLVMValueRef boxes[ZAN_REFL_ARG_SLOTS];
   int pushed;
 } refl_arg_temps_t;
+
+static LLVMValueRef refl_pack_single_val(zan_irgen_t *g, zan_ast_node_t *expr,
+                                         LLVMValueRef value,
+                                         local_scope_t *locals,
+                                         LLVMValueRef *out_vkind,
+                                         LLVMValueRef *out_box) {
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (out_box)
+    *out_box = NULL;
+  if (!value || !expr) {
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+    return LLVMConstInt(i64, 0, 0);
+  }
+  zan_type_t *vt = infer_expr_type(g, expr, locals);
+  LLVMTypeRef lt = LLVMTypeOf(value);
+  LLVMTypeKind tk = LLVMGetTypeKind(lt);
+  if (vt && vt->kind == TYPE_DECIMAL) {
+    LLVMTypeRef dec_ty = get_decimal_type(g);
+    LLVMValueRef ds = emit_entry_alloca(g, dec_ty, "refl.darg");
+    LLVMBuildStore(g->builder, value, ds);
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_DECIMAL, 0);
+    return LLVMBuildPtrToInt(g->builder, ds, i64, "refl.dptr");
+  }
+  if (vt && vt->kind == TYPE_STRUCT) {
+    if (irgen_boxed_eligible_struct(g, vt)) {
+      bool owned = expr_yields_owned_rc_value(g, expr, locals);
+      LLVMValueRef box = refl_emit_box_struct_val(g, vt, value, owned);
+      if (out_box)
+        *out_box = box;
+      *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_PTR, 0);
+      return LLVMBuildPtrToInt(g->builder, box, i64, "refl.sbox");
+    }
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+    return LLVMConstInt(i64, 0, 0);
+  }
+  if (vt && vt->kind == TYPE_NULLABLE && vt->element_type &&
+      llvm_is_nullable(lt)) {
+    zan_type_t *et = vt->element_type;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef some_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.pns");
+    LLVMBasicBlockRef none_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.pnn");
+    LLVMBasicBlockRef done_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.pnd");
+    LLVMBuildCondBr(g->builder, nullable_has_value(g, value), some_bb, none_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, some_bb);
+    LLVMValueRef pl = nullable_get_payload(g, value);
+    LLVMValueRef sv = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef sk = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+    LLVMValueRef sbox = LLVMConstNull(i8ptr);
+    if (et->kind == TYPE_DECIMAL) {
+      LLVMTypeRef dec_ty = get_decimal_type(g);
+      LLVMValueRef ds = emit_entry_alloca(g, dec_ty, "refl.ndarg");
+      LLVMBuildStore(g->builder, pl, ds);
+      sv = LLVMBuildPtrToInt(g->builder, ds, i64, "refl.ndptr");
+      sk = LLVMConstInt(i64, ZAN_REFL_VK_DECIMAL, 0);
+    } else if (et->kind == TYPE_STRUCT && irgen_boxed_eligible_struct(g, et)) {
+      bool owned = expr_yields_owned_rc_value(g, expr, locals);
+      sbox = refl_emit_box_struct_val(g, et, pl, owned);
+      sv = LLVMBuildPtrToInt(g->builder, sbox, i64, "refl.nsbox");
+      sk = LLVMConstInt(i64, ZAN_REFL_VK_PTR, 0);
+    } else if (et->kind == TYPE_FLOAT || et->kind == TYPE_DOUBLE) {
+      sv = refl_to_slot(g, pl);
+      sk = LLVMConstInt(i64, ZAN_REFL_VK_DOUBLE, 0);
+    } else if (LLVMGetTypeKind(LLVMTypeOf(pl)) == LLVMIntegerTypeKind) {
+      sv = extend_int_for_slot(g, pl, et, i64);
+      sk = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+    }
+    LLVMBasicBlockRef some_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, none_bb);
+    LLVMBuildBr(g->builder, done_bb);
+
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+    LLVMValueRef vphi = LLVMBuildPhi(g->builder, i64, "refl.pnv");
+    LLVMAddIncoming(vphi, (LLVMValueRef[]){sv, LLVMConstInt(i64, 0, 0)},
+                    (LLVMBasicBlockRef[]){some_end, none_bb}, 2);
+    LLVMValueRef kphi = LLVMBuildPhi(g->builder, i64, "refl.pnk");
+    LLVMAddIncoming(kphi,
+                    (LLVMValueRef[]){sk, LLVMConstInt(i64, ZAN_REFL_VK_PTR, 0)},
+                    (LLVMBasicBlockRef[]){some_end, none_bb}, 2);
+    if (out_box && et->kind == TYPE_STRUCT && irgen_boxed_eligible_struct(g, et)) {
+      LLVMValueRef bphi = LLVMBuildPhi(g->builder, i8ptr, "refl.pnb");
+      LLVMAddIncoming(bphi, (LLVMValueRef[]){sbox, LLVMConstNull(i8ptr)},
+                      (LLVMBasicBlockRef[]){some_end, none_bb}, 2);
+      *out_box = bphi;
+    }
+    *out_vkind = kphi;
+    return vphi;
+  }
+  if (tk == LLVMFloatTypeKind || tk == LLVMDoubleTypeKind) {
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_DOUBLE, 0);
+    return refl_to_slot(g, value);
+  }
+  if (tk == LLVMPointerTypeKind) {
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_PTR, 0);
+    return refl_to_slot(g, value);
+  }
+  if (tk == LLVMIntegerTypeKind) {
+    *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+    return extend_int_for_slot(g, value, vt, i64);
+  }
+  *out_vkind = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
+  return refl_to_slot(g, value);
+}
 
 static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
                                    int argc, int from, local_scope_t *locals,
@@ -95,21 +205,35 @@ static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
   memset(temps, 0, sizeof(*temps));
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMValueRef slots = LLVMBuildArrayAlloca(
-      g->builder, i64, LLVMConstInt(i64, ZAN_REFL_ARG_SLOTS, 0), "refl.args");
+      g->builder, i64, LLVMConstInt(i64, 2 * ZAN_REFL_ARG_SLOTS, 0),
+      "refl.args");
   for (int i = 0; i < ZAN_REFL_ARG_SLOTS; i++) {
     LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)i, 0);
     LLVMValueRef p = LLVMBuildGEP2(g->builder, i64, slots, &off, 1, "refl.as");
+    LLVMValueRef koff =
+        LLVMConstInt(i64, (unsigned long long)(ZAN_REFL_ARG_SLOTS + i), 0);
+    LLVMValueRef kp =
+        LLVMBuildGEP2(g->builder, i64, slots, &koff, 1, "refl.aks");
     int ai = from + i;
     LLVMValueRef v = LLVMConstInt(i64, 0, 0);
+    LLVMValueRef vk = LLVMConstInt(i64, ZAN_REFL_VK_INT, 0);
     if (args && ai < argc) {
       LLVMValueRef value = emit_expr(g, args[ai], locals);
-      temps->values[i] = value;
-      /* Reuse normal calls' exception protocol: keep each fresh argument
-       * alive across evaluation of later arguments and the thunk call. */
-      temps->pushed += emit_call_arg_eh_push(g, args[ai], value, locals);
-      v = refl_to_slot(g, value);
+      LLVMValueRef box = NULL;
+      v = refl_pack_single_val(g, args[ai], value, locals, &vk, &box);
+      if (box) {
+        temps->boxes[i] = box;
+        emit_eh_tmp_push_obj(g, box);
+        temps->pushed++;
+      } else {
+        temps->values[i] = value;
+        /* Reuse normal calls' exception protocol: keep each fresh argument
+         * alive across evaluation of later arguments and the thunk call. */
+        temps->pushed += emit_call_arg_eh_push(g, args[ai], value, locals);
+      }
     }
     LLVMBuildStore(g->builder, v, p);
+    LLVMBuildStore(g->builder, vk, kp);
   }
   return slots;
 }
@@ -120,8 +244,11 @@ static void refl_release_args(zan_irgen_t *g, zan_ast_node_t **args, int argc,
   for (int i = 0; i < temps->pushed; i++)
     emit_eh_tmp_pop(g);
   for (int i = ZAN_REFL_ARG_SLOTS - 1; i >= 0; i--) {
-    if (args && from + i < argc && temps->values[i])
+    if (temps->boxes[i]) {
+      emit_release_obj_value(g, temps->boxes[i]);
+    } else if (args && from + i < argc && temps->values[i]) {
       emit_release_owned_call_temp(g, args[from + i], temps->values[i], locals);
+    }
   }
 }
 
@@ -170,9 +297,13 @@ static void refl_emit_owned_drop(zan_irgen_t *g, LLVMValueRef v, LLVMValueRef k,
                                  LLVMValueRef called, bool incl_string) {
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  LLVMValueRef owned =
+  LLVMValueRef owned = LLVMBuildOr(
+      g->builder,
       LLVMBuildICmp(g->builder, LLVMIntEQ, k,
-                    LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.dropref");
+                    LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.dropref"),
+      LLVMBuildICmp(g->builder, LLVMIntEQ, k,
+                    LLVMConstInt(i64, ZAN_REFL_FK_STRUCT, 0), "refl.dropst"),
+      "refl.dropobj");
   if (incl_string) {
     owned = LLVMBuildOr(g->builder, owned,
                         LLVMBuildICmp(g->builder, LLVMIntEQ, k,
@@ -200,8 +331,12 @@ static LLVMValueRef refl_emit_unpack_invoke_ret(zan_irgen_t *g, int ret_kind,
   LLVMValueRef kv = LLVMBuildLoad2(g->builder, i64, kout, "refl.ikv");
   LLVMValueRef called = LLVMBuildICmp(
       g->builder, LLVMIntNE, kv, LLVMConstInt(i64, 0, 0), "refl.icalled");
-  if (ret_kind == 0) /* void -> bool */
+  LLVMValueRef k =
+      LLVMBuildSub(g->builder, kv, LLVMConstInt(i64, 1, 0), "refl.ik1");
+  if (ret_kind == 0) { /* void -> bool */
+    refl_emit_owned_drop(g, v, k, called, true);
     return called;
+  }
   if (ret_kind == 5) { /* object */
     LLVMValueRef obj_ret = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.iobj");
     return LLVMBuildSelect(g->builder, called, obj_ret, LLVMConstNull(i8ptr),
@@ -210,8 +345,6 @@ static LLVMValueRef refl_emit_unpack_invoke_ret(zan_irgen_t *g, int ret_kind,
   if (ret_kind == 6) /* task */
     return LLVMBuildSelect(g->builder, called, v, LLVMConstInt(i64, 0, 0),
                            "refl.itok");
-  LLVMValueRef k =
-      LLVMBuildSub(g->builder, kv, LLVMConstInt(i64, 1, 0), "refl.ik1");
   if (ret_kind == 4) { /* string */
     LLVMValueRef s = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.isv");
     LLVMValueRef isstr = LLVMBuildAnd(
@@ -644,21 +777,17 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti, zan_istr_t name,
     g->refl_sfield_used = true;
     LLVMValueRef nm = refl_arg_str(g, arg0, locals);
     LLVMValueRef v = arg1 ? emit_expr(g, arg1, locals) : NULL;
-    int vkind = code == ZAN_REFL_M_SSDOUBLE ? ZAN_REFL_VK_DOUBLE
-                : (code == ZAN_REFL_M_SSSTRING || code == ZAN_REFL_M_SSOBJECT)
-                    ? ZAN_REFL_VK_PTR
-                    : ZAN_REFL_VK_INT;
-    LLVMValueRef slot = v ? refl_to_slot(g, v) : LLVMConstInt(i64, 0, 0);
+    LLVMValueRef vk = NULL, box = NULL;
+    LLVMValueRef slot = refl_pack_single_val(g, arg1, v, locals, &vk, &box);
     LLVMValueRef ok = zan_call2(
         g->builder,
         LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i8ptr, i64, i64}, 4, 0),
-        refl_sset_fn(g),
-        (LLVMValueRef[]){ti, nm, slot,
-                         LLVMConstInt(i64, (unsigned long long)vkind, 0)},
-        4, "refl.sset");
+        refl_sset_fn(g), (LLVMValueRef[]){ti, nm, slot, vk}, 4, "refl.sset");
     if (arg0)
       emit_release_owned_call_temp(g, arg0, nm, locals);
-    if (arg1 && v)
+    if (box)
+      emit_release_obj_value(g, box);
+    else if (arg1 && v)
       emit_release_owned_call_temp(g, arg1, v, locals);
     *out = LLVMBuildICmp(g->builder, LLVMIntNE, ok, LLVMConstInt(i64, 0, 0),
                          "refl.ssetok");
@@ -685,11 +814,13 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
                                       zan_ast_node_t **args, int argc,
                                       local_scope_t *locals, LLVMValueRef *out,
                                       LLVMValueRef *nm_tmp,
-                                      LLVMValueRef *val_tmp) {
+                                      LLVMValueRef *val_tmp,
+                                      LLVMValueRef *box_tmp) {
   int code = 0;
   if (!zan_refl_instance_method(name, &code))
     return false;
-  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
   LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
@@ -702,9 +833,22 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
   }
   LLVMValueRef ti = refl_emit_get_type(g, rt, recv);
   LLVMValueRef obj = refl_receiver_ptr(g, rt, recv);
+  if (!rt || rt->kind != TYPE_STRUCT) {
+    LLVMValueRef is_boxed = LLVMBuildAnd(
+        g->builder, LLVMBuildIsNotNull(g->builder, obj, "refl.objnn"),
+        LLVMBuildICmp(g->builder, LLVMIntEQ,
+                      refl_hdr_i64(g, ti, ZAN_REFL_KIND_OFF, "refl.otk"),
+                      LLVMConstInt(i64, ZAN_REFL_TK_STRUCT, 0), "refl.isbox"),
+        "refl.shift8");
+    LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
+    LLVMValueRef obj8 =
+        LLVMBuildGEP2(g->builder, i8, obj, &eight, 1, "refl.obj8");
+    obj = LLVMBuildSelect(g->builder, is_boxed, obj8, obj, "refl.objadj");
+  }
   LLVMTypeRef three_at[3] = {i8ptr, i8ptr, i64};
   if (code == ZAN_REFL_M_OINT_AT || code == ZAN_REFL_M_OLONG_AT ||
       code == ZAN_REFL_M_OBOOL_AT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef idx = refl_arg_index(g, arg0, locals);
     LLVMValueRef v =
         zan_call2(g->builder, LLVMFunctionType(i64, three_at, 3, 0),
@@ -720,6 +864,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     return true;
   }
   if (code == ZAN_REFL_M_ODOUBLE_AT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef idx = refl_arg_index(g, arg0, locals);
     *out = zan_call2(g->builder, LLVMFunctionType(dbl, three_at, 3, 0),
                      refl_get_f64_at_fn(g), (LLVMValueRef[]){ti, obj, idx}, 3,
@@ -727,6 +872,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     return true;
   }
   if (code == ZAN_REFL_M_OSTRING_AT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef idx = refl_arg_index(g, arg0, locals);
     *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three_at, 3, 0),
                      refl_get_str_at_fn(g), (LLVMValueRef[]){ti, obj, idx}, 3,
@@ -734,6 +880,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     return true;
   }
   if (code == ZAN_REFL_M_OOBJECT_AT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef idx = refl_arg_index(g, arg0, locals);
     *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three_at, 3, 0),
                      refl_get_obj_at_fn(g), (LLVMValueRef[]){ti, obj, idx}, 3,
@@ -743,24 +890,21 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
   if (code == ZAN_REFL_M_SETINT_AT || code == ZAN_REFL_M_SETLONG_AT ||
       code == ZAN_REFL_M_SETBOOL_AT || code == ZAN_REFL_M_SETDOUBLE_AT ||
       code == ZAN_REFL_M_SETSTRING_AT || code == ZAN_REFL_M_SETOBJECT_AT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef idx = refl_arg_index(g, arg0, locals);
     LLVMValueRef v = arg1 ? emit_expr(g, arg1, locals) : NULL;
-    if (arg1)
+    LLVMValueRef vk = NULL, box = NULL;
+    LLVMValueRef slot = refl_pack_single_val(g, arg1, v, locals, &vk, &box);
+    if (box)
+      *box_tmp = box;
+    else if (arg1)
       *val_tmp = v;
-    int vkind = code == ZAN_REFL_M_SETDOUBLE_AT ? ZAN_REFL_VK_DOUBLE
-                : (code == ZAN_REFL_M_SETSTRING_AT ||
-                   code == ZAN_REFL_M_SETOBJECT_AT)
-                    ? ZAN_REFL_VK_PTR
-                    : ZAN_REFL_VK_INT;
-    LLVMValueRef slot = v ? refl_to_slot(g, v) : LLVMConstInt(i64, 0, 0);
     LLVMValueRef ok = zan_call2(
         g->builder,
         LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i8ptr, i64, i64, i64}, 5,
                          0),
-        refl_set_at_fn(g),
-        (LLVMValueRef[]){ti, obj, idx, slot,
-                         LLVMConstInt(i64, (unsigned long long)vkind, 0)},
-        5, "refl.setat");
+        refl_set_at_fn(g), (LLVMValueRef[]){ti, obj, idx, slot, vk}, 5,
+        "refl.setat");
     *out = LLVMBuildICmp(g->builder, LLVMIntNE, ok, LLVMConstInt(i64, 0, 0),
                          "refl.setok");
     return true;
@@ -819,22 +963,19 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
   if (code == ZAN_REFL_M_SETINT || code == ZAN_REFL_M_SETLONG ||
       code == ZAN_REFL_M_SETBOOL || code == ZAN_REFL_M_SETDOUBLE ||
       code == ZAN_REFL_M_SETSTRING || code == ZAN_REFL_M_SETOBJECT) {
+    g->refl_field_rw_used = true;
     LLVMValueRef v = arg1 ? emit_expr(g, arg1, locals) : NULL;
-    if (arg1)
+    LLVMValueRef vk = NULL, box = NULL;
+    LLVMValueRef slot = refl_pack_single_val(g, arg1, v, locals, &vk, &box);
+    if (box)
+      *box_tmp = box;
+    else if (arg1)
       *val_tmp = v;
-    int vkind = code == ZAN_REFL_M_SETDOUBLE ? ZAN_REFL_VK_DOUBLE
-                : (code == ZAN_REFL_M_SETSTRING || code == ZAN_REFL_M_SETOBJECT)
-                    ? ZAN_REFL_VK_PTR
-                    : ZAN_REFL_VK_INT;
-    LLVMValueRef slot = v ? refl_to_slot(g, v) : LLVMConstInt(i64, 0, 0);
     LLVMValueRef ok = zan_call2(
         g->builder,
         LLVMFunctionType(i64, (LLVMTypeRef[]){i8ptr, i8ptr, i8ptr, i64, i64}, 5,
                          0),
-        refl_set_fn(g),
-        (LLVMValueRef[]){ti, obj, nm, slot,
-                         LLVMConstInt(i64, (unsigned long long)vkind, 0)},
-        5, "refl.set");
+        refl_set_fn(g), (LLVMValueRef[]){ti, obj, nm, slot, vk}, 5, "refl.set");
     *out = LLVMBuildICmp(g->builder, LLVMIntNE, ok, LLVMConstInt(i64, 0, 0),
                          "refl.setok");
     return true;
@@ -845,6 +986,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     return true;
   }
   if (code == ZAN_REFL_M_OBOOL) { /* GetFieldBool(name) */
+    g->refl_field_rw_used = true;
     LLVMValueRef v = zan_call2(g->builder, LLVMFunctionType(i64, three, 3, 0),
                                refl_get_i64_fn(g),
                                (LLVMValueRef[]){ti, obj, nm}, 3, "refl.b64");
@@ -861,23 +1003,27 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     return true;
   }
   if (code == ZAN_REFL_M_ODOUBLE) {
+    g->refl_field_rw_used = true;
     *out = zan_call2(g->builder, LLVMFunctionType(dbl, three, 3, 0),
                      refl_get_f64_fn(g), (LLVMValueRef[]){ti, obj, nm}, 3,
                      "refl.f64");
     return true;
   }
   if (code == ZAN_REFL_M_OSTRING) {
+    g->refl_field_rw_used = true;
     *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three, 3, 0),
                      refl_get_str_fn(g), (LLVMValueRef[]){ti, obj, nm}, 3,
                      "refl.str");
     return true;
   }
   if (code == ZAN_REFL_M_OOBJECT) {
+    g->refl_field_rw_used = true;
     *out = zan_call2(g->builder, LLVMFunctionType(i8ptr, three, 3, 0),
                      refl_get_obj_fn(g), (LLVMValueRef[]){ti, obj, nm}, 3,
                      "refl.obj");
     return true;
   }
+  g->refl_field_rw_used = true;
   LLVMValueRef v = zan_call2(g->builder, LLVMFunctionType(i64, three, 3, 0),
                              refl_get_i64_fn(g), (LLVMValueRef[]){ti, obj, nm},
                              3, "refl.i64");
@@ -889,13 +1035,15 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
 bool refl_emit_instance_call(zan_irgen_t *g, zan_type_t *rt, LLVMValueRef recv,
                              zan_istr_t name, zan_ast_node_t **args, int argc,
                              local_scope_t *locals, LLVMValueRef *out) {
-  LLVMValueRef nm_tmp = NULL, val_tmp = NULL;
+  LLVMValueRef nm_tmp = NULL, val_tmp = NULL, box_tmp = NULL;
   if (!refl_emit_instance_call_1(g, rt, recv, name, args, argc, locals, out,
-                                 &nm_tmp, &val_tmp))
+                                 &nm_tmp, &val_tmp, &box_tmp))
     return false;
   if (nm_tmp)
     emit_release_owned_call_temp(g, args[0], nm_tmp, locals);
-  if (val_tmp)
+  if (box_tmp)
+    emit_release_obj_value(g, box_tmp);
+  else if (val_tmp)
     emit_release_owned_call_temp(g, args[1], val_tmp, locals);
   return true;
 }

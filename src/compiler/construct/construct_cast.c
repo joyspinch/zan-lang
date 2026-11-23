@@ -131,7 +131,8 @@ LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
                              zan_ast_node_t *src_expr, LLVMValueRef val,
                              local_scope_t *locals);
 static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
-                                      LLVMValueRef val, zan_ast_node_t *expr);
+                                      LLVMValueRef val, zan_ast_node_t *expr,
+                                      local_scope_t *locals);
 LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                  local_scope_t *locals) {
   zan_type_t *tt0 = resolve_type_ctx(g, expr->cast.type);
@@ -193,7 +194,7 @@ LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         st->kind != TYPE_NULLABLE &&
         LLVMGetTypeKind(src) == LLVMPointerTypeKind &&
         irgen_boxed_eligible_struct(g, tt))
-      return emit_unbox_struct(g, tt, val, expr);
+      return emit_unbox_struct(g, tt, val, expr, locals);
   }
   if (llvm_is_nullable(src) && !llvm_is_nullable(target)) {
     emit_runtime_check(
@@ -656,10 +657,14 @@ LLVMValueRef emit_box_struct(zan_irgen_t *g, zan_type_t *st,
  * --strict-runtime 下 exit 70）。C# 同款拷贝语义：载荷按值拷出，
  * 目的地（局部捕获/赋值协议）对托管字段 retain，箱保有自己的份。 */
 static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
-                                      LLVMValueRef val, zan_ast_node_t *expr) {
+                                      LLVMValueRef val, zan_ast_node_t *expr,
+                                      local_scope_t *locals) {
   LLVMTypeRef lt = map_type(g, tt);
   if (!lt || LLVMGetTypeKind(lt) != LLVMStructTypeKind)
     return val;
+  bool owned_src =
+      expr && expr->kind == AST_CAST_EXPR &&
+      expr_yields_owned_rc_value(g, expr->cast.expr, locals) != 0;
   LLVMValueRef ok = emit_runtime_is_check_name(g, val, tt);
   LLVMValueRef cfn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
   LLVMBasicBlockRef ok_bb =
@@ -678,8 +683,15 @@ static LLVMValueRef emit_unbox_struct(zan_irgen_t *g, zan_type_t *tt,
   LLVMValueRef slot =
       LLVMBuildBitCast(g->builder, p8, LLVMPointerType(lt, 0), "unbox.p");
   LLVMValueRef good = LLVMBuildLoad2(g->builder, lt, slot, "unbox.v");
+  if (owned_src) {
+    if (type_contains_collection_rc(g, tt, 0))
+      emit_collection_value_retain(g, tt, good, 0);
+    emit_release_obj_value(g, val);
+  }
   LLVMBuildBr(g->builder, m_bb);
   LLVMPositionBuilderAtEnd(g->builder, bad_bb);
+  if (owned_src)
+    emit_release_obj_value(g, val);
   /* B-ID163③：拆箱失败同强转口径——无条件抛 InvalidCastException，
    * 不再软失败拿零值结构体继续跑。m_bb 只剩 ok_bb 单前驱，无需 phi。 */
   emit_cast_throw(g, expr->loc,

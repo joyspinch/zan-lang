@@ -301,13 +301,19 @@ partial class Irgen {
     // type -- not "the first method with that name": with two overloads the
     // by-name pick hands the awaited temp the other overload's return type
     // (a class pointer where a string belongs -> invalid IR).
+    Node AnfThisTy(Node cls) {
+        if (curThisTy != null) { return curThisTy; }
+        if (cls != null) { return MkType(cls.sval); }
+        return CurThisTy();
+    }
+
     Node AwaitCallTy(Node cls, Node m, Node callExpr) {
         if (callExpr == null || callExpr.kind != AK.Call()) { return null; }
         Node callee = callExpr.a;
         if (callee == null) { return null; }
         if (callee.kind == AK.Ident()) {
             Node mm = AwaitTarget(cls, callee.sval, m, callExpr, false);
-            if (mm != null) { return SubstCallType(mm, CurThisTy(), callExpr); }
+            if (mm != null) { return SubstCallType(mm, AnfThisTy(cls), callExpr); }
             Node dt = DeclTypeOf(m, callee.sval);
             if (dt != null) {
                 Node dr = DelegRet(dt);
@@ -320,7 +326,7 @@ partial class Irgen {
             if (r == null) { return null; }
             if (r.kind == AK.ThisExpr()) {
                 Node mt = AwaitTarget(cls, callee.sval, m, callExpr, false);
-                if (mt != null) { return SubstCallType(mt, CurThisTy(), callExpr); }
+                if (mt != null) { return SubstCallType(mt, AnfThisTy(cls), callExpr); }
                 return null;
             }
             if (r.kind == AK.Ident()) {
@@ -334,11 +340,30 @@ partial class Irgen {
                 if (vt != null) {
                     Node rc2 = binder.FindType(vt.sval);
                     if (rc2 != null) {
-                        Node mi = AwaitTarget(rc2, callee.sval, m, callExpr, true);
+                        Node mi = AwaitTarget(rc2, callee.sval, m, callExpr, false);
                         // the receiver's own instantiation binds the class's
                         // type parameters (`Pool<string>` -> T = string)
                         if (mi != null) { return SubstCallType(mi, vt, callExpr); }
                     }
+                }
+                if (cls != null) {
+                    Node ft = FieldType(cls, r.sval);
+                    if (ft != null) {
+                        Node rc3 = binder.FindType(ft.sval);
+                        if (rc3 != null) {
+                            Node mf = AwaitTarget(rc3, callee.sval, m, callExpr, false);
+                            if (mf != null) { return SubstCallType(mf, ft, callExpr); }
+                        }
+                    }
+                }
+                return null;
+            }
+            Node rt = AnfExprType(cls, m, r);
+            if (rt != null) {
+                Node rc4 = binder.FindType(rt.sval);
+                if (rc4 != null) {
+                    Node me = AwaitTarget(rc4, callee.sval, m, callExpr, false);
+                    if (me != null) { return SubstCallType(me, rt, callExpr); }
                 }
             }
         }
@@ -445,11 +470,223 @@ partial class Irgen {
         return id;
     }
 
+    Node AnfExprType(Node cls, Node m, Node e) {
+        if (e == null) { return null; }
+        int k = e.kind;
+        if (k == AK.AwaitExpr()) { return AsyncElemTyOf(AwaitCallTy(cls, m, e.a)); }
+        if (k == AK.Call()) { return AwaitCallTy(cls, m, e); }
+        if (k == AK.Conditional()) {
+            Node bt = AnfExprType(cls, m, e.b);
+            Node ct = AnfExprType(cls, m, e.c);
+            if (bt == null || bt.sval == "void") { return ct; }
+            if (ct == null || ct.sval == "void") { return bt; }
+            return MergeArmTypes(bt, ct);
+        }
+        if (k == AK.Ident()) {
+            Node dt = DeclTypeOf(m, e.sval);
+            if (dt != null) { return dt; }
+            if (cls != null) {
+                Node ft = FieldType(cls, e.sval);
+                if (ft != null) { return ft; }
+            }
+            return null;
+        }
+        if (k == AK.ThisExpr()) { return AnfThisTy(cls); }
+        if (k == AK.MemberAccess()) {
+            Node rt = AnfExprType(cls, m, e.a);
+            if (rt != null) {
+                Node rc = binder.FindType(rt.sval);
+                if (rc != null) {
+                    Node ft = FieldType(rc, e.sval);
+                    if (ft != null) { return ft; }
+                }
+            }
+            return null;
+        }
+        if (k == AK.Binary()) {
+            int op = e.op;
+            if (op == TK.AmpAmp() || op == TK.PipePipe()
+                || op == TK.EqEq() || op == TK.BangEq()
+                || op == TK.Less() || op == TK.Greater()
+                || op == TK.LessEq() || op == TK.GreaterEq()) {
+                return MkType("bool");
+            }
+            if (op == TK.QQ()) {
+                Node lt = AnfExprType(cls, m, e.a);
+                if (lt != null && IsNullableValue(lt)) { return MkType(lt.sval); }
+                if (lt != null) { return lt; }
+                return AnfExprType(cls, m, e.b);
+            }
+            Node lat = AnfExprType(cls, m, e.a);
+            Node rbt = AnfExprType(cls, m, e.b);
+            if (lat == null) { return rbt; }
+            if (rbt == null) { return lat; }
+            return MergeArmTypes(lat, rbt);
+        }
+        if (k == AK.Unary()) {
+            if (e.op == TK.Bang()) { return MkType("bool"); }
+            return AnfExprType(cls, m, e.a);
+        }
+        if (k == AK.IntLit()) { return MkType(e.IntLitTypeName()); }
+        if (k == AK.FloatLit()) {
+            if (e.suffix == 1) { return MkType("float"); }
+            if (e.suffix == 2) { return MkType("decimal"); }
+            return MkType("double");
+        }
+        if (k == AK.StringLit()) { return MkType("string"); }
+        if (k == AK.CharLit()) { return MkType("char"); }
+        if (k == AK.BoolLit()) { return MkType("bool"); }
+        if (k == AK.CastExpr() || k == AK.NewExpr()) { return e.type; }
+        if (k == AK.IsExpr()) { return MkType("bool"); }
+        return null;
+    }
+
+    Node AnfMakeBranchBlock(Node cls, Node m, string dstName, Node rhs, bool isVoid) {
+        Node blk = new Node(AK.Block());
+        if (rhs == null) { return blk; }
+        Node stmt = new Node(AK.ExprStmt());
+        stmt.line = rhs.line; stmt.col = rhs.col;
+        if (isVoid) {
+            stmt.a = rhs;
+        } else {
+            Node lhs = new Node(AK.Ident());
+            lhs.sval = dstName;
+            lhs.line = rhs.line; lhs.col = rhs.col;
+            Node asn = new Node(AK.Assignment());
+            asn.op = TK.Eq();
+            asn.a = lhs;
+            asn.b = rhs;
+            asn.line = rhs.line; asn.col = rhs.col;
+            stmt.a = asn;
+        }
+        blk.Add(stmt);
+        NormBlock(cls, m, blk);
+        return blk;
+    }
+
     // Rewrite an expression tree: hoist every embedded await into `pre` and
-    // replace it with a reference to the hoisted temp.
+    // replace it with a reference to the hoisted temp. Short-circuiting and
+    // conditional arms with await stay guarded under IfStmt so dead arms
+    // never execute.
     Node HoistExpr(Node cls, Node m, Node e, List<Node> pre) {
         if (e == null) { return null; }
         if (e.kind == AK.Lambda()) { return e; }
+        if (e.kind == AK.Conditional() && (ExprHasAwait(e.b) || ExprHasAwait(e.c))) {
+            e.a = HoistExpr(cls, m, e.a, pre);
+            Node rty = AnfExprType(cls, m, e);
+            bool isVoid = (rty != null && rty.sval == "void");
+            if (isVoid) {
+                Node ifs = new Node(AK.IfStmt());
+                ifs.a = e.a;
+                ifs.b = AnfMakeBranchBlock(cls, m, "", e.b, true);
+                ifs.c = AnfMakeBranchBlock(cls, m, "", e.c, true);
+                ifs.line = e.line; ifs.col = e.col;
+                pre.Add(ifs);
+                Node dummy = new Node(AK.BoolLit());
+                dummy.ival = 0;
+                dummy.line = e.line; dummy.col = e.col;
+                return dummy;
+            }
+            string tmpName = "__aw$" + awHoistN;
+            awHoistN = awHoistN + 1;
+            Node d = new Node(AK.VarDecl());
+            d.sval = tmpName;
+            d.type = rty;
+            d.line = e.line; d.col = e.col;
+            pre.Add(d);
+            Node ifs = new Node(AK.IfStmt());
+            ifs.a = e.a;
+            ifs.b = AnfMakeBranchBlock(cls, m, tmpName, e.b, false);
+            ifs.c = AnfMakeBranchBlock(cls, m, tmpName, e.c, false);
+            ifs.line = e.line; ifs.col = e.col;
+            pre.Add(ifs);
+            Node id = new Node(AK.Ident());
+            id.sval = tmpName;
+            id.line = e.line; id.col = e.col;
+            return id;
+        }
+        if (e.kind == AK.Binary() && (e.op == TK.AmpAmp() || e.op == TK.PipePipe()) && ExprHasAwait(e.b)) {
+            e.a = HoistExpr(cls, m, e.a, pre);
+            string tmpName = "__aw$" + awHoistN;
+            awHoistN = awHoistN + 1;
+            Node d = new Node(AK.VarDecl());
+            d.sval = tmpName;
+            d.type = MkType("bool");
+            d.b = e.a;
+            d.line = e.line; d.col = e.col;
+            pre.Add(d);
+            Node condId = new Node(AK.Ident());
+            condId.sval = tmpName;
+            condId.line = e.line; condId.col = e.col;
+            Node guard = condId;
+            if (e.op == TK.PipePipe()) {
+                guard = new Node(AK.Unary());
+                guard.op = TK.Bang();
+                guard.a = condId;
+                guard.line = e.line; guard.col = e.col;
+            }
+            Node ifs = new Node(AK.IfStmt());
+            ifs.a = guard;
+            ifs.b = AnfMakeBranchBlock(cls, m, tmpName, e.b, false);
+            ifs.c = null;
+            ifs.line = e.line; ifs.col = e.col;
+            pre.Add(ifs);
+            Node id = new Node(AK.Ident());
+            id.sval = tmpName;
+            id.line = e.line; id.col = e.col;
+            return id;
+        }
+        if (e.kind == AK.Binary() && e.op == TK.QQ() && ExprHasAwait(e.b)) {
+            e.a = HoistExpr(cls, m, e.a, pre);
+            Node lty = AnfExprType(cls, m, e.a);
+            Node rty = AnfExprType(cls, m, e);
+            if (rty == null) { rty = lty; }
+            string lhsName = "__aw$" + awHoistN;
+            awHoistN = awHoistN + 1;
+            Node dl = new Node(AK.VarDecl());
+            dl.sval = lhsName;
+            dl.type = lty != null ? lty : rty;
+            dl.b = e.a;
+            dl.line = e.line; dl.col = e.col;
+            pre.Add(dl);
+            string resName = "__aw$" + awHoistN;
+            awHoistN = awHoistN + 1;
+            Node dr = new Node(AK.VarDecl());
+            dr.sval = resName;
+            dr.type = rty;
+            dr.line = e.line; dr.col = e.col;
+            pre.Add(dr);
+            Node lhsRef = new Node(AK.Ident());
+            lhsRef.sval = lhsName;
+            lhsRef.line = e.line; lhsRef.col = e.col;
+            Node nullLit = new Node(AK.NullLit());
+            nullLit.line = e.line; nullLit.col = e.col;
+            Node cond = new Node(AK.Binary());
+            cond.op = TK.BangEq();
+            cond.a = lhsRef;
+            cond.b = nullLit;
+            cond.line = e.line; cond.col = e.col;
+            Node thenVal = new Node(AK.Ident());
+            thenVal.sval = lhsName;
+            thenVal.line = e.line; thenVal.col = e.col;
+            if (lty != null && IsNullableValue(lty) && rty != null) {
+                Node castVal = new Node(AK.CastExpr());
+                castVal.type = rty;
+                castVal.b = thenVal;
+                castVal.line = e.line; castVal.col = e.col;
+                thenVal = castVal;
+            }
+            Node ifs = new Node(AK.IfStmt());
+            ifs.a = cond;
+            ifs.b = AnfMakeBranchBlock(cls, m, resName, thenVal, false);
+            ifs.c = AnfMakeBranchBlock(cls, m, resName, e.b, false);
+            ifs.line = e.line; ifs.col = e.col;
+            pre.Add(ifs);
+            Node id = new Node(AK.Ident());
+            id.sval = resName;
+            id.line = e.line; id.col = e.col;
+            return id;
+        }
         e.a = HoistExpr(cls, m, e.a, pre);
         e.b = HoistExpr(cls, m, e.b, pre);
         e.c = HoistExpr(cls, m, e.c, pre);

@@ -65,16 +65,179 @@ static zan_arc_call_kind_t get_arc_call_kind(LLVMValueRef inst) {
 
 static LLVMValueRef strip_pointer_casts(LLVMValueRef v) {
   int depth = 0;
-  while (v && LLVMIsAInstruction(v) && depth < 16) {
-    LLVMOpcode op = LLVMGetInstructionOpcode(v);
-    if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
-      v = LLVMGetOperand(v, 0);
-      depth++;
-    } else {
-      break;
+  while (v && depth < 16) {
+    if (LLVMIsAInstruction(v)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(v);
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+        v = LLVMGetOperand(v, 0);
+        depth++;
+        continue;
+      }
+    } else if (LLVMIsAConstantExpr(v)) {
+      LLVMOpcode op = LLVMGetConstOpcode(v);
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+        v = LLVMGetOperand(v, 0);
+        depth++;
+        continue;
+      }
     }
+    break;
   }
   return v;
+}
+
+static bool gep_const_byte_offset(LLVMModuleRef mod, LLVMValueRef v,
+                                  LLVMValueRef *out_base, uint64_t *out_off) {
+  uint64_t total_off = 0;
+  LLVMTargetDataRef td = LLVMGetModuleDataLayout(mod);
+  if (!td)
+    return false;
+  for (int depth = 0; depth < 6; depth++) {
+    v = strip_pointer_casts(v);
+    if (!v)
+      return false;
+    bool is_gep = false;
+    if (LLVMIsAInstruction(v) &&
+        LLVMGetInstructionOpcode(v) == LLVMGetElementPtr) {
+      is_gep = true;
+    } else if (LLVMIsAConstantExpr(v) &&
+               LLVMGetConstOpcode(v) == LLVMGetElementPtr) {
+      is_gep = true;
+    }
+    if (!is_gep) {
+      *out_base = v;
+      *out_off = total_off;
+      return depth > 0;
+    }
+    unsigned nops = (unsigned)LLVMGetNumOperands(v);
+    if (nops < 2)
+      return false;
+    LLVMTypeRef cur_ty = LLVMGetGEPSourceElementType(v);
+    if (!cur_ty)
+      return false;
+    for (unsigned i = 1; i < nops; i++) {
+      LLVMValueRef idx_v = LLVMGetOperand(v, i);
+      if (!idx_v || !LLVMIsAConstantInt(idx_v))
+        return false;
+      long long idx = LLVMConstIntGetSExtValue(idx_v);
+      if (idx < 0)
+        return false;
+      if (i == 1) {
+        total_off += (uint64_t)idx * LLVMABISizeOfType(td, cur_ty);
+      } else {
+        LLVMTypeKind tk = LLVMGetTypeKind(cur_ty);
+        if (tk == LLVMStructTypeKind) {
+          if ((unsigned)idx >= LLVMCountStructElementTypes(cur_ty))
+            return false;
+          total_off += LLVMOffsetOfElement(td, cur_ty, (unsigned)idx);
+          cur_ty = LLVMStructGetTypeAtIndex(cur_ty, (unsigned)idx);
+        } else if (tk == LLVMArrayTypeKind) {
+          LLVMTypeRef elem_ty = LLVMGetElementType(cur_ty);
+          total_off += (uint64_t)idx * LLVMABISizeOfType(td, elem_ty);
+          cur_ty = elem_ty;
+        } else {
+          return false;
+        }
+      }
+    }
+    v = LLVMGetOperand(v, 0);
+  }
+  return false;
+}
+
+static bool is_immortal_arc_value(LLVMModuleRef mod, LLVMValueRef v,
+                                  LLVMValueRef *visited, int nvis, int depth) {
+  if (!v || depth > 8)
+    return false;
+  v = strip_pointer_casts(v);
+  if (!v)
+    return false;
+  if (LLVMIsNull(v))
+    return true;
+
+  if (LLVMIsAInstruction(v)) {
+    LLVMOpcode op = LLVMGetInstructionOpcode(v);
+    if (op == LLVMPHI) {
+      for (int i = 0; i < nvis; i++) {
+        if (visited[i] == v)
+          return true;
+      }
+      if (nvis >= 8)
+        return false;
+      unsigned n = LLVMCountIncoming(v);
+      if (n == 0 || n > 16)
+        return false;
+      LLVMValueRef next_vis[8];
+      for (int i = 0; i < nvis; i++)
+        next_vis[i] = visited[i];
+      next_vis[nvis] = v;
+      for (unsigned i = 0; i < n; i++) {
+        if (!is_immortal_arc_value(mod, LLVMGetIncomingValue(v, i), next_vis,
+                                   nvis + 1, depth + 1))
+          return false;
+      }
+      return true;
+    }
+    if (op == LLVMSelect && LLVMGetNumOperands(v) >= 3) {
+      return is_immortal_arc_value(mod, LLVMGetOperand(v, 1), visited, nvis,
+                                   depth + 1) &&
+             is_immortal_arc_value(mod, LLVMGetOperand(v, 2), visited, nvis,
+                                   depth + 1);
+    }
+  }
+
+  LLVMValueRef base = NULL;
+  uint64_t off = 0;
+  if (!gep_const_byte_offset(mod, v, &base, &off))
+    return false;
+  if (!base || !LLVMIsAGlobalVariable(base) || off < 16)
+    return false;
+  LLVMValueRef init = LLVMGetInitializer(base);
+  if (!init)
+    return false;
+
+  if (LLVMIsAConstantDataSequential(init)) {
+    LLVMTypeRef it = LLVMTypeOf(init);
+    LLVMTypeRef et = LLVMGetElementType(it);
+    if (!et || LLVMGetTypeKind(et) != LLVMIntegerTypeKind ||
+        LLVMGetIntTypeWidth(et) != 8)
+      return false;
+    const char *gname = LLVMGetValueName(base);
+    if (!LLVMIsGlobalConstant(base) &&
+        !(gname && strncmp(gname, "__zan.strlit.", 13) == 0))
+      return false;
+    size_t len = 0;
+    const char *raw = LLVMGetAsString(init, &len);
+    if (!raw || off > len)
+      return false;
+    for (int k = 0; k < 8; k++) {
+      if ((uint8_t)raw[off - 16 + (size_t)k] != 0xFF)
+        return false;
+    }
+    return true;
+  }
+
+  LLVMTypeRef st = LLVMTypeOf(init);
+  if (LLVMGetTypeKind(st) == LLVMStructTypeKind && !LLVMIsPackedStruct(st) &&
+      LLVMIsGlobalConstant(base)) {
+    LLVMTargetDataRef td = LLVMGetModuleDataLayout(mod);
+    unsigned nf = LLVMCountStructElementTypes(st);
+    for (unsigned f = 0; f < nf; f++) {
+      if (LLVMOffsetOfElement(td, st, f) == off - 16) {
+        LLVMTypeRef ft = LLVMStructGetTypeAtIndex(st, f);
+        if (ft && LLVMGetTypeKind(ft) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(ft) == 64) {
+          LLVMValueRef fv = LLVMGetAggregateElement(init, f);
+          if (fv && LLVMIsAConstantInt(fv) &&
+              LLVMConstIntGetSExtValue(fv) == -1LL)
+            return true;
+        }
+        break;
+      }
+    }
+  }
+
+  return false;
 }
 
 static LLVMValueRef get_arc_operand(LLVMValueRef call) {
@@ -239,15 +402,198 @@ static bool is_safe_arc_intermediate(LLVMValueRef inst,
   return true;
 }
 
-zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
+static bool is_branch_terminator(LLVMValueRef term) {
+  if (!term)
+    return false;
+  LLVMOpcode op = LLVMGetInstructionOpcode(term);
+#if ZAN_LLVM_MAJOR >= 23
+  return op == LLVMBr || op == LLVMCondBr;
+#else
+  return op == LLVMBr;
+#endif
+}
+
+static int find_bb_in_list(LLVMBasicBlockRef *bbs, int count,
+                           LLVMBasicBlockRef bb) {
+  for (int i = 0; i < count; i++) {
+    if (bbs[i] == bb)
+      return i;
+  }
+  return -1;
+}
+
+static bool all_preds_in_dom_set(LLVMBasicBlockRef bb, LLVMBasicBlockRef *bbs,
+                                 int count) {
+  LLVMValueRef bb_val = LLVMBasicBlockAsValue(bb);
+  LLVMUseRef u = LLVMGetFirstUse(bb_val);
+  while (u) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (user && LLVMIsATerminatorInst(user)) {
+      LLVMBasicBlockRef pred = LLVMGetInstructionParent(user);
+      if (find_bb_in_list(bbs, count, pred) < 0)
+        return false;
+    }
+    u = LLVMGetNextUse(u);
+  }
+  return true;
+}
+
+static bool try_cross_block_arc(LLVMBasicBlockRef b0, LLVMValueRef retain_inst,
+                                zan_arc_call_kind_t k1, LLVMValueRef op1,
+                                int start_depth, zan_arc_opt_stats_t *stats) {
+  enum { MAX_XBLK_BLOCKS = 24, MAX_XBLK_MATCHES = 32, MAX_XBLK_INSTS = 256 };
+  LLVMValueRef term0 = LLVMGetBasicBlockTerminator(b0);
+  if (!is_branch_terminator(term0))
+    return false;
+  LLVMValueRef fn = LLVMGetBasicBlockParent(b0);
+  if (!fn)
+    return false;
+  LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
+
+  LLVMBasicBlockRef dom_bbs[MAX_XBLK_BLOCKS];
+  dom_bbs[0] = b0;
+  int dom_count = 1;
+  bool grew = true;
+  while (grew && dom_count < MAX_XBLK_BLOCKS) {
+    grew = false;
+    for (int i = 0; i < dom_count && dom_count < MAX_XBLK_BLOCKS; i++) {
+      LLVMValueRef term = LLVMGetBasicBlockTerminator(dom_bbs[i]);
+      if (!is_branch_terminator(term))
+        continue;
+      unsigned ns = LLVMGetNumSuccessors(term);
+      for (unsigned s = 0; s < ns && dom_count < MAX_XBLK_BLOCKS; s++) {
+        LLVMBasicBlockRef succ = LLVMGetSuccessor(term, s);
+        if (!succ || succ == entry_bb)
+          continue;
+        if (find_bb_in_list(dom_bbs, dom_count, succ) >= 0)
+          continue;
+        if (all_preds_in_dom_set(succ, dom_bbs, dom_count)) {
+          dom_bbs[dom_count++] = succ;
+          grew = true;
+        }
+      }
+    }
+  }
+  if (dom_count <= 1)
+    return false;
+
+  int entry_bal[MAX_XBLK_BLOCKS];
+  for (int i = 0; i < MAX_XBLK_BLOCKS; i++)
+    entry_bal[i] = -1;
+
+  int q_bb[MAX_XBLK_BLOCKS * 2];
+  int q_bal[MAX_XBLK_BLOCKS * 2];
+  int q_head = 0, q_tail = 0;
+
+  unsigned ns0 = LLVMGetNumSuccessors(term0);
+  if (ns0 == 0)
+    return false;
+  for (unsigned s = 0; s < ns0; s++) {
+    int si = find_bb_in_list(dom_bbs, dom_count, LLVMGetSuccessor(term0, s));
+    if (si <= 0)
+      return false;
+    if (q_tail >= MAX_XBLK_BLOCKS * 2)
+      return false;
+    q_bb[q_tail] = si;
+    q_bal[q_tail] = start_depth;
+    q_tail++;
+  }
+
+  LLVMValueRef matches[MAX_XBLK_MATCHES];
+  int n_matches = 0;
+  int total_insts = 0;
+
+  while (q_head < q_tail) {
+    int bi = q_bb[q_head];
+    int bal = q_bal[q_head];
+    q_head++;
+
+    if (entry_bal[bi] != -1) {
+      if (entry_bal[bi] != bal)
+        return false;
+      continue;
+    }
+    entry_bal[bi] = bal;
+
+    bool path_balanced = false;
+    LLVMValueRef c = LLVMGetFirstInstruction(dom_bbs[bi]);
+    while (c) {
+      if (++total_insts > MAX_XBLK_INSTS)
+        return false;
+      if (LLVMIsAPHINode(c)) {
+        c = LLVMGetNextInstruction(c);
+        continue;
+      }
+      zan_arc_call_kind_t k2 = get_arc_call_kind(c);
+      if (k2 != ARC_NONE) {
+        LLVMValueRef op2 = get_arc_operand(c);
+        if (are_same_arc_object(op1, op2)) {
+          if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RETAIN_OBJ) ||
+              (k1 == ARC_RETAIN_STR && k2 == ARC_RETAIN_STR)) {
+            bal++;
+          } else if ((k1 == ARC_RETAIN_OBJ && k2 == ARC_RELEASE_OBJ) ||
+                     (k1 == ARC_RETAIN_STR && k2 == ARC_RELEASE_STR)) {
+            bal--;
+            if (bal == 0) {
+              if (n_matches >= MAX_XBLK_MATCHES)
+                return false;
+              matches[n_matches++] = c;
+              path_balanced = true;
+              break;
+            }
+          }
+        } else if (k2 == ARC_RELEASE_OBJ || k2 == ARC_RELEASE_STR) {
+          return false;
+        }
+      }
+
+      if (LLVMIsATerminatorInst(c))
+        break;
+      if (!is_safe_arc_intermediate(c, op1))
+        return false;
+      c = LLVMGetNextInstruction(c);
+    }
+
+    if (!path_balanced) {
+      LLVMValueRef term = LLVMGetBasicBlockTerminator(dom_bbs[bi]);
+      if (!is_branch_terminator(term))
+        return false;
+      unsigned ns = LLVMGetNumSuccessors(term);
+      if (ns == 0)
+        return false;
+      for (unsigned s = 0; s < ns; s++) {
+        int si = find_bb_in_list(dom_bbs, dom_count, LLVMGetSuccessor(term, s));
+        if (si <= 0 || q_tail >= MAX_XBLK_BLOCKS * 2)
+          return false;
+        q_bb[q_tail] = si;
+        q_bal[q_tail] = bal;
+        q_tail++;
+      }
+    }
+  }
+
+  if (n_matches == 0)
+    return false;
+  for (int i = 0; i < n_matches; i++)
+    LLVMInstructionEraseFromParent(matches[i]);
+  LLVMInstructionEraseFromParent(retain_inst);
+  stats->pairs_elided++;
+  return true;
+}
+
+static zan_arc_opt_stats_t zan_opt_arc_mod(LLVMModuleRef mod,
+                                           zan_opt_level_t level) {
   zan_arc_opt_stats_t stats = {0, 0, 0};
-  if (level == ZAN_OPT_NONE)
+  if (!mod || level == ZAN_OPT_NONE)
     return stats;
 
-  LLVMModuleRef mod = g->mod;
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
   while (fn) {
+    if (LLVMIsDeclaration(fn)) {
+      fn = LLVMGetNextFunction(fn);
+      continue;
+    }
     bool fn_changed = true;
     int fn_pass = 0;
     while (fn_changed && fn_pass < 8) {
@@ -262,8 +608,7 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
 
           if (k1 != ARC_NONE) {
             LLVMValueRef op = get_arc_operand(inst);
-            if (op &&
-                (LLVMIsNull(op) || (LLVMIsAConstant(op) && LLVMIsNull(op)))) {
+            if (!op || is_immortal_arc_value(mod, op, NULL, 0, 0)) {
               LLVMInstructionEraseFromParent(inst);
               stats.pairs_elided++;
               fn_changed = true;
@@ -280,8 +625,13 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
               const int MAX_ARC_WINDOW = 128;
               LLVMValueRef match_release = NULL;
               int retain_depth = 1;
+              bool hit_block_end = false;
 
               while (curr && steps < MAX_ARC_WINDOW) {
+                if (LLVMIsATerminatorInst(curr)) {
+                  hit_block_end = true;
+                  break;
+                }
                 zan_arc_call_kind_t k2 = get_arc_call_kind(curr);
                 if (k2 != ARC_NONE) {
                   LLVMValueRef op2 = get_arc_operand(curr);
@@ -317,6 +667,8 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                 curr = LLVMGetNextInstruction(curr);
                 steps++;
               }
+              if (!curr)
+                hit_block_end = true;
 
               if (match_release) {
                 LLVMValueRef after_retain = LLVMGetNextInstruction(inst);
@@ -328,6 +680,14 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                 stats.pairs_elided++;
                 fn_changed = true;
                 inst = after_retain;
+                continue;
+              }
+
+              if (hit_block_end && retain_depth > 0 &&
+                  try_cross_block_arc(bb, inst, k1, op1, retain_depth,
+                                      &stats)) {
+                fn_changed = true;
+                inst = next;
                 continue;
               }
             }
@@ -344,72 +704,327 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
   return stats;
 }
 
-zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
-  zan_devirt_stats_t stats = {0, 0};
-  (void)binder;
+zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
+  if (!g || !g->mod)
+    return (zan_arc_opt_stats_t){0, 0, 0};
+  return zan_opt_arc_mod(g->mod, level);
+}
 
-  LLVMModuleRef mod = g->mod;
+static LLVMValueRef unwrap_const_bitcasts(LLVMValueRef v) {
+  int d = 0;
+  while (v && LLVMIsAConstantExpr(v) &&
+         LLVMGetConstOpcode(v) == LLVMBitCast && d < 8) {
+    v = LLVMGetOperand(v, 0);
+    d++;
+  }
+  return v;
+}
+
+static LLVMValueRef lookup_vtable_slot_fn(LLVMValueRef vt_gv,
+                                          unsigned long long slot) {
+  if (!vt_gv || !LLVMIsAGlobalVariable(vt_gv) || !LLVMIsGlobalConstant(vt_gv))
+    return NULL;
+  LLVMValueRef init = LLVMGetInitializer(vt_gv);
+  if (!init)
+    return NULL;
+  const char *vt_name = LLVMGetValueName(vt_gv);
+  if (!vt_name || strstr(vt_name, "_vtable") == NULL)
+    return NULL;
+  LLVMValueRef agg = unwrap_const_bitcasts(init);
+  unsigned agg_ops = agg ? (unsigned)LLVMGetNumOperands(agg) : 0;
+  if (!agg || slot >= agg_ops)
+    return NULL;
+  LLVMValueRef elem = unwrap_const_bitcasts(LLVMGetOperand(agg, (unsigned)slot));
+  return (elem && LLVMIsAFunction(elem)) ? elem : NULL;
+}
+
+static LLVMValueRef resolve_vtable_ptr_slot(LLVMModuleRef mod, LLVMValueRef ptr,
+                                            unsigned long long *out_slot,
+                                            int depth) {
+  if (!ptr || depth > 4)
+    return NULL;
+  ptr = strip_pointer_casts(ptr);
+  if (!ptr)
+    return NULL;
+
+  /* instcombine/GVN may fold GEP(@__zan_vtable_X, 0, 0) to @__zan_vtable_X */
+  if (LLVMIsAGlobalVariable(ptr)) {
+    const char *nm = LLVMGetValueName(ptr);
+    if (nm && strstr(nm, "_vtable")) {
+      LLVMValueRef fn = lookup_vtable_slot_fn(ptr, 0);
+      if (fn && out_slot)
+        *out_slot = 0;
+      return fn;
+    }
+    return NULL;
+  }
+
+  LLVMValueRef base = NULL;
+  uint64_t byte_off = 0;
+  if (gep_const_byte_offset(mod, ptr, &base, &byte_off)) {
+    if (base && LLVMIsAGlobalVariable(base)) {
+      const char *nm = LLVMGetValueName(base);
+      if (nm && strstr(nm, "_vtable")) {
+        LLVMTargetDataRef td = LLVMGetModuleDataLayout(mod);
+        LLVMTypeRef i8ptr = LLVMPointerType(
+            LLVMInt8TypeInContext(LLVMGetModuleContext(mod)), 0);
+        uint64_t ptr_sz = td ? LLVMABISizeOfType(td, i8ptr) : 8;
+        if (ptr_sz > 0 && (byte_off % ptr_sz) == 0) {
+          unsigned long long slot = byte_off / ptr_sz;
+          LLVMValueRef fn = lookup_vtable_slot_fn(base, slot);
+          if (fn && out_slot)
+            *out_slot = slot;
+          return fn;
+        }
+      }
+    }
+    return NULL;
+  }
+
+  if (LLVMIsAInstruction(ptr)) {
+    LLVMOpcode op = LLVMGetInstructionOpcode(ptr);
+    if (op == LLVMSelect && LLVMGetNumOperands(ptr) >= 3) {
+      unsigned long long s1 = 0, s2 = 0;
+      LLVMValueRef f1 =
+          resolve_vtable_ptr_slot(mod, LLVMGetOperand(ptr, 1), &s1, depth + 1);
+      LLVMValueRef f2 =
+          resolve_vtable_ptr_slot(mod, LLVMGetOperand(ptr, 2), &s2, depth + 1);
+      if (f1 && f1 == f2) {
+        if (out_slot)
+          *out_slot = s1;
+        return f1;
+      }
+    } else if (op == LLVMPHI) {
+      unsigned n = LLVMCountIncoming(ptr);
+      if (n > 0 && n <= 8) {
+        LLVMValueRef common = NULL;
+        unsigned long long common_s = 0;
+        for (unsigned i = 0; i < n; i++) {
+          unsigned long long si = 0;
+          LLVMValueRef fi = resolve_vtable_ptr_slot(
+              mod, LLVMGetIncomingValue(ptr, i), &si, depth + 1);
+          if (!fi)
+            return NULL;
+          if (!common) {
+            common = fi;
+            common_s = si;
+          } else if (fi != common) {
+            return NULL;
+          }
+        }
+        if (common && out_slot)
+          *out_slot = common_s;
+        return common;
+      }
+    }
+  }
+  return NULL;
+}
+
+static bool vtable_is_possibly_instantiated(LLVMValueRef value, int depth) {
+  if (!value)
+    return false;
+  if (depth > 16)
+    return true;
+  for (LLVMUseRef u = LLVMGetFirstUse(value); u; u = LLVMGetNextUse(u)) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (!user)
+      return true;
+    if (LLVMIsAInstruction(user)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(user);
+      if (op == LLVMICmp)
+        continue;
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
+        if (vtable_is_possibly_instantiated(user, depth + 1))
+          return true;
+        continue;
+      }
+      return true;
+    }
+    if (LLVMIsAConstantExpr(user)) {
+      LLVMOpcode cop = LLVMGetConstOpcode(user);
+      if (cop == LLVMBitCast || cop == LLVMAddrSpaceCast) {
+        if (vtable_is_possibly_instantiated(user, depth + 1))
+          return true;
+        continue;
+      }
+      return true;
+    }
+    return true;
+  }
+  return false;
+}
+
+static void replace_callee_operand(LLVMBuilderRef b, LLVMValueRef inst,
+                                   LLVMValueRef orig_callee,
+                                   LLVMValueRef fn_elem) {
+  LLVMValueRef target = fn_elem;
+  if (LLVMTypeOf(target) != LLVMTypeOf(orig_callee)) {
+    LLVMPositionBuilderBefore(b, inst);
+    target = LLVMBuildBitCast(b, fn_elem, LLVMTypeOf(orig_callee), "devirt.fn");
+  }
+  unsigned num_ops = (unsigned)LLVMGetNumOperands(inst);
+  for (unsigned k = 0; k < num_ops; k++) {
+    if (LLVMGetOperand(inst, k) == orig_callee) {
+      LLVMSetOperand(inst, k, target);
+      break;
+    }
+  }
+}
+
+static bool struct_idx_is_subclass_of(const zan_irgen_t *g, int sub_idx,
+                                      int base_idx) {
+  if (!g || sub_idx < 0 || base_idx < 0 || sub_idx >= g->struct_type_count ||
+      base_idx >= g->struct_type_count)
+    return false;
+  int cur = sub_idx;
+  for (int steps = 0; cur >= 0 && cur < g->struct_type_count &&
+                      steps <= g->struct_type_count;
+       steps++) {
+    if (cur == base_idx)
+      return true;
+    cur = g->struct_types[cur].base_struct_idx;
+  }
+  return false;
+}
+
+static LLVMValueRef find_single_live_vcall_impl(zan_irgen_t *g,
+                                                LLVMModuleRef mod,
+                                                int st_idx,
+                                                unsigned long long slot) {
+  if (!g || st_idx < 0 || st_idx >= g->struct_type_count)
+    return NULL;
+  LLVMValueRef single_fn = NULL;
+  for (int i = 0; i < g->struct_type_count; i++) {
+    if (!struct_idx_is_subclass_of(g, i, st_idx))
+      continue;
+    if (g->struct_types[i].devirt_abstract)
+      continue;
+    if (g->struct_types[i].devirt_generic)
+      return NULL;
+    const char *vt_name = g->struct_types[i].vtable_name;
+    if (!vt_name)
+      continue;
+    LLVMValueRef gv = LLVMGetNamedGlobal(mod, vt_name);
+    if (!gv)
+      continue;
+    if (!vtable_is_possibly_instantiated(gv, 0))
+      continue;
+    LLVMValueRef fn = lookup_vtable_slot_fn(gv, slot);
+    if (!fn)
+      return NULL;
+    if (!single_fn)
+      single_fn = fn;
+    else if (single_fn != fn)
+      return NULL;
+  }
+  return single_fn;
+}
+
+static zan_devirt_stats_t zan_opt_devirt_mod(LLVMModuleRef mod, zan_irgen_t *g) {
+  zan_devirt_stats_t stats = {0, 0};
+  if (!mod)
+    return stats;
+
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+  bool closed_world =
+      (g != NULL && !g->emit_lib && g->publish_instance_prune &&
+       !g->sharded_module);
+
+  if (closed_world) {
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(ctx);
+    LLVMValueRef vtrue = LLVMConstInt(i1, 1, 0);
+    LLVMValueRef vfalse = LLVMConstInt(i1, 0, 0);
+    for (LLVMValueRef gv = LLVMGetFirstGlobal(mod); gv;
+         gv = LLVMGetNextGlobal(gv)) {
+      const char *nm = LLVMGetValueName(gv);
+      if (!nm || strncmp(nm, "__zan_vtable_", 13) != 0)
+        continue;
+      if (!LLVMGetInitializer(gv) || LLVMIsDeclaration(gv))
+        continue;
+      if (vtable_is_possibly_instantiated(gv, 0))
+        continue;
+      /* Collect all ICmp users of gv (through bitcasts) and fold them. */
+      LLVMValueRef work[64];
+      int nw = 0;
+      work[nw++] = gv;
+      for (int wi = 0; wi < nw; wi++) {
+        for (LLVMUseRef u = LLVMGetFirstUse(work[wi]); u;) {
+          LLVMUseRef next_u = LLVMGetNextUse(u);
+          LLVMValueRef user = LLVMGetUser(u);
+          bool erased = false;
+          if (user && LLVMIsAICmpInst(user)) {
+            LLVMIntPredicate pred = LLVMGetICmpPredicate(user);
+            if (pred == LLVMIntEQ) {
+              LLVMReplaceAllUsesWith(user, vfalse);
+              LLVMInstructionEraseFromParent(user);
+              stats.interfaces_resolved++;
+              erased = true;
+            } else if (pred == LLVMIntNE) {
+              LLVMReplaceAllUsesWith(user, vtrue);
+              LLVMInstructionEraseFromParent(user);
+              stats.interfaces_resolved++;
+              erased = true;
+            }
+          } else if (user &&
+                     ((LLVMIsAInstruction(user) &&
+                       (LLVMGetInstructionOpcode(user) == LLVMBitCast ||
+                        LLVMGetInstructionOpcode(user) == LLVMAddrSpaceCast)) ||
+                      (LLVMIsAConstantExpr(user) &&
+                       (LLVMGetConstOpcode(user) == LLVMBitCast ||
+                        LLVMGetConstOpcode(user) == LLVMAddrSpaceCast)))) {
+            if (nw < 64)
+              work[nw++] = user;
+          }
+          u = erased ? LLVMGetFirstUse(work[wi]) : next_u;
+        }
+      }
+    }
+  }
+
+  unsigned vcall_md = LLVMGetMDKindIDInContext(ctx, "zan.vcall", 9);
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
   while (fn) {
+    if (LLVMIsDeclaration(fn)) {
+      fn = LLVMGetNextFunction(fn);
+      continue;
+    }
     LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
     while (bb) {
       LLVMValueRef inst = LLVMGetFirstInstruction(bb);
       while (inst) {
         LLVMValueRef next = LLVMGetNextInstruction(inst);
-        if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+        LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+        if (op == LLVMCall || op == LLVMInvoke) {
           LLVMValueRef callee = LLVMGetCalledValue(inst);
-          if (callee && LLVMIsAInstruction(callee) &&
-              LLVMGetInstructionOpcode(callee) == LLVMLoad) {
-            LLVMValueRef ptr = LLVMGetOperand(callee, 0);
-            if (ptr && LLVMIsAInstruction(ptr) &&
-                LLVMGetInstructionOpcode(ptr) == LLVMGetElementPtr) {
-              LLVMValueRef base = LLVMGetOperand(ptr, 0);
-              if (base && LLVMIsAGlobalVariable(base) &&
-                  LLVMGetInitializer(base)) {
-                const char *vt_name = LLVMGetValueName(base);
-                if (vt_name && strstr(vt_name, "_vtable")) {
-                  LLVMValueRef init = LLVMGetInitializer(base);
-                  int num_gep_ops = LLVMGetNumOperands(ptr);
-                  LLVMValueRef idx_op = LLVMGetOperand(ptr, num_gep_ops - 1);
-                  if (LLVMIsAConstantInt(idx_op)) {
-                    unsigned long long slot = LLVMConstIntGetZExtValue(idx_op);
-                    /* vtable 是聚合常量：先剥掉 bitcast 常量表达式
-                     * （否则索引到的是 bitcast 的操作数，根本不是槽位），
-                     * 再按操作数个数做边界检查。越界索引在 LLVM C API
-                     * 里是未定义行为——读到的是相邻堆内存，拿到垃圾指针
-                     * 后会被写进调用点。槽位号来自静态类型的虚方法序号，
-                     * 表长来自动态类型的虚方法数，两者不一定相等。 */
-                    LLVMValueRef agg = init;
-                    while (agg && LLVMIsAConstantExpr(agg) &&
-                           LLVMGetConstOpcode(agg) == LLVMBitCast) {
-                      agg = LLVMGetOperand(agg, 0);
-                    }
-                    unsigned agg_ops =
-                        agg ? (unsigned)LLVMGetNumOperands(agg) : 0;
-                    if (agg && slot < agg_ops) {
-                      LLVMValueRef elem = LLVMGetOperand(agg, (unsigned)slot);
-                      while (elem && LLVMIsAConstantExpr(elem) &&
-                             LLVMGetConstOpcode(elem) == LLVMBitCast) {
-                        elem = LLVMGetOperand(elem, 0);
-                      }
-                      if (elem && LLVMIsAFunction(elem)) {
-                        unsigned num_call_ops =
-                            (unsigned)LLVMGetNumOperands(inst);
-                        LLVMValueRef target = elem;
-                        if (LLVMTypeOf(target) != LLVMTypeOf(callee)) {
-                          LLVMBuilderRef b = g->builder;
-                          LLVMPositionBuilderBefore(b, inst);
-                          target = LLVMBuildBitCast(b, elem, LLVMTypeOf(callee),
-                                                    "devirt.fn");
-                        }
-                        LLVMSetOperand(inst, num_call_ops - 1, target);
-                        stats.calls_devirtualized++;
-                      }
-                    }
-                  }
+          if (callee && !LLVMIsAFunction(callee)) {
+            LLVMValueRef resolved = NULL;
+            LLVMValueRef cstripped = strip_pointer_casts(callee);
+            if (cstripped && LLVMIsAInstruction(cstripped) &&
+                LLVMGetInstructionOpcode(cstripped) == LLVMLoad) {
+              LLVMValueRef ptr = LLVMGetOperand(cstripped, 0);
+              resolved = resolve_vtable_ptr_slot(mod, ptr, NULL, 0);
+            }
+            if (!resolved && closed_world) {
+              LLVMValueRef md = LLVMGetMetadata(inst, vcall_md);
+              if (md && LLVMGetNumOperands(md) == 2) {
+                LLVMValueRef v0 = LLVMGetOperand(md, 0);
+                LLVMValueRef v1 = LLVMGetOperand(md, 1);
+                if (v0 && LLVMIsAConstantInt(v0) && v1 &&
+                    LLVMIsAConstantInt(v1)) {
+                  int st_idx = (int)LLVMConstIntGetSExtValue(v0);
+                  unsigned long long slot = LLVMConstIntGetZExtValue(v1);
+                  resolved = find_single_live_vcall_impl(g, mod, st_idx, slot);
                 }
               }
+            }
+            if (resolved) {
+              replace_callee_operand(b, inst, callee, resolved);
+              if (LLVMGetMetadata(inst, vcall_md))
+                LLVMSetMetadata(inst, vcall_md, NULL);
+              stats.calls_devirtualized++;
             }
           }
         }
@@ -420,16 +1035,31 @@ zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
     fn = LLVMGetNextFunction(fn);
   }
 
+  LLVMDisposeBuilder(b);
   return stats;
 }
 
-zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
-  zan_constfold_stats_t stats = {0, 0, 0};
+zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
+  (void)binder;
+  if (!g || !g->mod)
+    return (zan_devirt_stats_t){0, 0};
+  return zan_opt_devirt_mod(g->mod, g);
+}
 
-  LLVMModuleRef mod = g->mod;
+static zan_constfold_stats_t zan_opt_const_fold_mod(LLVMModuleRef mod) {
+  zan_constfold_stats_t stats = {0, 0, 0};
+  if (!mod)
+    return stats;
+
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  LLVMBuilderRef b_shared = LLVMCreateBuilderInContext(ctx);
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
   while (fn) {
+    if (LLVMIsDeclaration(fn)) {
+      fn = LLVMGetNextFunction(fn);
+      continue;
+    }
     bool fn_changed = true;
     int pass = 0;
     while (fn_changed && pass < 4) {
@@ -525,10 +1155,10 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                           m++;
                         }
                       }
-                      LLVMBuilderRef pb = g->builder;
-                      LLVMPositionBuilderBefore(pb, phi);
+                      LLVMPositionBuilderBefore(b_shared, phi);
                       if (m > 0) {
-                        LLVMValueRef np = LLVMBuildPhi(pb, LLVMTypeOf(phi), "");
+                        LLVMValueRef np =
+                            LLVMBuildPhi(b_shared, LLVMTypeOf(phi), "");
                         LLVMAddIncoming(np, vals, blks, m);
                         LLVMReplaceAllUsesWith(phi, np);
                       } else {
@@ -545,9 +1175,8 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                     phi = phi_next;
                   }
                 }
-                LLVMBuilderRef b = g->builder;
-                LLVMPositionBuilderBefore(b, inst);
-                LLVMBuildBr(b, target_bb);
+                LLVMPositionBuilderBefore(b_shared, inst);
+                LLVMBuildBr(b_shared, target_bb);
                 LLVMInstructionEraseFromParent(inst);
                 stats.branches_eliminated++;
                 fn_changed = true;
@@ -565,16 +1194,28 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
     fn = LLVMGetNextFunction(fn);
   }
 
+  LLVMDisposeBuilder(b_shared);
   return stats;
 }
 
-zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
-  zan_dce_stats_t stats = {0, 0, 0};
+zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
+  if (!g || !g->mod)
+    return (zan_constfold_stats_t){0, 0, 0};
+  return zan_opt_const_fold_mod(g->mod);
+}
 
-  LLVMModuleRef mod = g->mod;
+static zan_dce_stats_t zan_opt_dce_mod(LLVMModuleRef mod) {
+  zan_dce_stats_t stats = {0, 0, 0};
+  if (!mod)
+    return stats;
+
   LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
   while (fn) {
+    if (LLVMIsDeclaration(fn)) {
+      fn = LLVMGetNextFunction(fn);
+      continue;
+    }
     bool changed = true;
     int pass = 0;
     while (changed && pass < 4) {
@@ -587,18 +1228,11 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
           LLVMValueRef next = LLVMGetNextInstruction(inst);
           unsigned opcode = LLVMGetInstructionOpcode(inst);
 
-          if (opcode == LLVMAlloca) {
-            if (!LLVMGetFirstUse(inst)) {
-              LLVMInstructionEraseFromParent(inst);
-              stats.dead_stores++;
-              changed = true;
-              inst = next;
-              continue;
-            }
-          } else if (opcode == LLVMAdd || opcode == LLVMSub ||
-                     opcode == LLVMMul || opcode == LLVMBitCast ||
-                     opcode == LLVMAddrSpaceCast || opcode == LLVMZExt ||
-                     opcode == LLVMSExt || opcode == LLVMTrunc) {
+          if (opcode == LLVMAlloca || opcode == LLVMAdd || opcode == LLVMSub ||
+              opcode == LLVMMul || opcode == LLVMBitCast ||
+              opcode == LLVMAddrSpaceCast || opcode == LLVMZExt ||
+              opcode == LLVMSExt || opcode == LLVMTrunc ||
+              opcode == LLVMICmp) {
             if (!LLVMGetFirstUse(inst)) {
               LLVMInstructionEraseFromParent(inst);
               stats.dead_stores++;
@@ -616,6 +1250,12 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
   }
 
   return stats;
+}
+
+zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
+  if (!g || !g->mod)
+    return (zan_dce_stats_t){0, 0, 0};
+  return zan_opt_dce_mod(g->mod);
 }
 
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
@@ -1026,6 +1666,14 @@ static void shrink_collapse_invoke(LLVMBuilderRef b, LLVMValueRef inv) {
     for (unsigned a = 0; a < cnt; a++)
       LLVMAddCallSiteAttribute(call, idx, attrs[a]);
   }
+  {
+    unsigned vcall_md =
+        LLVMGetMDKindIDInContext(LLVMGetModuleContext(LLVMGetGlobalParent(fn)),
+                                 "zan.vcall", 9);
+    LLVMValueRef md = LLVMGetMetadata(inv, vcall_md);
+    if (md)
+      LLVMSetMetadata(call, vcall_md, md);
+  }
   LLVMReplaceAllUsesWith(inv, call);
   LLVMBasicBlockRef blk = LLVMGetInstructionParent(inv);
   /* unwind 目标块的 PHI 仍持有 (值, blk) 入口——RAUW 只修 value 不修
@@ -1242,33 +1890,256 @@ fail:
   return 0;
 }
 
-zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g,
-                                           zan_opt_level_t level,
-                                           const zan_opt_knobs_t *knobs) {
-  if (level == ZAN_OPT_NONE)
-    return ZAN_OK;
-
-#if ZAN_LLVM_MAJOR >= 23
-  if (level == ZAN_OPT_SIZE) {
-    zan_opt_mark_size(g, false);
-  } else if (level == ZAN_OPT_SIZE_MIN) {
-    zan_opt_mark_size(g, true);
+static void insert_entry_alloca(LLVMBuilderRef b, LLVMValueRef fn) {
+  LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+  LLVMValueRef first = LLVMGetFirstInstruction(entry);
+  while (first && LLVMIsAAllocaInst(first)) {
+    first = LLVMGetNextInstruction(first);
   }
-#endif
-
-  LLVMTargetMachineRef tm = NULL;
-  if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
-    return ZAN_ERROR;
-  zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level, knobs);
-  if (tm)
-    LLVMDisposeTargetMachine(tm);
-  return status;
+  if (first) {
+    LLVMPositionBuilderBefore(b, first);
+  } else {
+    LLVMPositionBuilderAtEnd(b, entry);
+  }
 }
 
-zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
+static bool check_val_escapes(LLVMValueRef val, LLVMBasicBlockRef alloc_bb,
+                              LLVMBasicBlockRef entry_bb, int depth) {
+  if (depth > 12)
+    return true; /* 保守深度封顶 */
+  LLVMValueRef base_val = strip_pointer_casts(val);
+  LLVMUseRef u = LLVMGetFirstUse(val);
+  while (u) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (!user || !LLVMIsAInstruction(user))
+      return true;
+    LLVMOpcode op = LLVMGetInstructionOpcode(user);
+
+    if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
+        op == LLVMGetElementPtr || op == LLVMSelect) {
+      if (check_val_escapes(user, alloc_bb, entry_bb, depth + 1))
+        return true;
+    } else if (op == LLVMICmp || op == LLVMFCmp) {
+      /* 仅比较指针地址（如判空）不逃逸 */
+    } else if (op == LLVMLoad) {
+      /* 读字段或取值不逃逸基对象 */
+    } else if (op == LLVMStore) {
+      LLVMValueRef store_val = strip_pointer_casts(LLVMGetOperand(user, 0));
+      LLVMValueRef store_dst = strip_pointer_casts(LLVMGetOperand(user, 1));
+      if (store_dst == base_val) {
+        /* 写入对象自身字段：对象自身不逃逸 */
+      } else if (store_val == base_val) {
+        /* 对象被存入某目标 */
+        if (LLVMIsAAllocaInst(store_dst)) {
+          /* 若分配在非入口块（可能位于循环中），存入长寿命栈槽可能跨迭代存活 */
+          if (alloc_bb != entry_bb) {
+            LLVMUseRef au_chk = LLVMGetFirstUse(store_dst);
+            while (au_chk) {
+              LLVMValueRef auser_chk = LLVMGetUser(au_chk);
+              if (!auser_chk || !LLVMIsAInstruction(auser_chk) ||
+                  LLVMGetInstructionParent(auser_chk) != alloc_bb)
+                return true;
+              au_chk = LLVMGetNextUse(au_chk);
+            }
+          }
+          /* 存入局部栈槽，递归检查对该栈槽的所有使用 */
+          LLVMUseRef au = LLVMGetFirstUse(store_dst);
+          while (au) {
+            LLVMValueRef auser = LLVMGetUser(au);
+            if (auser != user) {
+              if (!LLVMIsAInstruction(auser))
+                return true;
+              LLVMOpcode aop = LLVMGetInstructionOpcode(auser);
+              if (aop == LLVMLoad) {
+                if (check_val_escapes(auser, alloc_bb, entry_bb, depth + 1))
+                  return true;
+              } else if (aop == LLVMStore) {
+                /* 只有覆盖写入 store_dst 才安全；把 store_dst 指针本身作为值存出则逃逸 */
+                if (strip_pointer_casts(LLVMGetOperand(auser, 1)) != store_dst)
+                  return true;
+              } else {
+                return true;
+              }
+            }
+            au = LLVMGetNextUse(au);
+          }
+        } else {
+          return true;
+        }
+      } else {
+        return true;
+      }
+    } else if (op == LLVMCall) {
+      if (LLVMGetTailCallKind(user) == LLVMTailCallKindMustTail)
+        return true;
+      LLVMValueRef callee = LLVMGetCalledValue(user);
+      const char *name = callee ? LLVMGetValueName(callee) : NULL;
+      if (!name)
+        return true;
+      if (strcmp(name, "zan_rt_retain") == 0 ||
+          strcmp(name, "zan_retain") == 0 ||
+          strcmp(name, "zan_rt_release") == 0 ||
+          strcmp(name, "zan_rt_release_dyn") == 0 ||
+          strcmp(name, "zan_release") == 0 ||
+          strcmp(name, "zan_rt_str_retain") == 0 ||
+          strcmp(name, "zan_rt_str_release") == 0 ||
+          strcmp(name, "zan_rt_arr_len") == 0 ||
+          strcmp(name, "zan_bound_check") == 0 ||
+          strcmp(name, "zan_rt_bound_check") == 0 ||
+          strcmp(name, "zan_rt_live_register") == 0 ||
+          strcmp(name, "zan_rt_live_register_named") == 0 ||
+          strcmp(name, "zan_rt_live_unregister") == 0 ||
+          strncmp(name, "llvm.memset", 11) == 0 ||
+          strncmp(name, "llvm.memcpy", 11) == 0 ||
+          strncmp(name, "llvm.memmove", 12) == 0 ||
+          strncmp(name, "llvm.lifetime", 13) == 0) {
+        /* 安全内部调用 */
+      } else {
+        return true;
+      }
+    } else if (op == LLVMRet) {
+      return true; /* 返回指针则逃逸 */
+    } else {
+      return true;
+    }
+
+    u = LLVMGetNextUse(u);
+  }
+  return false;
+}
+
+/* 栈提升把堆指针替换为 caller 帧内的 alloca；若前置 LLVM pass 已给接收该指针的
+ * 外部调用标过 tail，后续 DSE 会依据 tail 不读 caller alloca 的假设把头部 rc/site
+ * 存储删掉，必须在替换前清除所有可达调用点上的 tail 标记。 */
+static void clear_escape_user_tail_calls(LLVMValueRef val, int depth) {
+  if (!val || depth > 12)
+    return;
+  LLVMValueRef base_val = strip_pointer_casts(val);
+  LLVMUseRef u = LLVMGetFirstUse(val);
+  while (u) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (user && LLVMIsAInstruction(user)) {
+      LLVMOpcode op = LLVMGetInstructionOpcode(user);
+      if (op == LLVMBitCast || op == LLVMAddrSpaceCast ||
+          op == LLVMGetElementPtr || op == LLVMSelect) {
+        clear_escape_user_tail_calls(user, depth + 1);
+      } else if (op == LLVMStore) {
+        LLVMValueRef store_val = strip_pointer_casts(LLVMGetOperand(user, 0));
+        LLVMValueRef store_dst = strip_pointer_casts(LLVMGetOperand(user, 1));
+        if (store_dst != base_val && store_val == base_val &&
+            LLVMIsAAllocaInst(store_dst)) {
+          LLVMUseRef au = LLVMGetFirstUse(store_dst);
+          while (au) {
+            LLVMValueRef auser = LLVMGetUser(au);
+            if (auser && auser != user && LLVMIsAInstruction(auser) &&
+                LLVMGetInstructionOpcode(auser) == LLVMLoad) {
+              clear_escape_user_tail_calls(auser, depth + 1);
+            }
+            au = LLVMGetNextUse(au);
+          }
+        }
+      } else if (op == LLVMCall) {
+        if (LLVMGetTailCallKind(user) == LLVMTailCallKindTail)
+          LLVMSetTailCallKind(user, LLVMTailCallKindNone);
+      }
+    }
+    u = LLVMGetNextUse(u);
+  }
+}
+
+static zan_escape_stats_t zan_opt_escape_mod(LLVMModuleRef mod) {
+  zan_escape_stats_t stats = {0, 0};
+  if (!mod)
+    return stats;
+
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx);
+  LLVMTypeRef i8 = LLVMInt8TypeInContext(ctx);
+
+  LLVMValueRef fn = LLVMGetFirstFunction(mod);
+  while (fn) {
+    if (!LLVMIsDeclaration(fn)) {
+      LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
+      LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+      while (bb) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+          LLVMValueRef next = LLVMGetNextInstruction(inst);
+          if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
+            LLVMValueRef callee = LLVMGetCalledValue(inst);
+            const char *callee_name = callee ? LLVMGetValueName(callee) : NULL;
+            if (callee_name && (strcmp(callee_name, "zan_rt_alloc") == 0 ||
+                                strcmp(callee_name, "zan_alloc") == 0)) {
+              stats.objects_analyzed++;
+              LLVMValueRef size_val = LLVMGetOperand(inst, 0);
+              LLVMValueRef site_val = LLVMGetOperand(inst, 1);
+              /* 仅对有界常量尺寸做入口栈提升，防止动态大尺寸或循环内动态 alloca 爆栈/破坏 SSA 支配 */
+              if (LLVMIsAConstantInt(size_val)) {
+                uint64_t obj_sz = LLVMConstIntGetZExtValue(size_val);
+                if (obj_sz <= 4096 &&
+                    !check_val_escapes(inst, bb, entry_bb, 0)) {
+                  LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
+                  insert_entry_alloca(b_entry, fn);
+
+                  LLVMValueRef total_val =
+                      LLVMConstInt(i64, obj_sz + ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef alloca_buf =
+                      LLVMBuildArrayAlloca(b_entry, i8, total_val, "stk.raw");
+                  LLVMSetAlignment(alloca_buf, 16);
+                  LLVMDisposeBuilder(b_entry);
+
+                  LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
+                  LLVMPositionBuilderBefore(b_inst, inst);
+
+                  /* rc = 1 at raw[0..7] */
+                  LLVMValueRef rc_ptr = LLVMBuildBitCast(
+                      b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.rcp");
+                  LLVMBuildStore(b_inst, LLVMConstInt(i64, 1, 0), rc_ptr);
+
+                  /* site = site | ZAN_OBJ_STACK_FLAG at raw[8..15] */
+                  LLVMValueRef site_marked = LLVMBuildOr(
+                      b_inst, site_val,
+                      LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0), "stk.site");
+                  LLVMValueRef eight =
+                      LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
+                  LLVMValueRef site_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &eight, 1, "stk.sptr");
+                  LLVMValueRef site_iptr = LLVMBuildBitCast(
+                      b_inst, site_ptr, LLVMPointerType(i64, 0), "stk.siptr");
+                  LLVMBuildStore(b_inst, site_marked, site_iptr);
+
+                  /* user_ptr = raw + 16 */
+                  LLVMValueRef hdr_off =
+                      LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
+                  LLVMValueRef stk_user_ptr = LLVMBuildGEP2(
+                      b_inst, i8, alloca_buf, &hdr_off, 1, "stk.usr");
+                  LLVMDisposeBuilder(b_inst);
+
+                  clear_escape_user_tail_calls(inst, 0);
+                  LLVMReplaceAllUsesWith(inst, stk_user_ptr);
+                  LLVMInstructionEraseFromParent(inst);
+
+                  stats.stack_promoted++;
+                }
+              }
+            }
+          }
+          inst = next;
+        }
+        bb = LLVMGetNextBasicBlock(bb);
+      }
+    }
+    fn = LLVMGetNextFunction(fn);
+  }
+  return stats;
+}
+
+static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
                                           LLVMTargetMachineRef tm,
                                           zan_opt_level_t level,
-                                          const zan_opt_knobs_t *knobs) {
+                                          const zan_opt_knobs_t *knobs,
+                                          zan_irgen_t *g_opt,
+                                          zan_opt_report_t *report_out) {
   static const zan_opt_knobs_t default_knobs;
   if (!knobs)
     knobs = &default_knobs;
@@ -1306,6 +2177,7 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
   /* 调试旋钮：--opt-pipeline（或回退 ZAN_OPT_PIPELINE）覆盖默认管线
    * 文本（如 "sroa" 逐 pass 二分），"none" 完全跳过 LLVM 管线——定位
    * 优化缺陷用（A595）。 */
+  bool custom_pipe = false;
   {
     const char *pipe =
         knobs->pipeline ? knobs->pipeline : getenv("ZAN_OPT_PIPELINE");
@@ -1314,6 +2186,32 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
         return ZAN_OK;
       }
       passes = pipe;
+      custom_pipe = true;
+    }
+  }
+
+  /* 在主 LLVM O* 管线期间暂时给运行时 ARC/alloc 辅助函数加上 noinline，
+   * 让用户函数先行内联并暴露出完整逃逸/ARC 配对/常量特征，再在后续清理中按需放行内联。 */
+  static const char *const k_rt_defer_inline[] = {
+      "zan_rt_alloc",       "zan_rt_retain",     "zan_rt_release",
+      "zan_rt_release_dyn", "zan_rt_str_retain", "zan_rt_str_release",
+  };
+  LLVMValueRef marked_rt[6] = {0};
+  int marked_count = 0;
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  unsigned noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
+  if (!custom_pipe && noinline_kind != 0 && level != ZAN_OPT_BASIC) {
+    LLVMAttributeRef noinl_attr = LLVMCreateEnumAttribute(ctx, noinline_kind, 0);
+    for (int i = 0; i < 6; i++) {
+      LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
+      if (fn && !LLVMIsDeclaration(fn) &&
+          !LLVMGetEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+              noinline_kind)) {
+        LLVMAddAttributeAtIndex(
+            fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinl_attr);
+        marked_rt[marked_count++] = fn;
+      }
     }
   }
 
@@ -1331,11 +2229,83 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
   LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
   LLVMDisposePassBuilderOptions(opts);
   if (err) {
+    for (int i = 0; i < marked_count; i++) {
+      LLVMRemoveEnumAttributeAtIndex(
+          marked_rt[i], (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+          noinline_kind);
+    }
     char *msg = LLVMGetErrorMessage(err);
     fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
     LLVMDisposeErrorMessage(msg);
     return ZAN_ERROR;
   }
+
+  /* Post-inline Zan 优化 pass：主内联与 SROA 完成后再次消除栈逃逸、ARC 冗余、虚调用、常量与死代码 */
+  bool post_changed = false;
+  if (!custom_pipe) {
+    if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE")) {
+      zan_escape_stats_t es = zan_opt_escape_mod(mod);
+      if (es.stack_promoted > 0)
+        post_changed = true;
+      if (report_out) {
+        report_out->escape.objects_analyzed += es.objects_analyzed;
+        report_out->escape.stack_promoted += es.stack_promoted;
+      }
+    }
+    if (!zan_opt_knob_off(knobs->no_arc, "ZAN_NO_OPT_ARC")) {
+      zan_arc_opt_stats_t as = zan_opt_arc_mod(mod, level);
+      if (as.pairs_elided > 0)
+        post_changed = true;
+      if (report_out)
+        report_out->arc.pairs_elided += as.pairs_elided;
+    }
+    if (!zan_opt_knob_off(knobs->no_devirt, "ZAN_NO_OPT_DEVIRT")) {
+      zan_devirt_stats_t ds = zan_opt_devirt_mod(mod, g_opt);
+      if (ds.calls_devirtualized > 0)
+        post_changed = true;
+      if (report_out)
+        report_out->devirt.calls_devirtualized += ds.calls_devirtualized;
+    }
+    if (!zan_opt_knob_off(knobs->no_constfold, "ZAN_NO_OPT_CONSTFOLD")) {
+      zan_constfold_stats_t cs = zan_opt_const_fold_mod(mod);
+      if (cs.constants_folded > 0)
+        post_changed = true;
+      if (report_out)
+        report_out->constfold.constants_folded += cs.constants_folded;
+    }
+    if (!zan_opt_knob_off(knobs->no_dce, "ZAN_NO_OPT_DCE")) {
+      zan_dce_stats_t ds2 = zan_opt_dce_mod(mod);
+      if (ds2.dead_stores > 0)
+        post_changed = true;
+      if (report_out)
+        report_out->dce.dead_stores += ds2.dead_stores;
+    }
+
+    for (int i = 0; i < marked_count; i++) {
+      LLVMRemoveEnumAttributeAtIndex(
+          marked_rt[i], (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+          noinline_kind);
+    }
+
+    const char *cleanup = NULL;
+    if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
+      if (post_changed || marked_count > 0)
+        cleanup =
+            "cgscc(inline),function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
+            "globaldce";
+    } else if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {
+      if (post_changed)
+        cleanup =
+            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),mergefunc,"
+            "globaldce";
+    } else if (post_changed) {
+      cleanup =
+          "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse)";
+    }
+    if (cleanup && run_checked_passes(mod, tm, cleanup) != ZAN_OK)
+      return ZAN_ERROR;
+  }
+
   if (zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
     return ZAN_ERROR;
   /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
@@ -1355,181 +2325,54 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
   return ZAN_OK;
 }
 
+static zan_status_t zan_opt_configure_llvm_passes_ex(
+    zan_irgen_t *g, zan_opt_level_t level, const zan_opt_knobs_t *knobs,
+    zan_opt_report_t *report_out) {
+  if (level == ZAN_OPT_NONE)
+    return ZAN_OK;
+
+#if ZAN_LLVM_MAJOR >= 23
+  if (level == ZAN_OPT_SIZE) {
+    zan_opt_mark_size(g, false);
+  } else if (level == ZAN_OPT_SIZE_MIN) {
+    zan_opt_mark_size(g, true);
+  }
+#endif
+
+  LLVMTargetMachineRef tm = NULL;
+  if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
+    return ZAN_ERROR;
+  zan_status_t status =
+      zan_opt_run_passes_ex(g->mod, tm, level, knobs, g, report_out);
+  if (tm)
+    LLVMDisposeTargetMachine(tm);
+  return status;
+}
+
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g,
+                                           zan_opt_level_t level,
+                                           const zan_opt_knobs_t *knobs) {
+  return zan_opt_configure_llvm_passes_ex(g, level, knobs, NULL);
+}
+
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
+                                          LLVMTargetMachineRef tm,
+                                          zan_opt_level_t level,
+                                          const zan_opt_knobs_t *knobs) {
+  return zan_opt_run_passes_ex(mod, tm, level, knobs, NULL, NULL);
+}
+
 /* 全局死代码消除 (GlobalDCE)：纯可达性扫描剔除未引用的内部符号 */
 zan_status_t zan_opt_strip_unused(zan_irgen_t *g) {
   return run_checked_passes(g->mod, NULL, "globaldce");
 }
 
-static void insert_entry_alloca(LLVMBuilderRef b, LLVMValueRef fn) {
-  LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
-  LLVMValueRef first = LLVMGetFirstInstruction(entry);
-  while (first && LLVMIsAAllocaInst(first)) {
-    first = LLVMGetNextInstruction(first);
-  }
-  if (first) {
-    LLVMPositionBuilderBefore(b, first);
-  } else {
-    LLVMPositionBuilderAtEnd(b, entry);
-  }
-}
-
-static bool check_val_escapes(LLVMValueRef val, int depth) {
-  if (depth > 12)
-    return true; /* 保守深度封顶 */
-  LLVMUseRef u = LLVMGetFirstUse(val);
-  while (u) {
-    LLVMValueRef user = LLVMGetUser(u);
-    if (!user || !LLVMIsAInstruction(user))
-      return true;
-    LLVMOpcode op = LLVMGetInstructionOpcode(user);
-
-    if (op == LLVMBitCast || op == LLVMAddrSpaceCast) {
-      if (check_val_escapes(user, depth + 1))
-        return true;
-    } else if (op == LLVMGetElementPtr) {
-      if (check_val_escapes(user, depth + 1))
-        return true;
-    } else if (op == LLVMLoad) {
-      /* 读字段或取值不逃逸基对象 */
-    } else if (op == LLVMStore) {
-      LLVMValueRef store_val = strip_pointer_casts(LLVMGetOperand(user, 0));
-      LLVMValueRef store_dst = strip_pointer_casts(LLVMGetOperand(user, 1));
-      if (store_dst == strip_pointer_casts(val)) {
-        /* 写入对象自身字段：对象自身不逃逸 */
-      } else if (store_val == strip_pointer_casts(val)) {
-        /* 对象被存入某目标 */
-        if (LLVMIsAAllocaInst(store_dst)) {
-          /* 存入局部栈槽，递归检查对该栈槽的读取 */
-          LLVMUseRef au = LLVMGetFirstUse(store_dst);
-          while (au) {
-            LLVMValueRef auser = LLVMGetUser(au);
-            if (auser != user && LLVMIsAInstruction(auser)) {
-              LLVMOpcode aop = LLVMGetInstructionOpcode(auser);
-              if (aop == LLVMLoad) {
-                if (check_val_escapes(auser, depth + 1))
-                  return true;
-              } else if (aop != LLVMStore) {
-                return true;
-              }
-            }
-            au = LLVMGetNextUse(au);
-          }
-        } else {
-          return true;
-        }
-      } else {
-        return true;
-      }
-    } else if (op == LLVMCall) {
-      LLVMValueRef callee = LLVMGetCalledValue(user);
-      const char *name = callee ? LLVMGetValueName(callee) : NULL;
-      if (!name)
-        return true;
-      if (strcmp(name, "zan_rt_retain") == 0 ||
-          strcmp(name, "zan_retain") == 0 ||
-          strcmp(name, "zan_rt_release") == 0 ||
-          strcmp(name, "zan_rt_release_dyn") == 0 ||
-          strcmp(name, "zan_release") == 0 ||
-          strcmp(name, "zan_rt_live_register") == 0 ||
-          strcmp(name, "zan_rt_live_register_named") == 0 ||
-          strcmp(name, "zan_rt_live_unregister") == 0 ||
-          strncmp(name, "llvm.memset", 11) == 0 ||
-          strncmp(name, "llvm.memcpy", 11) == 0 ||
-          strncmp(name, "llvm.lifetime", 13) == 0) {
-        /* 安全内部调用 */
-      } else {
-        return true;
-      }
-    } else if (op == LLVMRet) {
-      return true; /* 返回指针则逃逸 */
-    } else {
-      return true;
-    }
-
-    u = LLVMGetNextUse(u);
-  }
-  return false;
-}
-
 zan_escape_stats_t zan_opt_escape(zan_irgen_t *g) {
-  zan_escape_stats_t stats = {0, 0};
-  if (!g || !g->mod)
-    return stats;
-
-  LLVMContextRef ctx = g->ctx;
-  LLVMTypeRef i64 = LLVMInt64TypeInContext(ctx);
-
-  LLVMValueRef fn = LLVMGetFirstFunction(g->mod);
-  while (fn) {
-    if (!LLVMIsDeclaration(fn)) {
-      LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
-      while (bb) {
-        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
-        while (inst) {
-          LLVMValueRef next = LLVMGetNextInstruction(inst);
-          if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
-            LLVMValueRef callee = LLVMGetCalledValue(inst);
-            const char *callee_name = callee ? LLVMGetValueName(callee) : NULL;
-            if (callee_name && (strcmp(callee_name, "zan_rt_alloc") == 0 ||
-                                strcmp(callee_name, "zan_alloc") == 0)) {
-              stats.objects_analyzed++;
-              if (!check_val_escapes(inst, 0)) {
-                LLVMValueRef size_val = LLVMGetOperand(inst, 0);
-                LLVMValueRef site_val = LLVMGetOperand(inst, 1);
-
-                LLVMBuilderRef b_entry = LLVMCreateBuilderInContext(ctx);
-                insert_entry_alloca(b_entry, fn);
-
-                LLVMValueRef total_val = LLVMBuildAdd(
-                    b_entry, size_val, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0),
-                    "stk.total");
-                LLVMValueRef alloca_buf = LLVMBuildArrayAlloca(
-                    b_entry, LLVMInt8TypeInContext(ctx), total_val, "stk.raw");
-                LLVMDisposeBuilder(b_entry);
-
-                LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
-                LLVMPositionBuilderBefore(b_inst, inst);
-
-                /* rc = 1 at raw[0..7] */
-                LLVMValueRef rc_ptr = LLVMBuildBitCast(
-                    b_inst, alloca_buf, LLVMPointerType(i64, 0), "stk.rcp");
-                LLVMBuildStore(b_inst, LLVMConstInt(i64, 1, 0), rc_ptr);
-
-                /* site = site | ZAN_OBJ_STACK_FLAG at raw[8..15] */
-                LLVMValueRef site_marked = LLVMBuildOr(
-                    b_inst, site_val, LLVMConstInt(i64, ZAN_OBJ_STACK_FLAG, 0),
-                    "stk.site");
-                LLVMValueRef eight =
-                    LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
-                LLVMValueRef site_ptr =
-                    LLVMBuildGEP2(b_inst, LLVMInt8TypeInContext(ctx),
-                                  alloca_buf, &eight, 1, "stk.sptr");
-                LLVMValueRef site_iptr = LLVMBuildBitCast(
-                    b_inst, site_ptr, LLVMPointerType(i64, 0), "stk.siptr");
-                LLVMBuildStore(b_inst, site_marked, site_iptr);
-
-                /* user_ptr = raw + 16 */
-                LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
-                LLVMValueRef stk_user_ptr =
-                    LLVMBuildGEP2(b_inst, LLVMInt8TypeInContext(ctx),
-                                  alloca_buf, &hdr_off, 1, "stk.usr");
-                LLVMDisposeBuilder(b_inst);
-
-                LLVMReplaceAllUsesWith(inst, stk_user_ptr);
-                LLVMInstructionEraseFromParent(inst);
-
-                stats.stack_promoted++;
-              }
-            }
-          }
-          inst = next;
-        }
-        bb = LLVMGetNextBasicBlock(bb);
-      }
-    }
-    fn = LLVMGetNextFunction(fn);
+  if (!g || !g->mod) {
+    zan_escape_stats_t empty = {0, 0};
+    return empty;
   }
-  return stats;
+  return zan_opt_escape_mod(g->mod);
 }
 
 bool zan_opt_knob_off(signed char knob, const char *env) {
@@ -1585,7 +2428,8 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
     report.dce = zan_opt_dce(g);
   if (!zan_opt_knob_off(knobs->no_inline, "ZAN_NO_OPT_INLINE"))
     report.inlining = zan_opt_inline(g, level);
-  report.success = zan_opt_configure_llvm_passes(g, level, knobs) == ZAN_OK;
+  report.success =
+      zan_opt_configure_llvm_passes_ex(g, level, knobs, &report) == ZAN_OK;
 
   double t1 = get_time_ms();
   report.time_ms = t1 - t0;

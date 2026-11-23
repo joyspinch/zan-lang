@@ -593,8 +593,34 @@ LLVMValueRef emit_dispatch_call_gctx(zan_irgen_t *g, zan_symbol_t *static_sym,
         LLVMValueRef fn8 = LLVMBuildLoad2(b, i8ptr, sp, "vfn8");
         LLVMValueRef fnp =
             LLVMBuildBitCast(b, fn8, LLVMPointerType(vtable_fnty, 0), "vfnp");
-        return zan_call_or_invoke(g, b, vtable_fnty, fnp, call_args,
-                                  (unsigned)argc, cn);
+        LLVMValueRef call_res = zan_call_or_invoke(
+            g, b, vtable_fnty, fnp, call_args, (unsigned)argc, cn);
+        if (g->publish_instance_prune && !g->emit_lib &&
+            !is_user_generic_sym(static_sym) &&
+            (LLVMIsACallInst(call_res) || LLVMIsAInvokeInst(call_res))) {
+          int st_idx = -1;
+          for (int si = 0; si < g->struct_type_count; si++) {
+            if (g->struct_types[si].sym == static_sym) {
+              st_idx = si;
+              break;
+            }
+          }
+          if (st_idx >= 0) {
+            LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+            LLVMMetadataRef md_elems[] = {
+                LLVMValueAsMetadata(
+                    LLVMConstInt(i64t, (unsigned long long)st_idx, 0)),
+                LLVMValueAsMetadata(
+                    LLVMConstInt(i64t, (unsigned long long)slot, 0))};
+            unsigned md_kind =
+                LLVMGetMDKindIDInContext(g->ctx, "zan.vcall", 9);
+            LLVMSetMetadata(
+                call_res, md_kind,
+                LLVMMetadataAsValue(
+                    g->ctx, LLVMMDNodeInContext2(g->ctx, md_elems, 2)));
+          }
+        }
+        return call_res;
       }
     }
   }

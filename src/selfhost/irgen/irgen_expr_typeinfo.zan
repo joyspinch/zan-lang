@@ -315,6 +315,12 @@ partial class Irgen {
             L("  " + z + " = zext i1 " + phi + " to i64");
             return new ExprVal(z, MkType("bool"));
         }
+        if (mname == "FindField") {
+            ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
+            string idx = NT();
+            L("  " + idx + " = call i64 @__zan_refl_field_find_idx(i8* " + recv.op + ", i8* " + nmVal.op + ")");
+            return new ExprVal(idx, MkType("int"));
+        }
         if (mname == "GetMethodName" || mname == "GetMethodReturnType"
         || mname == "GetMethodParamCount" || mname == "IsMethodStatic"
         || mname == "GetMethodCustomAttributes" || mname == "GetMethodAttrs") {
@@ -924,23 +930,39 @@ partial class Irgen {
                 }
             }
         }
-        // Dynamic reflection fallback using TypeInfo & @__zan_refl_field_find
-        ExprVal nmVal = e.kids.Count > 0 ? GenExpr(e.kids[0]) : new ExprVal("null", MkType("string"));
-        ExprVal vVal = (mname.StartsWith("SetField") && e.kids.Count > 1) ? GenExpr(e.kids[1]) : new ExprVal("0", MkType("int"));
-        ExprVal ti = EmitGetType(recv);
+        // Dynamic reflection fallback using TypeInfo & @__zan_refl_field_find / @__zan_refl_field_at
+        bool isAt = mname.EndsWith("At");
+        string opName = isAt ? mname.Substring(0, mname.Length - 2) : mname;
+        ExprVal objRecv = IsErasedType(recv.ty) ? new ExprVal(Coerce(recv, "i8*"), MkType("object")) : recv;
+        string rop = Coerce(objRecv, "i8*");
+        ExprVal nmOrIdxVal = e.kids.Count > 0
+            ? GenExpr(e.kids[0])
+            : new ExprVal(isAt ? "-1" : "null", MkType(isAt ? "int" : "string"));
+        ExprVal vVal = (opName.StartsWith("SetField") && e.kids.Count > 1) ? GenExpr(e.kids[1]) : new ExprVal("0", MkType("int"));
+        ExprVal ti = EmitGetType(objRecv);
         string slotP = NT();
-        L("  " + slotP + " = call i8* @__zan_refl_field_find(i8* " + ti.op + ", i8* " + nmVal.op + ")");
-        string hit = NT();
-        L("  " + hit + " = icmp ne i8* " + slotP + ", null");
+        if (isAt) {
+            string idx64 = ToI64(nmOrIdxVal);
+            L("  " + slotP + " = call i8* @__zan_refl_field_at(i8* " + ti.op + ", i64 " + idx64 + ")");
+        } else {
+            L("  " + slotP + " = call i8* @__zan_refl_field_find(i8* " + ti.op + ", i8* " + nmOrIdxVal.op + ")");
+        }
+        string slotNn = NT();
+        L("  " + slotNn + " = icmp ne i8* " + slotP + ", null");
 
-        if (mname == "HasField") {
+        if (opName == "HasField") {
             string z = NT();
-            L("  " + z + " = zext i1 " + hit + " to i64");
+            L("  " + z + " = zext i1 " + slotNn + " to i64");
             return new ExprVal(z, MkType("bool"));
         }
 
-        if (mname == "SetFieldString" || mname == "SetFieldInt" || mname == "SetFieldLong"
-        || mname == "SetFieldDouble" || mname == "SetFieldBool" || mname == "SetFieldObject") {
+        string recvNn = NT();
+        L("  " + recvNn + " = icmp ne i8* " + rop + ", null");
+        string hit = NT();
+        L("  " + hit + " = and i1 " + slotNn + ", " + recvNn);
+
+        if (opName == "SetFieldString" || opName == "SetFieldInt" || opName == "SetFieldLong"
+        || opName == "SetFieldDouble" || opName == "SetFieldBool" || opName == "SetFieldObject") {
             int lset = NL();
             int lend = NL();
             string lookupFrom = curLbl;
@@ -960,12 +982,10 @@ partial class Irgen {
             string fkind = NT();
             L("  " + fkind + " = load i64, i64* " + fkind_i64);
 
-            string rop = NT();
-            L("  " + rop + " = bitcast " + MapType(recv.ty) + " " + recv.op + " to i8*");
             string fp = NT();
             L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
 
-            if (mname == "SetFieldString" || mname == "SetFieldObject") {
+            if (opName == "SetFieldString" || opName == "SetFieldObject") {
                 int lstore = NL();
                 L("  switch i64 " + fkind + ", label %L" + lend + " [");
                 L("    i64 " + ReflFkOf("string") + ", label %L" + lstore);
@@ -988,13 +1008,15 @@ partial class Irgen {
                 L("  " + result + " = phi i64 [ 0, %" + lookupFrom + " ], [ 0, %L" + lset + " ], [ 1, %L" + lstore + " ]");
                 return new ExprVal(result, MkType("bool"));
             }
-            if (mname == "SetFieldBool") {
+            if (opName == "SetFieldBool") {
+                string val64 = ToI64(vVal);
                 string val1 = NT();
-                L("  " + val1 + " = icmp ne i64 " + vVal.op + ", 0");
+                L("  " + val1 + " = icmp ne i64 " + val64 + ", 0");
                 string val8 = NT();
                 L("  " + val8 + " = zext i1 " + val1 + " to i8");
                 L("  store i8 " + val8 + ", i8* " + fp);
-            } else if (mname == "SetFieldInt" || mname == "SetFieldLong") {
+            } else if (opName == "SetFieldInt" || opName == "SetFieldLong") {
+                string val64 = ToI64(vVal);
                 int l1 = NL();
                 int l2 = NL();
                 int l4 = NL();
@@ -1008,7 +1030,7 @@ partial class Irgen {
                 L("  br i1 " + is1Tot + ", label %L" + l1 + ", label %L" + l2);
 
                 Label(l1);
-                string val8 = NT(); L("  " + val8 + " = trunc i64 " + vVal.op + " to i8");
+                string val8 = NT(); L("  " + val8 + " = trunc i64 " + val64 + " to i8");
                 L("  store i8 " + val8 + ", i8* " + fp);
                 L("  br label %L" + ldone);
 
@@ -1020,7 +1042,7 @@ partial class Irgen {
                 L("  br i1 " + is2Tot + ", label %L" + l2body + ", label %L" + l4);
 
                 Label(l2body);
-                string val16 = NT(); L("  " + val16 + " = trunc i64 " + vVal.op + " to i16");
+                string val16 = NT(); L("  " + val16 + " = trunc i64 " + val64 + " to i16");
                 string p16 = NT(); L("  " + p16 + " = bitcast i8* " + fp + " to i16*");
                 L("  store i16 " + val16 + ", i16* " + p16);
                 L("  br label %L" + ldone);
@@ -1035,31 +1057,32 @@ partial class Irgen {
                 L("  br i1 " + is4Tot + ", label %L" + l4body + ", label %L" + l8);
 
                 Label(l4body);
-                string val32 = NT(); L("  " + val32 + " = trunc i64 " + vVal.op + " to i32");
+                string val32 = NT(); L("  " + val32 + " = trunc i64 " + val64 + " to i32");
                 string p32 = NT(); L("  " + p32 + " = bitcast i8* " + fp + " to i32*");
                 L("  store i32 " + val32 + ", i32* " + p32);
                 L("  br label %L" + ldone);
 
                 Label(l8);
                 string p64 = NT(); L("  " + p64 + " = bitcast i8* " + fp + " to i64*");
-                L("  store i64 " + vVal.op + ", i64* " + p64);
+                L("  store i64 " + val64 + ", i64* " + p64);
                 L("  br label %L" + ldone);
 
                 Label(ldone);
-            } else if (mname == "SetFieldDouble") {
+            } else if (opName == "SetFieldDouble") {
+                string valD = Coerce(vVal, "double");
                 int lflt = NL();
                 int ldbl = NL();
                 int ldone = NL();
                 string isFlt = NT(); L("  " + isFlt + " = icmp eq i64 " + fkind + ", 12");
                 L("  br i1 " + isFlt + ", label %L" + lflt + ", label %L" + ldbl);
                 Label(lflt);
-                string valF = NT(); L("  " + valF + " = fptrunc double " + vVal.op + " to float");
+                string valF = NT(); L("  " + valF + " = fptrunc double " + valD + " to float");
                 string pF = NT(); L("  " + pF + " = bitcast i8* " + fp + " to float*");
                 L("  store float " + valF + ", float* " + pF);
                 L("  br label %L" + ldone);
                 Label(ldbl);
                 string pD = NT(); L("  " + pD + " = bitcast i8* " + fp + " to double*");
-                L("  store double " + vVal.op + ", double* " + pD);
+                L("  store double " + valD + ", double* " + pD);
                 L("  br label %L" + ldone);
                 Label(ldone);
             }
@@ -1071,7 +1094,7 @@ partial class Irgen {
         }
 
         string resSlot = NT();
-        if (mname == "GetFieldString") {
+        if (opName == "GetFieldString") {
             L("  " + resSlot + " = alloca i8*");
             L("  store i8* " + GenStr("").op + ", i8** " + resSlot);
             int lget = NL();
@@ -1081,7 +1104,6 @@ partial class Irgen {
             string foff_p = NT(); L("  " + foff_p + " = getelementptr inbounds i8, i8* " + slotP + ", i64 24");
             string foff_i64 = NT(); L("  " + foff_i64 + " = bitcast i8* " + foff_p + " to i64*");
             string foff = NT(); L("  " + foff + " = load i64, i64* " + foff_i64);
-            string rop = NT(); L("  " + rop + " = bitcast " + MapType(recv.ty) + " " + recv.op + " to i8*");
             string fp = NT(); L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
             string sp = NT(); L("  " + sp + " = bitcast i8* " + fp + " to i8**");
             string val = NT(); L("  " + val + " = load i8*, i8** " + sp);
@@ -1092,7 +1114,7 @@ partial class Irgen {
             return new ExprVal(ret, MkType("string"));
         }
 
-        if (mname == "GetFieldInt" || mname == "GetFieldLong" || mname == "GetFieldBool") {
+        if (opName == "GetFieldInt" || opName == "GetFieldLong" || opName == "GetFieldBool") {
             L("  " + resSlot + " = alloca i64");
             L("  store i64 0, i64* " + resSlot);
             int lget = NL();
@@ -1106,7 +1128,6 @@ partial class Irgen {
             string fkind_i64 = NT(); L("  " + fkind_i64 + " = bitcast i8* " + fkind_p + " to i64*");
             string fkind = NT(); L("  " + fkind + " = load i64, i64* " + fkind_i64);
 
-            string rop = NT(); L("  " + rop + " = bitcast " + MapType(recv.ty) + " " + recv.op + " to i8*");
             string fp = NT(); L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
 
             int l1 = NL();
@@ -1190,15 +1211,15 @@ partial class Irgen {
             L("  br label %L" + lend);
             Label(lend);
             string ret = NT(); L("  " + ret + " = load i64, i64* " + resSlot);
-            if (mname == "GetFieldBool") {
+            if (opName == "GetFieldBool") {
                 string bcmp = NT(); L("  " + bcmp + " = icmp ne i64 " + ret + ", 0");
                 string bz = NT(); L("  " + bz + " = zext i1 " + bcmp + " to i64");
                 return new ExprVal(bz, MkType("bool"));
             }
-            return new ExprVal(ret, MkType(mname == "GetFieldLong" ? "long" : "int"));
+            return new ExprVal(ret, MkType(opName == "GetFieldLong" ? "long" : "int"));
         }
 
-        if (mname == "GetFieldDouble") {
+        if (opName == "GetFieldDouble") {
             L("  " + resSlot + " = alloca double");
             L("  store double 0.0, double* " + resSlot);
             int lget = NL();
@@ -1212,7 +1233,6 @@ partial class Irgen {
             string fkind_i64 = NT(); L("  " + fkind_i64 + " = bitcast i8* " + fkind_p + " to i64*");
             string fkind = NT(); L("  " + fkind + " = load i64, i64* " + fkind_i64);
 
-            string rop = NT(); L("  " + rop + " = bitcast " + MapType(recv.ty) + " " + recv.op + " to i8*");
             string fp = NT(); L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
 
             int lflt = NL(); int ldbl = NL(); int ldone = NL();
@@ -1236,7 +1256,7 @@ partial class Irgen {
             return new ExprVal(ret, MkType("double"));
         }
 
-        if (mname == "GetFieldObject") {
+        if (opName == "GetFieldObject") {
             L("  " + resSlot + " = alloca i8*");
             L("  store i8* null, i8** " + resSlot);
             int lget = NL();
@@ -1246,7 +1266,6 @@ partial class Irgen {
             string foff_p = NT(); L("  " + foff_p + " = getelementptr inbounds i8, i8* " + slotP + ", i64 24");
             string foff_i64 = NT(); L("  " + foff_i64 + " = bitcast i8* " + foff_p + " to i64*");
             string foff = NT(); L("  " + foff + " = load i64, i64* " + foff_i64);
-            string rop = NT(); L("  " + rop + " = bitcast " + MapType(recv.ty) + " " + recv.op + " to i8*");
             string fp = NT(); L("  " + fp + " = getelementptr inbounds i8, i8* " + rop + ", i64 " + foff);
             string sp = NT(); L("  " + sp + " = bitcast i8* " + fp + " to i8**");
             string val = NT(); L("  " + val + " = load i8*, i8** " + sp);

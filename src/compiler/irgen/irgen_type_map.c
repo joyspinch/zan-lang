@@ -501,8 +501,10 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
   snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len,
            sym->name.str);
   LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
+  memset(&g->struct_types[g->struct_type_count], 0, sizeof(*g->struct_types));
   g->struct_types[g->struct_type_count].sym = sym;
   g->struct_types[g->struct_type_count].llvm_type = st;
+  g->struct_types[g->struct_type_count].base_struct_idx = -1;
   g->struct_type_count++;
   /* 本结构体在表里的下标：下面算字段类型时可能**递归**注册别的结构体，
    * 那会让 g->struct_types 扩容搬家——事后不能再用"最后一个"当下标，

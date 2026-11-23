@@ -1289,7 +1289,8 @@ static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
 }
 
 static void zan_prepare_static_runtime(zan_irgen_t *g,
-                                       const zan_target_t *target) {
+                                       const zan_target_t *target,
+                                       bool preserve_link_abi) {
   if (g->emit_lib && g->emit_shared)
     return;
   bool use_comdat = target->os != ZAN_OS_MACOS && target->os != ZAN_OS_IOS;
@@ -1320,6 +1321,9 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
     for (size_t i = 0; i < sizeof(co_fallbacks) / sizeof(co_fallbacks[0]); i++)
       zan_runtime_fallback(g, co_fallbacks[i], use_comdat);
   }
+
+  if (preserve_link_abi)
+    return;
 
   LLVMValueRef helpers[] = {
       g->rt_println,      g->rt_print_int,        g->rt_print_uint,
