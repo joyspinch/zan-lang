@@ -33,6 +33,7 @@ Control/PropSpec 基类，并行必冲突）。
 | 1 ✅ | 事件模型：UiEvent 单通道；`EventTable` 按类型反射 `[Event]`/`[Event(Alias/Hidden/Display)]` 标注；删逐控件 `Events/BindEvent/BindEventS/TriggerEvent` 重写与 `On*S` 族；DataGrid/浏览器盒以事件属性公开、state 持 `weak host` 作 sender | ~1000 行样板 |
 | 2a ✅ | `PropKind`/`PropValueKind` 枚举；`Field(name)` 由声明类型推断值类型；DefineProps 链式压实（358 处、95 处字段派生工厂） | ~720 行 |
 | 2b ✅ | `Kind()` 基类默认类名（去泛型实参），删 160 处同名重写；33 个按父类种类上报的子类与 3 个父类改报 Panel 的控件显式重写，前后有效 Kind 逐类比对一致（46 个内部辅助件由 "Control" 改报类名，无 CSS/克隆影响） | ~330 行 |
+| 2c-1 ✅ | 属性协议声明化基础：`PropSpec.Accessor(getter, setter)`、`.Setter(name)`（按字段类型收参）、`.ForwardTo(target, prop)`，`Control.OnPropertyChanged(spec)` 写后钩子；40 个类删除 SetProp/GetProp/GetExtra/SetExtra 重写；修反射 Invoke 丢弃返回值泄漏 | ~600 行重写 |
 | 2 | 属性模型（余下）：`PropKind`/`ValueKind` 枚举替代魔法数；`Field(name)` 反射推断值类型；`SetProp/GetProp/GetExtra/SetExtra` 重写改属性 setter；`Kind()` 基类默认 `GetType().Name`；全量 DefineProps 改写 | ~140 处重写、~100 处 Kind |
 | 3 | 拆包：`Zan.Gui`（控件树/布局/样式/渲染/标记/后端）、`Zan.Gui.Widgets`（控件目录）、设计器逻辑归 `Zan.Gui.Designer`、UiDriver 归 `Zan.Gui.Automation` | 包依赖与模板/IDE 引用 |
 | 4 | App 服务化：Automation/Glass/ThemeDrawer/Offscreen/Diagnostics 抽成服务；控件经 `this.RequestRedraw()` 而非 `FindApp().RequestRedraw()` | App 146 个方法 |
