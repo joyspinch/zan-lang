@@ -1,0 +1,108 @@
+namespace Gui;
+
+// 主题设置抽屉（换肤 / 强调色 / 密度 / 透明度 / 壁纸 / 动效）的协调服务。
+// 从 App 拆出：App 只持有一个惰性创建的服务实例（App.ThemeMenu），抽屉视图、开关状态
+// 与设置命令的应用都在这里，App 本体不再承载这块可选功能。
+public class ThemeMenuService {
+    private weak App app;
+    // 视图以 object 存放：可选视图类型不进 App 的字段图。
+    internal object drawer;
+
+    public ThemeMenuService(App owner) {
+        app = owner;
+    }
+
+    // 当前抽屉视图（未打开过或已退休时为 null）。
+    public ThemeDrawer CurrentDrawer() {
+        return drawer != null ? (ThemeDrawer)drawer : null;
+    }
+
+    // 开关抽屉。核心外壳只经显式安装的设置动作调用它（见 ThemeSettings）。
+    public void Toggle(int triggerId) {
+        App host = app;
+        if (host == null || host.themeNames.Count == 0) { return; }
+        ThemeDrawer current = this.CurrentDrawer();
+        if (current != null && current.IsOpen()) { this.Close(current); }
+        else { this.Show(); }
+        host.NoteRedrawWhy("ToggleThemeMenu");
+        host.needsRedraw = true;
+    }
+
+    public void Show() {
+        App host = app;
+        if (host == null || !host.isRunning || host.themeNames.Count == 0 || host.overlayHost == null) { return; }
+        if (drawer == null) { drawer = new ThemeDrawer(host); }
+        host.themeMenuOpen.Set(true);
+        ((ThemeDrawer)drawer).Present(host);
+    }
+
+    internal void Close(ThemeDrawer view) {
+        App host = app;
+        if (host == null || drawer != view) { return; }
+        host.themeMenuOpen.Set(false);
+        if (host.overlayHost != null) { host.overlayHost.Hide(view); }
+        if (view.IsOpen()) { view.Hide(); }
+        host.RequestRedraw();
+    }
+
+    internal void Retire(ThemeDrawer view) {
+        App host = app;
+        if (host == null || drawer != view) { return; }
+        drawer = null;
+        host.themeMenuOpen.Set(false);
+        view.Retire();
+    }
+
+    // 强调色色板第 index 项（0 = 跟随皮肤）。
+    internal int Accent(int index) {
+        if (index == 1) { return Theme.Rgb(59, 130, 246); }
+        if (index == 2) { return Theme.Rgb(139, 92, 246); }
+        if (index == 3) { return Theme.Rgb(236, 72, 153); }
+        if (index == 4) { return Theme.Rgb(16, 185, 129); }
+        if (index == 5) { return Theme.Rgb(245, 158, 11); }
+        if (index == 6) { return Theme.Rgb(239, 68, 68); }
+        return 0;
+    }
+
+    // 应用抽屉里的一条设置命令。
+    internal void ChangeSetting(ThemeDrawer view, string command, int value) {
+        App host = app;
+        if (host == null || drawer != view || !view.IsOpen()) { return; }
+        if (command == "tab") { view.SelectTab(value); return; }
+        if (command == "skin") {
+            if (value < 0 || value >= host.themeNames.Count) { return; }
+            int previous = host.themeMenuModel.Get();
+            if (host.autoSkins) {
+                host.ApplySkin(value);
+                if (host.appliedSkin != value) { return; }
+            } else { host.themeMenuModel.Set(value); }
+            if (host.themeMenuModel.Get() != previous) { host.themeMenuChange.Raise(); }
+        } else if (command == "accent") {
+            host.accentOverride = this.Accent(value);
+            if (host.autoSkins) { host.ApplySkin(host.appliedSkin); }
+            else if (host.accentOverride != 0) {
+                host.theme.ApplyAccent(host.accentOverride);
+                host.ApplyAppCss();
+            }
+        } else if (command == "density") {
+            host.SetDensity(value);
+        } else if (command == "opacity") {
+            host.SetWindowOpacity(view.opacity.Low());
+        } else if (command == "wallpaper-pick") {
+            host.RequestWallpaperPick();
+        } else if (command == "wallpaper-clear") {
+            host.ClearWallpaper();
+        } else if (command == "wallpaper-opacity") {
+            if (host.HasUserWallpaper()) {
+                host.SetUserWallpaper(host.UserWallpaperPath(), view.wallpaperOpacity.Low());
+            } else { host.SetWallpaper(host.WallpaperPath(), view.wallpaperOpacity.Low()); }
+        } else if (command == "animations") {
+            host.SetBackdropFx(view.animations.IsChecked());
+        } else if (command == "effect") {
+            host.SetFxKind(value);
+        }
+        // 设置项既有的通知可能停掉或替换宿主。
+        if (host.isRunning && drawer == view && view.IsOpen()) { view.Prepare(host); }
+        host.RequestRedraw();
+    }
+}
