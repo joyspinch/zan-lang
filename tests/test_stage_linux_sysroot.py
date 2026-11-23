@@ -52,6 +52,16 @@ class SysrootSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not supply"):
             self.select(self.trace(self.sources[:-1]))
 
+    def test_absent_crti_crtn_pair_is_allowed(self):
+        kept = [p for p in self.sources if p.name not in MODULE.OPTIONAL_PAIR]
+        self.assertEqual(set(self.select(self.trace(kept))),
+                         set(MODULE.REQUIRED) - set(MODULE.OPTIONAL_PAIR))
+
+    def test_half_of_crti_crtn_pair_fails(self):
+        kept = [p for p in self.sources if p.name != "crtn.o"]
+        with self.assertRaisesRegex(ValueError, "crtn.o"):
+            self.select(self.trace(kept))
+
     def test_duplicate_input_fails(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             self.select(self.trace(self.sources + self.sources[:1]))

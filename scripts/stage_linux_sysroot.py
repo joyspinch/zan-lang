@@ -14,6 +14,12 @@ REQUIRED = (
     "crt1.o", "crti.o", "crtn.o", "libc.a", "libc++.a",
     "libc++abi.a", "libunwind.a", "libcompiler_rt.a",
 )
+# musl only ships crti.s/crtn.s on architectures with legacy .init/.fini
+# prologues (x86_64, aarch64, ...). On others (riscv64) Zig's static link uses
+# neither, so the pair may be absent together -- never just one of them.
+# build_linux_rt.sh then compiles empty stubs, which is what musl itself
+# provides there; zanc's cross link line names both files unconditionally.
+OPTIONAL_PAIR = ("crti.o", "crtn.o")
 LINK_COMMAND = re.compile(
     r'^\s*(?:ld\.lld(?:\.exe)?|"[^"\r\n]*[/\\]ld\.lld(?:\.exe)?"'
     r'|[^\s"]*[/\\]ld\.lld(?:\.exe)?)\s+'
@@ -46,6 +52,8 @@ def selected_inputs(trace, cache_root):
             raise ValueError("missing absolute target runtime input: " + str(source))
         selected[name] = source
     missing = set(REQUIRED) - selected.keys()
+    if missing == set(OPTIONAL_PAIR):
+        missing = set()
     if missing:
         raise ValueError("Zig did not supply runtime inputs: " + ", ".join(sorted(missing)))
     return selected
@@ -109,6 +117,7 @@ def main():
     cache = parser.add_mutually_exclusive_group()
     cache.add_argument("--cache-root", type=Path)
     cache.add_argument("--zig-env", type=Path, help="JSON output of the same Zig executable's env command")
+    parser.add_argument("--target", default="", help="target name, only for error messages")
     options = parser.parse_args()
     if options.publish:
         # Convert ordinary termination signals into exceptions while swapping,
@@ -126,7 +135,12 @@ def main():
         cache_root = json.loads(options.zig_env.read_text(encoding="utf-8"))["global_cache_dir"]
     if cache_root is None:
         parser.error("staging requires --cache-root or --zig-env")
-    selected = selected_inputs(options.trace.read_text(encoding="utf-8"), cache_root)
+    try:
+        selected = selected_inputs(options.trace.read_text(encoding="utf-8"), cache_root)
+    except ValueError as error:
+        if options.target:
+            raise ValueError(options.target + ": " + str(error)) from error
+        raise
     options.output.mkdir(parents=True, exist_ok=True)
     # Validate the entire selection before publishing any of it. The caller
     # builds into its own staging directory and publishes only after success.
