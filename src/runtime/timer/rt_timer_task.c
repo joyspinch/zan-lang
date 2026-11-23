@@ -13,6 +13,13 @@ typedef struct {
     const volatile int *done;
     volatile int *cancel;
     void *child;
+    /* Back edge of child: the frame whose `child` names this frame. Await
+     * edges form a tree, so retire clears exactly that one edge instead of
+     * scanning every slot. multi_parent marks the (unexpected) case of a
+     * second parent naming the same child; retire then falls back to the
+     * full scan so no edge can outlive the address. */
+    void *parent;
+    int multi_parent;
     size_t pins;
     void (*retire)(void *);
     void (*allocator_release)(void *);
@@ -26,6 +33,70 @@ static void task_lock(void) {
     while (__atomic_exchange_n(&g_task_lock, 1, __ATOMIC_ACQUIRE)) { }
 }
 static void task_unlock(void) { __atomic_store_n(&g_task_lock, 0, __ATOMIC_RELEASE); }
+
+/* ---- O(1) frame index ----
+ * Every coroutine creation configures its frame (config/allocator/child) and
+ * every retirement looks it up again. Those lookups were linear scans over all
+ * slots under the global lock: with thousands of live frames the registry
+ * dominated a web server's CPU (zan_task_child alone ~10% of samples). Frames
+ * are now found through an open-addressing index (slot+1, 0 = empty; linear
+ * probing, backward-shift deletion) and free slots come from a stack. Indices
+ * stay valid across realloc of g_task_entries. */
+static uint32_t *g_task_index;
+static size_t g_task_index_cap;   /* power of two, >= 2 * g_task_capacity */
+static uint32_t *g_task_free;     /* stack of free slot numbers */
+static size_t g_task_free_n;
+
+static size_t task_hash(const void *frame, size_t mask) {
+    uint64_t x = (uint64_t)(uintptr_t)frame;
+    x ^= x >> 33;
+    x *= UINT64_C(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    return (size_t)x & mask;
+}
+static void task_index_insert(size_t slot) {
+    size_t mask = g_task_index_cap - 1;
+    size_t h = task_hash(g_task_entries[slot].frame, mask);
+    while (g_task_index[h]) h = (h + 1) & mask;
+    g_task_index[h] = (uint32_t)(slot + 1);
+}
+static void task_index_rebuild(size_t cap) {
+    uint32_t *idx = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    if (!idx) abort();
+    free(g_task_index);
+    g_task_index = idx;
+    g_task_index_cap = cap;
+    for (size_t i = 0; i < g_task_capacity; ++i)
+        if (g_task_entries[i].frame) task_index_insert(i);
+}
+static size_t task_index_pos(const void *frame) {
+    if (!g_task_index_cap) return SIZE_MAX;
+    size_t mask = g_task_index_cap - 1;
+    size_t h = task_hash(frame, mask);
+    for (;;) {
+        uint32_t v = g_task_index[h];
+        if (!v) return SIZE_MAX;
+        if (g_task_entries[v - 1].frame == frame) return h;
+        h = (h + 1) & mask;
+    }
+}
+static void task_index_remove(const void *frame) {
+    size_t pos = task_index_pos(frame);
+    if (pos == SIZE_MAX) return;
+    size_t mask = g_task_index_cap - 1;
+    g_task_index[pos] = 0;
+    /* Backward-shift: re-seat the rest of the probe run. */
+    size_t j = (pos + 1) & mask;
+    while (g_task_index[j]) {
+        uint32_t v = g_task_index[j];
+        g_task_index[j] = 0;
+        size_t h = task_hash(g_task_entries[v - 1].frame, mask);
+        while (g_task_index[h]) h = (h + 1) & mask;
+        g_task_index[h] = v;
+        j = (j + 1) & mask;
+    }
+}
+
 static zan_task_entry *task_find(uint64_t generation) {
     if (!generation) return NULL;
     for (size_t i = 0; i < g_task_capacity; ++i)
@@ -35,30 +106,61 @@ static zan_task_entry *task_find(uint64_t generation) {
 }
 static zan_task_entry *task_frame(void *frame) {
     if (!frame) return NULL;
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].frame == frame) return &g_task_entries[i];
-    return NULL;
+    size_t pos = task_index_pos(frame);
+    if (pos == SIZE_MAX) return NULL;
+    return &g_task_entries[g_task_index[pos] - 1];
 }
 static zan_task_entry *task_slot(void *frame) {
     zan_task_entry *entry = task_frame(frame);
     if (entry) return entry;
-    size_t i;
-    for (i = 0; i < g_task_capacity; ++i)
-        if (!g_task_entries[i].frame) break;
-    if (i == g_task_capacity) {
+    if (!g_task_free_n) {
         size_t next = g_task_capacity ? g_task_capacity * 2 : 16;
-        if (next < g_task_capacity || next > SIZE_MAX / sizeof(zan_task_entry)) abort();
+        if (next < g_task_capacity || next > UINT32_MAX - 1
+            || next > SIZE_MAX / sizeof(zan_task_entry)) abort();
         zan_task_entry *entries = (zan_task_entry *)realloc(g_task_entries,
             next * sizeof(zan_task_entry));
         if (!entries) abort();
         memset(entries + g_task_capacity, 0,
             (next - g_task_capacity) * sizeof(zan_task_entry));
+        uint32_t *fl = (uint32_t *)realloc(g_task_free, next * sizeof(uint32_t));
+        if (!fl) abort();
+        g_task_free = fl;
+        /* Push new slots so the lowest number pops first. */
+        for (size_t k = next; k > g_task_capacity; --k)
+            g_task_free[g_task_free_n++] = (uint32_t)(k - 1);
         g_task_entries = entries;
         g_task_capacity = next;
+        task_index_rebuild(next * 2);
     }
+    size_t i = g_task_free[--g_task_free_n];
     entry = &g_task_entries[i];
     entry->frame = frame;
+    task_index_insert(i);
     return entry;
+}
+/* Clear every edge naming `frame` as a child. Back edge first; the full scan
+ * only when a second parent was ever recorded for this child. */
+static void task_clear_child_edges(zan_task_entry *entry, void *frame) {
+    if (entry && !entry->multi_parent) {
+        zan_task_entry *p = task_frame(entry->parent);
+        if (p && p->child == frame) p->child = NULL;
+        entry->parent = NULL;
+        return;
+    }
+    for (size_t i = 0; i < g_task_capacity; ++i)
+        if (g_task_entries[i].child == frame) g_task_entries[i].child = NULL;
+    if (entry) { entry->parent = NULL; entry->multi_parent = 0; }
+}
+/* Release a slot: drop its outgoing back edge, unindex, zero, free-list. */
+static void task_drop(zan_task_entry *entry) {
+    void *frame = entry->frame;
+    zan_task_entry *c = task_frame(entry->child);
+    if (c && c->parent == frame) c->parent = NULL;
+    task_clear_child_edges(entry, frame);
+    task_index_remove(frame);
+    size_t slot = (size_t)(entry - g_task_entries);
+    memset(entry, 0, sizeof(*entry));
+    g_task_free[g_task_free_n++] = (uint32_t)slot;
 }
 /* Called before publication. Addresses are supplied by the compiler rather
  * than inferred from a driver-specific frame layout. NULL leaves a field alone. */
@@ -144,7 +246,7 @@ void zan_task_unpin(void *frame) {
     --entry->pins;
     if (!entry->pins && entry->retire) {
         retire = entry->retire;
-        memset(entry, 0, sizeof(*entry));
+        task_drop(entry);
     }
     task_unlock();
     if (retire) retire(frame);
@@ -175,7 +277,18 @@ void zan_task_child(void *parent, void *child) {
     if (!p || p->retire || (child && (!c || c->retire))) {
         task_unlock(); abort();
     }
+    if (p->child != child) {
+        zan_task_entry *old = task_frame(p->child);
+        if (old && old->parent == parent) old->parent = NULL;
+    }
     p->child = child;
+    if (c) {
+        if (c->parent && c->parent != parent) {
+            zan_task_entry *other = task_frame(c->parent);
+            if (other && other->child == child) c->multi_parent = 1;
+        }
+        c->parent = parent;
+    }
     if (p->cancel && __atomic_load_n(p->cancel, __ATOMIC_ACQUIRE))
         task_cancel_chain(c);
     task_unlock();
@@ -186,16 +299,17 @@ void zan_task_retire(void *frame, void (*release)(void *)) {
     if (!frame) return;
     int deferred = 0;
     task_lock();
-    for (size_t i = 0; i < g_task_capacity; ++i)
-        if (g_task_entries[i].child == frame) g_task_entries[i].child = NULL;
     zan_task_entry *entry = task_frame(frame);
+    task_clear_child_edges(entry, frame);
     if (entry) {
         entry->generation = 0;
+        zan_task_entry *c = task_frame(entry->child);
+        if (c && c->parent == frame) c->parent = NULL;
         entry->child = NULL;
         if (entry->retire) { task_unlock(); return; }
         if (entry->allocator_release) release = entry->allocator_release;
         if (entry->pins) { entry->retire = release; deferred = 1; }
-        else memset(entry, 0, sizeof(*entry));
+        else task_drop(entry);
     }
     task_unlock();
     if (!deferred) release(frame);

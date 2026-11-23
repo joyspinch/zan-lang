@@ -58,6 +58,14 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
   1 ms 时间片内联（单步 > 200 µs 或超片即重新卸载）。list 8 连接 3.7k → 10.9k rps，
   p99 3.2 → 2.1 ms；32 连接受 8 条连接池限制（4.2k）。回归用例
   `conformance/blocking_pool_stress`、`conformance/sqlite_query_async_slices`。
+- **已修（2026-11-23）：协程任务登记表每次线性扫描。** `rt_timer_task.c` 以全局数组存帧，
+  config/allocator/child/retire 每次按帧指针线性查找、retire 还全表清子边，都在一把全局
+  自旋锁下——O(活跃协程数)。改为开放寻址索引 + 空闲槽栈 + 父回边。同 HEAD A/B：plain
+  32 连接 20.9k → 29.5k rps、p99 10.3 → 4.1 ms；8 连接 +8.7%。剩余：全局自旋锁仍有争用
+  （自旋计入 zan_task_child 自身时间）。
+- **待查：HEAD 自上一基线后 plain 8 连接 33.6k → 26.7k。** 期间唯一运行时相关提交是
+  66b32700e（读串头前的可读性守卫）；剖析中其慢路径 `zan_rt_hdr_readable`→`vm_read_overwrite`
+  约占 1% 采样，不足以解释，机器负载波动大，未定论。
 - **未解（间歇）：压测端一次 "out of memory" 退出。** 同环境 11 次未复现；HEAD 同期合入了
   macOS 小对象分配器（bf700ebbf），未能归因。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
