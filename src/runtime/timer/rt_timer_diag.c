@@ -359,3 +359,48 @@ void zan_rt_fatal(const char *category, const char *message) {
     if (fn) fn(category, message);
     abort();
 }
+
+/* 头字可读性慢路径：生成代码在 string/数组上探测 [p-need, p) 的 ARC/串头字
+ * 判定「托管还是外来」。p 自身可读，故 (p & 4095) >= need 时头字与 p 同页，
+ * 编译器内联放行；只有 p 贴近页首（外来指针在独立映射页首、或托管块头恰在
+ * 前一页末尾）才调到这里。用不会触发信号的「安全拷贝」系统调用试读：不可读
+ * （未映射 / PROT_NONE）返回 0，生成代码按外来串处理（strlen、不碰 RC）；
+ * 判不了（系统调用被沙箱拒绝等）返回 1，即回到旧行为。 */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__linux__) && !defined(ZAN_BARE_METAL)
+#include <sys/uio.h>
+#endif
+int zan_rt_hdr_readable(const void *p, int64_t need) {
+    if (!p || need <= 0) return 1;
+    uintptr_t lo = (uintptr_t)p - (uintptr_t)need;
+    if (lo > (uintptr_t)p) return 0;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)lo, &mbi, sizeof mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return 1;
+#elif defined(__APPLE__)
+    unsigned char buf[64];
+    vm_size_t got = 0;
+    if ((size_t)need > sizeof buf) need = (int64_t)sizeof buf;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)lo,
+        (vm_size_t)need, (vm_address_t)buf, &got);
+    if (kr == KERN_SUCCESS) return 1;
+    return (kr == KERN_INVALID_ADDRESS || kr == KERN_PROTECTION_FAILURE) ? 0 : 1;
+#elif defined(__linux__) && !defined(ZAN_BARE_METAL)
+    unsigned char buf[64];
+    if ((size_t)need > sizeof buf) need = (int64_t)sizeof buf;
+    struct iovec local = { buf, (size_t)need };
+    struct iovec remote = { (void *)lo, (size_t)need };
+    int saved = errno;
+    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    int err = errno;
+    errno = saved;
+    if (n == (ssize_t)need) return 1;
+    return (n >= 0 || err == EFAULT) ? 0 : 1;
+#else
+    return 1;
+#endif
+}

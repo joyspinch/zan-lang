@@ -657,11 +657,25 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
     LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
         &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
         "strbuf.hdrp");
-    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
     LLVMValueRef probe_ok = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strbuf.nonnull");
-    if (read_ok) probe_ok = zan_and(g->builder, probe_ok, read_ok, "strbuf.ok");
-    LLVMBuildCondBr(g->builder, probe_ok, probe_bb, raw_bb);
+    /* 非空但头字不可读（外来指针贴页首）：不探测、不盖戳，直接 strlen */
+    LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.hdrchk");
+    LLVMBuildCondBr(g->builder, probe_ok, chk_bb, raw_bb);
+    LLVMPositionBuilderAtEnd(g->builder, chk_bb);
+    LLVMBasicBlockRef foreign_bb = NULL;
+    LLVMValueRef foreign_len = NULL;
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
+    if (read_ok) {
+        foreign_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strbuf.foreign");
+        LLVMBuildCondBr(g->builder, read_ok, probe_bb, foreign_bb);
+        LLVMPositionBuilderAtEnd(g->builder, foreign_bb);
+        foreign_len = zan_call2(g->builder, strlen_ty, g->fn_strlen,
+                                &payload, 1, "strbuf.foreignlen");
+        LLVMBuildBr(g->builder, done_bb);
+    } else {
+        LLVMBuildBr(g->builder, probe_bb);
+    }
 
     LLVMPositionBuilderAtEnd(g->builder, probe_bb);
     LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
@@ -755,6 +769,9 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
     if (phi_raw)
         LLVMAddIncoming(phi, (LLVMValueRef[]){ phi_raw },
                         (LLVMBasicBlockRef[]){ phi_raw_pred }, 1);
+    if (foreign_bb)
+        LLVMAddIncoming(phi, (LLVMValueRef[]){ foreign_len },
+                        (LLVMBasicBlockRef[]){ foreign_bb }, 1);
     return phi;
 }
 void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
@@ -770,11 +787,14 @@ void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMValueRef hdr_ptr = LLVMBuildGEP2(g->builder, i8, payload,
         &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1,
         "strinv.hdrp");
-    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
     LLVMValueRef nonnull = zan_icmp(g->builder, LLVMIntNE, payload,
         LLVMConstNull(LLVMTypeOf(payload)), "strinv.nonnull");
-    if (read_ok) nonnull = zan_and(g->builder, nonnull, read_ok, "strinv.ok");
-    LLVMBuildCondBr(g->builder, nonnull, probe_bb, done_bb);
+    LLVMBasicBlockRef chk_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.hdrchk");
+    LLVMBuildCondBr(g->builder, nonnull, chk_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, chk_bb);
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, payload);
+    if (read_ok) LLVMBuildCondBr(g->builder, read_ok, probe_bb, done_bb);
+    else LLVMBuildBr(g->builder, probe_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, probe_bb);
     LLVMValueRef hdr_iptr = LLVMBuildBitCast(g->builder, hdr_ptr, i64p,
