@@ -888,6 +888,7 @@ LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
                    LLVMConstInt(LLVMTypeOf(idx), words, 0), "slot.wi");
 }
 
+
 static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
     if (llvm_scalar_size(st)) return;
     zan_loc_t loc; memset(&loc, 0, sizeof(loc));

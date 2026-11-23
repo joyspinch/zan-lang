@@ -800,8 +800,9 @@
                     LLVMValueRef raw_opt = emit_expr(g, expr->call.args.items[1], locals);
                     opt = coerce_int_to(g, raw_opt, i64);
                 }
-                LLVMValueRef lst = emit_alloc_rc_collection(g, expr, 24, 1,
+                LLVMValueRef lst = emit_alloc_rc_collection(g, expr, 32, 1,
                                                             g->binder->type_string);
+                list_header_init_esz(g, lst, g->binder->type_string);
                 LLVMValueRef lp = LLVMBuildBitCast(g->builder, lst,
                     LLVMPointerType(g->list_struct_type, 0), "lp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),

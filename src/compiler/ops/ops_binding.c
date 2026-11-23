@@ -687,11 +687,8 @@ LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
                 "cf"), "cnt");
         emit_index_bounds_check(g, idx, count, expr->loc, "list");
         idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-        idx = slot_word_index(g, idx, elem_slot_words(g, container_elem_type(bt)));
-        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
-            LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2,
-                "df"), "data");
-        LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, data, &idx, 1, "ep");
+        LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(bt), "data");
+        LLVMValueRef ep = list_elem_ptr(g, data, idx, container_elem_type(bt), "ep");
         return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
     }
     if (bt->kind == TYPE_ARRAY && bt->array_rank == 1) {

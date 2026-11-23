@@ -507,7 +507,7 @@ struct zan_irgen {
     int bind_acc_cap;
 
     LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
-    LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+    LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data, i64 esz } */
     LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
     LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */

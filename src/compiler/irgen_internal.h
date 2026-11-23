@@ -341,6 +341,15 @@ zan_symbol_t * resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name, int 
 zan_symbol_t * resolve_overload(zan_symbol_t *type_sym, zan_istr_t name, int argc, int type_arg_count);
 zan_type_t * resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref);
 LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx, unsigned words);
+int list_elem_tag(zan_irgen_t *g, zan_type_t *et);
+unsigned list_elem_bytes(zan_irgen_t *g, zan_type_t *et);
+LLVMTypeRef list_slot_type(zan_irgen_t *g, zan_type_t *et);
+LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et, const char *nm);
+void list_header_init_esz(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et);
+LLVMValueRef list_elem_ptr(zan_irgen_t *g, LLVMValueRef data, LLVMValueRef idx, zan_type_t *et, const char *nm);
+LLVMValueRef list_slot_load_word(zan_irgen_t *g, LLVMValueRef ep, zan_type_t *et, const char *nm);
+void list_slot_store_word(zan_irgen_t *g, LLVMValueRef word, LLVMValueRef ep, zan_type_t *et);
+LLVMValueRef list_load_value(zan_irgen_t *g, zan_type_t *et, LLVMValueRef ep);
 void store_struct_in_slot(zan_irgen_t *g, LLVMValueRef v, LLVMValueRef slot_ptr, zan_ast_node_t *at);
 int type_named(zan_type_t *t, const char *n, int len);
 LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn, LLVMValueRef *args, unsigned n, const char *nm);

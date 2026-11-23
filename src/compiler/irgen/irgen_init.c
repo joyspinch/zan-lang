@@ -311,9 +311,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef realloc_type = LLVMFunctionType(i8ptr, realloc_args, 2, 0);
     g->fn_realloc = LLVMAddFunction(g->mod, "realloc", realloc_type);
 
-    LLVMTypeRef list_fields[] = { i64, i64, LLVMPointerType(i64, 0) };
+    /* { count, capacity, data, esz }：esz 是元素槽宽标签（list_elem_tag），
+     * 0 = 传统 8 字节槽字。见 irgen_type_map.c「List 元素槽」。 */
+    LLVMTypeRef list_fields[] = { i64, i64, LLVMPointerType(i64, 0), i64 };
     g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
-    LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
+    LLVMStructSetBody(g->list_struct_type, list_fields, 4, 0);
 
     LLVMTypeRef span_fields[] = { i8ptr, i64 };
     g->span_struct_type = LLVMStructCreateNamed(g->ctx, "Span");

@@ -146,8 +146,7 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
             LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
                 LLVMPointerType(g->list_struct_type, 0), "lptr");
-            LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type, list_ptr, 2, "df");
-            LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), data_field, "data");
+            zan_type_t *et = container_elem_type(arr_type);
             LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
             LLVMValueRef count_field = LLVMBuildStructGEP2(g->builder,
                 g->list_struct_type, list_ptr, 0, "countf");
@@ -159,14 +158,14 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
                 idx = LLVMBuildSExt(g->builder, idx, i64, "ext");
             }
             idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-            zan_type_t *et = container_elem_type(arr_type);
-            LLVMValueRef widx = slot_word_index(g, idx, elem_slot_words(g, et));
-            LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "ep");
+            /* 数据指针在下标求值之后取：下标表达式可能改动该表（扩容换缓冲） */
+            LLVMValueRef data = list_data_for(g, list_ptr, et, "data");
+            LLVMValueRef elem_ptr = list_elem_ptr(g, data, idx, et, "ep");
             LLVMTypeRef em = et ? map_type(g, et) : NULL;
             if (em && LLVMGetTypeKind(em) == LLVMStructTypeKind)
                 return finish_index_of_temp(g, expr, locals, arr_type, et,
                     arr_ptr, load_struct_from_slot(g, elem_ptr, em));
-            LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+            LLVMValueRef raw = list_slot_load_word(g, elem_ptr, et, "elem");
             /* 集合物理 i64 槽与非整型元素间的重解释转换 */
             LLVMValueRef out = raw;
             if (em) {

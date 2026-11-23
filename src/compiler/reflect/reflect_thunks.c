@@ -497,12 +497,13 @@ static LLVMValueRef refl_make_list_add_thunk(zan_irgen_t *g, zan_type_t *elem_ty
     di_clear(g);
     LLVMValueRef lp = LLVMBuildBitCast(g->builder, LLVMGetParam(th, 0),
         LLVMPointerType(g->list_struct_type, 0), "refl.lp");
+    /* 先过宽度守卫（反射新建的表头 esz=0，首次 Add 时空表直接改标签） */
+    (void)list_data_for(g, lp, elem_type, "refl.d0");
     LLVMValueRef cntp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 0, "refl.cntp");
     LLVMValueRef capp = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 1, "refl.capp");
     LLVMValueRef datap = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "refl.datap");
     LLVMValueRef cnt = LLVMBuildLoad2(g->builder, i64, cntp, "refl.cnt");
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capp, "refl.cap");
-    unsigned words = elem_slot_words(g, elem_type);
     LLVMBasicBlockRef grow = LLVMAppendBasicBlockInContext(g->ctx, th, "grow");
     LLVMBasicBlockRef add = LLVMAppendBasicBlockInContext(g->ctx, th, "add");
     LLVMBuildCondBr(g->builder,
@@ -516,7 +517,8 @@ static LLVMValueRef refl_make_list_add_thunk(zan_irgen_t *g, zan_type_t *elem_ty
     LLVMValueRef data = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i64 }, 2, 0), g->fn_realloc,
         (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, olddata, i8ptr, "refl.oldraw"),
-            LLVMBuildMul(g->builder, newcap, LLVMConstInt(i64, 8 * words, 0), "refl.size") },
+            LLVMBuildMul(g->builder, newcap,
+                LLVMConstInt(i64, (unsigned long long)list_elem_bytes(g, elem_type), 0), "refl.size") },
         2, "refl.data");
     zan_irgen_emit_oom_check(g, th, data);
     LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, data, i64ptr, "refl.newdata"), datap);
@@ -524,15 +526,14 @@ static LLVMValueRef refl_make_list_add_thunk(zan_irgen_t *g, zan_type_t *elem_ty
     LLVMBuildBr(g->builder, add);
     LLVMPositionBuilderAtEnd(g->builder, add);
     LLVMValueRef buffer = LLVMBuildLoad2(g->builder, i64ptr, datap, "refl.buffer");
-    LLVMValueRef widx = slot_word_index(g, cnt, words);
-    LLVMValueRef slotp = LLVMBuildGEP2(g->builder, i64, buffer, &widx, 1, "refl.slotp");
+    LLVMValueRef slotp = list_elem_ptr(g, buffer, cnt, elem_type, "refl.slotp");
     bool ok = true;
     LLVMValueRef value = refl_slot_to(g,
         LLVMBuildLoad2(g->builder, i64, LLVMGetParam(th, 1), "refl.arg"),
         map_type(g, elem_type), &ok);
     /* Invoke borrows arguments. The normal typed store retains references,
      * including nested collections, and preserves null as an occupied slot. */
-    emit_collection_slot_store(g, elem_type, i64, slotp, value, NULL, NULL, 0);
+    emit_collection_slot_store(g, elem_type, list_slot_type(g, elem_type), slotp, value, NULL, NULL, 0);
     LLVMBuildStore(g->builder,
         LLVMBuildAdd(g->builder, cnt, LLVMConstInt(i64, 1, 0), "refl.next"), cntp);
     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), LLVMGetParam(th, 2));
@@ -618,13 +619,9 @@ static LLVMValueRef refl_make_list_get_thunk(zan_irgen_t *g, zan_type_t *elem_ty
     LLVMBuildRetVoid(g->builder);
 
     LLVMPositionBuilderAtEnd(g->builder, in_b);
-    LLVMValueRef datap = LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 2, "refl.datap");
-    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0), datap, "refl.data");
-
-    int slot_words = (int)elem_slot_words(g, elem_type);
-    LLVMValueRef widx = slot_word_index(g, idx, (unsigned)slot_words);
-    LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, data, &widx, 1, "refl.ep");
-    LLVMValueRef raw = LLVMBuildLoad2(g->builder, i64, ep, "refl.raw");
+    LLVMValueRef data = list_data_for(g, lp, elem_type, "refl.data");
+    LLVMValueRef ep = list_elem_ptr(g, data, idx, elem_type, "refl.ep");
+    LLVMValueRef raw = list_slot_load_word(g, ep, elem_type, "refl.raw");
 
     bool is_ref = elem_type && (
         elem_type->kind == TYPE_CLASS ||

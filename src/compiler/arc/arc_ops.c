@@ -451,16 +451,27 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                 if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMFloatTypeKind) {
                     LLVMValueRef f32 = LLVMBuildFPTrunc(g->builder, stored,
                         LLVMFloatTypeInContext(g->ctx), "slot.f32d");
-                    LLVMValueRef bits = LLVMBuildBitCast(g->builder, f32,
+                    stored = LLVMBuildBitCast(g->builder, f32,
                         LLVMInt32TypeInContext(g->ctx), "slot.f32b");
-                    stored = LLVMBuildZExt(g->builder, bits, slot_ty, "slot.f32w");
                 } else {
                     stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
                 }
             } else if (value_kind == LLVMFloatTypeKind) {
-                LLVMValueRef bits = LLVMBuildBitCast(g->builder, stored,
+                stored = LLVMBuildBitCast(g->builder, stored,
                     LLVMInt32TypeInContext(g->ctx), "slot.f32b");
-                stored = LLVMBuildZExt(g->builder, bits, slot_ty, "slot.f32w");
+            }
+            /* 槽宽对齐：8 字节槽字零扩展（浮点位模式）；List 窄槽（list_slot_type）
+             * 截断——char 的 LLVM 类型是 i64，原样 store 会写穿 4 字节窄槽。 */
+            if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMIntegerTypeKind) {
+                unsigned sw = LLVMGetIntTypeWidth(LLVMTypeOf(stored));
+                unsigned tw = LLVMGetIntTypeWidth(slot_ty);
+                if (sw < tw)
+                    stored = (value_kind == LLVMFloatTypeKind ||
+                              value_kind == LLVMDoubleTypeKind)
+                        ? LLVMBuildZExt(g->builder, stored, slot_ty, "slot.f32w")
+                        : extend_int_for_slot(g, stored, elem_type, slot_ty);
+                else if (sw > tw)
+                    stored = LLVMBuildTrunc(g->builder, stored, slot_ty, "slot.narrow");
             }
         }
         LLVMBuildStore(g->builder, stored, slot_ptr);

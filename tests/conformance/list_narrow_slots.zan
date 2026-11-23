@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Json;
+
+// List<T> 窄槽：int/uint/float 4 字节、short/ushort 2 字节、bool/byte/sbyte 1 字节。
+// 覆盖每个元素访问点（Add/索引读写/foreach/Insert/RemoveAt/Reverse/Contains/
+// IndexOf/LastIndexOf/ToArray/AddRange/拷贝构造/数组构造/初始化式/Clear/Reserve/
+// Keys/Values/ref 绑定），以及与擦除版泛型代码、LINQ、反射/JSON 的往返——
+// 擦除代码按 8 字节槽读写，交界处由宽度守卫原地改宽，值必须一致。
+class Holder<T> {
+    public List<T> items = new List<T>();
+    public void Put(T x) { items.Add(x); }
+    public T At(int i) { return items[i]; }
+    public int Count() { return items.Count; }
+}
+
+class NarrowSlots {
+    static int failures = 0;
+    static void Check(bool ok, string name) {
+        if (!ok) { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    static void Bump(ref int x) { x = x + 1000; }
+
+    static T Pass<T>(List<T> xs, int i) { return xs[i]; }
+
+    static void Ints() {
+        List<int> a = new List<int>();
+        for (int i = 0; i < 100; i++) { a.Add(i * 3 - 50); }
+        Check(a.Count == 100 && a[0] == -50 && a[99] == 247, "int add/index");
+        a[10] = -7;
+        Check(a[10] == -7 && a[11] == -17, "int set");
+        long sum = 0;
+        foreach (int v in a) { sum = sum + v; }
+        Check(sum == 9863, "int foreach");
+        a.Insert(0, int.MinValue);
+        a.Insert(a.Count, int.MaxValue);
+        Check(a[0] == int.MinValue && a[a.Count - 1] == int.MaxValue && a[1] == -50, "int insert");
+        a.RemoveAt(0);
+        a.RemoveAt(a.Count - 1);
+        Check(a.Count == 100 && a[0] == -50, "int removeat");
+        Check(a.Contains(-7) && a.IndexOf(247) == 99 && a.LastIndexOf(-50) == 0, "int search");
+        a.Reverse();
+        Check(a[0] == 247 && a[99] == -50, "int reverse");
+        int[] arr = a.ToArray();
+        Check(arr.Length == 100 && arr[0] == 247 && arr[99] == -50, "int toarray");
+        List<int> b = new List<int>(arr);
+        List<int> c = new List<int>(b);
+        c.AddRange(b);
+        Check(c.Count == 200 && c[100] == 247 && c[199] == -50, "int ctor/addrange");
+        List<int> d = new List<int> { 1, -2, 3 };
+        Check(d.Count == 3 && d[1] == -2, "int initializer");
+        Bump(ref d[1]);
+        Check(d[1] == 998 && d[0] == 1 && d[2] == 3, "int ref element");
+        d.Clear();
+        Check(d.Count == 0, "int clear");
+        d.Add(5);
+        Check(d[0] == 5, "int add after clear");
+    }
+
+    static void Others() {
+        List<byte> bs = new List<byte>();
+        for (int i = 0; i < 300; i++) { bs.Add((byte)i); }
+        Check(bs.Count == 300 && bs[255] == 255 && bs[256] == 0 && bs[299] == 43, "byte");
+        List<sbyte> sb = new List<sbyte> { (sbyte)-128, (sbyte)127, (sbyte)-1 };
+        Check(sb[0] == -128 && sb[1] == 127 && sb[2] == -1, "sbyte");
+        List<bool> fl = new List<bool>();
+        for (int i = 0; i < 10; i++) { fl.Add(i % 3 == 0); }
+        Check(fl[0] && !fl[1] && fl[9] && fl.Contains(false), "bool");
+        List<short> sh = new List<short> { (short)-32768, (short)32767 };
+        sh.Add((short)-5);
+        Check(sh[0] == -32768 && sh[1] == 32767 && sh[2] == -5, "short");
+        List<ushort> us = new List<ushort> { (ushort)65535, (ushort)1 };
+        Check(us[0] == 65535 && us[1] == 1, "ushort");
+        List<uint> ui = new List<uint>();
+        ui.Add(4294967295U);
+        ui.Add(7U);
+        Check(ui[0] == 4294967295U && ui[1] == 7U, "uint");
+        List<float> fs = new List<float> { 1.5f, -2.25f };
+        fs.Add(3.0f);
+        float fsum = 0.0f;
+        foreach (float f in fs) { fsum = fsum + f; }
+        Check(fs[1] == -2.25f && fsum == 2.25f, "float");
+        List<long> ls = new List<long> { 9000000000L };
+        Check(ls[0] == 9000000000L, "long stays wide");
+    }
+
+    static void Boundaries() {
+        // 擦除版泛型类：内部 List<T> 按 8 字节读写
+        Holder<int> h = new Holder<int>();
+        for (int i = 0; i < 20; i++) { h.Put(i - 10); }
+        Check(h.Count() == 20 && h.At(0) == -10 && h.At(19) == 9, "generic holder");
+        List<int> inner = h.items;
+        inner.Add(77);
+        Check(inner[0] == -10 && inner[20] == 77 && h.At(20) == 77, "holder list shared");
+        Check(Pass<int>(inner, 3) == -7, "generic method pass");
+        // LINQ（推导实例化后为特化版；Stream 内建表）
+        List<int> nums = new List<int>();
+        for (int i = 0; i < 30; i++) { nums.Add(i - 15); }
+        List<int> neg = nums.AsStream().Where(x => x < 0).ToList();
+        Check(neg.Count == 15 && neg[0] == -15 && neg[14] == -1, "stream where");
+        List<int> ev = nums.Where(x => x % 2 == 0);
+        Check(ev.Count == 15 && ev[0] == -14, "enumerable where");
+        // Dict Keys/Values
+        Dict<string, int> dm = new Dict<string, int>();
+        dm["a"] = -1; dm["b"] = 2;
+        List<int> vals = dm.Values;
+        List<string> keys = dm.Keys;
+        Check(vals.Count == 2 && vals[0] + vals[1] == 1 && keys.Count == 2, "dict values");
+        // JSON / 反射
+        string js = Json.Serialize<List<int>>(nums);
+        List<int> back = Json.Deserialize<List<int>>(js);
+        Check(back.Count == 30 && back[0] == -15 && back[29] == 14, "json roundtrip");
+        // 反射新建并逐个 Add（表头宽度标签为 0，首次 Add 时改宽）
+        object made = typeof(List<int>).CreateInstance();
+        List<int> rl = (List<int>)made;
+        rl.Add(-3);
+        rl.Add(4);
+        Check(rl.Count == 2 && rl[0] == -3 && rl[1] == 4, "reflect create");
+        // 查询表达式
+        List<int> q = from n in nums where n > 10 select n * 2;
+        Check(q.Count == 4 && q[0] == 22 && q[3] == 28, "query expr");
+    }
+
+    static void Main() {
+        Ints();
+        Others();
+        Boundaries();
+        Console.WriteLine("failures=" + failures);
+    }
+}
