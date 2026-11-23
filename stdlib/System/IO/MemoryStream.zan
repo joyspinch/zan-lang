@@ -3,15 +3,7 @@ using System.Interop;
 
 namespace System.IO;
 
-// 基于可增长的堆外缓冲区的 <see cref="Stream"/>——测试中
-// 用作 FileStream 的内存替身，也是用流式代码构造
-// 字节载荷、再交给 socket 或文件的方式：
-// MemoryStream ms = MemoryStream.Alloc(64);
-// ms.Write("hello");
-// ms.Close();
-// 读写共用同一个游标：写入
-// 越过末尾会扩展缓冲区，Length 记录最高水位。
-// <see cref="Close"/> 释放缓冲区。
+// 基于可增长堆外缓冲区的 Stream：读写共用游标，写超末尾自动扩容，Length 记录最高水位，Close 释放内存。
 public class MemoryStream : Stream {
     nint data;
     int capacity;
@@ -93,43 +85,25 @@ public class MemoryStream : Stream {
         return arr;
     }
 
-    // 写入托管字节数组切片。返回实际写入字节数。切片界与 2 GiB 位置上限
-    // 用不回绕的写法校验（offset+count / pos+count 的 int 加法曾可回绕成
-    // 负数绕过检查，导致越界读/越界写）。
+    // 写入托管字节数组切片，返回实际写入字节数（以 long 防溢出，超过 2 GiB 抛 ArgumentException）。
     public int WriteBytes(byte[] buffer, int offset, int count) {
         if (this.capacity == 0 || buffer == null || count <= 0) { return 0; }
         if (offset < 0 || count > buffer.Length - offset) { return 0; }
-        long end = (long)this.pos + count;
-        if (end > 2147483647L) {
-            throw new ArgumentException("MemoryStream: write would exceed the 2 GiB limit");
-        }
-        this.Grow((int)end);
-        NativeMemory.Copy(this.data + this.pos, (nint)buffer + offset, count);
-        this.pos = this.pos + count;
-        if (this.pos > this.length) {
-            this.length = this.pos;
-        }
-        return count;
+        return this.WriteFrom((nint)buffer + offset, count);
     }
 
-    // 读取数据到托管字节数组切片
+    // 读取数据到托管字节数组切片，返回实际读取字节数。
     public int ReadBytes(byte[] buffer, int offset, int count) {
         if (this.capacity == 0 || buffer == null || count <= 0) { return 0; }
         if (offset < 0 || count > buffer.Length - offset) { return 0; }
-        if (this.pos >= this.length) { return 0; }
-        int avail = this.length - this.pos;
-        int toRead = count < avail ? count : avail;
-        NativeMemory.Copy((nint)buffer + offset, this.data + this.pos, toRead);
-        this.pos = this.pos + toRead;
-        return toRead;
+        return this.ReadInto((nint)buffer + offset, count);
     }
 
     // 底层缓冲区地址，用于零拷贝 FFI。写入导致缓冲区增长后
     // 以及 Close 之后失效。
     public nint Raw() { return this.data; }
 
-    // 扩容到至少 needed 字节（倍增策略，long 中间量防 int 倍增回绕死循环）；
-    // 分配失败或越过 2 GiB 位置上限抛 IOException。
+    // 扩容到至少 needed 字节（倍增策略）；分配失败或越过 2 GiB 上限抛 IOException。
     void Grow(int needed) {
         if (needed <= this.capacity) { return; }
         long cap = this.capacity;
@@ -170,8 +144,7 @@ public class MemoryStream : Stream {
     // 当前读写位置。
     public override long Position() { return this.pos; }
 
-    // origin 0=开头 1=当前位置 2=末尾；目标钳制到不小于 0，超过 int.MaxValue
-    // 抛 ArgumentException（int 位置域，静默截断曾致越界写），返回新位置。
+    // origin: 0=开头 1=当前 2=末尾；目标钳制到 >= 0，超过 int.MaxValue 抛 ArgumentException。
     public override long Seek(long offset, int origin) {
         long target = offset;
         if (origin == 1) { target = this.pos + offset; }
@@ -202,9 +175,7 @@ public class MemoryStream : Stream {
         return n;
     }
 
-    // 从 buf 追加 count 字节（必要时扩容），推进位置与最高水位；
-    // 成功时总是返回 count。位置加长度越过 int.MaxValue 抛 ArgumentException
-    // （int 回绕曾让 Grow(0) 直通、向缓冲区前越界写）。
+    // 从 buf 追加 count 字节（必要时扩容），推进位置与最高水位；超过 2 GiB 上限抛 ArgumentException。
     public override int WriteFrom(nint buf, int count) {
         if (count <= 0) { return 0; }
         long end = (long)this.pos + count;

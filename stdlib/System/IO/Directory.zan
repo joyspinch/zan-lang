@@ -4,24 +4,15 @@ using System.Text;
 
 namespace System.IO;
 
-// 目录操作。底层操作系统调用下沉至平台抽象层（Pal.FileSystem），
-// 统一提供跨平台 UTF-8 编码路径与强类型参数接口。
 public class Directory {
-    // Synchronize existing directory entries where supported (POSIX fsync).
-    // Unsupported platforms throw; file contents require File.FlushToDisk too.
     public static void FlushToDisk(string path) {
         Pal.FileSystem.FlushDirectoryToDisk(path);
     }
 
-    // 只读资源的落地位置：相对路径在当前工作目录下不存在时，运行时会
-    // 依次回退到单文件包的解包目录（ZAN_PKG_DIR）与可执行文件所在目录，
-    // 返回第一个真实存在的路径，都不存在（或本来就存在）时返回 ""。
-    // File 的读取走同一套回退，这里让目录枚举也走，发布后的程序才能
-    // 找到自己的 views/、wwwroot/，而不受启动时的工作目录影响。
+    // 相对路径在工作目录不存在时依次回退 ZAN_PKG_DIR 与可执行目录，保证发布后仍可枚举随附资源。
     [DllImport("crt")]
     static extern string zan_file_read_path(string path);
 
-    // 把只读枚举用的相对路径解析到程序随附的那一份。
     public static string ReadPath(string path) {
         if (path.Length == 0) { return path; }
         string r = zan_file_read_path(path);
@@ -29,13 +20,10 @@ public class Directory {
         return r;
     }
 
-    // 内嵌资源里 `path` 下的直接子项：dirs 为真取子目录名，
-    // 否则取文件名。磁盘上的同名目录仍然优先，这里只补上磁盘里没有的
-    // 那部分，发布成单个可执行文件后 views/ 之类照样能枚举。
     public static List<string> EmbedChildren(string path, bool dirs) {
         List<string> outp = new List<string>();
         string pre = File.EmbedName(path);
-        if (pre.Length > 0 && (pre[pre.Length - 1] & 255) != 47) {  // '/'
+        if (pre.Length > 0 && (pre[pre.Length - 1] & 255) != 47) {
             pre = pre + "/";
         }
         string raw = File.zan_embed_list(pre);
@@ -43,14 +31,13 @@ public class Directory {
         int start = 0;
         int rawLen = raw.Length;
         for (int i = 0; i <= rawLen; i = i + 1) {
-            if (i != rawLen && (raw[i] & 255) != 10) { continue; }  // '\n'
+            if (i != rawLen && (raw[i] & 255) != 10) { continue; }
             string name = raw.Substring(start, i - start);
             start = i + 1;
             if (name.Length <= pre.Length) { continue; }
             string rest = name.Substring(pre.Length, name.Length - pre.Length);
             int slash = rest.IndexOf("/");
-            string item = rest;
-            if (slash >= 0) { item = rest.Substring(0, slash); }
+            string item = slash >= 0 ? rest.Substring(0, slash) : rest;
             if (dirs != (slash >= 0)) { continue; }
             bool seen = false;
             for (int k = 0; k < outp.Count; k = k + 1) {
@@ -61,13 +48,11 @@ public class Directory {
         return outp;
     }
 
-    // 内嵌资源里是否有这个目录（即有资源以它为前缀）。
     public static bool EmbedExists(string path) {
         if (Directory.EmbedChildren(path, false).Count > 0) { return true; }
         return Directory.EmbedChildren(path, true).Count > 0;
     }
 
-    // 把内嵌资源里的子项并进磁盘枚举结果（磁盘优先，不重复）。
     public static List<string> MergeEmbed(List<string> disk, string path, bool dirs) {
         List<string> emb = Directory.EmbedChildren(path, dirs);
         for (int i = 0; i < emb.Count; i = i + 1) {
@@ -80,30 +65,11 @@ public class Directory {
         return disk;
     }
 
-    // 检查 UTF-8 路径是否存在（委托 PAL 平台实现）。
-    public static bool ExistsUtf8(string path) {
-        return Pal.FileSystem.DirectoryExists(path);
-    }
+    public static bool ExistsUtf8(string path) { return Pal.FileSystem.DirectoryExists(path); }
+    public static bool FileExistsUtf8(string path) { return Pal.FileSystem.FileExists(path); }
+    public static void CreateDirectoryUtf8(string path) { Pal.FileSystem.CreateDirectory(path); }
+    public static List<string> GetRootsUtf8() { return Pal.FileSystem.GetLogicalDrives(); }
 
-    // 检查 UTF-8 路径是否指向普通文件。
-    public static bool FileExistsUtf8(string path) {
-        return Pal.FileSystem.FileExists(path);
-    }
-
-    // 创建路径以 UTF-8 编码的目录。
-    public static void CreateDirectoryUtf8(string path) {
-        Pal.FileSystem.CreateDirectory(path);
-    }
-
-    // 文件系统根列表：Windows 为每个存在的盘符（"C:/" 形式），POSIX 为 "/"。
-    public static List<string> GetRootsUtf8() {
-        return Pal.FileSystem.GetLogicalDrives();
-    }
-
-    // 检查目录是否存在。工作目录下找不到时，与 GetFiles/
-    // GetDirectories 一样回退到程序随附的那一份（单文件包的解包目录、
-    // 可执行文件所在目录），否则发布后的程序会在枚举之前就判定
-    // views/、wwwroot/ 不存在。
     public static bool Exists(string path) {
         if (Directory.ExistsOnDisk(path)) { return true; }
         string p = Directory.ReadPath(path);
@@ -111,49 +77,18 @@ public class Directory {
         return Directory.EmbedExists(path);
     }
 
-    // 目录是否真实存在于磁盘（不走随附资源与内嵌副本回退）。
     public static bool ExistsOnDisk(string path) {
         return Pal.FileSystem.DirectoryExists(path);
     }
 
-    // 在指定路径创建目录，路径中缺失的上级一并创建（C# 口径；
-    // 曾是单层 WinCreateDirectory/mkdir 直呼，父目录缺失时静默失败，
-    // 与 C# Directory.CreateDirectory 的语义不符）。已存在时无操作。
-    public static void CreateDirectory(string path) {
-        Directory.CreateDirectoryRecursive(path);
-    }
+    public static void CreateDirectory(string path) { Directory.CreateDirectoryRecursive(path); }
+    static void CreateDirSingle(string path) { Pal.FileSystem.CreateDirectory(path); }
+    public static void Delete(string path) { Pal.FileSystem.DeleteDirectory(path); }
+    public static string GetCurrentDirectory() { return Pal.FileSystem.GetCurrentDirectory(); }
+    public static void SetCurrentDirectory(string path) { Pal.FileSystem.SetCurrentDirectory(path); }
+    public static bool IsSymlink(string path) { return Pal.FileSystem.IsSymlink(path); }
 
-    // 单层创建原语（不做父级补全，不查存在性）。
-    static void CreateDirSingle(string path) {
-        Pal.FileSystem.CreateDirectory(path);
-    }
-
-    // 删除空目录。
-    public static void Delete(string path) {
-        Pal.FileSystem.DeleteDirectory(path);
-    }
-
-    // 获取当前工作目录。
-    public static string GetCurrentDirectory() {
-        return Pal.FileSystem.GetCurrentDirectory();
-    }
-
-    // 设置当前工作目录。
-    public static void SetCurrentDirectory(string path) {
-        Pal.FileSystem.SetCurrentDirectory(path);
-    }
-
-    // 路径本身是符号链接时返回 true。
-    public static bool IsSymlink(string path) {
-        return Pal.FileSystem.IsSymlink(path);
-    }
-
-    // 枚举一层目录条目名（委托 PAL 平台实现，不含路径）。
-    static List<string> listSingle(
-        string path,
-        bool wantDirs,
-        bool includeHidden
-    ) {
+    static List<string> listSingle(string path, bool wantDirs, bool includeHidden) {
         List<PlatformFileEntry> entries = Pal.FileSystem.EnumerateEntries(path, wantDirs, includeHidden);
         List<string> result = new List<string>();
         for (int i = 0; i < entries.Count; i = i + 1) {
@@ -162,9 +97,6 @@ public class Directory {
         return result;
     }
 
-    // 把枚举出的裸名字拼成完整路径（与 C# GetFiles 的返回
-    // 形态一致）。拼接基准用磁盘枚举时 ReadPath 解析到的目录：随附
-    // 资源回退后路径才真实存在。
     public static List<string> ToPaths(List<string> names, string baseDir) {
         List<string> outp = new List<string>();
         for (int i = 0; i < names.Count; i = i + 1) {
@@ -173,64 +105,25 @@ public class Directory {
         return outp;
     }
 
-    // 列出目录中的文件（不递归、含隐藏），返回完整路径——
-    // 与 C# Directory.GetFiles 的语义对齐（审计 ：本库 GetFiles
-    // 返回裸文件名，是 C# 移植陷阱，但几十处既有调用都依赖裸名，
-    // 不能直接改签名）。找不到磁盘目录时回退到随附资源并合并内嵌
-    // 子项（内嵌项只有原始 path 可拼，基准取原始 path）。
-    public static List<string> GetPaths(string path) {
+    static List<string> GetEntryPaths(string path, bool wantDirs) {
         string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, false, true);
+        List<string> r = listSingle(p, wantDirs, true);
         int diskCount = r.Count;
-        List<string> all = Directory.MergeEmbed(r, path, false);
-        // 磁盘项拼到解析后的真实目录，内嵌项拼到原始 path。
+        List<string> all = Directory.MergeEmbed(r, path, wantDirs);
         string baseDir = (p != null && p.Length > 0) ? p : path;
         List<string> outp = new List<string>();
         for (int i = 0; i < all.Count; i = i + 1) {
-            string name = all[i];
             if (i >= diskCount) { baseDir = path; }
-            outp.Add(baseDir + "/" + name);
+            outp.Add(baseDir + "/" + all[i]);
         }
         return outp;
     }
 
-    // 列出目录中的子目录（不递归、含隐藏），返回完整路径。
-    // 语义同 <see cref="GetPaths"/>：磁盘项拼 ReadPath 解析目录，
-    // 内嵌项拼原始 path。
-    public static List<string> GetDirectoryPaths(string path) {
-        string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, true, true);
-        int diskCount = r.Count;
-        List<string> all = Directory.MergeEmbed(r, path, true);
-        string baseDir = (p != null && p.Length > 0) ? p : path;
+    static List<string> FilterByPattern(List<string> paths, string searchPattern) {
+        if (searchPattern == null || searchPattern.Length == 0) { return paths; }
         List<string> outp = new List<string>();
-        for (int i = 0; i < all.Count; i = i + 1) {
-            string name = all[i];
-            if (i >= diskCount) { baseDir = path; }
-            outp.Add(baseDir + "/" + name);
-        }
-        return outp;
-    }
-
-    // 列出目录中的文件（不递归、含隐藏），返回完整路径——C#
-    // Directory.GetFiles 的口径（磁盘项拼 ReadPath 解析目录，内嵌项拼
-    // 原始 path；找不到磁盘目录时回退到随附资源并合并内嵌子项）。
-    // 曾返回裸文件名（名实不一，C# 移植陷阱），裸名需求用
-    // <see cref="GetFileNames"/>；完整路径另有别名 <see cref="GetPaths"/>。
-    public static List<string> GetFiles(string path) {
-        return Directory.GetPaths(path);
-    }
-
-    // C# 形态按模式列出文件：searchPattern 只匹配文件名部分（'*' 任意
-    // 字符序列、'?' 单个字符；Windows 上不区分大小写，与 Path 的 glob
-    // 口径一致，不含 8.3 短名/三字符扩展名兼容怪癖），返回值仍是完整
-    // 路径。null 或空 pattern 视为 "*"（全量）。
-    public static List<string> GetFiles(string path, string searchPattern) {
-        List<string> all = Directory.GetPaths(path);
-        if (searchPattern == null || searchPattern.Length == 0) { return all; }
-        List<string> outp = new List<string>();
-        for (int i = 0; i < all.Count; i = i + 1) {
-            string p = all[i];
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            string p = paths[i];
             int at = Directory.AfterLastSeparator(p);
             string name = p.Substring(at, p.Length - at);
             if (Directory.NameMatch(searchPattern, 0, name, 0)) {
@@ -240,12 +133,22 @@ public class Directory {
         return outp;
     }
 
-    // 递归或非递归按模式列出目录中的文件（返回值均为完整路径，C# 口径）。
-    // recursive 为 true 时深入遍历全部子目录树。
+    static List<string> ListEntryNames(string path, bool wantDirs, bool includeHidden) {
+        string p = Directory.ReadPath(path);
+        List<string> r = listSingle(p, wantDirs, includeHidden);
+        return Directory.MergeEmbed(r, path, wantDirs);
+    }
+
+    public static List<string> GetPaths(string path) { return Directory.GetEntryPaths(path, false); }
+    public static List<string> GetDirectoryPaths(string path) { return Directory.GetEntryPaths(path, true); }
+    public static List<string> GetFiles(string path) { return Directory.GetEntryPaths(path, false); }
+
+    public static List<string> GetFiles(string path, string searchPattern) {
+        return Directory.FilterByPattern(Directory.GetEntryPaths(path, false), searchPattern);
+    }
+
     public static List<string> GetFiles(string path, string searchPattern, bool recursive) {
-        if (!recursive) {
-            return Directory.GetFiles(path, searchPattern);
-        }
+        if (!recursive) { return Directory.GetFiles(path, searchPattern); }
         List<string> result = new List<string>();
         Directory.CollectFilesRecursive(result, path, searchPattern);
         return result;
@@ -262,22 +165,9 @@ public class Directory {
         }
     }
 
-    // 递归或非递归列出子目录完整路径（支持 searchPattern 模式匹配）。
-    // recursive 为 true 时深入遍历全部子目录树。
     public static List<string> GetDirectories(string path, string searchPattern, bool recursive) {
         if (!recursive) {
-            List<string> dirs = Directory.GetDirectoryPaths(path);
-            if (searchPattern == null || searchPattern.Length == 0) { return dirs; }
-            List<string> outp = new List<string>();
-            for (int i = 0; i < dirs.Count; i = i + 1) {
-                string d = dirs[i];
-                int at = Directory.AfterLastSeparator(d);
-                string name = d.Substring(at, d.Length - at);
-                if (Directory.NameMatch(searchPattern, 0, name, 0)) {
-                    outp.Add(d);
-                }
-            }
-            return outp;
+            return Directory.FilterByPattern(Directory.GetEntryPaths(path, true), searchPattern);
         }
         List<string> result = new List<string>();
         Directory.CollectDirectoriesRecursive(result, path, searchPattern);
@@ -291,15 +181,11 @@ public class Directory {
             int at = Directory.AfterLastSeparator(d);
             string name = d.Substring(at, d.Length - at);
             bool match = searchPattern == null || searchPattern.Length == 0 || Directory.NameMatch(searchPattern, 0, name, 0);
-            if (match) {
-                outp.Add(d);
-            }
+            if (match) { outp.Add(d); }
             Directory.CollectDirectoriesRecursive(outp, d, searchPattern);
         }
     }
 
-    // 最后一个路径分隔符之后的索引，没有分隔符时为 0
-    //（GetPaths 产出的全路径统一 '/' 拼接，用户传入的 '\\' 也认）。
     private static int AfterLastSeparator(string p) {
         for (int i = p.Length - 1; i >= 0; i = i - 1) {
             int c = p[i] & 255;
@@ -308,8 +194,6 @@ public class Directory {
         return 0;
     }
 
-    // 文件名通配匹配（回溯实现，连续 '*' 合并）；语义同
-    // Path.SegMatch：'*' 任意序列、'?' 单字符。
     private static bool NameMatch(string pat, int pi, string name, int ni) {
         if (pi >= pat.Length) { return ni >= name.Length; }
         int pc = pat[pi] & 255;
@@ -326,7 +210,6 @@ public class Directory {
         return Directory.NameMatch(pat, pi + 1, name, ni + 1);
     }
 
-    // 单字符比较；根据平台大小写敏感性判定（Windows 上不区分大小写）。
     private static bool NameCharEq(int a, int b) {
         if (a == b) { return true; }
         if (!Pal.FileSystem.IsCaseSensitive()) {
@@ -337,71 +220,27 @@ public class Directory {
         return false;
     }
 
-    // 列出目录中的文件名（不递归、含隐藏），返回裸文件名（不含路径）。
-    // 承接 GetFiles 全路径化之前的裸名契约。
-    public static List<string> GetFileNames(string path) {
-        string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, false, true);
-        return Directory.MergeEmbed(r, path, false);
-    }
+    // 返回裸文件名/裸目录名（与 GetFiles/GetDirectoryPaths 的全路径口径区分）。
+    public static List<string> GetFileNames(string path) { return Directory.ListEntryNames(path, false, true); }
+    public static List<string> GetDirectories(string path) { return Directory.ListEntryNames(path, true, true); }
+    static List<string> GetFilesFiltered(string path, bool includeHidden) { return Directory.ListEntryNames(path, false, includeHidden); }
+    static List<string> GetDirectoriesFiltered(string path, bool includeHidden) { return Directory.ListEntryNames(path, true, includeHidden); }
 
-    // 列出目录中的子目录（不递归、含隐藏）。回退与合并
-    // 语义同 <see cref="GetFileNames"/>。注意：返回裸目录名（不含路径，
-    // 与 GetFiles 的全路径口径刻意不同——裸目录名既有调用面大，迁移
-    // 另行安排），C# 形态的完整路径用 <see cref="GetDirectoryPaths"/>。
-    public static List<string> GetDirectories(string path) {
-        string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, true, true);
-        return Directory.MergeEmbed(r, path, true);
-    }
-
-    // GetFileNames 的可控版本（返回裸文件名）：includeHidden=false 时
-    // （Windows 属性位 / POSIX 点前缀）跳过隐藏项。
-    static List<string> GetFilesFiltered(
-        string path,
-        bool includeHidden
-    ) {
-        string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, false, includeHidden);
-        return Directory.MergeEmbed(r, path, false);
-    }
-
-    // GetDirectories 的可控版本：includeHidden=false 时
-    // （Windows 属性位 / POSIX 点前缀）跳过隐藏项。
-    static List<string> GetDirectoriesFiltered(
-        string path,
-        bool includeHidden
-    ) {
-        string p = Directory.ReadPath(path);
-        List<string> r = listSingle(p, true, includeHidden);
-        return Directory.MergeEmbed(r, path, true);
-    }
-
-    // 递归创建路径中的所有目录。
     public static void CreateDirectoryRecursive(string path) {
         if (path == null || path.Length == 0) { return; }
         int len = path.Length;
         for (int i = 0; i < len; i = i + 1) {
             int c = path[i] & 255;
-            if (c == 47 || c == 92) {  // '/' or '\\'
+            if (c == 47 || c == 92) {
                 string part = path.Substring(0, i + 1);
-                // 创建走原始路径：随附资源里有同名目录不代表工作目录下
-                // 也有，写入永远落在工作目录（见 rt_file.c 的说明）。
-                if (!ExistsOnDisk(part)) {
-                    CreateDirSingle(part);
-                }
+                if (!ExistsOnDisk(part)) { CreateDirSingle(part); }
             }
         }
-        if (!ExistsOnDisk(path)) {
-            CreateDirSingle(path);
-        }
+        if (!ExistsOnDisk(path)) { CreateDirSingle(path); }
     }
 
-    // 递归删除目录及其全部内容。目录本来就不存在时返回 true；
-    // 任何一项删不掉（占用/权限）时返回 false，其余项仍会尽力删除。
     public static bool DeleteRecursive(string path) {
-        // 顶层本身是链接（Windows junction/符号链接、POSIX 符号链接）
-        // 时只删链接本身，绝不递归进指向的树。
+        // 顶层为符号链接/junction 时只删链接本身，绝不递归穿透。
         if (Pal.FileSystem.IsSymlink(path)) {
             File.Delete(path);
             return !File.Exists(path);
@@ -427,58 +266,13 @@ public class Directory {
         return ok;
     }
 
-    // 异步列出目录中的文件完整路径。
-    public static async List<string> GetPathsAsync(string path) {
-        await Task.Yield();
-        return Directory.GetPaths(path);
-    }
-
-    // 异步列出目录中的子目录完整路径。
-    public static async List<string> GetDirectoryPathsAsync(string path) {
-        await Task.Yield();
-        return Directory.GetDirectoryPaths(path);
-    }
-
-    // 异步列出目录中的文件（完整路径，C# 口径，同 <see cref="GetFiles"/>）。
-    public static async List<string> GetFilesAsync(string path) {
-        await Task.Yield();
-        return Directory.GetFiles(path);
-    }
-
-    // 异步按模式列出目录中的文件（语义同
-    // <see cref="GetFiles(string, string)"/>，完整路径 C# 口径）。
-    public static async List<string> GetFilesAsync(string path, string searchPattern) {
-        await Task.Yield();
-        return Directory.GetFiles(path, searchPattern);
-    }
-
-    // 异步列出目录中的子目录名。
-    public static async List<string> GetDirectoriesAsync(string path) {
-        await Task.Yield();
-        return Directory.GetDirectories(path);
-    }
-
-    // 异步检查目录是否存在。
-    public static async bool ExistsAsync(string path) {
-        await Task.Yield();
-        return Directory.Exists(path);
-    }
-
-    // 异步在指定路径创建目录。
-    public static async void CreateDirectoryAsync(string path) {
-        await Task.Yield();
-        Directory.CreateDirectory(path);
-    }
-
-    // 异步删除空目录。
-    public static async void DeleteAsync(string path) {
-        await Task.Yield();
-        Directory.Delete(path);
-    }
-
-    // 异步递归删除目录及其全部内容。
-    public static async bool DeleteRecursiveAsync(string path) {
-        await Task.Yield();
-        return Directory.DeleteRecursive(path);
-    }
+    public static async List<string> GetPathsAsync(string path) { await Task.Yield(); return Directory.GetPaths(path); }
+    public static async List<string> GetDirectoryPathsAsync(string path) { await Task.Yield(); return Directory.GetDirectoryPaths(path); }
+    public static async List<string> GetFilesAsync(string path) { await Task.Yield(); return Directory.GetFiles(path); }
+    public static async List<string> GetFilesAsync(string path, string searchPattern) { await Task.Yield(); return Directory.GetFiles(path, searchPattern); }
+    public static async List<string> GetDirectoriesAsync(string path) { await Task.Yield(); return Directory.GetDirectories(path); }
+    public static async bool ExistsAsync(string path) { await Task.Yield(); return Directory.Exists(path); }
+    public static async void CreateDirectoryAsync(string path) { await Task.Yield(); Directory.CreateDirectory(path); }
+    public static async void DeleteAsync(string path) { await Task.Yield(); Directory.Delete(path); }
+    public static async bool DeleteRecursiveAsync(string path) { await Task.Yield(); return Directory.DeleteRecursive(path); }
 }

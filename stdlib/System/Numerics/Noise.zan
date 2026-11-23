@@ -3,16 +3,8 @@ using System.Collections.Generic;
 
 namespace System.Numerics;
 
-// 确定性程序化噪声。
-//
-// 同一 seed 必然产生同一序列（可复现、可回放），不同 seed 产生不同噪声。
-// 组成：
-//   * <see cref="Value2D"/> / <see cref="Value3D"/>：网格点随机值 + 平滑插值的值噪声；
-//   * <see cref="Perlin2D"/> / <see cref="Perlin3D"/>：梯度插值的 Perlin 噪声；
-//   * <see cref="Fbm2D"/>：多倍频叠加的分形布朗运动；
-//   * <see cref="Ridged2D"/>：脊状变体（适合山脊、云、裂纹）。
-//
-// 噪声值域为 [-1, 1]（Perlin 系列的理论上界略小于 1）。
+// 确定性程序化噪声（同 seed 可复现），值域 [-1, 1]：
+// Value2D/3D（值噪声）、Perlin2D/3D（梯度噪声）、Fbm2D（分形叠加）、Ridged2D（脊状变体）。
 public class Noise {
     // 置换表：前 256 项为 0..255 的一个排列，后 256 项复制前 256 项，
     // 便于用 & 255 做无缝索引。
@@ -177,16 +169,19 @@ public class Noise {
         return Noise.Lerp(x1, x2, w);
     }
 
-    // 分形布朗运动：多个倍频的 Perlin 噪声叠加。
-    // persistence 控制振幅衰减（常用 0.5），lacunarity 控制频率倍增（常用 2.0）。
-    public double Fbm2D(double x, double y, int octaves, double persistence, double lacunarity) {
+    private double Accumulate2D(double x, double y, int octaves, double persistence, double lacunarity, bool ridged) {
         int n = octaves < 1 ? 1 : octaves;
         double total = 0.0;
         double amplitude = 1.0;
         double frequency = 1.0;
         double maxValue = 0.0;
         for (int i = 0; i < n; i++) {
-            total = total + this.Perlin2D(x * frequency, y * frequency) * amplitude;
+            double s = this.Perlin2D(x * frequency, y * frequency);
+            if (ridged) {
+                double v = 1.0 - Math.Abs(s);
+                s = v * v;
+            }
+            total = total + s * amplitude;
             maxValue = maxValue + amplitude;
             amplitude = amplitude * persistence;
             frequency = frequency * lacunarity;
@@ -195,21 +190,13 @@ public class Noise {
         return total / maxValue;
     }
 
-    // 脊状噪声：1-|n| 平方后叠加，形成山脊 / 裂纹状的锐利结构。
+    // 分形布朗运动：多倍频 Perlin 噪声叠加（常用 persistence=0.5、lacunarity=2.0）。
+    public double Fbm2D(double x, double y, int octaves, double persistence, double lacunarity) {
+        return this.Accumulate2D(x, y, octaves, persistence, lacunarity, false);
+    }
+
+    // 脊状噪声：1-|n| 平方后叠加，形成山脊 / 裂纹状锐利结构。
     public double Ridged2D(double x, double y, int octaves, double persistence, double lacunarity) {
-        int n = octaves < 1 ? 1 : octaves;
-        double total = 0.0;
-        double amplitude = 1.0;
-        double frequency = 1.0;
-        double maxValue = 0.0;
-        for (int i = 0; i < n; i++) {
-            double v = 1.0 - Math.Abs(this.Perlin2D(x * frequency, y * frequency));
-            total = total + v * v * amplitude;
-            maxValue = maxValue + amplitude;
-            amplitude = amplitude * persistence;
-            frequency = frequency * lacunarity;
-        }
-        if (maxValue <= 0.0) { return 0.0; }
-        return total / maxValue;
+        return this.Accumulate2D(x, y, octaves, persistence, lacunarity, true);
     }
 }

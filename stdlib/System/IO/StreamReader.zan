@@ -2,18 +2,8 @@ using System;
 
 namespace System.IO;
 
-// 基于 <see cref="Stream"/> 的缓冲文本读取：逐行读取，
-// 避免像 File.ReadAllText 那样把整个文件读入内存，
-// （这正是 File.ReadAllText 目前的做法）。
-// while (line != null) {
-// Console.WriteLine(line);
-// line = r.ReadLine();
-// }
-// r.Close();
-// <see cref="ReadLine"/> 在输入结束时返回 null，并去掉行
-// 终止符（"\n" 和 "\r\n" 都适用）。字节按原样传递（UTF-8
-// 输入仍保持 UTF-8）。若此 reader 打开了底层流，Close 会将其关闭；
-// 若 reader 包装的是调用方传入的流，则不会动它。
+// 基于 Stream 的缓冲文本读取器：按块拉取并逐行解码（兼容 "\n" 与 "\r\n"，字节按 UTF-8 原样传递）。
+// 若由本 reader 打开底层流（如 Open/FromStr），Close 时一并关闭；Wrap 传入的外部流由调用方关闭。
 public class StreamReader : IDisposable {
     Stream stream;
     bool owns;
@@ -43,21 +33,14 @@ public class StreamReader : IDisposable {
         this.owns = false;
     }
 
-    // 从现有流读取文本（不由本 reader
-    // 关闭）。
+    // 从现有流读取文本（不由本 reader 关闭）。
     public static StreamReader Wrap(Stream s) {
-        StreamReader r = new StreamReader();
-        r.stream = s;
-        return r;
+        return new StreamReader(s);
     }
 
-    // 打开文件用于读取。若文件
-    // 不存在则抛出 FileNotFoundException。
+    // 打开文件用于读取；文件不存在抛 FileNotFoundException。
     public static StreamReader Open(string path) {
-        StreamReader r = new StreamReader();
-        r.stream = FileStream.OpenRead(path);
-        r.owns = true;
-        return r;
+        return new StreamReader(path);
     }
 
     // 从字符串读取文本，用于测试解析器。
@@ -80,12 +63,7 @@ public class StreamReader : IDisposable {
         return this.pos >= this.buf.Length;
     }
 
-    // 缓冲区耗尽时再拉取一块数据。
-    void Fill() {
-        if (this.pos < this.buf.Length || this.eof) {
-            return;
-        }
-        string more = this.stream.Read(this.chunk);
+    private void AcceptChunk(string more) {
         if (more.Length == 0) {
             this.eof = true;
             return;
@@ -94,18 +72,16 @@ public class StreamReader : IDisposable {
         this.pos = 0;
     }
 
+    // 缓冲区耗尽时再拉取一块数据。
+    void Fill() {
+        if (this.pos < this.buf.Length || this.eof) { return; }
+        this.AcceptChunk(this.stream.Read(this.chunk));
+    }
+
     // 异步拉取一块数据到缓冲区。
     async void FillAsync() {
-        if (this.pos < this.buf.Length || this.eof) {
-            return;
-        }
-        string more = await this.stream.ReadAsync(this.chunk);
-        if (more.Length == 0) {
-            this.eof = true;
-            return;
-        }
-        this.buf = more;
-        this.pos = 0;
+        if (this.pos < this.buf.Length || this.eof) { return; }
+        this.AcceptChunk(await this.stream.ReadAsync(this.chunk));
     }
 
     // 读取一个字节作为单字符字符串，结束时返回 ""。
@@ -139,55 +115,46 @@ public class StreamReader : IDisposable {
         return sb.ToString();
     }
 
-    // 读取下一行（不含终止符），或返回 null（输入
-    // 结束）。
+    private static void AppendTrimmedSlice(StringBuilder sb, string slice) {
+        if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
+            slice = slice.Substring(0, slice.Length - 1);
+        }
+        if (slice.IndexOf("\r") >= 0) {
+            slice = slice.Replace("\r", "");
+        }
+        if (slice.Length > 0) {
+            sb.Append(slice);
+        }
+    }
+
+    // 从当前 buf 消费至 '\n'；命中返回 true（pos 跳过换行），未命中消费到 buf 尾返回 false。
+    private bool ConsumeBufferedLine(StringBuilder sb) {
+        int bufLen = this.buf.Length;
+        int start = this.pos;
+        int end = this.pos;
+        while (end < bufLen) {
+            if ((this.buf[end] & 255) == 10) {  // '\n'
+                StreamReader.AppendTrimmedSlice(sb, this.buf.Substring(start, end - start));
+                this.pos = end + 1;
+                return true;
+            }
+            end = end + 1;
+        }
+        StreamReader.AppendTrimmedSlice(sb, this.buf.Substring(start, end - start));
+        this.pos = end;
+        return false;
+    }
+
+    // 读取下一行（不含终止符），输入结束返回 null。
     public string ReadLine() {
         this.Fill();
         if (this.pos >= this.buf.Length) {
             return null;
         }
         StringBuilder sb = new StringBuilder();
-        bool done = false;
-        while (!done) {
+        while (true) {
             this.Fill();
-            int bufLen = this.buf.Length;
-            if (this.pos >= bufLen) {
-                done = true;
-            } else {
-                int start = this.pos;
-                int end = this.pos;
-                while (end < bufLen) {
-                    if ((this.buf[end] & 255) == 10) {  // '\n'
-                        string slice = this.buf.Substring(start, end - start);
-                        if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
-                            slice = slice.Substring(0, slice.Length - 1);
-                        }
-                        if (slice.IndexOf("\r") >= 0) {
-                            slice = slice.Replace("\r", "");
-                        }
-                        if (slice.Length > 0) {
-                            sb.Append(slice);
-                        }
-                        this.pos = end + 1;
-                        done = true;
-                        break;
-                    }
-                    end = end + 1;
-                }
-                if (!done) {
-                    string slice = this.buf.Substring(start, end - start);
-                    if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
-                        slice = slice.Substring(0, slice.Length - 1);
-                    }
-                    if (slice.IndexOf("\r") >= 0) {
-                        slice = slice.Replace("\r", "");
-                    }
-                    if (slice.Length > 0) {
-                        sb.Append(slice);
-                    }
-                    this.pos = end;
-                }
-            }
+            if (this.pos >= this.buf.Length || this.ConsumeBufferedLine(sb)) { break; }
         }
         return sb.ToString();
     }
@@ -203,54 +170,16 @@ public class StreamReader : IDisposable {
         return lines;
     }
 
-    // 异步读取下一行（不含终止符），或返回 null（输入结束）。
+    // 异步读取下一行（不含终止符），输入结束返回 null。
     public async string ReadLineAsync() {
         await this.FillAsync();
         if (this.pos >= this.buf.Length) {
             return null;
         }
         StringBuilder sb = new StringBuilder();
-        bool done = false;
-        while (!done) {
+        while (true) {
             await this.FillAsync();
-            int bufLen = this.buf.Length;
-            if (this.pos >= bufLen) {
-                done = true;
-            } else {
-                int start = this.pos;
-                int end = this.pos;
-                while (end < bufLen) {
-                    if ((this.buf[end] & 255) == 10) {
-                        string slice = this.buf.Substring(start, end - start);
-                        if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
-                            slice = slice.Substring(0, slice.Length - 1);
-                        }
-                        if (slice.IndexOf("\r") >= 0) {
-                            slice = slice.Replace("\r", "");
-                        }
-                        if (slice.Length > 0) {
-                            sb.Append(slice);
-                        }
-                        this.pos = end + 1;
-                        done = true;
-                        break;
-                    }
-                    end = end + 1;
-                }
-                if (!done) {
-                    string slice = this.buf.Substring(start, end - start);
-                    if (slice.Length > 0 && (slice[slice.Length - 1] & 255) == 13) {
-                        slice = slice.Substring(0, slice.Length - 1);
-                    }
-                    if (slice.IndexOf("\r") >= 0) {
-                        slice = slice.Replace("\r", "");
-                    }
-                    if (slice.Length > 0) {
-                        sb.Append(slice);
-                    }
-                    this.pos = end;
-                }
-            }
+            if (this.pos >= this.buf.Length || this.ConsumeBufferedLine(sb)) { break; }
         }
         return sb.ToString();
     }
@@ -296,17 +225,10 @@ public class StreamReader : IDisposable {
 
     // 异步关闭 reader。
     public async void CloseAsync() {
-        if (this.owns && this.stream != null) {
-            this.stream.Close();
-        }
-        this.stream = null;
-        this.buf = "";
-        this.pos = 0;
-        this.eof = true;
+        this.Close();
     }
 
-    // 关闭 reader；若该 reader 打开了底层流，也一并关闭
-    // 该流。
+    // 关闭 reader；若由本 reader 打开底层流则一并关闭。
     public void Close() {
         if (this.owns && this.stream != null) {
             this.stream.Close();

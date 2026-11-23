@@ -7,9 +7,7 @@ using System.Threading;
 
 namespace System;
 
-/// <summary>
-/// POSIX TZ 规则中的夏令时起止规则定义（例如 M3.2.0/2 或 Jn 或 n）。
-/// </summary>
+// POSIX TZ 规则中的夏令时起止规则定义（例如 M3.2.0/2 或 Jn 或 n）。
 public class PosixTransitionRule {
     public int type; // 0: Mm.w.d, 1: Jn, 2: n
     public int month; // 1-12
@@ -87,9 +85,7 @@ public class PosixTransitionRule {
     }
 }
 
-/// <summary>
-/// POSIX.1-2017 TZ 规则解析器与评估器（例如 "EST5EDT,M3.2.0,M11.1.0" 或 "CST-8"）。
-/// </summary>
+// POSIX.1-2017 TZ 规则解析器与评估器（例如 "EST5EDT,M3.2.0,M11.1.0" 或 "CST-8"）。
 public class PosixRule {
     public string stdName;
     public int stdOffsetSec; // 从本地到 UTC 的偏移秒数（例如东八区 CST 为 +28800）
@@ -172,6 +168,16 @@ public class PosixRule {
         return s.Substring(st, idx - st);
     }
 
+    private static int ReadDigits(string s, ref int idx) {
+        int val = 0;
+        int len = s.Length;
+        while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
+            val = val * 10 + ((int)s[idx] - 48);
+            idx++;
+        }
+        return val;
+    }
+
     private static int ParseOffset(string s, ref int idx) {
         int len = s.Length;
         if (idx >= len) { return 0; }
@@ -183,33 +189,23 @@ public class PosixRule {
             idx++;
         }
 
-        int h = 0;
-        while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
-            h = h * 10 + ((int)s[idx] - 48);
-            idx++;
-        }
+        int h = ReadDigits(s, ref idx);
         int m = 0;
         if (idx < len && s[idx] == ':') {
             idx++;
-            while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
-                m = m * 10 + ((int)s[idx] - 48);
-                idx++;
-            }
+            m = ReadDigits(s, ref idx);
         }
         int sec = 0;
         if (idx < len && s[idx] == ':') {
             idx++;
-            while (idx < len && s[idx] >= '0' && s[idx] <= '9') {
-                sec = sec * 10 + ((int)s[idx] - 48);
-                idx++;
-            }
+            sec = ReadDigits(s, ref idx);
         }
         return sign * (h * 3600 + m * 60 + sec);
     }
 
     public long ComputeTransitionUtc(int year, PosixTransitionRule tr, int baseOffsetSec) {
         if (tr == null) { return 0L; }
-        int targetDay = 1;
+        int totalDays = 0;
         if (tr.type == 0) { // Mm.w.d
             int days = DateTime.DaysFromCivil(year, tr.month, 1);
             int wday1 = (days % 7 + 4) % 7;
@@ -217,6 +213,7 @@ public class PosixRule {
             int diff = tr.dayOfWeek - wday1;
             if (diff < 0) { diff += 7; }
             int day1 = 1 + diff;
+            int targetDay;
             if (tr.week >= 1 && tr.week <= 4) {
                 targetDay = day1 + (tr.week - 1) * 7;
             } else {
@@ -224,18 +221,14 @@ public class PosixRule {
                 int dim = DateTime.DaysInMonth(year, tr.month);
                 if (targetDay > dim) { targetDay -= 7; }
             }
-            int totalDays = DateTime.DaysFromCivil(year, tr.month, targetDay);
-            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
-            return wallSec - (long)baseOffsetSec;
+            totalDays = DateTime.DaysFromCivil(year, tr.month, targetDay);
         } else if (tr.type == 1) { // Jn
-            int totalDays = DateTime.DaysFromCivil(year, 1, 1) + (tr.julianDay - 1);
-            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
-            return wallSec - (long)baseOffsetSec;
+            totalDays = DateTime.DaysFromCivil(year, 1, 1) + (tr.julianDay - 1);
         } else { // n
-            int totalDays = DateTime.DaysFromCivil(year, 1, 1) + tr.julianDay;
-            long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
-            return wallSec - (long)baseOffsetSec;
+            totalDays = DateTime.DaysFromCivil(year, 1, 1) + tr.julianDay;
         }
+        long wallSec = (long)totalDays * 86400L + (long)tr.timeSec;
+        return wallSec - (long)baseOffsetSec;
     }
 
     public bool IsDaylightSavingTime(long unixSeconds) {
@@ -266,9 +259,7 @@ public class PosixRule {
     }
 }
 
-/// <summary>
-/// 跨平台时区信息类。支持 IANA TZif (RFC 8536 v1/v2/v3)、POSIX TZ 规则、内建时区库及跨时区转换。
-/// </summary>
+// 跨平台时区信息类：支持 IANA TZif (RFC 8536 v1/v2/v3)、POSIX TZ 规则与跨时区转换。
 public class TimeZoneInfo {
     private string id;
     private string displayName;
@@ -375,14 +366,14 @@ public class TimeZoneInfo {
         return (hi << 32) | lo;
     }
 
-    /// <summary>
-    /// 从 RFC 8536 TZif 二进制字节流解析时区信息（支持 v1/v2/v3，优先提取 64 位转换时间戳与 POSIX 规则）。
-    /// </summary>
+    private static bool HasTzifMagic(byte[] data, int off) {
+        return data[off] == (byte)84 && data[off + 1] == (byte)90
+            && data[off + 2] == (byte)105 && data[off + 3] == (byte)102;
+    }
+
+    // 从 RFC 8536 TZif 二进制字节流解析时区信息（支持 v1/v2/v3，优先提取 64 位时间戳与 POSIX 规则）。
     public static TimeZoneInfo FromTzData(string id, byte[] data) {
-        if (data == null || data.Length < 44) { return null; }
-        if (data[0] != (byte)84 || data[1] != (byte)90 || data[2] != (byte)105 || data[3] != (byte)102) {
-            return null; // Magic 不是 "TZif"
-        }
+        if (data == null || data.Length < 44 || !HasTzifMagic(data, 0)) { return null; }
         byte ver = data[4];
         int ttisutccnt = ReadInt32BE(data, 20);
         int ttisstdcnt = ReadInt32BE(data, 24);
@@ -400,7 +391,7 @@ public class TimeZoneInfo {
 
         if (hasV2) {
             hdr = 44 + v1DataSize;
-            if (data[hdr] == (byte)84 && data[hdr+1] == (byte)90 && data[hdr+2] == (byte)105 && data[hdr+3] == (byte)102) {
+            if (HasTzifMagic(data, hdr)) {
                 ttisutccnt = ReadInt32BE(data, hdr + 20);
                 ttisstdcnt = ReadInt32BE(data, hdr + 24);
                 leapcnt    = ReadInt32BE(data, hdr + 28);
@@ -527,33 +518,37 @@ public class TimeZoneInfo {
         return tzi;
     }
 
+    // 返回 >=0 为命中的转换表下标，-1 表示无表或超出表尾走 posixRule，-2 表示早于首条转换记录。
+    private int TransitionIndex(long unixSeconds) {
+        if (this.transitionTimes == null || this.transitionTimes.Count == 0) { return -1; }
+        if (unixSeconds < this.transitionTimes[0]) { return -2; }
+        int lo = 0;
+        int hi = this.transitionTimes.Count - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (this.transitionTimes[mid] <= unixSeconds) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        int idx = lo - 1;
+        if (idx == this.transitionTimes.Count - 1 && this.posixRule != null) { return -1; }
+        return idx;
+    }
+
     public TimeSpan GetUtcOffset(long unixSeconds) {
-        if (this.transitionTimes != null && this.transitionTimes.Count > 0) {
-            if (unixSeconds < this.transitionTimes[0]) {
-                for (int i = 0; i < this.transitionOffsets.Count; i++) {
-                    if (!this.transitionIsDst[i]) {
-                        return TimeSpan.FromSeconds(this.transitionOffsets[i]);
-                    }
-                }
-                return TimeSpan.FromSeconds(this.transitionOffsets[0]);
-            }
-            int lo = 0;
-            int hi = this.transitionTimes.Count - 1;
-            while (lo <= hi) {
-                int mid = (lo + hi) / 2;
-                if (this.transitionTimes[mid] <= unixSeconds) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid - 1;
+        int idx = TransitionIndex(unixSeconds);
+        if (idx == -2) {
+            for (int i = 0; i < this.transitionOffsets.Count; i++) {
+                if (!this.transitionIsDst[i]) {
+                    return TimeSpan.FromSeconds(this.transitionOffsets[i]);
                 }
             }
-            int idx = lo - 1;
-            if (idx == this.transitionTimes.Count - 1 && this.posixRule != null) {
-                return TimeSpan.FromSeconds(this.posixRule.GetUtcOffsetSeconds(unixSeconds));
-            }
-            if (idx >= 0 && idx < this.transitionOffsets.Count) {
-                return TimeSpan.FromSeconds(this.transitionOffsets[idx]);
-            }
+            return TimeSpan.FromSeconds(this.transitionOffsets[0]);
+        }
+        if (idx >= 0 && idx < this.transitionOffsets.Count) {
+            return TimeSpan.FromSeconds(this.transitionOffsets[idx]);
         }
         if (this.posixRule != null) {
             return TimeSpan.FromSeconds(this.posixRule.GetUtcOffsetSeconds(unixSeconds));
@@ -566,27 +561,10 @@ public class TimeZoneInfo {
     }
 
     public bool IsDaylightSavingTime(long unixSeconds) {
-        if (this.transitionTimes != null && this.transitionTimes.Count > 0) {
-            if (unixSeconds < this.transitionTimes[0]) {
-                return false;
-            }
-            int lo = 0;
-            int hi = this.transitionTimes.Count - 1;
-            while (lo <= hi) {
-                int mid = (lo + hi) / 2;
-                if (this.transitionTimes[mid] <= unixSeconds) {
-                    lo = mid + 1;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            int idx = lo - 1;
-            if (idx == this.transitionTimes.Count - 1 && this.posixRule != null) {
-                return this.posixRule.IsDaylightSavingTime(unixSeconds);
-            }
-            if (idx >= 0 && idx < this.transitionIsDst.Count) {
-                return this.transitionIsDst[idx];
-            }
+        int idx = TransitionIndex(unixSeconds);
+        if (idx == -2) { return false; }
+        if (idx >= 0 && idx < this.transitionIsDst.Count) {
+            return this.transitionIsDst[idx];
         }
         if (this.posixRule != null) {
             return this.posixRule.IsDaylightSavingTime(unixSeconds);
