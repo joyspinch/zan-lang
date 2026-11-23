@@ -500,6 +500,7 @@
             zan_istr_t empty = { (char *)"", 0 };
             zan_store_fit(g, emit_string_literal_rc(g, empty), alloca);
         }
+        bool borrowed = false;
         local_var_t obj_slot;
         memset(&obj_slot, 0, sizeof(obj_slot));
         obj_slot.alloca = alloca;
@@ -544,7 +545,12 @@
                                                     init_val, init_src, locals);
                 }
             }
-            if (arc_own) {
+            if (arc_own && !conv_owned && !bind_owned &&
+                local_init_can_borrow(g, stmt, type, locals)) {
+                /* 别名借用（stmt_borrow.c）：不 retain，作用域末不 release */
+                zan_store_fit(g, init_val, alloca);
+                borrowed = true;
+            } else if (arc_own) {
                 init_val = emit_implicit_box(g, type, init_val, init_src, locals);
                 emit_rc_capture_local(g, type, alloca, init_val,
                     (conv_owned || bind_owned)
@@ -588,7 +594,7 @@
             locals->vars[locals->count - 1].struct_rc = 1;
             lpad_register_local(g, &locals->vars[locals->count - 1]);
         }
-        if (arc_own) arc_own_local(g, locals);
+        if (arc_own && !borrowed) arc_own_local(g, locals);
         if (obj_own)
             locals->vars[locals->count - 1].obj_rc_flag = obj_slot.obj_rc_flag;
         if (type &&

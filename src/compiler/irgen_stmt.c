@@ -2,6 +2,7 @@
 
 /* Composite Dispatcher Submodules */
 #include "stmt/stmt_helpers.c"
+#include "stmt/stmt_borrow.c"
 
 static void emit_stmt_impl(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
