@@ -194,10 +194,29 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
         LLVMValueRef sv = LLVMGetNamedFunction(g->mod, "setvbuf");
         if (!sv) sv = LLVMAddFunction(g->mod, "setvbuf", sv_type);
         int sv_mode = g->target_is_windows ? 4 /* _IONBF */ : 1 /* _IOLBF */;
-        LLVMValueRef sv_args[] = { stdout_ptr, LLVMConstNull(i8p),
+        /* 缓冲策略交给运行时 zan_rt_stdout_setup：终端/管道保持逐行（IDE 控制台、
+         * docker logs 等实时消费者依赖），重定向到普通文件时整块缓冲——曾每行
+         * 一次 write(2)，200 万行写文件 3.5 s（C 全缓冲 0.46 s）。模块内放同名
+         * 弱实现 = 原样 setvbuf，未带此符号的旧预编译交叉运行时行为不变。 */
+        LLVMTypeRef su_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ i8p, svi32, svi64 }, 3, 0);
+        LLVMValueRef su = LLVMGetNamedFunction(g->mod, "zan_rt_stdout_setup");
+        if (!su) {
+            su = LLVMAddFunction(g->mod, "zan_rt_stdout_setup", su_type);
+            LLVMSetLinkage(su, LLVMWeakAnyLinkage);
+            LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+            LLVMPositionBuilderAtEnd(g->builder,
+                LLVMAppendBasicBlockInContext(g->ctx, su, "entry"));
+            LLVMValueRef fb_args[] = { LLVMGetParam(su, 0), LLVMConstNull(i8p),
+                LLVMGetParam(su, 1), LLVMGetParam(su, 2) };
+            zan_call2(g->builder, sv_type, sv, fb_args, 4, "");
+            LLVMBuildRetVoid(g->builder);
+            LLVMPositionBuilderAtEnd(g->builder, cur);
+        }
+        LLVMValueRef su_args[] = { stdout_ptr,
             LLVMConstInt(svi32, sv_mode, 0),
             LLVMConstInt(svi64, g->target_is_windows ? 0 : 4096, 0) };
-        zan_call2(g->builder, sv_type, sv, sv_args, 4, "");
+        zan_call2(g->builder, su_type, su, su_args, 3, "");
     }
 
     if (g->target_is_windows) {
