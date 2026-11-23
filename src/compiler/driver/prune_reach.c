@@ -559,6 +559,114 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     }
 }
 
+#ifdef _WIN32
+static int pi_realpath(const char *in, char *out, size_t cap) {
+    DWORD n = GetFullPathNameA(in, (DWORD)cap, out, NULL);
+    return n > 0 && n < cap;
+}
+#else
+static int pi_realpath(const char *in, char *out, size_t cap) {
+    char buf[4096];
+    if (!realpath(in, buf)) return 0;
+    snprintf(out, cap, "%s", buf);
+    return 1;
+}
+#endif
+
+/* ---------- 控件目录（zan.pkg `catalog`，B-ID172）----------
+ * 包清单声明哪些命名空间是「控件目录」。程序一旦按名构造控件（引用了
+ * Gui.ControlFactory），这些命名空间里已到达目录的文件整体拉入编译图，
+ * 编译器再据此合成 __ZanControlCatalog（见 main_synth.c）。只拉「已到达」的
+ * 目录：Zan.Gui 的 Gui.Widget 由 HTML 装载层的 using 到达；兄弟包的组件仍由
+ * 应用 using 其命名空间显式选用——与手工注册梯子时代的拉入面一致。 */
+/* 目录项 = (声明包的根目录, 命名空间)：只认声明包自己的文件——同一命名空间
+ * 下兄弟包的文件（如 Zan.Gui.Workplace 也写 Gui.Widget）不随目录整体拉入。 */
+static char pi_catalog_ns[64][256];
+static char pi_catalog_pkg[64][1024];
+static int pi_catalog_count = -1;
+
+static void pi_catalog_load(void) {
+    if (pi_catalog_count >= 0) return;
+    pi_catalog_count = 0;
+    if (!package_project_root[0]) return;
+    static char dirs[256][1024];
+    int n = zan_pkg_all_manifest_dirs(package_project_root, dirs, 256);
+    for (int i = 0; i < n; i++) {
+        char manifest[1100];
+        snprintf(manifest, sizeof(manifest), "%s/zan.pkg", dirs[i]);
+        zan_package_t pkg;
+        if (!zan_pkg_load(&pkg, manifest)) continue;
+        char pkg_real[1024];
+        if (!pi_realpath(dirs[i], pkg_real, sizeof(pkg_real))) {
+            zan_pkg_destroy(&pkg);
+            continue;
+        }
+        const char *c = pkg.catalog;
+        while (*c && pi_catalog_count < 64) {
+            while (*c == ' ' || *c == '\t') c++;
+            int len = 0;
+            while (c[len] && c[len] != ' ' && c[len] != '\t') len++;
+            if (len > 0 && len < 255) {
+                char *dst = pi_catalog_ns[pi_catalog_count];
+                for (int k = 0; k < len; k++) dst[k] = c[k] == '.' ? '/' : c[k];
+                dst[len] = 0;
+                snprintf(pi_catalog_pkg[pi_catalog_count], sizeof(pi_catalog_pkg[0]), "%s", pkg_real);
+                pi_catalog_count++;
+            }
+            c += len;
+        }
+        zan_pkg_destroy(&pkg);
+    }
+}
+
+static int pi_dir_is_catalog(const char *subdir) {
+    pi_catalog_load();
+    for (int i = 0; i < pi_catalog_count; i++)
+        if (strcmp(pi_catalog_ns[i], subdir) == 0) return 1;
+    return 0;
+}
+
+/* 文件属于为 subdir 声明了目录的那个包，且声明的命名空间恰为 subdir。 */
+static int pi_file_is_catalog(const char *subdir, const char *path) {
+    char real[1024];
+    if (!pi_realpath(path, real, sizeof(real))) return 0;
+    int owned = 0;
+    for (int i = 0; i < pi_catalog_count && !owned; i++) {
+        if (strcmp(pi_catalog_ns[i], subdir) != 0) continue;
+        size_t pl = strlen(pi_catalog_pkg[i]);
+        if (strncmp(real, pi_catalog_pkg[i], pl) == 0 && (real[pl] == '/' || real[pl] == '\\'))
+            owned = 1;
+    }
+    if (!owned) return 0;
+    char want[256], ns[256] = {0};
+    subdir_to_namespace(subdir, want, sizeof(want));
+    return probe_file_namespace(path, ns, sizeof(ns)) && strcmp(ns, want) == 0;
+}
+
+/* 被已编译文件（含入口单元）以 using 导入的命名空间。目录「已到达」只说明
+ * 有文件被扫描过时提到它，不说明程序在用——目录整体拉入只认这里。 */
+static char pi_live_ns[512][256];
+static int pi_live_ns_count = 0;
+
+static void pi_ns_live_add(const char *subdir) {
+    for (int i = 0; i < pi_live_ns_count; i++)
+        if (strcmp(pi_live_ns[i], subdir) == 0) return;
+    if (pi_live_ns_count >= 512 || strlen(subdir) >= sizeof(pi_live_ns[0])) return;
+    snprintf(pi_live_ns[pi_live_ns_count++], sizeof(pi_live_ns[0]), "%s", subdir);
+}
+
+static int pi_ns_live(const char *subdir) {
+    for (int i = 0; i < pi_live_ns_count; i++)
+        if (strcmp(pi_live_ns[i], subdir) == 0) return 1;
+    return 0;
+}
+
+/* 按名构造控件的入口已进入编译图。 */
+static int pi_catalog_live(void) {
+    pi_name_t *n = pi_intern("ControlFactory", 14);
+    return n && n->flagged;
+}
+
 static void pi_add_package_source(const char *path, void *context) {
     pi_dir_t *d = (pi_dir_t *)context;
     pi_add_file(d, path);
@@ -592,6 +700,10 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     size_t __sc0 = g_scale_stats.metadata_scans;
     for (int i = 0; i < d->file_count; i++)
         pi_scan_file(&d->files[i]);
+    /* 包源按目录树整体登记（子命名空间、兄弟包的文件也在其中），逐文件判定归属。 */
+    if (pi_dir_is_catalog(d->subdir))
+        for (int i = 0; i < d->file_count; i++)
+            d->files[i].catalog = pi_file_is_catalog(d->subdir, d->files[i].path);
     zan_compile_trace("process_dir '%s': glob=%.1fms pkg=%d(%.1fms) files=%d scans=%zu scan=%.1fms",
                       d->subdir, __g1 - __g0, package_count, __g2 - __g1,
                       d->file_count, g_scale_stats.metadata_scans - __sc0,
@@ -600,14 +712,17 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
 
 static int pi_close_once(const char *stdlib_root) {
     int changed = 0;
+    int catalog_live = pi_catalog_live();
     for (pi_dir_t *d = pi_dirs_head; d; d = d->next) {
         if (!d->reached) pi_process_dir(d, stdlib_root);
+        int catalog_dir = catalog_live && pi_ns_live(d->subdir);
         for (int i = 0; i < d->file_count; i++) {
             pi_file_t *f = &d->files[i];
             if (f->included) continue;
-            int hit = f->has_ext || f->has_controller;
+            int hit = f->has_ext || f->has_controller || (f->catalog && catalog_dir);
             const char *why = f->has_ext ? "ext"
-                              : (f->has_controller ? "controller" : NULL);
+                              : (f->has_controller ? "controller"
+                                 : (f->catalog && catalog_dir ? "catalog" : NULL));
             for (int k = 0; k < f->top_count && !hit; k++)
                 if (f->top[k]->flagged) { hit = 1; why = f->top[k]->str; }
             if (!hit) continue;
@@ -616,8 +731,10 @@ static int pi_close_once(const char *stdlib_root) {
                 fprintf(stderr, "[pullin] incl %s because %s\n",
                         f->path ? f->path : "?", why ? why : "?");
             changed = 1;
-            for (int k = 0; k < f->using_count; k++)
+            for (int k = 0; k < f->using_count; k++) {
                 pi_reach(f->usings[k]);
+                pi_ns_live_add(f->usings[k]);
+            }
         }
     }
     return changed;
@@ -783,6 +900,7 @@ static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
                 }
                 subdir[used] = 0;
                 pi_reach(subdir);
+                pi_ns_live_add(subdir);
                 if (u->using_decl.is_static &&
                     qn->qualified_name.parts.count > 0)
                     pi_flag_istr(qn->qualified_name.parts.items[

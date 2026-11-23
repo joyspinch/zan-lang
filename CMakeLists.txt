@@ -6625,7 +6625,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       control_host_lifecycle app_post_lifecycle text_routed_input form_lifecycle
       treeview_filter_input colorpicker_input_lifecycle layer_input_lifecycle layer_photos_retained
       drag_routed_input scroll_routed_input scrollcolumn_input_lifecycle input_root_composition
-      control_factory_equivalence model_binding_equivalence scroll_widgets_input_lifecycle
+      control_factory_equivalence control_catalog model_binding_equivalence scroll_widgets_input_lifecycle
       control_children_lifecycle contextmenu_routed_lifecycle popup_factory_mount
       overlay_anchor_retirement retained_longpress_input retained_focus_lifecycle hover_callback_lifetime
       treeview_retained_input_lifecycle listview_retained_input_lifecycle virtuallist_string_input carousel_retained_input

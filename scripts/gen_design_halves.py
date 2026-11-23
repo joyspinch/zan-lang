@@ -68,6 +68,7 @@ REGISTRY = """// <auto-design> IDE 组件注册表（B-ID44）——由
 using Gui;
 using Gui.Widget;
 using Gui.Component;
+using Gui.Component.DataTable;
 
 public static class IdeDesignedRegistry {{
     static bool installed;
@@ -77,8 +78,6 @@ public static class IdeDesignedRegistry {{
     public static void Install() {{
         if (installed) {{ return; }}
         installed = true;
-        Gui.ControlBootstrap.Install();
-        Gui.Component.DataTable.DataTableBootstrap.Install();
 {lines}
     }}
 }}

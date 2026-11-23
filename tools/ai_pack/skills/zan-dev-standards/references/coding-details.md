@@ -21,11 +21,12 @@
      原因：漏接布局曾使 `style="width:88px"` 无效；将 padding 简写首数
      写入 Pad 又会丢失四边和单位，并在替换样式后残留 padSet。回归同时检查
      实际槽位、替换样式和 DPI，不以样式字段正确代替布局正确。
-  ③ **控件 kind 与构造注册保持同一事实源**：`ControlBootstrap.Install()`
-     对 70 个核心 kind 各写一条 `ControlFactory.Register(kind, constructor)`，
-     不再维护独立 Names/Make 名单；可选包仍由各自显式 Install 注册，
-     应用组件继续自声明 Install 走 HeavyControls 自发现。注册键必须与
-     实例 `Kind()` 一致（含 RadioButton 形态），HTML 别名保持原映射。
+  ③ **控件 kind 名单由编译器合成，不手写注册梯子**：编译图里继承 `Gui.Control`、
+     public、非抽象、可无参构造的类按类名（= `Kind()` 默认值）进
+     `__ZanControlCatalog`；别名/工厂/泛型闭合写 `[ControlKind(Name=, Factory=, Of=)]`
+     （如 Radio 的 `RadioButton`、`ListView<string>`）。包清单 `catalog = "Ns ..."`
+     声明的命名空间在程序按名构造且 `using` 了它时整体拉入。`ControlFactory.Register`
+     只留给运行期动态组件。见 docs/GUI_CONTROL_CATALOG.md。
      新增或调整 kind 时验证自然构造、工厂、HTML、Html.Clone 及弱引用
      释放等价；复合控件通过 CloneContentTo 复制业务内容并重建生成部件。
      编译期 GenForm 限定名单已删除，不恢复重复清单。

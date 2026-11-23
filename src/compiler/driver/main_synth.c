@@ -533,6 +533,179 @@ static void zan_synth_action_dispatch(zan_ast_node_t *unit, zan_arena_t *arena,
                           synth->comp_unit.decls.items[i], arena);
 }
 
+/* ---------- 控件目录的编译期合成（B-ID172，docs/GUI_CONTROL_CATALOG.md） ----------
+ *
+ * 取代各包手写的 XxxBootstrap.Install() 注册梯子：编译单元里凡是继承链上有
+ * Gui.Control、非抽象、非泛型、有可访问无参构造器的类，都按类名（= Control.Kind()
+ * 默认值）进入目录；[ControlKind(Name = "...", Factory = "...", Of = "...")] 声明
+ * 别名（静态工厂方法）与泛型控件的闭合类型。合成 __ZanControlCatalog 的
+ * Create(kind)/Kinds()，由 Gui.ControlFactory 调用。哪些控件进编译单元由包清单的
+ * catalog 命名空间决定（见 prune_reach.c 的 pi_catalog_*）。 */
+
+typedef struct { char name[128]; } zc_kind_t;
+
+static bool zc_kind_seen(zc_kind_t *ks, int n, const char *name) {
+    for (int i = 0; i < n; i++) if (strcmp(ks[i].name, name) == 0) return true;
+    return false;
+}
+
+/* 继承链上是否有命名空间 Gui 下的 Control。 */
+static bool zc_is_control(zan_ast_node_t *unit, zan_ast_node_t *decl, int depth) {
+    if (!decl || depth > 32) return false;
+    for (int i = 0; i < decl->type_decl.bases.count; i++) {
+        zan_ast_node_t *b = decl->type_decl.bases.items[i];
+        if (!b || b->kind != AST_TYPE_REF || !b->type_ref.name.str) continue;
+        const char *bs = b->type_ref.name.str;
+        int len = (int)b->type_ref.name.len;
+        for (int k = len - 1; k >= 0; k--) {
+            if (bs[k] == '.') { bs += k + 1; len -= k + 1; break; }
+        }
+        char base[128];
+        if (len <= 0 || len >= (int)sizeof(base)) continue;
+        memcpy(base, bs, (size_t)len);
+        base[len] = 0;
+        zan_ast_node_t *bd = zd_find_class(unit, base);
+        if (!bd) continue;
+        if (strcmp(base, "Control") == 0) {
+            zan_istr_t ns = zan_ast_ns_name(bd);
+            if (ns.len == 3 && memcmp(ns.str, "Gui", 3) == 0) return true;
+        }
+        if (zc_is_control(unit, bd, depth + 1)) return true;
+    }
+    return false;
+}
+
+/* 有可访问的无参构造器（或未声明任何构造器）。 */
+static bool zc_default_constructible(zan_ast_node_t *decl) {
+    bool any = false;
+    for (int j = 0; j < decl->type_decl.members.count; j++) {
+        zan_ast_node_t *m = decl->type_decl.members.items[j];
+        if (!m || m->kind != AST_CONSTRUCTOR_DECL) continue;
+        if (m->method_decl.modifiers & MOD_STATIC) continue;
+        any = true;
+        if (m->method_decl.modifiers & (MOD_PRIVATE | MOD_PROTECTED | MOD_INTERNAL)) continue;
+        if (m->method_decl.params.count == 0) return true;
+    }
+    return !any;
+}
+
+/* [ControlKind] 的一个具名实参（Name/Factory/Of）；首个位置实参等同 Name。 */
+static bool zc_attr_arg(zan_ast_node_t *a, const char *key, char *out, size_t cap) {
+    out[0] = 0;
+    for (int j = 0; j < a->attribute.args.count; j++) {
+        zan_ast_node_t *arg = a->attribute.args.items[j];
+        if (!arg) continue;
+        zan_ast_node_t *val = NULL;
+        if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+            arg->binary.left->kind == AST_IDENTIFIER) {
+            zan_istr_t k = arg->binary.left->ident.name;
+            if ((int)k.len == (int)strlen(key) && memcmp(k.str, key, k.len) == 0)
+                val = arg->binary.right;
+        } else if (j == 0 && strcmp(key, "Name") == 0) {
+            val = arg;
+        }
+        if (val && val->kind == AST_STRING_LITERAL && val->str_val.str) {
+            snprintf(out, cap, "%s", val->str_val.str);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void zc_full_name(zan_ast_node_t *decl, char *out, size_t cap) {
+    zan_istr_t ns = zan_ast_ns_name(decl);
+    if (ns.len > 0 && ns.str)
+        snprintf(out, cap, "%.*s.%.*s", (int)ns.len, ns.str,
+                 (int)decl->type_decl.name.len, decl->type_decl.name.str);
+    else
+        snprintf(out, cap, "%.*s", (int)decl->type_decl.name.len, decl->type_decl.name.str);
+}
+
+static void zan_synth_control_catalog(zan_ast_node_t *unit, zan_arena_t *arena,
+                                      zan_diag_t *diag) {
+    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
+    zan_ast_node_t *factory = zd_find_class(unit, "ControlFactory");
+    if (!factory) return;
+    zan_istr_t fns = zan_ast_ns_name(factory);
+    if (!(fns.len == 3 && memcmp(fns.str, "Gui", 3) == 0)) return;
+    int cap = 1024, count = 0;
+    zc_kind_t *kinds = (zc_kind_t *)calloc((size_t)cap, sizeof(zc_kind_t));
+    if (!kinds) return;
+    zd_buf_t create, list;
+    memset(&create, 0, sizeof(create));
+    memset(&list, 0, sizeof(list));
+    zd_putf(&create, "/* 由编译器合成的控件目录（勿手改），见 docs/GUI_CONTROL_CATALOG.md。 */\n");
+    zd_putf(&create, "class __ZanControlCatalog {\n");
+    zd_putf(&create, "    public static Gui.Control Create(string kind) {\n");
+    zd_putf(&list, "    public static List<string> Kinds() {\n");
+    zd_putf(&list, "        List<string> k = new List<string>();\n");
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
+        if (!decl || decl->kind != AST_CLASS_DECL || !decl->type_decl.name.str) continue;
+        if (decl->type_decl.modifiers & (MOD_ABSTRACT | MOD_STATIC | MOD_INTERNAL | MOD_PRIVATE))
+            continue;
+        if (!zc_is_control(unit, decl, 0)) continue;
+        char full[512];
+        zc_full_name(decl, full, sizeof(full));
+        bool generic = decl->type_decl.type_params.count > 0;
+        bool constructible = zc_default_constructible(decl);
+        char simple[128];
+        snprintf(simple, sizeof(simple), "%.*s", (int)decl->type_decl.name.len,
+                 decl->type_decl.name.str);
+        /* [ControlKind] 声明：别名 / 工厂 / 泛型闭合。 */
+        bool declared_default = false;
+        const zan_ast_list_t *attrs = zan_ast_attributes_const(decl);
+        for (int a = 0; a < attrs->count; a++) {
+            int alen = 0;
+            const char *an = zd_attr_name(attrs->items[a], &alen);
+            if (!an || !zd_name_eq(an, alen, "ControlKind")) continue;
+            char name[128], fac[128], of[128];
+            if (!zc_attr_arg(attrs->items[a], "Name", name, sizeof(name))) snprintf(name, sizeof(name), "%s", simple);
+            zc_attr_arg(attrs->items[a], "Factory", fac, sizeof(fac));
+            zc_attr_arg(attrs->items[a], "Of", of, sizeof(of));
+            if (zc_kind_seen(kinds, count, name) || count >= cap) continue;
+            if (fac[0]) {
+                zd_putf(&create, "        if (kind == \"%s\") { return %s.%s(); }\n", name, full, fac);
+            } else if (generic && of[0]) {
+                zd_putf(&create, "        if (kind == \"%s\") { return new %s<%s>(); }\n", name, full, of);
+            } else if (!generic && constructible) {
+                zd_putf(&create, "        if (kind == \"%s\") { return new %s(); }\n", name, full);
+            } else {
+                continue;
+            }
+            snprintf(kinds[count++].name, sizeof(kinds[0].name), "%s", name);
+            zd_putf(&list, "        k.Add(\"%s\");\n", name);
+            if (strcmp(name, simple) == 0) declared_default = true;
+        }
+        if (generic || !constructible || declared_default) continue;
+        if (zc_kind_seen(kinds, count, simple) || count >= cap) continue;
+        snprintf(kinds[count++].name, sizeof(kinds[0].name), "%s", simple);
+        zd_putf(&create, "        if (kind == \"%s\") { return new %s(); }\n", simple, full);
+        zd_putf(&list, "        k.Add(\"%s\");\n", simple);
+    }
+    free(kinds);
+    zd_putf(&create, "        return null;\n    }\n");
+    zd_putf(&list, "        return k;\n    }\n}\n");
+    zd_putf(&create, "%s", list.buf ? list.buf : "");
+    free(list.buf);
+    if (!create.buf) return;
+    size_t slen = create.len;
+    char *src = zan_arena_strdup(arena, create.buf, slen);
+    free(create.buf);
+    if (!src) return;
+    int file_id = diag->file_count;
+    zan_diag_add_file(diag, "<control-catalog>", src);
+    zan_lexer_t lex;
+    zan_lexer_init(&lex, src, slen, file_id, arena, diag);
+    zan_parser_t parser;
+    zan_parser_init(&parser, &lex, arena, diag);
+    zan_ast_node_t *synth = zan_parser_parse(&parser);
+    if (!synth || synth->kind != AST_COMPILATION_UNIT) return;
+    for (int i = 0; i < synth->comp_unit.decls.count; i++)
+        zan_ast_list_push(&unit->comp_unit.decls,
+                          synth->comp_unit.decls.items[i], arena);
+}
+
 /* ---------- gui 工程的入口 shim 合成（B-ID147） ----------
  *
  * zan.proj type=gui 且用户没写 Main、没有 __DesignMain 时，合成一个
