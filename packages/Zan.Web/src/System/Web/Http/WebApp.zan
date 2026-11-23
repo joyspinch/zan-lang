@@ -453,6 +453,25 @@ public class WebApp : IDisposable {
         return true;
     }
 
+    // 未命中路由、且落在某个静态挂载前缀下的 GET/HEAD——交给 StaticHook
+    // 应答的请求。命中路由的同前缀请求仍走完整认证（路由优先）。
+    private bool IsStaticRequest(HttpContext ctx, Route route) {
+        if (route != null) { return false; }
+        if (ctx.Method() != "GET" && ctx.Method() != "HEAD") { return false; }
+        string path = ctx.Path();
+        int count = this.staticMounts.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            // 与 StaticFiles.RelativeTo 同判据（前缀 + '/' + 非空余部），不切片。
+            string prefix = this.staticMounts[i].Prefix();
+            int pn = prefix.Length;
+            if (path.Length > pn + 1 && HttpContext.StartsWith(path, prefix)
+                && (path[pn] & 255) == 47) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ---- CSRF 豁免管理 ----
     public WebApp SkipCsrf(string prefix) {
         if (prefix != null && prefix.Length > 0) {
@@ -637,22 +656,29 @@ public class WebApp : IDisposable {
         }
     }
 
-    private async HttpResponse HandleHttp2Request(HttpRequest req) {
-        HttpContext ctx = new HttpContext(req, "127.0.0.1");
-        ctx.SetApp(this);
-        if (req.bodyLength > 0) {
-            if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
-                HttpContext.ParseMultipartFields(req, ctx);
-            } else {
-                HttpContext.ParseFormBody(req, ctx);
-            }
+    // HTTP/2 流与 HTTP/1 同一口径：真实对端 IP（经 ForwardedHeaders 解析）
+    // 参与按 IP 限流与日志——曾写死 "127.0.0.1"，所有 h2 客户端共用一个
+    // 限流桶，一人刷爆全员 429；限流先于正文解析，被限请求不付解析 CPU。
+    internal async HttpResponse HandleHttp2Request(HttpRequest req, string remoteIp) {
+        HttpContext ctx = new HttpContext(req, remoteIp);
+        if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+            ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
         }
+        ctx.SetApp(this);
+        ctx.MarkTransportSecure();
         Route route = this.router.Match(ctx);
         if (await this.LimitExceeded(ctx, route)) {
             HttpResponse limited = HttpResponse.Text("rate limit exceeded");
             limited.statusCode = 429;
             limited.statusText = "Too Many Requests";
             return limited;
+        }
+        if (req.bodyLength > 0) {
+            if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
+                HttpContext.ParseMultipartFields(req, ctx);
+            } else {
+                HttpContext.ParseFormBody(req, ctx);
+            }
         }
         Worker.BumpStat();
         await this.Dispatch(ctx, route, true);
@@ -716,7 +742,8 @@ public class WebApp : IDisposable {
             if (stream != null && request.method == "PRI" && request.path == "*"
                 && request.version == "HTTP/2.0") {
                 framer.Consume(headerEnd);
-                await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request,
+                Http2RequestBridge bridge = new Http2RequestBridge(this, remoteIp);
+                await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, bridge.Handle,
                     framer, 65000, this.maxBodyBytes, this.requestTimeoutMs);
                 return;
             }
@@ -868,7 +895,13 @@ public class WebApp : IDisposable {
     // true 表示超限，应答由调用方写出并断连。ctx.uid 顺带在这里解析好
     // （AuthUser 只看请求头），DispatchInner 复用、不再重付会话查询。
     private async bool LimitExceeded(HttpContext ctx, Route route) {
-        string uid = await this.AuthUser(ctx);
+        // 静态资源不解析身份：浏览器对 /static 也带会话 cookie，逐个资源
+        // 解密令牌并查库（AuthResolver）会让一个页面的每个 css/js/图片
+        // 各付一次数据库往返。静态请求按 IP 计全局限流，同匿名请求。
+        string uid = "";
+        if (!this.IsStaticRequest(ctx, route)) {
+            uid = await this.AuthUser(ctx);
+        }
         ctx.SetUid(uid);
         string principal = uid;
         if (principal.Length == 0) { principal = ctx.ClientIp(); }

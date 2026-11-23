@@ -12,12 +12,14 @@ namespace Zan.Web;
 
 /* 注入数据库与缓存访问的控制器基类。依赖在 main.zan 装配并经 AppServices.Use(...) 安装，动作通过 this.Conn()/this.Cache() 访问。连接按请求作用域：Conn() 首次调用时从连接池借出，同请求后续调用复用同一连接，OnAfter() 在动作返回时归还——故业务代码与 DAO 不含 Acquire/Release；按请求(非按查询)持一连接也使事务成为可能，事务内每条语句须在同一连接上执行。BEGIN/COMMIT/ROLLBACK 同其他语句一样需 await。子类清理覆盖 OnDone() 而非 OnAfterAsync()，以确保连接总是被释放。 */
 public abstract class AppController : Controller {
-    IDbConnection lease;
+    /* 请求惰性连接：首条语句才向池借出（见 RequestDbConnection）。 */
+    RequestDbConnection lease;
+    /* 租约已弃用或请求已收尾：Held()/__Conn() 答 null，显式 Conn() 可重开。 */
+    bool leaseClosed;
     IDbConnection readLease;
     bool inTx;
     bool commitFailed;
     bool readOnlyIntent;
-    bool leaseIsRead;
 
     override public void UseReadOnly() { this.readOnlyIntent = true; }
 
@@ -47,30 +49,39 @@ public abstract class AppController : Controller {
         return s.Cache();
     }
 
-    /* 本次请求的连接：首次调用借出、之后复用、动作返回自动释放。null 表示数据库不可用——处理器应答 503 而非假设结果集为空。 */
-    protected async IDbConnection Conn() {
+    /* 本请求的惰性连接代理；数据库未配置或租约已关闭时为 null。
+       只建代理不借连接——借出发生在首条语句。 */
+    private RequestDbConnection Lease() {
         if (this.lease != null) { return this.lease; }
+        if (this.leaseClosed) { return null; }
         DbContext ctx = this.Db();
         if (ctx == null) { return null; }
-        if (this.readOnlyIntent) {
-            this.lease = await ctx.AcquireRead();
-            this.leaseIsRead = this.lease != null;
-        } else {
-            this.lease = await ctx.Acquire();
-        }
+        this.lease = new RequestDbConnection(ctx, this.readOnlyIntent);
         return this.lease;
     }
 
-    /* 本次请求已借出的连接，不 await；仅在 Conn() 或 Begin() 成功后有效。 */
+    /* 本次请求的连接：立即借出（已借出则复用），动作返回自动释放。null 表示数据库不可用——处理器应答 503 而非假设结果集为空。 */
+    protected async IDbConnection Conn() {
+        this.leaseClosed = false;
+        RequestDbConnection l = this.Lease();
+        if (l == null) { return null; }
+        if (!await l.Open()) { return null; }
+        return l;
+    }
+
+    /* 本次请求的连接（惰性：首条语句才真正借出），不 await。
+       数据库未配置时为 null。 */
     public IDbConnection Held() {
-        return this.lease;
+        return this.Lease();
     }
 
-    /* 请求已有租约时复用同一连接，不嵌套借用；没有租约时借只读池。
-       [ReadOnly] 动作在 OnBeforeAsync 已持只读租约，普通动作复用主库；
-       事务强制主库，读后写一致性由不标注 [ReadOnly] 保证。 */
+    /* 一个请求只持一条连接：已有租约（含 [ReadOnly] 的只读租约）时复用；
+       事务中强制主库；否则借只读池一次。读后写一致性由不标注
+       [ReadOnly] 保证。 */
     protected async IDbConnection ReadConn() {
-        if (this.lease != null) { return this.lease; }
+        if (this.readOnlyIntent || (this.lease != null && this.lease.IsOpen())) {
+            return await this.Conn();
+        }
         if (this.inTx) { return await this.Conn(); }
         if (this.readLease != null) { return this.readLease; }
         DbContext ctx = this.Db();
@@ -81,38 +92,49 @@ public abstract class AppController : Controller {
 
     /* 本次请求已借出的只读连接（未借出则回退到请求连接）。*/
     protected IDbConnection HeldRead() {
-        if (this.lease != null) { return this.lease; }
-        return this.readLease;
+        if (this.lease != null && this.lease.IsOpen()) { return this.lease; }
+        if (this.readLease != null) { return this.readLease; }
+        return this.Held();
     }
 
-    /* 表访问器运行其上的连接：this.SysUser、this.Post 编译为在此连接上的类型化查询，故租约需在 OnBeforeAsync() 取得（访问器是普通成员，无法 await）。不构造 DAO、不借还、字段名在编译期校验。
+    /* 表访问器运行其上的连接：this.SysUser、this.Post 编译为在此连接上的类型化查询。访问器是普通成员无法 await，故这里给的是惰性代理，首条（异步）语句才借出。不构造 DAO、不借还、字段名在编译期校验。
      * 复杂实体方法也由编译器使用同一请求连接派发，业务调用处不构造 DAO 或传递控制器。 */
     public IDbConnection __Conn() {
-        return this.lease;
+        return this.Lease();
     }
 
-    /* 动作运行前借出本次请求连接，供表访问器使用；数据库未配置时零开销（Conn() 答 null，动作回退到 503）。 */
-    /* override 而非 virtual：virtual 在 Zan 里是「新开槽位」（隐藏基类
-       方法），不是覆盖——生成的路由蹦床经 Controller 静态类型的槽位派
-       发，新槽位永远打不中，基类的空实现就会替它执行：请求租约借了
-       不还，池被拖干后全站 503/无响应（实测过的全站假死形态）。 */
+    /* 动作运行前不再预借连接：不碰库的动作（缓存命中、纯模板页、健康
+       探针）不占池位，碰库的动作在首条语句借出、动作返回归还。 */
     override public async bool OnBeforeAsync() {
-        IDbConnection _db = await this.Conn();
         return this.OnBefore();
     }
 
-    /* 本次请求是否有可用数据库。false 表示连接池无法借出（未配置或不可达），对调用方答 503 而非抛异常；廉价：租约在 OnBeforeAsync() 已取得。 */
+    /* 本次请求是否有可用数据库。已借出 → true；借用失败过 → false；
+       否则不挂起地取一条空闲连接；池正忙（全部借出但连接存活）也算
+       可用，随后的异步语句排队等池。需要确证可达（健康探针）用
+       await DbOpen()。 */
     protected bool DbReady() {
-        return this.lease != null;
+        RequestDbConnection l = this.Lease();
+        if (l == null) { return false; }
+        if (l.IsOpen()) { return true; }
+        if (l.Failed()) { return false; }
+        return l.OpenNow();
+    }
+
+    /* 确证本请求能借到连接（会真正借出）；false 表示数据库不可用。 */
+    protected async bool DbOpen() {
+        return await this.Conn() != null;
     }
 
     /* 弃用未知事务状态的主库租约，清理异常不能覆盖原事务失败。
        先清请求字段，确保之后的收尾不会再次归还或操作此连接。 */
     private void DiscardLease() {
-        IDbConnection db = this.lease;
+        RequestDbConnection l = this.lease;
         this.lease = null;
-        this.leaseIsRead = false;
+        this.leaseClosed = true;
         this.inTx = false;
+        if (l == null) { return; }
+        IDbConnection db = l.Detach();
         if (db == null) { return; }
         try {
             DbContext ctx = this.Db();
@@ -195,17 +217,18 @@ public abstract class AppController : Controller {
         }
         try {
             if (this.lease != null) {
+                IDbConnection db = this.lease.Detach();
                 DbContext ctx = this.Db();
-                if (ctx != null) {
-                    if (this.leaseIsRead) { ctx.ReleaseRead(this.lease); }
-                    else { ctx.Release(this.lease); }
+                if (db != null && ctx != null) {
+                    if (this.lease.IsRead()) { ctx.ReleaseRead(db); }
+                    else { ctx.Release(db); }
                 }
             }
         } catch (Exception releaseError) {
             if (failure == null) { failure = releaseError; }
         } finally {
             this.lease = null;
-            this.leaseIsRead = false;
+            this.leaseClosed = true;
             this.inTx = false;
         }
         try {
