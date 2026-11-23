@@ -335,8 +335,19 @@
                 g->rt_defer_drain = LLVMAddFunction(g->mod, "zan_rt_defer_drain", drain_ty);
             }
             enum { ZAN_ARC_DEFER_DEPTH = 100 };
-            LLVMValueRef dcur = LLVMBuildLoad2(g->builder, i32t,
-                                               g->arc_defer_depth, "adepth");
+            /* 线程局部地址只算一次：macOS 每次 TLS 访问都是一次 _tlv_get_addr
+             * 调用，读/加/读回减三次访问夹着一次 dtor 调用，后端不会跨调用
+             * 复用地址。release_dyn 不挂起、不换线程，同一指针全程有效。 */
+            LLVMValueRef depth_p = g->arc_defer_depth;
+            if (LLVMIsThreadLocal(g->arc_defer_depth)) {
+                unsigned tla = LLVMLookupIntrinsicID("llvm.threadlocal.address",
+                                                     strlen("llvm.threadlocal.address"));
+                LLVMTypeRef pty = LLVMTypeOf(g->arc_defer_depth);
+                LLVMValueRef tlf = LLVMGetIntrinsicDeclaration(g->mod, tla, &pty, 1);
+                depth_p = zan_call2(g->builder, LLVMGlobalGetValueType(tlf), tlf,
+                                    &g->arc_defer_depth, 1, "adepth.p");
+            }
+            LLVMValueRef dcur = LLVMBuildLoad2(g->builder, i32t, depth_p, "adepth");
             LLVMBasicBlockRef defer_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adefer");
             LLVMBasicBlockRef sync_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "async2");
             LLVMBasicBlockRef drain_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adrain");
@@ -365,22 +376,26 @@
             LLVMPositionBuilderAtEnd(g->builder, sync_bb);
             LLVMBuildStore(g->builder,
                 zan_add(g->builder, dcur, LLVMConstInt(i32t, 1, 0), "aup"),
-                g->arc_defer_depth);
+                depth_p);
             zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
-            LLVMValueRef dnow = LLVMBuildLoad2(g->builder, i32t,
-                                               g->arc_defer_depth, "adnow");
+            LLVMValueRef dnow = LLVMBuildLoad2(g->builder, i32t, depth_p, "adnow");
             LLVMValueRef ddown = zan_add(g->builder, dnow,
                 LLVMConstInt(i32t, (unsigned)-1, 0), "adown");
-            LLVMBuildStore(g->builder, ddown, g->arc_defer_depth);
+            LLVMBuildStore(g->builder, ddown, depth_p);
             LLVMValueRef dzero = zan_icmp(g->builder, LLVMIntEQ, ddown,
                 LLVMConstInt(i32t, 0, 0), "azero");
+            /* 只在回到最外层（深度归零）时才问队列：曾每次释放都无条件调
+             * zan_rt_defer_pending（运行时里一把互斥锁），对象密集代码每个
+             * 对象白付一次加解锁。 */
+            LLVMBasicBlockRef pchk_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "apchk");
+            LLVMBuildCondBr(g->builder, dzero, pchk_bb, tail_bb);
+            LLVMPositionBuilderAtEnd(g->builder, pchk_bb);
             LLVMValueRef pend = zan_call2(g->builder,
                 LLVMGlobalGetValueType(g->rt_defer_pending),
                 g->rt_defer_pending, NULL, 0, "apend");
             LLVMValueRef pend1 = zan_icmp(g->builder, LLVMIntNE, pend,
                 LLVMConstInt(i32t, 0, 0), "apend1");
-            LLVMBuildCondBr(g->builder, zan_and(g->builder, dzero, pend1, "ado"),
-                drain_bb, tail_bb);
+            LLVMBuildCondBr(g->builder, pend1, drain_bb, tail_bb);
             LLVMPositionBuilderAtEnd(g->builder, drain_bb);
             zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_defer_drain),
                       g->rt_defer_drain, NULL, 0, "");

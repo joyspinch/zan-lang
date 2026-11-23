@@ -144,8 +144,14 @@ static LLVMValueRef emit_swisstable_match_mask(zan_irgen_t *g, LLVMValueRef ctrl
     LLVMValueRef mask = LLVMConstVector(mask_elems, 16);
     LLVMValueRef h2_vec = LLVMBuildShuffleVector(b, ins, LLVMGetUndef(v16i8), mask, "h2.vec");
 
-    LLVMValueRef eq_vec = emit_byte_eq_mask_i64(g, ctrl_vec, h2_vec, 16);
-    return emit_pmovmskb_portable(g, eq_vec, 16);
+    /* 规范形 icmp eq <16 x i8> → bitcast <16 x i1> 为 i16：LLVM 在 x86 下成
+     * pcmpeqb+pmovmskb，在 AArch64 下成 cmeq+按位权归约，其余目标照样得到同一
+     * 位掩码。曾走 emit_byte_eq_mask_i64/emit_pmovmskb_portable 的 64 位 SWAR
+     * 模拟（每组约 25 条向量指令、每次探测两遍），Mac 上整数键查找比 C++
+     * 慢 9 倍、80% 时间耗在这里。那两个助手仍服务 SIMD 内建，语义不动。 */
+    LLVMValueRef eq = LLVMBuildICmp(b, LLVMIntEQ, ctrl_vec, h2_vec, "h2.eq");
+    LLVMValueRef bits = LLVMBuildBitCast(b, eq, LLVMInt16TypeInContext(c), "h2.bits");
+    return LLVMBuildZExt(b, bits, i32, "h2.mask");
 }
 
 /* SwissTable 控制字节：EMPTY=0x80，DELETED（墓碑）=0xFE，占用槽 = h2（0..0x7F）。
