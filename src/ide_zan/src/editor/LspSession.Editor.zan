@@ -63,6 +63,45 @@ partial class LspSession {
         return request.state == LspPendingState.Ready ? request : null;
     }
 
+    void CompleteEditorRequest(LspPendingRequest request) {
+        List<string> lines = LspSession.SplitLines(request.text);
+        string sourceLine = request.line >= 0 && request.line < lines.Count ? lines[request.line] : "";
+        request.editorCompletions = LspSession.EditorCompletions(request.completions, sourceLine, request.line, request.col);
+        if (request.editorCompletions == null || request.editorCompletions.Count == 0) { request.state = LspPendingState.Empty; }
+    }
+
+    void CancelStaleEditorRequests() {
+        List<int> ids = pending.Keys;
+        for (int i = ids.Count - 1; i >= 0; i = i - 1) {
+            LspPendingRequest request = pending[ids[i]];
+            CodeEditor editor = request.editor;
+            if (editor == null) { continue; }
+            bool keep = (editor == boundEditor && request.generation == generation
+                && request.documentGeneration == documentGeneration && DocVersion(request.path) == request.version
+                && editor.documentPath == request.path && editor.TextStamp() == request.stamp
+                && editor.CurLine() == request.caretLine && editor.CurCol() == request.caretCol
+                && editor.GetText() == request.text
+                && (request.method != "textDocument/completion"
+                    || editor.SemanticCompletionToken() == request.completionToken));
+
+            if (keep) { continue; }
+            request.state = LspPendingState.Cancelled;
+            pending.Remove(request.id);
+            cache.Remove(request);
+            editor.ClearSemanticTextMemo(request.method, request.path, request.stamp,
+                request.line, request.col, request.name);
+            if (background) {
+                if (request.cancellation != null) { request.cancellation.Cancel(); }
+            } else if (!DropUnsentRequest(request.id)) {
+                JsonWriter cw = new JsonWriter();
+                cw.WriteStartObject();
+                cw.WriteProperty("id", request.id);
+                cw.WriteEndObject();
+                Notify("$/cancelRequest", cw.ToJson());
+            }
+        }
+    }
+
     void RefreshEditor(LspPendingRequest request) {
         CodeEditor editor = request.editor;
         if (editor == null || editor != boundEditor || request.generation != generation
@@ -200,22 +239,27 @@ partial class LspSession {
         boundEditor = null;
     }
 
+    void HandleSemanticReset() {
+        if (boundEditor != null) { boundEditor.ResetSemanticProviders(); }
+    }
+
+    void HandleSemanticDocUpdated(string docPath) {
+        if (boundEditor != null) {
+            if (LspSession.SameDocumentPath(boundEditor.documentPath, docPath)) {
+                boundEditor.ClearSemanticTextMemos();
+            } else {
+                boundEditor.ResetSemanticProviders();
+            }
+        }
+    }
+
     void BindToEditor(CodeEditor editor) {
         if (editor == null || stopping) { return; }
         DetachEditor();
         boundEditor = editor;
-        onSemanticReset = () => {
-            if (boundEditor != null) { boundEditor.ResetSemanticProviders(); }
-        };
-        onSemanticDocUpdated = (string docPath) => {
-            if (boundEditor != null) {
-                if (LspSession.SameDocumentPath(boundEditor.documentPath, docPath)) {
-                    boundEditor.ClearSemanticTextMemos();
-                } else {
-                    boundEditor.ResetSemanticProviders();
-                }
-            }
-        };
+        LspEditorSemanticRelay relay = new LspEditorSemanticRelay(this);
+        onSemanticReset = relay.Reset;
+        onSemanticDocUpdated = relay.DocUpdated;
         generation = generation + 1;
         if (background) { CancelUiRequests(LspPendingState.Cancelled); }
         else { CancelStaleEditorRequests(); cache.Clear(); }
@@ -270,5 +314,23 @@ partial class LspSession {
                 || editor.GetText() != text) { return ""; }
             return request != null ? request.hover : "";
         };
+    }
+}
+
+class LspEditorSemanticRelay {
+    weak LspSession session;
+
+    public LspEditorSemanticRelay(LspSession session) {
+        this.session = session;
+    }
+
+    public void Reset() {
+        LspSession target = session;
+        if (target != null) { target.HandleSemanticReset(); }
+    }
+
+    public void DocUpdated(string docPath) {
+        LspSession target = session;
+        if (target != null) { target.HandleSemanticDocUpdated(docPath); }
     }
 }

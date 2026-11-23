@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
+using Gui.Component.CodeEditor;
 
 partial class ZanIDE {
     string syncedEditorPath;
@@ -36,35 +37,44 @@ partial class ZanIDE {
         lspError = "";
         lspStartedMs = Gui.Backend.Window.GetTickMs();
         int workspace = documentWorkspace;
-        lspSess = LspSession.StartAsync(app, root, delegate (LspSession session, bool ready) {
-            if (shuttingDown || documentWorkspace != workspace || lspSess != session) {
-                session.Shutdown();
-                return;
-            }
-            if (ready) {
-                lspState = 2;
-                lspError = "";
-                lspConnectMs = Gui.Backend.Window.GetTickMs() - lspStartedMs;
-                log.Add("> zan-lsp connected: semantic navigation & completion enabled.");
-                this.SyncEditorDocument();
-                this.RefreshFoldRanges();
-            } else {
-                this.MarkLspUnavailable(this.LspFailureText(session.StartReport()));
-            }
-            app.RequestRedraw();
-        });
+        IdeLspRelay relay = new IdeLspRelay(this, workspace);
+        lspSess = LspSession.StartAsync(app, root, relay.OnReady);
         lspSess.BindToEditor(editor);
         // 语言服务推送的诊断（打字即报）：存进编辑器，由编辑器在出错的
         // 字符下面画波浪线（VS 的做法）。
-        lspSess.onDiagnostics = (string path, List<Diagnostic> diagnostics) => {
-            this.ApplySemanticDiagnostics(path, diagnostics);
-        };
+        lspSess.onDiagnostics = relay.OnDiagnostics;
+    }
+
+    void HandleLspReady(LspSession session, bool ready, int workspace) {
+        if (shuttingDown || documentWorkspace != workspace || lspSess != session) {
+            if (session != null) { session.Shutdown(); }
+            return;
+        }
+        if (ready) {
+            lspState = 2;
+            lspError = "";
+            lspConnectMs = Gui.Backend.Window.GetTickMs() - lspStartedMs;
+            log.Add("> zan-lsp connected: semantic navigation & completion enabled.");
+            this.SyncEditorDocument();
+            this.RefreshFoldRanges();
+        } else {
+            this.MarkLspUnavailable(this.LspFailureText(session.StartReport()));
+        }
+        app.RequestRedraw();
     }
 
     // 语义诊断入库。诊断按文档路径存放，换标签页回来还在；
     // 文档关闭时服务端会推一份空诊断过来，这里随之清掉。
-    void ApplySemanticDiagnostics(string path, List<Diagnostic> diagnostics) {
+    void ApplySemanticDiagnostics(string path, List<LspDiagnostic> lspDiagnostics) {
         if (editor == null || path.Length == 0) { return; }
+        List<Diagnostic> diagnostics = new List<Diagnostic>();
+        if (lspDiagnostics != null) {
+            for (int i = 0; i < lspDiagnostics.Count; i = i + 1) {
+                LspDiagnostic d = lspDiagnostics[i];
+                if (d == null) { continue; }
+                diagnostics.Add(new Diagnostic(d.line, d.startCol, d.endCol, d.severity, d.msg));
+            }
+        }
         editor.SetSemanticDiagnostics(path, diagnostics);
         // 同一批诊断也进错误列表（VS 的 Error List 收 IDE 实时分析结果，
         // 不只是上次构建的日志）。
@@ -190,5 +200,29 @@ partial class ZanIDE {
             editor.SetFoldRegions(result.regions);
             app.RequestRedraw();
         });
+    }
+}
+
+class IdeLspRelay {
+    weak ZanIDE owner;
+    int workspace;
+
+    public IdeLspRelay(ZanIDE owner, int workspace) {
+        this.owner = owner;
+        this.workspace = workspace;
+    }
+
+    public void OnReady(LspSession session, bool ready) {
+        ZanIDE ide = owner;
+        if (ide == null) {
+            if (session != null) { session.Shutdown(); }
+            return;
+        }
+        ide.HandleLspReady(session, ready, workspace);
+    }
+
+    public void OnDiagnostics(string path, List<LspDiagnostic> diagnostics) {
+        ZanIDE ide = owner;
+        if (ide != null) { ide.ApplySemanticDiagnostics(path, diagnostics); }
     }
 }

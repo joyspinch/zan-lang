@@ -24,6 +24,9 @@ partial class SymbolListPopup {
     int anchorY;
     // 本帧被激活的符号，由外壳取走（-1 表示没有）。
     int picked;
+    int shownX;
+    int shownY;
+    bool shownOverlay;
     // 树的处理器要说话的对象：同一时刻屏幕上只有一个符号列表。
     static SymbolListPopup current;
 
@@ -35,6 +38,9 @@ partial class SymbolListPopup {
         anchorX = 0 - 1;
         anchorY = 0 - 1;
         picked = 0 - 1;
+        shownX = 0 - 1;
+        shownY = 0 - 1;
+        shownOverlay = false;
         this.CloseBtn.SetProp("tip", ZanIDE.T("Close (Esc)", "关闭 (Esc)"));
         this.CloseBtn.Click.Add(SymbolListPopup.ClosePicked);
         this.Tree.Bind(nodes);
@@ -44,7 +50,7 @@ partial class SymbolListPopup {
 
     static void ClosePicked() {
         SymbolListPopup p = SymbolListPopup.current;
-        if (p != null) { p.open = false; }
+        if (p != null) { p.Close(); }
     }
 
     static void RowPicked() {
@@ -53,7 +59,10 @@ partial class SymbolListPopup {
         int row = p.Tree.SelectedIndex();
         if (row >= 0 && row < p.nodes.Count) {
             string payload = p.nodes[row].payload;
-            if (payload != "") { p.picked = ZanIDE.ParseInt(payload); }
+            if (payload != "") {
+                p.picked = ZanIDE.ParseInt(payload);
+                p.Close();
+            }
         }
     }
 
@@ -65,7 +74,17 @@ partial class SymbolListPopup {
     }
 
     bool IsOpen() { return open; }
-    void Close() { open = false; }
+    void Close() {
+        open = false;
+        shownOverlay = false;
+        if (this.App != null && this.App.overlayHost != null) {
+            this.App.overlayHost.Hide(this);
+        }
+    }
+    public override void OnPopupDismissed() {
+        open = false;
+        shownOverlay = false;
+    }
     int Count() { return symbols.Count; }
 
     // 本帧用户激活的符号（-1 表示没有），取走后清空。
@@ -114,6 +133,8 @@ partial class SymbolListPopup {
         this.Tree.Bind(nodes);
         this.Tree.ClearSelection();
         open = symbols.Count > 0;
+        this.HeadLbl.Text = Convert.ToString(symbols.Count) + " "
+            + ZanIDE.T("symbols for", "个符号匹配") + " '" + query + "'";
     }
 
     static void AddLeaf(List<TreeNode> nodes, List<LspWorkspaceSymbol> symbols,
@@ -122,8 +143,9 @@ partial class SymbolListPopup {
         symbols.Add(symbol);
         string place = SymbolListPopup.RelPath(symbol.path, root) + ":"
             + Convert.ToString(symbol.line + 1);
-        nodes.Add(TreeNode.FileIcon(symbol.name + "   " + place, depth, "code")
-            .WithPayload(Convert.ToString(idx)));
+        TreeNode node = TreeNode.FileIcon(symbol.name + "   " + place, depth, "code");
+        node.WithPayload(Convert.ToString(idx));
+        nodes.Add(node);
     }
 
     static int IndexOfName(List<string> names, string name) {
@@ -142,16 +164,7 @@ partial class SymbolListPopup {
         return path;
     }
 
-    // 每帧调一次：打开时把自己排进覆盖层，关闭时什么都不做。
-    void Frame(App app) {
-        if (!open) { return; }
-        SymbolListPopup.current = this;
-        app.AddOverlay(OverlayPopup.Host(this));
-    }
-
-    // 延迟面板：在所有页面内容之后由 App.RunOverlays 绘制并派发事件。
-    override void OnPaintOverlay(App app) {
-        if (!open) { return; }
+    override void OnMeasure(App app) {
         int chromeH = this.Bar.prefH + app.theme.gapMedium;
         // 至多十四行高：弹在代码上的浮层，不是占掉半个编辑器的窗格。
         int rowH = app.theme.heightSmall;
@@ -159,35 +172,30 @@ partial class SymbolListPopup {
         int maxListH = rowH * 14;
         if (listH > maxListH) { listH = maxListH; }
         if (listH < rowH) { listH = rowH; }
-        int w = app.Scale(560);
-        int h = OverlayPopup.FitH(app, chromeH + listH);
-        int x = OverlayPopup.FitX(app, anchorX, w);
-        int y = OverlayPopup.FitY(app, anchorY, 0, h);
+        prefW = app.Scale(560);
+        prefH = OverlayPopup.FitH(app, chromeH + listH);
+    }
 
-        app.BlockHitsBelow();
-        app.BlockHitsRect(x, y, w, h);
-
-        this.HeadLbl.Text = Convert.ToString(symbols.Count) + " "
-            + ZanIDE.T("symbols for", "个符号匹配") + " '" + query + "'";
-        this.RenderInside(app, new Rect(x, y, w, h));
-
-        if (picked >= 0) {
-            open = false;
-            app.RequestRedraw();
+    // 在布局准备阶段调用：打开时挂入 OverlayHost，关闭时撤出。
+    void Frame(App app) {
+        if (app == null || app.overlayHost == null) { return; }
+        if (!open) {
+            if (shownOverlay || app.overlayHost.ActiveRoot() == this) {
+                shownOverlay = false;
+                app.overlayHost.Hide(this);
+            }
             return;
         }
-        // 别处的按压把浮层收起来，任何弹层都该这样。
-        if (app.ClickAvailable()) {
-            bool inside = app.mouseX >= x && app.mouseX < x + w
-                && app.mouseY >= y && app.mouseY < y + h;
-            if (!inside) {
-                open = false;
-                app.RequestRedraw();
-            }
-        }
-        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
-            open = false;
-            app.RequestRedraw();
+        SymbolListPopup.current = this;
+        this.MeasureTree(app);
+        int x = OverlayPopup.FitX(app, anchorX, prefW);
+        int y = OverlayPopup.FitY(app, anchorY, 0, prefH);
+        if (app.overlayHost.ActiveRoot() != this || !shownOverlay
+            || x != shownX || y != shownY) {
+            shownX = x;
+            shownY = y;
+            shownOverlay = true;
+            app.overlayHost.ShowAt(app, this, x, y);
         }
     }
 }

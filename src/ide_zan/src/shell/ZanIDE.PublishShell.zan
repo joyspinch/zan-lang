@@ -1,0 +1,116 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// Publish UI dialogs and skin packaging helpers (shell layer).
+partial class ZanIDE {
+    static List<string> AvailableSkinNames() {
+        return Skin.Names();
+    }
+
+    static List<string> ProjSkinList(string root) {
+        List<string> outp = ZanIDE.ProjCsvItems(ZanIDE.ProjField(root, "skinlist"));
+        if (outp.Count == 0) { return Skin.BuiltInNames(); }
+        return outp;
+    }
+
+    static void CopyThemeSkins(string root, string outDir, string sourcePath,
+                               List<string> log) {
+        if (!ZanIDE.IsGuiTarget(root, sourcePath)) { return; }
+        string src = ZanIDE.StdlibDir() + "/../packages/Zan.Gui/skins";
+        if (!Directory.Exists(src)) {
+            log.Add("> WARNING: skins requested but no baseline skins folder "
+                + "found (looked in packages/Zan.Gui/skins).");
+            return;
+        }
+        string dst = outDir + "/skins";
+        Directory.CreateDirectoryRecursive(dst);
+        int baseCopied = 0;
+        if (File.Exists(src + "/base.css")) {
+            File.Copy(src + "/base.css", dst + "/base.css");
+            baseCopied = 1;
+        }
+        List<string> baseline = Skin.BuiltInNames();
+        List<string> bundled = new List<string>();
+        int baselineCopied = 0;
+        for (int i = 0; i < baseline.Count; i = i + 1) {
+            string sd = src + "/" + baseline[i];
+            if (Directory.Exists(sd)) {
+                AssetManager.copyTree(sd, dst + "/" + baseline[i]);
+                bundled.Add(baseline[i]);
+                baselineCopied = baselineCopied + 1;
+            } else {
+                log.Add("> WARNING: skin not found, skipped: " + baseline[i]);
+            }
+        }
+        int extraCopied = 0;
+        if (ZanIDE.ProjSkinsEnabled(root)) {
+            List<string> want = ZanIDE.ProjSkinList(root);
+            for (int i = 0; i < want.Count; i = i + 1) {
+                if (bundled.Contains(want[i])) { continue; }
+                string sd = root + "/skins/" + want[i];
+                if (!File.Exists(sd + "/skin.css")) { sd = Skin.FindDir(want[i]); }
+                if (sd != "" && File.Exists(sd + "/skin.css")) {
+                    AssetManager.copyTree(sd, dst + "/" + want[i]);
+                    bundled.Add(want[i]);
+                    extraCopied = extraCopied + 1;
+                } else {
+                    log.Add("> WARNING: skin not found, skipped: " + want[i]);
+                }
+            }
+        }
+        log.Add("> Bundled " + Convert.ToString(baseCopied)
+            + " base.css file(s), " + Convert.ToString(baselineCopied)
+            + " baseline skin pack(s) and " + Convert.ToString(extraCopied)
+            + " extra skin pack(s) into " + dst);
+    }
+
+    // 结束发布状态并根据结果弹出提示或刷新界面
+    void FinishPublish(bool success) {
+        if (success) {
+            this.PromptPublishComplete();
+        } else {
+            Layer.Msg(ZanIDE.T("Publish failed. See the Output panel for details.",
+                "发布失败，请查看输出面板中的详细日志。"), 4);
+        }
+        pubBusy = false;
+        pubStep = null;
+        pubPacking = false;
+        pubPackStartMs = 0;
+        pubExes = new List<string>();
+        coLog.Reset();
+        app.RequestRedraw();
+    }
+
+    // 弹出“发布成功，是否打开文件夹”的模态对话框
+    void PromptPublishComplete() {
+        string target = jobPublishedTarget != "" ? jobPublishedTarget : pubRoot;
+        pubDoneTarget = target;
+        pubDoneAsk = LayerState.Confirm(
+            ZanIDE.T("Publish Succeeded", "发布成功"),
+            ZanIDE.T("Publish completed successfully. Do you want to open the output folder?",
+                     "项目发布已成功完成。是否打开输出文件夹？"),
+            1);
+        pubDoneAsk.okText = ZanIDE.T("Open Folder", "打开文件夹");
+        pubDoneAsk.cancelText = ZanIDE.T("Close", "关闭");
+        pubDoneAsk.Open();
+        app.RequestRedraw();
+    }
+
+    // 处理发布完成对话框的动作；显示与输入由 retained OverlayHost 负责。
+    void SyncPublishDialog() {
+        if (pubDoneAsk != null && pubDoneAsk.open) {
+            int a = pubDoneAsk.action;
+            if (a != 0) {
+                pubDoneAsk.action = 0;
+                pubDoneAsk.open = false;
+                if (a == 1 && pubDoneTarget != "") {
+                    ZanIDE.RevealInFileManager(pubDoneTarget);
+                }
+                app.RequestRedraw();
+            }
+        }
+    }
+}

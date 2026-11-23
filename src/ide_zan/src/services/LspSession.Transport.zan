@@ -6,7 +6,6 @@ using System.Text;
 using System.Threading;
 using System.Collections.Generic;
 using System.Net.Sockets;
-using Gui.Component.CodeEditor;
 
 partial class LspSession {
     // ---- transport ----
@@ -34,7 +33,7 @@ partial class LspSession {
         rbuf = "";
         if (sendQueue != null) { sendQueue.Clear(); }
         queuedBytes = 0;
-        if (boundEditor != null) { boundEditor.ResetSemanticProviders(); }
+        if (onSemanticReset != null) { onSemanticReset(); }
         if (pending != null) {
             List<int> ids = pending.Keys;
             for (int i = 0; i < ids.Count; i = i + 1) {
@@ -280,10 +279,7 @@ partial class LspSession {
                             it = doc.NextSibling(it);
                         }
                     }
-                    List<string> lines = CodeEditor.SplitLines(request.text);
-                    string sourceLine = request.line >= 0 && request.line < lines.Count ? lines[request.line] : "";
-                    request.editorCompletions = LspSession.EditorCompletions(request.completions, sourceLine, request.line, request.col);
-                    if (request.editorCompletions == null || request.editorCompletions.Count == 0) { request.state = LspPendingState.Empty; }
+                    this.CompleteEditorRequest(request);
                 } else if (request.method == "textDocument/signatureHelp") {
                     if (doc.KindAt(resNode) == 5) {
                         LspSignatureHelp sh = new LspSignatureHelp();
@@ -353,7 +349,7 @@ partial class LspSession {
         if (documents != null && documents.ContainsKey(key)) {
             lines = documents[key].lines;
         }
-        List<Diagnostic> diags = LspSession.ParsePublishDiagnostics(doc, paramsNode, lines);
+        List<LspDiagnostic> diags = LspSession.ParsePublishDiagnostics(doc, paramsNode, lines);
         if (onDiagnostics != null) { onDiagnostics(key, diags); }
     }
 
@@ -407,38 +403,6 @@ partial class LspSession {
         while (terminalCount > 64 && index < cache.Count) {
             if (cache[index].state == LspPendingState.Pending) { index = index + 1; }
             else { cache.RemoveAt(index); terminalCount = terminalCount - 1; }
-        }
-    }
-
-    void CancelStaleEditorRequests() {
-        List<int> ids = pending.Keys;
-        for (int i = ids.Count - 1; i >= 0; i = i - 1) {
-            LspPendingRequest request = pending[ids[i]];
-            CodeEditor editor = request.editor;
-            if (editor == null) { continue; }
-            bool keep = (editor == boundEditor && request.generation == generation
-                && request.documentGeneration == documentGeneration && DocVersion(request.path) == request.version
-                && editor.documentPath == request.path && editor.TextStamp() == request.stamp
-                && editor.CurLine() == request.caretLine && editor.CurCol() == request.caretCol
-                && editor.GetText() == request.text
-                && (request.method != "textDocument/completion"
-                    || editor.SemanticCompletionToken() == request.completionToken));
-
-            if (keep) { continue; }
-            request.state = LspPendingState.Cancelled;
-            pending.Remove(request.id);
-            cache.Remove(request);
-            editor.ClearSemanticTextMemo(request.method, request.path, request.stamp,
-                request.line, request.col, request.name);
-            if (background) {
-                if (request.cancellation != null) { request.cancellation.Cancel(); }
-            } else if (!DropUnsentRequest(request.id)) {
-                JsonWriter cw = new JsonWriter();
-                cw.WriteStartObject();
-                cw.WriteProperty("id", request.id);
-                cw.WriteEndObject();
-                Notify("$/cancelRequest", cw.ToJson());
-            }
         }
     }
 

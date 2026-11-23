@@ -1,0 +1,343 @@
+using System;
+using System.Json;
+using System.Collections.Generic;
+
+partial class LspSession {
+    // 同一文档只打开一次，后续未保存修改走递增版本的全量 didChange。
+    void SyncDoc(string path, string text) {
+        if (background) {
+            if (stopping || path.Length == 0) { return; }
+            string key = DocumentUri(path);
+            LspOpenDocument previous = documents.ContainsKey(key) ? documents[key] : null;
+            if (previous != null && previous.text == text) { return; }
+            LspOpenDocument snapshot = new LspOpenDocument();
+            snapshot.path = path;
+            snapshot.text = text;
+            snapshot.version = previous != null ? previous.version + 1 : 1;
+            documents[key] = snapshot;
+            documentGeneration = documentGeneration + 1;
+            CancelUiRequests(LspPendingState.Cancelled);
+            if (onSemanticDocUpdated != null) { onSemanticDocUpdated(path); }
+            LspCommand command = CreateCommand("sync", path, 0, 0);
+            commands.Enqueue(command);
+            return;
+        }
+        if (!this.alive || path.Length == 0) { return; }
+        if (documents == null) { documents = new Dict<string, LspOpenDocument>(); }
+        string uri = this.DocumentUri(path);
+        LspOpenDocument doc = null;
+        if (documents.ContainsKey(uri)) { doc = documents[uri]; }
+        if (doc != null && doc.text == text) { return; }
+        if (doc == null) {
+            doc = new LspOpenDocument();
+            doc.version = 1;
+            LspDidOpenParams p = new LspDidOpenParams();
+            p.textDocument = new LspTextDocumentItem();
+            p.textDocument.uri = uri;
+            p.textDocument.languageId = "zan";
+            p.textDocument.version = doc.version;
+            p.textDocument.text = text;
+            this.Notify("textDocument/didOpen", Json.Serialize<LspDidOpenParams>(p));
+        } else {
+            doc.version = doc.version + 1;
+            LspDidChangeParams p = new LspDidChangeParams();
+            p.textDocument = new LspVersionedDocument();
+            p.textDocument.uri = uri;
+            p.textDocument.version = doc.version;
+            p.contentChanges = new List<LspContentChange>();
+            LspContentChange change = new LspContentChange();
+            change.text = text;
+            p.contentChanges.Add(change);
+            this.Notify("textDocument/didChange", Json.Serialize<LspDidChangeParams>(p));
+        }
+        doc.path = path;
+        doc.text = text;
+        doc.lines = LspSession.SplitLines(text);
+        documents[uri] = doc;
+        documentGeneration = documentGeneration + 1;
+        if (cache != null) { cache.Clear(); }
+        if (onSemanticDocUpdated != null) { onSemanticDocUpdated(path); }
+    }
+
+    string DocumentUri(string path) {
+        if (background) {
+            string key = path.Replace("\\", "/");
+            #if WINDOWS
+            key = key.ToLower();
+            #endif
+            return key;
+        }
+        string uri = LspSession.PathToUri(path);
+        if (documents == null || documents.ContainsKey(uri)) { return uri; }
+        List<string> keys = documents.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (LspSession.SameDocumentPath(LspSession.UriToPath(keys[i]), path)) { return keys[i]; }
+        }
+        return uri;
+    }
+
+    int DocVersion(string path) {
+        string uri = this.DocumentUri(path);
+        if (documents == null || !documents.ContainsKey(uri)) { return 0; }
+        return documents[uri].version;
+    }
+
+    bool DocTextMatches(string path, string text) {
+        string uri = this.DocumentUri(path);
+        return documents == null || !documents.ContainsKey(uri) || documents[uri].text == text;
+    }
+
+    LspPosition DocPosObj(string path, int line0, int byteCol) {
+        string uri = this.DocumentUri(path);
+        if (documents != null && documents.ContainsKey(uri)) {
+            LspOpenDocument doc = documents[uri];
+            if (line0 >= 0 && line0 < doc.lines.Count) {
+                return LspSession.PosObj(line0, LspSession.ByteColumnToUtf16(doc.lines[line0], byteCol));
+            }
+        }
+        return LspSession.PosObj(line0, byteCol);
+    }
+
+    LspTextDocumentIdentifier DocUriObj(string path) {
+        LspTextDocumentIdentifier document = new LspTextDocumentIdentifier();
+        document.uri = this.DocumentUri(path);
+        return document;
+    }
+
+    string DocPosParams(string path, int line0, int byteCol) {
+        LspDocPosParams p = new LspDocPosParams();
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, byteCol);
+        return Json.Serialize<LspDocPosParams>(p);
+    }
+
+    // Semantic go-to-definition. null 表示无目标、失败或文档已变更。
+    LspDefinitionTarget Definition(string path, int line0, int col0) {
+        if (background) { throw new Exception("Use DefinitionAsync on the UI LSP facade."); }
+        int version = this.DocVersion(path);
+        int generation = documentGeneration;
+        string m = this.RequestWait("textDocument/definition",
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version
+            || documentGeneration != generation) { return null; }
+        return LspSession.ParseDefinition(m);
+    }
+
+    List<string> References(string path, int line0, int col0) {
+        if (background) { throw new Exception("Use ReferencesAsync on the UI LSP facade."); }
+        List<string> outp = new List<string>();
+        LspReferenceParams p = new LspReferenceParams();
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, col0);
+        p.context = new LspReferenceContext();
+        p.context.includeDeclaration = true;
+        string m = this.RequestWait("textDocument/references",
+            Json.Serialize<LspReferenceParams>(p));
+        if (m.Length == 0) { return outp; }
+        LspLocationsResult r = Json.Deserialize<LspLocationsResult>(m);
+        if (r == null || r.result == null) { return outp; }
+        for (int i = 0; i < r.result.Count; i = i + 1) {
+            if (r.result[i].uri.Length == 0) { continue; }
+            int ln = 0;
+            if (r.result[i].range != null && r.result[i].range.start != null) {
+                ln = r.result[i].range.start.line;
+            }
+            outp.Add(LspSession.UriToPath(r.result[i].uri) + "\t"
+                + ln.ToString());
+        }
+        return outp;
+    }
+
+    // Semantic rename. null 表示失败/过期；空列表表示服务端未给出编辑。
+    List<LspRenameEdit> Rename(string path, int line0, int col0, string newName) {
+        if (background) { throw new Exception("Use RenameAsync on the UI LSP facade."); }
+        int version = this.DocVersion(path);
+        int generation = documentGeneration;
+        LspRenameParams p = new LspRenameParams();
+        p.textDocument = this.DocUriObj(path);
+        p.position = this.DocPosObj(path, line0, col0);
+        p.newName = newName;
+        string m = this.RequestWait("textDocument/rename",
+            Json.Serialize<LspRenameParams>(p));
+        if (m.Length == 0 || this.DocVersion(path) != version
+            || documentGeneration != generation) { return null; }
+        List<LspRenameEdit> edits = LspSession.ParseWorkspaceEdit(m);
+        if (edits == null) { return null; }
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            if (edits[i].version >= 0 && this.DocVersion(edits[i].path) != edits[i].version) { return null; }
+        }
+        return edits;
+    }
+
+    string Hover(string path, int line0, int col0) {
+        if (background) { throw new Exception("UI hover must use the bound provider."); }
+        int version = this.DocVersion(path);
+        string m = this.RequestWait("textDocument/hover",
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return ""; }
+        string result = "";
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int res = doc.Get(root, "result");
+                if (res < 0 || doc.KindAt(res) != 5) { return; }
+                int contents = doc.Get(res, "contents");
+                if (contents >= 0) {
+                    result = LspSession.ExtractMarkupText(doc, contents);
+                }
+            });
+        } catch (Exception) {
+            return "";
+        }
+        return result;
+    }
+
+    List<LspCompletionItem> Completion(string path, int line0, int col0) {
+        if (background) { throw new Exception("UI completion must use the bound provider."); }
+        List<LspCompletionItem> empty = new List<LspCompletionItem>();
+        int version = this.DocVersion(path);
+        string m = this.RequestWait("textDocument/completion",
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return empty; }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int result = doc.Get(root, "result");
+                if (result < 0) { return; }
+                if (doc.KindAt(result) == 5) { result = doc.Get(result, "items"); }
+                if (result < 0 || doc.KindAt(result) != 4) { return; }
+                int it = doc.FirstChild(result);
+                while (it >= 0) {
+                    if (doc.KindAt(it) == 5) {
+                        LspCompletionItem item = new LspCompletionItem();
+                        item.label = doc.Str(it, "label", "");
+                        item.kind = (int)doc.Long(it, "kind", 0L);
+                        item.detail = doc.Str(it, "detail", "");
+                        item.insertText = doc.Str(it, "insertText", "");
+                        item.insertTextFormat = (int)doc.Long(it, "insertTextFormat", 1L);
+                        item.sortText = doc.Str(it, "sortText", "");
+                        int docNode = doc.Get(it, "documentation");
+                        if (docNode >= 0) {
+                            item.documentation = LspSession.ExtractMarkupText(doc, docNode);
+                        }
+                        int teNode = doc.Get(it, "textEdit");
+                        if (teNode >= 0 && doc.KindAt(teNode) == 5) {
+                            LspTextEdit te = new LspTextEdit();
+                            te.newText = doc.Str(teNode, "newText", "");
+                            int rNode = doc.Get(teNode, "range");
+                            if (rNode < 0) { rNode = doc.Get(teNode, "replace"); }
+                            if (rNode >= 0 && doc.KindAt(rNode) == 5) {
+                                te.range = new LspRange();
+                                int sNode = doc.Get(rNode, "start");
+                                if (sNode >= 0 && doc.KindAt(sNode) == 5) {
+                                    te.range.start = new LspPosition();
+                                    te.range.start.line = (int)doc.Long(sNode, "line", 0L);
+                                    te.range.start.character = (int)doc.Long(sNode, "character", 0L);
+                                }
+                                int eNode = doc.Get(rNode, "end");
+                                if (eNode >= 0 && doc.KindAt(eNode) == 5) {
+                                    te.range.end = new LspPosition();
+                                    te.range.end.line = (int)doc.Long(eNode, "line", 0L);
+                                    te.range.end.character = (int)doc.Long(eNode, "character", 0L);
+                                }
+                            }
+                            item.textEdit = te;
+                        }
+                        empty.Add(item);
+                    }
+                    it = doc.NextSibling(it);
+                }
+            });
+        } catch (Exception) {
+            return empty;
+        }
+        return empty;
+    }
+
+    LspSignatureHelp SignatureHelp(string path, int line0, int col0) {
+        if (background) { throw new Exception("UI signature help must use the bound provider."); }
+        int version = this.DocVersion(path);
+        string m = this.RequestWait("textDocument/signatureHelp",
+            this.DocPosParams(path, line0, col0));
+        if (m.Length == 0 || this.DocVersion(path) != version) { return null; }
+        LspSignatureHelpResult r = Json.Deserialize<LspSignatureHelpResult>(m);
+        if (r == null || r.result == null) { return null; }
+        return r.result;
+    }
+
+    List<LspWorkspaceSymbol> WorkspaceSymbols(string query) {
+        if (background) { throw new Exception("Use WorkspaceSymbolsAsync on the UI LSP facade."); }
+        List<LspWorkspaceSymbol> outp = new List<LspWorkspaceSymbol>();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("query", query != null ? query : "");
+        w.WriteEndObject();
+        string m = this.RequestWait("workspace/symbol", w.ToJson());
+        if (m.Length == 0) { return outp; }
+        return LspSession.ParseWorkspaceSymbols(m);
+    }
+
+    List<LspCodeAction> CodeActions(string path, int line0, int col0) {
+        if (background) { throw new Exception("Use CodeActionsAsync on the UI LSP facade."); }
+        List<LspCodeAction> outp = new List<LspCodeAction>();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WritePropertyName("textDocument");
+        w.WriteStartObject();
+        w.WriteProperty("uri", LspSession.PathToUri(path));
+        w.WriteEndObject();
+        w.WritePropertyName("range");
+        w.WriteStartObject();
+        w.WritePropertyName("start");
+        w.WriteStartObject();
+        w.WriteProperty("line", line0);
+        w.WriteProperty("character", col0);
+        w.WriteEndObject();
+        w.WritePropertyName("end");
+        w.WriteStartObject();
+        w.WriteProperty("line", line0);
+        w.WriteProperty("character", col0);
+        w.WriteEndObject();
+        w.WriteEndObject();
+        w.WritePropertyName("context");
+        w.WriteStartObject();
+        w.WritePropertyName("diagnostics");
+        w.WriteStartArray();
+        w.WriteEndArray();
+        w.WriteEndObject();
+        w.WriteEndObject();
+        string m = this.RequestWait("textDocument/codeAction", w.ToJson());
+        if (m.Length == 0) { return outp; }
+        return LspSession.ParseCodeActions(m);
+    }
+
+    List<string> FoldingRanges(string path) {
+        if (background) { throw new Exception("Use RequestFoldingRanges on the UI LSP facade."); }
+        List<string> outp = new List<string>();
+        LspDocParams p = new LspDocParams();
+        p.textDocument = this.DocUriObj(path);
+        string m = this.RequestWait("textDocument/foldingRange",
+            Json.Serialize<LspDocParams>(p));
+        if (m.Length == 0) { return outp; }
+        try {
+            JsonDoc.ParseScoped(m, doc => {
+                int root = doc.root;
+                if (doc.KindAt(root) != 5) { return; }
+                int arr = doc.Get(root, "result");
+                if (arr < 0 || doc.KindAt(arr) != 4) { return; }
+                int fr = doc.FirstChild(arr);
+                while (fr >= 0) {
+                    if (doc.KindAt(fr) == 5) {
+                        int sl = (int)doc.Long(fr, "startLine", 0L);
+                        int el = (int)doc.Long(fr, "endLine", 0L);
+                        outp.Add(sl.ToString() + "\t" + el.ToString());
+                    }
+                    fr = doc.NextSibling(fr);
+                }
+            });
+        } catch (Exception) {}
+        return outp;
+    }
+}

@@ -30,6 +30,9 @@ partial class RefListPopup {
     int anchorY;
     // 本帧被激活的命中，由外壳取走（-1 表示没有）。
     int picked;
+    int shownX;
+    int shownY;
+    bool shownOverlay;
     // 树的处理器要说话的对象：处理器是普通 Action，而同一时刻
     // 屏幕上只有一个引用列表。
     static RefListPopup current;
@@ -42,6 +45,9 @@ partial class RefListPopup {
         anchorX = 0 - 1;
         anchorY = 0 - 1;
         picked = 0 - 1;
+        shownX = 0 - 1;
+        shownY = 0 - 1;
+        shownOverlay = false;
         this.CloseBtn.SetProp("tip", ZanIDE.T("Close (Esc)", "关闭 (Esc)"));
         this.CloseBtn.Click.Add(RefListPopup.ClosePicked);
         this.FoldBtn.Click.Add(RefListPopup.FoldPicked);
@@ -54,7 +60,7 @@ partial class RefListPopup {
     // 一行被点了：文件行折叠（树自己做），命中行就是要打开的引用。
     static void ClosePicked() {
         RefListPopup r = RefListPopup.current;
-        if (r != null) { r.open = false; }
+        if (r != null) { r.Close(); }
     }
 
     static void FoldPicked() {
@@ -68,7 +74,10 @@ partial class RefListPopup {
         int row = r.Tree.SelectedIndex();
         if (row >= 0 && row < r.nodes.Count) {
             string p = r.nodes[row].payload;
-            if (p != "") { r.picked = ZanIDE.ParseInt(p); }
+            if (p != "") {
+                r.picked = ZanIDE.ParseInt(p);
+                r.Close();
+            }
         }
     }
 
@@ -80,7 +89,17 @@ partial class RefListPopup {
     }
 
     bool IsOpen() { return open; }
-    void Close() { open = false; }
+    void Close() {
+        open = false;
+        shownOverlay = false;
+        if (this.App != null && this.App.overlayHost != null) {
+            this.App.overlayHost.Hide(this);
+        }
+    }
+    public override void OnPopupDismissed() {
+        open = false;
+        shownOverlay = false;
+    }
     List<SearchHit> Hits() { return hits; }
     int Count() { return hits.Count; }
 
@@ -118,13 +137,30 @@ partial class RefListPopup {
                 SearchHit hit = mine[k];
                 int idx = hits.Count;
                 hits.Add(hit);
-                nodes.Add(TreeNode.FileIcon(Convert.ToString(hit.line + 1)
-                + "  " + hit.text, 1, "code").WithPayload(Convert.ToString(idx)));
+                TreeNode node = TreeNode.FileIcon(Convert.ToString(hit.line + 1)
+                    + "  " + hit.text, 1, "code");
+                node.WithPayload(Convert.ToString(idx));
+                nodes.Add(node);
             }
         }
         this.Tree.Bind(nodes);
         this.Tree.ClearSelection();
         open = hits.Count > 0;
+        this.SyncChrome();
+    }
+
+    void SyncChrome() {
+        bool unfolded = this.AnyUnfolded();
+        string foldText = unfolded
+            ? ZanIDE.T("Collapse All", "全部折叠")
+            : ZanIDE.T("Expand All", "全部展开");
+        if (this.FoldBtn.Text.Get() != foldText) { this.FoldBtn.Text = foldText; }
+        string head = Convert.ToString(hits.Count) + " "
+            + ZanIDE.T("references to", "处引用") + " '" + word + "'";
+        if (hits.Count == 1) {
+            head = ZanIDE.T("1 reference to", "1 处引用") + " '" + word + "'";
+        }
+        if (this.HeadLbl.Text.Get() != head) { this.HeadLbl.Text = head; }
     }
 
     // `p` 在 `paths` 里的下标，没有就是 -1。
@@ -150,6 +186,7 @@ partial class RefListPopup {
             if (nodes[g].isDir) { nodes[g].expanded = !folded; }
         }
         this.Tree.Refresh();
+        this.SyncChrome();
     }
 
     // 至少有一个文件是展开的。
@@ -160,69 +197,42 @@ partial class RefListPopup {
         return false;
     }
 
-    // 每帧调一次：打开时把自己排进覆盖层，关闭时什么都不做。
-    // 外壳只说「它是开着的」，绘制、定位和输入都在覆盖层阶段。
-    void Frame(App app) {
-        if (!open) { return; }
-        RefListPopup.current = this;
-        app.AddOverlay(OverlayPopup.Host(this));
-    }
-
-    // 延迟面板：在所有页面内容之后由 App.RunOverlays 绘制并派发事件，
-    // 因此它在代码之上，并且拿到最上层的点击。
-    override void OnPaintOverlay(App app) {
-        if (!open) { return; }
+    override void OnMeasure(App app) {
         int chromeH = this.Bar.prefH + this.Foot.prefH
-        + app.theme.gapMedium;
+            + app.theme.gapMedium;
         // 至多十二行高：弹在代码上的浮层，不是占掉半个编辑器的窗格。
         int rowH = app.theme.heightSmall;
         int listH = this.Tree.ContentHeight(app);
         int maxListH = rowH * 12;
         if (listH > maxListH) { listH = maxListH; }
         if (listH < rowH) { listH = rowH; }
-        int w = app.Scale(560);
-        int h = OverlayPopup.FitH(app, chromeH + listH);
-        int x = OverlayPopup.FitX(app, anchorX, w);
-        int y = OverlayPopup.FitY(app, anchorY, rowH, h);
+        prefW = app.Scale(560);
+        prefH = OverlayPopup.FitH(app, chromeH + listH);
+    }
 
-        app.BlockHitsBelow();
-        app.BlockHitsRect(x, y, w, h);
-
-        bool unfolded = this.AnyUnfolded();
-        if (unfolded) {
-            this.FoldBtn.Text = ZanIDE.T("Collapse All", "全部折叠");
-        } else {
-            this.FoldBtn.Text = ZanIDE.T("Expand All", "全部展开");
-        }
-        string head = Convert.ToString(hits.Count) + " "
-        + ZanIDE.T("references to", "处引用") + " '" + word + "'";
-        if (hits.Count == 1) {
-            head = ZanIDE.T("1 reference to", "1 处引用") + " '" + word + "'";
-        }
-        this.HeadLbl.Text = head;
-
-        this.RenderInside(app, new Rect(x, y, w, h));
-
-        // 打开一处引用就是列表的活干完了：它关掉，跳过去的代码不必
-        // 隔着一个面板去读。
-        if (picked >= 0) {
-            open = false;
-            app.RequestRedraw();
+    // 在布局准备阶段调用：打开时把浮层挂入 OverlayHost 并按锚点定位，
+    // 关闭时立即撤出，由 OverlayHost 统一接管命中测试、外部点击与 Esc。
+    void Frame(App app) {
+        if (app == null || app.overlayHost == null) { return; }
+        if (!open) {
+            if (shownOverlay || app.overlayHost.ActiveRoot() == this) {
+                shownOverlay = false;
+                app.overlayHost.Hide(this);
+            }
             return;
         }
-        // 别处的按压把浮层收起来，任何弹层都该这样；在按压时判断，
-        // 所以关掉它的那一下手势仍然会把光标放到点的位置。
-        if (app.ClickAvailable()) {
-            bool inside = app.mouseX >= x && app.mouseX < x + w
-            && app.mouseY >= y && app.mouseY < y + h;
-            if (!inside) {
-                open = false;
-                app.RequestRedraw();
-            }
-        }
-        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
-            open = false;
-            app.RequestRedraw();
+        RefListPopup.current = this;
+        this.SyncChrome();
+        this.MeasureTree(app);
+        int rowH = app.theme.heightSmall;
+        int x = OverlayPopup.FitX(app, anchorX, prefW);
+        int y = OverlayPopup.FitY(app, anchorY, rowH, prefH);
+        if (app.overlayHost.ActiveRoot() != this || !shownOverlay
+            || x != shownX || y != shownY) {
+            shownX = x;
+            shownY = y;
+            shownOverlay = true;
+            app.overlayHost.ShowAt(app, this, x, y);
         }
     }
 }
