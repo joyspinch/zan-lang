@@ -41,9 +41,23 @@ partial class MvcRoutesGenerator {
         for (int i = 0; i < bases.Count(); i++) {
             string parent = bases.At(i).AsString("");
             if (parent == "Controller" || parent == "System.Web.Controller" || parent == "AppController"
-                || parent == "AdminController" || parent == "ApiController") { return true; }
+                || parent == "AdminController" || parent == "AdminApiController"
+                || parent == "Zan.Web.AdminApiController" || parent == "ApiController") { return true; }
             JsonValue baseType = FindType(types, parent, Text(type, "ns"));
             if (baseType != null && IsController(types, baseType, depth - 1)) { return true; }
+        }
+        return false;
+    }
+
+    static bool InheritsClass(JsonValue types, JsonValue type, string target, int depth) {
+        if (depth == 0 || type == null || Text(type, "kind") != "class") { return false; }
+        JsonValue bases = type.Get("bases");
+        if (bases == null) { return false; }
+        for (int i = 0; i < bases.Count(); i++) {
+            string parent = bases.At(i).AsString("");
+            if (parent == target || parent.EndsWith("." + target)) { return true; }
+            JsonValue baseType = FindType(types, parent, Text(type, "ns"));
+            if (baseType != null && InheritsClass(types, baseType, target, depth - 1)) { return true; }
         }
         return false;
     }
@@ -54,7 +68,8 @@ partial class MvcRoutesGenerator {
     }
 
     static bool HasAttr(JsonValue item, string name) {
-        JsonValue attrs = item.Get("attrs");
+        JsonValue attrs = item == null ? null : item.Get("attrs");
+        if (attrs == null) { return false; }
         for (int i = 0; i < attrs.Count(); i++) {
             if (AttrName(attrs.At(i)) == name) { return true; }
         }
@@ -66,6 +81,7 @@ partial class MvcRoutesGenerator {
         if (Flag(method, "ctor") || Flag(method, "private") || Flag(method, "protected")
             || Flag(method, "abstract") || method.Get("type_params") != null
             || name.StartsWith("__")) { return false; }
+        if (HasAttr(method, "NonAction")) { return false; }
         if (name == "Index") { return true; }
         JsonValue attrs = method.Get("attrs");
         for (int i = 0; i < attrs.Count(); i++) {
@@ -77,36 +93,233 @@ partial class MvcRoutesGenerator {
         return false;
     }
 
-    static List<JsonValue> FrameworkControllers(JsonValue types) {
+    static bool IsFrameworkType(JsonValue files, JsonValue type) {
+        if (Flag(type, "from_package")) { return true; }
+        if (files == null) { return false; }
+        JsonValue fileIdx = type.Get("file");
+        if (fileIdx == null) { return false; }
+        int idx = fileIdx.AsInt(-1);
+        if (idx < 0 || idx >= files.Count()) { return false; }
+        string path = files.At(idx).AsString("").Replace("\\", "/");
+        return path.StartsWith("packages/Zan.Mvc/src/") || path.Contains("/packages/Zan.Mvc/src/");
+    }
+
+    static List<JsonValue> CollectControllers(JsonValue types, JsonValue files, bool fromPackage) {
         List<JsonValue> result = new List<JsonValue>();
-        JsonValue routes = FindType(types, "Zan.Web.__AttrRoutes", "");
-        if (routes == null) { return result; }
-        JsonValue methods = routes.Get("methods");
-        for (int i = 0; i < methods.Count(); i++) {
-            JsonValue method = methods.At(i);
-            if (Text(method, "name") != "RegisterFramework") { continue; }
-            JsonValue body = method.Get("body_expressions");
-            for (int j = 0; j < body.Count(); j++) {
-                JsonValue expr = body.At(j);
-                if (Text(expr, "k") != "typeof") { continue; }
-                string name = Text(expr, "t");
-                JsonValue type = FindType(types, name, "Zan.Web");
-                if (type == null) { throw new Exception("Missing framework controller metadata " + name); }
+        for (int i = 0; i < types.Count(); i++) {
+            JsonValue type = types.At(i);
+            if (IsFrameworkType(files, type) != fromPackage || Flag(type, "from_stdlib")
+                || Flag(type, "generic") || Flag(type, "abstract")) { continue; }
+            if (IsController(types, type, 32) && !HasAttr(type, "NonController")) {
                 result.Add(type);
             }
         }
         return result;
     }
 
+    static bool MethodInType(JsonValue type, string methodName) {
+        JsonValue methods = type.Get("methods");
+        if (methods == null) { return false; }
+        for (int i = 0; i < methods.Count(); i++) {
+            if (Text(methods.At(i), "name") == methodName) { return true; }
+        }
+        return false;
+    }
+
+    static bool IsAppLifecycleBase(string name) {
+        return name == "AppController" || name == "Zan.Web.AppController"
+            || name == "AdminController" || name == "Zan.Web.AdminController"
+            || name == "AdminApiController" || name == "Zan.Web.AdminApiController"
+            || name == "ApiController" || name == "Zan.Web.ApiController";
+    }
+
+    // 0 = overrides OnBeforeAsync/OnAfterAsync/Tx* (async only);
+    // 1 = inherits Controller directly without async lifecycle overrides;
+    // 2 = inherits AppController/AdminController/ApiController without async lifecycle overrides.
+    static int SyncLifecycleKind(JsonValue types, JsonValue type, int depth) {
+        if (depth == 0 || type == null || Text(type, "kind") != "class") { return 0; }
+        string full = TypeName(type);
+        if (IsAppLifecycleBase(full) || IsAppLifecycleBase(Text(type, "name"))) { return 2; }
+        if (full == "System.Web.Controller" || full == "Controller") { return 1; }
+        if (MethodInType(type, "OnBeforeAsync") || MethodInType(type, "OnAfterAsync")
+            || MethodInType(type, "TxBegin") || MethodInType(type, "TxCommit")
+            || MethodInType(type, "TxRollback")) {
+            return 0;
+        }
+        JsonValue bases = type.Get("bases");
+        if (bases == null) { return 0; }
+        for (int i = 0; i < bases.Count(); i++) {
+            string parent = bases.At(i).AsString("");
+            if (IsAppLifecycleBase(parent)) { return 2; }
+            if (parent == "Controller" || parent == "System.Web.Controller") { return 1; }
+            JsonValue baseType = FindType(types, parent, Text(type, "ns"));
+            if (baseType != null) {
+                int baseKind = SyncLifecycleKind(types, baseType, depth - 1);
+                if (baseKind != 0) { return baseKind; }
+            }
+        }
+        return 0;
+    }
+
+    static string ExprSymbol(JsonValue expr) {
+        if (expr == null) { return ""; }
+        string kind = Text(expr, "k");
+        if (kind == "id") { return Text(expr, "n"); }
+        if (kind == "mem") {
+            string obj = ExprSymbol(expr.Get("o"));
+            string mem = Text(expr, "n");
+            return obj.Length > 0 && mem.Length > 0 ? obj + "." + mem : mem;
+        }
+        if (kind == "bin" && Text(expr, "op") == "|") {
+            string left = ExprSymbol(expr.Get("l"));
+            string right = ExprSymbol(expr.Get("r"));
+            return left.Length > 0 && right.Length > 0 ? left + "|" + right : "";
+        }
+        return "";
+    }
+
+    static string ArgValue(JsonValue expr, out bool isStr) {
+        isStr = false;
+        if (expr == null) { return ""; }
+        string kind = Text(expr, "k");
+        if (kind == "lit") {
+            string t = Text(expr, "t");
+            JsonValue v = expr.Get("v");
+            if (t == "str") { isStr = true; return v == null ? "" : v.AsString(""); }
+            if (t == "bool") { return v != null && v.AsBool(false) ? "true" : "false"; }
+            if (t == "decimal") { return v == null ? "" : v.AsString(""); }
+            if (v != null) { return JsonValue.NumText(v); }
+            return "";
+        }
+        if (kind == "uni" && Text(expr, "op") == "-") {
+            bool ignored;
+            string inner = ArgValue(expr.Get("o"), out ignored);
+            return inner.Length > 0 ? "-" + inner : "";
+        }
+        return ExprSymbol(expr);
+    }
+
+    static Dict<string, string> ReadAttrs(JsonValue item, out List<string> keys) {
+        Dict<string, string> values = new Dict<string, string>();
+        keys = new List<string>();
+        JsonValue attrs = item == null ? null : item.Get("attrs");
+        if (attrs == null) { return values; }
+        for (int i = 0; i < attrs.Count(); i++) {
+            JsonValue attr = attrs.At(i);
+            string name = AttrName(attr);
+            if (name.Length == 0) { continue; }
+            JsonValue args = attr.Get("args");
+            if (args == null || args.Count() == 0) {
+                if (!values.ContainsKey(name)) {
+                    values.Add(name, name == "Authorization" ? "Unknown" : "true");
+                    keys.Add(name);
+                }
+                continue;
+            }
+            for (int j = 0; j < args.Count(); j++) {
+                JsonValue arg = args.At(j);
+                string key = name;
+                JsonValue rhs = arg;
+                if (Text(arg, "k") == "assign") {
+                    string argName = Text(arg.Get("l"), "n");
+                    if (argName.Length > 0) { key = name + "." + argName; }
+                    rhs = arg.Get("r");
+                }
+                bool isStr;
+                string value = ArgValue(rhs, out isStr);
+                if (key == "Authorization" || key == "Custom.Authorization") {
+                    key = "Authorization";
+                    if (value.StartsWith("System.Web.CustomAuthorization.")) {
+                        value = value.Substring("System.Web.CustomAuthorization.".Length);
+                    } else if (value.StartsWith("CustomAuthorization.")) {
+                        value = value.Substring("CustomAuthorization.".Length);
+                    }
+                    if (value.Length == 0) { value = "Unknown"; }
+                } else if ((key == "Lock" || key == "Custom.Lock") && !isStr) {
+                    value = "Unknown";
+                }
+                if (!values.ContainsKey(key)) {
+                    values.Add(key, value);
+                    keys.Add(key);
+                }
+            }
+        }
+        return values;
+    }
+
+    static string AttrVal(Dict<string, string> attrs, string name) {
+        string value = "";
+        if (attrs.TryGetValue(name, out value)) { return value; }
+        return "";
+    }
+
+    static string Setting(Dict<string, string> attrs, string name, string fallback = "") {
+        string value = "";
+        if (attrs.TryGetValue("Custom." + name, out value) || attrs.TryGetValue(name, out value)) { return value; }
+        return fallback;
+    }
+
+    static string ExtractVerb(Dict<string, string> attrs) {
+        if (AttrVal(attrs, "HttpPost") == "true") { return "POST"; }
+        if (AttrVal(attrs, "HttpPut") == "true") { return "PUT"; }
+        if (AttrVal(attrs, "HttpPatch") == "true") { return "PATCH"; }
+        if (AttrVal(attrs, "HttpHead") == "true") { return "HEAD"; }
+        if (AttrVal(attrs, "HttpOptions") == "true") { return "OPTIONS"; }
+        if (AttrVal(attrs, "HttpDelete") == "true") { return "DELETE"; }
+        return "GET";
+    }
+
+    static bool IsCoreRouteAttr(string name) {
+        return name == "Route" || name == "RouteR" || name == "Description"
+            || name == "Authorization" || name == "Perm" || name == "IsMenu"
+            || name == "Upload" || name == "ReadOnly" || name == "NonAction"
+            || name == "Action" || name == "HttpGet" || name == "HttpPost"
+            || name == "HttpPut" || name == "HttpPatch" || name == "HttpDelete"
+            || name == "HttpHead" || name == "HttpOptions";
+    }
+
+    static void AppendMetadata(StringBuilder reg, Dict<string, string> attrs, List<string> keys,
+                               bool classDefaults, bool isIndex) {
+        for (int i = 0; i < keys.Count; i++) {
+            string key = keys[i];
+            bool custom = key.StartsWith("Custom.");
+            string name = custom ? key.Substring("Custom.".Length) : key;
+            if (IsCoreRouteAttr(name)) { continue; }
+            if (classDefaults && name == "Icon" && !isIndex) { continue; }
+            if (!custom && attrs.ContainsKey("Custom." + name)) { continue; }
+            reg.Append(".Meta(" + Quote(name) + ", " + Quote(attrs[key]) + ")");
+        }
+    }
+
+    static string ControllerShortName(JsonValue owner) {
+        string ctrl = Text(owner, "orig");
+        if (ctrl.Length == 0) { ctrl = Text(owner, "name"); }
+        if (ctrl.EndsWith("Controller")) { ctrl = ctrl.Substring(0, ctrl.Length - 10); }
+        return ctrl.ToLower();
+    }
+
+    static string ExplicitBasePath(string explicitRoute, string ctrlShort) {
+        string sub = explicitRoute.Replace("[controller]", ctrlShort);
+        if (!sub.StartsWith("/")) { sub = "/" + sub; }
+        if (sub.EndsWith("/[action]")) { sub = sub.Substring(0, sub.Length - 9); }
+        return sub.Length > 0 ? sub : "/";
+    }
+
     static int EmitGroup(StringBuilder code, JsonValue types, List<JsonValue> controllers,
                          string group, int id) {
-        StringBuilder dispatch = new StringBuilder();
-        StringBuilder docs = new StringBuilder();
-        StringBuilder actions = new StringBuilder();
-        string registrations = "";
+        StringBuilder reg = new StringBuilder();
         for (int i = 0; i < controllers.Count; i++) {
             JsonValue owner = controllers[i];
-            registrations = registrations + (i == 0 ? "" : ",\n") + "            typeof(" + TypeName(owner) + ")";
+            int lifecycleKind = SyncLifecycleKind(types, owner, 32);
+            List<string> classKeys;
+            Dict<string, string> classAttrs = ReadAttrs(owner, out classKeys);
+            string explicitRoute = AttrVal(classAttrs, "Route");
+            string ctrlShort = ControllerShortName(owner);
+            bool baseIsRuntime = explicitRoute.Length == 0;
+            string basePath = baseIsRuntime ? "" : ExplicitBasePath(explicitRoute, ctrlShort);
+            string ctrlVar = "c" + Convert.ToString(id);
+            bool ctrlVarEmitted = false;
+
             JsonValue methods = owner.Get("methods");
             HashSet<string> seen = new HashSet<string>();
             for (int j = 0; j < methods.Count(); j++) {
@@ -117,49 +330,112 @@ partial class MvcRoutesGenerator {
                     throw new Exception("Overloaded MVC action " + TypeName(owner) + "." + name);
                 }
                 seen.Add(name);
-                EmitAction(code, dispatch, docs, actions, types, owner, method, id);
+                if (baseIsRuntime && !ctrlVarEmitted) {
+                    reg.Append("        string " + ctrlVar + " = __AttrRoutes.ConventionPath("
+                        + Quote(Text(owner, "ns")) + ", " + Quote(ctrlShort) + ");\n");
+                    ctrlVarEmitted = true;
+                }
+                EmitAction(code, reg, types, owner, method, id, lifecycleKind,
+                           basePath, baseIsRuntime, ctrlVar, classAttrs, classKeys);
                 id++;
             }
+            if (InheritsClass(types, owner, "CrudScreenController", 32)) {
+                if (baseIsRuntime && !ctrlVarEmitted) {
+                    reg.Append("        string " + ctrlVar + " = __AttrRoutes.ConventionPath("
+                        + Quote(Text(owner, "ns")) + ", " + Quote(ctrlShort) + ");\n");
+                    ctrlVarEmitted = true;
+                }
+                id = EmitCrudActions(code, reg, owner, id, lifecycleKind, basePath, baseIsRuntime,
+                                     ctrlVar, classAttrs, classKeys, seen);
+            }
         }
-        code.Append("    static async bool Dispatch" + group + "(HttpContext ctx, string actionKey) {\n");
-        code.Append(dispatch.ToString());
-        code.Append("        return false;\n    }\n");
-        code.Append("    static bool Has" + group + "Action(string actionKey) {\n");
-        code.Append(actions.ToString());
-        code.Append("        return false;\n    }\n");
-        code.Append("    static void Parameters" + group + "(Route route, string actionKey) {\n");
-        code.Append(docs.ToString());
-        code.Append("    }\n");
         if (group == "Framework") {
             code.Append("    public static void RegisterFramework(WebApp app) {\n"
-                + "        __AttrRoutes.RegisterFramework(app, DispatchFramework, ParametersFramework, HasFrameworkAction);\n    }\n");
+                + "        if (app == null) { return; }\n"
+                + reg.ToString()
+                + "    }\n");
         } else {
-            string array = controllers.Count == 0 ? "new TypeInfo[0]" : "new TypeInfo[] {\n" + registrations + "\n        }";
+            code.Append("    public static void RegisterApp(WebApp app) {\n"
+                + "        if (app == null) { return; }\n"
+                + reg.ToString()
+                + "    }\n");
             code.Append("    public static void Register(WebApp app) {\n"
-                + "        __AttrRoutes.Register(app, " + array + ", DispatchApp, ParametersApp, HasAppAction);\n    }\n");
+                + "        if (app == null) { return; }\n"
+                + "        RegisterApp(app);\n"
+                + "        app.Router().InitRouteTableShared();\n"
+                + "    }\n");
         }
         return id;
     }
 
-    static string Generate(JsonValue unit, bool framework) {
-        JsonValue types = unit.Get("classes");
-        if (types == null) { throw new Exception("Missing compiler declaration metadata"); }
-        List<JsonValue> frameworkTypes = framework ? FrameworkControllers(types) : new List<JsonValue>();
-        if (framework && frameworkTypes.Count == 0) { throw new Exception("No framework controllers in metadata"); }
-        List<JsonValue> appTypes = new List<JsonValue>();
+    static bool IsCallTarget(JsonValue expr, string owner, string method) {
+        if (expr == null || Text(expr, "k") != "call") { return false; }
+        JsonValue f = expr.Get("f");
+        if (f == null || Text(f, "k") != "mem" || Text(f, "n") != method) { return false; }
+        JsonValue o = f.Get("o");
+        if (o == null) { return false; }
+        string ok = Text(o, "k");
+        return (ok == "id" || ok == "mem") && Text(o, "n") == owner;
+    }
+
+    static void ScanAutoSignals(JsonValue types, out bool usesBootRun,
+                                out bool usesRegister, out bool usesRegisterFramework) {
+        usesBootRun = false;
+        usesRegister = false;
+        usesRegisterFramework = false;
         for (int i = 0; i < types.Count(); i++) {
             JsonValue type = types.At(i);
-            if (Flag(type, "from_package") || Flag(type, "from_stdlib")
-                || Flag(type, "generic") || Flag(type, "abstract")) { continue; }
-            if (IsController(types, type, 32)) { appTypes.Add(type); }
+            if (Flag(type, "from_package") || Flag(type, "from_stdlib")) { continue; }
+            JsonValue methods = type.Get("methods");
+            if (methods == null) { continue; }
+            for (int j = 0; j < methods.Count(); j++) {
+                JsonValue exprs = methods.At(j).Get("body_expressions");
+                if (exprs == null) { continue; }
+                for (int k = 0; k < exprs.Count(); k++) {
+                    JsonValue expr = exprs.At(k);
+                    if (IsCallTarget(expr, "Boot", "Run")) { usesBootRun = true; }
+                    if (IsCallTarget(expr, "MvcRoutes", "Register")) { usesRegister = true; }
+                    if (IsCallTarget(expr, "MvcRoutes", "RegisterFramework")) { usesRegisterFramework = true; }
+                }
+            }
         }
+    }
+
+    static string Generate(JsonValue unit, string mode) {
+        JsonValue types = unit.Get("classes");
+        if (types == null) { throw new Exception("Missing compiler declaration metadata"); }
+        JsonValue files = unit.Get("files");
+        bool isFrameworkMode = mode == "framework";
+        bool isAutoMode = mode == "auto";
+        bool usesBootRun = false;
+        bool usesRegister = false;
+        bool usesRegisterFramework = false;
+        if (isAutoMode) {
+            ScanAutoSignals(types, out usesBootRun, out usesRegister, out usesRegisterFramework);
+        }
+        List<JsonValue> appTypes = CollectControllers(types, files, false);
+        if (isAutoMode && appTypes.Count == 0 && !usesBootRun && !usesRegister && !usesRegisterFramework) {
+            return "";
+        }
+        List<JsonValue> frameworkTypes = new List<JsonValue>();
+        bool wantFramework = isFrameworkMode || (isAutoMode && (usesBootRun || usesRegisterFramework));
+        if (wantFramework) {
+            frameworkTypes = CollectControllers(types, files, true);
+            if (isFrameworkMode && frameworkTypes.Count == 0) {
+                throw new Exception("No framework controllers in metadata");
+            }
+        }
+        bool emitFramework = isFrameworkMode || usesRegisterFramework || (isAutoMode && usesBootRun && frameworkTypes.Count > 0);
         StringBuilder code = new StringBuilder();
         code.Append("// Generated by Zan.Mvc.\nusing System;\nusing System.Web;\nusing Zan.Web;\n\n");
-        code.Append("public static class MvcRoutes {\n"
-            + "    static void RequireInput(bool present, string name) {\n"
-            + "        if (!present) { throw new ApiError(400, \"0003\", name + \"不能为空\"); }\n    }\n");
+        code.Append("public static class MvcRoutes {\n");
         int id = EmitGroup(code, types, appTypes, "App", 0);
-        if (framework) { EmitGroup(code, types, frameworkTypes, "Framework", id); }
+        if (emitFramework) { EmitGroup(code, types, frameworkTypes, "Framework", id); }
+        code.Append("    [System.Runtime.CompilerServices.ModuleInitializer]\n"
+            + "    public static void AutoInit() {\n"
+            + "        __AttrRoutes.UseAutoRoutes(MvcRoutes.RegisterApp, "
+            + (emitFramework ? "MvcRoutes.RegisterFramework" : "null") + ");\n"
+            + "    }\n");
         code.Append("}\n");
         return code.ToString();
     }

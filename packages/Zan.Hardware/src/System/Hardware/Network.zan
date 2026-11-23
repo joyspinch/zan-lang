@@ -1,10 +1,11 @@
 using System;
-using Gui.Backend;
+using System.IO;
 
 namespace System.Hardware;
 
 // 网络连接类型
 public enum NetworkType {
+    Unknown = -1,   // -1: 无法观测网络状态（如未接入探测宿主或无权限）
     None = 0,       // 0: 无网络/断网
     Wifi = 1,       // 1: Wi-Fi 无线局域网
     Cellular = 2,   // 2: 蜂窝数据（4G/5G 移动流量）
@@ -12,25 +13,167 @@ public enum NetworkType {
 }
 
 // 跨平台网络连接感知门面（Network）：
-// 实时探测当前设备是否连网、网络连接媒介类型，
-// 辅助移动端在大文件下载、视频播放或实时同步时感知是否消耗蜂窝流量。
+// 在 Windows/Linux 桌面与服务端直接通过操作系统原生接口无头探测活动网卡，
+// 不依赖任何 GUI 后端；若上层注册了 HardwareHost，优先委派宿主探测。
 public class Network {
-    // 当前设备是否处于已联网状态（True 为有网络）
+    static bool hasMock;
+    static int mockType;
+
+    // 当前设备是否处于已联网状态（仅当观测到可用网络接口时为 true）
     public static bool IsConnected() {
-        return Network.Type() != NetworkType.None;
+        NetworkType t = Network.Type();
+        return t != NetworkType.None && t != NetworkType.Unknown;
     }
 
-    // 获取当前网络连接类型（Wifi, Cellular, Ethernet, None）
+    // 获取当前网络连接类型（Wifi, Cellular, Ethernet, None, Unknown）
     public static NetworkType Type() {
-        int t = Platform.Shell().NetworkType();
-        if (t >= 0 && t <= 3) {
-            return (NetworkType)t;
+        if (Network.hasMock) {
+            if (Network.mockType >= -1 && Network.mockType <= 3) {
+                return (NetworkType)Network.mockType;
+            }
+            return NetworkType.Unknown;
         }
-        return NetworkType.None;
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) {
+            int t = host.NetworkType();
+            if (t >= 0 && t <= 3) {
+                return (NetworkType)t;
+            }
+            return NetworkType.Unknown;
+        }
+        return Network.NativeType();
     }
 
     // 仿真/注入当前网络状态（用于离线测试、断网演练）
     public static void Inject(NetworkType t) {
-        Platform.Shell().SetNetworkType((int)t);
+        Network.mockType = (int)t;
+        Network.hasMock = true;
     }
+
+    // 清除仿真注入，恢复真实网络探测。
+    public static void Reset() {
+        Network.hasMock = false;
+        Network.mockType = -1;
+    }
+
+    static NetworkType NativeType() {
+        #if WINDOWS
+        return Network.WinProbeNetwork();
+        #elif LINUX && !ANDROID && !OHOS
+        return Network.LinuxProbeNetwork();
+        #else
+        return NetworkType.Unknown;
+        #endif
+    }
+
+    #if WINDOWS
+    [DllImport("iphlpapi", EntryPoint = "GetBestInterface")]
+    private static extern int WinGetBestInterface(int destAddr, nint bestIfIndex);
+
+    [DllImport("iphlpapi", EntryPoint = "GetIfEntry")]
+    private static extern int WinGetIfEntry(nint ifRow);
+
+    [DllImport("iphlpapi", EntryPoint = "GetIfTable")]
+    private static extern int WinGetIfTable(nint ifTable, nint sizePtr, int sort);
+
+    // Win64 MIB_IFROW 实测布局：sizeof=860, dwIndex@512, dwType@516, dwPhysAddrLen@528, dwOperStatus@544；
+    // MIB_IFTABLE.table@4；dwType: 6=Ethernet, 71=IEEE80211(Wifi), 24=Loopback；dwOperStatus: 4=Connected, 5=Operational。
+    static NetworkType ClassifyWinIf(int ifType, int operStatus) {
+        if (operStatus != 4 && operStatus != 5) { return NetworkType.None; }
+        if (ifType == 71) { return NetworkType.Wifi; }
+        if (ifType == 6) { return NetworkType.Ethernet; }
+        return NetworkType.None;
+    }
+
+    static NetworkType WinProbeNetwork() {
+        // 1) 优先探测默认路由出口（8.8.8.8 = 0x08080808）对应的物理/虚拟网卡
+        nint idxPtr = NativeMemory.Alloc(4);
+        nint row = NativeMemory.Alloc(860);
+        try {
+            new Span<int>(idxPtr, 1)[0] = 0;
+            if (Network.WinGetBestInterface(0x08080808, idxPtr) == 0) {
+                int bestIdx = new Span<int>(idxPtr, 1)[0];
+                // 清零 dwIndex 前后的接口名槽位并写入 dwIndex@512
+                for (int i = 0; i < 860; i = i + 4) {
+                    new Span<int>(row + i, 1)[0] = 0;
+                }
+                new Span<int>(row + 512, 1)[0] = bestIdx;
+                if (Network.WinGetIfEntry(row) == 0) {
+                    int ifType = new Span<int>(row + 516, 1)[0];
+                    int oper = new Span<int>(row + 544, 1)[0];
+                    NetworkType best = Network.ClassifyWinIf(ifType, oper);
+                    if (best != NetworkType.None) { return best; }
+                }
+            }
+        } finally {
+            NativeMemory.Free(idxPtr);
+            NativeMemory.Free(row);
+        }
+
+        // 2) 无默认公网路由时（如纯内网服务器），回退扫描 GetIfTable 中处于 Operational 的非回环有 MAC 网卡
+        nint sizePtr = NativeMemory.Alloc(4);
+        try {
+            new Span<int>(sizePtr, 1)[0] = 0;
+            int rc0 = Network.WinGetIfTable(0, sizePtr, 0);
+            int needed = new Span<int>(sizePtr, 1)[0];
+            if (needed <= 4) {
+                return rc0 == 0 ? NetworkType.None : NetworkType.Unknown;
+            }
+            nint tbl = NativeMemory.Alloc((long)needed);
+            try {
+                if (Network.WinGetIfTable(tbl, sizePtr, 0) != 0) {
+                    return NetworkType.Unknown;
+                }
+                int count = new Span<int>(tbl, 1)[0];
+                bool sawEthernet = false;
+                for (int i = 0; i < count; i = i + 1) {
+                    long baseOff = 4L + (long)i * 860L;
+                    if (baseOff + 860L > (long)needed) { break; }
+                    int ifType = new Span<int>(tbl + (nint)(baseOff + 516L), 1)[0];
+                    int physLen = new Span<int>(tbl + (nint)(baseOff + 528L), 1)[0];
+                    int oper = new Span<int>(tbl + (nint)(baseOff + 544L), 1)[0];
+                    if (physLen <= 0 || oper != 5) { continue; }
+                    if (ifType == 71) { return NetworkType.Wifi; }
+                    if (ifType == 6) { sawEthernet = true; }
+                }
+                if (sawEthernet) { return NetworkType.Ethernet; }
+                return NetworkType.None;
+            } finally {
+                NativeMemory.Free(tbl);
+            }
+        } finally {
+            NativeMemory.Free(sizePtr);
+        }
+    }
+    #endif
+
+    #if LINUX && !ANDROID && !OHOS
+    static NetworkType LinuxProbeNetwork() {
+        try {
+            if (!Directory.Exists("/sys/class/net")) { return NetworkType.Unknown; }
+            List<string> ifaces = Directory.GetDirectories("/sys/class/net");
+            bool sawEthernet = false;
+            for (int i = 0; i < ifaces.Count; i = i + 1) {
+                string dir = ifaces[i];
+                string name = Path.GetFileName(dir);
+                if (name == "lo") { continue; }
+                string statePath = dir + "/operstate";
+                if (!File.Exists(statePath)) { continue; }
+                string state = File.ReadAllText(statePath).Trim();
+                if (state != "up") { continue; }
+                if (Directory.Exists(dir + "/wireless")) {
+                    return NetworkType.Wifi;
+                }
+                string typePath = dir + "/type";
+                if (File.Exists(typePath) && File.ReadAllText(typePath).Trim() == "1") {
+                    sawEthernet = true;
+                }
+            }
+            if (sawEthernet) { return NetworkType.Ethernet; }
+            return NetworkType.None;
+        } catch (Exception _ex) {
+            return NetworkType.Unknown;
+        }
+    }
+    #endif
 }

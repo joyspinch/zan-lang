@@ -2,17 +2,7 @@ using System;
 
 namespace System.Linq;
 
-// 针对 <see cref="List&lt;T&gt;"/> 的零分配惰性求值流水线（Stream Pipeline）。
-// 核心特性：
-// 1. 零中间分配（Zero Allocation）：Where/Skip/Take/TakeWhile 不创建任何中间 List；
-// 2. 短路提前终止（Short-Circuiting）：Take(k)、First()、Any() 在满足条件时立即 break，不再扫描后续元素；
-// 3. 单趟遍历（Single Pass）：所有谓词在一个内联循环中流水线式过滤，CPU 缓存行高度亲和。
-// 示例：
-// .Where((User u) => u.age >= 18)
-// .Skip(20)
-// .Take(10)
-// .Select&lt;int&gt;((User u) => u.id)
-// .ToList();
+// 针对 List<T> 的零中间分配惰性求值流水线（Where/Skip/Take/TakeWhile 单趟过滤并在 Take/First/Any 处短路）。
 public class Stream<T> {
     public List<T> src;
     public List<Predicate<T>> filters;
@@ -80,37 +70,35 @@ public class Stream<T> {
         return this;
     }
 
+    private bool MatchesFilters(T item) {
+        for (int f = 0; f < this.filters.Count; f = f + 1) {
+            if (!this.filters[f](item)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // 使用 selector 变换元素类型并开启新子流（中间操作）。
     public Stream<R> Select<R>(Selector<T, R> selector) {
         List<R> mapped = new List<R>();
+        if (this.takeN == 0) { return new Stream<R>(mapped); }
         int skipped = 0;
         Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
-                break;
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesFilters(item)) { continue; }
+            if (seen != null) {
+                if (seen.ContainsKey(item)) { continue; }
+                seen[item] = true;
             }
-            bool pass = true;
-            for (int f = 0; f < this.filters.Count; f = f + 1) {
-                if (!this.filters[f](item)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                if (seen != null) {
-                    if (seen.ContainsKey(item)) { continue; }
-                    seen[item] = true;
-                }
-                if (skipped < this.skipN) {
-                    skipped = skipped + 1;
-                } else {
-                    mapped.Add(selector(item));
-                    if (this.takeN >= 0 && mapped.Count >= this.takeN) {
-                        break;
-                    }
-                }
+            if (skipped < this.skipN) {
+                skipped = skipped + 1;
+            } else {
+                mapped.Add(selector(item));
+                if (this.takeN >= 0 && mapped.Count >= this.takeN) { break; }
             }
         }
         return new Stream<R>(mapped);
@@ -118,7 +106,7 @@ public class Stream<T> {
 
     // ===== 终结操作（Terminal Operations） =====
 
-    // 物化为新的 List&lt;T&gt;（单趟遍历，按需提前终止）。
+    // 物化为新的 List<T>（单趟遍历，按需提前终止）。
     public List<T> ToList() {
         List<T> res = new List<T>();
         if (this.takeN == 0) { return res; }
@@ -128,35 +116,23 @@ public class Stream<T> {
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
-                break;
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesFilters(item)) { continue; }
+            if (seen != null) {
+                if (seen.ContainsKey(item)) { continue; }
+                seen[item] = true;
             }
-            bool pass = true;
-            for (int f = 0; f < this.filters.Count; f = f + 1) {
-                if (!this.filters[f](item)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                if (seen != null) {
-                    if (seen.ContainsKey(item)) { continue; }
-                    seen[item] = true;
-                }
-                if (skipped < this.skipN) {
-                    skipped = skipped + 1;
-                } else {
-                    res.Add(item);
-                    if (this.takeN >= 0 && res.Count >= this.takeN) {
-                        break;
-                    }
-                }
+            if (skipped < this.skipN) {
+                skipped = skipped + 1;
+            } else {
+                res.Add(item);
+                if (this.takeN >= 0 && res.Count >= this.takeN) { break; }
             }
         }
         return res;
     }
 
-    // 返回第一个匹配元素。匹配到立即退出循环（短路）。空序列抛异常。
+    // 返回第一个匹配元素（短路）。空序列抛异常。
     public T First() {
         List<T> r = this.Clone().Take(1).ToList();
         if (r.Count == 0) {
@@ -165,14 +141,14 @@ public class Stream<T> {
         return r[0];
     }
 
-    // 返回第一个匹配元素，无匹配时返回给定的默认值。匹配到立即退出循环（短路）。
+    // 返回第一个匹配元素，无匹配时返回默认值（短路）。
     public T FirstOrDefault(T dflt) {
         List<T> r = this.Clone().Take(1).ToList();
         if (r.Count > 0) { return r[0]; }
         return dflt;
     }
 
-    // 是否存在至少一个满足流过滤条件的元素（找到首个匹配项即短路退出）。
+    // 是否存在至少一个满足流过滤条件的元素（短路）。
     public bool Any() {
         List<T> r = this.Clone().Take(1).ToList();
         return r.Count > 0;
@@ -183,38 +159,27 @@ public class Stream<T> {
         return this.Clone().Where(pred).Any();
     }
 
-    // 流中是否所有满足现有过滤的元素均满足给定谓词（短路）。
+    // 流中是否所有满足现有过滤的元素均满足给定谓词（短路，尊重 Skip/Take）。
     public bool All(Predicate<T> pred) {
+        if (this.takeN == 0) { return true; }
         int skipped = 0;
+        int yielded = 0;
         Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
-                break;
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesFilters(item)) { continue; }
+            if (seen != null) {
+                if (seen.ContainsKey(item)) { continue; }
+                seen[item] = true;
             }
-            bool pass = true;
-            for (int f = 0; f < this.filters.Count; f = f + 1) {
-                if (!this.filters[f](item)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                if (seen != null) {
-                    if (seen.ContainsKey(item)) { continue; }
-                    seen[item] = true;
-                }
-                if (skipped < this.skipN) {
-                    skipped = skipped + 1;
-                } else {
-                    if (!pred(item)) {
-                        return false;
-                    }
-                    if (this.takeN >= 0) {
-                        // 计数控制
-                    }
-                }
+            if (skipped < this.skipN) {
+                skipped = skipped + 1;
+            } else {
+                if (!pred(item)) { return false; }
+                yielded = yielded + 1;
+                if (this.takeN >= 0 && yielded >= this.takeN) { break; }
             }
         }
         return true;
@@ -229,29 +194,17 @@ public class Stream<T> {
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
-                break;
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesFilters(item)) { continue; }
+            if (seen != null) {
+                if (seen.ContainsKey(item)) { continue; }
+                seen[item] = true;
             }
-            bool pass = true;
-            for (int f = 0; f < this.filters.Count; f = f + 1) {
-                if (!this.filters[f](item)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                if (seen != null) {
-                    if (seen.ContainsKey(item)) { continue; }
-                    seen[item] = true;
-                }
-                if (skipped < this.skipN) {
-                    skipped = skipped + 1;
-                } else {
-                    count = count + 1;
-                    if (this.takeN >= 0 && count >= this.takeN) {
-                        break;
-                    }
-                }
+            if (skipped < this.skipN) {
+                skipped = skipped + 1;
+            } else {
+                count = count + 1;
+                if (this.takeN >= 0 && count >= this.takeN) { break; }
             }
         }
         return count;
@@ -259,36 +212,25 @@ public class Stream<T> {
 
     // 遍历消费流中每一个有效元素。
     public void ForEach(Action<T> action) {
+        if (this.takeN == 0) { return; }
         int skipped = 0;
         int yielded = 0;
         Dict<T, bool> seen = this.distinct ? new Dict<T, bool>() : null;
 
         for (int i = 0; i < this.src.Count; i = i + 1) {
             T item = this.src[i];
-            if (this.takeWhilePred != null && !this.takeWhilePred(item)) {
-                break;
+            if (this.takeWhilePred != null && !this.takeWhilePred(item)) { break; }
+            if (!this.MatchesFilters(item)) { continue; }
+            if (seen != null) {
+                if (seen.ContainsKey(item)) { continue; }
+                seen[item] = true;
             }
-            bool pass = true;
-            for (int f = 0; f < this.filters.Count; f = f + 1) {
-                if (!this.filters[f](item)) {
-                    pass = false;
-                    break;
-                }
-            }
-            if (pass) {
-                if (seen != null) {
-                    if (seen.ContainsKey(item)) { continue; }
-                    seen[item] = true;
-                }
-                if (skipped < this.skipN) {
-                    skipped = skipped + 1;
-                } else {
-                    action(item);
-                    yielded = yielded + 1;
-                    if (this.takeN >= 0 && yielded >= this.takeN) {
-                        break;
-                    }
-                }
+            if (skipped < this.skipN) {
+                skipped = skipped + 1;
+            } else {
+                action(item);
+                yielded = yielded + 1;
+                if (this.takeN >= 0 && yielded >= this.takeN) { break; }
             }
         }
     }

@@ -32,28 +32,33 @@ public class DepartmentsController : AdminController {
             .WhereIf(sc.ByDept(), a => scoped.Contains(a.id))
             .WhereIf(sc.Mine(), a => a.id == myDept)
             .OrderBy(a => a.sortOrder).ToListAsync();
-        List<SysUser> users = await this.SysUser
-            .WhereIf(sc.ByDept(), a => scoped.Contains(a.departmentId))
-            .WhereIf(sc.Mine(), a => a.id == mine)
-            .ToListAsync();
+        IDbConnection db = this.Held();
+        List<int> deptIds = new List<int>();
+        for (int i = 0; i < rows.Count; i = i + 1) { deptIds.Add(rows[i].id); }
+        Dictionary<int, int> counts = await MemberCounts(db, deptIds, sc.Mine(), mine);
 
         /* 未选中取首部门，使名册旁不出现空面板。 */
         int pick = this.InInt("id", 0);
         if (pick == 0 && rows.Count > 0) { pick = rows[0].id; }
 
+        SysDepartment picked = null;
         List<StrMap> tree = d.AddList("tree");
         Rows.Project(rows, tree);
         for (int i = 0; i < rows.Count; i = i + 1) {
+            int id = rows[i].id;
+            int count = 0;
+            counts.TryGetValue(id, out count);
             tree[i].Set("indent", Indent(rows, rows[i]));
-            tree[i].Set("members",
-                Convert.ToString(Members(users, rows[i].id)));
-            if (rows[i].id == pick) { tree[i].Set("active", "active"); }
+            tree[i].Set("members", Convert.ToString(count));
+            if (id == pick) {
+                tree[i].Set("active", "active");
+                picked = rows[i];
+            }
         }
         d.Set("total", Convert.ToString(rows.Count));
         if (rows.Count == 0) { d.Set("empty", "1"); }
 
-        SysDepartment picked = await this.SysDepartment.ById(pick);
-        if (picked == null || !Listed(rows, pick)) {
+        if (picked == null) {
             this.Page(d); return;
         }
         d.Set("deptId", Convert.ToString(picked.id));
@@ -63,27 +68,38 @@ public class DepartmentsController : AdminController {
         d.Set("deptStatusText", Fmt.EnabledText(picked.status));
         d.Set("deptStatusClass", Fmt.EnabledClass(picked.status));
 
+        SelectQuery<SysUser> staffQuery = db.Select<SysUser>().WhereEq("departmentId", pick);
+        if (sc.Mine()) { staffQuery.WhereEq("id", mine); }
+        staffQuery.inner.OrderBySafe("id");
+        List<SysUser> staff = await staffQuery.ToListAsync();
+        List<SysUserRole> held = await StaffRoles(db, staff);
+
         /* 该部门借给其所有人的角色——账号能持无人为其分派的权利的原因。 */
-        List<SysRole> roles = await this.SysRole.ToListAsync();
-        List<SysDepartmentRole> lent = await this.SysDepartmentRole
-            .Where(a => a.departmentId == pick).ToListAsync();
+        SelectQuery<SysDepartmentRole> lentQuery = db.Select<SysDepartmentRole>().WhereEq("departmentId", pick);
+        lentQuery.inner.OrderBySafe("id");
+        List<SysDepartmentRole> lent = await lentQuery.ToListAsync();
+        Dictionary<int, string> roleNames = await RoleNames(db, lent, held);
         List<StrMap> lentRows = d.AddList("deptRoles");
         for (int i = 0; i < lent.Count; i = i + 1) {
             StrMap row = new StrMap();
-            row.Set("name", RoleName(roles, lent[i].roleId));
+            row.Set("name", roleNames[lent[i].roleId]);
             lentRows.Add(row);
         }
 
-        List<SysUserRole> held = await this.SysUserRole.ToListAsync();
-        List<SysUser> staff = new List<SysUser>();
-        for (int i = 0; i < users.Count; i = i + 1) {
-            if (users[i].departmentId == pick) { staff.Add(users[i]); }
+        Dictionary<int, string> memberRoles = new Dictionary<int, string>();
+        for (int i = 0; i < held.Count; i = i + 1) {
+            SysUserRole link = held[i];
+            string names = "";
+            memberRoles.TryGetValue(link.userId, out names);
+            if (names.Length > 0) { names = names + "、"; }
+            memberRoles[link.userId] = names + roleNames[link.roleId];
         }
         List<StrMap> members = d.AddList("members");
         Rows.Project(staff, members);
         for (int i = 0; i < staff.Count; i = i + 1) {
-            members[i].Set("roles",
-                RolesOf(roles, held, staff[i].id));
+            string names = "";
+            memberRoles.TryGetValue(staff[i].id, out names);
+            members[i].Set("roles", names.Length > 0 ? names : "—");
         }
         d.Set("memberCount", Convert.ToString(members.Count));
         if (members.Count == 0) { d.Set("noMembers", "1"); }
@@ -115,7 +131,7 @@ public class DepartmentsController : AdminController {
             if (dept.status == 1) { d.Set("status1", "selected"); }
             else { d.Set("status0", "selected"); }
         }
-        /* 上级选择项为树可见部分，故部门不能被归档到不可读的位置。 */
+        /* 上级选择项为树可见部分，故部门不能被归档到调用方自身不可读的位置。 */
         DataScope sc = await this.Scope();
         List<int> scoped = sc.Depts();
         int myDept = (await this.Admin()).departmentId;
@@ -154,8 +170,9 @@ public class DepartmentsController : AdminController {
         }
         await this.Parented(parentId);
         if (id > 0) {
-            SysDepartment _t = await this.Reach(id);
+            SysDepartment dept = await this.Reach(id);
             int n = await this.SysDepartment.UpdateBasic(id, name, code, parentId, sortOrder, status);
+            if (n > 0 && dept.parentId != parentId) { AuthUser.ForgetAll(); }
             await this.Note("编辑部门", name, n > 0, "");
             this.Saved("部门已保存");
             return;
@@ -167,7 +184,9 @@ public class DepartmentsController : AdminController {
         dept.sortOrder = sortOrder;
         dept.status = status;
         dept.leaderUserId = 0;
+        dept.createdAt = WebApp.NowSeconds();
         int newId = await this.SysDepartment.Insert(dept).ExecuteIdentityAsync();
+        if (newId > 0) { AuthUser.ForgetAll(); }
         await this.Note("新增部门", name, newId > 0, "");
         this.Saved("部门已创建");
     }
@@ -204,6 +223,7 @@ public class DepartmentsController : AdminController {
         int id = this.InInt("id", 0);
         SysDepartment dept = await this.Reach(id);
         string picked = this.In("roleIds");
+        if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
         int _cleared = await this.SysDepartmentRole.Delete()
             .Where(a => a.departmentId == id).ExecuteAffrowsAsync();
         List<SysRole> roles = await this.SysRole.ToListAsync();
@@ -213,9 +233,11 @@ public class DepartmentsController : AdminController {
             SysDepartmentRole link = new SysDepartmentRole();
             link.departmentId = id;
             link.roleId = roles[i].id;
-            int _n = await this.SysDepartmentRole.Insert(link).ExecuteIdentityAsync();
+            int inserted = await this.SysDepartmentRole.Insert(link).ExecuteAffrowsAsync();
+            if (inserted != 1) { throw new Exception("department role was not saved"); }
             granted = granted + 1;
         }
+        await this.Commit();
         /* 部门内所有人权利刚变更，授权缓存按账号键，故整体清除。 */
         AuthUser.ForgetAll();
         await this.Note("部门角色", dept.name, true,
@@ -269,12 +291,60 @@ public class DepartmentsController : AdminController {
         SysDepartment _p = await this.Reach(parentId);
     }
 
-    /* 左侧 scoped 树是否含该 id，使右侧名册无法为该树未提供的部门打开。 */
-    private static bool Listed(List<SysDepartment> rows, int id) {
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            if (rows[i].id == id) { return true; }
+    /* 预留额外过滤参数，并兼容单条语句绑定值较少的驱动。 */
+    private static const int ListBatchSize = 900;
+
+    private static List<int> IdBatch(List<int> ids, int start) {
+        List<int> batch = new List<int>();
+        for (int i = start; i < ids.Count && batch.Count < ListBatchSize; i = i + 1) {
+            batch.Add(ids[i]);
         }
-        return false;
+        return batch;
+    }
+
+    private static async Dictionary<int, int> MemberCounts(IDbConnection db, List<int> ids, bool self, int mine) {
+        Dictionary<int, int> counts = new Dictionary<int, int>();
+        for (int start = 0; start < ids.Count; start = start + ListBatchSize) {
+            Select query = db.Select<SysUser>().inner;
+            query.WhereIn("departmentId", IdBatch(ids, start));
+            if (self) { query.WhereEq("id", mine); }
+            string key = query.RequireCol("departmentId");
+            query.GroupBy(key);
+            DbResult groups = await query.AggRAsync(key + ", COUNT(" + key + ")");
+            if (groups == null) { continue; }
+            for (int i = 0; i < groups.RowCount(); i = i + 1) {
+                counts[groups.GetInt(i, 0)] = groups.GetInt(i, 1);
+            }
+        }
+        return counts;
+    }
+
+    private static async List<SysUserRole> StaffRoles(IDbConnection db, List<SysUser> staff) {
+        List<int> ids = new List<int>();
+        for (int i = 0; i < staff.Count; i = i + 1) { ids.Add(staff[i].id); }
+        List<SysUserRole> held = new List<SysUserRole>();
+        for (int start = 0; start < ids.Count; start = start + ListBatchSize) {
+            SelectQuery<SysUserRole> query = db.Select<SysUserRole>();
+            query.inner.WhereIn("userId", IdBatch(ids, start));
+            query.inner.OrderBySafe("id");
+            List<SysUserRole> batch = await query.ToListAsync();
+            held.AddRange(batch);
+        }
+        return held;
+    }
+
+    private static async Dictionary<int, string> RoleNames(IDbConnection db, List<SysDepartmentRole> lent, List<SysUserRole> held) {
+        Dictionary<int, string> names = new Dictionary<int, string>();
+        for (int i = 0; i < lent.Count; i = i + 1) { names[lent[i].roleId] = "—"; }
+        for (int i = 0; i < held.Count; i = i + 1) { names[held[i].roleId] = "—"; }
+        List<int> ids = names.Keys;
+        for (int start = 0; start < ids.Count; start = start + ListBatchSize) {
+            SelectQuery<SysRole> query = db.Select<SysRole>();
+            query.inner.WhereIn("id", IdBatch(ids, start));
+            List<SysRole> roles = await query.ToListAsync();
+            for (int i = 0; i < roles.Count; i = i + 1) { names[roles[i].id] = roles[i].name; }
+        }
+        return names;
     }
 
     /* 每层两个全角空格，使平表仍读作树。 */
@@ -303,33 +373,5 @@ public class DepartmentsController : AdminController {
         }
         return "—";
     }
-
-    private static string RoleName(List<SysRole> roles, int id) {
-        for (int i = 0; i < roles.Count; i = i + 1) {
-            if (roles[i].id == id) { return roles[i].name; }
-        }
-        return "—";
-    }
-
-    /* 账号本人持有的角色，作一个标签。 */
-    private static string RolesOf(List<SysRole> roles, List<SysUserRole> held, int userId) {
-        string s = "";
-        for (int i = 0; i < held.Count; i = i + 1) {
-            if (held[i].userId != userId) { continue; }
-            if (s.Length > 0) { s = s + "、"; }
-            s = s + RoleName(roles, held[i].roleId);
-        }
-        if (s.Length == 0) { return "—"; }
-        return s;
-    }
-
-    private static int Members(List<SysUser> users, int deptId) {
-        int n = 0;
-        for (int i = 0; i < users.Count; i = i + 1) {
-            if (users[i].departmentId == deptId) { n = n + 1; }
-        }
-        return n;
-    }
-
 
 }

@@ -5,6 +5,12 @@ namespace System.Json;
 
 // 工业级 JSON 统一序列化与反序列化入口门面。
 // 提供类似 C# / Go / Rust / Java 风格的标准顶层静态接口。
+//
+// 需要修改 JSON 树时，Deserialize 和 DeserializeLenient 返回 JsonValue。
+// 只读查询可用 DeserializeDoc。仅在回调内读取时，JsonDoc.ParseScoped
+// 可以复用解析工作区。
+// Json.Deserialize<T> 从 JsonDoc 绑定强类型对象，目标类型或其成员为
+// JsonValue 时会构建对应的树。
 public class JsonSerializer {
     // 将 JsonValue 序列化为紧凑 JSON 文本。
     public static string Serialize(JsonValue val) {
@@ -55,19 +61,22 @@ public class Json {
 
     public static string Serialize<T>(T obj) {
         if (obj == null) { return "null"; }
-        TypeInfo ti = typeof(T);
-        if (Json.IsJsonValueType(ti.Name) || Json.IsJsonValueType(ti.FullName)) {
-            return ((JsonValue)(object)obj).ToJson();
-        }
         StringBuilder sb = new StringBuilder();
-        if (Json.IsListType(ti.Name)) {
-            Json.SerializeList(sb, ti, (object)obj);
-        } else if (Json.IsDictType(ti.Name)) {
-            Json.SerializeDict(sb, ti, (object)obj);
-        } else {
-            Json.SerializeObject(sb, ti, (object)obj);
-        }
+        Json.WriteTo(sb, typeof(T), (object)obj);
         return sb.ToString();
+    }
+
+    internal static void WriteTo(StringBuilder sb, TypeInfo ti, object obj) {
+        if (obj == null) { sb.Append("null"); return; }
+        if (Json.IsJsonValueType(ti.Name) || Json.IsJsonValueType(ti.FullName)) {
+            ((JsonValue)obj).WriteTo(sb);
+        } else if (Json.IsListType(ti.Name)) {
+            Json.SerializeList(sb, ti, obj);
+        } else if (Json.IsDictType(ti.Name)) {
+            Json.SerializeDict(sb, ti, obj);
+        } else {
+            Json.SerializeObject(sb, ti, obj);
+        }
     }
 
     public static T Deserialize<T>(string json) {
@@ -79,10 +88,14 @@ public class Json {
             JsonValue jv = JsonValue.Parse(json);
             return (T)(object)jv;
         }
-        JsonDoc doc = JsonDoc.Parse(json);
+        return JsonDoc.ParseScoped<T>(json, (doc) => Json.Bind<T>(doc));
+    }
+
+    private static T Bind<T>(JsonDoc doc) {
         if (doc == null || doc.slotCount == 0) {
             throw new Exception("Invalid JSON root");
         }
+        TypeInfo ti = typeof(T);
         int root = doc.root;
         if (Json.IsListType(ti.Name)) {
             object list = Json.DeserializeList(doc, root, ti);
@@ -99,28 +112,22 @@ public class Json {
     public static void SerializeObject(StringBuilder sb, TypeInfo ti, object obj) {
         if (obj == null) { sb.Append("null"); return; }
         sb.Append("{");
-        int count = ti.FieldCount;
-        int written = 0;
-        for (int i = 0; i < count; i = i + 1) {
-            FieldMapping mapping = FieldMapping.Read(ti, i);
-            if (mapping.Ignored) { continue; }
-            string fname = ti.GetFieldName(i);
-            string ftype = ti.GetFieldType(i);
-            TypeInfo fti = ti.GetFieldTypeInfo(i);
-            string jsonKey = mapping.Name;
-            if (jsonKey.Length == 0) { jsonKey = fname; }
-            if (written > 0) { sb.Append(","); }
-            sb.Append("\"");
-            sb.Append(jsonKey);
-            sb.Append("\":");
-            Json.SerializeMember(sb, fti, ftype, obj, fname);
-            written = written + 1;
+        List<JsonMemberMapping> fields = JsonTypeMapping.Get(ti).Fields;
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            JsonMemberMapping field = fields[i];
+            if (i > 0) { sb.Append(","); }
+            sb.Append(field.OutputName);
+            Json.WriteMember(sb, field.Type, field.Kind, obj, field.FieldName);
         }
         sb.Append("}");
     }
 
     public static void SerializeMember(StringBuilder sb, TypeInfo fti, string ftype, object target, string fname) {
-        if (ftype == "string") {
+        Json.WriteMember(sb, fti, JsonMemberMapping.Classify(ftype, fti), target, fname);
+    }
+
+    private static void WriteMember(StringBuilder sb, TypeInfo fti, JsonMemberKind kind, object target, string fname) {
+        if (kind == JsonMemberKind.String) {
             string s = target.GetFieldString(fname);
             if (s == null) { sb.Append("null"); }
             else {
@@ -128,24 +135,22 @@ public class Json {
                 Encoding.JsonEscapeTo(sb, s);
                 sb.Append("\"");
             }
-        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || ftype == "uint" || ftype == "ushort" || ftype == "sbyte") {
-            sb.Append(Convert.ToString(target.GetFieldInt(fname)));
-        } else if (ftype == "long" || ftype == "ulong") {
-            sb.Append(Convert.ToString(target.GetFieldLong(fname)));
-        } else if (ftype == "double" || ftype == "float") {
+        } else if (kind == JsonMemberKind.Int || kind == JsonMemberKind.UnsignedInt) {
+            sb.Append(target.GetFieldInt(fname));
+        } else if (kind == JsonMemberKind.Long || kind == JsonMemberKind.UnsignedLong) {
+            sb.Append(target.GetFieldLong(fname));
+        } else if (kind == JsonMemberKind.Double) {
             sb.Append(Convert.ToString(target.GetFieldDouble(fname)));
-        } else if (ftype == "bool") {
+        } else if (kind == JsonMemberKind.Bool) {
             sb.Append(target.GetFieldBool(fname) ? "true" : "false");
-        } else if (fti.Kind == "enum") {
-            sb.Append(Convert.ToString(target.GetFieldInt(fname)));
-        } else if (Json.IsJsonValueType(ftype)) {
+        } else if (kind == JsonMemberKind.Value) {
             object jvo = target.GetFieldObject(fname);
             if (jvo == null) { sb.Append("null"); }
-            else { sb.Append(((JsonValue)jvo).ToJson()); }
-        } else if (Json.IsListType(ftype)) {
+            else { ((JsonValue)jvo).WriteTo(sb); }
+        } else if (kind == JsonMemberKind.List) {
             object listObj = target.GetFieldObject(fname);
             Json.SerializeList(sb, fti, listObj);
-        } else if (Json.IsDictType(ftype)) {
+        } else if (kind == JsonMemberKind.Dictionary) {
             object dictObj = target.GetFieldObject(fname);
             Json.SerializeDict(sb, fti, dictObj);
         } else {
@@ -198,13 +203,13 @@ public class Json {
             int count = listObj.InvokeInt("Count");
             for (int j = 0; j < count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                sb.Append(Convert.ToString(listObj.InvokeInt("Get", j)));
+                sb.Append(listObj.InvokeInt("Get", j));
             }
         } else if (elemName == "long") {
             List<long> list = (List<long>)listObj;
             for (int j = 0; j < list.Count; j = j + 1) {
                 if (j > 0) { sb.Append(","); }
-                sb.Append(Convert.ToString(list[j]));
+                sb.Append(list[j]);
             }
         } else if (elemName == "double" || elemName == "float") {
             int count = listObj.InvokeInt("Count");
@@ -224,7 +229,7 @@ public class Json {
                 if (j > 0) { sb.Append(","); }
                 object item = listObj.InvokeObject("Get", j);
                 if (item == null) { sb.Append("null"); }
-                else { sb.Append(((JsonValue)item).ToJson()); }
+                else { ((JsonValue)item).WriteTo(sb); }
             }
         } else if (Json.IsDictType(elemName)) {
             int count = listObj.InvokeInt("Count");
@@ -282,7 +287,7 @@ public class Json {
                 sb.Append("\"");
                 Encoding.JsonEscapeTo(sb, k);
                 sb.Append("\":");
-                sb.Append(Convert.ToString(d[k]));
+                sb.Append(d[k]);
             }
         } else if (valName == "long") {
             Dict<string, long> d = (Dict<string, long>)dictObj;
@@ -293,7 +298,7 @@ public class Json {
                 sb.Append("\"");
                 Encoding.JsonEscapeTo(sb, k);
                 sb.Append("\":");
-                sb.Append(Convert.ToString(d[k]));
+                sb.Append(d[k]);
             }
         } else if (valName == "double" || valName == "float") {
             Dict<string, double> d = (Dict<string, double>)dictObj;
@@ -328,7 +333,7 @@ public class Json {
                 sb.Append("\":");
                 object v = d[k];
                 if (v == null) { sb.Append("null"); }
-                else { sb.Append(((JsonValue)v).ToJson()); }
+                else { ((JsonValue)v).WriteTo(sb); }
             }
         } else {
             Dict<string, object> d = (Dict<string, object>)dictObj;
@@ -355,67 +360,74 @@ public class Json {
     }
 
     public static object DeserializeObject(JsonDoc doc, int at, TypeInfo ti) {
+        JsonTypeMapping mapping = null;
+        return Json.BindObject(doc, at, ti, ref mapping);
+    }
+
+    private static object BindObject(JsonDoc doc, int at, TypeInfo ti, ref JsonTypeMapping mapping) {
         if (at < 0 || at >= doc.slotCount || doc.KindAt(at) != 5) {
             throw new Exception("JSON root must be an object");
         }
         object obj = ti.CreateInstance();
-        int count = ti.FieldCount;
-        for (int i = 0; i < count; i = i + 1) {
-            FieldMapping mapping = FieldMapping.Read(ti, i);
-            if (mapping.Ignored) { continue; }
-            string fname = ti.GetFieldName(i);
-            string ftype = ti.GetFieldType(i);
-            TypeInfo fti = ti.GetFieldTypeInfo(i);
-            string jsonKey = mapping.Name;
-            if (jsonKey.Length == 0) { jsonKey = fname; }
-            int fv = doc.Get(at, jsonKey);
-            if (mapping.Required && fv < 0) {
-                throw new Exception("Missing required JSON property: " + jsonKey);
-            }
+        if (mapping == null) { mapping = JsonTypeMapping.Get(ti); }
+        List<JsonMemberMapping> fields = mapping.Fields;
+        int[] matches = mapping.MatchProperties(doc, at);
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            JsonMemberMapping field = fields[i];
+            int fv = matches == null ? doc.Get(at, field.JsonName) : matches[i] - 1;
             if (fv < 0) {
-                string dflt = mapping.DefaultValue;
-                if (dflt.Length > 0) {
-                    Json.ApplyFieldDefault(obj, fname, ftype, fti, dflt);
+                if (field.Required) {
+                    throw new Exception("Missing required JSON property: " + field.JsonName);
                 }
-                continue;
+                if (field.DefaultValue.Length > 0) {
+                    Json.SetDefault(obj, field.FieldName, field.Kind, field.DefaultValue);
+                }
+            } else if (doc.KindAt(fv) != 0) {
+                Json.ReadField(obj, field.FieldName, field.Kind, field.Type, doc, fv);
             }
-            if (doc.KindAt(fv) == 0) { continue; }
-            Json.DeserializeField(obj, fname, ftype, fti, doc, fv);
         }
         return obj;
     }
 
     public static void ApplyFieldDefault(object obj, string fname, string ftype, TypeInfo fti, string dflt) {
-        if (ftype == "string") {
+        Json.SetDefault(obj, fname, JsonMemberMapping.Classify(ftype, fti), dflt);
+    }
+
+    private static void SetDefault(object obj, string fname, JsonMemberKind kind, string dflt) {
+        if (kind == JsonMemberKind.String) {
             obj.SetFieldString(fname, dflt);
-        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || fti.Kind == "enum") {
+        } else if (kind == JsonMemberKind.Int) {
             obj.SetFieldInt(fname, Convert.ToInt32(dflt));
-        } else if (ftype == "long") {
+        } else if (kind == JsonMemberKind.Long) {
             obj.SetFieldLong(fname, Convert.ToInt64(dflt));
-        } else if (ftype == "double" || ftype == "float") {
+        } else if (kind == JsonMemberKind.Double) {
             obj.SetFieldDouble(fname, Convert.ToDouble(dflt));
-        } else if (ftype == "bool") {
+        } else if (kind == JsonMemberKind.Bool) {
             obj.SetFieldBool(fname, dflt == "true" || dflt == "1");
         }
     }
 
     public static void DeserializeField(object obj, string fname, string ftype, TypeInfo fti, JsonDoc doc, int fv) {
-        if (ftype == "string") {
+        Json.ReadField(obj, fname, JsonMemberMapping.Classify(ftype, fti), fti, doc, fv);
+    }
+
+    private static void ReadField(object obj, string fname, JsonMemberKind kind, TypeInfo fti, JsonDoc doc, int fv) {
+        if (kind == JsonMemberKind.String) {
             obj.SetFieldString(fname, doc.StrAt(fv, ""));
-        } else if (ftype == "int" || ftype == "short" || ftype == "byte" || fti.Kind == "enum") {
+        } else if (kind == JsonMemberKind.Int) {
             obj.SetFieldInt(fname, doc.IntAt(fv, 0));
-        } else if (ftype == "long") {
+        } else if (kind == JsonMemberKind.Long) {
             obj.SetFieldLong(fname, doc.LongAt(fv, 0L));
-        } else if (ftype == "double" || ftype == "float") {
+        } else if (kind == JsonMemberKind.Double) {
             obj.SetFieldDouble(fname, doc.DoubleAt(fv, 0.0));
-        } else if (ftype == "bool") {
+        } else if (kind == JsonMemberKind.Bool) {
             obj.SetFieldBool(fname, doc.BoolAt(fv, false));
-        } else if (Json.IsJsonValueType(ftype)) {
+        } else if (kind == JsonMemberKind.Value) {
             obj.SetFieldObject(fname, (object)JsonValue.FromDoc(doc, fv));
-        } else if (Json.IsListType(ftype)) {
+        } else if (kind == JsonMemberKind.List) {
             object list = Json.DeserializeList(doc, fv, fti);
             obj.SetFieldObject(fname, list);
-        } else if (Json.IsDictType(ftype)) {
+        } else if (kind == JsonMemberKind.Dictionary) {
             object dict = Json.DeserializeDict(doc, fv, fti);
             obj.SetFieldObject(fname, dict);
         } else {
@@ -526,24 +538,41 @@ public class Json {
         TypeInfo elemTi = listTi;
         if (listTi.TypeArgCount > 0) { elemTi = listTi.GetTypeArg(0); }
         if (at >= 0 && at < doc.slotCount) {
+            string elemName = elemTi.Name;
+            string elemKind = elemTi.Kind;
+            JsonTypeMapping mapping = null;
             if (doc.KindAt(at) == 4) {
                 int count = doc.Count(at);
                 int child = doc.FirstChild(at);
+                if (elemName == "long") {
+                    List<long> longs = list as List<long>;
+                    if (longs != null) {
+                        longs.Reserve(count);
+                        for (int i = 0; i < count; i++) {
+                            longs.Add(doc.LongAt(child, 0L));
+                            child = doc.NextSibling(child);
+                        }
+                        return list;
+                    }
+                }
                 for (int i = 0; i < count; i = i + 1) {
-                    Json.DeserializeListItem(list, elemTi, doc, child);
+                    Json.BindListItem(list, elemTi, elemName, elemKind, doc, child, ref mapping);
                     child = doc.NextSibling(child);
                 }
-            } else if (!Json.IsListType(elemTi.Name)) {
+            } else if (!Json.IsListType(elemName)) {
                 // Preserve the existing lenient scalar/object-to-single-item behavior.
-                Json.DeserializeListItem(list, elemTi, doc, at);
+                Json.BindListItem(list, elemTi, elemName, elemKind, doc, at, ref mapping);
             }
         }
         return list;
     }
 
     public static void DeserializeListItem(object list, TypeInfo elemTi, JsonDoc doc, int at) {
-        string elemName = elemTi.Name;
-        string elemKind = elemTi.Kind;
+        JsonTypeMapping mapping = null;
+        Json.BindListItem(list, elemTi, elemTi.Name, elemTi.Kind, doc, at, ref mapping);
+    }
+
+    private static void BindListItem(object list, TypeInfo elemTi, string elemName, string elemKind, JsonDoc doc, int at, ref JsonTypeMapping mapping) {
         bool added = false;
         if (elemName == "int" || elemKind == "enum") {
             added = list.Invoke("Add", doc.IntAt(at, 0));
@@ -571,7 +600,7 @@ public class Json {
             if (Json.IsDictType(elemName)) {
                 added = list.Invoke("Add", Json.DeserializeDict(doc, at, elemTi));
             } else {
-                added = list.Invoke("Add", Json.DeserializeObject(doc, at, elemTi));
+                added = list.Invoke("Add", Json.BindObject(doc, at, elemTi, ref mapping));
             }
         } else {
             return;

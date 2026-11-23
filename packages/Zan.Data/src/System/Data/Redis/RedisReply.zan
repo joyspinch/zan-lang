@@ -3,11 +3,8 @@ using System.Collections.Generic;
 
 namespace System.Data.Redis;
 
-// 一条已解析的 RESP（REdis Serialization Protocol）回复。
-// Redis 回复自带类型信息；<see cref=\"kind\"/> 指明值在哪个字段中：
-// 携带值：
-// <see cref=\"len\"/> 是 BULK 负载的真实字节长度；当值可能含
-// NUL 字节时，用它代替 <c>str.Length</c>（二进制安全）。
+// 已解析的 RESP 回复：kind 标识类别（STR/ERROR/INT/BULK/NIL/ARRAY）；
+// BULK 负载真实字节长度存 len，含 NUL 字节时以 len 为准（二进制安全）。
 public class RedisReply {
     public static int STR   = 1;
     public static int ERROR = 2;
@@ -37,7 +34,7 @@ public class RedisReply {
         return this.kind == RedisReply.NIL;
     }
 
-    // 当回复为服务器错误（<c>-ERR ...</c>）时为 true。
+    // 当回复为服务器错误（-ERR ...）时为 true。
     public bool IsError() {
         return this.kind == RedisReply.ERROR;
     }
@@ -45,6 +42,14 @@ public class RedisReply {
     // 当回复为简单字符串或 bulk 字符串时为 true。
     public bool IsString() {
         return this.kind == RedisReply.STR || this.kind == RedisReply.BULK;
+    }
+
+    private bool IsNonEmptyString() {
+        return this.IsString() && this.len > 0;
+    }
+
+    private bool IsArrayReady() {
+        return this.kind == RedisReply.ARRAY && this.items != null;
     }
 
     // 返回原始字节数组。二进制安全，即使包含 NUL 字节也不会被截断。
@@ -74,8 +79,7 @@ public class RedisReply {
         if (this.kind == RedisReply.INT) {
             return this.integer;
         }
-        if ((this.kind == RedisReply.STR || this.kind == RedisReply.BULK) &&
-            this.len > 0) {
+        if (this.IsNonEmptyString()) {
             return Convert.ToInt(this.str);
         }
         return 0;
@@ -86,8 +90,7 @@ public class RedisReply {
         if (this.kind == RedisReply.INT) {
             return this.integer64;
         }
-        if ((this.kind == RedisReply.STR || this.kind == RedisReply.BULK) &&
-            this.len > 0) {
+        if (this.IsNonEmptyString()) {
             return Convert.ToInt64(this.str);
         }
         return 0;
@@ -98,8 +101,7 @@ public class RedisReply {
         if (this.kind == RedisReply.INT) {
             return (double)this.integer64;
         }
-        if ((this.kind == RedisReply.STR || this.kind == RedisReply.BULK) &&
-            this.len > 0) {
+        if (this.IsNonEmptyString()) {
             return Convert.ToDouble(this.str);
         }
         return 0.0;
@@ -110,7 +112,7 @@ public class RedisReply {
         if (this.kind == RedisReply.INT) {
             return this.integer64 != 0;
         }
-        if (this.kind == RedisReply.STR || this.kind == RedisReply.BULK) {
+        if (this.IsString()) {
             string s = this.str;
             return s == "OK" || s == "1" || s == "true" || s == "PONG";
         }
@@ -120,14 +122,9 @@ public class RedisReply {
     // ARRAY 回复转为字符串列表（nil 元素视为空字符串）。
     public List<string> AsListString() {
         List<string> res = new List<string>();
-        if (this.kind == RedisReply.ARRAY && this.items != null) {
+        if (this.IsArrayReady()) {
             for (int i = 0; i < this.items.Count; i = i + 1) {
-                RedisReply item = this.items[i];
-                if (item.IsNil()) {
-                    res.Add("");
-                } else {
-                    res.Add(item.AsString());
-                }
+                res.Add(this.items[i].AsString());
             }
         }
         return res;
@@ -136,12 +133,10 @@ public class RedisReply {
     // ARRAY 回复转为字典（成对键值，如 HGETALL 返回的 field, val 序列）。
     public Dictionary<string, string> AsDictionary() {
         Dictionary<string, string> dict = new Dictionary<string, string>();
-        if (this.kind == RedisReply.ARRAY && this.items != null) {
+        if (this.IsArrayReady()) {
             int n = this.items.Count;
             for (int i = 0; i + 1 < n; i = i + 2) {
-                string k = this.items[i].AsString();
-                string v = this.items[i + 1].AsString();
-                dict.Add(k, v);
+                dict.Add(this.items[i].AsString(), this.items[i + 1].AsString());
             }
         }
         return dict;
@@ -150,12 +145,10 @@ public class RedisReply {
     // ARRAY 回复转为有序集合成员列表（成对的 member, score 序列）。
     public List<ZMember> AsZMemberList() {
         List<ZMember> res = new List<ZMember>();
-        if (this.kind == RedisReply.ARRAY && this.items != null) {
+        if (this.IsArrayReady()) {
             int n = this.items.Count;
             for (int i = 0; i + 1 < n; i = i + 2) {
-                string m = this.items[i].AsString();
-                double sc = this.items[i + 1].AsDouble();
-                res.Add(new ZMember(m, sc));
+                res.Add(new ZMember(this.items[i].AsString(), this.items[i + 1].AsDouble()));
             }
         }
         return res;
@@ -163,13 +156,13 @@ public class RedisReply {
 
     // ARRAY 回复的元素数量（否则为 0）。
     public int Count() {
-        if (this.kind == RedisReply.ARRAY && this.items != null) {
+        if (this.IsArrayReady()) {
             return this.items.Count;
         }
         return 0;
     }
 
-    // ARRAY 回复中下标为 <paramref name="i"/> 的元素。
+    // ARRAY 回复中下标为 i 的元素。
     public RedisReply At(int i) {
         return this.items[i];
     }

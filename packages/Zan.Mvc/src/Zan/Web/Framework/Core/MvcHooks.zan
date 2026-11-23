@@ -1,0 +1,154 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Web;
+using Zan.Web.Model;
+using Zan.Web.Security;
+
+namespace Zan.Web.Core;
+
+/* 登录校验扩展点：密码核验通过、签发令牌前执行。返回 "" 表示放行，非空文本表示拒绝登录。 */
+public async delegate string LoginGuardFn(IDbConnection db, SysUser user);
+
+/* 登录成功事件扩展点：令牌签发前/后通知扩展模块（如更新活跃状态、租户会话等）。 */
+public async delegate void LoginEventFn(IDbConnection db, SysUser user);
+
+/* 数据范围扩展点：在基础组织架构范围（DataScope）解析完成后执行，可用于附加租户/业务标签或收窄可见范围。 */
+public async delegate void ScopeResolveFn(IDbConnection db, SysUser user, DataScope scope);
+
+/* 菜单扩展点：菜单树收集完成、排序输出前执行，可用于动态过滤、改写或追加菜单项。 */
+public async delegate void MenuHookFn(IDbConnection db, string uid, string activePath, List<MenuNode> nodes);
+
+/* 操作审计扩展点：操作日志入库前执行。返回 false 可拦截默认入库（例如改由异步总线投递）。 */
+public async delegate bool AuditHookFn(IDbConnection db, SysOperationLog entry);
+
+/* 登录令牌声明扩展点：密码校验通过、签发加密 Cookie/Bearer 令牌前执行，可注入 activeCompanyId / tenantId 等签名声明。 */
+public async delegate void TokenClaimsFn(IDbConnection db, SysUser user, Dictionary<string, string> claims);
+
+/* 资源数据域解析扩展点：在基础 sys_user_scope 解析完成后执行，可用于按当前租户/公司动态收窄或计算 RowScope。 */
+public async delegate void GrantResolveFn(IDbConnection db, int userId, string key, DataScope dept, RowScope scope);
+
+/* 仪表盘摘要扩展点：向 /api/admin/summary 与后台仪表盘注入业务自定义 KPI 指标。 */
+public async delegate void SummaryHookFn(IDbConnection db, DataScope scope, Dictionary<string, string> metrics);
+
+/* Zan.Mvc 可扩展钩子注册中心：让多租户、SaaS 策略、自定义认证与菜单扩展留在应用/扩展层，保持核心框架精炼。 */
+public class MvcHooks {
+    private static List<LoginGuardFn> loginGuards = new List<LoginGuardFn>();
+    private static List<LoginEventFn> loginEvents = new List<LoginEventFn>();
+    private static List<ScopeResolveFn> scopeResolvers = new List<ScopeResolveFn>();
+    private static List<MenuHookFn> menuHooks = new List<MenuHookFn>();
+    private static List<AuditHookFn> auditHooks = new List<AuditHookFn>();
+    private static List<TokenClaimsFn> tokenClaimHooks = new List<TokenClaimsFn>();
+    private static List<GrantResolveFn> grantResolvers = new List<GrantResolveFn>();
+    private static List<SummaryHookFn> summaryHooks = new List<SummaryHookFn>();
+
+    public static void OnLoginCheck(LoginGuardFn fn) {
+        if (fn != null) { loginGuards.Add(fn); }
+    }
+
+    public static void OnLogin(LoginEventFn fn) {
+        if (fn != null) { loginEvents.Add(fn); }
+    }
+
+    public static void OnScopeResolve(ScopeResolveFn fn) {
+        if (fn != null) { scopeResolvers.Add(fn); }
+    }
+
+    public static void OnMenu(MenuHookFn fn) {
+        if (fn != null) { menuHooks.Add(fn); }
+    }
+
+    public static void OnAudit(AuditHookFn fn) {
+        if (fn != null) { auditHooks.Add(fn); }
+    }
+
+    public static void OnTokenClaims(TokenClaimsFn fn) {
+        if (fn != null) { tokenClaimHooks.Add(fn); }
+    }
+
+    public static void OnGrantResolve(GrantResolveFn fn) {
+        if (fn != null) { grantResolvers.Add(fn); }
+    }
+
+    public static void OnSummary(SummaryHookFn fn) {
+        if (fn != null) { summaryHooks.Add(fn); }
+    }
+
+    public static void Clear() {
+        loginGuards.Clear();
+        loginEvents.Clear();
+        scopeResolvers.Clear();
+        menuHooks.Clear();
+        auditHooks.Clear();
+        tokenClaimHooks.Clear();
+        grantResolvers.Clear();
+        summaryHooks.Clear();
+    }
+
+    public static bool HasLoginGuards() { return loginGuards.Count > 0; }
+    public static bool HasLoginEvents() { return loginEvents.Count > 0; }
+    public static bool HasScopeResolvers() { return scopeResolvers.Count > 0; }
+    public static bool HasMenuHooks() { return menuHooks.Count > 0; }
+    public static bool HasAuditHooks() { return auditHooks.Count > 0; }
+    public static bool HasTokenClaimHooks() { return tokenClaimHooks.Count > 0; }
+    public static bool HasGrantResolvers() { return grantResolvers.Count > 0; }
+    public static bool HasSummaryHooks() { return summaryHooks.Count > 0; }
+
+    public static async string RunLoginGuards(IDbConnection db, SysUser user) {
+        for (int i = 0; i < loginGuards.Count; i = i + 1) {
+            string err = await loginGuards[i](db, user);
+            if (err != null && err.Length > 0) { return err; }
+        }
+        return "";
+    }
+
+    public static async void RunLoginEvents(IDbConnection db, SysUser user) {
+        for (int i = 0; i < loginEvents.Count; i = i + 1) {
+            await loginEvents[i](db, user);
+        }
+    }
+
+    public static async void RunScopeResolvers(IDbConnection db, SysUser user, DataScope scope) {
+        if (scope == null) { return; }
+        for (int i = 0; i < scopeResolvers.Count; i = i + 1) {
+            await scopeResolvers[i](db, user, scope);
+        }
+    }
+
+    public static async void RunMenuHooks(IDbConnection db, string uid, string activePath, List<MenuNode> nodes) {
+        if (nodes == null) { return; }
+        for (int i = 0; i < menuHooks.Count; i = i + 1) {
+            await menuHooks[i](db, uid, activePath, nodes);
+        }
+    }
+
+    public static async bool RunAuditHooks(IDbConnection db, SysOperationLog entry) {
+        if (entry == null) { return false; }
+        for (int i = 0; i < auditHooks.Count; i = i + 1) {
+            bool keep = await auditHooks[i](db, entry);
+            if (!keep) { return false; }
+        }
+        return true;
+    }
+
+    public static async void RunTokenClaims(IDbConnection db, SysUser user, Dictionary<string, string> claims) {
+        if (claims == null || user == null) { return; }
+        for (int i = 0; i < tokenClaimHooks.Count; i = i + 1) {
+            await tokenClaimHooks[i](db, user, claims);
+        }
+    }
+
+    public static async void RunGrantResolvers(IDbConnection db, int userId, string key, DataScope dept, RowScope scope) {
+        if (scope == null) { return; }
+        for (int i = 0; i < grantResolvers.Count; i = i + 1) {
+            await grantResolvers[i](db, userId, key, dept, scope);
+        }
+    }
+
+    public static async void RunSummaryHooks(IDbConnection db, DataScope scope, Dictionary<string, string> metrics) {
+        if (metrics == null) { return; }
+        for (int i = 0; i < summaryHooks.Count; i = i + 1) {
+            await summaryHooks[i](db, scope, metrics);
+        }
+    }
+}

@@ -48,14 +48,46 @@ public partial class HttpClient {
         return origin + dir + loc;
     }
 
+    private static string AsciiLowerSlice(string s, int start, int len) {
+        if (len <= 0) { return ""; }
+        bool hasUpper = false;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[start + i] & 255;
+            if (c >= 65 && c <= 90) { hasUpper = true; break; }
+        }
+        if (!hasUpper) {
+            if (start == 0 && len == s.Length) { return s; }
+            return s.Substring(start, len);
+        }
+        byte[] buf = new byte[len];
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            buf[i] = (byte)c;
+        }
+        return buf.ToStr(0, len);
+    }
+
+    private static bool EqualsRangeAsciiIgnoreCase(string s, int start, int len, string lowerLit) {
+        if (len != lowerLit.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lowerLit[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
     // 本客户端 host 的小写形式，剥掉 IPv6 字面量的方括号；
     // 与 ExternalTarget.Host() 比较重定向是否同源。
     private string RedirectHost() {
-        string h = this.host.ToLower();
-        if (h.StartsWith("[") && h.EndsWith("]")) {
-            return h.Substring(1, h.Length - 2);
+        int start = 0;
+        int len = this.host.Length;
+        if (len >= 2 && (this.host[0] & 255) == 91 && (this.host[len - 1] & 255) == 93) {
+            start = 1;
+            len = len - 2;
         }
-        return h;
+        return HttpClient.AsciiLowerSlice(this.host, start, len);
     }
 
     // 本客户端当前请求目标的规范 URL（scheme://host[:port]/path），
@@ -94,16 +126,40 @@ public partial class HttpClient {
     private bool IsRedirectHeader(string line, bool sameOrigin, bool dropEntity) {
         int colon = line.IndexOf(":");
         if (colon <= 0) { return false; }
-        string name = line.Substring(0, colon).Trim().ToLower();
-        if (name == "host" || name == "range") { return false; }
-        if (dropEntity && (name == "content-length"
-            || name == "transfer-encoding" || name == "expect"
-            || name == "content-type" || name == "content-encoding"
-            || name == "content-md5" || name == "trailer")) {
+        int start = 0;
+        while (start < colon) {
+            int c = line[start] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            start = start + 1;
+        }
+        int end = colon;
+        while (end > start) {
+            int c = line[end - 1] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
+        }
+        int len = end - start;
+        if (len <= 0) { return false; }
+        if (HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "host")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "range")) {
             return false;
         }
-        if (!sameOrigin && (name == "authorization" || name == "cookie"
-            || name == "proxy-authorization")) { return false; }
+        if (dropEntity && (
+            HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "content-length")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "transfer-encoding")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "expect")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "content-type")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "content-encoding")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "content-md5")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "trailer"))) {
+            return false;
+        }
+        if (!sameOrigin && (
+            HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "authorization")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "cookie")
+            || HttpClient.EqualsRangeAsciiIgnoreCase(line, start, len, "proxy-authorization"))) {
+            return false;
+        }
         return true;
     }
 
@@ -159,8 +215,13 @@ public partial class HttpClient {
         next.keepAliveEnabled = false;
         next.useTls = target.IsTls();
         next.verifyTls = current.verifyTls;
-        next.clientCertificateFile = current.clientCertificateFile;
-        next.clientPrivateKeyFile = current.clientPrivateKeyFile;
+        if (sameOrigin && target.IsTls()) {
+            next.clientCertificateFile = current.clientCertificateFile;
+            next.clientPrivateKeyFile = current.clientPrivateKeyFile;
+        } else {
+            next.clientCertificateFile = "";
+            next.clientPrivateKeyFile = "";
+        }
         next.tlsPins = current.tlsPins;
         next.pinningEnabled = current.pinningEnabled;
         next.certPolicy = current.certPolicy;

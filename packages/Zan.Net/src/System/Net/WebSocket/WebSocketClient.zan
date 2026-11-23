@@ -7,16 +7,13 @@ using System.Collections.Generic;
 
 namespace System.Net.WebSocket;
 
-// WebSocket 帧操作码（opcode）。
+// RFC 6455 WebSocket 客户端（异步套接字 + 显式长度 WsReader，支持二进制 NUL 帧）。
 public class WebSocketClient : IDisposable {
     private TcpClient conn;
     private string host;
     private int port;
     private string path;
-    // 握手与帧共用一个带显式长度的累积缓冲（WsReader）。
-    // 此前用字符串拼接攒帧：Zan 字符串按 NUL 结尾计长，
-    // 二进制帧负载里的 NUL 会让帧长判断、Substring 切片
-    // 全部错位；且无缓冲上限，对端可慢慢撑爆内存。
+    // 显式长度缓冲：避免字符串按 NUL 截断二进制负载并限制头部积压。
     private WsReader reader;
     private WsClientSession session;
 
@@ -29,20 +26,12 @@ public class WebSocketClient : IDisposable {
         this.session = new WsClientSession();
     }
 
-    // 发起 ws://host:port/path 握手（随机 Sec-WebSocket-Key，校验
-    // Sec-WebSocket-Accept）。绝不返回 null：连接/握手失败时返回
-    // 一个 connected=false 的对象，用 IsConnected() 判断成败（失败
-    // 路径已顺手关闭底层连接）。
+    // 发起 ws://host:port/path 握手（失败返回 connected=false 的对象并关闭底层连接，不返回 null）。
     public static async WebSocketClient ConnectAsync(string host, int port, string path) {
         return await WebSocketClient.ConnectAsyncHeaders(host, port, path, null);
     }
 
-    // 带自定义握手头的连接。`headers` 里每一项是一个完整的
-    // 头行（如 "Authorization: Bearer xxx"），原样追加在标准握手头
-    // 之后——授权在升级前生效的 MVC 路由（needsAuth 检查先于
-    // WsUpgrade）没有它就永远 401。行内出现 CR/LF/NUL/DEL 一律
-    // 拒绝并按握手失败返回（头注入会伪造额外头/截断握手块），
-    // 其余字节不校验——值里写什么由调用方负责。
+    // 带自定义握手头（完整头行如 "Authorization: Bearer ..."）建立连接；行内含 CR/LF/NUL/DEL 时拒绝握手。
     public static async WebSocketClient ConnectAsyncHeaders(string host, int port,
             string path, List<string> headers) {
         WebSocketClient ws = new WebSocketClient();
@@ -53,12 +42,8 @@ public class WebSocketClient : IDisposable {
         if (!WsHandshake.SafeRequestPart(host, false)
             || !WsHandshake.SafeRequestPart(path, false)) { return ws; }
         ws.conn = await TcpClient.ConnectAsync(host, port);
-        // 连接失败/超时按文档返回 null：解引用是空对象虚调用，进程
-        // SIGSEGV。保持 connected=false 由 IsConnected() 检查。
         if (ws.conn == null) { return ws; }
 
-        // RFC 6455 要求客户端握手的 key 是随机的；此前硬编码 RFC 样例
-        // nonce，可预测且部分服务器/代理会拒绝重复值。
         byte[] keyBytes = RandomNumberGenerator.GetBytes(16);
         if (keyBytes == null) { ws.conn.Close(); return ws; }
         string key = Base64.Encode(keyBytes, 16);
@@ -97,38 +82,23 @@ public class WebSocketClient : IDisposable {
         sb.Append("\r\n");
         await ws.conn.SendAsync(sb.ToString());
 
-        // 响应头可能被 TCP 分段；头之后的字节已是帧（可能含 NUL）。
-        // 全部落进 reader 的显式长度缓冲，按字节扫描头部结束标记。
-        // 握手接收受 30 秒空闲窗口约束：接受了连接却一个字节不发
-        // 的服务端不能再永久钉住本协程（数据阶段的空闲等待仍不设限）。
+        // 握手接收设 30s 空闲窗口，头部与后续帧字节统一由 WsReader 缓冲。
         ws.reader = new WsReader(ws.conn.GetSocket());
         HttpDeadlineToken watch = HttpDeadline.Arm(ws.conn.GetSocket(), 30000);
         int headerEnd = -1;
+        bool ok = true;
         while (headerEnd < 0) {
-            if (!WsHandshake.HeaderWithinLimit(-1, ws.reader.Buffered())) {
-                HttpDeadline.Disarm(watch);
-                ws.conn.Close();
-                return ws;
-            }
+            if (!WsHandshake.HeaderWithinLimit(-1, ws.reader.Buffered())) { ok = false; break; }
             int n = await ws.reader.FillMore();
-            if (n == 0) {
-                HttpDeadline.Disarm(watch);
-                ws.conn.Close();
-                return ws;
-            }
-            if (HttpDeadline.Expired(watch)) {
-                HttpDeadline.Disarm(watch);
-                ws.conn.Close();
-                return ws;
-            }
+            if (n == 0 || HttpDeadline.Expired(watch)) { ok = false; break; }
             headerEnd = ws.reader.FindHeaderEnd();
-            if (!WsHandshake.HeaderWithinLimit(headerEnd, ws.reader.Buffered())) {
-                HttpDeadline.Disarm(watch);
-                ws.conn.Close();
-                return ws;
-            }
+            if (!WsHandshake.HeaderWithinLimit(headerEnd, ws.reader.Buffered())) { ok = false; break; }
         }
         HttpDeadline.Disarm(watch);
+        if (!ok) {
+            ws.conn.Close();
+            return ws;
+        }
         string head = ws.reader.Slice(headerEnd);
         string acceptSource = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
         string expectedAccept = Base64.Encode(
@@ -184,13 +154,7 @@ public class WebSocketClient : IDisposable {
         return await this.RecvText(0);
     }
 
-    // 带空闲窗口的 RecvText：时限内没有任何帧到达时返回 ""
-    // ——连接未断，IsConnected() 仍为 true，已收到的半截帧留在
-    // 缓冲区里下次接着读；这正是心跳调用方的判据（超时 → Ping()
-    // → 继续 RecvText(timeout)）。真正的断开（对端关闭帧/EOF/协议
-    // 错误）会 CloseNow，IsConnected() 变 false。timeoutMs 非正表示
-    // 不限时。空数据消息与空闲超时都返回 ""，无法区分——协议上
-    // 不发空消息（发心跳用 Ping）就没有歧义。
+    // 带空闲窗口的 RecvText（timeoutMs<=0 不限时）：超时返回 "" 且保持连接，真正断开会 CloseNow。
     public async string RecvText(int timeoutMs) {
         return await this.session.RecvText(timeoutMs);
     }

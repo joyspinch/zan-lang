@@ -1,0 +1,481 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Json;
+using System.Runtime.InteropServices;
+
+namespace System.Web;
+
+// Invoked once with a frozen trace after the response and request cleanup.
+public delegate void RequestDiagnosticsHandler(RequestTrace trace);
+
+internal class RequestWait {
+    public string file;
+    public string kind;
+    public int line;
+    public int column;
+    public long offsetUs;
+    public long elapsedUs;
+
+    public RequestWait(string file, string kind, int line, int column, long offsetUs, long elapsedUs) {
+        this.file = file;
+        this.kind = kind;
+        this.line = line;
+        this.column = column;
+        this.offsetUs = offsetUs;
+        this.elapsedUs = elapsedUs;
+    }
+}
+
+internal struct RequestExecutionSlice {
+    public long tid;
+    public long startUs;
+    public long elapsedUs;
+    public long cpu;
+    public long bytes;
+}
+
+// Shared by the request and its child work until completion.
+public class RequestTrace {
+    private static const int MaxStages = 48;
+    private static const int MaxLabelLength = 96;
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_enable")]
+    internal static extern void EnableResources();
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_begin")]
+    private static extern int BeginProfile(int flags);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_stage_id")]
+    private static extern long ProfileStageId();
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_stage_set")]
+    private static extern void SetProfileStage(long id, int slot, int open);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_read_stage")]
+    private static extern int ReadProfileStage(nint report, int slot, ref long cpu, ref long bytes);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_read_execution")]
+    private static extern int ReadProfileExecution(nint report, int index, ref long tid,
+        ref long start, ref long elapsed, ref long cpu, ref long bytes);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_omitted_execution")]
+    private static extern long OmittedProfileExecution(nint report);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_end")]
+    private static extern nint EndProfile(ref long cpu, ref long bytes, ref long slices, ref long unfinished);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_read_wait")]
+    private static extern int ReadProfileWait(nint report, int index, ref nint file, ref int line,
+        ref int column, ref nint kind, ref long start, ref long elapsed);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_omitted_waits")]
+    private static extern long OmittedProfileWaits(nint report);
+
+    [DllImport("crt", EntryPoint = "zan_task_profile_release_report")]
+    private static extern void ReleaseProfile(nint report);
+
+    // The names array guards mutation until both publication destinations are cleared.
+    private RequestProfiler owner;
+    private RequestDiagnosticsHandler diagnostics;
+    private long id;
+    private long startUs;
+    private long endUs;
+    private string protocol;
+    private string method = "";
+    private string route = "";
+    private string action = "";
+    private int status;
+    private string outcome = "aborted";
+    private int count;
+    private int omitted;
+    private int sqlCalls;
+    private int sqlCompleted;
+    private int sqlFailed;
+    private long sqlElapsedUs;
+    private int resourceState;
+    private string resourceCpuUnit = "";
+    private long resourceCpu;
+    private long resourceBytes;
+    private long resourceSlices;
+    private long resourceUnfinishedTasks;
+    private long profileStageId;
+    private bool readLoopCoverage;
+    // Only populated in stage-resource mode. Element 0 holds the residual.
+    private long[] stageCpu;
+    private long[] stageBytes;
+    private long omittedWaits;
+    private List<RequestWait> waits;
+    private long omittedExecution;
+    private List<RequestExecutionSlice> execution;
+    private string[] names = new string[MaxStages];
+    private long[] starts = new long[MaxStages];
+    private long[] ends = new long[MaxStages];
+    private string[] failures = new string[MaxStages];
+
+    internal RequestTrace(RequestProfiler owner, RequestDiagnosticsHandler diagnostics, long id, string protocol, long startUs) {
+        this.owner = owner;
+        this.diagnostics = diagnostics;
+        this.id = id;
+        this.protocol = protocol;
+        this.startUs = startUs;
+    }
+
+    // Zero for sampled requests that are outside the debug history.
+    public long Id() { return this.id; }
+
+    // Read these properties from the completion callback, after the trace freezes.
+    public string Protocol() { return this.protocol; }
+    public string Method() { return this.method; }
+    public string RoutePattern() { return this.route; }
+    public long ElapsedUs() { return this.endUs - this.startUs; }
+    public int StatusCode() { return this.status; }
+    public string Outcome() { return this.outcome; }
+    public int StageCount() { return this.count; }
+    public string StageName(int index) { return this.names[index]; }
+    public long StageElapsedUs(int index) { return this.ends[index] == 0 ? -1 : this.ends[index] - this.starts[index]; }
+    public bool StageFailed(int index) { return this.failures[index] != null; }
+    public int OmittedStages() { return this.omitted; }
+    public int SqlCalls() { return this.sqlCalls; }
+    public int SqlCompleted() { return this.sqlCompleted; }
+    public long SqlElapsedUs() { return this.sqlElapsedUs; }
+    public int SqlFailed() { return this.sqlFailed; }
+    public int ResourceState() { return this.resourceState; }
+    public string ResourceCpuUnit() { return this.resourceCpuUnit; }
+    public long ResourceCpu() { return this.resourceCpu; }
+    public long ResourceBytes() { return this.resourceBytes; }
+    public long ResourceSlices() { return this.resourceSlices; }
+    public long ResourceUnfinishedTasks() { return this.resourceUnfinishedTasks; }
+
+    public string ResourceCoverage() {
+        if (this.protocol == "HTTP/1") {
+            return this.readLoopCoverage ? "read-loop-to-cleanup" : "header-to-cleanup";
+        }
+        return this.protocol == "HTTP/2" ? "application" : "";
+    }
+
+    internal void SetReadLoopCoverage() { this.readLoopCoverage = true; }
+
+    internal bool BeginResources(bool recordExecution, bool recordStages = false) {
+        int flags = recordExecution && this.owner != null ? 1 : 0;
+        if (recordStages && this.owner != null) { flags = flags | 2; }
+        if (RequestTrace.BeginProfile(flags) != 1) { return false; }
+        if ((flags & 2) != 0) { this.profileStageId = RequestTrace.ProfileStageId(); }
+        return true;
+    }
+
+    internal void EndResources() {
+        long cpu = -1;
+        long bytes = 0;
+        long slices = 0;
+        long unfinished = 0;
+        nint report = RequestTrace.EndProfile(ref cpu, ref bytes, ref slices, ref unfinished);
+        if (report == 0) { return; }
+        try {
+            this.resourceState = 1;
+            this.resourceCpu = cpu;
+            this.resourceCpuUnit = OperatingSystem.IsWindows() ? "cycles" : "ns";
+            this.resourceBytes = bytes;
+            this.resourceSlices = slices;
+            this.resourceUnfinishedTasks = unfinished;
+            if (this.owner != null) {
+                if (this.profileStageId != 0) { this.CopyStageResources(report); }
+                this.CopyWaits(report);
+                this.CopyExecution(report);
+            }
+        } finally {
+            RequestTrace.ReleaseProfile(report);
+        }
+    }
+
+    private void CopyStageResources(nint report) {
+        this.stageCpu = new long[MaxStages + 1];
+        this.stageBytes = new long[MaxStages + 1];
+        for (int i = 0; i <= MaxStages; i = i + 1) {
+            long cpu = -1;
+            long bytes = -1;
+            RequestTrace.ReadProfileStage(report, i - 1, ref cpu, ref bytes);
+            this.stageCpu[i] = cpu;
+            this.stageBytes[i] = bytes;
+        }
+    }
+
+    private void CopyWaits(nint report) {
+        this.omittedWaits = RequestTrace.OmittedProfileWaits(report);
+        nint file = 0;
+        nint kind = 0;
+        int line = 0;
+        int column = 0;
+        long start = 0;
+        long elapsed = 0;
+        for (int i = 0; RequestTrace.ReadProfileWait(report, i, ref file, ref line, ref column,
+                ref kind, ref start, ref elapsed) == 1; i++) {
+            if (this.waits == null) { this.waits = new List<RequestWait>(); }
+            this.waits.Add(new RequestWait(Marshal.PtrToStringUtf8(file), Marshal.PtrToStringUtf8(kind),
+                line, column, start - this.startUs, elapsed));
+        }
+    }
+
+    private void CopyExecution(nint report) {
+        this.omittedExecution = RequestTrace.OmittedProfileExecution(report);
+        RequestExecutionSlice slice = new RequestExecutionSlice();
+        for (int i = 0; RequestTrace.ReadProfileExecution(report, i, ref slice.tid, ref slice.startUs,
+                ref slice.elapsedUs, ref slice.cpu, ref slice.bytes) == 1; i++) {
+            if (this.execution == null) { this.execution = new List<RequestExecutionSlice>(); }
+            this.execution.Add(slice);
+        }
+    }
+
+    // Subtract the union of closed intervals. Sorting indices preserves export order.
+    public long UnattributedUs() {
+        int[] order = new int[this.count];
+        int closed = 0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            if (this.ends[i] <= this.starts[i]) { continue; }
+            int next = closed;
+            while (next > 0 && this.starts[order[next - 1]] > this.starts[i]) {
+                order[next] = order[next - 1];
+                next = next - 1;
+            }
+            order[next] = i;
+            closed = closed + 1;
+        }
+        long covered = 0;
+        long boundary = this.startUs;
+        for (int i = 0; i < closed; i = i + 1) {
+            int stage = order[i];
+            long start = this.starts[stage] > boundary ? this.starts[stage] : boundary;
+            long end = this.ends[stage] < this.endUs ? this.ends[stage] : this.endUs;
+            if (end > start) {
+                covered = covered + end - start;
+                boundary = end;
+            }
+        }
+        return this.ElapsedUs() - covered;
+    }
+
+    private bool Recording() { return this.owner != null || this.diagnostics != null; }
+
+    internal void Discard() {
+        lock (this.names) {
+            this.owner = null;
+            this.diagnostics = null;
+        }
+    }
+
+    // The overflow token preserves the SQL counters when the timeline is full.
+    public int BeginSql(string operation, long atUs) {
+        lock (this.names) {
+            if (!this.Recording()) { return -1; }
+            this.sqlCalls = this.sqlCalls + 1;
+            int stage = this.AddStage(operation, atUs);
+            if (this.profileStageId != 0) { RequestTrace.SetProfileStage(this.profileStageId, stage, 1); }
+            return stage < 0 ? MaxStages : stage;
+        }
+    }
+
+    public void CompleteSql(int stage, long start, long end, string failure) {
+        if (stage < 0) { return; }
+        lock (this.names) {
+            if (!this.Recording()) { return; }
+            this.sqlCompleted = this.sqlCompleted + 1;
+            this.sqlElapsedUs = this.sqlElapsedUs + end - start;
+            if (failure != null) { this.sqlFailed = this.sqlFailed + 1; }
+            if (stage < this.count) {
+                if (this.profileStageId != 0) { RequestTrace.SetProfileStage(this.profileStageId, stage, 0); }
+                this.ends[stage] = end;
+                if (failure != null) { this.failures[stage] = RequestTrace.LimitLabel(failure); }
+            }
+        }
+    }
+
+    // Names and failure codes are fixed application labels, never request data.
+    public int Begin(string name) {
+        return this.BeginAt(name, Stopwatch.GetMicroseconds(), true);
+    }
+
+    internal int BeginAt(string name, long atUs, bool live = false) {
+        lock (this.names) {
+            if (!this.Recording()) { return -1; }
+            int stage = this.AddStage(name, atUs);
+            if (live && this.profileStageId != 0) { RequestTrace.SetProfileStage(this.profileStageId, stage, 1); }
+            return stage;
+        }
+    }
+
+    private int AddStage(string name, long atUs) {
+        if (this.count == MaxStages) { this.omitted = this.omitted + 1; return -1; }
+        int slot = this.count;
+        this.names[slot] = RequestTrace.LimitLabel(name);
+        this.starts[slot] = atUs;
+        this.count = slot + 1;
+        return slot;
+    }
+
+    private static string LimitLabel(string label) {
+        return label.Length > MaxLabelLength ? label.Substring(0, MaxLabelLength) : label;
+    }
+
+    public void End(int stage) {
+        this.EndAt(stage, Stopwatch.GetMicroseconds());
+    }
+
+    internal void EndAt(int stage, long atUs) {
+        if (stage < 0) { return; }
+        lock (this.names) {
+            if (this.Recording() && stage < this.count && this.ends[stage] == 0) {
+                if (this.profileStageId != 0) { RequestTrace.SetProfileStage(this.profileStageId, stage, 0); }
+                this.ends[stage] = atUs;
+            }
+        }
+    }
+
+    public void Fail(int stage, string code) {
+        if (stage < 0) { return; }
+        lock (this.names) {
+            if (this.Recording() && stage < this.count) {
+                this.failures[stage] = RequestTrace.LimitLabel(code);
+            }
+        }
+    }
+
+    internal void FailOpen(string code) {
+        lock (this.names) {
+            if (this.Recording()) { this.MarkOpenStageFailed(code); }
+        }
+    }
+
+    private void MarkOpenStageFailed(string code) {
+        for (int i = this.count - 1; i >= 0; i = i - 1) {
+            if (this.ends[i] == 0) { this.failures[i] = RequestTrace.LimitLabel(code); return; }
+        }
+    }
+
+    internal void Identify(string method, Route route) {
+        lock (this.names) {
+            if (!this.Recording()) { return; }
+            // Use registered route labels. Unmatched paths may contain user data.
+            if (route != null) {
+                this.method = route.Method();
+                this.route = route.Pattern();
+                this.action = route.Action();
+            } else if (method == "GET" || method == "HEAD" || method == "POST" || method == "PUT"
+            || method == "PATCH" || method == "DELETE" || method == "OPTIONS") {
+                this.method = method;
+            }
+        }
+    }
+
+    internal void SetOutcome(int status, string outcome) {
+        lock (this.names) {
+            this.status = status;
+            this.outcome = outcome;
+        }
+    }
+
+    internal void FinishPending() {
+        this.Complete(this.status, this.outcome, 0, 0);
+    }
+
+    internal void FinishStream(int status, string outcome, long sendStartUs, long sendEndUs) {
+        this.Complete(status, outcome, sendStartUs, sendEndUs);
+    }
+
+    internal void Finish(int status, string outcome) {
+        this.Complete(status, outcome, 0, 0);
+    }
+
+    private void Complete(int status, string outcome, long sendStartUs, long sendEndUs) {
+        RequestProfiler recorder = null;
+        RequestDiagnosticsHandler report = null;
+        lock (this.names) {
+            if (!this.Recording()) { return; }
+            if (outcome == "application_exception") { this.MarkOpenStageFailed("Exception"); }
+            if (sendStartUs != 0) {
+                int stage = this.AddStage("send", sendStartUs);
+                if (stage >= 0) {
+                    this.ends[stage] = sendEndUs;
+                    if (outcome == "send_failed" || outcome == "stream_closed" || outcome == "stream_reset") {
+                        this.failures[stage] = outcome;
+                    }
+                }
+            }
+            this.status = status;
+            this.outcome = outcome;
+            this.endUs = Stopwatch.GetMicroseconds();
+            recorder = this.owner;
+            report = this.diagnostics;
+            this.owner = null;
+            this.diagnostics = null;
+        }
+        if (recorder != null) { recorder.Record(this); }
+        if (report != null && this.route.Length > 0) {
+            try { report(this); }
+            catch (Exception) {
+                Console.ErrorWriteLine("[request diagnostics] completion callback failed");
+            }
+        }
+    }
+
+    internal void WriteJson(JsonWriter writer) {
+        writer.WriteStartObject().WriteProperty("id", this.id)
+        .WriteProperty("protocol", this.protocol).WriteProperty("method", this.method)
+        .WriteProperty("route", this.route).WriteProperty("action", this.action)
+        .WriteProperty("start_us", this.startUs).WriteProperty("elapsed_us", this.endUs - this.startUs)
+        .WriteProperty("status", this.status).WriteProperty("outcome", this.outcome)
+        .WriteProperty("omitted_stages", this.omitted);
+        if (this.resourceState == 1) {
+            writer.WritePropertyName("resources").WriteStartObject()
+            .WriteProperty("cpu", this.resourceCpu).WriteProperty("cpu_unit", this.resourceCpuUnit)
+            .WriteProperty("coverage", this.ResourceCoverage())
+            .WriteProperty("allocated_bytes", this.resourceBytes).WriteProperty("slices", this.resourceSlices)
+            .WriteProperty("unfinished_tasks", this.resourceUnfinishedTasks);
+            if (this.stageCpu != null) {
+                writer.WriteProperty("stage_resources", true);
+                if (this.stageCpu[0] >= 0) { writer.WriteProperty("residual_cpu", this.stageCpu[0]); }
+                if (this.stageBytes[0] >= 0) { writer.WriteProperty("residual_allocated_bytes", this.stageBytes[0]); }
+            }
+            writer.WriteEndObject();
+            writer.WriteProperty("omitted_waits", this.omittedWaits);
+            writer.WritePropertyName("waits").WriteStartArray();
+            if (this.waits != null) {
+                for (int i = 0; i < this.waits.Count; i++) {
+                    RequestWait wait = this.waits[i];
+                    writer.WriteStartObject().WriteProperty("kind", wait.kind).WriteProperty("file", wait.file)
+                    .WriteProperty("line", wait.line).WriteProperty("column", wait.column)
+                    .WriteProperty("offset_us", wait.offsetUs);
+                    if (wait.elapsedUs >= 0) { writer.WriteProperty("elapsed_us", wait.elapsedUs); }
+                    writer.WriteEndObject();
+                }
+            }
+            writer.WriteEndArray();
+            if (this.execution != null || this.omittedExecution > 0) {
+                writer.WriteProperty("omitted_execution_slices", this.omittedExecution)
+                    .WritePropertyName("execution_slices").WriteStartArray();
+                if (this.execution != null) {
+                    for (int i = 0; i < this.execution.Count; i = i + 1) {
+                        RequestExecutionSlice slice = this.execution[i];
+                        writer.WriteStartObject().WriteProperty("tid", slice.tid)
+                            .WriteProperty("start_us", slice.startUs).WriteProperty("elapsed_us", slice.elapsedUs)
+                            .WriteProperty("cpu", slice.cpu).WriteProperty("allocated_bytes", slice.bytes)
+                            .WriteEndObject();
+                    }
+                }
+                writer.WriteEndArray();
+            }
+        }
+        writer.WritePropertyName("stages").WriteStartArray();
+        for (int i = 0; i < this.count; i = i + 1) {
+            writer.WriteStartObject().WriteProperty("name", this.names[i])
+            .WriteProperty("offset_us", this.starts[i] - this.startUs);
+            if (this.ends[i] != 0) { writer.WriteProperty("elapsed_us", this.ends[i] - this.starts[i]); }
+            if (this.failures[i] != null) { writer.WriteProperty("failure", this.failures[i]); }
+            if (this.stageCpu != null) {
+                if (this.stageCpu[i + 1] >= 0) { writer.WriteProperty("cpu", this.stageCpu[i + 1]); }
+                if (this.stageBytes[i + 1] >= 0) { writer.WriteProperty("allocated_bytes", this.stageBytes[i + 1]); }
+            }
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray().WriteEndObject();
+    }
+}

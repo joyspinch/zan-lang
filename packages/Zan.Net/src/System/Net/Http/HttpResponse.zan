@@ -404,15 +404,31 @@ public class HttpResponse : IDisposable {
         return this;
     }
 
+    private static bool EqualsAsciiIgnoreCaseRange(string s, int start, int stop, string target) {
+        if (target == null || stop - start != target.Length) { return false; }
+        for (int i = 0; i < target.Length; i = i + 1) {
+            int a = s[start + i] & 255;
+            int b = target[i] & 255;
+            if (a >= 65 && a <= 90) { a = a + 32; }
+            if (b >= 65 && b <= 90) { b = b + 32; }
+            if (a != b) { return false; }
+        }
+        return true;
+    }
+
     public string GetHeader(string name) {
         if (name.Length == 0 || this.headers == null) { return ""; }
-        string want = name.ToLower();
         for (int i = 0; i < this.headers.Count; i = i + 1) {
             string line = this.headers[i];
             int colon = line.IndexOf(":");
             if (colon <= 0) { continue; }
-            string got = line.Substring(0, colon).Trim().ToLower();
-            if (got == want) { return line.Substring(colon + 1).Trim(); }
+            int l = 0;
+            int r = colon;
+            while (l < r && (line[l] & 255) <= 32) { l = l + 1; }
+            while (r > l && (line[r - 1] & 255) <= 32) { r = r - 1; }
+            if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, l, r, name)) {
+                return line.Substring(colon + 1).Trim();
+            }
         }
         return "";
     }
@@ -573,14 +589,13 @@ public class HttpResponse : IDisposable {
 
     public bool ParseFraming() {
         bool sawTe = false;
-        string encoding = "";
+        bool teChunked = false;
         for (int i = 0; i < this.headers.Count; i = i + 1) {
             string line = this.headers[i];
             int colon = line.IndexOf(":");
             if (colon <= 0) { continue; }
-            string name = line.Substring(0, colon).ToLower();
-            string value = line.Substring(colon + 1).Trim();
-            if (name == "content-length") {
+            if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, colon, "content-length")) {
+                string value = line.Substring(colon + 1).Trim();
                 if (value.Length == 0) { return false; }
                 long length = 0;
                 for (int j = 0; j < value.Length; j = j + 1) {
@@ -595,14 +610,15 @@ public class HttpResponse : IDisposable {
                 }
                 this.framingHasLength = true;
                 this.framingLength = (int)length;
-            } else if (name == "transfer-encoding") {
+            } else if (HttpResponse.EqualsAsciiIgnoreCaseRange(line, 0, colon, "transfer-encoding")) {
+                string value = line.Substring(colon + 1).Trim();
                 if (sawTe || value.Length == 0) { return false; }
                 sawTe = true;
-                encoding = value.ToLower();
+                teChunked = HttpResponse.EqualsAsciiIgnoreCaseRange(value, 0, value.Length, "chunked");
             }
         }
         if (sawTe && this.framingHasLength) { return false; }
-        if (sawTe && encoding != "chunked") { return false; }
+        if (sawTe && !teChunked) { return false; }
         this.framingChunked = sawTe;
         return true;
     }

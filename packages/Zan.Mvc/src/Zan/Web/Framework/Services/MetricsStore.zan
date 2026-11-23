@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Web;
 
 namespace Zan.Web.Services;
 
@@ -13,6 +14,8 @@ public class MetricsStore {
     private static List<MinuteBucket> retryBuckets = new List<MinuteBucket>();
     private static List<MetricError> retryErrors = new List<MetricError>();
     private static List<MetricSql> retrySqlBuckets = new List<MetricSql>();
+    private static RouteDiagnosticsBuffer routeDiagnostics = new RouteDiagnosticsBuffer();
+    private static int configuredRouteEvery = -1;
     private static object batchLock = new object();
     private static bool flushActive = false;
     /* 未刷新桶数上限，超出则丢弃最旧记录。 */
@@ -20,6 +23,9 @@ public class MetricsStore {
     public static const int MaxErrors = 4096;
     /* 内存 SQL 模板数上限，超出时折叠为"其他语句"。 */
     public static const int MaxSqlShapes = 512;
+    private static int maxBuckets = MaxBuckets;
+    private static int maxErrors = MaxErrors;
+    private static int maxSqlShapes = MaxSqlShapes;
     public static const string OtherSql = "(其他语句)";
     private static DbPool pool = null;
     private static bool ready = false;
@@ -28,6 +34,60 @@ public class MetricsStore {
 
     /* 历史库是否就绪：不就绪时查询端（告警评估等）直接空手而回。 */
     public static bool Ready() { return ready; }
+
+    public static void SetCapsForTest(int bucketsCap, int errorsCap, int sqlShapesCap) {
+        lock (batchLock) {
+            maxBuckets = bucketsCap;
+            maxErrors = errorsCap;
+            maxSqlShapes = sqlShapesCap;
+        }
+    }
+
+    public static void ResetCaps() {
+        lock (batchLock) {
+            maxBuckets = MaxBuckets;
+            maxErrors = MaxErrors;
+            maxSqlShapes = MaxSqlShapes;
+        }
+    }
+
+    public static DbPool Pool() { return pool; }
+
+    public static void UsePool(DbPool nextPool) { pool = nextPool; }
+
+    public static bool IsFlushActive() {
+        lock (batchLock) { return flushActive; }
+    }
+
+    public static void EnqueueBucket(MinuteBucket bucket) {
+        if (bucket == null) { return; }
+        lock (batchLock) { buckets.Add(bucket); }
+    }
+
+    public static void EnqueueSql(MetricSql sql) {
+        if (sql == null) { return; }
+        lock (batchLock) { sqlBuckets.Add(sql); }
+    }
+
+    public static int ActiveBucketCount() { lock (batchLock) { return buckets.Count; } }
+    public static int ActiveErrorCount() { lock (batchLock) { return errors.Count; } }
+    public static int ActiveSqlCount() { lock (batchLock) { return sqlBuckets.Count; } }
+    public static int RetryBucketCount() { lock (batchLock) { return retryBuckets.Count; } }
+    public static int RetryErrorCount() { lock (batchLock) { return retryErrors.Count; } }
+    public static int RetrySqlCount() { lock (batchLock) { return retrySqlBuckets.Count; } }
+    public static MinuteBucket RetryBucketAt(int index) { lock (batchLock) { return retryBuckets[index]; } }
+    public static MetricError RetryErrorAt(int index) { lock (batchLock) { return retryErrors[index]; } }
+    public static MetricSql RetrySqlAt(int index) { lock (batchLock) { return retrySqlBuckets[index]; } }
+
+    public static int RouteDiagnosticEvery() {
+        if (configuredRouteEvery >= 0) { return configuredRouteEvery; }
+        string configured = Environment.GetEnvironmentVariable("ZAN_ROUTE_DIAGNOSTICS_EVERY");
+        int every = 0;
+        if (configured != null && int.TryParse(configured, out every) && every >= 0) {
+            return every;
+        }
+        return 64;
+    }
 
     /* 初始化 metrics.db，创建表并启动后台刷新；失败时继续运行但不记历史。 */
     public static async bool Start() {
@@ -39,8 +99,6 @@ public class MetricsStore {
         try {
             /* WAL 模式：刷新写入时历史界面仍可读取。 */
             await DbSchema.UseWriteAheadLogAsync(db);
-            /* 旧版使用不同键（route 列 + 毫秒单位），新表独立创建，旧数据归档为 _legacy。 */
-            await RetireLegacyMinutes(db);
             /* CodeFirst 建表/加列/建索引；SQL 统计按天聚合，分钟仅用于刷新时机。
              * 直调 SyncAsync：泛型扩展包装（SyncStructureAsync<T>）在特化后
              * Meta.For<T>() 静默失真（B-ID58），这里必须绕开。 */
@@ -48,10 +106,28 @@ public class MetricsStore {
             await Sync.SyncAsync(db, Meta.For<MetricError>());
             await Sync.SyncAsync(db, Meta.For<MetricSql>());
             await Sync.SyncAsync(db, Meta.For<MetricLive>());
+            await EnsureRouteTable(db, Meta.For<MetricRouteDiagnostic>());
+            await EnsureRouteTable(db, Meta.For<MetricRouteStage>());
+            await EnsureRouteTable(db, Meta.For<MetricRouteResource>());
         } finally {
             Give(db);
         }
+        configuredRouteEvery = RouteDiagnosticEvery();
         ready = true;
+        return true;
+    }
+
+    /* The metrics database is SQLite. IF NOT EXISTS closes the schema check/create race
+     * when the application starts multiple workers on an existing metrics database. */
+    private static async bool EnsureRouteTable(IDbConnection db, Meta meta) {
+        int provider = db.GetProvider();
+        string table = Sync.CreateDdl(provider, meta, meta.Table);
+        await Sync.ExecDdlAsync(db, table.Replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS "));
+        for (int i = 0; i < meta.Idx.Count; i += 1) {
+            var index = meta.Idx[i];
+            string ddl = Dialect.IndexDdl(provider, index.Name, meta.Table, index.Cols, index.Unique);
+            await Sync.ExecDdlAsync(db, ddl.Replace("INDEX ", "INDEX IF NOT EXISTS "));
+        }
         return true;
     }
 
@@ -75,28 +151,6 @@ public class MetricsStore {
 
     /* 截断到午夜的 epoch 秒。 */
     public static long Day(long sec) { return sec - (sec % 86400); }
-
-    /* 检测并重命名旧版 metrics_minute 表（按 route 或 total_ms 列判断），归档为 _legacy。 */
-    public static async void RetireLegacyMinutes(IDbConnection db) {
-        try {
-            bool exists = await DbSchema.TableExistsAsync(db,
-                "metrics_minute");
-            if (!exists) { return; }
-            /* 通过 route 或 total_ms 列判断是否为旧版表结构。 */
-            List<string> gone = new List<string> { "route", "total_ms" };
-            bool old = await DbSchema.HasAnyColumnAsync(db,
-                "metrics_minute", gone);
-            if (!old) { return; }
-            await DbSchema.RenameTableAsync(db, "metrics_minute",
-                "metrics_minute_legacy");
-            Console.WriteLine("[metrics] history schema changed: previous "
-                + "rows kept in metrics_minute_legacy");
-        } catch (Exception ex) {
-            /* 检查失败不影响服务启动。 */
-            Console.WriteLine("[metrics] legacy history check failed: "
-                + ex.Message);
-        }
-    }
 
     /* 首次有数据可刷新时启动后台刷新协程，避免启动阶段阻塞。 */
     public static void Arm() {
@@ -126,7 +180,7 @@ public class MetricsStore {
  屏上实时 P95 与这里落库的 P95 可互相对照。 */
         b2.hist = new long[ServerMetrics.HIST_BINS];
         buckets.Add(b2);
-        while (buckets.Count > MaxBuckets) {
+        while (buckets.Count > maxBuckets) {
             buckets.RemoveAt(0);
         }
         return b2;
@@ -144,6 +198,38 @@ public class MetricsStore {
             int bin = ServerMetrics.HistBin(us);
             b.hist[bin] = b.hist[bin] + 1;
         }
+    }
+
+    public static void RecordRouteDiagnostics(RequestTrace trace) {
+        if (!ready || configuredRouteEvery == 0 || trace == null) { return; }
+        if (!routeDiagnostics.Record(trace, Minute((long)WebApp.NowSeconds()))) { return; }
+        if (!flushing) {
+            lock (batchLock) { Arm(); }
+        }
+    }
+
+    public static async string RouteDiagnostics(int hours, string method, string route) {
+        int every = RouteDiagnosticEvery();
+        bool available = ready;
+        IDbConnection db = null;
+        RouteDiagnosticReport report = null;
+        try {
+            if (available) { db = await Lease(); }
+            /* Holding the only metrics lease keeps a local commit from moving rows
+             * between the pending buffers and the database during this read. */
+            report = new RouteDiagnosticReport(hours, Minute((long)WebApp.NowSeconds()), method, route);
+            routeDiagnostics.Snapshot(report);
+            if (db != null) { await report.Load(db); }
+        } catch (Exception ex) {
+            Console.WriteLine("[metrics] route diagnostics read failed: " + ex.Message);
+            if (report == null) {
+                report = new RouteDiagnosticReport(hours, Minute((long)WebApp.NowSeconds()), method, route);
+                routeDiagnostics.Snapshot(report);
+            }
+        } finally {
+            Give(db);
+        }
+        return report.ToJson(available && every > 0, every);
     }
 
     /* 长连接以推送帧数/字节计量，不计耗时。 */
@@ -182,7 +268,7 @@ public class MetricsStore {
             MetricSql e = rows[i];
             if (e.day == day && e.sql == norm) { return e; }
         }
-        if (rows.Count >= MaxSqlShapes) {
+        if (rows.Count >= maxSqlShapes) {
             for (int i = 0; i < rows.Count; i = i + 1) {
                 MetricSql o = rows[i];
                 if (o.day == day && o.sql == OtherSql) { return o; }
@@ -193,7 +279,7 @@ public class MetricsStore {
         n.day = day;
         n.sql = norm;
         rows.Add(n);
-        while (rows.Count > MaxSqlShapes + 1) {
+        while (rows.Count > maxSqlShapes + 1) {
             rows.RemoveAt(0);
         }
         return n;
@@ -208,7 +294,7 @@ public class MetricsStore {
         e.detail = detail;
         lock (batchLock) {
             errors.Add(e);
-            while (errors.Count > MaxErrors) {
+            while (errors.Count > maxErrors) {
                 errors.RemoveAt(0);
             }
         }
@@ -242,6 +328,9 @@ public class MetricsStore {
                 full = buckets.Count >= Cfg.Metrics.flushRows
                     || errors.Count >= Cfg.Metrics.flushRows
                     || sqlBuckets.Count >= Cfg.Metrics.flushRows;
+            }
+            if (!full && configuredRouteEvery > 0) {
+                full = routeDiagnostics.PendingRows() >= Cfg.Metrics.flushRows;
             }
             if (!due && !full) { continue; }
             waited = 0;
@@ -279,7 +368,7 @@ public class MetricsStore {
                 }
             }
         }
-        while (retryBuckets.Count > MaxBuckets) {
+        while (retryBuckets.Count > maxBuckets) {
             retryBuckets.RemoveAt(0);
         }
         for (int i = 0; i < sqlBuckets.Count; i = i + 1) {
@@ -292,7 +381,7 @@ public class MetricsStore {
             if (add.maxUs > hit.maxUs) { hit.maxUs = add.maxUs; }
         }
         retryErrors.AddRange(errors);
-        while (retryErrors.Count > MaxErrors) {
+        while (retryErrors.Count > maxErrors) {
             retryErrors.RemoveAt(0);
         }
     }
@@ -306,7 +395,8 @@ public class MetricsStore {
                 && sqlBuckets.Count == 0
                 && retryBuckets.Count == 0
                 && retryErrors.Count == 0
-                && retrySqlBuckets.Count == 0) {
+                && retrySqlBuckets.Count == 0
+                && (configuredRouteEvery == 0 || routeDiagnostics.PendingRows() == 0)) {
                 return 0;
             }
             flushActive = true;
@@ -322,6 +412,9 @@ public class MetricsStore {
         bool discard = false;
         int written = 0;
         try {
+            if (configuredRouteEvery > 0 && routeDiagnostics.PendingRows() > 0) {
+                routeDiagnostics.Detach(RetentionCutoff((long)WebApp.NowSeconds()));
+            }
             List<MetricMinute> mine = new List<MetricMinute>();
             for (int i = 0; i < retryBuckets.Count; i = i + 1) {
                 MinuteBucket b = retryBuckets[i];
@@ -367,10 +460,14 @@ public class MetricsStore {
                     written = written + await fsql.Insert<MetricError>(retryErrors)
                         .ExecuteAffrowsAsync();
                 }
+                if (configuredRouteEvery > 0) {
+                    written = written + await routeDiagnostics.Persist(fsql);
+                }
                 if (!await db.CommitAsync()) {
                     throw new Exception("commit failed");
                 }
                 /* 只有确认提交成功才丢弃批次；清理过期行失败不能重放已提交数据。 */
+                if (configuredRouteEvery > 0) { routeDiagnostics.Committed(); }
                 lock (batchLock) {
                     retryBuckets = new List<MinuteBucket>();
                     retryErrors = new List<MetricError>();
@@ -428,12 +525,16 @@ public class MetricsStore {
         await Flush();
     }
 
+    private static long RetentionCutoff(long now) {
+        return now - (long)Cfg.Metrics.keepDays * 86400;
+    }
+
     /* 按保留天数清理过期数据，每小时最多执行一次。 */
     public static async void Sweep(IZanSql fsql) {
         long now = (long)WebApp.NowSeconds();
         if (now - lastSweep < 3600) { return; }
         lastSweep = now;
-        long cut = now - (long)Cfg.Metrics.keepDays * 86400;
+        long cut = RetentionCutoff(now);
         long dayCut = Day(cut);
         /* 批量清扫走显式列谓词下推（范围比较 + 参数绑定），整表过滤
          * 不进内存；bool lambda Where 现按主键集合下推，留给行数有限的
@@ -450,6 +551,18 @@ public class MetricsStore {
         ds.inner.W("day < ?");
         ds.inner.Pl(dayCut);
         int _c = await ds.ExecuteAffrowsAsync();
+        DeleteQuery<MetricRouteDiagnostic> dr = fsql.Delete<MetricRouteDiagnostic>();
+        dr.inner.W("minute < ?");
+        dr.inner.Pl(cut);
+        int _d = await dr.ExecuteAffrowsAsync();
+        DeleteQuery<MetricRouteStage> dt = fsql.Delete<MetricRouteStage>();
+        dt.inner.W("minute < ?");
+        dt.inner.Pl(cut);
+        int _e = await dt.ExecuteAffrowsAsync();
+        DeleteQuery<MetricRouteResource> rr = fsql.Delete<MetricRouteResource>();
+        rr.inner.W("minute < ?");
+        rr.inner.Pl(cut);
+        int _f = await rr.ExecuteAffrowsAsync();
     }
 
     /* 查询窗口内 SQL 模板聚合，按调用/耗时/慢次数排序，数据库端聚合，无原始行入内存。 */
@@ -700,10 +813,12 @@ public class MetricsStore {
             retryBuckets.Clear();
             retryErrors.Clear();
             retrySqlBuckets.Clear();
+            routeDiagnostics.Reset();
             flushActive = false;
         }
         ready = false;
         flushing = false;
+        configuredRouteEvery = -1;
         pool = null;
     }
 }

@@ -44,7 +44,18 @@ public class DbPool : IDisposable {
     // worker 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
     // 全站无响应）。
     // 连接池关闭后同样返回 null。
+    public IDbConnection TryAcquireFast() {
+        while (true) {
+            IDbConnection c = this.core.TakeIdle();
+            if (c == null) { return null; }
+            if (c.IsConnected()) { return c; }
+            this.CloseAndDrop(c);
+        }
+    }
+
     public async IDbConnection AcquireAsync() {
+        IDbConnection fast = this.TryAcquireFast();
+        if (fast != null) { return fast; }
         PoolOpenAsync<IDbConnection> open = this.OpenOne;
         Predicate<IDbConnection> connected = DbPool.IsUsable;
         Action<IDbConnection> close = DbPool.CloseConnection;
@@ -94,9 +105,7 @@ public class DbPool : IDisposable {
     // <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
     // "容量已耗尽"。归还方式与借出的连接相同。
     public IDbConnection TryAcquire() {
-        Predicate<IDbConnection> connected = DbPool.IsUsable;
-        Action<IDbConnection> close = DbPool.CloseConnection;
-        return this.core.TryAcquireIdle(connected, close);
+        return this.TryAcquireFast();
     }
 
     // 最多打开 <paramref name="count"/> 个连接（上限为

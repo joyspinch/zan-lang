@@ -74,28 +74,28 @@ public class WebDavClient : IDisposable {
             + "</D:prop></D:propfind>";
     }
 
-    // XML 五个预定义实体的转义。
+    // XML 五个预定义实体的转义（单遍扫描 + 惰性 StringBuilder）。
     public static string EscapeXml(string text) {
         if (text == null || text.Length == 0) { return ""; }
-        if (text.IndexOf("&") < 0 && text.IndexOf("<") < 0 && text.IndexOf(">") < 0
-            && text.IndexOf("\"") < 0 && text.IndexOf("'") < 0) {
-            return text;
-        }
-        StringBuilder result = new StringBuilder();
+        StringBuilder result = null;
         int len = text.Length;
         int last = 0;
         for (int i = 0; i < len; i = i + 1) {
             int c = text[i] & 255;
-            if (c == 38 || c == 60 || c == 62 || c == 34 || c == 39) {
+            string esc = null;
+            if (c == 38) { esc = "&amp;"; }
+            else if (c == 60) { esc = "&lt;"; }
+            else if (c == 62) { esc = "&gt;"; }
+            else if (c == 34) { esc = "&quot;"; }
+            else if (c == 39) { esc = "&apos;"; }
+            if (esc != null) {
+                if (result == null) { result = new StringBuilder(); }
                 if (i > last) { result.Append(text.Substring(last, i - last)); }
-                if (c == 38) { result.Append("&amp;"); }
-                else if (c == 60) { result.Append("&lt;"); }
-                else if (c == 62) { result.Append("&gt;"); }
-                else if (c == 34) { result.Append("&quot;"); }
-                else { result.Append("&apos;"); }
+                result.Append(esc);
                 last = i + 1;
             }
         }
+        if (result == null) { return text; }
         if (last < len) { result.Append(text.Substring(last, len - last)); }
         return result.ToString();
     }
@@ -111,7 +111,7 @@ public class WebDavClient : IDisposable {
         while (i < len) {
             if ((text[i] & 255) == 38) {  // '&'
                 if (i > last) { result.Append(text.Substring(last, i - last)); }
-                int semi = WebDavClient.IndexOf(text, ";", i + 1);
+                int semi = text.IndexOf(";", i + 1);
                 if (semi > i) {
                     string entity = text.Substring(i, semi - i + 1);
                     if (entity == "&amp;") { result.Append("&"); i = semi + 1; }
@@ -392,7 +392,13 @@ public class WebDavClient : IDisposable {
             for (int i = 0; i + 1 < setProps.Count; i = i + 2) {
                 string pName = WebDavClient.EscapeXml(setProps[i]);
                 string pVal = WebDavClient.EscapeXml(setProps[i + 1]);
-                sb.Append("<D:" + pName + ">" + pVal + "</D:" + pName + ">");
+                sb.Append("<D:");
+                sb.Append(pName);
+                sb.Append(">");
+                sb.Append(pVal);
+                sb.Append("</D:");
+                sb.Append(pName);
+                sb.Append(">");
             }
             sb.Append("</D:prop></D:set>");
         }
@@ -400,7 +406,9 @@ public class WebDavClient : IDisposable {
             sb.Append("<D:remove><D:prop>");
             for (int j = 0; j < removeProps.Count; j = j + 1) {
                 string rName = WebDavClient.EscapeXml(removeProps[j]);
-                sb.Append("<D:" + rName + "/>");
+                sb.Append("<D:");
+                sb.Append(rName);
+                sb.Append("/>");
             }
             sb.Append("</D:prop></D:remove>");
         }
@@ -432,7 +440,7 @@ public class WebDavClient : IDisposable {
                     }
                     return res;
                 }
-                string res2 = WebDavClient.UnescapeXml(WebDavClient.Trim(tokenInner));
+                string res2 = WebDavClient.UnescapeXml(tokenInner.Trim());
                 if (res2.Length >= 2 && (res2[0] & 255) == 60 && (res2[res2.Length - 1] & 255) == 62) {
                     res2 = res2.Substring(1, res2.Length - 2);
                 }
@@ -499,7 +507,7 @@ public class WebDavClient : IDisposable {
 
     // 第一个 localName 标签的去转义文本内容；不存在为 ""。
     private static string TagValue(string xml, string localName) {
-        return WebDavClient.UnescapeXml(WebDavClient.Trim(WebDavClient.TagInner(xml, localName)));
+        return WebDavClient.UnescapeXml(WebDavClient.TagInner(xml, localName).Trim());
     }
 
     // 最后一个 localName 标签的去转义文本内容；不存在为 ""。
@@ -514,8 +522,8 @@ public class WebDavClient : IDisposable {
             if (start < 0) { break; }
             int close = WebDavClient.FindClose(xml, localName, start + 1);
             if (close < 0) { break; }
-            result = WebDavClient.UnescapeXml(WebDavClient.Trim(
-                xml.Substring(start + 1, close - start - 1)));
+            result = WebDavClient.UnescapeXml(
+                xml.Substring(start + 1, close - start - 1).Trim());
             from = close + 1;
         }
         return result;
@@ -533,12 +541,26 @@ public class WebDavClient : IDisposable {
         return xml.Substring(start + 1, close - start - 1);
     }
 
+    private static bool MatchLocalName(string xml, int nameStart, int end, string localName) {
+        int colon = -1;
+        for (int i = nameStart; i < end; i = i + 1) {
+            if ((xml[i] & 255) == 58) { colon = i; break; }
+        }
+        if (colon >= 0) { nameStart = colon + 1; }
+        int len = localName.Length;
+        if (end - nameStart != len) { return false; }
+        for (int k = 0; k < len; k = k + 1) {
+            if ((xml[nameStart + k] & 255) != (localName[k] & 255)) { return false; }
+        }
+        return true;
+    }
+
     // 从 from 起找第一个名为 localName 的开始标签（忽略命名空间
     // 前缀，跳过注释/处理指令/结束标签）；没有返回 -1。
     private static int FindOpen(string xml, string localName, int from) {
-        int pos = from;
+        int pos = from < 0 ? 0 : from;
         while (pos < xml.Length) {
-            int lt = WebDavClient.IndexOf(xml, "<", pos);
+            int lt = xml.IndexOf("<", pos);
             if (lt < 0 || lt + 1 >= xml.Length) { return -1; }
             int first = xml[lt + 1] & 255;
             if (first != 47 && first != 33 && first != 63) {  // not '/', '!', '?'
@@ -548,10 +570,7 @@ public class WebDavClient : IDisposable {
                     if (c == 62 || c == 47 || c == 32 || c == 9 || c == 13 || c == 10) { break; }
                     end = end + 1;
                 }
-                string name = xml.Substring(lt + 1, end - lt - 1);
-                int colon = name.IndexOf(":");
-                if (colon >= 0) { name = name.Substring(colon + 1); }
-                if (name == localName) { return lt; }
+                if (WebDavClient.MatchLocalName(xml, lt + 1, end, localName)) { return lt; }
             }
             pos = lt + 1;
         }
@@ -561,9 +580,9 @@ public class WebDavClient : IDisposable {
     // 从 from 起找第一个 localName 结束标签（忽略命名空间前缀）；
     // 没有返回 -1。
     private static int FindClose(string xml, string localName, int from) {
-        int pos = from;
+        int pos = from < 0 ? 0 : from;
         while (pos < xml.Length) {
-            int lt = WebDavClient.IndexOf(xml, "</", pos);
+            int lt = xml.IndexOf("</", pos);
             if (lt < 0) { return -1; }
             int end = lt + 2;
             while (end < xml.Length) {
@@ -571,21 +590,10 @@ public class WebDavClient : IDisposable {
                 if (c == 62 || c == 32 || c == 9 || c == 13 || c == 10) { break; }
                 end = end + 1;
             }
-            string name = xml.Substring(lt + 2, end - lt - 2);
-            int colon = name.IndexOf(":");
-            if (colon >= 0) { name = name.Substring(colon + 1); }
-            if (name == localName) { return lt; }
+            if (WebDavClient.MatchLocalName(xml, lt + 2, end, localName)) { return lt; }
             pos = lt + 2;
         }
         return -1;
-    }
-
-    // 从 from 起的子串搜索；没有返回 -1。
-    private static int IndexOf(string haystack, string needle, int from) {
-        if (haystack == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > haystack.Length) { return -1; }
-        return haystack.IndexOf(needle, from);
     }
 
     // 标签开始处的 "<" 的下标 → 结束 ">" 的下标（跳过引号里的
@@ -606,27 +614,6 @@ public class WebDavClient : IDisposable {
             i = i + 1;
         }
         return -1;
-    }
-
-    // 去掉两侧 XML 空白（空格/制表/CR/LF）。
-    private static string Trim(string text) {
-        if (text == null) { return ""; }
-        int first = 0;
-        int last = text.Length;
-        while (first < last && WebDavClient.IsSpaceByte(text[first] & 255)) { first = first + 1; }
-        while (last > first && WebDavClient.IsSpaceByte(text[last - 1] & 255)) { last = last - 1; }
-        if (first == 0 && last == text.Length) { return text; }
-        return text.Substring(first, last - first);
-    }
-
-    // 该单字符字节是否为 XML 空白。
-    private static bool IsSpaceByte(int c) {
-        return c == 32 || c == 9 || c == 13 || c == 10;
-    }
-
-    // 该单字符是否为 XML 空白。
-    private static bool IsSpace(string ch) {
-        return ch == " " || ch == "\t" || ch == "\r" || ch == "\n";
     }
 
     // 从 "HTTP/1.1 207 Multi-Status" 一类文本里取第一段三位数字；

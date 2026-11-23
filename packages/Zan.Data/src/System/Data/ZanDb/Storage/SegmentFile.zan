@@ -134,8 +134,7 @@ public class SegmentFile {
     // 最近一次错误描述（块 CRC 不符也记在这里）。
     public string GetError() { return this.lastError; }
 
-    // 定位 key 所在或其插入位置的块号：最后一个
-    // 块首键 &lt;= key 的块；key 小于所有块首键时返回 0。
+    // 定位 key 所在或其插入位置的块号（最后一个块首键 <= key 的块；小于全部首键返回 0）。
     public int BlockFor(string key) {
         int lo = 0;
         int hi = this.entries.Count - 1;
@@ -155,12 +154,8 @@ public class SegmentFile {
     // 稀疏索引覆盖的块数（0 = 空段）。
     public int BlockCount() { return this.entries.Count; }
 
-    // 块跨度整读：把块 [fromBlock, toBlock) 的文件区间
-    // 一次 ReadAt 读入（块在段文件里物理连续），供块级内核跨块
-    // 连续解析——把每块一次的系统调用摊成每跨度一次。 CRC 逐块
-    // 校验（块边界在缓冲内偏移已知；用 NativeMemory.Crc32 直接
-    // 对缓冲内子区间算，不复制）。未固化校验的块标记为已验。
-    // 失败返回 null 并在 GetError 留痕；缓冲归调用方 Free。
+    // 一次 ReadAt 读入 [fromBlock, toBlock) 连续块区间并逐块校验未缓存 CRC；
+    // 失败返回 null 并在 GetError 留痕，缓冲归调用方 Free。
     public ByteBuffer LoadBlockSpan(int fromBlock, int toBlock, ByteBuffer reuse) {
         if (fromBlock < 0 || toBlock > this.entries.Count || fromBlock >= toBlock) {
             this.lastError = "segment block span out of range";
@@ -184,9 +179,7 @@ public class SegmentFile {
         }
         for (int i = fromBlock; i < toBlock; i = i + 1) {
             if (this.entries[i].verified == 0) {
-                long bend = this.indexStart;
-                if (i + 1 < this.entries.Count) { bend = this.entries[i + 1].offset; }
-                int blen = (int)(bend - this.entries[i].offset);
+                int blen = this.BlockLen(i);
                 int boff = (int)(this.entries[i].offset - start);
                 if (NativeMemory.Crc32(b.Raw() + boff, blen) != this.entries[i].crc) {
                     this.lastError = "segment block corrupt";
@@ -210,26 +203,19 @@ public class SegmentFile {
         return (int)(end - this.entries[i].offset);
     }
 
-    // 加载块 i 并校验 CRC；失败（越界/腐坏/短读）返回 null
-    // 并在 <see cref="GetError"/> 留痕。缓冲区归调用方 Free。
+    // 加载块 i 并校验 CRC；失败返回 null 并在 GetError 留痕，缓冲区归调用方 Free。
     public ByteBuffer LoadBlock(int i) {
-        ByteBuffer b = this.LoadBlockReuse(i, null);
-        return b;
+        return this.LoadBlockReuse(i, null);
     }
 
-    // <see cref="LoadBlock"/> 的复用形式：给定非 null 的
-    // reuse 缓冲时原地扩容读入（容量足够则零分配），消除每块的
-    // Alloc/Free。段不可变——CRC 每块只在首次加载时校验一次，
-    // 之后同一打开会话内的重复读取免 CRC（读时不算派生数）。
+    // LoadBlock 的复用缓冲版：非 null reuse 原地读入，每块只于首次加载校验 CRC。
     public ByteBuffer LoadBlockReuse(int i, ByteBuffer reuse) {
         if (i < 0 || i >= this.entries.Count) {
             // 空段（0 条记录）或越界：返回「未命中」而不是索引崩。
             this.lastError = "segment block out of range";
             return null;
         }
-        long end = this.indexStart;
-        if (i + 1 < this.entries.Count) { end = this.entries[i + 1].offset; }
-        int len = (int)(end - this.entries[i].offset);
+        int len = this.BlockLen(i);
         if (len <= 0) {
             this.lastError = "segment block empty";
             return null;
@@ -254,28 +240,19 @@ public class SegmentFile {
         return b;
     }
 
-    // 块内顺序解析下一条记录到 key/val/op；
-    // 缓冲耗尽返回 false。读位置推进到下一条记录。
+    // 块内顺序解析下一条记录到 key/val/op；缓冲耗尽返回 false。
     public static bool NextRecord(ByteBuffer b, out string key, out string val, out int op) {
         key = "";
         val = "";
-        op = 0;
-        if (!b.CanRead(1)) { return false; }
-        op = b.ReadU8();
-        if (op != 1 && op != 2) { return false; }
-        if (!b.CanRead(1)) { return false; }
-        long klen = b.ReadVarInt();
-        if (klen < 0 || !b.CanRead((int)klen)) { return false; }
-        int kp = b.ReadPos();
-        b.SeekRead(kp + (int)klen);
-        key = b.Str(kp, (int)klen);
-        if (op == 2) { return true; }
-        if (!b.CanRead(1)) { return false; }
-        long vlen = b.ReadVarInt();
-        if (vlen < 0 || !b.CanRead((int)vlen)) { return false; }
-        int vp = b.ReadPos();
-        b.SeekRead(vp + (int)vlen);
-        val = b.Str(vp, (int)vlen);
+        int keyOff;
+        int keyLen;
+        int valOff;
+        int valLen;
+        if (!SegmentFile.NextRecordRaw(b, out keyOff, out keyLen, out valOff, out valLen, out op)) {
+            return false;
+        }
+        key = b.Str(keyOff, keyLen);
+        if (op != 2) { val = b.Str(valOff, valLen); }
         return true;
     }
 

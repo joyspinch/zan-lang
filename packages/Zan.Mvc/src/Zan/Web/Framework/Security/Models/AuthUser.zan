@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
+using Zan.Web.Core;
+using Zan.Web.Dao;
 using Zan.Web.Model;
 
 namespace Zan.Web.Security;
@@ -23,56 +25,10 @@ public class AuthUser {
         s.Db().Release(db);
     }
 
-    /* 遗留口令哈希：12000 轮 SHA-256 迭代链（material_{r+1} =
-       hex(sha256(material_r + ":" + salt))），仅用于校验升级前的旧行；
-       新写入一律走 <see cref="NewHash"/> 的 PBKDF2 自描述格式。*/
-    public static string PasswordHash(string password, string salt) {
-        int saltLen = salt.Length;
-        int pwLen = password.Length;
-        /* 第一轮为 salt:password:salt，后续为 64 hex:salt。
-           先用 long 算长度，拒绝 int 分配长度溢出；不限制既存凭证长度。 */
-        long firstBytes = (long)pwLen + (long)saltLen * 2 + 2;
-        long roundBytes = 64 + (long)saltLen + 1;
-        long capacity = firstBytes > roundBytes ? firstBytes : roundBytes;
-        if (capacity >= 2147483647) {
-            throw new ArgumentException("legacy password material is too large");
-        }
-        nint buf = NativeMemory.Alloc((int)capacity + 1);
-        nint tbl = 0;
-        try {
-            NativeMemory.PutString(buf, 0, salt, saltLen);
-            NativeMemory.PutString(buf, saltLen, ":", 1);
-            NativeMemory.PutString(buf, saltLen + 1, password, password.Length);
-            int len = saltLen + 1 + password.Length;
-            Span<byte> hex = new Span<byte>(buf, 65);
-            /* 16 进制半字节表，Span 直读直写 */
-            tbl = NativeMemory.Alloc(16);
-            NativeMemory.PutString(tbl, 0, "0123456789abcdef", 16);
-            Span<byte> dt = new Span<byte>(tbl, 16);
-            for (int i = 0; i < 12000; i = i + 1) {
-                NativeMemory.PutString(buf, len, ":", 1);
-                NativeMemory.PutString(buf, len + 1, salt, saltLen);
-                string digest = NativeMemory.Sha256(buf, len + 1 + saltLen);
-                for (int b = 0; b < 32; b = b + 1) {
-                    int v = digest[b] & 255;
-                    hex[2 * b] = dt[v >> 4];
-                    hex[2 * b + 1] = dt[v & 15];
-                }
-                len = 64;
-            }
-            /* 最后一轮的 hex 摘要就在缓冲前 64 字节 */
-            return NativeMemory.GetString(buf, 0, 64);
-        } finally {
-            if (tbl != 0) { NativeMemory.Free(tbl); }
-            NativeMemory.Free(buf);
-        }
-    }
-
     /* PBKDF2-HMAC-SHA256（stdlib Pbkdf2，默认 30 万轮 ≈ 0.17s/次，
        登录专用路径）。存库格式自描述：pbkdf2$<iter>$<saltHex>$<hashHex>
-       ——盐与轮数随哈希落库，调参不迁移旧值；passwordSalt 列只服务
-       遗留行。迭代次数取 [auth].iter（env ZAN_AUTH_PBKDF2_ITER），
-       下限 1000。 */
+       ——盐与轮数随哈希落库，调参不迁移旧值。迭代次数取 [auth].iter
+       （env ZAN_AUTH_PBKDF2_ITER），下限 1000。 */
     public static string NewHash(string password) {
         int iter = Cfg.Auth.iter;
         if (iter < 1000) { iter = 300000; }
@@ -81,25 +37,18 @@ public class AuthUser {
         return "pbkdf2$" + Convert.ToString(iter) + "$" + salt + "$" + hex;
     }
 
-    /* 校验口令对一行凭证：pbkdf2$ 自描述格式按解析出的盐/轮数重派生
-       比对；否则按遗留迭代链（passwordSalt 列）。比较走常时路径；
-       格式不认得、字段残缺一律拒绝。 */
-    public static bool Verify(string password, string saltCol, string stored) {
-        if (stored.IndexOf("pbkdf2$") == 0) {
-            int p1 = stored.IndexOf("$", 7);
-            int p2 = stored.IndexOf("$", p1 + 1);
-            if (p1 < 0 || p2 < 0) { return false; }
-            int iter = Filter.ToInt(stored.Substring(7, p1 - 7), 0);
-            string salt = stored.Substring(p1 + 1, p2 - p1 - 1);
-            string want = stored.Substring(p2 + 1);
-            if (iter < 1 || salt.Length == 0 || want.Length != 64) { return false; }
-            return AuthToken.Equal(Pbkdf2.Hex(password, salt, iter), want);
-        }
-        if (saltCol.Length > 0 && stored.Length == 64) {
-            return AuthToken.Equal(PasswordHash(password, saltCol),
-                stored);
-        }
-        return false;
+    /* 校验口令对一行凭证：仅接受 pbkdf2$ 自描述格式，按解析出的盐/轮数重派生
+       常时比对；格式不认得、字段残缺一律拒绝。 */
+    public static bool Verify(string password, string stored) {
+        if (stored == null || stored.IndexOf("pbkdf2$") != 0) { return false; }
+        int p1 = stored.IndexOf("$", 7);
+        int p2 = stored.IndexOf("$", p1 + 1);
+        if (p1 < 0 || p2 < 0) { return false; }
+        int iter = Filter.ToInt(stored.Substring(7, p1 - 7), 0);
+        string salt = stored.Substring(p1 + 1, p2 - p1 - 1);
+        string want = stored.Substring(p2 + 1);
+        if (iter < 1 || salt.Length == 0 || want.Length != 64) { return false; }
+        return AuthToken.Equal(Pbkdf2.Hex(password, salt, iter), want);
     }
 
     /* ZanSql 门面：认证单操作经门面逐次取还池连接，等价于一次性借还。*/
@@ -129,76 +78,41 @@ public class AuthUser {
             LoginThrottle.Fail(username);
             return "";
         }
-        if (!Verify(password, row.passwordSalt, row.passwordHash)) {
+        if (!Verify(password, row.passwordHash)) {
             LoginThrottle.Fail(username);
             return "";
         }
-        /* 遗留行成功登录即升级为 pbkdf2$ 自描述格式；写库失败静默，
-           下次登录再试。不 bump tokenVersion：已发会话与口令哈希无关。 */
-        if (row.passwordHash.IndexOf("pbkdf2$") != 0) {
-            await UpgradeHash(row.id, password);
+        Dictionary<string, string> claims = new Dictionary<string, string>();
+        if (MvcHooks.HasLoginGuards() || MvcHooks.HasLoginEvents() || MvcHooks.HasTokenClaimHooks()) {
+            IDbConnection db = await Lease();
+            if (db == null) {
+                if (MvcHooks.HasLoginGuards()) { return ""; }
+            } else {
+                try {
+                    if (MvcHooks.HasLoginGuards()) {
+                        string denied = await MvcHooks.RunLoginGuards(db, row);
+                        if (denied.Length > 0) {
+                            Log.Warn("[auth] login guard rejected user=" + username + ": " + denied);
+                            return "";
+                        }
+                    }
+                    if (MvcHooks.HasTokenClaimHooks()) {
+                        await MvcHooks.RunTokenClaims(db, row, claims);
+                    }
+                    if (MvcHooks.HasLoginEvents()) {
+                        await MvcHooks.RunLoginEvents(db, row);
+                    }
+                } finally {
+                    Give(db);
+                }
+            }
         }
         LoginThrottle.Clear(username);
         return AuthToken.Issue(Convert.ToString(row.id), row.tokenVersion,
-            WebApp.NowSeconds());
+            WebApp.NowSeconds(), claims);
     }
 
-    /* 登录成功后的哈希格式升级（遗留链 → pbkdf2$）。独立门面操作，
-       绝不嵌套在调用方租约之内。 */
-    public static async void UpgradeHash(int uid, string password) {
-        int _n = await new SysUserDao().UpgradeHash(uid,
-            NewHash(password), WebApp.NowSeconds());
-    }
-
-    /* 保留版本缓存操作供既有调用方使用；认证必须读取数据库中的当前版本和状态。
-       进程内缓存无法同步其他 worker 的撤销，也可能被已开始的旧查询回填。*/
-    public static const int VerTtlSec = 30;
-
-    private static List<AuthTokenVersionEntry> verEntries = new List<AuthTokenVersionEntry>();
-
-    /* 命中返回缓存的版本号，过期/缺失返回 -1。 */
-    public static int CachedVersion(string uid, int now) {
-        lock (verEntries) {
-            for (int i = 0; i < verEntries.Count; i = i + 1) {
-                AuthTokenVersionEntry e = verEntries[i];
-                if (e != null && e.uid == uid && e.goodUntil > now) {
-                    return e.version;
-                }
-            }
-        }
-        return -1;
-    }
-
-    public static void StoreVersion(string uid, int version, int now) {
-        lock (verEntries) {
-            /* 顺带清扫过期项：倒序安全移除，永不漏项或死循环。 */
-            for (int i = verEntries.Count - 1; i >= 0; i = i - 1) {
-                AuthTokenVersionEntry e = verEntries[i];
-                if (e == null || e.goodUntil <= now) {
-                    verEntries.RemoveAt(i);
-                } else if (e.uid == uid) {
-                    e.version = version;
-                    e.goodUntil = now + VerTtlSec;
-                    return;
-                }
-            }
-            verEntries.Add(new AuthTokenVersionEntry(uid, version, now + VerTtlSec));
-        }
-    }
-
-    public static void DropCachedVersion(string uid) {
-        lock (verEntries) {
-            for (int i = 0; i < verEntries.Count; i = i + 1) {
-                AuthTokenVersionEntry e = verEntries[i];
-                if (e != null && e.uid == uid) {
-                    verEntries.RemoveAt(i);
-                    return;
-                }
-            }
-        }
-    }
-
-    /* 撤销后的下一次认证以持久化版本为准，不信任短 TTL 的进程缓存。 */
+    /* 认证以数据库中的持久化版本与状态为准，不使用进程内短 TTL 缓存。 */
     public static async int TokenVersion(string uid) {
         SysUser row = await ById(uid);
         if (row == null || row.status != Active) { return -1; }
@@ -211,7 +125,7 @@ public class AuthUser {
 
     /* ---- 授权 ---- */
     /* 模型：用户持角色，角色持路由 action，action 是调度和菜单共问的唯一权限单位。权限数据在共享内存（PermTable），首次缺失时从数据库加载。授权变更主动写回共享内存。*/
-    /* 授权变更时同步失效版本缓存。若启用了集群总线，向集群广播。*/
+    /* 授权变更时使共享内存权限失效；若启用了集群总线，向集群广播。*/
     public static void Forget(string uid) {
         ForgetLocal(uid);
         if (ClusterBus.Enabled()) {
@@ -219,9 +133,8 @@ public class AuthUser {
         }
     }
 
-    /* 仅清除本进程内存与共享内存，不发跨节点广播（用于接收集群广播或纯本地清理）。*/
+    /* 仅清除本进程及本机共享内存，不发跨节点广播（用于接收集群广播或纯本地清理）。*/
     public static void ForgetLocal(string uid) {
-        DropCachedVersion(uid);
         PermTable.Forget(uid);
     }
 
@@ -233,20 +146,23 @@ public class AuthUser {
     }
 
     public static void ForgetAllLocal() {
-        lock (verEntries) {
-            verEntries.Clear();
-        }
         PermTable.ForgetAll();
     }
 
     public static async void RolesChanged(IDbConnection db) {
-        await PermTable.LoadRoles(db);
-        PermTable.ForgetAll();
+        try {
+            await PermTable.LoadRolesWithRetry(ZanSql.FromConnection(db), Orm());
+        } finally {
+            if (ClusterBus.Enabled()) { ClusterBus.PublishRolesChanged(); }
+        }
     }
 
     public static async void RolesChanged(List<SysRole> roles, List<SysRoleGrant> grants) {
-        await PermTable.LoadRoles(roles, grants);
-        PermTable.ForgetAll();
+        try {
+            await PermTable.LoadRoles(roles, grants);
+        } finally {
+            if (ClusterBus.Enabled()) { ClusterBus.PublishRolesChanged(); }
+        }
     }
 
     /* 调度器和菜单共用的权限解析：账号是否可执行该 action。Bootstrap 账号绕过查找。
@@ -257,15 +173,20 @@ public class AuthUser {
         return await Allow(null, uid, action);
     }
 
+    public static async bool AllowInScope(string uid, string action, object scope) {
+        if (scope == null) { return await Allow(uid, action); }
+        return await Allow((IDbConnection)scope, uid, action);
+    }
+
     /* 带租约的权限解析：db 传调用方已持有的请求租约（Held()），角色
        未命中时的回填查询直接跑在它上面，不再二次借连接；传 null 则
        自行借还一次（调用方未持有任何连接时）。 */
     public static async bool Allow(IDbConnection db, string uid, string action) {
         if (action.Length == 0) { return false; }
+        long version = PermTable.UserVersion(uid);
         string roleIds = await RolesOf(db, uid);
-        if (roleIds == "*") { return true; }
-        if (roleIds.Length == 0) { return false; }
-        return PermTable.RolesAllow(roleIds, action);
+        bool allowed = roleIds == "*" || (roleIds.Length > 0 && PermTable.RolesAllow(roleIds, action));
+        return allowed && PermTable.UserVersion(uid) == version;
     }
 
     /* 该账号在某屏上的按钮掩码；与 Allow() 拒之依据为同一决策。Bootstrap 账号持该屏所有位。 */
@@ -276,10 +197,10 @@ public class AuthUser {
     /* 带租约的按钮掩码：语义同 <see cref="Allow"/> 的带连接重载。 */
     public static async int MaskOf(IDbConnection db, string uid, string screen) {
         if (screen.Length == 0) { return 0; }
+        long version = PermTable.UserVersion(uid);
         string roleIds = await RolesOf(db, uid);
-        if (roleIds == "*") { return Perm.MaskOf(screen); }
-        if (roleIds.Length == 0) { return 0; }
-        return PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
+        int mask = roleIds == "*" ? Perm.MaskOf(screen) : PermTable.RolesMask(roleIds, screen) & Perm.MaskOf(screen);
+        return PermTable.UserVersion(uid) == version ? mask : 0;
     }
 
     /* 账号角色 ",3,7,"；"*" 为 bootstrap；"" 为未知/禁用/数据库不可达。共享内存读，首次缺失从数据库填充。*/
@@ -294,8 +215,10 @@ public class AuthUser {
        自行借还一次，此时本协程未持有任何连接，顺序借用是安全的。*/
     public static async string RolesOf(IDbConnection db, string uid) {
         int id = ToInt(uid);
-        if (id <= 0) { return ""; }
+        long version = PermTable.UserVersion(uid);
+        if (id <= 0 || version == 0) { return ""; }
 
+        uid = Convert.ToString(id);
         string hit = PermTable.UserRoles(uid);
         if (hit.Length > 0) { return hit; }
 
@@ -306,15 +229,14 @@ public class AuthUser {
             db = owned;
         }
         try {
+            if (PermTable.UserVersion(uid) != version) { return ""; }
             SysUser me = await db.Select<SysUser>().Where(a => a.id == id).FirstAsync();
             if (me == null || me.status != Active) { return ""; }
             if (me.isSuper == 1) {
-                PermTable.SetUser(uid, true, "");
-                return "*";
+                return PermTable.SetUserIfCurrent(uid, true, "", version) ? "*" : "";
             }
             string joined = await RoleIds(db, me);
-            PermTable.SetUser(uid, false, joined);
-            return joined;
+            return PermTable.SetUserIfCurrent(uid, false, joined, version) ? joined : "";
         } finally {
             if (owned != null) { Give(owned); }
         }
@@ -330,10 +252,13 @@ public class AuthUser {
         }
         int dept = me.departmentId;
         if (dept > 0) {
-            List<SysDepartmentRole> byDept = await db.Select<SysDepartmentRole>()
-                .Where(a => a.departmentId == dept).ToListAsync();
-            for (int i = 0; i < byDept.Count; i = i + 1) {
-                AddId(roleIds, byDept[i].roleId);
+            SysDepartment d = await db.Select<SysDepartment>().Where(a => a.id == dept).FirstAsync();
+            if (d != null && d.status == 1) {
+                List<SysDepartmentRole> byDept = await db.Select<SysDepartmentRole>()
+                    .Where(a => a.departmentId == dept).ToListAsync();
+                for (int i = 0; i < byDept.Count; i = i + 1) {
+                    AddId(roleIds, byDept[i].roleId);
+                }
             }
         }
         if (roleIds.Count == 0) { return ""; }

@@ -1,0 +1,114 @@
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System;
+
+namespace System.Web;
+
+// HttpContext 传输层与流式接管部分（TLS/Socket/Deadline/SSE/WebSocket）。
+public partial class HttpContext {
+    public WebApp App() { return this.app; }
+
+    public void ExcludeRequestProfile() {
+        RequestTrace trace = this.Trace;
+        if (trace == null) { return; }
+        trace.Discard();
+        this.Trace = null;
+    }
+
+    public void SetApp(WebApp a) { this.app = a; }
+    public void Attach(TcpClient client) { this.conn = client; }
+    public void AttachTls(TlsStream stream) { this.tlsStream = stream; }
+    public TlsStream Tls() { return this.tlsStream; }
+    public bool IsSecure() { return this.tlsStream != null || this.Header("X-Forwarded-Proto") == "https"; }
+
+    public nint ClientSock() {
+        if (this.conn == null) { return 0; }
+        return this.conn.Sock();
+    }
+
+    public HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
+    public int StreamIdleMs() { return this.streamIdleMs; }
+    public HttpFramer Framer() { return this.framer; }
+    public TcpClient Conn() { return this.conn; }
+
+    public void SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
+        this.deadlineSlot = slot;
+        this.streamIdleMs = idleMs;
+    }
+
+    public void SetFramer(HttpFramer framer) { this.framer = framer; }
+
+    public void TouchDeadline(int timeoutMs) {
+        if (this.deadlineSlot != null) {
+            HttpDeadline.Touch(this.deadlineSlot, timeoutMs);
+        }
+    }
+
+    public void Hijack() {
+        this.hijacked = true;
+        this.wasHijacked = true;
+    }
+
+    public void CloseHijack() {
+        this.hijacked = false;
+    }
+
+    public void RecordFrame(long bytes) {
+        this.frames = this.frames + 1;
+        this.framesBytes = this.framesBytes + bytes;
+    }
+
+    public bool Hijacked() { return this.hijacked; }
+    public bool MetricsExcluded() { return this.wasHijacked; }
+    public long Frames() { return this.frames; }
+    public long FrameBytes() { return this.framesBytes; }
+
+    public async bool SseOpen() {
+        return await HttpSseStreamer.Open(this);
+    }
+
+    public async bool SendAllTcp(string data) {
+        return await HttpSseStreamer.SendAllTcp(this.conn, data);
+    }
+
+    public async bool SseSend(string name, string data) {
+        return await HttpSseStreamer.Send(this, name, data);
+    }
+
+    public async bool SsePing() {
+        return await HttpSseStreamer.Ping(this);
+    }
+
+    public bool IsWebSocketRequest() {
+        if (this.conn == null) { return false; }
+        string up = this.request.GetHeader("Upgrade");
+        int ul = up.Length;
+        int i = 0;
+        bool found = false;
+        while (i < ul && !found) {
+            while (i < ul && ((up[i] & 255) == 32 || (up[i] & 255) == 9)) {
+                i = i + 1;
+            }
+            int start = i;
+            while (i < ul && (up[i] & 255) != 44) { i = i + 1; }
+            int stop = i;
+            while (stop > start
+                   && ((up[stop - 1] & 255) == 32 || (up[stop - 1] & 255) == 9)) {
+                stop = stop - 1;
+            }
+            if (stop - start == 9) {
+                found = true;
+                string w = "websocket";
+                for (int j = 0; j < 9; j = j + 1) {
+                    int c = up[start + j] & 255;
+                    if (c >= 65 && c <= 90) { c = c + 32; }
+                    if (c != (w[j] & 255)) { found = false; break; }
+                }
+            }
+            i = i + 1;
+        }
+        if (!found) { return false; }
+        return this.request.GetHeader("Sec-WebSocket-Key").Length > 0;
+    }
+}

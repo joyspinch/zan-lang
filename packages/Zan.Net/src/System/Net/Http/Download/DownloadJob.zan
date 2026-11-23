@@ -66,13 +66,8 @@ public class DownloadJob {
         this.cancelGate = new AtomicInt(0);
     }
 
-    // 惰性初始化保底空实现
-    private static void EnsureShared() {
-    }
-
-    // 锁住进程级共享状态（首次使用时先惰性初始化）。
+    // 锁住进程级共享状态。
     private static void Lock() {
-        DownloadJob.EnsureShared();
         Mutex.Lock(DownloadJob.sLock);
     }
 
@@ -116,7 +111,6 @@ public class DownloadJob {
     // 在工作线程上开始处理。返回 false = 线程起不来（此时任务
     // 状态为失败，原因见 <see cref="Error"/>）。
     public bool Start() {
-        DownloadJob.EnsureShared();
         DownloadJob.Lock();
         this.stage = DownloadStage.Idle;
         this.failedStage = DownloadStage.Idle;
@@ -359,14 +353,25 @@ public class DownloadJob {
         }
     }
 
+    private static bool EndsWithAsciiIgnoreCase(string s, string lowerSuffix) {
+        if (s == null || s.Length < lowerSuffix.Length) { return false; }
+        int off = s.Length - lowerSuffix.Length;
+        for (int i = 0; i < lowerSuffix.Length; i = i + 1) {
+            int c = s[off + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lowerSuffix[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
     // 把下载好的文件安装到 <c>extractTo</c>：归档按扩展名解开，
     // 其余扩展名直接复制过去。
     private static bool Install(DownloadItem it) {
         if (it.installer != null) { return it.installer(it); }
         string dst = it.extractTo;
         Directory.CreateDirectoryRecursive(dst);
-        string low = it.localPath.ToLower();
-        if (low.EndsWith(".tar.bz2") || low.EndsWith(".tbz2")) {
+        if (DownloadJob.EndsWithAsciiIgnoreCase(it.localPath, ".tar.bz2")
+            || DownloadJob.EndsWithAsciiIgnoreCase(it.localPath, ".tbz2")) {
             string tar = it.localPath + ".tar";
             if (!BZip2.DecompressFile(it.localPath, tar)) {
                 File.Delete(tar);
@@ -376,10 +381,10 @@ public class DownloadJob {
             File.Delete(tar);
             return n > 0;
         }
-        if (low.EndsWith(".tar")) {
+        if (DownloadJob.EndsWithAsciiIgnoreCase(it.localPath, ".tar")) {
             return Tar.ExtractFile(it.localPath, dst) > 0;
         }
-        if (low.EndsWith(".zip")) {
+        if (DownloadJob.EndsWithAsciiIgnoreCase(it.localPath, ".zip")) {
             return Zip.ExtractToDirectory(it.localPath, dst) > 0;
         }
         File.Copy(it.localPath, dst + "/" + DownloadItem.LastSegment(it.localPath));
@@ -571,12 +576,13 @@ public class DownloadJob {
 
     // 路径的目录部分（兼容 / 与 \ 分隔符）；无分隔符返回 "."。
     private static string ParentDir(string path) {
-        int at = 0 - 1;
-        for (int i = 0; i < path.Length; i = i + 1) {
+        for (int i = path.Length - 1; i >= 0; i = i - 1) {
             int c = path[i] & 255;
-            if (c == 47 || c == 92) { at = i; }
+            if (c == 47 || c == 92) {
+                if (i == 0) { return "."; }
+                return path.Substring(0, i);
+            }
         }
-        if (at <= 0) { return "."; }
-        return path.Substring(0, at);
+        return ".";
     }
 }

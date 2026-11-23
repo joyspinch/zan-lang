@@ -41,13 +41,12 @@ src/Zan/Web/            包源码。目录是工程组织（Framework/Modules �
                             Fmt/Lang/Prose/Rows 渲染与格式化件
   Modules/                业务模块，一个目录一个模块（垂直切片：Controller+Model+Dao）
     Sys/
-      Controller/           接入层：目录=URL 族（Account/ Admin/ Api/ Blog/
-                            Health/ Index/ User/），一类一文件
+      Controller/           接入层：目录=URL 族（Account/ Admin/ Api/
+                            Health/ Index/），一类一文件
       Model/  Dao/          数据层：sys_* 实体与 DAO；DAO 统一封装实体业务操作，
-                            与普通查询共用实体访问器，见「DB 访问规范」；
-                            Model/Blog/、Dao/Blog/ 为示例模块
-      Services/             模块内非控制器业务件（业务种子 BlogSeed · GEO 内容源
-                            BlogGeo 等），不进 Controller/，见「Controller/ 纯净与端点纪律」
+                            与普通查询共用实体访问器，见「DB 访问规范」
+      Services/             模块内非控制器业务件（GEO 内容源、业务种子等），
+                            不进 Controller/，见「Controller/ 纯净与端点纪律」
     Crud/                   CRUD 模块：声明式 CRUD 引擎、配置驱动管理屏与表单设计器
       Engine/               引擎件：CrudOps 写网关 · FormPage 声明式表单页与校验 ·
                             ListPage 声明式列表页与表格配置 · Gen 表设计器与代码生成引擎
@@ -83,15 +82,15 @@ wwwroot/                唯一 Web 可达目录，挂载在 /static（css/js/ven
 
 ### 目录 ↔ namespace ↔ URL 三者同构
 
-`Modules/<模块>/Controller/` 以下的目录 == namespace（`ZanWeb.` 以下）==
-URL 族：`Controller/Admin/Content/Categories.zan` ↔ `ZanWeb.Admin.Content` ↔
-`/admin/content/*`。`Model/`、`Dao/` 层段保留在 namespace
-（`ZanWeb.Model[.子族]`、`ZanWeb.Dao[.子族]`）。模块目录名（Sys、Crud）
+`Modules/<模块>/Controller/` 以下的目录 == namespace（`Zan.Web.` 以下）==
+URL 族：`Controller/Admin/System/UsersController.zan` ↔ `Zan.Web.Admin.System` ↔
+`/admin/system/*`。`Model/`、`Dao/` 层段保留在 namespace
+（`Zan.Web.Model[.子族]`、`Zan.Web.Dao[.子族]`）。模块目录名（Sys、Crud）
 是纯物理分组——不入 namespace、不入 URL。
 
 为什么：RBAC 权限码就是 `namespace.Class.Action`
-（`Admin.Content.Categories.Def`），多级菜单分组就是 URL 第一段
-（`MenuBuilder.Section("content", "内容管理")` 注册段名，`ForUser` 从
+（`Admin.System.UsersController.Save`），多级菜单分组就是 URL 第一段
+（`MenuBuilder.Section("system", "系统管理")` 注册段名，`ForUser` 从
 路由表推导、可见性与放行走同一个权限解析器）。namespace 或目录一旦
 偏离 URL，权限码与菜单就失去锚点——不存在第二份要维护的映射表。
 
@@ -103,7 +102,7 @@ HTTP 仍是 200，页面渲染成 `<!-- view not found -->` 注释，冒烟只�
 
 **控制器一律 `XxxController`**：类名与文件名都带 `Controller` 后缀（`LoginController.zan`/`class LoginController`），一眼分清控制器；URL 不带——约定模板禁用 `[controller]`（类名进了 URL：类加后缀 URL 就跟着烂），一律写显式前缀（`api/data/[action]`）。视图键由类名派生，类加后缀=视图资产同提交改名。
 
-**屏 slug 与类名直译**：URL 末段（屏 slug）= 类名去 `Controller` 后缀小写，无任何前缀换算——域语义由 URL 的模块段承担（`system/jobs` ↔ `System/JobsController`），控制器类名不再叠 `Sys` 前缀；`sys_`/`blog_` 域前缀只属于数据层（实体/Dao/表），不上屏
+**屏 slug 与类名直译**：URL 末段（屏 slug）= 类名去 `Controller` 后缀小写，无任何前缀换算——域语义由 URL 的模块段承担（`system/jobs` ↔ `System/JobsController`），控制器类名不再叠 `Sys` 前缀；`sys_` 域前缀只属于数据层（实体/Dao/表），不上屏
 （`SysUsers`→`users`）；模块自名屏类名 = 目录名（`Admin/Media/Media.zan`
 ↔ `/admin/media`）。类名同时锚定文件名与视图文件名——改一处必须四处
 （文件、类、视图资产、引用）同一提交搬完。不同构时**改类名就 URL**：
@@ -117,7 +116,7 @@ URL 本身错置的（assistant 曾挂 `admin/dev/ai`）才 URL+JS 同提交改�
 `Controller/` 路径下**只允许控制器类**（成员资格看继承链，不变式 3），
 且控制器文件里**不得混入非控制器类型**——数据形状进 `Model/`（如
 `Model/Dev/AiAgentDoc.zan`），业务种子等非控制器业务件进模块的
-`Services/`（如 `Services/BlogSeed.zan`）。
+`Services/`。
 
 **非端点方法必须显式 `private`/`protected`。** Zan 成员默认公有，而类级
 `[Route(".../[action]")]` 的约定展开会把**每一个公有方法**变成可达端点
@@ -127,7 +126,7 @@ URL 本身错置的（assistant 曾挂 `admin/dev/ai`）才 URL+JS 同提交改�
 
 **权限三档**，新动作先选档再写码：`Grant`（管理屏，授权位驱动）/
 `Login`（登录即可：个人中心、菜单 JSON）/`None`（登录注册页、健康检查、
-前台博客、API 文档与演示口）。匿名面必须逐动作复核——公开控制器里
+API 文档与演示口）。匿名面必须逐动作复核——公开控制器里
 新增动作不标档即匿名。
 
 ### 路由区籍
@@ -261,7 +260,7 @@ adminUI（JSON 体）两套前端同动作双兼容靠它。成员按所在层�
 int members = await this.SysUser
     .Where(a => a.departmentId == id)
     .CountAsync();
-int changed = await this.SysUser.ResetPassword(id, salt, hash, now);
+int changed = await this.SysUser.ResetPassword(id, hash, now);
 ```
 
 1. **普通查询/写入**：使用 `Where`、`Insert`、`Update`、`Delete` 等
@@ -273,7 +272,7 @@ int changed = await this.SysUser.ResetPassword(id, salt, hash, now);
    `new EntityDao(this)`，DAO 不接收控制器。DAO 的 `IDbConnection` 构造
    合约供自动派发使用，不自行借还连接。单表操作同样可以有业务语义，不能
    因为实现使用 ORM 就把封装展开到各个调用处；例如 `ResetPassword` 必须
-   同时更新凭证与原子递增 `tokenVersion`，`UpgradeHash` 则不递增版本。
+   同时更新凭证与原子递增 `tokenVersion`。
 3. **种子/后台任务**：已有连接直接写 `db.Entity.Where(...)` 或
    `db.Entity.Method(...)`（引入 `System.Data.Orm` 与对应 DAO 命名空间）。
    操作始终使用该连接与事务，连接借还仍归原调用方。
@@ -442,7 +441,7 @@ minlength/maxlength）。声明即约束，不因走行内/批量通道而放宽
 基座用 `DataGrant` 承载这一层，业务只需两步：
 
 ```zan
-/* 启动时注册一次资源域（表名 + 文案列） */
+/* 启动时注册一次资源域（默认严格隔离 strict=true：仅平台超管可绕过白名单） */
 DataGrant.Define("shop", "店铺", "shop", "name");
 
 /* 屏声明一行：行归属哪个资源列 */
@@ -555,6 +554,10 @@ Use the current attribute names and named `Custom` properties:
 | `[Custom(ApiMax = 100)]` | per-route rate limit |
 | `[Custom(Upload = true)]` | stream the request body to disk |
 | `[Custom(IsMenu = true)]` | include the route in the permission-filtered menu |
+| `[Tx]` | commit after the action prepares a response, roll back on action failure or a missing response |
+
+An automatic `/index` alias shares the primary route's authorization, upload settings,
+rate limit and request lock. The menu lists the primary route once.
 
 The source examples are `Modules/Sys/Controller/Api/DataController.zan` and the
 admin controllers. Use explicit class-level route templates such as
@@ -643,6 +646,24 @@ edit it and restart to change settings. Ship it next to the executable.
 connection is opened lazily and tolerantly: if it is not configured/reachable,
 the server still runs and DB-backed routes return a clear 503 instead of
 crashing.
+
+Set `auth.secret` or `ZAN_AUTH_SECRET` to a random secret of at least 32 characters
+on deployments that use MVC sessions. Both token issuance and validation reject
+an empty or shorter secret.
+
+When `cluster.enabled` is set, use `cache.driver = redis` and the same
+`cluster.channel` across instances of the application. Each instance shares a
+role snapshot with its workers. Redis delivers invalidations. The master loads
+roles from the primary database after subscribing. Every 30 seconds while
+connected, the master invalidates cached user role assignments and data scopes
+and checks for missed changes to role definitions and grants. An unchanged
+check preserves the live role snapshot. Role checks deny access while the
+snapshot is unavailable. Standalone servers retry failed snapshot loads every
+two seconds while the generation is still pending.
+Active roles from databases that predate the data-scope column retain their
+original full scope (`dataScope = 0`).
+Applications that assemble their own `WebApp` can call `Boot.InitPermissions`
+after registering routes to use the same startup behavior.
 
 ## Features
 
@@ -735,7 +756,8 @@ The request lifecycle and database queries are instrumented into the shared
 ## Monitoring screens (`/admin/monitor/*`)
 
 Four screens read the persisted history (`metrics.db`, `[metrics]` config):
-**运行监控** (live SSE snapshot + today's totals + per-route leaderboard),
+**运行监控** (recent SSE trends, persisted UTC day totals, route rankings,
+and per-worker request diagnostics),
 **历史统计** (time-bucketed windows, per-route ranking, CSV/JSON export),
 **错误日志** (persisted, sanitized error events), **SQL 统计**
 (`/admin/monitor/sql` — per-day per-normalized-statement aggregates from
@@ -743,6 +765,45 @@ Four screens read the persisted history (`metrics.db`, `[metrics]` config):
 total time or slow count; CSV export). Slow SQL and slow requests are also
 logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
 
+- **Endpoint diagnostics.** Open **接口诊断** from **运行监控** or **历史统计** and
+  select a registered HTTP method and route. The one-hour view refreshes while
+  open. Longer windows read SQLite history with the current worker's pending
+  samples. The view shows end-to-end latency, recorded stage timings, failures,
+  and observed SQL calls and elapsed time. A request's stages may overlap.
+  **未覆盖耗时** subtracts the union of closed stage intervals from its total time.
+  Process CPU and RSS are available in the main monitoring view.
+  With `[metrics]` enabled, `ZAN_ROUTE_DIAGNOSTICS_EVERY` defaults to `64` (roughly
+  one sample in 64). Use `0` to stop sampling or `1` to capture every completed
+  eligible request. Restart the worker to apply the setting. Saved samples
+  remain readable within the retention period. Start the worker with
+  `ZAN_REQUEST_PROFILE_RESOURCES=1` to collect CPU, instrumented allocation bytes,
+  scheduler slices and unfinished child task counts for sampled requests.
+  The endpoint detail shows their totals and trends by protocol coverage and CPU unit.
+- **Request diagnostics.** Set `ZAN_REQUEST_PROFILE_CAPACITY` on the worker
+  before startup to retain completed requests in memory. Open **运行监控 → 请求诊断**
+  with the monitor View grant. The list reads up to 100 requests at a time and
+  supports filtering by route/action and outcome, sorting by latency, and
+  opening the recorded stages of a request on a shared elapsed-time axis. Use
+  **读取最新** to refresh and **更早记录** to page within the current capture. If the
+  load balancer switches workers, the page keeps the current results and asks
+  for a fresh read. Resource capture adds up to 32 source-level async suspensions
+  to each retained trace. The suspension time includes the delay before dispatch.
+  On Windows host builds, also set `ZAN_REQUEST_PROFILE_EXECUTION=1` to open
+  **线程执行片段** in the request detail. It shows the OS thread ID, elapsed-time
+  position, CPU cycles, and allocated bytes for each retained slice. The request
+  totals include slices beyond the 64-entry detail limit.
+  The CPU and RSS charts show worker process readings. Applications that own
+  their admin shell should update the Monitor Index and History views, `admin.js`,
+  `admin-widgets.js`, `admin-monitor.js`, `admin-assistant.js`,
+  `admin-request-traces.js`, `admin-request-traces.css`, `admin-route-diagnostics.js`,
+  and the layout together. The built-in monitoring routes use the `framework`
+  registration mode. See the [request and process
+  diagnostics guide](../../docs/ZANC_CLI.md#17-zanweb-请求诊断).
+- **Live and daily metrics.** The date picker changes the stored UTC day.
+  Live trends show the last 120 seconds, with the newest buckets still being
+  aggregated. HTTP 5xx, cumulative HTTP 4xx/5xx, and cumulative 429 have their
+  own labels. Worker CPU uses 100% per logical core. The RSS total sums per-process
+  resident memory, so shared pages can appear in multiple workers' totals.
 - **P95 is persisted.** `metrics_minute` carries `p95_us` per route per
   minute, computed at flush time from a fixed-bin latency histogram (the same
   bins as the live series, so live and stored P95 read the same scale).
@@ -769,24 +830,20 @@ logged at the `[log].slowSqlMs` / `[log].slowMs` thresholds.
 
 应用不复制本包代码：源文件按层 `using`，zanc 自动发现并拉入包源（发现顺序：
 应用 `packages/` → 应用 `.zan-packages/` → 编译器旁 `packages/` → 全局包库）。
-组合根只声明菜单分组、路由挂点、业务种子与 GEO 内容源注册：
+组合根只声明菜单分组、模型/钩子、路由挂点与业务种子：
 
 ```zan
 using System;
 using System.Web;
 using Zan.Web;
-using Zan.Web.Blog;
 
 class Program {
     static void Main() {
         /* 侧栏分组：URL 首段 → 显示名（管理台外壳与 /api/admin/menu 同读） */
-        MenuBuilder.Section("content", "内容管理");
         MenuBuilder.Section("monitor", "运行监控");
         MenuBuilder.Section("system", "系统管理");
 
         Boot.OnRoutes(Program.RegisterRoutes);
-        BlogSeed.Register();   /* 业务种子：内置管理员与演示文章（幂等） */
-        BlogGeo.Register();    /* GEO 内容源：已发布文章进 sitemap / llms.txt（幂等） */
         int _r = await Boot.Run();
     }
     static void RegisterRoutes(WebApp app) {
@@ -811,6 +868,11 @@ zanc src/main.zan src/**/*.zan \
 
 **随包资产**：`views/` 与 `wwwroot/` 随包分发，但视图引擎运行时只读一个根
 （`View.LoadDir`），所以应用发布目录需携带这两个目录与应用自有的
+
+### 管理台外壳解耦与插件扩展点（`AdminShell` + `window.ZanAdmin`）
+
+- **服务端插槽 `Zan.Web.Core.AdminShell`**：`AdminController.Layout()` 将额外样式、脚本、按需懒加载模块清单、顶栏部件与悬浮按钮输出至 `views/Admin/layout.html` 的 `{{{shellStyles}}}`、`{{{shellScripts}}}`、`{{{shellModules}}}`、`{{{topWidgets}}}`、`{{{fabWidgets}}}`。默认注册 `admin-alert-bell`（按 `Monitor.Index` 权限裁减）与 `admin-ai-fab`，应用或模块可通过 `AdminShell.AddStyle` / `AddScript` / `AddModule` / `RemoveModule` / `AddTopWidget` / `AddFabWidget` / `RemoveTopWidget` / `RemoveFabWidget` / `Clear` 增删外壳挂件而无需修改 `layout.html`；`AddModule(selector, scriptUrl, styleUrl, tabPrefix, tabParam)` 以 CSP 安全的 HTML 转义 JSON 清单下发，不触发内联脚本；Crud 设计表菜单由 `Modules/Crud/Services/CrudMenu.zan` 经 `[ModuleInitializer]` 注册到 `MvcHooks.OnMenu`。
+- **前端生命周期总线 `window.ZanAdmin`**：`wwwroot/js/admin.js` 仅保留工作区标签（含 `ad-pane` 保活与 `[data-fullbleed]` 全幅工作区）、碎片面板、`Layer` 弹层、通用委托与 Ctrl+K 命令面板内核，并通过 `ZanAdmin.onInit(fn)`、`onMount(fn)`、`onUnmount(fn)`、`onActivate(fn)`、`onDeactivate(fn)`、`registerDirtyGuard(fn)`、`registerCommand(provider)`、`registerModule(selector, spec)`、`registerTabKey(prefixOrFn, paramName)` 与 `isPaneInteractive(target, ev)` 挂载独立业务脚本与按需懒加载大型工作区（如无限画布/可视化编排器），不修改 `admin.js`。
 `config/app.json`（配置永远是应用所有，不编译进二进制）——从包复制一次后
 归应用所有，框架更新不覆盖。
 
@@ -863,21 +925,15 @@ every sign-in "wrong password").
 
 The following is a selection of current controller routes, available when the
 application registers the package's attribute routes. GEO protocol endpoints also
-require the corresponding source registration; blog content comes from the
-registered blog contributor.
+require the corresponding source registration (`Geo.Register` + `Geo.AddContributor`).
 
 - `GET /` — public landing page.
-- `GET /blog`, `GET /blog/{id}`, `GET /blog?tag=X` — public blog index, detail and whole-tag archive. Article writes belong to the admin content routes.
-- `POST /blog/{id}/reply` — blog comment submission.
-- `GET /rss.xml` — RSS feed of published posts; requires a configured public site address.
 - `GET /sitemap.xml` — registered public URLs; empty until `site.url` is configured.
 - `GET /robots.txt` — crawler instructions, including disallow rules for `/admin/` and `/api/admin/`; these rules do not enforce access control. Sitemap and llms.txt pointers require `site.url`.
 - `GET /llms.txt`, `GET /.well-known/llms.txt`, `GET /.well-known/llms-full.txt` — registered site content in guide or aggregated form.
 - `GET /admin/login`, `POST /admin/login/submit`, `GET /admin/logout` — admin login page, credential submission and logout. There is no fixed default password: an empty database requires `auth.bootstrapPassword` or `ZAN_BOOTSTRAP_ADMIN_PASSWORD` (at least 12 characters) to seed the `admin` account.
 - `GET /admin/dashboard` — dashboard; login required. The post-login landing page is selected from the account's accessible menu entries.
 - `GET /admin/system/users`, `POST /admin/system/users/status`, `POST /admin/system/users/kick` — account list, status changes and session invalidation; Grant authorization with View for the list and Update for these writes.
-- `GET /admin/content/posts`, `POST /admin/content/posts/field` — content administration, including drafts and allow-listed field changes; Grant authorization with View and Update respectively.
-- `GET /users`, `GET /user/{id}` — ORM/cache and route-parameter demos; login required.
 - `GET /admin/stats` — runtime diagnostics; Grant authorization and the monitor screen's View permission are already required.
 - `POST /api/data/echo` — anonymous echo, configured with `ApiMax = 100`.
 - `POST /api/data/gather` — login required, with a per-user request lock; no rank-3 requirement is declared.
@@ -1047,23 +1103,33 @@ Streamed file uploads with a deny-by-default extension whitelist.
   file name never touches a path. The real name travels as `?name=`, is
   reduced through `Validator.SafeFileName`, its extension is checked against
   a whitelist (`png/jpg/pdf/docx/zip/mp4/...`; **svg is deliberately
-  excluded** — an SVG served same-origin can carry script), and only then is
-  the file moved into `wwwroot/media/` and recorded in the `media` table.
-  Duplicate names get a timestamp prefix instead of overwriting; rejected
-  uploads delete their spool file.
+  excluded** — an SVG served same-origin can carry script). The original name
+  is kept for display. Under the media directory lock, the service moves the
+  upload to an unused server-generated path in `wwwroot/media/` and records it
+  in `sys_media_file`. A failed insert removes the published file. The spool
+  and media directories must support same-filesystem moves. Give the service
+  exclusive write access to the media directory.
 - **Serving** — the default layout stores media at `wwwroot/media/<file>`,
-  publicly served as `/static/media/<file>`. Multiple static mounts are supported;
-  keep the `uploads/` spool directory unmounted. The static server's 4 MiB file
-  limit applies independently of the upload limit: an accepted larger upload
-  cannot be downloaded through this static-file path.
+  publicly served as `/static/media/<file>`. Keep the `uploads/` spool outside
+  static mounts. The default `StaticFiles` handler rejects the dot-prefixed
+  `.media-delete/` path. Preserve that rule when serving the directory through
+  a separate static server. When the app's built-in mount serves the media
+  directory, the media action also rejects files above 4 MiB before publication.
+  With a separate static server and no corresponding app mount, the app applies
+  the configured upload limit.
 - **Cache note** — `StaticFiles` opens files on each request, so deletion takes
   effect on subsequent origin requests. Browsers and proxies may still retain
   previous responses according to `Cache-Control`; the default max-age is one day.
 - **Size cap** — `[server].uploadBodyMB` (default 64) feeds
   `app.MaxUpload()`; over-cap requests are refused with 413 before the body
   is read.
-- **Delete** — removes the row and the disk file; the path is rebuilt from
-  the stored server-generated file name, never trusted as a full path.
+- **Delete** — stages the last reference's file in `wwwroot/media/.media-delete/`,
+  commits the record deletion, then removes the staged file. A failure before
+  commit triggers restoration. On a delete commit error, an acknowledged
+  rollback lets the service check the path on a clean primary connection.
+  It restores the file if a committed row still references it, or removes the
+  staged copy if no row does. When the result remains unknown, the service
+  keeps the file and logs its location for reconciliation against `sys_media_file`.
 - The admin page's 上传文件 button posts the raw bytes with
   `?name=` (`data-upload` in `admin.js`) — no multipart machinery needed.
 
@@ -1097,11 +1163,8 @@ sitemap joins the aggregation — it does not write a route.
   async delegate and share the mount point with the static-object form
   (`UseSitemap()` / `UseRobotsTxt()` / `UseLlmsTxt()`), so a path is mounted
   once — never twice, no route collision. The content comes from
-  `ZanWeb.Services.Geo` (site level) plus the module contributors registered
-  through `Geo.AddContributor()`; `ZanWeb.Blog.BlogGeo` contributes the
-  published posts. `Boot.Run()` wires the site-level service automatically;
-  a module registers its own content in the composition root
-  (`BlogGeo.Register()`).
+  `Zan.Web.Services.Geo` (site level) plus application module contributors registered
+  through `Geo.AddContributor()`. `Boot.Run()` wires the site-level service automatically.
 - **Absolute base** — `site.url` (`站点地址` in 站点设置) is the **only** source
   of absolute URLs, because the sitemap / robots / llms.txt specs require
   absolute addresses. When it is unset the framework emits an **empty**
@@ -1159,7 +1222,8 @@ Any admin list can opt its table into in-place editing without page-specific
 scripts: put `data-quick="<POST url>"` on the `<table>` and mark each editable
 control with `data-quick-field="<field>"` and `data-id`. Controls are plain
 checkboxes / text / number inputs / selects (select initial value via
-`data-value`). `admin.js` (`applyFragmentWidgets`, so panels, fragments and
+`data-value`). `admin-widgets.js` (`applyFragmentWidgets`, mounted via
+`window.ZanAdmin.onMount` so panels, fragments and
 dialogs all pick it up) delegates `change` to one POST `{id, field, value}` per
 edit; a failed save reverts the control and toasts, so the UI never shows a
 state the server refused. The `.cell-edit` styles keep the table looking like a

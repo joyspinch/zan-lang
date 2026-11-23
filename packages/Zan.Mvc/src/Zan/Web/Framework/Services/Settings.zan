@@ -29,11 +29,16 @@ public class Settings {
 
     /* 加载所有设置，每 worker 每分钟一次。 */
     public static async StrMap All() {
+        return await All(null);
+    }
+
+    internal static async StrMap All(IDbConnection connection) {
         long now = WebApp.NowSeconds();
         if (values != null && now < expires) {
             return values;
         }
-        IDbConnection db = await AuthUser.Lease();
+        IDbConnection db = connection;
+        if (db == null) { db = await AuthUser.Lease(); }
         if (db == null) {
             /* 数据库不可用时返回旧缓存，下次读取时重试。 */
             if (values != null) { return values; }
@@ -47,7 +52,7 @@ public class Settings {
                 m.Set(rows[i].name, rows[i].value);
             }
         } finally {
-            AuthUser.Give(db);
+            if (connection == null) { AuthUser.Give(db); }
         }
         Fmt.SetOffsetMinutes(Filter.ToInt(m.Get(SettingKeys.SiteTimezone), 0));
         values = m;
@@ -76,17 +81,32 @@ public class Settings {
         return v != "0";
     }
 
+    private static string[] viewDataKeys() {
+        return new string[] {
+            "siteTitle", "siteSubtitle", "siteKeywords", "siteDescription",
+            "siteIcp", "sitePolice", "siteCopyright", "siteAnalytics"
+        };
+    }
+
+    private static string[] viewSettingKeys() {
+        return new string[] {
+            SettingKeys.SiteTitle, SettingKeys.SiteSubtitle, SettingKeys.SiteKeywords,
+            SettingKeys.SiteDescription, SettingKeys.SiteIcp, SettingKeys.SitePolice,
+            SettingKeys.SiteCopyright, SettingKeys.SiteAnalytics
+        };
+    }
+
     /* 将公开设置注入视图数据（站点标题、备案号、分析代码等）。 */
     public static async void Apply(ViewData d) {
         StrMap m = await All();
-        d.Set("siteTitle", m.GetOr(SettingKeys.SiteTitle, "Zan"));
-        d.Set("siteSubtitle", m.Get(SettingKeys.SiteSubtitle));
-        d.Set("siteKeywords", m.Get(SettingKeys.SiteKeywords));
-        d.Set("siteDescription", m.Get(SettingKeys.SiteDescription));
-        d.Set("siteIcp", m.Get(SettingKeys.SiteIcp));
-        d.Set("sitePolice", m.Get(SettingKeys.SitePolice));
-        d.Set("siteCopyright", m.Get(SettingKeys.SiteCopyright));
-        d.Set("siteAnalytics", m.Get(SettingKeys.SiteAnalytics));
+        string[] dkeys = viewDataKeys();
+        string[] skeys = viewSettingKeys();
+        for (int i = 0; i < dkeys.Length; i = i + 1) {
+            string val = skeys[i] == SettingKeys.SiteTitle
+                ? m.GetOr(skeys[i], "Zan")
+                : m.Get(skeys[i]);
+            d.Set(dkeys[i], val);
+        }
         if (await On(SettingKeys.RegisterEnabled, false)) {
             d.Set("canRegister", "1");
         }

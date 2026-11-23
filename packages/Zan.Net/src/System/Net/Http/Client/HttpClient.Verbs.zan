@@ -142,14 +142,6 @@ public partial class HttpClient {
         }
     }
 
-    // 逐字节的子串搜索（利用原生机器指令向量化搜索）。
-    private static int IndexOf(string s, string needle, int from) {
-        if (s == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > s.Length) { return -1; }
-        return s.IndexOf(needle, from);
-    }
-
     // 解析十六进制 chunk 大小前缀，在第一个非十六进制字节处停止
     // （例如 ';' 分块扩展或 CR）。累计上限 0x00FFFFFF（16 MiB-1）：恶意
     // 服务器发超长十六进制串会让 v*16 回绕成负数，下游
@@ -203,7 +195,7 @@ public partial class HttpClient {
         bool finalChunked = false;
         while (lineStart < head.Length) {
             int lineEnd = head.Length;
-            int e = HttpClient.IndexOf(head, "\n", lineStart);
+            int e = head.IndexOf("\n", lineStart);
             if (e >= 0) { lineEnd = e; }
             int stop = lineEnd;
             if (stop > lineStart && (head[stop - 1] & 255) == 13) {
@@ -214,8 +206,8 @@ public partial class HttpClient {
                 if ((head[i] & 255) == 58) { colon = i; break; }
             }
             if (colon == lineStart + 17
-                && HttpClient.AsciiNameEquals(
-                    head.Substring(lineStart, 17), "transfer-encoding", 17)) {
+                && HttpClient.AsciiNameEqualsAt(
+                    head, lineStart, "transfer-encoding", 17)) {
                 sawTe = true;
                 int p = colon + 1;
                 while (p < stop && ((head[p] & 255) == 32
@@ -244,8 +236,8 @@ public partial class HttpClient {
                     }
                     if (codingStop <= p) { return false; }
                     lineFinal = codingStop - p == 7
-                        && HttpClient.AsciiNameEquals(
-                            head.Substring(p, codingStop - p), "chunked", 7);
+                        && HttpClient.AsciiNameEqualsAt(
+                            head, p, "chunked", 7);
                     lineSaw = true;
                     p = itemEnd + 1;
                     while (p < stop && ((head[p] & 255) == 32
@@ -309,16 +301,9 @@ public partial class HttpClient {
     public async int PostSseToSinkAsync(string path, string body, SseSink sink) {
         this.ResetTotalBudget();
         sink.Begin();
-        if (this.callPolicy != null) {
-            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
-                this.port, this.useTls,
-                this.callPolicy.AllowsLoopback(),
-                this.callPolicy.AllowsHttp(),
-                this.callPolicy.LocalHttpOnly());
-            if (!targetOk) {
-                sink.Finish("err: external target is not allowed");
-                return 0;
-            }
+        if (!this.IsTargetPolicyAllowed()) {
+            sink.Finish("err: external target is not allowed");
+            return 0;
         }
         if (this.callPolicy != null
             && body.Length > this.callPolicy.MaxRequestBytes()) {
@@ -342,12 +327,7 @@ public partial class HttpClient {
         TlsStream stream = channel.tls;
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        int sent = 0;
-        if (this.useTls) {
-            sent = await stream.SendAsync(requestData, requestData.Length);
-        } else {
-            sent = await conn.SendAsync(requestData);
-        }
+        int sent = await this.WriteTextRequest(channel, requestData);
         if (sent != requestData.Length) {
             HttpDeadline.Disarm(watch);
             channel.Dispose();
@@ -356,27 +336,11 @@ public partial class HttpClient {
         }
         HttpDeadline.Touch(watch, this.ReadBudget());
 
-        // 读取响应头，以便把状态/头部与正文分开。
-        // 扫描从末尾前几个字节重新开始，而非从 0 开始，且头部
-        // 有上限，使从不发送空行的对端无法无限增大
-        // 缓冲区。
-        string head = "";
-        int hb = 0 - 1;
-        while (hb < 0 && head.Length < 262144) {
-            string c;
-            if (this.useTls) { c = await stream.RecvAsync(65536); }
-            else { c = await conn.RecvAsync(65536); }
-            if (c.Length == 0) { break; }
-            int scanFrom = head.Length - 3;
-            if (scanFrom < 0) { scanFrom = 0; }
-            head = head + c;
-            hb = HttpClient.IndexOf(head, "\r\n\r\n", scanFrom);
-            HttpDeadline.Touch(watch, this.IdleBudget());
-        }
+        string[] headParts = await this.ReadStreamingHeadAsync(channel, watch);
 
         // 未找到头部终止符：对端提前关闭、超时，或发送了
         // 过大的头部。干净地失败，而不是把垃圾数据当正文解析。
-        if (hb < 0) {
+        if (headParts == null) {
             bool timedOut = HttpDeadline.Expired(watch);
             HttpDeadline.Disarm(watch);
             channel.Dispose();
@@ -385,12 +349,11 @@ public partial class HttpClient {
             return 0;
         }
 
-        string headOnly = head.Substring(0, hb);
+        string headOnly = headParts[0];
         int status = HttpClient.HeadStatus(headOnly);
         bool chunked = HttpClient.HeadIsChunked(headOnly);
         int bodyLen = HttpClient.HeaderInt(headOnly, "content-length");
-        string pending = head.Substring(hb + 4, head.Length - hb - 4);
-        head = "";
+        string pending = headParts[1];
         sink.SetResponse(status, headOnly, "");
         headOnly = "";
 
@@ -447,7 +410,7 @@ public partial class HttpClient {
                 bool progressed = true;
                 while (progressed) {
                     progressed = false;
-                    int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
+                    int crlf = pending.IndexOf("\r\n", 0);
                     if (crlf < 0) { progressed = false; }
                     else {
                         string sizeLine = pending.Substring(0, crlf);
@@ -481,7 +444,7 @@ public partial class HttpClient {
                                 if (doneScan.Length > 64) {
                                     doneScan = doneScan.Substring(doneScan.Length - 64, 64);
                                 }
-                                if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                                if (doneScan.IndexOf("[DONE]", 0) >= 0) {
                                     sawDone = true;
                                 }
                                 pending = pending.Substring(need, pending.Length - need);
@@ -510,7 +473,7 @@ public partial class HttpClient {
                     if (doneScan.Length > 64) {
                         doneScan = doneScan.Substring(doneScan.Length - 64, 64);
                     }
-                    if (HttpClient.IndexOf(doneScan, "[DONE]", 0) >= 0) {
+                    if (doneScan.IndexOf("[DONE]", 0) >= 0) {
                         sawDone = true;
                     }
                     pending = "";

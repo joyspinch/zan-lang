@@ -34,20 +34,13 @@ public class ServiceProcess {
         ServiceInfo cur = null;
         for (int i = 0; i < lines.Count; i = i + 1) {
             string line = lines[i];
-            if (ServiceProcess.StartsWith(line, "SERVICE_NAME:")) {
+            if (TextUtil.StartsWithOr(line, "SERVICE_NAME:", false)) {
                 if (cur != null) { list.Add(cur); }
                 cur = new ServiceInfo();
-                cur.name = ServiceProcess.Trim(line.Substring(13, line.Length - 13));
+                cur.name = line.Substring(13, line.Length - 13).Trim();
                 cur.state = 1;
             } else if (cur != null) {
-                string t = ServiceProcess.Trim(line);
-                if (ServiceProcess.StartsWith(t, "DISPLAY_NAME:")) {
-                    cur.displayName = ServiceProcess.Trim(t.Substring(13, t.Length - 13));
-                } else if (ServiceProcess.StartsWith(t, "STATE")) {
-                    cur.state = ServiceProcess.ParseState(t);
-                } else if (ServiceProcess.StartsWith(t, "PID")) {
-                    cur.processId = ServiceProcess.ParseInt(ServiceProcess.AfterColon(t));
-                }
+                ServiceProcess.ParseScDetailLine(cur, TextUtil.TrimOrEmpty(line));
             }
         }
         if (cur != null) { list.Add(cur); }
@@ -70,23 +63,15 @@ public class ServiceProcess {
         ProcessResult qres = Process.CaptureSafe("sc.exe", qargs);
         List<string> lines = qres.lines;
         string first = ServiceProcess.FirstNonEmpty(lines);
-        if (first == null || !ServiceProcess.StartsWith(first, "SERVICE_NAME:")) {
+        if (first == null || !TextUtil.StartsWithOr(first, "SERVICE_NAME:", false)) {
             return null;
         }
         ServiceInfo e = new ServiceInfo();
         e.name = name;
         e.displayName = name;
         e.state = 1;
-        int i = 0;
-        for (; i < lines.Count; i = i + 1) {
-            string t = ServiceProcess.Trim(lines[i]);
-            if (ServiceProcess.StartsWith(t, "DISPLAY_NAME:")) {
-                e.displayName = ServiceProcess.Trim(t.Substring(13, t.Length - 13));
-            } else if (ServiceProcess.StartsWith(t, "STATE")) {
-                e.state = ServiceProcess.ParseState(t);
-            } else if (ServiceProcess.StartsWith(t, "PID")) {
-                e.processId = ServiceProcess.ParseInt(ServiceProcess.AfterColon(t));
-            }
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            ServiceProcess.ParseScDetailLine(e, TextUtil.TrimOrEmpty(lines[i]));
         }
         return e;
         #else
@@ -197,6 +182,17 @@ public class ServiceProcess {
     }
 
     #if WINDOWS
+    // 解析 sc.exe 输出的 DISPLAY_NAME / STATE / PID 明细行。
+    private static void ParseScDetailLine(ServiceInfo info, string t) {
+        if (t.StartsWith("DISPLAY_NAME:")) {
+            info.displayName = t.Substring(13, t.Length - 13).Trim();
+        } else if (t.StartsWith("STATE")) {
+            info.state = ServiceProcess.ParseState(t);
+        } else if (t.StartsWith("PID")) {
+            info.processId = ServiceProcess.ParseInt(ServiceProcess.AfterColon(t));
+        }
+    }
+
     // sc 命令是否成功：捕获 stderr 后看首行是否含 FAILED
     // （成功行是 SERVICE_NAME: / STATE: 4 RUNNING 等）。
     private static bool ScOk(string verb, string name) {
@@ -206,15 +202,15 @@ public class ServiceProcess {
         ProcessResult res = Process.CaptureSafe("sc.exe", args);
         List<string> lines = res.lines;
         if (lines.Count == 0) { return false; }
-        string head = ServiceProcess.Trim(lines[0]);
-        if (ServiceProcess.IndexOf(head, "FAILED", 0) >= 0) { return false; }
+        string head = TextUtil.TrimOrEmpty(lines[0]);
+        if (head.IndexOf("FAILED", 0) >= 0) { return false; }
         return true;
     }
 
     // 从 "STATE : 4 RUNNING" 行提取数字状态码；无冒号时返回 1（stopped）。
     private static int ParseState(string line) {
         // "STATE : 4 RUNNING"
-        int idx = ServiceProcess.IndexOf(line, ":", 0);
+        int idx = line.IndexOf(":", 0);
         if (idx < 0) { return 1; }
         int len = line.Length;
         int i = idx + 1;
@@ -236,7 +232,7 @@ public class ServiceProcess {
 
     // 返回第一个冒号之后的文本；无冒号时返回空串。
     private static string AfterColon(string line) {
-        int idx = ServiceProcess.IndexOf(line, ":", 0);
+        int idx = line.IndexOf(":", 0);
         if (idx < 0) { return ""; }
         return line.Substring(idx + 1, line.Length - idx - 1);
     }
@@ -244,19 +240,9 @@ public class ServiceProcess {
     // 返回首个非空白行；没有非空行时返回 null。
     private static string FirstNonEmpty(List<string> lines) {
         for (int i = 0; i < lines.Count; i = i + 1) {
-            if (ServiceProcess.Trim(lines[i]).Length > 0) { return lines[i]; }
+            if (TextUtil.TrimOrEmpty(lines[i]).Length > 0) { return lines[i]; }
         }
         return null;
-    }
-
-    // 前缀匹配（转发 stdlib TextUtil）。
-    private static bool StartsWith(string s, string prefix) {
-        return TextUtil.StartsWithOr(s, prefix, false);
-    }
-
-    // 去除首尾空白（空格/制表/回车/换行），转发 stdlib TextUtil.TrimOrEmpty。
-    private static string Trim(string s) {
-        return TextUtil.TrimOrEmpty(s);
     }
 
     // 解析前导非负整数，非数字处停止。
@@ -288,15 +274,15 @@ public class ServiceProcess {
         int i = 0;
         while (i < lines.Count) {
             string line = lines[i];
-            int sp = ServiceProcess.IndexOf(line, " ", 0);
+            int sp = line != null ? line.IndexOf(" ", 0) : -1;
             if (sp <= 0) { i = i + 1; continue; }
             string unit = line.Substring(0, sp);
-            if (!ServiceProcess.EndsWith(unit, ".service")) { i = i + 1; continue; }
+            if (!unit.EndsWith(".service")) { i = i + 1; continue; }
             ServiceInfo e = new ServiceInfo();
             e.name = unit.Substring(0, unit.Length - 8);
             e.displayName = e.name;
             e.state = 1;
-            if (ServiceProcess.IndexOf(line, "active", 0) >= 0) { e.state = 4; }
+            if (line.IndexOf("active", 0) >= 0) { e.state = 4; }
             e.processId = ServiceProcess.SystemctlPid(e.name);
             list.Add(e);
             i = i + 1;
@@ -330,14 +316,8 @@ public class ServiceProcess {
         args.Add(name + ".service");
         ProcessResult res = Process.CaptureSafe("systemctl", args);
         List<string> lines = res.lines;
-        return lines.Count == 0 ||
-               ServiceProcess.IndexOf(lines[0], "error", 0) < 0;
-    }
-
-    // 后缀匹配。
-    private static bool EndsWith(string s, string tail) {
-        if (s == null || tail == null) { return false; }
-        return s.EndsWith(tail);
+        return lines.Count == 0 || lines[0] == null
+               || lines[0].IndexOf("error", 0) < 0;
     }
     #endif
 
@@ -378,12 +358,4 @@ public class ServiceProcess {
         return res.exitCode == 0;
     }
     #endif
-
-    // 从 from 起查找子串首次出现位置，未找到返回 -1。
-    private static int IndexOf(string hay, string needle, int from) {
-        if (hay == null || needle == null) { return -1; }
-        if (from < 0) { from = 0; }
-        if (from > hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
-    }
 }

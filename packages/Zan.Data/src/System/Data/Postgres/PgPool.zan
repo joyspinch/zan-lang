@@ -4,16 +4,7 @@ using System.Threading;
 
 namespace System.Data.Postgres;
 
-// 面向 <see cref="PgConnection"/> 的协程化连接池。
-// 契约与 <see cref="DbPool"/> 相同——惰性增长至 <c>maxSize</c>，
-// 用事件驱动 <see cref="Gate"/> 等待而非轮询，驱逐失效
-// 连接——但它是类型化的，协程查询 API（<c>QueryAsync</c>、
-// <c>ExecuteAsync</c>、<c>QueryParamsAsync</c>）仍然可用。连接
-// 使用纯 Zan 异步网络握手建立，因此无论扩容
-// 连接池还是查询都不会阻塞工作线程。
-// 用法：
-// pool.Release(db);
-// pool.Close();
+// 面向 PgConnection 的协程化连接池（惰性增长至 maxSize，事件驱动等待，纯 Zan 异步握手建连）。
 public class PgPool : IDisposable {
     string conninfo;
     PoolCore<PgConnection> core;
@@ -36,10 +27,7 @@ public class PgPool : IDisposable {
         return await PgConnection.OpenAsync(this.conninfo);
     }
 
-    // 借出连接：优先复用空闲连接，
-    // 未达上限则新建，否则挂起协程直到有连接被归还。饱和等待有
-    // 硬上限（见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
-    // 连接池关闭后返回 null。
+    // 借出连接：复用空闲连接或扩容新建，达上限时挂起等待直到归还或超时返回 null；池关闭返回 null。
     public async PgConnection AcquireAsync() {
         PoolOpenAsync<PgConnection> open = this.OpenOne;
         Predicate<PgConnection> connected = PgPool.IsUsable;
@@ -57,19 +45,21 @@ public class PgPool : IDisposable {
             + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
-    // 将连接归还连接池。已损坏或 Close() 之后的
-    // 连接会被关闭销毁而不入池。
+    private void Discard(PgConnection c) {
+        c.Close();
+        this.core.Drop(c);
+    }
+
+    // 将连接归还连接池；损坏、池已关闭或回滚失败的连接直接关闭丢弃。
     public void Release(PgConnection c) {
         if (c == null) {
             return;
         }
         if (this.core.IsClosed() || !c.IsConnected()) {
-            c.Close();
-            this.core.Drop(c);
+            this.Discard(c);
             return;
         }
         if (c.inTxn) {
-            // 归还时事务未收尾：执行回滚；若回滚失败则连接状态不可信，必须关闭丢弃。
             bool failed = false;
             try {
                 c.Rollback();
@@ -78,8 +68,7 @@ public class PgPool : IDisposable {
             }
             c.inTxn = false;
             if (failed || this.core.IsClosed() || !c.IsConnected()) {
-                c.Close();
-                this.core.Drop(c);
+                this.Discard(c);
                 return;
             }
         }
@@ -101,14 +90,12 @@ public class PgPool : IDisposable {
         return this.core.WaitingCount();
     }
 
-    // 关闭所有空闲连接并标记连接池已关闭。仍
-    // 被借出的连接在归还时关闭。
+    // 关闭所有空闲连接并标记连接池已关闭（借出连接在归还时关闭）。
     public void Close() {
         this.core.MarkClosed();
         PgConnection c = this.core.TakeClosing();
         while (c != null) {
-            c.Close();
-            this.core.Drop(c);
+            this.Discard(c);
             c = this.core.TakeClosing();
         }
         this.core.WakeAll();

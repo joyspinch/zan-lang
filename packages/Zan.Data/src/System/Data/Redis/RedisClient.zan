@@ -7,11 +7,7 @@ using System.Threading;
 
 namespace System.Data.Redis;
 
-// 基于异步 IO reactor、使用 RESP（RESP2）协议的高性能协程化 Redis 客户端。
-// 全面对标 FreeRedis 规范设计，支持池化多协程安全复用与丰富强类型命令，告别手拼命令。
-// 用法（免借还连接池模式，如同 FreeRedis）：
-// 用法（单一底层连接模式）：
-// r.Close();
+// 协程化 RESP2 Redis 客户端，支持连接池透明路由与回复预算保护。
 public partial class RedisClient {
     nint sock;
     string host;
@@ -19,7 +15,6 @@ public partial class RedisClient {
     bool connected;
     string lastError;
     string protocolError;
-    // Per-line content bytes, including the RESP type byte but excluding CRLF.
     private const int MaxProtocolLineBytes = 65536;
     private const int MaxReceiveBufferBytes = 1073741824;
     private const int MaxProtocolArrayDepth = 64;
@@ -36,16 +31,9 @@ public partial class RedisClient {
     int tmpcap;
     TlsStream tls;
 
-    // 当作为池化客户端使用时，委托至该连接池执行
     RedisPool pool;
-
-    // 对象序列化委托（例如 obj => Json.Serialize(obj)）。
     public RedisSerializer Serialize;
-
-    // 对象反序列化委托（例如 (json, type) => Json.Deserialize(json, type)）。
     public RedisDeserializer Deserialize;
-
-    // 命令执行日志与审计通知事件（FreeRedis Notice 规范）。
     public NoticeEventHandler Notice;
 
     private static bool defaultVerifyTls = true;
@@ -54,7 +42,6 @@ public partial class RedisClient {
         set { RedisClient.defaultVerifyTls = value; }
     }
 
-    // 切换后续 ConnectSecureAsync 的证书与主机名校验。
     public static void SetTlsVerify(bool verify) {
         RedisClient.defaultVerifyTls = verify;
     }
@@ -64,18 +51,14 @@ public partial class RedisClient {
     [DllImport("crt")]
     static extern long strlen(string str);
 
-    // 通过连接字符串创建池化 Redis 客户端（FreeRedis 规范）。
     public RedisClient(string connectionString) {
-        RedisOptions opt = RedisOptions.Parse(connectionString);
-        this.initPool(opt);
+        this.initPool(RedisOptions.Parse(connectionString));
     }
 
-    // 通过配置项创建池化 Redis 客户端。
     public RedisClient(RedisOptions options) {
         this.initPool(options);
     }
 
-    // 直接绑定现有连接池作为客户端。
     public RedisClient(RedisPool pool) {
         this.initMembers();
         this.pool = pool;
@@ -105,14 +88,6 @@ public partial class RedisClient {
         this.Notice = null;
     }
 
-    // Per-root decoded reply limits; defaults: 64 MiB payload and 1,048,576
-    // nodes (root, arrays, scalars and nil all count). Bulk/simple/error bytes
-    // count at their wire length; integers count as eight bytes. Node overhead
-    // is bounded separately, so empty values cannot bypass the memory bound.
-    // Both limits must be positive; invalid/busy changes return false unchanged.
-    // Configure before issuing commands. A pooled facade applies its limits to
-    // each borrowed connection for that command, then restores its old limits.
-    // Direct RedisPool users get defaults, or configure an acquired client.
     public bool SetReplyLimits(int maxPayloadBytes, int maxNodes) {
         if (maxPayloadBytes <= 0 || maxNodes <= 0 || this.busy) { return false; }
         this.maxReplyPayloadBytes = maxPayloadBytes;
@@ -122,12 +97,10 @@ public partial class RedisClient {
 
     void FireNotice(string logText, long elapsedMs, Exception ex) {
         if (this.Notice != null) {
-            NoticeEventArgs e = new NoticeEventArgs(logText, elapsedMs, ex);
-            this.Notice(this, e);
+            this.Notice(this, new NoticeEventArgs(logText, elapsedMs, ex));
         }
         if (this.pool != null && this.pool.Notice != null) {
-            NoticeEventArgs e2 = new NoticeEventArgs(logText, elapsedMs, ex);
-            this.pool.Notice(this, e2);
+            this.pool.Notice(this, new NoticeEventArgs(logText, elapsedMs, ex));
         }
     }
 
@@ -137,40 +110,22 @@ public partial class RedisClient {
         for (int i = 0; i < args.Count; i = i + 1) {
             if (i > 0) { sb.Append(" "); }
             string a = args[i];
-            if (a.Length > 80) {
-                sb.Append(a.Substring(0, 77) + "...");
-            } else {
-                sb.Append(a);
-            }
+            sb.Append(a.Length > 80 ? a.Substring(0, 77) + "..." : a);
         }
         return sb.ToString();
     }
 
-    // 使用绑定的序列化器将对象转为字符串。
     public string SerializeObject(object obj) {
         if (obj == null) { return ""; }
-        if (this.Serialize != null) {
-            return this.Serialize(obj);
-        }
-        if (this.pool != null && this.pool.Serialize != null) {
-            return this.pool.Serialize(obj);
-        }
+        if (this.Serialize != null) { return this.Serialize(obj); }
+        if (this.pool != null && this.pool.Serialize != null) { return this.pool.Serialize(obj); }
         return Convert.ToString(obj);
     }
 
-    // 使用绑定的反序列化器将字符串解析为指定类型。
     public T DeserializeObject<T>(string val) {
-        if (val == null) {
-            return (T)(object)null;
-        }
-        if (this.Deserialize != null) {
-            object obj = this.Deserialize(val, typeof(T));
-            return (T)obj;
-        }
-        if (this.pool != null && this.pool.Deserialize != null) {
-            object obj2 = this.pool.Deserialize(val, typeof(T));
-            return (T)obj2;
-        }
+        if (val == null) { return (T)(object)null; }
+        if (this.Deserialize != null) { return (T)this.Deserialize(val, typeof(T)); }
+        if (this.pool != null && this.pool.Deserialize != null) { return (T)this.pool.Deserialize(val, typeof(T)); }
         return (T)(object)val;
     }
 
@@ -181,54 +136,41 @@ public partial class RedisClient {
         this.pool = new RedisPool(opt);
     }
 
-    // 私有构造；单一物理连接统一经 ConnectAsync 创建。
     public RedisClient() {
         this.initMembers();
     }
 
-    // 连接 Redis 服务器（默认超时）。
     public static async RedisClient ConnectAsync(string host, int port) {
         return await RedisClient.ConnectAsync(host, port, 0);
     }
 
-    // 带连接超时（毫秒，0 = 不限时）的连接；失败返回 null。
     public static async RedisClient ConnectAsync(string host, int port, int timeoutMs) {
         return await RedisClient.doConnect(host, port, timeoutMs, false);
     }
 
-    // 通过连接字符串异步建立单物理连接。
     public static async RedisClient ConnectAsync(string connectionString) {
-        RedisOptions opt = RedisOptions.Parse(connectionString);
-        return await RedisClient.ConnectAsync(opt);
+        return await RedisClient.ConnectAsync(RedisOptions.Parse(connectionString));
     }
 
-    // 通过配置项异步建立单物理连接（包含自动 AUTH 与 SELECT）。
     public static async RedisClient ConnectAsync(RedisOptions opt) {
         RedisClient c = await RedisClient.doConnect(opt.host, opt.port, opt.connectTimeoutMs, opt.ssl);
         if (c == null) { return null; }
         if (opt.password != null && opt.password.Length > 0) {
-            bool authOk = false;
-            if (opt.user != null && opt.user.Length > 0) {
-                authOk = await c.AuthAsync(opt.user, opt.password);
-            } else {
-                authOk = await c.AuthAsync(opt.password);
-            }
+            bool authOk = (opt.user != null && opt.user.Length > 0)
+                ? await c.AuthAsync(opt.user, opt.password)
+                : await c.AuthAsync(opt.password);
             if (!authOk) {
                 c.Close();
                 return null;
             }
         }
-        if (opt.database > 0) {
-            bool selOk = await c.SelectAsync(opt.database);
-            if (!selOk) {
-                c.Close();
-                return null;
-            }
+        if (opt.database > 0 && !await c.SelectAsync(opt.database)) {
+            c.Close();
+            return null;
         }
         return c;
     }
 
-    // TLS 加密信道连接。
     public static async RedisClient ConnectSecureAsync(string host, int port, int timeoutMs) {
         return await RedisClient.doConnect(host, port, timeoutMs, true);
     }
@@ -293,7 +235,6 @@ public partial class RedisClient {
         }
     }
 
-    // 关闭连接并释放缓冲区；若是池化客户端则关闭连接池。
     public void Close() {
         if (this.pool != null) {
             this.pool.Close();
@@ -327,11 +268,15 @@ public partial class RedisClient {
         this.Close();
     }
 
-    RedisReply protocolFailure() {
+    static RedisReply makeErrorReply(string msg) {
         RedisReply r = new RedisReply();
         r.kind = RedisReply.ERROR;
-        r.str = this.protocolError;
+        r.str = msg;
         return r;
+    }
+
+    RedisReply protocolFailure() {
+        return RedisClient.makeErrorReply(this.protocolError);
     }
 
     string sliceBytes(int start, int len) {
@@ -343,9 +288,7 @@ public partial class RedisClient {
             this.failProtocol("receive buffer limit exceeded");
             return false;
         }
-        if (extra <= this.incap - this.intail) {
-            return true;
-        }
+        if (extra <= this.incap - this.intail) { return true; }
         if (this.inhead > 0) {
             int span = this.intail - this.inhead;
             if (span > 0) {
@@ -354,9 +297,7 @@ public partial class RedisClient {
             this.inhead = 0;
             this.intail = span;
         }
-        if (extra <= this.incap - this.intail) {
-            return true;
-        }
+        if (extra <= this.incap - this.intail) { return true; }
         if (this.intail > RedisClient.MaxReceiveBufferBytes - extra) {
             this.failProtocol("receive buffer limit exceeded");
             return false;
@@ -364,16 +305,12 @@ public partial class RedisClient {
         int need = this.intail + extra;
         int ncap = this.incap > 0 ? this.incap : 16384;
         while (need > ncap) {
-            if (ncap > RedisClient.MaxReceiveBufferBytes / 2) {
-                ncap = RedisClient.MaxReceiveBufferBytes;
-            } else {
-                ncap = ncap * 2;
-            }
+            ncap = ncap > RedisClient.MaxReceiveBufferBytes / 2
+                ? RedisClient.MaxReceiveBufferBytes
+                : ncap * 2;
         }
         byte[] nb = new byte[ncap + 1];
-        if (this.intail > 0) {
-            NativeMemory.Copy((nint)nb, (nint)this.inbuf, this.intail);
-        }
+        if (this.intail > 0) { NativeMemory.Copy((nint)nb, (nint)this.inbuf, this.intail); }
         this.inbuf = nb;
         this.incap = ncap;
         return true;
@@ -382,12 +319,9 @@ public partial class RedisClient {
     async int fillMore(int maxBytes) {
         if (!this.connected) { return 0; }
         int take = maxBytes < this.tmpcap ? maxBytes : this.tmpcap;
-        int n;
-        if (this.tls != null) {
-            n = await this.tls.RecvBytesAsync(this.tmp, 0, take);
-        } else {
-            n = await Socket.RecvIntoAsync(this.sock, this.tmp, take);
-        }
+        int n = this.tls != null
+            ? await this.tls.RecvBytesAsync(this.tmp, 0, take)
+            : await Socket.RecvIntoAsync(this.sock, this.tmp, take);
         if (n <= 0) {
             this.failProtocol("truncated RESP reply");
             return 0;
@@ -400,10 +334,7 @@ public partial class RedisClient {
 
     async bool ensureAvailable(int need) {
         while ((this.intail - this.inhead) < need) {
-            int got = await this.fillMore(this.tmpcap);
-            if (got == 0) {
-                return false;
-            }
+            if (await this.fillMore(this.tmpcap) == 0) { return false; }
         }
         return true;
     }
@@ -434,9 +365,6 @@ public partial class RedisClient {
                         this.failProtocol("invalid RESP line ending");
                         return null;
                     }
-                    // Charge raw text bytes before either ToStr or Substring.
-                    // Numeric/length headers stay bounded by the line guard;
-                    // their decoded payload is admitted by readReplyAtDepth.
                     if (lineLen > 0 && (this.inbuf[this.inhead] == 43 || this.inbuf[this.inhead] == 45)) {
                         if (!budget.AdmitPayload(lineLen - 1)) {
                             this.failProtocol("RESP reply payload budget exceeded");
@@ -455,20 +383,14 @@ public partial class RedisClient {
                     return null;
                 }
             }
-            // Limit this read before ensureRoom can grow; later replies already
-            // prefetched after a complete CRLF do not contribute to this budget.
             int remaining = RedisClient.MaxProtocolLineBytes + 2 - available;
-            int got = await this.fillMore(remaining);
-            if (got == 0) { return null; }
+            if (await this.fillMore(remaining) == 0) { return null; }
         }
         return null;
     }
 
     async string readBulk(int n) {
-        bool ok = await this.ensureAvailable(n + 2);
-        if (!ok) {
-            return null;
-        }
+        if (!await this.ensureAvailable(n + 2)) { return null; }
         if (this.inbuf[this.inhead + n] != 13 || this.inbuf[this.inhead + n + 1] != 10) {
             this.failProtocol("invalid bulk string trailer");
             return null;
@@ -487,25 +409,18 @@ public partial class RedisClient {
         return await this.readReplyAtDepth(0, budget);
     }
 
-    // The root or parent array reserves this node before entering the parser.
     async RedisReply readReplyAtDepth(int arrayDepth, RedisReplyBudget budget) {
         string line = await this.readLine(budget);
         if (line == null) { return this.protocolFailure(); }
-        RedisReply r = new RedisReply();
         if (line.Length == 0) {
             this.failProtocol("empty RESP line");
             return this.protocolFailure();
         }
         int prefix = line[0];
         string rest = line.Substring(1);
-        if (prefix == 43) {  // '+'
-            r.kind = RedisReply.STR;
-            r.str = rest;
-            r.len = (int)strlen(rest);
-            return r;
-        }
-        if (prefix == 45) {  // '-'
-            r.kind = RedisReply.ERROR;
+        RedisReply r = new RedisReply();
+        if (prefix == 43 || prefix == 45) {
+            r.kind = prefix == 43 ? RedisReply.STR : RedisReply.ERROR;
             r.str = rest;
             r.len = (int)strlen(rest);
             return r;
@@ -517,7 +432,7 @@ public partial class RedisClient {
                 return this.protocolFailure();
             }
         }
-        if (prefix == 58) {  // ':'
+        if (prefix == 58) {
             if (!budget.AdmitPayload(8)) {
                 this.failProtocol("RESP reply payload budget exceeded");
                 return this.protocolFailure();
@@ -527,17 +442,13 @@ public partial class RedisClient {
             r.integer = (int)r.integer64;
             return r;
         }
-        if (prefix == 36) {  // '$'
-            if (number == -1) {
-                r.kind = RedisReply.NIL;
-                return r;
-            }
+        if (prefix == 36) {
+            if (number == -1) { r.kind = RedisReply.NIL; return r; }
             if (number < -1 || number > 536870912) {
                 this.failProtocol("bulk string length outside -1..536870912 limit");
                 return this.protocolFailure();
             }
             int blen = (int)number;
-            // Admit the advertised length before receive-buffer growth or ToStr.
             if (!budget.AdmitPayload(blen)) {
                 this.failProtocol("RESP reply payload budget exceeded");
                 return this.protocolFailure();
@@ -549,23 +460,17 @@ public partial class RedisClient {
             r.len = blen;
             return r;
         }
-        if (prefix == 42) {  // '*'
-            // Bound active array frames before allocating or descending.
+        if (prefix == 42) {
             if (arrayDepth >= RedisClient.MaxProtocolArrayDepth) {
                 this.failProtocol("RESP array nesting exceeds 64 level limit");
                 return this.protocolFailure();
             }
-            if (number == -1) {
-                r.kind = RedisReply.NIL;
-                return r;
-            }
+            if (number == -1) { r.kind = RedisReply.NIL; return r; }
             if (number < -1 || number > 1048576) {
                 this.failProtocol("array element count outside -1..1048576 limit");
                 return this.protocolFailure();
             }
             int count = (int)number;
-            // Reserve all direct children at the header, before allocating the
-            // list or any child. Descendants share this root's remaining nodes.
             if (!budget.AdmitNodes(count)) {
                 this.failProtocol("RESP reply node budget exceeded");
                 return this.protocolFailure();
@@ -589,7 +494,6 @@ public partial class RedisClient {
         bool negative = text[0] == 45;
         int i = negative || text[0] == 43 ? 1 : 0;
         if (i == text.Length) { return false; }
-        // Accumulate negatively so Int64.MinValue also fits without overflow.
         long limit = negative ? -9223372036854775807L - 1 : -9223372036854775807L;
         long result = 0;
         while (i < text.Length) {
@@ -604,10 +508,10 @@ public partial class RedisClient {
         return true;
     }
 
-    async int sendArgs(List<string> args) {
+    static StringBuilder BuildRespPrefix(List<string> args, int totalCount) {
         StringBuilder sb = new StringBuilder();
         sb.Append("*");
-        sb.Append(Convert.ToString(args.Count));
+        sb.Append(Convert.ToString(totalCount));
         sb.Append("\r\n");
         for (int i = 0; i < args.Count; i = i + 1) {
             string a = args[i];
@@ -617,40 +521,45 @@ public partial class RedisClient {
             sb.Append(a);
             sb.Append("\r\n");
         }
-        string payload = sb.ToString();
-        int expected = (int)strlen(payload);
-        int sent;
-        if (this.tls != null) {
-            sent = await this.tls.SendAsync(payload, expected);
-        } else {
-            sent = await Socket.SendAsync(this.sock, payload, expected);
-        }
-        if (sent != expected) { this.Close(); }
+        return sb;
+    }
+
+    async int sendStringExact(string data, int len) {
+        int sent = this.tls != null
+            ? await this.tls.SendAsync(data, len)
+            : await Socket.SendAsync(this.sock, data, len);
+        if (sent != len) { this.Close(); }
         return sent;
     }
 
-    // 发送命令（参数向量）并等待其回复。自动支持池化透明路由。
+    async int sendBytesExact(byte[] data, int len) {
+        int sent = this.tls != null
+            ? await this.tls.SendBytesAsync(data, 0, len)
+            : await Socket.SendBytesAsync(this.sock, data, 0, len);
+        if (sent != len) { this.Close(); }
+        return sent;
+    }
+
+    void emitNoticeIfSubscribed(long startTicks, string logText, Exception errEx) {
+        if (this.Notice != null || (this.pool != null && this.pool.Notice != null)) {
+            this.FireNotice(logText, Environment.TickCount64 - startTicks, errEx);
+        }
+    }
+
     public async RedisReply CommandAsync(List<string> args) {
         long start = Environment.TickCount64;
         Exception errEx = null;
-        RedisReply r = null;
         try {
             if (this.pool != null) {
                 RedisClient c = await this.pool.AcquireAsync();
-                if (c == null) {
-                    RedisReply err = new RedisReply();
-                    err.kind = RedisReply.ERROR;
-                    err.str = "failed to acquire redis client from pool";
-                    r = err;
-                    return err;
-                }
+                if (c == null) { return RedisClient.makeErrorReply("failed to acquire redis client from pool"); }
                 int savedPayload = c.maxReplyPayloadBytes;
                 int savedNodes = c.maxReplyNodes;
                 c.SetReplyLimits(this.maxReplyPayloadBytes, this.maxReplyNodes);
                 try {
-                    r = await c.CommandAsync(args);
-                    if (r.IsError()) { this.lastError = r.str; }
-                    return r;
+                    RedisReply pr = await c.CommandAsync(args);
+                    if (pr.IsError()) { this.lastError = pr.str; }
+                    return pr;
                 } finally {
                     c.SetReplyLimits(savedPayload, savedNodes);
                     this.pool.Release(c);
@@ -658,8 +567,7 @@ public partial class RedisClient {
             }
             await this.AcquireLock();
             try {
-                r = await this.CommandInternalAsync(args);
-                return r;
+                return await this.CommandInternalAsync(args);
             } finally {
                 this.ReleaseLock();
             }
@@ -667,60 +575,42 @@ public partial class RedisClient {
             errEx = ex;
             throw ex;
         } finally {
-            if (this.Notice != null || (this.pool != null && this.pool.Notice != null)) {
-                long el = Environment.TickCount64 - start;
-                string log = this.formatCmdLog(args);
-                this.FireNotice(log, el, errEx);
-            }
+            this.emitNoticeIfSubscribed(start, this.formatCmdLog(args), errEx);
         }
     }
 
     async RedisReply CommandInternalAsync(List<string> args) {
         if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
         if (!this.connected) {
-            RedisReply closed = new RedisReply();
-            closed.kind = RedisReply.ERROR;
-            closed.str = "connection closed";
-            this.lastError = closed.str;
-            return closed;
+            this.lastError = "connection closed";
+            return RedisClient.makeErrorReply("connection closed");
         }
-        int sent = await this.sendArgs(args);
-        RedisReply r = new RedisReply();
+        string payload = RedisClient.BuildRespPrefix(args, args.Count).ToString();
+        int expected = (int)strlen(payload);
+        int sent = await this.sendStringExact(payload, expected);
         if (!this.connected || sent <= 0) {
-            r.kind = RedisReply.ERROR;
-            r.str = "connection closed";
-            this.lastError = r.str;
-            return r;
+            this.lastError = "connection closed";
+            return RedisClient.makeErrorReply("connection closed");
         }
-        r = await this.readReply();
-        if (r.IsError()) {
-            this.lastError = r.str;
-        }
+        RedisReply r = await this.readReply();
+        if (r.IsError()) { this.lastError = r.str; }
         return r;
     }
 
-    // 发送带二进制参数的命令（如 SET key <byte[]>）并等待回复。
     public async RedisReply CommandBytesAsync(List<string> prefixArgs, byte[] binaryArg) {
         long start = Environment.TickCount64;
         Exception errEx = null;
-        RedisReply r = null;
         try {
             if (this.pool != null) {
                 RedisClient c = await this.pool.AcquireAsync();
-                if (c == null) {
-                    RedisReply err = new RedisReply();
-                    err.kind = RedisReply.ERROR;
-                    err.str = "failed to acquire redis client from pool";
-                    r = err;
-                    return err;
-                }
+                if (c == null) { return RedisClient.makeErrorReply("failed to acquire redis client from pool"); }
                 int savedPayload = c.maxReplyPayloadBytes;
                 int savedNodes = c.maxReplyNodes;
                 c.SetReplyLimits(this.maxReplyPayloadBytes, this.maxReplyNodes);
                 try {
-                    r = await c.CommandBytesAsync(prefixArgs, binaryArg);
-                    if (r.IsError()) { this.lastError = r.str; }
-                    return r;
+                    RedisReply pr = await c.CommandBytesAsync(prefixArgs, binaryArg);
+                    if (pr.IsError()) { this.lastError = pr.str; }
+                    return pr;
                 } finally {
                     c.SetReplyLimits(savedPayload, savedNodes);
                     this.pool.Release(c);
@@ -728,8 +618,7 @@ public partial class RedisClient {
             }
             await this.AcquireLock();
             try {
-                r = await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
-                return r;
+                return await this.CommandBytesInternalAsync(prefixArgs, binaryArg);
             } finally {
                 this.ReleaseLock();
             }
@@ -738,103 +627,48 @@ public partial class RedisClient {
             throw ex;
         } finally {
             if (this.Notice != null || (this.pool != null && this.pool.Notice != null)) {
-                long el = Environment.TickCount64 - start;
                 string log = this.formatCmdLog(prefixArgs) + " <bytes:" + Convert.ToString(binaryArg != null ? binaryArg.Length : 0) + ">";
-                this.FireNotice(log, el, errEx);
+                this.FireNotice(log, Environment.TickCount64 - start, errEx);
             }
         }
     }
 
     async RedisReply CommandBytesInternalAsync(List<string> prefixArgs, byte[] binaryArg) {
         if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
-        RedisReply r = new RedisReply();
         if (!this.connected) {
-            r.kind = RedisReply.ERROR;
-            r.str = "connection closed";
-            this.lastError = r.str;
-            return r;
+            this.lastError = "connection closed";
+            return RedisClient.makeErrorReply("connection closed");
         }
-        int totalArgs = prefixArgs.Count + 1;
-        StringBuilder sb = new StringBuilder();
-        sb.Append("*");
-        sb.Append(Convert.ToString(totalArgs));
-        sb.Append("\r\n");
-        for (int i = 0; i < prefixArgs.Count; i = i + 1) {
-            string a = prefixArgs[i];
-            sb.Append("$");
-            sb.Append(Convert.ToString((int)strlen(a)));
-            sb.Append("\r\n");
-            sb.Append(a);
-            sb.Append("\r\n");
-        }
-        sb.Append("$");
+        StringBuilder sb = RedisClient.BuildRespPrefix(prefixArgs, prefixArgs.Count + 1);
         int blen = binaryArg != null ? binaryArg.Length : 0;
+        sb.Append("$");
         sb.Append(Convert.ToString(blen));
         sb.Append("\r\n");
         string head = sb.ToString();
         int hlen = (int)strlen(head);
-        int sentHead = 0;
-        if (this.tls != null) {
-            sentHead = await this.tls.SendAsync(head, hlen);
-        } else {
-            sentHead = await Socket.SendAsync(this.sock, head, hlen);
+        if (await this.sendStringExact(head, hlen) != hlen) {
+            return RedisClient.makeErrorReply("connection closed");
         }
-        if (sentHead != hlen) {
-            this.Close();
-            r.kind = RedisReply.ERROR;
-            r.str = "connection closed";
-            return r;
+        if (blen > 0 && await this.sendBytesExact(binaryArg, blen) != blen) {
+            return RedisClient.makeErrorReply("connection closed");
         }
-        if (blen > 0) {
-            int sentBin = 0;
-            if (this.tls != null) {
-                sentBin = await this.tls.SendBytesAsync(binaryArg, 0, blen);
-            } else {
-                sentBin = await Socket.SendBytesAsync(this.sock, binaryArg, 0, blen);
-            }
-            if (sentBin != blen) {
-                this.Close();
-                r.kind = RedisReply.ERROR;
-                r.str = "connection closed";
-                return r;
-            }
+        if (await this.sendStringExact("\r\n", 2) != 2) {
+            return RedisClient.makeErrorReply("connection closed");
         }
-        int sentTail = 0;
-        if (this.tls != null) {
-            sentTail = await this.tls.SendAsync("\r\n", 2);
-        } else {
-            sentTail = await Socket.SendAsync(this.sock, "\r\n", 2);
-        }
-        if (sentTail != 2) {
-            this.Close();
-            r.kind = RedisReply.ERROR;
-            r.str = "connection closed";
-            return r;
-        }
-        r = await this.readReply();
-        if (r.IsError()) {
-            this.lastError = r.str;
-        }
+        RedisReply r = await this.readReply();
+        if (r.IsError()) { this.lastError = r.str; }
         return r;
     }
 
-    // 便捷方法：单参数命令。
     public async RedisReply CommandAsync1(string a0) {
-        List<string> args = new List<string>();
-        args.Add(a0);
-        return await this.CommandAsync(args);
+        return await this.CommandAsync(new List<string>{ a0 });
     }
 
-    // 便捷方法：双参数命令。
     public async RedisReply CommandAsync2(string a0, string a1) {
-        List<string> args = new List<string>{ a0, a1 };
-        return await this.CommandAsync(args);
+        return await this.CommandAsync(new List<string>{ a0, a1 });
     }
 
-    // 便捷方法：三参数命令。
     public async RedisReply CommandAsync3(string a0, string a1, string a2) {
-        List<string> args = new List<string>{ a0, a1, a2 };
-        return await this.CommandAsync(args);
+        return await this.CommandAsync(new List<string>{ a0, a1, a2 });
     }
-
 }

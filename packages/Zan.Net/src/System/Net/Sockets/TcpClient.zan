@@ -5,7 +5,7 @@ using System.Threading;
 
 namespace System.Net.Sockets;
 
-// 基于 Socket 层实现的 TCP 客户端，提供发送/接收操作。
+// 基于 Socket 层实现的 TCP 客户端。
 public class TcpClient : IDisposable {
     private nint sock;
     private string host;
@@ -18,8 +18,6 @@ public class TcpClient : IDisposable {
     [DllImport("crt")]
     private static extern long strlen(string str);
 
-    // 内部构造：句柄 -1（未连接），接收缓冲默认 64KB；经
-    // Connect/ConnectAsync/FromSocket 使用。
     public TcpClient() {
         this.sock = -1;
         this.host = "";
@@ -30,20 +28,9 @@ public class TcpClient : IDisposable {
         this.recvBuf = null;
     }
 
-    // 返回底层套接字句柄（例如用于在
-    // TlsStream 中包装连接）。
-    public nint Sock() {
-        return this.sock;
-    }
+    public nint Sock() { return this.sock; }
+    public Socket Client { get { return new Socket(this.sock); } }
 
-    // 面向对象底层 Socket 实例访问器（对标 .NET TcpClient.Client）。
-    public Socket Client {
-        get {
-            return new Socket(this.sock);
-        }
-    }
-
-    // 从已连接的套接字创建 TcpClient。
     public static TcpClient FromSocket(nint sock) {
         TcpClient client = new TcpClient();
         client.sock = sock;
@@ -51,39 +38,26 @@ public class TcpClient : IDisposable {
         return client;
     }
 
-    // 连接远程主机，在 IO reactor 上挂起直到
-    // 连接建立（非阻塞 connect）。连接失败时返回 null
-    // （例如被拒绝或不可达）。
     public static async TcpClient ConnectAsync(string host, int port) {
         return await TcpClient.ConnectAsync(host, port, NetConstants.TimeoutLongConnectMs, true);
     }
 
-    // 带 <paramref name="timeoutMs"/> 截止时间的 ConnectAsync：
-    // 连接失败，或在截止时间到来时仍处于等待状态，则返回
-    // null（用 LastConnectTimedOut 区分两种情况）。非正超时
-    // 表示"不设截止时间"。
     public static async TcpClient ConnectAsync(string host, int port, int timeoutMs) {
         return await TcpClient.ConnectAsync(host, port, timeoutMs, true);
     }
 
-    // 连接到已由调用方明确允许的本地或远程目标。DNS 解析完成后
-    // 每个候选地址先做二进制安全审核，再以同一 sockaddr 发起连接。
-    public static async TcpClient ConnectAsync(string host, int port, int timeoutMs,
-                                        bool allowLoopback) {
+    public static async TcpClient ConnectAsync(string host, int port, int timeoutMs, bool allowLoopback) {
         return await TcpClient.ConnectAsync(host, port, timeoutMs, allowLoopback, true);
     }
 
-    // 连接到已由调用方明确允许的本地或远程目标。DNS 解析完成后
-    // 每个候选地址先做二进制安全审核（可指定是否放行环回与私网），再以同一 sockaddr 发起连接。
+    // 解析并按候选 sockaddr 逐个审核与建连；timeoutMs <= 0 表示不设截止时间。
     public static async TcpClient ConnectAsync(string host, int port, int timeoutMs,
                                         bool allowLoopback, bool allowPrivate) {
         Socket.Initialize();
         TcpClient.MarkConnectTimeout(false);
         TcpClient.MarkConnectResolveFailed(false);
         bool bounded = timeoutMs > 0;
-        int limit = timeoutMs;
-        long deadline = 0;
-        if (bounded) { deadline = Socket.NativeMonotonicUs() + limit * 1000; }
+        long deadline = bounded ? (Socket.NativeMonotonicUs() + (long)timeoutMs * 1000) : 0;
         byte[] records = new byte[16 * 32];
         bool fromCache = false;
         int count = DnsCache.Lookup(host, port, records);
@@ -97,8 +71,8 @@ public class TcpClient : IDisposable {
             }
             DnsCache.Store(host, port, records, count);
         }
+        byte[] rec = new byte[32];
         for (int i = 0; i < count; i = i + 1) {
-            byte[] rec = new byte[32];
             int offset = i * 32;
             for (int j = 0; j < 32; j = j + 1) { rec[j] = records[offset + j]; }
             int family = Socket.SockAddrFamily(rec, 32);
@@ -120,12 +94,11 @@ public class TcpClient : IDisposable {
                     return null;
                 }
             }
-            int err = await Socket.ConnectSockAddrAsync(sock, rec,
-                saLen, remain);
+            int err = await Socket.ConnectSockAddrAsync(sock, rec, saLen, remain);
             if (err == 0) {
                 TcpClient client = new TcpClient();
                 client.sock = sock;
-                client.host = host;  // TLS metadata remains the original hostname.
+                client.host = host;  // 保留原始主机名供 TLS SNI/校验证书使用
                 client.port = port;
                 client.connected = true;
                 client.nonBlocking = true;
@@ -138,7 +111,7 @@ public class TcpClient : IDisposable {
             }
         }
         if (fromCache) {
-            // 缓存的候选地址全部失效（如对端漂移或下线），主动驱逐失效缓存并以剩余预算重试一次新鲜解析
+            // 缓存地址全部不可达时驱逐缓存并以剩余预算重新解析一次。
             DnsCache.Invalidate(host, port);
             int retryRemain = -1;
             if (bounded) {
@@ -153,40 +126,25 @@ public class TcpClient : IDisposable {
         return null;
     }
 
-    // 本线程最近一次 ConnectAsync 是因超时放弃
-    // 而非被拒绝时为 true。通过同步辅助函数写入，
-    // 本协程最近一次 ConnectAsync 是否因超时放弃而返回 null。
-    // 使用 ThreadLocal 隔离各线程/协程结果。
-    public static bool LastConnectTimedOut() {
-        if (TcpClient.tlConnectTimedOut == null) { return false; }
-        return TcpClient.tlConnectTimedOut.Value;
-    }
-
     private static ThreadLocal<bool> tlConnectTimedOut = new ThreadLocal<bool>();
     private static ThreadLocal<bool> tlConnectResolveFailed = new ThreadLocal<bool>();
 
-    // 更新 LastConnectTimedOut 报告的标志。
+    public static bool LastConnectTimedOut() {
+        return TcpClient.tlConnectTimedOut != null && TcpClient.tlConnectTimedOut.Value;
+    }
+
     private static void MarkConnectTimeout(bool timedOut) {
-        if (TcpClient.tlConnectTimedOut != null) {
-            TcpClient.tlConnectTimedOut.Value = timedOut;
-        }
+        if (TcpClient.tlConnectTimedOut != null) { TcpClient.tlConnectTimedOut.Value = timedOut; }
     }
 
-    // 最近一次 ConnectAsync 是否因 DNS 解析失败（或候选地址全部被
-    // 安全审核拒绝）而返回 null；与超时标志互斥使用。
     public static bool LastConnectResolveFailed() {
-        if (TcpClient.tlConnectResolveFailed == null) { return false; }
-        return TcpClient.tlConnectResolveFailed.Value;
+        return TcpClient.tlConnectResolveFailed != null && TcpClient.tlConnectResolveFailed.Value;
     }
 
-    // 更新 LastConnectResolveFailed 报告的标志。
     private static void MarkConnectResolveFailed(bool failed) {
-        if (TcpClient.tlConnectResolveFailed != null) {
-            TcpClient.tlConnectResolveFailed.Value = failed;
-        }
+        if (TcpClient.tlConnectResolveFailed != null) { TcpClient.tlConnectResolveFailed.Value = failed; }
     }
 
-    // 同步连接远程主机。
     public static TcpClient Connect(string host, int port) {
         Socket.Initialize();
         TcpClient client = new TcpClient();
@@ -204,110 +162,76 @@ public class TcpClient : IDisposable {
         return client;
     }
 
-    // 把套接字切到非阻塞模式（幂等）。异步操作把描述符
-    // 交给 IO reactor，阻塞描述符会让整个调度线程停在一次
-    // recv/send 上；同步 Connect 与 FromSocket 交出的套接字
-    // 未必已经是非阻塞的，因此在每个异步入口处保证一次，而不是
-    // 依赖调用方的构造路径。同步 Send/Recv 不经过这里，仍是
-    // 阻塞语义。
+    // 异步入口幂等切到非阻塞，避免同步 Connect/FromSocket 传入的阻塞句柄卡住调度线程。
     public void EnsureNonBlocking() {
-        if (this.nonBlocking) { return; }
-        if (this.sock < 0) { return; }
+        if (this.nonBlocking || this.sock < 0) { return; }
         Socket.SetNonBlocking(this.sock);
         this.nonBlocking = true;
     }
 
-    // 发送数据，必要时在 IO reactor 上挂起。
     public async int SendAsync(string data) {
         this.EnsureNonBlocking();
-        int len = (int)strlen(data);
-        int r = await Socket.SendAsync(this.sock, data, len);
-        return r;
+        return await Socket.SendAsync(this.sock, data, (int)strlen(data));
     }
 
-    // 发送原始字节，必要时在 IO reactor 上挂起。
     public async int SendBytesAsync(string data, int len) {
         this.EnsureNonBlocking();
-        int r = await Socket.SendAsync(this.sock, data, len);
-        return r;
+        return await Socket.SendAsync(this.sock, data, len);
     }
 
-    // 发送原始字节数组，必要时在 IO reactor 上挂起。
     public async int SendBytesAsync(byte[] data, int len) {
         this.EnsureNonBlocking();
-        int r = await Socket.SendBytesAsync(this.sock, data, 0, len);
-        return r;
+        return await Socket.SendBytesAsync(this.sock, data, 0, len);
     }
 
-    // 发送原始字节数组指定切片，必要时在 IO reactor 上挂起。
     public async int SendBytesAsync(byte[] data, int offset, int len) {
         this.EnsureNonBlocking();
-        int r = await Socket.SendBytesAsync(this.sock, data, offset, len);
-        return r;
+        return await Socket.SendBytesAsync(this.sock, data, offset, len);
     }
 
-    // 发送裸指针内存切片，必要时在 IO reactor 上挂起。零分配与零拷贝。
     public async int SendPtrAsync(nint ptr, int len) {
         this.EnsureNonBlocking();
-        int r = await Socket.SendPtrAsync(this.sock, ptr, len);
-        return r;
+        return await Socket.SendPtrAsync(this.sock, ptr, len);
     }
 
-    // 发送 StringView 视图，必要时在 IO reactor 上挂起。零分配与零拷贝。
     public async int SendViewAsync(StringView view) {
         this.EnsureNonBlocking();
-        int r = await Socket.SendViewAsync(this.sock, view);
-        return r;
+        return await Socket.SendViewAsync(this.sock, view);
     }
 
-    // 异步接收数据到裸指针内存，零中间字符串与零额外拷贝。
     public async int RecvPtrAsync(nint ptr, int maxLen) {
         this.EnsureNonBlocking();
-        int r = await Socket.RecvPtrAsync(this.sock, ptr, maxLen);
-        return r;
+        return await Socket.RecvPtrAsync(this.sock, ptr, maxLen);
     }
 
-    // 接收数据，在 IO reactor 上挂起直到可读。
     public async string RecvAsync(int bufSize) {
         this.EnsureNonBlocking();
-        string r = await Socket.RecvAsync(this.sock, bufSize);
-        return r;
+        return await Socket.RecvAsync(this.sock, bufSize);
     }
 
-    // 异步接收数据到字节数组，避免中间字符串分配与拷贝。
     public async int RecvBytesAsync(byte[] buf, int maxLen) {
         this.EnsureNonBlocking();
         return await Socket.RecvBytesAsync(this.sock, buf, maxLen);
     }
 
-    // 带超时时间限制的异步接收数据到字节数组。
     public async int RecvBytesAsync(byte[] buf, int maxLen, int timeoutMs) {
         this.EnsureNonBlocking();
         return await Socket.RecvBytesAsync(this.sock, buf, maxLen, timeoutMs);
     }
 
-    // 带 <paramref name="timeoutMs"/> 截止时间的接收：时限内
-    // 没有数据到达时返回空串（用 Socket.LastRecvTimedOut 与对端关闭
-    // 区分）。非正超时表示"不设截止时间"。
     public async string RecvAsync(int bufSize, int timeoutMs) {
         this.EnsureNonBlocking();
-        string r = await Socket.RecvAsync(this.sock, bufSize, timeoutMs);
-        return r;
+        return await Socket.RecvAsync(this.sock, bufSize, timeoutMs);
     }
 
-    // 使用默认缓冲区大小接收。
     public async string RecvAsync() {
-        string r = await Socket.RecvAsync(this.sock, this.recvBufSize);
-        return r;
+        this.EnsureNonBlocking();
+        return await Socket.RecvAsync(this.sock, this.recvBufSize);
     }
 
-    // 接收数据到本连接的复用缓冲区，在
-    // IO reactor 上挂起直到可读。缓冲区每条连接只分配一次，
-    // 在 keep-alive 请求间复用，因此没有每次请求的
-    // 分配/清零开销。返回以 NUL 结尾的接收字节
-    // 字符串（对端关闭时为空）。返回的字符串指向共享缓冲区，
-    // 仅在该客户端下一次接收前有效。
+    // 复用本连接 64KB ARC 缓冲区；返回值仅在下一次接收前有效。
     public async string RecvReuseAsync() {
+        this.EnsureNonBlocking();
         if (this.recvBuf == null) {
             this.recvBuf = TcpClient.RentRecvBuffer(this.recvBufSize);
         }
@@ -315,17 +239,10 @@ public class TcpClient : IDisposable {
         return this.recvBuf;
     }
 
-    // 复用缓冲区的进程级空闲池。缓冲区本身是 ARC 托管字符串
-    // （见 RentRecvBuffer），构建一个的代价是按字节填充 64KB
-    // ——每条连接付一次的话，短连接（Connection: close）负载下
-    // 它比处理请求本身还贵。连接关闭时把缓冲区还回池中，
-    // 下一条连接直接借用：稳定状态下既没有构建开销，
-    // 也没有 64KB 的分配/释放抖动。
     private static List<string> recvPool = new List<string>();
     private static int recvPoolSize = 65536;
     private static int recvPoolMax = 1024;
 
-    // 高效指数倍增构建指定大小的填充字符串（O(log N) 级构造，避免逐字符拼接海量中间对象）。
     private static string AllocBuffer(int size) {
         if (size <= 0) { return ""; }
         string cur = " ";
@@ -340,14 +257,8 @@ public class TcpClient : IDisposable {
         return cur;
     }
 
-    // 借一个至少 <paramref name="size"/> 字节的接收缓冲区。
-    // 只有默认大小的缓冲区进池：池里的每一项都是本方法按
-    // recvPoolSize 构建的，所以借出的容量总是已知且足够。
     public static string RentRecvBuffer(int size) {
         if (size == TcpClient.recvPoolSize) {
-            // 池是进程级的，而协程运行在多个 worker 线程上
-            // （--async-workers），两条连接同时借用时，"看 Count
-            // 再按下标取" 会读到已被另一线程摘走的位置。
             lock (TcpClient.recvPool) {
                 int n = TcpClient.recvPool.Count;
                 if (n > 0) {
@@ -357,73 +268,37 @@ public class TcpClient : IDisposable {
                 }
             }
         }
-        // 把复用缓冲区分配为真正的 ARC 托管字符串。与原始 calloc
-        // 块不同，它带有字符串引用计数头，因此 ARC 能正确释放；
-        // 原始缓冲区会被手动释放，之后又可能被后续的
-        // str_release 再次读取，一旦堆回收了那 64KB 页面就会出错。
+        // 必须分配为 ARC 托管字符串，避免原始 calloc 块被 str_release 误释放。
         return TcpClient.AllocBuffer(size);
     }
 
-    // 把缓冲区还回池中。调用方在归还后不得再读取它
-    // （RecvReuseAsync 的返回值本来就只在下一次接收前有效）。
     public static void ReturnRecvBuffer(string buf, int size) {
-        if (buf == null) { return; }
-        if (size != TcpClient.recvPoolSize) { return; }
+        if (buf == null || size != TcpClient.recvPoolSize) { return; }
         lock (TcpClient.recvPool) {
             if (TcpClient.recvPool.Count >= TcpClient.recvPoolMax) { return; }
             TcpClient.recvPool.Add(buf);
         }
     }
 
-    // 同步发送数据。
-    public int Send(string data) {
-        return Socket.SendString(this.sock, data);
-    }
+    public int Send(string data) { return Socket.SendString(this.sock, data); }
+    public string Recv(int bufSize) { return Socket.Receive(this.sock, bufSize); }
 
-    // 同步接收数据。
-    public string Recv(int bufSize) {
-        return Socket.Receive(this.sock, bufSize);
-    }
-
-    // 关闭连接。
     public void Close() {
         if (this.connected) {
-            // 先 shutdown 再关：closesocket 自己不会唤醒挂在本句柄上的
-            // 重叠操作（Windows 连完成包都不投递），对端也只靠 FIN
-            // 之外无信号可收——Keep-alive 连接里停在 RecvAsync 的对端
-            // 协程会带着未完成事件永远挂起，调度器因此永不静止。
-            // ShutdownBoth = shutdown + Windows CancelIoEx，本句柄挂起
-            // 操作以 0 字节复位、对端以 EOF 复位；与 TcpListener.Stop 同型。
+            // 先 ShutdownBoth（含 Windows CancelIoEx）唤醒挂起重叠 IO，防止调度器永不静止。
             Socket.ShutdownBoth(this.sock);
             Socket.Close(this.sock);
             this.connected = false;
             this.sock = -1;
         }
-        // 归还每条连接的接收缓冲区，供下一条连接复用；池满时
-        // 直接丢弃，清空该字段即释放最后一个引用（ARC 托管字符串）。
         if (this.recvBuf != null) {
             TcpClient.ReturnRecvBuffer(this.recvBuf, this.recvBufSize);
             this.recvBuf = null;
         }
     }
 
-    // 释放客户端连接与缓冲区资源（实现 IDisposable，等同于 Close）。
-    public void Dispose() {
-        this.Close();
-    }
-
-    // 已连接时返回 true。
-    public bool IsConnected() {
-        return this.connected;
-    }
-
-    // 获取底层套接字句柄。
-    public nint GetSocket() {
-        return this.sock;
-    }
-
-    // 设置接收缓冲区大小。
-    public void SetRecvBufferSize(int size) {
-        this.recvBufSize = size;
-    }
+    public void Dispose() { this.Close(); }
+    public bool IsConnected() { return this.connected; }
+    public nint GetSocket() { return this.sock; }
+    public void SetRecvBufferSize(int size) { this.recvBufSize = size; }
 }

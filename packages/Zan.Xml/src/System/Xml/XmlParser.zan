@@ -3,28 +3,18 @@ using System.Text;
 
 namespace System.Xml;
 
-// 递归下降 XML 解析器（XmlDocument.Parse 的实现）。字节游标风格
-// 与 System.Json 的 JsonReader 一致：<c>s[pos] &amp; 255</c> 逐字节
-// 判别，格式非法立即抛 <see cref="XmlException"/>（带行列号）。
-// 支持范围：元素/属性（单双引号）、文本、五种命名实体与
-// <c>&amp;#DDD;</c>/<c>&amp;#xHH;</c> 数字字符引用、CDATA、注释、
-// PI、XML 声明、DOCTYPE（原文截取，含内部子集）。命名空间不
-// 解析，前缀原样留在名字里。非 ASCII 字节整体视作名字字符，
-// 中文元素/属性名可用。
+// 递归下降 XML 解析器（XmlDocument.Parse 实现）：按字节游标逐字节判别（保留 UTF-8 多字节名），
+// 支持元素/属性、文本、5 种命名实体及 &#DDD;/&#xHH;、CDATA、注释、PI、XML 声明与 DOCTYPE（不解析命名空间）；非法格式抛带行列号的 XmlException。
 public class XmlParser {
     // 输入文本与游标。
     public string s;
     public int pos;
     public int len;
-    // 与 JsonValue 对称的嵌套深度上限：写侧序列化同样递归，
-    // 无界深度会耗尽调用栈，读写两侧一起限。
+    // 读写对称的嵌套深度上限，防止无界递归耗尽调用栈。
     public static int MaxDepth = 512;
 
-    // 解析入口。格式非法时抛 XmlException（带行列号）。
+    // 解析入口（自动剥除前导 UTF-8 BOM）。
     public static XmlDocument Parse(string src) {
-        // BOM 是编码标记不是内容：文件路径已由 File.ReadAllText 剥过，
-        // 网络/内嵌文本（Windows 工具常带 EF BB BF）在这里兜底，不剥
-        // 会被当成根元素前的杂散字符报"expected <"。
         if (src.Length >= 3 && (src[0] & 255) == 239 && (src[1] & 255) == 187
         && (src[2] & 255) == 191) {
             src = src.Substring(3);
@@ -36,8 +26,7 @@ public class XmlParser {
         return p.ReadDocument();
     }
 
-    // 文档层：空白/声明/注释/PI/DOCTYPE 之间恰一个根元素；
-    // 根外的零散文本非法。
+    // 文档层：空白/声明/注释/PI/DOCTYPE 间恰一个根元素。
     public XmlDocument ReadDocument() {
         XmlDocument doc = new XmlDocument();
         bool sawRoot = false;
@@ -66,8 +55,7 @@ public class XmlParser {
         return doc;
     }
 
-    // 前置 '<' 已确认，读开始标签、属性，再递归读内容直到匹配
-    // 的结束标签（自闭合则直接返回）。
+    // 读取开始标签、属性及子内容（自闭合则跳过内容）。
     private XmlNode ReadElement(int depth) {
         if (depth > XmlParser.MaxDepth) { Err("XML nesting too deep"); }
         pos = pos + 1;  // 消费 '<'
@@ -79,9 +67,7 @@ public class XmlParser {
         return elem;
     }
 
-    // 属性序列，读到 '>'（普通标签）或 '/>'（自闭合）为止；
-    // isDecl 时以 '?&gt;' 收尾（xml 声明的伪属性）。返回是否自闭合
-    // ——自闭合元素没有内容可读，调用方不得再进 ReadChildren。
+    // 读取属性列表直到 '>'、'/>' 或（isDecl=true 时的）'?>'；返回是否自闭合。
     private bool ReadAttrs(XmlNode elem, bool isDecl) {
         while (pos < len) {
             SkipWs();
@@ -117,9 +103,7 @@ public class XmlParser {
             if (pos >= len) { Err("unterminated attribute value"); }
             string raw = s.Substring(start, pos - start);
             pos = pos + 1;  // 消费闭引号
-            // XML 规范（WFC: Unique Att Spec）：同一标签上重复属性名是
-            // fatal。历史上静默保留两个同名属性，读端 Attr 取首个——文档
-            // 语义不确定（P1-6）。带行列号报错。
+            // XML WFC: Unique Att Spec — 重复属性名立即报错。
             if (elem.attrs != null) {
                 for (int ai = 0; ai < elem.attrs.Count; ai = ai + 1) {
                     if (elem.attrs[ai].name == aname) {
@@ -136,8 +120,7 @@ public class XmlParser {
         return false;
     }
 
-    // 元素内容：文本游程与子元素/CDATA/注释/PI 交替，直到匹配
-    // 的结束标签。结束标签名与开始不符立即报错。
+    // 读取元素子节点与文本直到匹配的结束标签。
     private void ReadChildren(XmlNode elem, int depth) {
         while (pos < len) {
             int c = CurB();
@@ -178,42 +161,33 @@ public class XmlParser {
         Err("unclosed element <" + elem.name + ">");
     }
 
-    // '<!--' 已确认，读到 '--&gt;'。注释正文原样保存（含 '--' 的
-    // 非法形态不校验，写侧原样回吐）。
+    private string ReadUntil(int skipPrefix, string closeDelim, string unterminatedMsg) {
+        pos = pos + skipPrefix;
+        int start = pos;
+        int dlen = closeDelim.Length;
+        while (pos < len) {
+            if (Has(closeDelim)) {
+                string text = s.Substring(start, pos - start);
+                pos = pos + dlen;
+                return text;
+            }
+            pos = pos + 1;
+        }
+        Err(unterminatedMsg);
+        return "";
+    }
+
+    // 读取 '<!--...-->' 注释（正文原样保留）。
     private XmlNode ReadComment() {
-        pos = pos + 4;  // 消费 '<!--'
-        int start = pos;
-        while (pos < len) {
-            if (Has("-->")) {
-                XmlNode n = XmlNode.NewComment(s.Substring(start, pos - start));
-                pos = pos + 3;
-                return n;
-            }
-            pos = pos + 1;
-        }
-        Err("unterminated comment");
-        return null;
+        return XmlNode.NewComment(ReadUntil(4, "-->", "unterminated comment"));
     }
 
-    // '&lt;![CDATA[' 已确认，读到 ']]&gt;'。内容原样保存（其中
-    // 出现 ']]&gt;' 属非法形态，按首个 ']]&gt;' 截断的宽松语义处理）。
+    // 读取 '<![CDATA[...]]>' 段（在首个 ']]>' 截断）。
     XmlNode ReadCdata() {
-        pos = pos + 9;  // 消费 '<![CDATA['
-        int start = pos;
-        while (pos < len) {
-            if (Has("]]>")) {
-                XmlNode n = XmlNode.NewCdata(s.Substring(start, pos - start));
-                pos = pos + 3;
-                return n;
-            }
-            pos = pos + 1;
-        }
-        Err("unterminated CDATA section");
-        return null;
+        return XmlNode.NewCdata(ReadUntil(9, "]]>", "unterminated CDATA section"));
     }
 
-    // '&lt;?' 已确认。目标名为 'xml' 的是声明（伪属性走属性表），
-    // 其余为 PI（目标名 + 原文正文）。
+    // 读取 '<?...'：目标为 'xml' 走声明，其余为 PI。
     XmlNode ReadPiOrDecl() {
         pos = pos + 2;  // 消费 '<?'
         string target = ReadName();
@@ -234,8 +208,7 @@ public class XmlParser {
         return pi;
     }
 
-    // '&lt;!DOCTYPE' 已确认，原文截取到未配对的 '>'（内部子集
-    // [...] 里的 '>' 不算结束）。不做 DTD 校验。
+    // 读取 '<!DOCTYPE...>' 原文（跳过内部子集 [...] 内的 '>'，不做 DTD 校验）。
     XmlNode ReadDoctype() {
         int start = pos;
         pos = pos + 2;  // 消费 '<!'
@@ -254,8 +227,7 @@ public class XmlParser {
         return null;
     }
 
-    // 读名字：ASCII 字母/数字与 <c>_ - . :</c>，非 ASCII 字节
-    // （UTF-8 多字节整体）也计入，中文标签名可用。
+    // 读取 XML 名字（ASCII 字母/数字/_ - . : 及 UTF-8 多字节）。
     string ReadName() {
         int start = pos;
         while (pos < len) {
@@ -270,9 +242,7 @@ public class XmlParser {
         return s.Substring(start, pos - start);
     }
 
-    // 实体解码 + CR 归一（\r\n 与孤立 \r 都归一成 \n，XML 规范
-    // 行为；写侧把 \r 转义成 &amp;#13; 保证往返无损）。
-    // 快路径：游程里既无 '&' 又无 '\r' 时原串返回，零分配。
+    // 实体解码与 CR 归一（\r\n / \r → \n）；无 '&' / '\r' 时零分配原串返回。
     string DecodeText(string raw) {
         int n = raw.Length;
         int scan = 0;

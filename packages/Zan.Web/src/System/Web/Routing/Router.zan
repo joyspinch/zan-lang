@@ -186,6 +186,15 @@ public class Router {
     // DELETE 快捷。
     public Route Delete(string pattern, HttpHandler handler) { return this.Add("DELETE", pattern, handler); }
 
+    // 纯同步路由注册（零协程帧分配快路径）。
+    public Route AddSync(string method, string pattern, SyncHttpAction handler) {
+        return this.Add(method, pattern, null).SyncAction(handler);
+    }
+    public Route GetSync(string pattern, SyncHttpAction handler) { return this.AddSync("GET", pattern, handler); }
+    public Route PostSync(string pattern, SyncHttpAction handler) { return this.AddSync("POST", pattern, handler); }
+    public Route PutSync(string pattern, SyncHttpAction handler) { return this.AddSync("PUT", pattern, handler); }
+    public Route DeleteSync(string pattern, SyncHttpAction handler) { return this.AddSync("DELETE", pattern, handler); }
+
     // 正则快捷
     public Route GetRegex(string pattern, HttpHandler handler) { return this.AddRegex("GET", pattern, handler); }
     public Route PostRegex(string pattern, HttpHandler handler) { return this.AddRegex("POST", pattern, handler); }
@@ -262,7 +271,13 @@ public class Router {
         string method = ctx.Method();
         string path = ctx.Path();
 
-        // 1. 优先通过跨进程共享内存路由表做 O(1) 匹配
+        // 1. 优先命中进程内静态开址哈希表（O(1)、零字符串拼接、零堆分配）
+        Route hit = this.FindStatic(method, path);
+        if (hit != null) { return hit; }
+        hit = this.FindStatic("*", path);
+        if (hit != null) { return hit; }
+
+        // 2. 跨进程共享内存路由表兜底（仅当静态表未命中或通过 AttachRouteTable 挂载外部表时）
         if (this.routeTable != null) {
             string key = RouteTable.KeyOf(method, path);
             long h = SharedTable.Hash(key);
@@ -278,10 +293,6 @@ public class Router {
             }
         }
 
-        Route hit = this.FindStatic(method, path);
-        if (hit != null) { return hit; }
-        hit = this.FindStatic("*", path);
-        if (hit != null) { return hit; }
         // 自动尾部斜杠容错：/about/company/ -> /about/company
         if (path.Length > 1 && path.EndsWith("/")) {
             string altPath = path.Substring(0, path.Length - 1);

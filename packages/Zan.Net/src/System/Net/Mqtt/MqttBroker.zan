@@ -173,57 +173,6 @@ public class MqttBroker : IDisposable {
     // 当前连接的客户端数。
     public int Count() { return this.sessions.Count; }
 
-    // ---- 帧解析（二进制安全的读取；理由见 MqttClient） ----
-
-    // 精确读一个字节；对端关闭或套接字已死时返回 -1——两种
-    // 情况都必须结束会话。用真正的重叠接收（RecvOv）而非
-    // ReadReady + Recv：后者在数据未到达时把 would-block 误判
-    // 为对端关闭，而在对端 RST 后死套接字永远"可读"，重试只会
-    // 让协程原地空转。RecvOv 只有读到数据或对端关闭才完成。
-    private async int ReadByteAsync(nint sock) {
-        byte[] b = new byte[2];
-        int n = await Socket.RecvOv(sock, b, 1);
-        if (n <= 0) {
-            // 0 = 对端关闭（或硬错误，运行时按对端关闭上报）。
-            return -1;
-        }
-        return b[0] & 255;
-    }
-
-    // 循环读满 `need` 字节；对端中途关闭时返回已读部分。
-    private async byte[] ReadBytesAsync(nint sock, int need) {
-        byte[] buf = new byte[need + 1];
-        byte[] tmp = new byte[need + 1];
-        int got = 0;
-        while (got < need) {
-            int n = await Socket.RecvOv(sock, tmp, need - got);
-            if (n <= 0) { return buf; }
-            for (int i = 0; i < n; i = i + 1) {
-                buf[got] = tmp[i];
-                got = got + 1;
-            }
-        }
-        return buf;
-    }
-
-    // 读 MQTT 变长（varint）剩余长度；套接字关闭返回 -1，
-    // 超过 4 字节编码上限返回 -2（协议错误）。
-    private async int ReadRemainingLenAsync(nint sock) {
-        int multiplier = 1;
-        int acc = 0;
-        int encoded = 128;
-        while ((encoded & 128) != 0) {
-            // MQTT 变长编码最多 4 字节（上限 268435455）；不设上限时
-            // 一串 0x80 让循环无限自旋——恶意客户端的每连接 CPU DoS。
-            if (multiplier > 128 * 128 * 128) { return -2; }
-            encoded = await ReadByteAsync(sock);
-            if (encoded < 0) { return -1; }
-            acc = acc + (encoded & 127) * multiplier;
-            multiplier = multiplier * 128;
-        }
-        return acc;
-    }
-
     // ---- 主题匹配：带 + / # 通配符的过滤器 vs 具体主题 ----
 
     // 按 "/" 切分主题/过滤器为层。
@@ -294,41 +243,6 @@ public class MqttBroker : IDisposable {
         }
         if (payloadLen > 0 && payload != null) {
             NativeMemory.PutString((nint)packet, offset, payload, payloadLen);
-            offset = offset + payloadLen;
-        }
-        return packet;
-    }
-
-    // 构建 QoS 0 的 PUBLISH 报文（原生 byte[] 载荷，零中转字符串拷贝）。
-    private static byte[] BuildPublishBytes(string topic, byte[] payload, int pOffset, int payloadLen) {
-        int topicLen = (int)strlen(topic);
-        int remainLen = 2 + topicLen + payloadLen;
-        byte[] packet = new byte[remainLen + 5];
-        int offset = 0;
-        packet[offset] = (byte)(MqttPacketType.PUBLISH << 4);
-        offset = offset + 1;
-        int rl = remainLen;
-        while (true) {
-            int digit = rl & 127;
-            rl = rl >> 7;
-            if (rl > 0) {
-                packet[offset] = (byte)(digit | 128);
-            } else {
-                packet[offset] = (byte)digit;
-            }
-            offset = offset + 1;
-            if (rl == 0) { break; }
-        }
-        packet[offset] = (byte)((topicLen >> 8) & 255);
-        offset = offset + 1;
-        packet[offset] = (byte)(topicLen & 255);
-        offset = offset + 1;
-        if (topicLen > 0) {
-            NativeMemory.PutString((nint)packet, offset, topic, topicLen);
-            offset = offset + topicLen;
-        }
-        if (payloadLen > 0 && payload != null) {
-            NativeMemory.Copy((nint)packet + (nint)offset, (nint)payload + (nint)pOffset, payloadLen);
             offset = offset + payloadLen;
         }
         return packet;

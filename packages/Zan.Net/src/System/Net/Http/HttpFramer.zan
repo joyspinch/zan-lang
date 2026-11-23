@@ -48,6 +48,7 @@ public class HttpFramer : IDisposable {
     // 最近一次 ReadBody 定下的本请求线路字节数（头部 + 正文，
     // 分块编码则是整个分块序列）。
     public int wireBytes;
+    private bool nonBlocking;
 
     // 构造：用 <see cref="Create"/> 创建；TLS 变体见 HttpFramerTls.Create。
     public HttpFramer() {
@@ -59,13 +60,13 @@ public class HttpFramer : IDisposable {
         this.scanned = 0;
         this.closed = false;
         this.wireBytes = 0;
+        this.nonBlocking = false;
     }
 
-    // 为明文套接字创建拆包器（64KB 复用接收缓冲）。
+    // 为明文套接字创建拆包器（明文路径直接零拷贝收进 pend，无需 64KB 暂存区）。
     public static HttpFramer Create(nint sock) {
         HttpFramer f = new HttpFramer();
         f.sock = sock;
-        f.buf = TcpClient.RentRecvBuffer(65536);
         f.bufCap = 65536;
         f.pend = ByteBuffer.Alloc(4096);
         return f;
@@ -94,6 +95,7 @@ public class HttpFramer : IDisposable {
     public async int Fill() {
         int n = 0;
         if (this.recv != null) {
+            if (this.buf == null) { this.buf = TcpClient.RentRecvBuffer(this.bufCap); }
             n = await this.recv(this.buf, this.bufCap);
             if (n <= 0) {
                 this.closed = true;
@@ -121,6 +123,7 @@ public class HttpFramer : IDisposable {
         if (want > room) { want = room; }
         int n = 0;
         if (this.recv != null) {
+            if (this.buf == null) { this.buf = TcpClient.RentRecvBuffer(this.bufCap); }
             n = await this.recv(this.buf, want);
             if (n <= 0) { this.closed = true; return 0; }
             if (n > room) { return -1; }
@@ -171,6 +174,7 @@ public class HttpFramer : IDisposable {
         if (want > room) { want = room; }
         int n = 0;
         if (this.recv != null) {
+            if (this.buf == null) { this.buf = TcpClient.RentRecvBuffer(this.bufCap); }
             n = await this.recv(this.buf, want);
             if (n <= 0) {
                 this.closed = true;
@@ -206,18 +210,121 @@ public class HttpFramer : IDisposable {
     // 头部块超过 <paramref name="maxHeaderBytes"/> 返回 -431——
     // 违规字节在被无限缓冲之前就被拒绝（slowloris 的一种形态是
     // 只发头部却永不发空行）。
-    public async int ReadHead(int maxHeaderBytes) {
+    public long HeadStartUs { get; private set; }
+
+    // 同步非阻塞头部读取快路径：如果待处理缓冲或内核读缓冲已有完整头部，
+    // 直接零协程帧返回 true；仅当遇到 EAGAIN/WSAEWOULDBLOCK（或 TLS 路径）时
+    // 返回 false，由调用方 await ReadHeadContinue 挂起等待 reactor。
+    public bool TryReadHeadSync(int maxHeaderBytes, bool measure, out int headerEnd) {
+        if (maxHeaderBytes <= 0) {
+            headerEnd = -431;
+            return true;
+        }
+        if (this.recv != null || this.sock < 0) {
+            if (measure) { this.HeadStartUs = 0; }
+            headerEnd = 0;
+            return false;
+        }
+        if (measure) {
+            this.HeadStartUs = this.pend.Length() > 0 ? Stopwatch.GetMicroseconds() : 0;
+        }
+        int he = this.HeaderEnd();
+        while (he < 0) {
+            int room = maxHeaderBytes - this.pend.Length();
+            if (room <= 0) {
+                headerEnd = -431;
+                return true;
+            }
+            int want = this.bufCap;
+            if (want > room) { want = room; }
+            if (!this.nonBlocking) {
+                Socket.SetNonBlocking(this.sock);
+                this.nonBlocking = true;
+            }
+            this.pend.EnsureRoom(want);
+            long raw = Socket.ReactorRecvPtr(this.sock, this.pend.data + (nint)this.pend.length,
+                (long)want, 0);
+            if (raw > 0) {
+                int n = (int)raw;
+                if (measure && this.HeadStartUs == 0) {
+                    this.HeadStartUs = Stopwatch.GetMicroseconds();
+                }
+                if (n > room) {
+                    headerEnd = -431;
+                    return true;
+                }
+                this.pend.SetLength(this.pend.length + n);
+                if (this.pend.Length() > maxHeaderBytes) {
+                    headerEnd = -431;
+                    return true;
+                }
+                he = this.HeaderEnd();
+                if (this.pend.Length() > maxHeaderBytes) {
+                    headerEnd = -431;
+                    return true;
+                }
+            } else if (raw == -1) {
+                headerEnd = 0;
+                return false;
+            } else {
+                this.closed = true;
+                headerEnd = 0;
+                return true;
+            }
+        }
+        if (he > maxHeaderBytes) {
+            headerEnd = -431;
+            return true;
+        }
+        headerEnd = he;
+        return true;
+    }
+
+    public async int ReadHeadContinue(int maxHeaderBytes, bool measure = false) {
         if (maxHeaderBytes <= 0) { return -431; }
         int he = this.HeaderEnd();
         while (he < 0) {
-            int n = await this.FillHead(maxHeaderBytes);
-            if (n == -431) { return -431; }
-            if (n == 0) { return 0; }
+            int room = maxHeaderBytes - this.pend.Length();
+            if (room <= 0) { return -431; }
+            int want = this.bufCap;
+            if (want > room) { want = room; }
+            int n = 0;
+            if (this.recv != null) {
+                if (this.buf == null) { this.buf = TcpClient.RentRecvBuffer(this.bufCap); }
+                n = await this.recv(this.buf, want);
+                if (n <= 0) {
+                    this.closed = true;
+                    return 0;
+                }
+                if (n > room) { return -431; }
+                this.pend.WriteRaw(this.buf, n);
+            } else {
+                this.pend.EnsureRoom(want);
+                n = await Socket.RecvPtrAsync(this.sock, this.pend.data + (nint)this.pend.length, want);
+                if (n <= 0) {
+                    this.closed = true;
+                    return 0;
+                }
+                if (n > room) { return -431; }
+                this.pend.SetLength(this.pend.length + n);
+            }
+            if (measure && this.HeadStartUs == 0 && n != 0) {
+                this.HeadStartUs = Stopwatch.GetMicroseconds();
+            }
+            if (this.pend.Length() > maxHeaderBytes) { return -431; }
             he = this.HeaderEnd();
             if (this.pend.Length() > maxHeaderBytes) { return -431; }
         }
         if (he > maxHeaderBytes) { return -431; }
         return he;
+    }
+
+    public async int ReadHead(int maxHeaderBytes, bool measure = false) {
+        if (maxHeaderBytes <= 0) { return -431; }
+        if (measure) {
+            this.HeadStartUs = this.pend.Length() > 0 ? Stopwatch.GetMicroseconds() : 0;
+        }
+        return await this.ReadHeadContinue(maxHeaderBytes, measure);
     }
 
     // 头部块（前 <paramref name="headerLen"/> 个字节）的字符串
@@ -245,6 +352,37 @@ public class HttpFramer : IDisposable {
     // （413 超限、400 分块编码畸形）；返回 -1 表示对端在正文
     // 中途关闭。分块编码在这里解码，解码后的正文与固定长度
     // 正文一样，对处理器不可区分。
+    // 同步读取请求体快路径：若非分块且所需字节已完整在 pend 缓冲中（或 Content-Length <= 0），
+    // 直接零协程完成，返回 true；否则返回 false 交由 ReadBody 异步挂起接收。
+    public bool TryReadBodySync(HttpRequest req, int maxBodyBytes, out int bodyStatus) {
+        int he = req.bodyStart;
+        if (req.chunked) {
+            bodyStatus = 0;
+            return false;
+        }
+        int total = req.contentLength;
+        if (total <= 0) {
+            req.body = "";
+            req.bodyLength = 0;
+            this.wireBytes = he;
+            bodyStatus = 0;
+            return true;
+        }
+        if (total > maxBodyBytes) {
+            bodyStatus = 413;
+            return true;
+        }
+        if (this.pend.Length() - he >= total) {
+            req.body = this.pend.Str(he, total);
+            req.bodyLength = total;
+            this.wireBytes = he + total;
+            bodyStatus = 0;
+            return true;
+        }
+        bodyStatus = 0;
+        return false;
+    }
+
     public async int ReadBody(HttpRequest req, int maxBodyBytes) {
         int he = req.bodyStart;
         if (req.chunked) {

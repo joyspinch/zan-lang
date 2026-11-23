@@ -16,7 +16,8 @@ namespace Zan.Web.Security;
  *   的、数量可变的业务资源，一个账号可以同时持有多个，且彼此无关。
  *
  * 解析规则（fail closed）：
- *   · 超管，或角色 dataScope=全部 → 不受限；
+ *   · 严格域（默认 strict=true）：仅超管（IsSuper）不受限，普通 RoleAll 不绕过域白名单；
+ *   · 非严格域（strict=false）：超管，或角色 dataScope=全部 → 不受限；
  *   · 其余账号 → sys_user_scope 里登记的 id；
  *   · **一条都没登记 = 一条都看不到**，而不是"默认全部"。
  *
@@ -29,6 +30,7 @@ public class GrantDomain {
     public string label;
     public string table;
     public string labelCol;
+    public bool strict;
 }
 
 /* 一次请求内的可见集合：all=true 不受限；否则 ids 为白名单（可为空）。 */
@@ -59,8 +61,9 @@ public class DataGrant {
     /* 注册顺序 + 键列表（Dict 不暴露遍历，界面顺序由这里给出）。 */
     static List<GrantDomain> order = null;
 
-    /* 业务启动时注册一个资源域。重复注册以后者为准（热重载/测试友好）。 */
-    public static void Define(string key, string label, string table, string labelCol) {
+    /* 业务启动时注册一个资源域（默认严格隔离，仅平台超管 IsSuper 绕过白名单；
+     * 传 strict = false 允许非超管 RoleAll 绕过）。重复注册以后者为准（热重载/测试友好）。 */
+    public static void Define(string key, string label, string table, string labelCol, bool strict = true) {
         if (key.Length == 0 || table.Length == 0) { return; }
         if (defs == null) { defs = new Dict<string, GrantDomain>(); }
         if (order == null) { order = new List<GrantDomain>(); }
@@ -69,6 +72,7 @@ public class DataGrant {
         g.label = label;
         g.table = table;
         g.labelCol = labelCol.Length > 0 ? labelCol : "name";
+        g.strict = strict;
         /* 重注册保持原位置：菜单/分配界面的域顺序不因一次热重载而跳动。 */
         List<GrantDomain> next = new List<GrantDomain>();
         bool placed = false;
@@ -111,20 +115,32 @@ public class DataGrant {
         return outp;
     }
 
-    /* 解析一次请求的可见集合。dept 是组织架构范围：它为"全部"时直接
-     * 放行（超管/全量角色），否则只认 sys_user_scope 的登记。 */
+    /* 解析一次请求的可见集合。普通域在 dept.Any() 时放行，strict 隔离域仅在 dept.IsSuper() 时放行；
+     * 随后执行 GrantResolveFn 扩展钩子（用于多租户动态收敛）。 */
     public static async RowScope Of(IDbConnection db, int userId, string key, DataScope dept) {
         RowScope sc = new RowScope();
-        if (dept != null && dept.Any()) { sc.all = true; return sc; }
-        if (userId <= 0 || key.Length == 0 || db == null) { return sc; }
-        IZanSql fsql = ZanSql.FromConnection(db);
-        List<SysUserScope> rows = await fsql.Select<SysUserScope>()
-            .Where(a => a.userId == userId && a.scopeKey == key)
-            .ToListAsync();
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            if (rows[i].resourceId <= 0) { continue; }
-            if (Has(sc.ids, rows[i].resourceId)) { continue; }
-            sc.ids.Add(rows[i].resourceId);
+        GrantDomain g = Get(key);
+        bool bypass = dept != null && ((g != null && g.strict) ? dept.IsSuper() : dept.Any());
+        if (bypass) {
+            sc.all = true;
+            if (MvcHooks.HasGrantResolvers()) {
+                await MvcHooks.RunGrantResolvers(db, userId, key, dept, sc);
+            }
+            return sc;
+        }
+        if (userId > 0 && key.Length > 0 && db != null) {
+            IZanSql fsql = ZanSql.FromConnection(db);
+            List<SysUserScope> rows = await fsql.Select<SysUserScope>()
+                .Where(a => a.userId == userId && a.scopeKey == key)
+                .ToListAsync();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                if (rows[i].resourceId <= 0) { continue; }
+                if (Has(sc.ids, rows[i].resourceId)) { continue; }
+                sc.ids.Add(rows[i].resourceId);
+            }
+        }
+        if (MvcHooks.HasGrantResolvers()) {
+            await MvcHooks.RunGrantResolvers(db, userId, key, dept, sc);
         }
         return sc;
     }

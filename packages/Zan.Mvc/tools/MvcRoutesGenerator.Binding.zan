@@ -56,17 +56,12 @@ partial class MvcRoutesGenerator {
         string key = Quote(name);
         string suffix = InputSuffix(type);
         string declaration = "        " + type + " " + local + " = ";
-        if (!optional && receiver != "ctx") {
-            code.Append(declaration + receiver + ".Need" + suffix + "(" + key + ", " + key + ");\n");
+        if (!optional) {
+            code.Append(declaration + "controller.Need" + suffix + "(" + key + ", " + key + ");\n");
         } else if (type == "string") {
             code.Append(declaration + receiver + ".In(" + key + ");\n");
-            if (optional) {
-                code.Append("        if (" + local + ".Length == 0) { " + local + " = " + Quote(defaultValue) + "; }\n");
-            } else {
-                code.Append("        RequireInput(" + local + ".Length != 0, " + key + ");\n");
-            }
+            code.Append("        if (" + local + ".Length == 0) { " + local + " = " + Quote(defaultValue) + "; }\n");
         } else {
-            if (!optional) { code.Append("        RequireInput(ctx.HasIn(" + key + "), " + key + ");\n"); }
             code.Append(declaration + receiver + ".In" + suffix + "(" + key + ", "
                 + DefaultLiteral(type, defaultValue) + ");\n");
         }
@@ -91,13 +86,95 @@ partial class MvcRoutesGenerator {
         }
     }
 
-    static void EmitAction(StringBuilder code, StringBuilder dispatch, StringBuilder docs,
-                           StringBuilder actions, JsonValue types, JsonValue owner, JsonValue method, int id) {
+    static void EmitRoute(StringBuilder reg, string varName, string verb, string pathExpr,
+                          string handleExpr, string syncChain, string actionKeyExpr,
+                          Dict<string, string> classAttrs, List<string> classKeys,
+                          Dict<string, string> methodAttrs, List<string> methodKeys,
+                          bool isIndex, bool showMenu, List<RouteInput> inputs,
+                          List<RouteInput> pathParams, string ownerType, string methodName) {
+        reg.Append("        Route " + varName + " = app.Map(" + Quote(verb) + ", " + pathExpr
+            + ", " + handleExpr + ")" + syncChain + ";\n");
+        reg.Append("        " + varName + ".Named(" + actionKeyExpr + ")");
+        string title = Setting(methodAttrs, "Description", Setting(classAttrs, "Description"));
+        if (title.Length > 0) { reg.Append(".Title(" + Quote(title) + ")"); }
+        AppendMetadata(reg, classAttrs, classKeys, true, isIndex);
+        AppendMetadata(reg, methodAttrs, methodKeys, false, isIndex);
+
+        // Unknown and undeclared authorization keep the login gate.
+        string auth = Setting(methodAttrs, "Authorization", Setting(classAttrs, "Authorization"));
+        if (auth == "Grant" || auth == "ApiAuth") { reg.Append(".Auth()"); }
+        else if (auth != "None" && auth != "Auth") { reg.Append(".Login()"); }
+
+        // RBAC requires an explicit permission bit for each action.
+        string perm = Setting(methodAttrs, "Perm");
+        if (perm.Length > 0) {
+            reg.Append(".Meta(\"Perm\", " + Quote(perm.Replace("System.Web.PermBit.", "").Replace("PermBit.", "")) + ")");
+        }
+        string classMenu = isIndex ? Setting(classAttrs, "IsMenu") : "";
+        if (showMenu && Setting(methodAttrs, "IsMenu", classMenu) == "true") { reg.Append(".Menu()"); }
+        if (Setting(methodAttrs, "Upload", Setting(classAttrs, "Upload")) == "true") { reg.Append(".Upload()"); }
+
+        string limit = Setting(methodAttrs, "ApiMax", Setting(classAttrs, "ApiMax", "0"));
+        int max = 0;
+        if (!int.TryParse(limit, out max) || max < 0) {
+            throw new Exception("Invalid ApiMax for " + ownerType + "." + methodName + ": " + limit);
+        }
+        if (max > 0) { reg.Append(".Limit(" + Convert.ToString(max) + ")"); }
+
+        string lockScope = Setting(methodAttrs, "Lock", Setting(classAttrs, "Lock"));
+        if (lockScope.Length > 0) {
+            if (lockScope == "Unknown") {
+                throw new Exception("Invalid Lock for " + ownerType + "." + methodName + ": " + lockScope);
+            }
+            reg.Append(".Lock(" + Quote(lockScope) + ")");
+        }
+        reg.Append(";\n");
+
+        if (showMenu) {
+            for (int i = 0; i < inputs.Count; i++) {
+                RouteInput input = inputs[i];
+                reg.Append("        " + varName + ".Param(" + Quote(input.Name) + ", " + Quote(input.Type) + ", "
+                    + (input.Required ? "true" : "false") + ", " + Quote(input.DefaultValue) + ", "
+                    + Quote(input.Description) + ", " + Quote(input.Source) + ");\n");
+            }
+        }
+        for (int i = 0; i < pathParams.Count; i++) {
+            RouteInput p = pathParams[i];
+            reg.Append("        " + varName + ".Param(" + Quote(p.Name) + ", " + Quote(p.Type) + ", true, \"\", \"\", \"path\");\n");
+        }
+    }
+
+    static List<RouteInput> ExtractPathParams(string pathTemplate, List<RouteInput> inputs, bool includeTypedSig) {
+        List<RouteInput> result = new List<RouteInput>();
+        if (pathTemplate.Length == 0 || pathTemplate.IndexOf("{") < 0) { return result; }
+        List<string> segs = pathTemplate.Split("/");
+        for (int i = 0; i < segs.Count; i++) {
+            string seg = segs[i];
+            if (seg.Length <= 2 || seg[0] != '{' || seg[seg.Length - 1] != '}') { continue; }
+            int colon = seg.IndexOf(":");
+            string pName = colon > 1 ? seg.Substring(1, colon - 1) : seg.Substring(1, seg.Length - 2);
+            if (pName.Length == 0) { continue; }
+            string pType = colon < 0 ? "" : seg.Substring(colon + 1, seg.Length - colon - 2);
+            if (pType.Length == 0 && includeTypedSig) {
+                for (int j = 0; j < inputs.Count; j++) {
+                    if (inputs[j].Name == pName) { pType = inputs[j].Type; break; }
+                }
+            }
+            result.Add(new RouteInput(pName, pType, "path", true));
+        }
+        return result;
+    }
+
+    static void EmitAction(StringBuilder code, StringBuilder reg, JsonValue types,
+                           JsonValue owner, JsonValue method, int id, int lifecycleKind,
+                           string basePath, bool baseIsRuntime, string ctrlVar,
+                           Dict<string, string> classAttrs, List<string> classKeys) {
         string name = Text(method, "name");
         string type = TypeName(owner);
-        string ownerNs = Text(owner, "ns");
-        string key = "typeof(" + type + ").FullName + " + Quote("." + name);
+        string keyExpr = "typeof(" + type + ").FullName + " + Quote("." + name);
         string wrapper = "Action" + Convert.ToString(id);
+        string handler = "Handle" + Convert.ToString(id);
+        string syncHandler = "Sync" + Convert.ToString(id);
         bool isStatic = Flag(method, "static");
         bool isAsync = Flag(method, "async");
         bool transaction = HasAttr(owner, "Tx") || HasAttr(method, "Tx");
@@ -108,6 +185,7 @@ partial class MvcRoutesGenerator {
         Dictionary<string, string> optional = Options(method);
         StringBuilder body = new StringBuilder();
         string args = "";
+        bool needsController = false;
         for (int i = 0; i < parameters.Count(); i++) {
             JsonValue param = parameters.At(i);
             string paramType = Text(param, "type");
@@ -118,12 +196,13 @@ partial class MvcRoutesGenerator {
             string error = "Unsupported MVC parameter " + type + "." + name + "(" + paramType + " " + paramName + ")";
             if (param.Get("by_ref") != null) { throw new Exception(error); }
             if (IsScalar(paramType)) {
+                needsController = needsController || !opt;
                 BindScalar(body, paramType, paramName, local, isStatic ? "ctx" : "controller", opt, dflt);
                 inputs.Add(new RouteInput(paramName, paramType, "query", !opt, dflt));
             } else if (paramType == "HttpContext" || paramType == "System.Web.HttpContext") {
                 local = "ctx";
             } else {
-                JsonValue form = FindType(types, paramType, ownerNs);
+                JsonValue form = FindType(types, paramType, Text(owner, "ns"));
                 if (form == null || Text(form, "kind") != "class" || Flag(form, "abstract") || Flag(form, "generic")) {
                     throw new Exception(error);
                 }
@@ -133,29 +212,224 @@ partial class MvcRoutesGenerator {
         }
 
         string signature = isStatic ? "HttpContext ctx" : "Controller baseController, HttpContext ctx";
-        code.Append("    static " + (isAsync || !isStatic ? "async " : "") + "void " + wrapper + "(" + signature + ") {\n");
-        if (!isStatic) { code.Append("        " + type + " controller = (" + type + ")baseController;\n"); }
+        code.Append("    static " + (isAsync ? "async " : "") + "void " + wrapper + "(" + signature + ") {\n");
+        if (!isStatic) {
+            code.Append("        " + type + " controller = (" + type + ")baseController;\n");
+        } else if (needsController) {
+            code.Append("        Controller controller = new Controller();\n        controller.Bind(ctx);\n");
+        }
         code.Append(body.ToString());
         code.Append("        " + (isAsync ? "await " : "") + (isStatic ? type : "controller") + "." + name + "(" + args + ");\n    }\n");
 
-        actions.Append("        if (actionKey == " + key + ") { return true; }\n");
-        dispatch.Append("        if (actionKey == " + key + ") {\n");
+        string handleRef = wrapper;
+        string syncChain = "";
         if (isStatic) {
-            dispatch.Append("            " + (isAsync ? "await " : "") + wrapper + "(ctx);\n");
+            if (!isAsync) {
+                code.Append("    static async void " + handler + "(HttpContext ctx) { " + wrapper + "(ctx); }\n");
+                handleRef = handler;
+                if (!transaction) { syncChain = ".SyncAction(" + wrapper + ")"; }
+            }
+        } else if (isAsync) {
+            code.Append("    static async void " + handler + "(HttpContext ctx) {\n"
+                + "        await __AttrRoutes.RunAction(new " + type + "(), ctx, " + Quote(view + "." + name)
+                + ", " + (readOnly ? "true" : "false") + ", " + (transaction ? "true" : "false") + ", " + wrapper
+                + ", " + (lifecycleKind != 0 ? "true" : "false") + ");\n    }\n");
+            handleRef = handler;
         } else {
-            dispatch.Append("            await __AttrRoutes.RunAction(new " + type + "(), ctx, " + Quote(view + "." + name)
-                + ", " + (readOnly ? "true" : "false") + ", " + (transaction ? "true" : "false") + ", " + wrapper + ");\n");
+            code.Append("    static async void " + handler + "(HttpContext ctx) {\n"
+                + "        await __AttrRoutes.RunSyncActionAsync(new " + type + "(), ctx, " + Quote(view + "." + name)
+                + ", " + (readOnly ? "true" : "false") + ", " + (transaction ? "true" : "false") + ", " + wrapper
+                + ", " + (lifecycleKind != 0 ? "true" : "false") + ");\n    }\n");
+            handleRef = handler;
+            if (!transaction && lifecycleKind != 0) {
+                code.Append("    static bool " + syncHandler + "(HttpContext ctx) {\n"
+                    + "        return __AttrRoutes.TryRunSyncAction(new " + type + "(), ctx, "
+                    + Quote(view + "." + name) + ", " + (readOnly ? "true" : "false") + ", "
+                    + (lifecycleKind == 1 ? "true" : "false") + ", " + wrapper + ");\n    }\n");
+                syncChain = ".Sync(" + syncHandler + ")";
+            }
         }
-        dispatch.Append("            return true;\n        }\n");
+
         AddBodyInputs(method, inputs);
-        if (inputs.Count == 0) { return; }
-        docs.Append("        if (actionKey == " + key + ") {\n");
-        for (int i = 0; i < inputs.Count; i++) {
-            RouteInput input = inputs[i];
-            docs.Append("            route.Param(" + Quote(input.Name) + ", " + Quote(input.Type) + ", "
-                + (input.Required ? "true" : "false") + ", " + Quote(input.DefaultValue) + ", "
-                + Quote(input.Description) + ", " + Quote(input.Source) + ");\n");
+        List<string> methodKeys;
+        Dict<string, string> methodAttrs = ReadAttrs(method, out methodKeys);
+        bool isIndex = name == "Index";
+        string methodRoute = AttrVal(methodAttrs, "Route");
+        string verb = ExtractVerb(methodAttrs);
+        string routeVar = "r" + Convert.ToString(id);
+
+        bool pathIsExpr = false;
+        string pathExpr = "";
+        string staticTemplate = "";
+        if (methodRoute.Length > 0) {
+            if (methodRoute.StartsWith("/")) {
+                pathExpr = Quote(methodRoute);
+                staticTemplate = methodRoute;
+            } else if (baseIsRuntime) {
+                pathIsExpr = true;
+                pathExpr = "(" + ctrlVar + " == \"/\" ? \"/\" + " + Quote(methodRoute) + " : " + ctrlVar + " + \"/\" + " + Quote(methodRoute) + ")";
+                staticTemplate = methodRoute;
+            } else {
+                staticTemplate = basePath == "/" ? "/" + methodRoute : basePath + "/" + methodRoute;
+                pathExpr = Quote(staticTemplate);
+            }
+        } else if (isIndex) {
+            if (baseIsRuntime) {
+                pathIsExpr = true;
+                pathExpr = ctrlVar;
+            } else {
+                staticTemplate = basePath;
+                pathExpr = Quote(basePath);
+            }
+        } else {
+            string mlower = name.ToLower();
+            if (baseIsRuntime) {
+                pathIsExpr = true;
+                pathExpr = "(" + ctrlVar + " == \"/\" ? " + Quote("/" + mlower) + " : " + ctrlVar + " + " + Quote("/" + mlower) + ")";
+            } else {
+                staticTemplate = basePath == "/" ? "/" + mlower : basePath + "/" + mlower;
+                pathExpr = Quote(staticTemplate);
+            }
         }
-        docs.Append("            return;\n        }\n");
+
+        List<RouteInput> primaryPathParams = ExtractPathParams(staticTemplate, inputs, false);
+        EmitRoute(reg, routeVar, verb, pathExpr, handleRef, syncChain, keyExpr,
+                  classAttrs, classKeys, methodAttrs, methodKeys, isIndex, true,
+                  inputs, primaryPathParams, type, name);
+
+        if (isIndex && methodRoute.Length == 0) {
+            List<RouteInput> aliasPathParams = ExtractPathParams(staticTemplate, inputs, true);
+            if (pathIsExpr) {
+                reg.Append("        if (!" + pathExpr + ".EndsWith(\"/index\") && " + pathExpr + " != \"/\") {\n");
+                EmitRoute(reg, routeVar + "a", verb, pathExpr + " + \"/index\"", handleRef, syncChain, keyExpr,
+                          classAttrs, classKeys, methodAttrs, methodKeys, true, false,
+                          inputs, aliasPathParams, type, name);
+                reg.Append("        " + routeVar + "a.SharePolicyKey(" + routeVar + ");\n");
+                reg.Append("        }\n");
+            } else if (!staticTemplate.EndsWith("/index") && staticTemplate != "/") {
+                EmitRoute(reg, routeVar + "a", verb, Quote(staticTemplate + "/index"), handleRef, syncChain, keyExpr,
+                          classAttrs, classKeys, methodAttrs, methodKeys, true, false,
+                          inputs, aliasPathParams, type, name);
+                reg.Append("        " + routeVar + "a.SharePolicyKey(" + routeVar + ");\n");
+            }
+        }
+    }
+
+    static int EmitCrudActions(StringBuilder code, StringBuilder reg, JsonValue owner,
+                               int id, int lifecycleKind, string basePath, bool baseIsRuntime,
+                               string ctrlVar, Dict<string, string> classAttrs, List<string> classKeys,
+                               HashSet<string> seen) {
+        string[] names = new string[] {
+            "Index", "Conf", "ListData", "Edit", "FormConf",
+            "Form", "Save", "Delete", "Batch", "Field", "Options"
+        };
+        string[] doMethods = new string[] {
+            "DoList", "DoConfAsync", "DoListData", "DoEdit", "DoFormConfAsync",
+            "DoForm", "DoSave", "DoDelete", "DoBatch", "DoField", "DoOptions"
+        };
+        string[] verbs = new string[] {
+            "GET", "PUT", "POST", "POST", "PUT",
+            "GET", "POST", "POST", "POST", "POST", "GET"
+        };
+        string[] routes = new string[] {
+            "", "conf", "list", "edit", "formconf",
+            "form", "save", "delete", "batch", "field", "options"
+        };
+        string[] perms = new string[] {
+            "PermBit.View", "PermBit.View", "PermBit.View", "PermBit.View", "PermBit.View",
+            "PermBit.Create|PermBit.Update", "PermBit.Create|PermBit.Update", "PermBit.Delete",
+            "PermBit.Update|PermBit.Delete", "PermBit.Update", "PermBit.View"
+        };
+        string[] descs = new string[] {
+            "", "表格配置", "数据", "行数据", "表单配置",
+            "表单", "保存", "删除", "批量操作", "行内修改", "选项"
+        };
+        for (int i = 0; i < names.Length; i++) {
+            if (seen.Contains(names[i])) { continue; }
+            seen.Add(names[i]);
+            EmitCrudAction(code, reg, owner, id, lifecycleKind, basePath, baseIsRuntime, ctrlVar,
+                           classAttrs, classKeys, names[i], doMethods[i], verbs[i], routes[i],
+                           perms[i], descs[i]);
+            id++;
+        }
+        return id;
+    }
+
+    static void EmitCrudAction(StringBuilder code, StringBuilder reg, JsonValue owner,
+                               int id, int lifecycleKind, string basePath, bool baseIsRuntime,
+                               string ctrlVar, Dict<string, string> classAttrs, List<string> classKeys,
+                               string name, string doMethod, string verb, string methodRoute,
+                               string perm, string descSuffix) {
+        string type = TypeName(owner);
+        string keyExpr = "typeof(" + type + ").FullName + " + Quote("." + name);
+        string wrapper = "Action" + Convert.ToString(id);
+        string handler = "Handle" + Convert.ToString(id);
+        bool transaction = HasAttr(owner, "Tx");
+        string view = type.StartsWith("Zan.Web.") ? type.Substring(8) : type;
+
+        code.Append("    static async void " + wrapper + "(Controller baseController, HttpContext ctx) {\n");
+        code.Append("        " + type + " controller = (" + type + ")baseController;\n");
+        code.Append("        await controller." + doMethod + "();\n    }\n");
+        code.Append("    static async void " + handler + "(HttpContext ctx) {\n"
+            + "        await __AttrRoutes.RunAction(new " + type + "(), ctx, " + Quote(view + "." + name)
+            + ", false, " + (transaction ? "true" : "false") + ", " + wrapper
+            + ", " + (lifecycleKind != 0 ? "true" : "false") + ");\n    }\n");
+
+        List<RouteInput> inputs = new List<RouteInput>();
+        List<RouteInput> pathParams = new List<RouteInput>();
+        Dict<string, string> methodAttrs = new Dict<string, string>();
+        List<string> methodKeys = new List<string>();
+        methodAttrs.Add("Perm", perm);
+        methodKeys.Add("Perm");
+        string classTitle = Setting(classAttrs, "Description");
+        if (descSuffix.Length > 0) {
+            string title = classTitle.Length > 0 ? classTitle + descSuffix : descSuffix;
+            methodAttrs.Add("Description", title);
+            methodKeys.Add("Description");
+        }
+
+        bool isIndex = name == "Index";
+        string routeVar = "r" + Convert.ToString(id);
+        bool pathIsExpr = false;
+        string pathExpr = "";
+        string staticTemplate = "";
+        if (methodRoute.Length > 0) {
+            if (baseIsRuntime) {
+                pathIsExpr = true;
+                pathExpr = "(" + ctrlVar + " == \"/\" ? \"/\" + " + Quote(methodRoute) + " : " + ctrlVar + " + \"/\" + " + Quote(methodRoute) + ")";
+                staticTemplate = methodRoute;
+            } else {
+                staticTemplate = basePath == "/" ? "/" + methodRoute : basePath + "/" + methodRoute;
+                pathExpr = Quote(staticTemplate);
+            }
+        } else {
+            if (baseIsRuntime) {
+                pathIsExpr = true;
+                pathExpr = ctrlVar;
+            } else {
+                staticTemplate = basePath;
+                pathExpr = Quote(basePath);
+            }
+        }
+
+        EmitRoute(reg, routeVar, verb, pathExpr, handler, "", keyExpr,
+                  classAttrs, classKeys, methodAttrs, methodKeys, isIndex, true,
+                  inputs, pathParams, type, name);
+
+        if (isIndex && methodRoute.Length == 0) {
+            if (pathIsExpr) {
+                reg.Append("        if (!" + pathExpr + ".EndsWith(\"/index\") && " + pathExpr + " != \"/\") {\n");
+                EmitRoute(reg, routeVar + "a", verb, pathExpr + " + \"/index\"", handler, "", keyExpr,
+                          classAttrs, classKeys, methodAttrs, methodKeys, true, false,
+                          inputs, pathParams, type, name);
+                reg.Append("        " + routeVar + "a.SharePolicyKey(" + routeVar + ");\n");
+                reg.Append("        }\n");
+            } else if (!staticTemplate.EndsWith("/index") && staticTemplate != "/") {
+                EmitRoute(reg, routeVar + "a", verb, Quote(staticTemplate + "/index"), handler, "", keyExpr,
+                          classAttrs, classKeys, methodAttrs, methodKeys, true, false,
+                          inputs, pathParams, type, name);
+                reg.Append("        " + routeVar + "a.SharePolicyKey(" + routeVar + ");\n");
+            }
+        }
     }
 }

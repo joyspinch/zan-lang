@@ -1,0 +1,191 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Orm;
+using System.Web;
+
+namespace Zan.Web.Services;
+
+/* Stage names are stored only if they are fixed Web/MVC instrumentation labels. */
+internal class RouteDiagnosticsBuffer {
+    private static const int MaxBuckets = 2048;
+    private static const int Unattributed = 0;
+    private static Dict<string, int> stageSlots = RouteDiagnosticsBuffer.CreateStageSlots();
+    private object gate = new object();
+    private Dict<string, RouteDiagnosticBucket> active = new Dict<string, RouteDiagnosticBucket>();
+    private Dict<string, RouteDiagnosticBucket> retry = new Dict<string, RouteDiagnosticBucket>();
+    private long dropped;
+
+    private static Dict<string, int> CreateStageSlots() {
+        string[] names = new string[] {
+            "receive_head", "parse_head", "spool_upload", "receive_body", "dispatch_queue",
+            "parse_form", "match_route", "dispatch", "authenticate", "rate_limit",
+            "dispatch_gate", "request_lock", "handler", "controller_before", "mvc_action",
+            "controller_after", "db_borrow", "db_release", "db_discard", "tx_begin",
+            "tx_commit", "tx_rollback", "sql_query", "sql_execute", "sql_scalar",
+            "after_hooks", "pack_response", "http2_response", "send", "cleanup"
+        };
+        Dict<string, int> slots = new Dict<string, int>();
+        for (int i = 0; i < names.Length; i += 1) { slots[names[i]] = i + 1; }
+        return slots;
+    }
+
+    internal static string RouteKey(string method, string route) {
+        return Convert.ToString(method.Length) + ":" + method + route;
+    }
+
+    internal bool Record(RequestTrace trace, long minute) {
+        string route = trace.RoutePattern();
+        if (route.Length == 0) { return false; }
+        string method = trace.Method();
+        string key = Convert.ToString(minute) + ":" + RouteKey(method, route);
+        long elapsed = trace.ElapsedUs();
+        long unattributed = trace.UnattributedUs();
+        string outcome = trace.Outcome();
+        lock (this.gate) {
+            RouteDiagnosticBucket bucket = null;
+            if (!this.active.TryGetValue(key, out bucket)) {
+                if (this.active.Count >= MaxBuckets) {
+                    this.dropped += 1;
+                    return false;
+                }
+                bucket = new RouteDiagnosticBucket(minute, method, route, stageSlots.Count + 1);
+                this.active[key] = bucket;
+            }
+            MetricRouteDiagnostic row = bucket.row;
+            row.samples += 1;
+            row.elapsedUs += elapsed;
+            if (elapsed > row.maxUs) { row.maxUs = elapsed; }
+            if (trace.StatusCode() >= 400 || (outcome != "sent"
+            && outcome != "stream_handled" && outcome != "rejected")) {
+                row.failed += 1;
+            }
+            row.sqlCalls += trace.SqlCalls();
+            row.sqlCompleted += trace.SqlCompleted();
+            row.sqlUs += trace.SqlElapsedUs();
+            row.sqlFailed += trace.SqlFailed();
+            if (trace.ResourceState() == 1) {
+                MetricRouteResource resource = row.Resource(trace.ResourceCoverage(), trace.ResourceCpuUnit());
+                if (resource != null) {
+                    resource.Observe(trace.ResourceCpu(), trace.ResourceBytes(), trace.ResourceSlices(),
+                        trace.ResourceUnfinishedTasks());
+                }
+            }
+            bool incomplete = trace.OmittedStages() > 0 || trace.SqlCompleted() < trace.SqlCalls();
+            int count = trace.StageCount();
+            for (int i = 0; i < count; i += 1) {
+                long us = trace.StageElapsedUs(i);
+                if (us < 0) { incomplete = true; }
+                string name = trace.StageName(i);
+                int slot = 0;
+                if (stageSlots.TryGetValue(name, out slot)) {
+                    bucket.Stage(slot, name).Observe(us, trace.StageFailed(i));
+                }
+            }
+            if (incomplete) { row.incomplete += 1; }
+            bucket.Stage(Unattributed, "unattributed").Observe(unattributed, false);
+        }
+        return true;
+    }
+
+    internal int PendingRows() {
+        lock (this.gate) { return this.active.Count + this.retry.Count; }
+    }
+
+    /* Prefer newly buffered minutes when an extended outage fills the retry budget. */
+    internal void Detach(long retainFrom) {
+        lock (this.gate) {
+            Dict<string, RouteDiagnosticBucket> next = new Dict<string, RouteDiagnosticBucket>();
+            this.Merge(next, this.active, retainFrom);
+            this.Merge(next, this.retry, retainFrom);
+            this.retry = next;
+            this.active = new Dict<string, RouteDiagnosticBucket>();
+        }
+    }
+
+    private void Merge(Dict<string, RouteDiagnosticBucket> dest,
+    Dict<string, RouteDiagnosticBucket> source, long retainFrom) {
+        foreach (string key in source.Keys) {
+            RouteDiagnosticBucket add = source[key];
+            if (add.row.minute < retainFrom) { continue; }
+            RouteDiagnosticBucket hit = null;
+            if (dest.TryGetValue(key, out hit)) {
+                hit.Add(add);
+            } else if (dest.Count < MaxBuckets) {
+                dest[key] = add;
+            } else {
+                this.dropped += add.row.samples;
+            }
+        }
+    }
+
+    /* Flush owns the detached batch until commit or failure. New traces write to active. */
+    internal async int Persist(IZanSql fsql) {
+        Dict<string, RouteDiagnosticBucket> batch = this.retry;
+        if (batch.Count == 0) { return 0; }
+        List<MetricRouteDiagnostic> rows = new List<MetricRouteDiagnostic>();
+        List<MetricRouteStage> stageRows = new List<MetricRouteStage>();
+        List<MetricRouteResource> resourceRows = new List<MetricRouteResource>();
+        foreach (string key in batch.Keys) {
+            RouteDiagnosticBucket bucket = batch[key];
+            rows.Add(bucket.row);
+            for (int i = 0; i < bucket.stages.Length; i += 1) {
+                MetricRouteStage stage = bucket.stages[i];
+                if (stage != null) { stageRows.Add(stage); }
+            }
+            if (bucket.row.resources != null) {
+                foreach (MetricRouteResource resource in bucket.row.resources) {
+                    if (resource != null) { resourceRows.Add(resource); }
+                }
+            }
+        }
+        int count = await fsql.Insert<MetricRouteDiagnostic>(rows)
+        .OnConflict("minute").OnConflict("method").OnConflict("route")
+        .SetIncr("samples").SetIncr("elapsed_us").SetMax("max_us")
+        .SetIncr("failed").SetIncr("incomplete").SetIncr("sql_calls")
+        .SetIncr("sql_completed").SetIncr("sql_us").SetIncr("sql_failed")
+        .ExecuteAffrowsAsync();
+        int stageCount = await fsql.Insert<MetricRouteStage>(stageRows)
+        .OnConflict("minute").OnConflict("method").OnConflict("route").OnConflict("stage")
+        .SetIncr("calls").SetIncr("completed").SetIncr("elapsed_us")
+        .SetMax("max_us").SetIncr("failed").ExecuteAffrowsAsync();
+        int resourceCount = 0;
+        if (resourceRows.Count > 0) {
+            resourceCount = await fsql.Insert<MetricRouteResource>(resourceRows)
+            .OnConflict("minute").OnConflict("method").OnConflict("route")
+            .OnConflict("coverage").OnConflict("cpu_unit")
+            .SetIncr("samples").SetIncr("cpu_samples").SetIncr("cpu")
+            .SetIncr("allocated_bytes").SetIncr("slices").SetIncr("unfinished_tasks").ExecuteAffrowsAsync();
+        }
+        if (count != rows.Count || stageCount != stageRows.Count || resourceCount != resourceRows.Count) {
+            throw new Exception("route diagnostics flush did not write the complete batch");
+        }
+        return count + stageCount + resourceCount;
+    }
+
+    internal void Committed() {
+        lock (this.gate) { this.retry = new Dict<string, RouteDiagnosticBucket>(); }
+    }
+
+    internal void Snapshot(RouteDiagnosticReport report) {
+        lock (this.gate) {
+            this.AddPending(this.active, report);
+            this.AddPending(this.retry, report);
+            report.localDropped = this.dropped;
+        }
+    }
+
+    private void AddPending(Dict<string, RouteDiagnosticBucket> source, RouteDiagnosticReport report) {
+        foreach (string key in source.Keys) {
+            RouteDiagnosticBucket bucket = source[key];
+            if (report.Includes(bucket.row)) { report.AddPending(bucket); }
+        }
+    }
+
+    internal void Reset() {
+        lock (this.gate) {
+            this.active = new Dict<string, RouteDiagnosticBucket>();
+            this.retry = new Dict<string, RouteDiagnosticBucket>();
+            this.dropped = 0;
+        }
+    }
+}

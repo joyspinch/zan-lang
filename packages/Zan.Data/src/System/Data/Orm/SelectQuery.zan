@@ -116,6 +116,120 @@ internal static class OrmProbeConstants {
     public const long PROBE_LONG_MAGIC = 9876543210L;
     public const double PROBE_DOUBLE_MAGIC = 987654.25;
     public const string PROBE_STRING_MAGIC = "__detect_marker__";
+
+    private static string FallbackCol(Meta meta, bool fallbackLast) {
+        if (fallbackLast && meta != null && meta.Cols.Count > 0) {
+            return meta.Cols[meta.Cols.Count - 1].Col;
+        }
+        return "";
+    }
+
+    private static object CreateProbeDummy<T>(Meta meta) {
+        TypeInfo ti = (meta != null && meta.Type.Name.Length > 0) ? meta.Type : typeof(T);
+        return ti.CreateInstance();
+    }
+
+    public static string DetectColInt<T>(Meta meta, Func<T, int> expr, bool fallbackLast) {
+        object dummy = OrmProbeConstants.CreateProbeDummy<T>(meta);
+        if (dummy == null) { return OrmProbeConstants.FallbackCol(meta, fallbackLast); }
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            if (c.Kind == 0) {
+                if (c.I64) { dummy.SetFieldLong(c.Field, (long)OrmProbeConstants.PROBE_INT_MAGIC); }
+                else { dummy.SetFieldInt(c.Field, OrmProbeConstants.PROBE_INT_MAGIC); }
+                try {
+                    int res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_INT_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                    // 探针反射探测：非目标字段触发异常时跳过该候选列
+                }
+                if (c.I64) { dummy.SetFieldLong(c.Field, 0L); }
+                else { dummy.SetFieldInt(c.Field, 0); }
+            }
+        }
+        return OrmProbeConstants.FallbackCol(meta, fallbackLast);
+    }
+
+    public static string DetectColLong<T>(Meta meta, Func<T, long> expr, bool fallbackLast) {
+        object dummy = OrmProbeConstants.CreateProbeDummy<T>(meta);
+        if (dummy == null) { return OrmProbeConstants.FallbackCol(meta, fallbackLast); }
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            if (c.Kind == 0) {
+                if (c.I64) {
+                    dummy.SetFieldLong(c.Field, OrmProbeConstants.PROBE_LONG_MAGIC);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == OrmProbeConstants.PROBE_LONG_MAGIC) { return c.Col; }
+                    } catch (Exception _ex) {
+                    }
+                    dummy.SetFieldLong(c.Field, 0L);
+                } else {
+                    dummy.SetFieldInt(c.Field, OrmProbeConstants.PROBE_INT_MAGIC);
+                    try {
+                        long res = expr((T)dummy);
+                        if (res == (long)OrmProbeConstants.PROBE_INT_MAGIC) { return c.Col; }
+                    } catch (Exception _ex) {
+                    }
+                    dummy.SetFieldInt(c.Field, 0);
+                }
+            }
+        }
+        return OrmProbeConstants.FallbackCol(meta, fallbackLast);
+    }
+
+    public static string DetectColDouble<T>(Meta meta, Func<T, double> expr, bool fallbackLast) {
+        object dummy = OrmProbeConstants.CreateProbeDummy<T>(meta);
+        if (dummy == null) { return OrmProbeConstants.FallbackCol(meta, fallbackLast); }
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            if (c.Kind == 1) {
+                dummy.SetFieldDouble(c.Field, OrmProbeConstants.PROBE_DOUBLE_MAGIC);
+                try {
+                    double res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_DOUBLE_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                }
+                dummy.SetFieldDouble(c.Field, 0.0);
+            }
+        }
+        return OrmProbeConstants.FallbackCol(meta, fallbackLast);
+    }
+
+    public static string DetectColString<T>(Meta meta, Func<T, string> expr, bool fallbackLast) {
+        object dummy = OrmProbeConstants.CreateProbeDummy<T>(meta);
+        if (dummy == null) { return OrmProbeConstants.FallbackCol(meta, fallbackLast); }
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            if (c.Kind == 3) {
+                dummy.SetFieldString(c.Field, OrmProbeConstants.PROBE_STRING_MAGIC);
+                try {
+                    string res = expr((T)dummy);
+                    if (res == OrmProbeConstants.PROBE_STRING_MAGIC) { return c.Col; }
+                } catch (Exception _ex) {
+                }
+                dummy.SetFieldString(c.Field, "");
+            }
+        }
+        return OrmProbeConstants.FallbackCol(meta, fallbackLast);
+    }
+
+    public static string DetectColBool<T>(Meta meta, Func<T, bool> expr, bool fallbackLast) {
+        object dummy = OrmProbeConstants.CreateProbeDummy<T>(meta);
+        if (dummy == null) { return OrmProbeConstants.FallbackCol(meta, fallbackLast); }
+        for (int i = 0; i < meta.Cols.Count; i = i + 1) {
+            Col c = meta.Cols[i];
+            if (c.Kind == 2) {
+                dummy.SetFieldBool(c.Field, true);
+                try {
+                    if (expr((T)dummy)) { return c.Col; }
+                } catch (Exception _ex) {
+                }
+                dummy.SetFieldBool(c.Field, false);
+            }
+        }
+        return OrmProbeConstants.FallbackCol(meta, fallbackLast);
+    }
 }
 
 // 泛型 SELECT 查询驱动：结合元数据缓存与原生类型反射，提供流式查询。
@@ -940,11 +1054,13 @@ public class SelectQuery<T> {
         for (int i = 0; i < rows.Count; i = i + 1) {
             T item = rows[i];
             string key = this.groupByStringFn(item);
-            if (!groups.ContainsKey(key)) {
-                groups[key] = new List<object>();
+            List<object> list = null;
+            if (!groups.TryGetValue(key, out list)) {
+                list = new List<object>();
+                groups[key] = list;
                 keys.Add(key);
             }
-            groups[key].Add((object)item);
+            list.Add((object)item);
         }
         return groups;
     }

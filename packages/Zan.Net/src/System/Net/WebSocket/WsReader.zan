@@ -16,23 +16,15 @@ public class WsReader {
     private TlsStream closingStream;
     private TlsContext closingContext;
     public nint sock;
-    // 非空时字节源为 TLS 明文流（wss），否则直接从 sock 读取。
     public TlsStream tlsSrc;
     public byte[] buf;
     public int len;
     public int cap;
     public byte[] tmp;
-    // 下一个未读帧的游标。已消费的帧通过向前移动游标跳过；
-    // 仅当需要读取更多字节时才压缩缓冲区，
-    // 这样一批管道帧只需一次搬移，而不是每帧一次。
     public int start;
-    // 单条消息的缓冲上限：对端声明的帧总长超过它时按
-    // 协议错误拒绝（FrameSize 返回 -3），而不是把内存
-    // 无限翻倍——远端声明一个 2GB 的帧再慢慢滴字节，
-    // 即可把无上限的 Ensure 撑到 OOM。
+    // 单消息最大字节上限，防大帧声明引发 OOM。
     public int maxLen;
 
-    // 内部构造：64KiB 缓冲、消息上限 16 MiB；经 new / WrapTls 使用。
     public WsReader(nint sock) {
         this.receiveSync = new object();
         this.sock = sock;
@@ -42,27 +34,19 @@ public class WsReader {
         this.len = 0;
         this.start = 0;
         this.tmp = new byte[65537];
-        this.maxLen = 16777216;   // 16 MiB，与 MQTT broker 单包上限一致
+        this.maxLen = 16777216;
     }
 
-    // 以 TLS 明文流为字节源的读取器（wss 连接）。
     public static WsReader WrapTls(TlsStream stream) {
-        // 套接字句柄无用但字段必须一致：FillMore 走 tlsSrc 分支。
         WsReader r = new WsReader((nint)0);
         r.tlsSrc = stream;
         return r;
     }
 
-    // 调整单条消息的缓冲上限（字节）。
     public void SetMaxLen(int max) { this.maxLen = max; }
-
-    // 单条消息的缓冲上限（字节）。
     public int MaxLen() { return this.maxLen; }
-
-    // 缓冲中未读字节数。
     public int Buffered() { return this.len - this.start; }
 
-    // 把未读字节移到开头，使游标归零。
     public void Compact() {
         if (this.start == 0) { return; }
         int rem = this.len - this.start;
@@ -73,9 +57,6 @@ public class WsReader {
         this.start = 0;
     }
 
-    // 用已从套接字读到的字节初始化缓冲区。
-    // 同时服务 HTTP 与 WebSocket 的端口会自行读取握手，可能连带读入
-    // 首批帧，这些字节不能丢失。
     public void Prime(string data, int n) {
         if (n <= 0) { return; }
         this.Ensure(this.len + n);
@@ -83,11 +64,8 @@ public class WsReader {
         this.len = this.len + n;
     }
 
-    // 扩展累积缓冲区，使其至少容纳 `need` 个字节。
     public void Ensure(int need) {
         long limit = (long)this.maxLen + 65536;
-        // Clamping capacity cannot clamp the caller's following explicit-length
-        // copy. Reject before copying, also catching an overflowing len + n.
         if (this.maxLen < 0 || limit > 1073741824 || need < 0 || (long)need > limit) {
             throw new ArgumentException("WebSocket reader buffer limit exceeded");
         }
@@ -96,23 +74,16 @@ public class WsReader {
         int nc = this.cap * 2;
         if (nc < 65536) { nc = 65536; }
         while (nc < need) {
-            if (nc > 1073741824 / 2) {
-                nc = 1073741824;
-                break;
-            }
+            if (nc > 1073741824 / 2) { nc = 1073741824; break; }
             nc = nc * 2;
         }
         if (nc > maxCap) { nc = maxCap; }
         byte[] nb = new byte[nc + 1];
-        if (this.len > 0) {
-            NativeMemory.Copy((nint)nb, (nint)this.buf, this.len);
-        }
+        if (this.len > 0) { NativeMemory.Copy((nint)nb, (nint)this.buf, this.len); }
         this.buf = nb;
         this.cap = nc;
     }
 
-    // Invalidation alone does not own or close the caller's transport. Owners
-    // closing a live receive must retain its descriptor until FillMore drains.
     internal void Invalidate() {
         lock (this.receiveSync) {
             this.stopped = true;
@@ -120,10 +91,7 @@ public class WsReader {
         }
     }
 
-    // Session ownership is transferred exactly once. Shutdown wakes a read even
-    // if it registers after invalidation; keeping the descriptor allocated also
-    // protects that registration gap from descriptor reuse. Native shutdown only
-    // queues reactor continuations; it does not invoke managed code inline.
+    // 会话所有权一次性转移；Shutdown 唤醒挂起读，待读写全部退出后再释放句柄。
     internal void CloseTransport(TcpClient conn, TlsStream stream, TlsContext context) {
         lock (this.receiveSync) {
             if (this.transportClosing) { return; }
@@ -138,9 +106,6 @@ public class WsReader {
         this.DrainTransport();
     }
 
-    // Called while the session's connected/snapshot lock is held, before a
-    // sender can yield. This counts admitted I/O, independently of sendBusy's
-    // queue handoff state. CloseTransport never takes the session lock.
     internal bool AcquireSend() {
         lock (this.receiveSync) {
             if (this.stopped) { return false; }
@@ -167,7 +132,7 @@ public class WsReader {
             this.closingStream = null;
             this.closingContext = null;
         }
-        // Never run close/free or managed callbacks with the reader lock held.
+        // 绝不持锁执行 Close/Free。
         try {
             if (stream != null) { stream.Close(); }
         } finally {
@@ -179,13 +144,9 @@ public class WsReader {
         }
     }
 
-    // One receive owns buffers and its descriptor snapshot through every await.
-    // Public fields remain available for existing server/handshake consumers;
-    // supported session close goes through CloseTransport, not raw Socket.Close.
     public async int FillMore() { return await this.FillMore(0); }
 
-    // >0 = bytes, 0 = EOF/invalidation, -1 = idle timeout (partial frame kept).
-    // TLS retains the existing unlimited-wait behavior for a positive timeout.
+    // 返回 >0 读取字节数，0 EOF/已失效，-1 空闲超时。
     public async int FillMore(int timeoutMs) {
         nint handle = -1;
         TlsStream source = null;
@@ -202,29 +163,25 @@ public class WsReader {
                 lock (this.receiveSync) { if (this.stopped) { return 0; } }
                 int n = 0;
                 bool direct = this.len == 0 && source == null;
+                byte[] dst = direct ? this.buf : this.tmp;
+                int dstCap = direct ? this.cap : 65536;
                 if (source != null) {
                     n = await source.RecvIntoAsync(this.tmp, 65536);
                 } else if (timeoutMs > 0) {
-                    if (direct) {
-                        n = await Socket.RecvToOv(handle, this.buf, this.cap, timeoutMs);
-                    } else {
-                        n = await Socket.RecvToOv(handle, this.tmp, 65536, timeoutMs);
-                    }
+                    n = await Socket.RecvToOv(handle, dst, dstCap, timeoutMs);
                 } else {
                     await Socket.ReadReady(handle);
                     lock (this.receiveSync) {
                         if (this.stopped) { return 0; }
-                        // The nonblocking syscall and stop share a lock, closing
-                        // the check/recv gap without holding a lock across await.
-                        if (direct) { n = Socket.Recv(handle, this.buf, this.cap); }
-                        else { n = Socket.Recv(handle, this.tmp, 65536); }
+                        n = Socket.Recv(handle, dst, dstCap);
                     }
                 }
                 lock (this.receiveSync) {
                     if (this.stopped) { return 0; }
                     if (n > 0) {
-                        if (direct) { this.len = n; }
-                        else {
+                        if (direct) {
+                            this.len = n;
+                        } else {
                             this.Ensure(this.len + n);
                             NativeMemory.Copy((nint)this.buf + (nint)this.len, (nint)this.tmp, n);
                             this.len = this.len + n;
@@ -234,7 +191,6 @@ public class WsReader {
                     if (n == 0 || source != null) { return 0; }
                     if (timeoutMs > 0) { return -1; }
                     if (n <= -2) { return 0; }
-                    // Would-block/spurious wake: check stop again before rearm.
                 }
             }
         } finally {
@@ -243,32 +199,23 @@ public class WsReader {
         }
     }
 
-    // 缓冲区头部帧的总字节长度；若完整帧尚未全部缓冲
-    // 则返回 -1。返回 -2 = 协议违规（64 位长度的高 32 位非零，
-    // RFC 要求连接失败）；-3 = 帧总长超过 maxLen（消息过大）。
-    // 调用方对 -2/-3 都必须关闭而非继续等待。
+    // 返回帧总字节数，-1 未收全，-2 协议错误，-3 超过 maxLen。
     public int FrameSize() {
         int s = this.start;
         int avail = this.len - s;
         if (avail < 2) { return -1; }
         int b0 = this.buf[s] & 255;
-        int rsv = (b0 >> 4) & 7;
-        if (rsv != 0) { return -2; }
+        if (((b0 >> 4) & 7) != 0) { return -2; }
         int opcode = b0 & 15;
         if ((opcode >= 3 && opcode <= 7) || (opcode >= 11 && opcode <= 15)) { return -2; }
         bool fin = (b0 & 128) != 0;
         int b1 = this.buf[s + 1] & 255;
-        bool masked = (b1 & 128) != 0;
         int payloadLen = b1 & 127;
-        if (opcode >= 8) {
-            // RFC 6455 §5.5: 控制帧禁止分片且载荷 <= 125
-            if (!fin || payloadLen > 125) { return -2; }
-        }
+        if (opcode >= 8 && (!fin || payloadLen > 125)) { return -2; }
         int offset = 2;
         if (payloadLen == 126) {
             if (avail < 4) { return -1; }
             payloadLen = ((this.buf[s + 2] & 255) << 8) + (this.buf[s + 3] & 255);
-            // RFC 6455 §5.2: 规范长度最小化要求，126 扩展编码的载荷长度必须 >= 126
             if (payloadLen < 126) { return -2; }
             offset = 4;
         } else if (payloadLen == 127) {
@@ -278,43 +225,31 @@ public class WsReader {
                 || (this.buf[s + 6] & 128) != 0) {
                 return -2;
             }
-            payloadLen = ((this.buf[s + 6] & 255) << 24) +
-                         ((this.buf[s + 7] & 255) << 16) +
-                         ((this.buf[s + 8] & 255) << 8) + (this.buf[s + 9] & 255);
-            // RFC 6455 §5.2: 规范长度最小化要求，127 扩展编码的载荷长度必须 > 65535
+            payloadLen = ((this.buf[s + 6] & 255) << 24) + ((this.buf[s + 7] & 255) << 16)
+                + ((this.buf[s + 8] & 255) << 8) + (this.buf[s + 9] & 255);
             if (payloadLen < 65536) { return -2; }
             offset = 10;
         }
-        int maskLen = 0;
-        if (masked) { maskLen = 4; }
-        int total = offset + maskLen + payloadLen;
+        int total = offset + ((b1 & 128) != 0 ? 4 : 0) + payloadLen;
         if (total < 0) { return -2; }
         if (total > this.maxLen) { return -3; }
         if (avail < total) { return -1; }
         return total;
     }
 
-    // 解码游标处的帧（长度由 FrameSize 给出），并
-    // 越过该帧。
     public WsFrame TakeFrame(int total) {
         WsFrame frame = WsFrame.DecodeAt(this.buf, this.start, total);
         this.Consume(total);
         return frame;
     }
 
-    // 在缓冲的未读字节里扫描 HTTP 头部结束标记
-    // （CRLFCRLF）。借助 AVX2 向量化 IndexOf 快速跳过普通字节。
-    // 返回相对游标的偏移；未找到返回 -1。
-    // 握手与首帧常在同一段到达，而帧字节可能含 NUL，
-    // 因此扫描必须按字节下标进行，不能走字符串长度。
+    // 按字节下标扫描 CRLFCRLF（避免帧内 NUL 截断）。
     public int FindHeaderEnd() {
         int last = this.len - 4;
         int i = this.start;
         while (i <= last) {
             int pos = MemoryExtensions.IndexOf(this.buf, (byte)13, i, last + 1 - i);
-            if (pos < 0 || pos > last) {
-                return 0 - 1;
-            }
+            if (pos < 0 || pos > last) { return -1; }
             if ((this.buf[pos + 1] & 255) == 10
                 && (this.buf[pos + 2] & 255) == 13
                 && (this.buf[pos + 3] & 255) == 10) {
@@ -322,18 +257,14 @@ public class WsReader {
             }
             i = pos + 1;
         }
-        return 0 - 1;
+        return -1;
     }
 
-    // 取出游标处 n 个字节，作为显式长度的字符串
-    // （不推进游标）。零额外堆分配拷贝。
     public string Slice(int n) {
         if (n <= 0) { return ""; }
         return this.buf.ToStr(this.start, n);
     }
 
-    // 把外部收到的字节（例如 TLS 流解密出的明文）
-    // 追加到累积缓冲区，绕过套接字。
     public void Append(string data, int n) {
         if (n <= 0) { return; }
         this.Compact();
@@ -342,7 +273,6 @@ public class WsReader {
         this.len = this.len + n;
     }
 
-    // 跳过游标处的帧以丢弃它。
     public void Consume(int total) {
         this.start = this.start + total;
         if (this.start >= this.len) {
@@ -351,10 +281,3 @@ public class WsReader {
         }
     }
 }
-
-// 供连续应答帧使用的二进制安全输出缓冲区。
-// // 每帧一次 send() 比编码一帧更贵：每 recv 携带 64 个管道帧时，
-// echo 路径把时间全花在系统调用上（满载内核约 13 万消息/秒，
-// 而 tcp 路径一次写入回显整个 recv，达 680 万/秒）。
-// 在更多完整帧已缓冲时累积响应，
-// 待读取方无帧可读时再一次性刷出。

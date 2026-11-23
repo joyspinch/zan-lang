@@ -51,34 +51,9 @@ public class SseClient : IDisposable {
         // 垃圾字节会直接变成首条缓冲事件并宣告连接成功）。握手接收
         // 受 30 秒空闲窗口约束：沉默的上游不能再永久钉住本协程。
         HttpDeadlineToken watch = HttpDeadline.Arm(c.client.GetSocket(), 30000);
-        string head = "";
-        while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
-            string chunk = await c.client.RecvAsync(4096);
-            if (chunk.Length == 0) {
-                HttpDeadline.Disarm(watch);
-                c.client.Close();
-                return c;
-            }
-            if (HttpDeadline.Expired(watch)) {
-                HttpDeadline.Disarm(watch);
-                c.client.Close();
-                return c;
-            }
-            head = head + chunk;
-        }
+        bool ok = await c.ReadHandshakeHeadAsync(watch);
         HttpDeadline.Disarm(watch);
-        int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
-        // 状态行必须是 "HTTP/1.x 200"：`" 200 "` 全头扫描会把正文/头里
-        // 恰好带 " 200 " 的 404 也当成功。状态码固定在状态行第 10..12 位。
-        bool ok = false;
-        if (bodyAt >= 0 && head.Length >= 12
-            && (head.Substring(0, 5) == "HTTP/")
-            && (head.Substring(9, 3) == "200")) {
-            ok = true;
-        }
-        if (!ok) { c.client.Close(); return c; }
-        c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
-        c.connected = true;
+        if (!ok) { c.Close(); }
         return c;
     }
 
@@ -134,31 +109,48 @@ public class SseClient : IDisposable {
             return c;
         }
 
-        string head = "";
-        byte[] tmp = new byte[4096];
-        while (SseText.Find(head, "\r\n\r\n", 0) < 0 && head.Length < 65536) {
-            int rn = await c.tls.RecvBytesAsync(tmp, 0, 4096);
-            if (rn <= 0) {
-                c.Close();
-                return c;
-            }
-            string chunk = Encoding.UTF8.GetString(tmp, 0, rn);
-            head = head + chunk;
-        }
-        int bodyAt = SseText.Find(head, "\r\n\r\n", 0);
-        bool ok = false;
-        if (bodyAt >= 0 && head.Length >= 12
-            && (head.Substring(0, 5) == "HTTP/")
-            && (head.Substring(9, 3) == "200")) {
-            ok = true;
-        }
-        if (!ok) {
-            c.Close();
-            return c;
-        }
-        c.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
-        c.connected = true;
+        bool ok = await c.ReadHandshakeHeadAsync(null);
+        if (!ok) { c.Close(); }
         return c;
+    }
+
+    // 统一读取并校验握手响应头（至 "\r\n\r\n"，上限 64 KiB）：
+    // 用 StringBuilder + 3 字节尾滑窗避免 O(N^2) 拼接与全量重扫。
+    private async bool ReadHandshakeHeadAsync(HttpDeadlineToken watch) {
+        StringBuilder headSb = new StringBuilder();
+        string tail = "";
+        int bodyAt = -1;
+        byte[] tmp = this.tls != null ? new byte[4096] : null;
+        while (bodyAt < 0 && headSb.Length < 65536) {
+            string chunk = "";
+            if (this.tls != null) {
+                int rn = await this.tls.RecvBytesAsync(tmp, 0, 4096);
+                if (rn <= 0) { return false; }
+                chunk = Encoding.UTF8.GetString(tmp, 0, rn);
+            } else {
+                chunk = await this.client.RecvAsync(4096);
+                if (chunk.Length == 0) { return false; }
+                if (watch != null && HttpDeadline.Expired(watch)) { return false; }
+            }
+            headSb.Append(chunk);
+            string probe = tail.Length > 0 ? tail + chunk : chunk;
+            int hit = SseText.Find(probe, "\r\n\r\n", 0);
+            if (hit >= 0) {
+                bodyAt = headSb.Length - probe.Length + hit;
+            } else {
+                tail = probe.Length >= 3 ? probe.Substring(probe.Length - 3, 3) : probe;
+            }
+        }
+        if (bodyAt < 0 || headSb.Length < 12) { return false; }
+        string head = headSb.ToString();
+        // 状态行必须是 "HTTP/1.x 200"：`" 200 "` 全头扫描会把正文/头里
+        // 恰好带 " 200 " 的 404 也当成功。状态码固定在状态行第 10..12 位。
+        if (head.Substring(0, 5) != "HTTP/" || head.Substring(9, 3) != "200") {
+            return false;
+        }
+        this.buf = head.Substring(bodyAt + 4, head.Length - bodyAt - 4);
+        this.connected = true;
+        return true;
     }
 
     // 握手是否成功（连接失败或服务器拒绝该流时为 false）。
@@ -169,6 +161,7 @@ public class SseClient : IDisposable {
     // （keep-alive 心跳）会被透明跳过。
     public async SseEvent NextAsync() {
         if (!this.connected) { return null; }
+        byte[] tlsTmp = null;
         while (true) {
             // 事件以空行结束；流中可能使用 \n 或 \r\n。
             int end = SseText.Find(this.buf, "\n\n", 0);
@@ -185,10 +178,10 @@ public class SseClient : IDisposable {
             }
             string chunk = "";
             if (this.tls != null) {
-                byte[] tmp = new byte[4096];
-                int rn = await this.tls.RecvBytesAsync(tmp, 0, 4096);
+                if (tlsTmp == null) { tlsTmp = new byte[4096]; }
+                int rn = await this.tls.RecvBytesAsync(tlsTmp, 0, 4096);
                 if (rn > 0) {
-                    chunk = Encoding.UTF8.GetString(tmp, 0, rn);
+                    chunk = Encoding.UTF8.GetString(tlsTmp, 0, rn);
                 }
             } else if (this.client != null) {
                 chunk = await this.client.RecvAsync(4096);

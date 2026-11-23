@@ -1,0 +1,227 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Json;
+
+namespace Zan.Web.Services;
+
+internal class RouteDiagnosticReport {
+    private static const string RouteSums = "SUM(samples), SUM(elapsed_us), MAX(max_us), "
+    + "SUM(failed), SUM(incomplete), SUM(sql_calls), SUM(sql_completed), SUM(sql_us), SUM(sql_failed)";
+    private static const string ResourceSums = "SUM(samples), SUM(cpu_samples), SUM(cpu), "
+    + "SUM(allocated_bytes), SUM(slices), SUM(unfinished_tasks), 0, 0, 0, coverage, cpu_unit";
+    private static const int RouteRow = 0;
+    private static const int StageRow = 1;
+    private static const int SeriesRow = 2;
+    private static const int ResourceRouteRow = 3;
+    private static const int ResourceSeriesRow = 4;
+    private long from;
+    private long to;
+    private long step;
+    private string method;
+    private string route;
+    private bool details;
+    private bool storageReadable;
+    private long localPending;
+    internal long localDropped;
+    private Dict<string, MetricRouteDiagnostic> routes = new Dict<string, MetricRouteDiagnostic>();
+    private Dict<string, MetricRouteStage> stages = new Dict<string, MetricRouteStage>();
+    private Dict<long, MetricRouteDiagnostic> series = new Dict<long, MetricRouteDiagnostic>();
+
+    internal RouteDiagnosticReport(int hours, long to, string method, string route) {
+        int minutes = 1;
+        switch (hours) {
+            case 1: break;
+            case 6: break;
+            case 24: minutes = 5; break;
+            case 168: minutes = 60; break;
+            case 720: minutes = 120; break;
+            default: hours = 1; break;
+        }
+        this.to = to + 60;
+        this.from = this.to - (long)hours * 3600;
+        this.step = (long)minutes * 60;
+        this.method = method != null ? method : "";
+        this.route = route != null ? route : "";
+        this.details = this.method.Length > 0 || this.route.Length > 0;
+    }
+
+    internal bool Includes(MetricRouteDiagnostic row) {
+        return row.minute >= this.from && row.minute < this.to
+        && (this.method.Length == 0 || this.method == row.method)
+        && (this.route.Length == 0 || this.route == row.route);
+    }
+
+    internal void AddPending(RouteDiagnosticBucket bucket) {
+        MetricRouteDiagnostic row = bucket.row;
+        this.localPending += row.samples;
+        this.Route(row.method, row.route).Add(row);
+        if (!this.details) { return; }
+        long minute = row.minute - ((row.minute - this.from) % this.step);
+        this.Point(minute).Add(row);
+        for (int i = 0; i < bucket.stages.Length; i += 1) {
+            MetricRouteStage stage = bucket.stages[i];
+            if (stage != null) { this.Stage(stage.stage).Add(stage); }
+        }
+    }
+
+    private MetricRouteDiagnostic Route(string method, string route) {
+        string key = RouteDiagnosticsBuffer.RouteKey(method, route);
+        MetricRouteDiagnostic row = null;
+        if (!this.routes.TryGetValue(key, out row)) {
+            row = new MetricRouteDiagnostic();
+            row.method = method;
+            row.route = route;
+            this.routes[key] = row;
+        }
+        return row;
+    }
+
+    private MetricRouteStage Stage(string name) {
+        MetricRouteStage row = null;
+        if (!this.stages.TryGetValue(name, out row)) {
+            row = new MetricRouteStage();
+            row.stage = name;
+            this.stages[name] = row;
+        }
+        return row;
+    }
+
+    private MetricRouteDiagnostic Point(long minute) {
+        MetricRouteDiagnostic row = null;
+        if (!this.series.TryGetValue(minute, out row)) {
+            row = new MetricRouteDiagnostic();
+            row.minute = minute;
+            this.series[minute] = row;
+        }
+        return row;
+    }
+
+    private void BindWindow(DbParams args) {
+        args.AddLong(this.from).AddLong(this.to);
+        if (this.method.Length > 0) { args.Add(this.method); }
+        if (this.route.Length > 0) { args.Add(this.route); }
+    }
+
+    /* One SQLite statement sees a single WAL snapshot across all aggregates. */
+    internal async bool Load(IDbConnection db) {
+        string window = " WHERE minute >= ? AND minute < ?";
+        if (this.method.Length > 0) { window += " AND method = ?"; }
+        if (this.route.Length > 0) { window += " AND route = ?"; }
+        DbParams args = new DbParams();
+        this.BindWindow(args);
+        this.BindWindow(args);
+        string sql = "SELECT 0, method, route, 0, " + RouteSums + ", '', ''"
+        + " FROM metrics_route_diagnostics" + window + " GROUP BY method, route"
+        + " UNION ALL SELECT 3, method, route, 0, " + ResourceSums
+        + " FROM metrics_route_resources" + window + " GROUP BY method, route, coverage, cpu_unit";
+        if (this.details) {
+            this.BindWindow(args);
+            args.AddLong(this.from).AddLong(this.step);
+            this.BindWindow(args);
+            args.AddLong(this.from).AddLong(this.step);
+            this.BindWindow(args);
+            sql += " UNION ALL SELECT 1, stage, '', 0, SUM(calls), SUM(elapsed_us), MAX(max_us),"
+            + " SUM(failed), SUM(completed), 0, 0, 0, 0, '', ''"
+            + " FROM metrics_route_stages" + window + " GROUP BY stage"
+            + " UNION ALL SELECT 2, '', '', minute - ((minute - ?) % ?), " + RouteSums + ", '', ''"
+            + " FROM metrics_route_diagnostics" + window + " GROUP BY 4"
+            + " UNION ALL SELECT 4, '', '', minute - ((minute - ?) % ?), " + ResourceSums
+            + " FROM metrics_route_resources" + window + " GROUP BY 4, coverage, cpu_unit";
+        }
+        DbResult rows = await db.QueryAsync(sql, args);
+        for (int i = 0; i < rows.RowCount(); i += 1) {
+            long kind = rows.GetLong(i, 0);
+            if (kind == StageRow) {
+                MetricRouteStage stage = this.Stage(rows.GetString(i, 1));
+                stage.calls += rows.GetLong(i, 4);
+                stage.elapsedUs += rows.GetLong(i, 5);
+                long max = rows.GetLong(i, 6);
+                if (max > stage.maxUs) { stage.maxUs = max; }
+                stage.failed += rows.GetLong(i, 7);
+                stage.completed += rows.GetLong(i, 8);
+            } else if (kind == ResourceRouteRow || kind == ResourceSeriesRow) {
+                MetricRouteDiagnostic target = kind == ResourceRouteRow
+                    ? this.Route(rows.GetString(i, 1), rows.GetString(i, 2))
+                    : this.Point(rows.GetLong(i, 3));
+                MetricRouteResource resource = target.Resource(rows.GetString(i, 13), rows.GetString(i, 14));
+                if (resource == null) { continue; }
+                resource.samples += rows.GetLong(i, 4);
+                resource.cpuSamples += rows.GetLong(i, 5);
+                resource.cpu += rows.GetLong(i, 6);
+                resource.allocatedBytes += rows.GetLong(i, 7);
+                resource.slices += rows.GetLong(i, 8);
+                resource.unfinishedTasks += rows.GetLong(i, 9);
+            } else {
+                MetricRouteDiagnostic row = new MetricRouteDiagnostic();
+                row.samples = rows.GetLong(i, 4);
+                row.elapsedUs = rows.GetLong(i, 5);
+                row.maxUs = rows.GetLong(i, 6);
+                row.failed = rows.GetLong(i, 7);
+                row.incomplete = rows.GetLong(i, 8);
+                row.sqlCalls = rows.GetLong(i, 9);
+                row.sqlCompleted = rows.GetLong(i, 10);
+                row.sqlUs = rows.GetLong(i, 11);
+                row.sqlFailed = rows.GetLong(i, 12);
+                if (kind == RouteRow) {
+                    this.Route(rows.GetString(i, 1), rows.GetString(i, 2)).Add(row);
+                } else if (kind == SeriesRow) {
+                    this.Point(rows.GetLong(i, 3)).Add(row);
+                }
+            }
+        }
+        this.storageReadable = true;
+        return true;
+    }
+
+    internal string ToJson(bool enabled, int sampleEvery) {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("enabled", enabled);
+        w.WriteProperty("sample_every", sampleEvery);
+        w.WriteProperty("from_minute", this.from / 60);
+        w.WriteProperty("to_minute", this.to / 60);
+        w.WriteProperty("bucket_minutes", this.step / 60);
+        w.WriteProperty("storage_readable", this.storageReadable);
+        w.WriteProperty("local_pending_samples", this.localPending);
+        w.WriteProperty("local_dropped_samples", this.localDropped);
+        w.WritePropertyName("routes");
+        w.WriteStartArray();
+        foreach (string key in this.routes.Keys) {
+            MetricRouteDiagnostic row = this.routes[key];
+            w.WriteStartObject();
+            w.WriteProperty("method", row.method);
+            w.WriteProperty("route", row.route);
+            row.WriteCounts(w);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WritePropertyName("stages");
+        w.WriteStartArray();
+        foreach (string name in this.stages.Keys) {
+            MetricRouteStage row = this.stages[name];
+            w.WriteStartObject();
+            w.WriteProperty("name", name);
+            w.WriteProperty("calls", row.calls);
+            w.WriteProperty("completed", row.completed);
+            w.WriteProperty("elapsed_us", row.elapsedUs);
+            w.WriteProperty("max_us", row.maxUs);
+            w.WriteProperty("failed", row.failed);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WritePropertyName("series");
+        w.WriteStartArray();
+        for (long minute = this.from; minute < this.to; minute += this.step) {
+            MetricRouteDiagnostic row = null;
+            if (!this.series.TryGetValue(minute, out row)) { continue; }
+            w.WriteStartObject();
+            w.WriteProperty("minute", minute / 60);
+            row.WriteCounts(w);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        return w.ToString();
+    }
+}

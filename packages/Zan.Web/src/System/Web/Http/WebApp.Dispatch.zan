@@ -1,0 +1,496 @@
+using System.Diagnostics;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System;
+
+namespace System.Web;
+
+// WebApp 路由匹配、鉴权/限流门控与同步/异步请求派发部分。
+public partial class WebApp {
+    private static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
+
+    private static string[] EnsureDefaultErrorBodies() {
+        if (WebApp.defaultErrorBodies == null) {
+            string[] arr = new string[120];
+            arr[401 - 400] = WebApp.BuildErrorJson("401", "authentication required");
+            arr[403 - 400] = WebApp.BuildErrorJson("403", "insufficient permission");
+            arr[404 - 400] = WebApp.BuildErrorJson("404", "not found");
+            arr[405 - 400] = WebApp.BuildErrorJson("405", "method not allowed");
+            arr[429 - 400] = WebApp.BuildErrorJson("429", "request already in progress");
+            arr[500 - 400] = WebApp.BuildErrorJson("500", "internal server error");
+            arr[503 - 400] = WebApp.BuildErrorJson("503", "service unavailable");
+            WebApp.defaultErrorBodies = arr;
+        }
+        return WebApp.defaultErrorBodies;
+    }
+
+    private string ErrorBody(int status, string code, string msg) {
+        if (status >= 400 && status < 520) {
+            int idx = status - 400;
+            if (this.customErrorBodies != null && this.customErrorBodies[idx] != null) {
+                return this.customErrorBodies[idx];
+            }
+            if (status == 500 && msg == "handler produced no response") {
+                return WebApp.err500noResp;
+            }
+            string[] defs = WebApp.EnsureDefaultErrorBodies();
+            if (defs[idx] != null && (msg.Length == 0 || status != 429 || msg == "request already in progress")) {
+                return defs[idx];
+            }
+        }
+        return WebApp.BuildErrorJson(code, msg);
+    }
+
+    private void WriteError(HttpContext ctx, int status, string reason,
+                            string code, string msg, bool keepAlive) {
+        ctx.Status(status, reason);
+        ctx.Json(this.ErrorBody(status, code, msg));
+        ctx.BuildResponseDirect(keepAlive);
+    }
+
+    private Route MatchRequest(HttpContext ctx) {
+        RequestTrace trace = ctx.Trace;
+        int stage = trace != null ? trace.Begin("match_route") : -1;
+        Route route = this.router.Match(ctx);
+        if (trace != null) {
+            trace.End(stage);
+            trace.Identify(ctx.Method(), route);
+        }
+        return route;
+    }
+
+    private bool CanGateSync(HttpContext ctx, Route route) {
+        if (route == null || !route.NeedsAuth()) { return true; }
+        if (ctx.Uid().Length == 0) { return true; }
+        return this.scopedPermissionResolver == null && this.permissionResolver == null;
+    }
+
+    private long FinalizeDispatchedRoute(HttpContext ctx, int rIdx, long startUs,
+                                         bool keepAlive, int handlerStage, bool errLogged) {
+        RequestTrace trace = ctx.Trace;
+        if (!ctx.Ended()) {
+            if (trace != null) { trace.Fail(handlerStage, "no_response"); }
+            Console.WriteLine("[WebApp ERROR] handler produced no response: " + ctx.Method() + " " + ctx.Path());
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.Method() + " " + ctx.Path(), "handler produced no response");
+            errLogged = true;
+            ctx.Status(500, "Internal Server Error");
+            ctx.Json(this.ErrorBody(500, "500", "handler produced no response"));
+        }
+        if (ctx.GetStatus() >= 500 && !errLogged) {
+            if (trace != null) { trace.Fail(handlerStage, "http_5xx"); }
+            string detail = ctx.StatusText();
+            if (detail == null || detail.Length == 0) {
+                detail = "HTTP " + Convert.ToString(ctx.GetStatus());
+            }
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.Method() + " " + ctx.Path(), detail);
+        }
+
+        long endUs = ServerMetrics.MonoMicros();
+        if (!ctx.MetricsExcluded()) {
+            this.router.RecordHit(rIdx, endUs - startUs);
+        }
+        ctx.BuildResponseDirect(keepAlive);
+        return endUs;
+    }
+
+    private void CompleteDispatchMetrics(HttpContext ctx, RequestTrace trace,
+                                         long startUs, int dispatchStage, long endUs) {
+        long tid = Thread.CurrentId();
+        long _n = this.totalRequestsShards[(int)(((tid ^ (tid >> 4) ^ (tid >> 8)) * 2654435761L) & 15)].Increment();
+        long dispatchEndUs = endUs > 0 ? endUs : ServerMetrics.MonoMicros();
+        long elapsedUs = dispatchEndUs - startUs;
+        if (trace != null) { trace.EndAt(dispatchStage, dispatchEndUs); }
+        if (ctx.MetricsExcluded()) {
+            this.metrics.StreamClosed(ctx.Frames(), ctx.FrameBytes());
+        } else {
+            long sec = dispatchEndUs / 1000000;
+            if (ctx.RoutePattern().Length == 0) {
+                this.metrics.RecordUnmatchedAt(ctx.GetStatus(), elapsedUs, sec);
+            } else {
+                this.metrics.RecordRouteAt(ctx.RouteSlot(), ctx.Method(),
+                    ctx.RoutePattern(), ctx.GetStatus(), elapsedUs, sec);
+            }
+        }
+        int afterStage = trace != null ? trace.Begin("after_hooks") : -1;
+        this.hooks.RunAfter(ctx, elapsedUs, afterStage);
+        if (trace != null) { trace.End(afterStage); }
+    }
+
+    private LockLease AcquireRouteLock(HttpContext ctx, Route route, RequestTrace trace,
+                                       bool keepAlive, out bool blocked) {
+        blocked = false;
+        if (route.LockScope().Length == 0) { return null; }
+        string principal = ctx.Uid();
+        if (principal.Length == 0) { principal = ctx.ClientIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
+        int lockStage = trace != null ? trace.Begin("request_lock") : -1;
+        LockLease lockLease = this.Locks().TryAcquire(LockManager.KeyFor(route, principal));
+        if (trace != null) { trace.End(lockStage); }
+        if (lockLease == null) {
+            if (trace != null) { trace.Fail(lockStage, "already_in_progress"); }
+            ctx.SetHeader("Retry-After", "1");
+            this.WriteError(ctx, 429, "Too Many Requests", "429", "request already in progress", keepAlive);
+            blocked = true;
+        }
+        return lockLease;
+    }
+
+    // 纯同步请求派发快路径（零协程分配、零协程调度切换）：
+    // 若门控及处理器均可同步完成则直接完成并构建响应返回 true；
+    // 若处理器需要 await 或门控需异步解析则安全回退返回 false（且绝不重复执行 Before 钩子）。
+    private bool TryDispatchSync(HttpContext ctx, Route route, bool keepAlive,
+                                 bool gatePassed, bool gateRejected, out bool gateAlreadyPassed) {
+        gateAlreadyPassed = gatePassed;
+        if (!gateRejected && !gatePassed && !this.CanGateSync(ctx, route)) {
+            return false;
+        }
+        if (!gateRejected && route != null
+            && route.SyncActionHandler() == null && route.SyncHandler() == null) {
+            return false;
+        }
+
+        long startUs = ServerMetrics.MonoMicros();
+        RequestTrace trace = ctx.Trace;
+        int dispatchStage = trace != null ? trace.BeginAt("dispatch", startUs, true) : -1;
+        int concShard = this.metrics.EnterShard();
+        long endUs = 0;
+        bool needAsyncFallback = false;
+        try {
+            if (!gateRejected) {
+                bool proceed = true;
+                if (!gatePassed) {
+                    proceed = this.DispatchGateSync(ctx, route, keepAlive);
+                    if (proceed) { gateAlreadyPassed = true; }
+                }
+                if (proceed) {
+                    bool lockBlocked;
+                    LockLease lockLease = this.AcquireRouteLock(ctx, route, trace, keepAlive, out lockBlocked);
+                    if (!lockBlocked) {
+                        int rIdx = route.Idx();
+                        SyncHttpAction syncAction = route.SyncActionHandler();
+                        SyncHttpHandler syncH = route.SyncHandler();
+                        bool errLogged = false;
+                        int handlerStage = trace != null ? trace.Begin("handler") : -1;
+                        try {
+                            if (syncAction != null) {
+                                syncAction(ctx);
+                            } else if (!syncH(ctx)) {
+                                needAsyncFallback = true;
+                            }
+                        } catch (Exception failure) {
+                            if (trace != null) { trace.Fail(handlerStage, WebApp.RequestFailureCode(failure)); }
+                            errLogged = this.ApplyRequestFailure(ctx, failure);
+                        } finally {
+                            if (trace != null) { trace.End(handlerStage); }
+                            if (lockLease != null) { this.Locks().Release(lockLease); }
+                        }
+                        if (!needAsyncFallback) {
+                            endUs = this.FinalizeDispatchedRoute(ctx, rIdx, startUs, keepAlive, handlerStage, errLogged);
+                        }
+                    }
+                }
+            }
+        } finally {
+            this.metrics.LeaveShard(concShard);
+        }
+        if (needAsyncFallback) {
+            return false;
+        }
+        this.CompleteDispatchMetrics(ctx, trace, startUs, dispatchStage, endUs);
+        return true;
+    }
+
+    private async void Dispatch(HttpContext ctx, Route route, bool keepAlive,
+                                bool gatePassed = false, bool gateRejected = false) {
+        long startUs = ServerMetrics.MonoMicros();
+        RequestTrace trace = ctx.Trace;
+        int dispatchStage = trace != null ? trace.BeginAt("dispatch", startUs, true) : -1;
+        int concShard = this.metrics.EnterShard();
+        long endUs = 0;
+        try {
+            if (!gateRejected) {
+                bool proceed = true;
+                if (!gatePassed) {
+                    proceed = this.CanGateSync(ctx, route)
+                        ? this.DispatchGateSync(ctx, route, keepAlive)
+                        : await this.DispatchGate(ctx, route, keepAlive);
+                }
+                if (proceed) {
+                    bool lockBlocked;
+                    LockLease lockLease = this.AcquireRouteLock(ctx, route, trace, keepAlive, out lockBlocked);
+                    if (!lockBlocked) {
+                        int rIdx = route.Idx();
+                        SyncHttpAction syncAction = route.SyncActionHandler();
+                        SyncHttpHandler syncH = route.SyncHandler();
+                        HttpHandler h = route.Handler();
+                        bool errLogged = false;
+                        int handlerStage = trace != null ? trace.Begin("handler") : -1;
+                        try {
+                            if (syncAction != null) {
+                                syncAction(ctx);
+                            } else if (syncH == null || !syncH(ctx)) {
+                                await h(ctx);
+                            }
+                        } catch (Exception failure) {
+                            if (trace != null) { trace.Fail(handlerStage, WebApp.RequestFailureCode(failure)); }
+                            errLogged = this.ApplyRequestFailure(ctx, failure);
+                        } finally {
+                            if (trace != null) { trace.End(handlerStage); }
+                            if (lockLease != null) { this.Locks().Release(lockLease); }
+                        }
+                        endUs = this.FinalizeDispatchedRoute(ctx, rIdx, startUs, keepAlive, handlerStage, errLogged);
+                    }
+                }
+            }
+        } finally {
+            this.metrics.LeaveShard(concShard);
+        }
+        this.CompleteDispatchMetrics(ctx, trace, startUs, dispatchStage, endUs);
+    }
+
+    private bool FinishPrepareRequest(HttpContext ctx, Route route, string uid,
+                                      RequestTrace trace, int stage) {
+        ctx.SetUid(uid);
+        if (trace != null) {
+            trace.End(stage);
+            stage = trace.Begin("rate_limit");
+        }
+        bool limited = this.LimitExceeded(ctx, route, uid);
+        if (limited) {
+            if (trace != null) { trace.Fail(stage, "rate_limited"); }
+            ctx.Status(429, "Too Many Requests");
+            ctx.Text("rate limit exceeded");
+        }
+        if (trace != null) { trace.End(stage); }
+        return !limited;
+    }
+
+    private bool TryPrepareRequestSync(HttpContext ctx, Route route, out bool admitted) {
+        RequestTrace trace = ctx.Trace;
+        int stage = trace != null ? trace.Begin("authenticate") : -1;
+        try {
+            string uid;
+            if (!this.TryAuthUserSync(ctx, out uid)) {
+                if (trace != null) { trace.End(stage); }
+                admitted = false;
+                return false;
+            }
+            admitted = this.FinishPrepareRequest(ctx, route, uid, trace, stage);
+            return true;
+        } catch (Exception failure) {
+            if (trace != null) {
+                trace.Fail(stage, WebApp.RequestFailureCode(failure));
+                trace.End(stage);
+            }
+            this.ApplyRequestFailure(ctx, failure);
+            admitted = false;
+            return true;
+        }
+    }
+
+    private async bool PrepareRequest(HttpContext ctx, Route route) {
+        RequestTrace trace = ctx.Trace;
+        int stage = trace != null ? trace.Begin("authenticate") : -1;
+        try {
+            string uid = await this.AuthUser(ctx);
+            return this.FinishPrepareRequest(ctx, route, uid, trace, stage);
+        } catch (Exception failure) {
+            if (trace != null) {
+                trace.Fail(stage, WebApp.RequestFailureCode(failure));
+                trace.End(stage);
+            }
+            this.ApplyRequestFailure(ctx, failure);
+            return false;
+        }
+    }
+
+    private bool LimitExceeded(HttpContext ctx, Route route, string uid) {
+        string principal = uid;
+        if (principal.Length == 0) { principal = ctx.ClientIp(); }
+        if (principal.Length == 0) { principal = "_unknown_"; }
+        if (this.globalLimit > 0
+            && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
+            return true;
+        }
+        if (route == null || route.RateLimit() <= 0) { return false; }
+        string rateKey = route.Key();
+        if (route.RateScope() == "uid") {
+            rateKey = rateKey + ":uid:" + uid;
+        } else if (route.RateScope() == "ip") {
+            rateKey = rateKey + ":ip:" + ctx.ClientIp();
+        }
+        return !this.Limiter().Allow(rateKey, route.RateLimit());
+    }
+
+    private bool GateCheckPrefix(HttpContext ctx, Route route, bool keepAlive) {
+        if (!this.hooks.RunBefore(ctx)) {
+            ctx.BuildResponseDirect(keepAlive);
+            return false;
+        }
+        if (route == null) {
+            if (this.router.PathExists(ctx.Path())) {
+                this.WriteError(ctx, 405, "Method Not Allowed", "405", "method not allowed", keepAlive);
+            } else {
+                this.WriteError(ctx, 404, "Not Found", "404", "not found", keepAlive);
+            }
+            return false;
+        }
+        ctx.SetRoute(route.Action(), route.Pattern(), route.Idx());
+        if ((route.NeedsLogin() || route.NeedsAuth()) && ctx.Uid().Length == 0) {
+            if (this.WantsPage(ctx)) {
+                ctx.Redirect(this.loginPath + "?next=" + Encoding.UrlEncode(ctx.Path()));
+                ctx.BuildResponseDirect(keepAlive);
+            } else {
+                this.WriteError(ctx, 401, "Unauthorized", "401", "authentication required", keepAlive);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private bool DispatchGateSync(HttpContext ctx, Route route, bool keepAlive) {
+        RequestTrace trace = ctx.Trace;
+        int stage = trace != null ? trace.Begin("dispatch_gate") : -1;
+        try {
+            return this.GateCheckPrefix(ctx, route, keepAlive);
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, WebApp.RequestFailureCode(failure)); }
+            this.ApplyRequestFailure(ctx, failure);
+        } finally {
+            if (trace != null) { trace.End(stage); }
+        }
+        ctx.BuildResponseDirect(keepAlive);
+        return false;
+    }
+
+    private async bool DispatchGate(HttpContext ctx, Route route, bool keepAlive) {
+        RequestTrace trace = ctx.Trace;
+        int stage = trace != null ? trace.Begin("dispatch_gate") : -1;
+        try {
+            if (!this.GateCheckPrefix(ctx, route, keepAlive)) { return false; }
+            if (route.NeedsAuth()) {
+                if (!await this.Allow(ctx.Uid(), route.Action())) {
+                    this.WriteError(ctx, 403, "Forbidden", "403", "insufficient permission", keepAlive);
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, WebApp.RequestFailureCode(failure)); }
+            this.ApplyRequestFailure(ctx, failure);
+        } finally {
+            if (trace != null) { trace.End(stage); }
+        }
+        ctx.BuildResponseDirect(keepAlive);
+        return false;
+    }
+
+    private bool ApplyRequestFailure(HttpContext ctx, Exception failure) {
+        bool logged = false;
+        if (failure is ApiError) {
+            ApiError error = (ApiError)failure;
+            if (error.Status() >= 500) {
+                this.metrics.RecordError((long)WebApp.NowSeconds(),
+                    ctx.Method() + " " + ctx.Path(), WebApp.Redact(error.Message));
+                logged = true;
+            }
+            if (ctx.ResetFailedResponse()) {
+                ctx.Status(error.Status(), ApiError.Reason(error.Status()));
+                ctx.Api(error.Code(), error.Message, "null");
+            }
+        } else {
+            string detail = WebApp.Redact(failure.Message);
+            try { Console.WriteLine("[WebApp ERROR] " + ctx.Method() + " " + ctx.Path() + ": " + detail); }
+            catch (Exception logFailure) { }
+            this.metrics.RecordError((long)WebApp.NowSeconds(),
+                ctx.Method() + " " + ctx.Path(), detail);
+            logged = true;
+            if (ctx.ResetFailedResponse()) {
+                ctx.Status(500, "Internal Server Error");
+                ctx.Json(this.ErrorBody(500, "500", "internal server error"));
+            }
+        }
+        return logged;
+    }
+
+    private bool WantsPage(HttpContext ctx) {
+        if (this.loginPath.Length == 0) { return false; }
+        string path = ctx.Path();
+        if (this.IsApiPath(path)) { return false; }
+        if (ctx.Method() != "GET") { return false; }
+        if (ctx.Header("HX-Request").Length > 0) { return false; }
+        if (ctx.Header("X-Requested-With").Length > 0) { return false; }
+        if (ctx.Header("X-Fragment").Length > 0) { return false; }
+        return !ctx.Header("Accept").Contains("application/json");
+    }
+
+    public async bool Allow(string uid, string action) {
+        return await this.Allow(uid, action, null);
+    }
+
+    internal async bool Allow(string uid, string action, object scope) {
+        if (this.scopedPermissionResolver != null) {
+            return await this.scopedPermissionResolver(uid, action, scope);
+        }
+        if (this.permissionResolver != null) {
+            return await this.permissionResolver(uid, action);
+        }
+        return uid.Length > 0;
+    }
+
+    private bool TryAuthUserSync(HttpContext ctx, out string uid) {
+        if (this.authHeader.Length > 0) {
+            string auth = ctx.Header(this.authHeader);
+            if (auth != null && auth.Length > 0
+                && (this.authScheme.Length == 0 || auth.StartsWith(this.authScheme))) {
+                if (this.authResolver != null) { uid = ""; return false; }
+                string token = this.authScheme.Length > 0
+                    ? auth.Substring(this.authScheme.Length)
+                    : auth;
+                uid = this.sessionStorage != null
+                    ? this.sessionStorage.UserOf(token, 0)
+                    : this.sessions.UserOf(token);
+                return true;
+            }
+        }
+        if (this.sessionCookie.Length > 0) {
+            string cookie = ctx.Cookie(this.sessionCookie);
+            if (cookie.Length > 0) {
+                if (this.authResolver != null) { uid = ""; return false; }
+                uid = this.sessionStorage != null
+                    ? this.sessionStorage.UserOf(cookie, 0)
+                    : this.sessions.UserOf(cookie);
+                return true;
+            }
+        }
+        uid = "";
+        return true;
+    }
+
+    private async string AuthUser(HttpContext ctx) {
+        if (this.authHeader.Length > 0) {
+            string auth = ctx.Header(this.authHeader);
+            if (auth != null && auth.Length > 0
+                && (this.authScheme.Length == 0 || auth.StartsWith(this.authScheme))) {
+                string token = this.authScheme.Length > 0
+                    ? auth.Substring(this.authScheme.Length)
+                    : auth;
+                if (this.authResolver != null) { return await this.authResolver(token); }
+                if (this.sessionStorage != null) { return this.sessionStorage.UserOf(token, 0); }
+                return this.sessions.UserOf(token);
+            }
+        }
+        if (this.sessionCookie.Length > 0) {
+            string cookie = ctx.Cookie(this.sessionCookie);
+            if (cookie.Length > 0) {
+                if (this.authResolver != null) { return await this.authResolver(cookie); }
+                if (this.sessionStorage != null) { return this.sessionStorage.UserOf(cookie, 0); }
+                return this.sessions.UserOf(cookie);
+            }
+        }
+        return "";
+    }
+}

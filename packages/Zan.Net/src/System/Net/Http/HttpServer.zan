@@ -366,7 +366,8 @@ public class HttpServer : IDisposable {
                                   int maxHeaderBytes, int maxRequestBytes,
                                   int timeoutMs, HttpDeadlineToken watch,
                                   TcpClient client) {
-        Http1Writer writer = new Http1Writer(client.SendViewAsync);
+        client.EnsureNonBlocking();
+        Http1Writer writer = new Http1Writer(client.SendViewAsync, 0, clientSock);
         return await HttpServer.ServeHttp1Session(handler, framer, writer,
             maxHeaderBytes, maxRequestBytes, timeoutMs, watch,
             "<h1>Zan HTTP Server</h1><p>Register a handler with OnRequest.</p>");
@@ -380,14 +381,17 @@ public class HttpServer : IDisposable {
         int reject = 0;
         while (true) {
             HttpDeadline.Touch(watch, timeoutMs);
-            int headerEnd = await framer.ReadHead(maxHeaderBytes);
+            int headerEnd;
+            if (!framer.TryReadHeadSync(maxHeaderBytes, false, out headerEnd)) {
+                headerEnd = await framer.ReadHeadContinue(maxHeaderBytes);
+            }
             if (Worker.IsDebug()) {
                 Worker.Dbg("http readHead=" + Convert.ToString(headerEnd));
             }
             if (headerEnd == -431) { reject = 431; break; }
             if (headerEnd <= 0) { break; }
 
-            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd), headerEnd);
+            HttpRequest request = HttpRequest.ParseView(framer.HeadView(headerEnd));
             if (Worker.IsDebug()) {
                 Worker.Dbg("http parsed " + request.method + " " + request.path
                     + " status=" + Convert.ToString(request.parseStatus));
@@ -479,7 +483,11 @@ public class HttpServer : IDisposable {
             if (omitBody || binary || response.framingChunked) { response.WriteHeadersTo(sb); }
             else { response.WriteTo(sb); }
             StringView wire = sb.AsView();
-            int sent = await writer.SendViewAsync(wire);
+            int sent;
+            if (!writer.TrySendViewSync(wire, out sent)) {
+                int rem = await writer.SendViewAsync(wire.Slice(sent, wire.length - sent));
+                sent = sent + rem;
+            }
             if (sent != wire.length) { return false; }
         } finally {
             HttpBufferPool.Return(sb);

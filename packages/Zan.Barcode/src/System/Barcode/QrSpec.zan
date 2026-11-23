@@ -3,13 +3,8 @@ using System.Collections.Generic;
 
 namespace System.Barcode;
 
-// QR 规格层（ISO/IEC 18004）：版本表 / 纠错分块 / 对齐图形 / 功能图形地图 /
-// GF(256) 算术 / Reed-Solomon 编码。
-//
-// **为什么单独这一层**：编码器与解码器必须对"哪些模块是功能图形""数据码字
-// 怎么分块、怎么交织"有**逐位一致**的理解。两边各写一份，迟早对不上——而
-// 对不上的症状是"解出来是乱码"，极难定位。所以这份规格只有一份，编解码共用：
-// `FunctionMap` 同时喂给编码器（放数据时跳过）和解码器（取数据时跳过）。
+// QR 规格层（ISO/IEC 18004）：版本表、纠错分块、对齐图形、FunctionMap、GF(256) 与 RS 编码。
+// 编码器与解码器共用本层规格与 FunctionMap，保证功能模块判定与分块交织逐位一致。
 public class QrSpec {
 
     // ---- 版本表（ISO 18004 Table 13-22 / E.1） ---------------------------
@@ -146,23 +141,17 @@ public class QrSpec {
 
     // ---- 功能图形地图 -------------------------------------------------------
 
-    // 功能图形（不可放数据、不可掩码）地图：true = 功能模块。
-    //
-    // **编解码共用这一张图**——编码时"跳过它"、解码时"同样跳过它"，只要有一
-    // 处不一致，解出来的就是乱码而不是报错。
-    //
-    // 覆盖：三个定位图形及其分隔带、定时图形、校正图形、版本信息区、格式信
-    // 息区、以及那个固定深色模块。定位/校正图形按"Nayuki 的 dist != 2 && dist
-    // != 4"画法，越界部分丢弃。
+    // 功能图形（不可放数据/掩码）地图：true = 功能模块，编解码共用同一份实现。
+    // 覆盖三个定位图形及分隔带、定时/校正图形、版本/格式信息区与固定深色模块。
     public static bool[] FunctionMap(int ver) {
         int size = ver * 4 + 17;
         bool[] fn = new bool[size * size];
         for (int i = 0; i < size * size; i = i + 1) { fn[i] = false; }
 
         // 定位图形（连同分隔带一起算功能区）。
-        QrSpec.MarkFinder(fn, size, 3, 3);
-        QrSpec.MarkFinder(fn, size, size - 4, 3);
-        QrSpec.MarkFinder(fn, size, 3, size - 4);
+        QrSpec.MarkSquare(fn, size, 3, 3, 4);
+        QrSpec.MarkSquare(fn, size, size - 4, 3, 4);
+        QrSpec.MarkSquare(fn, size, 3, size - 4, 4);
 
         // 定时图形：第 6 行与第 6 列（8 .. size-9）。
         for (int i = 8; i <= size - 9; i = i + 1) {
@@ -179,7 +168,7 @@ public class QrSpec {
                     || (r == 0 && c == n - 1)
                     || (r == n - 1 && c == 0);
                 if (!corner) {
-                    QrSpec.MarkAlign(fn, size, pos[c + 1], pos[r + 1]);
+                    QrSpec.MarkSquare(fn, size, pos[c + 1], pos[r + 1], 2);
                 }
             }
         }
@@ -215,19 +204,10 @@ public class QrSpec {
         fn[y * size + x] = true;
     }
 
-    // 定位图形：以 (cx,cy) 为中心的 7x7 环 + 1 模块分隔带。
-    static void MarkFinder(bool[] fn, int size, int cx, int cy) {
-        for (int dy = -4; dy <= 4; dy = dy + 1) {
-            for (int dx = -4; dx <= 4; dx = dx + 1) {
-                QrSpec.MarkFn(fn, size, cx + dx, cy + dy);
-            }
-        }
-    }
-
-    // 校正图形：以 (cx,cy) 为中心的 5x5 图案。
-    static void MarkAlign(bool[] fn, int size, int cx, int cy) {
-        for (int dy = -2; dy <= 2; dy = dy + 1) {
-            for (int dx = -2; dx <= 2; dx = dx + 1) {
+    // 以 (cx,cy) 为中心标记边长 (2*r+1) 的方形功能区（定位图形 r=4，校正图形 r=2）。
+    static void MarkSquare(bool[] fn, int size, int cx, int cy, int r) {
+        for (int dy = -r; dy <= r; dy = dy + 1) {
+            for (int dx = -r; dx <= r; dx = dx + 1) {
                 QrSpec.MarkFn(fn, size, cx + dx, cy + dy);
             }
         }
@@ -238,11 +218,7 @@ public class QrSpec {
     static int[] gfExp = null;
     static int[] gfLog = null;
 
-    // 首次调用时构建 GF(256) 的指数/对数表。
-    //
-    // 表在**局部数组里建完再整体赋值**给静态字段：并发的首次调用要么看到
-    // null（自己建一份），要么看到一张**已经建好**的表——不存在"建到一半被
-    // 另一个线程读到"的中间态。重复建表代价可忽略，结果也一样。
+    // 首次调用时在局部数组构建完 GF(256) 指数/对数表后再整体发布到静态字段，避免并发读到半初始化态。
     static void EnsureGf() {
         if (gfExp != null) { return; }
         int[] e = new int[512];
@@ -289,9 +265,7 @@ public class QrSpec {
 
     // ---- Reed-Solomon 编码 --------------------------------------------------
 
-    // RS 生成多项式（Nayuki 式）：prod (x - a^i)，i = 0..deg-1。
-    // 返回长度 deg 的数组，result[deg-1] = 1（最高次系数），升幂索引，
-    // 最高次 x^deg 的系数隐式为 1。
+    // RS 生成多项式 prod(x - a^i), i=0..deg-1；升幂索引且 result[deg-1] = 1（最高次 x^deg 隐式为 1）。
     public static int[] RsGenerator(int deg) {
         QrSpec.EnsureGf();
         int[] result = new int[deg];

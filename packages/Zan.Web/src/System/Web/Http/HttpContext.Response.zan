@@ -1,0 +1,337 @@
+using System.Json;
+using System.Net.Http;
+using System.Text;
+using System;
+
+namespace System.Web;
+
+// HttpContext 响应构建与序列化部分：状态码、Header/Cookie 注入、载荷输出及 HTTP/1.1 报文直出。
+public partial class HttpContext {
+    public void ReleaseResponseBuf() {
+        if (this.responseSb != null) {
+            HttpBufferPool.Return(this.responseSb);
+            this.responseSb = null;
+        }
+        if (this.responseBuf != null) {
+            HttpBufferPool.ReturnBytes(this.responseBuf);
+            this.responseBuf = null;
+        }
+        this.responseLen = 0;
+    }
+
+    internal StringView ResponseWireView() {
+        if (this.responseLen <= 0) { return StringView.Empty(); }
+        if (this.responseSb != null) {
+            return new StringView(this.responseSb.BufferPtr(), this.responseLen);
+        }
+        if (this.responseBuf != null) {
+            return StringView.FromBytes(this.responseBuf, 0, this.responseLen);
+        }
+        return StringView.Empty();
+    }
+
+    internal bool ResetFailedResponse() {
+        if (this.wasHijacked || this.hijacked) { return false; }
+        this.ReleaseResponseBuf();
+        this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
+        if (this.headers != null) {
+            for (int i = this.headers.Count - 1; i >= 0; i = i - 1) {
+                string header = this.headers[i].ToLower();
+                bool safe = header.StartsWith("access-control-")
+                    || header.StartsWith("vary:")
+                    || header.StartsWith("content-security-policy:")
+                    || header.StartsWith("content-security-policy-report-only:")
+                    || header.StartsWith("strict-transport-security:")
+                    || header.StartsWith("x-content-type-options:")
+                    || header.StartsWith("x-frame-options:")
+                    || header.StartsWith("referrer-policy:")
+                    || header.StartsWith("permissions-policy:")
+                    || header.StartsWith("cross-origin-");
+                if (!safe) { this.headers.RemoveAt(i); }
+            }
+        }
+        this.status = 500;
+        this.statusText = "Internal Server Error";
+        this.contentType = HttpLimits.MimeJson;
+        this.ended = false;
+        return true;
+    }
+
+    public HttpContext Status(int code, string text) {
+        this.status = code;
+        this.statusText = text;
+        return this;
+    }
+
+    private static string HeaderSafe(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10 || c == 0) { break; }
+            i = i + 1;
+        }
+        if (i == n) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int flush = 0;
+        int k = 0;
+        while (k < n) {
+            int c = s[k] & 255;
+            if (c == 13 || c == 10 || c == 0) {
+                if (k > flush) { sb.Append(s.Substring(flush, k - flush)); }
+                flush = k + 1;
+            }
+            k = k + 1;
+        }
+        if (n > flush) { sb.Append(s.Substring(flush, n - flush)); }
+        return sb.ToString();
+    }
+
+    public HttpContext SetHeader(string name, string val) {
+        if (this.headers == null) { this.headers = new List<string>(); }
+        this.headers.Add(HttpContext.HeaderSafe(name) + ": "
+            + HttpContext.HeaderSafe(val));
+        return this;
+    }
+
+    public HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
+        if (this.headers == null) { this.headers = new List<string>(); }
+        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
+            + HttpContext.HeaderSafe(val)
+            + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
+            + "; Path=/; HttpOnly; SameSite=Lax"
+            + HttpContext.SecureFlag(this));
+        return this;
+    }
+
+    public HttpContext SetCookieJs(string name, string val, int maxAgeSeconds) {
+        if (this.headers == null) { this.headers = new List<string>(); }
+        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
+            + HttpContext.HeaderSafe(val)
+            + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
+            + "; Path=/; SameSite=Lax"
+            + HttpContext.SecureFlag(this));
+        return this;
+    }
+
+    private static string SecureFlag(HttpContext ctx) {
+        if (ctx.IsSecure()) { return "; Secure"; }
+        return "";
+    }
+
+    public void Html(string html) {
+        this.contentType = HttpLimits.MimeHtmlUtf8;
+        this.body = html;
+        this.ended = true;
+    }
+
+    public void Text(string text) {
+        this.contentType = HttpLimits.MimePlainUtf8;
+        this.body = text;
+        this.ended = true;
+    }
+
+    public void Markdown(string md) {
+        this.contentType = "text/markdown; charset=utf-8";
+        this.body = md;
+        this.ended = true;
+    }
+
+    public void Xml(string xml) {
+        this.contentType = HttpLimits.MimeXmlUtf8;
+        this.body = xml;
+        this.ended = true;
+    }
+
+    public bool IsAiBot() {
+        return GeoAgent.IsAiBot(this.Header("User-Agent"));
+    }
+
+    public bool WantsMarkdown() {
+        return GeoAgent.WantsMarkdown(this);
+    }
+
+    public void Binary(string mime, byte[] data, int len) {
+        this.contentType = mime;
+        this.bodyBytes = data;
+        this.bodyBytesLen = len;
+        this.body = "";
+        this.ended = true;
+    }
+
+    public bool IsBinary() { return this.bodyBytes != null; }
+    public byte[] BodyBytes() { return this.bodyBytes; }
+    public int BodyBytesLen() { return this.bodyBytesLen; }
+    public string ResponseBody() { return this.body; }
+
+    public bool StatusForbidsBody() {
+        return (this.status >= 100 && this.status < 200)
+            || this.status == 204 || this.status == 304;
+    }
+
+    public int BodyLength() {
+        if (this.StatusForbidsBody()) { return 0; }
+        if (this.bodyBytes != null) { return this.bodyBytesLen; }
+        return this.body.Length;
+    }
+
+    public void Json(string json) {
+        this.contentType = HttpLimits.MimeJson;
+        this.body = json;
+        this.ended = true;
+    }
+
+    public void Download(string fileName, string mime, string body) {
+        if (fileName == null) { fileName = ""; }
+        int len = fileName.Length;
+        bool hasBad = false;
+        for (int j = 0; j < len; j = j + 1) {
+            int c = fileName[j] & 255;
+            if (c < 32 || c == 34 || c == 47 || c == 92 || c == 59) {
+                hasBad = true;
+                break;
+            }
+        }
+        string name = fileName;
+        if (hasBad) {
+            StringBuilder safe = new StringBuilder();
+            int start = 0;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = fileName[i] & 255;
+                if (c < 32 || c == 34 || c == 47 || c == 92 || c == 59) {
+                    if (i > start) {
+                        safe.Append(fileName.Substring(start, i - start));
+                    }
+                    start = i + 1;
+                }
+            }
+            if (start < len) {
+                safe.Append(fileName.Substring(start, len - start));
+            }
+            name = safe.ToString();
+        }
+        if (name.Length == 0) { name = "export.txt"; }
+        this.SetHeader("Content-Disposition",
+            "attachment; filename=\"" + name + "\"");
+        this.contentType = mime;
+        this.body = body;
+        this.ended = true;
+    }
+
+    public void ApiEntity<T>(string code, string msg, T data) {
+        JsonWriter writer = new JsonWriter();
+        writer.WriteStartObject();
+        writer.WriteProperty("code", code);
+        writer.WriteProperty("msg", msg);
+        writer.WritePropertyName("data");
+        writer.WriteEntity<T>(data);
+        writer.WriteEndObject();
+        this.Json(writer.ToJson());
+    }
+
+    public void Api(string code, string msg, string data) {
+        ApiEnvelope o = new ApiEnvelope();
+        o.code = code;
+        o.msg = msg;
+        JsonValue dv = JsonValue.ParseLenient(data);
+        if (dv == null) { dv = JsonValue.NewStr(data); }
+        o.data = dv;
+        this.Json(Json.Serialize<ApiEnvelope>(o));
+    }
+
+    public void Redirect(string url) {
+        this.status = 302;
+        this.statusText = "Found";
+        if (this.headers == null) { this.headers = new List<string>(); }
+        this.headers.Add("Location: " + HttpContext.HeaderSafe(url));
+        this.body = "";
+        this.ended = true;
+    }
+
+    public void BuildResponseDirect(bool keepAlive) {
+        if (this.responseSb != null || this.responseBuf != null) {
+            this.ReleaseResponseBuf();
+        }
+        RequestTrace trace = this.Trace;
+        int stage = trace != null ? trace.Begin("pack_response") : -1;
+        if (trace != null && trace.Id() > 0) { this.SetHeader("X-Zan-Request-Profile", Convert.ToString(trace.Id())); }
+        bool statusBodyless = this.StatusForbidsBody();
+        bool omitBody = this.method == "HEAD" || statusBodyless;
+        bool forbidFraming = statusBodyless && this.status != 304;
+        StringBuilder sb = HttpBufferPool.Rent();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(this.status);
+        sb.Append(" ");
+        sb.Append(this.statusText);
+        sb.Append("\r\nContent-Type: ");
+        sb.Append(this.contentType);
+        if (!statusBodyless) {
+            int blen = this.BodyLength();
+            if (blen == 0) {
+                sb.Append("\r\nContent-Length: 0");
+            } else {
+                sb.Append("\r\nContent-Length: ");
+                sb.Append(blen);
+            }
+        }
+        if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
+        else { sb.Append("\r\nConnection: close"); }
+        sb.Append("\r\nServer: Zan/1.0");
+        int hn = 0;
+        if (this.headers != null) { hn = this.headers.Count; }
+        for (int i = 0; i < hn; i = i + 1) {
+            string header = this.headers[i];
+            if (forbidFraming) {
+                int colon = header.IndexOf(":");
+                if (colon >= 0) {
+                    string name = header.Substring(0, colon).Trim();
+                    if (HttpContext.AsciiEq(name, "Content-Length")
+                        || HttpContext.AsciiEq(name, "Transfer-Encoding")) {
+                        continue;
+                    }
+                }
+            }
+            sb.Append("\r\n");
+            sb.Append(header);
+        }
+        sb.Append("\r\n\r\n");
+
+        if (this.bodyBytes != null) {
+            int headLen = sb.Length;
+            int bodyLen = omitBody ? 0 : this.BodyLength();
+            int total = headLen + bodyLen;
+            byte[] buf = HttpBufferPool.RentBytes(total);
+            NativeMemory.Copy((nint)buf, sb.BufferPtr(), headLen);
+            HttpBufferPool.Return(sb);
+            if (bodyLen > 0) {
+                NativeMemory.Copy((nint)buf + headLen, (nint)this.bodyBytes, bodyLen);
+            }
+            this.responseBuf = buf;
+            this.responseLen = total;
+        } else {
+            if (!omitBody && this.body != null && this.body.Length > 0) {
+                sb.Append(this.body);
+            }
+            this.responseSb = sb;
+            this.responseLen = sb.Length;
+        }
+        if (trace != null) { trace.End(stage); }
+    }
+
+    public string BuildResponse(bool keepAlive) {
+        this.BuildResponseDirect(keepAlive);
+        StringView wire = this.ResponseWireView();
+        if (wire.length <= 0) { return ""; }
+        int slen = wire.length;
+        if (this.bodyBytes != null && this.method != "HEAD" &&
+            !this.StatusForbidsBody()) {
+            int blen = this.BodyLength();
+            if (blen > 0 && slen > blen) { slen = slen - blen; }
+        }
+        string res = NativeMemory.GetString(wire.ptr, 0, slen);
+        this.ReleaseResponseBuf();
+        return res;
+    }
+}

@@ -40,12 +40,10 @@ public class QueryBuilder {
     }
 
     public string Quote(string ident) {
-        ident = QueryBuilder.RequireIdent(ident);
-        return Dialect.QuoteIdentifier(this.Provider(), ident);
+        return Dialect.QuoteIdentifier(this.Provider(), QueryBuilder.RequireIdent(ident));
     }
 
-    // 当 s 是安全的 SQL 标识符时返回 true：[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*
-    // （点号允许用于 schema.table 这类限定名，禁止连续点号与尾随点号）。
+    // 校验 SQL 标识符：[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*
     public static bool IsIdent(string s) {
         int n = s.Length;
         if (n == 0) { return false; }
@@ -54,310 +52,167 @@ public class QueryBuilder {
             int c = s[i] & 255;
             bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
             bool digit = c >= 48 && c <= 57;
-            bool dot = c == 46;
             if (i == 0) {
                 if (!alpha) { return false; }
-            } else {
-                if (dot) {
-                    if (prevDot || i == n - 1) { return false; }
-                    prevDot = true;
-                    continue;
-                }
-                if (!alpha && !digit) { return false; }
+            } else if (c == 46) {
+                if (prevDot || i == n - 1) { return false; }
+                prevDot = true;
+                continue;
+            } else if (!alpha && !digit) {
+                return false;
             }
             prevDot = false;
         }
         return true;
     }
 
-    // s 是安全标识符时原样返回；否则抛出异常。
     public static string RequireIdent(string s) {
-        if (!QueryBuilder.IsIdent(s)) {
-            throw new Exception("unsafe SQL identifier: " + s);
-        }
+        if (!QueryBuilder.IsIdent(s)) { throw new Exception("unsafe SQL identifier: " + s); }
         return s;
     }
 
-    // s 是安全的 DDL 类型文本时原样返回；否则抛出异常。
-    // 允许字母、数字、下划线、空格、括号、逗号、单引号与点号——足以表达
-    // 这类类型与约束表达式，而分号、注释符等批处理注入通道一律拒绝。
-    // 列类型文本会拼接进 CREATE TABLE，必须过这道检查。
+    // 校验 DDL 列类型文本，拒绝分号与注释符等注入通道。
     public static string RequireDdlType(string s) {
         int n = s.Length;
-        if (n == 0) {
-            throw new Exception("unsafe SQL column type: empty");
-        }
+        if (n == 0) { throw new Exception("unsafe SQL column type: empty"); }
         for (int i = 0; i < n; i = i + 1) {
             int c = s[i] & 255;
-            bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
-            bool digit = c >= 48 && c <= 57;
-            bool space = c == 32;
-            bool paren = c == 40 || c == 41;
-            bool comma = c == 44;
-            bool quote = c == 39;  // 单引号允许用于 DEFAULT 'literal'
-            bool dot = c == 46;  // 浮点默认值
-            if (!alpha && !digit && !space && !paren && !comma && !quote && !dot) {
-                throw new Exception("unsafe SQL column type: " + s);
-            }
+            bool ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+                || (c >= 48 && c <= 57) || c == 32 || c == 40 || c == 41
+                || c == 44 || c == 39 || c == 46;
+            if (!ok) { throw new Exception("unsafe SQL column type: " + s); }
         }
         return s;
     }
 
-    // 创建从某表 SELECT 的查询构建器。
-    public static QueryBuilder From(string table) {
-        return new QueryBuilder(table);
-    }
+    public static QueryBuilder From(string table) { return new QueryBuilder(table); }
+    public static QueryBuilder InsertInto(string table) { return new QueryBuilder(table); }
+    public static QueryBuilder Update(string table) { return new QueryBuilder(table); }
+    public static QueryBuilder DeleteFrom(string table) { return new QueryBuilder(table); }
 
-    // 创建向某表 INSERT INTO 的查询构建器。
-    public static QueryBuilder InsertInto(string table) {
-        return new QueryBuilder(table);
-    }
-
-    // 创建更新某表的查询构建器。
-    public static QueryBuilder Update(string table) {
-        return new QueryBuilder(table);
-    }
-
-    // 创建从某表 DELETE 的查询构建器。
-    public static QueryBuilder DeleteFrom(string table) {
-        return new QueryBuilder(table);
-    }
-
-    // 添加 WHERE 子句。
     public QueryBuilder Where(string condition) {
-        if (this.whereClause.Length == 0) {
-            this.whereClause = condition;
-        } else {
-            this.whereClause = this.whereClause + " AND " + condition;
-        }
+        this.whereClause = this.whereClause.Length == 0
+            ? condition
+            : this.whereClause + " AND " + condition;
         return this;
     }
 
-    // 添加 OR WHERE 子句。
     public QueryBuilder OrWhere(string condition) {
-        if (this.whereClause.Length == 0) {
-            this.whereClause = condition;
-        } else {
-            this.whereClause = this.whereClause + " OR " + condition;
-        }
+        this.whereClause = this.whereClause.Length == 0
+            ? condition
+            : this.whereClause + " OR " + condition;
         return this;
     }
 
-    // 添加 `column = ?`，值作为绑定参数传递
-    // （防 SQL 注入：值永远不会进入 SQL 文本）。
-    public QueryBuilder WhereEq(string column, string val) {
+    private QueryBuilder AppendCmpStr(string column, string op, string val) {
         this.whereParams.Add(val);
-        return Where(this.Quote(column) + " = ?");
+        return this.Where(this.Quote(column) + op);
     }
 
-    // 添加 `column = ?`，使用整数参数。
-    public QueryBuilder WhereEqInt(string column, int val) {
+    private QueryBuilder AppendCmpInt(string column, string op, int val) {
         this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " = ?");
+        return this.Where(this.Quote(column) + op);
     }
 
-    // 添加 `column = ?`，使用 64 位整数参数。
-    public QueryBuilder WhereEqLong(string column, long val) {
+    private QueryBuilder AppendCmpLong(string column, string op, long val) {
         this.whereParams.AddLong(val);
-        return Where(this.Quote(column) + " = ?");
+        return this.Where(this.Quote(column) + op);
     }
 
-    // 添加 `column >= ?`，使用 64 位整数参数。
-    public QueryBuilder WhereGeLong(string column, long val) {
-        this.whereParams.AddLong(val);
-        return Where(this.Quote(column) + " >= ?");
-    }
+    public QueryBuilder WhereEq(string column, string val) { return this.AppendCmpStr(column, " = ?", val); }
+    public QueryBuilder WhereEqInt(string column, int val) { return this.AppendCmpInt(column, " = ?", val); }
+    public QueryBuilder WhereEqLong(string column, long val) { return this.AppendCmpLong(column, " = ?", val); }
+    public QueryBuilder WhereGeLong(string column, long val) { return this.AppendCmpLong(column, " >= ?", val); }
+    public QueryBuilder WhereLeLong(string column, long val) { return this.AppendCmpLong(column, " <= ?", val); }
 
-    // 添加 `column <= ?`，使用 64 位整数参数。
-    public QueryBuilder WhereLeLong(string column, long val) {
-        this.whereParams.AddLong(val);
-        return Where(this.Quote(column) + " <= ?");
-    }
-
-    // 添加 `column = ?`，值按 DbValues 里声明的类型绑定
-    // （运行期成形的条件：提交的筛选表单、解析出的 JSON）。
     public QueryBuilder WhereValueAt(DbValues vals, int i) {
         vals.BindTo(this.whereParams, i);
-        return Where(this.Quote(vals.NameAt(i)) + " = ?");
+        return this.Where(this.Quote(vals.NameAt(i)) + " = ?");
     }
 
-    // 添加 WHERE column IN (?, ?, ...)，使用绑定参数。
+    private string FormatInClause(string column, string op, int count) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(this.Quote(column));
+        sb.Append(op);
+        for (int i = 0; i < count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append("?");
+        }
+        if (count == 0) { sb.Append("NULL"); }
+        sb.Append(")");
+        return sb.ToString();
+    }
+
     public QueryBuilder WhereIn(string column, List<string> values) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.Quote(column));
-        sb.Append(" IN (");
-        int n = values.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.whereParams.Add(values[i]);
-        }
-        if (n == 0) { sb.Append("NULL"); }
-        sb.Append(")");
-        return Where(sb.ToString());
+        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.Add(values[i]); }
+        return this.Where(this.FormatInClause(column, " IN (", values.Count));
     }
 
-    // 添加 WHERE column IN (?, ?, ...)，使用整数参数；
-    // 空列表按恒假处理（`IN (NULL)`），不生成 `IN ()`。
+    // 空列表生成 IN (NULL) 恒假；避免非法 IN ()。
     public QueryBuilder WhereInInts(string column, List<int> values) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.Quote(column));
-        sb.Append(" IN (");
-        int n = values.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.whereParams.AddInt(values[i]);
-        }
-        if (n == 0) { sb.Append("NULL"); }
-        sb.Append(")");
-        return Where(sb.ToString());
+        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.AddInt(values[i]); }
+        return this.Where(this.FormatInClause(column, " IN (", values.Count));
     }
 
-    // 添加 WHERE column IN (?, ?, ...)，使用 64 位整数参数；
-    // 空列表按恒假处理（`IN (NULL)`），不生成 `IN ()`。
     public QueryBuilder WhereInLongs(string column, List<long> values) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.Quote(column));
-        sb.Append(" IN (");
-        int n = values.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.whereParams.AddLong(values[i]);
-        }
-        if (n == 0) { sb.Append("NULL"); }
-        sb.Append(")");
-        return Where(sb.ToString());
+        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.AddLong(values[i]); }
+        return this.Where(this.FormatInClause(column, " IN (", values.Count));
     }
 
-    // 添加 WHERE column NOT IN (?, ?, ...)，使用绑定参数。
     public QueryBuilder WhereNotIn(string column, List<string> values) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.Quote(column));
-        sb.Append(" NOT IN (");
-        int n = values.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
-            this.whereParams.Add(values[i]);
-        }
-        sb.Append(")");
-        return Where(sb.ToString());
+        if (values.Count == 0) { return this; }
+        for (int i = 0; i < values.Count; i = i + 1) { this.whereParams.Add(values[i]); }
+        return this.Where(this.FormatInClause(column, " NOT IN (", values.Count));
     }
 
-    // 添加 WHERE column LIKE ?，使用绑定参数。
-    public QueryBuilder WhereLike(string column, string pattern) {
-        this.whereParams.Add(pattern);
-        return Where(this.Quote(column) + " LIKE ?");
-    }
+    public QueryBuilder WhereLike(string column, string pattern) { return this.AppendCmpStr(column, " LIKE ?", pattern); }
+    public QueryBuilder WhereNotLike(string column, string pattern) { return this.AppendCmpStr(column, " NOT LIKE ?", pattern); }
+    public QueryBuilder WhereContains(string column, string val) { return this.WhereLike(column, "%" + val + "%"); }
+    public QueryBuilder WhereStartsWith(string column, string val) { return this.WhereLike(column, val + "%"); }
+    public QueryBuilder WhereEndsWith(string column, string val) { return this.WhereLike(column, "%" + val); }
 
-    // 添加 WHERE column NOT LIKE ?，使用绑定参数。
-    public QueryBuilder WhereNotLike(string column, string pattern) {
-        this.whereParams.Add(pattern);
-        return Where(this.Quote(column) + " NOT LIKE ?");
-    }
-
-    // 添加 `column LIKE %value%`（子串匹配，已绑定）。
-    public QueryBuilder WhereContains(string column, string val) {
-        return WhereLike(column, "%" + val + "%");
-    }
-
-    // 添加 `column LIKE value%`（前缀匹配，已绑定）。
-    public QueryBuilder WhereStartsWith(string column, string val) {
-        return WhereLike(column, val + "%");
-    }
-
-    // 添加 `column LIKE %value`（后缀匹配，已绑定）。
-    public QueryBuilder WhereEndsWith(string column, string val) {
-        return WhereLike(column, "%" + val);
-    }
-
-    // 添加 `(col1 LIKE ? OR col2 LIKE ? OR ...)`，单个关键字
-    // 绑定到每一列（子串匹配）。整个组是一个 WHERE
-    // 操作数，因此可与 AND 组合为 `... AND (a LIKE ? OR b LIKE ?)`。
-    // 空列列表时不做任何操作；值始终绑定，绝不内联。
     public QueryBuilder WhereAnyLike(List<string> columns, string val) {
         int n = columns.Count;
         if (n == 0) { return this; }
         StringBuilder sb = new StringBuilder();
         sb.Append("(");
+        string pat = "%" + val + "%";
         for (int i = 0; i < n; i = i + 1) {
             if (i > 0) { sb.Append(" OR "); }
             sb.Append(this.Quote(columns[i]));
             sb.Append(" LIKE ?");
-            this.whereParams.Add("%" + val + "%");
+            this.whereParams.Add(pat);
         }
         sb.Append(")");
-        return Where(sb.ToString());
+        return this.Where(sb.ToString());
     }
 
-    // 添加 `column <> ?`，使用绑定参数。
-    public QueryBuilder WhereNe(string column, string val) {
-        this.whereParams.Add(val);
-        return Where(this.Quote(column) + " <> ?");
-    }
+    public QueryBuilder WhereNe(string column, string val) { return this.AppendCmpStr(column, " <> ?", val); }
+    public QueryBuilder WhereNeInt(string column, int val) { return this.AppendCmpInt(column, " <> ?", val); }
+    public QueryBuilder WhereGtInt(string column, int val) { return this.AppendCmpInt(column, " > ?", val); }
+    public QueryBuilder WhereGeInt(string column, int val) { return this.AppendCmpInt(column, " >= ?", val); }
+    public QueryBuilder WhereLtInt(string column, int val) { return this.AppendCmpInt(column, " < ?", val); }
+    public QueryBuilder WhereLeInt(string column, int val) { return this.AppendCmpInt(column, " <= ?", val); }
 
-    // 添加 `column <> ?`，使用整数参数。
-    public QueryBuilder WhereNeInt(string column, int val) {
-        this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " <> ?");
-    }
-
-    // 添加 `column > ?`，使用整数参数。
-    public QueryBuilder WhereGtInt(string column, int val) {
-        this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " > ?");
-    }
-
-    // 添加 `column >= ?`，使用整数参数。
-    public QueryBuilder WhereGeInt(string column, int val) {
-        this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " >= ?");
-    }
-
-    // 添加 `column < ?`，使用整数参数。
-    public QueryBuilder WhereLtInt(string column, int val) {
-        this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " < ?");
-    }
-
-    // 添加 `column <= ?`，使用整数参数。
-    public QueryBuilder WhereLeInt(string column, int val) {
-        this.whereParams.AddInt(val);
-        return Where(this.Quote(column) + " <= ?");
-    }
-
-    // 添加 WHERE column BETWEEN ? AND ?，使用绑定参数。
     public QueryBuilder WhereBetween(string column, string low, string high) {
         this.whereParams.Add(low);
         this.whereParams.Add(high);
-        return Where(this.Quote(column) + " BETWEEN ? AND ?");
+        return this.Where(this.Quote(column) + " BETWEEN ? AND ?");
     }
 
-    // 添加 WHERE IS NULL 子句。
-    public QueryBuilder WhereNull(string column) {
-        return Where(this.Quote(column) + " IS NULL");
-    }
+    public QueryBuilder WhereNull(string column) { return this.Where(this.Quote(column) + " IS NULL"); }
+    public QueryBuilder WhereNotNull(string column) { return this.Where(this.Quote(column) + " IS NOT NULL"); }
 
-    // 添加 WHERE IS NOT NULL 子句。
-    public QueryBuilder WhereNotNull(string column) {
-        return Where(this.Quote(column) + " IS NOT NULL");
-    }
-
-    // 设置 ORDER BY 子句（列名已做标识符校验）。
     public QueryBuilder OrderBy(string column) {
         this.orderByClause = QueryBuilder.RequireIdent(column);
         return this;
     }
 
-    // 设置 ORDER BY DESC 子句（列名已做标识符校验）。
     public QueryBuilder OrderByDesc(string column) {
         this.orderByClause = QueryBuilder.RequireIdent(column) + " DESC";
         return this;
     }
 
-    // 列名必须精确命中调用方提供的白名单；未命中抛异常。
     public static void CheckAllowed(string column, List<string> allowed) {
         if (allowed != null) {
             for (int i = 0; i < allowed.Count; i = i + 1) {
@@ -367,156 +222,71 @@ public class QueryBuilder {
         throw new Exception("column not in allowed list: " + column);
     }
 
-    // 白名单版 ORDER BY：列名必须命中 allowed（精确匹配）
-    // 且是安全标识符，否则抛异常。RequireIdent 挡住注入语法，但挡不住
-    // "合法但未授权"的列——排序既能被攻击者当布尔预言机（按保密列
-    // 排序观察顺序差），也能放大误差泄密；ORDER BY 无法参数化，可能
-    // 来自用户输入（?sort=）的排序列必须持单。
+    // 排序列无法参数化：来自用户输入的列必须经白名单校验以防布尔预言机泄密。
     public QueryBuilder OrderBySafe(string column, List<string> allowed) {
         QueryBuilder.CheckAllowed(column, allowed);
-        this.orderByClause = QueryBuilder.RequireIdent(column);
-        return this;
+        return this.OrderBy(column);
     }
 
-    // 白名单版 ORDER BY DESC。
     public QueryBuilder OrderBySafeDesc(string column, List<string> allowed) {
         QueryBuilder.CheckAllowed(column, allowed);
-        this.orderByClause = QueryBuilder.RequireIdent(column) + " DESC";
-        return this;
+        return this.OrderByDesc(column);
     }
 
-    // 设置 GROUP BY 子句（列名已做标识符校验）。
     public QueryBuilder GroupBy(string column) {
         this.groupByClause = QueryBuilder.RequireIdent(column);
         return this;
     }
 
-    // 设置 HAVING 子句。
     public QueryBuilder Having(string condition) {
         this.havingClause = condition;
         return this;
     }
 
-    // 添加 JOIN 子句。表名经过标识符校验；
-    // `on` 是自由条件表达式，引用外部输入时须自行参数化。
-    public QueryBuilder Join(string table, string on) {
-        this.joinClause = this.joinClause + " JOIN "
-            + QueryBuilder.RequireIdent(table) + " ON " + on;
+    private QueryBuilder AddJoin(string keyword, string table, string on) {
+        this.joinClause = this.joinClause + keyword + QueryBuilder.RequireIdent(table) + " ON " + on;
         return this;
     }
 
-    // 添加 LEFT JOIN 子句。表名经过标识符校验。
-    public QueryBuilder LeftJoin(string table, string on) {
-        this.joinClause = this.joinClause + " LEFT JOIN "
-            + QueryBuilder.RequireIdent(table) + " ON " + on;
-        return this;
-    }
+    public QueryBuilder Join(string table, string on) { return this.AddJoin(" JOIN ", table, on); }
+    public QueryBuilder LeftJoin(string table, string on) { return this.AddJoin(" LEFT JOIN ", table, on); }
+    public QueryBuilder RightJoin(string table, string on) { return this.AddJoin(" RIGHT JOIN ", table, on); }
 
-    // 添加 RIGHT JOIN 子句。表名经过标识符校验。
-    public QueryBuilder RightJoin(string table, string on) {
-        this.joinClause = this.joinClause + " RIGHT JOIN "
-            + QueryBuilder.RequireIdent(table) + " ON " + on;
-        return this;
-    }
+    public QueryBuilder Limit(int count) { this.limitVal = count; return this; }
+    public QueryBuilder Offset(int count) { this.offsetVal = count; return this; }
+    public QueryBuilder Dialect(int d) { this.dialect = d; return this; }
+    public QueryBuilder Distinct() { this.distinct = true; return this; }
 
-    // 设置 LIMIT。
-    public QueryBuilder Limit(int count) {
-        this.limitVal = count;
-        return this;
-    }
-
-    // 设置 OFFSET。
-    public QueryBuilder Offset(int count) {
-        this.offsetVal = count;
-        return this;
-    }
-
-    // 选择 SQL 分页方言（参见 SqlDialect）。
-    public QueryBuilder Dialect(int d) {
-        this.dialect = d;
-        return this;
-    }
-
-    // 设置 DISTINCT 标志。
-    public QueryBuilder Distinct() {
-        this.distinct = true;
-        return this;
-    }
-
-    // 为 INSERT/UPDATE 设置 column=value 对。
     public QueryBuilder Set(string column, string val) {
         this.sets.Add(new SetClause(QueryBuilder.RequireIdent(column), val));
         return this;
     }
 
-    // 声明一个 column = ? 赋值，值由调用方自己绑定
-    // （运行期成形的列：DbValues 按它记录的类型绑定，值不必
-    // 先变成字符串）。与 BuildInsertParams / BuildUpdateParams
-    // 搭配使用，绑定顺序即声明顺序。
-    public QueryBuilder SetParam(string column) {
-        this.sets.Add(new SetClause(QueryBuilder.RequireIdent(column), ""));
-        return this;
-    }
+    public QueryBuilder SetParam(string column) { return this.Set(column, ""); }
+    public QueryBuilder SetInt(string column, int val) { return this.Set(column, Convert.ToString(val)); }
 
-    // 设置整数形式的 column=value 对。
-    public QueryBuilder SetInt(string column, int val) {
-        this.sets.Add(new SetClause(QueryBuilder.RequireIdent(column), Convert.ToString(val)));
-        return this;
-    }
-
-    // ===== 参数化构建器（推荐） =====
-    // SQL 文本只包含 `?` 占位符；调用对应的 *Params()
-    // 访问器，将两者一起传给支持参数化的驱动重载，例如
-    // db.Query(qb.BuildSelectParams("*"), qb.SelectParams())
-
-    // 把 JOIN/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT/OFFSET
-    // 子句追加到 sb（占位符原样保留，参数由调用方随 SQL 一起传）。
     public void AppendClauses(StringBuilder sb) {
-        if (this.joinClause.Length > 0) {
-            sb.Append(this.joinClause);
-        }
-        if (this.whereClause.Length > 0) {
-            sb.Append(" WHERE ");
-            sb.Append(this.whereClause);
-        }
-        if (this.groupByClause.Length > 0) {
-            sb.Append(" GROUP BY ");
-            sb.Append(this.groupByClause);
-        }
-        if (this.havingClause.Length > 0) {
-            sb.Append(" HAVING ");
-            sb.Append(this.havingClause);
-        }
-        if (this.orderByClause.Length > 0) {
-            sb.Append(" ORDER BY ");
-            sb.Append(this.orderByClause);
-        }
+        if (this.joinClause.Length > 0) { sb.Append(this.joinClause); }
+        if (this.whereClause.Length > 0) { sb.Append(" WHERE "); sb.Append(this.whereClause); }
+        if (this.groupByClause.Length > 0) { sb.Append(" GROUP BY "); sb.Append(this.groupByClause); }
+        if (this.havingClause.Length > 0) { sb.Append(" HAVING "); sb.Append(this.havingClause); }
+        if (this.orderByClause.Length > 0) { sb.Append(" ORDER BY "); sb.Append(this.orderByClause); }
         if (this.dialect == SqlDialect.Standard) {
+            if (this.limitVal >= 0) { sb.Append(" LIMIT "); sb.Append(Convert.ToString(this.limitVal)); }
+            if (this.offsetVal >= 0) { sb.Append(" OFFSET "); sb.Append(Convert.ToString(this.offsetVal)); }
+        } else if (this.offsetVal >= 0 || this.limitVal >= 0) {
+            int off = this.offsetVal < 0 ? 0 : this.offsetVal;
+            sb.Append(" OFFSET ");
+            sb.Append(Convert.ToString(off));
+            sb.Append(" ROWS");
             if (this.limitVal >= 0) {
-                sb.Append(" LIMIT ");
+                sb.Append(" FETCH NEXT ");
                 sb.Append(Convert.ToString(this.limitVal));
-            }
-            if (this.offsetVal >= 0) {
-                sb.Append(" OFFSET ");
-                sb.Append(Convert.ToString(this.offsetVal));
-            }
-        } else {
-            if (this.offsetVal >= 0 || this.limitVal >= 0) {
-                int off = this.offsetVal;
-                if (off < 0) { off = 0; }
-                sb.Append(" OFFSET ");
-                sb.Append(Convert.ToString(off));
-                sb.Append(" ROWS");
-                if (this.limitVal >= 0) {
-                    sb.Append(" FETCH NEXT ");
-                    sb.Append(Convert.ToString(this.limitVal));
-                    sb.Append(" ROWS ONLY");
-                }
+                sb.Append(" ROWS ONLY");
             }
         }
     }
 
-    // 构建带 `?` 占位符的 SELECT（参见 SelectParams()）。
     public string BuildSelectParams(string columns) {
         StringBuilder sb = new StringBuilder();
         sb.Append("SELECT ");
@@ -524,57 +294,44 @@ public class QueryBuilder {
         sb.Append(columns);
         sb.Append(" FROM ");
         sb.Append(this.Quote(this.tableName));
-        AppendClauses(sb);
+        this.AppendClauses(sb);
         return sb.ToString();
     }
 
-    // BuildSelectParams / BuildDeleteParams 的参数。
-    public DbParams SelectParams() {
-        return this.whereParams;
-    }
+    public DbParams SelectParams() { return this.whereParams; }
 
-    // 构建带 `?` 占位符的 INSERT（参见 InsertParams()）。
     public string BuildInsertParams() {
         StringBuilder sb = new StringBuilder();
+        StringBuilder vals = new StringBuilder();
         sb.Append("INSERT INTO ");
         sb.Append(this.Quote(this.tableName));
         sb.Append(" (");
-        bool first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append(this.Quote(s.column));
-            first = false;
+        for (int i = 0; i < this.sets.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); vals.Append(", "); }
+            sb.Append(this.Quote(this.sets[i].column));
+            vals.Append("?");
         }
         sb.Append(") VALUES (");
-        first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append("?");
-            first = false;
-        }
+        sb.Append(vals.ToString());
         sb.Append(")");
         return sb.ToString();
     }
 
-    // BuildInsertParams 的参数（按顺序排列的 Set 值）。
     public DbParams InsertParams() {
         DbParams p = new DbParams();
         foreach (SetClause s in this.sets) { p.Add(s.val); }
         return p;
     }
 
-    // 构建带 `?` 占位符的 UPDATE（参见 UpdateParams()）。
     public string BuildUpdateParams() {
         StringBuilder sb = new StringBuilder();
         sb.Append("UPDATE ");
         sb.Append(this.Quote(this.tableName));
         sb.Append(" SET ");
-        bool first = true;
-        foreach (SetClause s in this.sets) {
-            if (!first) { sb.Append(", "); }
-            sb.Append(this.Quote(s.column));
+        for (int i = 0; i < this.sets.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(this.Quote(this.sets[i].column));
             sb.Append(" = ?");
-            first = false;
         }
         if (this.whereClause.Length > 0) {
             sb.Append(" WHERE ");
@@ -583,7 +340,6 @@ public class QueryBuilder {
         return sb.ToString();
     }
 
-    // BuildUpdateParams 的参数（先是 Set 值，再是 WHERE 值）。
     public DbParams UpdateParams() {
         DbParams p = new DbParams();
         foreach (SetClause s in this.sets) { p.Add(s.val); }
@@ -598,7 +354,6 @@ public class QueryBuilder {
         return p;
     }
 
-    // 构建带 `?` 占位符的 DELETE（参见 SelectParams()）。
     public string BuildDeleteParams() {
         StringBuilder sb = new StringBuilder();
         sb.Append("DELETE FROM ");
@@ -610,14 +365,10 @@ public class QueryBuilder {
         return sb.ToString();
     }
 
-    // DDL 字面量转义（单引号加倍）。只允许用于
-    // CREATE TABLE 的 DEFAULT 子句这类无法参数化的位置——
-    // 所有 DML 一律走 `?` + DbParams 驱动级绑定，
-    // 不要用本方法拼接查询值。
+    // 仅用于无法参数化的 DDL DEFAULT 字面量；DML 一律走 `?` 参数绑定。
     public static string EscapeDdlLiteral(string val) {
         if (val == null || val.Length == 0) { return ""; }
         if (val.IndexOf("'") < 0) { return val; }
         return val.Replace("'", "''");
     }
-
 }

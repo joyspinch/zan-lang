@@ -24,6 +24,19 @@
     }
   }
 
+  function syncToggles() {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    var loose = root.getAttribute('data-density') === 'comfortable';
+    var tBtns = document.querySelectorAll('[data-theme-toggle]');
+    for (var i = 0; i < tBtns.length; i++) {
+      tBtns[i].setAttribute('aria-pressed', dark ? 'true' : 'false');
+    }
+    var dBtns = document.querySelectorAll('[data-density-toggle]');
+    for (var j = 0; j < dBtns.length; j++) {
+      dBtns[j].setAttribute('aria-pressed', loose ? 'true' : 'false');
+    }
+  }
+
   var picked = stored();
   apply(picked || (prefersDark() ? 'dark' : 'light'), false);
 
@@ -34,6 +47,12 @@
     }
   } catch (e) { /* 隐私模式：用默认紧凑 */ }
 
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', syncToggles);
+  } else {
+    syncToggles();
+  }
+
   document.addEventListener('click', function (ev) {
     var dbtn = ev.target.closest ? ev.target.closest('[data-density-toggle]') : null;
     if (dbtn) {
@@ -41,20 +60,21 @@
       if (loose) { root.removeAttribute('data-density'); }
       else { root.setAttribute('data-density', 'comfortable'); }
       try { localStorage.setItem(DENSITY_KEY, loose ? 'compact' : 'comfortable'); } catch (e) { }
-      dbtn.setAttribute('aria-pressed', loose ? 'false' : 'true');
+      syncToggles();
       return;
     }
     var btn = ev.target.closest ? ev.target.closest('[data-theme-toggle]') : null;
     if (!btn) { return; }
     var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
     apply(next, true);
-    btn.setAttribute('aria-pressed', next === 'dark' ? 'true' : 'false');
+    syncToggles();
   });
 
   try {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function (e) {
       if (stored()) { return; }
       apply(e.matches ? 'dark' : 'light', false);
+      syncToggles();
     });
   } catch (e) { /* 老浏览器没有 addEventListener：只认首次偏好 */ }
 })();

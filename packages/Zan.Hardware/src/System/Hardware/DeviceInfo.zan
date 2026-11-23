@@ -1,43 +1,218 @@
 using System;
-using Gui.Backend;
+using System.IO;
+using System.Management;
 
 namespace System.Hardware;
 
 // 设备硬件标识与运行环境标定（DeviceInfo）：
 // 提供设备型号、品牌厂商、操作系统版本以及形态（折叠屏/平板/手机）的轻量查询。
-// 用于崩溃上报、特定机型 UI 微调与设备行为分流。
+// 在桌面与服务端环境下直接无头读取 OS/SMBIOS 信息，不依赖任何 GUI 后端；
+// 若上层已注册 HardwareHost，则优先通过宿主读取（适用于移动端容器）。
 public class DeviceInfo {
-    // 设备型号（例如 "HUAWEI Mate XT", "Pixel 8 Pro", "iPhone15,2", "PC Desktop"）
+    static bool hasMock;
+    static string mockModel;
+    static string mockManufacturer;
+    static string mockPlatform;
+    static string mockOSVersion;
+    static bool mockIsFoldable;
+
+    // 设备型号（例如 "HUAWEI Mate XT", "Pixel 8 Pro", "ThinkPad X1", "PC Desktop"）
     public static string Model() {
-        return Platform.Shell().DeviceInfoGet(1);
+        if (DeviceInfo.hasMock) { return DeviceInfo.mockModel != null ? DeviceInfo.mockModel : ""; }
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) { return host.DeviceInfoGet(1); }
+        return DeviceInfo.NativeModel();
     }
 
-    // 硬件制造商/品牌（例如 "HUAWEI", "Google", "Apple", "PC Architecture"）
+    // 硬件制造商/品牌（例如 "HUAWEI", "Google", "Apple", "LENOVO", "PC Architecture"）
     public static string Manufacturer() {
-        return Platform.Shell().DeviceInfoGet(2);
+        if (DeviceInfo.hasMock) { return DeviceInfo.mockManufacturer != null ? DeviceInfo.mockManufacturer : ""; }
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) { return host.DeviceInfoGet(2); }
+        return DeviceInfo.NativeManufacturer();
     }
 
-    // 运行操作系统平台名称（例如 "HarmonyOS", "Android", "iOS", "Windows", "Linux"）
+    // 运行操作系统平台名称（例如 "HarmonyOS", "Android", "iOS", "Windows", "Linux", "macOS"）
     public static string PlatformName() {
-        return Platform.Shell().DeviceInfoGet(3);
+        if (DeviceInfo.hasMock) { return DeviceInfo.mockPlatform != null ? DeviceInfo.mockPlatform : ""; }
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) { return host.DeviceInfoGet(3); }
+        return DeviceInfo.NativePlatformName();
     }
 
     // 操作系统内核或发行版版本号（例如 "Next.0.0.36", "14.0", "17.4", "10.0.19044"）
     public static string OSVersion() {
-        return Platform.Shell().DeviceInfoGet(4);
+        if (DeviceInfo.hasMock) { return DeviceInfo.mockOSVersion != null ? DeviceInfo.mockOSVersion : ""; }
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) { return host.DeviceInfoGet(4); }
+        return DeviceInfo.NativeOSVersion();
     }
 
     // 当前设备是否为折叠屏硬件形态（外折/内折/三折叠）
     public static bool IsFoldable() {
-        return Platform.Shell().DeviceIsFoldable();
+        if (DeviceInfo.hasMock) { return DeviceInfo.mockIsFoldable; }
+        IHardwareHost host = HardwareHost.Current();
+        if (host != null) { return host.DeviceIsFoldable(); }
+        return false;
     }
 
     // 仿真/注入设备信息（用于多机型适配自动化测试）
     public static void Inject(string model, string manufacturer, string platform, string osVersion, bool isFoldable) {
-        Platform.Shell().DeviceInfoSet(1, model);
-        Platform.Shell().DeviceInfoSet(2, manufacturer);
-        Platform.Shell().DeviceInfoSet(3, platform);
-        Platform.Shell().DeviceInfoSet(4, osVersion);
-        Platform.Shell().DeviceInfoSet(5, isFoldable ? "1" : "0");
+        DeviceInfo.mockModel = model != null ? model : "";
+        DeviceInfo.mockManufacturer = manufacturer != null ? manufacturer : "";
+        DeviceInfo.mockPlatform = platform != null ? platform : "";
+        DeviceInfo.mockOSVersion = osVersion != null ? osVersion : "";
+        DeviceInfo.mockIsFoldable = isFoldable;
+        DeviceInfo.hasMock = true;
     }
+
+    // 清除仿真注入，恢复真实硬件探测。
+    public static void Reset() {
+        DeviceInfo.hasMock = false;
+        DeviceInfo.mockModel = null;
+        DeviceInfo.mockManufacturer = null;
+        DeviceInfo.mockPlatform = null;
+        DeviceInfo.mockOSVersion = null;
+        DeviceInfo.mockIsFoldable = false;
+    }
+
+    static string NativePlatformName() {
+        #if WINDOWS
+        return "Windows";
+        #elif MACOS
+        return "macOS";
+        #elif IOS
+        return "iOS";
+        #elif ANDROID
+        return "Android";
+        #elif OHOS
+        return "HarmonyOS";
+        #elif LINUX
+        return "Linux";
+        #else
+        return OperatingSystem.Platform;
+        #endif
+    }
+
+    static string NativeModel() {
+        #if WINDOWS
+        string v = DeviceInfo.ReadBiosString("SystemProductName");
+        if (v != "") { return v; }
+        return "PC Desktop";
+        #elif LINUX && !ANDROID && !OHOS
+        string dmi = DeviceInfo.ReadTrimmed("/sys/class/dmi/id/product_name");
+        if (dmi != "") { return dmi; }
+        string dt = DeviceInfo.ReadTrimmed("/proc/device-tree/model");
+        if (dt != "") { return dt; }
+        return "Linux Host";
+        #elif MACOS
+        string m = DeviceInfo.SysctlString("hw.model");
+        if (m != "") { return m; }
+        return "Mac";
+        #else
+        return "";
+        #endif
+    }
+
+    static string NativeManufacturer() {
+        #if WINDOWS
+        string v = DeviceInfo.ReadBiosString("SystemManufacturer");
+        if (v != "") { return v; }
+        return "PC Architecture";
+        #elif LINUX && !ANDROID && !OHOS
+        string v = DeviceInfo.ReadTrimmed("/sys/class/dmi/id/sys_vendor");
+        if (v != "") { return v; }
+        return "";
+        #elif MACOS
+        return "Apple";
+        #else
+        return "";
+        #endif
+    }
+
+    static string NativeOSVersion() {
+        #if WINDOWS
+        return SystemInfo.KernelVersion();
+        #elif LINUX && !ANDROID && !OHOS
+        string ver = DeviceInfo.ReadOsRelease("VERSION_ID");
+        if (ver != "") { return ver; }
+        return SystemInfo.KernelVersion();
+        #elif MACOS
+        return SystemInfo.KernelVersion();
+        #else
+        return "";
+        #endif
+    }
+
+    #if WINDOWS
+    static string ReadBiosString(string valueName) {
+        nint k = Registry.OpenKey(Registry.Hklm(), "HARDWARE\\DESCRIPTION\\System\\BIOS", false);
+        if (k == 0) { return ""; }
+        try {
+            return Registry.GetString(k, valueName).Trim();
+        } finally {
+            Registry.CloseKey(k);
+        }
+    }
+    #endif
+
+    #if LINUX && !ANDROID && !OHOS
+    static string ReadTrimmed(string path) {
+        try {
+            if (!File.Exists(path)) { return ""; }
+            return File.ReadAllText(path).Replace("\0", "").Trim();
+        } catch (Exception _ex) {
+            return "";
+        }
+    }
+
+    static string ReadOsRelease(string key) {
+        try {
+            if (!File.Exists("/etc/os-release")) { return ""; }
+            string txt = File.ReadAllText("/etc/os-release");
+            int i = 0;
+            while (i < txt.Length) {
+                int eol = txt.IndexOf("\n", i);
+                if (eol < 0) { eol = txt.Length; }
+                string line = txt.Substring(i, eol - i).Trim();
+                if (line.StartsWith(key + "=")) {
+                    string val = line.Substring(key.Length + 1, line.Length - key.Length - 1).Trim();
+                    if (val.Length >= 2 && val.Substring(0, 1) == "\"" && val.Substring(val.Length - 1, 1) == "\"") {
+                        val = val.Substring(1, val.Length - 2);
+                    }
+                    return val;
+                }
+                i = eol + 1;
+            }
+            return "";
+        } catch (Exception _ex) {
+            return "";
+        }
+    }
+    #endif
+
+    #if MACOS
+    [DllImport("crt", EntryPoint = "sysctlbyname")]
+    private static extern int SysctlByName(string name, nint oldp, nint oldlenp, nint newp, int newlen);
+
+    static string SysctlString(string name) {
+        nint buf = NativeMemory.Alloc(256);
+        nint len = NativeMemory.Alloc(8);
+        string s = "";
+        try {
+            new Span<long>(len, 1)[0] = 256;
+            if (DeviceInfo.SysctlByName(name, buf, len, 0, 0) == 0) {
+                int n = 0;
+                while (n < 256 && new Span<byte>(buf + n, 1)[0] != 0) {
+                    n = n + 1;
+                }
+                if (n > 0) { s = NativeMemory.GetString(buf, 0, n); }
+            }
+        } finally {
+            NativeMemory.Free(buf);
+            NativeMemory.Free(len);
+        }
+        return s;
+    }
+    #endif
 }

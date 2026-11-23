@@ -2,13 +2,8 @@ using System;
 using System.Text;
 namespace System.Xml;
 
-// XML 树节点。元素/文本/CDATA/注释/PI/声明/DOCTYPE 用
-// <see cref="kind"/> 区分：元素持有 <see cref="attrs"/> 与
-// <see cref="children"/>，其余类别只用 <see cref="text"/> 承载内容。
-// 命名空间不做解析（没有 xmlns 作用域表）：名字按原文匹配，
-// 用不带前缀的名字查找时回退到"忽略前缀只比本地名"，这样
-// <c>Element("href")</c> 能命中 <c>&lt;D:href&gt;</c>——WebDAV、
-// WeChat 这类前缀随服务器变化的报文靠这一条规则就够用。
+// XML 树节点：以 kind 区分元素(0)/文本(1)/CDATA(2)/注释(3)/PI(4)/声明(5)/DOCTYPE(6)。
+// 无 prefix 查询在精确匹配未命中时回退至本地名匹配（适配带变化前缀的报文）。
 public class XmlNode {
     // 节点类别：0 元素，1 文本，2 CDATA，3 注释，4 PI，5 声明，6 DOCTYPE。
     public int kind;
@@ -53,7 +48,7 @@ public class XmlNode {
         return n;
     }
 
-    // 构造处理指令节点（<c>&lt;?target body?&gt;</c>）。
+    // 构造处理指令节点（<?target body?>）。
     public static XmlNode NewPi(string target, string body) {
         XmlNode n = new XmlNode();
         n.kind = 4;
@@ -70,7 +65,7 @@ public class XmlNode {
         return n;
     }
 
-    // 构造 DOCTYPE 节点（<see cref="text"/> 存 <c>&lt;!DOCTYPE ...&gt;</c> 原文）。
+    // 构造 DOCTYPE 节点（text 存 <!DOCTYPE ...> 原文）。
     public static XmlNode NewDoctype(string raw) {
         XmlNode n = new XmlNode();
         n.kind = 6;
@@ -103,48 +98,49 @@ public class XmlNode {
         AddChild(XmlNode.NewText(piece));
     }
 
-    // 构建侧便捷方法：追加一段文本（合并语义同 <see cref="MergeText"/>）。
+    // 追加文本（语义同 MergeText）。
     public void AddText(string text) {
         MergeText(text);
     }
 
-    // 追加属性（懒建 attrs 列表）。同名（原样比较）已存在时改为替换值：
-    // XML 里同名属性不合法，静默追加会产出解析器拒绝的文档，且 ToXml
-    // 只会序列化出第一个。
+    private int IndexOfAttr(string attrName) {
+        if (attrs == null) { return -1; }
+        for (int i = 0; i < attrs.Count; i = i + 1) {
+            if (attrs[i].name == attrName) { return i; }
+        }
+        return -1;
+    }
+
+    // 追加或覆盖同名属性。
     public void AddAttr(XmlAttribute a) {
         if (attrs == null) { attrs = new List<XmlAttribute>(); }
-        for (int i = 0; i < attrs.Count; i = i + 1) {
-            if (attrs[i].name == a.name) {
-                attrs[i].value = a.value;
-                return;
-            }
+        int idx = IndexOfAttr(a.name);
+        if (idx >= 0) {
+            attrs[idx].value = a.value;
+            return;
         }
         attrs.Add(a);
     }
 
-    // 设置属性：已有同名（原样比较）就改值，没有则追加。
+    // 设置属性：已有同名则改值，否则追加。
     public void SetAttr(string attrName, string value) {
-        if (attrs != null) {
-            for (int i = 0; i < attrs.Count; i = i + 1) {
-                if (attrs[i].name == attrName) {
-                    attrs[i].value = value;
-                    return;
-                }
-            }
+        int idx = IndexOfAttr(attrName);
+        if (idx >= 0) {
+            attrs[idx].value = value;
+            return;
         }
         XmlAttribute a = new XmlAttribute();
         a.name = attrName;
         a.value = value;
-        AddAttr(a);
+        if (attrs == null) { attrs = new List<XmlAttribute>(); }
+        attrs.Add(a);
     }
 
     // 取属性值；不存在返回 null。无前缀的名字回退本地名匹配。
     public string Attr(string attrName) {
-        if (attrs == null) { return null; }
-        for (int i = 0; i < attrs.Count; i = i + 1) {
-            if (attrs[i].name == attrName) { return attrs[i].value; }
-        }
-        if (XmlNode.IndexOf(attrName, ":", 0) < 0) {
+        int idx = IndexOfAttr(attrName);
+        if (idx >= 0) { return attrs[idx].value; }
+        if (attrs != null && XmlNode.IndexOf(attrName, ":", 0) < 0) {
             for (int i = 0; i < attrs.Count; i = i + 1) {
                 if (XmlNode.LocalNameOf(attrs[i].name) == attrName) {
                     return attrs[i].value;
@@ -188,7 +184,7 @@ public class XmlNode {
         return XmlNode.LocalNameOf(name) == want;
     }
 
-    // 第一个按 <see cref="MatchesName"/> 命中的子元素；没有返回 null。
+    // 第一个按 MatchesName 命中的子元素；没有返回 null。
     public XmlNode Element(string name) {
         if (children == null) { return null; }
         for (int i = 0; i < children.Count; i = i + 1) {
@@ -198,7 +194,7 @@ public class XmlNode {
         return null;
     }
 
-    // 全部按 <see cref="MatchesName"/> 命中的子元素（按文档顺序）。
+    // 全部按 MatchesName 命中的子元素（按文档顺序）。
     public List<XmlNode> Elements(string name) {
         List<XmlNode> outList = new List<XmlNode>();
         if (children == null) { return outList; }
@@ -237,8 +233,7 @@ public class XmlNode {
         }
     }
 
-    // 在 <see cref="s"/> 中自 <see cref="from"/> 起找子串；找不到
-    // 返回 -1。stdlib 字符串按 UTF-8 字节存取，这里按字节比较。
+    // 按 UTF-8 字节在 s 中自 from 起查找子串，未命中返回 -1。
     public static int IndexOf(string s, string needle, int from) {
         int n = s.Length;
         int m = needle.Length;

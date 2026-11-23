@@ -4,35 +4,9 @@ using System.Net.Http;
 
 namespace Ai;
 
-// 向量化（embeddings）。
-//
-// 协议：**OpenAI 兼容的 `/v1/embeddings`**。这一个协议覆盖了几乎所有
-// 主流服务——OpenAI、DeepSeek、Ollama、vLLM、LM Studio、阿里云
-// 百炼的兼容模式等都用它。不做各厂商的私有嵌入协议（那是碎片化
-// 的根源，收益不抵成本）。
-//
-// 请求体：
-//   {"model": "...", "input": ["文本1", "文本2"]}
-//
-// 响应体：
-//   {"data": [{"embedding": [0.1, ...], "index": 0}, ...],
-//    "usage": {"prompt_tokens": 12, "total_tokens": 12}}
-//
-// 两条实现要点：
-// 1. **响应的 data 顺序不保证与请求一致**——协议里有 `index` 字段，
-//    本包**按 index 归位**，不靠数组顺序（靠顺序是典型的错位 bug
-//    来源：某个网关重排了数组，向量就全对不上号了）。
-// 2. **维度校验**：所有向量必须同维，否则下游的余弦相似度算不了。
-//    维度不一致直接报错，不做"截断到最短"这种和稀泥的处理。
-
+// OpenAI 兼容 /v1/embeddings 客户端：按响应 index 归位并校验所有向量维度一致。
 public class Embeddings {
-    // 一次向量化：把一组文本变成一组向量。
-    //
-    // texts 是输入文本（可以为空串——有些服务允许，但本包不替服务
-    // 做判断）。normalize 为 true 时把向量归一化到单位长度（余弦
-    // 检索时省掉每次的模长计算）。
-    //
-    // 失败返回 null（原因在 client.lastError）。
+    // 向量化一批文本（normalize=true 时原地归一化到单位长度）；失败返回 null 并写 client.lastError。
     public static async AiEmbedding Embed(AiClient client, List<string> texts,
     bool normalize) {
         if (client == null) { return null; }
@@ -66,17 +40,7 @@ public class Embeddings {
         return Embeddings.ParseResponse(client, raw, texts.Count, normalize);
     }
 
-    // 解析嵌入服务的响应（**可独立测试**——这是本包最该被测的地方：
-    // 归位、维度校验、错误提取全在��里）。
-    //
-    // expected 是本次请求的输入条数。返回 null 表示响应不可用，
-    // 原因在 client.lastError。
-    //
-    // 两条硬规则：
-    // 1. **按 index 归位**，不靠数组顺序（某个网关重排了数组，靠顺序
-    //    就是全部错位）。
-    // 2. **维度必须一致**——不一致直接报错，不做"截断到最短"那种
-    //    和稀泥的处理（截断会让相似度算出来是错的，且错得很隐蔽）。
+    // 解析 /v1/embeddings JSON 响应（按 index 归位并校验同维）；失败返回 null 并写 client.lastError。
     public static AiEmbedding ParseResponse(AiClient client, string raw,
     int expected, bool normalize) {
         // JsonDoc.Parse 扁平线性解析，零多余树状堆分配与垃圾回收开销

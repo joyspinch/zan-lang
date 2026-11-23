@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 
 namespace Document.Pdf;
 
@@ -17,13 +18,75 @@ public class PdfBuffer {
     // 当前长度（字节）。
     public int Length() { return this.bytes.Count; }
 
+    // 清空缓冲以便复用（保留底层容量）。
+    public void Clear() { this.bytes.Clear(); }
+
     // 追加 ASCII 文本（非 ASCII 字符按字节截断——调用方只应传 ASCII）。
     public void Ascii(string text) {
         if (text == null) { return; }
-        for (int i = 0; i < text.Length; i = i + 1) {
+        this.AsciiSlice(text, 0, text.Length);
+    }
+
+    // 追加字符串切片 [start, start + length) 的 ASCII/Latin-1 字节（零中间 Substring 分配）。
+    public void AsciiSlice(string text, int start, int length) {
+        if (text == null || length <= 0) { return; }
+        int end = start + length;
+        if (start < 0) { start = 0; }
+        if (end > text.Length) { end = text.Length; }
+        for (int i = start; i < end; i = i + 1) {
             int c = text[i];
             if (c > 255) { c = 63; }
             this.bytes.Add((byte)c);
+        }
+    }
+
+    // 直接合并另一份 PdfBuffer 的字节内容。
+    public void Append(PdfBuffer other) {
+        if (other == null) { return; }
+        int n = other.bytes.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            this.bytes.Add(other.bytes[i]);
+        }
+    }
+
+    // 追加十进制整数（零中间字符串分配）。
+    public void AppendInt(int value) {
+        this.AppendLong((long)value);
+    }
+
+    // 追加 64 位十进制整数（零中间字符串分配）。
+    public void AppendLong(long value) {
+        if (value == 0L) {
+            this.bytes.Add(48);
+            return;
+        }
+        long v = value;
+        if (v < 0L) {
+            this.bytes.Add(45);
+            v = -v;
+        }
+        byte[] digits = new byte[20];
+        int count = 0;
+        while (v > 0L) {
+            digits[count] = (byte)(48 + (int)(v % 10L));
+            v = v / 10L;
+            count = count + 1;
+        }
+        for (int i = count - 1; i >= 0; i = i - 1) {
+            this.bytes.Add(digits[i]);
+        }
+    }
+
+    // 追加定长 10 位十进制整数（左侧补 '0'，用于 xref 偏移表）。
+    public void AppendPad10(int value) {
+        int v = value < 0 ? 0 : value;
+        byte[] digits = new byte[10];
+        for (int i = 9; i >= 0; i = i - 1) {
+            digits[i] = (byte)(48 + (v % 10));
+            v = v / 10;
+        }
+        for (int i = 0; i < 10; i = i + 1) {
+            this.bytes.Add(digits[i]);
         }
     }
 
@@ -32,9 +95,32 @@ public class PdfBuffer {
         this.bytes.Add(value);
     }
 
-    // 追加一个数（PDF 数字格式，最多三位小数）。
+    // 追加一个数（PDF 数字格式，最多三位小数，零中间字符串分配）。
     public void Number(double value) {
-        this.Ascii(PdfBuffer.Format(value));
+        if (value < 0.0) {
+            this.bytes.Add(45);
+            value = -value;
+        }
+        double intPart = Math.Floor(value);
+        long whole = (long)intPart;
+        long thousandths = (long)((value - intPart) * 1000.0 + 0.5);
+        if (thousandths >= 1000L) {
+            whole = whole + 1L;
+            thousandths = thousandths - 1000L;
+        }
+        this.AppendLong(whole);
+        if (thousandths == 0L) { return; }
+        this.bytes.Add(46);
+        int d1 = (int)(thousandths / 100L);
+        int d2 = (int)((thousandths / 10L) % 10L);
+        int d3 = (int)(thousandths % 10L);
+        this.bytes.Add((byte)(48 + d1));
+        if (d2 != 0 || d3 != 0) {
+            this.bytes.Add((byte)(48 + d2));
+            if (d3 != 0) {
+                this.bytes.Add((byte)(48 + d3));
+            }
+        }
     }
 
     // 取出内容。
@@ -51,18 +137,26 @@ public class PdfBuffer {
             return "-" + PdfBuffer.Format(-value);
         }
         double intPart = Math.Floor(value);
-        double frac = value - intPart;
         long whole = (long)intPart;
-        long thousandths = (long)(frac * 1000.0 + 0.5);
+        long thousandths = (long)((value - intPart) * 1000.0 + 0.5);
         if (thousandths >= 1000L) {
             whole = whole + 1L;
             thousandths = thousandths - 1000L;
         }
-        string head = whole.ToString();
-        if (thousandths == 0L) { return head; }
-        string tail = thousandths.ToString();
-        while (tail.Length < 3) { tail = "0" + tail; }
-        while (tail.EndsWith("0")) { tail = tail.Substring(0, tail.Length - 1); }
-        return head + "." + tail;
+        if (thousandths == 0L) { return whole.ToString(); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(whole);
+        sb.Append(".");
+        int d1 = (int)(thousandths / 100L);
+        int d2 = (int)((thousandths / 10L) % 10L);
+        int d3 = (int)(thousandths % 10L);
+        sb.Append(d1);
+        if (d2 != 0 || d3 != 0) {
+            sb.Append(d2);
+            if (d3 != 0) {
+                sb.Append(d3);
+            }
+        }
+        return sb.ToString();
     }
 }

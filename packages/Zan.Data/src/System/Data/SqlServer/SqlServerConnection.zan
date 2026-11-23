@@ -6,37 +6,23 @@ using System.Threading;
 
 namespace System.Data.SqlServer;
 
-// 原生、协程化的 SQL Server 客户端，线协议为 TDS 7.4——
-// 无需 ODBC 驱动、SNI、原生 DLL。PRELOGIN、LOGIN7、SQL 批处理及
-// sp_executesql RPC 都由 <see cref="TdsMessage"/> 构建，每步网络
-// 操作都在 IO reactor 上挂起（<c>Socket.ConnectAsync</c> /
-// <c>Socket.SendAsync</c> / <c>Socket.RecvOv</c>），因此查询从不阻塞
-// 工作线程，多个连接可在单线程上并行推进。
-// 明文路径（OpenAsync）的登录包以明文发送：TDS 会对密码字段做
-// 加扰，但那只是混淆而非加密，因此开启了 "force encryption" 的
-// 服务器会拒绝登录（其 PRELOGIN 应答 ENCRYPT_REQ，表现为
-// 连接错误而非静默降级）。跨网使用请走
-// <see cref="OpenSecureAsync"/>（整条流含口令走 TLS）。
-// 用法：
-// "127.0.0.1", 1433, "master", "sa", "secret");
-// db.Close();
+// 协程化的纯 Zan TDS 7.4 客户端（支持明文 OpenAsync 与全链路 TLS OpenSecureAsync）。
+// 用法：SqlServerConnection db = await SqlServerConnection.OpenAsync("127.0.0.1", 1433, "master", "sa", "secret");
 public class SqlServerConnection : IDbConnection {
     nint sock;
     bool connected;
     string lastError;
-    int lastNumber;  // 服务器自身的错误号，无则为 0
+    int lastNumber;
     int lastAffected;
     string serverVersion;
     string database;
     string appName;
     int packetSize;
     int packetId;
-    TlsStream tls;  // 非空 = 通道已加密（OpenSecureAsync 建立）
+    TlsStream tls;
     bool busy;
     List<AsyncGate> waiters;
-    // A535：BEGIN TRANSACTION 后为 true，COMMIT/ROLLBACK 落地后清零。
-    // 连接池归还时据此挂清理协程，把残留事务回滚掉再入池（P2-29 的
-    // 异步驱动半边）。
+    // 连接池归还时据此挂异步 ROLLBACK 清理未收尾事务（P2-29）。
     public bool inTxn;
 
     async bool AcquireLock() {
@@ -62,24 +48,19 @@ public class SqlServerConnection : IDbConnection {
         }
     }
 
-    // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
-    // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient/
-    // MySqlConnection/RedisClient 的开关同一语义。
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
         get { return SqlServerConnection.defaultVerifyTls; }
         set { SqlServerConnection.defaultVerifyTls = value; }
     }
 
-    // 切换后续 OpenSecureAsync 的证书与主机名校验。
-    // 仅测试/开发自签场景关闭；生产保持默认开启。
+    // 切换后续 OpenSecureAsync 的证书链与主机名校验（仅自签测试关闭，生产保持开启）。
     public static void SetTlsVerify(bool verify) {
         SqlServerConnection.defaultVerifyTls = verify;
     }
 
     public bool tlsVerify = true;
 
-    // 统一经 <see cref="OpenAsync"/> 创建。
     public SqlServerConnection() {
         this.sock = -1;
         this.connected = false;
@@ -93,52 +74,32 @@ public class SqlServerConnection : IDbConnection {
         this.tls = null;
     }
 
-    // 报文 IO
-
-    // 恰好读取 <paramref name="need"/> 字节，部分读取之间
-    // 会挂起。返回实际读到的字节数。TLS 建立后从解密流读取
-    // （TDS 报文层整体运行在隧道之内）。
     async int recvExact(byte[] dst, int off, int need) {
-        if (this.tls != null) {
-            int have = 0;
-            while (have < need) {
-                int read = await this.tls.RecvBytesAsync(dst, off + have, need - have);
-                if (read <= 0) { return have; }
-                have = have + read;
-            }
-            return have;
+        if (this.tls == null) {
+            return await this.recvExactRaw(dst, off, need);
         }
-        int got = 0;
-        byte[] tmp = new byte[need + 1];
-        while (got < need) {
-            int n = await Socket.RecvOv(this.sock, tmp, need - got);
-            if (n <= 0) {
-                return got;
-            }
-            NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
-            got = got + n;
+        int have = 0;
+        while (have < need) {
+            int read = await this.tls.RecvBytesAsync(dst, off + have, need - have);
+            if (read <= 0) { return have; }
+            have = have + read;
         }
-        return got;
+        return have;
     }
 
-    // 握手阶段专用的原话路收发（0x12 封装的 TLS 密文），
-    // 绝不经 recvExact——那里此时还走不了隧道。
+    // 握手阶段专用裸读取（0x12 封装的 TLS 密文，此时尚不能走隧道）。
     async int recvExactRaw(byte[] dst, int off, int need) {
         int got = 0;
         byte[] tmp = new byte[need + 1];
         while (got < need) {
             int n = await Socket.RecvOv(this.sock, tmp, need - got);
-            if (n <= 0) {
-                return got;
-            }
+            if (n <= 0) { return got; }
             NativeMemory.Copy((nint)dst + (nint)(off + got), (nint)tmp, n);
             got = got + n;
         }
         return got;
     }
 
-    // 发送一条消息，按协商的包大小拆分成
-    // 所需数量的包；只有最后一个包带 EOM 位。
     async bool sendMessage(int type, TdsBytes payload) {
         int max = this.packetSize - TdsPacket.HEADER_LEN;
         int off = 0;
@@ -152,16 +113,12 @@ public class SqlServerConnection : IDbConnection {
                 chunk = max;
                 status = TdsPacket.STATUS_NORMAL;
             }
-            TdsBytes pkt = TdsPacket.Frame(type, status, this.packetId, payload,
-                                           off, chunk);
+            TdsBytes pkt = TdsPacket.Frame(type, status, this.packetId, payload, off, chunk);
             this.packetId = this.packetId + 1;
             if (this.packetId > 255) { this.packetId = 1; }
-            int sent;
-            if (this.tls != null) {
-                sent = await this.tls.SendBytesAsync(pkt.Data(), 0, pkt.Len());
-            } else {
-                sent = await Socket.SendAsync(this.sock, pkt.Data(), pkt.Len());
-            }
+            int sent = this.tls != null
+                ? await this.tls.SendBytesAsync(pkt.Data(), 0, pkt.Len())
+                : await Socket.SendAsync(this.sock, pkt.Data(), pkt.Len());
             pkt.Release();
             if (sent < 0) {
                 this.lastError = "send failed";
@@ -172,16 +129,12 @@ public class SqlServerConnection : IDbConnection {
         return true;
     }
 
-    // 读取一整条响应消息：不断拼接数据包，直到
-    // 服务器标记消息结束，因为令牌可能跨越
-    // 两个数据包的边界。
     async TdsBytes recvMessage() {
         TdsBuf body = new TdsBuf();
         bool more = true;
         while (more) {
             byte[] hdr = new byte[TdsPacket.HEADER_LEN + 1];
-            int got = await this.recvExact(hdr, 0, TdsPacket.HEADER_LEN);
-            if (got < TdsPacket.HEADER_LEN) {
+            if (await this.recvExact(hdr, 0, TdsPacket.HEADER_LEN) < TdsPacket.HEADER_LEN) {
                 this.lastError = "connection closed by the server";
                 return null;
             }
@@ -194,78 +147,51 @@ public class SqlServerConnection : IDbConnection {
             }
             if (payLen > 0) {
                 byte[] pay = new byte[payLen + 1];
-                int g2 = await this.recvExact(pay, 0, payLen);
-                if (g2 < payLen) {
+                if (await this.recvExact(pay, 0, payLen) < payLen) {
                     this.lastError = "truncated packet";
                     return null;
                 }
-                for (int i = 0; i < payLen; i = i + 1) {
-                    body.U8(pay[i] & 255);
-                }
+                for (int i = 0; i < payLen; i = i + 1) { body.U8(pay[i] & 255); }
             }
             if ((status & TdsPacket.STATUS_EOM) != 0) { more = false; }
         }
         return body.ToBytes();
     }
 
-    // 连接与登录
+    static async SqlServerConnection OpenCoreAsync(string host, int port,
+            string database, string user, string password, bool secure) {
+        Socket.Initialize();
+        SqlServerConnection conn = new SqlServerConnection();
+        conn.database = database;
+        bool ok = await conn.handshake(host, port, database, user, password, secure);
+        conn.connected = ok;
+        if (!ok && conn.sock >= 0) {
+            Socket.Close(conn.sock);
+            conn.sock = -1;
+        }
+        return conn;
+    }
 
-    // 打开连接并使用 SQL Server 认证方式登录。
     public static async SqlServerConnection OpenAsync(string host, int port,
             string database, string user, string password) {
-        Socket.Initialize();
-        SqlServerConnection conn = new SqlServerConnection();
-        conn.database = database;
-        bool ok = await conn.handshake(host, port, database, user, password, false);
-        conn.connected = ok;
-        if (!ok && conn.sock >= 0) {
-            Socket.Close(conn.sock);
-            conn.sock = -1;
-        }
-        return conn;
+        return await SqlServerConnection.OpenCoreAsync(host, port, database, user, password, false);
     }
 
-    // 与 <see cref="OpenAsync"/> 相同，但 PRELOGIN 协商
-    // ENCRYPT_ON，握手响应起整条 TDS 流（含 LOGIN7 与口令）走 TLS。
-    // MS-TDS 的特例：握手期间的 TLS 记录封装在 PRELOGIN(0x12) 报文
-    // 里，握手完成后裸 TLS 记录直达套接字、TDS 报文层整体进入隧道。
-    // 服务器拒绝加密（应答 NOT_SUP）时显式失败——绝不静默降级
-    // 明文。
+    // 协商 ENCRYPT_ON 并升级 TLS；服务器拒绝加密时显式失败，绝不静默降级明文。
     public static async SqlServerConnection OpenSecureAsync(string host, int port,
             string database, string user, string password) {
-        Socket.Initialize();
-        SqlServerConnection conn = new SqlServerConnection();
-        conn.database = database;
-        bool ok = await conn.handshake(host, port, database, user, password, true);
-        conn.connected = ok;
-        if (!ok && conn.sock >= 0) {
-            Socket.Close(conn.sock);
-            conn.sock = -1;
-        }
-        return conn;
+        return await SqlServerConnection.OpenCoreAsync(host, port, database, user, password, true);
     }
 
-    // PRELOGIN + LOGIN7 握手。明文路径声明 ENCRYPT_NOT_SUP，
-    // 服务器要求 TLS（ENCRYPT_REQ）时在这里失败；安全路径声明
-    // ENCRYPT_ON 并在 PRELOGIN 应答后把通道升级为 TLS。登录应答
-    // 带出服务器版本与实际绑定的数据库。
-    async bool handshake(string host, int port, string db, string user, string pw,
-            bool secure) {
+    async bool handshake(string host, int port, string db, string user, string pw, bool secure) {
         this.sock = Socket.CreateTcp();
-        if (this.sock < 0) {
-            this.lastError = "socket create failed";
-            return false;
-        }
+        if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
         Socket.SetNonBlocking(this.sock);
-        int rc = await Socket.ConnectAsync(this.sock, host, port);
-        if (rc != 0) {
+        if (await Socket.ConnectAsync(this.sock, host, port) != 0) {
             this.lastError = "cannot reach " + host + ":" + Convert.ToString(port);
             return false;
         }
 
-        // PRELOGIN。明文路径声明 NOT_SUP 使交换保持明文（要求 TLS 的
-        // 服务器会应答 ENCRYPT_REQ，在这一步被拒绝，而不是稍后报出
-        // 晦涩的登录错误）；安全路径声明 ON。
         TdsBytes preloginMsg = TdsMessage.Prelogin(secure ? 1 : 2);
         bool sent = await this.sendMessage(TdsPacket.PRELOGIN, preloginMsg);
         preloginMsg.Release();
@@ -276,20 +202,17 @@ public class SqlServerConnection : IDbConnection {
         pre.Release();
         if (secure) {
             if (enc != 1 && enc != 3) {
-                // 服务器不接受加密：安全打开绝不能退回明文。
                 this.lastError = "server refused TDS encryption (no TLS)";
                 return false;
             }
-            bool up = await this.tlsUpgrade(host);
-            if (!up) { return false; }
+            if (!await this.tlsUpgrade(host)) { return false; }
         } else if (enc == 1 || enc == 3) {
             this.lastError = "the server requires TLS, which this driver does not speak yet";
             return false;
         }
 
         this.packetId = 1;
-        TdsBytes login = TdsMessage.Login7(host, user, pw, this.appName, host, db,
-                                           this.packetSize);
+        TdsBytes login = TdsMessage.Login7(host, user, pw, this.appName, host, db, this.packetSize);
         sent = await this.sendMessage(TdsPacket.LOGIN7, login);
         login.Release();
         if (!sent) { return false; }
@@ -302,16 +225,11 @@ public class SqlServerConnection : IDbConnection {
             return false;
         }
         this.serverVersion = resp.ServerVersion();
-        if (resp.Database().Length > 0) {
-            this.database = resp.Database();
-        }
+        if (resp.Database().Length > 0) { this.database = resp.Database(); }
         return true;
     }
 
-    // 把通道升级为 TLS：握手期间的 TLS 记录按 MS-TDS 规则
-    // 封装在 PRELOGIN(0x12) 报文里收发；握手完成后调用方照常经
-    // sendMessage/recvMessage 走隧道（裸 TLS 记录，TDS 报文层在
-    // 解密侧）。失败时已记录 lastError。
+    // 握手期间 TLS 记录封装在 PRELOGIN(0x12) 中，完成后直接走裸 TLS 隧道。
     async bool tlsUpgrade(string host) {
         TlsContext tlsCtx = TlsContext.CreateClient();
         if (tlsCtx == null) {
@@ -319,10 +237,7 @@ public class SqlServerConnection : IDbConnection {
             return false;
         }
         if (!this.tlsVerify || !SqlServerConnection.defaultVerifyTls) { tlsCtx.DisableVerify(); }
-        // MS-TDS 的带内 TLS 与 TLS 1.3 不兼容：1.3 在握手完成后还会发
-        // 会话票据等 post-handshake 记录，而此时 0x12 封装已停止——
-        // 到达的封装记录会污染裸流（go-mssqldb 同样把 TDS 的 TLS 压到
-        // 1.2）。1.2 的一切记录都在握手的封装期内。
+        // 压制 TLS 1.3：1.3 握手后仍会发 post-handshake 记录，会污染已停止 0x12 封装的裸流。
         tlsCtx.DisableTls13();
         this.tls = TlsStream.ConnectStepped(tlsCtx, this.sock, host);
         if (this.tls == null) {
@@ -342,44 +257,32 @@ public class SqlServerConnection : IDbConnection {
                 int len = chunk + 8;
                 frame[2] = (byte)(len >> 8);
                 frame[3] = (byte)(len & 255);
-                frame[4] = 0;
-                frame[5] = 0;
+                frame[4] = 0; frame[5] = 0;
                 frame[6] = (byte)(this.packetId & 255);
                 frame[7] = 0;
-                for (int i = 0; i < chunk; i = i + 1) {
-                    frame[8 + i] = (byte)(out1[off + i] & 255);
-                }
+                for (int i = 0; i < chunk; i = i + 1) { frame[8 + i] = (byte)(out1[off + i] & 255); }
                 this.packetId = this.packetId + 1;
                 if (this.packetId > 255) { this.packetId = 1; }
-                int sent = await Socket.SendAsync(this.sock, frame, chunk + 8);
-                if (sent < 0) {
+                if (await Socket.SendAsync(this.sock, frame, chunk + 8) < 0) {
                     this.lastError = "TLS handshake send failed";
                     return false;
                 }
                 off = off + chunk;
             }
-            if (st == 1) {
-                // 客户端完成的这一次泵出的剩余记录是握手阶段的一部分
-                // （TLS 1.2 下是自己的 CCS+Finished；已压 1.2，见上），
-                // 仍需 0x12 封装——上面已按封装帧发出。
-                return true;
-            }
+            if (st == 1) { return true; }
             if (st < 0) {
                 this.lastError = "TLS handshake failed: " + TlsStream.LastError();
                 return false;
             }
-            // 状态机要更多输入：收下一个 0x12 封装的密文块喂进去。
             byte[] hdr = new byte[9];
-            int got = await this.recvExactRaw(hdr, 0, 8);
-            if (got < 8) {
+            if (await this.recvExactRaw(hdr, 0, 8) < 8) {
                 this.lastError = "TLS handshake: connection closed by the server";
                 return false;
             }
             int payLen = (((hdr[2] & 255) << 8) | (hdr[3] & 255)) - 8;
             if (payLen > 0) {
                 byte[] pay = new byte[payLen + 1];
-                int g2 = await this.recvExactRaw(pay, 0, payLen);
-                if (g2 < payLen) {
+                if (await this.recvExactRaw(pay, 0, payLen) < payLen) {
                     this.lastError = "TLS handshake: truncated packet";
                     return false;
                 }
@@ -389,10 +292,6 @@ public class SqlServerConnection : IDbConnection {
         return false;
     }
 
-    // 语句
-
-    // 发送一条消息并解码响应：网络失败会把连接标记为断开并返回
-    // 空响应，语句级失败只记录（由调用方决定是否抛出）。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
     async TdsResponse roundTrip(int type, TdsBytes payload) {
         await this.AcquireLock();
         try {
@@ -426,65 +325,40 @@ public class SqlServerConnection : IDbConnection {
                 this.fail();
             }
             return resp;
-        } finally {
-            this.ReleaseLock();
-        }
+        } finally { this.ReleaseLock(); }
     }
 
-    // 运行语句批处理并返回结果集。当服务器拒绝批处理时抛出
-    // <see cref="DbException"/>。因此空
-    // 结果总表示“无行”；<see cref="GetError"/> 仍会携带
-    // 错误消息，供偏好自行检查的调用方查看。
+    TdsBytes buildRpcParams(string sql, DbParams prms) {
+        string text = SqlServerConnection.Renumber(sql, prms.Count());
+        if (text.Length == 0 && sql.Length > 0) {
+            this.lastError = "parameter count does not match the placeholders";
+            this.fail();
+        }
+        return TdsMessage.RpcExecuteSql(text, prms);
+    }
+
     public async DbResult QueryAsync(string sql) {
-        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
-                                                TdsMessage.SqlBatch(sql));
-        if (resp.Failed()) { this.fail(); }
+        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH, TdsMessage.SqlBatch(sql));
         return resp.Rows();
     }
 
-    // 通过 sp_executesql 运行参数化查询。占位符
-    // 为 `?`，会被改写为服务器期望的 @P1.. 名称；值
-    // 带外传输，因此无需向语句文本中做任何转义。
     public async DbResult QueryAsync(string sql, DbParams prms) {
-        string text = SqlServerConnection.Renumber(sql, prms.Count());
-        if (text.Length == 0 && sql.Length > 0) {
-            this.lastError = "parameter count does not match the placeholders";
-            this.fail();
-        }
-        TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
-                                                TdsMessage.RpcExecuteSql(text, prms));
-        if (resp.Failed()) { this.fail(); }
+        TdsResponse resp = await this.roundTrip(TdsPacket.RPC, this.buildRpcParams(sql, prms));
         return resp.Rows();
     }
 
-    // 执行一条语句并返回受影响的行数。服务器拒绝时抛出
     public async int ExecuteAsync(string sql) {
-        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH,
-                                                TdsMessage.SqlBatch(sql));
-        if (resp.Failed()) { this.fail(); }
+        TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH, TdsMessage.SqlBatch(sql));
         return resp.Affected();
     }
 
-    // 带参数的语句。
     public async int ExecuteAsync(string sql, DbParams prms) {
-        string text = SqlServerConnection.Renumber(sql, prms.Count());
-        if (text.Length == 0 && sql.Length > 0) {
-            this.lastError = "parameter count does not match the placeholders";
-            this.fail();
-        }
-        TdsResponse resp = await this.roundTrip(TdsPacket.RPC,
-                                                TdsMessage.RpcExecuteSql(text, prms));
-        if (resp.Failed()) { this.fail(); }
+        TdsResponse resp = await this.roundTrip(TdsPacket.RPC, this.buildRpcParams(sql, prms));
         return resp.Affected();
     }
 
-    // 抛出已记录的错误，使服务器自身的消息
-    // 能到达调用方，而不是返回空结果。
     void fail() {
-        string why = this.lastError;
-        if (why.Length == 0) {
-            why = "the statement failed";
-        }
+        string why = this.lastError.Length > 0 ? this.lastError : "the statement failed";
         throw new DbException(why, this.lastNumber, DbProvider.SqlServer);
     }
 
@@ -498,7 +372,6 @@ public class SqlServerConnection : IDbConnection {
     public int Execute(string sql, DbParams prms) { throw SqlServerConnection.Sync(); }
     public string ExecuteScalar(string sql) { throw SqlServerConnection.Sync(); }
     public string ExecuteScalar(string sql, DbParams prms) { throw SqlServerConnection.Sync(); }
-
     public void BeginTransaction() { throw SqlServerConnection.Sync(); }
     public void Commit() { throw SqlServerConnection.Sync(); }
     public void Rollback() { throw SqlServerConnection.Sync(); }
@@ -521,22 +394,17 @@ public class SqlServerConnection : IDbConnection {
         return true;
     }
 
-    // 第一行第一列的值，无行时返回 ""。
     public async string ExecuteScalarAsync(string sql) {
         DbResult r = await this.QueryAsync(sql);
-        if (r.RowCount() == 0) { return ""; }
-        return r.GetString(0, 0);
+        return r.RowCount() == 0 ? "" : r.GetString(0, 0);
     }
 
     public async string ExecuteScalarAsync(string sql, DbParams prms) {
         DbResult r = await this.QueryAsync(sql, prms);
-        if (r == null || r.RowCount() == 0 || r.ColumnCount() == 0) { return ""; }
-        return r.GetString(0, 0);
+        return (r == null || r.RowCount() == 0 || r.ColumnCount() == 0) ? "" : r.GetString(0, 0);
     }
 
-    // 将 `?` 占位符重写为 @P1、@P2 ……，
-    // 字符串字面量、带引号的标识符或括号内的内容原样保留。数量不匹配时返回 ""
-    // 。
+    // 将 `?` 占位符改写为 @P1..，保留引号/方括号字面量；占位符数不匹配时返回 ""。
     public static string Renumber(string sql, int count) {
         if (sql == null) { return ""; }
         if (count == 0) { return sql; }
@@ -553,9 +421,7 @@ public class SqlServerConnection : IDbConnection {
                 else if (c == 34) { quote = 2; }
                 else if (c == 91) { quote = 3; }
                 else if (c == 63) {
-                    if (i > start) {
-                        outp.Append(sql.Substring(start, i - start));
-                    }
+                    if (i > start) { outp.Append(sql.Substring(start, i - start)); }
                     n = n + 1;
                     outp.Append("@P");
                     outp.Append(Convert.ToString(n));
@@ -563,44 +429,22 @@ public class SqlServerConnection : IDbConnection {
                     start = i;
                     continue;
                 }
-            } else if (quote == 1 && c == 39) {
-                quote = 0;
-            } else if (quote == 2 && c == 34) {
-                quote = 0;
-            } else if (quote == 3 && c == 93) {
+            } else if ((quote == 1 && c == 39) || (quote == 2 && c == 34) || (quote == 3 && c == 93)) {
                 quote = 0;
             }
             i = i + 1;
         }
-        if (start < len) {
-            outp.Append(sql.Substring(start, len - start));
-        }
-        if (n != count) { return ""; }
-        return outp.ToString();
+        if (start < len) { outp.Append(sql.Substring(start, len - start)); }
+        return n != count ? "" : outp.ToString();
     }
 
-    // 状态
-
-    // 上一条语句影响的行数。
     public int AffectedRows() { return this.lastAffected; }
-
-    // 上一次失败的错误描述，无则为 ""。
     public string GetError() { return this.lastError; }
-
-    // LOGINACK 报告的服务器版本，如 "16.0.1000"。
     public string ServerVersion() { return this.serverVersion; }
-
-    // 会话所绑定的数据库。
     public string Database() { return this.database; }
-
-    // 登录成功且连接未被网络错误关闭。
     public bool IsConnected() { return this.connected; }
-
-    // 恒为 <see cref="DbProvider.SqlServer"/>。
     public int GetProvider() { return DbProvider.SqlServer; }
 
-    // 关闭套接字；重复调用安全。TLS 先发 close_notify（fd 仍归
-    // 调用方）再关套接字。安全唤醒所有门控等待者。
     public void Close() {
         this.connected = false;
         lock (this) {
@@ -620,7 +464,5 @@ public class SqlServerConnection : IDbConnection {
         }
     }
 
-    public void Dispose() {
-        this.Close();
-    }
+    public void Dispose() { this.Close(); }
 }

@@ -4,13 +4,8 @@ using System.Numerics;
 
 namespace Ai.Tensor;
 
-// 张量算子。全部是静态方法，输入输出都是 Tensor（不原地改输入）。
-//
-// 约定：
-// - 逐元素算子要求两个张量元素数一致（形状不必相同，按行主序对齐）；
-// - 归一化/激活类算子沿**最后一维**做（Transformer 的习惯）；
-// - 矩阵乘要求二维张量，走 ComputeBackendRegistry 登记的后端
-//   （没有后端时用这里的 CPU 参考实现）。
+// 张量算子（纯静态方法，不原地修改输入，AddInto 除外）。
+// 逐元素算子按行主序对齐元素数；归一化/激活沿最后一维执行；矩阵乘优先走 ComputeBackendRegistry。
 public class TensorMath {
 
     // ---- 逐元素 ----
@@ -147,10 +142,7 @@ public class TensorMath {
         return acc;
     }
 
-    // 右操作数转置的矩阵乘：left 是 [m,k]，right 是 [n,k]，
-    // 结果[m,n] = Σ_p left[m,p]·right[n,p]（即 left · rightᵀ）。
-    // 自注意力打分就是这一形：q[m,k] · k[n,k]ᵀ。循环序 (m,n,p) 让两个
-    // 操作数都沿最后一维连续访问。
+    // 右操作数转置矩阵乘：left[m,k] · right[n,k]ᵀ -> [m,n]（(m,n,p) 循环保证双侧末维连续访问）。
     public static Tensor MatMulRightTransposed(Tensor left, Tensor right) {
         if (left.Rank() != 2 || right.Rank() != 2) {
             throw new ArgumentException("TensorMath.MatMulRightTransposed: expects 2D tensors");
@@ -182,31 +174,33 @@ public class TensorMath {
 
     // ---- 归一化与激活 ----
 
+    private static void SoftmaxSlice(Tensor src, float[] dst, int rowBase, int count) {
+        float max = TensorMath.MaxOf(src, rowBase, count);
+        float sum = 0.0f;
+        for (int i = 0; i < count; i = i + 1) {
+            float e = (float)MathUtil.Exp((double)(src.data[rowBase + i] - max));
+            dst[rowBase + i] = e;
+            sum = sum + e;
+        }
+        if (sum == 0.0f) {
+            for (int i = 0; i < count; i = i + 1) { dst[rowBase + i] = 0.0f; }
+        } else {
+            for (int i = 0; i < count; i = i + 1) { dst[rowBase + i] = dst[rowBase + i] / sum; }
+        }
+    }
+
     // Softmax：沿最后一维，数值稳定版（先减最大值）。
     public static Tensor Softmax(Tensor x) {
         int last = x.Dim(x.Rank() - 1);
         int rows = x.Count() / (last > 0 ? last : 1);
         float[] res = new float[x.Count()];
         for (int r = 0; r < rows; r = r + 1) {
-            int rowBase = r * last;
-            float max = TensorMath.MaxOf(x, rowBase, last);
-            float sum = 0.0f;
-            for (int i = 0; i < last; i = i + 1) {
-                float e = (float)MathUtil.Exp((double)(x.data[rowBase + i] - max));
-                res[rowBase + i] = e;
-                sum = sum + e;
-            }
-            if (sum == 0.0f) {
-                for (int i = 0; i < last; i = i + 1) { res[rowBase + i] = 0.0f; }
-            } else {
-                for (int i = 0; i < last; i = i + 1) { res[rowBase + i] = res[rowBase + i] / sum; }
-            }
+            TensorMath.SoftmaxSlice(x, res, r * last, last);
         }
         return new Tensor(x.Shape(), res);
     }
 
-    // 因果 Softmax：scores 是 [seq, seq]，第 i 行只能看 j ≤ i 的位置，
-    // 其余位置置 0（自注意力用）。空行（没有可见位置）整行留 0。
+    // 因果 Softmax（scores[seq, seq]，第 i 行仅保留 j <= i，其余为 0）。
     public static Tensor SoftmaxCausal(Tensor scores) {
         if (scores.Rank() != 2) {
             throw new ArgumentException("TensorMath.SoftmaxCausal: expects a 2D score matrix");
@@ -217,38 +211,25 @@ public class TensorMath {
         for (int i = 0; i < seq; i = i + 1) {
             int visible = i + 1;
             if (visible > width) { visible = width; }
-            /* width==0（如 [2,0] 张量，构造器允许）时 visible 钳到 0：
-               MaxOf 读空区间会越界，整行本就应留 0，直接跳过。 */
             if (visible <= 0) { continue; }
-            int rowBase = i * width;
-            float max = TensorMath.MaxOf(scores, rowBase, visible);
-            float sum = 0.0f;
-            for (int j = 0; j < visible; j = j + 1) {
-                float e = (float)MathUtil.Exp((double)(scores.data[rowBase + j] - max));
-                res[rowBase + j] = e;
-                sum = sum + e;
-            }
-            if (sum == 0.0f) {
-                for (int j = 0; j < visible; j = j + 1) { res[rowBase + j] = 0.0f; }
-            } else {
-                for (int j = 0; j < visible; j = j + 1) { res[rowBase + j] = res[rowBase + j] / sum; }
-            }
+            TensorMath.SoftmaxSlice(scores, res, i * width, visible);
         }
         return new Tensor(scores.Shape(), res);
     }
 
-    // RMSNorm：沿最后一维，结果 = x / sqrt(mean(x²) + eps) * weight。
-    // weight 为 null 时只做归一化不乘权重。
+    private static void RequireLastDimMatch(string op, string arg, Tensor t, int last) {
+        if (t != null && t.Count() != last) {
+            throw new ArgumentException("TensorMath." + op + ": " + arg + " length "
+                + Convert.ToString(t.Count()) + " != last dim "
+                + Convert.ToString(last));
+        }
+    }
+
+    // RMSNorm：沿最后一维 x / sqrt(mean(x²) + eps) * weight（weight 可为 null）。
     public static Tensor RMSNorm(Tensor x, float eps, Tensor weight) {
         int last = x.Dim(x.Rank() - 1);
         int rows = x.Count() / (last > 0 ? last : 1);
-        /* weight 长度与最后一维不符时，裸 IndexOutOfRange 指不出是谁的
-           形状错了——进函数先校验，报出两边长度。 */
-        if (weight != null && weight.Count() != last) {
-            throw new ArgumentException("TensorMath.RMSNorm: weight length "
-                + Convert.ToString(weight.Count()) + " != last dim "
-                + Convert.ToString(last));
-        }
+        TensorMath.RequireLastDimMatch("RMSNorm", "weight", weight, last);
         float[] res = new float[x.Count()];
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;
@@ -268,17 +249,8 @@ public class TensorMath {
     public static Tensor LayerNorm(Tensor x, float eps, Tensor weight, Tensor bias) {
         int last = x.Dim(x.Rank() - 1);
         int rows = x.Count() / (last > 0 ? last : 1);
-        /* weight/bias 长度与最后一维不符时报裸越界，进函数先校验。 */
-        if (weight != null && weight.Count() != last) {
-            throw new ArgumentException("TensorMath.LayerNorm: weight length "
-                + Convert.ToString(weight.Count()) + " != last dim "
-                + Convert.ToString(last));
-        }
-        if (bias != null && bias.Count() != last) {
-            throw new ArgumentException("TensorMath.LayerNorm: bias length "
-                + Convert.ToString(bias.Count()) + " != last dim "
-                + Convert.ToString(last));
-        }
+        TensorMath.RequireLastDimMatch("LayerNorm", "weight", weight, last);
+        TensorMath.RequireLastDimMatch("LayerNorm", "bias", bias, last);
         float[] res = new float[x.Count()];
         for (int r = 0; r < rows; r = r + 1) {
             int rowBase = r * last;

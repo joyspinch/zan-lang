@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
+using System.Data;
 using Zan.Web.Model;
 using Zan.Web.Core;
+using Zan.Web.Dao;
 
 namespace Zan.Web.Security;
 
@@ -18,15 +21,23 @@ public class DataScope {
 
     private int mode;
     private int userId;
+    private bool superUser;
     private List<int> depts;
+    private StrMap tags;
 
     public DataScope() {
         this.mode = ByDepts;
         this.userId = 0;
+        this.superUser = false;
         this.depts = new List<int>();
+        this.tags = null;
     }
 
     public bool Any() { return this.mode == All; }
+
+    public bool IsSuper() { return this.superUser; }
+
+    public void SetSuper(bool value) { this.superUser = value; }
 
     public bool ByDept() { return this.mode == ByDepts; }
 
@@ -35,6 +46,72 @@ public class DataScope {
     public List<int> Depts() { return this.depts; }
 
     public int UserId() { return this.userId; }
+
+    /* 可扩展上下文标签（如 tenantId / orgKey / companyId 等，供业务/多租户扩展钩子读写）。 */
+    public void SetTag(string key, string value) {
+        if (key == null || key.Length == 0) { return; }
+        if (this.tags == null) { this.tags = new StrMap(); }
+        this.tags.Set(key, value == null ? "" : value);
+    }
+
+    public void ApplyTags(Dictionary<string, string> claims) {
+        if (claims == null || claims.Count == 0) { return; }
+        List<string> keys = claims.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            string v = "";
+            claims.TryGetValue(k, out v);
+            this.SetTag(k, v);
+        }
+    }
+
+    public string Tag(string key) {
+        if (this.tags == null || key == null || key.Length == 0) { return ""; }
+        return this.tags.Get(key);
+    }
+
+    public bool HasTag(string key) {
+        return this.tags != null && key != null && key.Length > 0 && this.tags.Has(key);
+    }
+
+    /* 将当前数据范围收窄到指定部门集合（All → ByDepts；ByDepts → 求交集；空集 → fail-closed）。 */
+    public void NarrowToDepts(List<int> allowedDepts) {
+        if (this.mode == Self) { return; }
+        if (allowedDepts == null || allowedDepts.Count == 0) {
+            this.NarrowToNone();
+            return;
+        }
+        List<int> next = new List<int>();
+        if (this.mode == All) {
+            for (int i = 0; i < allowedDepts.Count; i = i + 1) {
+                Add(next, allowedDepts[i]);
+            }
+        } else {
+            for (int i = 0; i < this.depts.Count; i = i + 1) {
+                int id = this.depts[i];
+                if (id > 0 && Has(allowedDepts, id)) {
+                    Add(next, id);
+                }
+            }
+        }
+        if (next.Count == 0) {
+            this.NarrowToNone();
+            return;
+        }
+        this.mode = ByDepts;
+        this.depts = next;
+    }
+
+    public void NarrowToSelf() {
+        this.mode = Self;
+        this.depts = new List<int>();
+    }
+
+    public void NarrowToNone() {
+        this.mode = ByDepts;
+        this.depts = new List<int>();
+        this.depts.Add(0 - 1);
+    }
 
     public bool Covers(int rowUserId, int rowDepartmentId) {
         if (this.Any()) { return true; }
@@ -53,47 +130,96 @@ public class DataScope {
         DataScope sc = new DataScope();
         sc.mode = All;
         sc.userId = userId;
+        sc.superUser = true;
+        return sc;
+    }
+
+    private static DataScope RoleAllScope(int userId) {
+        DataScope sc = new DataScope();
+        sc.mode = All;
+        sc.userId = userId;
+        sc.superUser = false;
         return sc;
     }
 
     public static async DataScope Of(SysUser me, List<SysDepartment> departments) {
-        if (me == null || me.status != AuthUser.Active) {
+        return await Of(null, me, departments);
+    }
+
+    public static async DataScope Of(IDbConnection db, SysUser me, List<SysDepartment> departments) {
+        string uid = me == null ? "" : Convert.ToString(me.id);
+        return await Of(db, me, departments, PermTable.UserVersion(uid), false, null);
+    }
+
+    internal static async DataScope ForRequest(IDbConnection db, SysUser me, long userVersion,
+                                              Dictionary<string, string> claims = null) {
+        return await Of(db, me, null, userVersion, true, claims);
+    }
+
+    private static async DataScope Of(IDbConnection db, SysUser me,
+        List<SysDepartment> departments, long userVersion, bool loadDepartments,
+        Dictionary<string, string> claims) {
+        if (me == null || me.status != AuthUser.Active || userVersion == 0) { return None(); }
+        string uid = Convert.ToString(me.id);
+        if (PermTable.UserVersion(uid) != userVersion) { return None(); }
+        string roleIds = await AuthUser.RolesOf(db, uid);
+        if (PermTable.UserVersion(uid) != userVersion) { return None(); }
+        if (roleIds == "*") {
+            DataScope all = Everything(me.id);
+            all.ApplyTags(claims);
+            if (MvcHooks.HasScopeResolvers()) { await MvcHooks.RunScopeResolvers(db, me, all); }
+            return all;
+        }
+        if (roleIds.Length == 0 || (departments == null && !loadDepartments)) { return None(); }
+
+        long roleVersion = PermTable.RoleVersion();
+        if (roleVersion == 0) { return None(); }
+        string cached = PermTable.UserScopeEntry(uid, userVersion, roleVersion);
+        int sep = cached.IndexOf(":");
+        if (sep > 0) {
+            DataScope restored = Restore(me.id, Filter.ToInt(cached.Substring(0, sep), 0),
+                cached.Substring(sep + 1));
+            if (PermTable.RoleVersion() == roleVersion
+                && PermTable.UserVersion(uid) == userVersion) {
+                restored.ApplyTags(claims);
+                if (MvcHooks.HasScopeResolvers()) { await MvcHooks.RunScopeResolvers(db, me, restored); }
+                return restored;
+            }
             return None();
         }
-        if (me.isSuper == 1) { return Everything(me.id); }
-
-        string uid = Convert.ToString(me.id);
-        int cached = PermTable.UserScope(uid);
-        if (cached > 0) {
-            return Restore(me.id, cached, PermTable.UserDepts(uid));
+        DataScope sc = await Resolve(db, departments, me, roleIds, roleVersion);
+        if (PermTable.RoleVersion() != roleVersion || PermTable.UserVersion(uid) != userVersion) {
+            return None();
         }
-
-        string roleIds = await AuthUser.RolesOf(uid);
-        if (roleIds == "*") { return Everything(me.id); }
-        if (roleIds.Length == 0) { return None(); }
-        if (departments == null) { return None(); }
-
-        DataScope sc = await Resolve(departments, me, roleIds);
-        PermTable.SetUserScope(uid, sc.mode, Join(sc.depts));
+        PermTable.SetUserScope(uid, sc.mode, Join(sc.depts), userVersion, roleVersion);
+        if (PermTable.RoleVersion() != roleVersion || PermTable.UserVersion(uid) != userVersion) {
+            return None();
+        }
+        sc.ApplyTags(claims);
+        if (MvcHooks.HasScopeResolvers()) { await MvcHooks.RunScopeResolvers(db, me, sc); }
         return sc;
     }
 
-    private static async DataScope Resolve(List<SysDepartment> departments, SysUser me, string roleIds) {
+    private static async DataScope Resolve(IDbConnection db, List<SysDepartment> departments,
+        SysUser me, string roleIds, long version) {
         List<string> ids = PermTable.Split(roleIds);
         List<int> depts = new List<int>();
         bool tree = false;
         bool own = false;
+        bool self = false;
 
         for (int i = 0; i < ids.Count; i = i + 1) {
-            int scope = PermTable.RoleScope(ids[i]);
-            if (scope <= 0) { scope = RoleAll; }
-            if (scope == RoleAll) {
-                return Everything(me.id);
-            }
+            string policy = PermTable.RolePolicy(ids[i], version);
+            int sep = policy.IndexOf(":");
+            if (sep <= 0) { continue; }
+            int scope = Filter.ToInt(policy.Substring(0, sep), 0);
+            if (scope < RoleAll || scope > RoleCustom) { continue; }
+            if (scope == RoleAll) { return RoleAllScope(me.id); }
             if (scope == RoleDept) { own = true; }
             else if (scope == RoleDeptTree) { own = true; tree = true; }
+            else if (scope == RoleSelf) { self = true; }
             else if (scope == RoleCustom) {
-                List<string> named = PermTable.Split(PermTable.RoleDepts(ids[i]));
+                List<string> named = PermTable.Split(policy.Substring(sep + 1));
                 for (int j = 0; j < named.Count; j = j + 1) {
                     Add(depts, Filter.ToInt(named[j], 0));
                 }
@@ -104,12 +230,19 @@ public class DataScope {
             Add(depts, me.departmentId);
         }
         if (tree && me.departmentId > 0) {
-            Descend(departments, me.departmentId, depts);
+            if (departments == null) {
+                departments = await new SysDepartmentDao(db).All();
+            }
+            List<int> treeDepts = new List<int>();
+            treeDepts.Add(me.departmentId);
+            Descend(departments, me.departmentId, treeDepts);
+            for (int i = 1; i < treeDepts.Count; i = i + 1) { Add(depts, treeDepts[i]); }
         }
 
         DataScope sc = new DataScope();
         sc.userId = me.id;
         if (depts.Count == 0) {
+            if (!self) { return None(); }
             sc.mode = Self;
             return sc;
         }
@@ -131,6 +264,7 @@ public class DataScope {
     private static DataScope Restore(int userId, int mode, string depts) {
         DataScope sc = new DataScope();
         sc.userId = userId;
+        if (mode != ByDepts && mode != Self) { return None(); }
         sc.mode = mode;
         if (mode == ByDepts) {
             List<string> ids = PermTable.Split(depts);
@@ -165,10 +299,11 @@ public class DataScope {
     }
 
     public static string Label(int roleScope) {
+        if (roleScope == RoleAll) { return "全部数据"; }
         if (roleScope == RoleDept) { return "本部门"; }
         if (roleScope == RoleDeptTree) { return "本部门及下级"; }
         if (roleScope == RoleSelf) { return "仅本人"; }
         if (roleScope == RoleCustom) { return "自定义部门"; }
-        return "全部数据";
+        return "未配置";
     }
 }

@@ -1,7 +1,9 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Diagnostics;
 using System.IO;
+using System.Security.Cryptography;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Dao;
@@ -11,16 +13,17 @@ using Zan.Web;
 
 namespace Zan.Web.Admin.Media;
 
-/* /admin/media 媒体库。上传走 [Upload] 流式路由：整个请求体先落到
-   uploads/ 暂存（服务器命名，客户端文件名不参与路径），文件名经 ?name=
-   传入；入库前 SafeFileName + 扩展名白名单双重消毒，再改名挪进公开目录
-   wwwroot/media/（由 /static 唯一挂载对外服务，URL /static/media/<名>）。
-   svg 可携带同源脚本，白名单默认不放行；保持默认拒绝——不在表内的一律
-   拒绝。 */
+/* 上传体先由 [Upload] 写入暂存文件。展示名经 SafeFileName 处理，
+   公开路径单独分配。/static/media/ 同时服务既有路径和新生成的路径。
+   白名单默认拒绝 SVG 等可携带同源脚本的类型。 */
 [Custom(Authorization = CustomAuthorization.Grant, Group = "媒体库", GroupOrder = 60)]
 [Description("媒体库")]
 public class MediaController : AdminController {
     SysMediaFileDao SysMediaFile { get { return new SysMediaFileDao(this.Held()); } }
+    private static const string MediaDir = "wwwroot/media";
+    private static const string MediaUrl = "/static/media/";
+    // StaticFiles rejects dot-prefixed segments. Keep staging on the media volume.
+    private static const string DeleteDir = "wwwroot/media/.media-delete";
     /* 上传白名单：图片/文档/压缩包/音视频。 */
     static string Allowed = "png,jpg,jpeg,gif,webp,ico,bmp,"
         + "pdf,txt,md,csv,doc,docx,xls,xlsx,ppt,pptx,"
@@ -45,39 +48,61 @@ public class MediaController : AdminController {
     [Custom(Perm = PermBit.Create, Upload = true)]
     [Description("上传媒体")]
     public async void Upload() {
-        string spool = this.ctx.UploadPath();
-        if (spool.Length == 0) { this.Fail(400, "0004", "没有上传内容"); }
-        if (this.ctx.UploadSize() <= 0) {
-            File.Delete(spool);
-            this.Fail(400, "0004", "上传内容为空");
-        }
+        long size = this.ctx.UploadSize();
         string safe = Validator.SafeFileName(this.In("name"));
-        string ext = ExtOf(safe);
-        if (!Validator.ExtAllowed(safe.ToLower(), Allowed)) {
-            /* 拒收也要清掉暂存包，uploads/ 不留垃圾。 */
-            File.Delete(spool);
-            if (ext.Length > 0) { this.Fail(400, "0004", "不支持的文件类型 ." + ext); }
-            this.Fail(400, "0004", "文件缺少扩展名");
+        string spool = this.ctx.TakeUpload();
+        if (spool.Length == 0) { this.Fail(400, "0004", "没有上传内容"); }
+        string dest = "";
+        bool published = false;
+        bool committing = false;
+        try {
+            if (size <= 0) { this.Fail(400, "0004", "上传内容为空"); }
+            if (safe.Length > 255) { this.Fail(400, "0004", "文件名过长"); }
+            string ext = ExtOf(safe);
+            if (!Validator.ExtAllowed(safe.ToLower(), Allowed)) {
+                if (ext.Length > 0) { this.Fail(400, "0004", "不支持的文件类型 ." + ext); }
+                this.Fail(400, "0004", "文件缺少扩展名");
+            }
+            byte[] random = RandomNumberGenerator.GetBytes(16);
+            if (random == null) { throw new IOException("无法分配媒体文件名"); }
+            SysMediaFile m = new SysMediaFile();
+            m.name = safe;
+            m.path = Hex.Encode(random, 16) + "." + ext;
+            m.ext = ext;
+            m.size = size;
+            m.uploadedBy = this.who != null ? this.who.username : "";
+            m.createdAt = WebApp.NowSeconds();
+            string storedPath = m.path;
+            dest = Path.Combine(MediaDir, storedPath);
+            if (size > StaticFiles.MaxFileBytes && this.UsesBuiltInMediaMount(storedPath, dest)) {
+                this.Fail(413, "0004", "媒体文件超过静态资源服务的 4 MiB 上限");
+            }
+            if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
+            if (await this.SysMediaFile.Where(a => a.path == storedPath).AnyAsync()) {
+                throw new IOException("媒体路径已分配 " + dest);
+            }
+            long gate = this.LockMedia();
+            try {
+                MoveMedia(spool, dest);
+                published = true;
+            } finally {
+                File.Unlock(gate);
+            }
+            int inserted = await this.SysMediaFile.Insert(m).ExecuteAffrowsAsync();
+            if (inserted != 1) { throw new Exception("媒体记录未写入"); }
+            committing = true;
+            await this.Commit();
+        } catch (Exception ex) {
+            await this.RollbackMedia();
+            if (published) {
+                if (committing) { ReportMediaIssue("upload commit unconfirmed, retained " + dest); }
+                else { RemoveFile(dest); }
+            }
+            throw;
+        } finally {
+            RemoveFile(spool);
         }
-        Directory.CreateDirectoryRecursive("wwwroot/media");
-        string fileName = safe;
-        string dest = "wwwroot/media/" + fileName;
-        for (int i = 1; i <= 100 && File.Exists(dest); i = i + 1) {
-            fileName = Convert.ToString(WebApp.NowSeconds()) + "_"
-                + Convert.ToString(i) + "_" + safe;
-            dest = "wwwroot/media/" + fileName;
-        }
-        File.Move(spool, dest);
-
-        SysMediaFile m = new SysMediaFile();
-        m.name = safe;
-        m.path = fileName;
-        m.ext = ext;
-        m.size = this.ctx.UploadSize();
-        m.uploadedBy = this.who != null ? this.who.username : "";
-        m.createdAt = WebApp.NowSeconds();
-        int newId = await this.SysMediaFile.Insert(m).ExecuteIdentityAsync();
-        await this.Note("上传媒体", safe, newId > 0, "");
+        await this.AuditMedia("上传媒体", safe);
         this.Saved("已上传 " + safe);
     }
 
@@ -86,16 +111,162 @@ public class MediaController : AdminController {
     [Description("删除媒体")]
     public async void Delete() {
         int id = this.InInt("id", 0);
-        SysMediaFile m = await this.SysMediaFile.ById(id);
-        if (m == null) { this.Fail(404, "0404", "文件不存在"); }
-        /* path 是服务端 SafeFileName 的产物、无目录成分；删除仍按文件名
-           拼回媒体目录，不信任库里的完整路径。 */
-        string disk = "wwwroot/media/" + m.path;
-        if (File.Exists(disk)) { File.Delete(disk); }
-        int n = await this.SysMediaFile.Delete().Where(a => a.id == id)
-            .ExecuteAffrowsAsync();
-        await this.Note("删除媒体", m.name, n > 0, "");
+        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
+        long gate = LockMedia();
+        string name = "";
+        string disk = "";
+        string staged = "";
+        string foldedPath = "";
+        bool committing = false;
+        try {
+            SysMediaFile m = await this.SysMediaFile.ById(id);
+            if (m == null) { this.Fail(404, "0404", "文件不存在"); }
+            name = m.name;
+            string storedPath = m.path;
+            if (storedPath.Length == 0 || storedPath != Validator.SafeFileName(storedPath)) {
+                throw new IOException("媒体记录的文件名无效");
+            }
+            disk = Path.Combine(MediaDir, storedPath);
+            if (Directory.Exists(disk) || File.IsReparsePoint(disk)) {
+                throw new IOException("媒体记录未指向普通文件");
+            }
+            // 旧记录可能共用原文件名。最后一条引用删除时才移动文件。
+            foldedPath = storedPath.ToLower();
+            bool shared = await this.SysMediaFile.Where(a => a.id != id)
+                .Where(a => a.path.ToLower() == foldedPath).AnyAsync();
+            if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
+            int deleted = await this.SysMediaFile.Delete().Where(a => a.id == id)
+                .Where(a => a.path == storedPath).ExecuteAffrowsAsync();
+            if (deleted == 0) { this.Fail(409, "1005", "媒体记录已变更，请刷新后重试"); }
+            if (deleted != 1) { throw new Exception("媒体记录未删除"); }
+            if (!shared) { staged = StageDeletedFile(id, storedPath, disk); }
+            committing = true;
+            await this.Commit();
+            if (staged.Length > 0) { RemoveFile(staged); }
+        } catch (Exception ex) {
+            bool rolledBack = await this.RollbackMedia();
+            if (staged.Length > 0) {
+                if (!committing) {
+                    RestoreFile(disk, staged);
+                } else if (rolledBack) {
+                    await this.ReconcileDelete(foldedPath, disk, staged);
+                } else {
+                    ReportMediaIssue("delete commit unconfirmed, retained " + staged);
+                }
+            }
+            throw;
+        } finally {
+            File.Unlock(gate);
+        }
+        await this.AuditMedia("删除媒体", name);
         this.Saved("文件已删除");
+    }
+
+    private bool UsesBuiltInMediaMount(string storedPath, string disk) {
+        WebApp app = this.ctx.App();
+        if (app == null) { return false; }
+        string url = MediaUrl + storedPath;
+        List<StaticMount> mounts = app.StaticMounts();
+        for (int i = 0; i < mounts.Count; i = i + 1) {
+            StaticMount mount = mounts[i];
+            string rel = StaticFiles.RelativeTo(url, mount.Prefix());
+            if (rel == null) { continue; }
+            // ServeStatic uses the first matching mount. Compare the resolved file.
+            string served = Path.GetFullPath(mount.Root() + "/" + rel);
+            string published = Path.GetFullPath(disk);
+            #if WINDOWS
+            return served.ToLower() == published.ToLower();
+            #else
+            return served == published;
+            #endif
+        }
+        return false;
+    }
+
+    private async void ReconcileDelete(string foldedPath, string disk, string staged) {
+        try {
+            // ROLLBACK acknowledgement ends the old transaction but can also follow
+            // a successful COMMIT. Discard that session before reading the primary.
+            this.DiscardLease();
+            IDbConnection db = await this.Conn();
+            if (db == null) {
+                ReportMediaIssue("delete verification unavailable, retained " + staged);
+                return;
+            }
+            bool referenced = await this.SysMediaFile.Where(a => a.path.ToLower() == foldedPath).AnyAsync();
+            if (referenced) { RestoreFile(disk, staged); }
+            else { RemoveFile(staged); }
+        } catch (Exception ex) {
+            ReportMediaIssue("delete verification failed, retained " + staged + " - " + ex.Message);
+        }
+    }
+
+    private long LockMedia() {
+        Directory.CreateDirectoryRecursive(DeleteDir);
+        // 多个 worker 共用媒体目录，串行处理文件发布、旧引用和补偿。
+        long gate = File.TryLock(Path.Combine(DeleteDir, ".lock"));
+        if (gate == 0) { this.Fail(409, "1005", "媒体文件正在处理，请稍后重试"); }
+        return gate;
+    }
+
+    // 调用方持有媒体目录锁。发布与恢复都只移动到空闲路径。
+    private static void MoveMedia(string source, string dest) {
+        if (File.Exists(dest) || Directory.Exists(dest) || File.IsReparsePoint(dest)) {
+            throw new IOException("媒体路径已存在 " + dest);
+        }
+        File.Move(source, dest);
+    }
+
+    private static string StageDeletedFile(int id, string path, string disk) {
+        string staged = Path.Combine(DeleteDir, Convert.ToString(id) + "-" + Hex.Encode(Sha256.Hash(path), 32));
+        if (Directory.Exists(staged) || File.IsReparsePoint(staged)) {
+            throw new IOException("媒体删除暂存路径无效");
+        }
+        if (File.Exists(staged)) {
+            if (File.Exists(disk)) { throw new IOException("媒体删除暂存文件待处理 " + staged); }
+            return staged;
+        }
+        if (!File.Exists(disk)) { return ""; }
+        MoveMedia(disk, staged);
+        return staged;
+    }
+
+    private static void RestoreFile(string disk, string staged) {
+        try { MoveMedia(staged, disk); }
+        catch (Exception ex) {
+            ReportMediaIssue("could not restore " + disk + " from " + staged + " - " + ex.Message);
+        }
+    }
+
+    private static void RemoveFile(string path) {
+        try {
+            File.Delete(path);
+            if (File.Exists(path) || File.IsReparsePoint(path)) {
+                ReportMediaIssue("could not remove " + path);
+            }
+        } catch (Exception ex) {
+            ReportMediaIssue("could not remove " + path + " - " + ex.Message);
+        }
+    }
+
+    private static void ReportMediaIssue(string message) {
+        try { Log.Error("[media] " + message); }
+        catch (Exception ex) { }
+    }
+
+    private async bool RollbackMedia() {
+        try {
+            await this.Rollback();
+            return true;
+        } catch (Exception ex) {
+            ReportMediaIssue("rollback failed: " + ex.Message);
+            return false;
+        }
+    }
+
+    private async void AuditMedia(string title, string name) {
+        try { await this.Note(title, name, true, ""); }
+        catch (Exception ex) { ReportMediaIssue("audit failed: " + ex.Message); }
     }
 
     /* 取最后一个点之后的扩展名并转小写；无点或点在末尾视为无扩展名。 */

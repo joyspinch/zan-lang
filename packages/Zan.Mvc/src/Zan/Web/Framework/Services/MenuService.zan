@@ -1,0 +1,276 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Dao;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web;
+
+namespace Zan.Web.Services;
+
+/* 数据库驱动动态菜单服务：
+   1) 启动幂等扫描路由表同步 sys_menu（保留 customized=1 的人工编辑，只更新路由路径）；
+   2) 运行期按进程内缓存 + 共享 CacheContext 版本键加载活动菜单，避免每请求扫库；
+   3) 若库未就绪、表不存在或尚未同步任何菜单，自动回退到 MenuBuilder 路由直出（保障极简测试与降级可用）。 */
+public class MenuService {
+    private static const string VerCacheKey = "mvc:menu:ver";
+    private static List<SysMenu> cachedRows = null;
+    private static long localVersion = 1;
+    private static long loadedLocalVersion = -1;
+    private static string loadedSharedVersion = "";
+
+    /* 菜单发生变更（管理端 CRUD / 重新同步）后主动失效本地与共享缓存。 */
+    public static async Task Invalidate(CacheContext cache = null) {
+        lock (VerCacheKey) {
+            localVersion = localVersion + 1;
+            cachedRows = null;
+            loadedLocalVersion = -1;
+        }
+        CacheContext target = cache != null ? cache : ActiveCache();
+        if (target != null && target.Shared()) {
+            string token = Convert.ToString(WebApp.NowSeconds()) + ":" + Convert.ToString(localVersion);
+            await target.SetAsync(VerCacheKey, token);
+        }
+    }
+
+    private static CacheContext ActiveCache() {
+        AppServices svc = AppServices.Current();
+        return svc != null ? svc.Cache() : null;
+    }
+
+    /* 启动 / 手动幂等同步：将带 [Custom(IsMenu = true)] 的 GET 路由写入 sys_menu。 */
+    public static async bool SyncRoutes(WebApp app, IDbConnection db = null, CacheContext cache = null) {
+        if (app == null) { return false; }
+        bool ownLease = db == null;
+        IDbConnection conn = ownLease ? await AuthUser.Lease() : db;
+        if (conn == null) { return false; }
+        try {
+            SysMenuDao dao = new SysMenuDao(conn);
+            List<SysMenu> existing = await dao.AllOrdered();
+            StrMap byActionIdx = new StrMap();
+            for (int i = 0; i < existing.Count; i = i + 1) {
+                if (existing[i].actionKey.Length > 0) {
+                    byActionIdx.Set(existing[i].actionKey, Convert.ToString(i));
+                }
+            }
+
+            List<Route> routes = app.Router().All();
+            StrMap seenRoutes = new StrMap();
+            long now = WebApp.NowSeconds();
+            int changed = 0;
+            int seq = 0;
+            for (int i = 0; i < routes.Count; i = i + 1) {
+                Route r = routes[i];
+                if (!r.InMenu() || r.Method() != "GET") { continue; }
+                if (r.MetaGet("Hidden") == "true") { continue; }
+                string routeKey = r.Method() + " " + r.Pattern();
+                if (seenRoutes.Has(routeKey)) { continue; }
+                seenRoutes.Set(routeKey, "1");
+                string action = r.Action();
+                if (action.Length == 0) { continue; }
+
+                seq = seq + 1;
+                string title = r.GetTitle();
+                if (title.Length == 0) { title = action; }
+                string path = r.Pattern();
+                string groupName = r.MetaGet("Group");
+                if (groupName.Length == 0) { groupName = MenuBuilder.GroupOf(path); }
+                int groupOrder = MenuBuilder.OrderOfGroup(groupName, path);
+                string explicitGroupOrder = r.MetaGet("GroupOrder");
+                if (explicitGroupOrder.Length > 0) {
+                    groupOrder = Filter.ToInt(explicitGroupOrder, groupOrder);
+                }
+                int sortOrder = seq * 10;
+                string explicitOrder = r.MetaGet("Order");
+                if (explicitOrder.Length > 0) {
+                    int parsed = Filter.ToInt(explicitOrder, -1);
+                    if (parsed >= 0) { sortOrder = parsed; }
+                }
+                string icon = r.MetaGet("Icon");
+                if (icon.Length == 0) { icon = "mdi:antenna"; }
+                string permAction = r.NeedsAuth() ? action : "";
+
+                if (!byActionIdx.Has(action)) {
+                    SysMenu row = new SysMenu();
+                    row.parentId = 0;
+                    row.actionKey = action;
+                    row.title = title;
+                    row.path = path;
+                    row.groupName = groupName;
+                    row.groupOrder = groupOrder;
+                    row.sortOrder = sortOrder;
+                    row.icon = icon;
+                    row.permAction = permAction;
+                    row.hidden = 0;
+                    row.status = 1;
+                    row.customized = 0;
+                    row.isExternal = 0;
+                    row.createdAt = now;
+                    row.updatedAt = now;
+                    int _newId = await dao.Insert(row).ExecuteIdentityAsync();
+                    changed = changed + 1;
+                    continue;
+                }
+
+                int idx = Filter.ToInt(byActionIdx.Get(action), -1);
+                SysMenu cur = idx >= 0 && idx < existing.Count ? existing[idx] : null;
+                if (cur == null) { continue; }
+
+                if (cur.customized == 1) {
+                    /* 管理员已手工定制：保留标题/分组/排序/图标/显隐，仅当路由路径或权限键变化时同步。 */
+                    if (cur.isExternal == 0 && (cur.path != path || cur.permAction != permAction)) {
+                        int _u = await dao.Update()
+                            .Set(a => a.path, path)
+                            .Set(a => a.permAction, permAction)
+                            .Set(a => a.updatedAt, now)
+                            .Where(a => a.id == cur.id)
+                            .ExecuteAffrowsAsync();
+                        changed = changed + 1;
+                    }
+                    continue;
+                }
+
+                bool dirty = cur.title != title || cur.path != path
+                    || cur.groupName != groupName || cur.groupOrder != groupOrder
+                    || cur.icon != icon || cur.permAction != permAction;
+                if (dirty) {
+                    int _u = await dao.Update()
+                        .Set(a => a.title, title)
+                        .Set(a => a.path, path)
+                        .Set(a => a.groupName, groupName)
+                        .Set(a => a.groupOrder, groupOrder)
+                        .Set(a => a.icon, icon)
+                        .Set(a => a.permAction, permAction)
+                        .Set(a => a.updatedAt, now)
+                        .Where(a => a.id == cur.id)
+                        .ExecuteAffrowsAsync();
+                    changed = changed + 1;
+                }
+            }
+            if (changed > 0) {
+                await Invalidate(cache);
+            }
+            return true;
+        } catch (Exception ex) {
+            Log.Warn("[menu] route sync skipped: " + ex.Message);
+            return false;
+        } finally {
+            if (ownLease) { AuthUser.Give(conn); }
+        }
+    }
+
+    private static async List<SysMenu> CachedMenus(IDbConnection db) {
+        if (db == null) { return null; }
+        CacheContext cache = ActiveCache();
+        string sharedVer = "";
+        if (cache != null && cache.Shared()) {
+            sharedVer = await cache.GetAsync(VerCacheKey);
+        }
+        lock (VerCacheKey) {
+            if (cachedRows != null && loadedLocalVersion == localVersion
+                && loadedSharedVersion == sharedVer) {
+                return cachedRows;
+            }
+        }
+        List<SysMenu> fresh = null;
+        try {
+            fresh = await new SysMenuDao(db).AllOrdered();
+        } catch (Exception _ex) {
+            /* 测试夹具或降级态下 sys_menu 可能未建表，调用方自动回退到 MenuBuilder。 */
+            return null;
+        }
+        if (fresh == null || fresh.Count == 0) {
+            return null;
+        }
+        lock (VerCacheKey) {
+            cachedRows = fresh;
+            loadedLocalVersion = localVersion;
+            loadedSharedVersion = sharedVer;
+        }
+        return fresh;
+    }
+
+    /* 为当前登录账号构建可见菜单节点（复用请求租约 db），统一执行 MenuHook 与排序。 */
+    public static async List<MenuNode> ForUser(WebApp app, string uid, string activePath, IDbConnection db = null) {
+        if (app == null) { return new List<MenuNode>(); }
+        int qAt = activePath != null ? activePath.IndexOf("?") : -1;
+        string matchPath = qAt >= 0 ? activePath.Substring(0, qAt) : (activePath != null ? activePath : "");
+        if (db == null) {
+            List<MenuNode> fallbackNoDb = DedupNodes(await MenuBuilder.ForUser(app, uid, matchPath, null));
+            if (MvcHooks.HasMenuHooks()) {
+                await MvcHooks.RunMenuHooks(null, uid, activePath, fallbackNoDb);
+            }
+            MenuBuilder.Sort(fallbackNoDb);
+            return fallbackNoDb;
+        }
+        List<SysMenu> rows = await CachedMenus(db);
+        if (rows == null || rows.Count == 0) {
+            List<MenuNode> fallback = DedupNodes(await MenuBuilder.ForUser(app, uid, matchPath, db));
+            if (MvcHooks.HasMenuHooks()) {
+                await MvcHooks.RunMenuHooks(db, uid, activePath, fallback);
+            }
+            MenuBuilder.Sort(fallback);
+            return fallback;
+        }
+        List<MenuNode> outp = new List<MenuNode>();
+        StrMap seenPaths = new StrMap();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysMenu row = rows[i];
+            if (row.status != 1 || row.hidden == 1) { continue; }
+            if (uid.Length == 0) { continue; }
+            if (row.permAction.Length > 0 && !await AuthUser.Allow(db, uid, row.permAction)) {
+                continue;
+            }
+            if (row.path.Length > 0) {
+                if (seenPaths.Has(row.path)) { continue; }
+                seenPaths.Set(row.path, "1");
+            }
+            MenuNode n = new MenuNode();
+            n.SetTitle(row.title);
+            n.SetPath(row.path);
+            n.SetGroup(row.groupName);
+            n.SetGroupOrder(row.groupOrder);
+            n.SetOrder(PadSort(row.sortOrder) + "|" + row.path);
+            n.SetIcon(row.icon.Length > 0 ? row.icon : "mdi:antenna");
+            n.SetActive(MenuBuilder.Matches(row.path, matchPath));
+            outp.Add(n);
+        }
+        if (MvcHooks.HasMenuHooks()) {
+            await MvcHooks.RunMenuHooks(db, uid, activePath, outp);
+        }
+        MenuBuilder.Sort(outp);
+        return outp;
+    }
+
+    private static List<MenuNode> DedupNodes(List<MenuNode> nodes) {
+        if (nodes == null || nodes.Count <= 1) { return nodes; }
+        List<MenuNode> outp = new List<MenuNode>();
+        StrMap seen = new StrMap();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            string p = nodes[i].Path();
+            if (p.Length > 0) {
+                if (seen.Has(p)) { continue; }
+                seen.Set(p, "1");
+            }
+            outp.Add(nodes[i]);
+        }
+        return outp;
+    }
+
+    /* 登录后默认落地页：该账号可到达的第一个菜单项。 */
+    public static async string LandingFor(WebApp app, string uid, IDbConnection db = null) {
+        List<MenuNode> nodes = await ForUser(app, uid, "", db);
+        if (nodes.Count == 0) { return ""; }
+        return nodes[0].Path();
+    }
+
+    private static string PadSort(int n) {
+        if (n < 0) { n = 0; }
+        if (n > 999999) { n = 999999; }
+        string s = Convert.ToString(n);
+        while (s.Length < 6) { s = "0" + s; }
+        return s;
+    }
+}

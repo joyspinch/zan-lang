@@ -2,132 +2,62 @@ using System;
 using System.Text;
 namespace System.Text.RegularExpressions;
 
-// 模式的编译形态及其执行引擎：模式被解析为小型指令程序
-// （Thompson 风格：Char / Any / Class / Split / Jmp / Save / 断言），
-// 由回溯解释器对输入执行。
-// 指令存放于四个并行的 int 列表（op / x / y / z），无需为模式的
-// 每个字符分配对象；解释器通过字节缓冲区而非 Substring 读取输入。
-// 匹配的单位是 **UTF-8 码点**：`.`、字符类和字面量都按整个码点
-// 前进，因此 `^.$` 能匹配 "中"、`[中文]` 是合法的类。
-// 这是 <see cref="Regex"/> 的实现细节，请直接使用 Regex。
-// 支持的语法：字面量、`.`、带范围/取反的字符类（类内可用
-// `\d \D \w \W \s \S` 与 POSIX `[:alpha:]` 等）、`\b \B \A \z \Z \G`、
-// 转义 `\n \r \t \f \v \a \e \0 \xHH \x{HH..} \uXXXX \cX`、
-// 分组 `( )` `(?: )` `(?<name> )`、原子组 `(?> )`、注释 `(?# )`、
-// 环视 `(?= ) (?! ) (?<= ) (?<! )`（回顾须定长）、交替 `|`、
-// 量词 `* + ? {n} {n,} {n,m}`（均有惰性 `?` 形式）、
-// 锚点 `^ $`、反向引用 `\1`-`\99` 与 `\k&lt;name&gt;`，
-// 以及只能出现在模式开头的内联标志 `(?i)(?m)(?s)`。
-// 不支持的语法一律在编译期报错，绝不"接受但永不匹配"。
+// UTF-8 码点级编译正则程序与有界回溯解释器（供 Regex 内部使用）。
 public partial class RegexProgram {
-    // 操作码
-    // 操作码：匹配一个字面码点（ax=码点）。
     public static int OpChar() { return 1; }
-    // 操作码：`.` 匹配任意码点（未开 dotAll 时排除 \n）。
     public static int OpAny() { return 2; }
-    // 操作码：匹配字符类（ax=类索引）。
     public static int OpClass() { return 3; }
-    // 操作码：匹配成功终点。
     public static int OpMatch() { return 4; }
-    // 操作码：无条件跳转（ax=目标地址）。
     public static int OpJmp() { return 5; }
-    // 操作码：回溯分叉（先试 ax，失败再试 ay）。
     public static int OpSplit() { return 6; }
-    // 操作码：记录捕获位置（ax=槽位，组 g 用 2g/2g+1）。
     public static int OpSave() { return 7; }
-    // 操作码：`^` 行首断言。
     public static int OpBol() { return 8; }
-    // 操作码：`$` 行尾断言。
     public static int OpEol() { return 9; }
-    // 操作码：`\b`/`\B` 词边界断言（ax=1 为 \b，0 为 \B）。
     public static int OpWordB() { return 10; }
-    // 操作码：反向引用（ax=组号）。
     public static int OpBackref() { return 11; }
-    // 操作码：`\A` 输入起点断言。
-    public static int OpBos() { return 12; }  // \A
-    // 操作码：`\z`/`\Z` 输入终点断言。
-    public static int OpEos() { return 13; }  // \z（ax=1 时为 \Z）
-    // 操作码：`\G` 上次匹配起点断言。
-    public static int OpGpos() { return 14; }  // \G
-    // 操作码：把当前 sp 存入标记槽位，供空循环检查。
-    public static int OpMark() { return 15; }  // 记录 sp，供空循环检查
-    // 操作码：主体这一轮没有前进就跳出循环。
-    public static int OpEmptyChk() { return 16; }  // 本轮没前进就跳出循环
-    // 操作码：环视 / 原子组入口（ax=种类，ay=断言后的继续地址）。
-    public static int OpLook() { return 17; }  // 环视 / 原子组
-    // 操作码：环视子程序终点，回传子匹配结束位置。
-    public static int OpLookEnd() { return 18; }  // 环视子程序的终点
+    public static int OpBos() { return 12; }
+    public static int OpEos() { return 13; }
+    public static int OpGpos() { return 14; }
+    public static int OpMark() { return 15; }
+    public static int OpEmptyChk() { return 16; }
+    public static int OpLook() { return 17; }
+    public static int OpLookEnd() { return 18; }
 
-    // 环视种类（OpLook.ax）
-    // 环视种类：顺序肯定 `(?=...)`。
     public static int LookAhead() { return 0; }
-    // 环视种类：顺序否定 `(?!...)`。
     public static int LookAheadNeg() { return 1; }
-    // 环视种类：回顾肯定 `(?<=...)`。
     public static int LookBehind() { return 2; }
-    // 环视种类：回顾否定 `(?<!...)`。
     public static int LookBehindNeg() { return 3; }
-    // 环视种类：原子组 `(?>...)`。
     public static int LookAtomic() { return 4; }
 
-    // 字符类成员种类（clsKind）
-    // 字符类成员种类：码点范围。
-    public static int MemRange() { return 0; }  // [lo, hi]
-    // 字符类成员种类：不属于简写集合 lo（用于类内 \D \W \S）。
-    public static int MemNotSet() { return 1; }  // 不属于简写集合 lo（'d'/'w'/'s'）
+    public static int MemRange() { return 0; }
+    public static int MemNotSet() { return 1; }
 
-    // 操作码列。
     List<int> op;
-    // x 操作数列（常为指令地址、码点或组号）。
     List<int> ax;
-    // y 操作数列。
     List<int> ay;
-    // z 操作数列。
     List<int> az;
 
-    // 字符类：类 c 的成员位于 clsKind/clsLo/clsHi[clsStart[c] ..
-    // clsStart[c] + clsCount[c])，当 clsNeg[c] == 1 时整类取反。
-    // 成员种类（MemRange/MemNotSet）。
     List<int> clsKind;
-    // 成员下界（MemRange）或简写集合字母（MemNotSet）。
     List<int> clsLo;
-    // 成员上界（MemRange 用）。
     List<int> clsHi;
-    // 类 c 的成员区间起点。
     List<int> clsStart;
-    // 类 c 的成员个数。
     List<int> clsCount;
-    // 1 表示整类取反。
     List<int> clsNeg;
 
-    // 命名组实体列表（消除平行列表反模式）。
     List<RegexNamedGroup> namedGroups;
 
-    // 捕获组数量，组 0 为整个匹配。
     int groups;
-    // 空循环检查用的槽位数。
     int marks;
-    // (?i)：ASCII 大小写折叠比较。
     bool ignoreCase;
-
-    // 回溯递归深度上限（Step 的 depth 参数）。预算 2M 步只限总步数
-    // 不限深度，深递归先撞线程栈——超帽抛 RegexBudgetException。
-    // 量级对照 parser 深度帽（512~10000 档）；调大以线程栈余量为界。
+    // 与步数预算（2M）互补：防单量词在长输入上深递归打穿线程栈。
     static int MaxRecursionDepth = 10000;
-    // (?m)：^ $ 也匹配行边界
     bool multiline;
-    // (?s)：. 也匹配 \n
     bool dotAll;
-    // 编译所用的模式文本。
     string pattern;
-    // 解析失败原因，成功为 ""。
     string error;
 
-    // 指向模式字节的解析游标
     nint pbuf;
-    // 模式字节长度。
     int plen;
-    // 当前解析位置（字节偏移）。
     int ppos;
 
     public RegexProgram() {
@@ -154,19 +84,14 @@ public partial class RegexProgram {
         this.ppos = 0;
     }
 
-    // 解析 `pattern`。之后检查 <see cref="Error"/>：
-    // 可用时为空字符串，否则为失败原因。
     public static RegexProgram Compile(string pattern, bool ignoreCase) {
         RegexProgram p = new RegexProgram();
         p.pattern = pattern;
         p.ignoreCase = ignoreCase;
         p.plen = pattern.Length;
         p.pbuf = NativeMemory.Alloc(p.plen + 1);
-        if (p.plen > 0) {
-            NativeMemory.PutString(p.pbuf, 0, pattern, p.plen);
-        }
+        if (p.plen > 0) { NativeMemory.PutString(p.pbuf, 0, pattern, p.plen); }
         p.ParseInlineFlags();
-        // 组 0 覆盖整个匹配
         p.Emit(RegexProgram.OpSave(), 0, 0, 0);
         p.ParseAlt();
         if (p.error.Length == 0 && p.ppos < p.plen) {
@@ -179,16 +104,10 @@ public partial class RegexProgram {
         return p;
     }
 
-    // 模式解析成功时返回 ""，否则返回失败原因。
     public string Error() { return this.error; }
-
-    // 捕获组数量，含组 0。
     public int GroupCount() { return this.groups; }
-
-    // 此程序编译所用的模式。
     public string Pattern() { return this.pattern; }
 
-    // 命名组 `name` 的组号，没有该名字时返回 -1。
     public int GroupNumber(string name) {
         if (this.namedGroups != null) {
             for (int i = 0; i < this.namedGroups.Count; i = i + 1) {
@@ -198,7 +117,6 @@ public partial class RegexProgram {
         return -1;
     }
 
-    // 所有命名组的名字（顺序与出现顺序一致）。
     public List<string> GroupNames() {
         List<string> names = new List<string>();
         if (this.namedGroups != null) {
@@ -209,11 +127,7 @@ public partial class RegexProgram {
         return names;
     }
 
-    // ---- UTF-8 ---------------------------------------------------------
-
-    // 解码 `buf + sp` 处的码点，返回 `(码点 &lt;&lt; 3) | 字节数`；
-    // sp 到达末尾时返回 -1。非法字节按 U+FFFD、1 字节处理，这样
-    // 引擎在任意字节串上都能前进而不会卡住。
+    // 返回 `(cp << 3) | byteLen`，到达末尾返回 -1；非法 UTF-8 回退为 U+FFFD/1 字节以保证前进。
     public static int DecodeAt(nint buf, int len, int sp) {
         if (sp < 0 || sp >= len) { return -1; }
         int b0 = new Span<byte>(buf + sp, 1)[0];
@@ -241,15 +155,11 @@ public partial class RegexProgram {
         return (cp * 8) | (need + 1);
     }
 
-    // 从 `sp` 向后推进一个码点所需的字节数（至少 1）。
-    // 扫描下一个起点时用它，避免停在多字节字符的中间。
     public static int StepWidth(nint buf, int len, int sp) {
         int packed = RegexProgram.DecodeAt(buf, len, sp);
-        if (packed < 0) { return 1; }
-        return packed & 7;
+        return packed < 0 ? 1 : packed & 7;
     }
 
-    // 码点的 UTF-8 字节数。
     public static int Utf8Len(int cp) {
         if (cp < 128) { return 1; }
         if (cp < 2048) { return 2; }
@@ -257,9 +167,6 @@ public partial class RegexProgram {
         return 4;
     }
 
-    // ---- 发射辅助 ----------------------------------------------------
-
-    // 追加一条指令，返回其地址。
     public int Emit(int o, int x, int y, int z) {
         this.op.Add(o);
         this.ax.Add(x);
@@ -268,51 +175,34 @@ public partial class RegexProgram {
         return this.op.Count - 1;
     }
 
-    // 下一条指令将写入的地址。
     int Here() { return this.op.Count; }
 
-    // 指令 `o` 的 x 字段是否是指令地址。
     public static bool XIsPc(int o) {
         return o == RegexProgram.OpJmp() || o == RegexProgram.OpSplit();
     }
 
-    // 指令 `o` 的 y 字段是否是指令地址。
     public static bool YIsPc(int o) {
         return o == RegexProgram.OpSplit() || o == RegexProgram.OpLook()
             || o == RegexProgram.OpEmptyChk();
     }
 
-    // 复制 [from, to) 区间的指令并追加，重定位跳转目标。
-    // 用于把 `{n,m}` 展开为重复副本。
     public int CopyRange(int from, int to) {
         int delta = this.op.Count - from;
-        int i = from;
-        while (i < to) {
+        for (int i = from; i < to; i = i + 1) {
             int o = this.op[i];
-            int x = this.ax[i];
-            int y = this.ay[i];
-            if (RegexProgram.XIsPc(o)) { x = x + delta; }
-            if (RegexProgram.YIsPc(o)) { y = y + delta; }
+            int x = RegexProgram.XIsPc(o) ? this.ax[i] + delta : this.ax[i];
+            int y = RegexProgram.YIsPc(o) ? this.ay[i] + delta : this.ay[i];
             this.Emit(o, x, y, this.az[i]);
-            i = i + 1;
         }
         return delta;
     }
 
-
-    // 语法分析器 (ParseAlt/ParseSeq/ParseGroup/ParseQuantifier/ParseLook) 见 RegexProgram.Parser.zan
-    // 字符类构建与转义解析 (BeginClass/ParseClass/ParseEscape/ParsePosixInClass) 见 RegexProgram.ClassEscape.zan
-
-    // ---- 解释器 -----------------------------------------------------
-
-    // ASCII 大小写折叠。非 ASCII 码点原样返回：Unicode
-    // 折叠需要码表，这里明确只做 ASCII（文档已说明）。
+    // (?i) 仅做 ASCII 大小写折叠。
     public static int Fold(int c) {
         if (c >= 65 && c <= 90) { return c + 32; }
         return c;
     }
 
-    // 码点是否属于 \w（ASCII 字母、数字、下划线）。
     public static bool IsWordCp(int c) {
         if (c >= 48 && c <= 57) { return true; }
         if (c >= 65 && c <= 90) { return true; }
@@ -320,7 +210,6 @@ public partial class RegexProgram {
         return c == 95;
     }
 
-    // 码点是否属于 \d/\w/\s 集合（kind 为小写字母的码值）。
     public static bool InShorthand(int kind, int c) {
         if (kind == 100) { return c >= 48 && c <= 57; }
         if (kind == 119) { return RegexProgram.IsWordCp(c); }
@@ -328,14 +217,11 @@ public partial class RegexProgram {
         return false;
     }
 
-    // 码点是否属于类 ci（逐成员判定，ignoreCase 时做 ASCII 折叠，
-    // clsNeg 为 1 时整类取反）。
     public bool ClassHas(int ci, int c) {
         int from = this.clsStart[ci];
         int to = from + this.clsCount[ci];
         bool hit = false;
-        int i = from;
-        while (i < to && !hit) {
+        for (int i = from; i < to && !hit; i = i + 1) {
             if (this.clsKind[i] == RegexProgram.MemNotSet()) {
                 if (!RegexProgram.InShorthand(this.clsLo[i], c)) { hit = true; }
             } else {
@@ -349,27 +235,15 @@ public partial class RegexProgram {
                     if (c >= 97 && c <= 122 && u >= lo && u <= hi) { hit = true; }
                 }
             }
-            i = i + 1;
         }
-        if (this.clsNeg[ci] == 1) { return !hit; }
-        return hit;
+        return this.clsNeg[ci] == 1 ? !hit : hit;
     }
 
-    // 从 `start` 运行程序。成功后 `caps` 保存
-    // 2 * GroupCount() 个偏移（组未参与时为 -1），返回值为匹配
-    // 结束位置；-1 表示此处无匹配，-2 表示回溯预算耗尽
-    // （调用方应把它与"无匹配"区分开）。
-    // 预算语义（ScanFrom 约定）：budget 在每次 RunAt 重新置
-    // 2000000，即按起始位置重置——从不同起点出发的尝试各自享有
-    // 完整预算，不是整段扫描共享一个预算。长输入的失败扫描因此
-    // 最坏是 O(起点数 × 预算)；这是有意的取舍：起点推进本身廉价，
-    // 共享预算会把靠后起点可匹配的模式误报成预算耗尽。
+    // 返回匹配终点，-1 表示无匹配，-2 表示回溯预算耗尽；每次按起点重置 2M 预算。
     public int RunAt(nint input, int len, int start, int origin, List<int> caps) {
         int slots = this.groups * 2;
         caps.Clear();
-        for (int i = 0; i < slots; i = i + 1) {
-            caps.Add(-1);
-        }
+        for (int i = 0; i < slots; i = i + 1) { caps.Add(-1); }
         RegexRun run = new RegexRun();
         run.input = input;
         run.len = len;
@@ -377,34 +251,61 @@ public partial class RegexProgram {
         run.budget = 2000000;
         run.origin = origin;
         run.overflow = false;
-        for (int i = 0; i < this.marks; i = i + 1) {
-            run.marks.Add(-1);
-        }
-        if (this.Step(run, 0, start, 0)) {
-            return run.end;
-        }
-        if (run.overflow) { return -2; }
-        return -1;
+        for (int i = 0; i < this.marks; i = i + 1) { run.marks.Add(-1); }
+        if (this.Step(run, 0, start, 0)) { return run.end; }
+        return run.overflow ? -2 : -1;
     }
 
-    // 回溯解释器：每走一个分支递归调用一次。`budget`
-    // 限制总步数；耗尽时置 `overflow` 并一路返回失败，让调用方
-    // 能报告"预算耗尽"而不是把超时伪装成"无匹配"。
-    // `depth` 是递归路径深度：Split 的首选臂、Save/Mark、环视每
-    // 嵌套一层 +1（while 循环的顺序推进不计）。预算限步数不限
-    // 深度——`(a*)` 这类模式每次循环迭代都经一次真递归，深输入会
-    // 先于预算撞爆线程栈；超过 <see cref="MaxRecursionDepth"/> 直接
-    // 抛 RegexBudgetException（与预算耗尽同型报错，不静默）。代价：
-    // 单个量词在一段输入上的连续迭代数受此帽约束，确需更深的场景
-    // 调大 MaxRecursionDepth（线程栈允许时）。
+    bool MatchAssertion(int o, int pc, RegexRun run, int sp) {
+        if (o == RegexProgram.OpBol()) {
+            if (sp == 0) { return true; }
+            return this.multiline && new Span<byte>(run.input + sp - 1, 1)[0] == 10;
+        }
+        if (o == RegexProgram.OpEol()) {
+            if (sp == run.len) { return true; }
+            if (new Span<byte>(run.input + sp, 1)[0] != 10) { return false; }
+            return this.multiline || sp == run.len - 1;
+        }
+        if (o == RegexProgram.OpBos()) { return sp == 0; }
+        if (o == RegexProgram.OpEos()) {
+            if (sp == run.len) { return true; }
+            return this.ax[pc] == 1 && sp == run.len - 1
+                && new Span<byte>(run.input + sp, 1)[0] == 10;
+        }
+        if (o == RegexProgram.OpGpos()) { return sp == run.origin; }
+        bool before = sp > 0 && RegexProgram.IsWordCp(new Span<byte>(run.input + sp - 1, 1)[0]);
+        bool after = false;
+        if (sp < run.len) {
+            int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
+            after = RegexProgram.IsWordCp(packed / 8);
+        }
+        bool boundary = before != after;
+        return this.ax[pc] == 1 ? boundary : !boundary;
+    }
+
+    int StepBackref(RegexRun run, int group, int sp) {
+        int gs = run.caps[group * 2];
+        int ge = run.caps[group * 2 + 1];
+        if (gs < 0 || ge < gs) { return sp; }
+        int n = ge - gs;
+        if (sp + n > run.len) { return -1; }
+        for (int k = 0; k < n; k = k + 1) {
+            int a = new Span<byte>(run.input + gs + k, 1)[0];
+            int b = new Span<byte>(run.input + sp + k, 1)[0];
+            if (a != b) {
+                if (!this.ignoreCase || RegexProgram.Fold(a) != RegexProgram.Fold(b)) { return -1; }
+            }
+        }
+        return sp + n;
+    }
+
     public bool Step(RegexRun run, int pc, int sp, int depth) {
         if (depth > RegexProgram.MaxRecursionDepth) {
             throw new RegexBudgetException("regular expression recursion deeper than "
                 + Convert.ToString(RegexProgram.MaxRecursionDepth)
                 + " (pattern quantifier nesting on long input)");
         }
-        bool running = true;
-        while (running) {
+        while (true) {
             if (run.overflow) { return false; }
             run.budget = run.budget - 1;
             if (run.budget <= 0) {
@@ -417,22 +318,19 @@ public partial class RegexProgram {
                 if (packed < 0) { return false; }
                 int c = packed / 8;
                 int want = this.ax[pc];
-                if (c != want) {
-                    if (!this.ignoreCase) { return false; }
-                    if (RegexProgram.Fold(c) != RegexProgram.Fold(want)) { return false; }
+                if (c != want && (!this.ignoreCase || RegexProgram.Fold(c) != RegexProgram.Fold(want))) {
+                    return false;
                 }
                 pc = pc + 1;
                 sp = sp + (packed & 7);
             } else if (o == RegexProgram.OpAny()) {
                 int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                if (packed < 0) { return false; }
-                if (!this.dotAll && packed / 8 == 10) { return false; }
+                if (packed < 0 || (!this.dotAll && packed / 8 == 10)) { return false; }
                 pc = pc + 1;
                 sp = sp + (packed & 7);
             } else if (o == RegexProgram.OpClass()) {
                 int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                if (packed < 0) { return false; }
-                if (!this.ClassHas(this.ax[pc], packed / 8)) { return false; }
+                if (packed < 0 || !this.ClassHas(this.ax[pc], packed / 8)) { return false; }
                 pc = pc + 1;
                 sp = sp + (packed & 7);
             } else if (o == RegexProgram.OpJmp()) {
@@ -456,19 +354,12 @@ public partial class RegexProgram {
                 run.marks[slot] = old;
                 return false;
             } else if (o == RegexProgram.OpEmptyChk()) {
-                // 本轮一个字节都没吃掉（`(a*)*`、`()+`）就离开循环：
-                // 再转下去只会无限重复同一个空匹配
-                if (run.marks[this.ax[pc]] == sp) {
-                    pc = this.ay[pc];
-                } else {
-                    pc = pc + 1;
-                }
+                pc = run.marks[this.ax[pc]] == sp ? this.ay[pc] : pc + 1;
             } else if (o == RegexProgram.OpLook()) {
                 int kind = this.ax[pc];
                 int cont = this.ay[pc];
                 int at = sp;
-                if (kind == RegexProgram.LookBehind()
-                    || kind == RegexProgram.LookBehindNeg()) {
+                if (kind == RegexProgram.LookBehind() || kind == RegexProgram.LookBehindNeg()) {
                     at = sp - this.az[pc];
                     if (at < 0) {
                         if (kind == RegexProgram.LookBehind()) { return false; }
@@ -482,88 +373,24 @@ public partial class RegexProgram {
                 if (run.overflow) { return false; }
                 int subEnd = run.subEnd;
                 run.subEnd = savedEnd;
-                if (kind == RegexProgram.LookAheadNeg()
-                    || kind == RegexProgram.LookBehindNeg()) {
-                    if (ok) { return false; }
-                    pc = cont;
-                } else {
-                    if (!ok) { return false; }
-                    if (kind == RegexProgram.LookAtomic()) { sp = subEnd; }
-                    pc = cont;
-                }
+                bool neg = kind == RegexProgram.LookAheadNeg() || kind == RegexProgram.LookBehindNeg();
+                if (neg ? ok : !ok) { return false; }
+                if (kind == RegexProgram.LookAtomic()) { sp = subEnd; }
+                pc = cont;
             } else if (o == RegexProgram.OpLookEnd()) {
                 run.subEnd = sp;
                 return true;
-            } else if (o == RegexProgram.OpBol()) {
-                if (sp != 0) {
-                    if (!this.multiline) { return false; }
-                    if (new Span<byte>(run.input + sp - 1, 1)[0] != 10) { return false; }
-                }
-                pc = pc + 1;
-            } else if (o == RegexProgram.OpEol()) {
-                if (sp != run.len) {
-                    bool atLineEnd = new Span<byte>(run.input + sp, 1)[0] == 10;
-                    if (!atLineEnd) { return false; }
-                    // 非多行模式下 `$` 只允许出现在结尾的换行之前
-                    if (!this.multiline && sp != run.len - 1) { return false; }
-                }
-                pc = pc + 1;
-            } else if (o == RegexProgram.OpBos()) {
-                if (sp != 0) { return false; }
-                pc = pc + 1;
-            } else if (o == RegexProgram.OpEos()) {
-                if (sp != run.len) {
-                    if (this.ax[pc] != 1) { return false; }
-                    // \Z：结尾换行之前也算
-                    if (sp != run.len - 1) { return false; }
-                    if (new Span<byte>(run.input + sp, 1)[0] != 10) { return false; }
-                }
-                pc = pc + 1;
-            } else if (o == RegexProgram.OpGpos()) {
-                if (sp != run.origin) { return false; }
-                pc = pc + 1;
-            } else if (o == RegexProgram.OpWordB()) {
-                bool before = false;
-                bool after = false;
-                if (sp > 0) {
-                    before = RegexProgram.IsWordCp(
-                        new Span<byte>(run.input + sp - 1, 1)[0]);
-                }
-                if (sp < run.len) {
-                    int packed = RegexProgram.DecodeAt(run.input, run.len, sp);
-                    after = RegexProgram.IsWordCp(packed / 8);
-                }
-                bool boundary = before != after;
-                if (this.ax[pc] == 1) {
-                    if (!boundary) { return false; }
-                } else {
-                    if (boundary) { return false; }
-                }
-                pc = pc + 1;
             } else if (o == RegexProgram.OpBackref()) {
-                int g = this.ax[pc];
-                int gs = run.caps[g * 2];
-                int ge = run.caps[g * 2 + 1];
-                if (gs < 0 || ge < gs) {
-                    pc = pc + 1;
-                } else {
-                    int n = ge - gs;
-                    if (sp + n > run.len) { return false; }
-                    for (int k = 0; k < n; k = k + 1) {
-                        int a = new Span<byte>(run.input + gs + k, 1)[0];
-                        int b = new Span<byte>(run.input + sp + k, 1)[0];
-                        if (a != b) {
-                            if (!this.ignoreCase) { return false; }
-                            if (RegexProgram.Fold(a) != RegexProgram.Fold(b)) { return false; }
-                        }
-                    }
-                    pc = pc + 1;
-                    sp = sp + n;
-                }
-            } else {
-                // OpMatch
+                int nextSp = this.StepBackref(run, this.ax[pc], sp);
+                if (nextSp < 0) { return false; }
+                pc = pc + 1;
+                sp = nextSp;
+            } else if (o == RegexProgram.OpMatch()) {
                 run.end = sp;
                 return true;
+            } else {
+                if (!this.MatchAssertion(o, pc, run, sp)) { return false; }
+                pc = pc + 1;
             }
         }
         return false;

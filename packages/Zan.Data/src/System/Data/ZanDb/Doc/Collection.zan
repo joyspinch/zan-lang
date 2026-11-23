@@ -332,14 +332,7 @@ public partial class Collection {
         } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
-    // 从文档缓存中获取文档，若存在则更新 LRU 访问热度并返回其只读副本。
-    public JsonValue CacheGet(int id) {
-        Mutex.Lock(this.cacheMtx);
-        try {
-        if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || !this.docCache.ContainsKey(id)) {
-            JsonValue miss = null;
-            return miss;
-        }
+    private void TouchCacheOrder(int id) {
         int lastIdx = this.docCacheOrder.Count - 1;
         if (lastIdx >= 0 && this.docCacheOrder[lastIdx] != id) {
             for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
@@ -350,7 +343,19 @@ public partial class Collection {
                 }
             }
         }
-        return this.docCache[id];
+    }
+
+    // 从文档缓存中获取文档，若存在则更新 LRU 访问热度并返回其只读副本。
+    public JsonValue CacheGet(int id) {
+        Mutex.Lock(this.cacheMtx);
+        try {
+        JsonValue cached = null;
+        if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || !this.docCache.TryGetValue(id, out cached)) {
+            JsonValue miss = null;
+            return miss;
+        }
+        this.TouchCacheOrder(id);
+        return cached;
         } finally { Mutex.Unlock(this.cacheMtx); }
     }
 
@@ -361,16 +366,7 @@ public partial class Collection {
         if (this.kv.InTransaction() || this.docCacheCapacity <= 0 || doc == null) { return; }
         if (this.docCache.ContainsKey(id)) {
             this.docCache[id] = doc.Clone();
-            int lastIdx = this.docCacheOrder.Count - 1;
-            if (lastIdx >= 0 && this.docCacheOrder[lastIdx] != id) {
-                for (int i = 0; i < this.docCacheOrder.Count; i = i + 1) {
-                    if (this.docCacheOrder[i] == id) {
-                        this.docCacheOrder.RemoveAt(i);
-                        this.docCacheOrder.Add(id);
-                        break;
-                    }
-                }
-            }
+            this.TouchCacheOrder(id);
             return;
         }
         if (this.docCacheOrder.Count >= this.docCacheCapacity && this.docCacheOrder.Count > 0) {

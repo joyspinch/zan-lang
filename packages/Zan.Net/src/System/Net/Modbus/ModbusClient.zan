@@ -5,16 +5,8 @@ using System.Collections.Generic;
 
 namespace System.Net.Modbus;
 
-// Modbus TCP 客户端——用于 PLC、仪表与工业传感器的
-// 主流现场总线协议，默认端口 502。
-// // 与 MqttClient 一样对协程友好：每个操作都 await 非阻塞套接字，
-// 响应依据 MBAP 长度前缀重新组装，
-// 无论设备如何分段写入，解析都能保持帧同步。
-// // 寄存器值为 16 位（0..65535）；地址为基于零的协议地址
-// （文档中 "40001" 的约定对应地址 0）。
-// // 用法：
-// int ok = await m.WriteRegisterAsync(10, 1234);
-// m.Close();
+// Modbus TCP 客户端（默认端口 502，协程友好）：按 MBAP 长度前缀重组帧并串行化单连接事务。
+// 寄存器值为 16 位（0..65535），地址为基于 0 的协议地址（"40001" 对应 0）。
 public class ModbusClient : IDisposable {
     private TcpClient conn;
     private int unitId;
@@ -22,8 +14,6 @@ public class ModbusClient : IDisposable {
     private bool connected;
     private bool busy;
     private List<AsyncGate> waiters;
-    // 成功交换后为空 ""；失败后为简短原因，
-    // 以便调用方区分异常应答与链路断开。
     private string lastError;
 
     // 构造
@@ -36,9 +26,7 @@ public class ModbusClient : IDisposable {
         this.lastError = "";
     }
 
-    // 连接 Modbus TCP 端点。<paramref name="unit"/> 是
-    // 单元/从站 id（大多数 TCP 设备为 1，
-    // 在网关之后才有意义）。
+    // 连接 Modbus TCP 端点（unit 为单元/从站 id，直连 TCP 设备通常为 1）。
     public static async ModbusClient ConnectAsync(string host, int port, int unit) {
         ModbusClient m = new ModbusClient();
         m.unitId = unit;
@@ -70,9 +58,7 @@ public class ModbusClient : IDisposable {
         this.Close();
     }
 
-    // 在 IO reactor 上挂起，跨多次 recv 精确读取
-    // <paramref name="need"/> 个字节；对端关闭或出错时置 connected=false
-    // 并返回已到手的（残缺）缓冲。
+    // 跨多次 recv 精确读取 need 字节；对端关闭或出错时置 connected=false 并返回已读缓冲。
     private async byte[] ReadBytesAsync(int need) {
         if (need <= 0) { return new byte[1]; }
         byte[] buf = new byte[need + 1];
@@ -118,9 +104,7 @@ public class ModbusClient : IDisposable {
         }
     }
 
-    // 一次请求/响应往返：发送 MBAP 头 + PDU，接收帧化的
-    // 应答 PDU（功能字节 + 数据）。带并发排队门控，确保单连接上
-    // 事务互斥单飞，杜绝并发请求在 TCP 流上相互踩踏。
+    // 互斥串行化的请求/响应往返（发送 MBAP + PDU，接收应答 PDU）。
     private async byte[] TransactAsync(byte[] pdu, int pduLen) {
         await this.AcquireLock();
         try {
@@ -130,11 +114,16 @@ public class ModbusClient : IDisposable {
         }
     }
 
+    private byte[] FailFrame(string err, bool disconnect) {
+        this.lastError = err;
+        if (disconnect) { this.connected = false; }
+        return new byte[1];
+    }
+
     private async byte[] TransactInternalAsync(byte[] pdu, int pduLen) {
         this.lastError = "";
         if (!this.connected) {
-            this.lastError = "not connected";
-            return new byte[1];
+            return this.FailFrame("not connected", false);
         }
         int tid = this.nextTid & 65535;
         this.nextTid = (this.nextTid % 65535) + 1;
@@ -154,55 +143,38 @@ public class ModbusClient : IDisposable {
 
         byte[] mbap = await ReadBytesAsync(7);
         if (!this.connected) {
-            this.lastError = "connection closed";
-            return new byte[1];
+            return this.FailFrame("connection closed", false);
         }
         int respTid = ((mbap[0] & 255) << 8) + (mbap[1] & 255);
         if (respTid != tid) {
-            this.lastError = "transaction id mismatch";
-            this.connected = false;
-            return new byte[1];
+            return this.FailFrame("transaction id mismatch", true);
         }
         int proto = ((mbap[2] & 255) << 8) + (mbap[3] & 255);
         if (proto != 0) {
-            this.lastError = "bad protocol id";
-            this.connected = false;
-            return new byte[1];
+            return this.FailFrame("bad protocol id", true);
         }
         int len = ((mbap[4] & 255) << 8) + (mbap[5] & 255);
         if (len < 2 || len > 260) {
-            this.lastError = "bad frame length";
-            this.connected = false;
-            return new byte[1];
+            return this.FailFrame("bad frame length", true);
         }
         int respUnit = mbap[6] & 255;
         if (respUnit != this.unitId) {
-            this.lastError = "unit id mismatch";
-            this.connected = false;
-            return new byte[1];
+            return this.FailFrame("unit id mismatch", true);
         }
-        // MBAP 长度字段计入 unit id + PDU；unit id 位于 mbap[6]。
+        // MBAP 长度计入 unit id + PDU；unit id 已在 mbap[6] 读取。
         byte[] body = await ReadBytesAsync(len - 1);
         if (!this.connected) {
-            this.lastError = "connection closed";
-            return new byte[1];
+            return this.FailFrame("connection closed", false);
         }
         int expectedFc = pdu[0] & 255;
         int respFc = body[0] & 255;
         // body[0] 为功能码回显；0x80 位表示异常应答。
         if ((respFc & 128) != 0) {
-            int exCode = 0;
-            if (len - 1 >= 2) {
-                exCode = body[1] & 255;
-            }
-            this.lastError = "exception code "
-                + Convert.ToString(exCode);
-            return new byte[1];
+            int exCode = len - 1 >= 2 ? (body[1] & 255) : 0;
+            return this.FailFrame("exception code " + Convert.ToString(exCode), false);
         }
         if (respFc != expectedFc) {
-            this.lastError = "function code mismatch";
-            this.connected = false;
-            return new byte[1];
+            return this.FailFrame("function code mismatch", true);
         }
         byte[] outb = new byte[len];
         if (len > 1) {

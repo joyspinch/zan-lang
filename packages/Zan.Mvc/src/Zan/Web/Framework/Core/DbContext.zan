@@ -33,8 +33,25 @@ public class DbContext {
         return this.pool;
     }
 
+    /* 同步快速借出空闲主库连接（无协程挂起、无委托分配）；池空时返回 null，由调用方回退到 Acquire()。 */
+    public IDbConnection TryAcquireSync(IDbStatementObserver observer = null) {
+        if (this.pool == null) { return null; }
+        IDbConnection db = this.pool.TryAcquireFast();
+        if (db == null) { return null; }
+        return TracedDbConnection.Wrap(db, observer);
+    }
+
+    /* 同步快速借出空闲只读连接（无协程挂起、无委托分配）；池空时返回 null，由调用方回退到 AcquireRead()。 */
+    public IDbConnection TryAcquireReadSync(IDbStatementObserver observer = null) {
+        DbPool target = (this.readPool != null) ? this.readPool : this.pool;
+        if (target == null) { return null; }
+        IDbConnection db = target.TryAcquireFast();
+        if (db == null) { return null; }
+        return TracedDbConnection.Wrap(db, observer);
+    }
+
     /* 借出主库连接供请求使用（写/事务）；池满时挂起协程。*/
-    public async IDbConnection Acquire() {
+    public async IDbConnection Acquire(IDbStatementObserver observer = null) {
         if (this.pool == null) { return null; }
         IDbConnection db = await this.pool.AcquireAsync();
         if (db == null || !db.IsConnected()) {
@@ -42,7 +59,7 @@ public class DbContext {
             return null;
         }
         /* 所有应用语句在此被借用，故在此计时：每个借用点一个包装器，避免每个 DAO 都放秒表。Metrics.db 使用独立池，不会自跟踪。*/
-        return TracedDbConnection.Wrap(db);
+        return TracedDbConnection.Wrap(db, observer);
     }
 
     /* 归还主库连接到池，兼容 null，可直接放入 finally。*/
@@ -62,7 +79,7 @@ public class DbContext {
     }
 
     /* 借出只读连接（未配置从库时自动借主库，配置从库时借从库）；池满时挂起协程。*/
-    public async IDbConnection AcquireRead() {
+    public async IDbConnection AcquireRead(IDbStatementObserver observer = null) {
         DbPool target = (this.readPool != null) ? this.readPool : this.pool;
         if (target == null) { return null; }
         IDbConnection db = await target.AcquireAsync();
@@ -70,7 +87,7 @@ public class DbContext {
             target.Release(db);
             return null;
         }
-        return TracedDbConnection.Wrap(db);
+        return TracedDbConnection.Wrap(db, observer);
     }
 
     /* 归还只读连接到对应的池。*/

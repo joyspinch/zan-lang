@@ -50,7 +50,7 @@ public partial class JsonDoc {
 
     // 按 tape 链遍历 <paramref name="at"/> 的全部孩子，逐个
     // 调用 <paramref name="fn"/>（at 是孩子槽位；对象成员是值槽位，
-    // 键用 <see cref="KeyAt"/> 取）。顺序与源文档一致。这是 O(孩子数)
+    // 对象键可走 FirstProperty/NextProperty）。顺序与源文档一致。这是 O(孩子数)
     // 的正确遍历姿势：FirstChild/NextSibling 各走一步，不像
     // <see cref="At"/> 顺序循环那样累计 O(n²)。非容器（标量）与
     // 负槽位没有孩子，回调一次都不触发；fn 为 null 时静默返回。
@@ -71,84 +71,67 @@ public partial class JsonDoc {
     }
 
     public int Get(int at, string key) {
-        if (at < 0 || at >= this.slotCount) { return -1; }
-        long oa = slots[at].a;
-        if ((int)(oa & 255) != 5) { return -1; }
-        int p = (int)(oa >> 8);
-        byte[] buf = this.buf;
-        int kl = key.Length;
+        if (key == null) { return -1; }
+        return this.GetByView(at, StringView.FromString(key));
+    }
+
+    // Resolve a path segment directly from its source string.
+    public int GetDirect(int at, string path, int keyOff, int keyLen) {
+        if (path == null || keyOff < 0 || keyLen <= 0 || keyOff > path.Length - keyLen) { return -1; }
+        return this.GetByView(at, new StringView((nint)path + (nint)keyOff, keyLen));
+    }
+
+    private int GetByView(int at, StringView key) {
+        int p = this.FirstProperty(at);
         while (p >= 0) {
-            JsonPair pair = pairs[p];
-            if (pair.keyLen == kl) {
-                int ks = pair.keyStart;
-                if (ks >= 0) {
-                    int m = 0;
-                    int ok = 1;
-                    while (m < kl) {
-                        if ((buf[ks + m] & 255) != (key[m] & 255)) { ok = 0; break; }
-                        m = m + 1;
-                    }
-                    if (ok != 0) { return pair.valueSlot; }
-                } else if (escPool[pair.keyLen] == key) {
-                    return pair.valueSlot;
-                }
+            JsonPair pair = this.pairs[p];
+            if (pair.keyStart < 0 || pair.keyLen == key.Length) {
+                if (this.ViewOfKey(pair).Equals(key)) { return pair.valueSlot; }
             }
             p = pair.nextPair;
         }
         return -1;
     }
 
-    // 零分配子串键寻址：直接在外部路径字符串的 [keyOff, keyOff + keyLen) 范围内进行比对，
-    // 完全免除 Substring 堆内存分配与垃圾回收开销。
-    public int GetDirect(int at, string path, int keyOff, int keyLen) {
-        if (at < 0 || at >= this.slotCount || path == null || keyLen <= 0 || keyOff < 0 || keyOff + keyLen > path.Length) {
-            return -1;
-        }
-        long oa = slots[at].a;
-        if ((int)(oa & 255) != 5) { return -1; }
-        int p = (int)(oa >> 8);
-        byte[] buf = this.buf;
-        while (p >= 0) {
-            JsonPair pair = pairs[p];
-            if (pair.keyLen == keyLen) {
-                int ks = pair.keyStart;
-                if (ks >= 0) {
-                    if (keyLen == 2) {
-                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
-                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255)) {
-                            return pair.valueSlot;
-                        }
-                    } else if (keyLen == 4) {
-                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
-                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255) &&
-                            (buf[ks + 2] & 255) == (path[keyOff + 2] & 255) &&
-                            (buf[ks + 3] & 255) == (path[keyOff + 3] & 255)) {
-                            return pair.valueSlot;
-                        }
-                    } else if (keyLen == 5) {
-                        if ((buf[ks] & 255) == (path[keyOff] & 255) &&
-                            (buf[ks + 1] & 255) == (path[keyOff + 1] & 255) &&
-                            (buf[ks + 2] & 255) == (path[keyOff + 2] & 255) &&
-                            (buf[ks + 3] & 255) == (path[keyOff + 3] & 255) &&
-                            (buf[ks + 4] & 255) == (path[keyOff + 4] & 255)) {
-                            return pair.valueSlot;
-                        }
-                    } else {
-                        int m = 0;
-                        int ok = 1;
-                        while (m < keyLen) {
-                            if ((buf[ks + m] & 255) != (path[keyOff + m] & 255)) { ok = 0; break; }
-                            m = m + 1;
-                        }
-                        if (ok != 0) { return pair.valueSlot; }
-                    }
-                } else if (escPool[pair.keyLen] == path.Substring(keyOff, keyLen)) {
-                    return pair.valueSlot;
-                }
-            }
-            p = pair.nextPair;
-        }
-        return -1;
+    // Build a reusable lookup for one object. Keep the tape and source buffer unchanged while using it.
+    public JsonObjectIndex IndexObject(int at) {
+        return this.KindAt(at) == 5 ? new JsonObjectIndex(this, at) : null;
+    }
+
+    // Property cursors follow source order, including repeated names.
+    public int FirstProperty(int at) {
+        if (at < 0 || at >= this.slotCount) { return -1; }
+        long a = this.slots[at].a;
+        return (a & 255L) == 5L ? (int)(a >> 8) : -1;
+    }
+
+    public int NextProperty(int property) {
+        if (property < 0 || property >= this.pairCount) { return -1; }
+        return this.pairs[property].nextPair;
+    }
+
+    public int PropertyValue(int property) {
+        if (property < 0 || property >= this.pairCount) { return -1; }
+        return this.pairs[property].valueSlot;
+    }
+
+    public string PropertyName(int property) {
+        if (property < 0 || property >= this.pairCount) { return ""; }
+        return this.NameOfKey(this.pairs[property]);
+    }
+
+    private string NameOfKey(JsonPair pair) {
+        return pair.keyStart < 0 ? this.escPool[pair.keyLen] : this.src.Substring(pair.keyStart, pair.keyLen);
+    }
+
+    public StringView PropertyNameView(int property) {
+        if (property < 0 || property >= this.pairCount) { return StringView.Empty(); }
+        return this.ViewOfKey(this.pairs[property]);
+    }
+
+    private StringView ViewOfKey(JsonPair pair) {
+        if (pair.keyStart < 0) { return StringView.FromString(this.escPool[pair.keyLen]); }
+        return new StringView((nint)this.buf + (nint)pair.keyStart, pair.keyLen);
     }
 
     public int Get(string key) { return this.Get(this.root, key); }
@@ -160,7 +143,7 @@ public partial class JsonDoc {
         long a = slots[at].a;
         int start = (int)(a >> 8);
         if (start >= 0) { return src.Substring(start, (int)slots[at].b); }
-        return escPool[(int)slots[at].b];
+        return start == JsonDoc.DeferredEscape ? this.DecodeDeferredStringAt(at) : escPool[(int)slots[at].b];
     }
 
     public int IntAt(int at, int dflt) {
@@ -224,7 +207,7 @@ public partial class JsonDoc {
         if (k == 3) {
             int start = (int)(a >> 8);
             if (start >= 0) { return src.Substring(start, (int)slots[at].b); }
-            return escPool[(int)slots[at].b];
+            return start == JsonDoc.DeferredEscape ? this.DecodeDeferredStringAt(at) : escPool[(int)slots[at].b];
         }
         if (k == 2) { return Convert.ToString(slots[at].b); }
         if (k == 7) {
@@ -237,7 +220,7 @@ public partial class JsonDoc {
         return dflt;
     }
 
-    // 零分配视图提取：直接返回指定槽位指向底层缓冲区的 16 字节 StringView，免去 Substring 堆内存分配与垃圾回收。
+    // 返回指向源缓冲区或字符串池的视图。按需值在首次访问时解码。
     public StringView ViewAt(int at) {
         if (at < 0 || at >= this.slotCount) { return StringView.Empty(); }
         long a = slots[at].a;
@@ -248,7 +231,7 @@ public partial class JsonDoc {
                 int len = (int)slots[at].b;
                 return new StringView((nint)this.buf + (nint)start, len);
             }
-            string s = escPool[(int)slots[at].b];
+            string s = start == JsonDoc.DeferredEscape ? this.DecodeDeferredStringAt(at) : escPool[(int)slots[at].b];
             return StringView.FromString(s);
         }
         if (k == 7) {
@@ -259,7 +242,7 @@ public partial class JsonDoc {
         return StringView.Empty();
     }
 
-    // 零分配字符串比对：直接将底层缓冲中指定槽位的文本与目标字符串比对，不产生 Substring 堆分配。
+    // 直接比对源缓冲区或已解码的文本。按需值在首次访问时解码。
     public bool StrEquals(int at, string expected) {
         if (at < 0 || at >= this.slotCount || expected == null) { return false; }
         long a = slots[at].a;
@@ -287,6 +270,7 @@ public partial class JsonDoc {
             }
             return true;
         }
+        if (start == JsonDoc.DeferredEscape) { return this.DecodeDeferredStringAt(at) == expected; }
         return escPool[(int)slots[at].b] == expected;
     }
 
@@ -339,9 +323,7 @@ public partial class JsonDoc {
         int n = 0;
         while (p >= 0 && n < i) { p = pairs[p].nextPair; n = n + 1; }
         if (p < 0) { return ""; }
-        int ks = pairs[p].keyStart;
-        if (ks < 0) { return escPool[pairs[p].keyLen]; }
-        return src.Substring(ks, pairs[p].keyLen);
+        return this.NameOfKey(this.pairs[p]);
     }
 
     public int ValAt(int at, int i) {
@@ -373,7 +355,7 @@ public partial class JsonDoc {
         if (k == 7) {
             int ns = (int)(a >> 8);
             int len = (int)slots[at].b;
-            sb.Append(this.src.Substring(ns, len));
+            sb.Append(new StringView((nint)this.src + (nint)ns, len));
             return;
         }
         if (k == 3) {
@@ -402,10 +384,7 @@ public partial class JsonDoc {
             if (!first) { sb.Append(","); }
             first = false;
             sb.Append("\"");
-            int ks = pairs[p].keyStart;
-            string key = ks >= 0 ? src.Substring(ks, pairs[p].keyLen)
-                : escPool[pairs[p].keyLen];
-            Encoding.JsonEscapeTo(sb, key);
+            Encoding.JsonEscapeTo(sb, this.NameOfKey(pairs[p]));
             sb.Append("\":");
             this.WriteSlot(sb, pairs[p].valueSlot);
             p = pairs[p].nextPair;

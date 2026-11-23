@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data.Orm;
 using System.Data.Redis;
 using System.Json;
 using System.Threading;
@@ -8,15 +9,19 @@ using Zan.Web.Security;
 
 namespace Zan.Web.Services;
 
-/* 集群事件总线：当配置 [cluster].enabled = true 时，使用 Redis Pub/Sub 广播
-   与监听跨物理节点的缓存/权限状态失效事件。当未开启时，纯单机运行，零开销。*/
+/* Redis Pub/Sub 通知独立实例撤下权限快照。每个实例由 master 订阅，worker 共用授权表。 */
 public class ClusterBus {
     private static bool enabled = false;
     private static string channel = "zanweb:cluster:events";
     private static RedisPool pool = null;
     private static bool listening = false;
+    private static bool clusterOnline = false;
+    private static object refreshGate = new object();
+    private static bool refreshing = false;
+    private static long refreshVersion = 0;
+    private static RedisClient subscriber = null;
+    private static const int RefreshSeconds = 30;
 
-    /* 初始化总线状态（在 main.zan 中服务装配时调用）。*/
     public static void Init(ClusterCfg cfg, RedisPool redisPool) {
         enabled = (cfg != null && cfg.enabled && redisPool != null);
         if (enabled) {
@@ -26,70 +31,82 @@ public class ClusterBus {
         }
     }
 
-    /* 集群总线是否已启用。*/
     public static bool Enabled() {
         return enabled;
     }
 
-    /* 启动后台订阅监听协程（仅在 ClusterBus.enabled 时有意义）。*/
     public static void Start() {
         if (!enabled || listening) { return; }
+        PermTable.SetClusterOnline(false);
         listening = true;
         Task.Spawn(ListenLoop());
+        Task.Spawn(ReconcileLoop());
     }
 
-    /* 停止监听。*/
     public static void Stop() {
         listening = false;
+        clusterOnline = false;
+        PermTable.SetClusterOnline(false);
+        RedisClient client = subscriber;
+        if (client != null) { client.Close(); }
     }
 
-    /* 后台订阅长循环。*/
     public static async void ListenLoop() {
         while (listening) {
             RedisClient subClient = null;
             try {
                 subClient = await RedisClient.ConnectAsync(
                     Cfg.Cache.redisHost, Cfg.Cache.redisPort, Cfg.Cache.connectTimeoutMs);
-                if (subClient == null) {
-                    await Task.Delay(3000);
-                    continue;
-                }
-
-                List<string> args = new List<string>();
-                args.Add("SUBSCRIBE");
-                args.Add(channel);
-                RedisReply _sub = await subClient.CommandAsync(args);
-
-                while (listening) {
-                    RedisReply reply = await subClient.readReply();
-                    if (reply == null || reply.IsNil() || reply.IsError()) {
-                        break;
-                    }
-                    if (reply.Count() == 3) {
-                        RedisReply tag = reply.At(0);
-                        if (tag != null && tag.AsString() == "message") {
-                            RedisReply payloadRep = reply.At(2);
-                            if (payloadRep != null) {
-                                Dispatch(payloadRep.AsString());
-                            }
-                        }
-                    }
+                if (listening && subClient != null) {
+                    subscriber = subClient;
+                    bool _listened = await Listen(subClient);
                 }
             } catch (Exception ex) {
                 Log.Warn("[cluster] subscriber exception: " + ex.Message);
             } finally {
-                if (subClient != null) {
-                    subClient.Close();
-                }
+                clusterOnline = false;
+                PermTable.SetClusterOnline(false);
+                if (subClient != null) { subClient.Close(); }
+                subscriber = null;
             }
-
-            if (listening) {
-                await Task.Delay(2000);
-            }
+            if (listening) { await Task.Delay(2000); }
         }
     }
 
-    /* 解析并分派集群事件（调用本地清理，绝不再次广播以免产生死循环风暴）。*/
+    private static async bool Listen(RedisClient client) {
+        List<string> args = new List<string>();
+        args.Add("SUBSCRIBE");
+        args.Add(channel);
+        RedisReply ack = await client.CommandAsync(args);
+        if (!listening || !IsFrame(ack, "subscribe")) {
+            Log.Warn("[cluster] failed to subscribe to " + channel);
+            return false;
+        }
+
+        /* 订阅确认后重新查库，补齐离线期间漏收的通知；后续消息已在订阅流中排队。 */
+        AuthUser.ForgetAllLocal();
+        ReloadRoles();
+        PermTable.SetClusterOnline(true);
+        clusterOnline = true;
+        while (listening) {
+            RedisReply reply = await client.readReply();
+            if (reply == null || reply.IsNil() || reply.IsError()) { return false; }
+            if (IsFrame(reply, "message")) {
+                RedisReply payload = reply.At(2);
+                if (payload != null) { Dispatch(payload.AsString()); }
+            }
+        }
+        return false;
+    }
+
+    private static bool IsFrame(RedisReply reply, string kind) {
+        if (reply == null || reply.Count() != 3) { return false; }
+        RedisReply tag = reply.At(0);
+        RedisReply name = reply.At(1);
+        return tag != null && name != null && tag.AsString() == kind && name.AsString() == channel;
+    }
+
+    /* 接收的事件只触发本地失效，不再次广播。 */
     public static void Dispatch(string msg) {
         if (msg == null || msg.Length == 0) { return; }
         try {
@@ -97,53 +114,109 @@ public class ClusterBus {
             if (doc == null) { return; }
             string type = doc.PathStr("type", "");
             if (type == "evict_user") {
-                string uid = doc.PathStr("uid", "");
-                if (uid.Length > 0) {
-                    AuthUser.ForgetLocal(uid);
-                }
+                int id = AuthUser.ToInt(doc.PathStr("uid", ""));
+                if (id > 0) { AuthUser.ForgetLocal(Convert.ToString(id)); }
             } else if (type == "evict_all") {
                 AuthUser.ForgetAllLocal();
+            } else if (type == "roles_changed") {
+                ReloadRoles();
             }
         } catch (Exception ex) {
             Log.Warn("[cluster] dispatch error: " + ex.Message);
         }
     }
 
-    /* 广播单用户失效事件。*/
-    public static async void PublishEvictUser(string uid) {
-        if (!enabled || pool == null || uid.Length == 0) { return; }
-        RedisClient client = await pool.AcquireAsync();
-        if (client == null) { return; }
-        try {
-            string json = "{\"type\":\"evict_user\",\"uid\":\"" + uid + "\"}";
-            List<string> args = new List<string>();
-            args.Add("PUBLISH");
-            args.Add(channel);
-            args.Add(json);
-            RedisReply _rep = await client.CommandAsync(args);
-        } catch (Exception ex) {
-            Log.Warn("[cluster] publish evict_user failed: " + ex.Message);
-        } finally {
-            pool.Release(client);
+    private static void ReloadRoles() {
+        lock (refreshGate) {
+            long version = PermTable.BeginRoleReload();
+            if (version == 0) { return; }
+            refreshVersion = version;
+            if (refreshing) { return; }
+            refreshing = true;
+        }
+        Task.Spawn(RefreshRoles());
+    }
+
+    private static async void RefreshRoles() {
+        while (true) {
+            long version = 0;
+            lock (refreshGate) {
+                if (!listening || refreshVersion == 0) {
+                    refreshing = false;
+                    return;
+                }
+                version = refreshVersion;
+                refreshVersion = 0;
+            }
+            bool loaded = false;
+            try {
+                loaded = await PermTable.ReloadRoles(AuthUser.Orm(), version);
+            } catch (Exception ex) {
+                Log.Warn("[cluster] role reload failed: " + ex.Message);
+            }
+            if (!loaded && PermTable.RoleReloadPending(version)) {
+                lock (refreshGate) {
+                    if (refreshVersion == 0) { refreshVersion = version; }
+                }
+                await Task.Delay(2000);
+            }
         }
     }
 
-    /* 广播全量失效事件。*/
+    /* 周期查库补齐漏收的通知。查库期间继续使用已发布的快照，只有确认差异
+       或无法校验时才撤下旧版本，再按新版本查库并发布。 */
+    private static async void ReconcileLoop() {
+        while (listening) {
+            await Task.Delay(RefreshSeconds * 1000);
+            if (!listening || !clusterOnline) { continue; }
+            // 角色分配和部门树不在角色快照里。即使通知丢失，也定期从主库回填。
+            AuthUser.ForgetAllLocal();
+            if (refreshing) { continue; }
+            long version = PermTable.RoleVersion();
+            bool reload = true;
+            try {
+                IZanSql orm = AuthUser.Orm();
+                if (orm != null) { reload = await PermTable.RolesChangedSince(orm, version); }
+            } catch (Exception ex) {
+                Log.Warn("[cluster] role reconciliation failed: " + ex.Message);
+            }
+            if (reload && listening && clusterOnline && !refreshing) { ReloadRoles(); }
+        }
+    }
+
+    public static async void PublishEvictUser(string uid) {
+        int id = AuthUser.ToInt(uid);
+        if (id > 0) {
+            await Publish("{\"type\":\"evict_user\",\"uid\":\"" + Convert.ToString(id) + "\"}");
+        }
+    }
+
     public static async void PublishEvictAll() {
+        await Publish("{\"type\":\"evict_all\"}");
+    }
+
+    public static async void PublishRolesChanged() {
+        await Publish("{\"type\":\"roles_changed\"}");
+    }
+
+    private static async void Publish(string message) {
         if (!enabled || pool == null) { return; }
-        RedisClient client = await pool.AcquireAsync();
-        if (client == null) { return; }
+        RedisClient client = null;
         try {
-            string json = "{\"type\":\"evict_all\"}";
-            List<string> args = new List<string>();
-            args.Add("PUBLISH");
-            args.Add(channel);
-            args.Add(json);
-            RedisReply _rep = await client.CommandAsync(args);
+            client = await pool.AcquireAsync();
+            if (client != null) {
+                List<string> args = new List<string>();
+                args.Add("PUBLISH");
+                args.Add(channel);
+                args.Add(message);
+                RedisReply reply = await client.CommandAsync(args);
+                if (reply != null && !reply.IsError() && !reply.IsNil()) { return; }
+            }
+            Log.Warn("[cluster] permission notification failed on " + channel);
         } catch (Exception ex) {
-            Log.Warn("[cluster] publish evict_all failed: " + ex.Message);
+            Log.Warn("[cluster] permission notification failed: " + ex.Message);
         } finally {
-            pool.Release(client);
+            if (client != null) { pool.Release(client); }
         }
     }
 }

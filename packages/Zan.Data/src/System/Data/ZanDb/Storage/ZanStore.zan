@@ -183,20 +183,16 @@ public partial class ZanStore {
         return s;
     }
 
-    // 恢复扫描回调：段内记录重指索引（段按号升序扫描，
-    // 后段覆盖前段；墓碑摘除索引，为合并输出预留）。
+    // 恢复扫描回调：后段覆盖前段，墓碑摘除索引。
     public bool RecoverRecord(string key, string val, int op) {
         if (op == 2) {
-            if (this.index.ContainsKey(key)) { this.index.Remove(key); }
+            this.index.Remove(key);
             return true;
         }
-        if (this.index.ContainsKey(key)) { this.index.Remove(key); }
-        this.index.Add(key, this.recoverSeg);
+        this.index[key] = this.recoverSeg;
         return true;
     }
 
-    // 不物化字符串地验证完整长度，避免 ReadString 的 long→int
-    // 转换吞掉恶意高位；合法帧的长度前缀最多需要 5 个字节。
     public static bool SkipWalString(ByteBuffer b) {
         int at = b.ReadPos();
         int next = at;
@@ -206,7 +202,6 @@ public partial class ZanStore {
         return true;
     }
 
-    // 校验全部记录后才允许应用，CRC 有效并不等于载荷有效。
     public static bool ValidFrame(ByteBuffer b) {
         b.SeekRead(0);
         if (!b.CanRead(9)) { return false; }
@@ -232,8 +227,6 @@ public partial class ZanStore {
         return b.Remaining() == 0;
     }
 
-    // 新格式：seq:u64, op=3:u8, version:u32, count:u32，随后每条
-    // op:u8 + WriteString(key)，put 再跟 WriteString(val)。旧 op1/2 兼容。
     public bool ApplyFrame(ByteBuffer b) {
         if (!ZanStore.ValidFrame(b)) {
             this.lastError = "invalid WAL record or batch";
@@ -259,13 +252,12 @@ public partial class ZanStore {
 
     public void ApplyRecord(int op, string key, string val) {
         if (op == 1) {
-            this.memtable.Remove(key);
             this.tombstones.Remove(key);
-            this.memtable.Add(key, val);
+            this.memtable[key] = val;
         } else {
             this.memtable.Remove(key);
             this.index.Remove(key);
-            if (!this.tombstones.ContainsKey(key)) { this.tombstones.Add(key, 0); }
+            this.tombstones[key] = 0;
         }
     }
 
@@ -273,17 +265,12 @@ public partial class ZanStore {
         return !this.closed && this.lastError == "" && this.log != null && this.log.IsOpen();
     }
 
-    // 打开/读写/维护失败的诊断；失败句柄不再接收写入。
     public string GetError() { return this.lastError; }
-
-    // 已提交版本：每个非空外层批次只推进一次，回滚不推进。
     public long Version() { return this.seq; }
     public long GetRevision() { return this.seq; }
     public bool InTransaction() { return this.txDepth > 0; }
-    // 缓存失效代数：外层提交及回滚后改变；事务中读缓存应禁用。
     public long CacheVersion() { return this.cacheEpoch; }
 
-    // 键值对总数：索引（已落段）+ memtable 中尚未落段的新键。
     public int Count() {
         if (!this.IsOpen()) { return 0; }
         int n = this.index.Count;
@@ -294,54 +281,29 @@ public partial class ZanStore {
         return n;
     }
 
-    // 已固化段的数量。
     public int SegCount() { return this.segs.Count; }
-
-    // 日志逻辑大小（字节）：0 表示全部数据已在段里。
     public long LogBytes() { return this.log != null ? this.log.Size() : -1; }
-
-    // 切换持久化档（立即生效）。
     public void SetDurability(int d) { this.durability = d; }
 
-    // GROUP 档的 fsync 窗口：N = 每 N 次提交至多
-    // 一次 fsync（攒满 <see cref="GROUP_FLUSH_BYTES"/> 字节会提前）。
     public void SetSyncEvery(int n) {
         if (n >= 1) { this.syncEvery = n; }
     }
 
-    // memtable/日志 flush 阈值（字节）：日志攒到该值
-    // 即固化新段。默认 64MB；调小是合法配置（=1 即每次提交
-    // 都固化），只拒绝非正数。
     public void SetFlushThreshold(long bytes) {
         if (bytes >= 1) { this.flushThreshold = bytes; }
     }
 
-    // 块缓存字节上限。默认 32MB；调小是合法配置
-    // （缓存退化到直读），只拒绝非正数。
     public void SetCacheCap(long bytes) {
         if (bytes >= 1) { this.cache.SetCap(bytes); }
     }
 
-    // 开启自动增量归并：每次固化新段后若段数达到
-    // <paramref name="atSegs"/>，就地归并最老的
-    // <paramref name="mergeK"/> 个段（同
-    // <see cref="MergeSomeSegments"/>，有界停顿=写 k 段的耗时）。
-    // atSegs ≥ max(3, mergeK+1) 才生效——阈值太低会每次固化都
-    // 归并、得不偿失；atSegs = 0 关闭（默认）。段数稳态在
-    // [atSegs-mergeK+1, atSegs] 间振荡，不再无界增长。
     public void SetAutoMerge(int atSegs, int mergeK) {
         if (atSegs <= 0) { this.autoMergeAt = 0; this.autoMergeK = 0; return; }
-        if (mergeK < 2) { return; }
-        if (atSegs < mergeK + 1) { return; }
+        if (mergeK < 2 || atSegs < mergeK + 1) { return; }
         this.autoMergeAt = atSegs;
         this.autoMergeK = mergeK;
     }
 
-    // ===== 同步核心（单所有者，无锁） =====
-
-    // 返回值；不存在时返回 ""（与「值为空串」不可区分，
-    // 需要区分时用 <see cref="Contains"/>）。事务内可见未提交的
-    // 本事务写入。
     public string Get(string key) {
         if (!this.IsOpen()) { return ""; }
         if (this.txDepth > 0) {
@@ -364,7 +326,6 @@ public partial class ZanStore {
         return "";
     }
 
-    // 键是否存在。
     public bool Contains(string key) {
         if (!this.IsOpen()) { return false; }
         if (this.txDepth > 0) {
@@ -375,39 +336,29 @@ public partial class ZanStore {
         return this.index.ContainsKey(key);
     }
 
-    // 事务内只暂存最终值；自动提交走同一批次路径。
-    // 失败抛 IOException，并通过 GetError 留下诊断。
     public void Put(string key, string val) {
         if (!this.WriteReady()) { throw new IOException(this.GetError()); }
         bool automatic = this.txDepth == 0;
         if (automatic) { this.Begin(); }
         this.txDel.Remove(key);
-        this.txPut.Remove(key);
-        this.txPut.Add(key, val);
+        this.txPut[key] = val;
         if (automatic && !this.Commit()) { throw new IOException(this.GetError()); }
     }
 
-    // 删除存在的键；事务内 true 表示暂存，自动提交失败返回 false。
     public bool Delete(string key) {
         if (!this.WriteReady() || !this.Contains(key)) { return false; }
         bool automatic = this.txDepth == 0;
         if (automatic) { this.Begin(); }
         this.txPut.Remove(key);
-        this.txDel.Remove(key);
-        this.txDel.Add(key, "");
+        this.txDel[key] = "";
         return !automatic || this.Commit();
     }
 
-    // 写入仅进入覆盖层；嵌套批次由最外层一次性提交。
     public void Begin() {
         if (!this.WriteReady()) { throw new IOException(this.GetError()); }
         this.txDepth = this.txDepth + 1;
     }
 
-    // 最外层非空批次写一个 CRC 帧，按持久化档落盘成功后
-    // 才发布 memtable 和版本。嵌套 true 仅表示仍在暂存；空批次不推进。
-    // I/O 失败返回 false 并关闭写入。若自动固化在 WAL 提交后失败，
-    // false 的结果可能已提交，调用者应重开并检查修订号。
     public bool Commit() {
         if (!this.WriteReady()) { return false; }
         if (this.txDepth == 0) { return true; }
@@ -434,7 +385,6 @@ public partial class ZanStore {
             if (logBytes >= this.flushThreshold) { this.FlushToSegment(); }
             return this.IsOpen();
         } catch (Exception ex) {
-            // bool 提交契约：丢弃覆盖层、关闭失败句柄，保留真实诊断。
             this.Fail("store commit failed: " + ex.Message);
             return false;
         } finally {
@@ -448,7 +398,6 @@ public partial class ZanStore {
         return bytes;
     }
 
-    // 在分配/追加之前计算精确大小，不让多键批次绕过帧上限。
     public ByteBuffer BuildTxFrame() {
         List<string> dk = this.txDel.Keys;
         List<string> pk = this.txPut.Keys;
@@ -483,7 +432,6 @@ public partial class ZanStore {
         return b;
     }
 
-    // 回滚覆盖层；缓冲中从未写入本事务，既有已提交待写帧不受影响。
     public void Rollback() {
         if (this.txDepth == 0) { return; }
         this.txDepth = 0;
@@ -505,8 +453,6 @@ public partial class ZanStore {
         this.txPut.Clear();
     }
 
-    // 成功完成选定的持久化动作后才能发布覆盖层。GROUP 字节窗口
-    // 记录已 flush 但未 sync 的量，不能在 Flush 清零后看 PendingBytes。
     public bool PersistCommit(int bytes) {
         if (this.durability == ZanStore.DUR_SYNC) {
             if (!this.log.Sync()) { return false; }
@@ -527,18 +473,36 @@ public partial class ZanStore {
         return true;
     }
 
-    // 把 memtable 固化为新段：put 与未固化墓碑按键序
-    // 合并写段 → fsync → 保存 manifest（水位 = 当前 seq）→ 截断
-    // 日志。墓碑必须随段持久化：被删键在旧段里仍有旧版本，没有
-    // 新段墓碑压住，恢复扫描就会把它复活。任一步失败都保持日志
-    // 兜底（旧 manifest + 完整日志 = 完好状态）；成功后日志归零。
-    // 须在写侧串行环境调用（同步核心即满足；协程请走
+    public static List<string> CollectSortedKeys(List<string> a, List<string> b) {
+        List<string> keys = new List<string>();
+        for (int i = 0; i < a.Count; i = i + 1) { keys.Add(a[i]); }
+        for (int i = 0; i < b.Count; i = i + 1) { keys.Add(b[i]); }
+        ZanStore.SortStrings(keys);
+        return keys;
+    }
+
+    public SegmentFile FinishAndOpenSegment(SegmentWriter wtr, string segPath) {
+        if (!wtr.Finish()) { this.Fail(wtr.GetError()); return null; }
+        SegmentFile seg = SegmentFile.Open(segPath);
+        if (seg.GetError() != "") {
+            this.Fail(seg.GetError());
+            seg.Close();
+            return null;
+        }
+        if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
+            this.Fail("segment dir sync failed");
+            seg.Close();
+            return null;
+        }
+        return seg;
+    }
+
+    // 固化 memtable 与未固化墓碑为新段，发布双槽清单后截断 WAL。
     public void FlushToSegment() {
         if (!this.WriteReady() || this.txDepth > 0) { return; }
         long logBytes = this.log.Size();
         if (logBytes < 0) { this.Fail(this.log.GetError()); return; }
         if (this.memtable.Count == 0 && this.tombstones.Count == 0 && logBytes == 0) { return; }
-        // 维护失败也不得丢失此前 NONE 档的已提交待写帧。
         if (!this.log.Sync()) { this.Fail(this.log.GetError()); return; }
         if (this.memtable.Count == 0 && this.tombstones.Count == 0) {
             List<long> ids = this.SegIdList();
@@ -553,12 +517,7 @@ public partial class ZanStore {
         if (segId == 9223372036854775807) { this.Fail("store segment id exhausted"); return; }
         string segPath = ZanStore.SegPath(this.basePath, segId);
         File.Delete(segPath);
-        List<string> keys = new List<string>();
-        List<string> src = this.memtable.Keys;
-        for (int i = 0; i < src.Count; i = i + 1) { keys.Add(src[i]); }
-        List<string> tks = this.tombstones.Keys;
-        for (int i = 0; i < tks.Count; i = i + 1) { keys.Add(tks[i]); }
-        ZanStore.SortStrings(keys);
+        List<string> keys = ZanStore.CollectSortedKeys(this.memtable.Keys, this.tombstones.Keys);
         SegmentWriter wtr = null;
         SegmentFile seg = null;
         bool published = false;
@@ -574,26 +533,17 @@ public partial class ZanStore {
                     wtr.Add(keys[i], v, 1);
                 }
             }
-            if (!wtr.Finish()) { this.Fail(wtr.GetError()); return; }
-            seg = SegmentFile.Open(segPath);
-            if (seg.GetError() != "") { this.Fail(seg.GetError()); return; }
-            // 段目录项持久化后再发布清单：断电最坏留下孤儿段
-            // （同号覆盖），旧槽 + 完整日志仍可恢复。
-            if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
-                this.Fail("segment dir sync failed");
-                return;
-            }
+            seg = this.FinishAndOpenSegment(wtr, segPath);
+            if (seg == null) { return; }
             if (ZanStore.CrashHook != null) { ZanStore.CrashHook("flush_mid_seg"); }
             List<long> ids = this.SegIdList();
             ids.Add(segId);
-            // 第一槽成功后新段已可能被引用，之后失败必须保留新段。
             published = true;
             if (!this.PublishBoth(this.seq, segId + 1, ids)) { return; }
-            // 两个 fallback 槽都覆盖日志后才能截断，否则旧槽会缺恢复尾。
             if (!this.log.Reset()) { this.Fail(this.log.GetError()); return; }
             for (int i = 0; i < keys.Count; i = i + 1) {
-                this.index.Remove(keys[i]);
-                if (!this.tombstones.ContainsKey(keys[i])) { this.index.Add(keys[i], segId); }
+                if (this.tombstones.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
+                else { this.index[keys[i]] = segId; }
             }
             this.memtable.Clear();
             this.tombstones.Clear();
@@ -607,7 +557,6 @@ public partial class ZanStore {
                 this.MergeSomeSegments(this.autoMergeK);
             }
         } catch (Exception ex) {
-            // 维护的错误值契约：旧清单与 WAL 或新清单均可恢复。
             this.Fail("store flush failed: " + ex.Message);
         } finally {
             ZanStore.CloseWriter(wtr);
@@ -616,16 +565,7 @@ public partial class ZanStore {
         }
     }
 
-    // 批量直写段提交（刀5）：最外层非空批次不写 WAL 数据帧，把
-    // 覆盖层排序后直接固化成新段发布——大数据导入免 WAL 双写、
-    // 免 memtable 常驻（内存峰值减半），段只写一遍。语义契约：
-    // 崩溃窗口全有或全无——覆盖层只在内存，日志先行 Sync 归零后
-    // 写段，任一步失败/崩溃都回到导入前状态（旧清单 + 空日志，
-    // 未发布孤儿段同号覆盖），调用方重跑导入即可；这与事务回滚
-    // 一致的原子性，但已提交批崩溃后不恢复（WAL 通道才有恢复
-    // 兜底）。memtable 非空先固化（保证数据不混两介质），空批次
-    // 不推进。失败返回 false 并留诊断，调用方 Rollback。须在写侧
-    // 串行环境调用。
+    // 批量直写段提交：先固化已有 memtable，再将覆盖层直接写段发布。
     public bool CommitBulk() {
         if (!this.WriteReady()) { return false; }
         if (this.txDepth == 0) { return true; }
@@ -633,9 +573,6 @@ public partial class ZanStore {
         if (this.txDepth > 0) { return true; }
         if (this.txPut.Count == 0 && this.txDel.Count == 0) { return true; }
         if (this.seq == 9223372036854775807) { this.Fail("store revision exhausted"); return false; }
-        // 既有 memtable 先固化：BulkLoad 只走段介质，覆盖层与其
-        // 不混。空日志是崩溃窗口「回到导入前」的前提——日志若还
-        // 有未固化已提交帧，崩溃后重放会把导入前的旧状态复活。
         this.FlushToSegment();
         if (!this.IsOpen()) { return false; }
         long logBytes = this.log.Size();
@@ -647,12 +584,7 @@ public partial class ZanStore {
         if (segId == 9223372036854775807) { this.Fail("store segment id exhausted"); return false; }
         string segPath = ZanStore.SegPath(this.basePath, segId);
         File.Delete(segPath);
-        List<string> keys = new List<string>();
-        List<string> src = this.txPut.Keys;
-        for (int i = 0; i < src.Count; i = i + 1) { keys.Add(src[i]); }
-        List<string> tks = this.txDel.Keys;
-        for (int i = 0; i < tks.Count; i = i + 1) { keys.Add(tks[i]); }
-        ZanStore.SortStrings(keys);
+        List<string> keys = ZanStore.CollectSortedKeys(this.txPut.Keys, this.txDel.Keys);
         SegmentWriter wtr = null;
         SegmentFile seg = null;
         bool published = false;
@@ -661,7 +593,6 @@ public partial class ZanStore {
             wtr = SegmentWriter.Create(segPath);
             if (wtr.Failed()) { this.Fail(wtr.GetError()); return false; }
             for (int i = 0; i < keys.Count; i = i + 1) {
-                // 同键 put+del 并存时 del 胜（与事务覆盖层语义一致）。
                 if (this.txDel.ContainsKey(keys[i])) { wtr.Add(keys[i], "", 2); }
                 else {
                     string v = "";
@@ -669,23 +600,16 @@ public partial class ZanStore {
                     wtr.Add(keys[i], v, 1);
                 }
             }
-            if (!wtr.Finish()) { this.Fail(wtr.GetError()); return false; }
-            seg = SegmentFile.Open(segPath);
-            if (seg.GetError() != "") { this.Fail(seg.GetError()); return false; }
-            // 段目录项持久化后再发布清单：断电最坏留下孤儿段
-            // （同号覆盖），旧清单 + 空日志 = 导入前状态。
-            if (!PageFile.DirSync(ZanStore.DirOf(this.basePath))) {
-                this.Fail("segment dir sync failed");
-                return false;
-            }
+            seg = this.FinishAndOpenSegment(wtr, segPath);
+            if (seg == null) { return false; }
             List<long> ids = this.SegIdList();
             ids.Add(segId);
             published = true;
             if (!this.PublishBoth(newSeq, segId + 1, ids)) { return false; }
             if (!this.log.Reset()) { this.Fail(this.log.GetError()); return false; }
             for (int i = 0; i < keys.Count; i = i + 1) {
-                this.index.Remove(keys[i]);
-                if (!this.txDel.ContainsKey(keys[i])) { this.index.Add(keys[i], segId); }
+                if (this.txDel.ContainsKey(keys[i])) { this.index.Remove(keys[i]); }
+                else { this.index[keys[i]] = segId; }
             }
             this.segs.Add(new SegRef(seg, segId));
             adopted = true;

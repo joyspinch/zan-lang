@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Net;
 using System.Net.External;
 using System.Net.Sockets;
@@ -559,13 +560,39 @@ public partial class HttpForwarder : IDisposable {
         return FwdChannel.OfTls(sock, stream, ctx, this.recvIdleMs);
     }
 
+    // 把起始行与保留下来的非逐跳头部写入 StringBuilder（单遍收集 Connection 提名，
+    // 消除逐行重解析头部的 O(L^2) 与循环字符串拼接）。
+    private static void WriteFilteredHead(StringBuilder sb, List<string> lines,
+            bool skipHostAndForwarded) {
+        List<string> connTokens = HttpForwarder.CollectConnectionTokens(lines);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            if (i == 0) {
+                sb.Append(line);
+                sb.Append("\r\n");
+                continue;
+            }
+            string name = HttpForwarder.LowerName(line);
+            if (skipHostAndForwarded && (name == "host"
+                || name == "transfer-encoding" || name == "x-forwarded-for")) {
+                continue;
+            }
+            if (HttpForwarder.IsHopByHop(name) || connTokens.Contains(name)) {
+                continue;
+            }
+            sb.Append(line);
+            sb.Append("\r\n");
+        }
+    }
+
     // 改写请求头：Host 指向上游、剥离逐跳头部、
     // 追加 X-Forwarded-For，并要求上游按请求关闭连接。
     // 对 Transfer-Encoding: chunked 的请求保留该头部，确保上游
     // 能正确解析后续 chunk 正文。
     private string RewriteRequestHead(string head, string peer) {
         List<string> lines = HttpForwarder.HeadLines(head);
-        string outHead = "";
+        StringBuilder sb = new StringBuilder();
+        HttpForwarder.WriteFilteredHead(sb, lines, true);
         string hostValue = this.upHost;
         // IPv6 字面量在 Host 头里必须带方括号（RFC 3986）；upHost
         // 存的是去括号形式，改写时还原。
@@ -577,31 +604,25 @@ public partial class HttpForwarder : IDisposable {
         bool chunked = HttpForwarder.HeadIsChunked(head);
         bool upgrade = HttpForwarder.HasHeaderToken(head, "connection", "upgrade")
             && HttpForwarder.HeaderValue(head, "upgrade").Length > 0;
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
-            string name = HttpForwarder.LowerName(line);
-            if (name == "host" || name == "transfer-encoding"
-                || name == "x-forwarded-for") { continue; }
-            if (HttpForwarder.IsHopByHop(name)
-                || HttpForwarder.HasHeaderToken(head, "connection", name)
-                || HttpForwarder.HasHeaderToken(head, "proxy-connection", name)) { continue; }
-            outHead = outHead + line + "\r\n";
-        }
-        outHead = outHead + "Host: " + hostValue + "\r\n";
-        if (chunked) { outHead = outHead + "Transfer-Encoding: chunked\r\n"; }
+        sb.Append("Host: ");
+        sb.Append(hostValue);
+        sb.Append("\r\n");
+        if (chunked) { sb.Append("Transfer-Encoding: chunked\r\n"); }
         if (peer.Length > 0) {
-            outHead = outHead + "X-Forwarded-For: " + peer + "\r\n";
+            sb.Append("X-Forwarded-For: ");
+            sb.Append(peer);
+            sb.Append("\r\n");
         }
         if (upgrade) {
-            outHead = outHead + "Upgrade: " + HttpForwarder.HeaderValue(head, "upgrade")
-                + "\r\nConnection: Upgrade\r\n\r\n";
+            sb.Append("Upgrade: ");
+            sb.Append(HttpForwarder.HeaderValue(head, "upgrade"));
+            sb.Append("\r\nConnection: Upgrade\r\n\r\n");
         } else if (this.pool != null) {
-            outHead = outHead + "Connection: keep-alive\r\n\r\n";
+            sb.Append("Connection: keep-alive\r\n\r\n");
         } else {
-            outHead = outHead + "Connection: close\r\n\r\n";
+            sb.Append("Connection: close\r\n\r\n");
         }
-        return outHead;
+        return sb.ToString();
     }
 
     // 请求头声明了正文（Content-Length &gt; 0 或 chunked）。
@@ -643,29 +664,22 @@ public partial class HttpForwarder : IDisposable {
     // Transfer-Encoding 保留（分块帧原样透传给下游）。
     private static string RewriteResponseHead(string head, bool switched) {
         List<string> lines = HttpForwarder.HeadLines(head);
-        string outHead = "";
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            if (i == 0) { outHead = outHead + line + "\r\n"; continue; }
-            string name = HttpForwarder.LowerName(line);
-            if (HttpForwarder.IsHopByHop(name)
-                || HttpForwarder.HasHeaderToken(head, "connection", name)
-                || HttpForwarder.HasHeaderToken(head, "proxy-connection", name)) { continue; }
-            outHead = outHead + line + "\r\n";
-        }
+        StringBuilder sb = new StringBuilder();
+        HttpForwarder.WriteFilteredHead(sb, lines, false);
         if (HttpForwarder.HeadIsChunked(head)) {
-            outHead = outHead + "Transfer-Encoding: chunked\r\n";
+            sb.Append("Transfer-Encoding: chunked\r\n");
         }
         if (switched) {
-            outHead = outHead + "Upgrade: " + HttpForwarder.HeaderValue(head, "upgrade")
-                + "\r\nConnection: Upgrade\r\n\r\n";
+            sb.Append("Upgrade: ");
+            sb.Append(HttpForwarder.HeaderValue(head, "upgrade"));
+            sb.Append("\r\nConnection: Upgrade\r\n\r\n");
         } else if (HttpForwarder.StatusOf(head) >= 100
             && HttpForwarder.StatusOf(head) < 200) {
-            outHead = outHead + "\r\n";
+            sb.Append("\r\n");
         } else {
-            outHead = outHead + "Connection: close\r\n\r\n";
+            sb.Append("Connection: close\r\n\r\n");
         }
-        return outHead;
+        return sb.ToString();
     }
 
     // 按 `head` 声明的帧格式把正文从 `src` 搬到 `dst`，每收到

@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 using System.Web;
 using Zan.Web.Security;
@@ -14,12 +16,6 @@ namespace Zan.Web.Core;
    只存在于应用内，框架经此挂点执行注册而不感知具体路由表。 */
 public delegate void RouteFn(WebApp app);
 
-/* 项目侧业务种子委托：Schema 就绪后、服务器启动前执行一次——业务表建表、
-   种子数据、旧库数据迁移等。异步方法（async bool）经 async delegate 回调，
-   注册：Boot.OnSeed(Program.Seed)。回调内经 AppServices.Current().Db()
-   借还连接；失败记为未就绪。新应用优先使用持约的 OnAfterSchema。 */
-public async delegate bool BootSeedFn();
-
 /* 项目侧 WebApp 接线委托：Boot 装配完标准件（解析器/静态挂载/中间件）
    之后、路由注册之前调用——应用侧追加全局中间件、替换解析器、挂业务
    通道等最后接线位。注册：Boot.OnApp(Program.Wire)。 */
@@ -27,8 +23,8 @@ public delegate void AppFn(WebApp app);
 
 /* ZanWeb 应用引导：配置、日志、连接池、缓存、Schema 迁移、WebApp 装配、
    中间件、指标、集群总线、任务调度、路由授权、接口文档与服务器生命周期
-   全部在此收口。应用侧 main.zan 只做三件事：声明业务菜单分组、注册路由
-   表挂点与业务种子挂点，然后 await Boot.Run()。框架升级 = 包升级，应用
+   全部在此收口。应用侧 main.zan 只做三件事：声明业务模型与扩展钩子、注册路由
+   表挂点与 Schema 种子挂点（Schema.OnSeed / Boot.OnAfterSchema），然后 await Boot.Run()。框架升级 = 包升级，应用
    组合根不随之变动。 */
 public class Boot {
     /* 应用侧经 Boot.OnRoutes 注册的路由表执行入口。 */
@@ -43,13 +39,6 @@ public class Boot {
        Boot.OnRoutes(Program.RegisterRoutes); */
     public static void OnRoutes(RouteFn fn) {
         routes = fn;
-    }
-
-    /* 业务种子挂点：调用时机见 SeedFn 注释。 */
-    static BootSeedFn seedFn;
-
-    public static void OnSeed(BootSeedFn fn) {
-        seedFn = fn;
     }
 
     /* 迁移与业务种子共用 Schema 的互斥租约和连接，不能在回调里另借连接。
@@ -74,6 +63,34 @@ public class Boot {
 
     public static void OnApp(AppFn fn) {
         appFn = fn;
+    }
+
+    /* 扩展性钩子快捷注册入口（委托给 MvcHooks，便于在应用组合根 main.zan 集中装配）。 */
+    public static void OnLoginCheck(LoginGuardFn fn) { MvcHooks.OnLoginCheck(fn); }
+    public static void OnLogin(LoginEventFn fn) { MvcHooks.OnLogin(fn); }
+    public static void OnScopeResolve(ScopeResolveFn fn) { MvcHooks.OnScopeResolve(fn); }
+    public static void OnMenu(MenuHookFn fn) { MvcHooks.OnMenu(fn); }
+    public static void OnAudit(AuditHookFn fn) { MvcHooks.OnAudit(fn); }
+    public static void OnTokenClaims(TokenClaimsFn fn) { MvcHooks.OnTokenClaims(fn); }
+    public static void OnGrantResolve(GrantResolveFn fn) { MvcHooks.OnGrantResolve(fn); }
+    public static void OnSummary(SummaryHookFn fn) { MvcHooks.OnSummary(fn); }
+
+    static List<string> extraViewDirs;
+    static List<string> extraStaticDirs;
+    static List<string> resolvedStaticDirs;
+
+    /* 注册基础视图目录（后加载的 Cfg.Server.viewsDir 会按视图键精确覆盖同名模板）。 */
+    public static void AddViewsDir(string dir) {
+        if (dir == null || dir.Length == 0) { return; }
+        if (extraViewDirs == null) { extraViewDirs = new List<string>(); }
+        extraViewDirs.Add(dir);
+    }
+
+    /* 注册基础静态资源目录（应用 Cfg.Server.staticDir 优先命中，缺失时再回退基础目录）。 */
+    public static void AddStaticDir(string dir) {
+        if (dir == null || dir.Length == 0) { return; }
+        if (extraStaticDirs == null) { extraStaticDirs = new List<string>(); }
+        extraStaticDirs.Add(dir);
     }
 
     /* 引导并运行服务器；返回值即进程退出码（start/stop/restart 命令语义）。 */
@@ -142,21 +159,6 @@ public class Boot {
                 + " see error log");
         }
 
-        /* 兼容原有自行借库的业务种子；新挂点在 Schema 租约内执行。
-           任何种子失败均保留未就绪结果，由 required 策略决定是否启动。 */
-        if (ready && seedFn != null) {
-            try {
-                bool seeded = await seedFn();
-                if (!seeded) {
-                    ready = false;
-                    Log.Error("[seed] business seed reported failure"
-                        + " -- check app log");
-                }
-            } catch (Exception seedError) {
-                ready = false;
-                Log.Error("[seed] business seed hook failed: " + seedError.Message);
-            }
-        }
         if (!ready && requireDataReady) {
             Log.Error("[startup] required data initialization failed -- refusing to serve");
             AppServices.Use(null);
@@ -170,10 +172,14 @@ public class Boot {
         /* 上传上限独立于请求体上限：流式上传不占内存，可以给得宽裕 */
         app.MaxUpload(Cfg.Server.uploadBodyMB * 1024 * 1024);
         app.GlobalLimit(Cfg.Server.globalLimitPerSec);
+        app.SessionCookie(Cfg.Auth.cookieName);
+        app.AuthHeader(Cfg.Auth.headerName, Cfg.Auth.bearerScheme);
+        app.ApiPrefix(Cfg.Server.apiPrefix);
+        Csrf.Configure(Cfg.Security.csrfCookie, Cfg.Security.csrfHeader, Cfg.Security.csrfForm);
         WebHost.Use(app);
         app.AuthResolver(AuthToken.Resolve);
-        app.PermissionResolver(AuthUser.Allow);
-        app.LoginPath(Routes.Login);
+        app.ScopedPermissionResolver(AuthUser.AllowInScope);
+        app.LoginPath(Cfg.Security.loginPath.Length > 0 ? Cfg.Security.loginPath : Routes.Login);
         /* 全站安全响应头，放在一切可能短路应答的中间件之前，让 403/204
            也带着这些头出门。 */
         app.Before(SecurityHeaders);
@@ -186,14 +192,12 @@ public class Boot {
         }
         /* 运行模式判断：mode=api 时跳过 HTML 视图载入与静态目录挂载（纯 API 轻量模式） */
         if (Cfg.Server.mode != "api") {
-            /* 视图从磁盘读取一次，之后从内存渲染 */
-            app.Views("views");
+            /* 视图从磁盘读取一次，之后从内存渲染；支持 baseViewsDir → extraViewDirs → viewsDir 分层覆盖 */
+            MountLayeredViews(app);
 
-            /* 静态文件挂载：仅 wwwroot/ 可被外部访问。资产无版本号指纹，
-               故浏览器缓存只保留一小时；改版后一小时内或强制刷新生效。 */
-            /* 后台资产不缓存：改完 CSS/JS 刷新即生效。max-age=3600 曾让「改完没变化」反复发生——版本号得靠人手改，漏一次就是半小时的误判。 */
-            StaticFiles.MaxAge(0);
-            StaticFiles.Mount(app, "/static", "wwwroot");
+            /* 静态文件挂载：仅静态根目录可被外部访问；支持 staticDir 优先、回退到 baseStaticDir / extraStaticDirs。 */
+            StaticFiles.MaxAge(Cfg.Server.staticMaxAge);
+            MountLayeredStatic(app);
         } else {
             Console.WriteLine("[server] mode=api (headless): views and static assets bypassed");
         }
@@ -224,23 +228,11 @@ public class Boot {
         /* 指标历史写入独立数据库，由后台协程定期刷新 */
         bool hist = await MetricsStore.Start();
         if (hist) {
+            app.UseRequestDiagnostics(MetricsStore.RouteDiagnosticEvery(), MetricsStore.RecordRouteDiagnostics);
             Console.WriteLine("[metrics] history " + Cfg.Metrics.path
                 + " flush=" + Convert.ToString(Cfg.Metrics.flushSeconds) + "s");
             /* 停机最后一冲：Worker 排空完成后、退出前把残余窗口落库。 */
             Worker.OnShutdown(MetricsStore.FlushAtExit);
-        }
-
-        /* 跨物理节点状态总线：默认关闭（保持单机高性能共享内存），配置集群时通过 Redis Pub/Sub 同步失效事件 */
-        if (Cfg.Cluster.enabled) {
-            if (Cfg.Cache.driver == "redis") {
-                ClusterBus.Init(Cfg.Cluster, Db.OpenRedis());
-                ClusterBus.Start();
-                Console.WriteLine("[cluster] Redis Pub/Sub bus armed on channel "
-                    + Cfg.Cluster.channel);
-            } else {
-                Console.WriteLine("[cluster] cluster.enabled is true but cache.driver is not redis"
-                    + " -- cluster bus disabled, state will remain local");
-            }
         }
 
         /* 定时任务调度：每 worker 一条循环，到点经数据库乐观锁抢单，
@@ -251,12 +243,17 @@ public class Boot {
             Console.WriteLine("[job] disabled by config");
         }
 
-        /* 路由：编译期从控制器属性生成，运行时只执行注册（挂点由应用侧注册） */
+        /* 路由：编译期从控制器属性生成，优先应用侧 Boot.OnRoutes，否则使用 [ModuleInitializer] 自注册表 */
         if (appFn != null) {
             appFn(app);
         }
         if (routes != null) {
             routes(app);
+        } else {
+            __AttrRoutes.ApplyAutoRoutes(app);
+        }
+        if (Cfg.Security.loginPath.Length == 0) {
+            app.LoginPath(Routes.PathOf(typeof(Zan.Web.Admin.LoginController), "Index", Routes.Login));
         }
 
         /* GEO 站点级内容源：内容由应用层（框架的 Geo 服务 + 各模块贡献）
@@ -275,28 +272,11 @@ public class Boot {
                 + " 个管理区端点显式声明匿名，已被抬回需登录");
         }
 
-        /* 权限索引：从路由表建立 screen->bit 映射 */
-        Perm.Index(app);
+        await InitPermissions(app, ready);
 
-        if (ready) {
-            /* 内置角色同步路由授权，然后移入共享内存（匿名表，master 建、worker 继承） */
-            bool grantsReady = await Schema.SyncRoleGrants(app);
-            if (!grantsReady) {
-                Console.WriteLine("[rbac] role grants not synchronized"
-                    + " -- check database connectivity and schema");
-            }
-            if (!PermTable.Open()) {
-                Console.WriteLine("[rbac] shared memory unavailable");
-            }
-            IZanSql rbac = AppServices.Current().Orm();
-            if (rbac != null) {
-                await PermTable.LoadRoles(rbac);
-            }
-        }
-
-        /* API 文档：从属性生成，挂载到 /api/docs */
+        /* API 文档：从属性生成，挂载到配置的文档路径（默认 /api/docs） */
         ApiDocs.Title(Cfg.Server.name);
-        ApiDocs.MountSpec(app, "/api/docs");
+        ApiDocs.MountSpec(app, Cfg.Server.apiDocsPath);
 
         /* RunCommand 的返回不是 worker 停服边界：start 的 master/worker 在
            Worker 内直接 exit；stop/reload/status 返回的只是命令发送进程，
@@ -308,21 +288,50 @@ public class Boot {
         return r;
     }
 
+    public static async void InitPermissions(WebApp app, bool ready) {
+        /* 权限索引和共享表必须在 master/worker 各自装配，句柄由 Worker 负责继承。 */
+        Perm.Index(app);
+        if (ready) {
+            if (!ProcessHost.IsWorker() && !await Schema.SyncRoleGrants(app)) {
+                Console.WriteLine("[rbac] role grants not synchronized"
+                    + " -- check database connectivity and schema");
+            }
+            if (!ProcessHost.IsWorker()) {
+                bool _menuSynced = await MenuService.SyncRoutes(app);
+            }
+            if (!PermTable.Open()) {
+                Console.WriteLine("[rbac] shared memory unavailable");
+            }
+        }
+        if (Cfg.Cluster.enabled) {
+            if (Cfg.Cache.driver == "redis") {
+                ClusterBus.Init(Cfg.Cluster, Db.OpenRedis());
+                if (!ProcessHost.IsWorker()) { ClusterBus.Start(); }
+            } else {
+                Log.Error("[cluster] cluster.enabled requires cache.driver=redis");
+                PermTable.SetClusterOnline(false);
+            }
+        } else if (ready && !ProcessHost.IsWorker()) {
+            IZanSql orm = AuthUser.Orm();
+            try { await PermTable.LoadRolesWithRetry(orm, orm); }
+            catch (Exception ex) { Log.Warn("[rbac] initial role load failed: " + ex.Message); }
+        }
+    }
+
     /* double-submit CSRF 默认关闭（见 Run 内注释）。 */
     static bool csrfEnabled = false;
 
-    /* 管理区守门：段边界对齐的 /admin 与 /api/admin 前缀，豁免登录页/
-       登录提交/登出三件套，其余全部抬为需要登录（needsAuth 蕴含登录，
-       无需处理）。返回被纠正的端点数——正常装配为 0（编译期默认已是
-       Login），非 0 说明有控制器显式声明了匿名。 */
+    /* 管理区守门：段边界对齐的 adminPrefixes 前缀，豁免 AdminExempt 元数据
+       或 adminExemptPaths（默认登录页/登录提交/登出三件套），其余全部抬为
+       需要登录（needsAuth 蕴含登录，无需处理）。返回被纠正的端点数——
+       正常装配为 0（编译期默认已是 Login），非 0 说明有控制器显式声明了匿名。 */
     public static int AdminGate(WebApp app) {
         List<Route> all = app.Router().All();
         int raised = 0;
         for (int i = 0; i < all.Count; i = i + 1) {
             Route r = all[i];
             if (!AdminPath(r.Pattern())) { continue; }
-            if (r.Pattern() == Routes.Login || r.Pattern() == Routes.LoginSubmit
-                || r.Pattern() == Routes.Logout) { continue; }
+            if (IsAdminExempt(r)) { continue; }
             if (r.NeedsLogin()) { continue; }
             r.Login();
             raised = raised + 1;
@@ -330,9 +339,30 @@ public class Boot {
         return raised;
     }
 
-    /* 前缀匹配容忍缺前导斜杠的手写注册，但要求段边界（/adminX 不算）。 */
+    public static bool IsAdminExempt(Route r) {
+        if (r == null) { return false; }
+        if (r.MetaGet("AdminExempt") == "true") { return true; }
+        string raw = Cfg.Security.adminExemptPaths;
+        if (raw == null || raw.Length == 0) { return false; }
+        string pat = r.Pattern();
+        List<string> parts = raw.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length > 0 && pat == p) { return true; }
+        }
+        return false;
+    }
+
+    /* 前缀匹配容忍缺前导斜杠的手写注册，但要求段边界（/adminX 不算）。从 Cfg.Security.adminPrefixes 自动读取。 */
     public static bool AdminPath(string pattern) {
-        return PathIs(pattern, "/admin") || PathIs(pattern, "/api/admin");
+        string raw = Cfg.Security.adminPrefixes;
+        if (raw == null || raw.Length == 0) { return false; }
+        List<string> parts = raw.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length > 0 && PathIs(pattern, p)) { return true; }
+        }
+        return false;
     }
 
     private static bool PathIs(string pattern, string prefix) {
@@ -351,14 +381,113 @@ public class Boot {
         csrfEnabled = true;
     }
 
+    private static void SplitDirs(string csv, List<string> outDirs) {
+        if (csv == null || csv.Length == 0 || outDirs == null) { return; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length > 0 && Directory.Exists(p)) {
+                outDirs.Add(p);
+            }
+        }
+    }
+
+    public static void MountLayeredViews(WebApp app) {
+        List<string> dirs = new List<string>();
+        SplitDirs(Cfg.Server.baseViewsDir, dirs);
+        if (extraViewDirs != null) {
+            for (int i = 0; i < extraViewDirs.Count; i = i + 1) {
+                if (Directory.Exists(extraViewDirs[i])) {
+                    dirs.Add(extraViewDirs[i]);
+                }
+            }
+        }
+        if (Cfg.Server.viewsDir.Length > 0 && Directory.Exists(Cfg.Server.viewsDir)) {
+            dirs.Add(Cfg.Server.viewsDir);
+        }
+        if (dirs.Count == 0) {
+            app.Views(Cfg.Server.viewsDir);
+            return;
+        }
+        app.Views(dirs[0]);
+        View v = app.GetViews();
+        for (int i = 1; i < dirs.Count; i = i + 1) {
+            OverlayViews(v, dirs[i], "");
+        }
+    }
+
+    private static void OverlayViews(View target, string d, string prefix) {
+        if (target == null || !Directory.Exists(d)) { return; }
+        List<string> files = Directory.GetFileNames(d);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string fn = files[i];
+            if (fn.Length > 5 && fn.Substring(fn.Length - 5, 5) == ".html") {
+                string stem = fn.Substring(0, fn.Length - 5);
+                string body = File.ReadAllText(d + "/" + fn);
+                target.Put(prefix + stem, body);
+                if (stem == "layout" && prefix.Length == 0) { target.Put("layout", body); }
+            }
+        }
+        List<string> dirs = Directory.GetDirectories(d);
+        for (int j = 0; j < dirs.Count; j = j + 1) {
+            string sub = dirs[j];
+            if (sub == "View") {
+                OverlayViews(target, d + "/" + sub, prefix);
+            } else {
+                OverlayViews(target, d + "/" + sub, prefix + sub + ".");
+            }
+        }
+    }
+
+    public static void MountLayeredStatic(WebApp app) {
+        List<string> dirs = new List<string>();
+        if (Cfg.Server.staticDir.Length > 0) { dirs.Add(Cfg.Server.staticDir); }
+        if (extraStaticDirs != null) {
+            for (int i = 0; i < extraStaticDirs.Count; i = i + 1) {
+                if (Directory.Exists(extraStaticDirs[i])) {
+                    dirs.Add(extraStaticDirs[i]);
+                }
+            }
+        }
+        SplitDirs(Cfg.Server.baseStaticDir, dirs);
+        if (dirs.Count <= 1) {
+            StaticFiles.Mount(app, Cfg.Server.staticUrl, Cfg.Server.staticDir);
+            return;
+        }
+        resolvedStaticDirs = dirs;
+        app.Before(LayeredStaticHook);
+        StaticFiles.Mount(app, Cfg.Server.staticUrl, Cfg.Server.staticDir);
+    }
+
+    public static bool LayeredStaticHook(HttpContext ctx) {
+        if (ctx == null || (ctx.Method() != "GET" && ctx.Method() != "HEAD")) { return true; }
+        string rel = StaticFiles.RelativeTo(ctx.Path(), Cfg.Server.staticUrl);
+        if (rel == null) { return true; }
+        if (rel.Length == 0 || !StaticFiles.IsSafe(rel)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
+        }
+        if (resolvedStaticDirs != null) {
+            for (int i = 0; i < resolvedStaticDirs.Count; i = i + 1) {
+                string root = resolvedStaticDirs[i];
+                string full = Directory.ReadPath(root + "/" + rel);
+                if (File.Exists(full) || File.EmbedExists(full)) {
+                    return StaticFiles.ServeFile(ctx, rel, root, Cfg.Server.staticUrl, Cfg.Server.staticMaxAge);
+                }
+            }
+        }
+        return StaticFiles.ServeFile(ctx, rel, Cfg.Server.staticDir, Cfg.Server.staticUrl, Cfg.Server.staticMaxAge);
+    }
+
     // double-submit 闸的浏览器形态过滤：真闸在 Csrf.Guard。
     private static bool CsrfGuard(HttpContext ctx) {
         bool safe = ctx.Method() == "GET" || ctx.Method() == "HEAD"
             || ctx.Method() == "OPTIONS";
         if (!safe) {
-            bool bearer = ctx.Header("Authorization").StartsWith("Bearer ");
-            bool browser = ctx.Cookie("zsession").Length > 0
-                || ctx.Cookie("csrf_token").Length > 0;
+            bool bearer = Cfg.Auth.headerName.Length > 0
+                && ctx.Header(Cfg.Auth.headerName).StartsWith(Cfg.Auth.bearerScheme);
+            bool browser = ctx.Cookie(Cfg.Auth.cookieName).Length > 0
+                || ctx.Cookie(Csrf.CookieName).Length > 0;
             if (bearer || !browser) { return true; }
         }
         return Csrf.Guard(ctx);
@@ -403,8 +532,9 @@ public class Boot {
             return true;
         }
         string origin = ctx.Header("Origin");
-        bool bearer = ctx.Header("Authorization").StartsWith("Bearer ");
-        bool cookie = !bearer && ctx.Cookie("zsession").Length > 0;
+        bool bearer = Cfg.Auth.headerName.Length > 0
+            && ctx.Header(Cfg.Auth.headerName).StartsWith(Cfg.Auth.bearerScheme);
+        bool cookie = !bearer && ctx.Cookie(Cfg.Auth.cookieName).Length > 0;
         if (!cookie) {
             if (origin.Length > 0 && Cfg.Cors.enabled && ValidCorsOrigin()
                     && (origin == Cfg.Cors.allowOrigin

@@ -8,44 +8,23 @@ using System.Threading;
 
 namespace System.Data.MySql;
 
-// 原生、协程化的 MySQL / MariaDB 客户端，直接用 Zan 的异步套接字
-// 讲 MySQL 线协议 —— 不依赖 libmariadb、ODBC
-// 或任何原生数据库 DLL。每个网络步骤（连接、握手、认证、查询、
-// 结果）都通过 <c>Socket.RecvOv</c> /
-// <c>Socket.SendAsync</c> 在 IO reactor 上挂起，因此查询不会阻塞工作线程，
-// 多个连接可在同一线程上并行推进。
-// 认证实现了 <c>caching_sha2_password</c> 快速认证（MySQL
-// 8.x 默认方式），用纯 Zan 实现的 <see cref="Sha256"/> 计算：
-// 成功登录后服务器会预热凭据缓存，因此
-// 之后的每次连接都能走快速认证。缓存为空时，
-// 服务器要求完整认证：客户端获取服务器的 RSA
-// 公钥，将 NUL 结尾的密码与握手 nonce 异或，再
-// 以 RSA-OAEP(SHA-1) 加密发送 —— 全部用纯 Zan 实现。
-// 数据包按原始字节缓冲区构建与解析（Zan 字符串用作字节
-// 数组），对含内嵌 NUL 字节的二进制数据安全。
-// 用法：
-// "127.0.0.1", 3306, "test", "root", "secret");
-// db.Close();
+// 原生协程化 MySQL / MariaDB 客户端（支持明文、TLS 升级与 caching_sha2_password）。
 public partial class MySqlConnection : IDbConnection {
     nint sock;
     bool connected;
     string lastError;
-    int lastNumber;  // 服务器自身的错误号，无错误时为 0
-    int lastLen;  // 最近读取数据包的负载长度
-    // A535：START TRANSACTION 后为 true，COMMIT/ROLLBACK 落地后清零。
-    // 连接池归还时据此挂清理协程，把残留事务回滚掉再入池（P2-29 的
-    // 异步驱动半边）。
+    int lastNumber;
+    int lastLen;
     public bool inTxn;
-    int lastSeq;  // 最近读取数据包的序列号
-    int lastAffected;  // 上一条语句影响的行数
-    bool hadError;  // 上一条语句是否返回了 ERR 数据包
-    List<PreparedStmt> stmtCache;  // 预编译语句缓存（SQL -> 服务端 id）
-    TlsStream tls;  // 非空 = 通道已加密（OpenSecureParamsAsync 建立）
+    int lastSeq;
+    int lastAffected;
+    bool hadError;
+    List<PreparedStmt> stmtCache;
+    TlsStream tls;
     public bool tlsVerify = true;
     bool busy;
     List<AsyncGate> waiters;
 
-    // 空连接；外部经 <see cref="OpenParamsAsync"/> 构造。
     public MySqlConnection() {
         this.sock = -1;
         this.connected = false;
@@ -81,13 +60,6 @@ public partial class MySqlConnection : IDbConnection {
         }
     }
 
-    // 字节 / 数据包辅助函数
-
-    // 恰好读取 <paramref name="need"/> 个字节到
-    // <paramref name="dst"/> 的 <paramref name="off"/> 处，在 IO
-    // reactor 上分段读取间挂起。返回实际读到的字节数（对端关闭时 &lt; need，
-    // 不足）。TLS 建立后从解密流读取（每次最多一个 TLS 记录，
-    // 逐字节汇入目标缓冲，与明文路径的 tmp 汇入同一形状）。
     private async int recvExact(byte[] dst, int off, int need) {
         if (this.tls != null) {
             int have = 0;
@@ -109,12 +81,6 @@ public partial class MySqlConnection : IDbConnection {
         return got;
     }
 
-    // 读取一个协议数据包，返回其负载，并将长度写入
-    // <c>lastLen</c>（负载是二进制，从不当作
-    // NUL 结尾的字符串读取）。同时设置 <c>lastSeq</c>。连接关闭时返回 null。
-    // Continuations share a 64 MiB logical-message budget; a zero-length
-    // terminator is valid even at the budget. An incomplete message cannot
-    // leave a reusable session or return its already-received prefix.
     internal async byte[] readPacket() {
         byte[] hdr = new byte[5];
         byte[] pay = new byte[1];
@@ -125,7 +91,7 @@ public partial class MySqlConnection : IDbConnection {
             while (true) {
                 int got = await this.recvExact(hdr, 0, 4);
                 if (got < 4) { this.lastError = "truncated MySQL packet header"; return null; }
-                int len = (hdr[0]&255) | ((hdr[1]&255)<<8) | ((hdr[2]&255)<<16);
+                int len = (hdr[0] & 255) | ((hdr[1] & 255) << 8) | ((hdr[2] & 255) << 16);
                 this.lastSeq = hdr[3] & 255;
                 int nextLen = MySqlPacketBounds.AppendLength(totalLen, len);
                 if (nextLen < 0) {
@@ -147,23 +113,27 @@ public partial class MySqlConnection : IDbConnection {
                 }
             }
         } finally {
-            // Any failed/throwing read leaves framing uncertain; never pool it.
+            // 读帧中断则销毁连接，禁止半截帧回到连接池。
             if (!complete) { this.Close(); }
         }
     }
 
-    // 以给定序列号写入一个协议数据包（4 字节头 + 负载）
-    // ，二进制安全（按长度发送）。TLS 建立后写入加密流
-    // （头与负载合为一段明文交由 TLS 分记录）。超 16MB 时按 MySQL 规范自动分片。
+    private async int SendRawPacketBytesAsync(byte[] buf, int totalBytes) {
+        if (this.tls != null) {
+            return await this.tls.SendBytesAsync(buf, 0, totalBytes);
+        }
+        return await Socket.SendAsync(this.sock, buf, totalBytes);
+    }
+
     internal async int writePacket(string payload, int len, int seq) {
         if (len < 16777215) {
             byte[] buf = new byte[len + 5];
-            buf[0]=(byte)(len&255); buf[1]=(byte)((len>>8)&255); buf[2]=(byte)((len>>16)&255); buf[3]=(byte)(seq&255);
+            buf[0] = (byte)(len & 255);
+            buf[1] = (byte)((len >> 8) & 255);
+            buf[2] = (byte)((len >> 16) & 255);
+            buf[3] = (byte)(seq & 255);
             NativeMemory.PutString((nint)buf + (nint)4, 0, payload, len);
-            if (this.tls != null) {
-                return await this.tls.SendBytesAsync(buf, 0, len + 4);
-            }
-            return await Socket.SendAsync(this.sock, buf, len + 4);
+            return await this.SendRawPacketBytesAsync(buf, len + 4);
         }
         int offset = 0;
         int curSeq = seq;
@@ -172,14 +142,12 @@ public partial class MySqlConnection : IDbConnection {
             int chunkLen = len - offset;
             if (chunkLen > 16777215) { chunkLen = 16777215; }
             byte[] buf = new byte[chunkLen + 5];
-            buf[0]=(byte)(chunkLen&255); buf[1]=(byte)((chunkLen>>8)&255); buf[2]=(byte)((chunkLen>>16)&255); buf[3]=(byte)(curSeq&255);
+            buf[0] = (byte)(chunkLen & 255);
+            buf[1] = (byte)((chunkLen >> 8) & 255);
+            buf[2] = (byte)((chunkLen >> 16) & 255);
+            buf[3] = (byte)(curSeq & 255);
             NativeMemory.PutString((nint)buf + (nint)4, 0, payload.Substring(offset, chunkLen), chunkLen);
-            int r = 0;
-            if (this.tls != null) {
-                r = await this.tls.SendBytesAsync(buf, 0, chunkLen + 4);
-            } else {
-                r = await Socket.SendAsync(this.sock, buf, chunkLen + 4);
-            }
+            int r = await this.SendRawPacketBytesAsync(buf, chunkLen + 4);
             if (r <= 0) { return r; }
             sentTotal = sentTotal + r;
             offset = offset + chunkLen;
@@ -188,26 +156,10 @@ public partial class MySqlConnection : IDbConnection {
         return sentTotal;
     }
 
-    // 将缓冲区中 <paramref name="len"/> 个字节复制到新的
-    // Zan 字符串。
-
-    // 在游标 <c>cur[0]</c> 处解码长度编码整数，
-    // 并推进游标。NULL 标记（0xFB）返回 -1；八字节形式
-    // 携带 64 位计数，因此返回 <c>long</c>。
-
-    // 在游标 <c>cur[0]</c> 处解码长度编码字符串，
-    // 并推进游标。NULL（0xFB）返回 ""。
-
-    // 是否为 EOF 包（0xFE 首字节且负载短于 9 字节，以区分行首恰为 0xFE 的长负载）。
     private bool isEof(byte[] pkt) {
         return (pkt[0] & 255) == 254 && this.lastLen < 9;
     }
 
-    // 认证
-
-    // caching_sha2_password 快速认证加扰：
-    // SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )，返回 32 字节
-    // 缓冲区。
     static byte[] scramble41(string pw, string nonce20) {
         byte[] a = Sha256.Hash(pw, pw.Length);
         byte[] b = Sha256.Hash(a, 32);
@@ -216,14 +168,10 @@ public partial class MySqlConnection : IDbConnection {
         NativeMemory.PutString((nint)cat, 32, nonce20, 20);
         byte[] c = Sha256.Hash(cat, 52);
         byte[] tok = new byte[33];
-        int i = 0;
-        while (i < 32) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
+        for (int i = 0; i < 32; i = i + 1) { tok[i] = (byte)((a[i] ^ c[i]) & 255); }
         return tok;
     }
 
-    // mysql_native_password 加扰：
-    // SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) )，返回 20 字节
-    // 缓冲区。
     static byte[] scrambleNative(string pw, string nonce20) {
         byte[] a = Sha1.Hash(pw, pw.Length);
         byte[] b = Sha1.Hash(a, 20);
@@ -232,44 +180,18 @@ public partial class MySqlConnection : IDbConnection {
         NativeMemory.Copy((nint)cat + 20, (nint)b, 20);
         byte[] c = Sha1.Hash(cat, 40);
         byte[] tok = new byte[21];
-        int i = 0;
-        while (i < 20) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
+        for (int i = 0; i < 20; i = i + 1) { tok[i] = (byte)((a[i] ^ c[i]) & 255); }
         return tok;
     }
 
-    // 按服务器要求的认证插件生成令牌：空密码返回空令牌；
-    // caching_sha2_password 走 scramble41，mysql_native_password 走
-    // scrambleNative；其他插件返回 null（outLen 置 -1）。
     static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
-        if (pw.Length == 0) {
-            outLen[0] = 0;
-            return new byte[1];
-        }
-        if (plugin == "caching_sha2_password") {
-            outLen[0] = 32;
-            return scramble41(pw, nonce20);
-        }
-        if (plugin == "mysql_native_password") {
-            outLen[0] = 20;
-            return scrambleNative(pw, nonce20);
-        }
+        if (pw.Length == 0) { outLen[0] = 0; return new byte[1]; }
+        if (plugin == "caching_sha2_password") { outLen[0] = 32; return scramble41(pw, nonce20); }
+        if (plugin == "mysql_native_password") { outLen[0] = 20; return scrambleNative(pw, nonce20); }
         outLen[0] = -1;
         return null;
     }
 
-    // caching_sha2_password 完整认证（缓存为空时）
-
-    // 取 n 字节加密随机数（完整认证的 RSA-OAEP 随机种子）。
-    static byte[] genSeed(int n) {
-        // 操作系统 CSPRNG（跨平台）；为完整认证提供 RSA-OAEP 随机种子。
-        return RandomNumberGenerator.GetBytes(n);
-    }
-
-    // 从 <paramref name="from"/> 起在 haystack 中查找 needle；
-    // 返回其索引或 -1。
-
-    // 从 PEM 公钥中提取 DER SubjectPublicKeyInfo。
-    // outLen[0] 接收 DER 长度；找不到 PEM 主体则返回 null。
     static byte[] pemToDer(string pem, int pemLen, List<int> outLen) {
         int begin = MySqlWire.findSub(pem, pemLen, "-----BEGIN", 10, 0);
         if (begin < 0) { return null; }
@@ -279,8 +201,6 @@ public partial class MySqlConnection : IDbConnection {
         int end = MySqlWire.findSub(pem, pemLen, "-----END", 8, hb);
         if (end < 0) { end = pemLen; }
         int blen = end - hb;
-        // PEM 正文按 64 列折行（RFC 7468 软换行）。严格 base64
-        // 解码前只剥离换行，正文中的其他字符仍保持严格校验。
         byte[] b64 = new byte[blen + 1];
         int o = 0;
         for (int i = 0; i < blen; i = i + 1) {
@@ -293,255 +213,157 @@ public partial class MySqlConnection : IDbConnection {
         return der;
     }
 
-    // 在游标 c[0] 处读取 DER 长度，并将 c[0] 推进过它。
-
-    // 解析 RSA SubjectPublicKeyInfo，并用 RSA OAEP-SHA1
-    // （MySQL 完整认证填充）加密 <paramref name="obf"/>。kOut[0] 接收模数
-    // 字节长度（即密文长度）。
     static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
         List<int> c = new List<int>(); c.Add(0);
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);  // 外层 SEQUENCE
-        c[0] = c[0] + 1; int algLen = MySqlWire.readDerLen(der, c); c[0] = c[0] + algLen;  // 跳过 AlgorithmIdentifier
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);  // BIT STRING
-        c[0] = c[0] + 1;  // 未使用位字节（0x00）
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);  // 内层 SEQUENCE（RSAPublicKey）
-        c[0] = c[0] + 1; int nLen = MySqlWire.readDerLen(der, c);  // INTEGER 模数
-        int origStart = c[0]; int origLen = nLen;
-        int nStart = origStart; int useLen = origLen;
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1; int algLen = MySqlWire.readDerLen(der, c); c[0] = c[0] + algLen;
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1;
+        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
+        c[0] = c[0] + 1; int nLen = MySqlWire.readDerLen(der, c);
+        int origStart = c[0];
+        int nStart = origStart;
+        int useLen = nLen;
         if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
-        c[0] = origStart + origLen;
-        c[0] = c[0] + 1; int eLen = MySqlWire.readDerLen(der, c);  // INTEGER 指数
+        c[0] = origStart + nLen;
+        c[0] = c[0] + 1; int eLen = MySqlWire.readDerLen(der, c);
         int eStart = c[0];
         byte[] nBuf = new byte[useLen + 1];
-        int i = 0; for (; i < useLen; i = i + 1) { nBuf[i] = (byte)(der[nStart + i] & 255); }
+        for (int i = 0; i < useLen; i = i + 1) { nBuf[i] = (byte)(der[nStart + i] & 255); }
         byte[] eBuf = new byte[eLen + 1];
-        i = 0; while (i < eLen) { eBuf[i] = (byte)(der[eStart + i] & 255); i = i + 1; }
+        for (int i = 0; i < eLen; i = i + 1) { eBuf[i] = (byte)(der[eStart + i] & 255); }
         byte[] cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
         kOut[0] = useLen;
         return cph;
     }
 
-    // 连接
-
-    // 使用原生线协议打开协程化的 MySQL/MariaDB 连接
-    // 。
     public static async MySqlConnection OpenParamsAsync(string host, int port,
             string database, string user, string password) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        bool ok = await conn.doConnect(host, port, database, user, password, false, "");
-        conn.connected = ok;
+        conn.connected = await conn.doConnect(host, port, database, user, password, false, "");
         return conn;
     }
 
-    // TLS 校验开关：默认开启——证书链与主机名都验。自签/测试服务器
-    // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient 的
-    // verifyTls 开关同一语义。
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
         get { return MySqlConnection.defaultVerifyTls; }
         set { MySqlConnection.defaultVerifyTls = value; }
     }
 
-    // 切换后续 OpenSecureParamsAsync 的证书与主机名校验。
-    // 仅测试/开发自签场景关闭；生产保持默认开启。
     public static void SetTlsVerify(bool verify) {
         MySqlConnection.defaultVerifyTls = verify;
     }
 
-    // 与 <see cref="OpenParamsAsync"/> 相同，但把通道升级为
-    // TLS（MySQL 协议的 CLIENT_SSL：SSLRequest 后整个会话加密）。
-    // 服务器不报 CLIENT_SSL 能力时显式失败（绝不静默降级明文）；
-    // 握手按 <paramref name="host"/> 做证书主机名校验，信任系统根，
-    // 口令与查询不再走明文信道。
     public static async MySqlConnection OpenSecureParamsAsync(string host, int port,
             string database, string user, string password) {
-        return await MySqlConnection.OpenSecureParamsAsync(host, port,
-            database, user, password, "");
+        return await MySqlConnection.OpenSecureParamsAsync(host, port, database, user, password, "");
     }
 
-    // 与五参重载相同，另把 <paramref name="sslCa"/> 指向的 PEM
-    // CA 证书/证书束追加为信任锚——自签或私有 CA 部署在各平台保留完整
-    // 证书链与主机名校验（等价 Postgres 连接串的 sslrootcert；非
-    // Windows 平台缺系统信任根时这是正路，而非关闭校验）。空串表示
-    // 只用系统信任根。文件不可读即显式失败，绝不静默退回系统根。
     public static async MySqlConnection OpenSecureParamsAsync(string host, int port,
             string database, string user, string password, string sslCa) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        bool ok = await conn.doConnect(host, port, database, user, password, true, sslCa);
-        conn.connected = ok;
+        conn.connected = await conn.doConnect(host, port, database, user, password, true, sslCa);
         return conn;
     }
 
-    // 完整握手与认证（协程版）：解析握手包、发送握手响应，
-    // 处理 OK / ERR / AuthMoreData（快速成功与 RSA 全量认证）/
-    // AuthSwitch。返回认证是否成功；失败原因写入 lastError。
-    // <paramref name="sslCa"/> 为 TLS 升级时的 PEM CA 束路径（空串 =
-    // 只用系统信任根），仅 secure=true 时生效。
-    internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure, string sslCa) {
-        this.sock = Socket.CreateTcp();
-        if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
-        Socket.SetNonBlocking(this.sock);
-        await Socket.ConnectAsync(this.sock, host, port);
+    private async bool UpgradeTlsAsync(string host, int caps, string sslCa) {
+        byte[] sslreq = new byte[33];
+        sslreq[0] = (byte)(caps & 255);
+        sslreq[1] = (byte)((caps >> 8) & 255);
+        sslreq[2] = (byte)((caps >> 16) & 255);
+        sslreq[3] = (byte)((caps >> 24) & 255);
+        MySqlPacketBounds.Advertise(sslreq, 4);
+        sslreq[8] = (byte)45;
+        await this.writePacket(sslreq.ToStr(0, 32), 32, 1);
+        TlsContext tlsCtx = TlsContext.CreateClient();
+        if (tlsCtx == null) {
+            this.lastError = "TLS init failed: " + TlsStream.LastError();
+            return false;
+        }
+        if (!this.tlsVerify || !MySqlConnection.defaultVerifyTls) { tlsCtx.DisableVerify(); }
+        if (sslCa.Length > 0 && !tlsCtx.AddTrustedCert(sslCa)) {
+            this.lastError = "TLS CA bundle unreadable: " + sslCa;
+            return false;
+        }
+        this.tls = await TlsStream.ConnectAsync(tlsCtx, this.sock, host, 15000);
+        if (this.tls == null) {
+            this.lastError = "TLS handshake failed: " + TlsStream.LastError();
+            return false;
+        }
+        return true;
+    }
 
-        // --- 读取并解析握手包（数据包序号 0） ---
-        byte[] hs = await this.readPacket();
-        if (hs == null) { this.lastError = "no handshake from server"; return false; }
-        int proto = hs[0] & 255;
-        if (proto == 255) {
-            int code = (hs[1]&255)|((hs[2]&255)<<8);
-            this.lastError = "handshake err " + Convert.ToString(code) + ": "
-                + MySqlWire.bytesToStr(hs, 3, this.lastLen - 3);
-            return false;
-        }
-        int p = 1;
-        while ((hs[p] & 255) != 0) { p = p + 1; }  // 服务器版本（NUL 结尾）
-        p = p + 1;
-        p = p + 4;  // 线程 id
-        byte[] nonce = new byte[21];
-        int i = 0;
-        for (; i < 8; i = i + 1) { nonce[i] = (byte)(hs[p+i] & 255); }
-        p = p + 8;
-        p = p + 1;  // 填充字节
-        int capLow = (hs[p]&255)|((hs[p+1]&255)<<8);
-        p = p + 2;  // 能力标志（低位）
-        p = p + 1;  // 字符集
-        p = p + 2;  // 状态标志
-        int capHigh = (hs[p]&255)|((hs[p+1]&255)<<8);
-        int serverCaps = capLow | (capHigh << 16);
-        p = p + 2;  // 能力标志（高位）
-        int authlen = hs[p] & 255; p = p + 1;  // 认证插件数据长度
-        p = p + 10;  // 保留字段
-        int part2 = authlen - 8;
-        if (part2 < 13) { part2 = 13; }
-        int copy2 = part2;
-        if (copy2 > 12) { copy2 = 12; }
-        i = 0;
-        while (i < copy2) { nonce[8+i] = (byte)(hs[p+i] & 255); i = i + 1; }
-        p = p + part2;
-        string plugin = "mysql_native_password";
-        if ((serverCaps & 524288) != 0 && p < this.lastLen) {
-            int pluginEnd = p;
-            while (pluginEnd < this.lastLen && (hs[pluginEnd] & 255) != 0) {
-                pluginEnd = pluginEnd + 1;
-            }
-            if (pluginEnd > p) { plugin = MySqlWire.bytesToStr(hs, p, pluginEnd - p); }
-        }
-        // --- TLS 升级（secure=true 时）：SSLRequest(序号 1) 后整条
-        // 通道换 TLS，握手响应(序号 2)起全部走加密流。服务器不报
-        // CLIENT_SSL 即显式失败——绝不静默降级明文。
-        // SSLRequest and HandshakeResponse41 must advertise the same capabilities.
-        // CLIENT_FOUND_ROWS keeps affected-row semantics consistent with SQLite.
-        int caps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
+    private static byte[] BuildHandshakeResponse(int caps, string db, string user, string plugin,
+            byte[] token, int tokenLen, out int respLen) {
         bool hasDb = db.Length > 0;
-        if (hasDb) { caps = caps | 8; }
-        if (secure) { caps = caps | 2048; }
-        int loginSeq = 1;
-        if (secure) {
-            if ((serverCaps & 2048) == 0) {
-                this.lastError = "server does not support TLS (no CLIENT_SSL)";
-                return false;
-            }
-            byte[] sslreq = new byte[33];
-            sslreq[0]=(byte)(caps&255); sslreq[1]=(byte)((caps>>8)&255);
-            sslreq[2]=(byte)((caps>>16)&255); sslreq[3]=(byte)((caps>>24)&255);
-            MySqlPacketBounds.Advertise(sslreq, 4);
-            sslreq[8]=(byte)45;  // utf8mb4_general_ci
-            int z = 9;
-            while (z < 32) { sslreq[z] = 0; z = z + 1; }
-            await this.writePacket(sslreq.ToStr(0, 32), 32, 1);
-            TlsContext tlsCtx = TlsContext.CreateClient();
-            if (tlsCtx == null) {
-                this.lastError = "TLS init failed: " + TlsStream.LastError();
-                return false;
-            }
-            if (!this.tlsVerify || !MySqlConnection.defaultVerifyTls) { tlsCtx.DisableVerify(); }
-            if (sslCa.Length > 0 && !tlsCtx.AddTrustedCert(sslCa)) {
-                this.lastError = "TLS CA bundle unreadable: " + sslCa;
-                return false;
-            }
-            this.tls = await TlsStream.ConnectAsync(tlsCtx, this.sock, host, 15000);
-            if (this.tls == null) {
-                this.lastError = "TLS handshake failed: " + TlsStream.LastError();
-                return false;
-            }
-            loginSeq = 2;  // greeting 0 + SSLRequest 1
-        }
-        // --- 构建并发送握手响应（明文=序号 1 / TLS=序号 2） ---
-        List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
-        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
-        int tokenLen = tokenLenOut[0];
-        if (token == null || tokenLen < 0) {
-            this.lastError = "unsupported auth plugin: " + plugin;
-            return false;
-        }
         int userLen = user.Length;
-        int respLen = 4 + 4 + 1 + 23 + userLen + 1 + 1 + tokenLen;
-        if (hasDb) { respLen = respLen + db.Length + 1; }
-        respLen = respLen + plugin.Length + 1;
+        respLen = 34 + userLen + tokenLen + plugin.Length + 1 + (hasDb ? db.Length + 1 : 0);
         byte[] resp = new byte[respLen + 1];
         int q = 0;
-        resp[q] = (byte)(caps&255); resp[q+1] = (byte)((caps>>8)&255); resp[q+2] = (byte)((caps>>16)&255); resp[q+3] = (byte)((caps>>24)&255); q=q+4;
-        MySqlPacketBounds.Advertise(resp, q); q=q+4;
-        resp[q] = (byte)(45); q=q+1;  // 字符集 utf8mb4_general_ci
-        q = q + 23;  // 23 字节填充（零）
-        i = 0; while (i < userLen) { resp[q+i] = (byte)(user[i] & 255); i = i + 1; } q = q + userLen;
-        resp[q] = (byte)(0); q=q+1;
-        resp[q] = (byte)(tokenLen); q=q+1;  // 认证响应长度
-        i = 0; while (i < tokenLen) { resp[q+i] = (byte)(token[i] & 255); i = i + 1; } q = q + tokenLen;
+        resp[q] = (byte)(caps & 255);
+        resp[q + 1] = (byte)((caps >> 8) & 255);
+        resp[q + 2] = (byte)((caps >> 16) & 255);
+        resp[q + 3] = (byte)((caps >> 24) & 255);
+        q = q + 4;
+        MySqlPacketBounds.Advertise(resp, q);
+        q = q + 4;
+        resp[q] = (byte)45;
+        q = q + 24;
+        for (int i = 0; i < userLen; i = i + 1) { resp[q + i] = (byte)(user[i] & 255); }
+        q = q + userLen + 1;
+        resp[q] = (byte)tokenLen;
+        q = q + 1;
+        for (int i = 0; i < tokenLen; i = i + 1) { resp[q + i] = (byte)(token[i] & 255); }
+        q = q + tokenLen;
         if (hasDb) {
-            i = 0; while (i < db.Length) { resp[q+i] = (byte)(db[i] & 255); i = i + 1; } q = q + db.Length;
-            resp[q] = (byte)(0); q=q+1;
+            for (int i = 0; i < db.Length; i = i + 1) { resp[q + i] = (byte)(db[i] & 255); }
+            q = q + db.Length + 1;
         }
-        i = 0; while (i < plugin.Length) { resp[q+i] = (byte)(plugin[i] & 255); i = i + 1; } q = q + plugin.Length;
-        resp[q] = (byte)(0); q=q+1;
-        await this.writePacket(resp, respLen, loginSeq);
-        // --- 认证结果 ---
+        for (int i = 0; i < plugin.Length; i = i + 1) { resp[q + i] = (byte)(plugin[i] & 255); }
+        return resp;
+    }
+
+    private async bool RunAuthLoopAsync(string pw, byte[] nonce) {
         while (true) {
             byte[] r = await this.readPacket();
             if (r == null) { this.lastError = "connection closed during auth"; return false; }
             int b0 = r[0] & 255;
-            if (b0 == 0) { return true; }  // OK -> 认证成功
+            if (b0 == 0) { return true; }
             if (b0 == 255) {
-                int code = (r[1]&255)|((r[2]&255)<<8);
+                int code = (r[1] & 255) | ((r[2] & 255) << 8);
                 this.lastError = "auth err " + Convert.ToString(code) + ": "
                     + MySqlWire.bytesToStr(r, 9, this.lastLen - 9);
                 return false;
             }
             if (b0 == 1) {
                 int more = r[1] & 255;
-                if (more == 3) { continue; }  // fast_auth_success -> 后续跟随 OK
+                if (more == 3) { continue; }
                 if (more == 4) {
-                    // perform_full_authentication。TLS 已建立时信道本身
-                    // 机密，按协议直接发 NUL 结尾的明文密码（0x04 请求的
-                    // 安全信道分支），无需 RSA 公钥往返；明文信道才走
-                    // RSA-OAEP(SHA-1) 加密路径。
                     if (this.tls != null) {
                         byte[] pwresp = new byte[pw.Length + 2];
-                        i = 0;
-                        while (i < pw.Length) { pwresp[i] = (byte)(pw[i] & 255); i = i + 1; }
-                        pwresp[pw.Length] = (byte)(0);
+                        for (int i = 0; i < pw.Length; i = i + 1) { pwresp[i] = (byte)(pw[i] & 255); }
                         await this.writePacket(pwresp.ToStr(0, pw.Length + 1), pw.Length + 1, this.lastSeq + 1);
-                        continue;  // 随后跟随 OK / ERR
+                        continue;
                     }
-                    // perform_full_authentication：请求服务器的 RSA 公钥，
-                    // 然后以 OAEP-SHA1 加密发送（密码 XOR nonce）。
-                    byte[] req = new byte[2]; req[0] = 2;  // request_public_key
+                    byte[] req = new byte[2];
+                    req[0] = 2;
                     await this.writePacket(req, 1, this.lastSeq + 1);
                     byte[] pk = await this.readPacket();
                     if (pk == null) { this.lastError = "no RSA public key from server"; return false; }
-                    int pemLen = this.lastLen - 1;  // 跳过开头的 0x01
+                    int pemLen = this.lastLen - 1;
                     byte[] pem = new byte[pemLen + 1];
-                    i = 0; while (i < pemLen) { pem[i] = (byte)(pk[1 + i] & 255); i = i + 1; }
+                    for (int i = 0; i < pemLen; i = i + 1) { pem[i] = (byte)(pk[1 + i] & 255); }
                     List<int> derLen = new List<int>(); derLen.Add(0);
                     byte[] der = pemToDer(pem, pemLen, derLen);
                     if (der == null) { this.lastError = "bad RSA public key PEM"; return false; }
-                    int pwLen = pw.Length;
-                    int obfLen = pwLen + 1;  // 包含结尾的 NUL
+                    int obfLen = pw.Length + 1;
                     byte[] obf = new byte[obfLen + 1];
-                    i = 0; while (i < obfLen) { obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255)); i = i + 1; }
-                    byte[] seed = genSeed(20);
+                    for (int i = 0; i < obfLen; i = i + 1) {
+                        obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255));
+                    }
+                    byte[] seed = RandomNumberGenerator.GetBytes(20);
                     if (seed == null) {
                         this.lastError = "secure RNG unavailable for full-auth";
                         return false;
@@ -549,25 +371,21 @@ public partial class MySqlConnection : IDbConnection {
                     List<int> kOut = new List<int>(); kOut.Add(0);
                     byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
                     await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
-                    continue;  // 随后跟随 OK / ERR
+                    continue;
                 }
                 this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
                 return false;
             }
             if (b0 == 254) {
                 int pluginEnd = 1;
-                while (pluginEnd < this.lastLen && (r[pluginEnd] & 255) != 0) {
-                    pluginEnd = pluginEnd + 1;
-                }
+                while (pluginEnd < this.lastLen && (r[pluginEnd] & 255) != 0) { pluginEnd = pluginEnd + 1; }
                 string switchPlugin = MySqlWire.bytesToStr(r, 1, pluginEnd - 1);
                 int nonceStart = pluginEnd + 1;
                 int switchNonceLen = this.lastLen - nonceStart;
                 if (switchNonceLen > 20) { switchNonceLen = 20; }
                 byte[] switchNonce = new byte[21];
-                i = 0;
-                while (i < switchNonceLen) {
+                for (int i = 0; i < switchNonceLen; i = i + 1) {
                     switchNonce[i] = (byte)(r[nonceStart + i] & 255);
-                    i = i + 1;
                 }
                 List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
                 byte[] switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
@@ -586,21 +404,75 @@ public partial class MySqlConnection : IDbConnection {
         return false;
     }
 
-    // 查询 / 执行
+    internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure, string sslCa) {
+        this.sock = Socket.CreateTcp();
+        if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
+        Socket.SetNonBlocking(this.sock);
+        await Socket.ConnectAsync(this.sock, host, port);
 
-    // 发送 COM_QUERY 文本查询。
+        byte[] hs = await this.readPacket();
+        if (hs == null) { this.lastError = "no handshake from server"; return false; }
+        if ((hs[0] & 255) == 255) {
+            int code = (hs[1] & 255) | ((hs[2] & 255) << 8);
+            this.lastError = "handshake err " + Convert.ToString(code) + ": "
+                + MySqlWire.bytesToStr(hs, 3, this.lastLen - 3);
+            return false;
+        }
+        int p = 1;
+        while ((hs[p] & 255) != 0) { p = p + 1; }
+        p = p + 5;
+        byte[] nonce = new byte[21];
+        for (int i = 0; i < 8; i = i + 1) { nonce[i] = (byte)(hs[p + i] & 255); }
+        p = p + 9;
+        int capLow = (hs[p] & 255) | ((hs[p + 1] & 255) << 8);
+        p = p + 5;
+        int capHigh = (hs[p] & 255) | ((hs[p + 1] & 255) << 8);
+        int serverCaps = capLow | (capHigh << 16);
+        p = p + 2;
+        int authlen = hs[p] & 255;
+        p = p + 11;
+        int part2 = authlen - 8;
+        if (part2 < 13) { part2 = 13; }
+        int copy2 = part2 > 12 ? 12 : part2;
+        for (int i = 0; i < copy2; i = i + 1) { nonce[8 + i] = (byte)(hs[p + i] & 255); }
+        p = p + part2;
+        string plugin = "mysql_native_password";
+        if ((serverCaps & 524288) != 0 && p < this.lastLen) {
+            int pluginEnd = p;
+            while (pluginEnd < this.lastLen && (hs[pluginEnd] & 255) != 0) { pluginEnd = pluginEnd + 1; }
+            if (pluginEnd > p) { plugin = MySqlWire.bytesToStr(hs, p, pluginEnd - p); }
+        }
+
+        // SSLRequest 与 HandshakeResponse41 须通告一致的能力标志。
+        int caps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
+        if (db.Length > 0) { caps = caps | 8; }
+        if (secure) { caps = caps | 2048; }
+        int loginSeq = 1;
+        if (secure) {
+            if ((serverCaps & 2048) == 0) {
+                this.lastError = "server does not support TLS (no CLIENT_SSL)";
+                return false;
+            }
+            if (!await this.UpgradeTlsAsync(host, caps, sslCa)) { return false; }
+            loginSeq = 2;
+        }
+        List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
+        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
+        if (token == null || tokenLenOut[0] < 0) {
+            this.lastError = "unsupported auth plugin: " + plugin;
+            return false;
+        }
+        int respLen = 0;
+        byte[] resp = MySqlConnection.BuildHandshakeResponse(caps, db, user, plugin, token, tokenLenOut[0], out respLen);
+        await this.writePacket(resp, respLen, loginSeq);
+        return await this.RunAuthLoopAsync(pw, nonce);
+    }
+
     internal async int comQuery(string sql) {
         int len = sql.Length + 1;
         byte[] pay = new byte[len + 1];
-        pay[0] = (byte)(3);  // COM_QUERY
-        for (int i = 0; i < sql.Length; i = i + 1) { pay[i+1] = (byte)(sql[i] & 255); }
-        int r = await this.writePacket(pay, len, 0);
-        return r;
+        pay[0] = (byte)3;
+        for (int i = 0; i < sql.Length; i = i + 1) { pay[i + 1] = (byte)(sql[i] & 255); }
+        return await this.writePacket(pay, len, 0);
     }
-
-    // 执行查询并返回完整结果集。非 SELECT
-    // 语句的结果为空，受影响行数会被记录。当服务器返回错误包或
-    // 会话已断开时抛出 <see cref="DbException"/>，
-    // 因此空结果总意味着「无行」；
-    // 错误信息仍可通过 <see cref="GetError"/> 获取。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
 }

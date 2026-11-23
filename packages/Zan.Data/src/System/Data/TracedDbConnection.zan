@@ -1,22 +1,43 @@
 using System;
+using System.Diagnostics;
+using System.Data.MySql;
+using System.Data.Postgres;
 
 namespace System.Data;
 
 public class TracedDbConnection : IDbConnection {
     public IDbConnection inner;
+    private IDbStatementObserver observer;
+    private bool reportDbTrace = true;
 
     public TracedDbConnection(IDbConnection inner) {
         this.inner = inner;
     }
 
-    // connection).
+    private TracedDbConnection(IDbConnection inner, IDbStatementObserver observer, bool reportDbTrace) {
+        this.inner = inner;
+        this.observer = observer;
+        this.reportDbTrace = reportDbTrace;
+    }
+
     public IDbConnection Inner() { return this.inner; }
 
     public static IDbConnection Wrap(IDbConnection db) {
+        return TracedDbConnection.Wrap(db, null);
+    }
+
+    public static IDbConnection Wrap(IDbConnection db, IDbStatementObserver observer) {
         if (db == null) { return null; }
-        if (!DbTrace.Enabled()) { return db; }
-        if (db is TracedDbConnection) { return db; }
-        return new TracedDbConnection(db);
+        bool reportDbTrace = DbTrace.Enabled();
+        if (db is TracedDbConnection) {
+            TracedDbConnection traced = (TracedDbConnection)db;
+            if (observer == null && traced.observer == null) { return db; }
+            // Observers belong to one lease. Flatten the old wrapper to keep a single DbTrace report.
+            reportDbTrace = reportDbTrace || traced.reportDbTrace;
+            db = TracedDbConnection.Unwrap(db);
+        }
+        if (observer == null && !reportDbTrace) { return db; }
+        return new TracedDbConnection(db, observer, reportDbTrace);
     }
 
     public static IDbConnection Unwrap(IDbConnection db) {
@@ -27,103 +48,220 @@ public class TracedDbConnection : IDbConnection {
         return cur;
     }
 
+    private void CompleteStatement(int stage, long startUs, bool completed, bool returnedError = false) {
+        if (stage < 0 || this.observer == null) { return; }
+        string failure = !completed ? "exception" : (returnedError ? "returned_error" : null);
+        this.observer.Complete(stage, startUs, Stopwatch.GetMicroseconds(), failure);
+    }
+
+    private bool IsExecuteFailure(int rows, bool isAsync) {
+        // These driver paths document -1 as a failure. ODBC also uses it for unknown row counts.
+        return rows == -1 && (this.inner is MySqlSyncConnection || (!isAsync && this.inner is PgConnection));
+    }
 
     public DbResult Query(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        DbResult r = this.inner.Query(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_query", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        DbResult r = null;
+        bool completed = false;
+        try {
+            r = this.inner.Query(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, r == null);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return r;
     }
 
     public DbResult Query(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        DbResult r = this.inner.Query(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_query", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        DbResult r = null;
+        bool completed = false;
+        try {
+            r = this.inner.Query(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, r == null);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return r;
     }
 
     public int Execute(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        int n = this.inner.Execute(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_execute", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        int n = 0;
+        bool completed = false;
+        try {
+            n = this.inner.Execute(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, stage >= 0 && completed && this.IsExecuteFailure(n, false));
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return n;
     }
 
     public int Execute(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        int n = this.inner.Execute(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_execute", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        int n = 0;
+        bool completed = false;
+        try {
+            n = this.inner.Execute(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, stage >= 0 && completed && this.IsExecuteFailure(n, false));
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return n;
     }
 
     public string ExecuteScalar(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        string s = this.inner.ExecuteScalar(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_scalar", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        string s = null;
+        bool completed = false;
+        try {
+            s = this.inner.ExecuteScalar(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return s;
     }
 
     public string ExecuteScalar(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        string s = this.inner.ExecuteScalar(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_scalar", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        string s = null;
+        bool completed = false;
+        try {
+            s = this.inner.ExecuteScalar(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return s;
     }
 
     public async DbResult QueryAsync(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        DbResult r = await this.inner.QueryAsync(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_query", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        DbResult r = null;
+        bool completed = false;
+        try {
+            r = await this.inner.QueryAsync(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, r == null);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return r;
     }
 
     public async DbResult QueryAsync(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        DbResult r = await this.inner.QueryAsync(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_query", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        DbResult r = null;
+        bool completed = false;
+        try {
+            r = await this.inner.QueryAsync(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, r == null);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return r;
     }
 
     public async int ExecuteAsync(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        int n = await this.inner.ExecuteAsync(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_execute", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        int n = 0;
+        bool completed = false;
+        try {
+            n = await this.inner.ExecuteAsync(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, stage >= 0 && completed && this.IsExecuteFailure(n, true));
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return n;
     }
 
     public async int ExecuteAsync(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        int n = await this.inner.ExecuteAsync(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_execute", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        int n = 0;
+        bool completed = false;
+        try {
+            n = await this.inner.ExecuteAsync(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed, stage >= 0 && completed && this.IsExecuteFailure(n, true));
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return n;
     }
 
     public async string ExecuteScalarAsync(string sql) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        string s = await this.inner.ExecuteScalarAsync(sql);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_scalar", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        string s = null;
+        bool completed = false;
+        try {
+            s = await this.inner.ExecuteScalarAsync(sql);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return s;
     }
 
     public async string ExecuteScalarAsync(string sql, DbParams prms) {
-        long t = DbTrace.NowUs();
-        Activity span = DbTrace.BeginSpan(sql);
-        string s = await this.inner.ExecuteScalarAsync(sql, prms);
-        DbTrace.Report(sql, t, span);
+        long startUs = this.observer != null ? Stopwatch.GetMicroseconds() : 0;
+        int stage = this.observer != null ? this.observer.Begin("sql_scalar", startUs) : -1;
+        long t = this.reportDbTrace ? DbTrace.NowUs() : 0L;
+        Activity span = this.reportDbTrace ? DbTrace.BeginSpan(sql) : null;
+        string s = null;
+        bool completed = false;
+        try {
+            s = await this.inner.ExecuteScalarAsync(sql, prms);
+            completed = true;
+        } finally {
+            this.CompleteStatement(stage, startUs, completed);
+        }
+        if (this.reportDbTrace) { DbTrace.Report(sql, t, span); }
         return s;
     }
-
 
     public int GetProvider() { return this.inner.GetProvider(); }
     public bool IsConnected() { return this.inner.IsConnected(); }

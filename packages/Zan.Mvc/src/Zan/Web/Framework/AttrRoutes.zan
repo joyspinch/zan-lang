@@ -1,151 +1,284 @@
 using System;
-using System.Web;
 using System.Reflection;
+using System.Web;
 using Zan.Web.Core;
-using Zan.Web.Security;
 using Zan.Web;
 
 namespace Zan.Web;
 
-/* 纯净的约定优于配置（Convention over Configuration）路由引擎：
-   1. 命名空间与目录层级 1:1 映射为 URL 路由层级，类名剥离尾部 "Controller"（转小写）作为控制器段。
-      （若类上声明了显式 [Route]，以自定义路由为准）。
-   2. 方法级特性驱动（基于 TypeInfo.GetMethodAttributeData 原生反射）：
-      - 显式 [Route] 覆盖优先；
-      - 动词由 [HttpPost]/[HttpGet]/[HttpDelete]/[HttpPut] 等特性精确指定，无特性默认 GET；
-      - 权限由 [Custom(Perm = ...)]、[Custom(Authorization = ...)] 声明指定；
-      - 标题由 [Description] 指定，菜单由 [Custom(IsMenu = true)] 指定；
-      - 无 Web 特性且非公共动作的框架内部钩子天然不注册，绝无方法名黑名单硬编码。
-   3. 服务器启动时全量装载入跨进程共享内存路由表（RouteTable）。
-   4. 请求进入时直接从共享内存表匹配，没有的路由瞬间抛 404（Fail-Fast）。 */
-public async delegate bool RouteDispatchHandler(HttpContext ctx, string actionKey);
+/* 路由生命周期运行器、约定路径解析与自动路由挂点：
+   控制器路由、特性解析与强类型动作派发全部在编译期由 MvcRoutesGenerator 生成，
+   运行时不执行 AttributeReader 反射或字符串 actionKey 二次派发。 */
 public async delegate void ControllerAction(Controller controller, HttpContext ctx);
-public delegate bool RouteActionFilter(string actionKey);
-public delegate void RouteParameterWriter(Route route, string actionKey);
+public delegate void SyncControllerAction(Controller controller, HttpContext ctx);
 
 public class __AttrRoutes {
 
-    public static async void RunAction(Controller controller, HttpContext ctx, string view,
-                                       bool readOnly, bool transaction, ControllerAction action) {
+    private static RouteFn autoAppRoutes = null;
+    private static RouteFn autoFrameworkRoutes = null;
+
+    public static void UseAutoRoutes(RouteFn appRoutes, RouteFn frameworkRoutes = null) {
+        autoAppRoutes = appRoutes;
+        autoFrameworkRoutes = frameworkRoutes;
+    }
+
+    public static void ApplyAutoRoutes(WebApp app) {
+        if (app == null) { return; }
+        if (autoAppRoutes != null) {
+            autoAppRoutes(app);
+        }
+        if (autoFrameworkRoutes != null) {
+            autoFrameworkRoutes(app);
+        }
+        app.Router().InitRouteTableShared();
+    }
+
+    public static bool TryRunSyncAction(Controller controller, HttpContext ctx, string view,
+                                        bool readOnly, bool directLifecycle, SyncControllerAction action) {
         controller.Bind(ctx);
         controller.SetView(view);
         if (readOnly) { controller.UseReadOnly(); }
-        bool begun = false;
+        RequestTrace trace = ctx != null ? ctx.Trace : null;
+        bool failed = false;
+        bool syncHandled = true;
         try {
-            if (await controller.BeforeAsync()) {
+            bool proceed = false;
+            int beforeStage = trace != null ? trace.Begin("controller_before") : -1;
+            try {
+                if (directLifecycle) {
+                    proceed = controller.Before();
+                } else if (!controller.TryBeforeSync(out proceed)) {
+                    syncHandled = false;
+                    return false;
+                }
+                if (!proceed && trace != null) { trace.Fail(beforeStage, "short_circuit"); }
+            } catch (Exception beforeFailure) {
+                if (trace != null) { trace.Fail(beforeStage, "exception"); }
+                throw;
+            } finally {
+                if (trace != null) { trace.End(beforeStage); }
+            }
+            if (proceed) {
+                int actionStage = trace != null ? trace.Begin("mvc_action") : -1;
+                try {
+                    action(controller, ctx);
+                } catch (Exception actionFailure) {
+                    if (trace != null) { trace.Fail(actionStage, "exception"); }
+                    throw;
+                } finally {
+                    if (trace != null) { trace.End(actionStage); }
+                }
+            }
+            return true;
+        } catch (Exception failure) {
+            failed = true;
+            throw;
+        } finally {
+            if (syncHandled) {
+                int afterStage = trace != null ? trace.Begin("controller_after") : -1;
+                try {
+                    if (directLifecycle) {
+                        controller.After();
+                    } else if (!controller.TryAfterSync()) {
+                        controller.OnAfter();
+                    }
+                } catch (Exception cleanupFailure) {
+                    if (trace != null) { trace.Fail(afterStage, "exception"); }
+                    if (!failed) { throw; }
+                    try { Console.WriteLine("[MVC ERROR] controller cleanup failed: " + cleanupFailure.Message); }
+                    catch (Exception logFailure) { }
+                } finally {
+                    if (trace != null) { trace.End(afterStage); }
+                }
+            }
+        }
+    }
+
+    public static async void RunSyncActionAsync(Controller controller, HttpContext ctx, string view,
+                                                bool readOnly, bool transaction, SyncControllerAction action,
+                                                bool syncLifecycle = true) {
+        controller.Bind(ctx);
+        controller.SetView(view);
+        if (readOnly) { controller.UseReadOnly(); }
+        RequestTrace trace = ctx != null ? ctx.Trace : null;
+        bool begun = false;
+        bool committed = false;
+        bool failed = false;
+        try {
+            bool proceed = false;
+            int beforeStage = trace != null ? trace.Begin("controller_before") : -1;
+            try {
+                if (!syncLifecycle || !controller.TryBeforeSync(out proceed)) {
+                    proceed = await controller.OnBeforeAsync();
+                }
+                if (!proceed && trace != null) { trace.Fail(beforeStage, "short_circuit"); }
+            } catch (Exception beforeFailure) {
+                if (trace != null) { trace.Fail(beforeStage, "exception"); }
+                throw;
+            } finally {
+                if (trace != null) { trace.End(beforeStage); }
+            }
+            if (proceed) {
                 if (transaction) {
                     bool ready = await controller.TxBegin();
                     if (!ready) { throw new ApiError(503, "0503", "服务不可用"); }
                     begun = true;
                 }
-                await action(controller, ctx);
+                int actionStage = trace != null ? trace.Begin("mvc_action") : -1;
+                try {
+                    action(controller, ctx);
+                    if (trace != null && begun && !ctx.Ended()) { trace.Fail(actionStage, "no_response"); }
+                } catch (Exception actionFailure) {
+                    if (trace != null) { trace.Fail(actionStage, "exception"); }
+                    throw;
+                } finally {
+                    if (trace != null) { trace.End(actionStage); }
+                }
                 if (begun) {
+                    if (!ctx.Ended()) {
+                        throw new ApiError(500, "500", "handler produced no response");
+                    }
                     await controller.TxCommit();
                     begun = false;
+                    committed = true;
                 }
             }
         } catch (Exception failure) {
+            failed = true;
             if (begun) {
                 try { await controller.TxRollback(); }
                 catch (Exception rollbackFailure) { }
             }
             throw;
         } finally {
-            await controller.AfterAsync();
-        }
-    }
-
-    private static RouteDispatchHandler CustomDispatcher = null;
-    private static RouteDispatchHandler FrameworkDispatcher = null;
-
-    public static void SetCustomDispatcher(RouteDispatchHandler dispatcher) {
-        CustomDispatcher = dispatcher;
-    }
-
-    public static RouteDispatchHandler GetCustomDispatcher() {
-        return CustomDispatcher;
-    }
-
-    static async void Dispatch(HttpContext ctx) {
-        string act = ctx.RouteAction();
-        if (CustomDispatcher != null) {
-            if (await CustomDispatcher(ctx, act)) {
-                return;
+            int afterStage = trace != null ? trace.Begin("controller_after") : -1;
+            try {
+                if (!syncLifecycle || !controller.TryAfterSync()) {
+                    await controller.OnAfterAsync();
+                }
+            } catch (Exception cleanupFailure) {
+                if (trace != null) { trace.Fail(afterStage, "exception"); }
+                if (!failed && !committed) { throw; }
+                try { Console.WriteLine("[MVC ERROR] controller cleanup failed: " + cleanupFailure.Message); }
+                catch (Exception logFailure) { }
+            } finally {
+                if (trace != null) { trace.End(afterStage); }
             }
         }
-        if (FrameworkDispatcher != null) {
-            if (await FrameworkDispatcher(ctx, act)) { return; }
-        }
-        ctx.Status(404, "Not Found");
-        ctx.Text("Action not found: " + act);
     }
 
-    static string ExtractAttr(string attrs, string prefix) {
-        int idx = attrs.IndexOf(prefix);
-        if (idx < 0) { return ""; }
-        int start = idx + prefix.Length;
-        int end = attrs.IndexOf(";", start);
-        if (end < 0) { end = attrs.Length; }
-        return attrs.Substring(start, end - start);
-    }
-
-    /* 只取完整元数据字段，避免 Custom 描述文本或值的子串被当成授权声明。
-       空串表示未声明，Unknown/未知值仍是显式声明，后续统一 fail-closed。 */
-    static string AuthorizationOf(string attrs) {
-        List<string> fields = attrs.Split(";");
-        for (int i = 0; i < fields.Count; i = i + 1) {
-            string field = fields[i];
-            int equals = field.IndexOf("=");
-            if (equals < 0) { continue; }
-            string key = field.Substring(0, equals);
-            if (key != "Custom.Authorization" && key != "Authorization") { continue; }
-            string value = field.Substring(equals + 1);
-            if (value.StartsWith("CustomAuthorization.")) {
-                value = value.Substring(20);
+    public static async void RunAction(Controller controller, HttpContext ctx, string view,
+                                       bool readOnly, bool transaction, ControllerAction action,
+                                       bool syncLifecycle = true) {
+        controller.Bind(ctx);
+        controller.SetView(view);
+        if (readOnly) { controller.UseReadOnly(); }
+        RequestTrace trace = ctx != null ? ctx.Trace : null;
+        bool begun = false;
+        bool committed = false;
+        bool failed = false;
+        try {
+            bool proceed = false;
+            int beforeStage = trace != null ? trace.Begin("controller_before") : -1;
+            try {
+                if (!syncLifecycle || !controller.TryBeforeSync(out proceed)) {
+                    proceed = await controller.OnBeforeAsync();
+                }
+                if (!proceed && trace != null) { trace.Fail(beforeStage, "short_circuit"); }
+            } catch (Exception beforeFailure) {
+                if (trace != null) { trace.Fail(beforeStage, "exception"); }
+                throw;
+            } finally {
+                if (trace != null) { trace.End(beforeStage); }
             }
-            return value.Length > 0 ? value : "Unknown";
+            if (proceed) {
+                if (transaction) {
+                    bool ready = await controller.TxBegin();
+                    if (!ready) { throw new ApiError(503, "0503", "服务不可用"); }
+                    begun = true;
+                }
+                int actionStage = trace != null ? trace.Begin("mvc_action") : -1;
+                try {
+                    await action(controller, ctx);
+                    if (trace != null && begun && !ctx.Ended()) { trace.Fail(actionStage, "no_response"); }
+                } catch (Exception actionFailure) {
+                    if (trace != null) { trace.Fail(actionStage, "exception"); }
+                    throw;
+                } finally {
+                    if (trace != null) { trace.End(actionStage); }
+                }
+                if (begun) {
+                    if (!ctx.Ended()) {
+                        throw new ApiError(500, "500", "handler produced no response");
+                    }
+                    await controller.TxCommit();
+                    begun = false;
+                    committed = true;
+                }
+            }
+        } catch (Exception failure) {
+            failed = true;
+            if (begun) {
+                try { await controller.TxRollback(); }
+                catch (Exception rollbackFailure) { }
+            }
+            throw;
+        } finally {
+            int afterStage = trace != null ? trace.Begin("controller_after") : -1;
+            try {
+                if (!syncLifecycle || !controller.TryAfterSync()) {
+                    await controller.OnAfterAsync();
+                }
+            } catch (Exception cleanupFailure) {
+                if (trace != null) { trace.Fail(afterStage, "exception"); }
+                if (!failed && !committed) { throw; }
+                try { Console.WriteLine("[MVC ERROR] controller cleanup failed: " + cleanupFailure.Message); }
+                catch (Exception logFailure) { }
+            } finally {
+                if (trace != null) { trace.End(afterStage); }
+            }
         }
-        return "";
     }
 
-    static string DeriveControllerPath(string fullName, string attrs) {
-        string explicitRoute = __AttrRoutes.ExtractAttr(attrs, "Route=");
-        if (explicitRoute.Length > 0 && explicitRoute.StartsWith("/")) {
-            return explicitRoute;
-        }
+    private static List<string> stripNamespaces = null;
 
-        int lastDot = fullName.LastIndexOf(".");
-        string className = lastDot >= 0 ? fullName.Substring(lastDot + 1) : fullName;
-        string ns = lastDot >= 0 ? fullName.Substring(0, lastDot) : "";
-        /* 同名类型的反射身份保留内部改名；URL 只消费一次源码命名空间。
-           不按最后一个下划线切分，否则命名空间被重复映射进路径。 */
-        string collisionPrefix = ns.Replace(".", "_") + "_";
-        if (ns.Length > 0 && className.StartsWith(collisionPrefix)) {
-            className = className.Substring(collisionPrefix.Length);
+    private static List<string> EnsureStripNamespaces() {
+        if (stripNamespaces == null) {
+            stripNamespaces = new List<string>();
+            stripNamespaces.Add("zan");
+            stripNamespaces.Add("web");
         }
+        return stripNamespaces;
+    }
 
-        string ctrl = className;
-        if (ctrl.EndsWith("Controller")) {
-            ctrl = ctrl.Substring(0, ctrl.Length - 10);
+    public static void StripNamespace(string segment) {
+        if (segment == null || segment.Length == 0) { return; }
+        List<string> list = EnsureStripNamespaces();
+        string seg = segment.ToLower();
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == seg) { return; }
         }
-        ctrl = ctrl.ToLower();
+        list.Add(seg);
+    }
 
-        if (explicitRoute.Length > 0) {
-            string sub = explicitRoute.Replace("[controller]", ctrl);
-            if (!sub.StartsWith("/")) { sub = "/" + sub; }
-            if (sub.EndsWith("/[action]")) { sub = sub.Substring(0, sub.Length - 9); }
-            return sub;
-        }
+    public static void ClearStripNamespaces() {
+        stripNamespaces = new List<string>();
+    }
 
-        /* 命名空间与目录逐级下推映射 */
+    public static string ConventionPath(string ns, string ctrl) {
+        List<string> stripped = __AttrRoutes.EnsureStripNamespaces();
         string path = "";
-        if (ns.Length > 0) {
+        if (ns != null && ns.Length > 0) {
             int start = 0;
             for (int i = 0; i <= ns.Length; i = i + 1) {
                 if (i == ns.Length || ns[i] == '.' || ns[i] == '_') {
                     if (i > start) {
                         string seg = ns.Substring(start, i - start).ToLower();
-                        if (seg != "zan" && seg != "web") {
+                        bool skip = false;
+                        for (int j = 0; j < stripped.Count; j = j + 1) {
+                            if (seg == stripped[j]) { skip = true; break; }
+                        }
+                        if (!skip) {
                             path = path + "/" + seg;
                         }
                     }
@@ -153,278 +286,34 @@ public class __AttrRoutes {
                 }
             }
         }
-        if (ctrl.Length > 0) {
+        if (ctrl != null && ctrl.Length > 0) {
             path = path + "/" + ctrl;
         }
         if (path.Length == 0) { path = "/"; }
         return path;
     }
 
-    static StrMap ReadMethodAttributes(string data, out bool isAction) {
-        StrMap values = new StrMap();
-        isAction = false;
-        if (data == "") { return values; }
-        AttributeReader reader = new AttributeReader(data);
-        while (reader.MoveNext()) {
-            string name = reader.Name;
-            if (name.Length > 9 && name.EndsWith("Attribute")) {
-                name = name.Substring(0, name.Length - 9);
-            }
-            if (name == "Route" || name == "Description" || name == "Custom" || name == "Action"
-                || name == "HttpGet" || name == "HttpPost" || name == "HttpPut" || name == "HttpPatch"
-                || name == "HttpDelete" || name == "HttpHead" || name == "HttpOptions") {
-                isAction = true;
-            }
-            bool hasArgument = reader.MoveNextArgument();
-            if (!hasArgument) {
-                if (name == "Authorization" && !values.Has("Authorization")) {
-                    values.Set("Authorization", "Unknown");
-                } else if (!values.Has(name)) {
-                    values.Set(name, "true");
-                }
-                continue;
-            }
-            while (hasArgument) {
-                string key = reader.ArgumentName == "" ? name : name + "." + reader.ArgumentName;
-                string value = reader.ArgumentValue;
-                if (key == "Authorization" || key == "Custom.Authorization") {
-                    if (!values.Has("Authorization")) {
-                        if (value.StartsWith("System.Web.CustomAuthorization.")) {
-                            value = value.Substring("System.Web.CustomAuthorization.".Length);
-                        } else if (value.StartsWith("CustomAuthorization.")) {
-                            value = value.Substring("CustomAuthorization.".Length);
-                        }
-                        values.Set("Authorization", value.Length > 0 ? value : "Unknown");
-                    }
-                } else if (!values.Has(key)) {
-                    values.Set(key, value);
-                }
-                hasArgument = reader.MoveNextArgument();
-            }
-        }
-        return values;
+    public static string ActionKey(TypeInfo controller, string action = "Index") {
+        string full = controller.FullName;
+        if (full.Length == 0) { return ""; }
+        string act = (action == null || action.Length == 0) ? "Index" : action;
+        return full + "." + act;
     }
 
-    static string ExtractVerb(StrMap attrs) {
-        if (attrs.Get("HttpPost") == "true") { return "POST"; }
-        if (attrs.Get("HttpPut") == "true") { return "PUT"; }
-        if (attrs.Get("HttpPatch") == "true") { return "PATCH"; }
-        if (attrs.Get("HttpHead") == "true") { return "HEAD"; }
-        if (attrs.Get("HttpOptions") == "true") { return "OPTIONS"; }
-        if (attrs.Get("HttpDelete") == "true") { return "DELETE"; }
-        return "GET";
-    }
-
-    static string MethodSetting(StrMap attrs, string name) {
-        string value = attrs.Get("Custom." + name);
-        return value.Length > 0 ? value : attrs.Get(name);
-    }
-
-    static void RegisterController(WebApp app, TypeInfo ti, RouteParameterWriter parameters,
-                                   RouteActionFilter actions) {
-        /* 路径和动作键均取 FullName。不同命名空间可以声明同名控制器，
-           短名无法区分它们；动作键须与派发器的完整身份一致。 */
-        string fullName = ti.FullName;
-        string classAttrs = ti.GetCustomAttributes();
-        string basePath = __AttrRoutes.DeriveControllerPath(fullName, classAttrs);
-
-        string classAuthorization = __AttrRoutes.AuthorizationOf(classAttrs);
-        bool classIsMenu = classAttrs.Contains("Custom.IsMenu=true") || classAttrs.Contains("IsMenu=true");
-        string classDesc = __AttrRoutes.ExtractAttr(classAttrs, "Description=");
-        string classIcon = __AttrRoutes.ExtractAttr(classAttrs, "Custom.Icon=");
-        if (classIcon.Length == 0) { classIcon = __AttrRoutes.ExtractAttr(classAttrs, "Icon="); }
-        string classGroup = __AttrRoutes.ExtractAttr(classAttrs, "Custom.Group=");
-        if (classGroup.Length == 0) { classGroup = __AttrRoutes.ExtractAttr(classAttrs, "Group="); }
-        string classGroupOrder = __AttrRoutes.ExtractAttr(classAttrs, "Custom.GroupOrder=");
-        if (classGroupOrder.Length == 0) { classGroupOrder = __AttrRoutes.ExtractAttr(classAttrs, "GroupOrder="); }
-        string classOrder = __AttrRoutes.ExtractAttr(classAttrs, "Custom.Order=");
-        if (classOrder.Length == 0) { classOrder = __AttrRoutes.ExtractAttr(classAttrs, "Order="); }
-
-        for (int m = 0; m < ti.MethodCount; m = m + 1) {
-            string mname = ti.GetMethodName(m);
-            if (mname.StartsWith("__")) {
-                continue;
+    public static string PathOf(WebApp app, TypeInfo controller, string action = "Index", string fallback = "") {
+        string key = __AttrRoutes.ActionKey(controller, action);
+        if (app != null && key.Length > 0) {
+            List<Route> all = app.Router().All();
+            string matched = "";
+            for (int i = 0; i < all.Count; i = i + 1) {
+                Route r = all[i];
+                if (r.Action() != key) { continue; }
+                string pat = r.Pattern();
+                if (!pat.EndsWith("/index")) { return pat; }
+                if (matched.Length == 0) { matched = pat; }
             }
-            bool hasWebAttr;
-            string data = ti.GetMethodAttributeData(m);
-            if (data == "" && mname != "Index") { continue; }
-            StrMap mattrs = __AttrRoutes.ReadMethodAttributes(data, out hasWebAttr);
-            bool isIndex = mname == "Index";
-            if (!hasWebAttr && !isIndex) { continue; }
-
-            string methodRoute = mattrs.Get("Route");
-            string actionPath = "";
-            if (methodRoute.Length > 0) {
-                if (methodRoute.StartsWith("/")) {
-                    actionPath = methodRoute;
-                } else {
-                    actionPath = basePath == "/" ? "/" + methodRoute : basePath + "/" + methodRoute;
-                }
-            } else if (isIndex) {
-                actionPath = basePath;
-            } else {
-                actionPath = basePath == "/" ? "/" + mname.ToLower() : basePath + "/" + mname.ToLower();
-            }
-
-            string verb = __AttrRoutes.ExtractVerb(mattrs);
-            /* 应用和框架使用同一完整身份协议，避免同名控制器派发到其他动作。 */
-            string actionKey = fullName + "." + mname;
-            if (actions != null && !actions(actionKey)) { continue; }
-
-            Route r = app.Map(verb, actionPath, __AttrRoutes.Dispatch);
-            r.Named(actionKey);
-
-            /* 标题声明 */
-            string methodDesc = mattrs.Get("Description");
-            if (methodDesc.Length > 0) {
-                r.Title(methodDesc);
-            } else if (classDesc.Length > 0) {
-                r.Title(classDesc);
-            }
-
-            /* 方法显式声明完整覆盖类默认值；其他 Custom 字段不影响继承。
-               None/Auth 不强制登录，Grant/ApiAuth 要权限；未声明或未知值
-               按 Login fail-closed。Index 别名复用同一组最终标志。 */
-            string authorization = mattrs.Get("Authorization");
-            if (authorization.Length == 0) { authorization = classAuthorization; }
-            bool isNone = authorization == "None" || authorization == "Auth";
-            bool needsAuth = authorization == "Grant" || authorization == "ApiAuth";
-            bool needsLogin = !isNone && !needsAuth;
-
-            if (needsAuth) {
-                r.Auth();
-            } else if (needsLogin) {
-                r.Login();
-            }
-
-            /* 导航菜单声明 */
-            bool isMenu = false;
-            if (mattrs.Get("Custom.IsMenu") == "true" || mattrs.Get("IsMenu") == "true") {
-                isMenu = true;
-            } else if (isIndex && classIsMenu) {
-                isMenu = true;
-            }
-            if (mattrs.Get("Custom.IsMenu") == "false" || mattrs.Get("IsMenu") == "false") {
-                isMenu = false;
-            }
-            if (isMenu) { r.Menu(); }
-
-            /* 流式文件上传声明 */
-            if (mattrs.Get("Upload") == "true" || mattrs.Get("Custom.Upload") == "true"
-                || classAttrs.Contains("Upload=true") || classAttrs.Contains("Upload = true")) {
-                r.Upload();
-            }
-
-            string methodIcon = __AttrRoutes.MethodSetting(mattrs, "Icon");
-            string icon = methodIcon.Length > 0 ? methodIcon : (isIndex ? classIcon : "");
-            if (icon.Length > 0) { r.Meta("Icon", icon); }
-
-            string methodGroup = __AttrRoutes.MethodSetting(mattrs, "Group");
-            string group = methodGroup.Length > 0 ? methodGroup : classGroup;
-            if (group.Length > 0) { r.Meta("Group", group); }
-
-            string methodGroupOrder = __AttrRoutes.MethodSetting(mattrs, "GroupOrder");
-            string groupOrder = methodGroupOrder.Length > 0 ? methodGroupOrder : classGroupOrder;
-            if (groupOrder.Length > 0) { r.Meta("GroupOrder", groupOrder); }
-
-            string methodOrder = __AttrRoutes.MethodSetting(mattrs, "Order");
-            string order = methodOrder.Length > 0 ? methodOrder : classOrder;
-            if (order.Length > 0) { r.Meta("Order", order); }
-
-            /* 权限位掩码直录 */
-            string perm = mattrs.Get("Custom.Perm");
-            if (perm.Length > 0) {
-                r.Meta("Perm", perm.Replace("System.Web.PermBit.", "").Replace("PermBit.", ""));
-            }
-
-            /* 路由路径中的 {param} 占位符直录为 path 参数 */
-            int braceStart = 0;
-            while (braceStart < actionPath.Length) {
-                int o = actionPath.IndexOf("{", braceStart);
-                if (o < 0) { break; }
-                int c = actionPath.IndexOf("}", o);
-                if (c < 0) { break; }
-                string pname = actionPath.Substring(o + 1, c - o - 1);
-                int colon = pname.IndexOf(":");
-                string ptype = "string";
-                if (colon >= 0) {
-                    ptype = pname.Substring(colon + 1);
-                    pname = pname.Substring(0, colon);
-                }
-                r.Param(pname, ptype, true, "", "", "path");
-                braceStart = c + 1;
-            }
-
-            if (parameters != null) { parameters(r, actionKey); }
-
-            /* Index 别名支持：仅对按约定生成的 Index 生成 /index 别名，显式 [Route] 绝不擅自篡改路径 */
-            if (isIndex && methodRoute.Length == 0 && !actionPath.EndsWith("/index") && actionPath != "/") {
-                Route rAlias = app.Map(verb, actionPath + "/index", __AttrRoutes.Dispatch);
-                rAlias.Named(actionKey);
-                if (needsAuth) { rAlias.Auth(); }
-                else if (needsLogin) { rAlias.Login(); }
-            }
+            if (matched.Length > 0) { return matched; }
         }
-    }
-
-    public static void RegisterFramework(WebApp app, RouteDispatchHandler dispatcher,
-                                         RouteParameterWriter parameters = null,
-                                         RouteActionFilter actions = null) {
-        if (app == null) { return; }
-        /* 框架动作派发器与应用派发器独立保存。 */
-        if (dispatcher != null) { FrameworkDispatcher = dispatcher; }
-        TypeInfo[] f = new TypeInfo[] {
-            typeof(Zan.Web.Admin.LoginController),
-            typeof(Zan.Web.Admin.DashboardController),
-            typeof(Zan.Web.Admin.ProfileController),
-            typeof(Zan.Web.Admin.Media.MediaController),
-            typeof(Zan.Web.Admin.Wiki.WikiController),
-            typeof(Zan.Web.Admin.Content.PostsController),
-            typeof(Zan.Web.Admin.Content.CategoriesController),
-            typeof(Zan.Web.Admin.Content.CommentsController),
-            typeof(Zan.Web.Admin.Dev.CoderController),
-            typeof(Zan.Web.Admin.Dev.AssistantController),
-            typeof(Zan.Web.Admin.Dev.TxProbeController),
-            typeof(Zan.Web.Admin.Monitor.MonitorController),
-            typeof(Zan.Web.Admin.Monitor.DataController),
-            typeof(Zan.Web.Admin.System.DocsController),
-            typeof(Zan.Web.Admin.System.DepartmentsController),
-            typeof(Zan.Web.Admin.System.DictsController),
-            typeof(Zan.Web.Admin.System.JobsController),
-            typeof(Zan.Web.Admin.System.LogsController),
-            typeof(Zan.Web.Admin.System.UsersController),
-            typeof(Zan.Web.Admin.System.SettingsController),
-            typeof(Zan.Web.Admin.System.RolesController),
-            typeof(Zan.Web.Account.LoginController),
-            typeof(Zan.Web.Account.RegisterController),
-            typeof(Zan.Web.Account.ForgotController),
-            typeof(Zan.Web.Health.HealthController)
-        };
-        for (int i = 0; i < f.Length; i = i + 1) {
-            __AttrRoutes.RegisterController(app, f[i], parameters, actions);
-        }
-    }
-
-    public static void Register(WebApp app, TypeInfo[] controllers,
-                                RouteDispatchHandler dispatcher,
-                                RouteParameterWriter parameters = null,
-                                RouteActionFilter actions = null) {
-        if (app == null) { return; }
-
-        /* 约定路由统一进入 Dispatch，由应用提供可等待的动作派发器。 */
-        if (dispatcher != null) {
-            CustomDispatcher = dispatcher;
-        }
-
-        /* 1. 动态装载应用业务控制器约定路由与属性路由 */
-        if (controllers != null) {
-            for (int i = 0; i < controllers.Length; i = i + 1) {
-                TypeInfo ti = controllers[i];
-                __AttrRoutes.RegisterController(app, ti, parameters, actions);
-            }
-        }
-
-        /* 2. 装载入共享内存路由表，启动 O(1) 极速匹配与非法路径 404 截断 */
-        app.Router().InitRouteTableShared();
+        return fallback;
     }
 }

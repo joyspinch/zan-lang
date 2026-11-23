@@ -21,14 +21,33 @@ public class OssClient {
         if (this.config.endpointHost.Length == 0) { this.config.Parse(); }
     }
 
+    private static bool EqualsAsciiIgnoreCase(string a, string lowerLit) {
+        if (a == null || a.Length != lowerLit.Length) { return false; }
+        for (int i = 0; i < lowerLit.Length; i = i + 1) {
+            int c = a[i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (lowerLit[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    private static bool IsAliyunDriver(string driver) {
+        return OssClient.EqualsAsciiIgnoreCase(driver, "aliyun_oss")
+            || OssClient.EqualsAsciiIgnoreCase(driver, "aliyun")
+            || OssClient.EqualsAsciiIgnoreCase(driver, "oss");
+    }
+
     /// <summary>按 driver 造客户端。driver 不认识返回 null。
     /// 认得：aliyun_oss / aliyun / oss、tencent_cos / cos、s3 / minio。</summary>
     public static OssClient Create(OssConfig cfg) {
         if (cfg == null) { return null; }
-        string d = cfg.driver == null ? "" : cfg.driver.ToLower();
-        if (d == "aliyun_oss" || d == "aliyun" || d == "oss") { return new AliyunOssClient(cfg); }
-        if (d == "tencent_cos" || d == "cos") { return new TencentCosClient(cfg); }
-        if (d == "s3" || d == "s3_compatible" || d == "minio") { return new S3Client(cfg); }
+        string d = cfg.driver;
+        if (OssClient.IsAliyunDriver(d)) { return new AliyunOssClient(cfg); }
+        if (OssClient.EqualsAsciiIgnoreCase(d, "tencent_cos")
+            || OssClient.EqualsAsciiIgnoreCase(d, "cos")) { return new TencentCosClient(cfg); }
+        if (OssClient.EqualsAsciiIgnoreCase(d, "s3")
+            || OssClient.EqualsAsciiIgnoreCase(d, "s3_compatible")
+            || OssClient.EqualsAsciiIgnoreCase(d, "minio")) { return new S3Client(cfg); }
         return null;
     }
 
@@ -77,28 +96,28 @@ public class OssClient {
         string portStr = "";
         if ((this.config.endpointTls && this.config.endpointPort != 443) ||
             (!this.config.endpointTls && this.config.endpointPort != 80)) {
-            portStr = ":" + this.config.endpointPort;
+            portStr = ":" + Convert.ToString(this.config.endpointPort);
         }
         string baseUrl = scheme + this.HostName() + portStr + this.RequestPath(objKey);
         long expiresTimestamp = DateTime.UtcNow().ToUnixSeconds() + (expiresSeconds <= 0 ? 900 : expiresSeconds);
+        string expStr = Convert.ToString(expiresTimestamp);
 
-        string d = this.config.driver == null ? "" : this.config.driver.ToLower();
-        if (d == "aliyun_oss" || d == "aliyun" || d == "oss") {
+        if (OssClient.IsAliyunDriver(this.config.driver)) {
             string resource = "/" + this.config.bucket + "/" + objKey;
-            string sts = method + "\n\n\n" + expiresTimestamp + "\n" + resource;
+            string sts = method + "\n\n\n" + expStr + "\n" + resource;
             string sig = AliyunOssSigner.Sign(this.config.secretKey, sts);
             return baseUrl + "?OSSAccessKeyId=" + OssSigner.Rfc3986(this.config.accessKey) +
-                   "&Expires=" + expiresTimestamp +
+                   "&Expires=" + expStr +
                    "&Signature=" + OssSigner.Rfc3986(sig);
         }
 
         // S3 / MinIO 兼容模式 (标准查询参数预签名)
         string s3Resource = "/" + this.config.bucket + "/" + objKey;
-        string s3Sts = method + "\n\n\n" + expiresTimestamp + "\n" + s3Resource;
+        string s3Sts = method + "\n\n\n" + expStr + "\n" + s3Resource;
         byte[] mac = OssSigner.HmacSha1(this.config.secretKey, s3Sts);
         string s3Sig = mac != null ? OssSigner.Base64(mac) : "";
         return baseUrl + "?AWSAccessKeyId=" + OssSigner.Rfc3986(this.config.accessKey) +
-               "&Expires=" + expiresTimestamp +
+               "&Expires=" + expStr +
                "&Signature=" + OssSigner.Rfc3986(s3Sig);
     }
 

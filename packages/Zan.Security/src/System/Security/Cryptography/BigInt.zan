@@ -274,23 +274,134 @@ public class BigInt {
         return add(a, b);
     }
 
-    // 教科书式长除法：返回 [商, 余数]
+    // 转换为 16 位无符号小端半字数组（大整数 Knuth D 除法用，确保中间乘加均 < 2^32 无符号溢出）。
+    private static int len16(BigInt x) {
+        int c = x.count();
+        int n = c * 2;
+        if (n > 1 && (x.limb(c - 1) >> 16) == 0) { n = n - 1; }
+        return n;
+    }
+
+    private static long[] to16(BigInt x, int n16) {
+        long[] arr = new long[n16];
+        int c = x.count();
+        for (int i = 0; i < c; i = i + 1) {
+            long w = x.limb(i);
+            arr[2 * i] = w & 65535;
+            if (2 * i + 1 < n16) { arr[2 * i + 1] = (w >> 16) & 65535; }
+        }
+        return arr;
+    }
+
+    private static BigInt from16(long[] d16, int n16) {
+        List<long> limbs = new List<long>();
+        for (int i = 0; i < n16; i = i + 2) {
+            long lo = d16[i] & 65535;
+            long hi = (i + 1 < n16) ? (d16[i + 1] & 65535) : 0;
+            limbs.Add(lo | (hi << 16));
+        }
+        if (limbs.Count == 0) { limbs.Add(0); }
+        return make(limbs);
+    }
+
+    // Knuth Algorithm D（基 2^16）：返回 [商, 余数]。
     private static List<BigInt> divmod(BigInt a, BigInt b) {
         List<BigInt> outp = new List<BigInt>();
+        if (b.isZero()) { outp.Add(zero()); outp.Add(zero()); return outp; }
         if (cmp(a, b) < 0) { outp.Add(zero()); outp.Add(a); return outp; }
-        BigInt q = zero(); BigInt rem = zero();
-        int bits = a.bitLength();
-        int i = bits - 1;
-        while (i >= 0) {
-            rem = add(rem, rem);                    // rem <<= 1
-            if (a.getBit(i) == 1) { rem = add(rem, one()); }
-            if (cmp(rem, b) >= 0) {
-                rem = sub(rem, b);
-                q = setBit(q, i);
+        int m = len16(a);
+        int n = len16(b);
+        long[] u = to16(a, m);
+        long[] v = to16(b, n);
+        if (n == 1) {
+            long d0 = v[0];
+            long[] qd = new long[m];
+            long rem = 0;
+            for (int i = m - 1; i >= 0; i = i - 1) {
+                long cur = (rem << 16) + u[i];
+                qd[i] = cur / d0;
+                rem = cur - qd[i] * d0;
             }
-            i = i - 1;
+            List<long> rl = new List<long>();
+            rl.Add(rem);
+            outp.Add(from16(qd, m));
+            outp.Add(make(rl));
+            return outp;
         }
-        outp.Add(q); outp.Add(rem);
+        int shift = 0;
+        long top = v[n - 1];
+        while (top < 32768) { top = top << 1; shift = shift + 1; }
+        long[] vn = new long[n];
+        long[] un = new long[m + 1];
+        if (shift == 0) {
+            for (int i = 0; i < n; i = i + 1) { vn[i] = v[i]; }
+            for (int i = 0; i < m; i = i + 1) { un[i] = u[i]; }
+        } else {
+            long carry = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                long w = (v[i] << shift) | carry;
+                vn[i] = w & 65535;
+                carry = w >> 16;
+            }
+            carry = 0;
+            for (int i = 0; i < m; i = i + 1) {
+                long w = (u[i] << shift) | carry;
+                un[i] = w & 65535;
+                carry = w >> 16;
+            }
+            un[m] = carry;
+        }
+        int qlen = m - n + 1;
+        long[] qd = new long[qlen];
+        for (int j = m - n; j >= 0; j = j - 1) {
+            long num = (un[j + n] << 16) + un[j + n - 1];
+            long qhat = num / vn[n - 1];
+            long rhat = num - qhat * vn[n - 1];
+            while (qhat >= 65536 || (rhat < 65536 && qhat * vn[n - 2] > ((rhat << 16) + un[j + n - 2]))) {
+                qhat = qhat - 1;
+                rhat = rhat + vn[n - 1];
+            }
+            long borrow = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                long p = qhat * vn[i] + borrow;
+                long pLo = p & 65535;
+                long pHi = p >> 16;
+                long diff = un[j + i] - pLo;
+                if (diff < 0) {
+                    un[j + i] = diff + 65536;
+                    borrow = pHi + 1;
+                } else {
+                    un[j + i] = diff;
+                    borrow = pHi;
+                }
+            }
+            if (un[j + n] < borrow) {
+                qd[j] = qhat - 1;
+                long carry = 0;
+                for (int i = 0; i < n; i = i + 1) {
+                    long s = un[j + i] + vn[i] + carry;
+                    un[j + i] = s & 65535;
+                    carry = s >> 16;
+                }
+                un[j + n] = (un[j + n] - borrow + carry) & 65535;
+            } else {
+                qd[j] = qhat;
+                un[j + n] = un[j + n] - borrow;
+            }
+        }
+        long[] rd = new long[n];
+        if (shift == 0) {
+            for (int i = 0; i < n; i = i + 1) { rd[i] = un[i]; }
+        } else {
+            long remCarry = 0;
+            int rshift = 16 - shift;
+            for (int i = n - 1; i >= 0; i = i - 1) {
+                rd[i] = ((un[i] >> shift) | remCarry) & 65535;
+                remCarry = (un[i] << rshift) & 65535;
+            }
+        }
+        outp.Add(from16(qd, qlen));
+        outp.Add(from16(rd, n));
         return outp;
     }
 
@@ -298,16 +409,5 @@ public class BigInt {
     public static BigInt mod(BigInt a, BigInt m) {
         List<BigInt> qr = divmod(a, m);
         return qr[1];
-    }
-
-    // 返回第 idx 位置 1 的副本。
-    private static BigInt setBit(BigInt x, int idx) {
-        int limbIdx = idx / 32; int within = idx % 32;
-        List<long> l = new List<long>();
-         int need = limbIdx + 1;
-        for (int i = 0; i < x.count() || i < need; i = i + 1) { l.Add(x.limb(i)); }
-        long one = 1;
-        l[limbIdx] = (l[limbIdx] | (one << within)) & 4294967295;
-        return make(l);
     }
 }

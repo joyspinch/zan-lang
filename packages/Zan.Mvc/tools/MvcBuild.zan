@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Json;
+using System.Text;
 
 class MvcBuild {
     static int RunCompiler(string compiler, List<string> args) {
@@ -11,26 +12,99 @@ class MvcBuild {
         return status;
     }
 
-    static int Build(string compiler, bool framework, List<string> args) {
+    static void ExpandArgument(string arg, List<string> expanded, int depth) {
+        if (arg.Length <= 1 || arg[0] != 64) { expanded.Add(arg); return; }
+        string path = arg.Substring(1);
+        if (depth >= 8) { throw new Exception("Argument file nested too deeply: " + path); }
+
+        // Match zanc's @file syntax. ReadAllText strips the UTF-8 BOM.
+        string text = File.ReadAllText(path);
+        int i = 0;
+        while (i < text.Length) {
+            while (i < text.Length && (text[i] & 255) <= 32) { i++; }
+            if (i == text.Length) { break; }
+            if (text[i] == 35) {
+                while (i < text.Length && text[i] != 10) { i++; }
+                continue;
+            }
+            StringBuilder token = new StringBuilder();
+            bool quoted = false;
+            int start = i;
+            while (i < text.Length) {
+                int c = text[i] & 255;
+                if (c == 34) {
+                    token.Append(text.Substring(start, i - start));
+                    quoted = !quoted;
+                    start = i + 1;
+                } else if (!quoted && c <= 32) {
+                    break;
+                }
+                i++;
+            }
+            token.Append(text.Substring(start, i - start));
+            string value = token.ToString();
+            if (value.Length > 0) { ExpandArgument(value, expanded, depth + 1); }
+        }
+    }
+
+    static bool TakesValue(string arg) {
+        // Skip operands in main_options_parse.c so an operand named -o stays an operand.
+        switch (arg) {
+            case "-o":
+            case "--emit-apk": case "--emit-hap": case "--emit-ipa":
+            case "--emit-symbols": case "--gen-meta": case "--warn-level": case "--suppress":
+            case "--emit-site-map": case "--link-mode": case "--driver-dir": case "--target":
+            case "--cpu-profile": case "--api": case "--stdlib-path": case "--package-api":
+            case "--package-install": case "--package-name": case "--package-project": case "--package-scope":
+            case "--codegen-level": case "--subsystem": case "--apk-package": case "--apk-label":
+            case "--ipa-bundle-id": case "--ipa-name": case "--icon": case "--embed":
+            case "--link-input": case "--link-lib": case "--libpath":
+                return true;
+        }
+        return false;
+    }
+
+    static string OutputPath(List<string> args) {
+        List<string> expanded = new List<string>();
+        for (int i = 0; i < args.Count; i++) { ExpandArgument(args[i], expanded, 0); }
         string output = "";
         string bundle = "";
-        List<string> metadataArgs = new List<string>();
-        for (int i = 0; i < args.Count; i++) {
-            string arg = args[i];
-            if (i + 1 < args.Count) {
-                if (arg == "-o") { output = args[i + 1]; }
-                if (arg == "--emit-apk" || arg == "--emit-hap" || arg == "--emit-ipa") { bundle = args[i + 1]; }
-            }
-            metadataArgs.Add(arg);
+        for (int i = 0; i < expanded.Count; i++) {
+            string arg = expanded[i];
+            if (!TakesValue(arg)) { continue; }
+            if (i + 1 >= expanded.Count) { throw new Exception("Missing compiler argument for " + arg); }
+            string value = expanded[++i];
+            if (arg == "-o") { output = value; }
+            if (arg == "--emit-apk" || arg == "--emit-hap" || arg == "--emit-ipa") { bundle = value; }
         }
         if (output == "") { output = bundle; }
         if (output == "") { throw new Exception("Specify a compiler output path"); }
+        return output;
+    }
+
+    static int GenerateFromFile(string mode, string metaPath, string outPath) {
+        JsonValue unit = JsonValue.Parse(File.ReadAllText(metaPath));
+        string generated = MvcRoutesGenerator.Generate(unit, mode);
+        string dir = Path.GetDirectoryName(outPath);
+        if (dir != null && dir.Length > 0) {
+            Directory.CreateDirectoryRecursive(dir);
+        }
+        File.WriteAllText(outPath, generated);
+        return 0;
+    }
+
+    static int Build(string compiler, string mode, List<string> args) {
+        string output = OutputPath(args);
+        // Forward the original @arguments to both invocations to preserve command-line size.
+        List<string> metadataArgs = new List<string>();
+        for (int i = 0; i < args.Count; i++) { metadataArgs.Add(args[i]); }
         string work = Path.Combine(Path.GetDirectoryName(output), ".mvc-" + Convert.ToString(Environment.ProcessId));
         // Keep the final two path components stable for runtime source locations.
         string generated = Path.Combine(work, "generated");
         Directory.CreateDirectoryRecursive(generated);
         string metadata = Path.Combine(work, "declarations.json");
         string source = Path.Combine(generated, "MvcRoutes.zan");
+        metadataArgs.Add("--no-pkg-gen");
         metadataArgs.Add("--no-pullin-filter");
         metadataArgs.Add("--gen-meta-bodies");
         metadataArgs.Add("--gen-meta");
@@ -39,8 +113,12 @@ class MvcBuild {
             int result = RunCompiler(compiler, metadataArgs);
             if (result != 0) { return result; }
             JsonValue unit = JsonValue.Parse(File.ReadAllText(metadata));
-            File.WriteAllText(source, MvcRoutesGenerator.Generate(unit, framework));
-            args.Add(source);
+            string content = MvcRoutesGenerator.Generate(unit, mode);
+            args.Add("--no-pkg-gen");
+            if (content.Length > 0) {
+                File.WriteAllText(source, content);
+                args.Add(source);
+            }
             return RunCompiler(compiler, args);
         } finally {
             File.Delete(metadata);
@@ -51,8 +129,22 @@ class MvcBuild {
     }
 
     static int Main() {
+        if (Environment.ArgCount() >= 4 && Environment.ArgAt(0) == "--generate") {
+            string mode = Environment.ArgAt(1);
+            if (mode != "app" && mode != "framework" && mode != "auto") {
+                Console.WriteLine("Unknown MVC generate mode: " + mode);
+                return 2;
+            }
+            try {
+                return GenerateFromFile(mode, Environment.ArgAt(2), Environment.ArgAt(3));
+            } catch (Exception failure) {
+                Console.WriteLine("MVC route generation failed: " + failure.Message);
+                return 1;
+            }
+        }
         if (Environment.ArgCount() < 3) {
             Console.WriteLine("usage: zan-mvc <zanc> <app|framework> <zanc arguments including an output path>");
+            Console.WriteLine("   or: zan-mvc --generate <auto|app|framework> <meta.json> <out.zan>");
             return 2;
         }
         string mode = Environment.ArgAt(1);
@@ -63,7 +155,7 @@ class MvcBuild {
         List<string> args = new List<string>();
         for (int i = 2; i < Environment.ArgCount(); i++) { args.Add(Environment.ArgAt(i)); }
         try {
-            return Build(Environment.ArgAt(0), mode == "framework", args);
+            return Build(Environment.ArgAt(0), mode, args);
         } catch (Exception failure) {
             Console.WriteLine("MVC build failed: " + failure.Message);
             return 1;

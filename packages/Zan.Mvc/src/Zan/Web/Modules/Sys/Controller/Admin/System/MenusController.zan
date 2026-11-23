@@ -1,0 +1,97 @@
+using System;
+using System.Data;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web.Services;
+using Zan.Web;
+
+namespace Zan.Web.Admin.System;
+
+/* /admin/system/menus 动态菜单管理：由 sys_menu 持久化供给后台导航。
+   启动期由 MenuService.SyncRoutes 幂等同步静态路由并保留管理员手工调整；
+   本屏提供菜单增改/行内排序与显隐/一键同步路由，并在任何变更后失效菜单缓存。 */
+[Custom(Authorization = CustomAuthorization.Grant, Group = "系统管理", GroupOrder = 90, IsMenu = true, Icon = "mdi:menu")]
+[Description("菜单管理")]
+public class MenusController : CrudScreenController {
+    protected override CrudConf Def() {
+        return CrudConf.Of("sys_menu", "菜单管理", "admin/system/menus")
+            .Order("groupOrder", false)
+            .Label("title")
+            .Wide()
+            .FormWidth("680px")
+
+            .Col("id", "ID").Int().W("64px").Ro()
+            .Col("title", "标题").W("140px").Req().Max(64)
+                .Search("搜索标题或路径").Inline()
+            .Col("groupName", "分组").W("110px").Def("系统管理").Max(64)
+                .Search("按分组筛选")
+            .Col("groupOrder", "组序").Int().W("72px").Def("50").Inline()
+            .Col("sortOrder", "排序").Int().W("72px").Def("100").Inline()
+            .Col("path", "路径").W("220px").Req().Max(255).Ph("/admin/... 或 https://...")
+            .Col("icon", "图标").W("130px").Max(64).Ph("mdi:menu")
+            .Col("isExternal", "类型").Opts("0=站内路由|muted,1=外部链接|ok").W("96px").Def("0")
+            .Col("permAction", "权限动作").W("220px").Max(128).Ph("留空则仅登录可见")
+                .ShowWhen("isExternal", "0")
+            .Col("hidden", "可见").Opts("0=显示|ok,1=隐藏|off").W("84px").Def("0").Inline()
+            .Col("status", "状态").Opts("1=启用|ok,0=停用|off").W("84px").Def("1").Inline()
+            .Col("customized", "来源").Opts("0=自动同步|muted,1=已定制|warn").W("96px").Ro()
+            .Col("updatedAt", "更新时间").Time().W("140px").Ro()
+
+            .TbarAdd("新增菜单")
+            .TbarReload()
+            .TbarEnable()
+            .TbarDisable()
+            .TbarPost("同步路由", "sync", "确认从当前路由表重新同步默认菜单吗？（已定制项将保留）")
+            .OpsEdit()
+            .OpsDel("删除后不可恢复，确认删除该菜单项吗？")
+            .Created("createdAt").Updated("updatedAt");
+    }
+
+    protected override string OnSaving(DbValues row, bool isNew) {
+        string path = this.InAny("path").Trim();
+        if (path.Length == 0) { return "路径不能为空"; }
+        row.Set("path", path);
+        row.Set("customized", 1);
+        long isExt = Filter.ToLong(this.InAny("isExternal"), 0);
+        if (isExt != 1) { isExt = 0; }
+        row.Set("isExternal", isExt);
+        if (isExt == 1) {
+            row.Set("permAction", "");
+        }
+        if (isNew) {
+            row.Set("parentId", 0);
+            row.Set("actionKey", "custom:" + Convert.ToString(WebApp.NowSeconds()) + ":" + path);
+        }
+        return "";
+    }
+
+    protected override async Task OnSaved(bool isNew) {
+        await MenuService.Invalidate(this.Cache());
+    }
+
+    protected override async Task OnFielded(string field, long id) {
+        await MenuService.Invalidate(this.Cache());
+    }
+
+    protected override async Task OnBatched(string field, string value, List<int> ids) {
+        await MenuService.Invalidate(this.Cache());
+    }
+
+    protected override async Task OnDeleted(long id) {
+        await MenuService.Invalidate(this.Cache());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("同步路由菜单")]
+    public async void Sync() {
+        WebApp app = WebHost.Current();
+        if (app == null) { this.Fail(503, "2001", "应用上下文未就绪"); return; }
+        bool ok = await MenuService.SyncRoutes(app, this.Held(), this.Cache());
+        await this.Note("同步路由菜单", "sys_menu", ok, "");
+        if (!ok) { this.Fail(503, "2001", "同步菜单失败"); return; }
+        this.Saved("已从路由表同步菜单");
+    }
+}

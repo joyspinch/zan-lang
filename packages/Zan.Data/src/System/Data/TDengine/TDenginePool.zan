@@ -4,16 +4,7 @@ using System.Threading;
 
 namespace System.Data.TDengine;
 
-// 为 <see cref="TDengineConnection"/> 设计的协程感知连接池。
-// 契约与 <see cref="DbPool"/> 相同——惰性增长到 <c>maxSize</c>，
-// 等待由 <see cref="Gate"/> 驱动而非轮询，逐出失效连接——
-// 但它是类型化的，协程查询 API（<c>QueryAsync</c>、
-// <c>ExecuteAsync</c>）仍可用。打开连接和每条语句都运行在
-// IO reactor 上，因此限制并发的是池的大小，
-// 而不是 worker 线程数。
-// 用法：
-// pool.Release(db);
-// pool.Close();
+// 面向 TDengineConnection 的协程化连接池（惰性增长至 maxSize，事件驱动等待，非阻塞建连与查询）。
 public class TDenginePool : IDisposable {
     string host;
     int port;
@@ -50,10 +41,7 @@ public class TDenginePool : IDisposable {
                                                   this.password, this.database);
     }
 
-    // 借出一个连接：复用空闲连接，未达上限则新建，
-    // 否则挂起协程，直到有连接被归还。饱和等待有硬上限
-    // （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
-    // 池已关闭后返回 null。
+    // 借出连接：复用空闲连接或扩容新建，达上限时挂起等待直到归还或超时返回 null；池关闭返回 null。
     public async TDengineConnection AcquireAsync() {
         PoolOpenAsync<TDengineConnection> open = this.OpenOne;
         Predicate<TDengineConnection> connected = TDenginePool.IsUsable;
@@ -71,15 +59,18 @@ public class TDenginePool : IDisposable {
             + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
-    // 将连接归还给池。已损坏或 Close() 之后的
-    // 连接会被直接关闭丢弃，不再入池。
+    private void Discard(TDengineConnection c) {
+        c.Close();
+        this.core.Drop(c);
+    }
+
+    // 将连接归还连接池；损坏或池已关闭的连接直接关闭丢弃。
     public void Release(TDengineConnection c) {
         if (c == null) {
             return;
         }
         if (this.core.IsClosed() || !c.IsConnected()) {
-            c.Close();
-            this.core.Drop(c);
+            this.Discard(c);
             return;
         }
         if (!this.core.Pool(c)) { c.Close(); }
@@ -105,14 +96,12 @@ public class TDenginePool : IDisposable {
         return this.core.MaxSize();
     }
 
-    // 关闭所有空闲连接并将池标记为已关闭。
-    // 仍借出的连接会在归还时被关闭。
+    // 关闭所有空闲连接并将池标记为已关闭（借出连接在归还时关闭）。
     public void Close() {
         this.core.MarkClosed();
         TDengineConnection c = this.core.TakeClosing();
         while (c != null) {
-            c.Close();
-            this.core.Drop(c);
+            this.Discard(c);
             c = this.core.TakeClosing();
         }
         this.core.WakeAll();

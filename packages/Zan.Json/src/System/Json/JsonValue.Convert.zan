@@ -498,6 +498,21 @@ public partial class JsonValue {
         return doc.src.Substring(keyStart, keyLen);
     }
 
+    private static bool IsFloatingSlot(JsonDoc doc, int at) {
+        long header = doc.slots[at].a;
+        if ((header & 255L) != 7L) { return false; }
+        int length = (int)doc.slots[at].b;
+        // Only integers with at least 19 digits use kind 7.
+        if (length < 19) { return true; }
+        int start = (int)(header >> 8);
+        int end = start + length;
+        for (int i = start; i < end; i++) {
+            int c = doc.buf[i] & 255;
+            if (c == 46 || c == 101 || c == 69) { return true; }
+        }
+        return false;
+    }
+
     // 将 JsonDoc Tape 节点快速物化为可变的 JsonValue DOM 子树。
     public static JsonValue FromDoc(JsonDoc doc) {
         if (doc == null) { return JsonValue.NewNull(); }
@@ -507,35 +522,30 @@ public partial class JsonValue {
     // 从 JsonDoc 指定槽位快速物化为 JsonValue DOM 节点（预知容量、零重复语法校验）。
     public static JsonValue FromDoc(JsonDoc doc, int at) {
         if (doc == null || at < 0 || at >= doc.slotCount) { return JsonValue.NewNull(); }
-        int k = doc.KindAt(at);
+        int k = (int)(doc.slots[at].a & 255L);
         if (k == 0) { return JsonValue.NewNull(); }
-        if (k == 1) { return JsonValue.NewBool(doc.BoolAt(at, false)); }
-        if (k == 2) {
-            long a = doc.slots[at].a;
-            int rawK = (int)(a & 255);
-            if (rawK == 7) {
-                JsonValue v = JsonValue.NewDouble(doc.DoubleAt(at, 0.0));
-                v.numRaw = doc.StrAt(at, "");
-                return v;
-            }
-            long numVal = doc.LongAt(at, 0L);
-            return JsonValue.NewInt(numVal);
+        if (k == 1 || k == 6) { return JsonValue.NewBool(k == 1); }
+        if (k == 2) { return JsonValue.NewInt(doc.slots[at].b); }
+        if (k == 7) {
+            JsonValue v = JsonValue.NewDouble(doc.DoubleAt(at, 0.0));
+            v.numRaw = doc.StrAt(at, "");
+            return v;
         }
         if (k == 3) { return JsonValue.NewStr(doc.StrAt(at, "")); }
         if (k == 4) {
             int n = doc.Count(at);
             if (n == 0) { return JsonValue.NewArray(); }
             int c = doc.FirstChild(at);
-            // 优化：当数组长度 >= 8 且所有元素均为浮点数值（rawK == 7）时，
-            // 优先自适应物化为 double[] numArr 直存形态，消除海量 JsonValue 节点分配。
+            // Kind 7 stores both floating-point and long integer tokens.
+            // Only floating-point arrays can use the existing double storage.
             if (n >= 8 && c >= 0) {
                 bool allDouble = true;
                 int cur = c;
                 for (int i = 0; i < n; i = i + 1) {
-                    if (cur < 0 || cur >= doc.slotCount) { allDouble = false; break; }
-                    long slotA = doc.slots[cur].a;
-                    int rawK = (int)(slotA & 255);
-                    if (rawK != 7) { allDouble = false; break; }
+                    if (cur < 0 || cur >= doc.slotCount || !JsonValue.IsFloatingSlot(doc, cur)) {
+                        allDouble = false;
+                        break;
+                    }
                     cur = doc.NextSibling(cur);
                 }
                 if (allDouble) {
@@ -545,7 +555,7 @@ public partial class JsonValue {
                         arrData[i] = doc.DoubleAt(cur, 0.0);
                         cur = doc.NextSibling(cur);
                     }
-                    return JsonValue.NewDoubleArray(arrData);
+                    return JsonValue.FromOwnedDoubles(arrData);
                 }
             }
             JsonValue arr = JsonValue.NewArray();
@@ -584,8 +594,7 @@ public partial class JsonValue {
     // 预知子容器容量且免除二次语法校验。格式错误时抛出 JsonException。
     public static JsonValue Parse(string src) {
         if (src == null) { throw new JsonException("JSON source cannot be null"); }
-        JsonDoc doc = JsonDoc.Parse(src);
-        return JsonValue.FromDoc(doc, doc.root);
+        return JsonDoc.ParseScoped<JsonValue>(src, (doc) => JsonValue.FromDoc(doc));
     }
 
     // 尽力而为的解析：输入格式错误时返回已解析的部分

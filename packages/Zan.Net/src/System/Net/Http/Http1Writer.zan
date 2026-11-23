@@ -1,4 +1,5 @@
 using System;
+using System.Net.Sockets;
 
 namespace System.Net.Http;
 
@@ -9,10 +10,63 @@ public async delegate int Http1SendViewFn(StringView view);
 public class Http1Writer {
     private Http1SendViewFn send;
     private int maxSegment;
+    private nint directSock;
+    private bool nonBlocking;
 
-    public Http1Writer(Http1SendViewFn send, int maxSegment = 0) {
+    public Http1Writer(Http1SendViewFn send) {
+        this.send = send;
+        this.maxSegment = 0;
+        this.directSock = -1;
+        this.nonBlocking = false;
+    }
+
+    public Http1Writer(Http1SendViewFn send, int maxSegment) {
         this.send = send;
         this.maxSegment = maxSegment;
+        this.directSock = -1;
+        this.nonBlocking = false;
+    }
+
+    public Http1Writer(Http1SendViewFn send, int maxSegment, nint directSock) {
+        this.send = send;
+        this.maxSegment = maxSegment;
+        this.directSock = directSock;
+        this.nonBlocking = false;
+    }
+
+    public bool TrySendViewSync(StringView view, out int sent) {
+        if (this.directSock < 0 || this.maxSegment > 0) {
+            sent = 0;
+            return false;
+        }
+        if (view.ptr == (nint)0 || view.length <= 0) {
+            sent = 0;
+            return true;
+        }
+        if (!this.nonBlocking) {
+            Socket.SetNonBlocking(this.directSock);
+            this.nonBlocking = true;
+        }
+        int totalSent = 0;
+        int len = view.length;
+        while (totalSent < len) {
+            int n = (int)Socket.ReactorSendPtr(this.directSock, view.ptr + (nint)totalSent,
+                (long)(len - totalSent), 0);
+            if (n > 0) {
+                totalSent = totalSent + n;
+            } else if (n == 0) {
+                sent = totalSent;
+                return true;
+            } else if (n == -1) {
+                sent = totalSent;
+                return false;
+            } else {
+                sent = totalSent;
+                return true;
+            }
+        }
+        sent = totalSent;
+        return true;
     }
 
     public async int SendViewAsync(StringView view) {

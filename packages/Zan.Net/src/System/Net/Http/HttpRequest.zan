@@ -3,6 +3,8 @@ using System.Text;
 
 namespace System.Net.Http;
 
+public delegate void HttpStreamCompletion(int status, string outcome, long sendStartUs, long sendEndUs);
+
 // HTTP 请求的表示与解析器。
 // 从 TCP 数据解析原始 HTTP/1.1 请求。
 public class HttpRequest {
@@ -41,6 +43,11 @@ public class HttpRequest {
     // 未实现的 Transfer-Encoding 都是请求走私的入口。
     public int parseStatus;
 
+    // Set only when the HTTP/2 transport is asked to measure the stream.
+    public long StreamHeadersUs;
+    public long StreamReadyUs;
+    public HttpStreamCompletion StreamCompletion;
+
     // 零拷贝视图支持：原始报文及路径/查询切片偏移与长度
     public string raw;
     public int pathOffset;
@@ -50,6 +57,11 @@ public class HttpRequest {
 
     // 默认构造：HTTP/1.1 keep-alive 的默认状态，由 Parse 使用。
     public HttpRequest() {
+        this.Reset();
+    }
+
+    // 重置所有字段以供长连接复用同一个 HttpRequest 实例，避免每请求堆分配。
+    public void Reset() {
         this.raw = "";
         this.pathOffset = 0;
         this.pathLength = 0;
@@ -72,11 +84,359 @@ public class HttpRequest {
         this.chunked = false;
         this.bodyStart = 0;
         this.parseStatus = 0;
+        this.StreamHeadersUs = 0;
+        this.StreamReadyUs = 0;
+        this.StreamCompletion = null;
     }
 
     // 是否为可选空白（SP / HTAB，RFC 7230 OWS）。
     private static bool IsOws(int c) {
         return c == 32 || c == 9;
+    }
+
+    private static int TrimOwsStartSpan(Span<byte> buf, int start, int stop) {
+        while (start < stop && HttpRequest.IsOws((int)buf[start])) {
+            start = start + 1;
+        }
+        return start;
+    }
+
+    private static int TrimOwsStopSpan(Span<byte> buf, int start, int stop) {
+        while (stop > start && HttpRequest.IsOws((int)buf[stop - 1])) {
+            stop = stop - 1;
+        }
+        return stop;
+    }
+
+    private static bool SpanRegionIs(Span<byte> buf, int pos, int stop, string name) {
+        if (stop - pos != name.Length) { return false; }
+        for (int i = 0; pos + i < stop; i = i + 1) {
+            int c = (int)buf[pos + i];
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (name[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    private static bool ParseRequestLineSpan(HttpRequest req, nint ptr, Span<byte> buf, int len, out int lineEnd) {
+        lineEnd = 0;
+        for (; lineEnd < len && buf[lineEnd] != 10; lineEnd = lineEnd + 1) {
+        }
+        if (lineEnd >= len || lineEnd == 0 || buf[lineEnd - 1] != 13) {
+            return false;
+        }
+        int rlEnd = lineEnd - 1;
+        for (int ri = 0; ri < rlEnd; ri = ri + 1) {
+            int b = (int)buf[ri];
+            if ((b < 32 && b != 9) || b == 127) {
+                return false;
+            }
+        }
+
+        int sp1 = 0;
+        while (sp1 < rlEnd && !HttpRequest.IsOws((int)buf[sp1])) {
+            sp1 = sp1 + 1;
+        }
+        if (sp1 == 3) {
+            int b0 = (int)buf[0];
+            int b1 = (int)buf[1];
+            int b2 = (int)buf[2];
+            if (b0 == 71 && b1 == 69 && b2 == 84) { req.method = "GET"; }
+            else if (b0 == 80 && b1 == 85 && b2 == 84) { req.method = "PUT"; }
+            else { req.method = NativeMemory.GetString(ptr, 0, sp1); }
+        } else if (sp1 == 4) {
+            int b0 = (int)buf[0];
+            int b1 = (int)buf[1];
+            int b2 = (int)buf[2];
+            int b3 = (int)buf[3];
+            if (b0 == 80 && b1 == 79 && b2 == 83 && b3 == 84) { req.method = "POST"; }
+            else if (b0 == 72 && b1 == 69 && b2 == 65 && b3 == 68) { req.method = "HEAD"; }
+            else { req.method = NativeMemory.GetString(ptr, 0, sp1); }
+        } else if (sp1 == 6 && HttpRequest.SpanRegionIs(buf, 0, sp1, "delete")) {
+            req.method = "DELETE";
+        } else if (sp1 == 7 && HttpRequest.SpanRegionIs(buf, 0, sp1, "options")) {
+            req.method = "OPTIONS";
+        } else if (sp1 == 5 && HttpRequest.SpanRegionIs(buf, 0, sp1, "patch")) {
+            req.method = "PATCH";
+        } else if (sp1 > 0) {
+            req.method = NativeMemory.GetString(ptr, 0, sp1);
+        } else {
+            return false;
+        }
+
+        int pathStart = HttpRequest.TrimOwsStartSpan(buf, sp1, rlEnd);
+        int sp2 = pathStart;
+        while (sp2 < rlEnd && !HttpRequest.IsOws((int)buf[sp2])) {
+            sp2 = sp2 + 1;
+        }
+        int pathEnd = sp2;
+        int versionStart = HttpRequest.TrimOwsStartSpan(buf, sp2, rlEnd);
+        int versionStop = HttpRequest.TrimOwsStopSpan(buf, versionStart, rlEnd);
+        int vLen = versionStop - versionStart;
+        if (vLen == 8 && HttpRequest.SpanRegionIs(buf, versionStart, versionStop, "http/1.1")) {
+            req.version = "HTTP/1.1";
+        } else if (vLen == 8 && HttpRequest.SpanRegionIs(buf, versionStart, versionStop, "http/1.0")) {
+            req.version = "HTTP/1.0";
+        } else if (versionStart < versionStop) {
+            req.version = NativeMemory.GetString(ptr, versionStart, vLen);
+        } else {
+            return false;
+        }
+        if (req.method.Length == 0 || pathStart >= pathEnd) {
+            return false;
+        }
+
+        int qmark = pathStart;
+        bool foundQ = false;
+        while (qmark < pathEnd) {
+            if (buf[qmark] == 63) {
+                foundQ = true;
+                break;
+            }
+            qmark = qmark + 1;
+        }
+        if (foundQ) {
+            req.pathOffset = pathStart;
+            int plen = qmark - pathStart;
+            req.pathLength = plen;
+            req.queryOffset = qmark + 1;
+            int qlen = pathEnd - qmark - 1;
+            req.queryLength = qlen;
+            if (plen == 1 && buf[pathStart] == 47) {
+                req.path = "/";
+            } else if (plen == 0) {
+                req.path = "";
+            } else {
+                req.path = NativeMemory.GetString(ptr, pathStart, plen);
+            }
+            if (qlen == 0) {
+                req.queryString = "";
+            } else {
+                req.queryString = NativeMemory.GetString(ptr, qmark + 1, qlen);
+            }
+        } else {
+            req.pathOffset = pathStart;
+            int plen = pathEnd - pathStart;
+            req.pathLength = plen;
+            req.queryOffset = 0;
+            req.queryLength = 0;
+            if (plen == 1 && buf[pathStart] == 47) {
+                req.path = "/";
+            } else if (plen == 0) {
+                req.path = "";
+            } else {
+                req.path = NativeMemory.GetString(ptr, pathStart, plen);
+            }
+            req.queryString = "";
+        }
+        return true;
+    }
+
+    private static int ParseHeadersBlockSpan(HttpRequest req, nint ptr, Span<byte> buf, int len, int pos,
+            out bool clSeen, out bool teSeen, out int hostCount, out bool connClose, out bool connKeep,
+            out int headersStart, out int headersStop, out bool hasExtraHeaders) {
+        headersStart = pos;
+        headersStop = pos;
+        clSeen = false;
+        teSeen = false;
+        hostCount = 0;
+        connClose = false;
+        connKeep = false;
+        hasExtraHeaders = false;
+        long clAcc = 0;
+        long firstCl = 0;
+        bool headersEnded = false;
+
+        while (pos < len) {
+            int hEnd = pos;
+            while (hEnd < len && buf[hEnd] != 10) {
+                hEnd = hEnd + 1;
+            }
+            if (hEnd >= len || hEnd == pos || buf[hEnd - 1] != 13) {
+                req.parseStatus = 400;
+                return -1;
+            }
+            int lineStop = hEnd - 1;
+            if (lineStop == pos) {
+                pos = hEnd + 1;
+                headersEnded = true;
+                break;
+            }
+            headersStop = lineStop;
+
+            for (int hi = pos; hi < lineStop; hi = hi + 1) {
+                int hb = (int)buf[hi];
+                if ((hb < 32 && hb != 9) || hb == 127) {
+                    req.parseStatus = 400;
+                    return -1;
+                }
+            }
+            int colonPos = pos;
+            while (colonPos < lineStop && buf[colonPos] != 58) {
+                colonPos = colonPos + 1;
+            }
+            if (colonPos >= lineStop || colonPos == pos) {
+                req.parseStatus = 400;
+                return -1;
+            }
+
+            for (int si = pos; si < colonPos; si = si + 1) {
+                int sc = (int)buf[si];
+                bool token = (sc >= 48 && sc <= 57)
+                    || (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122)
+                    || sc == 33 || sc == 35 || sc == 36 || sc == 37
+                    || sc == 38 || sc == 39 || sc == 42 || sc == 43
+                    || sc == 45 || sc == 46 || sc == 94 || sc == 95
+                    || sc == 96 || sc == 124 || sc == 126;
+                if (!token) {
+                    req.parseStatus = 400;
+                    return -1;
+                }
+            }
+            int vStart = HttpRequest.TrimOwsStartSpan(buf, colonPos + 1, lineStop);
+            int vStop = HttpRequest.TrimOwsStopSpan(buf, vStart, lineStop);
+            int nameLen = colonPos - pos;
+
+            if (nameLen == 4 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "host")) {
+                hostCount = hostCount + 1;
+                if (hostCount > 1 || vStart == vStop) { req.parseStatus = 400; }
+                req.host = vStop > vStart ? NativeMemory.GetString(ptr, vStart, vStop - vStart) : "";
+            } else if (nameLen == 12 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "content-type")) {
+                req.contentType = vStop > vStart ? NativeMemory.GetString(ptr, vStart, vStop - vStart) : "";
+            } else if (nameLen == 13 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "authorization")) {
+                if (req.authorization.Length == 0 && vStop > vStart) {
+                    req.authorization = NativeMemory.GetString(ptr, vStart, vStop - vStart);
+                }
+            } else if (nameLen == 6 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "cookie")) {
+                if (req.cookie.Length == 0 && vStop > vStart) {
+                    req.cookie = NativeMemory.GetString(ptr, vStart, vStop - vStart);
+                }
+            } else if (nameLen == 10 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "user-agent")) {
+                if (req.userAgent.Length == 0 && vStop > vStart) {
+                    req.userAgent = NativeMemory.GetString(ptr, vStart, vStop - vStart);
+                }
+            } else if (nameLen == 14 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "content-length")) {
+                clAcc = 0;
+                bool bad = vStart == vStop;
+                int di = vStart;
+                while (di < vStop) {
+                    int d = (int)buf[di];
+                    if (d < 48 || d > 57) { bad = true; break; }
+                    clAcc = clAcc * 10 + (d - 48);
+                    if (clAcc > 2147483647) { bad = true; break; }
+                    di = di + 1;
+                }
+                if (bad) {
+                    bool overflow = vStart != vStop;
+                    int ci = vStart;
+                    while (ci < vStop) {
+                        int dd = (int)buf[ci];
+                        if (dd < 48 || dd > 57) { overflow = false; break; }
+                        ci = ci + 1;
+                    }
+                    req.parseStatus = overflow ? 413 : 400;
+                } else if (clSeen) {
+                    if (firstCl != clAcc) { req.parseStatus = 400; }
+                } else {
+                    clSeen = true;
+                    firstCl = clAcc;
+                    req.contentLength = (int)clAcc;
+                }
+            } else if (nameLen == 17 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "transfer-encoding")) {
+                req.chunked = !teSeen && HttpRequest.SpanRegionIs(buf, vStart, vStop, "chunked");
+                teSeen = true;
+            } else if (nameLen == 10 && HttpRequest.SpanRegionIs(buf, pos, colonPos, "connection")) {
+                int t = vStart;
+                while (t < lineStop) {
+                    int tEnd = t;
+                    while (tEnd < lineStop && buf[tEnd] != 44) {
+                        tEnd = tEnd + 1;
+                    }
+                    int tStop = HttpRequest.TrimOwsStopSpan(buf, t, tEnd);
+                    t = HttpRequest.TrimOwsStartSpan(buf, t, tStop);
+                    if (HttpRequest.SpanRegionIs(buf, t, tStop, "close")) { connClose = true; }
+                    if (HttpRequest.SpanRegionIs(buf, t, tStop, "keep-alive")) { connKeep = true; }
+                    t = HttpRequest.TrimOwsStartSpan(buf, tEnd + 1, lineStop);
+                }
+            } else {
+                hasExtraHeaders = true;
+            }
+            pos = hEnd + 1;
+        }
+        if (!headersEnded) {
+            req.parseStatus = 400;
+            return -1;
+        }
+        return pos;
+    }
+
+    // 零拷贝视图解析进可复用的 HttpRequest 实例（直接扫描 HttpFramer 内部缓冲区，不整块复制头部与 rawHeaders）。
+    public static void ParseViewInto(StringView head, HttpRequest req) {
+        req.Reset();
+        int len = head.length;
+        if (len <= 0 || head.ptr == (nint)0) { return; }
+        Span<byte> buf = new Span<byte>(head.ptr, len);
+
+        int lineEnd = 0;
+        if (!HttpRequest.ParseRequestLineSpan(req, head.ptr, buf, len, out lineEnd)) {
+            req.parseStatus = 400;
+            return;
+        }
+
+        bool clSeen = false;
+        bool teSeen = false;
+        int hostCount = 0;
+        bool connClose = false;
+        bool connKeep = false;
+        int headersStart = 0;
+        int headersStop = 0;
+        bool hasExtraHeaders = false;
+        int pos = HttpRequest.ParseHeadersBlockSpan(req, head.ptr, buf, len, lineEnd + 1,
+            out clSeen, out teSeen, out hostCount, out connClose, out connKeep,
+            out headersStart, out headersStop, out hasExtraHeaders);
+        if (pos < 0) {
+            return;
+        }
+
+        if (req.version == "HTTP/1.0") {
+            req.keepAlive = connKeep;
+        } else {
+            req.keepAlive = !connClose;
+        }
+        if (teSeen && req.parseStatus == 0) {
+            if (clSeen) {
+                req.parseStatus = 400;
+                req.chunked = false;
+            } else if (!req.chunked) {
+                req.parseStatus = 501;
+            }
+        }
+        if (req.version != "HTTP/1.1" && req.version != "HTTP/1.0") {
+            req.parseStatus = 400;
+        }
+        if (req.version == "HTTP/1.1" && hostCount != 1) {
+            req.parseStatus = 400;
+        }
+        if (hasExtraHeaders && headersStop > headersStart) {
+            req.rawHeaders = NativeMemory.GetString(head.ptr, headersStart, headersStop - headersStart);
+        }
+
+        req.bodyStart = pos;
+        if (pos < len && !req.chunked) {
+            int avail = len - pos;
+            int take = avail;
+            if (clSeen && req.contentLength < avail) { take = req.contentLength; }
+            if (take > 0) {
+                req.body = NativeMemory.GetString(head.ptr, pos, take);
+                req.bodyLength = take;
+            }
+        }
+    }
+
+    public static HttpRequest ParseView(StringView head) {
+        HttpRequest req = new HttpRequest();
+        HttpRequest.ParseViewInto(head, req);
+        return req;
     }
 
     // [start, stop) 起点跳过 RFC 7230 OWS（SP / HTAB）。
@@ -479,6 +839,8 @@ public class HttpRequest {
     // 按名称获取某个头部值（大小写不敏感）。
     public string GetHeader(string name) {
         // 解析时已捕获的头部不必重扫头部块。
+        if (HttpRequest.NameIs(name, "host")) { return this.host; }
+        if (HttpRequest.NameIs(name, "content-type")) { return this.contentType; }
         if (HttpRequest.NameIs(name, "authorization")) { return this.authorization; }
         if (HttpRequest.NameIs(name, "cookie")) { return this.cookie; }
         if (HttpRequest.NameIs(name, "user-agent")) { return this.userAgent; }
@@ -512,7 +874,7 @@ public class HttpRequest {
 
     // 零分配视图辅助：直接返回路径的 StringView 视图。
     public StringView PathView() {
-        if (this.raw == null || this.pathLength <= 0) {
+        if (this.raw == null || this.raw.Length == 0 || this.pathLength <= 0) {
             if (this.path != null && this.path.Length > 0) {
                 return this.path.AsView();
             }
@@ -528,7 +890,7 @@ public class HttpRequest {
 
     // 零分配视图辅助：直接返回查询字符串的 StringView 视图。
     public StringView QueryView() {
-        if (this.raw == null || this.queryLength <= 0) {
+        if (this.raw == null || this.raw.Length == 0 || this.queryLength <= 0) {
             if (this.queryString != null && this.queryString.Length > 0) {
                 return this.queryString.AsView();
             }
@@ -539,6 +901,12 @@ public class HttpRequest {
 
     // 按名称获取某个头部值的 16 字节只读切片视图（StringView，完全零堆内存分配）。
     public StringView GetHeaderView(string name) {
+        if (HttpRequest.NameIs(name, "host")) {
+            return StringView.FromString(this.host);
+        }
+        if (HttpRequest.NameIs(name, "content-type")) {
+            return StringView.FromString(this.contentType);
+        }
         if (HttpRequest.NameIs(name, "authorization")) {
             return StringView.FromString(this.authorization);
         }
@@ -580,6 +948,12 @@ public class HttpRequest {
     // 按名称获取某个头部值的只读切片视图（零堆内存分配）。
     // 若未找到，返回长度为 0 的空 ReadOnlySpan<char>。
     public ReadOnlySpan<char> GetHeaderSpan(string name) {
+        if (HttpRequest.NameIs(name, "host")) {
+            return this.host.AsSpan();
+        }
+        if (HttpRequest.NameIs(name, "content-type")) {
+            return this.contentType.AsSpan();
+        }
         if (HttpRequest.NameIs(name, "authorization")) {
             return this.authorization.AsSpan();
         }

@@ -1,11 +1,177 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Json;
+using System.Threading;
 
 namespace System.Diagnostics;
 
 // 服务端异常捕获沉淀槽：持久化错误记录供管理看板检索。
 public delegate void ErrorSink(long ts, string origin, string detail);
+
+// 分片指标桶：每线程哈希到独立分片，消除多核请求/查询热路径上的全局锁争用。
+internal class MetricsShard {
+    public AtomicInt concurrent;
+    public AtomicInt concurrentPeak;
+    public int reqCount;
+    public int reqErrors;
+    public int reqFailed;
+    public int reqRejected;
+    public int reqUnmatched;
+    public long reqTotalUs;
+    public long reqMaxUs;
+    public List<SlowEntry> slowReqs;
+
+    public int queryCount;
+    public long queryTotalUs;
+    public long queryMaxUs;
+    public List<SlowEntry> slowQueries;
+
+    public List<ReqAgg> routeSlots;
+    public List<ReqAgg> reqAgg;
+    public Dictionary<string, ReqAgg> reqIdx;
+    public List<SqlAgg> sqlAgg;
+    public Dictionary<string, SqlAgg> sqlIdx;
+
+    public int seriesCap;
+    public long[] sSec;
+    public int[] sReq;
+    public int[] sErr;
+    public long[] sTotalUs;
+    public long[] sMaxUs;
+    public int[] sQuery;
+    public long[] sQueryUs;
+    public int[] sHist;
+
+    public MetricsShard(int seriesCap) {
+        this.concurrent = new AtomicInt(0);
+        this.concurrentPeak = new AtomicInt(0);
+        this.reqCount = 0;
+        this.reqErrors = 0;
+        this.reqFailed = 0;
+        this.reqRejected = 0;
+        this.reqUnmatched = 0;
+        this.reqTotalUs = 0;
+        this.reqMaxUs = 0;
+        this.slowReqs = new List<SlowEntry>();
+        this.queryCount = 0;
+        this.queryTotalUs = 0;
+        this.queryMaxUs = 0;
+        this.slowQueries = new List<SlowEntry>();
+        this.routeSlots = new List<ReqAgg>();
+        this.reqAgg = new List<ReqAgg>();
+        this.reqIdx = new Dictionary<string, ReqAgg>();
+        this.sqlAgg = new List<SqlAgg>();
+        this.sqlIdx = new Dictionary<string, SqlAgg>();
+        this.seriesCap = seriesCap;
+        this.sSec = new long[seriesCap];
+        this.sReq = new int[seriesCap];
+        this.sErr = new int[seriesCap];
+        this.sTotalUs = new long[seriesCap];
+        this.sMaxUs = new long[seriesCap];
+        this.sQuery = new int[seriesCap];
+        this.sQueryUs = new long[seriesCap];
+        this.sHist = new int[seriesCap * ServerMetrics.HIST_BINS];
+        for (int i = 0; i < seriesCap; i = i + 1) { this.sSec[i] = 0 - 1; }
+    }
+
+    public int SeriesSlot(long sec) {
+        int idx = (int)(sec % (long)this.seriesCap);
+        if (this.sSec[idx] == sec) { return idx; }
+        this.sSec[idx] = sec;
+        this.sReq[idx] = 0;
+        this.sErr[idx] = 0;
+        this.sTotalUs[idx] = 0;
+        this.sMaxUs[idx] = 0;
+        this.sQuery[idx] = 0;
+        this.sQueryUs[idx] = 0;
+        int hbase = idx * ServerMetrics.HIST_BINS;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            this.sHist[hbase + b] = 0;
+        }
+        return idx;
+    }
+
+    public void CountRequest(long sec, int status, long us) {
+        this.reqCount = this.reqCount + 1;
+        this.reqTotalUs = this.reqTotalUs + us;
+        if (us > this.reqMaxUs) { this.reqMaxUs = us; }
+        if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
+        if (status >= 400) { this.reqFailed = this.reqFailed + 1; }
+        if (status == 429) { this.reqRejected = this.reqRejected + 1; }
+
+        int idx = this.SeriesSlot(sec);
+        this.sReq[idx] = this.sReq[idx] + 1;
+        this.sTotalUs[idx] = this.sTotalUs[idx] + us;
+        if (us > this.sMaxUs[idx]) { this.sMaxUs[idx] = us; }
+        if (status >= 500) { this.sErr[idx] = this.sErr[idx] + 1; }
+        int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(us);
+        this.sHist[hb] = this.sHist[hb] + 1;
+    }
+
+    public void FoldEndpoint(int slot, string method, string path, long us, int status, int reqAggCap) {
+        ReqAgg a = null;
+        if (slot >= 0) {
+            while (this.routeSlots.Count <= slot) { this.routeSlots.Add(null); }
+            a = this.routeSlots[slot];
+            if (a == null) {
+                a = new ReqAgg(method, path);
+                this.routeSlots[slot] = a;
+                this.AddAgg(a);
+            }
+        } else {
+            string key = method + " " + path;
+            if (!this.reqIdx.TryGetValue(key, out a)) {
+                if (this.reqAgg.Count >= reqAggCap) { return; }
+                a = new ReqAgg(method, path);
+                this.AddAgg(a);
+            }
+        }
+        a.count = a.count + 1;
+        a.totalUs = a.totalUs + us;
+        if (us > a.maxUs) { a.maxUs = us; }
+        if (status >= 500) { a.errors = a.errors + 1; }
+        if (status >= 400) { a.failed = a.failed + 1; }
+        if (status == 429) { a.rejected = a.rejected + 1; }
+    }
+
+    void AddAgg(ReqAgg a) {
+        this.reqAgg.Add(a);
+        string key = a.method + " " + a.path;
+        if (!this.reqIdx.ContainsKey(key)) { this.reqIdx.Add(key, a); }
+    }
+
+    public void RecordQuery(long sec, string norm, long us, int sqlAggCap, int slowQueryMs, int ringCap) {
+        this.queryCount = this.queryCount + 1;
+        this.queryTotalUs = this.queryTotalUs + us;
+        if (us > this.queryMaxUs) { this.queryMaxUs = us; }
+
+        int idx = this.SeriesSlot(sec);
+        this.sQuery[idx] = this.sQuery[idx] + 1;
+        this.sQueryUs[idx] = this.sQueryUs[idx] + us;
+
+        SqlAgg a = null;
+        if (!this.sqlIdx.TryGetValue(norm, out a)) {
+            if (this.sqlAgg.Count < sqlAggCap) {
+                a = new SqlAgg(norm);
+                this.sqlAgg.Add(a);
+                this.sqlIdx.Add(norm, a);
+            }
+        }
+        if (a != null) {
+            a.count = a.count + 1;
+            a.totalUs = a.totalUs + us;
+            if (us > a.maxUs) { a.maxUs = us; }
+        }
+
+        if (us >= (long)slowQueryMs * 1000) {
+            this.slowQueries.Add(new SlowEntry(norm, us));
+            if (this.slowQueries.Count > ringCap) {
+                this.slowQueries.RemoveAt(0);
+            }
+        }
+    }
+}
 
 // 进程内服务器指标聚合器（单例经 Global()）：请求/查询吞吐与延迟、
 // 慢操作环形缓冲、每秒序列，以及 /admin/stats 形状的 JSON 快照。
@@ -34,33 +200,18 @@ public class ServerMetrics {
     [DllImport("crt", EntryPoint = "zan_monotonic_us")]
     private static extern long NativeMonotonicUs();
 
-    int reqCount;
-    int reqErrors;
-    int reqFailed;  // 4xx + 5xx
-    int reqRejected;  // 429: a refusal is not a success, and hiding it makes a
-    // 未被任何路由或资源认领的请求数（404/405、路径扫描），只计数不按键保存。
-    int reqUnmatched;  // requests no route and no asset claimed (404/405, path
-    long reqTotalUs;
-    long reqMaxUs;
-    int slowReqMs;  // slow-request threshold, configured in ms
-    List<SlowEntry> slowReqs;  // "METHOD path -> status" + elapsed us
+    private static const int SHARD_COUNT = 32;
 
-    int queryCount;
-    long queryTotalUs;
-    long queryMaxUs;
+    int slowReqMs;  // slow-request threshold, configured in ms
     int slowQueryMs;  // slow-query threshold, configured in ms
-    List<SlowEntry> slowQueries;  // truncated SQL + elapsed us
-    List<SqlAgg> sqlAgg;  // per-normalized-statement leaderboard
     int sqlAggCap;  // distinct statement shapes kept
-    List<ReqAgg> reqAgg;  // per-endpoint request leaderboard
     int reqAggCap;  // distinct endpoints kept
-    List<ReqAgg> routeSlots;
-    Dictionary<string, ReqAgg> reqIdx;
-    Dictionary<string, SqlAgg> sqlIdx;
+    MetricsShard[] shards;
 
     List<ErrEntry> errors;
     int errCap;  // entries kept in memory
-    long errTotal;  // errors seen since start
+    AtomicInt errTotal;  // errors seen since start
+    object errLock;
     // 错误追加写入的日志文件路径（"" = 不写文件）。
     string errLogPath;  // append-only sink ("" disables the file)
     // 调试模式下错误同时回显到 stdout。
@@ -73,56 +224,35 @@ public class ServerMetrics {
     int ringCap;
 
     int seriesCap;
-    // 该槽位持有的秒值（-1 = 空槽，环形已被越过）。
-    long[] sSec;  // the second this slot holds (-1 = empty)
-    int[] sReq;
-    int[] sErr;
-    long[] sTotalUs;
-    long[] sMaxUs;
-    int[] sQuery;
-    long[] sQueryUs;
+    long[] sSampleSec;
     // 该秒的进程 CPU%（-1 = 未知）。
     int[] sCpu;  // process CPU% at that second (-1 unknown)
     // 该秒的常驻内存字节数（-1 = 未知）。
     long[] sRss;  // resident bytes at that second (-1 unknown)
-    int[] sHist;  // seriesCap * HIST_BINS latency histogram
     long seriesLastWall;
     long seriesLastCpu;  // from the snapshot's own delta state
+    AtomicInt lastSampledSec;
+    object sampleLock;
+    object snapshotLock;
 
-    long concurrent;
-    long concurrentPeak;
-    long streams;
-    long streamFrames;
-    long streamBytes;
+    AtomicInt concurrent;
+    AtomicInt concurrentPeak;
+    AtomicInt streams;
+    AtomicInt streamFrames;
+    AtomicInt streamBytes;
 
     ErrorSink errSink;
 
-    // 私有构造：唯一入口是 Global()。各计数、环形缓冲与每秒序列在此初始化。
+    // 私有构造：唯一入口是 Global()。各计数、分片桶、环形缓冲与每秒序列在此初始化。
     ServerMetrics() {
-        this.reqCount = 0;
-        this.reqErrors = 0;
-        this.reqFailed = 0;
-        this.reqRejected = 0;
-        this.reqUnmatched = 0;
-        this.reqTotalUs = 0;
-        this.reqMaxUs = 0;
         this.slowReqMs = 500;
-        this.slowReqs = new List<SlowEntry>();
-        this.queryCount = 0;
-        this.queryTotalUs = 0;
-        this.queryMaxUs = 0;
         this.slowQueryMs = 200;
-        this.slowQueries = new List<SlowEntry>();
-        this.sqlAgg = new List<SqlAgg>();
         this.sqlAggCap = 200;
-        this.reqAgg = new List<ReqAgg>();
         this.reqAggCap = 200;
-        this.routeSlots = new List<ReqAgg>();
-        this.reqIdx = new Dictionary<string, ReqAgg>();
-        this.sqlIdx = new Dictionary<string, SqlAgg>();
         this.errors = new List<ErrEntry>();
         this.errCap = 100;
-        this.errTotal = 0;
+        this.errTotal = new AtomicInt(0);
+        this.errLock = new object();
         this.errLogPath = "logs/error.log";
         this.errDebug = false;
         this.startMillis = ServerMetrics.MonoMillis();
@@ -132,54 +262,93 @@ public class ServerMetrics {
         this.ringCap = 32;
 
         this.seriesCap = 300;  // five minutes of one-second buckets
-        this.sSec = new long[this.seriesCap];
-        this.sReq = new int[this.seriesCap];
-        this.sErr = new int[this.seriesCap];
-        this.sTotalUs = new long[this.seriesCap];
-        this.sMaxUs = new long[this.seriesCap];
-        this.sQuery = new int[this.seriesCap];
-        this.sQueryUs = new long[this.seriesCap];
+        this.shards = new MetricsShard[ServerMetrics.SHARD_COUNT];
+        for (int i = 0; i < ServerMetrics.SHARD_COUNT; i = i + 1) {
+            this.shards[i] = new MetricsShard(this.seriesCap);
+        }
+        this.sSampleSec = new long[this.seriesCap];
         this.sCpu = new int[this.seriesCap];
         this.sRss = new long[this.seriesCap];
-        this.sHist = new int[this.seriesCap * ServerMetrics.HIST_BINS];
-        for (int i = 0; i < this.seriesCap; i = i + 1) { this.sSec[i] = 0 - 1; }
+        for (int i = 0; i < this.seriesCap; i = i + 1) {
+            this.sSampleSec[i] = 0 - 1;
+            this.sCpu[i] = 0 - 1;
+            this.sRss[i] = 0 - 1;
+        }
         this.seriesLastWall = this.startMillis;
         this.seriesLastCpu = 0;
-        this.concurrent = 0;
-        this.concurrentPeak = 0;
-        this.streams = 0;
-        this.streamFrames = 0;
-        this.streamBytes = 0;
+        this.lastSampledSec = new AtomicInt(0 - 1);
+        this.sampleLock = new object();
+        this.snapshotLock = new object();
+        this.concurrent = new AtomicInt(0);
+        this.concurrentPeak = new AtomicInt(0);
+        this.streams = new AtomicInt(0);
+        this.streamFrames = new AtomicInt(0);
+        this.streamBytes = new AtomicInt(0);
         this.errSink = null;
     }
 
+    private int ShardIndex() {
+        long tid = Thread.CurrentId();
+        long h = (tid ^ (tid >> 4) ^ (tid >> 8)) * 2654435761L;
+        return (int)(h & 31);
+    }
+
+    private MetricsShard Shard() {
+        return this.shards[this.ShardIndex()];
+    }
+
+    // 分片进入/离开并发计数：返回进入时命中的分片下标，离开时按原下标递减，
+    // 既消除多核全局原子争用，又保证协程跨线程迁移时加减严格配对不漂移。
+    public int EnterShard() {
+        int idx = this.ShardIndex();
+        MetricsShard shard = this.shards[idx];
+        long cur = shard.concurrent.Increment();
+        long peak = shard.concurrentPeak.Load();
+        while (cur > peak) {
+            long prev = shard.concurrentPeak.CompareExchange(peak, cur);
+            if (prev == peak) { break; }
+            peak = prev;
+        }
+        return idx;
+    }
+
+    public void LeaveShard(int shardIdx) {
+        if (shardIdx < 0 || shardIdx >= ServerMetrics.SHARD_COUNT) { return; }
+        long _rem = this.shards[shardIdx].concurrent.Decrement();
+    }
+
     public void Entered() {
-        lock (this) {
-            this.concurrent = this.concurrent + 1;
-            if (this.concurrent > this.concurrentPeak) {
-                this.concurrentPeak = this.concurrent;
-            }
+        long cur = this.concurrent.Increment();
+        long peak = this.concurrentPeak.Load();
+        while (cur > peak) {
+            long prev = this.concurrentPeak.CompareExchange(peak, cur);
+            if (prev == peak) { break; }
+            peak = prev;
         }
     }
 
     // 一次请求离开，与 Entered() 配对；计数不会减到零以下。
     public void Left() {
-        lock (this) {
-            if (this.concurrent > 0) { this.concurrent = this.concurrent - 1; }
+        long rem = this.concurrent.Decrement();
+        if (rem < 0) {
+            long _fix = this.concurrent.Increment();
         }
     }
 
     public void StreamOpened() {
-        lock (this) { this.streams = this.streams + 1; }
+        long _s = this.streams.Increment();
     }
 
     // 一条长连接关闭，`frames`/`bytes` 为其存续期内的累计推送量，并入总量。
     public void StreamClosed(long frames, long bytes) {
-        lock (this) {
-            if (this.streams > 0) { this.streams = this.streams - 1; }
-            this.streamFrames = this.streamFrames + frames;
-            this.streamBytes = this.streamBytes + bytes;
+        long cur = this.streams.Load();
+        while (cur > 0) {
+            long prev = this.streams.CompareExchange(cur, cur - 1);
+            if (prev == cur) { break; }
+            cur = prev;
         }
+        long _f = this.streamFrames.Add(frames);
+        long _b = this.streamBytes.Add(bytes);
     }
 
     public static const int HIST_BINS = 13;
@@ -202,43 +371,44 @@ public class ServerMetrics {
 
     // `us` 落入的直方图桶下标（0 起）；超过所有上沿落在最后一桶。
     public static int HistBin(long us) {
-        int b = 0;
-        while (b < ServerMetrics.HIST_BINS - 1) {
-            if (us <= ServerMetrics.HistEdge(b)) { return b; }
-            b = b + 1;
+        if (us <= 10000) {
+            if (us <= 1000) {
+                if (us <= 250) { return us <= 100 ? 0 : 1; }
+                return us <= 500 ? 2 : 3;
+            }
+            if (us <= 5000) { return us <= 2500 ? 4 : 5; }
+            return 6;
         }
-        return ServerMetrics.HIST_BINS - 1;
+        if (us <= 100000) {
+            if (us <= 50000) { return us <= 25000 ? 7 : 8; }
+            return 9;
+        }
+        if (us <= 500000) { return 10; }
+        if (us <= 2000000) { return 11; }
+        return 12;
     }
 
-    private int SeriesSlot(long sec) {
-        lock (this) {
+    private void SampleSeriesSecondIfNeeded(long sec) {
+        long prev = this.lastSampledSec.Load();
+        if (prev == sec) { return; }
+        if (this.lastSampledSec.CompareExchange(prev, sec) != prev) { return; }
         int idx = (int)(sec % (long)this.seriesCap);
-        if (this.sSec[idx] == sec) { return idx; }
-        this.sSec[idx] = sec;
-        this.sReq[idx] = 0;
-        this.sErr[idx] = 0;
-        this.sTotalUs[idx] = 0;
-        this.sMaxUs[idx] = 0;
-        this.sQuery[idx] = 0;
-        this.sQueryUs[idx] = 0;
-        int hbase = idx * ServerMetrics.HIST_BINS;
-        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
-            this.sHist[hbase + b] = 0;
-        }
-        this.sCpu[idx] = 0 - 1;
-        this.sRss[idx] = ServerMetrics.MemoryRssBytes();
+        long rss = ServerMetrics.MemoryRssBytes();
         long cpuMs = ServerMetrics.CpuMillis();
-        long nowWall = sec * 1000;
-        if (cpuMs >= 0) {
-            long dWall = nowWall - this.seriesLastWall;
-            long dCpu = cpuMs - this.seriesLastCpu;
-            if (dWall > 0 && dCpu >= 0) {
-                this.sCpu[idx] = (int)((dCpu * 100) / dWall);
+        lock (this.sampleLock) {
+            this.sSampleSec[idx] = sec;
+            this.sRss[idx] = rss;
+            this.sCpu[idx] = 0 - 1;
+            long nowWall = sec * 1000;
+            if (cpuMs >= 0) {
+                long dWall = nowWall - this.seriesLastWall;
+                long dCpu = cpuMs - this.seriesLastCpu;
+                if (dWall > 0 && dCpu >= 0) {
+                    this.sCpu[idx] = (int)((dCpu * 100) / dWall);
+                }
+                this.seriesLastWall = nowWall;
+                this.seriesLastCpu = cpuMs;
             }
-            this.seriesLastWall = nowWall;
-            this.seriesLastCpu = cpuMs;
-        }
-        return idx;
         }
     }
 
@@ -283,8 +453,8 @@ public class ServerMetrics {
     }
 
     public void RecordError(long ts, string origin, string detail) {
-        lock (this) {
-            this.errTotal = this.errTotal + 1;
+        long _et = this.errTotal.Increment();
+        lock (this.errLock) {
             this.errors.Add(new ErrEntry(ts, origin, detail));
             while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
         }
@@ -299,11 +469,11 @@ public class ServerMetrics {
     public ServerMetrics OnError(ErrorSink fn) { this.errSink = fn; return this; }
 
     // 启动以来记录的错误总数（含已滚出内存 ring 的条目）。
-    public long ErrorTotal() { return this.errTotal; }
+    public long ErrorTotal() { return this.errTotal.Load(); }
 
     public List<ServerErrorDoc> RecentErrors(int limit) {
         List<ServerErrorDoc> outp = new List<ServerErrorDoc>();
-        lock (this) {
+        lock (this.errLock) {
             int n = this.errors.Count;
             for (int i = n - 1; i >= 0 && outp.Count < limit; i = i - 1) {
                 ErrEntry e = this.errors[i];
@@ -431,89 +601,54 @@ public class ServerMetrics {
     // ---- recording ----
 
     void RecordRoute(int slot, string method, string pattern, int status, long us) {
-        lock (this) {
-        this.CountRequest(status, us);
-        this.FoldEndpoint(slot, method, pattern, us, status);
-        if (us >= (long)this.slowReqMs * 1000) {
-            this.slowReqs.Add(new SlowEntry(method + " " + pattern + " -> "
-                + Convert.ToString(status), us));
-            if (this.slowReqs.Count > this.ringCap) {
-                this.slowReqs.RemoveAt(0);
+        this.RecordRouteAt(slot, method, pattern, status, us, ServerMetrics.MonoMillis() / 1000);
+    }
+
+    public void RecordRouteAt(int slot, string method, string pattern, int status, long us, long sec) {
+        this.SampleSeriesSecondIfNeeded(sec);
+        MetricsShard shard = this.Shard();
+        lock (shard) {
+            shard.CountRequest(sec, status, us);
+            shard.FoldEndpoint(slot, method, pattern, us, status, this.reqAggCap);
+            if (us >= (long)this.slowReqMs * 1000) {
+                shard.slowReqs.Add(new SlowEntry(method + " " + pattern + " -> "
+                    + Convert.ToString(status), us));
+                if (shard.slowReqs.Count > this.ringCap) {
+                    shard.slowReqs.RemoveAt(0);
+                }
             }
-        }
         }
     }
 
     void RecordUnmatched(int status, long us) {
-        lock (this) {
-        this.reqUnmatched = this.reqUnmatched + 1;
-        this.CountRequest(status, us);
+        this.RecordUnmatchedAt(status, us, ServerMetrics.MonoMillis() / 1000);
+    }
+
+    public void RecordUnmatchedAt(int status, long us, long sec) {
+        this.SampleSeriesSecondIfNeeded(sec);
+        MetricsShard shard = this.Shard();
+        lock (shard) {
+            shard.reqUnmatched = shard.reqUnmatched + 1;
+            shard.CountRequest(sec, status, us);
         }
     }
 
     // normalization at all.
     public void RecordRequest(string method, string path, int status, long us) {
         string folded = ServerMetrics.FoldPath(path);
-        lock (this) {
-        this.CountRequest(status, us);
-        this.FoldEndpoint(0 - 1, method, folded, us, status);
-        if (us >= (long)this.slowReqMs * 1000) {
-            this.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), us));
-            if (this.slowReqs.Count > this.ringCap) {
-                this.slowReqs.RemoveAt(0);
+        long sec = ServerMetrics.MonoMillis() / 1000;
+        this.SampleSeriesSecondIfNeeded(sec);
+        MetricsShard shard = this.Shard();
+        lock (shard) {
+            shard.CountRequest(sec, status, us);
+            shard.FoldEndpoint(0 - 1, method, folded, us, status, this.reqAggCap);
+            if (us >= (long)this.slowReqMs * 1000) {
+                shard.slowReqs.Add(new SlowEntry(method + " " + path + " -> " + Convert.ToString(status), us));
+                if (shard.slowReqs.Count > this.ringCap) {
+                    shard.slowReqs.RemoveAt(0);
+                }
             }
         }
-        }
-    }
-
-    // lock.
-    void CountRequest(int status, long us) {
-        this.reqCount = this.reqCount + 1;
-        this.reqTotalUs = this.reqTotalUs + us;
-        if (us > this.reqMaxUs) { this.reqMaxUs = us; }
-        if (status >= 500) { this.reqErrors = this.reqErrors + 1; }
-        if (status >= 400) { this.reqFailed = this.reqFailed + 1; }
-        if (status == 429) { this.reqRejected = this.reqRejected + 1; }
-
-        int idx = this.SeriesSlot(ServerMetrics.MonoMicros() / 1000000);
-        this.sReq[idx] = this.sReq[idx] + 1;
-        this.sTotalUs[idx] = this.sTotalUs[idx] + us;
-        if (us > this.sMaxUs[idx]) { this.sMaxUs[idx] = us; }
-        if (status >= 500) { this.sErr[idx] = this.sErr[idx] + 1; }
-        int hb = idx * ServerMetrics.HIST_BINS + ServerMetrics.HistBin(us);
-        this.sHist[hb] = this.sHist[hb] + 1;
-    }
-
-    void FoldEndpoint(int slot, string method, string path, long us, int status) {
-        ReqAgg a = null;
-        if (slot >= 0) {
-            while (this.routeSlots.Count <= slot) { this.routeSlots.Add(null); }
-            a = this.routeSlots[slot];
-            if (a == null) {
-                a = new ReqAgg(method, path);
-                this.routeSlots[slot] = a;
-                this.AddAgg(a);
-            }
-        } else {
-            string key = method + " " + path;
-            if (!this.reqIdx.TryGetValue(key, out a)) {
-                if (this.reqAgg.Count >= this.reqAggCap) { return; }
-                a = new ReqAgg(method, path);
-                this.AddAgg(a);
-            }
-        }
-        a.count = a.count + 1;
-        a.totalUs = a.totalUs + us;
-        if (us > a.maxUs) { a.maxUs = us; }
-        if (status >= 500) { a.errors = a.errors + 1; }
-        if (status >= 400) { a.failed = a.failed + 1; }
-        if (status == 429) { a.rejected = a.rejected + 1; }
-    }
-
-    void AddAgg(ReqAgg a) {
-        this.reqAgg.Add(a);
-        string key = a.method + " " + a.path;
-        if (!this.reqIdx.ContainsKey(key)) { this.reqIdx.Add(key, a); }
     }
 
     private static bool IsAllDigits(string s) {
@@ -556,39 +691,11 @@ public class ServerMetrics {
     void RecordQuery(string sql, long us) {
         string norm = ServerMetrics.NormalizeSql(sql);
         if (norm.Length > 400) { norm = norm.Substring(0, 400); }
-        lock (this) {
-        this.queryCount = this.queryCount + 1;
-        this.queryTotalUs = this.queryTotalUs + us;
-        if (us > this.queryMaxUs) { this.queryMaxUs = us; }
-
-        int idx = this.SeriesSlot(ServerMetrics.MonoMicros() / 1000000);
-        this.sQuery[idx] = this.sQuery[idx] + 1;
-        this.sQueryUs[idx] = this.sQueryUs[idx] + us;
-
-        this.RecordSqlAgg(norm, us);
-
-        if (us >= (long)this.slowQueryMs * 1000) {
-            this.slowQueries.Add(new SlowEntry(norm, us));
-            if (this.slowQueries.Count > this.ringCap) {
-                this.slowQueries.RemoveAt(0);
-            }
-        }
-        }
-    }
-
-    // 慢 SQL 排行榜聚合统计项（规范化 SQL 语句、总次数、最大/平均耗时）。
-    void RecordSqlAgg(string norm, long us) {
-        lock (this) {
-        SqlAgg a = null;
-        if (!this.sqlIdx.TryGetValue(norm, out a)) {
-            if (this.sqlAgg.Count >= this.sqlAggCap) { return; }
-            a = new SqlAgg(norm);
-            this.sqlAgg.Add(a);
-            this.sqlIdx.Add(norm, a);
-        }
-        a.count = a.count + 1;
-        a.totalUs = a.totalUs + us;
-        if (us > a.maxUs) { a.maxUs = us; }
+        long sec = ServerMetrics.MonoMicros() / 1000000;
+        this.SampleSeriesSecondIfNeeded(sec);
+        MetricsShard shard = this.Shard();
+        lock (shard) {
+            shard.RecordQuery(sec, norm, us, this.sqlAggCap, this.slowQueryMs, this.ringCap);
         }
     }
 
@@ -682,8 +789,23 @@ public class ServerMetrics {
     public JsonValue TopSqlJson(int limit) {
         JsonValue outp = JsonValue.NewArray();
         List<SqlAgg> pool = new List<SqlAgg>();
-        lock (this) {
-            for (int k = 0; k < this.sqlAgg.Count; k = k + 1) { pool.Add(this.sqlAgg[k]); }
+        Dictionary<string, SqlAgg> merged = new Dictionary<string, SqlAgg>();
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            lock (shard) {
+                for (int k = 0; k < shard.sqlAgg.Count; k = k + 1) {
+                    SqlAgg src = shard.sqlAgg[k];
+                    SqlAgg dst = null;
+                    if (!merged.TryGetValue(src.sql, out dst)) {
+                        dst = new SqlAgg(src.sql);
+                        merged.Add(src.sql, dst);
+                        pool.Add(dst);
+                    }
+                    dst.count = dst.count + src.count;
+                    dst.totalUs = dst.totalUs + src.totalUs;
+                    if (src.maxUs > dst.maxUs) { dst.maxUs = src.maxUs; }
+                }
+            }
         }
         while (outp.Count() < limit && pool.Count > 0) {
             int best = 0;
@@ -706,9 +828,25 @@ public class ServerMetrics {
     public JsonValue TopReqJson(int limit) {
         JsonValue outp = JsonValue.NewArray();
         List<ReqAgg> pool = new List<ReqAgg>();
-        lock (this) {
-            for (int k = 0; k < this.reqAgg.Count; k = k + 1) {
-                pool.Add(this.reqAgg[k]);
+        Dictionary<string, ReqAgg> merged = new Dictionary<string, ReqAgg>();
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            lock (shard) {
+                for (int k = 0; k < shard.reqAgg.Count; k = k + 1) {
+                    ReqAgg src = shard.reqAgg[k];
+                    ReqAgg dst = null;
+                    if (!merged.TryGetValue(src.req, out dst)) {
+                        dst = new ReqAgg(src.method, src.path);
+                        merged.Add(src.req, dst);
+                        pool.Add(dst);
+                    }
+                    dst.count = dst.count + src.count;
+                    dst.totalUs = dst.totalUs + src.totalUs;
+                    if (src.maxUs > dst.maxUs) { dst.maxUs = src.maxUs; }
+                    dst.errors = dst.errors + src.errors;
+                    dst.failed = dst.failed + src.failed;
+                    dst.rejected = dst.rejected + src.rejected;
+                }
             }
         }
         while (outp.Count() < limit && pool.Count > 0) {
@@ -737,12 +875,15 @@ public class ServerMetrics {
     // 慢请求 ring 的 JSON 数组（{"req","us"}），按记录先后排列。
     public JsonValue SlowReqJson() {
         JsonValue outp = JsonValue.NewArray();
-        lock (this) {
-            foreach (SlowEntry e in this.slowReqs) {
-                JsonValue o = JsonValue.NewObject();
-                o.Put("req", ServerMetrics.DocStr(e.text));
-                o.Put("us", ServerMetrics.DocNum(e.us));
-                outp.Append(o);
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            lock (shard) {
+                foreach (SlowEntry e in shard.slowReqs) {
+                    JsonValue o = JsonValue.NewObject();
+                    o.Put("req", ServerMetrics.DocStr(e.text));
+                    o.Put("us", ServerMetrics.DocNum(e.us));
+                    outp.Append(o);
+                }
             }
         }
         return outp;
@@ -751,22 +892,25 @@ public class ServerMetrics {
     // 慢查询 ring 的 JSON 数组（{"sql","us"}），按记录先后排列。
     public JsonValue SlowQueryJson() {
         JsonValue outp = JsonValue.NewArray();
-        lock (this) {
-            foreach (SlowEntry e in this.slowQueries) {
-                JsonValue o = JsonValue.NewObject();
-                o.Put("sql", ServerMetrics.DocStr(e.text));
-                o.Put("us", ServerMetrics.DocNum(e.us));
-                outp.Append(o);
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            lock (shard) {
+                foreach (SlowEntry e in shard.slowQueries) {
+                    JsonValue o = JsonValue.NewObject();
+                    o.Put("sql", ServerMetrics.DocStr(e.text));
+                    o.Put("us", ServerMetrics.DocNum(e.us));
+                    outp.Append(o);
+                }
             }
         }
         return outp;
     }
 
-    long SeriesPercentile(int idx, int pct) {
-        int hbase = idx * ServerMetrics.HIST_BINS;
+    long SeriesPercentile(int[] hist, int k, long maxUs, int pct) {
+        int hbase = k * ServerMetrics.HIST_BINS;
         long total = 0;
         for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
-            total = total + this.sHist[hbase + b];
+            total = total + hist[hbase + b];
         }
         if (total == 0) { return 0; }
         long want = (total * (long)pct + 99) / 100;
@@ -774,19 +918,18 @@ public class ServerMetrics {
         if (want > total) { want = total; }
         long seen = 0;
         for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
-            seen = seen + this.sHist[hbase + b];
+            seen = seen + hist[hbase + b];
             if (seen >= want) {
-                if (b == ServerMetrics.HIST_BINS - 1) { return this.sMaxUs[idx]; }
+                if (b == ServerMetrics.HIST_BINS - 1) { return maxUs; }
                 long edge = ServerMetrics.HistEdge(b);
-                if (edge > this.sMaxUs[idx]) { return this.sMaxUs[idx]; }
+                if (edge > maxUs) { return maxUs; }
                 return edge;
             }
         }
-        return this.sMaxUs[idx];
+        return maxUs;
     }
 
     string SeriesJson(int seconds) {
-        lock (this) {
         int want = seconds;
         if (want <= 0) { want = 60; }
         if (want > this.seriesCap) { want = this.seriesCap; }
@@ -796,17 +939,66 @@ public class ServerMetrics {
         if (from < 0) { from = 0; }
         if (now < 0) { now = 0; }
         want = (int)(now - from + 1);
+
+        bool[] mLive = new bool[want];
+        int[] mReq = new int[want];
+        int[] mErr = new int[want];
+        long[] mTotalUs = new long[want];
+        long[] mMaxUs = new long[want];
+        int[] mQuery = new int[want];
+        long[] mQueryUs = new long[want];
+        int[] mHist = new int[want * ServerMetrics.HIST_BINS];
+        int[] mCpu = new int[want];
+        long[] mRss = new long[want];
+        for (int k = 0; k < want; k = k + 1) {
+            mCpu[k] = 0 - 1;
+            mRss[k] = 0 - 1;
+        }
+
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            lock (shard) {
+                for (int k = 0; k < want; k = k + 1) {
+                    long sec = from + (long)k;
+                    int idx = (int)(sec % (long)this.seriesCap);
+                    if (shard.sSec[idx] == sec) {
+                        mLive[k] = true;
+                        mReq[k] = mReq[k] + shard.sReq[idx];
+                        mErr[k] = mErr[k] + shard.sErr[idx];
+                        mTotalUs[k] = mTotalUs[k] + shard.sTotalUs[idx];
+                        if (shard.sMaxUs[idx] > mMaxUs[k]) { mMaxUs[k] = shard.sMaxUs[idx]; }
+                        mQuery[k] = mQuery[k] + shard.sQuery[idx];
+                        mQueryUs[k] = mQueryUs[k] + shard.sQueryUs[idx];
+                        int sBase = idx * ServerMetrics.HIST_BINS;
+                        int mBase = k * ServerMetrics.HIST_BINS;
+                        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+                            mHist[mBase + b] = mHist[mBase + b] + shard.sHist[sBase + b];
+                        }
+                    }
+                }
+            }
+        }
+
+        lock (this.sampleLock) {
+            for (int k = 0; k < want; k = k + 1) {
+                long sec = from + (long)k;
+                int idx = (int)(sec % (long)this.seriesCap);
+                if (this.sSampleSec[idx] == sec) {
+                    mCpu[k] = this.sCpu[idx];
+                    mRss[k] = this.sRss[idx];
+                }
+            }
+        }
+
         int lastCpu = 0 - 1;
         long lastRss = 0 - 1;
-
         StringBuilder sb = new StringBuilder();
         sb.Append("{\"step_ms\":1000,\"count\":");
         sb.Append(Convert.ToString(want));
         sb.Append(",\"points\":[");
-        for (long sec = from; sec <= now; sec = sec + 1) {
-            if (sec > from) { sb.Append(","); }
-            int idx = (int)(sec % (long)this.seriesCap);
-            bool live = this.sSec[idx] == sec;
+        for (int k = 0; k < want; k = k + 1) {
+            long sec = from + (long)k;
+            if (k > 0) { sb.Append(","); }
             long req = 0;
             long err = 0;
             long avg = 0;
@@ -814,16 +1006,16 @@ public class ServerMetrics {
             long max = 0;
             long q = 0;
             long qavg = 0;
-            if (live) {
-                req = this.sReq[idx];
-                err = this.sErr[idx];
-                if (this.sReq[idx] > 0) { avg = this.sTotalUs[idx] / this.sReq[idx]; }
-                p95 = this.SeriesPercentile(idx, 95);
-                max = this.sMaxUs[idx];
-                q = this.sQuery[idx];
-                if (this.sQuery[idx] > 0) { qavg = this.sQueryUs[idx] / this.sQuery[idx]; }
-                if (this.sCpu[idx] >= 0) { lastCpu = this.sCpu[idx]; }
-                if (this.sRss[idx] >= 0) { lastRss = this.sRss[idx]; }
+            if (mLive[k]) {
+                req = mReq[k];
+                err = mErr[k];
+                if (mReq[k] > 0) { avg = mTotalUs[k] / mReq[k]; }
+                p95 = this.SeriesPercentile(mHist, k, mMaxUs[k], 95);
+                max = mMaxUs[k];
+                q = mQuery[k];
+                if (mQuery[k] > 0) { qavg = mQueryUs[k] / mQuery[k]; }
+                if (mCpu[k] >= 0) { lastCpu = mCpu[k]; }
+                if (mRss[k] >= 0) { lastRss = mRss[k]; }
             }
             sb.Append("{\"t\":");
             sb.Append(Convert.ToString(sec - now));  // seconds ago, 0 = now
@@ -849,7 +1041,6 @@ public class ServerMetrics {
         }
         sb.Append("]}");
         return sb.ToString();
-        }
     }
 
     static int CpuWindowMs = 200;
@@ -865,55 +1056,94 @@ public class ServerMetrics {
     // 生成本进程的指标快照 JSON（/admin/stats 形状）：uptime、CPU/内存、
     // 请求与查询计数、并发与流负载、慢操作列表和 top SQL/端点排行。
     public string SnapshotJson() {
-        lock (this) {
         long nowWall = ServerMetrics.MonoMillis();
         long cpuMs = ServerMetrics.CpuMillis();
         long uptime = nowWall - this.startMillis;
-
-        long cpuPct = this.lastCpuPct;
-        if (cpuMs >= 0) {
-            long dWall = nowWall - this.lastWallMs;
-            if (dWall >= (long)ServerMetrics.CpuWindowMs) {
-                cpuPct = ((cpuMs - this.lastCpuMs) * 100) / dWall;
-                this.lastWallMs = nowWall;
-                this.lastCpuMs = cpuMs;
-                this.lastCpuPct = cpuPct;
+        long cpuPct;
+        lock (this.snapshotLock) {
+            cpuPct = this.lastCpuPct;
+            if (cpuMs >= 0) {
+                long dWall = nowWall - this.lastWallMs;
+                if (dWall >= (long)ServerMetrics.CpuWindowMs) {
+                    cpuPct = ((cpuMs - this.lastCpuMs) * 100) / dWall;
+                    this.lastWallMs = nowWall;
+                    this.lastCpuMs = cpuMs;
+                    this.lastCpuPct = cpuPct;
+                }
             }
         }
 
+        long totReq = 0;
+        long totReqErr = 0;
+        long totReqFail = 0;
+        long totReqRej = 0;
+        long totReqUnmatched = 0;
+        long totReqUs = 0;
+        long maxReqUs = 0;
+        int slowReqCnt = 0;
+        long totQ = 0;
+        long totQUs = 0;
+        long maxQUs = 0;
+        int slowQCnt = 0;
+        long shardConc = 0;
+        long shardPeak = 0;
+        for (int s = 0; s < ServerMetrics.SHARD_COUNT; s = s + 1) {
+            MetricsShard shard = this.shards[s];
+            shardConc = shardConc + shard.concurrent.Load();
+            shardPeak = shardPeak + shard.concurrentPeak.Load();
+            lock (shard) {
+                totReq = totReq + shard.reqCount;
+                totReqErr = totReqErr + shard.reqErrors;
+                totReqFail = totReqFail + shard.reqFailed;
+                totReqRej = totReqRej + shard.reqRejected;
+                totReqUnmatched = totReqUnmatched + shard.reqUnmatched;
+                totReqUs = totReqUs + shard.reqTotalUs;
+                if (shard.reqMaxUs > maxReqUs) { maxReqUs = shard.reqMaxUs; }
+                slowReqCnt = slowReqCnt + shard.slowReqs.Count;
+                totQ = totQ + shard.queryCount;
+                totQUs = totQUs + shard.queryTotalUs;
+                if (shard.queryMaxUs > maxQUs) { maxQUs = shard.queryMaxUs; }
+                slowQCnt = slowQCnt + shard.slowQueries.Count;
+            }
+        }
+        long concTotal = this.concurrent.Load() + shardConc;
+        if (concTotal < 0) { concTotal = 0; }
+        long concPeakTotal = this.concurrentPeak.Load();
+        if (shardPeak > concPeakTotal) { concPeakTotal = shardPeak; }
+
         long reqAvg = 0;
-        if (this.reqCount > 0) { reqAvg = this.reqTotalUs / this.reqCount; }
+        if (totReq > 0) { reqAvg = totReqUs / totReq; }
         long qAvg = 0;
-        if (this.queryCount > 0) { qAvg = this.queryTotalUs / this.queryCount; }
+        if (totQ > 0) { qAvg = totQUs / totQ; }
 
         JsonValue requests = JsonValue.NewObject();
-        requests.Put("count", ServerMetrics.DocNum(this.reqCount));
-        requests.Put("errors", ServerMetrics.DocNum(this.reqErrors));
-        requests.Put("failed", ServerMetrics.DocNum(this.reqFailed));
-        requests.Put("rejected", ServerMetrics.DocNum(this.reqRejected));
-        requests.Put("unmatched", ServerMetrics.DocNum(this.reqUnmatched));
-        requests.Put("total_us", ServerMetrics.DocNum(this.reqTotalUs));
+        requests.Put("count", ServerMetrics.DocNum(totReq));
+        requests.Put("errors", ServerMetrics.DocNum(totReqErr));
+        requests.Put("failed", ServerMetrics.DocNum(totReqFail));
+        requests.Put("rejected", ServerMetrics.DocNum(totReqRej));
+        requests.Put("unmatched", ServerMetrics.DocNum(totReqUnmatched));
+        requests.Put("total_us", ServerMetrics.DocNum(totReqUs));
         requests.Put("avg_us", ServerMetrics.DocNum(reqAvg));
-        requests.Put("max_us", ServerMetrics.DocNum(this.reqMaxUs));
+        requests.Put("max_us", ServerMetrics.DocNum(maxReqUs));
         requests.Put("slow_threshold_us",
             ServerMetrics.DocNum((long)this.slowReqMs * 1000));
-        requests.Put("slow_count", ServerMetrics.DocNum(this.slowReqs.Count));
+        requests.Put("slow_count", ServerMetrics.DocNum(slowReqCnt));
 
         JsonValue queries = JsonValue.NewObject();
-        queries.Put("count", ServerMetrics.DocNum(this.queryCount));
-        queries.Put("total_us", ServerMetrics.DocNum(this.queryTotalUs));
+        queries.Put("count", ServerMetrics.DocNum(totQ));
+        queries.Put("total_us", ServerMetrics.DocNum(totQUs));
         queries.Put("avg_us", ServerMetrics.DocNum(qAvg));
-        queries.Put("max_us", ServerMetrics.DocNum(this.queryMaxUs));
+        queries.Put("max_us", ServerMetrics.DocNum(maxQUs));
         queries.Put("slow_threshold_us",
             ServerMetrics.DocNum((long)this.slowQueryMs * 1000));
-        queries.Put("slow_count", ServerMetrics.DocNum(this.slowQueries.Count));
+        queries.Put("slow_count", ServerMetrics.DocNum(slowQCnt));
 
         JsonValue load = JsonValue.NewObject();
-        load.Put("concurrent", ServerMetrics.DocNum(this.concurrent));
-        load.Put("peak", ServerMetrics.DocNum(this.concurrentPeak));
-        load.Put("streams", ServerMetrics.DocNum(this.streams));
-        load.Put("stream_frames", ServerMetrics.DocNum(this.streamFrames));
-        load.Put("stream_bytes", ServerMetrics.DocNum(this.streamBytes));
+        load.Put("concurrent", ServerMetrics.DocNum(concTotal));
+        load.Put("peak", ServerMetrics.DocNum(concPeakTotal));
+        load.Put("streams", ServerMetrics.DocNum(this.streams.Load()));
+        load.Put("stream_frames", ServerMetrics.DocNum(this.streamFrames.Load()));
+        load.Put("stream_bytes", ServerMetrics.DocNum(this.streamBytes.Load()));
 
         JsonValue o = JsonValue.NewObject();
         o.Put("uptime_ms", ServerMetrics.DocNum(uptime));
@@ -930,6 +1160,5 @@ public class ServerMetrics {
         o.Put("top_sql", this.TopSqlJson(20));
         o.Put("top_requests", this.TopReqJson(20));
         return o.ToJson();
-        }
     }
 }

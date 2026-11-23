@@ -6,6 +6,33 @@ JSON 契约层（纯 Zan，无原生依赖）。基础 JSON（`JsonValue` / `Jso
 
 `using System.Json;` 按需拉入——基础 JSON 与高级契约统一在此命名空间。
 
+## 实体与动态数据
+
+已知结构使用 `Json.Deserialize<T>` 和 `Json.Serialize<T>`。绑定会复用类型的字段映射，并在解析工作区内填充实体。`JsonWriter.WriteEntity<T>` 使用同一映射，适合在一个对象或数组中直接写入实体。
+
+只读动态数据使用 `JsonDoc`。数组可用 `FirstChild`、`NextSibling` 按顺序遍历。对象用 `FirstProperty`、`NextProperty` 遍历属性，`PropertyValue` 读取值槽位，`PropertyName` 返回可独立保存的键名，`PropertyNameView` 返回借用视图。属性枚举保留输入顺序和重复键，键视图只在文档及底层缓冲有效期间使用。修改树时使用 `JsonValue`。
+
+反复查找同一个宽对象的属性时，用 `IndexObject` 建一次索引，再用 `Get` 按键取得值槽位。`IndexObject` 对非对象或无效槽位返回 `null`。索引查找命中第一个同名属性，缺失时返回 `-1`。
+
+```zan
+JsonObjectIndex index = doc.IndexObject(doc.root);
+if (index != null) {
+    int count = doc.IntAt(index.Get("count"), 0);
+}
+```
+
+索引复用文档的键与槽位。使用期间保持属性表、键字节和槽位布局稳定，包括 `ParseBytes` 借用的源字节。作用域文档的索引在同一回调内使用。只查少量键时可直接调用 `JsonDoc.Get`，遍历全部属性时可使用属性游标。
+
+含大量转义字符串且只读取少量字段时，可以用 `JsonDoc.ParseScopedDeferred`。
+
+```zan
+int count = JsonDoc.ParseScopedDeferred<int>(json, (doc) => doc.PathInt("count", 0));
+```
+
+解析器在回调前校验全部输入，并立即解码转义键。带转义的字符串值在首次访问时解码并缓存。请在调用线程的同步回调内通过 `JsonDoc` 访问器读取，文档和 `StringView` 的有效期都限于该回调。需要带出文本时，返回 `StrAt` 或 `PathStr` 得到的 `string`。`Count` 用于数组和对象，按需模式的原始槽会在访问时更新，`escPool` 按键的解析顺序和值的首次读取顺序填充。需要读取大部分字符串时，可使用即时解码的 `JsonDoc.ParseScoped`。
+
+`MaxValueDepth()` 返回解析时最深值的深度，根值深度为 0。 作用域解析为最多 4 MiB 的源文本复用缓冲，超出时使用本次调用独占的缓冲。
+
 ## 文件
 
 | 文件 | 内容 |

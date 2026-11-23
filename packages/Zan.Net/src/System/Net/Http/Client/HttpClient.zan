@@ -323,17 +323,21 @@ public partial class HttpClient : IDisposable {
         return HttpClient.CopyCallPolicy(this.callPolicy);
     }
 
+    // 策略目标是否允许连接（调用前假定安全状态已冻结或由调用方按需冻结）。
+    private bool IsTargetPolicyAllowed() {
+        if (this.callPolicy == null) { return true; }
+        return ExternalTargetPolicy.IsClientAllowed(this.host, this.port,
+            this.useTls, this.callPolicy.AllowsLoopback(),
+            this.callPolicy.AllowsHttp(), this.callPolicy.LocalHttpOnly());
+    }
+
     // 绑定 policy 后，目标必须在建连前通过同一个 URL/地址策略；
     // 这样图片、下载、上传和 AI 即使误用了裸 host API，也不会绕过
     // ExternalTargetPolicy。DNS 多地址复核仍由 socket 层继续补齐。
     // 不允许时抛 HttpRequestException。
     private void CheckTargetPolicy() {
         this.FreezeSecurity();
-        if (this.callPolicy == null) { return; }
-        bool ok = ExternalTargetPolicy.IsClientAllowed(this.host, this.port,
-            this.useTls, this.callPolicy.AllowsLoopback(),
-            this.callPolicy.AllowsHttp(), this.callPolicy.LocalHttpOnly());
-        if (!ok) {
+        if (!this.IsTargetPolicyAllowed()) {
             throw new HttpRequestException("external target is not allowed: "
                 + this.host + ":" + Convert.ToString(this.port));
         }
@@ -509,17 +513,27 @@ public partial class HttpClient : IDisposable {
         return false;
     }
 
-    // 将 <paramref name="hay"/> 的前 <paramref name="n"/> 个字节与 <paramref name="name"/> 做
-    // ASCII 大小写不敏感的相等比较。
-    private static bool AsciiNameEquals(string hay, string name, int n) {
+    // 将 <paramref name="hay"/> 从 <paramref name="offset"/> 起的 <paramref name="n"/> 个字节与
+    // <paramref name="name"/> 做 ASCII 大小写不敏感的相等比较（零 Substring 分配）。
+    private static bool AsciiNameEqualsAt(string hay, int offset, string name, int n) {
+        if (hay == null || name == null || offset < 0 || n < 0
+            || offset + n > hay.Length || n > name.Length) {
+            return false;
+        }
         for (int i = 0; i < n; i = i + 1) {
-            int a = hay[i] & 255;
+            int a = hay[offset + i] & 255;
             int b = name[i] & 255;
             if (a >= 65 && a <= 90) { a = a + 32; }
             if (b >= 65 && b <= 90) { b = b + 32; }
             if (a != b) { return false; }
         }
         return true;
+    }
+
+    // 将 <paramref name="hay"/> 的前 <paramref name="n"/> 个字节与 <paramref name="name"/> 做
+    // ASCII 大小写不敏感的相等比较。
+    private static bool AsciiNameEquals(string hay, string name, int n) {
+        return HttpClient.AsciiNameEqualsAt(hay, 0, name, n);
     }
 
     // 构建原始 HTTP/1.1 请求文本。<paramref name="close"/> 选择帧结构：

@@ -30,16 +30,38 @@ public class RolesController : AdminController {
             .OrderBy(a => a.rank).Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         List<StrMap> items = d.AddList("rows");
         Rows.Project(rows, items);
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            int perms = await this.SysRoleGrant
-                .Where(a => a.roleId == rows[i].id).CountAsync();
-            int users = await this.SysUserRole
-                .Where(a => a.roleId == rows[i].id).CountAsync();
-            items[i].Set("perms", Convert.ToString(perms));
-            items[i].Set("users", Convert.ToString(users));
+        if (rows.Count > 0) {
+            List<int> ids = new List<int>();
+            for (int i = 0; i < rows.Count; i = i + 1) { ids.Add(rows[i].id); }
+
+            IDbConnection db = this.Held();
+            Dictionary<int, int> permCounts = await CountByRole(db.Select<SysRoleGrant>().inner, ids);
+            Dictionary<int, int> userCounts = await CountByRole(db.Select<SysUserRole>().inner, ids);
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int id = rows[i].id;
+                int perms = 0;
+                int users = 0;
+                permCounts.TryGetValue(id, out perms);
+                userCounts.TryGetValue(id, out users);
+                items[i].Set("perms", Convert.ToString(perms));
+                items[i].Set("users", Convert.ToString(users));
+            }
         }
         this.Pager(d, q, total);
         this.Page(d);
+    }
+
+    private static async Dictionary<int, int> CountByRole(Select query, List<int> ids) {
+        query.WhereIn("roleId", ids);
+        string key = query.RequireCol("roleId");
+        query.GroupBy(key);
+        DbResult groups = await query.AggRAsync(key + ", COUNT(" + key + ")");
+        Dictionary<int, int> counts = new Dictionary<int, int>();
+        if (groups == null) { return counts; }
+        for (int i = 0; i < groups.RowCount(); i = i + 1) {
+            counts[groups.GetInt(i, 0)] = groups.GetInt(i, 1);
+        }
+        return counts;
     }
 
     [HttpGet]
@@ -67,13 +89,13 @@ public class RolesController : AdminController {
             d.Set("status1", "");
             if (r.status == 1) { d.Set("status1", "selected"); }
             else { d.Set("status0", "selected"); }
-            if (r.dataScope > 0) { scope = r.dataScope; }
+            scope = r.dataScope;
+            if (scope < DataScope.RoleAll || scope > DataScope.RoleCustom) { scope = DataScope.RoleSelf; }
             picked = Fmt.Text(r.scopeDepts, "");
         }
         /* 数据范围与自定义选项所指的部门；勾选框总是渲染，模板只在该选项选中时显示。 */
         d.Set("scope" + Convert.ToString(scope), "selected");
-        List<SysDepartment> depts = await this.SysDepartment
-            .OrderBy(a => a.sortOrder).ToListAsync();
+        List<SysDepartment> depts = await this.SysDepartment.OrderBy(a => a.sortOrder).ToListAsync();
         List<StrMap> opts = d.AddList("depts");
         for (int i = 0; i < depts.Count; i = i + 1) {
             StrMap o = new StrMap();
@@ -101,9 +123,10 @@ public class RolesController : AdminController {
         int status = this.InInt("status", 1);
         string description = this.In("description");
         if (status != 1) { status = 0; }
-        int dataScope = this.InInt("dataScope", DataScope.RoleAll);
+        int dataScope = this.InInt("dataScope", 0);
         if (dataScope < DataScope.RoleAll || dataScope > DataScope.RoleCustom) {
-            dataScope = DataScope.RoleAll;
+            this.Fail(400, Codes.BadInput, "请选择有效的数据权限范围");
+            return;
         }
         /* 仅自定义保留部门列表，切离不会留下后续重用的旧集。 */
         string scopeDepts = "";
@@ -152,9 +175,11 @@ public class RolesController : AdminController {
             this.Fail(400, Codes.Conflict, "还有 " + Convert.ToString(held)
                 + " 个账号在使用该角色，请先解除分配");
         }
+        if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
         int n = await this.SysRole.Delete().Where(a => a.id == id).ExecuteAffrowsAsync();
         int _g = await this.SysRoleGrant.Delete().Where(a => a.roleId == id)
             .ExecuteAffrowsAsync();
+        await this.Commit();
         await this.RefreshRoles();
         await this.Note("删除角色", r.code, n > 0, "");
         this.Saved("角色已删除");
@@ -209,6 +234,7 @@ public class RolesController : AdminController {
         int id = this.InInt("id", 0);
         SysRole r = await this.Find(id);
         string picked = this.In("permIds");
+        if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
         int _cleared = await this.SysRoleGrant.Delete()
             .Where(a => a.roleId == id).ExecuteAffrowsAsync();
 
@@ -235,9 +261,11 @@ public class RolesController : AdminController {
             g.action = screen;
             g.mask = mask;
             g.createdAt = now;
-            int _n = await this.SysRoleGrant.Insert(g).ExecuteIdentityAsync();
+            int inserted = await this.SysRoleGrant.Insert(g).ExecuteAffrowsAsync();
+            if (inserted != 1) { throw new Exception("role grant was not saved"); }
             granted = granted + 1;
         }
+        await this.Commit();
         await this.RefreshRoles();
         await this.Note("角色授权", r.code, true,
             Convert.ToString(granted) + " 项权限");
@@ -245,9 +273,7 @@ public class RolesController : AdminController {
     }
 
     private async void RefreshRoles() {
-        List<SysRole> roles = await this.SysRole.ToListAsync();
-        List<SysRoleGrant> grants = await this.SysRoleGrant.ToListAsync();
-        await AuthUser.RolesChanged(roles, grants);
+        await AuthUser.RolesChanged(this.Held());
     }
 
     private async SysRole Find(int id) {
@@ -256,9 +282,9 @@ public class RolesController : AdminController {
         return r;
     }
 
-    /* 提交的部门存作 ",3,7,"；只保留存在的——与 GrantSave 仅保留存在的动作同理，防止伪造字段把不可见部门 id 写进 scope。 */
+    /* 提交的部门存作 ",3,7,"；只保留存在的——防止伪造部门 id 写进 scope。 */
     private async string ScopeDepts(string picked) {
-        List<SysDepartment> all = await this.SysDepartment.ToListAsync();
+        List<SysDepartment> all = await this.SysDepartment.All();
         StringBuilder outp = new StringBuilder();
         outp.Append(",");
         int kept = 0;

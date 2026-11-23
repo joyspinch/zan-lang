@@ -6,12 +6,7 @@ using System.Interop;
 
 namespace System.Data.ZanDb;
 
-// 刀15 企业级多引擎高并发列式向量表引擎（VectorTable）：
-// 1. 物理层：定长扁平二进制文件（.zvec）O(1) 绝对寻址（offset = 32 + (id-1)*dims*4）；
-// 2. 写入层：Add / AddBulk 极速写盘 + 增量缓冲（appendBuf），微秒级释放排他写锁，彻底告别前台假死；
-// 3. 检索层：不可变 HNSW 快照 + appendBuf 旁路扫描双路 Top-K 堆融合，100% Read-Your-Writes（立即可查零等待）；
-// 4. 契约层：Remove 采用墓碑标记，物理槽位永不前移，业务外部关联 ID 绝对稳定不变；
-// 5. 运维层：Flush / Checkpoint / Backup 自动将增量缓冲收口并固化 .zhnsw 快照。
+// 列式向量表：.zvec 定长按 ID 寻址 + appendBuf 增量双路检索 + 墓碑软删 + .zhnsw 快照。
 public class VectorTable : IDisposable {
     public static string MAGIC_VEC = "ZVEC";
     public static string MAGIC_HNSW = "ZHNS";
@@ -150,17 +145,22 @@ public class VectorTable : IDisposable {
         return vt;
     }
 
+    private static ByteBuffer BuildVecHeader(int dims, int metric, long total, long active) {
+        ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
+        h.WriteU8(90); h.WriteU8(86); h.WriteU8(69); h.WriteU8(67); // "ZVEC"
+        h.WriteU32((long)VERSION);
+        h.WriteU32((long)dims);
+        h.WriteU32((long)metric);
+        h.WriteU64(total);
+        h.WriteU64(active);
+        return h;
+    }
+
     // 写入头部元数据（持写锁或初始化时调用）
     public void WriteHeaderLocked(long total, long active) {
         this.totalRows = (int)total;
         this.activeRows = (int)active;
-        ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
-        h.WriteU8(90); h.WriteU8(86); h.WriteU8(69); h.WriteU8(67); // "ZVEC"
-        h.WriteU32((long)VERSION);
-        h.WriteU32((long)this.options.dimensions);
-        h.WriteU32((long)this.options.metric);
-        h.WriteU64(total);
-        h.WriteU64(active);
+        ByteBuffer h = VectorTable.BuildVecHeader(this.options.dimensions, this.options.metric, total, active);
         Mutex.Lock(this.ioMtx);
         try {
             this.file.WriteAt(0, h.Raw(), HEADER_SIZE);
@@ -206,8 +206,6 @@ public class VectorTable : IDisposable {
         finally { this.tlock.ExitRead(); }
     }
 
-    // 追加单条向量：返回新分配的自增 id（从 1 开始）。
-    // 瞬时追加写盘并进入 appendBuf，微秒级释放排他写锁（彻底消除前台假死）。
     public int Add(float[] vector) {
         this.tlock.EnterWrite();
         try {
@@ -231,9 +229,6 @@ public class VectorTable : IDisposable {
         } finally { this.tlock.ExitWrite(); }
     }
 
-    // 高吞吐批量直插（企业级高吞吐非阻塞物理通道）：
-    // 纯二进制列存批量顺序写盘 + 增量缓冲入队，微秒~毫秒级极速释放写锁（彻底消除前台假死）。
-    // 增量数据由 Search 自动双路实时融合（100% Read-Your-Writes），可在空闲时由 CatchUpIndex 集中建图。
     public void AddBulk(List<float[]> vectors, out int firstId) {
         this.AddBulk(vectors, out firstId, true);
     }
@@ -345,7 +340,7 @@ public class VectorTable : IDisposable {
             if (!this.IsOpen() || id < 1 || id > this.totalRows) { return; }
             if (this.tombstones.ContainsKey(id)) { return; }
             this.tombstones[id] = true;
-            if (this.index != null && this.index.idSlots.ContainsKey(id)) {
+            if (this.index != null) {
                 this.index.Remove(id);
             }
             int newActive = this.totalRows - this.tombstones.Count;
@@ -355,7 +350,6 @@ public class VectorTable : IDisposable {
         } finally { this.tlock.ExitWrite(); }
     }
 
-    // 物理空洞整理：将活性向量紧凑重写到新 .zvec 文件，并重构纯净 HNSW 索引
     public void Vacuum() {
         this.tlock.EnterWrite();
         try {
@@ -363,7 +357,7 @@ public class VectorTable : IDisposable {
             this.CatchUpIndexLocked();
             if (this.tombstones.Count == 0 && this.activeRows == this.totalRows) { return; }
             string tmpVec = this.vecPath + ".vac.tmp";
-            if (File.Exists(tmpVec)) { File.Delete(tmpVec); }
+            File.Delete(tmpVec);
 
             PageFile newFile = PageFile.Open(tmpVec);
             if (!newFile.IsOpen()) { return; }
@@ -372,34 +366,29 @@ public class VectorTable : IDisposable {
             int bytesPerVec = dims * 4;
             long newTotal = (long)this.activeRows;
 
-            // 写入头部
-            ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
-            h.WriteU8(90); h.WriteU8(86); h.WriteU8(69); h.WriteU8(67);
-            h.WriteU32((long)VERSION);
-            h.WriteU32((long)dims);
-            h.WriteU32((long)this.options.metric);
-            h.WriteU64(newTotal);
-            h.WriteU64(newTotal);
+            ByteBuffer h = VectorTable.BuildVecHeader(dims, this.options.metric, newTotal, newTotal);
             newFile.WriteAt(0, h.Raw(), HEADER_SIZE);
             h.Free();
 
             VectorIndex newIndex = new VectorIndex(this.options);
             int newId = 1;
+            float[] scratchVec = new float[dims];
             for (int oldId = 1; oldId <= this.totalRows; oldId = oldId + 1) {
                 if (!this.tombstones.ContainsKey(oldId)) {
-                    long offset = (long)HEADER_SIZE + (long)(oldId - 1) * (long)dims * 4L;
-                    float[] v = new float[dims];
+                    long offset = (long)HEADER_SIZE + (long)(oldId - 1) * (long)bytesPerVec;
                     int got = 0;
                     Mutex.Lock(this.ioMtx);
                     try {
-                        got = this.file.ReadRaw(offset, (nint)v, dims * 4);
+                        got = this.file.ReadRaw(offset, (nint)scratchVec, bytesPerVec);
                     } finally {
                         Mutex.Unlock(this.ioMtx);
                     }
-                    if (got == dims * 4) {
+                    if (got == bytesPerVec) {
                         long off = (long)HEADER_SIZE + (long)(newId - 1) * (long)bytesPerVec;
-                        newFile.WriteAt(off, (nint)v, bytesPerVec);
-                        newIndex.Add(newId, v);
+                        newFile.WriteAt(off, (nint)scratchVec, bytesPerVec);
+                        float[] copy = new float[dims];
+                        NativeMemory.Copy((nint)copy, (nint)scratchVec, bytesPerVec);
+                        newIndex.Add(newId, copy);
                         newId = newId + 1;
                     }
                 }
@@ -609,11 +598,9 @@ public class VectorTable : IDisposable {
             if (File.Exists(this.hnswPath)) { File.Delete(this.hnswPath); }
             File.Move(tmpPath, this.hnswPath);
         } catch (Exception _ex) {
-            // 快照写入中断异常：关闭文件句柄并清理临时中间文件
+            this.lastError = "hnsw snapshot write failed: " + _ex.Message;
             snapFile.Close();
-            if (File.Exists(tmpPath)) {
-                try { File.Delete(tmpPath); } catch (Exception _delEx) {}
-            }
+            File.Delete(tmpPath);
         }
     }
 

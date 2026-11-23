@@ -12,7 +12,8 @@ using System;
 
 namespace System.Web;
 
-public class WebApp : IDisposable {
+// Web 应用服务器核心：配置项、共享内存表初始化、路由注册、生命周期与状态快照。
+public partial class WebApp : IDisposable {
     private string host;
     private int port;
     private bool running;
@@ -29,7 +30,15 @@ public class WebApp : IDisposable {
     private LockManager locks;
     private AuthFn authResolver;
     private PermissionFn permissionResolver;
+    private ScopedPermissionFn scopedPermissionResolver;
     private ServerMetrics metrics;
+    private RequestProfiler requestProfiler;
+    private bool profileRequestResources;
+    private bool profileRequestExecution;
+    private bool profileRequestStages;
+    private RequestDiagnosticsHandler requestDiagnostics;
+    private int requestDiagnosticEvery;
+    private AtomicInt requestDiagnosticSequence;
     private LlmsTxt llmsTxt;
     private RobotsTxt robotsTxt;
     private Sitemap sitemap;
@@ -49,30 +58,32 @@ public class WebApp : IDisposable {
     private string certFile;
     private string keyFile;
 
-    // 内存请求体上限（字节），超出回答 413。
-    private int maxBodyBytes;  // in-memory request body cap (413 above this)
-    // 流式上传上限（字节），只作用于 [Upload] 路由。
-    private int maxUploadBytes;  // streaming upload cap for .Upload() routes
-    private int requestTimeoutMs;  // per-request deadline: a connection that stops
-    // 并发连接上限（0 = 不设上限；超限回答 503 并关闭）。
-    private int maxConnections;  // concurrent connections served at once (0 = no cap)
-    private string uploadDir;  // where streamed uploads land
-    // 进程内全局连接统计原子计数器。
+    private int maxBodyBytes;
+    private int maxUploadBytes;
+    private int requestTimeoutMs;
+    private int maxConnections;
+    private string uploadDir;
     private AtomicInt uploadSeq;
     private string loginPath;
-    // 全局每秒请求上限（0 = 不限；超限 429）。
-    private int globalLimit;  // requests/sec across all routes (0 = unlimited)
-    private AtomicInt totalRequests;
+    private string sessionCookie;
+    private string authHeader;
+    private string authScheme;
+    private string apiPrefix;
+    private List<string> extraApiPrefixes;
+    private string[] customErrorBodies;
+    private int globalLimit;
+    private AtomicInt[] totalRequestsShards;
     private AtomicInt activeConnections;
     private bool reusePort;
 
-    // 当前进程单例应用实例句柄，供 Worker 底层连接回调分发。
     private static WebApp active;
+    private static string[] defaultErrorBodies;
 
-    // 构造应用服务器并填入默认配置：请求体上限 2MB、流式上传上限
-    // 512MB、请求超时 30s、并发连接上限 10000、上传目录 uploads；
-    // 共享表（限流/锁/路由统计）由 InitShared 在派生 worker 之前创建，
-    // 不在这里。
+    private static const string ShareRate = "WEB_RATE";
+    private static const string ShareLock = "WEB_LOCK";
+    private static const string ShareRoute = "WEB_ROUTE";
+    private static const string ShareRouteTable = "WEB_ROUTE_TABLE";
+
     public WebApp(string host, int port) {
         this.host = host;
         this.port = port;
@@ -87,6 +98,14 @@ public class WebApp : IDisposable {
         this.authResolver = null;
         this.permissionResolver = null;
         this.metrics = ServerMetrics.Global();
+        int profileCapacity = Filter.ToInt(Environment.GetEnvironmentVariable("ZAN_REQUEST_PROFILE_CAPACITY"), 0);
+        if (profileCapacity > 0) { this.requestProfiler = new RequestProfiler(profileCapacity); }
+        this.profileRequestResources = Environment.GetEnvironmentVariable("ZAN_REQUEST_PROFILE_RESOURCES") == "1";
+        this.profileRequestExecution = this.profileRequestResources && OperatingSystem.IsWindows()
+            && Environment.GetEnvironmentVariable("ZAN_REQUEST_PROFILE_EXECUTION") == "1";
+        this.profileRequestStages = this.profileRequestResources
+            && Environment.GetEnvironmentVariable("ZAN_REQUEST_PROFILE_STAGES") == "1";
+        if (this.profileRequestResources) { RequestTrace.EnableResources(); }
         this.maxBodyBytes = HttpLimits.DefaultMaxBodyBytes;
         this.maxUploadBytes = HttpLimits.DefaultMaxUploadBytes;
         this.requestTimeoutMs = HttpLimits.DefaultTimeoutMs;
@@ -94,11 +113,19 @@ public class WebApp : IDisposable {
         this.uploadDir = HttpLimits.DefaultUploadDir;
         this.uploadSeq = new AtomicInt(0);
         this.loginPath = "";
+        this.sessionCookie = HttpLimits.DefaultSessionCookie;
+        this.authHeader = HttpLimits.DefaultAuthHeader;
+        this.authScheme = HttpLimits.DefaultAuthScheme;
+        this.apiPrefix = HttpLimits.DefaultApiPrefix;
+        this.extraApiPrefixes = null;
+        this.customErrorBodies = null;
         this.globalLimit = 0;
-        this.totalRequests = new AtomicInt(0);
+        this.totalRequestsShards = new AtomicInt[16];
+        for (int i = 0; i < 16; i = i + 1) {
+            this.totalRequestsShards[i] = new AtomicInt(0);
+        }
         this.activeConnections = new AtomicInt(0);
         this.reusePort = false;
-        // 共享内存表在 Worker 派生前由 InitShared 创建。
         this.limiter = null;
         this.locks = null;
         this.sitemapMounted = false;
@@ -113,43 +140,27 @@ public class WebApp : IDisposable {
         this.keyFile = "";
     }
 
-    // ---- configuration ----
-
-    // 监听主机地址。
+    // ---- 基础配置 ----
     public string Host() { return this.host; }
-    // 监听端口。
     public int Port() { return this.port; }
-    // 路由分发器。
     public Router Router() { return this.router; }
-    // 中间件钩子注册器。
     public Hooks Hooks() { return this.hooks; }
-    // 视图模板引擎实例。
     public View GetViews() { return this.views; }
-    // 内存/分布式会话管理器。
     public Sessions Sessions() { return this.sessions; }
-    // 配置分布式或自定义会话持久化存储驱动（默认使用本地高性能内存会话）。
     public WebApp UseSessions(ISessionStorage storage) {
-        if (storage != null) {
-            this.sessionStorage = storage;
-        }
+        if (storage != null) { this.sessionStorage = storage; }
         return this;
     }
     public ISessionStorage SessionStorage() { return this.sessionStorage; }
 
-    // 启用反向代理标头还原（解析 X-Forwarded-For 真实客户端 IP 与 X-Forwarded-Proto 协议）。
     public WebApp UseForwardedHeaders() {
-        if (this.forwardedHeaders == null) {
-            this.forwardedHeaders = new ForwardedHeaders();
-        }
+        if (this.forwardedHeaders == null) { this.forwardedHeaders = new ForwardedHeaders(); }
         this.forwardedHeaders.Enable();
         return this;
     }
     public ForwardedHeaders ForwardedHeaders() { return this.forwardedHeaders; }
 
-    // 启用云原生与负载均衡器健康检查探针（默认 /healthz 与 /readyz）。
-    public WebApp UseHealthChecks() {
-        return this.UseHealthChecks("/healthz", "/readyz");
-    }
+    public WebApp UseHealthChecks() { return this.UseHealthChecks("/healthz", "/readyz"); }
     public WebApp UseHealthChecks(string livenessPath, string readinessPath) {
         if (this.healthChecks == null) {
             this.healthChecks = new HealthChecks(livenessPath, readinessPath);
@@ -161,14 +172,10 @@ public class WebApp : IDisposable {
     }
     public HealthChecks Health() { return this.healthChecks; }
 
-    // 平滑排空本节点流量（Ready 探针置为 503 DRAINING，网关摘除流量）。
     public void Drain() {
-        if (this.healthChecks != null) {
-            this.healthChecks.Drain();
-        }
+        if (this.healthChecks != null) { this.healthChecks.Drain(); }
     }
 
-    // 配置集群 WebSocket 跨节点消息广播背板（IWsBackplane）。
     public WebApp UseWsBackplane(IWsBackplane backplane) {
         WsHub.Default().UseBackplane(backplane);
         return this;
@@ -177,28 +184,94 @@ public class WebApp : IDisposable {
         WsHub.Default().UseBackplane(publishFn);
         return this;
     }
-    // 服务端度量统计收集器。
     public ServerMetrics Metrics() { return this.metrics; }
-    // 加载视图目录（编译进内存）并返回自身。
+
+    public WebApp UseRequestProfiler(RequestProfiler profiler) { this.requestProfiler = profiler; return this; }
+    public RequestProfiler RequestProfile() { return this.requestProfiler; }
+
+    public WebApp UseRequestDiagnostics(int every, RequestDiagnosticsHandler completed) {
+        this.requestDiagnostics = every > 0 ? completed : null;
+        this.requestDiagnosticEvery = every;
+        this.requestDiagnosticSequence = this.requestDiagnostics != null && every > 1
+            ? new AtomicInt(Stopwatch.GetMicroseconds()) : null;
+        return this;
+    }
+
+    private RequestTrace StartRequestTrace(string protocol, long startUs) {
+        RequestDiagnosticsHandler report = this.requestDiagnostics;
+        if (report != null && this.requestDiagnosticSequence != null) {
+            long draw = this.requestDiagnosticSequence.Increment() * 6364136223846793005L;
+            if (((draw >> 33) & 2147483647L) % this.requestDiagnosticEvery != 0) { report = null; }
+        }
+        if (this.requestProfiler != null) { return this.requestProfiler.Start(protocol, startUs, report); }
+        return report != null ? new RequestTrace(null, report, 0, protocol, startUs) : null;
+    }
+
     public WebApp Views(string dir) { this.views = View.LoadDir(dir); return this; }
-    // 内存请求体上限（字节），超出回答 413。
     public WebApp MaxBody(int bytes) { this.maxBodyBytes = bytes; return this; }
-    // 流式上传上限（字节），只作用于 [Upload] 路由，超出回答 413。
     public WebApp MaxUpload(int bytes) { this.maxUploadBytes = bytes; return this; }
-    // 请求到达与响应处理的超时时限（毫秒）。
     public WebApp Timeout(int ms) { this.requestTimeoutMs = ms; return this; }
-    // 最大并发连接数上限，超出时直接响应 503 并关闭连接。
     public WebApp MaxConnections(int n) { this.maxConnections = n; return this; }
-    // 流式上传的落盘目录（默认 uploads）。
     public WebApp UploadDir(string dir) { this.uploadDir = dir; return this; }
-    // 全局每秒请求上限，按 uid（匿名时按对端 IP）计；0 不限，超限 429。
     public WebApp GlobalLimit(int perSecond) { this.globalLimit = perSecond; return this; }
-    // 未授权重定向的登录页路由（未配置时默认返回 401 JSON）。
     public WebApp LoginPath(string path) { this.loginPath = path; return this; }
-    // 多进程部署时以 SO_REUSEPORT 监听，由内核把连接分发给各 worker。
+    public WebApp SessionCookie(string name) {
+        if (name != null && name.Length > 0) { this.sessionCookie = name; }
+        return this;
+    }
+    public string GetSessionCookie() { return this.sessionCookie; }
+    public WebApp AuthHeader(string header, string scheme) {
+        if (header != null && header.Length > 0) { this.authHeader = header; }
+        if (scheme != null) { this.authScheme = scheme; }
+        return this;
+    }
+    public string GetAuthHeader() { return this.authHeader; }
+    public string GetAuthScheme() { return this.authScheme; }
+    public WebApp ApiPrefix(string prefix) {
+        this.apiPrefix = prefix != null ? prefix : "";
+        return this;
+    }
+    public WebApp AddApiPrefix(string prefix) {
+        if (prefix != null && prefix.Length > 0) {
+            if (this.extraApiPrefixes == null) { this.extraApiPrefixes = new List<string>(); }
+            this.extraApiPrefixes.Add(prefix);
+        }
+        return this;
+    }
+    public bool IsApiPath(string path) {
+        if (path == null || path.Length == 0) { return false; }
+        if (WebApp.MatchesPrefix(path, this.apiPrefix)) { return true; }
+        if (this.extraApiPrefixes != null) {
+            for (int i = 0; i < this.extraApiPrefixes.Count; i = i + 1) {
+                if (WebApp.MatchesPrefix(path, this.extraApiPrefixes[i])) { return true; }
+            }
+        }
+        return false;
+    }
+    private static bool MatchesPrefix(string path, string prefix) {
+        if (prefix == null || prefix.Length == 0) { return false; }
+        if (prefix == "/") { return path.StartsWith("/"); }
+        if (path == prefix) { return true; }
+        if (!path.StartsWith(prefix)) { return false; }
+        return (path[prefix.Length] & 255) == 47;
+    }
+    public WebApp Error(int status, string code, string msg) {
+        if (status >= 400 && status < 520) {
+            if (this.customErrorBodies == null) { this.customErrorBodies = new string[120]; }
+            this.customErrorBodies[status - 400] = WebApp.BuildErrorJson(code, msg);
+        }
+        return this;
+    }
+    private static string BuildErrorJson(string code, string msg) {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("code", code != null ? code : "");
+        w.WriteProperty("msg", msg != null ? msg : "");
+        w.WriteEndObject();
+        return w.ToJson();
+    }
     public WebApp ReusePort(bool on) { this.reusePort = on; return this; }
 
-    // 配置 HTTPS 原生 TLS 服务端证书与私钥。
     public WebApp UseHttps(string certFile, string keyFile) {
         this.certFile = certFile;
         this.keyFile = keyFile;
@@ -206,10 +279,7 @@ public class WebApp : IDisposable {
         return this.UseTls(this.tls);
     }
 
-    // 注入现有的服务端 TLS 上下文。
     public WebApp UseTls(TlsContext ctx) {
-        // This listener dispatches both HTTP versions; advertise them before the handshake.
-        // Preserve an explicit application protocol policy on injected contexts.
         if (ctx != null && ctx.alpnProtocols.Count == 0) {
             ctx.alpnProtocols.Add("h2");
             ctx.alpnProtocols.Add("http/1.1");
@@ -218,278 +288,88 @@ public class WebApp : IDisposable {
         return this;
     }
 
-    public bool IsHttps() {
-        return this.tls != null;
-    }
+    public bool IsHttps() { return this.tls != null; }
+    public TlsContext Tls() { return this.tls; }
+    public bool IsRunning() { return this.running; }
 
-    public TlsContext Tls() {
-        return this.tls;
-    }
-
-    // 初始化跨进程路由统计共享内存表。
+    // ---- 共享内存表（多工作进程无拷贝共享） ----
     public void InitStats() { this.router.InitStatsShared(); }
 
-    private static const string ShareRate = "WEB_RATE";
-    private static const string ShareLock = "WEB_LOCK";
-    private static const string ShareRoute = "WEB_ROUTE";
-    private static const string ShareRouteTable = "WEB_ROUTE_TABLE";
-
-    // 共享内存表：包含限流、锁和路由计数器，多工作进程间无拷贝共享。
     public void InitShared() {
         if (this.AttachShared()) { return; }
         RateLimiter l = this.Limiter();
         LockManager k = this.Locks();
         this.InitStats();
         this.router.InitRouteTableShared();
-        // 共享内存表句柄传递：在派生工作进程时分发匿名共享表句柄。
         Worker.ShareHandle(WebApp.ShareRate, l.OsHandle());
         Worker.ShareHandle(WebApp.ShareLock, k.OsHandle());
         Worker.ShareHandle(WebApp.ShareRoute, this.router.StatsOsHandle());
         Worker.ShareHandle(WebApp.ShareRouteTable, this.router.RouteTableOsHandle());
     }
 
-    // Worker 侧：映射主进程创建并下发的各表。主进程与单进程服务没有
-    // 可继承句柄，返回 false，由它们自己建表。
     public bool AttachShared() {
         long rate = Worker.InheritedHandle(WebApp.ShareRate);
         long lockTable = Worker.InheritedHandle(WebApp.ShareLock);
         long route = Worker.InheritedHandle(WebApp.ShareRoute);
         long routeTable = Worker.InheritedHandle(WebApp.ShareRouteTable);
         if (rate == 0 && lockTable == 0 && route == 0 && routeTable == 0) { return false; }
-        if (this.limiter == null) {
-            this.limiter = RateLimiter.Attach(rate, 1000);
-        }
+        if (this.limiter == null) { this.limiter = RateLimiter.Attach(rate, 1000); }
         if (this.locks == null) { this.locks = LockManager.Attach(lockTable); }
         this.router.AttachStats(route);
         this.router.AttachRouteTable(routeTable);
         return true;
     }
 
-    // 按需创建；拥有各表的进程已在 InitShared 里提前建好。
     public RateLimiter Limiter() {
         if (this.limiter == null) { this.limiter = RateLimiter.Owned(1000); }
         return this.limiter;
     }
 
-    // 按需创建请求锁管理器；worker 进程由 AttachShared 映射主进程下发的表。
     public LockManager Locks() {
         if (this.locks == null) { this.locks = LockManager.Owned(); }
         return this.locks;
     }
-    // 注册 before 钩子（按注册顺序执行；返回 false 短路请求）。
-    public WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
-    // 注册 after 钩子（请求结束后按注册顺序执行，收微秒耗时）。
-    public WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
-    // 安装 token→用户解析器；未安装时用内置 Sessions 表解析。
-    public WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
-    // 安装权限解析器；未安装时"任何已登录用户"即被允许。
-    public WebApp PermissionResolver(PermissionFn fn) { this.permissionResolver = fn; return this; }
 
-    // 通用路由注册底层入口（供属性路由生成器调用）。
+    // ---- 钩子、鉴权与路由注册 ----
+    public WebApp Before(HookFn fn) { this.hooks.Before(fn); return this; }
+    public WebApp After(AfterFn fn) { this.hooks.After(fn); return this; }
+    public WebApp AuthResolver(AuthFn fn) { this.authResolver = fn; return this; }
+    public WebApp PermissionResolver(PermissionFn fn) {
+        this.permissionResolver = fn;
+        this.scopedPermissionResolver = null;
+        return this;
+    }
+
+    public WebApp ScopedPermissionResolver(ScopedPermissionFn fn) {
+        this.scopedPermissionResolver = fn;
+        this.permissionResolver = null;
+        return this;
+    }
+
     public Route Map(string method, string pattern, HttpHandler h) {
         return this.router.Add(method, pattern, h);
     }
 
-    // 正则路由注册底层入口（供属性路由生成器调用）。
     public Route MapRegex(string method, string pattern, HttpHandler h) {
         return this.router.AddRegex(method, pattern, h);
     }
 
-    // 注册 GET 路由（= Map("GET", ...)）。
     public Route Get(string pattern, HttpHandler h) { return this.router.Get(pattern, h); }
-    // 注册 POST 路由。
     public Route Post(string pattern, HttpHandler h) { return this.router.Post(pattern, h); }
-    // 注册 PUT 路由。
     public Route Put(string pattern, HttpHandler h) { return this.router.Put(pattern, h); }
-    // 注册 DELETE 路由。
     public Route Delete(string pattern, HttpHandler h) { return this.router.Delete(pattern, h); }
 
-    // 启用 GEO 大模型站点友好规范，自动挂载 /.well-known/llms.txt 与 /llms.txt。
-    public WebApp UseLlmsTxt(LlmsTxt llms) {
-        this.llmsTxt = llms;
-        if (llms != null) { this.MountLlms(); }
-        return this;
+    // 纯同步路由快捷入口（零协程帧分配）
+    public Route MapSync(string method, string pattern, SyncHttpAction h) {
+        return this.router.AddSync(method, pattern, h);
     }
+    public Route GetSync(string pattern, SyncHttpAction h) { return this.router.GetSync(pattern, h); }
+    public Route PostSync(string pattern, SyncHttpAction h) { return this.router.PostSync(pattern, h); }
+    public Route PutSync(string pattern, SyncHttpAction h) { return this.router.PutSync(pattern, h); }
+    public Route DeleteSync(string pattern, SyncHttpAction h) { return this.router.DeleteSync(pattern, h); }
 
-    // 应用层接管 llms.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
-    public WebApp UseLlmsSource(LlmsSource source) {
-        this.llmsSource = source;
-        if (source != null) { this.MountLlms(); }
-        return this;
-    }
-
-    // llms.txt 挂载点：委托给 SeoRouter。
-    public void MountLlms() {
-        SeoRouter.MountLlms(this);
-    }
-
-    // 启用搜索引擎与 AI 爬虫协议规则 robots.txt。
-    public WebApp UseRobotsTxt(RobotsTxt robots) {
-        this.robotsTxt = robots;
-        if (robots != null) { this.MountRobots(); }
-        return this;
-    }
-
-    // 应用层接管 robots.txt 内容：委托每次请求求值，返回 null 时回退静态对象。
-    public WebApp UseRobotsSource(RobotsSource source) {
-        this.robotsSource = source;
-        if (source != null) { this.MountRobots(); }
-        return this;
-    }
-
-    // robots.txt 挂载点：委托给 SeoRouter。
-    public void MountRobots() {
-        SeoRouter.MountRobots(this);
-    }
-
-    // 启用 XML 站点地图 sitemap.xml。
-    public WebApp UseSitemap(Sitemap sm) {
-        this.sitemap = sm;
-        if (sm != null) { this.MountSitemap(); }
-        return this;
-    }
-
-    // 应用层接管 sitemap.xml 内容：委托每次请求求值，返回 null 时回退静态对象。
-    public WebApp UseSitemapSource(SitemapSource source) {
-        this.sitemapSource = source;
-        if (source != null) { this.MountSitemap(); }
-        return this;
-    }
-
-    // sitemap.xml 挂载点：委托给 SeoRouter。
-    public void MountSitemap() {
-        SeoRouter.MountSitemap(this);
-    }
-
-    public bool IsRunning() { return this.running; }
-    public LlmsTxt Llms() { return this.llmsTxt; }
-    public RobotsTxt Robots() { return this.robotsTxt; }
-    public Sitemap SiteMap() { return this.sitemap; }
-    public LlmsSource LlmsSource() { return this.llmsSource; }
-    public RobotsSource RobotsSource() { return this.robotsSource; }
-    public SitemapSource SitemapSource() { return this.sitemapSource; }
-    public bool IsSitemapMounted() { return this.sitemapMounted; }
-    public void MarkSitemapMounted() { this.sitemapMounted = true; }
-    public bool IsRobotsMounted() { return this.robotsMounted; }
-    public void MarkRobotsMounted() { this.robotsMounted = true; }
-    public bool IsLlmsMounted() { return this.llmsMounted; }
-    public void MarkLlmsMounted() { this.llmsMounted = true; }
-    // 是否已启用 llms.txt（静态对象或应用层内容源任一）。
-    public bool HasLlms() { return this.llmsTxt != null || this.llmsSource != null; }
-    // 是否已启用 robots.txt（静态对象或应用层内容源任一）。
-    public bool HasRobots() { return this.robotsTxt != null || this.robotsSource != null; }
-    // 是否已启用 sitemap.xml（静态对象或应用层内容源任一）。
-    public bool HasSitemap() { return this.sitemap != null || this.sitemapSource != null; }
-
-    // llms.txt 处理器：委托给 SeoRouter。
-    public static async void HandleLlmsTxt(HttpContext ctx) {
-        SeoRouter.HandleLlmsTxt(ctx);
-    }
-
-    // llms-full.txt 处理器：委托给 SeoRouter。
-    public static async void HandleLlmsFullTxt(HttpContext ctx) {
-        SeoRouter.HandleLlmsFullTxt(ctx);
-    }
-
-    // robots.txt 处理器：委托给 SeoRouter。
-    public static async void HandleRobotsTxt(HttpContext ctx) {
-        SeoRouter.HandleRobotsTxt(ctx);
-    }
-
-    // sitemap.xml 处理器：委托给 SeoRouter。
-    public static async void HandleSitemapXml(HttpContext ctx) {
-        SeoRouter.HandleSitemapXml(ctx);
-    }
-
-    // 渲染模板并套最近的布局；未加载视图时返回空串。
-    public string RenderPage(string name, ViewData data) {
-        if (this.views == null) { return ""; }
-        return this.views.RenderPage(name, data);
-    }
-
-    // 局部渲染模板（不包含外层 layout，供页面局部无刷新更新调用）。
-    public string RenderFragment(string name, ViewData data) {
-        if (this.views == null) { return ""; }
-        return this.views.Render(name, data);
-    }
-
-    // ---- 静态文件挂载与分发 ----
-    public WebApp Mount(string urlPrefix, string dir) {
-        return this.Mount(urlPrefix, dir, HttpLimits.DefaultTtlSeconds);
-    }
-
-    public WebApp Mount(string urlPrefix, string dir, int maxAge) {
-        this.staticMounts.Add(new StaticMount(urlPrefix, dir, maxAge));
-        if (!this.staticHookInstalled) {
-            this.staticHookInstalled = true;
-            this.Before(WebApp.StaticHook);
-        }
-        return this;
-    }
-
-    private static bool StaticHook(HttpContext ctx) {
-        if (ctx == null) { return true; }
-        WebApp app = ctx.App();
-        if (app != null) {
-            return app.ServeStatic(ctx);
-        }
-        return true;
-    }
-
-    public List<StaticMount> StaticMounts() {
-        return this.staticMounts;
-    }
-
-    public bool ServeStatic(HttpContext ctx) {
-        if (ctx.Method() != "GET" && ctx.Method() != "HEAD") { return true; }
-        int count = this.staticMounts.Count;
-        for (int i = 0; i < count; i = i + 1) {
-            StaticMount m = this.staticMounts[i];
-            string rel = StaticFiles.RelativeTo(ctx.Path(), m.Prefix());
-            if (rel != null) {
-                return StaticFiles.ServeFile(ctx, rel, m.Root(), m.Prefix(), m.MaxAge());
-            }
-        }
-        return true;
-    }
-
-    // ---- CSRF 豁免管理 ----
-    public WebApp SkipCsrf(string prefix) {
-        if (prefix != null && prefix.Length > 0) {
-            this.csrfSkips.Add(prefix);
-        }
-        return this;
-    }
-
-    public bool HasCsrfSkip(string path) {
-        int count = this.csrfSkips.Count;
-        for (int i = 0; i < count; i = i + 1) {
-            string p = this.csrfSkips[i];
-            if (p.Length > 0 && HttpContext.StartsWith(path, p)) { return true; }
-        }
-        return false;
-    }
-
-    // ---- WebSocket 允许 Origin 管理 ----
-    public WebApp AllowWsOrigin(string origin) {
-        if (origin != null && origin.Length > 0) {
-            this.wsOrigins.Add(origin);
-        }
-        return this;
-    }
-
-    public bool HasWsOrigin(string origin) {
-        int count = this.wsOrigins.Count;
-        for (int i = 0; i < count; i = i + 1) {
-            if (this.wsOrigins[i] == origin) { return true; }
-        }
-        return false;
-    }
-
-    // 墙钟秒（CRT time），上传文件名与错误日志时间戳用。
     public static int NowSeconds() { return time(0); }
 
-    // 错误日志消息截断（防止超大异常堆栈撑爆日志文件）。
     private static string Redact(string s) {
         if (s == null) { return ""; }
         if (s.Length > 500) { return s.Substring(0, 500); }
@@ -498,9 +378,7 @@ public class WebApp : IDisposable {
 
     public ServerBanner Banner(int procs) {
         string mode = "single process";
-        if (procs > 1) {
-            mode = "master + " + Convert.ToString(procs) + " workers";
-        }
+        if (procs > 1) { mode = "master + " + Convert.ToString(procs) + " workers"; }
         ServerBanner b = new ServerBanner("ZAN WEB", "SERVICES").Mode(mode);
         b.Service("http",
             "http://" + this.host + ":" + Convert.ToString(this.port),
@@ -516,8 +394,7 @@ public class WebApp : IDisposable {
         if (this.healthChecks != null && this.healthChecks.IsEnabled()) {
             b.Info("health", "on");
         }
-        b.Info("max body", Convert.ToString(this.maxBodyBytes / (1024 * 1024))
-            + "MB");
+        b.Info("max body", Convert.ToString(this.maxBodyBytes / (1024 * 1024)) + "MB");
         b.Info("uploads", this.uploadDir + "/ "
             + Convert.ToString(this.maxUploadBytes / (1024 * 1024)) + "MB max");
         if (this.globalLimit > 0) {
@@ -526,7 +403,6 @@ public class WebApp : IDisposable {
         if (this.reusePort) { b.Info("reuseport", "on"); }
         return b;
     }
-
 
     public async int Start() {
         this.InitShared();
@@ -549,7 +425,6 @@ public class WebApp : IDisposable {
         return 0;
     }
 
-    // 置停标志并关闭监听 socket，accept 循环随之退出。
     public void Stop() {
         this.running = false;
         if (this.listener != null) { this.listener.Stop(); }
@@ -557,600 +432,35 @@ public class WebApp : IDisposable {
 
     public void Dispose() {
         this.Stop();
-        if (this.hooks != null) {
-            this.hooks.Clear();
-        }
-        if (this.staticMounts != null) {
-            this.staticMounts.Clear();
-        }
-        if (this.csrfSkips != null) {
-            this.csrfSkips.Clear();
-        }
-        if (this.wsOrigins != null) {
-            this.wsOrigins.Clear();
-        }
+        if (this.hooks != null) { this.hooks.Clear(); }
+        if (this.staticMounts != null) { this.staticMounts.Clear(); }
+        if (this.csrfSkips != null) { this.csrfSkips.Clear(); }
+        if (this.wsOrigins != null) { this.wsOrigins.Clear(); }
         if (this.tls != null) {
             this.tls.Free();
             this.tls = null;
         }
     }
 
-    public void Activate() {
-        active = this;
-    }
+    public void Activate() { active = this; }
 
     public static void SetActive(WebApp app) {
         if (app != null) { app.Activate(); }
         else { active = null; }
     }
 
-    private static async void ServeSock(nint clientSock) {
-        WebApp app = active;
-        if (app == null) { Socket.Close(clientSock); return; }
-        if (await app.RefuseOverCapacity(clientSock)) { return; }
-        if (app.IsHttps()) {
-            await app.HandleTlsConnection(clientSock);
-        } else {
-            await app.HandleConnection(clientSock);
-        }
-    }
-
-    private async bool RefuseOverCapacity(nint clientSock) {
-        long live = this.activeConnections.Increment();
-        if (this.maxConnections <= 0 || live <= (long)this.maxConnections) {
-            return false;
-        }
-        long _back = this.activeConnections.Decrement();
-        if (this.IsHttps()) {
-            // Refuse the connection before handshake without putting plaintext on TLS.
-            Socket.Close(clientSock);
-            return true;
-        }
-        TcpClient c = TcpClient.FromSocket(clientSock);
-        int _s = await c.SendAsync(WebApp.SimpleResponse(503,
-            "Service Unavailable", "server is at capacity"));
-        c.Close();
-        return true;
-    }
-
-    // TLS owns the handshake and record layer; only plaintext HTTP bytes enter
-    // the shared request loop. Keep the raw socket out of the request context.
-    public async void HandleTlsConnection(nint clientSock) {
-        try {
-            Socket.SetNoDelay(clientSock);
-            TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
-            if (stream == null) { return; }
-            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-            HttpFramer framer = HttpFramerTls.Create(stream);
-            try {
-                Http1Writer writer = HttpFramerTls.CreateWriter(stream);
-                string remoteIp = Socket.RemoteIp(clientSock);
-                await this.ServeHttp1(framer, writer, remoteIp, watch, null, stream);
-            } finally {
-                HttpDeadline.Disarm(watch);
-                framer.Dispose();
-                stream.Close();
-            }
-        } finally {
-            Socket.Close(clientSock);
-            long _live = this.activeConnections.Decrement();
-        }
-    }
-
-    private async HttpResponse HandleHttp2Request(HttpRequest req) {
-        HttpContext ctx = new HttpContext(req, "127.0.0.1");
-        ctx.SetApp(this);
-        if (req.bodyLength > 0) {
-            if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
-                HttpContext.ParseMultipartFields(req, ctx);
-            } else {
-                HttpContext.ParseFormBody(req, ctx);
-            }
-        }
-        Route route = this.router.Match(ctx);
-        if (await this.LimitExceeded(ctx, route)) {
-            HttpResponse limited = HttpResponse.Text("rate limit exceeded");
-            limited.statusCode = 429;
-            limited.statusText = "Too Many Requests";
-            return limited;
-        }
-        Worker.BumpStat();
-        await this.Dispatch(ctx, route, true);
-        HttpResponse resp = new HttpResponse();
-        resp.statusCode = ctx.GetStatus();
-        resp.statusText = ctx.StatusText();
-        resp.contentType = ctx.ContentType();
-        if (ctx.Headers() != null) {
-            for (int i = 0; i < ctx.Headers().Count; i = i + 1) {
-                resp.headers.Add(ctx.Headers()[i]);
-            }
-        }
-        if (ctx.IsBinary()) {
-            resp.bodyBytes = ctx.BodyBytes();
-            resp.bodyBytesLen = ctx.BodyBytesLen();
-        } else if (ctx.ResponseBody() != null) {
-            resp.body = ctx.ResponseBody();
-        }
-        ctx.ReleaseResponseBuf();
-        Worker.BumpSent();
-        return resp;
-    }
-
-    public async void HandleConnection(nint clientSock) {
-        TcpClient client = TcpClient.FromSocket(clientSock);
-        try {
-            Socket.SetNoDelay(clientSock);
-            HttpFramer framer = HttpFramer.Create(clientSock);
-            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
-            try {
-                Http1Writer writer = new Http1Writer(client.SendViewAsync);
-                string remoteIp = Socket.RemoteIp(clientSock);
-                await this.ServeHttp1(framer, writer, remoteIp, watch, client, null);
-            } finally {
-                HttpDeadline.Disarm(watch);
-                framer.Dispose();
-            }
-        } finally {
-            client.Close();
-            long _live = this.activeConnections.Decrement();
-        }
-    }
-
-    private async void ServeHttp1(HttpFramer framer, Http1Writer writer, string remoteIp,
-                                  HttpDeadlineToken watch, TcpClient client, TlsStream stream) {
-        bool keepAlive = true;
-        while (keepAlive) {
-            HttpDeadline.Touch(watch, this.requestTimeoutMs);
-            int headerEnd = await framer.ReadHead(65000);
-            if (headerEnd == -431) {
-                int _s = await writer.SendTextAsync(WebApp.SimpleResponse(431,
-                    "Request Header Fields Too Large",
-                    "header block too large"));
-                break;
-            }
-            if (headerEnd <= 0) { break; }
-
-            HttpRequest request = HttpRequest.Parse(framer.Head(headerEnd),
-                                                   headerEnd);
-            // Hand the same pending bytes to the existing HTTP/2 session.
-            if (stream != null && request.method == "PRI" && request.path == "*"
-                && request.version == "HTTP/2.0") {
-                framer.Consume(headerEnd);
-                await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request,
-                    framer, 65000, this.maxBodyBytes, this.requestTimeoutMs);
-                return;
-            }
-            // 定界失败（Content-Length 溢出/重复不一致、非数字、
-            // Transfer-Encoding 未实现等）→ 拒绝，不切分正文：
-            // 剩余字节可能是走私的伪装请求。
-            if (request.parseStatus != 0) {
-                int _s0 = await writer.SendTextAsync(WebApp.SimpleResponse(
-                    request.parseStatus,
-                    request.parseStatus == 501 ? "Not Implemented" : "Bad Request",
-                    "malformed request framing"));
-                break;
-            }
-            keepAlive = request.keepAlive;
-            HttpContext ctx = new HttpContext(request, remoteIp);
-            if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
-                ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
-            }
-            ctx.SetApp(this);
-            // Existing file/SSE/upgrade handlers keep their transport contract.
-            if (stream != null) { ctx.AttachTls(stream); }
-            else { ctx.Attach(client); }
-            ctx.SetFramer(framer);
-            // 请求到达与响应处理的超时时限（毫秒）。
-            ctx.SetDeadlineSlot(watch, this.requestTimeoutMs);
-            Route route = this.router.Match(ctx);
-
-            // 限流在正文之前：原顺序先把正文缓冲齐（≤maxBodyBytes）并解析
-            // form/multipart，DispatchInner 才判全局限流与路由限流——被限的
-            // 调用方照样花掉服务器的带宽与解析 CPU，限流形同虚设。判定只在
-            // 这里做一次（Allow 消耗令牌，判两次等于双倍扣减）；429 用
-            // SimpleResponse 应答并断连，因为正文留在流上没读，keep-alive
-            // 复用会把残余字节当下一个请求的头。
-            if (await this.LimitExceeded(ctx, route)) {
-                int _s1 = await writer.SendTextAsync(WebApp.SimpleResponse(429,
-                    "Too Many Requests", "rate limit exceeded"));
-                break;
-            }
-
-            // ctx owns any completed spool until the handler explicitly takes it.
-            // Cleanup also runs on response-send failures and hook exceptions.
-            try {
-                bool gatePassed = false;
-                // Only positive Content-Length uses the spool. Chunked bodies
-                // retain the normal, separately bounded in-memory path.
-                if (route != null && route.StreamUpload() && request.contentLength > 0) {
-                    // Unread bodies require closing the connection on rejection.
-                    if (!await this.DispatchGate(ctx, route, false)) {
-                        await this.Dispatch(ctx, route, false, true, true);
-                        if (!ctx.MetricsExcluded() && ctx.responseBuf != null && ctx.responseLen > 0) {
-                            int _denied = await writer.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
-                        }
-                        break;
-                    }
-                    gatePassed = true;
-                    if (request.contentLength > this.maxUploadBytes) {
-                        int _s2 = await writer.SendTextAsync(WebApp.SimpleResponse(413,
-                            "Payload Too Large", "upload exceeds limit"));
-                        break;
-                    }
-                    string tmp = await HttpUploadStreamer.StreamToFile(framer, request,
-                        this.uploadDir, this.uploadSeq);
-                    if (tmp.Length == 0) {
-                        int _s3 = await writer.SendTextAsync(WebApp.SimpleResponse(400,
-                            "Bad Request", "upload failed"));
-                        break;
-                    }
-                    ctx.SetUpload(tmp, request.contentLength);
-                    request.body = "";
-                } else {
-                    if (request.contentLength > this.maxBodyBytes) {
-                        int _s4 = await writer.SendTextAsync(WebApp.SimpleResponse(413,
-                            "Payload Too Large", "body exceeds limit"));
-                        break;
-                    }
-                    int bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
-                    if (bodyStatus > 0) {
-                        int _s4b = await writer.SendTextAsync(WebApp.SimpleResponse(
-                            bodyStatus,
-                            bodyStatus == 413 ? "Payload Too Large" : "Bad Request",
-                            bodyStatus == 413 ? "body exceeds limit"
-                                              : "malformed request body"));
-                        break;
-                    }
-                    if (bodyStatus < 0) {
-                        int _s5 = await writer.SendTextAsync(WebApp.SimpleResponse(400,
-                            "Bad Request", "incomplete body"));
-                        break;
-                    }
-                    framer.Consume(framer.RequestBytes());
-                    if (request.bodyLength > 0) {
-                        if (HttpContext.StartsWith(request.contentType,
-                                                   "multipart/form-data")) {
-                            // 内存路径的 multipart：文本字段进 form 表
-                            // （文件部件由处理器按需取用）。
-                            HttpContext.ParseMultipartFields(request, ctx);
-                        } else {
-                            HttpContext.ParseFormBody(request, ctx);
-                        }
-                    }
-                }
-
-                Worker.BumpStat();
-                await this.Dispatch(ctx, route, keepAlive, gatePassed);
-                if (ctx.MetricsExcluded()) { break; }
-                if (ctx.responseBuf != null && ctx.responseLen > 0) {
-                    int sent = await writer.SendBytesAsync(ctx.responseBuf, 0, ctx.responseLen);
-                    if (sent != ctx.responseLen) { break; }
-                }
-                Worker.BumpSent();
-                if (!keepAlive) { break; }
-            } finally {
-                ctx.CleanupUpload();
-                ctx.ReleaseResponseBuf();
-            }
-        }
-    }
-
-    private async void Dispatch(HttpContext ctx, Route route, bool keepAlive, bool gatePassed = false, bool gateRejected = false) {
-        long startUs = ServerMetrics.MonoMicros();
-        long _n = this.totalRequests.Increment();
-        this.metrics.Entered();
-        try {
-            if (!gateRejected) {
-                await this.DispatchInner(ctx, route, keepAlive, startUs, gatePassed);
-            }
-        } finally {
-            this.metrics.Left();
-        }
-        long elapsedUs = ServerMetrics.MonoMicros() - startUs;
-        if (ctx.MetricsExcluded()) {
-            this.metrics.StreamClosed(ctx.Frames(), ctx.FrameBytes());
-        }
-        // 未授权重定向的登录页路由（未配置时默认返回 401 JSON）。
-        if (!ctx.MetricsExcluded()) {
-            if (ctx.RoutePattern().Length == 0) {
-                this.metrics.RecordUnmatched(ctx.GetStatus(), elapsedUs);
-            } else {
-                this.metrics.RecordRoute(ctx.RouteSlot(), ctx.Method(),
-                    ctx.RoutePattern(), ctx.GetStatus(), elapsedUs);
-            }
-        }
-        this.hooks.RunAfter(ctx, elapsedUs);
-    }
-
-    // 全局与路由限流的唯一判定点，在正文缓冲/解析之前调用。
-    // 键语义与键序与原 DispatchInner 内联判定一致：全局限流按 uid（匿名
-    // 回落 IP，再回落 _unknown_），路由限流按 rateScope 拼 uid/ip。返回
-    // true 表示超限，应答由调用方写出并断连。ctx.uid 顺带在这里解析好
-    // （AuthUser 只看请求头），DispatchInner 复用、不再重付会话查询。
-    private async bool LimitExceeded(HttpContext ctx, Route route) {
-        string uid = await this.AuthUser(ctx);
-        ctx.SetUid(uid);
-        string principal = uid;
-        if (principal.Length == 0) { principal = ctx.ClientIp(); }
-        if (principal.Length == 0) { principal = "_unknown_"; }
-        if (this.globalLimit > 0
-            && !this.Limiter().Allow("_global_:" + principal, this.globalLimit)) {
-            return true;
-        }
-        if (route == null || route.RateLimit() <= 0) { return false; }
-        string rateKey = route.Key();
-        if (route.RateScope() == "uid") {
-            rateKey = rateKey + ":uid:" + uid;
-        } else if (route.RateScope() == "ip") {
-            rateKey = rateKey + ":ip:" + ctx.ClientIp();
-        }
-        return !this.Limiter().Allow(rateKey, route.RateLimit());
-    }
-
-    // 唯一的 before/路由/认证门。流式正文必须在此门成功后才能落盘。
-    // before 钩子也承载应用的 Origin/CSRF 策略，预检后不可再次调用。
-    private async bool DispatchGate(HttpContext ctx, Route route, bool keepAlive) {
-        try {
-            return await this.DispatchGateInner(ctx, route, keepAlive);
-        } catch (ApiError ae) {
-            if (ae.Status() >= 500) {
-                this.metrics.RecordError((long)WebApp.NowSeconds(),
-                    ctx.Method() + " " + ctx.Path(), WebApp.Redact(ae.Message));
-            }
-            if (ctx.ResetFailedResponse()) {
-                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
-                ctx.Api(ae.Code(), ae.Message, "null");
-            }
-        } catch (Exception e) {
-            // Request boundary: gate failures obey the same fixed 500 contract
-            // as handlers; exception details stay in server diagnostics.
-            Console.WriteLine("[WebApp ERROR] " + ctx.Method() + " " + ctx.Path() + ": " + e.Message);
-            this.metrics.RecordError((long)WebApp.NowSeconds(),
-                ctx.Method() + " " + ctx.Path(), WebApp.Redact(e.Message));
-            if (ctx.ResetFailedResponse()) {
-                ctx.Status(500, "Internal Server Error");
-                ctx.Json(WebApp.ErrorJson("500", "internal server error"));
-            }
-        }
-        ctx.BuildResponseDirect(keepAlive);
-        return false;
-    }
-
-    private async bool DispatchGateInner(HttpContext ctx, Route route, bool keepAlive) {
-        if (!this.hooks.RunBefore(ctx)) {
-            ctx.BuildResponseDirect(keepAlive);
-            return false;
-        }
-
-        if (route == null) {
-            if (this.router.PathExists(ctx.Path())) {
-                ctx.Status(405, "Method Not Allowed");
-                ctx.Json(WebApp.ErrorJson("405", "method not allowed"));
-            } else {
-                ctx.Status(404, "Not Found");
-                ctx.Json(WebApp.ErrorJson("404", "not found"));
-            }
-            ctx.BuildResponseDirect(keepAlive);
-            return false;
-        }
-
-        ctx.SetRoute(route.Action(), route.Pattern(), route.Idx());
-
-        if (route.NeedsLogin() || route.NeedsAuth()) {
-            if (ctx.Uid().Length == 0) {
-                if (this.WantsPage(ctx)) {
-                    ctx.Redirect(this.loginPath + "?next="
-                        + Encoding.UrlEncode(ctx.Path()));
-                    ctx.BuildResponseDirect(keepAlive);
-                    return false;
-                }
-                ctx.Status(401, "Unauthorized");
-                ctx.Json(WebApp.ErrorJson("401", "authentication required"));
-                ctx.BuildResponseDirect(keepAlive);
-                return false;
-            }
-            if (route.NeedsAuth()) {
-                if (!await this.Allow(ctx.Uid(), route.Action())) {
-                    ctx.Status(403, "Forbidden");
-                    ctx.Json(WebApp.ErrorJson("403", "insufficient permission"));
-                    ctx.BuildResponseDirect(keepAlive);
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    // 认证之后的请求管线，按序：before 钩子 → 404/405 → 填路由元数据 →
-    // 登录/权限门 → [Lock] 请求锁 → handler。全局限流与路由限流已前移到
-    // 正文读取之前（ServeHttp1 的 LimitExceeded——被限请求不再
-    // 花服务器的带宽与解析 CPU），uid 亦由门处解析好放在 ctx.uid。
-    // ApiError 变成它携带的应答；其余异常记录后回答 500，handler 结束
-    // 时仍未写应答的也兜底 500。
-    private async void DispatchInner(HttpContext ctx, Route route, bool keepAlive, long startUs, bool gatePassed) {
-
-        string uid = ctx.Uid();
-        string principal = uid;
-        if (principal.Length == 0) { principal = ctx.ClientIp(); }
-        if (principal.Length == 0) { principal = "_unknown_"; }
-
-        if (!gatePassed && !await this.DispatchGate(ctx, route, keepAlive)) { return; }
-
-        LockLease lockLease = null;
-        if (route.LockScope().Length > 0) {
-            lockLease = this.Locks().TryAcquire(
-                LockManager.KeyFor(route, principal));
-            if (lockLease == null) {
-                ctx.Status(429, "Too Many Requests").SetHeader("Retry-After", "1");
-                ctx.Json(WebApp.ErrorJson("429", "request already in progress"));
-                ctx.BuildResponseDirect(keepAlive);
-                return;
-            }
-        }
-
-        int rIdx = route.Idx();
-        HttpHandler h = route.Handler();
-        bool errLogged = false;
-        try {
-            await h(ctx);
-        } catch (ApiError ae) {
-            if (ae.Status() >= 500) {
-                this.metrics.RecordError((long)WebApp.NowSeconds(),
-                    ctx.Method() + " " + ctx.Path(), WebApp.Redact(ae.Message));
-                errLogged = true;
-            }
-            if (ctx.ResetFailedResponse()) {
-                ctx.Status(ae.Status(), ApiError.Reason(ae.Status()));
-                ctx.Api(ae.Code(), ae.Message, "null");
-            }
-        } catch (Exception e) {
-            Console.WriteLine("[WebApp ERROR] " + ctx.Method() + " " + ctx.Path() + ": " + e.Message);
-            this.metrics.RecordError((long)WebApp.NowSeconds(),
-                ctx.Method() + " " + ctx.Path(), WebApp.Redact(e.Message));
-            errLogged = true;
-            if (ctx.ResetFailedResponse()) {
-                ctx.Status(500, "Internal Server Error");
-                ctx.Json(WebApp.ErrorJson("500", "internal server error"));
-            }
-        }
-        if (lockLease != null) { this.Locks().Release(lockLease); }
-        if (!ctx.Ended()) {
-            Console.WriteLine("[WebApp ERROR] handler produced no response: " + ctx.Method() + " " + ctx.Path());
-            this.metrics.RecordError((long)WebApp.NowSeconds(),
-                ctx.Method() + " " + ctx.Path(), "handler produced no response");
-            errLogged = true;
-            ctx.Status(500, "Internal Server Error");
-            ctx.Json(WebApp.ErrorJson("500", "handler produced no response"));
-        }
-        if (ctx.GetStatus() >= 500 && !errLogged) {
-            string detail = ctx.StatusText();
-            if (detail == null || detail.Length == 0) {
-                detail = "HTTP " + Convert.ToString(ctx.GetStatus());
-            }
-            this.metrics.RecordError((long)WebApp.NowSeconds(),
-                ctx.Method() + " " + ctx.Path(), detail);
-        }
-
-        // ServerMetrics.RecordRequest in Dispatch.
-        if (!ctx.MetricsExcluded()) {
-            long elapsedUs = ServerMetrics.MonoMicros() - startUs;
-            this.router.RecordHit(rIdx, elapsedUs);
-        }
-        ctx.BuildResponseDirect(keepAlive);
-    }
-
-    private bool WantsPage(HttpContext ctx) {
-        if (this.loginPath.Length == 0) { return false; }
-        // /api is the JSON route convention shared with ApiDocs. Missing
-        // Accept headers must not turn authentication failures into redirects.
-        string path = ctx.Path();
-        if (path == "/api" || path.StartsWith("/api/")) { return false; }
-        if (ctx.Method() != "GET") { return false; }
-        if (ctx.Header("HX-Request").Length > 0) { return false; }
-        if (ctx.Header("X-Requested-With").Length > 0) { return false; }
-        if (ctx.Header("X-Fragment").Length > 0) { return false; }
-        return !ctx.Header("Accept").Contains("application/json");
-    }
-
-    public async bool Allow(string uid, string action) {
-        if (this.permissionResolver != null) {
-            return await this.permissionResolver(uid, action);
-        }
-        return uid.Length > 0;
-    }
-
-    private async string AuthUser(HttpContext ctx) {
-        string auth = ctx.Header("Authorization");
-        if (auth != null && auth.StartsWith("Bearer ")) {
-            string token = auth.Substring(7);
-            if (this.authResolver != null) { return await this.authResolver(token); }
-            if (this.sessionStorage != null) { return this.sessionStorage.UserOf(token, 0); }
-            return this.sessions.UserOf(token);
-        }
-        string cookie = ctx.Cookie("zsession");
-        if (cookie.Length > 0) {
-            if (this.authResolver != null) { return await this.authResolver(cookie); }
-            if (this.sessionStorage != null) { return this.sessionStorage.UserOf(cookie, 0); }
-            return this.sessions.UserOf(cookie);
-        }
-        return "";
-    }
-
-    private static string err404 = "{\"code\":\"404\",\"msg\":\"not found\"}";
-    private static string err405 = "{\"code\":\"405\",\"msg\":\"method not allowed\"}";
-    private static string err401 = "{\"code\":\"401\",\"msg\":\"authentication required\"}";
-    private static string err403 = "{\"code\":\"403\",\"msg\":\"insufficient permission\"}";
-    private static string err429 = "{\"code\":\"429\",\"msg\":\"request already in progress\"}";
-    private static string err500 = "{\"code\":\"500\",\"msg\":\"internal server error\"}";
-    private static string err500noResp = "{\"code\":\"500\",\"msg\":\"handler produced no response\"}";
-
-    private static string ErrorJson(string code, string msg) {
-        if (code == "404" && msg == "not found") { return WebApp.err404; }
-        if (code == "500") {
-            if (msg == "internal server error") { return WebApp.err500; }
-            if (msg == "handler produced no response") { return WebApp.err500noResp; }
-        }
-        if (code == "401" && msg == "authentication required") { return WebApp.err401; }
-        if (code == "403" && msg == "insufficient permission") { return WebApp.err403; }
-        if (code == "405" && msg == "method not allowed") { return WebApp.err405; }
-        if (code == "429" && msg == "request already in progress") { return WebApp.err429; }
-        return "{\"code\":\"" + code + "\",\"msg\":\"" + msg + "\"}";
-    }
-
     public string StatusJson() {
         WebAppStatusDoc o = new WebAppStatusDoc();
-        o.total_requests = (int)this.totalRequests.Load();
+        long totalReq = 0;
+        for (int i = 0; i < 16; i = i + 1) {
+            totalReq = totalReq + this.totalRequestsShards[i].Load();
+        }
+        o.total_requests = (int)totalReq;
         o.active_connections = (int)this.activeConnections.Load();
         o.routes = this.router.Stats();
         return Json.Serialize<WebAppStatusDoc>(o);
     }
 
-    public string MetricsJson() {
-        return this.metrics.SnapshotJson();
-    }
-
-    // start or stop.
-    public string MetricsSeriesJson(int seconds) {
-        return this.metrics.SeriesJson(seconds);
-    }
-
-    // 构造一条完整的 HTTP/1.1 JSON 应答字符串（Connection: close），
-    // 用于 HttpContext 尚不存在的早期拒绝（413/431/503、定界失败）。
-    private static string SimpleResponse(int code, string text, string msg) {
-        StringBuilder sb = HttpBufferPool.Rent();
-        sb.Append("{\"code\":\"");
-        sb.Append(Convert.ToString(code));
-        sb.Append("\",\"msg\":\"");
-        sb.Append(msg);
-        sb.Append("\"}");
-        string body = sb.ToString();
-        sb.Clear();
-        sb.Append("HTTP/1.1 ");
-        sb.Append(Convert.ToString(code));
-        sb.Append(" ");
-        sb.Append(text);
-        sb.Append("\r\nContent-Type: application/json\r\nContent-Length: ");
-        sb.Append(Convert.ToString(body.Length));
-        sb.Append("\r\nConnection: close\r\n\r\n");
-        sb.Append(body);
-        string res = sb.ToString();
-        HttpBufferPool.Return(sb);
-        return res;
-    }
-
-    // 报文中头部块的结束位置（"\n\n" 或 "\n\r\n" 之后的首下标）；
-    // 没有空行返回 -1。
-    private static int FindHeaderEnd(string raw) {
-        int n = raw.Length;
-        for (int i = 0; i < n; i = i + 1) {
-            if ((raw[i] & 255) == 10) {
-                // "\n\n"
-                if (i + 1 < n && (raw[i + 1] & 255) == 10) { return i + 2; }
-                // "\n\r\n"
-                if (i + 2 < n && (raw[i + 1] & 255) == 13 && (raw[i + 2] & 255) == 10) { return i + 3; }
-            }
-        }
-        return -1;
-    }
+    public string MetricsJson() { return this.metrics.SnapshotJson(); }
+    public string MetricsSeriesJson(int seconds) { return this.metrics.SeriesJson(seconds); }
 }

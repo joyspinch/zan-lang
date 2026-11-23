@@ -209,10 +209,10 @@
       var off = canSelect ? 1 : 0;
       cols.forEach(function (col, i) {
         var hide = !!hiddenCols[i];
-        col.th.style.display = hide ? 'none' : '';
+        col.th.classList.toggle('zt-col-hidden', hide);
         for (var r = 0; r < tbody.rows.length; r++) {
           var td = tbody.rows[r].cells[i + off];
-          if (td) { td.style.display = hide ? 'none' : ''; }
+          if (td) { td.classList.toggle('zt-col-hidden', hide); }
         }
       });
     }
@@ -256,6 +256,12 @@
     }
     fitScrollX();
     window.addEventListener('resize', fitScrollX);
+    table._ztFitScrollX = fitScrollX;
+    table._ztDispose = function () {
+      window.removeEventListener('resize', fitScrollX);
+      table._ztFitScrollX = null;
+      table._ztDispose = null;
+    };
 
     function setDensity(mode) {
       var compact = mode === 'compact';
@@ -279,13 +285,12 @@
 
     if (canSelect) {
       var headCell = el('th', 'zt-cell');
-      headCell.style.width = '36px';
       var all = el('input');
       all.type = 'checkbox';
       all.setAttribute('aria-label', '全选');
       all.addEventListener('change', function () {
         rows().forEach(function (tr) {
-          if (tr.style.display !== 'none') { setRow(tr, all.checked); }
+          if (!tr.classList.contains('zt-row-hidden')) { setRow(tr, all.checked); }
         });
         apply();
       });
@@ -347,7 +352,7 @@
       list.forEach(function (tr) {
         var hit = state.query === '' ||
           tr.textContent.toLowerCase().indexOf(state.query) >= 0;
-        tr.style.display = hit ? '' : 'none';
+        tr.classList.toggle('zt-row-hidden', !hit);
         if (hit) { visible++; }
       });
 
@@ -388,7 +393,7 @@
         selInfo.textContent = state.selected > 0 ? '已选 ' + state.selected + ' 行' : '';
         selInfo.hidden = state.selected === 0;
         clear.hidden = state.selected === 0;
-        var boxes = rows().filter(function (tr) { return tr.style.display !== 'none'; });
+        var boxes = rows().filter(function (tr) { return !tr.classList.contains('zt-row-hidden'); });
         var checked = boxes.filter(function (tr) {
           var b = tr.querySelector('td.zt-cell input[type="checkbox"]');
           return b && b.checked;
@@ -416,5 +421,27 @@
     }
   }
 
-  window.ZanTable = { wire: wire, enhance: enhance };
+  function unwire(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var tables = scope.querySelectorAll('table[data-table]');
+    for (var i = 0; i < tables.length; i++) {
+      if (tables[i]._ztDispose) { tables[i]._ztDispose(); }
+    }
+    if (scope !== document && scope.matches && scope.matches('table[data-table]') && scope._ztDispose) {
+      scope._ztDispose();
+    }
+  }
+
+  function reflow(root) {
+    var scope = root && root.querySelectorAll ? root : document;
+    var tables = scope.querySelectorAll('table[data-table]');
+    for (var i = 0; i < tables.length; i++) {
+      if (tables[i]._ztFitScrollX) { tables[i]._ztFitScrollX(); }
+    }
+    if (scope !== document && scope.matches && scope.matches('table[data-table]') && scope._ztFitScrollX) {
+      scope._ztFitScrollX();
+    }
+  }
+
+  window.ZanTable = { wire: wire, unwire: unwire, reflow: reflow, enhance: enhance };
 })();

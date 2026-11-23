@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Diagnostics;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Model;
@@ -11,12 +12,13 @@ using Zan.Web;
 namespace Zan.Web.Admin.System;
 
 /* /admin/system/jobs 定时任务——配置驱动屏 + 三个特有动作（执行/
-   历史/清空：没有同质兄弟，按动词表豁免）。定义存 sys_job、执行体是
-   内置 kind，到点由各 worker 乐观锁抢单执行。启停与间隔行内改，类型
-   与参数走编辑框（参数语义随类型变）。任何写动作之后 JobHost 都要
+   历史/清空：没有同质兄弟，按动词表豁免）；标准 CRUD 端点由
+   CrudScreenController + MvcRoutesGenerator 自动供给。定义存 sys_job、
+   执行体是内置 kind，到点由各 worker 乐观锁抢单执行。启停与间隔行内改，
+   类型与参数走编辑框（参数语义随类型变）。任何写动作之后 JobHost 都要
    重读镜像，各自落在钩子里：Save→OnSaved、Field→OnFielded、
    Batch→OnBatched、Delete→OnDeleted（连带清运行历史）。 */
-[Custom(Authorization = CustomAuthorization.Grant, Group = "系统管理", GroupOrder = 90)]
+[Custom(Authorization = CustomAuthorization.Grant, Group = "系统管理", GroupOrder = 90, IsMenu = true, Icon = "mdi:clock-outline")]
 [Description("定时任务")]
 public class JobsController : CrudScreenController {
     protected override CrudConf Def() {
@@ -55,63 +57,6 @@ public class JobsController : CrudScreenController {
             .Created("createdAt").Updated("updatedAt")
             .Toggle("enabled");
     }
-
-    [HttpGet]
-    [Custom(IsMenu = true, Icon = "mdi:clock-outline", Perm = PermBit.View)]
-    [Description("定时任务")]
-    public async void Index() { await this.DoList(); }
-
-    [HttpPut]
-    [Custom(Perm = PermBit.View)]
-    [Description("任务表格配置")]
-    public void Conf() { this.DoConf(); }
-
-    /* adminUI 数据契约：POST {api}/list，方法名带 Data 避开撞名。 */
-    [HttpPost]
-    [Route("/admin/system/jobs/list")]
-    [Custom(Perm = PermBit.View)]
-    [Description("任务数据")]
-    public async void ListData() { await this.DoListData(); }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.View)]
-    [Description("任务行数据")]
-    public async void Edit() { await this.DoEdit(); }
-
-    [HttpPut]
-    [Custom(Perm = PermBit.View)]
-    [Description("任务表单配置")]
-    public void FormConf() { this.DoFormConf(); }
-
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("任务表单")]
-    public async void Form() { await this.DoForm(); }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("保存任务")]
-    public async void Save() { await this.DoSave(); }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.Delete)]
-    [Description("删除任务")]
-    public async void Delete() { await this.DoDelete(); }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.Update | PermBit.Delete)]
-    [Description("任务批量启停或删除")]
-    public async void Batch() { await this.DoBatch(); }
-
-    [HttpPost]
-    [Custom(Perm = PermBit.Update)]
-    [Description("任务行内修改")]
-    public async void Field() { await this.DoField(); }
-
-    [HttpGet]
-    [Custom(Perm = PermBit.View)]
-    [Description("任务选项")]
-    public async void Options() { await this.DoOptions(); }
 
     /* 保存即归一：类型白名单、参数随类型归一、间隔钳位、启停收 0/1；
        新行补运行态种子列（引擎只写声明列，这些列没有表单字段）。 */
@@ -173,20 +118,31 @@ public class JobsController : CrudScreenController {
 
     /* ---- 特有动作（动词表豁免：没有同质兄弟） ------------------- */
 
-    /* 手动执行一次：停用任务也允许，抢不到说明别的 worker 正在跑。 */
+    /* 手动执行一次，停用任务也允许。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("执行一次")]
     public async void Run() {
         int id = this.InInt("id", 0);
-        SysJob j = await this.SysJob.ById(id);
-        if (j == null) { this.Fail(404, "0404", "任务不存在"); }
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
-        string message = await JobHost.RunNow(db, j);
-        JobHost.Touch();
-        await this.Note("执行定时任务", j.name, true, message);
-        this.Saved("已执行：" + message);
+        SysJob j = await this.SysJob.ById(id);
+        if (j == null) { this.Fail(404, "0404", "任务不存在"); }
+        JobRunResult result = null;
+        try {
+            // 绑定请求租约，JobHost 的运行记录事务沿用这条连接。
+            result = await JobHost.RunNowResult(ZanSql.FromConnection(db), j);
+        } finally {
+            JobHost.Touch();
+        }
+        try {
+            await this.Note("执行定时任务", j.name, result.ok, result.message);
+        } catch (Exception ex) {
+            Log.Warn("[jobs] manual run audit failed: " + ex.Message);
+        }
+        if (!result.claimed) { this.Fail(409, "1005", result.message); }
+        if (!result.ok) { this.Fail(500, "2001", "任务执行失败，请查看运行历史"); }
+        this.Saved("已执行：" + result.message);
     }
 
     [HttpGet]

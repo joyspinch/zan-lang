@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Net.Tls;
@@ -63,6 +64,36 @@ public partial class HttpClient {
     private async int WriteRawBytes(PooledHttpConnection channel, byte[] data, int length) {
         if (channel.tls != null) { return await channel.tls.SendBytesAsync(data, length); }
         return await channel.conn.SendBytesAsync(data, length);
+    }
+
+    // 流式读取响应头至 "\r\n\r\n"（上限 256 KiB）：内部使用 StringBuilder 与
+    // 3 字节尾滑窗，避免 O(N^2) 拼接与全量重扫。返回 { headOnly, pending }，
+    // 未读到完整头部时返回 null。
+    private async string[] ReadStreamingHeadAsync(PooledHttpConnection channel,
+            HttpDeadlineToken watch) {
+        StringBuilder sb = new StringBuilder();
+        string tail = "";
+        int hb = -1;
+        while (hb < 0 && sb.Length < 262144) {
+            string c;
+            if (channel.tls != null) { c = await channel.tls.RecvAsync(65536); }
+            else { c = await channel.conn.RecvAsync(65536); }
+            if (c.Length == 0) { break; }
+            sb.Append(c);
+            string probe = tail.Length > 0 ? tail + c : c;
+            int hit = probe.IndexOf("\r\n\r\n", 0);
+            if (hit >= 0) {
+                hb = sb.Length - probe.Length + hit;
+            } else {
+                tail = probe.Length >= 3 ? probe.Substring(probe.Length - 3, 3) : probe;
+            }
+            HttpDeadline.Touch(watch, this.IdleBudget());
+        }
+        if (hb < 0) { return null; }
+        string full = sb.ToString();
+        string headOnly = full.Substring(0, hb);
+        string pending = full.Substring(hb + 4, full.Length - hb - 4);
+        return new string[] { headOnly, pending };
     }
 
     private static bool ResponseHasNoBody(HttpResponse response, string method) {

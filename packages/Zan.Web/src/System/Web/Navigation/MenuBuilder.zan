@@ -7,11 +7,65 @@ public class MenuBuilder {
     // Display name per URL segment ("system" -> "系统").
     private static StrMap labels = new StrMap();
     private static List<string> sections = new List<string>();
-    // 菜单项图标缺省值。早期的 [Custom] 是带构造参数的专用特性，Icon 参数
-    // 默认 "mdi:antenna"；特性泛化成通用名值对之后默认值无处安放，没写
-    // Icon 的菜单项就落成空串（前端按 icon 字符串渲染，空串=没有图标）。
-    // 缺省补在菜单构建这一层——它是 icon 的唯一消费方。
+    private static List<string> stripPrefixes = null;
+    private static List<string> excludedPaths = null;
+    // 菜单项图标缺省值（可通过 DefaultIcon 配置覆盖）。
     private static string defaultIcon = "mdi:antenna";
+
+    // 配置缺省图标；空串保持原值。
+    public static void DefaultIcon(string icon) {
+        if (icon != null && icon.Length > 0) {
+            MenuBuilder.defaultIcon = icon;
+        }
+    }
+
+    private static List<string> EnsureStripPrefixes() {
+        if (MenuBuilder.stripPrefixes == null) {
+            MenuBuilder.stripPrefixes = new List<string>();
+            MenuBuilder.stripPrefixes.Add("admin");
+            MenuBuilder.stripPrefixes.Add("api");
+        }
+        return MenuBuilder.stripPrefixes;
+    }
+
+    // 注册分组推断时需要剥离的首段路由前缀（默认已含 "admin"、"api"）。
+    public static void StripPrefix(string prefix) {
+        if (prefix == null || prefix.Length == 0) { return; }
+        List<string> list = MenuBuilder.EnsureStripPrefixes();
+        string p = prefix.StartsWith("/") ? prefix.Substring(1) : prefix;
+        p = p.ToLower();
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i] == p) { return; }
+        }
+        list.Add(p);
+    }
+
+    // 清空默认剥离前缀列表，完全按真实路径首段分组。
+    public static void ClearStripPrefixes() {
+        MenuBuilder.stripPrefixes = new List<string>();
+    }
+
+    // 从自动菜单中排除指定路径（例如通过独立顶栏入口打开的个人资料页）。
+    public static void Exclude(string path) {
+        if (path == null || path.Length == 0) { return; }
+        if (MenuBuilder.excludedPaths == null) {
+            MenuBuilder.excludedPaths = new List<string>();
+        }
+        for (int i = 0; i < MenuBuilder.excludedPaths.Count; i = i + 1) {
+            if (MenuBuilder.excludedPaths[i] == path) { return; }
+        }
+        MenuBuilder.excludedPaths.Add(path);
+    }
+
+    private static bool IsExcluded(Route r) {
+        if (r.MetaGet("Hidden") == "true") { return true; }
+        if (MenuBuilder.excludedPaths == null) { return false; }
+        string pt = r.Pattern();
+        for (int i = 0; i < MenuBuilder.excludedPaths.Count; i = i + 1) {
+            if (MenuBuilder.excludedPaths[i] == pt) { return true; }
+        }
+        return false;
+    }
 
     // 声明 URL 路由段对应的菜单分组名称与排序。
     public static void Section(string segment, string label) {
@@ -22,14 +76,19 @@ public class MenuBuilder {
     }
 
     public static async List<MenuNode> ForUser(WebApp app, string uid, string activePath) {
+        return await MenuBuilder.ForUser(app, uid, activePath, null);
+    }
+
+    public static async List<MenuNode> ForUser(WebApp app, string uid, string activePath, object scope) {
         List<Route> routes = app.Router().All();
         List<MenuNode> outp = new List<MenuNode>();
         for (int i = 0; i < routes.Count; i = i + 1) {
             Route r = routes[i];
             if (!r.InMenu()) { continue; }
+            if (MenuBuilder.IsExcluded(r)) { continue; }
             if (r.Method() != "GET") { continue; }
             if ((r.NeedsLogin() || r.NeedsAuth()) && uid.Length == 0) { continue; }
-            if (r.NeedsAuth() && !await app.Allow(uid, r.Action())) { continue; }
+            if (r.NeedsAuth() && !await app.Allow(uid, r.Action(), scope)) { continue; }
 
             MenuNode n = new MenuNode();
             string title = r.GetTitle();
@@ -139,10 +198,17 @@ public class MenuBuilder {
     private static List<string> Body(string pattern) {
         List<string> raw = Router.SplitPath(pattern);
         List<string> outp = new List<string>();
+        List<string> stripped = MenuBuilder.EnsureStripPrefixes();
         for (int i = 0; i < raw.Count; i = i + 1) {
             string s = raw[i];
             if (s.Length == 0 || s.StartsWith("{")) { continue; }
-            if (outp.Count == 0 && (s == "admin" || s == "api")) { continue; }
+            if (outp.Count == 0) {
+                bool skip = false;
+                for (int j = 0; j < stripped.Count; j = j + 1) {
+                    if (s == stripped[j]) { skip = true; break; }
+                }
+                if (skip) { continue; }
+            }
             outp.Add(s);
         }
         return outp;

@@ -153,21 +153,26 @@ public class NetworkInterface : IDisposable {
     }
 
     // 物理地址字节序列格式化为冒号分隔的大写十六进制
-    // （最多 8 字节）。
+    // （最多 8 字节，单缓冲直写零中间拼接）。
     private static string ReadMac(nint bytes, int length) {
         if (length <= 0) { return ""; }
         if (length > 8) { length = 8; }
-        string text = "";
+        string hex = "0123456789ABCDEF";
+        int outLen = length * 3 - 1;
+        byte[] buf = new byte[outLen];
+        int pos = 0;
         for (int i = 0; i < length; i = i + 1) {
-            if (i > 0) { text = text + ":"; }
-            text = text + NetworkInterface.HexByte(
-                (int)new Span<byte>(bytes + i, 1)[0]);
+            if (i > 0) { buf[pos] = 58; pos = pos + 1; }  // ':'
+            int b = (int)new Span<byte>(bytes + i, 1)[0];
+            buf[pos] = (byte)(hex[(b >> 4) & 15] & 255);
+            buf[pos + 1] = (byte)(hex[b & 15] & 255);
+            pos = pos + 2;
         }
-        return text;
+        return buf.ToStr(0, outLen);
     }
 
     // sockaddr 格式化为地址文本：AF_INET（2）为点分 IPv4，
-    // AF_INET6（23）为 8 组冒号分隔十六进制；其余家族返回空串。
+    // AF_INET6（23）为 8 组冒号分隔大写十六进制；其余家族返回空串。
     private static string ReadAddress(nint sockaddr, int length) {
         if (sockaddr == 0 || length < 2) { return ""; }
         int family = (int)new Span<ushort>(sockaddr, 1)[0];
@@ -177,44 +182,28 @@ public class NetworkInterface : IDisposable {
                 + "." + Convert.ToString((int)b[2]) + "." + Convert.ToString((int)b[3]);
         }
         if (family == 23 && length >= 24) {  // sockaddr_in6
-            string text = "";
+            string hex = "0123456789ABCDEF";
+            byte[] buf = new byte[39];
+            int pos = 0;
             for (int i = 0; i < 8; i = i + 1) {
-                if (i > 0) { text = text + ":"; }
+                if (i > 0) { buf[pos] = 58; pos = pos + 1; }  // ':'
                 int word = ((int)new Span<byte>(sockaddr + 8 + i * 2, 1)[0] << 8)
                     | (int)new Span<byte>(sockaddr + 9 + i * 2, 1)[0];
-                text = text + NetworkInterface.HexWord(word);
+                bool started = false;
+                int shift = 12;
+                while (shift >= 0) {
+                    int digit = (word >> shift) & 15;
+                    if (digit != 0 || started || shift == 0) {
+                        buf[pos] = (byte)(hex[digit] & 255);
+                        pos = pos + 1;
+                        started = true;
+                    }
+                    shift = shift - 4;
+                }
             }
-            return text;
+            return buf.ToStr(0, pos);
         }
         return "";
-    }
-
-    // 字节为两位大写十六进制。
-    private static string HexByte(int number) {
-        return NetworkInterface.HexDigit((number >> 4) & 15)
-            + NetworkInterface.HexDigit(number & 15);
-    }
-
-    // 16 位值为去前导零的大写十六进制（全零输出 "0"）。
-    private static string HexWord(int number) {
-        string text = "";
-        bool started = false;
-        int shift = 12;
-        while (shift >= 0) {
-            int digit = (number >> shift) & 15;
-            if (digit != 0 || started || shift == 0) {
-                text = text + NetworkInterface.HexDigit(digit);
-                started = true;
-            }
-            shift = shift - 4;
-        }
-        return text;
-    }
-
-    // 0-15 为单个大写十六进制字符。
-    private static string HexDigit(int number) {
-        string hex = "0123456789ABCDEF";
-        return hex.Substring(number & 15, 1);
     }
     #endif
 }

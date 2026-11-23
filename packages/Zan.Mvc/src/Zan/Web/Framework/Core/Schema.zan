@@ -1,11 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Web;
 using Zan.Web.Model;
-using Zan.Web.Model.Blog;
 using Zan.Web.Services;
 using Zan.Web.Dao;
 using Zan.Web.Core;
@@ -23,6 +23,7 @@ public async delegate bool SchemaHookFn(IDbConnection db);
 public class Schema {
     static SchemaHookFn beforeSchema;
     static SchemaHookFn afterSchema;
+    static List<Meta[]> extraModelGroups;
 
     public static void OnBeforeSchema(SchemaHookFn fn) {
         beforeSchema = fn;
@@ -30,6 +31,18 @@ public class Schema {
 
     public static void OnAfterSchema(SchemaHookFn fn) {
         afterSchema = fn;
+    }
+
+    /* 模块/扩展包注册自有的 CodeFirst 模型组（在 Boot.Run 之前调用），免于耦合到核心 FrameworkModels。 */
+    public static void AddModels(Meta[] models) {
+        if (models == null || models.Length == 0) { return; }
+        if (extraModelGroups == null) { extraModelGroups = new List<Meta[]>(); }
+        extraModelGroups.Add(models);
+    }
+
+    public static void AddModel(Meta model) {
+        if (model == null) { return; }
+        AddModels(new Meta[] { model });
     }
     /* 迁移互斥租约与等待参数。租约有效期必须远大于一次完整迁移的
        时长（秒级 schema、百万行级 backfill 也远用不到 15 分钟）；
@@ -74,8 +87,12 @@ public class Schema {
         /* SQLite 启用 WAL（其他引擎无操作）：多 worker 共享文件时避免写者阻塞读者。*/
         await DbSchema.UseWriteAheadLogAsync(db);
         if (!await db.SyncStructureAllAsync(FrameworkModels())) { return false; }
+        if (extraModelGroups != null) {
+            for (int i = 0; i < extraModelGroups.Count; i = i + 1) {
+                if (!await db.SyncStructureAllAsync(extraModelGroups[i])) { return false; }
+            }
+        }
         if (!await db.SyncStructureAllAsync(appModels)) { return false; }
-        await BackfillGenFlags(db);
 
         IZanSql fsql = ZanSql.FromConnection(db);
         if (!await SeedAdmin(fsql)) { return false; }
@@ -100,6 +117,7 @@ public class Schema {
             Meta.For<SysJobLog>(),
             Meta.For<SysLoginLog>(),
             Meta.For<SysMediaFile>(),
+            Meta.For<SysMenu>(),
             Meta.For<SysOperationLog>(),
             Meta.For<SysRole>(),
             Meta.For<SysRoleGrant>(),
@@ -110,9 +128,6 @@ public class Schema {
             Meta.For<SysWikiDoc>(),
             Meta.For<SysWikiRevision>(),
             Meta.For<SysWikiSpace>(),
-            Meta.For<Category>(),
-            Meta.For<Comment>(),
-            Meta.For<Post>(),
             Meta.For<MetricError>(),
             Meta.For<MetricLive>(),
             Meta.For<MetricMinute>(),
@@ -193,37 +208,6 @@ public class Schema {
             + "name = 'schema' AND holder = ?", ps);
     }
 
-    /* 表设计器的动作/行内编辑标志后补列时，旧行是 NULL（ORM 读作 0）——
-       直接按 0 解释会把既有模块的新增/编辑/删除/菜单和所有列的行内编辑
-       全部关掉。只在仍为 NULL 时回填为开（inQuick 跟随该列的 inEdit，与
-       旧行为"行内编辑从 inEdit 推导"一致）；显式设 0 的行是 0 不是 NULL，
-       不受影响，重复启动 no-op。
-       CodeFirst 对启动库里已存在的表不补列（只建缺失的表），模型新增的
-       标志列必须在这里先补上 —— 否则下面的 UPDATE 撞缺失列，DbException
-       直接崩掉启动。 */
-    private static async bool BackfillGenFlags(IDbConnection db) {
-        List<DbColumnDef> tableCols = new List<DbColumnDef>();
-        tableCols.Add(DbColumnDef.Of("hasCreate", "int"));
-        tableCols.Add(DbColumnDef.Of("hasEdit", "int"));
-        tableCols.Add(DbColumnDef.Of("hasDelete", "int"));
-        tableCols.Add(DbColumnDef.Of("menuEnabled", "int"));
-        int _t = await DbSchema.MigrateAsync(db, "sys_gen_table", tableCols);
-        List<DbColumnDef> columnCols = new List<DbColumnDef>();
-        columnCols.Add(DbColumnDef.Of("inQuick", "int"));
-        int _c = await DbSchema.MigrateAsync(db, "sys_gen_column", columnCols);
-        await db.ExecuteAsync(
-            "UPDATE sys_gen_table SET hasCreate = 1 WHERE hasCreate IS NULL");
-        await db.ExecuteAsync(
-            "UPDATE sys_gen_table SET hasEdit = 1 WHERE hasEdit IS NULL");
-        await db.ExecuteAsync(
-            "UPDATE sys_gen_table SET hasDelete = 1 WHERE hasDelete IS NULL");
-        await db.ExecuteAsync(
-            "UPDATE sys_gen_table SET menuEnabled = 1 WHERE menuEnabled IS NULL");
-        await db.ExecuteAsync(
-            "UPDATE sys_gen_column SET inQuick = inEdit WHERE inQuick IS NULL");
-        return true;
-    }
-
     /* 空库仅在明确配置强口令时创建引导账号；无配置则拒绝启动。*/
     public static async bool SeedAdmin(IZanSql fsql) {
         SysUserDao dao = new SysUserDao(fsql);
@@ -233,11 +217,11 @@ public class Schema {
         if (legacy != null) {
             /* 旧部署若仍使用公开的初始密码，必须更换后才能继续服务。*/
             if (legacy.isSuper == 1 &&
-                AuthUser.Verify("admin1234", legacy.passwordSalt, legacy.passwordHash)) {
+                AuthUser.Verify("admin1234", legacy.passwordHash)) {
                 if (password == null || password.Length < 12 || password == "admin1234") {
                     throw new Exception("legacy admin password must be rotated with auth.bootstrapPassword or ZAN_BOOTSTRAP_ADMIN_PASSWORD");
                 }
-                int changed = await dao.ResetPassword(legacy.id, "",
+                int changed = await dao.ResetPassword(legacy.id,
                     AuthUser.NewHash(password), WebApp.NowSeconds());
                 if (changed < 1) { throw new Exception("legacy admin password rotation failed"); }
             }
@@ -248,7 +232,6 @@ public class Schema {
         }
         SysUser admin = new SysUser();
         admin.username = "admin";
-        admin.passwordSalt = "";
         admin.passwordHash = AuthUser.NewHash(password);
         admin.nickname = "系统管理员";
         admin.status = AuthUser.Active;
@@ -262,9 +245,9 @@ public class Schema {
         return created != null && created.id == _id && created.isSuper == 1;
     }
 
-    /* 两个内置角色：admin（全部管理）和 editor（仅内容管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
+    /* 内置角色：admin（全部管理）。bootstrap 账号绕过角色表，防止误操作锁死。具体权限由 SyncRoleGrants 从路由表填充。*/
     private static async bool SeedRoles(IZanSql fsql) {
-        /* 业务迁移可以先创建自己的角色。内置角色逐 code 补缺，不更新已有
+        /* 业务迁移可以先创建自己的角色。内置角色按 code 补缺，不更新已有
            角色或任何授权，保留运维修改与自定义角色的权限。 */
         SysRoleDao dao = new SysRoleDao(fsql);
         SysRole admin = await dao.ByCode("admin");
@@ -275,15 +258,7 @@ public class Schema {
             admin = await dao.ByCode("admin");
             if (admin == null || admin.id != id) { return false; }
         }
-        SysRole editor = await dao.ByCode("editor");
-        if (editor == null) {
-            int id = await AddRole(fsql, "内容编辑", "editor", 10,
-                "只能管理博客内容", DataScope.RoleAll);
-            if (id <= 0) { return false; }
-            editor = await dao.ByCode("editor");
-            if (editor == null || editor.id != id) { return false; }
-        }
-        return admin.id > 0 && editor.id > 0;
+        return admin.id > 0;
     }
 
     private static async int AddRole(IZanSql fsql, string name, string code, int rank,
@@ -294,7 +269,6 @@ public class Schema {
         r.rank = rank;
         r.status = 1;
         r.description = description;
-        /* 旧行缺此列则读作 0，DataScope 视为 全部数据，升级不缩权。*/
         r.dataScope = dataScope;
         r.scopeDepts = "";
         r.createdAt = WebApp.NowSeconds();
@@ -316,12 +290,12 @@ public class Schema {
     private static async bool SeedDepartments(IZanSql fsql) {
         int have = await fsql.Select<SysDepartment>().CountAsync();
         if (have > 0) { return true; }
-        if (!await AddDept(fsql, 0, "总部", "root", 1)) { return false; }
-        if (!await AddDept(fsql, 1, "技术部", "tech", 2)) { return false; }
-        return await AddDept(fsql, 1, "内容运营", "content", 3);
+        int rootId = await AddDept(fsql, 0, "总部", "root", 1);
+        if (rootId <= 0) { return false; }
+        return await AddDept(fsql, rootId, "技术部", "tech", 2) > 0;
     }
 
-    private static async bool AddDept(IZanSql fsql, int parentId, string name,
+    private static async int AddDept(IZanSql fsql, int parentId, string name,
                            string code, int sortOrder) {
         SysDepartment d = new SysDepartment();
         d.parentId = parentId;
@@ -330,8 +304,9 @@ public class Schema {
         d.leaderUserId = 0;
         d.sortOrder = sortOrder;
         d.status = 1;
-        int _id = await fsql.Insert<SysDepartment>(d).ExecuteIdentityAsync();
-        return _id > 0;
+        d.createdAt = WebApp.NowSeconds();
+        d.updatedAt = d.createdAt;
+        return await fsql.Insert<SysDepartment>(d).ExecuteIdentityAsync();
     }
 
     private static async bool SeedDicts(IZanSql fsql) {
@@ -339,10 +314,7 @@ public class Schema {
         if (have > 0) { return true; }
         if (!await AddDictType(fsql, "user_status", "账号状态")) { return false; }
         if (!await AddDictItem(fsql, "user_status", "1", "启用", 1)) { return false; }
-        if (!await AddDictItem(fsql, "user_status", "0", "禁用", 2)) { return false; }
-        if (!await AddDictType(fsql, "post_status", "文章状态")) { return false; }
-        if (!await AddDictItem(fsql, "post_status", "1", "已发布", 1)) { return false; }
-        return await AddDictItem(fsql, "post_status", "0", "草稿", 2);
+        return await AddDictItem(fsql, "user_status", "0", "禁用", 2);
     }
 
     private static async bool AddDictType(IZanSql fsql, string code, string name) {
@@ -398,10 +370,6 @@ public class Schema {
     }
 
     private static async bool SeedFeatureSettings(IZanSql fsql) {
-        if (!await EnsureSetting(fsql, "内容与评论", "blog.comment.enabled",
-            "开放评论", "1", "switch", "关闭后前台不再显示评论框，已有评论仍可在后台查看", 40)) { return false; }
-        if (!await EnsureSetting(fsql, "内容与评论", "blog.comment.review",
-            "评论需审核", "1", "switch", "开启时新评论要在后台通过后才公开显示", 41)) { return false; }
         if (!await EnsureSetting(fsql, "基本", "site.timezone", "时区偏移",
             "480", "text",
             "与 UTC 的分钟偏移，例如 480 表示 UTC+8（北京时间）；服务器在境外时按此换算显示",
@@ -494,118 +462,36 @@ public class Schema {
 
     
     /* ---- 路由派生授权 ---- */
-    /* 存在的权限 = 路由表。部署决策写入 sys_role_grant 行。内置 admin 始终覆盖全部管理屏，内置 editor 始终覆盖内容屏。本方法只 INSERT，操作者撤销的权限不会被重新添加。*/
-
-    /* 将 mask=0 的旧授权行按 screen 合并为一条屏掩码行；仅 mask=0 的行参与，第二次启动起即 no-op。未声明位的 action 丢弃并在 Perm.Index boot 行提示。*/
-    private static async bool MigrateGrants(IZanSql fsql) {
-        List<SysRoleGrant> old = await fsql.Select<SysRoleGrant>()
-            .Where(a => a.mask == 0).ToListAsync();
-        if (old.Count == 0) { return true; }
-
-        List<string> keys = new List<string>();
-        List<int> masks = new List<int>();
-        for (int i = 0; i < old.Count; i = i + 1) {
-            SysRoleGrant g = old[i];
-            int bit = Perm.BitOf(g.action);
-            if (bit == 0) { continue; }
-            string key = Convert.ToString(g.roleId) + "|"
-                + Perm.ScreenOf(g.action);
-            int at = keys.IndexOf(key);
-            if (at < 0) { keys.Add(key); masks.Add(bit); }
-            else { masks[at] = masks[at] | bit; }
-        }
-
-        int _gone = await fsql.Delete<SysRoleGrant>().Where(a => a.mask == 0)
-            .ExecuteAffrowsAsync();
-        long now = WebApp.NowSeconds();
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            string key = keys[i];
-            int bar = key.IndexOf("|");
-            int roleId = Convert.ToInt32(key.Substring(0, bar));
-            string screen = key.Substring(bar + 1);
-            SysRoleGrant have = await fsql.Select<SysRoleGrant>()
-                .Where(a => a.roleId == roleId && a.action == screen)
-                .FirstAsync();
-            if (have != null) {
-                int merged = have.mask | masks[i];
-                int _n = await fsql.Update<SysRoleGrant>()
-                    .Set(a => a.mask, merged)
-                    .Where(a => a.id == have.id).ExecuteAffrowsAsync();
-                continue;
-            }
-            if (!await Grant(fsql, roleId, screen, masks[i], now)) { return false; }
-        }
-        Console.WriteLine("[rbac] 旧授权已合并为 "
-            + Convert.ToString(keys.Count) + " 条屏掩码");
-        return true;
-    }
-
-    /* 将不再存在的旧屏键迁移到带模块前缀的新键；无匹配或多匹配的不动并在日志中标出。*/
-    private static async bool MigrateGrantKeys(IZanSql fsql) {
-        List<SysRoleGrant> rows = await fsql.Select<SysRoleGrant>()
-            .Where(a => a.mask != 0).ToListAsync();
-        int moved = 0;
-        List<string> stray = new List<string>();
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            SysRoleGrant g = rows[i];
-            if (Perm.MaskOf(g.action) != 0) { continue; }
-            string now = Perm.Qualify(g.action);
-            if (now.Length == 0) { stray.Add(g.action); continue; }
-            int gid = g.id;
-            int _n = await fsql.Update<SysRoleGrant>().Set(a => a.action, now)
-                .Where(a => a.id == gid).ExecuteAffrowsAsync();
-            moved = moved + 1;
-        }
-        if (moved > 0) {
-            Console.WriteLine("[rbac] " + Convert.ToString(moved)
-                + " 条授权已改用带模块前缀的屏键");
-        }
-        if (stray.Count > 0) {
-            Console.WriteLine("[rbac] " + Convert.ToString(stray.Count)
-                + " 条授权的屏幕已不存在，保留未动: "
-                + Perm.Join(stray, 8));
-        }
-        return true;
-    }
-
-    /* 给内置角色补发尚未持有的受控 action。每次启动安全，永不删除。*/
+    /* 存在的权限 = 路由表。部署决策写入 sys_role_grant 行。内置 admin 始终覆盖全部受控管理屏。本方法只 INSERT，操作者撤销的权限不会被重新添加。*/
     public static async bool SyncRoleGrants(WebApp app) {
         IDbConnection db = await AuthUser.Lease();
         if (db == null) { return false; }
         IZanSql fsql = ZanSql.FromConnection(db);
         try {
-            if (!await MigrateGrants(fsql)) { return false; }
-            if (!await MigrateGrantKeys(fsql)) { return false; }
             SysRole admin = await fsql.Select<SysRole>()
                 .Where(a => a.code == "admin").FirstAsync();
-            SysRole editor = await fsql.Select<SysRole>()
-                .Where(a => a.code == "editor").FirstAsync();
-            if (admin == null && editor == null) { return true; }
+            if (admin == null) { return true; }
 
             List<SysRoleGrant> rows = await fsql.Select<SysRoleGrant>().ToListAsync();
-            string adminHas = ",";
-            string editorHas = ",";
+            bool adminEmpty = true;
             for (int i = 0; i < rows.Count; i = i + 1) {
-                SysRoleGrant g = rows[i];
-                if (admin != null && g.roleId == admin.id) {
-                    adminHas = adminHas + g.action + ",";
-                }
-                if (editor != null && g.roleId == editor.id) {
-                    editorHas = editorHas + g.action + ",";
+                if (rows[i].roleId == admin.id) {
+                    adminEmpty = false;
+                    break;
                 }
             }
-
-            bool fillAdmin = admin != null && adminHas == ",";
-            bool fillEditor = editor != null && editorHas == ",";
-            if (!fillAdmin && !fillEditor) { return true; }
+            if (!adminEmpty) { return true; }
 
             long now = WebApp.NowSeconds();
             List<Route> routes = app.Router().All();
             List<string> screens = new List<string>();
             List<int> masks = new List<int>();
-            List<bool> content = new List<bool>();
+            StrMap seenRoutes = new StrMap();
             for (int i = 0; i < routes.Count; i = i + 1) {
                 Route r = routes[i];
+                string routeKey = r.Method() + " " + r.Pattern();
+                if (seenRoutes.Has(routeKey)) { continue; }
+                seenRoutes.Set(routeKey, "1");
                 if (r.Action().Length == 0 || !r.NeedsAuth()) { continue; }
                 int bit = Perm.BitOf(r.Action());
                 if (bit == 0) { continue; }
@@ -614,18 +500,12 @@ public class Schema {
                 if (at < 0) {
                     screens.Add(screen);
                     masks.Add(bit);
-                    content.Add(IsContent(r.Pattern()));
                 } else {
                     masks[at] = masks[at] | bit;
-                    if (IsContent(r.Pattern())) { content[at] = true; }
                 }
             }
             for (int i = 0; i < screens.Count; i = i + 1) {
-                if (fillAdmin && !await Grant(fsql, admin.id, screens[i], masks[i], now)) {
-                    return false;
-                }
-                if (fillEditor && content[i] &&
-                    !await Grant(fsql, editor.id, screens[i], masks[i], now)) {
+                if (!await Grant(fsql, admin.id, screens[i], masks[i], now)) {
                     return false;
                 }
             }
@@ -633,10 +513,6 @@ public class Schema {
         } finally {
             AuthUser.Give(db);
         }
-    }
-
-    private static bool IsContent(string pattern) {
-        return pattern.StartsWith("/admin/content/") || pattern == "/admin";
     }
 
     /* 内置定时任务种子：日志清理默认启用（每天一次、保留 30 天），

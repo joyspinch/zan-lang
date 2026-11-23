@@ -19,7 +19,7 @@ public class TlsStream : IDisposable {
     [DllImport("crt", EntryPoint = "zan_monotonic_us")]
     private static extern long MonotonicUs();
 
-    private TlsEngine engine;
+    public TlsEngine engine;
     private nint sock;
     private bool open;
     private HttpDeadlineToken watch;
@@ -65,19 +65,39 @@ public class TlsStream : IDisposable {
         this.flushWaiters = new List<AsyncGate>();
     }
 
-    private static TlsStream Setup(TlsContext ctx, nint sock, string host) {
+    private static TlsStream SetupClient(TlsContext ctx, nint sock, string host) {
         if (ctx == null) { TlsStream.SetLastError("TLS 上下文缺失"); return null; }
         #if !WINDOWS
-        if (!ctx.server && ctx.verify && ctx.certPolicy == null
+        if (ctx.verify && ctx.certPolicy == null
             && (ctx.trustedCerts == null || ctx.trustedCerts.Count == 0)) {
             TlsStream.SetLastError("TLS 系统信任根不可用；需显式 AddTrustedCert 配置 CA");
             return null;
         }
         #endif
         TlsStream s = new TlsStream();
-        s.engine = new TlsEngine(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, ctx.server, ctx.certFile, ctx.keyFile);
+        s.engine = TlsEngine.CreateClient(host, !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts);
+        if (ctx.cachedCert != null) {
+            s.engine.SetCredentials(ctx.cachedCert, ctx.cachedKey, ctx.cachedEcKey);
+            s.engine.SetCertChain(ctx.cachedChain);
+        }
+        if (ctx.alpnProtocols != null && ctx.alpnProtocols.Count > 0) {
+            s.engine.SetAlpnProtocols(ctx.alpnProtocols);
+        }
+        s.sock = sock;
+        s.scratch = new byte[SCRATCH + 1];
+        s.open = true;
+        return s;
+    }
+
+    private static TlsStream SetupServer(TlsContext ctx, nint sock) {
+        if (ctx == null) { TlsStream.SetLastError("TLS 上下文缺失"); return null; }
+        TlsStream s = new TlsStream();
+        s.engine = new TlsEngine("", !ctx.verify, ctx.disableTls13, ctx.pins, ctx.pinRequired, ctx.certPolicy, ctx.trustedCerts, true, ctx.certFile, ctx.keyFile);
         s.engine.SetCredentials(ctx.cachedCert, ctx.cachedKey, ctx.cachedEcKey);
         s.engine.SetCertChain(ctx.cachedChain);
+        if (ctx.requireClientCert) {
+            s.engine.SetRequireClientCert(true, ctx.clientTrustedCerts);
+        }
         if (ctx.alpnProtocols != null && ctx.alpnProtocols.Count > 0) {
             s.engine.SetAlpnProtocols(ctx.alpnProtocols);
         }
@@ -93,7 +113,7 @@ public class TlsStream : IDisposable {
     }
 
     public static async TlsStream AcceptAsync(TlsContext ctx, nint sock, int timeoutMs) {
-        TlsStream s = Setup(ctx, sock, "");
+        TlsStream s = SetupServer(ctx, sock);
         if (s == null) { return null; }
         int ok = await s.HandshakeAsync(timeoutMs);
         if (ok != 1) {
@@ -110,7 +130,7 @@ public class TlsStream : IDisposable {
 
     public static async TlsStream ConnectAsync(TlsContext ctx, nint sock, string host, int timeoutMs) {
         TlsStream.SetLastError("");
-        TlsStream s = Setup(ctx, sock, host);
+        TlsStream s = SetupClient(ctx, sock, host);
         if (s == null) {
             if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
@@ -132,7 +152,7 @@ public class TlsStream : IDisposable {
 
     public static TlsStream ConnectStepped(TlsContext ctx, nint sock, string host) {
         TlsStream.SetLastError("");
-        TlsStream s = TlsStream.SetupStepped(ctx, sock, host);
+        TlsStream s = TlsStream.SetupStepped(SetupClient(ctx, sock, host));
         if (s == null) {
             if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
@@ -143,7 +163,7 @@ public class TlsStream : IDisposable {
 
     public static TlsStream AcceptStepped(TlsContext ctx, nint sock) {
         TlsStream.SetLastError("");
-        TlsStream s = TlsStream.SetupStepped(ctx, sock, "");
+        TlsStream s = TlsStream.SetupStepped(SetupServer(ctx, sock));
         if (s == null) {
             if (TlsStream.LastError() == "") { TlsStream.SetLastError("TLS 引擎初始化失败"); }
             return null;
@@ -151,8 +171,7 @@ public class TlsStream : IDisposable {
         return s;
     }
 
-    private static TlsStream SetupStepped(TlsContext ctx, nint sock, string host) {
-        TlsStream s = Setup(ctx, sock, host);
+    private static TlsStream SetupStepped(TlsStream s) {
         if (s == null) { return null; }
         s.pendingOut = new byte[SCRATCH * 2 + 1];
         s.pendingLen = 0;

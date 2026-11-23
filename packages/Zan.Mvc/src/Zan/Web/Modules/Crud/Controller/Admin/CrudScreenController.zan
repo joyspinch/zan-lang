@@ -29,7 +29,7 @@ namespace Zan.Web.Admin;
  * 审计经 Note 落 sys_operation_log；权限位由子类属性壳显式声明，未
  * 声明位的动作不可授权（与调度器同一掩码）。
  */
-public class CrudScreenController : AdminController {
+public abstract class CrudScreenController : AdminController {
     /* 最近一次 LoadKeys 的行键集：结果集列名 + 声明的虚拟列（OnRows
        投影）。StrMap 无键枚举，行 JSON 序列化按此显式键集进行。 */
     protected List<string> rowKeys;
@@ -95,11 +95,55 @@ public class CrudScreenController : AdminController {
         return "";
     }
 
-    /* ---- 基座端点（子类属性壳转发到这里） ------------------------ */
+    /* ---- 基座端点（子类属性壳或 MvcRoutesGenerator 自动转发到这里） ---- */
+
+    /* 解析字段上绑定的 sys_dict 字典项，写回列/筛选/表单的 options。 */
+    protected async Task ResolveDicts(CrudConf conf) {
+        if (conf == null || !this.DbReady()) { return; }
+        conf.Seal();
+        StrMap cache = new StrMap();
+        bool any = false;
+        for (int i = 0; i < conf.cols.Count; i = i + 1) {
+            if (conf.cols[i].dictCode != null && conf.cols[i].dictCode.Length > 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) { return; }
+        for (int i = 0; i < conf.cols.Count; i = i + 1) {
+            ListCol c = conf.cols[i];
+            if (c.dictCode == null || c.dictCode.Length == 0) { continue; }
+            c.opts = await LoadDictOpts(c.dictCode, cache);
+        }
+        for (int i = 0; i < conf.fs.Count; i = i + 1) {
+            ListFilter sf = conf.fs[i];
+            if (sf.dictCode == null || sf.dictCode.Length == 0) { continue; }
+            sf.options = CrudConf.SelectOpts(await LoadDictOpts(sf.dictCode, cache));
+        }
+        for (int i = 0; i < conf.forms.Count; i = i + 1) {
+            FormField f = conf.forms[i];
+            if (f.dictCode == null || f.dictCode.Length == 0) { continue; }
+            f.options = CrudConf.SelectOpts(await LoadDictOpts(f.dictCode, cache));
+        }
+    }
+
+    private async string LoadDictOpts(string dictCode, StrMap cache) {
+        if (cache.Has(dictCode)) { return cache.Get(dictCode); }
+        List<SysDictItem> items = await this.SysDictItem.ByTypeCodeActive(dictCode);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(items[i].value + "=" + items[i].label);
+        }
+        string opts = sb.ToString();
+        cache.Set(dictCode, opts);
+        return opts;
+    }
 
     /* 列表屏：声明收集条件 → 计数 → 取页 → 投影钩子 → 整段渲染。 */
     public virtual async Task DoList() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         ListPage lp = conf.Build(false);
         ViewData d = await this.Layout(conf.Title());
         /* 引擎自家屏渲染走 CrudPage（覆写 Page 的壳），故此处不套 PageReady。 */
@@ -124,6 +168,7 @@ public class CrudScreenController : AdminController {
        条件仍由声明收集：JSON 体筛选与表单编码共用 InAny 入口。 */
     public virtual async Task DoListData() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         ListPage lp = conf.Build(false);
         if (!this.DataReady()) { return; }
         List<OrmCond> conds = lp.Collect(this);
@@ -170,10 +215,21 @@ public class CrudScreenController : AdminController {
        pass→password、opts→select；校验规则同源导出。 */
     public virtual void DoFormConf() {
         CrudConf conf = this.Def();
+        conf.Seal();
+        WriteFormConfJson(conf);
+    }
+
+    public virtual async Task DoFormConfAsync() {
+        CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
+        WriteFormConfJson(conf);
+    }
+
+    private void WriteFormConfJson(CrudConf conf) {
         JsonWriter w = new JsonWriter();
         w.WriteStartObject();
         w.WriteProperty("title", conf.Title());
-        w.WriteProperty("width", "600px");
+        w.WriteProperty("width", conf.formWidth != null && conf.formWidth.Length > 0 ? conf.formWidth : "600px");
         w.WriteProperty("labelWidth", 100);
         w.WriteProperty("size", "medium");
         w.WriteProperty("cols", 24);
@@ -194,6 +250,13 @@ public class CrudScreenController : AdminController {
             w.WriteProperty("required", f.required);
             if (f.ph.Length > 0) { w.WriteProperty("placeholder", f.ph); }
             if (f.value.Length > 0) { w.WriteProperty("defaultValue", f.value); }
+            if (f.showWhenField != null && f.showWhenField.Length > 0) {
+                w.WritePropertyName("visibleWhen");
+                w.WriteStartObject();
+                w.WriteProperty("field", f.showWhenField);
+                w.WriteProperty("values", f.showWhenValues);
+                w.WriteEndObject();
+            }
             if (f.kind == "select") {
                 w.WritePropertyName("options");
                 WriteSelectOpts(w, f.options);
@@ -223,10 +286,17 @@ public class CrudScreenController : AdminController {
         CrudOps.Conf(this, this.Def().Build(false));
     }
 
+    public virtual async Task DoConfAsync() {
+        CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
+        CrudOps.Conf(this, conf.Build(false));
+    }
+
     /* 表单对话框：FormPage 产出表单体，共享壳 Admin._FormDialog 渲染；
        编辑时按行回显（pass 字段恒不回显）。 */
     public virtual async Task DoForm() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         int id = this.InAnyInt("id");
         bool isEdit = id > 0;
         if (!await this.Can(isEdit ? (int)PermBit.Update : (int)PermBit.Create)) {
@@ -270,6 +340,7 @@ public class CrudScreenController : AdminController {
        OnSaving 钩子 → 插入/更新 → 审计 → OnSaved 钩子。 */
     public virtual async Task DoSave() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         int id = this.InAnyInt("id");
         bool isNew = id <= 0;
         if (!await this.Can(isNew ? (int)PermBit.Create : (int)PermBit.Update)) {
@@ -359,6 +430,7 @@ public class CrudScreenController : AdminController {
        子表/缓存副作用；权限按实际分支复核。 */
     public virtual async Task DoBatch() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         string value = this.InAny("value");
         if (!await this.Can(value.Length == 0 ? (int)PermBit.Delete : (int)PermBit.Update)) {
             this.Fail(403, "0403", "无操作权限"); return;
@@ -409,6 +481,7 @@ public class CrudScreenController : AdminController {
     /* 行内单字段修改：field 必须在行内白名单内，行必须存在。 */
     public virtual async Task DoField() {
         CrudConf conf = this.Def();
+        await this.ResolveDicts(conf);
         int id = this.InAnyInt("id");
         if (id <= 0) {
             /* adminUI fieldAsync 把整行放 data 里提交：{data:{id:..},

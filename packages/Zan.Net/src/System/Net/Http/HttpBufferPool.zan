@@ -1,36 +1,82 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 
 namespace System.Net.Http;
 
-// Worker / 协程级序列化缓冲复用池：
+internal class HttpBufferShard {
+    public List<StringBuilder> sbPool;
+    public List<byte[]> pool16k;
+    public List<byte[]> pool64k;
+    public List<byte[]> pool256k;
+
+    public HttpBufferShard() {
+        this.sbPool = new List<StringBuilder>();
+        this.pool16k = new List<byte[]>();
+        this.pool64k = new List<byte[]>();
+        this.pool256k = new List<byte[]>();
+    }
+}
+
+// Worker / 协程级序列化缓冲复用池（16 分片按线程哈希，消除多核全局锁争用）：
 // 1. 为 HTTP 响应报文头构建与正文序列化提供零分配 StringBuilder 借还机制。
 // 2. 为 HTTP 全报文（头 + 正文）流式装配提供分级 byte[] 零分配复用池（16K / 64K / 256K）。
 // 借出时自动就绪，归还时施加容量保护（超大缓冲区直接淘汰，防止常驻内存膨胀）。
 public class HttpBufferPool {
-    private static List<StringBuilder> pool = new List<StringBuilder>();
-    private static int maxPoolSize = 512;
+    private static const int SHARD_COUNT = 16;
+    private static HttpBufferShard[] shards = HttpBufferPool.CreateShards();
+    private static int maxPoolSizePerShard = 32;
     // 超过 128KB 的异常大响应缓冲区不回池，直接由运行时析构回收
     private static int maxRetainCapacity = 131072;
+    private static int maxBytePoolSizePerShard = 16;
 
-    // 分级 byte[] 缓冲池
-    private static List<byte[]> pool16k = new List<byte[]>();
-    private static List<byte[]> pool64k = new List<byte[]>();
-    private static List<byte[]> pool256k = new List<byte[]>();
-    private static int maxBytePoolSize = 256;
+    private static HttpBufferShard[] CreateShards() {
+        HttpBufferShard[] arr = new HttpBufferShard[SHARD_COUNT];
+        for (int i = 0; i < SHARD_COUNT; i = i + 1) {
+            arr[i] = new HttpBufferShard();
+        }
+        return arr;
+    }
 
-    // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
-    public static StringBuilder Rent() {
-        lock (pool) {
-            int n = pool.Count;
+    private static int ShardIndex() {
+        long tid = Thread.CurrentId();
+        long h = (tid ^ (tid >> 4) ^ (tid >> 8)) * 2654435761L;
+        return (int)(h & 15);
+    }
+
+    private static StringBuilder PopSb(HttpBufferShard s) {
+        lock (s.sbPool) {
+            int n = s.sbPool.Count;
             if (n > 0) {
-                StringBuilder sb = pool[n - 1];
-                pool.RemoveAt(n - 1);
+                StringBuilder sb = s.sbPool[n - 1];
+                s.sbPool.RemoveAt(n - 1);
                 sb.Clear();
                 return sb;
             }
         }
+        return null;
+    }
+
+    private static byte[] PopBytes(List<byte[]> list) {
+        lock (list) {
+            int n = list.Count;
+            if (n > 0) {
+                byte[] b = list[n - 1];
+                list.RemoveAt(n - 1);
+                return b;
+            }
+        }
+        return null;
+    }
+
+    // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
+    public static StringBuilder Rent() {
+        int idx = HttpBufferPool.ShardIndex();
+        StringBuilder sb = HttpBufferPool.PopSb(shards[idx]);
+        if (sb != null) { return sb; }
+        sb = HttpBufferPool.PopSb(shards[(idx + 1) & 15]);
+        if (sb != null) { return sb; }
         return new StringBuilder();
     }
 
@@ -39,45 +85,37 @@ public class HttpBufferPool {
         if (sb == null) { return; }
         if (sb.Length > maxRetainCapacity) { return; }
         sb.Clear();
-        lock (pool) {
-            if (pool.Count >= maxPoolSize) { return; }
-            pool.Add(sb);
+        HttpBufferShard s = shards[HttpBufferPool.ShardIndex()];
+        lock (s.sbPool) {
+            if (s.sbPool.Count >= maxPoolSizePerShard) { return; }
+            s.sbPool.Add(sb);
         }
     }
 
     // 租借指定最小容量的字节缓冲区：按 16K / 64K / 256K 梯度分桶，超大直分不回池。
     public static byte[] RentBytes(int minCap) {
+        int idx = HttpBufferPool.ShardIndex();
+        HttpBufferShard s0 = shards[idx];
+        HttpBufferShard s1 = shards[(idx + 1) & 15];
         if (minCap <= 16384) {
-            lock (pool16k) {
-                int n = pool16k.Count;
-                if (n > 0) {
-                    byte[] b = pool16k[n - 1];
-                    pool16k.RemoveAt(n - 1);
-                    return b;
-                }
-            }
+            byte[] b = HttpBufferPool.PopBytes(s0.pool16k);
+            if (b != null) { return b; }
+            b = HttpBufferPool.PopBytes(s1.pool16k);
+            if (b != null) { return b; }
             return new byte[16384];
         }
         if (minCap <= 65536) {
-            lock (pool64k) {
-                int n = pool64k.Count;
-                if (n > 0) {
-                    byte[] b = pool64k[n - 1];
-                    pool64k.RemoveAt(n - 1);
-                    return b;
-                }
-            }
+            byte[] b = HttpBufferPool.PopBytes(s0.pool64k);
+            if (b != null) { return b; }
+            b = HttpBufferPool.PopBytes(s1.pool64k);
+            if (b != null) { return b; }
             return new byte[65536];
         }
         if (minCap <= 262144) {
-            lock (pool256k) {
-                int n = pool256k.Count;
-                if (n > 0) {
-                    byte[] b = pool256k[n - 1];
-                    pool256k.RemoveAt(n - 1);
-                    return b;
-                }
-            }
+            byte[] b = HttpBufferPool.PopBytes(s0.pool256k);
+            if (b != null) { return b; }
+            b = HttpBufferPool.PopBytes(s1.pool256k);
+            if (b != null) { return b; }
             return new byte[262144];
         }
         return new byte[minCap];
@@ -87,17 +125,18 @@ public class HttpBufferPool {
     public static void ReturnBytes(byte[] buf) {
         if (buf == null) { return; }
         int len = buf.Length;
+        HttpBufferShard s = shards[HttpBufferPool.ShardIndex()];
         if (len == 16384) {
-            lock (pool16k) {
-                if (pool16k.Count < maxBytePoolSize) { pool16k.Add(buf); }
+            lock (s.pool16k) {
+                if (s.pool16k.Count < maxBytePoolSizePerShard) { s.pool16k.Add(buf); }
             }
         } else if (len == 65536) {
-            lock (pool64k) {
-                if (pool64k.Count < maxBytePoolSize) { pool64k.Add(buf); }
+            lock (s.pool64k) {
+                if (s.pool64k.Count < maxBytePoolSizePerShard) { s.pool64k.Add(buf); }
             }
         } else if (len == 262144) {
-            lock (pool256k) {
-                if (pool256k.Count < maxBytePoolSize) { pool256k.Add(buf); }
+            lock (s.pool256k) {
+                if (s.pool256k.Count < maxBytePoolSizePerShard) { s.pool256k.Add(buf); }
             }
         }
     }

@@ -52,8 +52,15 @@ public class AesGcm {
         return gfmul(x, H);
     }
 
-    // GHASH 硬件快路径（PCLMUL/PMULL 流式内核）：AAD 段、密文段
-    // 再接长度块在 C 端 SIMD 寄存器流水线一次性完成，避免逐块跨语言与内存拷贝。
+    private static string lengthBlock(int aadLen, int dataLen) {
+        byte[] lb = new byte[16];
+        store64(lb, 0, (long)aadLen * 8);
+        store64(lb, 8, (long)dataLen * 8);
+        string lbStr = lb;
+        return lbStr;
+    }
+
+    // GHASH 硬件快路径（PCLMUL/PMULL 流式内核），不可用时返回 null 走纯 Zan 回退。
     private static List<long> hwGhash(List<long> H, string aad, int aadLen, string data, int dataLen) {
         byte[] hBlk = new byte[16];
         store64(hBlk, 0, H[0]);
@@ -68,11 +75,7 @@ public class AesGcm {
         if (dataLen > 0) {
             if (NativeMemory.GhashUpdate(hStr, data, (long)dataLen, yStr) != 0) { return null; }
         }
-        // 长度块：[aadBits(64) | dataBits(64)]
-        byte[] xb = new byte[16];
-        store64(xb, 0, (long)aadLen * 8);
-        store64(xb, 8, (long)dataLen * 8);
-        string xStr = xb;
+        string xStr = lengthBlock(aadLen, dataLen);
         if (NativeMemory.GhashUpdate(hStr, xStr, 16, yStr) != 0) { return null; }
         List<long> r = new List<long>(); r.Add(load64(yStr, 0)); r.Add(load64(yStr, 8));
         return r;
@@ -96,11 +99,7 @@ public class AesGcm {
             Y = ghashBlock(Y, data, p, avail, H);
             p = p + 16;
         }
-        // 长度块：[aadBits(64) | dataBits(64)]
-        byte[] lb = new byte[16];
-        store64(lb, 0, (long)aadLen * 8);
-        store64(lb, 8, (long)dataLen * 8);
-        string lbStr = lb;
+        string lbStr = lengthBlock(aadLen, dataLen);
         List<long> x = new List<long>{
             Y[0] ^ load64(lbStr, 0),
             Y[1] ^ load64(lbStr, 8) };
@@ -146,15 +145,60 @@ public class AesGcm {
         }
     }
 
-    // AES-GCM 加密，使用 96 位（12 字节）IV。密文（与明文等长）写入返回值，
-    // 16 字节 tag 写入 <paramref name="tagOut"/>。参数不合法时返回 null。
+    private static bool invalidParams(int keyLen, string key, string iv, int aadLen, string aad, int dataLen, string data, string tag) {
+        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { return true; }
+        if (aadLen < 0 || dataLen < 0) { return true; }
+        if (key == null || key.Length < keyLen) { return true; }
+        if (iv == null || iv.Length < 12 || tag == null || tag.Length < 16) { return true; }
+        if (aadLen > 0 && (aad == null || aad.Length < aadLen)) { return true; }
+        if (dataLen > 0 && (data == null || data.Length < dataLen)) { return true; }
+        return false;
+    }
+
+    private static List<long> deriveHashKey(string key, int keyLen) {
+        byte[] zero = new byte[16];
+        string zeroStr = zero;
+        byte[] hb = Aes.EncryptBlockEcb(key, keyLen, zeroStr);
+        string hbStr = hb;
+        List<long> H = new List<long>();
+        H.Add(load64(hbStr, 0));
+        H.Add(load64(hbStr, 8));
+        return H;
+    }
+
+    // J0 = IV || 0^31 || 1
+    private static byte[] makeJ0(string iv) {
+        byte[] j0 = new byte[16];
+        for (int i = 0; i < 12; i = i + 1) { j0[i] = (byte)(iv[i] & 255); }
+        j0[15] = 1;
+        return j0;
+    }
+
+    private static void cryptPayload(string key, int keyLen, byte[] j0, string src, int len, byte[] dst) {
+        byte[] ctr = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) { ctr[i] = j0[i]; }
+        inc32(ctr);
+        string ctrStr = ctr;
+        gctr(key, keyLen, ctrStr, src, len, dst);
+    }
+
+    private static byte[] computeTag(string key, int keyLen, byte[] j0, List<long> H, string aad, int aadLen, string ct, int ctLen) {
+        List<long> S = ghash(H, aad, aadLen, ct, ctLen);
+        byte[] sb = new byte[16];
+        store64(sb, 0, S[0]);
+        store64(sb, 8, S[1]);
+        string j0Str = j0;
+        byte[] ej0 = Aes.EncryptBlockEcb(key, keyLen, j0Str);
+        byte[] tag = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) {
+            tag[i] = (byte)((ej0[i] & 255) ^ (sb[i] & 255));
+        }
+        return tag;
+    }
+
+    // AES-GCM 加密（96 位 IV）。返回与明文等长的密文，16 字节 tag 写入 tagOut；参数非法返回 null。
     public static byte[] Encrypt(string key, int keyLen, string iv, string aad, int aadLen, string pt, int ptLen, string tagOut) {
-        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { return null; }
-        if (aadLen < 0 || ptLen < 0) { return null; }
-        if (key == null || key.Length < keyLen) { return null; }
-        if (iv == null || iv.Length < 12 || tagOut == null || tagOut.Length < 16) { return null; }
-        if (aadLen > 0 && (aad == null || aad.Length < aadLen)) { return null; }
-        if (ptLen > 0 && (pt == null || pt.Length < ptLen)) { return null; }
+        if (invalidParams(keyLen, key, iv, aadLen, aad, ptLen, pt, tagOut)) { return null; }
 
         byte[] ct = new byte[ptLen];
         long hwRes = NativeMemory.AesGcmEncrypt(key, keyLen * 8, iv, aad, (long)aadLen, pt, (long)ptLen, ct, tagOut);
@@ -162,44 +206,23 @@ public class AesGcm {
             return ct;
         }
 
-        byte[] zero = new byte[16];
-        string zeroStr = zero;
-        byte[] Hb = Aes.EncryptBlockEcb(key, keyLen, zeroStr);
-        string HbStr = Hb;
-        List<long> H = new List<long>(); H.Add(load64(HbStr, 0)); H.Add(load64(HbStr, 8));
-
-        // J0 = IV || 0^31 || 1
-        byte[] j0 = new byte[16];
-        int i = 0; for (; i < 12; i = i + 1) { j0[i] = (byte)(iv[i] & 255); }
-        j0[15] = 1;
-
-        byte[] ctr = new byte[16];
-        i = 0; while (i < 16) { ctr[i] = j0[i]; i = i + 1; }
-        inc32(ctr);
-        string ctrStr = ctr;
-        gctr(key, keyLen, ctrStr, pt, ptLen, ct);
+        List<long> H = deriveHashKey(key, keyLen);
+        byte[] j0 = makeJ0(iv);
+        cryptPayload(key, keyLen, j0, pt, ptLen, ct);
 
         string ctStr = ct;
-        List<long> S = ghash(H, aad, aadLen, ctStr, ptLen);
-        byte[] sb = new byte[16];
-        store64(sb, 0, S[0]); store64(sb, 8, S[1]);
-        string j0Str = j0;
-        byte[] ej0 = Aes.EncryptBlockEcb(key, keyLen, j0Str);
-        i = 0; while (i < 16) { tagOut[i] = (char)((ej0[i] & 255) ^ (sb[i] & 255)); i = i + 1; }
+        byte[] computedTag = computeTag(key, keyLen, j0, H, aad, aadLen, ctStr, ptLen);
+        for (int i = 0; i < 16; i = i + 1) {
+            tagOut[i] = (char)(computedTag[i] & 255);
+        }
         return ct;
     }
 
-    // AES-GCM 解密，使用 96 位 IV。校验通过时返回明文并将 <paramref name="ok"/>[0] 置 -1；
-    // tag/aad/密文被篡改时返回 null 并将 <paramref name="ok"/>[0] 置 0。
-    // 常数时间防时序攻击，认证失败绝不产出明文。
+    // AES-GCM 解密（96 位 IV）。校验通过返回明文并将 ok[0] 置 -1；
+    // 认证失败返回 null 并将 ok[0] 置 0（常数时间校验，绝不产出未认证明文）。
     public static byte[] Decrypt(string key, int keyLen, string iv, string aad, int aadLen, string ct, int ctLen, string tag, List<int> ok) {
         if (ok == null || ok.Count == 0) { return null; }
-        if (keyLen != 16 && keyLen != 24 && keyLen != 32) { ok[0] = 0; return null; }
-        if (aadLen < 0 || ctLen < 0) { ok[0] = 0; return null; }
-        if (key == null || key.Length < keyLen) { ok[0] = 0; return null; }
-        if (iv == null || iv.Length < 12 || tag == null || tag.Length < 16) { ok[0] = 0; return null; }
-        if (aadLen > 0 && (aad == null || aad.Length < aadLen)) { ok[0] = 0; return null; }
-        if (ctLen > 0 && (ct == null || ct.Length < ctLen)) { ok[0] = 0; return null; }
+        if (invalidParams(keyLen, key, iv, aadLen, aad, ctLen, ct, tag)) { ok[0] = 0; return null; }
 
         byte[] pt = new byte[ctLen];
         long hwRes = NativeMemory.AesGcmDecrypt(key, keyLen * 8, iv, aad, (long)aadLen, ct, (long)ctLen, tag, pt);
@@ -212,40 +235,20 @@ public class AesGcm {
             return null;
         }
 
-        byte[] zero = new byte[16];
-        string zeroStr = zero;
-        byte[] Hb = Aes.EncryptBlockEcb(key, keyLen, zeroStr);
-        string HbStr = Hb;
-        List<long> H = new List<long>(); H.Add(load64(HbStr, 0)); H.Add(load64(HbStr, 8));
-
-        byte[] j0 = new byte[16];
-        int i = 0; for (; i < 12; i = i + 1) { j0[i] = (byte)(iv[i] & 255); }
-        j0[15] = 1;
-
-        List<long> S = ghash(H, aad, aadLen, ct, ctLen);
-        byte[] sb = new byte[16];
-        store64(sb, 0, S[0]); store64(sb, 8, S[1]);
-        string j0Str = j0;
-        byte[] ej0 = Aes.EncryptBlockEcb(key, keyLen, j0Str);
+        List<long> H = deriveHashKey(key, keyLen);
+        byte[] j0 = makeJ0(iv);
+        byte[] expectedTag = computeTag(key, keyLen, j0, H, aad, aadLen, ct, ctLen);
 
         int diff = 0;
-        i = 0;
-        while (i < 16) {
-            int t = (ej0[i] & 255) ^ (sb[i] & 255);
-            diff = diff | (t ^ (tag[i] & 255));
-            i = i + 1;
+        for (int i = 0; i < 16; i = i + 1) {
+            diff = diff | ((expectedTag[i] & 255) ^ (tag[i] & 255));
         }
         if (diff != 0) {
             ok[0] = 0;
             return null;
         }
 
-        byte[] ctr = new byte[16];
-        i = 0; while (i < 16) { ctr[i] = j0[i]; i = i + 1; }
-        inc32(ctr);
-        string ctrStr = ctr;
-        gctr(key, keyLen, ctrStr, ct, ctLen, pt);
-
+        cryptPayload(key, keyLen, j0, ct, ctLen, pt);
         ok[0] = -1;
         return pt;
     }

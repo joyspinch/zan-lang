@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Diagnostics;
 using System.Net;
 using System.Threading;
 using System.Web;
@@ -9,29 +10,33 @@ using Zan.Web.Core;
 
 namespace Zan.Web.Security;
 
-/* 共享内存授权表：角色可执行哪些 action、账号持有哪些角色。数据库仍持有 sys_role_grant / sys_user_role / sys_department_role，请求路径读共享内存，零查询。角色整表加载、授权变更时重写；账号按需加载，带短租约过期。*/
+/* 每服务实例的授权表。master 建匿名共享内存，worker 继承同一映射。 */
 public class PermTable {
-    /* 句柄在 master 与 worker 之间传递所用的名字（ZAN_SHARE_<name>）。*/
     public static const string ShareRoles = "WEB_PERM_ROLES";
     public static const string ShareUsers = "WEB_PERM_USERS";
-
     public static const long UserLeaseMs = 300000;
 
+    private static const string State = "#state";
+    private static const string RoleWriter = "#role-writer";
+    private static const long ReloadLeaseMs = 30000;
+    private static const int RetryDelayMs = 2000;
+    private static const int UserBuckets = 64;
     private static SharedTable roles = null;
     private static SharedTable users = null;
 
-    /* 两张表只属于本服务实例：master 在派生 worker 之前建匿名共享内存，
-     * 句柄经 Worker.ShareHandle 下发，worker 用继承的句柄映射同一块内存。
-     * 全程没有名字，同机其他进程（包括别的 zan 服务）无法触及。*/
     public static bool Open() {
+        if (Ready()) { return true; }
         long roleHandle = Worker.InheritedHandle(ShareRoles);
         long userHandle = Worker.InheritedHandle(ShareUsers);
-        if (roleHandle != 0 || userHandle != 0) {
-            /* worker：映射 master 下发的两张表；缺一即视为不可用，
-             * 权限判断一律失败（fail closed）。*/
+        if (roleHandle != 0 || userHandle != 0 || ProcessHost.IsWorker()) {
+            if (roleHandle == 0 || userHandle == 0) { return false; }
             SharedTable r = SharedTable.Attach(roleHandle);
             SharedTable u = SharedTable.Attach(userHandle);
-            if (!r.IsOpen() || !u.IsOpen()) { return false; }
+            if (!r.IsOpen() || !u.IsOpen()) {
+                r.Close();
+                u.Close();
+                return false;
+            }
             r.Label("web perm roles");
             u.Label("web perm users");
             roles = r;
@@ -39,22 +44,33 @@ public class PermTable {
             return true;
         }
 
-        /* master / 单进程：创建匿名表并登记句柄，供之后派生的 worker 继承。*/
         SharedTable nr = new SharedTable("", 256);
         nr.KeySize(16);
-        nr.ColumnString("acts", 8192);
-        nr.ColumnInt("scope");
-        nr.ColumnString("depts", 255);
+        nr.ColumnString("acts", 8216);
+        nr.ColumnString("policy", 288);
         if (!nr.CreateAnonymous()) { return false; }
         nr.Label("web perm roles");
 
         SharedTable nu = new SharedTable("", 8192);
         nu.KeySize(24);
-        nu.ColumnInt("super");
-        nu.ColumnString("roles", 192);
-        nu.ColumnInt("scope");
-        nu.ColumnString("depts", 1024);
-        if (!nu.CreateAnonymous()) { return false; }
+        nu.ColumnInt("owner");
+        nu.ColumnInt("userVersion");
+        nu.ColumnInt("roleVersion");
+        nu.ColumnInt("publishedRoles");
+        nu.ColumnInt("clusterOffline");
+        nu.ColumnString("roles", 216);
+        nu.ColumnString("scope", 1056);
+        if (!nu.CreateAnonymous() || !nu.SetInt(State, "userVersion", 1)) {
+            nr.Close();
+            nu.Close();
+            return false;
+        }
+        for (int i = 0; i < UserBuckets; i = i + 1) {
+            if (nu.SetInt(UserBucket(i), "userVersion", 0)) { continue; }
+            nr.Close();
+            nu.Close();
+            return false;
+        }
         nu.Label("web perm users");
 
         Worker.ShareHandle(ShareRoles, nr.OsHandle());
@@ -68,113 +84,280 @@ public class PermTable {
         return roles != null && users != null;
     }
 
-    /* 从数据库重写所有角色掩码。启动时和授权变更后运行。*/
-    public static async void LoadRoles(IZanSql fsql) {
-        if (!Ready()) { return; }
-        List<SysRole> rows = await fsql.Select<SysRole>().ToListAsync();
-        List<SysRoleGrant> grants = await fsql.Select<SysRoleGrant>().ToListAsync();
-        await LoadRoles(rows, grants);
+    /* 在查库前登记版本。较晚的失效立即撤下当前版本，并使在途回填作废。 */
+    internal static long BeginRoleReload() {
+        if (!Ready()) { return 0; }
+        long version = users.Increment(State, "roleVersion", 1);
+        ForgetAll();
+        return version;
     }
 
-    /* 兼容重载：IDbConnection 入口封装为 IZanSql 门面。*/
+    public static async void LoadRoles(IZanSql fsql) {
+        long version = BeginRoleReload();
+        bool _loaded = await ReloadRoles(fsql, version);
+    }
+
+    /* 首次尝试可复用请求连接，失败后只用独立的 ORM 借还连接。 */
+    internal static async void LoadRolesWithRetry(IZanSql fsql, IZanSql retryOrm) {
+        long version = BeginRoleReload();
+        try {
+            if (await ReloadRoles(fsql, version)) { return; }
+        } finally {
+            if (retryOrm != null && RoleReloadPending(version)) {
+                Task.Spawn(RetryRoleReload(retryOrm, version));
+            }
+        }
+    }
+
+    private static async void RetryRoleReload(IZanSql fsql, long version) {
+        while (RoleReloadPending(version)) {
+            await Task.Delay(RetryDelayMs);
+            if (!RoleReloadPending(version)) { return; }
+            try {
+                if (await ReloadRoles(fsql, version)) { return; }
+            } catch (Exception ex) {
+                Log.Warn("[rbac] role reload failed: " + ex.Message);
+            }
+        }
+    }
+
+    internal static async bool ReloadRoles(IZanSql fsql, long version) {
+        if (!Loading(version) || fsql == null) { return false; }
+        List<SysRole> rows = await fsql.Select<SysRole>().ToListAsync();
+        List<SysRoleGrant> grants = await fsql.Select<SysRoleGrant>().OrderBy(a => a.id).ToListAsync();
+        return await PublishRoles(version, rows, grants);
+    }
+
+    internal static async bool RolesChangedSince(IZanSql fsql, long version) {
+        if (version == 0) { return true; }
+        List<SysRole> rows = await fsql.Select<SysRole>().ToListAsync();
+        List<SysRoleGrant> grants = await fsql.Select<SysRoleGrant>().OrderBy(a => a.id).ToListAsync();
+        if (RoleVersion() != version) { return false; }
+        int active = 0;
+        string tag = VersionTag(version);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysRole row = rows[i];
+            if (row.status != 1) { continue; }
+            active = active + 1;
+            string key = Convert.ToString(row.id);
+            if (roles.GetString(key, "acts") != RoleActions(row.id, grants, tag)
+                || RolePolicy(key, version) != EncodePolicy(row)) { return RoleVersion() == version; }
+        }
+        return roles.Count() != active && RoleVersion() == version;
+    }
+
     public static async void LoadRoles(IDbConnection db) {
         await LoadRoles(ZanSql.FromConnection(db));
     }
 
-    /* 发布已加载的角色行（Controller 端使用，避免暴露请求连接）。*/
     public static async void LoadRoles(List<SysRole> rows, List<SysRoleGrant> grants) {
-        if (!Ready()) { return; }
-        if (rows == null) { rows = new List<SysRole>(); }
-        if (grants == null) { grants = new List<SysRoleGrant>(); }
-        roles.Clear();
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            SysRole r = rows[i];
-            if (r.status != 1) { continue; }
-            StringBuilder acts = new StringBuilder();
-            acts.Append(",");
-            for (int j = 0; j < grants.Count; j = j + 1) {
-                if (grants[j].roleId != r.id) { continue; }
-                if (grants[j].action.Length == 0) { continue; }
-                Perm.Append(acts, grants[j].action, grants[j].mask);
+        bool _loaded = await PublishRoles(BeginRoleReload(), rows, grants);
+    }
+
+    internal static bool RoleReloadPending(long version) {
+        return Loading(version) && users.GetInt(State, "publishedRoles") != version;
+    }
+
+    private static bool Loading(long version) {
+        return Ready() && version > 0 && users.GetInt(State, "roleVersion") == version;
+    }
+
+    private static async bool PublishRoles(long version, List<SysRole> rows, List<SysRoleGrant> grants) {
+        if (rows == null || grants == null) { return false; }
+        while (Loading(version)) {
+            if (users.TryAcquireLease(RoleWriter, version, -1, ReloadLeaseMs)) {
+                try {
+                    return WriteRoles(version, rows, grants);
+                } finally {
+                    bool _released = users.ReleaseLease(RoleWriter, version);
+                }
             }
-            string key = Convert.ToString(r.id);
-            bool _ok = roles.SetString(key, "acts", acts.ToString());
-            bool _s = roles.SetInt(key, "scope", r.dataScope);
-            string depts = r.scopeDepts;
-            if (depts == null) { depts = ""; }
-            bool _d = roles.SetString(key, "depts", depts);
+            await Task.Delay(10);
+        }
+        return false;
+    }
+
+    private static bool WriteRoles(long version, List<SysRole> rows, List<SysRoleGrant> grants) {
+        if (!Loading(version)) { return false; }
+        if (!RoleReloadPending(version)) { return Loading(version); }
+        roles.Clear();
+        string tag = VersionTag(version);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysRole row = rows[i];
+            if (row.status != 1) { continue; }
+            string acts = RoleActions(row.id, grants, tag);
+            if (!Loading(version)) { return false; }
+            string key = Convert.ToString(row.id);
+            if (!roles.SetString(key, "acts", acts)
+                || !roles.SetString(key, "policy", tag + EncodePolicy(row))) {
+                Log.Warn("[rbac] role snapshot exceeds shared table capacity");
+                return false;
+            }
+        }
+        /* 角色行中的版本还会保护读者免受过期写租约的迟到写入影响。 */
+        if (!Loading(version)) { return false; }
+        bool published = users.SetInt(State, "publishedRoles", version);
+        return published && Loading(version);
+    }
+
+    private static string RoleActions(int roleId, List<SysRoleGrant> grants, string tag) {
+        StringBuilder acts = new StringBuilder();
+        acts.Append(tag + ",");
+        for (int i = 0; i < grants.Count; i = i + 1) {
+            SysRoleGrant grant = grants[i];
+            if (grant.roleId != roleId || grant.action == null || grant.action.Length == 0) { continue; }
+            Perm.Append(acts, grant.action, grant.mask);
+        }
+        return acts.ToString();
+    }
+
+    private static string EncodePolicy(SysRole role) {
+        string depts = role.scopeDepts == null ? "" : role.scopeDepts;
+        return Convert.ToString(role.dataScope) + ":" + depts;
+    }
+
+    internal static long RoleVersion() {
+        if (UserVersion() == 0) { return 0; }
+        long version = users.GetInt(State, "publishedRoles");
+        return Loading(version) ? version : 0;
+    }
+
+    internal static void SetClusterOnline(bool online) {
+        if (!Ready()) { return; }
+        if (!online) {
+            bool _offline = users.SetInt(State, "clusterOffline", 1);
+            long _version = BeginRoleReload();
+        } else {
+            bool _online = users.SetInt(State, "clusterOffline", 0);
         }
     }
 
+    private static string VersionTag(long version) {
+        return Convert.ToString(version) + ":";
+    }
+
+    private static string AtVersion(string value, long version) {
+        if (version <= 0) { return ""; }
+        string tag = VersionTag(version);
+        return value.IndexOf(tag) == 0 ? value.Substring(tag.Length) : "";
+    }
+
+    internal static string RolePolicy(string roleId, long version) {
+        if (version == 0 || RoleVersion() != version) { return ""; }
+        return AtVersion(roles.GetString(roleId, "policy"), version);
+    }
+
     public static int RoleScope(string roleId) {
-        if (!Ready()) { return 0; }
-        return roles.GetInt(roleId, "scope");
+        long version = RoleVersion();
+        string policy = RolePolicy(roleId, version);
+        int sep = policy.IndexOf(":");
+        return sep > 0 && RoleVersion() == version ? Filter.ToInt(policy.Substring(0, sep), 0) : 0;
     }
 
     public static string RoleDepts(string roleId) {
-        if (!Ready()) { return ""; }
-        return roles.GetString(roleId, "depts");
+        long version = RoleVersion();
+        string policy = RolePolicy(roleId, version);
+        int sep = policy.IndexOf(":");
+        return sep > 0 && RoleVersion() == version ? policy.Substring(sep + 1) : "";
     }
 
     public static bool RolesAllow(string roleIds, string action) {
-        if (!Ready()) { return false; }
         int bit = Perm.BitOf(action);
         if (bit == 0) { return false; }
         return (RolesMask(roleIds, Perm.ScreenOf(action)) & bit) != 0;
     }
 
     public static int RolesMask(string roleIds, string screen) {
-        if (!Ready() || screen.Length == 0) { return 0; }
+        long version = RoleVersion();
+        if (version == 0 || screen.Length == 0) { return 0; }
         int mask = 0;
         List<string> ids = Split(roleIds);
         for (int i = 0; i < ids.Count; i = i + 1) {
-            string acts = roles.GetString(ids[i], "acts");
+            string acts = AtVersion(roles.GetString(ids[i], "acts"), version);
             if (acts.Length == 0) { continue; }
             mask = mask | Perm.MaskIn(acts, screen);
         }
-        return mask;
+        return RoleVersion() == version ? mask : 0;
+    }
+
+    private static string UserBucket(int bucket) {
+        return "#user:" + Convert.ToString(bucket);
+    }
+
+    internal static long UserVersion() {
+        if (!Ready() || users.GetInt(State, "clusterOffline") != 0) { return 0; }
+        return users.GetInt(State, "userVersion");
+    }
+
+    /* 固定的共享分组保留版本，避免账号缓存过期后重用版本。全局与分组计数只增不减。 */
+    internal static long UserVersion(string uid) {
+        long version = UserVersion();
+        int id = AuthUser.ToInt(uid);
+        if (version == 0 || id <= 0) { return 0; }
+        return version + users.GetInt(UserBucket(id % UserBuckets), "userVersion");
     }
 
     public static string UserRoles(string uid) {
-        if (!Ready()) { return ""; }
-        if (!users.Exists(uid)) { return ""; }
-        if (users.GetInt(uid, "super") == 1) { return "*"; }
-        return users.GetString(uid, "roles");
+        long version = UserVersion(uid);
+        if (version == 0) { return ""; }
+        string hit = AtVersion(users.GetString(uid, "roles"), version);
+        return UserVersion(uid) == version ? hit : "";
     }
 
     public static int UserScope(string uid) {
-        if (!Ready()) { return 0; }
-        if (!users.Exists(uid)) { return 0; }
-        return users.GetInt(uid, "scope");
+        string cached = UserScopeEntry(uid, UserVersion(uid), RoleVersion());
+        int sep = cached.IndexOf(":");
+        return sep > 0 ? Filter.ToInt(cached.Substring(0, sep), 0) : 0;
     }
 
     public static string UserDepts(string uid) {
-        if (!Ready()) { return ""; }
-        return users.GetString(uid, "depts");
+        string cached = UserScopeEntry(uid, UserVersion(uid), RoleVersion());
+        int sep = cached.IndexOf(":");
+        return sep > 0 ? cached.Substring(sep + 1) : "";
+    }
+
+    internal static string UserScopeEntry(string uid, long userVersion, long roleVersion) {
+        if (userVersion == 0 || roleVersion == 0 || UserVersion(uid) != userVersion
+            || RoleVersion() != roleVersion) { return ""; }
+        string cached = AtVersion(AtVersion(users.GetString(uid, "scope"), userVersion), roleVersion);
+        return UserVersion(uid) == userVersion && RoleVersion() == roleVersion ? cached : "";
     }
 
     public static void SetUserScope(string uid, int mode, string depts) {
-        if (!Ready()) { return; }
-        bool _m = users.SetInt(uid, "scope", mode);
-        bool _d = users.SetString(uid, "depts", depts);
-        bool _e = users.Expire(uid, UserLeaseMs);
+        SetUserScope(uid, mode, depts, UserVersion(uid), RoleVersion());
+    }
+
+    internal static void SetUserScope(string uid, int mode, string depts, long userVersion, long roleVersion) {
+        if (userVersion == 0 || roleVersion == 0 || UserVersion(uid) != userVersion
+            || RoleVersion() != roleVersion) { return; }
+        string value = VersionTag(userVersion) + Convert.ToString(roleVersion) + ":"
+            + Convert.ToString(mode) + ":" + depts;
+        if (users.SetString(uid, "scope", value)) {
+            bool _expires = users.Expire(uid, UserLeaseMs);
+        }
     }
 
     public static void SetUser(string uid, bool isSuper, string roleIds) {
-        if (!Ready()) { return; }
-        bool _s = users.SetInt(uid, "super", isSuper ? 1 : 0);
-        bool _r = users.SetString(uid, "roles", roleIds);
-        bool _e = users.Expire(uid, UserLeaseMs);
+        bool _current = SetUserIfCurrent(uid, isSuper, roleIds, UserVersion(uid));
+    }
+
+    internal static bool SetUserIfCurrent(string uid, bool isSuper, string roleIds, long version) {
+        if (version == 0 || UserVersion(uid) != version) { return false; }
+        if (users.SetString(uid, "roles", VersionTag(version) + (isSuper ? "*" : roleIds))) {
+            bool _expires = users.Expire(uid, UserLeaseMs);
+        }
+        return UserVersion(uid) == version;
     }
 
     public static void Forget(string uid) {
-        if (!Ready()) { return; }
-        bool _d = users.Delete(uid);
+        int id = AuthUser.ToInt(uid);
+        if (!Ready() || id <= 0) { return; }
+        long _version = users.Increment(UserBucket(id % UserBuckets), "userVersion", 1);
     }
 
     public static void ForgetAll() {
         if (!Ready()) { return; }
-        users.Clear();
+        long _version = users.Increment(State, "userVersion", 1);
     }
 
     public static List<string> Split(string joined) {

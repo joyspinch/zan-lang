@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text;
 using System.Web;
 using Zan.Web.Model;
 using Zan.Web.Dao;
@@ -56,11 +58,19 @@ public class AuthToken {
         return Sha256.Hash(secret, secret.Length);
     }
 
-    /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion。不含密码材料，强制登出只需 bump 整数。*/
+    /* 用 AES-GCM 加密签发 Cookie：版本标记 + uid + 签发时间 + tokenVersion（可选签名 Claims）。不含密码材料，强制登出只需 bump 整数。*/
     public static string Issue(string uid, int tokenVersion, int now) {
+        return Issue(uid, tokenVersion, now, null);
+    }
+
+    public static string Issue(string uid, int tokenVersion, int now, Dictionary<string, string> claims) {
         if (!Ready()) { return ""; }
+        string encodedClaims = EncodeClaims(claims);
         string plain = "2\t" + uid + "\t" + Convert.ToString(now) + "\t"
             + Convert.ToString(tokenVersion);
+        if (encodedClaims.Length > 0) {
+            plain = plain + "\t" + encodedClaims;
+        }
         byte[] key = Key();
         byte[] iv = RandomNumberGenerator.GetBytes(12);
         byte[] tag = new byte[16];
@@ -75,12 +85,47 @@ public class AuthToken {
         return EncodeUrl(packed, packed.Length);
     }
 
-    public static async string Resolve(string token) {
-        if (token.Length < 50 || token.Length > 512) { return ""; }
+    private static string EncodeClaims(Dictionary<string, string> claims) {
+        if (claims == null || claims.Count == 0) { return ""; }
+        List<string> keys = claims.Keys;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            string k = keys[i];
+            if (k == null || k.Length == 0) { continue; }
+            string v = "";
+            claims.TryGetValue(k, out v);
+            if (sb.Length > 0) { sb.Append("&"); }
+            sb.Append(Encoding.UrlEncode(k));
+            sb.Append("=");
+            sb.Append(Encoding.UrlEncode(v == null ? "" : v));
+        }
+        return sb.ToString();
+    }
+
+    private static void DecodeClaims(string raw, Dictionary<string, string> outClaims) {
+        if (outClaims == null || raw == null || raw.Length == 0) { return; }
+        List<string> pairs = raw.Split("&");
+        for (int i = 0; i < pairs.Count; i = i + 1) {
+            string item = pairs[i];
+            if (item.Length == 0) { continue; }
+            int eq = item.IndexOf("=");
+            string k = eq >= 0 ? Encoding.UrlDecode(item.Substring(0, eq)) : Encoding.UrlDecode(item);
+            string v = eq >= 0 ? Encoding.UrlDecode(item.Substring(eq + 1)) : "";
+            if (k.Length > 0) {
+                outClaims[k] = v;
+            }
+        }
+    }
+
+    private static bool TryDecryptPayload(string token, out string uid, out int carriedVersion,
+                                          Dictionary<string, string> outClaims) {
+        uid = "";
+        carriedVersion = -1;
+        if (!Ready() || token == null || token.Length < 50 || token.Length > 2048) { return false; }
         List<int> decodedLen = new List<int>(); decodedLen.Add(0);
         byte[] packed = DecodeUrl(token, decodedLen);
         int total = decodedLen[0];
-        if (total < 29) { return ""; }
+        if (total < 29) { return false; }
         int cipherLen = total - 28;
         byte[] iv = new byte[12];
         byte[] cipher = new byte[cipherLen];
@@ -93,22 +138,59 @@ public class AuthToken {
         string aad = "zan.auth.cookie.v1";
         byte[] plainBytes = AesGcm.Decrypt(key, 32, iv, aad, aad.Length,
             cipher, cipherLen, tag, ok);
-        if (ok[0] == 0 || plainBytes == null) { return ""; }
+        if (ok[0] == 0 || plainBytes == null) { return false; }
         string plain = plainBytes.ToStr(0, cipherLen);
         int first = plain.IndexOf("\t");
         int second = plain.IndexOf("\t", first + 1);
         int third = plain.IndexOf("\t", second + 1);
         if (first != 1 || plain.Substring(0, first) != "2"
-            || second <= first + 1 || third <= second + 1
-            || plain.IndexOf("\t", third + 1) >= 0) { return ""; }
-        string uid = plain.Substring(first + 1, second - first - 1);
+            || second <= first + 1 || third <= second + 1) { return false; }
+        int fourth = plain.IndexOf("\t", third + 1);
+        if (fourth >= 0 && plain.IndexOf("\t", fourth + 1) >= 0) { return false; }
+        string parsedUid = plain.Substring(first + 1, second - first - 1);
         int issued = Filter.ToInt(plain.Substring(second + 1, third - second - 1), 0);
         int now = WebApp.NowSeconds();
-        if (issued <= 0 || issued > now + 300 || issued + 864000 <= now) { return ""; }
-        int carried = Filter.ToInt(plain.Substring(third + 1), -1);
+        int ttl = Cfg.Auth.ttlSeconds > 0 ? Cfg.Auth.ttlSeconds : 864000;
+        if (issued <= 0 || issued > now + 300 || issued + ttl <= now) { return false; }
+        string verStr = fourth >= 0
+            ? plain.Substring(third + 1, fourth - third - 1)
+            : plain.Substring(third + 1);
+        int carried = Filter.ToInt(verStr, -1);
+        if (carried < 0) { return false; }
+        uid = parsedUid;
+        carriedVersion = carried;
+        if (fourth >= 0 && outClaims != null) {
+            DecodeClaims(plain.Substring(fourth + 1), outClaims);
+        }
+        return true;
+    }
+
+    /* 解密并校验签名及有效期（免二次查库），供请求上下文提取已验证声明。 */
+    public static bool ParseClaims(string token, string expectedUid, Dictionary<string, string> outClaims) {
+        string parsedUid = "";
+        int carried = -1;
+        if (!TryDecryptPayload(token, out parsedUid, out carried, outClaims)) { return false; }
+        if (expectedUid != null && expectedUid.Length > 0 && parsedUid != expectedUid) {
+            if (outClaims != null) { outClaims.Clear(); }
+            return false;
+        }
+        return true;
+    }
+
+    public static async string Resolve(string token) {
+        return await ResolveClaims(token, null);
+    }
+
+    public static async string ResolveClaims(string token, Dictionary<string, string> outClaims) {
+        string uid = "";
+        int carried = -1;
+        if (!TryDecryptPayload(token, out uid, out carried, outClaims)) { return ""; }
         int current = await AuthUser.TokenVersion(uid);
         /* 不记录 token 或 uid，避免凭证材料泄漏。*/
-        if (carried < 0 || current < 0 || carried != current) { return ""; }
+        if (carried < 0 || current < 0 || carried != current) {
+            if (outClaims != null) { outClaims.Clear(); }
+            return "";
+        }
         return uid;
     }
 }

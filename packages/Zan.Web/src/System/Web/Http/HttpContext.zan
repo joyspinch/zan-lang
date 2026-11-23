@@ -9,31 +9,31 @@ using System;
 
 namespace System.Web;
 
-// 统一 API 响应信封模型：包含 code、msg、data 与 traceId。
-public class HttpContext : IDisposable {
+// 统一请求上下文核心：承载请求元数据、参数解析与安全过滤输入。
+public partial class HttpContext : IDisposable {
     private WebApp app;
+    public RequestTrace Trace { get; internal set; }
     private HttpRequest request;
     private string method;
     private string path;
     private string remoteIp;
+    private string clientIp;
     private StrMap routeParams;
     private StrMap query;
     private StrMap form;
     // 已登录的主体 id（匿名时为 ""）。
-    private string uid;  // signed-in principal ("" when anonymous)
+    private string uid;
     // 命中路由的动作名（"Users.Save"）。
-    private string routeAction;  // the matched route's action ("Users.Save")
+    private string routeAction;
     private string routePattern;
     // 命中路由的下标（O(1) 按路由记账）；非路由（如资源）为 -1。
     private int routeSlot;
     // 已落盘的 multipart 正文路径（无则为 ""）。
-    private string uploadPath;  // spooled multipart body ("" when none)
+    private string uploadPath;
     private long uploadSize;
-    // JSON 正文的惰性缓存：JsonBody() 第一次调用时解析一次，之后
-    // 直接返回缓存（同一个请求体往往被多个读取方消费）。
+    // JSON 正文的惰性缓存：JsonBody()/JsonDoc() 第一次调用时解析一次。
     private JsonValue jsonBody;
     private bool jsonParsed;
-    // 高性能平面 Tape JSON 文档缓存（零分配解析，JsonDoc() 调用时解析一次）。
     private JsonDoc jsonDoc;
     private bool jsonDocParsed;
 
@@ -45,42 +45,36 @@ public class HttpContext : IDisposable {
     private byte[] bodyBytes;
     private int bodyBytesLen;
     private List<string> headers;
-    private bool ended;  // a hook or handler already produced the response
+    private bool ended;
 
-    // Worker 级序列化缓冲池持有的全响应（头+正文）字节数组，发送完毕后归还。
+    // Worker 级序列化缓冲池持有的全响应（头+正文）缓冲，发送完毕后归还。
+    internal StringBuilder responseSb;
     internal byte[] responseBuf;
     internal int responseLen;
-
-    public void ReleaseResponseBuf() {
-        if (this.responseBuf != null) {
-            HttpBufferPool.ReturnBytes(this.responseBuf);
-            this.responseBuf = null;
-            this.responseLen = 0;
-        }
-    }
 
     // ---- 流式响应 (SSE / WebSocket) 连接接管 ----
     internal TcpClient conn;
     private TlsStream tlsStream;
     internal bool hijacked;
-    // ---- 流式响应 (SSE / WebSocket) 连接接管 ----
     internal bool wasHijacked;
-    // 流式推送度量：统计已推送的帧数与总字节数。
     private long frames;
     private long framesBytes;
+    internal HttpDeadlineToken deadlineSlot;
+    internal int streamIdleMs;
+    internal HttpFramer framer;
 
-    // 构造请求上下文：解析 query，并对 POST/PUT/PATCH 的 urlencoded 或
-    // multipart 正文做一次表单解析。连接循环里正文是构造之后才缓冲齐
-    // 的，那里会经 ParseFormBody 再解析一次；空正文不会重复解析。
+    // 构造请求上下文：解析 query，并对 POST/PUT/PATCH 的 urlencoded 或 multipart 正文做表单解析。
     public HttpContext(HttpRequest req, string remoteIp) {
         this.app = null;
+        this.Trace = null;
         this.request = req;
         this.method = req.method;
         this.path = req.path;
         this.remoteIp = remoteIp;
-        this.routeParams = new StrMap();
-        this.query = new StrMap();
-        this.form = new StrMap();
+        this.clientIp = "";
+        this.routeParams = null;
+        this.query = null;
+        this.form = null;
         this.uid = "";
         this.routeAction = "";
         this.routePattern = "";
@@ -99,6 +93,9 @@ public class HttpContext : IDisposable {
         this.bodyBytesLen = 0;
         this.headers = null;
         this.ended = false;
+        this.responseSb = null;
+        this.responseBuf = null;
+        this.responseLen = 0;
         this.conn = null;
         this.tlsStream = null;
         this.hijacked = false;
@@ -108,15 +105,54 @@ public class HttpContext : IDisposable {
         this.deadlineSlot = null;
         this.streamIdleMs = HttpLimits.DefaultTimeoutMs;
         this.framer = null;
+        this.ParseInitialQueryAndForm(req);
+    }
+
+    // 长连接复用上下文：原地重置所有请求级字段与集合（保留底层连接与已分配 Map/List 容器）。
+    public void ResetForRequest(HttpRequest req, string remoteIp) {
+        this.ReleaseResponseBuf();
+        this.Trace = null;
+        this.request = req;
+        this.method = req.method;
+        this.path = req.path;
+        this.remoteIp = remoteIp;
+        this.clientIp = "";
+        if (this.routeParams != null) { this.routeParams.Clear(); }
+        if (this.query != null) { this.query.Clear(); }
+        if (this.form != null) { this.form.Clear(); }
+        this.uid = "";
+        this.routeAction = "";
+        this.routePattern = "";
+        this.routeSlot = 0 - 1;
+        this.uploadPath = "";
+        this.uploadSize = 0;
+        this.jsonBody = null;
+        this.jsonParsed = false;
+        this.jsonDoc = null;
+        this.jsonDocParsed = false;
+        this.status = 200;
+        this.statusText = "OK";
+        this.contentType = HttpLimits.MimeHtmlUtf8;
+        this.body = "";
+        this.bodyBytes = null;
+        this.bodyBytesLen = 0;
+        if (this.headers != null) { this.headers.Clear(); }
+        this.ended = false;
+        this.hijacked = false;
+        this.wasHijacked = false;
+        this.frames = 0;
+        this.framesBytes = 0;
+        if (req.queryString.Length > 0) {
+            if (this.query == null) { this.query = new StrMap(); }
+            HttpFormParser.ParsePairs(req.queryString, this.query);
+        }
+    }
+
+    private void ParseInitialQueryAndForm(HttpRequest req) {
         if (req.queryString.Length > 0) {
             this.query = new StrMap();
             HttpFormParser.ParsePairs(req.queryString, this.query);
         }
-        // 表单在这里解析一次，服务的是直接构造 HttpContext 的调用方
-        // （此时 request.body 已是完整正文）。WebApp 的连接循环里正文
-        // 是在构造之后才由 HttpFramer 缓冲齐的，那里经 ParseFormBody
-        // 再解析一次——空正文时 ParsePairs 立即返回，同一条请求的
-        // 表单仍然只被真正解析一次。
         if (req.method == "POST" || req.method == "PUT" || req.method == "PATCH") {
             if (HttpContext.StartsWith(req.contentType, "application/x-www-form-urlencoded")) {
                 if (req.body.Length > 0) {
@@ -136,33 +172,22 @@ public class HttpContext : IDisposable {
             this.headers.Clear();
             this.headers = null;
         }
-        if (this.form != null) {
-            this.form.Clear();
-        }
-        if (this.query != null) {
-            this.query.Clear();
-        }
-        if (this.routeParams != null) {
-            this.routeParams.Clear();
-        }
+        if (this.form != null) { this.form.Clear(); }
+        if (this.query != null) { this.query.Clear(); }
+        if (this.routeParams != null) { this.routeParams.Clear(); }
         this.bodyBytes = null;
         this.jsonBody = null;
         this.jsonDoc = null;
     }
 
     // 客户端实际 IP（在开启反向代理标头还原时提取真实公网 IP，默认回退为底层对端 IP）。
-    private string clientIp;
     public void SetClientIp(string ip) { this.clientIp = ip; }
     public string ClientIp() {
-        if (this.clientIp != null && this.clientIp.Length > 0) {
-            return this.clientIp;
-        }
+        if (this.clientIp != null && this.clientIp.Length > 0) { return this.clientIp; }
         return this.remoteIp;
     }
 
-    // 客户端底层套接字直连 IP 文本（点分 IPv4）。
     public string RemoteIp() { return this.remoteIp; }
-    // 对端 IPv4 的整数形式（Socket.Ipv4ToLong）。
     public long RemoteIpLong() { return Socket.Ipv4ToLong(this.remoteIp); }
 
     public string Method() { return this.method; }
@@ -177,16 +202,17 @@ public class HttpContext : IDisposable {
     public int GetStatus() { return this.status; }
     public bool Ended() { return this.ended; }
     public HttpRequest Request() { return this.request; }
-    public StrMap RouteParams() { return this.routeParams; }
-    public StrMap QueryParams() { return this.query; }
-    public StrMap QueryMap() { return this.query; }
+    public StrMap RouteParams() { return this.EnsureRouteParams(); }
+    public StrMap QueryParams() { return this.EnsureQuery(); }
+    public StrMap QueryMap() { return this.EnsureQuery(); }
     public void SetQuery(StrMap q) { this.query = q; }
-    public StrMap FormParams() { return this.form; }
+    public StrMap FormParams() {
+        if (this.form == null) { this.form = new StrMap(); }
+        return this.form;
+    }
     public string ContentType() { return this.contentType; }
     public List<string> Headers() { return this.headers; }
 
-    // A completed spool is request-owned by default. Handlers that retain the
-    // original file beyond the request must explicitly transfer ownership.
     public string TakeUpload() {
         string path = this.uploadPath;
         this.uploadPath = "";
@@ -200,7 +226,6 @@ public class HttpContext : IDisposable {
         try {
             if (File.Exists(path)) { File.Delete(path); }
         } catch (Exception e) {
-            // Cleanup must not hide the request's original error or response.
             Console.WriteLine("[WebApp upload cleanup] " + e.Message);
         }
     }
@@ -217,79 +242,50 @@ public class HttpContext : IDisposable {
         this.routeSlot = slot;
     }
 
-    public void SetRoutePattern(string pattern) {
-        this.routePattern = pattern;
-    }
-
-    public void SetRouteAction(string action) {
-        this.routeAction = action;
-    }
-
-    public string StatusText() {
-        return this.statusText;
-    }
-
-    public void SetEnded(bool e) {
-        this.ended = e;
-    }
-
-    public void MarkEnded() {
-        this.ended = true;
-    }
+    public void SetRoutePattern(string pattern) { this.routePattern = pattern; }
+    public void SetRouteAction(string action) { this.routeAction = action; }
+    public string StatusText() { return this.statusText; }
+    public void SetEnded(bool e) { this.ended = e; }
+    public void MarkEnded() { this.ended = true; }
 
     public StrMap EnsureForm() {
-        if (this.form == null) {
-            this.form = new StrMap();
-        } else {
-            this.form.Clear();
-        }
+        if (this.form == null) { this.form = new StrMap(); }
+        else { this.form.Clear(); }
         return this.form;
     }
 
     public StrMap EnsureRouteParams() {
-        if (this.routeParams == null) {
-            this.routeParams = new StrMap();
-        }
+        if (this.routeParams == null) { this.routeParams = new StrMap(); }
         return this.routeParams;
     }
 
     public StrMap EnsureQuery() {
-        if (this.query == null) {
-            this.query = new StrMap();
-        }
+        if (this.query == null) { this.query = new StrMap(); }
         return this.query;
     }
 
-    // 请求体缓冲完成后重新解析表单键值对。
     public static void ParseFormBody(HttpRequest req, HttpContext ctx) {
         HttpFormParser.ParseFormBody(req, ctx);
     }
 
-    // multipart/form-data 的文本字段进 form 表。
     public static void ParseMultipartFields(HttpRequest req, HttpContext ctx) {
         HttpFormParser.ParseMultipartFields(req, ctx);
     }
 
-
-    // 路由参数（{param} 段匹配到的值）。
     public string Param(string name) {
         if (this.routeParams == null) { return ""; }
         return this.routeParams.Get(name);
     }
-    // query string 参数。
     public string Query(string name) {
         if (this.query == null) { return ""; }
         return this.query.Get(name);
     }
-    // 表单字段（urlencoded 或 multipart 的文本字段）。
     public string Form(string name) {
         if (this.form == null) { return ""; }
         return this.form.Get(name);
     }
-    // 原始请求正文。
     public string Body() { return this.request.body; }
 
-    // 解析并缓存请求体 JSON 对象，空体返回 null。
     public JsonValue JsonBody() {
         if (!this.jsonParsed) {
             this.jsonParsed = true;
@@ -302,7 +298,6 @@ public class HttpContext : IDisposable {
         return this.jsonBody;
     }
 
-    // 解析并缓存请求体高性能平面 Tape JSON 文档（零中间节点分配），空体或非 JSON 体返回 null。
     public JsonDoc JsonDoc() {
         if (!this.jsonDocParsed) {
             this.jsonDocParsed = true;
@@ -319,61 +314,31 @@ public class HttpContext : IDisposable {
         return this.jsonDoc;
     }
 
-    // 通过点分隔路径从 JSON 请求体中零分配取整型（如 "data.id" 或 "user.profile.age"）
     public int JsonInt(string path, int dflt) {
         JsonDoc doc = this.JsonDoc();
         return doc != null ? doc.PathInt(path, dflt) : dflt;
     }
 
-    // 通过点分隔路径从 JSON 请求体中零分配取 64 位长整型
     public long JsonLong(string path, long dflt) {
         JsonDoc doc = this.JsonDoc();
         return doc != null ? doc.PathLong(path, dflt) : dflt;
     }
 
-    // 通过点分隔路径从 JSON 请求体中零分配取字符串
     public string JsonStr(string path, string dflt) {
         JsonDoc doc = this.JsonDoc();
         return doc != null ? doc.PathStr(path, dflt) : dflt;
     }
 
-    // 通过点分隔路径从 JSON 请求体中零分配取布尔值
     public bool JsonBool(string path, bool dflt) {
         JsonDoc doc = this.JsonDoc();
         return doc != null ? doc.PathBool(path, dflt) : dflt;
     }
 
-    // ================= 类型化取参族 =================
-    // Input* 是 In* 家族的类型化别名（历史上是两套并行实现，合并顺序
-    // 在两族里会解析到不同来源）。现在统一走 InRaw/InInt/InLong/InBool：
-    // 一份合并顺序、一份解析规则，生成的蹦床与手写控制器读到的值一致。
+    public string InputString(string name) { return this.InRaw(name); }
+    public int InputInt(string name, int dflt) { return this.InInt(name, dflt); }
+    public long InputLong(string name, long dflt) { return this.InLong(name, dflt); }
+    public bool InputBool(string name, bool dflt) { return this.InBool(name, dflt); }
 
-    // 按 route → query → form 顺序取原始字符串（未过滤）；
-    // 三处都缺时返回空串。
-    public string InputString(string name) {
-        return this.InRaw(name);
-    }
-
-    // 按合并顺序取整型；缺失、非整数或溢出时返回
-    // `dflt`。"42"、"-7"、"+7" 合法；"12abc"、"2.5"、"" 不合法。
-    public int InputInt(string name, int dflt) {
-        return this.InInt(name, dflt);
-    }
-
-    // 按合并顺序取 64 位整型；规则同 InputInt。
-    public long InputLong(string name, long dflt) {
-        return this.InLong(name, dflt);
-    }
-
-    // 按合并顺序取布尔："1"/"true"/"on"/"yes"
-    // （大小写不敏感）为真，"0"/"false"/"off"/"no" 为假，
-    // 其余返回 `dflt`。
-    public bool InputBool(string name, bool dflt) {
-        return this.InBool(name, dflt);
-    }
-
-    // 严格十进制解析：可选 +/- 前缀、其余必须全为数字、
-    // 整串消费、int 范围校验；任何一条不满足返回 `dflt`。
     public static int ParseIntStrict(string v, int dflt) {
         if (v == null || v.Length == 0) { return dflt; }
         long r = HttpContext.ParseLongStrict(v, dflt);
@@ -381,7 +346,6 @@ public class HttpContext : IDisposable {
         return (int)r;
     }
 
-    // ASCII 大小写不敏感等值（布尔词表用）。
     private static bool AsciiEq(string a, string b) {
         if (a.Length != b.Length) { return false; }
         for (int i = 0; i < a.Length; i = i + 1) {
@@ -394,8 +358,6 @@ public class HttpContext : IDisposable {
         return true;
     }
 
-    // 严格 64 位解析，规则同 ParseIntStrict；累加中途变负（64 位回绕）
-    // 视为解析失败。
     public static long ParseLongStrict(string v, long dflt) {
         if (v == null || v.Length == 0) { return dflt; }
         int i = 0;
@@ -409,35 +371,28 @@ public class HttpContext : IDisposable {
             int c = v[i] & 255;
             if (c < 48 || c > 57) { return dflt; }
             acc = acc * 10 + (c - 48);
-            // 只有全是数字时 acc 才可能为负：变负即说明 64 位已回绕，
-            // 当作解析失败而不是把回绕值当结果返回。
             if (acc < 0) { return dflt; }
             i = i + 1;
         }
         return neg ? 0 - acc : acc;
     }
-    // 按名取请求头；不存在返回 ""。
+
     public string Header(string name) { return this.request.GetHeader(name); }
 
     public string Cookie(string name) {
         string all = this.request.GetHeader("Cookie");
         int allLen = all.Length;
         if (allLen == 0) { return ""; }
-        // 就地比较，不切片：每个 cookie 段先 Substring 出来、再拼一个
-        // "name=" 前缀去比，一次查找就要分配三四个临时串（外加每个
-        // .Length 一次 strlen）。命中时才分配返回值。
         int nameLen = name.Length;
         int i = 0;
         while (i < allLen) {
             while (i < allLen) {
                 int c = all[i] & 255;
-                if (c != 32 && c != 59) { break; }  // ' ' or ';'
+                if (c != 32 && c != 59) { break; }
                 i = i + 1;
             }
             int e = i;
-            while (e < allLen && (all[e] & 255) != 59) { e = e + 1; }  // ';'
-            // 名字后必须紧跟 '='，且值至少一个字符——空值视为未命中，
-            // 与旧的 part.Length > prefix.Length 判定一致。
+            while (e < allLen && (all[e] & 255) != 59) { e = e + 1; }
             if (e - i > nameLen + 1 && (all[i + nameLen] & 255) == 61) {
                 bool same = true;
                 for (int k = 0; k < nameLen; k = k + 1) {
@@ -453,15 +408,11 @@ public class HttpContext : IDisposable {
         return "";
     }
 
-    // X-Requested-With 恰为 XMLHttpRequest（仅认这两种大小写写法）时为真。
     public bool IsAjax() {
         string x = this.request.GetHeader("X-Requested-With");
         return x == "XMLHttpRequest" || x == "xmlhttprequest";
     }
 
-    // 统一过滤输入：优先使用安全过滤方法读取参数。
-
-    // 获取原始未过滤参数值 (优先级：路由参数 -> Query -> Form)。
     public string InRaw(string name) {
         if (this.routeParams != null) {
             string v = this.routeParams.Get(name);
@@ -477,25 +428,11 @@ public class HttpContext : IDisposable {
         return "";
     }
 
-    // 获取安全过滤后的字符串参数值（自动裁剪首尾空白并剔除控制字符）。
     public string In(string name) { return Filter.Clean(this.InRaw(name)); }
-
     public string InText(string name) { return Filter.Html(this.InRaw(name)); }
-
-    // 获取整数参数值，缺失或格式无效时回退默认值。
-    public int InInt(string name, int def) {
-        return HttpContext.ParseIntStrict(Filter.Clean(this.InRaw(name)), def);
-    }
-
-    // 获取 64 位长整数参数值，缺失或格式无效时回退默认值。
-    public long InLong(string name, long def) {
-        return HttpContext.ParseLongStrict(Filter.Clean(this.InRaw(name)), def);
-    }
-
-    public double InDouble(string name, double def) {
-        return Filter.ToDouble(this.InRaw(name), def);
-    }
-
+    public int InInt(string name, int def) { return HttpContext.ParseIntStrict(Filter.Clean(this.InRaw(name)), def); }
+    public long InLong(string name, long def) { return HttpContext.ParseLongStrict(Filter.Clean(this.InRaw(name)), def); }
+    public double InDouble(string name, double def) { return Filter.ToDouble(this.InRaw(name), def); }
     public bool InBool(string name, bool def) { return Filter.ToBool(this.InRaw(name), def); }
 
     public bool HasIn(string name) {
@@ -505,453 +442,6 @@ public class HttpContext : IDisposable {
         return false;
     }
 
-
-    // Ended only means a response was prepared. An exception before transport
-    // ownership must discard every success payload/header, including cookies.
-    internal bool ResetFailedResponse() {
-        if (this.wasHijacked || this.hijacked) { return false; }
-        this.ReleaseResponseBuf();
-        this.body = "";
-        this.bodyBytes = null;
-        this.bodyBytesLen = 0;
-        if (this.headers != null) {
-            for (int i = this.headers.Count - 1; i >= 0; i = i - 1) {
-                string header = this.headers[i].ToLower();
-                bool safe = header.StartsWith("access-control-")
-                    || header.StartsWith("vary:")
-                    || header.StartsWith("content-security-policy:")
-                    || header.StartsWith("content-security-policy-report-only:")
-                    || header.StartsWith("strict-transport-security:")
-                    || header.StartsWith("x-content-type-options:")
-                    || header.StartsWith("x-frame-options:")
-                    || header.StartsWith("referrer-policy:")
-                    || header.StartsWith("permissions-policy:")
-                    || header.StartsWith("cross-origin-");
-                if (!safe) { this.headers.RemoveAt(i); }
-            }
-        }
-        this.status = 500;
-        this.statusText = "Internal Server Error";
-        this.contentType = HttpLimits.MimeJson;
-        this.ended = false;
-        return true;
-    }
-
-    // 设置状态码与原因短语（可链式）。
-    public HttpContext Status(int code, string text) {
-        this.status = code;
-        this.statusText = text;
-        return this;
-    }
-
-    // splitting).
-    private static string HeaderSafe(string s) {
-        int n = s.Length;
-        int i = 0;
-        while (i < n) {
-            int c = s[i] & 255;
-            if (c == 13 || c == 10 || c == 0) { break; }
-            i = i + 1;
-        }
-        if (i == n) { return s; }
-        StringBuilder sb = new StringBuilder();
-        int flush = 0;
-        int k = 0;
-        while (k < n) {
-            int c = s[k] & 255;
-            if (c == 13 || c == 10 || c == 0) {
-                if (k > flush) { sb.Append(s.Substring(flush, k - flush)); }
-                flush = k + 1;
-            }
-            k = k + 1;
-        }
-        if (n > flush) { sb.Append(s.Substring(flush, n - flush)); }
-        return sb.ToString();
-    }
-
-    // 追加响应头；名称与值都经 HeaderSafe 清洗（可链式）。
-    public HttpContext SetHeader(string name, string val) {
-        if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add(HttpContext.HeaderSafe(name) + ": "
-            + HttpContext.HeaderSafe(val));
-        return this;
-    }
-
-    // 设置 HttpOnly + SameSite=Lax 的会话 cookie（可链式）。请求经
-    // TLS 反代（X-Forwarded-Proto: https）时追加 Secure——明文直连
-    // 不加，避免本地开发/无 TLS 部署拿不到 cookie。
-    public HttpContext SetCookie(string name, string val, int maxAgeSeconds) {
-        if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
-            + HttpContext.HeaderSafe(val)
-            + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
-            + "; Path=/; HttpOnly; SameSite=Lax"
-            + HttpContext.SecureFlag(this));
-        return this;
-    }
-
-    public HttpContext SetCookieJs(string name, string val, int maxAgeSeconds) {
-        if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Set-Cookie: " + HttpContext.HeaderSafe(name) + "="
-            + HttpContext.HeaderSafe(val)
-            + "; Max-Age=" + Convert.ToString(maxAgeSeconds)
-            + "; Path=/; SameSite=Lax"
-            + HttpContext.SecureFlag(this));
-        return this;
-    }
-
-    // TLS 反代协议（X-Forwarded-Proto: https）或原生 TLS → "; Secure"，否则空串。
-    private static string SecureFlag(HttpContext ctx) {
-        if (ctx.IsSecure()) { return "; Secure"; }
-        return "";
-    }
-
-    // 以 text/html; charset=utf-8 应答并结束本请求。
-    public void Html(string html) {
-        this.contentType = HttpLimits.MimeHtmlUtf8;
-        this.body = html;
-        this.ended = true;
-    }
-
-    // 以 text/plain; charset=utf-8 应答并结束本请求。
-    public void Text(string text) {
-        this.contentType = HttpLimits.MimePlainUtf8;
-        this.body = text;
-        this.ended = true;
-    }
-
-    // 以 text/markdown; charset=utf-8 应答并结束本请求（GEO/AI 搜索引擎内容协商）。
-    public void Markdown(string md) {
-        this.contentType = "text/markdown; charset=utf-8";
-        this.body = md;
-        this.ended = true;
-    }
-
-    // 以 application/xml; charset=utf-8 应答并结束本请求（Sitemap/RSS/XML 输出）。
-    public void Xml(string xml) {
-        this.contentType = HttpLimits.MimeXmlUtf8;
-        this.body = xml;
-        this.ended = true;
-    }
-
-    // 判断请求客户端是否命中已知生成式 AI 搜索引擎爬虫（如 GPTBot、PerplexityBot 等）。
-    public bool IsAiBot() {
-        return GeoAgent.IsAiBot(this.Header("User-Agent"));
-    }
-
-    // 判断当前请求是否期望接收 Markdown 格式（通过 format 参数、Accept 头或 AI 爬虫协商）。
-    public bool WantsMarkdown() {
-        return GeoAgent.WantsMarkdown(this);
-    }
-
-    public void Binary(string mime, byte[] data, int len) {
-        this.contentType = mime;
-        this.bodyBytes = data;
-        this.bodyBytesLen = len;
-        this.body = "";
-        this.ended = true;
-    }
-
-    public bool IsBinary() { return this.bodyBytes != null; }
-    public byte[] BodyBytes() { return this.bodyBytes; }
-    public int BodyBytesLen() { return this.bodyBytesLen; }
-    public string ResponseBody() { return this.body; }
-
-    public bool StatusForbidsBody() {
-        return (this.status >= 100 && this.status < 200)
-            || this.status == 204 || this.status == 304;
-    }
-
-    public int BodyLength() {
-        if (this.StatusForbidsBody()) { return 0; }
-        if (this.bodyBytes != null) { return this.bodyBytesLen; }
-        return this.body.Length;
-    }
-
-    // 以 application/json 应答并结束本请求。
-    public void Json(string json) {
-        this.contentType = HttpLimits.MimeJson;
-        this.body = json;
-        this.ended = true;
-    }
-
-    public void Download(string fileName, string mime, string body) {
-        if (fileName == null) { fileName = ""; }
-        int len = fileName.Length;
-        bool hasBad = false;
-        for (int j = 0; j < len; j = j + 1) {
-            int c = fileName[j] & 255;
-            if (c < 32 || c == 34 || c == 47 || c == 92 || c == 59) {
-                hasBad = true;
-                break;
-            }
-        }
-        string name = fileName;
-        if (hasBad) {
-            StringBuilder safe = new StringBuilder();
-            int start = 0;
-            for (int i = 0; i < len; i = i + 1) {
-                int c = fileName[i] & 255;
-                if (c < 32 || c == 34 || c == 47 || c == 92 || c == 59) {
-                    if (i > start) {
-                        safe.Append(fileName.Substring(start, i - start));
-                    }
-                    start = i + 1;
-                }
-            }
-            if (start < len) {
-                safe.Append(fileName.Substring(start, len - start));
-            }
-            name = safe.ToString();
-        }
-        if (name.Length == 0) { name = "export.txt"; }
-        this.SetHeader("Content-Disposition",
-            "attachment; filename=\"" + name + "\"");
-        this.contentType = mime;
-        this.body = body;
-        this.ended = true;
-    }
-
-    // 统一 API 响应信封模型：包含 code、msg、data 与 traceId。
-    public void Api(string code, string msg, string data) {
-        ApiEnvelope o = new ApiEnvelope();
-        o.code = code;
-        o.msg = msg;
-        JsonValue dv = JsonValue.ParseLenient(data);
-        if (dv == null) { dv = JsonValue.NewStr(data); }
-        o.data = dv;
-        this.Json(Json.Serialize<ApiEnvelope>(o));
-    }
-
-    // 302 跳转：Location 经 HeaderSafe 清洗，正文为空。
-    public void Redirect(string url) {
-        this.status = 302;
-        this.statusText = "Found";
-        if (this.headers == null) { this.headers = new List<string>(); }
-        this.headers.Add("Location: " + HttpContext.HeaderSafe(url));
-        this.body = "";
-        this.ended = true;
-    }
-
-
-    public WebApp App() { return this.app; }
-    public void SetApp(WebApp a) { this.app = a; }
-
-    public void Attach(TcpClient client) { this.conn = client; }
-    public void AttachTls(TlsStream stream) { this.tlsStream = stream; }
-    public TlsStream Tls() { return this.tlsStream; }
-    public bool IsSecure() { return this.tlsStream != null || this.Header("X-Forwarded-Proto") == "https"; }
-
-    public nint ClientSock() {
-        if (this.conn == null) { return 0; }
-        return this.conn.Sock();
-    }
-
-    // 请求到达与响应处理的超时时限（毫秒）。
-    internal HttpDeadlineToken deadlineSlot;
-
-    // 请求到达与响应处理的超时时限（毫秒）。
-    internal int streamIdleMs;
-    internal HttpFramer framer;
-
-    // 本连接挂载的期限槽（长流处理器须定期 Touch，见 deadlineSlot 字段说明）。
-    public HttpDeadlineToken DeadlineSlot() { return this.deadlineSlot; }
-    public int StreamIdleMs() { return this.streamIdleMs; }
-    public HttpFramer Framer() { return this.framer; }
-    public TcpClient Conn() { return this.conn; }
-
-    // 由连接循环注入期限槽与空闲窗口（应用的 requestTimeoutMs）。
-    public void SetDeadlineSlot(HttpDeadlineToken slot, int idleMs) {
-        this.deadlineSlot = slot;
-        this.streamIdleMs = idleMs;
-    }
-
-    // 由连接循环注入定界缓冲（WS 升级时从中切出管线其后的帧字节）。
-    public void SetFramer(HttpFramer framer) { this.framer = framer; }
-
-    // 请求到达与响应处理的超时时限（毫秒）。
-    public void TouchDeadline(int timeoutMs) {
-        if (this.deadlineSlot != null) {
-            HttpDeadline.Touch(this.deadlineSlot, timeoutMs);
-        }
-    }
-
-    public void Hijack() {
-        this.hijacked = true;
-        this.wasHijacked = true;
-    }
-
-    public void CloseHijack() {
-        this.hijacked = false;
-    }
-
-    public void RecordFrame(long bytes) {
-        this.frames = this.frames + 1;
-        this.framesBytes = this.framesBytes + bytes;
-    }
-
-    public bool Hijacked() { return this.hijacked; }
-
-    public bool MetricsExcluded() { return this.wasHijacked; }
-
-    public long Frames() { return this.frames; }
-    // 该连接累计推出的帧字节数（流式连接的流量度量）。
-    public long FrameBytes() { return this.framesBytes; }
-
-    // 开启 SSE 流式响应，委托给 HttpSseStreamer。
-    public async bool SseOpen() {
-        return await HttpSseStreamer.Open(this);
-    }
-
-    // 底层流式长链接 TCP 写出辅助（带短写重试）。
-    public async bool SendAllTcp(string data) {
-        return await HttpSseStreamer.SendAllTcp(this.conn, data);
-    }
-
-    // 发送 SSE 格式事件帧，委托给 HttpSseStreamer。
-    public async bool SseSend(string name, string data) {
-        return await HttpSseStreamer.Send(this, name, data);
-    }
-
-    // 发送 SSE 格式保活心跳帧，委托给 HttpSseStreamer。
-    public async bool SsePing() {
-        return await HttpSseStreamer.Ping(this);
-    }
-
-    // socket's permission.
-
-    public bool IsWebSocketRequest() {
-        if (this.conn == null) { return false; }
-        string up = this.request.GetHeader("Upgrade");
-        int ul = up.Length;
-        int i = 0;
-        bool found = false;
-        while (i < ul && !found) {
-            while (i < ul && ((up[i] & 255) == 32 || (up[i] & 255) == 9)) {
-                i = i + 1;
-            }
-            int start = i;
-            while (i < ul && (up[i] & 255) != 44) { i = i + 1; }
-            int stop = i;
-            while (stop > start
-                   && ((up[stop - 1] & 255) == 32 || (up[stop - 1] & 255) == 9)) {
-                stop = stop - 1;
-            }
-            if (stop - start == 9) {
-                found = true;
-                string w = "websocket";
-                for (int j = 0; j < 9; j = j + 1) {
-                    int c = up[start + j] & 255;
-                    if (c >= 65 && c <= 90) { c = c + 32; }
-                    if (c != (w[j] & 255)) { found = false; break; }
-                }
-            }
-            i = i + 1;  // past the comma
-        }
-        if (!found) { return false; }
-        return this.request.GetHeader("Sec-WebSocket-Key").Length > 0;
-    }
-
-
-    // 序列化为完整 HTTP/1.1 报文：状态行、Content-Type/Length、依
-    // keepAlive 的 Connection 头、Server 头，再接已清洗的自定义头。
-    // Worker 级全报文流式装配：通过 HttpBufferPool.RentBytes 零分配复用 byte[] 缓冲区，
-    // 将响应头与正文在连续内存中原位格式化，一并交付底层 Socket.SendBytesAsync，
-    // 完全消除堆分配与大包阶段的双报文拆分开销。
-    public void BuildResponseDirect(bool keepAlive) {
-        // HEAD 的应答头必须与 GET 完全一致（含 Content-Length），
-        // 但正文一律不发送（RFC 9110 §9.3.2）。不剥离的话 keep-alive
-        // 连接上正文会被当作下一个请求解析——请求走私；非 keep-alive
-        // 的客户端则可能收到与声明不符的额外字节。
-        bool statusBodyless = this.StatusForbidsBody();
-        bool omitBody = this.method == "HEAD" || statusBodyless;
-        bool forbidFraming = statusBodyless && this.status != 304;
-        StringBuilder sb = HttpBufferPool.Rent();
-        sb.Append("HTTP/1.1 ");
-        sb.Append(this.status);
-        sb.Append(" ");
-        sb.Append(this.statusText);
-        sb.Append("\r\nContent-Type: ");
-        sb.Append(this.contentType);
-        if (!statusBodyless) {
-            int blen = this.BodyLength();
-            if (blen == 0) {
-                sb.Append("\r\nContent-Length: 0");
-            } else {
-                sb.Append("\r\nContent-Length: ");
-                sb.Append(blen);
-            }
-        }
-        if (keepAlive) { sb.Append("\r\nConnection: keep-alive"); }
-        else { sb.Append("\r\nConnection: close"); }
-        sb.Append("\r\nServer: Zan/1.0");
-        int hn = 0;
-        if (this.headers != null) { hn = this.headers.Count; }
-        for (int i = 0; i < hn; i = i + 1) {
-            string header = this.headers[i];
-            if (forbidFraming) {
-                int colon = header.IndexOf(":");
-                if (colon >= 0) {
-                    string name = header.Substring(0, colon).Trim();
-                    if (HttpContext.AsciiEq(name, "Content-Length")
-                        || HttpContext.AsciiEq(name, "Transfer-Encoding")) {
-                        continue;
-                    }
-                }
-            }
-            sb.Append("\r\n");
-            sb.Append(header);
-        }
-        sb.Append("\r\n\r\n");
-
-        int headLen = sb.Length;
-        int bodyLen = 0;
-        if (!omitBody) {
-            if (this.bodyBytes != null) {
-                bodyLen = this.BodyLength();
-            } else if (this.body != null) {
-                bodyLen = this.body.Length;
-            }
-        }
-        int total = headLen + bodyLen;
-        byte[] buf = HttpBufferPool.RentBytes(total);
-
-        NativeMemory.PutString((nint)buf, 0, sb.ToString(), headLen);
-        HttpBufferPool.Return(sb);
-
-        if (!omitBody && bodyLen > 0) {
-            if (this.bodyBytes != null) {
-                NativeMemory.Copy((nint)buf + headLen, (nint)this.bodyBytes, bodyLen);
-            } else if (this.body != null) {
-                NativeMemory.PutString((nint)buf, headLen, this.body, bodyLen);
-            }
-        }
-
-        this.responseBuf = buf;
-        this.responseLen = total;
-    }
-
-    public string BuildResponse(bool keepAlive) {
-        this.BuildResponseDirect(keepAlive);
-        if (this.responseBuf == null || this.responseLen == 0) { return ""; }
-        // 二进制正文的字符串表示只取响应头：字节经 responseBuf 原样出网，
-        // 混进字符串会被 NUL 截断也无法代表（web_response_bodyless 钉的
-        // ordinary binary send contract）；HEAD 的字符串形式本就无体，
-        // 两者因此一致（HEAD binary representation length）。
-        int slen = this.responseLen;
-        if (this.bodyBytes != null && this.method != "HEAD" &&
-            !this.StatusForbidsBody()) {
-            int blen = this.BodyLength();
-            if (blen > 0 && slen > blen) { slen = slen - blen; }
-        }
-        string res = NativeMemory.GetString((nint)this.responseBuf, 0, slen);
-        this.ReleaseResponseBuf();
-        return res;
-    }
-
-    // ---- helpers ----
-
-    // 前缀判断（大小写敏感，零堆分配逐字符比对）。
     public static bool StartsWith(string s, string prefix) {
         if (s == null || prefix == null || s.Length < prefix.Length) { return false; }
         int n = prefix.Length;

@@ -11,31 +11,32 @@ using Zan.Web;
 namespace Zan.Web.Account;
 
 /* 登录屏（前台 /login）：与 POST /api/auth/login 发出同一 cookie（AuthUser.LoginController → AuthToken.Issue），浏览器会话与 API 令牌为同一机制；此处不关心密码如何加盐或令牌如何签名。独立模块以取得独立外壳（Account/layout.html 为居中卡片，非管理后台外壳——尚未可用的页面放侧边栏是噪声）。管理台端点 /admin/login 与 /admin/logout 的声明区在 Admin/LoginController.zan（URL 区籍：admin 前缀端点只能由 Admin 区声明），校验流 Attempt 在本类 static 共享、两壳复用，失败重渲染卡片，理由就在用户正看的页面上。 */
-[Route("[controller]/[action]")]
+[Route("/login")]
 [Custom(Authorization = CustomAuthorization.None)]
 [Description("登录")]
 public class LoginController : AppController {
     public static const string Tpl = "Account.LoginController.Index";
 
-    /* 前台登录：同一机制与卡片，自有外壳与目的地——普通成员回站点首页（/），而非一个可能无权进入的管理后台。GET /login 由默认动作 Index 承接；POST 显式带动作段 /login/submit，路由可逐段寻到方法。 */
+    /* 前台登录：同一机制与卡片，自有外壳与目的地——普通成员回站点首页（/），而非一个可能无权进入的管理后台。GET /login 由默认动作 Index 承接；POST /login/submit 由 Submit 承接。 */
     [HttpGet]
-    [Route("/login")]
     [Description("登录")]
     public async void Index() {
         if (this.IsLogin()) {
-            this.Ctx().Redirect(Routes.Home);
+            this.Ctx().Redirect(Routes.PathOf(typeof(Zan.Web.Index.IndexController), "Index", Routes.Home));
             return;
         }
         string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
+        string submitPath = Routes.PathOf(typeof(LoginController), "Submit", "/login/submit");
         this.ViewOf(Tpl, await Form(site, "", this.In("user"),
-            "/login/submit", "登录", false, true));
+            submitPath, "登录", false, true));
     }
 
     [HttpPost]
-    [Route("/login/submit")]
     [Description("登录提交")]
     public async void Submit() {
-        await Attempt(this, "/login/submit", "登录", false, true, "/");
+        string submitPath = Routes.PathOf(typeof(LoginController), "Submit", "/login/submit");
+        string homePath = Routes.PathOf(typeof(Zan.Web.Index.IndexController), "Index", Routes.Home);
+        await Attempt(this, submitPath, "登录", false, true, homePath);
     }
 
     /* 两张卡片共用一条登录路径：action/heading/demo/home 只塑造重渲的表单，redirectTo 是成功后的去向；失败重渲同卡片，理由留在用户正看的页面上。static 供 Admin/LoginController.zan 薄壳转发（/admin/login 的声明区在 Admin 区）。 */
@@ -73,7 +74,7 @@ public class LoginController : AppController {
             return;
         }
         await Record(c, c.Ctx(), user, true, "");
-        c.Ctx().SetCookie("zsession", token, 864000);
+        c.Ctx().SetCookie(Cfg.Auth.cookieName, token, Cfg.Auth.ttlSeconds);
         /* redirectTo 为空 = 管理台壳：落地页交给"该账号可到达的第一个
            菜单项"（与侧边栏同源同序，看到什么第一项就落到哪里）；
            一项不可达（新号未授权）落到个人资料页——那里能改密码、能退出，
@@ -82,8 +83,10 @@ public class LoginController : AppController {
         if (target.Length == 0) {
             WebApp cur = WebHost.Current();
             string uid2 = await AuthToken.Resolve(token);
-            target = await MenuBuilder.LandingFor(cur, uid2);
-            if (target.Length == 0) { target = Routes.Profile; }
+            target = await MenuService.LandingFor(cur, uid2, c.Held());
+            if (target.Length == 0) {
+                target = Routes.PathOf(typeof(Zan.Web.Admin.ProfileController), "Index", Routes.Profile);
+            }
         }
         c.Ctx().Redirect(target);
     }

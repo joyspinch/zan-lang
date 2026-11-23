@@ -8,11 +8,8 @@ using System.Threading;
 
 namespace System.Net;
 
-// WebSocket 协议分片：握手/帧循环/连接注册表/Push 的实现，
-// 从 Worker.zan 外迁为独立类。Worker 核心只经静态槽分发（Worker.wsEntry），
-// 应用调用一次 WorkerWs.Install() 本文件才进编译图——纯 HTTP 服务不背
-// ws 编解码（约 870 行），正如不背 SSE/MQTT。槽反转与独立类（不写
-// partial Worker）的理由见 Worker.ProtoEntryFn 的文档。
+// WebSocket 协议分片：握手、帧循环、连接注册表与 Push。
+// 经 Worker.wsEntry 静态槽延迟接入，调用 WorkerWs.Install() 时才编入构建。
 public class WorkerWs {
     [DllImport("crt")]
     private static extern long strlen(string str);
@@ -190,77 +187,45 @@ public class WorkerWs {
         }
     }
 
-    // WebSocket push：把一条 Text 帧排进该连接的出站缓冲并立即
-    // 写出（服务端帧不掩码）。可从任何回调上下文调用——包括 onOpen 里
-    // 主动欢迎、定时器里广播等没有入站消息先行的场景，这正是与"从
-    // onMessage 返回应答"的区别。连接已关或未升级返回 false。
-    // 帧序与帧循环共用同一缓冲，Append 到 Flush 之间不让出，天然一致。
+    private static async bool SendFrame(Connection c, WsLink link, WsFrame frame, int len) {
+        await link.LockAsync();
+        try {
+            if (c.IsClosed()) { return false; }
+            byte[] encoded = frame.Encode();
+            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
+            int n = await link.writer.Flush(link.client);
+            if (n < 0) {
+                c.Close();
+                return false;
+            }
+            Worker.BumpSent();
+            return true;
+        } finally {
+            link.Unlock();
+        }
+    }
+
+    // 推送一条服务端 Text 帧（可从任意回调上下文调用）；已关闭或未升级返回 false。
     public static async bool Push(Connection c, string data) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        await link.LockAsync();
-        try {
-            if (c.IsClosed()) { return false; }
-            int len = (int)strlen(data);
-            WsFrame frame = WsFrame.RawFrame(WsOpcode.Text, data, len);
-            byte[] encoded = frame.Encode();
-            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
-            int n = await link.writer.Flush(link.client);
-            if (n < 0) {
-                c.Close();
-                return false;
-            }
-            Worker.BumpSent();
-            return true;
-        } finally {
-            link.Unlock();
-        }
+        int len = (int)strlen(data);
+        return await WorkerWs.SendFrame(c, link, WsFrame.RawFrame(WsOpcode.Text, data, len), len);
     }
 
-    // WebSocket 二进制 push：`data` 可含 NUL，`len` 为精确
-    // 字节数（绝不 strlen）。语义同 Push。
+    // 二进制 push：data 可含 NUL，len 为精确字节数（不做 strlen）。
     public static async bool PushBinary(Connection c, string data, int len) {
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        await link.LockAsync();
-        try {
-            if (c.IsClosed()) { return false; }
-            WsFrame frame = WsFrame.RawFrame(WsOpcode.Binary, data, len);
-            byte[] encoded = frame.Encode();
-            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
-            int n = await link.writer.Flush(link.client);
-            if (n < 0) {
-                c.Close();
-                return false;
-            }
-            Worker.BumpSent();
-            return true;
-        } finally {
-            link.Unlock();
-        }
+        return await WorkerWs.SendFrame(c, link, WsFrame.RawFrame(WsOpcode.Binary, data, len), len);
     }
 
-    // WebSocket 原始字节数组 push：零中转字符串拷贝与二进制安全。
+    // 原始字节数组 push：零中转字符串拷贝与二进制安全。
     public static async bool PushBinary(Connection c, byte[] data, int offset, int len) {
         if (data == null || offset < 0 || len <= 0 || offset + len > data.Length) { return false; }
         WsLink link = WorkerWs.LinkOf(c.GetId());
         if (link == null || c.IsClosed()) { return false; }
-        await link.LockAsync();
-        try {
-            if (c.IsClosed()) { return false; }
-            WsFrame frame = WsFrame.RawBytes(WsOpcode.Binary, data, offset, len);
-            byte[] encoded = frame.Encode();
-            link.writer.Append(encoded, WsFrame.HeaderLen(len) + len);
-            int n = await link.writer.Flush(link.client);
-            if (n < 0) {
-                c.Close();
-                return false;
-            }
-            Worker.BumpSent();
-            return true;
-        } finally {
-            link.Unlock();
-        }
+        return await WorkerWs.SendFrame(c, link, WsFrame.RawBytes(WsOpcode.Binary, data, offset, len), len);
     }
 
     // WebSocket 原始字节数组 push 全量切片。
@@ -271,12 +236,17 @@ public class WorkerWs {
 
     // ---- 帧循环 ----
 
+    private static async bool SendCloseAndFlush(WsWriter writer, TcpClient client, int code) {
+        byte[] enc = WsFrame.CloseFrameWithCode(code).Encode();
+        writer.Append(enc, 4);
+        int _f = await writer.Flush(client);
+        return false;
+    }
+
     public static async void HandleWebSocket(Worker w, nint clientSock) {
         TcpClient client = TcpClient.FromSocket(clientSock);
 
-        // 握手读取与明文 HTTP 一样受 requestTimeout 约束（慢速客户端
-        // 每秒滴一个字节就能永久钉住协程与 64KB 复用缓冲）；WS 循环
-        // 的空闲不设限，与 HTTP keep-alive 的请求间空闲一致。
+        // 握手阶段沿用 requestTimeout 防慢速客户端占槽；进入帧循环后空闲不设限。
         HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, w.requestTimeout);
         HttpFramer framer = HttpFramer.Create(clientSock);
         int headerEnd = 0;
@@ -320,8 +290,7 @@ public class WorkerWs {
             w.DropConn();
             return;
         }
-        // 之后的路径全部收口到帧循环末尾的统一清理；本函数内不再
-        // 有提前 return。
+        // 之后统一走末尾 finally 清理；不再提前 return。
 
         StringBuilder sb = HttpBufferPool.Rent();
         sb.Append("HTTP/1.1 101 Switching Protocols\r\n");
@@ -343,15 +312,9 @@ public class WorkerWs {
         }
         framer.Dispose();
         WsWriter writer = new WsWriter();
-        // 连接级出站能力：WorkerWs.Push/Broadcast 与帧循环共用这个 writer，
-        // 回调里（onOpen 欢迎、定时器广播）无需入站消息先行即可推帧。
+        // 须先 Attach 再触发 onOpen，否则回调内 WorkerWs.Push 会因注册项为空静默失败；
+        // 末尾 finally 必须执行 Close/ConnRemove/DropConn 避免死 socket 残留与计数漂移。
         WorkerWs.Attach(conn, writer, client);
-        // onOpen 必须在 writer 挂载并登记之后触发：回调里的
-        // WorkerWs.Push 依赖注册项非空（否则静默返回 false，
-        // 欢迎帧丢失且无任何错误迹象）。
-        // WS 帧循环的收尾清理在 finally 中：onOpen/onFrameData 抛出时
-        // Close/ConnRemove/DropConn 一个都不能少——连接留在广播表里
-        // 会对死 socket 持续推送，计数漂移则自我拒绝服务。
         ConnectionHandler onUp = w.OpenHandler();
         try {
         if (onUp != null) { await onUp(conn); }
@@ -362,12 +325,8 @@ public class WorkerWs {
             int total = reader.FrameSize();
             while (total < 0) {
                 if (total == -2 || total == -3) {
-                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009）。
-                    // 无上限时对端声明一个 2GB 的帧就能把缓冲撑到 OOM。
-                    byte[] enc = WsFrame.CloseFrameWithCode(total == -3 ? 1009 : 1002).Encode();
-                    writer.Append(enc, 4);
-                    int _v = await writer.Flush(client);
-                    active = false;
+                    // -2 = 帧长编码违规（1002）；-3 = 消息过大（1009，防大帧 OOM）。
+                    active = await WorkerWs.SendCloseAndFlush(writer, client, total == -3 ? 1009 : 1002);
                     break;
                 }
                 if (writer.Pending()) { int _f = await writer.Flush(client); }
@@ -382,18 +341,13 @@ public class WorkerWs {
 
             WsFrame frame = reader.TakeFrame(total);
 
-            // RFC 6455 入站帧门禁：统一复用公共校验，包含 RSV、掩码、
-            // 控制帧边界、保留 opcode 与 Close code/reason UTF-8。
+            // RFC 6455 入站帧校验（RSV/掩码/控制帧边界/保留 opcode/Close UTF-8）。
             if (!WsFrame.ValidInbound(frame, true)) {
-                byte[] enc = WsFrame.CloseFrameWithCode(1002).Encode();
-                writer.Append(enc, 4);
-                int _b = await writer.Flush(client);
-                active = false;
+                active = await WorkerWs.SendCloseAndFlush(writer, client, 1002);
                 break;
             }
             if (frame.opcode == WsOpcode.Ping) {
-                // §5.5.3：Pong 必须原样带回 Ping 的应用数据——空 Pong
-                // 会让按载荷配对的心跳客户端断连。
+                // §5.5.3：Pong 须原样带回 Ping 应用数据。
                 WsFrame pong = WsFrame.RawFrame(WsOpcode.Pong, frame.payload, frame.payloadLen);
                 byte[] encoded = pong.Encode();
                 writer.Append(encoded, WsFrame.HeaderLen(frame.payloadLen) + frame.payloadLen);
@@ -408,22 +362,15 @@ public class WorkerWs {
                 active = false;
                 break;
             }
-            // 数据帧（Text/Binary/Continuation）：分片消息在 fin 时
-            // 整条交付——此前 continuation 帧被静默丢弃。
+            // 数据帧（Text/Binary/Continuation）在 fin 时整条交付。
             int feed = asm.Feed(frame);
             if (feed < 0) {
-                byte[] enc = WsFrame.CloseFrameWithCode(feed == -2 ? 1009 : 1002).Encode();
-                writer.Append(enc, 4);
-                int _r = await writer.Flush(client);
-                active = false;
+                active = await WorkerWs.SendCloseAndFlush(writer, client, feed == -2 ? 1009 : 1002);
                 break;
             }
             if (feed == 0) { continue; }
             if (!asm.ValidComplete()) {
-                byte[] encUtf = WsFrame.CloseFrameWithCode(1007).Encode();
-                writer.Append(encUtf, 4);
-                int _u = await writer.Flush(client);
-                active = false;
+                active = await WorkerWs.SendCloseAndFlush(writer, client, 1007);
                 break;
             }
 
@@ -433,8 +380,7 @@ public class WorkerWs {
             Worker.BumpStat();
             string response = "";
             if (onFrameData != null) {
-                // 同 HandleTcp：用户帧回调抛出只丢弃本条消息，
-                // 连接与循环存活。
+                // 用户帧回调异常只丢弃本条消息，保持连接存活。
                 try {
                     response = await onFrameData(conn, message);
                     if (response == null) { response = ""; }
@@ -447,10 +393,7 @@ public class WorkerWs {
             }
             int respLen = (int)strlen(response);
             if (respLen > 16777216) {
-                byte[] encBig = WsFrame.CloseFrameWithCode(1009).Encode();
-                writer.Append(encBig, 4);
-                int _big = await writer.Flush(client);
-                active = false;
+                active = await WorkerWs.SendCloseAndFlush(writer, client, 1009);
                 break;
             }
             if (respLen > 0) {
@@ -528,19 +471,22 @@ public class WebSocketHub {
         Mutex.Unlock(this.chanLock);
     }
 
+    private static void RemoveConnFromList(List<Connection> list, int id) {
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].GetId() == id) {
+                list.RemoveAt(i);
+                break;
+            }
+        }
+    }
+
     public void Leave(string channel, Connection conn) {
         if (conn == null || channel == "") { return; }
         this.ChanInit();
         Mutex.Lock(this.chanLock);
         if (this.channels.ContainsKey(channel)) {
             List<Connection> list = this.channels[channel];
-            int id = conn.GetId();
-            for (int i = 0; i < list.Count; i = i + 1) {
-                if (list[i].GetId() == id) {
-                    list.RemoveAt(i);
-                    break;
-                }
-            }
+            WebSocketHub.RemoveConnFromList(list, conn.GetId());
             if (list.Count == 0) {
                 this.channels.Remove(channel);
             }
@@ -555,14 +501,7 @@ public class WebSocketHub {
         int id = conn.GetId();
         List<string> keys = this.channels.Keys;
         for (int k = 0; k < keys.Count; k = k + 1) {
-            string ch = keys[k];
-            List<Connection> list = this.channels[ch];
-            for (int i = 0; i < list.Count; i = i + 1) {
-                if (list[i].GetId() == id) {
-                    list.RemoveAt(i);
-                    break;
-                }
-            }
+            WebSocketHub.RemoveConnFromList(this.channels[keys[k]], id);
         }
         Mutex.Unlock(this.chanLock);
     }

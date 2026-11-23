@@ -210,11 +210,7 @@ public class DocQuery {
 
     // ===== 执行 =====
 
-    // 候选集检索：
-    // 1. 若有多个就绪二级索引约束，执行有序双指针求交（Index Intersection）；
-    // 2. 若单索引就绪，直接索引定位；
-    // 3. 若无索引，优先使用首个等值约束或范围约束做存储层单字段快筛扫描；
-    // 4. 否则全表扫描。
+    // 候选集检索：多就绪索引求交 -> 单索引快路径 -> 无索引流式快筛 / 全表扫描。
     public List<JsonValue> Candidates() {
         // 统计所有已就绪的二级索引条件
         List<int> readyEq = new List<int>();
@@ -246,22 +242,10 @@ public class DocQuery {
             }
             if (readyRange.Count == 1) {
                 RangeFilter rf = this.rangeFilters[readyRange[0]];
-                List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
-                List<JsonValue> rdocs = new List<JsonValue>();
-                for (int i = 0; i < rids.Count; i = i + 1) {
-                    JsonValue d = this.col.FindById(rids[i]);
-                    if (d != null) { rdocs.Add(d); }
-                }
-                return rdocs;
+                return this.LoadDocsByIds(this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi));
             }
             InFilter inf = this.inFilters[readyIn[0]];
-            List<int> rids = FindIdsByInValues(inf.field, inf.values);
-            List<JsonValue> rdocs = new List<JsonValue>();
-            for (int i = 0; i < rids.Count; i = i + 1) {
-                JsonValue d = this.col.FindById(rids[i]);
-                if (d != null) { rdocs.Add(d); }
-            }
-            return rdocs;
+            return this.LoadDocsByIds(FindIdsByInValues(inf.field, inf.values));
         }
 
         // 多索引求交路径：拉取各索引匹配 ID 并归并求交
@@ -270,45 +254,26 @@ public class DocQuery {
             for (int i = 0; i < readyEq.Count; i = i + 1) {
                 EqFilter f = this.eqFilters[readyEq[i]];
                 List<int> ids = this.col.FindIdsByField(f.field, f.val);
-                if (curIds == null) {
-                    curIds = ids;
-                } else {
-                    curIds = DocQuery.IntersectSortedIds(curIds, ids);
-                    if (curIds.Count == 0) { break; }
-                }
+                curIds = curIds == null ? ids : DocQuery.IntersectSortedIds(curIds, ids);
+                if (curIds.Count == 0) { break; }
             }
             if (curIds == null || curIds.Count > 0) {
                 for (int i = 0; i < readyRange.Count; i = i + 1) {
                     RangeFilter rf = this.rangeFilters[readyRange[i]];
                     List<int> ids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
-                    if (curIds == null) {
-                        curIds = ids;
-                    } else {
-                        curIds = DocQuery.IntersectSortedIds(curIds, ids);
-                        if (curIds.Count == 0) { break; }
-                    }
+                    curIds = curIds == null ? ids : DocQuery.IntersectSortedIds(curIds, ids);
+                    if (curIds.Count == 0) { break; }
                 }
             }
             if (curIds == null || curIds.Count > 0) {
                 for (int i = 0; i < readyIn.Count; i = i + 1) {
                     InFilter inf = this.inFilters[readyIn[i]];
                     List<int> ids = FindIdsByInValues(inf.field, inf.values);
-                    if (curIds == null) {
-                        curIds = ids;
-                    } else {
-                        curIds = DocQuery.IntersectSortedIds(curIds, ids);
-                        if (curIds.Count == 0) { break; }
-                    }
+                    curIds = curIds == null ? ids : DocQuery.IntersectSortedIds(curIds, ids);
+                    if (curIds.Count == 0) { break; }
                 }
             }
-            List<JsonValue> rdocs = new List<JsonValue>();
-            if (curIds != null) {
-                for (int i = 0; i < curIds.Count; i = i + 1) {
-                    JsonValue d = this.col.FindById(curIds[i]);
-                    if (d != null) { rdocs.Add(d); }
-                }
-            }
-            return rdocs;
+            return this.LoadDocsByIds(curIds);
         }
 
         // 无就绪索引回退：首选等值字段流式快筛
@@ -318,47 +283,24 @@ public class DocQuery {
         }
         if (this.rangeFilters.Count > 0) {
             RangeFilter rf = this.rangeFilters[0];
-            List<int> rids = this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi);
-            List<JsonValue> rdocs = new List<JsonValue>();
-            for (int i = 0; i < rids.Count; i = i + 1) {
-                JsonValue d = this.col.FindById(rids[i]);
-                if (d != null) { rdocs.Add(d); }
-            }
-            return rdocs;
+            return this.LoadDocsByIds(this.col.FindIdsByFieldRange(rf.field, rf.lo, rf.hi));
         }
         return this.col.FindAll();
     }
 
-    // 检查余下的等值约束、范围约束与 lambda 过滤器
-    // （首个等值约束已由 <see cref="Candidates"/> 的扫描应用）。
+    private List<JsonValue> LoadDocsByIds(List<int> ids) {
+        List<JsonValue> docs = new List<JsonValue>();
+        if (ids == null) { return docs; }
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            JsonValue d = this.col.FindById(ids[i]);
+            if (d != null) { docs.Add(d); }
+        }
+        return docs;
+    }
+
+    // 检查余下的等值约束、范围约束与 lambda 过滤器（首个等值约束已由 Candidates 扫描应用）。
     public bool MatchesRest(JsonValue d) {
-        int i = 1;
-        while (i < this.eqFilters.Count) {
-            EqFilter f = this.eqFilters[i];
-            JsonValue v = d.Get(f.field);
-            if (v == null) { return false; }
-            if (v.AsString("") != f.val) { return false; }
-            i = i + 1;
-        }
-        for (int r = 0; r < this.rangeFilters.Count; r = r + 1) {
-            RangeFilter rf = this.rangeFilters[r];
-            JsonValue v = d.Get(rf.field);
-            if (v == null) { return false; }
-            string sv = v.AsString("");
-            if (rf.lo != "" && String.CompareOrdinal(sv, rf.lo) < 0) { return false; }
-            if (rf.hi != "" && String.CompareOrdinal(sv, rf.hi) > 0) { return false; }
-        }
-        for (int k = 0; k < this.inFilters.Count; k = k + 1) {
-            InFilter inf = this.inFilters[k];
-            JsonValue v = d.Get(inf.field);
-            if (v == null) { return false; }
-            string sv = v.AsString("");
-            if (!inf.valSet.ContainsKey(sv)) { return false; }
-        }
-        foreach (DocPredicate p in this.preds) {
-            if (!p(d)) { return false; }
-        }
-        return true;
+        return this.MatchesFrom(d, 1);
     }
 
     // 当候选集已经由单字段快筛扫描应用了首个等值条件时为 true。
@@ -382,11 +324,14 @@ public class DocQuery {
 
     // 检查全部等值约束、范围约束与 lambda 过滤器。
     public bool Matches(JsonValue d) {
-        for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
+        return this.MatchesFrom(d, 0);
+    }
+
+    private bool MatchesFrom(JsonValue d, int eqStart) {
+        for (int i = eqStart; i < this.eqFilters.Count; i = i + 1) {
             EqFilter f = this.eqFilters[i];
             JsonValue v = d.Get(f.field);
-            if (v == null) { return false; }
-            if (v.AsString("") != f.val) { return false; }
+            if (v == null || v.AsString("") != f.val) { return false; }
         }
         for (int r = 0; r < this.rangeFilters.Count; r = r + 1) {
             RangeFilter rf = this.rangeFilters[r];
@@ -399,9 +344,7 @@ public class DocQuery {
         for (int k = 0; k < this.inFilters.Count; k = k + 1) {
             InFilter inf = this.inFilters[k];
             JsonValue v = d.Get(inf.field);
-            if (v == null) { return false; }
-            string sv = v.AsString("");
-            if (!inf.valSet.ContainsKey(sv)) { return false; }
+            if (v == null || !inf.valSet.ContainsKey(v.AsString(""))) { return false; }
         }
         foreach (DocPredicate p in this.preds) {
             if (!p(d)) { return false; }
@@ -717,37 +660,17 @@ public class DocQuery {
         return null;
     }
 
-    // 匹配数量（不应用排序/分页）。只有单个等值约束
-    // 时无需具体化任何文档即可计数——字段已索引时
-    // 用索引键，否则从每条记录读取
-    // 一个字段来计数。
+    // 匹配数量（不应用排序/分页；单等值条件走快速计数）。
     public int Count() {
-        if (this.preds.Count == 0 && this.rangeFilters.Count == 0) {
-            bool hasReady = false;
-            int readyIdx = -1;
-            for (int i = 0; i < this.eqFilters.Count; i = i + 1) {
-                if (this.col.IndexReady(this.eqFilters[i].field)) {
-                    hasReady = true;
-                    readyIdx = i;
-                    break;
-                }
-            }
-            if (hasReady && this.eqFilters.Count == 1) {
-                EqFilter only = this.eqFilters[readyIdx];
-                return this.col.CountByField(only.field, only.val);
-            }
-            if (!hasReady && this.eqFilters.Count == 1) {
-                EqFilter only = this.eqFilters[0];
-                return this.col.CountByField(only.field, only.val);
-            }
+        if (this.preds.Count == 0 && this.rangeFilters.Count == 0 && this.eqFilters.Count == 1) {
+            EqFilter only = this.eqFilters[0];
+            return this.col.CountByField(only.field, only.val);
         }
         List<JsonValue> cand = Candidates();
         bool scanned = EqAppliedByScan();
         int n = 0;
         for (int i = 0; i < cand.Count; i = i + 1) {
-            bool keep = false;
-            if (scanned) { keep = MatchesRest(cand[i]); }
-            else { keep = Matches(cand[i]); }
+            bool keep = scanned ? MatchesRest(cand[i]) : Matches(cand[i]);
             if (keep) { n = n + 1; }
         }
         return n;

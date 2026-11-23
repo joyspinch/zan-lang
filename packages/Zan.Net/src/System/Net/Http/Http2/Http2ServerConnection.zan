@@ -52,6 +52,7 @@ public class Http2ServerConnection : IDisposable {
     private int bufferedBytes;
     private Http2HeaderBlock headerBlock;
     private bool settingsReceived;
+    private bool measureStreams;
     public int maxHeaderBytes = 65536;
     public int maxRequestBytes = 8388608;
     public int maxConcurrentStreams = 16;
@@ -168,6 +169,7 @@ public class Http2ServerConnection : IDisposable {
             int declared = Http2HeaderBlock.Validate(headers, true);
             if (declared > this.maxRequestBytes) { throw new IOException("HTTP2 request body limit"); }
             HttpRequest req = this.BuildRequest(headers);
+            if (this.measureStreams) { req.StreamHeadersUs = Stopwatch.GetMicroseconds(); }
             Http2ServerStream stream = new Http2ServerStream(frame.streamId, req);
             stream.declaredLength = declared;
             lock (this.pendingStreams) {
@@ -177,6 +179,7 @@ public class Http2ServerConnection : IDisposable {
             }
             if (this.headerBlock.endStream) {
                 if (declared > 0) { throw new IOException("HTTP2 content-length mismatch"); }
+                if (this.measureStreams) { stream.request.StreamReadyUs = Stopwatch.GetMicroseconds(); }
                 stream.complete = true;
                 Task.Spawn(this.ProcessAndRespondStreamAsync(stream));
             }
@@ -206,6 +209,7 @@ public class Http2ServerConnection : IDisposable {
                 if (stream.declaredLength >= 0 && size != stream.declaredLength) { throw new IOException("HTTP2 content-length mismatch"); }
                 stream.request.body = stream.bodyBuffer.ToStr();
                 stream.request.bodyLength = size;
+                if (this.measureStreams) { stream.request.StreamReadyUs = Stopwatch.GetMicroseconds(); }
                 stream.complete = true;
                 Task.Spawn(this.ProcessAndRespondStreamAsync(stream));
             }
@@ -286,6 +290,10 @@ public class Http2ServerConnection : IDisposable {
         return req;
     }
     private async void ProcessAndRespondStreamAsync(Http2ServerStream stream) {
+        int status = 0;
+        string outcome = "stream_closed";
+        long sendStartUs = 0;
+        long sendEndUs = 0;
         try {
             if (!this.connected || stream.reset) { return; }
             HttpResponse response = null;
@@ -294,16 +302,39 @@ public class Http2ServerConnection : IDisposable {
                 else { response = HttpResponse.Ok("<h1>Zan HTTP/2 Server</h1>"); }
             } catch (Exception ex) {
                 // Request boundary: application failures become a generic 500.
+                outcome = "application_exception";
                 response = HttpResponse.ServerError("Internal Server Error");
             }
             if (response == null) { response = HttpResponse.NotFound(); }
-            if (this.connected && !stream.reset) { await this.SendResponseAsync(stream, response); }
+            status = response.statusCode;
+            if (this.connected && !stream.reset) {
+                if (this.measureStreams) { sendStartUs = Stopwatch.GetMicroseconds(); }
+                bool sent = await this.SendResponseAsync(stream, response);
+                if (this.measureStreams) { sendEndUs = Stopwatch.GetMicroseconds(); }
+                if (sent && outcome != "application_exception") { outcome = "sent"; }
+                else if (!sent) { outcome = stream.reset ? "stream_reset" : "stream_closed"; }
+            } else if (stream.reset) { outcome = "stream_reset"; }
         } catch (Exception ex) {
+            if (this.measureStreams) { sendEndUs = Stopwatch.GetMicroseconds(); }
+            outcome = "send_failed";
             // Background response boundary: fail the connection and release its bounded stream slot.
             await this.FailAsync(Http2Error.INTERNAL_ERROR);
-        } finally { this.RemovePendingStream(stream.streamId); }
+        } finally {
+            try { this.RemovePendingStream(stream.streamId); }
+            catch (Exception failure) {
+                outcome = "cleanup_exception";
+                throw;
+            } finally {
+                HttpStreamCompletion completion = stream.request.StreamCompletion;
+                if (completion != null) {
+                    stream.request.StreamCompletion = null;
+                    try { completion(status, outcome, sendStartUs, sendEndUs); }
+                    catch (Exception diagnosticFailure) { }
+                }
+            }
+        }
     }
-    private async Task SendResponseAsync(Http2ServerStream stream, HttpResponse response) {
+    private async bool SendResponseAsync(Http2ServerStream stream, HttpResponse response) {
         int length = response.BodyLength();
         if (length < 0 || length > this.maxRequestBytes) { throw new IOException("HTTP2 response body limit"); }
         List<HpackHeader> headers = new List<HpackHeader>();
@@ -331,6 +362,7 @@ public class Http2ServerConnection : IDisposable {
         // Hold an async gate across the whole header sequence, never a blocking thread mutex.
         await this.sendGate.Wait();
         try {
+            if (!this.connected || stream.reset) { return false; }
             byte[] encoded = this.outboundHpack.EncodeHeaders(headers, false);
             int offset = 0;
             bool first = true;
@@ -345,25 +377,36 @@ public class Http2ServerConnection : IDisposable {
                 first = false;
             }
         } finally { this.sendGate.Signal(); }
-        if (noBody) { return; }
+        if (noBody) { return true; }
         byte[] body = response.bodyBytes != null && response.bodyBytesLen > 0 ? response.bodyBytes : response.body.ToBytes();
         int sent = 0;
         long deadline = Stopwatch.GetMilliseconds() + this.timeoutMs;
         while (sent < length && this.connected && !stream.reset) {
             int chunk = 0;
-            lock (this.pendingStreams) {
-                chunk = length - sent;
-                if (chunk > 16384) { chunk = 16384; }
-                if (chunk > this.outboundConnWindow) { chunk = this.outboundConnWindow; }
-                if (chunk > stream.outboundStreamWindow) { chunk = stream.outboundStreamWindow; }
-                if (chunk > 0) { this.outboundConnWindow = this.outboundConnWindow - chunk; stream.outboundStreamWindow = stream.outboundStreamWindow - chunk; }
-            }
-            if (Stopwatch.GetMilliseconds() >= deadline) { throw new IOException("HTTP2 response flow-control timeout"); }
-            if (chunk <= 0) { await Task.Delay(2); continue; }
-            byte[] packet = this.Packet(Http2FrameType.DATA, sent + chunk == length ? Http2Flags.END_STREAM : 0, stream.streamId, body, sent, chunk);
-            await this.SendRawAsync(packet, packet.Length);
-            sent = sent + chunk;
+            await this.sendGate.Wait();
+            try {
+                if (!this.connected || stream.reset) { return false; }
+                if (Stopwatch.GetMilliseconds() >= deadline) { throw new IOException("HTTP2 response flow-control timeout"); }
+                lock (this.pendingStreams) {
+                    chunk = length - sent;
+                    if (chunk > 16384) { chunk = 16384; }
+                    if (chunk > this.outboundConnWindow) { chunk = this.outboundConnWindow; }
+                    if (chunk > stream.outboundStreamWindow) { chunk = stream.outboundStreamWindow; }
+                    if (chunk > 0) {
+                        this.outboundConnWindow = this.outboundConnWindow - chunk;
+                        stream.outboundStreamWindow = stream.outboundStreamWindow - chunk;
+                    }
+                }
+                if (chunk > 0) {
+                    byte[] packet = this.Packet(Http2FrameType.DATA, sent + chunk == length ? Http2Flags.END_STREAM : 0,
+                        stream.streamId, body, sent, chunk);
+                    await this.SendUnlockedAsync(packet);
+                    sent = sent + chunk;
+                }
+            } finally { this.sendGate.Signal(); }
+            if (chunk <= 0) { await Task.Delay(2); }
         }
+        return sent == length;
     }
     private byte[] Packet(int type, int flags, int id, byte[] data, int offset, int count) {
         byte[] packet = new byte[9 + count];
@@ -395,8 +438,9 @@ public class Http2ServerConnection : IDisposable {
         connection.timeoutMs = timeoutMs;
         return await connection.RunAsync();
     }
-    public static async int ServeTlsAsync(Http2SendFn sendFn, HttpRequestHandler handler, HttpFramer framer, int maxHeaderBytes, int maxRequestBytes, int timeoutMs) {
+    public static async int ServeTlsAsync(Http2SendFn sendFn, HttpRequestHandler handler, HttpFramer framer, int maxHeaderBytes, int maxRequestBytes, int timeoutMs, bool measureStreams = false) {
         Http2ServerConnection connection = new Http2ServerConnection(framer, handler, sendFn);
+        connection.measureStreams = measureStreams;
         connection.maxHeaderBytes = maxHeaderBytes;
         connection.maxRequestBytes = maxRequestBytes;
         connection.timeoutMs = timeoutMs;

@@ -1,0 +1,55 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Runtime.CompilerServices;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Dao;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web;
+
+namespace Zan.Web.Services;
+
+/* CRUD 设计表菜单贡献者：通过 MvcHooks.OnMenu 为有权访问通用数据屏的账号追加
+   已迁移但尚未生成独立模块的设计表入口，使 AdminController 不再直接耦合
+   SysGenTableDao 与 Monitor.DataController。 */
+public class CrudMenu {
+    [ModuleInitializer]
+    public static void Init() {
+        MvcHooks.OnMenu(AppendDesigned);
+    }
+
+    public static async void AppendDesigned(IDbConnection db, string uid, string activePath, List<MenuNode> nodes) {
+        if (db == null || uid == null || uid.Length == 0 || nodes == null) { return; }
+        string dataAction = Routes.ActionOf(typeof(Zan.Web.Admin.Monitor.DataController));
+        if (!await AuthUser.Allow(db, uid, dataAction)) { return; }
+        List<SysGenTable> tables = null;
+        try {
+            tables = await new SysGenTableDao(db).AllMigrated();
+        } catch (Exception _ex) {
+            /* 极简测试或尚未建 sys_gen_table 时安静降级。 */
+            return;
+        }
+        if (tables == null || tables.Count == 0) { return; }
+        string dataPath = Routes.PathOf(typeof(Zan.Web.Admin.Monitor.DataController), "Index", Routes.Data);
+        string group = MenuBuilder.GroupOf(dataPath);
+        int groupOrder = MenuBuilder.OrderOf(dataPath);
+        for (int i = 0; i < tables.Count; i = i + 1) {
+            SysGenTable t = tables[i];
+            /* 表已生成自己的模块后，菜单归该模块，通用数据屏不再列出。 */
+            if (t.generatedAt > 0) { continue; }
+            string fullPath = dataPath + "?t=" + t.tableName;
+            MenuNode n = new MenuNode();
+            n.SetTitle(t.title);
+            n.SetPath(fullPath);
+            n.SetGroup(group);
+            n.SetGroupOrder(groupOrder);
+            n.SetIcon("mdi:table");
+            /* 排在该分区块的路由页面之后，按设计顺序。 */
+            n.SetOrder(dataPath + "~" + Convert.ToString(i));
+            n.SetActive(activePath == fullPath);
+            nodes.Add(n);
+        }
+    }
+}

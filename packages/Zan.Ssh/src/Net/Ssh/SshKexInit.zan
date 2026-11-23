@@ -3,27 +3,7 @@ using System.Collections.Generic;
 
 namespace Net.Ssh;
 
-// SSH_MSG_KEXINIT 的载荷（RFC 4253 §7.1）与算法协商。
-//
-// 载荷结构（**载荷不含消息号那个字节**——交换哈希算的是"载荷"，不含
-// 消息号；把消息号也算进去，两边算出来的 H 就不一样了）：
-//
-//     byte[16]     cookie
-//     name-list    kex_algorithms
-//     name-list    server_host_key_algorithms
-//     name-list    encryption_algorithms_client_to_server
-//     name-list    encryption_algorithms_server_to_client
-//     name-list    mac_algorithms_client_to_server
-//     name-list    mac_algorithms_server_to_client
-//     name-list    compression_algorithms_client_to_server
-//     name-list    compression_algorithms_server_to_client
-//     name-list    languages_client_to_server
-//     name-list    languages_server_to_client
-//     boolean      first_kex_packet_follows
-//     uint32       0（保留）
-//
-// **cookie 必须是随机 16 字节**：它的作用是让双方都没法提前算出密钥与会话
-// 标识符。用固定值（比如全 0）等于把这层保护去掉。
+// SSH_MSG_KEXINIT 载荷（RFC 4253 §7.1）：不含消息号字节（交换哈希计算依赖载荷），cookie 须为随机 16 字节。
 public class SshKexInit {
     // 随机 cookie（16 字节）。
     public byte[] cookie;
@@ -102,25 +82,16 @@ public class SshKexInit {
         init.firstKexPacketFollows = r.ReadBool();
         long reserved = r.ReadU32();
         if (reserved != 0) {
-            // 保留字段非 0：RFC 说要忽略，但忽略一个非 0 的保留字段意味着
-            // 对端在用我们不认识的扩展——按"不认识就断开"的规矩处理更安全。
+            // 保留字段非 0 视为未知扩展，直接拒绝连接。
             throw new SshException(SshError.Malformed, "KEXINIT reserved field is not zero");
         }
         return init;
     }
 }
 
-// 算法协商（RFC 4253 §7.1）。
-//
-// **规则只有一条，但方向很重要**：选的是"**客户端列表里第一个、同时也在服务端
-// 列表里**的算法"——不是"服务端列表里第一个客户端也支持的"。客户端列表代表
-// 客户端的偏好顺序，服务端列表代表服务端支持什么。两条规则选出来的算法可能
-// 不同，RFC 明确以客户端顺序为准。
-//
-// 密钥交换算法多一条约束：它需要的**主机密钥算法**也必须是双方都支持的
-// （例如要求"可签名"的主机密钥，就得在双方的主机密钥算法里找到一个可签名的）。
+// 算法协商（RFC 4253 §7.1）：按客户端偏好顺序取首个双方均支持的算法。
 public class SshNegotiation {
-    // 选一个双方都支持的算法；没有交集返回 null。
+    // 选出双方均支持的算法；无交集返回 null。
     public static string Choose(List<string> clientList, List<string> serverList) {
         if (clientList == null || serverList == null) { return null; }
         for (int i = 0; i < clientList.Count; i = i + 1) {
@@ -132,8 +103,7 @@ public class SshNegotiation {
         return null;
     }
 
-    // 主机密钥算法要求"可签名"（本包支持的主机密钥算法全都是可签名的，
-    // 所以这条约束退化成"双方有交集"）。
+    // 主机密钥算法协商（本包支持的算法均支持签名）。
     public static string ChooseHostKey(List<string> clientList, List<string> serverList) {
         return SshNegotiation.Choose(clientList, serverList);
     }

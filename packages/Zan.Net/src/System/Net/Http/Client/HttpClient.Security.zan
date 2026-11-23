@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Net.Sockets;
 using System.Net.Http;
+using System.Net.Tls;
 using System.Net.External;
 
 namespace System.Net.Http.Client;
@@ -53,6 +54,29 @@ public partial class HttpClient {
         HttpClient.defaultBoundedContentDecoder = fn;
     }
 
+    private static string SliceTrimLowerAscii(string s, int start, int stop) {
+        while (start < stop && (s[start] & 255) <= 32) { start = start + 1; }
+        while (stop > start && (s[stop - 1] & 255) <= 32) { stop = stop - 1; }
+        int n = stop - start;
+        if (n <= 0) { return ""; }
+        bool hasUpper = false;
+        for (int i = start; i < stop; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 65 && c <= 90) { hasUpper = true; break; }
+        }
+        if (!hasUpper) {
+            if (start == 0 && stop == s.Length) { return s; }
+            return s.Substring(start, n);
+        }
+        byte[] buf = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[start + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            buf[i] = (byte)c;
+        }
+        return buf.ToStr(0, n);
+    }
+
     // 拆分 Content-Encoding 的取值：可能是逗号分隔的多段
     // （"gzip, br"——按发送顺序逐层编码）。空段丢掉。
     private static List<string> SplitCodings(string header) {
@@ -63,7 +87,7 @@ public partial class HttpClient {
         while (pos <= len) {
             int comma = header.IndexOf(",", pos);
             int stop = comma < 0 ? len : comma;
-            string one = header.Substring(pos, stop - pos).Trim().ToLower();
+            string one = HttpClient.SliceTrimLowerAscii(header, pos, stop);
             if (one.Length > 0) { out2.Add(one); }
             if (comma < 0) { break; }
             pos = comma + 1;
@@ -133,7 +157,7 @@ public partial class HttpClient {
             resp.bodyBytesLen = 0;
         }
         resp.contentDecoded = true;
-        resp.contentEncoding = header.Trim().ToLower();
+        resp.contentEncoding = HttpClient.SliceTrimLowerAscii(header, 0, header.Length);
         return resp;
     }
 
@@ -207,9 +231,16 @@ public partial class HttpClient {
         ctx.RequirePinning(true);
     }
 
-    // Reserved compatibility API. Client authentication is not implemented;
-    // reject at configuration rather than silently making an anonymous request.
+    // 配置 mTLS 客户端 PEM 证书链与私钥；仅允许在首次发送前配置，并立即校验证书与私钥有效性。
     public HttpClient SetClientCertificate(string certFile, string keyFile) {
-        throw new NotSupportedException("TLS client certificate authentication is not implemented");
+        this.securityGate.WaitOne();
+        try {
+            this.RequireMutableSecurity();
+            TlsContext.LoadClientCredentials(null, certFile, keyFile);
+            this.clientCertificateFile = certFile;
+            this.clientPrivateKeyFile = keyFile;
+            this.useTls = true;
+            return this;
+        } finally { this.securityGate.ReleaseMutex(); }
     }
 }

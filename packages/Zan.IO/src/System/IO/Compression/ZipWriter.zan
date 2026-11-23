@@ -3,7 +3,7 @@ using System.IO;
 
 namespace System.IO.Compression;
 
-// 中途放弃时调 <see cref="Abort"/> 删掉半成品文件。
+// 流式 ZIP 归档写出器（支持一次性条目与分块流式条目；中途放弃可调 Abort 清理半成品文件）。
 public class ZipWriter : IDisposable {
     [DllImport("crt", EntryPoint = "zan_file_fopen")]
     private static extern nint fopen(string path, string mode);
@@ -40,7 +40,7 @@ public class ZipWriter : IDisposable {
     long curHdrPos;
     DeflateChunker curChunker;
 
-    // 构造空写出器；实例经 <see cref="Open"/> 创建。
+    // 构造空写出器；实例经 Open 创建。
     public ZipWriter() {
         this.fp = 0;
         this.offsets = new List<long>();
@@ -75,17 +75,11 @@ public class ZipWriter : IDisposable {
         long hpos = this.Tell();
         this.WriteHeader(name, method, crc, payload.Length, data.Length);
         this.WriteRaw(payload, payload.Length);
-        this.offsets.Add(hpos);
-        this.names.Add(name);
-        this.methods.Add(method);
-        this.crcs.Add(crc);
-        this.csizes.Add(payload.Length);
-        this.usizes.Add(data.Length);
+        this.RecordEntry(hpos, name, method, crc, payload.Length, data.Length);
     }
 
-    // 开始一个分块条目：写出本地头（CRC/尺寸先占位，
-    // <see cref="EndEntry"/> 时回填）。之后用 <see cref="WriteData"/>
-    // 喂数据。级别 0 表示存储（原样写盘），1-9 分块 deflate。
+    // 开始一个分块条目（先写占位本地头，EndEntry 时回填 CRC 与尺寸），配合 WriteData 喂数据；
+    // 级别 0 表示存储，1-9 分块 deflate。
     public void BeginEntry(string name, int level) {
         this.curName = name;
         this.curMethod = level > 0 ? Zip.MethodDeflate : Zip.MethodStored;
@@ -133,14 +127,19 @@ public class ZipWriter : IDisposable {
             this.curCrc, this.curCsize, this.curUsize);
         this.Seek((int)this.curHdrPos);
         this.WriteRaw(hdr, 30);
-        this.offsets.Add(this.curHdrPos);
-        this.names.Add(this.curName);
-        this.methods.Add(this.curMethod);
-        this.crcs.Add(this.curCrc);
-        this.csizes.Add(this.curCsize);
-        this.usizes.Add(this.curUsize);
+        this.RecordEntry(this.curHdrPos, this.curName, this.curMethod,
+            this.curCrc, this.curCsize, this.curUsize);
         // 回到文件尾，后续条目继续追加。
         this.SeekEnd();
+    }
+
+    private void RecordEntry(long offset, string name, int method, int crc, long csize, long usize) {
+        this.offsets.Add(offset);
+        this.names.Add(name);
+        this.methods.Add(method);
+        this.crcs.Add(crc);
+        this.csizes.Add(csize);
+        this.usizes.Add(usize);
     }
 
     // 写中央目录与 EOCD，关闭文件。之后归档可读。

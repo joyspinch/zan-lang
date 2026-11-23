@@ -1,0 +1,544 @@
+using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Http2;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Net;
+using System.Text;
+using System;
+
+namespace System.Web;
+
+// WebApp 传输层接入与 HTTP/1.1 / HTTP/2 / TLS 连接循环部分（零拷贝请求解析 + 连接级复用）。
+public partial class WebApp {
+    private static async void ServeSock(nint clientSock) {
+        WebApp app = active;
+        if (app == null) { Socket.Close(clientSock); return; }
+        if (await app.RefuseOverCapacity(clientSock)) { return; }
+        if (app.IsHttps()) {
+            await app.HandleTlsConnection(clientSock);
+        } else {
+            await app.HandleConnection(clientSock);
+        }
+    }
+
+    private async bool RefuseOverCapacity(nint clientSock) {
+        long live = this.activeConnections.Increment();
+        if (this.maxConnections <= 0 || live <= (long)this.maxConnections) {
+            return false;
+        }
+        long _back = this.activeConnections.Decrement();
+        if (this.IsHttps()) {
+            Socket.Close(clientSock);
+            return true;
+        }
+        TcpClient c = TcpClient.FromSocket(clientSock);
+        int _s = await c.SendAsync(WebApp.SimpleResponse(503,
+            "Service Unavailable", "server is at capacity"));
+        c.Close();
+        return true;
+    }
+
+    public async void HandleTlsConnection(nint clientSock) {
+        try {
+            Socket.SetNoDelay(clientSock);
+            TlsStream stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
+            if (stream == null) { return; }
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            HttpFramer framer = HttpFramerTls.Create(stream);
+            try {
+                Http1Writer writer = HttpFramerTls.CreateWriter(stream);
+                string remoteIp = Socket.RemoteIp(clientSock);
+                await this.ServeHttp1(framer, writer, remoteIp, watch, null, stream);
+            } finally {
+                HttpDeadline.Disarm(watch);
+                framer.Dispose();
+                stream.Close();
+            }
+        } finally {
+            Socket.Close(clientSock);
+            long _live = this.activeConnections.Decrement();
+        }
+    }
+
+    public async HttpResponse DispatchRequest(HttpRequest req) {
+        return await this.HandleHttp2Request(req);
+    }
+
+    private async HttpResponse HandleHttp2Request(HttpRequest req) {
+        RequestTrace trace = null;
+        if (req.StreamHeadersUs != 0) { trace = this.StartRequestTrace("HTTP/2", req.StreamHeadersUs); }
+        if (trace != null) {
+            req.StreamCompletion = trace.FinishStream;
+            trace.EndAt(trace.BeginAt("receive_body", req.StreamHeadersUs), req.StreamReadyUs);
+            trace.End(trace.BeginAt("dispatch_queue", req.StreamReadyUs));
+        }
+        bool resources = trace != null && this.profileRequestResources
+            && trace.BeginResources(this.profileRequestExecution, this.profileRequestStages);
+        try {
+            HttpContext ctx = new HttpContext(req, "127.0.0.1");
+            ctx.Trace = trace;
+            ctx.SetApp(this);
+            int formStage = trace != null ? trace.Begin("parse_form") : -1;
+            if (req.bodyLength > 0) {
+                if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
+                    HttpContext.ParseMultipartFields(req, ctx);
+                } else {
+                    HttpContext.ParseFormBody(req, ctx);
+                }
+            }
+            if (trace != null) { trace.End(formStage); }
+            Route route = this.MatchRequest(ctx);
+            bool admitted;
+            if (!this.TryPrepareRequestSync(ctx, route, out admitted)) {
+                admitted = await this.PrepareRequest(ctx, route);
+            }
+            Worker.BumpStat();
+            await this.Dispatch(ctx, route, true, false, !admitted);
+            int responseStage = trace != null ? trace.Begin("http2_response") : -1;
+            HttpResponse resp = new HttpResponse();
+            resp.statusCode = ctx.GetStatus();
+            resp.statusText = ctx.StatusText();
+            resp.contentType = ctx.ContentType();
+            if (ctx.Headers() != null) {
+                for (int i = 0; i < ctx.Headers().Count; i = i + 1) {
+                    resp.headers.Add(ctx.Headers()[i]);
+                }
+            }
+            if (ctx.IsBinary()) {
+                resp.bodyBytes = ctx.BodyBytes();
+                resp.bodyBytesLen = ctx.BodyBytesLen();
+            } else if (ctx.ResponseBody() != null) {
+                resp.body = ctx.ResponseBody();
+            }
+            ctx.ReleaseResponseBuf();
+            if (trace != null) { trace.End(responseStage); }
+            Worker.BumpSent();
+            return resp;
+        } finally {
+            if (resources) { trace.EndResources(); }
+        }
+    }
+
+    public async void HandleConnection(nint clientSock) {
+        TcpClient client = TcpClient.FromSocket(clientSock);
+        try {
+            client.EnsureNonBlocking();
+            Socket.SetNoDelay(clientSock);
+            HttpFramer framer = HttpFramer.Create(clientSock);
+            HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, this.requestTimeoutMs);
+            try {
+                Http1Writer writer = new Http1Writer(client.SendViewAsync, 0, clientSock);
+                string remoteIp = Socket.RemoteIp(clientSock);
+                await this.ServeHttp1(framer, writer, remoteIp, watch, client, null);
+            } finally {
+                HttpDeadline.Disarm(watch);
+                framer.Dispose();
+            }
+        } finally {
+            client.Close();
+            long _live = this.activeConnections.Decrement();
+        }
+    }
+
+    private async void ServeHttp1(HttpFramer framer, Http1Writer writer, string remoteIp,
+                                  HttpDeadlineToken watch, TcpClient client, TlsStream stream) {
+        HttpRequest request = new HttpRequest();
+        HttpContext ctx = null;
+        bool keepAlive = true;
+        try {
+            while (keepAlive) {
+                RequestProfiler profiler = this.requestProfiler;
+                bool measure = profiler != null || this.requestDiagnostics != null;
+                RequestTrace trace = null;
+                bool resources = false;
+                int headStage = -1;
+                if (profiler != null && this.profileRequestStages) {
+                    trace = this.StartRequestTrace("HTTP/1", Stopwatch.GetMicroseconds());
+                    resources = trace.BeginResources(this.profileRequestExecution, true);
+                    trace.SetReadLoopCoverage();
+                    int deadlineStage = trace.Begin("request_deadline");
+                    HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                    trace.End(deadlineStage);
+                    headStage = trace.Begin("receive_head");
+                } else {
+                    HttpDeadline.Touch(watch, this.requestTimeoutMs);
+                }
+
+                int headerEnd;
+                try {
+                    if (!framer.TryReadHeadSync(65000, measure, out headerEnd)) {
+                        headerEnd = await framer.ReadHeadContinue(65000, measure);
+                    }
+                } catch (Exception failure) {
+                    this.RecordHeadFailure(trace, profiler, framer, headStage, resources, failure);
+                    throw;
+                }
+
+                if (headerEnd <= 0 && framer.HeadStartUs == 0 && headerEnd != -431) {
+                    if (resources) { trace.EndResources(); }
+                    break;
+                }
+                trace = this.FinalizeHeadTrace(trace, measure, headStage, headerEnd, framer);
+                if (trace != null && headStage < 0 && this.profileRequestResources) {
+                    resources = trace.BeginResources(this.profileRequestExecution);
+                }
+
+                if (headerEnd == -431) {
+                    string earlyOutcome = "rejected";
+                    try {
+                        earlyOutcome = await this.SendSimpleProfiled(writer, trace, 431,
+                            "Request Header Fields Too Large", "header block too large");
+                    } finally {
+                        this.FinishAbortedHead(trace, resources, 431, earlyOutcome);
+                    }
+                    break;
+                }
+                if (headerEnd <= 0) {
+                    this.FinishAbortedHead(trace, resources, 0, "incomplete_head");
+                    break;
+                }
+
+                int parseStage = trace != null ? trace.Begin("parse_head") : -1;
+                HttpRequest.ParseViewInto(framer.HeadView(headerEnd), request);
+                if (trace != null) { trace.End(parseStage); }
+
+                if (stream != null && request.method == "PRI" && request.path == "*"
+                    && request.version == "HTTP/2.0") {
+                    if (resources) { trace.EndResources(); resources = false; }
+                    framer.Consume(headerEnd);
+                    await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request,
+                        framer, 65000, this.maxBodyBytes, this.requestTimeoutMs, measure);
+                    return;
+                }
+
+                if (request.parseStatus != 0) {
+                    if (trace != null) { trace.Fail(parseStage, "invalid_framing"); }
+                    int earlyStatus = request.parseStatus;
+                    string earlyOutcome = "rejected";
+                    try {
+                        earlyOutcome = await this.SendSimpleProfiled(writer, trace, earlyStatus,
+                            earlyStatus == 501 ? "Not Implemented" : "Bad Request",
+                            "malformed request framing");
+                    } finally {
+                        this.FinishAbortedHead(trace, resources, earlyStatus, earlyOutcome);
+                    }
+                    break;
+                }
+
+                if (ctx == null) {
+                    ctx = new HttpContext(request, remoteIp);
+                    ctx.SetApp(this);
+                    if (stream != null) { ctx.AttachTls(stream); }
+                    else { ctx.Attach(client); }
+                    ctx.SetFramer(framer);
+                    ctx.SetDeadlineSlot(watch, this.requestTimeoutMs);
+                } else {
+                    ctx.ResetForRequest(request, remoteIp);
+                }
+                ctx.Trace = trace;
+                if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+                    ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
+                }
+
+                try {
+                    keepAlive = await this.ServeHttp1Request(framer, writer, request, ctx, trace);
+                } finally {
+                    if (trace != null) {
+                        if (resources) { trace.EndResources(); }
+                        trace.FinishPending();
+                    }
+                }
+            }
+        } finally {
+            if (ctx != null) { ctx.Dispose(); }
+        }
+    }
+
+    private void RecordHeadFailure(RequestTrace trace, RequestProfiler profiler, HttpFramer framer,
+                                   int headStage, bool resources, Exception failure) {
+        if (trace != null) {
+            trace.End(headStage);
+            if (resources) { trace.EndResources(); }
+            if (framer.HeadStartUs != 0) {
+                trace.Fail(headStage, WebApp.RequestFailureCode(failure));
+                trace.Finish(0, "receive_failed");
+            }
+        } else if (profiler != null && framer.HeadStartUs != 0) {
+            long startUs = framer.HeadStartUs;
+            RequestTrace failed = profiler.Start("HTTP/1", startUs);
+            int stage = failed.BeginAt("receive_head", startUs);
+            failed.Fail(stage, WebApp.RequestFailureCode(failure));
+            failed.End(stage);
+            failed.Finish(0, "receive_failed");
+        }
+    }
+
+    private RequestTrace FinalizeHeadTrace(RequestTrace trace, bool measure, int headStage,
+                                         int headerEnd, HttpFramer framer) {
+        if (trace != null) {
+            trace.End(headStage);
+            if (headerEnd <= 0) { trace.Fail(headStage, headerEnd == -431 ? "header_limit" : "incomplete_head"); }
+            return trace;
+        }
+        if (!measure) { return null; }
+        long headersUs = Stopwatch.GetMicroseconds();
+        long startUs = framer.HeadStartUs != 0 ? framer.HeadStartUs : headersUs;
+        RequestTrace t = this.StartRequestTrace("HTTP/1", startUs);
+        if (t != null) {
+            int stage = t.BeginAt("receive_head", startUs);
+            t.EndAt(stage, headersUs);
+            if (headerEnd <= 0) { t.Fail(stage, headerEnd == -431 ? "header_limit" : "incomplete_head"); }
+        }
+        return t;
+    }
+
+    private void FinishAbortedHead(RequestTrace trace, bool resources, int status, string outcome) {
+        if (trace != null) {
+            if (resources) { trace.EndResources(); }
+            trace.Finish(status, outcome);
+        }
+    }
+
+    private async bool ServeHttp1Request(HttpFramer framer, Http1Writer writer, HttpRequest request,
+                                         HttpContext ctx, RequestTrace trace) {
+        bool keepAlive = request.keepAlive;
+        string outcome = "aborted";
+        try {
+            Route route = this.MatchRequest(ctx);
+            bool admitted;
+            if (!this.TryPrepareRequestSync(ctx, route, out admitted)) {
+                admitted = await this.PrepareRequest(ctx, route);
+            }
+            if (!admitted) {
+                Worker.BumpStat();
+                ctx.BuildResponseDirect(false);
+                bool _gateIgn;
+                if (!this.TryDispatchSync(ctx, route, false, false, true, out _gateIgn)) {
+                    await this.Dispatch(ctx, route, false, false, true);
+                }
+                outcome = "rejected";
+                StringView rejWire = ctx.ResponseWireView();
+                if (rejWire.length > 0) {
+                    int sent = await this.SendWireProfiled(writer, ctx, rejWire, 0, -1);
+                    if (sent == rejWire.length) { Worker.BumpSent(); }
+                    else { outcome = "send_failed"; }
+                }
+                return false;
+            }
+
+            bool gatePassed = false;
+            bool okBody;
+            if (route != null && route.StreamUpload() && request.contentLength > 0) {
+                bool gateOk = this.CanGateSync(ctx, route)
+                    ? this.DispatchGateSync(ctx, route, false)
+                    : await this.DispatchGate(ctx, route, false);
+                if (!gateOk) {
+                    await this.Dispatch(ctx, route, false, true, true);
+                    outcome = "rejected";
+                    if (!ctx.MetricsExcluded()) {
+                        StringView deniedWire = ctx.ResponseWireView();
+                        if (deniedWire.length > 0) {
+                            int denied = await this.SendWireProfiled(writer, ctx, deniedWire, 0, -1);
+                            if (denied != deniedWire.length) { outcome = "send_failed"; }
+                        }
+                    }
+                    return false;
+                }
+                gatePassed = true;
+                okBody = await this.ReceiveStreamUpload(framer, writer, request, ctx, trace);
+                if (!okBody) { outcome = "rejected"; return false; }
+            } else {
+                int bodyErrStatus;
+                okBody = await this.ReceiveBufferedBody(framer, writer, request, ctx, trace, out bodyErrStatus);
+                if (!okBody) {
+                    outcome = bodyErrStatus > 0 ? "rejected" : "send_failed";
+                    return false;
+                }
+            }
+
+            Worker.BumpStat();
+            bool gateAlreadyPassed;
+            if (!this.TryDispatchSync(ctx, route, keepAlive, gatePassed, false, out gateAlreadyPassed)) {
+                await this.Dispatch(ctx, route, keepAlive, gateAlreadyPassed, false);
+            }
+            if (ctx.MetricsExcluded()) { outcome = "stream_handled"; return false; }
+
+            StringView wire = ctx.ResponseWireView();
+            if (wire.length > 0) {
+                int sent;
+                if (trace == null) {
+                    if (!writer.TrySendViewSync(wire, out sent)) {
+                        int rem = await writer.SendViewAsync(wire.Slice(sent, wire.length - sent));
+                        sent = sent + rem;
+                    }
+                } else {
+                    int sendStage = trace.Begin("send");
+                    if (writer.TrySendViewSync(wire, out sent)) {
+                        if (sent != wire.length) { trace.Fail(sendStage, "short_send"); }
+                        trace.End(sendStage);
+                    } else {
+                        sent = await this.SendWireProfiled(writer, ctx, wire, sent, sendStage);
+                    }
+                }
+                if (sent != wire.length) { outcome = "send_failed"; return false; }
+            }
+            outcome = "sent";
+            Worker.BumpSent();
+            return keepAlive;
+        } catch (Exception failure) {
+            outcome = "pipeline_exception";
+            if (trace != null) { trace.FailOpen(WebApp.RequestFailureCode(failure)); }
+            throw;
+        } finally {
+            int cleanupStage = trace != null ? trace.Begin("cleanup") : -1;
+            try {
+                ctx.CleanupUpload();
+                ctx.ReleaseResponseBuf();
+            } catch (Exception failure) {
+                outcome = "cleanup_exception";
+                if (trace != null) { trace.Fail(cleanupStage, WebApp.RequestFailureCode(failure)); }
+                throw;
+            } finally {
+                if (trace != null) {
+                    trace.End(cleanupStage);
+                    int status = (outcome != "pipeline_exception" || ctx.Ended()) ? ctx.GetStatus() : 0;
+                    trace.SetOutcome(status, outcome);
+                }
+            }
+        }
+    }
+
+    private async bool ReceiveStreamUpload(HttpFramer framer, Http1Writer writer,
+                                           HttpRequest request, HttpContext ctx, RequestTrace trace) {
+        if (request.contentLength > this.maxUploadBytes) {
+            ctx.Status(413, "Payload Too Large");
+            string _r = await this.SendSimpleProfiled(writer, trace, 413, "Payload Too Large", "upload exceeds limit");
+            return false;
+        }
+        int uploadStage = trace != null ? trace.Begin("spool_upload") : -1;
+        string tmp = await HttpUploadStreamer.StreamToFile(framer, request, this.uploadDir, this.uploadSeq);
+        if (trace != null) { trace.End(uploadStage); }
+        if (tmp.Length == 0) {
+            if (trace != null) { trace.Fail(uploadStage, "upload_failed"); }
+            ctx.Status(400, "Bad Request");
+            string _r = await this.SendSimpleProfiled(writer, trace, 400, "Bad Request", "upload failed");
+            return false;
+        }
+        ctx.SetUpload(tmp, request.contentLength);
+        request.body = "";
+        return true;
+    }
+
+    private async bool ReceiveBufferedBody(HttpFramer framer, Http1Writer writer, HttpRequest request,
+                                           HttpContext ctx, RequestTrace trace, out int errStatus) {
+        errStatus = 0;
+        int bodyStage = trace != null ? trace.Begin("receive_body") : -1;
+        int bodyStatus = 0;
+        if (!framer.TryReadBodySync(request, this.maxBodyBytes, out bodyStatus)) {
+            bodyStatus = await framer.ReadBody(request, this.maxBodyBytes);
+        }
+        if (trace != null) { trace.End(bodyStage); }
+        if (bodyStatus != 0) {
+            string reason = bodyStatus == 413 ? "body_limit" : (bodyStatus < 0 ? "incomplete_body" : "invalid_body");
+            if (trace != null) { trace.Fail(bodyStage, reason); }
+            int status = bodyStatus < 0 ? 400 : bodyStatus;
+            string statusText = status == 413 ? "Payload Too Large" : "Bad Request";
+            string message = status == 413 ? "body exceeds limit"
+                : (bodyStatus < 0 ? "incomplete body" : "malformed request body");
+            ctx.Status(status, statusText);
+            string _res = await this.SendSimpleProfiled(writer, trace, status, statusText, message);
+            errStatus = status;
+            return false;
+        }
+        framer.Consume(framer.RequestBytes());
+        if (request.bodyLength > 0) {
+            int formStage = trace != null ? trace.Begin("parse_form") : -1;
+            if (HttpContext.StartsWith(request.contentType, "multipart/form-data")) {
+                HttpContext.ParseMultipartFields(request, ctx);
+            } else {
+                HttpContext.ParseFormBody(request, ctx);
+            }
+            if (trace != null) { trace.End(formStage); }
+        }
+        return true;
+    }
+
+    private async string SendSimpleProfiled(Http1Writer writer, RequestTrace trace, int status, string reason, string message) {
+        string response = WebApp.SimpleResponse(status, reason, message);
+        int stage = trace != null ? trace.Begin("send") : -1;
+        try {
+            int sent = await writer.SendTextAsync(response);
+            if (sent != response.Length) {
+                if (trace != null) { trace.Fail(stage, "short_send"); }
+                return "send_failed";
+            }
+            return "rejected";
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "send_exception"); }
+            throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+        }
+    }
+
+    private async int SendWireProfiled(Http1Writer writer, HttpContext ctx,
+                                       StringView wire, int alreadySent, int stage) {
+        RequestTrace trace = ctx.Trace;
+        if (stage < 0 && trace != null) { stage = trace.Begin("send"); }
+        try {
+            int rem = await writer.SendViewAsync(
+                alreadySent > 0 ? wire.Slice(alreadySent, wire.length - alreadySent) : wire);
+            int sent = alreadySent + rem;
+            if (trace != null && sent != wire.length) { trace.Fail(stage, "short_send"); }
+            return sent;
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "send_exception"); }
+            throw;
+        } finally {
+            if (trace != null && stage >= 0) { trace.End(stage); }
+        }
+    }
+
+    internal static string RequestFailureCode(Exception failure) {
+        if (failure is ApiError) { return "ApiError"; }
+        if (failure is TimeoutException) { return "TimeoutException"; }
+        if (failure is IOException) { return "IOException"; }
+        if (failure is ArgumentException) { return "ArgumentException"; }
+        return "Exception";
+    }
+
+    private static string SimpleResponse(int code, string text, string msg) {
+        StringBuilder sb = HttpBufferPool.Rent();
+        sb.Append("{\"code\":\"");
+        sb.Append(Convert.ToString(code));
+        sb.Append("\",\"msg\":\"");
+        sb.Append(msg);
+        sb.Append("\"}");
+        string body = sb.ToString();
+        sb.Clear();
+        sb.Append("HTTP/1.1 ");
+        sb.Append(Convert.ToString(code));
+        sb.Append(" ");
+        sb.Append(text);
+        sb.Append("\r\nContent-Type: application/json\r\nContent-Length: ");
+        sb.Append(Convert.ToString(body.Length));
+        sb.Append("\r\nConnection: close\r\n\r\n");
+        sb.Append(body);
+        string res = sb.ToString();
+        HttpBufferPool.Return(sb);
+        return res;
+    }
+
+    private static int FindHeaderEnd(string raw) {
+        int n = raw.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((raw[i] & 255) == 10) {
+                if (i + 1 < n && (raw[i + 1] & 255) == 10) { return i + 2; }
+                if (i + 2 < n && (raw[i + 1] & 255) == 13 && (raw[i + 2] & 255) == 10) { return i + 3; }
+            }
+        }
+        return -1;
+    }
+}

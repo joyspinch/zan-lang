@@ -4,16 +4,7 @@ using System.Threading;
 
 namespace System.Data.Firebird;
 
-// 面向协程的 <see cref="FirebirdConnection"/> 连接池。
-// 与 <see cref="DbPool"/> 契约一致——惰性增长至 <c>maxSize</c>，
-// 由 <see cref="Gate"/> 驱动等待而非轮询，淘汰失效
-// 连接——但类型化，因此协程查询 API（<c>QueryAsync</c>、
-// <c>ExecuteAsync</c>）仍可访问。一次 attach 需要一次 SRP 握手和
-// 多轮往返，这就是要复用会话而非
-// 每条语句开一个新会话的原因。
-// 用法：
-// pool.Release(db);
-// pool.Close();
+// 面向协程的 FirebirdConnection 连接池：惰性增长至 maxSize，由 Gate 驱动等待并复用 SRP 会话。
 public class FirebirdPool : IDisposable {
     private string host;
     private int port;
@@ -49,10 +40,7 @@ public class FirebirdPool : IDisposable {
                                                   this.wireCrypt);
     }
 
-    // 借出一个连接：复用空闲的，未达上限则新建，
-    // 否则挂起协程，直到有连接被释放。饱和等待有硬上限
-    // （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
-    // 连接池关闭后返回 null。
+    // 借出连接（复用空闲或新建，饱和时协程挂起等待，超时或关闭返回 null）。
     public async FirebirdConnection AcquireAsync() {
         PoolOpenAsync<FirebirdConnection> open = this.OpenOne;
         Predicate<FirebirdConnection> connected = FirebirdPool.IsUsable;
@@ -70,11 +58,7 @@ public class FirebirdPool : IDisposable {
             + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
-    // 将连接归还连接池。已损坏或 Close() 之后
-    // 的连接会直接关闭丢弃，而非放回池中。归还时事务未收尾的连接
-    // 不直接入池：挂清理协程把残留事务 ROLLBACK 掉后再回池
-    // （A535，P2-29 的异步驱动半边；协程由调度器泵动——异步
-    // 驱动的使用方必然运行在协程环境里）。
+    // 归还连接；已损坏或池已关闭时直接关闭丢弃，残留未收尾事务则由清理协程回滚后再回池。
     public void Release(FirebirdConnection c) {
         if (c == null) {
             return;
@@ -139,12 +123,12 @@ public class FirebirdPool : IDisposable {
         return this.core.MaxSize();
     }
 
-    // <see cref="Close"/> 调用过后为 true。
+    // Close 调用过后为 true。
     public bool IsClosed() {
         return this.core.IsClosed();
     }
 
-    // 池的 provider id（恒为 <see cref="DbProvider.Firebird"/>）。
+    // 池的 provider id（恒为 DbProvider.Firebird）。
     public int GetProvider() {
         return DbProvider.Firebird;
     }

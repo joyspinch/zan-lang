@@ -75,8 +75,8 @@ public class UsersController : AdminController {
         List<SysUser> rows = await this.SysUser.PagedListBy(
             conds, sc.ByDept(), scoped, sc.Mine(), mine, q.Skip(), q.Limit());
 
-        List<SysDepartment> depts = await this.SysDepartment.ToListAsync();
-        List<SysRole> roles = await this.SysRole.ToListAsync();
+        List<SysDepartment> depts = await this.SysDepartment.All();
+        List<SysRole> roles = await this.SysRole.All();
         List<SysUserRole> links = await this.SysUserRole.ToListAsync();
 
         /* 实体行一行投影；部门名/角色名是跨表组合，留控制器补键。 */
@@ -144,9 +144,10 @@ public class UsersController : AdminController {
         }
         /* 仅该账号可写部门入选，使对话框无法提议 Save 随后拒绝的迁移；仅本人 scope 一处都不可写。 */
         DataScope sc = await this.Scope();
-        List<SysDepartment> depts = await this.SysDepartment.ToListAsync();
+        List<SysDepartment> depts = await this.SysDepartment.All();
         List<StrMap> deptRows = new List<StrMap>();
         for (int i = 0; i < depts.Count; i = i + 1) {
+            if (!sc.Any() && !sc.Covers(0, depts[i].id)) { continue; }
             StrMap o = new StrMap();
             o.Set("id", Convert.ToString(depts[i].id));
             o.Set("name", depts[i].name);
@@ -196,7 +197,7 @@ public class UsersController : AdminController {
         if (clash != null && clash.id != id) {
             this.Fail(400, "0004", "账号 " + username + " 已存在");
         }
-        /* 两端皆校验：被编账号在 scope 内、归档到的部门也在——否则仅看一部门的操作员可将账号移出自己范围。 */
+        /* 两端皆校验：被编账号在 scope 内、归档到的部门也在——否则操作员可将账号移出自己范围。 */
         if (id > 0) { SysUser _t = await this.Reach(id); }
         await this.Reachable(departmentId);
 
@@ -217,7 +218,6 @@ public class UsersController : AdminController {
         u.email = email;
         u.mobile = mobile;
         u.departmentId = departmentId;
-        u.passwordSalt = "";
         u.passwordHash = AuthUser.NewHash(password);
         u.status = status;
         u.isSuper = 0;
@@ -290,7 +290,14 @@ public class UsersController : AdminController {
         int status = value == "1" ? 1 : 0;
         List<SysUser> rows = await this.SysUser.ByIds(ids);
         if (rows.Count == 0) { this.Fail(400, "0004", "所选账号不存在"); return; }
+        DataScope sc = await this.Scope();
         SysUser me = await this.Admin();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (!sc.Covers(rows[i].id, rows[i].departmentId)) {
+                this.Fail(404, "0404", "所选账号包含无权操作的记录");
+                return;
+            }
+        }
         if (value.Length == 0) {
             if (!await this.Can(PermBit.Delete)) { this.Fail(403, "0403", "无删除权限"); return; }
             for (int i = 0; i < rows.Count; i = i + 1) {
@@ -351,7 +358,7 @@ public class UsersController : AdminController {
     [Description("重置密码表单")]
     public async void PasswordForm() {
         int id = this.InInt("id", 0);
-        SysUser u = await this.Reach(id);
+        SysUser u = await this.PasswordTarget(id);
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
@@ -367,10 +374,12 @@ public class UsersController : AdminController {
         if (password.Length < 8) {
             this.Fail(400, "0004", "密码至少 8 位");
         }
-        SysUser u = await this.Reach(id);
-        int n = await this.SysUser.ResetPassword(id, "", AuthUser.NewHash(password),
-            WebApp.NowSeconds());
-        if (n > 0) { AuthUser.Forget(Convert.ToString(id)); }
+        SysUser u = await this.PasswordTarget(id);
+        SysUser me = await this.Admin();
+        int n = await this.SysUser.ResetPassword(id, AuthUser.NewHash(password),
+            WebApp.NowSeconds(), me.id);
+        if (n != 1) { this.Fail(409, Codes.Conflict, "账号状态已变化，请刷新后重试"); return; }
+        AuthUser.Forget(Convert.ToString(id));
         await this.Note("重置密码",
             "#" + Convert.ToString(id) + " " + u.username, n > 0, "");
         this.Saved("密码已重置，该账号需要重新登录");
@@ -386,7 +395,7 @@ public class UsersController : AdminController {
         ViewData d = new ViewData();
         d.Set("id", Convert.ToString(id));
         d.Set("username", u.username);
-        List<SysRole> roles = await this.SysRole.ToListAsync();
+        List<SysRole> roles = await this.SysRole.All();
         List<SysUserRole> mine = await this.SysUserRole.Where(a => a.userId == id).ToListAsync();
         List<StrMap> rows = d.AddList("roles");
         Rows.Project(roles, rows);
@@ -407,17 +416,20 @@ public class UsersController : AdminController {
         int id = this.InInt("id", 0);
         SysUser u = await this.Reach(id);
         string picked = this.In("roleIds");
+        if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
         int _cleared = await this.SysUserRole.Delete().Where(a => a.userId == id).ExecuteAffrowsAsync();
-        List<SysRole> roles = await this.SysRole.ToListAsync();
+        List<SysRole> roles = await this.SysRole.All();
         int granted = 0;
         for (int i = 0; i < roles.Count; i = i + 1) {
             if (!AuthUser.Holds(picked, Convert.ToString(roles[i].id))) { continue; }
             SysUserRole link = new SysUserRole();
             link.userId = id;
             link.roleId = roles[i].id;
-            int _n = await this.SysUserRole.Insert(link).ExecuteIdentityAsync();
+            int inserted = await this.SysUserRole.Insert(link).ExecuteAffrowsAsync();
+            if (inserted != 1) { throw new Exception("user role was not saved"); }
             granted = granted + 1;
         }
+        await this.Commit();
         AuthUser.Forget(Convert.ToString(id));
         await this.Note("分配角色",
             "#" + Convert.ToString(id) + " " + u.username, true,
@@ -438,12 +450,13 @@ public class UsersController : AdminController {
         d.Set("username", u.username);
         List<SysUserScope> mine = await DataGrant.OfUser(this.Held(), id);
         List<GrantDomain> domains = DataGrant.All();
+        DataScope callerScope = await this.Scope();
+        int callerId = Filter.ToInt(this.uid, 0);
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < domains.Count; i = i + 1) {
             GrantDomain g = domains[i];
-            RowScope all = new RowScope();
-            all.all = true;
-            string opts = await DataGrant.Options(this.Held(), g.key, all, 300);
+            RowScope allowedScope = await DataGrant.Of(this.Held(), callerId, g.key, callerScope);
+            string opts = await DataGrant.Options(this.Held(), g.key, allowedScope, 300);
             sb.Append("<div class=\"scope-group\">\n");
             sb.Append("  <div class=\"scope-title\">" + Esc(g.label)
                 + " <span class=\"hint\">可多选；一项都不选 = 该域内看不到任何数据</span></div>\n");
@@ -485,10 +498,22 @@ public class UsersController : AdminController {
         int id = this.InInt("id", 0);
         SysUser u = await this.Reach(id);
         List<GrantDomain> domains = DataGrant.All();
+        DataScope callerScope = await this.Scope();
+        int callerId = Filter.ToInt(this.uid, 0);
         StringBuilder detail = new StringBuilder();
         for (int i = 0; i < domains.Count; i = i + 1) {
             GrantDomain g = domains[i];
+            RowScope allowedScope = await DataGrant.Of(this.Held(), callerId, g.key, callerScope);
+            if (allowedScope.Empty()) { continue; }
             List<int> ids = this.IdList("scope_" + g.key);
+            if (!allowedScope.all) {
+                for (int j = 0; j < ids.Count; j = j + 1) {
+                    if (!allowedScope.Allows(ids[j])) {
+                        this.Fail(403, "0403", "数据权限不允许授予该" + DataGrant.Label(g.key));
+                        return;
+                    }
+                }
+            }
             int n = await DataGrant.Replace(this.Held(), id, g.key, ids);
             if (detail.Length > 0) { detail.Append("；"); }
             detail.Append(Lang.T(g.label) + " " + Convert.ToString(n) + " 项");
@@ -525,20 +550,33 @@ public class UsersController : AdminController {
         return r;
     }
 
-    /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404——无法列表的账号不得在对话框或 POST 中确认其存在。 */
+    /* 请求有权操作的账号；超调用方数据 scope 的答与不存在的行同 404。 */
     private async SysUser Reach(int id) {
         SysUser u = await this.SysUser.ById(id);
         if (u == null) { this.Fail(404, "0404", "账号不存在"); }
         DataScope sc = await this.Scope();
-        if (!sc.Covers(u.id, u.departmentId)) {
-            this.Fail(404, "0404", "账号不存在");
-        }
+        if (!sc.Covers(u.id, u.departmentId)) { this.Fail(404, "0404", "账号不存在"); }
         return u;
+    }
+
+    private async SysUser PasswordTarget(int id) {
+        SysUser target = await this.Reach(id);
+        if (target.isSuper == 1) {
+            SysUser me = await this.Admin();
+            if (me.isSuper != 1 || me.id != target.id) {
+                this.Fail(403, "0403", "超级管理员只能重置本人的密码");
+            }
+        }
+        return target;
     }
 
     /* 拒绝不可写入的部门，使账号无法被建入或移至操作员不可见的部门。 */
     private async void Reachable(int departmentId) {
         DataScope sc = await this.Scope();
+        if (departmentId <= 0) {
+            if (sc.Any()) { return; }
+            this.Fail(403, "0403", "数据权限不允许选择未分配部门");
+        }
         if (sc.Covers(0, departmentId)) { return; }
         this.Fail(403, "0403", "数据权限不允许操作该部门的账号");
     }

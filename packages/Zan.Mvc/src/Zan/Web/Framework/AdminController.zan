@@ -29,30 +29,33 @@ public abstract class AdminController : AppController {
     public SysWikiRevisionDao SysWikiRevision { get { return new SysWikiRevisionDao(this.Held()); } }
     public SysWikiSpaceDao SysWikiSpace { get { return new SysWikiSpaceDao(this.Held()); } }
 
-    /* 本次请求所属账号，由 Admin() 解析一次。 */
+    private AdminSession adminSession;
+
+    /* 本次请求所属账号，由 Admin() 解析一次（保留字段供现有子类直接读取）。 */
     protected SysUser who;
 
     /* 当前屏幕标题，用于告知标签条该给新载入的标签命名。 */
     protected string headingText;
 
-    /* 本次请求可见的数据范围，由 Scope() 解析一次。 */
+    /* 本次请求可见的数据范围，由 Scope() 解析一次（保留字段供现有子类直接读取）。 */
     protected DataScope scope;
+
+    protected AdminSession Session() {
+        if (this.adminSession == null) {
+            this.adminSession = new AdminSession(this);
+        }
+        return this.adminSession;
+    }
 
     /* 浏览器要面板而非整页时返回 true（标签加载或就地刷新）。 */
     protected bool IsFragment() {
         return this.Ctx().Header("X-Fragment").Length > 0;
     }
 
-    /* 已登录账号；调度器已确认为非空，若该行在令牌检查后被禁用则中止。 */
+    /* 已登录账号；调度器已确认为非空，若该行已被禁用则中止。 */
     protected async SysUser Admin() {
-        if (this.who != null) { return this.who; }
-        if (!this.DbReady()) { this.Fail(503, "2001", "数据库不可用"); }
-        SysUser me = await new SysUserDao().ById(Filter.ToInt(this.uid, 0));
-        if (me == null || me.status != AuthUser.Active) {
-            this.Fail(403, "0403", "该账号无法登录管理后台");
-        }
-        this.who = me;
-        return me;
+        this.who = await this.Session().Admin();
+        return this.who;
     }
 
     /* 进入任何管理屏之前先把该账号的角色解析进共享权限表：此刻请求
@@ -60,6 +63,14 @@ public abstract class AdminController : AppController {
        全部是共享内存读，绝不在持有租约时再向池借第二条连接——
        并发数达到上限后，那种嵌套租借会变成「人人持一条、人人等
        第二条」的循环等待（实测过的全站假死形态）。 */
+    override public bool TryBeforeSync(out bool proceed) {
+        if (this.uid.Length > 0) {
+            proceed = false;
+            return false;
+        }
+        return base.TryBeforeSync(out proceed);
+    }
+
     override public async bool OnBeforeAsync() {
         if (this.uid.Length > 0) {
             await AuthUser.RolesOf(this.uid);
@@ -67,12 +78,9 @@ public abstract class AdminController : AppController {
         return await base.OnBeforeAsync();
     }
 
-    /* 本次请求可见的数据行（见 DataScope）。列表屏幕取之传给 WhereIf；账号在屏幕运行前已加载，范围来自共享内存，无额外开销。 */
+    /* 数据范围优先从共享内存读取，只有未缓存的部门树范围需要查询组织结构。 */
     protected async DataScope Scope() {
-        if (this.scope != null) { return this.scope; }
-        SysUser me = await this.Admin();
-        List<SysDepartment> departments = await new SysDepartmentDao().All();
-        this.scope = await DataScope.Of(me, departments);
+        this.scope = await this.Session().Scope();
         return this.scope;
     }
 
@@ -80,10 +88,12 @@ public abstract class AdminController : AppController {
     protected async ViewData Layout(string heading) {
         SysUser me = await this.Admin();
 
-        await Lang.Load();
+        StrMap settings = await Settings.All(this.Held());
+        Lang.LoadLanguage(settings.Get(SettingKeys.SiteLanguage));
         string hshown = Lang.T(heading);
         ViewData d = new ViewData();
-        string site = await Settings.Get(SettingKeys.SiteTitle, Cfg.Server.name);
+        string site = settings.Get(SettingKeys.SiteTitle);
+        if (site.Length == 0) { site = Cfg.Server.name; }
         d.Set("title", hshown + " · " + site + " " + Lang.T("管理后台"));
         d.Set("brand", site);
         d.Set("heading", hshown);
@@ -97,23 +107,20 @@ public abstract class AdminController : AppController {
         d.Set("tabTitle", hshown);
         if (me.isSuper == 1) { d.Set("isSuper", "1"); }
 
-        /* 顶栏告警铃铛只给能看运行监控的账号渲染：/admin/monitor/alerts
-           的权限属于运行监控屏，无权者不渲染也不轮询（省一个 403）。 */
+        /* 兼容自定义外壳模板的布尔标记；默认外壳由 AdminShell 顶栏部件权限裁减接管。 */
         if (await AuthUser.Allow(this.Held(), this.uid, "Monitor.Index")) {
             d.Set("canMonitor", "1");
         }
 
         await this.Buttons(d);
 
-        /* 侧边栏即路由表，按调度器所用同一解析器裁减到该账号可打开的项。 */
-        List<MenuNode> nodes = await MenuBuilder.ForUser(
-            WebHost.Current(), this.uid, this.Ctx().Path());
-        await this.AddDesigned(nodes);
-        /* 个人资料由顶栏账号菜单进入，不占用业务导航的首级位置。 */
-        for (int i = nodes.Count - 1; i >= 0; i = i - 1) {
-            if (nodes[i].path == "/admin/profile") { nodes.RemoveAt(i); }
-        }
-        /* 菜单标题与分组名都过翻译层；设计表标题是用户数据，不翻。 */
+        /* 侧边栏即路由表，按调度器所用同一解析器裁减到该账号可打开的项；
+           业务/模块动态菜单（如 Crud 设计表）经 MvcHooks.OnMenu 注入，外壳不直接耦合具体模块。 */
+        string activeMenuPath = this.Ctx().Path();
+        string tableQuery = this.In("t");
+        if (tableQuery.Length > 0) { activeMenuPath = activeMenuPath + "?t=" + tableQuery; }
+        List<MenuNode> nodes = await MenuService.ForUser(
+            WebHost.Current(), this.uid, activeMenuPath, this.Held());
         for (int i = 0; i < nodes.Count; i = i + 1) {
             nodes[i].title = Lang.T(nodes[i].title);
             nodes[i].group = Lang.T(nodes[i].group);
@@ -121,34 +128,43 @@ public abstract class AdminController : AppController {
         MenuBuilder.Sort(nodes);
         MenuBuilder.Fill(d.AddList("menu"), nodes);
         this.I18n(d);
+
+        /* 外壳插槽：允许模块与扩展应用按需注入样式、脚本、懒加载模块与挂件，
+           无需分叉 views/Admin/layout.html 或重写 AdminController。 */
+        d.Set("shellStyles", AdminShell.RenderStyles());
+        d.Set("shellScripts", AdminShell.RenderScripts());
+        d.Set("shellModules", AdminShell.RenderModules());
+        d.Set("topWidgets", await AdminShell.RenderTopWidgets(this.Held(), this.uid, d));
+        d.Set("fabWidgets", await AdminShell.RenderFabWidgets(this.Held(), this.uid, d));
         return d;
+    }
+
+    private static string[] i18nKeys() {
+        return new string[] {
+            "iEdit", "iDelete", "iRead", "iHistory", "iLogs", "iView", "iRunOnce",
+            "iBackList", "iBackHistory", "iSave", "iCancel", "iOps", "iStatus",
+            "iFront", "iMenuT", "iAlarm", "iRefresh", "iProfile", "iPassword",
+            "iLogout", "iFind", "iUpload"
+        };
+    }
+
+    private static string[] i18nTexts() {
+        return new string[] {
+            "编辑", "删除", "阅读", "历史", "日志", "查看", "执行一次",
+            "返回列表", "返回历史", "保存", "取消", "操作", "状态",
+            "查看前台", "菜单", "运行告警", "刷新", "个人资料", "修改密码",
+            "退出登录", "筛选菜单（支持首拼）", "上传文件"
+        };
     }
 
     /* 公共词条注入：布局与对话框都从这里拿 {{iXxx}} 行内按钮文案，
        语言包切换后无需改视图。 */
     protected void I18n(ViewData d) {
-        d.Set("iEdit", Lang.T("编辑"));
-        d.Set("iDelete", Lang.T("删除"));
-        d.Set("iRead", Lang.T("阅读"));
-        d.Set("iHistory", Lang.T("历史"));
-        d.Set("iLogs", Lang.T("日志"));
-        d.Set("iView", Lang.T("查看"));
-        d.Set("iRunOnce", Lang.T("执行一次"));
-        d.Set("iBackList", Lang.T("返回列表"));
-        d.Set("iBackHistory", Lang.T("返回历史"));
-        d.Set("iSave", Lang.T("保存"));
-        d.Set("iCancel", Lang.T("取消"));
-        d.Set("iOps", Lang.T("操作"));
-        d.Set("iStatus", Lang.T("状态"));
-        d.Set("iFront", Lang.T("查看前台"));
-        d.Set("iMenuT", Lang.T("菜单"));
-        d.Set("iAlarm", Lang.T("运行告警"));
-        d.Set("iRefresh", Lang.T("刷新"));
-        d.Set("iProfile", Lang.T("个人资料"));
-        d.Set("iPassword", Lang.T("修改密码"));
-        d.Set("iLogout", Lang.T("退出登录"));
-        d.Set("iFind", Lang.T("筛选菜单（支持首拼）"));
-        d.Set("iUpload", Lang.T("上传文件"));
+        string[] keys = i18nKeys();
+        string[] texts = i18nTexts();
+        for (int i = 0; i < keys.Length; i = i + 1) {
+            d.Set(keys[i], Lang.T(texts[i]));
+        }
     }
 
     /* 当前屏幕可显示的按钮：canView/可增/可改/可删/可导出，取自与调度器相同的授权掩码。 */
@@ -166,35 +182,12 @@ public abstract class AdminController : AppController {
     /* 当前屏幕对该登录账号的授权掩码。传请求租约：掩码回填即使需要
        查库也跑在这条连接上，不二次借用（见 AuthUser.RolesOf）。 */
     protected async int Mask() {
-        return await AuthUser.MaskOf(this.Held(), this.uid,
-            Perm.ScreenOf(this.Ctx().RouteAction()));
+        return await this.Session().Mask();
     }
 
     /* 当前屏幕是否允许某按钮——与模板 {{#if canUpdate}} 取同一数字。 */
     protected async bool Can(int bit) {
-        return (await this.Mask() & bit) != 0;
-    }
-
-    /* 为每张设计表追加一条侧边栏项；这是行而非路由，唯一一张通用数据屏 /admin/monitor/data 承载它们，故路由表无法供给。 */
-    protected async void AddDesigned(List<MenuNode> nodes) {
-        if (!await AuthUser.Allow(this.Held(), this.uid, Routes.DataIndex)) { return; }
-        if (!this.DbReady()) { return; }
-        List<SysGenTable> tables = await new SysGenTableDao().AllMigrated();
-        for (int i = 0; i < tables.Count; i = i + 1) {
-            SysGenTable t = tables[i];
-            /* 表已生成自己的模块后，菜单归该模块，通用数据屏不再列出。 */
-            if (t.generatedAt > 0) { continue; }
-            MenuNode n = new MenuNode();
-            n.SetTitle(t.title);
-            n.SetPath(Routes.Data + "?t=" + t.tableName);
-            n.SetGroup(MenuBuilder.GroupOf(Routes.Data));
-            n.SetGroupOrder(MenuBuilder.OrderOf(Routes.Data));
-            n.SetIcon("mdi:table");
-            /* 排在该分区块的路由页面之后，按设计顺序。 */
-            n.SetOrder(Routes.Data + "~" + Convert.ToString(i));
-            n.SetActive(this.Ctx().Path() == Routes.Data && this.In("t") == t.tableName);
-            nodes.Add(n);
-        }
+        return await this.Session().Can(bit);
     }
 
     /* 渲染屏幕：直接打开 URL 时输出整页，标签加载时只输出面板。 */
@@ -240,43 +233,8 @@ public abstract class AdminController : AppController {
     /* 将写操作记入 sys_operation_log；读不记（流量主体，无审计意义）。记录动作即路由自身动作名，与授权行和文档同名。包内公开：通用写动作（CrudOps）在控制器之外落审计。 */
     public async void Note(string title, string target,
                               bool ok, string message) {
-        if (!this.DbReady()) { return; }
-        /* 审计必须归因到人：CrudOps 与生成器的写动作不经 Admin()，
-           此处懒解析一次。解析失败（账号此刻被禁、库抖动）不阻断记账，
-           退回 cookie uid 兜底，至少追责到账号 id。 */
-        if (this.who == null) {
-            try {
-                /* 接住结果（协程裸 await 丢返回值的编译器坑，见 TASKS）。 */
-                SysUser me = await this.Admin();
-                this.who = me;
-            } catch (Exception ex) {
-                /* 兜底接住，继续落审计；留一条诊断，userId=0 的审计行
-                   不再无因。 */
-                Log.Warn("[audit] identity lookup failed, audit falls "
-                    + "back to uid: " + ex.Message);
-            }
-        }
-        SysOperationLog row = new SysOperationLog();
-        row.userId = 0;
-        row.username = "";
-        if (this.who != null) {
-            row.userId = this.who.id;
-            row.username = this.who.username;
-        } else if (this.uid.Length > 0) {
-            row.userId = Filter.ToInt(this.uid, 0);
-            row.username = "uid:" + this.uid;
-        }
-        row.action = this.Ctx().RouteAction();
-        row.title = title;
-        row.method = this.Ctx().Method();
-        row.path = this.Ctx().Path();
-        row.target = target;
-        row.ip = ClientIp.Of(this.Ctx());
-        row.ok = 0;
-        if (ok) { row.ok = 1; }
-        row.message = message;
-        row.createdAt = WebApp.NowSeconds();
-        int _id = await new SysOperationLogDao().Insert(row);
+        await this.Session().Note(title, target, ok, message);
+        this.who = this.Session().CachedUser();
     }
 
     /* 写出分页页脚：total/page/pages/limit 及上下页号（不存在则空，模板据此隐藏链接）。 */
@@ -296,17 +254,7 @@ public abstract class AdminController : AppController {
        非数字串回退 0，天然过滤脏词；只收正 id，上限 500，防止一次提交
        拖垮一条连接。空列表不是错误——调用方自行决定"未选择"的措辞与码。 */
     protected List<int> Ids(string name) {
-        List<int> out_ = new List<int>();
-        string csv = this.In(name).Trim();
-        if (csv.Length == 0) { return out_; }
-        List<string> parts = csv.Split(",");
-        for (int i = 0; i < parts.Count && out_.Count < 500; i = i + 1) {
-            string p = parts[i].Trim();
-            if (p.Length == 0 || p.Length > 9) { continue; }
-            int v = Filter.ToInt(p, 0);
-            if (v > 0) { out_.Add(v); }
-        }
-        return out_;
+        return AdminSession.ParseIds(this.In(name));
     }
 
     /* ---- 数据库降级的两个统一出口 ----

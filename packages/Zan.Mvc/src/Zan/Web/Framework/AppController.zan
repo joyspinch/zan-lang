@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Orm;
 using System.Web;
@@ -6,9 +7,20 @@ using System.Json;
 using Zan.Web.Core;
 using Zan.Web.Dao;
 using Zan.Web.Model;
+using Zan.Web.Security;
 using Zan.Web.Services;
 
 namespace Zan.Web;
+
+internal class RequestSqlObserver : IDbStatementObserver {
+    private RequestTrace trace;
+
+    public RequestSqlObserver(RequestTrace trace) { this.trace = trace; }
+    public int Begin(string operation, long startUs) { return this.trace.BeginSql(operation, startUs); }
+    public void Complete(int span, long startUs, long endUs, string failure) {
+        this.trace.CompleteSql(span, startUs, endUs, failure);
+    }
+}
 
 /* 注入数据库与缓存访问的控制器基类。依赖在 main.zan 装配并经 AppServices.Use(...) 安装，动作通过 this.Conn()/this.Cache() 访问。连接按请求作用域：Conn() 首次调用时从连接池借出，同请求后续调用复用同一连接，OnAfter() 在动作返回时归还——故业务代码与 DAO 不含 Acquire/Release；按请求(非按查询)持一连接也使事务成为可能，事务内每条语句须在同一连接上执行。BEGIN/COMMIT/ROLLBACK 同其他语句一样需 await。子类清理覆盖 OnDone() 而非 OnAfterAsync()，以确保连接总是被释放。 */
 public abstract class AppController : Controller {
@@ -18,6 +30,8 @@ public abstract class AppController : Controller {
     bool commitFailed;
     bool readOnlyIntent;
     bool leaseIsRead;
+    Dictionary<string, string> tokenClaims;
+    bool tokenClaimsLoaded;
 
     override public void UseReadOnly() { this.readOnlyIntent = true; }
 
@@ -47,18 +61,64 @@ public abstract class AppController : Controller {
         return s.Cache();
     }
 
+    private RequestTrace BoundTrace() {
+        HttpContext request = this.Ctx();
+        return request != null ? request.Trace : null;
+    }
+
+    /* 同步快路径借出请求连接：仅消费已空闲的池连接（零委托/零协程开销），池空返回 false 交由 Conn() 挂起或新建。 */
+    private bool TryConnSync(out IDbConnection result) {
+        if (this.lease != null) { result = this.lease; return true; }
+        DbContext ctx = this.Db();
+        if (ctx == null) { result = null; return true; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("db_borrow") : -1;
+        bool ended = false;
+        try {
+            IDbStatementObserver observer = trace != null ? new RequestSqlObserver(trace) : null;
+            IDbConnection db = this.readOnlyIntent
+                ? ctx.TryAcquireReadSync(observer)
+                : ctx.TryAcquireSync(observer);
+            if (db == null) {
+                if (trace != null) { trace.End(stage); ended = true; }
+                result = null;
+                return false;
+            }
+            this.lease = db;
+            this.leaseIsRead = this.readOnlyIntent;
+            result = this.lease;
+            return true;
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (trace != null && !ended) { trace.End(stage); }
+        }
+    }
+
     /* 本次请求的连接：首次调用借出、之后复用、动作返回自动释放。null 表示数据库不可用——处理器应答 503 而非假设结果集为空。 */
     protected async IDbConnection Conn() {
         if (this.lease != null) { return this.lease; }
         DbContext ctx = this.Db();
         if (ctx == null) { return null; }
-        if (this.readOnlyIntent) {
-            this.lease = await ctx.AcquireRead();
-            this.leaseIsRead = this.lease != null;
-        } else {
-            this.lease = await ctx.Acquire();
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("db_borrow") : -1;
+        try {
+            IDbStatementObserver observer = trace != null ? new RequestSqlObserver(trace) : null;
+            if (this.readOnlyIntent) {
+                this.lease = await ctx.AcquireRead(observer);
+                this.leaseIsRead = this.lease != null;
+            } else {
+                this.lease = await ctx.Acquire(observer);
+            }
+            if (this.lease == null && trace != null) { trace.Fail(stage, "unavailable"); }
+            return this.lease;
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
         }
-        return this.lease;
     }
 
     /* 本次请求已借出的连接，不 await；仅在 Conn() 或 Begin() 成功后有效。 */
@@ -75,8 +135,19 @@ public abstract class AppController : Controller {
         if (this.readLease != null) { return this.readLease; }
         DbContext ctx = this.Db();
         if (ctx == null) { return null; }
-        this.readLease = await ctx.AcquireRead();
-        return this.readLease;
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("db_borrow") : -1;
+        try {
+            IDbStatementObserver observer = trace != null ? new RequestSqlObserver(trace) : null;
+            this.readLease = await ctx.AcquireRead(observer);
+            if (this.readLease == null && trace != null) { trace.Fail(stage, "unavailable"); }
+            return this.readLease;
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+        }
     }
 
     /* 本次请求已借出的只读连接（未借出则回退到请求连接）。*/
@@ -90,8 +161,21 @@ public abstract class AppController : Controller {
        方法），不是覆盖——生成的路由蹦床经 Controller 静态类型的槽位派
        发，新槽位永远打不中，基类的空实现就会替它执行：请求租约借了
        不还，池被拖干后全站 503/无响应（实测过的全站假死形态）。 */
+    override public bool TryBeforeSync(out bool proceed) {
+        IDbConnection _db;
+        if (!this.TryConnSync(out _db)) {
+            proceed = false;
+            return false;
+        }
+        proceed = this.OnBefore();
+        return true;
+    }
+
     override public async bool OnBeforeAsync() {
-        IDbConnection _db = await this.Conn();
+        IDbConnection _db;
+        if (!this.TryConnSync(out _db)) {
+            _db = await this.Conn();
+        }
         return this.OnBefore();
     }
 
@@ -100,20 +184,41 @@ public abstract class AppController : Controller {
         return this.lease != null;
     }
 
-    /* 弃用未知事务状态的主库租约，清理异常不能覆盖原事务失败。
+    private void ReleaseLease(IDbConnection db, bool readOnly) {
+        DbContext ctx = this.Db();
+        if (ctx == null) { return; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("db_release") : -1;
+        try {
+            if (readOnly) { ctx.ReleaseRead(db); }
+            else { ctx.Release(db); }
+        } catch (Exception failure) {
+            if (trace != null) { trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+        }
+    }
+
+    /* 弃用主库租约，清理异常不能覆盖原事务失败。
        先清请求字段，确保之后的收尾不会再次归还或操作此连接。 */
-    private void DiscardLease() {
+    protected void DiscardLease() {
         IDbConnection db = this.lease;
         this.lease = null;
         this.leaseIsRead = false;
         this.inTx = false;
         if (db == null) { return; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("db_discard") : -1;
         try {
             DbContext ctx = this.Db();
             if (ctx != null) { ctx.Discard(db); }
             else { db.Close(); }
         } catch (Exception _cleanupError) {
             // 租约丢弃时的底层物理连接关闭或释放异常已无恢复价值，抑制异常避免覆盖主业务异常
+            if (trace != null) { trace.Fail(stage, "exception"); }
+        } finally {
+            if (trace != null) { trace.End(stage); }
         }
     }
 
@@ -123,45 +228,60 @@ public abstract class AppController : Controller {
         IDbConnection db = await this.Conn();
         if (db == null) { return false; }
         if (this.inTx) { return true; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("tx_begin") : -1;
         bool begun = false;
-        try { begun = await db.BeginTransactionAsync(); }
-        catch (Exception beginError) {
-            this.DiscardLease();
+        try {
+            begun = await db.BeginTransactionAsync();
+            if (!begun && trace != null) { trace.Fail(stage, "returned_false"); }
+        } catch (Exception beginError) {
+            if (trace != null) { trace.Fail(stage, "exception"); }
             throw beginError;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+            if (!begun) { this.DiscardLease(); }
         }
-        if (!begun) {
-            this.DiscardLease();
-            return false;
-        }
-        this.inTx = true;
-        return true;
+        this.inTx = begun;
+        return begun;
     }
 
     /* 提交失败（包括 false）保留 inTx，供失败路径回滚。 */
     protected async void Commit() {
         if (!this.inTx) { return; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("tx_commit") : -1;
+        bool committed = false;
         try {
-            if (!await this.lease.CommitAsync()) {
-                throw new Exception("commit failed");
-            }
+            committed = await this.lease.CommitAsync();
+            if (!committed && trace != null) { trace.Fail(stage, "returned_false"); }
         } catch (Exception commitError) {
-            this.commitFailed = true;
+            if (trace != null) { trace.Fail(stage, "exception"); }
             throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+            if (!committed) { this.commitFailed = true; }
         }
+        if (!committed) { throw new Exception("commit failed"); }
         this.inTx = false;
     }
 
     /* 回滚失败即弃用状态不明的连接，收尾不得重试并覆盖原提交异常。 */
     protected async void Rollback() {
         if (!this.inTx) { return; }
+        RequestTrace trace = this.BoundTrace();
+        int stage = trace != null ? trace.Begin("tx_rollback") : -1;
+        bool rolledBack = false;
         try {
-            if (!await this.lease.RollbackAsync()) {
-                throw new Exception("rollback failed");
-            }
+            rolledBack = await this.lease.RollbackAsync();
+            if (!rolledBack && trace != null) { trace.Fail(stage, "returned_false"); }
         } catch (Exception rollbackError) {
-            this.DiscardLease();
+            if (trace != null) { trace.Fail(stage, "exception"); }
             throw;
+        } finally {
+            if (trace != null) { trace.End(stage); }
+            if (!rolledBack) { this.DiscardLease(); }
         }
+        if (!rolledBack) { throw new Exception("rollback failed"); }
         this.inTx = false;
     }
 
@@ -176,6 +296,44 @@ public abstract class AppController : Controller {
     /* 任何失败路径回滚；可重复调用、可在提交后调用。 */
     override public async void TxRollback() { await this.Rollback(); }
 
+    private void CleanupLeases(Exception initialFailure) {
+        Exception failure = initialFailure;
+        try {
+            if (this.lease != null) { this.ReleaseLease(this.lease, this.leaseIsRead); }
+        } catch (Exception releaseError) {
+            if (failure == null) { failure = releaseError; }
+        } finally {
+            this.lease = null;
+            this.leaseIsRead = false;
+            this.inTx = false;
+        }
+        try {
+            if (this.readLease != null) { this.ReleaseLease(this.readLease, true); }
+        } catch (Exception readError) {
+            if (failure == null) { failure = readError; }
+        } finally {
+            this.readLease = null;
+        }
+        try { this.OnDone(); }
+        catch (Exception doneError) {
+            if (failure == null) { failure = doneError; }
+        }
+        if (failure != null) {
+            if (!this.commitFailed) { throw failure; }
+            try { Console.WriteLine("[MVC ERROR] controller cleanup failed: " + failure.Message); }
+            catch (Exception logFailure) { }
+        }
+    }
+
+    /* 无未提交事务时同步释放租约与清理，消除 OnAfterAsync 协程帧开销。 */
+    override public bool TryAfterSync() {
+        if (this.lease != null && this.inTx) {
+            return false;
+        }
+        this.CleanupLeases(null);
+        return true;
+    }
+
     /* 未完成事务先回滚；失败时先摘除池租约，再尝试关闭脏连接。
        各清理步骤都必须执行，后续清理异常不能覆盖最初的失败。 */
     override public async void OnAfterAsync() {
@@ -187,36 +345,7 @@ public abstract class AppController : Controller {
                 this.DiscardLease();
             }
         }
-        try {
-            if (this.lease != null) {
-                DbContext ctx = this.Db();
-                if (ctx != null) {
-                    if (this.leaseIsRead) { ctx.ReleaseRead(this.lease); }
-                    else { ctx.Release(this.lease); }
-                }
-            }
-        } catch (Exception releaseError) {
-            if (failure == null) { failure = releaseError; }
-        } finally {
-            this.lease = null;
-            this.leaseIsRead = false;
-            this.inTx = false;
-        }
-        try {
-            if (this.readLease != null) {
-                DbContext ctx = this.Db();
-                if (ctx != null) { ctx.ReleaseRead(this.readLease); }
-            }
-        } catch (Exception readError) {
-            if (failure == null) { failure = readError; }
-        } finally {
-            this.readLease = null;
-        }
-        try { this.OnDone(); }
-        catch (Exception doneError) {
-            if (failure == null) { failure = doneError; }
-        }
-        if (failure != null && !this.commitFailed) { throw failure; }
+        this.CleanupLeases(failure);
     }
 
     /* 供子类做每请求清理；覆盖此而非 OnAfterAsync()，后者负责释放连接。 */
@@ -253,4 +382,72 @@ public abstract class AppController : Controller {
 
     public SysUserDao SysUser { get { return new SysUserDao(this.Held()); } }
     public SysLoginLogDao SysLoginLog { get { return new SysLoginLogDao(this.Held()); } }
+
+    /* 提取本次请求承载的认证令牌（优先 Bearer 请求头，其次会话 Cookie）。 */
+    public string RequestAuthToken() {
+        HttpContext c = this.Ctx();
+        if (c == null) { return ""; }
+        if (Cfg.Auth.headerName.Length > 0) {
+            string hdr = c.Header(Cfg.Auth.headerName);
+            string scheme = Cfg.Auth.bearerScheme;
+            if (scheme.Length > 0 && hdr.StartsWith(scheme)) {
+                string val = hdr.Substring(scheme.Length).Trim();
+                if (val.Length > 0) { return val; }
+            }
+        }
+        return c.Cookie(Cfg.Auth.cookieName);
+    }
+
+    /* 解析并缓存当前请求令牌携带的已签名扩展声明（如 activeCompanyId）。 */
+    public Dictionary<string, string> Claims() {
+        if (!this.tokenClaimsLoaded) {
+            this.tokenClaimsLoaded = true;
+            this.tokenClaims = new Dictionary<string, string>();
+            string tok = this.RequestAuthToken();
+            if (tok.Length > 0) {
+                AuthToken.ParseClaims(tok, this.uid, this.tokenClaims);
+            }
+        }
+        return this.tokenClaims;
+    }
+
+    public string Claim(string key, string def = "") {
+        if (key == null || key.Length == 0) { return def; }
+        Dictionary<string, string> map = this.Claims();
+        string val = "";
+        if (map != null && map.TryGetValue(key, out val)) { return val; }
+        return def;
+    }
+
+    /* 保持会话有效的前提下刷新签名声明并回写会话 Cookie（如切换当前公司/租户）。 */
+    public async string RefreshAuthClaims(Dictionary<string, string> claims) {
+        if (!this.IsLogin()) { return ""; }
+        int id = Filter.ToInt(this.uid, 0);
+        if (id <= 0) { return ""; }
+        int ver = -1;
+        if (this.Held() != null) {
+            SysUser u = await this.SysUser.ById(id);
+            if (u != null && u.status == AuthUser.Active) { ver = u.tokenVersion; }
+        } else {
+            ver = await AuthUser.TokenVersion(this.uid);
+        }
+        if (ver < 0) { return ""; }
+        string tok = AuthToken.Issue(this.uid, ver, WebApp.NowSeconds(), claims);
+        if (tok.Length == 0) { return ""; }
+        this.tokenClaims = new Dictionary<string, string>();
+        if (claims != null) {
+            List<string> keys = claims.Keys;
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                string k = keys[i];
+                string v = "";
+                claims.TryGetValue(k, out v);
+                this.tokenClaims[k] = v;
+            }
+        }
+        this.tokenClaimsLoaded = true;
+        if (this.Ctx() != null) {
+            this.Ctx().SetCookie(Cfg.Auth.cookieName, tok, Cfg.Auth.ttlSeconds);
+        }
+        return tok;
+    }
 }

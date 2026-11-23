@@ -68,22 +68,21 @@ public partial class FirebirdConnection : IDbConnection {
         return ok;
     }
 
-    // 提交当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
-    public async bool CommitAsync() {
+    // 提交或回滚当前事务并开启新事务（通过 AsyncGate 门控保证单连接事务互斥）。
+    async bool endTransactionAsync(int op) {
         await this.AcquireLock();
         try {
             if (!this.connected) { return false; }
             FbBuf p = new FbBuf();
-            p.Int(FbOp.COMMIT);
+            p.Int(op);
             p.Int(this.transHandle);
             FbResponse resp = await this.roundTrip(p.ToBytes());
             if (resp == null) { return false; }
             bool ok = !resp.Failed();
             resp.Release();
-            this.transHandle = 0 - 1;
+            this.transHandle = -1;
             if (!ok) { return false; }
-            // 提交已落地，未收尾写清零（随后的 beginTransaction 是驱动
-            // 基线的空事务，不携带用户写入）。
+            // 事务已结束，清除未收尾写标记（随后的 beginTransaction 是空基线事务）。
             this.inTxn = false;
             return await this.beginTransaction();
         } finally {
@@ -91,30 +90,9 @@ public partial class FirebirdConnection : IDbConnection {
         }
     }
 
-    // 回滚当前事务并开启新事务。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
-    public async bool RollbackAsync() {
-        await this.AcquireLock();
-        try {
-            if (!this.connected) { return false; }
-            FbBuf p = new FbBuf();
-            p.Int(FbOp.ROLLBACK);
-            p.Int(this.transHandle);
-            FbResponse resp = await this.roundTrip(p.ToBytes());
-            if (resp == null) { return false; }
-            bool ok = !resp.Failed();
-            resp.Release();
-            this.transHandle = 0 - 1;
-            if (!ok) { return false; }
-            // 回滚已落地，未收尾写清零（随后的 beginTransaction 是驱动
-            // 基线的空事务，不携带用户写入）。
-            this.inTxn = false;
-            return await this.beginTransaction();
-        } finally {
-            this.ReleaseLock();
-        }
-    }
+    public async bool CommitAsync() { return await this.endTransactionAsync(FbOp.COMMIT); }
 
-    // 语句
+    public async bool RollbackAsync() { return await this.endTransactionAsync(FbOp.ROLLBACK); }
 
     // 分配语句句柄；失败返回 -1。
     async int allocStatement() {
@@ -122,21 +100,27 @@ public partial class FirebirdConnection : IDbConnection {
         p.Int(FbOp.ALLOCATE_STATEMENT);
         p.Int(this.dbHandle);
         FbResponse resp = await this.roundTrip(p.ToBytes());
-        if (resp == null) { return 0 - 1; }
+        if (resp == null) { return -1; }
         if (resp.Failed()) {
             resp.Release();
-            return 0 - 1;
+            return -1;
         }
         int h = resp.Handle();
         resp.Release();
         return h;
     }
 
-    // prepare 请求的 describe 条目：先是语句类型，
-    // 再是每个输出列的布局。
-    static FbBytes describeItems() {
+    // prepare/INFO_SQL 的 describe 条目：startCol<=0 时包含语句类型，>0 时从 INFO_SQLDA_START 续读。
+    static FbBytes describeItems(int startCol) {
         FbBuf b = new FbBuf();
-        b.U8(FbType.INFO_STMT_TYPE);
+        if (startCol <= 0) {
+            b.U8(FbType.INFO_STMT_TYPE);
+        } else {
+            b.U8(FbType.INFO_SQLDA_START);
+            b.U8(2);
+            b.U8(startCol & 255);
+            b.U8((startCol >> 8) & 255);
+        }
         b.U8(FbType.INFO_SELECT);
         b.U8(FbType.INFO_DESCRIBE_VARS);
         b.U8(FbType.INFO_SQLDA_SEQ);
@@ -153,8 +137,7 @@ public partial class FirebirdConnection : IDbConnection {
         return b.ToBytes();
     }
 
-    // prepare 语句并解析输出描述（XSQLDA）；描述超出单个缓冲区时
-    // 按 INFO_SQLDA_START 从服务器停下的列继续读取，失败返回 null。
+    // prepare 语句并解析输出描述（XSQLDA）；缓冲截断时按 INFO_SQLDA_START 续读，失败返回 null。
     async FbXsqlda prepare(int stmt, string sql) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.PREPARE_STATEMENT);
@@ -162,7 +145,7 @@ public partial class FirebirdConnection : IDbConnection {
         p.Int(stmt);
         p.Int(3);  // SQL 方言
         p.Str(sql);
-        FbBytes items = FirebirdConnection.describeItems();
+        FbBytes items = FirebirdConnection.describeItems(0);
         p.Block(items);
         items.Release();
         p.Int(FirebirdConnection.INFO_BUFFER);
@@ -175,36 +158,16 @@ public partial class FirebirdConnection : IDbConnection {
         FbXsqlda xs = new FbXsqlda();
         int next = xs.Parse(resp.Buf());
         resp.Release();
-        if (next == 0 - 2) {
+        if (next == -2) {
             this.lastError = "malformed statement description";
             return null;
         }
-        // 超出单个缓冲区的描述会被截断返回；从服务器
-        // 停下的列开始请求剩余部分。
         while (next > 0) {
             FbBuf q = new FbBuf();
             q.Int(FbOp.INFO_SQL);
             q.Int(stmt);
             q.Int(0);
-            FbBuf items2 = new FbBuf();
-            items2.U8(FbType.INFO_SQLDA_START);
-            items2.U8(2);
-            items2.U8(next & 255);
-            items2.U8((next >> 8) & 255);
-            items2.U8(FbType.INFO_SELECT);
-            items2.U8(FbType.INFO_DESCRIBE_VARS);
-            items2.U8(FbType.INFO_SQLDA_SEQ);
-            items2.U8(FbType.INFO_TYPE);
-            items2.U8(FbType.INFO_SUB_TYPE);
-            items2.U8(FbType.INFO_SCALE);
-            items2.U8(FbType.INFO_LENGTH);
-            items2.U8(FbType.INFO_NULL_IND);
-            items2.U8(FbType.INFO_FIELD);
-            items2.U8(FbType.INFO_RELATION);
-            items2.U8(FbType.INFO_OWNER);
-            items2.U8(FbType.INFO_ALIAS);
-            items2.U8(FbType.INFO_DESCRIBE_END);
-            FbBytes i2 = items2.ToBytes();
+            FbBytes i2 = FirebirdConnection.describeItems(next);
             q.Block(i2);
             i2.Release();
             q.Int(FirebirdConnection.INFO_BUFFER);
@@ -435,9 +398,7 @@ public partial class FirebirdConnection : IDbConnection {
         return res;
     }
 
-    // 完整读取 BLOB。子类型 1 为文本，按文本返回；
-    // 其余为二进制，以十六进制渲染，而非在
-    // 首个零字节处截断。
+    // 完整读取 BLOB：子类型 1 为文本，其余按二进制十六进制渲染（不在首个 0 字节截断）。
     async string readBlob(FbBytes blobId, int subtype) {
         FbBuf p = new FbBuf();
         p.Int(FbOp.OPEN_BLOB2);
@@ -496,20 +457,12 @@ public partial class FirebirdConnection : IDbConnection {
         return outp;
     }
 
-    // 协程查询 API
-
-    // 运行语句并返回其行（不产生行的语句
-    // 返回空）。语句失败时抛出 <see cref="DbException"/>，
-    // 因此空结果总是表示“无行”而绝非“未执行”；
-    // <see cref="GetError"/> 和 <see cref="SqlCode"/> 仍携带
-    // 上次失败信息，供调用方自行检查。
+    // 运行语句并返回其行（不产生行返回空）；失败抛出 DbException。
     public async DbResult QueryAsync(string sql) {
         return await this.QueryAsync(sql, null);
     }
 
-    // 运行带参数的语句。占位符是协议
-    // 自身的位置占位符，因此值采用绑定而非拼入
-    // SQL 文本。内部通过 AsyncGate 门控保证单连接事务互斥，杜绝并发调用数据串号。
+    // 带参数运行语句（位置占位符协议绑定；内部 AsyncGate 保证单连接并发互斥）。
     public async DbResult QueryAsync(string sql, DbParams prms) {
         await this.AcquireLock();
         try {
@@ -527,8 +480,7 @@ public partial class FirebirdConnection : IDbConnection {
                 this.fail();
             }
             if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
-                // 带输出参数的过程以 op_sql_response 应答，
-                // 而非游标；应据此判断，避免误读数据流。
+                // 带输出参数的过程走 op_sql_response 而非游标，改用 SELECT 调用。
                 await this.freeStatement(stmt);
                 this.lastError = "EXECUTE PROCEDURE with output parameters is not"
                     + " supported; select from the procedure instead";
@@ -556,45 +508,35 @@ public partial class FirebirdConnection : IDbConnection {
         }
     }
 
-    // 运行语句并返回其影响的行数。语句
-    // 失败时抛出 <see cref="DbException"/>。
+    // 运行语句并返回影响行数；失败抛出 DbException。
     public async int ExecuteAsync(string sql) {
         return await this.ExecuteAsync(sql, null);
     }
 
-    // ExecuteAsync 的带参数版本。
     public async int ExecuteAsync(string sql, DbParams prms) {
         DbResult r = await this.QueryAsync(sql, prms);
         if (this.lastError.Length > 0) { this.fail(); }
         return this.lastAffected;
     }
 
-    // 抛出记录的失败，让调用方看到服务器的
-    // 原始措辞和 SQL 码，而不是空结果。
     void fail() {
         string why = this.lastError;
-        if (why.Length == 0) {
-            why = "the statement failed";
-        }
-        throw new DbException(why, this.lastStatus.SqlCode(),
-                              DbProvider.Firebird);
+        if (why.Length == 0) { why = "the statement failed"; }
+        throw new DbException(why, this.lastStatus.SqlCode(), DbProvider.Firebird);
     }
 
     // 第一行第一列的值，无行时返回 ""。
     public async string ExecuteScalarAsync(string sql) {
-        DbResult r = await this.QueryAsync(sql, null);
-        if (r.RowCount() == 0) { return ""; }
-        return r.GetString(0, 0);
+        return await this.ExecuteScalarAsync(sql, null);
     }
 
-    // ExecuteScalarAsync 的带参数版本。
     public async string ExecuteScalarAsync(string sql, DbParams prms) {
         DbResult r = await this.QueryAsync(sql, prms);
         if (r.RowCount() == 0) { return ""; }
         return r.GetString(0, 0);
     }
 
-    // 用于验证会话仍可用的往返。内部通过 AsyncGate 门控保证单连接事务互斥。
+    // 用于验证会话仍可用的往返（AsyncGate 互斥）。
     public async bool PingAsync() {
         await this.AcquireLock();
         try {
@@ -611,37 +553,17 @@ public partial class FirebirdConnection : IDbConnection {
         }
     }
 
-    // 状态
-
-    // 上一条语句影响的行数。
     public int AffectedRows() { return this.lastAffected; }
-
-    // 上次失败的描述，没有则为 ""。
     public string GetError() { return this.lastError; }
-
-    // 上次失败的 Firebird SQL 码（无失败时为 0）。
     public int SqlCode() { return this.lastStatus.SqlCode(); }
-
-    // 服务器选择的认证插件。
     public string AuthPlugin() { return this.plugin; }
-
-    // 当前线路加密方式，会话未加密时为 ""。
     public string WireCrypt() { return this.cryptPlugin; }
-
-    // 服务器接受的协议版本。
     public int ProtocolVersion() { return this.acceptVersion; }
-
-    // 本会话附加到的数据库。
     public string Database() { return this.database; }
-
-    // 连接是否仍打开。
     public bool IsConnected() { return this.connected; }
-
-    // 驱动标识，恒为 <see cref="DbProvider.Firebird"/>。
     public int GetProvider() { return DbProvider.Firebird; }
 
-    // 礼貌地分离（回滚打开的事务），然后
-    // 关闭套接字。
+    // 礼貌分离（回滚未结束事务）并关闭套接字。
     public async void CloseAsync() {
         if (this.connected && this.transHandle >= 0) {
             FbBuf p = new FbBuf();
@@ -649,7 +571,7 @@ public partial class FirebirdConnection : IDbConnection {
             p.Int(this.transHandle);
             FbResponse r = await this.roundTrip(p.ToBytes());
             if (r != null) { r.Release(); }
-            this.transHandle = 0 - 1;
+            this.transHandle = -1;
         }
         if (this.connected && this.dbHandle >= 0) {
             FbBuf p = new FbBuf();
@@ -657,12 +579,12 @@ public partial class FirebirdConnection : IDbConnection {
             p.Int(this.dbHandle);
             FbResponse r = await this.roundTrip(p.ToBytes());
             if (r != null) { r.Release(); }
-            this.dbHandle = 0 - 1;
+            this.dbHandle = -1;
         }
         this.Close();
     }
 
-    // 不经分离往返直接丢弃连接。安全释放互斥门控并唤醒所有等待者。
+    // 直接关闭连接，释放互斥门控并唤醒等待者。
     public void Close() {
         while (this.waiters != null && this.waiters.Count > 0) {
             AsyncGate g = this.waiters[0];
@@ -672,7 +594,7 @@ public partial class FirebirdConnection : IDbConnection {
         this.busy = false;
         if (this.sock >= 0) {
             Socket.Close(this.sock);
-            this.sock = 0 - 1;
+            this.sock = -1;
         }
         this.connected = false;
         this.encIn = null;

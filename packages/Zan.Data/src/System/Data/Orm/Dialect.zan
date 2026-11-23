@@ -4,9 +4,7 @@ using System.Data;
 
 namespace System.Data.Orm;
 
-// 方言与目录探测：列类型、upsert 写法、表/列/索引存在性、自增值。
-// 以前这些文本由代码生成器抄进每个用户产物，现在只有这一份实现，
-// 改 SQL 规则只改这里。
+// SQL 方言与目录探测：标识符转义、upsert 写法、表/列/索引存在性与自增值。
 public class Dialect {
     // 对表名、列名、索引名等标识符按数据库方言进行转义包装，避免保留关键字（如 Order/User/Group/Key/Desc 等）语法崩毁。
     public static string QuoteIdentifier(int p, string ident) {
@@ -136,8 +134,7 @@ public class Dialect {
         return qc + " = " + src;
     }
 
-    // 列 c 的冲突更新模式码：累加 1、取大 2、取小 3、覆盖 0
-    // （与 <see cref="Excl"/> 的 md 对应）。
+    // 列 c 的冲突更新模式码：累加 1、取大 2、取小 3、覆盖 0（与 Excl 的 md 对应）。
     public static int Mode(List<string> acc, List<string> mx, List<string> mn,
                     string c) {
         if (Dialect.Has(acc, c)) { return 1; }
@@ -146,10 +143,7 @@ public class Dialect {
         return 0;
     }
 
-    // 刚插入行的自增值。没有会话级「最后自增 id」的
-    // 引擎（Firebird 用 INSERT … RETURNING 读生成器，TDengine
-    // 没有自增列）直接抛错，而不是发出别的方言的 SQL 让
-    // 服务器报一条费解的错。
+    // 刚插入行的自增值 SQL（不支持会话级 last id 的引擎直接报错）。
     public static string LastIdSql(IDbExecutor db) {
         int p = db.GetProvider();
         if (p == DbProvider.SQLite) {
@@ -178,7 +172,7 @@ public class Dialect {
         return r.GetInt(0, 0);
     }
 
-    // <see cref="LastId"/> 的异步版本。
+    // LastId 的异步版本。
     public static async int LastIdAsync(IDbExecutor db) {
         string sql = Dialect.LastIdSql(db);
         DbResult r = await db.QueryAsync(sql);
@@ -186,11 +180,7 @@ public class Dialect {
         return r.GetInt(0, 0);
     }
 
-    /* information_schema 横跨 MySQL 服务器上每个数据库（PostgreSQL/
-     * SQL Server 上每个 schema），不加作用域会找到别人库里同名表，
-     * CodeFirst 于是"改"一张这里不存在的表。每个目录探测都限定在
-     * 连接自己的库/schema。 */
-    // 目录探测的库/schema 作用域过滤子句（限定在连接自己的库，按 provider 给出）。
+    // 目录探测的库/schema 作用域过滤子句（限定在当前连接所属库/schema）。
     public static string OwnScope(int p) {
         if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
             return " AND table_schema = DATABASE()";
@@ -205,9 +195,6 @@ public class Dialect {
         return "";
     }
 
-    /* 这些引擎提供 information_schema 目录（DM 兼容 SQL Server 的
-     * 目录视图）。不在此列、也没有专门分支的引擎，CodeFirst
-     * 的目录探测会显式抛错而不是发出一句必然失败的 SQL。 */
     // 该 provider 是否提供 information_schema 目录。
     public static bool HasInformationSchema(int p) {
         return p == DbProvider.MySQL || p == DbProvider.MariaDB
@@ -216,9 +203,7 @@ public class Dialect {
             || p == DbProvider.DM;
     }
 
-    // 表存在性探测 SQL（SQLite 查 sqlite_master、Firebird 查
-    // RDB$RELATIONS、其余查 information_schema，均带参数占位符）；
-    // 不支持目录探测的 provider 直接抛错。
+    // 表存在性探测 SQL（带参数占位符）；不支持目录探测的 provider 抛错。
     public static string HasTableSql(IDbExecutor db) {
         int p = db.GetProvider();
         if (p == DbProvider.SQLite) {
@@ -249,7 +234,7 @@ public class Dialect {
         return r.GetInt(0, 0) > 0;
     }
 
-    // <see cref="HasTable"/> 的异步版本。
+    // HasTable 的异步版本。
     public static async bool HasTableAsync(IDbExecutor db, string t) {
         string sql = Dialect.HasTableSql(db);
         DbResult r = await db.QueryAsync(sql, new DbParams().Add(t));
@@ -263,12 +248,21 @@ public class Dialect {
             + " WHERE table_name = ?" + Dialect.OwnScope(p);
     }
 
-    // 表现有的列名清单：SQLite 走 PRAGMA table_info，Firebird 走
-    // RDB$RELATION_FIELDS（并截掉 CHAR(31) 的尾部空格），
-    // 其余走 information_schema；不支持的 provider 抛错。
+    private static List<string> ReadColNames(DbResult r, int nameCol, bool padded) {
+        List<string> cols = new List<string>();
+        int i = 0;
+        while (i < r.RowCount()) {
+            string nm = r.GetString(i, nameCol);
+            if (padded) { nm = nm.Trim(); }
+            cols.Add(nm);
+            i = i + 1;
+        }
+        return cols;
+    }
+
+    // 查询表已有列名清单（SQLite 走 PRAGMA table_info，Firebird 裁剪 CHAR(31) 尾空格）。
     public static List<string> Cols(IDbExecutor db, string t) {
         QueryBuilder.RequireIdent(t);
-        List<string> cols = new List<string>();
         int p = db.GetProvider();
         DbResult r;
         int nameCol = 0;
@@ -280,7 +274,7 @@ public class Dialect {
             r = db.Query("SELECT RDB$FIELD_NAME FROM RDB$RELATION_FIELDS"
                 + " WHERE RDB$RELATION_NAME = UPPER(?)"
                 + " ORDER BY RDB$FIELD_POSITION", new DbParams().Add(t));
-            padded = true;  // CHAR(31) 取出来带尾部空格
+            padded = true;
         } else if (Dialect.HasInformationSchema(p)) {
             r = db.Query(Dialect.ColsSql(p), new DbParams().Add(t));
         } else {
@@ -288,20 +282,12 @@ public class Dialect {
                 "CodeFirst catalog queries are not supported for provider id "
                 + Convert.ToString(p), 0, p);
         }
-        int i = 0;
-        while (i < r.RowCount()) {
-            string nm = r.GetString(i, nameCol);
-            if (padded) { nm = nm.Trim(); }
-            cols.Add(nm);
-            i = i + 1;
-        }
-        return cols;
+        return Dialect.ReadColNames(r, nameCol, padded);
     }
 
-    // <see cref="Cols"/> 的异步版本。
+    // Cols 的异步版本。
     public static async List<string> ColsAsync(IDbExecutor db, string t) {
         QueryBuilder.RequireIdent(t);
-        List<string> cols = new List<string>();
         int p = db.GetProvider();
         DbResult r;
         int nameCol = 0;
@@ -323,22 +309,10 @@ public class Dialect {
                 "CodeFirst catalog queries are not supported for provider id "
                 + Convert.ToString(p), 0, p);
         }
-        int i = 0;
-        while (i < r.RowCount()) {
-            string nm = r.GetString(i, nameCol);
-            if (padded) { nm = nm.Trim(); }
-            cols.Add(nm);
-            i = i + 1;
-        }
-        return cols;
+        return Dialect.ReadColNames(r, nameCol, padded);
     }
 
-    /* 二级索引：声明在实体上，缺了就补，已有就不动。
-     * `CREATE INDEX IF NOT EXISTS` 不是各家都有的写法（MySQL 没有），
-     * 所以存在性自己按方言查。探测参数由 <see cref="IndexProbeParams"/>
-     * 按同一方言给出——MySQL/SQL Server 的索引名只在表内唯一，
-     * 必须连同表名一起比对，别的表的同名索引不算「已存在」。 */
-    // 二级索引存在性探测 SQL（按方言给出，带参数占位符）。
+    // 二级索引存在性探测 SQL（按方言给出，MySQL/SQL Server 连同表名比对）。
     public static string HasIndexSql(int p) {
         if (p == DbProvider.SQLite) {
             return "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'"
@@ -369,8 +343,7 @@ public class Dialect {
             + Convert.ToString(p), 0, p);
     }
 
-    // <see cref="HasIndexSql"/> 对应的探测参数：
-    // 按表名一起比对的方言为 (索引名, 表名)，其余为 (索引名)。
+    // HasIndexSql 对应的探测参数：按表名比对的方言为 (索引名, 表名)，其余为 (索引名)。
     public static DbParams IndexProbeParams(int p, string nm, string t) {
         if (p == DbProvider.MySQL || p == DbProvider.MariaDB
                 || p == DbProvider.SqlServer || p == DbProvider.DM) {
@@ -392,7 +365,7 @@ public class Dialect {
             + t + " (" + cols + ")";
     }
 
-    // 索引不存在时创建；DDL 失败（负返回值）抛
+    // 索引不存在时创建；DDL 失败（负返回值）抛 DbException。
     public static void EnsureIndex(IDbExecutor db, string nm, string t, string cols,
                             bool uniq) {
         int p = db.GetProvider();
@@ -406,7 +379,7 @@ public class Dialect {
         }
     }
 
-    // <see cref="EnsureIndex"/> 的异步版本。
+    // EnsureIndex 的异步版本。
     public static async bool EnsureIndexAsync(IDbExecutor db, string nm, string t,
                                        string cols, bool uniq) {
         int p = db.GetProvider();

@@ -1,0 +1,129 @@
+using System;
+using System.Threading;
+
+namespace System.Json;
+
+internal enum JsonMemberKind {
+    Object,
+    String,
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
+    Double,
+    Bool,
+    Value,
+    List,
+    Dictionary
+}
+
+internal class JsonMemberMapping {
+    internal string FieldName;
+    internal string JsonName;
+    internal string OutputName;
+    internal string DefaultValue;
+    internal bool Required;
+    internal TypeInfo Type;
+    internal JsonMemberKind Kind;
+
+    internal static JsonMemberKind Classify(string name, TypeInfo type) {
+        if (name == "string") { return JsonMemberKind.String; }
+        if (name == "int" || name == "short" || name == "byte" || type.Kind == "enum") {
+            return JsonMemberKind.Int;
+        }
+        if (name == "uint" || name == "ushort" || name == "sbyte") { return JsonMemberKind.UnsignedInt; }
+        if (name == "long") { return JsonMemberKind.Long; }
+        if (name == "ulong") { return JsonMemberKind.UnsignedLong; }
+        if (name == "double" || name == "float") { return JsonMemberKind.Double; }
+        if (name == "bool") { return JsonMemberKind.Bool; }
+        if (Json.IsJsonValueType(name)) { return JsonMemberKind.Value; }
+        if (Json.IsListType(name)) { return JsonMemberKind.List; }
+        if (Json.IsDictType(name)) { return JsonMemberKind.Dictionary; }
+        return JsonMemberKind.Object;
+    }
+}
+
+internal class JsonTypeMapping {
+    private static Mutex gate = new Mutex();
+    private static Dict<long, JsonTypeMapping> cache = new Dict<long, JsonTypeMapping>();
+    internal List<JsonMemberMapping> Fields;
+    private int[] buckets;
+    private int[] next;
+
+    internal static JsonTypeMapping Get(TypeInfo type) {
+        // A TypeInfo points to the type's static reflection metadata. Its name can
+        // be shared by distinct closed generic types.
+        long key = (long)(nint)type;
+        if (key == 0L) { return JsonTypeMapping.Build(type); }
+        JsonTypeMapping.gate.WaitOne();
+        try {
+            JsonTypeMapping mapping = null;
+            if (!JsonTypeMapping.cache.TryGetValue(key, out mapping)) {
+                mapping = JsonTypeMapping.Build(type);
+                JsonTypeMapping.cache.Add(key, mapping);
+            }
+            return mapping;
+        } finally {
+            JsonTypeMapping.gate.ReleaseMutex();
+        }
+    }
+
+    private static JsonTypeMapping Build(TypeInfo type) {
+        List<JsonMemberMapping> fields = new List<JsonMemberMapping>();
+        int count = type.FieldCount;
+        fields.Reserve(count);
+        for (int i = 0; i < count; i++) {
+            FieldMapping mapping = FieldMapping.Read(type, i);
+            if (mapping.Ignored) { continue; }
+            JsonMemberMapping field = new JsonMemberMapping();
+            field.FieldName = type.GetFieldName(i);
+            field.JsonName = mapping.Name.Length == 0 ? field.FieldName : mapping.Name;
+            field.OutputName = "\"" + field.JsonName + "\":";
+            field.DefaultValue = mapping.DefaultValue;
+            field.Required = mapping.Required;
+            field.Type = type.GetFieldTypeInfo(i);
+            field.Kind = JsonMemberMapping.Classify(type.GetFieldType(i), field.Type);
+            fields.Add(field);
+        }
+        JsonTypeMapping result = new JsonTypeMapping();
+        result.Fields = fields;
+        if (fields.Count > 8) { result.IndexFields(); }
+        return result;
+    }
+
+    private static int Bucket(StringView key, int count) {
+        if (key.Length == 0) { return 0; }
+        int hash = key.Length * 31;
+        hash = hash * 31 + key.ByteAt(0);
+        hash = hash * 31 + key.ByteAt(key.Length / 2);
+        hash = hash * 31 + key.ByteAt(key.Length - 1);
+        return (hash & 2147483647) % count;
+    }
+
+    private void IndexFields() {
+        int count = this.Fields.Count;
+        this.buckets = new int[count * 2];
+        this.next = new int[count];
+        for (int i = 0; i < count; i++) {
+            int bucket = JsonTypeMapping.Bucket(StringView.FromString(this.Fields[i].JsonName), this.buckets.Length);
+            this.next[i] = this.buckets[bucket];
+            this.buckets[bucket] = i + 1;
+        }
+    }
+
+    internal int[] MatchProperties(JsonDoc doc, int at) {
+        if (this.buckets == null || doc.Count(at) <= 8) { return null; }
+        int[] matches = new int[this.Fields.Count];
+        for (int p = doc.FirstProperty(at); p >= 0; p = doc.NextProperty(p)) {
+            StringView key = doc.PropertyNameView(p);
+            int bucket = JsonTypeMapping.Bucket(key, this.buckets.Length);
+            for (int entry = this.buckets[bucket]; entry != 0; entry = this.next[entry - 1]) {
+                int i = entry - 1;
+                if (matches[i] == 0 && key.Equals(this.Fields[i].JsonName)) {
+                    matches[i] = doc.PropertyValue(p) + 1;
+                }
+            }
+        }
+        return matches;
+    }
+}

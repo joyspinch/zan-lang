@@ -3,7 +3,7 @@ using System.IO;
 
 namespace System.IO.Compression;
 
-// ustar 前缀字段，因此长路径也能保留。
+// ustar tar 读写与流式解包（支持 ustar prefix 与 GNU 'L' 长文件名及防逃逸校验）。
 public class Tar {
     [DllImport("crt", EntryPoint = "zan_file_fopen")]
     private static extern nint PlatFopen(string path, string mode);
@@ -17,25 +17,18 @@ public class Tar {
     [DllImport("crt", EntryPoint = "fclose")]
     private static extern int PlatFclose(nint fp);
 
-    // 在内存中构建 tar 归档。目录条目应
-    // 标记 isDirectory（或名称以 "/" 结尾）。mode 为 0 时文件取 0644、
-    // 目录取 0755；超过 100 字节的路径按 ustar 规则拆入 prefix 字段，
-    // 无法拆分时截断到 100 字节。归档以两个 512 字节零块结尾。
+    // 在内存中构建 tar 归档（mode==0 时文件取 0644、目录取 0755；结尾附两个 512 字节零块）。
     public static byte[] Create(List<TarEntry> entries) {
-        // 每个头部 512 字节；数据按 512 字节边界补齐。
-        int total = 1024;  // 结尾的两个零块
-        int i = 0;
-        for (; i < entries.Count; i = i + 1) {
+        int total = 1024;
+        for (int i = 0; i < entries.Count; i = i + 1) {
             TarEntry e = entries[i];
             total = total + 512 + ((e.data == null ? 0 : e.data.Length) + 511) / 512 * 512;
         }
         byte[] out2 = new byte[total];
         int pos = 0;
-        i = 0;
-        while (i < entries.Count) {
+        for (int i = 0; i < entries.Count; i = i + 1) {
             TarEntry e = entries[i];
-            int hdr = pos;
-            Tar.WriteHeader(out2, hdr, e);
+            Tar.WriteHeader(out2, pos, e);
             pos = pos + 512;
             if (e.data != null && e.data.Length > 0) {
                 for (int k = 0; k < e.data.Length; k = k + 1) {
@@ -43,45 +36,35 @@ public class Tar {
                 }
                 pos = pos + ((e.data.Length + 511) / 512) * 512;
             }
-            i = i + 1;
         }
         return out2;
     }
 
-    // 读取 tar 归档中的所有条目（含数据）。逐块校验头部
-    // 校验和；归档损坏（校验和不符、size 越界）返回 null。普通文件
-    // 与目录照常解析，符号链接/设备等特殊条目 data 为 null、
-    // isDirectory 为 false。
+    // 读取 tar 归档全部条目；校验和不符或 size 越界返回 null。
     public static List<TarEntry> Read(byte[] tar) {
         List<TarEntry> entries = new List<TarEntry>();
         int pos = 0;
         while (pos + 512 <= tar.Length) {
             if (Tar.IsZeroBlock(tar, pos)) { break; }
-            if (tar[pos] == 0) { pos = pos + 512; continue; }  // 跳过填充
-            // 校验校验和（字段 148..155，空格填充的八进制）。
+            if (tar[pos] == 0) { pos = pos + 512; continue; }
             int stored = Tar.ParseOctal(tar, pos + 148, 8);
             int computed = Tar.HeaderSum(tar, pos);
-            if (stored != computed) { return null; }  // 损坏
+            if (stored != computed) { return null; }
             string name = Tar.ReadStr(tar, pos, 100);
             string prefix = Tar.ReadStr(tar, pos + 345, 155);
-            if (prefix.Length > 0) {
-                name = prefix + "/" + name;
-            }
+            if (prefix.Length > 0) { name = prefix + "/" + name; }
             long size = Tar.ParseSize(tar, pos + 124);
             int type = tar[pos + 156] & 255;
-            // 防炸弹 + 防溢出：size 来自归档头部（12 位八进制），
-            // 用 long 累计，数据区必须整体落在归档内——byte[] 无越界
-            // 检查，(size + 511) 的 int 溢出会让游标倒退、从缓冲区
-            // 前方读取。
+            // 用 long 做越界检查，防止 (size + 511) 的 32 位溢出绕过边界。
             if (size < 0) { return null; }
             long dataLen = ((size + 511) / 512) * 512;
             if ((long)pos + 512 + dataLen > tar.Length) { return null; }
             TarEntry e = new TarEntry(name);
             e.mode = Tar.ParseOctal(tar, pos + 100, 8);
             e.mtime = Tar.ParseSize(tar, pos + 136);
-            if (type == 53) {  // '5' = 目录
+            if (type == 53) {
                 e.isDirectory = true;
-            } else if (type == 0 || type == 48) {  // 普通文件（'0' 或 NUL）
+            } else if (type == 0 || type == 48) {
                 int isz = (int)size;
                 e.data = new byte[isz];
                 for (int k = 0; k < isz; k = k + 1) {
@@ -89,7 +72,7 @@ public class Tar {
                 }
             } else {
                 e.isDirectory = false;
-                e.data = null;  // 符号链接/设备/其他
+                e.data = null;
             }
             entries.Add(e);
             pos = pos + 512 + (int)dataLen;
@@ -97,18 +80,12 @@ public class Tar {
         return entries;
     }
 
-    // 写出 512 字节 ustar 头部：长路径按「最靠前的 '/' 且
-    // 名称部分 ≤100、前缀 ≤155」拆入 prefix 字段（无法拆分时截断）；
-    // 目录 typeflag '5'、普通文件 '0'；uid/gid/devmajor/devminor 恒 0；
-    // 末尾写校验和。mode 为 0 时按条目类型取默认权限。
+    // 写出 512 字节 ustar 头部（>100 字节按最靠前 '/' 拆进 prefix<=155 + name<=100）。
     private static void WriteHeader(byte[] b, int off, TarEntry e) {
-        // 名称（100）+ 前缀（155）拆分，用于长路径。
         string name = e.name;
         string prefix = "";
         if (name.Length > 100) {
-            // ustar 拆分：取最靠前的 '/'，使名称部分 ≤ 100 且前缀 ≤ 155
-            // （前缀不含末尾的 '/'，读取端按 prefix + "/" + name 复原）。
-            int split = 0 - 1;
+            int split = -1;
             for (int i = 0; i < name.Length && i <= 155; i = i + 1) {
                 if ((name[i] & 255) == 47 && name.Length - i - 1 <= 100) {
                     split = i;
@@ -119,32 +96,27 @@ public class Tar {
                 prefix = name.Substring(0, split);
                 name = name.Substring(split + 1, name.Length - split - 1);
             } else {
-                name = name.Substring(0, 100);  // 无法拆分：只能截断
+                name = name.Substring(0, 100);
             }
         }
         Tar.WriteStr(b, off, name, 100);
         Tar.WriteOctal(b, off + 100, e.mode == 0 ? (e.isDirectory ? 493 : 420) : e.mode, 8);
-        Tar.WriteOctal(b, off + 108, 0, 8);  // uid
-        Tar.WriteOctal(b, off + 116, 0, 8);  // gid
+        Tar.WriteOctal(b, off + 108, 0, 8);
+        Tar.WriteOctal(b, off + 116, 0, 8);
         int size = (e.isDirectory || e.data == null) ? 0 : e.data.Length;
         Tar.WriteOctal(b, off + 124, size, 12);
-        Tar.WriteOctal(b, off + 136, e.mtime, 12);  // mtime
-        // 校验和字段：先用空格占位，稍后计算
-        int k = 148;
-        while (k < 156) { b[off + k] = 32; k = k + 1; }
-        b[off + 156] = (byte)(e.isDirectory ? 53 : 48);  // typeflag '5'/'0'
-        k = 157;
-        while (k < 257) { b[off + k] = 0; k = k + 1; }  // linkname
-        Tar.WriteStr(b, off + 257, "ustar", 6);  // magic
+        Tar.WriteOctal(b, off + 136, e.mtime, 12);
+        for (int k = 148; k < 156; k = k + 1) { b[off + k] = 32; }
+        b[off + 156] = (byte)(e.isDirectory ? 53 : 48);
+        for (int k = 157; k < 257; k = k + 1) { b[off + k] = 0; }
+        Tar.WriteStr(b, off + 257, "ustar", 6);
         b[off + 263] = 0;
-        Tar.WriteStr(b, off + 265, "00", 2);  // version
-        k = 267;
-        while (k < 345) { b[off + k] = 0; k = k + 1; }  // uname/gname
-        Tar.WriteOctal(b, off + 329, 0, 8);  // devmajor
-        Tar.WriteOctal(b, off + 337, 0, 8);  // devminor
-        Tar.WriteStr(b, off + 345, prefix, 155);  // prefix
-        k = 500;
-        while (k < 512) { b[off + k] = 0; k = k + 1; }
+        Tar.WriteStr(b, off + 265, "00", 2);
+        for (int k = 267; k < 345; k = k + 1) { b[off + k] = 0; }
+        Tar.WriteOctal(b, off + 329, 0, 8);
+        Tar.WriteOctal(b, off + 337, 0, 8);
+        Tar.WriteStr(b, off + 345, prefix, 155);
+        for (int k = 500; k < 512; k = k + 1) { b[off + k] = 0; }
         int sum = Tar.HeaderSum(b, off);
         Tar.WriteOctal(b, off + 148, sum, 8);
     }
@@ -201,15 +173,10 @@ public class Tar {
         return s;
     }
 
-    // 按 POSIX 写八进制字段：右对齐、末字节为 NUL 终止符、
-    // 其余高位补空格；值为 0 时写单个 '0'。
+    // POSIX 八进制字段（右对齐、末字节 NUL、高位补空格）。
     private static void WriteOctal(byte[] b, int off, long v, int fieldLen) {
-        // 八进制数字右对齐，最后一个字节为终止符（NUL）。
         char[] digits = new char[fieldLen];
-        int i = 0;
-        for (; i < fieldLen; i = i + 1) {
-            digits[i] = ' ';
-        }
+        for (int i = 0; i < fieldLen; i = i + 1) { digits[i] = ' '; }
         int pos = fieldLen - 2;
         long val = v;
         while (val > 0 && pos >= 0) {
@@ -218,16 +185,12 @@ public class Tar {
             pos = pos - 1;
         }
         digits[fieldLen - 1] = '\0';
-        i = 0;
-        while (i < fieldLen) {
+        for (int i = 0; i < fieldLen; i = i + 1) {
             b[off + i] = (byte)digits[i];
-            i = i + 1;
         }
     }
 
-    // 解析八进制字段，忽略非八进制字符（兼容空格填充与
-    // GNU 的 base-256 形态首字节被当作无效跳过——仅适用于 mode 等
-    // int 范围内的字段；size 用 <see cref="ParseSize"/>）。
+    // 解析八进制字段（忽略空格与非八进制字符；仅用于 int 范围字段，size 请用 ParseSize）。
     private static int ParseOctal(byte[] b, int off, int fieldLen) {
         int v = 0;
         for (int i = 0; i < fieldLen; i = i + 1) {
@@ -239,9 +202,7 @@ public class Tar {
         return v;
     }
 
-    // size 字段（12 位八进制）可能超过 int 范围，必须用
-    // long 累计，否则攻击者把 32 位截断值写进 size 就能绕过边界
-    // 检查。mtime 等大数值字段同样经此解析。
+    // 12 位八进制大数值字段（size/mtime）：用 long 累计防止 32 位截断绕过边界。
     private static long ParseSize(byte[] b, int off) {
         long v = 0;
         for (int i = 0; i < 12; i = i + 1) {
@@ -253,13 +214,10 @@ public class Tar {
         return v;
     }
 
-    // 把 tar 归档流式解包到目录（按 64 KiB 分块读写，不把归档
-    // 整体读入内存，适合数百 MB 的运行时包）。支持 ustar 前缀长名与
-    // GNU 长名（'L'）条目；符号链接/设备等条目被跳过。返回写出的文件与
-    // 目录数，归档损坏或路径越界时返回 -1。
+    // 流式解包 tar 到目录（64 KiB 分块，支持 ustar prefix 与 GNU 'L' 长名）；损坏或越界返回 -1。
     public static int ExtractFile(string tarPath, string destDir) {
         nint fp = PlatFopen(tarPath, "rb");
-        if (fp == 0) { return 0 - 1; }
+        if (fp == 0) { return -1; }
         string root = destDir;
         if (!root.EndsWith("/") && !root.EndsWith("\\")) { root = root + "/"; }
         Directory.CreateDirectoryRecursive(root);
@@ -293,17 +251,17 @@ public class Tar {
 
                     if (size < 0) {
                         failed = 1; more = false;
-                    } else if (type == 76) {  // GNU 长名条目
+                    } else if (type == 76) {
                         longName = Tar.ReadName(fp, buf, size);
                         if (longName == null) { failed = 1; more = false; }
                         else if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
                     } else if (!Tar.SafeName(name)) {
                         failed = 1; more = false;
-                    } else if (type == 53 || name.EndsWith("/")) {  // 目录
+                    } else if (type == 53 || name.EndsWith("/")) {
                         Directory.CreateDirectoryRecursive(root + name);
                         count = count + 1;
                         if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
-                    } else if (type == 0 || type == 48) {  // 普通文件
+                    } else if (type == 0 || type == 48) {
                         string outPath = root + name;
                         int slash = Tar.LastSlash(outPath);
                         if (slash > 0) {
@@ -316,7 +274,7 @@ public class Tar {
                             if ((mode & 73) != 0) { File.SetExecutable(outPath, true); }
                             if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
                         }
-                    } else {  // 链接/设备/其他
+                    } else {
                         if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
                     }
                 }
@@ -324,19 +282,16 @@ public class Tar {
         } finally {
             PlatFclose(fp);
         }
-        if (failed != 0) { return 0 - 1; }
+        if (failed != 0) { return -1; }
         return count;
     }
 
-    // 归档内路径防逃逸检查：必须是相对路径、无盘符、
-    // 不含 ".." 段。注意 "\\" 仅在段边界处当分隔符参与 ".." 判定，
-    // 普通段内的反斜杠不拒绝——Windows 上会原样成为文件名的一部分。
-    // 非法时返回 false。
+    // 路径防逃逸检查：须为相对路径、无盘符、无 ".." 段。
     public static bool SafeName(string name) {
         if (name.Length == 0) { return false; }
         int c0 = name[0] & 255;
-        if (c0 == 47 || c0 == 92) { return false; }  // 绝对路径
-        if (name.Length >= 2 && (name[1] & 255) == 58) { return false; }  // "C:"
+        if (c0 == 47 || c0 == 92) { return false; }
+        if (name.Length >= 2 && (name[1] & 255) == 58) { return false; }
         int n = name.Length;
         int seg = 0;
         for (int i = 0; i <= n; i = i + 1) {
@@ -353,7 +308,7 @@ public class Tar {
 
     // 路径中最后一个 '/' 或 '\' 的下标；没有时为 -1。
     public static int LastSlash(string path) {
-        int last = 0 - 1;
+        int last = -1;
         for (int i = 0; i < path.Length; i = i + 1) {
             int c = path[i] & 255;
             if (c == 47 || c == 92) { last = i; }

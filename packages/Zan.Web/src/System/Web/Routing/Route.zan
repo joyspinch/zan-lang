@@ -11,7 +11,10 @@ public class Route {
     // 逐段预提取的参数名（若为 "{id}" 则存 "id"，静态段存 ""，避免运行时重复 Substring）
     private List<string> paramNames;
     private HttpHandler handler;
+    private SyncHttpHandler syncHandler;
+    private SyncHttpAction syncAction;
     private string key;
+    private string policyKey;
     private string action;  // "Controller.Method" -- for docs / menu / diagnostics
 
     // 正则路由属性
@@ -44,16 +47,32 @@ public class Route {
         this.pattern = pattern;
         this.segs = Router.SplitPath(pattern);
         this.paramNames = new List<string>();
+        bool hasTypeHint = false;
         for (int si = 0; si < this.segs.Count; si = si + 1) {
             string sp = this.segs[si];
-            if (sp.Length > 2 && (sp[0] & 255) == 123 && (sp[sp.Length - 1] & 255) == 125) {
-                this.paramNames.Add(sp.Substring(1, sp.Length - 2));
+            if (sp.Length > 2 && sp[0] == '{' && sp[sp.Length - 1] == '}') {
+                int colon = sp.IndexOf(":");
+                int end = colon > 1 ? colon : sp.Length - 1;
+                this.paramNames.Add(sp.Substring(1, end - 1));
+                hasTypeHint = hasTypeHint || colon > 1;
             } else {
                 this.paramNames.Add("");
             }
         }
+        if (hasTypeHint) {
+            // OpenAPI path placeholders and the matching parameter names must agree.
+            StringBuilder path = new StringBuilder();
+            for (int i = 0; i < this.segs.Count; i = i + 1) {
+                string name = this.paramNames[i];
+                path.Append("/" + (name.Length > 0 ? "{" + name + "}" : this.segs[i]));
+            }
+            this.pattern = path.ToString();
+        }
         this.handler = handler;
-        this.key = method + " " + pattern;
+        this.syncHandler = null;
+        this.syncAction = null;
+        this.key = method + " " + this.pattern;
+        this.policyKey = this.key;
         this.action = "";
         this.title = "";
         this.rateLimit = 0;
@@ -78,7 +97,10 @@ public class Route {
         this.segs = new List<string>();
         this.paramNames = new List<string>();
         this.handler = handler;
+        this.syncHandler = null;
+        this.syncAction = null;
         this.key = method + " " + pattern;
+        this.policyKey = this.key;
         this.action = "";
         this.title = "";
         this.rateLimit = 0;
@@ -103,6 +125,10 @@ public class Route {
 
     // 动作名（"Controller.Method"，文档/菜单/诊断用）。
     public Route Named(string action) { this.action = action; return this; }
+    // 可选同步请求处理器快路径。
+    public Route Sync(SyncHttpHandler handler) { this.syncHandler = handler; return this; }
+    // 纯同步路由动作快路径（零协程帧分配）。
+    public Route SyncAction(SyncHttpAction handler) { this.syncAction = handler; return this; }
     // 标题（菜单文案 / 文档 summary）。
     public Route Title(string title) { this.title = title; return this; }
     // 每秒限流上限；0 不限流。
@@ -131,7 +157,19 @@ public class Route {
     public Route Param(string name, string type, bool required, string def, string desc,
                 string source) {
         for (int i = 0; i < this.docParams.Count; i = i + 1) {
-            if (this.docParams[i].Name() == name) { return this; }
+            ApiParam existing = this.docParams[i];
+            if (existing.Name() != name) { continue; }
+            if (source == "path") {
+                string pathType = type.Length > 0 ? type : existing.Type();
+                if (pathType == "double") { pathType = "number"; }
+                string description = desc.Length > 0 ? desc : existing.Desc();
+                this.docParams[i] = new ApiParam(name, pathType, true, "", description, "path");
+            }
+            return this;
+        }
+        if (source == "path") {
+            if (type.Length == 0) { type = "string"; }
+            else if (type == "double") { type = "number"; }
         }
         this.docParams.Add(new ApiParam(name, type, required, def, desc, source));
         return this;
@@ -139,14 +177,17 @@ public class Route {
     // 读自由属性；缺失返回空串。
     public string MetaGet(string key) { return this.meta.Get(key); }
 
-    // 预计算的 "METHOD pattern"（每请求统计/锁键）。
-    public string Key() { return this.key; }
+    // 别名沿用主路由的限流和请求锁键，访问统计仍按各自路径记录。
+    public void SharePolicyKey(Route primary) { this.policyKey = primary.Key(); }
+    public string Key() { return this.policyKey; }
 
     public string Method() { return this.method; }
     public string Pattern() { return this.pattern; }
     public List<string> Segs() { return this.segs; }
     public List<string> ParamNames() { return this.paramNames; }
     public HttpHandler Handler() { return this.handler; }
+    public SyncHttpHandler SyncHandler() { return this.syncHandler; }
+    public SyncHttpAction SyncActionHandler() { return this.syncAction; }
     public string Action() { return this.action; }
     public bool IsRegex() { return this.isRegex; }
     public Regex Regex() { return this.regex; }

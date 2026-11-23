@@ -1,0 +1,81 @@
+using System;
+using System.Diagnostics;
+using System.Json;
+using System.Runtime.InteropServices;
+
+namespace System.Web;
+
+// Per-worker bounded history. The request path publishes one frozen record.
+public class RequestProfiler {
+    [DllImport("crt", EntryPoint = "zan_task_profile_process_start_unix_ms")]
+    private static extern long ReadProcessStart();
+
+    private RequestTrace[] records;
+    private long sequence;
+    private int cursor;
+    private int count;
+    private long completed;
+    private int pid = Environment.ProcessId;
+    private long processStartUnixMs;
+    private long unixMs;
+    private long monoUs;
+
+    public RequestProfiler(int capacity) {
+        if (capacity < 1 || capacity > 100000) {
+            throw new ArgumentException("Request profiler capacity must be between 1 and 100000");
+        }
+        this.records = new RequestTrace[capacity];
+        this.processStartUnixMs = RequestProfiler.ReadProcessStart();
+        this.monoUs = Stopwatch.GetMicroseconds();
+        this.unixMs = DateTime.UtcNow().ToUnixMilliseconds();
+    }
+
+    internal RequestTrace Start(string protocol, long startUs, RequestDiagnosticsHandler diagnostics = null) {
+        long id = 0;
+        lock (this.records) {
+            this.sequence = this.sequence + 1;
+            id = this.sequence;
+        }
+        return new RequestTrace(this, diagnostics, id, protocol, startUs);
+    }
+
+    internal void Record(RequestTrace trace) {
+        lock (this.records) {
+            this.records[this.cursor] = trace;
+            this.cursor = (this.cursor + 1) % this.records.Length;
+            if (this.count < this.records.Length) { this.count = this.count + 1; }
+            this.completed = this.completed + 1;
+        }
+    }
+
+    // Limit export work independently of the retention size. Page backwards by
+    // completion sequence, because concurrent requests can finish out of ID order.
+    public string SnapshotJson(int limit = 100, long before = 0) {
+        int maxRows = limit < 1 ? 1 : (limit > 1000 ? 1000 : limit);
+        RequestTrace[] rows = new RequestTrace[maxRows];
+        int length = 0;
+        long latest = 0;
+        long oldest = 0;
+        long next = 0;
+        lock (this.records) {
+            latest = this.completed;
+            oldest = latest - this.count + 1;
+            long last = before > 0 && before <= latest ? before - 1 : latest;
+            for (long n = last; n >= oldest && length < maxRows; n = n - 1) {
+                rows[length] = this.records[(int)((n - 1) % this.records.Length)];
+                length = length + 1;
+                next = n;
+            }
+            if (next <= oldest) { next = 0; }
+        }
+        JsonWriter writer = new JsonWriter();
+        writer.WriteStartObject().WriteProperty("pid", this.pid)
+        .WriteProperty("process_start_unix_ms", this.processStartUnixMs).WriteProperty("clock_unix_ms", this.unixMs)
+        .WriteProperty("clock_mono_us", this.monoUs).WriteProperty("completed", latest)
+        .WriteProperty("overwritten", oldest - 1).WriteProperty("next_before", next)
+        .WritePropertyName("requests").WriteStartArray();
+        for (int i = 0; i < length; i = i + 1) { rows[i].WriteJson(writer); }
+        writer.WriteEndArray().WriteEndObject();
+        return writer.ToString();
+    }
+}

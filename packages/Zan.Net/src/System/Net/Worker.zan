@@ -92,21 +92,48 @@ public partial class Worker {
     private static string logDir = "logs";
     private static string logPattern = "{yyyy}{MM}/{dd}.log";
 
-    // 本进程累计服务的请求/消息数（workerman 风格 `status` 统计）。
-    private static AtomicInt statRequests = new AtomicInt(0);
+    // 本进程累计服务的请求/消息数（workerman 风格 `status` 统计），16 分片消除多核原子争用。
+    private static AtomicInt[] statRequestsShards = Worker.MakeStatShards();
+    private static AtomicInt[] statSentShards = Worker.MakeStatShards();
+
+    private static AtomicInt[] MakeStatShards() {
+        AtomicInt[] arr = new AtomicInt[16];
+        for (int i = 0; i < 16; i = i + 1) {
+            arr[i] = new AtomicInt(0);
+        }
+        return arr;
+    }
+
+    private static int StatShardIndex() {
+        long tid = Thread.CurrentId();
+        long h = (tid ^ (tid >> 4) ^ (tid >> 8)) * 2654435761L;
+        return (int)(h & 15);
+    }
 
     // 静态上下文里的计数自增；实例 async 方法中直接自增会被按值捕获而丢失。
     public static void BumpStat() {
-        long _r = statRequests.Increment();
+        long _r = statRequestsShards[Worker.StatShardIndex()].Increment();
     }
-
-    // 当前工作进程向对端成功写回的数据报文/帧统计数。
-    // 本进程累计发回对端的消息/帧/数据报数。
-    private static AtomicInt statSent = new AtomicInt(0);
 
     // 发送计数自增（同 BumpStat 的静态上下文约束）。
     public static void BumpSent() {
-        long _s = statSent.Increment();
+        long _s = statSentShards[Worker.StatShardIndex()].Increment();
+    }
+
+    public static long TotalRequests() {
+        long total = 0;
+        for (int i = 0; i < 16; i = i + 1) {
+            total = total + statRequestsShards[i].Load();
+        }
+        return total;
+    }
+
+    public static long TotalSent() {
+        long total = 0;
+        for (int i = 0; i < 16; i = i + 1) {
+            total = total + statSentShards[i].Load();
+        }
+        return total;
     }
 
     // 当前工作进程中维护的活跃客户端连接总数。

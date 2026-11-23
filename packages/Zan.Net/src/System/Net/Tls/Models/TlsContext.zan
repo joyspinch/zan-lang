@@ -7,6 +7,7 @@ public class TlsContext {
     public string error;
     public bool verify;
     public bool disableTls13;
+    public bool requireClientCert;
     public string certFile;
     public string keyFile;
     public string trust;
@@ -14,6 +15,7 @@ public class TlsContext {
     public bool pinRequired;
     public CertPolicyFn certPolicy;
     public List<X509Certificate> trustedCerts;
+    public List<X509Certificate> clientTrustedCerts;
     public List<X509Certificate> cachedChain;
     public X509Certificate cachedCert;
     public RsaKey cachedKey;
@@ -31,6 +33,7 @@ public class TlsContext {
         this.error = "";
         this.verify = true;
         this.disableTls13 = false;
+        this.requireClientCert = false;
         this.certFile = null;
         this.keyFile = null;
         this.trust = "";
@@ -38,6 +41,7 @@ public class TlsContext {
         this.pinRequired = false;
         this.certPolicy = null;
         this.trustedCerts = null;
+        this.clientTrustedCerts = null;
         this.cachedChain = null;
         this.cachedCert = null;
         this.cachedKey = null;
@@ -47,6 +51,14 @@ public class TlsContext {
 
     // 完整解析证书包后再替换信任列表，防止不完整输入破坏信任链。
     public static List<X509Certificate> ParseTrustBundle(string pem, bool strict) {
+        return TlsContext.ParseTrustBundleWithRole(pem, strict, false);
+    }
+
+    public static List<X509Certificate> ParseClientTrustBundle(string pem, bool strict) {
+        return TlsContext.ParseTrustBundleWithRole(pem, strict, true);
+    }
+
+    private static List<X509Certificate> ParseTrustBundleWithRole(string pem, bool strict, bool allowClientAuthCa) {
         if (pem == null || pem.Length == 0 || pem.Length > MAX_TRUST_BUNDLE_BYTES) { return null; }
         List<X509Certificate> certs = new List<X509Certificate>();
         int pos = 0;
@@ -65,7 +77,9 @@ public class TlsContext {
             int next = end + PEM_END.Length;
             // 精确匹配证书 PEM 标头，忽略无关的密钥或公钥块。
             X509Certificate cert = X509Certificate.FromPem(pem.Substring(begin, next - begin));
-            if (cert != null && cert.CanSignCertificates()) { certs.Add(cert); }
+            bool caAllowed = cert != null
+                && (cert.CanSignCertificates() || (allowClientAuthCa && cert.CanSignClientCertificates()));
+            if (caAllowed) { certs.Add(cert); }
             else if (strict) { return null; }
             pos = next;
         }
@@ -73,13 +87,17 @@ public class TlsContext {
     }
 
     public static List<X509Certificate> ReadTrustBundle(string path, bool strict) {
+        return TlsContext.ReadTrustBundleWithRole(path, strict, false);
+    }
+
+    private static List<X509Certificate> ReadTrustBundleWithRole(string path, bool strict, bool allowClientAuthCa) {
         if (path == null || !File.Exists(path)) { return null; }
         try {
             int size = File.GetSize(path);
             if (size < 1 || size > MAX_TRUST_BUNDLE_BYTES) { return null; }
             byte[] raw = File.ReadBytes(path, 0, size + 1);
             if (raw == null || raw.Length != size) { return null; }
-            return TlsContext.ParseTrustBundle(raw.ToStr(0, raw.Length), strict);
+            return TlsContext.ParseTrustBundleWithRole(raw.ToStr(0, raw.Length), strict, allowClientAuthCa);
         } catch (Exception e) {
             return null;
         }
@@ -142,6 +160,24 @@ public class TlsContext {
         if (this.trustedCerts == null) { this.trustedCerts = new List<X509Certificate>(); }
         for (int i = 0; i < certs.Count; i = i + 1) { this.trustedCerts.Add(certs[i]); }
         return true;
+    }
+
+    public bool AddClientTrustedCert(string pemFile) {
+        List<X509Certificate> certs = TlsContext.ReadTrustBundleWithRole(pemFile, true, true);
+        if (certs == null) { return false; }
+        if (this.clientTrustedCerts == null) { this.clientTrustedCerts = new List<X509Certificate>(); }
+        for (int i = 0; i < certs.Count; i = i + 1) { this.clientTrustedCerts.Add(certs[i]); }
+        return true;
+    }
+
+    public bool RequireClientCertificate(string caPemFile) {
+        if (!this.AddClientTrustedCert(caPemFile)) { return false; }
+        this.requireClientCert = true;
+        return true;
+    }
+
+    public void RequireClientCertificate() {
+        this.requireClientCert = true;
     }
 
     public static List<X509Certificate> SystemTrustRoots() {
@@ -229,9 +265,47 @@ public class TlsContext {
         return c;
     }
 
-    // Reserved API: this engine does not implement TLS client authentication.
+    // 校验并加载客户端 PEM 证书链与私钥；任一条件不满足则抛出 ArgumentException（闭锁）。
+    public static void LoadClientCredentials(TlsContext target, string certFile, string keyFile) {
+        if (certFile == null || certFile.Length == 0 || !File.Exists(certFile)) {
+            throw new ArgumentException("TLS client certificate file not found: " + (certFile == null ? "" : certFile));
+        }
+        if (keyFile == null || keyFile.Length == 0 || !File.Exists(keyFile)) {
+            throw new ArgumentException("TLS client private key file not found: " + (keyFile == null ? "" : keyFile));
+        }
+        List<X509Certificate> chain = TlsContext.ReadCertChainFile(certFile);
+        if (chain == null || chain.Count == 0) {
+            throw new ArgumentException("TLS client certificate PEM is invalid or empty");
+        }
+        X509Certificate leaf = chain[0];
+        if (leaf == null || !leaf.ValidNow() || !leaf.CanAuthClient()) {
+            throw new ArgumentException("TLS client certificate is expired or not allowed for clientAuth");
+        }
+        int keySize = File.GetSize(keyFile);
+        if (keySize < 1 || keySize > MAX_TRUST_CERT_BYTES) {
+            throw new ArgumentException("TLS client private key file size is invalid");
+        }
+        string privKeyPem = File.ReadAllText(keyFile);
+        RsaKey rsa = RsaKey.FromPrivatePem(privKeyPem);
+        EcKey ec = rsa == null ? EcKey.FromPrivatePem(privKeyPem) : null;
+        if (!leaf.PublicKeyMatches(rsa, ec)) {
+            throw new ArgumentException("TLS client private key is invalid or does not match certificate");
+        }
+        if (target != null) {
+            target.certFile = certFile;
+            target.keyFile = keyFile;
+            target.cachedChain = chain;
+            target.cachedCert = leaf;
+            target.cachedKey = rsa;
+            target.cachedEcKey = ec;
+        }
+    }
+
+    // 创建带客户端证书（mTLS）的客户端 TLS 上下文；校验失败立即抛异常闭锁。
     public static TlsContext CreateClientWithCertificate(string certFile, string keyFile) {
-        throw new NotSupportedException("TLS client certificate authentication is not implemented");
+        TlsContext c = TlsContext.CreateClient();
+        TlsContext.LoadClientCredentials(c, certFile, keyFile);
+        return c;
     }
 
     // 禁用对端证书与主机名校验（仅用于本地自签名开发调试）。

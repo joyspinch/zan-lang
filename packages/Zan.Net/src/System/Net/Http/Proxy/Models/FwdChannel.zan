@@ -13,7 +13,7 @@ public class FwdChannel : IDisposable {
     // 通道创建时注入，避免读进程级全局导致的实例间串扰。
     public int idleMs;
 
-    // 构造：用 <see cref="OfSocket"/> / <see cref="OfTls"/> 创建。
+    // 构造：用 OfSocket / OfTls 创建。
     public FwdChannel(nint sock, TlsStream tls, TlsContext ctx, int idleMs) {
         this.sock = sock;
         this.tls = tls;
@@ -38,10 +38,7 @@ public class FwdChannel : IDisposable {
         if (this.tls != null) {
             return await this.tls.RecvAsync(max);
         }
-        // 空闲截止：对端迟迟不发数据时让出连接，而不是永久占用
-        // 协程 + 套接字（慢速客户端 / 卡死的上游正是这样拖死
-        // 转发器的——类文档一直声称有这个行为）。TLS 侧待运行时
-        // 提供带截止的解密接收后同样接入。
+        // 明文路径按 idleMs 应用空闲截止（TLS 路径待带截止解密接口接入）。
         int idle = this.idleMs;
         if (idle > 0) {
             return await Socket.RecvAsync(this.sock, max, idle);
@@ -125,12 +122,7 @@ public class FwdChannel : IDisposable {
         }
         if (this.sock >= 0) {
             #if WINDOWS
-            // 隧道两端是两个方向泵共享的 fd：一个方向读到 EOF 退出时
-            // 会顺手关掉对端还挂着的套接字，而 Windows 的 closesocket
-            // 不给挂起的重叠 recv 投递完成包，兄弟泵就永远停在 await
-            // 上导致整条链路被记为仍可达。
-            // 先 CancelIoEx 让挂起者以 0 字节复位再关——与
-            // TcpListener.Stop / TcpClient.Close 同一模式。
+            // 先 shutdown 唤醒挂起的兄弟 recv 协程再 Close，避免句柄直接关闭导致无限挂起。
             Socket.ShutdownBoth(this.sock);
             #endif
             Socket.Close(this.sock);
@@ -151,18 +143,12 @@ public class FwdChannel : IDisposable {
         return this.closed;
     }
 
-    // 调整空闲截止（毫秒；0 = 不设截止）。隧道在
-    // <see cref="Tunnel"/> 入口把两条链路都切到 0。
+    // 调整空闲截止（毫秒；0 = 不设截止；隧道入口会置 0）。
     public void SetIdleMs(int ms) {
         this.idleMs = ms;
     }
 
-    // 半关闭：只对套接字做双向 shutdown，不释放描述符。
-    // 隧道的对端方向泵可能还挂在本链路的读上——直接 Close 会把
-    // 它脚下的 fd 抽掉（Windows 上 select 对已关闭的句柄不再报
-    // 可读，轮询式接收从此永远等不到任何事件）；shutdown 让
-    // 对端下一轮探测立即看到可读、recv 返回 0（EOF 语义）正常
-    // 退出，由它在自己的退出路径里做完整的 Close。
+    // 半关闭（只做双向 shutdown 不释放描述符），让对端读协程收到 EOF 后自行走 Close 退出。
     public void Shutdown() {
         if (this.closed) { return; }
         if (this.sock >= 0) {

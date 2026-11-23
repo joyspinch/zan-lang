@@ -18,7 +18,7 @@ public partial class HttpClient {
         int sl = s.Length;
         int fl = suf.Length;
         if (sl < fl) { return false; }
-        return HttpClient.AsciiNameEquals(s.Substring(sl - fl, fl), suf, fl);
+        return HttpClient.AsciiNameEqualsAt(s, sl - fl, suf, fl);
     }
 
     // multipart 的 name/filename 原样进入 Content-Disposition 的引号内：
@@ -77,7 +77,7 @@ public partial class HttpClient {
         for (int i = 0; i + nl <= n; i = i + 1) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
                 && i + nl < n && (head[i + nl] & 255) == 58
-                && HttpClient.AsciiNameEquals(head.Substring(i, nl), lowerName, nl)) {
+                && HttpClient.AsciiNameEqualsAt(head, i, lowerName, nl)) {
                 int j = i + nl;
                 while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
                     j = j + 1;
@@ -100,7 +100,7 @@ public partial class HttpClient {
         for (int i = 0; i + nl <= n; i = i + 1) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
                 && i + nl < n && (head[i + nl] & 255) == 58
-                && HttpClient.AsciiNameEquals(head.Substring(i, nl), lowerName, nl)) {
+                && HttpClient.AsciiNameEqualsAt(head, i, lowerName, nl)) {
                 int j = i + nl;
                 while (j < n && ((head[j] & 255) == 32 || (head[j] & 255) == 58)) {
                     j = j + 1;
@@ -134,14 +134,14 @@ public partial class HttpClient {
         int i = 0;
         while (i + kl <= n) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
-                && HttpClient.AsciiNameEquals(head.Substring(i, kl), key, kl)) {
+                && HttpClient.AsciiNameEqualsAt(head, i, key, kl)) {
                 idx = i;
                 break;
             }
             i = i + 1;
         }
         if (idx < 0) { return 0; }
-        int slash = HttpClient.IndexOf(head, "/", idx);
+        int slash = head.IndexOf("/", idx);
         if (slash < 0) { return 0; }
         long v = 0;
         bool any = false;
@@ -292,16 +292,9 @@ public partial class HttpClient {
         this.SetDownloadError("");
         int bodyLimit = 0;
         if (this.callPolicy != null) { bodyLimit = this.callPolicy.MaxBodyBytes(); }
-        if (this.callPolicy != null) {
-            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
-                this.port, this.useTls,
-                this.callPolicy.AllowsLoopback(),
-                this.callPolicy.AllowsHttp(),
-                this.callPolicy.LocalHttpOnly());
-            if (!targetOk) {
-                this.SetDownloadError("external target is not allowed");
-                return 0 - 1;
-            }
+        if (!this.IsTargetPolicyAllowed()) {
+            this.SetDownloadError("external target is not allowed");
+            return 0 - 1;
         }
         int have = 0;
         nint probe = fopen(localPath, "rb");
@@ -328,9 +321,7 @@ public partial class HttpClient {
         TlsStream stream = channel.tls;
 
         HttpDeadlineToken watch = HttpDeadline.Arm(conn.Sock(), this.WriteBudget(), this.TotalBudget());
-        int sent = 0;
-        if (this.useTls) { sent = await stream.SendAsync(req, req.Length); }
-        else { sent = await conn.SendAsync(req); }
+        int sent = await this.WriteTextRequest(channel, req);
         if (sent != req.Length) {
             this.SetDownloadError("下载请求发送失败");
             HttpDeadline.Disarm(watch);
@@ -339,32 +330,18 @@ public partial class HttpClient {
         }
         HttpDeadline.Touch(watch, this.ReadBudget());
 
-        string head = "";
-        int hb = 0 - 1;
-        while (hb < 0 && head.Length < 262144) {
-            string c;
-            if (this.useTls) { c = await stream.RecvAsync(65536); }
-            else { c = await conn.RecvAsync(65536); }
-            if (c.Length == 0) { break; }
-            int scanFrom = head.Length - 3;
-            if (scanFrom < 0) { scanFrom = 0; }
-            head = head + c;
-            hb = HttpClient.IndexOf(head, "\r\n\r\n", scanFrom);
-            HttpDeadline.Touch(watch, this.IdleBudget());
-        }
-
-        if (hb < 0) {
+        string[] headParts = await this.ReadStreamingHeadAsync(channel, watch);
+        if (headParts == null) {
             this.SetDownloadError("响应头不完整");
             HttpDeadline.Disarm(watch);
             channel.Dispose();
             return 0 - 1;
         }
 
-        string headOnly = head.Substring(0, hb);
+        string headOnly = headParts[0];
         int status = HttpClient.HeadStatus(headOnly);
         bool chunked = HttpClient.HeadIsChunked(headOnly);
-        string pending = head.Substring(hb + 4, head.Length - hb - 4);
-        head = "";
+        string pending = headParts[1];
 
         if (status == 416) {
             bool complete = HttpClient.RangeAlreadyComplete(headOnly, (long)have);
@@ -475,7 +452,7 @@ public partial class HttpClient {
                 bool progressed = true;
                 while (progressed) {
                     progressed = false;
-                    int crlf = HttpClient.IndexOf(pending, "\r\n", 0);
+                    int crlf = pending.IndexOf("\r\n", 0);
                     if (crlf >= 0) {
                         int size = HttpClient.ParseHex(pending.Substring(0, crlf));
                         if (size < 0) {
@@ -591,16 +568,9 @@ public partial class HttpClient {
         this.SetDownloadError("");
         long bodyLimit = 0;
         if (this.callPolicy != null) { bodyLimit = (long)this.callPolicy.MaxBodyBytes(); }
-        if (this.callPolicy != null) {
-            bool targetOk = ExternalTargetPolicy.IsClientAllowed(this.host,
-                this.port, this.useTls,
-                this.callPolicy.AllowsLoopback(),
-                this.callPolicy.AllowsHttp(),
-                this.callPolicy.LocalHttpOnly());
-            if (!targetOk) {
-                this.SetDownloadError("external target is not allowed");
-                return 0 - 1;
-            }
+        if (!this.IsTargetPolicyAllowed()) {
+            this.SetDownloadError("external target is not allowed");
+            return 0 - 1;
         }
         long have = 0;
         if (File.Exists(localPath)) {
@@ -631,9 +601,7 @@ public partial class HttpClient {
             channel.Dispose();
             return 0 - 1;
         }
-        int sentReq = 0;
-        if (this.useTls) { sentReq = await stream.SendAsync(req, req.Length); }
-        else { sentReq = await conn.SendAsync(req); }
+        int sentReq = await this.WriteTextRequest(channel, req);
         if (sentReq != req.Length) {
             this.SetDownloadError("下载请求发送失败");
             HttpDeadline.Disarm(watch);
@@ -878,8 +846,13 @@ public partial class HttpClient {
     // 分配一个可写的 ARC 托管字节缓冲区（内容为空格）。
     // 原始 calloc 块不带字符串引用计数头，交给 ARC 会出错。
     private static string NewBuffer(int size) {
+        if (size <= 0) { return ""; }
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < size; i = i + 1) { sb.Append(" "); }
+        string chunk64 = "                                                                ";
+        int full = size / 64;
+        for (int i = 0; i < full; i = i + 1) { sb.Append(chunk64); }
+        int rem = size % 64;
+        if (rem > 0) { sb.Append(chunk64.Substring(0, rem)); }
         return sb.ToString();
     }
 }

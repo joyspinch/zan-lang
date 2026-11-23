@@ -1,0 +1,66 @@
+using System;
+
+namespace System.Json;
+
+// Read-only lookup for one object in an existing tape. The document owns the key bytes.
+public class JsonObjectIndex {
+    private const int MaxProbes = 32;
+    private JsonDoc doc;
+    private int objectSlot;
+    private long[] buckets;
+
+    internal JsonObjectIndex(JsonDoc doc, int at) {
+        this.doc = doc;
+        this.objectSlot = at;
+        int count = doc.Count(at);
+        if (count <= 8 || count > 536870912) { return; }
+        int capacity = 16;
+        while (capacity / 2 < count) { capacity = capacity * 2; }
+        long[] table = new long[capacity];
+        for (int p = doc.FirstProperty(at); p >= 0; p = doc.NextProperty(p)) {
+            StringView key = doc.PropertyNameView(p);
+            int hash = JsonObjectIndex.HashKey(key);
+            int bucket = this.FindBucket(table, key, hash);
+            // A long collision chain abandons the index and keeps ordinary lookup.
+            if (bucket < 0) { return; }
+            if (table[bucket] == 0L) {
+                table[bucket] = ((long)hash << 32) | (long)(p + 1);
+            }
+        }
+        this.buckets = table;
+    }
+
+    // Return the first matching value slot, or -1 for a missing key.
+    public int Get(string key) {
+        if (key == null || this.doc.slots == null) { return -1; }
+        long[] table = this.buckets;
+        if (table == null) { return this.doc.Get(this.objectSlot, key); }
+        StringView view = StringView.FromString(key);
+        int bucket = this.FindBucket(table, view, JsonObjectIndex.HashKey(view));
+        if (bucket < 0 || table[bucket] == 0L) { return -1; }
+        return this.doc.PropertyValue((int)table[bucket] - 1);
+    }
+
+    private int FindBucket(long[] table, StringView key, int hash) {
+        int mask = table.Length - 1;
+        int bucket = hash & mask;
+        for (int i = 0; i < JsonObjectIndex.MaxProbes; i = i + 1) {
+            long entry = table[bucket];
+            if (entry == 0L) { return bucket; }
+            if ((int)(entry >> 32) == hash && this.doc.PropertyNameView((int)entry - 1).Equals(key)) {
+                return bucket;
+            }
+            bucket = (bucket + 1) & mask;
+        }
+        return -1;
+    }
+
+    private static int HashKey(StringView key) {
+        int hash = -2128831035;
+        Span<byte> bytes = new Span<byte>(key.ptr, key.Length);
+        for (int i = 0; i < bytes.Length; i = i + 1) {
+            hash = (hash ^ (int)bytes[i]) * 16777619;
+        }
+        return hash ^ (hash >>> 16);
+    }
+}

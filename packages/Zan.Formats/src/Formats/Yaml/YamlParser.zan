@@ -39,57 +39,40 @@ public class YamlParser {
     }
 
     void SplitLines(string src) {
-        StringBuilder sb = new StringBuilder();
         int lineNo = 1;
+        int lineStart = 0;
         int i = 0;
         int n = src.Length;
         while (i <= n) {
             int c = i < n ? (src[i] & 255) : 10;
-            if (c == 13) {  // \r\n 或孤立 \r 都算换行
-                PushLine(sb, lineNo);
-                sb = new StringBuilder();
+            if (c == 13 || c == 10) {
+                PushLineSlice(src, lineStart, i, lineNo);
                 lineNo = lineNo + 1;
                 i = i + 1;
-                if (i < n && (src[i] & 255) == 10) { i = i + 1; }
-            } else if (c == 10) {
-                PushLine(sb, lineNo);
-                sb = new StringBuilder();
-                lineNo = lineNo + 1;
-                i = i + 1;
+                if (c == 13 && i < n && (src[i] & 255) == 10) { i = i + 1; }
+                lineStart = i;
             } else {
-                sb.Append(src.Substring(i, 1));
                 i = i + 1;
             }
         }
         lineCount = lines.Count;
     }
 
-    void PushLine(StringBuilder sb, int lineNo) {
-        string t = sb.ToString();
-        int ind = 0;
-        int m = t.Length;
-        while (ind < m && (t[ind] & 255) == 32) { ind = ind + 1; }
+    void PushLineSlice(string src, int lineStart, int lineEnd, int lineNo) {
+        int ind = lineStart;
+        while (ind < lineEnd && (src[ind] & 255) == 32) { ind = ind + 1; }
         bool blank = true;
         int k = ind;
-        while (k < m) {
-            int c = t[k] & 255;
-            if (c != 32 && c != 9) { blank = false; k = m; }
-            else { k = k + 1; }
+        while (k < lineEnd) {
+            int c = src[k] & 255;
+            if (c != 32 && c != 9) { blank = false; break; }
+            k = k + 1;
         }
-        if ((ind < m && (t[ind] & 255) == 9) && !blank) {
-            // 制表符出现在内容行缩进区：YAML 禁止，明确报错。
-            bool onlyTabsIndent = true;
-            int j = 0;
-            while (j < ind) {
-                if ((t[j] & 255) != 9) { onlyTabsIndent = false; j = m; }
-                else { j = j + 1; }
-            }
-            if (onlyTabsIndent) {
-                throw new YamlException("tab indentation is not allowed (line "
-                    + Convert.ToString(lineNo) + ")");
-            }
+        if (ind < lineEnd && (src[ind] & 255) == 9 && !blank) {
+            throw new YamlException("tab indentation is not allowed (line "
+                + Convert.ToString(lineNo) + ")");
         }
-        lines.Add(new YamlLine(ind, t.Substring(ind, m - ind), lineNo));
+        lines.Add(new YamlLine(ind - lineStart, src.Substring(ind, lineEnd - ind), lineNo));
     }
 
     // 前导：指令行（%）、注释、空行，以及一个 --- 起始符（带内联
@@ -561,38 +544,50 @@ public class YamlParser {
         if (c == 34) {  // 双引
             StringBuilder sb = new StringBuilder();
             at = at + 1;
+            int chunkStart = at;
             int n = s.Length;
             while (at < n) {
                 int ch = s[at] & 255;
                 if (ch == 92) {
+                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
                     at = at + 1;
                     ReadEscape(s, ref at, sb);
+                    chunkStart = at;
                     continue;
                 }
-                if (ch == 34) { at = at + 1; break; }
-                sb.Append(s.Substring(at, 1));
+                if (ch == 34) {
+                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
+                    at = at + 1;
+                    chunkStart = at;
+                    break;
+                }
                 at = at + 1;
             }
+            if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
             return JsonValue.NewStr(sb.ToString());
         }
         if (c == 39) {  // 单引
             StringBuilder sb = new StringBuilder();
             at = at + 1;
+            int chunkStart = at;
             int n = s.Length;
             while (at < n) {
                 int ch = s[at] & 255;
                 if (ch == 39) {
+                    if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
                     if (at + 1 < n && (s[at + 1] & 255) == 39) {
                         sb.Append("'");
                         at = at + 2;
+                        chunkStart = at;
                         continue;
                     }
                     at = at + 1;
+                    chunkStart = at;
                     break;
                 }
-                sb.Append(s.Substring(at, 1));
                 at = at + 1;
             }
+            if (at > chunkStart) { sb.Append(s.Substring(chunkStart, at - chunkStart)); }
             return JsonValue.NewStr(sb.ToString());
         }
         int start = at;
@@ -683,18 +678,25 @@ public class YamlParser {
     string DecodeDoubleQuoted(string t) {
         StringBuilder sb = new StringBuilder();
         int at = 1;
+        int start = 1;
         int n = t.Length;
         while (at < n) {
             int ch = t[at] & 255;
-            if (ch == 34) { break; }
+            if (ch == 34) {
+                if (at > start) { sb.Append(t.Substring(start, at - start)); }
+                start = at;
+                break;
+            }
             if (ch == 92) {
+                if (at > start) { sb.Append(t.Substring(start, at - start)); }
                 at = at + 1;
                 ReadEscape(t, ref at, sb);
+                start = at;
                 continue;
             }
-            sb.Append(t.Substring(at, 1));
             at = at + 1;
         }
+        if (at > start) { sb.Append(t.Substring(start, at - start)); }
         return sb.ToString();
     }
 
@@ -702,20 +704,24 @@ public class YamlParser {
     string DecodeSingleQuoted(string t) {
         StringBuilder sb = new StringBuilder();
         int at = 1;
+        int start = 1;
         int n = t.Length;
         while (at < n) {
             int ch = t[at] & 255;
             if (ch == 39) {
+                if (at > start) { sb.Append(t.Substring(start, at - start)); }
                 if (at + 1 < n && (t[at + 1] & 255) == 39) {
                     sb.Append("'");
                     at = at + 2;
+                    start = at;
                     continue;
                 }
+                start = at;
                 break;
             }
-            sb.Append(t.Substring(at, 1));
             at = at + 1;
         }
+        if (at > start) { sb.Append(t.Substring(start, at - start)); }
         return sb.ToString();
     }
 

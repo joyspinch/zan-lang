@@ -6,8 +6,25 @@ namespace System.Web;
 
 public class ApiDocs {
     private static string title = "API";
+    private static string err400Code = "0004";
+    private static string err400Msg = "参数不合法";
+    private static string err401Code = "0001";
+    private static string err401Msg = "登录已过期，请重新登录";
+    private static string err403Code = "0403";
+    private static string err403Msg = "没有执行该操作的权限";
+    private static string err404Code = "0404";
+    private static string err404Msg = "对象不存在";
 
     public static void Title(string name) { ApiDocs.title = name; }
+
+    // 按 HTTP 状态码定制 OpenAPI 文档里的默认错误码与示例消息。
+    public static void ConfigureError(int status, string code, string msg) {
+        if (code == null || code.Length == 0 || msg == null) { return; }
+        if (status == 400) { ApiDocs.err400Code = code; ApiDocs.err400Msg = msg; }
+        else if (status == 401) { ApiDocs.err401Code = code; ApiDocs.err401Msg = msg; }
+        else if (status == 403) { ApiDocs.err403Code = code; ApiDocs.err403Msg = msg; }
+        else if (status == 404) { ApiDocs.err404Code = code; ApiDocs.err404Msg = msg; }
+    }
 
     public static void Mount(WebApp app, string path) {
         string p = path;
@@ -40,8 +57,8 @@ public class ApiDocs {
         ctx.Html(ApiDocs.Html());
     }
 
-    // 全程 JsonValue 树构建 + ToJson 序列化——标题/描述等文本经
-    // Encoding.JsonEscape 转义，任何路由名/参数名都毁不掉文档结构。
+    // 全程 JsonValue 树构建 + ToJson 序列化——标题/描述等文本自动转义，
+    // 任何路由名/参数名都毁不掉文档结构。
     public static string SpecJson(WebApp host) {
         JsonValue paths = JsonValue.NewObject();
 
@@ -63,7 +80,7 @@ public class ApiDocs {
             for (int k = 0; k < routes.Count; k++) {
                 Route rt = routes[k];
                 if (rt.Pattern() != pt) { continue; }
-                ops.Put(rt.Method().ToLower(), ApiDocs.Operation(rt));
+                ops.Put(rt.Method().ToLower(), ApiDocs.Operation(rt, host));
             }
             paths.Put(ApiDocs.OpenApiPath(pt), ops);
         }
@@ -83,7 +100,7 @@ public class ApiDocs {
     // 把一条路由写成一个 OpenAPI operation：summary/operationId/tags、
     // x-login/x-auth/x-menu 徽标、parameters 与 requestBody（写请求的
     // 非 path 参数归入表单体）、responses。
-    private static JsonValue Operation(Route rt) {
+    private static JsonValue Operation(Route rt, WebApp host) {
         JsonValue op = JsonValue.NewObject();
         string sum = rt.GetTitle();
         if (sum.Length == 0) { sum = rt.Action(); }
@@ -139,14 +156,29 @@ public class ApiDocs {
             }
         }
 
-        op.Put("responses", ApiDocs.Responses(rt));
+        op.Put("responses", ApiDocs.Responses(rt, host));
         return op;
     }
 
-    private static JsonValue Responses(Route rt) {
-        bool stream = rt.Pattern().IndexOf("/stream") >= 0;
-        bool json = rt.Method() != "GET" && rt.Method() != "HEAD";
-        if (rt.Pattern().Length >= 5 && rt.Pattern().Substring(0, 5) == "/api/") { json = true; }
+    private static bool IsDefaultApiPattern(string pat) {
+        string p = pat;
+        if (p == HttpLimits.DefaultApiPrefix) { return true; }
+        return p.StartsWith(HttpLimits.DefaultApiPrefix + "/");
+    }
+
+    private static JsonValue Responses(Route rt, WebApp host) {
+        string kind = rt.MetaGet("ResponseKind").ToLower();
+        bool stream = kind == "stream"
+            || (kind.Length == 0 && rt.Pattern().IndexOf("/stream") >= 0);
+        bool json = kind == "json";
+        if (kind.Length == 0 && !stream) {
+            json = rt.Method() != "GET" && rt.Method() != "HEAD";
+            if (!json) {
+                json = host != null
+                    ? host.IsApiPath(rt.Pattern())
+                    : ApiDocs.IsDefaultApiPattern(rt.Pattern());
+            }
+        }
 
         JsonValue ok = JsonValue.NewObject();
         if (stream) {
@@ -185,16 +217,16 @@ public class ApiDocs {
         JsonValue responses = JsonValue.NewObject();
         responses.Put("200", ok);
         if (json || stream) {
-            responses.Put("400", ApiDocs.ErrorResponse("参数不合法", "0004", "参数不合法"));
+            responses.Put("400", ApiDocs.ErrorResponse("参数不合法", ApiDocs.err400Code, ApiDocs.err400Msg));
         }
         if (rt.NeedsLogin() || rt.NeedsAuth()) {
-            responses.Put("401", ApiDocs.ErrorResponse("未登录或登录已过期", "0001", "登录已过期，请重新登录"));
+            responses.Put("401", ApiDocs.ErrorResponse("未登录或登录已过期", ApiDocs.err401Code, ApiDocs.err401Msg));
         }
         if (rt.NeedsLogin() || rt.NeedsAuth()) {
-            responses.Put("403", ApiDocs.ErrorResponse("没有该操作的权限", "0403", "没有执行该操作的权限"));
+            responses.Put("403", ApiDocs.ErrorResponse("没有该操作的权限", ApiDocs.err403Code, ApiDocs.err403Msg));
         }
         if (json) {
-            responses.Put("404", ApiDocs.ErrorResponse("对象不存在", "0404", "对象不存在"));
+            responses.Put("404", ApiDocs.ErrorResponse("对象不存在", ApiDocs.err404Code, ApiDocs.err404Msg));
         }
         return responses;
     }

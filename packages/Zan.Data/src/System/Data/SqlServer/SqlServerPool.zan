@@ -4,15 +4,7 @@ using System.Threading;
 
 namespace System.Data.SqlServer;
 
-// 适用于 <see cref="SqlServerConnection"/> 的协程感知连接池。
-// 与 <see cref="DbPool"/> 契约相同——惰性增长至 <c>maxSize</c>，
-// 用 <see cref="Gate"/> 驱动等待而非轮询，驱逐失效的
-// 连接——但保留类型，因此协程查询 API（<c>QueryAsync</c>、
-// <c>ExecuteAsync</c>）仍然可用。一次 TDS 登录需要多轮往返，
-// 因此应复用会话，而非每条语句都新建一个。
-// 用法：
-// pool.Release(db);
-// pool.Close();
+// 面向 SqlServerConnection 的协程化连接池（惰性增长至 maxSize，事件驱动等待，复用 TDS 会话）。
 public class SqlServerPool : IDisposable {
     string host;
     int port;
@@ -38,10 +30,7 @@ public class SqlServerPool : IDisposable {
                                                    this.password);
     }
 
-    // 借出一条连接：复用空闲连接，未达到上限则新建，
-    // 否则挂起协程直到有连接被释放。饱和等待有硬上限
-    // （见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
-    // 连接池关闭后返回 null。
+    // 借出连接：复用空闲连接或扩容新建，达上限时挂起等待直到归还或超时返回 null；池关闭返回 null。
     public async SqlServerConnection AcquireAsync() {
         PoolOpenAsync<SqlServerConnection> open = this.OpenOne;
         Predicate<SqlServerConnection> connected = SqlServerPool.IsUsable;
@@ -59,29 +48,32 @@ public class SqlServerPool : IDisposable {
             + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
-    // 将连接归还连接池。已损坏或 Close() 之后的
-    // 连接将被关闭并丢弃，而不会入池。归还时事务未收尾的连接
-    // 不直接入池：挂清理协程把残留事务 ROLLBACK 掉后再回池
-    // （A535，P2-29 的异步驱动半边；协程由调度器泵动——异步
-    // 驱动的使用方必然运行在协程环境里）。
-    public void Release(SqlServerConnection c) {
-        if (c == null) {
-            return;
-        }
+    private void Discard(SqlServerConnection c) {
+        c.Close();
+        this.core.Drop(c);
+    }
+
+    private void ReturnToPool(SqlServerConnection c) {
         if (this.core.IsClosed() || !c.IsConnected()) {
-            c.Close();
-            this.core.Drop(c);
-            return;
-        }
-        if (c.inTxn) {
-            Task.Spawn(this.Cleanup(c));
+            this.Discard(c);
             return;
         }
         if (!this.core.Pool(c)) { c.Close(); }
     }
 
-    // 清理协程体：ROLLBACK 落地后连接才回池；若回滚异常或连接失效，
-    // 说明连接协议或底层通道已损坏，立即关闭并丢弃，严禁脏连接回池。
+    // 将连接归还连接池；未收尾事务的可用连接转入异步回滚清理后再回池，损坏连接直接关闭丢弃。
+    public void Release(SqlServerConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (!this.core.IsClosed() && c.IsConnected() && c.inTxn) {
+            Task.Spawn(this.Cleanup(c));
+            return;
+        }
+        this.ReturnToPool(c);
+    }
+
+    // 异步回滚残留事务后回池；回滚失败或连接失效时直接丢弃。
     private async bool Cleanup(SqlServerConnection c) {
         bool failed = false;
         try {
@@ -90,12 +82,11 @@ public class SqlServerPool : IDisposable {
             failed = true;
         }
         c.inTxn = false;
-        if (failed || this.core.IsClosed() || !c.IsConnected()) {
-            c.Close();
-            this.core.Drop(c);
+        if (failed) {
+            this.Discard(c);
             return true;
         }
-        if (!this.core.Pool(c)) { c.Close(); }
+        this.ReturnToPool(c);
         return true;
     }
 
@@ -119,14 +110,12 @@ public class SqlServerPool : IDisposable {
         return this.core.MaxSize();
     }
 
-    // 关闭所有空闲连接并将连接池标记为已关闭。
-    // 仍被借出的连接在归还时关闭。
+    // 关闭所有空闲连接并将连接池标记为已关闭（借出连接在归还时关闭）。
     public void Close() {
         this.core.MarkClosed();
         SqlServerConnection c = this.core.TakeClosing();
         while (c != null) {
-            c.Close();
-            this.core.Drop(c);
+            this.Discard(c);
             c = this.core.TakeClosing();
         }
         this.core.WakeAll();

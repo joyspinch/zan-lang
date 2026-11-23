@@ -1,0 +1,341 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Json;
+using System.Text;
+using System.Web;
+using Zan.Web.Security;
+
+namespace Zan.Web.Core;
+
+/* 管理台外壳部件渲染委托：按当前请求租约、登录账号与布局 ViewData 动态产出 HTML 片段。 */
+public async delegate string ShellWidgetFn(IDbConnection db, string uid, ViewData d);
+
+/* 内部注册项：样式/脚本资源。 */
+class ShellAssetEntry {
+    public string url;
+    public bool deferred;
+
+    public ShellAssetEntry(string url, bool deferred) {
+        this.url = url;
+        this.deferred = deferred;
+    }
+}
+
+/* 内部注册项：按需懒加载工作区大型模块。 */
+class ShellModuleEntry {
+    public string selector;
+    public string script;
+    public string style;
+    public string tabPrefix;
+    public string tabParam;
+
+    public ShellModuleEntry(string selector, string script, string style, string tabPrefix, string tabParam) {
+        this.selector = selector;
+        this.script = script;
+        this.style = style;
+        this.tabPrefix = tabPrefix;
+        this.tabParam = tabParam;
+    }
+}
+
+/* 内部注册项：顶栏 / 悬浮动作插槽部件。 */
+class ShellWidgetEntry {
+    public string id;
+    public string html;
+    public ShellWidgetFn renderer;
+    public string permAction;
+
+    public ShellWidgetEntry(string id, string html, ShellWidgetFn renderer, string permAction) {
+        this.id = id;
+        this.html = html;
+        this.renderer = renderer;
+        this.permAction = permAction;
+    }
+}
+
+/* 管理台外壳插槽注册中心：将额外的样式、脚本、顶栏挂件与右下角悬浮挂件从
+   views/Admin/layout.html 与 AdminController.Layout() 中解耦出来，模块或应用在
+   启动期/模块初始化期按需增删，不在每个页面壳里硬编码功能开关。 */
+public class AdminShell {
+    private static List<ShellAssetEntry> styles = new List<ShellAssetEntry>();
+    private static List<ShellAssetEntry> scripts = new List<ShellAssetEntry>();
+    private static List<ShellModuleEntry> modules = new List<ShellModuleEntry>();
+    private static List<ShellWidgetEntry> topWidgets = new List<ShellWidgetEntry>();
+    private static List<ShellWidgetEntry> fabWidgets = new List<ShellWidgetEntry>();
+    private static bool defaultsReady = false;
+
+    /* 确保默认内置外壳部件只装配一次；Clear() 后不再自动回填，由调用方完全接管。 */
+    private static void EnsureDefaults() {
+        if (defaultsReady) { return; }
+        defaultsReady = true;
+        UpsertWidget(topWidgets, "admin-alert-bell", "", RenderAlertBell, "Monitor.Index");
+        UpsertWidget(fabWidgets, "admin-ai-fab", "", RenderAiFab, "");
+    }
+
+    /* 恢复默认外壳挂件与清零自定义扩展资源。 */
+    public static void ResetDefaults() {
+        styles.Clear();
+        scripts.Clear();
+        modules.Clear();
+        topWidgets.Clear();
+        fabWidgets.Clear();
+        defaultsReady = false;
+        EnsureDefaults();
+    }
+
+    /* 清空所有外壳样式、脚本与挂件（含默认告警铃铛与 AI 按钮），供全自定义外壳使用。 */
+    public static void Clear() {
+        defaultsReady = true;
+        styles.Clear();
+        scripts.Clear();
+        modules.Clear();
+        topWidgets.Clear();
+        fabWidgets.Clear();
+    }
+
+    /* 注册管理台附加样式表（仅接受站内 / 开头相对路径或 http(s):// 地址）。 */
+    public static void AddStyle(string href) {
+        EnsureDefaults();
+        string safe = SafeAssetUrl(href);
+        if (safe.Length == 0) { return; }
+        for (int i = 0; i < styles.Count; i = i + 1) {
+            if (styles[i].url == safe) { return; }
+        }
+        styles.Add(new ShellAssetEntry(safe, false));
+    }
+
+    /* 注册管理台附加脚本（默认 defer，仅接受站内 / 开头相对路径或 http(s):// 地址）。 */
+    public static void AddScript(string src, bool deferred = true) {
+        EnsureDefaults();
+        string safe = SafeAssetUrl(src);
+        if (safe.Length == 0) { return; }
+        for (int i = 0; i < scripts.Count; i = i + 1) {
+            if (scripts[i].url == safe) {
+                scripts[i].deferred = deferred;
+                return;
+            }
+        }
+        scripts.Add(new ShellAssetEntry(safe, deferred));
+    }
+
+    /* 移除已注册样式表。 */
+    public static void RemoveStyle(string href) {
+        EnsureDefaults();
+        for (int i = styles.Count - 1; i >= 0; i = i - 1) {
+            if (styles[i].url == href) { styles.RemoveAt(i); }
+        }
+    }
+
+    /* 移除已注册脚本。 */
+    public static void RemoveScript(string src) {
+        EnsureDefaults();
+        for (int i = scripts.Count - 1; i >= 0; i = i - 1) {
+            if (scripts[i].url == src) { scripts.RemoveAt(i); }
+        }
+    }
+
+    /* 注册按需懒加载的工作区大型模块：仅当页签包含匹配 selector 的元素时才按需加载
+       scriptUrl（ESM import()）与 styleUrl；可选指定多实例页签键规则 tabPrefix + tabParam。 */
+    public static void AddModule(string selector, string scriptUrl, string styleUrl = "",
+                                 string tabPrefix = "", string tabParam = "") {
+        EnsureDefaults();
+        string sel = selector != null ? selector.Trim() : "";
+        if (sel.Length == 0) { return; }
+        string safeScript = SafeAssetUrl(scriptUrl);
+        if (safeScript.Length == 0) { return; }
+        string safeStyle = SafeAssetUrl(styleUrl);
+        string prefix = tabPrefix != null ? tabPrefix.Trim() : "";
+        string param = tabParam != null ? tabParam.Trim() : "";
+        for (int i = 0; i < modules.Count; i = i + 1) {
+            if (modules[i].selector == sel) {
+                modules[i].script = safeScript;
+                modules[i].style = safeStyle;
+                modules[i].tabPrefix = prefix;
+                modules[i].tabParam = param;
+                return;
+            }
+        }
+        modules.Add(new ShellModuleEntry(sel, safeScript, safeStyle, prefix, param));
+    }
+
+    /* 移除已注册的按需懒加载模块。 */
+    public static void RemoveModule(string selector) {
+        EnsureDefaults();
+        string sel = selector != null ? selector.Trim() : "";
+        if (sel.Length == 0) { return; }
+        for (int i = modules.Count - 1; i >= 0; i = i - 1) {
+            if (modules[i].selector == sel) { modules.RemoveAt(i); }
+        }
+    }
+
+    /* 注册顶栏右侧静态 HTML 部件；同 id 覆盖，permAction 非空时按 RBAC 权限裁减。 */
+    public static void AddTopWidget(string id, string html, string permAction = "") {
+        EnsureDefaults();
+        if (html == null || html.Length == 0) { return; }
+        UpsertWidget(topWidgets, id, html, null, permAction);
+    }
+
+    /* 注册顶栏右侧动态渲染部件；同 id 覆盖。 */
+    public static void AddTopWidgetRenderer(string id, ShellWidgetFn fn, string permAction = "") {
+        EnsureDefaults();
+        if (fn == null) { return; }
+        UpsertWidget(topWidgets, id, "", fn, permAction);
+    }
+
+    /* 移除顶栏部件（如无需内置的 admin-alert-bell）。 */
+    public static void RemoveTopWidget(string id) {
+        EnsureDefaults();
+        RemoveWidget(topWidgets, id);
+    }
+
+    /* 注册右下角悬浮动作区静态 HTML 部件；同 id 覆盖。 */
+    public static void AddFabWidget(string id, string html, string permAction = "") {
+        EnsureDefaults();
+        if (html == null || html.Length == 0) { return; }
+        UpsertWidget(fabWidgets, id, html, null, permAction);
+    }
+
+    /* 注册右下角悬浮动作区动态渲染部件；同 id 覆盖。 */
+    public static void AddFabWidgetRenderer(string id, ShellWidgetFn fn, string permAction = "") {
+        EnsureDefaults();
+        if (fn == null) { return; }
+        UpsertWidget(fabWidgets, id, "", fn, permAction);
+    }
+
+    /* 移除右下角悬浮动作部件（如无需内置的 admin-ai-fab）。 */
+    public static void RemoveFabWidget(string id) {
+        EnsureDefaults();
+        RemoveWidget(fabWidgets, id);
+    }
+
+    /* 输出 <link rel="stylesheet"> 片段（注入 layout.html {{{shellStyles}}}）。 */
+    public static string RenderStyles() {
+        EnsureDefaults();
+        if (styles.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < styles.Count; i = i + 1) {
+            sb.Append("  <link rel=\"stylesheet\" href=\"");
+            sb.Append(Encoding.HtmlEncode(styles[i].url));
+            sb.Append("\">\n");
+        }
+        return sb.ToString();
+    }
+
+    /* 输出 <script src="..."> 片段（注入 layout.html {{{shellScripts}}}）。 */
+    public static string RenderScripts() {
+        EnsureDefaults();
+        if (scripts.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < scripts.Count; i = i + 1) {
+            sb.Append("  <script src=\"");
+            sb.Append(Encoding.HtmlEncode(scripts[i].url));
+            sb.Append(scripts[i].deferred ? "\" defer></script>\n" : "\"></script>\n");
+        }
+        return sb.ToString();
+    }
+
+    /* 输出 CSP 安全的按需懒加载模块清单（注入 layout.html {{{shellModules}}}，不含内联脚本）。 */
+    public static string RenderModules() {
+        EnsureDefaults();
+        if (modules.Count == 0) { return ""; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < modules.Count; i = i + 1) {
+            ShellModuleEntry m = modules[i];
+            w.WriteStartObject();
+            w.WriteProperty("selector", m.selector);
+            w.WriteProperty("script", m.script);
+            if (m.style.Length > 0) { w.WriteProperty("style", m.style); }
+            if (m.tabPrefix.Length > 0) { w.WriteProperty("tabPrefix", m.tabPrefix); }
+            if (m.tabParam.Length > 0) { w.WriteProperty("tabParam", m.tabParam); }
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        return "  <div id=\"ad-shell-modules\" data-modules=\""
+            + Encoding.HtmlEncode(w.ToJson()) + "\" hidden></div>\n";
+    }
+
+    /* 渲染当前账号可见的顶栏挂件 HTML（注入 layout.html {{{topWidgets}}}）。 */
+    public static async string RenderTopWidgets(IDbConnection db, string uid, ViewData d) {
+        EnsureDefaults();
+        return await RenderWidgets(topWidgets, db, uid, d);
+    }
+
+    /* 渲染当前账号可见的右下角悬浮挂件 HTML（注入 layout.html {{{fabWidgets}}}）。 */
+    public static async string RenderFabWidgets(IDbConnection db, string uid, ViewData d) {
+        EnsureDefaults();
+        return await RenderWidgets(fabWidgets, db, uid, d);
+    }
+
+    private static async string RenderWidgets(List<ShellWidgetEntry> list, IDbConnection db, string uid, ViewData d) {
+        if (list.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.Count; i = i + 1) {
+            ShellWidgetEntry item = list[i];
+            if (item.permAction.Length > 0) {
+                if (db == null || uid == null || uid.Length == 0) { continue; }
+                if (!await AuthUser.Allow(db, uid, item.permAction)) { continue; }
+            }
+            string piece = item.renderer != null
+                ? await item.renderer(db, uid, d)
+                : item.html;
+            if (piece != null && piece.Length > 0) {
+                sb.Append(piece);
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static void UpsertWidget(List<ShellWidgetEntry> list, string id, string html,
+                                     ShellWidgetFn fn, string permAction) {
+        string key = id != null ? id.Trim() : "";
+        string perm = permAction != null ? permAction.Trim() : "";
+        if (key.Length > 0) {
+            for (int i = 0; i < list.Count; i = i + 1) {
+                if (list[i].id == key) {
+                    list[i].html = html != null ? html : "";
+                    list[i].renderer = fn;
+                    list[i].permAction = perm;
+                    return;
+                }
+            }
+        }
+        list.Add(new ShellWidgetEntry(key, html != null ? html : "", fn, perm));
+    }
+
+    private static void RemoveWidget(List<ShellWidgetEntry> list, string id) {
+        if (id == null || id.Length == 0) { return; }
+        for (int i = list.Count - 1; i >= 0; i = i - 1) {
+            if (list[i].id == id) { list.RemoveAt(i); }
+        }
+    }
+
+    /* 仅放行 / 开头站内路径或 http(s)://，拦截 javascript:、空格换行与引号注入。 */
+    private static string SafeAssetUrl(string raw) {
+        if (raw == null) { return ""; }
+        string s = raw.Trim();
+        if (s.Length == 0) { return ""; }
+        if (s.Contains("\"") || s.Contains("'") || s.Contains("<") || s.Contains(">")
+            || s.Contains("\r") || s.Contains("\n")) {
+            return "";
+        }
+        if (s.StartsWith("/") && !s.StartsWith("//")) { return s; }
+        string low = s.ToLower();
+        if (low.StartsWith("https://") || low.StartsWith("http://")) { return s; }
+        return "";
+    }
+
+    private static async string RenderAlertBell(IDbConnection db, string uid, ViewData d) {
+        string label = Lang.T("运行告警");
+        string safeLabel = Encoding.HtmlEncode(label);
+        return "<a class=\"ad-bell\" id=\"ad-bell\" href=\"/admin/monitor/monitor\""
+            + " data-tab data-title=\"" + safeLabel + "\" title=\"" + safeLabel + "\" hidden>"
+            + "<span class=\"ad-bell-n\" hidden>0</span>" + safeLabel + "</a>\n";
+    }
+
+    private static async string RenderAiFab(IDbConnection db, string uid, ViewData d) {
+        string label = Encoding.HtmlEncode(Lang.T("AI 助手"));
+        return "<button class=\"ai-fab\" type=\"button\" data-ai-btn title=\"" + label + "\">AI</button>\n";
+    }
+}

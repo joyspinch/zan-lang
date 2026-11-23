@@ -149,117 +149,7 @@ public class MySqlSyncConnection : IDbConnection {
     }
 
     // ============================================================
-    // 认证（与异步客户端共享的纯逻辑）
-    // ============================================================
-
-    // caching_sha2_password 快速认证混淆：
-    // SHA256(pw) XOR SHA256( SHA256(SHA256(pw)) . nonce )，32 字节。
-    static byte[] scramble41(string pw, string nonce20) {
-        byte[] a = Sha256.Hash(pw, pw.Length);
-        byte[] b = Sha256.Hash(a, 32);
-        byte[] cat = new byte[53];
-        NativeMemory.Copy((nint)cat, (nint)b, 32);
-        NativeMemory.PutString((nint)cat, 32, nonce20, 20);
-        byte[] c = Sha256.Hash(cat, 52);
-        byte[] tok = new byte[33];
-        int i = 0;
-        while (i < 32) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
-        return tok;
-    }
-
-    // mysql_native_password 混淆：
-    // SHA1(pw) XOR SHA1( nonce . SHA1(SHA1(pw)) )，20 字节。
-    static byte[] scrambleNative(string pw, string nonce20) {
-        byte[] a = Sha1.Hash(pw, pw.Length);
-        byte[] b = Sha1.Hash(a, 20);
-        byte[] cat = new byte[41];
-        NativeMemory.PutString((nint)cat, 0, nonce20, 20);
-        NativeMemory.Copy((nint)cat + 20, (nint)b, 20);
-        byte[] c = Sha1.Hash(cat, 40);
-        byte[] tok = new byte[21];
-        int i = 0;
-        while (i < 20) { tok[i] = (byte)((a[i] ^ c[i]) & 255); i = i + 1; }
-        return tok;
-    }
-
-    // 按服务器要求的认证插件生成令牌：空密码返回空令牌；
-    // caching_sha2_password 走 scramble41，mysql_native_password 走
-    // scrambleNative；其他插件返回 null（outLen 置 -1）。
-    static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
-        if (pw.Length == 0) {
-            outLen[0] = 0;
-            return new byte[1];
-        }
-        if (plugin == "caching_sha2_password") {
-            outLen[0] = 32;
-            return scramble41(pw, nonce20);
-        }
-        if (plugin == "mysql_native_password") {
-            outLen[0] = 20;
-            return scrambleNative(pw, nonce20);
-        }
-        outLen[0] = -1;
-        return null;
-    }
-
-    // 取 n 字节加密随机数（RSA 全量认证的 OAEP seed）。
-    static byte[] genSeed(int n) {
-        return RandomNumberGenerator.GetBytes(n);
-    }
-
-
-    // 剥掉 PEM 头尾与换行后 base64 解码，返回服务器公钥的 DER 编码。
-    static byte[] pemToDer(string pem, int pemLen, List<int> outLen) {
-        int begin = MySqlWire.findSub(pem, pemLen, "-----BEGIN", 10, 0);
-        if (begin < 0) { return null; }
-        int hb = begin;
-        while (hb < pemLen && (pem[hb] & 255) != 10) { hb = hb + 1; }
-        hb = hb + 1;
-        int end = MySqlWire.findSub(pem, pemLen, "-----END", 8, hb);
-        if (end < 0) { end = pemLen; }
-        int blen = end - hb;
-        // PEM 正文按 64 列折行（RFC 7468 软换行）。严格 base64
-        // 解码前只剥离换行，正文中的其他字符仍保持严格校验。
-        byte[] b64 = new byte[blen + 1];
-        int o = 0;
-        for (int i = 0; i < blen; i = i + 1) {
-            int c = pem[hb + i] & 255;
-            if (c != 10 && c != 13) { b64[o] = (byte)c; o = o + 1; }
-        }
-        List<int> dl = new List<int>(); dl.Add(0);
-        byte[] der = Base64.Decode(b64.ToStr(0, o), dl);
-        outLen[0] = dl[0];
-        return der;
-    }
-
-
-    // 解析 DER 公钥中的模数 n 与指数 e，用 RSA-OAEP 加密
-    // （XOR nonce 混淆后的密码 + NUL），模数长度写入 kOut。
-    static byte[] fullAuthCipher(string der, int derLen, string obf, int obfLen, string seed, List<int> kOut) {
-        List<int> c = new List<int>(); c.Add(0);
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
-        c[0] = c[0] + 1; int algLen = MySqlWire.readDerLen(der, c); c[0] = c[0] + algLen;
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
-        c[0] = c[0] + 1;
-        c[0] = c[0] + 1; MySqlWire.readDerLen(der, c);
-        c[0] = c[0] + 1; int nLen = MySqlWire.readDerLen(der, c);
-        int origStart = c[0]; int origLen = nLen;
-        int nStart = origStart; int useLen = origLen;
-        if ((der[nStart] & 255) == 0) { nStart = nStart + 1; useLen = useLen - 1; }
-        c[0] = origStart + origLen;
-        c[0] = c[0] + 1; int eLen = MySqlWire.readDerLen(der, c);
-        int eStart = c[0];
-        byte[] nBuf = new byte[useLen + 1];
-        int i = 0; for (; i < useLen; i = i + 1) { nBuf[i] = (byte)(der[nStart + i] & 255); }
-        byte[] eBuf = new byte[eLen + 1];
-        i = 0; while (i < eLen) { eBuf[i] = (byte)(der[eStart + i] & 255); i = i + 1; }
-        byte[] cph = Rsa.EncryptOaep(obf, obfLen, nBuf, useLen, eBuf, eLen, 1, seed);
-        kOut[0] = useLen;
-        return cph;
-    }
-
-    // ============================================================
-    // 连接（同步握手 + 认证）
+    // 连接（同步握手 + 认证；认证辅助复用 MySqlConnection）
     // ============================================================
 
     // 使用 wire 协议在阻塞套接字上打开原生 MySQL/MariaDB 连接。
@@ -345,7 +235,7 @@ public class MySqlSyncConnection : IDbConnection {
         bool hasDb = db.Length > 0;
         if (hasDb) { caps2 = caps2 | 8; }
         List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
-        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
+        byte[] token = MySqlConnection.authToken(plugin, pw, nonce, tokenLenOut);
         int tokenLen = tokenLenOut[0];
         if (token == null || tokenLen < 0) {
             this.lastError = "unsupported auth plugin: " + plugin;
@@ -396,19 +286,19 @@ public class MySqlSyncConnection : IDbConnection {
                     byte[] pem = new byte[pemLen + 1];
                     i = 0; while (i < pemLen) { pem[i] = (byte)(pk[1 + i] & 255); i = i + 1; }
                     List<int> derLen = new List<int>(); derLen.Add(0);
-                    byte[] der = pemToDer(pem, pemLen, derLen);
+                    byte[] der = MySqlConnection.pemToDer(pem, pemLen, derLen);
                     if (der == null) { this.lastError = "bad RSA public key PEM"; return false; }
                     int pwLen = pw.Length;
                     int obfLen = pwLen + 1;
                     byte[] obf = new byte[obfLen + 1];
                     i = 0; while (i < obfLen) { obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255)); i = i + 1; }
-                    byte[] seed = genSeed(20);
+                    byte[] seed = RandomNumberGenerator.GetBytes(20);
                     if (seed == null) {
                         this.lastError = "secure RNG unavailable for full-auth";
                         return false;
                     }
                     List<int> kOut = new List<int>(); kOut.Add(0);
-                    byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
+                    byte[] cipher = MySqlConnection.fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
                     this.writePacket(cipher, kOut[0], this.lastSeq + 1);
                     continue;
                 }
@@ -431,7 +321,7 @@ public class MySqlSyncConnection : IDbConnection {
                     i = i + 1;
                 }
                 List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
-                byte[] switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                byte[] switchToken = MySqlConnection.authToken(switchPlugin, pw, switchNonce, switchLenOut);
                 int switchLen = switchLenOut[0];
                 if (switchToken == null || switchLen < 0) {
                     this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
@@ -562,114 +452,7 @@ public class MySqlSyncConnection : IDbConnection {
 
 
     // 按列类型解码二进制协议行值，返回其文本形式（整型带符号处理，
-    // 日期/时间/浮点按 wire 格式渲染，其余按 lenenc 字符串）。
-    // 在游标 cur[0] 处读取给定列类型的一个二进制协议整数值，
-    // 读取后推进游标，返回 long（免去格式化成字符串再反解析；无符号 BIGINT 与
-    // readBinValue 一样按 long 回绕解释）。
-    static long readBinLong(string buf, List<int> cur, int type, int flags) {
-        int p = cur[0];
-        long v = readBinLongRaw(buf, ref p, type, flags);
-        cur[0] = p;
-        return v;
-    }
-
-    static long readBinLongRaw(string buf, ref int p, int type, int flags) {
-        bool uns = (flags & 32) != 0;
-        if (type == 1) {
-            int v = buf[p] & 255; p = p + 1;
-            if (!uns && v > 127) { v = v - 256; }
-            return v;
-        }
-        if (type == 2 || type == 13) {
-            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
-            if (!uns && v > 32767) { v = v - 65536; }
-            return v;
-        }
-        if (type == 3 || type == 9) {
-            long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
-                   | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            p = p + 4;
-            if (!uns && v > 2147483647) { v = v - 4294967296; }
-            return v;
-        }
-        long w = 0;
-        for (int i = 0; i < 8; i = i + 1) { w = w | ((long)(buf[p+i]&255) << (8*i)); }
-        p = p + 8;
-        return w;
-    }
-
-    static string readBinValue(string buf, List<int> cur, int type, int flags) {
-        int p = cur[0];
-        string s = readBinValueRaw(buf, ref p, type, flags);
-        cur[0] = p;
-        return s;
-    }
-
-    static string readBinValueRaw(string buf, ref int p, int type, int flags) {
-        bool uns = (flags & 32) != 0;
-        if (type == 1) {
-            int v = buf[p] & 255; p = p + 1;
-            if (!uns && v > 127) { v = v - 256; }
-            return Convert.ToString(v);
-        }
-        if (type == 2 || type == 13) {
-            int v = (buf[p]&255) | ((buf[p+1]&255) << 8); p = p + 2;
-            if (!uns && v > 32767) { v = v - 65536; }
-            return Convert.ToString(v);
-        }
-        if (type == 3 || type == 9) {
-            long v = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
-                   | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            p = p + 4;
-            if (!uns && v > 2147483647) { v = v - 4294967296; }
-            return Convert.ToString(v);
-        }
-        if (type == 8) {
-            long v = 0; 
-            for (int i = 0; i < 8; i = i + 1) { v = v | ((long)(buf[p+i]&255) << (8*i)); }
-            p = p + 8;
-            return Convert.ToString(v);
-        }
-        if (type == 4) {
-            long bits = (long)(buf[p]&255) | ((long)(buf[p+1]&255)<<8)
-                      | ((long)(buf[p+2]&255)<<16) | ((long)(buf[p+3]&255)<<24);
-            p = p + 4;
-            return MySqlWire.ieeeToText((int)((bits >> 31) & 1), (int)((bits >> 23) & 255),
-                              bits & 8388607, 127, 23);
-        }
-        if (type == 5) {
-            long bits = 0; 
-            for (int i = 0; i < 8; i = i + 1) { bits = bits | ((long)(buf[p+i]&255) << (8*i)); }
-            p = p + 8;
-            return MySqlWire.ieeeToText((int)((bits >> 63) & 1), (int)((bits >> 52) & 2047),
-                              bits & 4503599627370495, 1023, 52);
-        }
-        if (type == 10 || type == 12 || type == 7) {
-            int len = buf[p] & 255; p = p + 1;
-            int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
-            if (len >= 4) {
-                y = (buf[p]&255) | ((buf[p+1]&255)<<8);
-                mo = buf[p+2] & 255; d = buf[p+3] & 255;
-            }
-            if (len >= 7) { h = buf[p+4] & 255; mi = buf[p+5] & 255; s = buf[p+6] & 255; }
-            p = p + len;
-            string date = Convert.ToString(y) + "-" + MySqlWire.pad2(mo) + "-" + MySqlWire.pad2(d);
-            if (type == 10) { return date; }
-            return date + " " + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
-        }
-        if (type == 11) {
-            int len = buf[p] & 255; p = p + 1;
-            int h = 0; int mi = 0; int s = 0; string sign = "";
-            if (len >= 8) {
-                if ((buf[p] & 255) == 1) { sign = "-"; }
-                int days = (buf[p+1]&255) | ((buf[p+2]&255)<<8) | ((buf[p+3]&255)<<16) | ((buf[p+4]&255)<<24);
-                h = (buf[p+5] & 255) + days * 24; mi = buf[p+6] & 255; s = buf[p+7] & 255;
-            }
-            p = p + len;
-            return sign + MySqlWire.pad2(h) + ":" + MySqlWire.pad2(mi) + ":" + MySqlWire.pad2(s);
-        }
-        return MySqlWire.readLenencStrRaw(buf, ref p);
-    }
+    // 日期/时间/浮点按 wire 格式渲染，其余按 lenenc 字符串，复用 MySqlConnection 解码。
 
     // 发送 COM_STMT_PREPARE；成功时把语句 id、列数、参数数依次写入 outIds，
     // 并读掉随后的参数/列定义包。
@@ -885,11 +668,11 @@ public class MySqlSyncConnection : IDbConnection {
                     if (ct == 1 || ct == 2 || ct == 3 || ct == 8
                             || ct == 9 || ct == 13) {
                         cell.kind = 1;    // 整型直取
-                        cell.ival = readBinLongRaw(row, ref p, ct, colFlags[c]);
+                        cell.ival = MySqlConnection.ReadBinLongRaw(row, ref p, ct, colFlags[c]);
                         texts.Add("");
                     } else {
                         cell.kind = 2;
-                        texts.Add(readBinValueRaw(row, ref p, ct, colFlags[c]));
+                        texts.Add(MySqlConnection.ReadBinValueRaw(row, ref p, ct, colFlags[c]));
                     }
                 }
                 cells.Add(cell);

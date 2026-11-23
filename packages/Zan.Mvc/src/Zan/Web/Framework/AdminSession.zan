@@ -1,0 +1,133 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Web;
+using Zan.Web.Core;
+using Zan.Web.Dao;
+using Zan.Web.Model;
+using Zan.Web.Security;
+
+namespace Zan.Web;
+
+/* 无视图的管理会话上下文：抽离账号核验、DataScope 解析、按钮掩码、操作审计与批量 ID 夹紧。
+   由 AdminController（SSR 壳）与 AdminApiController（纯 JSON API 壳）共同组合复用，
+   使鉴权/数据权限/审计逻辑彻底脱离 HTML 视图渲染层。 */
+public class AdminSession {
+    private AppController owner;
+    private SysUser who;
+    private long whoVersion;
+    private DataScope scope;
+    private long scopeVersion;
+
+    public AdminSession(AppController owner) {
+        this.owner = owner;
+        this.who = null;
+        this.whoVersion = 0;
+        this.scope = null;
+        this.scopeVersion = 0;
+    }
+
+    public SysUser CachedUser() { return this.who; }
+
+    /* 已登录账号；若账号已禁用或不存在则以 403 中断。 */
+    public async SysUser Admin() {
+        string uid = this.owner.Uid();
+        long version = PermTable.UserVersion(uid);
+        if (this.who != null && this.whoVersion == version) { return this.who; }
+        if (this.owner.Held() == null) { this.owner.Fail(503, "2001", "数据库不可用"); }
+        SysUser me = await this.owner.SysUser.ById(Filter.ToInt(uid, 0));
+        if (me == null || me.status != AuthUser.Active) {
+            this.owner.Fail(403, "0403", "该账号无法登录管理后台");
+        }
+        this.who = me;
+        this.whoVersion = version;
+        return me;
+    }
+
+    /* 数据范围优先从共享内存读取，必要时查询组织结构并执行扩展钩子（自动注入令牌 Claims）。 */
+    public async DataScope Scope() {
+        string uid = this.owner.Uid();
+        long version = PermTable.UserVersion(uid);
+        if (this.scope != null && this.scopeVersion == version) { return this.scope; }
+        SysUser me = await this.Admin();
+        this.scope = await DataScope.ForRequest(this.owner.Held(), me, version, this.owner.Claims());
+        this.scopeVersion = version;
+        return this.scope;
+    }
+
+    public void ResetScope() {
+        this.scope = null;
+        this.scopeVersion = 0;
+    }
+
+    public string Claim(string key, string def = "") {
+        return this.owner.Claim(key, def);
+    }
+
+    /* 当前屏幕对该登录账号的授权掩码，复用请求租约避免二次借连接。 */
+    public async int Mask() {
+        HttpContext ctx = this.owner.Ctx();
+        return await AuthUser.MaskOf(this.owner.Held(), this.owner.Uid(),
+            Perm.ScreenOf(ctx.RouteAction()));
+    }
+
+    public async bool Can(int bit) {
+        return (await this.Mask() & bit) != 0;
+    }
+
+    /* 将写操作记入 sys_operation_log 并触发扩展审计钩子。 */
+    public async void Note(string title, string target, bool ok, string message) {
+        IDbConnection db = this.owner.Held();
+        if (db == null) { return; }
+        if (this.who == null) {
+            try {
+                SysUser me = await this.Admin();
+                this.who = me;
+            } catch (Exception ex) {
+                Log.Warn("[audit] identity lookup failed, audit falls back to uid: " + ex.Message);
+            }
+        }
+        HttpContext ctx = this.owner.Ctx();
+        string uid = this.owner.Uid();
+        SysOperationLog row = new SysOperationLog();
+        row.userId = 0;
+        row.username = "";
+        if (this.who != null) {
+            row.userId = this.who.id;
+            row.username = this.who.username;
+        } else if (uid.Length > 0) {
+            row.userId = Filter.ToInt(uid, 0);
+            row.username = "uid:" + uid;
+        }
+        row.action = ctx.RouteAction();
+        row.title = title;
+        row.method = ctx.Method();
+        row.path = ctx.Path();
+        row.target = target;
+        row.ip = ClientIp.Of(ctx);
+        row.ok = ok ? 1 : 0;
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        if (MvcHooks.HasAuditHooks()) {
+            bool keep = await MvcHooks.RunAuditHooks(db, row);
+            if (!keep) { return; }
+        }
+        int _id = await new SysOperationLogDao(db).Insert(row).ExecuteIdentityAsync();
+    }
+
+    /* 批量 id 参数夹紧：收正 id，上限 500。 */
+    public static List<int> ParseIds(string raw) {
+        List<int> out_ = new List<int>();
+        string csv = raw != null ? raw.Trim() : "";
+        if (csv.Length == 0) { return out_; }
+        List<string> parts = csv.Split(",");
+        for (int i = 0; i < parts.Count && out_.Count < 500; i = i + 1) {
+            string p = parts[i].Trim();
+            if (p.Length == 0 || p.Length > 9) { continue; }
+            int v = Filter.ToInt(p, 0);
+            if (v > 0) { out_.Add(v); }
+        }
+        return out_;
+    }
+}
