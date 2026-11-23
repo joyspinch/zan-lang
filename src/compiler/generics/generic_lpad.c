@@ -107,6 +107,14 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     }
     if (e->kind == AST_MEMBER_ACCESS && expr_member_of_owned_temp(g, e, locals))
         return 1;
+    /* Task<T>.Result 属性：emit_task_member(mode 1) 把结果从帧里搬出（槽清零
+     * 后 reap），交给调用方的是 +1 引用——与 await / t.Result() 同口径。
+     * 曾被当成借用读，`V r = t.Result;` 再 retain 一次，值永不释放。 */
+    if (e->kind == AST_MEMBER_ACCESS && !e->member.null_cond &&
+        e->member.name.len == 6 && memcmp(e->member.name.str, "Result", 6) == 0) {
+        zan_type_t *tt = infer_expr_type(g, e->member.object, locals);
+        if (tt && tt->kind == TYPE_TASK && tt->type_arg_count == 1) return 1;
+    }
     if (e->kind == AST_MEMBER_ACCESS) {
         zan_ast_node_t *obj = e->member.object;
         /* weak 弱引用字段读取：尝试提升并向调用方返回 +1 强引用 */

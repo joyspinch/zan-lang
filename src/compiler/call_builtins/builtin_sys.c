@@ -230,7 +230,11 @@
                 !is_call_to(expr, "Task", "Spawn") &&
                 sub_ty && sub_ty->kind != TYPE_VOID;
             LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result, true);
-            emit_release_owned_call_temp(g, sub_arg, sub, locals);
+            /* async 调用的值是协程帧，所有权已随 detach 交给调度器/任务登记表。
+             * 不能再按声明的结果类型 T 当 owned 临时 release：那会对帧做
+             * release_dyn，把帧前缀（池魔数）当引用计数减一——--check-leaks
+             * 下回收时魔数校验失败直接 abort。 */
+            if (!sub_i8) emit_release_owned_call_temp(g, sub_arg, sub, locals);
             /* Task */
             if (sub_i8) return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");
             return LLVMConstInt(sp_i64, 0, 0);

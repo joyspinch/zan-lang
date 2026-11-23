@@ -42,11 +42,7 @@ static void mkdir_p2(const char *base, const char *name) {
 int main(void) {
     char dir[512];
     snprintf(dir, sizeof dir, "tree_ck_smoke");
-#ifdef _WIN32
-    mkdir(dir);
-#else
-    mkdir(dir, 0755);
-#endif
+    mkdir(dir);   /* 文件头的单参宏已按平台补齐权限位 */
     mkdir_p2(dir, "src");
     write_file("tree_ck_smoke/zan.pkg", "name = \"smoke\"\n");
     write_file("tree_ck_smoke/src/a.zan", "int a() { return 1; }\n");
