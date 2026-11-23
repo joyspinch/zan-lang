@@ -99,3 +99,7 @@ static void timer_yield(void) { sched_yield(); }
 #include "timer/rt_timer_co.c"
 #include "timer/rt_timer_task.c"
 #include "timer/rt_timer_misc.c"
+/* 5. rt_timer_gc: 活对象注册表、孤儿环探测/回收与堆快照（wasm/bare 走 IR 弱空实现） */
+#if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
+#include "timer/rt_timer_gc.c"
+#endif

@@ -380,6 +380,8 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_co.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
 add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})

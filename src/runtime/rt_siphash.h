@@ -21,8 +21,10 @@ static inline void zan_sipround(uint64_t *v0, uint64_t *v1, uint64_t *v2, uint64
     *v2 += *v1; *v1 = SIPROT(*v1, 17); *v1 ^= *v2; *v2 = SIPROT(*v2, 32);
 }
 
-static inline uint64_t zan_siphash24(const void *data, size_t len,
-                                     uint64_t k0, uint64_t k1) {
+/* c 轮压缩 / d 轮终结。Dictionary 键哈希用 1-3（Rust std HashMap 同款：
+ * 仍是带密钥 PRF，抗离线碰撞构造；压缩轮减半，长键快约 1.7 倍）。 */
+static inline uint64_t zan_siphash_cd(const void *data, size_t len,
+                                      uint64_t k0, uint64_t k1, int c, int d) {
     const uint8_t *p = (const uint8_t *)data;
     uint64_t v0 = k0 ^ 0x736f6d6570736575ull; /* "somepseudorandomlygenerated" */
     uint64_t v1 = k1 ^ 0x646f72616e646f6dull; /*  le 常量，SipHash 规范  */
@@ -33,23 +35,28 @@ static inline uint64_t zan_siphash24(const void *data, size_t len,
         uint64_t m;
         memcpy(&m, p, 8);
         v3 ^= m;
-        zan_sipround(&v0, &v1, &v2, &v3);
-        zan_sipround(&v0, &v1, &v2, &v3);
+        for (int r = 0; r < c; r++) zan_sipround(&v0, &v1, &v2, &v3);
         v0 ^= m;
         p += 8; left -= 8;
     }
     uint64_t b = ((uint64_t)len) << 56;
     for (size_t i = 0; i < left; i++) b |= ((uint64_t)p[i]) << (8 * i);
     v3 ^= b;
-    zan_sipround(&v0, &v1, &v2, &v3);
-    zan_sipround(&v0, &v1, &v2, &v3);
+    for (int r = 0; r < c; r++) zan_sipround(&v0, &v1, &v2, &v3);
     v0 ^= b;
     v2 ^= 0xff;
-    zan_sipround(&v0, &v1, &v2, &v3);
-    zan_sipround(&v0, &v1, &v2, &v3);
-    zan_sipround(&v0, &v1, &v2, &v3);
-    zan_sipround(&v0, &v1, &v2, &v3);
+    for (int r = 0; r < d; r++) zan_sipround(&v0, &v1, &v2, &v3);
     return v0 ^ v1 ^ v2 ^ v3;
+}
+
+static inline uint64_t zan_siphash24(const void *data, size_t len,
+                                     uint64_t k0, uint64_t k1) {
+    return zan_siphash_cd(data, len, k0, k1, 2, 4);
+}
+
+static inline uint64_t zan_siphash13(const void *data, size_t len,
+                                     uint64_t k0, uint64_t k1) {
+    return zan_siphash_cd(data, len, k0, k1, 1, 3);
 }
 
 #endif /* ZAN_RT_SIPHASH_H */

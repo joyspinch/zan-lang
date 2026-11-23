@@ -552,6 +552,16 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, cyc_entry);
     LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
 
+    LLVMValueRef col_fn = LLVMGetNamedFunction(g->mod, "zan_gc_collect_cycles");
+    if (!col_fn) {
+        col_fn = LLVMAddFunction(g->mod, "zan_gc_collect_cycles",
+            LLVMFunctionType(i64t, NULL, 0, 0));
+    }
+    LLVMSetLinkage(col_fn, LLVMWeakAnyLinkage);
+    LLVMPositionBuilderAtEnd(g->builder,
+        LLVMAppendBasicBlockInContext(g->ctx, col_fn, "entry"));
+    LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+
     LLVMValueRef snap_fn = LLVMGetNamedFunction(g->mod, "zan_gc_write_heap_snapshot");
     if (!snap_fn) {
         snap_fn = LLVMAddFunction(g->mod, "zan_gc_write_heap_snapshot",

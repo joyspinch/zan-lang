@@ -86,8 +86,14 @@ size_t zan_mem_trim(void);
 /* 运行时活对象注册表与孤儿环探测 (B-ID89) */
 void zan_rt_live_register(void *obj, size_t size);
 void zan_rt_live_unregister(void *obj);
+/* 开启活对象注册表（GC.DetectCycles / WriteHeapSnapshot 的程序由编译器在启动时调用）。 */
+void zan_rt_live_enable(void);
 void zan_rt_register_site_field_graphs(void **graphs, void **tynames, int64_t count);
+/* --check-leaks 站点表模式的站点释放函数表（GC.CollectCycles 用） */
+void zan_rt_register_site_dtors(void **dtors, int64_t count);
 int64_t zan_gc_detect_cycles(void);
+/* 回收孤儿强引用环，返回释放的对象数（GC.CollectCycles；需调用方保证无并发改图） */
+int64_t zan_gc_collect_cycles(void);
 void zan_rt_dump_leaks(void);
 int64_t zan_gc_write_heap_snapshot(const char *path);
 
