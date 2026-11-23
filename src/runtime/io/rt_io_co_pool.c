@@ -1,260 +1,317 @@
-/* rt_io_co_pool.c: 协程工作窃取队列 (Work-Stealing Deque)、注入器与帧检疫区实现 */
+/* rt_io_co_pool.c: 协程工作窃取队列 (Work-Stealing Deque)、注入器与帧检疫区实现
+ */
 
-
-/* 跨平台原语（pthread→Win32 shim）已收敛至 rt_io_posix_compat.c（自带系统头）。 */
+/* 跨平台原语（pthread→Win32 shim）已收敛至 rt_io_posix_compat.c（自带系统头）。
+ */
 /* UNITY-ORDER: after io/rt_io_posix_compat.c */
 
-
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
-#define ZAN_CO_MAXW      256
-#define ZAN_LQ_CAP       256u
-#define ZAN_LQ_MASK      (ZAN_LQ_CAP - 1u)
-#define ZAN_LIFO_BUDGET  3
-#define ZAN_GLOBAL_TICK  61
-#define ZAN_POLL_GATE     256u
+#define ZAN_CO_MAXW 256
+#define ZAN_LQ_CAP 256u
+#define ZAN_LQ_MASK (ZAN_LQ_CAP - 1u)
+#define ZAN_LIFO_BUDGET 3
+#define ZAN_GLOBAL_TICK 61
+#define ZAN_POLL_GATE 256u
 #define ZAN_STEAL_ROUNDS 2
-#define ZAN_WAKE_KEY     ((ULONG_PTR)-3)
+#define ZAN_WAKE_KEY ((ULONG_PTR) - 3)
 
 /* 协程调度器维护的异步帧前缀结构 */
 typedef struct {
-    volatile long long sched;    /* CO_* bits */
-    zan_co_step_t      pending;
+  volatile long long sched; /* CO_* bits */
+  zan_co_step_t pending;
 } zan_co_fhdr;
 
-#define CO_QUEUED    1LL
-#define CO_RUNNING   2LL
-#define CO_NOTIFIED  4LL
-#define CO_DEAD      8LL
-#define CO_SELFQ     16LL  
+#define CO_QUEUED 1LL
+#define CO_RUNNING 2LL
+#define CO_NOTIFIED 4LL
+#define CO_DEAD 8LL
+#define CO_SELFQ 16LL
 
 /* zan_co_task_t / zan_co_task 由 rt_co.h 声明 */
 
 typedef struct {
-    unsigned long long ran;
-    unsigned long long lifo_put;
-    unsigned long long lifo_hit;
-    unsigned long long lifo_demote;
-    unsigned long long lq_push;
-    unsigned long long lq_pop;
-    unsigned long long spill;
-    unsigned long long inj_push;
-    unsigned long long inj_pop;
-    unsigned long long steal_ok;
-    unsigned long long steal_fail;
-    unsigned long long park;
-    unsigned long long wake_post;
-    unsigned long long selfq;
+  unsigned long long ran;
+  unsigned long long lifo_put;
+  unsigned long long lifo_hit;
+  unsigned long long lifo_demote;
+  unsigned long long lq_push;
+  unsigned long long lq_pop;
+  unsigned long long spill;
+  unsigned long long inj_push;
+  unsigned long long inj_pop;
+  unsigned long long steal_ok;
+  unsigned long long steal_fail;
+  unsigned long long park;
+  unsigned long long wake_post;
+  unsigned long long selfq;
 } zan_co_stats_t;
 
 typedef struct {
-    volatile long long head;
-    char pad_head[56];
-    volatile long long tail;
-    char pad_tail[56];
-    CRITICAL_SECTION   queue_lock;
-    zan_co_task        buf[ZAN_LQ_CAP];
-    zan_co_task        lifo;
-    int                lifo_full;
-    int                lifo_budget;
-    int         index;
-    int         bg_gen;
-    int                searching;
-    long long          slice_start_us;
-    /* 当前工作线程正在步进执行的协程帧指针 */
-    void              *cur;
-    volatile LONG      parked;
-    unsigned           tick;
-    unsigned           poll_tick;
-    unsigned           rng;
-    zan_co_stats_t     st;
-    volatile LONG      cnt_act;
-    volatile LONG      cnt_out;
-    char               pad[64];
+  volatile long long head;
+  char pad_head[56];
+  volatile long long tail;
+  char pad_tail[56];
+  CRITICAL_SECTION queue_lock;
+  zan_co_task buf[ZAN_LQ_CAP];
+  zan_co_task lifo;
+  int lifo_full;
+  int lifo_budget;
+  int index;
+  int bg_gen;
+  int searching;
+  long long slice_start_us;
+  /* 当前工作线程正在步进执行的协程帧指针 */
+  void *cur;
+  volatile LONG parked;
+  unsigned tick;
+  unsigned poll_tick;
+  unsigned rng;
+  zan_co_stats_t st;
+  volatile LONG cnt_act;
+  volatile LONG cnt_out;
+  char pad[64];
 } __attribute__((aligned(64))) zan_co_worker_t;
 
 static CRITICAL_SECTION g_co_lock;
-static volatile LONG    g_co_running;
-static volatile LONG    g_co_parked;
-static volatile LONG    g_co_searching;
-static volatile LONG    g_co_wake;
-static volatile LONG    g_co_stop;
-static int              g_co_inited;
-static int              g_co_workers;
-static DWORD            g_co_tls = TLS_OUT_OF_INDEXES;
+static volatile LONG g_co_running;
+static volatile LONG g_co_parked;
+static volatile LONG g_co_searching;
+static volatile LONG g_co_wake;
+static volatile LONG g_co_stop;
+static int g_co_inited;
+static int g_co_workers;
+static _Thread_local zan_co_worker_t *t_co_self;
 static zan_co_worker_t *g_wk;
 
 static volatile LONG g_co_pool_live;
 static volatile LONG g_co_pool_fg;
-static int           g_co_pool_gen;
+static int g_co_pool_gen;
 static volatile LONG g_co_pool_out;
 static void co_pool_ensure(void);
 
 static CRITICAL_SECTION g_inj_lock;
-static zan_co_node     *g_inj_head, *g_inj_tail, *g_inj_free;
-static volatile LONG    g_inj_len;
-static volatile LONG    g_inj_push_ext;
+static zan_co_node *g_inj_head, *g_inj_tail, *g_inj_free;
+static volatile LONG g_inj_len;
+static volatile LONG g_inj_push_ext;
+static volatile unsigned long long g_co_nonempty[4];
 
-static LONG co_load(volatile LONG *p) {
-    return InterlockedCompareExchange(p, 0, 0);
+static inline void co_mark_nonempty(int idx) {
+  unsigned w = (unsigned)idx >> 6;
+  unsigned long long bit = 1ULL << ((unsigned)idx & 63u);
+  if ((__atomic_load_n(&g_co_nonempty[w], __ATOMIC_RELAXED) & bit) == 0)
+    __atomic_fetch_or(&g_co_nonempty[w], bit, __ATOMIC_RELEASE);
 }
 
-static long long co_now_ms(void) { return (long long)GetTickCount64(); }
+static inline void co_clear_empty(int idx) {
+  unsigned w = (unsigned)idx >> 6;
+  unsigned long long bit = 1ULL << ((unsigned)idx & 63u);
+  if ((__atomic_load_n(&g_co_nonempty[w], __ATOMIC_RELAXED) & bit) != 0)
+    __atomic_fetch_and(&g_co_nonempty[w], ~bit, __ATOMIC_RELEASE);
+}
 
-static volatile LONG      g_timer_owner;
-static volatile long long g_timer_pumped_us;   /* zan_co_precise_us stamp */
+static inline int co_any_nonempty_other(int self_idx) {
+  unsigned sw = (unsigned)self_idx >> 6;
+  unsigned long long sbit = 1ULL << ((unsigned)self_idx & 63u);
+  for (unsigned i = 0; i < 4; i++) {
+    unsigned long long m = __atomic_load_n(&g_co_nonempty[i], __ATOMIC_ACQUIRE);
+    if (i == sw)
+      m &= ~sbit;
+    if (m != 0)
+      return 1;
+  }
+  return 0;
+}
+
+static inline int co_worker_has_work(int idx) {
+  unsigned w = (unsigned)idx >> 6;
+  unsigned long long bit = 1ULL << ((unsigned)idx & 63u);
+  return (__atomic_load_n(&g_co_nonempty[w], __ATOMIC_ACQUIRE) & bit) != 0;
+}
+
+static LONG co_load(volatile LONG *p) {
+  return InterlockedCompareExchange(p, 0, 0);
+}
+
+static volatile LONG g_timer_owner;
+static volatile long long g_timer_pumped_us; /* zan_co_precise_us stamp */
 static volatile long long g_timer_next_ms;
 
 /* 跨线程分片任务生成计量统计 */
 static struct {
-    _Alignas(64) volatile LONG act; char pad1[64 - sizeof(LONG)];
-    _Alignas(64) volatile LONG out; char pad2[64 - sizeof(LONG)];
+  _Alignas(64) volatile LONG act;
+  char pad1[64 - sizeof(LONG)];
+  _Alignas(64) volatile LONG out;
+  char pad2[64 - sizeof(LONG)];
 } g_co_cnt_ext;
 
 static void co_wake_shard(int shard) {
 #if defined(_WIN32)
-    HANDLE p = io_shard(shard);
-    if (p) PostQueuedCompletionStatus(p, 0, ZAN_WAKE_KEY, NULL);
+  HANDLE p = io_shard(shard);
+  if (p)
+    PostQueuedCompletionStatus(p, 0, ZAN_WAKE_KEY, NULL);
 #elif defined(__linux__)
-    if (shard >= 0 && shard < (int)g_shards && g_ioshard[shard].wake_wfd >= 0) {
-        uint64_t one = 1;
-        (void)write(g_ioshard[shard].wake_wfd, &one, sizeof(one));
-    }
+  if (shard >= 0 && shard < (int)g_shards && g_ioshard[shard].wake_wfd >= 0) {
+    uint64_t one = 1;
+    (void)write(g_ioshard[shard].wake_wfd, &one, sizeof(one));
+  }
 #elif defined(__APPLE__)
-    if (shard >= 0 && shard < (int)g_shards && g_ioshard[shard].wake_wfd >= 0) {
-        char b = 1;
-        (void)write(g_ioshard[shard].wake_wfd, &b, 1);
-    }
+  if (shard >= 0 && shard < (int)g_shards && g_ioshard[shard].wake_wfd >= 0) {
+    char b = 1;
+    (void)write(g_ioshard[shard].wake_wfd, &b, 1);
+  }
 #endif
 }
 
 static int co_worker_shard(int worker) {
-    int n = (int)g_shards;
-    return (n <= 1) ? 0 : (worker % n);
+  int n = (int)g_shards;
+  return (n <= 1) ? 0 : (worker % n);
 }
 
 static zan_co_worker_t *co_self(void);
 
 static void co_notify(void) {
-    if (co_load(&g_co_searching) > 0) return;
-    if (co_load(&g_co_parked) <= 0) return;
-    if (InterlockedIncrement(&g_co_wake) > co_load(&g_co_parked)) {
-        InterlockedDecrement(&g_co_wake);
-        return;
+  if (co_load(&g_co_searching) > 0)
+    return;
+  if (co_load(&g_co_parked) <= 0)
+    return;
+  if (InterlockedIncrement(&g_co_wake) > co_load(&g_co_parked)) {
+    InterlockedDecrement(&g_co_wake);
+    return;
+  }
+  zan_co_worker_t *self = co_self();
+  if (self)
+    self->st.wake_post++;
+  for (int i = 0; i < g_co_workers; i++) {
+    if (co_load(&g_wk[i].parked)) {
+      co_wake_shard(co_worker_shard(i));
+      return;
     }
-    zan_co_worker_t *self = co_self();
-    if (self) self->st.wake_post++;
-    for (int i = 0; i < g_co_workers; i++) {
-        if (co_load(&g_wk[i].parked)) { co_wake_shard(co_worker_shard(i)); return; }
-    }
-    co_wake_shard(0);
+  }
+  co_wake_shard(0);
 }
 
-static zan_co_worker_t *co_self(void) {
-    if (g_co_tls == TLS_OUT_OF_INDEXES) return NULL;
-    return (zan_co_worker_t *)TlsGetValue(g_co_tls);
-}
+static zan_co_worker_t *co_self(void) { return t_co_self; }
 
 #if !defined(_WIN32)
 static int io_thread_shard(void) {
-    zan_co_worker_t *w = co_self();
-    int i = w ? w->index : 0;
-    int n = (int)g_shards;
-    return (n <= 1) ? 0 : (i % n);
+  zan_co_worker_t *w = co_self();
+  int i = w ? w->index : 0;
+  int n = (int)g_shards;
+  return (n <= 1) ? 0 : (i % n);
 }
 #endif
 
 static unsigned co_rand(zan_co_worker_t *w) {
-    unsigned x = w->rng;
-    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-    w->rng = x ? x : 0x9e3779b9u;
-    return w->rng;
+  unsigned x = w->rng;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  w->rng = x ? x : 0x9e3779b9u;
+  return w->rng;
 }
 
 /* ---- injector ---- */
 
 static void inj_push(zan_co_task t) {
-    EnterCriticalSection(&g_inj_lock);
-    zan_co_node *n = g_inj_free;
-    if (n) g_inj_free = n->next;
-    else {
-        n = (zan_co_node *)malloc(sizeof(*n));
-        if (!n) zan_rt_fatal("oom", "io: injection node alloc failed");
-    }
-    n->next = NULL; n->frame = t.frame; n->step = t.step;
-    if (g_inj_tail) g_inj_tail->next = n; else g_inj_head = n;
-    g_inj_tail = n;
-    InterlockedIncrement(&g_inj_len);
-    LeaveCriticalSection(&g_inj_lock);
+  EnterCriticalSection(&g_inj_lock);
+  zan_co_node *n = g_inj_free;
+  if (n)
+    g_inj_free = n->next;
+  else {
+    n = (zan_co_node *)malloc(sizeof(*n));
+    if (!n)
+      zan_rt_fatal("oom", "io: injection node alloc failed");
+  }
+  n->next = NULL;
+  n->frame = t.frame;
+  n->step = t.step;
+  if (g_inj_tail)
+    g_inj_tail->next = n;
+  else
+    g_inj_head = n;
+  g_inj_tail = n;
+  InterlockedIncrement(&g_inj_len);
+  LeaveCriticalSection(&g_inj_lock);
 }
 
-/* 单次临界区持有，批量链接注入任务节点，极大降低跨核加锁竞争 (B-ID89 Pipeline Merging) */
+/* 单次临界区持有，批量链接注入任务节点，极大降低跨核加锁竞争 (B-ID89 Pipeline
+ * Merging) */
 static void inj_push_batch(const zan_co_task *tasks, size_t count) {
-    if (!tasks || count == 0) return;
-    EnterCriticalSection(&g_inj_lock);
-    zan_co_node *head_batch = NULL;
-    zan_co_node *tail_batch = NULL;
-    for (size_t i = 0; i < count; i++) {
-        zan_co_node *n = g_inj_free;
-        if (n) {
-            g_inj_free = n->next;
-        } else {
-            n = (zan_co_node *)malloc(sizeof(*n));
-            if (!n) zan_rt_fatal("oom", "io: injection node alloc failed");
-        }
-        n->next = NULL;
-        n->frame = tasks[i].frame;
-        n->step = tasks[i].step;
-        if (tail_batch) {
-            tail_batch->next = n;
-        } else {
-            head_batch = n;
-        }
-        tail_batch = n;
-    }
-    if (g_inj_tail) {
-        g_inj_tail->next = head_batch;
+  if (!tasks || count == 0)
+    return;
+  EnterCriticalSection(&g_inj_lock);
+  zan_co_node *head_batch = NULL;
+  zan_co_node *tail_batch = NULL;
+  for (size_t i = 0; i < count; i++) {
+    zan_co_node *n = g_inj_free;
+    if (n) {
+      g_inj_free = n->next;
     } else {
-        g_inj_head = head_batch;
+      n = (zan_co_node *)malloc(sizeof(*n));
+      if (!n)
+        zan_rt_fatal("oom", "io: injection node alloc failed");
     }
-    g_inj_tail = tail_batch;
-    InterlockedExchangeAdd(&g_inj_len, (LONG)count);
-    LeaveCriticalSection(&g_inj_lock);
+    n->next = NULL;
+    n->frame = tasks[i].frame;
+    n->step = tasks[i].step;
+    if (tail_batch) {
+      tail_batch->next = n;
+    } else {
+      head_batch = n;
+    }
+    tail_batch = n;
+  }
+  if (g_inj_tail) {
+    g_inj_tail->next = head_batch;
+  } else {
+    g_inj_head = head_batch;
+  }
+  g_inj_tail = tail_batch;
+  InterlockedExchangeAdd(&g_inj_len, (LONG)count);
+  LeaveCriticalSection(&g_inj_lock);
 }
 
 static int inj_pop(zan_co_task *out) {
-    if (co_load(&g_inj_len) <= 0) return 0;
-    EnterCriticalSection(&g_inj_lock);
-    zan_co_node *n = g_inj_head;
-    if (n) {
-        g_inj_head = n->next;
-        if (!g_inj_head) g_inj_tail = NULL;
-        out->frame = n->frame; out->step = n->step;
-        n->next = g_inj_free; g_inj_free = n;
-        InterlockedDecrement(&g_inj_len);
-    }
-    LeaveCriticalSection(&g_inj_lock);
-    return n != NULL;
+  if (co_load(&g_inj_len) <= 0)
+    return 0;
+  EnterCriticalSection(&g_inj_lock);
+  zan_co_node *n = g_inj_head;
+  if (n) {
+    g_inj_head = n->next;
+    if (!g_inj_head)
+      g_inj_tail = NULL;
+    out->frame = n->frame;
+    out->step = n->step;
+    n->next = g_inj_free;
+    g_inj_free = n;
+    InterlockedDecrement(&g_inj_len);
+  }
+  LeaveCriticalSection(&g_inj_lock);
+  return n != NULL;
 }
 
 /* 单次加锁批量抽取注入的任务队列 */
 #define ZAN_INJ_BATCH 64
 static int inj_pop_batch(zan_co_task *out, int max) {
-    if (co_load(&g_inj_len) <= 0) return 0;
-    EnterCriticalSection(&g_inj_lock);
-    int n = 0;
-    while (n < max && g_inj_head) {
-        zan_co_node *nd = g_inj_head;
-        g_inj_head = nd->next;
-        if (!g_inj_head) g_inj_tail = NULL;
-        out[n].frame = nd->frame; out[n].step = nd->step;
-        nd->next = g_inj_free; g_inj_free = nd;
-        InterlockedDecrement(&g_inj_len);
-        n++;
-    }
-    LeaveCriticalSection(&g_inj_lock);
-    return n;
+  if (co_load(&g_inj_len) <= 0)
+    return 0;
+  EnterCriticalSection(&g_inj_lock);
+  int n = 0;
+  while (n < max && g_inj_head) {
+    zan_co_node *nd = g_inj_head;
+    g_inj_head = nd->next;
+    if (!g_inj_head)
+      g_inj_tail = NULL;
+    out[n].frame = nd->frame;
+    out[n].step = nd->step;
+    nd->next = g_inj_free;
+    g_inj_free = nd;
+    InterlockedDecrement(&g_inj_len);
+    n++;
+  }
+  LeaveCriticalSection(&g_inj_lock);
+  return n;
 }
-
 
 static void lq_push(zan_co_worker_t *w, zan_co_task t);
 
@@ -263,246 +320,283 @@ static void lq_push(zan_co_worker_t *w, zan_co_task t);
  * head movement together; index atomics alone do not protect slot lifetime.
  * No queue lock is held while publishing to another queue or the injector. */
 static void lq_spill(zan_co_worker_t *w) {
-    zan_co_task tmp[ZAN_LQ_CAP / 2];
-    EnterCriticalSection(&w->queue_lock);
-    long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
-    long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-    long long n = (t - h) / 2;
-    if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
-    for (long long i = 0; i < n; i++)
-        tmp[i] = w->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
-    if (n > 0) __atomic_store_n(&w->head, h + n, __ATOMIC_RELEASE);
-    LeaveCriticalSection(&w->queue_lock);
-    if (n <= 0) return;
-    for (long long i = 0; i < n; i++) inj_push(tmp[i]);
-    w->st.spill++;
-    w->st.inj_push += (unsigned long long)n;
+  zan_co_task tmp[ZAN_LQ_CAP / 2];
+  EnterCriticalSection(&w->queue_lock);
+  long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+  long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+  long long n = (t - h) / 2;
+  if (n > (long long)(ZAN_LQ_CAP / 2))
+    n = (long long)(ZAN_LQ_CAP / 2);
+  for (long long i = 0; i < n; i++)
+    tmp[i] = w->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+  if (n > 0)
+    __atomic_store_n(&w->head, h + n, __ATOMIC_RELEASE);
+  LeaveCriticalSection(&w->queue_lock);
+  if (n <= 0)
+    return;
+  for (long long i = 0; i < n; i++)
+    inj_push(tmp[i]);
+  w->st.spill++;
+  w->st.inj_push += (unsigned long long)n;
 }
 
 static void lq_push(zan_co_worker_t *w, zan_co_task task) {
-    EnterCriticalSection(&w->queue_lock);
-    long long tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-    long long head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
-    if (tail - head >= (long long)ZAN_LQ_CAP) {
-        LeaveCriticalSection(&w->queue_lock);
-        lq_spill(w);
-        EnterCriticalSection(&w->queue_lock);
-        tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-        head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
-        if (tail - head >= (long long)ZAN_LQ_CAP) {
-            LeaveCriticalSection(&w->queue_lock);
-            inj_push(task);
-            w->st.inj_push++;
-            return;
-        }
-    }
-    w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = task;
-    __atomic_store_n(&w->tail, tail + 1, __ATOMIC_RELEASE);
+  EnterCriticalSection(&w->queue_lock);
+  long long tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+  long long head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+  if (tail - head >= (long long)ZAN_LQ_CAP) {
     LeaveCriticalSection(&w->queue_lock);
-    w->st.lq_push++;
+    lq_spill(w);
+    EnterCriticalSection(&w->queue_lock);
+    tail = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+    head = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+    if (tail - head >= (long long)ZAN_LQ_CAP) {
+      LeaveCriticalSection(&w->queue_lock);
+      inj_push(task);
+      w->st.inj_push++;
+      return;
+    }
+  }
+  w->buf[(unsigned long long)tail & ZAN_LQ_MASK] = task;
+  __atomic_store_n(&w->tail, tail + 1, __ATOMIC_RELEASE);
+  co_mark_nonempty(w->index);
+  LeaveCriticalSection(&w->queue_lock);
+  w->st.lq_push++;
 }
 
 static int lq_pop(zan_co_worker_t *w, zan_co_task *out) {
-    EnterCriticalSection(&w->queue_lock);
-    long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
-    long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
-    if (h >= t) {
-        LeaveCriticalSection(&w->queue_lock);
-        return 0;
-    }
-    *out = w->buf[(unsigned long long)h & ZAN_LQ_MASK];
-    __atomic_store_n(&w->head, h + 1, __ATOMIC_RELEASE);
+  if (__atomic_load_n(&w->tail, __ATOMIC_RELAXED) <=
+      __atomic_load_n(&w->head, __ATOMIC_RELAXED))
+    return 0;
+  EnterCriticalSection(&w->queue_lock);
+  long long h = __atomic_load_n(&w->head, __ATOMIC_RELAXED);
+  long long t = __atomic_load_n(&w->tail, __ATOMIC_RELAXED);
+  if (h >= t) {
+    co_clear_empty(w->index);
     LeaveCriticalSection(&w->queue_lock);
-    return 1;
+    return 0;
+  }
+  *out = w->buf[(unsigned long long)h & ZAN_LQ_MASK];
+  __atomic_store_n(&w->head, h + 1, __ATOMIC_RELEASE);
+  if (h + 1 >= t)
+    co_clear_empty(w->index);
+  LeaveCriticalSection(&w->queue_lock);
+  return 1;
 }
 
 static int lq_steal(zan_co_worker_t *v, zan_co_worker_t *w, zan_co_task *out) {
-    zan_co_task tmp[ZAN_LQ_CAP / 2];
-    EnterCriticalSection(&v->queue_lock);
-    long long h = __atomic_load_n(&v->head, __ATOMIC_RELAXED);
-    long long t = __atomic_load_n(&v->tail, __ATOMIC_RELAXED);
-    long long n = t - h;
-    if (n <= 0) {
-        LeaveCriticalSection(&v->queue_lock);
-        return 0;
-    }
-    n = n - n / 2; /* half, rounded up */
-    if (n > (long long)(ZAN_LQ_CAP / 2)) n = (long long)(ZAN_LQ_CAP / 2);
-    for (long long i = 0; i < n; i++)
-        tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
-    __atomic_store_n(&v->head, h + n, __ATOMIC_RELEASE);
+  if (!co_worker_has_work(v->index))
+    return 0;
+  if (!TryEnterCriticalSection(&v->queue_lock))
+    return 0;
+  long long h = __atomic_load_n(&v->head, __ATOMIC_RELAXED);
+  long long t = __atomic_load_n(&v->tail, __ATOMIC_RELAXED);
+  long long n = t - h;
+  if (n <= 0) {
+    co_clear_empty(v->index);
     LeaveCriticalSection(&v->queue_lock);
-    *out = tmp[0];
-    for (long long i = 1; i < n; i++) lq_push(w, tmp[i]);
-    return 1;
+    return 0;
+  }
+  zan_co_task tmp[ZAN_LQ_CAP / 2];
+  long long take = n - n / 2; /* half, rounded up */
+  if (take > (long long)(ZAN_LQ_CAP / 2))
+    take = (long long)(ZAN_LQ_CAP / 2);
+  for (long long i = 0; i < take; i++)
+    tmp[i] = v->buf[(unsigned long long)(h + i) & ZAN_LQ_MASK];
+  __atomic_store_n(&v->head, h + take, __ATOMIC_RELEASE);
+  if (h + take >= t)
+    co_clear_empty(v->index);
+  LeaveCriticalSection(&v->queue_lock);
+  *out = tmp[0];
+  for (long long i = 1; i < take; i++)
+    lq_push(w, tmp[i]);
+  return 1;
 }
-
 
 static zan_co_fhdr *co_hdr(void *frame) { return (zan_co_fhdr *)frame; }
 
 #define ZAN_TR_RING 8192
-typedef struct { long long seq; unsigned long tid; const char* tag; const void* fp; } zan_tr_ent;
+typedef struct {
+  long long seq;
+  unsigned long tid;
+  const char *tag;
+  const void *fp;
+} zan_tr_ent;
 static zan_tr_ent *g_tr_ring;
 static volatile long long g_tr_seq = -1;
 static int g_co_trace = -1;
 static void co_trace(const char *what, const void *fp) {
-    if (g_co_trace < 0) {
-        const char *e = getenv("ZAN_CO_TRACE");
-        g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-        if (g_co_trace && !g_tr_ring) {
-            g_tr_ring = (zan_tr_ent *)calloc(ZAN_TR_RING, sizeof(zan_tr_ent));
-        }
+  if (g_co_trace < 0) {
+    const char *e = getenv("ZAN_CO_TRACE");
+    g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    if (g_co_trace && !g_tr_ring) {
+      g_tr_ring = (zan_tr_ent *)calloc(ZAN_TR_RING, sizeof(zan_tr_ent));
     }
-    if (!g_co_trace || !g_tr_ring) return;
-    long long i = InterlockedIncrement64(&g_tr_seq);
-    zan_tr_ent *e = &g_tr_ring[i & (ZAN_TR_RING - 1)];
-    e->seq = i;
-    e->tid = GetCurrentThreadId();
-    e->tag = what;
-    e->fp = fp;
+  }
+  if (!g_co_trace || !g_tr_ring)
+    return;
+  long long i = InterlockedIncrement64(&g_tr_seq);
+  zan_tr_ent *e = &g_tr_ring[i & (ZAN_TR_RING - 1)];
+  e->seq = i;
+  e->tid = GetCurrentThreadId();
+  e->tag = what;
+  e->fp = fp;
 }
 
 static void co_trace_dump(long long live) {
-    if (g_co_trace < 0) {
-        const char *e = getenv("ZAN_CO_TRACE");
-        g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-    }
-    if (!g_co_trace || !g_tr_ring) return;
-    long long total = g_tr_seq;
-    long long first = total - ZAN_TR_RING;
-    if (first < 0) first = -1;
-    fprintf(stderr, "[cot DUMP live=%lld seq=%lld]\n",
-        live, total);
-    for (long long s = (first > 0 ? first : 0) + 1; s <= total; s++) {
-        zan_tr_ent *e = &g_tr_ring[s & (ZAN_TR_RING - 1)];
-        if (e->seq != s) continue;
-        fprintf(stderr, "[cot %lld %lu %s %p]\n",
-            e->seq, (unsigned long)e->tid, e->tag, e->fp);
-    }
-    fflush(stderr);
+  if (g_co_trace < 0) {
+    const char *e = getenv("ZAN_CO_TRACE");
+    g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+  }
+  if (!g_co_trace || !g_tr_ring)
+    return;
+  long long total = g_tr_seq;
+  long long first = total - ZAN_TR_RING;
+  if (first < 0)
+    first = -1;
+  fprintf(stderr, "[cot DUMP live=%lld seq=%lld]\n", live, total);
+  for (long long s = (first > 0 ? first : 0) + 1; s <= total; s++) {
+    zan_tr_ent *e = &g_tr_ring[s & (ZAN_TR_RING - 1)];
+    if (e->seq != s)
+      continue;
+    fprintf(stderr, "[cot %lld %lu %s %p]\n", e->seq, (unsigned long)e->tid,
+            e->tag, e->fp);
+  }
+  fflush(stderr);
 }
 
 static LONG co_cnt_activity(void) {
-    long long s = co_load(&g_co_cnt_ext.act);
-    for (int i = 0; i < g_co_workers; i++) s += co_load(&g_wk[i].cnt_act);
-    return (LONG)s;
+  long long s = co_load(&g_co_cnt_ext.act);
+  for (int i = 0; i < g_co_workers; i++)
+    s += co_load(&g_wk[i].cnt_act);
+  return (LONG)s;
 }
 static LONG co_cnt_outstanding(void) {
-    long long s = co_load(&g_co_cnt_ext.out);
-    for (int i = 0; i < g_co_workers; i++) s += co_load(&g_wk[i].cnt_out);
-    return (LONG)s;
+  long long s = co_load(&g_co_cnt_ext.out);
+  for (int i = 0; i < g_co_workers; i++)
+    s += co_load(&g_wk[i].cnt_out);
+  return (LONG)s;
 }
 static void co_cnt_add(zan_co_worker_t *w, int act, int out) {
-    volatile LONG *pa = w ? &w->cnt_act : &g_co_cnt_ext.act;
-    volatile LONG *po = w ? &w->cnt_out : &g_co_cnt_ext.out;
-    /* Batch submission passes full deltas. Counting only their sign lets a
-     * batch of N drain N times after recording one owner, producing negative
-     * outstanding work and invalid scheduler quiescence decisions. */
-    if (act) InterlockedExchangeAdd(pa, (LONG)act);
-    if (out) InterlockedExchangeAdd(po, (LONG)out);
+  volatile LONG *pa = w ? &w->cnt_act : &g_co_cnt_ext.act;
+  volatile LONG *po = w ? &w->cnt_out : &g_co_cnt_ext.out;
+  /* Batch submission passes full deltas. Counting only their sign lets a
+   * batch of N drain N times after recording one owner, producing negative
+   * outstanding work and invalid scheduler quiescence decisions. */
+  if (act)
+    InterlockedExchangeAdd(pa, (LONG)act);
+  if (out)
+    InterlockedExchangeAdd(po, (LONG)out);
 }
 
 static void co_submit(void *frame, zan_co_step_t step) {
-    zan_co_task t;
-    t.frame = frame; t.step = step;
-    zan_co_worker_t *w = co_self();
-    co_cnt_add(w, +1, +1);
-    if (!w) {
-        inj_push(t);
-        InterlockedIncrement(&g_inj_push_ext);
-        co_trace("inj", t.frame);
-        co_notify();
-        return;
-    }
-    if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) {
-        w->lifo = t;
-        __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
-        w->st.lifo_put++;
-        return;
-    }
-    lq_push(w, t);
+  zan_co_task t;
+  t.frame = frame;
+  t.step = step;
+  zan_co_worker_t *w = co_self();
+  co_cnt_add(w, +1, +1);
+  if (!w) {
+    inj_push(t);
+    InterlockedIncrement(&g_inj_push_ext);
+    co_trace("inj", t.frame);
     co_notify();
+    return;
+  }
+  if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE)) {
+    w->lifo = t;
+    __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
+    w->st.lifo_put++;
+    return;
+  }
+  lq_push(w, t);
+  co_notify();
 }
 
 static void co_submit_batch(const zan_co_task *tasks, size_t count) {
-    if (!tasks || count == 0) return;
-    zan_co_worker_t *w = co_self();
-    if (!w) {
-        co_cnt_add(NULL, (int)count, (int)count);
-        inj_push_batch(tasks, count);
-        InterlockedExchangeAdd(&g_inj_push_ext, (LONG)count);
-        for (size_t i = 0; i < count; i++) co_trace("inj", tasks[i].frame);
-        co_notify();
-        return;
-    }
-    co_cnt_add(w, (int)count, (int)count);
-    size_t i = 0;
-    if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE) && i < count) {
-        w->lifo = tasks[i];
-        __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
-        w->st.lifo_put++;
-        i++;
-    }
-    for (; i < count; i++) {
-        lq_push(w, tasks[i]);
-    }
+  if (!tasks || count == 0)
+    return;
+  zan_co_worker_t *w = co_self();
+  if (!w) {
+    co_cnt_add(NULL, (int)count, (int)count);
+    inj_push_batch(tasks, count);
+    InterlockedExchangeAdd(&g_inj_push_ext, (LONG)count);
+    for (size_t i = 0; i < count; i++)
+      co_trace("inj", tasks[i].frame);
     co_notify();
+    return;
+  }
+  co_cnt_add(w, (int)count, (int)count);
+  size_t i = 0;
+  if (!__atomic_load_n(&w->lifo_full, __ATOMIC_ACQUIRE) && i < count) {
+    w->lifo = tasks[i];
+    __atomic_store_n(&w->lifo_full, 1, __ATOMIC_RELEASE);
+    w->st.lifo_put++;
+    i++;
+  }
+  for (; i < count; i++) {
+    lq_push(w, tasks[i]);
+  }
+  co_notify();
 }
 
 void zan_co_ready_batch(const zan_co_task_t *tasks, size_t count) {
-    if (!tasks || count == 0) return;
-    zan_co_task runnable[64];
-    size_t n_run = 0;
+  if (!tasks || count == 0)
+    return;
+  zan_co_task runnable[64];
+  size_t n_run = 0;
 
-    for (size_t i = 0; i < count; i++) {
-        void *frame = tasks[i].frame;
-        zan_co_step_t step = tasks[i].step;
-        if (!step || !frame) continue;
+  for (size_t i = 0; i < count; i++) {
+    void *frame = tasks[i].frame;
+    zan_co_step_t step = tasks[i].step;
+    if (!step || !frame)
+      continue;
 
-        zan_co_fhdr *h = co_hdr(frame);
-        int queued = 0;
-        for (;;) {
-            long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
-            if (s & CO_DEAD) break;
-            if (s & CO_QUEUED) break;
-            if (s & CO_RUNNING) {
-                zan_co_worker_t *sw = co_self();
-                long long selfq = (sw && sw->cur == frame) ? CO_SELFQ : 0;
-                __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
-                if (__atomic_compare_exchange_n(&h->sched, &s,
-                                                s | CO_NOTIFIED | selfq, 0,
-                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                    break;
-                continue;
-            }
-            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                queued = 1;
-                break;
-            }
-        }
-        if (queued) {
-            runnable[n_run].frame = frame;
-            runnable[n_run].step = step;
-            n_run++;
-            if (n_run == 64) {
-                co_submit_batch(runnable, n_run);
-                n_run = 0;
-            }
-        }
+    zan_co_fhdr *h = co_hdr(frame);
+    int queued = 0;
+    for (;;) {
+      long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+      if (s & CO_DEAD)
+        break;
+      if (s & CO_QUEUED)
+        break;
+      if (s & CO_RUNNING) {
+        zan_co_worker_t *sw = co_self();
+        long long selfq = (sw && sw->cur == frame) ? CO_SELFQ : 0;
+        __atomic_store_n(&h->pending, step, __ATOMIC_RELAXED);
+        if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_NOTIFIED | selfq,
+                                        0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+          break;
+        continue;
+      }
+      if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_QUEUED, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        queued = 1;
+        break;
+      }
     }
-    if (n_run > 0) {
+    if (queued) {
+      runnable[n_run].frame = frame;
+      runnable[n_run].step = step;
+      n_run++;
+      if (n_run == 64) {
         co_submit_batch(runnable, n_run);
+        n_run = 0;
+      }
     }
-    co_pool_ensure();
+  }
+  if (n_run > 0) {
+    co_submit_batch(runnable, n_run);
+  }
+  co_pool_ensure();
 }
 
 void zan_co_ready(void *frame, zan_co_step_t step) {
-    if (!step || !frame) return;
-    zan_co_task_t t;
-    t.frame = frame;
-    t.step = step;
-    zan_co_ready_batch(&t, 1);
+  if (!step || !frame)
+    return;
+  zan_co_task_t t;
+  t.frame = frame;
+  t.step = step;
+  zan_co_ready_batch(&t, 1);
 }
 
 /* Bounded thread-local allocation cache. Safety comes from scheduler ownership
@@ -512,130 +606,146 @@ void zan_co_ready(void *frame, zan_co_step_t step) {
 #define ZAN_CO_FRAME_CLASSES 4
 #define ZAN_CO_FRAME_POOL_CAP 32
 
-static const size_t g_co_frame_class_sz[ZAN_CO_FRAME_CLASSES] = {
-    256, 512, 1024, 2048
-};
+static const size_t g_co_frame_class_sz[ZAN_CO_FRAME_CLASSES] = {256, 512, 1024,
+                                                                 2048};
 
 typedef struct {
-    uint32_t magic;      /* ZAN_CO_FRAME_MAGIC */
-    uint32_t class_idx;  /* 0..3 或 99(堆分配 fallback) */
-    uint64_t actual_sz;  /* 请求尺寸 */
+  uint32_t magic;     /* ZAN_CO_FRAME_MAGIC */
+  uint32_t class_idx; /* 0..3 或 99(堆分配 fallback) */
+  uint64_t actual_sz; /* 请求尺寸 */
 } zan_co_frame_prefix_t;
 
 typedef struct {
-    void  *frames[ZAN_CO_FRAME_POOL_CAP];
-    size_t count;
+  void *frames[ZAN_CO_FRAME_POOL_CAP];
+  size_t count;
 } zan_co_frame_bucket_t;
 
-static _Thread_local zan_co_frame_bucket_t t_co_frame_pool[ZAN_CO_FRAME_CLASSES];
+static _Thread_local zan_co_frame_bucket_t
+    t_co_frame_pool[ZAN_CO_FRAME_CLASSES];
 
 static inline uint32_t co_frame_size_class(size_t sz) {
-    if (sz <= 256)  return 0;
-    if (sz <= 512)  return 1;
-    if (sz <= 1024) return 2;
-    if (sz <= 2048) return 3;
-    return 99;
+  if (sz <= 256)
+    return 0;
+  if (sz <= 512)
+    return 1;
+  if (sz <= 1024)
+    return 2;
+  if (sz <= 2048)
+    return 3;
+  return 99;
 }
 
 static void co_frame_recycle(void *frame);
 
 void *__zan_co_frame_alloc(size_t size) {
-    size_t req = size ? size : 1;
-    if (req > SIZE_MAX - sizeof(zan_co_frame_prefix_t)) return NULL;
-    uint32_t c = co_frame_size_class(req);
-    size_t alloc_sz = (c < ZAN_CO_FRAME_CLASSES) ? g_co_frame_class_sz[c] : req;
-    size_t total_sz = sizeof(zan_co_frame_prefix_t) + alloc_sz;
+  size_t req = size ? size : 1;
+  if (req > SIZE_MAX - sizeof(zan_co_frame_prefix_t))
+    return NULL;
+  uint32_t c = co_frame_size_class(req);
+  size_t alloc_sz = (c < ZAN_CO_FRAME_CLASSES) ? g_co_frame_class_sz[c] : req;
+  size_t total_sz = sizeof(zan_co_frame_prefix_t) + alloc_sz;
 
-    zan_co_frame_prefix_t *pfx = NULL;
-    if (c < ZAN_CO_FRAME_CLASSES && t_co_frame_pool[c].count > 0) {
-        pfx = (zan_co_frame_prefix_t *)t_co_frame_pool[c].frames[--t_co_frame_pool[c].count];
-    } else {
-        pfx = (zan_co_frame_prefix_t *)malloc(total_sz);
-        if (!pfx) return NULL;
-    }
-    memset(pfx, 0, total_sz);
-    pfx->magic = ZAN_CO_FRAME_MAGIC;
-    pfx->class_idx = c;
-    pfx->actual_sz = req;
-    void *frame = (void *)(pfx + 1);
-    zan_task_frame_allocator(frame, co_frame_recycle);
-    return frame;
+  zan_co_frame_prefix_t *pfx = NULL;
+  if (c < ZAN_CO_FRAME_CLASSES && t_co_frame_pool[c].count > 0) {
+    pfx = (zan_co_frame_prefix_t *)t_co_frame_pool[c]
+              .frames[--t_co_frame_pool[c].count];
+  } else {
+    pfx = (zan_co_frame_prefix_t *)malloc(total_sz);
+    if (!pfx)
+      return NULL;
+  }
+  memset(pfx, 0, sizeof(zan_co_frame_prefix_t) + req);
+  pfx->magic = ZAN_CO_FRAME_MAGIC;
+  pfx->class_idx = c;
+  pfx->actual_sz = req;
+  void *frame = (void *)(pfx + 1);
+  zan_task_frame_allocator(frame, co_frame_recycle);
+  return frame;
 }
 
 static void co_frame_recycle(void *frame) {
-    zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)frame - 1;
-    /* Only allocator-registered payloads reach this callback. */
-    if (pfx->magic != ZAN_CO_FRAME_MAGIC) abort();
-    uint32_t c = pfx->class_idx;
-    if (c < ZAN_CO_FRAME_CLASSES && t_co_frame_pool[c].count < ZAN_CO_FRAME_POOL_CAP) {
-        t_co_frame_pool[c].frames[t_co_frame_pool[c].count++] = pfx;
-    } else {
-        free(pfx);
-    }
+  zan_co_frame_prefix_t *pfx = (zan_co_frame_prefix_t *)frame - 1;
+  /* Only allocator-registered payloads reach this callback. */
+  if (pfx->magic != ZAN_CO_FRAME_MAGIC)
+    abort();
+  uint32_t c = pfx->class_idx;
+  if (c < ZAN_CO_FRAME_CLASSES &&
+      t_co_frame_pool[c].count < ZAN_CO_FRAME_POOL_CAP) {
+    t_co_frame_pool[c].frames[t_co_frame_pool[c].count++] = pfx;
+  } else {
+    free(pfx);
+  }
 }
 
 static void co_frame_pool_flush_tls(void) {
-    for (int c = 0; c < ZAN_CO_FRAME_CLASSES; c++) {
-        for (size_t i = 0; i < t_co_frame_pool[c].count; i++) {
-            free(t_co_frame_pool[c].frames[i]);
-        }
-        t_co_frame_pool[c].count = 0;
+  for (int c = 0; c < ZAN_CO_FRAME_CLASSES; c++) {
+    for (size_t i = 0; i < t_co_frame_pool[c].count; i++) {
+      free(t_co_frame_pool[c].frames[i]);
     }
+    t_co_frame_pool[c].count = 0;
+  }
 }
 
 void __zan_co_frame_free(void *frame) {
-    if (!frame) return;
-    zan_co_fhdr *h = co_hdr(frame);
-    for (;;) {
-        long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
-        if (s & CO_DEAD) return;
-        if (s & (CO_QUEUED | CO_RUNNING)) {
-            if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_DEAD, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                return;
-            continue;
-        }
-        if (__atomic_compare_exchange_n(&h->sched, &s, CO_DEAD, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            break;
+  if (!frame)
+    return;
+  zan_co_fhdr *h = co_hdr(frame);
+  for (;;) {
+    long long s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
+    if (s & CO_DEAD)
+      return;
+    if (s & (CO_QUEUED | CO_RUNNING)) {
+      if (__atomic_compare_exchange_n(&h->sched, &s, s | CO_DEAD, 0,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+      continue;
     }
-    zan_task_retire(frame, free);
+    if (__atomic_compare_exchange_n(&h->sched, &s, CO_DEAD, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE))
+      break;
+  }
+  zan_task_retire(frame, free);
 }
 
 void zan_co_delay(long long ms, void *frame, zan_co_step_t step) {
-    zan_timer_delay(ms, frame, step);
-    co_cnt_add(co_self(), +1, 0);
-    co_notify();
+  zan_timer_delay(ms, frame, step);
+  co_cnt_add(co_self(), +1, 0);
+  co_notify();
 }
 
 static int co_worker_count(void) {
-    int w = 0;
-    w = zan_async_cfg_workers();
-    if (w <= 0) {
+  int w = 0;
+  w = zan_async_cfg_workers();
+  if (w <= 0) {
 #if defined(_WIN32)
-        char envbuf[32];
-        DWORD r = GetEnvironmentVariableA("ZAN_CO_WORKERS", envbuf, sizeof(envbuf));
-        if (r > 0 && r < sizeof(envbuf)) w = atoi(envbuf);
+    char envbuf[32];
+    DWORD r = GetEnvironmentVariableA("ZAN_CO_WORKERS", envbuf, sizeof(envbuf));
+    if (r > 0 && r < sizeof(envbuf))
+      w = atoi(envbuf);
 #endif
-    }
-    if (w <= 0) {
-        const char *e = getenv("ZAN_CO_WORKERS");
-        if (e && *e) w = atoi(e);
-    }
-    if (w <= 0) {
+  }
+  if (w <= 0) {
+    const char *e = getenv("ZAN_CO_WORKERS");
+    if (e && *e)
+      w = atoi(e);
+  }
+  if (w <= 0) {
 #if defined(_WIN32)
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        w = (int)si.dwNumberOfProcessors;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    w = (int)si.dwNumberOfProcessors;
 #else
-        long n = sysconf(_SC_NPROCESSORS_ONLN);
-        w = (n > 0) ? (int)n : 1;
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    w = (n > 0) ? (int)n : 1;
 #endif
-        if (w > 4) w = 4;
-    }
-    if (w < 1) w = 1;
-    if (w > ZAN_CO_MAXW) w = ZAN_CO_MAXW;
-    return w;
+    if (w > 16)
+      w = 16;
+  }
+  if (w < 1)
+    w = 1;
+  if (w > ZAN_CO_MAXW)
+    w = ZAN_CO_MAXW;
+  return w;
 }
 
 #endif /* _WIN32 || __linux__ || __APPLE__ */

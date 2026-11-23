@@ -213,7 +213,11 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                                  e->member.object->ident.name);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, e->member.name);
-                if (fs) return fs->type;
+                if (fs) {
+                    zan_type_t *sinst = static_access_inst(g, e->member.object);
+                    zan_type_t *ft = field_store_type(g, fs, sinst);
+                    return ft ? ft : fs->type;
+                }
             }
         }
         if (e->member.object->kind == AST_IDENTIFIER &&
@@ -490,11 +494,22 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             zan_symbol_t *m = resolve_overload_typed(g, g->current_type_sym,
                                                      callee->ident.name, e, locals);
             if (!m) m = get_method_sym(g->current_type_sym, callee->ident.name);
-                if (m) return method_ret_type_at(g, m, e, NULL, locals);
+                if (m) {
+                    zan_type_t *mt = method_ret_type_at(g, m, e, NULL, locals);
+                    if (mt && g->cur_mtps)
+                        mt = subst_method_tp(g, mt, g->cur_mtps, g->cur_mbind);
+                    if (mt && mt->kind == TYPE_TYPE_PARAM) mt = concretize(g, mt);
+                    return mt;
+                }
             }
             zan_symbol_t *gf = zan_binder_lookup(g->binder, callee->ident.name);
-            if (gf && gf->kind == SYM_METHOD)
-                return method_ret_type_at(g, gf, e, NULL, locals);
+            if (gf && gf->kind == SYM_METHOD) {
+                zan_type_t *mt = method_ret_type_at(g, gf, e, NULL, locals);
+                if (mt && g->cur_mtps)
+                    mt = subst_method_tp(g, mt, g->cur_mtps, g->cur_mbind);
+                if (mt && mt->kind == TYPE_TYPE_PARAM) mt = concretize(g, mt);
+                return mt;
+            }
             return NULL;
         }
         if (callee->kind == AST_MEMBER_ACCESS) {
@@ -507,7 +522,15 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     if (!m) m = get_method_sym(ts, callee->member.name);
                     if (m) {
                         zan_type_t *gr = method_ret_type_at(g, m, e, NULL, locals);
-                        return gr ? gr : m->type;
+                        if (!gr) gr = m->type;
+                        zan_type_t *sinst = static_access_inst(g, obj);
+                        if (!sinst)
+                            sinst = infer_generic_static_recv_inst(g, ts, m, e, locals);
+                        if (gr && sinst) gr = subst_type_param_deep(g, gr, sinst);
+                        if (gr && g->cur_mtps)
+                            gr = subst_method_tp(g, gr, g->cur_mtps, g->cur_mbind);
+                        if (gr && gr->kind == TYPE_TYPE_PARAM) gr = concretize(g, gr);
+                        return gr;
                     }
                 }
             }

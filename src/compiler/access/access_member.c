@@ -458,7 +458,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                                 enum_val = em_decl->enum_member.value->int_val;
                             }
                             return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
-                                               (uint64_t)(uint32_t)enum_val, 0);
+                                               (uint64_t)enum_val, 1);
                         }
                         zan_ast_node_t *em_decl = enum_sym->members[ei]->decl;
                         if (em_decl && em_decl->kind == AST_ENUM_MEMBER &&
@@ -479,18 +479,21 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_symbol_t *cs = receiver_type_symbol(g, expr->member.object, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, expr->member.name);
+                zan_type_t *sinst = static_access_inst(g, expr->member.object);
                 zan_symbol_t *getter = property_getter_sym(g, fs);
                 if (getter) {
-                    return emit_property_getter_call(g, getter, cs->type, NULL,
+                    return emit_property_getter_call(g, getter,
+                        sinst ? sinst : cs->type, NULL,
                         expr->member.object, locals);
                 }
-                LLVMValueRef gv = get_static_field_global(g, cs, fs,
-                    static_access_inst(g, expr->member.object));
+                LLVMValueRef gv = get_static_field_global(g, cs, fs, sinst);
                 if (gv) {
-                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
-                                              : LLVMInt64TypeInContext(g->ctx);
+                    zan_type_t *fst = field_store_type(g, fs, sinst);
+                    zan_type_t *rft = fst ? fst : fs->type;
+                    LLVMTypeRef ft = rft ? map_type(g, rft)
+                                         : LLVMInt64TypeInContext(g->ctx);
                     return promote_loaded(g,
-                        LLVMBuildLoad2(g->builder, ft, gv, "sfld"), fs->type);
+                        LLVMBuildLoad2(g->builder, ft, gv, "sfld"), rft);
                 }
             }
         }

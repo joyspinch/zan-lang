@@ -79,7 +79,8 @@ partial class Irgen {
     }
 
     // Descriptor: { outer rank, element stride, ownership kind, element rank }.
-    // kind 0 = value/borrowed, 1 = ARC payload, 2 = delegate, 3 = array.
+    // kind 0 = value/borrowed, 1 = ARC payload, 2 = delegate, 3 = array,
+    // 4 = dynamic reference, 5 = string slot (string / byte[] / nint).
     // Nullable boxes remain borrowed until their separate ownership migration.
     int ArrayElementKind(Node ty) {
         if (ty == null) { return 0; }
@@ -87,6 +88,7 @@ partial class Irgen {
         if (IsNullableValue(ty)) { return 1; }
         if (IsDelegate(ty)) { return 2; }
         if (DynamicReferenceType(ty)) { return 4; }
+        if (IsStr(ty)) { return 5; }
         if (ArcManaged(ty) && !ArrayInlineStruct(ty)) { return 1; }
         return 0;
     }
@@ -309,10 +311,10 @@ partial class Irgen {
         H("done:");
         H("  ret void");
         H("}");
-        // Every array uses [dimensions...][descriptor|1][rc][count][data].
+        // Every array uses [dimensions...][magic][descriptor|1][rc][count][data].
         // The public data pointer is also the ARC owner, for every rank.
-        // The tagged, aligned descriptor at data[-3] distinguishes arrays from
-        // class/string identities without probing arbitrary candidate pointers.
+        // ZAN_ARRAY_RC_MAGIC at data[-4] and descriptor|1 at data[-3]
+        // distinguish arrays from strings, class objects, and raw nint pointers.
         // rc=-1 is immortal; the descriptor rank determines the free base.
         // Same fatal protocol as EmitAbortIf: report, exit(1), unreachable.
         H("@zarr_alloc_error = private constant [25 x i8] c\"array allocation failed\\0A\\00\"");
@@ -360,8 +362,8 @@ partial class Irgen {
         H("  br i1 %bad, label %fail, label %headercheck");
         H("headercheck:");
         H("  %rect = icmp sgt i64 %rank, 1");
-        H("  %rh = add i64 %rank, 3");
-        H("  %words = select i1 %rect, i64 %rh, i64 3");
+        H("  %rh = add i64 %rank, 4");
+        H("  %words = select i1 %rect, i64 %rh, i64 4");
         H("  %header = mul i64 %words, 8");
         H("  %available = sub i64 9223372036854775807, %header");
         H("  %limit = udiv i64 %available, %stride");
@@ -380,6 +382,8 @@ partial class Irgen {
         H("  call void @zan_rt_alloc_add(i64 %total)");
         H("  %base = bitcast i8* %raw to i64*");
         H("  %data = getelementptr i64, i64* %base, i64 %words");
+        H("  %mp = getelementptr i64, i64* %data, i64 -4");
+        H("  store i64 25404552263127619, i64* %mp");
         H("  %dp = getelementptr i64, i64* %data, i64 -3");
         H("  %di = ptrtoint i64* %desc to i64");
         H("  %tagged = or i64 %di, 1");
@@ -434,7 +438,7 @@ partial class Irgen {
         H("define void @zarr_element_retain(i64 %value, i64 %kind, i64 %rank) {");
         H("entry:");
         H("  %p = inttoptr i64 %value to i8*");
-        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic ]");
+        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic i64 5, label %str ]");
         H("obj:");
         H("  call void @zretain(i8* %p)");
         H("  br label %ret");
@@ -449,13 +453,16 @@ partial class Irgen {
         H("dynamic:");
         H("  call void @zref_retain(i8* %p)");
         H("  br label %ret");
+        H("str:");
+        H("  call void @zstr_slot_retain(i8* %p)");
+        H("  br label %ret");
         H("ret:");
         H("  ret void");
         H("}");
         H("define void @zarr_element_release(i64 %value, i64 %kind, i64 %rank) {");
         H("entry:");
         H("  %p = inttoptr i64 %value to i8*");
-        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic ]");
+        H("  switch i64 %kind, label %ret [ i64 1, label %obj i64 2, label %delegate i64 3, label %array i64 4, label %dynamic i64 5, label %str ]");
         H("obj:");
         H("  call void @zrelease(i8* %p)");
         H("  br label %ret");
@@ -469,6 +476,9 @@ partial class Irgen {
         H("  br label %ret");
         H("dynamic:");
         H("  call void @zref_release(i8* %p)");
+        H("  br label %ret");
+        H("str:");
+        H("  call void @zstr_slot_release(i8* %p)");
         H("  br label %ret");
         H("ret:");
         H("  ret void");
@@ -541,7 +551,7 @@ partial class Irgen {
         H("  %inner = load i64, i64* %irp");
         H("  %rect = icmp sgt i64 %rank, 1");
         H("  %dims = select i1 %rect, i64 %rank, i64 0");
-        H("  %header = add i64 %dims, 3");
+        H("  %header = add i64 %dims, 4");
         H("  %back = sub i64 0, %header");
         H("  %base = getelementptr i64, i64* %p, i64 %back");
         H("  %data = getelementptr i64, i64* %p, i64 0");

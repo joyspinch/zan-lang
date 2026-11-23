@@ -393,12 +393,19 @@ public partial class Program {
                                      string objPath, string optLevel, string archiveExports) {
         string target = "-mtriple=x86_64-w64-windows-gnu";
         List<string> optimize = new List<string>() { target, "-relocation-model=pic" };
+        string passSuffix = (optLevel == "-Os" || optLevel == "-Oz") ? ",mergefunc,globaldce" : "";
         if (archiveExports == "") {
-            optimize.Add(optLevel == "-O0" ? "-passes=verify" : optLevel);
+            if (optLevel == "-O0") {
+                optimize.Add("-passes=verify");
+            } else if (passSuffix != "") {
+                optimize.Add("-passes=default<" + optLevel.Substring(1) + ">" + passSuffix);
+            } else {
+                optimize.Add(optLevel);
+            }
         } else {
             optimize.Add("--internalize-public-api-file=" + archiveExports);
             optimize.Add(optLevel == "-O0" ? "-passes=internalize,globaldce,verify"
-                : "-passes=internalize,default<" + optLevel.Substring(1) + ">");
+                : "-passes=internalize,default<" + optLevel.Substring(1) + ">" + passSuffix);
         }
         optimize.Add(llPath); optimize.Add("-o"); optimize.Add(bitcodePath);
         int rc = Process.RunWithStandardStreams(dir + "/opt.exe", optimize);
@@ -406,7 +413,8 @@ public partial class Program {
 
         string codegen = optLevel == "-Os" || optLevel == "-Oz" ? "-O2" : optLevel;
         List<string> emit = new List<string>() {
-            target, "-relocation-model=pic", "-filetype=obj", codegen, bitcodePath, "-o", objPath
+            target, "-relocation-model=pic", "-filetype=obj",
+            "-function-sections", "-data-sections", codegen, bitcodePath, "-o", objPath
         };
         rc = Process.RunWithStandardStreams(dir + "/llc.exe", emit);
         if (rc != 0) { throw "zanc: LLVM object emission failed with exit code " + rc; }
@@ -431,7 +439,11 @@ public partial class Program {
             if (subsystem != "") { args.Add("--subsystem"); args.Add(subsystem); }
         }
         args.Add("--gc-sections");
-        if (stripSymbols) { args.Add("-s"); }
+        if (stripSymbols) {
+            args.Add("-s");
+            args.Add("--icf=safe");
+            args.Add("-O2");
+        }
         args.Add("-o"); args.Add(outPath);
         args.Add("-L" + lib);
         args.Add(lib + (dll ? "/dllcrt2.o" : "/crt2.o"));
@@ -505,20 +517,29 @@ public partial class Program {
         List<string> args = new List<string>();
         args.Add(optLevel != null && optLevel.Length > 0 ? optLevel : "-O2");
         args.Add("-Wno-override-module");
-        if (subsystem != "" || stripSymbols || debug) {
-            ProcessResult target = Process.CaptureSafe(clang, new List<string>() { "-print-target-triple" }, 10000);
-            if (!target.Ok()) { throw "zanc: cannot determine Clang's Windows target"; }
-            List<string> lines = target.Lines();
-            if (lines.Count == 0) { throw "zanc: Clang returned no Windows target"; }
-            if (lines[0].Contains("-msvc")) {
-                if (debug) { args.Add("-Wl,/debug:dwarf"); }
-                if (subsystem != "") { args.Add("-Wl,/subsystem:" + subsystem); }
-                if (subsystem == "windows") { args.Add("-Wl,/entry:mainCRTStartup"); }
-            } else {
-                if (stripSymbols) { args.Add("-s"); }
-                if (debug) { args.Add("-g"); }
-                if (subsystem != "") { args.Add(subsystem == "windows" ? "-mwindows" : "-mconsole"); }
+        ProcessResult target = Process.CaptureSafe(clang, new List<string>() { "-print-target-triple" }, 10000);
+        if (!target.Ok()) { throw "zanc: cannot determine Clang's Windows target"; }
+        List<string> lines = target.Lines();
+        if (lines.Count == 0) { throw "zanc: Clang returned no Windows target"; }
+        if (lines[0].Contains("-msvc")) {
+            if (stripSymbols) {
+                args.Add("-Wl,/OPT:REF");
+                args.Add("-Wl,/OPT:ICF");
             }
+            if (debug) { args.Add("-Wl,/debug:dwarf"); }
+            if (subsystem != "") { args.Add("-Wl,/subsystem:" + subsystem); }
+            if (subsystem == "windows") { args.Add("-Wl,/entry:mainCRTStartup"); }
+        } else if (lines[0].Contains("apple") || lines[0].Contains("darwin")) {
+            args.Add("-Wl,-dead_strip");
+            if (stripSymbols) { args.Add("-Wl,-S"); }
+            if (debug) { args.Add("-g"); }
+        } else {
+            args.Add("-ffunction-sections");
+            args.Add("-fdata-sections");
+            args.Add("-Wl,--gc-sections");
+            if (stripSymbols) { args.Add("-s"); }
+            if (debug) { args.Add("-g"); }
+            if (subsystem != "") { args.Add(subsystem == "windows" ? "-mwindows" : "-mconsole"); }
         }
         args.Add(llPath);
         if (File.Exists(rtDir + "/zanrt_sh_rt_file.obj")) {

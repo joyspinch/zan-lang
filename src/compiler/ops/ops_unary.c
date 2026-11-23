@@ -61,6 +61,7 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef mft = g->functions[fi].fn_type;
     LLVMValueRef mfn = route_generic_method(g, ot, op_sym, g->functions[fi].fn,
                                             mft, &mft);
+    LLVMValueRef gctx_arg = route_generic_method_gctx(g, ot, op_sym);
     zan_type_t *p1 = method_param_type_at(g, op_sym, 1, probe,
                                           expr->unary.operand, locals);
     bool op_generic = p1 && type_mentions_tp(p1);
@@ -74,7 +75,7 @@ static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
         if (LLVMTypeOf(arg) != p1t)
             arg = coerce_int_to(g, arg, p1t);
     }
-    LLVMValueRef res = zan_call2(g->builder, mft, mfn, &arg, 1, "opcall");
+    LLVMValueRef res = zan_call_with_gctx(g, mft, mfn, &arg, 1, gctx_arg, "opcall");
     emit_release_owned_call_temp(g, expr->unary.operand, arg, locals);
     return res;
 }

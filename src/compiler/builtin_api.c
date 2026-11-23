@@ -6,323 +6,346 @@
 #include <string.h>
 
 static const zan_builtin_member_t members_string[] = {
-    { "Length",      'P', "int Length" },
-    { "Substring",   'M', "string Substring(int start[, int length])" },
-    { "IndexOf",     'M', "int IndexOf(string needle[, int startIndex])" },
-    { "LastIndexOf", 'M', "int LastIndexOf(string needle)" },
-    { "Contains",    'M', "bool Contains(string needle)" },
-    { "StartsWith",  'M', "bool StartsWith(string prefix)" },
-    { "EndsWith",    'M', "bool EndsWith(string suffix)" },
-    { "Replace",     'M', "string Replace(string from, string to)" },
-    { "Trim",        'M', "string Trim()" },
-    { "ToUpper",     'M', "string ToUpper()" },
-    { "ToLower",     'M', "string ToLower()" },
-    { "Split",       'M', "List<string> Split(string separator[, StringSplitOptions options])" },
-    { "Equals",      'M', "bool Equals(string other)" },
-    { "ToString",    'M', "string ToString()" },
+    {"Length", 'P', "int Length"},
+    {"Substring", 'M', "string Substring(int start[, int length])"},
+    {"IndexOf", 'M', "int IndexOf(string needle[, int startIndex])"},
+    {"LastIndexOf", 'M', "int LastIndexOf(string needle)"},
+    {"Contains", 'M', "bool Contains(string needle)"},
+    {"StartsWith", 'M', "bool StartsWith(string prefix)"},
+    {"EndsWith", 'M', "bool EndsWith(string suffix)"},
+    {"Replace", 'M', "string Replace(string from, string to)"},
+    {"Trim", 'M', "string Trim()"},
+    {"ToUpper", 'M', "string ToUpper()"},
+    {"ToLower", 'M', "string ToLower()"},
+    {"Split", 'M',
+     "List<string> Split(string separator[, StringSplitOptions options])"},
+    {"Equals", 'M', "bool Equals(string other)"},
+    {"ToString", 'M', "string ToString()"},
 };
 
 static const zan_builtin_member_t members_list[] = {
-    { "Count",       'P', "int Count" },
-    { "Add",         'M', "void Add(T item)" },
-    { "Reserve",     'M', "void Reserve(int n)" },
-    { "AddRange",    'M', "void AddRange(List<T> items)" },
-    { "Insert",      'M', "void Insert(int index, T item)" },
-    { "RemoveAt",    'M', "void RemoveAt(int index)" },
-    { "Clear",       'M', "void Clear()" },
-    { "Contains",    'M', "bool Contains(T item)" },
-    { "IndexOf",     'M', "int IndexOf(T item)" },
-    { "LastIndexOf", 'M', "int LastIndexOf(T item)" },
-    { "Reverse",     'M', "void Reverse()" },
-    { "ToArray",     'M', "T[] ToArray()" },
+    {"Count", 'P', "int Count"},
+    {"Add", 'M', "void Add(T item)"},
+    {"Reserve", 'M', "void Reserve(int n)"},
+    {"AddRange", 'M', "void AddRange(List<T> items)"},
+    {"Insert", 'M', "void Insert(int index, T item)"},
+    {"RemoveAt", 'M', "void RemoveAt(int index)"},
+    {"Clear", 'M', "void Clear()"},
+    {"Contains", 'M', "bool Contains(T item)"},
+    {"IndexOf", 'M', "int IndexOf(T item)"},
+    {"LastIndexOf", 'M', "int LastIndexOf(T item)"},
+    {"Reverse", 'M', "void Reverse()"},
+    {"ToArray", 'M', "T[] ToArray()"},
 };
 
 static const zan_builtin_member_t members_dict[] = {
-    { "Count",       'P', "int Count" },
-    { "Keys",        'P', "List<K> Keys" },
-    { "Values",      'P', "List<V> Values" },
-    { "Add",         'M', "void Add(K key, V value)" },
-    { "Remove",      'M', "bool Remove(K key)" },
-    { "Clear",       'M', "void Clear()" },
-    { "ContainsKey", 'M', "bool ContainsKey(K key)" },
-    { "TryGetValue", 'M', "bool TryGetValue(K key, out V value)" },
+    {"Count", 'P', "int Count"},
+    {"Keys", 'P', "List<K> Keys"},
+    {"Values", 'P', "List<V> Values"},
+    {"Add", 'M', "void Add(K key, V value)"},
+    {"Remove", 'M', "bool Remove(K key)"},
+    {"Clear", 'M', "void Clear()"},
+    {"ContainsKey", 'M', "bool ContainsKey(K key)"},
+    {"TryGetValue", 'M', "bool TryGetValue(K key, out V value)"},
 };
 
 static const zan_builtin_member_t members_sb[] = {
-    { "Append",     'M', "void Append(object value)" },
-    { "AppendLine", 'M', "void AppendLine(object value)" },
-    { "Clear",      'M', "void Clear()" },
-    { "Length",     'P', "int Length" },
-    { "BufferPtr",  'M', "nint BufferPtr()" },
-    { "ToString",   'M', "string ToString()" },
+    {"Append", 'M', "void Append(object value)"},
+    {"AppendLine", 'M', "void AppendLine(object value)"},
+    {"Clear", 'M', "void Clear()"},
+    {"Length", 'P', "int Length"},
+    {"BufferPtr", 'M', "nint BufferPtr()"},
+    {"ToString", 'M', "string ToString()"},
 };
 
 static const zan_builtin_member_t members_console[] = {
-    { "WriteLine",       'M', "void WriteLine(object value)" },
-    { "ErrorWriteLine",  'M', "void ErrorWriteLine(string value)" },
-    { "Write",           'M', "void Write(object value)" },
-    { "PrintLine",       'M', "void PrintLine(object value)" },
-    { "ReadLine",        'M', "string ReadLine()" },
-    { "Read",            'M', "int Read()" },
-    { "ReadKey",         'M', "int ReadKey([bool intercept])" },
-    { "Clear",           'M', "void Clear()" },
-    { "ResetColor",      'M', "void ResetColor()" },
-    { "ForegroundColor", 'P', "ConsoleColor ForegroundColor" },
-    { "BackgroundColor", 'P', "ConsoleColor BackgroundColor" },
-    { "Title",           'P', "string Title" },
-    { "IsOutputRedirected", 'M', "bool IsOutputRedirected()" },
-    { "IsTerminal",      'M', "bool IsTerminal()" },
+    {"WriteLine", 'M', "void WriteLine(object value)"},
+    {"ErrorWriteLine", 'M', "void ErrorWriteLine(string value)"},
+    {"Write", 'M', "void Write(object value)"},
+    {"PrintLine", 'M', "void PrintLine(object value)"},
+    {"ReadLine", 'M', "string ReadLine()"},
+    {"Read", 'M', "int Read()"},
+    {"ReadKey", 'M', "int ReadKey([bool intercept])"},
+    {"Clear", 'M', "void Clear()"},
+    {"ResetColor", 'M', "void ResetColor()"},
+    {"ForegroundColor", 'P', "ConsoleColor ForegroundColor"},
+    {"BackgroundColor", 'P', "ConsoleColor BackgroundColor"},
+    {"Title", 'P', "string Title"},
+    {"IsOutputRedirected", 'M', "bool IsOutputRedirected()"},
+    {"IsTerminal", 'M', "bool IsTerminal()"},
 };
 
 static const zan_builtin_member_t members_math[] = {
-    { "Abs",     'M', "double Abs(double value)" },
-    { "Max",     'M', "int Max(int a, int b)" },
-    { "Max",     'M', "long Max(long a, long b)" },
-    { "Max",     'M', "uint Max(uint a, uint b)" },
-    { "Max",     'M', "ulong Max(ulong a, ulong b)" },
-    { "Max",     'M', "nint Max(nint a, nint b)" },
-    { "Max",     'M', "double Max(double a, double b)" },
-    { "Min",     'M', "int Min(int a, int b)" },
-    { "Min",     'M', "long Min(long a, long b)" },
-    { "Min",     'M', "uint Min(uint a, uint b)" },
-    { "Min",     'M', "ulong Min(ulong a, ulong b)" },
-    { "Min",     'M', "nint Min(nint a, nint b)" },
-    { "Min",     'M', "double Min(double a, double b)" },
-    { "Pow",     'M', "double Pow(double x, double y)" },
-    { "Sqrt",    'M', "double Sqrt(double value)" },
-    { "Round",   'M', "double Round(double value)" },
-    { "Floor",   'M', "double Floor(double value)" },
-    { "Ceiling", 'M', "double Ceiling(double value)" },
-    { "Sin",     'M', "double Sin(double value)" },
-    { "Cos",     'M', "double Cos(double value)" },
-    { "Tan",     'M', "double Tan(double value)" },
-    { "Atan2",   'M', "double Atan2(double y, double x)" },
-    { "Atan",    'M', "double Atan(double value)" },
-    { "Asin",    'M', "double Asin(double value)" },
-    { "Acos",    'M', "double Acos(double value)" },
+    {"Abs", 'M', "double Abs(double value)"},
+    {"Max", 'M', "int Max(int a, int b)"},
+    {"Max", 'M', "long Max(long a, long b)"},
+    {"Max", 'M', "uint Max(uint a, uint b)"},
+    {"Max", 'M', "ulong Max(ulong a, ulong b)"},
+    {"Max", 'M', "nint Max(nint a, nint b)"},
+    {"Max", 'M', "double Max(double a, double b)"},
+    {"Min", 'M', "int Min(int a, int b)"},
+    {"Min", 'M', "long Min(long a, long b)"},
+    {"Min", 'M', "uint Min(uint a, uint b)"},
+    {"Min", 'M', "ulong Min(ulong a, ulong b)"},
+    {"Min", 'M', "nint Min(nint a, nint b)"},
+    {"Min", 'M', "double Min(double a, double b)"},
+    {"Pow", 'M', "double Pow(double x, double y)"},
+    {"Sqrt", 'M', "double Sqrt(double value)"},
+    {"Round", 'M', "double Round(double value)"},
+    {"Floor", 'M', "double Floor(double value)"},
+    {"Ceiling", 'M', "double Ceiling(double value)"},
+    {"Sin", 'M', "double Sin(double value)"},
+    {"Cos", 'M', "double Cos(double value)"},
+    {"Tan", 'M', "double Tan(double value)"},
+    {"Atan2", 'M', "double Atan2(double y, double x)"},
+    {"Atan", 'M', "double Atan(double value)"},
+    {"Asin", 'M', "double Asin(double value)"},
+    {"Acos", 'M', "double Acos(double value)"},
 };
 
 static const zan_builtin_member_t members_convert[] = {
-    { "ToDouble", 'M', "double ToDouble(string text)" },
-    { "ToInt32",  'M', "int ToInt32(string text)" },
-    { "ToInt64",  'M', "long ToInt64(string text)" },
+    {"ToDouble", 'M', "double ToDouble(string text)"},
+    {"ToInt32", 'M', "int ToInt32(string text)"},
+    {"ToInt64", 'M', "long ToInt64(string text)"},
 };
 
 static const zan_builtin_member_t members_stringcls[] = {
-    { "Format",           'M', "string Format(string format, params object[] args)" },
-    { "Join",             'M', "string Join(string separator, List<string> values)" },
-    { "IsNullOrEmpty",    'M', "bool IsNullOrEmpty(string value)" },
-    { "CompareOrdinal",   'M', "int CompareOrdinal(string a, string b)" },
+    {"Format", 'M', "string Format(string format, params object[] args)"},
+    {"Join", 'M', "string Join(string separator, List<string> values)"},
+    {"IsNullOrEmpty", 'M', "bool IsNullOrEmpty(string value)"},
+    {"CompareOrdinal", 'M', "int CompareOrdinal(string a, string b)"},
 };
 
 /* char 的静态类（System.Char）：A525 补的 API 面。谓词走 <ctype.h>
  * （ASCII 口径，非 ASCII 与 C# 的 Unicode 类目有偏差，TASKS.md 有注）。 */
 static const zan_builtin_member_t members_charcls[] = {
-    { "IsDigit",         'M', "bool IsDigit(char c)" },
-    { "IsLetter",        'M', "bool IsLetter(char c)" },
-    { "IsLetterOrDigit", 'M', "bool IsLetterOrDigit(char c)" },
-    { "IsUpper",         'M', "bool IsUpper(char c)" },
-    { "IsLower",         'M', "bool IsLower(char c)" },
-    { "IsWhiteSpace",    'M', "bool IsWhiteSpace(char c)" },
-    { "ToUpper",         'M', "char ToUpper(char c)" },
-    { "ToLower",         'M', "char ToLower(char c)" },
+    {"IsDigit", 'M', "bool IsDigit(char c)"},
+    {"IsLetter", 'M', "bool IsLetter(char c)"},
+    {"IsLetterOrDigit", 'M', "bool IsLetterOrDigit(char c)"},
+    {"IsUpper", 'M', "bool IsUpper(char c)"},
+    {"IsLower", 'M', "bool IsLower(char c)"},
+    {"IsWhiteSpace", 'M', "bool IsWhiteSpace(char c)"},
+    {"ToUpper", 'M', "char ToUpper(char c)"},
+    {"ToLower", 'M', "char ToLower(char c)"},
 };
 
 static const zan_builtin_member_t members_file[] = {
-    { "Exists",        'M', "bool Exists(string path)" },
-    { "ReadAllText",   'M', "string ReadAllText(string path)" },
-    { "WriteAllText",  'M', "void WriteAllText(string path, string text)" },
-    { "AppendAllText", 'M', "void AppendAllText(string path, string text)" },
-    { "Delete",        'M', "void Delete(string path)" },
-    { "Copy",          'M', "void Copy(string from, string to)" },
-    { "Move",          'M', "void Move(string from, string to)" },
-    { "GetSize",       'M', "long GetSize(string path)" },
+    {"Exists", 'M', "bool Exists(string path)"},
+    {"ReadAllText", 'M', "string ReadAllText(string path)"},
+    {"WriteAllText", 'M', "void WriteAllText(string path, string text)"},
+    {"AppendAllText", 'M', "void AppendAllText(string path, string text)"},
+    {"Delete", 'M', "void Delete(string path)"},
+    {"Copy", 'M', "void Copy(string from, string to)"},
+    {"Move", 'M', "void Move(string from, string to)"},
+    {"GetSize", 'M', "long GetSize(string path)"},
 };
 
 static const zan_builtin_member_t members_dir[] = {
-    { "Exists",              'M', "bool Exists(string path)" },
-    { "CreateDirectory",     'M', "void CreateDirectory(string path)" },
-    { "Delete",              'M', "void Delete(string path)" },
-    { "ListNames",           'M', "string ListNames(string globPattern)" },
-    { "GetCurrentDirectory", 'M', "string GetCurrentDirectory()" },
-    { "SetCurrentDirectory", 'M', "void SetCurrentDirectory(string path)" },
+    {"Exists", 'M', "bool Exists(string path)"},
+    {"CreateDirectory", 'M', "void CreateDirectory(string path)"},
+    {"Delete", 'M', "void Delete(string path)"},
+    {"ListNames", 'M', "string ListNames(string globPattern)"},
+    {"GetCurrentDirectory", 'M', "string GetCurrentDirectory()"},
+    {"SetCurrentDirectory", 'M', "void SetCurrentDirectory(string path)"},
 };
 
 static const zan_builtin_member_t members_env[] = {
-    { "ArgCount", 'M', "int ArgCount()" },
-    { "ArgAt",    'M', "string ArgAt(int index)" },
-    { "ExeDir",   'M', "string ExeDir()" },
+    {"ArgCount", 'M', "int ArgCount()"},
+    {"ArgAt", 'M', "string ArgAt(int index)"},
+    {"ExeDir", 'M', "string ExeDir()"},
 };
 
 static const zan_builtin_member_t members_nativemem[] = {
-    { "Alloc",     'M', "nint Alloc(long size)" },
-    { "Free",      'M', "void Free(nint ptr)" },
-    { "Copy",      'M', "void Copy(nint dst, nint src, long size)" },
-    { "Copy2D",    'M', "void Copy2D(nint dst, long dstStride, nint src, long srcStride, long rowBytes, long height)" },
-    { "Fill",      'M', "void Fill(nint ptr, int value, long size)" },
-    { "Compare",   'M', "int Compare(nint a, nint b, long size)" },
-    { "ScanNotByte", 'M', "long ScanNotByte(nint ptr, long offset, int byte, long limit)" },
-    { "ScanNotAnyOf", 'M', "long ScanNotAnyOf(nint ptr, long offset, string acceptSet, long limit)" },
-    { "FindNotAnyOf", 'M', "long FindNotAnyOf(nint ptr, long offset, string rejectSet, long limit)" },
-    { "Load64", 'M', "long Load64(nint ptr, long offset)" },
-    { "AsI32",  'M', "int AsI32(float value)" },
-    { "AsF32",  'M', "float AsF32(int bits)" },
-    { "AsI64",  'M', "long AsI64(double value)" },
-    { "AsF64",  'M', "double AsF64(long bits)" },
-    { "GetString", 'M', "string GetString(nint ptr)" },
-    { "PutString", 'M', "void PutString(nint ptr, string text)" },
+    {"Alloc", 'M', "nint Alloc(long size)"},
+    {"Free", 'M', "void Free(nint ptr)"},
+    {"Copy", 'M', "void Copy(nint dst, nint src, long size)"},
+    {"Copy2D", 'M',
+     "void Copy2D(nint dst, long dstStride, nint src, long srcStride, long "
+     "rowBytes, long height)"},
+    {"Fill", 'M', "void Fill(nint ptr, int value, long size)"},
+    {"Compare", 'M', "int Compare(nint a, nint b, long size)"},
+    {"ScanNotByte", 'M',
+     "long ScanNotByte(nint ptr, long offset, int byte, long limit)"},
+    {"ScanNotAnyOf", 'M',
+     "long ScanNotAnyOf(nint ptr, long offset, string acceptSet, long limit)"},
+    {"FindNotAnyOf", 'M',
+     "long FindNotAnyOf(nint ptr, long offset, string rejectSet, long limit)"},
+    {"Load64", 'M', "long Load64(nint ptr, long offset)"},
+    {"AsI32", 'M', "int AsI32(float value)"},
+    {"AsF32", 'M', "float AsF32(int bits)"},
+    {"AsI64", 'M', "long AsI64(double value)"},
+    {"AsF64", 'M', "double AsF64(long bits)"},
+    {"GetString", 'M', "string GetString(nint ptr)"},
+    {"PutString", 'M', "void PutString(nint ptr, string text)"},
 };
 
 static const zan_builtin_member_t members_x86_aes[] = {
-    { "Encrypt",            'M', "Vector128 Encrypt(Vector128 value, Vector128 roundKey)" },
-    { "EncryptLast",        'M', "Vector128 EncryptLast(Vector128 value, Vector128 roundKey)" },
-    { "Decrypt",            'M', "Vector128 Decrypt(Vector128 value, Vector128 roundKey)" },
-    { "DecryptLast",        'M', "Vector128 DecryptLast(Vector128 value, Vector128 roundKey)" },
-    { "KeygenAssist",       'M', "Vector128 KeygenAssist(Vector128 value, byte rcon)" },
-    { "InverseMixColumns",  'M', "Vector128 InverseMixColumns(Vector128 value)" },
-    { "IsSupported",        'P', "bool IsSupported" },
+    {"Encrypt", 'M', "Vector128 Encrypt(Vector128 value, Vector128 roundKey)"},
+    {"EncryptLast", 'M',
+     "Vector128 EncryptLast(Vector128 value, Vector128 roundKey)"},
+    {"Decrypt", 'M', "Vector128 Decrypt(Vector128 value, Vector128 roundKey)"},
+    {"DecryptLast", 'M',
+     "Vector128 DecryptLast(Vector128 value, Vector128 roundKey)"},
+    {"KeygenAssist", 'M', "Vector128 KeygenAssist(Vector128 value, byte rcon)"},
+    {"InverseMixColumns", 'M', "Vector128 InverseMixColumns(Vector128 value)"},
+    {"IsSupported", 'P', "bool IsSupported"},
 };
 
 static const zan_builtin_member_t members_x86_sse2[] = {
-    { "Xor",            'M', "Vector128 Xor(Vector128 left, Vector128 right)" },
-    { "And",            'M', "Vector128 And(Vector128 left, Vector128 right)" },
-    { "Or",             'M', "Vector128 Or(Vector128 left, Vector128 right)" },
-    { "CompareEqual",   'M', "Vector128 CompareEqual(Vector128 left, Vector128 right)" },
-    { "MoveMask",       'M', "int MoveMask(Vector128 value)" },
-    { "LoadVector128",  'M', "Vector128 LoadVector128(nint address)" },
-    { "Store",          'M', "void Store(nint address, Vector128 source)" },
-    { "IsSupported",    'P', "bool IsSupported" },
+    {"Xor", 'M', "Vector128 Xor(Vector128 left, Vector128 right)"},
+    {"And", 'M', "Vector128 And(Vector128 left, Vector128 right)"},
+    {"Or", 'M', "Vector128 Or(Vector128 left, Vector128 right)"},
+    {"CompareEqual", 'M',
+     "Vector128 CompareEqual(Vector128 left, Vector128 right)"},
+    {"MoveMask", 'M', "int MoveMask(Vector128 value)"},
+    {"LoadVector128", 'M', "Vector128 LoadVector128(nint address)"},
+    {"Store", 'M', "void Store(nint address, Vector128 source)"},
+    {"IsSupported", 'P', "bool IsSupported"},
 };
 
 static const zan_builtin_member_t members_vector128[] = {
-    { "Create",                       'M', "Vector128 Create(byte value)" },
-    { "Load",                         'M', "Vector128 Load(nint address)" },
-    { "Load",                         'M', "Vector128 Load(byte[] source)" },
-    { "Load",                         'M', "Vector128 Load(byte[] source, int offset)" },
-    { "Load",                         'M', "Vector128 Load(float[] source, int offset)" },
-    { "Store",                        'M', "void Store(nint address, Vector128 source)" },
-    { "Store",                        'M', "void Store(byte[] dest, Vector128 source)" },
-    { "Store",                        'M', "void Store(byte[] dest, int offset, Vector128 source)" },
-    { "Store",                        'M', "void Store(float[] dest, int offset, Vector128 source)" },
-    { "And",                          'M', "Vector128 And(Vector128 left, Vector128 right)" },
-    { "Or",                           'M', "Vector128 Or(Vector128 left, Vector128 right)" },
-    { "Xor",                          'M', "Vector128 Xor(Vector128 left, Vector128 right)" },
-    { "AndNot",                       'M', "Vector128 AndNot(Vector128 left, Vector128 right)" },
-    { "Equals",                       'M', "Vector128 Equals(Vector128 left, Vector128 right)" },
-    { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector128 value)" },
-    { "Shuffle",                      'M', "Vector128 Shuffle(Vector128 value, Vector128 mask)" },
-    { "Add",                          'M', "Vector128 Add(Vector128 left, Vector128 right)" },
-    { "Subtract",                     'M', "Vector128 Subtract(Vector128 left, Vector128 right)" },
-    { "AddSaturate",                  'M', "Vector128 AddSaturate(Vector128 left, Vector128 right)" },
-    { "SubtractSaturate",             'M', "Vector128 SubtractSaturate(Vector128 left, Vector128 right)" },
-    { "Min",                          'M', "Vector128 Min(Vector128 left, Vector128 right)" },
-    { "Max",                          'M', "Vector128 Max(Vector128 left, Vector128 right)" },
-    { "Average",                      'M', "Vector128 Average(Vector128 left, Vector128 right)" },
-    { "ConditionalSelect",            'M', "Vector128 ConditionalSelect(Vector128 condition, Vector128 left, Vector128 right)" },
-    { "UnpackLow",                    'M', "Vector128 UnpackLow(Vector128 left, Vector128 right)" },
-    { "UnpackHigh",                   'M', "Vector128 UnpackHigh(Vector128 left, Vector128 right)" },
-    { "GreaterThan",                  'M', "Vector128 GreaterThan(Vector128 left, Vector128 right)" },
-    { "LessThan",                     'M', "Vector128 LessThan(Vector128 left, Vector128 right)" },
-    { "Prefetch",                     'M', "void Prefetch(nint address)" },
-    { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
-    { "Create",                       'M', "Vector128 Create(float value)" },
-    { "Create",                       'M', "Vector128 Create(float e0, float e1, float e2, float e3)" },
-    { "AddFloat",                     'M', "Vector128 AddFloat(Vector128 left, Vector128 right)" },
-    { "SubtractFloat",                'M', "Vector128 SubtractFloat(Vector128 left, Vector128 right)" },
-    { "Multiply",                     'M', "Vector128 Multiply(Vector128 left, Vector128 right)" },
-    { "MultiplyAdd",                  'M', "Vector128 MultiplyAdd(Vector128 a, Vector128 b, Vector128 c)" },
-    { "Sqrt",                         'M', "Vector128 Sqrt(Vector128 value)" },
-    { "ReciprocalSqrt",               'M', "Vector128 ReciprocalSqrt(Vector128 value)" },
-    { "Zero",                         'P', "Vector128 Zero" },
-    { "AllBitsSet",                   'P', "Vector128 AllBitsSet" },
+    {"Create", 'M', "Vector128 Create(byte value)"},
+    {"Load", 'M', "Vector128 Load(nint address)"},
+    {"Load", 'M', "Vector128 Load(byte[] source)"},
+    {"Load", 'M', "Vector128 Load(byte[] source, int offset)"},
+    {"Load", 'M', "Vector128 Load(float[] source, int offset)"},
+    {"Store", 'M', "void Store(nint address, Vector128 source)"},
+    {"Store", 'M', "void Store(byte[] dest, Vector128 source)"},
+    {"Store", 'M', "void Store(byte[] dest, int offset, Vector128 source)"},
+    {"Store", 'M', "void Store(float[] dest, int offset, Vector128 source)"},
+    {"And", 'M', "Vector128 And(Vector128 left, Vector128 right)"},
+    {"Or", 'M', "Vector128 Or(Vector128 left, Vector128 right)"},
+    {"Xor", 'M', "Vector128 Xor(Vector128 left, Vector128 right)"},
+    {"AndNot", 'M', "Vector128 AndNot(Vector128 left, Vector128 right)"},
+    {"Equals", 'M', "Vector128 Equals(Vector128 left, Vector128 right)"},
+    {"ExtractMostSignificantBits", 'M',
+     "int ExtractMostSignificantBits(Vector128 value)"},
+    {"Shuffle", 'M', "Vector128 Shuffle(Vector128 value, Vector128 mask)"},
+    {"Add", 'M', "Vector128 Add(Vector128 left, Vector128 right)"},
+    {"Subtract", 'M', "Vector128 Subtract(Vector128 left, Vector128 right)"},
+    {"AddSaturate", 'M',
+     "Vector128 AddSaturate(Vector128 left, Vector128 right)"},
+    {"SubtractSaturate", 'M',
+     "Vector128 SubtractSaturate(Vector128 left, Vector128 right)"},
+    {"Min", 'M', "Vector128 Min(Vector128 left, Vector128 right)"},
+    {"Max", 'M', "Vector128 Max(Vector128 left, Vector128 right)"},
+    {"Average", 'M', "Vector128 Average(Vector128 left, Vector128 right)"},
+    {"ConditionalSelect", 'M',
+     "Vector128 ConditionalSelect(Vector128 condition, Vector128 left, "
+     "Vector128 right)"},
+    {"UnpackLow", 'M', "Vector128 UnpackLow(Vector128 left, Vector128 right)"},
+    {"UnpackHigh", 'M',
+     "Vector128 UnpackHigh(Vector128 left, Vector128 right)"},
+    {"GreaterThan", 'M',
+     "Vector128 GreaterThan(Vector128 left, Vector128 right)"},
+    {"LessThan", 'M', "Vector128 LessThan(Vector128 left, Vector128 right)"},
+    {"Prefetch", 'M', "void Prefetch(nint address)"},
+    {"Prefetch", 'M', "void Prefetch(byte[] source, int offset)"},
+    {"Create", 'M', "Vector128 Create(float value)"},
+    {"Create", 'M', "Vector128 Create(float e0, float e1, float e2, float e3)"},
+    {"AddFloat", 'M', "Vector128 AddFloat(Vector128 left, Vector128 right)"},
+    {"SubtractFloat", 'M',
+     "Vector128 SubtractFloat(Vector128 left, Vector128 right)"},
+    {"Multiply", 'M', "Vector128 Multiply(Vector128 left, Vector128 right)"},
+    {"MultiplyAdd", 'M',
+     "Vector128 MultiplyAdd(Vector128 a, Vector128 b, Vector128 c)"},
+    {"Sqrt", 'M', "Vector128 Sqrt(Vector128 value)"},
+    {"ReciprocalSqrt", 'M', "Vector128 ReciprocalSqrt(Vector128 value)"},
+    {"Zero", 'P', "Vector128 Zero"},
+    {"AllBitsSet", 'P', "Vector128 AllBitsSet"},
 };
 
 static const zan_builtin_member_t members_vector256[] = {
-    { "Create",                       'M', "Vector256 Create(byte value)" },
-    { "Load",                         'M', "Vector256 Load(nint address)" },
-    { "Load",                         'M', "Vector256 Load(byte[] source)" },
-    { "Load",                         'M', "Vector256 Load(byte[] source, int offset)" },
-    { "Load",                         'M', "Vector256 Load(float[] source, int offset)" },
-    { "Store",                        'M', "void Store(nint address, Vector256 source)" },
-    { "Store",                        'M', "void Store(byte[] dest, Vector256 source)" },
-    { "Store",                        'M', "void Store(byte[] dest, int offset, Vector256 source)" },
-    { "Store",                        'M', "void Store(float[] dest, int offset, Vector256 source)" },
-    { "And",                          'M', "Vector256 And(Vector256 left, Vector256 right)" },
-    { "Or",                           'M', "Vector256 Or(Vector256 left, Vector256 right)" },
-    { "Xor",                          'M', "Vector256 Xor(Vector256 left, Vector256 right)" },
-    { "AndNot",                       'M', "Vector256 AndNot(Vector256 left, Vector256 right)" },
-    { "Equals",                       'M', "Vector256 Equals(Vector256 left, Vector256 right)" },
-    { "ExtractMostSignificantBits",   'M', "int ExtractMostSignificantBits(Vector256 value)" },
-    { "Add",                          'M', "Vector256 Add(Vector256 left, Vector256 right)" },
-    { "Subtract",                     'M', "Vector256 Subtract(Vector256 left, Vector256 right)" },
-    { "AddSaturate",                  'M', "Vector256 AddSaturate(Vector256 left, Vector256 right)" },
-    { "SubtractSaturate",             'M', "Vector256 SubtractSaturate(Vector256 left, Vector256 right)" },
-    { "Min",                          'M', "Vector256 Min(Vector256 left, Vector256 right)" },
-    { "Max",                          'M', "Vector256 Max(Vector256 left, Vector256 right)" },
-    { "Average",                      'M', "Vector256 Average(Vector256 left, Vector256 right)" },
-    { "ConditionalSelect",            'M', "Vector256 ConditionalSelect(Vector256 condition, Vector256 left, Vector256 right)" },
-    { "Prefetch",                     'M', "void Prefetch(nint address)" },
-    { "Prefetch",                     'M', "void Prefetch(byte[] source, int offset)" },
-    { "Zero",                         'P', "Vector256 Zero" },
-    { "AllBitsSet",                   'P', "Vector256 AllBitsSet" },
+    {"Create", 'M', "Vector256 Create(byte value)"},
+    {"Load", 'M', "Vector256 Load(nint address)"},
+    {"Load", 'M', "Vector256 Load(byte[] source)"},
+    {"Load", 'M', "Vector256 Load(byte[] source, int offset)"},
+    {"Load", 'M', "Vector256 Load(float[] source, int offset)"},
+    {"Store", 'M', "void Store(nint address, Vector256 source)"},
+    {"Store", 'M', "void Store(byte[] dest, Vector256 source)"},
+    {"Store", 'M', "void Store(byte[] dest, int offset, Vector256 source)"},
+    {"Store", 'M', "void Store(float[] dest, int offset, Vector256 source)"},
+    {"And", 'M', "Vector256 And(Vector256 left, Vector256 right)"},
+    {"Or", 'M', "Vector256 Or(Vector256 left, Vector256 right)"},
+    {"Xor", 'M', "Vector256 Xor(Vector256 left, Vector256 right)"},
+    {"AndNot", 'M', "Vector256 AndNot(Vector256 left, Vector256 right)"},
+    {"Equals", 'M', "Vector256 Equals(Vector256 left, Vector256 right)"},
+    {"ExtractMostSignificantBits", 'M',
+     "int ExtractMostSignificantBits(Vector256 value)"},
+    {"Add", 'M', "Vector256 Add(Vector256 left, Vector256 right)"},
+    {"Subtract", 'M', "Vector256 Subtract(Vector256 left, Vector256 right)"},
+    {"AddSaturate", 'M',
+     "Vector256 AddSaturate(Vector256 left, Vector256 right)"},
+    {"SubtractSaturate", 'M',
+     "Vector256 SubtractSaturate(Vector256 left, Vector256 right)"},
+    {"Min", 'M', "Vector256 Min(Vector256 left, Vector256 right)"},
+    {"Max", 'M', "Vector256 Max(Vector256 left, Vector256 right)"},
+    {"Average", 'M', "Vector256 Average(Vector256 left, Vector256 right)"},
+    {"ConditionalSelect", 'M',
+     "Vector256 ConditionalSelect(Vector256 condition, Vector256 left, "
+     "Vector256 right)"},
+    {"Prefetch", 'M', "void Prefetch(nint address)"},
+    {"Prefetch", 'M', "void Prefetch(byte[] source, int offset)"},
+    {"Zero", 'P', "Vector256 Zero"},
+    {"AllBitsSet", 'P', "Vector256 AllBitsSet"},
 };
 
 static const zan_builtin_member_t members_x86_sse42[] = {
-    { "Crc32",          'M', "uint Crc32(uint crc, byte data)" },
-    { "Crc32",          'M', "uint Crc32(uint crc, ushort data)" },
-    { "Crc32",          'M', "uint Crc32(uint crc, uint data)" },
-    { "Crc32",          'M', "ulong Crc32(ulong crc, ulong data)" },
-    { "IsSupported",    'P', "bool IsSupported" },
+    {"Crc32", 'M', "uint Crc32(uint crc, byte data)"},
+    {"Crc32", 'M', "uint Crc32(uint crc, ushort data)"},
+    {"Crc32", 'M', "uint Crc32(uint crc, uint data)"},
+    {"Crc32", 'M', "ulong Crc32(ulong crc, ulong data)"},
+    {"IsSupported", 'P', "bool IsSupported"},
 };
 
 static const zan_builtin_member_t members_bitops[] = {
-    { "PopCount",           'M', "int PopCount(int value)" },
-    { "LeadingZeroCount",   'M', "int LeadingZeroCount(int value)" },
-    { "TrailingZeroCount",  'M', "int TrailingZeroCount(int value)" },
-    { "RotateLeft",         'M', "int RotateLeft(int value, int offset)" },
-    { "RotateRight",        'M', "int RotateRight(int value, int offset)" },
-    { "ReverseEndianness",  'M', "int ReverseEndianness(int value)" },
-    { "Log2",               'M', "int Log2(int value)" },
-    { "IsPow2",             'M', "bool IsPow2(int value)" },
-    { "RoundUpToPowerOf2",  'M', "int RoundUpToPowerOf2(int value)" },
-    { "ResetLowestSetBit",  'M', "int ResetLowestSetBit(int value)" },
-    { "ExtractLowestSetBit",'M', "int ExtractLowestSetBit(int value)" },
+    {"PopCount", 'M', "int PopCount(int value)"},
+    {"LeadingZeroCount", 'M', "int LeadingZeroCount(int value)"},
+    {"TrailingZeroCount", 'M', "int TrailingZeroCount(int value)"},
+    {"RotateLeft", 'M', "int RotateLeft(int value, int offset)"},
+    {"RotateRight", 'M', "int RotateRight(int value, int offset)"},
+    {"ReverseEndianness", 'M', "int ReverseEndianness(int value)"},
+    {"Log2", 'M', "int Log2(int value)"},
+    {"IsPow2", 'M', "bool IsPow2(int value)"},
+    {"RoundUpToPowerOf2", 'M', "int RoundUpToPowerOf2(int value)"},
+    {"ResetLowestSetBit", 'M', "int ResetLowestSetBit(int value)"},
+    {"ExtractLowestSetBit", 'M', "int ExtractLowestSetBit(int value)"},
 };
 
 static const zan_builtin_member_t members_cpu[] = {
-    { "HasPopcnt", 'P', "bool HasPopcnt" },
-    { "HasLzcnt",  'P', "bool HasLzcnt" },
-    { "HasSse42",  'P', "bool HasSse42" },
-    { "HasAvx2",   'P', "bool HasAvx2" },
-    { "HasAesNi",  'P', "bool HasAesNi" },
-    { "HasNeon",   'P', "bool HasNeon" },
-    { "CpuFeature",'M', "int CpuFeature(int id)" },
+    {"HasPopcnt", 'P', "bool HasPopcnt"},
+    {"HasLzcnt", 'P', "bool HasLzcnt"},
+    {"HasSse42", 'P', "bool HasSse42"},
+    {"HasAvx2", 'P', "bool HasAvx2"},
+    {"HasAesNi", 'P', "bool HasAesNi"},
+    {"HasNeon", 'P', "bool HasNeon"},
+    {"CpuFeature", 'M', "int CpuFeature(int id)"},
 };
 
 static const zan_builtin_member_t members_task[] = {
-    { "Spawn",  'M', "long Spawn(asyncCall)" },
-    { "Run",    'M', "long Run(asyncCall)" },
-    { "Delay",  'M', "await Task.Delay(long ms)" },
-    { "Yield",  'M', "await Task.Yield()" },
-    { "WhenAll",'M', "async int WhenAll(List<long> handles)" },
-    { "WhenAny",'M', "async int WhenAny(List<long> handles)" },
-    { "IsDone", 'M', "int IsDone(long handle)" },
-    { "Release", 'M', "void Release(long handle)" },
-    { "Cancel", 'M', "void Cancel(long handle)" },
-    { "IsCancellationRequested", 'M', "int IsCancellationRequested()" },
-    { "JoinNew",   'M', "long JoinNew(int npairs, int any)" },
-    { "JoinBind",  'M', "int JoinBind(long entry, long handle, int idx)" },
-    { "JoinWait",  'M', "await int JoinWait(long entry)" },
-    { "JoinWaitOwned", 'M', "await int JoinWaitOwned(long entry)" },
-    { "JoinCancel",'M', "void JoinCancel(long entry)" },
+    {"Spawn", 'M', "long Spawn(asyncCall)"},
+    {"Run", 'M', "long Run(asyncCall)"},
+    {"Delay", 'M', "await Task.Delay(long ms)"},
+    {"Yield", 'M', "await Task.Yield()"},
+    {"WhenAll", 'M', "async int WhenAll(List<long> handles)"},
+    {"WhenAny", 'M', "async int WhenAny(List<long> handles)"},
+    {"IsDone", 'M', "int IsDone(long handle)"},
+    {"Release", 'M', "void Release(long handle)"},
+    {"Cancel", 'M', "void Cancel(long handle)"},
+    {"IsCancellationRequested", 'M', "int IsCancellationRequested()"},
+    {"JoinNew", 'M', "long JoinNew(int npairs, int any)"},
+    {"JoinBind", 'M', "int JoinBind(long entry, long handle, int idx)"},
+    {"JoinWait", 'M', "await int JoinWait(long entry)"},
+    {"JoinWaitOwned", 'M', "await int JoinWaitOwned(long entry)"},
+    {"JoinCancel", 'M', "void JoinCancel(long entry)"},
 };
 
 static const zan_builtin_member_t members_scalar[] = {
-    { "ToString",            'M', "string ToString()" },
+    {"ToString", 'M', "string ToString()"},
 };
 
-#define BT(name, pub, disp, stat, arr) \
-    { name, pub, disp, stat, arr, (int)(sizeof(arr) / sizeof((arr)[0])) }
+#define BT(name, pub, disp, stat, arr)                                         \
+  {name, pub, disp, stat, arr, (int)(sizeof(arr) / sizeof((arr)[0]))}
 
 static const zan_builtin_type_t builtin_types[] = {
     BT("int", "int", "int", 0, members_scalar),
@@ -363,16 +386,20 @@ static const zan_builtin_type_t builtin_types[] = {
 };
 
 const zan_builtin_type_t *zan_builtin_types(int *count) {
-    if (count) *count = (int)(sizeof(builtin_types) / sizeof(builtin_types[0]));
-    return builtin_types;
+  if (count)
+    *count = (int)(sizeof(builtin_types) / sizeof(builtin_types[0]));
+  return builtin_types;
 }
 
 const zan_builtin_type_t *zan_builtin_find(const char *type) {
-    if (!type) return NULL;
-    for (size_t i = 0; i < sizeof(builtin_types) / sizeof(builtin_types[0]); i++) {
-        if (strcmp(builtin_types[i].type, type) == 0) return &builtin_types[i];
-    }
+  if (!type)
     return NULL;
+  for (size_t i = 0; i < sizeof(builtin_types) / sizeof(builtin_types[0]);
+       i++) {
+    if (strcmp(builtin_types[i].type, type) == 0)
+      return &builtin_types[i];
+  }
+  return NULL;
 }
 
 /* 取内建方法的**形参类型列表**（签名的括号里，按逗号分隔）。
@@ -390,149 +417,181 @@ const zan_builtin_type_t *zan_builtin_find(const char *type) {
  */
 int zan_builtin_member_params(const char *type, const char *name, int name_len,
                               const char **out, int max_out) {
-    if (!out || max_out <= 0) return 0;
-    const zan_builtin_type_t *bt = zan_builtin_find(type);
-    if (!bt || !name || name_len <= 0) return 0;
-    for (int i = 0; i < bt->member_count; i++) {
-        if ((int)strlen(bt->members[i].name) != name_len ||
-            memcmp(bt->members[i].name, name, (size_t)name_len) != 0)
-            continue;
-        if (bt->members[i].kind != 'M') return 0;
-        const char *sig = bt->members[i].sig;
-        if (!sig) return 0;
-        const char *open = strchr(sig, '(');
-        if (!open) return 0;
-        const char *close = strchr(open, ')');
-        if (!close) return 0;
-        int n = 0;
-        const char *p = open + 1;
-        while (p < close) {
-            /* 跳到下一个形参类型的开头（跳过名字与修饰符）。可选参数写成
-             * "int start[, int length]"，方括号是标记，跳过。 */
-            while (p < close && (*p == ' ' || *p == ',' || *p == '[' ||
-                                 *p == ']')) p++;
-            const char *start = p;
-            while (p < close && *p != ',' && *p != ' ' && *p != '[' && *p != ']')
-                p++;
-            const char *end = p;
-            const char *last_space = NULL;
-            for (const char *q = start; q < end; q++)
-                if (*q == ' ') last_space = q;
-            const char *type_start = last_space ? last_space + 1 : start;
-            if (type_start < end) {
-                if (n < max_out) {
-                    static char buf[16][64];
-                    size_t len = (size_t)(end - type_start);
-                    if (len >= sizeof(buf[0])) len = sizeof(buf[0]) - 1;
-                    memcpy(buf[n], type_start, len);
-                    buf[n][len] = '\0';
-                    out[n] = buf[n];
-                }
-                n++;
-            }
-            while (p < close && *p != ',') p++;
-            if (p < close) p++;
-        }
-        return n;
-    }
+  if (!out || max_out <= 0)
     return 0;
+  const zan_builtin_type_t *bt = zan_builtin_find(type);
+  if (!bt || !name || name_len <= 0)
+    return 0;
+  for (int i = 0; i < bt->member_count; i++) {
+    if ((int)strlen(bt->members[i].name) != name_len ||
+        memcmp(bt->members[i].name, name, (size_t)name_len) != 0)
+      continue;
+    if (bt->members[i].kind != 'M')
+      return 0;
+    const char *sig = bt->members[i].sig;
+    if (!sig)
+      return 0;
+    const char *open = strchr(sig, '(');
+    if (!open)
+      return 0;
+    const char *close = strchr(open, ')');
+    if (!close)
+      return 0;
+    int n = 0;
+    const char *p = open + 1;
+    while (p < close) {
+      /* 跳到下一个形参类型的开头（跳过名字与修饰符）。可选参数写成
+       * "int start[, int length]"，方括号是标记，跳过。 */
+      while (p < close && (*p == ' ' || *p == ',' || *p == '[' || *p == ']'))
+        p++;
+      const char *start = p;
+      while (p < close && *p != ',' && *p != ' ' && *p != '[' && *p != ']')
+        p++;
+      const char *end = p;
+      const char *last_space = NULL;
+      for (const char *q = start; q < end; q++)
+        if (*q == ' ')
+          last_space = q;
+      const char *type_start = last_space ? last_space + 1 : start;
+      if (type_start < end) {
+        if (n < max_out) {
+          static char buf[16][64];
+          size_t len = (size_t)(end - type_start);
+          if (len >= sizeof(buf[0]))
+            len = sizeof(buf[0]) - 1;
+          memcpy(buf[n], type_start, len);
+          buf[n][len] = '\0';
+          out[n] = buf[n];
+        }
+        n++;
+      }
+      while (p < close && *p != ',')
+        p++;
+      if (p < close)
+        p++;
+    }
+    return n;
+  }
+  return 0;
 }
 
 /* 获取内建成员的返回值类型名称（解析方法/属性签名中首个空格前的类型名） */
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
-    static const char *results[] = {
-        "string", "int", "long", "uint", "ulong", "double", "bool", "void", "nint", "char",
-        "List<string>", "List<K>", "List<V>", "ConsoleColor", "T[]",
-        "Vector128", "Vector256",
-    };
-    const zan_builtin_type_t *bt = zan_builtin_find(type);
-    if (!bt || !name || name_len <= 0) return NULL;
-    const char *result = NULL;
-    for (int i = 0; i < bt->member_count; i++) {
-        const char *m = bt->members[i].name;
-        if ((int)strlen(m) != name_len || memcmp(m, name, (size_t)name_len) != 0)
-            continue;
-        const char *sig = bt->members[i].sig;
-        const char *sp = strchr(sig, ' ');
-        if (!sp) return NULL;
-        size_t len = (size_t)(sp - sig);
-        const char *current = NULL;
-        for (size_t r = 0; r < sizeof(results) / sizeof(results[0]); r++) {
-            if (strlen(results[r]) == len && memcmp(results[r], sig, len) == 0) {
-                current = results[r];
-                break;
-            }
-        }
-        if (!current || (result && result != current)) return NULL;
-        result = current;
+  static const char *results[] = {
+      "string",  "int",          "long", "uint",      "ulong",        "double",
+      "bool",    "void",         "nint", "char",      "List<string>", "List<K>",
+      "List<V>", "ConsoleColor", "T[]",  "Vector128", "Vector256",
+  };
+  const zan_builtin_type_t *bt = zan_builtin_find(type);
+  if (!bt || !name || name_len <= 0)
+    return NULL;
+  const char *result = NULL;
+  for (int i = 0; i < bt->member_count; i++) {
+    const char *m = bt->members[i].name;
+    if ((int)strlen(m) != name_len || memcmp(m, name, (size_t)name_len) != 0)
+      continue;
+    const char *sig = bt->members[i].sig;
+    const char *sp = strchr(sig, ' ');
+    if (!sp)
+      return NULL;
+    size_t len = (size_t)(sp - sig);
+    const char *current = NULL;
+    for (size_t r = 0; r < sizeof(results) / sizeof(results[0]); r++) {
+      if (strlen(results[r]) == len && memcmp(results[r], sig, len) == 0) {
+        current = results[r];
+        break;
+      }
     }
-    return result;
+    if (!current || (result && result != current))
+      return NULL;
+    result = current;
+  }
+  return result;
 }
 
 /* Keep Min/Max's numeric contract local: general arithmetic promotion still
  * has legacy signed/unsigned shortcuts and must not decide these overloads. */
 static int minmax_arg_numeric(const zan_type_t *type) {
-    if (!type || type->is_nullable) return 0;
-    switch (type->kind) {
-    case TYPE_BYTE: case TYPE_SBYTE: case TYPE_SHORT: case TYPE_USHORT:
-    case TYPE_CHAR: case TYPE_INT: case TYPE_UINT: case TYPE_LONG:
-    case TYPE_ULONG: case TYPE_NINT: case TYPE_FLOAT: case TYPE_DOUBLE:
-        return 1;
-    default:
-        return 0;
-    }
+  if (!type || type->is_nullable)
+    return 0;
+  switch (type->kind) {
+  case TYPE_BYTE:
+  case TYPE_SBYTE:
+  case TYPE_SHORT:
+  case TYPE_USHORT:
+  case TYPE_CHAR:
+  case TYPE_INT:
+  case TYPE_UINT:
+  case TYPE_LONG:
+  case TYPE_ULONG:
+  case TYPE_NINT:
+  case TYPE_FLOAT:
+  case TYPE_DOUBLE:
+    return 1;
+  default:
+    return 0;
+  }
 }
 
 static int minmax_arg_signed(zan_type_kind_t kind) {
-    return kind == TYPE_SBYTE || kind == TYPE_SHORT || kind == TYPE_INT ||
-           kind == TYPE_LONG || kind == TYPE_NINT;
+  return kind == TYPE_SBYTE || kind == TYPE_SHORT || kind == TYPE_INT ||
+         kind == TYPE_LONG || kind == TYPE_NINT;
 }
 
 const char *zan_builtin_minmax_result(const char *type, const char *name,
-                                     int name_len, const struct zan_type *a,
-                                     const struct zan_type *b) {
-    if (!type || strcmp(type, "Math") != 0 || !name || name_len != 3 ||
-        (memcmp(name, "Min", 3) != 0 && memcmp(name, "Max", 3) != 0))
-        return NULL;
-    if (!minmax_arg_numeric(a) || !minmax_arg_numeric(b)) return NULL;
-    zan_type_kind_t ak = a->kind, bk = b->kind;
-    if (ak == TYPE_FLOAT || ak == TYPE_DOUBLE ||
-        bk == TYPE_FLOAT || bk == TYPE_DOUBLE) return "double";
-    if (ak == TYPE_ULONG || bk == TYPE_ULONG) {
-        if (minmax_arg_signed(ak) || minmax_arg_signed(bk)) return NULL;
-        return "ulong";
-    }
-    if (ak == TYPE_LONG || bk == TYPE_LONG) return "long";
-    if (ak == TYPE_UINT || bk == TYPE_UINT) {
-        if (minmax_arg_signed(ak) || minmax_arg_signed(bk)) return "long";
-        return "uint";
-    }
-    if (ak == TYPE_NINT || bk == TYPE_NINT) return "nint";
-    return "int";
+                                      int name_len, const struct zan_type *a,
+                                      const struct zan_type *b) {
+  if (!type || strcmp(type, "Math") != 0 || !name || name_len != 3 ||
+      (memcmp(name, "Min", 3) != 0 && memcmp(name, "Max", 3) != 0))
+    return NULL;
+  if (!minmax_arg_numeric(a) || !minmax_arg_numeric(b))
+    return NULL;
+  zan_type_kind_t ak = a->kind, bk = b->kind;
+  if (ak == TYPE_FLOAT || ak == TYPE_DOUBLE || bk == TYPE_FLOAT ||
+      bk == TYPE_DOUBLE)
+    return "double";
+  if (ak == TYPE_ULONG || bk == TYPE_ULONG) {
+    if (minmax_arg_signed(ak) || minmax_arg_signed(bk))
+      return NULL;
+    return "ulong";
+  }
+  if (ak == TYPE_LONG || bk == TYPE_LONG)
+    return "long";
+  if (ak == TYPE_UINT || bk == TYPE_UINT) {
+    if (minmax_arg_signed(ak) || minmax_arg_signed(bk))
+      return "long";
+    return "uint";
+  }
+  if (ak == TYPE_NINT || bk == TYPE_NINT)
+    return "nint";
+  return "int";
 }
 
 char zan_builtin_member_kind(const char *type, const char *name, int name_len) {
-    const zan_builtin_type_t *bt = zan_builtin_find(type);
-    if (!bt || !name || name_len <= 0) return 'M';
-    for (int i = 0; i < bt->member_count; i++) {
-        const char *m = bt->members[i].name;
-        if ((int)strlen(m) == name_len && memcmp(m, name, (size_t)name_len) == 0)
-            return bt->members[i].kind;
-    }
+  const zan_builtin_type_t *bt = zan_builtin_find(type);
+  if (!bt || !name || name_len <= 0)
     return 'M';
+  for (int i = 0; i < bt->member_count; i++) {
+    const char *m = bt->members[i].name;
+    if ((int)strlen(m) == name_len && memcmp(m, name, (size_t)name_len) == 0)
+      return bt->members[i].kind;
+  }
+  return 'M';
 }
 
 int zan_builtin_has_member(const char *type, const char *name, int name_len) {
-    const zan_builtin_type_t *bt = zan_builtin_find(type);
-    if (!bt) return 1;
-    if (!name || name_len <= 0) return 1;
-    for (int i = 0; i < bt->member_count; i++) {
-        const char *m = bt->members[i].name;
-        if ((int)strlen(m) == name_len && memcmp(m, name, (size_t)name_len) == 0)
-            return 1;
-    }
-    return 0;
+  const zan_builtin_type_t *bt = zan_builtin_find(type);
+  if (!bt)
+    return 1;
+  if (!name || name_len <= 0)
+    return 1;
+  for (int i = 0; i < bt->member_count; i++) {
+    const char *m = bt->members[i].name;
+    if ((int)strlen(m) == name_len && memcmp(m, name, (size_t)name_len) == 0)
+      return 1;
+  }
+  return 0;
 }
 
 /* 编译器原生实现的成员。
@@ -551,39 +610,44 @@ int zan_builtin_has_member(const char *type, const char *name, int name_len) {
  *     （Gate.Park / Socket.RecvOv 这类）。
  *
  * 增删原生成员时，本表必须与上述分派点同步。 */
-static const struct { const char *type; const char *name; } native_members[] = {
-    { "int",    "Parse" },
-    { "long",   "Parse" },
-    { "double", "Parse" },
-    { "float",  "Parse" },
-    { "bool",   "Parse" },
-    { "int",    "TryParse" },
-    { "long",   "TryParse" },
-    { "double", "TryParse" },
-    { "float",  "TryParse" },
-    { "bool",   "TryParse" },
-    { "string", "AsSpan" },
-    { "string", "AsReadOnlySpan" },
-    { "string", "ToBytes" },
-    { "Gate",   "Park" },
-    { "Socket", "ReadReady" },
-    { "Socket", "WriteReady" },
-    { "Socket", "RecvOv" },
-    { "Socket", "RecvToOv" },
-    { "Socket", "AcceptOv" },
-    { "Socket", "ResolveAsync" },
-    { "Socket", "ResolveSockAddr" },
+static const struct {
+  const char *type;
+  const char *name;
+} native_members[] = {
+    {"int", "Parse"},
+    {"long", "Parse"},
+    {"double", "Parse"},
+    {"float", "Parse"},
+    {"bool", "Parse"},
+    {"int", "TryParse"},
+    {"long", "TryParse"},
+    {"double", "TryParse"},
+    {"float", "TryParse"},
+    {"bool", "TryParse"},
+    {"string", "AsSpan"},
+    {"string", "AsReadOnlySpan"},
+    {"string", "ToBytes"},
+    {"Gate", "Park"},
+    {"Socket", "ReadReady"},
+    {"Socket", "WriteReady"},
+    {"Socket", "RecvOv"},
+    {"Socket", "RecvToOv"},
+    {"Socket", "AcceptOv"},
+    {"Socket", "ResolveAsync"},
+    {"Socket", "ResolveSockAddr"},
 };
 
 int zan_builtin_has_native_member(const char *type, int type_len,
-                                   const char *name, int name_len) {
-    if (!type || !name || type_len <= 0 || name_len <= 0) return 0;
-    for (size_t i = 0; i < sizeof(native_members) / sizeof(native_members[0]); i++) {
-        size_t tl = strlen(native_members[i].type);
-        size_t nl = strlen(native_members[i].name);
-        if ((int)tl == type_len && memcmp(type, native_members[i].type, tl) == 0 &&
-            (int)nl == name_len && memcmp(name, native_members[i].name, nl) == 0)
-            return 1;
-    }
+                                  const char *name, int name_len) {
+  if (!type || !name || type_len <= 0 || name_len <= 0)
     return 0;
+  for (size_t i = 0; i < sizeof(native_members) / sizeof(native_members[0]);
+       i++) {
+    size_t tl = strlen(native_members[i].type);
+    size_t nl = strlen(native_members[i].name);
+    if ((int)tl == type_len && memcmp(type, native_members[i].type, tl) == 0 &&
+        (int)nl == name_len && memcmp(name, native_members[i].name, nl) == 0)
+      return 1;
+  }
+  return 0;
 }

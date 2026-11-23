@@ -127,6 +127,12 @@ static LLVMValueRef vtable_slot_fn(zan_irgen_t *g, zan_symbol_t *impl,
             LLVMValueRef spec = find_generic_fn(g, impl, owner->type_args,
                                                 owner->type_arg_count, &spec_ty);
             LLVMTypeRef erased_ty = erased ? LLVMGlobalGetValueType(erased) : NULL;
+            if (spec && inst_uses_canon(g, owner)) {
+                LLVMTypeRef thunk_ty = NULL;
+                LLVMValueRef thunk = build_gctx_vtable_thunk(
+                    g, spec, spec_ty, owner, NULL, 0, &thunk_ty);
+                if (thunk && (!erased_ty || thunk_ty == erased_ty)) return thunk;
+            }
             if (spec && erased_ty && spec_ty == erased_ty) return spec;
         }
     }
@@ -393,6 +399,12 @@ zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
 bool types_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
+    if (a->is_canon != b->is_canon) return false;
+    if (a->is_canon) {
+        if (a->canon_tp_kind != b->canon_tp_kind) return false;
+        if (a->canon_tp_kind != 0 && a->canon_tp_idx != b->canon_tp_idx) return false;
+        return true;
+    }
     if (a->kind != b->kind) return false;
     if (a->sym && b->sym && a->sym == b->sym) {
         /* 同一类型符号 */
@@ -438,6 +450,9 @@ bool is_user_generic_sym(zan_symbol_t *sym) {
 void add_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
                            zan_type_t **args, int argc,
                            LLVMValueRef fn, LLVMTypeRef fn_type) {
+    zan_symbol_t *owner = msym ? msym->parent : NULL;
+    if (args_use_canon(g, owner, args, argc))
+        args = canonicalize_args(g, owner, args, argc, NULL, 0);
     if (g->generic_fn_count >= g->generic_fn_cap) {
         int ncap = g->generic_fn_cap ? g->generic_fn_cap * 2 : 64;
         g->generic_fns = realloc(g->generic_fns,
@@ -455,6 +470,10 @@ LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
                                     zan_type_t **args, int argc,
                                     LLVMTypeRef *out_fn_type) {
     if (!msym || argc <= 0 || !args) return NULL;
+    zan_type_t *scratch[8];
+    zan_symbol_t *owner = msym->parent;
+    if (args_use_canon(g, owner, args, argc))
+        args = canonicalize_args(g, owner, args, argc, scratch, 8);
     for (int i = 0; i < g->generic_fn_count; i++) {
         if (g->generic_fns[i].msym == msym &&
             type_arglists_equal(g->generic_fns[i].args, g->generic_fns[i].argc,
@@ -469,6 +488,8 @@ void add_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                              zan_ast_node_t *decl, zan_type_t **args, int argc,
                              int param_count,
                              LLVMValueRef fn, LLVMTypeRef fn_type) {
+    if (args_use_canon(g, type_sym, args, argc))
+        args = canonicalize_args(g, type_sym, args, argc, NULL, 0);
     if (g->generic_ctor_count >= g->generic_ctor_cap) {
         int ncap = g->generic_ctor_cap ? g->generic_ctor_cap * 2 : 64;
         g->generic_ctors = realloc(g->generic_ctors,
@@ -489,6 +510,9 @@ LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
                                       zan_type_t **args, int argc,
                                       LLVMTypeRef *out_fn_type) {
     if (!type_sym || argc <= 0 || !args) return NULL;
+    zan_type_t *scratch[8];
+    if (args_use_canon(g, type_sym, args, argc))
+        args = canonicalize_args(g, type_sym, args, argc, scratch, 8);
     for (int i = 0; i < g->generic_ctor_count; i++) {
         if (g->generic_ctors[i].type_sym == type_sym &&
             g->generic_ctors[i].decl == decl &&
@@ -504,6 +528,7 @@ void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
     if (!inst || !inst->sym || inst->type_arg_count <= 0) return;
     if (!is_user_generic_sym(inst->sym)) return;
     if (!type_is_concrete(inst)) return;
+    if (type_mentions_canon(inst)) return;
     for (int i = 0; i < g->generic_inst_count; i++)
         if (g->generic_insts[i].type_sym == inst->sym &&
             type_arglists_equal(g->generic_insts[i].inst->type_args,
@@ -522,6 +547,11 @@ void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
 }
 void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t) {
     if (!t) return;
+    if (t->is_canon) {
+        int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0, "__Canon");
+        if (w > 0) *off += (size_t)w;
+        return;
+    }
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
         mangle_type_token(buf, n, off, t->element_type);
         int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0, "A");

@@ -934,22 +934,24 @@ public partial class Parser {
         Expect(TK.RBrace());
     }
 
-    // brace-initializer items between `{ }`: plain expressions (list items,
-    // `Field = v` object fields), `member = { a, b }` member collection
-    // initializers (encoded as an Assignment whose rhs is a typeless
-    // NewExpr bundle with ival == 2), and `{ k, v }` dictionary pairs
-    // (encoded as TupleExpr with op == 1).
-    void ParseBraceItems(Node n) {
-        Expect(TK.LBrace());
-        if (!At(TK.RBrace())) {
+    // collection-initializer items between `{ }` or `[ ]`: plain expressions
+    // (list items, `Field = v` object fields), `member = { a, b }` /
+    // `member = [ a, b ]` member collection initializers (encoded as an
+    // Assignment whose rhs is a typeless NewExpr bundle with ival == 2), and
+    // `{ k, v }` dictionary pairs (encoded as TupleExpr with op == 1).
+    void ParseInitItems(Node n, int openTok, int closeTok) {
+        Expect(openTok);
+        if (!At(closeTok)) {
             n.Add(ParseBraceItem());
             while (Eat(TK.Comma())) {
-                if (At(TK.RBrace())) { break; }
+                if (At(closeTok)) { break; }
                 n.Add(ParseBraceItem());
             }
         }
-        Expect(TK.RBrace());
+        Expect(closeTok);
     }
+
+    void ParseBraceItems(Node n) { ParseInitItems(n, TK.LBrace(), TK.RBrace()); }
 
     Node ParseBraceItem() {
         if (At(TK.LBrace())) { return ParseDictPair(); }
@@ -957,11 +959,11 @@ public partial class Parser {
         if (At(TK.Ident())) {
             Token nt = Next();
             while (At(TK.Dot())) { Next(); if (At(TK.Ident())) { Next(); } }
-            bool memberInit = At(TK.Eq()) && K1() == TK.LBrace();
+            bool memberInit = At(TK.Eq()) && (K1() == TK.LBrace() || K1() == TK.LBracket());
             pos = save;
             if (memberInit) {
                 // dotted member name parsed by hand (ParseExpr would try to
-                // consume `= {...}` as an assignment)
+                // consume `= {...}` / `= [...]` as an assignment)
                 Node name = new Node(AK.Ident());
                 name.sval = Next().text;
                 name.line = nt.line; name.col = nt.col;
@@ -974,9 +976,11 @@ public partial class Parser {
                     name = m;
                 }
                 Next(); // =
+                int openTok = At(TK.LBracket()) ? TK.LBracket() : TK.LBrace();
+                int closeTok = openTok == TK.LBracket() ? TK.RBracket() : TK.RBrace();
                 Node bundle = new Node(AK.NewExpr());
                 bundle.ival = 2;          // collection items, no type node
-                ParseBraceItems(bundle);
+                ParseInitItems(bundle, openTok, closeTok);
                 Node asg = new Node(AK.Assignment());
                 asg.op = TK.Eq();
                 asg.a = name;

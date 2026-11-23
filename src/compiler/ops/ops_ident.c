@@ -47,18 +47,23 @@ LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
         /* 外层类的裸名静态字段：直接映射为全局符号 */
         if (g->current_type_sym) {
             zan_symbol_t *fsym = get_field_sym(g->current_type_sym, expr->ident.name);
+            zan_type_t *sinst = (g->cur_inst &&
+                g->cur_inst->sym == g->current_type_sym)
+                ? g->cur_inst : g->current_type_sym->type;
             /* 静态自定义 getter 属性读取分发 */
             zan_symbol_t *getter = property_getter_sym(g, fsym);
             if (getter) {
-                return emit_property_getter_call(g, getter,
-                    g->current_type_sym->type, NULL, NULL, locals);
+                return emit_property_getter_call(g, getter, sinst, NULL, NULL,
+                                                 locals);
             }
             LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fsym, NULL);
             if (gv) {
-                LLVMTypeRef ft = fsym->type ? map_type(g, fsym->type)
-                                            : LLVMInt64TypeInContext(g->ctx);
+                zan_type_t *fst = field_store_type(g, fsym, g->cur_inst);
+                zan_type_t *rft = fst ? fst : fsym->type;
+                LLVMTypeRef ft = rft ? map_type(g, rft)
+                                     : LLVMInt64TypeInContext(g->ctx);
                 return promote_loaded(g,
-                    LLVMBuildLoad2(g->builder, ft, gv, "sfld"), fsym->type);
+                    LLVMBuildLoad2(g->builder, ft, gv, "sfld"), rft);
             }
         }
         /* 方法组转换为委托实例（方法名作为第一类值传递） */

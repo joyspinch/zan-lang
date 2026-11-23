@@ -47,6 +47,8 @@
                             LLVMTypeRef mft = g->functions[fi].fn_type;
                             LLVMValueRef mfn = route_generic_method(g, g->cur_inst,
                                 method_sym, g->functions[fi].fn, mft, &mft);
+                            LLVMValueRef gctx_arg = route_generic_method_gctx(
+                                g, g->cur_inst, method_sym);
                             if (g->runtime_checks && g->current_fn &&
                                 sym_declares_extern(method_sym)) {
                                 for (int k = 0; k < argc; k++) {
@@ -68,9 +70,9 @@
                                 }
                             }
                             const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "bcall";
-                            LLVMValueRef result = emit_dispatch_call(g,
+                            LLVMValueRef result = emit_dispatch_call_gctx(g,
                                 is_static ? NULL : g->current_type_sym, method_sym,
-                                mfn, mft, call_args, argc + extra, cn);
+                                mfn, mft, call_args, argc + extra, gctx_arg, cn);
                             int consumes_free_arg =
                                 argc == 1 && call_consumes_free_arg(g->functions[fi].fn);
                             if (consumes_free_arg) {

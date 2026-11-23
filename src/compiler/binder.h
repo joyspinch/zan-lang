@@ -8,101 +8,110 @@
 #include <string.h>
 
 typedef enum {
-    SYM_NAMESPACE,
-    SYM_CLASS,
-    SYM_STRUCT,
-    SYM_INTERFACE,
-    SYM_ENUM,
-    SYM_METHOD,
-    SYM_CONSTRUCTOR,
-    SYM_FIELD,
-    SYM_PROPERTY,
-    SYM_PARAM,
-    SYM_LOCAL,
-    SYM_ENUM_MEMBER,
-    SYM_TYPE_PARAM,
-    SYM_DELEGATE,
+  SYM_NAMESPACE,
+  SYM_CLASS,
+  SYM_STRUCT,
+  SYM_INTERFACE,
+  SYM_ENUM,
+  SYM_METHOD,
+  SYM_CONSTRUCTOR,
+  SYM_FIELD,
+  SYM_PROPERTY,
+  SYM_PARAM,
+  SYM_LOCAL,
+  SYM_ENUM_MEMBER,
+  SYM_TYPE_PARAM,
+  SYM_DELEGATE,
 } zan_sym_kind_t;
 
 typedef enum {
-    TYPE_VOID,
-    TYPE_BOOL,
-    TYPE_BYTE,
-    TYPE_SHORT,
-    TYPE_INT,
-    TYPE_LONG,
-    TYPE_SBYTE,
-    TYPE_USHORT,
-    TYPE_UINT,
-    TYPE_ULONG,
-    TYPE_FLOAT,
-    TYPE_DOUBLE,
-    TYPE_DECIMAL,
-    TYPE_CHAR,
-    TYPE_STRING,
-    TYPE_OBJECT,
-    TYPE_NINT,
-    TYPE_CLASS,
-    TYPE_STRUCT,
-    TYPE_INTERFACE,
-    TYPE_ENUM,
-    TYPE_ARRAY,
-    TYPE_NULLABLE,
-    TYPE_TASK,
-    TYPE_TYPE_PARAM,
-    TYPE_DELEGATE,
-    TYPE_ERROR,
+  TYPE_VOID,
+  TYPE_BOOL,
+  TYPE_BYTE,
+  TYPE_SHORT,
+  TYPE_INT,
+  TYPE_LONG,
+  TYPE_SBYTE,
+  TYPE_USHORT,
+  TYPE_UINT,
+  TYPE_ULONG,
+  TYPE_FLOAT,
+  TYPE_DOUBLE,
+  TYPE_DECIMAL,
+  TYPE_CHAR,
+  TYPE_STRING,
+  TYPE_OBJECT,
+  TYPE_NINT,
+  TYPE_CLASS,
+  TYPE_STRUCT,
+  TYPE_INTERFACE,
+  TYPE_ENUM,
+  TYPE_ARRAY,
+  TYPE_NULLABLE,
+  TYPE_TASK,
+  TYPE_TYPE_PARAM,
+  TYPE_DELEGATE,
+  TYPE_ERROR,
 } zan_type_kind_t;
 
 typedef struct zan_type zan_type_t;
 struct zan_type {
-    zan_type_kind_t kind;
-    zan_istr_t name;
-    struct zan_symbol *sym;
-    zan_type_t *element_type;
-    int array_rank;
-    zan_type_t *base_type;
-    int bases_resolved;
-    zan_type_t **interfaces;
-    int interface_count;
-    zan_type_t **type_args;
-    int type_arg_count;
-    zan_type_t *delegate_ret_type;
-    zan_type_t **delegate_param_types;
-    int delegate_param_count;
-    int delegate_is_async;
-    uint8_t is_nullable;
+  zan_type_kind_t kind;
+  zan_istr_t name;
+  struct zan_symbol *sym;
+  zan_type_t *element_type;
+  int array_rank;
+  zan_type_t *base_type;
+  int bases_resolved;
+  zan_type_t **interfaces;
+  int interface_count;
+  zan_type_t **type_args;
+  int type_arg_count;
+  zan_type_t *delegate_ret_type;
+  zan_type_t **delegate_param_types;
+  int delegate_param_count;
+  int delegate_is_async;
+  uint8_t is_nullable;
+  /* Phase 2a: __Canon generic code sharing */
+  uint8_t is_canon;
+  uint8_t canon_tp_kind; /* 0 = canonical key sentinel, 1 = class tp, 2 = method tp */
+  uint16_t canon_tp_idx;
 };
 
 typedef struct zan_symbol zan_symbol_t;
 struct zan_symbol {
-    zan_sym_kind_t kind;
-    zan_istr_t name;
-    zan_type_t *type;
-    zan_ast_node_t *decl;
-    uint32_t modifiers;
-    zan_symbol_t *parent;
+  zan_sym_kind_t kind;
+  zan_istr_t name;
+  zan_type_t *type;
+  zan_ast_node_t *decl;
+  uint32_t modifiers;
+  zan_symbol_t *parent;
 
-    zan_symbol_t **members;
-    int member_count;
-    int member_cap;
+  zan_symbol_t **members;
+  int member_count;
+  int member_cap;
 
-    uint32_t name_hash;
-    zan_symbol_t *hash_next;
+  uint32_t name_hash;
+  zan_symbol_t *hash_next;
+
+  /* Phase 2: __Canon eligibility cache (0 = unknown, 1 = yes, -1 = no) */
+  int8_t canon_eligible_cache;
+  uint8_t canon_check_visiting;
 };
 
-typedef void (*zan_symbol_reference_fn)(void *context, const zan_symbol_t *symbol,
+typedef void (*zan_symbol_reference_fn)(void *context,
+                                        const zan_symbol_t *symbol,
                                         const zan_ast_node_t *occurrence);
 
 typedef struct zan_scope zan_scope_t;
 struct zan_scope {
-    zan_scope_t *parent;
-    bool declaration_type_params;
-    zan_symbol_t **symbols;
-    int sym_count;
-    int sym_cap;
-    zan_symbol_t **buckets;
-    int bucket_count;
+  zan_scope_t *parent;
+  bool declaration_type_params;
+  zan_symbol_t **symbols;
+  int sym_count;
+  int sym_cap;
+  zan_symbol_t **buckets;
+  int bucket_count;
 };
 
 /* 扩展方法登记项：首参带 `this` 的方法。
@@ -115,66 +124,67 @@ struct zan_scope {
  * `this` 标记，**不额外要求 static**——两边口径不同就会一边能发、
  * 一边判成"没有这个方法"。 */
 typedef struct zan_ext_method {
-    zan_symbol_t *method;    /* 方法符号 */
-    zan_type_t *recv_type;   /* 首参（this）的类型——绑定时解析，
-                               * 那时类型参还在作用域里 */
+  zan_symbol_t *method;  /* 方法符号 */
+  zan_type_t *recv_type; /* 首参（this）的类型——绑定时解析，
+                          * 那时类型参还在作用域里 */
 } zan_ext_method_t;
 
 struct zan_binder {
-    zan_arena_t *arena;
-    zan_diag_t *diag;
-    zan_scope_t *current_scope;
-    zan_symbol_reference_fn symbol_reference;
-    void *symbol_reference_context;
+  zan_arena_t *arena;
+  zan_diag_t *diag;
+  zan_scope_t *current_scope;
+  zan_symbol_reference_fn symbol_reference;
+  void *symbol_reference_context;
 
-    /* built-in types */
-    zan_type_t *type_void;
-    zan_type_t *type_bool;
-    zan_type_t *type_byte;
-    zan_type_t *type_short;
-    zan_type_t *type_int;
-    zan_type_t *type_long;
-    zan_type_t *type_sbyte;
-    zan_type_t *type_ushort;
-    zan_type_t *type_uint;
-    zan_type_t *type_ulong;
-    zan_type_t *type_float;
-    zan_type_t *type_double;
-    zan_type_t *type_decimal;
-    zan_type_t *type_char;
-    zan_type_t *type_string;
-    zan_type_t *type_object;
-    zan_type_t *type_nint;
-    zan_type_t *type_error;
-    zan_type_t *type_typeinfo;
+  /* built-in types */
+  zan_type_t *type_void;
+  zan_type_t *type_bool;
+  zan_type_t *type_byte;
+  zan_type_t *type_short;
+  zan_type_t *type_int;
+  zan_type_t *type_long;
+  zan_type_t *type_sbyte;
+  zan_type_t *type_ushort;
+  zan_type_t *type_uint;
+  zan_type_t *type_ulong;
+  zan_type_t *type_float;
+  zan_type_t *type_double;
+  zan_type_t *type_decimal;
+  zan_type_t *type_char;
+  zan_type_t *type_string;
+  zan_type_t *type_object;
+  zan_type_t *type_nint;
+  zan_type_t *type_error;
+  zan_type_t *type_typeinfo;
 
-    bool binding_done;
+  bool binding_done;
 
-    /* 扩展方法登记表（static + 首参 this） */
-    zan_ext_method_t *ext_methods;
-    int ext_method_count;
-    int ext_method_cap;
+  /* 扩展方法登记表（static + 首参 this） */
+  zan_ext_method_t *ext_methods;
+  int ext_method_count;
+  int ext_method_cap;
 
-    zan_type_t **tuple_types;
-    int tuple_type_count;
-    int tuple_type_cap;
-    zan_type_t **tuple_hash;
-    int tuple_hash_cap;
-    struct zan_member_idx_slot {
-        zan_symbol_t *type;
-        struct zan_member_name_index *idx;
-    } *member_idx;
-    int member_idx_cap;
-    int member_idx_count;
+  zan_type_t **tuple_types;
+  int tuple_type_count;
+  int tuple_type_cap;
+  zan_type_t **tuple_hash;
+  int tuple_hash_cap;
+  struct zan_member_idx_slot {
+    zan_symbol_t *type;
+    struct zan_member_name_index *idx;
+  } *member_idx;
+  int member_idx_cap;
+  int member_idx_count;
 };
 
 void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag);
 void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit);
 
-static inline void zan_binder_record_reference(zan_binder_t *b, const zan_symbol_t *symbol,
-                                               const zan_ast_node_t *occurrence) {
-    if (b->symbol_reference && symbol && symbol->decl && occurrence)
-        b->symbol_reference(b->symbol_reference_context, symbol, occurrence);
+static inline void
+zan_binder_record_reference(zan_binder_t *b, const zan_symbol_t *symbol,
+                            const zan_ast_node_t *occurrence) {
+  if (b->symbol_reference && symbol && symbol->decl && occurrence)
+    b->symbol_reference(b->symbol_reference_context, symbol, occurrence);
 }
 
 zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref);
@@ -185,53 +195,68 @@ zan_scope_t *zan_binder_push_type_params(zan_binder_t *b, zan_ast_list_t *tps);
  * A parameterless derived candidate hides the base candidate regardless of
  * return type. Other arities allow base lookup. error: 1 signature,
  * 2 receiver/staticness, 3 ambiguity. A nonmethod member shadows the group. */
-static inline zan_symbol_t *zan_binder_task_action_method(
-        zan_binder_t *b, zan_symbol_t *owner, zan_istr_t name,
-        int receiver, bool has_this, int *error) {
-    *error = 0;
-    zan_symbol_t *fallback = NULL;
-    for (; owner; owner = owner->type && owner->type->base_type
-            ? owner->type->base_type->sym : NULL) {
-        zan_symbol_t *first = NULL, *selected = NULL;
-        bool compatible_receiver = false, has_zero_arity = false;
-        for (int k = 0; k < owner->member_count; k++) {
-            zan_symbol_t *m = owner->members[k];
-            if (!m || m->name.len != name.len ||
-                memcmp(m->name.str, name.str, (size_t)name.len) != 0 ||
-                m->kind == SYM_CONSTRUCTOR) continue;
-            if (m->kind != SYM_METHOD) return NULL;
-            if (!first) first = m;
-            if (!m->decl || m->decl->kind != AST_METHOD_DECL) continue;
-            zan_ast_node_t *d = m->decl;
-            if (d->method_decl.params.count == 0) has_zero_arity = true;
-            bool is_static = (d->method_decl.modifiers & MOD_STATIC) != 0;
-            if ((receiver == 1 && !is_static) ||
-                (receiver == 2 && is_static) ||
-                (receiver == 0 && !has_this && !is_static)) continue;
-            compatible_receiver = true;
-            zan_type_t *ret = zan_binder_resolve_type(b, d->method_decl.return_type);
-            if (d->method_decl.params.count || d->method_decl.type_params.count ||
-                !ret || ret->kind != TYPE_VOID ||
-                (d->method_decl.modifiers & MOD_ASYNC)) continue;
-            if (selected) { *error = 3; return selected; }
-            selected = m;
-        }
-        if (first) {
-            if (selected) return selected;
-            if (!fallback) fallback = first;
-            if (has_zero_arity) {
-                *error = compatible_receiver ? 1 : 2;
-                return first;
-            }
-        }
+static inline zan_symbol_t *
+zan_binder_task_action_method(zan_binder_t *b, zan_symbol_t *owner,
+                              zan_istr_t name, int receiver, bool has_this,
+                              int *error) {
+  *error = 0;
+  zan_symbol_t *fallback = NULL;
+  for (; owner; owner = owner->type && owner->type->base_type
+                            ? owner->type->base_type->sym
+                            : NULL) {
+    zan_symbol_t *first = NULL, *selected = NULL;
+    bool compatible_receiver = false, has_zero_arity = false;
+    for (int k = 0; k < owner->member_count; k++) {
+      zan_symbol_t *m = owner->members[k];
+      if (!m || m->name.len != name.len ||
+          memcmp(m->name.str, name.str, (size_t)name.len) != 0 ||
+          m->kind == SYM_CONSTRUCTOR)
+        continue;
+      if (m->kind != SYM_METHOD)
+        return NULL;
+      if (!first)
+        first = m;
+      if (!m->decl || m->decl->kind != AST_METHOD_DECL)
+        continue;
+      zan_ast_node_t *d = m->decl;
+      if (d->method_decl.params.count == 0)
+        has_zero_arity = true;
+      bool is_static = (d->method_decl.modifiers & MOD_STATIC) != 0;
+      if ((receiver == 1 && !is_static) || (receiver == 2 && is_static) ||
+          (receiver == 0 && !has_this && !is_static))
+        continue;
+      compatible_receiver = true;
+      zan_type_t *ret = zan_binder_resolve_type(b, d->method_decl.return_type);
+      if (d->method_decl.params.count || d->method_decl.type_params.count ||
+          !ret || ret->kind != TYPE_VOID ||
+          (d->method_decl.modifiers & MOD_ASYNC))
+        continue;
+      if (selected) {
+        *error = 3;
+        return selected;
+      }
+      selected = m;
     }
-    if (fallback) *error = 1;
-    return fallback;
+    if (first) {
+      if (selected)
+        return selected;
+      if (!fallback)
+        fallback = first;
+      if (has_zero_arity) {
+        *error = compatible_receiver ? 1 : 2;
+        return first;
+      }
+    }
+  }
+  if (fallback)
+    *error = 1;
+  return fallback;
 }
 
 zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem);
-zan_type_t *zan_binder_make_readonly_span_type(zan_binder_t *b, zan_type_t *elem);
+zan_type_t *zan_binder_make_readonly_span_type(zan_binder_t *b,
+                                               zan_type_t *elem);
 zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem);
@@ -244,7 +269,8 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
-/* Explicit qualified receivers retain their type identity across value scopes. */
+/* Explicit qualified receivers retain their type identity across value scopes.
+ */
 zan_symbol_t *zan_binder_type_receiver(zan_binder_t *b, zan_ast_node_t *expr);
 
 /* Method-group conversion: both checker and IR use the same candidate rules.
@@ -253,15 +279,17 @@ zan_symbol_t *zan_binder_type_receiver(zan_binder_t *b, zan_ast_node_t *expr);
  * The expression stores the target signature, not a candidate tied to one
  * generic instantiation; IR resolves it again in its concrete context. */
 typedef enum {
-    ZAN_METHOD_GROUP_TYPE,
-    ZAN_METHOD_GROUP_VALUE,
-    ZAN_METHOD_GROUP_IMPLICIT
+  ZAN_METHOD_GROUP_TYPE,
+  ZAN_METHOD_GROUP_VALUE,
+  ZAN_METHOD_GROUP_IMPLICIT
 } zan_method_group_receiver_t;
 zan_symbol_t *zan_binder_method_group(zan_binder_t *b, zan_type_t *receiver,
-    zan_istr_t name, zan_method_group_receiver_t form, zan_type_t *target,
-    int *score);
+                                      zan_istr_t name,
+                                      zan_method_group_receiver_t form,
+                                      zan_type_t *target, int *score);
 zan_type_t *zan_binder_method_group_target(zan_ast_node_t *expr);
-void zan_binder_set_method_group_target(zan_ast_node_t *expr, zan_type_t *target);
+void zan_binder_set_method_group_target(zan_ast_node_t *expr,
+                                        zan_type_t *target);
 
 /* 类（含其基类链）是否实现了接口 iface。checker 与 irgen 共用这一份判定，
  * 免得两边对"接口方法算不算这个类型的成员"口径分叉。 */
@@ -272,20 +300,22 @@ bool zan_binder_class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
  * -1: 逆变 (in)
  *  0: 不变 (invariant) */
 static inline int zan_type_param_variance(const zan_symbol_t *sym, int index) {
-    if (!sym || !sym->decl || index < 0) return 0;
-    const zan_ast_node_t *d = sym->decl;
-    const zan_ast_list_t *tps = NULL;
-    if (d->kind == AST_INTERFACE_DECL) {
-        tps = &d->type_decl.type_params;
-    } else if (d->kind == AST_DELEGATE_DECL) {
-        tps = &d->method_decl.type_params;
-    }
-    if (!tps || index >= tps->count) return 0;
-    const zan_ast_node_t *tp = tps->items[index];
-    if (tp && tp->kind == AST_IDENTIFIER) {
-        return tp->ident.variance;
-    }
+  if (!sym || !sym->decl || index < 0)
     return 0;
+  const zan_ast_node_t *d = sym->decl;
+  const zan_ast_list_t *tps = NULL;
+  if (d->kind == AST_INTERFACE_DECL) {
+    tps = &d->type_decl.type_params;
+  } else if (d->kind == AST_DELEGATE_DECL) {
+    tps = &d->method_decl.type_params;
+  }
+  if (!tps || index >= tps->count)
+    return 0;
+  const zan_ast_node_t *tp = tps->items[index];
+  if (tp && tp->kind == AST_IDENTIFIER) {
+    return tp->ident.variance;
+  }
+  return 0;
 }
 
 /* 名为 name 的扩展方法能否作用于 recv_ty。判定口径与 irgen 的

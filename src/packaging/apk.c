@@ -18,27 +18,40 @@
 #include "../common/host_oom.h"
 
 typedef struct {
-    unsigned char *p;
-    size_t len, cap;
+  unsigned char *p;
+  size_t len, cap;
 } buf_t;
 
-static void buf_init(buf_t *b) { b->p = NULL; b->len = 0; b->cap = 0; }
+static void buf_init(buf_t *b) {
+  b->p = NULL;
+  b->len = 0;
+  b->cap = 0;
+}
 
-static void buf_free(buf_t *b) { free(b->p); b->p = NULL; b->len = b->cap = 0; }
+static void buf_free(buf_t *b) {
+  free(b->p);
+  b->p = NULL;
+  b->len = b->cap = 0;
+}
 
 static void buf_reserve(buf_t *b, size_t extra) {
-    if (b->len + extra <= b->cap) return;
-    size_t nc = b->cap ? b->cap * 2 : 4096;
-    while (nc < b->len + extra) nc *= 2;
-    unsigned char *np = (unsigned char *)realloc(b->p, nc);
-    if (!np) { zan_host_oom(); }
-    b->p = np; b->cap = nc;
+  if (b->len + extra <= b->cap)
+    return;
+  size_t nc = b->cap ? b->cap * 2 : 4096;
+  while (nc < b->len + extra)
+    nc *= 2;
+  unsigned char *np = (unsigned char *)realloc(b->p, nc);
+  if (!np) {
+    zan_host_oom();
+  }
+  b->p = np;
+  b->cap = nc;
 }
 
 static void buf_write(buf_t *b, const void *d, size_t n) {
-    buf_reserve(b, n);
-    memcpy(b->p + b->len, d, n);
-    b->len += n;
+  buf_reserve(b, n);
+  memcpy(b->p + b->len, d, n);
+  b->len += n;
 }
 
 static void buf_u16(buf_t *b, uint16_t v) { buf_write(b, &v, 2); }
@@ -46,875 +59,1057 @@ static void buf_u32(buf_t *b, uint32_t v) { buf_write(b, &v, 4); }
 static void buf_u8(buf_t *b, uint8_t v) { buf_write(b, &v, 1); }
 
 static uint32_t crc32_buf(const unsigned char *d, size_t n) {
-    static uint32_t table[256];
-    static int have = 0;
-    if (!have) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        have = 1;
+  static uint32_t table[256];
+  static int have = 0;
+  if (!have) {
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++)
+        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      table[i] = c;
     }
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    have = 1;
+  }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++)
+    c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
 }
-
 
 static size_t deflate_store(const unsigned char *in, size_t n,
                             unsigned char **out) {
-    size_t nb = (n + 65534) / 65535;
-    size_t cap = n + nb * 5 + 16;
-    unsigned char *o = (unsigned char *)malloc(cap ? cap : 1);
-    if (!o) zan_host_oom();
-    size_t w = 0;
-    size_t off = 0;
-    if (n == 0) {
-        o[w++] = 0x01; o[w++] = 0x00; o[w++] = 0x00; o[w++] = 0xFF; o[w++] = 0xFF;
-    }
-    while (off < n) {
-        size_t chunk = n - off;
-        if (chunk > 65535) chunk = 65535;
-        int final = (off + chunk == n) ? 1 : 0;
-        o[w++] = (unsigned char)(final ? 1 : 0);
-        o[w++] = (unsigned char)(chunk & 0xFF);
-        o[w++] = (unsigned char)((chunk >> 8) & 0xFF);
-        o[w++] = (unsigned char)(~chunk & 0xFF);
-        o[w++] = (unsigned char)((~chunk >> 8) & 0xFF);
-        memcpy(o + w, in + off, chunk);
-        w += chunk;
-        off += chunk;
-    }
-    *out = o;
-    return w;
+  size_t nb = (n + 65534) / 65535;
+  size_t cap = n + nb * 5 + 16;
+  unsigned char *o = (unsigned char *)malloc(cap ? cap : 1);
+  if (!o)
+    zan_host_oom();
+  size_t w = 0;
+  size_t off = 0;
+  if (n == 0) {
+    o[w++] = 0x01;
+    o[w++] = 0x00;
+    o[w++] = 0x00;
+    o[w++] = 0xFF;
+    o[w++] = 0xFF;
+  }
+  while (off < n) {
+    size_t chunk = n - off;
+    if (chunk > 65535)
+      chunk = 65535;
+    int final = (off + chunk == n) ? 1 : 0;
+    o[w++] = (unsigned char)(final ? 1 : 0);
+    o[w++] = (unsigned char)(chunk & 0xFF);
+    o[w++] = (unsigned char)((chunk >> 8) & 0xFF);
+    o[w++] = (unsigned char)(~chunk & 0xFF);
+    o[w++] = (unsigned char)((~chunk >> 8) & 0xFF);
+    memcpy(o + w, in + off, chunk);
+    w += chunk;
+    off += chunk;
+  }
+  *out = o;
+  return w;
 }
 
 typedef struct {
-    char name[128];
-    size_t offset;
-    uint32_t crc, csize, usize;
-    uint16_t method;    /* 0 stored, 8 deflate */
-    int align;
+  char name[128];
+  size_t offset;
+  uint32_t crc, csize, usize;
+  uint16_t method; /* 0 stored, 8 deflate */
+  int align;
 } zip_ent_t;
 
 typedef struct {
-    buf_t out;
-    zip_ent_t *ents;
-    int nent;
-    int cap;
+  buf_t out;
+  zip_ent_t *ents;
+  int nent;
+  int cap;
 } zip_t;
 
 static void zip_start(zip_t *z) {
-    buf_init(&z->out);
-    z->cap = 64;
-    z->nent = 0;
-    z->ents = (zip_ent_t *)calloc((size_t)z->cap, sizeof(*z->ents));
+  buf_init(&z->out);
+  z->cap = 64;
+  z->nent = 0;
+  z->ents = (zip_ent_t *)calloc((size_t)z->cap, sizeof(*z->ents));
 }
 
 static void __attribute__((unused)) zip_end_align(zip_t *z, int boundary) {
-    while (z->out.len % (size_t)boundary) buf_u8(&z->out, 0);
+  while (z->out.len % (size_t)boundary)
+    buf_u8(&z->out, 0);
 }
 
 static int zip_add(zip_t *z, const char *name, const unsigned char *data,
                    size_t n, int compress, int align) {
-    if (!z->ents || z->nent == z->cap) {
-        int ncap = z->cap * 2;
-        zip_ent_t *ne = (zip_ent_t *)realloc(z->ents,
-            (size_t)ncap * sizeof(*ne));
-        if (!ne) {
-            fprintf(stderr, "error: out of memory adding zip entry '%s'\n",
-                    name);
-            return -1;
-        }
-        z->ents = ne;
-        z->cap = ncap;
+  if (!z->ents || z->nent == z->cap) {
+    int ncap = z->cap * 2;
+    zip_ent_t *ne = (zip_ent_t *)realloc(z->ents, (size_t)ncap * sizeof(*ne));
+    if (!ne) {
+      fprintf(stderr, "error: out of memory adding zip entry '%s'\n", name);
+      return -1;
     }
-    zip_ent_t *e = &z->ents[z->nent];
-    memset(e, 0, sizeof(*e));
-    if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name",
-                        "%s", name) != 0) return -1;
-    e->method = compress ? 8 : 0;
-    e->align = align;
-    e->usize = (uint32_t)n;
-    e->crc = crc32_buf(data, n);
+    z->ents = ne;
+    z->cap = ncap;
+  }
+  zip_ent_t *e = &z->ents[z->nent];
+  memset(e, 0, sizeof(*e));
+  if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name", "%s", name) !=
+      0)
+    return -1;
+  e->method = compress ? 8 : 0;
+  e->align = align;
+  e->usize = (uint32_t)n;
+  e->crc = crc32_buf(data, n);
 
-    unsigned char *comp = NULL;
-    size_t csize = n;
-    if (compress) csize = deflate_store(data, n, &comp);
-    e->csize = (uint32_t)csize;
+  unsigned char *comp = NULL;
+  size_t csize = n;
+  if (compress)
+    csize = deflate_store(data, n, &comp);
+  e->csize = (uint32_t)csize;
 
+  e->offset = z->out.len;
+  size_t name_len = strlen(name);
+  if (align > 1 && e->method == 0 && z->nent > 0) {
+    size_t need = 30 + name_len;
+    while ((z->out.len + need) % (size_t)align)
+      buf_u8(&z->out, 0);
     e->offset = z->out.len;
-    size_t name_len = strlen(name);
-    if (align > 1 && e->method == 0 && z->nent > 0) {
-        size_t need = 30 + name_len;
-        while ((z->out.len + need) % (size_t)align) buf_u8(&z->out, 0);
-        e->offset = z->out.len;
-    }
-    buf_u32(&z->out, 0x04034b50u);
-    buf_u16(&z->out, 20);
-    buf_u16(&z->out, 0);        /* flags */
-    buf_u16(&z->out, e->method);
-    buf_u16(&z->out, 0);
-    buf_u16(&z->out, 0x21);
-    buf_u32(&z->out, e->crc);
-    buf_u32(&z->out, (uint32_t)csize);
-    buf_u32(&z->out, e->usize);
-    buf_u16(&z->out, (uint16_t)name_len);
-    buf_u16(&z->out, 0);
-    buf_write(&z->out, name, name_len);
-    buf_write(&z->out, compress ? comp : data, csize);
-    if (compress) free(comp);
-    z->nent++;
-    return 0;
+  }
+  buf_u32(&z->out, 0x04034b50u);
+  buf_u16(&z->out, 20);
+  buf_u16(&z->out, 0); /* flags */
+  buf_u16(&z->out, e->method);
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, 0x21);
+  buf_u32(&z->out, e->crc);
+  buf_u32(&z->out, (uint32_t)csize);
+  buf_u32(&z->out, e->usize);
+  buf_u16(&z->out, (uint16_t)name_len);
+  buf_u16(&z->out, 0);
+  buf_write(&z->out, name, name_len);
+  buf_write(&z->out, compress ? comp : data, csize);
+  if (compress)
+    free(comp);
+  z->nent++;
+  return 0;
 }
 
 static int zip_finish(zip_t *z) {
-    size_t cen = z->out.len;
-    for (int i = 0; i < z->nent; i++) {
-        zip_ent_t *e = &z->ents[i];
-        size_t name_len = strlen(e->name);
-        buf_u32(&z->out, 0x02014b50u);
-        buf_u16(&z->out, 20);
-        buf_u16(&z->out, 20);
-        buf_u16(&z->out, 0);    /* flags */
-        buf_u16(&z->out, e->method);
-        buf_u16(&z->out, 0);    /* time */
-        buf_u16(&z->out, 0x21); /* date */
-        buf_u32(&z->out, e->crc);
-        buf_u32(&z->out, e->csize);
-        buf_u32(&z->out, e->usize);
-        buf_u16(&z->out, (uint16_t)name_len);
-        buf_u16(&z->out, 0);    /* extra */
-        buf_u16(&z->out, 0);    /* comment */
-        buf_u16(&z->out, 0);    /* disk */
-        buf_u16(&z->out, 0);
-        buf_u32(&z->out, 0);
-        buf_u32(&z->out, (uint32_t)e->offset);
-        buf_write(&z->out, e->name, name_len);
-    }
-    size_t cen_size = z->out.len - cen;
-    buf_u32(&z->out, 0x06054b50u);
-    buf_u16(&z->out, 0); buf_u16(&z->out, 0);
-    buf_u16(&z->out, (uint16_t)z->nent);
-    buf_u16(&z->out, (uint16_t)z->nent);
-    buf_u32(&z->out, (uint32_t)cen_size);
-    buf_u32(&z->out, (uint32_t)cen);
+  size_t cen = z->out.len;
+  for (int i = 0; i < z->nent; i++) {
+    zip_ent_t *e = &z->ents[i];
+    size_t name_len = strlen(e->name);
+    buf_u32(&z->out, 0x02014b50u);
+    buf_u16(&z->out, 20);
+    buf_u16(&z->out, 20);
+    buf_u16(&z->out, 0); /* flags */
+    buf_u16(&z->out, e->method);
+    buf_u16(&z->out, 0);    /* time */
+    buf_u16(&z->out, 0x21); /* date */
+    buf_u32(&z->out, e->crc);
+    buf_u32(&z->out, e->csize);
+    buf_u32(&z->out, e->usize);
+    buf_u16(&z->out, (uint16_t)name_len);
+    buf_u16(&z->out, 0); /* extra */
+    buf_u16(&z->out, 0); /* comment */
+    buf_u16(&z->out, 0); /* disk */
     buf_u16(&z->out, 0);
-    return 0;
+    buf_u32(&z->out, 0);
+    buf_u32(&z->out, (uint32_t)e->offset);
+    buf_write(&z->out, e->name, name_len);
+  }
+  size_t cen_size = z->out.len - cen;
+  buf_u32(&z->out, 0x06054b50u);
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, (uint16_t)z->nent);
+  buf_u16(&z->out, (uint16_t)z->nent);
+  buf_u32(&z->out, (uint32_t)cen_size);
+  buf_u32(&z->out, (uint32_t)cen);
+  buf_u16(&z->out, 0);
+  return 0;
 }
 
-
 static size_t pool_put_len(unsigned char *out, size_t v) {
-    if (v < 128) { out[0] = (unsigned char)v; return 1; }
-    out[0] = (unsigned char)(0x80 | (v >> 8));
-    out[1] = (unsigned char)(v & 0xFF);
-    return 2;
+  if (v < 128) {
+    out[0] = (unsigned char)v;
+    return 1;
+  }
+  out[0] = (unsigned char)(0x80 | (v >> 8));
+  out[1] = (unsigned char)(v & 0xFF);
+  return 2;
 }
 
 static size_t utf8_utf16_units(const char *s, size_t bytes) {
-    size_t units = 0, c = 0;
-    while (c < bytes) {
-        unsigned char b0 = (unsigned char)s[c];
-        uint32_t cp = b0;
-        size_t adv = 1;
-        if ((b0 & 0xE0) == 0xC0 && c + 1 < bytes) {
-            cp = ((uint32_t)(b0 & 0x1F) << 6)
-               | ((unsigned char)s[c + 1] & 0x3F);
-            adv = 2;
-        } else if ((b0 & 0xF0) == 0xE0 && c + 2 < bytes) {
-            cp = ((uint32_t)(b0 & 0x0F) << 12)
-               | (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 6)
-               | ((unsigned char)s[c + 2] & 0x3F);
-            adv = 3;
-        } else if ((b0 & 0xF8) == 0xF0 && c + 3 < bytes) {
-            cp = ((uint32_t)(b0 & 0x07) << 18)
-               | (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 12)
-               | (((uint32_t)(unsigned char)s[c + 2] & 0x3F) << 6)
-               | ((unsigned char)s[c + 3] & 0x3F);
-            adv = 4;
-        }
-        units += cp >= 0x10000 ? 2 : 1;
-        c += adv;
+  size_t units = 0, c = 0;
+  while (c < bytes) {
+    unsigned char b0 = (unsigned char)s[c];
+    uint32_t cp = b0;
+    size_t adv = 1;
+    if ((b0 & 0xE0) == 0xC0 && c + 1 < bytes) {
+      cp = ((uint32_t)(b0 & 0x1F) << 6) | ((unsigned char)s[c + 1] & 0x3F);
+      adv = 2;
+    } else if ((b0 & 0xF0) == 0xE0 && c + 2 < bytes) {
+      cp = ((uint32_t)(b0 & 0x0F) << 12) |
+           (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 6) |
+           ((unsigned char)s[c + 2] & 0x3F);
+      adv = 3;
+    } else if ((b0 & 0xF8) == 0xF0 && c + 3 < bytes) {
+      cp = ((uint32_t)(b0 & 0x07) << 18) |
+           (((uint32_t)(unsigned char)s[c + 1] & 0x3F) << 12) |
+           (((uint32_t)(unsigned char)s[c + 2] & 0x3F) << 6) |
+           ((unsigned char)s[c + 3] & 0x3F);
+      adv = 4;
     }
-    return units;
+    units += cp >= 0x10000 ? 2 : 1;
+    c += adv;
+  }
+  return units;
 }
 
 static int axml_patch(const unsigned char *xml, size_t xml_len,
-                      const char *package, const char *label,
-                      int nperms, const char (*perms)[128],
-                      unsigned char **out, size_t *out_len) {
-    if (xml_len < 40) return -1;
-    uint32_t root_size;
-    uint16_t root_hdr;
-    memcpy(&root_hdr, xml + 2, 2);
-    memcpy(&root_size, xml + 4, 4);
-    if (root_hdr != 8 || root_size != xml_len) return -1;
-    uint16_t first_type, first_hdr;
-    uint32_t first_size;
-    memcpy(&first_type, xml + 8, 2);
-    memcpy(&first_hdr, xml + 10, 2);
-    memcpy(&first_size, xml + 12, 4);
-    if (first_type != 0x0001 || first_hdr != 28) return -1;
-    uint32_t str_start;
-    uint32_t flags32;
-    memcpy(&flags32, xml + 24, 4);
-    memcpy(&str_start, xml + 28, 4);
-    int utf8 = (flags32 & 0x100) != 0;
-    if (8 + first_size > xml_len || str_start < 28) return -1;
+                      const char *package, const char *label, int nperms,
+                      const char (*perms)[128], unsigned char **out,
+                      size_t *out_len) {
+  if (xml_len < 40)
+    return -1;
+  uint32_t root_size;
+  uint16_t root_hdr;
+  memcpy(&root_hdr, xml + 2, 2);
+  memcpy(&root_size, xml + 4, 4);
+  if (root_hdr != 8 || root_size != xml_len)
+    return -1;
+  uint16_t first_type, first_hdr;
+  uint32_t first_size;
+  memcpy(&first_type, xml + 8, 2);
+  memcpy(&first_hdr, xml + 10, 2);
+  memcpy(&first_size, xml + 12, 4);
+  if (first_type != 0x0001 || first_hdr != 28)
+    return -1;
+  uint32_t str_start;
+  uint32_t flags32;
+  memcpy(&flags32, xml + 24, 4);
+  memcpy(&str_start, xml + 28, 4);
+  int utf8 = (flags32 & 0x100) != 0;
+  if (8 + first_size > xml_len || str_start < 28)
+    return -1;
 
-    size_t pool_off = 8;
-    const unsigned char *pool = xml + pool_off;
-    uint32_t str_count;
-    memcpy(&str_count, pool + 8, 4);
-    if (str_count > 4096) return -1;
-    /* 偏移表须整体落在串池块内：曾无此校验，str_count 最大 4096 时
-     * offs[i] 的读取可越 xml 末尾最多 16KB */
-    if (28 + (size_t)str_count * 4 > first_size) return -1;
-    const uint32_t *offs = (const uint32_t *)(pool + 28);
-    const unsigned char *base = pool + str_start;
+  size_t pool_off = 8;
+  const unsigned char *pool = xml + pool_off;
+  uint32_t str_count;
+  memcpy(&str_count, pool + 8, 4);
+  if (str_count > 4096)
+    return -1;
+  /* 偏移表须整体落在串池块内：曾无此校验，str_count 最大 4096 时
+   * offs[i] 的读取可越 xml 末尾最多 16KB */
+  if (28 + (size_t)str_count * 4 > first_size)
+    return -1;
+  const uint32_t *offs = (const uint32_t *)(pool + 28);
+  const unsigned char *base = pool + str_start;
 
-    unsigned char **raw = (unsigned char **)calloc(str_count, sizeof(*raw));
-    size_t *raw_len = (size_t *)calloc(str_count, sizeof(*raw_len));
-    char (*text)[256] = (char (*)[256])calloc(str_count, 256);
-    if (!raw || !raw_len || !text) zan_host_oom();
-    for (uint32_t i = 0; i < str_count; i++) {
-        size_t p = (size_t)(base - pool) + offs[i];
-        if (p >= first_size) goto fail_pool;
-        size_t hl = 1;
-        size_t n = 0;
-        size_t rl;
-        if (utf8) {
-            size_t hl2 = 1;
-            n = pool[p];
-            /* 长度前缀先验后读：曾先读后验，前缀字节可越 xml 末尾最多 3 字节 */
-            if (n & 0x80) {
-                if (p + 2 > first_size) goto fail_pool;
-                n = ((n & 0x7F) << 8) | pool[p + 1];
-                hl = 2;
-            }
-            if (p + hl >= first_size) goto fail_pool;
-            size_t nb = pool[p + hl];
-            if (nb & 0x80) {
-                if (p + hl + 2 > first_size) goto fail_pool;
-                nb = ((nb & 0x7F) << 8) | pool[p + hl + 1];
-                hl2 = 2;
-            }
-            if (p + hl + hl2 + nb + 1 > first_size) goto fail_pool;
-            size_t keep = nb < 255 ? nb : 255;
-            memcpy(text[i], pool + p + hl + hl2, keep);
-            text[i][keep] = '\0';
-            rl = hl + hl2 + nb + 1;
+  unsigned char **raw = (unsigned char **)calloc(str_count, sizeof(*raw));
+  size_t *raw_len = (size_t *)calloc(str_count, sizeof(*raw_len));
+  char(*text)[256] = (char(*)[256])calloc(str_count, 256);
+  if (!raw || !raw_len || !text)
+    zan_host_oom();
+  for (uint32_t i = 0; i < str_count; i++) {
+    size_t p = (size_t)(base - pool) + offs[i];
+    if (p >= first_size)
+      goto fail_pool;
+    size_t hl = 1;
+    size_t n = 0;
+    size_t rl;
+    if (utf8) {
+      size_t hl2 = 1;
+      n = pool[p];
+      /* 长度前缀先验后读：曾先读后验，前缀字节可越 xml 末尾最多 3 字节 */
+      if (n & 0x80) {
+        if (p + 2 > first_size)
+          goto fail_pool;
+        n = ((n & 0x7F) << 8) | pool[p + 1];
+        hl = 2;
+      }
+      if (p + hl >= first_size)
+        goto fail_pool;
+      size_t nb = pool[p + hl];
+      if (nb & 0x80) {
+        if (p + hl + 2 > first_size)
+          goto fail_pool;
+        nb = ((nb & 0x7F) << 8) | pool[p + hl + 1];
+        hl2 = 2;
+      }
+      if (p + hl + hl2 + nb + 1 > first_size)
+        goto fail_pool;
+      size_t keep = nb < 255 ? nb : 255;
+      memcpy(text[i], pool + p + hl + hl2, keep);
+      text[i][keep] = '\0';
+      rl = hl + hl2 + nb + 1;
+    } else {
+      /* 长度前缀先验后读（同 utf8 分支） */
+      if (p + 2 > first_size)
+        goto fail_pool;
+      uint16_t n16;
+      memcpy(&n16, pool + p, 2);
+      hl = 2;
+      if (n16 & 0x8000) {
+        if (p + 4 > first_size)
+          goto fail_pool;
+        uint16_t n16b;
+        memcpy(&n16b, pool + p + 2, 2);
+        n = ((size_t)(n16 & 0x7FFF) << 16) | n16b;
+        hl = 4;
+      } else {
+        n = n16;
+      }
+      if (p + hl + n * 2 + 2 > first_size)
+        goto fail_pool;
+      size_t chars = n < 255 ? n : 255;
+      for (size_t c = 0; c < chars; c++) {
+        uint16_t ch;
+        memcpy(&ch, pool + p + hl + c * 2, 2);
+        text[i][c] = (char)(ch < 128 ? ch : '?');
+      }
+      text[i][chars] = '\0';
+      rl = hl + n * 2 + 2;
+    }
+    raw_len[i] = rl;
+    raw[i] = (unsigned char *)malloc(rl);
+    if (!raw[i])
+      zan_host_oom();
+    memcpy(raw[i], pool + p, rl);
+  }
+
+  int pkg_i = -1, lbl_i = -1;
+  for (uint32_t i = 0; i < str_count; i++) {
+    if (strcmp(text[i], "dev.zan.app") == 0 && pkg_i < 0)
+      pkg_i = (int)i;
+    if (strcmp(text[i], "Zan App") == 0 && lbl_i < 0)
+      lbl_i = (int)i;
+  }
+  if (pkg_i < 0) {
+    fprintf(stderr, "error: template manifest lacks the "
+                    "package placeholder\n");
+    goto fail_pool;
+  }
+
+  unsigned char repl[2][1200];
+  size_t repl_len[2];
+  const char *vals[2] = {package, label};
+  int slots[2] = {pkg_i, lbl_i};
+  for (int v = 0; v < 2; v++) {
+    if (slots[v] < 0) {
+      repl_len[v] = 0;
+      continue;
+    }
+    size_t n = strlen(vals[v]);
+    if (utf8) {
+      size_t units = utf8_utf16_units(vals[v], n);
+      if (4 + n + 1 > sizeof(repl[v])) {
+        fprintf(stderr,
+                "error: manifest string replacement "
+                "(%zu bytes) exceeds the pool entry buffer\n",
+                n);
+        goto fail_pool;
+      }
+      size_t dl = pool_put_len(repl[v], units);
+      dl += pool_put_len(repl[v] + dl, n);
+      memcpy(repl[v] + dl, vals[v], n);
+      dl += n;
+      repl[v][dl++] = 0;
+      repl_len[v] = dl;
+    } else {
+      if (4 + n * 2 > sizeof(repl[v])) {
+        fprintf(stderr,
+                "error: manifest string replacement "
+                "(%zu bytes) exceeds the pool entry buffer\n",
+                n);
+        goto fail_pool;
+      }
+      size_t out = 0;
+      for (size_t c = 0; c < n;) {
+        unsigned char b0 = (unsigned char)vals[v][c];
+        uint32_t cp = b0;
+        size_t adv = 1;
+        if ((b0 & 0xE0) == 0xC0 && c + 1 < n) {
+          cp = ((uint32_t)b0 & 0x1F) << 6 |
+               ((unsigned char)vals[v][c + 1] & 0x3F);
+          adv = 2;
+        } else if ((b0 & 0xF0) == 0xE0 && c + 2 < n) {
+          cp = ((uint32_t)b0 & 0x0F) << 12 |
+               (((unsigned char)vals[v][c + 1] & 0x3F) << 6) |
+               ((unsigned char)vals[v][c + 2] & 0x3F);
+          adv = 3;
+        } else if ((b0 & 0xF8) == 0xF0 && c + 3 < n) {
+          cp = ((uint32_t)b0 & 0x07) << 18 |
+               (((unsigned char)vals[v][c + 1] & 0x3F) << 12) |
+               (((unsigned char)vals[v][c + 2] & 0x3F) << 6) |
+               ((unsigned char)vals[v][c + 3] & 0x3F);
+          adv = 4;
+        }
+        if (cp >= 0x10000) {
+          cp -= 0x10000;
+          uint16_t hi = (uint16_t)(0xD800 + (cp >> 10));
+          uint16_t lo = (uint16_t)(0xDC00 + (cp & 0x3FF));
+          memcpy(repl[v] + 2 + out, &hi, 2);
+          memcpy(repl[v] + 4 + out, &lo, 2);
+          out += 4;
         } else {
-            /* 长度前缀先验后读（同 utf8 分支） */
-            if (p + 2 > first_size) goto fail_pool;
-            uint16_t n16;
-            memcpy(&n16, pool + p, 2);
-            hl = 2;
-            if (n16 & 0x8000) {
-                if (p + 4 > first_size) goto fail_pool;
-                uint16_t n16b;
-                memcpy(&n16b, pool + p + 2, 2);
-                n = ((size_t)(n16 & 0x7FFF) << 16) | n16b;
-                hl = 4;
-            } else {
-                n = n16;
-            }
-            if (p + hl + n * 2 + 2 > first_size) goto fail_pool;
-            size_t chars = n < 255 ? n : 255;
-            for (size_t c = 0; c < chars; c++) {
-                uint16_t ch;
-                memcpy(&ch, pool + p + hl + c * 2, 2);
-                text[i][c] = (char)(ch < 128 ? ch : '?');
-            }
-            text[i][chars] = '\0';
-            rl = hl + n * 2 + 2;
+          uint16_t ch = (uint16_t)cp;
+          memcpy(repl[v] + 2 + out, &ch, 2);
+          out += 2;
         }
-        raw_len[i] = rl;
-        raw[i] = (unsigned char *)malloc(rl);
-        if (!raw[i]) zan_host_oom();
-        memcpy(raw[i], pool + p, rl);
+        c += adv;
+      }
+      uint16_t u16n = (uint16_t)(out / 2), zero = 0;
+      memcpy(repl[v], &u16n, 2);
+      memcpy(repl[v] + 2 + out, &zero, 2);
+      repl_len[v] = 2 + out + 2;
     }
+  }
 
-    int pkg_i = -1, lbl_i = -1;
-    for (uint32_t i = 0; i < str_count; i++) {
-        if (strcmp(text[i], "dev.zan.app") == 0 && pkg_i < 0) pkg_i = (int)i;
-        if (strcmp(text[i], "Zan App") == 0 && lbl_i < 0) lbl_i = (int)i;
+  uint32_t new_count = str_count + (uint32_t)nperms;
+  buf_t nb;
+  buf_init(&nb);
+  uint32_t *new_offs = (uint32_t *)malloc(sizeof(uint32_t) * new_count);
+  if (!new_offs)
+    zan_host_oom();
+  uint32_t acc = 0;
+  for (uint32_t i = 0; i < str_count; i++) {
+    int slot = (i == (uint32_t)pkg_i)                 ? 0
+               : (lbl_i >= 0 && i == (uint32_t)lbl_i) ? 1
+                                                      : -1;
+    const unsigned char *d = slot >= 0 ? repl[slot] : raw[i];
+    size_t dl = slot >= 0 ? repl_len[slot] : raw_len[i];
+    new_offs[i] = acc;
+    buf_write(&nb, d, dl);
+    acc += (uint32_t)dl;
+  }
+  for (int p = 0; p < nperms; p++) {
+    size_t n = strlen(perms[p]);
+    uint16_t u16n = (uint16_t)n, zero = 0;
+    unsigned char entry[2 + 128 * 2 + 2];
+    size_t dl = 0;
+    memcpy(entry + dl, &u16n, 2);
+    dl += 2;
+    for (size_t c = 0; c < n; c++) {
+      uint16_t ch = (unsigned char)perms[p][c];
+      memcpy(entry + dl + c * 2, &ch, 2);
     }
-    if (pkg_i < 0) { fprintf(stderr, "error: template manifest lacks the "
-                             "package placeholder\n"); goto fail_pool; }
+    dl += n * 2;
+    memcpy(entry + dl, &zero, 2);
+    dl += 2;
+    new_offs[str_count + (uint32_t)p] = acc;
+    buf_write(&nb, entry, dl);
+    acc += (uint32_t)dl;
+  }
+  uint32_t new_str_start = 28 + new_count * 4;
+  uint32_t new_pool_size = new_str_start + (uint32_t)nb.len;
+  uint32_t pad = (4 - (new_pool_size % 4)) % 4;
+  new_pool_size += pad;
 
-    unsigned char repl[2][1200];
-    size_t repl_len[2];
-    const char *vals[2] = { package, label };
-    int slots[2] = { pkg_i, lbl_i };
-    for (int v = 0; v < 2; v++) {
-        if (slots[v] < 0) { repl_len[v] = 0; continue; }
-        size_t n = strlen(vals[v]);
-        if (utf8) {
-            size_t units = utf8_utf16_units(vals[v], n);
-            if (4 + n + 1 > sizeof(repl[v])) {
-                fprintf(stderr, "error: manifest string replacement "
-                        "(%zu bytes) exceeds the pool entry buffer\n", n);
-                goto fail_pool;
-            }
-            size_t dl = pool_put_len(repl[v], units);
-            dl += pool_put_len(repl[v] + dl, n);
-            memcpy(repl[v] + dl, vals[v], n);
-            dl += n;
-            repl[v][dl++] = 0;
-            repl_len[v] = dl;
-        } else {
-            if (4 + n * 2 > sizeof(repl[v])) {
-                fprintf(stderr, "error: manifest string replacement "
-                        "(%zu bytes) exceeds the pool entry buffer\n", n);
-                goto fail_pool;
-            }
-            size_t out = 0;
-            for (size_t c = 0; c < n; ) {
-                unsigned char b0 = (unsigned char)vals[v][c];
-                uint32_t cp = b0;
-                size_t adv = 1;
-                if ((b0 & 0xE0) == 0xC0 && c + 1 < n) {
-                    cp = ((uint32_t)b0 & 0x1F) << 6
-                       | ((unsigned char)vals[v][c + 1] & 0x3F);
-                    adv = 2;
-                } else if ((b0 & 0xF0) == 0xE0 && c + 2 < n) {
-                    cp = ((uint32_t)b0 & 0x0F) << 12
-                       | (((unsigned char)vals[v][c + 1] & 0x3F) << 6)
-                       | ((unsigned char)vals[v][c + 2] & 0x3F);
-                    adv = 3;
-                } else if ((b0 & 0xF8) == 0xF0 && c + 3 < n) {
-                    cp = ((uint32_t)b0 & 0x07) << 18
-                       | (((unsigned char)vals[v][c + 1] & 0x3F) << 12)
-                       | (((unsigned char)vals[v][c + 2] & 0x3F) << 6)
-                       | ((unsigned char)vals[v][c + 3] & 0x3F);
-                    adv = 4;
-                }
-                if (cp >= 0x10000) {
-                    cp -= 0x10000;
-                    uint16_t hi = (uint16_t)(0xD800 + (cp >> 10));
-                    uint16_t lo = (uint16_t)(0xDC00 + (cp & 0x3FF));
-                    memcpy(repl[v] + 2 + out, &hi, 2);
-                    memcpy(repl[v] + 4 + out, &lo, 2);
-                    out += 4;
-                } else {
-                    uint16_t ch = (uint16_t)cp;
-                    memcpy(repl[v] + 2 + out, &ch, 2);
-                    out += 2;
-                }
-                c += adv;
-            }
-            uint16_t u16n = (uint16_t)(out / 2), zero = 0;
-            memcpy(repl[v], &u16n, 2);
-            memcpy(repl[v] + 2 + out, &zero, 2);
-            repl_len[v] = 2 + out + 2;
+  buf_t tree;
+  buf_init(&tree);
+  {
+    size_t rest_off = 8 + first_size;
+    const unsigned char *rest = xml + rest_off;
+    size_t rest_len = xml_len - rest_off;
+    size_t splice_off = 0;
+    if (rest_len >= 48 && nperms > 0) {
+      size_t o = 0;
+      while (o + 8 <= rest_len - 24) {
+        uint16_t ct = (uint16_t)(rest[o] | ((uint16_t)rest[o + 1] << 8));
+        uint32_t cs = (uint32_t)rest[o + 4] | ((uint32_t)rest[o + 5] << 8) |
+                      ((uint32_t)rest[o + 6] << 16) |
+                      ((uint32_t)rest[o + 7] << 24);
+        if (cs < 8 || o + cs > rest_len - 24) {
+          break;
         }
-    }
-
-    uint32_t new_count = str_count + (uint32_t)nperms;
-    buf_t nb; buf_init(&nb);
-    uint32_t *new_offs = (uint32_t *)malloc(sizeof(uint32_t) * new_count);
-    if (!new_offs) zan_host_oom();
-    uint32_t acc = 0;
-    for (uint32_t i = 0; i < str_count; i++) {
-        int slot = (i == (uint32_t)pkg_i) ? 0
-                 : (lbl_i >= 0 && i == (uint32_t)lbl_i) ? 1 : -1;
-        const unsigned char *d = slot >= 0 ? repl[slot] : raw[i];
-        size_t dl = slot >= 0 ? repl_len[slot] : raw_len[i];
-        new_offs[i] = acc;
-        buf_write(&nb, d, dl);
-        acc += (uint32_t)dl;
-    }
-    for (int p = 0; p < nperms; p++) {
-        size_t n = strlen(perms[p]);
-        uint16_t u16n = (uint16_t)n, zero = 0;
-        unsigned char entry[2 + 128 * 2 + 2];
-        size_t dl = 0;
-        memcpy(entry + dl, &u16n, 2); dl += 2;
-        for (size_t c = 0; c < n; c++) {
-            uint16_t ch = (unsigned char)perms[p][c];
-            memcpy(entry + dl + c * 2, &ch, 2);
+        if (ct == 0x0103) {
+          splice_off = o;
         }
-        dl += n * 2;
-        memcpy(entry + dl, &zero, 2); dl += 2;
-        new_offs[str_count + (uint32_t)p] = acc;
-        buf_write(&nb, entry, dl);
-        acc += (uint32_t)dl;
+        o += cs;
+      }
     }
-    uint32_t new_str_start = 28 + new_count * 4;
-    uint32_t new_pool_size = new_str_start + (uint32_t)nb.len;
-    uint32_t pad = (4 - (new_pool_size % 4)) % 4;
-    new_pool_size += pad;
-
-    buf_t tree; buf_init(&tree);
-    {
-        size_t rest_off = 8 + first_size;
-        const unsigned char *rest = xml + rest_off;
-        size_t rest_len = xml_len - rest_off;
-        size_t splice_off = 0;
-        if (rest_len >= 48 && nperms > 0) {
-            size_t o = 0;
-            while (o + 8 <= rest_len - 24) {
-                uint16_t ct = (uint16_t)(rest[o] | ((uint16_t)rest[o + 1] << 8));
-                uint32_t cs = (uint32_t)rest[o + 4]
-                            | ((uint32_t)rest[o + 5] << 8)
-                            | ((uint32_t)rest[o + 6] << 16)
-                            | ((uint32_t)rest[o + 7] << 24);
-                if (cs < 8 || o + cs > rest_len - 24) { break; }
-                if (ct == 0x0103) { splice_off = o; }
-                o += cs;
-            }
-        }
-        if (nperms > 0 && splice_off > 0) {
-            buf_write(&tree, rest, splice_off);
-            for (int p = 0; p < nperms; p++) {
-                uint32_t slot = str_count + (uint32_t)p;
-                buf_u16(&tree, 0x0102); buf_u16(&tree, 16);
-                buf_u32(&tree, 56);
-                buf_u32(&tree, 0); buf_u32(&tree, 0);   /* line, comment */
-                buf_u32(&tree, 0xFFFFFFFFu);            /* ns: none */
-                buf_u32(&tree, 42);                     /* name: uses-permission */
-                uint16_t astart = 20, asize = 20;
-                buf_u16(&tree, astart); buf_u16(&tree, asize);
-                buf_u16(&tree, 1);
-                buf_u16(&tree, 0);                      /* idIndex */
-                buf_u16(&tree, 0);                      /* classIndex */
-                buf_u16(&tree, 0);                      /* styleIndex */
-                buf_u32(&tree, 33);
-                buf_u32(&tree, 3);
-                buf_u32(&tree, slot);
-                buf_u16(&tree, 8);
-                buf_u8(&tree, 0);                       /* res */
-                buf_u8(&tree, 3);                       /* dataType: string */
-                buf_u32(&tree, slot);                   /* data */
-                buf_u16(&tree, 0x0103); buf_u16(&tree, 16);
-                buf_u32(&tree, 24);
-                buf_u32(&tree, 0); buf_u32(&tree, 0);
-                buf_u32(&tree, 0xFFFFFFFFu);
-                buf_u32(&tree, 42);
-            }
-            buf_write(&tree, rest + splice_off, rest_len - splice_off);
-        } else {
-            buf_write(&tree, rest, rest_len);
-        }
+    if (nperms > 0 && splice_off > 0) {
+      buf_write(&tree, rest, splice_off);
+      for (int p = 0; p < nperms; p++) {
+        uint32_t slot = str_count + (uint32_t)p;
+        buf_u16(&tree, 0x0102);
+        buf_u16(&tree, 16);
+        buf_u32(&tree, 56);
+        buf_u32(&tree, 0);
+        buf_u32(&tree, 0);           /* line, comment */
+        buf_u32(&tree, 0xFFFFFFFFu); /* ns: none */
+        buf_u32(&tree, 42);          /* name: uses-permission */
+        uint16_t astart = 20, asize = 20;
+        buf_u16(&tree, astart);
+        buf_u16(&tree, asize);
+        buf_u16(&tree, 1);
+        buf_u16(&tree, 0); /* idIndex */
+        buf_u16(&tree, 0); /* classIndex */
+        buf_u16(&tree, 0); /* styleIndex */
+        buf_u32(&tree, 33);
+        buf_u32(&tree, 3);
+        buf_u32(&tree, slot);
+        buf_u16(&tree, 8);
+        buf_u8(&tree, 0);     /* res */
+        buf_u8(&tree, 3);     /* dataType: string */
+        buf_u32(&tree, slot); /* data */
+        buf_u16(&tree, 0x0103);
+        buf_u16(&tree, 16);
+        buf_u32(&tree, 24);
+        buf_u32(&tree, 0);
+        buf_u32(&tree, 0);
+        buf_u32(&tree, 0xFFFFFFFFu);
+        buf_u32(&tree, 42);
+      }
+      buf_write(&tree, rest + splice_off, rest_len - splice_off);
+    } else {
+      buf_write(&tree, rest, rest_len);
     }
+  }
 
-    buf_t ob; buf_init(&ob);
-    buf_write(&ob, xml, 8);
-    uint16_t pt = 0x0001, ph = 28;
-    buf_write(&ob, &pt, 2);
-    buf_write(&ob, &ph, 2);
-    buf_write(&ob, &new_pool_size, 4);
-    buf_write(&ob, &new_count, 4);
-    uint32_t zero32 = 0;
-    buf_write(&ob, &zero32, 4);
-    buf_write(&ob, &flags32, 4);           /* flags */
-    buf_write(&ob, &new_str_start, 4);
-    buf_write(&ob, &zero32, 4);
-    buf_write(&ob, new_offs, 4 * new_count);
-    buf_write(&ob, nb.p, nb.len);
-    { unsigned char z4[4] = {0,0,0,0}; buf_write(&ob, z4, pad); }
-    buf_write(&ob, tree.p, tree.len);
-    { uint32_t total = (uint32_t)ob.len; memcpy(ob.p + 4, &total, 4); }
+  buf_t ob;
+  buf_init(&ob);
+  buf_write(&ob, xml, 8);
+  uint16_t pt = 0x0001, ph = 28;
+  buf_write(&ob, &pt, 2);
+  buf_write(&ob, &ph, 2);
+  buf_write(&ob, &new_pool_size, 4);
+  buf_write(&ob, &new_count, 4);
+  uint32_t zero32 = 0;
+  buf_write(&ob, &zero32, 4);
+  buf_write(&ob, &flags32, 4); /* flags */
+  buf_write(&ob, &new_str_start, 4);
+  buf_write(&ob, &zero32, 4);
+  buf_write(&ob, new_offs, 4 * new_count);
+  buf_write(&ob, nb.p, nb.len);
+  {
+    unsigned char z4[4] = {0, 0, 0, 0};
+    buf_write(&ob, z4, pad);
+  }
+  buf_write(&ob, tree.p, tree.len);
+  {
+    uint32_t total = (uint32_t)ob.len;
+    memcpy(ob.p + 4, &total, 4);
+  }
 
-    *out = ob.p; *out_len = ob.len;
-    buf_free(&tree);
-    for (uint32_t i = 0; i < str_count; i++) free(raw[i]);
-    free(raw); free(raw_len); free(text);
-    free(new_offs);
-    buf_free(&nb);
-    return 0;
+  *out = ob.p;
+  *out_len = ob.len;
+  buf_free(&tree);
+  for (uint32_t i = 0; i < str_count; i++)
+    free(raw[i]);
+  free(raw);
+  free(raw_len);
+  free(text);
+  free(new_offs);
+  buf_free(&nb);
+  return 0;
 
 fail_pool:
-    /* 串池已分配后的统一失败出口：曾 6 处早退整批泄漏 raw/raw_len/text */
-    for (uint32_t i = 0; i < str_count; i++) free(raw[i]);
-    free(raw); free(raw_len); free(text);
-    return -1;
+  /* 串池已分配后的统一失败出口：曾 6 处早退整批泄漏 raw/raw_len/text */
+  for (uint32_t i = 0; i < str_count; i++)
+    free(raw[i]);
+  free(raw);
+  free(raw_len);
+  free(text);
+  return -1;
 }
 
 static unsigned char *read_all(const char *path, size_t *len) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return NULL; }
-    unsigned char *d = (unsigned char *)malloc((size_t)n + 1);
-    if (!d) { fclose(f); zan_host_oom(); }
-    if (n > 0 && fread(d, 1, (size_t)n, f) != (size_t)n) {
-        fclose(f); free(d); return NULL;
-    }
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return NULL;
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (n < 0) {
     fclose(f);
-    *len = (size_t)n;
-    return d;
+    return NULL;
+  }
+  unsigned char *d = (unsigned char *)malloc((size_t)n + 1);
+  if (!d) {
+    fclose(f);
+    zan_host_oom();
+  }
+  if (n > 0 && fread(d, 1, (size_t)n, f) != (size_t)n) {
+    fclose(f);
+    free(d);
+    return NULL;
+  }
+  fclose(f);
+  *len = (size_t)n;
+  return d;
 }
 
 static int write_all(const char *path, const unsigned char *d, size_t n) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    int ok = n == 0 || fwrite(d, 1, n, f) == n;
-    int close_status = fclose(f);
-    if (!ok || close_status != 0) {
-        remove(path);
-        return -1;
-    }
-    return 0;
+  FILE *f = fopen(path, "wb");
+  if (!f)
+    return -1;
+  int ok = n == 0 || fwrite(d, 1, n, f) == n;
+  int close_status = fclose(f);
+  if (!ok || close_status != 0) {
+    remove(path);
+    return -1;
+  }
+  return 0;
 }
 
 static int file_exists(const char *p) {
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(p);
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+  DWORD a = GetFileAttributesA(p);
+  return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 #else
-    struct stat st;
-    return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+  struct stat st;
+  return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 #endif
 }
 
 static int dir_exists(const char *p) {
 #ifdef _WIN32
-    DWORD a = GetFileAttributesA(p);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+  DWORD a = GetFileAttributesA(p);
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 #else
-    struct stat st;
-    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+  struct stat st;
+  return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 #endif
 }
 
 static int find_java(char *out, size_t outsz) {
-    const char *home = getenv("JAVA_HOME");
-    if (home && home[0]) {
+  const char *home = getenv("JAVA_HOME");
+  if (home && home[0]) {
 #ifdef _WIN32
-        if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)",
-                            "%s\\bin\\java.exe", home) != 0) return -1;
+    if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)",
+                        "%s\\bin\\java.exe", home) != 0)
+      return -1;
 #else
-        if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)",
-                            "%s/bin/java", home) != 0) return -1;
+    if (zan_fmt_checked(out, outsz, "java path (JAVA_HOME)", "%s/bin/java",
+                        home) != 0)
+      return -1;
 #endif
-        if (file_exists(out)) return 0;
-    }
+    if (file_exists(out))
+      return 0;
+  }
 #ifdef _WIN32
-    char found[MAX_PATH];
-    if (SearchPathA(NULL, "java.exe", NULL, MAX_PATH, found, NULL) > 0) {
-        if (zan_fmt_checked(out, outsz, "java path (PATH search)",
-                            "%s", found) != 0) return -1;
-        return 0;
-    }
-    const char *uprofile = getenv("USERPROFILE");
-    if (!uprofile || !uprofile[0]) uprofile = getenv("HOME");
-    if (uprofile && uprofile[0]) {
-        if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre-win)",
-                            "%s\\.zan\\jre-win\\bin\\java.exe", uprofile) != 0) return -1;
-        if (file_exists(out)) return 0;
-    }
+  char found[MAX_PATH];
+  if (SearchPathA(NULL, "java.exe", NULL, MAX_PATH, found, NULL) > 0) {
+    if (zan_fmt_checked(out, outsz, "java path (PATH search)", "%s", found) !=
+        0)
+      return -1;
+    return 0;
+  }
+  const char *uprofile = getenv("USERPROFILE");
+  if (!uprofile || !uprofile[0])
+    uprofile = getenv("HOME");
+  if (uprofile && uprofile[0]) {
+    if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre-win)",
+                        "%s\\.zan\\jre-win\\bin\\java.exe", uprofile) != 0)
+      return -1;
+    if (file_exists(out))
+      return 0;
+  }
 #else
-    if (file_exists("/usr/bin/java") || file_exists("/usr/local/bin/java")) {
-        if (zan_fmt_checked(out, outsz, "java path (standard install)",
-                            "java") != 0) return -1;
-        return 0;
-    }
-    FILE *w = popen("command -v java 2>/dev/null", "r");
-    if (w) {
-        char line[1024];
-        if (fgets(line, sizeof(line), w)) {
-            size_t l = strlen(line);
-            while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
-            if (l > 0 && file_exists(line)) {
-                pclose(w);
-                if (zan_fmt_checked(out, outsz, "java path (command -v)",
-                                    "%s", line) != 0) return -1;
-                return 0;
-            }
-        }
+  if (file_exists("/usr/bin/java") || file_exists("/usr/local/bin/java")) {
+    if (zan_fmt_checked(out, outsz, "java path (standard install)", "java") !=
+        0)
+      return -1;
+    return 0;
+  }
+  FILE *w = popen("command -v java 2>/dev/null", "r");
+  if (w) {
+    char line[1024];
+    if (fgets(line, sizeof(line), w)) {
+      size_t l = strlen(line);
+      while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r'))
+        line[--l] = 0;
+      if (l > 0 && file_exists(line)) {
         pclose(w);
+        if (zan_fmt_checked(out, outsz, "java path (command -v)", "%s", line) !=
+            0)
+          return -1;
+        return 0;
+      }
     }
-    const char *uhome = getenv("HOME");
-    if (uhome && uhome[0]) {
-        if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre)",
-                            "%s/.zan/jre/bin/java", uhome) != 0) return -1;
-        if (file_exists(out)) return 0;
-    }
+    pclose(w);
+  }
+  const char *uhome = getenv("HOME");
+  if (uhome && uhome[0]) {
+    if (zan_fmt_checked(out, outsz, "java path (~/.zan/jre)",
+                        "%s/.zan/jre/bin/java", uhome) != 0)
+      return -1;
+    if (file_exists(out))
+      return 0;
+  }
 #endif
-    return -1;
+  return -1;
 }
 
 /* B-ID104：JRE 下载/安装器职责已整体移出编译器（见 scripts/setup_jdk.ps1）。
  * 编译器仅负责检测环境与报错引导，杜绝在编译构建管线中隐式拉取二进制。 */
 static int ensure_java(char *out, size_t outsz) {
-    if (find_java(out, outsz) == 0) return 0;
+  if (find_java(out, outsz) == 0)
+    return 0;
 
-    fprintf(stderr,
-        "error: apksigner needs Java (JDK/JRE 11+), but 'java' was not found on PATH or JAVA_HOME.\n"
+  fprintf(stderr, "error: apksigner needs Java (JDK/JRE 11+), but 'java' was "
+                  "not found on PATH or JAVA_HOME.\n"
 #ifdef _WIN32
-        "       Please install Java, or run 'pwsh scripts/setup_jdk.ps1' to install a portable JRE.\n"
+                  "       Please install Java, or run 'pwsh "
+                  "scripts/setup_jdk.ps1' to install a portable JRE.\n"
 #else
-        "       Please install a JRE (e.g. your package manager's default-jre or openjdk) and retry.\n"
+                  "       Please install a JRE (e.g. your package manager's "
+                  "default-jre or openjdk) and retry.\n"
 #endif
-    );
-    return -1;
+  );
+  return -1;
 }
 
-
 static int ensure_keystore(char *out, size_t outsz) {
-    const char *custom_ks = getenv("ZAN_ANDROID_KEYSTORE");
-    if (custom_ks && custom_ks[0] && file_exists(custom_ks)) {
-        if (zan_fmt_checked(out, outsz, "custom keystore path", "%s", custom_ks) == 0) {
-            return 0;
-        }
+  const char *custom_ks = getenv("ZAN_ANDROID_KEYSTORE");
+  if (custom_ks && custom_ks[0] && file_exists(custom_ks)) {
+    if (zan_fmt_checked(out, outsz, "custom keystore path", "%s", custom_ks) ==
+        0) {
+      return 0;
     }
-    const char *home = getenv("USERPROFILE");
-    if (!home || !home[0]) home = getenv("HOME");
-    if (!home || !home[0]) return -1;
+  }
+  const char *home = getenv("USERPROFILE");
+  if (!home || !home[0])
+    home = getenv("HOME");
+  if (!home || !home[0])
+    return -1;
 #ifdef _WIN32
-    if (zan_fmt_checked(out, outsz, "debug keystore path",
-                        "%s\\.zan\\debug.keystore", home) != 0) return -1;
+  if (zan_fmt_checked(out, outsz, "debug keystore path",
+                      "%s\\.zan\\debug.keystore", home) != 0)
+    return -1;
 #else
-    if (zan_fmt_checked(out, outsz, "debug keystore path",
-                        "%s/.zan/debug.keystore", home) != 0) return -1;
+  if (zan_fmt_checked(out, outsz, "debug keystore path",
+                      "%s/.zan/debug.keystore", home) != 0)
+    return -1;
 #endif
-    if (file_exists(out)) return 0;
-#ifdef _WIN32
-    { char dir[1200];
-      if (zan_fmt_checked(dir, sizeof(dir), "debug keystore dir",
-                          "%s\\.zan", home) != 0) return -1;
-      if (!dir_exists(dir)) CreateDirectoryA(dir, NULL); }
-#endif
+  if (file_exists(out))
     return 0;
+#ifdef _WIN32
+  {
+    char dir[1200];
+    if (zan_fmt_checked(dir, sizeof(dir), "debug keystore dir", "%s\\.zan",
+                        home) != 0)
+      return -1;
+    if (!dir_exists(dir))
+      CreateDirectoryA(dir, NULL);
+  }
+#endif
+  return 0;
 }
 
 static int run_quiet(const char *cmd) {
-    int rc = system(cmd);
-    return rc == 0 ? 0 : -1;
+  int rc = system(cmd);
+  return rc == 0 ? 0 : -1;
 }
 
-int zan_apk_build(const char *apk_path, const char *lib_main,
-                  const char *abi, const char *package, const char *label,
-                  const char *shell_dir, char **extra_libs, int extra_count,
-                  int perm_count, const char (*perms)[128]) {
-    char tmp_apk[1400];
-    if (zan_fmt_checked(tmp_apk, sizeof(tmp_apk), "APK temporary path",
-                        "%s.tmp", apk_path) != 0) return 1;
-
-    char path[1400];
-    size_t man_len = 0, arsc_len = 0, dex_len = 0, lib_len = 0;
-    unsigned char *manifest = NULL, *arsc = NULL, *dex = NULL;
-    if (zan_fmt_checked(path, sizeof(path), "APK shell manifest path",
-                        "%s/AndroidManifest.xml.bin", shell_dir) != 0) return 1;
-    manifest = read_all(path, &man_len);
-    if (zan_fmt_checked(path, sizeof(path), "APK shell resources path",
-                        "%s/resources.arsc", shell_dir) != 0) {
-        free(manifest); return 1;
-    }
-    arsc = read_all(path, &arsc_len);
-    if (zan_fmt_checked(path, sizeof(path), "APK shell dex path",
-                        "%s/classes.dex", shell_dir) != 0) {
-        free(manifest); free(arsc); return 1;
-    }
-    dex = read_all(path, &dex_len);
-    unsigned char *lib = read_all(lib_main, &lib_len);
-    if (!manifest || !arsc || !dex || !lib) {
-        fprintf(stderr, "error: APK shell assets missing in '%s' "
-                "(manifest/arsc/dex) or library '%s' unreadable\n",
-                shell_dir, lib_main);
-        free(manifest); free(arsc); free(dex); free(lib);
-        return 1;
-    }
-
-    unsigned char *man2 = NULL; size_t man2_len = 0;
-    int prc = axml_patch(manifest, man_len, package, label,
-                         perm_count, perms, &man2, &man2_len);
-    free(manifest);
-    if (prc != 0) { fprintf(stderr, "error: manifest patch failed\n");
-        free(arsc); free(dex); free(lib); return 1; }
-
-    zip_t z; zip_start(&z);
-    if (zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4) != 0 ||
-        zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4) != 0 ||
-        zip_add(&z, "classes.dex", dex, dex_len, 1, 4) != 0) {
-        goto fail_zip;
-    }
-    {
-        static const char *dpis[] = { "mipmap-mdpi", "mipmap-hdpi",
-            "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi" };
-        for (unsigned di = 0; di < sizeof(dpis) / sizeof(dpis[0]); di++) {
-            if (zan_fmt_checked(path, sizeof(path), "APK icon path",
-                                "%s/res/%s/ic_launcher.png",
-                                shell_dir, dpis[di]) != 0) goto fail_zip;
-            size_t ilen = 0;
-            unsigned char *idata = read_all(path, &ilen);
-            if (!idata) continue;
-            char ename[160];
-            if (zan_fmt_checked(ename, sizeof(ename), "APK icon entry name",
-                                "res/%s-v4/ic_launcher.png", dpis[di]) != 0) {
-                free(idata);
-                goto fail_zip;
-            }
-            if (zip_add(&z, ename, idata, ilen, 1, 4) != 0) {
-                free(idata);
-                goto fail_zip;
-            }
-            free(idata);
-        }
-    }
-    char lname[160];
-    if (zan_fmt_checked(lname, sizeof(lname), "APK main library entry name",
-                        "lib/%s/libmain.so", abi) != 0) goto fail_zip;
-    if (zip_add(&z, lname, lib, lib_len, 0, 4) != 0) goto fail_zip;
-    for (int i = 0; i < extra_count; i++) {
-        size_t elen = 0;
-        unsigned char *edata = read_all(extra_libs[i], &elen);
-        if (!edata) {
-            fprintf(stderr, "error: cannot read bundled library '%s'\n",
-                    extra_libs[i]);
-            goto fail_zip;
-        }
-        const char *base = strrchr(extra_libs[i], '/');
-        const char *base2 = strrchr(extra_libs[i], '\\');
-        if (base2 > base) base = base2;
-        base = base ? base + 1 : extra_libs[i];
-        char ename[200];
-        if (zan_fmt_checked(ename, sizeof(ename), "APK extra library entry name",
-                            "lib/%s/%s", abi, base) != 0) {
-            free(edata);
-            goto fail_zip;
-        }
-        if (zip_add(&z, ename, edata, elen, 0, 4) != 0) {
-            free(edata);
-            goto fail_zip;
-        }
-        free(edata);
-    }
-    zip_finish(&z);
-    int rc = write_all(tmp_apk, z.out.p, z.out.len);
-    buf_free(&z.out);
-    free(z.ents);
-    free(man2); free(arsc); free(dex); free(lib);
-    if (rc != 0) {
-        fprintf(stderr, "error: cannot write '%s'\n", tmp_apk);
-        return 1;
-    }
-    goto success_zip;
-
-fail_zip:
-    buf_free(&z.out);
-    free(z.ents);
-    free(man2); free(arsc); free(dex); free(lib);
+int zan_apk_build(const char *apk_path, const char *lib_main, const char *abi,
+                  const char *package, const char *label, const char *shell_dir,
+                  char **extra_libs, int extra_count, int perm_count,
+                  const char (*perms)[128]) {
+  char tmp_apk[1400];
+  if (zan_fmt_checked(tmp_apk, sizeof(tmp_apk), "APK temporary path", "%s.tmp",
+                      apk_path) != 0)
     return 1;
 
-success_zip: ;
+  char path[1400];
+  size_t man_len = 0, arsc_len = 0, dex_len = 0, lib_len = 0;
+  unsigned char *manifest = NULL, *arsc = NULL, *dex = NULL;
+  if (zan_fmt_checked(path, sizeof(path), "APK shell manifest path",
+                      "%s/AndroidManifest.xml.bin", shell_dir) != 0)
+    return 1;
+  manifest = read_all(path, &man_len);
+  if (zan_fmt_checked(path, sizeof(path), "APK shell resources path",
+                      "%s/resources.arsc", shell_dir) != 0) {
+    free(manifest);
+    return 1;
+  }
+  arsc = read_all(path, &arsc_len);
+  if (zan_fmt_checked(path, sizeof(path), "APK shell dex path",
+                      "%s/classes.dex", shell_dir) != 0) {
+    free(manifest);
+    free(arsc);
+    return 1;
+  }
+  dex = read_all(path, &dex_len);
+  unsigned char *lib = read_all(lib_main, &lib_len);
+  if (!manifest || !arsc || !dex || !lib) {
+    fprintf(stderr,
+            "error: APK shell assets missing in '%s' "
+            "(manifest/arsc/dex) or library '%s' unreadable\n",
+            shell_dir, lib_main);
+    free(manifest);
+    free(arsc);
+    free(dex);
+    free(lib);
+    return 1;
+  }
 
-    char exe_dir[1200] = {0};
+  unsigned char *man2 = NULL;
+  size_t man2_len = 0;
+  int prc = axml_patch(manifest, man_len, package, label, perm_count, perms,
+                       &man2, &man2_len);
+  free(manifest);
+  if (prc != 0) {
+    fprintf(stderr, "error: manifest patch failed\n");
+    free(arsc);
+    free(dex);
+    free(lib);
+    return 1;
+  }
+
+  zip_t z;
+  zip_start(&z);
+  if (zip_add(&z, "AndroidManifest.xml", man2, man2_len, 1, 4) != 0 ||
+      zip_add(&z, "resources.arsc", arsc, arsc_len, 0, 4) != 0 ||
+      zip_add(&z, "classes.dex", dex, dex_len, 1, 4) != 0) {
+    goto fail_zip;
+  }
+  {
+    static const char *dpis[] = {"mipmap-mdpi", "mipmap-hdpi", "mipmap-xhdpi",
+                                 "mipmap-xxhdpi", "mipmap-xxxhdpi"};
+    for (unsigned di = 0; di < sizeof(dpis) / sizeof(dpis[0]); di++) {
+      if (zan_fmt_checked(path, sizeof(path), "APK icon path",
+                          "%s/res/%s/ic_launcher.png", shell_dir,
+                          dpis[di]) != 0)
+        goto fail_zip;
+      size_t ilen = 0;
+      unsigned char *idata = read_all(path, &ilen);
+      if (!idata)
+        continue;
+      char ename[160];
+      if (zan_fmt_checked(ename, sizeof(ename), "APK icon entry name",
+                          "res/%s-v4/ic_launcher.png", dpis[di]) != 0) {
+        free(idata);
+        goto fail_zip;
+      }
+      if (zip_add(&z, ename, idata, ilen, 1, 4) != 0) {
+        free(idata);
+        goto fail_zip;
+      }
+      free(idata);
+    }
+  }
+  char lname[160];
+  if (zan_fmt_checked(lname, sizeof(lname), "APK main library entry name",
+                      "lib/%s/libmain.so", abi) != 0)
+    goto fail_zip;
+  if (zip_add(&z, lname, lib, lib_len, 0, 4) != 0)
+    goto fail_zip;
+  for (int i = 0; i < extra_count; i++) {
+    size_t elen = 0;
+    unsigned char *edata = read_all(extra_libs[i], &elen);
+    if (!edata) {
+      fprintf(stderr, "error: cannot read bundled library '%s'\n",
+              extra_libs[i]);
+      goto fail_zip;
+    }
+    const char *base = strrchr(extra_libs[i], '/');
+    const char *base2 = strrchr(extra_libs[i], '\\');
+    if (base2 > base)
+      base = base2;
+    base = base ? base + 1 : extra_libs[i];
+    char ename[200];
+    if (zan_fmt_checked(ename, sizeof(ename), "APK extra library entry name",
+                        "lib/%s/%s", abi, base) != 0) {
+      free(edata);
+      goto fail_zip;
+    }
+    if (zip_add(&z, ename, edata, elen, 0, 4) != 0) {
+      free(edata);
+      goto fail_zip;
+    }
+    free(edata);
+  }
+  zip_finish(&z);
+  int rc = write_all(tmp_apk, z.out.p, z.out.len);
+  buf_free(&z.out);
+  free(z.ents);
+  free(man2);
+  free(arsc);
+  free(dex);
+  free(lib);
+  if (rc != 0) {
+    fprintf(stderr, "error: cannot write '%s'\n", tmp_apk);
+    return 1;
+  }
+  goto success_zip;
+
+fail_zip:
+  buf_free(&z.out);
+  free(z.ents);
+  free(man2);
+  free(arsc);
+  free(dex);
+  free(lib);
+  return 1;
+
+success_zip:;
+
+  char exe_dir[1200] = {0};
 #ifdef _WIN32
-    { char mod[1200]; DWORD n = GetModuleFileNameA(NULL, mod, sizeof(mod));
-      if (n > 0 && n < sizeof(mod)) { char *s = strrchr(mod, '\\'); if (s) *s = 0;
-          if (zan_fmt_checked(exe_dir, sizeof(exe_dir), "zanc install dir",
-                              "%s", mod) != 0) { remove(tmp_apk); return 1; } } }
+  {
+    char mod[1200];
+    DWORD n = GetModuleFileNameA(NULL, mod, sizeof(mod));
+    if (n > 0 && n < sizeof(mod)) {
+      char *s = strrchr(mod, '\\');
+      if (s)
+        *s = 0;
+      if (zan_fmt_checked(exe_dir, sizeof(exe_dir), "zanc install dir", "%s",
+                          mod) != 0) {
+        remove(tmp_apk);
+        return 1;
+      }
+    }
+  }
 #elif defined(__APPLE__)
-    { uint32_t sz = sizeof(exe_dir); if (_NSGetExecutablePath(exe_dir, &sz) != 0) exe_dir[0] = 0; else { char *s = strrchr(exe_dir, '/'); if (s) *s = 0; } }
+  {
+    uint32_t sz = sizeof(exe_dir);
+    if (_NSGetExecutablePath(exe_dir, &sz) != 0)
+      exe_dir[0] = 0;
+    else {
+      char *s = strrchr(exe_dir, '/');
+      if (s)
+        *s = 0;
+    }
+  }
 #else
-    { ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
-      if (n > 0) { exe_dir[n] = 0; char *s = strrchr(exe_dir, '/'); if (s) *s = 0; } }
+  {
+    ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (n > 0) {
+      exe_dir[n] = 0;
+      char *s = strrchr(exe_dir, '/');
+      if (s)
+        *s = 0;
+    }
+  }
 #endif
-    char signer[1300];
-    if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
-                        "%s/apksigner.jar", exe_dir) != 0) {
-        remove(tmp_apk); return 1;
-    }
-    if (!file_exists(signer)) {
-        if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
-                            "%s/apk-shell/apksigner.jar", exe_dir) != 0) {
-            remove(tmp_apk); return 1;
-        }
-    }
-    if (!file_exists(signer)) {
-        fprintf(stderr, "error: apksigner.jar not found next to zan "
-                "(expected apk-shell/apksigner.jar; reinstall zan)\n");
-        remove(tmp_apk);
-        return 1;
-    }
-
-    char java[1200];
-    if (ensure_java(java, sizeof(java)) != 0) { remove(tmp_apk); return 1; }
-
-    char ks[1200];
-    if (ensure_keystore(ks, sizeof(ks)) != 0) {
-        fprintf(stderr, "error: cannot place the debug keystore\n");
-        remove(tmp_apk);
-        return 1;
-    }
-    if (!file_exists(ks)) {
-        char keytool[1200], cmd[3000];
-        { char *s = strrchr(java, '/'); char *s2 = strrchr(java, '\\');
-          char *cut = (s2 > s) ? s2 : s;
-          if (cut) { size_t keep = (size_t)(cut - java);
-            if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path",
-                                "%.*s", (int)keep, java) != 0) {
-                remove(tmp_apk); return 1;
-            } }
-          else if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path",
-                                   "%s", java) != 0) {
-              remove(tmp_apk); return 1;
-          } }
-#ifdef _WIN32
-        if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
-                 "\"\"%s\\keytool.exe\" -genkeypair -keystore \"%s\""
-                 " -storepass android -keypass android -alias zan"
-                 " -dname CN=Zan_Debug -keyalg RSA -keysize 2048"
-                 " -validity 10000 -storetype PKCS12\"", keytool, ks) != 0) {
-            remove(tmp_apk); return 1;
-        }
-#else
-        if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
-                 "\"%s/keytool\" -genkeypair -keystore \"%s\""
-                 " -storepass android -keypass android -alias zan"
-                 " -dname \"CN=Zan Debug\" -keyalg RSA -keysize 2048"
-                 " -validity 10000 -storetype PKCS12 >/dev/null 2>&1", keytool, ks) != 0) {
-            remove(tmp_apk); return 1;
-        }
-#endif
-        if (run_quiet(cmd) != 0 || !file_exists(ks)) {
-            fprintf(stderr, "error: could not generate the debug keystore "
-                    "(keytool missing from the Java runtime?)\n");
-            remove(tmp_apk);
-            return 1;
-        }
-        printf("  generated debug keystore ? %s\n", ks);
-    }
-
-    const char *ks_pass = getenv("ZAN_ANDROID_KEYSTORE_PASS");
-    if (!ks_pass || !ks_pass[0]) ks_pass = "android";
-    const char *ks_alias = getenv("ZAN_ANDROID_KEY_ALIAS");
-    char alias_opt[300] = "";
-    if (ks_alias && ks_alias[0]) {
-        snprintf(alias_opt, sizeof(alias_opt), " --ks-key-alias \"%s\"", ks_alias);
-    }
-
-    char scmd[4000];
-#ifdef _WIN32
-    if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
-             "\"\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
-             " --out \"%s\" \"%s\"\"", java, signer, ks, ks_pass, alias_opt, apk_path,
-             tmp_apk) != 0) { remove(tmp_apk); return 1; }
-#else
-    if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
-             "\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
-             " --out \"%s\" \"%s\" >/dev/null 2>&1", java, signer, ks, ks_pass, alias_opt,
-             apk_path, tmp_apk) != 0) { remove(tmp_apk); return 1; }
-#endif
-    if (run_quiet(scmd) != 0) {
-        fprintf(stderr, "error: APK signing failed (apksigner). Run with the"
-                " same command manually for details:\n  java -jar %s sign "
-                "--ks %s --out %s %s\n", signer, ks, apk_path, tmp_apk);
-        char keep[1400];
-        if (zan_fmt_checked(keep, sizeof(keep), "unsigned APK path",
-                            "%s.unsigned", apk_path) != 0) {
-            remove(tmp_apk); return 1;
-        }
-        if (rename(tmp_apk, keep) != 0) remove(tmp_apk);
-        return 1;
-    }
+  char signer[1300];
+  if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
+                      "%s/apksigner.jar", exe_dir) != 0) {
     remove(tmp_apk);
-    return 0;
+    return 1;
+  }
+  if (!file_exists(signer)) {
+    if (zan_fmt_checked(signer, sizeof(signer), "apksigner path",
+                        "%s/apk-shell/apksigner.jar", exe_dir) != 0) {
+      remove(tmp_apk);
+      return 1;
+    }
+  }
+  if (!file_exists(signer)) {
+    fprintf(stderr, "error: apksigner.jar not found next to zan "
+                    "(expected apk-shell/apksigner.jar; reinstall zan)\n");
+    remove(tmp_apk);
+    return 1;
+  }
+
+  char java[1200];
+  if (ensure_java(java, sizeof(java)) != 0) {
+    remove(tmp_apk);
+    return 1;
+  }
+
+  char ks[1200];
+  if (ensure_keystore(ks, sizeof(ks)) != 0) {
+    fprintf(stderr, "error: cannot place the debug keystore\n");
+    remove(tmp_apk);
+    return 1;
+  }
+  if (!file_exists(ks)) {
+    char keytool[1200], cmd[3000];
+    {
+      char *s = strrchr(java, '/');
+      char *s2 = strrchr(java, '\\');
+      char *cut = (s2 > s) ? s2 : s;
+      if (cut) {
+        size_t keep = (size_t)(cut - java);
+        if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path", "%.*s",
+                            (int)keep, java) != 0) {
+          remove(tmp_apk);
+          return 1;
+        }
+      } else if (zan_fmt_checked(keytool, sizeof(keytool), "keytool path", "%s",
+                                 java) != 0) {
+        remove(tmp_apk);
+        return 1;
+      }
+    }
+#ifdef _WIN32
+    if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
+                        "\"\"%s\\keytool.exe\" -genkeypair -keystore \"%s\""
+                        " -storepass android -keypass android -alias zan"
+                        " -dname CN=Zan_Debug -keyalg RSA -keysize 2048"
+                        " -validity 10000 -storetype PKCS12\"",
+                        keytool, ks) != 0) {
+      remove(tmp_apk);
+      return 1;
+    }
+#else
+    if (zan_fmt_checked(cmd, sizeof(cmd), "keystore generation command",
+                        "\"%s/keytool\" -genkeypair -keystore \"%s\""
+                        " -storepass android -keypass android -alias zan"
+                        " -dname \"CN=Zan Debug\" -keyalg RSA -keysize 2048"
+                        " -validity 10000 -storetype PKCS12 >/dev/null 2>&1",
+                        keytool, ks) != 0) {
+      remove(tmp_apk);
+      return 1;
+    }
+#endif
+    if (run_quiet(cmd) != 0 || !file_exists(ks)) {
+      fprintf(stderr, "error: could not generate the debug keystore "
+                      "(keytool missing from the Java runtime?)\n");
+      remove(tmp_apk);
+      return 1;
+    }
+    printf("  generated debug keystore ? %s\n", ks);
+  }
+
+  const char *ks_pass = getenv("ZAN_ANDROID_KEYSTORE_PASS");
+  if (!ks_pass || !ks_pass[0])
+    ks_pass = "android";
+  const char *ks_alias = getenv("ZAN_ANDROID_KEY_ALIAS");
+  char alias_opt[300] = "";
+  if (ks_alias && ks_alias[0]) {
+    snprintf(alias_opt, sizeof(alias_opt), " --ks-key-alias \"%s\"", ks_alias);
+  }
+
+  char scmd[4000];
+#ifdef _WIN32
+  if (zan_fmt_checked(
+          scmd, sizeof(scmd), "apksigner command",
+          "\"\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
+          " --out \"%s\" \"%s\"\"",
+          java, signer, ks, ks_pass, alias_opt, apk_path, tmp_apk) != 0) {
+    remove(tmp_apk);
+    return 1;
+  }
+#else
+  if (zan_fmt_checked(scmd, sizeof(scmd), "apksigner command",
+                      "\"%s\" -jar \"%s\" sign --ks \"%s\" --ks-pass pass:%s%s"
+                      " --out \"%s\" \"%s\" >/dev/null 2>&1",
+                      java, signer, ks, ks_pass, alias_opt, apk_path,
+                      tmp_apk) != 0) {
+    remove(tmp_apk);
+    return 1;
+  }
+#endif
+  if (run_quiet(scmd) != 0) {
+    fprintf(stderr,
+            "error: APK signing failed (apksigner). Run with the"
+            " same command manually for details:\n  java -jar %s sign "
+            "--ks %s --out %s %s\n",
+            signer, ks, apk_path, tmp_apk);
+    char keep[1400];
+    if (zan_fmt_checked(keep, sizeof(keep), "unsigned APK path", "%s.unsigned",
+                        apk_path) != 0) {
+      remove(tmp_apk);
+      return 1;
+    }
+    if (rename(tmp_apk, keep) != 0)
+      remove(tmp_apk);
+    return 1;
+  }
+  remove(tmp_apk);
+  return 0;
 }

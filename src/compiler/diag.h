@@ -5,9 +5,9 @@
 #include "zan.h"
 
 typedef enum {
-    DIAG_ERROR,
-    DIAG_WARNING,
-    DIAG_NOTE,
+  DIAG_ERROR,
+  DIAG_WARNING,
+  DIAG_NOTE,
 } zan_diag_level_t;
 
 /* 单行最大打印错误数，超过则折叠以抑制级联报错噪音 */
@@ -17,18 +17,18 @@ typedef enum {
 #define ZAN_DIAG_MAX_SOURCE_ECHO 200
 
 typedef struct {
-    zan_diag_level_t level;
-    zan_loc_t        loc;
-    int              code;   /* 诊断编号（A382 编号规范），0 = 未编号 */
-    char             message[1024];
+  zan_diag_level_t level;
+  zan_loc_t loc;
+  int code; /* 诊断编号（A382 编号规范），0 = 未编号 */
+  char message[1024];
 } zan_diag_entry_t;
 
 /* #pragma warning disable/restore 记下的生效区间（A382③） */
 typedef struct {
-    int      code;       /* 0 = 通配所有告警 */
-    uint32_t file_id;
-    uint32_t from_line;  /* 指令所在行起（含） */
-    uint32_t to_line;    /* restore 行止（不含），UINT32_MAX = 开放到文件尾 */
+  int code; /* 0 = 通配所有告警 */
+  uint32_t file_id;
+  uint32_t from_line; /* 指令所在行起（含） */
+  uint32_t to_line;   /* restore 行止（不含），UINT32_MAX = 开放到文件尾 */
 } zan_diag_pragma_range_t;
 
 /* 去重签名（B-ID106）：同 file/line/col/level/消息 的诊断只报一次——
@@ -36,61 +36,62 @@ typedef struct {
  * 比截断后的 msgbuf——超长诊断截到同一 1024 字节前缀但尾部不同时，
  * 截断串比对会误吞两条不同的错误），zan_diag_free_buffers 释放 */
 typedef struct {
-    uint32_t file_id;
-    uint32_t line;
-    uint32_t col;
-    int      level;
-    char    *msg;
+  uint32_t file_id;
+  uint32_t line;
+  uint32_t col;
+  int level;
+  char *msg;
 } zan_diag_dedup_sig_t;
 
 struct zan_diag {
-    int64_t only_file_id;  /* -1 includes all sources. */
-    int error_count;
-    int warning_count;
-    int max_errors;
-    /* 达到 max_errors 错误上限后丢弃的错误数 */
-    int  suppressed_errors;
-    bool limit_notice_shown;
-    bool jsonl;
-    const char *const *file_names;  /* indexed by file_id */
-    const char *const *file_sources; /* indexed by file_id */
-    int file_count;
+  int64_t only_file_id; /* -1 includes all sources. */
+  int error_count;
+  int warning_count;
+  int max_errors;
+  /* 达到 max_errors 错误上限后丢弃的错误数 */
+  int suppressed_errors;
+  bool limit_notice_shown;
+  bool jsonl;
+  const char *const *file_names;   /* indexed by file_id */
+  const char *const *file_sources; /* indexed by file_id */
+  int file_count;
 
-    /* 结构化诊断捕获（供 LSP 服务等工具消费） */
-    bool              capture;
-    bool              treat_warnings_as_errors;
-    /* A382②：--warn-level（0=none 1=default 2=error）与 --suppress 的过滤状态 */
-    int  warn_level;
-    int *suppress_codes;
-    int  suppress_count;
-    int  suppress_cap;
-    /* A382③：#pragma warning disable/restore 的区间抑制（按 file+line 判定，
-     * code=0 表示通配所有告警；仅作用于 WARNING 级，错误不受区间影响） */
-    zan_diag_pragma_range_t *pragma_ranges;
-    int  pragma_count;
-    int  pragma_cap;
-    zan_diag_entry_t *entries;
-    int               entry_count;
-    int               entry_cap;
+  /* 结构化诊断捕获（供 LSP 服务等工具消费） */
+  bool capture;
+  bool treat_warnings_as_errors;
+  /* A382②：--warn-level（0=none 1=default 2=error）与 --suppress 的过滤状态 */
+  int warn_level;
+  int *suppress_codes;
+  int suppress_count;
+  int suppress_cap;
+  /* A382③：#pragma warning disable/restore 的区间抑制（按 file+line 判定，
+   * code=0 表示通配所有告警；仅作用于 WARNING 级，错误不受区间影响） */
+  zan_diag_pragma_range_t *pragma_ranges;
+  int pragma_count;
+  int pragma_cap;
+  zan_diag_entry_t *entries;
+  int entry_count;
+  int entry_cap;
 
-    /* 级联报错抑制标记 */
-    uint32_t dup_file_id;
-    uint32_t dup_line;
-    int      dup_line_errors;
-    int      dup_line_suppressed;
-    bool     dup_line_notice_shown;
+  /* 级联报错抑制标记 */
+  uint32_t dup_file_id;
+  uint32_t dup_line;
+  int dup_line_errors;
+  int dup_line_suppressed;
+  bool dup_line_notice_shown;
 
-    /* 精确重复诊断去重（B-ID106）：线性签名表，4096 条封顶（内存有界，
-     * 超顶不再登记、退化为不去重） */
-    zan_diag_dedup_sig_t *dedup_sigs;
-    int      dedup_count;
-    int      dedup_cap;
+  /* 精确重复诊断去重（B-ID106）：线性签名表，4096 条封顶（内存有界，
+   * 超顶不再登记、退化为不去重） */
+  zan_diag_dedup_sig_t *dedup_sigs;
+  int dedup_count;
+  int dedup_cap;
 };
 
 zan_diag_t *zan_diag_new(zan_arena_t *arena);
 void zan_diag_only_file(zan_diag_t *diag, uint32_t file_id);
 void zan_diag_set_deny_warnings(zan_diag_t *diag, bool enabled);
-/* A382②：告警级别开关。0=none（告警不打印不计数）1=default 2=error（升级为错） */
+/* A382②：告警级别开关。0=none（告警不打印不计数）1=default 2=error（升级为错）
+ */
 void zan_diag_set_warn_level(zan_diag_t *diag, int level);
 /* 抑制指定编号的诊断（--suppress=W0003,E0030；按编号匹配，级别字母可省略） */
 void zan_diag_suppress_code(zan_diag_t *diag, int code);
@@ -118,7 +119,7 @@ bool zan_diag_has_errors(zan_diag_t *diag);
 /* 开启或关闭结构化诊断捕获（开启后诊断不打印至 stderr 而是存入内存数组） */
 void zan_diag_set_capture(zan_diag_t *diag, bool enabled);
 
-int  zan_diag_entry_count(const zan_diag_t *diag);
+int zan_diag_entry_count(const zan_diag_t *diag);
 const zan_diag_entry_t *zan_diag_entry_at(const zan_diag_t *diag, int index);
 
 /* 释放堆分配的结构化诊断捕获缓冲区及文件记录数组 */

@@ -163,7 +163,13 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
                 } else {
                     LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, v,
                         LLVMConstNull(LLVMTypeOf(v)), "is.nonnull");
-                    if (st->kind == TYPE_STRING || tt->kind == TYPE_STRING) {
+                    if (type_mentions_canon(tt)) {
+                        if (types_equal(st, tt)) {
+                            test = nn;
+                        } else {
+                            test = emit_runtime_is_check_name(g, v, tt);
+                        }
+                    } else if (st->kind == TYPE_STRING || tt->kind == TYPE_STRING) {
                         if (st->kind == tt->kind) {
                             test = nn;
                         } else if (st->kind == TYPE_OBJECT ||
@@ -258,12 +264,16 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
          * string 用、无关类 `as 接口` 绕过实现检查——类型混淆
          * （TASKS B-ID163④）。其余一律补运行时检查，失败静默 null
          * （as 契约，C# 同语义；与强转 `(T)x` 的抛异常口径不同）。 */
-        if (tt->kind == TYPE_OBJECT)
-            return emit_expr(g, expr->type_test.expr, locals);
-        if (st->kind == TYPE_STRING && tt->kind == TYPE_STRING)
-            return emit_expr(g, expr->type_test.expr, locals);
+        if (!type_mentions_canon(tt)) {
+            if (tt->kind == TYPE_OBJECT)
+                return emit_expr(g, expr->type_test.expr, locals);
+            if (st->kind == TYPE_STRING && tt->kind == TYPE_STRING)
+                return emit_expr(g, expr->type_test.expr, locals);
+        }
         LLVMValueRef v = emit_expr(g, expr->type_test.expr, locals);
-        if (st->kind == TYPE_CLASS && type_is_or_derives(st, tt))
+        if (types_equal(st, tt) ||
+            (!type_mentions_canon(tt) && st->kind == TYPE_CLASS &&
+             type_is_or_derives(st, tt)))
             return v;
         LLVMValueRef ok = emit_runtime_is_check_name(g, v, tt);
         if (expr_yields_owned_rc_value(g, expr->type_test.expr, locals)) {
@@ -301,6 +311,11 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
     case AST_TYPEOF_EXPR: {
         /* typeof(T): 获取类型的静态反射元数据记录 */
         zan_type_t *t = resolve_type_ctx(g, expr->cast.type);
+        if (g->cur_canon_body && g->cur_gctx_val && t &&
+            type_mentions_canon(t)) {
+            return emit_gctx_load_slot(g, GCTX_SLOT_TYPEINFO, t->sym, t,
+                                       NULL, 0, 0, 0);
+        }
         char buf[256];
         int len = 0;
         if (t) {

@@ -9,84 +9,84 @@
 #include <stdint.h>
 
 typedef enum {
-    ZAN_OPT_NONE = 0,
-    ZAN_OPT_BASIC = 1,
-    ZAN_OPT_FULL = 2,
-    ZAN_OPT_SIZE = 3,
-    ZAN_OPT_AGGRESSIVE = 4,
-    ZAN_OPT_SIZE_MIN = 5
+  ZAN_OPT_NONE = 0,
+  ZAN_OPT_BASIC = 1,
+  ZAN_OPT_FULL = 2,
+  ZAN_OPT_SIZE = 3,
+  ZAN_OPT_AGGRESSIVE = 4,
+  ZAN_OPT_SIZE_MIN = 5
 } zan_opt_level_t;
 
 typedef struct {
-    int pairs_elided;
-    int moves_optimized;
-    int stack_promotions;
+  int pairs_elided;
+  int moves_optimized;
+  int stack_promotions;
 } zan_arc_opt_stats_t;
 
 zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level);
 
 typedef struct {
-    int objects_analyzed;
-    int stack_promoted;
+  int objects_analyzed;
+  int stack_promoted;
 } zan_escape_stats_t;
 
 zan_escape_stats_t zan_opt_escape(zan_irgen_t *g);
 
 typedef struct {
-    int calls_devirtualized;
-    int interfaces_resolved;
+  int calls_devirtualized;
+  int interfaces_resolved;
 } zan_devirt_stats_t;
 
 zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder);
 
 typedef struct {
-    int constants_folded;
-    int branches_eliminated;
-    int variables_propagated;
+  int constants_folded;
+  int branches_eliminated;
+  int variables_propagated;
 } zan_constfold_stats_t;
 
 zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g);
 
 typedef struct {
-    int dead_stores;
-    int dead_calls;
-    int unreachable_blocks;
+  int dead_stores;
+  int dead_calls;
+  int unreachable_blocks;
 } zan_dce_stats_t;
 
 zan_dce_stats_t zan_opt_dce(zan_irgen_t *g);
 
 typedef struct {
-    int functions_inlined;
-    int recursive_skipped;
+  int functions_inlined;
+  int recursive_skipped;
 } zan_inline_stats_t;
 
 zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level);
 
 typedef struct {
-    zan_escape_stats_t escape;
-    zan_arc_opt_stats_t arc;
-    zan_devirt_stats_t devirt;
-    zan_constfold_stats_t constfold;
-    zan_dce_stats_t dce;
-    zan_inline_stats_t inlining;
-    double time_ms;
-    bool success; /* false: stop before publishing IR or machine code */
+  zan_escape_stats_t escape;
+  zan_arc_opt_stats_t arc;
+  zan_devirt_stats_t devirt;
+  zan_constfold_stats_t constfold;
+  zan_dce_stats_t dce;
+  zan_inline_stats_t inlining;
+  double time_ms;
+  bool success; /* false: stop before publishing IR or machine code */
 } zan_opt_report_t;
 
 /* 优化器调试旋钮（二分用）。CLI -fno-opt-* 显式置 1；0 = 未显式设置，
  * 此时回退读旧的环境变量 ZAN_NO_OPT_* / ZAN_EARLY_PASSES，兼容既有
  * 脚本。行为开关必须走 CLI，环境变量只作回退。 */
 typedef struct {
-    signed char no_early;     /* -fno-opt-early */
-    signed char no_escape;    /* -fno-opt-escape */
-    signed char no_arc;       /* -fno-opt-arc */
-    signed char no_devirt;    /* -fno-opt-devirt */
-    signed char no_constfold; /* -fno-opt-constfold */
-    signed char no_dce;       /* -fno-opt-dce */
-    signed char no_inline;    /* -fno-opt-inline */
-    signed char no_shrink;    /* -fno-opt-shrink（S-UNWIND 塌缩） */
-    const char *early_passes; /* --early-passes=<llvm-pass-list> */
-    const char *pipeline;     /* --opt-pipeline=<text|none> */
+  signed char no_early;     /* -fno-opt-early */
+  signed char no_escape;    /* -fno-opt-escape */
+  signed char no_arc;       /* -fno-opt-arc */
+  signed char no_devirt;    /* -fno-opt-devirt */
+  signed char no_constfold; /* -fno-opt-constfold */
+  signed char no_dce;       /* -fno-opt-dce */
+  signed char no_inline;    /* -fno-opt-inline */
+  signed char no_shrink;    /* -fno-opt-shrink（S-UNWIND 塌缩） */
+  const char *early_passes; /* --early-passes=<llvm-pass-list> */
+  const char *pipeline;     /* --opt-pipeline=<text|none> */
 } zan_opt_knobs_t;
 
 /* 单旋钮判定：显式 > 环境变量回退。env 仅在旋钮未显式设置时读取。 */
@@ -96,9 +96,11 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder,
                               zan_opt_level_t level,
                               const zan_opt_knobs_t *knobs);
 void zan_opt_report_print(const zan_opt_report_t *report);
-zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level,
+zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g,
+                                           zan_opt_level_t level,
                                            const zan_opt_knobs_t *knobs);
-zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm,
+zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod,
+                                          LLVMTargetMachineRef tm,
                                           zan_opt_level_t level,
                                           const zan_opt_knobs_t *knobs);
 

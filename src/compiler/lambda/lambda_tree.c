@@ -381,8 +381,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     int capc = cs.count;
     int has_this = cs.needs_this ? 1 : 0;
+    int has_gctx = (g->cur_canon_body && g->cur_gctx_val != NULL) ? 1 : 0;
     /* wasm32 平台下 Lambda 统一按带环境闭包形式发射 */
-    bool is_closure = (capc + has_this) > 0 || target_is_wasm32(g);
+    bool is_closure = (capc + has_this + has_gctx) > 0 || target_is_wasm32(g);
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef *all_params = (LLVMTypeRef *)calloc((size_t)pc + 2, sizeof(LLVMTypeRef));
@@ -400,11 +401,12 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     /* 全程序静态编译：Lambda 设为 internal 链接属性 */
     zan_set_module_local(lambda_fn);
 
-    /* 闭包记录内存布局：{ 函数指针, 析构指针, 目标指针, 捕获槽..., [this] } */
+    /* 闭包记录内存布局：{ 函数指针, 析构指针, 目标指针, 捕获槽..., [this], [__gctx] } */
     LLVMTypeRef rec_ty = NULL;
     if (is_closure) {
         LLVMTypeRef *fields = (LLVMTypeRef *)calloc(
-            (size_t)(ZAN_CLOSURE_HDR_FIELDS + capc + 1), sizeof(LLVMTypeRef));
+            (size_t)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this + has_gctx + 1),
+            sizeof(LLVMTypeRef));
         if (!fields) {
             cap_scan_free(&cs);
             return LLVMConstNull(i8ptr);
@@ -413,11 +415,13 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         for (int i = 0; i < capc; i++)
             fields[ZAN_CLOSURE_HDR_FIELDS + i] = cs.caps[i].llvm;
         if (has_this) fields[ZAN_CLOSURE_HDR_FIELDS + capc] = i8ptr;
+        if (has_gctx) fields[ZAN_CLOSURE_HDR_FIELDS + capc + has_this] = i8ptr;
         char rname[80];
         snprintf(rname, sizeof(rname), "%s$clo", lname);
         rec_ty = LLVMStructCreateNamed(g->ctx, rname);
         LLVMStructSetBody(rec_ty, fields,
-                          (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this), 0);
+                          (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this + has_gctx),
+                          0);
         free(fields);
     }
 
@@ -450,6 +454,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     zan_type_t *saved_recv_type = g->cur_recv_type;
     zan_ast_list_t *saved_mtps = g->cur_mtps;
     zan_type_t **saved_mbind = g->cur_mbind;
+    bool saved_canon_body = g->cur_canon_body;
+    LLVMValueRef saved_gctx_val = g->cur_gctx_val;
+    int saved_gctx_owner_idx = g->cur_gctx_owner_idx;
     int saved_arc_depth = g->arc_stmt_depth;
     g->current_fn_is_main = false;
     g->current_fn_is_ctor = false;
@@ -587,6 +594,11 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMBuildStore(g->builder, v, alloc);
             g->current_this = alloc;
         }
+        if (has_gctx) {
+            LLVMValueRef gp = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this), "cap.gctxp");
+            g->cur_gctx_val = LLVMBuildLoad2(g->builder, i8ptr, gp, "cap.gctx");
+        }
     }
     for (int k = 0; k < pc; k++) {
         zan_ast_node_t *param = expr->lambda.params.items[k];
@@ -667,6 +679,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     g->cur_recv_type = saved_recv_type;
     g->cur_mtps = saved_mtps;
     g->cur_mbind = saved_mbind;
+    g->cur_canon_body = saved_canon_body;
+    g->cur_gctx_val = saved_gctx_val;
+    g->cur_gctx_owner_idx = saved_gctx_owner_idx;
     g->arc_stmt_depth = saved_arc_depth;
     g->current_fn_ret_type = saved_fn_ret;
     g->current_fn_zan_ret_type = saved_fn_zan_ret;
@@ -723,9 +738,9 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         ? LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(saved_this),
                          saved_this, "cap.self")
         : NULL;
-    LLVMValueRef clo = emit_closure_record(g, expr->loc, lname, rec_ty,
-                                           lambda_fn, NULL, cs.caps, capc,
-                                           has_this, self, true);
+    LLVMValueRef clo = emit_closure_record_gctx(
+        g, expr->loc, lname, rec_ty, lambda_fn, NULL, cs.caps, capc,
+        has_this, self, true, has_gctx ? saved_gctx_val : NULL);
     cap_scan_free(&cs);
     return clo;
 }

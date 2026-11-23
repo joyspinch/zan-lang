@@ -35,17 +35,41 @@
                         int arc_own = (type && is_rc_managed_type(type) &&
                                        LLVMGetTypeKind(g->current_async_slots[i].llvm) == LLVMPointerTypeKind);
                         if (stmt->var_decl.initializer) {
-                            LLVMValueRef iv = (type->kind == TYPE_DELEGATE &&
-                                stmt->var_decl.initializer->kind == AST_LAMBDA)
-                                ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
-                                : emit_expr(g, stmt->var_decl.initializer, locals);
+                            LLVMValueRef iv = NULL;
+                            int iv_owned = 0;
+                            if (type && type_is_binding(type) &&
+                                !type_is_binding(infer_expr_type(g, stmt->var_decl.initializer, locals))) {
+                                iv = emit_binding_value(g, type,
+                                    stmt->var_decl.initializer, locals);
+                                if (iv) iv_owned = 1;
+                            }
+                            if (!iv)
+                                iv = (type->kind == TYPE_DELEGATE &&
+                                    stmt->var_decl.initializer->kind == AST_LAMBDA)
+                                    ? emit_lambda_typed(g, stmt->var_decl.initializer, type, locals)
+                                    : emit_expr(g, stmt->var_decl.initializer, locals);
+                            bool conv_owned = false;
+                            if (type && !iv_owned) {
+                                zan_type_t *ity = infer_expr_type(g, stmt->var_decl.initializer, locals);
+                                if (ity) {
+                                    conv_owned =
+                                        (find_user_conversion(g, ity, type, "op_implicit") != NULL) &&
+                                        is_rc_managed_type(type);
+                                    iv = emit_user_conversion(g, ity, type, "op_implicit",
+                                        iv, stmt->var_decl.initializer, locals);
+                                }
+                            }
+                            iv = emit_implicit_box(g, type, iv, stmt->var_decl.initializer, locals);
+                            zan_ast_node_t *rhs_node = (iv_owned || conv_owned)
+                                ? owned_rhs_marker(g, stmt->var_decl.initializer->loc)
+                                : stmt->var_decl.initializer;
                             LLVMTypeRef slot_ty = g->current_async_slots[i].llvm;
                             if (arc_own) {
                                 emit_rc_capture_local(g, type, pre->alloca, iv,
-                                    stmt->var_decl.initializer, locals);
+                                    rhs_node, locals);
                             } else if (pre->struct_rc) {
                                 emit_struct_local_capture(g, type, pre->alloca, iv,
-                                    stmt->var_decl.initializer, locals);
+                                    rhs_node, locals);
                             } else {
                                 iv = coerce_int_to(g, iv, slot_ty);
                                 if (LLVMGetTypeKind(slot_ty) == LLVMPointerTypeKind &&

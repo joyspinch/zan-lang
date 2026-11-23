@@ -106,32 +106,39 @@ binding_lowered:
                     local_slot_type(g, local));
                 zan_store_fit(g, sv, local->alloca);
             } else if (g->current_type_sym &&
-                       get_static_field_global(g, g->current_type_sym,
-                           get_field_sym(g->current_type_sym,
-                               expr->binary.left->ident.name), NULL)) {
+                       get_field_sym(g->current_type_sym,
+                           expr->binary.left->ident.name) &&
+                       field_member_is_static(get_field_sym(
+                           g->current_type_sym,
+                           expr->binary.left->ident.name))) {
                 /* 封闭类静态字段裸名访问降级为全局槽位寻址 */
                 zan_symbol_t *fs = get_field_sym(g->current_type_sym,
                     expr->binary.left->ident.name);
+                zan_type_t *sinst = (g->cur_inst &&
+                    g->cur_inst->sym == g->current_type_sym)
+                    ? g->cur_inst : g->current_type_sym->type;
                 /* 裸名静态属性写入：派发至 static set_Prop(value) */
                 zan_symbol_t *setter = property_setter_sym(g, fs);
                 if (setter) {
-                    emit_property_setter_call(g, setter, g->current_type_sym->type,
+                    emit_property_setter_call(g, setter, sinst,
                         NULL, right, expr->binary.left,
                         expr->binary.right, locals);
                 } else {
                 LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
-                if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
-                    emit_rc_store_member(g, fs, fs->type, gv, right, expr->binary.right, locals);
-                } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
-                           type_contains_collection_rc(g, fs->type, 0)) {
-                    emit_struct_field_capture(g, fs->type, gv, right,
+                zan_type_t *fst = field_store_type(g, fs, g->cur_inst);
+                zan_type_t *rft = fst ? fst : fs->type;
+                if (rft && (is_rc_managed_type(rft) || rft->kind == TYPE_OBJECT)) {
+                    emit_rc_store_member(g, fs, rft, gv, right, expr->binary.right, locals);
+                } else if (rft && rft->kind == TYPE_STRUCT &&
+                           type_contains_collection_rc(g, rft, 0)) {
+                    emit_struct_field_capture(g, rft, gv, right,
                                               expr->binary.right, locals);
-                } else if (fs->type && fs->type->kind == TYPE_STRUCT) {
+                } else if (rft && rft->kind == TYPE_STRUCT) {
                     /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
-                    zan_store_fit(g, coerce_struct_value(g, right, fs->type), gv);
+                    zan_store_fit(g, coerce_struct_value(g, right, rft), gv);
                 } else {
-                    LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
-                                              : LLVMInt64TypeInContext(g->ctx);
+                    LLVMTypeRef ft = rft ? map_type(g, rft)
+                                         : LLVMInt64TypeInContext(g->ctx);
                     zan_store_fit(g, coerce_int_to(g, right, ft), gv);
                 }
                 }
@@ -250,9 +257,12 @@ binding_lowered:
                                 LLVMTypeRef mft = g->functions[fi].fn_type;
                                 LLVMValueRef mfn = route_generic_method(g, oist,
                                     op_sym, g->functions[fi].fn, mft, &mft);
+                                LLVMValueRef gctx_arg =
+                                    route_generic_method_gctx(g, oist, op_sym);
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "ops";
-                                LLVMValueRef result = emit_dispatch_call(g,
-                                    oist->sym, op_sym, mfn, mft, call_args, 3, cn);
+                                LLVMValueRef result = emit_dispatch_call_gctx(g,
+                                    oist->sym, op_sym, mfn, mft, call_args, 3,
+                                    gctx_arg, cn);
                                 result = coerce_generic_result(g, result, op_sym, oist);
                                 if (recv_eh_pushed) emit_eh_tmp_pop(g);
                                 emit_release_owned_call_temp(g, arr_expr, recv_val, locals);
@@ -851,28 +861,31 @@ binding_lowered:
                 zan_symbol_t *cs = receiver_type_symbol(g, obj_expr, locals);
                 if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                     zan_symbol_t *fs = get_field_sym(cs, expr->binary.left->member.name);
+                    zan_type_t *sinst = static_access_inst(g, obj_expr);
                     zan_symbol_t *setter = property_setter_sym(g, fs);
                     if (setter) {
-                        emit_property_setter_call(g, setter, cs->type, NULL,
+                        emit_property_setter_call(g, setter,
+                            sinst ? sinst : cs->type, NULL,
                             right, obj_expr, expr->binary.right, locals);
                         stored = true;
                     } else {
-                    LLVMValueRef gv = get_static_field_global(g, cs, fs,
-                        static_access_inst(g, obj_expr));
+                    LLVMValueRef gv = get_static_field_global(g, cs, fs, sinst);
                     if (gv) {
-                        if (fs->type && (is_rc_managed_type(fs->type) || fs->type->kind == TYPE_OBJECT)) {
-                            emit_rc_store_member(g, fs, fs->type, gv, right,
+                        zan_type_t *fst = field_store_type(g, fs, sinst);
+                        zan_type_t *rft = fst ? fst : fs->type;
+                        if (rft && (is_rc_managed_type(rft) || rft->kind == TYPE_OBJECT)) {
+                            emit_rc_store_member(g, fs, rft, gv, right,
                                                 expr->binary.right, locals);
-                        } else if (fs->type && fs->type->kind == TYPE_STRUCT &&
-                                   type_contains_collection_rc(g, fs->type, 0)) {
-                            emit_struct_field_capture(g, fs->type, gv, right,
+                        } else if (rft && rft->kind == TYPE_STRUCT &&
+                                   type_contains_collection_rc(g, rft, 0)) {
+                            emit_struct_field_capture(g, rft, gv, right,
                                                       expr->binary.right, locals);
-                        } else if (fs->type && fs->type->kind == TYPE_STRUCT) {
+                        } else if (rft && rft->kind == TYPE_STRUCT) {
                             /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
-                            zan_store_fit(g, coerce_struct_value(g, right, fs->type), gv);
+                            zan_store_fit(g, coerce_struct_value(g, right, rft), gv);
                         } else {
-                            LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
-                                                      : LLVMInt64TypeInContext(g->ctx);
+                            LLVMTypeRef ft = rft ? map_type(g, rft)
+                                                 : LLVMInt64TypeInContext(g->ctx);
                             zan_store_fit(g, coerce_int_to(g, right, ft), gv);
                         }
                         stored = true;

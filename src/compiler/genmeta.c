@@ -16,20 +16,20 @@
 #include "../common/host_oom.h"
 
 typedef struct {
-    json_value *calls;
-    int call_id;
-    char cur_cls[128];
-    char cur_fn[128];
-    zan_ast_node_t **rec_nodes;
-    int *rec_ids;
-    int rec_count;
-    int rec_cap;
-    zan_ast_node_t **pend_nodes;
-    int *pend_ids;
-    int pend_count;
-    int pend_cap;
-    const char *const *expr_names;
-    int expr_count;
+  json_value *calls;
+  int call_id;
+  char cur_cls[128];
+  char cur_fn[128];
+  zan_ast_node_t **rec_nodes;
+  int *rec_ids;
+  int rec_count;
+  int rec_cap;
+  zan_ast_node_t **pend_nodes;
+  int *pend_ids;
+  int pend_count;
+  int pend_cap;
+  const char *const *expr_names;
+  int expr_count;
 } gm_ctx_t;
 
 /* Composite Dispatcher Submodules */

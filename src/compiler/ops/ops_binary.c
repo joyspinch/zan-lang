@@ -124,6 +124,8 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                 LLVMTypeRef mft = g->functions[fi].fn_type;
                                 LLVMValueRef mfn = route_generic_method(g, ltype,
                                     op_sym, g->functions[fi].fn, mft, &mft);
+                                LLVMValueRef gctx_arg =
+                                    route_generic_method_gctx(g, ltype, op_sym);
                                 zan_type_t *p1 = method_param_type_at(g, op_sym, 1,
                                     expr, expr->binary.left, locals);
                                 bool op_generic = p1 && type_mentions_tp(p1);
@@ -139,8 +141,8 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                         cargs[1] = coerce_int_to(g, cargs[1], p1t);
                                 }
                                 const char *cn = (LLVMGetTypeKind(LLVMGetReturnType(mft)) == LLVMVoidTypeKind) ? "" : "opcall";
-                                LLVMValueRef opres = zan_call2(g->builder,
-                                    mft, mfn, cargs, 2, cn);
+                                LLVMValueRef opres = zan_call_with_gctx(g,
+                                    mft, mfn, cargs, 2, gctx_arg, cn);
                                 /* 原地委托组合赋值 (E += obj.OnX)：包装为委托实例后执行组合操作 */
                                 /* 运算符重载实参入栈发射 */
                                 if (expr_yields_delegate_value(g, expr->binary.right, locals))

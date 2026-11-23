@@ -18,65 +18,70 @@
 #include <llvm-c/Comdat.h>
 
 typedef struct {
-    LLVMValueRef slot_alloca;
-    LLVMTypeRef  llvm;
-    int          frame_index;
-    LLVMValueRef box_payload;
-    LLVMValueRef box_cell;
+  LLVMValueRef slot_alloca;
+  LLVMTypeRef llvm;
+  int frame_index;
+  LLVMValueRef box_payload;
+  LLVMValueRef box_cell;
 } zan_async_slot_t;
 
 struct local_var;
 struct zan_fn_cleanup_state;
 typedef struct {
-    LLVMBasicBlockRef lpad_bb;
-    LLVMBasicBlockRef catch_bb;
-    LLVMValueRef fn;
-    int throw_locals_base;
-    int fin_idx;
-    int finally_depth; /* Finally/lock entries retained by this landing. */
-    struct local_var *cleanups;
-    int cleanup_count;
-    int cleanup_cap;
-    /* Only synchronous function roots cache lexical cleanup landing variants. */
-    struct zan_fn_cleanup_state *fn_cleanup;
+  LLVMBasicBlockRef lpad_bb;
+  LLVMBasicBlockRef catch_bb;
+  LLVMValueRef fn;
+  int throw_locals_base;
+  int fin_idx;
+  int finally_depth; /* Finally/lock entries retained by this landing. */
+  struct local_var *cleanups;
+  int cleanup_count;
+  int cleanup_cap;
+  /* Only synchronous function roots cache lexical cleanup landing variants. */
+  struct zan_fn_cleanup_state *fn_cleanup;
 } zan_lpad_entry_t;
 
 /* 编译器生成的保护文本驻留表项 */
 typedef struct zan_str_intern {
-    char *text;
-    LLVMValueRef gv;
-    struct zan_str_intern *next;
+  char *text;
+  LLVMValueRef gv;
+  struct zan_str_intern *next;
 } zan_str_intern_t;
 
 /* 代码生成器动态堆表扩容辅助原语 */
 static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
                                 int initial) {
-    int ncap = *cap ? *cap * 2 : initial;
-    void *n = realloc(*items, (size_t)ncap * elem);
-    if (!n) return false;
-    *items = n;
-    *cap = ncap;
-    return true;
+  int ncap = *cap ? *cap * 2 : initial;
+  void *n = realloc(*items, (size_t)ncap * elem);
+  if (!n)
+    return false;
+  *items = n;
+  *cap = ncap;
+  return true;
 }
 
 /* 确保表容量覆盖指定索引，新扩展槽位清零 */
 static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
-                                  int index, int initial) {
-    if (index < 0) return false;
-    if (index < *cap) return true;
-    int ncap = *cap ? *cap : initial;
-    while (ncap <= index) ncap *= 2;
-    void *n = realloc(*items, (size_t)ncap * elem);
-    if (!n) return false;
-    memset((char *)n + (size_t)*cap * elem, 0,
-           (size_t)(ncap - *cap) * elem);
-    *items = n;
-    *cap = ncap;
+                                   int index, int initial) {
+  if (index < 0)
+    return false;
+  if (index < *cap)
     return true;
+  int ncap = *cap ? *cap : initial;
+  while (ncap <= index)
+    ncap *= 2;
+  void *n = realloc(*items, (size_t)ncap * elem);
+  if (!n)
+    return false;
+  memset((char *)n + (size_t)*cap * elem, 0, (size_t)(ncap - *cap) * elem);
+  *items = n;
+  *cap = ncap;
+  return true;
 }
 
-#define ZAN_TAB_ENSURE(tab, cnt, cap, initial) \
-    ((cnt) < (cap) || zan_tab_grow((void **)&(tab), &(cap), sizeof(*(tab)), (initial)))
+#define ZAN_TAB_ENSURE(tab, cnt, cap, initial)                                 \
+  ((cnt) < (cap) ||                                                            \
+   zan_tab_grow((void **)&(tab), &(cap), sizeof(*(tab)), (initial)))
 
 /* 表达式推导递归深度上限（防止类型循环推导死循环） */
 #define ZAN_MAX_INFER_DEPTH 16384
@@ -86,785 +91,896 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 
 /* Optional member descriptions are independent of lookup and invocation. */
 enum {
-    ZAN_REFL_QUERY_METHOD_RETURN = 1u << 0,
-    ZAN_REFL_QUERY_METHOD_PARAMS = 1u << 1,
-    ZAN_REFL_QUERY_METHOD_ATTRS = 1u << 2,
-    ZAN_REFL_QUERY_CTORS = 1u << 3,
-    ZAN_REFL_QUERY_CTOR_PARAMS = 1u << 4,
-    ZAN_REFL_QUERY_FIELD_TYPE = 1u << 5,
-    ZAN_REFL_QUERY_FIELD_DECLATTRS = 1u << 6,
-    ZAN_REFL_QUERY_FIELD_TYPEINFO = 1u << 8,
-    ZAN_REFL_QUERY_FIELD_ATTRS = 1u << 9,
-    ZAN_REFL_QUERY_METHOD_DECLATTRS = 1u << 10
+  ZAN_REFL_QUERY_METHOD_RETURN = 1u << 0,
+  ZAN_REFL_QUERY_METHOD_PARAMS = 1u << 1,
+  ZAN_REFL_QUERY_METHOD_ATTRS = 1u << 2,
+  ZAN_REFL_QUERY_CTORS = 1u << 3,
+  ZAN_REFL_QUERY_CTOR_PARAMS = 1u << 4,
+  ZAN_REFL_QUERY_FIELD_TYPE = 1u << 5,
+  ZAN_REFL_QUERY_FIELD_DECLATTRS = 1u << 6,
+  ZAN_REFL_QUERY_FIELD_TYPEINFO = 1u << 8,
+  ZAN_REFL_QUERY_FIELD_ATTRS = 1u << 9,
+  ZAN_REFL_QUERY_METHOD_DECLATTRS = 1u << 10
 };
 
 typedef struct zan_irgen_pending_scope {
-    struct zan_irgen_pending_scope *parent;
-    int handler_id;
-    zan_ast_node_t *body;
+  struct zan_irgen_pending_scope *parent;
+  int handler_id;
+  zan_ast_node_t *body;
 } zan_irgen_pending_scope_t;
 
 typedef struct zan_irgen_pending_context {
-    zan_irgen_pending_scope_t *scope;
-    zan_irgen_pending_scope_t *break_scope;
-    zan_irgen_pending_scope_t *continue_scope;
-    int rethrow_base, rethrow_catch;
+  zan_irgen_pending_scope_t *scope;
+  zan_irgen_pending_scope_t *break_scope;
+  zan_irgen_pending_scope_t *continue_scope;
+  int rethrow_base, rethrow_catch;
 } zan_irgen_pending_context_t;
 
 typedef struct zan_goto_label_rec {
-    zan_istr_t        name;
-    LLVMValueRef      fn;
-    LLVMBasicBlockRef bb;
-    int               defined;
-    int               fin_depth;
-    int               eh_armed_base;
-    int               catch_base;
-    int               locals_base;
-    int               locals_owned;
-    zan_irgen_pending_scope_t *pending_scope;
-    zan_irgen_pending_scope_t *label_owner;
+  zan_istr_t name;
+  LLVMValueRef fn;
+  LLVMBasicBlockRef bb;
+  int defined;
+  int fin_depth;
+  int eh_armed_base;
+  int catch_base;
+  int locals_base;
+  int locals_owned;
+  zan_irgen_pending_scope_t *pending_scope;
+  zan_irgen_pending_scope_t *label_owner;
 } zan_goto_label_rec_t;
 
 /* catch 块异常清理上下文项：记录异常变量局部索引以供作用域展开 */
 typedef struct zan_irgen_catch_cleanup {
-    LLVMValueRef exc_slot;
-    LLVMValueRef owned_slot;
-    LLVMValueRef tid_slot;   /* 当前捕获异常类型描述符，供无参 throw; 原样重抛 */
+  LLVMValueRef exc_slot;
+  LLVMValueRef owned_slot;
+  LLVMValueRef tid_slot; /* 当前捕获异常类型描述符，供无参 throw; 原样重抛 */
 } zan_irgen_catch_cleanup_t;
 
 typedef struct zan_finally_lexical_context {
-    LLVMBasicBlockRef break_target, continue_target;
-    zan_irgen_pending_scope_t *break_scope, *continue_scope;
-    int locals_count;
-    int rethrow_catch;
-    int break_locals_base, loop_locals_base, loop_catch_base;
-    int finally_loop_base, eh_armed_loop_base;
-    int checked_depth;
+  LLVMBasicBlockRef break_target, continue_target;
+  zan_irgen_pending_scope_t *break_scope, *continue_scope;
+  int locals_count;
+  int rethrow_catch;
+  int break_locals_base, loop_locals_base, loop_catch_base;
+  int finally_loop_base, eh_armed_loop_base;
+  int checked_depth;
 } zan_finally_lexical_context_t;
 
 typedef struct zan_irgen_finally_entry {
-    zan_ast_node_t *body;
-    zan_finally_lexical_context_t lexical;
-    LLVMValueRef monitor_obj; /* lock (obj) 锁对象槽位，退出时释放监视器 */
-    LLVMValueRef continuation_slot;
-    struct zan_irgen_finally_shared *shared;
-    int outer_armed_depth;
-    int outer_throw_locals_base;
-    int outer_throw_catch_base;
-    zan_irgen_pending_scope_t *pending_parent;
-    zan_irgen_pending_scope_t *pending_scope;
-    bool in_try_body;       /* 正在发射 try 保护块体 */
+  zan_ast_node_t *body;
+  zan_finally_lexical_context_t lexical;
+  LLVMValueRef monitor_obj; /* lock (obj) 锁对象槽位，退出时释放监视器 */
+  LLVMValueRef continuation_slot;
+  struct zan_irgen_finally_shared *shared;
+  int outer_armed_depth;
+  int outer_throw_locals_base;
+  int outer_throw_catch_base;
+  zan_irgen_pending_scope_t *pending_parent;
+  zan_irgen_pending_scope_t *pending_scope;
+  bool in_try_body; /* 正在发射 try 保护块体 */
 } zan_irgen_finally_entry_t;
 
 typedef struct zan_goto_fixup {
-    zan_istr_t   name;
-    LLVMValueRef fn;
-    zan_loc_t    loc;
-    int          fin_depth;
-    int          eh_armed_base;
-    int          catch_base;
-    int          locals_base;
-    int          locals_owned;
-    struct local_var *locals_snap;
-    int          resolved;
-    LLVMBasicBlockRef from_bb;
-    int finally_snap_n;
-    struct zan_irgen_finally_entry *finally_snap;
-    int catch_snap_n;
-    struct zan_irgen_catch_cleanup *catch_snap;
-    LLVMValueRef *armed_snap;
-    zan_lpad_entry_t *lpad_snap;
-    int lpad_depth;
-    zan_irgen_pending_scope_t *label_owner;
-    zan_irgen_pending_context_t pending;
-    LLVMBasicBlockRef break_target, continue_target;
-    int throw_locals_base, throw_catch_base;
-    int loop_locals_base, loop_catch_base;
-    int break_locals_base;
-    int finally_loop_base, eh_armed_loop_base;
-    int checked_depth;
+  zan_istr_t name;
+  LLVMValueRef fn;
+  zan_loc_t loc;
+  int fin_depth;
+  int eh_armed_base;
+  int catch_base;
+  int locals_base;
+  int locals_owned;
+  struct local_var *locals_snap;
+  int resolved;
+  LLVMBasicBlockRef from_bb;
+  int finally_snap_n;
+  struct zan_irgen_finally_entry *finally_snap;
+  int catch_snap_n;
+  struct zan_irgen_catch_cleanup *catch_snap;
+  LLVMValueRef *armed_snap;
+  zan_lpad_entry_t *lpad_snap;
+  int lpad_depth;
+  zan_irgen_pending_scope_t *label_owner;
+  zan_irgen_pending_context_t pending;
+  LLVMBasicBlockRef break_target, continue_target;
+  int throw_locals_base, throw_catch_base;
+  int loop_locals_base, loop_catch_base;
+  int break_locals_base;
+  int finally_loop_base, eh_armed_loop_base;
+  int checked_depth;
 } zan_goto_fixup_t;
 
 struct zan_irgen {
-    zan_arena_t *arena;
-    zan_diag_t *diag;
-    zan_binder_t *binder;
+  zan_arena_t *arena;
+  zan_diag_t *diag;
+  zan_binder_t *binder;
 
-    LLVMContextRef ctx;
-    LLVMModuleRef mod;
-    LLVMBuilderRef builder;
+  LLVMContextRef ctx;
+  LLVMModuleRef mod;
+  LLVMBuilderRef builder;
 
-    LLVMValueRef current_fn;
-    LLVMTypeRef current_fn_ret_type;
-    zan_type_t *current_fn_zan_ret_type;
+  LLVMValueRef current_fn;
+  LLVMTypeRef current_fn_ret_type;
+  zan_type_t *current_fn_zan_ret_type;
 
-    int qdot_counter;
+  int qdot_counter;
 
-    LLVMValueRef current_this;
-    zan_symbol_t *current_type_sym;
-    zan_ast_node_t *current_fn_body;
-    bool current_fn_is_ctor;
-    bool current_fn_is_main;         /* 程序主入口函数：退出前释放静态对象 */
-    bool current_fn_no_runtime;
-    /* 处于 Lambda 函数体内部：此时 current_this 为 NULL */
-    int lambda_depth;
-    /* 当前 lambda 处在 async 方法里：lambda 不是协程，它里面的 await 没有
-     * 自己的帧可挂（挂到外层协程的块上 = 跨函数的 br，LLVM 校验直接失败）。 */
-    bool lambda_in_async_method;
+  LLVMValueRef current_this;
+  zan_symbol_t *current_type_sym;
+  zan_ast_node_t *current_fn_body;
+  bool current_fn_is_ctor;
+  bool current_fn_is_main; /* 程序主入口函数：退出前释放静态对象 */
+  bool current_fn_no_runtime;
+  /* 处于 Lambda 函数体内部：此时 current_this 为 NULL */
+  int lambda_depth;
+  /* 当前 lambda 处在 async 方法里：lambda 不是协程，它里面的 await 没有
+   * 自己的帧可挂（挂到外层协程的块上 = 跨函数的 br，LLVM 校验直接失败）。 */
+  bool lambda_in_async_method;
 
-    LLVMValueRef rt_println;
-    LLVMValueRef rt_print_int; /* zan_rt_print_int(int64) */
-    LLVMValueRef rt_print_uint; /* zan_rt_print_uint(uint64) */
-    LLVMValueRef rt_print_double; /* zan_rt_print_double(double) */
-    LLVMValueRef rt_print_float; /* zan_rt_print_float(float) */
+  LLVMValueRef rt_println;
+  LLVMValueRef rt_print_int;    /* zan_rt_print_int(int64) */
+  LLVMValueRef rt_print_uint;   /* zan_rt_print_uint(uint64) */
+  LLVMValueRef rt_print_double; /* zan_rt_print_double(double) */
+  LLVMValueRef rt_print_float;  /* zan_rt_print_float(float) */
 
-    LLVMValueRef fn_snprintf;
-    LLVMValueRef fn_malloc;
-    LLVMValueRef fn_free;
-    LLVMValueRef fn_strlen;
-    LLVMValueRef fn_strcpy;
-    /* 内部 64 位十进制格式化实现 */
-    LLVMValueRef fn_itoa64;
-    LLVMValueRef fn_strcat;
-    /* 模块共享空字符串常量字面量 */
-    LLVMValueRef str_empty;
+  LLVMValueRef fn_snprintf;
+  LLVMValueRef fn_malloc;
+  LLVMValueRef fn_free;
+  LLVMValueRef fn_strlen;
+  LLVMValueRef fn_strcpy;
+  /* 内部 64 位十进制格式化实现 */
+  LLVMValueRef fn_itoa64;
+  LLVMValueRef fn_strcat;
+  /* 模块共享空字符串常量字面量 */
+  LLVMValueRef str_empty;
 
-    /* 结构体类型注册表 */
-    struct zan_struct_type_entry {
-        zan_symbol_t *sym;
-        LLVMTypeRef llvm_type;
-        /* [StructLayout(LayoutKind */
-        bool explicit_layout;
-        unsigned long *field_offsets;
-        LLVMTypeRef *field_llvm;
-        int field_count;
-    } *struct_types;
-    int struct_type_count;
-    int struct_type_cap;
+  /* 结构体类型注册表 */
+  struct zan_struct_type_entry {
+    zan_symbol_t *sym;
+    LLVMTypeRef llvm_type;
+    /* [StructLayout(LayoutKind */
+    bool explicit_layout;
+    unsigned long *field_offsets;
+    LLVMTypeRef *field_llvm;
+    int field_count;
+  } *struct_types;
+  int struct_type_count;
+  int struct_type_cap;
 
-    /* 类级 ARC 字段级联释放函数表 */
-    struct zan_class_release_entry {
-        zan_symbol_t *sym;
-        zan_type_t   *inst;
-        LLVMValueRef  fn;
-    } *class_release;
-    int class_release_count;
-    int class_release_cap;
+  /* 类级 ARC 字段级联释放函数表 */
+  struct zan_class_release_entry {
+    zan_symbol_t *sym;
+    zan_type_t *inst;
+    LLVMValueRef fn;
+  } *class_release;
+  int class_release_count;
+  int class_release_cap;
 
-    struct zan_fn_entry {
-        zan_symbol_t *sym;
-        LLVMValueRef fn;
-        LLVMTypeRef fn_type;
-        /* 方法修饰符快照，供虚表与代码清单生成 */
-        uint32_t modifiers;
-    } *functions;
-    int function_count;
-    int function_cap;
-    /* 符号名至函数索引的 O(1) 查找映射表 */
-    struct zan_fn_index_slot {
-        zan_symbol_t *sym;
-        int idx;
-    } *fn_index;
-    int fn_index_cap;
+  struct zan_fn_entry {
+    zan_symbol_t *sym;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+    /* 方法修饰符快照，供虚表与代码清单生成 */
+    uint32_t modifiers;
+  } *functions;
+  int function_count;
+  int function_cap;
+  /* 符号名至函数索引的 O(1) 查找映射表 */
+  struct zan_fn_index_slot {
+    zan_symbol_t *sym;
+    int idx;
+  } *fn_index;
+  int fn_index_cap;
 
-    LLVMBasicBlockRef break_target;
-    LLVMBasicBlockRef continue_target;
-    /* 最内层循环首个局部变量索引：continue 据此释放局部变量 */
-    int loop_locals_base;
-    /* 最内层循环或 switch 首个局部变量索引：break 据此释放局部变量 */
-    int break_locals_base;
-    int throw_locals_base;
-    zan_irgen_catch_cleanup_t *catch_cleanups;
-    int catch_cleanup_count;
-    int catch_cleanup_cap;
-    /* 最内层循环内的 catch 清理项数量 */
-    int loop_catch_base;
-    /* 当前 try 块内的 catch 清理项数量 */
-    int throw_catch_base;
+  LLVMBasicBlockRef break_target;
+  LLVMBasicBlockRef continue_target;
+  /* 最内层循环首个局部变量索引：continue 据此释放局部变量 */
+  int loop_locals_base;
+  /* 最内层循环或 switch 首个局部变量索引：break 据此释放局部变量 */
+  int break_locals_base;
+  int throw_locals_base;
+  zan_irgen_catch_cleanup_t *catch_cleanups;
+  int catch_cleanup_count;
+  int catch_cleanup_cap;
+  /* 最内层循环内的 catch 清理项数量 */
+  int loop_catch_base;
+  /* 当前 try 块内的 catch 清理项数量 */
+  int throw_catch_base;
 
-    /* 当前激活的 finally 代码块栈（由内至外排布；动态伸缩，B-ID74） */
-    zan_irgen_finally_entry_t *finallys;
-    int finally_count;
-    int finally_cap;
-    int finally_loop_base;
-    zan_irgen_pending_context_t pending;
-    void *current_locals;
-    /* Scoped emission context; unlike current_locals this never outlives a call. */
-    void *active_cleanup_locals;
-    LLVMValueRef active_cleanup_fn;
+  /* 当前激活的 finally 代码块栈（由内至外排布；动态伸缩，B-ID74） */
+  zan_irgen_finally_entry_t *finallys;
+  int finally_count;
+  int finally_cap;
+  int finally_loop_base;
+  zan_irgen_pending_context_t pending;
+  void *current_locals;
+  /* Scoped emission context; unlike current_locals this never outlives a call.
+   */
+  void *active_cleanup_locals;
+  LLVMValueRef active_cleanup_fn;
 
-    /* 算术溢出检测嵌套深度：大于 0 时在 checked 块内发射溢出检测 */
-    int irgen_checked_depth;
+  /* 算术溢出检测嵌套深度：大于 0 时在 checked 块内发射溢出检测 */
+  int irgen_checked_depth;
 
-    struct {
-        LLVMValueRef old_top_slot;
-        /* A528 ctor 裸武装与 try 武装共用此槽，但语义不同：try 存的是
-         * EH top（出口写回 top），ctor 存的是 EH 临时栈深度（出口写回
-         * tmps 栈顶）。错写会把无 try 时的 top=-1 冲成 0，之后失败的
-         * 运行期检查误判“在 try 里”而跳进从未 setjmp 的 bufs[0]。 */
-        bool restore_tmps;
-    } *eh_armed;          /* 动态伸缩（B-ID74） */
-    int eh_armed_count;
-    int eh_armed_cap;
-    /* 当前函数体拥有的作用域清理项 */
-    int eh_armed_base;
-    int eh_armed_loop_base;
+  struct {
+    LLVMValueRef old_top_slot;
+    /* A528 ctor 裸武装与 try 武装共用此槽，但语义不同：try 存的是
+     * EH top（出口写回 top），ctor 存的是 EH 临时栈深度（出口写回
+     * tmps 栈顶）。错写会把无 try 时的 top=-1 冲成 0，之后失败的
+     * 运行期检查误判“在 try 里”而跳进从未 setjmp 的 bufs[0]。 */
+    bool restore_tmps;
+  } *eh_armed; /* 动态伸缩（B-ID74） */
+  int eh_armed_count;
+  int eh_armed_cap;
+  /* 当前函数体拥有的作用域清理项 */
+  int eh_armed_base;
+  int eh_armed_loop_base;
 
-    zan_lpad_entry_t lpad_stack[ZAN_MAX_ARMED_TRY];
-    int lpad_depth;
-    LLVMValueRef eh_personality_fn;
-    LLVMValueRef fn_cxa_allocate_exception;
-    LLVMValueRef fn_cxa_throw;
+  zan_lpad_entry_t lpad_stack[ZAN_MAX_ARMED_TRY];
+  int lpad_depth;
+  LLVMValueRef eh_personality_fn;
+  LLVMValueRef fn_cxa_allocate_exception;
+  LLVMValueRef fn_cxa_throw;
 
-    bool wasm_eh_used;
+  bool wasm_eh_used;
 
-    /* constructors */
-    struct zan_ctor_entry {
-        zan_symbol_t *type_sym;
-        zan_ast_node_t *decl;
-        LLVMValueRef fn;
-        LLVMTypeRef fn_type;
-        int param_count;
-    } *ctors;
-    int ctor_count;
-    int ctor_cap;
+  /* constructors */
+  struct zan_ctor_entry {
+    zan_symbol_t *type_sym;
+    zan_ast_node_t *decl;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+    int param_count;
+  } *ctors;
+  int ctor_count;
+  int ctor_cap;
 
-    zan_type_t *collect_inst_ctx;
-    zan_type_t *cur_inst;   /* 当前泛型类单态化实例化上下文 */
-    zan_type_t *cur_recv_type;
-    struct zan_generic_fn {
-        zan_symbol_t *msym;
-        zan_type_t  **args;
-        int           argc;
-        LLVMValueRef  fn;
-        LLVMTypeRef   fn_type;
-    } *generic_fns;
-    int generic_fn_count;
-    int generic_fn_cap;
-    struct zan_generic_ctor {
-        zan_symbol_t *type_sym;
-        zan_ast_node_t *decl;
-        zan_type_t  **args;
-        int           argc;
-        int           param_count;
-        LLVMValueRef  fn;
-        LLVMTypeRef   fn_type;
-    } *generic_ctors;
-    int generic_ctor_count;
-    int generic_ctor_cap;
-    struct zan_generic_inst {
-        zan_symbol_t *type_sym;
-        zan_type_t   *inst;
-    } *generic_insts;
-    int generic_inst_count;
-    int generic_inst_cap;
+  zan_type_t *collect_inst_ctx;
+  zan_type_t *cur_inst; /* 当前泛型类单态化实例化上下文 */
+  zan_type_t *cur_recv_type;
+  struct zan_generic_fn {
+    zan_symbol_t *msym;
+    zan_type_t **args;
+    int argc;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+  } *generic_fns;
+  int generic_fn_count;
+  int generic_fn_cap;
+  struct zan_generic_ctor {
+    zan_symbol_t *type_sym;
+    zan_ast_node_t *decl;
+    zan_type_t **args;
+    int argc;
+    int param_count;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+  } *generic_ctors;
+  int generic_ctor_count;
+  int generic_ctor_cap;
+  struct zan_generic_inst {
+    zan_symbol_t *type_sym;
+    zan_type_t *inst;
+  } *generic_insts;
+  int generic_inst_count;
+  int generic_inst_cap;
 
-    /* 泛型方法单态化特化实例表 */
-    struct zan_method_spec {
-        zan_symbol_t   *msym;
-        zan_symbol_t   *type_sym;
-        zan_type_t     *owner_inst;
-        zan_ast_node_t *member;    /* AST_METHOD_DECL */
-        zan_type_t    **bind;
-        int             bindc;
-        LLVMValueRef    fn;
-        LLVMTypeRef     fn_type;
-        /* 异步方法特化元组：ramp、resume 与协程帧类型 */
-        bool            is_async;
-        void           *async_ir;
-    } *method_specs;
-    int method_spec_count;
-    int method_spec_cap;
-    int method_spec_emitted;
-    /* 正在发射的方法特化形参和实参映射 */
-    zan_ast_list_t *cur_mtps;
-    zan_type_t    **cur_mbind;
+  /* 泛型方法单态化特化实例表 */
+  struct zan_method_spec {
+    zan_symbol_t *msym;
+    zan_symbol_t *type_sym;
+    zan_type_t *owner_inst;
+    zan_type_t *body_owner;
+    zan_ast_node_t *member; /* AST_METHOD_DECL */
+    zan_type_t **bind;
+    zan_type_t **body_bind;
+    int bindc;
+    LLVMValueRef fn;
+    LLVMTypeRef fn_type;
+    /* 异步方法特化元组：ramp、resume 与协程帧类型 */
+    bool is_async;
+    bool has_gctx;
+    int gctx_owner_idx;
+    void *async_ir;
+  } *method_specs;
+  int method_spec_count;
+  int method_spec_cap;
+  int method_spec_emitted;
+  /* 正在发射的方法特化形参和实参映射 */
+  zan_ast_list_t *cur_mtps;
+  zan_type_t **cur_mbind;
 
-    /* A556-1 隐式装箱：发生过装箱的表达式节点。箱是 fresh owned 堆
-     * 对象，但下游所有权判定（emit_rc_capture_local / 集合槽捕获 / 字段
-     * 捕获 / 实参释放协议）只能看 AST 的 owned 性——按 AST 判会当成
-     * 借用再 retain 一次，rc=2、释放只减 1，箱泄漏。登记后
-     * expr_yields_owned_rc_value 对这些节点直接判 owned。 */
-    zan_ast_node_t **boxed_exprs;
-    int boxed_expr_count;
-    int boxed_expr_cap;
+  /* Phase 2a: __Canon generic dictionary (__gctx) state */
+  LLVMValueRef cur_gctx_val;
+  bool cur_canon_body;
+  int cur_gctx_owner_idx;
+  struct zan_gctx_entry *gctx_entries;
+  int gctx_entry_count;
+  int gctx_entry_cap;
+  int gctx_emitted_count;
+  struct zan_gctx_thunk {
+    LLVMValueRef target_fn;
+    LLVMValueRef gctx_gv;
+    LLVMValueRef thunk_fn;
+  } *gctx_thunks;
+  int gctx_thunk_count;
+  int gctx_thunk_cap;
+  zan_type_t *canon_sentinel_type;
 
-    LLVMValueRef rt_retain;      /* zan_rt_retain(void*) */
-    LLVMValueRef rt_release;     /* zan_rt_release(void*) */
-    LLVMValueRef rt_release_dyn;
-    /* B-ID78 深树级联析构防护：深度计数 + 延迟释放队列 C 侧三函数 */
-    LLVMValueRef arc_defer_depth;   /* __zan_arc_rel_depth (thread-local i32) */
-    LLVMValueRef rt_defer_push;     /* zan_rt_defer_push(fn, obj) */
-    LLVMValueRef rt_defer_pending;  /* zan_rt_defer_pending() -> i32 */
-    LLVMValueRef rt_defer_drain;    /* zan_rt_defer_drain() */
-    LLVMValueRef rt_alloc;       /* zan_rt_alloc(int64_t size) -> void* */
-    LLVMValueRef rt_str_retain;  /* zan_rt_str_retain(void*) */
-    LLVMValueRef rt_str_release; /* zan_rt_str_release(void*) */
-    LLVMValueRef rt_str_alloc;
-    LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
-    LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
-    /* B-ID89 活对象注册表挂钩 */
-    LLVMValueRef rt_live_register;
-    LLVMValueRef rt_live_register_array;
-    LLVMValueRef rt_live_unregister;
-    LLVMTypeRef weak_node_type;  /* { next, target, slot } */
-    LLVMValueRef weak_buckets;
-    LLVMValueRef weak_lock;      /* zan_weak_lock */
-    LLVMValueRef weak_count;     /* zan_weak_count */
-    LLVMValueRef rt_weak_store;  /* zan_rt_weak_store(void**, void*) */
-    LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
-    LLVMValueRef rt_weak_load_retain;
-    LLVMValueRef rt_weak_destroy_begin;
+  /* A556-1 隐式装箱：发生过装箱的表达式节点。箱是 fresh owned 堆
+   * 对象，但下游所有权判定（emit_rc_capture_local / 集合槽捕获 / 字段
+   * 捕获 / 实参释放协议）只能看 AST 的 owned 性——按 AST 判会当成
+   * 借用再 retain 一次，rc=2、释放只减 1，箱泄漏。登记后
+   * expr_yields_owned_rc_value 对这些节点直接判 owned。 */
+  zan_ast_node_t **boxed_exprs;
+  int boxed_expr_count;
+  int boxed_expr_cap;
 
-    LLVMValueRef fn_printf;
-    LLVMTypeRef  printf_type;
-    LLVMValueRef fn_exit;
-    LLVMTypeRef  exit_type;
-    LLVMValueRef fn_atexit;
-    LLVMTypeRef  atexit_type;
-    struct zan_static_field_ref {
-        zan_type_t   *type;
-        LLVMValueRef  gv;
-        zan_symbol_t *owner;
-        zan_type_t   *inst;
-    } *static_fields;
-    int static_field_count;
-    int static_field_cap;
-    /* Startup initialization follows executable demand, independently of eager
-     * diagnostic body emission and reflection metadata retention. */
-    struct zan_static_init_type {
-        zan_symbol_t *sym;
-        zan_type_t   *inst;
-        LLVMValueRef fn;
-        LLVMValueRef cctor_fn;
-        bool         emitted;
-    } *static_init_types;
-    int static_init_type_count;
-    int static_init_type_cap;
-    struct zan_static_init_use {
-        zan_symbol_t *sym;
-        zan_type_t   *inst;
-        LLVMValueRef caller;
-    } *static_init_uses;
-    int static_init_use_count;
-    int static_init_use_cap;
-    LLVMValueRef static_init_coordinator;
-    LLVMValueRef static_init_cleanup;
-    bool static_init_ctor_demand; /* executable CreateInstance, excluding metadata thunks */
-    LLVMValueRef g_live;
-    LLVMValueRef g_site_live;
-    LLVMValueRef g_site_names;
-    LLVMValueRef g_site_dtors;
-    LLVMValueRef g_site_tynames;  /* 祖先类型名称数组指针，供运行时 is/as 检查 */
-    LLVMValueRef g_site_meta;     /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
-    LLVMValueRef g_site_field_graphs; /* 字段走图表指针数组 (B-ID89) */
-    LLVMValueRef g_site_count;
-    zan_symbol_t **site_syms;
-    zan_type_t   **site_inst;    /* 分配点特化类类型：确保泛型析构释放对应字段 */
-    int          *site_coll;
-    zan_type_t   **site_coll_elem;
-    uint32_t     *site_loc_file;
-    uint32_t     *site_loc_line;
-    int          leak_site_count;
-    int          leak_site_cap;
-    LLVMValueRef *desc_gv;
-    int          desc_gv_cap;    /* capacity of desc_gv */
-    bool         desc_hdr;
-    zan_str_intern_t **str_intern;
-    int          str_intern_cap;
-    bool         rt_guard_split;
-    LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
-    const char  *src_file;
-    bool         runtime_checks;
-    LLVMValueRef expect_false_fn;
-    LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
-    LLVMValueRef soft_scratch_fn;
-    bool         publish_mode;
-    bool         publish_instance_prune; /* closed-world instance callable roots */
-    bool         publish_vslot_demand;
-    zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */
-    int          vslot_demand_count;
-    int          vslot_demand_cap;
-    char       **html_handlers;      /* publish：设计稿事件处理器名，按名保留反射 */
-    int          html_handler_count;
-    bool         strict_runtime;
-    bool         check_leaks;
-    bool         arc_guard;       /* 释放对象隔离区 (UAF 检测) */
-    bool         arc_net;
-    bool         fast_codegen;
-    int          codegen_level;   /* --codegen-level；-1 未给（回退 ZAN_CODEGEN_LEVEL env） */
-    bool         shard_opt;       /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
-    bool         emit_lib;        /* 库构建模式：保持 public 成员导出链接 */
-    bool         emit_shared;     /* 动态共享库模式：发射平台标准入口 (DllMain) */
+  LLVMValueRef rt_retain;  /* zan_rt_retain(void*) */
+  LLVMValueRef rt_release; /* zan_rt_release(void*) */
+  LLVMValueRef rt_release_dyn;
+  /* B-ID78 深树级联析构防护：深度计数 + 延迟释放队列 C 侧三函数 */
+  LLVMValueRef arc_defer_depth;  /* __zan_arc_rel_depth (thread-local i32) */
+  LLVMValueRef rt_defer_push;    /* zan_rt_defer_push(fn, obj) */
+  LLVMValueRef rt_defer_pending; /* zan_rt_defer_pending() -> i32 */
+  LLVMValueRef rt_defer_drain;   /* zan_rt_defer_drain() */
+  LLVMValueRef rt_alloc;         /* zan_rt_alloc(int64_t size) -> void* */
+  LLVMValueRef rt_str_retain;    /* zan_rt_str_retain(void*) */
+  LLVMValueRef rt_str_release;   /* zan_rt_str_release(void*) */
+  LLVMValueRef rt_str_alloc;
+  LLVMValueRef rt_arr_retain;  /* zan_rt_arr_retain(void*) */
+  LLVMValueRef rt_arr_release; /* zan_rt_arr_release(void*) */
+  /* B-ID89 活对象注册表挂钩 */
+  LLVMValueRef rt_live_register;
+  LLVMValueRef rt_live_register_named;
+  LLVMValueRef rt_live_register_array;
+  LLVMValueRef rt_live_unregister;
+  LLVMTypeRef weak_node_type; /* { next, target, slot } */
+  LLVMValueRef weak_buckets;
+  LLVMValueRef weak_lock;       /* zan_weak_lock */
+  LLVMValueRef weak_count;      /* zan_weak_count */
+  LLVMValueRef rt_weak_store;   /* zan_rt_weak_store(void**, void*) */
+  LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
+  LLVMValueRef rt_weak_load_retain;
+  LLVMValueRef rt_weak_destroy_begin;
 
-    /* Binding<T> 属性访问器函数降解缓存 */
-    struct {
-        zan_symbol_t *cls;
-        zan_symbol_t *field;
-        zan_type_t *recv_type;
-        zan_type_t *value_type;
-        int base_dispatch;
-        LLVMValueRef get_fn;
-        LLVMValueRef set_fn;
-    } *bind_accs;
-    int bind_acc_count;
-    int bind_acc_cap;
+  LLVMValueRef fn_printf;
+  LLVMTypeRef printf_type;
+  LLVMValueRef fn_exit;
+  LLVMTypeRef exit_type;
+  LLVMValueRef fn_atexit;
+  LLVMTypeRef atexit_type;
+  struct zan_static_field_ref {
+    zan_type_t *type;
+    LLVMValueRef gv;
+    zan_symbol_t *owner;
+    zan_type_t *inst;
+  } *static_fields;
+  int static_field_count;
+  int static_field_cap;
+  /* Startup initialization follows executable demand, independently of eager
+   * diagnostic body emission and reflection metadata retention. */
+  struct zan_static_init_type {
+    zan_symbol_t *sym;
+    zan_type_t *inst;
+    LLVMValueRef fn;
+    LLVMValueRef cctor_fn;
+    bool emitted;
+  } *static_init_types;
+  int static_init_type_count;
+  int static_init_type_cap;
+  struct zan_static_init_use {
+    zan_symbol_t *sym;
+    zan_type_t *inst;
+    LLVMValueRef caller;
+  } *static_init_uses;
+  int static_init_use_count;
+  int static_init_use_cap;
+  LLVMValueRef static_init_coordinator;
+  LLVMValueRef static_init_cleanup;
+  bool static_init_ctor_demand; /* executable CreateInstance, excluding metadata
+                                   thunks */
+  bool static_init_sfield_demand; /* executable static field reflection */
+  LLVMValueRef g_live;
+  LLVMValueRef g_site_live;
+  LLVMValueRef g_site_names;
+  LLVMValueRef g_site_dtors;
+  LLVMValueRef g_site_tynames; /* 祖先类型名称数组指针，供运行时 is/as 检查 */
+  LLVMValueRef
+      g_site_meta; /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
+  LLVMValueRef g_site_field_graphs; /* 字段走图表指针数组 (B-ID89) */
+  LLVMValueRef g_site_count;
+  zan_symbol_t **site_syms;
+  zan_type_t **site_inst; /* 分配点特化类类型：确保泛型析构释放对应字段 */
+  int *site_coll;
+  zan_type_t **site_coll_elem;
+  uint32_t *site_loc_file;
+  uint32_t *site_loc_line;
+  int leak_site_count;
+  int leak_site_cap;
+  LLVMValueRef *desc_gv;
+  int desc_gv_cap; /* capacity of desc_gv */
+  bool desc_hdr;
+  zan_str_intern_t **str_intern;
+  int str_intern_cap;
+  bool rt_guard_split;
+  LLVMValueRef fn_report_leaks; /* void __zan_report_leaks(void) */
+  const char *src_file;
+  bool runtime_checks;
+  LLVMValueRef expect_false_fn;
+  LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
+  LLVMValueRef soft_scratch_fn;
+  bool publish_mode;
+  bool publish_instance_prune; /* closed-world instance callable roots */
+  bool publish_vslot_demand;
+  zan_symbol_t *
+      *vslot_demands; /* canonical declarations observed by emitted dispatch */
+  int vslot_demand_count;
+  int vslot_demand_cap;
+  bool strict_runtime;
+  bool check_leaks;
+  bool arc_guard; /* 释放对象隔离区 (UAF 检测) */
+  bool arc_net;
+  bool fast_codegen;
+  int codegen_level; /* --codegen-level；-1 未给（回退 ZAN_CODEGEN_LEVEL env）
+                      */
+  bool shard_opt;   /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
+  bool emit_lib;    /* 库构建模式：保持 public 成员导出链接 */
+  bool emit_shared; /* 动态共享库模式：发射平台标准入口 (DllMain) */
 
-    LLVMValueRef fn_realloc;     /* realloc(void*, size_t) -> void* */
-    LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
-    LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
-    LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
-    LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
-    LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
-    LLVMTypeRef decimal_struct_type; /* Decimal { i32 flags, i32 hi32, i64 lo64 } */
-    LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
+  /* Binding<T> 属性访问器函数降解缓存 */
+  struct {
+    zan_symbol_t *cls;
+    zan_symbol_t *field;
+    zan_type_t *recv_type;
+    zan_type_t *value_type;
+    int base_dispatch;
+    LLVMValueRef get_fn;
+    LLVMValueRef set_fn;
+  } *bind_accs;
+  int bind_acc_count;
+  int bind_acc_cap;
 
-    struct {
-        zan_istr_t text;
-        LLVMValueRef value;
-    } *string_literals;
-    int string_literal_count;
-    int string_literal_cap;
+  LLVMValueRef fn_realloc;      /* realloc(void*, size_t) -> void* */
+  LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+  LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
+  LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64*
+                                   values } */
+  LLVMTypeRef
+      sb_struct_type; /* StringBuilder { i64 count, i64 capacity, i8* data } */
+  LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64
+                                   thread_handle } */
+  LLVMTypeRef
+      decimal_struct_type; /* Decimal { i32 flags, i32 hi32, i64 lo64 } */
+  LLVMValueRef fn_strcmp;  /* strcmp(s1, s2) -> int */
 
-    /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
-    struct {
-        zan_symbol_t *sym;
-        const char   *name;
-        LLVMValueRef  rec;
-        LLVMValueRef  gv;           /* TypeInfo blob, projected after demand converges */
-    } *refl_metas;
-    int refl_meta_count;
-    int refl_meta_cap;
-    int refl_str_count;
-    bool refl_used;               /* explicit or dynamic reflection metadata is required */
-    bool publish_reflect_demand;  /* narrow publish metadata to emitted reflection capabilities */
-    unsigned refl_query_used;     /* emitted signature-query capabilities, monotonic */
-    bool refl_ctor_used;          /* live emitted CreateInstance; metadata alone is not callable demand */
-    zan_istr_t *refl_invoke_names; /* emitted literal Invoke names; storage belongs to arena */
-    int refl_invoke_name_count;
-    int refl_invoke_name_cap;
-    bool refl_invoke_unknown;     /* computed Invoke name preserves all callable hooks */
-    LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
-    LLVMValueRef refl_empty_str;
-    LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */
-    LLVMValueRef fn_refl_get_i64;   /* i64 (i8* ti, i8* obj, i8* name) */
-    LLVMValueRef fn_refl_get_f64;   /* double (i8* ti, i8* obj, i8* name) */
-    LLVMValueRef fn_refl_get_str;   /* i8* (i8* ti, i8* obj, i8* name) */
-    LLVMValueRef fn_refl_get_obj;   /* i8* (i8* ti, i8* obj, i8* name) */
-    LLVMValueRef fn_refl_fname;     /* i8* (i8* ti, i64 idx, i64 which) */
-    LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
-    LLVMTypeRef  refl_method_type;
-    LLVMValueRef refl_field_pool;  /* compact field records, shared by index tables */
-    LLVMValueRef refl_method_pool; /* compact method/ctor records */
-    LLVMValueRef refl_value_pool;  /* pointer payloads; entry zero is null */
-    /* 反射元数据静态记录表 */
-    struct {
-        LLVMValueRef  gv;
-        LLVMTypeRef   arr_ty;
-        zan_symbol_t *sym;
-        int           n;
-        bool          ctors;
-        bool          ctor_ready; /* callable initializer emitted before site tables freeze */
-        zan_type_t   *list_type;   /* closed builtin List ctor table; sym is NULL */
-        int           site;   /* ctor thunk 的分配点，desc_init 前预登记 */
-    } *refl_mtabs;
-    int refl_mtab_count;
-    int refl_mtab_cap;
-    int refl_thunk_count;
-    LLVMValueRef fn_refl_mfind;     /* i64 (i8* ti, i8* name, i64 flags) */
-    LLVMValueRef fn_refl_mstr;      /* i8* (i8* ti, i64 tbl, i64 i, i64 which, i64 k) */
-    LLVMValueRef fn_refl_mi64;      /* i64 (i8* ti, i64 tbl, i64 i, i64 which) */
-    LLVMValueRef fn_refl_invoke;    /* i64 (i8* ti, i64 tbl, i64 i, i8* obj,
-                                     *      i64* args, i64* ok) */
-    LLVMValueRef fn_refl_set;       /* i64 (i8* ti, i8* obj, i8* name, i64 v,
-                                     *      i64 vkind) */
-    LLVMValueRef fn_refl_pget;      /* i64 (i8* ti, i8* obj, i8* name,
-                                     *      i64* kindout) */
-    LLVMValueRef fn_refl_cfind;     /* i64 (i8* ti, i64 nargs) */
-    LLVMValueRef fn_refl_tainfo;    /* i64 (i8* ti, i64 idx, i64 which) */
-    LLVMValueRef fn_list_count_thunk;
+  struct {
+    zan_istr_t text;
+    LLVMValueRef value;
+  } *string_literals;
+  int string_literal_count;
+  int string_literal_cap;
 
-    bool obfuscate_strings;
-    unsigned char obf_key[16];
-    /* 字符串混淆动态增长表 */
-    struct { LLVMValueRef global; uint32_t len; } *obf_literals;
-    int obf_literal_count;
-    int obf_literal_cap;
+  /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
+  struct {
+    zan_symbol_t *sym;
+    zan_type_t *type;
+    const char *name;
+    LLVMValueRef rec;
+    LLVMValueRef gv; /* TypeInfo blob, projected after demand converges */
+    LLVMValueRef vops; /* per-type value field/slot helper for struct/nullable */
+    int box_site;      /* pre-reserved ARC site for boxing TYPE_STRUCT */
+  } *refl_metas;
+  int refl_meta_count;
+  int refl_meta_cap;
+  int refl_str_count;
+  bool refl_used; /* explicit or dynamic reflection metadata is required */
+  bool publish_reflect_demand; /* narrow publish metadata to emitted reflection
+                                  capabilities */
+  unsigned
+      refl_query_used; /* emitted signature-query capabilities, monotonic */
+  bool refl_ctor_used; /* live emitted CreateInstance; metadata alone is not
+                          callable demand */
+  bool refl_sfield_used; /* live emitted GetStaticField* / SetStaticField* */
+  bool refl_field_rw_used; /* live emitted instance GetField* / SetField* */
+  zan_istr_t *refl_invoke_names; /* emitted literal Invoke names; storage
+                                    belongs to arena */
+  int refl_invoke_name_count;
+  int refl_invoke_name_cap;
+  bool refl_invoke_unknown; /* computed Invoke name preserves all callable hooks
+                             */
+  LLVMTypeRef
+      refl_field_type; /* { i8* name, i8* typeName, i64 kind, i64 off } */
+  LLVMValueRef refl_empty_str;
+  LLVMValueRef fn_refl_find;     /* i64 (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_sfind;    /* i64 (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_get_i64;  /* i64 (i8* ti, i8* obj, i8* name) */
+  LLVMValueRef fn_refl_get_f64;  /* double (i8* ti, i8* obj, i8* name) */
+  LLVMValueRef fn_refl_get_str;  /* i8* (i8* ti, i8* obj, i8* name) */
+  LLVMValueRef fn_refl_get_obj;  /* i8* (i8* ti, i8* obj, i8* name) */
+  LLVMValueRef fn_refl_get_i64_at; /* i64 (i8* ti, i8* obj, i64 idx) */
+  LLVMValueRef fn_refl_get_f64_at; /* double (i8* ti, i8* obj, i64 idx) */
+  LLVMValueRef fn_refl_get_str_at; /* i8* (i8* ti, i8* obj, i64 idx) */
+  LLVMValueRef fn_refl_get_obj_at; /* i8* (i8* ti, i8* obj, i64 idx) */
+  LLVMValueRef fn_refl_sget_i64;   /* i64 (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_sget_f64;   /* double (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_sget_str;   /* i8* (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_sget_obj;   /* i8* (i8* ti, i8* name) */
+  LLVMValueRef fn_refl_fname;    /* i8* (i8* ti, i64 idx, i64 which) */
+  LLVMValueRef fn_refl_obj_type; /* i8* (i8* obj, i8* fallback) */
+  LLVMTypeRef refl_method_type;
+  LLVMValueRef
+      refl_field_pool; /* compact field records, shared by index tables */
+  LLVMValueRef refl_method_pool; /* compact method/ctor records */
+  LLVMValueRef refl_value_pool;  /* pointer payloads; entry zero is null */
+  /* 反射元数据静态记录表 */
+  struct {
+    LLVMValueRef gv;
+    LLVMTypeRef arr_ty;
+    zan_symbol_t *sym;
+    int n;
+    bool ctors;
+    bool
+        ctor_ready; /* callable initializer emitted before site tables freeze */
+    zan_type_t *list_type; /* closed builtin List ctor table; sym is NULL */
+    int site;              /* ctor thunk 的分配点，desc_init 前预登记 */
+  } *refl_mtabs;
+  int refl_mtab_count;
+  int refl_mtab_cap;
+  int refl_thunk_count;
+  LLVMValueRef fn_refl_mfind; /* i64 (i8* ti, i8* name, i64 flags) */
+  LLVMValueRef
+      fn_refl_mstr; /* i8* (i8* ti, i64 tbl, i64 i, i64 which, i64 k) */
+  LLVMValueRef fn_refl_mi64;   /* i64 (i8* ti, i64 tbl, i64 i, i64 which) */
+  LLVMValueRef fn_refl_invoke; /* i64 (i8* ti, i64 tbl, i64 i, i8* obj,
+                                *      i64* args, i64* ok) */
+  LLVMValueRef fn_refl_set;    /* i64 (i8* ti, i8* obj, i8* name, i64 v,
+                                *      i64 vkind) */
+  LLVMValueRef fn_refl_set_at; /* i64 (i8* ti, i8* obj, i64 idx, i64 v,
+                                *      i64 vkind) */
+  LLVMValueRef fn_refl_sset;   /* i64 (i8* ti, i8* name, i64 v, i64 vkind) */
+  LLVMValueRef fn_refl_pget;   /* i64 (i8* ti, i8* obj, i8* name,
+                                *      i64* kindout) */
+  LLVMValueRef fn_refl_spget;  /* i64 (i8* ti, i8* name, i64* kindout) */
+  LLVMValueRef fn_refl_cfind;  /* i64 (i8* ti, i64 nargs) */
+  LLVMValueRef fn_refl_tainfo; /* i64 (i8* ti, i64 idx, i64 which) */
+  LLVMValueRef fn_list_count_thunk;
 
-    bool hide_diagnostics;
-    const char *site_map_path;
-    FILE *site_map_fp;
-    uint32_t next_site_id;
-    struct {
-        uint32_t file_id;
-        uint32_t line;
-        uint32_t col;
-        uint32_t site_id;
-    } *site_records;
-    int site_record_count;
-    int site_record_cap;
+  bool obfuscate_strings;
+  unsigned char obf_key[16];
+  /* 字符串混淆动态增长表 */
+  struct {
+    LLVMValueRef global;
+    uint32_t len;
+  } *obf_literals;
+  int obf_literal_count;
+  int obf_literal_cap;
 
-    LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
-    LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */
-    LLVMTypeRef  co_header_type;
-    LLVMValueRef rt_co_ready;
-    LLVMTypeRef  rt_co_ready_type;
-    LLVMValueRef rt_co_poll;
-    LLVMTypeRef  rt_co_poll_type;
-    LLVMValueRef rt_co_frame_alloc;
-    LLVMTypeRef  rt_co_frame_alloc_type;
-    LLVMValueRef rt_co_frame_free;
-    LLVMTypeRef  rt_co_frame_free_type;
-    LLVMValueRef rt_co_sched_init;
-    LLVMTypeRef  rt_co_sched_init_type;
-    LLVMValueRef rt_co_sched_run;
-    LLVMTypeRef  rt_co_sched_run_type;
-    LLVMValueRef rt_co_sched_run_until;
-    LLVMTypeRef  rt_co_sched_run_until_type;
-    LLVMValueRef rt_co_delay;
-    LLVMTypeRef  rt_co_delay_type;
-    /* 套接字就绪反应堆外部驱动绑定 */
-    LLVMValueRef rt_io_wait_co;
-    LLVMTypeRef  rt_io_wait_co_type;
-    LLVMValueRef rt_io_recv_co;
-    LLVMTypeRef  rt_io_recv_co_type;
-    LLVMValueRef rt_io_recv_to_co; /* zan_io_recv_to_co 外部符号：超时重叠套接字读取挂起 */
-    LLVMTypeRef  rt_io_recv_to_co_type;
-    LLVMValueRef rt_io_accept_co;
-    LLVMTypeRef  rt_io_accept_co_type;
-    LLVMValueRef rt_io_resolve_co;
-    LLVMTypeRef  rt_io_resolve_co_type;
-    LLVMValueRef rt_io_resolve_sa_co; /* zan_io_resolve_sa_co 外部符号：异步套接字地址解析挂起 */
-    LLVMTypeRef  rt_io_resolve_sa_co_type;
-    LLVMValueRef rt_blocking_co;       /* 阻塞调用协程化转派原语 */
-    LLVMTypeRef  rt_blocking_co_type;
-    LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
-    LLVMTypeRef  rt_io_pump_timeout_type;
-    LLVMValueRef rt_io_has_pending;       /* i32 zan_io_has_pending(void) */
-    LLVMTypeRef  rt_io_has_pending_type;
-    bool         has_async_work;
-    bool         uses_socket_async;
-    bool         uses_timer_runtime;
-    bool         uses_sync_runtime;
-    bool         uses_file_runtime; /* set by zan_file_* (file IO) externs */
-    bool         uses_decimal_runtime; /* set by decimal arithmetic/literals */
-    bool         uses_embed_api;
-    bool         uses_inflate;
-    zan_goto_label_rec_t *goto_labels;
-    int goto_label_count;
-    int goto_label_cap;
-    zan_goto_fixup_t *goto_fixups;
-    int goto_fixup_count;
-    int goto_fixup_cap;
-    /* 异常类类型名注册表 */
-    struct {
-        LLVMValueRef tid;
-        const char     *name;
-    } *tid_names;
-    int tid_name_count;
-    int tid_name_cap;
-    /* 异常类描述符全局表及其元素类型 */
-    LLVMValueRef tid_name_reg_global;
-    LLVMTypeRef  tid_name_reg_ent_ty;
-    LLVMValueRef current_async_frame;
-    LLVMTypeRef  current_async_frame_type;
-    LLVMValueRef current_async_resume_fn;
-    /* 正在发射的异步函数体 AST */
-    zan_ast_node_t *current_async_body;
-    /* 异步方法声明返回类型，用于协程结果槽编解码 */
-    zan_type_t  *current_async_ret_type;
-    /* await 协程状态机上下文：状态分发 switch、下一状态编号及恢复块 */
-    LLVMValueRef current_async_switch;
-    LLVMValueRef current_async_cancel_switch;
-    int          current_async_next_state;
-    int          current_async_sub_base;
-    int          current_async_sub_next;
-    int          current_async_rval_slot;
-    zan_async_slot_t *current_async_slots;
-    int          current_async_slot_count;
-    /* 异步协程完成汇聚块：共享析构局部变量并发布完成状态 */
-    int          current_async_frame_local_count;
-    LLVMBasicBlockRef current_async_complete_bb;
-    LLVMValueRef current_async_result_phi;
-    LLVMBasicBlockRef current_async_suspend_ret_bb;
-    LLVMBasicBlockRef current_async_requeue_bb;
-    LLVMBasicBlockRef current_async_cancel_bb;
-    LLVMBasicBlockRef current_async_rethrow_bb;
-    LLVMBasicBlockRef current_async_sub_rethrow_bb;
-    LLVMValueRef      current_async_sub_rethrow_phi_sub;
-    LLVMValueRef      current_async_sub_rethrow_phi_ev;
-    LLVMValueRef current_async_state_ptr;
-    LLVMValueRef current_async_cancel_ptr;
-    LLVMValueRef current_async_self_i8;
-    LLVMValueRef current_async_self_int;        /* cached (uintptr_t)(i8*)frame */
-    LLVMValueRef current_async_child_ptr;
-    LLVMValueRef current_async_sub_slot_ptr;
-    LLVMValueRef current_async_result_ptr;
-    void        *function_compactor;
-    LLVMValueRef current_async_eh_entry;
-    LLVMBasicBlockRef current_async_exc_bb;
-    LLVMValueRef current_async_rearm_switch;
-    /* 异常处理器重新布防块：恢复调用帧异常簿记 */
-    LLVMValueRef current_async_rearm_init_switch;
-    LLVMBasicBlockRef current_async_rearm_next_bb;
-    int          current_async_handler_next;
-    /* 协程帧内异常处理器槽位数 */
-    int          current_async_handler_cap;
-    int          current_async_try_count;
-    /* 协程内 foreach 编号，索引常驻帧槽 */
-    int          current_async_foreach_next;
-    /* 协程帧持有的接收者强引用（析构时释放） */
-    int          current_async_this_owned;
-    zan_type_t  *current_async_this_type;
+  bool hide_diagnostics;
+  const char *site_map_path;
+  FILE *site_map_fp;
+  uint32_t next_site_id;
+  struct {
+    uint32_t file_id;
+    uint32_t line;
+    uint32_t col;
+    uint32_t site_id;
+  } *site_records;
+  int site_record_count;
+  int site_record_cap;
 
-    zan_istr_t *extern_libs;
-    int extern_lib_count;
-    int extern_lib_cap;
-    /* DllImport 外部库符号列表（用于跨平台链接检测） */
-    struct {
-        zan_istr_t lib;
-        zan_istr_t name; /* 外部符号名称 */
-    } *extern_fns;
-    int extern_fn_count;
-    int extern_fn_cap;
-    char **abi_pending;
-    int abi_pending_count;
-    int abi_pending_cap;
+  LLVMTypeRef co_step_type; /* void(i8*) — a frame's resume/step fn */
+  LLVMTypeRef co_step_ptr;  /* void(i8*)* — pointer to a step fn */
+  LLVMTypeRef co_header_type;
+  LLVMValueRef rt_co_ready;
+  LLVMTypeRef rt_co_ready_type;
+  LLVMValueRef rt_co_poll;
+  LLVMTypeRef rt_co_poll_type;
+  LLVMValueRef rt_co_frame_alloc;
+  LLVMTypeRef rt_co_frame_alloc_type;
+  LLVMValueRef rt_co_frame_free;
+  LLVMTypeRef rt_co_frame_free_type;
+  LLVMValueRef rt_co_sched_init;
+  LLVMTypeRef rt_co_sched_init_type;
+  LLVMValueRef rt_co_sched_run;
+  LLVMTypeRef rt_co_sched_run_type;
+  LLVMValueRef rt_co_sched_run_until;
+  LLVMTypeRef rt_co_sched_run_until_type;
+  LLVMValueRef rt_co_delay;
+  LLVMTypeRef rt_co_delay_type;
+  /* 套接字就绪反应堆外部驱动绑定 */
+  LLVMValueRef rt_io_wait_co;
+  LLVMTypeRef rt_io_wait_co_type;
+  LLVMValueRef rt_io_recv_co;
+  LLVMTypeRef rt_io_recv_co_type;
+  LLVMValueRef
+      rt_io_recv_to_co; /* zan_io_recv_to_co 外部符号：超时重叠套接字读取挂起 */
+  LLVMTypeRef rt_io_recv_to_co_type;
+  LLVMValueRef rt_io_accept_co;
+  LLVMTypeRef rt_io_accept_co_type;
+  LLVMValueRef rt_io_resolve_co;
+  LLVMTypeRef rt_io_resolve_co_type;
+  LLVMValueRef rt_io_resolve_sa_co; /* zan_io_resolve_sa_co
+                                       外部符号：异步套接字地址解析挂起 */
+  LLVMTypeRef rt_io_resolve_sa_co_type;
+  LLVMValueRef rt_blocking_co; /* 阻塞调用协程化转派原语 */
+  LLVMTypeRef rt_blocking_co_type;
+  LLVMValueRef rt_io_pump_timeout; /* i32 zan_io_pump_timeout(i64 timeout_ms) */
+  LLVMTypeRef rt_io_pump_timeout_type;
+  LLVMValueRef rt_io_has_pending; /* i32 zan_io_has_pending(void) */
+  LLVMTypeRef rt_io_has_pending_type;
+  bool has_async_work;
+  bool uses_socket_async;
+  bool uses_timer_runtime;
+  bool uses_sync_runtime;
+  bool uses_file_runtime;    /* set by zan_file_* (file IO) externs */
+  bool uses_decimal_runtime; /* set by decimal arithmetic/literals */
+  bool uses_embed_api;
+  bool uses_inflate;
+  zan_goto_label_rec_t *goto_labels;
+  int goto_label_count;
+  int goto_label_cap;
+  zan_goto_fixup_t *goto_fixups;
+  int goto_fixup_count;
+  int goto_fixup_cap;
+  /* 异常类类型名注册表 */
+  struct {
+    LLVMValueRef tid;
+    const char *name;
+  } *tid_names;
+  int tid_name_count;
+  int tid_name_cap;
+  /* 异常类描述符全局表及其元素类型 */
+  LLVMValueRef tid_name_reg_global;
+  LLVMTypeRef tid_name_reg_ent_ty;
+  LLVMValueRef current_async_frame;
+  LLVMTypeRef current_async_frame_type;
+  LLVMValueRef current_async_resume_fn;
+  /* 正在发射的异步函数体 AST */
+  zan_ast_node_t *current_async_body;
+  /* 异步方法声明返回类型，用于协程结果槽编解码 */
+  zan_type_t *current_async_ret_type;
+  /* await 协程状态机上下文：状态分发 switch、下一状态编号及恢复块 */
+  LLVMValueRef current_async_switch;
+  LLVMValueRef current_async_cancel_switch;
+  int current_async_next_state;
+  int current_async_sub_base;
+  int current_async_sub_next;
+  int current_async_rval_slot;
+  zan_async_slot_t *current_async_slots;
+  int current_async_slot_count;
+  /* 异步协程完成汇聚块：共享析构局部变量并发布完成状态 */
+  int current_async_frame_local_count;
+  LLVMBasicBlockRef current_async_complete_bb;
+  LLVMValueRef current_async_result_phi;
+  LLVMBasicBlockRef current_async_suspend_ret_bb;
+  LLVMBasicBlockRef current_async_requeue_bb;
+  LLVMBasicBlockRef current_async_cancel_bb;
+  LLVMBasicBlockRef current_async_rethrow_bb;
+  LLVMBasicBlockRef current_async_sub_rethrow_bb;
+  LLVMValueRef current_async_sub_rethrow_phi_sub;
+  LLVMValueRef current_async_sub_rethrow_phi_ev;
+  LLVMValueRef current_async_state_ptr;
+  LLVMValueRef current_async_cancel_ptr;
+  LLVMValueRef current_async_self_i8;
+  LLVMValueRef current_async_self_int; /* cached (uintptr_t)(i8*)frame */
+  LLVMValueRef current_async_child_ptr;
+  LLVMValueRef current_async_sub_slot_ptr;
+  LLVMValueRef current_async_result_ptr;
+  void *function_compactor;
+  LLVMValueRef current_async_eh_entry;
+  LLVMBasicBlockRef current_async_exc_bb;
+  LLVMValueRef current_async_rearm_switch;
+  /* 异常处理器重新布防块：恢复调用帧异常簿记 */
+  LLVMValueRef current_async_rearm_init_switch;
+  LLVMBasicBlockRef current_async_rearm_next_bb;
+  int current_async_handler_next;
+  /* 协程帧内异常处理器槽位数 */
+  int current_async_handler_cap;
+  int current_async_try_count;
+  /* 协程内 foreach 编号，索引常驻帧槽 */
+  int current_async_foreach_next;
+  /* 协程帧持有的接收者强引用（析构时释放） */
+  int current_async_this_owned;
+  zan_type_t *current_async_this_type;
 
-    LLVMTypeRef  eh_state_ty;
-    LLVMValueRef eh_state_owner;
-    LLVMValueRef eh_state_cached;
-    LLVMValueRef eh_state_fields[8];
+  zan_istr_t *extern_libs;
+  int extern_lib_count;
+  int extern_lib_cap;
+  /* DllImport 外部库符号列表（用于跨平台链接检测） */
+  struct {
+    zan_istr_t lib;
+    zan_istr_t name; /* 外部符号名称 */
+  } *extern_fns;
+  int extern_fn_count;
+  int extern_fn_cap;
+  char **abi_pending;
+  int abi_pending_count;
+  int abi_pending_cap;
 
-    char target_triple[128];
-    /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
-    const char *cpu_profile; /* explicit x86-64 profile, or NULL */
-    char target_cpu[64];
-    char target_features[192];
-    bool target_is_windows;
-    bool target_is_macos;     /* Darwin 平台 stdio 流导出符号适配 */
-    bool target_is_ios;       /* iOS 平台生命周期与 UIKit 代理适配 */
-    bool target_is_wasm;      /* WebAssembly 原生异常处理模式标记 */
-    bool external_async_executor;
-    bool mf_native;           /* 本机宿主平台构建标记 (x64/arm64) */
+  LLVMTypeRef eh_state_ty;
+  LLVMValueRef eh_state_owner;
+  LLVMValueRef eh_state_cached;
+  LLVMValueRef eh_state_fields[8];
 
-    char prefix_cache[128][64];
-    bool prefix_cache_val[128];
-    int  prefix_cache_count;
+  char target_triple[128];
+  /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
+  const char *cpu_profile; /* explicit x86-64 profile, or NULL */
+  char target_cpu[64];
+  char target_features[192];
+  bool target_is_windows;
+  bool target_is_macos; /* Darwin 平台 stdio 流导出符号适配 */
+  bool target_is_ios;   /* iOS 平台生命周期与 UIKit 代理适配 */
+  bool target_is_wasm;  /* WebAssembly 原生异常处理模式标记 */
+  bool external_async_executor;
+  bool mf_native; /* 本机宿主平台构建标记 (x64/arm64) */
 
-    /* DWARF 调试信息构建器状态 (-g 选项激活) */
-    bool             emit_debug;
-    LLVMDIBuilderRef di_builder;
-    LLVMMetadataRef  di_cu;
-    LLVMMetadataRef *di_files;
-    int              di_file_cap;
-    uint32_t         di_cur_line;
-    uint32_t         di_cur_file;
-    uint32_t         di_cur_col;
-    /* 最近一次设置过的调试位置（di_clear 只清"当前"位置，不动这两个）。
-       惰性构建的辅助函数——类的释放体、集合/数组的释放体——会在用户
-       代码中间被建出来，入口 di_clear 把当前位置清掉后不恢复，于是同
-       一表达式里后面的调用就丢了 !dbg。di_ensure_loc 用它把位置补回
-       去；di_last_loc_fn 记着这个位置属于哪个函数，免得挪到别的函数
-       里去（那会触发 LLVM 另一条校验）。 */
-    LLVMMetadataRef  di_last_loc;
-    LLVMValueRef     di_last_loc_fn;
+  char prefix_cache[128][64];
+  bool prefix_cache_val[128];
+  int prefix_cache_count;
 
-    /* ARC 语句控制流作用域嵌套深度 */
-    int arc_stmt_depth;
+  /* DWARF 调试信息构建器状态 (-g 选项激活) */
+  bool emit_debug;
+  LLVMDIBuilderRef di_builder;
+  LLVMMetadataRef di_cu;
+  LLVMMetadataRef *di_files;
+  int di_file_cap;
+  uint32_t di_cur_line;
+  uint32_t di_cur_file;
+  uint32_t di_cur_col;
+  /* 最近一次设置过的调试位置（di_clear 只清"当前"位置，不动这两个）。
+     惰性构建的辅助函数——类的释放体、集合/数组的释放体——会在用户
+     代码中间被建出来，入口 di_clear 把当前位置清掉后不恢复，于是同
+     一表达式里后面的调用就丢了 !dbg。di_ensure_loc 用它把位置补回
+     去；di_last_loc_fn 记着这个位置属于哪个函数，免得挪到别的函数
+     里去（那会触发 LLVM 另一条校验）。 */
+  LLVMMetadataRef di_last_loc;
+  LLVMValueRef di_last_loc_fn;
 
-    struct zan_body_write_entry {
-        zan_ast_node_t *body;
-        zan_istr_t      name;
-        unsigned char   written;
-        unsigned char   lam_written;
-        unsigned char   lam_captured;
-        unsigned char   known;
-    } *body_write_memo;
-    unsigned body_write_memo_cap;
-    unsigned body_write_memo_count;
-    zan_ast_node_t *body_write_scan_done;
+  /* ARC 语句控制流作用域嵌套深度 */
+  int arc_stmt_depth;
 
-    /* 流式分片状态：发射后即时回收函数体至文本缓冲区以控制内存峰值 */
-    bool enable_streaming_shard;
-    int  streaming_shard_count;
-    int  streaming_shard_cap;
-    struct zan_shard_buf {
-        char         *text;
-        size_t        len;
-        size_t        cap;
-        int           fn_count;
-        LLVMValueRef *fns;
-        int           fns_cap;
-    } *streaming_shards;
-    int streaming_shard_cur_fns;
+  struct zan_body_write_entry {
+    zan_ast_node_t *body;
+    zan_istr_t name;
+    unsigned char written;
+    unsigned char lam_written;
+    unsigned char lam_captured;
+    unsigned char known;
+  } *body_write_memo;
+  unsigned body_write_memo_cap;
+  unsigned body_write_memo_count;
+  zan_ast_node_t *body_write_scan_done;
+
+  /* 流式分片状态：发射后即时回收函数体至文本缓冲区以控制内存峰值 */
+  bool enable_streaming_shard;
+  int streaming_shard_count;
+  int streaming_shard_cap;
+  struct zan_shard_buf {
+    char *text;
+    size_t len;
+    size_t cap;
+    int fn_count;
+    LLVMValueRef *fns;
+    int fns_cap;
+  } *streaming_shards;
+  int streaming_shard_cur_fns;
 };
 
-void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn, const char *txt);
+typedef enum {
+  GCTX_SLOT_TYPEINFO = 1,   /* i8* (typeof(T) -> Reflection.Type record) */
+  GCTX_SLOT_TYPENAME = 2,   /* i8* (const C-string of concrete T) */
+  GCTX_SLOT_NEW_TP = 3,     /* i8* (*)(void) or thunk for new T() */
+  GCTX_SLOT_STATIC_FIELD = 4, /* i8* -> concrete static field global */
+  GCTX_SLOT_SINIT_FN = 5,   /* void (*)(void) concrete cctor / static init */
+  GCTX_SLOT_VTABLE = 6,     /* i8* concrete vtable global */
+  GCTX_SLOT_ARC_DESC = 7,   /* i8* concrete &desc_gv[site] (for new Coll<T>/Cls<T>) */
+  GCTX_SLOT_CHILD_GCTX = 8, /* i8* child __gctx for nested __Canon generic class/method */
+} zan_gctx_slot_kind_t;
+
+typedef struct zan_gctx_slot {
+  zan_gctx_slot_kind_t kind;
+  zan_symbol_t *sym;        /* target class/field/method/etc. */
+  zan_type_t *template_ty;  /* open template type (uses canon_tp_kind/idx) */
+  zan_type_t **bind;        /* open method bind args (for CHILD_GCTX method spec) */
+  int bindc;
+  int site_id;              /* reserved leak/ARC site or coll kind */
+  int coll_kind;            /* 0 = class, 1 = List, 2 = Dict, 3 = Set, 4 = Queue, 5 = Stack */
+} zan_gctx_slot_t;
+
+typedef struct zan_gctx_entry {
+  bool is_method_spec;
+  zan_symbol_t *sym;        /* class sym (if !is_method_spec) or method sym */
+  zan_type_t *concrete_inst;/* concrete class inst (or owner_inst for mspec) */
+  zan_type_t *canon_inst;   /* canonicalized inst */
+  zan_type_t **concrete_bind;
+  int bindc;
+  zan_type_t **canon_bind;
+  LLVMValueRef gv;          /* [N x i8*] global */
+  int owner_idx;            /* index of canonical owner entry (-1 if self is owner) */
+  zan_gctx_slot_t *slots;   /* recorded on canonical owner */
+  int slot_count;
+  int slot_cap;
+  int materialized_slots;
+  LLVMTypeRef gv_ty;
+} zan_gctx_entry_t;
+
+void zan_irgen_shard_buf_append(zan_irgen_t *g, LLVMValueRef fn,
+                                const char *txt);
 void zan_irgen_shard_buf_free(zan_irgen_t *g);
 bool zan_irgen_shard_harvest_fn(zan_irgen_t *g, LLVMValueRef fn);
 void zan_irgen_shard_harvest_stats(void);
 /* 插值与 ToString("F2") 共用的 spec→printf 映射（irgen_expr.c 定义） */
 int interp_format_to_printf(const zan_istr_t *spec, bool is_float,
-                            bool is_ulong, bool *want_float,
-                            char *out, size_t outcap);
+                            bool is_ulong, bool *want_float, char *out,
+                            size_t outcap);
 
 bool emit_target_is_x86(const zan_irgen_t *g);
-LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v, unsigned lanes);
-LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a, LLVMValueRef b, unsigned lanes);
+LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
+                                    unsigned lanes);
+LLVMValueRef emit_byte_eq_mask_i64(zan_irgen_t *g, LLVMValueRef a,
+                                   LLVMValueRef b, unsigned lanes);
 
 static inline void zan_set_module_local(LLVMValueRef fn) {
-    if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
+  if (fn)
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
 }
 
-static inline void zan_set_odr_comdat(zan_irgen_t *g, LLVMValueRef val, const char *name) {
-    if (!val || !g) return;
-    LLVMSetLinkage(val, LLVMLinkOnceODRLinkage);
-    if (!g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
-        LLVMComdatRef group = LLVMGetOrInsertComdat(g->mod, name);
-        LLVMSetComdatSelectionKind(group, LLVMAnyComdatSelectionKind);
-        LLVMSetComdat(val, group);
-    }
+static inline void zan_set_odr_comdat(zan_irgen_t *g, LLVMValueRef val,
+                                      const char *name) {
+  if (!val || !g)
+    return;
+  LLVMSetLinkage(val, LLVMLinkOnceODRLinkage);
+  if (!g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
+    LLVMComdatRef group = LLVMGetOrInsertComdat(g->mod, name);
+    LLVMSetComdatSelectionKind(group, LLVMAnyComdatSelectionKind);
+    LLVMSetComdat(val, group);
+  }
 }
 
 /* 构建位置与调试信息保护栈（B-ID93）：跨块/跨函数插入辅助指令后 1:1 恢复 */
 typedef struct {
-    LLVMBasicBlockRef bb;
-    LLVMValueRef      fn;
-    LLVMMetadataRef   dl;
+  LLVMBasicBlockRef bb;
+  LLVMValueRef fn;
+  LLVMMetadataRef dl;
 } zan_builder_point_t;
 
 static inline zan_builder_point_t zan_builder_save(zan_irgen_t *g) {
-    zan_builder_point_t pt;
-    pt.bb = (g && g->builder) ? LLVMGetInsertBlock(g->builder) : NULL;
-    pt.fn = g ? g->current_fn : NULL;
-    pt.dl = (g && g->emit_debug && g->builder) ? LLVMGetCurrentDebugLocation2(g->builder) : NULL;
-    return pt;
+  zan_builder_point_t pt;
+  pt.bb = (g && g->builder) ? LLVMGetInsertBlock(g->builder) : NULL;
+  pt.fn = g ? g->current_fn : NULL;
+  pt.dl = (g && g->emit_debug && g->builder)
+              ? LLVMGetCurrentDebugLocation2(g->builder)
+              : NULL;
+  return pt;
 }
 
 static inline void zan_builder_restore(zan_irgen_t *g, zan_builder_point_t pt) {
-    if (!g || !g->builder) return;
-    g->current_fn = pt.fn;
-    if (pt.bb) LLVMPositionBuilderAtEnd(g->builder, pt.bb);
-    if (g->emit_debug) LLVMSetCurrentDebugLocation2(g->builder, pt.dl);
+  if (!g || !g->builder)
+    return;
+  g->current_fn = pt.fn;
+  if (pt.bb)
+    LLVMPositionBuilderAtEnd(g->builder, pt.bb);
+  if (g->emit_debug)
+    LLVMSetCurrentDebugLocation2(g->builder, pt.dl);
 }
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             zan_diag_t *diag, zan_binder_t *binder,
-                            const char *module_name,
-                            const char *target_triple,
-                            bool target_is_windows, bool external_async_executor,
-                            bool check_leaks, bool runtime_checks,
-                            bool arc_guard, bool arc_net);
+                            const char *module_name, const char *target_triple,
+                            bool target_is_windows,
+                            bool external_async_executor, bool check_leaks,
+                            bool runtime_checks, bool arc_guard, bool arc_net);
 void zan_irgen_destroy(zan_irgen_t *g);
 void zan_irgen_release_llvm(zan_irgen_t *g);
 
 /* 编译器生成的保护文本驻留符号 */
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
 
-LLVMTypeRef  get_decimal_type(zan_irgen_t *g);
+LLVMTypeRef get_decimal_type(zan_irgen_t *g);
 
-void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw);
+void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn,
+                              LLVMValueRef raw);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
 /* 模块初始化解密构造函数 (.ctors) 发射 */
@@ -873,33 +989,36 @@ zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
 
 typedef struct zan_mf_fn {
-    const char *name;
-    unsigned    blocks, insns;
-    unsigned char defined, internal_linkage, varargs;
-    unsigned char indirect_call, addr_taken;
-    unsigned char is_async, is_spec, virtual_dispatch, simple_abi;
-    unsigned char eligible, clean_root;
-    unsigned char kind;
-    int reg_idx;
-    /* 直接调用边图：函数清单索引及引用的全局符号 */
-    int        *calls;     int call_cnt, call_cap;
-    const char **exts;     int ext_cnt,  ext_cap;
-    const char **globs;    int glob_cnt, glob_cap;
+  const char *name;
+  unsigned blocks, insns;
+  unsigned char defined, internal_linkage, varargs;
+  unsigned char indirect_call, addr_taken;
+  unsigned char is_async, is_spec, virtual_dispatch, simple_abi;
+  unsigned char eligible, clean_root;
+  unsigned char kind;
+  int reg_idx;
+  /* 直接调用边图：函数清单索引及引用的全局符号 */
+  int *calls;
+  int call_cnt, call_cap;
+  const char **exts;
+  int ext_cnt, ext_cap;
+  const char **globs;
+  int glob_cnt, glob_cap;
 } zan_mf_fn;
 
 typedef struct zan_cg_manifest {
-    zan_mf_fn *fns;
-    int fn_count;
-    unsigned long long total_insns;
-    int defined_count, extern_count, global_count;
+  zan_mf_fn *fns;
+  int fn_count;
+  unsigned long long total_insns;
+  int defined_count, extern_count, global_count;
 } zan_cg_manifest_t;
 
 /* 目标是否为原生宿主架构 (x64/arm64) */
 void zan_irgen_manifest_build(zan_irgen_t *g, zan_cg_manifest_t *m,
                               bool native);
 void zan_irgen_manifest_report(zan_irgen_t *g, const zan_cg_manifest_t *m);
-int  zan_irgen_manifest_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
-                                   const char *path);
+int zan_irgen_manifest_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
+                                  const char *path);
 void zan_irgen_manifest_free(zan_cg_manifest_t *m);
 
 int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
@@ -907,9 +1026,11 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 
 void zan_irgen_bind_target(zan_irgen_t *g);
 void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod);
-zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRef *out_tm);
+zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g,
+                                             LLVMTargetMachineRef *out_tm);
 /* 注册本机构建链接进来的 LLVM 后端。crosscomp.c 查"这个 triple 能不能发码"
-   之前必须先调它：后端没注册时 LLVMGetTargetFromTriple 对所有目标都返回失败。 */
+   之前必须先调它：后端没注册时 LLVMGetTargetFromTriple 对所有目标都返回失败。
+ */
 void zan_irgen_init_llvm_targets(void);
 
 /* DllImport 外部库符号列表（用于跨平台链接检测） */

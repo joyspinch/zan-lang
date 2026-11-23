@@ -28,6 +28,7 @@ typedef long LONG;
 typedef pthread_mutex_t CRITICAL_SECTION;
 static inline void InitializeCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_init(cs, NULL); }
 static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lock(cs); }
+static inline int TryEnterCriticalSection(CRITICAL_SECTION *cs) { return pthread_mutex_trylock(cs) == 0; }
 static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(cs); }
 static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(cs); }
 

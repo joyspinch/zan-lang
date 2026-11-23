@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "rt_co.h"
 
-#define ZAN_IO_READ  1
+#define ZAN_IO_READ 1
 #define ZAN_IO_WRITE 2
 
 /* ---- lifecycle ---- */
@@ -13,11 +13,11 @@ void zan_io_shutdown(void);
 void zan_io_socket_cleanup(void);
 int64_t zan_io_socket_send(intptr_t fd, const void *buf, int64_t len,
                            int32_t flags);
-int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len,
-                           int32_t flags);
+int64_t zan_io_socket_recv(intptr_t fd, void *buf, int64_t len, int32_t flags);
 int32_t zan_io_socket_ready(intptr_t fd, int32_t write_ready);
 
-/* 探测非阻塞连接结果：成功返回 0，失败返回 SO_ERROR 错误码，仍在连接中返回 -1 */
+/* 探测非阻塞连接结果：成功返回 0，失败返回 SO_ERROR 错误码，仍在连接中返回 -1
+ */
 int32_t zan_io_connect_status(intptr_t fd);
 
 /* 检查是否`fd` still refers to an open socket */
@@ -43,18 +43,22 @@ int64_t zan_io_resolve_all_async(intptr_t name_ptr, int32_t port,
 int32_t zan_io_sockaddr_family(const void *sa, int32_t len);
 /* 检查目标地址是否为公网可路由地址（排除本地回环） */
 int32_t zan_io_sockaddr_is_safe(const void *sa, int32_t len,
-                               int32_t allow_loopback);
-/* 检查目标地址类别，支持配置允许回环 (allow_loopback) 和允许私网 (allow_private) */
+                                int32_t allow_loopback);
+/* 检查目标地址类别，支持配置允许回环 (allow_loopback) 和允许私网
+ * (allow_private) */
 int32_t zan_io_sockaddr_is_safe_ex(const void *sa, int32_t len,
-                                  int32_t allow_loopback, int32_t allow_private);
+                                   int32_t allow_loopback,
+                                   int32_t allow_private);
 
-/* 启动底层 sockaddr 原始连接：已连接返回 0，进行中返回 EINPROGRESS，错误返回正数错误码 */
+/* 启动底层 sockaddr 原始连接：已连接返回 0，进行中返回
+ * EINPROGRESS，错误返回正数错误码 */
 int32_t zan_io_connect_sa_start(intptr_t fd, const void *sa, int32_t salen);
 /* 工作线程安全异步 ABI：原始 sockaddr 连接 */
 int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
-                           int32_t timeout_ms);
+                          int32_t timeout_ms);
 
-/* 将 sockaddr 二进制地址格式化为标准 IP 字符串 (IPv4 点分十进制 / IPv6 冒号十六进制) */
+/* 将 sockaddr 二进制地址格式化为标准 IP 字符串 (IPv4 点分十进制 / IPv6
+ * 冒号十六进制) */
 const char *zan_io_sockaddr_ip_str(const void *sa);
 
 void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
@@ -64,12 +68,14 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
 #if defined(_WIN32)
 /* 从 Windows PCCERT_CONTEXT 读取编码的 DER 证书指针与长度 */
 const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len);
-int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
-                                       int32_t count, const char *host, int32_t host_len);
+int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs,
+                                         int32_t total_len, int32_t count,
+                                         const char *host, int32_t host_len);
 #endif
 
 /* 无栈协程 (CPS 状态机) 运行时 ABI：支撑 await 原语在反应堆上的挂起与恢复 */
-void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame, zan_co_step_t step);
+void zan_io_wait_co(intptr_t fd, int32_t interest, void *frame,
+                    zan_co_step_t step);
 
 void zan_io_recv_co(intptr_t fd, void *buf, int32_t len, void *frame,
                     zan_co_step_t step, int64_t *out_n);
@@ -86,24 +92,25 @@ void zan_io_resolve_co(const char *hostname, void *frame, zan_co_step_t step,
                        int32_t *out);
 
 enum zan_blocking_status {
-    ZAN_BLOCKING_OK = 0,
-    ZAN_BLOCKING_QUEUE_FULL,
-    ZAN_BLOCKING_THREAD_FAILED,
-    ZAN_BLOCKING_NO_MEMORY,
-    ZAN_BLOCKING_INVALID_CALL
+  ZAN_BLOCKING_OK = 0,
+  ZAN_BLOCKING_QUEUE_FULL,
+  ZAN_BLOCKING_THREAD_FAILED,
+  ZAN_BLOCKING_NO_MEMORY,
+  ZAN_BLOCKING_INVALID_CALL
 };
 
 /* Both slots belong to the suspended frame. Status is written before wake;
  * out is optional for void and is written only on success. */
-void zan_rt_blocking_checked_co(void *fn, int32_t argc,
-                                int64_t a0, int64_t a1, int64_t a2, int64_t a3,
-                                void *frame, zan_co_step_t step, int64_t *out,
+void zan_rt_blocking_checked_co(void *fn, int32_t argc, int64_t a0, int64_t a1,
+                                int64_t a2, int64_t a3, void *frame,
+                                zan_co_step_t step, int64_t *out,
                                 int32_t *status);
 
-/* Legacy native ABI for previously emitted code. Submission failure is fatal. */
-void zan_rt_blocking_co(void *fn, int32_t argc,
-                        int64_t a0, int64_t a1, int64_t a2, int64_t a3,
-                        void *frame, zan_co_step_t step, int64_t *out);
+/* Legacy native ABI for previously emitted code. Submission failure is fatal.
+ */
+void zan_rt_blocking_co(void *fn, int32_t argc, int64_t a0, int64_t a1,
+                        int64_t a2, int64_t a3, void *frame, zan_co_step_t step,
+                        int64_t *out);
 
 int32_t zan_io_pump(void);
 
@@ -115,7 +122,6 @@ int32_t zan_io_pump_timeout(int64_t timeout_ms);
  * （A470）：裸的 Sleep/poll 会把整段时间变成"谁都不派发"，别的协程的
  * 定时器会被拖到等待结束才到期。 */
 void zan_co_sync_sleep(long long ms);
-
 
 /* 挂起当前协程直至 fd 可读：成功返回 0，失败返回 -1 */
 int64_t zan_io_wait_readable(intptr_t fd);
@@ -138,12 +144,14 @@ int32_t zan_io_set_nonblocking(intptr_t fd);
 
 /* 协程计数信号门原语 */
 long long zan_gate_new(void);
-/* arm: timed registration, paired with park_ticket and ticket_signal_and_release.
- * prepare: untimed registration, paired with park_ticket. Registrations pin the
- * gate across Close and may complete before park; tickets never use thread TLS. */
+/* arm: timed registration, paired with park_ticket and
+ * ticket_signal_and_release. prepare: untimed registration, paired with
+ * park_ticket. Registrations pin the gate across Close and may complete before
+ * park; tickets never use thread TLS. */
 long long zan_gate_arm(long long handle);
 long long zan_gate_prepare(long long handle);
-void zan_gate_park_ticket(long long handle, long long ticket, void *frame, zan_co_step_t step);
+void zan_gate_park_ticket(long long handle, long long ticket, void *frame,
+                          zan_co_step_t step);
 void zan_gate_park(long long handle, void *frame, zan_co_step_t step);
 void zan_gate_signal(long long handle);
 void zan_gate_signal_all(long long handle);

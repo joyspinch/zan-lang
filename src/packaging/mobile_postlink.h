@@ -4,24 +4,24 @@
 #include <stdbool.h>
 
 typedef struct {
-    const char *input_path;
-    const char *linked_path;
-    const char *staged_path;
-    const char *apk_path;
-    const char *apk_package;
-    const char *apk_label;
-    bool apk_arm64;
-    bool quiet;
-    int driver_count;
-    const char (*driver_dirs)[1024];
-    const char *const *driver_names;
-    const int *driver_name_lengths;
-    int android_permission_count;
-    const char (*android_permissions)[128];
-    const char *ipa_path;
-    const char *ipa_name;
-    const char *ipa_bundle_id;
-    const char *icon_path;
+  const char *input_path;
+  const char *linked_path;
+  const char *staged_path;
+  const char *apk_path;
+  const char *apk_package;
+  const char *apk_label;
+  bool apk_arm64;
+  bool quiet;
+  int driver_count;
+  const char (*driver_dirs)[1024];
+  const char *const *driver_names;
+  const int *driver_name_lengths;
+  int android_permission_count;
+  const char (*android_permissions)[128];
+  const char *ipa_path;
+  const char *ipa_name;
+  const char *ipa_bundle_id;
+  const char *icon_path;
 } zan_mobile_postlink_options_t;
 
 /* Borrow the inputs for this call. Select an APK or IPA by its final path and

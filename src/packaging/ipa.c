@@ -18,611 +18,669 @@
 #endif
 
 typedef struct {
-    unsigned char *data;
-    size_t len;
-    size_t cap;
+  unsigned char *data;
+  size_t len;
+  size_t cap;
 } ipa_buf_t;
 
 static void buf_init(ipa_buf_t *b) {
-    b->data = NULL;
-    b->len = 0;
-    b->cap = 0;
+  b->data = NULL;
+  b->len = 0;
+  b->cap = 0;
 }
 
 static void buf_free(ipa_buf_t *b) {
-    if (b->data) free(b->data);
-    b->data = NULL;
-    b->len = b->cap = 0;
+  if (b->data)
+    free(b->data);
+  b->data = NULL;
+  b->len = b->cap = 0;
 }
 
 static void buf_write(ipa_buf_t *b, const void *p, size_t n) {
-    if (n == 0) return;
-    if (b->len + n > b->cap) {
-        size_t nc = b->cap ? b->cap * 2 : 4096;
-        while (nc < b->len + n) nc *= 2;
-        unsigned char *nd = (unsigned char *)realloc(b->data, nc);
-        if (!nd) {
-            fprintf(stderr, "error: out of memory in IPA packager\n");
-            exit(1);
-        }
-        b->data = nd;
-        b->cap = nc;
+  if (n == 0)
+    return;
+  if (b->len + n > b->cap) {
+    size_t nc = b->cap ? b->cap * 2 : 4096;
+    while (nc < b->len + n)
+      nc *= 2;
+    unsigned char *nd = (unsigned char *)realloc(b->data, nc);
+    if (!nd) {
+      fprintf(stderr, "error: out of memory in IPA packager\n");
+      exit(1);
     }
-    memcpy(b->data + b->len, p, n);
-    b->len += n;
+    b->data = nd;
+    b->cap = nc;
+  }
+  memcpy(b->data + b->len, p, n);
+  b->len += n;
 }
 
 static void buf_u16(ipa_buf_t *b, uint16_t v) { buf_write(b, &v, 2); }
 static void buf_u32(ipa_buf_t *b, uint32_t v) { buf_write(b, &v, 4); }
 
 static uint32_t ipa_crc32(const unsigned char *d, size_t n) {
-    static uint32_t table[256];
-    static int have = 0;
-    if (!have) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            table[i] = c;
-        }
-        have = 1;
+  static uint32_t table[256];
+  static int have = 0;
+  if (!have) {
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++)
+        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      table[i] = c;
     }
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    have = 1;
+  }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++)
+    c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
 }
 
 typedef struct {
-    char name[256];
-    size_t offset;
-    uint32_t crc;
-    uint32_t uncomp_size;
-    uint32_t comp_size;
-    uint16_t method;
-    uint32_t mode;
+  char name[256];
+  size_t offset;
+  uint32_t crc;
+  uint32_t uncomp_size;
+  uint32_t comp_size;
+  uint16_t method;
+  uint32_t mode;
 } ipa_zip_ent_t;
 
 typedef struct {
-    ipa_buf_t out;
-    ipa_zip_ent_t *ents;
-    int nent;
-    int cap;
+  ipa_buf_t out;
+  ipa_zip_ent_t *ents;
+  int nent;
+  int cap;
 } ipa_zip_t;
 
 static void zip_start(ipa_zip_t *z) {
-    buf_init(&z->out);
-    z->cap = 32;
-    z->nent = 0;
-    z->ents = (ipa_zip_ent_t *)calloc(z->cap, sizeof(ipa_zip_ent_t));
-    if (!z->ents) {
-        fprintf(stderr, "error: out of memory in zip_start\n");
-        exit(1);
-    }
+  buf_init(&z->out);
+  z->cap = 32;
+  z->nent = 0;
+  z->ents = (ipa_zip_ent_t *)calloc(z->cap, sizeof(ipa_zip_ent_t));
+  if (!z->ents) {
+    fprintf(stderr, "error: out of memory in zip_start\n");
+    exit(1);
+  }
 }
 
 static void zip_destroy(ipa_zip_t *z) {
-    buf_free(&z->out);
-    if (z->ents) free(z->ents);
-    z->ents = NULL;
+  buf_free(&z->out);
+  if (z->ents)
+    free(z->ents);
+  z->ents = NULL;
 }
 
-static int zip_add(ipa_zip_t *z, const char *name, const void *data, size_t sz, uint32_t mode) {
-    if (z->nent >= z->cap) {
-        int ncap = z->cap * 2;
-        ipa_zip_ent_t *ne = (ipa_zip_ent_t *)realloc(z->ents, sizeof(ipa_zip_ent_t) * ncap);
-        if (!ne) return -1;
-        z->ents = ne;
-        z->cap = ncap;
-    }
+static int zip_add(ipa_zip_t *z, const char *name, const void *data, size_t sz,
+                   uint32_t mode) {
+  if (z->nent >= z->cap) {
+    int ncap = z->cap * 2;
+    ipa_zip_ent_t *ne =
+        (ipa_zip_ent_t *)realloc(z->ents, sizeof(ipa_zip_ent_t) * ncap);
+    if (!ne)
+      return -1;
+    z->ents = ne;
+    z->cap = ncap;
+  }
 
-    ipa_zip_ent_t *e = &z->ents[z->nent];
-    if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name",
-                        "%s", name) != 0) return -1;
-    e->uncomp_size = (uint32_t)sz;
-    e->crc = ipa_crc32((const unsigned char *)data, sz);
-    e->offset = z->out.len;
-    e->mode = mode;
+  ipa_zip_ent_t *e = &z->ents[z->nent];
+  if (zan_fmt_checked(e->name, sizeof(e->name), "zip entry name", "%s", name) !=
+      0)
+    return -1;
+  e->uncomp_size = (uint32_t)sz;
+  e->crc = ipa_crc32((const unsigned char *)data, sz);
+  e->offset = z->out.len;
+  e->mode = mode;
 
-    size_t comp_len = 0;
-    void *comp = NULL;
-    if (sz > 64) {
-        comp = tdefl_compress_mem_to_heap(data, sz, &comp_len, TDEFL_DEFAULT_MAX_PROBES);
-    }
+  size_t comp_len = 0;
+  void *comp = NULL;
+  if (sz > 64) {
+    comp = tdefl_compress_mem_to_heap(data, sz, &comp_len,
+                                      TDEFL_DEFAULT_MAX_PROBES);
+  }
 
-    const void *payload = data;
-    if (comp && comp_len < sz) {
-        e->method = 8; /* Deflate */
-        e->comp_size = (uint32_t)comp_len;
-        payload = comp;
-    } else {
-        e->method = 0; /* Store */
-        e->comp_size = (uint32_t)sz;
-    }
+  const void *payload = data;
+  if (comp && comp_len < sz) {
+    e->method = 8; /* Deflate */
+    e->comp_size = (uint32_t)comp_len;
+    payload = comp;
+  } else {
+    e->method = 0; /* Store */
+    e->comp_size = (uint32_t)sz;
+  }
 
-    size_t name_len = strlen(name);
+  size_t name_len = strlen(name);
 
-    buf_u32(&z->out, 0x04034b50u);
+  buf_u32(&z->out, 0x04034b50u);
+  buf_u16(&z->out, 20);
+  buf_u16(&z->out, 0);         /* flags */
+  buf_u16(&z->out, e->method); /* method: 8 (deflate) or 0 (store) */
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, 0x21);
+  buf_u32(&z->out, e->crc);
+  buf_u32(&z->out, e->comp_size);
+  buf_u32(&z->out, e->uncomp_size);
+  buf_u16(&z->out, (uint16_t)name_len);
+  buf_u16(&z->out, 0);
+  buf_write(&z->out, name, name_len);
+  buf_write(&z->out, payload, e->comp_size);
+
+  if (comp)
+    free(comp);
+
+  z->nent++;
+  return 0;
+}
+
+static int zip_finish(ipa_zip_t *z) {
+  size_t cen = z->out.len;
+  for (int i = 0; i < z->nent; i++) {
+    ipa_zip_ent_t *e = &z->ents[i];
+    size_t name_len = strlen(e->name);
+
+    buf_u32(&z->out, 0x02014b50u);
+    buf_u16(&z->out, 0x0314);
     buf_u16(&z->out, 20);
-    buf_u16(&z->out, 0);            /* flags */
-    buf_u16(&z->out, e->method);    /* method: 8 (deflate) or 0 (store) */
+    buf_u16(&z->out, 0);         /* flags */
+    buf_u16(&z->out, e->method); /* compression: deflate / store */
     buf_u16(&z->out, 0);
     buf_u16(&z->out, 0x21);
     buf_u32(&z->out, e->crc);
     buf_u32(&z->out, e->comp_size);
     buf_u32(&z->out, e->uncomp_size);
     buf_u16(&z->out, (uint16_t)name_len);
+    buf_u16(&z->out, 0); /* extra */
+    buf_u16(&z->out, 0); /* comment */
+    buf_u16(&z->out, 0); /* disk # */
     buf_u16(&z->out, 0);
-    buf_write(&z->out, name, name_len);
-    buf_write(&z->out, payload, e->comp_size);
+    uint32_t ext_attr = (e->mode ? e->mode : 0100644) << 16;
+    buf_u32(&z->out, ext_attr);
+    buf_u32(&z->out, (uint32_t)e->offset);
+    buf_write(&z->out, e->name, name_len);
+  }
 
-    if (comp) free(comp);
+  size_t cen_size = z->out.len - cen;
 
-    z->nent++;
-    return 0;
-}
-
-static int zip_finish(ipa_zip_t *z) {
-    size_t cen = z->out.len;
-    for (int i = 0; i < z->nent; i++) {
-        ipa_zip_ent_t *e = &z->ents[i];
-        size_t name_len = strlen(e->name);
-
-        buf_u32(&z->out, 0x02014b50u);
-        buf_u16(&z->out, 0x0314);
-        buf_u16(&z->out, 20);
-        buf_u16(&z->out, 0);        /* flags */
-        buf_u16(&z->out, e->method);/* compression: deflate / store */
-        buf_u16(&z->out, 0);
-        buf_u16(&z->out, 0x21);
-        buf_u32(&z->out, e->crc);
-        buf_u32(&z->out, e->comp_size);
-        buf_u32(&z->out, e->uncomp_size);
-        buf_u16(&z->out, (uint16_t)name_len);
-        buf_u16(&z->out, 0);        /* extra */
-        buf_u16(&z->out, 0);        /* comment */
-        buf_u16(&z->out, 0);        /* disk # */
-        buf_u16(&z->out, 0);
-        uint32_t ext_attr = (e->mode ? e->mode : 0100644) << 16;
-        buf_u32(&z->out, ext_attr);
-        buf_u32(&z->out, (uint32_t)e->offset);
-        buf_write(&z->out, e->name, name_len);
-    }
-
-    size_t cen_size = z->out.len - cen;
-
-    buf_u32(&z->out, 0x06054b50u);
-    buf_u16(&z->out, 0);
-    buf_u16(&z->out, 0);
-    buf_u16(&z->out, (uint16_t)z->nent);
-    buf_u16(&z->out, (uint16_t)z->nent);
-    buf_u32(&z->out, (uint32_t)cen_size);
-    buf_u32(&z->out, (uint32_t)cen);
-    buf_u16(&z->out, 0);
-    return 0;
+  buf_u32(&z->out, 0x06054b50u);
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, 0);
+  buf_u16(&z->out, (uint16_t)z->nent);
+  buf_u16(&z->out, (uint16_t)z->nent);
+  buf_u32(&z->out, (uint32_t)cen_size);
+  buf_u32(&z->out, (uint32_t)cen);
+  buf_u16(&z->out, 0);
+  return 0;
 }
 
 static unsigned char *read_file_bytes(const char *path, size_t *out_sz) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz < 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-    unsigned char *b = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
-    if (!b) { fclose(f); return NULL; }
-    if (sz > 0 && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
-        free(b);
-        fclose(f);
-        return NULL;
-    }
-    fclose(f);
-    *out_sz = (size_t)sz;
-    return b;
-}
-
-static unsigned char *extract_png_from_ico_or_png(const unsigned char *data, size_t sz, size_t *out_sz) {
-    if (!data || sz < 8) return NULL;
-    /* 1. Check if data is already a PNG: \x89PNG\r\n\x1a\n */
-    if (data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4e && data[3] == 0x47 &&
-        data[4] == 0x0d && data[5] == 0x0a && data[6] == 0x1a && data[7] == 0x0a) {
-        unsigned char *copy = (unsigned char *)malloc(sz);
-        if (copy) {
-            memcpy(copy, data, sz);
-            *out_sz = sz;
-        }
-        return copy;
-    }
-    /* 2. Check if data is Windows ICO (0x0000 0x0001) */
-    if (sz >= 22 && data[0] == 0 && data[1] == 0 && data[2] == 1 && data[3] == 0) {
-        uint16_t count = (uint16_t)(data[4] | (data[5] << 8));
-        int best_width = -1;
-        uint32_t best_offset = 0;
-        uint32_t best_size = 0;
-        for (uint16_t i = 0; i < count; i++) {
-            size_t entry_off = 6 + (size_t)i * 16;
-            if (entry_off + 16 > sz) break;
-            int w = data[entry_off];
-            if (w == 0) w = 256;
-            uint32_t img_sz = (uint32_t)(data[entry_off + 8] | (data[entry_off + 9] << 8) |
-                                        (data[entry_off + 10] << 16) | (data[entry_off + 11] << 24));
-            uint32_t img_off = (uint32_t)(data[entry_off + 12] | (data[entry_off + 13] << 8) |
-                                         (data[entry_off + 14] << 16) | (data[entry_off + 15] << 24));
-            if (img_off + img_sz <= sz && img_sz >= 8) {
-                const unsigned char *p = data + img_off;
-                if (p[0] == 0x89 && p[1] == 0x50 && p[2] == 0x4e && p[3] == 0x47) {
-                    if (w > best_width) {
-                        best_width = w;
-                        best_offset = img_off;
-                        best_size = img_sz;
-                    }
-                }
-            }
-        }
-        if (best_width > 0 && best_size > 0) {
-            unsigned char *copy = (unsigned char *)malloc(best_size);
-            if (copy) {
-                memcpy(copy, data + best_offset, best_size);
-                *out_sz = best_size;
-            }
-            return copy;
-        }
-    }
+  FILE *f = fopen(path, "rb");
+  if (!f)
     return NULL;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  if (sz < 0) {
+    fclose(f);
+    return NULL;
+  }
+  fseek(f, 0, SEEK_SET);
+  unsigned char *b = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
+  if (!b) {
+    fclose(f);
+    return NULL;
+  }
+  if (sz > 0 && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+    free(b);
+    fclose(f);
+    return NULL;
+  }
+  fclose(f);
+  *out_sz = (size_t)sz;
+  return b;
 }
 
-static int ipa_add_tree(ipa_zip_t *zip, const char *fs_dir, const char *zip_prefix) {
-#ifdef _WIN32
-    char pattern[1024];
-    if (zan_fmt_checked(pattern, sizeof(pattern), "asset search pattern",
-                        "%s\\*", fs_dir) != 0) return -1;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-        char sub_fs[1024];
-        if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
-                            "%s/%s", fs_dir, fd.cFileName) != 0) {
-            FindClose(h); return -1;
-        }
-        char sub_zip[1024];
-        if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
-                            "%s/%s", zip_prefix, fd.cFileName) != 0) {
-            FindClose(h); return -1;
-        }
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
-                FindClose(h); return -1;
-            }
-        } else {
-            size_t sz = 0;
-            unsigned char *d = read_file_bytes(sub_fs, &sz);
-            if (d) {
-                int rc = zip_add(zip, sub_zip, d, sz, 0100644);
-                free(d);
-                if (rc != 0) { FindClose(h); return -1; }
-            }
-        }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-#else
-    DIR *d = opendir(fs_dir);
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        char sub_fs[1024];
-        if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
-                            "%s/%s", fs_dir, e->d_name) != 0) {
-            closedir(d); return -1;
-        }
-        char sub_zip[1024];
-        if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
-                            "%s/%s", zip_prefix, e->d_name) != 0) {
-            closedir(d); return -1;
-        }
-        struct stat st;
-        if (stat(sub_fs, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
-                closedir(d); return -1;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            size_t sz = 0;
-            unsigned char *data = read_file_bytes(sub_fs, &sz);
-            if (data) {
-                int rc = zip_add(zip, sub_zip, data, sz, 0100644);
-                free(data);
-                if (rc != 0) { closedir(d); return -1; }
-            }
-        }
+static unsigned char *extract_png_from_ico_or_png(const unsigned char *data,
+                                                  size_t sz, size_t *out_sz) {
+  if (!data || sz < 8)
+    return NULL;
+  /* 1. Check if data is already a PNG: \x89PNG\r\n\x1a\n */
+  if (data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4e &&
+      data[3] == 0x47 && data[4] == 0x0d && data[5] == 0x0a &&
+      data[6] == 0x1a && data[7] == 0x0a) {
+    unsigned char *copy = (unsigned char *)malloc(sz);
+    if (copy) {
+      memcpy(copy, data, sz);
+      *out_sz = sz;
     }
-    closedir(d);
-#endif
+    return copy;
+  }
+  /* 2. Check if data is Windows ICO (0x0000 0x0001) */
+  if (sz >= 22 && data[0] == 0 && data[1] == 0 && data[2] == 1 &&
+      data[3] == 0) {
+    uint16_t count = (uint16_t)(data[4] | (data[5] << 8));
+    int best_width = -1;
+    uint32_t best_offset = 0;
+    uint32_t best_size = 0;
+    for (uint16_t i = 0; i < count; i++) {
+      size_t entry_off = 6 + (size_t)i * 16;
+      if (entry_off + 16 > sz)
+        break;
+      int w = data[entry_off];
+      if (w == 0)
+        w = 256;
+      uint32_t img_sz =
+          (uint32_t)(data[entry_off + 8] | (data[entry_off + 9] << 8) |
+                     (data[entry_off + 10] << 16) |
+                     (data[entry_off + 11] << 24));
+      uint32_t img_off =
+          (uint32_t)(data[entry_off + 12] | (data[entry_off + 13] << 8) |
+                     (data[entry_off + 14] << 16) |
+                     (data[entry_off + 15] << 24));
+      if (img_off + img_sz <= sz && img_sz >= 8) {
+        const unsigned char *p = data + img_off;
+        if (p[0] == 0x89 && p[1] == 0x50 && p[2] == 0x4e && p[3] == 0x47) {
+          if (w > best_width) {
+            best_width = w;
+            best_offset = img_off;
+            best_size = img_sz;
+          }
+        }
+      }
+    }
+    if (best_width > 0 && best_size > 0) {
+      unsigned char *copy = (unsigned char *)malloc(best_size);
+      if (copy) {
+        memcpy(copy, data + best_offset, best_size);
+        *out_sz = best_size;
+      }
+      return copy;
+    }
+  }
+  return NULL;
+}
+
+static int ipa_add_tree(ipa_zip_t *zip, const char *fs_dir,
+                        const char *zip_prefix) {
+#ifdef _WIN32
+  char pattern[1024];
+  if (zan_fmt_checked(pattern, sizeof(pattern), "asset search pattern", "%s\\*",
+                      fs_dir) != 0)
+    return -1;
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE)
     return 0;
+  do {
+    if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+      continue;
+    char sub_fs[1024];
+    if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
+                        "%s/%s", fs_dir, fd.cFileName) != 0) {
+      FindClose(h);
+      return -1;
+    }
+    char sub_zip[1024];
+    if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
+                        "%s/%s", zip_prefix, fd.cFileName) != 0) {
+      FindClose(h);
+      return -1;
+    }
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
+        FindClose(h);
+        return -1;
+      }
+    } else {
+      size_t sz = 0;
+      unsigned char *d = read_file_bytes(sub_fs, &sz);
+      if (d) {
+        int rc = zip_add(zip, sub_zip, d, sz, 0100644);
+        free(d);
+        if (rc != 0) {
+          FindClose(h);
+          return -1;
+        }
+      }
+    }
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  DIR *d = opendir(fs_dir);
+  if (!d)
+    return 0;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+      continue;
+    char sub_fs[1024];
+    if (zan_fmt_checked(sub_fs, sizeof(sub_fs), "asset filesystem path",
+                        "%s/%s", fs_dir, e->d_name) != 0) {
+      closedir(d);
+      return -1;
+    }
+    char sub_zip[1024];
+    if (zan_fmt_checked(sub_zip, sizeof(sub_zip), "asset zip entry name",
+                        "%s/%s", zip_prefix, e->d_name) != 0) {
+      closedir(d);
+      return -1;
+    }
+    struct stat st;
+    if (stat(sub_fs, &st) != 0)
+      continue;
+    if (S_ISDIR(st.st_mode)) {
+      if (ipa_add_tree(zip, sub_fs, sub_zip) != 0) {
+        closedir(d);
+        return -1;
+      }
+    } else if (S_ISREG(st.st_mode)) {
+      size_t sz = 0;
+      unsigned char *data = read_file_bytes(sub_fs, &sz);
+      if (data) {
+        int rc = zip_add(zip, sub_zip, data, sz, 0100644);
+        free(data);
+        if (rc != 0) {
+          closedir(d);
+          return -1;
+        }
+      }
+    }
+  }
+  closedir(d);
+#endif
+  return 0;
 }
 
 int zan_ipa_build(const char *ipa_path, const char *binary_path,
                   const char *app_name, const char *bundle_id,
                   const char *display_name, const char *version,
                   const char *icon_path, const char *assets_dir) {
-    if (!ipa_path || !binary_path || !app_name) {
-        fprintf(stderr, "error: invalid arguments to zan_ipa_build\n");
-        return -1;
-    }
+  if (!ipa_path || !binary_path || !app_name) {
+    fprintf(stderr, "error: invalid arguments to zan_ipa_build\n");
+    return -1;
+  }
 
-    size_t bin_sz = 0;
-    unsigned char *bin_data = read_file_bytes(binary_path, &bin_sz);
-    if (!bin_data) {
-        fprintf(stderr, "error: failed to read binary '%s' for IPA packaging\n", binary_path);
-        return -1;
-    }
+  size_t bin_sz = 0;
+  unsigned char *bin_data = read_file_bytes(binary_path, &bin_sz);
+  if (!bin_data) {
+    fprintf(stderr, "error: failed to read binary '%s' for IPA packaging\n",
+            binary_path);
+    return -1;
+  }
 
-    size_t icon_png_sz = 0;
-    unsigned char *icon_png = NULL;
-    if (icon_path && icon_path[0]) {
-        size_t raw_icon_sz = 0;
-        unsigned char *raw_icon = read_file_bytes(icon_path, &raw_icon_sz);
-        if (raw_icon) {
-            icon_png = extract_png_from_ico_or_png(raw_icon, raw_icon_sz, &icon_png_sz);
-            free(raw_icon);
-        }
+  size_t icon_png_sz = 0;
+  unsigned char *icon_png = NULL;
+  if (icon_path && icon_path[0]) {
+    size_t raw_icon_sz = 0;
+    unsigned char *raw_icon = read_file_bytes(icon_path, &raw_icon_sz);
+    if (raw_icon) {
+      icon_png =
+          extract_png_from_ico_or_png(raw_icon, raw_icon_sz, &icon_png_sz);
+      free(raw_icon);
     }
-    if (!icon_png) {
+  }
+  if (!icon_png) {
 #ifdef ZAN_DEFAULT_IOS_ICON_LEN
-        if (ZAN_DEFAULT_IOS_ICON_LEN > 0) {
-            icon_png = extract_png_from_ico_or_png(zan_default_ios_icon, ZAN_DEFAULT_IOS_ICON_LEN, &icon_png_sz);
-        }
+    if (ZAN_DEFAULT_IOS_ICON_LEN > 0) {
+      icon_png = extract_png_from_ico_or_png(
+          zan_default_ios_icon, ZAN_DEFAULT_IOS_ICON_LEN, &icon_png_sz);
+    }
 #endif
-        if (!icon_png) {
-            icon_png = extract_png_from_ico_or_png(zan_default_icon, ZAN_DEFAULT_ICON_LEN, &icon_png_sz);
-        }
+    if (!icon_png) {
+      icon_png = extract_png_from_ico_or_png(
+          zan_default_icon, ZAN_DEFAULT_ICON_LEN, &icon_png_sz);
     }
+  }
 
-    char default_bundle[256];
-    if (!bundle_id || !bundle_id[0]) {
-        if (zan_fmt_checked(default_bundle, sizeof(default_bundle),
-                            "default bundle id", "dev.zan.%s",
-                            app_name) != 0) {
-            if (icon_png) free(icon_png);
-            free(bin_data);
-            return -1;
-        }
-        bundle_id = default_bundle;
+  char default_bundle[256];
+  if (!bundle_id || !bundle_id[0]) {
+    if (zan_fmt_checked(default_bundle, sizeof(default_bundle),
+                        "default bundle id", "dev.zan.%s", app_name) != 0) {
+      if (icon_png)
+        free(icon_png);
+      free(bin_data);
+      return -1;
     }
-    if (!display_name || !display_name[0]) {
-        display_name = app_name;
-    }
-    if (!version || !version[0]) {
-        version = "1.0.0";
-    }
+    bundle_id = default_bundle;
+  }
+  if (!display_name || !display_name[0]) {
+    display_name = app_name;
+  }
+  if (!version || !version[0]) {
+    version = "1.0.0";
+  }
 
-    char plist[4096];
-    if (zan_fmt_checked(plist, sizeof(plist), "Info.plist",
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-        "<plist version=\"1.0\">\n"
-        "<dict>\n"
-        "    <key>CFBundleDevelopmentRegion</key>\n"
-        "    <string>en</string>\n"
-        "    <key>CFBundleExecutable</key>\n"
-        "    <string>%s</string>\n"
-        "    <key>CFBundleIdentifier</key>\n"
-        "    <string>%s</string>\n"
-        "    <key>CFBundleInfoDictionaryVersion</key>\n"
-        "    <string>6.0</string>\n"
-        "    <key>CFBundleName</key>\n"
-        "    <string>%s</string>\n"
-        "    <key>CFBundleDisplayName</key>\n"
-        "    <string>%s</string>\n"
-        "    <key>CFBundlePackageType</key>\n"
-        "    <string>APPL</string>\n"
-        "    <key>CFBundleShortVersionString</key>\n"
-        "    <string>%s</string>\n"
-        "    <key>CFBundleVersion</key>\n"
-        "    <string>1</string>\n"
-        "    <key>LSRequiresIPhoneOS</key>\n"
-        "    <true/>\n"
-        "    <key>MinimumOSVersion</key>\n"
-        "    <string>14.0</string>\n"
-        "    <key>UIDeviceFamily</key>\n"
-        "    <array>\n"
-        "        <integer>1</integer>\n"
-        "        <integer>2</integer>\n"
-        "    </array>\n"
-        "    <key>UIRequiredDeviceCapabilities</key>\n"
-        "    <array>\n"
-        "        <string>arm64</string>\n"
-        "    </array>\n"
-        "    <key>UISupportedInterfaceOrientations</key>\n"
-        "    <array>\n"
-        "        <string>UIInterfaceOrientationPortrait</string>\n"
-        "        <string>UIInterfaceOrientationLandscapeLeft</string>\n"
-        "        <string>UIInterfaceOrientationLandscapeRight</string>\n"
-        "    </array>\n"
-        "    <key>UILaunchScreen</key>\n"
-        "    <dict/>\n"
-        "    <key>CFBundleIcons</key>\n"
-        "    <dict>\n"
-        "        <key>CFBundlePrimaryIcon</key>\n"
-        "        <dict>\n"
-        "            <key>CFBundleIconFiles</key>\n"
-        "            <array>\n"
-        "                <string>AppIcon20x20</string>\n"
-        "                <string>AppIcon29x29</string>\n"
-        "                <string>AppIcon40x40</string>\n"
-        "                <string>AppIcon60x60</string>\n"
-        "            </array>\n"
-        "            <key>CFBundleIconName</key>\n"
-        "            <string>AppIcon</string>\n"
-        "            <key>UIPrerenderedIcon</key>\n"
-        "            <true/>\n"
-        "        </dict>\n"
-        "    </dict>\n"
-        "    <key>CFBundleIcons~ipad</key>\n"
-        "    <dict>\n"
-        "        <key>CFBundlePrimaryIcon</key>\n"
-        "        <dict>\n"
-        "            <key>CFBundleIconFiles</key>\n"
-        "            <array>\n"
-        "                <string>AppIcon20x20</string>\n"
-        "                <string>AppIcon29x29</string>\n"
-        "                <string>AppIcon40x40</string>\n"
-        "                <string>AppIcon60x60</string>\n"
-        "                <string>AppIcon76x76</string>\n"
-        "                <string>AppIcon83.5x83.5</string>\n"
-        "            </array>\n"
-        "            <key>CFBundleIconName</key>\n"
-        "            <string>AppIcon</string>\n"
-        "            <key>UIPrerenderedIcon</key>\n"
-        "            <true/>\n"
-        "        </dict>\n"
-        "    </dict>\n"
-        "    <key>UIPrerenderedIcon</key>\n"
-        "    <true/>\n"
-        "    <key>CFBundleIconFiles</key>\n"
-        "    <array>\n"
-        "        <string>AppIcon20x20</string>\n"
-        "        <string>AppIcon29x29</string>\n"
-        "        <string>AppIcon40x40</string>\n"
-        "        <string>AppIcon60x60</string>\n"
-        "        <string>AppIcon76x76</string>\n"
-        "        <string>AppIcon83.5x83.5</string>\n"
-        "    </array>\n"
-        "    <key>CFBundleIconFile</key>\n"
-        "    <string>AppIcon60x60</string>\n"
-        "    <key>NSLocationWhenInUseUsageDescription</key>\n"
-        "    <string>This application requires access to location for navigation and local positioning services.</string>\n"
-        "    <key>NSFaceIDUsageDescription</key>\n"
-        "    <string>This application requires Face ID for biometric identity verification and security.</string>\n"
-        "    <key>NSPhotoLibraryUsageDescription</key>\n"
-        "    <string>This application requires access to photo library to select media files.</string>\n"
-        "    <key>NSCameraUsageDescription</key>\n"
-        "    <string>This application requires camera access to capture photos and videos.</string>\n"
-        "    <key>NSMicrophoneUsageDescription</key>\n"
-        "    <string>This application requires microphone access for audio input.</string>\n"
-        "</dict>\n"
-        "</plist>\n",
-        app_name, bundle_id, app_name, display_name, version) != 0) {
-        if (icon_png) free(icon_png);
-        free(bin_data);
-        return -1;
-    }
-    size_t plist_len = strlen(plist);
-
-    const char *pkg_info = "APPL????";
-
-    ipa_zip_t zip;
-    zip_start(&zip);
-
-    char bin_entry[512];
-    if (zan_fmt_checked(bin_entry, sizeof(bin_entry), "IPA binary entry name",
-                        "Payload/%s.app/%s", app_name, app_name) != 0) {
-        if (icon_png) free(icon_png);
-        free(bin_data);
-        zip_destroy(&zip);
-        return -1;
-    }
-    if (zip_add(&zip, bin_entry, bin_data, bin_sz, 0100755) != 0) {
-        if (icon_png) free(icon_png);
-        free(bin_data);
-        zip_destroy(&zip);
-        return -1;
-    }
+  char plist[4096];
+  if (zan_fmt_checked(
+          plist, sizeof(plist), "Info.plist",
+          "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+          "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+          "<plist version=\"1.0\">\n"
+          "<dict>\n"
+          "    <key>CFBundleDevelopmentRegion</key>\n"
+          "    <string>en</string>\n"
+          "    <key>CFBundleExecutable</key>\n"
+          "    <string>%s</string>\n"
+          "    <key>CFBundleIdentifier</key>\n"
+          "    <string>%s</string>\n"
+          "    <key>CFBundleInfoDictionaryVersion</key>\n"
+          "    <string>6.0</string>\n"
+          "    <key>CFBundleName</key>\n"
+          "    <string>%s</string>\n"
+          "    <key>CFBundleDisplayName</key>\n"
+          "    <string>%s</string>\n"
+          "    <key>CFBundlePackageType</key>\n"
+          "    <string>APPL</string>\n"
+          "    <key>CFBundleShortVersionString</key>\n"
+          "    <string>%s</string>\n"
+          "    <key>CFBundleVersion</key>\n"
+          "    <string>1</string>\n"
+          "    <key>LSRequiresIPhoneOS</key>\n"
+          "    <true/>\n"
+          "    <key>MinimumOSVersion</key>\n"
+          "    <string>14.0</string>\n"
+          "    <key>UIDeviceFamily</key>\n"
+          "    <array>\n"
+          "        <integer>1</integer>\n"
+          "        <integer>2</integer>\n"
+          "    </array>\n"
+          "    <key>UIRequiredDeviceCapabilities</key>\n"
+          "    <array>\n"
+          "        <string>arm64</string>\n"
+          "    </array>\n"
+          "    <key>UISupportedInterfaceOrientations</key>\n"
+          "    <array>\n"
+          "        <string>UIInterfaceOrientationPortrait</string>\n"
+          "        <string>UIInterfaceOrientationLandscapeLeft</string>\n"
+          "        <string>UIInterfaceOrientationLandscapeRight</string>\n"
+          "    </array>\n"
+          "    <key>UILaunchScreen</key>\n"
+          "    <dict/>\n"
+          "    <key>CFBundleIcons</key>\n"
+          "    <dict>\n"
+          "        <key>CFBundlePrimaryIcon</key>\n"
+          "        <dict>\n"
+          "            <key>CFBundleIconFiles</key>\n"
+          "            <array>\n"
+          "                <string>AppIcon20x20</string>\n"
+          "                <string>AppIcon29x29</string>\n"
+          "                <string>AppIcon40x40</string>\n"
+          "                <string>AppIcon60x60</string>\n"
+          "            </array>\n"
+          "            <key>CFBundleIconName</key>\n"
+          "            <string>AppIcon</string>\n"
+          "            <key>UIPrerenderedIcon</key>\n"
+          "            <true/>\n"
+          "        </dict>\n"
+          "    </dict>\n"
+          "    <key>CFBundleIcons~ipad</key>\n"
+          "    <dict>\n"
+          "        <key>CFBundlePrimaryIcon</key>\n"
+          "        <dict>\n"
+          "            <key>CFBundleIconFiles</key>\n"
+          "            <array>\n"
+          "                <string>AppIcon20x20</string>\n"
+          "                <string>AppIcon29x29</string>\n"
+          "                <string>AppIcon40x40</string>\n"
+          "                <string>AppIcon60x60</string>\n"
+          "                <string>AppIcon76x76</string>\n"
+          "                <string>AppIcon83.5x83.5</string>\n"
+          "            </array>\n"
+          "            <key>CFBundleIconName</key>\n"
+          "            <string>AppIcon</string>\n"
+          "            <key>UIPrerenderedIcon</key>\n"
+          "            <true/>\n"
+          "        </dict>\n"
+          "    </dict>\n"
+          "    <key>UIPrerenderedIcon</key>\n"
+          "    <true/>\n"
+          "    <key>CFBundleIconFiles</key>\n"
+          "    <array>\n"
+          "        <string>AppIcon20x20</string>\n"
+          "        <string>AppIcon29x29</string>\n"
+          "        <string>AppIcon40x40</string>\n"
+          "        <string>AppIcon60x60</string>\n"
+          "        <string>AppIcon76x76</string>\n"
+          "        <string>AppIcon83.5x83.5</string>\n"
+          "    </array>\n"
+          "    <key>CFBundleIconFile</key>\n"
+          "    <string>AppIcon60x60</string>\n"
+          "    <key>NSLocationWhenInUseUsageDescription</key>\n"
+          "    <string>This application requires access to location for "
+          "navigation and local positioning services.</string>\n"
+          "    <key>NSFaceIDUsageDescription</key>\n"
+          "    <string>This application requires Face ID for biometric "
+          "identity verification and security.</string>\n"
+          "    <key>NSPhotoLibraryUsageDescription</key>\n"
+          "    <string>This application requires access to photo library to "
+          "select media files.</string>\n"
+          "    <key>NSCameraUsageDescription</key>\n"
+          "    <string>This application requires camera access to capture "
+          "photos and videos.</string>\n"
+          "    <key>NSMicrophoneUsageDescription</key>\n"
+          "    <string>This application requires microphone access for audio "
+          "input.</string>\n"
+          "</dict>\n"
+          "</plist>\n",
+          app_name, bundle_id, app_name, display_name, version) != 0) {
+    if (icon_png)
+      free(icon_png);
     free(bin_data);
-    bin_data = NULL;
+    return -1;
+  }
+  size_t plist_len = strlen(plist);
 
-    char plist_entry[512];
-    if (zan_fmt_checked(plist_entry, sizeof(plist_entry),
-                        "IPA Info.plist entry name",
-                        "Payload/%s.app/Info.plist", app_name) != 0) {
-        goto fail_pack;
-    }
-    if (zip_add(&zip, plist_entry, plist, plist_len, 0100644) != 0) {
-        goto fail_pack;
-    }
+  const char *pkg_info = "APPL????";
 
-    char pkg_entry[512];
-    if (zan_fmt_checked(pkg_entry, sizeof(pkg_entry),
-                        "IPA PkgInfo entry name",
-                        "Payload/%s.app/PkgInfo", app_name) != 0) {
-        goto fail_pack;
-    }
-    if (zip_add(&zip, pkg_entry, pkg_info, 8, 0100644) != 0) {
-        goto fail_pack;
-    }
+  ipa_zip_t zip;
+  zip_start(&zip);
 
-    if (icon_png && icon_png_sz > 0) {
-        const char *icon_names[] = {
-            "AppIcon.png",
-            "AppIcon60x60@2x.png",
-            "AppIcon60x60@3x.png",
-            "AppIcon76x76@2x~ipad.png",
-            "AppIcon20x20@2x.png",
-            "AppIcon20x20@3x.png",
-            "AppIcon29x29@2x.png",
-            "AppIcon29x29@3x.png",
-            "AppIcon40x40@2x.png",
-            "AppIcon40x40@3x.png",
-            "AppIcon83.5x83.5@2x~ipad.png",
-            "iTunesArtwork",
-            NULL
-        };
-        char icon_entry[512];
-        for (int k = 0; icon_names[k]; k++) {
-            if (zan_fmt_checked(icon_entry, sizeof(icon_entry),
-                                "IPA icon entry name",
-                                "Payload/%s.app/%s",
-                                app_name, icon_names[k]) != 0) {
-                goto fail_pack;
-            }
-            if (zip_add(&zip, icon_entry, icon_png, icon_png_sz,
-                        0100644) != 0) {
-                goto fail_pack;
-            }
-        }
-        if (zip_add(&zip, "iTunesArtwork", icon_png, icon_png_sz,
-                    0100644) != 0) {
-            goto fail_pack;
-        }
-    }
-    if (icon_png) { free(icon_png); icon_png = NULL; }
-
-    if (assets_dir && assets_dir[0]) {
-        char zip_assets[512];
-        if (zan_fmt_checked(zip_assets, sizeof(zip_assets),
-                            "IPA assets entry name",
-                            "Payload/%s.app/assets", app_name) != 0) {
-            goto fail_pack;
-        }
-        if (ipa_add_tree(&zip, assets_dir, zip_assets) != 0) goto fail_pack;
-    }
-
-    zip_finish(&zip);
-
-    FILE *out = fopen(ipa_path, "wb");
-    if (!out) {
-        fprintf(stderr, "error: failed to open '%s' for writing\n", ipa_path);
-        zip_destroy(&zip);
-        return -1;
-    }
-    size_t written = fwrite(zip.out.data, 1, zip.out.len, out);
-    int close_status = fclose(out);
-
-    if (written != zip.out.len || close_status != 0) {
-        fprintf(stderr, "error: failed to write complete IPA file to '%s'\n", ipa_path);
-        remove(ipa_path);
-        zip_destroy(&zip);
-        return -1;
-    }
-
-    zip_destroy(&zip);
-    return 0;
-
-fail_pack:
+  char bin_entry[512];
+  if (zan_fmt_checked(bin_entry, sizeof(bin_entry), "IPA binary entry name",
+                      "Payload/%s.app/%s", app_name, app_name) != 0) {
+    if (icon_png)
+      free(icon_png);
     free(bin_data);
-    if (icon_png) free(icon_png);
     zip_destroy(&zip);
     return -1;
+  }
+  if (zip_add(&zip, bin_entry, bin_data, bin_sz, 0100755) != 0) {
+    if (icon_png)
+      free(icon_png);
+    free(bin_data);
+    zip_destroy(&zip);
+    return -1;
+  }
+  free(bin_data);
+  bin_data = NULL;
+
+  char plist_entry[512];
+  if (zan_fmt_checked(plist_entry, sizeof(plist_entry),
+                      "IPA Info.plist entry name", "Payload/%s.app/Info.plist",
+                      app_name) != 0) {
+    goto fail_pack;
+  }
+  if (zip_add(&zip, plist_entry, plist, plist_len, 0100644) != 0) {
+    goto fail_pack;
+  }
+
+  char pkg_entry[512];
+  if (zan_fmt_checked(pkg_entry, sizeof(pkg_entry), "IPA PkgInfo entry name",
+                      "Payload/%s.app/PkgInfo", app_name) != 0) {
+    goto fail_pack;
+  }
+  if (zip_add(&zip, pkg_entry, pkg_info, 8, 0100644) != 0) {
+    goto fail_pack;
+  }
+
+  if (icon_png && icon_png_sz > 0) {
+    const char *icon_names[] = {"AppIcon.png",
+                                "AppIcon60x60@2x.png",
+                                "AppIcon60x60@3x.png",
+                                "AppIcon76x76@2x~ipad.png",
+                                "AppIcon20x20@2x.png",
+                                "AppIcon20x20@3x.png",
+                                "AppIcon29x29@2x.png",
+                                "AppIcon29x29@3x.png",
+                                "AppIcon40x40@2x.png",
+                                "AppIcon40x40@3x.png",
+                                "AppIcon83.5x83.5@2x~ipad.png",
+                                "iTunesArtwork",
+                                NULL};
+    char icon_entry[512];
+    for (int k = 0; icon_names[k]; k++) {
+      if (zan_fmt_checked(icon_entry, sizeof(icon_entry), "IPA icon entry name",
+                          "Payload/%s.app/%s", app_name, icon_names[k]) != 0) {
+        goto fail_pack;
+      }
+      if (zip_add(&zip, icon_entry, icon_png, icon_png_sz, 0100644) != 0) {
+        goto fail_pack;
+      }
+    }
+    if (zip_add(&zip, "iTunesArtwork", icon_png, icon_png_sz, 0100644) != 0) {
+      goto fail_pack;
+    }
+  }
+  if (icon_png) {
+    free(icon_png);
+    icon_png = NULL;
+  }
+
+  if (assets_dir && assets_dir[0]) {
+    char zip_assets[512];
+    if (zan_fmt_checked(zip_assets, sizeof(zip_assets), "IPA assets entry name",
+                        "Payload/%s.app/assets", app_name) != 0) {
+      goto fail_pack;
+    }
+    if (ipa_add_tree(&zip, assets_dir, zip_assets) != 0)
+      goto fail_pack;
+  }
+
+  zip_finish(&zip);
+
+  FILE *out = fopen(ipa_path, "wb");
+  if (!out) {
+    fprintf(stderr, "error: failed to open '%s' for writing\n", ipa_path);
+    zip_destroy(&zip);
+    return -1;
+  }
+  size_t written = fwrite(zip.out.data, 1, zip.out.len, out);
+  int close_status = fclose(out);
+
+  if (written != zip.out.len || close_status != 0) {
+    fprintf(stderr, "error: failed to write complete IPA file to '%s'\n",
+            ipa_path);
+    remove(ipa_path);
+    zip_destroy(&zip);
+    return -1;
+  }
+
+  zip_destroy(&zip);
+  return 0;
+
+fail_pack:
+  free(bin_data);
+  if (icon_png)
+    free(icon_png);
+  zip_destroy(&zip);
+  return -1;
 }

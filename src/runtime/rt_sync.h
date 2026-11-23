@@ -36,8 +36,8 @@ void zan_atomic_int_destroy(int64_t handle);
 int64_t zan_atomic_int_load(int64_t handle);
 void zan_atomic_int_store(int64_t handle, int64_t value);
 int64_t zan_atomic_int_exchange(int64_t handle, int64_t value);
-int64_t zan_atomic_int_compare_exchange(
-    int64_t handle, int64_t expected, int64_t desired);
+int64_t zan_atomic_int_compare_exchange(int64_t handle, int64_t expected,
+                                        int64_t desired);
 int64_t zan_atomic_int_add(int64_t handle, int64_t delta);
 
 int64_t zan_monotonic_us(void);
@@ -49,53 +49,54 @@ int64_t zan_stopwatch_frequency(void);
 int64_t zan_monotonic_ticks(void);
 int64_t zan_monotonic_frequency(void);
 
-int64_t zan_shared_table_create(
-    const char *name, int32_t capacity, int32_t key_size, const char *schema);
+int64_t zan_shared_table_create(const char *name, int32_t capacity,
+                                int32_t key_size, const char *schema);
 int64_t zan_shared_table_open(const char *name);
 /* 匿名共享内存表：仅通过继承句柄在父子进程间映射共享 */
-int64_t zan_shared_table_create_anon(
-    int32_t capacity, int32_t key_size, const char *schema);
+int64_t zan_shared_table_create_anon(int32_t capacity, int32_t key_size,
+                                     const char *schema);
 int64_t zan_shared_table_handle(int64_t handle);
 int64_t zan_shared_table_attach(int64_t os_handle);
 void zan_shared_table_close(int64_t handle);
 int32_t zan_shared_table_destroy(int64_t handle);
-int32_t zan_shared_table_set_int(
-    int64_t handle, const char *key, const char *column, int64_t value);
-int64_t zan_shared_table_get_int(
-    int64_t handle, const char *key, const char *column);
+int32_t zan_shared_table_set_int(int64_t handle, const char *key,
+                                 const char *column, int64_t value);
+int64_t zan_shared_table_get_int(int64_t handle, const char *key,
+                                 const char *column);
 /* 容错读：命中写 *out_value 回 1，键/列缺失或行失效回 0。 */
-int32_t zan_shared_table_try_get_int(
-    int64_t handle, const char *key, const char *column, int64_t *out_value);
-int32_t zan_shared_table_set_float(
-    int64_t handle, const char *key, const char *column, double value);
-double zan_shared_table_get_float(
-    int64_t handle, const char *key, const char *column);
-int32_t zan_shared_table_set_string(
-    int64_t handle, const char *key, const char *column, const char *value);
-const char *zan_shared_table_get_string(
-    int64_t handle, const char *key, const char *column);
-int64_t zan_shared_table_increment(
-    int64_t handle, const char *key, const char *column, int64_t delta);
-int32_t zan_shared_table_expire(
-    int64_t handle, const char *key, int64_t ttl_ms);
-int32_t zan_shared_table_expire_at(
-    int64_t handle, const char *key, int64_t expires_at);
+int32_t zan_shared_table_try_get_int(int64_t handle, const char *key,
+                                     const char *column, int64_t *out_value);
+int32_t zan_shared_table_set_float(int64_t handle, const char *key,
+                                   const char *column, double value);
+double zan_shared_table_get_float(int64_t handle, const char *key,
+                                  const char *column);
+int32_t zan_shared_table_set_string(int64_t handle, const char *key,
+                                    const char *column, const char *value);
+const char *zan_shared_table_get_string(int64_t handle, const char *key,
+                                        const char *column);
+int64_t zan_shared_table_increment(int64_t handle, const char *key,
+                                   const char *column, int64_t delta);
+int32_t zan_shared_table_expire(int64_t handle, const char *key,
+                                int64_t ttl_ms);
+int32_t zan_shared_table_expire_at(int64_t handle, const char *key,
+                                   int64_t expires_at);
 int64_t zan_shared_table_expires_at(int64_t handle, const char *key);
 int64_t zan_shared_table_purge_expired(int64_t handle, int64_t now_ms);
-int32_t zan_shared_table_rate_allow(
-    int64_t handle, const char *key, int64_t now_ms,
-    int64_t window_ms, int64_t limit);
-int32_t zan_shared_table_lock_acquire(
-    int64_t handle, const char *key, int64_t owner,
-    int64_t now_ms, int64_t lease_ms);
-int32_t zan_shared_table_lock_release(
-    int64_t handle, const char *key, int64_t owner);
+int32_t zan_shared_table_rate_allow(int64_t handle, const char *key,
+                                    int64_t now_ms, int64_t window_ms,
+                                    int64_t limit);
+int32_t zan_shared_table_lock_acquire(int64_t handle, const char *key,
+                                      int64_t owner, int64_t now_ms,
+                                      int64_t lease_ms);
+int32_t zan_shared_table_lock_release(int64_t handle, const char *key,
+                                      int64_t owner);
 int32_t zan_shared_table_delete(int64_t handle, const char *key);
 int32_t zan_shared_table_exists(int64_t handle, const char *key);
 int64_t zan_shared_table_count(int64_t handle);
 void zan_shared_table_clear(int64_t handle);
 
-/* 查询共享内存表元数据（0:保留字节 1:常驻字节 2:容量 3:已用行 4:行跨度 5:键大小 6:列数） */
+/* 查询共享内存表元数据（0:保留字节 1:常驻字节 2:容量 3:已用行 4:行跨度 5:键大小
+ * 6:列数） */
 #define ZAN_TABLE_STAT_RESERVED 0
 #define ZAN_TABLE_STAT_RESIDENT 1
 #define ZAN_TABLE_STAT_CAPACITY 2
@@ -107,26 +108,25 @@ int64_t zan_shared_table_stat(int64_t handle, int32_t what);
 
 /* 共享内存表哈希键变体接口：加速热路径查询 */
 int64_t zan_shared_table_hash(const char *value);
-int32_t zan_shared_table_set_int_at(
-    int64_t handle, int64_t key_hash, const char *column_name, int64_t value);
-int64_t zan_shared_table_get_int_at(
-    int64_t handle, int64_t key_hash, const char *column_name);
-int32_t zan_shared_table_try_get_int_at(
-    int64_t handle, int64_t key_hash, const char *column_name,
-    int64_t *out_value);
-int64_t zan_shared_table_increment_at(
-    int64_t handle, int64_t key_hash, const char *column_name, int64_t delta);
-int64_t zan_shared_table_extreme_at(
-    int64_t handle, int64_t key_hash, const char *column_name, int64_t value,
-    int64_t keep_larger);
-int32_t zan_shared_table_set_string_at(
-    int64_t handle, int64_t key_hash, const char *column_name,
-    const char *value);
-const char *zan_shared_table_get_string_at(
-    int64_t handle, int64_t key_hash, const char *column_name);
-int32_t zan_shared_table_match_at(
-    int64_t handle, int64_t key_hash, const char *column_name,
-    const char *text);
+int32_t zan_shared_table_set_int_at(int64_t handle, int64_t key_hash,
+                                    const char *column_name, int64_t value);
+int64_t zan_shared_table_get_int_at(int64_t handle, int64_t key_hash,
+                                    const char *column_name);
+int32_t zan_shared_table_try_get_int_at(int64_t handle, int64_t key_hash,
+                                        const char *column_name,
+                                        int64_t *out_value);
+int64_t zan_shared_table_increment_at(int64_t handle, int64_t key_hash,
+                                      const char *column_name, int64_t delta);
+int64_t zan_shared_table_extreme_at(int64_t handle, int64_t key_hash,
+                                    const char *column_name, int64_t value,
+                                    int64_t keep_larger);
+int32_t zan_shared_table_set_string_at(int64_t handle, int64_t key_hash,
+                                       const char *column_name,
+                                       const char *value);
+const char *zan_shared_table_get_string_at(int64_t handle, int64_t key_hash,
+                                           const char *column_name);
+int32_t zan_shared_table_match_at(int64_t handle, int64_t key_hash,
+                                  const char *column_name, const char *text);
 int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash);
 int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash);
 
@@ -136,25 +136,30 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc);
 int32_t zan_proc_run_safe_timeout(const char *exe, const char **args,
                                   int32_t argc, int32_t timeout_ms);
-int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc);
+int32_t zan_proc_start_detached_safe(const char *exe, const char **args,
+                                     int32_t argc);
 int32_t zan_proc_start_program_safe(const char *exe, const char *log_path);
 int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
-                              char **out_buf, int32_t *out_len, int32_t *exit_code);
+                              char **out_buf, int32_t *out_len,
+                              int32_t *exit_code);
 #if !defined(_WIN32) && !defined(__wasm32__)
 /* <=0: infinite; timeout: return 0, partial output and exit_code -1.
  * Kills/reaps the direct child; descendants cannot prolong output draining. */
-int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args, int32_t argc,
-                                      char **out_buf, int32_t *out_len,
-                                      int32_t *exit_code, int32_t timeout_ms);
+int32_t zan_proc_capture_safe_timeout(const char *exe, const char **args,
+                                      int32_t argc, char **out_buf,
+                                      int32_t *out_len, int32_t *exit_code,
+                                      int32_t timeout_ms);
 
 /* Returns the child PID and transfers the parent-side stdin/stdout fds on
- * success. Returns -1 on launch failure with no child or fd left to the caller. */
+ * success. Returns -1 on launch failure with no child or fd left to the caller.
+ */
 int32_t zan_proc_spawn(char *const argv[], const char *cwd, int32_t fds[2]);
 /* Managed children become group leaders before exec. Wait signals the group
  * before reaping the leader. -1 means the caller no longer owns the child;
  * ZAN_PROC_WAIT_OWNED_ERROR preserves ownership for disposal. */
 #define ZAN_PROC_WAIT_OWNED_ERROR (-259)
-int32_t zan_proc_spawn_managed(char *const argv[], const char *cwd, int32_t fds[2]);
+int32_t zan_proc_spawn_managed(char *const argv[], const char *cwd,
+                               int32_t fds[2]);
 /* Linux-only managed launch. The caller owns the opaque group on success. */
 int32_t zan_proc_sandbox_available(const char *cgroup_root);
 int32_t zan_proc_spawn_sandboxed(char *const argv[], const char *cwd,
@@ -164,10 +169,12 @@ int32_t zan_proc_spawn_sandboxed(char *const argv[], const char *cwd,
 int32_t zan_proc_sandbox_kill(intptr_t group);
 int32_t zan_proc_sandbox_wait(int32_t pid, int32_t timeout_ms, intptr_t group);
 /* Consumes the group and pipe handles. Pass pid 0 after reaping the child. */
-int32_t zan_proc_sandbox_dispose(intptr_t group, int32_t pid, int32_t input, int32_t output);
+int32_t zan_proc_sandbox_dispose(intptr_t group, int32_t pid, int32_t input,
+                                 int32_t output);
 int32_t zan_proc_spawn_managed_kill(int32_t pid);
 int32_t zan_proc_spawn_managed_wait(int32_t pid, int32_t timeout_ms);
-int32_t zan_proc_spawn_managed_dispose(int32_t pid, int32_t input, int32_t output);
+int32_t zan_proc_spawn_managed_dispose(int32_t pid, int32_t input,
+                                       int32_t output);
 int32_t zan_proc_spawn_available(int32_t fd);
 int32_t zan_proc_spawn_read(int32_t fd, void *buf, int32_t count);
 int32_t zan_proc_spawn_write(int32_t fd, const void *buf, int32_t count);

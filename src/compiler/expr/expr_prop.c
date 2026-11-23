@@ -48,16 +48,18 @@ LLVMValueRef emit_property_getter_call(zan_irgen_t *g,
             LLVMTypeRef mft = g->functions[fi].fn_type;
             LLVMValueRef mfn = route_generic_method(g, recv_type, getter,
                 g->functions[fi].fn, mft, &mft);
+            LLVMValueRef gctx_arg =
+                route_generic_method_gctx(g, recv_type, getter);
             LLVMValueRef args[1];
             unsigned argc = 0;
             if (!is_static) args[argc++] = rval;
             const char *cn = "pget";
             /* base.Prop 属性读取：绑定至基类属性 getter 实现 */
-            LLVMValueRef result = emit_dispatch_call(g,
+            LLVMValueRef result = emit_dispatch_call_gctx(g,
                 (is_static || !recv_type ||
                  (obj_ast && obj_ast->kind == AST_BASE_EXPR))
                     ? NULL : recv_type->sym, getter,
-                mfn, mft, args, (int)argc, cn);
+                mfn, mft, args, (int)argc, gctx_arg, cn);
             result = coerce_generic_result(g, result, getter, recv_type);
             /* 接收者强引用临时变量生命周期延长契约 */
             emit_release_owned_call_temp(g, obj_ast, recv, locals);
@@ -114,6 +116,8 @@ void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
             LLVMTypeRef mft = g->functions[fi].fn_type;
             LLVMValueRef mfn = route_generic_method(g, recv_type, setter,
                 g->functions[fi].fn, mft, &mft);
+            LLVMValueRef gctx_arg =
+                route_generic_method_gctx(g, recv_type, setter);
             /* 属性 setter 赋值实参位置绑定 */
             zan_type_t *p0 = method_param_type_at(g, setter, 0, NULL,
                                                   obj_ast, locals);
@@ -129,9 +133,10 @@ void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
             if (!is_static) args[argc++] = rval;
             args[argc++] = v;
             /* 裸属性名赋值 Prop = v 降解处理 */
-            emit_dispatch_call(g, (is_static || !recv_type ||
+            emit_dispatch_call_gctx(g, (is_static || !recv_type ||
                 (obj_ast && obj_ast->kind == AST_BASE_EXPR))
-                    ? NULL : recv_type->sym, setter, mfn, mft, args, (int)argc, "");
+                    ? NULL : recv_type->sym, setter, mfn, mft, args,
+                (int)argc, gctx_arg, "");
             emit_release_owned_call_temp(g, obj_ast, recv, locals);
             emit_release_owned_call_temp(g, rhs_ast, value, locals);
             return;

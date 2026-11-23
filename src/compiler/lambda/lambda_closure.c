@@ -459,12 +459,11 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc,
                                   LLVMValueRef init);
 LLVMValueRef box_value_ptr(zan_irgen_t *g, LLVMValueRef cell,
                                   LLVMTypeRef payload);
-static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
-                                        const char *lname, LLVMTypeRef rec_ty,
-                                        LLVMValueRef fn_ptr, LLVMValueRef target,
-                                        lambda_capture_t *caps, int capc,
-                                        int has_this, LLVMValueRef self,
-                                        bool retain_target) {
+static LLVMValueRef emit_closure_record_gctx(
+    zan_irgen_t *g, zan_loc_t loc, const char *lname, LLVMTypeRef rec_ty,
+    LLVMValueRef fn_ptr, LLVMValueRef target, lambda_capture_t *caps,
+    int capc, int has_this, LLVMValueRef self, bool retain_target,
+    LLVMValueRef gctx_val) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef dtor = build_closure_dtor(g, lname, rec_ty, caps, capc,
@@ -537,10 +536,28 @@ static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
             LLVMBuildStructGEP2(g->builder, rec_ty, rec,
                                 (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp"));
     }
+    if (gctx_val) {
+        if (LLVMTypeOf(gctx_val) != i8ptr)
+            gctx_val = LLVMBuildBitCast(g->builder, gctx_val, i8ptr, "cap.gctx8");
+        LLVMBuildStore(g->builder, gctx_val,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + has_this),
+                                "cap.gctxp"));
+    }
     LLVMValueRef tagged = LLVMBuildOr(g->builder,
         LLVMBuildPtrToInt(g->builder, rec, i64, "clo.i"),
         LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.tag");
     return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
+}
+static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
+                                        const char *lname, LLVMTypeRef rec_ty,
+                                        LLVMValueRef fn_ptr, LLVMValueRef target,
+                                        lambda_capture_t *caps, int capc,
+                                        int has_this, LLVMValueRef self,
+                                        bool retain_target) {
+    return emit_closure_record_gctx(g, loc, lname, rec_ty, fn_ptr, target,
+                                    caps, capc, has_this, self, retain_target,
+                                    NULL);
 }
 
 /* Erasure produces one owned tagged delegate. Native code addresses have no
@@ -1038,38 +1055,60 @@ LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
     if (fi < 0) return NULL;
     LLVMValueRef target = g->functions[fi].fn;
     LLVMTypeRef target_ty = g->functions[fi].fn_type;
+    if (receiver_type) {
+        if (g->cur_mtps)
+            receiver_type = subst_method_tp(g, receiver_type, g->cur_mtps, g->cur_mbind);
+        if (g->cur_inst)
+            receiver_type = subst_type_param_deep(g, receiver_type, g->cur_inst);
+    }
     target = route_generic_method(g, receiver_type, msym, target, target_ty, &target_ty);
+    LLVMValueRef gctx_arg = route_generic_method_gctx(g, receiver_type, msym);
+    if (gctx_arg && LLVMIsAConstant(gctx_arg)) {
+        zan_type_t *thk_owner = receiver_type;
+        if (msym->parent && thk_owner && thk_owner->sym != msym->parent &&
+            is_user_generic_sym(msym->parent)) {
+            zan_type_t *vo = vtable_owner_inst(g, thk_owner, msym->parent);
+            if (vo) thk_owner = vo;
+        }
+        target = build_gctx_vtable_thunk(g, target, target_ty, thk_owner,
+                                         NULL, 0, &target_ty);
+        gctx_arg = NULL;
+    }
+    bool has_dyn_gctx = (gctx_arg != NULL);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     bool is_static = (recv == NULL);
     unsigned np = LLVMCountParamTypes(target_ty);
-    if (!is_static && np < 1) return NULL;
-    LLVMTypeRef *tp = (LLVMTypeRef *)calloc((size_t)np, sizeof(LLVMTypeRef));
+    unsigned eff_np = (has_dyn_gctx && np >= 1) ? (np - 1) : np;
+    if (!is_static && eff_np < 1) return NULL;
+    LLVMTypeRef *tp = (LLVMTypeRef *)calloc((size_t)(np > 0 ? np : 1), sizeof(LLVMTypeRef));
     LLVMGetParamTypes(target_ty, tp);
     LLVMTypeRef ret = LLVMGetReturnType(target_ty);
 
     /* 每个方法生成单例 thunk，支持委托判等与比较 */
-    char lname[128];
-    snprintf(lname, sizeof(lname), "mg_%s", LLVMGetValueName(target));
+    char lname[512];
+    snprintf(lname, sizeof(lname), has_dyn_gctx ? "mg_%s_gctx" : "mg_%s",
+             LLVMGetValueName(target));
 
-    LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS] = { i8ptr, i8ptr, i8ptr };
-    char rname[128];
+    LLVMTypeRef fields[ZAN_CLOSURE_HDR_FIELDS + 1] = { i8ptr, i8ptr, i8ptr, i8ptr };
+    char rname[540];
     snprintf(rname, sizeof(rname), "%s$clo", lname);
     LLVMTypeRef rec_ty = LLVMStructCreateNamed(g->ctx, rname);
-    LLVMStructSetBody(rec_ty, fields, ZAN_CLOSURE_HDR_FIELDS, 0);
+    LLVMStructSetBody(rec_ty, fields,
+                      (unsigned)(ZAN_CLOSURE_HDR_FIELDS + (has_dyn_gctx ? 1 : 0)), 0);
 
-    LLVMTypeRef *thunk_params = (LLVMTypeRef *)calloc((size_t)np + 1, sizeof(LLVMTypeRef));
+    LLVMTypeRef *thunk_params = (LLVMTypeRef *)calloc((size_t)eff_np + 1, sizeof(LLVMTypeRef));
     unsigned tn;
     if (is_static) {
         thunk_params[0] = i8ptr;
-        for (unsigned i = 0; i < np; i++) thunk_params[i + 1] = tp[i];
-        tn = np + 1;
+        for (unsigned i = 0; i < eff_np; i++) thunk_params[i + 1] = tp[i];
+        tn = eff_np + 1;
     } else {
         thunk_params[0] = i8ptr;
-        for (unsigned i = 1; i < np; i++) thunk_params[i] = tp[i];
-        tn = np;
+        for (unsigned i = 1; i < eff_np; i++) thunk_params[i] = tp[i];
+        tn = eff_np;
     }
     LLVMTypeRef thunk_ty = LLVMFunctionType(ret, thunk_params, tn, 0);
-    char tname[160];
+    char tname[540];
     snprintf(tname, sizeof(tname), "__zan_%s", lname);
     LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);
     int thunk_is_new = thunk == NULL;
@@ -1082,14 +1121,22 @@ LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
     if (!thunk_is_new) {
         free(thunk_params);
         free(tp);
-        if (is_static) return build_static_mg_record(g, loc, lname, rec_ty, thunk);
-        return emit_closure_record(g, loc, lname, rec_ty, thunk, recv,
-                                   NULL, 0, 0, NULL, true);
+        if (is_static) {
+            if (has_dyn_gctx) {
+                build_closure_dtor(g, lname, rec_ty, NULL, 0, 0, false);
+                return emit_closure_record_gctx(g, loc, lname, rec_ty, thunk,
+                                                thunk, NULL, 0, 0, NULL, false,
+                                                gctx_arg);
+            }
+            return build_static_mg_record(g, loc, lname, rec_ty, thunk);
+        }
+        return emit_closure_record_gctx(g, loc, lname, rec_ty, thunk, recv,
+                                        NULL, 0, 0, NULL, true, gctx_arg);
     }
     LLVMPositionBuilderAtEnd(g->builder,
         LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry"));
     LLVMValueRef rec = LLVMGetParam(thunk, 0);
-    LLVMValueRef *cargs = (LLVMValueRef *)calloc((size_t)np + 1, sizeof(LLVMValueRef));
+    LLVMValueRef *cargs = (LLVMValueRef *)calloc((size_t)eff_np + 1, sizeof(LLVMValueRef));
     unsigned ca = 0;
     LLVMValueRef self = NULL;
     if (!is_static) {
@@ -1101,8 +1148,14 @@ LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
     } else {
         for (unsigned i = 1; i < tn; i++) cargs[ca++] = LLVMGetParam(thunk, i);
     }
-    LLVMValueRef r = emit_dispatch_call(g, is_static ? NULL : msym->parent,
-        msym, target, target_ty, cargs, (int)ca,
+    LLVMValueRef loaded_gctx = NULL;
+    if (has_dyn_gctx) {
+        LLVMValueRef gp = LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+            ZAN_CLOSURE_HDR_FIELDS, "mg.gctxp");
+        loaded_gctx = LLVMBuildLoad2(g->builder, i8ptr, gp, "mg.gctx");
+    }
+    LLVMValueRef r = emit_dispatch_call_gctx(g, is_static ? NULL : msym->parent,
+        msym, target, target_ty, cargs, (int)ca, loaded_gctx,
         LLVMGetTypeKind(ret) == LLVMVoidTypeKind ? "" : "mg.r");
     if (LLVMGetTypeKind(ret) == LLVMVoidTypeKind) LLVMBuildRetVoid(g->builder);
     else LLVMBuildRet(g->builder, r);
@@ -1111,8 +1164,17 @@ LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
     free(tp);
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 
-    if (is_static) return build_static_mg_record(g, loc, lname, rec_ty, thunk);
-    return emit_closure_record(g, loc, lname, rec_ty, thunk, recv, NULL, 0, 0, NULL, true);
+    if (is_static) {
+        if (has_dyn_gctx) {
+            build_closure_dtor(g, lname, rec_ty, NULL, 0, 0, false);
+            return emit_closure_record_gctx(g, loc, lname, rec_ty, thunk,
+                                            thunk, NULL, 0, 0, NULL, false,
+                                            gctx_arg);
+        }
+        return build_static_mg_record(g, loc, lname, rec_ty, thunk);
+    }
+    return emit_closure_record_gctx(g, loc, lname, rec_ty, thunk, recv, NULL, 0,
+                                    0, NULL, true, gctx_arg);
 }
 
 /* 为静态方法组构建闭包记录 */

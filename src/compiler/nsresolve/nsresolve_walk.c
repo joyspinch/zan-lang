@@ -1,672 +1,823 @@
 static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n);
 
 static void collect_shadows_list(nr_ctx_t *c, zan_ast_list_t *l) {
-    if (!l) return;
-    for (int i = 0; i < l->count; i++) collect_shadows(c, l->items[i]);
+  if (!l)
+    return;
+  for (int i = 0; i < l->count; i++)
+    collect_shadows(c, l->items[i]);
 }
 
 static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
-    if (!n) return;
-    switch (n->kind) {
-    case AST_PARAM:
-        shadow_add(&c->shadow, n->param.name);
-        collect_shadows(c, n->param.default_val);
-        break;
-    case AST_VAR_DECL:
-        shadow_add(&c->shadow, n->var_decl.name);
-        collect_shadows(c, n->var_decl.initializer);
-        break;
-    case AST_FOREACH_STMT:
-        shadow_add(&c->shadow, n->foreach_stmt.var_name);
-        collect_shadows(c, n->foreach_stmt.collection);
-        collect_shadows(c, n->foreach_stmt.body);
-        break;
-    case AST_CATCH_CLAUSE:
-        shadow_add(&c->shadow, n->catch_clause.var_name);
-        collect_shadows(c, n->catch_clause.body);
-        break;
-    case AST_LAMBDA:
-        collect_shadows_list(c, &n->lambda.params);
-        collect_shadows(c, n->lambda.body);
-        break;
-    case AST_BLOCK:
-        collect_shadows_list(c, &n->block.stmts);
-        break;
-    case AST_EXPR_STMT:  collect_shadows(c, n->expr_stmt.expr); break;
-    case AST_RETURN_STMT: collect_shadows(c, n->ret.value); break;
-    case AST_IF_STMT:
-        collect_shadows(c, n->if_stmt.cond);
-        collect_shadows(c, n->if_stmt.then_body);
-        collect_shadows(c, n->if_stmt.else_body);
-        break;
-    case AST_WHILE_STMT:
-    case AST_DO_WHILE_STMT:
-        collect_shadows(c, n->while_stmt.cond);
-        collect_shadows(c, n->while_stmt.body);
-        break;
-    case AST_FOR_STMT:
-        collect_shadows(c, n->for_stmt.init);
-        collect_shadows(c, n->for_stmt.cond);
-        collect_shadows(c, n->for_stmt.step);
-        collect_shadows(c, n->for_stmt.body);
-        break;
-    case AST_TRY_STMT:
-        collect_shadows(c, n->try_stmt.try_body);
-        collect_shadows_list(c, &n->try_stmt.catches);
-        collect_shadows(c, n->try_stmt.finally_body);
-        break;
-    case AST_SWITCH_STMT:
-        collect_shadows(c, n->switch_stmt.expr);
-        collect_shadows_list(c, &n->switch_stmt.cases);
-        break;
-    case AST_SWITCH_CASE:
-        collect_shadows(c, n->switch_case.body);
-        break;
-    case AST_LOCK_STMT:
-        collect_shadows(c, n->lock_stmt.expr);
-        collect_shadows(c, n->lock_stmt.body);
-        break;
-    case AST_CHECKED_STMT:
-        collect_shadows(c, n->checked_stmt.body);
-        break;
-    case AST_BINARY:
-    case AST_ASSIGNMENT:
-        collect_shadows(c, n->binary.left);
-        collect_shadows(c, n->binary.right);
-        break;
-    case AST_UNARY:
-    case AST_POSTFIX_UNARY:
-        collect_shadows(c, n->unary.operand);
-        break;
-    case AST_CALL:
-        collect_shadows(c, n->call.callee);
-        collect_shadows_list(c, &n->call.args);
-        break;
-    case AST_MEMBER_ACCESS:
-        collect_shadows(c, n->member.object);
-        break;
-    case AST_INDEX:
-        collect_shadows(c, n->index.object);
-        collect_shadows(c, n->index.index);
-        break;
-    case AST_NEW_EXPR:
-        collect_shadows_list(c, &n->new_expr.args);
-        collect_shadows_list(c, &n->new_expr.arg_inits);
-        break;
-    case AST_CONDITIONAL:
-        collect_shadows(c, n->conditional.cond);
-        collect_shadows(c, n->conditional.then_expr);
-        collect_shadows(c, n->conditional.else_expr);
-        break;
-    case AST_CAST_EXPR:
-    case AST_TYPEOF_EXPR:
-    case AST_SIZEOF_EXPR:
-        collect_shadows(c, n->cast.expr);
-        break;
-    case AST_IS_EXPR:
-    case AST_AS_EXPR:
-        collect_shadows(c, n->type_test.expr);
-        break;
-    case AST_AWAIT_EXPR:
-        collect_shadows(c, n->await_expr.expr);
-        break;
-    case AST_STRING_INTERP:
-        collect_shadows_list(c, &n->string_interp.parts);
-        break;
-    case AST_REF_ARG:
-        collect_shadows(c, n->ref_arg.expr);
-        break;
-    case AST_NAMED_ARG:
-        collect_shadows(c, n->named_arg.expr);
-        break;
-    case AST_COLL_INIT:
-        collect_shadows_list(c, &n->coll_init.items);
-        break;
-    case AST_THROW_STMT:
-        collect_shadows(c, n->throw_stmt.value);
-        break;
-    case AST_YIELD_STMT:
-        collect_shadows(c, n->yield_stmt.value);
-        break;
-    case AST_TUPLE_EXPR:
-        collect_shadows_list(c, &n->tuple_expr.items);
-        break;
-    case AST_TUPLE_DECON:
-        /* 解构声明本身就是局部影子名（names 为 IDENTIFIER 节点） */
-        for (int i = 0; i < n->tuple_decon.names.count; i++)
-            shadow_add(&c->shadow, n->tuple_decon.names.items[i]->ident.name);
-        collect_shadows(c, n->tuple_decon.initializer);
-        break;
-    case AST_WITH_EXPR:
-        collect_shadows(c, n->with_expr.expr);
-        collect_shadows_list(c, &n->with_expr.assigns);
-        break;
-    case AST_SWITCH_EXPR:
-        collect_shadows(c, n->switch_expr.expr);
-        collect_shadows_list(c, &n->switch_expr.arms);
-        break;
-    case AST_SWITCH_ARM:
-        collect_shadows(c, n->switch_arm.when_cond);
-        collect_shadows(c, n->switch_arm.result);
-        break;
-    case AST_IDENTIFIER:
-        /* inst_type_ref 是类型引用，不含局部影子名——显式 no-op 而非落 default */
-        break;
-    default: {
-        /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
-         * （ZANC_TRACE 门控）。 */
-        int nc = zan_ast_child_count(n), live = 0;
-        for (int i = 0; i < nc; i++) if (zan_ast_child_at(n, i)) live++;
-        if (live > 0)
-            zan_compile_trace("nsresolve.collect_shadows: kind %d has %d live children but no case",
-                              (int)n->kind, live);
-        break;
-    }
-    }
+  if (!n)
+    return;
+  switch (n->kind) {
+  case AST_PARAM:
+    shadow_add(&c->shadow, n->param.name);
+    collect_shadows(c, n->param.default_val);
+    break;
+  case AST_VAR_DECL:
+    shadow_add(&c->shadow, n->var_decl.name);
+    collect_shadows(c, n->var_decl.initializer);
+    break;
+  case AST_FOREACH_STMT:
+    shadow_add(&c->shadow, n->foreach_stmt.var_name);
+    collect_shadows(c, n->foreach_stmt.collection);
+    collect_shadows(c, n->foreach_stmt.body);
+    break;
+  case AST_CATCH_CLAUSE:
+    shadow_add(&c->shadow, n->catch_clause.var_name);
+    collect_shadows(c, n->catch_clause.body);
+    break;
+  case AST_LAMBDA:
+    collect_shadows_list(c, &n->lambda.params);
+    collect_shadows(c, n->lambda.body);
+    break;
+  case AST_BLOCK:
+    collect_shadows_list(c, &n->block.stmts);
+    break;
+  case AST_EXPR_STMT:
+    collect_shadows(c, n->expr_stmt.expr);
+    break;
+  case AST_RETURN_STMT:
+    collect_shadows(c, n->ret.value);
+    break;
+  case AST_IF_STMT:
+    collect_shadows(c, n->if_stmt.cond);
+    collect_shadows(c, n->if_stmt.then_body);
+    collect_shadows(c, n->if_stmt.else_body);
+    break;
+  case AST_WHILE_STMT:
+  case AST_DO_WHILE_STMT:
+    collect_shadows(c, n->while_stmt.cond);
+    collect_shadows(c, n->while_stmt.body);
+    break;
+  case AST_FOR_STMT:
+    collect_shadows(c, n->for_stmt.init);
+    collect_shadows(c, n->for_stmt.cond);
+    collect_shadows(c, n->for_stmt.step);
+    collect_shadows(c, n->for_stmt.body);
+    break;
+  case AST_TRY_STMT:
+    collect_shadows(c, n->try_stmt.try_body);
+    collect_shadows_list(c, &n->try_stmt.catches);
+    collect_shadows(c, n->try_stmt.finally_body);
+    break;
+  case AST_SWITCH_STMT:
+    collect_shadows(c, n->switch_stmt.expr);
+    collect_shadows_list(c, &n->switch_stmt.cases);
+    break;
+  case AST_SWITCH_CASE:
+    collect_shadows(c, n->switch_case.body);
+    break;
+  case AST_LOCK_STMT:
+    collect_shadows(c, n->lock_stmt.expr);
+    collect_shadows(c, n->lock_stmt.body);
+    break;
+  case AST_CHECKED_STMT:
+    collect_shadows(c, n->checked_stmt.body);
+    break;
+  case AST_BINARY:
+  case AST_ASSIGNMENT:
+    collect_shadows(c, n->binary.left);
+    collect_shadows(c, n->binary.right);
+    break;
+  case AST_UNARY:
+  case AST_POSTFIX_UNARY:
+    collect_shadows(c, n->unary.operand);
+    break;
+  case AST_CALL:
+    collect_shadows(c, n->call.callee);
+    collect_shadows_list(c, &n->call.args);
+    break;
+  case AST_MEMBER_ACCESS:
+    collect_shadows(c, n->member.object);
+    break;
+  case AST_INDEX:
+    collect_shadows(c, n->index.object);
+    collect_shadows(c, n->index.index);
+    break;
+  case AST_NEW_EXPR:
+    collect_shadows_list(c, &n->new_expr.args);
+    collect_shadows_list(c, &n->new_expr.arg_inits);
+    break;
+  case AST_CONDITIONAL:
+    collect_shadows(c, n->conditional.cond);
+    collect_shadows(c, n->conditional.then_expr);
+    collect_shadows(c, n->conditional.else_expr);
+    break;
+  case AST_CAST_EXPR:
+  case AST_TYPEOF_EXPR:
+  case AST_SIZEOF_EXPR:
+    collect_shadows(c, n->cast.expr);
+    break;
+  case AST_IS_EXPR:
+  case AST_AS_EXPR:
+    collect_shadows(c, n->type_test.expr);
+    break;
+  case AST_AWAIT_EXPR:
+    collect_shadows(c, n->await_expr.expr);
+    break;
+  case AST_STRING_INTERP:
+    collect_shadows_list(c, &n->string_interp.parts);
+    break;
+  case AST_REF_ARG:
+    collect_shadows(c, n->ref_arg.expr);
+    break;
+  case AST_NAMED_ARG:
+    collect_shadows(c, n->named_arg.expr);
+    break;
+  case AST_COLL_INIT:
+    collect_shadows_list(c, &n->coll_init.items);
+    break;
+  case AST_THROW_STMT:
+    collect_shadows(c, n->throw_stmt.value);
+    break;
+  case AST_YIELD_STMT:
+    collect_shadows(c, n->yield_stmt.value);
+    break;
+  case AST_TUPLE_EXPR:
+    collect_shadows_list(c, &n->tuple_expr.items);
+    break;
+  case AST_TUPLE_DECON:
+    /* 解构声明本身就是局部影子名（names 为 IDENTIFIER 节点） */
+    for (int i = 0; i < n->tuple_decon.names.count; i++)
+      shadow_add(&c->shadow, n->tuple_decon.names.items[i]->ident.name);
+    collect_shadows(c, n->tuple_decon.initializer);
+    break;
+  case AST_WITH_EXPR:
+    collect_shadows(c, n->with_expr.expr);
+    collect_shadows_list(c, &n->with_expr.assigns);
+    break;
+  case AST_SWITCH_EXPR:
+    collect_shadows(c, n->switch_expr.expr);
+    collect_shadows_list(c, &n->switch_expr.arms);
+    break;
+  case AST_SWITCH_ARM:
+    collect_shadows(c, n->switch_arm.when_cond);
+    collect_shadows(c, n->switch_arm.result);
+    break;
+  case AST_IDENTIFIER:
+    /* inst_type_ref 是类型引用，不含局部影子名——显式 no-op 而非落 default */
+    break;
+  default: {
+    /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
+     * （ZANC_TRACE 门控）。 */
+    int nc = zan_ast_child_count(n), live = 0;
+    for (int i = 0; i < nc; i++)
+      if (zan_ast_child_at(n, i))
+        live++;
+    if (live > 0)
+      zan_compile_trace(
+          "nsresolve.collect_shadows: kind %d has %d live children but no case",
+          (int)n->kind, live);
+    break;
+  }
+  }
 }
 
-static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
-                    zan_istr_t ns, zan_ast_list_t *usings);
+static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n, zan_istr_t ns,
+                    zan_ast_list_t *usings);
 
-static void nr_walk_list(nr_ctx_t *c, zan_ast_list_t *l,
-                         zan_istr_t ns, zan_ast_list_t *usings) {
-    if (!l) return;
-    for (int i = 0; i < l->count; i++)
-        nr_walk(c, l->items[i], ns, usings);
+static void nr_walk_list(nr_ctx_t *c, zan_ast_list_t *l, zan_istr_t ns,
+                         zan_ast_list_t *usings) {
+  if (!l)
+    return;
+  for (int i = 0; i < l->count; i++)
+    nr_walk(c, l->items[i], ns, usings);
 }
 
-static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
-                    zan_istr_t ns, zan_ast_list_t *usings) {
-    if (!n) return;
-    if (zan_ast_ns_usings(n)) {
-        ns = zan_ast_ns_name(n);
-        usings = zan_ast_ns_usings(n);
+static void nr_record_attr_name(nr_ctx_t *c, zan_ast_node_t *name) {
+  if (!c->refs || !name)
+    return;
+  zan_istr_t tail = {0};
+  if (name->kind == AST_IDENTIFIER) {
+    tail = name->ident.name;
+  } else if (name->kind == AST_MEMBER_ACCESS) {
+    tail = name->member.name;
+  } else if (name->kind == AST_QUALIFIED_NAME &&
+             name->qualified_name.parts.count > 0) {
+    zan_ast_node_t *last =
+        name->qualified_name.parts.items[name->qualified_name.parts.count - 1];
+    if (last && last->kind == AST_IDENTIFIER)
+      tail = last->ident.name;
+  }
+  if (!tail.str || tail.len == 0)
+    return;
+  zan_refs_add(c->refs, tail, c->arena);
+  if (tail.len <= 9 ||
+      memcmp(tail.str + tail.len - 9, "Attribute", 9) != 0) {
+    char *buf = (char *)zan_arena_alloc(c->arena, (size_t)tail.len + 10);
+    if (buf) {
+      memcpy(buf, tail.str, tail.len);
+      memcpy(buf + tail.len, "Attribute", 9);
+      buf[tail.len + 9] = '\0';
+      zan_refs_add(c->refs,
+                   (zan_istr_t){buf, (uint32_t)(tail.len + 9)}, c->arena);
     }
-    switch (n->kind) {
-    case AST_TYPE_REF:
-        resolve_ref(c, n, ns, usings);
-        nr_walk_list(c, &n->type_ref.type_args, ns, usings);
-        /* 数组的元素类型是**另一个**类型节点（解析器把元素包进一个合成的
-         * AST_TYPE_REF，元素本体挂在 array_element 上）。不下钻的话，元素
-         * 节点的名字从没被改写过——限定名（`Outer.Inner`）就保持原样，绑定期
-         * 的 scope_find 查不到 → "undefined type 'Outer.Inner'"。
-         * 元素节点与包装节点同名，"ambiguous type" 只由包装节点报一次。 */
-        if (n->type_ref.array_element) {
-            bool saved = c->quiet_ambiguity;
-            c->quiet_ambiguity = true;
-            nr_walk(c, n->type_ref.array_element, ns, usings);
-            c->quiet_ambiguity = saved;
-        }
-        break;
+  }
+}
 
-    case AST_CLASS_DECL:
-    case AST_STRUCT_DECL:
-    case AST_INTERFACE_DECL:
-    case AST_ENUM_DECL: {
-        int saved_fields = c->fields.count;
-        const zan_ast_list_t *saved_type_params = c->type_params;
-        c->type_params = &n->type_decl.type_params;
-        for (int i = 0; i < n->type_decl.members.count; i++) {
-            zan_ast_node_t *m = n->type_decl.members.items[i];
-            if (m && (m->kind == AST_FIELD_DECL || m->kind == AST_PROPERTY_DECL))
-                shadow_add(&c->fields, m->field_decl.name);
-        }
-        nr_walk_list(c, &n->type_decl.bases, ns, usings);
-        if (n->type_decl.where_clauses)
-            nr_walk_list(c, n->type_decl.where_clauses, ns, usings);
-        nr_walk_list(c, &n->type_decl.members, ns, usings);
-        c->fields.count = saved_fields;
-        c->type_params = saved_type_params;
-        break;
+static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n, zan_istr_t ns,
+                    zan_ast_list_t *usings) {
+  if (!n)
+    return;
+  if (zan_ast_ns_usings(n)) {
+    ns = zan_ast_ns_name(n);
+    usings = zan_ast_ns_usings(n);
+  }
+  if (n->meta && n->meta->attributes.count > 0)
+    nr_walk_list(c, &n->meta->attributes, ns, usings);
+  switch (n->kind) {
+  case AST_TYPE_REF:
+    resolve_ref(c, n, ns, usings);
+    nr_walk_list(c, &n->type_ref.type_args, ns, usings);
+    /* 数组的元素类型是**另一个**类型节点（解析器把元素包进一个合成的
+     * AST_TYPE_REF，元素本体挂在 array_element 上）。不下钻的话，元素
+     * 节点的名字从没被改写过——限定名（`Outer.Inner`）就保持原样，绑定期
+     * 的 scope_find 查不到 → "undefined type 'Outer.Inner'"。
+     * 元素节点与包装节点同名，"ambiguous type" 只由包装节点报一次。 */
+    if (n->type_ref.array_element) {
+      bool saved = c->quiet_ambiguity;
+      c->quiet_ambiguity = true;
+      nr_walk(c, n->type_ref.array_element, ns, usings);
+      c->quiet_ambiguity = saved;
     }
+    break;
 
-    case AST_DELEGATE_DECL:
-    case AST_METHOD_DECL:
-    case AST_CONSTRUCTOR_DECL:
-    case AST_DESTRUCTOR_DECL: {
-        const zan_ast_list_t *saved_type_params = c->method_type_params;
-        c->method_type_params = &n->method_decl.type_params;
-        c->shadow.count = 0;
-        collect_shadows_list(c, &n->method_decl.params);
-        collect_shadows(c, n->method_decl.body);
-        nr_walk(c, n->method_decl.return_type, ns, usings);
-        nr_walk_list(c, &n->method_decl.params, ns, usings);
-        if (n->method_decl.ext) {
-            nr_walk_list(c, &n->method_decl.ext->where_clauses, ns, usings);
-            nr_walk_list(c, &n->method_decl.ext->base_args, ns, usings);
-        }
-        nr_walk(c, n->method_decl.body, ns, usings);
-        c->shadow.count = 0;
-        c->method_type_params = saved_type_params;
-        break;
+  case AST_CLASS_DECL:
+  case AST_STRUCT_DECL:
+  case AST_INTERFACE_DECL:
+  case AST_ENUM_DECL: {
+    int saved_fields = c->fields.count;
+    const zan_ast_list_t *saved_type_params = c->type_params;
+    c->type_params = &n->type_decl.type_params;
+    for (int i = 0; i < n->type_decl.members.count; i++) {
+      zan_ast_node_t *m = n->type_decl.members.items[i];
+      if (m && (m->kind == AST_FIELD_DECL || m->kind == AST_PROPERTY_DECL))
+        shadow_add(&c->fields, m->field_decl.name);
     }
+    nr_walk_list(c, &n->type_decl.bases, ns, usings);
+    if (n->type_decl.where_clauses)
+      nr_walk_list(c, n->type_decl.where_clauses, ns, usings);
+    nr_walk_list(c, &n->type_decl.members, ns, usings);
+    c->fields.count = saved_fields;
+    c->type_params = saved_type_params;
+    break;
+  }
 
-    case AST_FIELD_DECL:
-    case AST_PROPERTY_DECL:
-        nr_walk(c, n->field_decl.type, ns, usings);
-        nr_walk(c, n->field_decl.initializer, ns, usings);
-        break;
-
-    case AST_PARAM:
-        nr_walk(c, n->param.type, ns, usings);
-        nr_walk(c, n->param.default_val, ns, usings);
-        break;
-
-    case AST_WHERE_CLAUSE:
-        nr_walk_list(c, &n->where_clause.constraints, ns, usings);
-        break;
-
-    case AST_BLOCK:
-        nr_walk_list(c, &n->block.stmts, ns, usings);
-        break;
-
-    case AST_VAR_DECL:
-        nr_walk(c, n->var_decl.type, ns, usings);
-        nr_walk(c, n->var_decl.initializer, ns, usings);
-        break;
-
-    case AST_EXPR_STMT:
-        nr_walk(c, n->expr_stmt.expr, ns, usings);
-        break;
-
-    case AST_RETURN_STMT:
-        nr_walk(c, n->ret.value, ns, usings);
-        break;
-
-    case AST_IF_STMT:
-        nr_walk(c, n->if_stmt.cond, ns, usings);
-        nr_walk(c, n->if_stmt.then_body, ns, usings);
-        nr_walk(c, n->if_stmt.else_body, ns, usings);
-        break;
-
-    case AST_WHILE_STMT:
-    case AST_DO_WHILE_STMT:
-        nr_walk(c, n->while_stmt.cond, ns, usings);
-        nr_walk(c, n->while_stmt.body, ns, usings);
-        break;
-
-    case AST_FOR_STMT:
-        nr_walk(c, n->for_stmt.init, ns, usings);
-        nr_walk(c, n->for_stmt.cond, ns, usings);
-        nr_walk(c, n->for_stmt.step, ns, usings);
-        nr_walk(c, n->for_stmt.body, ns, usings);
-        break;
-
-    case AST_FOREACH_STMT:
-        nr_walk(c, n->foreach_stmt.var_type, ns, usings);
-        nr_walk(c, n->foreach_stmt.collection, ns, usings);
-        nr_walk(c, n->foreach_stmt.body, ns, usings);
-        break;
-
-    case AST_THROW_STMT:
-        nr_walk(c, n->throw_stmt.value, ns, usings);
-        break;
-
-    case AST_TRY_STMT:
-        nr_walk(c, n->try_stmt.try_body, ns, usings);
-        nr_walk_list(c, &n->try_stmt.catches, ns, usings);
-        nr_walk(c, n->try_stmt.finally_body, ns, usings);
-        break;
-
-    case AST_CATCH_CLAUSE:
-        nr_walk(c, n->catch_clause.type, ns, usings);
-        nr_walk(c, n->catch_clause.body, ns, usings);
-        break;
-
-    case AST_SWITCH_STMT:
-        nr_walk(c, n->switch_stmt.expr, ns, usings);
-        nr_walk_list(c, &n->switch_stmt.cases, ns, usings);
-        break;
-
-    case AST_SWITCH_CASE:
-        nr_walk(c, n->switch_case.pattern, ns, usings);
-        nr_walk(c, n->switch_case.body, ns, usings);
-        break;
-
-    case AST_LOCK_STMT:
-        nr_walk(c, n->lock_stmt.expr, ns, usings);
-        nr_walk(c, n->lock_stmt.body, ns, usings);
-        break;
-
-    case AST_CHECKED_STMT:
-        nr_walk(c, n->checked_stmt.body, ns, usings);
-        break;
-
-    case AST_YIELD_STMT:
-        nr_walk(c, n->yield_stmt.value, ns, usings);
-        break;
-
-    case AST_BINARY:
-    case AST_ASSIGNMENT:
-        nr_walk(c, n->binary.left, ns, usings);
-        nr_walk(c, n->binary.right, ns, usings);
-        break;
-
-    case AST_UNARY:
-    case AST_POSTFIX_UNARY:
-        nr_walk(c, n->unary.operand, ns, usings);
-        break;
-
-    case AST_CALL:
-        nr_walk(c, n->call.callee, ns, usings);
-        nr_walk_list(c, &n->call.type_args, ns, usings);
-        nr_walk_list(c, &n->call.args, ns, usings);
-        break;
-
-    case AST_MEMBER_ACCESS:
-        if (n->member.object && n->member.object->kind == AST_IDENTIFIER)
-            resolve_static_receiver(c, n->member.object, ns, usings,
-                                    n->member.name);
-        else if (n->member.object && n->member.object->kind == AST_MEMBER_ACCESS)
-            resolve_qualified_receiver(c, n->member.object, ns, usings);
-        nr_walk(c, n->member.object, ns, usings);
-        break;
-
-    case AST_INDEX:
-        nr_walk(c, n->index.object, ns, usings);
-        nr_walk(c, n->index.index, ns, usings);
-        break;
-
-    case AST_NEW_EXPR:
-        nr_walk(c, n->new_expr.type, ns, usings);
-        nr_walk_list(c, &n->new_expr.args, ns, usings);
-        nr_walk_list(c, &n->new_expr.arg_inits, ns, usings);
-        break;
-
-    case AST_CAST_EXPR:
-    case AST_TYPEOF_EXPR:
-    case AST_SIZEOF_EXPR:
-        nr_walk(c, n->cast.type, ns, usings);
-        nr_walk(c, n->cast.expr, ns, usings);
-        break;
-
-    case AST_IS_EXPR:
-    case AST_AS_EXPR:
-        nr_walk(c, n->type_test.expr, ns, usings);
-        nr_walk(c, n->type_test.type, ns, usings);
-        break;
-
-    case AST_CONDITIONAL:
-        nr_walk(c, n->conditional.cond, ns, usings);
-        nr_walk(c, n->conditional.then_expr, ns, usings);
-        nr_walk(c, n->conditional.else_expr, ns, usings);
-        break;
-
-    case AST_LAMBDA:
-        nr_walk_list(c, &n->lambda.params, ns, usings);
-        nr_walk(c, n->lambda.body, ns, usings);
-        break;
-
-    case AST_AWAIT_EXPR:
-        if (c->refs) {
-            /* Native await lowering can throw without a source type reference. */
-            static const char exception_name[] = "InvalidOperationException";
-            zan_refs_add(c->refs,
-                         (zan_istr_t){(char *)exception_name, sizeof(exception_name) - 1},
-                         c->arena);
-        }
-        nr_walk(c, n->await_expr.expr, ns, usings);
-        break;
-
-    case AST_STRING_INTERP:
-        nr_walk_list(c, &n->string_interp.parts, ns, usings);
-        break;
-
-    case AST_REF_ARG:
-        nr_walk(c, n->ref_arg.expr, ns, usings);
-        nr_walk(c, n->ref_arg.decl_type, ns, usings);
-        break;
-
-    case AST_QUERY_EXPR:
-        nr_walk(c, n->query.source, ns, usings);
-        for (int ci = 0; ci < n->query.clauses.count; ci++) {
-            zan_ast_node_t *cl = n->query.clauses.items[ci];
-            nr_walk(c, cl->query_clause.expr, ns, usings);
-            if (cl->kind == AST_QUERY_JOIN) {
-                nr_walk(c, cl->query_clause.source, ns, usings);
-                nr_walk(c, cl->query_clause.left_key, ns, usings);
-                nr_walk(c, cl->query_clause.right_key, ns, usings);
-            }
-        }
-        nr_walk(c, n->query.group_expr, ns, usings);
-        nr_walk(c, n->query.group_key, ns, usings);
-        nr_walk(c, n->query.select, ns, usings);
-        break;
-
-    case AST_ENUM_MEMBER:
-        nr_walk(c, n->enum_member.value, ns, usings);
-        break;
-
-    case AST_NAMED_ARG:
-        nr_walk(c, n->named_arg.expr, ns, usings);
-        break;
-
-    case AST_COLL_INIT:
-        nr_walk_list(c, &n->coll_init.items, ns, usings);
-        break;
-
-    case AST_TUPLE_EXPR:
-        nr_walk_list(c, &n->tuple_expr.items, ns, usings);
-        break;
-
-    case AST_TUPLE_TYPE:
-        nr_walk_list(c, &n->tuple_type.elems, ns, usings);
-        break;
-
-    case AST_TUPLE_DECON:
-        nr_walk_list(c, &n->tuple_decon.types, ns, usings);
-        nr_walk(c, n->tuple_decon.initializer, ns, usings);
-        break;
-
-    case AST_WITH_EXPR:
-        nr_walk(c, n->with_expr.expr, ns, usings);
-        nr_walk_list(c, &n->with_expr.assigns, ns, usings);
-        break;
-
-    case AST_SWITCH_EXPR:
-        nr_walk(c, n->switch_expr.expr, ns, usings);
-        nr_walk_list(c, &n->switch_expr.arms, ns, usings);
-        break;
-
-    case AST_SWITCH_ARM:
-        nr_walk(c, n->switch_arm.pattern, ns, usings);
-        nr_walk(c, n->switch_arm.type_pattern, ns, usings);
-        nr_walk(c, n->switch_arm.when_cond, ns, usings);
-        nr_walk(c, n->switch_arm.result, ns, usings);
-        break;
-
-    case AST_IDENTIFIER:
-        /* 表达式位泛型实例化（`Gen<T>.Static()` / `Gen<T>{..}`）把类型实参挂在
-         * inst_type_ref 上——不下钻则其中的命名空间类型从未改写，绑定期
-         * "undefined type"（B-ID102 拓扑审计首发）。 */
-        nr_walk(c, n->ident.inst_type_ref, ns, usings);
-        break;
-
-    default: {
-        /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
-         * （ZANC_TRACE 门控）。 */
-        int nc = zan_ast_child_count(n), live = 0;
-        for (int i = 0; i < nc; i++) if (zan_ast_child_at(n, i)) live++;
-        if (live > 0)
-            zan_compile_trace("nsresolve.nr_walk: kind %d has %d live children but no case",
-                              (int)n->kind, live);
-        break;
+  case AST_DELEGATE_DECL:
+  case AST_METHOD_DECL:
+  case AST_CONSTRUCTOR_DECL:
+  case AST_DESTRUCTOR_DECL: {
+    const zan_ast_list_t *saved_type_params = c->method_type_params;
+    c->method_type_params = &n->method_decl.type_params;
+    c->shadow.count = 0;
+    collect_shadows_list(c, &n->method_decl.params);
+    collect_shadows(c, n->method_decl.body);
+    nr_walk(c, n->method_decl.return_type, ns, usings);
+    nr_walk_list(c, &n->method_decl.params, ns, usings);
+    if (n->method_decl.ext) {
+      nr_walk_list(c, &n->method_decl.ext->where_clauses, ns, usings);
+      nr_walk_list(c, &n->method_decl.ext->base_args, ns, usings);
     }
+    nr_walk(c, n->method_decl.body, ns, usings);
+    c->shadow.count = 0;
+    c->method_type_params = saved_type_params;
+    break;
+  }
+
+  case AST_FIELD_DECL:
+  case AST_PROPERTY_DECL: {
+    nr_walk(c, n->field_decl.type, ns, usings);
+    nr_walk(c, n->field_decl.initializer, ns, usings);
+    int saved_shadow = c->shadow.count;
+    if (n->field_decl.indexer_params) {
+      collect_shadows_list(c, n->field_decl.indexer_params);
+      nr_walk_list(c, n->field_decl.indexer_params, ns, usings);
     }
+    if (n->field_decl.getter_body) {
+      collect_shadows(c, n->field_decl.getter_body);
+      nr_walk(c, n->field_decl.getter_body, ns, usings);
+    }
+    if (n->field_decl.setter_body) {
+      collect_shadows(c, n->field_decl.setter_body);
+      nr_walk(c, n->field_decl.setter_body, ns, usings);
+    }
+    c->shadow.count = saved_shadow;
+    break;
+  }
+
+  case AST_ATTRIBUTE:
+    nr_record_attr_name(c, n->attribute.name);
+    nr_walk_list(c, &n->attribute.args, ns, usings);
+    break;
+
+  case AST_PARAM:
+    nr_walk(c, n->param.type, ns, usings);
+    nr_walk(c, n->param.default_val, ns, usings);
+    break;
+
+  case AST_WHERE_CLAUSE:
+    nr_walk_list(c, &n->where_clause.constraints, ns, usings);
+    break;
+
+  case AST_BLOCK:
+    nr_walk_list(c, &n->block.stmts, ns, usings);
+    break;
+
+  case AST_VAR_DECL:
+    nr_walk(c, n->var_decl.type, ns, usings);
+    nr_walk(c, n->var_decl.initializer, ns, usings);
+    break;
+
+  case AST_EXPR_STMT:
+    nr_walk(c, n->expr_stmt.expr, ns, usings);
+    break;
+
+  case AST_RETURN_STMT:
+    nr_walk(c, n->ret.value, ns, usings);
+    break;
+
+  case AST_IF_STMT:
+    nr_walk(c, n->if_stmt.cond, ns, usings);
+    nr_walk(c, n->if_stmt.then_body, ns, usings);
+    nr_walk(c, n->if_stmt.else_body, ns, usings);
+    break;
+
+  case AST_WHILE_STMT:
+  case AST_DO_WHILE_STMT:
+    nr_walk(c, n->while_stmt.cond, ns, usings);
+    nr_walk(c, n->while_stmt.body, ns, usings);
+    break;
+
+  case AST_FOR_STMT:
+    nr_walk(c, n->for_stmt.init, ns, usings);
+    nr_walk(c, n->for_stmt.cond, ns, usings);
+    nr_walk(c, n->for_stmt.step, ns, usings);
+    nr_walk(c, n->for_stmt.body, ns, usings);
+    break;
+
+  case AST_FOREACH_STMT:
+    nr_walk(c, n->foreach_stmt.var_type, ns, usings);
+    nr_walk(c, n->foreach_stmt.collection, ns, usings);
+    nr_walk(c, n->foreach_stmt.body, ns, usings);
+    break;
+
+  case AST_THROW_STMT:
+    nr_walk(c, n->throw_stmt.value, ns, usings);
+    break;
+
+  case AST_TRY_STMT:
+    nr_walk(c, n->try_stmt.try_body, ns, usings);
+    nr_walk_list(c, &n->try_stmt.catches, ns, usings);
+    nr_walk(c, n->try_stmt.finally_body, ns, usings);
+    break;
+
+  case AST_CATCH_CLAUSE:
+    nr_walk(c, n->catch_clause.type, ns, usings);
+    nr_walk(c, n->catch_clause.body, ns, usings);
+    break;
+
+  case AST_SWITCH_STMT:
+    nr_walk(c, n->switch_stmt.expr, ns, usings);
+    nr_walk_list(c, &n->switch_stmt.cases, ns, usings);
+    break;
+
+  case AST_SWITCH_CASE:
+    nr_walk(c, n->switch_case.pattern, ns, usings);
+    nr_walk(c, n->switch_case.body, ns, usings);
+    break;
+
+  case AST_LOCK_STMT:
+    nr_walk(c, n->lock_stmt.expr, ns, usings);
+    nr_walk(c, n->lock_stmt.body, ns, usings);
+    break;
+
+  case AST_CHECKED_STMT:
+    nr_walk(c, n->checked_stmt.body, ns, usings);
+    break;
+
+  case AST_YIELD_STMT:
+    nr_walk(c, n->yield_stmt.value, ns, usings);
+    break;
+
+  case AST_BINARY:
+  case AST_ASSIGNMENT:
+    nr_walk(c, n->binary.left, ns, usings);
+    nr_walk(c, n->binary.right, ns, usings);
+    break;
+
+  case AST_UNARY:
+  case AST_POSTFIX_UNARY:
+    nr_walk(c, n->unary.operand, ns, usings);
+    break;
+
+  case AST_CALL:
+    nr_walk(c, n->call.callee, ns, usings);
+    nr_walk_list(c, &n->call.type_args, ns, usings);
+    nr_walk_list(c, &n->call.args, ns, usings);
+    break;
+
+  case AST_MEMBER_ACCESS:
+    if (n->member.object && n->member.object->kind == AST_IDENTIFIER)
+      resolve_static_receiver(c, n->member.object, ns, usings, n->member.name);
+    else if (n->member.object && n->member.object->kind == AST_MEMBER_ACCESS)
+      resolve_qualified_receiver(c, n->member.object, ns, usings);
+    nr_walk(c, n->member.object, ns, usings);
+    break;
+
+  case AST_INDEX:
+    nr_walk(c, n->index.object, ns, usings);
+    nr_walk(c, n->index.index, ns, usings);
+    break;
+
+  case AST_NEW_EXPR:
+    nr_walk(c, n->new_expr.type, ns, usings);
+    nr_walk_list(c, &n->new_expr.args, ns, usings);
+    nr_walk_list(c, &n->new_expr.arg_inits, ns, usings);
+    break;
+
+  case AST_CAST_EXPR:
+  case AST_TYPEOF_EXPR:
+  case AST_SIZEOF_EXPR:
+    nr_walk(c, n->cast.type, ns, usings);
+    nr_walk(c, n->cast.expr, ns, usings);
+    break;
+
+  case AST_IS_EXPR:
+  case AST_AS_EXPR:
+    nr_walk(c, n->type_test.expr, ns, usings);
+    nr_walk(c, n->type_test.type, ns, usings);
+    break;
+
+  case AST_CONDITIONAL:
+    nr_walk(c, n->conditional.cond, ns, usings);
+    nr_walk(c, n->conditional.then_expr, ns, usings);
+    nr_walk(c, n->conditional.else_expr, ns, usings);
+    break;
+
+  case AST_LAMBDA:
+    nr_walk_list(c, &n->lambda.params, ns, usings);
+    nr_walk(c, n->lambda.body, ns, usings);
+    break;
+
+  case AST_AWAIT_EXPR:
+    if (c->refs) {
+      /* Native await lowering can throw without a source type reference. */
+      static const char exception_name[] = "InvalidOperationException";
+      zan_refs_add(
+          c->refs,
+          (zan_istr_t){(char *)exception_name, sizeof(exception_name) - 1},
+          c->arena);
+    }
+    nr_walk(c, n->await_expr.expr, ns, usings);
+    break;
+
+  case AST_STRING_INTERP:
+    nr_walk_list(c, &n->string_interp.parts, ns, usings);
+    break;
+
+  case AST_REF_ARG:
+    nr_walk(c, n->ref_arg.expr, ns, usings);
+    nr_walk(c, n->ref_arg.decl_type, ns, usings);
+    break;
+
+  case AST_QUERY_EXPR:
+    nr_walk(c, n->query.source, ns, usings);
+    for (int ci = 0; ci < n->query.clauses.count; ci++) {
+      zan_ast_node_t *cl = n->query.clauses.items[ci];
+      nr_walk(c, cl->query_clause.expr, ns, usings);
+      if (cl->kind == AST_QUERY_JOIN) {
+        nr_walk(c, cl->query_clause.source, ns, usings);
+        nr_walk(c, cl->query_clause.left_key, ns, usings);
+        nr_walk(c, cl->query_clause.right_key, ns, usings);
+      }
+    }
+    nr_walk(c, n->query.group_expr, ns, usings);
+    nr_walk(c, n->query.group_key, ns, usings);
+    nr_walk(c, n->query.select, ns, usings);
+    break;
+
+  case AST_ENUM_MEMBER:
+    nr_walk(c, n->enum_member.value, ns, usings);
+    break;
+
+  case AST_NAMED_ARG:
+    nr_walk(c, n->named_arg.expr, ns, usings);
+    break;
+
+  case AST_COLL_INIT:
+    nr_walk_list(c, &n->coll_init.items, ns, usings);
+    break;
+
+  case AST_TUPLE_EXPR:
+    nr_walk_list(c, &n->tuple_expr.items, ns, usings);
+    break;
+
+  case AST_TUPLE_TYPE:
+    nr_walk_list(c, &n->tuple_type.elems, ns, usings);
+    break;
+
+  case AST_TUPLE_DECON:
+    nr_walk_list(c, &n->tuple_decon.types, ns, usings);
+    nr_walk(c, n->tuple_decon.initializer, ns, usings);
+    break;
+
+  case AST_WITH_EXPR:
+    nr_walk(c, n->with_expr.expr, ns, usings);
+    nr_walk_list(c, &n->with_expr.assigns, ns, usings);
+    break;
+
+  case AST_SWITCH_EXPR:
+    nr_walk(c, n->switch_expr.expr, ns, usings);
+    nr_walk_list(c, &n->switch_expr.arms, ns, usings);
+    break;
+
+  case AST_SWITCH_ARM:
+    nr_walk(c, n->switch_arm.pattern, ns, usings);
+    nr_walk(c, n->switch_arm.type_pattern, ns, usings);
+    nr_walk(c, n->switch_arm.when_cond, ns, usings);
+    nr_walk(c, n->switch_arm.result, ns, usings);
+    break;
+
+  case AST_IDENTIFIER:
+    /* 表达式位泛型实例化（`Gen<T>.Static()` / `Gen<T>{..}`）把类型实参挂在
+     * inst_type_ref 上——不下钻则其中的命名空间类型从未改写，绑定期
+     * "undefined type"（B-ID102 拓扑审计首发）。 */
+    nr_walk(c, n->ident.inst_type_ref, ns, usings);
+    break;
+
+  default: {
+    /* B-ID102 覆盖审计：有非 NULL 子节点的 kind 落到 default 即疑似漏改
+     * （ZANC_TRACE 门控）。 */
+    int nc = zan_ast_child_count(n), live = 0;
+    for (int i = 0; i < nc; i++)
+      if (zan_ast_child_at(n, i))
+        live++;
+    if (live > 0)
+      zan_compile_trace(
+          "nsresolve.nr_walk: kind %d has %d live children but no case",
+          (int)n->kind, live);
+    break;
+  }
+  }
 }
 
 static void index_declarations(nr_ctx_t *c, const zan_ast_list_t *decls) {
-    c->items = (nr_type_t *)zan_arena_alloc(c->arena,
-                    sizeof(nr_type_t) * (size_t)decls->count);
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (!d || !is_type_decl_kind(d->kind)) continue;
-        nr_type_t *t = &c->items[c->count++];
-        *t = (nr_type_t){0};
-        t->decl = d;
-        t->simple = decl_source_name(d);
-        t->full = decl_full_name(c->arena, d);
-        if (decl_owner(d)) t->alias = join_ns(c->arena, zan_ast_ns_name(d), t->simple);
-        t->final = decl_simple_name(d);
-    }
-    nr_index_build(&c->by_full, c->items, c->count, NR_FULL, c->arena);
-    nr_index_build(&c->by_simple, c->items, c->count, NR_SIMPLE, c->arena);
-    nr_index_build(&c->by_alias, c->items, c->count, NR_ALIAS, c->arena);
+  c->items = (nr_type_t *)zan_arena_alloc(c->arena, sizeof(nr_type_t) *
+                                                        (size_t)decls->count);
+  for (int i = 0; i < decls->count; i++) {
+    zan_ast_node_t *d = decls->items[i];
+    if (!d || !is_type_decl_kind(d->kind))
+      continue;
+    nr_type_t *t = &c->items[c->count++];
+    *t = (nr_type_t){0};
+    t->decl = d;
+    t->simple = decl_source_name(d);
+    t->full = decl_full_name(c->arena, d);
+    if (decl_owner(d))
+      t->alias = join_ns(c->arena, zan_ast_ns_name(d), t->simple);
+    t->final = decl_simple_name(d);
+  }
+  nr_index_build(&c->by_full, c->items, c->count, NR_FULL, c->arena);
+  nr_index_build(&c->by_simple, c->items, c->count, NR_SIMPLE, c->arena);
+  nr_index_build(&c->by_alias, c->items, c->count, NR_ALIAS, c->arena);
 }
 
-static void walk_declaration(nr_ctx_t *c, zan_ast_node_t *decl, const nr_type_t *type) {
-    c->owner = type;
-    c->shadow.count = 0;
-    nr_walk(c, decl, zan_ast_ns_name(decl), zan_ast_ns_usings(decl));
+static void walk_declaration(nr_ctx_t *c, zan_ast_node_t *decl,
+                             const nr_type_t *type) {
+  c->owner = type;
+  c->shadow.count = 0;
+  nr_walk(c, decl, zan_ast_ns_name(decl), zan_ast_ns_usings(decl));
 }
 
 static void nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
                           zan_diag_t *diag, bool qualified_keys) {
-    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    zan_ast_list_t *decls = &unit->comp_unit.decls;
-    if (decls->count == 0) return;
-    /* B-ID102 拓扑表自检（ZANC_TRACE 门控）：经 child_count/child_at 递归数全树，
-     * 与 zan_ast_node_count() 对照——拓扑表登错字段即崩或计数离谱。 */
-    if (getenv("ZANC_TRACE"))
-        zan_compile_trace("nsresolve: unit subtree nodes=%zu (allocated=%zu)",
-                          zan_ast_subtree_count(unit), zan_ast_node_count());
+  if (!unit || unit->kind != AST_COMPILATION_UNIT)
+    return;
+  zan_ast_list_t *decls = &unit->comp_unit.decls;
+  if (decls->count == 0)
+    return;
+  /* B-ID102 拓扑表自检（ZANC_TRACE 门控）：经 child_count/child_at 递归数全树，
+   * 与 zan_ast_node_count() 对照——拓扑表登错字段即崩或计数离谱。 */
+  if (getenv("ZANC_TRACE"))
+    zan_compile_trace("nsresolve: unit subtree nodes=%zu (allocated=%zu)",
+                      zan_ast_subtree_count(unit), zan_ast_node_count());
 
-    nr_ctx_t c = {0};
-    c.arena = arena;
-    c.diag = diag;
-    c.qualified_keys = qualified_keys;
-    index_declarations(&c, decls);
+  nr_ctx_t c = {0};
+  c.arena = arena;
+  c.diag = diag;
+  c.qualified_keys = qualified_keys;
+  index_declarations(&c, decls);
 
-    /* A late source name can coincide with a key already assigned in pass one. */
-    for (int i = 0; i < c.count; i++) {
-        nr_type_t *t = &c.items[i];
-        if (ns_istr_eq(t->final, t->simple)) continue;
-        for (int node = c.by_simple.buckets[nr_hash(t->final) & c.by_simple.mask];
-             node >= 0; node = c.by_simple.chains[node].next) {
-            nr_type_t *other = &c.items[c.by_simple.chains[node].idx];
-            if (ns_istr_eq(other->simple, t->final)) other->conflicting = true;
-        }
+  /* A late source name can coincide with a key already assigned in pass one. */
+  for (int i = 0; i < c.count; i++) {
+    nr_type_t *t = &c.items[i];
+    if (ns_istr_eq(t->final, t->simple))
+      continue;
+    for (int node = c.by_simple.buckets[nr_hash(t->final) & c.by_simple.mask];
+         node >= 0; node = c.by_simple.chains[node].next) {
+      nr_type_t *other = &c.items[c.by_simple.chains[node].idx];
+      if (ns_istr_eq(other->simple, t->final))
+        other->conflicting = true;
     }
+  }
 
-    for (int i = 0; i < c.count; i++) {
-        nr_type_t *t = &c.items[i];
-        int first = i;
-        for (int node = c.by_simple.buckets[nr_hash(t->simple) & c.by_simple.mask];
-             node >= 0; node = c.by_simple.chains[node].next) {
-            int j = c.by_simple.chains[node].idx;
-            nr_type_t *other = &c.items[j];
-            if (!ns_istr_eq(other->simple, t->simple)) continue;
-            if (!same_decl_identity(other, t)) t->conflicting = true;
-            else if (j < first) first = j;
-        }
-        /* The binder diagnoses duplicates only when they have the same key. */
-        if (first < i) t->final = c.items[first].final;
-        else if (qualified_keys) t->final = t->full;
-        else if (t->conflicting && ns_istr_eq(t->final, t->simple))
-            t->final = mangle(&c, t->full);
-        if (!ns_istr_eq(t->final, t->simple) && zan_ast_orig_name(t->decl).len == 0)
-            zan_ast_ensure_decl_meta(t->decl, arena)->orig_name = t->simple;
-        decl_set_name(t->decl, t->final);
+  for (int i = 0; i < c.count; i++) {
+    nr_type_t *t = &c.items[i];
+    int first = i;
+    for (int node = c.by_simple.buckets[nr_hash(t->simple) & c.by_simple.mask];
+         node >= 0; node = c.by_simple.chains[node].next) {
+      int j = c.by_simple.chains[node].idx;
+      nr_type_t *other = &c.items[j];
+      if (!ns_istr_eq(other->simple, t->simple))
+        continue;
+      if (!same_decl_identity(other, t))
+        t->conflicting = true;
+      else if (j < first)
+        first = j;
     }
-    nr_index_build(&c.by_final, c.items, c.count, NR_FINAL, arena);
+    /* The binder diagnoses duplicates only when they have the same key. */
+    if (first < i)
+      t->final = c.items[first].final;
+    else if (qualified_keys)
+      t->final = t->full;
+    else if (t->conflicting && ns_istr_eq(t->final, t->simple))
+      t->final = mangle(&c, t->full);
+    if (!ns_istr_eq(t->final, t->simple) && zan_ast_orig_name(t->decl).len == 0)
+      zan_ast_ensure_decl_meta(t->decl, arena)->orig_name = t->simple;
+    decl_set_name(t->decl, t->final);
+  }
+  nr_index_build(&c.by_final, c.items, c.count, NR_FINAL, arena);
 
-    int type = 0;
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (!d) continue;
-        walk_declaration(&c, d, is_type_decl_kind(d->kind) ? &c.items[type++] : NULL);
-    }
-    free(c.fields.items);
-    free(c.shadow.items);
+  int type = 0;
+  for (int i = 0; i < decls->count; i++) {
+    zan_ast_node_t *d = decls->items[i];
+    if (!d)
+      continue;
+    walk_declaration(&c, d,
+                     is_type_decl_kind(d->kind) ? &c.items[type++] : NULL);
+  }
+  free(c.fields.items);
+  free(c.shadow.items);
 }
 
-void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
-    nsresolve_run(unit, arena, diag, false);
+void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
+                       zan_diag_t *diag) {
+  nsresolve_run(unit, arena, diag, false);
 }
 
-void zan_nsresolve_workspace(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *diag) {
-    nsresolve_run(unit, arena, diag, true);
+void zan_nsresolve_workspace(zan_ast_node_t *unit, zan_arena_t *arena,
+                             zan_diag_t *diag) {
+  nsresolve_run(unit, arena, diag, true);
+}
+
+static bool nr_decl_or_method_has_attr(const zan_ast_node_t *d,
+                                        const char *short_name,
+                                        const char *full_name) {
+  if (!d)
+    return false;
+  if (zan_ast_has_attr(d, short_name) || zan_ast_has_attr(d, full_name))
+    return true;
+  if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL) {
+    for (int m = 0; m < d->type_decl.members.count; m++) {
+      zan_ast_node_t *mem = d->type_decl.members.items[m];
+      if (mem && mem->kind == AST_METHOD_DECL &&
+          (zan_ast_has_attr(mem, short_name) ||
+           zan_ast_has_attr(mem, full_name)))
+        return true;
+    }
+  }
+  return false;
 }
 
 void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
                          zan_diag_t *diag) {
-    if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    zan_ast_list_t *decls = &unit->comp_unit.decls;
-    if (decls->count == 0) return;
+  if (!unit || unit->kind != AST_COMPILATION_UNIT)
+    return;
+  zan_ast_list_t *decls = &unit->comp_unit.decls;
+  if (decls->count == 0)
+    return;
 
-    if (getenv("ZAN_NO_PRUNE")) return;
-    nr_ctx_t c = {0};
-    c.arena = arena;
-    index_declarations(&c, decls);
-    int n = c.count;
-    nr_type_t *items = c.items;
+  if (getenv("ZAN_NO_PRUNE"))
+    return;
+  nr_ctx_t c = {0};
+  c.arena = arena;
+  index_declarations(&c, decls);
+  int n = c.count;
+  nr_type_t *items = c.items;
 
-    int user_roots = 0;
-    for (int i = 0; i < n; i++)
-        if (!items[i].decl->from_stdlib) user_roots++;
-    if (user_roots == 0) return;
-    nr_index_build(&c.by_final, items, n, NR_FINAL, arena);
-    unsigned char *kept = (unsigned char *)calloc((size_t)n, 1);
-    if (!kept) return;
-    for (int i = 0; i < n; i++) {
-        zan_ast_node_t *d = items[i].decl;
-        if (!d->from_stdlib) { kept[i] = 1; continue; }
-        if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL) {
-            bool is_ext_host = false;
-            for (int m = 0; m < d->type_decl.members.count && !is_ext_host; m++) {
-                zan_ast_node_t *mem = d->type_decl.members.items[m];
-                if (!mem || mem->kind != AST_METHOD_DECL) continue;
-                zan_ast_list_t *ps = &mem->method_decl.params;
-                if (ps->count > 0 && ps->items[0] &&
-                    ps->items[0]->kind == AST_PARAM &&
-                    ps->items[0]->param.is_this) is_ext_host = true;
-            }
-            if (is_ext_host) kept[i] = 1;
+  int user_roots = 0;
+  for (int i = 0; i < n; i++)
+    if (!items[i].decl->from_stdlib && !items[i].decl->from_package)
+      user_roots++;
+  if (user_roots == 0)
+    return;
+  nr_index_build(&c.by_final, items, n, NR_FINAL, arena);
+  unsigned char *kept = (unsigned char *)calloc((size_t)n, 1);
+  if (!kept)
+    return;
+  for (int i = 0; i < n; i++) {
+    zan_ast_node_t *d = items[i].decl;
+    if (!d->from_stdlib && !d->from_package) {
+      kept[i] = 1;
+      continue;
+    }
+    if (d->kind == AST_CLASS_DECL || d->kind == AST_STRUCT_DECL) {
+      bool keep_root = false;
+      for (int m = 0; m < d->type_decl.members.count && !keep_root; m++) {
+        zan_ast_node_t *mem = d->type_decl.members.items[m];
+        if (!mem || mem->kind != AST_METHOD_DECL)
+          continue;
+        if (zan_ast_has_module_initializer(mem) ||
+            zan_ast_has_attr(mem, "Test") ||
+            zan_ast_has_attr(mem, "TestAttribute")) {
+          keep_root = true;
+          break;
         }
+        zan_ast_list_t *ps = &mem->method_decl.params;
+        if (ps->count > 0 && ps->items[0] && ps->items[0]->kind == AST_PARAM &&
+            ps->items[0]->param.is_this)
+          keep_root = true;
+      }
+      if (keep_root)
+        kept[i] = 1;
     }
+  }
 
-    unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
-    if (!walked) { free(kept); return; }
-    zp_refs_t refs = {0};
-    c.refs = &refs;
-    for (;;) {
-        int before = 0;
-        for (int i = 0; i < n; i++) before += kept[i];
-        for (int i = 0; i < n; i++) {
-            if (!kept[i] || walked[i]) continue;
-            walked[i] = 1;
-            zan_ast_node_t *d = items[i].decl;
-            refs.count = 0;
-            walk_declaration(&c, d, &items[i]);
-            /* Keep duplicates of a live declaration visible to the binder. */
-            zan_refs_add(&refs, items[i].final, arena);
-            zan_ast_node_t *owner = decl_owner(d);
-            if (owner) zan_refs_add(&refs, decl_simple_name(owner), arena);
-            for (int k = 0; k < refs.count; k++) {
-                zan_istr_t key = refs.items[k];
-                nr_index_t *ix = &c.by_final;
-                for (int node = ix->buckets[nr_hash(key) & ix->mask]; node >= 0;
-                     node = ix->chains[node].next) {
-                    int j = ix->chains[node].idx;
-                    if (ns_istr_eq(items[j].final, key)) kept[j] = 1;
-                }
-            }
-        }
-        int after = 0;
-        for (int i = 0; i < n; i++) after += kept[i];
-        if (after == before) break;
-    }
-    free(walked);
-
-    int w = 0;
-    int type = 0;
-    for (int i = 0; i < decls->count; i++) {
-        zan_ast_node_t *d = decls->items[i];
-        if (d && is_type_decl_kind(d->kind) && !kept[type++]) continue;
-        decls->items[w++] = d;
-    }
-    decls->count = w;
-    free(c.fields.items);
-    free(c.shadow.items);
+  unsigned char *walked = (unsigned char *)calloc((size_t)n, 1);
+  if (!walked) {
     free(kept);
+    return;
+  }
+  bool manifest_seeded = false;
+  zp_refs_t refs = {0};
+  c.refs = &refs;
+  for (;;) {
+    if (!manifest_seeded) {
+      bool has_live_manifest = false;
+      for (int i = 0; i < n; i++) {
+        if (kept[i] &&
+            nr_decl_or_method_has_attr(items[i].decl, "GuiKindManifest",
+                                       "GuiKindManifestAttribute")) {
+          has_live_manifest = true;
+          break;
+        }
+      }
+      if (has_live_manifest) {
+        manifest_seeded = true;
+        for (int j = 0; j < n; j++) {
+          if (!kept[j] &&
+              nr_decl_or_method_has_attr(items[j].decl, "GuiKind",
+                                         "GuiKindAttribute"))
+            kept[j] = 1;
+        }
+      }
+    }
+    int before = 0;
+    for (int i = 0; i < n; i++)
+      before += kept[i];
+    for (int i = 0; i < n; i++) {
+      if (!kept[i] || walked[i])
+        continue;
+      walked[i] = 1;
+      zan_ast_node_t *d = items[i].decl;
+      refs.count = 0;
+      walk_declaration(&c, d, &items[i]);
+      /* Keep duplicates of a live declaration visible to the binder. */
+      zan_refs_add(&refs, items[i].final, arena);
+      zan_ast_node_t *owner = decl_owner(d);
+      if (owner)
+        zan_refs_add(&refs, decl_simple_name(owner), arena);
+      for (int k = 0; k < refs.count; k++) {
+        zan_istr_t key = refs.items[k];
+        nr_index_t *ix = &c.by_final;
+        for (int node = ix->buckets[nr_hash(key) & ix->mask]; node >= 0;
+             node = ix->chains[node].next) {
+          int j = ix->chains[node].idx;
+          if (ns_istr_eq(items[j].final, key))
+            kept[j] = 1;
+        }
+      }
+    }
+    int after = 0;
+    for (int i = 0; i < n; i++)
+      after += kept[i];
+    if (after == before)
+      break;
+  }
+  free(walked);
+
+  int w = 0;
+  int type = 0;
+  for (int i = 0; i < decls->count; i++) {
+    zan_ast_node_t *d = decls->items[i];
+    if (d && is_type_decl_kind(d->kind) && !kept[type++])
+      continue;
+    decls->items[w++] = d;
+  }
+  decls->count = w;
+  free(c.fields.items);
+  free(c.shadow.items);
+  free(kept);
 }

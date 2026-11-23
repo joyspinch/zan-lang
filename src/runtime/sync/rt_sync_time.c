@@ -1,13 +1,27 @@
 /* rt_sync_time.c: 高精度单调时钟与计时器秒表底层原语实现 */
 
+#ifdef _WIN32
+static inline int64_t zan_qpc_freq(void) {
+    static int64_t freq;
+    int64_t f = __atomic_load_n(&freq, __ATOMIC_RELAXED);
+    if (!f) {
+        LARGE_INTEGER lf;
+        QueryPerformanceFrequency(&lf);
+        f = lf.QuadPart;
+        __atomic_store_n(&freq, f, __ATOMIC_RELAXED);
+    }
+    return f;
+}
+#endif
+
 int64_t zan_monotonic_us(void) {
 #ifdef _WIN32
-    static LARGE_INTEGER frequency;
-    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    int64_t f = zan_qpc_freq();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000
-        + ((now.QuadPart % frequency.QuadPart) * 1000000) / frequency.QuadPart);
+    if (f == 10000000LL) return (int64_t)(now.QuadPart / 10LL);
+    return (int64_t)((now.QuadPart / f) * 1000000
+        + ((now.QuadPart % f) * 1000000) / f);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -17,12 +31,12 @@ int64_t zan_monotonic_us(void) {
 
 int64_t zan_monotonic_ns(void) {
 #ifdef _WIN32
-    static LARGE_INTEGER frequency;
-    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    int64_t f = zan_qpc_freq();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000000
-        + ((now.QuadPart % frequency.QuadPart) * 1000000000) / frequency.QuadPart);
+    if (f == 10000000LL) return (int64_t)(now.QuadPart * 100LL);
+    return (int64_t)((now.QuadPart / f) * 1000000000
+        + ((now.QuadPart % f) * 1000000000) / f);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -42,9 +56,7 @@ int64_t zan_stopwatch_ticks(void) {
 
 int64_t zan_stopwatch_frequency(void) {
 #ifdef _WIN32
-    static LARGE_INTEGER frequency;
-    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
-    return frequency.QuadPart;
+    return zan_qpc_freq();
 #else
     return 1000000000;
 #endif

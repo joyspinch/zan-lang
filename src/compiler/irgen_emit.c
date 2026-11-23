@@ -26,6 +26,8 @@ typedef struct {
     LLVMTypeRef     fn_type;
     zan_ast_list_t *mtps;
     zan_type_t    **mbind;
+    bool            has_gctx;
+    int             gctx_owner_idx;
 } method_body_work_t;
 
 

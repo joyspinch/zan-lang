@@ -32,7 +32,6 @@ static const char *type_name(zan_type_t *t);
 static ZAN_TLS char g_type_name_pool[TYPE_NAME_SLOTS][TYPE_NAME_SLOT_SIZE];
 static ZAN_TLS int g_type_name_slot;
 
-
 /* Composite Dispatcher Submodules */
 #include "checker/checker_util.c"
 #include "checker/checker_type.c"

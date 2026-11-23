@@ -11,8 +11,8 @@ struct zan_diag;
 
 char *zan_genmeta_export(struct zan_ast_node *unit);
 
-char *zan_genmeta_export_files(struct zan_ast_node *unit,
-                               struct zan_diag *diag, bool bodies);
+char *zan_genmeta_export_files(struct zan_ast_node *unit, struct zan_diag *diag,
+                               bool bodies);
 
 struct zan_ast_node *zan_genmeta_find_call(struct zan_ast_node *unit, int id);
 

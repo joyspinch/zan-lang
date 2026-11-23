@@ -188,6 +188,20 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             continue;
         }
 
+        bool saved_canon_body = g->cur_canon_body;
+        LLVMValueRef saved_gctx_val = g->cur_gctx_val;
+        int saved_gctx_owner = g->cur_gctx_owner_idx;
+        if (work[w].has_gctx) {
+            g->cur_canon_body = true;
+            g->cur_gctx_val =
+                LLVMGetParam(fn, (unsigned)(param_count + param_offset));
+            g->cur_gctx_owner_idx = work[w].gctx_owner_idx;
+        } else {
+            g->cur_canon_body = false;
+            g->cur_gctx_val = NULL;
+            g->cur_gctx_owner_idx = -1;
+        }
+
         LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, entry);
         di_set_loc(g, member->loc);
@@ -354,10 +368,21 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 }
                 LLVMValueRef target_fn = target ? target->fn : NULL;
                 LLVMTypeRef target_fn_type = target ? target->fn_type : NULL;
+                zan_type_t *base_inst =
+                    (!this_init && type_sym->type && type_sym->type->base_type)
+                        ? concretize(g, type_sym->type->base_type)
+                        : NULL;
                 if (target && g->cur_inst && target_sym == type_sym) {
                     LLVMValueRef specialized = find_generic_ctor(
                         g, target_sym, target->decl, g->cur_inst->type_args,
                         g->cur_inst->type_arg_count, &target_fn_type);
+                    if (specialized) target_fn = specialized;
+                } else if (target && !this_init && base_inst &&
+                           base_inst->type_arg_count > 0 &&
+                           is_user_generic_sym(target_sym)) {
+                    LLVMValueRef specialized = find_generic_ctor(
+                        g, target_sym, target->decl, base_inst->type_args,
+                        base_inst->type_arg_count, &target_fn_type);
                     if (specialized) target_fn = specialized;
                 }
                 if (!target) {
@@ -378,16 +403,31 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                                 LLVMPointerType(bst, 0), "base.this");
                     }
                     int argc = init_args->count + 1;
+                    bool need_gctx = target_fn_type &&
+                        LLVMCountParamTypes(target_fn_type) == (unsigned)(argc + 1);
                     LLVMValueRef *cargs = (LLVMValueRef *)malloc(
-                        sizeof(LLVMValueRef) * (size_t)argc);
+                        sizeof(LLVMValueRef) * (size_t)(argc + (need_gctx ? 1 : 0)));
                     cargs[0] = thisv;
                     for (int ai = 0; ai < init_args->count; ai++) {
                         zan_ast_node_t *param =
                             target->decl->method_decl.params.items[ai];
-                        zan_type_t *pt = zan_binder_resolve_type(
-                            g->binder, param->param.type);
+                        zan_type_t *pt = resolve_type_ctx(g, param->param.type);
                         cargs[ai + 1] = emit_arg_typed(
                             g, init_args->items[ai], pt, locals);
+                    }
+                    if (need_gctx) {
+                        LLVMValueRef gctx_arg = NULL;
+                        if (this_init && g->cur_canon_body && g->cur_gctx_val) {
+                            gctx_arg = g->cur_gctx_val;
+                        } else if (base_inst) {
+                            gctx_arg = resolve_gctx_arg_for_inst(
+                                g, false, target_sym, base_inst, NULL, 0);
+                        }
+                        if (!gctx_arg) {
+                            gctx_arg = LLVMConstNull(
+                                LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
+                        }
+                        cargs[argc++] = gctx_arg;
                     }
                     coerce_args_to_params(g, target_fn_type, cargs, argc);
                     zan_call2(g->builder, target_fn_type, target_fn,
@@ -476,6 +516,9 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_type_sym = saved_type_sym;
         g->current_fn_body = saved_fn_body;
         g->current_fn_no_runtime = false;
+        g->cur_canon_body = saved_canon_body;
+        g->cur_gctx_val = saved_gctx_val;
+        g->cur_gctx_owner_idx = saved_gctx_owner;
         free(param_types);
 
         bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
@@ -518,6 +561,7 @@ typedef struct {
     zan_istr_t     *fields;
     int             field_count;
     int             fields_cap;
+    bool            scan_type_refs;
     bool            found;
 } tp_use_scan_t;
 
@@ -565,6 +609,27 @@ static bool tp_typeref_is_tp(tp_use_scan_t *s, zan_ast_node_t *tref) {
     return false;
 }
 
+static bool tp_typeref_mentions_tp(tp_use_scan_t *s, zan_ast_node_t *tref) {
+    if (!tref) return false;
+    if (tref->kind == AST_IDENTIFIER) {
+        for (int i = 0; i < s->tps->count; i++)
+            if (tp_istr_eq(s->tps->items[i]->ident.name, tref->ident.name))
+                return true;
+        return tref->ident.inst_type_ref &&
+               tp_typeref_mentions_tp(s, tref->ident.inst_type_ref);
+    }
+    if (tref->kind != AST_TYPE_REF) return false;
+    if (tp_typeref_is_tp(s, tref)) return true;
+    for (int i = 0; i < tref->type_ref.type_args.count; i++) {
+        if (tp_typeref_mentions_tp(s, tref->type_ref.type_args.items[i]))
+            return true;
+    }
+    if (tref->type_ref.array_element &&
+        tp_typeref_mentions_tp(s, tref->type_ref.array_element))
+        return true;
+    return false;
+}
+
 static bool tp_scan_is_tp_field(tp_use_scan_t *s, zan_istr_t name) {
     for (int i = 0; i < s->field_count; i++)
         if (tp_istr_eq(s->fields[i], name)) return true;
@@ -590,6 +655,12 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st);
 static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
     if (!e || s->found) return;
     switch (e->kind) {
+    case AST_IDENTIFIER:
+        if (s->scan_type_refs && e->ident.inst_type_ref &&
+            tp_typeref_mentions_tp(s, e->ident.inst_type_ref)) {
+            s->found = true;
+        }
+        return;
     case AST_MEMBER_ACCESS:
         if (tp_scan_is_tp_value(s, e->member.object)) { s->found = true; return; }
         tp_scan_expr(s, e->member.object);
@@ -601,7 +672,9 @@ static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
         return;
     case AST_CALL:
         for (int i = 0; i < e->call.type_args.count; i++)
-            if (tp_typeref_is_tp(s, e->call.type_args.items[i])) {
+            if ((s->scan_type_refs
+                     ? tp_typeref_mentions_tp(s, e->call.type_args.items[i])
+                     : tp_typeref_is_tp(s, e->call.type_args.items[i]))) {
                 s->found = true;
                 return;
             }
@@ -622,14 +695,36 @@ static void tp_scan_expr(tp_use_scan_t *s, zan_ast_node_t *e) {
         tp_scan_expr(s, e->conditional.else_expr);
         return;
     case AST_NEW_EXPR:
+        if (s->scan_type_refs && tp_typeref_mentions_tp(s, e->new_expr.type)) {
+            s->found = true;
+            return;
+        }
         for (int i = 0; i < e->new_expr.args.count; i++)
             tp_scan_expr(s, e->new_expr.args.items[i]);
         for (int i = 0; i < e->new_expr.arg_inits.count; i++)
             tp_scan_expr(s, e->new_expr.arg_inits.items[i]);
         return;
-    case AST_CAST_EXPR:  tp_scan_expr(s, e->cast.expr); return;
+    case AST_TYPEOF_EXPR:
+        if (s->scan_type_refs && tp_typeref_mentions_tp(s, e->cast.type)) {
+            s->found = true;
+            return;
+        }
+        return;
+    case AST_CAST_EXPR:
+        if (s->scan_type_refs && tp_typeref_mentions_tp(s, e->cast.type)) {
+            s->found = true;
+            return;
+        }
+        tp_scan_expr(s, e->cast.expr);
+        return;
     case AST_IS_EXPR:
-    case AST_AS_EXPR:    tp_scan_expr(s, e->type_test.expr); return;
+    case AST_AS_EXPR:
+        if (s->scan_type_refs && tp_typeref_mentions_tp(s, e->type_test.type)) {
+            s->found = true;
+            return;
+        }
+        tp_scan_expr(s, e->type_test.expr);
+        return;
     case AST_AWAIT_EXPR: tp_scan_expr(s, e->await_expr.expr); return;
     case AST_LAMBDA:     tp_scan_stmt(s, e->lambda.body); return;
     case AST_STRING_INTERP:
@@ -648,6 +743,10 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
             tp_scan_stmt(s, st->block.stmts.items[i]);
         return;
     case AST_VAR_DECL:
+        if (s->scan_type_refs && tp_typeref_mentions_tp(s, st->var_decl.type)) {
+            s->found = true;
+            return;
+        }
         if (tp_typeref_is_tp(s, st->var_decl.type)) {
             tp_scan_bind(s, st->var_decl.name);
             if (local_is_lambda_captured(s->g, NULL, s->body, st)) {
@@ -677,6 +776,11 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
         tp_scan_stmt(s, st->for_stmt.body);
         return;
     case AST_FOREACH_STMT:
+        if (s->scan_type_refs &&
+            tp_typeref_mentions_tp(s, st->foreach_stmt.var_type)) {
+            s->found = true;
+            return;
+        }
         if (tp_typeref_is_tp(s, st->foreach_stmt.var_type))
             tp_scan_bind(s, st->foreach_stmt.var_name);
         tp_scan_expr(s, st->foreach_stmt.collection);
@@ -684,14 +788,28 @@ static void tp_scan_stmt(tp_use_scan_t *s, zan_ast_node_t *st) {
         return;
     case AST_TRY_STMT:
         tp_scan_stmt(s, st->try_stmt.try_body);
-        for (int i = 0; i < st->try_stmt.catches.count; i++)
-            tp_scan_stmt(s, st->try_stmt.catches.items[i]->catch_clause.body);
+        for (int i = 0; i < st->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = st->try_stmt.catches.items[i];
+            if (s->scan_type_refs &&
+                tp_typeref_mentions_tp(s, cc->catch_clause.type)) {
+                s->found = true;
+                return;
+            }
+            tp_scan_stmt(s, cc->catch_clause.body);
+        }
         tp_scan_stmt(s, st->try_stmt.finally_body);
         return;
     case AST_SWITCH_STMT:
         tp_scan_expr(s, st->switch_stmt.expr);
-        for (int i = 0; i < st->switch_stmt.cases.count; i++)
-            tp_scan_stmt(s, st->switch_stmt.cases.items[i]->switch_case.body);
+        for (int i = 0; i < st->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *sc = st->switch_stmt.cases.items[i];
+            if (s->scan_type_refs &&
+                tp_typeref_mentions_tp(s, sc->switch_case.type_pattern)) {
+                s->found = true;
+                return;
+            }
+            tp_scan_stmt(s, sc->switch_case.body);
+        }
         return;
     case AST_LOCK_STMT:
         tp_scan_expr(s, st->while_stmt.cond);
@@ -747,9 +865,11 @@ static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
     s.g = g;
     s.body = body;
     s.tps = tps;
+    s.scan_type_refs = true;
     for (int i = 0; i < decl->type_decl.members.count; i++) {
         zan_ast_node_t *f = decl->type_decl.members.items[i];
-        if (f && f->kind == AST_FIELD_DECL && tp_typeref_is_tp(&s, f->field_decl.type))
+        if (f && f->kind == AST_FIELD_DECL &&
+            tp_typeref_mentions_tp(&s, f->field_decl.type))
             tp_scan_add_field(&s, f->field_decl.name);
     }
     for (int i = 0; params && i < params->count; i++) {
@@ -760,7 +880,7 @@ static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
         }
     }
     bool result = s.found;
-    if (!result && (s.count > 0 || s.field_count > 0)) {
+    if (!result) {
         tp_scan_stmt(&s, body);
         result = s.found;
     }
@@ -800,25 +920,32 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     }
     int this_off = spec_static ? 0 : 1;
 
+    zan_type_t *canon_owner = owner_inst ? canonicalize_inst(g, owner_inst) : NULL;
+    zan_type_t *canon_scratch[8];
+    zan_type_t **canon_bind =
+        canonicalize_args(g, msym, bind, bindc, canon_scratch, 8);
+    bool has_gctx = (canon_owner && inst_uses_canon(g, canon_owner)) ||
+                    args_use_canon(g, msym, canon_bind, bindc);
+
     for (int i = 0; i < g->method_spec_count; i++)
         if (g->method_specs[i].msym == msym &&
-            mspec_owner_eq(g->method_specs[i].owner_inst, owner_inst) &&
+            mspec_owner_eq(g->method_specs[i].owner_inst, canon_owner) &&
             type_arglists_equal(g->method_specs[i].bind,
-                                g->method_specs[i].bindc, bind, bindc))
+                                g->method_specs[i].bindc, canon_bind, bindc))
             return i;
 
     char fn_name[512];
     {
         char osuffix[256];
         osuffix[0] = '\0';
-        if (owner_inst) mangle_inst_suffix(osuffix, sizeof(osuffix), owner_inst);
+        if (canon_owner) mangle_inst_suffix(osuffix, sizeof(osuffix), canon_owner);
         size_t off = (size_t)snprintf(fn_name, sizeof(fn_name), "%.*s%s_%.*s$",
             (int)type_sym->name.len, type_sym->name.str, osuffix,
             (int)msym->name.len, msym->name.str);
         for (int i = 0; i < bindc; i++) {
             if (off < sizeof(fn_name) - 1) fn_name[off++] = '$';
             fn_name[off < sizeof(fn_name) ? off : sizeof(fn_name) - 1] = '\0';
-            mangle_type_token(fn_name, sizeof(fn_name), &off, bind[i]);
+            mangle_type_token(fn_name, sizeof(fn_name), &off, canon_bind[i]);
         }
         if (off < sizeof(fn_name)) fn_name[off] = '\0';
         else fn_name[sizeof(fn_name) - 1] = '\0';
@@ -829,8 +956,22 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
             snprintf(fn_name, sizeof(fn_name), "%s$o%d", base_name, oi++);
     }
 
+    zan_type_t **bcopy = (zan_type_t **)zan_arena_alloc(g->arena,
+        sizeof(zan_type_t *) * (size_t)bindc);
+    for (int i = 0; i < bindc; i++) bcopy[i] = canon_bind[i];
+
+    zan_type_t *body_owner =
+        (has_gctx && canon_owner)
+            ? make_canon_body_inst(g, type_sym, canon_owner)
+            : canon_owner;
+    zan_type_t **body_bind =
+        has_gctx ? make_canon_body_bind(g, member, bcopy, bindc) : bcopy;
+    int gctx_owner_idx =
+        has_gctx ? get_or_register_gctx(g, true, msym, canon_owner, bcopy, bindc)
+                 : -1;
+
     int param_count = member->method_decl.params.count;
-    int total_params = param_count + this_off;
+    int total_params = param_count + this_off + (has_gctx ? 1 : 0);
     LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
         (size_t)(total_params > 0 ? total_params : 1), sizeof(LLVMTypeRef));
     if (this_off) {
@@ -841,21 +982,21 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     for (int k = 0; k < param_count; k++) {
         zan_ast_node_t *param = member->method_decl.params.items[k];
         zan_type_t *pt = subst_method_tp(g,
-            zan_binder_resolve_type(g->binder, param->param.type), tps, bind);
-        if (owner_inst) pt = subst_type_param_deep(g, pt, owner_inst);
+            zan_binder_resolve_type(g->binder, param->param.type), tps, body_bind);
+        if (body_owner) pt = subst_type_param_deep(g, pt, body_owner);
         param_types[k + this_off] = param->param.by_ref
             ? LLVMPointerType(map_type(g, pt), 0)
             : map_type(g, pt);
     }
+    if (has_gctx) {
+        param_types[param_count + this_off] =
+            LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    }
     zan_type_t *ret_type = member->method_decl.return_type
         ? subst_method_tp(g, zan_binder_resolve_type(g->binder,
-              member->method_decl.return_type), tps, bind)
+              member->method_decl.return_type), tps, body_bind)
         : g->binder->type_void;
-    if (owner_inst) ret_type = subst_type_param_deep(g, ret_type, owner_inst);
-
-    zan_type_t **bcopy = (zan_type_t **)zan_arena_alloc(g->arena,
-        sizeof(zan_type_t *) * (size_t)bindc);
-    for (int i = 0; i < bindc; i++) bcopy[i] = bind[i];
+    if (body_owner) ret_type = subst_type_param_deep(g, ret_type, body_owner);
 
     LLVMTypeRef fn_type = NULL;
     LLVMValueRef fn = NULL;
@@ -871,16 +1012,18 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
         air->param_offset = this_off;
         air->llvm_ret = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         air->ret_type = ret_type;
-        air->cur_inst = owner_inst;
+        air->cur_inst = body_owner;
         air->mtps = tps;
-        air->mbind = bcopy;
+        air->mbind = body_bind;
+        air->has_gctx = has_gctx;
+        air->gctx_owner_idx = gctx_owner_idx;
         zan_ast_list_t *saved_mtps = g->cur_mtps;
         zan_type_t **saved_mbind = g->cur_mbind;
         zan_type_t *saved_inst = g->cur_inst;
         g->cur_mtps = tps;
-        g->cur_mbind = bcopy;
-        g->cur_inst = owner_inst;
-        declare_async_method(g, air, fn_name);
+        g->cur_mbind = body_bind;
+        g->cur_inst = body_owner;
+        declare_async_ramp(g, air, fn_name);
         g->cur_mtps = saved_mtps;
         g->cur_mbind = saved_mbind;
         g->cur_inst = saved_inst;
@@ -903,14 +1046,18 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
     int idx = g->method_spec_count++;
     g->method_specs[idx].msym = msym;
     g->method_specs[idx].type_sym = type_sym;
-    g->method_specs[idx].owner_inst = owner_inst;
+    g->method_specs[idx].owner_inst = canon_owner;
+    g->method_specs[idx].body_owner = body_owner;
     g->method_specs[idx].member = member;
     g->method_specs[idx].bind = bcopy;
+    g->method_specs[idx].body_bind = body_bind;
     g->method_specs[idx].bindc = bindc;
     g->method_specs[idx].fn = fn;
     g->method_specs[idx].fn_type = fn_type;
     g->method_specs[idx].is_async = spec_async;
     g->method_specs[idx].async_ir = air;
+    g->method_specs[idx].has_gctx = has_gctx;
+    g->method_specs[idx].gctx_owner_idx = gctx_owner_idx;
     return idx;
 }
 
@@ -927,9 +1074,23 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     zan_ast_list_t *saved_mtps = g->cur_mtps;
     zan_type_t **saved_mbind = g->cur_mbind;
     zan_type_t *saved_inst = g->cur_inst;
+    bool saved_canon_body = g->cur_canon_body;
+    LLVMValueRef saved_gctx_val = g->cur_gctx_val;
+    int saved_gctx_owner = g->cur_gctx_owner_idx;
     g->cur_mtps = tps;
-    g->cur_mbind = sp.bind;
-    g->cur_inst = sp.owner_inst;
+    g->cur_mbind = sp.has_gctx ? sp.body_bind : sp.bind;
+    g->cur_inst = sp.has_gctx ? sp.body_owner : sp.owner_inst;
+    if (sp.has_gctx) {
+        int pcnt = member->method_decl.params.count;
+        int toff = (member->method_decl.modifiers & MOD_STATIC) ? 0 : 1;
+        g->cur_canon_body = true;
+        g->cur_gctx_val = LLVMGetParam(sp.fn, (unsigned)(pcnt + toff));
+        g->cur_gctx_owner_idx = sp.gctx_owner_idx;
+    } else {
+        g->cur_canon_body = false;
+        g->cur_gctx_val = NULL;
+        g->cur_gctx_owner_idx = -1;
+    }
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "entry");
@@ -1105,6 +1266,9 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->cur_mtps = saved_mtps;
     g->cur_mbind = saved_mbind;
     g->cur_inst = saved_inst;
+    g->cur_canon_body = saved_canon_body;
+    g->cur_gctx_val = saved_gctx_val;
+    g->cur_gctx_owner_idx = saved_gctx_owner;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     else if (g->function_compactor) LLVMClearInsertionPosition(g->builder);
     zan_irgen_compact_completed(g, sp.fn);

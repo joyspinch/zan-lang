@@ -547,7 +547,11 @@ zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals, zan_
             zan_symbol_t *cs = receiver_type_symbol(g, obj, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fsym = get_field_sym(cs, member->member.name);
-                if (fsym) return fsym->type;
+                if (fsym) {
+                    zan_type_t *sinst = static_access_inst(g, obj);
+                    return sinst ? field_type_through(g, fsym, sinst)
+                                 : fsym->type;
+                }
             }
         }
         /* EnumType */

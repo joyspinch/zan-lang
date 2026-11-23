@@ -7,32 +7,47 @@
 typedef long long i64;
 
 int zan_w32_snprintf(char *s, i64 n, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    int r = vsnprintf(s, (size_t)n, fmt, ap);
-    va_end(ap);
-    return r;
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vsnprintf(s, (size_t)n, fmt, ap);
+  va_end(ap);
+  return r;
 }
 
-int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
-int pthread_mutex_lock(void *m) { (void)m; return 0; }
-int pthread_mutex_unlock(void *m) { (void)m; return 0; }
-int pthread_mutex_destroy(void *m) { (void)m; return 0; }
+int pthread_mutex_init(void *m, const void *a) {
+  (void)m;
+  (void)a;
+  return 0;
+}
+int pthread_mutex_lock(void *m) {
+  (void)m;
+  return 0;
+}
+int pthread_mutex_unlock(void *m) {
+  (void)m;
+  return 0;
+}
+int pthread_mutex_destroy(void *m) {
+  (void)m;
+  return 0;
+}
 
-void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
+void longjmp(void *env, int val) {
+  (void)env;
+  (void)val;
+  abort();
+}
 
-__attribute__((returns_twice))
-int setjmp(void *env) { (void)env; return 0; }
+__attribute__((returns_twice)) int setjmp(void *env) {
+  (void)env;
+  return 0;
+}
 
 /* The single-threaded CPS executor owns these frames. Retire their task
  * registrations before the allocator can reuse their addresses. */
-void *__zan_co_frame_alloc(size_t size) {
-    return calloc(1, size ? size : 1);
-}
+void *__zan_co_frame_alloc(size_t size) { return calloc(1, size ? size : 1); }
 
-void __zan_co_frame_free(void *frame) {
-    zan_task_retire(frame, free);
-}
+void __zan_co_frame_free(void *frame) { zan_task_retire(frame, free); }
 
 /* __zan_dict_hash（B-ID80）在 zanrt_timer.o 里（rt_timer.c，全链接路径
  * 无条件对象）——wasm 链接同时拉 timer 与本对象，这里不得重复定义。 */

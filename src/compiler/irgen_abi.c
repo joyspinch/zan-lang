@@ -2,626 +2,706 @@
 /* irgen_abi */
 
 typedef enum {
-    ABI_TARGET_WIN64,
-    ABI_TARGET_SYSV64,
-    ABI_TARGET_AARCH64,
-    ABI_TARGET_UNSUPPORTED
+  ABI_TARGET_WIN64,
+  ABI_TARGET_SYSV64,
+  ABI_TARGET_AARCH64,
+  ABI_TARGET_UNSUPPORTED
 } abi_target_t;
 
 typedef enum {
-    ABI_SLOT_DIRECT,    /* passed as declared */
-    ABI_SLOT_COERCE,
-    ABI_SLOT_INDIRECT,  /* passed as a pointer to a copy */
-    ABI_SLOT_SRET
+  ABI_SLOT_DIRECT, /* passed as declared */
+  ABI_SLOT_COERCE,
+  ABI_SLOT_INDIRECT, /* passed as a pointer to a copy */
+  ABI_SLOT_SRET
 } abi_slot_kind_t;
 
 typedef struct {
-    abi_slot_kind_t kind;
-    LLVMTypeRef ty;
-    LLVMTypeRef parts[2];
-    LLVMTypeRef wide_storage;
-    int nparts;
-    bool byval;
-    unsigned stack_align;
+  abi_slot_kind_t kind;
+  LLVMTypeRef ty;
+  LLVMTypeRef parts[2];
+  LLVMTypeRef wide_storage;
+  int nparts;
+  bool byval;
+  unsigned stack_align;
 } abi_slot_t;
 
 static abi_target_t abi_target_of(zan_irgen_t *g) {
-    const char *t = g->target_triple;
-    if (t && t[0]) {
-        if (strncmp(t, "x86_64", 6) == 0 || strncmp(t, "amd64", 5) == 0)
-            return strstr(t, "windows") ? ABI_TARGET_WIN64 : ABI_TARGET_SYSV64;
-        if (strncmp(t, "aarch64", 7) == 0 || strncmp(t, "arm64", 5) == 0)
-            return ABI_TARGET_AARCH64;
-        return ABI_TARGET_UNSUPPORTED;
-    }
-#if defined(_WIN64) || defined(_M_X64)
-    return ABI_TARGET_WIN64;
-#elif defined(__aarch64__)
-    return ABI_TARGET_AARCH64;
-#elif defined(__x86_64__)
-    return ABI_TARGET_SYSV64;
-#else
+  const char *t = g->target_triple;
+  if (t && t[0]) {
+    if (strncmp(t, "x86_64", 6) == 0 || strncmp(t, "amd64", 5) == 0)
+      return strstr(t, "windows") ? ABI_TARGET_WIN64 : ABI_TARGET_SYSV64;
+    if (strncmp(t, "aarch64", 7) == 0 || strncmp(t, "arm64", 5) == 0)
+      return ABI_TARGET_AARCH64;
     return ABI_TARGET_UNSUPPORTED;
+  }
+#if defined(_WIN64) || defined(_M_X64)
+  return ABI_TARGET_WIN64;
+#elif defined(__aarch64__)
+  return ABI_TARGET_AARCH64;
+#elif defined(__x86_64__)
+  return ABI_TARGET_SYSV64;
+#else
+  return ABI_TARGET_UNSUPPORTED;
 #endif
 }
 
 static bool abi_target_is_apple(zan_irgen_t *g) {
-    const char *t = g->target_triple;
-    if (t && t[0]) return strstr(t, "apple") != NULL;
+  const char *t = g->target_triple;
+  if (t && t[0])
+    return strstr(t, "apple") != NULL;
 #if defined(__APPLE__)
-    return true;
+  return true;
 #else
-    return false;
+  return false;
 #endif
 }
 unsigned long abi_size_of(LLVMTypeRef t);
 unsigned long abi_align_of(LLVMTypeRef t) {
-    switch (LLVMGetTypeKind(t)) {
-    case LLVMIntegerTypeKind: {
-        unsigned long b = (LLVMGetIntTypeWidth(t) + 7) / 8;
-        return b > 8 ? 8 : (b == 0 ? 1 : b);
+  switch (LLVMGetTypeKind(t)) {
+  case LLVMIntegerTypeKind: {
+    unsigned long b = (LLVMGetIntTypeWidth(t) + 7) / 8;
+    return b > 8 ? 8 : (b == 0 ? 1 : b);
+  }
+  case LLVMFloatTypeKind:
+    return 4;
+  case LLVMDoubleTypeKind:
+    return 8;
+  case LLVMPointerTypeKind:
+    return 8;
+  case LLVMArrayTypeKind:
+    return abi_align_of(LLVMGetElementType(t));
+  case LLVMStructTypeKind: {
+    if (LLVMIsPackedStruct(t))
+      return 1;
+    unsigned n = LLVMCountStructElementTypes(t);
+    unsigned long maxa = 1;
+    for (unsigned i = 0; i < n; i++) {
+      unsigned long a = abi_align_of(LLVMStructGetTypeAtIndex(t, i));
+      if (a > maxa)
+        maxa = a;
     }
-    case LLVMFloatTypeKind:   return 4;
-    case LLVMDoubleTypeKind:  return 8;
-    case LLVMPointerTypeKind: return 8;
-    case LLVMArrayTypeKind:   return abi_align_of(LLVMGetElementType(t));
-    case LLVMStructTypeKind: {
-        if (LLVMIsPackedStruct(t)) return 1;
-        unsigned n = LLVMCountStructElementTypes(t);
-        unsigned long maxa = 1;
-        for (unsigned i = 0; i < n; i++) {
-            unsigned long a = abi_align_of(LLVMStructGetTypeAtIndex(t, i));
-            if (a > maxa) maxa = a;
-        }
-        return maxa;
-    }
-    default: return 8;
-    }
+    return maxa;
+  }
+  default:
+    return 8;
+  }
 }
 
 #define ABI_SIZE_MAX (1ULL << 40)
 
 static uint64_t abi_size_of64(LLVMTypeRef t) {
-    switch (LLVMGetTypeKind(t)) {
-    case LLVMIntegerTypeKind:
-        return ((uint64_t)LLVMGetIntTypeWidth(t) + 7) / 8;
-    case LLVMFloatTypeKind:   return 4;
-    case LLVMDoubleTypeKind:  return 8;
-    case LLVMPointerTypeKind: return 8;
-    case LLVMArrayTypeKind: {
-        uint64_t es = abi_size_of64(LLVMGetElementType(t));
-        uint64_t n = (uint64_t)LLVMGetArrayLength(t);
-        if (es != 0 && n > ABI_SIZE_MAX / es) return ABI_SIZE_MAX;
-        return n * es;
+  switch (LLVMGetTypeKind(t)) {
+  case LLVMIntegerTypeKind:
+    return ((uint64_t)LLVMGetIntTypeWidth(t) + 7) / 8;
+  case LLVMFloatTypeKind:
+    return 4;
+  case LLVMDoubleTypeKind:
+    return 8;
+  case LLVMPointerTypeKind:
+    return 8;
+  case LLVMArrayTypeKind: {
+    uint64_t es = abi_size_of64(LLVMGetElementType(t));
+    uint64_t n = (uint64_t)LLVMGetArrayLength(t);
+    if (es != 0 && n > ABI_SIZE_MAX / es)
+      return ABI_SIZE_MAX;
+    return n * es;
+  }
+  case LLVMStructTypeKind: {
+    bool packed = LLVMIsPackedStruct(t);
+    unsigned n = LLVMCountStructElementTypes(t);
+    uint64_t off = 0, maxa = 1;
+    for (unsigned i = 0; i < n; i++) {
+      LLVMTypeRef f = LLVMStructGetTypeAtIndex(t, i);
+      uint64_t a = packed ? 1 : (uint64_t)abi_align_of(f);
+      if (a > maxa)
+        maxa = a;
+      off = (off + a - 1) & ~(a - 1);
+      off += abi_size_of64(f);
+      if (off > ABI_SIZE_MAX)
+        return ABI_SIZE_MAX;
     }
-    case LLVMStructTypeKind: {
-        bool packed = LLVMIsPackedStruct(t);
-        unsigned n = LLVMCountStructElementTypes(t);
-        uint64_t off = 0, maxa = 1;
-        for (unsigned i = 0; i < n; i++) {
-            LLVMTypeRef f = LLVMStructGetTypeAtIndex(t, i);
-            uint64_t a = packed ? 1 : (uint64_t)abi_align_of(f);
-            if (a > maxa) maxa = a;
-            off = (off + a - 1) & ~(a - 1);
-            off += abi_size_of64(f);
-            if (off > ABI_SIZE_MAX) return ABI_SIZE_MAX;
-        }
-        return (off + maxa - 1) & ~(maxa - 1);
-    }
-    default: return 8;
-    }
+    return (off + maxa - 1) & ~(maxa - 1);
+  }
+  default:
+    return 8;
+  }
 }
 unsigned long abi_size_of(LLVMTypeRef t) {
-    uint64_t s = abi_size_of64(t);
-    if (s > 0xFFFFFFFFULL) s = 0xFFFFFFFFULL;
-    return (unsigned long)s;
+  uint64_t s = abi_size_of64(t);
+  if (s > 0xFFFFFFFFULL)
+    s = 0xFFFFFFFFULL;
+  return (unsigned long)s;
 }
 
 static bool abi_is_aggregate(LLVMTypeRef t) {
-    LLVMTypeKind k = LLVMGetTypeKind(t);
-    return k == LLVMStructTypeKind || k == LLVMArrayTypeKind;
+  LLVMTypeKind k = LLVMGetTypeKind(t);
+  return k == LLVMStructTypeKind || k == LLVMArrayTypeKind;
 }
 
-typedef enum { SYSV_NONE = 0, SYSV_SSE, SYSV_INTEGER, SYSV_MEMORY } sysv_class_t;
+typedef enum {
+  SYSV_NONE = 0,
+  SYSV_SSE,
+  SYSV_INTEGER,
+  SYSV_MEMORY
+} sysv_class_t;
 
 typedef struct {
-    sysv_class_t cls[2];
-    bool has_double[2];
-    unsigned long used[2];
-    unsigned long size;
-    bool memory;
+  sysv_class_t cls[2];
+  bool has_double[2];
+  unsigned long used[2];
+  unsigned long size;
+  bool memory;
 } sysv_info_t;
 
 static void sysv_merge(sysv_info_t *in, unsigned long off, unsigned long width,
                        sysv_class_t c, bool is_double) {
-    int eb = (int)(off / 8);
-    if (eb < 0 || eb > 1) { in->memory = true; return; }
-    if (c == SYSV_INTEGER) in->cls[eb] = SYSV_INTEGER;
-    else if (in->cls[eb] == SYSV_NONE) in->cls[eb] = SYSV_SSE;
-    if (c == SYSV_SSE && is_double) in->has_double[eb] = true;
-    unsigned long end = off % 8 + width;
-    if (end > 8) end = 8;
-    if (end > in->used[eb]) in->used[eb] = end;
+  int eb = (int)(off / 8);
+  if (eb < 0 || eb > 1) {
+    in->memory = true;
+    return;
+  }
+  if (c == SYSV_INTEGER)
+    in->cls[eb] = SYSV_INTEGER;
+  else if (in->cls[eb] == SYSV_NONE)
+    in->cls[eb] = SYSV_SSE;
+  if (c == SYSV_SSE && is_double)
+    in->has_double[eb] = true;
+  unsigned long end = off % 8 + width;
+  if (end > 8)
+    end = 8;
+  if (end > in->used[eb])
+    in->used[eb] = end;
 }
 
 static void sysv_walk(LLVMTypeRef t, unsigned long off, sysv_info_t *in) {
-    switch (LLVMGetTypeKind(t)) {
-    case LLVMIntegerTypeKind:
-    case LLVMPointerTypeKind: {
-        unsigned long w = abi_size_of(t);
-        sysv_merge(in, off, w > 8 ? 8 : w, SYSV_INTEGER, false);
-        if (w > 8) sysv_merge(in, off + 8, w - 8, SYSV_INTEGER, false);
-        break;
+  switch (LLVMGetTypeKind(t)) {
+  case LLVMIntegerTypeKind:
+  case LLVMPointerTypeKind: {
+    unsigned long w = abi_size_of(t);
+    sysv_merge(in, off, w > 8 ? 8 : w, SYSV_INTEGER, false);
+    if (w > 8)
+      sysv_merge(in, off + 8, w - 8, SYSV_INTEGER, false);
+    break;
+  }
+  case LLVMFloatTypeKind:
+    sysv_merge(in, off, 4, SYSV_SSE, false);
+    break;
+  case LLVMDoubleTypeKind:
+    sysv_merge(in, off, 8, SYSV_SSE, true);
+    break;
+  case LLVMArrayTypeKind: {
+    LLVMTypeRef el = LLVMGetElementType(t);
+    unsigned long es = abi_size_of(el);
+    for (unsigned i = 0; i < LLVMGetArrayLength(t); i++)
+      sysv_walk(el, off + i * es, in);
+    break;
+  }
+  case LLVMStructTypeKind: {
+    bool packed = LLVMIsPackedStruct(t);
+    unsigned n = LLVMCountStructElementTypes(t);
+    unsigned long fo = off;
+    for (unsigned i = 0; i < n; i++) {
+      LLVMTypeRef f = LLVMStructGetTypeAtIndex(t, i);
+      unsigned long a = packed ? 1 : abi_align_of(f);
+      fo = (fo + a - 1) & ~(a - 1);
+      sysv_walk(f, fo, in);
+      fo += abi_size_of(f);
     }
-    case LLVMFloatTypeKind:
-        sysv_merge(in, off, 4, SYSV_SSE, false);
-        break;
-    case LLVMDoubleTypeKind:
-        sysv_merge(in, off, 8, SYSV_SSE, true);
-        break;
-    case LLVMArrayTypeKind: {
-        LLVMTypeRef el = LLVMGetElementType(t);
-        unsigned long es = abi_size_of(el);
-        for (unsigned i = 0; i < LLVMGetArrayLength(t); i++)
-            sysv_walk(el, off + i * es, in);
-        break;
-    }
-    case LLVMStructTypeKind: {
-        bool packed = LLVMIsPackedStruct(t);
-        unsigned n = LLVMCountStructElementTypes(t);
-        unsigned long fo = off;
-        for (unsigned i = 0; i < n; i++) {
-            LLVMTypeRef f = LLVMStructGetTypeAtIndex(t, i);
-            unsigned long a = packed ? 1 : abi_align_of(f);
-            fo = (fo + a - 1) & ~(a - 1);
-            sysv_walk(f, fo, in);
-            fo += abi_size_of(f);
-        }
-        break;
-    }
-    default:
-        in->memory = true;
-        break;
-    }
+    break;
+  }
+  default:
+    in->memory = true;
+    break;
+  }
 }
 
 static void sysv_classify(LLVMTypeRef t, sysv_info_t *in) {
-    memset(in, 0, sizeof(*in));
-    in->size = abi_size_of(t);
-    if (in->size > 16 || in->size == 0) { in->memory = true; return; }
-    sysv_walk(t, 0, in);
+  memset(in, 0, sizeof(*in));
+  in->size = abi_size_of(t);
+  if (in->size > 16 || in->size == 0) {
+    in->memory = true;
+    return;
+  }
+  sysv_walk(t, 0, in);
 }
 
 static LLVMTypeRef sysv_part_type(zan_irgen_t *g, sysv_info_t *in, int eb) {
-    unsigned long rest = in->size - (unsigned long)eb * 8;
-    unsigned long bytes = rest > 8 ? 8 : rest;
-    if (in->used[eb] && in->used[eb] < bytes) bytes = in->used[eb];
-    if (in->cls[eb] == SYSV_INTEGER)
-        return LLVMIntTypeInContext(g->ctx, (unsigned)(bytes * 8));
-    if (in->has_double[eb]) return LLVMDoubleTypeInContext(g->ctx);
-    if (bytes > 4)
-        return LLVMVectorType(LLVMFloatTypeInContext(g->ctx), 2);
-    return LLVMFloatTypeInContext(g->ctx);
+  unsigned long rest = in->size - (unsigned long)eb * 8;
+  unsigned long bytes = rest > 8 ? 8 : rest;
+  if (in->used[eb] && in->used[eb] < bytes)
+    bytes = in->used[eb];
+  if (in->cls[eb] == SYSV_INTEGER)
+    return LLVMIntTypeInContext(g->ctx, (unsigned)(bytes * 8));
+  if (in->has_double[eb])
+    return LLVMDoubleTypeInContext(g->ctx);
+  if (bytes > 4)
+    return LLVMVectorType(LLVMFloatTypeInContext(g->ctx), 2);
+  return LLVMFloatTypeInContext(g->ctx);
 }
 
 typedef struct {
-    unsigned integer;
-    unsigned sse;
+  unsigned integer;
+  unsigned sse;
 } sysv_regs_t;
 
 static void sysv_assign_arg_regs(abi_slot_t *slot, sysv_regs_t *free_regs) {
-    if (slot->kind == ABI_SLOT_INDIRECT) return; /* byval uses the stack */
+  if (slot->kind == ABI_SLOT_INDIRECT)
+    return; /* byval uses the stack */
 
-    bool coerced = slot->kind == ABI_SLOT_COERCE;
-    unsigned integer = 0, sse = 0;
-    int nparts = coerced ? slot->nparts : 1;
-    for (int i = 0; i < nparts; i++) {
-        LLVMTypeRef part = coerced ? slot->parts[i] : slot->ty;
-        switch (LLVMGetTypeKind(part)) {
-        case LLVMIntegerTypeKind:
-            integer += (LLVMGetIntTypeWidth(part) + 63) / 64;
-            break;
-        case LLVMPointerTypeKind:
-            integer++;
-            break;
-        case LLVMFloatTypeKind:
-        case LLVMDoubleTypeKind:
-        case LLVMVectorTypeKind: /* two floats in one SSE eightbyte */
-            sse++;
-            break;
-        default:
-            break;
-        }
+  bool coerced = slot->kind == ABI_SLOT_COERCE;
+  unsigned integer = 0, sse = 0;
+  int nparts = coerced ? slot->nparts : 1;
+  for (int i = 0; i < nparts; i++) {
+    LLVMTypeRef part = coerced ? slot->parts[i] : slot->ty;
+    switch (LLVMGetTypeKind(part)) {
+    case LLVMIntegerTypeKind:
+      integer += (LLVMGetIntTypeWidth(part) + 63) / 64;
+      break;
+    case LLVMPointerTypeKind:
+      integer++;
+      break;
+    case LLVMFloatTypeKind:
+    case LLVMDoubleTypeKind:
+    case LLVMVectorTypeKind: /* two floats in one SSE eightbyte */
+      sse++;
+      break;
+    default:
+      break;
     }
+  }
 
-    if (integer <= free_regs->integer && sse <= free_regs->sse) {
-        free_regs->integer -= integer;
-        free_regs->sse -= sse;
-    } else if (coerced && (integer != 1 || sse != 0)) {
-        /* Spill the whole aggregate without consuming either register bank.
-         * A single INTEGER eightbyte already spills as one LLVM argument. */
-        slot->kind = ABI_SLOT_INDIRECT;
-        slot->byval = true;
-    }
+  if (integer <= free_regs->integer && sse <= free_regs->sse) {
+    free_regs->integer -= integer;
+    free_regs->sse -= sse;
+  } else if (coerced && (integer != 1 || sse != 0)) {
+    /* Spill the whole aggregate without consuming either register bank.
+     * A single INTEGER eightbyte already spills as one LLVM argument. */
+    slot->kind = ABI_SLOT_INDIRECT;
+    slot->byval = true;
+  }
 }
 
 static bool aarch64_hfa(LLVMTypeRef t, LLVMTypeRef *base, int *count) {
-    switch (LLVMGetTypeKind(t)) {
-    case LLVMFloatTypeKind:
-    case LLVMDoubleTypeKind:
-        if (*base && *base != t) return false;
-        *base = t;
-        (*count)++;
-        return *count <= 4;
-    case LLVMArrayTypeKind: {
-        LLVMTypeRef el = LLVMGetElementType(t);
-        for (unsigned i = 0; i < LLVMGetArrayLength(t); i++)
-            if (!aarch64_hfa(el, base, count)) return false;
-        return true;
-    }
-    case LLVMStructTypeKind: {
-        unsigned n = LLVMCountStructElementTypes(t);
-        for (unsigned i = 0; i < n; i++)
-            if (!aarch64_hfa(LLVMStructGetTypeAtIndex(t, i), base, count))
-                return false;
-        return true;
-    }
-    default:
+  switch (LLVMGetTypeKind(t)) {
+  case LLVMFloatTypeKind:
+  case LLVMDoubleTypeKind:
+    if (*base && *base != t)
+      return false;
+    *base = t;
+    (*count)++;
+    return *count <= 4;
+  case LLVMArrayTypeKind: {
+    LLVMTypeRef el = LLVMGetElementType(t);
+    for (unsigned i = 0; i < LLVMGetArrayLength(t); i++)
+      if (!aarch64_hfa(el, base, count))
         return false;
-    }
+    return true;
+  }
+  case LLVMStructTypeKind: {
+    unsigned n = LLVMCountStructElementTypes(t);
+    for (unsigned i = 0; i < n; i++)
+      if (!aarch64_hfa(LLVMStructGetTypeAtIndex(t, i), base, count))
+        return false;
+    return true;
+  }
+  default:
+    return false;
+  }
 }
 
 static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
                          bool is_return, abi_slot_t *slot) {
-    memset(slot, 0, sizeof(*slot));
-    slot->ty = ty;
-    slot->kind = ABI_SLOT_DIRECT;
-    if (!abi_is_aggregate(ty)) return;
+  memset(slot, 0, sizeof(*slot));
+  slot->ty = ty;
+  slot->kind = ABI_SLOT_DIRECT;
+  if (!abi_is_aggregate(ty))
+    return;
 
-    unsigned long size = abi_size_of(ty);
+  unsigned long size = abi_size_of(ty);
 
-    if (tgt == ABI_TARGET_WIN64) {
-        if (size == 1 || size == 2 || size == 4 || size == 8) {
-            slot->kind = ABI_SLOT_COERCE;
-            slot->parts[0] = LLVMIntTypeInContext(g->ctx, (unsigned)(size * 8));
-            slot->nparts = 1;
-        } else {
-            slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
-        }
-        return;
+  if (tgt == ABI_TARGET_WIN64) {
+    if (size == 1 || size == 2 || size == 4 || size == 8) {
+      slot->kind = ABI_SLOT_COERCE;
+      slot->parts[0] = LLVMIntTypeInContext(g->ctx, (unsigned)(size * 8));
+      slot->nparts = 1;
+    } else {
+      slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
     }
+    return;
+  }
 
-    if (tgt == ABI_TARGET_SYSV64) {
-        sysv_info_t in;
-        sysv_classify(ty, &in);
-        if (in.memory) {
-            slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
-            slot->byval = !is_return;
-            return;
-        }
-        slot->kind = ABI_SLOT_COERCE;
-        slot->parts[0] = sysv_part_type(g, &in, 0);
-        slot->nparts = 1;
-        if (in.size > 8) {
-            slot->parts[1] = sysv_part_type(g, &in, 1);
-            slot->nparts = 2;
-        }
-        return;
+  if (tgt == ABI_TARGET_SYSV64) {
+    sysv_info_t in;
+    sysv_classify(ty, &in);
+    if (in.memory) {
+      slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
+      slot->byval = !is_return;
+      return;
     }
-
-    if (tgt == ABI_TARGET_AARCH64) {
-        LLVMTypeRef base = NULL;
-        int count = 0;
-        if (aarch64_hfa(ty, &base, &count) && base && count > 0 && count <= 4) {
-            if (is_return) return;
-            slot->kind = ABI_SLOT_COERCE;
-            slot->parts[0] = LLVMArrayType(base, (unsigned)count);
-            slot->nparts = 1;
-            if (!abi_target_is_apple(g)) slot->stack_align = 8;
-            return;
-        }
-        if (size > 16) {
-            slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
-            return;
-        }
-        slot->kind = ABI_SLOT_COERCE;
-        slot->nparts = 1;
-        if (size <= 8) {
-            slot->parts[0] = is_return
-                ? LLVMIntTypeInContext(g->ctx, (unsigned)(size * 8))
-                : LLVMInt64TypeInContext(g->ctx);
-        } else {
-            slot->parts[0] = LLVMArrayType(LLVMInt64TypeInContext(g->ctx), 2);
-        }
-        if (abi_size_of(slot->parts[0]) > size)
-            slot->wide_storage = slot->parts[0];
-        return;
+    slot->kind = ABI_SLOT_COERCE;
+    slot->parts[0] = sysv_part_type(g, &in, 0);
+    slot->nparts = 1;
+    if (in.size > 8) {
+      slot->parts[1] = sysv_part_type(g, &in, 1);
+      slot->nparts = 2;
     }
+    return;
+  }
 
+  if (tgt == ABI_TARGET_AARCH64) {
+    LLVMTypeRef base = NULL;
+    int count = 0;
+    if (aarch64_hfa(ty, &base, &count) && base && count > 0 && count <= 4) {
+      if (is_return)
+        return;
+      slot->kind = ABI_SLOT_COERCE;
+      slot->parts[0] = LLVMArrayType(base, (unsigned)count);
+      slot->nparts = 1;
+      if (!abi_target_is_apple(g))
+        slot->stack_align = 8;
+      return;
+    }
+    if (size > 16) {
+      slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
+      return;
+    }
+    slot->kind = ABI_SLOT_COERCE;
+    slot->nparts = 1;
+    if (size <= 8) {
+      slot->parts[0] = is_return
+                           ? LLVMIntTypeInContext(g->ctx, (unsigned)(size * 8))
+                           : LLVMInt64TypeInContext(g->ctx);
+    } else {
+      slot->parts[0] = LLVMArrayType(LLVMInt64TypeInContext(g->ctx), 2);
+    }
+    if (abi_size_of(slot->parts[0]) > size)
+      slot->wide_storage = slot->parts[0];
+    return;
+  }
 }
 
-static void abi_add_type_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
-                              unsigned idx, const char *name, LLVMTypeRef ty) {
-    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
-    if (!kind) return;
-    if (fn)
-        LLVMAddAttributeAtIndex(fn, idx, LLVMCreateTypeAttribute(g->ctx, kind, ty));
-    if (call)
-        LLVMAddCallSiteAttribute(call, idx,
-                                 LLVMCreateTypeAttribute(g->ctx, kind, ty));
+static void abi_add_type_attr(zan_irgen_t *g, LLVMValueRef fn,
+                              LLVMValueRef call, unsigned idx, const char *name,
+                              LLVMTypeRef ty) {
+  unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+  if (!kind)
+    return;
+  if (fn)
+    LLVMAddAttributeAtIndex(fn, idx, LLVMCreateTypeAttribute(g->ctx, kind, ty));
+  if (call)
+    LLVMAddCallSiteAttribute(call, idx,
+                             LLVMCreateTypeAttribute(g->ctx, kind, ty));
 }
 
 static void abi_add_int_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                              unsigned idx, const char *name, uint64_t val) {
-    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
-    if (!kind) return;
-    if (fn)
-        LLVMAddAttributeAtIndex(fn, idx, LLVMCreateEnumAttribute(g->ctx, kind, val));
-    if (call)
-        LLVMAddCallSiteAttribute(call, idx,
-                                 LLVMCreateEnumAttribute(g->ctx, kind, val));
+  unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+  if (!kind)
+    return;
+  if (fn)
+    LLVMAddAttributeAtIndex(fn, idx,
+                            LLVMCreateEnumAttribute(g->ctx, kind, val));
+  if (call)
+    LLVMAddCallSiteAttribute(call, idx,
+                             LLVMCreateEnumAttribute(g->ctx, kind, val));
 }
 
 static const char *abi_int_ext_attr(zan_type_t *t) {
-    if (!t) return NULL;
-    switch (t->kind) {
-    case TYPE_BOOL:
-    case TYPE_BYTE:
-    case TYPE_USHORT: return "zeroext";
-    case TYPE_SBYTE:
-    case TYPE_SHORT:  return "signext";
-    default:          return NULL;
-    }
+  if (!t)
+    return NULL;
+  switch (t->kind) {
+  case TYPE_BOOL:
+  case TYPE_BYTE:
+  case TYPE_USHORT:
+    return "zeroext";
+  case TYPE_SBYTE:
+  case TYPE_SHORT:
+    return "signext";
+  default:
+    return NULL;
+  }
 }
-void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
-                                  zan_type_t *ret, zan_type_t **ptypes,
-                                  int pc) {
-    const char *r = abi_int_ext_attr(ret);
-    if (r) abi_add_int_attr(g, fn, NULL, (unsigned)LLVMAttributeReturnIndex, r, 0);
-    for (int i = 0; i < pc; i++) {
-        const char *a = abi_int_ext_attr(ptypes[i]);
-        if (a) abi_add_int_attr(g, fn, NULL, (unsigned)(i + 1), a, 0);
-    }
+void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn, zan_type_t *ret,
+                           zan_type_t **ptypes, int pc) {
+  const char *r = abi_int_ext_attr(ret);
+  if (r)
+    abi_add_int_attr(g, fn, NULL, (unsigned)LLVMAttributeReturnIndex, r, 0);
+  for (int i = 0; i < pc; i++) {
+    const char *a = abi_int_ext_attr(ptypes[i]);
+    if (a)
+      abi_add_int_attr(g, fn, NULL, (unsigned)(i + 1), a, 0);
+  }
 }
 
 static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
                                  unsigned long off) {
-    if (off == 0) return base;
-    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    LLVMValueRef idx = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), off, 0);
-    return LLVMBuildInBoundsGEP2(g->builder, i8, base, &idx, 1, "abi.off");
+  if (off == 0)
+    return base;
+  LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+  LLVMValueRef idx = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), off, 0);
+  return LLVMBuildInBoundsGEP2(g->builder, i8, base, &idx, 1, "abi.off");
 }
 
 static LLVMValueRef abi_slot_alloca(zan_irgen_t *g, const abi_slot_t *slot,
                                     const char *name) {
-    /* AArch64 can use a wider ABI carrier than the declared aggregate. */
-    LLVMTypeRef storage = slot->wide_storage ? slot->wide_storage : slot->ty;
-    LLVMValueRef tmp = LLVMBuildAlloca(g->builder, storage, name);
-    unsigned align = (unsigned)abi_align_of(storage);
-    LLVMSetAlignment(tmp, align < 8 ? 8 : align);
-    return tmp;
+  /* AArch64 can use a wider ABI carrier than the declared aggregate. */
+  LLVMTypeRef storage = slot->wide_storage ? slot->wide_storage : slot->ty;
+  LLVMValueRef tmp = LLVMBuildAlloca(g->builder, storage, name);
+  unsigned align = (unsigned)abi_align_of(storage);
+  LLVMSetAlignment(tmp, align < 8 ? 8 : align);
+  return tmp;
 }
 
 static void abi_pending_add(zan_irgen_t *g, const char *name) {
-    for (int i = 0; i < g->abi_pending_count; i++)
-        if (strcmp(g->abi_pending[i], name) == 0) return;
-    if (!ZAN_TAB_ENSURE(g->abi_pending, g->abi_pending_count,
-                        g->abi_pending_cap, 8)) return;
-    size_t n = strlen(name) + 1;
-    char *copy = (char *)malloc(n);
-    if (!copy) return;
-    memcpy(copy, name, n);
-    g->abi_pending[g->abi_pending_count++] = copy;
+  for (int i = 0; i < g->abi_pending_count; i++)
+    if (strcmp(g->abi_pending[i], name) == 0)
+      return;
+  if (!ZAN_TAB_ENSURE(g->abi_pending, g->abi_pending_count, g->abi_pending_cap,
+                      8))
+    return;
+  size_t n = strlen(name) + 1;
+  char *copy = (char *)malloc(n);
+  if (!copy)
+    return;
+  memcpy(copy, name, n);
+  g->abi_pending[g->abi_pending_count++] = copy;
 }
 void abi_pending_report(zan_irgen_t *g) {
-    if (g->abi_pending_count == 0) return;
-    for (LLVMValueRef f = LLVMGetFirstFunction(g->mod); f;
-         f = LLVMGetNextFunction(f)) {
-        if (LLVMCountBasicBlocks(f) == 0) continue;
-        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
-             bb = LLVMGetNextBasicBlock(bb)) {
-            for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
-                 inst = LLVMGetNextInstruction(inst)) {
-                unsigned op = LLVMGetInstructionOpcode(inst);
-                if (op != LLVMCall && op != LLVMInvoke) continue;
-                LLVMValueRef callee = LLVMGetCalledValue(inst);
-                const char *name = callee ? LLVMGetValueName(callee) : NULL;
-                if (!name || !name[0]) continue;
-                for (int i = 0; i < g->abi_pending_count; i++) {
-                    if (strcmp(g->abi_pending[i], name) != 0) continue;
-                    zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 4000,
-                                  "call to extern '%s' passes a struct by value, "
-                                  "which has no C ABI classification for target '%s'",
-                                  name,
-                                  g->target_triple[0] ? g->target_triple : "host");
-                    break;
-                }
-            }
+  if (g->abi_pending_count == 0)
+    return;
+  for (LLVMValueRef f = LLVMGetFirstFunction(g->mod); f;
+       f = LLVMGetNextFunction(f)) {
+    if (LLVMCountBasicBlocks(f) == 0)
+      continue;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+           inst = LLVMGetNextInstruction(inst)) {
+        unsigned op = LLVMGetInstructionOpcode(inst);
+        if (op != LLVMCall && op != LLVMInvoke)
+          continue;
+        LLVMValueRef callee = LLVMGetCalledValue(inst);
+        const char *name = callee ? LLVMGetValueName(callee) : NULL;
+        if (!name || !name[0])
+          continue;
+        for (int i = 0; i < g->abi_pending_count; i++) {
+          if (strcmp(g->abi_pending[i], name) != 0)
+            continue;
+          zan_diag_emit_code(
+              g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 4000,
+              "call to extern '%s' passes a struct by value, "
+              "which has no C ABI classification for target '%s'",
+              name, g->target_triple[0] ? g->target_triple : "host");
+          break;
         }
+      }
     }
+  }
 }
 LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
-                                     LLVMTypeRef zan_ft) {
-    unsigned pc = LLVMCountParamTypes(zan_ft);
-    LLVMTypeRef *zan_params =
-        (LLVMTypeRef *)calloc(pc ? pc : 1, sizeof(LLVMTypeRef));
-    if (!zan_params) return NULL;
-    LLVMGetParamTypes(zan_ft, zan_params);
-    LLVMTypeRef zan_ret = LLVMGetReturnType(zan_ft);
+                              LLVMTypeRef zan_ft) {
+  unsigned pc = LLVMCountParamTypes(zan_ft);
+  LLVMTypeRef *zan_params =
+      (LLVMTypeRef *)calloc(pc ? pc : 1, sizeof(LLVMTypeRef));
+  if (!zan_params)
+    return NULL;
+  LLVMGetParamTypes(zan_ft, zan_params);
+  LLVMTypeRef zan_ret = LLVMGetReturnType(zan_ft);
 
-    bool any = abi_is_aggregate(zan_ret);
-    for (unsigned i = 0; i < pc && !any; i++) any = abi_is_aggregate(zan_params[i]);
-    if (!any) { free(zan_params); return NULL; }
+  bool any = abi_is_aggregate(zan_ret);
+  for (unsigned i = 0; i < pc && !any; i++)
+    any = abi_is_aggregate(zan_params[i]);
+  if (!any) {
+    free(zan_params);
+    return NULL;
+  }
 
-    abi_target_t tgt = abi_target_of(g);
-    if (tgt == ABI_TARGET_UNSUPPORTED) {
-        abi_pending_add(g, name);
-        free(zan_params);
-        return NULL;
-    }
+  abi_target_t tgt = abi_target_of(g);
+  if (tgt == ABI_TARGET_UNSUPPORTED) {
+    abi_pending_add(g, name);
+    free(zan_params);
+    return NULL;
+  }
 
-    abi_slot_t ret_slot;
-    abi_slot_t *arg_slots =
-        (abi_slot_t *)calloc(pc ? pc : 1, sizeof(abi_slot_t));
-    LLVMTypeRef *c_params =
-        (LLVMTypeRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMTypeRef));
-    LLVMValueRef *c_args =
-        (LLVMValueRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMValueRef));
-    if (!arg_slots || !c_params || !c_args) {
-        free(arg_slots); free(c_params); free(c_args); free(zan_params);
-        return NULL;
-    }
-    abi_classify(g, tgt, zan_ret, true, &ret_slot);
-    bool sret = (ret_slot.kind == ABI_SLOT_SRET);
-    /* A SysV hidden result pointer occupies the first integer argument register. */
-    sysv_regs_t free_regs = {sret ? 5 : 6, 8};
-    for (unsigned i = 0; i < pc; i++) {
-        abi_classify(g, tgt, zan_params[i], false, &arg_slots[i]);
-        if (tgt == ABI_TARGET_SYSV64)
-            sysv_assign_arg_regs(&arg_slots[i], &free_regs);
-    }
+  abi_slot_t ret_slot;
+  abi_slot_t *arg_slots = (abi_slot_t *)calloc(pc ? pc : 1, sizeof(abi_slot_t));
+  LLVMTypeRef *c_params =
+      (LLVMTypeRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMTypeRef));
+  LLVMValueRef *c_args =
+      (LLVMValueRef *)calloc((size_t)pc * 2 + 1, sizeof(LLVMValueRef));
+  if (!arg_slots || !c_params || !c_args) {
+    free(arg_slots);
+    free(c_params);
+    free(c_args);
+    free(zan_params);
+    return NULL;
+  }
+  abi_classify(g, tgt, zan_ret, true, &ret_slot);
+  bool sret = (ret_slot.kind == ABI_SLOT_SRET);
+  /* A SysV hidden result pointer occupies the first integer argument register.
+   */
+  sysv_regs_t free_regs = {sret ? 5 : 6, 8};
+  for (unsigned i = 0; i < pc; i++) {
+    abi_classify(g, tgt, zan_params[i], false, &arg_slots[i]);
+    if (tgt == ABI_TARGET_SYSV64)
+      sysv_assign_arg_regs(&arg_slots[i], &free_regs);
+  }
 
-    unsigned cn = 0;
-    LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    if (sret) c_params[cn++] = ptr_ty;
-    for (unsigned i = 0; i < pc; i++) {
-        abi_slot_t *s = &arg_slots[i];
-        if (s->kind == ABI_SLOT_COERCE)
-            for (int k = 0; k < s->nparts; k++) c_params[cn++] = s->parts[k];
-        else if (s->kind == ABI_SLOT_INDIRECT)
-            c_params[cn++] = ptr_ty;
-        else
-            c_params[cn++] = zan_params[i];
-    }
-    LLVMTypeRef c_ret = LLVMVoidTypeInContext(g->ctx);
-    if (!sret) {
-        if (ret_slot.kind == ABI_SLOT_COERCE) {
-            c_ret = ret_slot.nparts == 1
-                ? ret_slot.parts[0]
-                : LLVMStructTypeInContext(g->ctx, ret_slot.parts, 2, 0);
-        } else {
-            c_ret = zan_ret;
-        }
-    }
-    LLVMTypeRef c_ft = LLVMFunctionType(c_ret, c_params, cn, 0);
-
-    LLVMValueRef c_fn = LLVMGetNamedFunction(g->mod, name);
-    if (!c_fn) {
-        c_fn = LLVMAddFunction(g->mod, name, c_ft);
-        if (sret) {
-            abi_add_type_attr(g, c_fn, NULL, 1, "sret", zan_ret);
-            abi_add_int_attr(g, c_fn, NULL, 1, "align",
-                             abi_align_of(zan_ret));
-        }
-        unsigned ai = sret ? 2 : 1;
-        for (unsigned i = 0; i < pc; i++) {
-            abi_slot_t *s = &arg_slots[i];
-            if (s->kind == ABI_SLOT_COERCE) {
-                if (s->stack_align)
-                    abi_add_int_attr(g, c_fn, NULL, ai, "alignstack",
-                                     s->stack_align);
-                ai += (unsigned)s->nparts;
-                continue;
-            }
-            if (s->kind == ABI_SLOT_INDIRECT && s->byval) {
-                abi_add_type_attr(g, c_fn, NULL, ai, "byval", zan_params[i]);
-                abi_add_int_attr(g, c_fn, NULL, ai, "align",
-                                 abi_align_of(zan_params[i]) < 8
-                                     ? 8 : abi_align_of(zan_params[i]));
-            }
-            if (s->stack_align)
-                abi_add_int_attr(g, c_fn, NULL, ai, "alignstack", s->stack_align);
-            ai++;
-        }
-    }
-
-    char tname[320];
-    snprintf(tname, sizeof(tname), "zan.abi.%s", name);
-    LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);
-    if (thunk) {
-        free(arg_slots); free(c_params); free(c_args); free(zan_params);
-        return thunk;
-    }
-    thunk = LLVMAddFunction(g->mod, tname, zan_ft);
-    LLVMSetLinkage(thunk, LLVMInternalLinkage);
-
-    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry");
-    LLVMPositionBuilderAtEnd(g->builder, entry);
-
-    unsigned an = 0;
-    LLVMValueRef ret_tmp = NULL;
-    if (sret) {
-        ret_tmp = LLVMBuildAlloca(g->builder, zan_ret, "abi.sret");
-        LLVMSetAlignment(ret_tmp, (unsigned)abi_align_of(zan_ret));
-        c_args[an++] = ret_tmp;
-    }
-    for (unsigned i = 0; i < pc; i++) {
-        abi_slot_t *s = &arg_slots[i];
-        LLVMValueRef v = LLVMGetParam(thunk, i);
-        if (s->kind == ABI_SLOT_DIRECT) { c_args[an++] = v; continue; }
-        LLVMValueRef tmp = abi_slot_alloca(g, s, "abi.arg");
-        if (s->wide_storage)
-            LLVMBuildStore(g->builder, LLVMConstNull(s->wide_storage), tmp);
-        LLVMBuildStore(g->builder, v, tmp);
-        if (s->kind == ABI_SLOT_INDIRECT) { c_args[an++] = tmp; continue; }
-        for (int k = 0; k < s->nparts; k++) {
-            LLVMValueRef p = abi_byte_ptr(g, tmp, (unsigned long)k * 8);
-            c_args[an++] = LLVMBuildLoad2(g->builder, s->parts[k], p, "abi.part");
-        }
-    }
-
-    LLVMValueRef call = LLVMBuildCall2(g->builder, c_ft, c_fn, c_args, an,
-                                       LLVMGetTypeKind(c_ret) == LLVMVoidTypeKind
-                                           ? "" : "abi.call");
-    if (sret) {
-        abi_add_type_attr(g, NULL, call, 1, "sret", zan_ret);
-        abi_add_int_attr(g, NULL, call, 1, "align", abi_align_of(zan_ret));
-    }
-    {
-        unsigned ai = sret ? 2 : 1;
-        for (unsigned i = 0; i < pc; i++) {
-            abi_slot_t *s = &arg_slots[i];
-            if (s->kind == ABI_SLOT_COERCE) {
-                if (s->stack_align)
-                    abi_add_int_attr(g, NULL, call, ai, "alignstack",
-                                     s->stack_align);
-                ai += (unsigned)s->nparts;
-                continue;
-            }
-            if (s->kind == ABI_SLOT_INDIRECT && s->byval) {
-                abi_add_type_attr(g, NULL, call, ai, "byval", zan_params[i]);
-                abi_add_int_attr(g, NULL, call, ai, "align",
-                                 abi_align_of(zan_params[i]) < 8
-                                     ? 8 : abi_align_of(zan_params[i]));
-            }
-            if (s->stack_align)
-                abi_add_int_attr(g, NULL, call, ai, "alignstack", s->stack_align);
-            ai++;
-        }
-    }
-
-    if (LLVMGetTypeKind(zan_ret) == LLVMVoidTypeKind) {
-        LLVMBuildRetVoid(g->builder);
-    } else if (sret) {
-        LLVMBuildRet(g->builder,
-                     LLVMBuildLoad2(g->builder, zan_ret, ret_tmp, "abi.ret"));
-    } else if (ret_slot.kind == ABI_SLOT_COERCE) {
-        LLVMValueRef tmp = abi_slot_alloca(g, &ret_slot, "abi.rettmp");
-        for (int k = 0; k < ret_slot.nparts; k++) {
-            LLVMValueRef part = ret_slot.nparts == 1
-                ? call
-                : LLVMBuildExtractValue(g->builder, call, (unsigned)k, "abi.rp");
-            LLVMBuildStore(g->builder, part,
-                           abi_byte_ptr(g, tmp, (unsigned long)k * 8));
-        }
-        LLVMBuildRet(g->builder,
-                     LLVMBuildLoad2(g->builder, zan_ret, tmp, "abi.ret"));
+  unsigned cn = 0;
+  LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (sret)
+    c_params[cn++] = ptr_ty;
+  for (unsigned i = 0; i < pc; i++) {
+    abi_slot_t *s = &arg_slots[i];
+    if (s->kind == ABI_SLOT_COERCE)
+      for (int k = 0; k < s->nparts; k++)
+        c_params[cn++] = s->parts[k];
+    else if (s->kind == ABI_SLOT_INDIRECT)
+      c_params[cn++] = ptr_ty;
+    else
+      c_params[cn++] = zan_params[i];
+  }
+  LLVMTypeRef c_ret = LLVMVoidTypeInContext(g->ctx);
+  if (!sret) {
+    if (ret_slot.kind == ABI_SLOT_COERCE) {
+      c_ret = ret_slot.nparts == 1
+                  ? ret_slot.parts[0]
+                  : LLVMStructTypeInContext(g->ctx, ret_slot.parts, 2, 0);
     } else {
-        LLVMBuildRet(g->builder, call);
+      c_ret = zan_ret;
     }
+  }
+  LLVMTypeRef c_ft = LLVMFunctionType(c_ret, c_params, cn, 0);
 
-    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
-    free(arg_slots); free(c_params); free(c_args); free(zan_params);
+  LLVMValueRef c_fn = LLVMGetNamedFunction(g->mod, name);
+  if (!c_fn) {
+    c_fn = LLVMAddFunction(g->mod, name, c_ft);
+    if (sret) {
+      abi_add_type_attr(g, c_fn, NULL, 1, "sret", zan_ret);
+      abi_add_int_attr(g, c_fn, NULL, 1, "align", abi_align_of(zan_ret));
+    }
+    unsigned ai = sret ? 2 : 1;
+    for (unsigned i = 0; i < pc; i++) {
+      abi_slot_t *s = &arg_slots[i];
+      if (s->kind == ABI_SLOT_COERCE) {
+        if (s->stack_align)
+          abi_add_int_attr(g, c_fn, NULL, ai, "alignstack", s->stack_align);
+        ai += (unsigned)s->nparts;
+        continue;
+      }
+      if (s->kind == ABI_SLOT_INDIRECT && s->byval) {
+        abi_add_type_attr(g, c_fn, NULL, ai, "byval", zan_params[i]);
+        abi_add_int_attr(
+            g, c_fn, NULL, ai, "align",
+            abi_align_of(zan_params[i]) < 8 ? 8 : abi_align_of(zan_params[i]));
+      }
+      if (s->stack_align)
+        abi_add_int_attr(g, c_fn, NULL, ai, "alignstack", s->stack_align);
+      ai++;
+    }
+  }
+
+  char tname[320];
+  snprintf(tname, sizeof(tname), "zan.abi.%s", name);
+  LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);
+  if (thunk) {
+    free(arg_slots);
+    free(c_params);
+    free(c_args);
+    free(zan_params);
     return thunk;
+  }
+  thunk = LLVMAddFunction(g->mod, tname, zan_ft);
+  LLVMSetLinkage(thunk, LLVMInternalLinkage);
+
+  LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+  LLVMBasicBlockRef entry =
+      LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+
+  unsigned an = 0;
+  LLVMValueRef ret_tmp = NULL;
+  if (sret) {
+    ret_tmp = LLVMBuildAlloca(g->builder, zan_ret, "abi.sret");
+    LLVMSetAlignment(ret_tmp, (unsigned)abi_align_of(zan_ret));
+    c_args[an++] = ret_tmp;
+  }
+  for (unsigned i = 0; i < pc; i++) {
+    abi_slot_t *s = &arg_slots[i];
+    LLVMValueRef v = LLVMGetParam(thunk, i);
+    if (s->kind == ABI_SLOT_DIRECT) {
+      c_args[an++] = v;
+      continue;
+    }
+    LLVMValueRef tmp = abi_slot_alloca(g, s, "abi.arg");
+    if (s->wide_storage)
+      LLVMBuildStore(g->builder, LLVMConstNull(s->wide_storage), tmp);
+    LLVMBuildStore(g->builder, v, tmp);
+    if (s->kind == ABI_SLOT_INDIRECT) {
+      c_args[an++] = tmp;
+      continue;
+    }
+    for (int k = 0; k < s->nparts; k++) {
+      LLVMValueRef p = abi_byte_ptr(g, tmp, (unsigned long)k * 8);
+      c_args[an++] = LLVMBuildLoad2(g->builder, s->parts[k], p, "abi.part");
+    }
+  }
+
+  LLVMValueRef call = LLVMBuildCall2(
+      g->builder, c_ft, c_fn, c_args, an,
+      LLVMGetTypeKind(c_ret) == LLVMVoidTypeKind ? "" : "abi.call");
+  if (sret) {
+    abi_add_type_attr(g, NULL, call, 1, "sret", zan_ret);
+    abi_add_int_attr(g, NULL, call, 1, "align", abi_align_of(zan_ret));
+  }
+  {
+    unsigned ai = sret ? 2 : 1;
+    for (unsigned i = 0; i < pc; i++) {
+      abi_slot_t *s = &arg_slots[i];
+      if (s->kind == ABI_SLOT_COERCE) {
+        if (s->stack_align)
+          abi_add_int_attr(g, NULL, call, ai, "alignstack", s->stack_align);
+        ai += (unsigned)s->nparts;
+        continue;
+      }
+      if (s->kind == ABI_SLOT_INDIRECT && s->byval) {
+        abi_add_type_attr(g, NULL, call, ai, "byval", zan_params[i]);
+        abi_add_int_attr(
+            g, NULL, call, ai, "align",
+            abi_align_of(zan_params[i]) < 8 ? 8 : abi_align_of(zan_params[i]));
+      }
+      if (s->stack_align)
+        abi_add_int_attr(g, NULL, call, ai, "alignstack", s->stack_align);
+      ai++;
+    }
+  }
+
+  if (LLVMGetTypeKind(zan_ret) == LLVMVoidTypeKind) {
+    LLVMBuildRetVoid(g->builder);
+  } else if (sret) {
+    LLVMBuildRet(g->builder,
+                 LLVMBuildLoad2(g->builder, zan_ret, ret_tmp, "abi.ret"));
+  } else if (ret_slot.kind == ABI_SLOT_COERCE) {
+    LLVMValueRef tmp = abi_slot_alloca(g, &ret_slot, "abi.rettmp");
+    for (int k = 0; k < ret_slot.nparts; k++) {
+      LLVMValueRef part =
+          ret_slot.nparts == 1
+              ? call
+              : LLVMBuildExtractValue(g->builder, call, (unsigned)k, "abi.rp");
+      LLVMBuildStore(g->builder, part,
+                     abi_byte_ptr(g, tmp, (unsigned long)k * 8));
+    }
+    LLVMBuildRet(g->builder,
+                 LLVMBuildLoad2(g->builder, zan_ret, tmp, "abi.ret"));
+  } else {
+    LLVMBuildRet(g->builder, call);
+  }
+
+  if (saved)
+    LLVMPositionBuilderAtEnd(g->builder, saved);
+  free(arg_slots);
+  free(c_params);
+  free(c_args);
+  free(zan_params);
+  return thunk;
 }

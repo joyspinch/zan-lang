@@ -39,17 +39,23 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         } else if (g->current_type_sym) {
             /* 外层类同名符号访问：根据静态/实例上下文分发 */
             zan_symbol_t *fs = get_field_sym(g->current_type_sym, operand->ident.name);
-            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
-            zan_symbol_t *getter = gv ? property_getter_sym(g, fs) : NULL;
+            zan_type_t *sinst = (g->cur_inst &&
+                g->cur_inst->sym == g->current_type_sym)
+                ? g->cur_inst : g->current_type_sym->type;
+            zan_symbol_t *getter =
+                (fs && field_member_is_static(fs)) ? property_getter_sym(g, fs) : NULL;
             if (getter) {
                 prop_getter = getter;
                 prop_setter = property_setter_sym(g, fs);
-                prop_recv_type = g->current_type_sym->type;
+                prop_recv_type = sinst;
                 prop_recv = NULL;
             } else {
+            LLVMValueRef gv = get_static_field_global(g, g->current_type_sym, fs, NULL);
             if (gv) {
+                zan_type_t *fst = field_store_type(g, fs, g->cur_inst);
+                zan_type_t *rft = fst ? fst : fs->type;
                 slot_ptr = gv;
-                slot_ty = fs->type ? map_type(g, fs->type) : i64;
+                slot_ty = rft ? map_type(g, rft) : i64;
             } else {
                 int fi = get_field_index(g->current_type_sym, operand->ident.name);
                 LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
@@ -78,18 +84,20 @@ LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_symbol_t *cs = receiver_type_symbol(g, obj_expr, locals);
             if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
                 zan_symbol_t *fs = get_field_sym(cs, operand->member.name);
+                zan_type_t *sinst = static_access_inst(g, obj_expr);
                 zan_symbol_t *getter = property_getter_sym(g, fs);
                 if (getter) {
                     prop_getter = getter;
                     prop_setter = property_setter_sym(g, fs);
-                    prop_recv_type = cs->type;
+                    prop_recv_type = sinst ? sinst : cs->type;
                     prop_recv = NULL;
                 } else {
-                LLVMValueRef gv = get_static_field_global(g, cs, fs,
-                    static_access_inst(g, obj_expr));
+                LLVMValueRef gv = get_static_field_global(g, cs, fs, sinst);
                 if (gv) {
+                    zan_type_t *fst = field_store_type(g, fs, sinst);
+                    zan_type_t *rft = fst ? fst : fs->type;
                     slot_ptr = gv;
-                    slot_ty = fs->type ? map_type(g, fs->type) : i64;
+                    slot_ty = rft ? map_type(g, rft) : i64;
                 }
                 }
             }
