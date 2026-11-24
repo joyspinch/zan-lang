@@ -4699,6 +4699,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # Combined rounded fill+border coverage (CPU primitive, no window needed).
   add_executable(zan_gui_surface_round_test tests/runtime/gui_surface_round_test.c)
   target_link_libraries(zan_gui_surface_round_test PRIVATE zan_gui)
+  if(UNIX)
+    target_link_libraries(zan_gui_surface_round_test PRIVATE m) # test calls sqrt directly
+  endif()
   add_test(NAME runtime_gui_surface_round COMMAND zan_gui_surface_round_test)
 
   # Real GL context, not a CPU substitute. Headless/unsupported hosts skip.
@@ -4712,6 +4715,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     if(ZAN_GAME_AVAILABLE)
       add_executable(zan_gui_gl_3d_test tests/runtime/gui_gl_3d_test.c)
       target_link_libraries(zan_gui_gl_3d_test PRIVATE ${CMAKE_DL_LIBS})
+      if(UNIX)
+        target_link_libraries(zan_gui_gl_3d_test PRIVATE m) # cos/sin
+      endif()
       add_dependencies(zan_gui_gl_3d_test zan_gui zan_game zan_image)
       add_test(NAME runtime_gui_gl_3d COMMAND zan_gui_gl_3d_test
         $<TARGET_FILE:zan_gui> $<TARGET_FILE:zan_game> $<TARGET_FILE:zan_image>)

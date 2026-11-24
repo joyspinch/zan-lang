@@ -721,8 +721,11 @@ static void zan_design_root_for(const char *input, char *out, size_t sz) {
     if (!zan_utf8_full_path(input, abs, sizeof(abs)))
         snprintf(abs, sizeof(abs), "%s", input);
 #else
-    if (realpath(input, abs) == NULL)
-        snprintf(abs, sizeof(abs), "%s", input);
+    /* realpath 的输出缓冲必须 >= PATH_MAX：glibc 加固（_FORTIFY_SOURCE）对
+     * 更小的缓冲一律 abort，与实际路径长短无关。让它自行分配。 */
+    char *rp = realpath(input, NULL);
+    snprintf(abs, sizeof(abs), "%s", rp ? rp : input);
+    free(rp);
 #endif
     char dir[1024];
     snprintf(dir, sizeof(dir), "%s", abs);
