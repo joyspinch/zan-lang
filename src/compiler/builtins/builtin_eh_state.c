@@ -450,7 +450,7 @@ static void emit_eh_tsd_clear(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, get_eh_tsd_key(g), "k.rel");
     LLVMSetOrdering(k, LLVMAtomicOrderingAcquire);
-    LLVMValueRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
     LLVMBasicBlockRef clr = LLVMAppendBasicBlockInContext(g->ctx, fn, "tsd.clr");
     LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, fn, "tsd.cont");

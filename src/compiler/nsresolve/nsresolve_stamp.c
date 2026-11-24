@@ -469,7 +469,7 @@ static bool decl_has_member(const zan_ast_node_t *d, zan_istr_t name) {
     if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
         d->kind != AST_INTERFACE_DECL && d->kind != AST_ENUM_DECL)
         return false;
-    zan_ast_list_t *ms = &d->type_decl.members;
+    const zan_ast_list_t *ms = &d->type_decl.members;
     for (int i = 0; i < ms->count; i++) {
         zan_ast_node_t *m = ms->items[i];
         if (!m) continue;
