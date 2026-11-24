@@ -938,6 +938,12 @@ codegen_ready:
         }
 
         generated_object_vec_add(&generated_objects, obj_tmp);
+        for (int si = 1; si < irgen.split_obj_count; si++)
+            generated_object_vec_add(&generated_objects, irgen.split_objs[si]);
+        for (int si = 0; si < irgen.split_obj_count; si++) free(irgen.split_objs[si]);
+        free(irgen.split_objs);
+        irgen.split_objs = NULL;
+        irgen.split_obj_count = 0;
         phase("write obj");
         probe_phase_mem("write obj");
 

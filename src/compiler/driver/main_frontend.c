@@ -520,6 +520,7 @@
     bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
                       ((shard_env && shard_env[0] == '1') || publish_mode);
 
+    irgen.split_codegen_ok = native_arch && !cross_compiling;
     zan_irgen_bind_target(&irgen);
     if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
         fprintf(stderr, "error: code generation failed\n");

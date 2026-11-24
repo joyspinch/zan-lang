@@ -774,3 +774,24 @@ try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内
 
 验证坑：`run_case.cmake` 在 exe 比 zanc/源码新时**复用旧 exe**——换环境变量做
 A/B 前必须 `touch build/zanc`，否则基线跑的是上一轮的二进制。
+
+## 35. 编译器"内存泄漏"先分清泄漏、常驻与峰值（2026-11-24 Mac arm64 实证）
+
+`leaks --atExit`（`MallocStackLogging=1`）编自举编译器只漏 36MB，几乎全是从不
+`LLVMContextDispose` 的上下文——不是峰值来源。峰值用 `--time`（macOS/Linux 已接
+`procmem.h`）分阶段看：自举 -O2 前端 52MB、irgen 500MB、优化 700MB、**目标文件
+代码生成 1.8GB**。拿 `--emit-ir` 产物喂原版 `llc -O2` 同样 27s/2.0GB，`-filetype=null`
+也一样——是 LLVM 代码生成随**整个模块**累积，与单个大函数无关（最大函数单独
+`llvm-extract` 后 llc 只要 170MB），切四份每份 ~500MB。
+
+三处修复：
+- 字符串长度探测逐点内联 ~30 条指令/10 个块，改调共享内部函数
+  `__zan_str_len[_arr]`（参数带 file/line/col 供空值报告）：自举 IR 1.37M → 934K，
+  -O0 5.5s/594MB → 4.4s/476MB，产物 12.3MB → 8.4MB。
+- 超大函数（>4000 条）加 optsize 压低往里内联：-O2 峰值再降 ~200MB，运行速度不变。
+- `codegen_split.cpp`：优化**之后** SplitModule 切分、写 bitcode、释放原模块、各线程
+  独立 context 重载并发射。不同于发布 shard（优化前切，丢跨分片内联，自举编译器
+  实测运行慢 45%），这条路运行速度不变、输出逐字节相同；代码生成 25s → 9.7s。
+
+验证坑：机器负载高（其他会话并行构建，load 12–16）时单次计时可差 40%，
+运行速度对比必须交替多轮跑。

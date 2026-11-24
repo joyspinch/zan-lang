@@ -125,7 +125,7 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 # distribution builds them (e.g. mozbuild clang omits RISCV). Link �� and
 # initialize, via HAVE_LLVM_* defines �� only the ones this LLVM provides.
 set(ZAN_LLVM_COMPONENTS
-    core support analysis bitwriter target
+    core support analysis bitwriter bitreader transformutils target
     x86codegen x86asmparser x86desc x86info
     aarch64codegen aarch64asmparser aarch64desc aarch64info
     passes
@@ -188,6 +188,7 @@ add_executable(zanc
     src/compiler/irgen_stmt.c
     src/compiler/irgen_weak.c
     src/compiler/irgen_compact.cpp
+    src/compiler/codegen_split.cpp
     src/compiler/optimizer.c
     src/compiler/incremental.c
     src/compiler/package.c

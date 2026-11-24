@@ -485,6 +485,12 @@ struct zan_irgen {
      * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
      * every body and a thunk for every method. Set by zan_irgen_emit. */
     bool closed_world;
+    /* Set by the driver for native, non-cross executable builds: object
+     * emission may split a large module across threads (codegen_split.h).
+     * The extra partition objects are listed here for the linker. */
+    bool split_codegen_ok;
+    char **split_objs;
+    int split_obj_count;
     bool         publish_instance_prune; /* closed-world instance callable roots */
     bool         publish_vslot_demand;
     zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */

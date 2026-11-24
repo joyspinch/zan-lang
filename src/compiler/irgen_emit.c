@@ -1,6 +1,10 @@
 #include "irgen_internal.h"
 #include "optimizer.h"
 #include "irgen_compact.h"
+#include "codegen_split.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 typedef struct {
     zan_ast_node_t *member;

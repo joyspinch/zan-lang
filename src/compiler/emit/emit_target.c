@@ -985,6 +985,37 @@ void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
     }
 }
 
+/* Split object emission when the optimized module is large enough that a
+ * single-threaded codegen pass dominates time and memory. ZAN_CODEGEN_SPLIT=0
+ * disables it; =N forces N partitions. */
+static bool zan_codegen_split_plan(zan_irgen_t *g, int *parts, int *threads) {
+    const char *env = getenv("ZAN_CODEGEN_SPLIT");
+    long forced = env && *env ? strtol(env, NULL, 10) : -1;
+    if (forced == 0 || !g->split_codegen_ok || g->emit_debug || g->emit_lib) return false;
+    long insns = 0;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn; fn = LLVMGetNextFunction(fn))
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+            for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in))
+                insns++;
+    long cpus = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cpus = (long)si.dwNumberOfProcessors;
+#else
+    cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (cpus < 1) cpus = 1;
+    if (cpus > 16) cpus = 16;
+    if (forced < 0 && (insns < 200000 || cpus < 2)) return false;
+    long n = forced > 0 ? forced : insns / 100000;
+    if (n < 2) n = 2;
+    if (n > 16) n = 16; /* keeps the link line short (cmd.exe caps at 8191) */
+    *parts = (int)n;
+    *threads = (int)(cpus < n ? cpus : n);
+    return true;
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
@@ -1149,6 +1180,46 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
         return ZAN_ERROR;
     }
     char *error = NULL;
+    int parts = 0, threads = 1;
+    if (zan_codegen_split_plan(g, &parts, &threads)) {
+        size_t plen = strlen(path);
+        char **paths = (char **)calloc((size_t)parts, sizeof(char *));
+        bool ok = paths != NULL;
+        for (int i = 0; ok && i < parts; i++) {
+            paths[i] = (char *)malloc(plen + 24);
+            if (!paths[i]) {
+                ok = false;
+                break;
+            }
+            if (i == 0) memcpy(paths[i], path, plen + 1);
+            else snprintf(paths[i], plen + 24, "%s.p%d.o", path, i);
+        }
+        if (ok) {
+            LLVMModuleRef mod = g->mod;
+            g->mod = NULL; /* owned and disposed by the splitter */
+            int rc =
+                zan_codegen_split_emit(mod, tm, parts, threads, (const char *const *)paths, &error);
+            LLVMDisposeTargetMachine(tm);
+            if (rc != 0) {
+                zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
+                                   "failed to emit object file: %s", error ? error : "?");
+                free(error);
+                for (int i = 0; i < parts; i++) {
+                    remove(paths[i]);
+                    free(paths[i]);
+                }
+                free(paths);
+                return ZAN_ERROR;
+            }
+            g->split_objs = paths;
+            g->split_obj_count = parts;
+            return ZAN_OK;
+        }
+        if (paths) {
+            for (int i = 0; i < parts; i++) free(paths[i]);
+            free(paths);
+        }
+    }
     if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path,
                                      LLVMObjectFile, &error)) {
         zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,

@@ -312,6 +312,9 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | `ZAN_VERBOSE_LINK` | 回显原生链接命令行（查 -L/-l 从哪来） |
 | `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策（`incl <文件> because <名字>`：`controller` 表示按 MVC 控制器常驻拉入） |
 | `ZAN_LINK_ECHO` | 回显链接命令（含 Unix 宿主 `cc` 链接，可看分片对象是否在链接行上） |
+| `ZAN_CODEGEN_SPLIT` | 优化后的模块 ≥20 万条指令时，目标文件代码生成按 `llvm::SplitModule` 切成多份、多线程并行发射（各线程独立 LLVMContext/TargetMachine，额外分区 `<out>.o.p<N>.o` 一并链接）；只影响本机、非交叉、非 `-g`、非库构建，不影响内联与运行速度。`=0` 关闭，`=N` 强制 N 份（上限 16，保持链接命令行短于 cmd.exe 的 8191 字符） |
+| `ZAN_HUGE_FN` | `-O2`/`-O3` 时，优化前指令数超过此值（默认 4000，`0` 关闭）的函数加 `optsize`，降低往超大分派函数里内联的阈值 |
+| `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |

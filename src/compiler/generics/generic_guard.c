@@ -660,8 +660,67 @@ LLVMValueRef emit_soft_base_select(zan_irgen_t *g, LLVMValueRef base,
     return phi;
 }
 
+/* Outlined-helper context: the null report reads file/line/col from the
+ * helper's parameters instead of baking the call site's constants. */
+typedef struct {
+    LLVMValueRef file, line, col;
+} strlen_site_args_t;
+
+static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload, int array_count,
+                                           zan_loc_t loc, const strlen_site_args_t *site);
+
+/* String length used to expand inline at every use: a null check, a header
+ * page-readability check, the cached-length probe, the array-count path, a
+ * strlen slow path that stamps the cache, a foreign-pointer path and a guard
+ * report -- ~30 instructions in 10 blocks. A 1200-line method with heavy
+ * string building reached 85k IR instructions, and LLVM's time and memory
+ * follow IR size. Emit one call to a shared internal helper per use instead;
+ * the optimizer still inlines it where that pays off. */
+static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
+    const char *name = array_count ? "__zan_str_len_arr" : "__zan_str_len";
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
+    if (fn) return fn;
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef fty = LLVMFunctionType(i64, (LLVMTypeRef[]){i8p, i8p, i32t, i32t}, 4, 0);
+    fn = LLVMAddFunction(g->mod, name, fty);
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef saved_fn = g->current_fn;
+    g->current_fn = fn;
+    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+    strlen_site_args_t site = {LLVMGetParam(fn, 1), LLVMGetParam(fn, 2), LLVMGetParam(fn, 3)};
+    LLVMValueRef len =
+        emit_string_len_inline(g, LLVMGetParam(fn, 0), array_count, zan_loc(0, 0, 0, 0), &site);
+    LLVMBuildRet(g->builder, len);
+    g->current_fn = saved_fn;
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    return fn;
+}
+
 static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
                                       int array_count, zan_loc_t loc) {
+    if (LLVMGetTypeKind(LLVMTypeOf(payload)) != LLVMPointerTypeKind || !g->rt_guard_split ||
+        !g->current_fn || getenv("ZAN_INLINE_STRLEN"))
+        return emit_string_len_inline(g, payload, array_count, loc, NULL);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef fn = get_string_len_helper(g, array_count);
+    LLVMValueRef file =
+        g->runtime_checks ? zan_irgen_intern_string(g, loc_site_file(g, loc)) : LLVMConstNull(i8p);
+    unsigned line = g->hide_diagnostics ? 0 : loc.line;
+    unsigned col = g->hide_diagnostics ? 0 : loc.col;
+    LLVMValueRef args[4] = {LLVMBuildBitCast(g->builder, payload, i8p, "strlen.p"), file,
+                            LLVMConstInt(i32t, line, 0), LLVMConstInt(i32t, col, 0)};
+    LLVMValueRef r = zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, args, 4, "strbuf.len");
+    LLVMSetInstructionCallConv(r, LLVMFastCallConv);
+    return r;
+}
+
+static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload, int array_count,
+                                           zan_loc_t loc, const strlen_site_args_t *site) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -776,7 +835,19 @@ static LLVMValueRef emit_string_len_ex(zan_irgen_t *g, LLVMValueRef payload,
 
     LLVMPositionBuilderAtEnd(g->builder, raw_bb);
     if (g->runtime_checks) {
-        emit_string_null_report(g, payload, loc);
+        if (site) {
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef fail_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                                   (LLVMTypeRef[]){i8p, i32t, i32t, i8p}, 4, 0);
+            LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail3");
+            if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+            LLVMValueRef msg = zan_irgen_intern_string(
+                g, "null reference where a string/byte buffer is required (length probe)\n");
+            zan_call2(g->builder, fail_ty, fail_fn,
+                      (LLVMValueRef[]){site->file, site->line, site->col, msg}, 4, "");
+        } else {
+            emit_string_null_report(g, payload, loc);
+        }
         LLVMBuildBr(g->builder, done_bb);
         phi_raw = LLVMConstInt(i64, 0, 0);
         phi_raw_pred = LLVMGetInsertBlock(g->builder);

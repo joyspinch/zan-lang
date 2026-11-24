@@ -414,7 +414,7 @@
             }
             link_ret = (int)zan_utf8_spawnv(_P_WAIT, lld_path, argv);
         } else {
-            char link_cmd[4096];
+            char link_cmd[32768];
             snprintf(link_cmd, sizeof(link_cmd),
                      "clang --target=x86_64-w64-windows-gnu --ld-path=\"%s\" "
                      "\"%s\" -o \"%s\" -Wl,--stack,268435456%s",
@@ -491,14 +491,13 @@
             link_ret = system(link_cmd);
         }
 #else
-        char link_cmd[4096];
-        if (publish_mode || strip_symbols) {
-            snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm -O2 -s",
-                     obj_tmp, obj_path);
-        } else {
-            snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm",
-                     obj_tmp, obj_path);
-        }
+            char link_cmd[32768];
+            if (publish_mode || strip_symbols) {
+                snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm -O2 -s", obj_tmp,
+                         obj_path);
+            } else {
+                snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm", obj_tmp, obj_path);
+            }
         /* Publish sharding (shard_emit.c) moves most functions into extra
          * objects; they were never on this host link line, so every sharded
          * Unix publish failed with undefined symbols. */
