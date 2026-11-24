@@ -124,7 +124,11 @@ build/zanc app.zan --target linux-x64 --cpu-profile avx2 --emit-ir > app.ll
 build/zanc probe.zan --auto-stdlib --emit-ir > ir.ll   # 看 IR
 build/zanc probe.zan --auto-stdlib --dump-ast          # 看语法树（--dump-tokens 同理）
 build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
+ZAN_LLVM_ARGS="-time-passes" build/zanc probe.zan --auto-stdlib -O2   # LLVM 逐 pass 耗时
 ```
+
+`ZAN_LLVM_ARGS` 是空格分隔的额外 LLVM 命令行选项（最多 31 个），原样交给
+`LLVMParseCommandLineOptions`，用于编译器自身的性能诊断（如 `-time-passes`）。
 
 `--emit-ir` 落出的 IR **自述目标特性**（头部注释 `; zanc-target-cpu:` /
 `; zanc-target-features:`），stderr 同时打印对应的 `llc` 命令行。消费方必须

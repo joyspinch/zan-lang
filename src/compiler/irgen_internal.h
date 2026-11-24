@@ -254,6 +254,11 @@ LLVMValueRef get_eh_personality_fn(zan_irgen_t *g);
 void ensure_function_personality(zan_irgen_t *g, LLVMValueRef fn);
 void emit_raise_exception(zan_irgen_t *g);
 void emit_raise_exception_through_cleanups(zan_irgen_t *g);
+LLVMBasicBlockRef zan_raise_unwind_dest(zan_irgen_t *g, bool include_cleanups);
+LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g);
+LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g);
+void zan_emit_raise_call(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef *args, unsigned n,
+                         LLVMBasicBlockRef cont_bb, bool include_cleanups);
 /* 收缩 pass（optimizer.c）的 Zan 函数名注记：irgen 每注册一个 Zan
  * 函数喂一次 LLVM 名；publish 跨片时这些名字在别的分片模块里只是
  * declaration，收缩 pass 据此判"可抛"，避免把跨片 Zan 调用误判为

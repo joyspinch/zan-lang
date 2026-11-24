@@ -270,6 +270,33 @@ void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
 
     zan_symbol_t *sym = infer_guard_exception_sym(g, msg);
+    /* Common case: one call into the shared cold helper (see
+     * zan_eh_guard_raise_fn). Inline finally blocks still need the
+     * per-site path: they run before the throw. */
+    if (sym && !g->target_is_wasm && g->rt_guard_split &&
+        !(g->finally_count > 0 && g->current_locals)) {
+        LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef vtg = get_vtable_global(g, sym);
+        LLVMValueRef vt = vtg ? LLVMConstBitCast(vtg, i8ptr) : LLVMConstNull(i8ptr);
+        LLVMValueRef ex_msg =
+            emit_string_literal_rc(g, (zan_istr_t){(char *)msg, (int)strlen(msg)});
+        LLVMValueRef tid = LLVMConstBitCast(get_class_tid_global(g, sym), i8ptr);
+        char mbuf[320];
+        snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
+        LLVMValueRef st = LLVMBuildBitCast(g->builder, zan_eh_state_ptr(g), i8ptr, "");
+        LLVMValueRef args[] = {st,
+                               vt,
+                               ex_msg,
+                               tid,
+                               zan_irgen_intern_string(g, loc_site_file(g, loc)),
+                               LLVMConstInt(i32t, g->hide_diagnostics ? 0 : loc.line, 0),
+                               LLVMConstInt(i32t, g->hide_diagnostics ? 0 : loc.col, 0),
+                               zan_irgen_intern_string(g, mbuf)};
+        zan_emit_raise_call(g, zan_eh_guard_raise_fn(g), args, 8, cont_bb, !g->current_async_frame);
+        LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+        return;
+    }
     if (sym && !g->target_is_wasm) {
         LLVMValueRef top_g, bufs_g, exc_g;
         get_eh_globals(g, &top_g, &bufs_g, &exc_g);

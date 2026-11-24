@@ -712,3 +712,23 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 - 实测接口调用循环 1580 ms → 179 ms；回归用例 arc_elem_receiver_borrow 钉住的
   五种危险形态（改写自身槽、调用、属性、重载运算符、有副作用实参）在
   --check-leaks --arc-guard 下都必须通过。
+
+## 32. 每个检查点的冷路径都内联展开会撑大全部 IR（2026-11-24 Mac arm64 实证）
+
+运行期检查（越界/空/强转/溢出）原先在每个检查点内联展开失败路径：读
+eh.top、构造 24 字节异常对象、写 EH 状态、`__cxa_allocate_exception` +
+`invoke __cxa_throw`、软失败上报——每点约 20 条指令 4 个块。自举编译器
+（4.6 万行）有约 1.8 万个这样的点，占 IR 约五分之一，LLVM 逐个优化、选指令。
+
+做法：模块内一个 `internal noinline cold` 的 `__zan_guard_raise(state, vt,
+msg, tid, file, line, col, msg2)`（`zan_eh_guard_raise_fn`），检查点只剩一条
+call/invoke（`zan_emit_raise_call` 按 `zan_raise_unwind_dest` 选 lpad，与
+`emit_raise_exception_impl` 同一规则；async 帧只认带 catch 的 lpad）。语义不变：
+try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内联 finally 的点
+（`finally_count>0`）与 wasm 仍走旧路径。
+
+实测：IR 指令 1.78M → 1.46M（−18%），基本块 −15%；-O0 7.7s → 6.5s；-O2 峰值
+内存 1171 → 917 MB。-O2 墙钟不变（67s）——`ZAN_LLVM_ARGS=-time-passes` 显示
+时间平摊在整条标准管线（ISel 20%、InstCombine 12%、RA 8%），没有病态 pass：
+剩下的杠杆是继续减 IR 量（内联 release、字符串拼接）与按分区并行 codegen。
+规律：任何"每个点都可能失败"的冷路径，先想能否收成一个共享冷函数。
