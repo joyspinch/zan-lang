@@ -1,22 +1,73 @@
 using System;
 using System.IO;
-using System.Diagnostics;
-using System.Json;
-using System.Data;
-using System.Data.Sqlite;
+using System.Collections.Generic;
+using System.Windows;
 using Gui;
 using Gui.Widget;
-using Gui.Designer;
-using Gui.Component;
-using Game.Scene;
 using Gui.Backend;
 
-partial class ZanIDE : UiViewOwner {
+// Zan Publish Studio 主控壳层：管理单窗体状态、工程加载、编译/运行/一键发布流水线。
+partial class ZanIDE {
+    static ZanIDE current;
 
-    // ---- UI language (one-click EN / 中文) ----
-    static string uiLang = "zh";
+    Form form;
+    App app;
+    PublishStudio studio;
 
-    // to compile).
+    string root = "";
+    bool haveProject = false;
+    List<string> log = new List<string>();
+    int lastLogCount = -1;
+
+    List<PublishTargetOption> pubTargets = new List<PublishTargetOption>();
+    List<Checkbox> targetBoxes = new List<Checkbox>();
+
+    bool buildBusy = false;
+    bool buildIsRun = false;
+    int buildConsumed = 0;
+    string runExe = "";
+    string runDir = "";
+
+    bool pubBusy = false;
+    bool pubPacking = false;
+    int pubConsumed = 0;
+    int pubPackStartMs = 0;
+    int pubPct = 0;
+    string statusMsg = "";
+    string pubRoot = "";
+    string jobPublishedTarget = "";
+    List<string> pubExes = new List<string>();
+
+    bool runPolling = false;
+    int runConsumed = 0;
+
+    LayerState pubDoneAsk = null;
+    string pubDoneTarget = "";
+    ConfigWindow cfgWindow = null;
+
+    FilePicker pathPicker = new FilePicker();
+    int pathPickerOwner = 0; // 1 = open zan.proj, 2 = pick icon
+    int lastSkinIdx = -1;
+    int savedW = 1040;
+    int savedH = 720;
+    bool updatingUi = false;
+
+    static void ApplySavedPreferences(App app) {
+        string cfg = "";
+        string path = ZanIDE.CfgPath();
+        if (File.Exists(path)) { cfg = File.ReadAllText(path); }
+        string lang = ZanIDE.CfgStr(cfg, "lang", "");
+        if (lang == "en" || lang == "zh") {
+            ZanIDE.uiLang = lang;
+        } else {
+            ZanIDE.uiLang = ZanIDE.ReadUiLang();
+        }
+        string skin = ZanIDE.CfgStr(cfg, "skin", "");
+        if (skin != "" && app != null) {
+            app.ApplySkinName(skin);
+        }
+    }
+
     static void Attach(Form form) {
         try {
             ZanIDE ide = new ZanIDE();
@@ -34,604 +85,428 @@ partial class ZanIDE : UiViewOwner {
         }
     }
 
-    string CtxProjRel() {
-        if (!haveProject) { return ""; }
-        if (ctxTarget < 0 || ctxTarget >= treeShow.Count) { return ""; }
-        string p = treeShow[ctxTarget].path;
-        if (p == "" || p == root) { return ""; }
-        if (!ZanIDE.StartsWith(p, root)) { return ""; }
-        return ZanIDE.NormRel(p.Substring(root.Length, p.Length - root.Length));
+    void InitShell(Form f) {
+        form = f;
+        app = f.GetApp();
+        studio = f.Get<PublishStudio>("Studio");
+        lastSkinIdx = app.ThemeMenuIndex();
+        statusMsg = ZanIDE.T("Ready", "就绪");
+
+        form.On("openProject", () => { this.OpenProjectPicker(); });
+        form.On("openConfig", () => { this.OpenConfigWindow(); });
+        form.On("toggleLang", () => { this.ToggleLanguage(); });
+        form.On("startPublish", () => { this.BeginPublish(); });
+        form.On("startBuild", () => { this.BeginBuild(false); });
+        form.On("startRun", () => { this.BeginBuild(true); });
+        form.On("openPublishDir", () => { this.OpenPublishFolder(); });
+        form.On("clearLog", () => { this.ClearLog(); });
+
+        if (studio != null) {
+            studio.RecentSelect.Change.Add(() => { this.OnRecentPicked(); });
+            studio.ChkSingleFile.Change.Add(() => { this.OnQuickOptionToggled(); });
+            studio.ChkPackAssets.Change.Add(() => { this.OnQuickOptionToggled(); });
+            studio.ChkPubDebug.Change.Add(() => { this.OnQuickOptionToggled(); });
+            studio.ChkStripSymbols.Change.Add(() => { this.OnQuickOptionToggled(); });
+            studio.ChkDenyWarnings.Change.Add(() => { this.OnQuickOptionToggled(); });
+        }
+
+        form.FrameHook(() => { this.FrameTick(); });
+        form.Every(120, () => { this.PollJobs(); });
+        form.OnExit(() => { this.OnExit(); });
+
+        this.LoadInitialProject();
+        this.RefreshUi();
     }
 
-    static string GenMark(string cur, string act) {
-        if (cur == act) { return "✓ "; }
-        return "   ";
+    void LoadInitialProject() {
+        string last = ZanIDE.ReadLastProject();
+        if (last != "" && File.Exists(last + "/zan.proj")) {
+            this.LoadProject(last);
+            return;
+        }
+        List<string> recents = ZanIDE.ReadRecentProjects();
+        for (int i = 0; i < recents.Count; i = i + 1) {
+            if (File.Exists(recents[i] + "/zan.proj")) {
+                this.LoadProject(recents[i]);
+                return;
+            }
+        }
+        log.Add(ZanIDE.T("> Select a zan.proj project to configure targets and publish.",
+                         "> 请选择 zan.proj 项目以配置目标平台并一键发布。"));
     }
 
-    static string GenLabel(string act) {
-        if (act == "copy") { return ZanIDE.T("Copy to Output", "复制到输出"); }
-        if (act == "embed") { return ZanIDE.T("Embed", "内嵌到程序"); }
-        return ZanIDE.T("None", "不处理");
+    void LoadProject(string dir) {
+        string clean = ZanIDE.NormSlashes(dir);
+        if (!File.Exists(clean + "/zan.proj")) {
+            Layer.Msg(app, ZanIDE.T("Selected folder does not contain zan.proj.",
+                "所选目录不包含 zan.proj 配置文件。"), 2);
+            return;
+        }
+        root = clean;
+        haveProject = true;
+        ZanIDE.WriteLastProject(root);
+        pubTargets = ZanIDE.ReadProjectPlatformOptions(root);
+        pubPct = 0;
+        statusMsg = ZanIDE.T("Project loaded", "已加载项目");
+        log.Add(ZanIDE.T("> Loaded project: ", "> 已加载项目：") + root);
+        this.RefreshUi();
+    }
+
+    string ProjectTypeLabel() {
+        if (!haveProject) { return "NONE"; }
+        if (ZanIDE.IsLibraryProject(root)) { return "LIB"; }
+        if (ZanIDE.ProjField(root, "mvcRoutes") != "") { return "MVC"; }
+        if (ZanIDE.IsGuiProject(root)) { return "GUI"; }
+        return "CLI";
+    }
+
+    bool IsBusy() { return buildBusy || pubBusy; }
+
+    void RefreshUi() {
+        if (studio == null) { return; }
+        updatingUi = true;
+        try {
+            string entryRel = haveProject ? ZanIDE.ProjField(root, "entry") : "";
+            bool singleFile = haveProject && ZanIDE.ProjSingleFile(root);
+            bool packAssets = haveProject && ZanIDE.PackEnabled(root);
+            bool pubDebug = haveProject && ZanIDE.ProjPublishDebug(root);
+            bool stripSymbols = haveProject && ZanIDE.ProjStripSymbols(root);
+            bool denyWarnings = haveProject && ZanIDE.ProjDenyWarnings(root);
+
+            studio.ApplyTexts(haveProject, root, entryRel, this.ProjectTypeLabel(),
+                singleFile, packAssets, pubDebug, stripSymbols, denyWarnings,
+                this.IsBusy(), pubPct, statusMsg);
+            studio.PopulateRecent(ZanIDE.ReadRecentProjects(), root);
+            targetBoxes = studio.PopulateTargets(pubTargets, !haveProject || this.IsBusy());
+            for (int i = 0; i < targetBoxes.Count; i = i + 1) {
+                int idx = i;
+                targetBoxes[i].Change.Add(() => { this.OnTargetBoxChanged(idx); });
+            }
+            this.SyncLogView();
+            string winTitle = IdeVersion.Product();
+            if (haveProject) { winTitle = winTitle + " — " + ZanIDE.BaseName(root); }
+            form.SetTitle(winTitle);
+        } finally {
+            updatingUi = false;
+        }
+        app.RequestRedraw();
+    }
+
+    void SyncLogView() {
+        if (studio == null) { return; }
+        if (log.Count == lastLogCount) { return; }
+        lastLogCount = log.Count;
+        studio.SetLogText(string.Join("\n", log));
+    }
+
+    void OnTargetBoxChanged(int idx) {
+        if (updatingUi || idx < 0 || idx >= pubTargets.Count || idx >= targetBoxes.Count) { return; }
+        pubTargets[idx].selected = targetBoxes[idx].IsChecked();
+        ZanIDE.SavePublishPlatforms(root, pubTargets);
+    }
+
+    void OnRecentPicked() {
+        if (updatingUi || studio == null || this.IsBusy()) { return; }
+        string picked = studio.RecentSelect.SelectedValue();
+        if (picked != "" && picked != root) {
+            this.LoadProject(picked);
+        }
+    }
+
+    void OnQuickOptionToggled() {
+        if (updatingUi || !haveProject || studio == null) { return; }
+        ZanIDE.SetProjField(root, "singleFile",
+            studio.ChkSingleFile.IsChecked() ? "true" : "false");
+        if (studio.ChkPackAssets.IsChecked()) {
+            ZanIDE.EnablePack(root, log);
+        } else {
+            ZanIDE.DisablePack(root, log);
+        }
+        ZanIDE.SetProjField(root, "pubDebug",
+            studio.ChkPubDebug.IsChecked() ? "true" : "false");
+        ZanIDE.SetProjField(root, "secStripSymbols",
+            studio.ChkStripSymbols.IsChecked() ? "1" : "0");
+        ZanIDE.SetProjField(root, "denyWarnings",
+            studio.ChkDenyWarnings.IsChecked() ? "1" : "0");
+    }
+
+    void ToggleLanguage() {
+        ZanIDE.uiLang = (ZanIDE.uiLang == "zh") ? "en" : "zh";
+        ChildWindows.ApplyLanguage(ZanIDE.uiLang);
+        this.RefreshUi();
+    }
+
+    void OpenProjectPicker() {
+        if (this.IsBusy() || pathPicker.IsOpen()) { return; }
+        string init = ZanIDE.ReadLastPickerDirectory(root);
+        pathPickerOwner = 1;
+        pathPicker.BeginOpenFile(init, ".proj",
+            ZanIDE.T("Open zan.proj Project File", "打开 zan.proj 项目文件"));
+        app.RequestRedraw();
+    }
+
+    void OpenConfigWindow() {
+        if (!haveProject || this.IsBusy()) { return; }
+        if (cfgWindow != null && cfgWindow.IsOpen()) { return; }
+        cfgWindow = ConfigWindow.Open(app, root, log, ZanIDE.uiLang);
+        app.RequestRedraw();
+    }
+
+    void OpenPublishFolder() {
+        if (!haveProject) { return; }
+        string pubDir = root + "/publish";
+        if (!Directory.Exists(pubDir)) { pubDir = root; }
+        ZanIDE.RevealInFileManager(pubDir);
+    }
+
+    void ClearLog() {
+        log = new List<string>();
+        lastLogCount = -1;
+        this.SyncLogView();
+        app.RequestRedraw();
+    }
+
+    void BeginBuild(bool runAfter) {
+        if (!haveProject) { return; }
+        if (this.IsBusy()) {
+            Layer.Msg(app, ZanIDE.T("Another build or publish task is running.",
+                "已有编译或发布任务正在运行。"), 2);
+            return;
+        }
+        string entry = ZanIDE.ProjectEntryPath(root);
+        if (!File.Exists(entry)) {
+            log.Add(ZanIDE.T("> Entry file not found: ", "> 入口文件不存在：") + entry);
+            this.SyncLogView();
+            return;
+        }
+        if (runAfter && ZanIDE.IsLibraryProject(root)) {
+            Layer.Msg(app, ZanIDE.T("Library projects cannot be executed directly.",
+                "库项目无法直接运行。"), 2);
+            return;
+        }
+        string bd = ZanIDE.EnsureBuildDir(root);
+        string inputs = ZanIDE.InputsArg(bd, ".zanbuild_inputs",
+            ZanIDE.ProjectInputs(ZanIDE.DirOf(entry), entry, ""));
+        string projName = ZanIDE.ProjField(root, "name");
+        string baseName = projName != "" ? projName : ZanIDE.BaseName(root);
+        string ext = ZanIDE.IsLibraryProject(root) ? ZanIDE.HostLibExt() : ZanIDE.ExeSuffix();
+        string outExe = bd + "/" + baseName + ext;
+        string ll = bd + "/.zanbuild.ll";
+        string cmd = ZanIDE.CompileToExe(root, entry, inputs, ll, outExe, false, true)
+            + ZanIDE.EmbedArgs(root);
+
+        buildBusy = true;
+        buildIsRun = runAfter;
+        buildConsumed = 0;
+        runExe = outExe;
+        runDir = bd;
+        pubPct = 20;
+        statusMsg = runAfter
+            ? ZanIDE.T("Building to run...", "正在编译以便运行...")
+            : ZanIDE.T("Building project...", "正在编译检查...");
+        log.Add(ZanIDE.T("> Building: ", "> 开始编译：") + outExe);
+        ZanIDE.BuildDetachWithPre(cmd, root, ZanIDE.ProjPreBuild(root));
+        this.RefreshUi();
+    }
+
+    void BeginPublish() {
+        if (!haveProject) { return; }
+        if (this.IsBusy()) {
+            Layer.Msg(app, ZanIDE.T("Another build or publish task is running.",
+                "已有编译或发布任务正在运行。"), 2);
+            return;
+        }
+        ZanIDE.SavePublishPlatforms(root, pubTargets);
+        pubExes = ZanIDE.PublishPlatformsBeginWithOptions(root, pubTargets, log);
+        if (pubExes.Count == 0) {
+            Layer.Msg(app, ZanIDE.T("Please select at least one target platform.",
+                "请至少勾选一个目标发布平台。"), 2);
+            this.SyncLogView();
+            return;
+        }
+        pubBusy = true;
+        pubPacking = false;
+        pubConsumed = 0;
+        pubPackStartMs = 0;
+        pubRoot = root;
+        jobPublishedTarget = "";
+        pubPct = 20;
+        statusMsg = ZanIDE.T("Compiling publish targets...", "正在编译发布目标...");
+        this.RefreshUi();
+    }
+
+    void PollJobs() {
+        if (buildBusy) {
+            buildConsumed = ZanIDE.BuildPoll(buildConsumed, log);
+            if (File.Exists(ZanIDE.BuildDonePath())) {
+                bool ok = ZanIDE.DoneOk(ZanIDE.BuildDonePath());
+                buildBusy = false;
+                if (ok) {
+                    pubPct = 100;
+                    statusMsg = ZanIDE.T("Build succeeded", "编译成功");
+                    log.Add(ZanIDE.T("> Build succeeded.", "> 编译成功。"));
+                    if (buildIsRun && File.Exists(runExe)) {
+                        string entry = ZanIDE.ProjectEntryPath(root);
+                        ZanIDE.CopyPayload(root, runDir, entry, log);
+                        ZanIDE.RunConsole(runExe, runDir);
+                        runPolling = true;
+                        runConsumed = 0;
+                        statusMsg = ZanIDE.T("Running...", "运行中...");
+                    }
+                } else {
+                    pubPct = 0;
+                    statusMsg = ZanIDE.T("Build failed", "编译失败");
+                    log.Add(ZanIDE.T("> Build failed.", "> 编译失败。"));
+                }
+                this.RefreshUi();
+            } else {
+                if (pubPct < 80) { pubPct = pubPct + 3; }
+                if (studio != null) { studio.PubProgress.SetPercent(pubPct); }
+            }
+        }
+
+        if (pubBusy && !pubPacking) {
+            pubConsumed = ZanIDE.PubPoll(pubConsumed, log);
+            if (File.Exists(ZanIDE.PubDonePath())) {
+                bool ok = ZanIDE.DoneOk(ZanIDE.PubDonePath());
+                if (!ok) {
+                    log.Add(ZanIDE.T("> Publish compile step failed.", "> 发布编译阶段失败。"));
+                    this.FinishPublish(false);
+                } else {
+                    bool pack = ZanIDE.ProjSingleFile(pubRoot) && !ZanIDE.IsLibraryProject(pubRoot);
+                    if (PubPack.NeedsPackaging(pubRoot, pubExes, pack)) {
+                        int st = PubPack.Start(pubRoot, pubExes, pack);
+                        if (st > 0) {
+                            pubPacking = true;
+                            pubPackStartMs = Gui.Backend.Window.GetTickMs();
+                            pubPct = 75;
+                            statusMsg = ZanIDE.T("Packaging outputs...", "正在归档打包产物...");
+                            this.RefreshUi();
+                        } else {
+                            bool syncOk = PubPack.PackNow(pubRoot, pubExes, pack, log);
+                            this.ResolvePublishedTarget();
+                            this.FinishPublish(syncOk);
+                        }
+                    } else {
+                        this.ResolvePublishedTarget();
+                        this.FinishPublish(true);
+                    }
+                }
+            } else {
+                if (pubPct < 70) { pubPct = pubPct + 2; }
+                if (studio != null) { studio.PubProgress.SetPercent(pubPct); }
+            }
+        }
+
+        if (pubBusy && pubPacking) {
+            PubJob doneJob = PubPack.Ready();
+            if (doneJob != null) {
+                for (int i = 0; i < doneJob.log.Count; i = i + 1) {
+                    log.Add(doneJob.log[i]);
+                }
+                this.ResolvePublishedTarget();
+                this.FinishPublish(doneJob.ok);
+            } else {
+                statusMsg = ZanIDE.T("Packaging: ", "打包中：") + PubPack.Stage();
+                if (studio != null) { studio.StatusLabel.SetProp("text", statusMsg); }
+            }
+        }
+
+        if (runPolling) {
+            runConsumed = ZanIDE.RunPoll(runConsumed, log);
+            if (File.Exists(ZanIDE.RunDonePath())) {
+                runPolling = false;
+                statusMsg = ZanIDE.T("Run exited", "运行结束");
+                this.RefreshUi();
+            }
+        }
+
+        this.SyncLogView();
+    }
+
+    void ResolvePublishedTarget() {
+        jobPublishedTarget = pubRoot + "/publish";
+        for (int i = 0; i < pubExes.Count; i = i + 1) {
+            if (File.Exists(pubExes[i])) {
+                jobPublishedTarget = pubExes[i];
+                return;
+            }
+        }
     }
 
     void FrameTick() {
-        if (shuttingDown || closeRequested) { this.RetireEditorTabsView(); return; }
-        this.SyncEditorDocument();
-        if (haveProject) { this.EnsureLsp(); }
-        this.PumpDocumentPages();
-        this.UpdateActiveCodeTab();
-        this.UpdateDesignDocument();
-        this.ApplyPendingCodeCaret();
-        this.PumpDocumentWatch();
-        this.RequestBuildErrors();
-        this.AutosaveAiSessions(Gui.Backend.Window.GetTickMs());
-        if (dock.TakeChanged()) { this.RememberDockLayoutAsync(dock.SaveLayout()); }
-        this.CaptureJobMonitor();
-        CodeEditor.lang = ZanIDE.uiLang;
-        Designer.lang = ZanIDE.uiLang;
+        int dscale = app.dpiScale;
+        if (dscale <= 0) { dscale = 100; }
+        savedW = app.ClientWidth() * 100 / dscale;
+        savedH = app.ClientHeight() * 100 / dscale;
+
         pathPicker.ApplySkin(app.ThemeMenuIndex());
         if (app.ThemeMenuIndex() != lastSkinIdx) {
             lastSkinIdx = app.ThemeMenuIndex();
             ChildWindows.FollowSkin(lastSkinIdx);
         }
-        if (app.WindowOpacity() != winOpacity) {
-            winOpacity = app.WindowOpacity();
-            ChildWindows.FollowOpacity(winOpacity);
-        }
-        if (app.ConsumeWallpaperPick() && !pathPicker.IsOpen()) {
-            pathPicker.BeginOpenFile(
-            ZanIDE.ReadLastPickerDirectory(root), ".png;.jpg;.jpeg;.bmp",
-            ZanIDE.T("Choose a window background image", "选择窗口背景图片"));
-            pathPickerOwner = 9;
-            app.RequestRedraw();
-        }
-        if (app.UserWallpaperPath() != wallPath
-        || app.UserWallpaperOpacity() != wallOpacity) {
-            wallPath = app.UserWallpaperPath();
-            wallOpacity = app.UserWallpaperOpacity();
-            ChildWindows.FollowWallpaper(wallPath, wallOpacity);
-        }
-        app.Stats.Mark("sh.skin");
 
         nint evh = Gui.Backend.Window.EventHwnd();
-        int kind = app.window.EventKind();
-
-        if (kind == 8) {
-            if (ChildWindows.RouteEvent(evh)) {
-                lastActive = 0 - 1;
-                app.RequestRedraw();
-            } else if (pathPicker.OwnsWindow(evh)) {
-                pathPicker.ApplyEvent(evh);
-                if (pathPicker.NeedsRedraw()) {
-                    pathPicker.RenderWindow();
-                }
-            } else if (evh == app.WindowHandle()) {
-                return;
-            } else {
-                app.RequestRedraw();
-            }
-        } else if (pathPicker.OwnsWindow(evh)) {
+        if (pathPicker.OwnsWindow(evh)) {
             pathPicker.ApplyEvent(evh);
-            if (pathPicker.NeedsRedraw()) {
-                pathPicker.RenderWindow();
-            }
+            if (pathPicker.NeedsRedraw()) { pathPicker.RenderWindow(); }
         } else if (evh != 0 && evh != app.WindowHandle()) {
             ChildWindows.RouteEvent(evh);
         }
-        app.Stats.Mark("sh.route");
-        int actDM = activeTab.Get();
-        if (actDM >= 0 && actDM < tabs.Count) {
-            designerMode = (ZanIDE.IsFormPath(tabs[actDM].path)
-            || tabs[actDM].designDoc)
-            && tabs[actDM].path != codeViewForm;
-            sceneMode = ZanIDE.IsScenePath(tabs[actDM].path) && tabs[actDM].path != codeViewForm;
-        } else {
-            designerMode = false;
-            sceneMode = false;
-        }
 
-        if (sceneDesigner != null) { sceneDesigner.SetInspectorVisible(sceneMode); }
-        this.HandleFrameHotkeys(kind);
-        app.Stats.Mark("sh.input");
-
-        this.PumpPublishWindow();
-        this.PumpConfigWindow();
-        this.PumpMarketplaceWindow();
-        this.PumpSettingsWindows();
         this.PumpFilePicker();
-        IdeUpdate.Poll();
-        // 商城安装执行器的结果（成败一行），接到输出面板。
-        string installDone = MarketplaceInstall.Poll();
-        if (installDone.Length > 0) {
-            log.Add(installDone);
-            if (marketplaceInstallPending && marketplaceInstallPackage == MarketplaceInstall.packageName) {
-                this.FinishMarketplaceRecovery(MarketplaceInstall.LastSucceeded());
-            }
-            app.RequestRedraw();
-        }
-        // 增量更新执行面：比对计划落地后接管下载/暂存，结果一行进日志。
-        string syncLine = IdeFileSync.Poll();
-        if (syncLine.Length > 0) {
-            log.Add(syncLine);
-            app.RequestRedraw();
-        }
-        // 商业插件使用账目：攒批/到点异步上报一轮（fire-and-forget，失败留队）。
-        PluginUsage.Poll();
-        app.Stats.Mark("sh.children");
-
-        if (aiCfgPending) {
-            aiCfgPending = false;
-            if (aiWindow == null || !aiWindow.IsOpen()) {
-                aiWindow = AiSettingsWindow.Open(app, ZanIDE.uiLang);
-            }
-            app.RequestRedraw();
-        }
-
-        if (aiWinPending) {
-            aiWinPending = false;
-            if (aiWin == null || !aiWin.IsOpen()) {
-                aiWin = AiAssistantWindow.Open(app);
-            }
-            app.RequestRedraw();
-        }
-        if (aiWin != null && !aiWin.IsOpen()) {
-            aiWin = null;
-            app.RequestRedraw();
-        }
-
-        if (rescan) {
-            rescan = false;
-            this.RequestTreeScan();
-        }
-        app.Stats.Mark("sh.rescan");
+        this.PumpConfigWindow();
+        this.SyncPublishDialog();
     }
 
-    // 后台活儿（构建、发布、程序输出、git、小助手请求）下一拍的重绘：
-    // 只声明这一拍可能变化的那块像素——那块面板自己。
-    // // 这些轮询过去都用整窗的 RequestAnimationFrame 排下一拍，于是模型
-    // 在想、编译器在跑的那几十秒里，屏上只有一个转圈在动，IDE 却按
-    // 4~12 帧/秒把整个窗口（磨砂主题还要重新模糊一遍背景）重画一遍：
-    // 这就是「小助手一干活 CPU 就上去」的那份活。声明了范围之后，
-    // 由这一拍唤醒的帧走损伤裁剪，只有那块面板被重画；真有内容变化
-    // 的时候各处照旧调 RequestRedraw，整窗帧一帧都没少。面板被收起
-    // （停到屏外）时范围为空，这一拍就只跑轮询逻辑、几乎不画东西。
-    void PollNextIn(App app, int ms, Rect r) {
-        if (r == null || r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0) {
-            app.RequestAnimationFrame(ms);
-            return;
-        }
-        app.RequestAnimationFrameIn(ms, r.x, r.y, r.width, r.height);
-    }
+    void PumpFilePicker() {
+        int pr = pathPicker.TakeResult();
+        if (pr == 0) { return; }
+        string picked = ZanIDE.NormSlashes(pathPicker.SelectedPath());
+        string curDir = ZanIDE.NormSlashes(pathPicker.CurrentDirectory());
+        if (curDir != "") { ZanIDE.WriteLastPickerDirectory(curDir); }
+        int owner = pathPickerOwner;
+        pathPickerOwner = 0;
+        if (pr != 1 || picked == "") { return; }
 
-    int editorPaintOwnerId = WidgetId.Next();
-
-    void PaintFrame(App app) {
-        int kind = app.window.EventKind();
-        try {
-            Canvas c = app.canvas;
-            Theme t = app.theme;
-            int left = app.ShapeOffX();
-            int W = app.ClientWidth();
-            int dscale = app.dpiScale;
-            if (dscale <= 0) { dscale = 100; }
-            savedW = W * 100 / dscale;
-            savedH = app.ClientHeight() * 100 / dscale;
-            int top = app.ShapeOffY() + app.ContentTop();
-            int ribbonH = this.ShellRibbonHeight(app);
-
-            int atE = activeTab.Get();
-            string apE = "";
-            if (atE >= 0 && atE < tabs.Count) { apE = tabs[atE].path; }
-            bool activeIsFile = apE != "" && apE != "@start";
-            bool haveProj = File.Exists(root + "/zan.proj");
-            bool canRun = activeIsFile || haveProj;
-            if (compactHeader) {
-                if (compactHeaderView == null) { compactHeaderView = new CompactHeader(); }
-                string curProj = haveProject ? Path.GetFileName(root) : "";
-                compactHeaderView.SyncState(curProj, canRun, haveProj, this.AgentOn());
-                compactHeaderView.RenderInside(app, new Rect(left, top, W, ribbonH));
-                int chAct = compactHeaderView.TakeAction();
-                if (chAct == 10) {
-                    findMode = 10;
-                    app.RequestRedraw();
-                } else if (chAct == 99) {
-                    compactHeader = false;
-                    ZanIDE.WriteEditorPrefs(edThemeIdx, edFontPx, compactHeader);
-                    app.RequestRedraw();
-                } else if (chAct > 0) {
-                    this.RunRibbonCommand(app, chAct);
-                }
-            } else {
-                // 功能区由当前保留树准备和分发输入，Paint 只访问这棵树。
-                if (this.RibbonViewReady(app)) { ribbonControl.RenderTree(app); }
+        if (owner == 1) {
+            string dir = Directory.Exists(picked) ? picked : ZanIDE.DirOf(picked);
+            this.LoadProject(dir);
+        } else if (owner == 2 && haveProject) {
+            string dst = ZanIDE.AssetsDir(root) + "/app.ico";
+            Directory.CreateDirectoryRecursive(ZanIDE.AssetsDir(root));
+            if (ZanIDE.NormSlashes(picked) != ZanIDE.NormSlashes(dst)) {
+                File.Copy(picked, dst);
             }
-
-            // 调试工具条（正在调试时）：按钮由 views/DebugToolbar.html
-            // 声明，这里只把它给出的动作接到调试会话上。
-            int dbgBarH = this.RunDebugBar(app, W, top + ribbonH);
-            app.Stats.Mark("sh.ribbon");
-            string outlineTitle = ZanIDE.T("STRUCTURE", "结构");
-            if (designerMode || sceneMode) { outlineTitle = ZanIDE.T("COMPONENTS", "组件"); }
-            if (outlineTitle != dockOutlineTitle) {
-                dock.SetTitle("structure", outlineTitle);
-                dockOutlineTitle = outlineTitle;
+            ZanIDE.SetProjectIcon(root, "assets/app.ico");
+            log.Add(ZanIDE.T("> Updated application icon: assets/app.ico",
+                             "> 已更新应用图标：assets/app.ico"));
+            if (cfgWindow != null && cfgWindow.IsOpen()) {
+                cfgWindow.OnLanguageChanged(ZanIDE.uiLang);
             }
-            dock.RenderPrepared(app);
-            explorerPanel.Render(app, dock.ContentParked("explorer"), tree);
-            treeShow = explorerPanel.Shown();
-            app.Stats.Mark("sh.explorer");
-
-            int stActTab = activeTab.Get();
-            string newSig = "";
-            if (designerMode) {
-                List<FormField> flatSig = new List<FormField>();
-                ZanIDE.FlattenFields(formDesigner.fields, flatSig);
-                int nameHash = 0;
-                for (int fi = 0; fi < flatSig.Count; fi = fi + 1) {
-                    FormField ff = flatSig[fi];
-                    nameHash = nameHash * 31 + ff.fname.Length + ff.label.Length + ff.dockSide;
-                    if (ff.fname.Length > 0) { nameHash = nameHash + Convert.ToInt(ff.fname[0]); }
-                }
-                newSig = "F:" + Convert.ToString(stActTab) + ":" + Convert.ToString(flatSig.Count) + ":" + Convert.ToString(nameHash);
-            } else if (sceneMode) {
-                newSig = "S:" + Convert.ToString(stActTab) + ":"
-                + Convert.ToString(sceneDesigner.doc.Count()) + ":"
-                + Convert.ToString(this.DesignDocumentRevision());
-            } else {
-                int cStamp = editor.TextStamp();
-                if (cStamp != structPendingStamp) {
-                    structPendingStamp = cStamp;
-                    structChangeMs = app.nowMs;
-                }
-                newSig = "C:" + Convert.ToString(stActTab) + ":" + Convert.ToString(cStamp);
-                if (newSig != structSig) {
-                    if (app.nowMs - structChangeMs < 350 && structTree != null && structTree.Count > 0) {
-                        newSig = structSig;
-                    } else {
-                        structTree = ZanIDE.BuildOutline(editor.GetText());
-                    }
-                }
-            }
-            if (newSig != structSig) {
-                structSig = newSig;
-                if (designerMode) {
-                    string sfn = "Form";
-                    if (stActTab >= 0 && stActTab < tabs.Count) {
-                        sfn = ZanIDE.FormBaseName(tabs[stActTab].path);
-                    }
-                    structTree = ZanIDE.BuildFieldTree(sfn, formDesigner.fields);
-                } else if (sceneMode) {
-                    string scn = "Scene";
-                    if (stActTab >= 0 && stActTab < tabs.Count) {
-                        scn = ZanIDE.BaseName(tabs[stActTab].path);
-                    }
-                    structTree = ZanIDE.BuildSceneTree(scn, sceneDesigner);
-                }
-                structSel.Set(0 - 1);
-            }
-            structurePanel.Render(app, dock.ContentParked("structure"), structTree);
-            structShow = structurePanel.Shown();
-            app.Stats.Mark("sh.structure");
-            stdlibPanel.Render(app, dock.ContentParked("stdlib"), exTree);
-            exShow = stdlibPanel.Shown();
-            app.Stats.Mark("sh.stdlib");
-
-            Rect ea = dock.Content("editor");
-            Rect orr = dock.ContentParked("output");
-
-            int tabH = editorTabs.HeaderHeight(app);
-            editorTabs.RenderTree(app);
-            app.Stats.Mark("sh.tabs");
-            int ctxTab = editorTabs.TakeContext();
-            if (ctxTab >= 0) {
-                ctxKind = 3; ctxX = app.mouseX; ctxY = app.mouseY;
-                ctxTarget = ctxTab; app.RequestRedraw();
-            }
-
-            int act = activeTab.Get();
-            Rect edRect = new Rect(ea.x, ea.y + tabH, ea.width, ea.height - tabH);
-            bool activeIsStart = (act >= 0 && act < tabs.Count && tabs[act].path == "@start");
-            bool activeIsDocs = (act >= 0 && act < tabs.Count && tabs[act].path == "@docs");
-            bool activeIsDiff = (act >= 0 && act < tabs.Count && tabs[act].path != null && tabs[act].path.StartsWith("@diff:"));
-
-            // 设计 | 代码 标签条（WinForms 同款）：窗体/场景设计稿的活动
-            // 文档在编辑区左上角挂两个标签，独占一行，内容整体下移。
-            int designTabsH = this.RenderDesignTabs(app, edRect.x, edRect.y);
-            Rect viewRect = edRect;
-            if (designTabsH > 0) {
-                viewRect = new Rect(edRect.x, edRect.y + designTabsH,
-                edRect.width, edRect.height - designTabsH);
-            }
-
-            // 编辑区（设计器 / 代码 / 起始页 / 文档）自成一段 id：设计器里
-            // 选中组件会让属性面板长出一批控件，若和标签条共用一条递增
-            // 序号，这一帧的点击就会落到标签条上，表现为“点一下就跳到
-            // 后面打开的代码页”。
-            if (designerMode) {
-                if (this.FormDesignReady()) {
-                    formDesigner.RenderHostPanels(app, dock.ContentParked("toolbox"),
-                    dock.ContentParked("props"));
-                    formDesigner.RootControl().RenderTree(app);
-                    this.QueueDesignCapture();
-                    string cbField = formDesigner.ConsumeOpenCodeBehind();
-                    if (cbField != "") {
-                        int actNow = activeTab.Get();
-                        if (actNow >= 0 && actNow < tabs.Count) {
-                            string curPath = tabs[actNow].path;
-                            string cbPath = ZanIDE.CodeBehindPath(curPath);
-                            if (!File.Exists(cbPath)) {
-                                string fbase = ZanIDE.FormBaseName(curPath);
-                                File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(fbase));
-                            }
-                            if (File.Exists(cbPath)) {
-                                int cbTab = ZanIDE.FindTabByPath(tabs, cbPath);
-                                if (cbTab >= 0) {
-                                    activeTab.Set(cbTab);
-                                } else {
-                                    ZanIDE.OpenPath(tabs, activeTab, cbPath, Path.GetFileName(cbPath));
-                                    cbTab = activeTab.Get();
-                                }
-                                codeViewForm = "";
-                                lastActive = 0 - 1;
-                                int matchLine = ZanIDE.EnsureCodeBehindFileHandler(cbPath, cbField, tabs, cbTab, editor);
-                                if (matchLine >= 0) {
-                                    editor.GoToLine(matchLine);
-                                }
-                                app.RequestRedraw();
-                            }
-                        }
-                    }
-                    string renPair = formDesigner.ConsumeRenamedField();
-                    if (renPair != "") {
-                        int colon = ZanIDE.IndexOfStr(renPair, ":");
-                        if (colon > 0) {
-                            string oldN = renPair.Substring(0, colon);
-                            string newN = renPair.Substring(colon + 1, renPair.Length - colon - 1);
-                            int actNow = activeTab.Get();
-                            if (actNow >= 0 && actNow < tabs.Count) {
-                                string curPath = tabs[actNow].path;
-                                string cbPath = ZanIDE.CodeBehindPath(curPath);
-                                if (File.Exists(cbPath)) {
-                                    string src = File.ReadAllText(cbPath);
-                                    string replaced = ZanIDE.ReplaceWholeWord(src, oldN, newN);
-                                    if (replaced != src) {
-                                        File.WriteAllText(cbPath, replaced);
-                                        int cbTab = ZanIDE.FindTabByPath(tabs, cbPath);
-                                        if (cbTab >= 0) { tabs[cbTab].body = replaced; }
-                                        log.Add("> Synchronized rename in code-behind: " + oldN + " -> " + newN);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else if (sceneMode) {
-                if (this.SceneDesignReady()) {
-                    sceneDesigner.PaletteRoot().RenderTree(app);
-                    sceneDesigner.InspectorRoot().RenderTree(app);
-                    sceneDesigner.CanvasRoot().RenderTree(app);
-                    sceneDesigner.RenderStatus(app, app.canvas, app.theme, viewRect.x + app.Scale(10),
-                    viewRect.y + viewRect.height - app.Scale(30), viewRect.width - app.Scale(20));
-                    this.QueueDesignCapture();
-                    string scbElement = sceneDesigner.ConsumeOpenCodeBehind();
-                    if (scbElement != "") {
-                        int actNow = activeTab.Get();
-                        if (actNow >= 0 && actNow < tabs.Count) {
-                            string curPath = tabs[actNow].path;
-                            string scbPath = ZanIDE.SceneCodeBehindPath(curPath);
-                            if (File.Exists(scbPath)) {
-                                int scbTab = ZanIDE.FindTabByPath(tabs, scbPath);
-                                if (scbTab >= 0) {
-                                    activeTab.Set(scbTab);
-                                } else {
-                                    ZanIDE.OpenPath(tabs, activeTab, scbPath, Path.GetFileName(scbPath));
-                                }
-                                codeViewForm = "";
-                                lastActive = 0 - 1;
-                                app.Post(delegate () {
-                                    int matchLine = ZanIDE.EnsureControlEventHandler(editor, scbElement);
-                                    if (matchLine >= 0) { editor.GoToLine(matchLine); }
-                                });
-                                app.RequestRedraw();
-                            }
-                        }
-                    }
-                }
-            } else if (activeIsDiff) {
-                if (diffView != null) { diffView.RenderTree(app); }
-            } else if (activeIsDocs) {
-                DocsPage.RenderDocsPage(app, edRect, log);
-            } else if (activeIsStart) {
-                startPage.RenderTree(app);
-            } else if (act >= 0 && act < tabs.Count
-            && ZanIDE.IsScenePath(tabs[act].path) && codeViewForm == tabs[act].path) {
-                if (this.DesignCodeReady()) {
-                    formCodeEd.RenderTree(app);
-                }
-            } else if (act >= 0 && act < tabs.Count
-            && (ZanIDE.IsFormPath(tabs[act].path)
-            || tabs[act].designDoc)
-            && codeViewForm == tabs[act].path) {
-                if (this.DesignCodeReady()) {
-                    formCodeEd.RenderTree(app);
-                }
-            } else {
-                if (act >= 0 && act < tabs.Count && editor.documentPath == tabs[act].path) {
-                    PaintHashToken editorPaint = PaintHash.BeginScope();
-                    try {
-                        editor.RenderTree(app);
-                        app.CommitPaintHash(editorPaint, editorPaintOwnerId,
-                        edRect.x, edRect.y, edRect.width, edRect.height);
-                    } finally {
-                        PaintHash.Restore(editorPaint);
-                    }
-                }
-                if (UiDriver.Active()) {
-                    UiDriver.SetProbe("editor", ZanIDE.EditorProbeJson(editor));
-                    UiDriver.SetProbe("log", string.Join("\n", log));
-                }
-                if (editor.ConsumeGotoRequest()) {
-                    app.Post(delegate () { this.GoToDefinitionAsync(); });
-                }
-                if (dbgState == 2 && dbgExecLine >= 0) {
-                    dbgInline.Render(app, edRect, dbgVarInfo);
-                }
-            }
-            if (refList != null) {
-                int refPick = refList.TakePicked();
-                if (refPick >= 0) { this.GotoReference(refPick); }
-            }
-            if (symbolList != null) {
-                int symPick = symbolList.TakePicked();
-                if (symPick >= 0) { this.GotoSymbol(symPick); }
-            }
-
-            this.RunCodeActionMenu(app);
-
-            if ((findMode == 1 || findMode == 2) && !designerMode && !sceneMode
-            && !activeIsStart && !activeIsDocs) {
-                findBar.Render(app, edRect, editor);
-                if (findBar.CloseRequested()) {
-                    findBar.ClearCloseRequest();
-                    findMode = 0;
-                    editor.Focus(app);
-                    app.RequestRedraw();
-                }
-            }
-
-            // ---- 跳转到行 / 断点条件 / 重命名 / 在文件中查找替换 ----
-            // 一个声明式的小输入条（views/QuickPrompt.html），已在
-            // PrepareShellControls 阶段挂入 OverlayHost，此处仅消费提交状态。
-            if (quickPrompt != null && quickPrompt.TakeSubmit()) {
-                this.ApplyQuickPrompt(app);
-            }
-            app.Stats.Mark("sh.editor");
-
-            this.RenderOutputPanels(app, orr);
-            app.Stats.Mark("sh.sidepanels");
-            app.Stats.Mark("");
-
-            app.Stats.Mark("sh.runpoll");
-            this.ConsumeHotReloadJob();
-
-            app.Stats.Mark("sh.gitpoll");
-
-            app.Stats.Mark("sh.buildpoll");
-            if (aiUiRunning) {
-                string uidP = root + "/_scratch/uidrv";
-                bool uiDone = File.Exists(uidP + "/ai_done.txt");
-                bool uiTo = Gui.Backend.Window.GetTickMs() > aiUiDeadline;
-                if (uiDone || uiTo) {
-                    aiUiRunning = false;
-                    if (uiDone) { File.Delete(uidP + "/ai_done.txt"); }
-                    string rlog = "";
-                    if (File.Exists(uidP + "/results.log")) {
-                        rlog = File.ReadAllText(uidP + "/results.log");
-                    }
-                    string rjson = "";
-                    if (File.Exists(uidP + "/regions.json")) {
-                        rjson = File.ReadAllText(uidP + "/regions.json");
-                    }
-                    string tjson = "";
-                    if (File.Exists(uidP + "/theme.json")) {
-                        tjson = File.ReadAllText(uidP + "/theme.json");
-                    }
-                    aiMsgs.Add(this.AiToolMsg("tool",
-                    aiUiTool + "\n"
-                    + AiAgent.UiResultOf(aiUiTool, rlog, rjson, tjson,
-                    uiTo && !uiDone)));
-                    string uce = ZanIDE.AiLaunchAs(aiRunAgent, aiMsgs,
-                    aiRunCtxName, aiRunCtxCode, root,
-                    aiProfiles[aiProfActive].baseUrl,
-                    aiProfiles[aiProfActive].key, aiRunModel);
-                    if (uce != "") {
-                        aiMsgs.Add(this.AiToolMsg("error", uce));
-                        aiBusy.Set(0);
-                    }
-                    this.AiChatToEnd();
-                    app.RequestRedraw();
-                } else {
-                    // 唤醒范围交给 Agent 面板自己：它开着时只重画那一块
-                    // （流式回答的像素都在那儿），关着时这块矩形停在屏外，
-                    // 心跳链照旧（RequestWakeIn 不置 needsRedraw，会断流）。
-                    this.PollNextIn(app, 150, dock.ContentParked("agent"));
-                }
-            }
-            app.Stats.Mark("sh.uipoll");
-            app.Stats.Mark("sh.pubpoll");
-            this.PollAiChat(app);
-            app.Stats.Mark("sh.aipoll");
-
-            this.AutosaveAiSessions(Gui.Backend.Window.GetTickMs());
-            app.Stats.Mark("sh.autosave");
-
-            dock.RenderOverlay(app);
-            string dockClosed = dock.TakeClosed();
-            if (dockClosed != "") {
-                Layer.Msg(ZanIDE.T("Panel closed - right-click a tab strip to restore",
-                "面板已关闭 - 右键标签栏可恢复"), 3);
-            }
-            if (dock.TakeChanged()) { ZanIDE.WriteDockLayout(dock.SaveLayout()); }
-            app.Stats.Mark("sh.dockend");
-
-            statusBar.RenderTree(app);
-            app.Stats.Mark("sh.status");
-
-            if (!designerMode && !activeIsStart && !activeIsDocs) {
-                string ecmd = editor.TakeCommand();
-                if (ecmd == "find") {
-                    findMode = 1;
-                    findBar.Open(false, this.FindSeed());
-                    app.RequestRedraw();
-                }
-                else if (ecmd == "gotoline") { findMode = 3; app.RequestRedraw(); }
-                else if (ecmd == "gotodef") {
-                    app.Post(delegate () { this.GoToDefinitionAsync(); });
-                } else if (ecmd == "findrefs") {
-                    app.Post(delegate () { this.CollectReferencesAsync(); });
-                } else if (ecmd == "format" || ecmd == "rename" || ecmd == "codeactions") {
-                    this.RunEditorCtxCommand(ecmd);
-                }
-            }
-            this.RenderContextMenu(app);
-
-            if (pubPending) {
-                pubPending = false;
-                if (buildBusy || pubBusy) {
-                    log.Add(ZanIDE.T("> Task already running; publish not started.",
-                    "> 已有任务进行中，发布未开始。"));
-                } else {
-                    this.BeginPublishJob();
-                }
-                app.RequestRedraw();
-            }
-            string windowTitle = IdeVersion.Product();
-            string updateBadge = IdeUpdate.Summary();
-            if (updateBadge.Length > 0) {
-                windowTitle = windowTitle + "  " + updateBadge;
-            }
-            if (haveProject) { windowTitle = windowTitle + "  —  " + root; }
-            Tooltip.Flush(app);
-        } catch (Exception frameEx) {
-            app.NoteFrameError("ide-frame", frameEx.Message);
-            app.CancelPartialFrame();
-            app.RequestRedraw();
+            this.RefreshUi();
         }
     }
 
-    void OutputReset() {
-        if (coLog != null) { coLog.Reset(); }
+    void PumpConfigWindow() {
+        if (cfgWindow == null) { return; }
+        if (cfgWindow.TakeChoose() && !pathPicker.IsOpen()) {
+            pathPickerOwner = 2;
+            pathPicker.BeginOpenFile(ZanIDE.ReadLastPickerDirectory(root), ".ico",
+                ZanIDE.T("Choose Application Icon (.ico)", "选择应用图标 (.ico)"));
+            app.RequestRedraw();
+        }
+        if (cfgWindow.TakeDone()) {
+            cfgWindow.Close();
+            cfgWindow = null;
+            this.RefreshUi();
+        }
     }
 
-    static void OutputClearRequested() {
-        ZanIDE ide = ZanIDE.current;
-        if (ide == null || ide.coCtxOpen) { return; }
-        ide.log = new List<string>();
-        ide.coFilter.SetText("");
-        ide.OutputReset();
+    void OnExit() {
+        ZanIDE.SaveSettings(savedW, savedH, app.SkinName(), ZanIDE.uiLang);
+        if (pubPacking) {
+            PubPack.DrainAsync();
+        }
     }
-
-    // EnsureLsp, SyncEditorDocument, RefreshFoldRanges moved to ZanIDE.Lsp.zan
-
 }
-

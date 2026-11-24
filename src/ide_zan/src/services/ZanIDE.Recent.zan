@@ -1,99 +1,14 @@
 using System;
 using System.IO;
-using System.Diagnostics;
-using System.Json;
-using System.Data;
-using System.Data.Sqlite;
-using System.Threading;
+using System.Text;
+using System.Collections.Generic;
 
-// 起始页的数据：最近打开的工程、动态条目和内置的服务商预设。
+// 最近打开/发布的项目列表持久化。
 partial class ZanIDE {
-    BlockingQueue<IdeRecentWorkspace> recentWorkspaceQueue;
-    TaskCompletionSource<bool> recentWorkspaceDrained;
-
-    void QueueWorkspacePersistence(IdeRecentWorkspace next) {
-        if (recentWorkspaceQueue == null) {
-            recentWorkspaceQueue = new BlockingQueue<IdeRecentWorkspace>();
-            recentWorkspaceDrained = new TaskCompletionSource<bool>();
-            BlockingQueue<IdeRecentWorkspace> queue = recentWorkspaceQueue;
-            TaskCompletionSource<bool> drained = recentWorkspaceDrained;
-            ZanIDE owner = this;
-            if (!Thread.Start(delegate () {
-                try {
-                    IdeRecentWorkspace item = queue.Dequeue();
-                    while (item != null) {
-                        string failure = ZanIDE.PersistWorkspaceItem(item);
-                        if (failure != "") {
-                            owner.PostUi(delegate () { owner.log.Add("> Recent project: " + failure); });
-                        }
-                        item = queue.Dequeue();
-                    }
-                } finally { drained.TrySetResult(true); }
-            })) {
-                queue.Complete();
-                queue.Dispose();
-                drained.TrySetResult(true);
-                drained.Close();
-                recentWorkspaceQueue = null;
-                recentWorkspaceDrained = null;
-                log.Add("> Could not start recent project writer.");
-                return;
-            }
-        }
-        recentWorkspaceQueue.Enqueue(next);
-    }
-
-    static string PersistWorkspaceItem(IdeRecentWorkspace item) {
-        try {
-            IdeDocumentPageWork page = item.documentPageWork;
-            if (page != null) { page.ReadStart(); }
-            else if (item.kind == 1) { ZanIDE.WriteDockLayout(item.layout); }
-            else if (item.kind == 2) {
-                IdeShellSettings s = item.settings;
-                if (s != null) {
-                    ZanIDE.SaveSettings(s.treeWidth, s.bottomHeight, s.width, s.height,
-                    s.autoRun, s.skin, s.rightWidth, s.opacity, s.wallpaper,
-                    s.wallpaperOpacity, s.partialFrames, s.renderBackend);
-                }
-            } else { ZanIDE.WriteLastProject(item.root); }
-        } catch (Exception error) { return error.Message; }
-        return "";
-    }
-
-    void RememberWorkspaceAsync(string path) {
-        if (path == "" || shuttingDown || closeRequested) { return; }
-        IdeRecentWorkspace next = new IdeRecentWorkspace();
-        next.root = path;
-        this.QueueWorkspacePersistence(next);
-        this.RequestStartPageData();
-    }
-
-    void RememberDockLayoutAsync(string layout) {
-        if (shuttingDown) { return; }
-        IdeRecentWorkspace next = new IdeRecentWorkspace();
-        next.kind = 1; next.layout = layout;
-        this.QueueWorkspacePersistence(next);
-    }
-
-    void SaveShellSettingsAsync(IdeShellSettings settings) {
-        IdeRecentWorkspace next = new IdeRecentWorkspace();
-        next.kind = 2; next.settings = settings;
-        this.QueueWorkspacePersistence(next);
-    }
-
-    async void DrainWorkspaceWorkAsync() {
-        if (recentWorkspaceQueue == null) { return; }
-        recentWorkspaceQueue.Complete();
-        await recentWorkspaceDrained.Task;
-        recentWorkspaceQueue.Dispose();
-        recentWorkspaceDrained.Close();
-        recentWorkspaceQueue = null;
-        recentWorkspaceDrained = null;
-    }
-
     static string RecentProjectsPath() { return ZanIDE.UserConfigDir() + "/recent_projects.txt"; }
 
     static string TrimWs(string s) {
+        if (s == null) { return ""; }
         int b = 0;
         int e = s.Length;
         while (b < e) {
@@ -156,98 +71,5 @@ partial class ZanIDE {
         }
         Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
         File.WriteAllText(ZanIDE.RecentProjectsPath(), sb.ToString());
-    }
-
-    static List<RecentItem> RecentProjectItems() {
-        List<RecentItem> items = new List<RecentItem>();
-        List<string> paths = ZanIDE.ReadRecentProjects();
-        for (int i = 0; i < paths.Count; i = i + 1) {
-            items.Add(RecentItem.Create(paths[i]));
-        }
-        return items;
-    }
-
-    static List<NewsItem> StartNews(string root) {
-        List<NewsItem> items = new List<NewsItem>();
-        string p = root + "/docs/news.json";
-        if (!File.Exists(p)) { p = ZanIDE.UserConfigDir() + "/start_news.json"; }
-        if (File.Exists(p)) {
-            try {
-                string text = File.ReadAllText(p);
-                JsonDoc.ParseScoped(text, doc => {
-                    int rootNode = doc.root;
-                    if (doc.KindAt(rootNode) != 5) { return; }
-                    int arr = doc.Get(rootNode, "items");
-                    if (arr < 0 || doc.KindAt(arr) != 4) { return; }
-                    int child = doc.FirstChild(arr);
-                    while (child >= 0) {
-                        if (doc.KindAt(child) == 5) {
-                            string ti = doc.Str(child, "title", "");
-                            if (ti != "") {
-                                items.Add(NewsItem.Create(ti,
-                                    doc.Str(child, "tag", ZanIDE.T("Info", "资讯")),
-                                    doc.Str(child, "kind", ""),
-                                    doc.Str(child, "url", "@docs")));
-                            }
-                        }
-                        child = doc.NextSibling(child);
-                    }
-                });
-            } catch (Exception) {
-            }
-            if (items.Count > 0) { return items; }
-        }
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Quick start: create a project and run it", "快速入门：新建项目并运行"),
-            ZanIDE.T("Must read", "必读"), "error", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Zan language syntax overview", "Zan 语法速览"),
-            ZanIDE.T("Must read", "必读"), "error", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Design game UI with the scene designer (.html)", "用场景设计器制作游戏 UI（.html）"),
-            ZanIDE.T("Tutorial", "教程"), "info", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Visual forms with the form designer (.html)", "窗体设计器与 .html 可视化开发"),
-            ZanIDE.T("Tutorial", "教程"), "info", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Xiao Zan (AI assistant): provider profiles and model switching", "小赞（AI 助手）：多配置与模型切换"),
-            ZanIDE.T("Tool", "工具"), "success", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Debugger: breakpoints, stepping and watches", "调试器：断点、单步与监视"),
-            ZanIDE.T("Tool", "工具"), "success", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Hot reload: save to rebuild and restart", "热重载：保存即重建重启"),
-            ZanIDE.T("Tool", "工具"), "success", "@docs"));
-        items.Add(NewsItem.Create(
-            ZanIDE.T("Browse the built-in examples (right panel)", "浏览内置示例（右侧“示例”页签）"),
-            ZanIDE.T("Sample", "示例"), "primary", "@docs"));
-        return items;
-    }
-
-    static List<AiPreset> AiPresets() {
-        List<AiPreset> presets = new List<AiPreset>();
-        presets.Add(AiPreset.Create("Agnes AI", "https://platform.agnes-ai.com/v1", "",
-            "https://platform.agnes-ai.com/"));
-        presets.Add(AiPreset.Create(ZanIDE.T("Zhipu GLM", "智谱 GLM"),
-            "https://open.bigmodel.cn/api/paas/v4", "glm-4-flash",
-            "https://open.bigmodel.cn/"));
-        presets.Add(AiPreset.Create("Kimi (Moonshot)", "https://api.moonshot.cn/v1",
-            "moonshot-v1-8k", "https://platform.moonshot.cn/"));
-        presets.Add(AiPreset.Create("DeepSeek", "https://api.deepseek.com/v1",
-            "deepseek-chat", "https://platform.deepseek.com/"));
-        presets.Add(AiPreset.Create(ZanIDE.T("Alibaba Qwen", "通义千问 Qwen"),
-            "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus",
-            "https://bailian.console.aliyun.com/"));
-        presets.Add(AiPreset.Create("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
-            "https://platform.openai.com/"));
-        return presets;
-    }
-
-    static void OpenExternal(string url) {
-        #if WINDOWS
-        Process.RunDetached("cmd /c start \"\" \"" + url + "\"");
-        #else
-        Process.RunDetached("xdg-open \"" + url + "\"");
-        #endif
     }
 }

@@ -140,25 +140,13 @@ $clangDir = Split-Path -Parent $clangExe
 # zanc selects archives from each module's driver directory by live imports.
 & (Join-Path $PSScriptRoot "build_gui_driver.ps1") -Static -Clang $clangExe `
     -Drivers @("zan_gui", "zan_image", "zan_audio") -BuildLocal:$BuildLocalDrivers
-if ($BuildLocalDrivers) {
-    # --driver-dir redirects every driver lookup, including the prebuilt SQLite archive.
-    $driverOutput = Join-Path $root 'build\local-drivers'
-    $sqlite = Join-Path $root 'packages\Zan.Data\src\System\Data\Sqlite\drivers\win-x64\static\libsqlite3.a'
-    Copy-Item -LiteralPath $sqlite -Destination (Join-Path $driverOutput 'static') -Force
-}
 
-# ---- 2) embedded resources (skins, help topics, ide.css) -------------------
+# ---- 2) embedded resources (skins, ide.css) --------------------------------
 # Everything the IDE reads as data ships inside the exe and is looked up by name
-# through zan_embed_*: skin packs, the Help page's topics.json and the
-# page-layout stylesheet. Regenerate every build so editing one shows up without
-# a manual step.
-#
-# All three groups go into ONE object on purpose: zan_embed_register replaces the
-# registered table, so a second generated object would hide the first one's
-# resources (that is how ide.css and topics.json used to need disk copies).
-# The 'ide' group is filtered to *.css because assets\ also holds docs\.
+# through zan_embed_*: skin packs and the page-layout stylesheet. Regenerate
+# every build so editing one shows up without a manual step.
 & powershell -ExecutionPolicy Bypass -File scripts\gen_embed.ps1 `
-    -Group "packages\Zan.Gui\skins=skins;src\ide_zan\assets\docs=docs;src\ide_zan\assets=ide:*.css" `
+    -Group "packages\Zan.Gui\skins=skins;src\ide_zan\assets=ide:*.css" `
     -OutC build\embed_gen.c -OutO build\embed_gen.o -Clang $clangExe
 if ($LASTEXITCODE -ne 0) { Write-Output "EMBED_GEN_FAILED"; exit 1 }
 
@@ -167,70 +155,9 @@ $zanc = if (Test-Path "build\zanc.exe") { "build\zanc.exe" } else { "dist\win-x6
 Write-Output "[zanc] $zanc"
 
 $files = @()
-# IDE sources (the standard project's own code). Component kinds are discovered
-# automatically by the compiler's __ZanControlCatalog pass.
+# IDE sources (the standard project's own code). Package dependencies and
+# Gui.Widget/Gui.Component catalogs are resolved by --auto-stdlib + --package-project.
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
-# The GUI stdlib is namespaced across subfolders (Gui root + Widget /
-# Component / Designer); recurse so every part is compiled.
-$files += (Get-ChildItem packages\Zan.Gui\src\Gui -Recurse -Include *.zan).FullName
-if (Test-Path packages\Zan.Gui.Designer) {
-    $files += (Get-ChildItem packages\Zan.Gui.Designer\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Gui.Charts) {
-    $files += (Get-ChildItem packages\Zan.Gui.Charts\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Gui.Browser) {
-    $files += (Get-ChildItem packages\Zan.Gui.Browser\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Industrial) {
-    $files += (Get-ChildItem packages\Zan.Industrial\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Data) {
-    $files += (Get-ChildItem packages\Zan.Data\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Desktop) {
-    $files += (Get-ChildItem packages\Zan.Desktop\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Security) {
-    $files += (Get-ChildItem packages\Zan.Security\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Net) {
-    $files += (Get-ChildItem packages\Zan.Net\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Diagnostics) {
-    $files += (Get-ChildItem packages\Zan.Diagnostics\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Text) {
-    $files += (Get-ChildItem packages\Zan.Text\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Linq) {
-    $files += (Get-ChildItem packages\Zan.Linq\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Scripting) {
-    $files += (Get-ChildItem packages\Zan.Scripting\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Ai\src\Ai\Knowledge) {
-    $files += (Get-ChildItem packages\Zan.Ai\src\Ai\Knowledge -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Globalization) {
-    $files += (Get-ChildItem packages\Zan.Globalization\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.Resources) {
-    $files += (Get-ChildItem packages\Zan.Resources\src -Recurse -Include *.zan).FullName
-}
-if (Test-Path packages\Zan.IO) {
-    $files += (Get-ChildItem packages\Zan.IO\src -Recurse -Include *.zan).FullName
-}
-# Tar (publish archives macOS/Linux output dirs as tar -- the only common
-# format that carries the unix mode bit, see ZanIDE.Package.zan) rides in the
-# Zan.IO group above alongside Zip/GZip used by Xlsx and MarketplaceInstall.
-if (Test-Path packages\Zan.Web) {
-    $files += (Get-ChildItem packages\Zan.Web\src -Recurse -Include *.zan).FullName
-}
-# System pieces the editor/workspace rely on.
-$files += (Join-Path (Get-Location) "stdlib\System\IO\File.zan")
-$files += (Join-Path (Get-Location) "stdlib\System\IO\Directory.zan")
-$files += (Join-Path (Get-Location) "stdlib\System\IO\FileInfo.zan")
 
 # Entry: the handwritten Main (IdeEntry, B-ID44) lives in the file named by
 # the manifest's `entry` key. Design documents are NOT compile inputs any
@@ -299,7 +226,7 @@ if ($env:IDE_NO_PUBLISH -eq "1") { $zanArgs = $zanArgs -ne "--publish" }
 # ever-growing process and a permanent CPU tax. Ask for them explicitly with
 # ZAN_IDE_ZANC_ARGS="--arc-guard --check-leaks" when chasing a leak.
 $zanArgs += @("--no-arc-guard", "--no-check-leaks")
-$zanArgs += @("--auto-stdlib", "--link-mode", "static")
+$zanArgs += @("--auto-stdlib", "--package-project", (Get-Location).Path, "--link-mode", "static")
 if ($BuildLocalDrivers) { $zanArgs += @('--driver-dir', (Join-Path $root 'build\local-drivers')) }
 $zanArgs += @("--link-input", (Join-Path (Get-Location) "build\embed_gen.o"))
 # Runtime/process system deps; each selected driver adds its own .libs closure.

@@ -50,7 +50,7 @@ function Test-Plan([string]$OutputPath = 'build\ZanIDE.exe', [switch]$RealParkin
     if ($GenerateMetadata) {
         $template = Join-Path $root 'src\ide_zan\src\services\IdeVersion.zan'
         $entry = Join-Path $root 'src\ide_zan\src\IdeForm.zan'
-        $otherSource = Join-Path $root 'src\ide_zan\src\services\IdeUpdate.zan'
+        $otherSource = Join-Path $root 'src\ide_zan\src\services\ZanIDE.Signing.zan'
         $files = @($template, $entry, $otherSource)
         . $versionPlan
         Assert ($files.Count -eq 2 -and $files -contains $otherSource -and $files -contains $versionSource) 'Wrong version source list'
