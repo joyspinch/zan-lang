@@ -89,12 +89,20 @@ static bool extern_can_supply_instances(zan_irgen_t *g) {
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return ZAN_ERROR;
     g_di_emit_ctx = g;
+    /* Ordinary (non -g) executable builds follow publish's closed-world
+     * rules, so reflection that works in development also works after
+     * --publish. They used to emit every body of every pulled-in file and a
+     * reflection thunk for every method: a small Gui test was 3.4M LLVM
+     * instructions, 90 s and 4 GB. ZAN_NO_DEV_PRUNE=1 restores full emission. */
+    const char *no_dev_prune = getenv("ZAN_NO_DEV_PRUNE");
+    bool dev_prune = !(no_dev_prune && strcmp(no_dev_prune, "1") == 0);
+    g->closed_world = g->publish_mode || (dev_prune && !g->emit_debug && !g->emit_lib);
     const char *no_instance_prune = getenv("ZAN_NO_PUBLISH_INSTANCE_PRUNE");
-    g->publish_instance_prune = g->publish_mode && !g->emit_debug && !g->emit_lib &&
+    g->publish_instance_prune = g->closed_world && !g->emit_debug && !g->emit_lib &&
                                 !(no_instance_prune && strcmp(no_instance_prune, "1") == 0);
     const char *no_reflect_demand = getenv("ZAN_NO_PUBLISH_REFLECT_DEMAND");
-    g->publish_reflect_demand = g->publish_mode && !g->emit_debug && !g->emit_lib &&
-                               !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
+    g->publish_reflect_demand = g->closed_world && !g->emit_debug && !g->emit_lib &&
+                                !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
     di_debug_types_reset();
     if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
         char error[4096];
@@ -128,7 +136,10 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     g->publish_vslot_demand = g->publish_instance_prune &&
         !(no_vslot_demand && strcmp(no_vslot_demand, "1") == 0);
 
-    bool prune_stdlib_bodies = (g->publish_mode || g->obfuscate_strings) && !g->emit_debug;
+    bool prune_stdlib_bodies = (g->closed_world || g->obfuscate_strings) && !g->emit_debug;
+    /* Non-publish builds still generate unreached bodies once, for their
+     * codegen diagnostics, then drop them before LLVM optimizes. */
+    bool diag_unused_bodies = !g->publish_mode && !g->obfuscate_strings;
     unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
     for (int w = 0; w < work_count; w++) {
         zan_ast_node_t *m = work[w].member;
@@ -346,7 +357,7 @@ done:
     free(work_ix.slots);
     /* Preserve ordinary/debug codegen diagnostics after freezing executable
      * initialization demand. These bodies cannot add startup roots. */
-    if (!prune_stdlib_bodies && !zan_diag_has_errors(g->diag)) {
+    if (diag_unused_bodies && !zan_diag_has_errors(g->diag)) {
         unsigned char *diagnostic_live = (unsigned char *)calloc((size_t)work_count + 1, 1);
         for (int w = 0; w < work_count; w++) {
             if (live[w]) diagnostic_live[w] = 2;
@@ -355,7 +366,18 @@ done:
         emit_demanded_method_bodies(g, work, work_count, diagnostic_live);
         emit_pending_method_specs(g);
         for (int w = 0; w < work_count; w++) {
-            if (!live[w] && diagnostic_live[w] == 2) live[w] = 3;
+            if (live[w]) continue;
+            if (prune_stdlib_bodies) {
+                /* Root-reachable set is fixed above; this body (and whatever
+                 * it demanded) existed only for its diagnostics. The dead-stub
+                 * loop below gives it an unreachable body, as publish does. */
+                zan_llvm_delete_body(work[w].fn);
+                if (work[w].resume_fn) zan_llvm_delete_body(work[w].resume_fn);
+                /* emitting the body already released param_types */
+                if (diagnostic_live[w] == 2) work[w].param_types = NULL;
+            } else if (diagnostic_live[w] == 2) {
+                live[w] = 3;
+            }
         }
         free(diagnostic_live);
     }

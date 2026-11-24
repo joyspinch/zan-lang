@@ -1,5 +1,6 @@
 #include "irgen_internal.h"
 #include "optimizer.h"
+#include "irgen_compact.h"
 
 typedef struct {
     zan_ast_node_t *member;

@@ -480,6 +480,11 @@ struct zan_irgen {
      * module's malloc/free/calloc/realloc declarations to rt_mem.c's
      * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
     bool         route_fast_alloc;
+    /* Executable builds without -g (publish or not) use closed-world rules:
+     * demand-driven method bodies and reflection thunks only for what the
+     * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
+     * every body and a thunk for every method. Set by zan_irgen_emit. */
+    bool closed_world;
     bool         publish_instance_prune; /* closed-world instance callable roots */
     bool         publish_vslot_demand;
     zan_symbol_t **vslot_demands; /* canonical declarations observed by emitted dispatch */

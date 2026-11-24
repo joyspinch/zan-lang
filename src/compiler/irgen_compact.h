@@ -20,6 +20,10 @@ int zan_irgen_compactor_run(zan_irgen_compactor_t *compactor,
 
 void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor);
 
+/* Drop a function's body, keeping its linkage (Function::deleteBody resets it
+ * to external). The function becomes a declaration. */
+void zan_llvm_delete_body(LLVMValueRef function);
+
 #ifdef __cplusplus
 }
 #endif

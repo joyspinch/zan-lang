@@ -238,3 +238,11 @@ extern "C" int zan_irgen_compactor_run(zan_irgen_compactor_t *compactor,
 extern "C" void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor) {
     delete compactor;
 }
+
+extern "C" void zan_llvm_delete_body(LLVMValueRef function) {
+    auto *fn = llvm::dyn_cast_or_null<llvm::Function>(llvm::unwrap(function));
+    if (!fn || fn->isDeclaration()) return;
+    llvm::GlobalValue::LinkageTypes linkage = fn->getLinkage();
+    fn->deleteBody();
+    fn->setLinkage(linkage);
+}

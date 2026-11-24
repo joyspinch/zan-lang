@@ -515,7 +515,7 @@ bool refl_ctor_needs_thunk(zan_irgen_t *g) {
     /* Capability-wide fallback: a live CreateInstance may receive any TypeInfo,
      * including dynamic GetType(), fields, ElementType or generic arguments.
      * Library exports remain conservative for callers outside this module. */
-    return !g->publish_mode || g->emit_lib || g->refl_ctor_used;
+    return !g->closed_world || g->emit_lib || g->refl_ctor_used;
 }
 
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
@@ -560,15 +560,16 @@ static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
 }
 
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target body-root 的唯一判定。
- * 非 publish：全部方法（现状不变）。
- * publish：仅 accessor（get_/set_ 且 owner 同名 property）、带注解方法、
+ * 非 closed_world（-g / 库 / ZAN_NO_DEV_PRUNE=1）：全部方法。
+ * closed_world（发布与普通构建）：仅 accessor（get_/set_ 且 owner 同名 property）、带注解方法、
+ * 被 Invoke 字面名点到（或存在非字面名 Invoke）的方法、
  * 设计稿事件处理器与实际 Invoke 可能选中的框架生命周期钩子。
  * 注意与 refl_method_should_export 的\u533a\u522b：\u672c\u8c13\u8bcd\u4e0d\u770b MOD_PUBLIC\uff08\u79c1\u6709 accessor/\u6ce8\u89e3\u4ecd\u751f thunk，\u4e0e\u73b0\u72b6\u4e00\u81f4）\u3002
  */
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl) {
     if (!decl || decl->kind != AST_METHOD_DECL) { return false; }
-    if (!g->publish_mode) { return true; }
+    if (!g->closed_world) { return true; }
     if (!(decl->method_decl.modifiers & MOD_STATIC) &&
         !refl_owner_can_have_instance(g, owner))
         return false;
@@ -579,20 +580,21 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
     if (attrs && attrs->count > 0) { return true; }
     zan_istr_t name = decl->method_decl.name;
     if (refl_is_exact_html_handler_name(g, name.str, name.len)) return true;
-    /* Named hooks are callable only when an emitted Invoke may select them.
+    /* Any other method (framework hooks included) is callable exactly when an
+     * emitted Invoke may select it: its literal name was invoked, or some
+     * Invoke takes a non-literal name. Without this, `obj.InvokeInt("Add", ..)`
+     * on a plain public method silently returned 0 under --publish.
      * HasMethod and member enumeration still retain the unchanged signatures. */
-    return refl_is_framework_hook_name(name.str, name.len) &&
-           refl_invoke_name_demanded(g, name);
+    return refl_invoke_name_demanded(g, name);
 }
 
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_symbol_t *m) {
     if (!m || m->kind != SYM_METHOD || !m->decl || m->decl->kind != AST_METHOD_DECL)
         return false;
-    if (!g->publish_mode)
-        return true;
+    if (!g->closed_world) return true;
     if (refl_is_html_handler(g, m))
         return true;
-    /* publish 模式下：
+    /* closed_world（发布与普通构建）下：
      * 1. 属性访问器（get_/set_）必须保留，支持运行期动态数据绑定
      * 2. 带有显式特性注解（attributes）的方法保留
      * 3. 必须是公开方法；私有/内部方法在发布期绝对不暴露反射
@@ -603,8 +605,10 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym, zan_sym
     if (attrs && attrs->count > 0)
         return true;
     uint32_t mods = m->modifiers | m->decl->method_decl.modifiers;
-    if (!(mods & MOD_PUBLIC))
-        return false;
+    /* An override takes the overridden member's accessibility: dropping a
+     * bare `override` row made Invoke fall through to the base row and run
+     * the base implementation. */
+    if (!(mods & (MOD_PUBLIC | MOD_OVERRIDE))) return false;
     return true;
 }
 

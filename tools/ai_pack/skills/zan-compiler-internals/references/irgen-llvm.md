@@ -751,6 +751,22 @@ try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内
 同期发现：LLVM 23 删了 `default<Os>/<Oz>`，体积档改 O2 管线 + optsize/minsize
 （必须在 `zan_opt_run_passes_on_module` 内做，分片模块也走这里）；Unix 宿主
 `cc` 链接行从不带发布分片对象（generated_objects），任何分片发布都缺符号。
-剩余大头是开发构建为每个方法生成反射 thunk（gui_tabs 8.4k 个，占函数 40%），
-发布构建只给访问器/注解/事件处理器——开发与发布反射语义不一致，是待定的
-语言决策（实验：开发构建套用发布规则 + 未达方法体置桩，gui_tabs 23s/1.3GB）。
+剩余大头是开发构建为每个方法生成反射 thunk（gui_tabs 8.4k 个，占函数 40%）。
+
+## 34. 普通构建走封闭世界：开发能反射调用的 = 发布后能调用的（2026-11-24）
+
+`g->closed_world = publish_mode || (!-g && !库 && !ZAN_NO_DEV_PRUNE=1)`。普通构建
+复用发布的按需方法体与反射可调用面；未达方法体仍生成一遍拿代码生成诊断，随后
+`zan_llvm_delete_body` 删掉（保 linkage），交给死桩循环——注意 body 已释放
+`param_types`，删前置 NULL，否则 double free（rc 134）。gui_tabs 45s/2.2GB →
+22s/1.3GB。
+
+切换当天普通构建即暴露两个**发布早已存在**的静默错误，教训：反射规则只在
+`--publish` 生效时，它的 bug 没有测试面——让日常构建走同一规则才有覆盖：
+- `obj.InvokeInt("Add6", …)` 普通公开方法：thunk 只给钩子，Invoke 静默返回 0。
+  现规则：字面名被 Invoke 点到的任何方法给 thunk；有非字面名 Invoke 则全给。
+- 不带 `public` 的 `override`：行不导出，Invoke 落到基类行跑基类实现。
+  override 继承被覆盖成员可见性。
+
+验证坑：`run_case.cmake` 在 exe 比 zanc/源码新时**复用旧 exe**——换环境变量做
+A/B 前必须 `touch build/zanc`，否则基线跑的是上一轮的二进制。
