@@ -41,6 +41,7 @@ Control/PropSpec 基类，并行必冲突）。
 | B-ID172 ① ✅ | 控件目录编译期合成：`__ZanControlCatalog`（继承 Gui.Control、public、可无参构造的类按类名入目录）、`[ControlKind(Name/Factory/Of)]`、zan.pkg `catalog` 声明式拉入（只认被 `using` 的命名空间、只拉声明包自己的文件）；删除三个 Bootstrap 注册梯子与仓内全部 `Install()` 调用；`ControlFactory.Require` | 3 个注册类、~60 处调用 |
 | B-ID172 ② ✅ | 按层摆目录（命名空间不变）：几何/窗口形状基元 → `src/Gui` 根；`Form`/`ChildWindow`/`Nav*` → `Forms/`；`ModelBinder`/`DocWire`/`UiViewScope` 族与绑定记录 → `Binding/`；`UiDriver`/`UiProbe` → `Testing/`。先倒置下行依赖：Core 新增 `WindowRoot`（Form 继承，Control 的 `FindForm`/`HostForm`/`OnHostForm` 与 Panel 只认它）与 `ChildWindowBase`（`ChildWindows` 注册表只经它驱动）；`Form.ReadDoc`/`FindDoc` 迁为 Markup 层 `HtmlDocs.Read`/`Find`（仓内调用方全部改）；`NavEnterHandler` 随 NavWindow。层级机检零新增违规，超基线项 62→51 | 36 个文件移动 |
 | B-ID173 ① ✅ | 绑定取值收敛：`ModelAccessor`（Binding 层）一处按模型种类分派 JsonValue / JsonDoc 与游标 / 标量字典 / 异构字典 / POCO 反射，无状态单例零分配；ModelBinder 的取值、值种类、写回、双向可写校验与 DocWire 字段校验只经它（删 30 余处 `is X` 梯子），行作用域取不到统一回落根模型完整路径。默认绑定属性（`PropSpec.DefaultBinding`）与 ChildWindow 绑定泵并入 ModelHosts 已在先前阶段落地。余 IDE Signal 状态迁 `Binding<T>` | ModelBinder ~180 行 |
+| B-ID174 ① ✅ | 背景绘制服务化：皮肤壁纸、用户壁纸图淡入、异形窗口投影/底色铺满与按槽背景快照（原 App.Markup 中 ~410 行、14 个方法、14 个缓存字段）移入 `BackdropPainter`（`App.Backdrop`）；App 只留 `RenderBackground` 门面与通用 `ISqrt`；`PaintContentMask` 调用方改经 `app.Backdrop` | App.Markup 674→~290 行 |
 | 4 | App 服务化：Automation/Glass/ThemeDrawer/Offscreen/Diagnostics 抽成服务；控件经 `this.RequestRedraw()` 而非 `FindApp().RequestRedraw()` | App 146 个方法 |
 | 5 | Control 组件化：滚动、命中测试、布局检查等能力拆为可挂载组件 | Control 176 个方法 |
 
