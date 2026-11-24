@@ -53,8 +53,15 @@ python3 tests/perf/protocols/run_bench.py --only=h2,ws --seconds=5   # 只跑部
   `Worker.ShareHandle` 的两张静态 List 无锁，明文 + TLS 两个 WebApp 在不同调度线程上
   同时登记共享表句柄，并发 Add 扩容崩（约 1/16 次启动）。加锁，派生 worker 时取快照。
   回归用例 `conformance/worker_share_handle_concurrent`（旧代码 26/30 崩）。
-- **待查：h2 单连接 8 并发流时 p99 达 30–40 ms**（单流时约 2 ms），吞吐也只比单流
-  高 ~30%。服务端每个应答分别写 HEADERS 与 DATA（两条 TLS 记录、两次发送、各过一次
-  `sendGate`），小应答可合并；流量窗口耗尽时两端仍以 `Task.Delay(2)` 轮询（>64 KB
-  应答才会碰到）。
+- **已修（2026-11-23）：h2 单连接 8 并发流时 p99 50–60 ms（单流约 1 ms）。** 服务端与客户端
+  埋点 + 请求/应答头里互打同机单调时钟戳拆单程：慢在"客户端发出 → 服务端读循环派发
+  HEADERS"，且派发前读循环并未停泊——每连接**一个串行读循环积压**，请求在套接字里排队。
+  三处：① `Http2ServerConnection.ReadExactAsync` 原以 `FillTo(count)` 只收恰好 count
+  字节，每帧帧头 9 字节与载荷各一次接收（TLS 下各过一次锁/Step/flush 检查）；改有界预读
+  max(count, 32 KB)。② 客户端每个 DATA 帧回一个连接级 WINDOW_UPDATE（小应答即每请求
+  多一帧入站）；改攒满半窗（32 KB）再补。③ 服务端小应答 HEADERS 与 DATA 各一次发送、各一条
+  TLS 记录；窗口够且单帧装得下时合成一次写。同机交替 A/B 4 轮中位：8×8 20.1k → 34.3k rps、
+  p99 59 → 12.7 ms；8×1 14.9k → 24.8k；1×8 12.0k → 20.7k（4/4 胜）。剩余：8×8 p99 仍为
+  单流的 ~20 倍（读循环仍串行）；流量窗口耗尽时两端仍以 `Task.Delay(2)` 轮询（>64 KB 应答）；
+  服务端对请求正文 DATA 仍逐帧回两个 WINDOW_UPDATE。
 - **未覆盖**：明文 h2c（`WebApp` 不支持）、HTTP/2 大响应、WSS、数据库/Redis 线协议。

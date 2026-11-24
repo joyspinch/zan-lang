@@ -69,10 +69,15 @@ public class Http2ServerConnection : IDisposable {
         this.pendingStreams = new List<Http2ServerStream>();
         this.connected = true;
     }
+    private static const int ReadAheadBytes = 32768;
     public static async int ReadExactAsync(HttpFramer framer, byte[] buffer, int count) {
         if (framer == null || buffer == null || count < 0 || count > buffer.Length) { return -1; }
+        // 预读：上限取 max(count, 32 KB)（> 一个最大帧 16 KB+9）。原先 FillTo(count)
+        // 只肯收恰好 count 字节——每帧帧头 9 字节、载荷各一次接收，单连接多流时
+        // 串行读循环跟不上入站帧，请求在套接字里排队（8 流 p99 30–50 ms）。
+        int limit = count > ReadAheadBytes ? count : ReadAheadBytes;
         while (framer.pend.Length() < count) {
-            int n = await framer.FillTo(count);
+            int n = await framer.FillTo(limit);
             if (n <= 0) { return -1; }
         }
         if (count > 0) { NativeMemory.Copy((nint)buffer, framer.pend.data, count); }
@@ -328,10 +333,23 @@ public class Http2ServerConnection : IDisposable {
             if (headerBytes > this.maxHeaderBytes || headers.Count > 128) { throw new IOException("HTTP2 response headers limit"); }
         }
         bool noBody = length == 0 || stream.request.method == "HEAD" || response.statusCode == 204 || response.statusCode == 304;
+        byte[] body = null;
+        if (!noBody) { body = response.bodyBytes != null && response.bodyBytesLen > 0 ? response.bodyBytes : response.body.ToBytes(); }
+        int sent = 0;
         // Hold an async gate across the whole header sequence, never a blocking thread mutex.
         await this.sendGate.Wait();
         try {
             byte[] encoded = this.outboundHpack.EncodeHeaders(headers, false);
+            // 小应答（单个 HEADERS 帧 + 单个 DATA 帧、窗口够）合成一次写：原先 HEADERS
+            // 与 DATA 各一次发送、各一条 TLS 记录、各过一次 sendGate，单连接多流时
+            // 发送次数翻倍。窗口不够或需要 CONTINUATION 时退回逐帧路径。
+            if (!noBody && encoded.Length <= 16384 && length <= 16384 && this.ReserveWindow(stream, length)) {
+                byte[] both = new byte[18 + encoded.Length + length];
+                this.PutFrame(both, 0, Http2FrameType.HEADERS, Http2Flags.END_HEADERS, stream.streamId, encoded, 0, encoded.Length);
+                this.PutFrame(both, 9 + encoded.Length, Http2FrameType.DATA, Http2Flags.END_STREAM, stream.streamId, body, 0, length);
+                await this.SendUnlockedAsync(both);
+                return;
+            }
             int offset = 0;
             bool first = true;
             while (offset < encoded.Length || first) {
@@ -346,8 +364,6 @@ public class Http2ServerConnection : IDisposable {
             }
         } finally { this.sendGate.Signal(); }
         if (noBody) { return; }
-        byte[] body = response.bodyBytes != null && response.bodyBytesLen > 0 ? response.bodyBytes : response.body.ToBytes();
-        int sent = 0;
         long deadline = Stopwatch.GetMilliseconds() + this.timeoutMs;
         while (sent < length && this.connected && !stream.reset) {
             int chunk = 0;
@@ -364,6 +380,20 @@ public class Http2ServerConnection : IDisposable {
             await this.SendRawAsync(packet, packet.Length);
             sent = sent + chunk;
         }
+    }
+    // 一次性预留整段应答的连接级与流级发送窗口；不够则不动窗口、返回 false。
+    private bool ReserveWindow(Http2ServerStream stream, int count) {
+        lock (this.pendingStreams) {
+            if (count > this.outboundConnWindow || count > stream.outboundStreamWindow) { return false; }
+            this.outboundConnWindow = this.outboundConnWindow - count;
+            stream.outboundStreamWindow = stream.outboundStreamWindow - count;
+            return true;
+        }
+    }
+    private void PutFrame(byte[] dst, int at, int type, int flags, int id, byte[] data, int offset, int count) {
+        byte[] hdr = Http2Frame.EncodeHeader(count, type, flags, id);
+        NativeMemory.Copy((nint)dst + at, (nint)hdr, 9);
+        if (count > 0) { NativeMemory.Copy((nint)dst + at + 9, (nint)data + offset, count); }
     }
     private byte[] Packet(int type, int flags, int id, byte[] data, int offset, int count) {
         byte[] packet = new byte[9 + count];
