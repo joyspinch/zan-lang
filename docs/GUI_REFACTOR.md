@@ -43,6 +43,7 @@ Control/PropSpec 基类，并行必冲突）。
 | B-ID173 ① ✅ | 绑定取值收敛：`ModelAccessor`（Binding 层）一处按模型种类分派 JsonValue / JsonDoc 与游标 / 标量字典 / 异构字典 / POCO 反射，无状态单例零分配；ModelBinder 的取值、值种类、写回、双向可写校验与 DocWire 字段校验只经它（删 30 余处 `is X` 梯子），行作用域取不到统一回落根模型完整路径。默认绑定属性（`PropSpec.DefaultBinding`）与 ChildWindow 绑定泵并入 ModelHosts 已在先前阶段落地。余 IDE Signal 状态迁 `Binding<T>` | ModelBinder ~180 行 |
 | B-ID174 ① ✅ | 背景绘制服务化：皮肤壁纸、用户壁纸图淡入、异形窗口投影/底色铺满与按槽背景快照（原 App.Markup 中 ~410 行、14 个方法、14 个缓存字段）移入 `BackdropPainter`（`App.Backdrop`）；App 只留 `RenderBackground` 门面与通用 `ISqrt`；`PaintContentMask` 调用方改经 `app.Backdrop` | App.Markup 674→~290 行 |
 | B-ID174 ② ✅ | 损伤帧服务化：脏区条带（partial*/dmg*/present*）、玻璃面板登记与跨条带扩展、滚动串玻璃延迟刷新、模糊 miss 计数共 21 个字段与 12 个方法（NoteDamage/NoteScrollDamage/FrameDamageContains/RequireFullFrame/CancelPartialFrame…）移入 `DamageTracker`（`App.Damage`，构造时建）；帧循环与 ~37 处外部调用方（控件、CodeEditor、Workplace、IDE、测试）改经 `app.Damage` | App.Glass 557→175 行 |
+| B-ID174 ③ ✅ | 颜色计算拆出：`App.LerpColor/Darken/Lighten/ScaleAlpha/WithAlpha`（打包 ARGB 纯函数）移入 Gui 根层静态类 `ColorMath`，~100 处调用方（Styling/Rendering/Widget/Charts/Industrial/测试）改为 `ColorMath.*`，下层取色不再向上依赖 App | 35 个文件 |
 | 4 | App 服务化：Automation/Glass/ThemeDrawer/Offscreen/Diagnostics 抽成服务；控件经 `this.RequestRedraw()` 而非 `FindApp().RequestRedraw()` | App 146 个方法 |
 | 5 | Control 组件化：滚动、命中测试、布局检查等能力拆为可挂载组件 | Control 176 个方法 |
 
