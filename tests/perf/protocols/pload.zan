@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Net.Http.Http2;
+using System.Net.Http.Hpack;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Text;
+using System.Threading;
+
+/* 通讯协议压测客户端（纯 Zan）：HTTP/2、HTTPS/1.1、WebSocket 回显。
+ * 明文 HTTP/1.1 用 ../web_mvc/load.zan（裸套接字，客户端开销最小）。
+ * 每条连接一个（h2 为 --streams 个）协程闭环发请求，预热期不计入，结束
+ * 输出一行与 load.zan 同字段的 JSON（rps = 每秒完成的请求/回显消息数）。
+ *
+ * 参数：--proto=h2|https|ws --host=127.0.0.1 --port=18491 --path=/hello
+ *       --conns=8 --streams=1（仅 h2：每连接并发流数）--bytes=64（仅 ws）
+ *       --seconds=10 --warmup=2 */
+class WorkerResult {
+    public List<int> samples = new List<int>();
+    public int connectFail;
+    public int sendFail;
+    public int recvFail;
+    public int non200;
+    public int reconnects;
+}
+
+/* 一条 h2 连接与它上面的流协程共享：首个发现连接坏掉的流负责重连。 */
+class H2Link {
+    public Http2ClientConnection conn;
+    public int generation;
+}
+
+class Program {
+    static string proto;
+    static string host;
+    static int port;
+    static string path;
+    static int bytes;
+    static long measureFromUs;
+    static long endUs;
+    static WorkerResult[] results;
+    static AtomicInt done;
+    static int stuck;
+
+    static string Arg(string[] args, string name, string dflt) {
+        string prefix = "--" + name + "=";
+        for (int i = 0; i < args.Length; i = i + 1) {
+            if (args[i].StartsWith(prefix)) { return args[i].Substring(prefix.Length); }
+        }
+        return dflt;
+    }
+
+    static void Sample(WorkerResult r, long t0, long t1) {
+        if (t0 >= Program.measureFromUs && t1 <= Program.endUs) {
+            r.samples.Add((int)(t1 - t0));
+        }
+    }
+
+    static void Finish(int slot, WorkerResult r) {
+        Program.results[slot] = r;
+        long _d = Program.done.Add(1);
+    }
+
+    /* h2：连接重建在 link 锁内做，generation 防止多个流重复重连。 */
+    static async Http2ClientConnection H2Get(H2Link link, WorkerResult r, int seen) {
+        Http2ClientConnection c = null;
+        lock (link) {
+            if (link.conn != null && link.conn.IsConnected()) { return link.conn; }
+            if (link.generation != seen) { return link.conn; }
+        }
+        c = await Http2ClientConnection.ConnectTlsAsync(Program.host, Program.port, false);
+        lock (link) {
+            if (link.generation != seen) {
+                if (c != null) { c.Dispose(); }
+                return link.conn;
+            }
+            if (link.conn != null) { link.conn.Dispose(); }
+            link.conn = c;
+            link.generation = link.generation + 1;
+        }
+        if (c == null) { r.connectFail = r.connectFail + 1; }
+        else if (seen > 0) { r.reconnects = r.reconnects + 1; }
+        return c;
+    }
+
+    static async void H2Stream(H2Link link, int slot) {
+        WorkerResult r = new WorkerResult();
+        while (Stopwatch.GetMicroseconds() < Program.endUs) {
+            int seen = 0;
+            Http2ClientConnection c = null;
+            lock (link) { c = link.conn; seen = link.generation; }
+            if (c == null || !c.IsConnected()) {
+                c = await Program.H2Get(link, r, seen);
+                if (c == null) { await Task.Delay(10); continue; }
+            }
+            long t0 = Stopwatch.GetMicroseconds();
+            HttpResponse resp = await c.SendAsync("GET", Program.path, null, null, "");
+            long t1 = Stopwatch.GetMicroseconds();
+            if (resp == null) {
+                // 流额度满（并发流 > 对端上限）也返回 null：连接仍在就重试。
+                if (c.IsConnected()) { r.sendFail = r.sendFail + 1; }
+                else { r.recvFail = r.recvFail + 1; }
+                continue;
+            }
+            if (resp.statusCode != 200) { r.non200 = r.non200 + 1; }
+            Program.Sample(r, t0, t1);
+        }
+        Program.Finish(slot, r);
+    }
+
+    static async void Https(int slot) {
+        WorkerResult r = new WorkerResult();
+        HttpClient c = null;
+        while (Stopwatch.GetMicroseconds() < Program.endUs) {
+            if (c == null) {
+                c = HttpClient.CreateHttps(Program.host, Program.port);
+                c.DisableTlsVerify();
+                c.SetTimeout(10000);
+            }
+            long t0 = Stopwatch.GetMicroseconds();
+            HttpResponse resp = await c.SendAsync("GET", Program.path, "");
+            long t1 = Stopwatch.GetMicroseconds();
+            if (resp == null || resp.statusCode <= 0) {
+                r.recvFail = r.recvFail + 1;
+                c.Dispose(); c = null;
+                r.reconnects = r.reconnects + 1;
+                continue;
+            }
+            if (resp.statusCode != 200) { r.non200 = r.non200 + 1; }
+            Program.Sample(r, t0, t1);
+        }
+        if (c != null) { c.Dispose(); }
+        Program.Finish(slot, r);
+    }
+
+    static async void Ws(int slot) {
+        WorkerResult r = new WorkerResult();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Program.bytes; i = i + 1) { sb.Append("x"); }
+        string msg = sb.ToString();
+        WebSocketClient c = null;
+        while (Stopwatch.GetMicroseconds() < Program.endUs) {
+            if (c == null) {
+                c = await WebSocketClient.ConnectAsync(Program.host, Program.port, Program.path);
+                if (c == null) { r.connectFail = r.connectFail + 1; await Task.Delay(10); continue; }
+            }
+            long t0 = Stopwatch.GetMicroseconds();
+            await c.SendText(msg);
+            string back = await c.RecvText(10000);
+            long t1 = Stopwatch.GetMicroseconds();
+            if (back == null || back.Length != msg.Length) {
+                r.recvFail = r.recvFail + 1;
+                c.CloseNow(); c = null;
+                r.reconnects = r.reconnects + 1;
+                continue;
+            }
+            Program.Sample(r, t0, t1);
+        }
+        if (c != null) { c.CloseNow(); }
+        Program.Finish(slot, r);
+    }
+
+    static long Pct(List<int> sorted, int permille) {
+        if (sorted.Count == 0) { return 0; }
+        int idx = (int)((long)(sorted.Count - 1) * permille / 1000);
+        return (long)sorted[idx];
+    }
+
+    static async void Main(string[] args) {
+        Program.proto = Program.Arg(args, "proto", "h2");
+        Program.host = Program.Arg(args, "host", "127.0.0.1");
+        Program.port = Convert.ToInt32(Program.Arg(args, "port", "18491"));
+        Program.path = Program.Arg(args, "path", "/hello");
+        Program.bytes = Convert.ToInt32(Program.Arg(args, "bytes", "64"));
+        int conns = Convert.ToInt32(Program.Arg(args, "conns", "8"));
+        int streams = Convert.ToInt32(Program.Arg(args, "streams", "1"));
+        int seconds = Convert.ToInt32(Program.Arg(args, "seconds", "10"));
+        int warmup = Convert.ToInt32(Program.Arg(args, "warmup", "2"));
+        if (Program.proto != "h2") { streams = 1; }
+
+        Socket.Initialize();
+        int workers = conns * streams;
+        Program.results = new WorkerResult[workers];
+        Program.done = new AtomicInt(0);
+        long start = Stopwatch.GetMicroseconds();
+        Program.measureFromUs = start + (long)warmup * 1000000;
+        Program.endUs = Program.measureFromUs + (long)seconds * 1000000;
+        for (int i = 0; i < conns; i = i + 1) {
+            if (Program.proto == "h2") {
+                H2Link link = new H2Link();
+                for (int s = 0; s < streams; s = s + 1) {
+                    Task.Spawn(Program.H2Stream(link, i * streams + s));
+                }
+            } else if (Program.proto == "https") {
+                Task.Spawn(Program.Https(i));
+            } else {
+                Task.Spawn(Program.Ws(i));
+            }
+        }
+        long hardStop = Program.endUs + 15000000;
+        while (Program.done.Load() < (long)workers && Stopwatch.GetMicroseconds() < hardStop) {
+            await Task.Delay(50);
+        }
+        Program.stuck = workers - (int)Program.done.Load();
+
+        List<int> samples = new List<int>();
+        int connectFail = 0;
+        int sendFail = 0;
+        int recvFail = 0;
+        int non200 = 0;
+        int reconnects = 0;
+        for (int w = 0; w < workers; w = w + 1) {
+            WorkerResult r = Program.results[w];
+            if (r == null) { continue; }
+            for (int k = 0; k < r.samples.Count; k = k + 1) { samples.Add(r.samples[k]); }
+            connectFail = connectFail + r.connectFail;
+            sendFail = sendFail + r.sendFail;
+            recvFail = recvFail + r.recvFail;
+            non200 = non200 + r.non200;
+            reconnects = reconnects + r.reconnects;
+        }
+        samples.Sort();
+        long n = samples.Count;
+        long sum = 0;
+        for (int i = 0; i < samples.Count; i = i + 1) { sum = sum + (long)samples[i]; }
+        double rps = (double)n / (double)seconds;
+        long mean = n > 0 ? sum / n : 0;
+        long max = n > 0 ? (long)samples[samples.Count - 1] : 0;
+        Console.WriteLine("{\"proto\":\"" + Program.proto + "\",\"path\":\"" + Program.path
+            + "\",\"conns\":" + Convert.ToString(conns)
+            + ",\"streams\":" + Convert.ToString(streams)
+            + ",\"seconds\":" + Convert.ToString(seconds)
+            + ",\"requests\":" + Convert.ToString(n)
+            + ",\"rps\":" + Convert.ToString((long)rps)
+            + ",\"mean_us\":" + Convert.ToString(mean)
+            + ",\"p50_us\":" + Convert.ToString(Program.Pct(samples, 500))
+            + ",\"p90_us\":" + Convert.ToString(Program.Pct(samples, 900))
+            + ",\"p99_us\":" + Convert.ToString(Program.Pct(samples, 990))
+            + ",\"max_us\":" + Convert.ToString(max)
+            + ",\"errors\":" + Convert.ToString(connectFail + sendFail + recvFail)
+            + ",\"connect_fail\":" + Convert.ToString(connectFail)
+            + ",\"send_fail\":" + Convert.ToString(sendFail)
+            + ",\"recv_fail\":" + Convert.ToString(recvFail)
+            + ",\"non200\":" + Convert.ToString(non200)
+            + ",\"reconnects\":" + Convert.ToString(reconnects)
+            + ",\"stuck\":" + Convert.ToString(Program.stuck) + "}");
+        Socket.Cleanup();
+    }
+}

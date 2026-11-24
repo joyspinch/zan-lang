@@ -1,0 +1,80 @@
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Web;
+
+/* 通讯协议压测的服务端：不经 MVC（无属性路由、无控制器、无模板），只量
+ * 协议栈 + 路由匹配 + 应答写出的每请求开销。同一进程起两个 WebApp：
+ *   明文端口：HTTP/1.1 keep-alive、WebSocket（/ws 回显）
+ *   TLS 端口：HTTPS/1.1 与 HTTP/2（WebApp 只在 TLS 上接 h2 前言）
+ * 路由：
+ *   GET /hello   5 字节文本
+ *   GET /4k      4096 字节文本（与 MVC 纯模板页同量级）
+ *   GET /ws      WebSocket 升级后逐条回显
+ *
+ * 参数：--port=N（默认 18490）--tls-port=N（默认 18491）--cert= --key= */
+class Program {
+    static string body4k;
+
+    static string Arg(string[] args, string name, string dflt) {
+        string prefix = "--" + name + "=";
+        for (int i = 0; i < args.Length; i = i + 1) {
+            if (args[i].StartsWith(prefix)) { return args[i].Substring(prefix.Length); }
+        }
+        return dflt;
+    }
+
+    static async void Hello(HttpContext ctx) {
+        ctx.Text("hello");
+    }
+
+    static async void FourK(HttpContext ctx) {
+        ctx.Text(Program.body4k);
+    }
+
+    static async void Echo(HttpContext ctx) {
+        WsSession ws = await WebWs.Upgrade(ctx);
+        if (ws == null) {
+            ctx.Text("not-a-websocket-request");
+            return;
+        }
+        while (ws.Open()) {
+            string msg = await ws.Recv();
+            if (msg == null) { break; }
+            if (!await ws.SendText(msg)) { break; }
+        }
+        ws.Dispose();
+    }
+
+    static void Routes(WebApp app) {
+        app.Get("/hello", Program.Hello);
+        app.Get("/4k", Program.FourK);
+        app.Get("/ws", Program.Echo);
+    }
+
+    static async void Main(string[] args) {
+        int port = Convert.ToInt32(Program.Arg(args, "port", "18490"));
+        int tlsPort = Convert.ToInt32(Program.Arg(args, "tls-port", "18491"));
+        string cert = Program.Arg(args, "cert", "");
+        string key = Program.Arg(args, "key", "");
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 64; i = i + 1) {
+            sb.Append("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n");
+        }
+        Program.body4k = sb.ToString();
+
+        Socket.Initialize();
+        if (cert.Length > 0 && key.Length > 0) {
+            WebApp secure = new WebApp("127.0.0.1", tlsPort);
+            secure.UseHttps(cert, key);
+            Program.Routes(secure);
+            Task.Spawn(secure.Start());
+        }
+        WebApp app = new WebApp("127.0.0.1", port);
+        Program.Routes(app);
+        Console.WriteLine("BENCH_READY port=" + Convert.ToString(port)
+            + " tls_port=" + Convert.ToString(tlsPort));
+        int _rc = await app.Start();
+    }
+}

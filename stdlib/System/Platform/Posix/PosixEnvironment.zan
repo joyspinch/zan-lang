@@ -31,8 +31,19 @@ public class PosixEnvironment : IPlatformEnvironment {
     [DllImport("crt", EntryPoint = "getenv")]
     static extern string posix_getenv(string name);
 
+    // 随机源：Apple 走 getentropy（libSystem，macOS 10.12+/iOS 10+，单次
+    // ≤256 字节、不占 fd）；其余 POSIX 仍 fopen /dev/urandom，但 setvbuf
+    // 关掉 stdio 缓冲——原先每次 fread 按块整读（KB 级）再丢弃，WebSocket
+    // 客户端每帧 4 字节掩码都付这一套，回显吞吐被压到 1/3。不绑 open/read：
+    // open 是变参函数（见 zan-debugging：Zan 侧不直接 DllImport 变参 libc）。
+    [DllImport("crt", EntryPoint = "getentropy")]
+    static extern int urandEntropy(nint buf, nint len);
+
     [DllImport("crt", EntryPoint = "fopen")]
     static extern nint urandOpen(string path, string mode);
+
+    [DllImport("crt", EntryPoint = "setvbuf")]
+    static extern int urandUnbuffer(nint fp, nint buf, int mode, nint size);
 
     [DllImport("crt", EntryPoint = "fread")]
     static extern long urandRead(byte[] buf, long size, long count, nint fp);
@@ -108,11 +119,24 @@ public class PosixEnvironment : IPlatformEnvironment {
         if (WasiRandomGet(buf, count) != 0) { return 0; }
         return count;
         #else
+        #if APPLE
+        nint dst = (nint)buf;
+        int done = 0;
+        while (done < count) {
+            int chunk = count - done;
+            if (chunk > 256) { chunk = 256; }
+            if (urandEntropy(dst + (nint)done, (nint)chunk) != 0) { return done; }
+            done = done + chunk;
+        }
+        return done;
+        #else
         nint fp = urandOpen("/dev/urandom", "rb");
         if (fp == 0) { return 0; }
+        int _nb = urandUnbuffer(fp, 0, 2, 0);  // _IONBF：glibc/musl/bionic/BSD 均为 2
         long got = urandRead(buf, 1, count, fp);
         urandClose(fp);
         return (int)got;
+        #endif
         #endif
     }
 

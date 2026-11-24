@@ -99,6 +99,17 @@ O(活跃协程数) × 每次创建/销毁，并发越高越慢；自旋时间算
 再加探针打印卡住时的计数——"服务端全部应答了、计数却差 1"即丢更新。修法：`AtomicInt`
 计数、`lock (list) { ... }` 包住共享集合写。
 
+### 压测数字低：先剖析**客户端**——标准库客户端自己就可能是瓶颈（协议压测实测，2026-11-23）
+
+压测端也是 Zan 写的、走标准库客户端时，数字同时量的是客户端。两例：WebSocket 回显只有
+HTTP/1.1 的 1/3，`sample` 压测端进程，top-of-stack 是 `__read_nocancel`/`__open_nocancel`——
+每帧 4 字节掩码经 `RandomNumberGenerator.Fill`，POSIX 实现每次 `fopen` + stdio 整块缓冲
+`fread` + `fclose` /dev/urandom（修后 4.6k → 15.6k msg/s）；h2 客户端等流完成用
+`Task.Delay(2)` 轮询，单流每请求 ≥2 ms 底（改等流的门后 3.0k → 15.7k rps）。判据：
+单连接延迟远高于同机 HTTP/1.1 裸套接字客户端，且服务端 CPU 大半在 kevent 空等。排查：
+`grep -n "Task.Delay" ` 查客户端等待循环；每消息调用链上找 open/read 系统调用。另：
+`sample` 时别在同一 shell 里裸 `wait`（会连服务端一起等），只 `wait` 采样作业的 PID。
+
 ### 同步上下文 `await` 每次 ~1ms、有定时器在途时卡到定时器截止：worker 停泊收不到唤醒（rt_io_co_sched 实测，2026-11-23）
 
 M:N 调度器 worker 空闲停泊必须阻塞在**可被 `co_notify` 叫醒**的原语上：POSIX 是本分片

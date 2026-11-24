@@ -11,6 +11,9 @@
 每个场景跑两档并发：连接池大小 ×1 与 ×4（默认池 8 → 8 / 32 条 keep-alive 连接）。
 服务端为单进程单 `WebApp`（不开多 worker）。
 
+不经 MVC 的协议层基线（HTTP/1.1、HTTPS、HTTP/2、WebSocket）见 [`../protocols`](../protocols/README.md)；
+两边之差即框架开销。
+
 ## 运行
 
 ```bash

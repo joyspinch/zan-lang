@@ -1,0 +1,29 @@
+using System;
+using System.Net;
+using System.Threading;
+
+/* Worker.ShareHandle 并发登记：同进程多个 WebApp 并发 Start（明文 + TLS）
+ * 时各在调度线程上登记共享表句柄。两张静态 List 曾无锁，并发 Add 扩容
+ * 在启动时 SIGSEGV（协议压测服务端约 1/16 次启动即崩）。 */
+class Program {
+    static AtomicInt done;
+
+    static async void Register(int id) {
+        for (int i = 0; i < 400; i = i + 1) {
+            // 一半名字各线程共享（走更新分支），一半各自独有（走 Add 扩容）。
+            string name = i % 2 == 0 ? "SHARED_" + Convert.ToString(i)
+                : "T" + Convert.ToString(id) + "_" + Convert.ToString(i);
+            Worker.ShareHandle(name, (long)(id * 100000 + i + 1));
+            if (i % 50 == 0) { await Task.Yield(); }
+        }
+        long _d = Program.done.Add(1);
+    }
+
+    static async void Main() {
+        Program.done = new AtomicInt(0);
+        int tasks = 16;
+        for (int t = 0; t < tasks; t = t + 1) { Task.Spawn(Program.Register(t)); }
+        while (Program.done.Load() < (long)tasks) { await Task.Delay(5); }
+        Console.WriteLine("registered tasks=" + Convert.ToString(Program.done.Load()));
+    }
+}
