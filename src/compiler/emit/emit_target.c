@@ -103,6 +103,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
     const char *no_reflect_demand = getenv("ZAN_NO_PUBLISH_REFLECT_DEMAND");
     g->publish_reflect_demand = g->closed_world && !g->emit_debug && !g->emit_lib &&
                                 !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
+    refl_collect_literal_names(g, unit);
     di_debug_types_reset();
     if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
         char error[4096];

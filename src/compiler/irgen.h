@@ -547,6 +547,10 @@ struct zan_irgen {
     int refl_invoke_name_count;
     int refl_invoke_name_cap;
     bool refl_invoke_unknown;     /* computed Invoke name preserves all callable hooks */
+    /* Sorted identifier-shaped string literals of the whole compilation unit:
+     * the names a computed Invoke can plausibly produce (closed world only). */
+    zan_istr_t *refl_literal_names;
+    int refl_literal_name_count;
     LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
     LLVMValueRef refl_empty_str;
     LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */

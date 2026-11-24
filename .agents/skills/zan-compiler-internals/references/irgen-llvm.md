@@ -764,7 +764,11 @@ try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内
 切换当天普通构建即暴露两个**发布早已存在**的静默错误，教训：反射规则只在
 `--publish` 生效时，它的 bug 没有测试面——让日常构建走同一规则才有覆盖：
 - `obj.InvokeInt("Add6", …)` 普通公开方法：thunk 只给钩子，Invoke 静默返回 0。
-  现规则：字面名被 Invoke 点到的任何方法给 thunk；有非字面名 Invoke 则全给。
+  现规则：字面名被 Invoke 点到的任何方法给 thunk；有计算名 Invoke 时，再给名字在
+  整个编译单元以标识符形字符串字面量出现过的方法（`refl_collect_literal_names`，
+  emit 开头一次 AST 遍历、排序去重、bsearch）。Gui 的 PropSpec/DocWire 都有计算名
+  Invoke：一律全给是 28s/1.8GB，按字面量池收窄后 21.6s/1.34GB。运行期纯拼接名
+  不支持，方法加特性保留。用例 `reflect_invoke_computed_name`。
 - 不带 `public` 的 `override`：行不导出，Invoke 落到基类行跑基类实现。
   override 继承被覆盖成员可见性。
 

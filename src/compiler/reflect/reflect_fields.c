@@ -549,14 +549,93 @@ bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
     return false;
 }
 
+typedef struct {
+    zan_istr_t *items;
+    int count;
+    int cap;
+} refl_literal_pool_t;
+
+static bool refl_is_identifier_text(const char *s, size_t n) {
+    if (n == 0 || n > 255) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        bool ok = c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (i > 0 && c >= '0' && c <= '9') || c >= 0x80;
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static zan_walk_action_t refl_collect_literal(zan_ast_node_t *node, void *user) {
+    refl_literal_pool_t *pool = (refl_literal_pool_t *)user;
+    if (node->kind != AST_STRING_LITERAL) return ZAN_WALK_CONTINUE;
+    zan_istr_t text = node->str_val;
+    if (!text.str || !refl_is_identifier_text(text.str, text.len)) return ZAN_WALK_CONTINUE;
+    if (pool->count == pool->cap) {
+        int cap = pool->cap ? pool->cap * 2 : 256;
+        zan_istr_t *items = (zan_istr_t *)realloc(pool->items, (size_t)cap * sizeof(*items));
+        if (!items) return ZAN_WALK_ABORT;
+        pool->items = items;
+        pool->cap = cap;
+    }
+    pool->items[pool->count++] = text;
+    return ZAN_WALK_CONTINUE;
+}
+
+static int refl_istr_cmp(const void *a, const void *b) {
+    const zan_istr_t *x = (const zan_istr_t *)a, *y = (const zan_istr_t *)b;
+    size_t n = x->len < y->len ? x->len : y->len;
+    int c = memcmp(x->str, y->str, n);
+    if (c) return c;
+    return x->len < y->len ? -1 : x->len > y->len ? 1 : 0;
+}
+
+/* A computed Invoke name is a runtime string; in a closed-world build it can
+ * only name a method if that name appears as a string literal somewhere in
+ * the program (or in a design file, or is a framework hook -- handled by the
+ * callers). Names assembled purely at runtime (concatenation, JSON) are not
+ * supported for plain methods; give such a method an attribute to keep it.
+ * On allocation failure the pool stays NULL and every name is kept. */
+void refl_collect_literal_names(zan_irgen_t *g, zan_ast_node_t *unit) {
+    g->refl_literal_names = NULL;
+    g->refl_literal_name_count = -1;
+    if (!g->closed_world || !unit) return;
+    refl_literal_pool_t pool = {NULL, 0, 0};
+    if (!zan_ast_walk(unit, refl_collect_literal, NULL, &pool)) {
+        free(pool.items);
+        return;
+    }
+    if (pool.count) qsort(pool.items, (size_t)pool.count, sizeof(*pool.items), refl_istr_cmp);
+    int n = 0;
+    for (int i = 0; i < pool.count; i++) {
+        if (n && refl_istr_cmp(&pool.items[n - 1], &pool.items[i]) == 0) continue;
+        pool.items[n++] = pool.items[i];
+    }
+    zan_istr_t *kept = n ? zan_arena_alloc(g->arena, (size_t)n * sizeof(*kept)) : NULL;
+    if (n && !kept) {
+        free(pool.items);
+        return;
+    }
+    if (n) memcpy(kept, pool.items, (size_t)n * sizeof(*kept));
+    free(pool.items);
+    g->refl_literal_names = kept;
+    g->refl_literal_name_count = n;
+}
+
 static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
-    if (!g->publish_reflect_demand || g->refl_invoke_unknown) return true;
+    if (!g->publish_reflect_demand) return true;
     for (int i = 0; i < g->refl_invoke_name_count; i++) {
         zan_istr_t invoked = g->refl_invoke_names[i];
         if (invoked.len == name.len && memcmp(invoked.str, name.str, name.len) == 0)
             return true;
     }
-    return false;
+    if (!g->refl_invoke_unknown) return false;
+    /* Framework hooks are dispatched by computed names by design. */
+    if (refl_is_framework_hook_name(name.str, name.len)) return true;
+    if (g->refl_literal_name_count < 0) return true;
+    return g->refl_literal_name_count > 0 &&
+           bsearch(&name, g->refl_literal_names, (size_t)g->refl_literal_name_count,
+                   sizeof(zan_istr_t), refl_istr_cmp) != NULL;
 }
 
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target body-root 的唯一判定。
@@ -582,8 +661,9 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
     if (refl_is_exact_html_handler_name(g, name.str, name.len)) return true;
     /* Any other method (framework hooks included) is callable exactly when an
      * emitted Invoke may select it: its literal name was invoked, or some
-     * Invoke takes a non-literal name. Without this, `obj.InvokeInt("Add", ..)`
-     * on a plain public method silently returned 0 under --publish.
+     * Invoke takes a computed name and this name occurs as a string literal.
+     * Without this, `obj.InvokeInt("Add", ..)` on a plain public method
+     * silently returned 0 under --publish.
      * HasMethod and member enumeration still retain the unchanged signatures. */
     return refl_invoke_name_demanded(g, name);
 }
