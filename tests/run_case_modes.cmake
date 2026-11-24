@@ -151,6 +151,16 @@ endfunction()
 # program mode: conformance + leak + ARC in one compile and one run
 # ============================================================================
 if(EXPECTED AND OUT_EXE)
+  # The runtime appends its leak report to $ZAN_LEAK_LOG (default zan_leaks.log
+  # in the working directory = repo root); keep it under build/test-out (S10).
+  get_filename_component(_cases_dir "${OUT_EXE}" DIRECTORY)
+  get_filename_component(_build_dir "${_cases_dir}" DIRECTORY)
+  get_filename_component(_case_stem "${OUT_EXE}" NAME_WE)
+  set(_leak_log "${_build_dir}/test-out/leaks/${_case_stem}.log")
+  file(REMOVE "${_leak_log}")
+  file(MAKE_DIRECTORY "${_build_dir}/test-out/leaks")
+  set(ENV{ZAN_LEAK_LOG} "${_leak_log}")
+
   # ---- compile the instrumented build (leak check + ARC guard in one image) -
   # Both instruments answer different questions (a retain without a release vs.
   # a release without a retain) but they read the same program, so one image

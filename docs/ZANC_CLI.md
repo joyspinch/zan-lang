@@ -332,6 +332,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
+| `ZAN_LEAK_LOG` | `--check-leaks` 产物退出时把泄漏报表副本追加到此路径（默认工作目录下 `zan_leaks.log`；设为空串只打印不落盘）。测试驱动指向 `build/test-out/leaks/<用例>.log`，不再污染仓库根 |
 | `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |
 | `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |
 | `ZAN_CO_QUANTUM_MS` | 协程协作式抢占的时间片（毫秒，默认 2，0=关闭）：编译器在 async 函数的每个循环回边埋 `zan_co_poll`，超片的计算密集帧自动重排到队尾，不再饿死定时器/IO 回调/兄弟协程；片长记账走微秒级单调钟（Windows QPC，POSIX CLOCK_MONOTONIC），2ms 就是真 2ms |
@@ -368,6 +369,12 @@ stamp，并发构建会让无关用例成批假红）。
 2. **重新 configure**（`cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`）
    ——GLOB 在 configure 期展开，不重跑 ctest 看不到新用例。
 3. `ctest -R conformance_<name>` 验证。
+
+**泄漏门禁（S10）**：经 `tests/run_case.cmake` 的用例默认追加 `--check-leaks` 编译，
+退出时仍可达对象数必须为 0——泄漏报表从 stdout 尾部切下单独判定，不进金样对账。
+`--publish` / `--no-check-leaks` / `-DLEAK_GATE=OFF` 的用例不设门禁。门禁上线时已有
+的泄漏登记在 `tests/leak_baseline.txt`（按产物名），**只减不增**：登记用例不再泄漏会
+变红，提醒删行；新用例泄漏要修（`weak` 打环、退订、Dispose），不许登记。
 
 ### 模板门配方（tests/run_templates.cmake 实际做的事）
 模板不是"直接编模板树"，而是脚手架后编译：

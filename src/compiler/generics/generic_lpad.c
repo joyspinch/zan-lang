@@ -514,7 +514,20 @@ void emit_leak_report_support(zan_irgen_t *g) {
         "zan: memory leak detected: %lld object(s) still reachable at exit\n");
     LLVMValueRef pargs[] = { msg, live };
     zan_call2(b, g->printf_type, g->fn_printf, pargs, 2, "");
-    LLVMValueRef log_path = zan_irgen_intern_string(g, "zan_leaks.log");
+    /* S10（docs/ZAN_STANDARD.md §3）：报表副本路径可由 ZAN_LEAK_LOG 指定——
+     * 测试驱动以仓库根为工作目录运行，固定的相对路径会把 zan_leaks.log 落进
+     * 根目录（WC §1）。未设置沿用 "zan_leaks.log"；设为空串则 fopen("") 失败，
+     * 等于只打印不落盘。 */
+    LLVMTypeRef getenv_args[1] = { i8p };
+    LLVMTypeRef getenv_type = LLVMFunctionType(i8p, getenv_args, 1, 0);
+    LLVMValueRef fn_getenv = LLVMGetNamedFunction(g->mod, "getenv");
+    if (!fn_getenv) fn_getenv = LLVMAddFunction(g->mod, "getenv", getenv_type);
+    LLVMValueRef env_name = zan_irgen_intern_string(g, "ZAN_LEAK_LOG");
+    LLVMValueRef env_args[1] = { env_name };
+    LLVMValueRef env_path = zan_call2(b, getenv_type, fn_getenv, env_args, 1, "leaklogenv");
+    LLVMValueRef default_path = zan_irgen_intern_string(g, "zan_leaks.log");
+    LLVMValueRef log_path = LLVMBuildSelect(b, LLVMBuildIsNull(b, env_path, "noenv"),
+        default_path, env_path, "leaklogpath");
     LLVMValueRef log_mode = zan_irgen_intern_string(g, "ab");
     LLVMValueRef fo_args[2] = { log_path, log_mode };
     LLVMValueRef log_fh = zan_call2(b, fopen_type, fn_fopen, fo_args, 2, "leaklog");

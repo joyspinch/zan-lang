@@ -32,7 +32,7 @@
 - [ ] B-ID220 ZanIDE 项目配置窗打开停顿。用 `tests/ide/theme_drawer_probe.ps1 -ProjectOverflowOnly` 恢复工程，在窄窗溢出菜单点击「项目配置」。Windows x64 正式发布构建有一次 `UIWATCHDOG stall stage=child-window blocked=246ms`，原始输出见 `build/test-out/ide-theme-drawer/project-overflow/stdout.log`。待区分窗口装配、绑定准备与首帧耗时，定位后复验打开、关闭和重复打开。
 - [ ] B-ID221 ZanIDE 符号导出进程的退出生命周期。工程加载或符号刷新经 `EmitSymbolsDetach` 启动后台编译，`DrainSymbolWorkAsync` 只等待监视器线程。待为发起的导出建立进程归属和退出策略，验证导出在途时关闭 IDE 或切换工程，避免遗留进程或旧结果写回。工程模式探针在清理临时工程前会等待该工程的 worker。
 
-- [~] B-ID222 ZAN_STANDARD P1 地基（`docs/ZAN_STANDARD.md` §1/§3）：S1 `zanc --diag=json` 结构化诊断 + fix-it（第一刀已落地：JSON Lines + E0032 缺分号补丁，钉 `diag_json_fixit`；余更多诊断接 `zan_diag_emit_fix`、结束区间、LSP 携带补丁）；S2 `zanc query`；S3 `--affected`；S4 `--summary`；S5 `zan check`；S10 退出零泄漏门禁（现存泄漏白名单基线、只减不增）；S11 类型图强环检查；S12 事件订阅绑定订阅者生命周期；S13 debug 环诊断。验收：现有 GUI 用例零泄漏；AI 修复循环可完全基于 JSON 诊断。
+- [~] B-ID222 ZAN_STANDARD P1 地基（`docs/ZAN_STANDARD.md` §1/§3）：S1 `zanc --diag=json` 结构化诊断 + fix-it（第一刀已落地：JSON Lines + E0032 缺分号补丁，钉 `diag_json_fixit`；余更多诊断接 `zan_diag_emit_fix`、结束区间、LSP 携带补丁）；S2 `zanc query`；S3 `--affected`；S4 `--summary`；S5 `zan check`；S10 退出零泄漏门禁（已落地：run_case 默认 `--check-leaks` + `ZAN_LEAK_LOG` 收口到 `build/test-out/leaks/`，基线 `tests/leak_baseline.txt` 上线 12 例只减不增；余清零基线）；S11 类型图强环检查；S12 事件订阅绑定订阅者生命周期；S13 debug 环诊断。验收：现有 GUI 用例零泄漏；AI 修复循环可完全基于 JSON 诊断。
 
 ### 批次 3 · 有前置（前置闭了再领）
 
