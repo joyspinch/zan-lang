@@ -10,7 +10,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__has_include)
+#if __has_include(<uchar.h>)
 #include <uchar.h>
+#define ZAN_HAVE_UCHAR_H 1
+#endif
+#endif
+#ifndef ZAN_HAVE_UCHAR_H
+typedef uint_least16_t char16_t; /* Apple libc has no <uchar.h>; C11 defines it so. */
+#endif
 #include <math.h>
 
 typedef int32_t i32;

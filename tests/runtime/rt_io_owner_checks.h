@@ -2,17 +2,13 @@
  * Include once before rt_io.c, then with ZAN_OWNER_CHECKS_IMPLEMENTATION. */
 #ifndef ZAN_OWNER_CHECKS_IMPLEMENTATION
 static void owner_unlocked(void *lock);
-static void owner_incremented(volatile LONG *counter);
+static void owner_wake_claimed(void);
+#define ZAN_CO_WAKE_CLAIMED() owner_wake_claimed()
 static void *owner_watched;
 static int owner_frees;
 static void owner_free(void *ptr) {
     if (ptr && ptr == owner_watched && ++owner_frees != 1) abort();
     free(ptr);
-}
-static LONG owner_increment(volatile LONG *counter) {
-    LONG result = InterlockedIncrement(counter);
-    owner_incremented(counter);
-    return result;
 }
 #if defined(_WIN32)
 static void WINAPI owner_unlock(PSRWLOCK lock) {
@@ -28,12 +24,9 @@ static int owner_unlock(pthread_mutex_t *lock) {
 }
 #define pthread_mutex_unlock owner_unlock
 #endif
-#undef InterlockedIncrement
-#define InterlockedIncrement owner_increment
 #define free owner_free
 #else
 #undef free
-#undef InterlockedIncrement
 #if defined(_WIN32)
 #undef ReleaseSRWLockExclusive
 #else
@@ -93,8 +86,7 @@ static void owner_batch_step(void *frame) {
         __atomic_fetch_or(&h->sched, CO_DEAD, __ATOMIC_RELEASE);
     }
 }
-static void owner_incremented(volatile LONG *counter) {
-    if (counter != &g_co_wake) return;
+static void owner_wake_claimed(void) {
     if (owner_stage == 2) owner_finish_at_barrier();
     if (!owner_batch) return;
     owner_batch = 0; /* co_run may rearm and notify recursively. */
@@ -129,6 +121,7 @@ static void run_dns_owner_case(int stage, int start_failed, int started) {
     if (!started) { g_blocking_queued = owner_job; g_blocking_queued_n = 1; }
     owner_stage = stage; owner_start_failed = start_failed;
     g_co_parked = 1;
+    g_wk[0].parked = 1;
     CHECK(dns_timeout_scan() == 1);
     CHECK(owner_barriers == initial_barriers + (stage != 0));
     CHECK(out == 0 && out64 == 0 && owner_releases == 1);
@@ -147,7 +140,8 @@ static void run_dns_owner_case(int stage, int start_failed, int started) {
     CHECK(owner_steps == initial_steps + 1 && co_all_idle());
     CHECK(co_cnt_outstanding() == 0 && owner_releases == 1);
     owner_watched = NULL; owner_job = NULL;
-    g_co_parked = 0; g_co_wake = 0;
+    g_co_parked = 0;
+    g_wk[0].parked = 0;
 }
 static void run_owner_checks(void) {
     run_dns_owner_case(0, 0, 0);
@@ -174,7 +168,9 @@ static void run_owner_checks(void) {
     CHECK(TlsSetValue(g_co_tls, &g_wk[0]) == 0);
 #endif
     CHECK(co_self() == &g_wk[0]);
-    g_co_parked = 1; g_co_wake = 0; owner_batch = 1;
+    g_co_parked = 1;
+    g_wk[0].parked = 1;
+    owner_batch = 1;
     zan_co_ready_batch(tasks, 4);
     CHECK(owner_batch == 0 && owner_steps == 5 && owner_rearms == 1);
     CHECK(co_load(&g_wk[0].cnt_act) - activity == 10);
@@ -185,7 +181,9 @@ static void run_owner_checks(void) {
 #else
     CHECK(TlsSetValue(g_co_tls, NULL) == 0);
 #endif
-    owner_watched = NULL; g_co_parked = 0; g_co_wake = 0;
+    owner_watched = NULL;
+    g_co_parked = 0;
+    g_wk[0].parked = 0;
     puts("PASS DNS ownership: 7 cases, 4 worker barriers, one free/wake/release each; TLS local batch: delta 4, immediate consume/rearm/free");
 }
 #endif
