@@ -64,4 +64,12 @@ python3 tests/perf/protocols/run_bench.py --only=h2,ws --seconds=5   # 只跑部
   p99 59 → 12.7 ms；8×1 14.9k → 24.8k；1×8 12.0k → 20.7k（4/4 胜）。剩余：8×8 p99 仍为
   单流的 ~20 倍（读循环仍串行）；流量窗口耗尽时两端仍以 `Task.Delay(2)` 轮询（>64 KB 应答）；
   服务端对请求正文 DATA 仍逐帧回两个 WINDOW_UPDATE。
+- **已修（2026-11-23）：协程注册表一把全进程自旋锁。** 与同机 C 参考服务端（每连接一线程、
+  阻塞 IO、OpenSSL，同一 C 客户端压）对比：h1/https 吞吐约为 C 的 1/3、ws 约 55%，每请求
+  CPU 约 7 倍；剖析显示 38% 忙 CPU 在 `zan_task_child/frame_config/retire`——
+  `rt_timer_task.c` 每个协程创建、每次 await 设/清边都拿同一把忙等锁（实测每 HTTP 请求约
+  110 次，近半争用）。改为按帧地址 64 分片、await 边带子帧化身戳（不再维护反向边，退役只删
+  自己），每操作至多持一把分片锁；争用降到 0.2%。同机交替 A/B 3 轮（负载 16–25）：h1 8 连接
+  47k → 64k rps、每请求 CPU 58 → 40 µs；ws 74k → 85k；https 34k → 41k（全胜）。之后的
+  热点是包层逐请求锁：`ServerMetrics.Entered/Left`、`HttpBufferPool.Rent/Return`。
 - **未覆盖**：明文 h2c（`WebApp` 不支持）、HTTP/2 大响应、WSS、数据库/Redis 线协议。

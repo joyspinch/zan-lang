@@ -97,7 +97,7 @@ static void concurrent_queries(void) {
     }
     assert(successful_pins > 0);
     assert(zan_task_live_count() == 0);
-    assert(zan_task_slot_capacity() == 16);
+    assert(zan_task_slot_capacity() <= TASK_SHARDS * 16);
     assert(released == 250001);
 }
 typedef struct { uint64_t marker; test_frame frame; } allocator_frame;
@@ -157,12 +157,12 @@ static void typed_discard(void) {
     zan_task_unpin(observer);
     assert(released == before + 1 && zan_task_live_count() == 0);
     assert(zan_task_acquire(token, 0) == NULL);
-    assert(discarded == 1 && zan_task_slot_capacity() == 16);
+    assert(discarded == 1 && zan_task_slot_capacity() <= TASK_SHARDS * 16);
 }
-/* Indexed lookups (open addressing + free list) and parent back edges: growth
- * across several doublings, deletion inside probe runs, edges to retired
- * children cleared without scanning, the multi-parent fallback, and slot
- * reuse with no further growth. */
+/* Indexed lookups (open addressing + free list) and incarnation-checked edges:
+ * growth across several doublings, deletion inside probe runs, edges to
+ * retired children going stale, two parents naming one child, and slot reuse
+ * with no further growth. */
 static void noop_release(void *frame) { (void)frame; }
 static void reset_cancels(test_frame *frames, int n) {
     for (int i = 0; i < n; ++i) frames[i].cancel = 0;
@@ -200,6 +200,56 @@ static void indexed_edges_and_reuse(void) {
     for (int i = 0; i < N; ++i) zan_task_retire(&frames[i], noop_release);
     assert(zan_task_live_count() == 0);
 }
+/* Scheduler threads hit different shards at once: each thread builds
+ * parent -> child chains whose frames hash to arbitrary shards, cancels some,
+ * re-awaits, and retires, while every check stays per-thread exact. */
+static THREAD_RESULT churn_worker(void *unused) {
+    (void)unused;
+    for (int i = 0; i < 40000; ++i) {
+        test_frame *parent = make_frame(1);
+        test_frame *child = make_frame(2);
+        test_frame *grand = make_frame(3);
+        zan_task_frame_config(parent, &parent->done, &parent->cancel);
+        zan_task_frame_config(child, &child->done, &child->cancel);
+        zan_task_frame_config(grand, &grand->done, &grand->cancel);
+        zan_task_child(parent, child);
+        zan_task_child(child, grand);
+        if (i & 1) {
+            zan_task_frame_cancel(parent);
+            assert(child->cancel == 1 && grand->cancel == 1);
+        } else {
+            assert(child->cancel == 0 && grand->cancel == 0);
+        }
+        zan_task_child(child, NULL);
+        zan_task_retire(grand, release_frame);
+        zan_task_child(parent, NULL);
+        zan_task_retire(child, release_frame);
+        zan_task_retire(parent, release_frame);
+    }
+    THREAD_RETURN;
+}
+static void parallel_churn(void) {
+    int before = __atomic_load_n(&released, __ATOMIC_ACQUIRE);
+    test_thread threads[6];
+    for (int i = 0; i < 6; ++i) {
+#if defined(_WIN32)
+        threads[i] = CreateThread(NULL, 0, churn_worker, NULL, 0, NULL);
+        assert(threads[i]);
+#else
+        assert(pthread_create(&threads[i], NULL, churn_worker, NULL) == 0);
+#endif
+    }
+    for (int i = 0; i < 6; ++i) {
+#if defined(_WIN32)
+        assert(WaitForSingleObject(threads[i], 60000) == WAIT_OBJECT_0);
+        CloseHandle(threads[i]);
+#else
+        assert(pthread_join(threads[i], NULL) == 0);
+#endif
+    }
+    assert(zan_task_live_count() == 0);
+    assert(released == before + 6 * 40000 * 3);
+}
 int main(void) {
     test_frame *frame = make_frame(7);
     uint64_t first = zan_task_register(frame, &frame->done);
@@ -228,12 +278,13 @@ int main(void) {
         zan_task_unpin(pin);
         assert(zan_task_live_count() == 0);
     }
-    assert(zan_task_slot_capacity() == 16);
+    assert(zan_task_slot_capacity() <= TASK_SHARDS * 16);
     assert(released == 100001);
     concurrent_queries();
     typed_discard();
     allocator_provenance();
     indexed_edges_and_reuse();
-    puts("task registry: lifetime, consume, stale generations, bounded slots, four query threads, typed discard, allocator provenance, indexed edges and reuse passed");
+    parallel_churn();
+    puts("task registry: lifetime, consume, stale generations, bounded slots, four query threads, typed discard, allocator provenance, indexed edges and reuse, parallel sharded churn passed");
     return 0;
 }
