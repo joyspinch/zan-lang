@@ -837,6 +837,7 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     free(g->fn_index);
     g->fn_index = NULL;
     g->fn_index_cap = 0;
+    refl_inst_index_free(g);
     free(g->struct_types);
     g->struct_types = NULL;
     g->struct_type_count = g->struct_type_cap = 0;

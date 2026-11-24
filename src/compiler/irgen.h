@@ -489,6 +489,7 @@ struct zan_irgen {
      * emission may split a large module across threads (codegen_split.h).
      * The extra partition objects are listed here for the linker. */
     bool split_codegen_ok;
+    struct refl_inst_index *refl_inst_index; /* reflect_fields.c, lazily built */
     char **split_objs;
     int split_obj_count;
     bool         publish_instance_prune; /* closed-world instance callable roots */

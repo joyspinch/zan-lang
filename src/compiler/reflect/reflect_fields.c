@@ -518,32 +518,133 @@ bool refl_ctor_needs_thunk(zan_irgen_t *g) {
     return !g->closed_world || g->emit_lib || g->refl_ctor_used;
 }
 
+/* Incremental instance index for refl_owner_can_have_instance. The predicate
+ * is asked for every method of every reflected class on every emission
+ * fixed-point round; rescanning all allocation sites and all class base chains
+ * per question was quadratic and took 3.6 s of a small Gui test's 8 s irgen
+ * once plain builds adopted closed-world reflection. Sites and struct types
+ * only ever grow, so fold each new one in once. */
+typedef struct {
+    zan_symbol_t *sym;
+    bool has_site; /* some allocation site is this class or derives from it */
+    bool vt_store; /* a derived vtable was seen stored into an object */
+    int *derived; /* struct_types indices whose base chain includes sym */
+    int nderived, cap;
+} refl_inst_entry_t;
+
+struct refl_inst_index {
+    refl_inst_entry_t *slots;
+    int cap, count;
+    int sites_seen, structs_seen;
+    bool deep_site; /* a site's base chain exceeded the walk limit */
+};
+
+static refl_inst_entry_t *refl_inst_entry(refl_inst_index_t *ix, zan_symbol_t *sym) {
+    if (ix->count * 2 >= ix->cap) {
+        int ncap = ix->cap ? ix->cap * 2 : 256;
+        refl_inst_entry_t *ns = (refl_inst_entry_t *)calloc((size_t)ncap, sizeof(*ns));
+        if (!ns) return NULL;
+        for (int i = 0; i < ix->cap; i++) {
+            if (!ix->slots[i].sym) continue;
+            size_t h = ((uintptr_t)ix->slots[i].sym >> 4) & (size_t)(ncap - 1);
+            while (ns[h].sym) h = (h + 1) & (size_t)(ncap - 1);
+            ns[h] = ix->slots[i];
+        }
+        free(ix->slots);
+        ix->slots = ns;
+        ix->cap = ncap;
+    }
+    size_t h = ((uintptr_t)sym >> 4) & (size_t)(ix->cap - 1);
+    while (ix->slots[h].sym && ix->slots[h].sym != sym) h = (h + 1) & (size_t)(ix->cap - 1);
+    if (!ix->slots[h].sym) {
+        ix->slots[h].sym = sym;
+        ix->count++;
+    }
+    return &ix->slots[h];
+}
+
+static refl_inst_entry_t *refl_inst_find(refl_inst_index_t *ix, zan_symbol_t *sym) {
+    if (!ix->cap) return NULL;
+    size_t h = ((uintptr_t)sym >> 4) & (size_t)(ix->cap - 1);
+    while (ix->slots[h].sym) {
+        if (ix->slots[h].sym == sym) return &ix->slots[h];
+        h = (h + 1) & (size_t)(ix->cap - 1);
+    }
+    return NULL;
+}
+
+void refl_inst_index_free(zan_irgen_t *g) {
+    refl_inst_index_t *ix = g->refl_inst_index;
+    if (!ix) return;
+    for (int i = 0; i < ix->cap; i++) free(ix->slots[i].derived);
+    free(ix->slots);
+    free(ix);
+    g->refl_inst_index = NULL;
+}
+
+/* Returns false on allocation failure (callers then answer conservatively). */
+static bool refl_inst_index_update(zan_irgen_t *g) {
+    refl_inst_index_t *ix = g->refl_inst_index;
+    if (!ix) {
+        ix = (refl_inst_index_t *)calloc(1, sizeof(*ix));
+        if (!ix) return false;
+        ix->sites_seen = 1; /* site 0 is the sentinel */
+        g->refl_inst_index = ix;
+    }
+    for (; ix->sites_seen < g->leak_site_count; ix->sites_seen++) {
+        zan_symbol_t *sym = g->site_syms ? g->site_syms[ix->sites_seen] : NULL;
+        zan_type_t *type = sym ? sym->type : NULL;
+        int depth = 0;
+        for (; type && type->sym && depth < 32; type = type->base_type, depth++) {
+            refl_inst_entry_t *e = refl_inst_entry(ix, type->sym);
+            if (!e) return false;
+            e->has_site = true;
+        }
+        if (depth == 32 && type) ix->deep_site = true;
+    }
+    for (; ix->structs_seen < g->struct_type_count; ix->structs_seen++) {
+        zan_symbol_t *sym = g->struct_types[ix->structs_seen].sym;
+        zan_type_t *type = sym ? sym->type : NULL;
+        for (int depth = 0; type && depth < 32; type = type->base_type, depth++) {
+            if (!type->sym) continue;
+            refl_inst_entry_t *e = refl_inst_entry(ix, type->sym);
+            if (!e) return false;
+            if (e->nderived && e->derived[e->nderived - 1] == ix->structs_seen) continue;
+            if (e->nderived == e->cap) {
+                int ncap = e->cap ? e->cap * 2 : 4;
+                int *nd = (int *)realloc(e->derived, (size_t)ncap * sizeof(int));
+                if (!nd) return false;
+                e->derived = nd;
+                e->cap = ncap;
+            }
+            e->derived[e->nderived++] = ix->structs_seen;
+        }
+    }
+    return true;
+}
+
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
     if (!g->publish_instance_prune || !owner || !owner->type || owner->type->kind != TYPE_CLASS ||
         refl_ctor_needs_thunk(g))
         return true;
+    if (!refl_inst_index_update(g)) return true;
+    refl_inst_index_t *ix = g->refl_inst_index;
     /* Recursive field metadata describes types without creating their objects.
      * A derived allocation can still receive methods declared on this owner. */
-    for (int i = 1; i < g->leak_site_count; i++) {
-        zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
-        zan_type_t *type = sym ? sym->type : NULL;
-        int depth = 0;
-        for (; type && type->sym && depth < 32; type = type->base_type, depth++) {
-            if (type->sym == owner) return true;
-        }
-        if (depth == 32 && type) return true;
-    }
+    if (ix->deep_site) return true;
+    refl_inst_entry_t *e = refl_inst_find(ix, owner);
+    if (!e) return false;
+    if (e->has_site || e->vt_store) return true;
     /* Runtime guard exceptions have site 0, but their vtable is stored into a
-     * real object. Metadata and interface tag comparisons do not make stores. */
-    for (int i = 0; i < g->struct_type_count; i++) {
-        zan_symbol_t *sym = g->struct_types[i].sym;
-        zan_type_t *type = sym ? sym->type : NULL;
-        for (int depth = 0; type && depth < 32; type = type->base_type, depth++) {
-            if (type->sym != owner) continue;
-            char name[320];
-            snprintf(name, sizeof(name), "__zan_vtable_%.*s", (int)sym->name.len, sym->name.str);
-            if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, name), 0)) return true;
-            break;
+     * real object. Metadata and interface tag comparisons do not make stores.
+     * Stores appear as code is emitted, so a miss is re-checked next time. */
+    for (int i = 0; i < e->nderived; i++) {
+        zan_symbol_t *sym = g->struct_types[e->derived[i]].sym;
+        char name[320];
+        snprintf(name, sizeof(name), "__zan_vtable_%.*s", (int)sym->name.len, sym->name.str);
+        if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, name), 0)) {
+            e->vt_store = true;
+            return true;
         }
     }
     return false;

@@ -360,9 +360,26 @@ done:
      * initialization demand. These bodies cannot add startup roots. */
     if (diag_unused_bodies && !zan_diag_has_errors(g->diag)) {
         unsigned char *diagnostic_live = (unsigned char *)calloc((size_t)work_count + 1, 1);
+        /* Unreached library methods (stdlib and packages/) are not generated
+         * just for diagnostics: the library's own builds and tests cover
+         * them, and every program that pulls a package in paid for it again
+         * (a small Gui test spent 11 of its 24 s here). User code is still
+         * fully diagnosed. ZAN_DIAG_LIB_BODIES=1 restores library coverage. */
+        const char *diag_lib_env = getenv("ZAN_DIAG_LIB_BODIES");
+        bool diag_lib = diag_lib_env && strcmp(diag_lib_env, "1") == 0;
         for (int w = 0; w < work_count; w++) {
-            if (live[w]) diagnostic_live[w] = 2;
-            else if (!sinit_is_cctor(work[w].member)) diagnostic_live[w] = 1;
+            if (live[w]) {
+                diagnostic_live[w] = 2;
+                continue;
+            }
+            if (sinit_is_cctor(work[w].member)) continue;
+            zan_ast_node_t *owner = work[w].type_sym ? work[w].type_sym->decl : NULL;
+            /* Only when the body would be dropped afterwards anyway: -g and
+             * other full builds keep these bodies (live = 3) for reflection. */
+            if (prune_stdlib_bodies && !diag_lib && owner &&
+                (owner->from_stdlib || owner->from_package))
+                continue;
+            diagnostic_live[w] = 1;
         }
         emit_demanded_method_bodies(g, work, work_count, diagnostic_live);
         emit_pending_method_specs(g);

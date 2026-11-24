@@ -865,6 +865,8 @@ bool refl_is_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
 bool refl_is_exact_html_handler_name(zan_irgen_t *g, const char *s, size_t n);
 bool refl_ctor_needs_thunk(zan_irgen_t *g);
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
+typedef struct refl_inst_index refl_inst_index_t;
+void refl_inst_index_free(zan_irgen_t *g);
 void refl_collect_literal_names(zan_irgen_t *g, zan_ast_node_t *unit);
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl);
