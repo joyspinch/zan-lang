@@ -7506,6 +7506,17 @@ add_test(NAME policy_control_factory
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_control_factory.cmake)
 
+# ---- Policy: packages/ dependency graph (WC §14) ----
+# zan.pkg declares no dependencies, so the graph is rebuilt from `using`
+# (type-level resolution for shared namespaces): no cycles between packages,
+# and the foundation layer (IO/Text/Json/Security/Diagnostics/Linq/Testing)
+# may only depend on itself. The pre-commit hook runs the same script.
+if(ZAN_PYTHON_EXE)
+  add_test(NAME policy_package_deps
+    COMMAND ${ZAN_PYTHON_EXE} -I -B ${CMAKE_SOURCE_DIR}/scripts/package_deps_check.py
+      --root ${CMAKE_SOURCE_DIR})
+endif()
+
 # ---- Policy: widget draw paths must not gain direct semantic-color reads ----
 # Colors belong to the style layer (base.css + Style/StyleBox/Fx); each direct
 # `t.<color>` read in a draw path is frozen CSS debt with a per-file budget

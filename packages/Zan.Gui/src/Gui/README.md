@@ -45,6 +45,14 @@ GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按
 | **`Gui.Component`** (`src/Gui/Component/`) | **高级业务组件**。具备独立状态机、复杂视口与重型交互的高级控件与视图。 | `TreeView`, `BandGrid`, `FilePicker`, `GraphView` |
 | **`Gui.Backend`** (`src/Gui/Backend/`) | **底层图形后端适配**。对接 Windows GDI/DirectWrite、Software Rasterizer 等本地驱动。 | `GdiBackend`, `SoftwareBackend` |
 
+命名空间 `Gui` 内部按层摆目录（目录只表层级、不改命名空间；依赖只许向下，
+机检见 `scripts/gui_layer_rules.py`）：`src/Gui/` 根放几何与窗口形状基元
+（`Point`/`Rect`/`Size`/`Insets`/`Cursor`/`WindowShape*`）→ `Backend` → `Rendering`/`Text`/`Media`
+→ `Styling`/`Layout` → `Core`（控件树、App 主循环、`WindowRoot`/`ChildWindowBase` 契约）
+→ `Binding`（`ModelBinder`、`DocWire`、`UiViewScope`）→ `Widget` → `Component` → `Markup`
+（含 `HtmlDocs` 文档查找）→ `Forms`（`Form`、`ChildWindow`、`Nav`/`NavWindow`）。
+`Testing`（`UiDriver`、`UiProbe`）是旁路层：可依赖任何层，任何层不得依赖它。
+
 数据绑定走两条正道：HTML 窗口用 `data-bind`（ModelBinder），代码侧用
 `Binding<T> data` 字段（`stdlib/System/Binding.zan`）。`Signal*` 只是控件内部
 状态缓冲，不是对外绑定协议；本包不存在 `Gui.Reactive`/`Gui.Designer` 命名空间。

@@ -322,6 +322,12 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
   + `ZAN_GUI_BASELINE_RAISE=1` + 提交说明写明理由），再提代码；Zan.Gui 之外的
   测试夹具新建 `Signal*`、App 仲裁调用同样要进基线。基线按文件逐个补，
   用 `python scripts/check_code_standards.py --staged` 一次扫全违规再批量 update。
+- **Zan.Gui 按层摆目录（B-ID172 ②，2026-11-23）**：`src/Gui/` 下第一段目录即层（根=几何/窗口形状基元 <
+  Backend < Rendering/Text/Media < Styling/Layout < Core < Binding/Animation < Widget < Component < Markup < Forms；
+  Testing 旁路），命名空间仍是 `Gui`。下层要用上层类型时**倒置成 Core 契约**而不是挪基线：
+  Control 只认 `WindowRoot`（Form 继承）、`ChildWindows` 只认 `ChildWindowBase`、文档查找用 Markup 层
+  `HtmlDocs.Read/Find`（原 `Form.ReadDoc/FindDoc`）。挪文件后对新旧路径一起 `--update` 重键基线；
+  先用依赖闭包算"移过去零新增违规"的最大集合再动手。
 - **PascalCase 门禁对 `op_*` 是已证实误报**：`op_add/op_sub` 是编译器脱糖生成的
   运算符重载固定命名（`src/selfhost/frontend/parser_desugar.zan:175-181` 由编译器
   自己生成同名方法），`check_code_standards.py` 豁免表只有 `operator` 关键字。

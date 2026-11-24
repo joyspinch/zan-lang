@@ -6,7 +6,7 @@ using Gui.Backend;
 namespace Gui;
 
 public class ChildWindows {
-    static List<ChildWindow> wins;
+    static List<ChildWindowBase> wins;
     static IModalWindow picker;
     // 最近一次已路由的事件序号与结果（`RouteEvent` 幂等）。标准循环
     // `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
@@ -66,7 +66,7 @@ public class ChildWindows {
 
     // 子窗渲染耗时记账 + 超阈值告警。告警格式与 UiWatchdog 一致，
     // 同一套 grep 规则就能把"谁把帧堵死了"捞出来。
-    static void ReportRenderCost(ChildWindow w, int ms) {
+    static void ReportRenderCost(ChildWindowBase w, int ms) {
         ChildWindows.lastRenderMs = ms;
         int warn = ChildWindows.slowRenderWarnMs;
         if (warn <= 0 || ms < warn) { return; }
@@ -80,18 +80,18 @@ public class ChildWindows {
     }
 
     // 注册表（惰性创建）。
-    static List<ChildWindow> All() {
+    static List<ChildWindowBase> All() {
         if (ChildWindows.wins == null) {
-            ChildWindows.wins = new List<ChildWindow>();
+            ChildWindows.wins = new List<ChildWindowBase>();
         }
         return ChildWindows.wins;
     }
 
     // 把窗口加入主循环驱动队列（OpenHost 自动调用）。
-    static void Register(ChildWindow w) {
+    static void Register(ChildWindowBase w) {
         if (!ChildWindows.All().Contains(w)) {
-            List<ChildWindow> next = new List<ChildWindow>();
-            foreach (ChildWindow current in ChildWindows.All()) { next.Add(current); }
+            List<ChildWindowBase> next = new List<ChildWindowBase>();
+            foreach (ChildWindowBase current in ChildWindows.All()) { next.Add(current); }
             next.Add(w);
             ChildWindows.wins = next;
         }
@@ -102,7 +102,7 @@ public class ChildWindows {
     // 设置窗回报语言变更时调用一次（lang 为 "zh"/"en" 语言码）；
     // 之后开的新窗口自然用新语言。
     static void ApplyLanguage(string lang) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (!w.IsOpen()) { continue; }
             w.OnLanguageChanged(lang);
             if (w.host != null) { w.host.SetWindowTitle(w.Title()); }
@@ -126,9 +126,9 @@ public class ChildWindows {
     }
 
     static void Prune() {
-        List<ChildWindow> all = ChildWindows.All();
-        List<ChildWindow> keep = new List<ChildWindow>();
-        foreach (ChildWindow w in all) {
+        List<ChildWindowBase> all = ChildWindows.All();
+        List<ChildWindowBase> keep = new List<ChildWindowBase>();
+        foreach (ChildWindowBase w in all) {
             if (w.IsOpen()) { keep.Add(w); }
             else { w.Teardown(); }
         }
@@ -137,7 +137,7 @@ public class ChildWindows {
 
     // 是否还有开着的子窗口。
     static bool AnyOpen() {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.IsOpen()) { return true; }
         }
         return false;
@@ -145,7 +145,7 @@ public class ChildWindows {
 
     // instead of blocking).
     static bool Wants() {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.NeedsRedraw()) { return true; }
         }
         if (ChildWindows.AnyPickerWants()) { return true; }
@@ -181,7 +181,7 @@ public class ChildWindows {
     // Register and Prune replace the registry rather than mutate active views.
     // Local references therefore remain stable across lifecycle callbacks.
     static App LoopRoot(App app) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != app || child.parentApp == null) { continue; }
             return ChildWindows.LoopRoot(child.parentApp);
         }
@@ -190,7 +190,7 @@ public class ChildWindows {
 
     // Loop service is independent of paint budget and BeginFrame wake clearing.
     static int LoopDeadline(App parent, int deadline) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.parentApp != parent) { continue; }
             int due = child.host.MinLoopDeadline();
             due = ChildWindows.LoopDeadline(child.host, due);
@@ -200,7 +200,7 @@ public class ChildWindows {
     }
 
     static void WakeLoopParent(App childApp) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != childApp) { continue; }
             App parent = child.parentApp;
             if (parent != null) { parent.WakeLoopParticipants(); }
@@ -209,8 +209,8 @@ public class ChildWindows {
     }
 
     static void ServiceLoopParticipants(App parent, int turn, int now) {
-        List<ChildWindow> snapshot = ChildWindows.All();
-        foreach (ChildWindow child in snapshot) {
+        List<ChildWindowBase> snapshot = ChildWindows.All();
+        foreach (ChildWindowBase child in snapshot) {
             if (!child.IsOpen() || child.parentApp != parent) { continue; }
             child.host.SyncSurface();
             child.host.DrainPosts();
@@ -221,7 +221,7 @@ public class ChildWindows {
     }
 
     static int Deadline(int deadline) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             int a = w.AnimNextMs();
             if (a >= 0 && (deadline < 0 || a < deadline)) { deadline = a; }
             int f = w.FxNextMs();
@@ -264,7 +264,7 @@ public class ChildWindows {
 
     static bool TickDue(int now) {
         bool due = false;
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.TickInputGestures();
             int a = w.AnimNextMs();
             int f = w.FxNextMs();
@@ -285,7 +285,7 @@ public class ChildWindows {
         if (seq == ChildWindows.routedSeq) { return ChildWindows.routedHandled; }
         ChildWindows.routedSeq = seq;
         ChildWindows.routedHandled = false;
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.ApplyEvent(hwnd);
                 ChildWindows.routedHandled = true;
@@ -324,7 +324,7 @@ public class ChildWindows {
     }
 
     static bool PaintForResize(nint hwnd) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.host.SyncSurface();
                 w.Render();
@@ -362,7 +362,7 @@ public class ChildWindows {
     // 预算只约束"这一帧画多少个子窗"，切不开单个子窗自己的渲染——
     // 单个子窗就慢到 3 秒的情形由耗时告警点名（ReportRenderCost）。
     static void PumpChildren() {
-        List<ChildWindow> all = ChildWindows.All();
+        List<ChildWindowBase> all = ChildWindows.All();
         int n = all.Count;
         ChildWindows.lastDeferred = 0;
         if (n == 0) { return; }
@@ -375,14 +375,14 @@ public class ChildWindows {
         bool deferred = false;
         for (int k = 0; k < n; k = k + 1) {
             int i = (start + k) % n;
-            ChildWindow w = all[i];
+            ChildWindowBase w = all[i];
             if (w == null || !w.IsOpen()) { continue; }
             if (budgetUs > 0 && spentUs >= budgetUs) {
                 // 预算用尽：剩下的子窗留给下一帧，从当前这个接着画。
                 ChildWindows.renderCursor = i;
                 int left = 0;
                 for (int j = k; j < n; j = j + 1) {
-                    ChildWindow rest = all[(start + j) % n];
+                    ChildWindowBase rest = all[(start + j) % n];
                     if (rest != null && rest.IsOpen()) { left = left + 1; }
                 }
                 ChildWindows.lastDeferred = left;
@@ -426,31 +426,31 @@ public class ChildWindows {
 
     // 主窗口换肤时同步每个开着的子窗口。
     static void FollowSkin(int i) {
-        foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
+        foreach (ChildWindowBase w in ChildWindows.All()) { w.FollowSkin(i); }
     }
 
     // 主窗口调整不透明度时同步每个开着的子窗口。
     static void FollowOpacity(int percent) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowOpacity(percent);
         }
     }
 
     // 把主窗口当前的标题提示文案推给每个开着的副窗口。
     static void FollowCaptionTips(App main) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowCaptionTips(main);
         }
     }
 
     // 主窗口更换用户壁纸时同步每个开着的子窗口。
     static void FollowWallpaper(string path, int opacity) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowWallpaper(path, opacity);
         }
     }
 
     static void RequestRedrawAll() {
-        foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
+        foreach (ChildWindowBase w in ChildWindows.All()) { w.RequestRedraw(); }
     }
 }

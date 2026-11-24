@@ -39,6 +39,7 @@ Control/PropSpec 基类，并行必冲突）。
 | 4a ✅ | `Control.RequestRedraw()` 收拢 23 处「找宿主再判空重绘」样板；主题设置抽屉从 App 拆为 `ThemeMenuService`（`App.ThemeMenu`），App 去掉 6 个方法与 1 个字段。Automation 已是可插拔会话，无需拆 | — |
 | 4b ✅ | Diagnostics 拆分：60 个帧统计字段与 11 个统计方法移入 `FrameStats`（`App.Stats`，GuiFrameProfiler/UiDriver 改读 `app.Stats.*`）；绘制指纹全局累加器移入静态类 `PaintHash`（`App.PaintHash*` → `PaintHash.Op/Text/BeginScope/Restore…`，App 只留按控件比较的 `CommitPaintHash`；删除无调用方的旧栈式 `PaintHashBegin`）。App.Glass 实为渲染脏区跟踪、Skinning 为主题核心，与主循环强耦合，暂不拆 | ~100 个 App 成员 |
 | B-ID172 ① ✅ | 控件目录编译期合成：`__ZanControlCatalog`（继承 Gui.Control、public、可无参构造的类按类名入目录）、`[ControlKind(Name/Factory/Of)]`、zan.pkg `catalog` 声明式拉入（只认被 `using` 的命名空间、只拉声明包自己的文件）；删除三个 Bootstrap 注册梯子与仓内全部 `Install()` 调用；`ControlFactory.Require` | 3 个注册类、~60 处调用 |
+| B-ID172 ② ✅ | 按层摆目录（命名空间不变）：几何/窗口形状基元 → `src/Gui` 根；`Form`/`ChildWindow`/`Nav*` → `Forms/`；`ModelBinder`/`DocWire`/`UiViewScope` 族与绑定记录 → `Binding/`；`UiDriver`/`UiProbe` → `Testing/`。先倒置下行依赖：Core 新增 `WindowRoot`（Form 继承，Control 的 `FindForm`/`HostForm`/`OnHostForm` 与 Panel 只认它）与 `ChildWindowBase`（`ChildWindows` 注册表只经它驱动）；`Form.ReadDoc`/`FindDoc` 迁为 Markup 层 `HtmlDocs.Read`/`Find`（仓内调用方全部改）；`NavEnterHandler` 随 NavWindow。层级机检零新增违规，超基线项 62→51 | 36 个文件移动 |
 | 4 | App 服务化：Automation/Glass/ThemeDrawer/Offscreen/Diagnostics 抽成服务；控件经 `this.RequestRedraw()` 而非 `FindApp().RequestRedraw()` | App 146 个方法 |
 | 5 | Control 组件化：滚动、命中测试、布局检查等能力拆为可挂载组件 | Control 176 个方法 |
 

@@ -188,3 +188,27 @@ gate_check_unity_order() {
     "$_guo_py" "$_guo_script" --root "$_guo_top" >&2 || return 1
     return 0
 }
+
+gate_check_package_deps() {
+    _gpd_py=""
+    if command -v python3 >/dev/null 2>&1; then
+        _gpd_py="python3"
+    elif command -v python >/dev/null 2>&1; then
+        _gpd_py="python"
+    fi
+    if [ -z "$_gpd_py" ]; then
+        return 0
+    fi
+    _gpd_top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    _gpd_script="$_gpd_top/scripts/package_deps_check.py"
+    if [ ! -f "$_gpd_script" ]; then
+        return 0
+    fi
+    # 只有触及 packages/ 下 .zan 的提交才重建包依赖图（约 1 秒）。
+    if ! git diff --cached --name-only -- packages 2>/dev/null |
+         grep -q '\.zan$'; then
+        return 0
+    fi
+    "$_gpd_py" -I -B "$_gpd_script" --root "$_gpd_top" >&2 || return 1
+    return 0
+}

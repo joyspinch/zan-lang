@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace Gui;
+
+// 界面文档查找：窗口类按"类名 ↔ 同名 .html"约定装载（Find），
+// HTML include 与按路径装载（Read）同源。内嵌 VFS（发布态）优先，
+// 退回工作目录与磁盘 src 树（开发态）。
+public static class HtmlDocs {
+    // 类名 ↔ 同目录同名 .html：内嵌 VFS 命中即用（发布态权威），退回
+    // 工作目录裸名、磁盘 src 树（开发态）；大小写不敏感 basename 匹配，
+    // 命中多份取大小写精确者，仍不唯一就列候选 fail-fast。
+    public static string Find(string cls) {
+        List<string> names = new List<string>();
+        List<string> emb = File.EmbeddedNames("");
+        if (emb != null) {
+            for (int i = 0; i < emb.Count; i++) {
+                string n = emb[i];
+                if (n.EndsWith(".html") && !names.Contains(n)) { names.Add(n); }
+            }
+        }
+        string exact = "";
+        List<string> hits = new List<string>();
+        for (int i = 0; i < names.Count; i++) {
+            string baseName = HtmlDocs.Basename(names[i]);
+            if (baseName == cls) { exact = names[i]; break; }
+            if (baseName.ToLower() == cls.ToLower()) { hits.Add(names[i]); }
+        }
+        if (exact != "") { return HtmlDocs.Read(exact); }
+        if (hits.Count == 1) { return HtmlDocs.Read(hits[0]); }
+        if (hits.Count > 1) {
+            string list = "";
+            for (int i = 0; i < hits.Count; i++) {
+                list = list + (i > 0 ? ", " : "") + hits[i];
+            }
+            Console.WriteLine("WINDOW: multiple docs match class '" + cls +
+                              "': " + list);
+            Environment.Exit(1);
+        }
+        if (hits.Count == 0) {
+            // 开发态散盘：工作目录裸名，再扫工程 src 树。
+            string local = cls + ".html";
+            string lower = cls.ToLower() + ".html";
+            if (HtmlDocs.ReadText(local) != null) { return HtmlDocs.Read(local); }
+            if (HtmlDocs.ReadText(lower) != null) { return HtmlDocs.Read(lower); }
+            HtmlDocs.CollectDisk("src", names);
+            if (names.Count == 0) { HtmlDocs.CollectDisk("../src", names); }
+            for (int i = 0; i < names.Count; i++) {
+                string baseName = HtmlDocs.Basename(names[i]);
+                if (baseName == cls) { exact = names[i]; break; }
+                if (baseName.ToLower() == cls.ToLower()) { hits.Add(names[i]); }
+            }
+            if (exact != "") { return HtmlDocs.Read(exact); }
+            if (hits.Count == 1) { return HtmlDocs.Read(hits[0]); }
+        }
+        return null;
+    }
+
+    public static string Read(string rel) {
+        string html = HtmlDocs.ReadText(rel);
+        if (html != null) { return html; }
+        string bare = rel;
+        int slash = bare.LastIndexOf("/");
+        if (slash >= 0) { bare = bare.Substring(slash + 1); }
+        html = HtmlDocs.ReadText(bare);
+        if (html != null) { return html; }
+        string hit = HtmlDocs.FindInTree("src", bare);
+        if (hit == null) { hit = HtmlDocs.FindInTree("../src", bare); }
+        return hit;
+    }
+
+    static string FindInTree(string dir, string target) {
+        try {
+            if (!Directory.Exists(dir)) { return null; }
+            List<string> files = Directory.GetFiles(dir);
+            for (int i = 0; files != null && i < files.Count; i++) {
+                string f = files[i];
+                int slash = f.LastIndexOf("/");
+                int bs = f.LastIndexOf("\\");
+                if (bs > slash) { slash = bs; }
+                if (slash >= 0 && f.Substring(slash + 1) == target) {
+                    return HtmlDocs.ReadText(f);
+                }
+            }
+            List<string> subdirs = Directory.GetDirectories(dir);
+            for (int i = 0; subdirs != null && i < subdirs.Count; i++) {
+                string hit = HtmlDocs.FindInTree(dir + "/" + subdirs[i], target);
+                if (hit != null) { return hit; }
+            }
+        } catch (Exception _ex) {
+            // 扫描目录权限异常或路径失效，跳过并返回 null
+        }
+        return null;
+    }
+
+    static void CollectDisk(string dir, List<string> names) {
+        try {
+            if (!Directory.Exists(dir)) { return; }
+            List<string> files = Directory.GetFiles(dir);
+            for (int i = 0; files != null && i < files.Count; i++) {
+                string f = files[i].Replace("\\", "/");
+                if (f.EndsWith(".html") && !names.Contains(f)) { names.Add(f); }
+            }
+            // Directory.GetDirectories 返回裸目录名（stdlib 刻意口径，见
+            // Skin.zan 同款处理）：递归必须手动拼回父路径，否则子目录
+            // 永远按 CWD 相对名解析失败——开发态（plain 构建）设计稿
+            // 扫描因此只在 src 顶层生效，Forms/** 全部漏采。
+            List<string> subdirs = Directory.GetDirectories(dir);
+            for (int i = 0; subdirs != null && i < subdirs.Count; i++) {
+                string leaf = subdirs[i];
+                if (leaf == "bin" || leaf == "obj" || leaf == "tools" ||
+                    leaf == "assets" || leaf == ".build") { continue; }
+                HtmlDocs.CollectDisk(dir + "/" + leaf, names);
+            }
+        } catch (Exception _ex) {
+            // 收集磁盘设计稿目录权限异常，中断本层扫描
+        }
+    }
+
+    static string ReadText(string rel) {
+        try {
+            if (File.Exists(rel)) { return File.ReadAllText(rel); }
+        } catch (Exception _ex) {
+            // 读取文件异常回退到 null
+        }
+        return null;
+    }
+
+    static string Basename(string path) {
+        string s = path.Replace("\\", "/");
+        int slash = s.LastIndexOf("/");
+        if (slash >= 0) { s = s.Substring(slash + 1); }
+        int dot = s.LastIndexOf(".");
+        if (dot > 0) { s = s.Substring(0, dot); }
+        return s;
+    }
+}
