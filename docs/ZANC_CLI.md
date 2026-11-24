@@ -161,6 +161,39 @@ ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点�
 file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
 trace 的事件序为准，不要顺着报表的站点名硬找。
 
+### 1.6 机器可读诊断（`--diag=json`）
+
+给 AI agent 与工具用的诊断通道（`docs/ZAN_STANDARD.md` S1）。stderr 只输出
+JSON Lines，每行一个对象；文本格式（默认）不受影响、逐字节不变。
+
+```bash
+build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag.jsonl
+```
+
+实际输出（每个对象一行，此处为可读性折行）：
+
+```json
+{"kind":"diagnostic","severity":"error","code":"E0032","message":"expected ';', got 'int'",
+ "file":"tests/diag/diag_json_missing_semicolon.zan","line":9,"col":9,"offset":338,
+ "fixits":[{"file":"tests/diag/diag_json_missing_semicolon.zan","line":8,"col":18,"offset":329,"length":0,"text":";"}]}
+{"kind":"summary","errors":1,"warnings":0,"suppressed":0}
+```
+
+字段契约：
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | `diagnostic` / `summary`；消费方遇到未知 `kind` 应忽略（向前兼容） |
+| `severity` | `error` / `warning` / `note`；被 `--deny-warnings` 升级的告警为 `error` |
+| `code` | 诊断编号如 `E0032` / `W2072`，字母按**发射时**级别；未编号为 `null` |
+| `message` | 不含 `[E####]` 前缀的消息正文 |
+| `file` `line` `col` `offset` | 位置：`line`/`col` 1 起，**`col` 按字节计**；`offset` 0 起字节偏移 |
+| `fixits[]` | 机器可应用补丁：把 `[offset, offset+length)` 字节替换为 `text`，`length = 0` 即插入；可能为空数组 |
+| summary `errors` `warnings` `suppressed` | 计数；`suppressed` = 错误上限与单行级联帽丢弃的条数；进程退出前输出 |
+
+当前带 fix-it 的诊断：E0032 缺 `;`（插在上一个 token 末尾；上一个 token 是
+字符串或运算符等量不出长度时不给补丁）。退出码语义与文本格式相同。
+
 ## 2. 全参数表（与 `zanc --help` 同源）
 
 > 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。
@@ -225,6 +258,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
 | `--warn-level <none\|default\|error>` | `default` | `none` 不打印警告；`default` 正常；`error` 等同 `--deny-warnings`；非法值报错退出 2 |
 | `--suppress <list>` | — | 按编号抑制**警告**（逗号/空格分隔，字母前缀可省，如 `W0003,0003`）；与 `--deny-warnings`/`--warn-level=error` 同用时警告已升级为错误，不再被抑制 |
+| `--diag <text\|json>` | `text` | 编译期诊断输出格式。`json` 为 JSON Lines（字段契约见 §1.6），供 AI/工具直接消费；非法值报错退出 2。钉：`diag_json_fixit` |
 | `--dump-tokens` | — | 词法 token 后退出 |
 | `--dump-ast` | — | 打印语法树后继续编译 |
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |

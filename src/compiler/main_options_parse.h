@@ -58,6 +58,7 @@ typedef struct zan_options {
     bool do_deny_warnings;
     const char *warn_level_arg;
     const char *suppress_arg;
+    const char *diag_format_arg; /* S1 --diag=text|json */
     zan_pkg_scope_t package_scope;
     int opt_level;
     const char *pp_defines[ZAN_MAX_PP_DEFINES];

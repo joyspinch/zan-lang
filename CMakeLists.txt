@@ -1836,6 +1836,19 @@ add_test(NAME diag_method_group_signature_mismatch
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_signature_mismatch PROPERTIES TIMEOUT 60)
 
+# S1（docs/ZAN_STANDARD.md §1）：--diag=json 契约——纯 JSON Lines、E0032 位置、
+# 缺分号 fix-it 坐标，且把补丁按 offset 应用回源码后必须能编译通过。
+add_test(NAME diag_json_fixit
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/diag_json_missing_semicolon.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_json_fixit${_exe_ext}
+    -DFIXED_SRC=${CMAKE_BINARY_DIR}/test-out/diag_json_fixit/fixed.zan
+    -DEXPECT_CODE=E0032 -DEXPECT_LINE=9 -DEXPECT_COL=9
+    -DEXPECT_FIX_LINE=8 -DEXPECT_FIX_COL=18 -DEXPECT_FIX_TEXT_ASCII=59
+    -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
+set_tests_properties(diag_json_fixit PROPERTIES TIMEOUT 120)
+
 # Target-typed overload selection rejects invalid receiver forms and signatures.
 foreach(_selected_case receiver signature)
   set(_selected_error_count 3)

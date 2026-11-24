@@ -20,6 +20,7 @@ zan_diag_t *zan_diag_new(zan_arena_t *arena) {
     d->file_count = 0;
     d->capture = false;
     d->treat_warnings_as_errors = false;
+    d->format = ZAN_DIAG_FORMAT_TEXT;
     d->warn_level = 1; /* default：告警照常打印（A382②） */
     d->suppress_codes = NULL;
     d->suppress_count = 0;
@@ -228,20 +229,128 @@ static zan_diag_entry_t *diag_capture_entry(zan_diag_t *diag, zan_diag_level_t l
     return e;
 }
 
+/* ---- S1：--diag=json（JSON Lines）---------------------------------------
+ * 每条诊断一行，进程退出前 atexit 补一行 summary。summary 读的是静态快照：
+ * diag 本体活在 arena 里，main 返回前就随 arena 释放了，atexit 时不能再碰。 */
+static bool g_json_summary_armed = false;
+static int  g_json_errors = 0;
+static int  g_json_warnings = 0;
+static int  g_json_suppressed = 0;
+
+static void diag_json_snapshot(const zan_diag_t *diag) {
+    if (!diag || diag->format != ZAN_DIAG_FORMAT_JSON || diag->capture) return;
+    g_json_errors = diag->error_count;
+    g_json_warnings = diag->warning_count;
+    g_json_suppressed = diag->suppressed_errors + diag->dup_line_suppressed;
+}
+
+static void diag_json_summary_atexit(void) {
+    fprintf(stderr,
+            "{\"kind\":\"summary\",\"errors\":%d,\"warnings\":%d,\"suppressed\":%d}\n",
+            g_json_errors, g_json_warnings, g_json_suppressed);
+    fflush(stderr);
+}
+
+/* JSON 字符串转义：UTF-8 原样透传（消息截断已保证码点完整，见 vemit），
+ * 控制字符走 \u00XX。 */
+static void diag_json_str(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+            else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+static const char *diag_file_name(const zan_diag_t *diag, uint32_t file_id) {
+    if (file_id < (uint32_t)diag->file_count && diag->file_names)
+        return diag->file_names[file_id];
+    return "<unknown>";
+}
+
+static void diag_json_loc(FILE *f, const zan_diag_t *diag, zan_loc_t loc) {
+    fputs("\"file\":", f);
+    diag_json_str(f, diag_file_name(diag, loc.file_id));
+    fprintf(f, ",\"line\":%u,\"col\":%u,\"offset\":%u", loc.line, loc.col, loc.offset);
+}
+
+/* prefix 是 vemit 按发射时级别拼好的 "[E0032] "（无编号为空串）；编号字母
+ * 跟发射时级别走，severity 跟升级后的最终级别走——与文本格式同口径。 */
+static void diag_json_print(const zan_diag_t *diag, zan_diag_level_t level,
+                            zan_loc_t loc, const char *prefix, const char *message,
+                            const zan_diag_fixit_t *fix) {
+    FILE *f = stderr;
+    const char *sev = level == DIAG_ERROR ? "error"
+                    : level == DIAG_WARNING ? "warning" : "note";
+    fprintf(f, "{\"kind\":\"diagnostic\",\"severity\":\"%s\",\"code\":", sev);
+    if (prefix[0] == '[') {
+        const char *close = strchr(prefix, ']');
+        int n = close ? (int)(close - prefix - 1) : 0;
+        fprintf(f, "\"%.*s\"", n, prefix + 1);
+    }
+    else fputs("null", f);
+    fputs(",\"message\":", f);
+    diag_json_str(f, message);
+    fputc(',', f);
+    diag_json_loc(f, diag, loc);
+    fputs(",\"fixits\":[", f);
+    if (fix && fix->text) {
+        fputc('{', f);
+        diag_json_loc(f, diag, fix->loc);
+        fprintf(f, ",\"length\":%u,\"text\":", fix->len);
+        diag_json_str(f, fix->text);
+        fputc('}', f);
+    }
+    fputs("]}\n", f);
+    fflush(f);
+}
+
+int zan_diag_parse_format(const char *name) {
+    if (!name) return -1;
+    if (strcmp(name, "text") == 0) return ZAN_DIAG_FORMAT_TEXT;
+    if (strcmp(name, "json") == 0) return ZAN_DIAG_FORMAT_JSON;
+    return -1;
+}
+
+void zan_diag_set_format(zan_diag_t *diag, zan_diag_format_t format) {
+    if (!diag) return;
+    diag->format = format;
+    if (format == ZAN_DIAG_FORMAT_JSON && !g_json_summary_armed) {
+        g_json_summary_armed = true;
+        atexit(diag_json_summary_atexit);
+    }
+}
+
+bool zan_diag_is_json(const zan_diag_t *diag) {
+    return diag && diag->format == ZAN_DIAG_FORMAT_JSON;
+}
+
 static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
-                           zan_loc_t loc, int code, const char *fmt,
+                           zan_loc_t loc, int code,
+                           const zan_diag_fixit_t *fix, const char *fmt,
                            va_list args);
+static void diag_json_snapshot(const zan_diag_t *diag);
 
 void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                    const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    zan_diag_vemit(diag, level, loc, 0, fmt, args);
+    zan_diag_vemit(diag, level, loc, 0, NULL, fmt, args);
     va_end(args);
+    diag_json_snapshot(diag);
 }
 
 static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
-                           zan_loc_t loc, int code, const char *fmt,
+                           zan_loc_t loc, int code,
+                           const zan_diag_fixit_t *fix, const char *fmt,
                            va_list args) {
     if (diag->only_file_id >= 0 && loc.file_id != diag->only_file_id) return;
     char msgbuf[1024];
@@ -368,7 +477,8 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
         if (diag->max_errors > 0 && diag->error_count > diag->max_errors) {
             /* 限制诊断信息条数上限，避免语法崩溃时输出大量级联错误 */
             diag->suppressed_errors++;
-            if (!diag->limit_notice_shown && !diag->capture) {
+            if (!diag->limit_notice_shown && !diag->capture &&
+                diag->format != ZAN_DIAG_FORMAT_JSON) {
                 diag->limit_notice_shown = true;
                 fprintf(stderr,
                         "\033[33mnote\033[0m: too many errors, stopping after %d"
@@ -393,7 +503,8 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
         }
         if (++diag->dup_line_errors > ZAN_DIAG_MAX_ERRORS_PER_LINE) {
             diag->dup_line_suppressed++;
-            if (!diag->dup_line_notice_shown && !diag->capture) {
+            if (!diag->dup_line_notice_shown && !diag->capture &&
+                diag->format != ZAN_DIAG_FORMAT_JSON) {
                 diag->dup_line_notice_shown = true;
                 fprintf(stderr,
                         "\033[33mnote\033[0m: line %u: more than %d errors,"
@@ -410,6 +521,11 @@ static void zan_diag_vemit(zan_diag_t *diag, zan_diag_level_t level,
             e->code = code;
             snprintf(e->message, sizeof(e->message), "%s", msgbuf);
         }
+        return;
+    }
+
+    if (diag->format == ZAN_DIAG_FORMAT_JSON) {
+        diag_json_print(diag, level, loc, prefix, msgbuf + plen, fix);
         return;
     }
 
@@ -466,8 +582,18 @@ void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                         int code, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    zan_diag_vemit(diag, level, loc, code, fmt, args);
+    zan_diag_vemit(diag, level, loc, code, NULL, fmt, args);
     va_end(args);
+    diag_json_snapshot(diag);
+}
+
+void zan_diag_emit_fix(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
+                       int code, const zan_diag_fixit_t *fix, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    zan_diag_vemit(diag, level, loc, code, fix, fmt, args);
+    va_end(args);
+    diag_json_snapshot(diag);
 }
 
 void zan_compile_trace(const char *fmt, ...) {

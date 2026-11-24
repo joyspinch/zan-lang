@@ -11,6 +11,17 @@
     g_main_arena = arena;
     zan_diag_t *diag = zan_diag_new(arena);
     zan_diag_set_deny_warnings(diag, do_deny_warnings);
+    /* S1（docs/ZAN_STANDARD.md §1）：--diag=text|json。放在最前，后续任何
+     * 诊断（含选项错误之后的前端报错）都按选定格式输出。 */
+    if (opts.diag_format_arg) {
+        int fmt = zan_diag_parse_format(opts.diag_format_arg);
+        if (fmt < 0) {
+            fprintf(stderr, "error: unknown --diag '%s' (text|json)\n",
+                    opts.diag_format_arg);
+            return 2;
+        }
+        zan_diag_set_format(diag, (zan_diag_format_t)fmt);
+    }
     /* A382②：--warn-level none|default|error（error 兼容 --deny-warnings）；
      * --suppress 逗号分隔诊断编号（W0003 / 3 皆可，字母仅作文档）。 */
     {
@@ -314,8 +325,9 @@
     }
 
     if (zan_diag_has_errors(diag)) {
-        fprintf(stderr, "\n%d error(s), %d warning(s)\n",
-                diag->error_count, diag->warning_count);
+        if (!zan_diag_is_json(diag))  /* json 由 summary 行承载计数 */
+            fprintf(stderr, "\n%d error(s), %d warning(s)\n",
+                    diag->error_count, diag->warning_count);
         report_suppressed_errors(diag);
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);
@@ -343,8 +355,9 @@
     }
 
     if (zan_diag_has_errors(diag)) {
-        fprintf(stderr, "\n%d error(s) after type checking\n",
-                diag->error_count);
+        if (!zan_diag_is_json(diag))
+            fprintf(stderr, "\n%d error(s) after type checking\n",
+                    diag->error_count);
         report_suppressed_errors(diag);
         zan_diag_free_buffers(diag);
         zan_arena_free(arena);

@@ -16,6 +16,23 @@ typedef enum {
 /* 诊断回显源码行最大字符宽度，超长行截断居中展示 */
 #define ZAN_DIAG_MAX_SOURCE_ECHO 200
 
+/* S1（docs/ZAN_STANDARD.md §1）：机器可应用的修复补丁——把源码字节区间
+ * [loc.offset, loc.offset + len) 替换为 text；len = 0 即在 loc 处插入。
+ * loc.col 与诊断位置同口径（1 起、按字节计）。 */
+typedef struct {
+    zan_loc_t   loc;
+    uint32_t    len;
+    const char *text;
+} zan_diag_fixit_t;
+
+/* 诊断输出格式（--diag=text|json）。json 为 JSON Lines：每条诊断一行
+ * {"kind":"diagnostic",...}，进程退出前补一行 {"kind":"summary",...}；
+ * 字段契约见 docs/ZANC_CLI.md。capture 模式（LSP）不受影响。 */
+typedef enum {
+    ZAN_DIAG_FORMAT_TEXT = 0,
+    ZAN_DIAG_FORMAT_JSON = 1,
+} zan_diag_format_t;
+
 typedef struct {
     zan_diag_level_t level;
     zan_loc_t        loc;
@@ -58,6 +75,7 @@ struct zan_diag {
     /* 结构化诊断捕获（供 LSP 服务等工具消费） */
     bool              capture;
     bool              treat_warnings_as_errors;
+    zan_diag_format_t format;
     /* A382②：--warn-level（0=none 1=default 2=error）与 --suppress 的过滤状态 */
     int  warn_level;
     int *suppress_codes;
@@ -112,7 +130,16 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
  * 时，前缀字母仍按发射时的级别（编号标识诊断本身，严重度另行展示）。 */
 void zan_diag_emit_code(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
                         int code, const char *fmt, ...);
+/* S1：带修复补丁的诊断。fix 为 NULL 时等同 zan_diag_emit_code。文本格式
+ * 不打印补丁（保持既有输出逐字节不变），json 格式写进 "fixits" 数组。 */
+void zan_diag_emit_fix(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
+                       int code, const zan_diag_fixit_t *fix, const char *fmt, ...);
 bool zan_diag_has_errors(zan_diag_t *diag);
+
+/* S1：--diag=text|json。解析失败返回 -1。 */
+int  zan_diag_parse_format(const char *name);
+void zan_diag_set_format(zan_diag_t *diag, zan_diag_format_t format);
+bool zan_diag_is_json(const zan_diag_t *diag);
 
 /* 开启或关闭结构化诊断捕获（开启后诊断不打印至 stderr 而是存入内存数组） */
 void zan_diag_set_capture(zan_diag_t *diag, bool enabled);

@@ -26,9 +26,52 @@ static bool parser_match(zan_parser_t *p, zan_token_kind_t kind) {
     return false;
 }
 
+/* S1（docs/ZAN_STANDARD.md §1）：缺 ';' 的 fix-it——插在上一个 token 末尾。
+ * token 不带长度，只对能从源码直接量出长度的 token（标识符/关键字/数字字面量/
+ * 右括号类）给补丁；字符串、运算符等量不准的宁可不给，错补丁比没补丁更糟。 */
+static bool parser_fix_insert_after_previous(zan_parser_t *p, const char *text,
+                                             zan_diag_fixit_t *out) {
+    const char *src = p->lex->source;
+    size_t n = p->lex->source_len;
+    zan_loc_t at = p->previous.loc;
+    if (!src || at.file_id != p->current.loc.file_id ||
+        at.offset >= p->current.loc.offset || at.offset >= n)
+        return false;
+    size_t i = at.offset;
+    unsigned char c = (unsigned char)src[i];
+#define ZAN_FIX_WORD(ch) (((ch) >= 'a' && (ch) <= 'z') || ((ch) >= 'A' && (ch) <= 'Z') || \
+                          ((ch) >= '0' && (ch) <= '9') || (ch) == '_' || (ch) >= 0x80)
+    if (c == ')' || c == ']' || c == '}') {
+        i++;
+    } else if (c >= '0' && c <= '9') {
+        while (i < n && (ZAN_FIX_WORD((unsigned char)src[i]) || src[i] == '.')) i++;
+    } else if (ZAN_FIX_WORD(c) || c == '@') {
+        if (c == '@') i++;
+        while (i < n && ZAN_FIX_WORD((unsigned char)src[i])) i++;
+    } else {
+        return false;
+    }
+#undef ZAN_FIX_WORD
+    if (i > p->current.loc.offset) return false;
+    out->loc = at;
+    out->loc.offset = (uint32_t)i;
+    out->loc.col = at.col + (uint32_t)(i - at.offset);
+    out->len = 0;
+    out->text = text;
+    return true;
+}
+
 static void parser_expect(zan_parser_t *p, zan_token_kind_t kind) {
     if (p->current.kind == kind) {
         parser_advance(p);
+        return;
+    }
+    zan_diag_fixit_t fix;
+    if (kind == TK_SEMICOLON && parser_fix_insert_after_previous(p, ";", &fix)) {
+        zan_diag_emit_fix(p->diag, DIAG_ERROR, p->current.loc, 32, &fix,
+                          "expected '%s', got '%s'",
+                          zan_token_kind_name(kind),
+                          zan_token_kind_name(p->current.kind));
         return;
     }
     zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 32,
