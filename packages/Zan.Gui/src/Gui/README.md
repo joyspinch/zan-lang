@@ -54,7 +54,9 @@ GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按
 `Testing`（`UiDriver`、`UiProbe`）是旁路层：可依赖任何层，任何层不得依赖它。
 
 数据绑定走两条正道：HTML 窗口用 `data-bind`（ModelBinder），代码侧用
-`Binding<T> data` 字段（`stdlib/System/Binding.zan`）。`Signal*` 只是控件内部
+`Binding<T> data` 字段（`stdlib/System/Binding.zan`）。HTML 绑定对模型的读写只经
+`Binding/ModelAccessor.zan`（JsonValue/JsonDoc/字典/POCO 各一个无状态实现），新增模型形态在那里加一个实现，
+不要在 ModelBinder 里写 `is X` 分支。`Signal*` 只是控件内部
 状态缓冲，不是对外绑定协议；本包不存在 `Gui.Reactive`/`Gui.Designer` 命名空间。
 
 ---

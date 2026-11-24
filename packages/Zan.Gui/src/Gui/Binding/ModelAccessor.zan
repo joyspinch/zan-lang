@@ -1,0 +1,281 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Gui;
+
+// 绑定模型的统一取值协议：ModelBinder / DocWire 对任意作用域对象只经这一层
+// 读、判类型、写回。模型种类分派（JsonValue / JsonDoc 槽位 / 标量字典 / POCO 反射）
+// 只在 For() 出现一次；实现都是无状态单例，按路径取值不分配。
+// 值种类约定：0 文本、1 数值、2 布尔；-1 路径不存在。
+public class ModelAccessor {
+    static ModelAccessor sJson;
+    static ModelAccessor sDoc;
+    static ModelAccessor sDocCursor;
+    static ModelAccessor sStrDict;
+    static ModelAccessor sNumDict;
+    static ModelAccessor sBoolDict;
+    static ModelAccessor sObjDict;
+    static ModelAccessor sPoco;
+
+    public static ModelAccessor For(object scope) {
+        if (ModelAccessor.sPoco == null) {
+            ModelAccessor.sJson = new JsonValueAccessor();
+            ModelAccessor.sDoc = new JsonDocAccessor();
+            ModelAccessor.sDocCursor = new JsonDocCursorAccessor();
+            ModelAccessor.sStrDict = new StrDictAccessor();
+            ModelAccessor.sNumDict = new NumDictAccessor();
+            ModelAccessor.sBoolDict = new BoolDictAccessor();
+            ModelAccessor.sObjDict = new ObjDictAccessor();
+            ModelAccessor.sPoco = new PocoAccessor();
+        }
+        if (scope is JsonValue) { return ModelAccessor.sJson; }
+        if (scope is JsonDocCursor) { return ModelAccessor.sDocCursor; }
+        if (scope is JsonDoc) { return ModelAccessor.sDoc; }
+        if (scope is Dictionary<string, string>) { return ModelAccessor.sStrDict; }
+        if (scope is Dictionary<string, double>) { return ModelAccessor.sNumDict; }
+        if (scope is Dictionary<string, bool>) { return ModelAccessor.sBoolDict; }
+        if (scope is Dictionary<string, object>) { return ModelAccessor.sObjDict; }
+        return ModelAccessor.sPoco;
+    }
+
+    // 路径值的字符串形式；路径不存在返回 false。
+    public virtual bool TryGet(object scope, string path, out string result) {
+        result = "";
+        return false;
+    }
+
+    // 路径值种类（见类注释）。标量字典按值类型定种类，不看键。
+    public virtual int ValueKind(object scope, string path) { return -1; }
+
+    // 路径存在（DocWire 装载期校验用）。
+    public virtual bool Has(object scope, string path) { return this.ValueKind(scope, path) >= 0; }
+
+    // 双向绑定可写性：0 可写、1 模型只读、2 目标字段只读。
+    public virtual int WriteCheck(object scope, string path) { return 0; }
+
+    // 按 modelKind 写回；false 表示目标未知、只读或类型不兼容。
+    public virtual bool Write(object scope, string path, string s, int modelKind) { return false; }
+}
+
+class JsonValueAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        JsonValue v = ((JsonValue)scope).PathGet(path);
+        if (v == null) { return false; }
+        result = (v.kind == 4 || v.kind == 5) ? v.ToJson() : v.AsString("");
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) {
+        JsonValue v = ((JsonValue)scope).PathGet(path);
+        if (v == null) { return -1; }
+        if (v.IsNumber()) { return 1; }
+        if (v.IsBool()) { return 2; }
+        return 0;
+    }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        JsonValue j = (JsonValue)scope;
+        if (modelKind == 1) {
+            string ns = s.Trim();
+            if (ns == "") { ns = "0"; }
+            j.PathSetValue(path, JsonValue.NewNum(ns));
+        } else if (modelKind == 2) {
+            j.PathSetValue(path, JsonValue.NewBool(s == "true"));
+        } else {
+            j.PathSet(path, s);
+        }
+        return true;
+    }
+}
+
+// JsonDoc 零拷贝 tape 是只读数据源：可读不可写回。
+class JsonDocAccessor : ModelAccessor {
+    public static bool SlotString(JsonDoc doc, int slot, out string result) {
+        result = "";
+        if (slot < 0) { return false; }
+        int k = doc.KindAt(slot);
+        result = (k == 4 || k == 5) ? doc.ToJson(slot) : doc.StrAt(slot, "");
+        return true;
+    }
+
+    public static int SlotKind(JsonDoc doc, int slot) {
+        if (slot < 0) { return -1; }
+        int k = doc.KindAt(slot);
+        return k == 2 ? 1 : (k == 1 ? 2 : 0);
+    }
+
+    public override bool TryGet(object scope, string path, out string result) {
+        JsonDoc doc = (JsonDoc)scope;
+        return JsonDocAccessor.SlotString(doc, doc.Path(doc.root, path), out result);
+    }
+
+    public override int ValueKind(object scope, string path) {
+        JsonDoc doc = (JsonDoc)scope;
+        return JsonDocAccessor.SlotKind(doc, doc.Path(doc.root, path));
+    }
+
+    public override int WriteCheck(object scope, string path) { return 1; }
+    public override bool Write(object scope, string path, string s, int modelKind) { return true; }
+}
+
+class JsonDocCursorAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        JsonDocCursor cur = (JsonDocCursor)scope;
+        return JsonDocAccessor.SlotString(cur.doc, cur.doc.Path(cur.slot, path), out result);
+    }
+
+    public override int ValueKind(object scope, string path) {
+        JsonDocCursor cur = (JsonDocCursor)scope;
+        return JsonDocAccessor.SlotKind(cur.doc, cur.doc.Path(cur.slot, path));
+    }
+
+    public override int WriteCheck(object scope, string path) { return 1; }
+    public override bool Write(object scope, string path, string s, int modelKind) { return true; }
+}
+
+// 标量字典：键是整条绑定路径（含点号），不做嵌套导航。
+class StrDictAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        Dictionary<string, string> d = (Dictionary<string, string>)scope;
+        if (!d.ContainsKey(path)) { return false; }
+        result = d[path];
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) { return 0; }
+    public override bool Has(object scope, string path) { return ((Dictionary<string, string>)scope).ContainsKey(path); }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        Dictionary<string, string> d = (Dictionary<string, string>)scope;
+        d[path] = s;
+        return true;
+    }
+}
+
+class NumDictAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        Dictionary<string, double> d = (Dictionary<string, double>)scope;
+        if (!d.ContainsKey(path)) { return false; }
+        result = Convert.ToString(d[path]);
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) { return 1; }
+    public override bool Has(object scope, string path) { return ((Dictionary<string, double>)scope).ContainsKey(path); }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        Dictionary<string, double> d = (Dictionary<string, double>)scope;
+        d[path] = s != "" ? s.ToDouble() : 0.0;
+        return true;
+    }
+}
+
+class BoolDictAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        Dictionary<string, bool> d = (Dictionary<string, bool>)scope;
+        if (!d.ContainsKey(path)) { return false; }
+        result = PropSpec.Flag(d[path]);
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) { return 2; }
+    public override bool Has(object scope, string path) { return ((Dictionary<string, bool>)scope).ContainsKey(path); }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        Dictionary<string, bool> d = (Dictionary<string, bool>)scope;
+        d[path] = s == "true";
+        return true;
+    }
+}
+
+// 异构字典（data-for 行项常见形态）：值按 ToString 读出，写回存文本。
+class ObjDictAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        Dictionary<string, object> d = (Dictionary<string, object>)scope;
+        if (!d.ContainsKey(path)) { return false; }
+        object v = d[path];
+        if (v != null) { result = Convert.ToString(v); }
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) {
+        return ((Dictionary<string, object>)scope).ContainsKey(path) ? 0 : -1;
+    }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        Dictionary<string, object> d = (Dictionary<string, object>)scope;
+        d[path] = s;
+        return true;
+    }
+}
+
+// 强类型实体反射，支持点号级联导航（user.addr.city）。
+class PocoAccessor : ModelAccessor {
+    public override bool TryGet(object scope, string path, out string result) {
+        result = "";
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
+        if (target == null || !target.HasField(leaf)) { return false; }
+        int valueKind = ModelBinder.FieldValueKind(target, leaf);
+        if (valueKind == 1) {
+            result = Convert.ToString(target.GetFieldDouble(leaf));
+            return true;
+        }
+        if (valueKind == 2) {
+            result = PropSpec.Flag(target.GetFieldBool(leaf));
+            return true;
+        }
+        result = target.GetFieldString(leaf);
+        if (result == "") {
+            // 集合字段（:options="names" 绑 List<string>、JsonValue 数组）序列化成
+            // JSON 数组，选择类控件的 options 属性直接吃。GetFieldObject 只对引用/
+            // 字符串字段取值，值类型字段返回 null。
+            object fo = target.GetFieldObject(leaf);
+            if (fo != null && fo is List<string>) {
+                result = ModelBinder.StrListJson((List<string>)fo);
+                return true;
+            }
+            if (fo != null && fo is JsonValue) {
+                JsonValue fj = (JsonValue)fo;
+                result = (fj.kind == 4 || fj.kind == 5) ? fj.ToJson() : fj.AsString("");
+                return true;
+            }
+            double d = target.GetFieldDouble(leaf);
+            if (d != 0.0) {
+                result = Convert.ToString(d);
+            } else if (target.GetFieldBool(leaf)) {
+                result = "true";
+            }
+        }
+        return true;
+    }
+
+    public override int ValueKind(object scope, string path) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
+        if (target == null || !target.HasField(leaf)) { return -1; }
+        return ModelBinder.FieldValueKind(target, leaf);
+    }
+
+    public override int WriteCheck(object scope, string path) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
+        if (target != null && target.HasField(leaf) && !ModelBinder.WritableField(target, leaf)) { return 2; }
+        return 0;
+    }
+
+    public override bool Write(object scope, string path, string s, int modelKind) {
+        string leaf = "";
+        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
+        if (target == null) { return false; }
+        if (modelKind == 1) { return target.SetFieldDouble(leaf, s != "" ? s.ToDouble() : 0.0); }
+        if (modelKind == 2) { return target.SetFieldBool(leaf, s == "true"); }
+        return target.SetFieldString(leaf, s);
+    }
+}

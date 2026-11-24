@@ -317,16 +317,13 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
     private void ValidateValueBinding(ModelValueBinding binding) {
         Control c = binding.control;
         object scope = this.ScopeItemOf(c);
-        if (binding.twoWay && (scope is JsonDoc || scope is JsonDocCursor)) {
-            throw new InvalidOperationException("Two-way binding requires a writable model: " + binding.path);
-        }
-        if (binding.twoWay && scope != null && !(scope is JsonValue)
-            && !(scope is Dictionary<string, string>) && !(scope is Dictionary<string, double>)
-            && !(scope is Dictionary<string, bool>)) {
+        if (binding.twoWay && scope != null) {
             string actualPath = ModelBinder.StripAlias(binding.path, this.ScopeAliasOf(c));
-            string leaf = "";
-            object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
-            if (target != null && target.HasField(leaf) && !ModelBinder.WritableField(target, leaf)) {
+            int check = ModelAccessor.For(scope).WriteCheck(scope, actualPath);
+            if (check == 1) {
+                throw new InvalidOperationException("Two-way binding requires a writable model: " + binding.path);
+            }
+            if (check == 2) {
                 throw new InvalidOperationException("Two-way binding requires a writable target: " + binding.path);
             }
         }
@@ -547,146 +544,17 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         return cur;
     }
 
-    // 从任意多态模型（JsonValue、JsonDocCursor、JsonDoc 或强类型 POCO 实体）解析字符串
+    // 从任意多态模型解析字符串：取值经 ModelAccessor 统一分派；行作用域取不到时
+    // 回落根模型（按完整路径）。
     public bool TryResolveString(Control c, string path, out string result) {
         result = "";
         if (path == "") { return false; }
         object scope = this.ScopeItemOf(c);
-        string alias = this.ScopeAliasOf(c);
-        string actualPath = ModelBinder.StripAlias(path, alias);
-
         if (scope == null) { return false; }
-
-        if (scope is JsonValue) {
-            JsonValue jv = ((JsonValue)scope).PathGet(actualPath);
-            if (jv != null) {
-                if (jv.kind == 4 || jv.kind == 5) {
-                    result = jv.ToJson();
-                } else {
-                    result = jv.AsString("");
-                }
-                return true;
-            }
-            if (scope != this.model && this.model != null && this.model is JsonValue) {
-                JsonValue mv = ((JsonValue)this.model).PathGet(path);
-                if (mv != null) {
-                    if (mv.kind == 4 || mv.kind == 5) {
-                        result = mv.ToJson();
-                    } else {
-                        result = mv.AsString("");
-                    }
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (scope is JsonDocCursor) {
-            JsonDocCursor cur = (JsonDocCursor)scope;
-            int slot = cur.doc.Path(cur.slot, actualPath);
-            if (slot >= 0) {
-                int k = cur.doc.KindAt(slot);
-                if (k == 4 || k == 5) {
-                    result = cur.doc.ToJson(slot);
-                } else {
-                    result = cur.doc.StrAt(slot, "");
-                }
-                return true;
-            }
-            return false;
-        }
-
-        if (scope is JsonDoc) {
-            JsonDoc doc = (JsonDoc)scope;
-            int slot = doc.Path(doc.root, actualPath);
-            if (slot >= 0) {
-                int k = doc.KindAt(slot);
-                if (k == 4 || k == 5) {
-                    result = doc.ToJson(slot);
-                } else {
-                    result = doc.StrAt(slot, "");
-                }
-                return true;
-            }
-            return false;
-        }
-
-        // 字典模型高性能直读（零 JSON 堆分配）
-        if (scope is Dictionary<string, string>) {
-            Dictionary<string, string> dict = (Dictionary<string, string>)scope;
-            if (dict.ContainsKey(actualPath)) {
-                result = dict[actualPath];
-                return true;
-            }
-            if (scope != this.model && this.model != null && this.model is Dictionary<string, string>) {
-                Dictionary<string, string> mdict = (Dictionary<string, string>)this.model;
-                if (mdict.ContainsKey(path)) {
-                    result = mdict[path];
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        if (scope is Dictionary<string, double>) {
-            Dictionary<string, double> dict = (Dictionary<string, double>)scope;
-            if (!dict.ContainsKey(actualPath)) { return false; }
-            result = Convert.ToString(dict[actualPath]);
-            return true;
-        }
-        if (scope is Dictionary<string, bool>) {
-            Dictionary<string, bool> dict = (Dictionary<string, bool>)scope;
-            if (!dict.ContainsKey(actualPath)) { return false; }
-            result = PropSpec.Flag(dict[actualPath]);
-            return true;
-        }
-
-        // POCO 强类型实体反射（支持点号级联导航如 user.addr.city）
-        string leaf = "";
-        object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
-        if (target != null && target.HasField(leaf)) {
-            int valueKind = ModelBinder.FieldValueKind(target, leaf);
-            if (valueKind == 1) {
-                result = Convert.ToString(target.GetFieldDouble(leaf));
-                return true;
-            }
-            if (valueKind == 2) {
-                result = PropSpec.Flag(target.GetFieldBool(leaf));
-                return true;
-            }
-            result = target.GetFieldString(leaf);
-            if (result == "") {
-                // 集合字段（:options="names" 绑 List<string>、JsonValue 数组）
-                // 序列化成 JSON 数组，选择类控件的 options 属性直接吃。此前
-                // 落到数值/布尔分支得空串，SetProp("options", "") 把下拉清空。
-                // GetFieldObject 只对引用/字符串字段取值，值类型字段返回 null。
-                object fo = target.GetFieldObject(leaf);
-                if (fo != null && fo is List<string>) {
-                    result = ModelBinder.StrListJson((List<string>)fo);
-                    return true;
-                }
-                if (fo != null && fo is JsonValue) {
-                    JsonValue fj = (JsonValue)fo;
-                    result = (fj.kind == 4 || fj.kind == 5) ? fj.ToJson() : fj.AsString("");
-                    return true;
-                }
-                double d = target.GetFieldDouble(leaf);
-                if (d != 0.0) {
-                    result = Convert.ToString(d);
-                } else if (target.GetFieldBool(leaf)) {
-                    result = "true";
-                }
-            }
-            return true;
-        }
-
+        string actualPath = ModelBinder.StripAlias(path, this.ScopeAliasOf(c));
+        if (ModelAccessor.For(scope).TryGet(scope, actualPath, out result)) { return true; }
         if (scope != this.model && this.model != null) {
-            string mleaf = "";
-            object mtarget = ModelBinder.ResolveFieldScope(this.model, path, out mleaf);
-            if (mtarget != null && mtarget.HasField(mleaf)) {
-                result = mtarget.GetFieldString(mleaf);
-                return true;
-            }
+            return ModelAccessor.For(this.model).TryGet(this.model, path, out result);
         }
         return false;
     }
@@ -734,44 +602,11 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         object scope = this.ScopeItemOf(c);
         if (scope == null) { return 0; }
         string path = ModelBinder.StripAlias(bindingPath, this.ScopeAliasOf(c));
-        if (scope is JsonValue) {
-            JsonValue v = ((JsonValue)scope).PathGet(path);
-            if (v == null && scope != this.model && this.model is JsonValue) {
-                v = ((JsonValue)this.model).PathGet(bindingPath);
-            }
-            if (v != null && v.IsNumber()) { return 1; }
-            if (v != null && v.IsBool()) { return 2; }
-            return 0;
+        int kind = ModelAccessor.For(scope).ValueKind(scope, path);
+        if (kind < 0 && scope != this.model && this.model != null) {
+            kind = ModelAccessor.For(this.model).ValueKind(this.model, bindingPath);
         }
-        if (scope is JsonDocCursor) {
-            JsonDocCursor cur = (JsonDocCursor)scope;
-            int slot = cur.doc.Path(cur.slot, path);
-            if (slot < 0) { return 0; }
-            int kind = cur.doc.KindAt(slot);
-            return kind == 2 ? 1 : (kind == 1 ? 2 : 0);
-        }
-        if (scope is JsonDoc) {
-            JsonDoc doc = (JsonDoc)scope;
-            int slot = doc.Path(doc.root, path);
-            if (slot < 0) { return 0; }
-            int kind = doc.KindAt(slot);
-            return kind == 2 ? 1 : (kind == 1 ? 2 : 0);
-        }
-        if (scope is Dictionary<string, double>) { return 1; }
-        if (scope is Dictionary<string, bool>) { return 2; }
-        if (scope is Dictionary<string, string>) { return 0; }
-        string leaf = "";
-        object target = ModelBinder.ResolveFieldScope(scope, path, out leaf);
-        if (target != null && target.HasField(leaf)) {
-            return ModelBinder.FieldValueKind(target, leaf);
-        }
-        if (scope != this.model && this.model != null) {
-            target = ModelBinder.ResolveFieldScope(this.model, bindingPath, out leaf);
-            if (target != null && target.HasField(leaf)) {
-                return ModelBinder.FieldValueKind(target, leaf);
-            }
-        }
-        return 0;
+        return kind < 0 ? 0 : kind;
     }
 
     string BoundProperty(ModelValueBinding binding) {
@@ -810,53 +645,12 @@ public partial class ModelBinder : AppLoopOwner, AppModelHost {
         string actualPath = ModelBinder.StripAlias(binding.path, alias);
 
         if (scope != null) {
-            if (scope is JsonValue) {
-                JsonValue jscope = (JsonValue)scope;
-                if (modelKind == 1) {
-                    string ns = s.Trim();
-                    if (ns == "") { ns = "0"; }
-                    jscope.PathSetValue(actualPath, JsonValue.NewNum(ns));
-                } else if (modelKind == 2) {
-                    jscope.PathSetValue(actualPath, JsonValue.NewBool(s == "true"));
-                } else {
-                    jscope.PathSet(actualPath, s);
-                }
-            } else if (scope is JsonDocCursor || scope is JsonDoc) {
-                // JsonDoc 为只读零分配数据源，不参与回写
-            } else if (scope is Dictionary<string, string>) {
-                Dictionary<string, string> dict = (Dictionary<string, string>)scope;
-                dict[actualPath] = s;
-            } else if (scope is Dictionary<string, double>) {
-                Dictionary<string, double> dict = (Dictionary<string, double>)scope;
-                dict[actualPath] = s != "" ? s.ToDouble() : 0.0;
-            } else if (scope is Dictionary<string, bool>) {
-                Dictionary<string, bool> dict = (Dictionary<string, bool>)scope;
-                dict[actualPath] = (s == "true");
-            } else {
-                // POCO 强类型实体双向写回（支持嵌套字段）
-                string leaf = "";
-                object target = ModelBinder.ResolveFieldScope(scope, actualPath, out leaf);
-                if (target != null) {
-                    bool wrote = false;
-                    if (modelKind == 1) {
-                        double numVal = s != "" ? s.ToDouble() : 0.0;
-                        wrote = target.SetFieldDouble(leaf, numVal);
-                    } else if (modelKind == 2) {
-                        wrote = target.SetFieldBool(leaf, s == "true");
-                    } else {
-                        wrote = target.SetFieldString(leaf, s);
-                    }
-                    if (!wrote) {
-                        throw new InvalidOperationException("Binding target is unknown, read-only or type-incompatible: " + binding.path);
-                    }
-                } else {
-                    throw new InvalidOperationException("Cannot resolve binding target: " + binding.path);
-                }
+            if (!ModelAccessor.For(scope).Write(scope, actualPath, s, modelKind)) {
+                throw new InvalidOperationException("Binding target is unknown, read-only or type-incompatible: " + binding.path);
             }
             if (!this.HostBindingCurrent(ticket, generation, tree, state)) { return; }
             binding.snapshot = s;
             binding.hasSnapshot = true;
-                return;
         }
     }
 }
