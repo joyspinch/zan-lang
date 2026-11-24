@@ -124,6 +124,28 @@ static void pi_reach(const char *subdir) {
 }
 
 static const char *pi_stdlib_root_buf;
+static int zan_path_is_package_source(const char *path);
+static int pi_realpath(const char *in, char *out, size_t cap);
+
+static int pi_reach_package_input(const char *file) {
+  char real[1024];
+  const char *probe = pi_realpath(file, real, sizeof(real)) ? real : file;
+  if (!zan_path_is_package_source(probe))
+    return 0;
+  char declared_ns[256] = {0};
+  if (!probe_file_namespace(file, declared_ns, sizeof(declared_ns)))
+    return 0;
+  char canon_sub[256];
+  size_t c = 0;
+  for (; declared_ns[c] && c + 1 < sizeof(canon_sub); c++) {
+    canon_sub[c] = declared_ns[c] == '.' ? '/' : declared_ns[c];
+  }
+  canon_sub[c] = '\0';
+  if (!canon_sub[0])
+    return 0;
+  pi_reach(canon_sub);
+  return 1;
+}
 
 static int pi_reach_input_dir(const char *file) {
   char comps[64][256];
@@ -143,7 +165,7 @@ static int pi_reach_input_dir(const char *file) {
     i++;
   }
   if (n < 2 || !pi_stdlib_root_buf)
-    return 0;
+    return pi_reach_package_input(file);
   const char *root = pi_stdlib_root_buf;
   size_t rl = strlen(root);
   size_t rs = rl;
@@ -173,7 +195,7 @@ static int pi_reach_input_dir(const char *file) {
     }
   }
   if (base < 0 || base == n - 1)
-    return 0;
+    return pi_reach_package_input(file);
   char sub[1024];
   size_t used = 0;
   for (int k = base + 1; k < n - 1; k++) {
