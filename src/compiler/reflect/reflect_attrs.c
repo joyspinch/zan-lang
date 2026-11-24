@@ -258,10 +258,16 @@ static int render_type_short(zan_type_t *t, char *buf, int cap) {
     return n;
   }
   if (t->name.len) {
-    int w = (int)t->name.len;
+    zan_istr_t short_name = t->name;
+    if (t->sym && t->sym->decl) {
+      zan_istr_t orig = zan_ast_orig_name(t->sym->decl);
+      if (orig.len > 0)
+        short_name = orig;
+    }
+    int w = (int)short_name.len;
     if (w > cap - n - 1)
       w = cap - n - 1;
-    memcpy(buf + n, t->name.str, (size_t)w);
+    memcpy(buf + n, short_name.str, (size_t)w);
     n += w;
   } else if (n < cap - 1) {
     buf[n++] = '?';
@@ -406,7 +412,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp,
   if (t && sym &&
       (t->kind == TYPE_CLASS || t->kind == TYPE_STRUCT ||
        t->kind == TYPE_INTERFACE)) {
-    methods = refl_shape_mtab(g, sym, false, &method_count);
+    methods = refl_shape_mtab(g, sym, t, false, &method_count);
     if (method_count >= 4) {
       zan_symbol_t **msyms =
           (zan_symbol_t **)calloc((size_t)method_count, sizeof(zan_symbol_t *));
@@ -421,7 +427,7 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp,
       free(mnames);
       free(msyms);
     }
-    ctors = refl_shape_mtab(g, sym, true, &ctor_count);
+    ctors = refl_shape_mtab(g, sym, t, true, &ctor_count);
   } else if (refl_is_builtin_list(t)) {
     methods = refl_emit_methods_builtin_list(g, t, &method_count);
     if (method_count == 4) {
@@ -553,14 +559,31 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
                   continue;
                 zan_type_t *rt = zan_binder_resolve_type(
                     g->binder, mdecl->method_decl.return_type);
+                zan_type_t *owner_inst = refl_method_owner_inst(
+                    g, sym, g->refl_mtabs[i].inst, msyms[j]);
+                if (rt && owner_inst)
+                  rt = subst_type_param_deep(g, rt, owner_inst);
                 if (rt && type_is_concrete(rt) && !type_mentions_canon(rt) &&
                     (rt->kind == TYPE_STRUCT || rt->kind == TYPE_NULLABLE)) {
                   refl_meta_for(g, rt, NULL, 0);
+                }
+                if (msyms[j]->parent && is_user_generic_sym(msyms[j]->parent) &&
+                    owner_inst && type_is_concrete(owner_inst) &&
+                    !type_mentions_canon(owner_inst)) {
+                  resolve_gctx_arg_for_inst(g, false, owner_inst->sym,
+                                            owner_inst, NULL, 0);
                 }
               }
               free(msyms);
             }
           }
+        }
+        if (g->refl_mtabs[i].ctors && g->refl_mtabs[i].sym &&
+            is_user_generic_sym(g->refl_mtabs[i].sym) &&
+            g->refl_mtabs[i].inst && type_is_concrete(g->refl_mtabs[i].inst) &&
+            !type_mentions_canon(g->refl_mtabs[i].inst)) {
+          resolve_gctx_arg_for_inst(g, false, g->refl_mtabs[i].sym,
+                                    g->refl_mtabs[i].inst, NULL, 0);
         }
         if (!refl_ctor_needs_thunk(g) || !g->refl_mtabs[i].ctors ||
             g->refl_mtabs[i].site >= 0)
@@ -568,11 +591,13 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
         zan_symbol_t *sym = g->refl_mtabs[i].sym;
         if (!sym || !sym->type)
           continue;
+        zan_type_t *site_ty =
+            g->refl_mtabs[i].inst ? g->refl_mtabs[i].inst : sym->type;
         if (sym->type->kind == TYPE_CLASS) {
-          g->refl_mtabs[i].site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+          g->refl_mtabs[i].site = reserve_arc_site(g, sym, site_ty, 0, NULL);
         } else if (sym->type->kind == TYPE_STRUCT &&
-                   irgen_boxed_eligible_struct(g, sym->type)) {
-          g->refl_mtabs[i].site = refl_struct_box_site(g, sym->type);
+                   irgen_boxed_eligible_struct(g, site_ty)) {
+          g->refl_mtabs[i].site = refl_struct_box_site(g, site_ty);
         }
       }
       /* Implicit class field initializers can allocate further classes,
@@ -591,8 +616,8 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
               g, g->refl_mtabs[i].list_type, true);
           init = LLVMConstArray(refl_method_type(g), &rec, 1);
         } else {
-          init = refl_mtab_init(g, g->refl_mtabs[i].sym, true,
-                                g->refl_mtabs[i].n, true);
+          init = refl_mtab_init(g, g->refl_mtabs[i].sym, g->refl_mtabs[i].inst,
+                                true, g->refl_mtabs[i].n, true);
         }
         if (init)
           LLVMSetInitializer(g->refl_mtabs[i].gv, init);
@@ -645,7 +670,7 @@ static void refl_project_member_table(zan_irgen_t *g, LLVMValueRef table,
 }
 
 static void refl_project_member_metadata(zan_irgen_t *g) {
-  if (!g->publish_reflect_demand)
+  if (!g->publish_reflect_demand || g->emit_lib)
     return;
   unsigned queries = g->refl_query_used;
   unsigned fields = 0, methods = 0, ctors = (1u << 1) | (1u << 7);
@@ -702,8 +727,8 @@ void refl_finalize_mtabs(zan_irgen_t *g) {
     if (g->refl_mtabs[i].ctors)
       continue;
     LLVMValueRef init =
-        refl_mtab_init(g, g->refl_mtabs[i].sym, g->refl_mtabs[i].ctors,
-                       g->refl_mtabs[i].n, true);
+        refl_mtab_init(g, g->refl_mtabs[i].sym, g->refl_mtabs[i].inst,
+                       g->refl_mtabs[i].ctors, g->refl_mtabs[i].n, true);
     if (init)
       LLVMSetInitializer(g->refl_mtabs[i].gv, init);
   }

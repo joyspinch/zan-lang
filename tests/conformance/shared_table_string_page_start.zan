@@ -1,0 +1,40 @@
+using System;
+using System.Threading;
+
+// SharedTable.GetStringAt 返回运行时每线程一块 >1MiB 的读出缓冲。生成代码会
+// 探测返回串前方的头字（[ptr-8] 魔数，判定非串后再读 [ptr-16]/[ptr-24]）；
+// 缓冲曾从 calloc 首字节开始，大块分配落在独立映射页首时前方即未映射页——
+// SIGBUS（Web 路由表每请求 GetStringAt，压测下间歇崩）。每个新线程拿一块新
+// 缓冲：48 个线程各读一次，旧行为下几乎必中页首。
+class Prog {
+    static SharedTable table;
+    static AtomicInt ok;
+    static AtomicInt done;
+
+    static void Reader() {
+        long h = SharedTable.Hash("GET /bench/plain");
+        string handler = Prog.table.GetStringAt(h, "handler");
+        if (handler == "BenchController.Plain" && handler.Length == 21) {
+            Prog.ok.Add(1);
+        }
+        Prog.done.Add(1);
+    }
+
+    static void Main() {
+        SharedTable t = new SharedTable("", 16);
+        t.KeySize(32);
+        t.ColumnString("handler", 64);
+        if (!t.CreateAnonymous()) { Console.WriteLine("FAIL create"); return; }
+        long h = SharedTable.Hash("GET /bench/plain");
+        bool stored = t.SetStringAt(h, "handler", "BenchController.Plain");
+        Prog.table = t;
+        Prog.ok = new AtomicInt(0);
+        Prog.done = new AtomicInt(0);
+        int n = 48;
+        for (int i = 0; i < n; i = i + 1) { Thread.Start(Prog.Reader); }
+        int spins = 0;
+        while (Prog.done.Load() < n && spins < 5000) { Thread.Sleep(1); spins = spins + 1; }
+        Console.WriteLine(stored ? "ok set" : "FAIL set");
+        Console.WriteLine(Prog.ok.Load() == n ? "ok all threads read" : "FAIL reads");
+    }
+}

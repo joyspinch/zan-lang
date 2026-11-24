@@ -86,12 +86,12 @@ static void double_free_child(void) {
     __wrap_free(p);               
 }
 
-static void corrupt_header_child(void) {
-    void *p = __wrap_malloc(32);
+/* 无块头布局：块元数据在 slab 页表里，没有可写坏的块头。对应的误用是
+ * 释放块内部指针（不是块起点），必须致命而不是静默吞掉。 */
+static void interior_free_child(void) {
+    char *p = __wrap_malloc(32);
     if (!p) _exit(2);
-    unsigned char *hdr = (unsigned char *)p - 16;
-    hdr[7] = (unsigned char)0xff; 
-    __wrap_free(p);               
+    __wrap_free(p + 8);
 }
 
 
@@ -138,7 +138,7 @@ int main(void) {
     __wrap_free(big);
 
     expect_abort(double_free_child, "double free");
-    expect_abort(corrupt_header_child, "corrupt block header");
+    expect_abort(interior_free_child, "invalid free");
 
     expect_exit(takeover_child, 71, "fatal-handler-saw: mem: double free");
     expect_abort(returning_handler_child, "double free");

@@ -62,16 +62,24 @@ static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
 static int g_soft_seen_count;
 static int g_soft_strict;
 
+/* 结果一经算出即不变：无锁快路径读已发布的值，只有首次计算才进锁。
+ * 曾每次调用都拿全局 timer_lock——与定时器调度同一把锁，热路径上的
+ * 软失败判定会把多 worker 串行化。 */
+static int g_soft_hard = -1;
+
 static int zan_soft_is_hard(void) {
+  int v = __atomic_load_n(&g_soft_hard, __ATOMIC_ACQUIRE);
+  if (v >= 0)
+    return v;
   timer_lock();
-  static int hard = -1;
-  if (hard < 0) {
+  v = g_soft_hard;
+  if (v < 0) {
     const char *env = getenv("ZAN_RT_HARD");
-    hard = (env && *env && *env != '0') ? 1 : 0;
-    if (!hard && !env)
-      hard = g_soft_strict;
+    v = (env && *env && *env != '0') ? 1 : 0;
+    if (!v && !env)
+      v = g_soft_strict;
+    __atomic_store_n(&g_soft_hard, v, __ATOMIC_RELEASE);
   }
-  int v = hard;
   timer_unlock();
   return v;
 }
@@ -94,21 +102,26 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
   }
 }
 
+/* 编译器在大量普通函数里插这条调用取软失败暂存区：返回的是常量指针，
+ * 只需首次初始化。曾每次都拿全局 timer_lock——Web 压测下多 worker 在这把锁
+ * 上排队，锁等待占 CPU 采样的四成以上（psynch_mutexwait 归因 ~6000/19000）。
+ * 改为 acquire 读快路径；未发布时进锁双检、初始化后 release 发布。 */
 unsigned char *zan_rt_soft_scratch(void) {
   unsigned char *scratch = __atomic_load_n(&g_soft_scratch, __ATOMIC_ACQUIRE);
   if (__builtin_expect(scratch != NULL, 1))
     return scratch;
   timer_lock();
-  if (!g_soft_scratch) {
+  scratch = g_soft_scratch;
+  if (!scratch) {
     unsigned char *hdr = g_soft_scratch_store.bytes;
     memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
     store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
     store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
     store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
     store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);     /* P-8:  discriminator */
-    __atomic_store_n(&g_soft_scratch, hdr + 32, __ATOMIC_RELEASE);
+    scratch = hdr + 32;
+    __atomic_store_n(&g_soft_scratch, scratch, __ATOMIC_RELEASE);
   }
-  scratch = g_soft_scratch;
   timer_unlock();
   return scratch;
 }
@@ -390,4 +403,49 @@ void zan_rt_fatal(const char *category, const char *message) {
   if (fn)
     fn(category, message);
   abort();
+}
+
+/* 头字可读性慢路径：生成代码在 string/数组上探测 [p-need, p) 的 ARC/串头字
+ * 判定「托管还是外来」。p 自身可读，故 (p & 4095) >= need 时头字与 p 同页，
+ * 编译器内联放行；只有 p 贴近页首（外来指针在独立映射页首、或托管块头恰在
+ * 前一页末尾）才调到这里。用不会触发信号的「安全拷贝」系统调用试读：不可读
+ * （未映射 / PROT_NONE）返回 0，生成代码按外来串处理（strlen、不碰 RC）；
+ * 判不了（系统调用被沙箱拒绝等）返回 1，即回到旧行为。 */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__linux__) && !defined(ZAN_BARE_METAL)
+#include <sys/uio.h>
+#endif
+int zan_rt_hdr_readable(const void *p, int64_t need) {
+    if (!p || need <= 0) return 1;
+    uintptr_t lo = (uintptr_t)p - (uintptr_t)need;
+    if (lo > (uintptr_t)p) return 0;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)lo, &mbi, sizeof mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return 1;
+#elif defined(__APPLE__)
+    unsigned char buf[64];
+    vm_size_t got = 0;
+    if ((size_t)need > sizeof buf) need = (int64_t)sizeof buf;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)lo,
+        (vm_size_t)need, (vm_address_t)buf, &got);
+    if (kr == KERN_SUCCESS) return 1;
+    return (kr == KERN_INVALID_ADDRESS || kr == KERN_PROTECTION_FAILURE) ? 0 : 1;
+#elif defined(__linux__) && !defined(ZAN_BARE_METAL)
+    unsigned char buf[64];
+    if ((size_t)need > sizeof buf) need = (int64_t)sizeof buf;
+    struct iovec local = { buf, (size_t)need };
+    struct iovec remote = { (void *)lo, (size_t)need };
+    int saved = errno;
+    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    int err = errno;
+    errno = saved;
+    if (n == (ssize_t)need) return 1;
+    return (n >= 0 || err == EFAULT) ? 0 : 1;
+#else
+    return 1;
+#endif
 }

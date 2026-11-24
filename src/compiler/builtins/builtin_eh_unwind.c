@@ -370,7 +370,9 @@ static LLVMValueRef get_eh_tmp_push_fn(zan_irgen_t *g) {
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
   fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_push", fnty);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
-  add_enum_attr(g, fn, NULL, "noinline");
+  /* 每个所有权临时值都要压/弹一次：小到该内联（对象密集代码里曾占 ~20%%
+   * 采样，大头是调用开销而非函数体）。 */
+  add_enum_attr(g, fn, NULL, "alwaysinline");
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
   LLVMPositionBuilderAtEnd(g->builder, entry);
@@ -396,7 +398,9 @@ static LLVMValueRef get_eh_tmp_pop_fn(zan_irgen_t *g) {
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
   fn = LLVMAddFunction(g->mod, "__zan_eh_tmp_pop", fnty);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
-  add_enum_attr(g, fn, NULL, "noinline");
+  /* 每个所有权临时值都要压/弹一次：小到该内联（对象密集代码里曾占 ~20%%
+   * 采样，大头是调用开销而非函数体）。 */
+  add_enum_attr(g, fn, NULL, "alwaysinline");
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
   LLVMBasicBlockRef dec = LLVMAppendBasicBlockInContext(g->ctx, fn, "dec");

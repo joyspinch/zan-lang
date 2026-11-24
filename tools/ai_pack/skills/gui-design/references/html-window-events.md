@@ -9,10 +9,32 @@
 1. **统一声明式事件指令**：
    - 支持 `@event`、`v-on:event`、`z-on:event`、`on<event>` 及 `data-on-<event>` 等标准声明语法。
    - 解析层自动完成 kebab-case 到组件标准 PascalCase 事件名的规范化映射（如 `@row-click` -> `RowClick`、`@cell-dblclick` -> `CellDoubleClick`、`@column-resize` -> `ColumnResize`、`@tab-change` -> `Change`、`@page-change` -> `Change` 等）。
-2. **双通道事件路由（BindEvent 与 BindEventS）**：
-   - 无参通道：`BindEvent(string evt, Action a)` 接收轻量无参回调。
-   - Sender 通道：`BindEventS(string evt, ControlEvent a)` 接收带 `Control sender` 实例强类型回调。
-   - **包装 state/model 的复合控件（如 DataGrid/TreeView/Pagination 等）必须重写 BindEventS**：不可仅重写 `BindEvent` 并任由 `BindEventS` 回退到基类的 `On.AddByNameS`，否则会导致带参回调无法触发底层状态机专属事件；必须显式通过 `this.st.<Event>.Add( => a(this))` 将自身封装为 sender 准确派发。
+2. **单通道事件与声明式事件表**：
+   - `UiEvent` 只有一个订阅通道：`Add` / `+=` / `On<Event>(…)` / `BindEvent(name, …)` 均按处理器形状重载，
+     `() => …` 与 `(Control s) => …` 共用同一事件，触发 `Raise(sender)` 先无参后 sender；`Count()` 计全部。
+     不存在 `AddS/RaiseS/PostS/BindEventS/OnClickS` 之类的平行方法。
+   - 控件**不重写** `BindEvent` / `TriggerEvent` / `Events()` 做字符串分派：在 `UiEvent` 字段或属性上标注
+     `[Event]`（列入设计器事件表）、`[Event(Alias = "Toggle PageChanged")]`（附加别名，空格分隔）、
+     `[Event(Hidden = true)]`（可按名绑定但不列出）、`[Event(Display = "Upload")]`（设计器显示名），
+     基类 `Control.EventOf` 经 `EventTable` 反射统一解析。
+   - **事件对象在 state/model 上的复合控件**（DataGrid、浏览器盒等）以属性公开：
+     `[Event] public UiEvent RowClick { get { return this.st.RowClick; } }`；state 持有 `weak Control host`，
+     触发处写 `st.RowClick.Raise(st.host)`，sender 处理器才拿到正确控件。
+   - `TriggerEvent` 仅在需要附带交互语义（禁用门控、切换状态、焦点副作用）时覆写。
+   - **属性声明（DefineProps）**：`Field("Name")` 不带值类型参数，值类型由字段/属性的声明类型
+     （string/int/bool 或对应 `Binding<T>`）反射推断；键与标签可由字段名派生时用
+     `PropSpec.TextField/IntField/BoolField/ColorField("CheckedText")`（键 `checkedText`、标签
+     `Checked text`），否则 `PropSpec.Text("key", "Label").Field("Name")`；一条属性一个链式表达式
+     `ps.Add(…)`，不再声明临时变量。编辑器种类与值类型用 `PropKind` / `PropValueKind` 枚举比较，
+     禁止 `kind == 3` 之类魔法数。
+   - **属性读写一律声明，不重写 SetProp/GetProp/GetExtra/SetExtra**（`ViaExtra` 已删除）：
+     字段型 `Field("X")`（声明类型可以是属性，setter 里写副作用）；读字段写方法
+     `Field("x").Setter("SetX")`（按字段类型收 string/int/bool）；计算属性
+     `Accessor("XText", "SetXText")`（一对文本方法，与 Field 并用时 Field 提供模型绑定身份）；
+     转发到子控件 `ForwardTo(child, "text")`；「任一属性写入即重建」覆写
+     `OnPropertyChanged(PropSpec)`（不按 key 分派）。方法名在 `Props()` 构建时校验。
+     唯一保留按名重写的是通用 HTML `Element`（开放属性袋）。未声明的键经通用协议写入会被当成样式类，
+     所以凡是可写的键都必须声明。
 3. **表格等大型组件的多维丰富事件（Row / Cell / Column / Grid）**：
    - 行级：`RowClick`、`RowDoubleClick`、`RowRightClick`（别名 `RowContext`）、`RowInserted`、`RowDeleted`。
    - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
@@ -24,7 +46,7 @@
    - `Pagination`：`Change`（切页）、`SizeChange`（切每页条数）。
    - `ListView`：`Select`、`Activate`、`Context`。
    - `Tabs`：`Change`（切标签页）。
-   - 全部专属事件必须注册在 `Events` 清单中，并通过 `BindEvent` / `BindEventS` 双通道无缝转发。
+   - 全部专属事件以 `[Event]` 标注声明，设计器清单与按名接线都由事件表自动生成。
 
 5. **设计器画布纪律（ToolStrip 项与组件配置规范）**：
    - **紧凑型关闭按钮（MiniCloseBtn）排版纪律**：属性检查器（选项列表、CSS 样式表等）中的单项删除按钮禁止使用常规 28px/34px 操作按钮，统一采用 20px 紧凑圆底微十字按钮，避免挤占输入框与标签的空间。
@@ -136,7 +158,7 @@
        4. `BEHAVIOR`（行为与状态）：`required`（必填校验）、`wrap`（自动折行）、`orient`（Tab方向）及 `defOn`（默认开启）。
      - 分类过滤（`inspCategory`）只在选择“全部 (All)”时渲染 Section 分组栏；在单项分类下隐去分组头直接展示过滤后的紧凑属性。
    - **PropertyGrid Section Bar 视觉质感**：
-     - `PropertyGrid` 渲染 `PropSpec.kind == 5`（Section 头）时，必须画出专属条带（`t.bgSecondary` 背景、左侧垂直强调色条 `t.primary`、高亮分类文字），与普通属性行形成鲜明视觉阶梯。
+     - `PropertyGrid` 渲染 `PropSpec.kind == PropKind.Section`（分组头）时，必须画出专属条带（`t.bgSecondary` 背景、左侧垂直强调色条 `t.primary`、高亮分类文字），与普通属性行形成鲜明视觉阶梯。
    - **快捷工具栏卡片行高计算与垂直呼吸律（Anti-Card-Overflow）**：
      - 快捷按钮（`SmallBtn`）的高度约为 24px。卡片内部放 N 行按钮时，行间步进距必须保持至少 28px~30px（例如 `row1: 8px`、`row2: 36px`、`row3: 66px`），卡片总高度必须为 `app.Scale(96~130)` 并留足底边距，严禁卡片高度不足 78px 强塞 3 行导致按钮垂直重叠、文字压盖与溢出边界。
      - 快捷卡片与卡片之间统一保持 10px 间距；快捷操作区与下方的 `PropertyGrid` 之间必须保持 12px 留白；多选批量卡片（3行按钮+双行文字）必须保留 126px 充足纵深。

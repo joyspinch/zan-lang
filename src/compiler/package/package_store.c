@@ -343,6 +343,7 @@ typedef struct {
   struct pkg_index_package *package;
   int project_owned;
   int uniform;        /* 1: declared 已知 = dir_ns */
+  int probed;         /* 1: 阶段一首文件已 probe（未命中 uniform） */
   char dir_ns[256];   /* 目录推导命名空间（回退用） */
   char declared[256]; /* probe 结果（仅 !uniform） */
   int has_ns;

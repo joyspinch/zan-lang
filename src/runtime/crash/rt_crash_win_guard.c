@@ -505,3 +505,9 @@ void zan__crash_install(void) {
   if (image == GetModuleHandleA(NULL))
     atexit(zan__crash_atexit);
 }
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor)) static void zan__crash_ctor(void) {
+  zan__crash_install();
+}
+#endif

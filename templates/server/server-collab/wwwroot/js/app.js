@@ -1,4 +1,4 @@
-/* app.js：htmx/Alpine 未覆盖的粘合层，页面渲染不依赖。 */
+/* app.js：htmx/Alpine 未覆盖的粘合层，以及商业科技官网的轻量交互（零内联脚本）。 */
 
 (function () {
   "use strict";
@@ -26,6 +26,47 @@
     host.appendChild(el);
     setTimeout(function () { el.remove(); }, 4000);
   }
+
+  // 工作台交互预览 Tab 切换（[data-preview-tab] -> [data-preview-panel]）。
+  (function previewTabs() {
+    var tabs = document.querySelectorAll("[data-preview-tab]");
+    var panels = document.querySelectorAll("[data-preview-panel]");
+    if (!tabs.length || !panels.length) { return; }
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].addEventListener("click", function () {
+        var target = this.getAttribute("data-preview-tab");
+        for (var j = 0; j < tabs.length; j++) {
+          var on = tabs[j] === this;
+          tabs[j].classList.toggle("active", on);
+          tabs[j].setAttribute("aria-selected", on ? "true" : "false");
+        }
+        for (var k = 0; k < panels.length; k++) {
+          var match = panels[k].getAttribute("data-preview-panel") === target;
+          panels[k].classList.toggle("active", match);
+          if (match) { panels[k].removeAttribute("hidden"); }
+          else { panels[k].setAttribute("hidden", ""); }
+        }
+      });
+    }
+  })();
+
+  // 移动端导航折叠按钮。
+  (function mobileNav() {
+    var btn = document.querySelector("[data-nav-toggle]");
+    var nav = document.getElementById("site-nav");
+    if (!btn || !nav) { return; }
+    btn.addEventListener("click", function () {
+      var open = nav.classList.toggle("open");
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    var links = nav.querySelectorAll("a");
+    for (var i = 0; i < links.length; i++) {
+      links[i].addEventListener("click", function () {
+        nav.classList.remove("open");
+        btn.setAttribute("aria-expanded", "false");
+      });
+    }
+  })();
 
   // 在线人数：每页一个 EventSource，流断开自动重连。
   (function live() {

@@ -47,35 +47,37 @@ class EventsLazyAllocationTest {
         for (int i = 0; i < 1000; i = i + 1) { nodes[i] = new Panel(); }
 
         bool empty = true;
+        // 每个控件类型的事件表（EventTable）在首次按名查找时构建一次并缓存；
+        // 预热后，空节点的查询/触发/投递/清空不再分配。
+        nodes[0].TriggerEvent("DoubleClick");
         before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < 1000; i = i + 1) {
             Control node = nodes[i];
             if (node.On.Any() || node.AcceptsRetainedLongPress()) { empty = false; }
             node.TriggerEvent("Click");
             node.TriggerEvent("DoubleClick");
-            node.On.FireByName("Unknown", node);
+            node.TriggerEvent("Unknown");
             node.TriggerEvent("Resize");
             node.TriggerEvent("Show");
             node.TriggerEvent("Hide");
             node.FireKeyNamed("KeyDown");
             bare[i].Count();
-            bare[i].CountS();
-            bare[i].CountAll();
+            bare[i].Count();
             bare[i].Raise();
-            bare[i].RaiseS(node);
+            bare[i].Raise(node);
             bare[i].Post();
-            bare[i].PostS(node);
+            bare[i].Post(node);
             bare[i].Clear();
         }
         long queryBytes = GC.GetAllocatedBytesForCurrentThread() - before;
         Check(empty && queryBytes == 0, "1000 empty nodes query/fire/post/clear allocate nothing");
 
         before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 1000; i = i + 1) { nodes[i].Click.CountAll(); }
+        for (int i = 0; i < 1000; i = i + 1) { nodes[i].Click.Count(); }
         long materializedBytes = GC.GetAllocatedBytesForCurrentThread() - before;
         Check(materializedBytes > eventBytes, "explicit access materializes event and slot storage");
         before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 1000; i = i + 1) { nodes[i].Click.CountAll(); }
+        for (int i = 0; i < 1000; i = i + 1) { nodes[i].Click.Count(); }
         Check(GC.GetAllocatedBytesForCurrentThread() - before == 0,
             "repeated property access preserves identity without allocations");
         Action plain = EventsLazyAllocationTest.Plain;
@@ -85,13 +87,13 @@ class EventsLazyAllocationTest {
         Check(GC.GetAllocatedBytesForCurrentThread() - before > 0,
             "first plain subscription allocates its list");
         before = GC.GetAllocatedBytesForCurrentThread();
-        bare[0].AddS(senderHandler);
+        bare[0].Add(senderHandler);
         Check(GC.GetAllocatedBytesForCurrentThread() - before > 0,
             "first sender subscription independently allocates its list");
         bare[0].Clear();
         before = GC.GetAllocatedBytesForCurrentThread();
         bare[0].Remove(plain);
-        bare[0].RemoveS(senderHandler);
+        bare[0].Remove(senderHandler);
         bare[0].Clear();
         Check(GC.GetAllocatedBytesForCurrentThread() - before == 0,
             "empty Remove and Clear allocate no replacement lists");
@@ -106,7 +108,7 @@ class EventsLazyAllocationTest {
         w.DoubleClick += EventsLazyAllocationTest.Plain;
         Check(w.DoubleClick == replacement && w.DoubleClick.Count() == 1, "property += writes same event back");
         w.DoubleClick -= EventsLazyAllocationTest.Plain;
-        Check(w.DoubleClick.CountAll() == 0 && !w.Any(), "property -= updates gate");
+        Check(w.DoubleClick.Count() == 0 && !w.Any(), "property -= updates gate");
         w.DoubleClick = null;
         Check(!w.Any(), "null replacement is empty");
         Check(w.DoubleClick != replacement, "access after null materializes a fresh event");
@@ -119,15 +121,14 @@ class EventsLazyAllocationTest {
         Control clickOwner = new Panel();
         clickOwner.Click = replacement;
         clickOwner.BindEvent("Click", EventsLazyAllocationTest.Hit);
-        clickOwner.BindEventS("Click", EventsLazyAllocationTest.Sender);
+        clickOwner.BindEvent("Click", EventsLazyAllocationTest.Sender);
         hits = 0;
         lastSender = null;
         clickOwner.TriggerEvent("Click");
         Check(hits == 1 && lastSender == clickOwner && clickOwner.Click == replacement,
             "named and direct Click subscriptions share one event");
         replacement.Clear();
-        Check(!w.AddByName("Click", EventsLazyAllocationTest.Hit)
-            && !w.AddByNameS("Click", EventsLazyAllocationTest.Sender), "no duplicate Click slot");
+        Check(w.Named("Click") == null && w.Find("Click") == null, "no duplicate Click slot");
 
         List<string> names = WidgetEvents.Names();
         Check(names.Count == 20 && names[0] == "DoubleClick" && names[15] == "LongPress"
@@ -135,11 +136,13 @@ class EventsLazyAllocationTest {
         Control sender = new Panel();
         for (int i = 0; i < names.Count; i = i + 1) {
             string name = names[i];
-            Check(w.AddByName(name, EventsLazyAllocationTest.Hit), "named subscription");
-            Check(w.AddByNameS(name, EventsLazyAllocationTest.Sender), "named sender subscription");
+            UiEvent named = w.Named(name);
+            Check(named != null && w.Find(name) == named, "named subscription");
+            named.Add(EventsLazyAllocationTest.Hit);
+            named.Add(EventsLazyAllocationTest.Sender);
             hits = 0;
             lastSender = null;
-            w.FireByName(name, sender);
+            w.Find(name).Raise(sender);
             Check(hits == 1 && lastSender == sender, "shared named fire mapping");
             object ev = w.GetFieldObject(name);
             Check(ev is UiEvent, "public property exists for each mapped name");
@@ -147,8 +150,7 @@ class EventsLazyAllocationTest {
         Check(w.HasLongPress(), "sender and plain longpress subscriptions opt in");
         w.LongPress.Clear();
         Check(!w.HasLongPress(), "cleared longpress opts out");
-        Check(!w.AddByName("Unknown", EventsLazyAllocationTest.Hit)
-            && !w.AddByNameS("Unknown", EventsLazyAllocationTest.Sender), "unknown names rejected");
+        Check(w.Named("Unknown") == null && !WidgetEvents.Has("Unknown"), "unknown names rejected");
         List<string> common = Control.CommonEvents();
         Check(common.Count == 24 && common[21] == "Resize" && common[23] == "Hide",
             "common lifecycle ordering");
@@ -161,39 +163,39 @@ class EventsLazyAllocationTest {
         Control sender = new Panel();
         UiEvent ev = new UiEvent();
         ev.Remove(EventsLazyAllocationTest.Plain);
-        ev.RemoveS(EventsLazyAllocationTest.Sender);
-        ev.AddS(EventsLazyAllocationTest.Sender);
+        ev.Remove(EventsLazyAllocationTest.Sender);
+        ev.Add(EventsLazyAllocationTest.Sender);
         ev.Add(EventsLazyAllocationTest.Plain);
-        ev.AddS(EventsLazyAllocationTest.SenderSecond);
+        ev.Add(EventsLazyAllocationTest.SenderSecond);
         ev.Add(EventsLazyAllocationTest.PlainSecond);
         order = "";
-        ev.RaiseS(sender);
+        ev.Raise(sender);
         Check(order == "ABST" && lastSender == sender, "sync plain-before-sender registration order");
         order = "";
-        ev.PostS(sender);
-        Check(order == "", "PostS is deferred");
+        ev.Post(sender);
+        Check(order == "", "Post(sender) is deferred");
         ev.Clear();
-        Check(ev.CountAll() == 0, "Clear empties both channels");
+        Check(ev.Count() == 0, "Clear empties both channels");
         EventsLazyAllocationTest.Drain();
-        Check(order == "ABST" && lastSender == sender, "Clear preserves queued PostS order and sender");
+        Check(order == "ABST" && lastSender == sender, "Clear preserves queued Post order and sender");
         ev.Add(EventsLazyAllocationTest.Plain);
         ev.Add(EventsLazyAllocationTest.PlainSecond);
         ev.Add(EventsLazyAllocationTest.Plain);
         ev.Remove(EventsLazyAllocationTest.Plain);
-        ev.AddS(EventsLazyAllocationTest.Sender);
-        ev.AddS(EventsLazyAllocationTest.Sender);
-        ev.RemoveS(EventsLazyAllocationTest.Sender);
-        Check(ev.Count() == 2 && ev.CountS() == 1, "Remove removes the last equal registration");
+        ev.Add(EventsLazyAllocationTest.Sender);
+        ev.Add(EventsLazyAllocationTest.Sender);
+        ev.Remove(EventsLazyAllocationTest.Sender);
+        Check(ev.Count() == 3, "Remove removes the last equal registration");
         order = "";
         ev.Post();
         Check(order == "", "Post is deferred");
         EventsLazyAllocationTest.Drain();
-        Check(order == "AB", "Post only queues plain channel in registration order");
+        Check(order == "ABS" && lastSender == null, "sender-less Post queues every handler, sender handlers get null");
         ev.Clear();
         ev.Add(() => { ev.Clear(); });
         ev.Add(() => { throw new Exception("cleared plain callback ran"); });
-        ev.AddS((Control s) => { throw new Exception("cleared sender callback ran"); });
-        ev.RaiseS(sender);
+        ev.Add((Control s) => { throw new Exception("cleared sender callback ran"); });
+        ev.Raise(sender);
         // 清除捕获自身的回调，防止测试构成 ev -> callback -> ev 环。
         ev.Clear();
         Console.WriteLine("subscription, removal, reentrant Clear and deferred order preserved");
@@ -202,12 +204,12 @@ class EventsLazyAllocationTest {
     static void RoutingAndButton() {
         Control node = new Panel();
         node.BindEvent("Click", EventsLazyAllocationTest.Plain);
-        node.BindEventS("Click", EventsLazyAllocationTest.Sender);
+        node.BindEvent("Click", EventsLazyAllocationTest.Sender);
         order = "";
         RoutedEventArgs click = new RoutedEventArgs("Click", node);
         node.OnRoutedEvent(click);
         Check(order == "AS" && lastSender == node, "routed event synchronous sender");
-        node.On.LongPress.AddS(EventsLazyAllocationTest.Sender);
+        node.On.LongPress.Add(EventsLazyAllocationTest.Sender);
         Check(node.AcceptsRetainedLongPress(), "longpress sender-only ownership");
         order = "";
         RoutedEventArgs press = new RoutedEventArgs("LongPress", node);
@@ -218,9 +220,9 @@ class EventsLazyAllocationTest {
 
         Button button = new Button();
         button.BindEvent("Click", EventsLazyAllocationTest.Plain);
-        button.BindEventS("Click", EventsLazyAllocationTest.Sender);
+        button.BindEvent("Click", EventsLazyAllocationTest.Sender);
         button.Click.Add(EventsLazyAllocationTest.PlainSecond);
-        button.Click.AddS(EventsLazyAllocationTest.SenderSecond);
+        button.Click.Add(EventsLazyAllocationTest.SenderSecond);
         order = "";
         button.TriggerEvent("Click");
         Check(order == "", "Button Click stays deferred");
@@ -234,7 +236,7 @@ class EventsLazyAllocationTest {
         EventCaptureBox capture = new EventCaptureBox();
         WeakReference<EventCaptureBox> watch = new WeakReference<EventCaptureBox>(capture);
         ev.Add(() => { capture.Set(1); });
-        ev.AddS((Control sender) => { capture.Set(2); });
+        ev.Add((Control sender) => { capture.Set(2); });
         return watch;
     }
 
@@ -244,24 +246,24 @@ class EventsLazyAllocationTest {
         Action plain = () => { capture.Set(1); };
         ControlEvent sender = (Control s) => { capture.Set(2); };
         ev.Add(plain);
-        ev.AddS(sender);
+        ev.Add(sender);
         ev.Remove(plain);
-        ev.RemoveS(sender);
+        ev.Remove(sender);
         return watch;
     }
 
     static WeakReference<Control> QueueSender() {
         Control sender = new Panel();
         WeakReference<Control> watch = new WeakReference<Control>(sender);
-        sender.Click.AddS((Control s) => { s.On.Any(); });
-        sender.Click.PostS(sender);
+        sender.Click.Add((Control s) => { s.On.Any(); });
+        sender.Click.Post(sender);
         return watch;
     }
 
     static WeakReference<Control> SubscribedNode() {
         Control node = new Panel();
         node.Click.Add(EventsLazyAllocationTest.Plain);
-        node.Click.AddS(EventsLazyAllocationTest.Sender);
+        node.Click.Add(EventsLazyAllocationTest.Sender);
         return new WeakReference<Control>(node);
     }
 
@@ -272,13 +274,13 @@ class EventsLazyAllocationTest {
         ev.Clear();
         Check(!capture.IsAlive, "Clear releases both channel closures");
         WeakReference<EventCaptureBox> removed = EventsLazyAllocationTest.RemoveCapture(ev);
-        Check(!removed.IsAlive && ev.CountAll() == 0, "Remove releases both channel closures");
+        Check(!removed.IsAlive && ev.Count() == 0, "Remove releases both channel closures");
         WeakReference<Control> subscribed = EventsLazyAllocationTest.SubscribedNode();
         Check(!subscribed.IsAlive, "event storage does not retain owner");
         WeakReference<Control> pending = EventsLazyAllocationTest.QueueSender();
-        Check(pending.IsAlive, "PostS retains sender until dispatch");
+        Check(pending.IsAlive, "Post retains sender until dispatch");
         EventsLazyAllocationTest.Drain();
-        Check(!pending.IsAlive, "drained PostS releases sender and its event bag");
+        Check(!pending.IsAlive, "drained Post releases sender and its event bag");
         Console.WriteLine("weak closure, owner and queued sender lifetimes preserved");
     }
 

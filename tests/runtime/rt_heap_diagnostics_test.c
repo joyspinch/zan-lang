@@ -1,6 +1,34 @@
 /* Standalone runtime fixture. Compile this translation unit without linker
  * allocator wrapping and pass a dedicated writable snapshot path as argv[1]. */
-#include "../../src/runtime/rt_mem.c"
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <sched.h>
+#endif
+
+#include "../../src/common/zan_abi.h"
+
+void zan_rt_fatal(const char *category, const char *message);
+
+static int fail_growth;
+static int failed_growths;
+
+static void *test_realloc(void *p, size_t bytes) {
+  if (p && fail_growth) {
+    failed_growths++;
+    return NULL;
+  }
+  return realloc(p, bytes);
+}
+
+#define ZAN_GC_REALLOC test_realloc
+#include "../../src/runtime/timer/rt_timer_gc.c"
 
 #define CHECK(c)                                                               \
   do {                                                                         \
@@ -9,33 +37,6 @@
       return 1;                                                                \
     }                                                                          \
   } while (0)
-
-static int fail_growth;
-static int failed_growths;
-
-#if defined(_WIN32)
-static void *(__cdecl *native_realloc)(void *, size_t);
-#else
-void *__real_malloc(size_t n) { return malloc(n); }
-void __real_free(void *p) { free(p); }
-void *__real_calloc(size_t n, size_t m) { return calloc(n, m); }
-#endif
-
-static void *test_realloc(void *p, size_t bytes) {
-  if (p && fail_growth) {
-    failed_growths++;
-    return NULL;
-  }
-#if defined(_WIN32)
-  return native_realloc(p, bytes);
-#else
-  return realloc(p, bytes);
-#endif
-}
-
-#if !defined(_WIN32)
-void *__real_realloc(void *p, size_t bytes) { return test_realloc(p, bytes); }
-#endif
 
 void zan_rt_fatal(const char *category, const char *message) {
   fprintf(stderr, "Unexpected fatal [%s]: %s\n", category, message);
@@ -335,17 +336,9 @@ static int test_snapshot_oom(const char *path) {
   CHECK(fputs("prior snapshot\n", file) >= 0);
   CHECK(fclose(file) == 0);
 
-#if defined(_WIN32)
-  zan_mem_require_native_alloc();
-  native_realloc = g_native_realloc;
-  g_native_realloc = test_realloc;
-#endif
   fail_growth = 1;
   int64_t result = zan_gc_write_heap_snapshot(path);
   fail_growth = 0;
-#if defined(_WIN32)
-  g_native_realloc = native_realloc;
-#endif
   CHECK(result == -1 && failed_growths == 1);
   char line[256];
   file = fopen(path, "r");

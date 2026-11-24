@@ -161,7 +161,7 @@ __attribute__((weak)) size_t zan_mem_trim(void) { return 0; }
 /* —— Dictionary/HashSet 键哈希（B-ID80）——
  * 曾在 IR 内联定种 FNV-1a（基值写死，irgen_builtins.c）：攻击者可离线
  * 构造碰撞键族，Web 服务端收到恶意键集即把哈希桶打满 O(N) 链。现改
- * SipHash-2-4 + 进程级随机盐：盐由 OS 熵源一次性取（构造器初始化 +
+ * SipHash-1-3 + 进程级随机盐：盐由 OS 熵源一次性取（构造器初始化 +
  * 惰性兜底），不出进程——离线碰撞构造失效，同进程内哈希稳定。
  * 落点选 rt_timer.o：它是唯一被所有链接路径（hosted/交叉 linux/macos/
  * ios/wasm32/android）无条件拉入的运行时对象；bare 单独走
@@ -181,9 +181,9 @@ int64_t __zan_dict_hash(const void *key, int64_t is_str) {
     const char *c = (const char *)key;
     while (c[n])
       n++;
-    return (int64_t)zan_siphash24(key, n, k0, k1);
+    return (int64_t)zan_siphash13(key, n, k0, k1);
   }
-  return (int64_t)zan_siphash24(&key, sizeof(key), k0, k1);
+  return (int64_t)zan_siphash13(&key, sizeof(key), k0, k1);
 }
 
 #else /* !ZAN_BARE_METAL：hosted 熵盐版 */
@@ -245,11 +245,11 @@ int64_t __zan_dict_hash(const void *key, int64_t is_str) {
     __atomic_store_n(&zan_hash_salt_lock, 0L, __ATOMIC_RELEASE);
   }
   if (is_str) {
-    return (int64_t)zan_siphash24(key, strlen((const char *)key),
+    return (int64_t)zan_siphash13(key, strlen((const char *)key),
                                   zan_hash_salt_k0, zan_hash_salt_k1);
   }
   /* 非字符串键走引用同一性：哈希指针 8 字节（同进程内稳定） */
-  return (int64_t)zan_siphash24(&key, sizeof(key), zan_hash_salt_k0,
+  return (int64_t)zan_siphash13(&key, sizeof(key), zan_hash_salt_k0,
                                 zan_hash_salt_k1);
 }
 

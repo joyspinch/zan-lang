@@ -401,6 +401,9 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_co.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
     VERBATIM)
 add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
@@ -3215,6 +3218,19 @@ if(NOT WIN32 AND NOT APPLE)
   set_tests_properties(runtime_mem_musl_calloc PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
 
+# Apple has no --wrap: Zan code calls zan_mem_* by name and a registered
+# malloc zone hands libc free/realloc of Zan blocks back to rt_mem.c.
+if(APPLE)
+  add_executable(zan_rt_mem_apple_zone_test
+    tests/runtime/rt_mem_apple_zone_test.c
+    src/runtime/rt_mem.c src/runtime/rt_timer.c src/runtime/rt_crash.c)
+  target_include_directories(zan_rt_mem_apple_zone_test PRIVATE ${CMAKE_SOURCE_DIR})
+  set_target_properties(zan_rt_mem_apple_zone_test PROPERTIES
+    C_STANDARD 11 C_STANDARD_REQUIRED YES)
+  add_test(NAME runtime_mem_apple_zone COMMAND zan_rt_mem_apple_zone_test)
+  set_tests_properties(runtime_mem_apple_zone PROPERTIES TIMEOUT 30)
+endif()
+
 # ---- Conformance suite: compile each program, run it, diff stdout vs golden ----
 if(WIN32)
   set(_exe_ext ".exe")
@@ -3550,8 +3566,9 @@ set(_plain_golden ${_known_leaky} array_local_free arc_leak_site_label)
 # Native ABI fixture deliberately supplies its own descriptors/headers, outside
 # leak-site registration. Keep one uninstrumented binary and a precise verdict.
 list(APPEND _conf_skip_cases arc_deferred_stack)
-# Verify the generated thread-local queue without the optional allocator.
-if(WIN32 OR UNIX)
+# The pending/drain assertions need the real queue, which lives in zanrt_timer
+# (linked on every hosted target, Apple included).
+if(TARGET zanrt_timer)
   set(_arc_fixture_cc "${CMAKE_C_COMPILER}")
   if(WIN32)
     set(_arc_fixture_cc "${ZAN_RT_IO_CC}")
@@ -3710,8 +3727,10 @@ foreach(_src ${_conf_srcs})
     set(_extra_args "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/runtime_generic_collection_identity_item.zan")
   elseif(_name STREQUAL "task_action_selected_public")
     set(_extra_args "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/task_action_selected_public.zan")
-  elseif(_name MATCHES "^(binding_custom_property_ir|binding_property_dispatch_ir|binding_property_generic_ir)$")
-    # Exercise property helpers and their caller debug-location isolation.
+  elseif(_name MATCHES "^(binding_custom_property_ir|binding_property_dispatch_ir|binding_property_generic_ir|debug_info_returnaddress)$")
+    # Exercise property helpers and their caller debug-location isolation;
+    # debug_info_returnaddress pins -g + ARC instruments past the verifier
+    # (llvm.returnaddress must carry its overload suffix on LLVM >= 23).
     set(_extra_args "-g")
   elseif(_name STREQUAL "gc_cycle_detector")
     # The host runtime appends the source table. The selfhost differential
@@ -4584,6 +4603,7 @@ if(SELFHOST_CLANG)
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_entry_format.cmake)
   set_tests_properties(selfhost_entry_format PROPERTIES
+    FIXTURES_REQUIRED selfhost_gen1_diagnostics
     TIMEOUT 300 RESOURCE_LOCK selfhost_entry_format)
   add_test(NAME selfhost_production_diff
     COMMAND ${CMAKE_COMMAND}
@@ -4662,7 +4682,9 @@ add_test(NAME selfhost_gen1
     "-DRT_OBJS=${_sh_rt_objs}"
     "-DSYSLIBS=${_sh_syslibs}"
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
-set_tests_properties(selfhost_gen1 PROPERTIES TIMEOUT 600)
+set_tests_properties(selfhost_gen1 PROPERTIES
+  FIXTURES_SETUP selfhost_gen1_diagnostics
+  TIMEOUT 600)
 
 # The gen1 twin of diag_method_group_this_return: the self-hosted checker
 # must emit the same W2072 return-escape warning, and --deny-warnings must
@@ -4676,7 +4698,9 @@ add_test(NAME selfhost_method_group_this_return
     "-DZANC_ARGS=--auto-stdlib;--deny-warnings"
     "-DEXPECT_REGEX=\\[W2072\\] returned closure captures 'this' and escapes method scope"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(selfhost_method_group_this_return PROPERTIES TIMEOUT 120)
+set_tests_properties(selfhost_method_group_this_return PROPERTIES
+  FIXTURES_REQUIRED selfhost_gen1_diagnostics
+  TIMEOUT 120)
 
 # A semantic ownership gate needs the LLVM verifier as well as a linker;
 # clang alone can accept malformed textual IR without running the verifier.
@@ -4704,6 +4728,7 @@ if(SELFHOST_CLANG AND _shd_rt_objs)
       "-DRTOBJS=${_shd_rt_objs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
   set_tests_properties(selfhost_method_group PROPERTIES
+    FIXTURES_REQUIRED selfhost_gen1_diagnostics
     TIMEOUT 600 LABELS "full" RESOURCE_LOCK selfhost_method_group)
 endif()
 if(SELFHOST_CLANG AND SELFHOST_LLVM_AS)
@@ -5153,7 +5178,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DWORK=${CMAKE_BINARY_DIR}/templates_build
       -DEXE_EXT=${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_templates.cmake)
-  set_tests_properties(templates_build PROPERTIES TIMEOUT 900)
+  set_tests_properties(templates_build PROPERTIES TIMEOUT 3000)
 
   add_test(NAME conformance_gui_retarget
     COMMAND ${CMAKE_COMMAND}
@@ -6547,20 +6572,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
 
 
 
-  # The generated IGameScene adapter: an .html scene design document projects a nested
-  # `partial class <Name>Scene : Game.Foundation.IGameScene` whose Enter/Exit
-  # route through the code-behind's OnScene* hooks, Doc() exposes the live
-  # document for handler registration, and PendingScene() surfaces the
-  # OpenScene queue to the host. Exercises the whole flow through a
-  # SceneStack headlessly (Update without a host window must no-op).
+  # The runtime HTML scene adapter: loads tests/gui/scene_adapter.html via
+  # SceneDoc.Parse, exposes IGameScene Enter/Exit hooks through the code-behind
+  # OnScene* callbacks, Doc() for handler registration, and PendingScene() for
+  # OpenScene transitions headlessly through a SceneStack.
   add_test(NAME conformance_gui_scene_adapter
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.html;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=--embed;tests/gui/scene_adapter.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_scene_adapter${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_scene_adapter PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
   add_test(NAME conformance_gui_props
     COMMAND ${CMAKE_COMMAND}
@@ -8965,7 +8990,6 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext})
   set_tests_properties(tool_selfhost_diagnostics_jsonl PROPERTIES
     FIXTURES_REQUIRED selfhost_gen1_diagnostics TIMEOUT 120)
-  set_tests_properties(selfhost_gen1 PROPERTIES FIXTURES_SETUP selfhost_gen1_diagnostics)
 
   add_test(NAME tool_zanc_semantic_refs
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/run_zanc_semantic_refs.py

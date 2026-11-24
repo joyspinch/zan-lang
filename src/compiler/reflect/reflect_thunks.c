@@ -264,8 +264,33 @@ static LLVMValueRef refl_unpack_arg(zan_irgen_t *g, LLVMValueRef fn,
   return LLVMConstNull(want);
 }
 
+static zan_type_t *refl_concrete_inst(zan_symbol_t *sym, zan_type_t *inst) {
+  if (!sym || !inst || !is_user_generic_sym(sym))
+    return NULL;
+  if (inst->sym != sym || inst->type_arg_count <= 0 || !inst->type_args)
+    return NULL;
+  if (!type_is_concrete(inst) || type_mentions_canon(inst))
+    return NULL;
+  return inst;
+}
+
+static zan_type_t *refl_method_owner_inst(zan_irgen_t *g, zan_symbol_t *sym,
+                                          zan_type_t *inst,
+                                          zan_symbol_t *msym) {
+  if (!msym || !msym->parent || !is_user_generic_sym(msym->parent))
+    return NULL;
+  zan_type_t *cur = inst ? inst : (sym ? sym->type : NULL);
+  zan_type_t *vo = cur ? vtable_owner_inst(g, cur, msym->parent) : NULL;
+  if (vo && vo->type_arg_count > 0 && vo->type_args && type_is_concrete(vo) &&
+      !type_mentions_canon(vo))
+    return vo;
+  return NULL;
+}
+
 static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
-                                    LLVMTypeRef fn_ty, zan_ast_list_t *params,
+                                    LLVMTypeRef fn_ty, LLVMValueRef gctx_arg,
+                                    zan_ast_list_t *params,
+                                    zan_type_t *owner_inst,
                                     zan_type_t *ret_type, bool is_static,
                                     bool is_task, const char *tag) {
   if (!fn || !fn_ty)
@@ -275,11 +300,15 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
 
-  unsigned total = LLVMCountParamTypes(fn_ty);
+  unsigned raw_total = LLVMCountParamTypes(fn_ty);
+  unsigned expected_user =
+      (is_static ? 0u : 1u) + (unsigned)(params ? params->count : 0);
+  bool pass_gctx = gctx_arg && raw_total == expected_user + 1u;
+  unsigned total = pass_gctx ? (raw_total - 1u) : raw_total;
   unsigned max_params = is_static ? ZAN_REFL_ARG_SLOTS : ZAN_REFL_ARG_SLOTS + 1;
   if (total > max_params)
     return NULL;
-  LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
+  LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 2];
   LLVMGetParamTypes(fn_ty, ptypes);
   unsigned first = is_static ? 0 : 1;
   if (!is_static &&
@@ -290,16 +319,36 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     return NULL;
 
   /* Inherited copies must refer to the same callable payload. Key by the
-   * complete LLVM callee identity and receiver convention, never by member
-   * name (overrides/specializations can have the same source name). */
+   * complete LLVM callee identity, receiver convention, and bound gctx
+   * constant (for __Canon instantiations), never by member name. */
   size_t fn_len = 0;
   const char *fn_name = LLVMGetValueName2(fn, &fn_len);
-  size_t name_cap = fn_len + 64;
+  size_t gctx_len = 0;
+  const char *gctx_name = NULL;
+  if (pass_gctx) {
+    LLVMValueRef gkey = gctx_arg;
+    while (gkey && LLVMIsAConstantExpr(gkey) &&
+           LLVMGetConstOpcode(gkey) == LLVMBitCast)
+      gkey = LLVMGetOperand(gkey, 0);
+    if (gkey && !LLVMIsNull(gkey))
+      gctx_name = LLVMGetValueName2(gkey, &gctx_len);
+    if (!gctx_name || !gctx_len) {
+      gctx_name = "null";
+      gctx_len = 4;
+    }
+  }
+  size_t name_cap = fn_len + gctx_len + 64;
   char *nm = (char *)malloc(name_cap);
   if (!nm)
     return NULL;
-  snprintf(nm, name_cap, "__zan.refl.thunk.%s.%c.%.*s", tag ? tag : "m",
-           is_static ? 's' : 'i', (int)fn_len, fn_name);
+  if (pass_gctx) {
+    snprintf(nm, name_cap, "__zan.refl.thunk.%s.%c.%.*s.%.*s",
+             tag ? tag : "m", is_static ? 's' : 'i', (int)fn_len, fn_name,
+             (int)gctx_len, gctx_name);
+  } else {
+    snprintf(nm, name_cap, "__zan.refl.thunk.%s.%c.%.*s", tag ? tag : "m",
+             is_static ? 's' : 'i', (int)fn_len, fn_name);
+  }
   LLVMValueRef cached = LLVMGetNamedFunction(g->mod, nm);
   if (cached) {
     free(nm);
@@ -332,7 +381,7 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
   LLVMPositionBuilderAtEnd(g->builder, entry);
 
   bool ok = true;
-  LLVMValueRef call_args[ZAN_REFL_ARG_SLOTS + 1];
+  LLVMValueRef call_args[ZAN_REFL_ARG_SLOTS + 2];
   if (!is_static)
     call_args[0] = LLVMBuildBitCast(g->builder, LLVMGetParam(th, 0), ptypes[0],
                                     "refl.self");
@@ -348,8 +397,11 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
                                      &vk_off, 1, "refl.vkp");
     LLVMValueRef vkind = LLVMBuildLoad2(g->builder, i64, vkp, "refl.vk");
     zan_type_t *pzt = NULL;
-    if (params && (int)ai < params->count)
+    if (params && (int)ai < params->count) {
       pzt = zan_binder_resolve_type(g->binder, params->items[ai]->param.type);
+      if (pzt && owner_inst)
+        pzt = subst_type_param_deep(g, pzt, owner_inst);
+    }
     call_args[i] =
         refl_unpack_arg(g, th, pzt, ptypes[i], slot, vkind, fail_bb, &ok);
   }
@@ -365,7 +417,13 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     return NULL;
   }
 
-  LLVMValueRef res = zan_call2(g->builder, fn_ty, fn, call_args, total, "");
+  if (pass_gctx) {
+    call_args[total] = (LLVMTypeOf(gctx_arg) != ptypes[total])
+                           ? LLVMBuildBitCast(g->builder, gctx_arg,
+                                              ptypes[total], "refl.gctx")
+                           : gctx_arg;
+  }
+  LLVMValueRef res = zan_call2(g->builder, fn_ty, fn, call_args, raw_total, "");
   LLVMValueRef slot = (is_task || LLVMGetTypeKind(rty) == LLVMVoidTypeKind)
                           ? LLVMConstInt(i64, 0, 0)
                           : refl_to_slot_typed(g, ret_type, res, true);
@@ -395,7 +453,8 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
   return LLVMConstBitCast(th, i8ptr);
 }
 
-static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params) {
+static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params,
+                                     zan_type_t *owner_inst) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (!params || params->count <= 0)
     return LLVMConstNull(i8ptr);
@@ -406,6 +465,8 @@ static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params) {
   for (int i = 0; i < params->count; i++) {
     zan_ast_node_t *p = params->items[i];
     zan_type_t *pt = zan_binder_resolve_type(g->binder, p->param.type);
+    if (pt && owner_inst)
+      pt = subst_type_param_deep(g, pt, owner_inst);
     names[i] = refl_field_type_name(g, pt);
   }
   LLVMTypeRef arr_ty = LLVMArrayType(i8ptr, (unsigned)params->count);
@@ -420,15 +481,19 @@ static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params) {
 }
 
 static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
-                                       zan_symbol_t *msym, bool late) {
+                                       zan_type_t *inst, zan_symbol_t *msym,
+                                       bool late) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef mrec = refl_method_type(g);
   zan_ast_node_t *decl = msym->decl;
+  zan_type_t *owner_inst = refl_method_owner_inst(g, sym, inst, msym);
   zan_type_t *rt =
       decl->method_decl.return_type
           ? zan_binder_resolve_type(g->binder, decl->method_decl.return_type)
           : g->binder->type_void;
+  if (rt && owner_inst)
+    rt = subst_type_param_deep(g, rt, owner_inst);
   bool is_static = (msym->modifiers & MOD_STATIC) != 0 ||
                    (decl->method_decl.modifiers & MOD_STATIC) != 0;
   int flags = is_static ? ZAN_REFL_MF_STATIC : 0;
@@ -451,11 +516,33 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
      */
     bool need_thunk = refl_method_needs_thunk(g, sym, decl);
     if (need_thunk) {
-      int fi = irgen_find_function(g, msym);
-      if (fi >= 0) {
+      LLVMValueRef target_fn = NULL;
+      LLVMTypeRef target_ty = NULL;
+      LLVMValueRef gctx_arg = NULL;
+      if (msym->parent && is_user_generic_sym(msym->parent)) {
+        if (owner_inst) {
+          target_fn = find_generic_fn(g, msym, owner_inst->type_args,
+                                      owner_inst->type_arg_count, &target_ty);
+          if (target_fn) {
+            gctx_arg = resolve_gctx_arg_for_inst(
+                g, false, owner_inst->sym, owner_inst, NULL, 0);
+            if (gctx_arg && !LLVMIsAConstant(gctx_arg)) {
+              target_fn = NULL;
+              gctx_arg = NULL;
+            }
+          }
+        }
+      } else {
+        int fi = irgen_find_function(g, msym);
+        if (fi >= 0) {
+          target_fn = g->functions[fi].fn;
+          target_ty = g->functions[fi].fn_type;
+        }
+      }
+      if (target_fn && target_ty) {
         LLVMValueRef t = refl_make_thunk(
-            g, g->functions[fi].fn, g->functions[fi].fn_type,
-            &decl->method_decl.params, rt, is_static, is_task, "m");
+            g, target_fn, target_ty, gctx_arg, &decl->method_decl.params,
+            owner_inst, rt, is_static, is_task, "m");
         if (t)
           thunk = t;
       }
@@ -473,7 +560,7 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
           LLVMConstInt(i64, (unsigned long long)refl_ret_kind(rt, is_task), 0),
           LLVMConstInt(i64, (unsigned long long)decl->method_decl.params.count,
                        0),
-          refl_param_names(g, &decl->method_decl.params), thunk,
+          refl_param_names(g, &decl->method_decl.params, owner_inst), thunk,
           LLVMConstInt(i64, (unsigned long long)flags, 0), mattrs,
           zan_ast_attributes_const(decl)->count ? refl_declared_attrs(g, decl)
                                                 : LLVMConstNull(i8ptr)},
@@ -481,9 +568,11 @@ static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
 }
 
 static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
+                                         zan_type_t *inst,
                                          zan_ast_node_t *decl,
                                          LLVMValueRef ctor_fn,
-                                         LLVMTypeRef ctor_ty) {
+                                         LLVMTypeRef ctor_ty,
+                                         LLVMValueRef ctor_gctx) {
   if (!sym || !sym->type)
     return NULL;
   bool is_struct = sym->type->kind == TYPE_STRUCT;
@@ -498,11 +587,12 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i64ptr = LLVMPointerType(i64, 0);
 
-  unsigned total = (ctor_fn && ctor_ty) ? LLVMCountParamTypes(ctor_ty) : 0;
+  unsigned raw_total = (ctor_fn && ctor_ty) ? LLVMCountParamTypes(ctor_ty) : 0;
+  unsigned total = (ctor_gctx && raw_total > 0) ? (raw_total - 1) : raw_total;
   if (total > ZAN_REFL_ARG_SLOTS + 1)
     return NULL;
-  LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
-  if (total > 0)
+  LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 2];
+  if (raw_total > 0)
     LLVMGetParamTypes(ctor_ty, ptypes);
 
   char nm[128];
@@ -550,8 +640,11 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
       LLVMValueRef vkp = LLVMBuildGEP2(g->builder, i64, LLVMGetParam(th, 1),
                                        &vk_off, 1, "refl.vkp");
       zan_type_t *pzt = NULL;
-      if (params && (int)ai < params->count)
+      if (params && (int)ai < params->count) {
         pzt = zan_binder_resolve_type(g->binder, params->items[ai]->param.type);
+        if (pzt && inst)
+          pzt = subst_type_param_deep(g, pzt, inst);
+      }
       args[i] = refl_unpack_arg(
           g, th, pzt, ptypes[i], LLVMBuildLoad2(g->builder, i64, sp, "refl.av"),
           LLVMBuildLoad2(g->builder, i64, vkp, "refl.vk"), fail_bb, &ok);
@@ -579,13 +672,15 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBuildStore(g->builder, LLVMConstNull(st), tmp_s);
     if (total > 0) {
       args[0] = LLVMBuildBitCast(g->builder, tmp_s, ptypes[0], "refl.this");
-      zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
+      zan_call_with_gctx(g, ctor_ty, ctor_fn, args, (int)total, ctor_gctx, "");
     } else {
       local_scope_t *locals = local_scope_new(g->arena);
-      emit_implicit_field_initializers(g, sym, sym->type, tmp_s, locals);
+      emit_implicit_field_initializers(g, sym, inst ? inst : sym->type, tmp_s,
+                                       locals);
     }
     LLVMValueRef sval = LLVMBuildLoad2(g->builder, st, tmp_s, "refl.newsv");
-    LLVMValueRef raw = refl_emit_box_struct_val(g, sym->type, sval, true);
+    LLVMValueRef raw =
+        refl_emit_box_struct_val(g, inst ? inst : sym->type, sval, true);
     LLVMBuildStore(g->builder,
                    LLVMBuildPtrToInt(g->builder, raw, i64, "refl.newsi"),
                    LLVMGetParam(th, 2));
@@ -598,13 +693,13 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     int site = -1;
     for (int i = 0; i < g->refl_mtab_count; i++) {
       if (g->refl_mtabs[i].ctors && g->refl_mtabs[i].sym == sym &&
-          g->refl_mtabs[i].site >= 0) {
+          g->refl_mtabs[i].inst == inst && g->refl_mtabs[i].site >= 0) {
         site = g->refl_mtabs[i].site;
         break;
       }
     }
     if (site < 0)
-      site = reserve_arc_site(g, sym, sym->type, 0, NULL);
+      site = reserve_arc_site(g, sym, inst ? inst : sym->type, 0, NULL);
     LLVMValueRef raw = zan_call2(
         g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64, i8ptr}, 3, 0),
@@ -617,23 +712,25 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBuildStore(g->builder, LLVMConstNull(st), obj);
     if (class_has_virtual_methods(sym)) {
       LLVMValueRef vp = LLVMBuildStructGEP2(g->builder, st, obj, 0, "refl.vpf");
-      LLVMBuildStore(g->builder,
-                     LLVMBuildBitCast(g->builder, get_vtable_global(g, sym),
-                                      i8ptr, "refl.vt"),
+      LLVMValueRef vt =
+          inst ? get_vtable_global_inst(g, sym, inst)
+               : get_vtable_global(g, sym);
+      LLVMBuildStore(g->builder, LLVMBuildBitCast(g->builder, vt, i8ptr, "refl.vt"),
                      vp);
     }
 
     emit_eh_tmp_push(g, obj);
     if (total > 0) {
       args[0] = LLVMBuildBitCast(g->builder, obj, ptypes[0], "refl.this");
-      zan_call2(g->builder, ctor_ty, ctor_fn, args, total, "");
+      zan_call_with_gctx(g, ctor_ty, ctor_fn, args, (int)total, ctor_gctx, "");
     } else {
       /* 无显式构造的类：new 路径在调用点内联发字段初始化器
        * （emit_implicit_field_initializers），反射造对象没有调用点——
        * thunk 里补发同一份（EH 语义同 new 路径），CreateInstance 与
        * new 对齐。 */
       local_scope_t *locals = local_scope_new(g->arena);
-      emit_implicit_field_initializers(g, sym, sym->type, obj, locals);
+      emit_implicit_field_initializers(g, sym, inst ? inst : sym->type, obj,
+                                       locals);
     }
     emit_eh_tmp_pop(g);
     LLVMBuildStore(g->builder,
@@ -661,15 +758,18 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
 }
 
 static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
-                                     zan_ast_node_t *decl, bool late) {
+                                     zan_type_t *inst, zan_ast_node_t *decl,
+                                     bool late) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMValueRef thunk = LLVMConstNull(i8ptr);
   late = late && refl_ctor_needs_thunk(g);
-  int rk = refl_ret_kind(sym ? sym->type : NULL, false);
+  zan_type_t *cinst = refl_concrete_inst(sym, inst);
+  int rk = refl_ret_kind(cinst ? cinst : (sym ? sym->type : NULL), false);
   if (!decl) {
-    if (late) {
-      LLVMValueRef t = refl_make_ctor_thunk(g, sym, NULL, NULL, NULL);
+    if (late && (!is_user_generic_sym(sym) || cinst != NULL)) {
+      LLVMValueRef t =
+          refl_make_ctor_thunk(g, sym, cinst, NULL, NULL, NULL, NULL);
       if (t)
         thunk = t;
     }
@@ -679,20 +779,38 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
             refl_const_string(g, ".ctor", 5),
             refl_const_string(g, sym->name.str, (int)sym->name.len),
             LLVMConstInt(i64, (unsigned long long)rk, 0),
-            LLVMConstInt(i64, 0, 0), refl_param_names(g, NULL), thunk,
+            LLVMConstInt(i64, 0, 0), refl_param_names(g, NULL, NULL), thunk,
             LLVMConstInt(i64, 0, 0), refl_empty_string(g),
             LLVMConstNull(i8ptr)},
         9);
   }
   if (late) {
-    for (int i = 0; i < g->ctor_count; i++) {
-      if (g->ctors[i].type_sym != sym || g->ctors[i].decl != decl)
-        continue;
-      LLVMValueRef t = refl_make_ctor_thunk(g, sym, decl, g->ctors[i].fn,
-                                            g->ctors[i].fn_type);
-      if (t)
-        thunk = t;
-      break;
+    if (is_user_generic_sym(sym)) {
+      if (cinst) {
+        LLVMTypeRef ctor_ty = NULL;
+        LLVMValueRef ctor_fn = find_generic_ctor(
+            g, sym, decl, cinst->type_args, cinst->type_arg_count, &ctor_ty);
+        if (ctor_fn && ctor_ty) {
+          LLVMValueRef ctor_gctx =
+              resolve_gctx_arg_for_inst(g, false, sym, cinst, NULL, 0);
+          if (!ctor_gctx || LLVMIsAConstant(ctor_gctx)) {
+            LLVMValueRef t = refl_make_ctor_thunk(
+                g, sym, cinst, decl, ctor_fn, ctor_ty, ctor_gctx);
+            if (t)
+              thunk = t;
+          }
+        }
+      }
+    } else {
+      for (int i = 0; i < g->ctor_count; i++) {
+        if (g->ctors[i].type_sym != sym || g->ctors[i].decl != decl)
+          continue;
+        LLVMValueRef t = refl_make_ctor_thunk(
+            g, sym, NULL, decl, g->ctors[i].fn, g->ctors[i].fn_type, NULL);
+        if (t)
+          thunk = t;
+        break;
+      }
     }
   }
   return LLVMConstNamedStruct(
@@ -703,7 +821,7 @@ static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
           LLVMConstInt(i64, (unsigned long long)rk, 0),
           LLVMConstInt(i64, (unsigned long long)decl->method_decl.params.count,
                        0),
-          refl_param_names(g, &decl->method_decl.params), thunk,
+          refl_param_names(g, &decl->method_decl.params, cinst), thunk,
           LLVMConstInt(i64, 0, 0), refl_empty_string(g), LLVMConstNull(i8ptr)},
       9);
 }
@@ -757,7 +875,8 @@ static bool refl_list_supported_element(zan_irgen_t *g, zan_type_t *elem_type) {
 
 static void refl_register_mtab(zan_irgen_t *g, LLVMValueRef gv,
                                LLVMTypeRef arr_ty, zan_symbol_t *sym,
-                               zan_type_t *list_type, int n, bool ctors) {
+                               zan_type_t *inst, zan_type_t *list_type, int n,
+                               bool ctors) {
   if (g->refl_mtab_count == g->refl_mtab_cap) {
     int ncap = g->refl_mtab_cap ? g->refl_mtab_cap * 2 : 16;
     g->refl_mtabs = (typeof(g->refl_mtabs))realloc(
@@ -768,6 +887,7 @@ static void refl_register_mtab(zan_irgen_t *g, LLVMValueRef gv,
   g->refl_mtabs[i].gv = gv;
   g->refl_mtabs[i].arr_ty = arr_ty;
   g->refl_mtabs[i].sym = sym;
+  g->refl_mtabs[i].inst = refl_concrete_inst(sym, inst);
   g->refl_mtabs[i].n = n;
   g->refl_mtabs[i].ctors = ctors;
   g->refl_mtabs[i].ctor_ready = false;
@@ -836,7 +956,7 @@ static LLVMValueRef refl_emit_ctor_builtin_list(zan_irgen_t *g, zan_type_t *t) {
   LLVMSetInitializer(gv, LLVMConstArray(refl_method_type(g), &rec, 1));
   LLVMSetLinkage(gv, LLVMPrivateLinkage);
   LLVMSetGlobalConstant(gv, 1);
-  refl_register_mtab(g, gv, arr_ty, NULL, t, 1, true);
+  refl_register_mtab(g, gv, arr_ty, NULL, NULL, t, 1, true);
   return LLVMConstBitCast(gv, i8ptr);
 }
 
@@ -1185,7 +1305,8 @@ refl_emit_methods_builtin_list(zan_irgen_t *g, zan_type_t *t, int *out_count) {
 }
 
 static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
-                                   bool ctors, int n, bool late) {
+                                   zan_type_t *inst, bool ctors, int n,
+                                   bool late) {
   LLVMTypeRef mrec = refl_method_type(g);
   LLVMValueRef *recs = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
   if (!recs)
@@ -1196,9 +1317,10 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
     int got = decls ? refl_collect_ctors(sym, decls, n) : 0;
     for (int i = 0; i < n; i++)
       recs[i] = i < got
-                    ? refl_ctor_record(g, sym, decls[i], late)
-                    : (got == 0 && i == 0 ? refl_ctor_record(g, sym, NULL, late)
-                                          : LLVMConstNull(mrec));
+                    ? refl_ctor_record(g, sym, inst, decls[i], late)
+                    : (got == 0 && i == 0
+                           ? refl_ctor_record(g, sym, inst, NULL, late)
+                           : LLVMConstNull(mrec));
     free(decls);
   } else {
     zan_symbol_t **msyms =
@@ -1207,7 +1329,7 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
     if (got > n)
       got = n;
     for (int i = 0; i < n; i++)
-      recs[i] = i < got ? refl_method_record(g, sym, msyms[i], late)
+      recs[i] = i < got ? refl_method_record(g, sym, inst, msyms[i], late)
                         : LLVMConstNull(mrec);
     free(msyms);
   }
@@ -1217,7 +1339,8 @@ static LLVMValueRef refl_mtab_init(zan_irgen_t *g, zan_symbol_t *sym,
 }
 
 static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
-                                    bool ctors, int *out_count) {
+                                    zan_type_t *inst, bool ctors,
+                                    int *out_count) {
   *out_count = 0;
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   if (!sym)
@@ -1249,11 +1372,11 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
   LLVMSetLinkage(gv, LLVMPrivateLinkage);
   LLVMSetAlignment(gv, 8);
 
-  refl_register_mtab(g, gv, arr_ty, sym, NULL, n, ctors);
+  refl_register_mtab(g, gv, arr_ty, sym, inst, NULL, n, ctors);
   /* Constructor discovery metadata is valid even when no callable demand
    * ever arrives. Its initializer is upgraded in the pre-freeze fixed point. */
   if (ctors) {
-    LLVMValueRef init = refl_mtab_init(g, sym, true, n, false);
+    LLVMValueRef init = refl_mtab_init(g, sym, inst, true, n, false);
     if (init)
       LLVMSetInitializer(gv, init);
   }

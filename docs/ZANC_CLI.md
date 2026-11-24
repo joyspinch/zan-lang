@@ -282,7 +282,7 @@ pwsh -NoProfile -File scripts/analyze_request_profile.ps1 -SnapshotPath pages.js
 | `--no-stdlib` | — | 关自动 stdlib **和**包发现；`--no-packages` 只关包 |
 | `--no-packages` | — | 只关包发现（stdlib 拉入照常）。回归锁 `conformance_gen_pkg_isolation`：包内库级调用不牵连父编译 |
 | `--no-pullin-filter` | 关 | 关闭拉入过滤（调试用；未给时回退读 `ZAN_NO_PULLIN_FILTER`，显式 CLI 优先） |
-| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）；Apple（macOS/iOS）与交叉目标不链；目标无分配器对象时告警并回退 CRT |
+| `--fast-alloc` | native 默认开 | 小对象分配器（`rt_mem.c`）。ELF/PE 以 `--wrap=malloc/free/calloc/realloc` 接管全镜像；Apple（ld64 无 `--wrap`）改为把 Zan 生成代码的分配调用改名指向 `zan_mem_*`，C 运行时/驱动仍用 libc，跨界的 `free`/`realloc` 由注册的 `zan_mem` malloc zone 回送。交叉目标不链；目标无分配器对象时告警并回退 CRT |
 | `--no-fast-alloc` | — | 原生回退 CRT malloc——排查堆问题、或块需交还外部 CRT/驱动边界时用；与 `--fast-alloc` 同现时后写的生效 |
 | `-L<dir>` / `--libpath <dir>` | — | 追加原生库搜索目录（可重复） |
 | `--driver-dir <d>` | 内建目录 | 覆盖内建原生驱动目录（测试门指向新编的 zan_gui） |

@@ -1,0 +1,210 @@
+using System;
+using System.Data;
+using System.Web;
+
+namespace Zan.Web.Core;
+
+/* 请求作用域的惰性连接：控制器 Held()/表访问器拿到的就是它。
+ *
+ * 旧口径是 OnBeforeAsync 无条件先借一条连接、持到动作返回——不碰库的
+ * 动作（缓存命中、纯模板页、健康检查）也占一个池位，模板渲染与外呼
+ * 期间同样占着，吞吐被锁死在「池大小 / 整个请求耗时」。
+ *
+ * 这里改为首条语句才真正借出：异步端点 await 池（池满挂起协程）；
+ * 同步端点无法挂起，只取空闲连接，池里没有空闲时抛错而不是阻塞
+ * 工作线程。借不到（数据库未配置/不可达）答 503 ApiError，与原先
+ * 「DbReady() 为 false → 503」的应答一致。
+ *
+ * 归还走 DbContext.Release/ReleaseRead/Discard：它们认得本类并只把
+ * 内层的真实池连接放回池，绝不把代理本身塞进池。 */
+public class RequestDbConnection : IDbConnection {
+    DbContext db;
+    bool read;
+    IDbStatementObserver observer;
+    RequestTrace trace;
+    IDbConnection inner;
+    bool failed;
+
+    public RequestDbConnection(DbContext db, bool read, IDbStatementObserver observer = null,
+                               RequestTrace trace = null) {
+        this.db = db;
+        this.read = read;
+        this.observer = observer;
+        this.trace = trace;
+        this.inner = null;
+        this.failed = false;
+    }
+
+    /* 已借出的真实连接（未借出时为 null）。 */
+    public IDbConnection Inner() { return this.inner; }
+
+    /* 借自只读池（[ReadOnly] 动作）还是主库池。 */
+    public bool IsRead() { return this.read; }
+
+    /* 是否已真正借出连接。 */
+    public bool IsOpen() { return this.inner != null; }
+
+    /* 是否借用失败过（数据库不可达）；失败后不再重试，同一请求内快速 503。 */
+    public bool Failed() { return this.failed; }
+
+    /* 取走内层连接并清空代理：调用方负责把它还给池或弃用。 */
+    public IDbConnection Detach() {
+        IDbConnection c = this.inner;
+        this.inner = null;
+        return c;
+    }
+
+    /* 异步借出；false 表示数据库不可用（不抛异常，供 Conn() 答 null）。 */
+    public async bool Open() {
+        if (this.inner != null) { return true; }
+        if (this.failed || this.db == null) { return false; }
+        int stage = this.trace != null ? this.trace.Begin("db_borrow") : -1;
+        IDbConnection c = null;
+        try {
+            if (this.read) { c = await this.db.AcquireRead(this.observer); }
+            else { c = await this.db.Acquire(this.observer); }
+            if (c == null && this.trace != null) { this.trace.Fail(stage, "unavailable"); }
+        } catch (Exception failure) {
+            if (this.trace != null) { this.trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (this.trace != null) { this.trace.End(stage); }
+        }
+        if (this.inner != null) {
+            /* 同一请求并发 await 两条语句时，后到者把多借的那条还回去。 */
+            if (c != null) { this.Return(c); }
+            return true;
+        }
+        if (c == null) { this.failed = true; return false; }
+        this.inner = c;
+        return true;
+    }
+
+    /* 不挂起的可用性判定（同步 DbReady 用）：有空闲连接就借出并答 true；
+       池正忙（无空闲但仍有存活连接）答 true，随后的异步语句排队等池；
+       池里一条存活连接都没有答 false（数据库不可达或从未连通）。 */
+    public bool OpenNow() {
+        if (this.inner != null) { return true; }
+        if (this.failed || this.db == null) { return false; }
+        int stage = this.trace != null ? this.trace.Begin("db_borrow") : -1;
+        IDbConnection c = null;
+        try {
+            c = this.db.TryAcquireNow(this.read, this.observer);
+            if (c == null && this.trace != null && this.db.Live(this.read) <= 0) {
+                this.trace.Fail(stage, "unavailable");
+            }
+        } catch (Exception failure) {
+            if (this.trace != null) { this.trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (this.trace != null) { this.trace.End(stage); }
+        }
+        if (c != null) { this.inner = c; return true; }
+        return this.db.Live(this.read) > 0;
+    }
+
+    private void Return(IDbConnection c) {
+        if (this.read) { this.db.ReleaseRead(c); } else { this.db.Release(c); }
+    }
+
+    private async IDbConnection Ensure() {
+        if (this.inner != null) { return this.inner; }
+        if (!await this.Open()) {
+            throw new ApiError(503, "2001", "数据库不可用");
+        }
+        return this.inner;
+    }
+
+    /* 同步端点：协程无法在这里挂起，只取池中空闲连接。 */
+    private IDbConnection EnsureNow() {
+        if (this.inner != null) { return this.inner; }
+        if (this.failed || this.db == null) {
+            throw new ApiError(503, "2001", "数据库不可用");
+        }
+        int stage = this.trace != null ? this.trace.Begin("db_borrow") : -1;
+        IDbConnection c = null;
+        try {
+            c = this.db.TryAcquireNow(this.read, this.observer);
+            if (c == null && this.trace != null) { this.trace.Fail(stage, "unavailable"); }
+        } catch (Exception failure) {
+            if (this.trace != null) { this.trace.Fail(stage, "exception"); }
+            throw;
+        } finally {
+            if (this.trace != null) { this.trace.End(stage); }
+        }
+        if (c == null) {
+            throw new InvalidOperationException(
+                "request connection not open and pool has no idle connection; "
+                + "use the async API or await Conn() first");
+        }
+        this.inner = c;
+        return c;
+    }
+
+    public DbResult Query(string sql) { return this.EnsureNow().Query(sql); }
+    public DbResult Query(string sql, DbParams prms) { return this.EnsureNow().Query(sql, prms); }
+    public int Execute(string sql) { return this.EnsureNow().Execute(sql); }
+    public int Execute(string sql, DbParams prms) { return this.EnsureNow().Execute(sql, prms); }
+    public string ExecuteScalar(string sql) { return this.EnsureNow().ExecuteScalar(sql); }
+    public string ExecuteScalar(string sql, DbParams prms) { return this.EnsureNow().ExecuteScalar(sql, prms); }
+
+    public async DbResult QueryAsync(string sql) {
+        IDbConnection c = await this.Ensure();
+        return await c.QueryAsync(sql);
+    }
+    public async DbResult QueryAsync(string sql, DbParams prms) {
+        IDbConnection c = await this.Ensure();
+        return await c.QueryAsync(sql, prms);
+    }
+    public async int ExecuteAsync(string sql) {
+        IDbConnection c = await this.Ensure();
+        return await c.ExecuteAsync(sql);
+    }
+    public async int ExecuteAsync(string sql, DbParams prms) {
+        IDbConnection c = await this.Ensure();
+        return await c.ExecuteAsync(sql, prms);
+    }
+    public async string ExecuteScalarAsync(string sql) {
+        IDbConnection c = await this.Ensure();
+        return await c.ExecuteScalarAsync(sql);
+    }
+    public async string ExecuteScalarAsync(string sql, DbParams prms) {
+        IDbConnection c = await this.Ensure();
+        return await c.ExecuteScalarAsync(sql, prms);
+    }
+
+    /* 方言选择在首条语句之前发生（ORM 先拼 SQL 再执行），未借出时问池。 */
+    public int GetProvider() {
+        if (this.inner != null) { return this.inner.GetProvider(); }
+        if (this.db == null) { return 0; }
+        return this.db.Provider(this.read);
+    }
+
+    /* 未借出时按「可用」回答：借用是惰性的，失败才算断开。 */
+    public bool IsConnected() {
+        if (this.inner != null) { return this.inner.IsConnected(); }
+        return !this.failed && this.db != null;
+    }
+
+    public void Close() {
+        if (this.inner != null) { this.inner.Close(); }
+    }
+    public void Dispose() { this.Close(); }
+
+    public void BeginTransaction() { this.EnsureNow().BeginTransaction(); }
+    public void Commit() { if (this.inner != null) { this.inner.Commit(); } }
+    public void Rollback() { if (this.inner != null) { this.inner.Rollback(); } }
+
+    public async bool BeginTransactionAsync() {
+        IDbConnection c = await this.Ensure();
+        return await c.BeginTransactionAsync();
+    }
+    public async bool CommitAsync() {
+        if (this.inner == null) { return false; }
+        return await this.inner.CommitAsync();
+    }
+    public async bool RollbackAsync() {
+        if (this.inner == null) { return false; }
+        return await this.inner.RollbackAsync();
+    }
+}

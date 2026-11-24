@@ -55,7 +55,11 @@ static void declare_async_ramp(zan_irgen_t *g, method_body_work_t *w,
   w->handler_cap = 1;
   w->fn_type = LLVMFunctionType(i8ptr, param_types, (unsigned)total_params, 0);
   w->fn = LLVMAddFunction(g->mod, fn_name, w->fn_type);
-  if (!(g->emit_lib && (member->method_decl.modifiers & MOD_PUBLIC) != 0))
+  bool is_user_export =
+      g->emit_lib && w->type_sym && w->type_sym->decl &&
+      !w->type_sym->decl->from_stdlib && !w->type_sym->decl->from_package &&
+      !w->cur_inst && (member->method_decl.modifiers & MOD_PUBLIC) != 0;
+  if (!is_user_export)
     zan_set_module_local(w->fn);
 }
 
@@ -1185,8 +1189,10 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
           fn_type = LLVMFunctionType(llvm_ret, param_types,
                                      (unsigned)total_params, 0);
           fn = LLVMAddFunction(g->mod, fn_name, fn_type);
-          if (!(g->emit_lib &&
-                (member->method_decl.modifiers & MOD_PUBLIC) != 0))
+          bool is_user_export =
+              g->emit_lib && decl && !decl->from_stdlib && !decl->from_package &&
+              !cur_variant && (member->method_decl.modifiers & MOD_PUBLIC) != 0;
+          if (!is_user_export)
             zan_set_module_local(fn);
         }
 

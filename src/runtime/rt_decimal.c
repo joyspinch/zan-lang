@@ -3,7 +3,14 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+/* 除零上报：原生走 SIGFPE（与整数除零同一条崩溃/异常通道）；wasm 没有信号
+ * （wasi-libc 的 signal.h 直接 #error），用 unreachable 陷阱同样终止执行。 */
+#if defined(__wasm__)
+#define ZAN_DECIMAL_FPE() __builtin_trap()
+#else
 #include <signal.h>
+#define ZAN_DECIMAL_FPE() raise(SIGFPE)
+#endif
 
 #define DECIMAL_SIGN_MASK  0x80000000U
 #define DECIMAL_SCALE_MASK 0x00FF0000U
@@ -336,7 +343,7 @@ zan_decimal_t zan_decimal_mul(zan_decimal_t a, zan_decimal_t b) {
 zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     uint128_t mb = get_m128(b);
     if (mb == 0) {
-        raise(SIGFPE);
+        ZAN_DECIMAL_FPE();
         return zan_decimal_zero();
     }
 
@@ -378,7 +385,7 @@ zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
 zan_decimal_t zan_decimal_rem(zan_decimal_t a, zan_decimal_t b) {
     uint128_t mb = get_m128(b);
     if (mb == 0) {
-        raise(SIGFPE);
+        ZAN_DECIMAL_FPE();
         return zan_decimal_zero();
     }
     uint128_t ma = get_m128(a);
@@ -408,13 +415,13 @@ zan_decimal_t zan_decimal_mul(zan_decimal_t a, zan_decimal_t b) {
 zan_decimal_t zan_decimal_div(zan_decimal_t a, zan_decimal_t b) {
     double db = zan_decimal_to_double(b);
     if (db == 0.0) {
-        raise(SIGFPE);
+        ZAN_DECIMAL_FPE();
         return zan_decimal_zero();
     }
     return zan_decimal_from_double(zan_decimal_to_double(a) / db);
 }
 zan_decimal_t zan_decimal_rem(zan_decimal_t a, zan_decimal_t b) {
-    raise(SIGFPE);
+    ZAN_DECIMAL_FPE();
     return zan_decimal_zero();
 }
 #endif

@@ -271,7 +271,10 @@ static void zan_register_array(zan_irgen_t *g, LLVMValueRef array,
   LLVMValueRef refs = LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
                                    is_rc_managed_type(elem_type), 0);
   LLVMValueRef args[] = {array, bytes, offset, refs};
-  zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, args, 4, "");
+  LLVMValueRef zan_emit_live_on(zan_irgen_t *);
+  void zan_emit_call_if(zan_irgen_t *, LLVMValueRef, LLVMValueRef,
+                        LLVMValueRef *, unsigned);
+  zan_emit_call_if(g, zan_emit_live_on(g), fn, args, 4);
 }
 
 static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,

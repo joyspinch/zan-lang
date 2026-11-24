@@ -95,6 +95,7 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
       if (method_sym)
         pack_params_args(g, expr, method_sym, locals);
       if (method_sym) {
+        refl_note_propspec_accessors(g, method_sym, expr);
         /* `d */
         bool callee_static = (method_sym->modifiers & MOD_STATIC) != 0;
         int recv_off = callee_static ? 0 : 1;
@@ -324,6 +325,7 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
     if (method_sym)
       pack_params_args(g, expr, method_sym, locals);
     if (method_sym) {
+      refl_note_propspec_accessors(g, method_sym, expr);
       bool callee_static = (method_sym->modifiers & MOD_STATIC) != 0;
       /* A same-named field can route Type.Method<T>() here.
        * Only extension calls pass a receiver as a static argument. */

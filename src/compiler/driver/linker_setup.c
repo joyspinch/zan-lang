@@ -138,8 +138,11 @@ if (!cross_compiling) {
 bool fast_alloc = fast_alloc_opt >= 0;
 const char *rt_mem_obj = NULL;
 #ifdef ZAN_RT_MEM_OBJ
-if (fast_alloc && !cross_compiling && target.os != ZAN_OS_MACOS &&
-    target.os != ZAN_OS_IOS) {
+/* Apple 没有 --wrap：只在发射期已把分配调用改指 zan_mem_* 时才链
+ * （irgen.route_fast_alloc，main_frontend.c 同一判据）。 */
+bool apple_target = target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS;
+if (fast_alloc && !cross_compiling &&
+    (!apple_target || irgen.route_fast_alloc)) {
   snprintf(rt_mem_buf, sizeof(rt_mem_buf), "%s/%s", link_exe_dir,
            zan_path_basename(ZAN_RT_MEM_OBJ));
   if (zan_file_exists(rt_mem_buf))

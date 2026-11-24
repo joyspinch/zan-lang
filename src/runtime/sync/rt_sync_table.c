@@ -55,6 +55,14 @@ typedef struct {
 #endif
 } zan_shared_table;
 
+/* 共享字符串读出缓冲（每线程一块，>1MiB）前留 32 个零字节：它作为 extern
+ * string 返回给 Zan 代码，生成代码会探测 [ptr-8]（字符串头魔数/长度字），
+ * 判定不是字符串后还会读 [ptr-16]/[ptr-24]（对象/数组头，数组头最远到
+ * ptr-32）。大块 calloc 落在独立映射的页首时这些地址是未映射页——SIGBUS
+ * （Web 路由表每请求 GetStringAt，压测下间歇崩）。零前缀 = 可读且不带任何
+ * 魔数，按外来串走 strlen。TLS 槽存 calloc 原始基址，析构照常 free。 */
+#define ZAN_SHARED_STRING_PAD 32
+
 #ifdef _WIN32
 static INIT_ONCE zan_shared_string_once = INIT_ONCE_STATIC_INIT;
 static DWORD zan_shared_string_slot = FLS_OUT_OF_INDEXES;
@@ -78,13 +86,15 @@ static char *zan_get_shared_string(void) {
   }
   buffer = (char *)FlsGetValue(zan_shared_string_slot);
   if (!buffer) {
-    buffer = (char *)calloc(ZAN_TABLE_MAX_STRING + 1, 1);
+    buffer = (char *)calloc(ZAN_SHARED_STRING_PAD + ZAN_TABLE_MAX_STRING + 1, 1);
+    if (!buffer)
+      zan_rt_fatal("oom", "sync: shared-string buffer");
     if (!FlsSetValue(zan_shared_string_slot, buffer)) {
       free(buffer);
       zan_rt_fatal("oom", "sync: shared-string TLS set failed");
     }
   }
-  return buffer;
+  return buffer + ZAN_SHARED_STRING_PAD;
 }
 #else
 static pthread_key_t zan_shared_string_key;
@@ -101,13 +111,15 @@ static char *zan_get_shared_string(void) {
   pthread_once(&once, zan_shared_string_key_create);
   char *buffer = (char *)pthread_getspecific(zan_shared_string_key);
   if (!buffer) {
-    buffer = (char *)calloc(ZAN_TABLE_MAX_STRING + 1, 1);
+    buffer = (char *)calloc(ZAN_SHARED_STRING_PAD + ZAN_TABLE_MAX_STRING + 1, 1);
+    if (!buffer)
+      zan_rt_fatal("oom", "sync: shared-string buffer");
     if (pthread_setspecific(zan_shared_string_key, buffer) != 0) {
       free(buffer);
       zan_rt_fatal("oom", "sync: shared-string TLS set failed");
     }
   }
-  return buffer;
+  return buffer + ZAN_SHARED_STRING_PAD;
 }
 #endif
 

@@ -4,6 +4,7 @@ using System.Json;
 using System.Net.Http;
 using System.Net.Http.Client;
 using System.Net.Http.Http2;
+using System.Net.Http.Hpack;
 using System.Net.Sockets;
 using System.Web;
 
@@ -98,6 +99,16 @@ class Program {
         ctx.Text("cookie set");
     }
 
+    static async void HandleClientIp(HttpContext ctx) {
+        ctx.Text(ctx.ClientIp());
+    }
+
+    static int authCalls = 0;
+    static async string CountingAuth(string token) {
+        Program.authCalls = Program.authCalls + 1;
+        return "";
+    }
+
     static TcpListener listener;
     static bool listening = true;
 
@@ -128,6 +139,13 @@ class Program {
 
         app.Router().Get("/hello", Program.HandleHello);
         app.Router().Get("/secure_cookie", Program.HandleSecureCookie);
+        app.Router().Get("/ip", Program.HandleClientIp);
+        app.UseForwardedHeaders();
+        app.ForwardedHeaders().AddTrustedProxy("127.0.0.1");
+        app.AuthResolver(Program.CountingAuth);
+        Directory.CreateDirectory("_scratch/web_tls_static");
+        File.WriteAllText("_scratch/web_tls_static/a.txt", "static body");
+        app.Mount("/static", "_scratch/web_tls_static", 0);
 
         Task.Spawn(Program.Accept(app));
         await Task.Delay(100);
@@ -155,6 +173,27 @@ class Program {
             HttpResponse h2Resp = await h2.SendAsync("GET", "/hello", null, null, "");
             Check(h2Resp != null && h2Resp.statusCode == 200, "http2 get status");
             Check(h2Resp != null && h2Resp.body == "hello over https", "http2 get body");
+
+            // h2 曾无 TLS 标记：IsSecure() 为假，Set-Cookie 丢 Secure。
+            HttpResponse h2Cookie = await h2.SendAsync("GET", "/secure_cookie", null, null, "");
+            Check(h2Cookie != null && h2Cookie.GetHeader("Set-Cookie").IndexOf("; Secure") >= 0,
+                "http2 secure cookie");
+
+            // h2 曾把对端 IP 写死为 127.0.0.1 且不过 ForwardedHeaders。
+            List<HpackHeader> xff = new List<HpackHeader>();
+            xff.Add(new HpackHeader("x-forwarded-for", "203.0.113.7"));
+            HttpResponse h2Ip = await h2.SendAsync("GET", "/ip", null, xff, "");
+            Check(h2Ip != null && h2Ip.body == "203.0.113.7", "http2 forwarded client ip");
+
+            // 静态资源带会话 cookie 也不解析身份；动态路由照常解析。
+            List<HpackHeader> cookie = new List<HpackHeader>();
+            cookie.Add(new HpackHeader("cookie", "zsession=abc"));
+            HttpResponse h2Static = await h2.SendAsync("GET", "/static/a.txt", null, cookie, "");
+            Check(h2Static != null && h2Static.statusCode == 200
+                && Program.authCalls == 0, "static request skips auth resolver");
+            HttpResponse h2Dyn = await h2.SendAsync("GET", "/hello", null, cookie, "");
+            Check(h2Dyn != null && h2Dyn.statusCode == 200
+                && Program.authCalls == 1, "routed request resolves auth");
             h2.Dispose();
         }
 

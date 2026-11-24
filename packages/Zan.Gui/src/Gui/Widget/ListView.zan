@@ -23,8 +23,14 @@ public partial class ListView<T> : Control {
     public List<RowDragOut> dragOut;
     public int dragOutFrom;
     public static int RowIdReserve() { return 4096; }
+    // 某行被选中（读取 SelectedIndex / Selected）。
+    [Event]
     public UiEvent Select;
+    // 选中的行再次被点击（打开 / 深入）。
+    [Event]
     public UiEvent Activate;
+    // 某行被右键点击。
+    [Event]
     public UiEvent Context;
     private ListRowsPanel<T> rowsBody;
     private bool layingRows;
@@ -115,31 +121,21 @@ public partial class ListView<T> : Control {
         get { return sel; }
         set { this.SelectIndex(value); }
     }
+    public void SetSelectedProp(int idx) {
+        if (idx >= -1 && (data == null || idx < this.Count())) { sel = idx; }
+        else { sel = -1; }
+        this.Invalidate();
+    }
+    public void SetEmptyProp(string val) {
+        Empty = val != null ? val : "";
+        this.Invalidate();
+    }
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Int("value", "Selected").DefaultBinding().Field("sel", 1).Also("sel").Also("selected"));
-        ps.Add(PropSpec.Bool("multi", "Multi select").Field("multi", 2));
-        ps.Add(PropSpec.Text("empty", "Empty text").Field("Empty", 0));
+        ps.Add(PropSpec.Int("value", "Selected").DefaultBinding().Field("sel").Setter("SetSelectedProp").Also("sel").Also("selected"));
+        ps.Add(PropSpec.Bool("multi", "Multi select").Field("multi"));
+        ps.Add(PropSpec.Text("empty", "Empty text").Field("Empty").Setter("SetEmptyProp"));
         return ps;
-    }
-    public override string GetProp(string key) {
-        if (key == "value" || key == "sel" || key == "selected") { return Convert.ToString(sel); }
-        if (key == "empty") { return Empty; }
-        return base.GetProp(key);
-    }
-    public override void SetProp(string key, string val) {
-        if (key == "value" || key == "sel" || key == "selected") {
-            int idx = -1;
-            if (val != null && val != "" && int.TryParse(val, out idx)) {
-                if (idx >= -1 && (data == null || idx < this.Count())) { sel = idx; }
-            } else {
-                sel = -1;
-            }
-            this.Invalidate();
-            return;
-        }
-        if (key == "empty") { Empty = val != null ? val : ""; this.Invalidate(); return; }
-        base.SetProp(key, val);
     }
     public void WithColumns(List<ListColumn<T>> columns) {
         cols = new List<ListColumn<T>>();
@@ -323,7 +319,7 @@ public partial class ListView<T> : Control {
         if (index < 0 || !this.Selectable(index)) { return; }
         App app = this.App;
         if (app.window.EventButton() == 1) {
-            sel = index; Context.PostS(this); this.NoteSelfDamage(app); e.Handle();
+            sel = index; Context.Post(this); this.NoteSelfDamage(app); e.Handle();
         } else if (app.window.EventButton() == 0 && dragOut.Count > 0
                 && (app.GetCapturedPointer() == null || app.GetCapturedPointer() == this)) {
             dragOutFrom = index;
@@ -371,7 +367,7 @@ public partial class ListView<T> : Control {
                 }
                 if (sel == index) { sel = -1; was = true; }
                 if (!was) { marks.Add(index); if (sel < 0) { sel = index; } }
-                Select.PostS(this);
+                Select.Post(this);
             } else if (multi && Modifiers.HasShift(mods) && sel >= 0) {
                 int a = sel;
                 int b = index;
@@ -381,13 +377,13 @@ public partial class ListView<T> : Control {
                     if (this.Selectable(r) && !this.IsMarked(r)) { marks.Add(r); }
                     r = r + 1;
                 }
-                Select.PostS(this);
+                Select.Post(this);
             } else {
                 bool again = (sel == index) || (sel < 0 && e.isDoubleClick);
                 if (multi) { marks = new List<int>(); }
                 sel = index;
-                if (again) { Activate.PostS(this); }
-                else { Select.PostS(this); }
+                if (again) { Activate.Post(this); }
+                else { Select.Post(this); }
             }
             this.NoteSelfDamage(app);
         e.Handle();
@@ -400,14 +396,14 @@ public partial class ListView<T> : Control {
                 dragOutFrom = -1;
                 App app = this.App;
                 if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
-                Context.PostS(this);
+                Context.Post(this);
                 this.NoteSelfDamage(app);
                 e.Handle();
             }
         }
         if (!e.handled) { base.OnRoutedEvent(e); }
     }
-    public override string Kind() { return "ListView"; }
+    // 覆写：CSS 类型选择器名（"list"）。
     protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
         this.Arrange(bx, by, bw, bh);
@@ -457,7 +453,7 @@ public partial class ListView<T> : Control {
         if (row >= 0 && !this.Selectable(row)) { return; }
         if (sel == row) { return; }
         sel = row;
-        Select.PostS(this);
+        Select.Post(this);
     }
     public void ClearSelection() { sel = -1; marks = new List<int>(); }
     public void WithMultiSelect() { multi = true; }
@@ -478,11 +474,27 @@ public partial class ListView<T> : Control {
         return outp;
     }
     public int SelectionCount() { return this.SelectedIndices().Count; }
-    public void OnSelect(Action a) { Select.Add(a); }
-    public void OnActivate(Action a) { Activate.Add(a); }
-    public void OnContext(Action a) { Context.Add(a); }
-    public void OnDragOut(RowDragOut a) { dragOut.Add(a); }
-    public void EmptyText(string text) { Empty = text; }
+    // ---- 处理器 ----
+
+    // 某行被选中时回调。
+    public ListView<T> OnSelect(Action a) { Select.Add(a); return this; }
+
+    // 选中的行再次被点击（打开 / 深入）时回调。
+    public ListView<T> OnActivate(Action a) { Activate.Add(a); return this; }
+
+    // 某行被右键点击时回调。
+    public ListView<T> OnContext(Action a) { Context.Add(a); return this; }
+
+    // 订阅「行被拖出列表」手势：在某行上按下、拖到列表矩形之外
+    // 松开时回调该行下标。列表只识别手势并报告下标，是否开窗、
+    // 开成什么窗口由宿主决定；在列表矩形内松开不算数（那次手势
+    // 仍归滚动/选择），右键与长按菜单不受影响。
+    public ListView<T> OnDragOut(RowDragOut a) { dragOut.Add(a); return this; }
+
+    // 列表为空时显示的文本。
+    public ListView<T> EmptyText(string text) { Empty = text; return this; }
+
+    // 是否拥有自定义插槽列。
     public bool HasSlotColumns() {
         if (cols == null) { return false; }
         for (int i = 0; i < cols.Count; i = i + 1) {

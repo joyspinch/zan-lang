@@ -9,6 +9,8 @@ public class DatePicker : Control {
     public Calendar calendarWidget;
     public Input editor;
     public Button trigger;
+    // 取值变化后触发（弹层点选、键盘编辑出合法文本）。
+    [Event]
     public UiEvent Change;
     public bool open;
     public int viewYear;
@@ -61,7 +63,7 @@ public class DatePicker : Control {
         wiresOwnEvents = true;
         this.Add(editor);
         this.Add(trigger);
-        trigger.Click.AddS(DatePicker.OnTriggerClick);
+        trigger.Click.Add(DatePicker.OnTriggerClick);
         this.SetDate(selected);
     }
     public DateTime DateValue {
@@ -80,13 +82,36 @@ public class DatePicker : Control {
         get { return shortcuts; }
         set { shortcuts = value; }
     }
-    public override string Kind() { return "DatePicker"; }
+
+    // 覆写：CSS 类型选择器名（"input"，与输入框共用皮肤规则）。
     public override string StyleType() { return "input"; }
     public override Binding<string> SizeOf() { return Size; }
+    // 覆写：返回设计器属性清单（日期文本 / 类型 / 尺寸档）。
+    // 换选择器类型：只认合法类型名，换后按新格式重写编辑器文本。
+    public void SetTypeName(string val) {
+        if (val == "date" || val == "datetime" || val == "daterange" ||
+            val == "datetimerange" || val == "week" || val == "month" ||
+            val == "monthrange" || val == "quarter" ||
+            val == "quarterrange" || val == "year" || val == "yearrange") {
+            Type = val;
+            this.WriteText(this.FormatText());
+        }
+    }
+
+    // 快捷项：true/default = 默认快捷项，false/none/"" = 清空。
+    public string ShortcutsText() {
+        return (shortcuts != null && shortcuts.Count > 0) ? "true" : "false";
+    }
+
+    public void SetShortcutsText(string val) {
+        if (val == "true" || val == "default") { this.UseDefaultShortcuts(); }
+        else if (val == "false" || val == "none" || val == "") { this.ClearShortcuts(); }
+    }
+
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        PropSpec text = PropSpec.Text("text", "Date").DefaultBinding().ViaExtra();
-        text.Field("Value", 0);
+        // Bound and unbound writes must both parse the editor text immediately.
+        PropSpec text = PropSpec.Text("text", "Date").DefaultBinding().Field("Value").Accessor("Text", "SetText");
         text.Also("value");
         text.Also("data");
         text.WithTip("Formats: date 'YYYY-MM-DD'; datetime 'YYYY-MM-DD HH:MM'"
@@ -97,53 +122,28 @@ public class DatePicker : Control {
             new List<string>{ "date", "datetime", "daterange",
                 "datetimerange", "week", "month", "monthrange",
                 "quarter", "quarterrange", "year", "yearrange" });
-        /* 有意不绑字段：type 写入要连带重建编辑器文本
-         * （SetExtra 里 this.WriteText(FormatText())），绑定 spec 会让
-         * PropOf 拦在 SetExtra 之前把写路径吃掉（快照 spec 挡死真写入）。
-         * 未绑定 spec 只负责把键带进序列化/schema，读写走 GetExtra/SetExtra。 */
+        type.Field("Type").Setter("SetTypeName");
         ps.Add(type);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.Field("Size", 0);
+        sz.Field("Size");
         ps.Add(sz);
+        ps.Add(PropSpec.Bool("shortcuts", "Shortcuts").Accessor("ShortcutsText", "SetShortcutsText"));
         return ps;
     }
-    public override string GetExtra(string key) {
-        if (key == "text" || key == "value" || key == "data") { return this.Text(); }
-        if (key == "type") { return Type; }
-        if (key == "shortcuts") { return (shortcuts != null && shortcuts.Count > 0) ? "true" : "false"; }
-        return "";
+    // 清空快捷选项。
+    public DatePicker ClearShortcuts() {
+        this.shortcuts = null;
+        return this;
     }
-    public override bool SetExtra(string key, string val) {
-        if (key == "text" || key == "value" || key == "data") {
-            this.SetText(val);
-            return true;
+
+    // 增加一项快捷选项（相对今天的天数偏移，0=今天，-1=昨天）。
+    public DatePicker AddShortcut(string label, int startOffset, int endOffset) {
+        if (this.shortcuts == null) {
+            this.shortcuts = new List<DateShortcut>();
         }
-        if (key == "shortcuts") {
-            if (val == "true" || val == "default") {
-                this.UseDefaultShortcuts();
-            } else if (val == "false" || val == "none" || val == "") {
-                this.ClearShortcuts();
-            }
-            return true;
-        }
-        if (key == "type") {
-            if (val == "date" || val == "datetime" || val == "daterange" ||
-                val == "datetimerange" || val == "week" || val == "month" ||
-                val == "monthrange" || val == "quarter" ||
-                val == "quarterrange" || val == "year" ||
-                val == "yearrange") {
-                Type = val;
-                this.WriteText(this.FormatText());
-            }
-            return true;
-        }
-        return false;
-    }
-    public void ClearShortcuts() { this.shortcuts = null; }
-    public void AddShortcut(string label, int startOffset, int endOffset) {
-        if (this.shortcuts == null) { this.shortcuts = new List<DateShortcut>(); }
         this.shortcuts.Add(new DateShortcut(label, startOffset, endOffset));
+        return this;
     }
     public void UseDefaultShortcuts() {
         this.ClearShortcuts();
@@ -156,27 +156,28 @@ public class DatePicker : Control {
         this.AddShortcut("过去60天", 0 - 60, 0 - 1);
         this.AddShortcut("过去90天", 0 - 90, 0 - 1);
     }
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Change");
-        return e;
+    // 挂接 Change 回调（链式）。
+    public DatePicker OnChange(Action a) {
+        Change.Add(a);
+        return this;
     }
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Change") { Change.Add(a); return; }
-        base.BindEvent(evt, a);
+
+    private void SyncEditorBinding() {
+        if (editor == null) { return; }
+        if (Value != null) {
+            editor.Text = Value;
+        } else if (editor.Text == null || editor.Text.IsLive()) {
+            editor.Text = editor.GetText();
+        }
     }
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Change") { Change.AddS(a); return; }
-        base.BindEventS(evt, a);
+
+    // 当前编辑框文本（各 Type 的格式见类文档）。
+    public string Text() {
+        this.SyncEditorBinding();
+        return editor.GetText();
     }
-    public override void TriggerEvent(string evt) {
-        if (evt == "Change") { Change.RaiseS(this); return; }
-        base.TriggerEvent(evt);
-    }
-    public void OnChange(Action a) { Change.Add(a); }
-    public string Text() { editor.Text = Value; return editor.GetText(); }
     private void WriteText(string value) {
-        editor.Text = Value;
+        this.SyncEditorBinding();
         editor.SetText(value);
     }
     public DateTime GetDate() { this.SyncBinding(); return selected; }
@@ -372,7 +373,7 @@ public class DatePicker : Control {
                 selected = endV;
                 viewYear = endV.Year();
                 viewMonth = endV.Month();
-                if (notify) { Change.RaiseS(this); }
+                if (notify) { Change.Raise(this); }
             }
             return;
         }
@@ -401,7 +402,7 @@ public class DatePicker : Control {
                 selected = endV;
                 viewYear = endV.Year();
                 viewMonth = endV.Month();
-                if (notify) { Change.RaiseS(this); }
+                if (notify) { Change.Raise(this); }
             }
             return;
         }
@@ -429,7 +430,7 @@ public class DatePicker : Control {
             minute = mi;
             viewYear = dv.Year();
             viewMonth = dv.Month();
-            if (notify) { Change.RaiseS(this); }
+            if (notify) { Change.Raise(this); }
             return;
         }
         DateTime value = this.ParseSingle(raw);
@@ -438,7 +439,7 @@ public class DatePicker : Control {
             selected = value;
             viewYear = value.Year();
             viewMonth = value.Month();
-            if (notify) { Change.RaiseS(this); }
+            if (notify) { Change.Raise(this); }
         }
     }
     private static void OnTriggerClick(Control sender) {
@@ -458,7 +459,7 @@ public class DatePicker : Control {
                     dp.selected = d;
                     dp.WriteText(dp.FormatText());
                     dp.open = false;
-                    dp.Change.RaiseS(dp);
+                    dp.Change.Raise(dp);
                     OverlayHost.DismissPopup();
                 }
                 return;
@@ -476,7 +477,7 @@ public class DatePicker : Control {
             defaultPopupCard.parent = this;
             calendarWidget = new Calendar();
             calendarWidget.Mode = "panel";
-            calendarWidget.Change.AddS(DatePicker.OnCalendarDateChange);
+            calendarWidget.Change.Add(DatePicker.OnCalendarDateChange);
             defaultPopupCard.With(calendarWidget);
         }
         if (selected != null) { calendarWidget.SetDate(selected); }
@@ -490,7 +491,7 @@ public class DatePicker : Control {
             return;
         }
         Control pop = this.customPopup != null ? this.customPopup : this.EnsurePopupCard();
-        OverlayHost.ShowPopup(App.FrameApp(), this, pop);
+        OverlayHost.ShowPopup(this.ResolveApp(App.FrameApp()), this, pop);
         pickingEnd = false;
         if (this.IsRange()) {
             if (hasPending) {
@@ -570,7 +571,7 @@ public class DatePicker : Control {
             pickingEnd = false;
             this.WriteText(this.FormatText());
             open = false;
-            Change.RaiseS(this);
+            Change.Raise(this);
             return;
         }
         if (this.IsRange()) {
@@ -594,13 +595,13 @@ public class DatePicker : Control {
             pickingEnd = false;
             this.WriteText(this.FormatText());
             open = false;
-            Change.RaiseS(this);
+            Change.Raise(this);
             return;
         }
         selected = picked;
         this.WriteText(this.FormatText());
         open = false;
-        Change.RaiseS(this);
+        Change.Raise(this);
     }
     public override void OnPaint(App app) { this.SyncBinding(); this.Edited(); }
     public override void OnMeasure(App app) {
@@ -640,7 +641,7 @@ public class DatePicker : Control {
         viewMonth = startV.Month();
         this.WriteText(this.FormatText());
         open = false;
-        Change.RaiseS(this);
+        Change.Raise(this);
     }
     public void ApplyShortcutIndex(int index) {
         if (this.shortcuts != null && index >= 0 && index < this.shortcuts.Count) {
@@ -650,9 +651,10 @@ public class DatePicker : Control {
     public override void SyncBinding() {
         base.SyncBinding();
         if (editor != null) {
-            editor.Text = Value;
+            this.SyncEditorBinding();
             editor.SyncBinding();
-            if (Value.Get() != parsedText || Type != parsedType) { this.ParseText(false); }
+            string cur = Value != null ? Value.Get() : editor.GetText();
+            if (cur != parsedText || Type != parsedType) { this.ParseText(false); }
         }
     }
 }

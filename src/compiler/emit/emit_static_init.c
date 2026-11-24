@@ -360,9 +360,13 @@ static void sinit_compute_closure(sinit_exec_graph_t *gr, LLVMValueRef root) {
       zan_ast_node_t *m = work->member;
       if (sinit_is_cctor(m))
         continue;
-      if ((gr->g->emit_lib && ((m->method_decl.modifiers & MOD_PUBLIC) ||
-                               m->kind == AST_CONSTRUCTOR_DECL)) ||
-          is_module_initializer_member(work->type_sym, m))
+      bool is_user_export =
+          gr->g->emit_lib && work->type_sym && work->type_sym->decl &&
+          !work->type_sym->decl->from_stdlib &&
+          !work->type_sym->decl->from_package && !work->cur_inst &&
+          ((m->method_decl.modifiers & MOD_PUBLIC) ||
+           m->kind == AST_CONSTRUCTOR_DECL);
+      if (is_user_export || is_module_initializer_member(work->type_sym, m))
         sinit_mark_from(gr, work->fn, &end);
     }
   }

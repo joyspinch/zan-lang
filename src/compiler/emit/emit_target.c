@@ -256,6 +256,7 @@ static bool module_needs_heap_diagnostics(zan_irgen_t *g) {
   if (g->emit_lib || g->check_leaks)
     return true;
   return fn_is_live_used(g->mod, "zan_gc_detect_cycles") ||
+         fn_is_live_used(g->mod, "zan_gc_collect_cycles") ||
          fn_is_live_used(g->mod, "zan_gc_write_heap_snapshot") ||
          fn_is_live_used(g->mod, "zan_rt_heap_diagnostics_enable") ||
          fn_is_live_used(g->mod, "zan_rt_heap_mutator_enter") ||
@@ -277,9 +278,9 @@ static void prune_unused_heap_diag(zan_irgen_t *g, bool need_heap_diag) {
   if (g->emit_lib)
     return;
   static const char *const diag_weak[] = {
-      "zan_gc_detect_cycles", "zan_gc_write_heap_snapshot",
-      "zan_rt_heap_diagnostics_enable", "zan_rt_heap_mutator_enter",
-      "zan_rt_heap_mutator_leave"};
+      "zan_gc_detect_cycles", "zan_gc_collect_cycles",
+      "zan_gc_write_heap_snapshot", "zan_rt_heap_diagnostics_enable",
+      "zan_rt_heap_mutator_enter", "zan_rt_heap_mutator_leave"};
   for (size_t i = 0; i < sizeof(diag_weak) / sizeof(diag_weak[0]); i++) {
     delete_fn_if_unused(g->mod, diag_weak[i]);
   }
@@ -317,6 +318,12 @@ static void prune_unused_heap_diag(zan_irgen_t *g, bool need_heap_diag) {
     if (reg_fg) {
       erase_calls_to_fn(reg_fg, true);
       delete_fn_if_unused(g->mod, "zan_rt_register_site_field_graphs");
+    }
+    LLVMValueRef reg_dt =
+        LLVMGetNamedFunction(g->mod, "zan_rt_register_site_dtors");
+    if (reg_dt) {
+      erase_calls_to_fn(reg_dt, true);
+      delete_fn_if_unused(g->mod, "zan_rt_register_site_dtors");
     }
   }
   bool request_profile = fn_is_live_used(g->mod, "zan_task_profile_begin");
@@ -360,7 +367,7 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
       !(no_instance_prune && strcmp(no_instance_prune, "1") == 0);
   const char *no_reflect_demand = getenv("ZAN_NO_PUBLISH_REFLECT_DEMAND");
   g->publish_reflect_demand =
-      !g->emit_debug && !g->emit_lib && !eager_codegen &&
+      !g->emit_debug && !eager_codegen &&
       !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
   di_debug_types_reset();
   if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
@@ -415,9 +422,12 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
           memcmp(m->method_decl.name.str, "Main", 4) == 0) ||
          (m->method_decl.name.len == 12 &&
           memcmp(m->method_decl.name.str, "__DesignMain", 12) == 0));
+    bool is_user_decl = owner && owner->decl && !owner->decl->from_stdlib &&
+                        !owner->decl->from_package;
     bool is_lib_export =
-        g->emit_lib && ((m->method_decl.modifiers & MOD_PUBLIC) ||
-                        m->kind == AST_CONSTRUCTOR_DECL);
+        g->emit_lib && is_user_decl && !work[w].cur_inst &&
+        ((m->method_decl.modifiers & MOD_PUBLIC) ||
+         m->kind == AST_CONSTRUCTOR_DECL);
     bool is_mod_init = is_module_initializer_member(owner, m);
     if (is_entry || is_lib_export || is_mod_init)
       live[w] = 1;
@@ -588,12 +598,20 @@ done:;
         is_refl_root = refl_method_needs_thunk(g, work[w].type_sym, member) &&
                        static_init_body_has_live_use(&static_graph, work[w].fn);
       } else if (is_refl_root && member->kind == AST_CONSTRUCTOR_DECL) {
-        is_refl_root = g->emit_lib || g->static_init_ctor_demand;
+        bool is_lib_export_owner =
+            g->emit_lib && work[w].type_sym && work[w].type_sym->decl &&
+            !work[w].type_sym->decl->from_stdlib &&
+            !work[w].type_sym->decl->from_package && !work[w].cur_inst;
+        is_refl_root = is_lib_export_owner || g->static_init_ctor_demand;
       }
+      zan_symbol_t *owner = work[w].type_sym;
+      bool is_user_decl = owner && owner->decl && !owner->decl->from_stdlib &&
+                          !owner->decl->from_package;
       bool root =
           !sinit_is_cctor(member) &&
-          ((g->emit_lib && ((member->method_decl.modifiers & MOD_PUBLIC) ||
-                            member->kind == AST_CONSTRUCTOR_DECL)) ||
+          ((g->emit_lib && is_user_decl && !work[w].cur_inst &&
+            ((member->method_decl.modifiers & MOD_PUBLIC) ||
+             member->kind == AST_CONSTRUCTOR_DECL)) ||
            is_refl_root);
       if (!root)
         root = body_has_live_use(work[w].fn, live, &work_ix) &&
@@ -720,7 +738,11 @@ done:;
    * （live/dtor/tyname/meta/desc）。反射 ctor thunk 的分配点原本在
    * finalize 才登记，名表早已冻结——反射造出的对象过不了任何
    * is/下转（MapRow (T)obj 全军覆没）。 */
-  refl_reserve_thunk_sites(g);
+  if (!prune_stdlib_bodies)
+    emit_vtables(g);
+  do {
+    refl_reserve_thunk_sites(g);
+  } while (materialize_pending_gctx(g));
   emit_site_live_tables(g);
   emit_site_dtor_table(g);
   emit_site_tyname_table(g);
@@ -730,8 +752,8 @@ done:;
   zan_irgen_emit_arc_desc_init(g, need_heap_diag);
   emit_all_class_releases(g);
   refl_finalize_mtabs(g);
-  if (!prune_stdlib_bodies)
-    emit_vtables(g);
+  while (materialize_pending_gctx(g)) {
+  }
   if (g->emit_lib && g->emit_shared && g->target_is_windows)
     emit_windows_dll_main(g);
   zan_irgen_emit_string_deobf(g);
@@ -1347,7 +1369,34 @@ zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g,
   return zan_bind_target_layout(g, out_tm);
 }
 
+/* Apple --fast-alloc: point every allocation call this module makes at the
+ * small-object allocator. Runs on the main and every shard module right
+ * before object emission, i.e. after the LLVM pipeline has had its look at
+ * the libc names (heap-to-stack, malloc/free pair elision). Only bodiless
+ * declarations are renamed; rt_mem.c's zone makes any pointer that still
+ * crosses to libc (C runtime, drivers, cached objects) safe either way. */
+static void zan_irgen_route_fast_alloc(zan_irgen_t *g, LLVMModuleRef mod) {
+    if (!g->route_fast_alloc) return;
+    static const char *const names[][2] = {
+        { "malloc", "zan_mem_malloc" }, { "free", "zan_mem_free" },
+        { "calloc", "zan_mem_calloc" }, { "realloc", "zan_mem_realloc" },
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(mod, names[i][0]);
+        if (!fn || !LLVMIsDeclaration(fn)) continue;
+        LLVMValueRef have = LLVMGetNamedFunction(mod, names[i][1]);
+        if (have) {
+            /* Both spellings declared (a DllImport of zan_mem_*): fold. */
+            LLVMReplaceAllUsesWith(fn, have);
+            LLVMDeleteFunction(fn);
+            continue;
+        }
+        LLVMSetValueName2(fn, names[i][1], strlen(names[i][1]));
+    }
+}
+
 void zan_irgen_prepare_object_sections(zan_irgen_t *g, LLVMModuleRef mod) {
+  zan_irgen_route_fast_alloc(g, mod);
   /* Main and shard objects need the same GC granularity. COFF '$' suffixes
    * merge into ordinary output sections. Preserve special runtime sections,
    * TLS and weak/ODR groups when making strong definitions discardable. */

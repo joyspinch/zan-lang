@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+
+/* HTTP/1.1 keep-alive 压测客户端（纯 Zan，跨平台，不依赖 wrk/ab）。
+ * N 条连接各一个协程，闭环发 GET、按 Content-Length 读完整应答、记延迟；
+ * 预热期不计入；结束时输出一行 JSON。
+ *
+ * 参数：--host=127.0.0.1 --port=18480 --path=/bench/plain --conns=8
+ *       --seconds=10 --warmup=2 */
+class Program {
+    static string host;
+    static int port;
+    static string path;
+    static long measureFromUs;
+    static long endUs;
+    static List<int> samples = new List<int>();
+    static int errors;
+    static int non200;
+    static int reconnects;
+    static int done;
+    static int stuck;
+
+    static string Arg(string[] args, string name, string dflt) {
+        string prefix = "--" + name + "=";
+        for (int i = 0; i < args.Length; i = i + 1) {
+            if (args[i].StartsWith(prefix)) { return args[i].Substring(prefix.Length); }
+        }
+        return dflt;
+    }
+
+    /* 在 buf[0..len) 中找 "\r\n\r\n"，返回头部总长（含空行），没有则 -1。 */
+    static int HeaderEnd(byte[] buf, int len) {
+        for (int i = 3; i < len; i = i + 1) {
+            if ((buf[i] & 255) == 10 && (buf[i - 1] & 255) == 13
+                && (buf[i - 2] & 255) == 10 && (buf[i - 3] & 255) == 13) {
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+
+    static int ContentLength(string head) {
+        int at = head.IndexOf("Content-Length: ");
+        if (at < 0) { return 0; }
+        int s = at + 16;
+        int e = s;
+        while (e < head.Length && (head[e] & 255) >= 48 && (head[e] & 255) <= 57) { e = e + 1; }
+        return Convert.ToInt32(head.Substring(s, e - s));
+    }
+
+    static async void Worker(int id) {
+        string req = "GET " + Program.path + " HTTP/1.1\r\nHost: " + Program.host
+            + "\r\nConnection: keep-alive\r\nAccept: text/html\r\n\r\n";
+        int cap = 1048576;
+        byte[] buf = new byte[cap];
+        byte[] chunk = new byte[65536];
+        TcpClient c = null;
+        while (Stopwatch.GetMicroseconds() < Program.endUs) {
+            if (c == null) {
+                c = await TcpClient.ConnectAsync(Program.host, Program.port, 5000);
+                if (c == null) { Program.errors = Program.errors + 1; await Task.Delay(10); continue; }
+            }
+            long t0 = Stopwatch.GetMicroseconds();
+            int sent = await c.SendAsync(req);
+            if (sent <= 0) { c.Dispose(); c = null; Program.reconnects = Program.reconnects + 1; continue; }
+            int have = 0;
+            int headLen = -1;
+            int need = -1;
+            bool broken = false;
+            while (need < 0 || have < need) {
+                // 带时限的接收：服务端丢应答或运行时丢唤醒时不至于整轮挂死，
+                // 记为错误并重连。
+                int room = cap - have;
+                if (room > 65536) { room = 65536; }
+                int got = await c.RecvBytesAsync(chunk, room, 10000);
+                if (got <= 0) { broken = true; break; }
+                NativeMemory.Copy((nint)buf + (nint)have, (nint)chunk, got);
+                have = have + got;
+                if (headLen < 0) {
+                    headLen = Program.HeaderEnd(buf, have);
+                    if (headLen > 0) {
+                        string head = NativeMemory.GetString((nint)buf, 0, headLen);
+                        need = headLen + Program.ContentLength(head);
+                        if (head.Length < 12 || head.Substring(9, 3) != "200") {
+                            Program.non200 = Program.non200 + 1;
+                        }
+                        if (need > cap) { broken = true; break; }
+                    }
+                }
+            }
+            long t1 = Stopwatch.GetMicroseconds();
+            if (broken) {
+                Program.errors = Program.errors + 1;
+                c.Dispose(); c = null;
+                Program.reconnects = Program.reconnects + 1;
+                continue;
+            }
+            if (t0 >= Program.measureFromUs && t1 <= Program.endUs) {
+                Program.samples.Add((int)(t1 - t0));
+            }
+        }
+        if (c != null) { c.Dispose(); }
+        Program.done = Program.done + 1;
+    }
+
+    static long Pct(List<int> sorted, int permille) {
+        if (sorted.Count == 0) { return 0; }
+        int idx = (int)((long)(sorted.Count - 1) * permille / 1000);
+        return (long)sorted[idx];
+    }
+
+    static async void Main(string[] args) {
+        Program.host = Program.Arg(args, "host", "127.0.0.1");
+        Program.port = Convert.ToInt32(Program.Arg(args, "port", "18480"));
+        Program.path = Program.Arg(args, "path", "/bench/plain");
+        int conns = Convert.ToInt32(Program.Arg(args, "conns", "8"));
+        int seconds = Convert.ToInt32(Program.Arg(args, "seconds", "10"));
+        int warmup = Convert.ToInt32(Program.Arg(args, "warmup", "2"));
+
+        Socket.Initialize();
+        long start = Stopwatch.GetMicroseconds();
+        Program.measureFromUs = start + (long)warmup * 1000000;
+        Program.endUs = Program.measureFromUs + (long)seconds * 1000000;
+        for (int i = 0; i < conns; i = i + 1) { Task.Spawn(Program.Worker(i)); }
+        // 硬截止：所有连接应在测量窗结束后 ~10s（接收时限）内收尾；超出仍
+        // 未结束的连接记为 stuck 并照常出报告，不让一条挂死拖住整轮。
+        long hardStop = Program.endUs + 15000000;
+        while (Program.done < conns && Stopwatch.GetMicroseconds() < hardStop) {
+            await Task.Delay(50);
+        }
+        Program.stuck = conns - Program.done;
+
+        Program.samples.Sort();
+        long n = Program.samples.Count;
+        long sum = 0;
+        for (int i = 0; i < Program.samples.Count; i = i + 1) { sum = sum + (long)Program.samples[i]; }
+        double rps = (double)n / (double)seconds;
+        long mean = n > 0 ? sum / n : 0;
+        long max = n > 0 ? (long)Program.samples[Program.samples.Count - 1] : 0;
+        Console.WriteLine("{\"path\":\"" + Program.path + "\",\"conns\":" + Convert.ToString(conns)
+            + ",\"seconds\":" + Convert.ToString(seconds)
+            + ",\"requests\":" + Convert.ToString(n)
+            + ",\"rps\":" + Convert.ToString((long)rps)
+            + ",\"mean_us\":" + Convert.ToString(mean)
+            + ",\"p50_us\":" + Convert.ToString(Program.Pct(Program.samples, 500))
+            + ",\"p90_us\":" + Convert.ToString(Program.Pct(Program.samples, 900))
+            + ",\"p99_us\":" + Convert.ToString(Program.Pct(Program.samples, 990))
+            + ",\"max_us\":" + Convert.ToString(max)
+            + ",\"errors\":" + Convert.ToString(Program.errors)
+            + ",\"non200\":" + Convert.ToString(Program.non200)
+            + ",\"reconnects\":" + Convert.ToString(Program.reconnects)
+            + ",\"stuck\":" + Convert.ToString(Program.stuck) + "}");
+        Socket.Cleanup();
+    }
+}

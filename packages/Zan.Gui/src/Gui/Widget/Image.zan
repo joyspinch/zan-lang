@@ -8,7 +8,11 @@ public class Image : Control {
     public Binding<string> Src;
     public string Alt;
     public string Fit;
+    // 图片就绪（已解码并缓存）。工作线程触发时自动封送回 UI 线程。
+    [Event]
     public UiEvent Loaded;
+    // 解码失败、URL 取回失败或超时。
+    [Event]
     public UiEvent Error;
     private string resolvedSrc;  // 已解析过的 Src；null = 尚未解析
     private string imgKey;  // 绘制用 key：文件路径或 mem: 注册 key
@@ -89,7 +93,7 @@ public class Image : Control {
         imgW = w;
         imgH = h;
         loadState = 1;
-        Loaded.PostS(this);
+        Loaded.Post(this);
     }
     private void ResolveFile(string src) {
         imgKey = src;
@@ -197,12 +201,12 @@ public class Image : Control {
         svgText = text;
         svgBaseKey = imgKey;
         this.RasterSvg(0, 0);
-        if (loadState == 1) { Loaded.PostS(this); }
+        if (loadState == 1) { Loaded.Post(this); }
     }
     public void OnFetchFailed() {
         if (loadState == 1) { return; }
         loadState = 2;
-        Error.PostS(this);
+        Error.Post(this);
     }
     public void Reload() {
         if (imgKey != "" && (imgKey.StartsWith("mem:u") || svgRasterKey != "")) { Canvas.EvictImage(imgKey); }
@@ -219,26 +223,10 @@ public class Image : Control {
         if (den <= 0) { return v; }
         return (v * num * 2 + den) / (den * 2);
     }
-    public override void SetProp(string key, string val) {
-        if (key == "src") {
-            if (Src != null) {
-                Src.Set(val);
-            } else {
-                Src = val;
-            }
-            resolvedSrc = null;
-            return;
-        }
-        if (key == "fit") {
-            Fit = val;
-            return;
-        }
-        if (key == "alt") {
-            Alt = val;
-            return;
-        }
-        base.SetProp(key, val);
-    }
+    // ---- 保留模式钩子（Control）-------------------------------------
+
+    // 测量：CSS 尺寸优先，缺一边时按已加载图片的纵横比补齐，
+    // 未加载时兜底 96x96。
     public override void OnMeasure(App app) {
         this.Resolve(app);
         StyleBox s = this.ResolveStyleAs(app, "image", Class, Style.SNormal());
@@ -326,35 +314,32 @@ public class Image : Control {
         c.DrawTextCentered(bx, by, bw, bh, label, s.FgOr(0),
                            s.FontOr(app.Scale(13)));
     }
-    public override string Kind() { return "Image"; }
+    // ---- 设计器 / 序列化模型 ---------------------------------------
+
+    // 换图源：写绑定并作废已解析的路径缓存。
+    public void SetSrc(string v) {
+        if (Src != null) { Src.Set(v); } else { Src = v; }
+        resolvedSrc = null;
+    }
+
+    // 设计器属性面：src / alt / fit / class。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Text("src", "Src").DefaultBinding().Field("Src", 0));
-        ps.Add(PropSpec.Text("alt", "Alt").Field("Alt", 0));
+        ps.Add(PropSpec.Text("src", "Src").DefaultBinding().Field("Src").Setter("SetSrc"));
+        ps.Add(PropSpec.TextField("Alt"));
         PropSpec fit = PropSpec.Enum("fit", "Fit",
             new List<string>{ "contain", "cover", "fill", "none" });
-        fit.Field("Fit", 0);
+        // 实时绑定 Fit 字段本身（选项文本即取值）。此前绑的是
+        // FitIndex() 方法返回值的快照——SetProp 经 PropOf 命中这张
+        // 游离 spec，写入永远落不到控件（SetExtra 的活路被
+        // PropOf-first 管线挡住）。
+        fit.Field("Fit");
         ps.Add(fit);
         return ps;
     }
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Loaded");
-        e.Add("Error");
-        return e;
-    }
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Loaded") { Loaded.Add(a); return; }
-        if (evt == "Error") { Error.Add(a); return; }
-        base.BindEvent(evt, a);
-    }
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Loaded") { Loaded.AddS(a); return; }
-        if (evt == "Error") { Error.AddS(a); return; }
-        base.BindEventS(evt, a);
-    }
-    public override string GetExtra(string key) { return ""; }
-    public override bool SetExtra(string key, string val) { return false; }
+
+    // FitMode 的枚举序号（设计器 fit 下拉用）：0 contain / 1 cover /
+    // 2 fill / 3 none。
     public int FitIndex() {
         string f = this.FitMode();
         if (f == "cover") { return 1; }

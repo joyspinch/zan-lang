@@ -474,8 +474,21 @@ void emit_weak_runtime(zan_irgen_t *g) {
   emit_live_registry_fallback(g);
 }
 
-/* Release spills to a per-thread queue when recursion reaches its limit. The
- * outer release drains that same queue, including work added by destructors. */
+/* B-ID78 延迟释放队列的形态自足弱回退：rt_release_dyn 的深树防护无条件
+ * 引用 zan_rt_defer_push/pending/drain（类释放胶水），但 rt_mem.o 只在
+ * 原生 exe 与跨端 linux exe 链入——Windows DLL、macOS dylib、Android
+ * 静态链（bionic 上 --wrap=malloc 崩，刻意不链）与 selfhost 对象束都拿
+ * 不到它，B-ID78 后这些形态全部断链（emit_lib 门 2026-11-03 实锤：
+ * dll/dylib undefined reference to zan_rt_defer_*）。这里对 release_dyn
+ * 已建好的三个声明补弱链路 + 函数体：真队列现在 rt_timer.o（2026-11-23
+ * 从 rt_mem.o 迁出，hosted 原生 exe 含 macOS 全覆盖），链入它的形态由强定义覆盖
+ * （真队列语义不变，与 zan_io_pump 的弱覆盖先例同款）；未链入的形态
+ * 退化为 push 即同步调析构——与真实现自身节点分配失败的 fail-open 路径
+ * 同语义，不泄漏、不挂队列，深树级联在该形态回到 B-ID78 前的同步递归。
+ * Release spills to a per-thread queue when recursion reaches its limit. The
+ * outer release drains that same queue, including work added by destructors.
+ * 必须在 defer 声明建成之后调用：LLVMAddFunction 不查重名，先建会让
+ * release_dyn 的同名声明被 mangler 改名（zan_rt_defer_push.5）而指空。 */
 void emit_defer_fallback(zan_irgen_t *g) {
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
   LLVMBuilderRef b = g->builder;
@@ -624,6 +637,16 @@ static void emit_live_registry_fallback(zan_irgen_t *g) {
   LLVMPositionBuilderAtEnd(g->builder, rfg_entry);
   LLVMBuildRetVoid(g->builder);
 
+  LLVMValueRef col_fn = LLVMGetNamedFunction(g->mod, "zan_gc_collect_cycles");
+  if (!col_fn) {
+    col_fn = LLVMAddFunction(g->mod, "zan_gc_collect_cycles",
+                             LLVMFunctionType(i64t, NULL, 0, 0));
+  }
+  LLVMSetLinkage(col_fn, LLVMWeakAnyLinkage);
+  LLVMPositionBuilderAtEnd(
+      g->builder, LLVMAppendBasicBlockInContext(g->ctx, col_fn, "entry"));
+  LLVMBuildRet(g->builder, LLVMConstInt(i64t, 0, 0));
+
   if (saved_bb)
     LLVMPositionBuilderAtEnd(g->builder, saved_bb);
 }
@@ -655,4 +678,55 @@ LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
   if (val_ty != i8ptr)
     v = LLVMBuildBitCast(g->builder, v, val_ty, "weak.rval");
   return v;
+}
+
+/* —— 热路径守卫：每个对象分配/释放都会经过的可选设施，先内联判一次再调 ——
+ * 曾无条件调用：zan_rt_live_register/unregister（活对象注册表，默认关）与
+ * zan_rt_weak_nil_all/destroy_begin（弱引用表，程序里没有 weak 时恒空），
+ * 对象密集代码里合计约 10% 采样，几乎全是调用开销——被调者第一件事就是读
+ * 同一个开关然后返回。语义不变：判据与被调者内部的早退判据相同。 */
+
+/* i1：弱引用表非空（与 emit_weak_count_check 同一读法） */
+LLVMValueRef zan_emit_weak_any(zan_irgen_t *g) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef count = LLVMBuildLoad2(g->builder, i64, g->weak_count, "weak.any.n");
+    LLVMSetAlignment(count, 8);
+    LLVMSetOrdering(count, LLVMAtomicOrderingMonotonic);
+    return LLVMBuildICmp(g->builder, LLVMIntNE, count,
+                         LLVMConstInt(i64, 0, 0), "weak.any");
+}
+
+/* 模块内的注册表开关：用 GC.DetectCycles/CollectCycles/WriteHeapSnapshot 的
+ * 程序编译期置 1；否则由启动构造器按环境变量 ZAN_DETECT_LEAKS 置位
+ * （zan_request_live_registry）。纯模块内全局，不新增运行时 ABI 符号。 */
+LLVMValueRef zan_live_flag_global(zan_irgen_t *g) {
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, "__zan_live_on");
+    if (gv) return gv;
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    gv = LLVMAddGlobal(g->mod, i8, "__zan_live_on");
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetInitializer(gv, LLVMConstInt(i8, 0, 0));
+    return gv;
+}
+
+/* cond 为真才调用 fn(args...)（返回值丢弃）；结束时 builder 停在汇合块 */
+void zan_emit_call_if(zan_irgen_t *g, LLVMValueRef cond, LLVMValueRef fn,
+                      LLVMValueRef *args, unsigned n) {
+    LLVMValueRef cur = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+    LLVMBasicBlockRef call_bb = LLVMAppendBasicBlockInContext(g->ctx, cur, "opt.call");
+    LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, cur, "opt.done");
+    LLVMBuildCondBr(g->builder, cond, call_bb, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, call_bb);
+    zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, args, n, "");
+    LLVMBuildBr(g->builder, done_bb);
+    LLVMPositionBuilderAtEnd(g->builder, done_bb);
+}
+
+/* i1：注册表开关已开 */
+LLVMValueRef zan_emit_live_on(zan_irgen_t *g) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef v = LLVMBuildLoad2(g->builder, i8, zan_live_flag_global(g), "live.on.v");
+    LLVMSetAlignment(v, 1);
+    LLVMSetOrdering(v, LLVMAtomicOrderingMonotonic);
+    return LLVMBuildICmp(g->builder, LLVMIntNE, v, LLVMConstInt(i8, 0, 0), "live.on");
 }

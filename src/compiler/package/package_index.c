@@ -67,36 +67,16 @@ static void pkg_index_source_tree_collect(pkg_probe_list_t *list,
   if (!ent)
     return;
 
-  /* 目录统一命名空间快路径：排序后的首个 .zan 若声明命名空间恰等于
-   * 目录推导命名空间，则整目录免逐文件 probe（仓库约定「目录即命名
-   * 空间」，stdlib glob 同款假设）。首文件无声明或与目录推导不符 →
-   * 整目录进并行 probe 队列，语义与旧实现一致。 */
+  /* 每个 .zan 文件均进入并行 probe 队列，避免目录内混放子命名空间文件
+   * （如 Game/Audio/MixerBus.zan 声明 Game.Audio.Spatial、Gui/Widget/
+   * ThemeDrawer.zan 声明 Gui）被首文件掩蔽。 */
   char dir_ns[256];
   pkg_rel_dir_ns(dir, src_root, dir_ns, sizeof(dir_ns));
   int uniform = 0;
+  int first_idx = -1;
+  int first_has_ns = 0;
+  char first_declared[256] = {0};
   g_pkg_dirs_total++;
-  if (dir_ns[0]) {
-    for (int i = 0; i < ent->count; i++) {
-      if (ent->flags[i] & 3)
-        continue; /* 目录/重解析点不参与 */
-      if (!pkg_safe_component(ent->names[i]))
-        continue;
-      size_t nl = strlen(ent->names[i]);
-      if (nl < 5 || strcmp(ent->names[i] + nl - 4, ".zan") != 0)
-        continue;
-      char first_path[1024];
-      if (snprintf(first_path, sizeof(first_path), "%s" PATH_SEP "%s", dir,
-                   ent->names[i]) < (int)sizeof(first_path)) {
-        char declared0[256] = {0};
-        g_pkg_probe_calls++;
-        uniform = probe(first_path, declared0, sizeof(declared0)) &&
-                  declared0[0] && strcmp(declared0, dir_ns) == 0;
-      }
-      break; /* 只看排序后的首个 .zan */
-    }
-    if (uniform)
-      g_pkg_dirs_uniform++;
-  }
 
   for (int i = 0; i < ent->count; i++) {
     const char *name = ent->names[i];
@@ -127,9 +107,15 @@ static void pkg_index_source_tree_collect(pkg_probe_list_t *list,
     it.project_owned = project_owned;
     it.uniform = uniform;
     snprintf(it.dir_ns, sizeof(it.dir_ns), "%s", dir_ns);
-    if (uniform)
+    if (uniform) {
       snprintf(it.declared, sizeof(it.declared), "%s", dir_ns);
-    it.has_ns = uniform;
+      it.has_ns = 1;
+    } else if (i == first_idx) {
+      it.probed = 1;
+      it.has_ns = first_has_ns;
+      if (first_has_ns)
+        snprintf(it.declared, sizeof(it.declared), "%s", first_declared);
+    }
     pkg_probe_list_push(list, &it);
   }
   pkg_dir_entries_free(ent);
@@ -248,7 +234,7 @@ static void pkg_index_build_from_items(zan_pkg_source_index_t *index,
   /* 待 probe 的 item 下标（保持走树次序中的相对顺序） */
   int pending_n = 0;
   for (int i = 0; i < list->count; i++)
-    if (!list->items[i].uniform)
+    if (!list->items[i].uniform && !list->items[i].probed)
       pending_n++;
   int *pending = NULL;
   if (pending_n > 0) {
@@ -258,7 +244,7 @@ static void pkg_index_build_from_items(zan_pkg_source_index_t *index,
     }
     int k = 0;
     for (int i = 0; i < list->count; i++)
-      if (!list->items[i].uniform)
+      if (!list->items[i].uniform && !list->items[i].probed)
         pending[k++] = i;
   }
 

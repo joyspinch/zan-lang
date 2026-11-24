@@ -308,6 +308,7 @@ LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                       zan_type_t *elem_type);
 void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
                          LLVMValueRef rc_iptr);
+LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty);
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
                   LLVMValueRef v);
 LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty,
@@ -1269,6 +1270,9 @@ bool refl_ctor_needs_thunk(zan_irgen_t *g);
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl);
+void refl_note_invoke_literal(zan_irgen_t *g, zan_ast_node_t *name);
+void refl_note_propspec_accessors(zan_irgen_t *g, zan_symbol_t *method_sym,
+                                  zan_ast_node_t *call);
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g, bool need_field_graph);
 
 /* --- From irgen_stmt.c (7 functions) --- */

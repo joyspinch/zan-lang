@@ -252,15 +252,9 @@ static void refl_release_args(zan_irgen_t *g, zan_ast_node_t **args, int argc,
   }
 }
 
-static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
-  if (g->refl_invoke_unknown)
-    return;
-  if (name && (name->kind != AST_STRING_LITERAL ||
-               memchr(name->str_val.str, '\0', name->str_val.len))) {
-    g->refl_invoke_unknown = true;
-    return;
-  }
-  if (!name || !name->str_val.len)
+void refl_note_invoke_literal(zan_irgen_t *g, zan_ast_node_t *name) {
+  if (!name || name->kind != AST_STRING_LITERAL || !name->str_val.len ||
+      memchr(name->str_val.str, '\0', name->str_val.len))
     return;
   zan_istr_t text = name->str_val;
   for (int i = 0; i < g->refl_invoke_name_count; i++) {
@@ -289,6 +283,35 @@ static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
   g->refl_invoke_names[g->refl_invoke_name_count++] = text;
 }
 
+void refl_note_propspec_accessors(zan_irgen_t *g, zan_symbol_t *method_sym,
+                                  zan_ast_node_t *call) {
+  if (!g || !method_sym || !method_sym->parent || !call)
+    return;
+  zan_symbol_t *owner = method_sym->parent;
+  if (owner->name.len != 8 || memcmp(owner->name.str, "PropSpec", 8) != 0)
+    return;
+  if (method_sym->name.len == 8 &&
+      memcmp(method_sym->name.str, "Accessor", 8) == 0) {
+    if (call->call.args.count >= 1)
+      refl_note_invoke_literal(g, call->call.args.items[0]);
+    if (call->call.args.count >= 2)
+      refl_note_invoke_literal(g, call->call.args.items[1]);
+  } else if (method_sym->name.len == 6 &&
+             memcmp(method_sym->name.str, "Setter", 6) == 0) {
+    if (call->call.args.count >= 1)
+      refl_note_invoke_literal(g, call->call.args.items[0]);
+  }
+}
+
+static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
+  if (name && (name->kind != AST_STRING_LITERAL ||
+               memchr(name->str_val.str, '\0', name->str_val.len))) {
+    g->refl_invoke_unknown = true;
+    return;
+  }
+  refl_note_invoke_literal(g, name);
+}
+
 /* thunk 把返回引用的所有权放进 ret 槽；不接管所有权的消费臂丢弃前必须
  * 释放，否则每次调用漏一个对象（探针 p2：InvokeLong 取 object 字段，
  * 进程退出漏 payload）。incl_string：数值化臂对 FK_STRING 错配返回的
@@ -297,28 +320,55 @@ static void refl_emit_owned_drop(zan_irgen_t *g, LLVMValueRef v, LLVMValueRef k,
                                  LLVMValueRef called, bool incl_string) {
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-  LLVMValueRef owned = LLVMBuildOr(
+  LLVMValueRef is_obj = LLVMBuildOr(
       g->builder,
       LLVMBuildICmp(g->builder, LLVMIntEQ, k,
                     LLVMConstInt(i64, ZAN_REFL_FK_REF, 0), "refl.dropref"),
       LLVMBuildICmp(g->builder, LLVMIntEQ, k,
                     LLVMConstInt(i64, ZAN_REFL_FK_STRUCT, 0), "refl.dropst"),
       "refl.dropobj");
+  LLVMValueRef is_str = NULL;
+  LLVMValueRef owned = is_obj;
   if (incl_string) {
-    owned = LLVMBuildOr(g->builder, owned,
-                        LLVMBuildICmp(g->builder, LLVMIntEQ, k,
-                                      LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0),
-                                      "refl.dropstr"),
-                        "refl.dropref2");
+    is_str = LLVMBuildICmp(g->builder, LLVMIntEQ, k,
+                           LLVMConstInt(i64, ZAN_REFL_FK_STRING, 0),
+                           "refl.dropstr");
+    owned = LLVMBuildOr(g->builder, owned, is_str, "refl.dropref2");
   }
-  LLVMValueRef take = LLVMBuildAnd(g->builder, called, owned, "refl.droprise");
+  LLVMValueRef drop = LLVMBuildAnd(
+      g->builder, LLVMBuildAnd(g->builder, called, owned, "refl.droprise"),
+      LLVMBuildICmp(g->builder, LLVMIntNE, v, LLVMConstInt(i64, 0, 0),
+                    "refl.dropnz"),
+      "refl.drop");
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+  LLVMBasicBlockRef rel_b =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irel");
+  LLVMBasicBlockRef cont_b =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.icont");
+  LLVMBuildCondBr(g->builder, drop, rel_b, cont_b);
+  LLVMPositionBuilderAtEnd(g->builder, rel_b);
   LLVMValueRef p = LLVMBuildIntToPtr(g->builder, v, i8ptr, "refl.dropp");
-  LLVMValueRef safe = LLVMBuildSelect(g->builder, take, p, LLVMConstNull(i8ptr),
-                                      "refl.dropsel");
-  zan_call2(g->builder,
-            LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
-                             (LLVMTypeRef[]){i8ptr}, 1, 0),
-            g->rt_release_dyn, (LLVMValueRef[]){safe}, 1, "");
+  LLVMTypeRef rel_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                        (LLVMTypeRef[]){i8ptr}, 1, 0);
+  if (incl_string) {
+    /* 字符串没有对象头（ZAN_STR_HDR_WORD），必须走 rt_str_release；
+     * 对象与装箱结构体走 rt_release_dyn。 */
+    LLVMBasicBlockRef str_b =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irels");
+    LLVMBasicBlockRef obj_b =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "refl.irelo");
+    LLVMBuildCondBr(g->builder, is_str, str_b, obj_b);
+    LLVMPositionBuilderAtEnd(g->builder, str_b);
+    zan_call2(g->builder, rel_ty, g->rt_str_release, &p, 1, "");
+    LLVMBuildBr(g->builder, cont_b);
+    LLVMPositionBuilderAtEnd(g->builder, obj_b);
+    zan_call2(g->builder, rel_ty, g->rt_release_dyn, &p, 1, "");
+    LLVMBuildBr(g->builder, cont_b);
+  } else {
+    zan_call2(g->builder, rel_ty, g->rt_release_dyn, &p, 1, "");
+    LLVMBuildBr(g->builder, cont_b);
+  }
+  LLVMPositionBuilderAtEnd(g->builder, cont_b);
 }
 
 static LLVMValueRef refl_emit_unpack_invoke_ret(zan_irgen_t *g, int ret_kind,
@@ -1053,7 +1103,8 @@ bool refl_needs_site_meta(zan_irgen_t *g) {
    * shared by GetType and object Get/Set/Invoke, including unknown receivers.
    * Once emitted, demand stays conservative even if optimization removes it. */
   return g->refl_used &&
-         (!g->publish_reflect_demand || g->fn_refl_obj_type != NULL);
+         (!g->publish_reflect_demand || g->emit_lib ||
+          g->fn_refl_obj_type != NULL);
 }
 
 void emit_site_meta_table(zan_irgen_t *g) {

@@ -63,10 +63,10 @@ public partial class WebApp {
     }
 
     public async HttpResponse DispatchRequest(HttpRequest req) {
-        return await this.HandleHttp2Request(req);
+        return await this.HandleHttp2Request(req, "127.0.0.1");
     }
 
-    private async HttpResponse HandleHttp2Request(HttpRequest req) {
+    internal async HttpResponse HandleHttp2Request(HttpRequest req, string remoteIp = "127.0.0.1") {
         RequestTrace trace = null;
         if (req.StreamHeadersUs != 0) { trace = this.StartRequestTrace("HTTP/2", req.StreamHeadersUs); }
         if (trace != null) {
@@ -77,22 +77,26 @@ public partial class WebApp {
         bool resources = trace != null && this.profileRequestResources
             && trace.BeginResources(this.profileRequestExecution, this.profileRequestStages);
         try {
-            HttpContext ctx = new HttpContext(req, "127.0.0.1");
+            HttpContext ctx = new HttpContext(req, remoteIp);
+            if (this.forwardedHeaders != null && this.forwardedHeaders.IsEnabled()) {
+                ctx.SetClientIp(this.forwardedHeaders.ResolveClientIp(ctx));
+            }
             ctx.Trace = trace;
             ctx.SetApp(this);
-            int formStage = trace != null ? trace.Begin("parse_form") : -1;
-            if (req.bodyLength > 0) {
+            ctx.MarkTransportSecure();
+            Route route = this.MatchRequest(ctx);
+            bool admitted;
+            if (!this.TryPrepareRequestSync(ctx, route, out admitted)) {
+                admitted = await this.PrepareRequest(ctx, route);
+            }
+            if (admitted && req.bodyLength > 0) {
+                int formStage = trace != null ? trace.Begin("parse_form") : -1;
                 if (HttpContext.StartsWith(req.contentType, "multipart/form-data")) {
                     HttpContext.ParseMultipartFields(req, ctx);
                 } else {
                     HttpContext.ParseFormBody(req, ctx);
                 }
-            }
-            if (trace != null) { trace.End(formStage); }
-            Route route = this.MatchRequest(ctx);
-            bool admitted;
-            if (!this.TryPrepareRequestSync(ctx, route, out admitted)) {
-                admitted = await this.PrepareRequest(ctx, route);
+                if (trace != null) { trace.End(formStage); }
             }
             Worker.BumpStat();
             await this.Dispatch(ctx, route, true, false, !admitted);
@@ -208,7 +212,8 @@ public partial class WebApp {
                     && request.version == "HTTP/2.0") {
                     if (resources) { trace.EndResources(); resources = false; }
                     framer.Consume(headerEnd);
-                    await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, this.HandleHttp2Request,
+                    Http2RequestBridge bridge = new Http2RequestBridge(this, remoteIp);
+                    await Http2ServerConnection.ServeTlsAsync(stream.SendBytesAsync, bridge.Handle,
                         framer, 65000, this.maxBodyBytes, this.requestTimeoutMs, measure);
                     return;
                 }

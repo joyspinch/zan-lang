@@ -688,8 +688,8 @@ bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
   return false;
 }
 
-static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
-  if (!g->publish_reflect_demand || g->refl_invoke_unknown)
+static bool refl_invoke_literal_demanded(zan_irgen_t *g, zan_istr_t name) {
+  if (!g->publish_reflect_demand)
     return true;
   for (int i = 0; i < g->refl_invoke_name_count; i++) {
     zan_istr_t invoked = g->refl_invoke_names[i];
@@ -697,6 +697,12 @@ static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
       return true;
   }
   return false;
+}
+
+static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
+  if (g->refl_invoke_unknown)
+    return true;
+  return refl_invoke_literal_demanded(g, name);
 }
 
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target
@@ -708,12 +714,18 @@ static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
  * accessor/\u6ce8\u89e3\u4ecd\u751f
  * thunk，\u4e0e\u73b0\u72b6\u4e00\u81f4）\u3002
  */
+static bool refl_is_lib_export_owner(zan_irgen_t *g, zan_symbol_t *owner) {
+  return g->emit_lib && owner && owner->decl &&
+         !owner->decl->from_stdlib && !owner->decl->from_package &&
+         !is_user_generic_sym(owner);
+}
+
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl) {
   if (!decl || decl->kind != AST_METHOD_DECL) {
     return false;
   }
-  if (!g->publish_reflect_demand) {
+  if (!g->publish_reflect_demand || refl_is_lib_export_owner(g, owner)) {
     return true;
   }
   if (!(decl->method_decl.modifiers & MOD_STATIC) &&
@@ -733,10 +745,12 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
     return refl_invoke_name_demanded(g, name);
   }
   /* Named hooks with dynamic Invoke(var) are callable only when an emitted
-   * Invoke may select them. Literal Invoke("ExactName") retains its exact
-   * demanded target even in --publish mode. */
-  return refl_is_framework_hook_name(name.str, name.len) &&
-         refl_invoke_name_demanded(g, name);
+   * Invoke may select them. Literal Invoke("ExactName") and declarative
+   * PropSpec Accessor/Setter targets retain their exact demanded targets even
+   * in --publish mode. */
+  return refl_invoke_literal_demanded(g, name) ||
+         (refl_is_framework_hook_name(name.str, name.len) &&
+          refl_invoke_name_demanded(g, name));
 }
 
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym,

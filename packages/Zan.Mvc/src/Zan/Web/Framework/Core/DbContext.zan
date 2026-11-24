@@ -64,6 +64,7 @@ public class DbContext {
 
     /* 归还主库连接到池，兼容 null，可直接放入 finally。*/
     public void Release(IDbConnection db) {
+        db = DbContext.Unproxy(db);
         if (this.pool == null || db == null) { return; }
         /* 归还的是底层池连接，而非请求拿到的计时包装器。*/
         this.pool.Release(TracedDbConnection.Unwrap(db));
@@ -72,6 +73,7 @@ public class DbContext {
     /* 永久弃用事务状态未知的主库租约。先释放池槽位，再关闭：Close
        可能抛错或仍报告已连接，不能经 Release 把脏连接回池或漏掉槽位。*/
     public void Discard(IDbConnection db) {
+        db = DbContext.Unproxy(db);
         if (db == null) { return; }
         IDbConnection raw = TracedDbConnection.Unwrap(db);
         if (this.pool != null) { this.pool.core.Drop(raw); }
@@ -92,10 +94,47 @@ public class DbContext {
 
     /* 归还只读连接到对应的池。*/
     public void ReleaseRead(IDbConnection db) {
+        db = DbContext.Unproxy(db);
         if (db == null) { return; }
         DbPool target = (this.readPool != null) ? this.readPool : this.pool;
         if (target == null) { return; }
         target.Release(TracedDbConnection.Unwrap(db));
+    }
+
+    /* 请求惰性连接（RequestDbConnection）交还时取出内层真实连接并清空
+       代理；代理本身绝不进池，未借出的代理没有可还之物。*/
+    private static IDbConnection Unproxy(IDbConnection db) {
+        if (db != null && db is RequestDbConnection) {
+            return ((RequestDbConnection)db).Detach();
+        }
+        return db;
+    }
+
+    /* 不挂起地取一条空闲连接（同步语句端点用）；池中无空闲时返回 null。*/
+    public IDbConnection TryAcquireNow(bool read, IDbStatementObserver observer = null) {
+        DbPool target = read ? this.readPool : this.pool;
+        if (target == null) { return null; }
+        IDbConnection db = target.TryAcquire();
+        if (db == null) { return null; }
+        if (!db.IsConnected()) {
+            target.Release(db);
+            return null;
+        }
+        return TracedDbConnection.Wrap(db, observer);
+    }
+
+    /* 方言 id：惰性连接尚未借出时，ORM 拼 SQL 需要先知道驱动。*/
+    public int Provider(bool read) {
+        DbPool target = read ? this.readPool : this.pool;
+        if (target == null) { return 0; }
+        return target.GetProvider();
+    }
+
+    /* 存活连接数（空闲 + 已借出）；read 选只读池。*/
+    public int Live(bool read) {
+        DbPool target = read ? this.readPool : this.pool;
+        if (target == null) { return 0; }
+        return target.LiveCount();
     }
 
     /* 是否启用了独立的只读从库池。*/

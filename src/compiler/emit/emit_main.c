@@ -306,6 +306,26 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method,
         LLVMBuildLoad2(g->builder, i64t, g->g_site_count, "fg.site.count");
     zan_call2(g->builder, reg_ty, reg_fn, (LLVMValueRef[]){tbl, tntbl, sc}, 3,
               "");
+    if (g->g_site_dtors) {
+      /* GC.CollectCycles 在站点表模式下按站点找类型化释放函数 */
+      LLVMTypeRef rd_ty = LLVMFunctionType(
+          LLVMVoidTypeInContext(g->ctx),
+          (LLVMTypeRef[]){LLVMPointerType(i8p, 0), i64t}, 2, 0);
+      LLVMValueRef rd_fn =
+          LLVMGetNamedFunction(g->mod, "zan_rt_register_site_dtors");
+      if (!rd_fn) {
+        rd_fn = LLVMAddFunction(g->mod, "zan_rt_register_site_dtors", rd_ty);
+        LLVMSetLinkage(rd_fn, LLVMWeakAnyLinkage);
+        LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+        LLVMPositionBuilderAtEnd(
+            g->builder, LLVMAppendBasicBlockInContext(g->ctx, rd_fn, "entry"));
+        LLVMBuildRetVoid(g->builder);
+        LLVMPositionBuilderAtEnd(g->builder, cur);
+      }
+      LLVMValueRef dt = LLVMBuildLoad2(g->builder, LLVMPointerType(i8p, 0),
+                                       g->g_site_dtors, "dttbl");
+      zan_call2(g->builder, rd_ty, rd_fn, (LLVMValueRef[]){dt, sc}, 2, "");
+    }
   }
 
   /* 协程工作窃取调度器 */

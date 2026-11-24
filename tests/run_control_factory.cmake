@@ -31,14 +31,24 @@ if(inlined)
     "ControlFactory inlines a return-new branch; declare [GuiKind] on controls instead")
 endif()
 
-# Verify [GuiKind("...")] uniqueness and Kind() overrides across packages.
+# Control.Props.zan must provide the default Type.Name-based Kind().
+set(control_props "${ROOT}/packages/Zan.Gui/src/Gui/Core/Control/Control.Props.zan")
+if(NOT EXISTS "${control_props}")
+  message(FATAL_ERROR "Control.Props.zan is missing: ${control_props}")
+endif()
+file(READ "${control_props}" control_props_source)
+if(NOT control_props_source MATCHES "virtual[ \t]+string[ \t]+Kind[ \t]*\\([ \t]*\\)")
+  message(FATAL_ERROR "Control.Props.zan missing default `virtual string Kind()`")
+endif()
+
+# Verify [GuiKind("...")] uniqueness and Kind() consistency across packages.
 file(GLOB_RECURSE zan_files LIST_DIRECTORIES false "${ROOT}/packages/*.zan")
 set(seen_kinds "")
 set(checked_count 0)
 foreach(path IN LISTS zan_files)
   file(READ "${path}" raw_text)
   string(REGEX REPLACE "//[^\n]*" "" text "${raw_text}")
-  string(REGEX MATCHALL "\\[GuiKind(Attribute)?\\(\"([A-Za-z0-9_]+)\"[^\\]]*\\]" matches "${text}")
+  string(REGEX MATCHALL "\\[GuiKind(Attribute)?\\(\"([A-Za-z0-9_]+)\"[^\\]]*\\][ \t\r\n]+[^\r\n{]+" matches "${text}")
   if(NOT matches)
     continue()
   endif()
@@ -52,10 +62,15 @@ foreach(path IN LISTS zan_files)
     math(EXPR checked_count "${checked_count} + 1")
 
     if(NOT kind STREQUAL "Element")
+      # Either the class name itself matches kind (inheriting Control.Kind()),
+      # it is a static factory alias (e.g. CreateChart / CreateRadioButton),
+      # or the file provides an explicit `override string Kind()`.
+      string(REGEX MATCH "(^|[ \t\r\n])class[ \t]+${kind}(<[A-Za-z0-9_, \t]*>)?[ \t]*[:{]" has_matching_class "${text}")
+      string(REGEX MATCH "static[ \t]+Control[ \t]+Create[A-Za-z0-9_]*[ \t]*\\(" is_static_alias "${m}")
       string(REGEX MATCH "override[ \t]+string[ \t]+Kind[ \t]*\\([ \t]*\\)" has_kind_override "${text}")
-      if(NOT has_kind_override)
+      if(NOT has_matching_class AND NOT is_static_alias AND NOT has_kind_override)
         message(FATAL_ERROR
-          "[GuiKind(\"${kind}\")] in ${path} lacks `override string Kind()`")
+          "[GuiKind(\"${kind}\")] in ${path} lacks matching class `${kind}` or `override string Kind()`")
       endif()
     endif()
   endforeach()
@@ -66,4 +81,4 @@ if(checked_count LESS 80)
 endif()
 
 message(STATUS
-  "control factory policy OK: ${checked_count} unique [GuiKind] entries with Kind() overrides and [GuiKindManifest] hooks")
+  "control factory policy OK: ${checked_count} unique [GuiKind] entries, Control.Kind() default, and [GuiKindManifest] hooks")

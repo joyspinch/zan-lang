@@ -2289,9 +2289,9 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
 
     const char *cleanup = NULL;
     if (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE) {
-      if (post_changed || marked_count > 0)
+      if (post_changed)
         cleanup =
-            "cgscc(inline),function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
+            "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
             "globaldce";
     } else if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {
       if (post_changed)

@@ -1,0 +1,128 @@
+using System;
+using System.Data;
+using System.Data.Sqlite;
+using System.IO;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Core;
+
+/* Web MVC 压测基线的服务端：走真实框架路径——属性路由 → 编译器合成派发 →
+ * AppController（请求租约）→ 视图 + 布局渲染。两个场景：
+ *   GET /bench/plain  纯模板页：布局 + 约 20 个变量 + 12 项菜单，不碰库。
+ *   GET /bench/list   后台列表页：COUNT + 分页查询 20 行（1000 行表）→ 渲染。
+ * 单进程、单 WebApp（不开多 worker），量的是框架每请求开销。
+ *
+ * 参数：--port=N（默认 18480）--pool=N（连接池，默认 8）--db=路径 */
+[Route("/bench")]
+[Custom(Authorization = CustomAuthorization.None)]
+class BenchController : AppController {
+
+    static ViewData Shell(string heading) {
+        ViewData d = new ViewData();
+        d.Set("title", heading + " · Bench");
+        d.Set("brand", "Zan Bench");
+        d.Set("heading", heading);
+        d.Set("account", "bench");
+        d.Set("accountName", "Bench User");
+        d.Set("accountMail", "bench@example.test");
+        List<StrMap> menu = d.AddList("menu");
+        for (int i = 0; i < 12; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("title", "菜单项 " + Convert.ToString(i));
+            m.Set("path", "/bench/item/" + Convert.ToString(i));
+            m.Set("icon", "mdi:table");
+            if (i == 3) { m.Set("active", "1"); }
+            menu.Add(m);
+        }
+        return d;
+    }
+
+    [HttpGet]
+    public async void Plain() {
+        ViewData d = BenchController.Shell("纯模板页");
+        d.Set("intro", "这是一个不访问数据库的页面，用来度量路由、派发与模板渲染的固定开销。");
+        for (int i = 0; i < 10; i = i + 1) {
+            d.Set("k" + Convert.ToString(i), "value-" + Convert.ToString(i * 7));
+        }
+        this.ViewOf("Bench.Plain", d);
+    }
+
+    [HttpGet]
+    public async void List() {
+        IDbConnection db = await this.Conn();
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+        int page = this.InInt("page", 1);
+        if (page < 1) { page = 1; }
+        DbResult total = await db.QueryAsync("SELECT COUNT(*) AS n FROM bench_item WHERE status = 1");
+        DbParams p = new DbParams();
+        p.Add(Convert.ToString((page - 1) * 20));
+        DbResult rows = await db.QueryAsync(
+            "SELECT id, title, owner, amount, created_at FROM bench_item WHERE status = 1 "
+            + "ORDER BY id DESC LIMIT 20 OFFSET ?", p);
+        ViewData d = BenchController.Shell("后台列表页");
+        d.Set("total", total.GetByName(0, "n"));
+        d.Set("page", Convert.ToString(page));
+        List<StrMap> items = d.AddList("rows");
+        for (int r = 0; r < rows.RowCount(); r = r + 1) {
+            StrMap row = new StrMap();
+            row.Set("id", rows.GetByName(r, "id"));
+            row.Set("title", rows.GetByName(r, "title"));
+            row.Set("owner", rows.GetByName(r, "owner"));
+            row.Set("amount", rows.GetByName(r, "amount"));
+            row.Set("createdAt", rows.GetByName(r, "created_at"));
+            items.Add(row);
+        }
+        this.ViewOf("Bench.List", d);
+    }
+}
+
+class Program {
+    static string Arg(string[] args, string name, string dflt) {
+        string prefix = "--" + name + "=";
+        for (int i = 0; i < args.Length; i = i + 1) {
+            if (args[i].StartsWith(prefix)) { return args[i].Substring(prefix.Length); }
+        }
+        return dflt;
+    }
+
+    static void Seed(string path) {
+        File.Delete(path);
+        SqliteConnection db = SqliteConnection.Open(path);
+        db.Execute("CREATE TABLE bench_item (id INTEGER PRIMARY KEY, title TEXT, owner TEXT, "
+            + "amount INTEGER, status INTEGER, created_at INTEGER)");
+        db.Execute("BEGIN");
+        for (int i = 1; i <= 1000; i = i + 1) {
+            DbParams p = new DbParams();
+            p.Add("条目 " + Convert.ToString(i) + " <示例 & 转义>");
+            p.Add("owner" + Convert.ToString(i % 17));
+            p.Add(Convert.ToString(i * 13 % 9973));
+            p.Add(i % 10 == 0 ? "0" : "1");
+            p.Add(Convert.ToString(1700000000 + i * 60));
+            db.Execute("INSERT INTO bench_item (title, owner, amount, status, created_at) "
+                + "VALUES (?, ?, ?, ?, ?)", p);
+        }
+        db.Execute("COMMIT");
+        db.Execute("CREATE INDEX ix_bench_status ON bench_item(status, id)");
+        db.Close();
+    }
+
+    static async void Main(string[] args) {
+        int port = Convert.ToInt32(Program.Arg(args, "port", "18480"));
+        int poolSize = Convert.ToInt32(Program.Arg(args, "pool", "8"));
+        string dbPath = Program.Arg(args, "db", "_scratch/bench_web_mvc.db");
+        string viewDir = Program.Arg(args, "views", "tests/perf/web_mvc/views");
+
+        Program.Seed(dbPath);
+        DbPool pool = SqliteConnector.Pool(dbPath, poolSize);
+        DbContext context = DbContext.Of(pool);
+        int warm = await context.Warmup(poolSize);
+        AppServices.Use(new AppServices(context, null));
+
+        WebApp app = new WebApp("127.0.0.1", port);
+        app.Views(viewDir);
+        __AttrRoutes.Register(app);
+        Console.WriteLine("BENCH_READY port=" + Convert.ToString(port)
+            + " pool=" + Convert.ToString(poolSize) + " warm=" + Convert.ToString(warm));
+        int _rc = await app.Start();
+    }
+}

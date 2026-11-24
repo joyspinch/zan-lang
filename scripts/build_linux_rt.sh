@@ -54,6 +54,14 @@ for pair in linux-musl:x86_64 linux-arm64:aarch64 linux-riscv64:riscv64; do
         }
     python3 -I "$ROOT/scripts/stage_linux_sysroot.py" --target "$sub" --zig-env "$stage/zig-env.json" \
         "$stage/link-$sub.log" "$out"
+    # No crti/crtn in Zig's own link (musl ships none for e.g. riscv64): stage
+    # empty stubs, as musl does, so zanc's fixed cross link line still resolves.
+    for crt in crti crtn; do
+        if [ ! -f "$out/$crt.o" ]; then
+            : > "$stage/$crt-empty.c"
+            "$ZIG" cc -target "$arch-linux-musl" -O2 -c "$stage/$crt-empty.c" -o "$out/$crt.o"
+        fi
+    done
     # -fPIC throughout: the same objects are linked both into static
     # executables (where ld.lld relaxes the PIC sequences) and into shared
     # libraries, which reject the absolute and static-TLS relocations a

@@ -723,12 +723,34 @@ zan_type_t *method_param_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                         int idx, zan_ast_node_t *call,
                                         zan_ast_node_t *recv_expr,
                                         local_scope_t *locals);
+/* 委托类型按签名比较：形参个数、各形参类型、返回类型一致才算同一具体
+ * 类型。只比 kind 会让任意两个非泛型委托（Action 与 ControlEvent 之类）
+ * 被判"精确相等"，重载打分同为 4，先声明者获胜——委托变量实参
+ * `ev.Add(h)` 于是落到形状不符的重载上，调用期按错误签名调闭包。 */
+static bool delegate_sigs_equal(zan_type_t *a, zan_type_t *b,
+                                bool (*eq)(zan_type_t *, zan_type_t *)) {
+    if (a->delegate_param_count != b->delegate_param_count) return false;
+    for (int i = 0; i < a->delegate_param_count; i++) {
+        zan_type_t *pa = a->delegate_param_types ? a->delegate_param_types[i] : NULL;
+        zan_type_t *pb = b->delegate_param_types ? b->delegate_param_types[i] : NULL;
+        if (pa == pb) continue;
+        if (!eq(pa, pb)) return false;
+    }
+    zan_type_t *ra = a->delegate_ret_type, *rb = b->delegate_ret_type;
+    bool va = !ra || ra->kind == TYPE_VOID, vb = !rb || rb->kind == TYPE_VOID;
+    if (va || vb) return va == vb;
+    return eq(ra, rb);
+}
+
 bool types_concrete_equal(zan_type_t *a, zan_type_t *b) {
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
     if ((a->kind == TYPE_CLASS || a->kind == TYPE_STRUCT ||
          a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
         a->sym != b->sym)
+        return false;
+    if (a->kind == TYPE_DELEGATE && a != b &&
+        !delegate_sigs_equal(a, b, types_concrete_equal))
         return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
@@ -749,6 +771,9 @@ static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
     if ((a->kind == TYPE_CLASS || a->kind == TYPE_STRUCT ||
          a->kind == TYPE_INTERFACE || a->kind == TYPE_ENUM) &&
         a->sym != b->sym)
+        return false;
+    if (a->kind == TYPE_DELEGATE && a != b &&
+        !delegate_sigs_equal(a, b, types_match_modulo_tp))
         return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)

@@ -473,3 +473,9 @@ int zan__guard_call(void (*fn)(void *), void *arg) {
   return 1;
 }
 long zan__guard_recovered_count(void) { return 0; }
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor)) static void zan__crash_ctor(void) {
+  zan__crash_install();
+}
+#endif

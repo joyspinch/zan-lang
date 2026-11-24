@@ -67,6 +67,7 @@ static ZAN_MAYBE_UNUSED int zan_sched_trace(void) {
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <fcntl.h>   /* zan_io_fd_cloexec 在下方首用；bionic 不经其他头间接带入 */
 #include <time.h>
 
 static void zan_io_ignore_sigpipe(void) {

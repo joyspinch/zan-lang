@@ -60,6 +60,31 @@ writes to stdout, so it must not replace stderr in protocols or golden-output te
   再读 `.Length` 或调用字符串方法；仅在业务契约允许时把缺席映射为空串或默认值。
   历史行与 ORM 可空列可能保留 null，构造时赋过默认值也不能证明读回后非空。
 
+### `await` 原生调用每次 10–40ms：先怀疑完成唤醒丢了，不是调用本身慢（rt_io_dns 实测，2026-11-23）
+
+`await extern(...)` 走运行时阻塞卸载：工作线程跑完后经唤醒通道通知 reactor。唤醒
+丢了不会挂死——20ms 扫描（`ZAN_IO_SWEEP_MS`）照样收割——只表现为每次往返稳定的
+十几毫秒，极易被当成「SQLite/驱动慢」。判据：同一调用同步版只要微秒级。最小探针
+`await getpid()`（或跨平台的 `sqlite3_libversion_number`）应在几十微秒内。pipe 型唤醒
+通道（kqueue/select）读端登记轮询器、**写端**才可写；写读端 EBADF 静默失败。eventfd
+（Linux）一个 fd 读写皆可，IOCP 用投递包，均不受这类错影响——只在 macOS/BSD 复现。
+
+**代价补充：** 卸载本身不是免费的——旧运行时每个阻塞作业新建一个 OS 线程，SQLite
+`QueryAsync` 又每行 await 一次 `sqlite3_step`，20 行一页 = 21 次建线程 + 线程往返。逐行
+FFI 不要逐次卸载：首个（重活）卸载、后续按时间片内联，并让作业复用常驻线程。
+
+### 多 worker 吞吐上不去、CPU 却很高：先看锁等待归因（Web 压测实测，2026-11-23）
+
+`sample <pid> 5` 的「Sort by top of stack」里 `__psynch_mutexwait` 占大头时，把调用图里
+`pthread_mutex_lock` 的上一帧按采样数聚合，直接得出是谁在抢锁。本仓库实测两例：只返回
+常量指针的 `zan_rt_soft_scratch`、只读计数的 `zan_rt_defer_pending`，都在每次调用时拿全局
+锁，而它们被编译器插进几乎所有函数/release 出口——单把锁吃掉 40% CPU。修法：已发布值
+acquire 无锁读，写方锁内原子更新。另：对比基准务必用干净树（HEAD + 自己的改动）构建，
+共享 build/zanc 会带上并行会话未提交的运行时改动，热点会被别人的半成品改写。
+锁本身之外还要看锁里做什么：协程任务登记表在全局自旋锁下按帧指针**线性**查找，
+O(活跃协程数) × 每次创建/销毁，并发越高越慢；自旋时间算在调用方自身采样里（如
+`zan_task_child`），sample 里看不到 mutexwait，要看调用方 self time 异常高。
+
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
 A native crash (Windows: `build/zan_crash.log` with register dump; `rcx` =

@@ -30,6 +30,8 @@ public class TextArea : Control {
     private string preparedStatus;
     public bool Round;
     public InputFilterFn Filter;
+    // 文本变化时触发（C# 风格：`area.Change += h;`）。
+    [Event]
     public UiEvent Change;
     public void InitTextArea(Binding<string> text, string hintText) {
         this.InitControl("textarea");
@@ -137,7 +139,7 @@ public class TextArea : Control {
     private void Edited() {
         if (errMsg != "") { errMsg = ""; }
         PushBinding();
-        Change.RaiseS(this);
+        Change.Raise(this);
     }
     public void SetError(string msg) { errMsg = msg; }
     public void ClearError() { errMsg = ""; }
@@ -639,51 +641,44 @@ public class TextArea : Control {
         }
         return id;
     }
-    public override string Kind() { return "TextArea"; }
+    // --- 设计器 / 序列化模型 ---
+
+    // 覆写：CSS 类型选择器名（"textarea"，皮肤与单行 Input 区分）。
     public override string StyleType() { return "textarea"; }
+
+    // 属性协议写文本：值没变就别碰光标/选区（属性写入可能每帧都来，而
+    // SetText 的语义是「换了一段文本」，光标收到末尾）。
+    public void SetTextProp(string val) {
+        if (val != this.GetText()) { this.SetText(val); }
+    }
+
+    // 覆写：返回设计器属性清单（占位 / 文本 / 状态 / 长度 / 计数 / 圆角）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Text("hint", "Placeholder").Field("hint", 0).Also("placeholder"));
-        ps.Add(PropSpec.Text("text", "Text").DefaultBinding().ViaExtra().Also("value").Also("data"));
+        ps.Add(PropSpec.Text("hint", "Placeholder").Field("hint").Also("placeholder"));
+        ps.Add(PropSpec.Text("text", "Text").DefaultBinding().Accessor("GetText", "SetTextProp").Also("value"));
+        ps.Add(PropSpec.Bool("countGraphemes", "Count graphemes").Field("CountGraphemes"));
         PropSpec st = PropSpec.Enum("status", "Status",
             new List<string>{ "", "success", "warning", "error" });
-        st.Field("FieldStatus", 0);
+        st.Field("FieldStatus");
         ps.Add(st);
-        ps.Add(PropSpec.Int("maxlen", "MaxLen").Field("MaxLen", 1).Step(1, 0, 4096));
-        ps.Add(PropSpec.Bool("showCount", "ShowCount").Field("ShowCount", 2));
-        ps.Add(PropSpec.Bool("round", "Round").Field("Round", 2));
-        ps.Add(PropSpec.Bool("readonly", "ReadOnly").Field("readOnly", 2));
-        ps.Add(PropSpec.Bool("autoHeight", "AutoHeight").Field("autoHeight", 2).WithTip("Grow the box with its content instead of scrolling inside a fixed height."));
+        ps.Add(PropSpec.Int("maxlen", "MaxLen").Field("MaxLen").Step(1, 0, 4096));
+        ps.Add(PropSpec.Bool("showCount", "ShowCount").Field("ShowCount"));
+        ps.Add(PropSpec.BoolField("Round"));
+        ps.Add(PropSpec.Bool("readonly", "ReadOnly").Field("readOnly"));
+        ps.Add(PropSpec.Bool("autoHeight", "AutoHeight")
+            .Field("autoHeight")
+            .WithTip("Grow the box with its content instead of scrolling inside a fixed height."));
         return ps;
     }
-    public override string GetExtra(string key) {
-        if (key == "text" || key == "value" || key == "data") { return editText; }
-        return "";
-    }
-    public override bool SetExtra(string key, string val) {
-        if (key == "text" || key == "value" || key == "data") {
-            string next = val != null ? val : "";
-            if (next != editText) { this.SetText(next); }
-            return true;
-        }
-        if (key == "countGraphemes") {
-            CountGraphemes = (val == "true"); return true;
-        }
-        return false;
-    }
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Change");
-        return e;
-    }
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Change") { Change.Add(a); return; }
-        base.BindEvent(evt, a);
-    }
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Change") { Change.AddS(a); return; }
-        base.BindEventS(evt, a);
-    }
+
+    // --- 保留式钩子（Control） ---
+
+    // 框外底行（show-count 文本与校验消息共用同一排，框下沿 2px 起）。
+    // 父容器渲染子树时会把自己的矩形作为裁剪带（Control.RenderTree 的
+    // PushClip），越出测量高度的绘制会被整条裁掉——所以这一行必须计入
+    // 测量高度，框体本身相应只占 bh - 本值，Render 内的描边/命中矩形
+    // 仍是框的真实高度。
     public int BottomRowH() { return this.BottomRowH(this.App); }
     public int BottomRowH(App app) {
         if (!ShowCount && errMsg == "") { return 0; }

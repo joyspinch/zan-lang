@@ -43,6 +43,12 @@ class LeaseActionController : AppController {
         LeaseActionController.observed = result.GetByName(0, "name");
     }
 
+    /* 不碰库的动作：惰性租约下全程不借连接。 */
+    [HttpGet]
+    async void Plain() {
+        LeaseActionController.observed = "plain";
+    }
+
     [HttpPost]
     [Tx]
     async void Save() {
@@ -117,6 +123,7 @@ class LeaseFaultController : AppController {
     int done;
     bool failDone;
     async IDbConnection BorrowRead() { return await this.ReadConn(); }
+    async IDbConnection Open() { return await this.Conn(); }
     override void OnDone() {
         this.done = this.done + 1;
         if (this.failDone) { throw new Exception("injected done failure"); }
@@ -152,7 +159,11 @@ class Program {
             AppServices.Use(new AppServices(context, null));
             LeaseFaultController ctrl = new LeaseFaultController();
             await ctrl.OnBeforeAsync();
-            Program.Check(ctrl.Held() is TracedDbConnection, "failure lease is traced");
+            Program.Check(pool.LiveCount() == 0, "OnBeforeAsync borrows nothing");
+            IDbConnection opened = await ctrl.Open();
+            Program.Check(opened != null && opened == ctrl.__Conn()
+                && ((RequestDbConnection)opened).Inner() is TracedDbConnection,
+                "failure lease is traced");
             LeaseFaultConnection raw = connector.last;
             raw.beginMode = mode;
             raw.failClose = true;
@@ -281,6 +292,7 @@ class Program {
             if (which == 0) { await c.List(); }
             else if (which == 1) { await c.MutatingGet(); }
             else if (which == 2) { await c.Save(); }
+            else if (which == 3) { await c.Plain(); }
         }
         await c.AfterAsync();
     }
@@ -362,6 +374,10 @@ class Program {
         DbPool write = SqliteConnector.Pool(writePath, 1);
         DbPool read = SqliteConnector.Pool(readPath, 1);
         AppServices.Use(new AppServices(DbContext.Of(write, read), null));
+        await Program.Dispatch(Program.Ctx("GET", "/lease/plain"), 3);
+        Program.Check(LeaseActionController.observed == "plain"
+            && write.LiveCount() == 0 && read.LiveCount() == 0,
+            "action without SQL borrows no connection");
         await Program.Dispatch(Program.Ctx("GET", "/lease/list"), 0);
         Program.Check(LeaseActionController.observed == "replica", "replica selected before action");
         Program.Check(LeaseActionController.reused, "same request lease for accessor and read");

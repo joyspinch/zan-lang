@@ -1,81 +1,110 @@
 using System;
 using System.Collections.Generic;
 namespace Gui;
+
+// 控件事件：单一订阅通道。`+=` / `Add` 按处理器形状重载——
+// `() => …` 收无参处理器，`(Control s) => …` 收带 sender 的处理器——
+// 两种可混用。触发时先无参、后 sender，各自保持注册顺序。
 public class UiEvent {
     List<Action> handlers;
     List<ControlEvent> senderHandlers;
-    public static UiEvent op_add(UiEvent self, Action handler) { self.Add(handler); return self; }
-    public static UiEvent op_sub(UiEvent self, Action handler) { self.Remove(handler); return self; }
+
+    // 支持 event += handler（追加，多播）。
+    public static UiEvent op_add(UiEvent self, Action handler) {
+        self.Add(handler);
+        return self;
+    }
+
+    public static UiEvent op_add(UiEvent self, ControlEvent handler) {
+        self.Add(handler);
+        return self;
+    }
+
+    // 支持 event -= handler（移除最近的相同注册项）。
+    public static UiEvent op_sub(UiEvent self, Action handler) {
+        self.Remove(handler);
+        return self;
+    }
+
+    public static UiEvent op_sub(UiEvent self, ControlEvent handler) {
+        self.Remove(handler);
+        return self;
+    }
+
     public void Add(Action handler) {
         if (handlers == null) { handlers = new List<Action>(); }
         handlers.Add(handler);
     }
+
+    public void Add(ControlEvent handler) {
+        if (senderHandlers == null) { senderHandlers = new List<ControlEvent>(); }
+        senderHandlers.Add(handler);
+    }
+
     public void Remove(Action handler) {
         if (handlers == null) { return; }
-        int i = handlers.Count - 1;
-        while (i >= 0) {
+        for (int i = handlers.Count - 1; i >= 0; i = i - 1) {
             if (handlers[i] == handler) {
                 handlers.RemoveAt(i);
                 return;
             }
-            i = i - 1;
         }
     }
-    public void AddS(ControlEvent h) {
-        if (senderHandlers == null) { senderHandlers = new List<ControlEvent>(); }
-        senderHandlers.Add(h);
-    }
-    public void RemoveS(ControlEvent h) {
+
+    public void Remove(ControlEvent handler) {
         if (senderHandlers == null) { return; }
-        int i = senderHandlers.Count - 1;
-        while (i >= 0) {
-            if (senderHandlers[i] == h) {
+        for (int i = senderHandlers.Count - 1; i >= 0; i = i - 1) {
+            if (senderHandlers[i] == handler) {
                 senderHandlers.RemoveAt(i);
                 return;
             }
-            i = i - 1;
         }
     }
-    public int CountS() {
-        if (senderHandlers == null) { return 0; }
-        return senderHandlers.Count;
+
+    // 全部订阅数（两种处理器形状合计）。
+    public int Count() {
+        int n = 0;
+        if (handlers != null) { n = n + handlers.Count; }
+        if (senderHandlers != null) { n = n + senderHandlers.Count; }
+        return n;
     }
-    public int CountAll() { return this.Count() + this.CountS(); }
+
+    // 丢弃旧列表，释放闭包；在分发回调中 Clear 后也会停止旧列表的后续处理。
     public void Clear() {
         handlers = null;
         senderHandlers = null;
     }
-    public int Count() {
-        if (handlers == null) { return 0; }
-        return handlers.Count;
-    }
-    public void Raise() {
+
+    // 同步派发给全部处理器；sender 处理器收到 `sender`。
+    // 不快照列表，保留回调期间 Add/Remove/Clear 对后续分发的既有影响。
+    public void Raise(Control sender) {
         for (int i = 0; handlers != null && i < handlers.Count; i = i + 1) {
             Action h = handlers[i];
             h();
         }
-    }
-    public void RaiseS(Control sender) {
-        this.Raise();
         for (int i = 0; senderHandlers != null && i < senderHandlers.Count; i = i + 1) {
             ControlEvent h = senderHandlers[i];
             h(sender);
         }
     }
+
+    // 无宿主控件的事件源（状态对象、服务）用：sender 处理器收到 null。
+    public void Raise() {
+        this.Raise(null);
+    }
+
+    public void RaiseIf(bool fire, Control sender) {
+        if (fire) { this.Raise(sender); }
+    }
+
     public void RaiseIf(bool fire) {
-        if (fire) { this.Raise(); }
+        if (fire) { this.Raise(null); }
     }
-    public void RaiseIfS(bool fire, Control sender) {
-        if (fire) { this.RaiseS(sender); }
-    }
-    public void Post() {
-        for (int i = 0; handlers != null && i < handlers.Count; i = i + 1) {
-            Action h = handlers[i];
-            Dispatcher.Post(h);
-        }
-    }
-    public void PostS(Control sender) {
-        if (this.CountAll() == 0) { return; }
+
+    // 排队到 UI 线程稍后执行。入队时捕获 sender 的宿主 App；无 sender
+    // 或已脱离的控件走全局 Dispatcher。Clear 不取消已排队的委托。
+    public void Post(Control sender) {
+        if (this.Count() == 0) { return; }
         App app = null;
         if (sender != null) { app = sender.FindApp(); }
         for (int i = 0; handlers != null && i < handlers.Count; i = i + 1) {
@@ -83,8 +112,11 @@ public class UiEvent {
             if (app != null) { app.Post(h); }
             else { Dispatcher.Post(h); }
         }
-        if (this.CountS() > 0) { this.PostSenderHandlers(app, sender); }
+        if (senderHandlers != null && senderHandlers.Count > 0) { this.PostSenderHandlers(app, sender); }
     }
+
+    // 闭包捕获 sender 的部分单独成方法：捕获形参在函数入口装箱，放在
+    // Post 里会让无订阅的投递也分配。
     private void PostSenderHandlers(App app, Control sender) {
         for (int i = 0; senderHandlers != null && i < senderHandlers.Count; i = i + 1) {
             ControlEvent h = senderHandlers[i];
@@ -92,5 +124,9 @@ public class UiEvent {
             if (app != null) { app.Post(invoke); }
             else { Dispatcher.Post(invoke); }
         }
+    }
+
+    public void Post() {
+        this.Post(null);
     }
 }

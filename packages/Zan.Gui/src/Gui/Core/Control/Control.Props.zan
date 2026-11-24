@@ -4,8 +4,20 @@ using System.Json;
 using Gui;
 namespace Gui;
 public partial class Control {
-    public virtual string Kind() { return "Control"; }
+    // --- 设计器/序列化模型（通过虚方法统一、免强转）---
+
+    // 用于重建此节点的稳定类型标签（见 ControlFactory），默认即类名（泛型去掉
+    // 类型实参）。只有标签与类名不同的控件（别名、按父类种类上报的内部件）
+    // 才重写它。
+    public virtual string Kind() {
+        string name = this.GetType().Name;
+        int lt = name.IndexOf("<");
+        return lt > 0 ? name.Substring(0, lt) : name;
+    }
+
     public virtual Control CreateCloneShell() { return null; }
+
+    // Copy business content only; composite widgets rebuild their generated parts.
     public virtual void CloneContentTo(Control target, CloneTreeFn clone) {
         for (int i = 0; i < childNodes.Count; i = i + 1) {
             Control child = clone(childNodes[i]);
@@ -25,7 +37,10 @@ public partial class Control {
                 List<PropSpec> cached = PropSpec.FindCachedSchema(schemaId);
                 if (cached == null) {
                     cached = this.DefineProps();
-                    PropSpec.StoreCachedSchema(schemaId, cached);
+                    for (int i = 0; i < cached.Count; i = i + 1) { cached[i].Resolve(this); }
+                    if (!PropSpec.HasInstanceForward(cached)) {
+                        PropSpec.StoreCachedSchema(schemaId, cached);
+                    }
                 }
                 this.propertySpecs = cached;
                 this.propertySchemaKey = 0;
@@ -33,6 +48,7 @@ public partial class Control {
             }
         }
         List<PropSpec> specs = this.DefineProps();
+        for (int i = 0; i < specs.Count; i = i + 1) { specs[i].Resolve(this); }
         this.propertySpecs = specs;
         this.propertySchemaKey = schemaKey;
         return specs;
@@ -57,13 +73,19 @@ public partial class Control {
             PropSpec p = ps[i];
             if (!p.defaultBinding) { continue; }
             if (first == null) { first = p; }
-            if ((p.ValueKind() == 1) == numeric) { return p; }
+            if ((p.ValueKind() == PropValueKind.Int) == numeric) { return p; }
         }
         return first;
     }
-    public virtual string GetExtra(string key) { return ""; }
-    public virtual bool SetExtra(string key, string val) { return false; }
-    public virtual Control SlotHost(int slot) { return this; }
+    // 设计里放进容器某个“位”的子控件（标签页的页、分栏的
+    // 窗格）真正的父节点。容器重写它，把设计文档的 `childTab`
+    // 映射到自己的内部容器；普通容器直接收下子节点。
+    public virtual Control SlotHost(int slot) {
+        return this;
+    }
+
+    // 具名插槽宿主容器：复合组件（Tabs/SplitPanel/Card/Dialog 等）根据 slot 名字
+    // 映射到具体的内部容器（如 "header"、"footer"、"left"、"right" 或数字页码）。
     public virtual Control NamedSlotHost(string slot) {
         if (slot == "" || slot == "default") { return this; }
         if (Control.IsNumericSlot(slot)) { return this.SlotHost(Convert.ToInt32(slot)); }
@@ -111,14 +133,21 @@ public partial class Control {
             return name;
         }
         PropSpec p = this.ResolveProperty(key);
-        if (p != null && p.ExtraAccess) { return this.GetExtra(p.key); }
         if (p != null && p.IsBound()) { return p.ReadFrom(this); }
         if (key == "disabled") { return PropSpec.Flag(this.Disabled.Get()); }
-        string extra = this.GetExtra(key);
-        if (extra != "") { return extra; }
         if (p != null) { return p.ReadFrom(this); }
         return "";
     }
+    // 从文本按键写入属性（GetProp 的逆操作）。未知的
+    // 键改指样式类，要么是标志（`"round": true`），要么是
+    // 变体名（`"size": "small"`），文档正是借此设置
+    // 控件没有字段对应的视觉变体。
+    // 属性经通用协议（设计器、HTML、模型绑定）写入之后的回调。属性变化后需要
+    // 重建内部结构的控件覆写它；不按 spec.key 分派——单个属性的副作用写在
+    // 该属性的 setter 里。
+    protected virtual void OnPropertyChanged(PropSpec spec) {
+    }
+
     public override void SetProp(string key, string val) {
         if (key == "class") { Class = val; this.Invalidate(); return; }
         if (key == "visible") { this.Visible = PropSpec.IsOn(val); this.Invalidate(); return; }
@@ -135,26 +164,15 @@ public partial class Control {
                 this.Invalidate();
                 return;
             }
-            if (this.SetExtra(key, val)) {
-                this.Invalidate();
-                return;
-            }
             name = val;
             this.Invalidate();
             return;
         }
         PropSpec p = this.ResolveProperty(key);
-        if (p != null && p.ExtraAccess) {
-            if (this.SetExtra(p.key, val)) { this.Invalidate(); }
-            return;
-        }
         if (p != null && p.IsBound()) {
             p.WriteTo(this, val);
             this.Invalidate();
-            return;
-        }
-        if (this.SetExtra(key, val)) {
-            this.Invalidate();
+            this.OnPropertyChanged(p);
             return;
         }
         if (p != null) {
@@ -374,7 +392,7 @@ public partial class Control {
     }
     PropSpec SizeProp() {
         PropSpec sz = PropSpec.Enum("size", "Size", PropSpec.Sizes());
-        if (this.SizeOf() != null) { sz.Field("Size", 0); }
+        if (this.SizeOf() != null) { sz.Field("Size"); }
         return sz;
     }
     static string StatusSuccess() { return "success"; }

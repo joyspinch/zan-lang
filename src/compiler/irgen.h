@@ -447,6 +447,10 @@ struct zan_irgen {
   LLVMValueRef rt_weak_nil_all; /* zan_rt_weak_nil_all(void*) */
   LLVMValueRef rt_weak_load_retain;
   LLVMValueRef rt_weak_destroy_begin;
+  /* Apple --fast-alloc: ld64 has no --wrap, so object emission renames the
+   * module's malloc/free/calloc/realloc declarations to rt_mem.c's
+   * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
+  bool route_fast_alloc;
 
   LLVMValueRef fn_printf;
   LLVMTypeRef printf_type;
@@ -623,6 +627,7 @@ struct zan_irgen {
     LLVMValueRef gv;
     LLVMTypeRef arr_ty;
     zan_symbol_t *sym;
+    zan_type_t *inst;
     int n;
     bool ctors;
     bool

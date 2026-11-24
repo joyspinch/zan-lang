@@ -333,6 +333,55 @@ static void request_profile(void) {
   assert(zan_task_live_count() == 0);
 }
 
+/* Indexed lookups (open addressing + free list) and parent back edges: growth
+ * across several doublings, deletion inside probe runs, edges to retired
+ * children cleared without scanning, the multi-parent fallback, and slot
+ * reuse with no further growth. */
+static void noop_release(void *frame) { (void)frame; }
+static void reset_cancels(test_frame *frames, int n) {
+  for (int i = 0; i < n; ++i)
+    frames[i].cancel = 0;
+}
+static void indexed_edges_and_reuse(void) {
+  enum { N = 600 };
+  static test_frame frames[N];
+  for (int i = 0; i < N; ++i)
+    zan_task_frame_config(&frames[i], &frames[i].done, &frames[i].cancel);
+  assert(zan_task_live_count() == N);
+  for (int i = 0; i + 1 < N; ++i)
+    zan_task_child(&frames[i], &frames[i + 1]);
+  zan_task_frame_cancel(&frames[0]);
+  assert(frames[N - 1].cancel == 1);
+  for (int i = 1; i < N; i += 2)
+    zan_task_retire(&frames[i], noop_release);
+  assert(zan_task_live_count() == N / 2);
+  for (int i = 0; i < N; i += 2)
+    zan_task_frame_config(&frames[i], NULL, NULL);
+  assert(zan_task_live_count() == N / 2);
+  reset_cancels(frames, N);
+  zan_task_frame_cancel(&frames[0]);
+  assert(frames[0].cancel == 1 && frames[2].cancel == 0);
+  zan_task_child(&frames[2], &frames[4]);
+  zan_task_child(&frames[6], &frames[4]);
+  zan_task_retire(&frames[4], noop_release);
+  reset_cancels(frames, N);
+  zan_task_frame_cancel(&frames[2]);
+  zan_task_frame_cancel(&frames[6]);
+  assert(frames[2].cancel == 1 && frames[6].cancel == 1 &&
+         frames[4].cancel == 0);
+  for (int i = 0; i < N; i += 2)
+    if (i != 4)
+      zan_task_retire(&frames[i], noop_release);
+  assert(zan_task_live_count() == 0);
+  size_t cap = zan_task_slot_capacity();
+  for (int i = 0; i < N; ++i)
+    zan_task_frame_config(&frames[i], &frames[i].done, &frames[i].cancel);
+  assert(zan_task_live_count() == N && zan_task_slot_capacity() == cap);
+  for (int i = 0; i < N; ++i)
+    zan_task_retire(&frames[i], noop_release);
+  assert(zan_task_live_count() == 0);
+}
+
 int main(void) {
   test_frame *frame = make_frame(7);
   uint64_t first = zan_task_register(frame, &frame->done);
@@ -368,8 +417,9 @@ int main(void) {
   allocator_provenance();
   registry_growth();
   request_profile();
+  indexed_edges_and_reuse();
   puts("task registry: lifetime, consume, stale generations, bounded slots, "
-       "four query threads, typed discard, allocator provenance, index growth "
-       "passed");
+       "four query threads, typed discard, allocator provenance, index growth, "
+       "request profile, and indexed edges and reuse passed");
   return 0;
 }

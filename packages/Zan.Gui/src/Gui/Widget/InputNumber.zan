@@ -20,8 +20,14 @@ public class InputNumber : Control {
     public Button plusBtn;
     public override int StyleDisplay() { return 1; } // CSS display: flex
     public override int StyleFlexDir() { return 0; } // flex-direction: row
+    // 值被用户改变时触发（C# 风格：`n.Change += h;`）。
+    [Event]
     public UiEvent Change;
+    // 回车提交编辑缓冲时触发（Naive UI 的键盘提交沿）。
+    [Event]
     public UiEvent Submit;
+    // 自定义验证未通过时触发（值已写入，仅标记 error 状态）。
+    [Event]
     public UiEvent Invalid;
     public Binding<string> Size;
     public Binding<string> Prefix;
@@ -112,7 +118,7 @@ public class InputNumber : Control {
     public InputNumber(int lo, int hi) { InitNumber(lo, hi); }
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
     }
-    public override string Kind() { return "InputNumber"; }
+    // 覆写：CSS 类型选择器名（"input"，与单行输入框共用皮肤规则）。
     public override string StyleType() { return "input"; }
     public override Binding<string> SizeOf() { return Size; }
     public void Hint(string text) { hint = text; }
@@ -257,7 +263,7 @@ public class InputNumber : Control {
         bool ok = true;
         if (Check != null) { ok = Check(v); }
         invalidFlag = !ok;
-        if (!ok) { Invalid.RaiseS(this); }
+        if (!ok) { Invalid.Raise(this); }
     }
     public string EditDisplay() {
         string s = editBuf;
@@ -270,7 +276,7 @@ public class InputNumber : Control {
         if (Value.Get() == v) { return; }
         Value.Set(v);
         this.RunValidator(v);
-        Change.RaiseS(this);
+        Change.Raise(this);
     }
     public void SetValue(int v) {
         this.CommitBuffer();
@@ -318,76 +324,57 @@ public class InputNumber : Control {
     public void OnInputSubmit() {
         if (Loading) { return; }
         OnInputChange();
-        if (Submit != null) { Submit.RaiseS(this); }
+        if (Submit != null) { Submit.Raise(this); }
     }
+    // ---- 设计器 / 序列化模型 -------------------------------------------
+
+    // 属性协议的值文本：读格式化展示文本；写经 ParseScaled（认千分位与按 precision
+    // 缩放的展示文本），再经 SetRaw 收口钳制 / 校验 / 事件。
+    public void SetValueText(string val) {
+        this.SetRaw(ParseScaled(val, this.Decimals(), Value.Get(), Parser));
+    }
+
+    // precision 读回钳位后的有效位数（字段存的是原始设定）。
+    public string PrecisionText() { return Convert.ToString(this.Decimals()); }
+    public void SetPrecisionText(string v) { Precision = Convert.ToInt32(v); }
+
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Int("value", "Value").DefaultBinding().Field("Value", 1).Also("text"));
+        PropSpec val = PropSpec.Int("value", "Value").DefaultBinding();
+        val.Field("Value").Accessor("DisplayText", "SetValueText");
+        val.Also("text");
+        ps.Add(val);
         PropSpec sz = PropSpec.Enum("size", "Size",
             PropSpec.Sizes());
-        sz.Field("Size", 0);
+        sz.Field("Size");
         ps.Add(sz);
-        ps.Add(PropSpec.Text("prefix", "Prefix").Field("Prefix", 0));
-        ps.Add(PropSpec.Text("suffix", "Suffix").Field("Suffix", 0));
+        ps.Add(PropSpec.TextField("Prefix"));
+        ps.Add(PropSpec.TextField("Suffix"));
         PropSpec plc = PropSpec.Enum("placement", "Button Placement",
             new List<string>{ "both", "right" });
-        plc.Field("Placement", 0);
+        plc.Field("Placement");
         ps.Add(plc);
-        ps.Add(PropSpec.Int("min", "Min").Field("minV", 1));
-        ps.Add(PropSpec.Int("max", "Max").Field("maxV", 1));
+        ps.Add(PropSpec.Int("min", "Min").Field("minV"));
+        ps.Add(PropSpec.Int("max", "Max").Field("maxV"));
         PropSpec stp = PropSpec.Int("step", "Step");
-        stp.Field("stepV", 1);
+        stp.Field("stepV");
         stp.StepBy(1);
         stp.WithTip("Increment of the +/- buttons, in display units "
                     + "(scaled by precision).");
         ps.Add(stp);
-        ps.Add(PropSpec.Text("hint", "Placeholder").Field("hint", 0).Also("placeholder"));
-        ps.Add(PropSpec.Int("precision", "Precision").Field("Precision", 1).Step(1, 0, 6).WithTip("Decimal places (fixed-point model: value * 10^precision)."));
-        ps.Add(PropSpec.Bool("group", "Group digits").Field("GroupDigits", 2).Also("groupDigits").WithTip("Show thousands separators while displaying."));
+        ps.Add(PropSpec.Text("hint", "Placeholder").Field("hint").Also("placeholder"));
+        ps.Add(PropSpec.BoolField("Loading"));
+        ps.Add(PropSpec.IntField("Precision").Accessor("PrecisionText", "SetPrecisionText")
+            .Step(1, 0, 6)
+            .WithTip("Decimal places (fixed-point model: value * 10^precision)."));
+        ps.Add(PropSpec.Bool("group", "Group digits")
+            .Field("GroupDigits")
+            .Also("groupDigits")
+            .WithTip("Show thousands separators while displaying."));
         return ps;
     }
-    public override string GetProp(string key) {
-        if (key == "value" || key == "text") { return this.DisplayText(); }
-        if (key == "precision") { return Convert.ToString(this.Decimals()); }
-        return base.GetProp(key);
-    }
-    public override void SetProp(string key, string val) {
-        if (key == "value" || key == "text") {
-            this.SetRaw(ParseScaled(val, this.Decimals(), Value.Get(), Parser));
-            return;
-        }
-        base.SetProp(key, val);
-    }
-    public override string GetExtra(string key) {
-        if (key == "loading") { return Loading ? "true" : "false"; }
-        return "";
-    }
-    public override bool SetExtra(string key, string val) {
-        if (key == "loading") {
-            Loading = (val == "true");
-            return true;
-        }
-        return false;
-    }
-    public override List<string> Events() {
-        List<string> e = Control.CommonEvents();
-        e.Add("Change");
-        e.Add("Submit");
-        e.Add("Invalid");
-        return e;
-    }
-    public override void BindEvent(string evt, Action a) {
-        if (evt == "Change") { Change.Add(a); return; }
-        if (evt == "Submit") { Submit.Add(a); return; }
-        if (evt == "Invalid") { Invalid.Add(a); return; }
-        base.BindEvent(evt, a);
-    }
-    public override void BindEventS(string evt, ControlEvent a) {
-        if (evt == "Change") { Change.AddS(a); return; }
-        if (evt == "Submit") { Submit.AddS(a); return; }
-        if (evt == "Invalid") { Invalid.AddS(a); return; }
-        base.BindEventS(evt, a);
-    }
+
+    // ---- 保留模式钩子 ---------------------------------------------------
     public override void SyncBinding() {
         base.SyncBinding();
         int current = Value.Get();

@@ -6,14 +6,69 @@ LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
   return zan_icmp(g->builder, LLVMIntEQ, tag,
                   LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
 }
+/* 头字可读守卫。string 形参/返回值可能是外来 C 指针（extern 返回的缓冲、
+ * calloc 大块、mmap 区），其前方未必可读：缓冲恰落在页首、前一页未映射或
+ * PROT_NONE 时，探测 [p-8] 串标签 / [p-24] 数组魔数即 SIGBUS/SIGSEGV。
+ * p 自身可读，故 (p & 4095) >= need 时 [p-need, p) 与 p 同页、必可读——
+ * 内联快路径一次 and+cmp；托管块的头始终和 p 同块，页首对齐的大块分配
+ * （raw 页对齐 → 串 p 偏移 16、数组 p 偏移 32）仍走快路径。仅当 p 贴近页首
+ * 才冷调用 zan_rt_hdr_readable 试读，托管对象照样判可读 → RC 不漏。
+ * 不用 IsBadReadPtr（破坏 Windows 栈保护页、多线程竞态）。 */
+static LLVMValueRef hdr_readable_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef ty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ i8p, i64t }, 2, 0);
+    *out_ty = ty;
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_hdr_readable");
+    if (fn) return fn;
+    fn = LLVMAddFunction(g->mod, "zan_rt_hdr_readable", ty);
+    /* 弱兜底：实现在 rt_timer.o；wasm/bare 或旧的预编译交叉运行时对象里
+     * 没有它，退回「可读」即旧行为，保证符号完备不报链接错误。 */
+    LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+    LLVMBuildRet(b, LLVMConstInt(i32t, 1, 0));
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+static LLVMValueRef zan_hdr_page_ok(zan_irgen_t *g, LLVMValueRef obj,
+                                    int64_t need) {
+    if (LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) return NULL;
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+    if (!cur) return NULL;
+    LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+    LLVMValueRef pgoff = LLVMBuildAnd(g->builder,
+        LLVMBuildPtrToInt(g->builder, obj, i64t, "hdr.addr"),
+        LLVMConstInt(i64t, 4095, 0), "hdr.pgoff");
+    LLVMValueRef fast = zan_icmp(g->builder, LLVMIntUGE, pgoff,
+        LLVMConstInt(i64t, (uint64_t)need, 0), "hdr.samepage");
+    LLVMBasicBlockRef slow_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdr.pgslow");
+    LLVMBasicBlockRef join_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdr.pgjoin");
+    LLVMBuildCondBr(g->builder, fast, join_bb, slow_bb);
+    LLVMPositionBuilderAtEnd(g->builder, slow_bb);
+    LLVMTypeRef rty = NULL;
+    LLVMValueRef rfn = hdr_readable_fn(g, &rty);
+    LLVMValueRef p8 = LLVMBuildBitCast(g->builder, obj,
+        LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0), "hdr.p8");
+    LLVMValueRef r = zan_call2(g->builder, rty, rfn,
+        (LLVMValueRef[]){ p8, LLVMConstInt(i64t, (uint64_t)need, 0) }, 2,
+        "hdr.readable");
+    LLVMValueRef slow_ok = zan_icmp(g->builder, LLVMIntNE, r,
+        LLVMConstInt(LLVMTypeOf(r), 0, 0), "hdr.slowok");
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(g->builder);
+    LLVMBuildBr(g->builder, join_bb);
+    LLVMPositionBuilderAtEnd(g->builder, join_bb);
+    LLVMValueRef phi = LLVMBuildPhi(g->builder, i1t, "hdr.readok");
+    LLVMAddIncoming(phi, (LLVMValueRef[]){ LLVMConstInt(i1t, 1, 0), slow_ok },
+                    (LLVMBasicBlockRef[]){ cur, slow_end }, 2);
+    return phi;
+}
 LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
-  /* 移除已过时且危险的 Win32 IsBadReadPtr API 调用。
-   * IsBadReadPtr 会破坏 Windows
-   * 线程栈增长保护页机制并引入多线程竞态与高昂系统调用开销。 保持与
-   * Linux/macOS/POSIX 平台统一的行为：返回 NULL，仅依靠非空判定与魔数校验。 */
-  (void)g;
-  (void)obj;
-  return NULL;
+  /* 串长缓存读/盖戳/失效只碰 [p-8]、[p-16]（数组计数也在 -16） */
+  return zan_hdr_page_ok(g, obj, -(int64_t)ZAN_OBJ_RC_OFF);
 }
 LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
   /* 4 字段：{dtor_fn, tynames_arr_ptr, meta_ptr, field_graph_ptr}，共 32 字节。
@@ -804,19 +859,28 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
   emit_arc_fault_report(g, obj, LLVMConstInt(i64t, 0, 0), freed_by, code, what);
   LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
+/* llvm.returnaddress 是按返回指针类型重载的 intrinsic：新版 LLVM（≥23）的
+ * verifier 要求名字带类型后缀（llvm.returnaddress.p0），裸名 LLVMAddFunction
+ * 声明会被拒。统一经 LLVM 自己的 intrinsic 表取声明，名字由 LLVM 按当前
+ * 版本修饰（老版本 p0i8/裸名、新版本 p0），同一模块重复调用返回同一声明。 */
+LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
+    static const char nm[] = "llvm.returnaddress";
+    unsigned id = LLVMLookupIntrinsicID(nm, sizeof(nm) - 1);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    size_t np = LLVMIntrinsicIsOverloaded(id) ? 1 : 0;
+    LLVMValueRef fn = LLVMGetIntrinsicDeclaration(g->mod, id, &i8p, np);
+    if (out_ty) *out_ty = LLVMGlobalGetValueType(fn);
+    return fn;
+}
 void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
                          LLVMValueRef rc_iptr) {
   LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
-  LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
   LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0),
                  rc_iptr);
-  LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
-  LLVMTypeRef ra_ty = LLVMFunctionType(i8p, &i32t, 1, 0);
-  LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
-  if (!ra_fn)
-    ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
+  LLVMTypeRef ra_ty = NULL;
+  LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
   LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
   LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &zero, 1, "retaddr");
   LLVMValueRef sp = LLVMBuildGEP2(
@@ -830,14 +894,24 @@ void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
 }
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8,
                             LLVMBasicBlockRef ret_bb) {
-  /* 移除已过时且危险的 Win32 IsBadReadPtr API 调用。
-   * IsBadReadPtr 会破坏 Windows
-   * 线程栈增长保护页机制并引入多线程竞态与高昂系统调用开销。 保持与
-   * Linux/macOS/POSIX 平台统一的行为：直接放行至魔数校验。 */
-  (void)g;
-  (void)fn;
-  (void)ptr8;
-  (void)ret_bb;
+  /* ptr8 = GEP(obj, off)：守卫随后读的 ptr8 与其下一个头字 ptr8-8
+   * （串：-8 魔数、-16 RC；数组：-24 魔数、-32 RC），need = 8 - off。
+   * 不可读则直接走 ret_bb（外来指针：不 retain/release）。 */
+  if (!ptr8 || !LLVMIsAGetElementPtrInst(ptr8) ||
+      LLVMGetNumOperands(ptr8) != 2)
+    return;
+  LLVMValueRef idx = LLVMGetOperand(ptr8, 1);
+  if (!LLVMIsAConstantInt(idx))
+    return;
+  int64_t off = LLVMConstIntGetSExtValue(idx);
+  if (off >= 0)
+    return;
+  LLVMValueRef ok = zan_hdr_page_ok(g, LLVMGetOperand(ptr8, 0), 8 - off);
+  if (!ok)
+    return;
+  LLVMBasicBlockRef go_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "hdr.ok");
+  LLVMBuildCondBr(g->builder, ok, go_bb, ret_bb);
+  LLVMPositionBuilderAtEnd(g->builder, go_bb);
 }
 
 static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
@@ -845,17 +919,14 @@ static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 LLVMValueRef rc, LLVMValueRef site) {
   if (!ev_fn)
     return;
-  LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-  LLVMTypeRef ra_ty = LLVMFunctionType(i8p, (LLVMTypeRef[]){i32t}, 1, 0);
+  LLVMTypeRef ra_ty = NULL;
   /* 声明而不是只查：只查的话，查不到就整段 return——ARC trace 事件被
    * 静默丢弃，而编译一个字都不说。当前靠「调用点都在 check_leaks 分支
    * 里、那里已声明过该 intrinsic」才不出事，但那是跨函数的隐式耦合：
    * 将来把调用点挪到别处，trace 就会无声地少一串记录。 */
-  LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
-  if (!ra_fn)
-    ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
+  LLVMValueRef ra_fn = zan_irgen_returnaddress_fn(g, &ra_ty);
   LLVMValueRef ra_arg = LLVMConstInt(i32t, 0, 0);
   LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &ra_arg, 1, "tra");
   LLVMValueRef tagc = zan_irgen_intern_string(g, tag);

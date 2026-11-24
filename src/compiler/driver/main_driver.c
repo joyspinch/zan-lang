@@ -1288,9 +1288,130 @@ static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
   }
 }
 
+static bool zan_module_calls(LLVMModuleRef m, const char *name) {
+    LLVMValueRef f = LLVMGetNamedFunction(m, name);
+    if (!f) return false;
+    for (LLVMUseRef u = LLVMGetFirstUse(f); u; u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (LLVMIsACallInst(user) || LLVMIsAInvokeInst(user)) return true;
+    }
+    return false;
+}
+
+/* 活对象注册表按需开启（见 rt_mem.c zan_live_wanted）：只有调用了
+ * GC.DetectCycles / CollectCycles / WriteHeapSnapshot 的模块才在启动时开启，构造器优先级
+ * 101 早于静态初始化（65535），不漏登记。注册表在 rt_timer.o 里（hosted 全覆盖）；wasm/bare
+ * 拿到弱空实现，与注册/探测函数的弱回退同口径。 */
+static void zan_request_live_registry(zan_irgen_t *g) {
+  bool uses = zan_module_calls(g->mod, "zan_gc_detect_cycles") ||
+              zan_module_calls(g->mod, "zan_gc_collect_cycles") ||
+              zan_module_calls(g->mod, "zan_gc_write_heap_snapshot") ||
+              zan_module_calls(g->mod, "zan_rt_heap_diagnostics_enable");
+  /* 分配/释放处的注册表调用先内联读模块内开关 __zan_live_on（irgen_weak.c）。
+   * 用 GC API 的程序编译期置 1；否则在保留检测钩子的模块（--check-leaks /
+   * --emit-lib）由启动构造器按 ZAN_DETECT_LEAKS 置位；普通模块已剪除
+   * 全部登记调用，直接返回。 */
+  LLVMValueRef flag = LLVMGetNamedGlobal(g->mod, "__zan_live_on");
+  if (uses && flag)
+    LLVMSetInitializer(flag, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0));
+  if (!uses && (!flag || (!g->check_leaks && !g->emit_lib)))
+    return;
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef vfn = LLVMFunctionType(voidt, NULL, 0, 0);
+    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef ctor = LLVMAddFunction(g->mod, "__zan_live_registry_ctor", vfn);
+    LLVMSetLinkage(ctor, LLVMInternalLinkage);
+    if (uses) {
+        LLVMValueRef en = LLVMGetNamedFunction(g->mod, "zan_rt_live_enable");
+        if (!en) {
+            en = LLVMAddFunction(g->mod, "zan_rt_live_enable", vfn);
+            LLVMSetLinkage(en, LLVMWeakAnyLinkage);
+            LLVMPositionBuilderAtEnd(g->builder,
+                LLVMAppendBasicBlockInContext(g->ctx, en, "entry"));
+            LLVMBuildRetVoid(g->builder);
+        }
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, ctor, "entry"));
+        LLVMBuildCall2(g->builder, vfn, en, NULL, 0, "");
+    } else {
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef i8p = LLVMPointerType(i8, 0);
+        LLVMTypeRef genv_ty = LLVMFunctionType(i8p, &i8p, 1, 0);
+        LLVMValueRef genv = LLVMGetNamedFunction(g->mod, "getenv");
+        if (!genv) genv = LLVMAddFunction(g->mod, "getenv", genv_ty);
+        LLVMPositionBuilderAtEnd(g->builder,
+            LLVMAppendBasicBlockInContext(g->ctx, ctor, "entry"));
+        LLVMValueRef name = LLVMBuildGlobalStringPtr(g->builder,
+            "ZAN_DETECT_LEAKS", "live.env");
+        LLVMValueRef v = LLVMBuildCall2(g->builder, genv_ty, genv, &name, 1, "live.env.v");
+        LLVMValueRef on = LLVMBuildZExt(g->builder,
+            LLVMBuildICmp(g->builder, LLVMIntNE, v, LLVMConstNull(i8p), "live.env.on"),
+            i8, "live.env.b");
+        LLVMValueRef st = LLVMBuildStore(g->builder, on, flag);
+        LLVMSetAlignment(st, 1);
+        LLVMSetOrdering(st, LLVMAtomicOrderingMonotonic);
+    }
+    LLVMBuildRetVoid(g->builder);
+    if (saved) LLVMPositionBuilderAtEnd(g->builder, saved);
+
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef record = LLVMConstStructInContext(g->ctx,
+        (LLVMValueRef[]){ LLVMConstInt(i32, 101, 0), ctor, LLVMConstNull(ptr) }, 3, 0);
+    LLVMValueRef records[64];
+    int count = 0;
+    LLVMValueRef old = LLVMGetNamedGlobal(g->mod, "llvm.global_ctors");
+    if (old) {
+        LLVMValueRef init = LLVMGetInitializer(old);
+        unsigned n = init ? LLVMGetArrayLength(LLVMTypeOf(init)) : 0;
+        if (n >= 63) return; /* 不可能的规模：保守地不改动现有构造器表 */
+        for (unsigned i = 0; i < n; i++) {
+            records[count] = LLVMGetAggregateElement(init, i);
+            /* 记录类型不一致时不合并（宁可退回旧行为：注册表关闭），不造坏表 */
+            if (LLVMTypeOf(records[count]) != LLVMTypeOf(record)) return;
+            count++;
+        }
+        LLVMSetValueName2(old, "", 0);
+    }
+    records[count++] = record;
+    LLVMTypeRef ty = LLVMTypeOf(record);
+    LLVMValueRef ctors = LLVMAddGlobal(g->mod, LLVMArrayType(ty, (unsigned)count),
+                                       "llvm.global_ctors");
+    LLVMSetLinkage(ctors, LLVMAppendingLinkage);
+    LLVMSetInitializer(ctors, LLVMConstArray(ty, records, (unsigned)count));
+    if (old) {
+        LLVMReplaceAllUsesWith(old, ctors);
+        LLVMDeleteGlobal(old);
+    }
+}
+
+/* 分配字节计数（A464，GC.GetAllocatedBytes* / GetTotalMemory）只在程序读它
+ * 时才有意义，却在每次对象/字符串分配上调一次 zan_rt_alloc_add：线程局部加法
+ * （macOS 上 TLS 每次经 _tlv_get_addr 函数调用）+ 一次全局原子加（多线程下
+ * 同一缓存行在所有分配线程间来回）。Mac 上子串循环 17% 的时间耗在这里。
+ * 程序（本模块）没调读取端时，删掉全部计数调用——它们是无返回值的纯副作用。
+ * 库（DLL/dylib）保留：宿主可能读进程级总数。 */
+static void zan_strip_alloc_counter(zan_irgen_t *g) {
+    if (g->emit_lib) return;
+    if (zan_module_calls(g->mod, "zan_rt_alloc_bytes_thread") ||
+        zan_module_calls(g->mod, "zan_rt_alloc_bytes_total"))
+        return;
+    LLVMValueRef f = LLVMGetNamedFunction(g->mod, "zan_rt_alloc_add");
+    if (!f) return;
+    LLVMUseRef u = LLVMGetFirstUse(f);
+    while (u) {
+        LLVMValueRef user = LLVMGetUser(u);
+        u = LLVMGetNextUse(u);
+        if (LLVMIsACallInst(user) && LLVMGetCalledValue(user) == f)
+            LLVMInstructionEraseFromParent(user);
+    }
+}
+
 static void zan_prepare_static_runtime(zan_irgen_t *g,
                                        const zan_target_t *target,
                                        bool preserve_link_abi) {
+  zan_request_live_registry(g);
+  zan_strip_alloc_counter(g);
   if (g->emit_lib && g->emit_shared)
     return;
   bool use_comdat = target->os != ZAN_OS_MACOS && target->os != ZAN_OS_IOS;

@@ -1,0 +1,102 @@
+// GC.CollectCycles：回收 ARC 无法自行释放的孤儿强引用环；活根可达的环、
+// 被外部持有的环成员不得误收；回收时把指向环外存活对象的引用正常释放。
+using System;
+using System.Collections.Generic;
+
+class Node {
+    public Node next;
+    public string name;
+    public Leaf leaf;
+    public Node(string n) { name = n; }
+}
+
+class Leaf {
+    public int v;
+    public Leaf(int x) { v = x; }
+}
+
+class Hub {
+    public List<Hub> peers = new List<Hub>();
+}
+
+class Probe {
+    public weak Node target;
+}
+
+class Program {
+    [DllImport("crt", EntryPoint = "zan_rt_heap_diagnostics_enable")]
+    static extern void EnableHeapDiagnostics();
+
+    [DllImport("crt", EntryPoint = "zan_rt_heap_mutator_enter")]
+    static extern void HeapMutatorEnter();
+
+    [DllImport("crt", EntryPoint = "zan_rt_heap_mutator_leave")]
+    static extern void HeapMutatorLeave();
+
+    static void MakeRing(int n, Probe p, Leaf shared) {
+        Node first = new Node("r0");
+        Node cur = first;
+        for (int i = 1; i < n; i = i + 1) {
+            Node nx = new Node("r" + i);
+            cur.next = nx;
+            cur = nx;
+        }
+        cur.next = first;
+        first.leaf = shared;
+        p.target = first;
+    }
+
+    static void MakeHubs() {
+        Hub a = new Hub();
+        Hub b = new Hub();
+        a.peers.Add(b);
+        b.peers.Add(a);
+        a.peers.Add(a);
+    }
+
+    static void Main() {
+        if (GC.CollectCycles() != -1) {
+            throw new Exception("CollectCycles must require heap diagnostics opt-in");
+        }
+        HeapMutatorEnter();
+        try {
+            // This fixture owns the heap and has no other mutators.
+            EnableHeapDiagnostics();
+            RunCollectCycles();
+        } finally {
+            HeapMutatorLeave();
+        }
+    }
+
+    static void RunCollectCycles() {
+        Console.WriteLine("empty: " + GC.CollectCycles());
+
+        Node la = new Node("live-a");
+        Node lb = new Node("live-b");
+        la.next = lb;
+        lb.next = la;
+        Console.WriteLine("live ring kept: " + (GC.CollectCycles() == 0) + " " + la.next.next.name);
+
+        Probe p = new Probe();
+        Leaf shared = new Leaf(7);
+        MakeRing(3, p, shared);
+        Console.WriteLine("ring alive before: " + (p.target != null));
+        Console.WriteLine("ring freed: " + GC.CollectCycles());
+        Console.WriteLine("weak cleared: " + (p.target == null));
+        Console.WriteLine("shared leaf ok: " + shared.v);
+
+        Probe held = new Probe();
+        MakeRing(4, held, shared);
+        Node pin = held.target.next;
+        Console.WriteLine("pinned ring kept: " + (GC.CollectCycles() == 0) + " " + pin.next.next.next.name);
+        pin = null;
+        Console.WriteLine("unpinned ring freed: " + GC.CollectCycles());
+
+        MakeHubs();
+        Console.WriteLine("list cycle freed: " + GC.CollectCycles());
+        Console.WriteLine("no cycles left: " + GC.DetectCycles());
+        Console.WriteLine("again: " + GC.CollectCycles());
+        Console.WriteLine("live ring still: " + la.next.name + " " + lb.next.name);
+        la.next = null; // 出作用域前断环，退出时零泄漏
+    }
+}

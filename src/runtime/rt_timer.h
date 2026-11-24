@@ -28,6 +28,8 @@ typedef void (*zan_fatal_fn)(const char *category, const char *message);
 void zan_rt_set_fatal_handler(zan_fatal_fn fn);
 void zan_rt_fatal(const char *category, const char *message);
 unsigned char *zan_rt_soft_scratch(void);
+/* [p-need, p) 是否可读（生成代码头字探测的页首慢路径） */
+int zan_rt_hdr_readable(const void *p, int64_t need);
 /* 堆内存分配度量 (A464) */
 void zan_rt_alloc_add(int64_t bytes);
 int64_t zan_rt_alloc_bytes_thread(void);

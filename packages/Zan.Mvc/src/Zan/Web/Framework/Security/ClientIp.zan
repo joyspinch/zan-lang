@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Net.External;
 using System.Web;
 using Zan.Web.Core;
 
@@ -12,110 +11,27 @@ namespace Zan.Web.Security;
    X-Forwarded-For 反代链解析真实客户端——只信受托跳，从不盲取最左项。 */
 public class ClientIp {
 
+    /* 规范拼写；算法唯一实现在 System.Web.ForwardedHeaders。 */
     public static string Canonical(string ip) {
-        if (ip.Length == 0 || ip.Length > 45) { return ""; }
-        if (ExternalTarget.ValidIPv4(ip)) { return ip; }
-        if (!ip.Contains(":")) { return ""; }
-        if (ip.Contains(".")) {
-            int tail = ip.LastIndexOf(":") + 1;
-            string v4 = ip.Substring(tail);
-            if (!ExternalTarget.ValidIPv4(v4)) { return ""; }
-            List<string> octets = v4.Split(".");
-            int high = Convert.ToInt32(octets[0]) * 256 + Convert.ToInt32(octets[1]);
-            int low = Convert.ToInt32(octets[2]) * 256 + Convert.ToInt32(octets[3]);
-            ip = ip.Substring(0, tail) + IpHex(high) + ":" + IpHex(low);
-        }
-        int gap = ip.IndexOf("::");
-        if (gap >= 0 && ip.IndexOf("::", gap + 2) >= 0) { return ""; }
-        string left = ip;
-        string right = "";
-        if (gap >= 0) { left = ip.Substring(0, gap); right = ip.Substring(gap + 2); }
-        List<int> before = new List<int>();
-        List<int> after = new List<int>();
-        if (!IpGroups(left, before) || !IpGroups(right, after)) { return ""; }
-        int count = before.Count + after.Count;
-        if ((gap < 0 && count != 8) || (gap >= 0 && count >= 8)) { return ""; }
-        List<int> words = new List<int>();
-        for (int i = 0; i < before.Count; i = i + 1) { words.Add(before[i]); }
-        for (int i = count; i < 8; i = i + 1) { words.Add(0); }
-        for (int i = 0; i < after.Count; i = i + 1) { words.Add(after[i]); }
-        if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0
-            && words[4] == 0 && words[5] == 65535) {
-            return Convert.ToString(words[6] / 256) + "." + Convert.ToString(words[6] % 256)
-                + "." + Convert.ToString(words[7] / 256) + "." + Convert.ToString(words[7] % 256);
-        }
-        string result = "";
-        for (int i = 0; i < 8; i = i + 1) {
-            if (i > 0) { result = result + ":"; }
-            result = result + IpHex(words[i]);
-        }
-        return result;
+        return ForwardedHeaders.Canonical(ip);
     }
 
-    private static bool IpGroups(string part, List<int> words) {
-        if (part.Length == 0) { return true; }
-        int start = 0;
-        for (int i = 0; i <= part.Length; i = i + 1) {
-            if (i == part.Length || part[i] == ':') {
-                int word = ExternalTarget.ParseHex(part.Substring(start, i - start));
-                if (word < 0 || words.Count >= 8) { return false; }
-                words.Add(word);
-                start = i + 1;
-            }
+    /* 受托代理名单（server.trustedProxies）；任一项非法即整份作废、不信任
+       任何代理——一条手误不得放大信任面。 */
+    public static List<string> Trusted() {
+        List<string> trusted = new List<string>();
+        string configured = Cfg.Server.trustedProxies;
+        if (configured.Length == 0 || configured.Length > 4096) { return trusted; }
+        List<string> entries = configured.Split(",");
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            string proxy = Canonical(entries[i].Trim());
+            if (proxy.Length == 0) { return new List<string>(); }
+            trusted.Add(proxy);
         }
-        return true;
-    }
-
-    private static string IpHex(int word) {
-        string digits = "0123456789abcdef";
-        string result = "";
-        for (int shift = 12; shift >= 0; shift = shift - 4) {
-            result = result + digits.Substring((word >> shift) & 15, 1);
-        }
-        return result;
+        return trusted;
     }
 
     public static string Of(HttpContext ctx) {
-        string peer = Canonical(ctx.RemoteIp());
-        if (peer.Length == 0) { return "unknown"; }
-        string configured = Cfg.Server.trustedProxies;
-        if (configured.Length == 0 || configured.Length > 4096) { return peer; }
-        List<string> entries = configured.Split(",");
-        List<string> trusted = new List<string>();
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            string proxy = Canonical(entries[i].Trim());
-            if (proxy.Length == 0) { return peer; }
-            trusted.Add(proxy);
-        }
-        if (!trusted.Contains(peer)) { return peer; }
-        HttpRequest request = ctx.Request();
-        if (request.parseStatus != 0) { return peer; }
-        int fields = 0;
-        List<string> lines = request.rawHeaders.Split("\n");
-        for (int i = 0; i < lines.Count; i = i + 1) {
-            string line = lines[i];
-            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t')) { return peer; }
-            int colon = line.IndexOf(":");
-            if (colon >= 0 && line.Substring(0, colon).Trim().ToLower() == "x-forwarded-for") {
-                fields = fields + 1;
-            }
-        }
-        if (fields != 1) { return peer; }
-        string forwarded = request.GetHeader("X-Forwarded-For");
-        if (forwarded.Length == 0 || forwarded.Length > 2048) { return peer; }
-        List<string> hops = forwarded.Split(",");
-        if (hops.Count > 32) { return peer; }
-        List<string> addresses = new List<string>();
-        for (int i = 0; i < hops.Count; i = i + 1) {
-            string hop = Canonical(hops[i].Trim());
-            if (hop.Length == 0) { return peer; }
-            addresses.Add(hop);
-        }
-        string current = peer;
-        for (int i = addresses.Count - 1; i >= 0; i = i - 1) {
-            if (!trusted.Contains(current)) { return current; }
-            current = addresses[i];
-        }
-        return current;
+        return ForwardedHeaders.Resolve(ctx.RemoteIp(), ctx.Request(), Trusted());
     }
 }

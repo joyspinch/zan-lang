@@ -23,13 +23,31 @@ public partial class TreeView : Control {
     private int hoveredRow = -1;
     private bool IsRowHovered(int index) { return hoveredRow == index; }
     public string Empty;
+
+    // 节点被选中时（读取 SelectedIndex / Selected）。
+    [Event(Alias = "NodeClick")]
     public UiEvent Select;
+    // 节点被双击时（打开 / 运行它）。
+    [Event]
     public UiEvent Activate;
+    // 目录被展开时。
+    [Event]
     public UiEvent Expand;
+    // 目录被折叠时。
+    [Event]
     public UiEvent Collapse;
+    // 节点被右键点击时（读取 ContextRow / ContextX / ContextY）。
+    [Event]
     public UiEvent Context;
+    // 复选框被切换时（用 ContextRow 读取节点）。
+    [Event]
     public UiEvent Check;
+    // 行被左键按下时（读取 ContextRow / ContextX / ContextY）。
+    // 供把行当拖拽源的宿主使用，例如设计器工具箱。
+    [Event]
     public UiEvent Press;
+    // 拖动行改变次序后（读取 MoveFrom / MoveTo）。
+    [Event]
     public UiEvent Move;
     public bool reorder;
     public bool pressed;
@@ -284,7 +302,7 @@ public partial class TreeView : Control {
                 Value.Set(index);
             }
             ctxRow = index; ctxX = e.x; ctxY = e.y;
-            Context.PostS(this);
+            Context.Post(this);
             e.Handle();
             return;
         }
@@ -292,7 +310,7 @@ public partial class TreeView : Control {
         dropDone = false;
         if (e.IsTouch()) { dropDone = true; }
         ctxRow = index; ctxX = e.x; ctxY = e.y;
-        Press.PostS(this);
+        Press.Post(this);
         if (reorder) {
             pressed = true; dragRow = index; dragging = false; dropAt = -1;
             app.CapturePointer(this, true);
@@ -331,7 +349,7 @@ public partial class TreeView : Control {
         bool moved = dragging && dropAt >= 0 && dropAt != dragRow && dropAt != dragRow + 1;
         pressed = false; dragging = false;
         if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
-        if (moved) { dropDone = true; Move.PostS(this); }
+        if (moved) { dropDone = true; Move.Post(this); }
     }
     public override void OnPointerCancel(RoutedEventArgs e) {
         base.OnPointerCancel(e);
@@ -349,7 +367,7 @@ public partial class TreeView : Control {
             && e.x < rowsBody.bx + app.theme.paddingSmall + app.Scale(16)) {
             TreeView.ToggleCheck(data, index);
             ctxRow = index;
-            Check.PostS(this);
+            Check.Post(this);
             this.NoteSelfDamage(app);
             e.Handle();
             return;
@@ -390,10 +408,10 @@ public partial class TreeView : Control {
             if (n.isDir) {
                 n.expanded = !n.expanded;
                 this.LayoutBody();
-                if (n.expanded) { Expand.PostS(this); } else { Collapse.PostS(this); }
+                if (n.expanded) { Expand.Post(this); } else { Collapse.Post(this); }
             }
-            if (moved) { Select.PostS(this); }
-            if (e.isDoubleClick) { Activate.PostS(this); }
+            if (moved) { Select.Post(this); }
+            if (e.isDoubleClick) { Activate.Post(this); }
             this.NoteSelfDamage(app);
         e.Handle();
     }
@@ -409,39 +427,28 @@ public partial class TreeView : Control {
                 pressed = false; dragging = false; dragRow = -1; dropAt = -1;
                 App app = this.App;
                 if (app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
-                Context.PostS(this);
+                Context.Post(this);
                 this.NoteSelfDamage(app);
                 e.Handle();
             }
         }
         if (!e.handled) { base.OnRoutedEvent(e); }
     }
-    public override string Kind() { return "TreeView"; }
+
+    // 覆写：返回设计器属性清单（checks/empty/sel/value）。
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Int("value", "Selected").DefaultBinding().Field("Value", 1).Also("data").Also("sel"));
-        ps.Add(PropSpec.Bool("checks", "Checkboxes").Field("checks", 2));
-        ps.Add(PropSpec.Bool("multi", "Multi select").Field("multi", 2));
-        ps.Add(PropSpec.Bool("reorder", "Drag reorder").Field("reorder", 2).WithTip("Allow dragging nodes to move or re-parent them."));
-        ps.Add(PropSpec.Text("empty", "Empty text").Field("Empty", 0));
+        ps.Add(PropSpec.Int("value", "Selected").DefaultBinding().Field("Value").Also("data").Also("sel"));
+        ps.Add(PropSpec.Bool("checks", "Checkboxes").Field("checks"));
+        ps.Add(PropSpec.Bool("multi", "Multi select").Field("multi"));
+        ps.Add(PropSpec.Bool("reorder", "Drag reorder")
+            .Field("reorder")
+            .WithTip("Allow dragging nodes to move or re-parent them."));
+        ps.Add(PropSpec.Text("empty", "Empty text").Field("Empty"));
         return ps;
     }
-    public override string GetProp(string key) {
-        if (key == "data" || key == "value" || key == "sel") {
-            return Convert.ToString(Value != null ? Value.Get() : -1);
-        }
-        if (key == "empty") { return Empty; }
-        return base.GetProp(key);
-    }
-    public override void SetProp(string key, string val) {
-        if (key == "data" || key == "value" || key == "sel") {
-            int idx = Convert.ToInt32(val);
-            if (Value != null) { Value.Set(idx); }
-            return;
-        }
-        if (key == "empty") { Empty = val; return; }
-        base.SetProp(key, val);
-    }
+
+    // 覆写：CSS 类型选择器名（"tree"）。
     public override void CollectInputFocus(App app, List<Control> controls) {
         this.Arrange(bx, by, bw, bh);
         base.CollectInputFocus(app, controls);
@@ -470,19 +477,22 @@ public partial class TreeView : Control {
         }
         this.RetireRows();
     }
-    public void WithFilter(Input f) {
-        if (filter == f) { return; }
+    // 在树顶部绘制内联过滤行，本身不进行过滤：
+    // 宿主在输入变化时重新绑定过滤后的列表。
+    public TreeView WithFilter(Input f) {
+        if (filter == f) { return this; }
         filterRevision = filterRevision + 1;
         int ticket = filterRevision;
         Input previous = filter;
         filter = null;
         if (previous != null) { this.Remove(previous); }
-        if (ticket != filterRevision) { return; }
+        if (ticket != filterRevision) { return this; }
         if (f != null) {
             base.Add(f);
-            if (ticket != filterRevision) { return; }
+            if (ticket != filterRevision) { return this; }
             if (f.parent == this) { filter = f; }
         }
+        return this;
     }
     protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
         if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
@@ -506,7 +516,7 @@ public partial class TreeView : Control {
         if (row < 0 - 1 || row >= data.Count) { return; }
         if (Value.Get() == row) { return; }
         Value.Set(row);
-        Select.PostS(this);
+        Select.Post(this);
     }
     public void ClearSelection() {
         Value.Set(0 - 1);
@@ -575,9 +585,11 @@ public partial class TreeView : Control {
         return res;
     }
     public int CheckedCount() { return this.CheckedLabels().Count; }
-    public void NodeSlot(NodeOf template) {
+    // 声明式设置自定义节点行插槽
+    public TreeView NodeSlot(NodeOf template) {
         tpl = template;
         this.RetireRows();
+        return this;
     }
     public bool HasExtraNodes() {
         if (data == null) { return false; }

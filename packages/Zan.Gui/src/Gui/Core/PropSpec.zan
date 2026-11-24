@@ -1,6 +1,15 @@
 using System;
 using System.Collections.Generic;
 namespace Gui;
+// 为可视化设计器和序列化器描述 Control 的一个可编辑属性，
+// 以及读写它的方式。控件从 Props() 返回其列表，
+// 并把每个 spec 指向它编辑的字段：
+// icon.str = Icon;            // 编译器合成的访问器对
+// ps.Add(icon);
+// 因为 spec 携带访问器对，`Control.GetProp/SetProp` 就能
+// 泛化地读写每个属性——控件只声明一次属性，
+// 而不必在三个字符串匹配方法里重复。
+// kind：编辑器种类，见 PropKind。
 public class PropSpec {
     private static Dictionary<string, List<PropSpec>> schemaCache = new Dictionary<string, List<PropSpec>>();
     internal static List<PropSpec> FindCachedSchema(string typeName) {
@@ -17,22 +26,77 @@ public class PropSpec {
     string key;
     string alias;
     string label;
-    int kind;
+    PropKind kind;
     List<string> options;
     Binding<string> str;
     Binding<int> num;
     Binding<bool> flag;
     private string member;
+    // 值类型与存储形态由字段（或属性）的声明类型推断：string/int/bool 或
+    // 对应的 Binding<T>。-1 = 尚未解析（Control.Props() 构建时即解析）。
     private int memberKind;
     private int memberStorage;
-    public PropSpec Field(string name, int valueKind) {
-        if (name == null || name == "" || valueKind < 0 || valueKind > 2) {
-            throw new ArgumentException("A property field requires a name and a string, int or bool value kind.");
+    public PropSpec Field(string name) {
+        if (name == null || name == "") {
+            throw new ArgumentException("A property field requires a name.");
         }
         member = name;
-        memberKind = valueKind;
+        memberKind = -1;
         memberStorage = -1;
         return this;
+    }
+
+    // 计算属性：经宿主上的一对访问器方法读写文本值（`string Getter()` /
+    // `void Setter(string)`），按名反射调用，不捕获宿主（无引用环）。
+    // 取代逐控件重写 GetExtra/SetExtra 的字符串分派。
+    private string getter;
+    private string setter;
+
+    public PropSpec Accessor(string getterName, string setterName) {
+        if (getterName == null || getterName == "" || setterName == null || setterName == "") {
+            throw new ArgumentException("A property accessor requires getter and setter method names.");
+        }
+        getter = getterName;
+        setter = setterName;
+        return this;
+    }
+
+    // 转发属性：读写另一个控件（通常是复合组件内部的子控件）的同名或指定属性。
+    // 目标弱引用：规格缓存在宿主上，子控件本就由宿主的树持有。
+    private weak Control forwardTarget;
+    private string forwardProp;
+
+    public PropSpec ForwardTo(Control target, string prop) {
+        forwardTarget = target;
+        forwardProp = prop != null ? prop : "";
+        return this;
+    }
+
+    internal static bool HasInstanceForward(List<PropSpec> specs) {
+        if (specs == null) { return false; }
+        for (int i = 0; i < specs.Count; i = i + 1) {
+            if (specs[i] != null && specs[i].forwardProp != "") { return true; }
+        }
+        return false;
+    }
+
+    // 读走字段、写走宿主的 `void Setter(string)`（写入需要重建内部结构的
+    // 文本属性：标签、项列表串等）。
+    public PropSpec Setter(string setterName) {
+        if (setterName == null || setterName == "") {
+            throw new ArgumentException("A property setter requires a method name.");
+        }
+        setter = setterName;
+        return this;
+    }
+
+    // 按宿主类型解析字段的值类型与存储形态、校验访问器方法存在；
+    // Control.Props() 构建后立即调用，拼错名字在首次取属性表时就抛出。
+    public void Resolve(Control owner) {
+        if (member != "" && memberStorage < 0) { this.Storage(owner); }
+        if ((getter != "" && !owner.HasMethod(getter)) || (setter != "" && !owner.HasMethod(setter))) {
+            throw new InvalidOperationException("Property accessor does not exist: " + getter + "/" + setter);
+        }
     }
     private int Storage(Control owner) {
         if (memberStorage >= 0) { return memberStorage; }
@@ -40,20 +104,27 @@ public class PropSpec {
         for (int i = 0; i < type.FieldCount; i = i + 1) {
             if (type.GetFieldName(i) != member) { continue; }
             string declared = type.GetFieldType(i);
-            string scalar = "string";
-            if (memberKind == 1) { scalar = "int"; }
-            else if (memberKind == 2) { scalar = "bool"; }
-            if (declared == scalar) { memberStorage = 0; return 0; }
-            if (declared == "System.Binding<" + scalar + ">" || declared == "Binding<" + scalar + ">") {
-                memberStorage = 1;
-                return 1;
+            string scalar = declared;
+            int storage = 0;
+            if (declared.StartsWith("System.Binding<") && declared.EndsWith(">")) {
+                scalar = declared.Substring(15, declared.Length - 16);
+                storage = 1;
+            } else if (declared.StartsWith("Binding<") && declared.EndsWith(">")) {
+                scalar = declared.Substring(8, declared.Length - 9);
+                storage = 1;
             }
-            throw new InvalidOperationException("Property field has an incompatible type: " + member);
+            if (scalar == "string") { memberKind = 0; }
+            else if (scalar == "int") { memberKind = 1; }
+            else if (scalar == "bool") { memberKind = 2; }
+            else { throw new InvalidOperationException("Property field has an unsupported type: " + member + " : " + declared); }
+            memberStorage = storage;
+            return storage;
         }
         throw new InvalidOperationException("Property field does not exist: " + member);
     }
     public string ReadFrom(Control owner) {
-        if (ExtraAccess) { return owner.GetProp(key); }
+        if (forwardProp != "") { return forwardTarget != null ? forwardTarget.GetProp(forwardProp) : ""; }
+        if (getter != "") { return owner.InvokeString(getter); }
         if (member == "") { return this.Read(); }
         bool binding = this.Storage(owner) == 1;
         if (memberKind == 0) {
@@ -71,7 +142,24 @@ public class PropSpec {
         return PropSpec.Flag(value != null && value.Get());
     }
     public void WriteTo(Control owner, string val) {
-        if (ExtraAccess) { owner.SetProp(key, val); return; }
+        if (forwardProp != "") {
+            if (forwardTarget != null) { forwardTarget.SetProp(forwardProp, val); }
+            return;
+        }
+        if (setter != "") {
+            // 字段型属性的 setter 按字段声明类型收参（string/int/bool）；访问器对收文本
+            // （与 Field 并用时访问器负责文本换算，字段只提供绑定身份）。
+            if (member == "" || getter != "") { owner.Invoke(setter, val); return; }
+            this.Storage(owner);
+            if (memberKind == 1) {
+                if (this.AcceptNumber(val)) { owner.Invoke(setter, this.NumberValue(val)); }
+            } else if (memberKind == 2) {
+                owner.Invoke(setter, PropSpec.IsOn(val));
+            } else {
+                owner.Invoke(setter, val);
+            }
+            return;
+        }
         if (member == "") { this.Write(val); return; }
         bool binding = this.Storage(owner) == 1;
         if (memberKind == 0) {
@@ -97,8 +185,8 @@ public class PropSpec {
         else { Binding<bool> created = flagValue; owner.SetFieldObject(member, created); }
     }
     private bool AcceptNumber(string val) {
-        if (kind == 4 || PropSpec.IsIntText(val)) { return true; }
-        if (kind == 3) {
+        if (kind == PropKind.Color || PropSpec.IsIntText(val)) { return true; }
+        if (kind == PropKind.Enum) {
             for (int i = 0; i < options.Count; i = i + 1) {
                 if (options[i] == val) { return true; }
             }
@@ -106,8 +194,8 @@ public class PropSpec {
         return false;
     }
     private int NumberValue(string val) {
-        if (kind == 4) { return PropSpec.ColorInt(val); }
-        if (kind == 3) {
+        if (kind == PropKind.Color) { return PropSpec.ColorInt(val); }
+        if (kind == PropKind.Enum) {
             for (int i = 0; i < options.Count; i = i + 1) {
                 if (options[i] == val) { return i; }
             }
@@ -115,6 +203,8 @@ public class PropSpec {
         return Convert.ToInt32(val);
     }
     string tip;
+    // 整数属性（PropKind.Int）的步进配置：`step` 为 +/- 按钮每次增减量，
+    // `lo`/`hi` 为取值范围。`hasRange` 为 true 时才做范围钳制。
     int step;
     int lo;
     int hi;
@@ -123,26 +213,36 @@ public class PropSpec {
     bool hasDef;
     public bool halfRow;
     bool defaultBinding;
-    public bool ExtraAccess;
-    public PropSpec ViaExtra() { ExtraAccess = true; return this; }
+    // Resolve aliases against one freshly obtained descriptor list. PropOf keeps
+    // its historical bound-only contract; property dispatch also answers unbound specs.
     public static PropSpec Find(List<PropSpec> specs, string key, bool boundOnly) {
         for (int i = 0; i < specs.Count; i = i + 1) {
             PropSpec p = specs[i];
-            if (p.Answers(key) && (p.IsBound() || (!boundOnly && p.ExtraAccess))) { return p; }
+            if (p.Answers(key) && (p.IsBound() || !boundOnly)) { return p; }
         }
         return null;
     }
-    public PropSpec DefaultBinding() { defaultBinding = true; return this; }
-    public int ValueKind() {
-        if (member != "") { return memberKind; }
-        if (str != null) { return 0; }
-        if (flag != null) { return 2; }
-        if (num != null) { return 1; }
-        if (kind == 1 || kind == 4) { return 1; }
-        if (kind == 2) { return 2; }
-        return 0;
+
+    public PropSpec DefaultBinding() {
+        defaultBinding = true;
+        return this;
     }
-    PropSpec(string k, string lbl, int kd) {
+
+    // 编辑器 kind 不等于值类型：枚举可能绑定字符串，也可能绑定数字。
+    // 无字段的计算属性沿用声明的 kind。
+    public PropValueKind ValueKind() {
+        if (member != "" && memberKind >= 0) { return (PropValueKind)memberKind; }
+        if (member == "") {
+            if (str != null) { return PropValueKind.Text; }
+            if (flag != null) { return PropValueKind.Bool; }
+            if (num != null) { return PropValueKind.Int; }
+        }
+        if (kind == PropKind.Int || kind == PropKind.Color) { return PropValueKind.Int; }
+        if (kind == PropKind.Bool) { return PropValueKind.Bool; }
+        return PropValueKind.Text;
+    }
+
+    PropSpec(string k, string lbl, PropKind kd) {
         key = k;
         alias = "";
         label = lbl;
@@ -150,6 +250,9 @@ public class PropSpec {
         options = new List<string>();
         str = null;
         member = "";
+        getter = "";
+        setter = "";
+        forwardProp = "";
         memberKind = 0;
         memberStorage = -1;
         tip = "";
@@ -168,10 +271,30 @@ public class PropSpec {
     }
     public bool HasDefault() { return hasDef; }
     public string DefaultValue() { return defVal; }
-    public PropSpec Half() { halfRow = true; return this; }
-    bool IsBound() { return member != "" || str != null || num != null || flag != null; }
-    bool Answers(string k) { return key == k || Style.Has(alias, k); }
-    PropSpec WithTip(string t) { tip = t; return this; }
+    // 标记该属性占半行：与同组的下一个 halfRow 属性合并在一行内等分布局，消除纵向堆叠和过高遮挡
+    public PropSpec Half() {
+        halfRow = true;
+        return this;
+    }
+
+    bool IsBound() {
+        return member != "" || getter != "" || forwardProp != "" || str != null || num != null || flag != null;
+    }
+
+    // 当 `key` 命名该属性（自身键或某个别名）时为 true。
+    bool Answers(string k) {
+        return key == k || Style.Has(alias, k);
+    }
+
+    // 给属性挂一段说明（返回 this，便于链式调用）。属性面板
+    // 悬停该行时以气泡提示展示。
+    PropSpec WithTip(string t) {
+        tip = t;
+        return this;
+    }
+
+    // 配置整数属性的 +/- 步进与范围（返回 this，便于链式调用）。
+    // `s` 为每次步进量，`min`/`max` 为钳制范围。
     PropSpec Step(int s, int min, int max) {
         step = s;
         lo = min;
@@ -197,6 +320,11 @@ public class PropSpec {
         if (flag != null) { return PropSpec.Flag(flag.Get()); }
         return "";
     }
+    // 按 `val` 字符串写回绑定：数字/布尔做解析（IsOn/ToInt32），
+    // 文本原样写入；未绑定任何字段/signal 时为空操作。
+    // 枚举属性（PropKind.Enum）还收选项文本：`SetProp("orient",
+    // "vertical")` 写入的是该选项的下标。只认数字序号的话，
+    // strtoll 对非数字串静默返回 0，"vertical" 会无声落回第一项。
     void Write(string val) {
         if (str != null) { str.Set(val); return; }
         if (num != null) {
@@ -230,20 +358,88 @@ public class PropSpec {
         if (on) { return "true"; }
         return "false";
     }
-    static bool IsOn(string val) { return val == "true" || val == "1"; }
-    static PropSpec Text(string k, string lbl) { return new PropSpec(k, lbl, 0); }
-    static PropSpec Int(string k, string lbl) { return new PropSpec(k, lbl, 1); }
-    static PropSpec Bool(string k, string lbl) { return new PropSpec(k, lbl, 2); }
-    static PropSpec Color(string k, string lbl) { return new PropSpec(k, lbl, 4); }
+    // 文档字符串是否表示开启（"true" 或 "1"）。
+    static bool IsOn(string val) {
+        return val == "true" || val == "1";
+    }
+
+    // 工厂：文本属性。
+    static PropSpec Text(string k, string lbl) { return new PropSpec(k, lbl, PropKind.Text); }
+    // 工厂：整数属性。
+    static PropSpec Int(string k, string lbl) { return new PropSpec(k, lbl, PropKind.Int); }
+    // 工厂：布尔属性。
+    static PropSpec Bool(string k, string lbl) { return new PropSpec(k, lbl, PropKind.Bool); }
+    // 工厂：颜色属性。
+    static PropSpec Color(string k, string lbl) { return new PropSpec(k, lbl, PropKind.Color); }
+
+    // 字段即属性：键与标签从字段名派生（`CheckedText` → 键 `checkedText`、
+    // 标签 `Checked text`），控件不必再把同一个名字写三遍。键或标签与
+    // 字段名不一致时仍用上面的显式工厂加 `Field()`。
+    public static PropSpec TextField(string field) {
+        return PropSpec.Text(PropSpec.KeyOf(field), PropSpec.LabelOf(field)).Field(field);
+    }
+    public static PropSpec IntField(string field) {
+        return PropSpec.Int(PropSpec.KeyOf(field), PropSpec.LabelOf(field)).Field(field);
+    }
+    public static PropSpec BoolField(string field) {
+        return PropSpec.Bool(PropSpec.KeyOf(field), PropSpec.LabelOf(field)).Field(field);
+    }
+    // 颜色字段按打包 ARGB 整数存储（0 = 跟随皮肤）。
+    public static PropSpec ColorField(string field) {
+        return PropSpec.Color(PropSpec.KeyOf(field), PropSpec.LabelOf(field)).Field(field);
+    }
+
+    // 字段名 → 文档键：首字母小写。
+    public static string KeyOf(string field) {
+        if (field == null || field.Length == 0) { return ""; }
+        return field.Substring(0, 1).ToLower() + field.Substring(1);
+    }
+
+    // 字段名 → 属性面板标签：在小写/数字后的大写处断词，后续单词转小写；
+    // 连续大写（缩写）保持原样（`MaxURL` → `Max URL`）。
+    public static string LabelOf(string field) {
+        if (field == null || field.Length == 0) { return ""; }
+        string s = field.Substring(0, 1);
+        for (int i = 1; i < field.Length; i = i + 1) {
+            int c = field[i] & 255;
+            int prev = field[i - 1] & 255;
+            bool upper = c >= 65 && c <= 90;
+            bool prevLowerOrDigit = (prev >= 97 && prev <= 122) || (prev >= 48 && prev <= 57);
+            string ch = field.Substring(i, 1);
+            if (upper && prevLowerOrDigit) {
+                bool nextUpper = false;
+                if (i + 1 < field.Length) {
+                    int nx = field[i + 1] & 255;
+                    nextUpper = nx >= 65 && nx <= 90;
+                }
+                s = s + " " + (nextUpper ? ch : ch.ToLower());
+            } else {
+                s = s + ch;
+            }
+        }
+        return s;
+    }
+
+    // 尺寸四档选项表（tiny/small/medium/large），给
+    // `PropSpec.Enum("size", "Size", PropSpec.Sizes())` 用——全库
+    // 统一从这里取，免得十六处字面量各自漂移。每次调用新建列表：
+    // PropSpec 持有 options 引用且 `Option()` 会追加，共享实例会串台。
     static List<string> Sizes() {
         return new List<string>{ "tiny", "small", "medium", "large" };
     }
     static List<string> Sizes3() {
         return new List<string>{ "small", "medium", "large" };
     }
-    static PropSpec Section(string lbl) { return new PropSpec("", lbl, 5); }
+
+    // 枚举属性，值为 `opts` 之一（以其标签文本存储）。
+    // 分组标题行（只有标题文字，没有值也没有编辑器）。
+    static PropSpec Section(string lbl) {
+        return new PropSpec("", lbl, PropKind.Section);
+    }
+
+    // 枚举属性工厂，值为 `opts` 之一（以其标签文本存储）。
     static PropSpec Enum(string k, string lbl, List<string> opts) {
-        PropSpec p = new PropSpec(k, lbl, 3);
+        PropSpec p = new PropSpec(k, lbl, PropKind.Enum);
         p.options = opts;
         return p;
     }

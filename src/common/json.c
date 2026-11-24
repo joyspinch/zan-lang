@@ -171,27 +171,33 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
 
 /* free */
 
-/* 待释放节点栈的推入：容量翻倍，OOM 走 host fail-fast（释放路径无回旋） */
+/* 待释放节点栈的推入：栈上小缓冲满后迁入堆并倍增，OOM 走 host fail-fast（释放路径无回旋） */
 static void jfree_push(json_value ***st, size_t *cap, size_t *n,
-                       json_value *v) {
+                       json_value *v, json_value *const *inline_st) {
     if (*n == *cap) {
         if (*cap > SIZE_MAX / (2 * sizeof(json_value *))) zan_host_oom();
-        *cap *= 2;
-        json_value **g =
-            (json_value **)realloc(*st, sizeof(json_value *) * *cap);
+        size_t nc = *cap * 2;
+        json_value **g;
+        if (*st == inline_st) {
+            g = (json_value **)malloc(sizeof(json_value *) * nc);
+            if (g) memcpy(g, *st, sizeof(json_value *) * (*n));
+        } else {
+            g = (json_value **)realloc(*st, sizeof(json_value *) * nc);
+        }
         if (!g) zan_host_oom();
         *st = g;
+        *cap = nc;
     }
     (*st)[(*n)++] = v;
 }
 
 void json_free(json_value *v) {
     if (!v) return;
-    /* 显式栈迭代释放：解析器允许 1024 层、程序化构建不限层，曾递归下钻
-     * 可耗尽线程栈（析构路径 Stack Overflow） */
-    size_t cap = 64, n = 0;
-    json_value **st = (json_value **)malloc(sizeof(json_value *) * cap);
-    if (!st) zan_host_oom();
+    /* 显式栈迭代释放：优先使用栈内小缓冲（浅树/OOM 清理路径零堆分配），
+     * 超出后再切堆缓冲防深树爆栈 */
+    json_value *inline_st[64];
+    size_t cap = sizeof(inline_st) / sizeof(inline_st[0]), n = 0;
+    json_value **st = inline_st;
     st[n++] = v;
     while (n) {
         json_value *cur = st[--n];
@@ -201,14 +207,14 @@ void json_free(json_value *v) {
             break;
         case JSON_ARR:
             for (int i = 0; i < cur->as.arr.count; i++)
-                jfree_push(&st, &cap, &n, cur->as.arr.items[i]);
+                jfree_push(&st, &cap, &n, cur->as.arr.items[i], inline_st);
             free(cur->as.arr.items);
             break;
         case JSON_OBJ:
             for (int i = 0; i < cur->as.obj.count; i++)
                 free(cur->as.obj.keys[i]);
             for (int i = 0; i < cur->as.obj.count; i++)
-                jfree_push(&st, &cap, &n, cur->as.obj.vals[i]);
+                jfree_push(&st, &cap, &n, cur->as.obj.vals[i], inline_st);
             free(cur->as.obj.keys);
             free(cur->as.obj.vals);
             free(cur->as.obj.index);
@@ -218,7 +224,7 @@ void json_free(json_value *v) {
         }
         free(cur);
     }
-    free(st);
+    if (st != inline_st) free(st);
 }
 
 /* accessors */

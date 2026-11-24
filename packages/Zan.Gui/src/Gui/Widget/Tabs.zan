@@ -21,8 +21,12 @@ public partial class Tabs : Control {
     private int closedIndex;
     public Control navStrip;
     public Control contentBox;
+
+    [Event(Alias = "Change")]
     public UiEvent TabChanged;
+    [Event]
     public UiEvent TabClosed;
+    [Event]
     public UiEvent TabAdded;
     public static int Line() { return 0; }
     public static int Card() { return 1; }
@@ -101,7 +105,7 @@ public partial class Tabs : Control {
         if (idx != ActiveIndex.Get() && idx >= 0 && (tabs.Count == 0 || idx < tabs.Count)) {
             ActiveIndex.Set(idx);
             this.BuildTree();
-            TabChanged.RaiseS(this);
+            TabChanged.Raise(this);
         }
     }
     public void SetActive(int idx) { this.Select(idx); }
@@ -212,7 +216,7 @@ public partial class Tabs : Control {
     private void EmitClosed(int idx) {
         int previous = closedIndex;
         closedIndex = idx;
-        try { TabClosed.RaiseS(this); }
+        try { TabClosed.Raise(this); }
         finally { closedIndex = previous; }
     }
     public void CloseTab(int idx) {
@@ -223,7 +227,9 @@ public partial class Tabs : Control {
             if (idx < pages.Count) { this.DropPage(idx); }
             this.ReindexClosed(idx);
             this.BuildTree();
-            if (ActiveIndex.Get() != before || idx == before) { TabChanged.RaiseS(this); }
+            if (ActiveIndex.Get() != before || idx == before) {
+                TabChanged.Raise(this);
+            }
         }
         this.EmitClosed(idx);
     }
@@ -263,10 +269,24 @@ public partial class Tabs : Control {
         this.BuildTree();
         TabItem afterItem = null;
         if (ActiveIndex.Get() >= 0 && ActiveIndex.Get() < tabs.Count) { afterItem = tabs[ActiveIndex.Get()]; }
-        if (ActiveIndex.Get() != before || afterItem != beforeItem) { TabChanged.RaiseS(this); }
+        // A removed active tab can be replaced at the same numeric index.
+        if (ActiveIndex.Get() != before || afterItem != beforeItem) {
+            TabChanged.Raise(this);
+        }
     }
-    public void TriggerAdd() { TabAdded.RaiseS(this); }
-    public int ClosedIndex() { return closedIndex; }
+
+    // 新增按钮意图（宿主自己把新页插到当前末尾）。
+    public void TriggerAdd() {
+        TabAdded.Raise(this);
+    }
+
+    // TabClosed 回调内读取：本次回调对应的被关页签下标。
+    public int ClosedIndex() {
+        return closedIndex;
+    }
+
+    // 右键命中的页签下标，消费后清零；这是右键菜单取数，不是事件
+    // 之外的重复输出。
     public int TakeContext() {
         int c = ctxIndex;
         ctxIndex = 0 - 1;
@@ -447,87 +467,52 @@ public partial class Tabs : Control {
         if (extraSlot != null) { copy.extraSlot = clone(extraSlot); }
         copy.BuildTree();
     }
-    public override string Kind() { return "Tabs"; }
     public override Binding<string> SizeOf() { return Size; }
     public override string EffectiveClass() { return this.SizeClassIn(Class); }
     public override void OnMeasure(App app) {
         this.SyncBinding();
         base.OnMeasure(app);
     }
-    public override List<string> Events() {
-        List<string> events = Control.CommonEvents();
-        events.Add("TabChanged");
-        events.Add("Change");
-        events.Add("Select");
-        events.Add("TabClosed");
-        events.Add("TabAdded");
-        return events;
+
+    // 标签样式（line/card/segment，或 0/1/2）；非法值忽略。
+    public string TabStyleText() { return style == 1 ? "card" : (style == 2 ? "segment" : "line"); }
+    public void SetTabStyleText(string val) {
+        if (val == "line" || val == "0") { style = 0; }
+        else if (val == "card" || val == "1") { style = 1; }
+        else if (val == "segment" || val == "2") { style = 2; }
     }
-    public override void BindEvent(string evt, Action handler) {
-        if (evt == "TabChanged" || evt == "Change" || evt == "Select") { TabChanged.Add(handler); return; }
-        if (evt == "TabClosed") { TabClosed.Add(handler); return; }
-        if (evt == "TabAdded") { TabAdded.Add(handler); return; }
-        base.BindEvent(evt, handler);
+
+    // 方向（horizontal/vertical，或 0/1）；非法值忽略。
+    public string OrientText() { return orient == 1 ? "vertical" : "horizontal"; }
+    public void SetOrientText(string val) {
+        if (val == "horizontal" || val == "0") { orient = 0; }
+        else if (val == "vertical" || val == "1") { orient = 1; }
+        else { return; }
+        this.SetClassIn("row col", orient == 1 ? "row" : "col");
     }
-    public override void BindEventS(string evt, ControlEvent handler) {
-        if (evt == "TabChanged" || evt == "Change" || evt == "Select") { TabChanged.AddS(handler); return; }
-        if (evt == "TabClosed") { TabClosed.AddS(handler); return; }
-        if (evt == "TabAdded") { TabAdded.AddS(handler); return; }
-        base.BindEventS(evt, handler);
+
+    // 标签集合 / 样式 / 方向 / 加号 / 可关闭经属性协议写入后整体重建导航条。
+    protected override void OnPropertyChanged(PropSpec spec) {
+        this.BuildTree();
     }
     protected override List<PropSpec> DefineProps() {
         List<PropSpec> ps = new List<PropSpec>();
-        ps.Add(PropSpec.Text("options", "Tabs").ViaExtra());
+        ps.Add(PropSpec.Text("options", "Tabs").Accessor("OptionsText", "SetOptionsText"));
         PropSpec appearance = PropSpec.Enum("tabStyle", "Tab style", new List<string>());
         appearance.Option("line"); appearance.Option("card"); appearance.Option("segment");
-        ps.Add(appearance.ViaExtra());
+        ps.Add(appearance.Accessor("TabStyleText", "SetTabStyleText"));
         PropSpec orientation = PropSpec.Enum("orient", "Orientation", new List<string>());
         orientation.Option("horizontal"); orientation.Option("vertical");
-        ps.Add(orientation.ViaExtra());
-        ps.Add(PropSpec.Bool("showAdd", "Show add button").ViaExtra());
-        ps.Add(PropSpec.Bool("closable", "All closable").ViaExtra());
-        ps.Add(PropSpec.Int("active", "Active").DefaultBinding().Field("ActiveIndex", 1).Also("activeTab").Also("data").Also("value"));
+        ps.Add(orientation.Accessor("OrientText", "SetOrientText"));
+        ps.Add(PropSpec.Bool("showAdd", "Show add button").Field("showAdd"));
+        ps.Add(PropSpec.Bool("closable", "All closable").Field("closableAll"));
+        ps.Add(PropSpec.Int("active", "Active").DefaultBinding()
+            .Field("ActiveIndex").Setter("Select")
+            .Also("activeTab")
+            .Also("data")
+            .Also("value"));
         ps.Add(this.SizeProp());
         return ps;
     }
-    public override string GetExtra(string key) {
-        if (key == "options") { return this.OptionsText(); }
-        if (key == "tabStyle") { return style == 1 ? "card" : (style == 2 ? "segment" : "line"); }
-        if (key == "orient") { return orient == 1 ? "vertical" : "horizontal"; }
-        if (key == "showAdd") { return PropSpec.Flag(showAdd); }
-        if (key == "closable") { return PropSpec.Flag(closableAll); }
-        return base.GetExtra(key);
-    }
-    public override bool SetExtra(string key, string val) {
-        if (key == "options") { this.SetOptionsText(val); return true; }
-        if (key == "tabStyle" || key == "style") {
-            if (val == "line" || val == "0") { style = 0; }
-            else if (val == "card" || val == "1") { style = 1; }
-            else if (val == "segment" || val == "2") { style = 2; }
-            else { return false; }
-        } else if (key == "orient") {
-            if (val == "horizontal" || val == "0") { orient = 0; }
-            else if (val == "vertical" || val == "1") { orient = 1; }
-            else { return false; }
-            this.SetClassIn("row col", orient == 1 ? "row" : "col");
-        } else if (key == "showAdd") { showAdd = PropSpec.IsOn(val); }
-        else if (key == "closable") { closableAll = PropSpec.IsOn(val); }
-        else { return base.SetExtra(key, val); }
-        this.BuildTree();
-        return true;
-    }
-    public override string GetProp(string key) {
-        if (key == "active" || key == "activeTab" || key == "data" || key == "value") {
-            return Convert.ToString(ActiveIndex.Get());
-        }
-        return base.GetProp(key);
-    }
-    public override void SetProp(string key, string val) {
-        if (key == "style" && this.SetExtra(key, val)) { this.Invalidate(); return; }
-        if (key == "active" || key == "activeTab" || key == "data" || key == "value") {
-            this.Select(Convert.ToInt32(val));
-            return;
-        }
-        base.SetProp(key, val);
-    }
+
 }

@@ -1,0 +1,54 @@
+using System;
+
+// An extern returning `string` may hand back a C pointer that sits at the very
+// start of a page whose preceding page is not readable (a big calloc in its own
+// mapping, an mmap'd region, ...). Generated code must not probe the Zan
+// header words in front of such a foreign pointer ([p-8] string tag, [p-16] /
+// [p-24] object/array header) -- doing so faulted with SIGBUS/SIGSEGV.
+// Build that layout directly: two anonymous pages, first one PROT_NONE, text
+// at the start of the second, then get the pointer back through strchr.
+class Program {
+    [DllImport("crt")] static extern long mmap(long addr, long len, int prot, int flags, int fd, long off);
+    [DllImport("crt")] static extern int mprotect(long addr, long len, int prot);
+    [DllImport("crt")] static extern int munmap(long addr, long len);
+    [DllImport("crt")] static extern long memcpy(long dst, string src, long n);
+    [DllImport("crt")] static extern string strchr(long s, int c);
+    [DllImport("crt")] static extern long getpagesize();
+    [DllImport("crt")] static extern long strlen(string s);
+
+    static int Count(string s, int c) {
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) { if (s[i] == c) { n = n + 1; } }
+        return n;
+    }
+
+    static void Main() {
+        long page = Program.getpagesize();
+        // PROT_READ|PROT_WRITE = 3; MAP_PRIVATE = 2; MAP_ANON = 0x1000 (Apple/BSD) or 0x20 (Linux)
+        #if MACOS
+        int anon = 4096;
+        #else
+        int anon = 32;
+        #endif
+        long region = Program.mmap(0, page * 2, 3, 2 | anon, -1, 0);
+        if (region == -1 || region == 0) { Console.WriteLine("FAIL mmap"); return; }
+        if (Program.mprotect(region, page, 0) != 0) { Console.WriteLine("FAIL mprotect"); return; }
+        long text = region + page;
+        Program.memcpy(text, "hello page start", 17);
+
+        string s = Program.strchr(text, 104);
+        Console.WriteLine(s.Length);
+        Console.WriteLine(s == "hello page start");
+        string t = s + "!";
+        Console.WriteLine(t);
+        Console.WriteLine(s[0] == 104);
+        // string arg to an extern: the call invalidates the arg's length cache
+        Console.WriteLine(Program.strlen(s));
+        Console.WriteLine(Program.Count(s, 101));
+        string kept = s;
+        Console.WriteLine(kept.Length + t.Length);
+
+        Program.munmap(region, page * 2);
+        Console.WriteLine("done");
+    }
+}
