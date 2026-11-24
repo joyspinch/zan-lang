@@ -510,7 +510,7 @@ static PI_UNUSED void pi_meta_cache_path(uint64_t key, char *out,
 }
 
 #define PI_META_MAGIC UINT32_C(0x5a504d32)
-#define PI_META_VERSION UINT32_C(3)
+#define PI_META_VERSION UINT32_C(5)
 #define PI_META_MAX_NAMES 100000u
 
 static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
@@ -671,11 +671,22 @@ static void pi_scan_file(pi_file_t *f) {
         zan_token_t next = zan_lexer_peek(&lex);
         if (next.kind == TK_IDENT) {
           tok = zan_lexer_next(&lex);
-          if (tok.str_val.len >= 10 &&
+          /* A *Controller / *Dao name alone does not make an MVC controller:
+           * main_synth (zd_class_is_controller) decides by the base chain.
+           * Without a base list the class is plain (Gui's ChartController,
+           * Game's FpsController3D) and treating it as always-live dragged its
+           * whole package into every program that reached the folder -- every
+           * Gui app compiled Zan.Gui.Charts. A direct `: XxxController` base
+           * is caught in TK_IDENT below; the name suffix still covers deeper
+           * chains (class FooController : MyBase) when a base list or generic
+           * parameter list follows. */
+          zan_token_kind_t after = zan_lexer_peek(&lex).kind;
+          int has_bases = after == TK_COLON || after == TK_LESS;
+          if (has_bases && tok.str_val.len >= 10 &&
               memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) {
             f->has_controller = 1;
           }
-          if (tok.str_val.len >= 3 &&
+          if (has_bases && tok.str_val.len >= 3 &&
               memcmp(tok.str_val.str + tok.str_val.len - 3, "Dao", 3) == 0) {
             f->has_controller = 1;
           }

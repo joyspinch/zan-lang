@@ -367,8 +367,11 @@ static void pkg_store_canonical(const char *path, char *out, size_t cap) {
       *c = (char)(*c - 'A' + 'a');
   }
 #else
-  if (!realpath(path, out))
-    snprintf(out, cap, "%s", path);
+  /* out 可能小于 PATH_MAX（调用方给 1024）；glibc 加固下 realpath 直写
+   * 小缓冲会 abort，故让它自行分配再拷贝。 */
+  char *rp = realpath(path, NULL);
+  snprintf(out, cap, "%s", rp ? rp : path);
+  free(rp);
 #endif
 }
 

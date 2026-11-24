@@ -130,60 +130,75 @@ int64_t zan_thread_current_id(void) {
 #endif
 }
 
-/* 生产级自适应 SyncTable：细粒度分桶锁 + 有界 SyncBlock 复用缓存
- * 彻底消除高频 lock(obj) 场景下 ref_count==0 反复 DeleteCriticalSection/free
- * 的抖动 */
+/* ---- 监视器锁：Zan `lock (obj) { ... }` ------------------------------------
+ * 对象没有可用的头部字段，监视状态放在按地址散列的 256 桶表里。每桶一把短临界区锁
+ * （Apple os_unfair_lock / Windows SRWLOCK / 其余 pthread 互斥锁），只守护链表与块内
+ * owner/recursion/waiters；临界区内无系统调用，空闲链命中时也无分配。
+ *
+ * 无争用（瘦锁）：enter = 桶锁 + 查链 + 取块（优先本桶空闲链）+ 记 owner/递归计数；
+ *   exit = 桶锁 + 递归计数归零 + 块回空闲链。没有 malloc/free，没有递归互斥锁初始化，
+ *   重入只是计数加一。
+ * 争用：后来者先登记 waiters（块因此不会被回收），放开桶锁短暂自旋观察 owner，仍被占
+ *   就在块自带的 mutex+cond 上停泊；唤醒代数 wake_seq 防丢失唤醒（桶锁与停泊锁双持才
+ *   写，持其一即可读）。持有者 exit 时若 waiters>0，在桶锁内推进代数并 signal——锁序
+ *   恒为 桶锁 → 停泊锁，停泊方等待期间不持桶锁。允许插队（与常见互斥锁同为非公平）。
+ * 回收：owner 归零且 waiters==0 时块离链，进本桶空闲链（每桶至多 ZAN_SYNC_FREE_CAP 个），
+ *   超出即销毁释放。常驻块数 ≤ 在持/在争对象数 + 256×CAP，锁大量短命对象不增长；
+ *   块只在被持有或被等待期间挂链，对象释放后地址复用拿到的必是新块，无 UAF。 */
 #define ZAN_SYNC_BUCKETS 256
-#define ZAN_SYNC_FREE_CAP 16
+#define ZAN_SYNC_FREE_CAP 4
+#define ZAN_SYNC_SPIN 128
+
+#if defined(__APPLE__) && !defined(_WIN32)
+#include <os/lock.h>
+#endif
+
+#ifdef _WIN32
+typedef SRWLOCK zan_mon_lock_t;
+#define zan_mon_lock(l) AcquireSRWLockExclusive(l)
+#define zan_mon_unlock(l) ReleaseSRWLockExclusive(l)
+#elif defined(__APPLE__)
+typedef os_unfair_lock zan_mon_lock_t;
+#define zan_mon_lock(l) os_unfair_lock_lock(l)
+#define zan_mon_unlock(l) os_unfair_lock_unlock(l)
+#else
+typedef pthread_mutex_t zan_mon_lock_t;
+#define zan_mon_lock(l) pthread_mutex_lock(l)
+#define zan_mon_unlock(l) pthread_mutex_unlock(l)
+#endif
 
 typedef struct zan_sync_block {
-  void *obj;
-  int32_t ref_count;
+    void *obj;
+    struct zan_sync_block *next;
+    uintptr_t owner;     /* 0 = 无主；桶锁内写，自旋期无锁原子读 */
+    uint32_t recursion;  /* 桶锁内读写 */
+    uint32_t waiters;    /* 自旋/停泊中的线程数，桶锁内维护；>0 时块不离链 */
+    uint32_t wake_seq;   /* 唤醒代数：桶锁 + 停泊锁双持写 */
 #ifdef _WIN32
-  CRITICAL_SECTION cs;
+    SRWLOCK park_lock;
+    CONDITION_VARIABLE park_cv;
 #else
-  pthread_mutex_t mx;
+    pthread_mutex_t park_mx;
+    pthread_cond_t park_cv;
 #endif
-  struct zan_sync_block *next;
 } zan_sync_block_t;
 
 typedef struct {
-#ifdef _WIN32
-  CRITICAL_SECTION bucket_cs;
-#else
-  pthread_mutex_t bucket_mx;
-#endif
-  zan_sync_block_t *head;
-  zan_sync_block_t *free_sb;
-  int free_count;
+    _Alignas(64) zan_mon_lock_t lock; /* 每桶独占缓存行，免相邻桶伪共享 */
+    zan_sync_block_t *head;           /* 被持有/被等待的块 */
+    zan_sync_block_t *free_list;      /* 回收待复用的块（停泊原语保持已初始化） */
+    uint32_t free_count;
 } zan_sync_bucket_t;
 
+/* SRWLOCK_INIT 与 OS_UNFAIR_LOCK_INIT 均为全零，静态零初始化即就绪 */
+#if defined(_WIN32) || defined(__APPLE__)
 static zan_sync_bucket_t g_sync_buckets[ZAN_SYNC_BUCKETS];
-#ifdef _WIN32
-static INIT_ONCE g_sync_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK zan_sync_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-  (void)once;
-  (void)param;
-  (void)ctx;
-  for (unsigned i = 0; i < ZAN_SYNC_BUCKETS; i++) {
-    InitializeCriticalSectionAndSpinCount(&g_sync_buckets[i].bucket_cs, 4000);
-    g_sync_buckets[i].head = NULL;
-    g_sync_buckets[i].free_sb = NULL;
-    g_sync_buckets[i].free_count = 0;
-  }
-  return TRUE;
-}
 #else
-static pthread_once_t g_sync_once = PTHREAD_ONCE_INIT;
-static void zan_sync_init(void) {
-  for (unsigned i = 0; i < ZAN_SYNC_BUCKETS; i++) {
-    pthread_mutex_init(&g_sync_buckets[i].bucket_mx, NULL);
-    g_sync_buckets[i].head = NULL;
-    g_sync_buckets[i].free_sb = NULL;
-    g_sync_buckets[i].free_count = 0;
-  }
-}
+static zan_sync_bucket_t g_sync_buckets[ZAN_SYNC_BUCKETS] = {
+    [0 ... ZAN_SYNC_BUCKETS - 1] = { PTHREAD_MUTEX_INITIALIZER, NULL, NULL, 0 }
+};
 #endif
+static int64_t g_sync_blocks_allocated; /* 仅冷路径（分配/释放块）原子增减 */
 
 static inline unsigned zan_sync_bucket_idx(void *obj) {
   uintptr_t bits = (uintptr_t)obj;
@@ -192,151 +207,216 @@ static inline unsigned zan_sync_bucket_idx(void *obj) {
   return (unsigned)((bits >> 4) & (ZAN_SYNC_BUCKETS - 1));
 }
 
-void zan_monitor_enter(void *obj) {
-  if (!obj)
-    return;
+static inline uintptr_t zan_mon_self(void) {
 #ifdef _WIN32
-  InitOnceExecuteOnce(&g_sync_once, zan_sync_init, NULL, NULL);
+    return (uintptr_t)GetCurrentThreadId(); /* 线程 ID 永不为 0 */
 #else
-  pthread_once(&g_sync_once, zan_sync_init);
-#endif
-  unsigned bidx = zan_sync_bucket_idx(obj);
-  zan_sync_bucket_t *bucket = &g_sync_buckets[bidx];
-
-#ifdef _WIN32
-  EnterCriticalSection(&bucket->bucket_cs);
-#else
-  pthread_mutex_lock(&bucket->bucket_mx);
-#endif
-
-  zan_sync_block_t *sb = bucket->head;
-  while (sb && sb->obj != obj) {
-    sb = sb->next;
-  }
-
-  if (!sb) {
-    if (bucket->free_sb) {
-      sb = bucket->free_sb;
-      bucket->free_sb = sb->next;
-      bucket->free_count--;
-      sb->obj = obj;
-      sb->ref_count = 0;
-    } else {
-      sb = (zan_sync_block_t *)ZAN_OOM_MALLOC("sync.monitor_block",
-                                              sizeof(zan_sync_block_t));
-      if (!sb) {
-#ifdef _WIN32
-        LeaveCriticalSection(&bucket->bucket_cs);
-#else
-        pthread_mutex_unlock(&bucket->bucket_mx);
-#endif
-        /* B-ID98：monitor 块分配失败即 fatal，不得未持锁裸奔回返回（对齐本文件
-         * TLS 路径口径） */
-        zan_rt_fatal("oom", "sync: monitor block alloc failed");
-      }
-      sb->obj = obj;
-      sb->ref_count = 0;
-#ifdef _WIN32
-      InitializeCriticalSectionAndSpinCount(&sb->cs, 4000);
-#else
-      pthread_mutexattr_t attr;
-      pthread_mutexattr_init(&attr);
-      pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-      pthread_mutex_init(&sb->mx, &attr);
-      pthread_mutexattr_destroy(&attr);
-#endif
-    }
-    sb->next = bucket->head;
-    bucket->head = sb;
-  }
-
-  sb->ref_count++;
-
-#ifdef _WIN32
-  LeaveCriticalSection(&bucket->bucket_cs);
-  EnterCriticalSection(&sb->cs);
-#else
-  pthread_mutex_unlock(&bucket->bucket_mx);
-  pthread_mutex_lock(&sb->mx);
+    return (uintptr_t)pthread_self();
 #endif
 }
 
-void zan_monitor_exit(void *obj) {
-  if (!obj)
-    return;
-  unsigned bidx = zan_sync_bucket_idx(obj);
-  zan_sync_bucket_t *bucket = &g_sync_buckets[bidx];
-
-  /* 必须先释放该对象内部持有的递归互斥锁，再进入桶锁更新引用计数并判定销毁，
-     彻底避免跨线程争用时提前在桶内销毁锁引发的释放 UAF 崩溃 */
+static inline uintptr_t zan_mon_owner(zan_sync_block_t *sb) {
 #ifdef _WIN32
-  EnterCriticalSection(&bucket->bucket_cs);
-  zan_sync_block_t **curr_p = &bucket->head;
-  zan_sync_block_t *sb = NULL;
-  while (*curr_p) {
-    if ((*curr_p)->obj == obj) {
-      sb = *curr_p;
-      break;
-    }
-    curr_p = &(*curr_p)->next;
-  }
-
-  if (!sb) {
-    LeaveCriticalSection(&bucket->bucket_cs);
-    return;
-  }
-
-  LeaveCriticalSection(&sb->cs);
-
-  sb->ref_count--;
-  if (sb->ref_count <= 0) {
-    *curr_p = sb->next;
-    sb->obj = NULL;
-    sb->ref_count = 0;
-    if (bucket->free_count < ZAN_SYNC_FREE_CAP) {
-      sb->next = bucket->free_sb;
-      bucket->free_sb = sb;
-      bucket->free_count++;
-    } else {
-      DeleteCriticalSection(&sb->cs);
-      free(sb);
-    }
-  }
-  LeaveCriticalSection(&bucket->bucket_cs);
+    return *(volatile uintptr_t *)&sb->owner; /* 对齐指针宽读单拷贝原子；自旋只作提示，桶锁内复核 */
 #else
-  pthread_mutex_lock(&bucket->bucket_mx);
-  zan_sync_block_t **curr_p = &bucket->head;
-  zan_sync_block_t *sb = NULL;
-  while (*curr_p) {
-    if ((*curr_p)->obj == obj) {
-      sb = *curr_p;
-      break;
+    return __atomic_load_n(&sb->owner, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline void zan_mon_set_owner(zan_sync_block_t *sb, uintptr_t v) {
+#ifdef _WIN32
+    *(volatile uintptr_t *)&sb->owner = v;
+#else
+    __atomic_store_n(&sb->owner, v, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline void zan_mon_relax(void) {
+#ifdef _WIN32
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+static void zan_mon_block_destroy(zan_sync_block_t *sb) {
+#ifndef _WIN32
+    pthread_cond_destroy(&sb->park_cv);
+    pthread_mutex_destroy(&sb->park_mx);
+#endif
+    free(sb);
+#ifdef _WIN32
+    InterlockedDecrement64((volatile LONG64 *)&g_sync_blocks_allocated);
+#else
+    __atomic_sub_fetch(&g_sync_blocks_allocated, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+/* 持桶锁调用：优先复用本桶空闲块，否则新分配（停泊原语只在此初始化一次）。 */
+static zan_sync_block_t *zan_mon_block_take(zan_sync_bucket_t *b) {
+    zan_sync_block_t *sb = b->free_list;
+    if (sb) {
+        b->free_list = sb->next;
+        b->free_count--;
+        return sb;
     }
-    curr_p = &(*curr_p)->next;
-  }
+    sb = (zan_sync_block_t *)ZAN_OOM_MALLOC("sync.monitor_block", sizeof(zan_sync_block_t));
+    if (!sb) return NULL;
+    sb->wake_seq = 0;
+#ifdef _WIN32
+    InitializeSRWLock(&sb->park_lock);
+    InitializeConditionVariable(&sb->park_cv);
+    InterlockedIncrement64((volatile LONG64 *)&g_sync_blocks_allocated);
+#else
+    pthread_mutex_init(&sb->park_mx, NULL);
+    pthread_cond_init(&sb->park_cv, NULL);
+    __atomic_add_fetch(&g_sync_blocks_allocated, 1, __ATOMIC_RELAXED);
+#endif
+    return sb;
+}
 
-  if (!sb) {
-    pthread_mutex_unlock(&bucket->bucket_mx);
-    return;
-  }
+void zan_monitor_enter(void *obj) {
+    if (!obj) return;
+    uintptr_t self = zan_mon_self();
+    zan_sync_bucket_t *b = &g_sync_buckets[zan_sync_bucket_idx(obj)];
 
-  pthread_mutex_unlock(&sb->mx);
+    zan_mon_lock(&b->lock);
+    zan_sync_block_t *sb = b->head;
+    while (sb && sb->obj != obj) sb = sb->next;
 
-  sb->ref_count--;
-  if (sb->ref_count <= 0) {
-    *curr_p = sb->next;
+    if (!sb) {
+        sb = zan_mon_block_take(b);
+        if (!sb) {
+            zan_mon_unlock(&b->lock);
+            /* B-ID98：monitor 块分配失败即 fatal，不得未持锁裸奔回返回（对齐本文件 TLS 路径口径） */
+            zan_rt_fatal("oom", "sync: monitor block alloc failed");
+        }
+        sb->obj = obj;
+        sb->recursion = 1;
+        sb->waiters = 0;
+        zan_mon_set_owner(sb, self);
+        sb->next = b->head;
+        b->head = sb;
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+
+    uintptr_t cur = zan_mon_owner(sb);
+    if (cur == self) {
+        sb->recursion++;
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+    if (cur == 0) {
+        zan_mon_set_owner(sb, self);
+        sb->recursion = 1;
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+
+    /* 争用：登记 waiters 钉住块，再放桶锁去自旋 / 停泊 */
+    sb->waiters++;
+    for (;;) {
+        uint32_t seen = sb->wake_seq;
+        zan_mon_unlock(&b->lock);
+
+        int freed = 0;
+        for (int i = 0; i < ZAN_SYNC_SPIN; i++) {
+            zan_mon_relax();
+            if (zan_mon_owner(sb) == 0) { freed = 1; break; }
+        }
+        if (!freed) {
+#ifdef _WIN32
+            AcquireSRWLockExclusive(&sb->park_lock);
+            while (sb->wake_seq == seen)
+                SleepConditionVariableSRW(&sb->park_cv, &sb->park_lock, INFINITE, 0);
+            ReleaseSRWLockExclusive(&sb->park_lock);
+#else
+            pthread_mutex_lock(&sb->park_mx);
+            while (sb->wake_seq == seen)
+                pthread_cond_wait(&sb->park_cv, &sb->park_mx);
+            pthread_mutex_unlock(&sb->park_mx);
+#endif
+        }
+
+        zan_mon_lock(&b->lock);
+        if (zan_mon_owner(sb) == 0) {
+            zan_mon_set_owner(sb, self);
+            sb->recursion = 1;
+            sb->waiters--;
+            zan_mon_unlock(&b->lock);
+            return;
+        }
+    }
+}
+
+void zan_monitor_exit(void *obj) {
+    if (!obj) return;
+    uintptr_t self = zan_mon_self();
+    zan_sync_bucket_t *b = &g_sync_buckets[zan_sync_bucket_idx(obj)];
+
+    zan_mon_lock(&b->lock);
+    zan_sync_block_t **pp = &b->head;
+    while (*pp && (*pp)->obj != obj) pp = &(*pp)->next;
+    zan_sync_block_t *sb = *pp;
+
+    /* 未持有（含非本线程持有）的 exit 静默忽略，绝不替别的线程放锁 */
+    if (!sb || zan_mon_owner(sb) != self) {
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+    if (--sb->recursion > 0) {
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+    zan_mon_set_owner(sb, 0);
+
+    if (sb->waiters > 0) {
+        /* 桶锁内唤醒：waiters>0 保证块不被回收；被唤醒者要先拿桶锁才能复核 */
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&sb->park_lock);
+        sb->wake_seq++;
+        WakeConditionVariable(&sb->park_cv);
+        ReleaseSRWLockExclusive(&sb->park_lock);
+#else
+        pthread_mutex_lock(&sb->park_mx);
+        sb->wake_seq++;
+        pthread_cond_signal(&sb->park_cv);
+        pthread_mutex_unlock(&sb->park_mx);
+#endif
+        zan_mon_unlock(&b->lock);
+        return;
+    }
+
+    *pp = sb->next;
     sb->obj = NULL;
-    sb->ref_count = 0;
-    if (bucket->free_count < ZAN_SYNC_FREE_CAP) {
-      sb->next = bucket->free_sb;
-      bucket->free_sb = sb;
-      bucket->free_count++;
-    } else {
-      pthread_mutex_destroy(&sb->mx);
-      free(sb);
+    if (b->free_count < ZAN_SYNC_FREE_CAP) {
+        sb->next = b->free_list;
+        b->free_list = sb;
+        b->free_count++;
+        sb = NULL;
     }
-  }
-  pthread_mutex_unlock(&bucket->bucket_mx);
+    zan_mon_unlock(&b->lock);
+    if (sb) zan_mon_block_destroy(sb); /* 已离链且无人等待，桶锁外销毁 */
+}
+
+/* 自检用：in_use = 挂链（被持有/被等待）块数，allocated = 已分配未释放块数（含空闲链）。 */
+void zan_monitor_debug_stats(int64_t *in_use, int64_t *allocated) {
+    int64_t used = 0;
+    for (unsigned i = 0; i < ZAN_SYNC_BUCKETS; i++) {
+        zan_sync_bucket_t *b = &g_sync_buckets[i];
+        zan_mon_lock(&b->lock);
+        for (zan_sync_block_t *sb = b->head; sb; sb = sb->next) used++;
+        zan_mon_unlock(&b->lock);
+    }
+    if (in_use) *in_use = used;
+#ifdef _WIN32
+    if (allocated) *allocated = (int64_t)InterlockedCompareExchange64(
+        (volatile LONG64 *)&g_sync_blocks_allocated, 0, 0);
+#else
+    if (allocated) *allocated = __atomic_load_n(&g_sync_blocks_allocated, __ATOMIC_RELAXED);
 #endif
 }
 

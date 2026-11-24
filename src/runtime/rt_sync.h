@@ -20,6 +20,8 @@ void __zan_eh_release(void);
 
 void zan_monitor_enter(void *obj);
 void zan_monitor_exit(void *obj);
+/* 自检用：挂链（被持有/被等待）监视块数与已分配未释放块数（含空闲复用链） */
+void zan_monitor_debug_stats(int64_t *in_use, int64_t *allocated);
 
 /* UI 线程派发队列：支持多线程投递闭包并在 UI 主线程消费执行 */
 void zan_dispatch_init(void);

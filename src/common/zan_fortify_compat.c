@@ -148,7 +148,7 @@ int __vsprintf_chk(char *s, int f, size_t sl, const char *fmt, va_list ap) {
     return r;
 }
 
-/* printf/fprintf 族没有 ds/sl 约束，直接转发（它们往 FILE*/stdout 输出，
+/* printf/fprintf 族没有 ds/sl 约束，直接转发（它们往 FILE 流或 stdout 输出，
  * 不存在栈缓冲区溢出问题）。 */
 int __printf_chk(int f, const char *fmt, ...) {
     va_list ap; int r; (void)f;

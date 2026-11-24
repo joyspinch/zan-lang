@@ -473,7 +473,7 @@ static void emit_eh_tsd_clear(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef k = LLVMBuildLoad2(g->builder, i64t, get_eh_tsd_key(g), "k.rel");
     LLVMSetOrdering(k, LLVMAtomicOrderingAcquire);
-    LLVMValueRef cur = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
     LLVMBasicBlockRef clr = LLVMAppendBasicBlockInContext(g->ctx, fn, "tsd.clr");
     LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(g->ctx, fn, "tsd.cont");
@@ -1030,4 +1030,86 @@ static unsigned eh_slot_shift(zan_irgen_t *g) {
 
 static unsigned eh_tmp_shift(zan_irgen_t *g) {
   return eh_bare_target(g) ? 6 : ZAN_EH_TMP_SHIFT;
+}
+/* ---- Outlined runtime-guard raise --------------------------------------
+ * Every runtime check (index/null/cast/overflow) used to expand its failure
+ * path inline: test eh.top, build the 24-byte exception object, publish it
+ * to the EH state, __cxa_allocate_exception + invoke __cxa_throw, plus the
+ * soft-report fallback -- ~20 instructions in 4 blocks per site. The
+ * self-hosted compiler alone has ~18k such sites (about a fifth of its
+ * IR), which LLVM then optimised and codegen'd one by one. One cold helper
+ * per module does all of it; the site is a single call/invoke. Semantics
+ * are unchanged: inside a try (eh.top >= 0) it throws through the caller's
+ * landing pad (the site invokes it), otherwise it reports and returns. */
+LLVMValueRef zan_eh_state_ptr(zan_irgen_t *g) { return emit_eh_state(g); }
+
+LLVMValueRef zan_eh_guard_raise_fn(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_guard_raise");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef params[] = {i8ptr, i8ptr, i8ptr, i8ptr, i8ptr, i32t, i32t, i8ptr};
+    fn = LLVMAddFunction(g->mod, "__zan_guard_raise", LLVMFunctionType(voidt, params, 8, 0));
+    LLVMSetLinkage(fn, LLVMInternalLinkage);
+    add_enum_attr(g, fn, NULL, "noinline");
+    add_enum_attr(g, fn, NULL, "cold");
+
+    zan_builder_point_t pt = zan_builder_save(g);
+    if (g->emit_debug) LLVMSetCurrentDebugLocation2(g->builder, NULL);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef thr = LLVMAppendBasicBlockInContext(g->ctx, fn, "throw");
+    LLVMBasicBlockRef soft = LLVMAppendBasicBlockInContext(g->ctx, fn, "soft");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMTypeRef st_ty = get_eh_state_ty(g);
+    LLVMValueRef st =
+        LLVMBuildBitCast(g->builder, LLVMGetParam(fn, 0), LLVMPointerType(st_ty, 0), "st");
+    LLVMValueRef top = LLVMBuildLoad2(
+        g->builder, i32t, LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_TOP, "topp"), "top");
+    LLVMBuildCondBr(g->builder,
+                    zan_icmp(g->builder, LLVMIntSGE, top, LLVMConstInt(i32t, 0, 0), "intry"), thr,
+                    soft);
+
+    LLVMPositionBuilderAtEnd(g->builder, thr);
+    LLVMTypeRef alloc_ty = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64t, i64t, i8ptr}, 3, 0);
+    LLVMValueRef raw =
+        zan_call2(g->builder, alloc_ty, g->rt_alloc,
+                  (LLVMValueRef[]){LLVMConstInt(i64t, 24, 0), LLVMConstInt(i64t, 0, 0),
+                                   zan_irgen_intern_string(g, "runtime_exception")},
+                  3, "exc");
+    LLVMValueRef slots = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i8ptr, 0), "slots");
+    LLVMValueRef vals[3] = {LLVMGetParam(fn, 1), LLVMGetParam(fn, 2), LLVMConstNull(i8ptr)};
+    for (unsigned i = 0; i < 3; i++)
+        LLVMBuildStore(g->builder, vals[i],
+                       LLVMBuildGEP2(g->builder, i8ptr, slots,
+                                     (LLVMValueRef[]){LLVMConstInt(i64t, i, 0)}, 1, "slot"));
+    LLVMBuildStore(g->builder, raw, LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_EXC, "excp"));
+    LLVMBuildStore(g->builder, LLVMConstInt(i32t, 1, 0),
+                   LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_EXC_OWNED, "ownp"));
+    LLVMBuildStore(g->builder, LLVMGetParam(fn, 3),
+                   LLVMBuildStructGEP2(g->builder, st_ty, st, EH_F_EXC_TID, "tidp"));
+    LLVMTypeRef cxa_alloc_ty = LLVMFunctionType(i8ptr, &i64t, 1, 0);
+    LLVMValueRef cxa_alloc = LLVMGetNamedFunction(g->mod, "__cxa_allocate_exception");
+    if (!cxa_alloc) cxa_alloc = LLVMAddFunction(g->mod, "__cxa_allocate_exception", cxa_alloc_ty);
+    LLVMTypeRef throw_ty = LLVMFunctionType(voidt, (LLVMTypeRef[]){i8ptr, i8ptr, i8ptr}, 3, 0);
+    LLVMValueRef cxa_throw = LLVMGetNamedFunction(g->mod, "__cxa_throw");
+    if (!cxa_throw) cxa_throw = LLVMAddFunction(g->mod, "__cxa_throw", throw_ty);
+    LLVMValueRef mem = zan_call2(g->builder, cxa_alloc_ty, cxa_alloc,
+                                 (LLVMValueRef[]){LLVMConstInt(i64t, 8, 0)}, 1, "mem");
+    zan_call2(g->builder, throw_ty, cxa_throw,
+              (LLVMValueRef[]){mem, LLVMConstNull(i8ptr), LLVMConstNull(i8ptr)}, 3, "");
+    LLVMBuildUnreachable(g->builder);
+
+    LLVMPositionBuilderAtEnd(g->builder, soft);
+    LLVMTypeRef fail_ty = LLVMFunctionType(voidt, (LLVMTypeRef[]){i8ptr, i32t, i32t, i8ptr}, 4, 0);
+    LLVMValueRef fail_fn = LLVMGetNamedFunction(g->mod, "zan_rt_guard_fail3");
+    if (!fail_fn) fail_fn = LLVMAddFunction(g->mod, "zan_rt_guard_fail3", fail_ty);
+    zan_call2(g->builder, fail_ty, fail_fn,
+              (LLVMValueRef[]){LLVMGetParam(fn, 4), LLVMGetParam(fn, 5), LLVMGetParam(fn, 6),
+                               LLVMGetParam(fn, 7)},
+              4, "");
+    LLVMBuildRetVoid(g->builder);
+    zan_builder_restore(g, pt);
+    return fn;
 }

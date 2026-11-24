@@ -857,8 +857,19 @@ int main(int argc, char **argv) {
     argv = utf8_argv;
 #endif
   {
-    const char *cl[] = {"zanc", "--wasm-enable-eh", NULL};
-    LLVMParseCommandLineOptions(2, cl, "");
+    /* ZAN_LLVM_ARGS：空格分隔的额外 LLVM 选项（如 "-time-passes"），
+     * 编译器自身性能诊断用。 */
+    const char *cl[34] = {"zanc", "--wasm-enable-eh"};
+    int ncl = 2;
+    static char extra[1024];
+    const char *env = getenv("ZAN_LLVM_ARGS");
+    if (env && env[0]) {
+      snprintf(extra, sizeof(extra), "%s", env);
+      for (char *t = strtok(extra, " "); t && ncl < 33; t = strtok(NULL, " "))
+        cl[ncl++] = t;
+    }
+    cl[ncl] = NULL;
+    LLVMParseCommandLineOptions(ncl, cl, "");
   }
   expand_arg_files(&argc, &argv);
   if (argc > 1 && strcmp(argv[1], "--compile-ir") == 0)

@@ -73,6 +73,12 @@ env:
   LUA_URL: 'https://www.lua.org/ftp/lua-5.4.6.tar.gz'
   LUA_DIR: 'lua-5.4.6'
 
+
+# 会回提交二进制，不中途取消；同组最多一个运行 + 一个等待，新的等待替换旧的。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # ---------------------------------------------------------------- Linux ----
   linux:
@@ -136,7 +142,7 @@ jobs:
           curl -fsSL -o lua.tar.gz "$LUA_URL"
           sh scripts/verify_dep.sh lua.tar.gz
           tar xzf lua.tar.gz
-          DEST="packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}"
+          DEST="packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}"
           mkdir -p "$DEST"
           cc -O2 -fPIC -shared -Wl,-soname,liblua5.4.so \
             -DLUA_USE_LINUX \
@@ -166,7 +172,7 @@ jobs:
           path: |
             packages/Zan.Data/src/System/Data/Sqlite/drivers/${{ matrix.target }}/
             packages/Zan.Data/src/System/Data/Postgres/drivers/${{ matrix.target }}/
-            packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
+            packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}/
             packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
             packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
             packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
@@ -178,8 +184,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: macos-arm64, runner: macos-14 }
-          - { target: macos-x64,   runner: macos-13 }
+          - { target: macos-arm64, runner: macos-15 }
+          # macos-13 and macos-14 are retired: macos-13 jobs queue forever and
+          # macos-14 jobs are cancelled at once ("configuration not supported"),
+          # so the write-back never ran. macos-15 / macos-15-intel are current.
+          - { target: macos-x64,   runner: macos-15-intel }
     runs-on: ${{ matrix.runner }}
     # Only this job needs to write back the refreshed GUI dylibs to main.
     # Elevate just here (top-level is contents: read) and gate the auto-push
@@ -222,7 +231,7 @@ jobs:
           curl -fsSL -o lua.tar.gz "$LUA_URL"
           sh scripts/verify_dep.sh lua.tar.gz
           tar xzf lua.tar.gz
-          DEST="packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}"
+          DEST="packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}"
           mkdir -p "$DEST"
           xcrun clang -O2 -fPIC -dynamiclib -install_name @rpath/liblua5.4.dylib \
             -DLUA_USE_MACOSX \
@@ -269,13 +278,15 @@ jobs:
             packages/Zan.Desktop/src/System/Media/drivers/macos-x64/
             packages/Zan.Game/src/Game/Graphics/drivers/macos-x64/
 
+      # Runs on main for push and workflow_dispatch alike, so a manual run
+      # can unstick a stale committed driver without a dummy commit.
       # Refresh the committed dylibs. A cross link reads them straight out of
       # the working tree, so a GUI runtime change that is not mirrored here
       # fails every `--target macos-*` publish with undefined symbols -- which
       # is exactly what a developer on Windows sees, days later.
       - name: Commit refreshed macOS GUI drivers
         if: >-
-          matrix.target == 'macos-arm64' && github.event_name == 'push'
+          matrix.target == 'macos-arm64' && github.event_name != 'pull_request'
           && github.ref == 'refs/heads/main'
         run: |
           set -eux
@@ -307,7 +318,7 @@ jobs:
             packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
             packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/
             packages/Zan.Game/src/Game/Graphics/drivers/${{ matrix.target }}/
-            packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
+            packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}/
 
   # -------------------------------------------------------------- Windows ----
   windows:
@@ -435,7 +446,7 @@ jobs:
       # PowerShell, not the job's msys2 shell: the MSYS2 environments here ship
       # no git, so the runner's own git has to do the commit.
       - name: Commit refreshed Windows runtime objects
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -507,7 +518,7 @@ jobs:
           # Same bytes as the POSIX runners' lua.tar.gz; tar handles it
           # regardless of the .zip name (unzip would reject the gzip).
           tar -xzf lua.zip
-          DEST="packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}"
+          DEST="packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}"
           mkdir -p "$DEST"
           # MSVC target + dynamic CRT import libs. A statically linked CRT
           # (libcmt/libucrt) crashes luaL_newstate in non-MSVC hosts (the
@@ -541,7 +552,7 @@ jobs:
               -D_CRT_SECURE_NO_WARNINGS -c "$LUA_DIR/src/$f.c" -o "luaobj/$f.obj"
           done
           "$LLVM/lld-link.exe" -dll -noentry -machine:$MACHINE \
-            -def:packages/Zan.Scripting/src/System/Scripting/lua54.def luaobj/*.obj \
+            -def:packages/Zan.Scripting/src/Scripting/Lua/lua54.def luaobj/*.obj \
             "$MSVC/lib/$LIBARCH/msvcrt.lib" "$MSVC/lib/$LIBARCH/vcruntime.lib" \
             "$SDK/ucrt/$LIBARCH/ucrt.lib" "$SDK/um/$LIBARCH/kernel32.Lib" \
             -out:"$DEST/lua54.dll"
@@ -555,7 +566,7 @@ jobs:
           path: |
             packages/Zan.Data/src/System/Data/Sqlite/drivers/${{ matrix.target }}/
             packages/Zan.Data/src/System/Data/Postgres/drivers/${{ matrix.target }}/
-            packages/Zan.Scripting/src/System/Scripting/drivers/${{ matrix.target }}/
+            packages/Zan.Scripting/src/Scripting/Lua/drivers/${{ matrix.target }}/
             packages/Zan.Gui/src/Gui/drivers/${{ matrix.target }}/
             packages/Zan.Drawing/src/System/Drawing/Imaging/drivers/${{ matrix.target }}/
             packages/Zan.Desktop/src/System/Media/drivers/${{ matrix.target }}/

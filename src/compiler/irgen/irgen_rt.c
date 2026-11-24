@@ -432,6 +432,38 @@ static void emit_raise_exception_impl(zan_irgen_t *g, bool include_cleanups) {
   LLVMBuildUnreachable(g->builder);
 }
 
+/* The landing pad emit_raise_exception_impl would invoke __cxa_throw into
+ * from the current position, or NULL when it would be a plain call. */
+LLVMBasicBlockRef zan_raise_unwind_dest(zan_irgen_t *g, bool include_cleanups) {
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
+    for (int i = g->lpad_depth - 1; i >= 0; i--) {
+        zan_lpad_entry_t *top = &g->lpad_stack[i];
+        if (top->fn != cur_fn) break;
+        if (top->lpad_bb && (include_cleanups || top->catch_bb)) {
+            ensure_function_personality(g, cur_fn);
+            return active_lpad(g, top);
+        }
+    }
+    return NULL;
+}
+
+/* Call a function that may throw on the raise path (it unwinds into the
+ * landing pad a raise from here would use) and continue at cont_bb when it
+ * returns. Terminates the current block. */
+void zan_emit_raise_call(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef *args, unsigned n,
+                         LLVMBasicBlockRef cont_bb, bool include_cleanups) {
+    LLVMTypeRef fty = LLVMGlobalGetValueType(fn);
+    LLVMBasicBlockRef lpad = zan_raise_unwind_dest(g, include_cleanups);
+    if (lpad) {
+        di_ensure_loc(g->builder);
+        LLVMBuildInvoke2(g->builder, fty, fn, args, n, cont_bb, lpad, "");
+    } else {
+        zan_call2(g->builder, fty, fn, args, n, "");
+        LLVMBuildBr(g->builder, cont_bb);
+    }
+}
+
 void emit_raise_exception(zan_irgen_t *g) {
   emit_raise_exception_impl(g, false);
 }

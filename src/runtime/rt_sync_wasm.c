@@ -109,6 +109,9 @@ i64 zan_atomic_int_add(i64 handle, i64 delta) {
 #endif
 }
 
+/* wasm32-wasi 单线程：zan_thread_start 就地同步执行委托，不存在第二个线程来争用，
+ * 递归/互斥语义平凡成立，监视器无需任何状态。将来启用 wasm 线程（wasi-threads）时
+ * 须换成 rt_sync_thread.c 的分桶瘦锁实现。 */
 void zan_monitor_enter(void *obj) { (void)obj; }
 void zan_monitor_exit(void *obj) { (void)obj; }
 

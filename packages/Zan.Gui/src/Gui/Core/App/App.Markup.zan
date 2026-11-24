@@ -15,6 +15,13 @@ public partial class App {
     }
     static CloneTreeFn CloneTree() { return GuiCoreState.Current().cloneTree; }
     static void SetCloneTree(CloneTreeFn fn) { GuiCoreState.Current().cloneTree = fn; }
+    static void SetCssScoper(CssScopeFn fn) { GuiCoreState.Current().cssScoper = fn; }
+    static string ScopeCss(string css, string scope) {
+        if (css == "") { return ""; }
+        CssScopeFn fn = GuiCoreState.Current().cssScoper;
+        if (fn != null) { return fn(css, scope); }
+        return css;
+    }
     static List<AppHookFn> PresentTails() { return GuiCoreState.Current().presentTails; }
     static void SetPresentTails(List<AppHookFn> tails) { GuiCoreState.Current().presentTails = tails; }
     static void AddPresentTail(AppHookFn fn) {
@@ -38,282 +45,7 @@ public partial class App {
             this.MarkScope(n.ChildAt(i), zs);
         }
     }
-    // 将壁纸快速拷贝到 [x,y,w,h]，居中裁剪覆盖，使图片
-    // 保持宽高比，然后淡入到下方皮肤背景中。
-    void RenderWallpaperImage(int x, int y, int w, int h) {
-        if (bgImagePath == "") { return; }
-        int iw = Canvas.ImageWidth(bgImagePath);
-        int ih = Canvas.ImageHeight(bgImagePath);
-        if (iw <= 0 || ih <= 0) { return; }
-        if (w <= 0 || h <= 0) { return; }
-        int sw = iw;
-        int sh = ih;
-        if (iw * h > w * ih) {
-            sw = w * ih / h;
-        } else {
-            sh = h * iw / w;
-        }
-        if (sw < 1) { sw = 1; }
-        if (sh < 1) { sh = 1; }
-        canvas.BlitImage(bgImagePath, x, y, w, h,
-                         (iw - sw) / 2, (ih - sh) / 2, sw, sh);
-        int fade = 100 - this.WallpaperOpacity();
-        if (fade > 0 && !this.SkinArtWallpaper()) {
-            StyleBox fadeStyle = Style.Part(this, "windowbg", "fade", "",
-                                            "", "", Style.SNormal());
-            int fadeBg = fadeStyle.BgOr(0);
-            int rgb = fadeBg % 16777216;
-            if (rgb < 0) { rgb = rgb + 16777216; }
-            canvas.FillRect(x, y, w, h, (fade * 255 / 100) * 16777216 + rgb);
-        }
-    }
-    void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
-        canvas.FillRadial(cx, cy, r, Theme.Rgb(cr, cg, cb), 150);
-    }
-    void BackdropDrift(int cx, int cy, int r, int color) {
-        int cr = (color / 65536) % 256;
-        int cg = (color / 256) % 256;
-        int cb = color % 256;
-        this.BackdropBlob(cx, cy, r, cr, cg, cb);
-    }
-    void BackdropGradientWallpaper(int ax, int ay, int aw, int ah) {
-        StyleBox primaryStyle = Style.Part(this, "windowbg", "blob", "",
-                                            "", "", Style.SNormal());
-        StyleBox infoStyle = Style.Part(this, "windowbg", "blob", "",
-                                        "info", "", Style.SNormal());
-        StyleBox successStyle = Style.Part(this, "windowbg", "blob", "",
-                                           "success", "", Style.SNormal());
-        StyleBox errorStyle = Style.Part(this, "windowbg", "blob", "",
-                                         "error", "", Style.SNormal());
-        int r = this.Scale(340);
-        this.BackdropDrift(ax + aw * 20 / 100, ay + ah * 24 / 100, r,
-                           primaryStyle.BgOr(0));
-        this.BackdropDrift(ax + aw * 74 / 100, ay + ah * 18 / 100, r,
-                           infoStyle.BgOr(0));
-        this.BackdropDrift(ax + aw * 82 / 100, ay + ah * 72 / 100, r,
-                           successStyle.BgOr(0));
-        this.BackdropDrift(ax + aw * 30 / 100, ay + ah * 84 / 100, r,
-                           errorStyle.BgOr(0));
-    }
-    void BackdropGlassWallpaper(int ax, int ay, int aw, int ah) {
-        this.BackdropBlob(ax + aw * 14 / 100, ay + ah * 20 / 100,
-            this.Scale(320), 128, 96, 245);
-        this.BackdropBlob(ax + aw * 40 / 100, ay + ah * 34 / 100,
-            this.Scale(300), 236, 120, 175);
-        this.BackdropBlob(ax + aw * 78 / 100, ay + ah * 16 / 100,
-            this.Scale(320), 96, 156, 255);
-        this.BackdropBlob(ax + aw * 62 / 100, ay + ah * 72 / 100,
-            this.Scale(340), 240, 112, 196);
-        this.BackdropBlob(ax + aw * 30 / 100, ay + ah * 86 / 100,
-            this.Scale(300), 96, 222, 208);
-        this.BackdropBlob(ax + aw * 90 / 100, ay + ah * 58 / 100,
-            this.Scale(280), 156, 120, 250);
-    }
-    WindowShapeDescription bgShapeSnapshot;
-    Theme bgShapeTheme;
-    string bgShapeSpec;
-    int bgShapeWidth;
-    int bgShapeHeight;
-    int bgShapeDpi;
-    int bgShapeMetrics;
-    int bgShapeRadius;
-    int bgShapeMode;
-    int bgShapeSlot;
-    int bgShapeGradient;
-    int bgShapeGradTop;
-    int bgShapeGradBottom;
-    int bgShapeGlass;
-    bool ShapeBackgroundMatches(int width, int height, int slot) {
-        if (bgShapeSnapshot == null || bgShapeTheme != theme
-        || bgShapeWidth != width || bgShapeHeight != height
-        || bgShapeDpi != dpiScale || bgShapeMetrics != metricsScale
-        || bgShapeRadius != shapeRadius || bgShapeMode != shapeMode
-        || bgShapeSlot != slot
-        || bgShapeSpec != shapeSpec
-        || bgShapeSnapshot.shadow != shapeShadow
-        || bgShapeSnapshot.offsetX != shapeOffX
-        || bgShapeSnapshot.offsetY != shapeOffY
-        || bgShapeGradient != theme.gradient
-        || bgShapeGradTop != theme.bgGradTop
-        || bgShapeGradBottom != theme.bgGradBottom
-        || bgShapeGlass != theme.glass) { return false; }
-        int count = shapeRegions == null ? 0 : shapeRegions.Count;
-        if (bgShapeSnapshot.regions.Count != count) { return false; }
-        for (int i = 0; i < count; i = i + 1) {
-            WindowShapeRegion a = bgShapeSnapshot.regions[i];
-            WindowShapeRegion b = shapeRegions[i];
-            if (a.kind != b.kind || a.x != b.x || a.y != b.y
-            || a.width != b.width || a.height != b.height
-            || a.radius != b.radius) { return false; }
-        }
-        return true;
-    }
-    void RememberShapeBackground(int width, int height, int slot) {
-        WindowShapeDescription snapshot = new WindowShapeDescription();
-        snapshot.shadow = shapeShadow;
-        snapshot.offsetX = shapeOffX;
-        snapshot.offsetY = shapeOffY;
-        if (shapeRegions != null) {
-            for (int i = 0; i < shapeRegions.Count; i = i + 1) {
-                snapshot.regions.Add(shapeRegions[i].Clone());
-            }
-        }
-        bgShapeSnapshot = snapshot;
-        bgShapeTheme = theme;
-        bgShapeSpec = shapeSpec;
-        bgShapeWidth = width;
-        bgShapeHeight = height;
-        bgShapeDpi = dpiScale;
-        bgShapeMetrics = metricsScale;
-        bgShapeRadius = shapeRadius;
-        bgShapeMode = shapeMode;
-        bgShapeSlot = slot;
-        bgShapeGradient = theme.gradient;
-        bgShapeGradTop = theme.bgGradTop;
-        bgShapeGradBottom = theme.bgGradBottom;
-        bgShapeGlass = theme.glass;
-        bgSnapGen = bgThemeGen;
-    }
-    void RenderBackground(int x, int y, int w, int h, int slot) {
-        Canvas c = canvas;
-        Theme t = theme;
-        if (shapeMode != 0) {
-            int width = c.Width();
-            int height = c.Height();
-            bool matches = this.ShapeBackgroundMatches(width, height, slot);
-            if (matches && bgSnapGen == bgThemeGen
-            && c.RestoreRect(0, 0, width, height, slot)) { return; }
-            bgSnapGen = 0;
-            if (shapeShadow > 0) { this.PaintShapeShadow(); }
-            this.PaintShapeFill();
-            if (!partialFrame) {
-                c.SnapshotRect(0, 0, width, height, slot);
-                this.RememberShapeBackground(width, height, slot);
-            }
-            return;
-        }
-        if (bgShapeSnapshot != null) {
-            bgShapeSnapshot = null;
-            bgShapeTheme = null;
-            bgSnapGen = 0;
-        }
-        if (glassNative) {
-            StyleBox sheenStyle = Style.Part(this, "windowbg", "sheen", "",
-                                             "", "", Style.SNormal());
-            int hi = sheenStyle.BgOr(0) % 16777216;
-            if (hi < 0) { hi = hi + 16777216; }
-            int bands = 18;
-            int bh = h / 3 / bands;
-            if (bh < 1) { bh = 1; }
-            for (int i = 0; i < bands; i = i + 1) {
-                int a = 15 - (15 * i / bands);
-                c.FillRect(x, y + i * bh, w, bh, a * 16777216 + hi);
-            }
-            return;
-        }
-        if (t.gradient != 0 || bgImagePath != "") {
-            bool restored = false;
-            if (bgSnapGen == bgThemeGen) { restored = c.RestoreRect(x, y, w, h, slot); }
-            if (!restored) {
-                bgSnapGen = 0;
-                c.PushClip(x, y, w, h);
-                try {
-                    if (t.gradient != 0) {
-                        c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
-                        if (t.glass != 0) {
-                            this.BackdropGlassWallpaper(x, y, w, h);
-                        } else {
-                            this.BackdropGradientWallpaper(x, y, w, h);
-                        }
-                    } else {
-                        StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
-                        Style.SNormal());
-                        c.FillRect(x, y, w, h, bgStyle.BgOr(0));
-                    }
-                    this.RenderWallpaperImage(x, y, w, h);
-                } finally { c.PopClip(); }
-                if (!partialFrame) {
-                    c.SnapshotRect(x, y, w, h, slot);
-                    bgSnapGen = bgThemeGen;
-                }
-            }
-        } else {
-            StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
-                                          Style.SNormal());
-            c.FillRect(x, y, w, h, bgStyle.BgOr(0));
-        }
-    }
-    void PaintShapeFill() {
-        if (shapeRegions == null || shapeRegions.Count == 0) { return; }
-        StyleBox shapeStyle = Style.Part(this, "windowbg", "shape", "",
-                                          "", "", Style.SNormal());
-        int col = shapeStyle.BgOr(0);
-        if (col == 0) {
-            StyleBox bgStyle = Style.Full(this, "windowbg", "", "",
-                                          Style.SNormal());
-            col = bgStyle.BgOr(0);
-        }
-        if (col == 0) {
-            StyleBox winStyle = Style.Part(this, "window", "base", "", "", "", Style.SNormal());
-            col = winStyle.BgOr(0);
-        }
-        int solidRegions = 0;
-        for (int i = 0; i < shapeRegions.Count; i = i + 1) {
-            if (shapeRegions[i].kind != 3) { solidRegions = solidRegions + 1; }
-        }
-        this.PaintShapeRegions(col, !partialFrame && shapeShadow == 0 && solidRegions == 1);
-    }
-    internal void PaintContentMask(int x, int y, int width, int height, int color) {
-        if (width <= 0 || height <= 0 || color == 0) { return; }
-        if (shapeMode == 0 || shapeRegions == null || shapeRegions.Count == 0) {
-            canvas.FillRect(x, y, width, height, color);
-            return;
-        }
-        canvas.PushClip(x, y, width, height);
-        try { this.PaintShapeRegions(color, false); }
-        finally { canvas.PopClip(); }
-    }
-    private void PaintShapeRegions(int col, bool initial) {
-        Canvas c = canvas;
-        for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
-            WindowShapeRegion reg = shapeRegions[ri];
-            if (reg.kind != 3) {
-                int x = this.Scale(reg.x);
-                int y = this.Scale(reg.y);
-                int w = this.Scale(reg.width);
-                int h = this.Scale(reg.height);
-                int r = this.Scale(reg.radius);
-                if (r < 0) { r = 0; }
-                if (w > 0 && h > 0) {
-                    if (reg.kind == 2) {
-                        this.FillEllipse(x, y, w, h, col);
-                    } else if (initial) {
-                        c.FillInitialShape(x, y, w, h, r, col);
-                    } else if (r > 0) {
-                        c.FillRoundRect(x, y, w, h, r, col);
-                    } else {
-                        c.FillRect(x, y, w, h, col);
-                    }
-                }
-            }
-        }
-    }
-    void FillEllipse(int x, int y, int w, int h, int col) {
-        if (w <= 0 || h <= 0) { return; }
-        Canvas c = canvas;
-        int rx = w / 2;
-        int ry = h / 2;
-        if (rx <= 0 || ry <= 0) { return; }
-        int cx = x + rx;
-        int cy = y + ry;
-        for (int dy = 0 - ry; dy <= ry; dy = dy + 1) {
-            int inside = ry * ry - dy * dy;
-            if (inside <= 0) { continue; }
-            int hw = rx * App.ISqrt(inside) / ry;
-            if (hw <= 0) { continue; }
-            c.FillRect(cx - hw, cy + dy, hw * 2, 1, col);
-        }
-    }
+    // 整数平方根（向下取整）。
     static int ISqrt(int v) {
         if (v <= 0) { return 0; }
         int r = 0;
@@ -331,33 +63,23 @@ public partial class App {
         }
         return r;
     }
-    void PaintShapeShadow() {
-        if (shapeRegions == null || shapeRegions.Count == 0 || shapeShadow <= 0) { return; }
-        Canvas c = canvas;
-        int blur = this.Scale(shapeShadow);
-        if (blur <= 0) { return; }
-        StyleBox shadowStyle = Style.Part(this, "windowbg", "shape-shadow",
-                                           "", "", "", Style.SNormal());
-        int baseCol = shadowStyle.BgOr(0);
-        if (baseCol == 0) { return; }
-        int peak = (baseCol >> 24) & 255;
-        if (peak < 80) { peak = 80; }
-        if (peak > 110) { peak = 110; }
-        int rgb = baseCol % 16777216;
-        if (rgb < 0) { rgb = rgb + 16777216; }
-        for (int ri = 0; ri < shapeRegions.Count; ri = ri + 1) {
-            WindowShapeRegion reg = shapeRegions[ri];
-            if (reg.kind == 3) { continue; }
-            int x = this.Scale(reg.x);
-            int y = this.Scale(reg.y);
-            int w = this.Scale(reg.width);
-            int h = this.Scale(reg.height);
-            int r = this.Scale(reg.radius);
-            if (r < 0) { r = 0; }
-            if (w <= 0 || h <= 0) { continue; }
-            c.ShadowRoundRect(x, y, w, h, r, blur * 2, (peak << 24) | rgb);
+    // 窗口背景绘制服务（首次使用时创建）。
+    private BackdropPainter backdropPainter;
+    public BackdropPainter Backdrop {
+        get {
+            if (backdropPainter == null) { backdropPainter = new BackdropPainter(this); }
+            return backdropPainter;
         }
     }
+
+    // 将当前皮肤的窗口背景绘制到 [x,y,w,h]（见 BackdropPainter.RenderBackground）。
+    public void RenderBackground(int x, int y, int w, int h, int slot) {
+        this.Backdrop.RenderBackground(x, y, w, h, slot);
+    }
+
+
+    // 当前生效的背景效果类型：设置了绘制器覆盖项则用覆盖项，
+    // 否则用皮肤自身的效果。0 = 无。
     int EffectiveFx() {
         if (fxKindOverride >= 0) { return fxKindOverride; }
         return theme.fx;
@@ -488,7 +210,7 @@ public partial class App {
         if (fullRepair) {
             window.PresentDirty(0, 0, cw, chh);
         } else {
-            this.MarkPresentDirty(fxTouched);
+            this.Damage.MarkPresentDirty(fxTouched);
         }
         if (App.PerfOn()) { perfFxPresentT0 = Window.GetTickUs(); }
         if (present) {

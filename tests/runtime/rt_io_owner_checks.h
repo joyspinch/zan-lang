@@ -2,7 +2,8 @@
  * Include once before rt_io.c, then with ZAN_OWNER_CHECKS_IMPLEMENTATION. */
 #ifndef ZAN_OWNER_CHECKS_IMPLEMENTATION
 static void owner_unlocked(void *lock);
-static void owner_woke(void);
+static void owner_wake_claimed(void);
+#define ZAN_CO_WAKE_CLAIMED() owner_wake_claimed()
 static void *owner_watched;
 static int owner_frees;
 static void owner_free(void *ptr) {
@@ -11,44 +12,26 @@ static void owner_free(void *ptr) {
   free(ptr);
 }
 #if defined(_WIN32)
-static BOOL WINAPI owner_post_completion(HANDLE port, DWORD bytes,
-                                         ULONG_PTR key, LPOVERLAPPED ov) {
-  BOOL ok = PostQueuedCompletionStatus(port, bytes, key, ov);
-  if (key == ((ULONG_PTR) - 3))
-    owner_woke();
-  return ok;
-}
 static void WINAPI owner_unlock(PSRWLOCK lock) {
   ReleaseSRWLockExclusive(lock);
   owner_unlocked(lock);
 }
 #define ReleaseSRWLockExclusive owner_unlock
-#define PostQueuedCompletionStatus owner_post_completion
 #else
-static int owner_is_wake_fd(int fd);
-static ssize_t owner_write(int fd, const void *buf, size_t n) {
-  ssize_t r = write(fd, buf, n);
-  if (owner_is_wake_fd(fd))
-    owner_woke();
-  return r;
-}
 static int owner_unlock(pthread_mutex_t *lock) {
   int result = pthread_mutex_unlock(lock);
   owner_unlocked(lock);
   return result;
 }
 #define pthread_mutex_unlock owner_unlock
-#define write owner_write
 #endif
 #define free owner_free
 #else
 #undef free
 #if defined(_WIN32)
 #undef ReleaseSRWLockExclusive
-#undef PostQueuedCompletionStatus
 #else
 #undef pthread_mutex_unlock
-#undef write
 #endif
 
 static zan_blocking_job_t *owner_job;
@@ -115,19 +98,7 @@ static void owner_batch_step(void *frame) {
     __atomic_fetch_or(&h->sched, CO_DEAD, __ATOMIC_RELEASE);
   }
 }
-#if !defined(_WIN32)
-static int owner_is_wake_fd(int fd) {
-  int n = (int)g_shards;
-  if (n < 1)
-    n = 1;
-  for (int i = 0; i < n; i++) {
-    if (fd >= 0 && fd == g_ioshard[i].wake_wfd)
-      return 1;
-  }
-  return 0;
-}
-#endif
-static void owner_woke(void) {
+static void owner_wake_claimed(void) {
   if (owner_stage == 2)
     owner_finish_at_barrier();
   if (!owner_batch)

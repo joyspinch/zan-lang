@@ -724,3 +724,45 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 - 实测接口调用循环 1580 ms → 179 ms；回归用例 arc_elem_receiver_borrow 钉住的
   五种危险形态（改写自身槽、调用、属性、重载运算符、有副作用实参）在
   --check-leaks --arc-guard 下都必须通过。
+
+## 32. 每个检查点的冷路径都内联展开会撑大全部 IR（2026-11-24 Mac arm64 实证）
+
+运行期检查（越界/空/强转/溢出）原先在每个检查点内联展开失败路径：读
+eh.top、构造 24 字节异常对象、写 EH 状态、`__cxa_allocate_exception` +
+`invoke __cxa_throw`、软失败上报——每点约 20 条指令 4 个块。自举编译器
+（4.6 万行）有约 1.8 万个这样的点，占 IR 约五分之一，LLVM 逐个优化、选指令。
+
+做法：模块内一个 `internal noinline cold` 的 `__zan_guard_raise(state, vt,
+msg, tid, file, line, col, msg2)`（`zan_eh_guard_raise_fn`），检查点只剩一条
+call/invoke（`zan_emit_raise_call` 按 `zan_raise_unwind_dest` 选 lpad，与
+`emit_raise_exception_impl` 同一规则；async 帧只认带 catch 的 lpad）。语义不变：
+try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内联 finally 的点
+（`finally_count>0`）与 wasm 仍走旧路径。
+
+实测：IR 指令 1.78M → 1.46M（−18%），基本块 −15%；-O0 7.7s → 6.5s；-O2 峰值
+内存 1171 → 917 MB。-O2 墙钟不变（67s）——`ZAN_LLVM_ARGS=-time-passes` 显示
+时间平摊在整条标准管线（ISel 20%、InstCombine 12%、RA 8%），没有病态 pass：
+剩下的杠杆是继续减 IR 量（内联 release、字符串拼接）与按分区并行 codegen。
+规律：任何"每个点都可能失败"的冷路径，先想能否收成一个共享冷函数。
+
+## 33. 编译慢先看"为什么拉进来"，再看 LLVM（2026-11-24 Mac arm64 实证）
+
+一个几十行的 Gui Tabs 测试编译 90s、峰值 4.2 GB、2.5 万个函数、339 万条 IR。
+前端只占 1s，时间全在 LLVM——但根因在拉入：`ZAN_PULLIN_DEBUG=1` 显示
+`Zan.Gui.Charts/.../ChartController.zan because controller`。prune_scan 把
+**类名**以 Controller/Dao 结尾的类当 MVC 控制器常驻拉入，而 MVC 自己
+（main_synth.c `zd_class_is_controller`）按**基类链**判定。无基类的
+`ChartController`（还有 Game 的 `FpsController3D`）于是把整个图表包拖进
+每个 Gui 程序。改为：类名后缀只在后跟基类列表或类型参数（`:`/`<`）时才算
+（宿主 prune_scan.c 与自举 main_pullin.zan 同步），直接 `: XxxController`
+基类本就由 TK_IDENT 分支覆盖。gui_tabs：90s/4.2GB → 45s/2.2GB，输出不变。
+
+排查顺序：`--time` 看阶段 → `--emit-ir` 按类名统计 define 个数 →
+`ZAN_PULLIN_DEBUG=1` 找最早把无关包拉进来的那一行 `because`。
+
+同期发现：LLVM 23 删了 `default<Os>/<Oz>`，体积档改 O2 管线 + optsize/minsize
+（必须在 `zan_opt_run_passes_on_module` 内做，分片模块也走这里）；Unix 宿主
+`cc` 链接行从不带发布分片对象（generated_objects），任何分片发布都缺符号。
+剩余大头是开发构建为每个方法生成反射 thunk（gui_tabs 8.4k 个，占函数 40%），
+发布构建只给访问器/注解/事件处理器——开发与发布反射语义不一致，是待定的
+语言决策（实验：开发构建套用发布规则 + 未达方法体置桩，gui_tabs 23s/1.3GB）。

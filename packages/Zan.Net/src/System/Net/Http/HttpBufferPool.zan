@@ -5,77 +5,94 @@ using System.Threading;
 
 namespace System.Net.Http;
 
-internal class HttpBufferShard {
-    public List<StringBuilder> sbPool;
+// 一个条带：自带原生互斥锁与三档 byte[] 池、StringBuilder 池。
+internal class HttpBufferStripe {
+    public nint mu;
+    public List<StringBuilder> builders;
     public List<byte[]> pool16k;
     public List<byte[]> pool64k;
     public List<byte[]> pool256k;
 
-    public HttpBufferShard() {
-        this.sbPool = new List<StringBuilder>();
+    public HttpBufferStripe() {
+        this.mu = Mutex.Create();
+        this.builders = new List<StringBuilder>();
         this.pool16k = new List<byte[]>();
         this.pool64k = new List<byte[]>();
         this.pool256k = new List<byte[]>();
     }
 }
 
-// Worker / 协程级序列化缓冲复用池（16 分片按线程哈希，消除多核全局锁争用）：
+// Worker / 协程级序列化缓冲复用池（16 条带按线程哈希 + 原生互斥锁，消除多核全局锁与监视器分配）：
 // 1. 为 HTTP 响应报文头构建与正文序列化提供零分配 StringBuilder 借还机制。
 // 2. 为 HTTP 全报文（头 + 正文）流式装配提供分级 byte[] 零分配复用池（16K / 64K / 256K）。
 // 借出时自动就绪，归还时施加容量保护（超大缓冲区直接淘汰，防止常驻内存膨胀）。
+//
+// 每个请求都借还好几次。原先全进程一张表、`lock (pool)`：调度线程全挤一把锁，
+// 且 `lock` 走运行时监视器（桶锁 + 递归锁 + 监视块分配）。现按当前线程分 16 条
+// 带，各带一把原生互斥锁——同一调度线程总落同一条带，跨线程几乎不碰撞。协程
+// 在 A 线程借、B 线程还无妨：缓冲只是换了条带。容量上限按条带均分。
 public class HttpBufferPool {
-    private static const int SHARD_COUNT = 16;
-    private static HttpBufferShard[] shards = HttpBufferPool.CreateShards();
-    private static int maxPoolSizePerShard = 32;
+    private static const int StripeCount = 16;
+    private static HttpBufferStripe[] stripes = HttpBufferPool.MakeStripes();
+    private static int maxPoolSize = 32;      // 每条带 StringBuilder 上限（共 512）
     // 超过 128KB 的异常大响应缓冲区不回池，直接由运行时析构回收
     private static int maxRetainCapacity = 131072;
-    private static int maxBytePoolSizePerShard = 16;
+    private static int maxBytePoolSize = 16;  // 每条带每档 byte[] 上限（共 256）
 
-    private static HttpBufferShard[] CreateShards() {
-        HttpBufferShard[] arr = new HttpBufferShard[SHARD_COUNT];
-        for (int i = 0; i < SHARD_COUNT; i = i + 1) {
-            arr[i] = new HttpBufferShard();
-        }
-        return arr;
+    private static HttpBufferStripe[] MakeStripes() {
+        HttpBufferStripe[] s = new HttpBufferStripe[HttpBufferPool.StripeCount];
+        for (int i = 0; i < s.Length; i = i + 1) { s[i] = new HttpBufferStripe(); }
+        return s;
     }
 
-    private static int ShardIndex() {
+    private static int StripeIndex() {
         long tid = Thread.CurrentId();
         long h = (tid ^ (tid >> 4) ^ (tid >> 8)) * 2654435761L;
-        return (int)(h & 15);
+        return (int)(h & (long)(HttpBufferPool.StripeCount - 1));
     }
 
-    private static StringBuilder PopSb(HttpBufferShard s) {
-        lock (s.sbPool) {
-            int n = s.sbPool.Count;
-            if (n > 0) {
-                StringBuilder sb = s.sbPool[n - 1];
-                s.sbPool.RemoveAt(n - 1);
-                sb.Clear();
-                return sb;
-            }
+    private static StringBuilder PopSb(HttpBufferStripe s) {
+        StringBuilder sb = null;
+        Mutex.Lock(s.mu);
+        int n = s.builders.Count;
+        if (n > 0) {
+            sb = s.builders[n - 1];
+            s.builders.RemoveAt(n - 1);
         }
-        return null;
+        Mutex.Unlock(s.mu);
+        if (sb != null) { sb.Clear(); }
+        return sb;
     }
 
+    // 从 `list` 弹出末尾元素；空则返回 null。调用方已持条带锁。
     private static byte[] PopBytes(List<byte[]> list) {
-        lock (list) {
-            int n = list.Count;
-            if (n > 0) {
-                byte[] b = list[n - 1];
-                list.RemoveAt(n - 1);
-                return b;
-            }
+        int n = list.Count;
+        if (n == 0) { return null; }
+        byte[] b = list[n - 1];
+        list.RemoveAt(n - 1);
+        return b;
+    }
+
+    private static byte[] TryPopBucket(HttpBufferStripe s, int minCap) {
+        byte[] b = null;
+        Mutex.Lock(s.mu);
+        if (minCap <= 16384) {
+            b = HttpBufferPool.PopBytes(s.pool16k);
+        } else if (minCap <= 65536) {
+            b = HttpBufferPool.PopBytes(s.pool64k);
+        } else {
+            b = HttpBufferPool.PopBytes(s.pool256k);
         }
-        return null;
+        Mutex.Unlock(s.mu);
+        return b;
     }
 
     // 从池中借出一个已清理就绪的 StringBuilder。若池空则创建新实例。
     public static StringBuilder Rent() {
-        int idx = HttpBufferPool.ShardIndex();
-        StringBuilder sb = HttpBufferPool.PopSb(shards[idx]);
+        int idx = HttpBufferPool.StripeIndex();
+        StringBuilder sb = HttpBufferPool.PopSb(stripes[idx]);
         if (sb != null) { return sb; }
-        sb = HttpBufferPool.PopSb(shards[(idx + 1) & 15]);
+        sb = HttpBufferPool.PopSb(stripes[(idx + 1) & 15]);
         if (sb != null) { return sb; }
         return new StringBuilder();
     }
@@ -85,59 +102,38 @@ public class HttpBufferPool {
         if (sb == null) { return; }
         if (sb.Length > maxRetainCapacity) { return; }
         sb.Clear();
-        HttpBufferShard s = shards[HttpBufferPool.ShardIndex()];
-        lock (s.sbPool) {
-            if (s.sbPool.Count >= maxPoolSizePerShard) { return; }
-            s.sbPool.Add(sb);
-        }
+        HttpBufferStripe s = stripes[HttpBufferPool.StripeIndex()];
+        Mutex.Lock(s.mu);
+        if (s.builders.Count < maxPoolSize) { s.builders.Add(sb); }
+        Mutex.Unlock(s.mu);
     }
 
     // 租借指定最小容量的字节缓冲区：按 16K / 64K / 256K 梯度分桶，超大直分不回池。
     public static byte[] RentBytes(int minCap) {
-        int idx = HttpBufferPool.ShardIndex();
-        HttpBufferShard s0 = shards[idx];
-        HttpBufferShard s1 = shards[(idx + 1) & 15];
-        if (minCap <= 16384) {
-            byte[] b = HttpBufferPool.PopBytes(s0.pool16k);
-            if (b != null) { return b; }
-            b = HttpBufferPool.PopBytes(s1.pool16k);
-            if (b != null) { return b; }
-            return new byte[16384];
-        }
-        if (minCap <= 65536) {
-            byte[] b = HttpBufferPool.PopBytes(s0.pool64k);
-            if (b != null) { return b; }
-            b = HttpBufferPool.PopBytes(s1.pool64k);
-            if (b != null) { return b; }
-            return new byte[65536];
-        }
-        if (minCap <= 262144) {
-            byte[] b = HttpBufferPool.PopBytes(s0.pool256k);
-            if (b != null) { return b; }
-            b = HttpBufferPool.PopBytes(s1.pool256k);
-            if (b != null) { return b; }
-            return new byte[262144];
-        }
-        return new byte[minCap];
+        if (minCap > 262144) { return new byte[minCap]; }
+        int idx = HttpBufferPool.StripeIndex();
+        byte[] b = HttpBufferPool.TryPopBucket(stripes[idx], minCap);
+        if (b != null) { return b; }
+        b = HttpBufferPool.TryPopBucket(stripes[(idx + 1) & 15], minCap);
+        if (b != null) { return b; }
+        int size = minCap <= 16384 ? 16384 : (minCap <= 65536 ? 65536 : 262144);
+        return new byte[size];
     }
 
     // 归还字节缓冲区到对应梯度池中。
     public static void ReturnBytes(byte[] buf) {
         if (buf == null) { return; }
         int len = buf.Length;
-        HttpBufferShard s = shards[HttpBufferPool.ShardIndex()];
+        if (len != 16384 && len != 65536 && len != 262144) { return; }
+        HttpBufferStripe s = stripes[HttpBufferPool.StripeIndex()];
+        Mutex.Lock(s.mu);
         if (len == 16384) {
-            lock (s.pool16k) {
-                if (s.pool16k.Count < maxBytePoolSizePerShard) { s.pool16k.Add(buf); }
-            }
+            if (s.pool16k.Count < maxBytePoolSize) { s.pool16k.Add(buf); }
         } else if (len == 65536) {
-            lock (s.pool64k) {
-                if (s.pool64k.Count < maxBytePoolSizePerShard) { s.pool64k.Add(buf); }
-            }
-        } else if (len == 262144) {
-            lock (s.pool256k) {
-                if (s.pool256k.Count < maxBytePoolSizePerShard) { s.pool256k.Add(buf); }
-            }
+            if (s.pool64k.Count < maxBytePoolSize) { s.pool64k.Add(buf); }
+        } else {
+            if (s.pool256k.Count < maxBytePoolSize) { s.pool256k.Add(buf); }
         }
+        Mutex.Unlock(s.mu);
     }
 }

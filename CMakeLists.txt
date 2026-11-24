@@ -1378,6 +1378,29 @@ add_test(NAME runtime_task_handle_registry COMMAND zanrt_task_handle_registry_te
 set_tests_properties(runtime_task_handle_registry PROPERTIES TIMEOUT 60)
 add_dependencies(zanc zanrt_task_handle_registry_test)
 
+# `lock (obj)` monitor: recursion, contention, distinct objects, address reuse,
+# bounded block recycling (TSan recipe in the test's header comment).
+add_executable(zanrt_monitor_lock_test
+  tests/runtime/monitor_lock.c
+  src/runtime/rt_sync.c
+  src/runtime/rt_file.c
+  src/runtime/rt_timer.c)
+target_include_directories(zanrt_monitor_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+set_target_properties(zanrt_monitor_lock_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+if(NOT WIN32)
+  target_compile_definitions(zanrt_monitor_lock_test PRIVATE _GNU_SOURCE)
+  find_package(Threads REQUIRED)
+  target_link_libraries(zanrt_monitor_lock_test PRIVATE Threads::Threads)
+  if(NOT APPLE)
+    target_link_libraries(zanrt_monitor_lock_test PRIVATE rt)
+  endif()
+endif()
+add_test(NAME runtime_monitor_lock COMMAND zanrt_monitor_lock_test)
+set_tests_properties(runtime_monitor_lock PROPERTIES TIMEOUT 120)
+add_dependencies(zanc zanrt_monitor_lock_test)
+
 add_executable(zanrt_timer_delay_cancel_index_test tests/runtime/timer_delay_cancel_index.c)
 set_target_properties(zanrt_timer_delay_cancel_index_test PROPERTIES
   C_STANDARD 11 C_STANDARD_REQUIRED YES
@@ -4910,6 +4933,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   # Combined rounded fill+border coverage (CPU primitive, no window needed).
   add_executable(zan_gui_surface_round_test tests/runtime/gui_surface_round_test.c)
   target_link_libraries(zan_gui_surface_round_test PRIVATE zan_gui)
+  if(UNIX)
+    target_link_libraries(zan_gui_surface_round_test PRIVATE m) # test calls sqrt directly
+  endif()
   add_test(NAME runtime_gui_surface_round COMMAND zan_gui_surface_round_test)
 
   # Real GL context, not a CPU substitute. Headless/unsupported hosts skip.
@@ -4923,6 +4949,9 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     if(ZAN_GAME_AVAILABLE)
       add_executable(zan_gui_gl_3d_test tests/runtime/gui_gl_3d_test.c)
       target_link_libraries(zan_gui_gl_3d_test PRIVATE ${CMAKE_DL_LIBS})
+      if(UNIX)
+        target_link_libraries(zan_gui_gl_3d_test PRIVATE m) # cos/sin
+      endif()
       add_dependencies(zan_gui_gl_3d_test zan_gui zan_game zan_image)
       add_test(NAME runtime_gui_gl_3d COMMAND zan_gui_gl_3d_test
         $<TARGET_FILE:zan_gui> $<TARGET_FILE:zan_game> $<TARGET_FILE:zan_image>)

@@ -189,6 +189,11 @@ static void co_park_end(zan_co_worker_t *w) {
         __atomic_sub_fetch(&g_co_parked, 1, __ATOMIC_SEQ_CST);
 }
 
+/* 白盒测试钩子：唤醒方认领到停泊 worker 的那一刻（tests/runtime/rt_io_owner_checks.h）。 */
+#ifndef ZAN_CO_WAKE_CLAIMED
+#define ZAN_CO_WAKE_CLAIMED() ((void)0)
+#endif
+
 static void co_notify(void) {
   if (__atomic_load_n(&g_co_searching, __ATOMIC_SEQ_CST) > 0)
     return;
@@ -207,6 +212,7 @@ static void co_notify(void) {
       __atomic_sub_fetch(&g_co_parked, 1, __ATOMIC_SEQ_CST);
       if (self)
         self->st.wake_post++;
+      ZAN_CO_WAKE_CLAIMED();
       co_wake_shard(co_worker_shard(i));
       return;
     }

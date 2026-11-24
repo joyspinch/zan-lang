@@ -61,13 +61,35 @@ static bool zd_name_eq(const char *s, int len, const char *lit) {
     return (size_t)len == n && memcmp(s, lit, n) == 0;
 }
 
+static zan_istr_t zc_decl_orig_name(const zan_ast_node_t *d) {
+    zan_istr_t orig = zan_ast_orig_name(d);
+    return orig.len > 0 ? orig : d->type_decl.name;
+}
+
 static zan_ast_node_t *zd_find_class(zan_ast_node_t *unit, const char *name) {
     int len = (int)strlen(name);
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
         if (!d || d->kind != AST_CLASS_DECL || !d->type_decl.name.str) continue;
-        if ((int)d->type_decl.name.len == len &&
-            memcmp(d->type_decl.name.str, name, (size_t)len) == 0)
+        zan_istr_t nm = zc_decl_orig_name(d);
+        if ((int)nm.len == len && memcmp(nm.str, name, (size_t)len) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+static zan_ast_node_t *zd_find_class_ns(zan_ast_node_t *unit, const char *ns_name,
+                                        const char *name) {
+    int nlen = (int)strlen(ns_name);
+    int len = (int)strlen(name);
+    for (int i = 0; i < unit->comp_unit.decls.count; i++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[i];
+        if (!d || d->kind != AST_CLASS_DECL || !d->type_decl.name.str) continue;
+        zan_istr_t ns = zan_ast_ns_name(d);
+        if ((int)ns.len != nlen || memcmp(ns.str, ns_name, (size_t)nlen) != 0)
+            continue;
+        zan_istr_t nm = zc_decl_orig_name(d);
+        if ((int)nm.len == len && memcmp(nm.str, name, (size_t)len) == 0)
             return d;
     }
     return NULL;
@@ -97,12 +119,11 @@ static bool zc_is_control(zan_ast_node_t *unit, zan_ast_node_t *decl, int depth)
         if (len <= 0 || len >= (int)sizeof(base)) continue;
         memcpy(base, bs, (size_t)len);
         base[len] = 0;
-        zan_ast_node_t *bd = zd_find_class(unit, base);
+        zan_ast_node_t *bd = strcmp(base, "Control") == 0
+            ? zd_find_class_ns(unit, "Gui", "Control")
+            : zd_find_class(unit, base);
         if (!bd) continue;
-        if (strcmp(base, "Control") == 0) {
-            zan_istr_t ns = zan_ast_ns_name(bd);
-            if (ns.len == 3 && memcmp(ns.str, "Gui", 3) == 0) return true;
-        }
+        if (strcmp(base, "Control") == 0) return true;
         if (zc_is_control(unit, bd, depth + 1)) return true;
     }
     return false;
@@ -147,20 +168,19 @@ static bool zc_attr_arg(zan_ast_node_t *a, const char *key, char *out, size_t ca
 
 static void zc_full_name(zan_ast_node_t *decl, char *out, size_t cap) {
     zan_istr_t ns = zan_ast_ns_name(decl);
+    zan_istr_t nm = zc_decl_orig_name(decl);
     if (ns.len > 0 && ns.str)
         snprintf(out, cap, "%.*s.%.*s", (int)ns.len, ns.str,
-                 (int)decl->type_decl.name.len, decl->type_decl.name.str);
+                 (int)nm.len, nm.str);
     else
-        snprintf(out, cap, "%.*s", (int)decl->type_decl.name.len, decl->type_decl.name.str);
+        snprintf(out, cap, "%.*s", (int)nm.len, nm.str);
 }
 
 static void zan_synth_control_catalog(zan_ast_node_t *unit, zan_arena_t *arena,
                                       zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
-    zan_ast_node_t *factory = zd_find_class(unit, "ControlFactory");
+    zan_ast_node_t *factory = zd_find_class_ns(unit, "Gui", "ControlFactory");
     if (!factory) return;
-    zan_istr_t fns = zan_ast_ns_name(factory);
-    if (!(fns.len == 3 && memcmp(fns.str, "Gui", 3) == 0)) return;
     int cap = 1024, count = 0;
     zc_kind_t *kinds = (zc_kind_t *)calloc((size_t)cap, sizeof(zc_kind_t));
     if (!kinds) return;
@@ -182,9 +202,9 @@ static void zan_synth_control_catalog(zan_ast_node_t *unit, zan_arena_t *arena,
         zc_full_name(decl, full, sizeof(full));
         bool generic = decl->type_decl.type_params.count > 0;
         bool constructible = zc_default_constructible(decl);
+        zan_istr_t orig = zc_decl_orig_name(decl);
         char simple[128];
-        snprintf(simple, sizeof(simple), "%.*s", (int)decl->type_decl.name.len,
-                 decl->type_decl.name.str);
+        snprintf(simple, sizeof(simple), "%.*s", (int)orig.len, orig.str);
         /* [ControlKind] 声明：别名 / 工厂 / 泛型闭合。 */
         bool declared_default = false;
         const zan_ast_list_t *attrs = zan_ast_attributes_const(decl);

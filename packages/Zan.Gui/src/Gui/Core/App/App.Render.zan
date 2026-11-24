@@ -42,7 +42,7 @@ public partial class App {
         this.TraceFullPresent(24, false);
         if (formPaintFrame) {
             this.SyncNativeDpi();
-            if (!this.FormPaintGeometryCurrent() || forceFullNext
+            if (!this.FormPaintGeometryCurrent() || Damage.forceFullNext
                 || window.ClientWidth() != canvas.Width() || window.ClientHeight() != canvas.Height()) {
                 this.AbortPreparationFrame();
                 return;
@@ -58,10 +58,15 @@ public partial class App {
         if (this.FxActive()) {
             Canvas fc = canvas;
             int fxNow = Window.GetTickMs();
-            if (partialFrame) {
+            if (Damage.partialFrame) {
+                // 只有损伤条带被重绘（因此那里是合成前的像素），
+                // 裁剪仍然生效：以上一整帧的相位重新合成
+                // 特效，只覆盖该条带，其余像素保持已合成的状态。
                 if (fxSnapValid) {
-                    fc.SnapshotPatchRect(presentX, presentY, presentW,
-                                         presentH, App.FxSnapSlot());
+                    // 只把页面条带的干净像素补进整窗快照。条带即使超过
+                    // 半窗也必须补齐，否则下一拍恢复会抹掉新页面内容。
+                    fc.SnapshotPatchRect(Damage.presentX, Damage.presentY, Damage.presentW,
+                                         Damage.presentH, App.FxSnapSlot());
                 }
                 this.PaintBackdropFx(fxFrameMs);
                 BackdropFx.TakeDamage();
@@ -110,26 +115,29 @@ public partial class App {
         this.TraceFullPresent(25, false);
         this.TraceFullPresent(26, true);
         int blurMiss = Canvas.TakeBlurPartialMiss();
-        if (partialFrame) {
+        if (Damage.partialFrame) {
             canvas.PopClip();
             if (blurMiss > 0) {
-                blurMissStreak = blurMissStreak + 1;
-                if (!this.WidenDamageToGlass() || blurMissStreak >= 2) {
-                    partialBlocked = true;
-                    forceFullNext = true;
-                    blurMissStreak = 0;
+                Damage.blurMissStreak = Damage.blurMissStreak + 1;
+                // 扩裁剪重算过的帧若仍报 miss，模糊核的取样边缘越出了
+                // 一切条带，widen 已无力——按 g_blur_partial_miss 的
+                // 契约把下一帧升级成整窗，别让滚动串帧帧欠账。
+                if (!this.Damage.WidenDamageToGlass() || Damage.blurMissStreak >= 2) {
+                    Damage.partialBlocked = true;
+                    Damage.forceFullNext = true;
+                    Damage.blurMissStreak = 0;
                     this.Stats.NoteRedrawWhy("glass-partial-blur");
                 } else {
                     this.Stats.NoteRedrawWhy("glass-strip-widen");
                 }
                 needsRedraw = true;
             } else {
-                blurMissStreak = 0;
+                Damage.blurMissStreak = 0;
             }
             if (frameDiagnostics != null) {
-                frameDiagnostics.Partial(presentX, presentY, presentW, presentH, blurMiss);
+                frameDiagnostics.Partial(Damage.presentX, Damage.presentY, Damage.presentW, Damage.presentH, blurMiss);
             }
-            window.PresentDirty(presentX, presentY, presentW, presentH);
+            window.PresentDirty(Damage.presentX, Damage.presentY, Damage.presentW, Damage.presentH);
         } else {
             window.PresentFull();
             #if !WINDOWS
@@ -137,7 +145,7 @@ public partial class App {
             #endif
             lastFullFrameMs = Window.GetTickMs();
         }
-        this.SettleGlassRefresh();
+        this.Damage.SettleGlassRefresh();
         this.TraceFullPresent(26, false);
         if (!this.ContinuePreparedFrame()) {
             this.TraceFullPresent(22, false);
@@ -150,19 +158,21 @@ public partial class App {
         }
         this.SealFormRegion();
         this.TraceFullPresent(27, true);
-        window.PresentSurface(canvas.surfaceId, partialFrame ? -1 : frameDpiRevision);
+        window.PresentSurface(canvas.surfaceId, Damage.partialFrame ? -1 : frameDpiRevision);
         this.TraceFullPresent(27, false);
         this.TraceFullPresent(28, true);
         if (fxPagePending) {
             fxPagePending = false;
-            if (partialFrame && this.FxActive() && window.IsVisible()) { this.ScheduleFxFrame(); }
+            if (Damage.partialFrame && this.FxActive() && window.IsVisible()) {
+                this.ScheduleFxFrame();
+            }
         }
         this.TraceFullPresent(28, false);
         this.TraceFullPresent(21, false);
         this.AutomationPresented();
         if (App.PerfOn()) {
             int endMs = Window.RawTickMs();
-            this.RecordFramePerf(Stats.BeginMs, perfPreMs, endMs, partialFrame);
+            this.RecordFramePerf(Stats.BeginMs, perfPreMs, endMs, Damage.partialFrame);
         }
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
@@ -182,7 +192,7 @@ public partial class App {
         frameCadence.Begin(Stopwatch.GetMicroseconds());
         this.SyncNativeDpi();
         frameDpiRevision = nativeDpiRevision;
-        if (window.DpiFramePending()) { forceFullNext = true; }
+        if (window.DpiFramePending()) { Damage.forceFullNext = true; }
         // Animation may be frozen for pixel comparisons; measured work uses
         // the independent monotonic clock so frozen frames retain real cost.
         if (App.PerfOn()) { Stats.BeginMs = Window.RawTickMs(); }
@@ -224,16 +234,20 @@ public partial class App {
         blocksInputBelow = false;
         frameSeq = frameSeq + 1;
         clickClaimed = false;
-        glassRects.Clear();
+        // pressOnBlocker 不在此复位：本帧的 BeginFrame 在
+        // ProcessEvent（按下置位）之后、释放帧的 ProcessEvent（读取）
+        // 之前各跑一次，复位会把跨帧手势状态抹掉。写入点只有
+        // kind==2 主键按下分支（每次按下无条件重写）。
+        Damage.glassRects.Clear();
         window.ClearHitGuards();
         focus.ResetIds();
         overlays.Clear();
         nativeLayers.Clear();
         nativeOccluders.Clear();
         hitOnlyBlockers.Clear();
-        partialFrame = false;
-        partialBlocked = false;
-        glassDeferred = false;
+        Damage.partialFrame = false;
+        Damage.partialBlocked = false;
+        Damage.glassDeferred = false;
         // 控件内容哈希只在本应用开了局部帧时计数（）。
         PaintHash.On = this.PartialFrames();
         // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
@@ -241,25 +255,37 @@ public partial class App {
         // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
         // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
         // 滚轮条带同样不参与命中归属：输入始终命中当前对象树。
-        if (inputNeedsFrame) { partialPending = false; }
+        if (inputNeedsFrame) { Damage.partialPending = false; }
         this.CheckFormPaintClip();
-        if (partialPending && dmgW > 0 && dmgH > 0) { partialFrame = true; }
-        partialPending = false;
-        if (forceFullNext) {
-            partialFrame = false;
-            forceFullNext = false;
+        if (Damage.partialPending && Damage.dmgW > 0 && Damage.dmgH > 0) {
+            Damage.partialFrame = true;
+        }
+        Damage.partialPending = false;
+        // 上一帧留下的“下一帧必须整窗”比任何局部声明优先：它记的是
+        // 表面上已经有不可信的像素，只重画一条条带永远纠不回来。
+        if (Damage.forceFullNext) {
+            Damage.partialFrame = false;
+            Damage.forceFullNext = false;
             this.Stats.NoteRedrawWhy("force-full");
         }
         inputNeedsFrame = false;
         wheelScrollInput = false;
-        if (!partialFrame) { animPrevValid = false; }
-        if (!partialFrame) { fxSnapValid = false; }
-        if (partialFrame) {
-            canvas.PushClip(dmgX, dmgY, dmgW, dmgH);
-            presentX = dmgX;
-            presentY = dmgY;
-            presentW = dmgW;
-            presentH = dmgH;
+        // 整窗帧重画了每一个像素，动画的旧位置已被覆盖：
+        // 下一次动画帧不必再把它算进裁剪。
+        if (!Damage.partialFrame) { animPrevValid = false; }
+        // 本帧正在重新渲染：整帧会覆盖整个画布，槽位 7 的 fx 快照
+        // 从此过期，交给帧尾的突发判定/非突发整帧重建；条带帧只
+        // 覆盖条带，快照其余部分仍准确，保持有效使特效拍在持续
+        // 动画（倒计时条带）期间仍能廉价整窗推进（条带分支回写）。
+        if (!Damage.partialFrame) { fxSnapValid = false; }
+        if (Damage.partialFrame) {
+            // 下方内容照常绘制；裁剪将其限制在
+            // 损坏条带内，上一帧未触及的像素得以保留。
+            canvas.PushClip(Damage.dmgX, Damage.dmgY, Damage.dmgW, Damage.dmgH);
+            Damage.presentX = Damage.dmgX;
+            Damage.presentY = Damage.dmgY;
+            Damage.presentW = Damage.dmgW;
+            Damage.presentH = Damage.dmgH;
         }
         if (shapeMode != 0) {
             int resizeBg = 0;
@@ -267,8 +293,11 @@ public partial class App {
                 lastResizeBg = resizeBg;
                 Window.SetResizeBackground(resizeBg);
             }
-            if (partialFrame) {
-                canvas.ClearRect(dmgX, dmgY, dmgW, dmgH, 0);
+            // 异形窗口：将整个表面清为完全透明，
+            // 轮廓仅由树绘制的像素定义（系统以逐像素 alpha
+            // 和抗锯齿边缘合成它）。
+            if (Damage.partialFrame) {
+                canvas.ClearRect(Damage.dmgX, Damage.dmgY, Damage.dmgW, Damage.dmgH, 0);
             } else {
                 canvas.Clear(0);
             }
@@ -283,15 +312,20 @@ public partial class App {
             if (glassNative) {
                 StyleBox glassStyle = Style.Part(this, "windowbg", "glass", "",
                                                  "", "", Style.SNormal());
-                if (partialFrame) {
-                    canvas.ClearRect(dmgX, dmgY, dmgW, dmgH,
+                // 磨砂表面：将整个窗口清为*半透明*色调
+                // （而非完全透明），使系统背景均匀透出
+                // 模糊，同时窗口保持为实心带边框的玻璃面板。
+                // 完全透明的清除会让窗口在浅色背景上
+                // 显得通透/发白（且无边框）。
+                if (Damage.partialFrame) {
+                    canvas.ClearRect(Damage.dmgX, Damage.dmgY, Damage.dmgW, Damage.dmgH,
                                      glassStyle.BgOr(0));
                 } else {
                     canvas.Clear(glassStyle.BgOr(0));
                 }
             } else {
-                if (partialFrame) {
-                    canvas.ClearRect(dmgX, dmgY, dmgW, dmgH, bgStyle.BgOr(0));
+                if (Damage.partialFrame) {
+                    canvas.ClearRect(Damage.dmgX, Damage.dmgY, Damage.dmgW, Damage.dmgH, bgStyle.BgOr(0));
                 } else {
                     canvas.Clear(bgStyle.BgOr(0));
                 }
@@ -300,7 +334,9 @@ public partial class App {
     }
     void AddOverlay(OverlayPopup p) {
         overlays.Add(p);
-        if (partialFrame) {
+        // 在损坏裁剪帧期间出现的弹层/工具提示会被
+        // 裁剪掉：注册后立即请求一帧完整重绘。
+        if (Damage.partialFrame) {
             this.Stats.NoteRedrawWhy("overlay-in-partial");
             needsRedraw = true;
         }

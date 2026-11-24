@@ -1,8 +1,28 @@
 /* Public handles are positive, never-reused generations. Raw scheduler frames
- * have separate entries and parent/child edges. Queries, cancellation and
- * retire share one lock; no callback or destructor runs while that lock is
- * held. Metadata is bounded by peak live frames plus query pins awaiting
- * retirement. */
+ * have separate entries and await edges. No callback or destructor runs while a
+ * registry lock is held. Metadata is bounded by peak live frames plus query pins
+ * awaiting retirement.
+ *
+ * ---- Sharding ----
+ * Every coroutine creation configures its frame and every await sets and clears
+ * an edge, so a web request makes ~100 registry calls. One process-wide lock
+ * serialized all scheduler threads on it: under load half the acquisitions were
+ * contended and the spinning was ~40% of a web server's busy CPU. Entries now
+ * live in TASK_SHARDS shards chosen by frame address, each with its own lock,
+ * slots, open-addressing index and free list, and every operation holds at most
+ * one shard lock at a time.
+ *
+ * That works because edges no longer need back pointers: an await edge records
+ * the child frame together with the child's incarnation (a stamp unique to one
+ * registration of an address). Retirement only drops its own entry; an edge to
+ * a retired child, or to a new frame that reused its address, no longer matches
+ * and is ignored. Cancellation walks the chain one shard at a time; a racing
+ * await is still caught because both the walk and zan_task_child work under the
+ * parent's shard lock (the walk sets cancel then reads the edge, the edge
+ * setter writes the edge then reads cancel).
+ *
+ * Generation tokens carry their shard in the low bits so token lookups visit a
+ * single shard. Tokens stay strictly increasing across calls. */
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +30,21 @@
 #include <time.h>
 #if defined(_WIN32)
 #include <windows.h>
+#define task_cpu_relax() YieldProcessor()
+static void task_os_yield(void) { SwitchToThread(); }
+#elif defined(__wasm__) || defined(ZAN_BARE_METAL)
+#define task_cpu_relax() ((void)0)
+static void task_os_yield(void) { }
+#else
+#include <sched.h>
+#if defined(__aarch64__) || defined(__arm__)
+#define task_cpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__x86_64__) || defined(__i386__)
+#define task_cpu_relax() __builtin_ia32_pause()
+#else
+#define task_cpu_relax() __asm__ __volatile__("" ::: "memory")
+#endif
+static void task_os_yield(void) { sched_yield(); }
 #endif
 #include "../rt_co.h"
 #include "../rt_timer.h"
@@ -92,19 +127,17 @@ static size_t g_profile_count;
 static int g_profile_enabled;
 static int64_t g_profile_stage_id;
 
-typedef struct zan_task_entry zan_task_entry;
-struct zan_task_entry {
+#define TASK_SHARD_BITS 6
+#define TASK_SHARDS (1u << TASK_SHARD_BITS)
+
+typedef struct {
   uint64_t generation;
-  uint64_t seq;
+  uint64_t incarnation; /* never 0 for a live entry */
   void *frame;
   const volatile int *done;
   volatile int *cancel;
-  zan_task_entry *child;
-  zan_task_entry *parents;
-  zan_task_entry *parent_next;
-  zan_task_entry **parent_link;
-  zan_task_entry *frame_next;
-  zan_task_entry *token_next;
+  void *child;
+  uint64_t child_incarnation;
   size_t pins;
   void (*retire)(void *);
   void (*allocator_release)(void *);
@@ -114,283 +147,167 @@ struct zan_task_entry {
   int configured;
   int inherited_stage;
   uint64_t open_stages;
-};
-typedef struct {
-  zan_task_entry *frames;
-  zan_task_entry *tokens;
-} zan_task_bucket;
-
-#define ZAN_TASK_SHARDS 64
-#define ZAN_TASK_SHARD_MASK (ZAN_TASK_SHARDS - 1)
-#define ZAN_TASK_SHARD_FREE_CAP 16
+} zan_task_entry;
 
 typedef struct {
-  volatile int lock;
-  char pad[64 - sizeof(volatile int)];
-} zan_task_shard_lock_t;
-
-static zan_task_bucket *g_task_buckets;
-static zan_task_entry *g_task_free;
-static size_t g_task_free_count;
-static zan_task_entry *g_shard_free[ZAN_TASK_SHARDS];
-static size_t g_shard_free_count[ZAN_TASK_SHARDS];
-static zan_task_shard_lock_t g_frame_locks[ZAN_TASK_SHARDS];
-static zan_task_shard_lock_t g_token_locks[ZAN_TASK_SHARDS];
-static zan_task_shard_lock_t g_reserve_lock;
-static zan_task_shard_lock_t g_grow_lock;
-static zan_task_shard_lock_t g_profile_lock;
-static size_t g_task_capacity;
-static size_t g_task_count;
+  _Alignas(64) volatile int lock;
+  zan_task_entry *entries;
+  size_t capacity;
+  /* Open-addressing index (slot+1, 0 = empty; linear probing, backward-shift
+   * deletion) and a free-slot stack. Indices stay valid across realloc. */
+  uint32_t *index;
+  size_t index_cap; /* power of two, >= 2 * capacity */
+  uint32_t *free_slots;
+  size_t free_n;
+  uint64_t next_incarnation;
+} task_shard;
+static task_shard g_task_shards[TASK_SHARDS];
 static uint64_t g_task_generation;
+static _Alignas(64) volatile int g_profile_lock;
 
-static inline void spin_pause(void) {
-#if defined(_WIN32)
-  YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-  __builtin_ia32_pause();
-#elif defined(__aarch64__)
-  __asm__ __volatile__("yield" ::: "memory");
-#endif
-}
-static inline void spin_lock_at(volatile int *lk) {
-  while (__atomic_exchange_n(lk, 1, __ATOMIC_ACQUIRE)) {
-    while (__atomic_load_n(lk, __ATOMIC_RELAXED))
-      spin_pause();
+static void task_lock(task_shard *s) {
+  for (unsigned spin = 0;; spin++) {
+    if (!__atomic_load_n(&s->lock, __ATOMIC_RELAXED) &&
+        !__atomic_exchange_n(&s->lock, 1, __ATOMIC_ACQUIRE))
+      return;
+    if (spin < 128)
+      task_cpu_relax();
+    else
+      task_os_yield();
   }
 }
-static inline int spin_trylock_at(volatile int *lk) {
-  return !__atomic_load_n(lk, __ATOMIC_RELAXED) &&
-         !__atomic_exchange_n(lk, 1, __ATOMIC_ACQUIRE);
+static void task_unlock(task_shard *s) {
+  __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE);
 }
-static inline void spin_unlock_at(volatile int *lk) {
-  __atomic_store_n(lk, 0, __ATOMIC_RELEASE);
+static inline void profile_lock(void) {
+  for (unsigned spin = 0;; spin++) {
+    if (!__atomic_load_n(&g_profile_lock, __ATOMIC_RELAXED) &&
+        !__atomic_exchange_n(&g_profile_lock, 1, __ATOMIC_ACQUIRE))
+      return;
+    if (spin < 128)
+      task_cpu_relax();
+    else
+      task_os_yield();
+  }
 }
-static inline void profile_lock(void) { spin_lock_at(&g_profile_lock.lock); }
 static inline void profile_unlock(void) {
-  spin_unlock_at(&g_profile_lock.lock);
+  __atomic_store_n(&g_profile_lock, 0, __ATOMIC_RELEASE);
 }
 
-static size_t task_bucket(uint64_t key, size_t capacity) {
-  key ^= key >> 33;
-  key *= UINT64_C(0xff51afd7ed558ccd);
-  key ^= key >> 33;
-  return (size_t)key & (capacity - 1);
+static uint64_t task_mix(const void *frame) {
+  uint64_t x = (uint64_t)(uintptr_t)frame;
+  x ^= x >> 33;
+  x *= UINT64_C(0xff51afd7ed558ccd);
+  x ^= x >> 33;
+  return x;
 }
-static inline size_t frame_shard_for(void *frame, size_t cap) {
-  return task_bucket((uintptr_t)frame, cap) & ZAN_TASK_SHARD_MASK;
+/* Shard from the high bits, index position from the low bits. */
+static task_shard *task_shard_of(const void *frame) {
+  return &g_task_shards[task_mix(frame) >> (64 - TASK_SHARD_BITS)];
 }
-static inline size_t token_shard_for(uint64_t token, size_t cap) {
-  return task_bucket(token, cap) & ZAN_TASK_SHARD_MASK;
+static task_shard *task_shard_of_token(uint64_t token) {
+  return &g_task_shards[token & (TASK_SHARDS - 1)];
 }
 
-static void task_ensure_init(void) {
-  if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE))
+static void task_index_insert(task_shard *s, size_t slot) {
+  size_t mask = s->index_cap - 1;
+  size_t h = (size_t)task_mix(s->entries[slot].frame) & mask;
+  while (s->index[h])
+    h = (h + 1) & mask;
+  s->index[h] = (uint32_t)(slot + 1);
+}
+static void task_index_rebuild(task_shard *s, size_t cap) {
+  uint32_t *idx = (uint32_t *)calloc(cap, sizeof(uint32_t));
+  if (!idx)
+    abort();
+  free(s->index);
+  s->index = idx;
+  s->index_cap = cap;
+  for (size_t i = 0; i < s->capacity; ++i)
+    if (s->entries[i].frame)
+      task_index_insert(s, i);
+}
+static size_t task_index_pos(task_shard *s, const void *frame) {
+  if (!s->index_cap)
+    return SIZE_MAX;
+  size_t mask = s->index_cap - 1;
+  size_t h = (size_t)task_mix(frame) & mask;
+  for (;;) {
+    uint32_t v = s->index[h];
+    if (!v)
+      return SIZE_MAX;
+    if (s->entries[v - 1].frame == frame)
+      return h;
+    h = (h + 1) & mask;
+  }
+}
+static void task_index_remove(task_shard *s, const void *frame) {
+  size_t pos = task_index_pos(s, frame);
+  if (pos == SIZE_MAX)
     return;
-  spin_lock_at(&g_grow_lock.lock);
-  if (!g_task_capacity) {
-    size_t cap = 16;
-    zan_task_entry *entries = (zan_task_entry *)calloc(cap, sizeof(*entries));
-    zan_task_bucket *buckets = (zan_task_bucket *)calloc(cap, sizeof(*buckets));
-    if (!entries || !buckets)
+  size_t mask = s->index_cap - 1;
+  s->index[pos] = 0;
+  /* Backward-shift: re-seat the rest of the probe run. */
+  size_t j = (pos + 1) & mask;
+  while (s->index[j]) {
+    uint32_t v = s->index[j];
+    s->index[j] = 0;
+    size_t h = (size_t)task_mix(s->entries[v - 1].frame) & mask;
+    while (s->index[h])
+      h = (h + 1) & mask;
+    s->index[h] = v;
+    j = (j + 1) & mask;
+  }
+}
+static zan_task_entry *task_find(task_shard *s, uint64_t generation) {
+  if (!generation)
+    return NULL;
+  for (size_t i = 0; i < s->capacity; ++i)
+    if (s->entries[i].generation == generation && s->entries[i].frame)
+      return &s->entries[i];
+  return NULL;
+}
+static zan_task_entry *task_frame(task_shard *s, void *frame) {
+  if (!frame)
+    return NULL;
+  size_t pos = task_index_pos(s, frame);
+  if (pos == SIZE_MAX)
+    return NULL;
+  return &s->entries[s->index[pos] - 1];
+}
+static zan_task_entry *task_slot(task_shard *s, void *frame) {
+  zan_task_entry *entry = task_frame(s, frame);
+  if (entry)
+    return entry;
+  if (!s->free_n) {
+    size_t next = s->capacity ? s->capacity * 2 : 16;
+    if (next < s->capacity || next > UINT32_MAX - 1 ||
+        next > SIZE_MAX / sizeof(zan_task_entry))
       abort();
-    g_task_buckets = buckets;
-    for (size_t i = 0; i < cap; ++i) {
-      entries[i].frame_next = g_task_free;
-      g_task_free = &entries[i];
-    }
-    g_task_free_count = cap;
-    __atomic_store_n(&g_task_capacity, cap, __ATOMIC_RELEASE);
+    zan_task_entry *entries =
+        (zan_task_entry *)realloc(s->entries, next * sizeof(zan_task_entry));
+    if (!entries)
+      abort();
+    memset(entries + s->capacity, 0,
+           (next - s->capacity) * sizeof(zan_task_entry));
+    uint32_t *fl = (uint32_t *)realloc(s->free_slots, next * sizeof(uint32_t));
+    if (!fl)
+      abort();
+    s->free_slots = fl;
+    /* Push new slots so the lowest number pops first. */
+    for (size_t k = next; k > s->capacity; --k)
+      s->free_slots[s->free_n++] = (uint32_t)(k - 1);
+    s->entries = entries;
+    __atomic_store_n(&s->capacity, next, __ATOMIC_RELAXED);
+    task_index_rebuild(s, next * 2);
   }
-  spin_unlock_at(&g_grow_lock.lock);
-}
-
-static size_t lock_frame_shard(void *frame, size_t *out_cap) {
-  for (;;) {
-    size_t cap = __atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE);
-    if (!cap) {
-      task_ensure_init();
-      continue;
-    }
-    size_t shard = frame_shard_for(frame, cap);
-    spin_lock_at(&g_frame_locks[shard].lock);
-    if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE) == cap) {
-      if (out_cap)
-        *out_cap = cap;
-      return shard;
-    }
-    spin_unlock_at(&g_frame_locks[shard].lock);
-  }
-}
-
-static size_t lock_token_shard(uint64_t token, size_t *out_cap) {
-  for (;;) {
-    size_t cap = __atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE);
-    if (!cap)
-      return ZAN_TASK_SHARDS;
-    size_t shard = token_shard_for(token, cap);
-    spin_lock_at(&g_token_locks[shard].lock);
-    if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE) == cap) {
-      if (out_cap)
-        *out_cap = cap;
-      return shard;
-    }
-    spin_unlock_at(&g_token_locks[shard].lock);
-  }
-}
-
-static zan_task_entry *task_find_cap(uint64_t generation, size_t cap) {
-  if (!generation || !cap)
-    return NULL;
-  for (zan_task_entry *entry =
-           g_task_buckets[task_bucket(generation, cap)].tokens;
-       entry; entry = entry->token_next)
-    if (entry->generation == generation)
-      return entry;
-  return NULL;
-}
-static zan_task_entry *task_frame_cap(void *frame, size_t cap) {
-  if (!frame || !cap)
-    return NULL;
-  for (zan_task_entry *entry =
-           g_task_buckets[task_bucket((uintptr_t)frame, cap)].frames;
-       entry; entry = entry->frame_next)
-    if (entry->frame == frame)
-      return entry;
-  return NULL;
-}
-static void task_index_frame(zan_task_entry *entry, size_t cap) {
-  zan_task_bucket *bucket =
-      &g_task_buckets[task_bucket((uintptr_t)entry->frame, cap)];
-  entry->frame_next = bucket->frames;
-  bucket->frames = entry;
-}
-static void task_index_token(zan_task_entry *entry, size_t cap) {
-  zan_task_bucket *bucket =
-      &g_task_buckets[task_bucket(entry->generation, cap)];
-  entry->token_next = bucket->tokens;
-  bucket->tokens = entry;
-}
-static void task_forget_token_locked(zan_task_entry *entry, size_t cap) {
-  uint64_t gen = entry->generation;
-  if (!gen)
-    return;
-  size_t tshard = token_shard_for(gen, cap);
-  spin_lock_at(&g_token_locks[tshard].lock);
-  zan_task_entry **link = &g_task_buckets[task_bucket(gen, cap)].tokens;
-  while (*link && *link != entry)
-    link = &(*link)->token_next;
-  if (*link == entry) {
-    *link = entry->token_next;
-    entry->token_next = NULL;
-  }
-  entry->generation = 0;
-  spin_unlock_at(&g_token_locks[tshard].lock);
-}
-static void task_grow_all_locked(void) {
-  size_t old_capacity = g_task_capacity;
-  size_t capacity = old_capacity ? old_capacity * 2 : 16;
-  if (capacity < old_capacity || capacity > SIZE_MAX / sizeof(zan_task_entry))
-    abort();
-  zan_task_entry *entries =
-      (zan_task_entry *)calloc(capacity - old_capacity, sizeof(*entries));
-  zan_task_bucket *buckets =
-      (zan_task_bucket *)calloc(capacity, sizeof(*buckets));
-  if (!entries || !buckets)
-    abort();
-
-  zan_task_bucket *old_buckets = g_task_buckets;
-  g_task_buckets = buckets;
-  for (size_t i = 0; i < old_capacity; ++i) {
-    zan_task_entry *entry = old_buckets[i].frames;
-    while (entry) {
-      zan_task_entry *next = entry->frame_next;
-      task_index_frame(entry, capacity);
-      if (entry->generation)
-        task_index_token(entry, capacity);
-      entry = next;
-    }
-  }
-  free(old_buckets);
-  /* Blocks stay at stable addresses for await edges and the free list. */
-  spin_lock_at(&g_reserve_lock.lock);
-  for (size_t i = 0; i < capacity - old_capacity; ++i) {
-    entries[i].frame_next = g_task_free;
-    g_task_free = &entries[i];
-    ++g_task_free_count;
-  }
-  spin_unlock_at(&g_reserve_lock.lock);
-  __atomic_store_n(&g_task_capacity, capacity, __ATOMIC_RELEASE);
-}
-static zan_task_entry *task_pop_reserve(void) {
-  spin_lock_at(&g_reserve_lock.lock);
-  zan_task_entry *entry = g_task_free;
-  if (entry) {
-    g_task_free = entry->frame_next;
-    entry->frame_next = NULL;
-    --g_task_free_count;
-  }
-  spin_unlock_at(&g_reserve_lock.lock);
+  size_t i = s->free_slots[--s->free_n];
+  entry = &s->entries[i];
+  entry->frame = frame;
+  entry->incarnation =
+      ++s->next_incarnation * TASK_SHARDS + (uint64_t)(s - g_task_shards);
+  task_index_insert(s, i);
   return entry;
-}
-static zan_task_entry *task_slot_locked(void *frame, size_t *shard_io,
-                                        size_t *cap_io) {
-  for (;;) {
-    size_t shard = *shard_io;
-    size_t cap = *cap_io;
-    zan_task_entry *entry = task_frame_cap(frame, cap);
-    if (entry)
-      return entry;
-
-    entry = g_shard_free[shard];
-    if (entry) {
-      g_shard_free[shard] = entry->frame_next;
-      entry->frame_next = NULL;
-      --g_shard_free_count[shard];
-    } else {
-      entry = task_pop_reserve();
-    }
-    if (entry) {
-      entry->frame = frame;
-      task_index_frame(entry, cap);
-      __atomic_add_fetch(&g_task_count, 1, __ATOMIC_RELAXED);
-      return entry;
-    }
-
-    /* Reclaim idle entries from other shards or grow when truly full. */
-    spin_unlock_at(&g_frame_locks[shard].lock);
-    spin_lock_at(&g_grow_lock.lock);
-    for (size_t s = 0; s < ZAN_TASK_SHARDS; ++s)
-      spin_lock_at(&g_frame_locks[s].lock);
-    for (size_t s = 0; s < ZAN_TASK_SHARDS; ++s)
-      spin_lock_at(&g_token_locks[s].lock);
-
-    int reclaimed = 0;
-    if (!g_task_free) {
-      spin_lock_at(&g_reserve_lock.lock);
-      for (size_t s = 0; s < ZAN_TASK_SHARDS; ++s) {
-        while (g_shard_free[s]) {
-          zan_task_entry *idle = g_shard_free[s];
-          g_shard_free[s] = idle->frame_next;
-          --g_shard_free_count[s];
-          idle->frame_next = g_task_free;
-          g_task_free = idle;
-          ++g_task_free_count;
-          reclaimed = 1;
-        }
-      }
-      spin_unlock_at(&g_reserve_lock.lock);
-      if (!reclaimed)
-        task_grow_all_locked();
-    }
-
-    for (size_t s = ZAN_TASK_SHARDS; s-- > 0;)
-      spin_unlock_at(&g_token_locks[s].lock);
-    for (size_t s = ZAN_TASK_SHARDS; s-- > 0;)
-      spin_unlock_at(&g_frame_locks[s].lock);
-    spin_unlock_at(&g_grow_lock.lock);
-
-    *shard_io = lock_frame_shard(frame, cap_io);
-  }
 }
 static void task_profile_release(zan_task_profile *profile) {
   if (profile && --profile->refs == 0) {
@@ -507,9 +424,9 @@ void zan_task_run_profiled(void *frame, zan_co_step_t step) {
   zan_task_profile_slice *previous = g_profile_slice;
   task_profile_pause(previous);
   if (__atomic_load_n(&g_profile_count, __ATOMIC_ACQUIRE)) {
-    size_t cap = 0;
-    size_t shard = lock_frame_shard(frame, &cap);
-    zan_task_entry *entry = task_frame_cap(frame, cap);
+    task_shard *s = task_shard_of(frame);
+    task_lock(s);
+    zan_task_entry *entry = task_frame(s, frame);
     if (entry && entry->profile) {
       profile_lock();
       if (!entry->profile->closed) {
@@ -525,7 +442,7 @@ void zan_task_run_profiled(void *frame, zan_co_step_t step) {
       }
       profile_unlock();
     }
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
   }
   g_profile_slice = &slice;
   task_profile_resume(&slice);
@@ -565,16 +482,16 @@ void zan_task_profile_checkpoint(void *frame) {
   if (!slice || slice->frame != frame || !slice->profile)
     return;
   task_profile_pause(slice);
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_frame_cap(frame, cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, frame);
   profile_lock();
   if (entry && entry->profile == slice->profile)
     task_profile_detach_locked(entry);
   task_profile_release(slice->profile);
   slice->profile = NULL;
   profile_unlock();
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
 }
 
 /* Bit 0 retains the execution-slice option. Bit 1 enables phase accounting. */
@@ -597,11 +514,11 @@ int zan_task_profile_begin(int flags) {
         malloc(ZAN_PROFILE_MAX_EXECUTION * sizeof(*profile->execution));
   }
 #endif
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(slice->frame, &cap);
-  zan_task_entry *entry = task_frame_cap(slice->frame, cap);
+  task_shard *s = task_shard_of(slice->frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, slice->frame);
   if (!entry || entry->retire || entry->profile) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     task_profile_release(profile);
     return 0;
   }
@@ -616,7 +533,7 @@ int zan_task_profile_begin(int flags) {
   slice->open_stages = 0;
   __atomic_add_fetch(&g_profile_count, 1, __ATOMIC_RELEASE);
   profile_unlock();
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
   task_profile_resume(slice);
   return 1;
 }
@@ -637,12 +554,12 @@ void zan_task_profile_stage_set(int64_t id, int slot, int open) {
     return;
   task_profile_pause(slice);
   slice->open_stages = next;
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(slice->frame, &cap);
-  zan_task_entry *entry = task_frame_cap(slice->frame, cap);
+  task_shard *s = task_shard_of(slice->frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, slice->frame);
   if (entry && entry->profile == slice->profile)
     entry->open_stages = next;
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
   task_profile_resume(slice);
 }
 
@@ -655,9 +572,9 @@ void zan_task_profile_wait(void *frame, const char *file, int32_t line,
     return;
   zan_task_profile *profile = slice->profile;
   int64_t start = zan_co_precise_us();
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_frame_cap(frame, cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, frame);
   profile_lock();
   if (!profile->closed && entry && entry->profile == profile &&
       !entry->pending_wait) {
@@ -672,7 +589,7 @@ void zan_task_profile_wait(void *frame, const char *file, int32_t line,
     }
   }
   profile_unlock();
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
 }
 
 void *zan_task_profile_end(int64_t *cpu, int64_t *bytes, int64_t *slices,
@@ -681,9 +598,9 @@ void *zan_task_profile_end(int64_t *cpu, int64_t *bytes, int64_t *slices,
   if (!slice || !slice->profile || slice->profile->root != slice->frame)
     return NULL;
   task_profile_pause(slice);
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(slice->frame, &cap);
-  zan_task_entry *entry = task_frame_cap(slice->frame, cap);
+  task_shard *s = task_shard_of(slice->frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, slice->frame);
   profile_lock();
   zan_task_profile *profile = slice->profile;
   profile->closed = 1;
@@ -695,7 +612,7 @@ void *zan_task_profile_end(int64_t *cpu, int64_t *bytes, int64_t *slices,
     task_profile_detach_locked(entry);
   slice->profile = NULL; /* Transfer the resume's reference to the report. */
   profile_unlock();
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
   return profile;
 }
 
@@ -761,93 +678,24 @@ void zan_task_profile_release_report(void *report) {
   profile_unlock();
 }
 
-static void task_recycle(zan_task_entry *entry, size_t shard, size_t cap) {
-  zan_task_entry **link =
-      &g_task_buckets[task_bucket((uintptr_t)entry->frame, cap)].frames;
-  while (*link != entry)
-    link = &(*link)->frame_next;
-  *link = entry->frame_next;
+/* Release a slot: unindex, detach profiler if attached, zero, free-list.
+ * Edges naming it go stale. */
+static void task_drop(task_shard *s, zan_task_entry *entry) {
   if (entry->profile) {
     profile_lock();
     task_profile_detach_locked(entry);
     profile_unlock();
   }
-  uint64_t next_seq = entry->seq + 1;
+  task_index_remove(s, entry->frame);
+  size_t slot = (size_t)(entry - s->entries);
   memset(entry, 0, sizeof(*entry));
-  entry->seq = next_seq;
-  if (g_shard_free_count[shard] < ZAN_TASK_SHARD_FREE_CAP) {
-    entry->frame_next = g_shard_free[shard];
-    g_shard_free[shard] = entry;
-    ++g_shard_free_count[shard];
-  } else {
-    spin_lock_at(&g_reserve_lock.lock);
-    entry->frame_next = g_task_free;
-    g_task_free = entry;
-    ++g_task_free_count;
-    spin_unlock_at(&g_reserve_lock.lock);
-  }
-  __atomic_sub_fetch(&g_task_count, 1, __ATOMIC_RELAXED);
+  s->free_slots[s->free_n++] = (uint32_t)slot;
 }
-static void task_unlink_child(zan_task_entry *parent) {
-  if (!parent->child)
-    return;
-  *parent->parent_link = parent->parent_next;
-  if (parent->parent_next)
-    parent->parent_next->parent_link = parent->parent_link;
-  parent->child = NULL;
-  parent->parent_next = NULL;
-  parent->parent_link = NULL;
-}
-static void lock_two_frame_shards(void *f1, void *f2, size_t *s1_out,
-                                  size_t *s2_out, size_t *cap_out) {
-  for (;;) {
-    size_t cap = __atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE);
-    if (!cap) {
-      task_ensure_init();
-      continue;
-    }
-    size_t s1 = frame_shard_for(f1, cap);
-    size_t s2 = frame_shard_for(f2, cap);
-    if (s1 == s2) {
-      spin_lock_at(&g_frame_locks[s1].lock);
-    } else if (s1 < s2) {
-      spin_lock_at(&g_frame_locks[s1].lock);
-      spin_lock_at(&g_frame_locks[s2].lock);
-    } else {
-      spin_lock_at(&g_frame_locks[s2].lock);
-      spin_lock_at(&g_frame_locks[s1].lock);
-    }
-    if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE) == cap) {
-      *s1_out = s1;
-      *s2_out = s2;
-      *cap_out = cap;
-      return;
-    }
-    spin_unlock_at(&g_frame_locks[s1].lock);
-    if (s2 != s1)
-      spin_unlock_at(&g_frame_locks[s2].lock);
-  }
-}
-static void lock_sorted_shards(size_t *shards, size_t n) {
-  for (size_t i = 0; i < n; ++i) {
-    for (size_t j = i + 1; j < n; ++j) {
-      if (shards[j] < shards[i]) {
-        size_t tmp = shards[i];
-        shards[i] = shards[j];
-        shards[j] = tmp;
-      }
-    }
-  }
-  for (size_t i = 0; i < n; ++i) {
-    if (i == 0 || shards[i] != shards[i - 1])
-      spin_lock_at(&g_frame_locks[shards[i]].lock);
-  }
-}
-static void unlock_sorted_shards(const size_t *shards, size_t n) {
-  for (size_t i = n; i-- > 0;) {
-    if (i == 0 || shards[i] != shards[i - 1])
-      spin_unlock_at(&g_frame_locks[shards[i]].lock);
-  }
+static size_t task_capacity_bound(void) {
+  size_t total = 0;
+  for (unsigned i = 0; i < TASK_SHARDS; ++i)
+    total += __atomic_load_n(&g_task_shards[i].capacity, __ATOMIC_RELAXED);
+  return total + 1;
 }
 /* Called before publication. Addresses are supplied by the compiler rather
  * than inferred from a driver-specific frame layout. NULL leaves a field alone.
@@ -856,11 +704,11 @@ void zan_task_frame_config(void *frame, const volatile int *done,
                            volatile int *cancel) {
   if (!frame)
     abort();
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_slot_locked(frame, &shard, &cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_slot(s, frame);
   if (entry->retire) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     abort();
   }
   if (done)
@@ -880,416 +728,240 @@ void zan_task_frame_config(void *frame, const volatile int *done,
     profile_unlock();
   }
   entry->configured = 1;
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
 }
 /* Record allocation provenance before publishing the frame. Retirement never
  * probes bytes before an address to guess which allocator owns it. */
 void zan_task_frame_allocator(void *frame, void (*release)(void *)) {
   if (!frame || !release)
     abort();
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_slot_locked(frame, &shard, &cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_slot(s, frame);
   if (entry->retire || entry->allocator_release) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     abort();
   }
   entry->allocator_release = release;
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
 }
 void zan_task_discard_config(void *frame, void (*discard)(void *)) {
   if (!frame || !discard)
     abort();
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_slot_locked(frame, &shard, &cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_slot(s, frame);
   if (entry->retire) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     abort();
   }
   entry->discard = discard;
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
 }
 /* The caller owns a consuming pin. Take the callback once, then run arbitrary
  * typed result and exception destructors outside the registry lock. */
 void zan_task_discard(void *frame) {
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_frame_cap(frame, cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, frame);
   if (!entry || entry->generation || !entry->pins || !entry->discard) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     abort();
   }
   void (*discard)(void *) = entry->discard;
   entry->discard = NULL;
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
   discard(frame);
 }
 uint64_t zan_task_register(void *frame, const volatile int *done) {
   if (!frame || !done)
     abort();
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_slot_locked(frame, &shard, &cap);
-  if (entry->generation || entry->retire) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
-    abort();
-  }
+  task_shard *s = task_shard_of(frame);
   /* Exhaustion is fatal, never wrap to a generation a saved long can name. */
-  uint64_t token = __atomic_add_fetch(&g_task_generation, 1, __ATOMIC_RELAXED);
-  if (token > (uint64_t)INT64_MAX) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+  uint64_t seq = __atomic_add_fetch(&g_task_generation, 1, __ATOMIC_RELAXED);
+  if (seq >= (uint64_t)INT64_MAX / TASK_SHARDS)
+    abort();
+  uint64_t token = seq * TASK_SHARDS + (uint64_t)(s - g_task_shards);
+  task_lock(s);
+  zan_task_entry *entry = task_slot(s, frame);
+  if (entry->generation || entry->retire) {
+    task_unlock(s);
     abort();
   }
-  size_t tshard = token_shard_for(token, cap);
-  spin_lock_at(&g_token_locks[tshard].lock);
-  entry->done = done;
   entry->generation = token;
-  task_index_token(entry, cap);
-  spin_unlock_at(&g_token_locks[tshard].lock);
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  entry->done = done;
+  task_unlock(s);
   return token;
 }
 int zan_task_isdone(uint64_t token) {
   if (!token)
     return 1;
-  size_t cap = 0;
-  size_t tshard = lock_token_shard(token, &cap);
-  if (tshard == ZAN_TASK_SHARDS)
-    return 1;
-  zan_task_entry *entry = task_find_cap(token, cap);
+  task_shard *s = task_shard_of_token(token);
+  task_lock(s);
+  zan_task_entry *entry = task_find(s, token);
   int done = !entry || entry->retire ||
              __atomic_load_n(entry->done, __ATOMIC_ACQUIRE) != 0;
-  spin_unlock_at(&g_token_locks[tshard].lock);
+  task_unlock(s);
   return done;
 }
 void *zan_task_acquire(uint64_t token, int consume) {
   if (!token)
     return NULL;
-  size_t cap = 0;
-  size_t tshard = lock_token_shard(token, &cap);
-  if (tshard == ZAN_TASK_SHARDS)
-    return NULL;
-  zan_task_entry *entry = task_find_cap(token, cap);
-  if (!entry) {
-    spin_unlock_at(&g_token_locks[tshard].lock);
-    return NULL;
-  }
-  void *frame = entry->frame;
-  uint64_t seq = entry->seq;
-  spin_unlock_at(&g_token_locks[tshard].lock);
-
-  size_t fcap = 0;
-  size_t fshard = lock_frame_shard(frame, &fcap);
-  void *ret = NULL;
-  if (entry->frame == frame && entry->seq == seq &&
-      entry->generation == token && !entry->retire) {
+  task_shard *s = task_shard_of_token(token);
+  task_lock(s);
+  zan_task_entry *entry = task_find(s, token);
+  void *frame = NULL;
+  if (entry && !entry->retire) {
     ++entry->pins;
-    ret = frame;
+    frame = entry->frame;
     if (consume)
-      task_forget_token_locked(entry, fcap);
+      entry->generation = 0;
   }
-  spin_unlock_at(&g_frame_locks[fshard].lock);
-  return ret;
+  task_unlock(s);
+  return frame;
 }
 void zan_task_unpin(void *frame) {
   if (!frame)
     return;
   void (*retire)(void *) = NULL;
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_frame_cap(frame, cap);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, frame);
   if (!entry || !entry->pins) {
-    spin_unlock_at(&g_frame_locks[shard].lock);
+    task_unlock(s);
     abort();
   }
   --entry->pins;
   if (!entry->pins && entry->retire) {
     retire = entry->retire;
-    task_recycle(entry, shard, cap);
+    task_drop(s, entry);
   }
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_unlock(s);
   if (retire)
     retire(frame);
 }
-static void task_cancel_chain_locked(zan_task_entry *entry, size_t *shard_io,
-                                     size_t *cap_io) {
-  /* Bound traversal even if a malformed await chain contains a cycle.
-   * Hand-over-hand trylock preserves deadlock freedom; sequence validation
-   * prevents ABA when falling back to re-acquire out-of-order shards. */
-  size_t remaining = __atomic_load_n(&g_task_count, __ATOMIC_RELAXED) + 64;
-  while (entry && !entry->retire && remaining--) {
+/* Mark `entry` (held under `s`, which this releases) cancelled, then follow
+ * live await edges one shard at a time. A malformed cycle must not hang
+ * cancellation: valid await edges form a tree, so the walk is bounded by the
+ * slot count. */
+static void task_cancel_chain_locked(task_shard *s, zan_task_entry *entry) {
+  size_t remaining = task_capacity_bound();
+  for (;;) {
+    if (!entry || entry->retire) {
+      task_unlock(s);
+      return;
+    }
     if (entry->cancel)
       __atomic_store_n(entry->cancel, 1, __ATOMIC_RELEASE);
-    zan_task_entry *next = entry->child;
-    if (!next)
-      break;
-    void *next_frame = next->frame;
-    uint64_t next_seq = next->seq;
-    size_t next_shard = frame_shard_for(next_frame, *cap_io);
-    if (next_shard == *shard_io) {
-      entry = next;
-      continue;
-    }
-    if (spin_trylock_at(&g_frame_locks[next_shard].lock)) {
-      spin_unlock_at(&g_frame_locks[*shard_io].lock);
-      *shard_io = next_shard;
-      entry = next;
-      continue;
-    }
-    spin_unlock_at(&g_frame_locks[*shard_io].lock);
-    *shard_io = lock_frame_shard(next_frame, cap_io);
-    zan_task_entry *found = task_frame_cap(next_frame, *cap_io);
-    if (!found || found != next || found->seq != next_seq || found->retire)
-      break;
-    entry = found;
+    void *child = entry->child;
+    uint64_t incarnation = entry->child_incarnation;
+    task_unlock(s);
+    if (!child || !remaining--)
+      return;
+    s = task_shard_of(child);
+    task_lock(s);
+    entry = task_frame(s, child);
+    if (entry && entry->incarnation != incarnation)
+      entry = NULL;
   }
 }
 void zan_task_cancel(uint64_t token) {
   if (!token)
     return;
-  size_t cap = 0;
-  size_t tshard = lock_token_shard(token, &cap);
-  if (tshard == ZAN_TASK_SHARDS)
-    return;
-  zan_task_entry *entry = task_find_cap(token, cap);
-  if (!entry) {
-    spin_unlock_at(&g_token_locks[tshard].lock);
-    return;
-  }
-  void *frame = entry->frame;
-  uint64_t seq = entry->seq;
-  spin_unlock_at(&g_token_locks[tshard].lock);
-
-  size_t fcap = 0;
-  size_t fshard = lock_frame_shard(frame, &fcap);
-  if (entry->frame == frame && entry->seq == seq &&
-      entry->generation == token && !entry->retire)
-    task_cancel_chain_locked(entry, &fshard, &fcap);
-  spin_unlock_at(&g_frame_locks[fshard].lock);
+  task_shard *s = task_shard_of_token(token);
+  task_lock(s);
+  task_cancel_chain_locked(s, task_find(s, token));
 }
 void zan_task_frame_cancel(void *frame) {
   if (!frame)
     return;
-  size_t cap = 0;
-  size_t shard = lock_frame_shard(frame, &cap);
-  zan_task_entry *entry = task_frame_cap(frame, cap);
-  if (entry && !entry->retire)
-    task_cancel_chain_locked(entry, &shard, &cap);
-  spin_unlock_at(&g_frame_locks[shard].lock);
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  task_cancel_chain_locked(s, task_frame(s, frame));
 }
 void zan_task_child(void *parent, void *child) {
-  size_t cap = 0;
-  size_t s_p = lock_frame_shard(parent, &cap);
-  zan_task_entry *p = task_frame_cap(parent, cap);
+  uint64_t incarnation = 0;
+  task_shard *cs = NULL;
+  if (child) {
+    cs = task_shard_of(child);
+    task_lock(cs);
+    zan_task_entry *c = task_frame(cs, child);
+    if (!c || c->retire) {
+      task_unlock(cs);
+      abort();
+    }
+    incarnation = c->incarnation;
+    task_unlock(cs);
+  }
+  task_shard *ps = task_shard_of(parent);
+  task_lock(ps);
+  zan_task_entry *p = task_frame(ps, parent);
   if (!p || p->retire) {
-    spin_unlock_at(&g_frame_locks[s_p].lock);
+    task_unlock(ps);
     abort();
   }
-  /* Fast path: clearing child on await resume (child == NULL). */
-  if (!child) {
-    zan_task_entry *old_c = p->child;
-    if (!old_c) {
-      spin_unlock_at(&g_frame_locks[s_p].lock);
-      return;
-    }
-    size_t s_old = frame_shard_for(old_c->frame, cap);
-    if (s_old == s_p) {
-      task_unlink_child(p);
-      spin_unlock_at(&g_frame_locks[s_p].lock);
-      return;
-    }
-    if (s_old > s_p) {
-      spin_lock_at(&g_frame_locks[s_old].lock);
-      task_unlink_child(p);
-      spin_unlock_at(&g_frame_locks[s_old].lock);
-      spin_unlock_at(&g_frame_locks[s_p].lock);
-      return;
-    }
-  }
-
-  /* Fast path: setting initial child when parent has no prior child. */
-  if (!p->child) {
-    size_t s_c = frame_shard_for(child, cap);
-    if (s_c == s_p || s_c > s_p) {
-      if (s_c > s_p)
-        spin_lock_at(&g_frame_locks[s_c].lock);
-      if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE) == cap) {
-        zan_task_entry *c = task_frame_cap(child, cap);
-        if (!c || c->retire) {
-          if (s_c > s_p)
-            spin_unlock_at(&g_frame_locks[s_c].lock);
-          spin_unlock_at(&g_frame_locks[s_p].lock);
-          abort();
-        }
-        p->child = c;
-        p->parent_next = c->parents;
-        p->parent_link = &c->parents;
-        if (c->parents)
-          c->parents->parent_link = &p->parent_next;
-        c->parents = p;
-        int should_cancel =
-            p->cancel && __atomic_load_n(p->cancel, __ATOMIC_ACQUIRE);
-        if (s_c > s_p)
-          spin_unlock_at(&g_frame_locks[s_c].lock);
-        spin_unlock_at(&g_frame_locks[s_p].lock);
-        if (should_cancel)
-          zan_task_frame_cancel(child);
-        return;
-      }
-      if (s_c > s_p)
-        spin_unlock_at(&g_frame_locks[s_c].lock);
-    }
-  }
-
-  void *old_frame = p->child ? p->child->frame : NULL;
-  spin_unlock_at(&g_frame_locks[s_p].lock);
-
-  for (;;) {
-    size_t cur_cap = __atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE);
-    size_t shards[3];
-    size_t n = 0;
-    shards[n++] = frame_shard_for(parent, cur_cap);
-    if (old_frame)
-      shards[n++] = frame_shard_for(old_frame, cur_cap);
-    if (child)
-      shards[n++] = frame_shard_for(child, cur_cap);
-    lock_sorted_shards(shards, n);
-
-    if (__atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE) != cur_cap) {
-      unlock_sorted_shards(shards, n);
-      continue;
-    }
-    p = task_frame_cap(parent, cur_cap);
-    if (!p || p->retire) {
-      unlock_sorted_shards(shards, n);
-      abort();
-    }
-    void *now_old = p->child ? p->child->frame : NULL;
-    if (now_old != old_frame) {
-      old_frame = now_old;
-      unlock_sorted_shards(shards, n);
-      continue;
-    }
-    zan_task_entry *c = child ? task_frame_cap(child, cur_cap) : NULL;
-    if (child && (!c || c->retire)) {
-      unlock_sorted_shards(shards, n);
-      abort();
-    }
-    task_unlink_child(p);
-    if (c) {
-      p->child = c;
-      p->parent_next = c->parents;
-      p->parent_link = &c->parents;
-      if (c->parents)
-        c->parents->parent_link = &p->parent_next;
-      c->parents = p;
-    }
-    int should_cancel =
-        c && p->cancel && __atomic_load_n(p->cancel, __ATOMIC_ACQUIRE);
-    unlock_sorted_shards(shards, n);
-    if (should_cancel)
-      zan_task_frame_cancel(child);
-    return;
+  p->child = child;
+  p->child_incarnation = incarnation;
+  int cancelled = p->cancel && __atomic_load_n(p->cancel, __ATOMIC_ACQUIRE);
+  task_unlock(ps);
+  if (cancelled && child) {
+    task_lock(cs);
+    zan_task_entry *c = task_frame(cs, child);
+    if (c && c->incarnation != incarnation)
+      c = NULL;
+    task_cancel_chain_locked(cs, c);
   }
 }
-/* Only after the scheduler gives up its final QUEUED/RUNNING owner. Retiring
- * a raw child clears all incoming edges before any address can be reused. */
+/* Only after the scheduler gives up its final QUEUED/RUNNING owner. Edges that
+ * still name this frame go stale with its incarnation, so no reuse of the
+ * address can be reached through them. */
 void zan_task_retire(void *frame, void (*release)(void *)) {
   if (!frame)
     return;
   int deferred = 0;
-  size_t cap = 0;
-  size_t s_f = lock_frame_shard(frame, &cap);
-  for (;;) {
-    zan_task_entry *entry = task_frame_cap(frame, cap);
-    if (!entry) {
-      spin_unlock_at(&g_frame_locks[s_f].lock);
-      if (release)
-        release(frame);
-      return;
-    }
+  task_shard *s = task_shard_of(frame);
+  task_lock(s);
+  zan_task_entry *entry = task_frame(s, frame);
+  if (entry) {
+    entry->generation = 0;
+    entry->child = NULL;
+    entry->child_incarnation = 0;
     if (entry->retire) {
-      spin_unlock_at(&g_frame_locks[s_f].lock);
+      task_unlock(s);
       return;
     }
-    if (entry->parents) {
-      zan_task_entry *p = entry->parents;
-      size_t s_p = frame_shard_for(p->frame, cap);
-      if (s_p == s_f) {
-        task_unlink_child(p);
-        continue;
-      }
-      if (s_p > s_f) {
-        spin_lock_at(&g_frame_locks[s_p].lock);
-        task_unlink_child(p);
-        spin_unlock_at(&g_frame_locks[s_p].lock);
-        continue;
-      }
-      void *pf = p->frame;
-      spin_unlock_at(&g_frame_locks[s_f].lock);
-      lock_two_frame_shards(pf, frame, &s_p, &s_f, &cap);
-      entry = task_frame_cap(frame, cap);
-      if (!entry || entry->retire) {
-        spin_unlock_at(&g_frame_locks[s_f].lock);
-        if (s_p != s_f)
-          spin_unlock_at(&g_frame_locks[s_p].lock);
-        return;
-      }
-      zan_task_entry *p2 = task_frame_cap(pf, cap);
-      if (p2 && p2->child == entry)
-        task_unlink_child(p2);
-      if (s_p != s_f)
-        spin_unlock_at(&g_frame_locks[s_p].lock);
-      continue;
-    }
-    if (entry->child) {
-      zan_task_entry *c = entry->child;
-      size_t s_c = frame_shard_for(c->frame, cap);
-      if (s_c == s_f) {
-        task_unlink_child(entry);
-        continue;
-      }
-      if (s_c > s_f) {
-        spin_lock_at(&g_frame_locks[s_c].lock);
-        task_unlink_child(entry);
-        spin_unlock_at(&g_frame_locks[s_c].lock);
-        continue;
-      }
-      void *cf = c->frame;
-      spin_unlock_at(&g_frame_locks[s_f].lock);
-      lock_two_frame_shards(cf, frame, &s_c, &s_f, &cap);
-      entry = task_frame_cap(frame, cap);
-      if (!entry || entry->retire) {
-        spin_unlock_at(&g_frame_locks[s_f].lock);
-        if (s_c != s_f)
-          spin_unlock_at(&g_frame_locks[s_c].lock);
-        return;
-      }
-      if (entry->child && entry->child->frame == cf)
-        task_unlink_child(entry);
-      if (s_c != s_f)
-        spin_unlock_at(&g_frame_locks[s_c].lock);
-      continue;
-    }
-    task_forget_token_locked(entry, cap);
     if (entry->allocator_release)
       release = entry->allocator_release;
     if (entry->pins) {
       entry->retire = release;
       deferred = 1;
     } else {
-      task_recycle(entry, s_f, cap);
+      task_drop(s, entry);
     }
-    break;
   }
-  spin_unlock_at(&g_frame_locks[s_f].lock);
-  if (!deferred)
+  task_unlock(s);
+  if (!deferred && release)
     release(frame);
 }
 size_t zan_task_live_count(void) {
-  return __atomic_load_n(&g_task_count, __ATOMIC_ACQUIRE);
+  size_t count = 0;
+  for (unsigned k = 0; k < TASK_SHARDS; ++k) {
+    task_shard *s = &g_task_shards[k];
+    task_lock(s);
+    for (size_t i = 0; i < s->capacity; ++i)
+      if (s->entries[i].frame)
+        ++count;
+    task_unlock(s);
+  }
+  return count;
 }
 size_t zan_task_slot_capacity(void) {
-  return __atomic_load_n(&g_task_capacity, __ATOMIC_ACQUIRE);
+  size_t capacity = 0;
+  for (unsigned k = 0; k < TASK_SHARDS; ++k) {
+    task_shard *s = &g_task_shards[k];
+    task_lock(s);
+    capacity += s->capacity;
+    task_unlock(s);
+  }
+  return capacity;
 }

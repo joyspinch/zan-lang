@@ -523,6 +523,15 @@ else {
              "cc \"%s\" -o \"%s\" -lm -Wl,--gc-sections", obj_tmp, obj_path);
   }
 #endif
+  /* Publish sharding (shard_emit.c) moves most functions into extra
+   * objects; they were never on this host link line, so every sharded
+   * Unix publish failed with undefined symbols. */
+  for (int oi = 0; oi < generated_objects.count; oi++) {
+    if (strcmp(generated_objects.paths[oi], obj_tmp) == 0)
+      continue;
+    cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"",
+                generated_objects.paths[oi]);
+  }
   if (rt_io_obj) {
     cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_io_obj);
   }
@@ -633,6 +642,8 @@ else {
   {
     cmd_appendf(link_cmd, sizeof(link_cmd), " -lm");
   }
+  if (getenv("ZAN_LINK_ECHO"))
+    fprintf(stderr, "[link] %s\n", link_cmd);
   link_ret = system(link_cmd);
 #endif
 }

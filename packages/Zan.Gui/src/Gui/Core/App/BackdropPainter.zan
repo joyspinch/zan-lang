@@ -1,0 +1,408 @@
+using System;
+using Gui.Backend;
+
+namespace Gui;
+
+// 窗口背景绘制服务（App.Backdrop）：皮肤壁纸（渐变 + 柔和色斑 / 玻璃彩斑）、
+// 用户壁纸图淡入、异形窗口的投影与底色铺满，以及按槽缓存的背景快照。
+// 从 App 拆出（B-ID174）；App 只留 RenderBackground 门面。
+public class BackdropPainter {
+    private weak App app;
+
+    public BackdropPainter(App owner) {
+        app = owner;
+    }
+
+    // 将壁纸快速拷贝到 [x,y,w,h]，居中裁剪覆盖，使图片
+    // 保持宽高比，然后淡入到下方皮肤背景中。
+    public void RenderWallpaperImage(int x, int y, int w, int h) {
+        if (app.bgImagePath == "") { return; }
+        int iw = Canvas.ImageWidth(app.bgImagePath);
+        int ih = Canvas.ImageHeight(app.bgImagePath);
+        if (iw <= 0 || ih <= 0) { return; }
+        // 目标尺寸为零会在下面的覆盖比例中除零。
+        if (w <= 0 || h <= 0) { return; }
+        // 覆盖：与目标宽高比一致的最大居中源矩形。
+        int sw = iw;
+        int sh = ih;
+        if (iw * h > w * ih) {
+            sw = w * ih / h;
+        } else {
+            sh = h * iw / w;
+        }
+        if (sw < 1) { sw = 1; }
+        if (sh < 1) { sh = 1; }
+        app.canvas.BlitImage(app.bgImagePath, x, y, w, h,
+                         (iw - sw) / 2, (ih - sh) / 2, sw, sh);
+        // 向皮肤背景淡出：以页面色绘制遮罩，强度为
+        // 所请求不透明度的补值。皮肤自身的美术
+        // 本就是为背景设计的——它以全强度呈现，由
+        // 半透明表面完成混合——因此只有用户选择的
+        // 壁纸才加遮罩。
+        int fade = 100 - app.WallpaperOpacity();
+        if (fade > 0 && !app.SkinArtWallpaper()) {
+            StyleBox fadeStyle = Style.Part(app, "windowbg", "fade", "",
+                                            "", "", Style.SNormal());
+            int fadeBg = fadeStyle.BgOr(0);
+            int rgb = fadeBg % 16777216;
+            if (rgb < 0) { rgb = rgb + 16777216; }
+            app.canvas.FillRect(x, y, w, h, (fade * 255 / 100) * 16777216 + rgb);
+        }
+    }
+
+    // ---- 主题化窗口背景（内置，所有窗口共用） ---------
+    // 让渐变/玻璃/霓虹皮肤显得真实的壁纸：
+    // 垂直渐变加上磨砂面板模糊掉的柔和色斑。
+    // 它位于框架中，使 IDE、画廊与任何窗口渲染出相同的
+    // 皮肤——应用只需在内容后面调用 RenderBackground。
+
+    // 单个柔和壁纸光晕：平滑径向渐隐到明亮的中心（无
+    // 生硬边缘），为背景模糊提供可柔化的真实色彩。
+    public void BackdropBlob(int cx, int cy, int r, int cr, int cg, int cb) {
+        // 一次逐像素径向渐隐（Canvas.FillRadial），而非叠加多个
+        // 半透明圆盘：叠加的圆盘会在边缘形成可见的"靶心"环带，
+        // 而这是一次拷贝而不是 20 次。
+        app.canvas.FillRadial(cx, cy, r, Theme.Rgb(cr, cg, cb), 150);
+    }
+
+    // 由打包 ARGB 主题强调色着色的柔和光晕。
+    public void BackdropDrift(int cx, int cy, int r, int color) {
+        int cr = (color / 65536) % 256;
+        int cg = (color / 256) % 256;
+        int cb = color % 256;
+        this.BackdropBlob(cx, cy, r, cr, cg, cb);
+    }
+
+    // 在垂直渐变上叠加来自主题强调色的色斑
+    // （非玻璃渐变预设），使渐变更像壁纸。
+    public void BackdropGradientWallpaper(int ax, int ay, int aw, int ah) {
+        StyleBox primaryStyle = Style.Part(app, "windowbg", "blob", "",
+                                            "", "", Style.SNormal());
+        StyleBox infoStyle = Style.Part(app, "windowbg", "blob", "",
+                                        "info", "", Style.SNormal());
+        StyleBox successStyle = Style.Part(app, "windowbg", "blob", "",
+                                           "success", "", Style.SNormal());
+        StyleBox errorStyle = Style.Part(app, "windowbg", "blob", "",
+                                         "error", "", Style.SNormal());
+        int r = app.Scale(340);
+        this.BackdropDrift(ax + aw * 20 / 100, ay + ah * 24 / 100, r,
+                           primaryStyle.BgOr(0));
+        this.BackdropDrift(ax + aw * 74 / 100, ay + ah * 18 / 100, r,
+                           infoStyle.BgOr(0));
+        this.BackdropDrift(ax + aw * 82 / 100, ay + ah * 72 / 100, r,
+                           successStyle.BgOr(0));
+        this.BackdropDrift(ax + aw * 30 / 100, ay + ah * 84 / 100, r,
+                           errorStyle.BgOr(0));
+    }
+
+    // 为磨砂玻璃预设准备的 iOS 风格多彩壁纸。
+    public void BackdropGlassWallpaper(int ax, int ay, int aw, int ah) {
+        this.BackdropBlob(ax + aw * 14 / 100, ay + ah * 20 / 100,
+            app.Scale(320), 128, 96, 245);
+        this.BackdropBlob(ax + aw * 40 / 100, ay + ah * 34 / 100,
+            app.Scale(300), 236, 120, 175);
+        this.BackdropBlob(ax + aw * 78 / 100, ay + ah * 16 / 100,
+            app.Scale(320), 96, 156, 255);
+        this.BackdropBlob(ax + aw * 62 / 100, ay + ah * 72 / 100,
+            app.Scale(340), 240, 112, 196);
+        this.BackdropBlob(ax + aw * 30 / 100, ay + ah * 86 / 100,
+            app.Scale(300), 96, 222, 208);
+        this.BackdropBlob(ax + aw * 90 / 100, ay + ah * 58 / 100,
+            app.Scale(280), 156, 120, 250);
+    }
+
+    // 与壁纸共用调用方的背景槽；只在完整帧捕获形状与阴影的透明基面。
+    // 保存区域值而非列表身份，使原地改几何也能使缓存失效。
+    WindowShapeDescription bgShapeSnapshot;
+    Theme bgShapeTheme;
+    string bgShapeSpec;
+    int bgShapeWidth;
+    int bgShapeHeight;
+    int bgShapeDpi;
+    int bgShapeMetrics;
+    int bgShapeRadius;
+    int bgShapeMode;
+    int bgShapeSlot;
+    int bgShapeGradient;
+    int bgShapeGradTop;
+    int bgShapeGradBottom;
+    int bgShapeGlass;
+
+    public bool ShapeBackgroundMatches(int width, int height, int slot) {
+        if (bgShapeSnapshot == null || bgShapeTheme != app.theme
+        || bgShapeWidth != width || bgShapeHeight != height
+        || bgShapeDpi != app.dpiScale || bgShapeMetrics != app.metricsScale
+        || bgShapeRadius != app.shapeRadius || bgShapeMode != app.shapeMode
+        || bgShapeSlot != slot
+        || bgShapeSpec != app.shapeSpec
+        || bgShapeSnapshot.shadow != app.shapeShadow
+        || bgShapeSnapshot.offsetX != app.shapeOffX
+        || bgShapeSnapshot.offsetY != app.shapeOffY
+        || bgShapeGradient != app.theme.gradient
+        || bgShapeGradTop != app.theme.bgGradTop
+        || bgShapeGradBottom != app.theme.bgGradBottom
+        || bgShapeGlass != app.theme.glass) { return false; }
+        int count = app.shapeRegions == null ? 0 : app.shapeRegions.Count;
+        if (bgShapeSnapshot.regions.Count != count) { return false; }
+        for (int i = 0; i < count; i = i + 1) {
+            WindowShapeRegion a = bgShapeSnapshot.regions[i];
+            WindowShapeRegion b = app.shapeRegions[i];
+            if (a.kind != b.kind || a.x != b.x || a.y != b.y
+            || a.width != b.width || a.height != b.height
+            || a.radius != b.radius) { return false; }
+        }
+        return true;
+    }
+
+    public void RememberShapeBackground(int width, int height, int slot) {
+        WindowShapeDescription snapshot = new WindowShapeDescription();
+        snapshot.shadow = app.shapeShadow;
+        snapshot.offsetX = app.shapeOffX;
+        snapshot.offsetY = app.shapeOffY;
+        if (app.shapeRegions != null) {
+            for (int i = 0; i < app.shapeRegions.Count; i = i + 1) {
+                snapshot.regions.Add(app.shapeRegions[i].Clone());
+            }
+        }
+        bgShapeSnapshot = snapshot;
+        bgShapeTheme = app.theme;
+        bgShapeSpec = app.shapeSpec;
+        bgShapeWidth = width;
+        bgShapeHeight = height;
+        bgShapeDpi = app.dpiScale;
+        bgShapeMetrics = app.metricsScale;
+        bgShapeRadius = app.shapeRadius;
+        bgShapeMode = app.shapeMode;
+        bgShapeSlot = slot;
+        bgShapeGradient = app.theme.gradient;
+        bgShapeGradTop = app.theme.bgGradTop;
+        bgShapeGradBottom = app.theme.bgGradBottom;
+        bgShapeGlass = app.theme.glass;
+        app.bgSnapGen = app.bgThemeGen;
+    }
+
+    // 将当前皮肤的窗口背景绘制到 [x,y,w,h]：渐变 +
+    // 柔和色斑（用于渐变/玻璃预设，使磨砂面板能模糊
+    // 真实色彩），否则为纯色 bgPrimary 填充。每次重绘缓存——
+    // 仅动画的帧用一次拷贝恢复像素，而非
+    // 重绘（昂贵的）色斑。`slot` 是调用方
+    // 为其背景预留的快照缓存槽。
+    public void RenderBackground(int x, int y, int w, int h, int slot) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        // 异形窗口：表面在 BeginFrame 里被清成 alpha 0，操作系统
+        // 只负责按轮廓合成，轮廓内的像素仍要自己画——所以这里
+        // 用皮肤底色铺满每个形状区域（先画投影，再铺底），
+        // 设计里没有铺满窗口的背景控件时，窗口才不会整个透明。
+        // 参数是内容区坐标（调用方按 ContentTop/ClientWidth 布局），
+        // 这里忽略：轮廓与阴影带覆盖整幅表面，按画布坐标一次画完。
+        if (app.shapeMode != 0) {
+            int width = c.Width();
+            int height = c.Height();
+            bool matches = this.ShapeBackgroundMatches(width, height, slot);
+            if (matches && app.bgSnapGen == app.bgThemeGen
+            && c.RestoreRect(0, 0, width, height, slot)) { return; }
+            // RestoreRect 只写当前 clip；SnapshotRect 却读取整个矩形。
+            // 局部 miss 时不能捕获 clip 外上一帧的控件，也不能扩张 draw clip。
+            app.bgSnapGen = 0;
+            if (app.shapeShadow > 0) { this.PaintShapeShadow(); }
+            this.PaintShapeFill();
+            // 异形背景只绘制上述静态形状；渐变壁纸与动态 Fx 不进入此分支。
+            // 仍记录主题渐变参数，防止切换渐变状态后复用旧主题基面。
+            if (!app.Damage.partialFrame) {
+                c.SnapshotRect(0, 0, width, height, slot);
+                this.RememberShapeBackground(width, height, slot);
+            }
+            return;
+        }
+        if (bgShapeSnapshot != null) {
+            // 壁纸和形状可能恰好同尺寸、同槽、同主题代次，不能互相恢复。
+            bgShapeSnapshot = null;
+            bgShapeTheme = null;
+            app.bgSnapGen = 0;
+        }
+        // 原生玻璃：窗口是一张扁平的半透明薄片（在
+        // BeginFrame 中清除），覆盖在 OS 模糊的桌面之上。加上柔和的从上到下
+        // 光泽，使玻璃具有纵深（顶部更亮），如同真实的
+        // 亚克力而非一块平板。
+        if (app.glassNative) {
+            StyleBox sheenStyle = Style.Part(app, "windowbg", "sheen", "",
+                                             "", "", Style.SNormal());
+            int hi = sheenStyle.BgOr(0) % 16777216;
+            if (hi < 0) { hi = hi + 16777216; }
+            int bands = 18;
+            int bh = h / 3 / bands;
+            if (bh < 1) { bh = 1; }
+            for (int i = 0; i < bands; i = i + 1) {
+                int a = 15 - (15 * i / bands);
+                c.FillRect(x, y + i * bh, w, bh, a * 16777216 + hi);
+            }
+            return;
+        }
+        if (t.gradient != 0 || app.bgImagePath != "") {
+            // 壁纸（渐变 + 柔和色斑）对每个皮肤+尺寸是静态的，因此
+            // 每帧从快照恢复——包括脏帧——
+            // 只要皮肤代次匹配。只有皮肤变更
+            // （bgThemeGen 递增）或尺寸变化（RestoreRect 几何不匹配）
+            // 才触发昂贵的重绘。这使玻璃/渐变皮肤在
+            // 滚动或输入时保持流畅，而非每帧重新绘制色斑。
+            bool restored = false;
+            if (app.bgSnapGen == app.bgThemeGen) {
+                restored = c.RestoreRect(x, y, w, h, slot);
+            }
+            if (!restored) {
+                app.bgSnapGen = 0;
+                // 径向色斑可越出背景矩形；限制到快照范围，使冷帧和恢复帧
+                // 对矩形之外的像素保持一致。PushClip 与已有损伤裁剪取交集。
+                c.PushClip(x, y, w, h);
+                try {
+                    if (t.gradient != 0) {
+                        c.FillVGrad(x, y, w, h, t.bgGradTop, t.bgGradBottom);
+                        if (t.glass != 0) {
+                            this.BackdropGlassWallpaper(x, y, w, h);
+                        } else {
+                            this.BackdropGradientWallpaper(x, y, w, h);
+                        }
+                    } else {
+                        StyleBox bgStyle = Control.BareBox(app, "windowbg", Style.SNormal());
+                        c.FillRect(x, y, w, h, bgStyle.BgOr(0));
+                    }
+                    this.RenderWallpaperImage(x, y, w, h);
+                } finally { c.PopClip(); }
+                if (!app.Damage.partialFrame) {
+                    c.SnapshotRect(x, y, w, h, slot);
+                    app.bgSnapGen = app.bgThemeGen;
+                }
+            }
+        } else {
+            StyleBox bgStyle = Control.BareBox(app, "windowbg", Style.SNormal());
+            c.FillRect(x, y, w, h, bgStyle.BgOr(0));
+        }
+    }
+
+    // 用皮肤底色铺满异形窗口的轮廓（见 RenderBackground）。
+    // 类型 3 的阴影带只是把系统表面撑大，不参与填充。
+    // 填充铺满整个轮廓：内容贴着窗口边缘，投影从轮廓边缘向外
+    // 衰减到阴影带里（见 PaintShapeShadow）；落在轮廓内的那半圈
+    // 衰减带被这张不透明底色盖住，不会脏到内容。
+    public void PaintShapeFill() {
+        if (app.shapeRegions == null || app.shapeRegions.Count == 0) {
+            return;
+        }
+        StyleBox shapeStyle = Style.Part(app, "windowbg", "shape", "",
+                                          "", "", Style.SNormal());
+        int col = shapeStyle.BgOr(0);
+        if (col == 0) {
+            StyleBox bgStyle = Control.BareBox(app, "windowbg", Style.SNormal());
+            col = bgStyle.BgOr(0);
+        }
+        if (col == 0) {
+            StyleBox winStyle = Style.Part(app, "window", "base", "", "", "", Style.SNormal());
+            col = winStyle.BgOr(0);
+        }
+
+        // Only a full, single-region background without shadow is an initial layer.
+        // Native also checks destination alpha; ordinary callers keep source-over.
+        int solidRegions = 0;
+        for (int i = 0; i < app.shapeRegions.Count; i = i + 1) {
+            if (app.shapeRegions[i].kind != 3) { solidRegions = solidRegions + 1; }
+        }
+        this.PaintShapeRegions(col, !app.Damage.partialFrame && app.shapeShadow == 0 && solidRegions == 1);
+    }
+
+    public void PaintContentMask(int x, int y, int width, int height, int color) {
+        if (width <= 0 || height <= 0 || color == 0) { return; }
+        if (app.shapeMode == 0 || app.shapeRegions == null || app.shapeRegions.Count == 0) {
+            app.canvas.FillRect(x, y, width, height, color);
+            return;
+        }
+        app.canvas.PushClip(x, y, width, height);
+        try { this.PaintShapeRegions(color, false); }
+        finally { app.canvas.PopClip(); }
+    }
+
+    private void PaintShapeRegions(int col, bool initial) {
+        Canvas c = app.canvas;
+        for (int ri = 0; ri < app.shapeRegions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = app.shapeRegions[ri];
+            if (reg.kind != 3) {
+                int x = app.Scale(reg.x);
+                int y = app.Scale(reg.y);
+                int w = app.Scale(reg.width);
+                int h = app.Scale(reg.height);
+                int r = app.Scale(reg.radius);
+                if (r < 0) { r = 0; }
+                if (w > 0 && h > 0) {
+                    if (reg.kind == 2) {
+                        this.FillEllipse(x, y, w, h, col);
+                    } else if (initial) {
+                        c.FillInitialShape(x, y, w, h, r, col);
+                    } else if (r > 0) {
+                        c.FillRoundRect(x, y, w, h, r, col);
+                    } else {
+                        c.FillRect(x, y, w, h, col);
+                    }
+                }
+            }
+        }
+    }
+
+    // 椭圆填充（渲染器只有正圆），按行扫描：轮廓由
+    // 操作系统裁剪，这里只要把里面填实。
+    public void FillEllipse(int x, int y, int w, int h, int col) {
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = app.canvas;
+        int rx = w / 2;
+        int ry = h / 2;
+        if (rx <= 0 || ry <= 0) { return; }
+        int cx = x + rx;
+        int cy = y + ry;
+        for (int dy = 0 - ry; dy <= ry; dy = dy + 1) {
+            int inside = ry * ry - dy * dy;
+            if (inside <= 0) { continue; }
+            int hw = rx * App.ISqrt(inside) / ry;
+            if (hw <= 0) { continue; }
+            c.FillRect(cx - hw, cy + dy, hw * 2, 1, col);
+        }
+    }
+
+    // 将异形轮廓的柔和投影绘制到表面，
+    // 位于控件树之下（由 RenderBackground 调用）。每个非阴影带区域
+    // 以圆角 SDF 一次出图（Canvas.ShadowRoundRect）——外轮廓到
+    // 圆角形状的有符号距离在 blur 带上做 smoothstep 衰减，每个像素
+    // 只写一次，半透明阴影色合成到标称 alpha，角部衰减连续。
+    // 类型 3 阴影带区域（由 formgen 为 winShadow 添加）只扩展
+    // OS 表面，不投射阴影。
+    public void PaintShapeShadow() {
+        if (app.shapeRegions == null || app.shapeRegions.Count == 0 || app.shapeShadow <= 0) {
+            return;
+        }
+        Canvas c = app.canvas;
+        int blur = app.Scale(app.shapeShadow);
+        if (blur <= 0) { return; }
+        StyleBox shadowStyle = Style.Part(app, "windowbg", "shape-shadow",
+                                           "", "", "", Style.SNormal());
+        int baseCol = shadowStyle.BgOr(0);
+        if (baseCol == 0) { return; }
+        // 峰值 alpha：主题的阴影着色。火绒及现代桌面贴边约三到四成黑，
+        // 向外自然平滑衰减。
+        int peak = (baseCol >> 24) & 255;
+        if (peak < 80) { peak = 80; }
+        if (peak > 110) { peak = 110; }
+        int rgb = baseCol % 16777216;
+        if (rgb < 0) { rgb = rgb + 16777216; }
+
+        for (int ri = 0; ri < app.shapeRegions.Count; ri = ri + 1) {
+            WindowShapeRegion reg = app.shapeRegions[ri];
+            if (reg.kind == 3) { continue; }
+            int x = app.Scale(reg.x);
+            int y = app.Scale(reg.y);
+            int w = app.Scale(reg.width);
+            int h = app.Scale(reg.height);
+            int r = app.Scale(reg.radius);
+            if (r < 0) { r = 0; }
+            if (w <= 0 || h <= 0) { continue; }
+            c.ShadowRoundRect(x, y, w, h, r, blur * 2, (peak << 24) | rgb);
+        }
+    }
+}

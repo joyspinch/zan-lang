@@ -5,9 +5,28 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # 全量 full（3600+ 条）在托管 4 核机器上 2 小时跑不完，只放夜间；
+  # 推送/PR 跑 smoke 档（~600 条），20 分钟内给信号。
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'ctest tier label (smoke | standard | full)'
+        default: 'full'
+
+env:
+  ZAN_CI_TIER: ${{ github.event_name == 'schedule' && 'full' || github.event.inputs.tier || 'smoke' }}
 
 permissions:
   contents: read
+
+
+# 多会话高频推送：同分支同事件的新运行取消旧运行，避免排队堆积（夜间 schedule 独立分组不被推送打断）。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # main 上多会话约每 15 分钟一推，取消进行中会让运行永远跑不完；main 只替换等待中的。
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Linux + macOS share a POSIX shell and a system C compiler (used by zanc at
@@ -20,6 +39,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || github.event_name == 'pull_request' && 60 || 340 }}
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -66,7 +86,8 @@ jobs:
       # code signing), so that job opts into the explicit skip only.
       env:
         ZAN_ALLOW_SKIP_DAP: ${{ runner.os == 'macOS' && '1' || '0' }}
-      run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure
+      # 按核数并行；档位见顶部 ZAN_CI_TIER（推送 smoke，夜间 full）。
+      run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" -L "^${ZAN_CI_TIER}$"
 
   # Windows uses MSYS2/MinGW, which ships a prebuilt LLVM (with CMake config),
   # clang (used by zanc at link time), CMake and Ninja in one self-contained
@@ -77,6 +98,7 @@ jobs:
       matrix:
         build_type: [Debug, Release]
     runs-on: windows-latest
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || github.event_name == 'pull_request' && 60 || 340 }}
     defaults:
       run:
         shell: msys2 {0}
@@ -104,14 +126,19 @@ jobs:
     # exercises the compiler end to end (compile + link + run real .zan
     # programs), which is the cross-platform guarantee that matters here.
     - name: Build
-      run: cmake --build build --target zanc zanrt_selfhost_bundle zanrt_selfhost_diff_bundle zan_json_oom_test zan_json_trailing_test zan_rpc_framing_test -j
+      run: cmake --build build --target zanc zanrt_selfhost_bundle zanrt_selfhost_diff_bundle zan_json_oom_test zan_json_trailing_test zan_rpc_framing_test zan_json_nul_test zan_ast_visitor_test zan_diag_dedup_test zan_package_lock_test zan_package_namespace_test zan_package_diamond_solver_test zan_gui_android_clock_test zan_gui_ios_input_test zan_gui_ohos_native_test -j
 
     # dap_integration is skipped here because this job builds only the
     # `zanc` target (above): it drives the zan-dap adapter + its test
     # harness, which are not built under MinGW (see the build note above).
     # It runs on Linux/macOS, where the full tree builds.
     - name: Test
-      run: ctest --test-dir build --output-on-failure -E "dap_integration"
+      # zanc 找 MinGW 系统库默认看 <zanc 目录>\mingw\lib（发布包自带）；CI 用
+      # MSYS2 的 MinGW，经 ZAN_LIB_PATH（; 分隔、Windows 路径）指过去。
+      run: |
+        export ZAN_LIB_PATH="$(cygpath -m /mingw64/lib);$(cygpath -m /mingw64/x86_64-w64-mingw32/lib);$(cygpath -m "$(dirname "$(gcc -print-libgcc-file-name)")")"
+        echo "ZAN_LIB_PATH=$ZAN_LIB_PATH"
+        ctest --test-dir build --output-on-failure -E "dap_integration" -j "$(nproc)" -L "^${ZAN_CI_TIER}$"
 
   lint:
     runs-on: ubuntu-latest
@@ -119,10 +146,10 @@ jobs:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         fetch-depth: 0
-    # 全仓 304/310 文件不合 .clang-format（存量债，`|| true` 时代永不失败，
-    # 纯噪音）。收窄为**本次变更文件**：新增/改动的 C 代码即时刻度，存量
-    # 债不挡路——谁碰谁修，逐步逼近全绿。
-    - name: Check formatting (changed files vs base)
+    # 全仓绝大多数文件不合 .clang-format（存量债）。只刻度**本次改动的行**
+    #（git clang-format --diff BASE HEAD）：整文件检查会让任何碰了 C 文件的
+    # 推送都因存量债失败，门禁永远红、等于没有。新写的行即时达标，存量谁碰谁顺手修。
+    - name: Check formatting (changed lines vs base)
       run: |
         BASE="${{ github.event.pull_request.base.sha }}"
         if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
@@ -132,13 +159,12 @@ jobs:
           echo "no base revision; nothing to diff against"
           exit 0
         fi
-        FILES=$(git diff --name-only "$BASE" HEAD -- '*.c' '*.h')
-        if [ -z "$FILES" ]; then
-          echo "no changed C sources vs $BASE"
-          exit 0
-        fi
-        echo "$FILES"
-        xargs clang-format --dry-run --Werror <<< "$FILES"
+        OUT=$(git clang-format --diff --extensions c,h "$BASE" HEAD -- || true)
+        case "$OUT" in
+          ""|*"no modified files to format"*|*"did not modify any files"*)
+            echo "changed C lines are clang-format clean vs $BASE" ;;
+          *) echo "$OUT"; echo "::error::changed lines need clang-format"; exit 1 ;;
+        esac
 
   # Fuzz the whole front-end with libFuzzer under ASan + UBSan: lexer, parser,
   # the post-parse resolve steps, the binder and the type checker. Runs a short
