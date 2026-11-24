@@ -395,7 +395,26 @@ static zan_fatal_fn g_fatal_handler;
 
 void zan_rt_set_fatal_handler(zan_fatal_fn fn) { g_fatal_handler = fn; }
 
+/* stdout 缓冲策略（编译器在 main 入口、任何输出之前调用一次；见 emit_main.c）：
+ * 目标是普通文件（重定向到文件）时用 64 KiB 整块缓冲，其余（终端、管道、套接字）
+ * 按编译器给的默认（POSIX 逐行 / Windows 不缓冲）。实时消费者（IDE 控制台、
+ * 日志采集管道）不受影响。 */
+void zan_rt_stdout_setup(FILE *out, int mode, long long size) {
+    int to_file = 0;
+#if defined(_WIN32)
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    to_file = h && h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK;
+#elif !defined(__wasm__) && !defined(ZAN_BARE_METAL)
+    struct stat st;
+    to_file = fstat(fileno(out), &st) == 0 && S_ISREG(st.st_mode);
+#endif
+    if (to_file) setvbuf(out, NULL, _IOFBF, 65536);
+    else setvbuf(out, NULL, mode, (size_t)size);
+}
+
 void zan_rt_fatal(const char *category, const char *message) {
+  /* abort() 不冲刷 stdio：整块缓冲到文件时先把已写的输出落盘 */
+  fflush(stdout);
   fprintf(stderr, "zan runtime: fatal (%s): %s\n",
           category ? category : "runtime", message ? message : "");
   fflush(stderr);

@@ -3,54 +3,96 @@ using Gui;
 using Gui.Widget;
 using Gui.Hmi;
 
-/* {{NAME}} 业务逻辑：屏幕在 {{NAME}}.html 中设计；过程点位在此定义，
- * 因为 I/O 属于代码而非布局（B-ID46 运行期形态：设计稿由 Main 运行期
- * 投影，HMI 控件用 ui.Ctl("Id") 取用后 Bind 点位）。 */
+/* {{NAME}}：工控上位机（HMI / SCADA）画面。
+ *
+ * 分工：
+ *   - {{NAME}}.html 只管画面布局（报警横幅、趋势、仪表、棒图、数显、指示灯、报警列表）；
+ *   - PlantModel（PlantModel.zan）持有位号表 TagTable 并模拟过程，接现场时只改它；
+ *   - 本类在 OnLoad 里把控件绑定到位号，再用一个 500 ms 周期任务完成
+ *     "采集 → 趋势取点 → 报警扫描 → 刷新状态"，整幅画面随之联动。
+ * 控件绑定的是位号（IoTag）而不是数值副本，所以 Step() 写一次原始值，
+ * 仪表、棒图、数显、趋势都会在下一帧同时更新。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
+    // 主窗引用：处理器里用 ui.Ctl("Id") 取设计稿里的控件。
     static Form ui;
-    static TagTable io;
+    static PlantModel plant;
     static AlarmBuffer alarms;
-    static IoTag pv;
-    static IoTag level;
+
+    // 工具条项下标（分隔条也占一个下标）。
+    const int ToolStart = 0;
+    const int ToolStop = 1;
+    const int ToolAck = 3;
+    const int ToolPurge = 4;
 
     static void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
-        ui = form;        io = new TagTable();
+        ui = form;
+        plant = new PlantModel();
         alarms = new AlarmBuffer();
 
-        /* 缩放后的工程值：原始计数为单位 0.1 度/百分比，scale=10 使控件显示一位小数。 */
-        pv = io.Add("TIC101.PV", "C", 10);
-        pv.Range(0, 3000).Limits(300, 2500);
-        level = io.Add("LIC102.PV", "%", 10);
-        level.Range(0, 1000).Limits(100, 900);
+        ((AlarmBanner)ui.Ctl("AlarmBanner")).Bind(alarms);
+        ((AlarmList)ui.Ctl("AlarmList")).Bind(alarms);
 
-        ((AlarmList)ui.Ctl("Alarms")).Bind(alarms);
-        ((Gauge)ui.Ctl("PvGauge")).Bind(pv);
-        ((Bargraph)ui.Ctl("LevelBar")).Bind(level);
-        ((Led)ui.Ctl("RunLed")).Set(1);
+        Gauge gauge = (Gauge)ui.Ctl("TempGauge");
+        gauge.Bind(plant.Temp);
+        ((Digital)ui.Ctl("SpDigital")).Bind(plant.TempSp);
+        ((Bargraph)ui.Ctl("LevelBar")).Bind(plant.Level);
+        ((Digital)ui.Ctl("FlowDigital")).Bind(plant.Flow);
+
         Trend trend = (Trend)ui.Ctl("PvTrend");
         trend.Range(0, 3000);
-        trend.Add("PV", pv, form.GetApp().theme.success);
+        trend.scale = 10;          // 与位号同一定点缩放：坐标轴按工程单位（℃）标注
+        trend.Add("PV", plant.Temp, form.GetApp().theme.primary);
+        trend.Add("SP", plant.TempSp, form.GetApp().theme.warning);
 
-        /* 单次周期性扫描驱动整个屏幕：读取过程值、记录趋势，再由报警缓冲区按限值触发/复位。 */
-        form.Every(1000, () => {
-            Scan();
-        });
+        UpdateLamps();
+        form.Every(500, () => { Scan(); });
     }
 
-    /* 用现场总线 / OPC / Modbus 读取替换以下 SetRaw 调用。 */
+    /* 一个扫描周期：采集（这里是仿真）→ 趋势取点 → 报警判限 → 刷新指示。 */
     static void Scan() {
-        pv.SetRaw(pv.Raw());
-        level.SetRaw(level.Raw());
+        plant.Step();
         ((Trend)ui.Ctl("PvTrend")).Sample();
-        alarms.Scan(io);
+        alarms.Scan(plant.Io);
+        UpdateLamps();
+    }
+
+    static void OnToolClick() {
+        ToolStrip tools = (ToolStrip)ui.Ctl("MainToolStrip");
+        int index = tools.LastIndex();
+        if (index == ToolStart) {
+            plant.Running = true;
+        } else if (index == ToolStop) {
+            plant.Running = false;
+        } else if (index == ToolAck) {
+            alarms.AckAll();
+        } else if (index == ToolPurge) {
+            alarms.Purge();
+        }
+        UpdateLamps();
+    }
+
+    /* 指示灯、工具条可用性与状态栏跟随运行态 / 报警态。 */
+    static void UpdateLamps() {
+        Led run = (Led)ui.Ctl("RunLed");
+        run.Set(plant.Running ? 1 : 0);
+        Led pump = (Led)ui.Ctl("PumpLed");
+        pump.Set(plant.DrainPump ? 1 : 0);
+
+        ToolStrip tools = (ToolStrip)ui.Ctl("MainToolStrip");
+        Button start = tools.ItemAt(ToolStart);
+        Button stop = tools.ItemAt(ToolStop);
+        if (start != null) { start.Disabled = plant.Running; }
+        if (stop != null) { stop.Disabled = !plant.Running; }
+
+        int unacked = alarms.UnackedCount();
         StatusBar sb = (StatusBar)ui.Ctl("MainStatusBar");
-        sb.SetText(0, "报警： "
-            + Convert.ToString(alarms.UnackedCount()));
+        sb.SetText(0, plant.Running ? "运行中" : "已停机");
+        sb.SetText(1, "未确认报警 " + Convert.ToString(unacked));
+        sb.SetColor(1, unacked > 0 ? ui.GetApp().theme.error : 0);
     }
 }

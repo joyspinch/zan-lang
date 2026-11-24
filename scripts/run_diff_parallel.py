@@ -345,6 +345,16 @@ def main():
             os.environ["PATH"] = os.pathsep.join([os.path.join(a.workdir, "build"), sqlite_dir, os.environ.get("PATH", "")])
     else:
         a.syslibs = ["-ldl", "-lpthread", "-lm"]
+        # POSIX: the Zan.Data cases [DllImport] sqlite3; link the bundled
+        # static driver for this host (no rpath / install-name to manage)
+        import platform
+        mach = platform.machine().lower()
+        arch = "arm64" if mach in ("arm64", "aarch64") else "x64" if mach in ("x86_64", "amd64") else mach
+        osname = "macos" if sys.platform == "darwin" else "linux"
+        sqlite_a = os.path.join(a.workdir, "packages", "Zan.Data", "src", "System", "Data", "Sqlite",
+                                "drivers", osname + "-" + arch, "static", "libsqlite3.a")
+        if os.path.exists(sqlite_a):
+            a.syslibs.append(sqlite_a)
     if a.focus:
         os.environ["ZAN_STDLIB_PATH"] = os.path.join(a.workdir, "stdlib")
         a.llvm_as = a.llvm_as or shutil.which("llvm-as") or ""

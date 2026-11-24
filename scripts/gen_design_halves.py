@@ -7,8 +7,8 @@
 以 accessor 属性暴露（code-behind 的 this.Tree 等引用零改动）。
 
 设计稿改动（增删命名控件、换 kind）后重跑本脚本即可；手工逻辑写在
-code-behind（<Name>.zan），半件只承载投影声明，并标注 `[GuiKind("<Name>")]`
-由编译器合成静态工厂清单。
+code-behind（<Name>.zan），半件只承载投影声明，由编译器 `__ZanControlCatalog`
+自动按公开可构造控件收录进控件目录。
 """
 import os
 import re
@@ -180,7 +180,6 @@ def emit(doc_path):
             usings.append(u)
     out.extend(usings)
     out.append('')
-    out.append('[GuiKind("%s")]' % name)
     out.append('public partial class %s : DesignedControl {' % name)
     out.append('    public override Control CreateCloneShell() { return new %s(); }' % name)
     out.append('')

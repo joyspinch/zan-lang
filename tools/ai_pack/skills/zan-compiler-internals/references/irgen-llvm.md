@@ -687,3 +687,34 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 - `map_type(TYPE_DELEGATE)` 只映射 opaque value pointer；调用点与 thunk 独立构造 `LLVMFunctionType`。为值指针递归展开签名会让 `delegate void R(R next)` 在编译期栈溢出（无诊断，Windows exit `-1073741571`），不能误判成程序运行失败。
 - `type_mentions_tp` 用当前路径 visited 跳过同指针环，继续检查其他分支；64 层预算耗尽保守返回 true。此项是静态防护，不是递归类型相等、替换或任意深度泛型图已正确的证明；本轮未单独隔离验证 visited 分支及预算边界。
 - 主代理收据：新 host build exit0；仅定向 `method_group_target_contexts`，host/gen1 各阶段全 PASS，含递归委托赋值、`recursive(null)` 及精确 golden。该结果不外推为全量 conformance、bootstrap 固定点或全部递归泛型已验证。
+
+## 30. Mach-O 上 thread_local 永远是一次调用（2026-11-23 Mac arm64 实证）
+
+- `LLVMInitialExecTLSModel` 在 Mach-O 上不生效：任何 thread_local 访问都编成
+  经 TLV 描述符的 `blr`（`_tlv_get_addr`），约 0.5 ns，接近一次空调用的一半。
+  EH 状态（`__zan_eh_self`）每个可抛函数入口读一次，递归/小函数密集时可见。
+- Apple arm64 改走 pthread TSD 直读：`mrs TPIDRRO_EL0` & ~7，再取 `base[key]`
+  （`pthread_getspecific` 的实现本身）。key 惰性创建并**自检**（setspecific
+  后直读必须读回同值），不符就把 key 置 -1，退回原 TLV 缓存路径——快路径不依赖
+  未经验证的布局。fib(35)：48 ms → 28~31 ms。
+- 判定 Apple 目标要看 `LLVMGetTarget(g->mod)`：宿主构建时 `g->target_triple`
+  是空串（只有交叉编译才填），按它判平台的分支在本机构建里静默不生效。
+- 量 TLS 收益别用会被内联的循环：内联后读状态被提出循环，差异为零；用递归或
+  虚调用，并用 otool 确认入口序列确实变了。
+
+## 31. 数组元素接收者的钉住只防"调用期间改写该槽"（2026-11-23 Mac arm64 实证）
+
+- `arr[i].M()` 的接收者照例 retain + EH 临时栈压入 + release（两次原子），
+  接口/虚调用热循环里占 ~8 ns/次。钉住防的是调用期间有人改写那个数组槽把
+  `this` 释放掉——只有"能写数组槽或跑任意用户代码"的东西做得到。
+- `zan_elem_receiver_needs_no_pin`（stmt_borrow.c）：M 的**全部**可能实现
+  （静态类型所有子类 / 接口所有实现类）都是叶子体，且下标与实参只含局部读、
+  字面量与原始数值运算时免钉住。窗口里没有任何代码能释放对象，所以连数组
+  本身是借用的形参也安全。
+- 叶子体必须带类型判：`string + obj` 会调用户 ToString，`a + b` 可能是
+  `op_add` 重载，裸标识符可能是属性 getter，`x[i]` 可能是索引器——运算/赋值/
+  转换只放行原始数值/布尔/字符/枚举，成员只放行 this 的**字段**。
+- 调用点拿不到 AST_CALL：`g->hold_call_expr` 在 AST_CALL 分派处保存/恢复。
+- 实测接口调用循环 1580 ms → 179 ms；回归用例 arc_elem_receiver_borrow 钉住的
+  五种危险形态（改写自身槽、调用、属性、重载运算符、有副作用实参）在
+  --check-leaks --arc-guard 下都必须通过。

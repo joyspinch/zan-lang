@@ -1378,6 +1378,17 @@ add_test(NAME runtime_task_handle_registry COMMAND zanrt_task_handle_registry_te
 set_tests_properties(runtime_task_handle_registry PROPERTIES TIMEOUT 60)
 add_dependencies(zanc zanrt_task_handle_registry_test)
 
+add_executable(zanrt_timer_delay_cancel_index_test tests/runtime/timer_delay_cancel_index.c)
+set_target_properties(zanrt_timer_delay_cancel_index_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+if(NOT WIN32)
+  target_link_libraries(zanrt_timer_delay_cancel_index_test PRIVATE Threads::Threads)
+endif()
+add_test(NAME runtime_timer_delay_cancel_index COMMAND zanrt_timer_delay_cancel_index_test)
+set_tests_properties(runtime_timer_delay_cancel_index PROPERTIES TIMEOUT 60)
+add_dependencies(zanc zanrt_timer_delay_cancel_index_test)
+
 add_executable(zanrt_task_frame_allocator_test
   tests/runtime/task_frame_allocator.c src/runtime/rt_io.c
   src/runtime/rt_crash.c src/runtime/rt_timer.c)
@@ -6834,7 +6845,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       control_host_lifecycle app_post_lifecycle text_routed_input form_lifecycle
       treeview_filter_input colorpicker_input_lifecycle layer_input_lifecycle layer_photos_retained
       drag_routed_input scroll_routed_input scrollcolumn_input_lifecycle input_root_composition
-      control_factory_equivalence model_binding_equivalence scroll_widgets_input_lifecycle form_local_animation
+      control_factory_equivalence control_catalog model_binding_equivalence scroll_widgets_input_lifecycle form_local_animation
       control_children_lifecycle contextmenu_routed_lifecycle popup_factory_mount
       overlay_anchor_retirement retained_longpress_input retained_focus_lifecycle hover_callback_lifetime
       treeview_retained_input_lifecycle listview_retained_input_lifecycle virtuallist_string_input carousel_retained_input
@@ -7692,6 +7703,17 @@ add_test(NAME policy_gallery_coverage
 add_test(NAME policy_control_factory
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR}
     -P ${CMAKE_SOURCE_DIR}/tests/run_control_factory.cmake)
+
+# ---- Policy: packages/ dependency graph (WC §14) ----
+# zan.pkg declares no dependencies, so the graph is rebuilt from `using`
+# (type-level resolution for shared namespaces): no cycles between packages,
+# and the foundation layer (IO/Text/Json/Security/Diagnostics/Linq/Testing)
+# may only depend on itself. The pre-commit hook runs the same script.
+if(ZAN_PYTHON_EXE)
+  add_test(NAME policy_package_deps
+    COMMAND ${ZAN_PYTHON_EXE} -I -B ${CMAKE_SOURCE_DIR}/scripts/package_deps_check.py
+      --root ${CMAKE_SOURCE_DIR})
+endif()
 
 # ---- Policy: widget draw paths must not gain direct semantic-color reads ----
 # Colors belong to the style layer (base.css + Style/StyleBox/Fx); each direct

@@ -16,6 +16,8 @@ typedef struct zan_timer_entry {
   zan_timer_kind kind;
   int removed;
   int waking;
+  int dead; /* 已取消、仍留在堆里待惰性回收（计入 g_heap_dead） */
+  struct zan_timer_entry *dnext; /* 同一帧的下一条 delay 条目（帧索引链） */
   zan_timer_callback_t callback;
   zan_timer_ctx_callback_t callback_ctx;
   void *frame;
@@ -33,6 +35,20 @@ static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
 static zan_timer_entry *g_dispatching;
 static unsigned long g_dispatch_tid;
 static volatile long long g_live;
+/* 帧 → 未决 delay 条目索引（线性探测开放寻址，值为同帧条目链表头）。
+ * 编译器在**每个**异步帧完成/清理时调 zan_timer_cancel_delay；原实现持全局
+ * 定时器锁全堆扫描 + 重建堆，O(堆大小)。服务端在连接池排队时每次门等都挂一个
+ * 250 ms 看门狗，堆里常驻上千条，于是每次帧完成都在锁里扫上千条——多 worker
+ * 在这把锁上排队，32 连接压测吞吐反比 8 连接低一半。索引让取消 O(1)；取消
+ * 的条目惰性回收（到堆顶时丢弃，死条目过半再整体压缩，摊还 O(1)）。 */
+typedef struct zan_delay_slot {
+    void *frame;
+    zan_timer_entry *head;
+} zan_delay_slot;
+static zan_delay_slot *g_dix;
+static size_t g_dix_cap;
+static size_t g_dix_len;
+static size_t g_heap_dead;
 /* 派发互斥：zan_timer_dispatch_due 不是可重入的（g_dispatching /
  * g_dispatch_tid 是普通静态量），两个线程同时派发会把状态搅乱。
  * worker 池里靠 rt_io.c 的 g_timer_owner 保护，但同步上下文里的
@@ -160,6 +176,147 @@ static zan_timer_entry *heap_pop(void) {
   return root;
 }
 
+static size_t dix_hash(const void *frame) {
+  unsigned long long x = (unsigned long long)(uintptr_t)frame;
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  return (size_t)x;
+}
+
+/* 帧所在槽位；不存在时返回 g_dix_cap。调用方持 timer_lock。 */
+static size_t dix_find(const void *frame) {
+  if (g_dix_cap == 0)
+    return 0;
+  size_t mask = g_dix_cap - 1;
+  for (size_t i = dix_hash(frame) & mask;; i = (i + 1) & mask) {
+    if (!g_dix[i].frame)
+      return g_dix_cap;
+    if (g_dix[i].frame == frame)
+      return i;
+  }
+}
+
+static void dix_place(void *frame, zan_timer_entry *head) {
+  size_t mask = g_dix_cap - 1;
+  size_t i = dix_hash(frame) & mask;
+  while (g_dix[i].frame)
+    i = (i + 1) & mask;
+  g_dix[i].frame = frame;
+  g_dix[i].head = head;
+}
+
+/* 保证还能再插一个帧（装载率 ≤ 1/2）。失败返回 -1，调用方按 OOM 口径处理。 */
+static int dix_reserve(void) {
+  if ((g_dix_len + 1) * 2 <= g_dix_cap)
+    return 0;
+  size_t cap = g_dix_cap ? g_dix_cap * 2 : 64;
+  zan_delay_slot *old = g_dix;
+  size_t old_cap = g_dix_cap;
+  zan_delay_slot *slots = (zan_delay_slot *)calloc(cap, sizeof(*slots));
+  if (!slots)
+    return -1;
+  g_dix = slots;
+  g_dix_cap = cap;
+  for (size_t i = 0; i < old_cap; i++)
+    if (old[i].frame)
+      dix_place(old[i].frame, old[i].head);
+  free(old);
+  return 0;
+}
+
+/* 删除槽位 i，并把后续探测链回填（backward-shift），不留墓碑。 */
+static void dix_erase_slot(size_t i) {
+  size_t mask = g_dix_cap - 1;
+  size_t j = i;
+  for (;;) {
+    g_dix[i].frame = NULL;
+    g_dix[i].head = NULL;
+    for (;;) {
+      j = (j + 1) & mask;
+      if (!g_dix[j].frame) {
+        g_dix_len--;
+        return;
+      }
+      size_t home = dix_hash(g_dix[j].frame) & mask;
+      /* j 的理想位置不在 (i, j] 环形区间内时，可以挪到 i。 */
+      if (i <= j ? (home <= i || home > j) : (home <= i && home > j))
+        break;
+    }
+    g_dix[i] = g_dix[j];
+    i = j;
+  }
+}
+
+/* 已 dix_reserve 过，不会失败。 */
+static void dix_link(zan_timer_entry *entry) {
+  size_t i = dix_find(entry->frame);
+  if (i < g_dix_cap) {
+    entry->dnext = g_dix[i].head;
+    g_dix[i].head = entry;
+    return;
+  }
+  entry->dnext = NULL;
+  dix_place(entry->frame, entry);
+  g_dix_len++;
+}
+
+static void dix_unlink(zan_timer_entry *entry) {
+  size_t i = dix_find(entry->frame);
+  if (i >= g_dix_cap)
+    return;
+  zan_timer_entry **pp = &g_dix[i].head;
+  while (*pp && *pp != entry)
+    pp = &(*pp)->dnext;
+  if (*pp)
+    *pp = entry->dnext;
+  entry->dnext = NULL;
+  if (!g_dix[i].head)
+    dix_erase_slot(i);
+}
+
+/* 丢弃堆顶的已取消条目。 */
+static void heap_drop_removed_top(void) {
+  while (g_heap_len > 0 && g_heap[0]->removed) {
+    zan_timer_entry *entry = heap_pop();
+    if (entry->dead && g_heap_dead > 0)
+      g_heap_dead--;
+    free(entry);
+  }
+}
+
+/* 死条目过半时整体压缩并重建堆：摊还到每次取消仍是 O(1)，且长延时被取消
+ * 后不会让堆无限增长。 */
+static void heap_compact_dead(void) {
+  if (g_heap_dead < 64 || g_heap_dead * 2 < g_heap_len)
+    return;
+  size_t w = 0;
+  for (size_t i = 0; i < g_heap_len; i++) {
+    if (g_heap[i]->dead)
+      free(g_heap[i]);
+    else
+      g_heap[w++] = g_heap[i];
+  }
+  g_heap_len = w;
+  g_heap_dead = 0;
+  for (size_t i = g_heap_len / 2; i-- > 0;) {
+    size_t index = i;
+    for (;;) {
+      size_t left = index * 2 + 1;
+      if (left >= g_heap_len)
+        break;
+      size_t right = left + 1;
+      size_t smallest =
+          right < g_heap_len && timer_less(g_heap[right], g_heap[left]) ? right
+                                                                        : left;
+      if (!timer_less(g_heap[smallest], g_heap[index]))
+        break;
+      heap_swap(index, smallest);
+      index = smallest;
+    }
+  }
+}
+
 void zan_timer_set_ready_hook(void (*ready)(void *frame,
                                             zan_timer_step_t step)) {
   timer_lock();
@@ -172,6 +329,10 @@ void zan_timer_runtime_reset(void) {
   for (size_t i = 0; i < g_heap_len; i++)
     free(g_heap[i]);
   g_heap_len = 0;
+  g_heap_dead = 0;
+  if (g_dix)
+    memset(g_dix, 0, g_dix_cap * sizeof(*g_dix));
+  g_dix_len = 0;
   __atomic_store_n(&g_live, 0, __ATOMIC_RELAXED);
   g_next_id = 1;
   g_round = 0;
@@ -221,12 +382,13 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
   timer_lock();
   g_initialized = 1;
   entry->sequence = ++g_sequence;
-  if (heap_push(entry) != 0) {
+  if (dix_reserve() != 0 || heap_push(entry) != 0) {
     timer_unlock();
     free(entry);
     step(frame);
     return;
   }
+  dix_link(entry);
   timer_unlock();
 }
 
@@ -235,14 +397,20 @@ int zan_timer_cancel_delay(void *frame) {
   if (!frame)
     return 0;
   timer_lock();
-  for (size_t i = 0; i < g_heap_len; i++) {
-    zan_timer_entry *entry = g_heap[i];
-    if (entry->kind == ZAN_TIMER_DELAY && !entry->removed &&
-        entry->frame == frame) {
+  size_t slot = dix_find(frame);
+  if (slot < g_dix_cap) {
+    zan_timer_entry *entry = g_dix[slot].head;
+    while (entry) {
+      zan_timer_entry *next = entry->dnext;
+      entry->dnext = NULL;
       entry->removed = 1;
+      entry->dead = 1;
+      g_heap_dead++;
       __atomic_fetch_sub(&g_live, 1, __ATOMIC_RELAXED);
       found++;
+      entry = next;
     }
+    dix_erase_slot(slot);
   }
   if (g_dispatching && g_dispatching->kind == ZAN_TIMER_DELAY &&
       !g_dispatching->removed && g_dispatching->frame == frame) {
@@ -256,35 +424,7 @@ int zan_timer_cancel_delay(void *frame) {
     timer_yield();
     timer_lock();
   }
-  size_t old_len = g_heap_len;
-  size_t w = 0;
-  for (size_t i = 0; i < g_heap_len; i++) {
-    if (g_heap[i]->removed && g_heap[i]->kind == ZAN_TIMER_DELAY) {
-      free(g_heap[i]);
-    } else {
-      g_heap[w++] = g_heap[i];
-    }
-  }
-  g_heap_len = w;
-  if (w != old_len && g_heap_len > 1) {
-    for (size_t i = g_heap_len / 2; i-- > 0;) {
-      size_t index = i;
-      for (;;) {
-        size_t left = index * 2 + 1;
-        if (left >= g_heap_len)
-          break;
-        size_t right = left + 1;
-        size_t smallest =
-            right < g_heap_len && timer_less(g_heap[right], g_heap[left])
-                ? right
-                : left;
-        if (!timer_less(g_heap[smallest], g_heap[index]))
-          break;
-        heap_swap(index, smallest);
-        index = smallest;
-      }
-    }
-  }
+  heap_compact_dead();
   timer_unlock();
   return found;
 }
@@ -357,8 +497,7 @@ long long zan_timer_after_ctx(long long delay,
 long long zan_timer_next_timeout(void) {
   long long timeout = -1;
   timer_lock();
-  while (g_heap_len > 0 && g_heap[0]->removed)
-    free(heap_pop());
+  heap_drop_removed_top();
   if (g_heap_len > 0) {
     long long rem_us = g_heap[0]->due_us - zan_co_precise_us();
     timeout = (rem_us <= 0) ? 0 : (rem_us + 999) / 1000;
@@ -374,8 +513,7 @@ static long long timer_dispatch_due_locked(void) {
   for (;;) {
     long long now = zan_co_precise_us();
     timer_lock();
-    while (g_heap_len > 0 && g_heap[0]->removed)
-      free(heap_pop());
+    heap_drop_removed_top();
     if (g_heap_len == 0 || g_heap[0]->due_us > now) {
       timer_unlock();
       __atomic_store_n(&g_dispatch_busy, 0, __ATOMIC_RELEASE);
@@ -383,6 +521,8 @@ static long long timer_dispatch_due_locked(void) {
       return dispatched;
     }
     zan_timer_entry *entry = heap_pop();
+    if (entry->kind == ZAN_TIMER_DELAY)
+      dix_unlink(entry);
     if (entry->kind == ZAN_TIMER_PUBLIC) {
       entry->exec_count++;
       entry->round = ++g_round;

@@ -1,14 +1,23 @@
 /* Coroutine counting gate. Each prepared wait owns its registration and timer.
  * Native threads can enter the gate even with the self-host fallback scheduler.
- */
+ *
+ * A ticket is the address of its waiter record. The protocol pins a record
+ * until it has been parked AND its timer (if any) has fired, and each ticket
+ * is handed to park_ticket and ticket_signal_and_release exactly once, so the
+ * address stays valid for every call that carries it. Tickets used to be
+ * sequence numbers resolved by walking a per-gate record list; timed records
+ * live until their watchdog fires (250 ms for pool waits), so under load every
+ * prepare/park/timeout walked ~1000 records under the gate mutex. */
 #ifndef _WIN32
 #include <pthread.h>
 #endif
 #include <limits.h>
 
+struct zan_gate;
+
 typedef struct zan_gate_waiter {
   struct zan_gate_waiter *next;
-  struct zan_gate_waiter *record_next;
+  struct zan_gate *gate;
   void *frame;
   zan_co_step_t step;
   long long ticket;
@@ -21,9 +30,7 @@ typedef struct zan_gate_waiter {
 typedef struct zan_gate {
   zan_gate_waiter *head;
   zan_gate_waiter *tail;
-  zan_gate_waiter *records;
   long long surplus;
-  long long next_ticket;
   int ref_count;
   int closed;
 #ifdef _WIN32
@@ -88,10 +95,8 @@ static void gate_remove(zan_gate *g, zan_gate_waiter *w) {
 }
 
 static zan_gate_waiter *gate_record(zan_gate *g, long long ticket) {
-  for (zan_gate_waiter *w = g->records; w; w = w->record_next)
-    if (w->ticket == ticket)
-      return w;
-  return NULL;
+  zan_gate_waiter *w = (zan_gate_waiter *)(intptr_t)ticket;
+  return (w && w->gate == g) ? w : NULL;
 }
 
 /* A record pins the gate until park has consumed it AND its watchdog is done.
@@ -100,13 +105,9 @@ static zan_gate_waiter *gate_record(zan_gate *g, long long ticket) {
 static void gate_retire(zan_gate *g, zan_gate_waiter *w) {
   if (!w->completed || !w->parked || !w->timer_done || w->dispatching)
     return;
-  if (w->ticket) {
-    zan_gate_waiter **p = &g->records;
-    while (*p != w)
-      p = &(*p)->record_next;
-    *p = w->record_next;
+  if (w->ticket)
     g->ref_count--;
-  }
+  w->gate = NULL;
   free(w);
 }
 
@@ -159,13 +160,9 @@ static long long gate_prepare(long long handle, int timed) {
     free(w);
     return 0;
   }
-  do {
-    g->next_ticket = g->next_ticket == LLONG_MAX ? 1 : g->next_ticket + 1;
-  } while (gate_record(g, g->next_ticket));
-  w->ticket = g->next_ticket;
+  w->gate = g;
+  w->ticket = (long long)(intptr_t)w;
   w->timer_done = !timed;
-  w->record_next = g->records;
-  g->records = w;
   g->ref_count++;
   if (g->surplus > 0) {
     g->surplus--;
@@ -184,6 +181,35 @@ static long long gate_prepare(long long handle, int timed) {
  * affinity. */
 long long zan_gate_arm(long long handle) { return gate_prepare(handle, 1); }
 long long zan_gate_prepare(long long handle) { return gate_prepare(handle, 0); }
+
+void zan_gate_ticket_signal_and_release(long long handle, long long ticket);
+
+static void gate_timeout_fired(void *arg) {
+  zan_gate_waiter *w = (zan_gate_waiter *)arg;
+  zan_gate_ticket_signal_and_release((long long)(intptr_t)w->gate,
+                                     (long long)(intptr_t)w);
+}
+
+/* Timed registration whose watchdog is a runtime timer callback rather than a
+ * spawned coroutine (one frame + task + Delay per wait before). Paired with
+ * park_ticket only; the timer performs the ticket_signal_and_release. */
+long long zan_gate_arm_ms(long long handle, long long ms) {
+  if (ms <= 0)
+    return gate_prepare(handle, 0);
+  long long ticket = gate_prepare(handle, 1);
+  if (!ticket)
+    return 0;
+  zan_gate_waiter *w = (zan_gate_waiter *)(intptr_t)ticket;
+  if (zan_timer_after_ctx(ms, gate_timeout_fired, w) == 0) {
+    /* No timer: behave as an untimed wait (signals still complete it). */
+    zan_gate *g = w->gate;
+    zan_gate_lock(g);
+    w->timer_done = 1;
+    gate_retire(g, w);
+    zan_gate_unlock(g);
+  }
+  return ticket;
+}
 
 void zan_gate_park_ticket(long long handle, long long ticket, void *frame,
                           zan_co_step_t step) {

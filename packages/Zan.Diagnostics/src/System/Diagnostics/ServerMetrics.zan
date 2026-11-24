@@ -189,6 +189,16 @@ public class ServerMetrics {
     [DllImport("crt", EntryPoint = "gettimeofday")]
     private static extern int gettimeofday(string tv, nint tz);
     #endif
+    #if MACOS
+    // libSystem: struct rusage (user/system CPU) and proc_pid_rusage
+    // (rusage_info_v0.ri_resident_size -- the current resident set).
+    [DllImport("crt", EntryPoint = "getrusage")]
+    private static extern int getrusage(int who, string usage);
+    [DllImport("crt", EntryPoint = "getpid")]
+    private static extern int getpid();
+    [DllImport("crt", EntryPoint = "proc_pid_rusage")]
+    private static extern int proc_pid_rusage(int pid, int flavor, string buffer);
+    #endif
 
     [DllImport("crt")]
     private static extern nint fopen(string path, string mode);
@@ -540,6 +550,14 @@ public class ServerMetrics {
         long utime = Convert.ToInt64(f[11]);
         long stime = Convert.ToInt64(f[12]);
         return (utime + stime) * 10;  // assumes 100 Hz USER_HZ -> *1000/100
+        #elif MACOS
+        // struct rusage: ru_utime and ru_stime are timevals (i64 seconds,
+        // i32 microseconds + padding on Darwin)
+        byte[] ru = new byte[144];
+        if (getrusage(0, ru) != 0) { return 0 - 1; }
+        long us = ServerMetrics.LeInt(ru, 0, 8) * 1000000 + ServerMetrics.LeInt(ru, 8, 4)
+            + ServerMetrics.LeInt(ru, 16, 8) * 1000000 + ServerMetrics.LeInt(ru, 24, 4);
+        return us / 1000;
         #else
         return 0 - 1;
         #endif
@@ -560,6 +578,12 @@ public class ServerMetrics {
         if (f.Count < 2) { return 0 - 1; }
         long residentPages = Convert.ToInt64(f[1]);
         return residentPages * 4096;
+        #elif MACOS
+        // rusage_info_v0: uuid[16], then u64 user/system time, pkg idle and
+        // interrupt wakeups, pageins, wired size, resident size (offset 64)
+        byte[] info = new byte[256];
+        if (proc_pid_rusage(getpid(), 0, info) != 0) { return 0 - 1; }
+        return ServerMetrics.LeInt(info, 64, 8);
         #else
         return 0 - 1;
         #endif

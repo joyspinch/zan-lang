@@ -393,18 +393,29 @@
             }
             break;
         }
-        LLVMValueRef data_ptr = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-            col_body, 2, "data_ptr");
-        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
-            data_ptr, "data");
+        /* 存储按**集合**的元素类型访问（循环变量可声明成更宽的类型，如
+         * foreach (long x in List<int>)）；Dict 借同一循环（count/键数组恰在
+         * 字段 0/2），它没有宽度标签，走原始 8 字节槽字。List 每轮重取并过
+         * 宽度守卫：循环体可能扩容或经擦除代码改宽。 */
+        zan_type_t *store_et = (col_type && type_named(col_type, "List", 4))
+            ? container_elem_type(col_type) : NULL;
+        LLVMValueRef data = store_et
+            ? list_data_for(g, col_body, store_et, "data")
+            : LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
+                  LLVMBuildStructGEP2(g->builder, g->list_struct_type, col_body,
+                                      2, "data_ptr"), "data");
         LLVMValueRef idx_body = LLVMBuildLoad2(g->builder, i64, idx_alloc, "ib");
-        LLVMValueRef fe_widx = slot_word_index(g, idx_body,
-            elem_slot_words(g, elem_type));
-        LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i64, data, &fe_widx, 1, "ep");
+        zan_type_t *acc_et = store_et ? store_et : elem_type;
+        LLVMValueRef elem_ptr = store_et
+            ? list_elem_ptr(g, data, idx_body, store_et, "ep")
+            : LLVMBuildGEP2(g->builder, i64, data,
+                  (LLVMValueRef[]){ slot_word_index(g, idx_body,
+                                                    elem_slot_words(g, elem_type)) },
+                  1, "ep");
         LLVMTypeKind ek = LLVMGetTypeKind(elem_llvm);
         LLVMValueRef elem = (ek == LLVMStructTypeKind)
             ? load_struct_from_slot(g, elem_ptr, elem_llvm)
-            : LLVMBuildLoad2(g->builder, i64, elem_ptr, "elem");
+            : list_slot_load_word(g, elem_ptr, acc_et, "elem");
         if (ek == LLVMPointerTypeKind)
             elem = LLVMBuildIntToPtr(g->builder, elem, elem_llvm, "elp");
         else if (ek == LLVMDoubleTypeKind)

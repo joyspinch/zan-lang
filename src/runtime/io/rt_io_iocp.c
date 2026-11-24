@@ -951,9 +951,11 @@ int32_t zan_io_poll(int64_t timeout_ms) {
   }
   IOTRACE("poll removed=%lu cnt=%ld", (unsigned long)removed, g_io_count);
   int woke = 0;
+#if defined(ZAN_CO_DRIVER)
   zan_co_task_t ready_batch[64];
-  int16_t comp_shards[64];
   size_t ready_count = 0;
+#endif
+  int16_t comp_shards[64];
   size_t completed_count = 0;
   for (ULONG i = 0; i < removed; i++) {
     if (!entries[i].lpOverlapped) {
@@ -972,16 +974,24 @@ int32_t zan_io_poll(int64_t timeout_ms) {
                    entries[i].Internal);
     op_free(op);
     comp_shards[completed_count++] = op_shard;
+#if defined(ZAN_CO_DRIVER)
     if (step && co) {
       ready_batch[ready_count].frame = co;
       ready_batch[ready_count].step = step;
       ready_count++;
     }
+#else
+    if (step && co) {
+      io_wake(co, step);
+    }
+#endif
     woke++;
   }
+#if defined(ZAN_CO_DRIVER)
   if (ready_count > 0) {
     zan_co_ready_batch(ready_batch, ready_count);
   }
+#endif
   /* Match worker polling: transfer liveness to the ready queues before
    * releasing pending IO. Frames may already be consumed after publication. */
   for (size_t k = 0; k < completed_count; k++) {

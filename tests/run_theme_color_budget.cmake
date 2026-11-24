@@ -22,7 +22,7 @@ cmake_policy(SET CMP0007 NEW)
 # self-checks; these reads are not drawing paths. When adding exported fields,
 # keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
-  "packages/Zan.Gui/src/Gui/Core/Automation/UiDriver.zan=12"
+  "packages/Zan.Gui/src/Gui/Testing/UiDriver.zan=12"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")

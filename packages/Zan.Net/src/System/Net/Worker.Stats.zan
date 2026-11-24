@@ -117,16 +117,31 @@ public partial class Worker {
     // 共享表句柄经环境变量传递时的变量名（ZAN_SHARE_<name>）。
     public static string ShareEnv(string name) { return "ZAN_SHARE_" + name; }
 
+    // 同进程可有多个 WebApp 并发 Start（如明文 + TLS 各一），各自在调度
+    // 线程上登记共享表：两张静态表的读写都在 shareNames 锁内，曾因并发
+    // Add 扩容在启动时 SIGSEGV。
     public static void ShareHandle(string name, long osHandle) {
         if (name == "" || osHandle == 0) { return; }
-        for (int i = 0; i < shareNames.Count; i = i + 1) {
-            if (shareNames[i] == name) {
-                shareHandles[i] = osHandle;
-                return;
+        lock (shareNames) {
+            for (int i = 0; i < shareNames.Count; i = i + 1) {
+                if (shareNames[i] == name) {
+                    shareHandles[i] = osHandle;
+                    return;
+                }
+            }
+            shareNames.Add(name);
+            shareHandles.Add(osHandle);
+        }
+    }
+
+    // 派生 worker 时取共享句柄表的一致快照（与 ShareHandle 同锁）。
+    private static void ShareSnapshot(List<string> names, List<long> handles) {
+        lock (shareNames) {
+            for (int i = 0; i < shareNames.Count; i = i + 1) {
+                names.Add(shareNames[i]);
+                handles.Add(shareHandles[i]);
             }
         }
-        shareNames.Add(name);
-        shareHandles.Add(osHandle);
     }
 
     public static long InheritedHandle(string name) {

@@ -85,6 +85,9 @@ typedef struct {
   char subsystem[32];        /* e.g. "windows", "console" */
   char subsystem_sym[64];    /* 触发子系统的符号前缀，如 "Gui_" */
   char subsystem_driver[64]; /* 触发子系统使用的驱动名，如 "zan_gui" */
+  char catalog[256];         /* 控件目录命名空间（空格分隔，如 "Gui.Widget Gui.Component"）：
+                                程序按名构造控件（引用 Gui.ControlFactory）时，这些命名空间里
+                                已到达的文件整体拉入编译图，供编译器合成控件目录。 */
   zan_dependency_t *deps;    /* dependencies */
   int dep_count;
   int dep_cap;

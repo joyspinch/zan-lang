@@ -23,7 +23,10 @@ namespace Zan;
 //     so struct layout stays correct by construction) hand every managed
 //     reference field to a callback;
 //   - zan_gc_detect_cycles / zan_gc_write_heap_snapshot mirror the host
-//     algorithm and the snapshot text format.
+//     algorithm and the snapshot text format. They are module-internal:
+//     rt_timer.o now exports the host's registry-backed pair (70e914ed6),
+//     which knows nothing of this tracker, so the stdlib's DllImport calls
+//     must bind to this module's copies without a duplicate global symbol.
 // The runtime is emitted only when the program actually calls
 // GC.DetectCycles/WriteHeapSnapshot (a pre-scan over the unit decides), so
 // programs that never probe pay nothing -- the hooks in zalloc/zrelease and
@@ -350,9 +353,15 @@ partial class Irgen {
         // stderr has no data export in the CRT this link uses -- the mingw
         // headers expand it to __acrt_iob_func(2), and so does the module
         // here (the C runtime objects resolve the same symbol).
-        if (!ExternSeen("__acrt_iob_func")) {
-            H("declare i8* @__acrt_iob_func(i32)");
-            externDecls.Add("__acrt_iob_func");
+        // POSIX: the libc stderr global, declared here at module level
+        // (PosixStdStream) before the detector body references it.
+        if (hostWin) {
+            if (!ExternSeen("__acrt_iob_func")) {
+                H("declare i8* @__acrt_iob_func(i32)");
+                externDecls.Add("__acrt_iob_func");
+            }
+        } else {
+            PosixStdStream(2);
         }
         if (!ExternSeen("fprintf")) {
             H("declare i32 @fprintf(i8*, i8*, ...)");
@@ -797,7 +806,11 @@ partial class Irgen {
         H("  %has = icmp sgt i64 %oc, 0");
         H("  br i1 %has, label %rep, label %clean");
         H("rep:");
-        H("  %sf = call i8* @__acrt_iob_func(i32 2)");
+        if (hostWin) {
+            H("  %sf = call i8* @__acrt_iob_func(i32 2)");
+        } else {
+            H("  %sf = load i8*, i8** " + PosixStdStream(2));
+        }
         H("  call i32 (i8*, i8*, ...) @fprintf(i8* %sf, i8* getelementptr inbounds ([85 x i8], [85 x i8]* @.gc.report, i64 0, i64 0), i64 %oc, i64 %ob)");
         H("  %small = icmp slt i64 %oc, 20");
         H("  %lim = select i1 %small, i64 %oc, i64 20");

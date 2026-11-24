@@ -1,52 +1,65 @@
 using System;
 using System.Net;
+using System.Net.Http;
 using WsGateway;
 
-/* {{NAME}} -- Worker 统一宿主上的 Gateway-Worker 式 WebSocket 服务。 */
-/* 握手/帧循环全在 Worker（onOpen/onMessage/onClose 回调）；连接注册表与广播在 Gateway；业务逻辑在 ChatWorker。config/app.json 运行时加载，不编译入二进制。 */
+/* {{NAME}} —— Gateway-Worker 式 WebSocket 聊天服务。
+ *
+ * 一个 http Worker 同时承担两件事（同一端口）：
+ *   - 普通 HTTP 请求 → StaticFiles 发 wwwroot/ 下的聊天页面；
+ *   - 带 Upgrade 头的请求 → 升级为 WebSocket，走 onOpen/onMessage/onClose。
+ * 分层：Worker 管字节（握手/帧/心跳），Gateway 管在线连接表与扇出，
+ * ChatWorker 管业务（昵称、发言、历史），三者互不越界。
+ *
+ * 运行后浏览器打开 http://127.0.0.1:8090/ ，多开几个标签页互相聊天。
+ * 配置在 config/app.json（运行期读取，不编译进二进制）。 */
 public class Program {
     static async int Run() {
         Config.Load("config/app.json");
+        string host = Config.Str("server", "host", "127.0.0.1");
+        int port = Config.Int("server", "port", 8090);
+        StaticFiles.Root(Config.Str("server", "wwwroot", "wwwroot"));
+        ChatWorker.Configure(Config.Int("chat", "maxNickBytes", 48),
+            Config.Int("chat", "maxTextBytes", 2000),
+            Config.Int("chat", "history", 30));
 
-        Worker server = new Worker("websocket",
-            Config.Str("server", "host", "127.0.0.1"),
-            Config.Int("server", "port", 8090));
+        Worker server = new Worker("http", host, port);
+        server.onHttpRequest = Program.OnHttp;
         server.onOpen = Program.OnOpen;
         server.onMessage = Program.OnMessage;
         server.onClose = Program.OnClose;
+        /* count > 1 时多进程分摊连接；注意各进程的在线表互不可见，见 README。 */
         server.SetCount(Config.Int("worker", "count", 1));
 
-        Console.WriteLine("{{NAME}} listening on ws://"
-            + Config.Str("server", "host", "127.0.0.1") + ":"
-            + Config.Int("server", "port", 8090).ToString());
-        WorkerWs.Install();               /* 协议分片 opt-in */
+        WorkerWs.Install();               /* WebSocket 协议分片 opt-in：不装则升级请求按普通 HTTP 应答 */
+        Console.WriteLine("{{NAME}} 已启动：浏览器打开 http://" + host + ":" + Convert.ToString(port) + "/");
         await Worker.RunAll();            /* 永不返回 */
         return 0;
     }
 
-    /* 连接建立：登记进 Gateway 注册表，欢迎私发 + 全员通报。 */
-    static async void OnOpen(Connection conn) {
-        Gateway.Add(conn);
-        Gateway.Push(conn, "* welcome, you are client #"
-            + conn.GetId().ToString());
-        string openMsg = await ChatWorker.OnOpen(conn, Gateway.Count());
-        Gateway.Broadcast(openMsg);
+    static async HttpResponse OnHttp(HttpRequest req) {
+        if (req.path == "/health") {
+            return HttpResponse.Json("{\"status\":\"ok\",\"online\":" + Convert.ToString(Gateway.Count()) + "}");
+        }
+        return StaticFiles.Serve(req);
     }
 
-    /* 业务消息：ChatWorker 决定要广播什么，网关扇出。 */
+    /* 连接建立：先登记，业务层决定欢迎语与历史回放。 */
+    static async void OnOpen(Connection conn) {
+        Gateway.Add(conn);
+        await ChatWorker.OnOpen(Gateway.Get(conn));
+    }
+
+    /* 每条文本帧交给业务层；返回 "" 表示不直接回包（回包由 Gateway 推送）。 */
     static async string OnMessage(Connection conn, string data) {
-        string outMsg = await ChatWorker.OnMessage(conn, data);
-        if (outMsg.Length > 0) {
-            Gateway.Broadcast(outMsg);
-        }
+        ClientConn client = Gateway.Get(conn);
+        if (client != null) { await ChatWorker.OnMessage(client, data); }
         return "";
     }
 
-    /* 连接关闭：移出注册表并通报。 */
     static async void OnClose(Connection conn) {
-        Gateway.Remove(conn);
-        string closeMsg = await ChatWorker.OnClose(conn, Gateway.Count());
-        Gateway.Broadcast(closeMsg);
+        ClientConn client = Gateway.Remove(conn);
+        if (client != null) { await ChatWorker.OnClose(client); }
     }
 
     static void Main() {

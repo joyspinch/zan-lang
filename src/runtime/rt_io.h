@@ -150,6 +150,9 @@ long long zan_gate_new(void);
  * park; tickets never use thread TLS. */
 long long zan_gate_arm(long long handle);
 long long zan_gate_prepare(long long handle);
+/* arm_ms: timed registration whose timeout runs as a runtime timer callback;
+ * paired with park_ticket only (the timer releases the registration). */
+long long zan_gate_arm_ms(long long handle, long long ms);
 void zan_gate_park_ticket(long long handle, long long ticket, void *frame,
                           zan_co_step_t step);
 void zan_gate_park(long long handle, void *frame, zan_co_step_t step);

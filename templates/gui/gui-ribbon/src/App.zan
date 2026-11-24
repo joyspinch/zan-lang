@@ -1,25 +1,184 @@
 using System;
+using System.IO;
 using Gui;
 using Gui.Widget;
 
-/* {{NAME}} 业务逻辑：HTML 模板直接声明 @item-click="OnHomeCommand" 绑定，
- * 后台类专注处理状态（B-ID149 窗口即对象：事件 @click 按名接线）。 */
+/* {{NAME}}：Office 风格功能区（Ribbon）外壳。
+ *
+ * Ribbon 只有一条命令带：切换页签时由本类按当前页签重建命令组（BuildGroups）。
+ * 每个命令带一个动作码（RibbonItem.act），点击后经 CommandClicked 抛出，
+ * 从 ribbon.lastAct 读回再统一派发（OnCommand）——加命令 = 加一个动作码 +
+ * 在 BuildGroups 里放按钮 + 在 OnCommand 里处理。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
+    // 主窗引用：处理器里用 ui.Ctl("Id") 取设计稿里的控件。
     static Form ui;
+    static bool readOnly;
+
+    // 页签下标。
+    const int TabHome = 0;
+    const int TabInsert = 1;
+    const int TabView = 2;
+
+    // 动作码。
+    const int ActPaste = 1;
+    const int ActCut = 2;
+    const int ActCopy = 3;
+    const int ActSelectAll = 4;
+    const int ActClear = 5;
+    const int ActSave = 6;
+    const int ActOpen = 7;
+    const int ActDateTime = 10;
+    const int ActDate = 11;
+    const int ActDivider = 12;
+    const int ActSignature = 13;
+    const int ActReadOnly = 20;
+    const int ActWordCount = 21;
 
     static void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
         ui = form;
+        readOnly = false;
+
+        Ribbon ribbon = MainRibbon();
+        ribbon.AddTab("开始");
+        ribbon.AddTab("插入");
+        ribbon.AddTab("视图");
+        ribbon.TabChanged.Add(() => { BuildGroups(); });
+        ribbon.CommandClicked.Add(() => { OnCommand(MainRibbon().lastAct); });
+        BuildGroups();
+        UpdateStatus();
     }
 
-    static void OnHomeCommand() {
-        ToolStrip home = (ToolStrip)ui.Ctl("HomeCommands");
+    // 按当前页签重建命令组。
+    static void BuildGroups() {
+        Ribbon ribbon = MainRibbon();
+        ribbon.groups = new List<RibbonGroup>();
+        int tab = ribbon.activeTab.Get();
+        if (tab == TabHome) {
+            RibbonGroup clip = new RibbonGroup("剪贴板");
+            clip.Add(Item(RibbonItem.Large("paste", "粘贴"), ActPaste));
+            clip.Add(Item(RibbonItem.Small("cut", "剪切"), ActCut));
+            clip.Add(Item(RibbonItem.Small("copy", "复制"), ActCopy));
+            ribbon.AddGroup(clip);
+            RibbonGroup edit = new RibbonGroup("编辑");
+            edit.Add(Item(RibbonItem.Small("select-all", "全选"), ActSelectAll));
+            edit.Add(Item(RibbonItem.Small("trash", "清空"), ActClear));
+            ribbon.AddGroup(edit);
+            RibbonGroup file = new RibbonGroup("文件");
+            file.Add(Item(RibbonItem.Large("save", "保存"), ActSave));
+            file.Add(Item(RibbonItem.Small("folder-open", "打开"), ActOpen));
+            ribbon.AddGroup(file);
+        } else if (tab == TabInsert) {
+            RibbonGroup time = new RibbonGroup("日期与时间");
+            time.Add(Item(RibbonItem.Large("calendar", "日期时间"), ActDateTime));
+            time.Add(Item(RibbonItem.Small("clock", "仅日期"), ActDate));
+            ribbon.AddGroup(time);
+            RibbonGroup text = new RibbonGroup("片段");
+            text.Add(Item(RibbonItem.Small("minus", "分隔线"), ActDivider));
+            text.Add(Item(RibbonItem.Small("user", "签名"), ActSignature));
+            ribbon.AddGroup(text);
+        } else if (tab == TabView) {
+            RibbonGroup show = new RibbonGroup("显示");
+            show.Add(Item(RibbonItem.Toggle("lock", "只读", readOnly), ActReadOnly));
+            ribbon.AddGroup(show);
+            RibbonGroup stats = new RibbonGroup("统计");
+            stats.Add(Item(RibbonItem.Large("calculator", "字数统计"), ActWordCount));
+            ribbon.AddGroup(stats);
+        }
+    }
+
+    static RibbonItem Item(RibbonItem item, int act) {
+        item.act = act;
+        return item;
+    }
+
+    static void OnCommand(int act) {
+        TextArea body = Body();
+        if (readOnly && act != ActReadOnly && act != ActWordCount && act != ActCopy
+            && act != ActSelectAll && act != ActSave) {
+            Say("文档是只读的：到「视图」关掉只读再编辑");
+            return;
+        }
+        if (act == ActPaste) {
+            string clip = Gui.Backend.Clipboard.GetText();
+            if (clip == "") { Say("剪贴板里没有文字"); } else { body.Insert(clip); Say("已粘贴"); }
+        } else if (act == ActCut || act == ActCopy) {
+            if (!body.HasSel()) { Say("请先在文本框里选中文字"); return; }
+            Gui.Backend.Clipboard.SetText(body.SelText());
+            if (act == ActCut) { body.Insert(""); Say("已剪切"); } else { Say("已复制"); }
+        } else if (act == ActSelectAll) {
+            body.SelectAll();
+            body.Focus();
+        } else if (act == ActClear) {
+            body.SetText("");
+            Say("已清空");
+        } else if (act == ActSave) {
+            try {
+                File.WriteAllText(DocumentPath(), body.GetText());
+                Say("已保存到 " + DocumentPath());
+            } catch (Exception e) { Say("保存失败：" + e.Message); }
+        } else if (act == ActOpen) {
+            if (!File.Exists(DocumentPath())) { Say("还没有保存过文档"); return; }
+            body.SetText(File.ReadAllText(DocumentPath()));
+            Say("已打开 " + DocumentPath());
+        } else if (act == ActDateTime) {
+            body.Insert(DateTime.Now().ToString());
+            Say("已插入日期时间");
+        } else if (act == ActDate) {
+            body.Insert(DateTime.Now().ToString().Substring(0, 10));
+            Say("已插入日期");
+        } else if (act == ActDivider) {
+            body.Insert("\n────────────────\n");
+        } else if (act == ActSignature) {
+            body.Insert("\n—— " + Environment.UserName + "\n");
+        } else if (act == ActReadOnly) {
+            readOnly = !readOnly;
+            body.ReadOnly(readOnly);
+            BuildGroups();      // 让开关按钮的点亮态跟上
+            Say(readOnly ? "已切换为只读" : "已恢复可编辑");
+        } else if (act == ActWordCount) {
+            string text = body.GetText();
+            Say("字数统计：" + Convert.ToString(body.CountValue()) + " 字，" + Convert.ToString(Lines(text)) + " 行");
+        }
+        UpdateStatus();
+    }
+
+    static void OnTextChange() {
+        UpdateStatus();
+    }
+
+    static void UpdateStatus() {
         StatusBar sb = (StatusBar)ui.Ctl("MainStatusBar");
-        sb.SetText(0, "命令 " + Convert.ToString(home.LastIndex()));
+        sb.SetText(1, readOnly ? "只读" : "可编辑");
+        sb.SetText(2, Convert.ToString(Body().CountValue()) + " 字");
+    }
+
+    static int Lines(string text) {
+        if (text == "") { return 0; }
+        int n = 1;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            if (text[i] == 10) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string DocumentPath() {
+        return Environment.ExeDir() + "/ribbon-document.txt";
+    }
+
+    static void Say(string message) {
+        ((StatusBar)ui.Ctl("MainStatusBar")).SetText(0, message);
+    }
+
+    static Ribbon MainRibbon() {
+        return (Ribbon)ui.Ctl("MainRibbon");
+    }
+
+    static TextArea Body() {
+        return (TextArea)ui.Ctl("BodyText");
     }
 }

@@ -347,9 +347,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
   LLVMTypeRef realloc_type = LLVMFunctionType(i8ptr, realloc_args, 2, 0);
   g->fn_realloc = LLVMAddFunction(g->mod, "realloc", realloc_type);
 
-  LLVMTypeRef list_fields[] = {i64, i64, LLVMPointerType(i64, 0)};
+  /* { count, capacity, data, esz }：esz 是元素槽宽标签（list_elem_tag），
+   * 0 = 传统 8 字节槽字。见 irgen_type_map.c「List 元素槽」。 */
+  LLVMTypeRef list_fields[] = {i64, i64, LLVMPointerType(i64, 0), i64};
   g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
-  LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
+  LLVMStructSetBody(g->list_struct_type, list_fields, 4, 0);
 
   LLVMTypeRef span_fields[] = {i8ptr, i64};
   g->span_struct_type = LLVMStructCreateNamed(g->ctx, "Span");
@@ -887,6 +889,46 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
           g->builder, g->rt_co_sched_run_until_type, g->rt_co_sched_run_until,
           (LLVMValueRef[]){LLVMConstNull(LLVMPointerType(i32t, 0))}, 1, "");
       LLVMBuildRetVoid(g->builder);
+    }
+    if (!g->target_is_wasm) {
+      {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(
+            g->ctx, g->rt_co_frame_alloc, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef sz = LLVMGetParam(g->rt_co_frame_alloc, 0);
+        LLVMValueRef zero = LLVMConstInt(i64t, 0, 0);
+        LLVMValueRef one = LLVMConstInt(i64t, 1, 0);
+        LLVMValueRef is_zero =
+            zan_icmp(g->builder, LLVMIntEQ, sz, zero, "sz.zero");
+        LLVMValueRef alloc_sz =
+            LLVMBuildSelect(g->builder, is_zero, one, sz, "alloc.sz");
+        LLVMTypeRef calloc_ty =
+            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64t, i64t}, 2, 0);
+        LLVMValueRef calloc_fn = LLVMGetNamedFunction(g->mod, "calloc");
+        if (!calloc_fn)
+          calloc_fn = LLVMAddFunction(g->mod, "calloc", calloc_ty);
+        LLVMValueRef ptr = zan_call2(g->builder, calloc_ty, calloc_fn,
+                                     (LLVMValueRef[]){one, alloc_sz}, 2,
+                                     "frame");
+        LLVMBuildRet(g->builder, ptr);
+      }
+      {
+        LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(
+            g->ctx, g->rt_co_frame_free, "entry");
+        LLVMPositionBuilderAtEnd(g->builder, bb);
+        LLVMValueRef frame = LLVMGetParam(g->rt_co_frame_free, 0);
+        LLVMTypeRef release_ty =
+            LLVMFunctionType(voidt, (LLVMTypeRef[]){i8ptr}, 1, 0);
+        LLVMTypeRef retire_ty = LLVMFunctionType(
+            voidt, (LLVMTypeRef[]){i8ptr, LLVMPointerType(release_ty, 0)}, 2,
+            0);
+        LLVMValueRef retire_fn = LLVMGetNamedFunction(g->mod, "zan_task_retire");
+        if (!retire_fn)
+          retire_fn = LLVMAddFunction(g->mod, "zan_task_retire", retire_ty);
+        zan_call2(g->builder, retire_ty, retire_fn,
+                  (LLVMValueRef[]){frame, g->fn_free}, 2, "");
+        LLVMBuildRetVoid(g->builder);
+      }
     }
     (void)voidt;
   }

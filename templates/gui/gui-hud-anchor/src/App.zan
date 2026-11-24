@@ -2,34 +2,151 @@ using System;
 using Gui;
 using Gui.Widget;
 
-/* App 业务逻辑：游戏 HUD 九宫格锚定范式（B-ID149 窗口即对象：事件 @click 按名接线）。
- * 窗口设计稿 src/{{NAME}}.html 由 Main 运行期投影；发布时经 zan.proj 的
- * gen.embed 烘进 exe（压缩加密内嵌），开发期直接读散盘。 */
+/* {{NAME}} —— 游戏 HUD 九宫格锚定排版。
+ * 布局：{{NAME}}.html 里每块面板贴一个锚点（左上角色、右上小地图、上中目标、
+ * 左下日志、下中技能栏），拉伸窗口时各自贴边，不会挤成一团。
+ * 逻辑：一个 100ms 的帧节拍（form.Every）推进技能冷却、法力回复和敌人攻击；
+ * 界面全部通过 bind / :disabled 绑定下面的字段，Tick 只改数据。
+ * 真游戏里把 Tick 换成你的游戏循环，把视口层换成 2D/3D 画布即可。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
-    static Form ui;
 
-    static void OnLoad(Form form) {
+    const int TickMs = 100;
+    const int SkillCount = 4;
+    const int MaxHp = 100;
+    const int MaxMp = 100;
+
+    static string[] SkillKeys = new string[] { "Q", "W", "E", "R" };
+    static string[] SkillNames = new string[] { "斩击", "治疗", "箭雨", "绝啸" };
+    static int[] SkillCost = new int[] { 10, 20, 30, 60 };
+    static int[] SkillCooldownMs = new int[] { 1000, 4000, 3000, 8000 };
+    static int[] SkillDamage = new int[] { 18, 0, 35, 90 };
+    static string[] EnemyNames = new string[] { "史莱姆", "狼人", "骷髅射手", "石像鬼" };
+
+    // ---- 绑定到界面的字段 ----
+    int hpPercent = 100;
+    int mpPercent = 100;
+    string hpText = "";
+    string mpText = "";
+    string targetText = "";
+    int targetPercent = 100;
+    string log1 = "";
+    string log2 = "";
+    string log3 = "";
+    string skill1Text = "";
+    string skill2Text = "";
+    string skill3Text = "";
+    string skill4Text = "";
+    bool skill1Busy = false;
+    bool skill2Busy = false;
+    bool skill3Busy = false;
+    bool skill4Busy = false;
+
+    // ---- 游戏状态 ----
+    int hp = MaxHp;
+    int mp = MaxMp;
+    int[] cooldownLeft = new int[SkillCount];
+    int enemyIndex = 0;
+    int enemyHp = 0;
+    int enemyMaxHp = 0;
+    int enemyAttackMs = 0;
+    int regenMs = 0;
+    int kills = 0;
+
+    void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
-        ui = form;    }
-
-    static void OnSkill1() {
-        Console.WriteLine("Cast Skill 1: Slash");
+        SpawnEnemy();
+        Log("进入迷雾森林，点技能栏出招。");
+        Refresh();
+        form.Every(TickMs, () => { Tick(); });
     }
 
-    static void OnSkill2() {
-        Console.WriteLine("Cast Skill 2: Dodge");
+    // 技能按钮 data-arg="0..3" @click="OnSkill"。
+    void OnSkill(string arg) {
+        int i = Convert.ToInt32(arg);
+        if (cooldownLeft[i] > 0) { return; }
+        if (mp < SkillCost[i]) {
+            Log("法力不足，无法释放「" + SkillNames[i] + "」。");
+            return;
+        }
+        mp = mp - SkillCost[i];
+        cooldownLeft[i] = SkillCooldownMs[i];
+        if (SkillDamage[i] == 0) {
+            int healed = Math.Min(30, MaxHp - hp);
+            hp = hp + healed;
+            Log("「" + SkillNames[i] + "」恢复 " + healed + " 点生命。");
+        } else {
+            enemyHp = Math.Max(0, enemyHp - SkillDamage[i]);
+            Log("「" + SkillNames[i] + "」造成 " + SkillDamage[i] + " 点伤害。");
+            if (enemyHp == 0) {
+                kills = kills + 1;
+                Log("击败了 " + EnemyNames[enemyIndex] + "！（累计 " + kills + "）");
+                SpawnEnemy();
+            }
+        }
+        Refresh();
     }
 
-    static void OnSkill3() {
-        Console.WriteLine("Cast Skill 3: Arrow Rain");
+    void Tick() {
+        for (int i = 0; i < SkillCount; i++) {
+            if (cooldownLeft[i] > 0) { cooldownLeft[i] = Math.Max(0, cooldownLeft[i] - TickMs); }
+        }
+        regenMs = regenMs + TickMs;
+        if (regenMs >= 1000) {           // 每秒回 4 点法力
+            regenMs = 0;
+            mp = Math.Min(MaxMp, mp + 4);
+        }
+        enemyAttackMs = enemyAttackMs + TickMs;
+        if (enemyAttackMs >= 2000) {     // 敌人每 2 秒攻击一次
+            enemyAttackMs = 0;
+            hp = Math.Max(0, hp - 7);
+            if (hp == 0) {
+                Log("你倒下了……在营地复活。");
+                hp = MaxHp;
+                mp = MaxMp;
+            }
+        }
+        Refresh();
     }
 
-    static void OnSkill4() {
-        Console.WriteLine("Cast Ultimate: Roar");
+    void SpawnEnemy() {
+        enemyIndex = (enemyIndex + 1) % EnemyNames.Length;
+        enemyMaxHp = 60 + enemyIndex * 30;
+        enemyHp = enemyMaxHp;
+        enemyAttackMs = 0;
+    }
+
+    // 状态 → 绑定字段：只在这里把游戏数据翻译成界面文字。
+    void Refresh() {
+        hpPercent = hp * 100 / MaxHp;
+        mpPercent = mp * 100 / MaxMp;
+        hpText = "生命 " + hp + " / " + MaxHp;
+        mpText = "法力 " + mp + " / " + MaxMp;
+        targetText = EnemyNames[enemyIndex] + "  " + enemyHp + " / " + enemyMaxHp;
+        targetPercent = enemyHp * 100 / enemyMaxHp;
+        skill1Text = SkillLabel(0);
+        skill2Text = SkillLabel(1);
+        skill3Text = SkillLabel(2);
+        skill4Text = SkillLabel(3);
+        skill1Busy = cooldownLeft[0] > 0;
+        skill2Busy = cooldownLeft[1] > 0;
+        skill3Busy = cooldownLeft[2] > 0;
+        skill4Busy = cooldownLeft[3] > 0;
+    }
+
+    // 冷却中显示剩余秒数（一位小数），就绪时显示键位 + 技能名。
+    string SkillLabel(int i) {
+        int left = cooldownLeft[i];
+        if (left <= 0) { return SkillKeys[i] + " " + SkillNames[i]; }
+        return SkillKeys[i] + " " + (left / 1000) + "." + (left % 1000 / 100) + "s";
+    }
+
+    void Log(string text) {
+        log3 = log2;
+        log2 = log1;
+        log1 = text;
     }
 }

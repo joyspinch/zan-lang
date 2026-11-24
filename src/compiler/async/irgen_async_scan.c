@@ -142,6 +142,12 @@ static void async_scan_expr(async_scan_t *s, zan_ast_node_t *e) {
     case AST_AS_EXPR:
         async_scan_expr(s, e->type_test.expr);
         break;
+    case AST_STRING_INTERP:
+        /* 插值片段里的 await 也要计数：漏数时帧布局不含 await 子槽，
+         * `$"{await F()}"` 在 async 方法里直接 LLVM 校验失败（E3090）。 */
+        for (int i = 0; i < e->string_interp.parts.count; i++)
+            async_scan_expr(s, e->string_interp.parts.items[i]);
+        break;
     default:
         break;
     }

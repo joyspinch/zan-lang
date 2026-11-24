@@ -50,6 +50,10 @@ static bool anf_expr_contains_await(zan_ast_node_t *e) {
     case AST_CAST_EXPR: return anf_expr_contains_await(e->cast.expr);
     case AST_IS_EXPR:
     case AST_AS_EXPR:  return anf_expr_contains_await(e->type_test.expr);
+    case AST_STRING_INTERP:
+        for (int i = 0; i < e->string_interp.parts.count; i++)
+            if (anf_expr_contains_await(e->string_interp.parts.items[i])) return true;
+        return false;
     default: return false;
     }
 }
@@ -296,6 +300,25 @@ static zan_ast_node_t *anf_expr(anf_ctx_t *c, zan_ast_node_t *e) {
     case AST_AS_EXPR:
         e->type_test.expr = anf_expr(c, e->type_test.expr);
         return e;
+    case AST_STRING_INTERP: {
+        /* 与调用实参同口径：片段按序求值，其后还有 await 的片段先落帧临时量。
+         * 否则前面片段的 SSA 值跨挂起点存活，`$"{a}{await F()}"` 在 async
+         * 方法里 LLVM 校验失败（"does not dominate all uses"）。片段位置不变，
+         * 格式说明（按片段序号索引）照旧作用在临时量上。 */
+        zan_ast_list_t *parts = &e->string_interp.parts;
+        for (int i = 0; i < parts->count; i++) {
+            zan_ast_node_t *part = parts->items[i];
+            if (!part || part->kind == AST_STRING_LITERAL) continue;
+            bool later_await = false;
+            for (int j = i + 1; j < parts->count; j++)
+                later_await |= anf_expr_contains_await(parts->items[j]);
+            part = anf_expr(c, part);
+            if (later_await)  /* 标识符也快照：后续 await 可能改写该变量 */
+                part = anf_hoist_value(c, part);
+            parts->items[i] = part;
+        }
+        return e;
+    }
     default:
         return e;
     }

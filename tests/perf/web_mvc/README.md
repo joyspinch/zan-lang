@@ -11,6 +11,9 @@
 每个场景跑两档并发：连接池大小 ×1 与 ×4（默认池 8 → 8 / 32 条 keep-alive 连接）。
 服务端为单进程单 `WebApp`（不开多 worker）。
 
+不经 MVC 的协议层基线（HTTP/1.1、HTTPS、HTTP/2、WebSocket）见 [`../protocols`](../protocols/README.md)；
+两边之差即框架开销。
+
 ## 运行
 
 ```bash
@@ -66,8 +69,39 @@ python3 tests/perf/web_mvc/run_bench.py --compare tests/perf/web_mvc/baselines/<
 - **待查：HEAD 自上一基线后 plain 8 连接 33.6k → 26.7k。** 期间唯一运行时相关提交是
   66b32700e（读串头前的可读性守卫）；剖析中其慢路径 `zan_rt_hdr_readable`→`vm_read_overwrite`
   约占 1% 采样，不足以解释，机器负载波动大，未定论。
-- **未解（间歇）：压测端一次 "out of memory" 退出。** 同环境 11 次未复现；HEAD 同期合入了
-  macOS 小对象分配器（bf700ebbf），未能归因。
+- **已查明（2026-11-23）：压测端偶发 "out of memory"/SIGSEGV/double free 是 load.zan 自身的数据竞争。**
+  连接协程跑在多个调度线程上，曾共用一个 List 记延迟、用普通 int 计数；并发扩容时分配器
+  报 double free。已改为每连接独立结果槽、结束时合并（`connect_fail`/`send_fail`/`recv_fail`
+  分项）。
+- **已修（2026-11-23）：keep-alive 连接约 1/4 的后续请求永不应答（macOS arm64）。**
+  根因：`PosixNetwork.SetNonBlocking` 把变参 `fcntl(int, int, ...)` 当三参普通 extern
+  调用；Apple arm64 变参走栈，第三参落在寄存器里被忽略——返回 0 却没设上 `O_NONBLOCK`，
+  所有经它的套接字一直阻塞。WebApp 的监听套接字因此在一个调度 worker 上阻塞 `accept()`，
+  该 worker 负责轮询的 IO 分片（`fd % 分片数`，默认 4 片即 1/4 的连接）就绪事件无人收割：
+  首个请求的字节通常已在缓冲区、非阻塞读直接拿到，之后的请求要等 kqueue 事件——永远
+  等不到。之前"新建连接首请求不应答"的描述不准确，实为 keep-alive 后续请求。改调运行时
+  的非变参 C 包装 `zan_io_set_nonblocking`。回归用例 `conformance/socket_nonblocking_accept`。
+  修后整轮 errors=0、stuck=0，基线重录。
+- **已修（2026-11-23）：list 32 连接吞吐反比 8 连接低一半。** 两处"每协程步/每帧完成都拿
+  全局锁"的运行时路径，代价随在途量上涨：① 编译器在每个异步帧完成处调
+  `zan_timer_cancel_delay`，它持全局定时器锁全堆扫描 + 重建堆；连接池排队时每次门等挂一个
+  250 ms 看门狗，堆常驻上千条。改为帧 → 条目索引 + 惰性删除（死条目过半再压缩）。
+  ② `co_run` 每步末尾只要有非 worker 线程在 `co_ext_wait`（服务端主线程终身在等根任务）
+  就拿 `g_co_ext_mx` 广播；改为只在刚跑的帧正是被等的帧时广播。同 HEAD A/B：list 8 连接
+  9.7k → 13.5k rps（p99 1.45 → 0.99 ms），32 连接 4.1k → 8.3k（p99 19 → 10 ms）。回归用例
+  `runtime_timer_delay_cancel_index`。剩余差距在连接池等待路径（每次门等的 Gate 锁、
+  派生看门狗协程、`PoolCore.IsClosed` 加锁）。
+- **已修（2026-11-23）：并发超过连接池时，池位被渲染与排队占住。** 剖析显示池等待路径
+  只占 worker CPU 约 7%，worker 大半空闲——瓶颈是每请求持连接的时长：请求连接一直持到
+  `OnAfterAsync`，拼行、模板渲染、以及排在 24 个别的请求后面等 CPU 的时间都算在 8 个
+  池位上，并发越高持有越久。`Controller` 新增 `OnRender()` 钩子（View/ViewOf/Fragment/
+  FragmentOf 渲染前调用），`AppController` 借此在渲染前把连接还回池：事务中、或连接
+  跑过会话语句（BEGIN/SET/PRAGMA/临时表/锁…，`RequestDbConnection` 钉住）时不还；代理
+  保留，渲染后再有语句重新惰性借出。另把定时门等的看门狗从"每次等待派生一个协程 +
+  Task.Delay"改为运行时定时器回调（`zan_gate_arm_ms`），门票据改为等待记录地址
+  （原为序号 + 遍历记录链表，定时记录要活到看门狗到期，压力下每次都在门锁里扫上千条）。
+  同 HEAD 交替 A/B：list 32 连接 8.6k → 11.9k rps（p99 15.4 → 8.6 ms，6/6 胜），
+  8 连接 12.0k → 13.8k（4/6 胜）。
 - **未解（间歇）：压测端偶发 1 条连接 `stuck`。** 带 10 s 时限的接收在 25 s 内都没返回，
   指向 socket 读路径上另一处丢唤醒（在压测客户端进程里），与上面已修的阻塞卸载
   路径不同。高负载（load ~30）下 3 轮里出现 1 次；未复现到可调试的程度。

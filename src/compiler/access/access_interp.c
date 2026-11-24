@@ -231,12 +231,16 @@ LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr,
                         continue;
                     }
                     if (flen <= 0) {
-                        /* 无格式说明符的整型直接使用固定 21 字节栈缓冲区转换 */
-                        LLVMValueRef buf = emit_string_alloc_rc(g,
-                            LLVMConstInt(i64, 24, 0));
+                        /* 无格式说明符的整型：进栈上 24 字节暂存区，拼接时按长度拷贝，
+                         * 不再为这段只活到拼接结束的临时量走一次堆分配/释放。
+                         * async 帧里保留堆分配：后面的片段可能含 await，栈暂存区跨挂起不保值。 */
+                        bool on_stack = !g->current_async_frame;
+                        LLVMValueRef buf = on_stack
+                            ? emit_entry_scratch(g, 24, "interp.i2s")
+                            : emit_string_alloc_rc(g, LLVMConstInt(i64, 24, 0));
                         strs[i] = buf;
                         lens[i] = emit_itoa_into(g, buf, val64, iu ? 1 : 0);
-                        owns[i] = 1;
+                        owns[i] = on_stack ? 0 : 1;
                         continue;
                     }
                     LLVMValueRef fmt = zan_irgen_intern_string(g,

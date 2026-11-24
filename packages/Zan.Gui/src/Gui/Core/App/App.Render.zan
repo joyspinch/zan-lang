@@ -104,8 +104,8 @@ public partial class App {
         int perfPreMs = 0;
         if (App.PerfOn()) {
             perfPreMs = Window.RawTickMs();
-            perfOverlayMs = perfOverlayMs + (perfT1 - perfT0);
-            perfFxMs = perfFxMs + (perfPreMs - perfT1);
+            Stats.OverlayMs = Stats.OverlayMs + (perfT1 - perfT0);
+            Stats.FxMs = Stats.FxMs + (perfPreMs - perfT1);
         }
         this.TraceFullPresent(25, false);
         this.TraceFullPresent(26, true);
@@ -118,9 +118,9 @@ public partial class App {
                     partialBlocked = true;
                     forceFullNext = true;
                     blurMissStreak = 0;
-                    this.NoteRedrawWhy("glass-partial-blur");
+                    this.Stats.NoteRedrawWhy("glass-partial-blur");
                 } else {
-                    this.NoteRedrawWhy("glass-strip-widen");
+                    this.Stats.NoteRedrawWhy("glass-strip-widen");
                 }
                 needsRedraw = true;
             } else {
@@ -162,7 +162,7 @@ public partial class App {
         this.AutomationPresented();
         if (App.PerfOn()) {
             int endMs = Window.RawTickMs();
-            this.RecordFramePerf(perfBeginMs, perfPreMs, endMs, partialFrame);
+            this.RecordFramePerf(Stats.BeginMs, perfPreMs, endMs, partialFrame);
         }
         frameCount = frameCount + 1;
         lastPresentMs = Window.GetTickMs();
@@ -183,7 +183,9 @@ public partial class App {
         this.SyncNativeDpi();
         frameDpiRevision = nativeDpiRevision;
         if (window.DpiFramePending()) { forceFullNext = true; }
-        if (App.PerfOn()) { perfBeginMs = Window.RawTickMs(); }
+        // Animation may be frozen for pixel comparisons; measured work uses
+        // the independent monotonic clock so frozen frames retain real cost.
+        if (App.PerfOn()) { Stats.BeginMs = Window.RawTickMs(); }
         if (App.PerfOn()) { Canvas.TextStatEnable(true); }
         this.SyncSkin();
         if (freezeAnimClock) {
@@ -193,18 +195,20 @@ public partial class App {
             nowMs = Window.GetTickMs();
         }
         if (App.PerfOn()) {
-            if (redrawWhy == "") {
-                if (needsRedraw) { redrawWhy = "silent"; }
-                else { redrawWhy = "unrequested"; }
+            if (Stats.RedrawWhy == "") {
+                if (needsRedraw) { Stats.RedrawWhy = "silent"; }
+                else { Stats.RedrawWhy = "unrequested"; }
             }
-            if (frameWhy != "" && redrawWhy == "") {
-                frameWhy = "rebegin:" + frameWhy;
+            if (Stats.FrameWhy != "" && Stats.RedrawWhy == "") {
+                // 这一帧之前已经有人交接过理由，却又走了一次
+                // BeginFrame：说明一次 Present 对应了两次开帧。
+                Stats.FrameWhy = "rebegin:" + Stats.FrameWhy;
             } else {
-                frameWhy = redrawWhy;
-                frameWhyN = redrawCount;
+                Stats.FrameWhy = Stats.RedrawWhy;
+                Stats.FrameWhyN = Stats.RedrawCount;
             }
-            redrawWhy = "";
-            redrawCount = 0;
+            Stats.RedrawWhy = "";
+            Stats.RedrawCount = 0;
         }
         needsRedraw = false;
         animNextMs = -1;
@@ -230,7 +234,13 @@ public partial class App {
         partialFrame = false;
         partialBlocked = false;
         glassDeferred = false;
-        Canvas.paintHashOn = this.PartialFrames();
+        // 控件内容哈希只在本应用开了局部帧时计数（）。
+        PaintHash.On = this.PartialFrames();
+        // 输入事件（按下/释放/按键）触发的帧不得继承上一帧遗留的
+        // 条带裁剪：条带外的控件本帧不渲染、不注册命中区，锚点认领
+        // 与 Ui.Clicked 都会落空——表现为点击无响应/迟钝。条带是
+        // 纯动画帧自己声明的，输入帧永远整帧（见 inputNeedsFrame）。
+        // 滚轮条带同样不参与命中归属：输入始终命中当前对象树。
         if (inputNeedsFrame) { partialPending = false; }
         this.CheckFormPaintClip();
         if (partialPending && dmgW > 0 && dmgH > 0) { partialFrame = true; }
@@ -238,7 +248,7 @@ public partial class App {
         if (forceFullNext) {
             partialFrame = false;
             forceFullNext = false;
-            this.NoteRedrawWhy("force-full");
+            this.Stats.NoteRedrawWhy("force-full");
         }
         inputNeedsFrame = false;
         wheelScrollInput = false;
@@ -291,7 +301,7 @@ public partial class App {
     void AddOverlay(OverlayPopup p) {
         overlays.Add(p);
         if (partialFrame) {
-            this.NoteRedrawWhy("overlay-in-partial");
+            this.Stats.NoteRedrawWhy("overlay-in-partial");
             needsRedraw = true;
         }
     }

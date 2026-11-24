@@ -1,0 +1,404 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+namespace Gui;
+
+// 顶层窗口容器：继承 WindowRoot（承载子控件树与布局），内聚底层 App
+// 并驱动帧循环，每帧在标题栏装饰之下布局并渲染整棵树。
+public partial class Form : WindowRoot {
+    App app;
+    string title;
+    List<FormTask> tasks;
+    HandlerRegistry handlers;
+    bool docWired;
+    private bool localAnimation;
+    private bool reusePaintLayout;
+    Form(string title, int width, int height) {
+        InitForm(title, width, height, false);
+    }
+    Form(string title, int width, int height, bool offscreen) {
+        InitForm(title, width, height, offscreen);
+    }
+    public Form() {
+    }
+    void InitForm(string title, int width, int height, bool offscreen) {
+        this.InitControl(title);
+        this.title = title;
+        this.app = offscreen ? App.CreateOffscreen(title, width, height)
+                             : new App(title, width, height);
+        this.handlers = new HandlerRegistry();
+        this.tasks = new List<FormTask>();
+    }
+    static Form CreateOffscreen(string title, int width, int height) {
+        return new Form(title, width, height, true);
+    }
+    static Form Create(string title, int width, int height) { return new Form(title, width, height); }
+    static Form CreateDark(string title, int width, int height) {
+        Form f = new Form(title, width, height);
+        f.app.SetDark(true);
+        f.app.EnableSkins(0);
+        return f;
+    }
+    // 底层 App（画布、主题、事件泵、时钟）。
+    public override App GetApp() {
+        return app;
+    }
+
+    // 运行时改写窗口标题：自绘标题栏下一帧就用新文字，
+    // 同时同步操作系统窗口标题（任务栏/Alt-Tab）。
+    void SetTitle(string text) {
+        if (this.title == text) { return; }
+        this.title = text;
+        app.SetWindowTitle(text);
+        app.RequestRedraw();
+    }
+    string Title() { return this.title; }
+    void Close() {
+        if (app != null) { app.RequestClose(); }
+    }
+    void Minimize() {
+        if (app != null) { app.MinimizeWindow(); }
+    }
+    void ToggleMaximize() {
+        if (app != null) { app.ToggleMaximizeWindow(); }
+    }
+
+    // 设置窗口保持置顶（TopMost）。
+    void SetTopmost(bool on) {
+        if (app != null) { app.SetTopmost(on); }
+    }
+    bool IsTopmost() {
+        if (app != null) { return app.IsTopmost(); }
+        return false;
+    }
+    void SetMinSize(int w, int h) {
+        if (app != null) { app.SetMinSize(w, h); }
+    }
+    override string StyleType() { return "window"; }
+    override int StyleDisplay() { return computedStyle == null ? 1 : base.StyleDisplay(); }
+    override int StyleFlexDir() { return computedStyle == null ? 1 : base.StyleFlexDir(); }
+    Action frameHook;
+    void FrameHook(Action a) { frameHook = a; }
+    Action exitHook;
+    void OnExit(Action a) { exitHook = a; }
+    FormTask Every(int ms, Action a) {
+        FormTask t = new FormTask(ms, a);
+        t.Schedule(app.nowMs + t.Period());
+        tasks.Add(t);
+        return t;
+    }
+    void PumpTasks() {
+        if (tasks.Count == 0) { return; }
+        int now = Window.GetTickMs();
+        int soonest = 0 - 1;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FormTask t = tasks[i];
+            if (now >= t.Due()) {
+                t.Fire();
+                t.Schedule(now + t.Period());
+                app.RequestRedraw();
+            }
+            int wait = t.Due() - now;
+            if (wait < 0) { wait = 0; }
+            if (soonest < 0 || wait < soonest) { soonest = wait; }
+        }
+        if (soonest >= 0) { app.RequestWakeIn(soonest); }
+    }
+    void FoldTaskDeadlines() {
+        if (tasks.Count == 0) { return; }
+        int now = Window.GetTickMs();
+        int soonest = 0 - 1;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            int wait = tasks[i].Due() - now;
+            if (wait < 0) { wait = 0; }
+            if (soonest < 0 || wait < soonest) { soonest = wait; }
+        }
+        if (soonest >= 0) { app.RequestWakeIn(soonest); }
+    }
+    Control Ctl(string name) { return this.Find(name); }
+    T Get<T>(string name) {
+        Control c = this.Find(name);
+        if (c == null) { return null; }
+        if (c is T) { return (T)c; }
+        return null;
+    }
+    void On(string name, Action a) { handlers.Set(name, a); }
+    void On(string name, Action<string> a) { handlers.SetArg(name, a); }
+    void On(string name, ControlEvent a) { handlers.SetSender(name, a); }
+    void On(string name, ControlItemEvent a) { handlers.SetItem(name, a); }
+    void HandleItem(string name, ControlItemEvent a) { handlers.SetItem(name, a); }
+    Action Handle(string name) { return handlers.Get(name); }
+    void Call(string name) {
+        Action a = handlers.Get(name);
+        if (a != null) { a(); }
+        ControlEvent s = handlers.GetSender(name);
+        if (s != null) { s(null); }
+        Action<string> aa = handlers.GetArg(name);
+        if (aa != null) { aa(""); }
+    }
+    void Call(string name, Control sender) {
+        Action a = handlers.Get(name);
+        if (a != null) { a(); }
+        ControlItemEvent ia = handlers.GetItem(name);
+        if (ia != null) { ia(sender, sender != null ? sender.item : null); }
+        ControlEvent s = handlers.GetSender(name);
+        if (s != null) { s(sender); }
+    }
+    void Call(string name, Control sender, object item) {
+        Action a = handlers.Get(name);
+        if (a != null) { a(); }
+        ControlItemEvent ia = handlers.GetItem(name);
+        if (ia != null) { ia(sender, item); }
+        ControlEvent s = handlers.GetSender(name);
+        if (s != null) { s(sender); }
+    }
+    void Call(string name, string arg) {
+        Action a = handlers.Get(name);
+        if (a != null) { a(); }
+        Action<string> aa = handlers.GetArg(name);
+        if (aa != null) { aa(arg); }
+    }
+    void WireDocEvents() {
+        if (this.docWired) { return; }
+        this.docWired = true;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Form.WireDocNode(this.ChildAt(i), this.handlers);
+        }
+    }
+    private static void WireDocNode(Control c, HandlerRegistry handlers) {
+        for (int i = 0; i < c.events.Count; i = i + 1) {
+            string evt = c.events[i].key;
+            string hname = c.events[i].val;
+            if (hname == "") { continue; }
+            ControlItemEvent ia = handlers.GetItem(hname);
+            if (ia != null) {
+                Control sc = c;
+                c.BindEvent(evt, () => { ia(sc, sc.item); });
+                continue;
+            }
+            ControlEvent sa = handlers.GetSender(hname);
+            if (sa != null) {
+                Control sc = c;
+                c.BindEvent(evt, () => { sa(sc); });
+                continue;
+            }
+            if (c.handlerArg != "") {
+                Action<string> aa = handlers.GetArg(hname);
+                if (aa != null) {
+                    string arg = c.handlerArg;
+                    c.BindEvent(evt, () => { aa(arg); });
+                    continue;
+                }
+            }
+            Action a = handlers.Get(hname);
+            if (a != null) { c.BindEvent(evt, a); }
+        }
+        for (int j = 0; j < c.ChildCount(); j = j + 1) {
+            Form.WireDocNode(c.ChildAt(j), handlers);
+        }
+    }
+    internal AppLoopRegistration hostLayoutRegistration;
+    private bool HostLayoutCurrent(App a, AppLoopRegistration ticket, AppPreparationProof proof,
+            int revision, int phase, long sequence, bool forInput) {
+        Control root = a.rootControl;
+        bool member = !forInput || (root != null
+            && (root.ContainsInputControl(this) || this.ContainsHostedControl(root)));
+        return member && app == a && hostLayoutRegistration == ticket
+            && a.PreparationInputCurrent(phase, sequence)
+            && a.HostPhaseCurrent(ticket, proof, revision);
+    }
+    internal bool SyncHostLayout(App a, bool forInput) {
+        AppLoopRegistration ticket = hostLayoutRegistration;
+        if (a != app || ticket == null || !a.LiveLoopRegistration(ticket) || ticket.host != a) { return false; }
+        AppPreparationProof proof = new AppPreparationProof(ticket);
+        int revision = a.hostLayoutRevision;
+        int phase = a.inputPreparationTicket;
+        long sequence = a.window.EventSeq();
+        if (!a.SyncModelHosts()) { return false; }
+        if (!HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput)) { return false; }
+        this.MeasureTree(a);
+        if (!HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput)) { return false; }
+        this.Arrange(a.ShapeOffX(), a.ContentTop() + a.ShapeOffY(),
+            a.ClientWidth(), a.ClientHeight() - a.ContentTop());
+        return HostLayoutCurrent(a, ticket, proof, revision, phase, sequence, forInput);
+    }
+    private bool ContinueFormFrame(App a, AppLoopRegistration ticket, string boundary = "form") {
+        if (app == a && hostLayoutRegistration == ticket && a.HostLayoutPrepared(ticket)) { return true; }
+        a.TracePreparationFailure(boundary);
+        a.AbortPreparationFrame();
+        return false;
+    }
+    internal void RenderPreparedFrame(App a) {
+        AppLoopRegistration ticket = hostLayoutRegistration;
+        if (!ContinueFormFrame(a, ticket)) { return; }
+        int top = a.ContentTop();
+        a.Stats.PhaseBegin();
+        a.RenderBackground(0, top, a.canvas.Width(), a.canvas.Height() - top, 0);
+        if (!ContinueFormFrame(a, ticket)) { return; }
+        a.Stats.PhaseEnd(0);
+        this.RenderTree(a);
+        if (!ContinueFormFrame(a, ticket, "form-after-tree")) { return; }
+        if (!a.WriteBackModelHosts()) {
+            a.TracePreparationFailure("form-writeback");
+            a.AbortPreparationFrame(); return;
+        }
+        if (!ContinueFormFrame(a, ticket, "form-after-writeback")) { return; }
+        a.Stats.PhaseEnd(3);
+    }
+    protected void RunScoped(Action loop) {
+        App prior = App.FrameApp();
+        Control priorInputRoot = app.rootControl;
+        FrameBody priorBody = app.frameBody;
+        AppLoopRegistration priorLayout = hostLayoutRegistration;
+        AppLoopRegistration scopeLayout = app.RegisterLoopParticipant(this, new FormHostLayout(this));
+        hostLayoutRegistration = scopeLayout;
+        try {
+            App scopeApp = app;
+            scopeApp.SetFrameBody(() => {
+                scopeApp.BeginFormRegionCapture(localAnimation);
+                this.RenderPreparedFrame(scopeApp);
+                if (!this.ContinueFormFrame(scopeApp, scopeLayout)) { return; }
+                scopeApp.RenderChrome(title);
+                if (!this.ContinueFormFrame(scopeApp, scopeLayout)) { return; }
+            });
+            app.SetRootControl(this);
+            loop();
+        } finally {
+            scopeLayout.Invalidate();
+            if (hostLayoutRegistration == scopeLayout) { hostLayoutRegistration = priorLayout; }
+            app.SetRootControl(priorInputRoot);
+            app.SetFrameBody(priorBody);
+            App.SetFrameApp(prior);
+        }
+    }
+    public void SetLocalAnimation(bool on) {
+        if (localAnimation == on) { return; }
+        localAnimation = on;
+        if (app != null) { app.RequestRedraw(); }
+    }
+    public void SetReusePaintLayout(bool on) {
+        if (reusePaintLayout == on) { return; }
+        reusePaintLayout = on;
+        if (app != null) { app.RequestRedraw(); }
+    }
+    protected bool RenderPendingFormFrame() {
+        if (app.PresentFormRegion()) { return true; }
+        if (!app.needsRedraw) { return false; }
+        app.TraceFullPresent(10, false);
+        app.TraceFullPresent(12, true);
+        app.SafeFrame(app.frameBody, reusePaintLayout ? hostLayoutRegistration : null);
+        app.TraceFullPresent(12, false);
+        return true;
+    }
+    void Run() {
+        this.WireDocEvents();
+        app.Show();
+        this.RunScoped(() => {
+            while (app.isRunning) {
+                app.TraceFullPresent(5, true);
+                if (!app.ProcessEvent()) { break; }
+                app.TraceFullPresent(5, false);
+                app.TraceFullPresent(6, true);
+                if (frameHook != null) { frameHook(); }
+                app.TraceFullPresent(6, false);
+                app.Stats.Mark("sh.framehook");
+                app.TraceFullPresent(7, true);
+                ChildWindows.PumpAll();
+                app.TraceFullPresent(7, false);
+                app.Stats.Mark("sh.childpump");
+                app.TraceFullPresent(8, true);
+                ChildWindows.FoldDeadlines(app);
+                app.TraceFullPresent(8, false);
+                app.Stats.Mark("sh.deadlines");
+                app.TraceFullPresent(9, true);
+                this.PumpTasks();
+                app.TraceFullPresent(9, false);
+                app.Stats.Mark("sh.tasks");
+                app.Stats.Mark("sh.framegate");
+                app.TraceFullPresent(10, true);
+                if (!this.RenderPendingFormFrame()) {
+                    app.TraceFullPresent(11, true);
+                    continue;
+                }
+                ChildWindows.FoldDeadlines(app);
+                this.FoldTaskDeadlines();
+            }
+        });
+        if (exitHook != null) { exitHook(); }
+    }
+    private void WithOffscreenHost(Action<AppLoopRegistration> body) {
+        App a = this.app;
+        if (a == null || !a.isRunning || a.window.GetHandle() != 0) { return; }
+        AppLoopRegistration priorLayout = hostLayoutRegistration;
+        Control priorRoot = a.rootControl;
+        AppLoopRegistration ticket = a.RegisterLoopParticipant(this, new FormHostLayout(this));
+        hostLayoutRegistration = ticket;
+        int generation = ticket.generation;
+        int rootGeneration = a.inputRootGeneration;
+        bool changedRoot = priorRoot == null;
+        try {
+            if (changedRoot) {
+                rootGeneration = rootGeneration + 1;
+                a.SetRootControl(this);
+            }
+            Control scopeRoot = changedRoot ? this : priorRoot;
+            if (app == a && a.isRunning && hostLayoutRegistration == ticket
+                    && ticket.active && ticket.generation == generation
+                    && a.rootControl == scopeRoot && a.inputRootGeneration == rootGeneration) {
+                body(ticket);
+            }
+        } finally {
+            bool ownsTicket = app == a && hostLayoutRegistration == ticket;
+            bool current = ownsTicket && a.isRunning && ticket.active && ticket.generation == generation;
+            if (hostLayoutRegistration == ticket) {
+                hostLayoutRegistration = current && priorLayout != null
+                    && a.LiveLoopRegistration(priorLayout) ? priorLayout : null;
+            }
+            ticket.Invalidate();
+            if (ownsTicket && changedRoot && a.rootControl == this
+                    && a.inputRootGeneration == rootGeneration) {
+                a.SetRootControl(priorRoot);
+            }
+        }
+    }
+    private ControlInputHost offscreenInputHost;
+    public void ProcessOffscreenInput(int kind, int x, int y, int button,
+            int key, int mods, int flag) {
+        App a = this.app;
+        if (a == null || !a.isRunning || a.window.GetHandle() != 0) { return; }
+        Control root = a.rootControl;
+        if (root == null) {
+            if (offscreenInputHost == null) { offscreenInputHost = new ControlInputHost(this); }
+            offscreenInputHost.Bind(a);
+            root = a.rootControl;
+        }
+        if (root == null || (!root.ContainsInputControl(this) && !this.ContainsHostedControl(root))) {
+            throw new InvalidOperationException("Offscreen Form input requires a root hosted by this Form.");
+        }
+        this.WithOffscreenHost((AppLoopRegistration ticket) => {
+            a.ProcessOffscreenInput(kind, x, y, button, key, mods, flag);
+        });
+    }
+    Canvas CaptureSnapshot() {
+        App a = this.app;
+        if (a == null) { return null; }
+        this.WithOffscreenHost((AppLoopRegistration ticket) => {
+            a.snapshotInputSilenceDepth = a.snapshotInputSilenceDepth + 1;
+            try {
+                a.BeginSnapshotFrame();
+                if (a.PrepareStandardHostFrame()) {
+                    this.RenderPreparedFrame(a);
+                    if (this.ContinueFormFrame(a, ticket)) { a.RenderChrome(this.title); }
+                    if (this.ContinueFormFrame(a, ticket)) { a.EndOffscreenFrame(); }
+                }
+            } catch (Exception error) {
+                a.AbortPreparationFrame();
+                throw error;
+            } finally {
+                a.snapshotInputSilenceDepth = a.snapshotInputSilenceDepth - 1;
+            }
+        });
+        return a.canvas;
+    }
+}

@@ -1,25 +1,136 @@
 using System;
+using System.IO;
 using Gui;
 using Gui.Widget;
 
-/* {{NAME}} 业务逻辑：界面在 {{NAME}}.html 中声明式设计，事件经 form.On
- * 直连本类方法（B-ID149 窗口即对象：事件 @click 按名接线）。 */
+/* {{NAME}}：工具条 + 文档区 + 状态栏的经典桌面外壳，做成了一个能用的小记事本。
+ *
+ * {{NAME}}.html 声明布局；本类处理命令：
+ *   - 新建 / 打开 / 保存：文档固定存在程序目录下的 notes.txt。
+ *     要换成系统文件对话框，把 DocumentPath() 换成
+ *     form.GetApp().window.PickFile("*.txt") 的返回值即可；
+ *   - 剪切 / 复制 / 粘贴 / 全选：作用在文本框当前选区；
+ *   - 文本变化 → 标题加"●"未保存标记，状态栏刷新行数与字数。
+ * 工具条按下标派发（分隔条也占下标），增删按钮时同步改下面的常量。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
+    // 主窗引用：处理器里用 ui.Ctl("Id") 取设计稿里的控件。
     static Form ui;
+    static bool dirty;
+
+    const int ToolNew = 0;
+    const int ToolOpen = 1;
+    const int ToolSave = 2;
+    const int ToolCut = 4;
+    const int ToolCopy = 5;
+    const int ToolPaste = 6;
+    const int ToolTime = 8;
+    const int ToolSelectAll = 9;
 
     static void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
         ui = form;
+        dirty = false;
+        UpdateChrome();
     }
 
     static void OnToolClick() {
         ToolStrip tools = (ToolStrip)ui.Ctl("MainToolStrip");
-        StatusBar sb = (StatusBar)ui.Ctl("MainStatusBar");
-        sb.SetText(0, "命令 " + Convert.ToString(tools.LastIndex()));
+        int index = tools.LastIndex();
+        TextArea body = Body();
+        if (index == ToolNew) {
+            body.SetText("");
+            dirty = false;
+            Say("已新建空白文档");
+        } else if (index == ToolOpen) {
+            Open();
+        } else if (index == ToolSave) {
+            Save();
+        } else if (index == ToolCut || index == ToolCopy) {
+            if (!body.HasSel()) {
+                Say("请先在文本框里选中文字");
+            } else {
+                Gui.Backend.Clipboard.SetText(body.SelText());
+                if (index == ToolCut) {
+                    body.Insert("");      // 用空串替换选区：会触发 Change，未保存标记随之更新
+                    Say("已剪切到剪贴板");
+                } else {
+                    Say("已复制到剪贴板");
+                }
+            }
+        } else if (index == ToolPaste) {
+            string clip = Gui.Backend.Clipboard.GetText();
+            if (clip == "") { Say("剪贴板里没有文字"); }
+            else { body.Insert(clip); Say("已粘贴"); }
+        } else if (index == ToolTime) {
+            body.Insert(DateTime.Now().ToString());
+            Say("已插入当前时间");
+        } else if (index == ToolSelectAll) {
+            body.SelectAll();
+            body.Focus();
+        }
+        UpdateChrome();
+    }
+
+    // 用户每次编辑都会走到这里。
+    static void OnTextChange() {
+        dirty = true;
+        UpdateChrome();
+    }
+
+    static void Open() {
+        string path = DocumentPath();
+        if (!File.Exists(path)) {
+            Say("还没有保存过文档：" + path);
+            return;
+        }
+        try {
+            Body().SetText(File.ReadAllText(path));
+            dirty = false;
+            Say("已打开 " + path);
+        } catch (Exception e) {
+            Say("打开失败：" + e.Message);
+        }
+    }
+
+    static void Save() {
+        string path = DocumentPath();
+        try {
+            File.WriteAllText(path, Body().GetText());
+            dirty = false;
+            Say("已保存到 " + path);
+        } catch (Exception e) {
+            Say("保存失败：" + e.Message);
+        }
+    }
+
+    // 标题的未保存标记 + 状态栏的行数 / 字数。
+    static void UpdateChrome() {
+        string text = Body().GetText();
+        ((Label)ui.Ctl("HeadingLabel")).Text = dirty ? "notes.txt ●（未保存）" : "notes.txt";
+        int lines = text == "" ? 0 : 1;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            if (text[i] == 10) { lines = lines + 1; }
+        }
+        Status().SetText(2, Convert.ToString(lines) + " 行 · " + Convert.ToString(Body().CountValue()) + " 字");
+    }
+
+    static string DocumentPath() {
+        return Environment.ExeDir() + "/notes.txt";
+    }
+
+    static void Say(string message) {
+        Status().SetText(0, message);
+    }
+
+    static TextArea Body() {
+        return (TextArea)ui.Ctl("BodyText");
+    }
+
+    static StatusBar Status() {
+        return (StatusBar)ui.Ctl("MainStatusBar");
     }
 }

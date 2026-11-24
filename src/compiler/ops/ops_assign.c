@@ -340,10 +340,6 @@ binding_lowered:
                     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, local->alloca, "lraw");
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, raw,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
-                    LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-                        list_ptr, 2, "df");
-                    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(LLVMInt64TypeInContext(g->ctx), 0),
-                        data_field, "data");
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                     LLVMValueRef count_field = LLVMBuildStructGEP2(g->builder,
                         g->list_struct_type, list_ptr, 0, "countf");
@@ -358,11 +354,9 @@ binding_lowered:
                         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx), "idxext");
                     }
                     idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-                    idx = slot_word_index(g, idx,
-                        elem_slot_words(g, container_elem_type(local->type)));
-                    LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, LLVMInt64TypeInContext(g->ctx), data, &idx, 1, "ep");
-                    emit_collection_slot_store(g, container_elem_type(local->type),
-                        LLVMInt64TypeInContext(g->ctx), slot_ptr,
+                    LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(local->type), "data");
+                    LLVMValueRef slot_ptr = list_elem_ptr(g, data, idx, container_elem_type(local->type), "ep");
+                    emit_collection_slot_store(g, container_elem_type(local->type), list_slot_type(g, container_elem_type(local->type)), slot_ptr,
                         right, expr->binary.right, locals, 1);
                     emit_oob_store_finish(g, ls_do, ls_end);
                 } else if (local) {
@@ -492,10 +486,6 @@ binding_lowered:
                             LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
                                 LLVMPointerType(g->list_struct_type, 0), "lptr");
-                            LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-                                list_ptr, 2, "df");
-                            LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
-                                data_field, "data");
                             LLVMValueRef count_field = LLVMBuildStructGEP2(g->builder,
                                 g->list_struct_type, list_ptr, 0, "countf");
                             LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
@@ -509,10 +499,9 @@ binding_lowered:
                                 idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
                             }
                             idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-                            idx = slot_word_index(g, idx,
-                                elem_slot_words(g, container_elem_type(fsym->type)));
-                            LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
-                            emit_collection_slot_store(g, container_elem_type(fsym->type), i64t, slot_ptr,
+                            LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(fsym->type), "data");
+                            LLVMValueRef slot_ptr = list_elem_ptr(g, data, idx, container_elem_type(fsym->type), "ep");
+                            emit_collection_slot_store(g, container_elem_type(fsym->type), list_slot_type(g, container_elem_type(fsym->type)), slot_ptr,
                                 right, expr->binary.right, locals, 1);
                             emit_oob_store_finish(g, lf_do, lf_end);
                         } else if (fsym->type && type_named(fsym->type, "Dict", 4)) {
@@ -617,10 +606,6 @@ binding_lowered:
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
                             LLVMPointerType(g->list_struct_type, 0), "lptr");
-                        LLVMValueRef data_field = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-                            list_ptr, 2, "df");
-                        LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
-                            data_field, "data");
                         LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                             LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                                 list_ptr, 0, "countf"), "count");
@@ -633,10 +618,9 @@ binding_lowered:
                             idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
                         }
                         idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-                        idx = slot_word_index(g, idx,
-                            elem_slot_words(g, container_elem_type(at)));
-                        LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
-                        emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
+                        LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(at), "data");
+                        LLVMValueRef slot_ptr = list_elem_ptr(g, data, idx, container_elem_type(at), "ep");
+                        emit_collection_slot_store(g, container_elem_type(at), list_slot_type(g, container_elem_type(at)), slot_ptr,
                             right, expr->binary.right, locals, 1);
                         emit_oob_store_finish(g, lm_do, lm_end);
                     } else if (type_named(at, "Dict", 4)) {
@@ -761,9 +745,6 @@ binding_lowered:
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
                     LLVMValueRef list_ptr = LLVMBuildBitCast(g->builder, arr_ptr,
                         LLVMPointerType(g->list_struct_type, 0), "lptr");
-                    LLVMValueRef data = LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0),
-                        LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-                            list_ptr, 2, "df"), "data");
                     LLVMValueRef count = LLVMBuildLoad2(g->builder, i64t,
                         LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                             list_ptr, 0, "countf"), "count");
@@ -774,10 +755,9 @@ binding_lowered:
                         idx = LLVMBuildSExt(g->builder, idx, i64t, "idxext");
                     }
                     idx = emit_index_safe_bounds(g, idx, count, expr->loc, "list");
-                    idx = slot_word_index(g, idx,
-                        elem_slot_words(g, container_elem_type(at)));
-                    LLVMValueRef slot_ptr = LLVMBuildGEP2(g->builder, i64t, data, &idx, 1, "ep");
-                    emit_collection_slot_store(g, container_elem_type(at), i64t, slot_ptr,
+                    LLVMValueRef data = list_data_for(g, list_ptr, container_elem_type(at), "data");
+                    LLVMValueRef slot_ptr = list_elem_ptr(g, data, idx, container_elem_type(at), "ep");
+                    emit_collection_slot_store(g, container_elem_type(at), list_slot_type(g, container_elem_type(at)), slot_ptr,
                         right, expr->binary.right, locals, 1);
                     emit_release_owned_call_temp(g, arr_expr, arr_ptr, locals);
                 } else if (at && at->kind == TYPE_ARRAY) {

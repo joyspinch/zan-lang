@@ -456,6 +456,8 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
         strncpy(pkg->plugin_id, val, sizeof(pkg->plugin_id) - 1);
       else if (strcmp(key, "generator") == 0)
         strncpy(pkg->generator, val, sizeof(pkg->generator) - 1);
+      else if (strcmp(key, "catalog") == 0)
+        strncpy(pkg->catalog, val, sizeof(pkg->catalog) - 1);
       else if (strcmp(key, "subsystem") == 0) {
         strncpy(pkg->subsystem, val, sizeof(pkg->subsystem) - 1);
         while (*lp) {

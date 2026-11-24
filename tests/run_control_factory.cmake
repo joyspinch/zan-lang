@@ -12,73 +12,45 @@ foreach(legacy IN ITEMS
   endif()
 endforeach()
 
+# 按名构造的策略闸：ControlFactory 只做查表转发，不得手写控件名单或内联
+# 控件构造分支。每个分支里的类名都是活标识符，按需拉取会把全部控件拖进
+# 编译图；名单要么来自编译器合成的控件目录（docs/GUI_CONTROL_CATALOG.md），
+# 要么来自运行期 Register。目录本身的正确性由 GUI 用例 control_catalog /
+# control_factory_equivalence 覆盖，这里只守 ControlFactory 源码形态。
 set(factory "${ROOT}/packages/Zan.Gui/src/Gui/Core/Control/ControlFactory.zan")
 if(NOT EXISTS "${factory}")
   message(FATAL_ERROR "control factory is missing: ${factory}")
 endif()
-file(READ "${factory}" factory_source)
+file(READ "${factory}" source)
 
-# ControlFactory must declare compiler-synthesized [GuiKindManifest] hooks
-# and must never inline `return new ...` branches.
-foreach(mode IN ITEMS "has" "kinds" "create" "createLower")
-  if(NOT factory_source MATCHES "\\[GuiKindManifest\\(\"${mode}\"\\)\\]")
-    message(FATAL_ERROR "ControlFactory.zan missing [GuiKindManifest(\"${mode}\")] extern")
-  endif()
-endforeach()
-string(REGEX MATCH "return[ ]+new[ ]+" inlined "${factory_source}")
-if(inlined)
+if(NOT source MATCHES "public[ \t]+class[ \t]+ControlFactory[ \t]*[:{]")
+  message(FATAL_ERROR "${factory} no longer declares class ControlFactory")
+endif()
+
+# 手写名单：List<string> 初始化器里出现字符串字面量。
+string(REGEX MATCH "new[ \t]+List<string>[ \t]*(\\(\\))?[ \t]*\\{[^}]*\"" literal_list "${source}")
+if(literal_list)
   message(FATAL_ERROR
-    "ControlFactory inlines a return-new branch; declare [GuiKind] on controls instead")
+    "ControlFactory hard-codes a kind list; kinds come from the control catalog or Register")
 endif()
 
-# Control.Props.zan must provide the default Type.Name-based Kind().
-set(control_props "${ROOT}/packages/Zan.Gui/src/Gui/Core/Control/Control.Props.zan")
-if(NOT EXISTS "${control_props}")
-  message(FATAL_ERROR "Control.Props.zan is missing: ${control_props}")
-endif()
-file(READ "${control_props}" control_props_source)
-if(NOT control_props_source MATCHES "virtual[ \t]+string[ \t]+Kind[ \t]*\\([ \t]*\\)")
-  message(FATAL_ERROR "Control.Props.zan missing default `virtual string Kind()`")
-endif()
-
-# Verify [GuiKind("...")] uniqueness and Kind() consistency across packages.
-file(GLOB_RECURSE zan_files LIST_DIRECTORIES false "${ROOT}/packages/*.zan")
-set(seen_kinds "")
-set(checked_count 0)
-foreach(path IN LISTS zan_files)
-  file(READ "${path}" raw_text)
-  string(REGEX REPLACE "//[^\n]*" "" text "${raw_text}")
-  string(REGEX MATCHALL "\\[GuiKind(Attribute)?\\(\"([A-Za-z0-9_]+)\"[^\\]]*\\][ \t\r\n]+[^\r\n{]+" matches "${text}")
-  if(NOT matches)
-    continue()
+# 内联构造：return new <类>，集合容器（List/Dict）的空实例除外。
+string(REGEX MATCHALL "return[ \t]+new[ \t]+[A-Za-z0-9_]+" returns "${source}")
+foreach(ret IN LISTS returns)
+  string(REGEX REPLACE "^return[ \t]+new[ \t]+" "" cls "${ret}")
+  if(NOT cls STREQUAL "List" AND NOT cls STREQUAL "Dict")
+    message(FATAL_ERROR
+      "ControlFactory inlines a construction branch (return new ${cls}); "
+      "let the control catalog or ControlFactory.Register construct it")
   endif()
-  foreach(m IN LISTS matches)
-    string(REGEX REPLACE "\\[GuiKind(Attribute)?\\(\"([A-Za-z0-9_]+)\".*" "\\2" kind "${m}")
-    list(FIND seen_kinds "${kind}" duplicate)
-    if(NOT duplicate EQUAL -1)
-      message(FATAL_ERROR "Duplicate [GuiKind(\"${kind}\")] across packages (also in ${path})")
-    endif()
-    list(APPEND seen_kinds "${kind}")
-    math(EXPR checked_count "${checked_count} + 1")
-
-    if(NOT kind STREQUAL "Element")
-      # Either the class name itself matches kind (inheriting Control.Kind()),
-      # it is a static factory alias (e.g. CreateChart / CreateRadioButton),
-      # or the file provides an explicit `override string Kind()`.
-      string(REGEX MATCH "(^|[ \t\r\n])class[ \t]+${kind}(<[A-Za-z0-9_, \t]*>)?[ \t]*[:{]" has_matching_class "${text}")
-      string(REGEX MATCH "static[ \t]+Control[ \t]+Create[A-Za-z0-9_]*[ \t]*\\(" is_static_alias "${m}")
-      string(REGEX MATCH "override[ \t]+string[ \t]+Kind[ \t]*\\([ \t]*\\)" has_kind_override "${text}")
-      if(NOT has_matching_class AND NOT is_static_alias AND NOT has_kind_override)
-        message(FATAL_ERROR
-          "[GuiKind(\"${kind}\")] in ${path} lacks matching class `${kind}` or `override string Kind()`")
-      endif()
-    endif()
-  endforeach()
 endforeach()
 
-if(checked_count LESS 80)
-  message(FATAL_ERROR "Expected at least 80 [GuiKind] entries across packages, found ${checked_count}")
+# 字符串分派：kind == "X" 形态的分支同样把控件名写死在工厂里。
+string(REGEX MATCH "kind[ \t]*==[ \t]*\"[A-Za-z0-9_]+\"" kind_branch "${source}")
+if(kind_branch)
+  message(FATAL_ERROR
+    "ControlFactory dispatches on a literal kind (${kind_branch}); "
+    "kinds come from the control catalog or Register")
 endif()
 
-message(STATUS
-  "control factory policy OK: ${checked_count} unique [GuiKind] entries, Control.Kind() default, and [GuiKindManifest] hooks")
+message(STATUS "control factory policy OK: ControlFactory only forwards (no literal kinds or inline constructors)")

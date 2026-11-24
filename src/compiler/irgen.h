@@ -208,6 +208,8 @@ struct zan_irgen {
   LLVMValueRef current_this;
   zan_symbol_t *current_type_sym;
   zan_ast_node_t *current_fn_body;
+  /* the AST_CALL being emitted (receiver-pin analysis, stmt_borrow.c) */
+  zan_ast_node_t *hold_call_expr;
   bool current_fn_is_ctor;
   bool current_fn_is_main; /* 程序主入口函数：退出前释放静态对象 */
   bool current_fn_no_runtime;
@@ -550,8 +552,9 @@ struct zan_irgen {
   int bind_acc_count;
   int bind_acc_cap;
 
-  LLVMValueRef fn_realloc;      /* realloc(void*, size_t) -> void* */
-  LLVMTypeRef list_struct_type; /* { i64 count, i64 capacity, i64* data } */
+  LLVMValueRef fn_realloc; /* realloc(void*, size_t) -> void* */
+  LLVMTypeRef
+      list_struct_type; /* { i64 count, i64 capacity, i64* data, i64 esz } */
   LLVMTypeRef span_struct_type; /* Span<T> value: { i8* base, i64 len } */
   LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64*
                                    values } */

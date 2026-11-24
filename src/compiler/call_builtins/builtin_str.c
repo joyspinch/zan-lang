@@ -352,19 +352,14 @@
                                 expr->call.args.items[0], locals);
                             if (bc) return emit_bool_to_cstr(g, bc);
                         }
-                        /* 双精度浮点数最短往返格式化缓冲区 (40 字节容量) */
-                        LLVMValueRef buf_size = LLVMConstInt(i64, 40, 0);
-                        LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
                         LLVMTypeKind atk = LLVMGetTypeKind(LLVMTypeOf(arg));
                         if (atk == LLVMDoubleTypeKind || atk == LLVMFloatTypeKind) {
-                            emit_dbl_str(g, buf, buf_size, arg);
-                            return buf;
+                            return emit_dbl_string(g, arg);
                         }
                         bool is_ul = expr_is_ulong(
                             g, expr->call.args.items[0], locals);
-                        emit_itoa_into(g, buf,
+                        return emit_itoa_string(g,
                             emit_widen_i64_for_print(g, arg), is_ul ? 1 : 0);
-                        return buf;
                     }
                 }
             }
@@ -805,8 +800,9 @@
                     LLVMValueRef raw_opt = emit_expr(g, expr->call.args.items[1], locals);
                     opt = coerce_int_to(g, raw_opt, i64);
                 }
-                LLVMValueRef lst = emit_alloc_rc_collection(g, expr, 24, 1,
+                LLVMValueRef lst = emit_alloc_rc_collection(g, expr, 32, 1,
                                                             g->binder->type_string);
+                list_header_init_esz(g, lst, g->binder->type_string);
                 LLVMValueRef lp = LLVMBuildBitCast(g->builder, lst,
                     LLVMPointerType(g->list_struct_type, 0), "lp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0),

@@ -24,6 +24,7 @@ public class Http2ClientConnection : IDisposable {
     private int outboundConnWindow;
     private int inboundConsumed;
     private int initialStreamWindow = 65535;
+    private const int InboundCreditBatch = 32768;
     private Http2HeaderBlock headerBlock;
     private bool settingsReceived;
     private int peerMaxStreams = 16;
@@ -73,6 +74,9 @@ public class Http2ClientConnection : IDisposable {
         }
         nint s = client.GetSocket();
         conn.sock = s;
+        // 多路复用：多个流各自小写 HEADERS，Nagle 会把后写的扣到对端
+        // 延迟 ACK 才发（多流并发时 p99 30–50 ms）。
+        Socket.SetNoDelay(s);
         conn.connected = true;
 
         // 1. 发送 24 字节客户端连接序言（RFC 7540 §3.5）
@@ -112,6 +116,9 @@ public class Http2ClientConnection : IDisposable {
         }
         nint s = client.GetSocket();
         conn.sock = s;
+        // 多路复用：多个流各自小写 HEADERS，Nagle 会把后写的扣到对端
+        // 延迟 ACK 才发（多流并发时 p99 30–50 ms）。
+        Socket.SetNoDelay(s);
 
         TlsContext ctx = TlsContext.CreateClient();
         if (!verifyCert) {
@@ -231,8 +238,15 @@ public class Http2ClientConnection : IDisposable {
             }
             if ((frame.flags & Http2Flags.END_STREAM) != 0) { stream.Complete(); }
             if (frame.length > 0) {
-                await this.SendWindowUpdateAsync(0, frame.length);
-                this.inboundConsumed = this.inboundConsumed - frame.length;
+                // 连接级窗口攒满一半再补（RFC 7540 §6.9.1 允许，nghttp2 同口径）：
+                // 原先每个 DATA 帧回一个 WINDOW_UPDATE，小应答下等于每请求多一帧
+                // 一条 TLS 记录，全压在对端单连接串行读循环上。读循环独占
+                // inboundConsumed，攒到 ≤ 32767+16384 < 65535，不会触发上面的越窗判定。
+                if (this.inboundConsumed >= InboundCreditBatch) {
+                    int credit = this.inboundConsumed;
+                    await this.SendWindowUpdateAsync(0, credit);
+                    this.inboundConsumed = this.inboundConsumed - credit;
+                }
                 if (!stream.completed) { await this.SendWindowUpdateAsync(frame.streamId, frame.length); stream.inboundWindow = stream.inboundWindow + frame.length; }
             }
         } else if (frame.type == Http2FrameType.WINDOW_UPDATE) {
@@ -349,9 +363,13 @@ public class Http2ClientConnection : IDisposable {
                     offset = offset + size;
                 }
             }
+            // 等流完成：读循环的 Complete/Reset（含连接关闭时的全体 Reset）
+            // 都会 Signal 本流的门，计数语义不丢唤醒。原先每 2 ms 轮询一次，
+            // 给每个请求加了 ≥2 ms 的客户端延迟底。
             while (!stream.completed && this.connected) {
-                if (Stopwatch.GetMilliseconds() >= deadline) { this.Close(); return null; }
-                await Task.Delay(2);
+                long left = deadline - Stopwatch.GetMilliseconds();
+                if (left <= 0) { this.Close(); return null; }
+                bool _woke = await stream.gate.Wait((int)left);
             }
             if (!stream.completed || stream.errorCode != 0 || !stream.headersReceived) { return null; }
             HttpResponse response = new HttpResponse();

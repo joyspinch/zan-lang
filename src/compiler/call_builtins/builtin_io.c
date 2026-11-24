@@ -84,9 +84,8 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
             LLVMPositionBuilderAtEnd(g->builder, miss);
             cur = miss;
           }
-          LLVMValueRef ebuf =
-              emit_string_alloc_rc(g, LLVMConstInt(i64t, 32, 0));
-          emit_itoa_into(g, ebuf, v64, 0);
+          LLVMValueRef ebuf = emit_itoa_string(g, v64, 0);
+          cur = LLVMGetInsertBlock(g->builder);
           LLVMBuildBr(g->builder, joinbb);
           LLVMPositionBuilderAtEnd(g->builder, joinbb);
           LLVMValueRef phi = LLVMBuildPhi(g->builder, i8ptr, "em.name");
@@ -117,14 +116,11 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
          * 字符渲染——两条路对齐到同一个 UTF-8 编码帮手。 */
         return emit_char_to_cstr(g, v);
       }
-      LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 40, 0));
       if (vk == LLVMDoubleTypeKind || vk == LLVMFloatTypeKind) {
-        emit_dbl_str(g, buf, LLVMConstInt(i64, 40, 0), v);
-        return buf;
+        return emit_dbl_string(g, v);
       }
-      emit_itoa_into(g, buf, emit_widen_i64_for_print(g, v),
-                     rt_ty->kind == TYPE_ULONG ? 1 : 0);
-      return buf;
+      return emit_itoa_string(g, emit_widen_i64_for_print(g, v),
+                              rt_ty->kind == TYPE_ULONG ? 1 : 0);
     }
   }
 }

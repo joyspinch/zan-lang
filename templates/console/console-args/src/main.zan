@@ -1,21 +1,86 @@
 using System;
+using System.Cli;
 
 /*
- * 命令行参数：Environment.ArgCount() 取个数、ArgAt(i) 取第 i 个、
- * ExeDir() 取程序所在目录。参数在 IDE 的运行设置里配，或在终端里跟在 exe 后面。
+ * {{NAME}} —— 命令行工具骨架：统计文本文件的行数 / 词数 / 字符数，
+ * 并列出出现最多的单词。
+ *
+ * 参数解析交给 Zan.Cli 的 CliApp（`using System.Cli;` 自动拉入包）：
+ *   位置参数   <files...>          要统计的文件（可多个）
+ *   带值选项   -n, --top <N>       列出前 N 个高频词（默认 5，0 = 不列）
+ *   开关       -i, --ignore-case   统计词频时忽略大小写
+ *   开关       --json              以 JSON 输出，便于脚本消费
+ *   开关       -V, --version       打印版本号
+ *   内建       -h, --help          打印用法（CliApp 自动生成）
+ *
+ * 退出码约定：0 成功；1 运行期错误（如文件不存在）；2 用法错误
+ * （未知选项、类型不对、缺参数——由 CliApp 统一报错）。
+ *
+ * 试一试（IDE 运行设置里填参数，或在终端）：
+ *   {{NAME}} --help
+ *   {{NAME}} src/main.zan --top 3
+ *   {{NAME}} src/main.zan src/TextStats.zan -i --json
  */
-
 public class Program {
-    static void Main() {
-        Console.WriteLine("{{NAME}}：命令行参数演示");
-        int argCount = Environment.ArgCount();
-        Console.WriteLine($"收到 {argCount} 个参数：");
-        for (int i = 0; i < argCount; i++) {
-            Console.WriteLine($"  参数[{i}] = {Environment.ArgAt(i)}");
+    const string Version = "1.0.0";
+
+    static int Main(string[] args) {
+        CliApp app = new CliApp("{{NAME}}");
+        app.Describe("统计文本文件的行数、词数、字符数与高频词。").Version(Version);
+
+        app.Option(new CliOption("top", CliType.Int).Short("n").Default("5")
+            .Help("列出前 N 个高频词（0 = 不列）"));
+        app.Option(new CliOption("ignore-case", CliType.Bool).Short("i")
+            .Help("词频统计忽略大小写"));
+        app.Option(new CliOption("json", CliType.Bool).Help("以 JSON 输出"));
+        app.Option(new CliOption("version", CliType.Bool).Short("V").Help("打印版本号"));
+        app.Option(new CliOption("files", CliType.String).AsPositional().Variadic()
+            .Help("要统计的文件"));
+
+        app.root.On((CliResult r) => { return Program.Execute(r); });
+        return app.Run(args);
+    }
+
+    /* 解析成功后的业务入口：先做 CliApp 管不到的语义校验，再干活。 */
+    static int Execute(CliResult r) {
+        if (r.GetBool("version")) {
+            Console.WriteLine("{{NAME}} " + Version);
+            return 0;
         }
-        if (argCount == 0) {
-            Console.WriteLine("（没有参数。试试在终端运行：{{NAME}}.exe hello 123）");
+        List<string> files = r.GetAll("files");
+        if (files.Count == 0) {
+            Cli.Error("至少需要一个文件参数");
+            Cli.Info("用法示例：{{NAME}} README.md --top 3（--help 查看全部选项）");
+            return 2;
         }
-        Console.WriteLine($"程序所在目录：{Environment.ExeDir()}");
+        int top = r.GetInt("top", 5);
+        if (top < 0) {
+            Cli.Error("--top 不能为负数：" + Convert.ToString(top));
+            return 2;
+        }
+
+        TextStats total = new TextStats(r.GetBool("ignore-case"));
+        List<TextStats> perFile = new List<TextStats>();
+        for (int i = 0; i < files.Count; i++) {
+            string path = files[i];
+            if (!File.Exists(path)) {
+                Cli.Error("文件不存在：" + path);
+                return 1;
+            }
+            TextStats one = new TextStats(r.GetBool("ignore-case"));
+            one.name = path;
+            string text = File.ReadAllText(path);
+            one.Add(text);
+            total.Add(text);
+            perFile.Add(one);
+        }
+        total.name = "合计";
+
+        if (r.GetBool("json")) {
+            Console.WriteLine(Report.Json(perFile, total, top));
+        } else {
+            Console.Write(Report.Text(perFile, total, top));
+        }
+        return 0;
     }
 }

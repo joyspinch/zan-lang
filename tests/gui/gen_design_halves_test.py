@@ -1,4 +1,4 @@
-"""Regress IDE runtime design-half generation with [GuiKind] attributes."""
+"""Regress IDE runtime design-half generation for __ZanControlCatalog."""
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -28,7 +28,7 @@ class DesignHalfGenerationTests(unittest.TestCase):
         self.addCleanup(self.patch_root.stop)
         self.addCleanup(self.patch_src.stop)
 
-    def test_emits_guikind_public_partial_and_skips_ideform(self):
+    def test_emits_public_partial_without_guikind_and_skips_ideform(self):
         (self.project / "IdeForm.html").write_text("<body></body>", encoding="utf-8")
         (self.project / "SampleView.html").write_text(
             '<body><button id="SaveBtn"></button><list-view id="Rows" data-of="RowItem"></list-view></body>',
@@ -44,7 +44,7 @@ class DesignHalfGenerationTests(unittest.TestCase):
         self.assertFalse((self.project / "IdeDesignedRegistry.zan").exists())
 
         half = (self.project / "SampleView.design.zan").read_text(encoding="utf-8")
-        self.assertIn('[GuiKind("SampleView")]', half)
+        self.assertNotIn('[GuiKind', half)
         self.assertIn("public partial class SampleView : DesignedControl {", half)
         self.assertIn("public override Control CreateCloneShell() { return new SampleView(); }", half)
         self.assertIn("public SampleView() {", half)

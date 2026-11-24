@@ -211,7 +211,7 @@ foreach(_proj IN LISTS _selected)
   # input on the command line (for a .zan entry the entry's own Main must win).
   # Compile-time HTML generation channel has been removed (de208fe98): design
   # documents (.html) are runtime assets loaded via Html.Parse (Form.Show /
-  # Form.ReadDoc, B-ID149) or baked in via --embed; they are NOT compiler
+  # HtmlDocs.Read, B-ID149) or baked in via --embed; they are NOT compiler
   # inputs.
   set(_srcs "")
   get_filename_component(_entry_norm "${_out}/${_entry}" ABSOLUTE)

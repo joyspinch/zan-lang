@@ -147,10 +147,10 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     return 1;
   /* Task<T>.Result transfers the keep-result frame's RVAL owner to the
    * consumer; emit_task_member zeroes the frame slot without releasing it. */
-  if (e->kind == AST_MEMBER_ACCESS && e->member.name.len == 6 &&
-      memcmp(e->member.name.str, "Result", 6) == 0) {
+  if (e->kind == AST_MEMBER_ACCESS && !e->member.null_cond &&
+      e->member.name.len == 6 && memcmp(e->member.name.str, "Result", 6) == 0) {
     zan_type_t *tt = infer_expr_type(g, e->member.object, locals);
-    if (tt && tt->kind == TYPE_TASK)
+    if (tt && tt->kind == TYPE_TASK && tt->type_arg_count == 1)
       return 1;
   }
   if (e->kind == AST_MEMBER_ACCESS) {
@@ -208,6 +208,17 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     }
     /* NativeMemory */
     if (is_call_to(e, "NativeMemory", "GetString") && e->call.args.count == 3)
+      return 1;
+    if (is_call_to(e, "NativeMemory", "Sha256") && e->call.args.count == 2)
+      return 1;
+    if (is_call_to(e, "NativeMemory", "Sha1") && e->call.args.count == 2)
+      return 1;
+    if (is_call_to(e, "NativeMemory", "Sha512") && e->call.args.count == 2)
+      return 1;
+    if (is_call_to(e, "NativeMemory", "Sm3") && e->call.args.count == 2)
+      return 1;
+    if (is_call_to(e, "NativeMemory", "Base64Encode") &&
+        e->call.args.count == 2)
       return 1;
     zan_symbol_t *cs = extern_check_callee_sym(g, e);
     if (sym_declares_extern(cs)) {

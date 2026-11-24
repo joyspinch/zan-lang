@@ -83,10 +83,15 @@ partial class Irgen {
                 locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(true);
             } else {
                 slot = AddLocal(p.sval, p.type);
+                bool borrowed = false;
                 if (ShouldBox(p.sval)) { slot = BoxLocal(locName.Count - 1); }
-                else { EA(slot, lt); }
+                else {
+                    borrowed = BorrowedStrParam(p.type, p.sval, method.d);
+                    if (borrowed) { locRef[locName.Count - 1] = true; }
+                    EA(slot, lt);
+                }
                 L("  store " + lt + " " + incoming + ", " + lt + "* " + slot);
-                EmitArcRetain(incoming, p.type);
+                if (!borrowed) { EmitArcRetain(incoming, p.type); }
             }
             if (debugBody != null) {
                 DebugVariable(p, p.sval, p.type, lt, slot, j + (curHasThis ? 2 : 1), true);
@@ -509,5 +514,29 @@ partial class Irgen {
         obody.Append(entryAllocas.ToString());
         obody.Append(body.ToString());
         body = obody; entryAllocas = oea; eaActive = oact;
+    }
+
+    // A string parameter the body never writes: borrowed for the call.
+    bool BorrowedStrParam(Node ty, string name, Node body) {
+        if (ty == null || ty.ival != 0 || !IsStr(ty) || body == null) { return false; }
+        return !WritesName(body, name);
+    }
+
+    // Does the subtree assign `name` (plain or compound assignment, or a
+    // ref/out argument)? Conservative: any write anywhere counts, including
+    // one to a shadowing local of the same name.
+    bool WritesName(Node n, string name) {
+        if (n == null) { return false; }
+        if ((n.kind == AK.Assignment() || n.kind == AK.OutArg()) && n.a != null
+            && n.a.kind == AK.Ident() && n.a.sval == name) { return true; }
+        if (WritesName(n.a, name) || WritesName(n.b, name) || WritesName(n.c, name) || WritesName(n.d, name)) { return true; }
+        if (n.kids != null) {
+            int i = 0;
+            while (i < n.kids.Count) {
+                if (WritesName(n.kids[i], name)) { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
     }
 }

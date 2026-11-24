@@ -271,28 +271,14 @@ public class Router {
         string method = ctx.Method();
         string path = ctx.Path();
 
-        // 1. 优先命中进程内静态开址哈希表（O(1)、零字符串拼接、零堆分配）
+        // 静态路由直接查本地哈希索引。共享内存路由表（RouteTable）不再进匹配
+        // 热路径：它只登记静态路由、与本地索引同源，每请求却要拼键、算哈希、
+        // 逐列加锁读行并拷贝 handler 串，比本地 O(1) 查找贵得多。表照常建立
+        // 与跨进程共享，供其他读者使用。
         Route hit = this.FindStatic(method, path);
         if (hit != null) { return hit; }
         hit = this.FindStatic("*", path);
         if (hit != null) { return hit; }
-
-        // 2. 跨进程共享内存路由表兜底（仅当静态表未命中或通过 AttachRouteTable 挂载外部表时）
-        if (this.routeTable != null) {
-            string key = RouteTable.KeyOf(method, path);
-            long h = SharedTable.Hash(key);
-            RouteInfo info = this.routeTable.Lookup(h, key);
-            if (info.Found() && info.RouteIdx() >= 0 && info.RouteIdx() < this.flat.Count) {
-                return this.flat[info.RouteIdx()];
-            }
-            string starKey = RouteTable.KeyOf("*", path);
-            long starH = SharedTable.Hash(starKey);
-            RouteInfo starInfo = this.routeTable.Lookup(starH, starKey);
-            if (starInfo.Found() && starInfo.RouteIdx() >= 0 && starInfo.RouteIdx() < this.flat.Count) {
-                return this.flat[starInfo.RouteIdx()];
-            }
-        }
-
         // 自动尾部斜杠容错：/about/company/ -> /about/company
         if (path.Length > 1 && path.EndsWith("/")) {
             string altPath = path.Substring(0, path.Length - 1);
@@ -350,12 +336,6 @@ public class Router {
     }
 
     public bool PathExists(string path) {
-        if (this.routeTable != null) {
-            long keyHash = RouteTable.Key("GET", path);
-            if (this.routeTable.Has(keyHash, RouteTable.KeyOf("GET", path))) { return true; }
-            keyHash = RouteTable.Key("POST", path);
-            if (this.routeTable.Has(keyHash, RouteTable.KeyOf("POST", path))) { return true; }
-        }
         int i = 0;
         for (; i < this.statics.Count; i = i + 1) {
             if (this.statics[i].Pattern() == path) { return true; }

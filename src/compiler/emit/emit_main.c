@@ -489,6 +489,58 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method,
     }
   }
 
+  {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef svi32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef svi64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef stdout_ptr;
+    if (g->target_is_windows) {
+      LLVMTypeRef iob_type =
+          LLVMFunctionType(i8p, (LLVMTypeRef[]){svi32}, 1, 0);
+      LLVMValueRef iobfn = LLVMGetNamedFunction(g->mod, "__acrt_iob_func");
+      if (!iobfn)
+        iobfn = LLVMAddFunction(g->mod, "__acrt_iob_func", iob_type);
+      LLVMValueRef one = LLVMConstInt(svi32, 1, 0);
+      stdout_ptr = zan_call2(g->builder, iob_type, iobfn, &one, 1, "stdout");
+    } else {
+      const char *soname =
+          (g->target_is_macos || g->target_is_ios) ? "__stdoutp" : "stdout";
+      LLVMValueRef sg = LLVMGetNamedGlobal(g->mod, soname);
+      if (!sg)
+        sg = LLVMAddGlobal(g->mod, i8p, soname);
+      stdout_ptr = LLVMBuildLoad2(g->builder, i8p, sg, "stdout");
+    }
+    LLVMTypeRef sv_type = LLVMFunctionType(
+        svi32, (LLVMTypeRef[]){i8p, i8p, svi32, svi64}, 4, 0);
+    LLVMValueRef sv = LLVMGetNamedFunction(g->mod, "setvbuf");
+    if (!sv)
+      sv = LLVMAddFunction(g->mod, "setvbuf", sv_type);
+    int sv_mode = g->target_is_windows ? 4 /* _IONBF */ : 1 /* _IOLBF */;
+    /* 缓冲策略交给运行时 zan_rt_stdout_setup：终端/管道保持逐行（IDE 控制台、
+     * docker logs 等实时消费者依赖），重定向到普通文件时整块缓冲——曾每行
+     * 一次 write(2)，200 万行写文件 3.5 s（C 全缓冲 0.46 s）。模块内放同名
+     * 弱实现 = 原样 setvbuf，未带此符号的旧预编译交叉运行时行为不变。 */
+    LLVMTypeRef su_type = LLVMFunctionType(
+        LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){i8p, svi32, svi64}, 3, 0);
+    LLVMValueRef su = LLVMGetNamedFunction(g->mod, "zan_rt_stdout_setup");
+    if (!su) {
+      su = LLVMAddFunction(g->mod, "zan_rt_stdout_setup", su_type);
+      LLVMSetLinkage(su, LLVMWeakAnyLinkage);
+      LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+      LLVMPositionBuilderAtEnd(
+          g->builder, LLVMAppendBasicBlockInContext(g->ctx, su, "entry"));
+      LLVMValueRef fb_args[] = {LLVMGetParam(su, 0), LLVMConstNull(i8p),
+                                LLVMGetParam(su, 1), LLVMGetParam(su, 2)};
+      zan_call2(g->builder, sv_type, sv, fb_args, 4, "");
+      LLVMBuildRetVoid(g->builder);
+      LLVMPositionBuilderAtEnd(g->builder, cur);
+    }
+    LLVMValueRef su_args[] = {
+        stdout_ptr, LLVMConstInt(svi32, sv_mode, 0),
+        LLVMConstInt(svi64, g->target_is_windows ? 0 : 4096, 0)};
+    zan_call2(g->builder, su_type, su, su_args, 3, "");
+  }
+
   g->current_fn_is_main = true;
   if (method->method_decl.body) {
     emit_stmt(g, method->method_decl.body, locals);

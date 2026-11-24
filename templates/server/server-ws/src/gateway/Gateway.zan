@@ -3,45 +3,60 @@ using System.Net;
 
 namespace WsGateway;
 
-/* 连接注册表：以 Worker.Connection 为主键的在线客户端列表，供广播/统计。 */
-/* Worker 已接管握手、帧编解码、ping/pong 与分片重组；这里只登记/移除/推送。 */
+/* 连接注册表：在线客户端列表 + 推送/广播。
+ * Worker 已接管握手、帧编解码、ping/pong 与分片重组；这里只登记/移除/扇出。
+ * 单进程内所有回调跑在同一调度器上，列表无需加锁。 */
 public class Gateway {
-    static List<Connection> conns = new List<Connection>();
+    static List<ClientConn> clients = new List<ClientConn>();
 
-    /* 连接建立时登记（Worker onOpen 回调里调用）。*/
-    static void Add(Connection conn) {
-        conns.Add(conn);
+    public static ClientConn Add(Connection conn) {
+        ClientConn c = new ClientConn(conn);
+        clients.Add(c);
+        return c;
     }
 
-    /* 连接断开时移除（Worker onClose 回调里调用）。*/
-    static void Remove(Connection conn) {
+    /* 移除并返回该连接对应的客户端（未登记过返回 null）。 */
+    public static ClientConn Remove(Connection conn) {
         int id = conn.GetId();
-        int i = 0;
-        while (i < conns.Count) {
-            if (conns[i].GetId() == id) {
-                conns.RemoveAt(i);
-                return;
+        for (int i = 0; i < clients.Count; i++) {
+            if (clients[i].Id() == id) {
+                ClientConn c = clients[i];
+                clients.RemoveAt(i);
+                return c;
             }
-            i = i + 1;
         }
+        return null;
     }
 
-    static int Count() { return conns.Count; }
-
-    /* 向单个客户端推送文本。Connection.Send 是异步队列写（帧的编解码在 Worker）。*/
-    static int Push(Connection conn, string text) {
-        if (conn.IsClosed()) { return 0; }
-        conn.Send(text);
-        return 1;
+    public static ClientConn Get(Connection conn) {
+        int id = conn.GetId();
+        for (int i = 0; i < clients.Count; i++) {
+            if (clients[i].Id() == id) { return clients[i]; }
+        }
+        return null;
     }
 
-    /* 向所有在线客户端广播文本，返回成功投递数。*/
-    static int Broadcast(string text) {
+    public static int Count() { return clients.Count; }
+
+    public static List<ClientConn> All() { return clients; }
+
+    /* 昵称是否已被别人占用（忽略大小写）。 */
+    public static bool NickTaken(string nick, ClientConn self) {
+        string key = nick.ToLower();
+        for (int i = 0; i < clients.Count; i++) {
+            if (clients[i] != self && clients[i].nick.ToLower() == key) { return true; }
+        }
+        return false;
+    }
+
+    /* 向所有在线客户端广播，返回投递数。 */
+    public static async int Broadcast(string text) {
         int sent = 0;
-        int i = 0;
-        while (i < conns.Count) {
-            if (Push(conns[i], text) > 0) { sent = sent + 1; }
-            i = i + 1;
+        /* 先取快照：await 期间可能有人上下线，直接遍历 clients 会错位。 */
+        List<ClientConn> snap = new List<ClientConn>();
+        for (int i = 0; i < clients.Count; i++) { snap.Add(clients[i]); }
+        for (int i = 0; i < snap.Count; i++) {
+            if (await snap[i].Push(text)) { sent = sent + 1; }
         }
         return sent;
     }

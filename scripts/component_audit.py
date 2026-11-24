@@ -4,7 +4,7 @@
 约定（每条都对应一次真实返工，见 TASKS.md 与 git 历史）：
 
 R1 名单一致   同一份"控件 kind 名单"在三处副本里必须对得上：
-              ① 编译器 [GuiKind] 清单（各包控件类/工厂方法上的 [GuiKind("...")]）
+              ① 编译器控件目录（__ZanControlCatalog + [ControlKind]）
               ② 编译期限定名单（GenForm.IsStdWidgetKind / IsHmiKind）
               ③ 控件自己声明的 Kind()
               两个方向都要对：
@@ -88,8 +88,8 @@ RE_GENFORM_QUALIFY = re.compile(
     r'public static string QualifyKind\(string kind\)\s*\{(.*?)\n    \}', re.S)
 RE_NONCONSTRUCTIBLE = re.compile(
     r'static List<string> NonConstructibleKinds\(\)\s*\{(.*?)\n\}', re.S)
-# 编译器 [GuiKind] 清单标注点
-RE_GUI_KIND = re.compile(r'\[GuiKind(?:Attribute)?\(\s*"([A-Za-z0-9_]+)"')
+# 编译器 [ControlKind] 别名标注点
+RE_GUI_KIND = re.compile(r'\[ControlKind(?:Attribute)?\(\s*(?:Name\s*=\s*)?"([A-Za-z0-9_]+)"')
 
 
 def read(path):
@@ -116,7 +116,7 @@ def widget_files():
 
 
 def strip_comments(text):
-    """去掉注释但保留字符串字面量，供 [GuiKind("...")] 提取。"""
+    """去掉注释但保留字符串字面量，供 [ControlKind] 提取。"""
     text = re.sub(r'/\*.*?\*/', lambda m: ' ' * len(m.group(0)), text, flags=re.S)
     text = re.sub(r'//[^\n]*', lambda m: ' ' * len(m.group(0)), text)
     return text
@@ -196,7 +196,7 @@ def css_types():
 
 
 def registered_kinds():
-    """编译器 [GuiKind] 清单发现的 kind 集合。"""
+    """编译器 [ControlKind] 清单发现的别名 kind 集合。"""
     out = set()
     for root, _dirs, names in os.walk(os.path.join(ROOT, 'packages')):
         for name in names:
@@ -301,7 +301,9 @@ def main():
             continue
         if name in SIZE_PASSED_DOWN:
             continue
-        t = effective_type(name, text, kinds.get(name, ''))
+        m_kind = RE_KIND.search(text)
+        own_kind = (m_kind.group(1) or m_kind.group(2)) if m_kind else ''
+        t = effective_type(name, text, own_kind)
         if not t:
             continue
         for tier in ('tiny', 'small', 'large'):

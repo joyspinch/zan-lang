@@ -542,57 +542,64 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
   if (!expr_yields_owned_rc_value(g, rhs, locals))
     emit_collection_value_retain(g, elem_type, value, 0);
 
-  LLVMValueRef stored = value;
-  LLVMTypeKind slot_kind = LLVMGetTypeKind(slot_ty);
-  LLVMTypeKind value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
-  if (elem_kind == LLVMDoubleTypeKind && value_kind == LLVMIntegerTypeKind &&
-      LLVMGetIntTypeWidth(LLVMTypeOf(stored)) > 1) {
-    stored = LLVMBuildSIToFP(g->builder, stored, elem_llvm, "slot.sitofp");
-    value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
-  }
-  if (value_kind == LLVMStructTypeKind) {
-    store_struct_in_slot(g, stored, slot_ptr, rhs);
-  } else {
-    if (slot_kind == LLVMPointerTypeKind) {
-      if (value_kind == LLVMIntegerTypeKind) {
-        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-        if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
-            LLVMGetIntTypeWidth(elem_llvm) <
-                LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
-          stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.knw");
-        if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64)
-          stored = extend_int_for_slot(g, stored, elem_type, i64);
-        stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
-      } else if (value_kind == LLVMPointerTypeKind &&
-                 LLVMTypeOf(stored) != slot_ty) {
-        stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
-      }
-    } else if (slot_kind == LLVMIntegerTypeKind) {
-      if (value_kind == LLVMPointerTypeKind) {
-        stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
-      } else if (value_kind == LLVMIntegerTypeKind) {
-        if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
-            LLVMGetIntTypeWidth(elem_llvm) <
-                LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
-          stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.elw");
-        if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) <
-            LLVMGetIntTypeWidth(slot_ty))
-          stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
-      } else if (value_kind == LLVMDoubleTypeKind) {
-        if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMFloatTypeKind) {
-          LLVMValueRef f32 = LLVMBuildFPTrunc(
-              g->builder, stored, LLVMFloatTypeInContext(g->ctx), "slot.f32d");
-          LLVMValueRef bits = LLVMBuildBitCast(
-              g->builder, f32, LLVMInt32TypeInContext(g->ctx), "slot.f32b");
-          stored = LLVMBuildZExt(g->builder, bits, slot_ty, "slot.f32w");
-        } else {
-          stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
-        }
-      } else if (value_kind == LLVMFloatTypeKind) {
-        LLVMValueRef bits = LLVMBuildBitCast(
-            g->builder, stored, LLVMInt32TypeInContext(g->ctx), "slot.f32b");
-        stored = LLVMBuildZExt(g->builder, bits, slot_ty, "slot.f32w");
-      }
+    LLVMValueRef stored = value;
+    LLVMTypeKind slot_kind = LLVMGetTypeKind(slot_ty);
+    LLVMTypeKind value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
+    if (elem_kind == LLVMDoubleTypeKind && value_kind == LLVMIntegerTypeKind &&
+        LLVMGetIntTypeWidth(LLVMTypeOf(stored)) > 1) {
+        stored = LLVMBuildSIToFP(g->builder, stored, elem_llvm, "slot.sitofp");
+        value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
+    }
+    if (value_kind == LLVMStructTypeKind) {
+        store_struct_in_slot(g, stored, slot_ptr, rhs);
+    } else {
+        if (slot_kind == LLVMPointerTypeKind) {
+            if (value_kind == LLVMIntegerTypeKind) {
+                LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(elem_llvm) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                    stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.knw");
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < 64)
+                    stored = extend_int_for_slot(g, stored, elem_type, i64);
+                stored = LLVMBuildIntToPtr(g->builder, stored, slot_ty, "slot.ip");
+            } else if (value_kind == LLVMPointerTypeKind && LLVMTypeOf(stored) != slot_ty) {
+                stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.bc");
+            }
+        } else if (slot_kind == LLVMIntegerTypeKind) {
+            if (value_kind == LLVMPointerTypeKind) {
+                stored = LLVMBuildPtrToInt(g->builder, stored, slot_ty, "slot.pi");
+            } else if (value_kind == LLVMIntegerTypeKind) {
+                if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(elem_llvm) < LLVMGetIntTypeWidth(LLVMTypeOf(stored)))
+                    stored = LLVMBuildTrunc(g->builder, stored, elem_llvm, "slot.elw");
+                if (LLVMGetIntTypeWidth(LLVMTypeOf(stored)) < LLVMGetIntTypeWidth(slot_ty))
+                    stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
+            } else if (value_kind == LLVMDoubleTypeKind) {
+                if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMFloatTypeKind) {
+                    LLVMValueRef f32 = LLVMBuildFPTrunc(g->builder, stored,
+                        LLVMFloatTypeInContext(g->ctx), "slot.f32d");
+                    stored = LLVMBuildBitCast(g->builder, f32,
+                        LLVMInt32TypeInContext(g->ctx), "slot.f32b");
+                } else {
+                    stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
+                }
+            } else if (value_kind == LLVMFloatTypeKind) {
+                stored = LLVMBuildBitCast(g->builder, stored,
+                    LLVMInt32TypeInContext(g->ctx), "slot.f32b");
+            }
+            /* 槽宽对齐：8 字节槽字零扩展（浮点位模式）；List 窄槽（list_slot_type）
+             * 截断——char 的 LLVM 类型是 i64，原样 store 会写穿 4 字节窄槽。 */
+            if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMIntegerTypeKind) {
+                unsigned sw = LLVMGetIntTypeWidth(LLVMTypeOf(stored));
+                unsigned tw = LLVMGetIntTypeWidth(slot_ty);
+                if (sw < tw)
+                    stored = (value_kind == LLVMFloatTypeKind ||
+                              value_kind == LLVMDoubleTypeKind)
+                        ? LLVMBuildZExt(g->builder, stored, slot_ty, "slot.f32w")
+                        : extend_int_for_slot(g, stored, elem_type, slot_ty);
+                else if (sw > tw)
+                    stored = LLVMBuildTrunc(g->builder, stored, slot_ty, "slot.narrow");
+            }
     }
     LLVMBuildStore(g->builder, stored, slot_ptr);
   }

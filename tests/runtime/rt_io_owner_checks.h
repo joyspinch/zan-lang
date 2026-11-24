@@ -2,7 +2,7 @@
  * Include once before rt_io.c, then with ZAN_OWNER_CHECKS_IMPLEMENTATION. */
 #ifndef ZAN_OWNER_CHECKS_IMPLEMENTATION
 static void owner_unlocked(void *lock);
-static void owner_incremented(volatile LONG *counter);
+static void owner_woke(void);
 static void *owner_watched;
 static int owner_frees;
 static void owner_free(void *ptr) {
@@ -10,35 +10,45 @@ static void owner_free(void *ptr) {
     abort();
   free(ptr);
 }
-static LONG owner_increment(volatile LONG *counter) {
-  LONG result = InterlockedIncrement(counter);
-  owner_incremented(counter);
-  return result;
-}
 #if defined(_WIN32)
+static BOOL WINAPI owner_post_completion(HANDLE port, DWORD bytes,
+                                         ULONG_PTR key, LPOVERLAPPED ov) {
+  BOOL ok = PostQueuedCompletionStatus(port, bytes, key, ov);
+  if (key == ((ULONG_PTR) - 3))
+    owner_woke();
+  return ok;
+}
 static void WINAPI owner_unlock(PSRWLOCK lock) {
   ReleaseSRWLockExclusive(lock);
   owner_unlocked(lock);
 }
 #define ReleaseSRWLockExclusive owner_unlock
+#define PostQueuedCompletionStatus owner_post_completion
 #else
+static int owner_is_wake_fd(int fd);
+static ssize_t owner_write(int fd, const void *buf, size_t n) {
+  ssize_t r = write(fd, buf, n);
+  if (owner_is_wake_fd(fd))
+    owner_woke();
+  return r;
+}
 static int owner_unlock(pthread_mutex_t *lock) {
   int result = pthread_mutex_unlock(lock);
   owner_unlocked(lock);
   return result;
 }
 #define pthread_mutex_unlock owner_unlock
+#define write owner_write
 #endif
-#undef InterlockedIncrement
-#define InterlockedIncrement owner_increment
 #define free owner_free
 #else
 #undef free
-#undef InterlockedIncrement
 #if defined(_WIN32)
 #undef ReleaseSRWLockExclusive
+#undef PostQueuedCompletionStatus
 #else
 #undef pthread_mutex_unlock
+#undef write
 #endif
 
 static zan_blocking_job_t *owner_job;
@@ -105,9 +115,19 @@ static void owner_batch_step(void *frame) {
     __atomic_fetch_or(&h->sched, CO_DEAD, __ATOMIC_RELEASE);
   }
 }
-static void owner_incremented(volatile LONG *counter) {
-  if (counter != &g_co_wake)
-    return;
+#if !defined(_WIN32)
+static int owner_is_wake_fd(int fd) {
+  int n = (int)g_shards;
+  if (n < 1)
+    n = 1;
+  for (int i = 0; i < n; i++) {
+    if (fd >= 0 && fd == g_ioshard[i].wake_wfd)
+      return 1;
+  }
+  return 0;
+}
+#endif
+static void owner_woke(void) {
   if (owner_stage == 2)
     owner_finish_at_barrier();
   if (!owner_batch)
@@ -154,7 +174,7 @@ static void run_dns_owner_case(int stage, int start_failed, int started) {
   }
   owner_stage = stage;
   owner_start_failed = start_failed;
-  g_co_parked = 1;
+  g_co_parked = g_wk[0].parked = 1;
   CHECK(dns_timeout_scan() == 1);
   CHECK(owner_barriers == initial_barriers + (stage != 0));
   CHECK(out == 0 && owner_releases == 1);
@@ -175,7 +195,7 @@ static void run_dns_owner_case(int stage, int start_failed, int started) {
   owner_watched = NULL;
   owner_job = NULL;
   g_co_parked = 0;
-  g_co_wake = 0;
+  g_wk[0].parked = 0;
 }
 static void run_owner_checks(void) {
   run_dns_owner_case(0, 0, 0);
@@ -200,8 +220,7 @@ static void run_owner_checks(void) {
   LONG external = co_load(&g_co_cnt_ext.act);
   t_co_self = &g_wk[0];
   CHECK(co_self() == &g_wk[0]);
-  g_co_parked = 1;
-  g_co_wake = 0;
+  g_co_parked = g_wk[0].parked = 1;
   owner_batch = 1;
   zan_co_ready_batch(tasks, 4);
   CHECK(owner_batch == 0 && owner_steps == 5 && owner_rearms == 1);
@@ -211,7 +230,7 @@ static void run_owner_checks(void) {
   t_co_self = NULL;
   owner_watched = NULL;
   g_co_parked = 0;
-  g_co_wake = 0;
+  g_wk[0].parked = 0;
   puts("PASS DNS ownership: 7 cases, 4 worker barriers, one free/wake/release "
        "each; TLS local batch: delta 4, immediate consume/rearm/free");
 }

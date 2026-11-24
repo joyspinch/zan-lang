@@ -864,9 +864,14 @@ void emit_finallys_left_by_throw(zan_irgen_t *g, local_scope_t *locals) {
       break;
     }
     if (top->catch_bb) {
-      /* Catch handles before outer finally. The lexical depth includes
-       * this try's own finally, but none of its enclosing finalizers. */
-      target_fin = top->finally_depth;
+      /* 只跑被这个 catch 截住之前离开的 finally。无 finally 的
+       * try/catch（fin_idx = -1）不能退到 0：它若嵌在别的 finally
+       * 体里（async：外层 finally 正在执行、外面还有 try/finally），
+       * 退到 0 会把正在执行的与外层的 finally 一并内联跑一遍——
+       * pending 栈被丢弃到 0（在途原异常被释放）随后下溢 abort。
+       * finally_depth 是入 try 时的 finally_count，正是外层边界。 */
+      target_fin =
+          (top->fin_idx >= 0) ? top->fin_idx + 1 : top->finally_depth;
       break;
     }
   }

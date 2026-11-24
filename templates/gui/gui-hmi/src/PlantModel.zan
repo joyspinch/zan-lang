@@ -1,0 +1,70 @@
+using System;
+using Gui.Hmi;
+
+/* 过程仿真：一台带加热的反应釜（温度回路 TIC101）+ 一个进料储罐（液位回路 LIC102）
+ * + 进料流量 FIC103。真实项目里这个类换成现场总线 / OPC UA / Modbus 采集：
+ * Step() 改成"读一遍设备、把原始计数写进位号"，画面代码不用动。
+ *
+ * 所有值都是定点原始计数（scale=10，即 0.1 工程单位）。 */
+public class PlantModel {
+    public TagTable Io;
+    public IoTag Temp;       // TIC101.PV 反应釜温度
+    public IoTag TempSp;     // TIC101.SP 温度设定值（只画趋势，不判限）
+    public IoTag Level;      // LIC102.PV 储罐液位
+    public IoTag Flow;       // FIC103.PV 进料流量
+    public bool Running;
+    public bool DrainPump;   // 出料泵：液位高启、液位低停（滞环）
+    int tick;
+    Random rng;
+
+    public PlantModel() {
+        rng = new Random(101);
+        Io = new TagTable();
+        Temp = Io.Add("TIC101.PV", "°C", 10);
+        Temp.Range(0, 3000).Limits(300, 2500);
+        TempSp = Io.Add("TIC101.SP", "°C", 10);
+        TempSp.Range(0, 3000);
+        Level = Io.Add("LIC102.PV", "%", 10);
+        Level.Range(0, 1000).Limits(100, 900);
+        Flow = Io.Add("FIC103.PV", "m³/h", 10);
+        Flow.Range(0, 500);
+        Temp.SetRaw(1750);
+        TempSp.SetRaw(1800);
+        Level.SetRaw(450);
+        Flow.SetRaw(0);
+        Running = true;
+        DrainPump = false;
+        tick = 0;
+    }
+
+    // 推进一个采样周期。
+    public void Step() {
+        tick = tick + 1;
+        // 设定值每 30 拍在 180 ℃ / 260 ℃ 之间切换：高档会越过 250 ℃ 高报限，
+        // 演示报警的产生、复归与确认。
+        if (Running) {
+            TempSp.SetRaw((tick / 30) % 2 == 0 ? 1800 : 2600);
+        }
+        // 一阶惯性逼近目标 + 噪声：运行时追设定值，停机时冷却到环境温度 20 ℃。
+        int target = Running ? TempSp.Raw() : 200;
+        int t = Temp.Raw() + (target - Temp.Raw()) / 8 + rng.Between(-12, 13);
+        Temp.SetRaw(Clamp(t, 0, 3000));
+
+        // 液位：运行时持续进料；出料泵按 75% / 30% 滞环启停。停机时自然泄放。
+        int inflow = Running ? 260 + rng.Between(-20, 21) : 0;
+        Flow.SetRaw(inflow);
+        if (Level.Raw() >= 750) { DrainPump = true; }
+        if (Level.Raw() <= 300) { DrainPump = false; }
+        if (!Running) { DrainPump = false; }
+        int lv = Level.Raw() + inflow / 12;
+        if (DrainPump) { lv = lv - 45; }
+        if (!Running) { lv = lv - 12; }
+        Level.SetRaw(Clamp(lv, 0, 1000));
+    }
+
+    static int Clamp(int v, int lo, int hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+}

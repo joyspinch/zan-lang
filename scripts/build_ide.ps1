@@ -168,7 +168,7 @@ Write-Output "[zanc] $zanc"
 
 $files = @()
 # IDE sources (the standard project's own code). Component kinds are discovered
-# automatically from [GuiKind] attributes by the compiler's [GuiKindManifest] pass.
+# automatically by the compiler's __ZanControlCatalog pass.
 $files += (Get-ChildItem src\ide_zan\*.zan -Recurse).FullName
 # The GUI stdlib is namespaced across subfolders (Gui root + Widget /
 # Component / Designer); recurse so every part is compiled.
@@ -258,7 +258,7 @@ $designs | ForEach-Object {
 }
 
 # ---- 2.5) 设计稿半件（自发现）-----------------------------------------------
-# 扫描 .html 设计稿：生成带 [GuiKind] 的 <Name>.design.zan 半件。
+# 扫描 .html 设计稿：生成 <Name>.design.zan 半件（由 __ZanControlCatalog 自动收录）。
 if (-not $SkipDesignGeneration) {
     python scripts/gen_design_halves.py
     if ($LASTEXITCODE -ne 0) { Write-Output "DESIGN_HALVES_FAILED"; exit 1 }

@@ -343,11 +343,12 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         if (lt)
           lelem = container_elem_type(lt);
       }
-      LLVMValueRef list_ptr = emit_alloc_rc_collection(g, expr, 24, 1, lelem);
+      /* 表头 { count, cap, data, esz } = 32 字节 */
+      LLVMValueRef list_ptr = emit_alloc_rc_collection(g, expr, 32, 1, lelem);
       /* cast to List* */
-      LLVMValueRef typed_ptr =
-          LLVMBuildBitCast(g->builder, list_ptr,
-                           LLVMPointerType(g->list_struct_type, 0), "lptr");
+      LLVMValueRef typed_ptr = LLVMBuildBitCast(
+          g->builder, list_ptr, LLVMPointerType(g->list_struct_type, 0), "lptr");
+      list_header_init_esz(g, list_ptr, lelem);
       /* new List<T>(src) 拷贝构造函数降解 */
       if (expr->new_expr.list_copy && expr->new_expr.args.count == 1) {
         LLVMValueRef src_raw =
@@ -363,11 +364,7 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                            LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                                                src_ptr, 0, "src.cnt"),
                            "src.n");
-        LLVMValueRef src_data =
-            LLVMBuildLoad2(g->builder, LLVMPointerType(i64, 0),
-                           LLVMBuildStructGEP2(g->builder, g->list_struct_type,
-                                               src_ptr, 2, "src.df"),
-                           "src.d");
+        LLVMValueRef src_data = list_data_for(g, src_ptr, lelem, "src.d");
 
         LLVMValueRef eight = LLVMConstInt(i64, 8, 0);
         LLVMValueRef cap = LLVMBuildSelect(
@@ -380,16 +377,14 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_store_fit(g, cap,
                       LLVMBuildStructGEP2(g->builder, g->list_struct_type,
                                           typed_ptr, 1, "cap"));
-        unsigned lwords = elem_slot_words(g, lelem);
-        LLVMValueRef bytes =
-            LLVMBuildMul(g->builder, cap,
-                         LLVMConstInt(i64, (unsigned long long)(8 * lwords), 0),
-                         "cpy.bytes");
+        LLVMValueRef bytes = LLVMBuildMul(
+            g->builder, cap,
+            LLVMConstInt(i64, (unsigned long long)list_elem_bytes(g, lelem), 0),
+            "cpy.bytes");
         LLVMValueRef data_ptr = zan_call2(
-            g->builder,
-            LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
-            get_calloc_fn(g), (LLVMValueRef[]){LLVMConstInt(i64, 1, 0), bytes},
-            2, "cpy.data");
+            g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
+            get_calloc_fn(g),
+            (LLVMValueRef[]){LLVMConstInt(i64, 1, 0), bytes}, 2, "cpy.data");
         zan_irgen_emit_oom_check(g, g->current_fn, data_ptr);
         LLVMValueRef dst_data = LLVMBuildBitCast(
             g->builder, data_ptr, LLVMPointerType(i64, 0), "cpy.dp");
@@ -399,7 +394,6 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
 
         LLVMValueRef cfn =
             LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-        LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
         LLVMBasicBlockRef cond_bb =
             LLVMAppendBasicBlockInContext(g->ctx, cfn, "cpy.cond");
         LLVMBasicBlockRef body_bb =
@@ -417,25 +411,11 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             end_bb);
         LLVMPositionBuilderAtEnd(g->builder, body_bb);
         iv = LLVMBuildLoad2(g->builder, i64, ip, "cpy.iv2");
-        LLVMValueRef off = LLVMBuildMul(
-            g->builder, iv, LLVMConstInt(i64, lwords, 0), "cpy.off");
-        LLVMValueRef s_slot =
-            LLVMBuildGEP2(g->builder, i64, src_data, &off, 1, "cpy.ss");
-        LLVMValueRef d_slot =
-            LLVMBuildGEP2(g->builder, i64, dst_data, &off, 1, "cpy.ds");
-        LLVMTypeRef elem_llvm = lelem ? map_type(g, lelem) : i64;
-        LLVMValueRef v;
-        if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind) {
-          v = load_struct_from_slot(g, s_slot, elem_llvm);
-        } else {
-          v = LLVMBuildLoad2(g->builder, i64, s_slot, "cpy.sv");
-          if (LLVMGetTypeKind(elem_llvm) == LLVMPointerTypeKind) {
-            v = LLVMBuildIntToPtr(g->builder, v, elem_llvm, "cpy.pv");
-          } else if (LLVMGetTypeKind(elem_llvm) == LLVMDoubleTypeKind) {
-            v = LLVMBuildBitCast(g->builder, v, elem_llvm, "cpy.dv");
-          }
-        }
-        emit_collection_slot_store(g, lelem, i64, d_slot, v, NULL, locals, 0);
+        LLVMValueRef s_slot = list_elem_ptr(g, src_data, iv, lelem, "cpy.ss");
+        LLVMValueRef d_slot = list_elem_ptr(g, dst_data, iv, lelem, "cpy.ds");
+        LLVMValueRef v = list_load_value(g, lelem, s_slot);
+        emit_collection_slot_store(g, lelem, list_slot_type(g, lelem), d_slot,
+                                   v, NULL, locals, 0);
         LLVMValueRef nxt =
             LLVMBuildAdd(g->builder, iv, LLVMConstInt(i64, 1, 0), "cpy.nx");
         LLVMBuildStore(g->builder, nxt, ip);
@@ -458,7 +438,6 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
           LLVMValueRef arr = emit_expr(g, asrc, locals);
           LLVMTypeRef aetl = map_type(g, at->element_type);
           LLVMTypeKind aek = LLVMGetTypeKind(aetl);
-          unsigned alwords = elem_slot_words(g, lelem);
           LLVMValueRef alen = zan_array_len(g, arr);
           LLVMValueRef aeight = LLVMConstInt(i64, 8, 0);
           LLVMValueRef acap = LLVMBuildSelect(
@@ -473,7 +452,8 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                             typed_ptr, 1, "acap"));
           LLVMValueRef abytes = LLVMBuildMul(
               g->builder, acap,
-              LLVMConstInt(i64, (unsigned long long)(8 * alwords), 0),
+              LLVMConstInt(i64, (unsigned long long)list_elem_bytes(g, lelem),
+                           0),
               "acpy.bytes");
           LLVMValueRef adata = zan_call2(
               g->builder,
@@ -528,10 +508,9 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
               }
             }
           }
-          LLVMValueRef awpos = slot_word_index(g, aiv, alwords);
-          LLVMValueRef adst =
-              LLVMBuildGEP2(g->builder, i64, adp, &awpos, 1, "acpy.ds");
-          emit_collection_slot_store(g, lelem, i64, adst, av, NULL, locals, 0);
+          LLVMValueRef adst = list_elem_ptr(g, adp, aiv, lelem, "acpy.ds");
+          emit_collection_slot_store(g, lelem, list_slot_type(g, lelem), adst,
+                                     av, NULL, locals, 0);
           LLVMValueRef anx =
               LLVMBuildAdd(g->builder, aiv, LLVMConstInt(i64, 1, 0), "acpy.nx");
           LLVMBuildStore(g->builder, anx, aip);
@@ -564,9 +543,8 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
           g->builder, g->list_struct_type, typed_ptr, 1, "cap");
       zan_store_fit(g, LLVMConstInt(i64, (unsigned long long)initcap, 0),
                     cap_ptr);
-      unsigned lwords = elem_slot_words(g, lelem);
-      LLVMValueRef data_size =
-          LLVMConstInt(i64, (unsigned long long)(initcap * 8 * lwords), 0);
+      LLVMValueRef data_size = LLVMConstInt(
+          i64, (unsigned long long)initcap * list_elem_bytes(g, lelem), 0);
       LLVMValueRef data_ptr = zan_call2(
           g->builder, LLVMFunctionType(i8ptr, (LLVMTypeRef[]){i64, i64}, 2, 0),
           get_calloc_fn(g),
@@ -582,12 +560,12 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                    ? expr->new_expr.args.items[ii]
                                    : expr->new_expr.arg_inits
                                          .items[ii - expr->new_expr.args.count];
-        LLVMValueRef idxk =
-            LLVMConstInt(i64, (unsigned long long)ii * lwords, 0);
-        LLVMValueRef slot =
-            LLVMBuildGEP2(g->builder, i64, data_typed, &idxk, 1, "iis");
         LLVMValueRef ival = emit_expr(g, item, locals);
-        emit_collection_slot_store(g, lelem, i64, slot, ival, item, locals, 0);
+        LLVMValueRef slot = list_elem_ptr(
+            g, data_typed, LLVMConstInt(i64, (unsigned long long)ii, 0), lelem,
+            "iis");
+        emit_collection_slot_store(g, lelem, list_slot_type(g, lelem), slot,
+                                   ival, item, locals, 0);
       }
       return LLVMBuildBitCast(g->builder, typed_ptr, i8ptr, "listv");
     }

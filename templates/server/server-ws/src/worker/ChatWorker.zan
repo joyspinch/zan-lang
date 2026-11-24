@@ -1,20 +1,94 @@
 using System;
-using System.Net;
+using System.Json;
 using WsGateway;
 
-/* 业务逻辑，与传输解耦：只返回要广播的文本。网关执行实际的推送。本演示为聊天室。 */
+/* 业务逻辑：聊天室。只认 ClientConn 与协议消息，从不碰 socket ——
+ * 换成别的业务（推送、协同、游戏房间）时只替换这个文件与 ChatMessage。 */
 public class ChatWorker {
-    static async string OnOpen(Connection c, int online) {
-        return "* client #" + Convert.ToString(c.GetId())
-            + " joined (" + Convert.ToString(online) + " online)";
+    /* 上限按 UTF-8 字节计（string.Length 是字节数）：一个汉字占 3 字节。 */
+    static int maxNick = 48;
+    static int maxText = 2000;
+    static int historySize = 30;
+    /* 最近的聊天记录（已序列化的帧），新人进来先回放。 */
+    static List<string> history = new List<string>();
+
+    public static void Configure(int nickLimit, int textLimit, int historyLimit) {
+        maxNick = nickLimit;
+        maxText = textLimit;
+        historySize = historyLimit;
     }
 
-    static async string OnMessage(Connection c, string msg) {
-        return "[#" + Convert.ToString(c.GetId()) + "] " + msg;
+    public static async int OnOpen(ClientConn c) {
+        if (c == null) { return 0; }
+        await c.Push(ChatMessage.Welcome(c.Id(), c.DisplayName()));
+        for (int i = 0; i < history.Count; i++) { await c.Push(history[i]); }
+        await Gateway.Broadcast(ChatMessage.System(c.DisplayName() + " 进入了聊天室"));
+        await ChatWorker.BroadcastUsers();
+        return 0;
     }
 
-    static async string OnClose(Connection c, int online) {
-        return "* client #" + Convert.ToString(c.GetId())
-            + " left (" + Convert.ToString(online) + " online)";
+    public static async int OnMessage(ClientConn c, string data) {
+        ChatIn msg = null;
+        try {
+            msg = Json.Deserialize<ChatIn>(data);
+        } catch (Exception) {
+            msg = null;
+        }
+        if (msg == null || msg.type == null) {
+            await c.Push(ChatMessage.Error("无法识别的消息：需要 JSON，如 {\"type\":\"say\",\"text\":\"hi\"}"));
+            return 0;
+        }
+        if (msg.type == "nick") {
+            await ChatWorker.Rename(c, msg.nick == null ? "" : msg.nick.Trim());
+        } else if (msg.type == "say") {
+            await ChatWorker.Say(c, msg.text == null ? "" : msg.text.Trim());
+        } else {
+            await c.Push(ChatMessage.Error("未知消息类型：" + msg.type));
+        }
+        return 0;
+    }
+
+    public static async int OnClose(ClientConn c) {
+        await Gateway.Broadcast(ChatMessage.System(c.DisplayName() + " 离开了聊天室"));
+        await ChatWorker.BroadcastUsers();
+        return 0;
+    }
+
+    static async int Rename(ClientConn c, string nick) {
+        if (nick == "" || nick.Length > maxNick) {
+            await c.Push(ChatMessage.Error("昵称不能为空，且不超过 " + Convert.ToString(maxNick) + " 字节（约 " + Convert.ToString(maxNick / 3) + " 个汉字）"));
+            return 0;
+        }
+        if (Gateway.NickTaken(nick, c)) {
+            await c.Push(ChatMessage.Error("昵称 " + nick + " 已被占用"));
+            return 0;
+        }
+        string old = c.DisplayName();
+        c.nick = nick;
+        await c.Push(ChatMessage.Welcome(c.Id(), c.DisplayName()));
+        await Gateway.Broadcast(ChatMessage.System(old + " 改名为 " + nick));
+        await ChatWorker.BroadcastUsers();
+        return 0;
+    }
+
+    static async int Say(ClientConn c, string text) {
+        if (text == "") { return 0; }
+        if (text.Length > maxText) {
+            await c.Push(ChatMessage.Error("消息过长（上限 " + Convert.ToString(maxText) + " 字节）"));
+            return 0;
+        }
+        string frame = ChatMessage.Chat(c.DisplayName(), text);
+        history.Add(frame);
+        while (history.Count > historySize) { history.RemoveAt(0); }
+        await Gateway.Broadcast(frame);
+        return 0;
+    }
+
+    static async int BroadcastUsers() {
+        List<string> names = new List<string>();
+        List<ClientConn> all = Gateway.All();
+        for (int i = 0; i < all.Count; i++) { names.Add(all[i].DisplayName()); }
+        await Gateway.Broadcast(ChatMessage.Users(names));
+        return 0;
     }
 }

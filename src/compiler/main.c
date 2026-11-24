@@ -430,7 +430,7 @@ static char *read_file_arena(zan_arena_t *arena, const char *path,
 #include "driver/main_semantic_refs.c"
 
 #include "driver/main_prune.c"
-#include "driver/gui_kind_manifest.c"
+#include "driver/main_synth.c"
 
 static void zan_apply_lex_defines(zan_lexer_t *lex, zan_target_t target,
                                   const char *const *pp_defines,

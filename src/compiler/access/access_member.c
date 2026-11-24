@@ -306,7 +306,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef src_slot_ty = want_keys ? i8ptr : i64;
                 LLVMValueRef src = LLVMBuildLoad2(g->builder,
                     LLVMPointerType(src_slot_ty, 0), srcp, "dsrc");
-                LLVMValueRef list_raw = emit_alloc_rc_collection(g, expr, 24, 1, elem);
+                LLVMValueRef list_raw = emit_alloc_rc_collection(g, expr, 32, 1, elem);
+                list_header_init_esz(g, list_raw, elem);
                 LLVMValueRef lp = LLVMBuildBitCast(g->builder, list_raw,
                     LLVMPointerType(g->list_struct_type, 0), "lp");
                 zan_store_fit(g, cnt,
@@ -315,11 +316,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMConstInt(i64, 8, 0), "lcap");
                 zan_store_fit(g, cap,
                     LLVMBuildStructGEP2(g->builder, g->list_struct_type, lp, 1, "lcapp"));
-                unsigned elem_words = elem_slot_words(g, elem);
-                LLVMValueRef data_words = zan_mul(g->builder, cap,
-                    LLVMConstInt(i64, elem_words, 0), "lwords");
-                LLVMValueRef data_size = zan_mul(g->builder, data_words,
-                    LLVMConstInt(i64, 8, 0), "lsz");
+                LLVMValueRef data_size = zan_mul(g->builder, cap,
+                    LLVMConstInt(i64, (unsigned long long)list_elem_bytes(g, elem), 0), "lsz");
                 LLVMValueRef data = zan_call2(g->builder,
                     LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
                     get_calloc_fn(g),
@@ -348,10 +346,8 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMValueRef sval = want_keys
                     ? LLVMBuildLoad2(g->builder, src_slot_ty, sslot, "sv")
                     : load_collection_slot_value(g, elem, sslot);
-                LLVMValueRef dst_index = slot_word_index(g, ci, elem_words);
-                LLVMValueRef dslot = LLVMBuildGEP2(g->builder, i64,
-                    data_typed, &dst_index, 1, "dsl");
-                emit_collection_slot_store(g, elem, i64, dslot, sval, NULL, locals, 0);
+                LLVMValueRef dslot = list_elem_ptr(g, data_typed, ci, elem, "dsl");
+                emit_collection_slot_store(g, elem, list_slot_type(g, elem), dslot, sval, NULL, locals, 0);
                 zan_store_fit(g,
                     zan_add(g->builder, ci, LLVMConstInt(i64, 1, 0), "ni"), idx_a);
                 LLVMBuildBr(g->builder, cond_bb);

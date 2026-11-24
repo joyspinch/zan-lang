@@ -431,7 +431,9 @@ void emit_weak_runtime(zan_irgen_t *g) {
 
   LLVMTypeRef calloc_args[] = {i64, i64};
   LLVMTypeRef calloc_type = LLVMFunctionType(i8ptr, calloc_args, 2, 0);
-  LLVMValueRef weak_calloc = LLVMAddFunction(g->mod, "calloc", calloc_type);
+  LLVMValueRef weak_calloc = LLVMGetNamedFunction(g->mod, "calloc");
+  if (!weak_calloc)
+    weak_calloc = LLVMAddFunction(g->mod, "calloc", calloc_type);
 
   LLVMTypeRef store_args[] = {slot_t, i8ptr};
   LLVMTypeRef store_type =

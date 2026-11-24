@@ -241,6 +241,15 @@ public partial class Control : StyleNode, AppLoopOwner {
         this.a11yRole = role;
         this.a11yLabel = label;
     }
+
+    // 请求宿主整帧重绘（控件未挂到宿主时空操作）。控件不必自己 FindApp 再判空。
+    public void RequestRedraw() {
+        App owner = this.FindApp();
+        if (owner != null) { owner.RequestRedraw(); }
+    }
+
+    // 精细化局部失效：仅将本控件当前占用的屏幕绝对矩形登记为脏区，
+    // 激活局部帧条带管线（partialFrame），避免 3K/折叠大屏整窗无效重绘。
     public void Invalidate() {
         if (!visible || bw <= 0 || bh <= 0) { return; }
         App app = App.FrameApp();
@@ -458,22 +467,28 @@ public partial class Control : StyleNode, AppLoopOwner {
             childNodes[i].InheritScope(zs);
         }
     }
-    Form HostForm() {
+    // 本节点所在的窗口，尚未挂到任何窗口下时为 null。
+    WindowRoot HostForm() {
         Control up = this;
         for (int guard = 0; up != null && guard < 4096; guard = guard + 1) {
-            if (up is Form) { return (Form)up; }
+            if (up is WindowRoot) { return (WindowRoot)up; }
             up = up.parent;
         }
         return null;
     }
-    Form FindForm() { return this.HostForm(); }
+
+    // 类 C# WinForms / WPF 风格的窗口与应用上下文上溯：挂树控件直接通过
+    // this.FindForm() / this.FindApp() 访问宿主，无需外界手动 UseApp(app) 传递。
+    WindowRoot FindForm() {
+        return this.HostForm();
+    }
     App FindApp() {
         if (this.app != null) { return this.app; }
         Control up = this.parent;
         for (int guard = 0; up != null && guard < 4096; guard = guard + 1) {
             if (up.app != null) { return up.app; }
-            if (up is Form) {
-                Form f = (Form)up;
+            if (up is WindowRoot) {
+                WindowRoot f = (WindowRoot)up;
                 if (f.GetApp() != null) { return f.GetApp(); }
             }
             up = up.parent;
@@ -517,10 +532,16 @@ public partial class Control : StyleNode, AppLoopOwner {
         }
         this.SetHostApp(host);
     }
-    public virtual void OnHostForm(Form f) {
-        if (f != null && this.app == null) { this.InheritApp(f.GetApp()); }
+    // 挂到窗口树上时同步自动继承的上下文；显式覆盖由 UseApp 管理。
+    public virtual void OnHostForm(WindowRoot f) {
+        if (f != null && this.app == null) {
+            this.InheritApp(f.GetApp());
+        }
     }
-    void SpreadHostForm(Form f) {
+
+    // 把宿主窗口沿子树发下去（收养时自动调用，一棵先建好的子树在
+    // 挂上来的那一刻整棵都收到宿主）。
+    void SpreadHostForm(WindowRoot f) {
         if (f == null) { return; }
         this.OnHostForm(f);
         for (int i = 0; i < childNodes.Count; i = i + 1) {

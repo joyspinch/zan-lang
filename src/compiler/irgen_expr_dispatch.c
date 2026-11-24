@@ -96,9 +96,13 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
     case AST_ASSIGNMENT:
         return emit_expr_assignment(g, expr, locals);
 
-    case AST_CALL:
-        return promote_loaded(g, emit_expr_call(g, expr, locals),
-                              infer_expr_type(g, expr, locals));
+    case AST_CALL: {
+        zan_ast_node_t *saved_call = g->hold_call_expr;
+        g->hold_call_expr = expr;
+        LLVMValueRef call_v = emit_expr_call(g, expr, locals);
+        g->hold_call_expr = saved_call;
+        return promote_loaded(g, call_v, infer_expr_type(g, expr, locals));
+    }
 
     case AST_STRING_INTERP:
         return emit_expr_string_interp(g, expr, locals);

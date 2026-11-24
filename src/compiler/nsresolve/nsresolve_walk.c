@@ -750,30 +750,9 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     free(kept);
     return;
   }
-  bool manifest_seeded = false;
   zp_refs_t refs = {0};
   c.refs = &refs;
   for (;;) {
-    if (!manifest_seeded) {
-      bool has_live_manifest = false;
-      for (int i = 0; i < n; i++) {
-        if (kept[i] &&
-            nr_decl_or_method_has_attr(items[i].decl, "GuiKindManifest",
-                                       "GuiKindManifestAttribute")) {
-          has_live_manifest = true;
-          break;
-        }
-      }
-      if (has_live_manifest) {
-        manifest_seeded = true;
-        for (int j = 0; j < n; j++) {
-          if (!kept[j] &&
-              nr_decl_or_method_has_attr(items[j].decl, "GuiKind",
-                                         "GuiKindAttribute"))
-            kept[j] = 1;
-        }
-      }
-    }
     int before = 0;
     for (int i = 0; i < n; i++)
       before += kept[i];

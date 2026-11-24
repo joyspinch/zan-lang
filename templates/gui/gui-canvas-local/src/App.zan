@@ -2,28 +2,133 @@ using System;
 using Gui;
 using Gui.Widget;
 
-/* App 业务逻辑：局部自由画布与自定义算法排版范式（B-ID149 窗口即对象：事件 @click 按名接线）。
- * 窗口设计稿 src/{{NAME}}.html 由 Form.Show 运行期装载建树（发布态读
- * --embed 烘入的内嵌副本，开发态读散盘），事件按名自动接线。发布需在
- * zan.proj 声明 gen.embed = src/{{NAME}}.html。 */
+/* {{NAME}} —— 局部自由画布 + 自定义排版算法。
+ * 外层工具栏走 flex，不写坐标；画布区里的牌是绝对定位，坐标全由 Arrange 计算：
+ * 扇形（弧线）、横排、堆叠三种算法，点击某张牌把它"抽起"。
+ * 每帧检查画布尺寸（FrameHook），首次布局完成或拉伸窗口后自动重排，牌始终围绕画布中心。
+ * 想做节点图、白板、卡牌桌：保留这个结构，替换 Arrange 里的算法即可。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
-    static Form ui;
 
-    // 注册设计稿里声明的全部 @事件。
-    static void OnLoad(Form form) {
+    const int CardCount = 5;
+    const int CardW = 96;
+    const int CardH = 136;
+    const int LiftPx = 24;
+
+    string layoutMode = "fan";
+    string fanClass = "small secondary primary";
+    string rowClass = "small";
+    string stackClass = "small";
+    string status = "";
+    int picked = -1;
+    int dealCount = 0;
+    int arrangedW = 0;
+    int arrangedH = 0;
+    Random rng = new Random();
+
+    static string[] Ranks = new string[] { "A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K" };
+    static string[] Suits = new string[] { "♠", "♥", "♣", "♦" };
+
+    void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
-        ui = form;    }
-
-    static void OnDeal() {
-        Console.WriteLine("Action: Deal Cards");
+        Deal();
+        form.FrameHook(() => { WatchCanvasSize(form); });
     }
 
-    static void OnRearrange() {
-        Console.WriteLine("Action: Rearrange in Fan Curve");
+    void OnDeal() {
+        Deal();
+        Arrange();
+    }
+
+    // 工具栏 data-arg="fan|row|stack" @click="OnLayout"。
+    void OnLayout(string mode) {
+        layoutMode = mode;
+        fanClass = mode == "fan" ? "small secondary primary" : "small";
+        rowClass = mode == "row" ? "small secondary primary" : "small";
+        stackClass = mode == "stack" ? "small secondary primary" : "small";
+        Arrange();
+    }
+
+    // 牌 data-arg="0..4" @click="OnPick"：再点一次放回。
+    void OnPick(string index) {
+        int i = Convert.ToInt32(index);
+        picked = picked == i ? -1 : i;
+        Arrange();
+    }
+
+    // 画布第一次排好版、或窗口被拉伸后，尺寸与上次排版时不同 → 重排。
+    // 还没排版（宽高为 0）时再要一帧，直到拿到真实尺寸。
+    void WatchCanvasSize(Form form) {
+        Control canvas = Ctl("Canvas");
+        if (canvas == null) { return; }
+        if (canvas.bw <= 0 || canvas.bh <= 0) { form.GetApp().RequestRedraw(); return; }
+        if (canvas.bw != arrangedW || canvas.bh != arrangedH) { Arrange(); }
+    }
+
+    // 随机发 5 张不重复的牌，红色花色用 error 色。
+    void Deal() {
+        dealCount = dealCount + 1;
+        picked = -1;
+        bool[] used = new bool[52];
+        for (int i = 0; i < CardCount; i++) {
+            int n = rng.NextBelow(52);
+            while (used[n]) { n = rng.NextBelow(52); }
+            used[n] = true;
+            string suit = Suits[n / 13];
+            bool red = n / 13 == 1 || n / 13 == 3;
+            SetLabel("Rank" + i, Ranks[n % 13], "h1");
+            SetLabel("Suit" + i, suit, red ? "h2 error" : "h2");
+        }
+    }
+
+    // 排版算法：只依赖画布当前宽高，计算每张牌左上角坐标后 Place。
+    void Arrange() {
+        Control canvas = Ctl("Canvas");
+        if (canvas == null) { return; }
+        int w = canvas.bw;
+        int h = canvas.bh;
+        if (w <= 0 || h <= 0) { return; }
+        arrangedW = w;
+        arrangedH = h;
+        int cx = w / 2 - CardW / 2;
+        int cy = h / 2 - CardH / 2;
+        for (int i = 0; i < CardCount; i++) {
+            int k = i - CardCount / 2; // -2..2，中间那张为 0
+            int x = cx;
+            int y = cy;
+            if (layoutMode == "fan") {
+                x = cx + k * (CardW * 2 / 3);
+                y = cy + k * k * 12;          // 抛物线近似圆弧：两端下沉
+            } else if (layoutMode == "row") {
+                x = cx + k * (CardW + 16);
+            } else {
+                x = cx + i * 6 - 12;          // 堆叠：每张错开一点
+                y = cy + i * 4 - 8;
+            }
+            if (i == picked) { y = y - LiftPx; }
+            Control card = Ctl("Card" + i);
+            if (card == null) { continue; }
+            card.Place(x, y);
+            card.Invalidate();
+        }
+        canvas.Invalidate();
+        status = "第 " + dealCount + " 手 · " + ModeName() + (picked >= 0 ? " · 抽起第 " + (picked + 1) + " 张" : "");
+    }
+
+    // 设计稿里的标签按 id 取用；Get 可能返回 null（id 写错），先判空。
+    void SetLabel(string id, string text, string cls) {
+        Label label = Get<Label>(id);
+        if (label == null) { return; }
+        label.SetProp("text", text);
+        label.SetProp("class", cls);
+    }
+
+    string ModeName() {
+        if (layoutMode == "fan") { return "扇形"; }
+        if (layoutMode == "row") { return "横排"; }
+        return "堆叠";
     }
 }

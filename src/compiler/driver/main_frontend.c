@@ -106,7 +106,6 @@ for (;;) {
         pi_seed_source(src, slen, opts.diagnostics_jsonl);
       } else {
         pi_seed_parsed_unit(unit, seed_entry);
-        pi_seed_manifest_unit(unit, input_files[fi]);
       }
       pi_seeding_stdlib = 0;
       pi_seed_stdlib_input = 0;
@@ -411,7 +410,6 @@ if (!zan_diag_has_errors(diag)) {
           }
         } else {
           pi_seed_parsed_unit(unit, 0);
-          pi_seed_manifest_unit(unit, input_files[fi]);
         }
         pi_seeding_stdlib = 0;
         if (auto_stdlib && resolved_stdlib_root[0] &&
@@ -440,8 +438,8 @@ if (!zan_diag_has_errors(diag)) {
     zan_arena_free(pi_arena);
     pi_arena = NULL;
     memset(pi_table, 0, sizeof(pi_table));
+    pi_live_ns_count = 0;
     pi_dirs_head = pi_dirs_tail = NULL;
-    pi_reset_manifest_roots();
   }
   if (pkg_gen_added) {
     zan_compile_trace("merge partials (post pkg-gen)");
@@ -449,7 +447,14 @@ if (!zan_diag_has_errors(diag)) {
     zan_compile_trace("desugar events (post pkg-gen)");
     zan_parser_desugar_events(ast, arena, diag);
   }
-  zan_compile_trace("nsresolve final");
+  /* 控件目录：同一窗口期合成 __ZanControlCatalog（控件类型已全部拉入）。 */
+  zan_compile_trace("synth control catalog");
+  zan_synth_control_catalog(ast, arena, diag);
+  /* 框架化窗口入口：同一窗口期合成 __ZanDocMain（零参 Bootstrap
+     调用点驱动，见 zan_synth_docapp_main 注释）。 */
+  zan_compile_trace("synth docapp main");
+  zan_synth_docapp_main(ast, arena, diag, input_file);
+  zan_compile_trace("nsresolve generated");
   zan_nsresolve_run(ast, arena, diag);
   if (pkg_gen_added) {
     zan_compile_trace("specialize generic bases (post pkg-gen)");
@@ -457,8 +462,6 @@ if (!zan_diag_has_errors(diag)) {
   }
   zan_compile_trace("prune");
   zan_nsresolve_prune(ast, arena, diag);
-  zan_compile_trace("gui kind manifest");
-  zan_synthesize_gui_kind_manifests(ast, arena, diag);
   phase("prune");
   zan_compile_trace("resolve done");
 }
@@ -650,24 +653,24 @@ if (zan_irgen_init(&irgen, ir_arena, diag, &binder, input_file, irgen_triple,
   free(source);
   return 1;
 }
-  irgen.cpu_profile = opts.cpu_profile;
-  irgen.emit_debug = debug_info;
-  irgen.strict_runtime = strict_runtime;
-  irgen.publish_mode = publish_mode;
-  /* Apple --fast-alloc（ld64 无 --wrap）：发射期把分配调用改指 rt_mem.c 的
-   * zan_mem_*；只有分配器对象确实在场才改，链接段（linker_setup.c）同判。
-   * --emit-lib 不改：静态库只装用户对象、由外部宿主链接，拿不到 rt_mem.o。 */
+irgen.cpu_profile = opts.cpu_profile;
+irgen.emit_debug = debug_info;
+irgen.strict_runtime = strict_runtime;
+irgen.publish_mode = publish_mode;
+/* Apple --fast-alloc（ld64 无 --wrap）：发射期把分配调用改指 rt_mem.c 的
+ * zan_mem_*；只有分配器对象确实在场才改，链接段（linker_setup.c）同判。
+ * --emit-lib 不改：静态库只装用户对象、由外部宿主链接，拿不到 rt_mem.o。 */
 #ifdef ZAN_RT_MEM_OBJ
-  if (fast_alloc_opt >= 0 && !cross_compiling && !emit_lib &&
-      (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-    char fa_dir[1024], fa_obj[1200];
-    zan_exe_dir(fa_dir, sizeof(fa_dir));
-    snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
-             zan_path_basename(ZAN_RT_MEM_OBJ));
+if (fast_alloc_opt >= 0 && !cross_compiling && !emit_lib &&
+    (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
+  char fa_dir[1024], fa_obj[1200];
+  zan_exe_dir(fa_dir, sizeof(fa_dir));
+  snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
+           zan_path_basename(ZAN_RT_MEM_OBJ));
     irgen.route_fast_alloc = zan_file_exists(fa_obj);
   }
 #endif
-  irgen.codegen_level = opts.codegen_level;
+irgen.codegen_level = opts.codegen_level;
 irgen.shard_opt = opts.shard_opt;
 irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
 irgen.rt_guard_split = !cross_compiling;

@@ -44,7 +44,8 @@ static LLVMValueRef query_new_list(zan_irgen_t *g, zan_ast_node_t *at,
                                    zan_type_t *elem) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    LLVMValueRef raw = emit_alloc_rc_collection(g, at, 24, 1, elem);
+    LLVMValueRef raw = emit_alloc_rc_collection(g, at, 32, 1, elem);
+    list_header_init_esz(g, raw, elem);
     LLVMValueRef lp = LLVMBuildBitCast(g->builder, raw,
         LLVMPointerType(g->list_struct_type, 0), "qlp");
     LLVMValueRef cnt = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
@@ -56,7 +57,7 @@ static LLVMValueRef query_new_list(zan_irgen_t *g, zan_ast_node_t *at,
     LLVMValueRef data = LLVMBuildStructGEP2(g->builder, g->list_struct_type,
         lp, 2, "qld");
     LLVMValueRef dsz = LLVMConstInt(i64,
-        8 * 8 * (long long)elem_slot_words(g, elem), 0);
+        8ULL * list_elem_bytes(g, elem), 0);
     LLVMValueRef dp = zan_call2(g->builder,
         LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64, i64 }, 2, 0),
         get_calloc_fn(g), (LLVMValueRef[]){ LLVMConstInt(i64, 1, 0), dsz },
@@ -173,12 +174,12 @@ static void query_loop_open(zan_irgen_t *g, query_loop_t *l,
 
 static LLVMValueRef query_loop_load(zan_irgen_t *g, query_loop_t *l,
                                     zan_type_t *elem, LLVMValueRef iv) {
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef elm = map_type(g, elem);
-    LLVMValueRef qwidx = slot_word_index(g, iv, elem_slot_words(g, elem));
-    LLVMValueRef ep = LLVMBuildGEP2(g->builder, i64, l->data, &qwidx, 1, "qlep");
+    /* 每元素经宽度守卫取数据指针（循环体可能改动或改宽该表） */
+    LLVMValueRef data = list_data_for(g, l->col, elem, "qldata.w");
+    LLVMValueRef ep = list_elem_ptr(g, data, iv, elem, "qlep");
     /* 集合元素加载梯级类型匹配转换 */
-    LLVMValueRef ev = load_collection_slot_value(g, elem, ep);
+    LLVMValueRef ev = list_load_value(g, elem, ep);
     LLVMValueRef slot = emit_entry_alloca(g, elm, "qels");
     zan_store_fit(g, ev, slot);
     return slot;

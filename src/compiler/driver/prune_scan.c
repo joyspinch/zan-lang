@@ -20,25 +20,22 @@ typedef struct pi_name {
 static pi_name_t *pi_table[PI_BUCKETS];
 
 typedef struct pi_file {
-  char *path;
-  pi_name_t **top;
-  int top_count, top_cap;
-  pi_name_t **idents;
-  int ident_count, ident_cap;
-  char **usings;
-  int using_count, using_cap;
-  char *decl_ns;
-  int has_ext;
-  int has_test;
-  int has_module_init;
-  int has_gui_kind;
-  int has_gui_manifest;
-  int pkg_src;
-  int gate_live;
-  int included;
-  int parsed;
-  int seeded;
-  struct pi_file *dnext;
+    char *path;
+    pi_name_t **top; int top_count, top_cap;
+    pi_name_t **idents; int ident_count, ident_cap;
+    char **usings; int using_count, using_cap;
+    char *decl_ns;
+    int has_ext;
+    int has_test;
+    int has_module_init;
+    int has_controller;         /* 控制器/路由/表等生成器实体 */
+    int catalog;                /* 位于包声明的控件目录命名空间（zan.pkg catalog） */
+    int pkg_src;
+    int gate_live;
+    int included;
+    int parsed;
+    int seeded;
+    struct pi_file *dnext;
 } pi_file_t;
 
 typedef struct pi_dir {
@@ -227,8 +224,8 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
   f->has_ext = 0;
   f->has_test = 0;
   f->has_module_init = 0;
-  f->has_gui_kind = 0;
-  f->has_gui_manifest = 0;
+  f->has_controller = 0;
+  f->catalog = 0;
   f->pkg_src = 0;
   f->gate_live = 0;
   f->included = 0;
@@ -544,30 +541,37 @@ static void pi_scan_file(pi_file_t *f) {
         depth--;
       break;
     case TK_LBRACKET: {
-      if (depth <= 2 &&
-          (prev == TK_EOF || prev == TK_SEMICOLON || prev == TK_RBRACE ||
-           prev == TK_LBRACE || prev == TK_RBRACKET)) {
+      if (depth <= 1 && (prev == TK_EOF || prev == TK_SEMICOLON ||
+                         prev == TK_RBRACE || prev == TK_LBRACE ||
+                         prev == TK_RBRACKET)) {
         zan_token_t next = zan_lexer_peek(&lex);
         if (next.kind == TK_IDENT) {
-          if (depth <= 1 && next.str_val.len == 4 &&
-              memcmp(next.str_val.str, "Test", 4) == 0) {
+          if (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0) {
             f->has_test = 1;
-          } else if (depth <= 1 &&
-                     ((next.str_val.len == 17 &&
-                       memcmp(next.str_val.str, "ModuleInitializer", 17) == 0) ||
-                      (next.str_val.len == 26 &&
-                       memcmp(next.str_val.str, "ModuleInitializerAttribute", 26) == 0))) {
+          } else if ((next.str_val.len == 17 &&
+                      memcmp(next.str_val.str, "ModuleInitializer", 17) == 0) ||
+                     (next.str_val.len == 26 &&
+                      memcmp(next.str_val.str, "ModuleInitializerAttribute", 26) == 0)) {
             f->has_module_init = 1;
-          } else if ((next.str_val.len == 7 &&
-                      memcmp(next.str_val.str, "GuiKind", 7) == 0) ||
-                     (next.str_val.len == 16 &&
-                      memcmp(next.str_val.str, "GuiKindAttribute", 16) == 0)) {
-            f->has_gui_kind = 1;
-          } else if ((next.str_val.len == 15 &&
-                      memcmp(next.str_val.str, "GuiKindManifest", 15) == 0) ||
-                     (next.str_val.len == 24 &&
-                      memcmp(next.str_val.str, "GuiKindManifestAttribute", 24) == 0)) {
-            f->has_gui_manifest = 1;
+          } else if ((next.str_val.len == 5 && memcmp(next.str_val.str, "Route", 5) == 0) ||
+                     (next.str_val.len == 13 && memcmp(next.str_val.str, "ApiController", 13) == 0) ||
+                     (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) ||
+                     (next.str_val.len == 6 && memcmp(next.str_val.str, "Custom", 6) == 0) ||
+                     (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpGet", 7) == 0) ||
+                     (next.str_val.len == 8 && memcmp(next.str_val.str, "HttpPost", 8) == 0) ||
+                     (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpPut", 7) == 0) ||
+                     (next.str_val.len == 10 && memcmp(next.str_val.str, "HttpDelete", 10) == 0) ||
+                     (next.str_val.len == 9 && memcmp(next.str_val.str, "HttpPatch", 9) == 0)) {
+            f->has_controller = 1;
+          }
+          /* A [Table] entity may be reached through a synthesized
+           * `recv.<Entity>` accessor (checker_try_entity_accessor):
+           * its fallback lowers to new BaseRepository<E>(
+           * ZanSql.FromConnection(conn)), names no source file
+           * spells -- demand them so the pull keeps those types. */
+          if (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) {
+            pi_flag_ident(f, "BaseRepository", 14);
+            pi_flag_ident(f, "ZanSql", 6);
           }
         }
       }
@@ -645,6 +649,14 @@ static void pi_scan_file(pi_file_t *f) {
         zan_token_t next = zan_lexer_peek(&lex);
         if (next.kind == TK_IDENT) {
           tok = zan_lexer_next(&lex);
+          if (tok.str_val.len >= 10 &&
+              memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) {
+            f->has_controller = 1;
+          }
+          if (tok.str_val.len >= 3 &&
+              memcmp(tok.str_val.str + tok.str_val.len - 3, "Dao", 3) == 0) {
+            f->has_controller = 1;
+          }
           pi_name_t *name = pi_intern(tok.str_val.str, tok.str_val.len);
           if (name && pi_reserve((void *)&f->top, f->top_count, &f->top_cap,
                                  sizeof(pi_name_t *)))
@@ -706,6 +718,14 @@ static void pi_scan_file(pi_file_t *f) {
         continue;
       }
       pi_name_t *cur_id = pi_intern(tok.str_val.str, tok.str_val.len);
+      if (prev == TK_COLON) {
+        if ((tok.str_val.len >= 10 &&
+             memcmp(tok.str_val.str + tok.str_val.len - 10, "Controller", 10) == 0) ||
+            (tok.str_val.len == 14 && memcmp(tok.str_val.str, "BaseRepository", 14) == 0) ||
+            (tok.str_val.len == 7 && memcmp(tok.str_val.str, "BaseDao", 7) == 0)) {
+          f->has_controller = 1;
+        }
+      }
       if (prev != TK_DOT)
         last_id = cur_id;
       pi_flag_ident(f, tok.str_val.str, tok.str_val.len);

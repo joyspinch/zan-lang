@@ -577,4 +577,66 @@ partial class Irgen {
         return retTy;
     }
 
+    // ---- generic vtable families (interface dispatch tag chain) ----
+    List<string> vtFamilies = new List<string>();
+
+    void NoteVtFamily(string cls) {
+        int i = 0;
+        while (i < vtFamilies.Count) { if (vtFamilies[i] == cls) { return; } i = i + 1; }
+        vtFamilies.Add(cls);
+    }
+
+    // the slot of `impl`'s method in cls's vtable when the slot's function
+    // has the implementation's own signature (no ABI adapter), else -1
+    int FamilySlot(Node cls, Node im, string impl) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        int i = 0;
+        while (i < ms.Count) {
+            Node sm = ms[i];
+            if (FindVSlotImpl(cls, sm) == im) {
+                if (IsAsync(sm) || DeclOwnerOf(cls, im) != impl) { return -1; }
+                string slotOwner = DeclOwnerOf(cls, sm);
+                if (MapTypeDecl(sm.type, slotOwner) != MapTypeDecl(im.type, impl)) { return -1; }
+                int pi = 0;
+                while (pi < MethodParamCount(sm)) {
+                    if (MapTypeDecl(ParamTypeNode(sm, pi), slotOwner) != MapTypeDecl(ParamTypeNode(im, pi), impl)) { return -1; }
+                    pi = pi + 1;
+                }
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // one predicate per generic class the tag chains test: its shared
+    // vtable plus every per-instantiation table the module ended up with
+    void EmitVtFamilies() {
+        int f = 0;
+        while (f < vtFamilies.Count) {
+            string cls = vtFamilies[f];
+            Node cd = binder.FindType(cls);
+            List<string> vslots = new List<string>();
+            CollectVSlots(cd, vslots);
+            string ty = "[" + vslots.Count + " x i8*]";
+            H("define internal i1 @zvt_family_" + cls + "(i8* %tag) {");
+            H("entry:");
+            H("  %m0 = icmp eq i8* %tag, bitcast (" + ty + "* @" + cls + "_vtable to i8*)");
+            string acc = "%m0";
+            int k = 0; int n = 1;
+            while (k < specVtSyms.Count) {
+                if (specVtCls[k] != null && specVtCls[k].sval == cls) {
+                    H("  %m" + n + " = icmp eq i8* %tag, bitcast (" + ty + "* @" + specVtSyms[k] + " to i8*)");
+                    H("  %o" + n + " = or i1 " + acc + ", %m" + n);
+                    acc = "%o" + n;
+                    n = n + 1;
+                }
+                k = k + 1;
+            }
+            H("  ret i1 " + acc);
+            H("}");
+            f = f + 1;
+        }
+    }
 }

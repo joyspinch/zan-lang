@@ -208,7 +208,10 @@ static int rto_timeout_scan(zan_io_shard_t *sh) {
     return woke;
 }
 
-static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
+/* park=1：worker 空闲停泊。即使本分片没有登记 I/O 也要阻塞在 poll fd 上——
+ * co_notify 的唤醒走分片 wake pipe（已登记在 poll fd 里），裸 nanosleep
+ * 收不到它，跨线程提交的任务会被搁到下一个定时器截止才被取走。 */
+static int32_t io_poll_shard_ex(int shard, int64_t timeout_ms, int park) {
     zan_io_shard_t *sh = &g_ioshard[shard];
     shard_lock(sh);
     if (sh->dead) {
@@ -225,11 +228,12 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
     }
     int empty = (g_io_count == 0 && g_blocking_inflight == 0);
     shard_unlock(sh);
-    if (empty) return 0;
+    if (empty && !park) return 0;
     struct kevent events[64];
     for (;;) {
         int64_t wait = dns_wait_ms(timeout_ms);
-        int capped = (wait < 0 || wait > ZAN_IO_SWEEP_MS);
+        /* 空闲停泊无需按扫描周期醒来：没有登记的 I/O 可扫。 */
+        int capped = (wait < 0 || (wait > ZAN_IO_SWEEP_MS && !(park && empty)));
         if (capped) wait = ZAN_IO_SWEEP_MS;
         struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
         int n = kevent(sh->poll_fd, NULL, 0, events, 64, &ts);
@@ -297,6 +301,10 @@ static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
         shard_unlock(sh);
         if (done) return val;
     }
+}
+
+static int32_t io_poll_shard(int shard, int64_t timeout_ms) {
+    return io_poll_shard_ex(shard, timeout_ms, 0);
 }
 
 int32_t zan_io_poll(int64_t timeout_ms) {

@@ -1,0 +1,773 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Gui;
+namespace Gui.Backend;
+public partial class UiDriver {
+    internal static UiDriverSession CurrentSession() {
+        object slot = GuiHostState.AutomationSession();
+        if (slot is UiDriverSession s) { return s; }
+        App frame = Gui.App.FrameApp();
+        if (frame != null) {
+            object frameSlot = frame.AutomationSession();
+            if (frameSlot is UiDriverSession fs) {
+                GuiHostState.SetAutomationSession(fs);
+                return fs;
+            }
+        }
+        UiDriverSession created = new UiDriverSession();
+        GuiHostState.SetAutomationSession(created);
+        return created;
+    }
+    static bool Active() { return UiDriver.CurrentSession().active; }
+    static void SetActive(bool value) { UiDriver.CurrentSession().active = value; }
+    static bool Finished() { return UiDriver.CurrentSession().finished; }
+    static bool WaitFullPresent() { return UiDriver.CurrentSession().waitFullPresent; }
+    static App App() { return UiDriver.CurrentSession().app; }
+    static void SetApp(App a) { UiDriver.CurrentSession().app = a; }
+    static string ResultsPath() { return UiDriver.CurrentSession().resultsPath; }
+    static void SetResultsPath(string path) { UiDriver.CurrentSession().resultsPath = path; }
+    static void SetProbes(List<UiProbe> list) { UiDriver.CurrentSession().probes = list; }
+    public static void Enable(App a) {
+        if (a == null) { return; }
+        UiDriverSession s = a.AutomationSession() as UiDriverSession;
+        if (s == null) {
+            s = new UiDriverSession();
+            a.SetAutomationSession(s);
+        }
+        GuiHostState.SetAutomationSession(s);
+        GuiFrameProfiler.EnableFromEnvironment(a);
+    }
+    static void Begin(App a) {
+        UiDriver.Enable(a);
+        UiDriverSession s = a != null ? a.AutomationSession() as UiDriverSession : UiDriver.CurrentSession();
+        if (s != null) { UiDriver.StartSession(s, a); }
+    }
+    internal static void StartSession(UiDriverSession s, App a) {
+        if (s == null || s.active) { return; }
+        string path = UiDriver.Env("ZAN_UI_SCRIPT");
+        if (path == "") { return; }
+        if (!File.Exists(path)) { return; }
+        GuiHostState.SetAutomationSession(s);
+        s.app = a;
+        s.outDir = UiDriver.Env("ZAN_UI_OUT");
+        if (s.outDir == "") { s.outDir = "_scratch/uidrv"; }
+        Directory.CreateDirectoryRecursive(s.outDir);
+        s.resultsPath = s.outDir + "/results.log";
+        s.cmds = new List<string>();
+        string body = File.ReadAllText(path);
+        List<string> raw = body.Replace("\r", "").Split("\n");
+        for (int i = 0; i < raw.Count; i = i + 1) { s.cmds.Add(raw[i]); }
+        s.pc = 0;
+        s.waitUntilUs = 0;
+        s.waitArmed = false;
+        s.waitFullPresent = false;
+        s.traceFullPresent = Gui.App.PerfOn();
+        s.traceOwner = s.traceOwner + 1;
+        s.traceRequest = 0;
+        s.traceEnterMask = 0;
+        s.traceLeaveMask = 0;
+        s.tracePreparationReason = false;
+        s.passCount = 0;
+        s.failCount = 0;
+        s.commandErrors = 0;
+        s.commandLine = 0;
+        s.probes = new List<UiProbe>();
+        s.finished = false;
+        s.active = true;
+        File.WriteAllText(s.resultsPath,
+        "# UiDriver session: " + path + " (" + Convert.ToString(s.cmds.Count)
+        + " lines)\n");
+        UiDriver.ApplyStartupClient(s);
+        s.app.RequestRedraw();
+    }
+    static void ApplyStartupClient(UiDriverSession s) {
+        int first = -1;
+        int client = -1;
+        for (int i = 0; i < s.cmds.Count; i++) {
+            string line = TextUtil.TrimOrEmpty(s.cmds[i]);
+            if (line == "" || line.StartsWith("#")) { continue; }
+            if (first < 0) { first = i; }
+            List<string> tokens = UiDriver.Tok(line);
+            if (tokens[0] != "client-dev") { continue; }
+            if (client >= 0 || i != first) {
+                throw new InvalidOperationException("client-dev must be the first and only startup size command");
+            }
+            client = i;
+        }
+        if (client < 0) { return; }
+        List<string> size = UiDriver.Tok(TextUtil.TrimOrEmpty(s.cmds[client]));
+        if (size.Count != 3) { throw new InvalidOperationException("client-dev requires W H"); }
+        int w = UiDriver.ParseProbeId(size[1]);
+        int h = UiDriver.ParseProbeId(size[2]);
+        if (w <= 0 || h <= 0 || w > 16384 || h > 16384) {
+            throw new InvalidOperationException("client-dev requires positive device dimensions <=16384");
+        }
+        int framesBefore = s.app.frameCount;
+        int perfBefore = s.app.Stats.Frames;
+        if (framesBefore != 0 || perfBefore != 0) {
+            throw new InvalidOperationException("client-dev requires an unpainted app");
+        }
+        s.app.SetClientSizeDev(w, h);
+        s.app.SyncSurface();
+        if (s.app.window.GetHandle() == 0 || s.app.window.ClientWidth() != w || s.app.window.ClientHeight() != h
+        || s.app.canvas.Width() != w || s.app.canvas.Height() != h
+        || s.app.frameCount != framesBefore || s.app.Stats.Frames != perfBefore) {
+            throw new InvalidOperationException("client-dev actual native canvas or prepaint counters mismatch: client="
+            + Convert.ToString(s.app.window.ClientWidth()) + "x" + Convert.ToString(s.app.window.ClientHeight())
+            + " canvas=" + Convert.ToString(s.app.canvas.Width()) + "x" + Convert.ToString(s.app.canvas.Height())
+            + " frames=" + Convert.ToString(s.app.frameCount) + "/" + Convert.ToString(s.app.Stats.Frames));
+        }
+        s.pc = client + 1;
+        UiDriver.Note(s, "client-dev " + Convert.ToString(w) + " " + Convert.ToString(h)
+        + " frame_before=" + Convert.ToString(framesBefore)
+        + " frame_after=" + Convert.ToString(s.app.frameCount)
+        + " perf_before=" + Convert.ToString(perfBefore)
+        + " perf_after=" + Convert.ToString(s.app.Stats.Frames));
+    }
+    internal static void NotifyPresented(UiDriverSession s, App owner) {
+        if (s != null && s.app == owner && s.waitFullPresent) {
+            UiDriver.TraceFullPresent(s, owner, 29, true);
+            UiDriver.TraceFullPresent(s, owner, 29, false);
+            s.waitFullPresent = false;
+        }
+    }
+    internal static void TraceFullPresent(UiDriverSession s, App owner, int stage, bool enter) {
+        if (s == null || !s.traceFullPresent || !s.waitFullPresent || s.app != owner || stage < 0 || stage > 29) { return; }
+        int bit = 1 << stage;
+        if (enter) {
+            if ((s.traceEnterMask & bit) != 0) { return; }
+            s.traceEnterMask = s.traceEnterMask | bit;
+        } else {
+            if ((s.traceLeaveMask & bit) != 0) { return; }
+            s.traceLeaveMask = s.traceLeaveMask | bit;
+        }
+        try {
+            UiDriver.Note(s, "full-present owner=" + Convert.ToString(s.traceOwner)
+            + " request=" + Convert.ToString(s.traceRequest)
+            + " stage=" + Convert.ToString(stage)
+            + " edge=" + (enter ? "enter" : "leave")
+            + " us=" + Convert.ToString(Window.GetTickUs()));
+        } catch (Exception ex) {
+            s.traceFullPresent = false;
+        }
+    }
+    internal static bool PreparationReasonPending(UiDriverSession s, App owner) {
+        return s != null && s.traceFullPresent && s.waitFullPresent && s.app == owner && !s.tracePreparationReason;
+    }
+    internal static void TracePreparationReason(UiDriverSession s, App owner, string reason) {
+        if (!UiDriver.PreparationReasonPending(s, owner)) { return; }
+        s.tracePreparationReason = true;
+        try {
+            UiDriver.Note(s, "full-present owner=" + Convert.ToString(s.traceOwner)
+            + " request=" + Convert.ToString(s.traceRequest)
+            + " stage=18 reason=" + reason);
+        } catch (Exception ex) { s.traceFullPresent = false; }
+    }
+    static string Env(string name) {
+        string v = Interop.EnvVar(name);
+        if (v == null) { return ""; }
+        return v;
+    }
+    static void SetProbe(string name, string val) {
+        UiDriverSession s = UiDriver.CurrentSession();
+        if (!s.active) { return; }
+        for (int i = 0; i < s.probes.Count; i = i + 1) {
+            if (s.probes[i].name == name) { s.probes[i].value = val; return; }
+        }
+        s.probes.Add(new UiProbe(name, val));
+    }
+    static string GetProbe(UiDriverSession s, string name) {
+        if (s == null || s.probes == null) { return ""; }
+        for (int i = 0; i < s.probes.Count; i = i + 1) {
+            if (s.probes[i].name == name) { return s.probes[i].value; }
+        }
+        return "";
+    }
+    static string GetProbe(string name) { return UiDriver.GetProbe(UiDriver.CurrentSession(), name); }
+    static int ParseProbeId(string s) {
+        if (s.Length == 0 || s.Length > 9) { return -1; }
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c < 48 || c > 57) { return -1; }
+            v = v * 10 + (c - 48);
+        }
+        return v;
+    }
+    static void Tick() { UiDriver.TickSession(UiDriver.CurrentSession()); }
+    internal static void TickSession(UiDriverSession s) {
+        if (s == null || !s.active || s.finished) { return; }
+        if (s.waitFullPresent) {
+            UiDriver.TraceFullPresent(s, s.app, 1, true);
+            s.app.pollPending = true;
+            return;
+        }
+        s.app.pollPending = true;
+        if (Window.InjectPending() > 0) { return; }
+        int nowUs = Window.GetTickUs();
+        if (s.waitArmed) {
+            if (nowUs - s.waitUntilUs < 0) { return; }
+            s.waitArmed = false;
+        }
+        while (s.pc < s.cmds.Count) {
+            string line = s.cmds[s.pc];
+            s.pc = s.pc + 1;
+            bool yield = UiDriver.ExecuteCommand(s, line, s.pc);
+            if (yield) { return; }
+        }
+        UiDriver.Finish(s);
+    }
+    static bool Exec(string line) { return UiDriver.ExecuteCommand(UiDriver.CurrentSession(), line, 0); }
+    static bool ExecCore(UiDriverSession s, string line) {
+        string trimmed = TextUtil.TrimOrEmpty(line);
+        if (trimmed == "") { return false; }
+        if (TextUtil.StartsWithOr(trimmed, "#", false)) { return false; }
+        List<string> t = UiDriver.Tok(trimmed);
+        string cmd = t[0];
+        if (cmd == "client-dev") {
+            throw new InvalidOperationException("client-dev is only valid in the Begin startup header");
+        }
+        if (cmd == "wait") {
+            int ms = UiDriver.ArgI(t, 1, 0);
+            s.waitUntilUs = Window.GetTickUs() + ms * 1000;
+            s.waitArmed = true;
+            UiDriver.Note(s, "wait " + Convert.ToString(ms));
+            return true;
+        }
+        if (cmd == "redraw") {
+            if (t.Count != 2 || t[1] != "full") {
+                UiDriver.CommandError(s, "redraw: expected full");
+                return false;
+            }
+            s.app.RequestRedraw();
+            s.waitFullPresent = true;
+            s.traceRequest = s.traceRequest + 1;
+            s.traceEnterMask = 0;
+            s.traceLeaveMask = 0;
+            s.tracePreparationReason = false;
+            UiDriver.Note(s, "redraw full");
+            UiDriver.TraceFullPresent(s, s.app, 0, true);
+            return true;
+        }
+        if (cmd == "freeze") {
+            if (t.Count < 2 || t.Count > 3 || t[1] != "clock") {
+                UiDriver.CommandError(s, "freeze: expected clock [tickMs]");
+                return false;
+            }
+            int fixedMs = 600000;
+            if (t.Count == 3) { fixedMs = UiDriver.ArgI(t, 2, fixedMs); }
+            s.app.FreezeAnimClock(fixedMs);
+            UiDriver.Note(s, "freeze clock " + Convert.ToString(fixedMs));
+            return false;
+        }
+        if (cmd == "unfreeze") {
+            if (t.Count != 2 || t[1] != "clock") {
+                UiDriver.CommandError(s, "unfreeze: expected clock");
+                return false;
+            }
+            s.app.UnfreezeAnimClock();
+            UiDriver.Note(s, "unfreeze clock");
+            return false;
+        }
+        if (cmd == "move") {
+            UiDriver.Inject(s, 1, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0, 0, 0);
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "click") {
+            UiDriver.ClickAt(s, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 0);
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "rclick") {
+            UiDriver.ClickAt(s, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0), 1);
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "clickid") {
+            string target = t.Count > 1 ? t[1] : "";
+            int id = -1;
+            ControlNode retained = UiDriver.FindInputTarget(s, target);
+            if (retained != null) {
+                if (retained.pointerHit == 0) {
+                    UiDriver.CommandError(s, "clickid " + target + " -> retained target is not reachable");
+                    return false;
+                }
+                UiDriver.ClickAt(s, retained.x + retained.w / 2, retained.y + retained.h / 2, 0);
+                UiDriver.Note(s, "clickid " + target + " (retained)");
+                return true;
+            }
+            if (TextUtil.StartsWithOr(target, "@", false)) {
+                string nm = TextUtil.TrimOrEmpty(target.Substring(1));
+                HitRegion lr = UiDriver.FindRegionByLabel(s, nm);
+                if (lr != null) {
+                    id = lr.id;
+                    UiDriver.Note(s, "clickid " + target + " -> id "
+                    + Convert.ToString(id) + " (label)");
+                } else {
+                    id = UiDriver.ParseProbeId(UiDriver.GetProbe(s, "id." + nm));
+                    if (id < 0) {
+                        UiDriver.CommandError(s, "clickid " + target + " -> no label, probe id."
+                        + nm + " missing or not a positive integer");
+                        return false;
+                    }
+                }
+            } else {
+                id = UiDriver.ArgI(t, 1, -1);
+            }
+            HitRegion r = UiDriver.FindRegion(s, id);
+            if (r != null) {
+                int cx = r.x + r.width / 2;
+                int cy = r.y + r.height / 2;
+                UiDriver.ClickAt(s, cx, cy, 0);
+                UiDriver.Note(s, "clickid " + target + " -> (" + Convert.ToString(cx)
+                + "," + Convert.ToString(cy) + ")");
+            } else {
+                UiDriver.CommandError(s, "clickid " + target + " -> NOT FOUND");
+                return false;
+            }
+            return true;
+        }
+        if (cmd == "scroll") {
+            UiDriver.Inject(s, 13, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+            0, UiDriver.ArgI(t, 3, 0), 0);
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "char") {
+            UiDriver.Inject(s, 6, 0, 0, 0, UiDriver.ArgI(t, 1, 0), 0);
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "type") {
+            string txt = UiDriver.Unquote(UiDriver.RemainderAfter(trimmed, 1));
+            for (int i = 0; i < txt.Length; i = i + 1) {
+                int b = txt[i];
+                if (b >= 32 && b < 127) { UiDriver.Inject(s, 6, 0, 0, 0, b, 0); }
+            }
+            UiDriver.Note(s, "type \"" + txt + "\"");
+            return true;
+        }
+        if (cmd == "keydown") {
+            UiDriver.Inject(s, 4, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "keyup") {
+            UiDriver.Inject(s, 5, 0, 0, 0, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0));
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "ev") {
+            UiDriver.Inject(s, UiDriver.ArgI(t, 1, 0), UiDriver.ArgI(t, 2, 0),
+            UiDriver.ArgI(t, 3, 0), UiDriver.ArgI(t, 4, 0),
+            UiDriver.ArgI(t, 5, 0), UiDriver.ArgI(t, 6, 0));
+            UiDriver.Note(s, trimmed);
+            return true;
+        }
+        if (cmd == "dump") {
+            UiDriver.DoDump(s, t);
+            return false;
+        }
+        if (cmd == "assert") {
+            UiDriver.DoAssert(s, t, trimmed);
+            return false;
+        }
+        if (cmd == "log") {
+            UiDriver.Note(s, UiDriver.RemainderAfter(trimmed, 1));
+            return false;
+        }
+        if (cmd == "quit") {
+            UiDriver.Note(s, "quit");
+            UiDriver.Finish(s);
+            s.app.window.Close();
+            s.app.isRunning = false;
+            return true;
+        }
+        UiDriver.CommandError(s, "UNKNOWN COMMAND: " + trimmed);
+        return false;
+    }
+    static void ClickAt(UiDriverSession s, int x, int y, int button) {
+        UiDriver.Inject(s, 1, x, y, 0, 0, 0);  // 移动
+        UiDriver.Inject(s, 2, x, y, button, 0, 0);  // 按下
+        UiDriver.Inject(s, 3, x, y, button, 0, 0);  // 释放
+    }
+    static void Inject(UiDriverSession s, int kind, int x, int y, int button, int code, int mods) {
+        s.app.window.InjectEvent(kind, x, y, button, code, mods);
+    }
+    static ControlNode FindInputTarget(string target) {
+        return UiDriver.FindInputTarget(UiDriver.CurrentSession(), target);
+    }
+    static ControlNode FindInputTarget(UiDriverSession s, string target) {
+        bool named = TextUtil.StartsWithOr(target, "@", false);
+        string name = named ? TextUtil.TrimOrEmpty(target.Substring(1)) : "";
+        int id = named ? -1 : UiDriver.ParseProbeId(target);
+        ControlTreeDoc snapshot = UiDriver.TreeSnapshot(s);
+        for (int i = snapshot.inputTargets.Count - 1; i >= 0; i = i - 1) {
+            ControlNode node = snapshot.inputTargets[i];
+            if (named ? node.name == name || node.name.EndsWith(":" + name) : node.id == id) { return node; }
+        }
+        return null;
+    }
+    static HitRegion FindRegion(UiDriverSession s, int id) {
+        int i = s.app.hitTester.RegionCount() - 1;
+        while (i >= 0) {
+            HitRegion r = s.app.hitTester.RegionAt(i);
+            if (r.id == id) { return r; }
+            i = i - 1;
+        }
+        return null;
+    }
+    static HitRegion FindRegionByLabel(UiDriverSession s, string name) {
+        int i = s.app.hitTester.RegionCount() - 1;
+        while (i >= 0) {
+            HitRegion r = s.app.hitTester.RegionAt(i);
+            if (r.label == name || r.label.EndsWith(":" + name)) { return r; }
+            i = i - 1;
+        }
+        return null;
+    }
+    static void DoDump(UiDriverSession s, List<string> t) {
+        if (t.Count < 3) { UiDriver.CommandError(s, "dump: missing args"); return; }
+        string what = t[1];
+        if (what == "hitregions") {
+            string file = t[2];
+            File.WriteAllText(UiDriver.OutPath(s, file), UiDriver.HitRegionsJson(s));
+            UiDriver.Note(s, "dump hitregions -> " + file + " ("
+            + Convert.ToString(s.app.hitTester.RegionCount()) + " regions)");
+            return;
+        }
+        if (what == "tree") {
+            string treeFile = t[2];
+            File.WriteAllText(UiDriver.OutPath(s, treeFile), UiDriver.TreeJson(s));
+            UiDriver.Note(s, "dump tree -> " + treeFile);
+            return;
+        }
+        if (what == "child") {
+            UiDriver.DumpChild(s, t[2]);
+            return;
+        }
+        if (what == "theme") {
+            string file = t[2];
+            File.WriteAllText(UiDriver.OutPath(s, file), UiDriver.ThemeJson(s));
+            UiDriver.Note(s, "dump theme -> " + file);
+            return;
+        }
+        if (what == "pixels") {
+            string file = t[2];
+            string path = UiDriver.OutPath(s, file);
+            int x = 0;
+            int y = s.app.titlebarH;
+            int w = s.app.canvas.Width();
+            int h = s.app.canvas.Height() - y;
+            if (t.Count == 7) {
+                x = UiDriver.ArgI(t, 3, 0);
+                y = UiDriver.ArgI(t, 4, 0);
+                w = UiDriver.ArgI(t, 5, 0);
+                h = UiDriver.ArgI(t, 6, 0);
+            } else if (t.Count != 3) {
+                UiDriver.CommandError(s, "dump pixels: expected file or file x y w h");
+                return;
+            }
+            int bytes = s.app.canvas.WritePixels(path, x, y, w, h);
+            int expected = 24 + w * h * 4;
+            if (bytes < 0 || bytes != expected) {
+                UiDriver.CommandError(s, "dump pixels FAILED -> " + file
+                + " rc=" + Convert.ToString(bytes)
+                + " expected=" + Convert.ToString(expected));
+                return;
+            }
+            File.WriteAllText(path + ".size",
+            Convert.ToString(w) + "x" + Convert.ToString(h));
+            UiDriver.Note(s, "dump pixels -> " + file + " ("
+            + Convert.ToString(w) + "x" + Convert.ToString(h)
+            + " at " + Convert.ToString(x) + ","
+            + Convert.ToString(y) + ")");
+            return;
+        }
+        if (what == "probe") {
+            if (t.Count < 4) { UiDriver.CommandError(s, "dump probe: missing file"); return; }
+            string name = t[2];
+            string file = t[3];
+            File.WriteAllText(UiDriver.OutPath(s, file), UiDriver.GetProbe(s, name));
+            UiDriver.Note(s, "dump probe " + name + " -> " + file);
+            return;
+        }
+        UiDriver.CommandError(s, "dump: unknown target " + what);
+    }
+    // The only open child of the script owner has its own canvas and input root.
+    static void DumpChild(UiDriverSession s, string file) {
+        ChildWindowBase window = null;
+        List<ChildWindowBase> windows = ChildWindows.All();
+        for (int i = 0; i < windows.Count; i = i + 1) {
+            ChildWindowBase candidate = windows[i];
+            if (candidate.parentApp != s.app || !candidate.IsOpen() || candidate.host == null) { continue; }
+            if (window != null) { UiDriver.CommandError(s, "dump child: more than one open child"); return; }
+            window = candidate;
+        }
+        if (window == null) { UiDriver.CommandError(s, "dump child: no open child"); return; }
+        App child = window.host;
+        int width = child.canvas.Width();
+        int height = child.canvas.Height();
+        string path = UiDriver.OutPath(s, file);
+        if (child.canvas.WritePixels(path + ".bin", 0, 0, width, height) != 24 + width * height * 4) {
+            UiDriver.CommandError(s, "dump child: could not write pixels");
+            return;
+        }
+        File.WriteAllText(path + ".json", Json.Serialize<ControlTreeDoc>(UiDriver.TreeSnapshotFor(child, window.View())));
+        File.WriteAllText(path + ".hwnd", Convert.ToString((long)child.window.GetHandle()));
+        UiDriver.Note(s, "dump child -> " + file);
+    }
+    static void DoAssert(UiDriverSession s, List<string> t, string trimmed) {
+        if (t.Count < 5 || t[1] != "probe") {
+            UiDriver.CommandError(s, "assert: bad form: " + trimmed);
+            return;
+        }
+        string name = t[2];
+        string op = t[3];
+        string expect = UiDriver.Unquote(UiDriver.RemainderAfter(trimmed, 4));
+        string val = UiDriver.GetProbe(s, name);
+        bool ok = false;
+        if (op == "contains") { ok = UiDriver.Contains(val, expect); }
+        else if (op == "equals") { ok = (TextUtil.TrimOrEmpty(val) == TextUtil.TrimOrEmpty(expect)); }
+        else { UiDriver.CommandError(s, "assert: unknown op " + op); return; }
+        if (ok) {
+            s.passCount = s.passCount + 1;
+            UiDriver.Note(s, "ASSERT PASS  probe " + name + " " + op + " \"" + expect + "\"");
+        } else {
+            s.failCount = s.failCount + 1;
+            string shown = val;
+            if (shown.Length > 200) { shown = shown.Substring(0, 200) + "..."; }
+            UiDriver.Note(s, "ASSERT FAIL  probe " + name + " " + op + " \"" + expect
+            + "\"  | actual=" + shown);
+        }
+    }
+    static void Finish(UiDriverSession s) {
+        if (s.finished) { return; }
+        s.finished = true;
+        UiDriver.Note(s, "DONE pass=" + Convert.ToString(s.passCount)
+        + " fail=" + Convert.ToString(s.failCount)
+        + " command_errors=" + Convert.ToString(s.commandErrors));
+    }
+    static string HitRegionsJson(UiDriverSession s) {
+        int n = s.app.hitTester.RegionCount();
+        HitRegionsDoc o = new HitRegionsDoc();
+        o.count = n;
+        o.regions = new List<HitRegionDoc>();
+        for (int i = 0; i < n; i = i + 1) {
+            HitRegion r = s.app.hitTester.RegionAt(i);
+            HitRegionDoc doc = new HitRegionDoc();
+            doc.z = i;
+            doc.id = r.id;
+            doc.x = r.x;
+            doc.y = r.y;
+            doc.w = r.width;
+            doc.h = r.height;
+            doc.type = r.widgetType;
+            doc.label = r.label;
+            o.regions.Add(doc);
+        }
+        return Json.Serialize<HitRegionsDoc>(o);
+    }
+    static string TreeJson(UiDriverSession s) { return Json.Serialize<ControlTreeDoc>(UiDriver.TreeSnapshot(s)); }
+    static Control PointerEndpoint(App host, Control hit, Control inputRoot) {
+        if (hit == null || !hit.InputFocusEligible(host, inputRoot)) { return null; }
+        Control node = hit;
+        while (node != null && inputRoot.ContainsInputControl(node)) {
+            if ((node.InputFocusCapabilities() & 1) != 0 || node.HasInputClick()) { return node; }
+            node = node.parent;
+        }
+        return null;
+    }
+    static ControlTreeDoc TreeSnapshot() { return UiDriver.TreeSnapshot(UiDriver.CurrentSession()); }
+    static ControlTreeDoc TreeSnapshot(UiDriverSession s) {
+        return UiDriver.TreeSnapshotFor(s.app, s.app != null ? s.app.AutomationRoot() : null);
+    }
+    static ControlTreeDoc TreeSnapshotFor(App host, Control currentRoot) {
+        ControlTreeDoc o = new ControlTreeDoc();
+        if (currentRoot != null) { o.root = UiDriver.NodeOf(currentRoot); }
+        o.inputTargets = new List<ControlNode>();
+        if (host == null) { return o; }
+        Control popup = host.overlayHost != null ? host.overlayHost.ActiveRoot() : null;
+        Control inputRoot = popup != null ? popup : host.rootControl;
+        if (inputRoot == null) { return o; }
+        Control capture = host.GetCapturedPointer();
+        if (capture != null && !inputRoot.ContainsInputControl(capture)) { capture = null; }
+        List<Control> focusEndpoints = new List<Control>();
+        inputRoot.CollectInputFocus(host, focusEndpoints);
+        List<Control> endpoints = new List<Control>();
+        for (int i = 0; i < focusEndpoints.Count; i = i + 1) {
+            Control endpoint = focusEndpoints[i];
+            if (!endpoints.Contains(endpoint)) { endpoints.Add(endpoint); }
+        }
+        inputRoot.CollectInputClicks(host, inputRoot, endpoints);
+        for (int i = 0; i < endpoints.Count; i = i + 1) {
+            Control endpoint = endpoints[i];
+            ControlNode node = UiDriver.NodeOf(endpoint);
+            node.id = endpoint.WidgetId();
+            node.focused = host.focus.focusedControl == endpoint ? 1 : 0;
+            Control hit = inputRoot.HitTest(endpoint.bx + endpoint.bw / 2,
+            endpoint.by + endpoint.bh / 2, 0);
+            node.pointerHit = endpoint.bw > 0 && endpoint.bh > 0
+            && endpoint.InputFocusEligible(host, inputRoot) && UiDriver.PointerEndpoint(host, hit, inputRoot) == endpoint
+            && (capture == null || capture == endpoint) ? 1 : 0;
+            o.inputTargets.Add(node);
+        }
+        return o;
+    }
+    static ControlNode NodeOf(Control c) {
+        ControlNode n = new ControlNode();
+        n.kind = c.Kind();
+        n.name = c.name;
+        n.visible = 0;
+        if (c.visible) { n.visible = 1; }
+        n.x = c.bx;
+        n.y = c.by;
+        n.w = c.bw;
+        n.h = c.bh;
+        n.prefW = c.prefW;
+        n.prefH = c.prefH;
+        n.kids = new List<ControlNode>();
+        for (int i = 0; i < c.ChildCount(); i = i + 1) {
+            n.kids.Add(UiDriver.NodeOf(c.ChildAt(i)));
+        }
+        return n;
+    }
+    static string ThemeJson(UiDriverSession s) {
+        Theme t = s.app.theme;
+        ThemeDoc o = new ThemeDoc();
+        o.scale = s.app.Scale(1000);
+        o.textPrimary = t.textPrimary;
+        o.textSecondary = t.textSecondary;
+        o.textTertiary = t.textTertiary;
+        o.textDisabled = t.textDisabled;
+        o.bgPrimary = t.bgPrimary;
+        o.bgSecondary = t.bgSecondary;
+        o.bgTertiary = t.bgTertiary;
+        o.borderPrimary = t.borderPrimary;
+        o.borderSecondary = t.borderSecondary;
+        o.divider = t.divider;
+        o.primary = t.primary;
+        o.shadowColor = t.shadowColor;
+        o.borderRadiusSmall = t.borderRadiusSmall;
+        o.borderRadiusMedium = t.borderRadiusMedium;
+        o.borderRadiusLarge = t.borderRadiusLarge;
+        o.borderWidth = t.borderWidth;
+        o.fontSizeTiny = t.fontSizeTiny;
+        o.fontSizeSmall = t.fontSizeSmall;
+        o.fontSizeMedium = t.fontSizeMedium;
+        o.fontSizeLarge = t.fontSizeLarge;
+        o.fontSizeHuge = t.fontSizeHuge;
+        o.heightTiny = t.heightTiny;
+        o.heightSmall = t.heightSmall;
+        o.heightMedium = t.heightMedium;
+        o.heightLarge = t.heightLarge;
+        o.paddingTiny = t.paddingTiny;
+        o.paddingSmall = t.paddingSmall;
+        o.paddingMedium = t.paddingMedium;
+        o.paddingLarge = t.paddingLarge;
+        o.gapSmall = t.gapSmall;
+        o.gapMedium = t.gapMedium;
+        o.gapLarge = t.gapLarge;
+        o.glass = t.glass;
+        o.gradient = t.gradient;
+        o.neu = t.neu;
+        o.brutal = t.brutal;
+        return Json.Serialize<ThemeDoc>(o);
+    }
+    static string JsonBool(bool b) {
+        if (b) { return "true"; }
+        return "false";
+    }
+    static void Note(UiDriverSession s, string msg) {
+        if (s != null && s.resultsPath != null && s.resultsPath != "") {
+            File.AppendAllText(s.resultsPath, msg + "\n");
+        }
+    }
+    static string OutPath(UiDriverSession s, string file) {
+        if (TextUtil.StartsWithOr(file, "/", false) || UiDriver.Contains(file, ":")) { return file; }
+        return s.outDir + "/" + file;
+    }
+    static int ArgI(List<string> t, int idx, int def) {
+        if (idx < 0 || idx >= t.Count) { return def; }
+        return Convert.ToInt32(t[idx]);
+    }
+    static List<string> Tok(string s) {
+        List<string> outp = new List<string>();
+        if (s == null) { return outp; }
+        int len = s.Length;
+        int start = -1;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) {
+                if (start >= 0) {
+                    outp.Add(s.Substring(start, i - start));
+                    start = -1;
+                }
+            } else {
+                if (start < 0) { start = i; }
+            }
+        }
+        if (start >= 0) { outp.Add(s.Substring(start, len - start)); }
+        return outp;
+    }
+    static string RemainderAfter(string s, int count) {
+        if (s == null) { return ""; }
+        int i = 0;
+        int len = s.Length;
+        for (int seen = 0; seen < count && i < len; seen = seen + 1) {
+            while (i < len) {
+                int c = s[i] & 255;
+                if (c == 32 || c == 9) { i = i + 1; } else { break; }
+            }
+            while (i < len) {
+                int c = s[i] & 255;
+                if (c != 32 && c != 9) { i = i + 1; } else { break; }
+            }
+        }
+        while (i < len) {
+            int c = s[i] & 255;
+            if (c == 32 || c == 9) { i = i + 1; } else { break; }
+        }
+        return s.Substring(i, len - i).Trim();
+    }
+    static string Unquote(string s) {
+        if (s == null) { return ""; }
+        string r = s.Trim();
+        if (r.Length >= 2 && (r[0] & 255) == 34 && (r[r.Length - 1] & 255) == 34) {
+            return r.Substring(1, r.Length - 2);
+        }
+        return r;
+    }
+    static bool Contains(string s, string sub) {
+        if (s == null || sub == null) { return false; }
+        if (sub.Length == 0) { return true; }
+        return s.IndexOf(sub, 0) >= 0;
+    }
+    static string JsonEsc(string s) {
+        if (s == null) { return ""; }
+        int len = s.Length;
+        int last = 0;
+        StringBuilder sb = null;
+        for (int i = 0; i < len; i = i + 1) {
+            int b = s[i] & 255;
+            string esc = null;
+            if (b == 34) { esc = "\\\""; }
+            else if (b == 92) { esc = "\\\\"; }
+            else if (b == 10) { esc = "\\n"; }
+            else if (b == 13) { esc = "\\r"; }
+            else if (b == 9) { esc = "\\t"; }
+            else if (b < 32) { esc = " "; }
+            if (esc != null) {
+                if (sb == null) { sb = new StringBuilder(); }
+                if (i > last) { sb.Append(s.Substring(last, i - last)); }
+                sb.Append(esc);
+                last = i + 1;
+            }
+        }
+        if (sb == null) { return s; }
+        if (last < len) { sb.Append(s.Substring(last, len - last)); }
+        return sb.ToString();
+    }
+}

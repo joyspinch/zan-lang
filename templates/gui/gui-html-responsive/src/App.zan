@@ -1,52 +1,145 @@
 using System;
+using System.Collections.Generic;
 using Gui;
 using Gui.Widget;
 
-/* 响应式管理后台 code-behind（B-ID149 窗口即对象：事件 @click 按名接线）：
- * 1. 窗口设计稿 src/{{NAME}}.html 由 Main 运行期投影（内嵌副本发布态优先）；
- * 2. 在 HTML 占位容器（TablePlaceholder）中挂载复杂组件，演示
- *    “声明式骨架 + 代码填充”的规范模式。
- */
+/* {{NAME}}：响应式监控台 —— "声明式骨架 + 代码挂载"范式。
+ *
+ *   - {{NAME}}.html：顶栏 / 侧栏 / 三个页面的骨架与样式，全部 flex + 令牌，没有绝对坐标；
+ *     指标卡用 flex-wrap 折行，窗口变窄自动从一行四张变成两行两张。
+ *   - 本类：导航切页（切 panel 的 Visible）、侧栏收起 / 展开、
+ *     把数据驱动的服务表格构建好后挂进设计稿里的占位槽 TableSlot。
+ *   - ServiceStore（ServiceStore.zan）是数据源，接真实系统只改它。 */
 partial class {{NAME}} : Form {
     static void Main() {
         new {{NAME}}().Show();
     }
-    // 主窗引用：事件处理器用 ui.Ctl("Id") 取设计里的控件。
+    // 主窗引用：处理器里用 ui.Ctl("Id") 取设计稿里的控件。
     static Form ui;
+    static ServiceStore store;
+    static bool sidebarCollapsed;
+    static string filter;
+    static List<string> events;
 
-    /* 在 HTML 占位容器中挂载复杂组件：设计稿留一个空 Panel 槽，
-     * 代码把真正的控件树填进去。 */
     static void OnLoad(Form form) {
         Gui.ThemeSettings.Enable(form.GetApp());
         Gui.Backend.UiDriver.Enable(form.GetApp());
-        ui = form;        Control placeholder = form.Ctl("TablePlaceholder");
-        if (placeholder != null) {
-            Panel tablePanel = Panel.Column();
-            tablePanel.Gap(6);
-            tablePanel.Add(new Label("• 核心服务调度器：正常 (运行时间: 14天 8小时)"));
-            tablePanel.Add(new Label("• 数据库连接池：健康 (活动连接: 12/64)"));
-            tablePanel.Add(new Label("• 缓存中间件命中率：94.2%"));
-            placeholder.Add(tablePanel);
+        ui = form;
+        store = new ServiceStore();
+        sidebarCollapsed = false;
+        filter = "";
+        events = new List<string>();
+        Log("监控台启动，已巡检 " + Convert.ToString(store.Services.Count) + " 个服务");
+        RefreshViews();
+    }
+
+    // ---- 导航 ----
+
+    static void OnNavOverview() { ShowPage("Overview"); }
+    static void OnNavServices() { ShowPage("Services"); }
+    static void OnNavAbout() { ShowPage("About"); }
+
+    static void ShowPage(string page) {
+        List<string> pages = new List<string> { "Overview", "Services", "About" };
+        for (int i = 0; i < pages.Count; i = i + 1) {
+            bool active = pages[i] == page;
+            Control panel = ui.Ctl("Page" + pages[i]);
+            Control nav = ui.Ctl("Nav" + pages[i]);
+            if (panel == null || nav == null) { continue; }
+            panel.Visible = active;
+            // 用 Add/RemoveClass 改类：直接给 Class 赋值会冲掉装载器混入的样式作用域类。
+            nav.RemoveClass(active ? "ghost" : "primary");
+            nav.AddClass(active ? "primary" : "ghost");
         }
+        ui.GetApp().RequestRedraw();
     }
 
-    static void OnAction() {
-        Console.WriteLine("Action executed from HTML button");
+    // 收起后侧栏只剩图标，内容区变宽，指标卡随之重排。
+    static void OnToggleSidebar() {
+        sidebarCollapsed = !sidebarCollapsed;
+        Control sidebar = ui.Ctl("Sidebar");
+        if (sidebar == null) { return; }
+        if (sidebarCollapsed) { sidebar.AddClass("collapsed"); } else { sidebar.RemoveClass("collapsed"); }
+        ((Button)ui.Ctl("NavOverview")).Text = sidebarCollapsed ? "" : "概览";
+        ((Button)ui.Ctl("NavServices")).Text = sidebarCollapsed ? "" : "服务";
+        ((Button)ui.Ctl("NavAbout")).Text = sidebarCollapsed ? "" : "关于";
+        ((Button)ui.Ctl("ToggleSidebar")).Text = sidebarCollapsed ? "展开侧栏" : "收起侧栏";
+        ui.GetApp().RequestRedraw();
     }
 
-    static void OnNavDashboard() {
-        Console.WriteLine("Nav to Dashboard");
+    // ---- 数据 ----
+
+    static void OnRefresh() {
+        store.Refresh();
+        int down = store.Services.Count - store.UpCount();
+        Log(down == 0 ? "巡检完成：全部正常" : "巡检完成：" + Convert.ToString(down) + " 个服务异常");
+        RefreshViews();
     }
 
-    static void OnNavUsers() {
-        Console.WriteLine("Nav to Users");
+    static void OnSearch() {
+        filter = ((Input)ui.Ctl("SearchInput")).GetText().Trim();
+        BuildTable();
+        if (filter != "") { ShowPage("Services"); }
     }
 
-    static void OnNavSettings() {
-        Console.WriteLine("Nav to Settings");
+    static void RefreshViews() {
+        ((Label)ui.Ctl("KpiUp")).Text = Convert.ToString(store.UpCount());
+        ((Label)ui.Ctl("KpiDown")).Text = Convert.ToString(store.Services.Count - store.UpCount());
+        ((Label)ui.Ctl("KpiLatency")).Text = Convert.ToString(store.AverageLatency()) + " ms";
+        ((Label)ui.Ctl("KpiInstances")).Text = Convert.ToString(store.InstanceCount());
+        for (int i = 0; i < 3; i = i + 1) {
+            Label line = (Label)ui.Ctl("Event" + Convert.ToString(i + 1));
+            line.Text = i < events.Count ? events[i] : "";
+        }
+        BuildTable();
     }
 
-    static void OnNavExit() {
-        Console.WriteLine("Nav to Exit");
+    // 构建服务表格并挂进占位槽：每次整表重建（几十行以内足够快）；
+    // 上千行的数据换成 Zan.Gui.DataTable 的 DataGrid（虚拟化、排序、筛选）。
+    static void BuildTable() {
+        Control slot = ui.Ctl("TableSlot");
+        if (slot == null) { return; }
+        slot.RemoveAll();
+        Table table = new Table();
+        table.AddRow(Row(true, "服务", "状态", "延迟", "实例"));
+        int shown = 0;
+        for (int i = 0; i < store.Services.Count; i = i + 1) {
+            ServiceInfo s = store.Services[i];
+            if (filter != "" && s.Name.IndexOf(filter) < 0) { continue; }
+            TableRow row = Row(false, s.Name, s.Up ? "● 在线" : "● 异常",
+                s.Up ? Convert.ToString(s.LatencyMs) + " ms" : "—", Convert.ToString(s.Instances));
+            row.SetStriped(shown % 2 == 1);
+            table.AddRow(row);
+            shown = shown + 1;
+        }
+        slot.Add(table);
+        string summary = "共 " + Convert.ToString(store.Services.Count) + " 个服务";
+        if (filter != "") { summary = summary + "，筛选「" + filter + "」命中 " + Convert.ToString(shown) + " 个"; }
+        ((Label)ui.Ctl("ServiceCount")).Text = summary;
+        ui.GetApp().RequestRedraw();
+    }
+
+    // 一行：首列吃满剩余宽度，其余列定宽，表头与数据行列宽一致。
+    static TableRow Row(bool header, string name, string state, string latency, string instances) {
+        TableRow row = new TableRow(header);
+        TableCell first = new TableCell(name);
+        first.SetProp("style", "flex-grow: 1; min-width: 0;");
+        row.AddCell(first);
+        TableCell status = new TableCell(state);
+        if (!header && status.textLabel != null) {
+            status.textLabel.AddClass(state.IndexOf("在线") >= 0 ? "success" : "error");
+        }
+        status.SetWidth(120);
+        row.AddCell(status);
+        row.AddCell(latency, 120);
+        row.AddCell(instances, 80);
+        return row;
+    }
+
+    // 最近事件：新的在最上面，只留三条。
+    static void Log(string text) {
+        string now = DateTime.Now().ToString().Substring(11);
+        events.Insert(0, now + "  " + text);
+        while (events.Count > 3) { events.RemoveAt(events.Count - 1); }
     }
 }

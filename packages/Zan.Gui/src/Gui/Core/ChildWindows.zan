@@ -4,7 +4,7 @@ using Gui;
 using Gui.Backend;
 namespace Gui;
 internal class ChildWindowManager {
-    internal List<ChildWindow> wins;
+    internal List<ChildWindowBase> wins;
     internal IModalWindow picker;
     internal long routedSeq;
     internal bool routedHandled;
@@ -23,15 +23,25 @@ public class ChildWindows {
         if (state.childWindows == null) { state.childWindows = new ChildWindowManager(); }
         return state.childWindows;
     }
+    // 单帧子窗渲染总预算（毫秒）。0 = 不限（回退到"每帧全画"）。
     public static void SetRenderBudgetMs(int ms) { ChildWindows.Mgr().renderBudgetMs = ms < 0 ? 0 : ms; }
+    // 当前单帧子窗渲染预算（毫秒）。
     public static int RenderBudgetMs() { return ChildWindows.Mgr().renderBudgetMs; }
+    // 单个子窗渲染的耗时告警阈值（毫秒）。0 = 不告警。
     public static void SetSlowRenderWarnMs(int ms) { ChildWindows.Mgr().slowRenderWarnMs = ms < 0 ? 0 : ms; }
+    // 当前耗时告警阈值（毫秒）。
     public static int SlowRenderWarnMs() { return ChildWindows.Mgr().slowRenderWarnMs; }
+    // 接管告警出口（传 null 恢复打控制台）。
     public static void SetSlowRenderSink(Action<string> s) { ChildWindows.Mgr().slowSink = s; }
+    // 最近一次子窗渲染耗时（毫秒）。
     public static int LastRenderMs() { return ChildWindows.Mgr().lastRenderMs; }
+    // 超阈值告警累计次数。
     public static int SlowRenderCount() { return ChildWindows.Mgr().slowRenderCount; }
+    // 最近一帧因预算用尽而推迟的子窗数。
     public static int LastDeferredCount() { return ChildWindows.Mgr().lastDeferred; }
-    static void ReportRenderCost(ChildWindow w, int ms) {
+    // 子窗渲染耗时记账 + 超阈值告警。告警格式与 UiWatchdog 一致，
+    // 同一套 grep 规则就能把"谁把帧堵死了"捞出来。
+    static void ReportRenderCost(ChildWindowBase w, int ms) {
         ChildWindowManager m = ChildWindows.Mgr();
         m.lastRenderMs = ms;
         int warn = m.slowRenderWarnMs;
@@ -44,21 +54,23 @@ public class ChildWindows {
         if (m.slowSink != null) { m.slowSink(msg); return; }
         Console.WriteLine(msg);
     }
-    static List<ChildWindow> All() {
+    // 注册表（惰性创建）。
+    static List<ChildWindowBase> All() {
         ChildWindowManager m = ChildWindows.Mgr();
-        if (m.wins == null) { m.wins = new List<ChildWindow>(); }
+        if (m.wins == null) { m.wins = new List<ChildWindowBase>(); }
         return m.wins;
     }
-    static void Register(ChildWindow w) {
+    // 把窗口加入主循环驱动队列（OpenHost 自动调用）。
+    static void Register(ChildWindowBase w) {
         if (!ChildWindows.All().Contains(w)) {
-            List<ChildWindow> next = new List<ChildWindow>();
-            foreach (ChildWindow current in ChildWindows.All()) { next.Add(current); }
+            List<ChildWindowBase> next = new List<ChildWindowBase>();
+            foreach (ChildWindowBase current in ChildWindows.All()) { next.Add(current); }
             next.Add(w);
             ChildWindows.Mgr().wins = next;
         }
     }
     static void ApplyLanguage(string lang) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (!w.IsOpen()) { continue; }
             w.OnLanguageChanged(lang);
             if (w.host != null) { w.host.SetWindowTitle(w.Title()); }
@@ -73,22 +85,22 @@ public class ChildWindows {
         return true;
     }
     static void Prune() {
-        List<ChildWindow> all = ChildWindows.All();
-        List<ChildWindow> keep = new List<ChildWindow>();
-        foreach (ChildWindow w in all) {
+        List<ChildWindowBase> all = ChildWindows.All();
+        List<ChildWindowBase> keep = new List<ChildWindowBase>();
+        foreach (ChildWindowBase w in all) {
             if (w.IsOpen()) { keep.Add(w); }
             else { w.Teardown(); }
         }
         ChildWindows.Mgr().wins = keep;
     }
     static bool AnyOpen() {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.IsOpen()) { return true; }
         }
         return false;
     }
     static bool Wants() {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.NeedsRedraw()) { return true; }
         }
         if (ChildWindows.AnyPickerWants()) { return true; }
@@ -116,14 +128,14 @@ public class ChildWindows {
         return false;
     }
     static App LoopRoot(App app) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != app || child.parentApp == null) { continue; }
             return ChildWindows.LoopRoot(child.parentApp);
         }
         return app;
     }
     static int LoopDeadline(App parent, int deadline) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.parentApp != parent) { continue; }
             int due = child.host.MinLoopDeadline();
             due = ChildWindows.LoopDeadline(child.host, due);
@@ -132,7 +144,7 @@ public class ChildWindows {
         return deadline;
     }
     static void WakeLoopParent(App childApp) {
-        foreach (ChildWindow child in ChildWindows.All()) {
+        foreach (ChildWindowBase child in ChildWindows.All()) {
             if (!child.IsOpen() || child.host != childApp) { continue; }
             App parent = child.parentApp;
             if (parent != null) { parent.WakeLoopParticipants(); }
@@ -140,8 +152,8 @@ public class ChildWindows {
         }
     }
     static void ServiceLoopParticipants(App parent, int turn, int now) {
-        List<ChildWindow> snapshot = ChildWindows.All();
-        foreach (ChildWindow child in snapshot) {
+        List<ChildWindowBase> snapshot = ChildWindows.All();
+        foreach (ChildWindowBase child in snapshot) {
             if (!child.IsOpen() || child.parentApp != parent) { continue; }
             child.host.SyncSurface();
             child.host.DrainPosts();
@@ -151,7 +163,7 @@ public class ChildWindows {
         }
     }
     static int Deadline(int deadline) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             int a = w.AnimNextMs();
             if (a >= 0 && (deadline < 0 || a < deadline)) { deadline = a; }
             int f = w.FxNextMs();
@@ -190,7 +202,7 @@ public class ChildWindows {
         m.pickers = keep;
     }
     static void TickDue(int now) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.TickInputGestures();
             int a = w.AnimNextMs();
             int f = w.FxNextMs();
@@ -203,7 +215,7 @@ public class ChildWindows {
         if (seq == m.routedSeq) { return m.routedHandled; }
         m.routedSeq = seq;
         m.routedHandled = false;
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.ApplyEvent(hwnd);
                 m.routedHandled = true;
@@ -232,7 +244,7 @@ public class ChildWindows {
         return false;
     }
     static bool PaintForResize(nint hwnd) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             if (w.OwnsWindow(hwnd)) {
                 w.host.SyncSurface();
                 w.Render();
@@ -262,7 +274,7 @@ public class ChildWindows {
     }
     static void PumpChildren() {
         ChildWindowManager m = ChildWindows.Mgr();
-        List<ChildWindow> all = ChildWindows.All();
+        List<ChildWindowBase> all = ChildWindows.All();
         int n = all.Count;
         m.lastDeferred = 0;
         if (n == 0) { return; }
@@ -273,13 +285,13 @@ public class ChildWindows {
         bool deferred = false;
         for (int k = 0; k < n; k = k + 1) {
             int i = (start + k) % n;
-            ChildWindow w = all[i];
+            ChildWindowBase w = all[i];
             if (w == null || !w.IsOpen()) { continue; }
             if (budgetUs > 0 && spentUs >= budgetUs) {
                 m.renderCursor = i;
                 int left = 0;
                 for (int j = k; j < n; j = j + 1) {
-                    ChildWindow rest = all[(start + j) % n];
+                    ChildWindowBase rest = all[(start + j) % n];
                     if (rest != null && rest.IsOpen()) { left = left + 1; }
                 }
                 m.lastDeferred = left;
@@ -298,24 +310,24 @@ public class ChildWindows {
         if (ChildWindows.AnyOpen() || ChildWindows.AnyPickerOpen()) { main.RequestWakeAt(now + 16); }
     }
     static void FollowSkin(int i) {
-        foreach (ChildWindow w in ChildWindows.All()) { w.FollowSkin(i); }
+        foreach (ChildWindowBase w in ChildWindows.All()) { w.FollowSkin(i); }
     }
     static void FollowOpacity(int percent) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowOpacity(percent);
         }
     }
     static void FollowCaptionTips(App main) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowCaptionTips(main);
         }
     }
     static void FollowWallpaper(string path, int opacity) {
-        foreach (ChildWindow w in ChildWindows.All()) {
+        foreach (ChildWindowBase w in ChildWindows.All()) {
             w.FollowWallpaper(path, opacity);
         }
     }
     static void RequestRedrawAll() {
-        foreach (ChildWindow w in ChildWindows.All()) { w.RequestRedraw(); }
+        foreach (ChildWindowBase w in ChildWindows.All()) { w.RequestRedraw(); }
     }
 }

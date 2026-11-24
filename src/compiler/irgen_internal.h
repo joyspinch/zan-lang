@@ -320,6 +320,8 @@ void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8,
                             LLVMBasicBlockRef ret_bb);
 LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v,
                             int is_unsigned);
+LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned);
+LLVMValueRef emit_dbl_string(zan_irgen_t *g, LLVMValueRef v);
 void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta);
 void emit_rt_alloc_add(zan_irgen_t *g, LLVMValueRef bytes);
 LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
@@ -390,6 +392,20 @@ zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
                                int argc, int type_arg_count);
 zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref);
 LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx, unsigned words);
+int list_elem_tag(zan_irgen_t *g, zan_type_t *et);
+unsigned list_elem_bytes(zan_irgen_t *g, zan_type_t *et);
+LLVMTypeRef list_slot_type(zan_irgen_t *g, zan_type_t *et);
+LLVMValueRef list_data_for(zan_irgen_t *g, LLVMValueRef list_ptr, zan_type_t *et,
+                           const char *nm);
+void list_header_init_esz(zan_irgen_t *g, LLVMValueRef list_ptr,
+                          zan_type_t *et);
+LLVMValueRef list_elem_ptr(zan_irgen_t *g, LLVMValueRef data, LLVMValueRef idx,
+                           zan_type_t *et, const char *nm);
+LLVMValueRef list_slot_load_word(zan_irgen_t *g, LLVMValueRef ep,
+                                 zan_type_t *et, const char *nm);
+void list_slot_store_word(zan_irgen_t *g, LLVMValueRef word, LLVMValueRef ep,
+                          zan_type_t *et);
+LLVMValueRef list_load_value(zan_irgen_t *g, zan_type_t *et, LLVMValueRef ep);
 void store_struct_in_slot(zan_irgen_t *g, LLVMValueRef v, LLVMValueRef slot_ptr,
                           zan_ast_node_t *at);
 int type_named(zan_type_t *t, const char *n, int len);
@@ -1007,6 +1023,7 @@ zan_type_t *infer_generic_static_recv_inst(zan_irgen_t *g,
                                            zan_symbol_t *method_sym,
                                            zan_ast_node_t *call,
                                            local_scope_t *locals);
+bool method_recv_is_arg0(zan_symbol_t *msym, zan_ast_node_t *recv_expr);
 bool irgen_is_tree_lambda(zan_irgen_t *g, zan_ast_node_t *expr);
 bool irgen_type_is_tree_target(zan_type_t *t);
 int local_is_lambda_captured(zan_irgen_t *g, local_scope_t *locals,

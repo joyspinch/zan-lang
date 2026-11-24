@@ -239,6 +239,8 @@ if ((is_call_to(expr, "Task", "Spawn") || is_call_to(expr, "Task", "Run")) &&
      * Detach transfers that frame to the scheduler/registry; treating
      * the AST_CALL temp as owned released it through the object header
      * and corrupted the frame allocator prefix (B-ID227). */
+    if (!sub_i8)
+      emit_release_owned_call_temp(g, sub_arg, sub, locals);
     /* Task */
     if (sub_i8)
       return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");

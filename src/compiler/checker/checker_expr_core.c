@@ -873,6 +873,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         if (m->method_decl.return_type) {
           zan_type_t *ret =
               zan_binder_resolve_type(c->binder, m->method_decl.return_type);
+          /* 裸名调用泛型方法带显式类型实参（First<int>(xs)）：返回类型
+           * 要按实参代换，否则 `a + First<int>(xs)` 报 'int' 与 'T'
+           * 不可运算（E2043）。与下方成员调用分支同一口径。 */
+          zan_ast_list_t *tps = &m->method_decl.type_params;
+          int n = expr->call.type_args.count;
+          if (n > 0 && n <= 8 && tps->count == n) {
+            zan_type_t *targs[8] = {NULL};
+            for (int i = 0; i < n; i++)
+              targs[i] = zan_binder_resolve_type(c->binder,
+                                                 expr->call.type_args.items[i]);
+            ret = zan_binder_subst_named(c->binder, ret, tps, targs);
+          }
           no_runtime_warn_arc_return(c, expr, ret);
           return ret;
         }

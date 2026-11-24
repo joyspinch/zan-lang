@@ -26,6 +26,10 @@ unchanged. Make the package visible to zanc through project `packages/`,
   `System.Data.Firebird`, `System.Data.TDengine` (REST), plus the generic
   `OdbcConnector`.
 - `System.Data.Redis` — client and connection pool.
+- `System.Data.Search` — BM25 full-text index (`Bm25Index`) and the
+  CJK-aware `TextTokenizer`, with JSON state export/import. ZanDb collection
+  search and Zan.Ai retrieval build on it. (Moved here from Zan.Text so that
+  Zan.Text no longer depends on Zan.Json.)
 - `System.Data.ZanDb` — embedded pure-Zan document/KV store (no native
   dependencies).
 - `System.Data.Excel` — Xlsx spreadsheet reader.

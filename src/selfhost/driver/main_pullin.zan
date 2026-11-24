@@ -27,6 +27,7 @@ public class PiFile {
     public string ns;            // declared namespace (probe for subdir pull)
     public int hasExt;           // hosts an extension method
     public int hasTest;          // hosts a test declaration
+    public int hasController;    // hosts a controller / route entity
     public int included;         // joins the parse
     public int parsed;           // already appended to the input list
     public PiFile(string p) {
@@ -35,7 +36,7 @@ public class PiFile {
         idents = new List<PiName>();
         usings = new List<string>();
         ns = null;
-        hasExt = 0; hasTest = 0; included = 0; parsed = 0;
+        hasExt = 0; hasTest = 0; hasController = 0; included = 0; parsed = 0;
     }
 }
 
@@ -485,7 +486,11 @@ public partial class Program {
             if ((k == TK.Class() || k == TK.Struct() || k == TK.Enum() || k == TK.Interface())
                     && depth <= 1 && prev != TK.Colon() && prev != TK.Comma()) {
                 if (i + 1 < n && toks[i + 1].kind == TK.Ident()) {
-                    f.top.Add(PiIntern(toks[i + 1].text));
+                    string cname = toks[i + 1].text;
+                    if (cname.EndsWith("Controller") || cname.EndsWith("Dao")) {
+                        f.hasController = 1;
+                    }
+                    f.top.Add(PiIntern(cname));
                     prev = TK.Ident();
                     i = i + 2;
                     continue;
@@ -520,9 +525,22 @@ public partial class Program {
                 i = j + 1;
                 continue;
             }
-            if (k == TK.LBracket() && i + 1 < n && toks[i + 1].kind == TK.Ident()
-                    && toks[i + 1].text == "Test") {
-                f.hasTest = 1;
+            if (k == TK.LBracket() && i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                string aname = toks[i + 1].text;
+                if (aname == "Test") {
+                    f.hasTest = 1;
+                } else if (aname == "Route" || aname == "ApiController" || aname == "Table"
+                        || aname == "Custom" || aname == "HttpGet" || aname == "HttpPost"
+                        || aname == "HttpPut" || aname == "HttpDelete" || aname == "HttpPatch") {
+                    f.hasController = 1;
+                }
+                // a [Table] entity's synthesized recv.<Entity> accessor
+                // lowers to new BaseRepository<E>(ZanSql.FromConnection(c))
+                // (the C host's pi_scan_file does the same)
+                if (aname == "Table") {
+                    f.idents.Add(PiIntern("BaseRepository"));
+                    f.idents.Add(PiIntern("ZanSql"));
+                }
             }
             if (k == TK.This()) {
                 // Extension-declaration shape: `( this Type name` -- `this`
@@ -541,6 +559,11 @@ public partial class Program {
                 continue;
             }
             if (k == TK.Ident()) {
+                if (prev == TK.Colon()) {
+                    if (t.text.EndsWith("Controller") || t.text == "BaseRepository" || t.text == "BaseDao") {
+                        f.hasController = 1;
+                    }
+                }
                 // `record Name(...)` lowers to a class; the name is the next
                 // identifier, and 'record' itself is a contextual keyword.
                 if (t.text == "record" && depth <= 1 && i + 1 < n
@@ -686,6 +709,17 @@ public partial class Program {
                             // `.WhenAll`/`.WhenAny`. Kept as a shape-only
                             // check, independent of whether `Task` sits
                             // under a namespace root.
+                            // `[Table]` on a user entity: its synthesized
+                            // recv.<Entity> accessor lowers to
+                            // new BaseRepository<E>(ZanSql.FromConnection(c)),
+                            // names the source never spells (the C host
+                            // seeds them from the class's attributes)
+                            if (t.text == "Table" && prev == TK.LBracket()) {
+                                PiName br = PiIntern("BaseRepository");
+                                br.flagged = 1;
+                                PiName zs = PiIntern("ZanSql");
+                                zs.flagged = 1;
+                            }
                             if (t.text == "Task" && i + 1 < n && toks[i + 1].kind == TK.Dot()
                                     && i + 2 < n && toks[i + 2].kind == TK.Ident()
                                     && (toks[i + 2].text == "WhenAll" || toks[i + 2].text == "WhenAny")) {
@@ -925,8 +959,8 @@ public partial class Program {
             while (i < d.files.Count) {
                 PiFile f = d.files[i];
                 if (f.included == 0) {
-                    int hit = allSources || f.hasExt == 1 || f.hasTest == 1 ? 1 : 0;
-                    string why = allSources ? "unfiltered" : (f.hasExt == 1 ? "ext" : (f.hasTest == 1 ? "test" : ""));
+                    int hit = allSources || f.hasExt == 1 || f.hasTest == 1 || f.hasController == 1 ? 1 : 0;
+                    string why = allSources ? "unfiltered" : (f.hasExt == 1 ? "ext" : (f.hasTest == 1 ? "test" : (f.hasController == 1 ? "controller" : "")));
                     int kk = 0;
                     while (hit == 0 && kk < f.top.Count) {
                         if (f.top[kk].flagged == 1) { hit = 1; why = f.top[kk].str; break; }

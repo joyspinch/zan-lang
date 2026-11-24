@@ -1,15 +1,13 @@
 using System;
 using System.Collections.Generic;
 namespace Gui;
+// 按 kind 名构造控件（HTML 标签、设计文档反序列化、Html.Clone、FormBuilder）。
+// 名单来自编译器合成的控件目录 __ZanControlCatalog（B-ID172，见
+// docs/GUI_CONTROL_CATALOG.md）：编译图里每个继承 Gui.Control、可无参构造的
+// 非抽象类按类名入目录，[ControlKind] 声明别名与泛型闭合类型；包清单的
+// catalog 键决定哪些命名空间在按名构造时整体拉入。Register 只留给运行期
+// 动态组件（如用户组件），优先于目录。
 public class ControlFactory {
-    [GuiKindManifest("has")]
-    private static extern bool HasManifest(string kind);
-    [GuiKindManifest("kinds")]
-    private static extern void ManifestKinds(List<string> outKinds);
-    [GuiKindManifest("create")]
-    private static extern Control CreateManifest(string kind);
-    [GuiKindManifest("createLower")]
-    private static extern Control CreateManifestLower(string kind);
     public static void Register(string kind, ControlFactoryFn fn) {
         GuiCoreState state = GuiCoreState.Current();
         if (state.controlFactoryRegistry == null) {
@@ -19,46 +17,70 @@ public class ControlFactory {
         if (!state.controlFactoryRegistry.ContainsKey(kind)) { state.controlFactoryKinds.Add(kind); }
         state.controlFactoryRegistry[kind] = fn;
     }
+
+    // kind 可按名构造（运行期注册或编译期目录；大小写敏感）。
     public static bool Has(string kind) {
         if (kind == null || kind == "") { return false; }
         Dict<string, ControlFactoryFn> registry = GuiCoreState.Current().controlFactoryRegistry;
         if (registry != null && registry.ContainsKey(kind)) { return true; }
-        return HasManifest(kind);
+        return CatalogKinds().Contains(kind);
     }
+
+    // 全部可按名构造的 kind：运行期注册在前，目录在后，去重。
     public static List<string> Kinds() {
-        List<string> outp = new List<string>();
-        ManifestKinds(outp);
-        List<string> registeredKinds = GuiCoreState.Current().controlFactoryKinds;
-        if (registeredKinds == null || registeredKinds.Count == 0) {
-            return outp;
-        }
-        for (int i = 0; i < registeredKinds.Count; i = i + 1) {
-            string rk = registeredKinds[i];
-            if (!outp.Contains(rk)) { outp.Add(rk); }
-        }
-        return outp;
-    }
-    public static Control Create(string kind) {
-        if (kind == null || kind == "") { return null; }
         GuiCoreState state = GuiCoreState.Current();
         Dict<string, ControlFactoryFn> registry = state.controlFactoryRegistry;
+        List<string> registeredKinds = state.controlFactoryKinds;
+        List<string> all = new List<string>();
+        if (registeredKinds != null) {
+            for (int i = 0; i < registeredKinds.Count; i = i + 1) { all.Add(registeredKinds[i]); }
+        }
+        List<string> cat = CatalogKinds();
+        for (int i = 0; i < cat.Count; i = i + 1) {
+            if (registry == null || !registry.ContainsKey(cat[i])) { all.Add(cat[i]); }
+        }
+        return all;
+    }
+
+    // 未知 kind 返回 null（HTML 装载据此回落为通用 Element）。
+    // 先精确匹配，再大小写不敏感匹配。
+    public static Control Create(string kind) {
+        if (kind == null || kind == "") { return null; }
+        Control c = CreateExact(kind);
+        if (c != null) { return c; }
+        string lk = kind.ToLower();
+        List<string> all = Kinds();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i] != kind && all[i].ToLower() == lk) { return CreateExact(all[i]); }
+        }
+        return null;
+    }
+
+    // 必须命中的按名构造（设计文档、克隆）：未命中抛出，消息指明 kind
+    // 不在编译图的控件目录里（未被引用的包/命名空间不会进目录）。
+    public static Control Require(string kind) {
+        Control c = Create(kind);
+        if (c == null) {
+            throw new Exception("ControlFactory: unknown control kind '" + kind
+                + "' (not in the compiled control catalog; reference its namespace or register it)");
+        }
+        return c;
+    }
+
+    private static Control CreateExact(string kind) {
+        Dict<string, ControlFactoryFn> registry = GuiCoreState.Current().controlFactoryRegistry;
         if (registry != null && registry.ContainsKey(kind)) {
             ControlFactoryFn fn = registry[kind];
             return fn != null ? fn(kind) : null;
         }
-        Control direct = CreateManifest(kind);
-        if (direct != null) { return direct; }
-        string lk = kind.ToLower();
-        List<string> registeredKinds = state.controlFactoryKinds;
-        if (registeredKinds != null) {
-            for (int i = 0; i < registeredKinds.Count; i = i + 1) {
-                string reg = registeredKinds[i];
-                if (reg.ToLower() == lk) {
-                    ControlFactoryFn fn = registry[reg];
-                    return fn != null ? fn(reg) : null;
-                }
-            }
+        return __ZanControlCatalog.Create(kind);
+    }
+
+    private static List<string> CatalogKinds() {
+        GuiCoreState state = GuiCoreState.Current();
+        if (state.controlFactoryCatalogKinds == null) {
+            state.controlFactoryCatalogKinds = __ZanControlCatalog.Kinds();
         }
-        return CreateManifestLower(lk);
+        return state.controlFactoryCatalogKinds;
     }
 }

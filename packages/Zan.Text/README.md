@@ -3,6 +3,9 @@
 文本处理（纯 Zan，无原生依赖）。`using System.Text;` /
 `using System.Text.RegularExpressions;` / `using System.Text.Html;` 按需拉入，
 命名空间保留零破坏。
+BM25 全文检索与分词器（`Bm25Index` / `TextTokenizer`）已移到 Zan.Data 的
+`System.Data.Search`：它们靠 `System.Json` 持久化状态，留在本包会让
+Zan.Text 与 Zan.Json 互相依赖。
 
 ## 内容（stdlib/System/Text 迁入，Encoding 留 stdlib）
 
@@ -10,7 +13,6 @@
 |---|---|
 | `Markdown.zan` | Markdown → HTML 渲染 |
 | `Pinyin.zan` | 汉字转拼音（`data/pinyin.txt` 数据表） |
-| `Bm25Index.zan` | BM25 全文检索 |
 | `Fuzzy.zan` | 模糊匹配 |
 | `Template.zan` | 文本模板（占位符展开） |
 | `TextTable.zan` | 等宽文本表格 |

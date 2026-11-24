@@ -38,6 +38,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>  /* _NSGetExecutablePath：zan_exe_dir_into */
+#endif
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>

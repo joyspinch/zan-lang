@@ -84,6 +84,63 @@ acquire 无锁读，写方锁内原子更新。另：对比基准务必用干净
 锁本身之外还要看锁里做什么：协程任务登记表在全局自旋锁下按帧指针**线性**查找，
 O(活跃协程数) × 每次创建/销毁，并发越高越慢；自旋时间算在调用方自身采样里（如
 `zan_task_child`），sample 里看不到 mutexwait，要看调用方 self time 异常高。
+**并发翻倍吞吐反降**（list 32 连接 4.1k < 8 连接 9.7k）就是这类"代价随在途量涨"的信号：
+编译器在**每个异步帧完成**处插 `zan_timer_cancel_delay`，它曾持全局定时器锁全堆扫描+重建；
+连接池排队时每次门等挂 250 ms 看门狗，堆常驻上千条 → 每次帧完成扫上千条。改帧索引后
+32 连接 4.1k → 8.3k。同轮第二例：`co_run` 每步末尾只要有非 worker 线程在 `co_ext_wait`
+（服务端主线程终身在等根任务）就拿锁广播；改成只在刚跑的帧正是被等的帧时广播。排查法：
+对 `zan_` 运行时入口按"每步/每帧完成/每次 await 都会调"过一遍，凡在锁里做 O(n) 或
+无条件拿锁的都是嫌疑；用"并发 ×1 与 ×4"两档对比暴露。
+
+**测试自身的数据竞争也会表现成"运行时偶发挂死/崩溃"**（2026-11-23 两例）：M:N 调度下
+同一程序里的多个协程跑在不同 OS 线程上，`static int done; done = done + 1` 会丢更新
+（`while (done < 4)` 永远转，tdengine_pool ~5% 挂死）；共享 `List.Add` 并发扩容会空指针
+（db_pool CloseWakesWaiters ~15% SIGSEGV）。先在原运行时上复现（A/B 同样失败即非回归），
+再加探针打印卡住时的计数——"服务端全部应答了、计数却差 1"即丢更新。修法：`AtomicInt`
+计数、`lock (list) { ... }` 包住共享集合写。
+
+### 多路复用尾延迟：请求/应答头里互打单调时钟戳拆单程，再看读循环是停泊还是积压（h2 实测，2026-11-23）
+
+单连接多流 p99 远高于单流、服务端各阶段（派发→处理→发送）计时又都不慢时，延迟在两端
+之间。同机两进程的 `Stopwatch.GetMicroseconds()` 是同一单调钟：客户端在请求头塞发出时刻、
+服务端在应答头塞发出时刻，各自在对端收到处比对，直接得出慢的是哪个方向。再在读循环里记
+"读到这一帧前等了多久"：等得久 = 停泊没被唤醒（查运行时唤醒）；几乎没等 = **串行读循环积压**，
+帧在套接字里排队。本仓库实测是后者：`ReadExactAsync` 以 `FillTo(count)` 每次只收恰好 count
+字节（帧头 9 字节、载荷各一次接收），加上客户端每个 DATA 帧回一个 WINDOW_UPDATE、服务端
+HEADERS 与 DATA 分两次发——修后 8×8 p99 59 → 13 ms。探针只在一次性构建里加，别带进提交。
+
+### 压测数字低：先剖析**客户端**——标准库客户端自己就可能是瓶颈（协议压测实测，2026-11-23）
+
+压测端也是 Zan 写的、走标准库客户端时，数字同时量的是客户端。两例：WebSocket 回显只有
+HTTP/1.1 的 1/3，`sample` 压测端进程，top-of-stack 是 `__read_nocancel`/`__open_nocancel`——
+每帧 4 字节掩码经 `RandomNumberGenerator.Fill`，POSIX 实现每次 `fopen` + stdio 整块缓冲
+`fread` + `fclose` /dev/urandom（修后 4.6k → 15.6k msg/s）；h2 客户端等流完成用
+`Task.Delay(2)` 轮询，单流每请求 ≥2 ms 底（改等流的门后 3.0k → 15.7k rps）。判据：
+单连接延迟远高于同机 HTTP/1.1 裸套接字客户端，且服务端 CPU 大半在 kevent 空等。排查：
+`grep -n "Task.Delay" ` 查客户端等待循环；每消息调用链上找 open/read 系统调用。另：
+`sample` 时别在同一 shell 里裸 `wait`（会连服务端一起等），只 `wait` 采样作业的 PID。
+
+### 同步上下文 `await` 每次 ~1ms、有定时器在途时卡到定时器截止：worker 停泊收不到唤醒（rt_io_co_sched 实测，2026-11-23）
+
+M:N 调度器 worker 空闲停泊必须阻塞在**可被 `co_notify` 叫醒**的原语上：POSIX 是本分片
+kqueue/epoll（wake fd 登记其中），Windows 是 IOCP。曾在无登记 I/O 时退化成裸
+`nanosleep(下一个定时器截止)`——主线程注入的任务要等定时器到期才被取走（Delay(60000)
+在途时同步 await 像挂死 60s）；空闲判停的观察窗口用 `Sleep(1)` 同理。非 worker 线程
+`zan_co_sched_run_until` 等 DONE 用 `Sleep(1)` 轮询，每个 await 固定 ~1ms，现改条件变量
+（`co_run` 每步后有登记等待者才广播）。最小探针：主线程循环 100 次 await 两层 async，
+起 0/4/32 个 `Task.Delay` 后台协程，应都在 ~1ms 量级且与定时器无关。另：任何"唤醒在途"
+计数（曾有 `g_co_wake`）都会漂——改认领式（CAS `w->parked` 1→0 再写它的 wake fd）。
+池重启计数 `g_co_pool_out` 不可在建线程后整体改写（先起的 worker 可能已 retire 扣过），
+否则池子标着 live 却无线程：lldb 看 `g_co_pool_live=1 g_co_pool_out>0 g_inj_len>0` 且无 worker 线程即此症。
+
+### `[DllImport]` 绑定变参 C 函数（fcntl/ioctl/open/printf…）：Apple arm64 上静默错参（套接字阻塞实测，2026-11-23）
+
+Apple arm64 ABI 的变参一律走栈；按普通 N 参 extern 声明调用时实参放在寄存器里，被调方
+从栈上读到垃圾。`fcntl(fd, F_SETFL, flags|O_NONBLOCK)` 照样返回 0，`O_NONBLOCK` 却没设上——
+x86-64/Linux 上同样写法恰好能跑，所以只在 macOS/iOS arm64 现形。症状绕得很远：监听套接字
+阻塞 accept 卡死一个调度 worker → 它负责的 IO 分片事件无人收割 → keep-alive 连接 1/4 的后续
+请求永不应答。判据：调用后用无变参的 `F_GETFL` 读回校验。修法：变参函数只经运行时 C 包装
+调用（如 `zan_io_set_nonblocking`），Zan 侧绝不直接 DllImport 变参 libc 函数。
 
 ### Crashes with no symbolized stack (the `0xC0000005` ritual)
 
