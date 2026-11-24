@@ -65,15 +65,21 @@ partial class Irgen {
                 continue;
             }
             string preg = AddLocal(pn[j], pt[j]);
+            bool borrowed = false;
             if (ShouldBox(pn[j])) {
                 // a closure in this method may capture the parameter: it has
                 // to live in a cell
                 preg = BoxLocal(locName.Count - 1);
             } else {
+                // a string parameter the body never reassigns is a borrow,
+                // as in the C host (no retain on entry, no release on exit):
+                // the caller may hand a raw nint buffer to a string slot
+                borrowed = BorrowedStrParam(pt[j], pn[j], m.d);
+                if (borrowed) { locRef[locName.Count - 1] = true; }
                 EA(preg, lt);
             }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
-            EmitArcRetain("%p" + j, pt[j]);
+            if (!borrowed) { EmitArcRetain("%p" + j, pt[j]); }
             j = j + 1;
         }
         if (m.d != null) { GenStmt(m.d); }
@@ -136,13 +142,17 @@ partial class Irgen {
                 continue;
             }
             string preg = AddLocal(pn[j], pt[j]);
+            bool borrowed = false;
             if (ShouldBox(pn[j])) {
                 preg = BoxLocal(locName.Count - 1);
             } else {
+                // an unassigned string parameter is a borrow (see GenMethod)
+                borrowed = BorrowedStrParam(pt[j], pn[j], m.d);
+                if (borrowed) { locRef[locName.Count - 1] = true; }
                 EA(preg, lt);
             }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
-            EmitArcRetain("%p" + j, pt[j]);
+            if (!borrowed) { EmitArcRetain("%p" + j, pt[j]); }
             j = j + 1;
         }
         // Constructor chaining and the field initializers (C# order):
@@ -528,5 +538,29 @@ partial class Irgen {
         obody.Append(entryAllocas.ToString());
         obody.Append(body.ToString());
         body = obody; entryAllocas = oea; eaActive = oact;
+    }
+
+    // A string parameter the body never writes: borrowed for the call.
+    bool BorrowedStrParam(Node ty, string name, Node body) {
+        if (ty == null || ty.ival != 0 || !IsStr(ty) || body == null) { return false; }
+        return !WritesName(body, name);
+    }
+
+    // Does the subtree assign `name` (plain or compound assignment, or a
+    // ref/out argument)? Conservative: any write anywhere counts, including
+    // one to a shadowing local of the same name.
+    bool WritesName(Node n, string name) {
+        if (n == null) { return false; }
+        if ((n.kind == AK.Assignment() || n.kind == AK.OutArg()) && n.a != null
+            && n.a.kind == AK.Ident() && n.a.sval == name) { return true; }
+        if (WritesName(n.a, name) || WritesName(n.b, name) || WritesName(n.c, name) || WritesName(n.d, name)) { return true; }
+        if (n.kids != null) {
+            int i = 0;
+            while (i < n.kids.Count) {
+                if (WritesName(n.kids[i], name)) { return true; }
+                i = i + 1;
+            }
+        }
+        return false;
     }
 }

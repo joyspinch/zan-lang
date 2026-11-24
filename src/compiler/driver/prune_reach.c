@@ -286,6 +286,14 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     case AST_CLASS_DECL:
     case AST_STRUCT_DECL:
     case AST_INTERFACE_DECL:
+        /* A [Table] entity may be reached through a synthesized
+         * `recv.<Entity>` accessor whose fallback lowers to
+         * new BaseRepository<E>(ZanSql.FromConnection(conn))
+         * (checker_try_entity_accessor): names no source spells. */
+        if (n->kind == AST_CLASS_DECL && zan_ast_has_attr(n, "Table")) {
+            pi_flag_ident(NULL, "BaseRepository", 14);
+            pi_flag_ident(NULL, "ZanSql", 6);
+        }
         pi_seed_list(&n->type_decl.bases);
         pi_seed_list(&n->type_decl.members);
         if (n->type_decl.where_clauses)

@@ -293,6 +293,20 @@ partial class Irgen {
 
     /// The cooperative scheduler main loop (zan_co_sched_run / zan_co_sched_run_until).
     void EmitAsyncSchedRun() {
+        // the runtime timer heap (rt_timer.o); weak no-op fallbacks when the
+        // program links without it -- a strong definition wins at link time
+        string[] tnames = new string[] { "zan_timer_dispatch_due", "zan_timer_next_timeout", "zan_timer_pending" };
+        string[] tvals = new string[] { "0", "-1", "0" };
+        int ti = 0;
+        while (ti < 3) {
+            if (!ExternSeen(tnames[ti])) {
+                externDecls.Add(tnames[ti]);
+                H("define weak i64 @" + tnames[ti] + "() {");
+                H("  ret i64 " + tvals[ti]);
+                H("}");
+            }
+            ti = ti + 1;
+        }
         H("define weak void @zan_co_sched_run_until(i32* %done) {");
         H("entry:");
         H("  %a.best = alloca i8*");
@@ -344,7 +358,15 @@ partial class Irgen {
         H("  %dv2 = load i32, i32* %done");
         H("  %disd2 = icmp ne i32 %dv2, 0");
         H("  br i1 %disd2, label %exit, label %tcheck");
+        // The C runtime's timer heap (zan_timer_after_ctx: Gate.Wait(ms)
+        // timeouts, Timer callbacks) is serviced here as the host scheduler
+        // does: dispatch what is due, and keep running while any is live.
         H("tcheck:");
+        H("  %rtd = call i64 @zan_timer_dispatch_due()");
+        H("  %rthead = load i8*, i8** @co_head");
+        H("  %rtready = icmp ne i8* %rthead, null");
+        H("  br i1 %rtready, label %loop, label %tcheck2");
+        H("tcheck2:");
         H("  %t0 = load i8*, i8** @co_timers");
         H("  %te = icmp eq i8* %t0, null");
         H("  br i1 %te, label %iopump, label %scansetup");
@@ -397,7 +419,12 @@ partial class Irgen {
         H("  br i1 %duenow, label %timerdue, label %timerwait");
         H("timerwait:");
         H("  %remaining = sub i64 %bestdued, %nowd");
-        H("  call i32 @zan_io_pump_timeout(i64 %remaining)");
+        H("  %rtn = call i64 @zan_timer_next_timeout()");
+        H("  %rtpos = icmp sge i64 %rtn, 0");
+        H("  %rtlt = icmp slt i64 %rtn, %remaining");
+        H("  %rtuse = and i1 %rtpos, %rtlt");
+        H("  %waitms = select i1 %rtuse, i64 %rtn, i64 %remaining");
+        H("  call i32 @zan_io_pump_timeout(i64 %waitms)");
         H("  br label %loop");
         H("timerdue:");
         H("  %bestp2 = bitcast i8* %best to %co_timer*");
@@ -424,6 +451,17 @@ partial class Irgen {
         H("  call void @free(i8* %best)");
         H("  br label %loop");
         H("iopump:");
+        H("  %rtlive = call i64 @zan_timer_pending()");
+        H("  %rthas = icmp sgt i64 %rtlive, 0");
+        H("  br i1 %rthas, label %rtwait, label %iopump2");
+        H("rtwait:");
+        H("  %rtn2 = call i64 @zan_timer_next_timeout()");
+        // a live entry with no deadline yet (-1): poll again shortly
+        H("  %rtn2neg = icmp slt i64 %rtn2, 0");
+        H("  %rtwaitms = select i1 %rtn2neg, i64 1, i64 %rtn2");
+        H("  call i32 @zan_io_pump_timeout(i64 %rtwaitms)");
+        H("  br label %loop");
+        H("iopump2:");
         H("  %woke = call i32 @zan_io_pump()");
         H("  %iomore = icmp sgt i32 %woke, 0");
         H("  br i1 %iomore, label %loop, label %exit");

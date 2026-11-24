@@ -637,7 +637,17 @@ partial class Irgen {
             int lmatch = NL();
             int lnext = NL();
             string cmp = NT();
-            L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+            // A generic class also has per-instantiation vtables (B-ID218,
+            // `C__SPI_<args>_vtable`) that only exist once every body has
+            // been generated: the tag is tested against the whole family by
+            // a predicate defined at the end of the module.
+            bool family = TParams(candCls).Count > 0;
+            if (family) {
+                NoteVtFamily(candCls.sval);
+                L("  " + cmp + " = call i1 @zvt_family_" + candCls.sval + "(i8* " + tag + ")");
+            } else {
+                L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+            }
             L("  br i1 " + cmp + ", label %L" + lmatch + ", label %L" + lnext);
             Label(lmatch);
 
@@ -650,11 +660,27 @@ partial class Irgen {
                 ai = ai + 1;
             }
             string demand = StaticDispatchMarker(candCls, candMeth, MethodSym(impl, candMeth));
+            // the instantiation's own slot (its specialized clone) when the
+            // slot keeps the implementation's signature; else the shared body
+            string callee = "@" + MethodSym(impl, candMeth);
+            int fslot = family ? FamilySlot(candCls, candMeth, impl) : -1;
+            if (fslot >= 0) {
+                string vt = NT();
+                L("  " + vt + " = bitcast i8* " + tag + " to i8**");
+                string fp = NT();
+                L("  " + fp + " = getelementptr i8*, i8** " + vt + ", i64 " + fslot);
+                string fraw = NT();
+                L("  " + fraw + " = load i8*, i8** " + fp);
+                string fn = NT();
+                L("  " + fn + " = bitcast i8* " + fraw + " to " + MethodFnTypeThis(candMeth, impl));
+                callee = fn;
+                demand = "";
+            }
             if (isVoid) {
-                L("  call void @" + MethodSym(impl, candMeth) + "(" + callArgs + ")" + demand);
+                L("  call void " + callee + "(" + callArgs + ")" + demand);
             } else {
                 string callRes = NT();
-                L("  " + callRes + " = call " + rt + " @" + MethodSym(impl, candMeth) + "(" + callArgs + ")" + demand);
+                L("  " + callRes + " = call " + rt + " " + callee + "(" + callArgs + ")" + demand);
                 L("  store " + rt + " " + callRes + ", " + rt + "* " + resSlot);
             }
             L("  br label %L" + lend);
@@ -780,4 +806,66 @@ partial class Irgen {
         return retTy;
     }
 
+    // ---- generic vtable families (interface dispatch tag chain) ----
+    List<string> vtFamilies = new List<string>();
+
+    void NoteVtFamily(string cls) {
+        int i = 0;
+        while (i < vtFamilies.Count) { if (vtFamilies[i] == cls) { return; } i = i + 1; }
+        vtFamilies.Add(cls);
+    }
+
+    // the slot of `impl`'s method in cls's vtable when the slot's function
+    // has the implementation's own signature (no ABI adapter), else -1
+    int FamilySlot(Node cls, Node im, string impl) {
+        List<Node> ms = new List<Node>();
+        CollectVSlotNodes(cls, ms);
+        int i = 0;
+        while (i < ms.Count) {
+            Node sm = ms[i];
+            if (FindVSlotImpl(cls, sm) == im) {
+                if (IsAsync(sm) || DeclOwnerOf(cls, im) != impl) { return -1; }
+                string slotOwner = DeclOwnerOf(cls, sm);
+                if (MapTypeDecl(sm.type, slotOwner) != MapTypeDecl(im.type, impl)) { return -1; }
+                int pi = 0;
+                while (pi < MethodParamCount(sm)) {
+                    if (MapTypeDecl(ParamTypeNode(sm, pi), slotOwner) != MapTypeDecl(ParamTypeNode(im, pi), impl)) { return -1; }
+                    pi = pi + 1;
+                }
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // one predicate per generic class the tag chains test: its shared
+    // vtable plus every per-instantiation table the module ended up with
+    void EmitVtFamilies() {
+        int f = 0;
+        while (f < vtFamilies.Count) {
+            string cls = vtFamilies[f];
+            Node cd = binder.FindType(cls);
+            List<string> vslots = new List<string>();
+            CollectVSlots(cd, vslots);
+            string ty = "[" + vslots.Count + " x i8*]";
+            H("define internal i1 @zvt_family_" + cls + "(i8* %tag) {");
+            H("entry:");
+            H("  %m0 = icmp eq i8* %tag, bitcast (" + ty + "* @" + cls + "_vtable to i8*)");
+            string acc = "%m0";
+            int k = 0; int n = 1;
+            while (k < specVtSyms.Count) {
+                if (specVtCls[k] != null && specVtCls[k].sval == cls) {
+                    H("  %m" + n + " = icmp eq i8* %tag, bitcast (" + ty + "* @" + specVtSyms[k] + " to i8*)");
+                    H("  %o" + n + " = or i1 " + acc + ", %m" + n);
+                    acc = "%o" + n;
+                    n = n + 1;
+                }
+                k = k + 1;
+            }
+            H("  ret i1 " + acc);
+            H("}");
+            f = f + 1;
+        }
+    }
 }

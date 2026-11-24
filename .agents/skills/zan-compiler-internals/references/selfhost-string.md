@@ -117,3 +117,19 @@ h.IndexOf("CD")=-1  h.LastIndexOf("C")=-1  h.EndsWith("CD")=0
 - string 现参与 ARC；fresh producer 通过 OwnedString/AddTemp 登记，赋值先 retain 新值再替换并释放旧值。AddTemp 只去重当前 live 的同 operand，不可把跨 statement 的历史登记当 live。
 - 循环条件分支的 temp 槽释放必须先清 null，避免下轮死臂再次消费旧指针。异步返回先独立 retain/store result，再消费 statement temps；只验证值正确不能证明临时量闭账。
 - 2026-11-11 durable string 11 组在 gen1 `ebe2ded3d5aa19596d3f47785bc030f3ef2a0fab8f6378a79ca2ad13ce333f4e` 实测 134 allocation/134 free，各组 live blocks/bytes 与 bad free 均 0；包含 alias、return、容器、转换/NUL、异常、object 动态所有权及跨 Yield。观测只覆盖生成模块分配，不含 runtime 内部，也不证明所有 API 或并发分配。nullable await 临时实参的独立修补需单独验收。
+
+## 8. string 槽里不一定是托管串（2026-11-23，Mac selfhost_diff 实测）
+
+- 包源码把 `byte[]` 直接传给 `string` 形参/字段（`new FbReader(b.Data(), n)`），
+  也把裸 `nint` 缓冲区传给 `string` 形参（`WriteRaw(buf.Raw(), n)`）。
+  数组的 payload-8 是**长度**而不是 magic，通用 `zretain/zrelease` 会把它当
+  对象，rc 归零时去调 payload-8 处的"析构器"→ SIGBUS。
+- 静态类型为 `string` 的 retain/release 一律走 `zstrv_retain/zstrv_release`：
+  有 magic → `zstr_*`，否则按数组 `zarr_*` 计数。类析构里的 string 字段同样走
+  `zstrv_release`。
+- 裸 `nint` 无法与数组区分，靠**借用形参**规避：方法体从不写入的 `string`
+  形参（`BorrowedStrParam`）不在入口 retain、不在出口 release（标 locRef，
+  不 arm），与 C 宿主"形参借用"一致。被赋值/ref/out 的形参保持旧的拥有语义。
+- 同类教训：数组引用凡是被**容器或闭包持有**都要显式 `zarr_retain`——
+  `ArcManaged()` 对数组返回 false。已补：List/Dictionary 槽（所有权 kind 3）、
+  struct 拷贝的数组字段、lambda env 捕获的数组。新增持有点时先查这一条。

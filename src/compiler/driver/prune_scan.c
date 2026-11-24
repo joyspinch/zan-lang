@@ -485,6 +485,15 @@ static void pi_scan_file(pi_file_t *f) {
                         (next.str_val.len == 4 && memcmp(next.str_val.str, "Test", 4) == 0)) {
                         f->has_controller = 1;
                     }
+                    /* A [Table] entity may be reached through a synthesized
+                     * `recv.<Entity>` accessor (checker_try_entity_accessor):
+                     * its fallback lowers to new BaseRepository<E>(
+                     * ZanSql.FromConnection(conn)), names no source file
+                     * spells -- demand them so the pull keeps those types. */
+                    if (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) {
+                        pi_flag_ident(f, "BaseRepository", 14);
+                        pi_flag_ident(f, "ZanSql", 6);
+                    }
                 }
             }
             break;

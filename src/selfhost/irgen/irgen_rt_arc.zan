@@ -243,6 +243,12 @@ partial class Irgen {
             L("  call void @zdelegate_retain(i8* " + val + ")");
             return;
         }
+        // a string slot holds a Zan string or a byte[] reinterpreted as one
+        // (an array's word at -8 is its length, not an object descriptor)
+        if (IsStr(ty) && MapType(ty) == "i8*") {
+            L("  call void @zstrv_retain(i8* " + val + ")");
+            return;
+        }
         if (!ArcManaged(ty)) { return; }
         string lt = MapType(ty);
         if (lt == "i8*") {
@@ -289,6 +295,12 @@ partial class Irgen {
         }
         if (IsDelegate(ty)) {
             L("  call void @zdelegate_release(i8* " + val + ")");
+            return;
+        }
+        // a string slot holds a Zan string or a byte[] reinterpreted as one
+        // (an array's word at -8 is its length, not an object descriptor)
+        if (IsStr(ty) && MapType(ty) == "i8*") {
+            L("  call void @zstrv_release(i8* " + val + ")");
             return;
         }
         if (!ArcManaged(ty)) { return; }
@@ -481,7 +493,10 @@ partial class Irgen {
         string savedScope = typeScopeCls;
         typeScopeCls = cls.sval;
         while (i < names.Count) {
-            if (WeakTy(types[i])) {
+            if (BindingTargetField(cls, names[i])) {
+                // Binding.target is a borrow (the C host's
+                // field_is_binding_target): the destructor skips it
+            } else if (WeakTy(types[i])) {
                 // a weak field leaves the registry when its holder dies: the
                 // registry must not keep a pointer into freed memory, and the
                 // slot itself is cleared
@@ -531,6 +546,9 @@ partial class Irgen {
                     H("  call void @zref_release(i8* " + dynamicValue + ")");
                 } else if (IsDelegate(types[i])) {
                     H("  call void @zdelegate_release(i8* " + fv + ")");
+                } else if (IsStr(types[i]) && lt == "i8*") {
+                    // a string field may hold a byte[] reinterpreted as one
+                    H("  call void @zstrv_release(i8* " + fv + ")");
                 } else if (lt == "i8*") {
                     H("  call void @zrelease(i8* " + fv + ")");
                 } else {
@@ -554,6 +572,33 @@ partial class Irgen {
         H("%zan.exception = type { i8*, i8*, i64, i64 }");
         H("@zexc_dispatch = internal thread_local global %zan.exception zeroinitializer");
         H("@zexc_owners = internal thread_local global i8* null");
+        // Owner nodes (40 bytes: prev + exception record) are recycled
+        // through a per-thread free list: every armed local takes one and a
+        // hot loop over object locals otherwise pays a malloc/free pair per
+        // iteration. A node freed on another thread just joins that list.
+        H("@zexc_node_free = internal thread_local global i8* null");
+        H("define internal i8* @zexc_node_alloc() {");
+        H("entry:");
+        H("  %head = load i8*, i8** @zexc_node_free");
+        H("  %empty = icmp eq i8* %head, null");
+        H("  br i1 %empty, label %fresh, label %reuse");
+        H("reuse:");
+        H("  %hp = bitcast i8* %head to i8**");
+        H("  %next = load i8*, i8** %hp");
+        H("  store i8* %next, i8** @zexc_node_free");
+        H("  ret i8* %head");
+        H("fresh:");
+        H("  %raw = call i8* @malloc(i64 40)");
+        H("  ret i8* %raw");
+        H("}");
+        H("define internal void @zexc_node_release(i8* %n) {");
+        H("entry:");
+        H("  %head = load i8*, i8** @zexc_node_free");
+        H("  %np = bitcast i8* %n to i8**");
+        H("  store i8* %head, i8** %np");
+        H("  store i8* %n, i8** @zexc_node_free");
+        H("  ret void");
+        H("}");
         // B-ID199 round4: heap-backed, grown by @__exc_grow (was fixed [64]).
         H("@zexc_marks = internal thread_local global i8* null");
         H("define internal void @zexc_drop(%zan.exception* %r) {");
@@ -662,7 +707,7 @@ partial class Irgen {
         H("}");
         H("define internal %zan.exception* @zexc_push() {");
         H("entry:");
-        H("  %raw = call i8* @malloc(i64 40)");
+        H("  %raw = call i8* @zexc_node_alloc()");
         H("  %n = bitcast i8* %raw to %zan.exception.owner*");
         H("  %prevp = getelementptr %zan.exception.owner, %zan.exception.owner* %n, i32 0, i32 0");
         H("  %prev = load i8*, i8** @zexc_owners");
@@ -691,7 +736,7 @@ partial class Irgen {
         H("  %prev = load i8*, i8** %prevp");
         H("  store i8* %prev, i8** %link");
         H("  call void @zexc_drop(%zan.exception* %r)");
-        H("  call void @free(i8* %raw)");
+        H("  call void @zexc_node_release(i8* %raw)");
         H("  ret void");
         H("}");
         H("define internal void @zexc_unwind(i8* %mark) {");
@@ -814,6 +859,34 @@ partial class Irgen {
     // Strings share the managed identity prefix, but length is not an RC.
     // Literal RC=-1 is immutable; heap RC starts at one and frees the raw base.
     void EmitStrOwnershipRuntime() {
+        // the retain/release of a statically string-typed value: a Zan
+        // string carries the ZANS magic; anything else in a string slot is a
+        // byte[] handed over as a string (counted like any array)
+        int k = 0;
+        while (k < 2) {
+            string op = k == 0 ? "retain" : "release";
+            H("define void @zstrv_" + op + "(i8* %p) {");
+            H("entry:");
+            H("  %nil = icmp eq i8* %p, null");
+            H("  br i1 %nil, label %done, label %kind");
+            H("kind:");
+            H("  %mp = getelementptr i8, i8* %p, i64 -8");
+            H("  %ms = bitcast i8* %mp to i64*");
+            H("  %magic = load i64, i64* %ms");
+            H("  %str = icmp eq i64 %magic, 1515082580");
+            H("  br i1 %str, label %string, label %array");
+            H("string:");
+            H("  call void @zstr_" + op + "(i8* %p)");
+            H("  br label %done");
+            H("array:");
+            H("  %a = bitcast i8* %p to i64*");
+            H("  call void @zarr_" + op + "(i64* %a)");
+            H("  br label %done");
+            H("done:");
+            H("  ret void");
+            H("}");
+            k = k + 1;
+        }
         H("define void @zstr_retain(i8* %p) {");
         H("entry:");
         H("  %nil = icmp eq i8* %p, null");
