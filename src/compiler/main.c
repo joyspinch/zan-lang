@@ -14,6 +14,7 @@
 #include "attr_routes.h"
 #include "irgen.h"
 #include "optimizer.h"
+#include "procmem.h"
 #include "crosscomp.h"
 #include "winres.h"
 #include "embedres.h"
@@ -208,15 +209,9 @@ static zan_arena_t *g_main_arena = NULL;
 static void phase(const char *name) {
     if (!g_time_phases) return;
     double t = now_ms();
-    size_t mem_mb = 0, ws_mb = 0, peak_mb = 0;
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        mem_mb = pmc.PagefileUsage / (1024 * 1024);
-        ws_mb = pmc.WorkingSetSize / (1024 * 1024);
-        peak_mb = pmc.PeakPagefileUsage / (1024 * 1024);
-    }
-#endif
+    zan_procmem_t pm = zan_procmem_read();
+    size_t mem_mb = pm.commit / (1024 * 1024), ws_mb = pm.ws / (1024 * 1024),
+           peak_mb = pm.peak / (1024 * 1024);
     size_t ar_mb = g_main_arena ? (zan_arena_total_bytes(g_main_arena) / (1024 * 1024)) : 0;
     if (g_phase_start > 0.0)
         fprintf(stderr, "%10.1f ms  [Commit: %4zu MB, Peak: %4zu MB, WS: %4zu MB, Arena: %4zu MB]  %s\n",
@@ -235,15 +230,11 @@ static void report_suppressed_errors(const zan_diag_t *diag) {
 }
 
 static void probe_phase_mem(const char *name) {
-#ifdef _WIN32
     if (!getenv("ZAN_PROBE_MEM")) return;
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return;
+    zan_procmem_t pm = zan_procmem_read();
     size_t ar_mb = g_main_arena ? (zan_arena_total_bytes(g_main_arena) / (1024 * 1024)) : 0;
-    fprintf(stderr, "    [phase %-14s Commit: %4zu MB, Peak: %4zu MB, Arena: %4zu MB]  %s\n",
-            "", pmc.PagefileUsage / (1024 * 1024),
-            pmc.PeakPagefileUsage / (1024 * 1024), ar_mb, name);
-#endif
+    fprintf(stderr, "    [phase %-14s Commit: %4zu MB, Peak: %4zu MB, Arena: %4zu MB]  %s\n", "",
+            pm.commit / (1024 * 1024), pm.peak / (1024 * 1024), ar_mb, name);
 }
 
 static char *read_file(const char *path, size_t *out_len) {
