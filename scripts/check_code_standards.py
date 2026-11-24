@@ -38,6 +38,13 @@ UNDERSCORE_EXEMPT_DIRS = (
     "build",
 )
 
+# Names the compiler itself recognises or synthesises. They keep their '__'
+# spelling on purpose and are exempt from the '__' and PascalCase rules:
+# __AttrRoutes (route registration, attr_routes.h), __ZanControlCatalog
+# (control catalog, main_synth.c), __Conn (ORM entity-accessor connection hook
+# looked up on the base chain, checker_decl.c).
+COMPILER_CONTRACT_NAMES = ("__AttrRoutes", "__ZanControlCatalog", "__Conn")
+
 MAX_NEW_FILE_LINES = 1200
 MAX_FUNCTION_LINES = 120
 
@@ -72,8 +79,8 @@ def check_double_underscore(rel_path: str, line_num: int, raw_line: str, strippe
         # Exclude common markdown fences or header separators if accidentally matched
         if m.startswith("___"):
             continue
-        # Exclude compiler-synthesized route registration intrinsic and runtime decimal ABI
-        if m in ("__AttrRoutes", "__ZanControlCatalog") or (norm_path.startswith("stdlib/System/Decimal.zan") and m.startswith("__zan_decimal_")):
+        # Exclude compiler contracts and the runtime decimal ABI
+        if m in COMPILER_CONTRACT_NAMES or (norm_path.startswith("stdlib/System/Decimal.zan") and m.startswith("__zan_decimal_")):
             continue
         return (
             f"手写代码严禁定义或使用 '__' 前缀标识符 ('{m}')。\n"
@@ -116,6 +123,8 @@ def check_pascal_case_api(rel_path: str, line_num: int, raw_line: str, stripped_
     if type_match:
         kind = type_match.group(1)
         name = type_match.group(2)
+        if name in COMPILER_CONTRACT_NAMES:
+            return None
         # Must start with uppercase letter, and no underscores
         if not re.match(r'^[A-Z][a-zA-Z0-9]*$', name):
             return (
@@ -133,7 +142,7 @@ def check_pascal_case_api(rel_path: str, line_num: int, raw_line: str, stripped_
         name = method_match.group(1)
         # Exclude language keywords or constructors (which start with uppercase class name)
         excluded_keywords = {"operator", "this", "base", "delegate", "get", "set"}
-        if name not in excluded_keywords and not name.startswith("~"):
+        if name not in excluded_keywords and not name.startswith("~") and name not in COMPILER_CONTRACT_NAMES:
             if not re.match(r'^[A-Z][a-zA-Z0-9]*$', name):
                 return (
                     f"公开方法命名必须使用 PascalCase (大驼峰且无下划线)，当前命名非法: '{name}'"
