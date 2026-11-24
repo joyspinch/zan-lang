@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Json;
+using System.Threading;
 
 namespace System.Diagnostics;
 
@@ -99,8 +100,9 @@ public class ServerMetrics {
     long seriesLastWall;
     long seriesLastCpu;  // from the snapshot's own delta state
 
-    long concurrent;
-    long concurrentPeak;
+    // 每个请求进出各改一次：原子计数，不进 lock(this)（原先两次监视器加锁/请求）。
+    AtomicInt concurrent;
+    AtomicInt concurrentPeak;
     long streams;
     long streamFrames;
     long streamBytes;
@@ -155,8 +157,8 @@ public class ServerMetrics {
         for (int i = 0; i < this.seriesCap; i = i + 1) { this.sSec[i] = 0 - 1; }
         this.seriesLastWall = this.startMillis;
         this.seriesLastCpu = 0;
-        this.concurrent = 0;
-        this.concurrentPeak = 0;
+        this.concurrent = new AtomicInt(0);
+        this.concurrentPeak = new AtomicInt(0);
         this.streams = 0;
         this.streamFrames = 0;
         this.streamBytes = 0;
@@ -164,18 +166,22 @@ public class ServerMetrics {
     }
 
     public void Entered() {
-        lock (this) {
-            this.concurrent = this.concurrent + 1;
-            if (this.concurrent > this.concurrentPeak) {
-                this.concurrentPeak = this.concurrent;
-            }
+        long now = this.concurrent.Increment();
+        long peak = this.concurrentPeak.Load();
+        while (now > peak) {
+            long seen = this.concurrentPeak.CompareExchange(peak, now);
+            if (seen == peak) { break; }
+            peak = seen;
         }
     }
 
     // 一次请求离开，与 Entered() 配对；计数不会减到零以下。
     public void Left() {
-        lock (this) {
-            if (this.concurrent > 0) { this.concurrent = this.concurrent - 1; }
+        long cur = this.concurrent.Load();
+        while (cur > 0) {
+            long seen = this.concurrent.CompareExchange(cur, cur - 1);
+            if (seen == cur) { break; }
+            cur = seen;
         }
     }
 
@@ -220,8 +226,9 @@ public class ServerMetrics {
         return ServerMetrics.HIST_BINS - 1;
     }
 
+    // 调用方已持 lock(this)（CountRequest / RecordQuery）；不再重入加锁——监视器
+    // 重入仍要走一遍桶锁与递归锁，每请求白付一次。
     private int SeriesSlot(long sec) {
-        lock (this) {
         int idx = (int)(sec % (long)this.seriesCap);
         if (this.sSec[idx] == sec) { return idx; }
         this.sSec[idx] = sec;
@@ -249,7 +256,6 @@ public class ServerMetrics {
             this.seriesLastCpu = cpuMs;
         }
         return idx;
-        }
     }
 
     static ServerMetrics inst;
@@ -601,8 +607,8 @@ public class ServerMetrics {
     }
 
     // 慢 SQL 排行榜聚合统计项（规范化 SQL 语句、总次数、最大/平均耗时）。
+    // 调用方已持 lock(this)（RecordQuery）。
     void RecordSqlAgg(string norm, long us) {
-        lock (this) {
         SqlAgg a = null;
         if (!this.sqlIdx.TryGetValue(norm, out a)) {
             if (this.sqlAgg.Count >= this.sqlAggCap) { return; }
@@ -613,7 +619,6 @@ public class ServerMetrics {
         a.count = a.count + 1;
         a.totalUs = a.totalUs + us;
         if (us > a.maxUs) { a.maxUs = us; }
-        }
     }
 
     public static string NormalizeSql(string sql) {
@@ -933,8 +938,8 @@ public class ServerMetrics {
         queries.Put("slow_count", ServerMetrics.DocNum(this.slowQueries.Count));
 
         JsonValue load = JsonValue.NewObject();
-        load.Put("concurrent", ServerMetrics.DocNum(this.concurrent));
-        load.Put("peak", ServerMetrics.DocNum(this.concurrentPeak));
+        load.Put("concurrent", ServerMetrics.DocNum(this.concurrent.Load()));
+        load.Put("peak", ServerMetrics.DocNum(this.concurrentPeak.Load()));
         load.Put("streams", ServerMetrics.DocNum(this.streams));
         load.Put("stream_frames", ServerMetrics.DocNum(this.streamFrames));
         load.Put("stream_bytes", ServerMetrics.DocNum(this.streamBytes));

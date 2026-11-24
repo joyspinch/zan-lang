@@ -72,4 +72,10 @@ python3 tests/perf/protocols/run_bench.py --only=h2,ws --seconds=5   # 只跑部
   自己），每操作至多持一把分片锁；争用降到 0.2%。同机交替 A/B 3 轮（负载 16–25）：h1 8 连接
   47k → 64k rps、每请求 CPU 58 → 40 µs；ws 74k → 85k；https 34k → 41k（全胜）。之后的
   热点是包层逐请求锁：`ServerMetrics.Entered/Left`、`HttpBufferPool.Rent/Return`。
+- **已修（2026-11-23）：逐请求的包层 `lock`。** 每个请求 `ServerMetrics.Entered/Left` 各一次、
+  `HttpBufferPool` 借还各一次全局 `lock`；运行时的 `lock (obj)` 无争用也要桶锁 + 递归锁 +
+  监视块分配/释放。进出计数改 `AtomicInt`（峰值 CAS），缓冲池按线程分 16 条带、各带一把原生
+  互斥锁；`SeriesSlot`/`RecordSqlAgg` 去掉调用方已持锁时的重入 `lock`。h1 32 连接 72.8k →
+  81.5k rps（3 轮全胜）、/4k 59.1k → 65.3k；https、ws 持平。剩余逐请求锁：
+  `ServerMetrics.RecordRoute`、`HttpDeadline.Touch`。
 - **未覆盖**：明文 h2c（`WebApp` 不支持）、HTTP/2 大响应、WSS、数据库/Redis 线协议。
