@@ -276,7 +276,9 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 |---|---|
 | `ZAN_LIB_PATH` | 追加原生库搜索目录（win 用 `;` 分隔，unix `:`）——TLS/DB 驱动的导入库不在默认路径时设它 |
 | `ZAN_VERBOSE_LINK` | 回显原生链接命令行（查 -L/-l 从哪来） |
-| `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策 |
+| `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策（`incl <文件> because <名字>`：`controller` 表示按 MVC 控制器常驻拉入） |
+| `ZAN_LINK_ECHO` | 回显链接命令（含 Unix 宿主 `cc` 链接，可看分片对象是否在链接行上） |
+| `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |
 | `ZAN_NO_PUBLISH_VSLOT_DEMAND` | `=1` 时恢复完整虚表槽引用；默认发布构建按实际发射的虚调用槽保留实现。调试、库构建以及外部接口可能供应实例时采用保守保留，用于回归定位 |

@@ -588,17 +588,18 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
 }
 
 #if ZAN_LLVM_MAJOR >= 23
-/* 运行 O2 流水线并标记尺寸属性以实现代码体积优化 */
-static void zan_opt_mark_size(zan_irgen_t *g, bool min_size) {
-    LLVMContextRef ctx = LLVMGetModuleContext(g->mod);
+/* LLVM 23 删掉了 default<Os>/<Oz> 管线：体积优化改为 O2 管线 + 函数级
+ * optsize（Oz 再加 minsize）。按模块打标，分片发布（shard_emit.c）的每个
+ * 分片模块也经 zan_opt_run_passes_on_module 走到这里。 */
+static void zan_opt_mark_size(LLVMModuleRef mod, bool min_size) {
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
     LLVMAttributeRef opt = LLVMCreateEnumAttribute(ctx,
         LLVMGetEnumAttributeKindForName("optsize", 7), 0);
     LLVMAttributeRef mins = min_size
         ? LLVMCreateEnumAttribute(ctx,
               LLVMGetEnumAttributeKindForName("minsize", 7), 0)
         : NULL;
-    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
-         fn = LLVMGetNextFunction(fn)) {
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
         if (LLVMIsDeclaration(fn)) continue;
         LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1), opt);
         if (mins) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1), mins);
@@ -1107,14 +1108,6 @@ fail:
 zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     if (level == ZAN_OPT_NONE) return ZAN_OK;
 
-#if ZAN_LLVM_MAJOR >= 23
-    if (level == ZAN_OPT_SIZE) {
-        zan_opt_mark_size(g, false);
-    } else if (level == ZAN_OPT_SIZE_MIN) {
-        zan_opt_mark_size(g, true);
-    }
-#endif
-
     LLVMTargetMachineRef tm = NULL;
     if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK) return ZAN_ERROR;
     zan_status_t status = zan_opt_run_passes_on_module(g->mod, tm, level);
@@ -1135,8 +1128,19 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     switch (level) {
     case ZAN_OPT_BASIC: passes = "default<O1>"; break;
     case ZAN_OPT_FULL: passes = "default<O2>"; break;
+#if ZAN_LLVM_MAJOR >= 23
+    case ZAN_OPT_SIZE:
+        zan_opt_mark_size(mod, false);
+        passes = "default<O2>";
+        break;
+    case ZAN_OPT_SIZE_MIN:
+        zan_opt_mark_size(mod, true);
+        passes = "default<O2>";
+        break;
+#else
     case ZAN_OPT_SIZE: passes = "default<Os>"; break;
     case ZAN_OPT_SIZE_MIN: passes = "default<Oz>"; break;
+#endif
     case ZAN_OPT_AGGRESSIVE: passes = "default<O3>"; break;
     default: return ZAN_ERROR;
     }
