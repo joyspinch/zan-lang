@@ -1,0 +1,89 @@
+using System;
+
+// arr[i].M(args) 的接收者免钉住（stmt_borrow.c zan_elem_receiver_needs_no_pin）：
+// 只有 M 的全部实现都是"叶子体"、下标与实参都无副作用时才免钉住。
+// 下面每个"危险"实现都能在调用期间改写数组槽或运行用户代码——它们必须
+// 仍被钉住，否则 this 在方法体内被释放（--check-leaks/arc-guard 下即崩）。
+// 输出确定性，与 .out 比对。
+
+interface IShape { int Area(int k); }
+
+class Sq : IShape {
+    public int s;
+    public int Area(int k) { return s * s + k; }
+}
+
+class Rc : IShape {
+    public int w;
+    public int Area(int k) {
+        int t = 0;
+        for (int i = 0; i < 3; i = i + 1) { t = t + w; }
+        if (k > 100) { return -1; }
+        return t + k;
+    }
+}
+
+class Holder { public static Victim[] slots; }
+
+// 改写自己所在的数组槽：调用期间 this 的最后一个强引用消失
+class Victim {
+    public int v;
+    public string tag;
+    public int Drop() {
+        Holder.slots[0] = null;
+        string after = this.tag + "!";
+        return v + after.Length;
+    }
+}
+
+class Counter {
+    public int n;
+    public int Prop { get { return n * 2; } }
+    public int Bump() { n = n + 1; return n; }
+    public int Twice() { return Bump() + Bump(); }   // calls: pinned
+    public int ViaProp() { return Prop + 1; }         // property getter: pinned
+}
+
+class Vec {
+    public int x;
+    public Vec(int a) { x = a; }
+    public static Vec operator +(Vec a, Vec b) { return new Vec(a.x + b.x); }
+    public Vec other;
+    public int Sum() { Vec r = this + other; return r.x; }   // overloaded op: pinned
+}
+
+class Program {
+    static int sideEffects = 0;
+    static int Next() { sideEffects = sideEffects + 1; return sideEffects; }
+
+    static void Main() {
+        IShape[] sh = new IShape[2];
+        Sq a = new Sq(); a.s = 3;
+        Rc b = new Rc(); b.w = 4;
+        sh[0] = a; sh[1] = b;
+        long s = 0;
+        for (int i = 0; i < 1000; i = i + 1) { s = s + sh[i & 1].Area(i & 15); }
+        Console.WriteLine("leaf " + s);
+
+        Victim[] vs = new Victim[1];
+        Victim x = new Victim(); x.v = 5; x.tag = "abc";
+        vs[0] = x;
+        x = null;
+        Holder.slots = vs;
+        Console.WriteLine("drop " + vs[0].Drop());
+        Console.WriteLine("slot " + (vs[0] == null));
+
+        Counter[] cs = new Counter[1];
+        cs[0] = new Counter();
+        Console.WriteLine("twice " + cs[0].Twice());
+        Console.WriteLine("prop " + cs[0].ViaProp());
+
+        Vec[] ws = new Vec[1];
+        ws[0] = new Vec(2);
+        ws[0].other = new Vec(5);
+        Console.WriteLine("op " + ws[0].Sum());
+
+        // a side-effecting argument keeps the pin
+        Console.WriteLine("arg " + sh[0].Area(Program.Next()));
+    }
+}

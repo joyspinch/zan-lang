@@ -144,3 +144,326 @@ bool zan_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
         return false;
     return zan_local_never_reassigned(g, object->ident.name);
 }
+
+/* —— 数组元素接收者免钉住 ——
+ * `arr[i].M(args)` 的接收者来自数组槽：钉住（retain + EH 临时栈 + release，
+ * 两次原子操作）防的是"调用期间有人改写该槽、把 this 释放掉"。只有能写数组槽
+ * 或运行任意用户代码的东西才做得到，所以满足下列全部条件时钉住多余：
+ *   - arr 是局部或形参（借用的也行：整个钉住窗口里没有任何代码能释放对象，
+ *     数组在读槽时活着，调用返回前就一直活着）；
+ *   - 下标与全部实参只由局部读、字面量与原始数值/布尔运算组成（无调用、
+ *     无属性 getter、无重载运算符）；
+ *   - M 的每一个可能实现（静态类型的全部子类 / 接口实现类）都是"叶子体"：
+ *     无调用、无 new、无 lambda/await/throw、无下标读写；运算、赋值、转换只作用
+ *     于原始数值/布尔/字符/枚举；成员只读写 this 的字段（属性 getter 是用户代码）。
+ * 任一判不出即保守钉住。另一线程无同步地并发写同一槽本就是数据竞争（读槽与
+ * retain 之间同样不原子），不在钉住的保障范围内。 */
+#define LEAF_MAX_LOCALS 32
+typedef struct {
+    zan_irgen_t *g;
+    zan_symbol_t *cls;
+    zan_ast_node_t *decl;
+    zan_istr_t lname[LEAF_MAX_LOCALS];
+    zan_type_t *ltype[LEAF_MAX_LOCALS];
+    int nl;
+    bool ok;
+} leaf_scan_t;
+
+static bool leaf_prim(const zan_type_t *t) {
+    if (!t) return false;
+    return (t->kind >= TYPE_BOOL && t->kind <= TYPE_DOUBLE) ||
+           t->kind == TYPE_CHAR || t->kind == TYPE_NINT || t->kind == TYPE_ENUM;
+}
+
+static zan_type_t *leaf_field_type(zan_symbol_t *cls, zan_istr_t name) {
+    for (int depth = 0; cls && depth < 64; depth++) {
+        for (int i = 0; i < cls->member_count; i++) {
+            zan_symbol_t *m = cls->members[i];
+            if (!borrow_name_eq(m->name, name)) continue;
+            /* 同名的非字段成员（属性/方法）：读它可能跑用户代码 */
+            return m->kind == SYM_FIELD ? m->type : NULL;
+        }
+        if (!cls->type || !cls->type->base_type) break;
+        cls = cls->type->base_type->sym;
+    }
+    return NULL;
+}
+
+static zan_type_t *leaf_name_type(leaf_scan_t *L, zan_istr_t name) {
+    for (int i = L->nl - 1; i >= 0; i--)
+        if (borrow_name_eq(L->lname[i], name)) return L->ltype[i];
+    zan_ast_list_t *ps = &L->decl->method_decl.params;
+    for (int i = 0; i < ps->count; i++) {
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || !borrow_name_eq(p->param.name, name)) continue;
+        if (p->param.by_ref || p->param.is_params) return NULL;
+        return zan_binder_resolve_type(L->g->binder, p->param.type);
+    }
+    return leaf_field_type(L->cls, name);
+}
+
+static zan_type_t *leaf_expr(leaf_scan_t *L, zan_ast_node_t *n);
+
+/* 可写的原始值位置：局部/形参/本类字段，或 this.字段 */
+static zan_type_t *leaf_place(leaf_scan_t *L, zan_ast_node_t *n) {
+    if (!n) return NULL;
+    if (n->kind == AST_IDENTIFIER || n->kind == AST_MEMBER_ACCESS) {
+        zan_type_t *t = leaf_expr(L, n);
+        return leaf_prim(t) ? t : NULL;
+    }
+    return NULL;
+}
+
+static zan_type_t *leaf_expr(leaf_scan_t *L, zan_ast_node_t *n) {
+    if (!n || !L->ok) { L->ok = false; return NULL; }
+    zan_type_t *t = NULL;
+    switch (n->kind) {
+    case AST_INT_LITERAL: case AST_FLOAT_LITERAL:
+    case AST_CHAR_LITERAL: case AST_BOOL_LITERAL:
+        t = L->g->binder->type_int;
+        if (n->kind == AST_BOOL_LITERAL) t = L->g->binder->type_bool;
+        break;
+    case AST_IDENTIFIER:
+        t = leaf_name_type(L, n->ident.name);
+        break;
+    case AST_THIS_EXPR:
+        t = L->cls ? L->cls->type : NULL;
+        break;
+    case AST_MEMBER_ACCESS:
+        if (n->member.object && n->member.object->kind == AST_THIS_EXPR &&
+            !n->member.null_cond)
+            t = leaf_field_type(L->cls, n->member.name);
+        break;
+    case AST_BINARY: {
+        zan_type_t *lt = leaf_expr(L, n->binary.left);
+        zan_type_t *rt = leaf_expr(L, n->binary.right);
+        if (leaf_prim(lt) && leaf_prim(rt)) {
+            switch (n->binary.op) {
+            case TK_EQ_EQ: case TK_BANG_EQ: case TK_LESS: case TK_GREATER:
+            case TK_LESS_EQ: case TK_GREATER_EQ: case TK_AMP_AMP: case TK_PIPE_PIPE:
+                t = L->g->binder->type_bool;
+                break;
+            default:
+                t = lt;
+                break;
+            }
+        }
+        break;
+    }
+    case AST_UNARY: case AST_POSTFIX_UNARY: {
+        zan_type_t *ot = (n->unary.op == TK_PLUS_PLUS || n->unary.op == TK_MINUS_MINUS)
+            ? leaf_place(L, n->unary.operand) : leaf_expr(L, n->unary.operand);
+        if (leaf_prim(ot)) t = ot;
+        break;
+    }
+    case AST_ASSIGNMENT: {
+        zan_type_t *lt = leaf_place(L, n->binary.left);
+        zan_type_t *rt = leaf_expr(L, n->binary.right);
+        if (leaf_prim(lt) && leaf_prim(rt)) t = lt;
+        break;
+    }
+    case AST_CONDITIONAL: {
+        zan_type_t *ct = leaf_expr(L, n->conditional.cond);
+        zan_type_t *a = leaf_expr(L, n->conditional.then_expr);
+        zan_type_t *b = leaf_expr(L, n->conditional.else_expr);
+        if (leaf_prim(ct) && leaf_prim(a) && leaf_prim(b)) t = a;
+        break;
+    }
+    case AST_CAST_EXPR: {
+        zan_type_t *to = zan_binder_resolve_type(L->g->binder, n->cast.type);
+        zan_type_t *from = leaf_expr(L, n->cast.expr);
+        if (leaf_prim(to) && leaf_prim(from)) t = to;
+        break;
+    }
+    default:
+        break;
+    }
+    if (!t) L->ok = false;
+    return t;
+}
+
+static void leaf_stmt(leaf_scan_t *L, zan_ast_node_t *n) {
+    if (!L->ok) return;
+    if (!n) return;
+    switch (n->kind) {
+    case AST_BLOCK:
+        for (int i = 0; i < n->block.stmts.count && L->ok; i++)
+            leaf_stmt(L, n->block.stmts.items[i]);
+        return;
+    case AST_RETURN_STMT:
+        /* 返回字段/局部（任意类型）只是一次读取 + 返回所需的 retain */
+        if (n->ret.value) leaf_expr(L, n->ret.value);
+        return;
+    case AST_EXPR_STMT:
+        leaf_expr(L, n->expr_stmt.expr);
+        return;
+    case AST_VAR_DECL: {
+        zan_type_t *t = n->var_decl.type
+            ? zan_binder_resolve_type(L->g->binder, n->var_decl.type) : NULL;
+        if (n->var_decl.initializer) {
+            zan_type_t *it = leaf_expr(L, n->var_decl.initializer);
+            if (!t) t = it;
+            if (!leaf_prim(it)) L->ok = false;
+        }
+        if (!leaf_prim(t) || L->nl >= LEAF_MAX_LOCALS) { L->ok = false; return; }
+        L->lname[L->nl] = n->var_decl.name;
+        L->ltype[L->nl] = t;
+        L->nl++;
+        return;
+    }
+    case AST_IF_STMT:
+        if (!leaf_prim(leaf_expr(L, n->if_stmt.cond))) { L->ok = false; return; }
+        leaf_stmt(L, n->if_stmt.then_body);
+        leaf_stmt(L, n->if_stmt.else_body);
+        return;
+    case AST_WHILE_STMT:
+        if (!leaf_prim(leaf_expr(L, n->while_stmt.cond))) { L->ok = false; return; }
+        leaf_stmt(L, n->while_stmt.body);
+        return;
+    case AST_FOR_STMT:
+        if (n->for_stmt.init) {
+            if (n->for_stmt.init->kind == AST_VAR_DECL || n->for_stmt.init->kind == AST_BLOCK)
+                leaf_stmt(L, n->for_stmt.init);
+            else leaf_expr(L, n->for_stmt.init);
+        }
+        if (n->for_stmt.cond && !leaf_prim(leaf_expr(L, n->for_stmt.cond))) {
+            L->ok = false; return;
+        }
+        if (n->for_stmt.step) leaf_expr(L, n->for_stmt.step);
+        leaf_stmt(L, n->for_stmt.body);
+        return;
+    case AST_BREAK_STMT: case AST_CONTINUE_STMT:
+        return;
+    default:
+        L->ok = false;
+        return;
+    }
+}
+
+typedef struct { zan_symbol_t *m; bool ok; } leaf_cache_t;
+static leaf_cache_t g_leaf_cache[128];
+static int g_leaf_cache_n;
+
+static bool method_is_leaf(zan_irgen_t *g, zan_symbol_t *m) {
+    if (!m || m->kind != SYM_METHOD || !m->decl ||
+        m->decl->kind != AST_METHOD_DECL || !m->decl->method_decl.body)
+        return false;
+    for (int i = 0; i < g_leaf_cache_n; i++)
+        if (g_leaf_cache[i].m == m) return g_leaf_cache[i].ok;
+    zan_ast_node_t *d = m->decl;
+    bool ok = !(d->method_decl.modifiers & (MOD_ASYNC | MOD_EXTERN | MOD_STATIC)) &&
+              d->method_decl.type_params.count == 0 && !d->method_decl.is_variadic &&
+              !d->method_decl.ext;
+    if (ok) {
+        leaf_scan_t L;
+        memset(&L, 0, sizeof L);
+        L.g = g;
+        L.cls = m->parent;
+        L.decl = d;
+        L.ok = true;
+        zan_ast_node_t *body = d->method_decl.body;
+        if (body->kind == AST_BLOCK) leaf_stmt(&L, body);
+        else leaf_expr(&L, body);      /* expression-bodied member */
+        ok = L.ok;
+    }
+    if (g_leaf_cache_n < 128) {
+        g_leaf_cache[g_leaf_cache_n].m = m;
+        g_leaf_cache[g_leaf_cache_n].ok = ok;
+        g_leaf_cache_n++;
+    }
+    return ok;
+}
+
+/* 调用方一侧的实参/下标：只许局部读、字面量与原始数值运算 */
+static bool caller_simple_expr(zan_irgen_t *g, zan_ast_node_t *n,
+                               local_scope_t *locals) {
+    if (!n) return false;
+    switch (n->kind) {
+    case AST_INT_LITERAL: case AST_FLOAT_LITERAL:
+    case AST_CHAR_LITERAL: case AST_BOOL_LITERAL: case AST_NULL_LITERAL:
+        return true;
+    case AST_IDENTIFIER: {
+        local_var_t *v = local_find(locals, n->ident.name);
+        return v && !v->byref_slot;
+    }
+    case AST_BINARY:
+        return n->binary.op != TK_QUESTION_QUESTION &&
+               caller_simple_expr(g, n->binary.left, locals) &&
+               caller_simple_expr(g, n->binary.right, locals) &&
+               leaf_prim(infer_expr_type(g, n->binary.left, locals)) &&
+               leaf_prim(infer_expr_type(g, n->binary.right, locals));
+    case AST_UNARY:
+        return n->unary.op != TK_PLUS_PLUS && n->unary.op != TK_MINUS_MINUS &&
+               caller_simple_expr(g, n->unary.operand, locals) &&
+               leaf_prim(infer_expr_type(g, n->unary.operand, locals));
+    case AST_CONDITIONAL:
+        return caller_simple_expr(g, n->conditional.cond, locals) &&
+               caller_simple_expr(g, n->conditional.then_expr, locals) &&
+               caller_simple_expr(g, n->conditional.else_expr, locals) &&
+               leaf_prim(infer_expr_type(g, n, locals));
+    case AST_CAST_EXPR:
+        return caller_simple_expr(g, n->cast.expr, locals) &&
+               leaf_prim(infer_expr_type(g, n->cast.expr, locals)) &&
+               leaf_prim(infer_expr_type(g, n, locals));
+    default:
+        return false;
+    }
+}
+
+static bool sym_derives_from(zan_symbol_t *cls, zan_symbol_t *base) {
+    for (int depth = 0; cls && depth < 512; depth++) {
+        if (cls == base) return true;
+        if (!cls->type || !cls->type->base_type) return false;
+        cls = cls->type->base_type->sym;
+    }
+    return false;
+}
+
+bool zan_elem_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
+                                    zan_ast_node_t *call, local_scope_t *locals) {
+    if (!object || object->kind != AST_INDEX || !call || call->kind != AST_CALL ||
+        !call->call.callee || call->call.callee->kind != AST_MEMBER_ACCESS ||
+        call->call.callee->member.object != object ||
+        call->call.callee->member.null_cond || call->call.type_args.count > 0)
+        return false;
+    if (object->index.extra.count > 0) return false;
+    /* The array only has to stay alive for the pinned window, and nothing
+     * in that window (simple index/arguments, leaf callee) can release any
+     * object: a plain local or parameter read is enough, borrowed or not. */
+    zan_ast_node_t *base = object->index.object;
+    if (!base || base->kind != AST_IDENTIFIER || !local_find(locals, base->ident.name))
+        return false;
+    zan_type_t *at = infer_expr_type(g, object->index.object, locals);
+    if (!at || at->kind != TYPE_ARRAY) return false;
+    if (!caller_simple_expr(g, object->index.index, locals) ||
+        !leaf_prim(infer_expr_type(g, object->index.index, locals)))
+        return false;
+    int argc = call->call.args.count;
+    for (int i = 0; i < argc; i++)
+        if (!caller_simple_expr(g, call->call.args.items[i], locals)) return false;
+    zan_type_t *st = infer_expr_type(g, object, locals);
+    if (!st || !st->sym || (st->kind != TYPE_CLASS && st->kind != TYPE_INTERFACE))
+        return false;
+    zan_istr_t name = call->call.callee->member.name;
+    int cands = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int n = pass == 0 ? g->struct_type_count : g->generic_inst_count;
+        for (int i = 0; i < n; i++) {
+            zan_symbol_t *cls = pass == 0 ? g->struct_types[i].sym
+                                          : g->generic_insts[i].type_sym;
+            if (!cls) continue;
+            bool related = st->kind == TYPE_INTERFACE
+                ? class_implements_iface(cls, st->sym)
+                : sym_derives_from(cls, st->sym);
+            if (!related) continue;
+            zan_symbol_t *impl = resolve_overload(cls, name, argc, 0);
+            if (!impl) {
+                if (st->kind == TYPE_INTERFACE) continue;
+                return false;
+            }
+            if (!method_is_leaf(g, impl)) return false;
+            cands++;
+        }
+    }
+    return cands > 0;
+}

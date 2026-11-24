@@ -191,6 +191,8 @@ struct zan_irgen {
     LLVMValueRef current_this;
     zan_symbol_t *current_type_sym;
     zan_ast_node_t *current_fn_body;
+    /* the AST_CALL being emitted (receiver-pin analysis, stmt_borrow.c) */
+    zan_ast_node_t *hold_call_expr;
     bool current_fn_is_ctor;
     bool current_fn_is_main;         /* 程序主入口函数：退出前释放静态对象 */
     bool current_fn_no_runtime;
