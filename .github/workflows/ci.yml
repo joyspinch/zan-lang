@@ -5,6 +5,18 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # 全量 full（3600+ 条）在托管 4 核机器上 2 小时跑不完，只放夜间；
+  # 推送/PR 跑 smoke 档（~600 条），20 分钟内给信号。
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'ctest tier label (smoke | standard | full)'
+        default: 'full'
+
+env:
+  ZAN_CI_TIER: ${{ github.event_name == 'schedule' && 'full' || github.event.inputs.tier || 'smoke' }}
 
 permissions:
   contents: read
@@ -20,7 +32,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         build_type: [Debug, Release]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || github.event_name == 'pull_request' && 60 || 340 }}
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -67,8 +79,8 @@ jobs:
       # code signing), so that job opts into the explicit skip only.
       env:
         ZAN_ALLOW_SKIP_DAP: ${{ runner.os == 'macOS' && '1' || '0' }}
-      # 3600+ 条用例串行要数小时；按核数并行（ctest 自身不另开构建）。
-      run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)"
+      # 按核数并行；档位见顶部 ZAN_CI_TIER（推送 smoke，夜间 full）。
+      run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" -L "^${ZAN_CI_TIER}$"
 
   # Windows uses MSYS2/MinGW, which ships a prebuilt LLVM (with CMake config),
   # clang (used by zanc at link time), CMake and Ninja in one self-contained
@@ -79,7 +91,7 @@ jobs:
       matrix:
         build_type: [Debug, Release]
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || github.event_name == 'pull_request' && 60 || 340 }}
     defaults:
       run:
         shell: msys2 {0}
@@ -114,7 +126,7 @@ jobs:
     # harness, which are not built under MinGW (see the build note above).
     # It runs on Linux/macOS, where the full tree builds.
     - name: Test
-      run: ctest --test-dir build --output-on-failure -E "dap_integration" -j "$(nproc)"
+      run: ctest --test-dir build --output-on-failure -E "dap_integration" -j "$(nproc)" -L "^${ZAN_CI_TIER}$"
 
   lint:
     runs-on: ubuntu-latest
