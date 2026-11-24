@@ -1316,6 +1316,29 @@ add_test(NAME runtime_task_handle_registry COMMAND zanrt_task_handle_registry_te
 set_tests_properties(runtime_task_handle_registry PROPERTIES TIMEOUT 60)
 add_dependencies(zanc zanrt_task_handle_registry_test)
 
+# `lock (obj)` monitor: recursion, contention, distinct objects, address reuse,
+# bounded block recycling (TSan recipe in the test's header comment).
+add_executable(zanrt_monitor_lock_test
+  tests/runtime/monitor_lock.c
+  src/runtime/rt_sync.c
+  src/runtime/rt_file.c
+  src/runtime/rt_timer.c)
+target_include_directories(zanrt_monitor_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+set_target_properties(zanrt_monitor_lock_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/cases")
+if(NOT WIN32)
+  target_compile_definitions(zanrt_monitor_lock_test PRIVATE _GNU_SOURCE)
+  find_package(Threads REQUIRED)
+  target_link_libraries(zanrt_monitor_lock_test PRIVATE Threads::Threads)
+  if(NOT APPLE)
+    target_link_libraries(zanrt_monitor_lock_test PRIVATE rt)
+  endif()
+endif()
+add_test(NAME runtime_monitor_lock COMMAND zanrt_monitor_lock_test)
+set_tests_properties(runtime_monitor_lock PROPERTIES TIMEOUT 120)
+add_dependencies(zanc zanrt_monitor_lock_test)
+
 add_executable(zanrt_timer_delay_cancel_index_test tests/runtime/timer_delay_cancel_index.c)
 set_target_properties(zanrt_timer_delay_cancel_index_test PROPERTIES
   C_STANDARD 11 C_STANDARD_REQUIRED YES
