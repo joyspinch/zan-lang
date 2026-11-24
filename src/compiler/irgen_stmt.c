@@ -60,6 +60,10 @@ void emit_release_static_rc_fields(zan_irgen_t *g, zan_ast_node_t *unit) {
     }
     zan_call2(g->builder, LLVMGlobalGetValueType(g->static_init_cleanup),
               g->static_init_cleanup, NULL, 0, "");
+    /* 只有主函数退出路径会释放静态字段：此后的退出报告按严格口径计数（S13） */
+    if (g->check_leaks)
+        LLVMBuildStore(g->builder, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0),
+                       zan_leak_main_done_global(g));
 }
 
 /* Main and the terminate handler are emitted before the reachability closure.

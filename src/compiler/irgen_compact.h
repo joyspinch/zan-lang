@@ -28,6 +28,10 @@ LLVMTargetMachineRef zan_create_target_machine_with_options(
     const char *features, LLVMCodeGenOptLevel level, LLVMBool emulated_tls,
     LLVMBool wasm_exceptions);
 
+/* Drop a function's body, keeping its linkage (Function::deleteBody resets it
+ * to external). The function becomes a declaration. */
+void zan_llvm_delete_body(LLVMValueRef function);
+
 #ifdef __cplusplus
 }
 #endif

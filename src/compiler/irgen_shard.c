@@ -14,6 +14,7 @@
 #endif
 
 /* Composite Dispatcher Submodules */
+#include "procmem.h"
 #include "shard/shard_index.c"
 #include "shard/shard_emit.c"
 #include "shard/shard_blob.c"

@@ -206,6 +206,19 @@ At exit it reports objects still reachable and the `file:line:col` of the `new`
 that allocated each one. An unbroken reference cycle is the usual cause — ARC
 does not collect cycles.
 
+The report then runs trial deletion over the leftovers and prints every
+**orphan cycle** as a path to break — mark one field on it `weak`, unsubscribe
+the handler, or Dispose:
+
+```
+cycle: Node@a.zan:5:35 .Next -> List<Node>@a.zan:3:57 [0] -> Node@a.zan:5:35
+```
+
+If the process ends through `Environment.Exit` (before `Main` returns), frames
+and statics are still alive, so only orphan cycles count and the header says
+`in unreachable cycles at exit`. A strict "nothing left" verdict needs a normal
+return from `Main`.
+
 Runtime guards are on by default (e.g. integer division by zero traps with a
 source location); `--no-runtime-checks` turns them off, so keep them on while
 debugging.

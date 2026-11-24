@@ -430,7 +430,7 @@ else {
     }
     link_ret = (int)zan_utf8_spawnv(_P_WAIT, lld_path, argv);
   } else {
-    char link_cmd[4096];
+    char link_cmd[32768];
     snprintf(link_cmd, sizeof(link_cmd),
              "clang --target=x86_64-w64-windows-gnu --ld-path=\"%s\" "
              "\"%s\" -o \"%s\" -Wl,--stack,268435456 -Wl,--gc-sections%s",
@@ -503,7 +503,7 @@ else {
     link_ret = system(link_cmd);
   }
 #else
-  char link_cmd[4096];
+  char link_cmd[32768];
 #ifdef __APPLE__
   if (publish_mode || strip_symbols) {
     snprintf(link_cmd, sizeof(link_cmd),

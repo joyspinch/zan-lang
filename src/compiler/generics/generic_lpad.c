@@ -560,6 +560,74 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g, zan_type_t *delegate_type,
   free(param_types);
   return result;
 }
+/* S13：主函数正常返回（静态字段已释放）时置 1。退出报告据此区分两种口径：
+ * 正常返回——残留对象一律算泄漏（严格）；Environment.Exit / 进程直接退出——
+ * 栈帧与静态字段仍活着，只有不可达的孤儿环才算泄漏。 */
+LLVMValueRef zan_leak_main_done_global(zan_irgen_t *g) {
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, "__zan_main_done");
+    if (gv) return gv;
+    gv = LLVMAddGlobal(g->mod, i8, "__zan_main_done");
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetInitializer(gv, LLVMConstInt(i8, 0, 0));
+    return gv;
+}
+
+/* int64 zan_rt_leak_cycles(site_names, field_names, site_count, log_fh, print)：
+ * 实现在 rt_timer.o（timer/rt_timer_leak.c）；不含它的形态（wasm/bare）走这里
+ * 的弱实现，恒报 0 个孤儿。 */
+static LLVMValueRef leak_cycles_fn(zan_irgen_t *g, LLVMTypeRef *ty_out) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef args[5] = { LLVMPointerType(i8p, 0), LLVMPointerType(i8p, 0), i64, i8p, i32t };
+    LLVMTypeRef ty = LLVMFunctionType(i64, args, 5, 0);
+    *ty_out = ty;
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_rt_leak_cycles");
+    if (fn) return fn;
+    fn = LLVMAddFunction(g->mod, "zan_rt_leak_cycles", ty);
+    LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
+    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
+    LLVMBuildRet(b, LLVMConstInt(i64, 0, 0));
+    LLVMDisposeBuilder(b);
+    return fn;
+}
+
+static LLVMValueRef leak_cycles_call(zan_irgen_t *g, LLVMBuilderRef b,
+                                     LLVMValueRef log_fh, int print) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ty = NULL;
+    LLVMValueRef fn = leak_cycles_fn(g, &ty);
+    LLVMValueRef names = LLVMBuildLoad2(b, LLVMPointerType(i8p, 0), g->g_site_names, "lc.names");
+    LLVMValueRef fnames = LLVMBuildLoad2(b, LLVMPointerType(i8p, 0),
+        zan_site_field_names_global(g), "lc.fnames");
+    LLVMValueRef count = LLVMBuildLoad2(b, i64, g->g_site_count, "lc.count");
+    LLVMValueRef args[5] = { names, fnames, count, log_fh, LLVMConstInt(i32t, (unsigned)print, 0) };
+    return zan_call2(b, ty, fn, args, 5, "lc.orphans");
+}
+
+/* 打开 ZAN_LEAK_LOG（未设置沿用 "zan_leaks.log"，空串 fopen 失败即不落盘） */
+static LLVMValueRef leak_log_open(zan_irgen_t *g, LLVMBuilderRef b) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef getenv_type = LLVMFunctionType(i8p, &i8p, 1, 0);
+    LLVMValueRef fn_getenv = LLVMGetNamedFunction(g->mod, "getenv");
+    if (!fn_getenv) fn_getenv = LLVMAddFunction(g->mod, "getenv", getenv_type);
+    LLVMValueRef env_name = zan_irgen_intern_string(g, "ZAN_LEAK_LOG");
+    LLVMValueRef env_path = zan_call2(b, getenv_type, fn_getenv, &env_name, 1, "leaklogenv");
+    LLVMValueRef default_path = zan_irgen_intern_string(g, "zan_leaks.log");
+    LLVMValueRef log_path = LLVMBuildSelect(b, LLVMBuildIsNull(b, env_path, "noenv"),
+        default_path, env_path, "leaklogpath");
+    LLVMTypeRef fopen_args[2] = { i8p, i8p };
+    LLVMTypeRef fopen_type = LLVMFunctionType(i8p, fopen_args, 2, 0);
+    LLVMValueRef fn_fopen = LLVMGetNamedFunction(g->mod, "fopen");
+    if (!fn_fopen) fn_fopen = LLVMAddFunction(g->mod, "fopen", fopen_type);
+    LLVMValueRef fo_args[2] = { log_path, zan_irgen_intern_string(g, "ab") };
+    return zan_call2(b, fopen_type, fn_fopen, fo_args, 2, "leaklog");
+}
+
 void emit_leak_report_support(zan_irgen_t *g) {
   if (!g->check_leaks || g->fn_report_leaks)
     return;
@@ -591,11 +659,6 @@ void emit_leak_report_support(zan_irgen_t *g) {
   LLVMBasicBlockRef done_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "done");
 
-  LLVMTypeRef fopen_args[2] = {i8p, i8p};
-  LLVMTypeRef fopen_type = LLVMFunctionType(i8p, fopen_args, 2, 0);
-  LLVMValueRef fn_fopen = LLVMGetNamedFunction(g->mod, "fopen");
-  if (!fn_fopen)
-    fn_fopen = LLVMAddFunction(g->mod, "fopen", fopen_type);
   LLVMTypeRef fprintf_args[2] = {i8p, i8p};
   LLVMTypeRef fprintf_type = LLVMFunctionType(i32t, fprintf_args, 2, 1);
   LLVMValueRef fn_fprintf = LLVMGetNamedFunction(g->mod, "fprintf");
@@ -607,7 +670,52 @@ void emit_leak_report_support(zan_irgen_t *g) {
   if (!fn_fclose)
     fn_fclose = LLVMAddFunction(g->mod, "fclose", fclose_type);
 
+  LLVMBasicBlockRef strict_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "strict");
+  LLVMBasicBlockRef exit_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "early.exit");
+  LLVMBasicBlockRef exit_leak_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "early.leak");
   LLVMPositionBuilderAtEnd(b, bb);
+  LLVMValueRef main_done = LLVMBuildLoad2(b, LLVMInt8TypeInContext(g->ctx),
+      zan_leak_main_done_global(g), "maindone");
+  LLVMBuildCondBr(b, LLVMBuildIsNotNull(b, main_done, "returned"), strict_bb, exit_bb);
+
+  /* Environment.Exit / 直接 exit：栈帧与静态字段仍持有的对象不是泄漏，
+   * 只报试探删除后不可达的孤儿环（S13）。 */
+  LLVMPositionBuilderAtEnd(b, exit_bb);
+  LLVMValueRef orphans = leak_cycles_call(g, b, LLVMConstNull(i8p), 0);
+  LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSGT, orphans, LLVMConstInt(i64, 0, 0), "orphaned"),
+      exit_leak_bb, done_bb);
+  LLVMPositionBuilderAtEnd(b, exit_leak_bb);
+  {
+    LLVMValueRef emsg = zan_irgen_intern_string(g,
+        "zan: memory leak detected: %lld object(s) in unreachable cycles at exit "
+        "(process exited before Main returned; objects held by live frames or statics are not counted)\n");
+    LLVMValueRef eargs[] = {emsg, orphans};
+    zan_call2(b, g->printf_type, g->fn_printf, eargs, 2, "");
+    LLVMValueRef efh = leak_log_open(g, b);
+    LLVMBasicBlockRef elog_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "early.log");
+    LLVMBasicBlockRef ecyc_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "early.cycles");
+    LLVMBasicBlockRef eclose_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "early.close");
+    LLVMValueRef ehave = LLVMBuildIsNotNull(b, efh, "early.havelog");
+    LLVMBuildCondBr(b, ehave, elog_bb, ecyc_bb);
+    LLVMPositionBuilderAtEnd(b, elog_bb);
+    LLVMValueRef ef_args[3] = {efh, emsg, orphans};
+    zan_call2(b, fprintf_type, fn_fprintf, ef_args, 3, "");
+    LLVMBuildBr(b, ecyc_bb);
+    LLVMPositionBuilderAtEnd(b, ecyc_bb);
+    leak_cycles_call(g, b, efh, 1);
+    LLVMBuildCondBr(b, ehave, eclose_bb, done_bb);
+    LLVMPositionBuilderAtEnd(b, eclose_bb);
+    zan_call2(b, fclose_type, fn_fclose, &efh, 1, "");
+    LLVMBuildBr(b, done_bb);
+  }
+
+  LLVMPositionBuilderAtEnd(b, strict_bb);
   LLVMValueRef live = LLVMBuildLoad2(b, i64, g->g_live, "live");
   LLVMValueRef leaked =
       zan_icmp(b, LLVMIntSGT, live, LLVMConstInt(i64, 0, 0), "leaked");
@@ -618,11 +726,9 @@ void emit_leak_report_support(zan_irgen_t *g) {
       g, "zan: memory leak detected: %lld object(s) still reachable at exit\n");
   LLVMValueRef pargs[] = {msg, live};
   zan_call2(b, g->printf_type, g->fn_printf, pargs, 2, "");
-  LLVMValueRef log_path = zan_irgen_intern_string(g, "zan_leaks.log");
-  LLVMValueRef log_mode = zan_irgen_intern_string(g, "ab");
-  LLVMValueRef fo_args[2] = {log_path, log_mode};
-  LLVMValueRef log_fh =
-      zan_call2(b, fopen_type, fn_fopen, fo_args, 2, "leaklog");
+  /* S10：报表副本路径由 ZAN_LEAK_LOG 指定——测试驱动以仓库根为工作目录
+   * 运行，固定相对路径会把 zan_leaks.log 落进根目录（WC §1）。 */
+  LLVMValueRef log_fh = leak_log_open(g, b);
   LLVMValueRef have_log = LLVMBuildIsNotNull(b, log_fh, "havelog");
   LLVMBuildCondBr(b, have_log, log_sum_bb, head_bb);
 
@@ -667,6 +773,8 @@ void emit_leak_report_support(zan_irgen_t *g) {
   LLVMBuildBr(b, head_bb);
 
   LLVMPositionBuilderAtEnd(b, close_bb);
+  /* S13：残留对象里的孤儿环逐条打印具体路径（报表副本同步写入） */
+  leak_cycles_call(g, b, LLVMBuildSelect(b, have_log, log_fh, LLVMConstNull(i8p), "lc.log"), 1);
   LLVMBasicBlockRef close_do_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->fn_report_leaks, "log.close.do");
   LLVMBuildCondBr(b, have_log, close_do_bb, done_bb);

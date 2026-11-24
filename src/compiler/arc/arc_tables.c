@@ -556,6 +556,61 @@ LLVMValueRef build_site_field_graph(zan_irgen_t *g, int site_idx) {
   LLVMSetInitializer(fg_gv, LLVMConstStruct(fg_init, 5, 0));
   return LLVMConstBitCast(fg_gv, i8p);
 }
+/* S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出环路诊断的字段名表。
+ * 每个类站点一个以 NUL 结尾的 C 串数组，与 build_site_field_graph 的 refs[]
+ * 同序——两边用同一判据（非静态、非 weak、引用计数类型）筛字段，运行时按
+ * 边的 refs 下标取名，打印 "Node.Next -> ..."。非类站点为空指针。 */
+static LLVMValueRef build_site_field_names(zan_irgen_t *g, int site_idx) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    if ((g->site_coll && g->site_coll[site_idx]) || !g->site_syms ||
+        !g->site_syms[site_idx])
+        return LLVMConstNull(i8p);
+    zan_symbol_t *sym = g->site_syms[site_idx];
+    zan_type_t *inst = g->site_inst ? g->site_inst[site_idx] : NULL;
+    struct zan_struct_type_entry *e = get_struct_entry(g, sym);
+    if (!e || !e->field_llvm) return LLVMConstNull(i8p);
+    LLVMValueRef names[256];
+    unsigned n = 0;
+    for (int i = 0; i < sym->member_count && n < 256; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) || field_member_is_static(m))
+            continue;
+        zan_type_t *ft = m->type;
+        if (inst) ft = subst_type_param_deep(g, ft, inst);
+        if (!ft || (m->modifiers & MOD_WEAK)) continue;
+        if (!(ft->kind == TYPE_STRING || ft->kind == TYPE_DELEGATE ||
+              ft->kind == TYPE_ARRAY || is_arc_managed_type(ft) ||
+              ft->kind == TYPE_OBJECT))
+            continue;
+        char buf[128];
+        size_t len = m->name.len < sizeof(buf) - 1 ? m->name.len : sizeof(buf) - 1;
+        memcpy(buf, m->name.str, len);
+        buf[len] = '\0';
+        names[n++] = zan_irgen_intern_string(g, buf);
+    }
+    if (n == 0) return LLVMConstNull(i8p);
+    char gname[64];
+    snprintf(gname, sizeof(gname), "__zan_fnames_%d", site_idx);
+    LLVMTypeRef at = LLVMArrayType(i8p, n);
+    LLVMValueRef gv = LLVMAddGlobal(g->mod, at, gname);
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(gv, 1);
+    LLVMSetInitializer(gv, LLVMConstArray(i8p, names, n));
+    return LLVMConstBitCast(gv, i8p);
+}
+
+/* 退出报告引用的字段名表全局（i8**）。报告函数在 main 发射时就要引用它，
+ * 表本身要等全部站点确定后才填（emit_site_field_graph_table）。 */
+LLVMValueRef zan_site_field_names_global(zan_irgen_t *g) {
+    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, "__zan_site_field_names");
+    if (gv) return gv;
+    gv = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_field_names");
+    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    LLVMSetInitializer(gv, LLVMConstNull(LLVMPointerType(i8p, 0)));
+    return gv;
+}
+
 void emit_site_field_graph_table(zan_irgen_t *g) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   int n = g->leak_site_count;
@@ -572,6 +627,17 @@ void emit_site_field_graph_table(zan_irgen_t *g) {
   if (g->g_site_field_graphs) {
     LLVMSetInitializer(g->g_site_field_graphs,
                        LLVMConstBitCast(arr, LLVMPointerType(i8ptr, 0)));
+  }
+  LLVMValueRef fnames = LLVMGetNamedGlobal(g->mod, "__zan_site_field_names");
+  if (fnames) {
+    for (int i = 0; i < n; i++)
+      elems[i] = build_site_field_names(g, i);
+    LLVMValueRef ntbl = LLVMAddGlobal(g->mod, at, "__zan_site_field_names_tbl");
+    LLVMSetInitializer(ntbl, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    LLVMSetLinkage(ntbl, LLVMInternalLinkage);
+    LLVMSetGlobalConstant(ntbl, 1);
+    LLVMSetInitializer(fnames,
+                       LLVMConstBitCast(ntbl, LLVMPointerType(i8ptr, 0)));
   }
   free(elems);
 }

@@ -436,14 +436,15 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
         LLVMSetThreadLocal(g->arc_defer_depth, 1);
       LLVMTypeRef push_ty = LLVMFunctionType(
           LLVMVoidTypeInContext(g->ctx), (LLVMTypeRef[]){i8ptr, i8ptr}, 2, 0);
-      g->rt_defer_push = LLVMAddFunction(g->mod, "zan_rt_defer_push", push_ty);
+      g->rt_defer_push =
+          LLVMAddFunction(g->mod, "__zan_arc_defer_push", push_ty);
       LLVMTypeRef pend_ty = LLVMFunctionType(i32t, NULL, 0, 0);
       g->rt_defer_pending =
-          LLVMAddFunction(g->mod, "zan_rt_defer_pending", pend_ty);
+          LLVMAddFunction(g->mod, "__zan_arc_defer_pending", pend_ty);
       LLVMTypeRef drain_ty =
           LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
       g->rt_defer_drain =
-          LLVMAddFunction(g->mod, "zan_rt_defer_drain", drain_ty);
+          LLVMAddFunction(g->mod, "__zan_arc_defer_drain", drain_ty);
     }
     enum { ZAN_ARC_DEFER_DEPTH = 100 };
     /* 线程局部地址只算一次：macOS 每次 TLS 访问都是一次 _tlv_get_addr

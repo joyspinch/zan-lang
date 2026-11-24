@@ -1289,6 +1289,30 @@ static void zan_opt_mark_size(LLVMModuleRef mod, bool min_size) {
 }
 #endif
 
+/* Very large functions are dispatch code (an AST-walking switch over many
+ * cases, a giant Main): inlining into them multiplies IR that LLVM's
+ * codegen must hold at once and buys little speed. Give them optsize, which
+ * lowers the inline threshold for calls made from them. ZAN_HUGE_FN sets the
+ * pre-optimization instruction count (default 4000; 0 disables). */
+static void zan_opt_mark_huge(LLVMModuleRef mod) {
+    long limit = 4000;
+    const char *env = getenv("ZAN_HUGE_FN");
+    if (env && *env) limit = strtol(env, NULL, 10);
+    if (limit <= 0) return;
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    unsigned kind = LLVMGetEnumAttributeKindForName("optsize", 7);
+    LLVMAttributeRef opt = LLVMCreateEnumAttribute(ctx, kind, 0);
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        if (LLVMIsDeclaration(fn)) continue;
+        long n = 0;
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb && n <= limit;
+             bb = LLVMGetNextBasicBlock(bb))
+            for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in))
+                n++;
+        if (n > limit) LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1), opt);
+    }
+}
+
 zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod) {
   if (!g->cpu_profile)
     return ZAN_OK;
@@ -2161,6 +2185,7 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     passes = "default<O1>";
     break;
   case ZAN_OPT_FULL:
+    zan_opt_mark_huge(mod);
     passes = "default<O2>";
     break;
 #if ZAN_LLVM_MAJOR >= 23
@@ -2181,6 +2206,7 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     break;
 #endif
   case ZAN_OPT_AGGRESSIVE:
+    zan_opt_mark_huge(mod);
     passes = "default<O3>";
     break;
   default:

@@ -491,6 +491,8 @@ void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 void emit_site_dtor_table(zan_irgen_t *g);
 void emit_site_field_graph_table(zan_irgen_t *g);
+LLVMValueRef zan_site_field_names_global(zan_irgen_t *g);
+LLVMValueRef zan_leak_main_done_global(zan_irgen_t *g);
 void emit_site_live_tables(zan_irgen_t *g);
 void emit_site_tyname_table(zan_irgen_t *g);
 void emit_string_release(zan_irgen_t *g, LLVMValueRef v);
@@ -1290,6 +1292,9 @@ void refl_reserve_thunk_sites(zan_irgen_t *g);
 bool refl_needs_site_meta(zan_irgen_t *g);
 bool refl_ctor_needs_thunk(zan_irgen_t *g);
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
+typedef struct refl_inst_index refl_inst_index_t;
+void refl_inst_index_free(zan_irgen_t *g);
+void refl_collect_literal_names(zan_irgen_t *g, zan_ast_node_t *unit);
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl);
 void refl_note_invoke_literal(zan_irgen_t *g, zan_ast_node_t *name);

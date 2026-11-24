@@ -97,6 +97,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   bool do_deny_warnings = false;
   const char *warn_level_arg = NULL; /* A382② --warn-level */
   const char *suppress_arg = NULL;   /* A382② --suppress */
+  const char *diag_format_arg = NULL; /* S1 --diag=text|json */
   zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
   int opt_level = -1;
   zan_opt_knobs_t opt_knobs;
@@ -200,6 +201,10 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
       suppress_arg = argv[i] + 11;
     } else if (strcmp(argv[i], "--suppress") == 0 && i + 1 < argc) {
       suppress_arg = argv[++i];
+    } else if (strncmp(argv[i], "--diag=", 7) == 0) {
+      diag_format_arg = argv[i] + 7;
+    } else if (strcmp(argv[i], "--diag") == 0 && i + 1 < argc) {
+      diag_format_arg = argv[++i];
     } else if (strcmp(argv[i], "--publish") == 0) {
       publish_mode = true;
     } else if (strcmp(argv[i], "--obfuscate-strings") == 0) {
@@ -600,6 +605,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   opts->do_deny_warnings = do_deny_warnings;
   opts->warn_level_arg = warn_level_arg;
   opts->suppress_arg = suppress_arg;
+  opts->diag_format_arg = diag_format_arg;
   opts->package_scope = package_scope;
   opts->opt_level = opt_level;
   opts->opt_knobs = opt_knobs;

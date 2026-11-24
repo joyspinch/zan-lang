@@ -652,37 +652,156 @@ bool refl_ctor_needs_thunk(zan_irgen_t *g) {
   return !g->publish_reflect_demand || g->emit_lib || g->refl_ctor_used;
 }
 
+/* Incremental instance index for refl_owner_can_have_instance. The predicate
+ * is asked for every method of every reflected class on every emission
+ * fixed-point round; rescanning all allocation sites and all class base chains
+ * per question was quadratic and took 3.6 s of a small Gui test's 8 s irgen
+ * once plain builds adopted closed-world reflection. Sites and struct types
+ * only ever grow, so fold each new one in once. */
+typedef struct {
+  zan_symbol_t *sym;
+  bool has_site; /* some allocation site is this class or derives from it */
+  bool vt_store; /* a derived vtable was seen stored into an object */
+  int *derived;  /* struct_types indices whose base chain includes sym */
+  int nderived, cap;
+} refl_inst_entry_t;
+
+struct refl_inst_index {
+  refl_inst_entry_t *slots;
+  int cap, count;
+  int sites_seen, structs_seen;
+  bool deep_site; /* a site's base chain exceeded the walk limit */
+};
+
+static refl_inst_entry_t *refl_inst_entry(refl_inst_index_t *ix,
+                                          zan_symbol_t *sym) {
+  if (ix->count * 2 >= ix->cap) {
+    int ncap = ix->cap ? ix->cap * 2 : 256;
+    refl_inst_entry_t *ns =
+        (refl_inst_entry_t *)calloc((size_t)ncap, sizeof(*ns));
+    if (!ns)
+      return NULL;
+    for (int i = 0; i < ix->cap; i++) {
+      if (!ix->slots[i].sym)
+        continue;
+      size_t h = ((uintptr_t)ix->slots[i].sym >> 4) & (size_t)(ncap - 1);
+      while (ns[h].sym)
+        h = (h + 1) & (size_t)(ncap - 1);
+      ns[h] = ix->slots[i];
+    }
+    free(ix->slots);
+    ix->slots = ns;
+    ix->cap = ncap;
+  }
+  size_t h = ((uintptr_t)sym >> 4) & (size_t)(ix->cap - 1);
+  while (ix->slots[h].sym && ix->slots[h].sym != sym)
+    h = (h + 1) & (size_t)(ix->cap - 1);
+  if (!ix->slots[h].sym) {
+    ix->slots[h].sym = sym;
+    ix->count++;
+  }
+  return &ix->slots[h];
+}
+
+static refl_inst_entry_t *refl_inst_find(refl_inst_index_t *ix,
+                                         zan_symbol_t *sym) {
+  if (!ix->cap)
+    return NULL;
+  size_t h = ((uintptr_t)sym >> 4) & (size_t)(ix->cap - 1);
+  while (ix->slots[h].sym) {
+    if (ix->slots[h].sym == sym)
+      return &ix->slots[h];
+    h = (h + 1) & (size_t)(ix->cap - 1);
+  }
+  return NULL;
+}
+
+void refl_inst_index_free(zan_irgen_t *g) {
+  refl_inst_index_t *ix = g->refl_inst_index;
+  if (!ix)
+    return;
+  for (int i = 0; i < ix->cap; i++)
+    free(ix->slots[i].derived);
+  free(ix->slots);
+  free(ix);
+  g->refl_inst_index = NULL;
+}
+
+/* Returns false on allocation failure (callers then answer conservatively). */
+static bool refl_inst_index_update(zan_irgen_t *g) {
+  refl_inst_index_t *ix = g->refl_inst_index;
+  if (!ix) {
+    ix = (refl_inst_index_t *)calloc(1, sizeof(*ix));
+    if (!ix)
+      return false;
+    ix->sites_seen = 1; /* site 0 is the sentinel */
+    g->refl_inst_index = ix;
+  }
+  for (; ix->sites_seen < g->leak_site_count; ix->sites_seen++) {
+    zan_symbol_t *sym = g->site_syms ? g->site_syms[ix->sites_seen] : NULL;
+    zan_type_t *type = sym ? sym->type : NULL;
+    int depth = 0;
+    for (; type && type->sym && depth < 32; type = type->base_type, depth++) {
+      refl_inst_entry_t *e = refl_inst_entry(ix, type->sym);
+      if (!e)
+        return false;
+      e->has_site = true;
+    }
+    if (depth == 32 && type)
+      ix->deep_site = true;
+  }
+  for (; ix->structs_seen < g->struct_type_count; ix->structs_seen++) {
+    zan_symbol_t *sym = g->struct_types[ix->structs_seen].sym;
+    zan_type_t *type = sym ? sym->type : NULL;
+    for (int depth = 0; type && depth < 32; type = type->base_type, depth++) {
+      if (!type->sym)
+        continue;
+      refl_inst_entry_t *e = refl_inst_entry(ix, type->sym);
+      if (!e)
+        return false;
+      if (e->nderived && e->derived[e->nderived - 1] == ix->structs_seen)
+        continue;
+      if (e->nderived == e->cap) {
+        int ncap = e->cap ? e->cap * 2 : 4;
+        int *nd = (int *)realloc(e->derived, (size_t)ncap * sizeof(int));
+        if (!nd)
+          return false;
+        e->derived = nd;
+        e->cap = ncap;
+      }
+      e->derived[e->nderived++] = ix->structs_seen;
+    }
+  }
+  return true;
+}
+
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner) {
   if (!g->publish_instance_prune || !owner || !owner->type ||
       owner->type->kind != TYPE_CLASS || refl_ctor_needs_thunk(g))
     return true;
+  if (!refl_inst_index_update(g))
+    return true;
+  refl_inst_index_t *ix = g->refl_inst_index;
   /* Recursive field metadata describes types without creating their objects.
    * A derived allocation can still receive methods declared on this owner. */
-  for (int i = 1; i < g->leak_site_count; i++) {
-    zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
-    zan_type_t *type = sym ? sym->type : NULL;
-    int depth = 0;
-    for (; type && type->sym && depth < 32; type = type->base_type, depth++) {
-      if (type->sym == owner)
-        return true;
-    }
-    if (depth == 32 && type)
-      return true;
-  }
+  if (ix->deep_site)
+    return true;
+  refl_inst_entry_t *e = refl_inst_find(ix, owner);
+  if (!e)
+    return false;
+  if (e->has_site || e->vt_store)
+    return true;
   /* Runtime guard exceptions have site 0, but their vtable is stored into a
-   * real object. Metadata and interface tag comparisons do not make stores. */
-  for (int i = 0; i < g->struct_type_count; i++) {
-    zan_symbol_t *sym = g->struct_types[i].sym;
-    zan_type_t *type = sym ? sym->type : NULL;
-    for (int depth = 0; type && depth < 32; type = type->base_type, depth++) {
-      if (type->sym != owner)
-        continue;
-      char name[320];
-      snprintf(name, sizeof(name), "__zan_vtable_%.*s", (int)sym->name.len,
-               sym->name.str);
-      if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, name), 0))
-        return true;
-      break;
+   * real object. Metadata and interface tag comparisons do not make stores.
+   * Stores appear as code is emitted, so a miss is re-checked next time. */
+  for (int i = 0; i < e->nderived; i++) {
+    zan_symbol_t *sym = g->struct_types[e->derived[i]].sym;
+    char name[320];
+    snprintf(name, sizeof(name), "__zan_vtable_%.*s", (int)sym->name.len,
+             sym->name.str);
+    if (vtable_has_instance_store(LLVMGetNamedGlobal(g->mod, name), 0)) {
+      e->vt_store = true;
+      return true;
     }
   }
   return false;
@@ -699,15 +818,100 @@ static bool refl_invoke_literal_demanded(zan_irgen_t *g, zan_istr_t name) {
   return false;
 }
 
-static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
-  if (g->refl_invoke_unknown)
+typedef struct {
+    zan_istr_t *items;
+    int count;
+    int cap;
+} refl_literal_pool_t;
+
+static bool refl_is_identifier_text(const char *s, size_t n) {
+    if (n == 0 || n > 255) return false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        bool ok = c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (i > 0 && c >= '0' && c <= '9') || c >= 0x80;
+        if (!ok) return false;
+    }
     return true;
-  return refl_invoke_literal_demanded(g, name);
+}
+
+static zan_walk_action_t refl_collect_literal(zan_ast_node_t *node, void *user) {
+    refl_literal_pool_t *pool = (refl_literal_pool_t *)user;
+    if (node->kind != AST_STRING_LITERAL) return ZAN_WALK_CONTINUE;
+    zan_istr_t text = node->str_val;
+    if (!text.str || !refl_is_identifier_text(text.str, text.len)) return ZAN_WALK_CONTINUE;
+    if (pool->count == pool->cap) {
+        int cap = pool->cap ? pool->cap * 2 : 256;
+        zan_istr_t *items = (zan_istr_t *)realloc(pool->items, (size_t)cap * sizeof(*items));
+        if (!items) return ZAN_WALK_ABORT;
+        pool->items = items;
+        pool->cap = cap;
+    }
+    pool->items[pool->count++] = text;
+    return ZAN_WALK_CONTINUE;
+}
+
+static int refl_istr_cmp(const void *a, const void *b) {
+    const zan_istr_t *x = (const zan_istr_t *)a, *y = (const zan_istr_t *)b;
+    size_t n = x->len < y->len ? x->len : y->len;
+    int c = memcmp(x->str, y->str, n);
+    if (c) return c;
+    return x->len < y->len ? -1 : x->len > y->len ? 1 : 0;
+}
+
+/* A computed Invoke name is a runtime string; in a closed-world build it can
+ * only name a method if that name appears as a string literal somewhere in
+ * the program (or in a design file, or is a framework hook -- handled by the
+ * callers). Names assembled purely at runtime (concatenation, JSON) are not
+ * supported for plain methods; give such a method an attribute to keep it.
+ * On allocation failure the pool stays NULL and every name is kept. */
+void refl_collect_literal_names(zan_irgen_t *g, zan_ast_node_t *unit) {
+    g->refl_literal_names = NULL;
+    g->refl_literal_name_count = -1;
+    if (!g->closed_world || !unit) return;
+    refl_literal_pool_t pool = {NULL, 0, 0};
+    if (!zan_ast_walk(unit, refl_collect_literal, NULL, &pool)) {
+        free(pool.items);
+        return;
+    }
+    if (pool.count) qsort(pool.items, (size_t)pool.count, sizeof(*pool.items), refl_istr_cmp);
+    int n = 0;
+    for (int i = 0; i < pool.count; i++) {
+        if (n && refl_istr_cmp(&pool.items[n - 1], &pool.items[i]) == 0) continue;
+        pool.items[n++] = pool.items[i];
+    }
+    zan_istr_t *kept = n ? zan_arena_alloc(g->arena, (size_t)n * sizeof(*kept)) : NULL;
+    if (n && !kept) {
+        free(pool.items);
+        return;
+    }
+    if (n) memcpy(kept, pool.items, (size_t)n * sizeof(*kept));
+    free(pool.items);
+    g->refl_literal_names = kept;
+    g->refl_literal_name_count = n;
+}
+
+static bool refl_invoke_name_demanded(zan_irgen_t *g, zan_istr_t name) {
+  if (refl_invoke_literal_demanded(g, name))
+    return true;
+  if (!g->refl_invoke_unknown)
+    return false;
+  /* Framework hooks are dispatched by computed names by design. */
+  if (refl_is_framework_hook_name(name.str, name.len))
+    return true;
+  if (g->refl_literal_name_count < 0)
+    return true;
+  return g->refl_literal_name_count > 0 &&
+         bsearch(&name, g->refl_literal_names,
+                 (size_t)g->refl_literal_name_count, sizeof(zan_istr_t),
+                 refl_istr_cmp) != NULL;
 }
 
 /* F4/S1 谓词上移（design.md § P_method_thunk）：thunk 生成与 emit_target
- * body-root 的唯一判定。 非 publish：全部方法（现状不变）。 publish：仅
- * accessor（get_/set_ 且 owner 同名 property）、带注解方法、
+ * body-root 的唯一判定。
+ * 非 closed_world（-g / 库 / ZAN_NO_DEV_PRUNE=1）：全部方法。
+ * closed_world（发布与普通构建）：仅 accessor（get_/set_ 且 owner 同名
+ * property）、带注解方法、被 Invoke 字面名点到（或存在非字面名 Invoke）的方法、
  * 设计稿事件处理器与实际 Invoke 可能选中的框架生命周期钩子。
  * 注意与 refl_method_should_export
  * 的\u533a\u522b：\u672c\u8c13\u8bcd\u4e0d\u770b MOD_PUBLIC\uff08\u79c1\u6709
@@ -740,17 +944,13 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
   if (attrs && attrs->count > 0) {
     return true;
   }
-  zan_istr_t name = decl->method_decl.name;
-  if (!g->publish_mode || !g->refl_invoke_unknown) {
-    return refl_invoke_name_demanded(g, name);
-  }
-  /* Named hooks with dynamic Invoke(var) are callable only when an emitted
-   * Invoke may select them. Literal Invoke("ExactName") and declarative
-   * PropSpec Accessor/Setter targets retain their exact demanded targets even
-   * in --publish mode. */
-  return refl_invoke_literal_demanded(g, name) ||
-         (refl_is_framework_hook_name(name.str, name.len) &&
-          refl_invoke_name_demanded(g, name));
+  /* Any other method (framework hooks included) is callable exactly when an
+   * emitted Invoke may select it: its literal name was invoked, or some
+   * Invoke takes a computed name and this name occurs as a string literal.
+   * Without this, `obj.InvokeInt("Add", ..)` on a plain public method
+   * silently returned 0 under --publish.
+   * HasMethod and member enumeration still retain the unchanged signatures. */
+  return refl_invoke_name_demanded(g, decl->method_decl.name);
 }
 
 static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym,
@@ -758,11 +958,11 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym,
   if (!m || m->kind != SYM_METHOD || !m->decl ||
       m->decl->kind != AST_METHOD_DECL)
     return false;
-  if (!g->publish_mode)
+  if (!g->closed_world)
     return true;
   if (refl_is_framework_hook_name(m->name.str, m->name.len))
     return true;
-  /* publish 模式下：
+  /* closed_world（发布与普通构建）下：
    * 1. 属性访问器（get_/set_）必须保留，支持运行期动态数据绑定
    * 2. 带有显式特性注解（attributes）的方法保留
    * 3. 必须是公开方法；私有/内部方法在发布期绝对不暴露反射
@@ -773,7 +973,10 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym,
   if (attrs && attrs->count > 0)
     return true;
   uint32_t mods = m->modifiers | m->decl->method_decl.modifiers;
-  if (!(mods & MOD_PUBLIC))
+  /* An override takes the overridden member's accessibility: dropping a
+   * bare `override` row made Invoke fall through to the base row and run
+   * the base implementation. */
+  if (!(mods & (MOD_PUBLIC | MOD_OVERRIDE)))
     return false;
   return true;
 }

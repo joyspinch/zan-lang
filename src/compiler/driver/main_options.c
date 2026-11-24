@@ -167,6 +167,8 @@ void print_usage(void) {
   fprintf(stderr, "                     error = --deny-warnings)\n");
   fprintf(stderr, "    --suppress <list> Suppress warnings by numeric code, "
                   "e.g. W0003,0003\n");
+  fprintf(stderr, "    --diag <text|json> Diagnostic format; json = JSON Lines "
+                  "with fix-its\n");
   fprintf(stderr, "                     (comma/space separated; letter prefix "
                   "is optional)\n");
   fprintf(stderr, "    --dump-tokens   Dump lexer tokens and exit\n");
@@ -222,9 +224,7 @@ void print_usage(void) {
                   "a local package directory\n");
   fprintf(stderr, "    --package-scope <project|global>  Select install scope "
                   "(default: project)\n");
-  fprintf(
-      stderr,
-      "    --package-project <dir>  Project root for package discovery and\n");
+  fprintf(stderr, "    --package-project <dir>  Project root for package discovery and\n");
   fprintf(stderr, "                     project-scope installation\n");
 }
 

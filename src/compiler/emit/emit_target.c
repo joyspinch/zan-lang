@@ -361,14 +361,24 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
   g_di_emit_ctx = g;
   const char *eager_env = getenv("ZAN_EAGER_CODEGEN");
   bool eager_codegen = (eager_env && strcmp(eager_env, "1") == 0);
+  /* Ordinary (non -g) executable builds follow publish's closed-world
+   * rules, so reflection that works in development also works after
+   * --publish. They used to emit every body of every pulled-in file and a
+   * reflection thunk for every method: a small Gui test was 3.4M LLVM
+   * instructions, 90 s and 4 GB. ZAN_NO_DEV_PRUNE=1 restores full emission. */
+  const char *no_dev_prune = getenv("ZAN_NO_DEV_PRUNE");
+  bool dev_prune = !(no_dev_prune && strcmp(no_dev_prune, "1") == 0);
+  g->closed_world =
+      g->publish_mode || (dev_prune && !g->emit_debug && !g->emit_lib);
   const char *no_instance_prune = getenv("ZAN_NO_PUBLISH_INSTANCE_PRUNE");
   g->publish_instance_prune =
-      !g->emit_debug && !g->emit_lib && !eager_codegen &&
+      g->closed_world && !g->emit_debug && !g->emit_lib && !eager_codegen &&
       !(no_instance_prune && strcmp(no_instance_prune, "1") == 0);
   const char *no_reflect_demand = getenv("ZAN_NO_PUBLISH_REFLECT_DEMAND");
   g->publish_reflect_demand =
-      !g->emit_debug && !eager_codegen &&
+      g->closed_world && !g->emit_debug && !g->emit_lib && !eager_codegen &&
       !(no_reflect_demand && strcmp(no_reflect_demand, "1") == 0);
+  refl_collect_literal_names(g, unit);
   di_debug_types_reset();
   if (g->publish_mode && !g->emit_debug && !g->function_compactor) {
     char error[4096];
@@ -408,7 +418,12 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit) {
       g->publish_instance_prune &&
       !(no_vslot_demand && strcmp(no_vslot_demand, "1") == 0);
 
-  bool prune_stdlib_bodies = !g->emit_debug && !eager_codegen;
+  bool prune_stdlib_bodies =
+      (g->closed_world || g->obfuscate_strings) && !g->emit_debug &&
+      !eager_codegen;
+  /* Non-publish builds still generate unreached bodies once, for their
+   * codegen diagnostics, then drop them before LLVM optimizes. */
+  bool diag_unused_bodies = !g->publish_mode && !g->obfuscate_strings;
   unsigned char *live = (unsigned char *)calloc((size_t)work_count + 1, 1);
   for (int w = 0; w < work_count; w++) {
     zan_ast_node_t *m = work[w].member;
@@ -652,29 +667,46 @@ done:;
   free(work_ix.slots);
   /* Preserve ordinary/debug codegen diagnostics on user declarations after
    * freezing executable initialization demand. Stdlib/package bodies are
-   * skipped unless debug/eager codegen is requested. */
-  if ((!g->publish_mode && !g->obfuscate_strings) &&
-      !zan_diag_has_errors(g->diag)) {
+   * skipped unless debug/eager/ZAN_DIAG_LIB_BODIES=1 is requested. */
+  if (diag_unused_bodies && !zan_diag_has_errors(g->diag)) {
     unsigned char *diagnostic_live =
         (unsigned char *)calloc((size_t)work_count + 1, 1);
+    const char *diag_lib_env = getenv("ZAN_DIAG_LIB_BODIES");
+    bool diag_lib = diag_lib_env && strcmp(diag_lib_env, "1") == 0;
     for (int w = 0; w < work_count; w++) {
       if (live[w]) {
         diagnostic_live[w] = 2;
-      } else if (!sinit_is_cctor(work[w].member)) {
-        zan_symbol_t *owner = work[w].type_sym;
-        bool is_user_decl = owner && owner->decl && !owner->decl->from_stdlib &&
-                            !owner->decl->from_package;
-        if (!prune_stdlib_bodies || (is_user_decl && !work[w].cur_inst))
-          diagnostic_live[w] = 1;
+        continue;
       }
+      if (sinit_is_cctor(work[w].member))
+        continue;
+      zan_symbol_t *owner = work[w].type_sym;
+      bool is_lib = owner && owner->decl &&
+                    (owner->decl->from_stdlib || owner->decl->from_package);
+      if (prune_stdlib_bodies && ((is_lib && !diag_lib) || work[w].cur_inst))
+        continue;
+      diagnostic_live[w] = 1;
     }
     emit_demanded_method_bodies(g, work, work_count, diagnostic_live);
     emit_pending_method_specs(g);
     while (materialize_pending_gctx(g)) {
     }
     for (int w = 0; w < work_count; w++) {
-      if (!live[w] && diagnostic_live[w] == 2)
+      if (live[w])
+        continue;
+      if (prune_stdlib_bodies) {
+        /* Root-reachable set is fixed above; this body (and whatever
+         * it demanded) existed only for its diagnostics. The dead-stub
+         * loop below gives it an unreachable body, as publish does. */
+        zan_llvm_delete_body(work[w].fn);
+        if (work[w].resume_fn)
+          zan_llvm_delete_body(work[w].resume_fn);
+        /* emitting the body already released param_types */
+        if (diagnostic_live[w] == 2)
+          work[w].param_types = NULL;
+      } else if (diagnostic_live[w] == 2) {
         live[w] = 3;
+      }
     }
     free(diagnostic_live);
   }
@@ -1669,6 +1701,37 @@ static zan_status_t prepare_target_output(zan_irgen_t *g, const char *stage) {
   return ZAN_OK;
 }
 
+/* Split object emission when the optimized module is large enough that a
+ * single-threaded codegen pass dominates time and memory. ZAN_CODEGEN_SPLIT=0
+ * disables it; =N forces N partitions. */
+static bool zan_codegen_split_plan(zan_irgen_t *g, int *parts, int *threads) {
+    const char *env = getenv("ZAN_CODEGEN_SPLIT");
+    long forced = env && *env ? strtol(env, NULL, 10) : -1;
+    if (forced == 0 || !g->split_codegen_ok || g->emit_debug || g->emit_lib) return false;
+    long insns = 0;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn; fn = LLVMGetNextFunction(fn))
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+            for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in))
+                insns++;
+    long cpus = 1;
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cpus = (long)si.dwNumberOfProcessors;
+#else
+    cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (cpus < 1) cpus = 1;
+    if (cpus > 16) cpus = 16;
+    if (forced < 0 && (insns < 200000 || cpus < 2)) return false;
+    long n = forced > 0 ? forced : insns / 100000;
+    if (n < 2) n = 2;
+    if (n > 16) n = 16; /* keeps the link line short (cmd.exe caps at 8191) */
+    *parts = (int)n;
+    *threads = (int)(cpus < n ? cpus : n);
+    return true;
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
   LLVMTargetMachineRef tm;
   if (zan_irgen_create_target_machine(g, &tm) != ZAN_OK)
@@ -1685,6 +1748,50 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     return ZAN_ERROR;
   }
   char *error = NULL;
+  int parts = 0, threads = 1;
+  if (zan_codegen_split_plan(g, &parts, &threads)) {
+    size_t plen = strlen(path);
+    char **paths = (char **)calloc((size_t)parts, sizeof(char *));
+    bool ok = paths != NULL;
+    for (int i = 0; ok && i < parts; i++) {
+      paths[i] = (char *)malloc(plen + 24);
+      if (!paths[i]) {
+        ok = false;
+        break;
+      }
+      if (i == 0)
+        memcpy(paths[i], path, plen + 1);
+      else
+        snprintf(paths[i], plen + 24, "%s.p%d.o", path, i);
+    }
+    if (ok) {
+      LLVMModuleRef mod = g->mod;
+      g->mod = NULL; /* owned and disposed by the splitter */
+      int rc = zan_codegen_split_emit(mod, tm, parts, threads,
+                                      (const char *const *)paths, &error);
+      LLVMDisposeTargetMachine(tm);
+      if (rc != 0) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,
+                           "failed to emit object file: %s",
+                           error ? error : "?");
+        free(error);
+        for (int i = 0; i < parts; i++) {
+          remove(paths[i]);
+          free(paths[i]);
+        }
+        free(paths);
+        return ZAN_ERROR;
+      }
+      g->split_objs = paths;
+      g->split_obj_count = parts;
+      return ZAN_OK;
+    }
+    if (paths) {
+      for (int i = 0; i < parts; i++)
+        free(paths[i]);
+      free(paths);
+    }
+  }
   if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path, LLVMObjectFile,
                                   &error)) {
     zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3092,

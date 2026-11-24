@@ -125,7 +125,7 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 # distribution builds them (e.g. mozbuild clang omits RISCV). Link �� and
 # initialize, via HAVE_LLVM_* defines �� only the ones this LLVM provides.
 set(ZAN_LLVM_COMPONENTS
-    core support analysis bitwriter target
+    core support analysis bitwriter bitreader transformutils target
     x86codegen x86asmparser x86desc x86info
     aarch64codegen aarch64asmparser aarch64desc aarch64info
     passes
@@ -188,6 +188,7 @@ add_executable(zanc
     src/compiler/irgen_stmt.c
     src/compiler/irgen_weak.c
     src/compiler/irgen_compact.cpp
+    src/compiler/codegen_split.cpp
     src/compiler/optimizer.c
     src/compiler/package.c
     src/compiler/crosscomp.c
@@ -402,6 +403,7 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_leak.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
@@ -1888,6 +1890,32 @@ add_test(NAME diag_method_group_signature_mismatch
     "-DEXPECT_REGEX=method .Handle. cannot be converted to delegate type .Act.: signature is not compatible"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_signature_mismatch PROPERTIES TIMEOUT 60)
+
+# S1（docs/ZAN_STANDARD.md §1）：--diag=json 契约——纯 JSON Lines、E0032 位置、
+# 缺分号 fix-it 坐标，且把补丁按 offset 应用回源码后必须能编译通过。
+add_test(NAME diag_json_fixit
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/diag_json_missing_semicolon.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_json_fixit${_exe_ext}
+    -DFIXED_SRC=${CMAKE_BINARY_DIR}/test-out/diag_json_fixit/fixed.zan
+    -DEXPECT_CODE=E0032 -DEXPECT_LINE=9 -DEXPECT_COL=9
+    -DEXPECT_FIX_LINE=8 -DEXPECT_FIX_COL=18 -DEXPECT_FIX_TEXT_ASCII=59
+    -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
+set_tests_properties(diag_json_fixit PROPERTIES TIMEOUT 120)
+
+# S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出报告——孤儿环逐条打印路径；
+# Environment.Exit 时栈帧/静态字段持有的对象是根，不误报。
+foreach(_leak_case leak_cycle_report leak_exit_roots)
+  add_test(NAME ${_leak_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/leak/${_leak_case}.zan
+      -DEXPECT=${CMAKE_SOURCE_DIR}/tests/leak/${_leak_case}.expect
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/${_leak_case}${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_leak_report.cmake)
+  set_tests_properties(${_leak_case} PROPERTIES TIMEOUT 120)
+endforeach()
 
 # Target-typed overload selection rejects invalid receiver forms and signatures.
 foreach(_selected_case receiver signature)

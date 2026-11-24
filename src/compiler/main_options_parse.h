@@ -67,6 +67,7 @@ typedef struct zan_options {
   bool diagnostics_jsonl;
   const char *warn_level_arg;
   const char *suppress_arg;
+  const char *diag_format_arg; /* S1 --diag=text|json */
   zan_pkg_scope_t package_scope;
   int opt_level;
   zan_opt_knobs_t opt_knobs;

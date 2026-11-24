@@ -1306,7 +1306,9 @@ static void zan_request_live_registry(zan_irgen_t *g) {
   bool uses = zan_module_calls(g->mod, "zan_gc_detect_cycles") ||
               zan_module_calls(g->mod, "zan_gc_collect_cycles") ||
               zan_module_calls(g->mod, "zan_gc_write_heap_snapshot") ||
-              zan_module_calls(g->mod, "zan_rt_heap_diagnostics_enable");
+              zan_module_calls(g->mod, "zan_rt_heap_diagnostics_enable") ||
+              /* S13：--check-leaks 退出报告要在注册表上做试探删除找孤儿环 */
+              zan_module_calls(g->mod, "zan_rt_leak_cycles");
   /* 分配/释放处的注册表调用先内联读模块内开关 __zan_live_on（irgen_weak.c）。
    * 用 GC API 的程序编译期置 1；否则在保留检测钩子的模块（--check-leaks /
    * --emit-lib）由启动构造器按 ZAN_DETECT_LEAKS 置位；普通模块已剪除

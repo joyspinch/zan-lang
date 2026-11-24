@@ -1,13 +1,8 @@
 static void sh_probe_mem(const char *tag) {
-#ifdef _WIN32
     if (!getenv("ZAN_PROBE_MEM")) return;
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
-        fprintf(stderr, "    [probe %-22s Commit: %4zu MB, Peak: %4zu MB]\n",
-                tag, pmc.PagefileUsage / (1024 * 1024),
-                pmc.PeakPagefileUsage / (1024 * 1024));
-    }
-#endif
+    zan_procmem_t pm = zan_procmem_read();
+    fprintf(stderr, "    [probe %-22s Commit: %4zu MB, Peak: %4zu MB]\n", tag,
+            pm.commit / (1024 * 1024), pm.peak / (1024 * 1024));
 }
 
 enum {

@@ -257,3 +257,11 @@ extern "C" LLVMTargetMachineRef zan_create_target_machine_with_options(
         triple, cpu, features, options, llvm::Reloc::PIC_, {}, opt_level);
     return reinterpret_cast<LLVMTargetMachineRef>(machine);
 }
+
+extern "C" void zan_llvm_delete_body(LLVMValueRef function) {
+    auto *fn = llvm::dyn_cast_or_null<llvm::Function>(llvm::unwrap(function));
+    if (!fn || fn->isDeclaration()) return;
+    llvm::GlobalValue::LinkageTypes linkage = fn->getLinkage();
+    fn->deleteBody();
+    fn->setLinkage(linkage);
+}

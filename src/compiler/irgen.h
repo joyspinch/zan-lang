@@ -453,6 +453,18 @@ struct zan_irgen {
    * module's malloc/free/calloc/realloc declarations to rt_mem.c's
    * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
   bool route_fast_alloc;
+  /* Executable builds without -g (publish or not) use closed-world rules:
+   * demand-driven method bodies and reflection thunks only for what the
+   * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
+   * every body and a thunk for every method. Set by zan_irgen_emit. */
+  bool closed_world;
+  /* Set by the driver for native, non-cross executable builds: object
+   * emission may split a large module across threads (codegen_split.h).
+   * The extra partition objects are listed here for the linker. */
+  bool split_codegen_ok;
+  struct refl_inst_index *refl_inst_index; /* reflect_fields.c, lazily built */
+  char **split_objs;
+  int split_obj_count;
 
   LLVMValueRef fn_printf;
   LLVMTypeRef printf_type;
@@ -601,6 +613,10 @@ struct zan_irgen {
   int refl_invoke_name_cap;
   bool refl_invoke_unknown; /* computed Invoke name preserves all callable hooks
                              */
+  /* Sorted identifier-shaped string literals of the whole compilation unit:
+   * the names a computed Invoke can plausibly produce (closed world only). */
+  zan_istr_t *refl_literal_names;
+  int refl_literal_name_count;
   LLVMTypeRef
       refl_field_type; /* { i8* name, i8* typeName, i64 kind, i64 off } */
   LLVMValueRef refl_empty_str;

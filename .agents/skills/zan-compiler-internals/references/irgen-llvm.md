@@ -763,6 +763,61 @@ try 内抛出经调用点的 lpad 展开，try 外上报后返回。需先跑内
 同期发现：LLVM 23 删了 `default<Os>/<Oz>`，体积档改 O2 管线 + optsize/minsize
 （必须在 `zan_opt_run_passes_on_module` 内做，分片模块也走这里）；Unix 宿主
 `cc` 链接行从不带发布分片对象（generated_objects），任何分片发布都缺符号。
-剩余大头是开发构建为每个方法生成反射 thunk（gui_tabs 8.4k 个，占函数 40%），
-发布构建只给访问器/注解/事件处理器——开发与发布反射语义不一致，是待定的
-语言决策（实验：开发构建套用发布规则 + 未达方法体置桩，gui_tabs 23s/1.3GB）。
+剩余大头是开发构建为每个方法生成反射 thunk（gui_tabs 8.4k 个，占函数 40%）。
+
+## 34. 普通构建走封闭世界：开发能反射调用的 = 发布后能调用的（2026-11-24）
+
+`g->closed_world = publish_mode || (!-g && !库 && !ZAN_NO_DEV_PRUNE=1)`。普通构建
+复用发布的按需方法体与反射可调用面；未达方法体仍生成一遍拿代码生成诊断，随后
+`zan_llvm_delete_body` 删掉（保 linkage），交给死桩循环——注意 body 已释放
+`param_types`，删前置 NULL，否则 double free（rc 134）。gui_tabs 45s/2.2GB →
+22s/1.3GB。
+
+切换当天普通构建即暴露两个**发布早已存在**的静默错误，教训：反射规则只在
+`--publish` 生效时，它的 bug 没有测试面——让日常构建走同一规则才有覆盖：
+- `obj.InvokeInt("Add6", …)` 普通公开方法：thunk 只给钩子，Invoke 静默返回 0。
+  现规则：字面名被 Invoke 点到的任何方法给 thunk；有计算名 Invoke 时，再给名字在
+  整个编译单元以标识符形字符串字面量出现过的方法（`refl_collect_literal_names`，
+  emit 开头一次 AST 遍历、排序去重、bsearch）。Gui 的 PropSpec/DocWire 都有计算名
+  Invoke：一律全给是 28s/1.8GB，按字面量池收窄后 21.6s/1.34GB。运行期纯拼接名
+  不支持，方法加特性保留。用例 `reflect_invoke_computed_name`。
+- 不带 `public` 的 `override`：行不导出，Invoke 落到基类行跑基类实现。
+  override 继承被覆盖成员可见性。
+
+验证坑：`run_case.cmake` 在 exe 比 zanc/源码新时**复用旧 exe**——换环境变量做
+A/B 前必须 `touch build/zanc`，否则基线跑的是上一轮的二进制。
+
+## 35. 编译器"内存泄漏"先分清泄漏、常驻与峰值（2026-11-24 Mac arm64 实证）
+
+`leaks --atExit`（`MallocStackLogging=1`）编自举编译器只漏 36MB，几乎全是从不
+`LLVMContextDispose` 的上下文——不是峰值来源。峰值用 `--time`（macOS/Linux 已接
+`procmem.h`）分阶段看：自举 -O2 前端 52MB、irgen 500MB、优化 700MB、**目标文件
+代码生成 1.8GB**。拿 `--emit-ir` 产物喂原版 `llc -O2` 同样 27s/2.0GB，`-filetype=null`
+也一样——是 LLVM 代码生成随**整个模块**累积，与单个大函数无关（最大函数单独
+`llvm-extract` 后 llc 只要 170MB），切四份每份 ~500MB。
+
+三处修复：
+- 字符串长度探测逐点内联 ~30 条指令/10 个块，改调共享内部函数
+  `__zan_str_len[_arr]`（参数带 file/line/col 供空值报告）：自举 IR 1.37M → 934K，
+  -O0 5.5s/594MB → 4.4s/476MB，产物 12.3MB → 8.4MB。
+- 超大函数（>4000 条）加 optsize 压低往里内联：-O2 峰值再降 ~200MB，运行速度不变。
+- `codegen_split.cpp`：优化**之后** SplitModule 切分、写 bitcode、释放原模块、各线程
+  独立 context 重载并发射。不同于发布 shard（优化前切，丢跨分片内联，自举编译器
+  实测运行慢 45%），这条路运行速度不变、输出逐字节相同；代码生成 25s → 9.7s。
+
+验证坑：机器负载高（其他会话并行构建，load 12–16）时单次计时可差 40%，
+运行速度对比必须交替多轮跑。
+
+## 36. irgen 慢先 `sample`，别猜（2026-11-24）
+
+普通构建切到封闭世界后 gui_tabs 的 irgen 占 11s。直觉是"诊断补发未达方法体"，
+改掉后内存 1.26GB → 767MB，但 irgen 只降到 8.3s。`sample <pid> 5` 一看：
+`refl_owner_can_have_instance` 占 3589/4000 样本——每个方法、每轮固定点都重扫全部
+分配点与全部类基链，O(方法×站点)。改为增量索引（站点/struct 只增不减，新项各
+折入一次；"vtable 被存入对象"命中后永久记真，未命中下次再查），irgen 8.3s → 1.8s。
+gui_tabs 全程 21.6s/1.34GB → 11.9s/760MB。谓词从"只在发布跑"变成"每次构建跑"
+时，它的复杂度问题才会暴露——同 §34 的教训。
+
+诊断补发现仅限用户源码：封闭世界下未达的 stdlib/`packages/` 方法不再生成
+（`from_stdlib`/`from_package` 看 `type_sym->decl`）；`-g` 等全量构建不能跳过——
+那里补发的方法体会以 live=3 保留给反射。`ZAN_DIAG_LIB_BODIES=1` 恢复库覆盖。

@@ -603,13 +603,32 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
         LLVMSetSection(usedg, "llvm.metadata");
         LLVMSetInitializer(usedg, LLVMConstArray(ptr, &ent, 1));
     } else {
-        /* register in llvm */
+        /* register in llvm (merge existing llvm.global_ctors e.g. __zan_stdio_init) */
         LLVMValueRef fields[] = { LLVMConstInt(i32, 65535, 0), fn, LLVMConstNull(ptr) };
-        LLVMValueRef entryc = LLVMConstStruct(fields, 3, 0);
-        LLVMTypeRef arrty = LLVMArrayType(LLVMTypeOf(entryc), 1);
+        LLVMValueRef entryc = LLVMConstStructInContext(g->ctx, fields, 3, 0);
+        LLVMTypeRef entry_ty = LLVMTypeOf(entryc);
+        LLVMValueRef records[64];
+        int count = 0;
+        LLVMValueRef old = LLVMGetNamedGlobal(g->mod, "llvm.global_ctors");
+        if (old) {
+            LLVMValueRef init = LLVMGetInitializer(old);
+            unsigned n = init ? LLVMGetArrayLength(LLVMTypeOf(init)) : 0;
+            for (unsigned i = 0; i < n && count < 63; i++) {
+                LLVMValueRef elem = LLVMGetAggregateElement(init, i);
+                if (LLVMTypeOf(elem) == entry_ty)
+                    records[count++] = elem;
+            }
+            LLVMSetValueName2(old, "", 0);
+        }
+        records[count++] = entryc;
+        LLVMTypeRef arrty = LLVMArrayType(entry_ty, (unsigned)count);
         LLVMValueRef gc = LLVMAddGlobal(g->mod, arrty, "llvm.global_ctors");
         LLVMSetLinkage(gc, LLVMAppendingLinkage);
-        LLVMSetInitializer(gc, LLVMConstArray(LLVMTypeOf(entryc), &entryc, 1));
+        LLVMSetInitializer(gc, LLVMConstArray(entry_ty, records, (unsigned)count));
+        if (old) {
+            LLVMReplaceAllUsesWith(old, gc);
+            LLVMDeleteGlobal(old);
+        }
     }
 }
 

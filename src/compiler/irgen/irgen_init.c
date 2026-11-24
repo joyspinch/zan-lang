@@ -298,12 +298,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMValueRef ctor_fields[] = {
         LLVMConstInt(sm_i32, 65535, 0), init_fn,
         LLVMConstNull(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0))};
-    LLVMTypeRef ctor_ty = LLVMStructTypeInContext(
-        g->ctx,
-        (LLVMTypeRef[]){sm_i32, LLVMTypeOf(init_fn),
-                        LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)},
-        3, 0);
-    LLVMValueRef ctor_c = LLVMConstStruct(ctor_fields, 3, 0);
+    LLVMValueRef ctor_c =
+        LLVMConstStructInContext(g->ctx, ctor_fields, 3, 0);
     LLVMTypeRef ctor_arr = LLVMArrayType(LLVMTypeOf(ctor_c), 1);
     LLVMValueRef ctors = LLVMAddGlobal(g->mod, ctor_arr, "llvm.global_ctors");
     LLVMSetLinkage(ctors, LLVMAppendingLinkage);
@@ -993,28 +989,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 }
 
 void zan_irgen_release_llvm(zan_irgen_t *g) {
-  if (!g)
-    return;
-  if (s_current_irgen == g)
-    s_current_irgen = NULL;
-  if (g_di_emit_ctx == g)
-    g_di_emit_ctx = NULL;
-  zan_irgen_compactor_destroy((zan_irgen_compactor_t *)g->function_compactor);
-  g->function_compactor = NULL;
-  if (g->builder) {
-    LLVMDisposeBuilder(g->builder);
-    g->builder = NULL;
-  }
-  if (g->mod) {
-    LLVMDisposeModule(g->mod);
-    g->mod = NULL;
-  }
-  free(g->functions);
-  g->functions = NULL;
-  g->function_count = g->function_cap = 0;
   free(g->fn_index);
   g->fn_index = NULL;
   g->fn_index_cap = 0;
+  refl_inst_index_free(g);
   free(g->struct_types);
   g->struct_types = NULL;
   g->struct_type_count = g->struct_type_cap = 0;

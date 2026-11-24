@@ -166,6 +166,15 @@ ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点�
 file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
 trace 的事件序为准，不要顺着报表的站点名硬找。
 
+退出报告还会对残留对象做试探删除（S13）：引用计数高于"来自其他残留对象的
+强引用数"者是根（栈帧、静态字段、未登记对象持有），根可达的都不算；其余
+孤儿只被孤儿引用——ARC 回收不了的环，逐条打印路径，例如
+`cycle: Node@a.zan:5:35 .Next -> List<Node>@a.zan:3:57 [0] -> Node@a.zan:5:35`
+（`.字段`、`[下标]`、Dict 的 `(key)`/`(value)`）。判定口径按退出方式分：
+Main 正常返回（静态字段已释放）时残留对象一律算泄漏；`Environment.Exit` 等
+在 Main 返回前退出时栈帧与静态字段仍活着，只有孤儿环才算泄漏，报表首行写明
+`in unreachable cycles at exit`。
+
 ### 1.6 Windows 进程性能采集
 
 [`profile_process.ps1`](../scripts/profile_process.ps1) 需要 Windows 和 PowerShell 7.2 或更新版本。它在进程外采样，适用于已运行的 Zan 服务和其他原生程序。多进程服务应选择实际执行请求的 worker PID。
@@ -260,6 +269,39 @@ pwsh -NoProfile -File scripts/analyze_request_profile.ps1 -SnapshotPath pages.js
 
 排查内存增长时，可在同一 `--check-leaks` 构建的预热后、等量负载后及空闲期分别调用 `System.GC.WriteHeapSnapshot(path)`，比较各类型和源码分配点的存活数量、字节数。没有源码标签的分配记为 `<unknown>`。跨轮持续增长可以定位仍存活对象的分配位置，保留它们的引用仍需结合对象生命周期调查。短时锁住对象跟踪表的开销应计入诊断窗口。请求追踪的环形缓冲也会在填满前增长，排查业务内存时可关闭采集或先让缓冲区达到稳态。`System.GC.DetectCycles()` 能发现孤儿循环，仍被全局缓存等根对象引用的数据需要另查其生命周期。
 
+### 1.8 机器可读诊断（`--diag=json`）
+
+给 AI agent 与工具用的诊断通道（`docs/ZAN_STANDARD.md` S1）。stderr 只输出
+JSON Lines，每行一个对象；文本格式（默认）不受影响、逐字节不变。
+
+```bash
+build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag.jsonl
+```
+
+实际输出（每个对象一行，此处为可读性折行）：
+
+```json
+{"kind":"diagnostic","severity":"error","code":"E0032","message":"expected ';', got 'int'",
+ "file":"tests/diag/diag_json_missing_semicolon.zan","line":9,"col":9,"offset":338,
+ "fixits":[{"file":"tests/diag/diag_json_missing_semicolon.zan","line":8,"col":18,"offset":329,"length":0,"text":";"}]}
+{"kind":"summary","errors":1,"warnings":0,"suppressed":0}
+```
+
+字段契约：
+
+| 字段 | 含义 |
+|---|---|
+| `kind` | `diagnostic` / `summary`；消费方遇到未知 `kind` 应忽略（向前兼容） |
+| `severity` | `error` / `warning` / `note`；被 `--deny-warnings` 升级的告警为 `error` |
+| `code` | 诊断编号如 `E0032` / `W2072`，字母按**发射时**级别；未编号为 `null` |
+| `message` | 不含 `[E####]` 前缀的消息正文 |
+| `file` `line` `col` `offset` | 位置：`line`/`col` 1 起，**`col` 按字节计**；`offset` 0 起字节偏移 |
+| `fixits[]` | 机器可应用补丁：把 `[offset, offset+length)` 字节替换为 `text`，`length = 0` 即插入；可能为空数组 |
+| summary `errors` `warnings` `suppressed` | 计数；`suppressed` = 错误上限与单行级联帽丢弃的条数；进程退出前输出 |
+
+当前带 fix-it 的诊断：E0032 缺 `;`（插在上一个 token 末尾；上一个 token 是
+字符串或运算符等量不出长度时不给补丁）。退出码语义与文本格式相同。
+
 ## 2. 全参数表（与 `zanc --help` 同源）
 
 > 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。
@@ -331,6 +373,7 @@ pwsh -NoProfile -File scripts/analyze_request_profile.ps1 -SnapshotPath pages.js
 | `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
 | `--warn-level <none\|default\|error>` | `default` | `none` 不打印警告；`default` 正常；`error` 等同 `--deny-warnings`；非法值报错退出 2 |
 | `--suppress <list>` | — | 按编号抑制**警告**（逗号/空格分隔，字母前缀可省，如 `W0003,0003`）；与 `--deny-warnings`/`--warn-level=error` 同用时警告已升级为错误，不再被抑制 |
+| `--diag <text\|json>` | `text` | 编译期诊断输出格式。`json` 为 JSON Lines（字段契约见 §1.8），供 AI/工具直接消费；非法值报错退出 2。钉：`diag_json_fixit` |
 | `--dump-tokens` | — | 词法 token 后退出 |
 | `--dump-ast` | — | 打印语法树后继续编译 |
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
@@ -415,8 +458,13 @@ GUI 窗口 HTML 与片段在发布时逐项声明。直接调用 zanc 时传入
 | `ZAN_VERBOSE_LINK` | 回显原生链接命令行（查 -L/-l 从哪来） |
 | `ZAN_PULLIN_DEBUG` | 打印 stdlib 拉入决策（`incl <文件> because <名字>`：`controller` 表示按 MVC 控制器常驻拉入） |
 | `ZAN_LINK_ECHO` | 回显链接命令（含 Unix 宿主 `cc` 链接，可看分片对象是否在链接行上） |
+| `ZAN_CODEGEN_SPLIT` | 优化后的模块 ≥20 万条指令时，目标文件代码生成按 `llvm::SplitModule` 切成多份、多线程并行发射（各线程独立 LLVMContext/TargetMachine，额外分区 `<out>.o.p<N>.o` 一并链接）；只影响本机、非交叉、非 `-g`、非库构建，不影响内联与运行速度。`=0` 关闭，`=N` 强制 N 份（上限 16，保持链接命令行短于 cmd.exe 的 8191 字符） |
+| `ZAN_HUGE_FN` | `-O2`/`-O3` 时，优化前指令数超过此值（默认 4000，`0` 关闭）的函数加 `optsize`，降低往超大分派函数里内联的阈值 |
+| `ZAN_DIAG_LIB_BODIES` | `=1` 时普通（封闭世界）构建也为未达到的标准库/`packages/` 方法生成一遍代码以报代码生成诊断（默认只诊断用户源码里未达到的方法；库由自身构建与测试覆盖） |
+| `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
+| `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |
 | `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |
 | `ZAN_NO_PUBLISH_VSLOT_DEMAND` | `=1` 时恢复完整虚表槽引用；默认发布构建按实际发射的虚调用槽保留实现。调试、库构建以及外部接口可能供应实例时采用保守保留，用于回归定位 |
 | `ZANC_DUMP_BAD_IR` | LLVM verifier 拒绝时 dump 挂掉函数的 IR（定位 verifier 错误第一工具） |
@@ -431,6 +479,7 @@ GUI 窗口 HTML 与片段在发布时逐项声明。直接调用 zanc 时传入
 ### 运行期（编译产物读；exe 已定型，env 是唯一现成通道）
 | 变量 | 作用 |
 |---|---|
+| `ZAN_LEAK_LOG` | `--check-leaks` 产物退出时把泄漏报表副本追加到此路径（默认工作目录下 `zan_leaks.log`；设为空串只打印不落盘）。测试驱动指向 `build/test-out/leaks/<用例>.log`，不再污染仓库根 |
 | `ZAN_RT_HARD` | 非空且非 `0` 时守卫失败硬退出（等效 `--strict-runtime`）；`=0` 显式强制软模式 |
 | `ZAN_CO_WORKERS` | 多 worker 协程调度器的 worker 数（native 64-bit 目标默认即多 worker 驱动，无需任何构建旗标；默认=min(逻辑核数，4)，见 `AsyncRuntime.SetWorkers` 优先） |
 | `ZAN_CO_QUANTUM_MS` | 协程协作式抢占的时间片（毫秒，默认 2，0=关闭）：编译器在 async 函数的每个循环回边埋 `zan_co_poll`，超片的计算密集帧自动重排到队尾，不再饿死定时器/IO 回调/兄弟协程；片长记账走微秒级单调钟（Windows QPC，POSIX CLOCK_MONOTONIC），2ms 就是真 2ms |
@@ -467,6 +516,13 @@ stamp，并发构建会让无关用例成批假红）。
 2. **重新 configure**（`cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`）
    ——GLOB 在 configure 期展开，不重跑 ctest 看不到新用例。
 3. `ctest -R conformance_<name>` 验证。
+
+**泄漏门禁（S10）**：经 `tests/run_case.cmake` 的用例默认追加 `--check-leaks` 编译，
+退出时仍可达对象数必须为 0——泄漏报表从 stdout 尾部切下单独判定，不进金样对账。
+`--publish` / `--no-check-leaks` / `-DLEAK_GATE=OFF` 的用例不设门禁。门禁上线时已有
+的泄漏登记在 `tests/leak_baseline.txt`（按产物名），**只减不增**：登记用例不再泄漏会
+变红，提醒删行；新用例泄漏要修（`weak` 打环、退订、Dispose），不许登记。
+报表里的 `cycle:` 行（见上文 S13）直接给出要打断的环。
 
 ### 模板门配方（tests/run_templates.cmake 实际做的事）
 模板不是"直接编模板树"，而是脚手架后编译：

@@ -103,5 +103,6 @@ static void timer_yield(void) { sched_yield(); }
  *    深树延迟释放队列（wasm/bare 走 IR 弱空实现） */
 #if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
 #include "timer/rt_timer_gc.c"
+#include "timer/rt_timer_leak.c"
 #include "timer/rt_timer_defer.c"
 #endif
