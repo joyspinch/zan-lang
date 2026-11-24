@@ -161,6 +161,15 @@ ARC 事件（alloc/retain/release/release-dyn，含对象地址、分配站点�
 file:line 键控），同形状分配点会互相顶掉名字——定位持有人时以
 trace 的事件序为准，不要顺着报表的站点名硬找。
 
+退出报告还会对残留对象做试探删除（S13）：引用计数高于"来自其他残留对象的
+强引用数"者是根（栈帧、静态字段、未登记对象持有），根可达的都不算；其余
+孤儿只被孤儿引用——ARC 回收不了的环，逐条打印路径，例如
+`cycle: Node@a.zan:5:35 .Next -> List<Node>@a.zan:3:57 [0] -> Node@a.zan:5:35`
+（`.字段`、`[下标]`、Dict 的 `(key)`/`(value)`）。判定口径按退出方式分：
+Main 正常返回（静态字段已释放）时残留对象一律算泄漏；`Environment.Exit` 等
+在 Main 返回前退出时栈帧与静态字段仍活着，只有孤儿环才算泄漏，报表首行写明
+`in unreachable cycles at exit`。
+
 ### 1.6 机器可读诊断（`--diag=json`）
 
 给 AI agent 与工具用的诊断通道（`docs/ZAN_STANDARD.md` S1）。stderr 只输出
@@ -376,6 +385,7 @@ stamp，并发构建会让无关用例成批假红）。
 `--publish` / `--no-check-leaks` / `-DLEAK_GATE=OFF` 的用例不设门禁。门禁上线时已有
 的泄漏登记在 `tests/leak_baseline.txt`（按产物名），**只减不增**：登记用例不再泄漏会
 变红，提醒删行；新用例泄漏要修（`weak` 打环、退订、Dispose），不许登记。
+报表里的 `cycle:` 行（见上文 S13）直接给出要打断的环。
 
 ### 模板门配方（tests/run_templates.cmake 实际做的事）
 模板不是"直接编模板树"，而是脚手架后编译：

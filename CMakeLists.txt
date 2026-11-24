@@ -382,6 +382,7 @@ add_custom_command(
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_leak.c
             ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
             ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
     COMMENT "Building unified timer runtime object (zanrt_timer)"
@@ -1849,6 +1850,19 @@ add_test(NAME diag_json_fixit
     -DEXPECT_FIX_LINE=8 -DEXPECT_FIX_COL=18 -DEXPECT_FIX_TEXT_ASCII=59
     -P ${CMAKE_SOURCE_DIR}/tests/run_diag_json.cmake)
 set_tests_properties(diag_json_fixit PROPERTIES TIMEOUT 120)
+
+# S13（docs/ZAN_STANDARD.md §3）：--check-leaks 退出报告——孤儿环逐条打印路径；
+# Environment.Exit 时栈帧/静态字段持有的对象是根，不误报。
+foreach(_leak_case leak_cycle_report leak_exit_roots)
+  add_test(NAME ${_leak_case}
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/leak/${_leak_case}.zan
+      -DEXPECT=${CMAKE_SOURCE_DIR}/tests/leak/${_leak_case}.expect
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/${_leak_case}${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_leak_report.cmake)
+  set_tests_properties(${_leak_case} PROPERTIES TIMEOUT 120)
+endforeach()
 
 # Target-typed overload selection rejects invalid receiver forms and signatures.
 foreach(_selected_case receiver signature)

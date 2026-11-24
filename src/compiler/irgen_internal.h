@@ -409,6 +409,8 @@ void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 void emit_rc_retain_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);
 void emit_site_dtor_table(zan_irgen_t *g);
 void emit_site_field_graph_table(zan_irgen_t *g);
+LLVMValueRef zan_site_field_names_global(zan_irgen_t *g);
+LLVMValueRef zan_leak_main_done_global(zan_irgen_t *g);
 void emit_site_live_tables(zan_irgen_t *g);
 void emit_site_tyname_table(zan_irgen_t *g);
 void emit_string_release(zan_irgen_t *g, LLVMValueRef v);
