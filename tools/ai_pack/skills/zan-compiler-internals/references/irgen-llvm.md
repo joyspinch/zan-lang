@@ -681,3 +681,17 @@ failed await 与消费式 Task<T>.Result 共用 EmitAwaitCheckExc：先检查 fr
 - `map_type(TYPE_DELEGATE)` 只映射 opaque value pointer；调用点与 thunk 独立构造 `LLVMFunctionType`。为值指针递归展开签名会让 `delegate void R(R next)` 在编译期栈溢出（无诊断，Windows exit `-1073741571`），不能误判成程序运行失败。
 - `type_mentions_tp` 用当前路径 visited 跳过同指针环，继续检查其他分支；64 层预算耗尽保守返回 true。此项是静态防护，不是递归类型相等、替换或任意深度泛型图已正确的证明；本轮未单独隔离验证 visited 分支及预算边界。
 - 主代理收据：新 host build exit0；仅定向 `method_group_target_contexts`，host/gen1 各阶段全 PASS，含递归委托赋值、`recursive(null)` 及精确 golden。该结果不外推为全量 conformance、bootstrap 固定点或全部递归泛型已验证。
+
+## 30. Mach-O 上 thread_local 永远是一次调用（2026-11-23 Mac arm64 实证）
+
+- `LLVMInitialExecTLSModel` 在 Mach-O 上不生效：任何 thread_local 访问都编成
+  经 TLV 描述符的 `blr`（`_tlv_get_addr`），约 0.5 ns，接近一次空调用的一半。
+  EH 状态（`__zan_eh_self`）每个可抛函数入口读一次，递归/小函数密集时可见。
+- Apple arm64 改走 pthread TSD 直读：`mrs TPIDRRO_EL0` & ~7，再取 `base[key]`
+  （`pthread_getspecific` 的实现本身）。key 惰性创建并**自检**（setspecific
+  后直读必须读回同值），不符就把 key 置 -1，退回原 TLV 缓存路径——快路径不依赖
+  未经验证的布局。fib(35)：48 ms → 28~31 ms。
+- 判定 Apple 目标要看 `LLVMGetTarget(g->mod)`：宿主构建时 `g->target_triple`
+  是空串（只有交叉编译才填），按它判平台的分支在本机构建里静默不生效。
+- 量 TLS 收益别用会被内联的循环：内联后读状态被提出循环，差异为零；用递归或
+  虚调用，并用 otool 确认入口序列确实变了。
