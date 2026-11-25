@@ -1,0 +1,290 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+public delegate string InputFilterFn(string candidate);
+
+// Input / TextArea 共享文本编辑基类：统一文本缓冲、绑定同步、选区/光标、
+// Undo/Redo、过滤与通用键盘路由，消除单行与多行编辑控件的重复实现。
+public class TextInputBase : Control {
+    protected string editText;
+    protected TextEditBuffer editBuf;
+    public Binding<string> Text;
+    public string hint;
+    public int cursorPos;
+    public int selAnchor;
+    public int wid;
+    public weak App liveApp;
+    public string errMsg;
+    public int MaxLen;
+    public bool ShowCount;
+    public bool CountGraphemes;
+    public bool Round;
+    public string FieldStatus;
+    public long lastKeyNamedSeq;
+    public InputFilterFn Filter;
+    // 文本变化时触发（C# 风格：`ctrl.Change += h;`）。
+    [Event]
+    public UiEvent Change;
+
+    protected void InitTextInput(string controlKind, Binding<string> text, string hintText) {
+        this.InitControl(controlKind);
+        Text = "";
+        if (text != null) { Text = text; }
+        editText = Text.Get();
+        editBuf = new TextEditBuffer(editText);
+        hint = hintText;
+        cursorPos = 0;
+        selAnchor = -1;
+        wid = this.CommonId();
+        errMsg = "";
+        MaxLen = 0;
+        ShowCount = false;
+        CountGraphemes = false;
+        Round = false;
+        FieldStatus = "";
+        lastKeyNamedSeq = 0;
+        Filter = null;
+        liveApp = null;
+        wiresOwnEvents = true;
+        Change = new UiEvent();
+    }
+
+    public string GetText() { this.SyncBinding(); return editText; }
+    public override int InputFocusCapabilities() { return 3; }
+    public override int PointerCursor() { return 1; }
+    public override int WidgetId() { return wid; }
+
+    internal override void SetDocumentText(string text, string placeholder) {
+        this.SetText(text);
+        cursorPos = 0;
+        hint = placeholder;
+    }
+
+    public void SetText(string v) {
+        editBuf.SetText(v);
+        this.PullBuf();
+        this.PushBinding();
+    }
+
+    public void SelectAll() {
+        this.PushBuf();
+        editBuf.SelectAll();
+        this.PullBuf();
+    }
+
+    public void Clear() {
+        if (editText == "") { return; }
+        this.PushBuf();
+        editBuf.SelectAll();
+        if (editBuf.DeleteSelection()) {
+            this.PullBuf();
+            this.Edited();
+            if (liveApp != null) { liveApp.RequestRedraw(); }
+        }
+    }
+
+    public bool Undo() {
+        if (this.IsEditReadOnly()) { return false; }
+        this.PushBuf();
+        if (!editBuf.Undo()) { return false; }
+        this.PullBuf();
+        this.Edited();
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+        return true;
+    }
+
+    public bool Redo() {
+        if (this.IsEditReadOnly()) { return false; }
+        this.PushBuf();
+        if (!editBuf.Redo()) { return false; }
+        this.PullBuf();
+        this.Edited();
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+        return true;
+    }
+
+    public void Focus() {
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || this.IsDisabled()) { return; }
+        liveApp = app;
+        app.focus.SetFocused(wid, this);
+        app.RequestRedraw();
+    }
+
+    public void Blur() {
+        if (liveApp == null) { return; }
+        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
+        liveApp.RequestRedraw();
+    }
+
+    public void ScrollToEnd() {
+        cursorPos = editText.Length;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    public void ScrollToStart() {
+        cursorPos = 0;
+        selAnchor = -1;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    public void SetStatus(string v) {
+        string s = Control.StatusSanitize(v);
+        if (s == FieldStatus) { return; }
+        FieldStatus = s;
+        if (liveApp != null) { liveApp.RequestRedraw(); }
+    }
+
+    public int CountOf(string s) { return TextEditBuffer.CountOf(s, CountGraphemes); }
+    public int CountValue() { return this.CountOf(this.GetText()); }
+    public void SetError(string msg) { errMsg = msg; }
+    public void ClearError() { errMsg = ""; }
+
+    protected void SyncTextBinding() {
+        if (Text == null) { return; }
+        string cur = Text.Get();
+        if (cur != editText) {
+            editText = cur;
+            this.ClampCursor();
+        }
+    }
+
+    protected void PushBinding() {
+        if (Text == null) { return; }
+        Text.Set(editText);
+    }
+
+    protected void Edited() {
+        if (errMsg != "") { errMsg = ""; }
+        this.PushBinding();
+        Change.Raise(this);
+    }
+
+    protected void PushBuf() {
+        if (editBuf == null) { editBuf = new TextEditBuffer(editText); }
+        editBuf.SyncFrom(editText, cursorPos, selAnchor);
+    }
+
+    protected void PullBuf() {
+        editText = editBuf.text;
+        cursorPos = editBuf.cursorPos;
+        selAnchor = editBuf.selAnchor;
+    }
+
+    protected Func<string, string> WrapFilter() {
+        InputFilterFn f = this.Filter;
+        if (f == null) { return null; }
+        return (string cand) => f(cand);
+    }
+
+    public void ClampCursor() { this.PushBuf(); this.PullBuf(); }
+    public bool HasSel() { return selAnchor >= 0 && selAnchor != cursorPos; }
+    public int SelStart() { if (selAnchor >= 0 && selAnchor < cursorPos) { return selAnchor; } return cursorPos; }
+    public int SelEnd() { if (selAnchor > cursorPos) { return selAnchor; } return cursorPos; }
+    public string SelText() { this.PushBuf(); return editBuf.SelText(); }
+
+    public void DeleteSel() {
+        this.PushBuf();
+        if (editBuf.DeleteSelection()) { this.PullBuf(); }
+    }
+
+    public bool Insert(string s) {
+        this.PushBuf();
+        if (!editBuf.Insert(s, MaxLen, CountGraphemes, this.WrapFilter())) { return false; }
+        this.PullBuf();
+        this.Edited();
+        return true;
+    }
+
+    public bool DeleteCandidate(string cand) {
+        this.PushBuf();
+        if (!editBuf.DeleteCandidate(cand, this.WrapFilter())) { return false; }
+        this.PullBuf();
+        this.Edited();
+        return true;
+    }
+
+    protected virtual bool IsEditReadOnly() { return false; }
+    protected virtual bool IsKeyInputBlocked() { return false; }
+    protected virtual bool IsSingleLineInput() { return true; }
+    // 返回 0 继续默认分发，1 立即返回 true，-1 立即返回 false。
+    protected virtual int InterceptKeyEvent(App app, int kind, int code, int mods) { return 0; }
+    protected virtual bool HandleSpecialTextChar(App app, int code) { return false; }
+    protected virtual bool HandleSpecialKeyDown(App app, int code, int mods) { return false; }
+    protected virtual bool BeforeRoutedKey(App app) { return true; }
+    protected virtual void AfterRoutedKey(App app) { }
+
+    protected bool HandleKeyEvent(App app, int kind, int code, int mods) {
+        int intercepted = this.InterceptKeyEvent(app, kind, code, mods);
+        if (intercepted != 0) { return intercepted > 0; }
+        this.PushBuf();
+        this.PullBuf();
+        if (kind == 6) {
+            if (this.IsEditReadOnly()) { return false; }
+            if (code == 8) {
+                if (editBuf.Backspace(false, this.WrapFilter())) {
+                    this.PullBuf();
+                    this.Edited();
+                    app.RequestRedraw();
+                }
+                return true;
+            }
+            if (code == 13 || code == 9) {
+                return this.HandleSpecialTextChar(app, code);
+            }
+            string ch = Gui.Text.CharStr(code);
+            if (ch.Length > 0 && app.window.EventSeq() != this.lastKeyNamedSeq) {
+                this.lastKeyNamedSeq = app.window.EventSeq();
+                this.FireKeyNamed("KeyPress");
+                if (this.IsDisabled() || this.IsEditReadOnly() || this.IsKeyInputBlocked()
+                    || !this.IsFocused(app)) { return true; }
+                if (this.Insert(ch)) { app.RequestRedraw(); }
+                return true;
+            }
+        } else if (kind == 4) {
+            bool changed = false;
+            if (editBuf.HandleCommonKeyDown(code, mods, this.IsEditReadOnly(), this.IsSingleLineInput(),
+                    MaxLen, CountGraphemes, this.WrapFilter(), out changed)) {
+                this.PullBuf();
+                if (changed) { this.Edited(); }
+                app.RequestRedraw();
+                return true;
+            }
+            return this.HandleSpecialKeyDown(app, code, mods);
+        }
+        return false;
+    }
+
+    protected void HandleRoutedKey(RoutedEventArgs e, int kind) {
+        if (e.handled || this.IsDisabled() || this.IsKeyInputBlocked()) { return; }
+        App app = this.FindApp();
+        if (app == null) { app = liveApp; }
+        if (app == null || !this.IsFocused(app)) { return; }
+        if (liveApp != app) { lastKeyNamedSeq = 0; }
+        liveApp = app;
+        if (!this.BeforeRoutedKey(app)) { return; }
+        this.SyncBinding();
+        if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
+        this.AfterRoutedKey(app);
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
+    public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
+    public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
+
+    protected void AddCommonTextProps(List<PropSpec> ps) {
+        PropSpec st = PropSpec.Enum("status", "Status",
+            new List<string>{ "", "success", "warning", "error" });
+        st.Field("FieldStatus");
+        ps.Add(st);
+        ps.Add(PropSpec.Int("maxlen", "MaxLen").Field("MaxLen").Step(1, 0, 4096));
+        ps.Add(PropSpec.Bool("showCount", "ShowCount").Field("ShowCount"));
+        ps.Add(PropSpec.BoolField("Round"));
+    }
+}

@@ -4,9 +4,8 @@ using Gui;
 using Gui.Backend;
 namespace Gui.Widget;
 public partial class TreeView {
-    public bool Templated() { return tpl != null || this.HasExtraNodes(); }
-    public int RowHeight() { return this.RowHeight(this.App); }
-    public int RowHeight(App app) {
+    public override bool Templated() { return tpl != null || this.HasExtraNodes(); }
+    public override int RowHeight(App app) {
         app = this.ResolveApp(app);
         if (fixedRowHeight > 0) { return app != null ? app.Scale(fixedRowHeight) : fixedRowHeight; }
         if (app == null) { return 24; }
@@ -36,8 +35,7 @@ public partial class TreeView {
         }
         return true;
     }
-    public int ContentHeight() { return this.ContentHeight(this.App); }
-    public int ContentHeight(App app) {
+    public override int ContentHeight(App app) {
         app = this.ResolveApp(app);
         int rowH = this.RowHeight(app);
         int h = 0;
@@ -61,16 +59,7 @@ public partial class TreeView {
         }
         return h;
     }
-    public int RowExtent(Control row) { return this.RowExtent(this.App, row); }
-    public int RowExtent(App app, Control row) {
-        app = this.ResolveApp(app);
-        if (fixedRowHeight > 0) { return this.RowHeight(app); }
-        int h = row.prefH;
-        if (h <= 0) { h = this.RowHeight(app); }
-        return h;
-    }
-    public void BuildRows() { this.BuildRows(this.App); }
-    private Control CreateRow(int index) {
+    protected override Control CreateRowControl(int index) {
         TreeNode node = data[index];
         if (tpl != null) { return tpl(node); }
         if (node.extra == null) { return null; }
@@ -85,43 +74,22 @@ public partial class TreeView {
         };
         return row;
     }
-    public void BuildRows(App app) {
-        if (buildingRows || (fixedRowHeight <= 0 && !rowsStale && builtFor == data.Count)) { return; }
-        buildingRows = true;
-        try {
-            App host = this.FindApp();
-            Control ownerParent = parent;
-            Control root = host != null ? host.rootControl : null;
-            int expectedRevision = rowsRevision;
-            if (rowsStale || builtFor != data.Count) {
-                expectedRevision = expectedRevision + 1;
-                this.RetireRows();
-            }
-            if (rowsRevision != expectedRevision || this.FindApp() != host || parent != ownerParent
-                || (host != null && host.rootControl != root)) { return; }
-            int ticket = rowsRevision;
-            List<int> wanted = new List<int>();
-            int n = data.Count;
-            if (this.Templated()) {
-                int hideDepth = -1;
-                int top = 0;
-                int height = this.RowHeight(app);
-                int offset = scroll.Get();
-                Rect view = this.ScrollViewport();
-                for (int i = 0; i < n; i = i + 1) {
-                    TreeNode node = data[i];
-                    if (fixedRowHeight <= 0) { wanted.Add(i); continue; }
-                    if (hideDepth >= 0 && node.depth > hideDepth) { continue; }
-                    hideDepth = -1;
-                    if (top + height > offset && top < offset + view.height + height) { wanted.Add(i); }
-                    top = top + height;
-                    if (node.isDir && !node.expanded) { hideDepth = node.depth; }
-                }
-            }
-            if (!rowHost.Reconcile(wanted, this.CreateRow, app) || ticket != rowsRevision) { return; }
-            rowsStale = false;
-            builtFor = n;
-        } finally { buildingRows = false; }
+    protected override void CollectWantedRows(App app, List<int> wanted) {
+        int n = data.Count;
+        int hideDepth = -1;
+        int top = 0;
+        int height = this.RowHeight(app);
+        int offset = scroll.Get();
+        Rect view = this.ScrollViewport();
+        for (int i = 0; i < n; i = i + 1) {
+            TreeNode node = data[i];
+            if (fixedRowHeight <= 0) { wanted.Add(i); continue; }
+            if (hideDepth >= 0 && node.depth > hideDepth) { continue; }
+            hideDepth = -1;
+            if (top + height > offset && top < offset + view.height + height) { wanted.Add(i); }
+            top = top + height;
+            if (node.isDir && !node.expanded) { hideDepth = node.depth; }
+        }
     }
     public Rect PaintFilter() { return this.PaintFilter(this.App); }
     public Rect PaintFilter(App app) {
@@ -141,10 +109,6 @@ public partial class TreeView {
         int inW = bw - (inX - bx) - pad;
         int inH = barH - app.Scale(4);
         return rows;
-    }
-    private void NoteSelfDamage(App app) {
-        app.Damage.NoteDamage(bx, by, bw, bh);
-        app.window.Wake();
     }
     private bool PaintCheck(App app, int row, int cx, int rowY, int rowH, int box) {
         int cy = rowY + (rowH - box) / 2;
@@ -201,29 +165,6 @@ public partial class TreeView {
     public int ScrollOffset(Rect rows, int contentH) { return this.ScrollOffset(this.App, rows, contentH); }
     public int ScrollOffset(App app, Rect rows, int contentH) {
         return rowsBody != null ? rowsBody.ScrollTop() : 0;
-    }
-    private void UpdateDrag(App app, Rect rows) {
-        if (!reorder || !pressed || dragRow < 0) { return; }
-        int ek = app.EventKind();
-        if (ek == 1) {
-            if (!dragging && app.mouseY >= rows.y
-                && app.mouseY < rows.y + rows.height) {
-                dragging = true;
-            }
-            if (dragging) { this.NoteSelfDamage(app); }
-            return;
-        }
-        if (ek != 3) { return; }
-        bool moved = dragging && dropAt >= 0 && dropAt != dragRow
-            && dropAt != dragRow + 1;
-        if (moved) {
-            dropDone = true;
-            Move.Post(this);
-            rowsStale = true;
-        }
-        dragging = false;
-        pressed = false;
-        this.NoteSelfDamage(app);
     }
     private void PaintDropLine(App app, Rect rows, int y) {
         int h = app.Scale(2);
@@ -310,10 +251,8 @@ public partial class TreeView {
         }
         c.PopClip();
     }
-    public override void OnMeasure(App app) {
-        this.SyncBinding();
-        if (this.Templated()) { this.BuildRows(app); }
-        prefH = this.ContentHeight(app) + this.FilterHeight(app);
+    internal override void PaintRowsBody(App app, Rect bodyView) {
+        this.PaintRows(app, bodyView);
     }
     public override void OnPaint(App app) {
         this.SyncBinding();
@@ -379,36 +318,5 @@ public partial class TreeView {
         int end = TreeView.SubtreeEnd(nodes, idx);
         int j = idx + 1;
         while (j < end) { nodes[j].checked = target; j = j + 1; }
-    }
-}
-class TreeRefreshAction {
-    private weak TreeView owner;
-    public TreeRefreshAction(TreeView value) { owner = value; }
-    public void Run() {
-        TreeView target = owner;
-        if (target != null) { target.Refresh(); }
-    }
-}
-class TreeRowsPanel : Panel {
-    public override string Kind() { return "Panel"; }
-    private weak TreeView owner;
-    public TreeRowsPanel(TreeView value) { owner = value; }
-    public override StyleBox ResolveStyle(App app, int state) {
-        StyleBox box = base.ResolveStyle(app, state);
-        box.overflow = 1;
-        box.overflowX = 0;
-        box.overflowY = 2;
-        return box;
-    }
-    public override void Arrange(int x, int y, int w, int h) {
-        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
-        if (owner != null) { owner.LayoutBody(); }
-    }
-    public override void OnScrollChanged() {
-        if (owner != null) { owner.BodyScrolled(); }
-    }
-    public override void OnPaint(App app) {
-        if (owner == null) { return; }
-        owner.PaintRows(app, this.ScrollViewport());
     }
 }

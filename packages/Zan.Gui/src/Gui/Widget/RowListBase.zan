@@ -1,0 +1,335 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// ListView<T> 与 TreeView 共享虚拟行列表基类：
+// 统一行宿主生命周期、滚动画布同步、视口裁剪、命中测试、多选索引与键盘步进。
+public class RowListBase : Control {
+    public string Empty;
+    public bool multi;
+    public List<int> marks;
+    protected IndexSelection selection;
+    public Binding<int> scroll;
+    public bool rowsStale;
+    public int builtFor;
+    // 某行被激活（双击/回车/再次点击）。
+    [Event]
+    public UiEvent Activate;
+    // 某行被右键/长按触发上下文菜单。
+    [Event]
+    public UiEvent Context;
+
+    protected RowsBodyPanel rowsBody;
+    protected bool layingRows;
+    protected bool projectingScroll;
+    protected bool layoutBodyActive;
+    protected VisibleRowHost rowHost;
+    protected int fixedRowHeight;
+    protected int rowsRevision;
+    protected bool buildingRows;
+
+    protected void InitRowList(string controlKind) {
+        this.InitControl(controlKind);
+        rowsBody = new RowsBodyPanel(this);
+        base.Add(rowsBody);
+        rowHost = new VisibleRowHost(this, rowsBody);
+        Empty = "";
+        multi = false;
+        selection = new IndexSelection();
+        marks = selection.marks;
+        scroll = 0;
+        rowsStale = true;
+        builtFor = -1;
+        wiresOwnEvents = true;
+        Activate = new UiEvent();
+        Context = new UiEvent();
+    }
+
+    protected Control DataRow(int index) { return rowHost != null ? rowHost.Row(index) : null; }
+    public Control RowControl(int index) { return this.DataRow(index); }
+    public int FixedRowHeight {
+        get { return fixedRowHeight; }
+        set { this.WithFixedRowHeight(value); }
+    }
+    public bool IsMultiSelect {
+        get { return multi; }
+        set { multi = value; }
+    }
+    public string EmptyMessage {
+        get { return Empty; }
+        set { Empty = value != null ? value : ""; }
+    }
+
+    public void WithFixedRowHeight(int height) {
+        fixedRowHeight = height > 0 ? height : 0;
+        this.RetireRows();
+    }
+
+    protected void RetireRows() {
+        rowsRevision = rowsRevision + 1;
+        rowsStale = true;
+        builtFor = -1;
+        if (rowHost != null) { rowHost.Reset(); }
+    }
+
+    public void Refresh() {
+        if (!Dispatcher.CheckUiThread()) {
+            RowListRefreshAction action = new RowListRefreshAction(this);
+            Dispatcher.Post(action.Run);
+            return;
+        }
+        this.RetireRows();
+    }
+
+    protected void NoteSelfDamage(App app) {
+        if (app == null) { return; }
+        app.Damage.NoteDamage(bx, by, bw, bh);
+        app.window.Wake();
+    }
+
+    public virtual int RowCount() { return 0; }
+    public virtual bool Templated() { return false; }
+    public virtual int RowHeight(App app) { return 24; }
+    public int RowHeight() { return this.RowHeight(this.App); }
+    protected virtual int TopChromeHeight(App app) { return 0; }
+    protected virtual void ArrangeTopChrome(App app) { }
+    protected virtual bool IsRowShown(int index) { return true; }
+    protected virtual Control CreateRowControl(int index) { return null; }
+    protected virtual void CollectWantedRows(App app, List<int> wanted) { }
+    protected virtual bool PrepareLayoutBody(App app, Rect view, int ticket, Control ownerParent) { return true; }
+    protected virtual int FallbackRowHeight(App app, bool forHitTest) { return this.RowHeight(app); }
+    public virtual int ContentHeight(App app) { return this.RowCount() * this.RowHeight(app); }
+    public int ContentHeight() { return this.ContentHeight(this.App); }
+    protected virtual int CurrentSelectedIndex() { return -1; }
+    internal virtual void PaintRowsBody(App app, Rect bodyView) { }
+
+    public int RowExtent(Control row) { return this.RowExtent(this.App, row); }
+    public int RowExtent(App app, Control row) {
+        app = this.ResolveApp(app);
+        if (fixedRowHeight > 0) { return this.RowHeight(app); }
+        int h = row.prefH;
+        if (h <= 0) { h = this.RowHeight(app); }
+        return h;
+    }
+
+    public void BuildRows() { this.BuildRows(this.App); }
+    public void BuildRows(App app) {
+        int n = this.RowCount();
+        if (buildingRows || (fixedRowHeight <= 0 && !rowsStale && builtFor == n)) { return; }
+        buildingRows = true;
+        try {
+            App host = this.FindApp();
+            Control ownerParent = parent;
+            Control root = host != null ? host.rootControl : null;
+            int expectedRevision = rowsRevision;
+            if (rowsStale || builtFor != n) {
+                expectedRevision = expectedRevision + 1;
+                this.RetireRows();
+            }
+            if (rowsRevision != expectedRevision || this.FindApp() != host || parent != ownerParent
+                || (host != null && host.rootControl != root)) { return; }
+            int ticket = rowsRevision;
+            n = this.RowCount();
+            List<int> wanted = new List<int>();
+            if (this.Templated()) {
+                this.CollectWantedRows(app, wanted);
+            }
+            if (!rowHost.Reconcile(wanted, this.CreateRowControl, app) || ticket != rowsRevision) { return; }
+            rowsStale = false;
+            builtFor = n;
+        } finally { buildingRows = false; }
+    }
+
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflowX = 0;
+        box.overflowY = 0;
+        box.overflow = 1;
+        return box;
+    }
+
+    protected Rect OuterScrollViewport() { return base.ScrollViewport(); }
+
+    public override Rect ScrollViewport() {
+        Rect view = base.ScrollViewport();
+        int fixedH = this.TopChromeHeight(this.App);
+        if (fixedH > view.height) { fixedH = view.height; }
+        if (fixedH < 0) { fixedH = 0; }
+        return new Rect(view.x, view.y + fixedH, view.width, view.height - fixedH);
+    }
+
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (layingRows || rowsBody == null) { return; }
+        layingRows = true;
+        try {
+            App app = this.FindApp();
+            Control ownerParent = parent;
+            this.BuildRows(app);
+            if (this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+            this.ArrangeTopChrome(app);
+            int requested = scroll.Get();
+            Rect view = this.ScrollViewport();
+            int ticket = rowsRevision;
+            rowsBody.Arrange(view.x, view.y, view.width, view.height);
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            if (requested != rowsBody.ScrollTop()) { rowsBody.SetScrollTop(requested); }
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            this.LayoutBody();
+        } finally { layingRows = false; }
+    }
+
+    public override void OnScrollChanged() {
+        if (projectingScroll || rowsBody == null) { return; }
+        App app = this.FindApp();
+        Control ownerParent = parent;
+        int ticket = rowsRevision;
+        int requested = scrollY;
+        if (scroll.Get() != requested) { scroll.Set(requested); }
+        if (rowsBody.ScrollTop() != requested) { rowsBody.SetScrollTop(requested); }
+        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+        this.BodyScrolled();
+    }
+
+    public void BodyScrolled() {
+        if (rowsBody == null || projectingScroll) { return; }
+        projectingScroll = true;
+        try {
+            int value = rowsBody.ScrollTop();
+            if (scroll.Get() != value) { scroll.Set(value); }
+            if (scrollY != value || scrollX != 0) { this.CommitScrollOffset(0, value); }
+        } finally { projectingScroll = false; }
+        if (!layingRows) { this.LayoutBody(); }
+    }
+
+    public void LayoutBody() {
+        if (rowsBody == null || layoutBodyActive) { return; }
+        layoutBodyActive = true;
+        try {
+            App app = this.FindApp();
+            Control ownerParent = parent;
+            int ticket = rowsRevision;
+            Rect view = rowsBody.ScrollViewport();
+            if (!this.PrepareLayoutBody(app, view, ticket, ownerParent)) { return; }
+            int width = 0;
+            int off = VisibleRowHost.ClampScrollViewport(
+                this, rowsBody, this.ContentHeight(app), view,
+                app != null ? app.Scale(12) : 12, out width);
+            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+            if (fixedRowHeight > 0) {
+                if (scroll.Get() != off) { scroll.Set(off); }
+                if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                this.BuildRows(app);
+                if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+            }
+            int y = view.y - off;
+            int n = this.RowCount();
+            for (int i = 0; i < n; i = i + 1) {
+                Control row = this.DataRow(i);
+                bool shown = this.IsRowShown(i);
+                int rh = row != null ? this.RowExtent(app, row) : this.FallbackRowHeight(app, false);
+                bool onscreen = shown && y + rh > view.y && y < view.y + view.height;
+                if (row != null) {
+                    if (!onscreen && app != null) { app.ReleaseInputSubtree(row); }
+                    if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                    if (row.parent == rowsBody) {
+                        row.Arrange(view.x, shown ? y : view.y - rh - 1, width, rh);
+                        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
+                    }
+                }
+                if (shown) { y = y + rh; }
+            }
+            this.BodyScrolled();
+        } finally { layoutBodyActive = false; }
+    }
+
+    protected int DataIndexAt(int x, int y) {
+        if (rowsBody == null) { return -1; }
+        Rect view = rowsBody.ScrollViewport();
+        if (!view.Contains(x, y)) { return -1; }
+        int top = view.y - rowsBody.ScrollTop();
+        int n = this.RowCount();
+        for (int i = 0; i < n; i = i + 1) {
+            if (!this.IsRowShown(i)) { continue; }
+            Control row = this.DataRow(i);
+            int height = row != null ? this.RowExtent(this.App, row) : this.FallbackRowHeight(this.App, true);
+            if (y >= top && y < top + height) { return i; }
+            top = top + height;
+        }
+        return -1;
+    }
+
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
+        this.Arrange(bx, by, bw, bh);
+        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
+    }
+
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        this.Arrange(bx, by, bw, bh);
+        base.CollectInputFocus(app, controls);
+    }
+
+    public override Control FindInputFocus(App app) {
+        this.Arrange(bx, by, bw, bh);
+        return base.FindInputFocus(app);
+    }
+
+    public override void OnMeasure(App app) {
+        this.SyncBinding();
+        if (this.Templated()) { this.BuildRows(app); }
+        prefH = this.ContentHeight(app) + this.TopChromeHeight(app);
+    }
+
+    protected int ResolveNavKeyTarget(int keyCode, int cur, int count, Predicate<int> allowed) {
+        if (keyCode == 38) { return IndexSelection.StepIndex(cur, 0 - 1, count, allowed); }
+        if (keyCode == 40) { return IndexSelection.StepIndex(cur, 1, count, allowed); }
+        if (keyCode == 33) { return IndexSelection.StepIndex(cur, 0 - 10, count, allowed); }
+        if (keyCode == 34) { return IndexSelection.StepIndex(cur, 10, count, allowed); }
+        if (keyCode == 36) { return IndexSelection.EdgeIndex(false, count, allowed); }
+        if (keyCode == 35) { return IndexSelection.EdgeIndex(true, count, allowed); }
+        return -2;
+    }
+
+    public void WithMultiSelect() { multi = true; }
+    public bool IsMarked(int row) { return selection.IsMarked(row, this.CurrentSelectedIndex()); }
+    public List<int> SelectedIndices() { return selection.SelectedIndices(this.RowCount(), this.CurrentSelectedIndex()); }
+    public int SelectionCount() { return this.SelectedIndices().Count; }
+}
+
+internal class RowListRefreshAction {
+    private weak RowListBase owner;
+    public RowListRefreshAction(RowListBase value) { owner = value; }
+    public void Run() {
+        RowListBase target = owner;
+        if (target != null) { target.Refresh(); }
+    }
+}
+
+public class RowsBodyPanel : Panel {
+    // 按父类种类上报：序列化与自动化以 "Panel" 识别本控件。
+    public override string Kind() { return "Panel"; }
+    private weak RowListBase owner;
+    public RowsBodyPanel(RowListBase value) { owner = value; }
+    public override StyleBox ResolveStyle(App app, int state) {
+        StyleBox box = base.ResolveStyle(app, state);
+        box.overflow = 1;
+        box.overflowX = 0;
+        box.overflowY = 2;
+        return box;
+    }
+    public override void Arrange(int x, int y, int w, int h) {
+        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
+        if (owner != null) { owner.LayoutBody(); }
+    }
+    public override void OnScrollChanged() {
+        if (owner != null) { owner.BodyScrolled(); }
+    }
+    public override void OnPaint(App app) {
+        if (owner == null) { return; }
+        owner.PaintRowsBody(app, this.ScrollViewport());
+    }
+}

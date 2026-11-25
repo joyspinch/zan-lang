@@ -4,9 +4,8 @@ using Gui;
 using Gui.Backend;
 namespace Gui.Widget;
 public partial class ListView<T> {
-    public bool Templated() { return rowOf != null || this.HasSlotColumns(); }
-    public int RowHeight() { return this.RowHeight(this.App); }
-    public int RowHeight(App app) {
+    public override bool Templated() { return rowOf != null || this.HasSlotColumns(); }
+    public override int RowHeight(App app) {
         app = this.ResolveApp(app);
         if (fixedRowHeight > 0) { return app != null ? app.Scale(fixedRowHeight) : fixedRowHeight; }
         if (app == null) { return 32; }
@@ -20,8 +19,7 @@ public partial class ListView<T> {
         if (cols.Count < 2 || Style.Has(Class, "headless")) { return 0; }
         return app.theme.heightSmall;
     }
-    public void BuildRows() { this.BuildRows(this.App); }
-    private Control CreateRow(int index) {
+    protected override Control CreateRowControl(int index) {
         int ticket = rowsRevision;
         List<T> source = data;
         Control row = rowOf != null ? rowOf(source[index]) : this.BuildCompositeRow(source[index]);
@@ -34,40 +32,18 @@ public partial class ListView<T> {
         }
         return row;
     }
-    public void BuildRows(App app) {
-        if (buildingRows || (fixedRowHeight <= 0 && !rowsStale && builtFor == this.Count())) { return; }
-        buildingRows = true;
-        try {
-            App host = this.FindApp();
-            Control ownerParent = parent;
-            Control root = host != null ? host.rootControl : null;
-            int expectedRevision = rowsRevision;
-            if (rowsStale || builtFor != this.Count()) {
-                expectedRevision = expectedRevision + 1;
-                this.RetireRows();
-            }
-            if (rowsRevision != expectedRevision || this.FindApp() != host || parent != ownerParent
-                || (host != null && host.rootControl != root)) { return; }
-            int ticket = rowsRevision;
-            int n = this.Count();
-            List<int> wanted = new List<int>();
-            if (this.Templated()) {
-                int first = 0;
-                int last = n;
-                if (fixedRowHeight > 0) {
-                    VisibleRowHost.ComputeVisibleWindow(
-                        scroll.Get(), this.ScrollViewport().height,
-                        this.RowHeight(app), n, out first, out last);
-                }
-                for (int i = first; i < last; i = i + 1) { wanted.Add(i); }
-            }
-            if (!rowHost.Reconcile(wanted, this.CreateRow, app) || ticket != rowsRevision) { return; }
-            rowsStale = false;
-            builtFor = n;
-        } finally { buildingRows = false; }
+    protected override void CollectWantedRows(App app, List<int> wanted) {
+        int n = this.Count();
+        int first = 0;
+        int last = n;
+        if (fixedRowHeight > 0) {
+            VisibleRowHost.ComputeVisibleWindow(
+                scroll.Get(), this.ScrollViewport().height,
+                this.RowHeight(app), n, out first, out last);
+        }
+        for (int i = first; i < last; i = i + 1) { wanted.Add(i); }
     }
-    public int ContentHeight() { return this.ContentHeight(this.App); }
-    public int ContentHeight(App app) {
+    public override int ContentHeight(App app) {
         app = this.ResolveApp(app);
         if (fixedRowHeight > 0) { return this.Count() * this.RowHeight(app); }
         if (this.Templated()) {
@@ -79,18 +55,6 @@ public partial class ListView<T> {
             return h;
         }
         return this.Count() * this.RowHeight(app);
-    }
-    public int RowExtent(Control row) { return this.RowExtent(this.App, row); }
-    public int RowExtent(App app, Control row) {
-        app = this.ResolveApp(app);
-        if (fixedRowHeight > 0) { return this.RowHeight(app); }
-        int h = row.prefH;
-        if (h <= 0) { h = this.RowHeight(app); }
-        return h;
-    }
-    private void NoteSelfDamage(App app) {
-        app.Damage.NoteDamage(bx, by, bw, bh);
-        app.window.Wake();
     }
     public bool Selectable(int row) {
         if (!this.Has(row)) { return false; }
@@ -285,10 +249,9 @@ public partial class ListView<T> {
             y = y + rh;
         }
     }
-    public override void OnMeasure(App app) {
-        this.SyncBinding();
-        if (this.Templated()) { this.BuildRows(app); }
-        prefH = this.ContentHeight(app) + this.HeaderHeight(app);
+    internal override void PaintRowsBody(App app, Rect bodyView) {
+        if (this.Templated()) { this.ArrangeRows(app, this.HeaderHeight(app)); }
+        else { this.PaintColumnRows(app, this.HeaderHeight(app)); }
     }
     public override void OnPaint(App app) {
         this.SyncBinding();
@@ -304,38 +267,5 @@ public partial class ListView<T> {
             this.PaintEmpty(app);
             return;
         }
-    }
-}
-class ListRefreshAction<T> {
-    private weak ListView<T> owner;
-    public ListRefreshAction(ListView<T> value) { owner = value; }
-    public void Run() {
-        ListView<T> target = owner;
-        if (target != null) { target.Refresh(); }
-    }
-}
-class ListRowsPanel<T> : Panel {
-    // 按父类种类上报：序列化与自动化以 "Panel" 识别本控件。
-    public override string Kind() { return "Panel"; }
-    private weak ListView<T> owner;
-    public ListRowsPanel(ListView<T> value) { owner = value; }
-    public override StyleBox ResolveStyle(App app, int state) {
-        StyleBox box = base.ResolveStyle(app, state);
-        box.overflow = 1;
-        box.overflowX = 0;
-        box.overflowY = 2;
-        return box;
-    }
-    public override void Arrange(int x, int y, int w, int h) {
-        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
-        if (owner != null) { owner.LayoutBody(); }
-    }
-    public override void OnScrollChanged() {
-        if (owner != null) { owner.BodyScrolled(); }
-    }
-    public override void OnPaint(App app) {
-        if (owner == null) { return; }
-        if (owner.Templated()) { owner.ArrangeRows(app, owner.HeaderHeight(app)); }
-        else { owner.PaintColumnRows(app, owner.HeaderHeight(app)); }
     }
 }

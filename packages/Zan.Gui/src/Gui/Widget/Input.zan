@@ -3,46 +3,27 @@ using Gui;
 using Gui.Backend;
 
 namespace Gui.Widget;
-public delegate string InputFilterFn(string candidate);
-public class Input : Control {
+public class Input : TextInputBase {
     public override Control CreateCloneShell() { return new Input(); }
-    private string editText;
-    private TextEditBuffer editBuf;
-    public Binding<string> Text;
-    public string hint;
-    public int cursorPos;
-    public int selAnchor;
-    public int wid;
-    public weak App liveApp;
     public bool password;
     public bool reveal;
     public string iconLead;
     public string iconTrail;
-    // 文本每次变化时触发（C# 风格：`inp.Change += h;`）。
-    [Event]
-    public UiEvent Change;
     // 获得焦点时按下回车触发。
     [Event]
     public UiEvent Submit;
-    public string errMsg;
     public Binding<string> Size;
     public bool Clearable;
     public bool Autoselect;
     public bool autoselected;
-    public int MaxLen;
     public string Prefix;
     public string Suffix;
     public string PrefixIcon;
     public string PasswordIcon;
     public string ClearIcon;
-    public bool ShowCount;
-    public bool CountGraphemes;
     public bool Loading;
-    public bool Round;
-    public string FieldStatus;
     public bool PassiveActivated;
     public bool passiveActive;
-    public long lastKeyNamedSeq;
     private bool pointerSelecting;
     private bool pointerOnTrail;
     private int pointerTrailAction;
@@ -50,21 +31,11 @@ public class Input : Control {
     private int pointerX;
     private int pointerY;
     private bool autoselectPending;
-    public InputFilterFn Filter;
     public void InitInput(Binding<string> text, string hintText) {
-        this.InitControl("input");
-        Text = "";
-        if (text != null) { Text = text; }
-        editText = Text.Get();
-        editBuf = new TextEditBuffer(editText);
-        hint = hintText;
-        cursorPos = 0;
-        selAnchor = -1;
-        wid = this.CommonId();
+        this.InitTextInput("input", text, hintText);
         password = false;
         reveal = false;
         iconLead = "";
-        errMsg = "";
         iconTrail = "";
         Size = "medium";
         Clearable = false;
@@ -75,18 +46,9 @@ public class Input : Control {
         PrefixIcon = "";
         PasswordIcon = "";
         ClearIcon = "";
-        ShowCount = false;
-        CountGraphemes = false;
         Loading = false;
-        Round = false;
-        FieldStatus = "";
         PassiveActivated = false;
         passiveActive = false;
-        lastKeyNamedSeq = 0;
-        Filter = null;
-        liveApp = null;
-        wiresOwnEvents = true;
-        Change = new UiEvent();
         Submit = new UiEvent();
     }
     public Input() : this("") { }
@@ -96,83 +58,7 @@ public class Input : Control {
         for (int i = 0; i < s.Length; i = i + 1) { m = m + "*"; }
         return m;
     }
-    public string GetText() { this.SyncBinding(); return editText; }
     public void SetHint(string v) { hint = v; }
-    public override int InputFocusCapabilities() { return 3; }
-    public override int PointerCursor() { return 1; }
-    public override int WidgetId() { return wid; }
-    internal override void SetDocumentText(string text, string placeholder) {
-        this.SetText(text);
-        cursorPos = 0;
-        hint = placeholder;
-    }
-    public void SetText(string v) {
-        editBuf.SetText(v);
-        this.PullBuf();
-        PushBinding();
-    }
-    public void SelectAll() {
-        this.PushBuf();
-        editBuf.SelectAll();
-        this.PullBuf();
-    }
-    public void Clear() {
-        if (editText == "") { return; }
-        this.PushBuf();
-        editBuf.SelectAll();
-        if (editBuf.DeleteSelection()) {
-            this.PullBuf();
-            Edited();
-            if (liveApp != null) { liveApp.RequestRedraw(); }
-        }
-    }
-    public bool Undo() {
-        this.PushBuf();
-        if (!editBuf.Undo()) { return false; }
-        this.PullBuf();
-        Edited();
-        if (liveApp != null) { liveApp.RequestRedraw(); }
-        return true;
-    }
-    public bool Redo() {
-        this.PushBuf();
-        if (!editBuf.Redo()) { return false; }
-        this.PullBuf();
-        Edited();
-        if (liveApp != null) { liveApp.RequestRedraw(); }
-        return true;
-    }
-    public void Focus() {
-        App app = this.FindApp();
-        if (app == null) { app = liveApp; }
-        if (app == null || this.IsDisabled()) { return; }
-        liveApp = app;
-        app.focus.SetFocused(wid, this);
-        app.RequestRedraw();
-    }
-    public void Blur() {
-        if (liveApp == null) { return; }
-        if (liveApp.focus.IsFocused(wid)) { liveApp.focus.ClearFocus(); }
-        liveApp.RequestRedraw();
-    }
-    public void ScrollToEnd() {
-        cursorPos = editText.Length;
-        selAnchor = -1;
-        if (liveApp != null) { liveApp.RequestRedraw(); }
-    }
-    public void ScrollToStart() {
-        cursorPos = 0;
-        selAnchor = -1;
-        if (liveApp != null) { liveApp.RequestRedraw(); }
-    }
-    public void SetStatus(string v) {
-        string s = Control.StatusSanitize(v);
-        if (s == FieldStatus) { return; }
-        FieldStatus = s;
-        if (liveApp != null) { liveApp.RequestRedraw(); }
-    }
-    public int CountOf(string s) { return TextEditBuffer.CountOf(s, CountGraphemes); }
-    public int CountValue() { return this.CountOf(this.GetText()); }
     public static string CountText(int count, int max) {
         string cur = "";
         if (count > 99) { cur = "99+"; } else { cur = Convert.ToString(count); }
@@ -194,124 +80,37 @@ public class Input : Control {
         return outStr;
     }
     public static string NoSpaces(string s) { return TextWrap.Trim(s); }
-    public void SetError(string msg) { errMsg = msg; }
-    public void ClearError() { errMsg = ""; }
-    public override void SyncBinding() {
-        if (Text == null) { return; }
-        string cur = Text.Get();
-        if (cur != editText) {
-            editText = cur;
-            this.ClampCursor();
-        }
-    }
-    private void PushBinding() {
-        if (Text == null) { return; }
-        Text.Set(editText);
-    }
-    private void Edited() {
-        errMsg = "";
-        PushBinding();
-        Change.Raise(this);
-    }
-    private void PushBuf() {
-        if (editBuf == null) { editBuf = new TextEditBuffer(editText); }
-        editBuf.SyncFrom(editText, cursorPos, selAnchor);
-    }
-    private void PullBuf() {
-        editText = editBuf.text;
-        cursorPos = editBuf.cursorPos;
-        selAnchor = editBuf.selAnchor;
-    }
-    private Func<string, string> WrapFilter() {
-        InputFilterFn f = this.Filter;
-        if (f == null) { return null; }
-        return (string cand) => f(cand);
-    }
-    public void ClampCursor() { this.PushBuf(); this.PullBuf(); }
-    public bool HasSel() { return selAnchor >= 0 && selAnchor != cursorPos; }
-    public int SelStart() { if (selAnchor >= 0 && selAnchor < cursorPos) { return selAnchor; } return cursorPos; }
-    public int SelEnd() { if (selAnchor > cursorPos) { return selAnchor; } return cursorPos; }
-    public string SelText() { this.PushBuf(); return editBuf.SelText(); }
-    private void DeleteSel() {
-        this.PushBuf();
-        if (editBuf.DeleteSelection()) { this.PullBuf(); }
-    }
-    public bool Insert(string s) {
-        this.PushBuf();
-        if (!editBuf.Insert(s, MaxLen, CountGraphemes, this.WrapFilter())) { return false; }
-        this.PullBuf();
-        Edited();
-        return true;
-    }
-    public bool DeleteCandidate(string cand) {
-        this.PushBuf();
-        if (!editBuf.DeleteCandidate(cand, this.WrapFilter())) { return false; }
-        this.PullBuf();
-        Edited();
-        return true;
-    }
-    private bool HandleKeyEvent(App app, int kind, int code, int mods) {
-        this.PushBuf();
-        this.PullBuf();
+    public override void SyncBinding() { this.SyncTextBinding(); }
+    protected override bool IsKeyInputBlocked() { return Loading; }
+    protected override int InterceptKeyEvent(App app, int kind, int code, int mods) {
         if (PassiveActivated && !passiveActive) {
             if (kind == 6 && code == 13) {
                 passiveActive = true;
                 app.RequestRedraw();
-                return true;
+                return 1;
             }
-            return false;
+            return -1;
         }
-        if (kind == 6) {
-            if (code == 8) {
-                if (editBuf.Backspace(false, this.WrapFilter())) {
-                    this.PullBuf();
-                    Edited();
-                    app.RequestRedraw();
-                }
-                return true;
-            } else if (code == 13) {
-                Submit.Raise(this);
-                app.RequestRedraw();
-                return true;
-            } else if (code == 9) {
-            } else {
-                string ch = Gui.Text.CharStr(code);
-                if (ch.Length > 0 && app.window.EventSeq() != this.lastKeyNamedSeq) {
-                    this.lastKeyNamedSeq = app.window.EventSeq();
-                    this.FireKeyNamed("KeyPress");
-                    if (this.IsDisabled() || Loading || !this.IsFocused(app)) { return true; }
-                    if (this.Insert(ch)) { app.RequestRedraw(); }
-                    return true;
-                }
-            }
-        } else if (kind == 4) {
-            bool changed = false;
-            if (editBuf.HandleCommonKeyDown(code, mods, false, true,
-                    MaxLen, CountGraphemes, this.WrapFilter(), out changed)) {
-                this.PullBuf();
-                if (changed) { Edited(); }
-                app.RequestRedraw();
-                return true;
-            }
+        return 0;
+    }
+    protected override bool HandleSpecialTextChar(App app, int code) {
+        if (code == 13) {
+            Submit.Raise(this);
+            app.RequestRedraw();
+            return true;
         }
         return false;
     }
-    private void HandleRoutedKey(RoutedEventArgs e, int kind) {
-        if (e.handled || this.IsDisabled() || Loading) { return; }
-        App app = this.FindApp();
-        if (app == null) { app = liveApp; }
-        if (app == null || !this.IsFocused(app)) { return; }
-        if (liveApp != app) { lastKeyNamedSeq = 0; }
-        liveApp = app;
+    protected override bool BeforeRoutedKey(App app) {
         this.SyncBinding();
         if (Autoselect && !autoselected) {
             this.SelectAll();
             autoselected = true;
         }
         autoselectPending = false;
-        if (this.HandleKeyEvent(app, kind, e.keyCode, e.modifiers)) { e.Handle(); }
-        this.UpdateInputCaret(app);
+        return true;
     }
+    protected override void AfterRoutedKey(App app) { this.UpdateInputCaret(app); }
     private InputGeometry InputGeometryForStyle(App app, StyleBox style, int x, int y, int w, int h) {
         int font = style.FontOr(Style.FontFallback(app, "medium"));
         string text = editText;
@@ -487,9 +286,6 @@ public class Input : Control {
         }
         base.TriggerEvent(evt);
     }
-    public override void OnKeyDown(RoutedEventArgs e) { this.HandleRoutedKey(e, 4); }
-    public override void OnKeyUp(RoutedEventArgs e) { this.HandleRoutedKey(e, 5); }
-    public override void OnTextInput(RoutedEventArgs e) { this.HandleRoutedKey(e, 6); }
     private int PaintInput(App app, int x, int y, int w, int h) {
         int id = wid;
         Canvas c = app.canvas;
@@ -652,13 +448,7 @@ public class Input : Control {
         ps.Add(PropSpec.BoolField("Autoselect"));
         ps.Add(PropSpec.TextField("Prefix"));
         ps.Add(PropSpec.TextField("Suffix"));
-        PropSpec st = PropSpec.Enum("status", "Status",
-            new List<string>{ "", "success", "warning", "error" });
-        st.Field("FieldStatus");
-        ps.Add(st);
-        ps.Add(PropSpec.Int("maxlen", "MaxLen").Field("MaxLen").Step(1, 0, 4096));
-        ps.Add(PropSpec.Bool("showCount", "ShowCount").Field("ShowCount"));
-        ps.Add(PropSpec.BoolField("Round"));
+        this.AddCommonTextProps(ps);
         ps.Add(PropSpec.BoolField("Loading"));
         ps.Add(PropSpec.Bool("passive", "PassiveActivated").Field("PassiveActivated"));
         ps.Add(PropSpec.Bool("password", "Password").Field("password"));

@@ -4,41 +4,28 @@ using Gui;
 using Gui.Backend;
 namespace Gui.Widget;
 public delegate Control NodeOf(TreeNode node);
-public partial class TreeView : Control {
+public partial class TreeView : RowListBase {
     public override Control CreateCloneShell() { return new TreeView(); }
     public List<TreeNode> data;
     public Binding<int> Value;
-    public Binding<int> scroll;
     public Input filter;
     public bool checks;
-    public bool multi;
-    public List<int> marks;
-    private IndexSelection selection;
     public NodeOf tpl;
-    public bool rowsStale;
-    public int builtFor;
     public int ctxRow;
     public int ctxX;
     public int ctxY;
     private int hoveredRow = -1;
     private bool IsRowHovered(int index) { return hoveredRow == index; }
-    public string Empty;
 
     // 节点被选中时（读取 SelectedIndex / Selected）。
     [Event(Alias = "NodeClick")]
     public UiEvent Select;
-    // 节点被双击时（打开 / 运行它）。
-    [Event]
-    public UiEvent Activate;
     // 目录被展开时。
     [Event]
     public UiEvent Expand;
     // 目录被折叠时。
     [Event]
     public UiEvent Collapse;
-    // 节点被右键点击时（读取 ContextRow / ContextX / ContextY）。
-    [Event]
-    public UiEvent Context;
     // 复选框被切换时（用 ContextRow 读取节点）。
     [Event]
     public UiEvent Check;
@@ -56,57 +43,26 @@ public partial class TreeView : Control {
     public int dropAt;
     public bool dropDone;
     public Rect rowBuf;
-    private TreeRowsPanel rowsBody;
-    private bool layingRows;
-    private bool projectingScroll;
     private int filterRevision;
-    private VisibleRowHost rowHost;
-    private int fixedRowHeight;
-    private int rowsRevision;
-    private bool buildingRows;
-    private Control DataRow(int index) { return rowHost != null ? rowHost.Row(index) : null; }
-    public void WithFixedRowHeight(int height) {
-        fixedRowHeight = height > 0 ? height : 0;
-        this.RetireRows();
-    }
-    private void RetireRows() {
-        rowsRevision = rowsRevision + 1;
-        rowsStale = true;
-        builtFor = -1;
-        if (rowHost != null) { rowHost.Reset(); }
-    }
     private Checkbox treeCheck;
     private Checkbox TreeCheck() {
         if (this.treeCheck == null) { this.treeCheck = new Checkbox(); }
         return this.treeCheck;
     }
     private void InitTree() {
-        this.InitControl("tree");
-        rowsBody = new TreeRowsPanel(this);
-        base.Add(rowsBody);
-        rowHost = new VisibleRowHost(this, rowsBody);
+        this.InitRowList("tree");
         this.rowBuf = new Rect(0, 0, 0, 0);
         data = new List<TreeNode>();
         Value = -1;
-        scroll = 0;
         filter = null;
         checks = false;
-        multi = false;
-        selection = new IndexSelection();
-        marks = selection.marks;
         tpl = null;
-        rowsStale = true;
-        builtFor = 0 - 1;
         ctxRow = 0 - 1;
         ctxX = 0;
         ctxY = 0;
-        Empty = "";
-        wiresOwnEvents = true;
         Select = new UiEvent();
-        Activate = new UiEvent();
         Expand = new UiEvent();
         Collapse = new UiEvent();
-        Context = new UiEvent();
         Check = new UiEvent();
         Press = new UiEvent();
         Move = new UiEvent();
@@ -130,10 +86,6 @@ public partial class TreeView : Control {
         get { return tpl; }
         set { this.NodeSlot(value); }
     }
-    public int FixedRowHeight {
-        get { return fixedRowHeight; }
-        set { this.WithFixedRowHeight(value); }
-    }
     public Input FilterInput {
         get { return filter; }
         set { this.WithFilter(value); }
@@ -142,23 +94,14 @@ public partial class TreeView : Control {
         get { return checks; }
         set { checks = value; }
     }
-    public bool IsMultiSelect {
-        get { return multi; }
-        set { multi = value; }
-    }
     public bool AllowReorder {
         get { return reorder; }
         set { reorder = value; }
-    }
-    public string EmptyMessage {
-        get { return Empty; }
-        set { Empty = value != null ? value : ""; }
     }
     public int SelectedIndexValue {
         get { return Value.Get(); }
         set { this.SelectIndex(value); }
     }
-    private bool layoutBodyActive;
     public override void CloneContentTo(Control target, CloneTreeFn clone) {
         TreeView copy = (TreeView)target;
         copy.Bind(data);
@@ -166,121 +109,19 @@ public partial class TreeView : Control {
         copy.WithFixedRowHeight(fixedRowHeight);
         if (filter != null) { copy.WithFilter((Input)clone(filter)); }
     }
-    public override StyleBox ResolveStyle(App app, int state) {
-        StyleBox box = base.ResolveStyle(app, state);
-        box.overflowX = 0;
-        box.overflowY = 0;
-        box.overflow = 1;
-        return box;
-    }
-    public override Rect ScrollViewport() {
-        Rect view = base.ScrollViewport();
-        int fixedH = this.FilterHeight(this.App);
-        if (fixedH > view.height) { fixedH = view.height; }
-        if (fixedH < 0) { fixedH = 0; }
-        return new Rect(view.x, view.y + fixedH, view.width, view.height - fixedH);
-    }
-    public Control RowControl(int index) { return this.DataRow(index); }
-    public int RowCount() { return data.Count; }
-    public override void Arrange(int x, int y, int w, int h) {
-        bx = x; by = y; bw = w > 0 ? w : 0; bh = h > 0 ? h : 0;
-        if (layingRows || rowsBody == null) { return; }
-        layingRows = true;
-        try {
-            App app = this.FindApp();
-            Control ownerParent = parent;
-            this.BuildRows(app);
-            if (this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
+    public override int RowCount() { return data.Count; }
+    protected override int TopChromeHeight(App app) { return this.FilterHeight(app); }
+    protected override bool IsRowShown(int index) { return this.Shown(index); }
+    protected override int CurrentSelectedIndex() { return Value.Get(); }
+    protected override void ArrangeTopChrome(App app) {
         if (filter != null) {
-            Rect frame = base.ScrollViewport();
+            Rect frame = this.OuterScrollViewport();
             int pad = app != null ? app.Scale(6) : 6;
             int glyph = app != null ? app.Scale(12) : 12;
             int inset = app != null ? app.Scale(2) : 2;
             filter.Arrange(frame.x + pad * 2 + glyph, frame.y + inset,
                 frame.width - pad * 3 - glyph, this.FilterHeight(app) - inset * 2);
         }
-            int requested = scroll.Get();
-            Rect view = this.ScrollViewport();
-            int ticket = rowsRevision;
-            rowsBody.Arrange(view.x, view.y, view.width, view.height);
-            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-            if (requested != rowsBody.ScrollTop()) { rowsBody.SetScrollTop(requested); }
-            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-            this.LayoutBody();
-        } finally { layingRows = false; }
-    }
-    public override void OnScrollChanged() {
-        if (projectingScroll || rowsBody == null) { return; }
-        App app = this.FindApp();
-        Control ownerParent = parent;
-        int ticket = rowsRevision;
-        int requested = scrollY;
-        if (scroll.Get() != requested) { scroll.Set(requested); }
-        if (rowsBody.ScrollTop() != requested) { rowsBody.SetScrollTop(requested); }
-        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-        this.BodyScrolled();
-    }
-    public void BodyScrolled() {
-        if (rowsBody == null || projectingScroll) { return; }
-        projectingScroll = true;
-        try {
-            int value = rowsBody.ScrollTop();
-            if (scroll.Get() != value) { scroll.Set(value); }
-            if (scrollY != value || scrollX != 0) { this.CommitScrollOffset(0, value); }
-        } finally { projectingScroll = false; }
-        if (!layingRows) { this.LayoutBody(); }
-    }
-    public void LayoutBody() {
-        if (rowsBody == null || layoutBodyActive) { return; }
-        layoutBodyActive = true;
-        try {
-        App app = this.FindApp();
-        Control ownerParent = parent;
-        int ticket = rowsRevision;
-        Rect view = rowsBody.ScrollViewport();
-        int width = 0;
-        int off = VisibleRowHost.ClampScrollViewport(
-            this, rowsBody, this.ContentHeight(app), view,
-            app != null ? app.Scale(12) : 12, out width);
-        if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-        if (fixedRowHeight > 0) {
-            if (scroll.Get() != off) { scroll.Set(off); }
-            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-            this.BuildRows(app);
-            if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent || rowsStale) { return; }
-        }
-        int y = view.y - off;
-        for (int i = 0; i < data.Count; i = i + 1) {
-            Control row = this.DataRow(i);
-            bool shown = this.Shown(i);
-            int rh = row != null ? this.RowExtent(app, row) : this.RowHeight(app);
-            bool onscreen = shown && y + rh > view.y && y < view.y + view.height;
-            if (row != null) {
-                if (!onscreen && app != null) { app.ReleaseInputSubtree(row); }
-                if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-                if (row.parent == rowsBody) {
-                    row.Arrange(view.x, shown ? y : view.y - rh - 1, width, rh);
-                    if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-                }
-            }
-            if (shown) { y = y + rh; }
-        }
-        this.BodyScrolled();
-        } finally { layoutBodyActive = false; }
-    }
-    private int DataIndexAt(int x, int y) {
-        if (rowsBody == null) { return -1; }
-        Rect view = rowsBody.ScrollViewport();
-        if (!view.Contains(x, y)) { return -1; }
-        int top = view.y - rowsBody.ScrollTop();
-        for (int i = 0; i < data.Count; i = i + 1) {
-            if (!(this.Shown(i))) { continue; }
-            Control row = this.DataRow(i);
-            int height = row != null ? this.RowExtent(this.App, row) : this.RowHeight(this.App);
-            if (y >= top && y < top + height) { return i; }
-            top = top + height;
-        }
-        return -1;
     }
     public override void OnPointerDown(RoutedEventArgs e) {
         base.OnPointerDown(e);
@@ -422,14 +263,8 @@ public partial class TreeView : Control {
             e.Handle();
             return;
         }
-        int next = 0 - 1;
-        if (kc == 38) { next = IndexSelection.StepIndex(cur, 0 - 1, n, (int r) => this.Shown(r)); }
-        else if (kc == 40) { next = IndexSelection.StepIndex(cur, 1, n, (int r) => this.Shown(r)); }
-        else if (kc == 33) { next = IndexSelection.StepIndex(cur, 0 - 10, n, (int r) => this.Shown(r)); }
-        else if (kc == 34) { next = IndexSelection.StepIndex(cur, 10, n, (int r) => this.Shown(r)); }
-        else if (kc == 36) { next = IndexSelection.EdgeIndex(false, n, (int r) => this.Shown(r)); }
-        else if (kc == 35) { next = IndexSelection.EdgeIndex(true, n, (int r) => this.Shown(r)); }
-        else { return; }
+        int next = this.ResolveNavKeyTarget(kc, cur, n, (int r) => this.Shown(r));
+        if (next == -2) { return; }
         if (next >= 0 && next != cur) {
             if (multi && Modifiers.HasShift(e.modifiers) && cur >= 0) {
                 selection.SelectRange(cur, next, cur, (int r) => this.Shown(r));
@@ -479,14 +314,6 @@ public partial class TreeView : Control {
     }
 
     // 覆写：CSS 类型选择器名（"tree"）。
-    public override void CollectInputFocus(App app, List<Control> controls) {
-        this.Arrange(bx, by, bw, bh);
-        base.CollectInputFocus(app, controls);
-    }
-    public override Control FindInputFocus(App app) {
-        this.Arrange(bx, by, bw, bh);
-        return base.FindInputFocus(app);
-    }
     public override string StyleType() { return "tree"; }
     public void Bind(List<TreeNode> nodes) {
         if (nodes == null) { data = new List<TreeNode>(); }
@@ -494,14 +321,6 @@ public partial class TreeView : Control {
         this.RetireRows();
         if (Value.Get() >= data.Count) { Value.Set(0 - 1); }
         selection.Prune(data.Count);
-    }
-    public void Refresh() {
-        if (!Dispatcher.CheckUiThread()) {
-            TreeRefreshAction action = new TreeRefreshAction(this);
-            Dispatcher.Post(action.Run);
-            return;
-        }
-        this.RetireRows();
     }
     // 在树顶部绘制内联过滤行，本身不进行过滤：
     // 宿主在输入变化时重新绑定过滤后的列表。
@@ -520,13 +339,7 @@ public partial class TreeView : Control {
         }
         return this;
     }
-    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
-        if (!this.StyleVisible() || !this.ContainsPoint(x, y, pointerType)) { return null; }
-        this.Arrange(bx, by, bw, bh);
-        return base.HitTestCore(x, y, pointerType, excludedSubtrees);
-    }
     public void WithChecks() { checks = true; }
-    public void WithMultiSelect() { multi = true; }
     public void WithReorder() { reorder = true; }
     public int MoveFrom() { return dragRow; }
     public int MoveTo() { return dropAt; }
@@ -549,9 +362,6 @@ public partial class TreeView : Control {
         selection.Clear();
         marks = selection.marks;
     }
-    public bool IsMarked(int row) { return selection.IsMarked(row, Value.Get()); }
-    public List<int> SelectedIndices() { return selection.SelectedIndices(data.Count, Value.Get()); }
-    public int SelectionCount() { return this.SelectedIndices().Count; }
     public int ContextRow() { return ctxRow; }
     public int ContextX() { return ctxX; }
     public int ContextY() { return ctxY; }

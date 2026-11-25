@@ -1,0 +1,890 @@
+using Gui.Backend;
+using Gui;
+using System.Collections.Generic;
+using System;
+
+namespace Gui.Widget;
+
+public class CalendarMark {
+    public DateTime day;
+    public string text;
+    public int tone;
+    public CalendarMark(DateTime d, string t, int tn) {
+        day = d;
+        text = t;
+        tone = tn;
+    }
+}
+
+public class CarouselAnim {
+    public int shown;
+    public int from;
+    public int startMs;
+    public bool animating;
+    public int dir;
+    public int tickMs;
+    public CarouselAnim() {
+        this.shown = 0;
+        this.from = 0;
+        this.startMs = 0;
+        this.animating = false;
+        this.dir = 1;
+        this.tickMs = 0;
+    }
+}
+
+public class CarouselChrome : Control {
+    public weak Carousel owner;
+    public Button prevBtn;
+    public Button nextBtn;
+    public List<Button> dotBtns;
+    private int builtCount;
+    private void InitChrome(Carousel c) {
+        this.InitControl("carousel-chrome");
+        this.ClassName = "carousel-chrome";
+        owner = c;
+        wiresOwnEvents = false;
+        builtCount = 0;
+        dotBtns = new List<Button>();
+        prevBtn = new Button("") { ClassName = "carousel-arrow carousel-arrow-prev", Icon = "arrow-left" };
+        CarouselChromeAction previous = new CarouselChromeAction(c, -1, -1);
+        prevBtn.Click.Add(previous.Invoke);
+        this.Add(prevBtn);
+        nextBtn = new Button("") { ClassName = "carousel-arrow carousel-arrow-next", Icon = "arrow-right" };
+        CarouselChromeAction next = new CarouselChromeAction(c, 1, -1);
+        nextBtn.Click.Add(next.Invoke);
+        this.Add(nextBtn);
+        this.SyncDots();
+    }
+    public CarouselChrome(Carousel c) { InitChrome(c); }
+    public void SyncDots() {
+        if (owner == null) { return; }
+        int count = owner.slides.Count;
+        if (count == builtCount) { return; }
+        for (int i = 0; i < dotBtns.Count; i = i + 1) {
+            this.Remove(dotBtns[i]);
+        }
+        dotBtns.Clear();
+        for (int i = 0; i < count; i = i + 1) {
+            Button dot = new Button("") { ClassName = "carousel-dot" };
+            CarouselChromeAction select = new CarouselChromeAction(owner, 0, i);
+            dot.Click.Add(select.Invoke);
+            dotBtns.Add(dot);
+            this.Add(dot);
+        }
+        builtCount = count;
+    }
+    public override void Arrange(int px, int py, int pw, int ph) {
+        base.Arrange(px, py, pw, ph);
+        if (owner == null) { return; }
+        this.SyncDots();
+        int count = owner.slides.Count;
+        if (count == 0) { return; }
+        int cur = owner.Index.Get();
+        if (cur < 0) { cur = 0; }
+        if (cur >= count) { cur = count - 1; }
+        int pad = 12;
+        int ab = 28;
+        if (owner.Vert()) {
+            prevBtn.Icon = "arrow-up";
+            nextBtn.Icon = "arrow-down";
+            int prevX = px + (pw - ab) / 2;
+            int prevY = py + pad;
+            prevBtn.Arrange(prevX, prevY, ab, ab);
+            nextBtn.Arrange(prevX, py + ph - ab - pad, ab, ab);
+        } else {
+            prevBtn.Icon = "arrow-left";
+            nextBtn.Icon = "arrow-right";
+            int prevY = py + (ph - ab) / 2;
+            prevBtn.Arrange(px + pad, prevY, ab, ab);
+            nextBtn.Arrange(px + pw - ab - pad, prevY, ab, ab);
+        }
+        int dot = 8;
+        int dotGap = 6;
+        int dotsW = count * dot + (count - 1) * dotGap;
+        bool dotsCol = (owner.dotPlacement == "left" || owner.dotPlacement == "right");
+        int dx = px + (pw - dotsW) / 2;
+        int dy = py + ph - 24;
+        if (owner.dotPlacement == "top") {
+            dy = py + pad;
+        } else if (dotsCol) {
+            dx = (owner.dotPlacement == "left") ? px + pad : px + pw - pad - dot;
+            dy = py + (ph - dotsW) / 2;
+        }
+        for (int i = 0; i < dotBtns.Count; i = i + 1) {
+            int dw = (i == cur) ? dot * 2 : dot;
+            dotBtns[i].Arrange(dx, dy, dw, dot);
+            if (i == cur) {
+                dotBtns[i].AddClass("active");
+            } else {
+                dotBtns[i].RemoveClass("active");
+            }
+            if (dotsCol) { dy = dy + dw + dotGap; }
+            else { dx = dx + dw + dotGap; }
+        }
+    }
+    public override void OnPaint(App app) { }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        Control hit = base.HitTestCore(x, y, pointerType, excludedSubtrees);
+        return hit == this ? null : hit;
+    }
+}
+class CarouselChromeAction {
+    weak Carousel owner;
+    int direction;
+    int index;
+    public CarouselChromeAction(Carousel carousel, int step, int target) {
+        owner = carousel; direction = step; index = target;
+    }
+    public void Invoke() {
+        Carousel carousel = owner;
+        if (carousel == null) { return; }
+        if (direction < 0) { carousel.Prev(); }
+        else if (direction > 0) { carousel.Next(); }
+        else { carousel.GoTo(index); }
+    }
+}
+
+internal class CarouselDriver : AppLoopParticipant {
+    internal weak Carousel owner;
+    internal CarouselDriver(Carousel carousel) { owner = carousel; }
+    public int NextDeadline() {
+        Carousel carousel = owner;
+        return carousel != null ? carousel.LoopDeadline() : -1;
+    }
+    public void Tick(App app, int now) {
+        Carousel carousel = owner;
+        if (carousel != null) { carousel.LoopTick(app, now); }
+    }
+}
+
+public class DateShortcut {
+    public string label;
+    public int startOffset;
+    public int endOffset;
+    public DateShortcut(string label, int startOffset, int endOffset) {
+        this.label = label;
+        this.startOffset = startOffset;
+        this.endOffset = endOffset;
+    }
+}
+
+public class DropdownChrome {
+    internal static Rect ContentBounds(Control trigger, StyleBox style, int padding) {
+        int left = style.PadLOr(padding) + style.BorderLeftPx();
+        int right = style.PadROr(padding) + style.BorderRightPx();
+        int top = style.PadTOr(0) + style.BorderTopPx();
+        int bottom = style.PadBOr(0) + style.BorderBottomPx();
+        int width = trigger.bw - left - right;
+        int height = trigger.bh - top - bottom;
+        return new Rect(trigger.bx + left, trigger.by + top,
+                        width > 0 ? width : 0, height > 0 ? height : 0);
+    }
+    internal static int SlotSize(Rect content, int size) {
+        if (size > content.height) { size = content.height; }
+        if (size > content.width) { size = content.width; }
+        return size;
+    }
+    internal static void PaintLabel(Canvas canvas, Rect content, int width,
+                                    string label, int font, int color) {
+        if (width <= 0 || content.height <= 0) { return; }
+        canvas.DrawText(content.x, Canvas.CenterTextY(content.y, content.height, font),
+                        Ellipsis.Fit(label, width, font), color, font);
+    }
+    internal static void PaintArrow(Canvas canvas, Rect content, int size, int color) {
+        if (size <= 0) { return; }
+        canvas.DrawGlyphIn("chevron-down", content.Right() - size, content.y,
+                           size, content.height, size, color);
+    }
+    public static void Paint(App app, Control trigger, string label, bool open) {
+        int id = trigger.WidgetId();
+        int x = trigger.bx; int y = trigger.by; int w = trigger.bw; int h = trigger.bh;
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int hv = app.StyleHoverLevelIn(id, 0, x, y, w, h);
+        if (open) { hv = 1000; }
+        StyleBox normal = Style.Of(app, "select", "", Style.SNormal());
+        StyleBox hover = Style.Of(app, "select", "", Style.SHover());
+        StyleBox s = StyleBox.Blend(normal, hover, hv);
+        s.Paint(app, x, y, w, h);
+        Rect content = DropdownChrome.ContentBounds(trigger, normal, t.paddingMedium);
+        int fs = normal.FontOr(Style.FontFallback(app, "medium"));
+        StyleBox arrow = Style.Part(app, "select", "arrow", "", "", "", Style.SNormal());
+        int size = DropdownChrome.SlotSize(content, arrow.FontOr(t.iconSizeSmall));
+        DropdownChrome.PaintLabel(c, content, content.width - size - t.gapSmall, label, fs, s.fg);
+        DropdownChrome.PaintArrow(c, content, size, arrow.FgOr(s.fg));
+    }
+}
+
+public class DropdownSession<T> : AppLoopParticipant, AppPreparationParticipant {
+    public weak Dropdown<T> owner;
+    public int session;
+    public void Selected(Control sender) {
+        Dropdown<T> dropdown = owner;
+        if (dropdown != null) { dropdown.MenuSelected(sender); }
+    }
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return -1; }
+    public void BeforeInput(App app, int kind) { this.Prepare(app); }
+    public void BeforePaint(App app, int frameSequence) { this.Prepare(app); }
+    void Prepare(App app) {
+        Dropdown<T> dropdown = owner;
+        if (dropdown != null) { dropdown.PreparePopup(app, session); }
+    }
+}
+
+public class FbFlow : Panel {
+    // 按父类种类上报：序列化与自动化以 "Panel" 识别本控件。
+    public override string Kind() { return "Panel"; }
+    // 与 children 平行的列宽表（span 1..24）。
+    public List<int> spans;
+    public int colGap;
+    public int rowGap;
+    public int minCell;
+    public int mColGap;
+    public int mRowGap;
+    public int mMinCell;
+    public FbFlow() {
+        this.InitPanel("fbflow", 3);
+        this.spans = new List<int>();
+        this.colGap = 12;
+        this.rowGap = 6;
+        this.minCell = 24;
+        this.mColGap = 12;
+        this.mRowGap = 6;
+        this.mMinCell = 24;
+        this.layoutFlow = true;
+        this.SetDocumentFactory((string kind) => new FbFlow(), "FbFlow");
+    }
+    public override void CloneContentTo(Control target, CloneTreeFn clone) {
+        FbFlow copy = (FbFlow)target;
+        copy.colGap = this.colGap;
+        copy.rowGap = this.rowGap;
+        copy.minCell = this.minCell;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control cell = clone(this.ChildAt(i));
+            if (cell != null) { copy.AddCell(cell, this.SpanAt(i)); }
+        }
+    }
+    public void AddCell(Control c, int span) {
+        this.spans.Add(span);
+        this.Add(c);
+    }
+    public int SpanAt(int i) {
+        if (i < this.spans.Count) {
+            int s = this.spans[i];
+            if (s < 1) { return 1; }
+            if (s > 24) { return 24; }
+            return s;
+        }
+        return 24;
+    }
+    public int RowEnd(int start) {
+        int n = this.ChildCount();
+        int end = start;
+        int cols = 0;
+        while (end < n) {
+            int sp = this.SpanAt(end);
+            if (end > start && cols + sp > 24) { break; }
+            cols = cols + sp;
+            end = end + 1;
+            if (cols >= 24) { break; }
+        }
+        return end;
+    }
+    public int RowHeight(int start, int end) {
+        int rowH = 0;
+        for (int k = start; k < end; k = k + 1) {
+            int hk = this.ChildAt(k).prefH;
+            if (hk > rowH) { rowH = hk; }
+        }
+        return rowH;
+    }
+    public override void OnPaint(App app) {
+    }
+    public override void OnMeasure(App app) {
+        this.mColGap = app.Scale(this.colGap);
+        this.mRowGap = app.Scale(this.rowGap);
+        this.mMinCell = app.Scale(this.minCell);
+        int n = this.ChildCount();
+        int i = 0;
+        int total = 0;
+        int rows = 0;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            total = total + this.RowHeight(i, end);
+            rows = rows + 1;
+            i = end;
+        }
+        if (rows > 1) { total = total + this.mRowGap * (rows - 1); }
+        this.prefH = total;
+        this.prefW = 0;
+    }
+    public override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cx = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int cw = pw - this.StylePadL() - this.StylePadR();
+        if (cw < 0) { cw = 0; }
+        int n = this.ChildCount();
+        int i = 0;
+        int rowY = cy;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            int rowH = this.RowHeight(i, end);
+            int acc = 0;
+            for (int k = i; k < end; k = k + 1) {
+                int xa = cx + cw * acc / 24;
+                acc = acc + this.SpanAt(k);
+                int xb = cx + cw * acc / 24;
+                int wCell = xb - xa;
+                if (k < end - 1) { wCell = wCell - this.mColGap; }
+                if (wCell < this.mMinCell) { wCell = this.mMinCell; }
+                this.ChildAt(k).Arrange(xa, rowY, wCell, rowH);
+            }
+            rowY = rowY + rowH + this.mRowGap;
+            i = end;
+        }
+    }
+}
+
+public class FbStack : Panel {
+    // 按父类种类上报：序列化与自动化以 "Panel" 识别本控件。
+    public override string Kind() { return "Panel"; }
+    public FbStack() {
+        this.InitPanel("fbstack", 3);
+        this.SetDocumentFactory((string kind) => new FbStack(), "FbStack");
+    }
+    public FbStack(string caption) : this() {
+        Label label = new Label(caption);
+        label.SetDocumentFactory((string kind) => new Label(), "Label");
+        this.Add(label);
+    }
+    public override void OnPaint(App app) {
+    }
+    public override void OnMeasure(App app) {
+        int h = 0;
+        int w = 0;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            h = h + this.ChildAt(i).prefH;
+            if (this.ChildAt(i).prefW > w) { w = this.ChildAt(i).prefW; }
+        }
+        this.prefH = h;
+        this.prefW = 0;
+    }
+    public override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cy = py;
+        int rest = ph;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control c = this.ChildAt(i);
+            if (c.grow) {
+                c.Arrange(px, cy, pw, rest);
+            } else {
+                int hh = c.prefH;
+                if (hh > rest) { hh = rest; }
+                if (hh < 0) { hh = 0; }
+                c.Arrange(px, cy, pw, hh);
+                cy = cy + hh;
+                rest = rest - hh;
+            }
+        }
+    }
+}
+
+public enum FieldAnchorMode {
+    None = 0,
+    TopLeft = 1,
+    TopCenter = 2,
+    TopRight = 3,
+    CenterLeft = 4,
+    Center = 5,
+    CenterRight = 6,
+    BottomLeft = 7,
+    BottomCenter = 8,
+    BottomRight = 9,
+    Stretch = 10
+}
+
+public enum FieldPositionMode {
+    Flow = 0,
+    Float = 1
+}
+
+public class FormRow : Panel {
+    // 按父类种类上报：序列化与自动化以 "Panel" 识别本控件。
+    public override string Kind() { return "Panel"; }
+    public Control field;
+    public Label label;
+    public Label help;
+    public Label err;
+    public List<FormRule> rules;
+    public string placement;
+    public int labelWidth;
+    public bool isRequired;
+    private string origCaption;
+    private Column rightBox;
+    public FormRow(string caption, Control ctl) {
+        this.InitPanel("formrow", 3);
+        this.gap = 4;
+        field = ctl;
+        rules = new List<FormRule>();
+        origCaption = caption;
+        placement = "top";
+        labelWidth = 80;
+        isRequired = false;
+        if (caption != "") { label = new Label(caption); }
+        err = new Label("");
+        err.Class = "error";
+        err.SetShown(false);
+        this.RebuildChildren();
+    }
+    public virtual void RebuildChildren() {
+        this.RemoveAll();
+        if (placement == "left") {
+            this.layout = 2;
+            if (label != null) {
+                label.Prefer(labelWidth, 28);
+                base.Add(label);
+            }
+            rightBox = new Column { Gap = 4 };
+            if (field != null) { rightBox.Add(field); }
+            if (help != null && help.Text.Get() != "") { rightBox.Add(help); }
+            rightBox.Add(err);
+            base.Add(rightBox);
+        } else {
+            this.layout = 1;
+            if (label != null) { base.Add(label); }
+            if (field != null) { base.Add(field); }
+            if (help != null && help.Text.Get() != "") { base.Add(help); }
+            base.Add(err);
+        }
+    }
+    public string CaptionText {
+        get { return this.origCaption; }
+        set { this.Caption(value); }
+    }
+    public Control FieldControl {
+        get { return this.field; }
+        set { this.SetControl(value); }
+    }
+    public string LabelPlacement {
+        get { return this.placement; }
+        set { this.Placement(value); }
+    }
+    public int LabelWidthPx {
+        get { return this.labelWidth; }
+        set { this.LabelWidth(value); }
+    }
+    public string HelpText {
+        get { return this.help != null ? this.help.GetText() : ""; }
+        set { this.Help(value); }
+    }
+
+    // 设置或更新标签标题
+    public FormRow Caption(string caption) {
+        origCaption = caption;
+        if (caption != "") {
+            if (label == null) {
+                label = new Label(caption);
+            } else {
+                label.Text = caption;
+            }
+        } else {
+            label = null;
+        }
+        this.RebuildChildren();
+        return this;
+    }
+    public void SetControl(Control ctl) {
+        field = ctl;
+        this.RebuildChildren();
+    }
+    public virtual void Placement(string p) {
+        placement = p;
+        this.RebuildChildren();
+    }
+    public virtual void LabelWidth(int w) {
+        labelWidth = w;
+        if (label != null && placement == "left") { label.Prefer(labelWidth, 28); }
+    }
+    public virtual void Required(string msg) {
+        isRequired = true;
+        this.Rule(FormRule.Required(msg));
+        if (label != null && !label.GetText().StartsWith("*")) {
+            label.Text = "* " + origCaption;
+            label.Class = "required";
+        }
+    }
+    public virtual void Help(string text) {
+        if (help == null) {
+            help = new Label(text);
+            help.Muted();
+        } else {
+            help.Text = text;
+        }
+        this.RebuildChildren();
+    }
+    public string Name() {
+        if (field == null) { return ""; }
+        return field.name;
+    }
+    public string Value() { return FormGroup.ValueOf(field); }
+    public virtual void Rule(FormRule r) { rules.Add(r); }
+    public bool Active() {
+        if (field == null) { return false; }
+        return field.StyleVisible() && !field.IsDisabled();
+    }
+    string ValidationValue() {
+        if (field is SelectBox && !((SelectBox)field).HasValue()) { return ""; }
+        return this.Value();
+    }
+    public string Check() {
+        if (!this.Active()) { this.Clear(); return ""; }
+        string v = this.ValidationValue();
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            string msg = rules[i].Apply(v);
+            if (msg != "") {
+                this.Paint(msg);
+                return msg;
+            }
+        }
+        this.Clear();
+        return "";
+    }
+    public string Peek() {
+        if (!this.Active()) { return ""; }
+        string v = this.ValidationValue();
+        for (int i = 0; i < rules.Count; i = i + 1) {
+            string msg = rules[i].Apply(v);
+            if (msg != "") { return msg; }
+        }
+        return "";
+    }
+    public void Clear() {
+        if (field != null && field is Input) { ((Input)field).ClearError(); }
+        err.SetShown(false);
+    }
+    public void Paint(string msg) {
+        if (field != null && field is Input) {
+            ((Input)field).SetError(msg);
+            err.Text = "";
+            err.SetShown(true);
+            return;
+        }
+        err.Text = msg;
+        err.SetShown(true);
+    }
+}
+
+public class FormRule {
+    public FormCheck check;
+    public FormRule(FormCheck c) { check = c; }
+    public string Apply(string value) { return check(value); }
+    public static FormRule Required(string msg) {
+        return new FormRule(v => {
+            if (v.Trim() == "") { return msg; }
+            return "";
+        });
+    }
+    public static FormRule MinLen(int n, string msg) {
+        return new FormRule(v => {
+            if (v.Length < n) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule MaxLen(int n, string msg) {
+        return new FormRule(v => {
+            if (v.Length > n) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule Email(string msg) {
+        return new FormRule(v => {
+            string s = v.Trim();
+            if (s == "") { return ""; }
+            int at = s.IndexOf("@");
+            if (at < 1 || at == s.Length - 1) { return msg; }
+            string host = s.Substring(at + 1);
+            int dot = host.IndexOf(".");
+            if (dot < 1 || dot == host.Length - 1) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule Range(int lo, int hi, string msg) {
+        return new FormRule(v => {
+            string s = v.Trim();
+            if (s == "") { return ""; }
+            if (!FormRule.IsInt(s)) { return msg; }
+            int n = Convert.ToInt32(s);
+            if (n < lo || n > hi) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule EqualsField(FormRow peer, string msg) {
+        return new FormRule(v => {
+            if (peer == null) { return ""; }
+            if (v != peer.Value()) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule Checked(string msg) {
+        return new FormRule(v => {
+            if (v != "true") { return msg; }
+            return "";
+        });
+    }
+    public static FormRule Numeric(string msg) {
+        return new FormRule(v => {
+            string s = v.Trim();
+            if (s == "") { return ""; }
+            if (!FormRule.IsInt(s)) { return msg; }
+            return "";
+        });
+    }
+    public static FormRule Custom(FormCheck check) { return new FormRule(check); }
+    public static bool IsInt(string s) {
+        if (s == null || s == "") { return false; }
+        int i = 0;
+        if (s.StartsWith("-")) { i = 1; }
+        if (i >= s.Length) { return false; }
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+public class GridSlotPlacement {
+    public int row;
+    public int col;
+    public int span;
+    public GridSlotPlacement(int row, int col, int span) {
+        this.row = row;
+        this.col = col;
+        this.span = span;
+    }
+}
+
+public class MarqueeAnim {
+    public int phase;
+    public int lastMs;
+    public MarqueeAnim() {
+        this.phase = 0;
+        this.lastMs = 0;
+    }
+}
+
+public class ProgressRing {
+    public int percent;
+    public int ringType;
+    public ProgressRing(int percent, int ringType) {
+        this.percent = percent;
+        this.ringType = ringType;
+    }
+}
+
+public enum QrEcl {
+    L = 0,  // ~7% 恢复
+    M = 1,  // ~15%
+    Q = 2,  // ~25%
+    H = 3,  // ~30%
+}
+
+public class QrMatrix {
+    public int version;
+    public int size;
+    public QrEcl ecl;
+    public bool[] modules;
+    public bool Get(int x, int y) { return modules[y * size + x]; }
+}
+
+public class RadioOption {
+    public string label;
+    public int value;
+    public bool hasValue;
+    public bool disabled;
+    public string cls;
+    public RadioOption(string lbl) {
+        label = lbl; value = 0; hasValue = false;
+        disabled = false; cls = "";
+    }
+    public RadioOption(string lbl, int val) {
+        label = lbl; value = val; hasValue = true;
+        disabled = false; cls = "";
+    }
+    public RadioOption(string lbl, int val, bool dis) {
+        label = lbl; value = val; hasValue = true;
+        disabled = dis; cls = "";
+    }
+}
+
+public class RadioOptionMeta {
+    public int value;
+    public bool disabled;
+    public RadioOptionMeta(int value, bool disabled) {
+        this.value = value;
+        this.disabled = disabled;
+    }
+}
+
+public class SliderMarkItem {
+    public int value;
+    public string label;
+    public SliderMarkItem(int value, string label) {
+        this.value = value;
+        this.label = label;
+    }
+}
+
+public class Step {
+    public string label;
+    public string desc;
+    public string icon;
+    public Step(string label, string desc, string icon) {
+        this.label = label;
+        this.desc = desc;
+        this.icon = icon;
+    }
+}
+
+internal class TabHeaderButton : Button {
+    // 按父类种类上报：序列化与自动化以 "Button" 识别本控件。
+    public override string Kind() { return "Button"; }
+    public override string StyleType() { return "tab"; }
+    public override StyleBox ResolveStyle(App app, int state) {
+        if (Style.Has(Class, "active")) { state = state | Style.SSelected(); }
+        return base.ResolveStyle(app, state);
+    }
+}
+
+public class TabItem {
+    public string label;
+    public bool closable;
+    public Control headerSlot;
+    public TabItem(string label, bool closable) {
+        this.label = label;
+        this.closable = closable;
+        this.headerSlot = null;
+    }
+    public TabItem Header(Control header) {
+        this.headerSlot = header;
+        return this;
+    }
+}
+
+public class TimelineItem : Control {
+    public override Control CreateCloneShell() { return new TimelineItem(); }
+    public string time;
+    public string title;
+    public string description;
+    public string cls;
+    public string icon;
+    public bool pending;
+    public TimelineItem() {
+        this.InitControl("timeline-item");
+        this.time = "";
+        this.title = "";
+        this.description = "";
+        this.cls = "";
+        this.icon = "";
+        this.pending = false;
+    }
+    public TimelineItem(Control content) {
+        this.InitControl("timeline-item");
+        this.time = "";
+        this.title = "";
+        this.description = "";
+        this.cls = "";
+        this.icon = "";
+        this.pending = false;
+        if (content != null) { this.Add(content); }
+    }
+    public TimelineItem(string time, Control content) {
+        this.InitControl("timeline-item");
+        this.time = time != null ? time : "";
+        this.title = "";
+        this.description = "";
+        this.cls = "";
+        this.icon = "";
+        this.pending = false;
+        if (content != null) { this.Add(content); }
+    }
+    public TimelineItem(string time, string title, string description) {
+        this.InitControl("timeline-item");
+        this.time = time != null ? time : "";
+        this.title = title != null ? title : "";
+        this.description = description != null ? description : "";
+        this.cls = "";
+        this.icon = "";
+        this.pending = false;
+    }
+    public TimelineItem(string time, string title, string description, string cls) {
+        this.InitControl("timeline-item");
+        this.time = time != null ? time : "";
+        this.title = title != null ? title : "";
+        this.description = description != null ? description : "";
+        this.cls = cls != null ? cls : "";
+        this.icon = "";
+        this.pending = false;
+    }
+    public TimelineItem(string time, string title, string description,
+                        string cls, string icon) {
+        this.InitControl("timeline-item");
+        this.time = time != null ? time : "";
+        this.title = title != null ? title : "";
+        this.description = description != null ? description : "";
+        this.cls = cls != null ? cls : "";
+        this.icon = icon != null ? icon : "";
+        this.pending = false;
+    }
+    protected override List<PropSpec> DefineProps() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("title", "Title").Field("title"));
+        ps.Add(PropSpec.Text("time", "Time").Field("time"));
+        return ps;
+    }
+    public override void OnMeasure(App app) {
+        int maxW = 0;
+        int totalH = 0;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control c = this.ChildAt(i);
+            c.OnMeasure(app);
+            if (c.prefW > maxW) { maxW = c.prefW; }
+            totalH = totalH + c.prefH;
+        }
+        prefW = maxW;
+        prefH = totalH;
+    }
+    public override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0) { return; }
+        int cy = by;
+        for (int i = 0; i < this.ChildCount(); i = i + 1) {
+            Control c = this.ChildAt(i);
+            int ch = c.prefH > 0 ? c.prefH : bh;
+            c.Arrange(bx, cy, bw, ch);
+            c.RenderTree(app);
+            cy = cy + ch;
+        }
+    }
+}
+
+public class TooltipRequest {
+    public string text;
+    public int x;
+    public int y;
+    public int placement;
+    public int width;
+}

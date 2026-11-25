@@ -1,0 +1,153 @@
+using System;
+
+namespace Gui;
+
+public interface AppLoopOwner {
+}
+
+public interface AppLoopService {
+    string ServiceKey();
+}
+
+public interface AppLoopStopped {
+    void Stopped(App app);
+}
+
+public interface AppLoopParticipant {
+    void Tick(App app, int now);
+    int NextDeadline();
+}
+
+public class AppLoopRegistration {
+    public weak App host;
+    public weak AppLoopOwner owner;
+    public AppLoopParticipant participant;
+    public bool active;
+    public int generation;
+    void Retire() {
+        App app = host;
+        if (active && app != null && participant is AppHostLayout) {
+            app.hostLayoutRevision = app.hostLayoutRevision + 1;
+        }
+        active = false;
+        generation = generation + 1;
+        participant = null;
+    }
+    public void Invalidate() {
+        if (!active) { return; }
+        Retire();
+        App app = host;
+        if (app != null) { app.WakeLoopParticipants(); }
+    }
+    public void Reschedule() {
+        App app = host;
+        if (active && app != null) { app.WakeLoopParticipants(); }
+    }
+}
+
+public interface AppPreparationParticipant {
+    void BeforeInput(App app, int kind);
+    void BeforePaint(App app, int frameSequence);
+}
+
+internal class AppPreparationProof {
+    private weak AppLoopRegistration ticket;
+    private weak AppLoopOwner owner;
+    private weak AppLoopParticipant participant;
+    private int generation;
+    internal AppPreparationProof(AppLoopRegistration registration) {
+        ticket = registration;
+        owner = registration.owner;
+        participant = registration.participant;
+        generation = registration.generation;
+    }
+    internal bool Current(App app) {
+        AppLoopRegistration registration = ticket;
+        return registration != null && owner != null && participant != null
+            && app.LiveLoopRegistration(registration) && registration.host == app
+            && registration.generation == generation && registration.owner == owner
+            && registration.participant == participant;
+    }
+}
+
+internal class AppHostLayout : AppLoopParticipant {
+    public void Tick(App app, int now) { }
+    public int NextDeadline() { return 0 - 1; }
+    internal virtual bool SyncLayout(App app, bool forInput) { return false; }
+}
+
+public interface AppFrameDiagnostics {
+    void FlushLoop(App app, int now);
+    void RecordFrame(App app, int beginMs, int preMs, int endMs, bool partial);
+    void Snapshot();
+    void Partial(int x, int y, int w, int h, int blurMiss);
+    void Damage(bool scroll, int x, int y, int w, int h);
+    void FxRepair(bool full, int count);
+}
+
+public interface AppAutomationSession {
+    void Shown(App app);
+    void Tick(App app);
+    void Presented(App app);
+    void TracePresent(App app, int stage, bool enter);
+    bool PreparationReasonPending(App app);
+    void TracePreparationReason(App app, string reason);
+    void Stopped(App app);
+}
+
+public interface AppModelHost {
+    void Attach(App app);
+    App HostApp();
+    AppLoopRegistration HostRegistration();
+    void SyncFromModel();
+    void SyncChangedValues();
+    void Detach();
+}
+internal interface AppModelFrameSync {
+    bool NeedsFrameSync();
+}
+
+public interface InputRetirementObserver {
+    void OnInputRetired(InputRetirementToken token);
+}
+
+public class InputRetirementToken {
+    weak App host;
+    weak Control scope;
+    weak InputRetirementObserver owner;
+    bool active;
+    public bool IsActive() { return active; }
+    public void Invalidate() {
+        if (!active) { return; }
+        active = false;
+        App app = host;
+        host = null; scope = null; owner = null;
+        if (app != null) { app.ForgetInputRetirement(this); }
+    }
+    void Notify() {
+        if (!active) { return; }
+        InputRetirementObserver observer = scope != null ? owner : null;
+        this.Invalidate();
+        if (observer != null) { observer.OnInputRetired(this); }
+    }
+}
+
+public interface UiCommandOwner {
+    bool CanExecuteCommand(int key);
+    bool IsCommandChecked(int key);
+    void ExecuteCommand(int key);
+}
+
+// 窗口根：控件树的顶层宿主（Form 继承它）。Control 沿父链找宿主窗口、
+// 下发宿主时只认这层 Core 抽象，不向上依赖 Forms 层的 Form。
+public class WindowRoot : Control {
+    public virtual App GetApp() { return null; }
+}
+
+public interface IModalWindow {
+    bool IsOpen();
+    bool NeedsRedraw();
+    bool OwnsWindow(nint hwnd);
+    bool ApplyEvent(nint hwnd);
+    void RenderWindow();
+}

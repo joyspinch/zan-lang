@@ -1,0 +1,266 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+public class AppLayerContext {
+    public List<ToastItem> toasts;
+    public List<ToastItem> notifs;
+    public Rect toastPrev;
+    public Rect notifPrev;
+    public List<LayerState> zorder;
+    LayerInputRoot inputRoot;
+    LayerWindowHost windowHost;
+    public bool requestRedraw;
+    public PhotoViewer photoViewer;
+    public int savedSeq;
+    public int bodySeq;
+    public AppLayerContext() {
+        this.toasts = new List<ToastItem>();
+        this.notifs = new List<ToastItem>();
+        this.toastPrev = new Rect(0, 0, 0, 0);
+        this.notifPrev = new Rect(0, 0, 0, 0);
+        this.zorder = new List<LayerState>();
+        this.bodySeq = 980000;
+    }
+}
+
+public class ToastItem {
+    public string text;
+    public int type;
+    public int bornMs;
+    public int lifeMs;
+    public bool closing;
+    public int closeMs;
+    public int curY;
+    public int curX;
+    public ToastItem(string text, int type, int lifeMs) {
+        this.text = text;
+        this.type = type;
+        this.bornMs = Window.GetTickMs();
+        this.lifeMs = lifeMs;
+        this.curY = 0 - 99999;
+        this.curX = 0 - 99999;
+    }
+}
+
+class LayerAction {
+    weak LayerState owner;
+    int action;
+    public LayerAction(LayerState owner, int action) {
+        this.owner = owner;
+        this.action = action;
+    }
+    public void Invoke() {
+        if (owner != null && owner.open) { owner.action = action; }
+    }
+}
+
+internal class LayerPreparation {
+    public static bool Current(App app, Control root, int generation, long sequence, LayerState state, int session) {
+        return app.rootControl == root && app.inputRootGeneration == generation
+        && app.window.EventSeq() == sequence && state.inputApp == app && state.inputGeneration == session;
+    }
+    public static bool Advance(App app, LayerState state) {
+        Control root = app.rootControl;
+        int generation = app.inputRootGeneration; long sequence = app.window.EventSeq();
+        int session = state.inputGeneration;
+        if (state.open) {
+            if (state.AutoCloseMs > 0 && state.openMs > 0
+            && Window.GetTickMs() - state.openMs >= state.AutoCloseMs) {
+                app.RequestRedraw();
+                Layer.Close(app, state);
+                return !state.open && LayerPreparation.Current(app, root, generation, sequence, state, session + 1);
+            }
+            if (Layer.Entrance(app, state) >= 1000) {
+                Layer.NotifyOpened(state);
+                if (!LayerPreparation.Current(app, root, generation, sequence, state, session) || !state.open) { return false; }
+            }
+        } else {
+            if (state.wasOpen) {
+                Layer.BeginExit(state);
+                if (!state.closedRaised) {
+                    state.closedRaised = true;
+                    state.Closed.Raise();
+                    if (!LayerPreparation.Current(app, root, generation, sequence, state, session) || state.open) { return false; }
+                }
+            }
+            if (state.closing) {
+                if (Layer.ExitP(state) >= 1000) { state.closing = false; app.RequestRedraw(); }
+                else { app.RequestAnimationFrameIn(0, 0, app.canvas.Width(), app.canvas.Height()); }
+            }
+        }
+        return LayerPreparation.Current(app, root, generation, sequence, state, session);
+    }
+}
+
+internal class LayerDialogPaint {
+    bool visible;
+    int x; int y; int w; int h; int screenW; int screenH;
+    int overlay; int radius; int shadow; int shadowX; int shadowY; int background;
+    int iconX; int iconY; int iconSize; int iconColor;
+    string icon = "";
+    string title = ""; string body = "";
+    int textX; int titleY; int titleColor; int titleFont;
+    int bodyY; int bodyColor; int bodyFont;
+    public void Prepare(App app, LayerState state, int px, int py, int pw, int ph) {
+        visible = state.open;
+        x = px; y = py; w = pw; h = ph; screenW = app.canvas.Width(); screenH = app.canvas.Height();
+        Theme theme = app.theme;
+        overlay = Style.Part(app, "dialog", "overlay", "", "", "", Style.SNormal()).bg;
+        radius = theme.borderRadiusLarge;
+        StyleBox surface = Style.Part(app, "dialog", "surface", "", "", "", Style.SNormal());
+        shadow = surface.shadow; shadowX = surface.shadowDx; shadowY = surface.shadowDy; background = surface.bg;
+        string role = Layer.RoleClass(state.dtype + 2);
+        icon = Layer.RoleIcon(state.dtype + 2); iconX = x + theme.paddingLarge; iconY = y + theme.paddingLarge;
+        iconSize = theme.iconSizeLarge;
+        iconColor = Style.Part(app, "dialog", "icon", "", role, "", Style.SNormal()).fg;
+        title = state.title; body = state.body;
+        textX = iconX + iconSize + theme.gapMedium; titleY = iconY;
+        StyleBox heading = Style.Part(app, "dialog", "title", "", "", "", Style.SNormal());
+        titleFont = heading.FontOr(Style.FontFallback(app, "large")); titleColor = heading.fg;
+        bodyY = iconY + iconSize + theme.gapMedium;
+        StyleBox text = Style.Part(app, "dialog", "body", "", "", "", Style.SNormal());
+        bodyFont = text.FontOr(Style.FontFallback(app, "medium")); bodyColor = text.fg;
+    }
+    public void Paint(App app) {
+        if (!visible) { return; }
+        Canvas canvas = app.canvas;
+        canvas.FillRect(0, 0, screenW, screenH, overlay);
+        NativeLayer.Occlude(app, 0, 0, screenW, screenH);
+        canvas.FillRoundRect(x + shadowX, y + shadowY, w, h, radius, shadow);
+        app.FillGlass(x, y, w, h, radius, background, 1000);
+        canvas.DrawGlyph(icon, iconX, iconY, iconSize, iconColor);
+        canvas.DrawText(textX, titleY, title, titleColor, titleFont);
+        if (body != "") { canvas.DrawText(textX, bodyY, body, bodyColor, bodyFont); }
+    }
+}
+
+class LayerInputRoot : InputRootAdapter {
+    weak AppLayerContext context;
+    public LayerDialogHost dialogHost;
+    public LayerQueueControl queueHost;
+    public LayerWindowHost windowHost;
+    public void SetWindowHost(LayerWindowHost host) { windowHost = host; }
+    public LayerInputRoot(AppLayerContext context) : base("layer_input") { this.context = context; }
+    LayerState Modal() {
+        if (context == null) { return null; }
+        for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+            LayerState s = context.zorder[i];
+            if (s.open && s.modal) { return s; }
+        }
+        return null;
+    }
+    public override bool ContainsHostedControl(Control control) {
+        if (control == null) { return false; }
+        if (base.ContainsHostedControl(control)) { return true; }
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState state = context.zorder[i];
+                if (!state.open) { continue; }
+                if (state.view != null && state.view.ContainsHostedControl(control)) { return true; }
+                if (state.wrap != null && state.wrap.ContainsHostedControl(control)) { return true; }
+                if (state.promptInput != null && state.promptInput.ContainsHostedControl(control)) { return true; }
+                if (state.dialogFooter != null && state.dialogFooter.ContainsHostedControl(control)) { return true; }
+                if (state.windowFooter != null && state.windowFooter.ContainsHostedControl(control)) { return true; }
+            }
+        }
+        return false;
+    }
+    public override bool ContainsInputControl(Control control) {
+        if (control == null) { return false; }
+        if (control == this) { return true; }
+        LayerState modal = this.Modal();
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                if (s.ContainsLayerInput(control)) { return true; }
+                if (s == modal) { return false; }
+            }
+        }
+        return content != null && content.ContainsInputControl(control);
+    }
+    public override void CollectInputFocus(App app, List<Control> controls) {
+        LayerState modal = this.Modal();
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                s.CollectLayerFocus(app, controls);
+                if (s == modal) { return; }
+            }
+        }
+        base.CollectInputFocus(app, controls);
+    }
+    public override Control FindInputFocus(App app) {
+        LayerState modal = this.Modal();
+        if (modal != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                Control focused = s.FindLayerFocus(app);
+                if (focused != null) { return focused; }
+                if (s == modal) { return this; }
+            }
+        }
+        if (context != null) {
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                Control focused = context.zorder[i].FindLayerFocus(app);
+                if (focused != null) { return focused; }
+            }
+        }
+        return content != null ? content.FindInputFocus(app) : null;
+    }
+    protected override Control HitTestCore(int x, int y, int pointerType, List<Control> excludedSubtrees) {
+        if (context != null) {
+            LayerState modal = this.Modal();
+            for (int i = context.zorder.Count - 1; i >= 0; i = i - 1) {
+                LayerState s = context.zorder[i];
+                if (s.open && !s.modal && s.state == 2 && inputApp != null
+                    && Layer.Contains(inputApp, s, x, y) && windowHost != null) {
+                    Control minimized = windowHost.HitTest(x, y, pointerType, excludedSubtrees);
+                    if (minimized != null) { return minimized; }
+                }
+                if (s.open && (s.modal || s.state != 2) && Layer.Inside(x, y, s.inputX, s.inputY, s.inputW, s.inputH)) {
+                    Control hit = s.HitLayerInput(x, y, pointerType, excludedSubtrees);
+                    return hit != null ? hit : this;
+                }
+                if (s == modal) { return this; }
+            }
+        }
+        if (windowHost != null) {
+            Control hit = windowHost.HitTest(x, y, pointerType, excludedSubtrees);
+            if (hit != null) { return hit; }
+        }
+        return content != null ? content.HitTest(x, y, pointerType, excludedSubtrees) : null;
+    }
+    public override void OnRoutedEvent(RoutedEventArgs e) {
+        if (e.eventName == "KeyDown" && inputApp != null && Layer.Key(inputApp, e.keyCode)) { e.Handle(); }
+    }
+    protected override List<Control> LayoutChildren() {
+        List<Control> children = base.LayoutChildren();
+        if (windowHost == null) { return children; }
+        if (children == null) { children = new List<Control>(); }
+        if (!children.Contains(windowHost)) { children.Add(windowHost); }
+        return children;
+    }
+    protected override bool OwnsLayoutChild(Control child) {
+        return base.OwnsLayoutChild(child) || (child != null && child == windowHost);
+    }
+    public override int InputPriority() { return 1; }
+    protected override void OnReleaseInput(App app) {
+        if (context == null) { return; }
+        for (int i = 0; i < context.zorder.Count; i = i + 1) {
+            context.zorder[i].ReleaseLayerInput();
+        }
+    }
+    void Activate(LayerState s) {
+        if (s.modal && inputApp != null) {
+            if (content != null) { inputApp.CancelInputSubtree(content); }
+            for (int i = 0; i < context.zorder.Count; i = i + 1) {
+                LayerState other = context.zorder[i];
+                if (other != s) { other.CancelLayerInputOnly(); }
+            }
+        }
+    }
+}

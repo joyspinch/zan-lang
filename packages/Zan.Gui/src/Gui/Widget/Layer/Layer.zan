@@ -71,46 +71,37 @@ public partial class Layer {
             ctx.zorder.RemoveAt(i);
         }
     }
-    public static LayerState TopmostDialog(App app) {
-        AppLayerContext ctx = Layer.Context(app);
+    private static LayerState FindTopmostDialogIn(AppLayerContext ctx) {
+        if (ctx == null) { return null; }
         Layer.EnsureZorder(ctx);
-        int i = ctx.zorder.Count - 1;
-        while (i >= 0) {
+        for (int i = ctx.zorder.Count - 1; i >= 0; i = i - 1) {
             LayerState s = ctx.zorder[i];
             if (s.open && s.kind != 0) { return s; }
-            i = i - 1;
-        }
-        AppLayerContext fb = GuiWidgetState.Current().layerFallbackContext;
-        if (ctx != fb && fb != null) {
-            Layer.EnsureZorder(fb);
-            int fi = fb.zorder.Count - 1;
-            while (fi >= 0) {
-                LayerState fs = fb.zorder[fi];
-                if (fs.open && fs.kind != 0) { return fs; }
-                fi = fi - 1;
-            }
         }
         return null;
     }
+    public static LayerState TopmostDialog(App app) {
+        AppLayerContext ctx = Layer.Context(app);
+        LayerState top = Layer.FindTopmostDialogIn(ctx);
+        if (top != null) { return top; }
+        AppLayerContext fb = GuiWidgetState.Current().layerFallbackContext;
+        return ctx != fb ? Layer.FindTopmostDialogIn(fb) : null;
+    }
     public static LayerState TopmostDialog() { return Layer.TopmostDialog(null); }
+    private static LayerState FindTopmostOpenIn(AppLayerContext ctx) {
+        if (ctx == null) { return null; }
+        Layer.EnsureZorder(ctx);
+        for (int i = ctx.zorder.Count - 1; i >= 0; i = i - 1) {
+            if (ctx.zorder[i].open) { return ctx.zorder[i]; }
+        }
+        return null;
+    }
     public static bool IsTopmost(App app, LayerState s) {
         AppLayerContext ctx = Layer.Context(app);
-        Layer.EnsureZorder(ctx);
-        int i = ctx.zorder.Count - 1;
-        while (i >= 0) {
-            if (ctx.zorder[i].open) { return ctx.zorder[i] == s; }
-            i = i - 1;
-        }
+        LayerState top = Layer.FindTopmostOpenIn(ctx);
+        if (top != null) { return top == s; }
         AppLayerContext fb = GuiWidgetState.Current().layerFallbackContext;
-        if (ctx != fb && fb != null) {
-            Layer.EnsureZorder(fb);
-            int fi = fb.zorder.Count - 1;
-            while (fi >= 0) {
-                if (fb.zorder[fi].open) { return fb.zorder[fi] == s; }
-                fi = fi - 1;
-            }
-        }
-        return false;
+        return ctx != fb && Layer.FindTopmostOpenIn(fb) == s;
     }
     public static bool IsTopmost(LayerState s) { return Layer.IsTopmost(null, s); }
     public static void Close(App app, LayerState s) {
@@ -240,12 +231,6 @@ public partial class Layer {
             }
         }
     }
-    private static int ActionWidth(App app, Button b, int minW) {
-        b.OnMeasure(app);
-        int w = b.prefW;
-        if (w < minW) { w = minW; }
-        return w;
-    }
     public static int Clamp01(int v) {
         if (v < 0) { return 0; }
         if (v > 1000) { return 1000; }
@@ -288,7 +273,6 @@ public partial class Layer {
     }
     public static void Notify(string title, int type) { Layer.Notify(null, title, type); }
     public static void Notify(string title) { Layer.Notify(null, title, 1); }
-    public static int NotifyH(App app) { return app.theme.heightLarge + app.theme.paddingSmall; }
     public static void Tips(App app, int anchorX, int anchorY, string text) {
         if (app == null) { app = App.FrameApp(); }
         Tooltip.Request(app, anchorX, anchorY, text, 0, 0);
@@ -316,15 +300,6 @@ public partial class Layer {
     public static int BarH(App app) { return app.theme.heightLarge; }
     public static int FooterH(App app) { return app.theme.heightMedium + app.Scale(20); }
     public static int BtnW(App app) { return app.Scale(46); }
-    public static int BodyTop(App app, LayerState s) {
-        int top = app.titlebarH;
-        if (s.state == 1) { return top + Layer.BarH(app) + app.Scale(16); }
-        return s.y + Layer.BarH(app) + app.Scale(16);
-    }
-    public static int BodyLeft(App app, LayerState s) {
-        if (s.state == 1) { return app.Scale(20); }
-        return s.x + app.Scale(20);
-    }
     public static bool Inside(int mx, int my, int x, int y, int w, int h) {
         return mx >= x && mx < x + w && my >= y && my < y + h;
     }
@@ -425,31 +400,41 @@ public partial class Layer {
         int al = (color - rgb) / 16777216 + 256;
         return (al * a / 1000) * 16777216 + rgb;
     }
-    public static bool ClosingFrame(App app, LayerState s) {
-        if (s.wasOpen) {
-            Layer.BeginExit(s);
-            if (!s.closedRaised) {
-                s.closedRaised = true;
-                s.Closed.Raise();
-            }
-        }
-        if (!s.closing) { return false; }
-        int outP = Layer.ExitP(s);
-        if (outP < 1000) {
-            if (!s.modal) { Layer.RenderClosing(app, s, outP); }
-            app.RequestAnimationFrameIn(0, 0,
-                                        app.canvas.Width(), app.canvas.Height());
-            return true;
-        }
-        s.closing = false;
-        app.RequestRedraw();
-        return true;
-    }
     public static void FlushCloseRedraw(App app) {
         AppLayerContext ctx = Layer.Context(app);
         if (ctx.requestRedraw) {
             ctx.requestRedraw = false;
             app.RequestRedraw();
+        }
+    }
+    static LayerInputRoot RetainedInput(App app) {
+        AppLayerContext context = Layer.Context(app);
+        if (context.inputRoot == null) { context.inputRoot = new LayerInputRoot(context); }
+        return context.inputRoot;
+    }
+    static void SyncDialogs(App app) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app == null) { return; }
+        LayerInputRoot root = Layer.RetainedInput(app);
+        if (root.dialogHost == null) { root.dialogHost = new LayerDialogHost(app); }
+        root.dialogHost.SyncStates(app);
+    }
+    static bool DialogOwnsOverlay(App app) {
+        if (app == null || app.overlayHost == null) { return false; }
+        AppLayerContext context = Layer.Context(app);
+        return context.inputRoot != null && context.inputRoot.dialogHost != null
+            && app.overlayHost.ActiveRoot() == context.inputRoot.dialogHost;
+    }
+    static void UpdateRetainedRoots(App app, AppLayerContext context) {
+        app.SetRetainedLayerRoots(context.windowHost, context.inputRoot.queueHost);
+    }
+    static void EnsureQueueHost(App app) {
+        if (app == null) { app = App.FrameApp(); }
+        if (app == null) { return; }
+        LayerInputRoot root = Layer.RetainedInput(app);
+        if (root.queueHost == null) {
+            root.queueHost = new LayerQueueControl(app);
+            Layer.UpdateRetainedRoots(app, Layer.Context(app));
         }
     }
 }
