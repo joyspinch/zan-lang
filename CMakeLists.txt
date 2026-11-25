@@ -865,6 +865,7 @@ add_executable(zan-lsp
     src/compiler/checker.c
     src/compiler/definite.c
     src/compiler/package.c
+    src/compiler/suggest.c
     src/lsp/intellisense.c
 )
 target_include_directories(zan-lsp PRIVATE src/compiler src/common src/lsp)
