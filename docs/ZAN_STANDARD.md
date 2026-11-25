@@ -63,7 +63,7 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 | S2 | `zanc query <符号>` | 回答：分配了什么、捕获了什么、可能抛什么、用到哪些能力（§2.2）、被谁调用 |
 | S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
 | S4 | `zanc --summary <包>` | 第一刀已落地，见 docs/ZANC_CLI.md §1.7（公开签名 + 一行文档）；余：效果与契约列（依赖 S2） |
-| S5 | `zan check` | 一条命令跑完：编译诊断 → 泄漏门禁（§3）→ `zan ui check`（§5）→ 回放比对与不变量（§6），输出单份 JSON 报告 |
+| S5 | `zan check` | 第一刀已落地为 `scripts/zan_check.py`，见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；余：ui/replay 步骤（随 P2/P3）、SDK 原生命令形态 |
 
 AI 工作循环收敛为：**改代码 → `zan check` → 应用 fix-it**。
 

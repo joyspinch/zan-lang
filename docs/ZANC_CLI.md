@@ -232,6 +232,25 @@ public class UiEvent  // 控件事件：单一订阅通道。
 - 实测：`packages/Zan.Gui/src` 460 个类型、6349 个成员，约 1.5 秒。
 - 钉：`summary_surface`（`tests/summary/`）。
 
+### 1.8 一条命令的检查报告（`zan check`，S5）
+
+`python3 scripts/zan_check.py <入口.zan|目录...> [--timeout 60] [--no-run]
+[--zanc-arg X ...] [--out report.json] [-- 程序参数...]` 依次跑完下面几步，向
+stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败步骤
+（skipped 不算失败），1 = 有失败，2 = 参数问题。
+
+| 步骤 | 内容 | 失败条件 |
+|---|---|---|
+| `compile` | `zanc … --auto-stdlib --check-leaks --diag=json`：全部诊断原样收进 `diagnostics`（§1.6，含 fix-it），`errors`/`warnings` 计数 | 编译失败 |
+| `leaks` | 运行产物（`stdin` 关闭、带超时）并解析退出报告：`leaked`、`sites[{count,site}]`、`cycles[]`（S13 路径）、`mode`（`strict` = Main 正常返回，`early-exit` = 提前退出只计不可达环） | 有泄漏、退出码非 0 或超时 |
+| `ui` | `zan ui check`（S22，P2） | 未实现，恒 `skipped` |
+| `replay` | 回放比对与不变量（S26/S27，P3） | 未实现，恒 `skipped` |
+
+编译失败时后续步骤记 `skipped` 并写明原因，报告形状不变：
+`{"version":1, "ok":…, "inputs":[…], "steps":[{"name":…, "status":"pass|fail|skipped", …}]}`。
+GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出运行上限。
+钉：`zan_check_report`（`tests/test_zan_check.py`）。
+
 ## 2. 全参数表（与 `zanc --help` 同源）
 
 > 分组与 `zanc --help` 一致：**常用 / 发布 / 调试 / 打包 / 内部（未稳定）**。

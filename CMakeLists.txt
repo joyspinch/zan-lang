@@ -8704,6 +8704,12 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/affected)
   set_tests_properties(affected_selection PROPERTIES TIMEOUT 300)
+  # S5（docs/ZAN_STANDARD.md §1）：scripts/zan_check.py——编译诊断 + 泄漏门禁
+  # （+ ui/replay 占位）合成单份 JSON 报告。
+  add_test(NAME zan_check_report
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_zan_check.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR})
+  set_tests_properties(zan_check_report PROPERTIES TIMEOUT 600)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
