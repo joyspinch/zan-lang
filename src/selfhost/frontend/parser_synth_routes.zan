@@ -1,0 +1,633 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+namespace Zan;
+
+// The conventional-route action dispatcher (the C host's
+// driver/main_synth.c zan_synth_action_dispatch + attr_routes.h + the
+// checker's Register rewrite, checker_expr_core.c). A unit that calls
+// `__AttrRoutes.Register(app)` / `RegisterFramework(app)` gets a
+// synthesized `__ZanActionDispatch` whose Dispatch / DispatchFramework
+// expand every controller action into a strongly typed call (reflection
+// Invoke cannot hand back a coroutine to await). Register additionally
+// receives `new TypeInfo[] { typeof(UserController), ... }` -- the user's
+// controllers, discovered at compile time -- and the dispatcher method
+// group; RegisterFramework receives its own dispatcher.
+public partial class Parser {
+
+    void SynthActionDispatch(Node unit) {
+        List<Node> appCalls = new List<Node>();
+        List<Node> fwCalls = new List<Node>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            if (d != null && !d.fromLib) { RoutesCollectCalls(d, appCalls, fwCalls); }
+            i = i + 1;
+        }
+        if (appCalls.Count == 0 && fwCalls.Count == 0) { return; }
+        List<string> fwRefs = RoutesFrameworkRefs(unit);
+        StringBuilder b = new StringBuilder();
+        b.Append("class __ZanActionDispatch {\n");
+        int fw = 0;
+        while (fw <= 1) {
+            b.Append("    public static async bool " + (fw == 1 ? "DispatchFramework" : "Dispatch")
+                + "(System.Web.HttpContext ctx, string actionKey) {\n");
+            int emitted = 0;
+            int ci = 0;
+            while (ci < unit.kids.Count) {
+                Node decl = unit.kids[ci];
+                ci = ci + 1;
+                if (decl == null || decl.kind != AK.ClassDecl() || decl.sval == null) { continue; }
+                if (decl.fromLib && RoutesIsStdlib(decl)) { continue; }
+                bool fwCtrl = RoutesIsFrameworkController(decl, fwRefs);
+                if (fw == 1) {
+                    if (fwCalls.Count == 0 || !fwCtrl) { continue; }
+                } else {
+                    if (appCalls.Count == 0 || decl.fromLib || fwCtrl) { continue; }
+                }
+                if ((decl.mods & MOD.Abstract()) != 0) { continue; }
+                if (SynthIsGeneric(decl)) { continue; }
+                if (!RoutesClassIsController(unit, decl, 0)) { continue; }
+                string ns = decl.nsName != null ? decl.nsName : "";
+                string full = ns != "" ? ns + "." + decl.sval : decl.sval;
+                string viewNs = ns;
+                if (viewNs == "Zan.Web") { viewNs = ""; }
+                else if (viewNs.StartsWith("Zan.Web.")) { viewNs = viewNs.Substring(8); }
+                string viewOwner = viewNs != "" ? viewNs + "." + decl.sval : decl.sval;
+                bool classTx = RoutesHasAttr(decl, "Tx");
+                bool classRo = RoutesHasAttr(decl, "ReadOnly");
+                int mi = 0;
+                while (mi < decl.kids.Count) {
+                    Node m = decl.kids[mi];
+                    mi = mi + 1;
+                    if (m == null || m.kind != AK.MethodDecl()) { continue; }
+                    if ((m.mods & MOD.Private()) != 0 || (m.mods & MOD.Abstract()) != 0) { continue; }
+                    if (RoutesEmitAction(b, unit, m, full, viewOwner, classTx, classRo)) { emitted = emitted + 1; }
+                }
+            }
+            if (emitted == 0) { b.Append("        await Task.Delay(0);\n"); }
+            b.Append("        return false;\n");
+            b.Append("    }\n");
+            fw = fw + 1;
+        }
+        b.Append("}\n");
+        SynthAppendSource(unit, b.ToString());
+        // the Register rewrite (the host does it in the checker): the user's
+        // controllers + the dispatcher method group join the call
+        string ctrlArray = RoutesControllersArray(unit, fwRefs);
+        i = 0;
+        while (i < appCalls.Count) {
+            Node call = appCalls[i];
+            int argc = RoutesArgCount(call);
+            if (argc == 1 || argc == 2) {
+                if (argc == 1) { RoutesAppendArg(call, ctrlArray); }
+                RoutesAppendArg(call, "__ZanActionDispatch.Dispatch");
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < fwCalls.Count) {
+            if (RoutesArgCount(fwCalls[i]) == 1) { RoutesAppendArg(fwCalls[i], "__ZanActionDispatch.DispatchFramework"); }
+            i = i + 1;
+        }
+    }
+
+    // stdlib (not a package) declarations never host routed controllers
+    bool RoutesIsStdlib(Node d) {
+        string ns = d.nsName != null ? d.nsName : "";
+        return ns == "System" || ns.StartsWith("System.");
+    }
+
+    // `__AttrRoutes.Register(...)` (1) / `RegisterFramework(...)` (2)
+    int RoutesRegistration(Node n) {
+        if (n == null || n.kind != AK.Call() || n.a == null || n.a.kind != AK.MemberAccess()) { return 0; }
+        Node o = n.a.a;
+        bool recv = o != null && ((o.kind == AK.Ident() && o.sval == "__AttrRoutes")
+            || (o.kind == AK.MemberAccess() && o.sval == "__AttrRoutes"));
+        if (!recv) { return 0; }
+        if (n.a.sval == "Register") { return 1; }
+        if (n.a.sval == "RegisterFramework") { return 2; }
+        return 0;
+    }
+
+    void RoutesCollectCalls(Node n, List<Node> app, List<Node> fw) {
+        if (n == null) { return; }
+        int r = RoutesRegistration(n);
+        if (r == 1) { app.Add(n); }
+        if (r == 2) { fw.Add(n); }
+        RoutesCollectCalls(n.a, app, fw);
+        RoutesCollectCalls(n.b, app, fw);
+        RoutesCollectCalls(n.c, app, fw);
+        RoutesCollectCalls(n.d, app, fw);
+        int i = 0;
+        while (i < n.kids.Count) { RoutesCollectCalls(n.kids[i], app, fw); i = i + 1; }
+    }
+
+    // the `typeof(...)` names inside __AttrRoutes.RegisterFramework: the
+    // explicit framework allowlist (never a namespace heuristic)
+    List<string> RoutesFrameworkRefs(Node unit) {
+        List<string> refs = new List<string>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            i = i + 1;
+            if (d == null || d.kind != AK.ClassDecl() || d.sval != "__AttrRoutes") { continue; }
+            int k = 0;
+            while (k < d.kids.Count) {
+                Node m = d.kids[k];
+                if (m != null && m.kind == AK.MethodDecl() && m.sval == "RegisterFramework") {
+                    RoutesCollectTypeofs(m, refs);
+                }
+                k = k + 1;
+            }
+        }
+        return refs;
+    }
+
+    void RoutesCollectTypeofs(Node n, List<string> refs) {
+        if (n == null) { return; }
+        if (n.kind == AK.StringLit() && n.b != null && n.b.kind == AK.TypeRef() && n.b.sval != null) {
+            refs.Add(n.b.sval);
+        }
+        RoutesCollectTypeofs(n.a, refs);
+        RoutesCollectTypeofs(n.b, refs);
+        RoutesCollectTypeofs(n.c, refs);
+        RoutesCollectTypeofs(n.d, refs);
+        int i = 0;
+        while (i < n.kids.Count) { RoutesCollectTypeofs(n.kids[i], refs); i = i + 1; }
+    }
+
+    bool RoutesIsFrameworkController(Node decl, List<string> refs) {
+        string ns = decl.nsName != null ? decl.nsName : "";
+        int i = 0;
+        while (i < refs.Count) {
+            string r = refs[i];
+            if (r == decl.sval || (ns != "" && r == ns + "." + decl.sval)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // some base along the chain ends in "Controller" (the host's
+    // zd_class_is_controller)
+    bool RoutesClassIsController(Node unit, Node decl, int depth) {
+        if (decl == null || depth > 16) { return false; }
+        string b = decl.sval2;
+        if (b == null || b == "") { return false; }
+        int dot = b.LastIndexOf(".");
+        if (dot >= 0) { b = b.Substring(dot + 1); }
+        if (b.EndsWith("Controller")) { return true; }
+        return RoutesClassIsController(unit, SynthFindClass(unit, b), depth + 1);
+    }
+
+    // the attribute names a node carries (its packed blob: `A=v;A.k=v;`)
+    bool RoutesHasAttr(Node n, string name) {
+        List<string> names = RoutesAttrNames(n);
+        return names.Contains(name);
+    }
+
+    List<string> RoutesAttrNames(Node n) {
+        List<string> names = new List<string>();
+        if (n == null || n.attrBlob == null || n.attrBlob == "") { return names; }
+        List<string> parts = n.attrBlob.Split(';');
+        int i = 0;
+        while (i < parts.Count) {
+            string p = parts[i];
+            i = i + 1;
+            int eq = p.IndexOf("=");
+            if (eq <= 0) { continue; }
+            string lhs = p.Substring(0, eq);
+            int dot = lhs.IndexOf(".");
+            if (dot > 0) { lhs = lhs.Substring(0, dot); }
+            if (!names.Contains(lhs)) { names.Add(lhs); }
+        }
+        return names;
+    }
+
+    // a routed action (the host's zd_is_action_method: Route / Http* /
+    // Description / Custom / *Action*, or the conventional Index)
+    bool RoutesIsAction(Node m) {
+        List<string> names = RoutesAttrNames(m);
+        int i = 0;
+        while (i < names.Count) {
+            string s = names[i];
+            if (s == "Route" || s.StartsWith("Http") || s == "Description" || s == "Custom"
+                || s.IndexOf("Action") >= 0) { return true; }
+            i = i + 1;
+        }
+        return m.sval == "Index";
+    }
+
+    // [Opt("page=1", "kw=")]: optional parameter -> default
+    string RoutesOptDefault(Node m, string pname, List<bool> found) {
+        found.Clear();
+        if (m.attrBlob == null) { return ""; }
+        List<string> parts = m.attrBlob.Split(';');
+        int i = 0;
+        while (i < parts.Count) {
+            string p = parts[i];
+            i = i + 1;
+            if (!p.StartsWith("Opt=")) { continue; }
+            string v = p.Substring(4);
+            int eq = v.IndexOf("=");
+            string nm = eq >= 0 ? v.Substring(0, eq) : v;
+            if (nm == pname) {
+                found.Add(true);
+                return eq >= 0 ? v.Substring(eq + 1) : "";
+            }
+        }
+        return "";
+    }
+
+    // the request-bindable scalar a parameter/field type names (null: none)
+    string RoutesParamType(Node t) {
+        if (t == null || t.kind != AK.TypeRef() || t.sval == null || t.ival > 0) { return null; }
+        string s = t.sval;
+        int dot = s.LastIndexOf(".");
+        if (dot >= 0) { s = s.Substring(dot + 1); }
+        if (s == "int" || s == "long" || s == "double" || s == "bool" || s == "string") { return s; }
+        return null;
+    }
+
+    string RoutesEsc(string s) {
+        StringBuilder o = new StringBuilder();
+        int i = 0;
+        while (i < s.Length) {
+            char ch = s[i];
+            if (ch == '"' || ch == '\\') { o.Append("\\"); }
+            o.Append(ch.ToString());
+            i = i + 1;
+        }
+        return o.ToString();
+    }
+
+    // one `if (actionKey == "...")` branch; false when the signature cannot
+    // be bound (the action is then left to the reflective path)
+    bool RoutesEmitAction(StringBuilder b, Node unit, Node m, string full, string viewOwner, bool classTx, bool classRo) {
+        if (m.sval == null || m.sval == "") { return false; }
+        if (SynthIsGeneric(m)) { return false; }
+        if (!RoutesIsAction(m)) { return false; }
+        List<Node> ps = new List<Node>();
+        int i = 0;
+        while (i < m.kids.Count) { if (m.kids[i].kind == AK.Param()) { ps.Add(m.kids[i]); } i = i + 1; }
+        if (ps.Count > 32) { return false; }
+        bool isStatic = (m.mods & MOD.Static()) != 0;
+        bool isAsync = (m.mods & MOD.Async()) != 0;
+        string aw = isAsync ? "await " : "";
+        bool tx = classTx || RoutesHasAttr(m, "Tx");
+        bool ro = classRo || RoutesHasAttr(m, "ReadOnly");
+        StringBuilder binds = new StringBuilder();
+        string args = "";
+        string recv = isStatic ? "ctx" : "__c";
+        i = 0;
+        while (i < ps.Count) {
+            Node p = ps[i];
+            string pn = p.sval;
+            string rt = RoutesParamType(p.type);
+            Node fcls = null;
+            if (rt == null && p.type != null && p.type.kind == AK.TypeRef() && p.type.sval != null) {
+                fcls = SynthFindClass(unit, p.type.sval);
+                if (fcls == null) { return false; }   // unknown type: not synthesized
+            } else if (rt == null) { return false; }
+            if (i > 0) { args = args + ", "; }
+            args = args + pn;
+            i = i + 1;
+            if (fcls != null) {
+                // a form model: new it, bind each scalar field present
+                string ft0 = p.type.sval;
+                binds.Append("            " + ft0 + " " + pn + " = new " + ft0 + "();\n");
+                int fi = 0;
+                while (fi < fcls.kids.Count) {
+                    Node mem = fcls.kids[fi];
+                    fi = fi + 1;
+                    if (mem == null || mem.kind != AK.FieldDecl() || (mem.mods & MOD.Static()) != 0) { continue; }
+                    string ft = RoutesParamType(mem.type);
+                    if (ft == null) { continue; }
+                    string fn = mem.sval;
+                    string getx;
+                    if (ft == "int") { getx = "ctx.InInt(\"" + fn + "\", " + pn + "." + fn + ")"; }
+                    else if (ft == "long") { getx = "ctx.InLong(\"" + fn + "\", " + pn + "." + fn + ")"; }
+                    else if (ft == "double") { getx = "ctx.InDouble(\"" + fn + "\", " + pn + "." + fn + ")"; }
+                    else if (ft == "bool") { getx = "ctx.InBool(\"" + fn + "\", " + pn + "." + fn + ")"; }
+                    else { getx = "ctx.In(\"" + fn + "\")"; }
+                    binds.Append("            if (ctx.HasIn(\"" + fn + "\")) { " + pn + "." + fn + " = " + getx + "; }\n");
+                }
+                continue;
+            }
+            List<bool> optFound = new List<bool>();
+            string dn = RoutesOptDefault(m, pn, optFound);
+            if (optFound.Count > 0) {
+                if (rt == "int") { binds.Append("            int " + pn + " = " + recv + ".InInt(\"" + pn + "\", " + (dn != "" ? dn : "0") + ");\n"); }
+                else if (rt == "long") { binds.Append("            long " + pn + " = " + recv + ".InLong(\"" + pn + "\", " + (dn != "" ? dn : "0") + ");\n"); }
+                else if (rt == "double") { binds.Append("            double " + pn + " = " + recv + ".InDouble(\"" + pn + "\", " + (dn != "" ? dn : "0") + ");\n"); }
+                else if (rt == "bool") { binds.Append("            bool " + pn + " = " + recv + ".InBool(\"" + pn + "\", " + (dn == "true" ? "true" : "false") + ");\n"); }
+                else {
+                    binds.Append("            string " + pn + " = " + recv + ".In(\"" + pn + "\");\n");
+                    binds.Append("            if (" + pn + ".Length == 0) { " + pn + " = \"" + RoutesEsc(dn) + "\"; }\n");
+                }
+            } else if (isStatic) {
+                string need = "            if (!ctx.HasIn(\"" + pn + "\")) { throw new System.Web.ApiError(400, \"0003\", \"" + pn + "不能为空\"); }\n";
+                if (rt == "int") { binds.Append(need + "            int " + pn + " = ctx.InInt(\"" + pn + "\", 0);\n"); }
+                else if (rt == "long") { binds.Append(need + "            long " + pn + " = ctx.InLong(\"" + pn + "\", 0);\n"); }
+                else if (rt == "double") { binds.Append(need + "            double " + pn + " = ctx.InDouble(\"" + pn + "\", 0);\n"); }
+                else if (rt == "bool") { binds.Append(need + "            bool " + pn + " = ctx.InBool(\"" + pn + "\", false);\n"); }
+                else {
+                    binds.Append("            string " + pn + " = ctx.In(\"" + pn + "\");\n");
+                    binds.Append("            if (" + pn + ".Length == 0) { throw new System.Web.ApiError(400, \"0003\", \"" + pn + "不能为空\"); }\n");
+                }
+            } else {
+                if (rt == "int") { binds.Append("            int " + pn + " = __c.NeedInt(\"" + pn + "\", \"" + pn + "\");\n"); }
+                else if (rt == "long") { binds.Append("            long " + pn + " = __c.NeedLong(\"" + pn + "\", \"" + pn + "\");\n"); }
+                else if (rt == "double") { binds.Append("            double " + pn + " = __c.NeedDouble(\"" + pn + "\", \"" + pn + "\");\n"); }
+                else if (rt == "bool") { binds.Append("            bool " + pn + " = __c.NeedBool(\"" + pn + "\", \"" + pn + "\");\n"); }
+                else { binds.Append("            string " + pn + " = __c.Need(\"" + pn + "\", \"" + pn + "\");\n"); }
+            }
+        }
+        // the key is the class's REFLECTED identity (typeof(..).FullName):
+        // a renamed collision class (a user HealthController next to the
+        // package's) keys under the name reflection reports for it
+        b.Append("        if (actionKey == typeof(" + full + ").FullName + \"." + m.sval + "\") {\n");
+        if (isStatic) {
+            b.Append(binds.ToString());
+            b.Append("            " + aw + full + "." + m.sval + "(" + args + ");\n");
+        } else {
+            b.Append("            " + full + " __c = new " + full + "();\n");
+            b.Append("            __c.Bind(ctx);\n");
+            b.Append("            __c.SetView(\"" + viewOwner + "." + m.sval + "\");\n");
+            if (ro) { b.Append("            __c.UseReadOnly();\n"); }
+            if (tx) { b.Append("            bool __tx = false;\n"); }
+            b.Append("            try {\n");
+            b.Append("                if (await __c.BeforeAsync()) {\n");
+            if (tx) {
+                b.Append("                    bool __begun = await __c.TxBegin();\n");
+                b.Append("                    if (!__begun) { throw new System.Web.ApiError(503, \"0503\", \"服务不可用\"); }\n");
+                b.Append("                    __tx = true;\n");
+            }
+            b.Append(binds.ToString());
+            b.Append("                    " + aw + "__c." + m.sval + "(" + args + ");\n");
+            if (tx) {
+                b.Append("                    await __c.TxCommit();\n");
+                b.Append("                    __tx = false;\n");
+            }
+            b.Append("                }\n");
+            if (tx) {
+                b.Append("            } catch (System.Exception __x) {\n");
+                b.Append("                if (__tx) { try { await __c.TxRollback(); } catch (System.Exception __r) { } }\n");
+                b.Append("                throw;\n");
+            }
+            b.Append("            } finally {\n");
+            b.Append("                await __c.AfterAsync();\n");
+            b.Append("            }\n");
+        }
+        b.Append("            return true;\n        }\n");
+        return true;
+    }
+
+    // the user's controllers (the host's checker_collect_controllers):
+    // user-file classes, not abstract/generic, not the framework base
+    // classes, named *Controller or [Route]/[ApiController] or deriving
+    // from a *Controller; framework-allowlisted ones excluded
+    string RoutesControllersArray(Node unit, List<string> fwRefs) {
+        StringBuilder s = new StringBuilder();
+        s.Append("new TypeInfo[] { ");
+        List<string> seen = new List<string>();
+        int n = 0;
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            i = i + 1;
+            if (d == null || d.kind != AK.ClassDecl() || d.sval == null || d.fromLib) { continue; }
+            if ((d.mods & MOD.Abstract()) != 0 || SynthIsGeneric(d)) { continue; }
+            if (RoutesIsFrameworkController(d, fwRefs)) { continue; }
+            string nm = d.sval;
+            if (nm == "Controller" || nm == "AppController" || nm == "AdminController"
+                || nm == "ApiController" || nm == "CrudScreenController") { continue; }
+            bool isCtrl = nm.EndsWith("Controller") || RoutesHasAttr(d, "Route") || RoutesHasAttr(d, "ApiController");
+            if (!isCtrl && d.sval2 != null && d.sval2.EndsWith("Controller")) { isCtrl = true; }
+            if (!isCtrl || seen.Contains(nm)) { continue; }
+            seen.Add(nm);
+            string ns = d.nsName != null ? d.nsName : "";
+            if (n > 0) { s.Append(", "); }
+            s.Append("typeof(" + (ns != "" ? ns + "." + nm : nm) + ")");
+            n = n + 1;
+        }
+        s.Append(" }");
+        return s.ToString();
+    }
+
+    int RoutesArgCount(Node call) {
+        int n = 0;
+        int i = 0;
+        while (i < call.kids.Count) { if (call.kids[i] != null) { n = n + 1; } i = i + 1; }
+        return n;
+    }
+
+    // parse `text` as an expression and append it as the call's next argument
+    void RoutesAppendArg(Node call, string text) {
+        Lexer lx = new Lexer(text);
+        List<Token> toks = lx.Run();
+        Parser sub = new Parser(toks, diags);
+        Node e = sub.ParseExpr();
+        if (e == null) { return; }
+        RoutesStampLine(e, call.line, call.col);
+        call.Add(e);
+    }
+
+    void RoutesStampLine(Node n, int line, int col) {
+        if (n == null) { return; }
+        n.line = line; n.col = col;
+        RoutesStampLine(n.a, line, col);
+        RoutesStampLine(n.b, line, col);
+        RoutesStampLine(n.c, line, col);
+        RoutesStampLine(n.d, line, col);
+        int i = 0;
+        while (i < n.kids.Count) { RoutesStampLine(n.kids[i], line, col); i = i + 1; }
+    }
+}
+
+// Request-parameter metadata for reflection (the C host's
+// reflect_attrs.c refl_append_method_params): every method's packed
+// attributes gain `Param=<name>\t<type>\t<where>\t<required>\t<def>\t<desc>;`
+// entries -- the signature's parameters ([Opt] makes one optional, a form
+// model class expands into its fields) and the request readers its body
+// calls (In*/Need*/Param on ctx/c/this/Ctx(), Paged). The route table's API
+// docs read them (AttrRoutes.RegisterController).
+public class RouteParamEntry {
+    public string name;
+    public string type;
+    public string source;
+    public bool required;
+    public string def;
+    public string desc;
+}
+
+public partial class Parser {
+
+    void SynthParamMeta(Node unit) {
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            i = i + 1;
+            if (d == null || (d.kind != AK.ClassDecl() && d.kind != AK.StructDecl())) { continue; }
+            int k = 0;
+            while (k < d.kids.Count) {
+                Node m = d.kids[k];
+                k = k + 1;
+                if (m == null || m.kind != AK.MethodDecl() || (m.mods & MOD.Extern()) != 0) { continue; }
+                string meta = ParamMetaOf(unit, m);
+                if (meta != "") { m.attrBlob = (m.attrBlob != null ? m.attrBlob : "") + meta; }
+            }
+        }
+    }
+
+    string ParamMetaOf(Node unit, Node m) {
+        List<RouteParamEntry> ps = new List<RouteParamEntry>();
+        int i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            i = i + 1;
+            if (p == null || p.kind != AK.Param() || ps.Count >= 32) { continue; }
+            string ptype = p.type != null && p.type.kind == AK.TypeRef() && p.type.sval != null ? p.type.sval : "string";
+            if (ptype == "HttpContext" || ptype == "System.Web.HttpContext") { continue; }
+            // a form model: its instance fields, sourced from the form
+            Node fcls = (p.type != null && p.type.ival == 0) ? SynthFindClass(unit, ptype) : null;
+            bool isForm = false;
+            if (fcls != null) {
+                int fi = 0;
+                while (fi < fcls.kids.Count && ps.Count < 32) {
+                    Node mem = fcls.kids[fi];
+                    fi = fi + 1;
+                    if (mem == null || mem.kind != AK.FieldDecl() || (mem.mods & MOD.Static()) != 0) { continue; }
+                    RouteParamEntry fe = new RouteParamEntry();
+                    fe.name = mem.sval;
+                    fe.type = mem.type != null && mem.type.kind == AK.TypeRef() && mem.type.sval != null ? mem.type.sval : "string";
+                    fe.source = "form"; fe.required = false; fe.def = ""; fe.desc = "";
+                    ps.Add(fe);
+                    isForm = true;
+                }
+            }
+            if (isForm) { continue; }
+            RouteParamEntry e = new RouteParamEntry();
+            e.name = p.sval; e.type = ptype; e.source = "query"; e.required = true; e.def = ""; e.desc = "";
+            List<bool> found = new List<bool>();
+            string od = RoutesOptDefault(m, p.sval, found);
+            if (found.Count > 0) { e.required = false; e.def = od; }
+            ps.Add(e);
+        }
+        ParamScan(m.d, ps);
+        StringBuilder s = new StringBuilder();
+        i = 0;
+        while (i < ps.Count) {
+            RouteParamEntry e = ps[i];
+            s.Append("Param=" + e.name + "\t" + (e.type != "" ? e.type : "string") + "\t"
+                + (e.source != "" ? e.source : "query") + "\t" + (e.required ? "true" : "false")
+                + "\t" + e.def + "\t" + e.desc + ";");
+            i = i + 1;
+        }
+        return s.ToString();
+    }
+
+    // ctx / c / this / X.Ctx(): the receivers of request readers
+    bool ParamIsInputRecv(Node o) {
+        if (o == null) { return false; }
+        if (o.kind == AK.ThisExpr()) { return true; }
+        if (o.kind == AK.Ident()) { return o.sval == "ctx" || o.sval == "c"; }
+        return o.kind == AK.Call() && o.a != null && o.a.kind == AK.MemberAccess() && o.a.sval == "Ctx";
+    }
+
+    string ParamLiteral(Node e) {
+        if (e == null) { return ""; }
+        string neg = "";
+        if (e.kind == AK.Unary() && e.op == TK.Minus() && e.a != null) { neg = "-"; e = e.a; }
+        if (e.kind == AK.IntLit()) { return neg + e.ival; }
+        if (e.kind == AK.FloatLit()) { return neg + e.sval; }
+        if (e.kind == AK.BoolLit()) { return e.ival != 0 ? "true" : "false"; }
+        if (e.kind == AK.StringLit() && e.b == null) { return e.sval != null ? e.sval : ""; }
+        return "";
+    }
+
+    void ParamScan(Node n, List<RouteParamEntry> ps) {
+        if (n == null) { return; }
+        if (n.kind == AK.Call() && n.a != null && n.a.kind == AK.MemberAccess() && ParamIsInputRecv(n.a.a)) {
+            string fn = n.a.sval;
+            if (fn == "Paged") { ParamAddPaged(ps, n); }
+            else { ParamAddReader(ps, fn, n); }
+        }
+        ParamScan(n.a, ps);
+        ParamScan(n.b, ps);
+        ParamScan(n.c, ps);
+        ParamScan(n.d, ps);
+        int i = 0;
+        while (i < n.kids.Count) { ParamScan(n.kids[i], ps); i = i + 1; }
+    }
+
+    // the host's s_refl_readers table: type, required, has-default, has-label, source
+    void ParamAddReader(List<RouteParamEntry> ps, string fn, Node call) {
+        string type = ""; bool req = false; bool hasDef = false; bool hasLabel = false; string source = "query";
+        if (fn == "In" || fn == "InText" || fn == "InRaw") { type = "string"; }
+        else if (fn == "InInt") { type = "int"; hasDef = true; }
+        else if (fn == "InLong") { type = "long"; hasDef = true; }
+        else if (fn == "InDouble") { type = "number"; hasDef = true; }
+        else if (fn == "InBool") { type = "bool"; hasDef = true; }
+        else if (fn == "HasIn") { type = "bool"; }
+        else if (fn == "Need" || fn == "NeedText") { type = "string"; req = true; hasLabel = true; }
+        else if (fn == "NeedInt") { type = "int"; req = true; hasLabel = true; }
+        else if (fn == "NeedLong") { type = "long"; req = true; hasLabel = true; }
+        else if (fn == "Param") { type = "string"; req = true; source = "path"; }
+        else { return; }
+        if (ps.Count >= 32 || call.kids.Count < 1) { return; }
+        Node a0 = call.kids[0];
+        if (a0 == null || a0.kind != AK.StringLit() || a0.b != null || a0.sval == null || a0.sval == "") { return; }
+        string nm = a0.sval;
+        Node a1 = call.kids.Count >= 2 ? call.kids[1] : null;
+        int i = 0;
+        while (i < ps.Count) {
+            RouteParamEntry p = ps[i];
+            if (p.name == nm) {
+                if (req) { p.required = true; }
+                if (hasLabel && a1 != null && p.desc == "") { p.desc = ParamLiteral(a1); }
+                if (hasDef && a1 != null && p.def == "") { p.def = ParamLiteral(a1); }
+                if (p.type == "string") { p.type = type; }
+                return;
+            }
+            i = i + 1;
+        }
+        RouteParamEntry e = new RouteParamEntry();
+        e.name = nm; e.type = type; e.required = req; e.source = source; e.def = ""; e.desc = "";
+        if (a1 != null) {
+            if (hasDef) { e.def = ParamLiteral(a1); }
+            if (hasLabel) { e.desc = ParamLiteral(a1); }
+        }
+        ps.Add(e);
+    }
+
+    void ParamAddPaged(List<RouteParamEntry> ps, Node call) {
+        string defOrder = call.kids.Count >= 1 ? ParamLiteral(call.kids[0]) : "";
+        string defLimit = call.kids.Count >= 2 ? ParamLiteral(call.kids[1]) : "";
+        List<string> names = new List<string>();
+        names.Add("page"); names.Add("limit"); names.Add("order"); names.Add("dir"); names.Add("kw");
+        List<string> types = new List<string>();
+        types.Add("int"); types.Add("int"); types.Add("string"); types.Add("string"); types.Add("string");
+        List<string> descs = new List<string>();
+        descs.Add("页码，从 1 开始"); descs.Add("每页条数"); descs.Add("排序字段");
+        descs.Add("排序方向：desc 或 asc"); descs.Add("搜索关键词");
+        int i = 0;
+        while (i < names.Count) {
+            if (ps.Count >= 32) { return; }
+            bool seen = false;
+            int j = 0;
+            while (j < ps.Count) { if (ps[j].name == names[i]) { seen = true; } j = j + 1; }
+            if (!seen) {
+                RouteParamEntry e = new RouteParamEntry();
+                e.name = names[i]; e.type = types[i]; e.required = false; e.source = "query"; e.desc = descs[i];
+                e.def = "";
+                if (names[i] == "page") { e.def = "1"; }
+                else if (names[i] == "limit") { e.def = defLimit; }
+                else if (names[i] == "order") { e.def = defOrder; }
+                else if (names[i] == "dir") { e.def = "desc"; }
+                ps.Add(e);
+            }
+            i = i + 1;
+        }
+    }
+}

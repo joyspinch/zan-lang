@@ -3,6 +3,28 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
+    // Is the object at `p` (non-null) a string? Zan strings carry no class id
+    // at [-24] and the magic 0x5A4E5354 at [-8] (the A444 probe).
+    string EmitIsStringPayload(string p) {
+        string hp = NT();
+        L("  " + hp + " = bitcast i8* " + p + " to i64*");
+        string cp = NT();
+        L("  " + cp + " = getelementptr i64, i64* " + hp + ", i64 -3");
+        string cv = NT();
+        L("  " + cv + " = load i64, i64* " + cp);
+        string mp = NT();
+        L("  " + mp + " = getelementptr i64, i64* " + hp + ", i64 -1");
+        string mv = NT();
+        L("  " + mv + " = load i64, i64* " + mp);
+        string c0 = NT();
+        L("  " + c0 + " = icmp eq i64 " + cv + ", 0");
+        string m0 = NT();
+        L("  " + m0 + " = icmp eq i64 " + mv + ", 1515082580");
+        string r = NT();
+        L("  " + r + " = and i1 " + c0 + ", " + m0);
+        return r;
+    }
+
     // A558: System.Object fallback family (ToString/Equals/GetHashCode)
     ExprVal EmitObjectFamilyCall(ExprVal recv, string name, Node e) {
         string rty = MapType(recv.ty);
@@ -63,7 +85,8 @@ partial class Irgen {
                         L("  " + sh + " = lshr i64 " + pi + ", 4");
                         string mix = NT();
                         L("  " + mix + " = mul i64 " + sh + ", 2654435769");
-                        return new ExprVal(mix, retTy);
+                        // GetHashCode is an int: the value lives in 32 bits
+                        return new ExprVal(WrapArith(mix, 32, false), retTy);
                     }
                 }
             }
@@ -77,7 +100,10 @@ partial class Irgen {
         while (ti < binder.types.Count) {
             Node c = binder.types[ti];
             bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
-            if (isCls && !HasMod(c, MOD.Abstract()) && !HasMod(c, MOD.Iface()) && IsPolyClass(c)) {
+            // a struct's own ToString/Equals/GetHashCode answers for its box
+            // (no vtable: matched by the header type id below)
+            if (isCls && !HasMod(c, MOD.Abstract()) && !HasMod(c, MOD.Iface())
+                && (IsPolyClass(c) || c.kind == AK.StructDecl())) {
                 Node im = FindMethodUp(c, name);
                 if (im != null && !IsAbstract(im) && (im.mods & MOD.Static()) == 0) {
                     int pcount = 0;
@@ -103,6 +129,46 @@ partial class Irgen {
         int lend = NL();
         int ldef = NL();
 
+        // an object holding a STRING (header: no class id, string magic)
+        // answers with the string itself / compares contents (the host's
+        // object-family string path)
+        if (name == "ToString" || (name == "Equals" && argRaw != "")) {
+            int lprobe = NL(); int lstr = NL(); int lnot = NL();
+            string rn = NT();
+            L("  " + rn + " = icmp eq i8* " + recvRaw + ", null");
+            L("  br i1 " + rn + ", label %L" + lnot + ", label %L" + lprobe);
+            Label(lprobe);
+            string sk = EmitIsStringPayload(recvRaw);
+            L("  br i1 " + sk + ", label %L" + lstr + ", label %L" + lnot);
+            Label(lstr);
+            if (name == "ToString") {
+                L("  call void @zstrv_retain(i8* " + recvRaw + ")");
+                L("  store i8* " + recvRaw + ", i8** " + resSlot);
+                L("  br label %L" + lend);
+            } else {
+                int laprobe = NL(); int lacmp = NL(); int lfalse = NL();
+                string an = NT();
+                L("  " + an + " = icmp eq i8* " + argRaw + ", null");
+                L("  br i1 " + an + ", label %L" + lfalse + ", label %L" + laprobe);
+                Label(laprobe);
+                string ask = EmitIsStringPayload(argRaw);
+                L("  br i1 " + ask + ", label %L" + lacmp + ", label %L" + lfalse);
+                Label(lacmp);
+                string sc = NT();
+                L("  " + sc + " = call i32 @__zan_strcmp0(i8* " + recvRaw + ", i8* " + argRaw + ")");
+                string se = NT();
+                L("  " + se + " = icmp eq i32 " + sc + ", 0");
+                string se64 = NT();
+                L("  " + se64 + " = zext i1 " + se + " to i64");
+                L("  store i64 " + se64 + ", i64* " + resSlot);
+                L("  br label %L" + lend);
+                Label(lfalse);
+                L("  store i64 0, i64* " + resSlot);
+                L("  br label %L" + lend);
+            }
+            Label(lnot);
+        }
+
         if (cands.Count > 0) {
             string tagp = NT();
             L("  " + tagp + " = bitcast i8* " + recvRaw + " to i8**");
@@ -120,7 +186,17 @@ partial class Irgen {
                 int lmatch = NL();
                 int lnext = NL();
                 string cmp = NT();
-                L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+                if (candCls.kind == AK.StructDecl()) {
+                    string hp = NT();
+                    L("  " + hp + " = bitcast i8* " + recvRaw + " to i64*");
+                    string cp = NT();
+                    L("  " + cp + " = getelementptr i64, i64* " + hp + ", i64 -3");
+                    string cv = NT();
+                    L("  " + cv + " = load i64, i64* " + cp);
+                    L("  " + cmp + " = icmp eq i64 " + cv + ", ptrtoint (i8** @__tid_" + candCls.sval + " to i64)");
+                } else {
+                    L("  " + cmp + " = icmp eq i8* " + tag + ", bitcast ([" + vslots.Count + " x i8*]* @" + candCls.sval + "_vtable to i8*)");
+                }
                 L("  br i1 " + cmp + ", label %L" + lmatch + ", label %L" + lnext);
                 Label(lmatch);
 
@@ -180,7 +256,8 @@ partial class Irgen {
             L("  " + sh + " = lshr i64 " + pi + ", 4");
             string mix = NT();
             L("  " + mix + " = mul i64 " + sh + ", 2654435769");
-            L("  store i64 " + mix + ", i64* " + resSlot);
+            string mix32 = WrapArith(mix, 32, false);
+            L("  store i64 " + mix32 + ", i64* " + resSlot);
         } else if (name == "ToString") {
             string cid = NT();
             L("  " + cid + " = call i8* @__zan_class_id(i8* " + recvRaw + ")");
