@@ -18,6 +18,7 @@ typedef struct {
 } zan_atlas_slot;
 
 #define ZAN_ATLAS_CAP   4096
+#define ZAN_ATLAS_MASK  (ZAN_ATLAS_CAP - 1)
 #define ZAN_ATLAS_PROBE 8
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_BYTES (4u * 1024u * 1024u)
@@ -148,9 +149,9 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
     }
 
     uint64_t h = zan_atlas_hash(kind, size, key, key_len);
-    int base = (int)(h % ZAN_ATLAS_CAP);
+    int base = (int)(h & ZAN_ATLAS_MASK);
     for (int i = 0; i < ZAN_ATLAS_PROBE; i++) {
-        zan_atlas_slot *e = &g_atlas[(base + i) % ZAN_ATLAS_CAP];
+        zan_atlas_slot *e = &g_atlas[(base + i) & ZAN_ATLAS_MASK];
         if (e->key_len <= 0) continue;
         const char *ekey = e->heap_key ? e->heap_key : e->inline_key;
         if (e->kind == kind && e->size == size && e->key_len == key_len
@@ -179,10 +180,10 @@ static const zan_glyph_tile *zan_atlas_store(
     if (w < 0 || h < 0) return NULL;
     if (w == 0 || h == 0) { w = 0; h = 0; cov = NULL; }
     uint64_t hv = zan_atlas_hash(kind, size, key, key_len);
-    int base = (int)(hv % ZAN_ATLAS_CAP);
+    int base = (int)(hv & ZAN_ATLAS_MASK);
     zan_atlas_slot *victim = NULL;
     for (int i = 0; i < ZAN_ATLAS_PROBE; i++) {
-        zan_atlas_slot *e = &g_atlas[(base + i) % ZAN_ATLAS_CAP];
+        zan_atlas_slot *e = &g_atlas[(base + i) & ZAN_ATLAS_MASK];
         if (e->key_len <= 0) { victim = e; break; }
         if (!victim || e->used < victim->used) victim = e;
     }

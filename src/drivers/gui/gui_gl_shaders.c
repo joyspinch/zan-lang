@@ -520,6 +520,23 @@ static int zgl_init(void) {
     g_zgl.u_atlas1 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas1");
     g_zgl.u_atlas4 = gl.GetUniformLocation(g_zgl.prog_text, "uAtlas4");
 
+    /* Bind constant sampler texture units once for the lifetime of each program. */
+    gl.UseProgram(g_zgl.prog_shape);
+    if (g_zgl.u_coverage >= 0) gl.Uniform1i(g_zgl.u_coverage, 0);
+    if (g_zgl.u_destination >= 0) gl.Uniform1i(g_zgl.u_destination, 1);
+    if (g_zgl.u_atlas2 >= 0) gl.Uniform1i(g_zgl.u_atlas2, 2);
+    gl.UseProgram(g_zgl.prog_text);
+    if (g_zgl.u_atlas1 >= 0) gl.Uniform1i(g_zgl.u_atlas1, 0);
+    if (g_zgl.u_atlas4 >= 0) gl.Uniform1i(g_zgl.u_atlas4, 1);
+    if (g_zgl.prog_blur && g_zgl.u_blur_tex >= 0) {
+        gl.UseProgram(g_zgl.prog_blur);
+        gl.Uniform1i(g_zgl.u_blur_tex, 0);
+    }
+    if (g_zgl.prog_blur_comp && g_zgl.u_bcomp_tex >= 0) {
+        gl.UseProgram(g_zgl.prog_blur_comp);
+        gl.Uniform1i(g_zgl.u_bcomp_tex, 0);
+    }
+
     gl.PixelStorei(ZGL_UNPACK_ALIGNMENT, 1);
     gl.PixelStorei(ZGL_PACK_ALIGNMENT, 1);
     zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
@@ -529,6 +546,9 @@ static int zgl_init(void) {
     g_zgl.cap = (size_t)ZGL_VF * 6 * 2048;
     g_zgl.verts = (float *)malloc(g_zgl.cap * sizeof(float));
     if (!g_zgl.verts) { zan_gl_ctx_destroy(); return 0; }
+    g_zgl.vbo_bytes = g_zgl.cap * sizeof(float);
+    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
+    gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)g_zgl.vbo_bytes, NULL, ZGL_STREAM_DRAW);
 
     if (gl.GetError() != ZGL_NO_ERROR) { zan_gl_ctx_destroy(); return 0; }
     g_gl_state = 1;

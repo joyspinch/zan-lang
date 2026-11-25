@@ -85,6 +85,9 @@ static struct {
     zgl_uint bitmap_tex;
     float   *verts;
     size_t   count, cap;             /* in floats */
+    size_t   vbo_bytes;
+    int      has_shader_over;
+    float    over_x0, over_y0, over_x1, over_y1;
     zgl_mode mode;
     zan_surface_t *target;
     int      is_gles;
@@ -255,10 +258,18 @@ static void gl_sync_from_cpu(zan_surface_t *s) {
 /* batching */
 
 static void zgl_flush(void) {
-    if (!g_zgl.count || !g_zgl.target) { g_zgl.count = 0; return; }
+    if (!g_zgl.count || !g_zgl.target) {
+        g_zgl.count = 0;
+        g_zgl.has_shader_over = 0;
+        return;
+    }
     zan_surface_t *s = g_zgl.target;
     zgl_target *t = zgl_target_of(s);
-    if (!t) { g_zgl.count = 0; return; }
+    if (!t) {
+        g_zgl.count = 0;
+        g_zgl.has_shader_over = 0;
+        return;
+    }
 
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
     if (g_zgl.mode == ZGL_MODE_UNION)
@@ -267,14 +278,17 @@ static void zgl_flush(void) {
     gl.Viewport(0, 0, t->w, t->h);
     gl.BindVertexArray(g_zgl.mode == ZGL_MODE_TEXT ? g_zgl.vao_text : g_zgl.vao);
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
-    gl.BufferData(ZGL_ARRAY_BUFFER,
-                  (zgl_sizeiptr)(g_zgl.count * sizeof(float)),
-                  g_zgl.verts, ZGL_STREAM_DRAW);
-    int shader_over = 0;
-    for (size_t v = 0; v + 8 <= g_zgl.count; v += ZGL_VF) {
-        int k = (int)(g_zgl.verts[v + 8] + 0.5f);
-        if (k == ZGL_K_UNION || k == ZGL_K_SURFACE) { shader_over = 1; break; }
+    size_t vbytes = g_zgl.count * sizeof(float);
+    if (gl.BufferSubData && vbytes <= g_zgl.vbo_bytes) {
+        gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)g_zgl.vbo_bytes,
+                      NULL, ZGL_STREAM_DRAW);
+        gl.BufferSubData(ZGL_ARRAY_BUFFER, 0, (zgl_sizeiptr)vbytes, g_zgl.verts);
+    } else {
+        gl.BufferData(ZGL_ARRAY_BUFFER, (zgl_sizeiptr)vbytes,
+                      g_zgl.verts, ZGL_STREAM_DRAW);
+        g_zgl.vbo_bytes = vbytes;
     }
+    int shader_over = g_zgl.has_shader_over;
     static zgl_uint snap_tex, snap_fbo; static int snap_w, snap_h;
 
     if (g_zgl.mode == ZGL_MODE_TEXT) {
@@ -282,10 +296,8 @@ static void zgl_flush(void) {
         gl.Uniform2f(g_zgl.u_viewport_text, (float)t->w, (float)t->h);
         gl.ActiveTexture(ZGL_TEXTURE0);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas1);
-        gl.Uniform1i(g_zgl.u_atlas1, 0);
         gl.ActiveTexture(ZGL_TEXTURE1);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
-        gl.Uniform1i(g_zgl.u_atlas4, 1);
         gl.Enable(ZGL_BLEND);
         if (g_zgl.is_gles) {
             gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
@@ -325,14 +337,21 @@ static void zgl_flush(void) {
                 gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
             }
             if (snap_tex) {
-                gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
-                gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, snap_fbo);
-                gl.BlitFramebuffer(0, 0, t->w, t->h, 0, 0, t->w, t->h,
-                                   ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
-                gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+                int bx0 = clamp_i((int)floorf(g_zgl.over_x0) - 1, 0, t->w);
+                int by0 = clamp_i((int)floorf(g_zgl.over_y0) - 1, 0, t->h);
+                int bx1 = clamp_i((int)ceilf(g_zgl.over_x1) + 1, 0, t->w);
+                int by1 = clamp_i((int)ceilf(g_zgl.over_y1) + 1, 0, t->h);
+                if (bx1 > bx0 && by1 > by0) {
+                    int gy0 = t->h - by1;
+                    int gy1 = t->h - by0;
+                    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
+                    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, snap_fbo);
+                    gl.BlitFramebuffer(bx0, gy0, bx1, gy1, bx0, gy0, bx1, gy1,
+                                       ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+                    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+                }
                 gl.ActiveTexture(ZGL_TEXTURE1);
                 gl.BindTexture(ZGL_TEXTURE_2D, snap_tex);
-                gl.Uniform1i(g_zgl.u_destination, 1);
                 gl.ActiveTexture(ZGL_TEXTURE0);
             } else {
                 shader_over = 0;
@@ -340,12 +359,10 @@ static void zgl_flush(void) {
         }
         if (g_zgl.mode != ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
-            gl.Uniform1i(g_zgl.u_coverage, 0);
         }
         if (g_zgl.bitmap_tex) {
             gl.ActiveTexture(ZGL_TEXTURE2);
             gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
-            gl.Uniform1i(g_zgl.u_atlas2, 2);
             gl.ActiveTexture(ZGL_TEXTURE0);
         }
         if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
@@ -359,6 +376,7 @@ static void zgl_flush(void) {
 
     gl.DrawArrays(ZGL_TRIANGLES, 0, (zgl_sizei)(g_zgl.count / ZGL_VF));
     g_zgl.count = 0;
+    g_zgl.has_shader_over = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
     zgl_blend_equation(ZGL_FUNC_ADD);
     gl.Enable(ZGL_BLEND);
@@ -405,6 +423,19 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
     if (x1 > cx1) x1 = cx1;
     if (y1 > cy1) y1 = cy1;
     if (x1 <= x0 || y1 <= y0) return;
+
+    if (q->kind == ZGL_K_UNION || q->kind == ZGL_K_SURFACE) {
+        if (!g_zgl.has_shader_over) {
+            g_zgl.has_shader_over = 1;
+            g_zgl.over_x0 = x0; g_zgl.over_y0 = y0;
+            g_zgl.over_x1 = x1; g_zgl.over_y1 = y1;
+        } else {
+            if (x0 < g_zgl.over_x0) g_zgl.over_x0 = x0;
+            if (y0 < g_zgl.over_y0) g_zgl.over_y0 = y0;
+            if (x1 > g_zgl.over_x1) g_zgl.over_x1 = x1;
+            if (y1 > g_zgl.over_y1) g_zgl.over_y1 = y1;
+        }
+    }
 
     if (g_zgl.count + (size_t)ZGL_VF * 6 > g_zgl.cap) {
         size_t cap = g_zgl.cap * 2;

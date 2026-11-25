@@ -3,9 +3,12 @@
 
 #ifdef _WIN32
 
+#define ZAN_FONT_CACHE_CAP 64
+
 static HDC g_text_dc = NULL;
-static HFONT g_fonts[16];
+static HFONT g_fonts[ZAN_FONT_CACHE_CAP];
 static int g_font_count = 0;
+static int g_font_next_evict = 0;
 static int g_text_stats_enabled = 0;
 static uint64_t g_text_draw_calls = 0;
 static uint64_t g_text_measure_calls = 0;
@@ -83,8 +86,8 @@ static void ensure_text_dc(void) {
     }
 }
 
-static int g_font_sizes[16];
-static int g_font_bold[16];
+static int g_font_sizes[ZAN_FONT_CACHE_CAP];
+static int g_font_bold[ZAN_FONT_CACHE_CAP];
 static wchar_t g_font_family[64] = L"Segoe UI";
 static int g_font_family_env_done = 0;
 static int g_font_family_explicit = 0;
@@ -94,18 +97,20 @@ static int g_os2_upem = 0;
 static int g_os2_tried = 0;
 
 static HFONT get_or_create_font(int size, int bold) {
-    /* Cache by exact (size, weight) match */
-    for (int i = 0; i < 16; i++) {
+    /* Cache by exact (size, weight) match across active slots */
+    for (int i = 0; i < g_font_count; i++) {
         if (g_font_sizes[i] == size && g_font_bold[i] == bold && g_fonts[i]) {
             if (g_text_stats_enabled) { g_text_font_hits++; }
             return g_fonts[i];
         }
     }
-    int slot = -1;
-    for (int i = 0; i < 16; i++) {
-        if (!g_fonts[i]) { slot = i; break; }
+    int slot;
+    if (g_font_count < ZAN_FONT_CACHE_CAP) {
+        slot = g_font_count++;
+    } else {
+        slot = g_font_next_evict;
+        g_font_next_evict = (g_font_next_evict + 1) & (ZAN_FONT_CACHE_CAP - 1);
     }
-    if (slot < 0) slot = 15;
 
     if (!g_font_family_explicit && !g_font_family_env_done) {
         g_font_family_env_done = 1;
@@ -132,6 +137,18 @@ static HFONT get_or_create_font(int size, int bold) {
     return g_fonts[slot];
 }
 
+static int g_fh_size[ZAN_FONT_CACHE_CAP];
+static int g_fh_val[ZAN_FONT_CACHE_CAP];
+static int g_fh_count = 0;
+
+static int g_fa_size[ZAN_FONT_CACHE_CAP];
+static int g_fa_val[ZAN_FONT_CACHE_CAP];
+static int g_fa_count = 0;
+
+static char g_last_meas_text[48] = {0};
+static int  g_last_meas_size = 0;
+static int  g_last_meas_width = 0;
+
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -139,11 +156,16 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (n <= 0 || n > 64) return 0;
     memcpy(g_font_family, want, (size_t)n * sizeof(wchar_t));
     g_font_family_explicit = 1;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < g_font_count; i++) {
         if (g_fonts[i]) { DeleteObject(g_fonts[i]); g_fonts[i] = NULL; }
         g_font_sizes[i] = 0;
         g_font_bold[i] = 0;
     }
+    g_font_count = 0;
+    g_font_next_evict = 0;
+    g_fh_count = 0;
+    g_fa_count = 0;
+    g_last_meas_size = 0;
     g_os2_tried = 0;
     g_os2_upem = 0;
     return 1;
@@ -560,13 +582,10 @@ typedef struct {
 } zan_measure_cache_t;
 
 #define ZAN_MEAS_CACHE_CAP 2048
+#define ZAN_MEAS_CACHE_MASK (ZAN_MEAS_CACHE_CAP - 1)
 #define ZAN_MEAS_CACHE_PROBE 8
 static zan_measure_cache_t g_mcache[ZAN_MEAS_CACHE_CAP];
 static uint64_t g_mcache_clock = 0;
-
-static char g_last_meas_text[48] = {0};
-static int  g_last_meas_size = 0;
-static int  g_last_meas_width = 0;
 
 static int measure_text_gdi(const char *text, int size) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
@@ -618,11 +637,11 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     }
 
     uint64_t h = zan_text_hash(text, size);
-    int base = (int)(h % ZAN_MEAS_CACHE_CAP);
+    int base = (int)(h & ZAN_MEAS_CACHE_MASK);
     zan_measure_cache_t *victim = NULL;
     uint64_t best = ~0ULL;
     for (int i = 0; i < ZAN_MEAS_CACHE_PROBE; i++) {
-        zan_measure_cache_t *e = &g_mcache[(base + i) % ZAN_MEAS_CACHE_CAP];
+        zan_measure_cache_t *e = &g_mcache[(base + i) & ZAN_MEAS_CACHE_MASK];
         const char *ctext = e->heap_text ? e->heap_text : e->inline_buf;
         if (ctext[0] && e->size == size && strcmp(ctext, text) == 0) {
             e->used = ++g_mcache_clock;
@@ -630,10 +649,11 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
                 g_text_measure_cache_hits++;
                 g_text_measure_us += text_qpc_us() - t0;
             }
-            if (strlen(text) < sizeof(g_last_meas_text)) {
+            size_t tlen = strlen(text);
+            if (tlen < sizeof(g_last_meas_text)) {
                 g_last_meas_size = size;
                 g_last_meas_width = e->width;
-                memcpy(g_last_meas_text, text, strlen(text) + 1);
+                memcpy(g_last_meas_text, text, tlen + 1);
             }
             return (i64)e->width;
         }
@@ -673,14 +693,6 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     }
     return (i64)w;
 }
-
-static int g_fh_size[16];
-static int g_fh_val[16];
-static int g_fh_count = 0;
-
-static int g_fa_size[16];
-static int g_fa_val[16];
-static int g_fa_count = 0;
 
 static void load_os2_vertical_metrics(void) {
     if (g_os2_tried) { return; }
@@ -722,7 +734,7 @@ EXPORT i32 zan_gui_font_ascent(i32 font_size) {
     GetTextMetricsW(g_text_dc, &tm);
     SelectObject(g_text_dc, old_font);
     int val = (int)tm.tmAscent;
-    if (g_fa_count < 16) {
+    if (g_fa_count < ZAN_FONT_CACHE_CAP) {
         g_fa_size[g_fa_count] = size;
         g_fa_val[g_fa_count] = val;
         g_fa_count = g_fa_count + 1;
@@ -763,7 +775,7 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
         SelectObject(g_text_dc, old_font);
         val = (int)tm.tmHeight;
     }
-    if (g_fh_count < 16) {
+    if (g_fh_count < ZAN_FONT_CACHE_CAP) {
         g_fh_size[g_fh_count] = size;
         g_fh_val[g_fh_count] = val;
         g_fh_count = g_fh_count + 1;

@@ -281,16 +281,6 @@ static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask) {
   return (int)(cov * 255.0);
 }
 
-static void blur_put(zan_surface_t *s, int px, int py, u32 c, int cov) {
-  if (cov <= 0 || clipped_out(s, px, py))
-    return;
-  if (cov >= 255) {
-    s->pixels[py * s->stride + px] = c;
-    return;
-  }
-  set_pixel_aa(s, px, py, c, cov);
-}
-
 static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
                                int radius, int cr, int cmask, u32 *capture) {
   int x0 = clamp_i(x, 0, s->width);
@@ -341,31 +331,94 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
   u32 *b = scratch_b;
 
   /* 双线性/块均值下采样缩放 */
-  for (int dj = 0; dj < dh; dj++) {
-    int sy0 = dj * ds;
-    int sy1 = sy0 + ds;
-    if (sy1 > rh)
-      sy1 = rh;
-    for (int di = 0; di < dw; di++) {
-      int sx0 = di * ds;
-      int sx1 = sx0 + ds;
-      if (sx1 > rw)
-        sx1 = rw;
-      int sr = 0, sg = 0, sb = 0, cnt = 0;
-      for (int yy = sy0; yy < sy1; yy++) {
-        u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
-        for (int xx = sx0; xx < sx1; xx++) {
-          u32 px = row[xx];
-          sr += (px >> 16) & 0xFF;
-          sg += (px >> 8) & 0xFF;
-          sb += px & 0xFF;
-          cnt++;
+  if (ds == 1) {
+    for (int dj = 0; dj < dh; dj++) {
+      const u32 *row = s->pixels + (y0 + dj) * s->stride + x0;
+      u32 *dst = a + dj * dw;
+      for (int di = 0; di < dw; di++)
+        dst[di] = row[di] | 0xFF000000u;
+    }
+  } else {
+    int shift = (ds == 2) ? 2 : 4;
+    for (int dj = 0; dj < dh; dj++) {
+      int sy0 = dj * ds;
+      int sy1 = sy0 + ds;
+      int full_y = (sy1 <= rh);
+      if (!full_y)
+        sy1 = rh;
+      u32 *dst = a + dj * dw;
+      if (full_y && ds == 2) {
+        const u32 *r0 = s->pixels + (y0 + sy0) * s->stride + x0;
+        const u32 *r1 = r0 + s->stride;
+        int full_dw = rw >> 1;
+        for (int di = 0; di < full_dw; di++) {
+          int sx = di << 1;
+          u32 p0 = r0[sx], p1 = r0[sx + 1], p2 = r1[sx], p3 = r1[sx + 1];
+          u32 sr = ((p0 >> 16) & 0xFFu) + ((p1 >> 16) & 0xFFu) +
+                   ((p2 >> 16) & 0xFFu) + ((p3 >> 16) & 0xFFu);
+          u32 sg = ((p0 >> 8) & 0xFFu) + ((p1 >> 8) & 0xFFu) +
+                   ((p2 >> 8) & 0xFFu) + ((p3 >> 8) & 0xFFu);
+          u32 sb = (p0 & 0xFFu) + (p1 & 0xFFu) + (p2 & 0xFFu) + (p3 & 0xFFu);
+          dst[di] = 0xFF000000u | ((sr >> 2) << 16) | ((sg >> 2) << 8) | (sb >> 2);
+        }
+        for (int di = full_dw; di < dw; di++) {
+          int sx0 = di * ds;
+          int sx1 = sx0 + ds;
+          if (sx1 > rw) sx1 = rw;
+          int sr = 0, sg = 0, sb = 0, cnt = 0;
+          for (int yy = sy0; yy < sy1; yy++) {
+            const u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+            for (int xx = sx0; xx < sx1; xx++) {
+              u32 px = row[xx];
+              sr += (px >> 16) & 0xFF;
+              sg += (px >> 8) & 0xFF;
+              sb += px & 0xFF;
+              cnt++;
+            }
+          }
+          if (cnt < 1) cnt = 1;
+          dst[di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
+                    ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
+        }
+      } else {
+        int full_dw = full_y ? (rw / ds) : 0;
+        for (int di = 0; di < full_dw; di++) {
+          int sx0 = di * ds;
+          u32 sr = 0, sg = 0, sb = 0;
+          for (int yy = sy0; yy < sy1; yy++) {
+            const u32 *row = s->pixels + (y0 + yy) * s->stride + x0 + sx0;
+            for (int k = 0; k < ds; k++) {
+              u32 px = row[k];
+              sr += (px >> 16) & 0xFFu;
+              sg += (px >> 8) & 0xFFu;
+              sb += px & 0xFFu;
+            }
+          }
+          dst[di] = 0xFF000000u | ((sr >> shift) << 16) |
+                    ((sg >> shift) << 8) | (sb >> shift);
+        }
+        for (int di = full_dw; di < dw; di++) {
+          int sx0 = di * ds;
+          int sx1 = sx0 + ds;
+          if (sx1 > rw)
+            sx1 = rw;
+          int sr = 0, sg = 0, sb = 0, cnt = 0;
+          for (int yy = sy0; yy < sy1; yy++) {
+            const u32 *row = s->pixels + (y0 + yy) * s->stride + x0;
+            for (int xx = sx0; xx < sx1; xx++) {
+              u32 px = row[xx];
+              sr += (px >> 16) & 0xFF;
+              sg += (px >> 8) & 0xFF;
+              sb += px & 0xFF;
+              cnt++;
+            }
+          }
+          if (cnt < 1)
+            cnt = 1;
+          dst[di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
+                    ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
         }
       }
-      if (cnt < 1)
-        cnt = 1;
-      a[dj * dw + di] = 0xFF000000u | ((u32)(sr / cnt) << 16) |
-                        ((u32)(sg / cnt) << 8) | (u32)(sb / cnt);
     }
   }
 
@@ -373,52 +426,118 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
   if (rr < 1)
     rr = 1;
   int win = 2 * rr + 1;
+  /* Exact 21-bit fixed-point reciprocal: (sum * inv_win) >> 21 == sum / win
+   * for all win in [1..81] and sum in [0..255*win] without 32-bit overflow. */
+  u32 inv_win = ((1u << 21) + (u32)win - 1u) / (u32)win;
+
+  static int *col_sums = NULL;
+  static int col_sums_cap = 0;
+  if (dw > col_sums_cap) {
+    int *nc = (int *)realloc(col_sums, (size_t)dw * 3u * sizeof(int));
+    if (!nc)
+      return;
+    col_sums = nc;
+    col_sums_cap = dw;
+  }
+
   for (int p = 0; p < 2; p++) {
-    /* horizontal: a -> b */
+    /* horizontal: a -> b (branchless interior, exact reciprocal) */
+    int mid_end = dw - rr - 1;
     for (int j = 0; j < dh; j++) {
-      u32 *src = a + j * dw;
+      const u32 *src = a + j * dw;
       u32 *dst = b + j * dw;
       int sr = 0, sg = 0, sb = 0;
       for (int k = -rr; k <= rr; k++) {
-        int ii = clamp_i(k, 0, dw - 1);
-        u32 px = src[ii];
+        u32 px = src[clamp_i(k, 0, dw - 1)];
         sr += (px >> 16) & 0xFF;
         sg += (px >> 8) & 0xFF;
         sb += px & 0xFF;
       }
-      for (int i = 0; i < dw; i++) {
-        dst[i] = 0xFF000000u | ((u32)(sr / win) << 16) |
-                 ((u32)(sg / win) << 8) | (u32)(sb / win);
-        u32 pa = src[clamp_i(i + rr + 1, 0, dw - 1)];
-        u32 ps = src[clamp_i(i - rr, 0, dw - 1)];
-        sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
-        sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
-        sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+      if (rr < mid_end) {
+        for (int i = 0; i < rr; i++) {
+          dst[i] = 0xFF000000u | ((((u32)sr * inv_win) >> 21) << 16) |
+                   ((((u32)sg * inv_win) >> 21) << 8) |
+                   (((u32)sb * inv_win) >> 21);
+          u32 pa = src[i + rr + 1];
+          u32 ps = src[0];
+          sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+          sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
+          sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+        }
+        for (int i = rr; i < mid_end; i++) {
+          dst[i] = 0xFF000000u | ((((u32)sr * inv_win) >> 21) << 16) |
+                   ((((u32)sg * inv_win) >> 21) << 8) |
+                   (((u32)sb * inv_win) >> 21);
+          u32 pa = src[i + rr + 1];
+          u32 ps = src[i - rr];
+          sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+          sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
+          sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+        }
+        for (int i = mid_end; i < dw; i++) {
+          dst[i] = 0xFF000000u | ((((u32)sr * inv_win) >> 21) << 16) |
+                   ((((u32)sg * inv_win) >> 21) << 8) |
+                   (((u32)sb * inv_win) >> 21);
+          u32 pa = src[clamp_i(i + rr + 1, 0, dw - 1)];
+          u32 ps = src[clamp_i(i - rr, 0, dw - 1)];
+          sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+          sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
+          sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+        }
+      } else {
+        for (int i = 0; i < dw; i++) {
+          dst[i] = 0xFF000000u | ((((u32)sr * inv_win) >> 21) << 16) |
+                   ((((u32)sg * inv_win) >> 21) << 8) |
+                   (((u32)sb * inv_win) >> 21);
+          u32 pa = src[clamp_i(i + rr + 1, 0, dw - 1)];
+          u32 ps = src[clamp_i(i - rr, 0, dw - 1)];
+          sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
+          sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
+          sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+        }
       }
     }
-    /* vertical: b -> a */
-    for (int i = 0; i < dw; i++) {
-      int sr = 0, sg = 0, sb = 0;
-      for (int k = -rr; k <= rr; k++) {
-        int jj = clamp_i(k, 0, dh - 1);
-        u32 px = b[jj * dw + i];
-        sr += (px >> 16) & 0xFF;
-        sg += (px >> 8) & 0xFF;
-        sb += px & 0xFF;
+    /* vertical: b -> a (cache-friendly row-major running column sums) */
+    {
+      const u32 *r0 = b;
+      int mult0 = rr + 1;
+      for (int i = 0; i < dw; i++) {
+        u32 px = r0[i];
+        col_sums[3 * i + 0] = (int)((px >> 16) & 0xFFu) * mult0;
+        col_sums[3 * i + 1] = (int)((px >> 8) & 0xFFu) * mult0;
+        col_sums[3 * i + 2] = (int)(px & 0xFFu) * mult0;
+      }
+      for (int k = 1; k <= rr; k++) {
+        const u32 *rk = b + clamp_i(k, 0, dh - 1) * dw;
+        for (int i = 0; i < dw; i++) {
+          u32 px = rk[i];
+          col_sums[3 * i + 0] += (int)((px >> 16) & 0xFFu);
+          col_sums[3 * i + 1] += (int)((px >> 8) & 0xFFu);
+          col_sums[3 * i + 2] += (int)(px & 0xFFu);
+        }
       }
       for (int j = 0; j < dh; j++) {
-        a[j * dw + i] = 0xFF000000u | ((u32)(sr / win) << 16) |
-                        ((u32)(sg / win) << 8) | (u32)(sb / win);
-        u32 pa = b[clamp_i(j + rr + 1, 0, dh - 1) * dw + i];
-        u32 ps = b[clamp_i(j - rr, 0, dh - 1) * dw + i];
-        sr += (int)((pa >> 16) & 0xFF) - (int)((ps >> 16) & 0xFF);
-        sg += (int)((pa >> 8) & 0xFF) - (int)((ps >> 8) & 0xFF);
-        sb += (int)(pa & 0xFF) - (int)(ps & 0xFF);
+        u32 *dst = a + j * dw;
+        const u32 *row_add = b + clamp_i(j + rr + 1, 0, dh - 1) * dw;
+        const u32 *row_sub = b + clamp_i(j - rr, 0, dh - 1) * dw;
+        for (int i = 0; i < dw; i++) {
+          int sr = col_sums[3 * i + 0];
+          int sg = col_sums[3 * i + 1];
+          int sb = col_sums[3 * i + 2];
+          dst[i] = 0xFF000000u | ((((u32)sr * inv_win) >> 21) << 16) |
+                   ((((u32)sg * inv_win) >> 21) << 8) |
+                   (((u32)sb * inv_win) >> 21);
+          u32 pa = row_add[i];
+          u32 ps = row_sub[i];
+          col_sums[3 * i + 0] = sr + (int)((pa >> 16) & 0xFFu) - (int)((ps >> 16) & 0xFFu);
+          col_sums[3 * i + 1] = sg + (int)((pa >> 8) & 0xFFu) - (int)((ps >> 8) & 0xFFu);
+          col_sums[3 * i + 2] = sb + (int)(pa & 0xFFu) - (int)(ps & 0xFFu);
+        }
       }
     }
   }
 
-  /* Vibrancy (luma-preserving ~1 */
+  /* Vibrancy (luma-preserving ~1.6x) */
   for (int i = 0; i < (int)dn; i++) {
     u32 px = a[i];
     int rc = (int)((px >> 16) & 0xFF);
@@ -432,26 +551,65 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
            ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
   }
 
+  int ci0 = clamp_i(s->clip_x0 - x0, 0, rw);
+  int ci1 = clamp_i(s->clip_x1 - x0, 0, rw);
+  int cj0 = clamp_i(s->clip_y0 - y0, 0, rh);
+  int cj1 = clamp_i(s->clip_y1 - y0, 0, rh);
+  int eff_cr = cr;
+  if (eff_cr > rw / 2) eff_cr = rw / 2;
+  if (eff_cr > rh / 2) eff_cr = rh / 2;
+  if (eff_cr < 0) eff_cr = 0;
+
   if (ds == 1) {
-    for (int j = 0; j < rh; j++) {
-      u32 *src = a + j * dw;
-      for (int i = 0; i < rw; i++) {
+    for (int j = cj0; j < cj1; j++) {
+      const u32 *src = a + j * dw;
+      u32 *dst_row = s->pixels + (y0 + j) * s->stride + x0;
+      int corner_row = (eff_cr > 0 && (j < eff_cr || j >= rh - eff_cr));
+      int y_term = (y0 + j) * 173;
+      for (int i = ci0; i < ci1; i++) {
         u32 px = src[i];
-        int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+        int nz = ((((x0 + i) * 197 + y_term) >> 3) % 7) - 3;
         int rC = clamp_i((int)((px >> 16) & 0xFF) + nz, 0, 255);
         int gC = clamp_i((int)((px >> 8) & 0xFF) + nz, 0, 255);
         int bC = clamp_i((int)(px & 0xFF) + nz, 0, 255);
         u32 out = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
-        blur_put(s, x0 + i, y0 + j, out,
-                 cr <= 0 ? 255 : zan_round_cov(i, j, rw, rh, cr, cmask));
-        if (capture)
-          capture[(size_t)j * rw + i] =
-              s->pixels[(y0 + j) * s->stride + x0 + i];
+        if (corner_row && (i < eff_cr || i >= rw - eff_cr)) {
+          int cov = zan_round_cov(i, j, rw, rh, eff_cr, cmask);
+          if (cov >= 255)
+            dst_row[i] = out;
+          else if (cov > 0)
+            set_pixel_aa(s, x0 + i, y0 + j, out, cov);
+        } else {
+          dst_row[i] = out;
+        }
       }
     }
   } else {
-    for (int j = 0; j < rh; j++) {
-      int fy = ((j * 2 + 1) * 256) / (ds * 2) - 128;
+    typedef struct { int gx, gx1, wx; } zan_blur_xlut_t;
+    static zan_blur_xlut_t *xlut = NULL;
+    static int xlut_cap = 0;
+    if (rw > xlut_cap) {
+      zan_blur_xlut_t *nx = (zan_blur_xlut_t *)realloc(xlut, (size_t)rw * sizeof(*xlut));
+      if (!nx)
+        return;
+      xlut = nx;
+      xlut_cap = rw;
+    }
+    int inv_ds2 = 256 / (ds * 2); /* exact for ds == 2 (64) and ds == 4 (32) */
+    for (int i = ci0; i < ci1; i++) {
+      int fx = (i * 2 + 1) * inv_ds2 - 128;
+      if (fx < 0) fx = 0;
+      int gx = fx >> 8;
+      int wx = fx & 255;
+      if (gx > dw - 1) { gx = dw - 1; wx = 0; }
+      int gx1 = gx + 1;
+      if (gx1 > dw - 1) gx1 = dw - 1;
+      xlut[i].gx = gx;
+      xlut[i].gx1 = gx1;
+      xlut[i].wx = wx;
+    }
+    for (int j = cj0; j < cj1; j++) {
+      int fy = (j * 2 + 1) * inv_ds2 - 128;
       if (fy < 0)
         fy = 0;
       int gy = fy >> 8;
@@ -463,26 +621,24 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
       int gy1 = gy + 1;
       if (gy1 > dh - 1)
         gy1 = dh - 1;
-      for (int i = 0; i < rw; i++) {
-        int fx = ((i * 2 + 1) * 256) / (ds * 2) - 128;
-        if (fx < 0)
-          fx = 0;
-        int gx = fx >> 8;
-        int wx = fx & 255;
-        if (gx > dw - 1) {
-          gx = dw - 1;
-          wx = 0;
-        }
-        int gx1 = gx + 1;
-        if (gx1 > dw - 1)
-          gx1 = dw - 1;
-        u32 p00 = a[gy * dw + gx];
-        u32 p01 = a[gy * dw + gx1];
-        u32 p10 = a[gy1 * dw + gx];
-        u32 p11 = a[gy1 * dw + gx1];
-        int w00 = (256 - wx) * (256 - wy);
-        int w01 = wx * (256 - wy);
-        int w10 = (256 - wx) * wy;
+      const u32 *row0 = a + gy * dw;
+      const u32 *row1 = a + gy1 * dw;
+      u32 *dst_row = s->pixels + (y0 + j) * s->stride + x0;
+      int iwy = 256 - wy;
+      int corner_row = (eff_cr > 0 && (j < eff_cr || j >= rh - eff_cr));
+      int y_term = (y0 + j) * 173;
+      for (int i = ci0; i < ci1; i++) {
+        int gx = xlut[i].gx;
+        int gx1 = xlut[i].gx1;
+        int wx = xlut[i].wx;
+        u32 p00 = row0[gx];
+        u32 p01 = row0[gx1];
+        u32 p10 = row1[gx];
+        u32 p11 = row1[gx1];
+        int iwx = 256 - wx;
+        int w00 = iwx * iwy;
+        int w01 = wx * iwy;
+        int w10 = iwx * wy;
         int w11 = wx * wy;
         int rC =
             ((int)((p00 >> 16) & 0xFF) * w00 + (int)((p01 >> 16) & 0xFF) * w01 +
@@ -496,17 +652,28 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
         int bC = ((int)(p00 & 0xFF) * w00 + (int)(p01 & 0xFF) * w01 +
                   (int)(p10 & 0xFF) * w10 + (int)(p11 & 0xFF) * w11) >>
                  16;
-        int nz = ((((x0 + i) * 197 + (y0 + j) * 173) >> 3) % 7) - 3;
+        int nz = ((((x0 + i) * 197 + y_term) >> 3) % 7) - 3;
         rC = clamp_i(rC + nz, 0, 255);
         gC = clamp_i(gC + nz, 0, 255);
         bC = clamp_i(bC + nz, 0, 255);
         u32 out = 0xFF000000u | ((u32)rC << 16) | ((u32)gC << 8) | (u32)bC;
-        blur_put(s, x0 + i, y0 + j, out,
-                 cr <= 0 ? 255 : zan_round_cov(i, j, rw, rh, cr, cmask));
-        if (capture)
-          capture[(size_t)j * rw + i] =
-              s->pixels[(y0 + j) * s->stride + x0 + i];
+        if (corner_row && (i < eff_cr || i >= rw - eff_cr)) {
+          int cov = zan_round_cov(i, j, rw, rh, eff_cr, cmask);
+          if (cov >= 255)
+            dst_row[i] = out;
+          else if (cov > 0)
+            set_pixel_aa(s, x0 + i, y0 + j, out, cov);
+        } else {
+          dst_row[i] = out;
+        }
       }
+    }
+  }
+  if (capture) {
+    for (int j = 0; j < rh; j++) {
+      memcpy(capture + (size_t)j * (size_t)rw,
+             s->pixels + (y0 + j) * s->stride + x0,
+             (size_t)rw * sizeof(u32));
     }
   }
 }

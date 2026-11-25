@@ -335,6 +335,107 @@ EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w,
                                  thickness);
 }
 
+static inline u32 shadow_eval_color(double d, double half, double inv,
+                                    u32 c, u32 sa, u32 rgb, int *is_solid) {
+  double t = (d + half) * inv;
+  if (t <= 0.0) {
+    *is_solid = 1;
+    return c;
+  }
+  *is_solid = 0;
+  if (t >= 1.0)
+    return 0;
+  double cov = 1.0 - t * t * (3.0 - 2.0 * t);
+  int cov_i = (int)(cov * 255.0);
+  if (cov_i <= 0)
+    return 0;
+  if (cov_i >= 255) {
+    *is_solid = 1;
+    return c;
+  }
+  u32 a = (sa * (u32)cov_i) / 255u;
+  if (a == 0)
+    return 0;
+  return (a << 24) | rgb;
+}
+
+static inline void shadow_fill_span(u32 *dst, int n, u32 sc) {
+  if (n <= 0 || (sc >> 24) == 0)
+    return;
+  if ((sc >> 24) == 255u)
+    fill_run_const(dst, n, sc);
+  else
+    blend_run_const(dst, n, sc);
+}
+
+static void shadow_fill_lr_band(zan_surface_t *s, int bx0, int bx1,
+                                int by0, int by1, double cx, double ex,
+                                double r, double half, double inv,
+                                u32 c, u32 sa, u32 rgb) {
+  int bw = bx1 - bx0;
+  if (bw <= 0 || by1 <= by0)
+    return;
+  u32 ramp_buf[256];
+  for (int off = 0; off < bw; off += 256) {
+    int n = bw - off;
+    if (n > 256)
+      n = 256;
+    int any = 0;
+    for (int k = 0; k < n; k++) {
+      double qx = fabs((double)(bx0 + off + k) + 0.5 - cx) - ex;
+      int solid = 0;
+      u32 sc = shadow_eval_color(qx - r, half, inv, c, sa, rgb, &solid);
+      ramp_buf[k] = sc;
+      if (sc)
+        any = 1;
+    }
+    if (!any)
+      continue;
+    for (int py = by0; py < by1; py++) {
+      u32 *row = s->pixels + py * s->stride + bx0 + off;
+      for (int k = 0; k < n; k++) {
+        u32 sc = ramp_buf[k];
+        if (sc)
+          row[k] = blend_over(row[k], sc);
+      }
+    }
+  }
+}
+
+static void shadow_fill_corner(zan_surface_t *s, int bx0, int bx1,
+                               int by0, int by1, double cx, double cy,
+                               double ex, double ey, double r,
+                               double half, double inv,
+                               u32 c, u32 sa, u32 rgb) {
+  if (bx1 <= bx0 || by1 <= by0)
+    return;
+  double max_d = r + half;
+  double max_d2 = max_d * max_d;
+  double min_d = r - half;
+  double min_d2 = min_d > 0.0 ? min_d * min_d : -1.0;
+  for (int py = by0; py < by1; py++) {
+    double qy = fabs((double)py + 0.5 - cy) - ey;
+    double qy2 = qy * qy;
+    if (qy2 >= max_d2)
+      continue;
+    u32 *row = s->pixels + py * s->stride;
+    for (int px = bx0; px < bx1; px++) {
+      double qx = fabs((double)px + 0.5 - cx) - ex;
+      double d2 = qx * qx + qy2;
+      if (d2 >= max_d2)
+        continue;
+      if (d2 <= min_d2) {
+        row[px] = blend_over(row[px], c);
+        continue;
+      }
+      int solid = 0;
+      u32 sc = shadow_eval_color(sqrt(d2) - r, half, inv, c, sa, rgb, &solid);
+      if (sc)
+        row[px] = blend_over(row[px], sc);
+    }
+  }
+}
+
 static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
                              int radius, int blur, u32 c) {
   int iw = w, ih = h;
@@ -345,6 +446,11 @@ static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
     cpu_fill_round(s, x, y, w, h, radius, ZAN_CORNERS_ALL, c);
     return;
   }
+  u32 sa = (c >> 24) & 0xFFu;
+  if (sa == 0)
+    return;
+  u32 rgb = c & 0x00FFFFFFu;
+
   int r = radius;
   if (r > iw / 2)
     r = iw / 2;
@@ -377,48 +483,88 @@ static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
     x1 = s->width;
   if (y1 > s->height)
     y1 = s->height;
-
-  int in = r + (bl + 1) / 2 + 1;
-  int xi0 = x + in, xi1 = x + iw - in;
-  int yi0 = y + in, yi1 = y + ih - in;
-  if (xi1 > xi0 && yi1 > yi0) {
-    cpu_fill_rect(s, xi0, yi0, xi1 - xi0, yi1 - yi0, c);
-  } else {
-    xi0 = 0;
-    xi1 = 0;
-    yi0 = 0;
-    yi1 = 0;
-  }
+  if (x0 >= x1 || y0 >= y1)
+    return;
 
   double half = (double)bl / 2.0;
   double inv = 1.0 / (double)bl;
-  for (int py = y0; py < y1; py++) {
-    double qy = fabs((double)py + 0.5 - cy) - ey;
-    int interiorRow = (py >= yi0 && py < yi1);
-    for (int px = x0; px < x1; px++) {
-      if (interiorRow && px >= xi0 && px < xi1) {
-        px = xi1 - 1;
-        continue;
-      }
-      double qx = fabs((double)px + 0.5 - cx) - ex;
-      double mx = qx > 0.0 ? qx : 0.0;
-      double my = qy > 0.0 ? qy : 0.0;
-      double outside = sqrt(mx * mx + my * my);
-      double inside = (qx > qy ? qx : qy);
-      if (inside > 0.0)
-        inside = 0.0;
-      double d = outside + inside - (double)r;
-      double t = (d + half) * inv;
-      if (t <= 0.0) {
-        set_pixel(s, px, py, c);
-        continue;
-      }
-      if (t >= 1.0)
-        continue;
-      double cov = 1.0 - t * t * (3.0 - 2.0 * t);
-      set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
+  double rd = (double)r;
+
+  /* 9-region partition along the rounded-rect inner box [x+r, x+iw-r) x [y+r, y+ih-r). */
+  int lx0 = x0, lx1 = clamp_i(x + r, x0, x1);
+  int mx0 = lx1, mx1 = clamp_i(x + iw - r, lx1, x1);
+  int rx0 = mx1, rx1 = x1;
+
+  int ty0 = y0, ty1 = clamp_i(y + r, y0, y1);
+  int my0 = ty1, my1 = clamp_i(y + ih - r, ty1, y1);
+  int by0 = my1, by1 = y1;
+
+  /* 1 & 2. Top-center and bottom-center straight bands: row-constant SIMD spans, 0 sqrt. */
+  if (mx1 > mx0) {
+    int mw = mx1 - mx0;
+    for (int py = ty0; py < ty1; py++) {
+      double qy = fabs((double)py + 0.5 - cy) - ey;
+      int solid = 0;
+      u32 sc = shadow_eval_color(qy - rd, half, inv, c, sa, rgb, &solid);
+      if (sc)
+        shadow_fill_span(s->pixels + py * s->stride + mx0, mw, sc);
+    }
+    for (int py = by0; py < by1; py++) {
+      double qy = fabs((double)py + 0.5 - cy) - ey;
+      int solid = 0;
+      u32 sc = shadow_eval_color(qy - rd, half, inv, c, sa, rgb, &solid);
+      if (sc)
+        shadow_fill_span(s->pixels + py * s->stride + mx0, mw, sc);
     }
   }
+
+  /* 3 & 4. Left-middle and right-middle straight bands: 1D X ramp, 0 sqrt. */
+  if (my1 > my0) {
+    shadow_fill_lr_band(s, lx0, lx1, my0, my1, cx, ex, rd, half, inv, c, sa, rgb);
+    shadow_fill_lr_band(s, rx0, rx1, my0, my1, cx, ex, rd, half, inv, c, sa, rgb);
+
+    /* 5. Center-middle region: qx <= 0 and qy <= 0, so d = max(qx, qy) - r (0 sqrt). */
+    if (mx1 > mx0) {
+      int half_i = (bl + 1) / 2;
+      int solid_x0 = clamp_i(x + half_i, mx0, mx1);
+      int solid_x1 = clamp_i(x + iw - half_i, solid_x0, mx1);
+      int solid_y0 = clamp_i(y + half_i, my0, my1);
+      int solid_y1 = clamp_i(y + ih - half_i, solid_y0, my1);
+      if (solid_x1 > solid_x0 && solid_y1 > solid_y0) {
+        int sw = solid_x1 - solid_x0;
+        for (int py = solid_y0; py < solid_y1; py++)
+          shadow_fill_span(s->pixels + py * s->stride + solid_x0, sw, c);
+      } else {
+        solid_x0 = solid_x1 = solid_y0 = solid_y1 = 0;
+      }
+      if (solid_x0 != mx0 || solid_x1 != mx1 ||
+          solid_y0 != my0 || solid_y1 != my1) {
+        for (int py = my0; py < my1; py++) {
+          double qy = fabs((double)py + 0.5 - cy) - ey;
+          int in_sy = (py >= solid_y0 && py < solid_y1);
+          u32 *row = s->pixels + py * s->stride;
+          for (int px = mx0; px < mx1; px++) {
+            if (in_sy && px >= solid_x0 && px < solid_x1) {
+              px = solid_x1 - 1;
+              continue;
+            }
+            double qx = fabs((double)px + 0.5 - cx) - ex;
+            double d = (qx > qy ? qx : qy) - rd;
+            int solid = 0;
+            u32 sc = shadow_eval_color(d, half, inv, c, sa, rgb, &solid);
+            if (sc)
+              row[px] = blend_over(row[px], sc);
+          }
+        }
+      }
+    }
+  }
+
+  /* 6..9. Four corner squares: tight clipped direct pointer loop + early radial reject. */
+  shadow_fill_corner(s, lx0, lx1, ty0, ty1, cx, cy, ex, ey, rd, half, inv, c, sa, rgb);
+  shadow_fill_corner(s, rx0, rx1, ty0, ty1, cx, cy, ex, ey, rd, half, inv, c, sa, rgb);
+  shadow_fill_corner(s, lx0, lx1, by0, by1, cx, cy, ex, ey, rd, half, inv, c, sa, rgb);
+  shadow_fill_corner(s, rx0, rx1, by0, by1, cx, cy, ex, ey, rd, half, inv, c, sa, rgb);
 }
 
 EXPORT void zan_gui_shadow_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w,
