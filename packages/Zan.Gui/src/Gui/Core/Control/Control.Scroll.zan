@@ -1,8 +1,53 @@
 using System;
 using Gui;
+using Gui.Core;
 namespace Gui;
 public partial class Control {
     public virtual void OnScrollChanged() { }
+    public void StopScrollAnimation() {
+        if (scroll != null) { scroll.StopMotion(); }
+    }
+    // 阻尼弹簧平滑滚动：支持中途再次调用 Retarget 保持速度连贯。
+    public void SmoothScrollTo(int targetX, int targetY) {
+        if (!this.IsScrollContainer()) { return; }
+        if (scroll == null) { scroll = new ScrollState(); }
+        Rect view = this.ScrollViewport();
+        int clampedX = scroll.Clamp(targetX, scrollExtentX, view.width);
+        int clampedY = scroll.Clamp(targetY, scrollExtent, view.height);
+        scroll.flingX = null;
+        scroll.flingY = null;
+        if (clampedX != scrollX || scroll.smoothX != null) {
+            float curPos = scroll.smoothX != null ? (float)scroll.smoothTargetX + scroll.smoothX.displacement : (float)scrollX;
+            float curVel = scroll.smoothX != null ? scroll.smoothX.velocity : 0.0f;
+            scroll.smoothTargetX = clampedX;
+            if (scroll.smoothX == null) { scroll.smoothX = new SpringState(curPos - (float)clampedX); }
+            else { scroll.smoothX.displacement = curPos - (float)clampedX; }
+            scroll.smoothX.velocity = curVel;
+        }
+        if (clampedY != scrollY || scroll.smoothY != null) {
+            float curPos = scroll.smoothY != null ? (float)scroll.smoothTargetY + scroll.smoothY.displacement : (float)scrollY;
+            float curVel = scroll.smoothY != null ? scroll.smoothY.velocity : 0.0f;
+            scroll.smoothTargetY = clampedY;
+            if (scroll.smoothY == null) { scroll.smoothY = new SpringState(curPos - (float)clampedY); }
+            else { scroll.smoothY.displacement = curPos - (float)clampedY; }
+            scroll.smoothY.velocity = curVel;
+        }
+        if (scroll.HasMotion()) { scroll.AttachMotion(this); }
+    }
+    // 物理惯性滑行滚动（接入 ScrollPhysics.FlingState，触边自动衰减停止）。
+    public void FlingScroll(float velocityX, float velocityY) {
+        if (!this.IsScrollContainer()) { return; }
+        if (scroll == null) { scroll = new ScrollState(); }
+        scroll.StopMotion();
+        float absVx = velocityX < 0.0f ? -velocityX : velocityX;
+        float absVy = velocityY < 0.0f ? -velocityY : velocityY;
+        if (absVx < ScrollPhysics.MinVelocity && absVy < ScrollPhysics.MinVelocity) { return; }
+        scroll.flingX = absVx >= ScrollPhysics.MinVelocity ? new FlingState(velocityX) : null;
+        scroll.flingY = absVy >= ScrollPhysics.MinVelocity ? new FlingState(velocityY) : null;
+        scroll.flingPosX = (float)scrollX;
+        scroll.flingPosY = (float)scrollY;
+        scroll.AttachMotion(this);
+    }
     void NotifyScrollChanged(int previousX, int previousY) {
         if (previousX == scrollX && previousY == scrollY) { return; }
         App host = this.App;
@@ -91,6 +136,7 @@ public partial class Control {
         if (app == null || app.window.EventButton() != 0) { return; }
         int axis = this.ScrollBarHit(e.x, e.y);
         if (axis == 0) { return; }
+        this.StopScrollAnimation();
         Rect view = this.ScrollBarViewport(axis == 2);
         int nextX = scrollX;
         int nextY = scrollY;

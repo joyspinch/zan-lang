@@ -1,0 +1,216 @@
+using System;
+using Gui;
+using Gui.Animation;
+using Gui.Backend;
+using Gui.Widget;
+
+class MotionLayerTest {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + msg);
+            throw new Exception("MotionLayerTest: " + msg);
+        }
+    }
+
+    static void TestAnimationEngine() {
+        // Easing: CubicBezier + Steps + ElasticInOut
+        float cb = Easing.CubicBezier(0.25f, 0.1f, 0.25f, 1.0f, 0.5f);
+        Check(cb > 0.75f && cb < 0.85f, "CubicBezier ease(0.5) ~0.80");
+        float stEnd = Easing.Steps(4, true, 0.3f);
+        Check(stEnd > 0.24f && stEnd < 0.26f, "Steps(4, jumpEnd=true, 0.3) == 0.25");
+        float stStart = Easing.Steps(4, false, 0.3f);
+        Check(stStart > 0.49f && stStart < 0.51f, "Steps(4, jumpEnd=false, 0.3) == 0.50");
+        float el = Easing.Evaluate(EaseType.ElasticInOut, 0.5f);
+        Check(el > 0.45f && el < 0.55f, "ElasticInOut(0.5) ~0.5");
+
+        // SpringAnim substepped convergence + retarget
+        SpringAnim sp = SpringAnim.Create(0.0f, 100.0f, 180.0f, 20.0f, 1.0f, null);
+        sp.Play();
+        for (int i = 0; i < 60; i++) { sp.Step(50); }
+        Check(sp.finished && sp.value > 99.5f && sp.value < 100.5f, "SpringAnim settles at 100");
+        sp.Retarget(50.0f);
+        Check(!sp.finished && sp.active, "SpringAnim restarts on Retarget");
+        for (int i = 0; i < 60; i++) { sp.Step(50); }
+        Check(sp.finished && sp.value > 49.5f && sp.value < 50.5f, "SpringAnim settles at 50");
+
+        // AnimationTimeline Pause eviction fix + Tween yoyo/delay
+        AnimationTimeline tl = new AnimationTimeline();
+        Tween tw = Tween.Create(0.0f, 100.0f, 200, EaseType.Linear, null);
+        tw.WithDelay(50).WithRepeat(1).WithYoyo(true);
+        tl.Add(tw);
+        tw.Play();
+        tl.Tick(30);
+        Check(tw.currentVal == 0.0f, "Tween holds start during delay");
+        tw.Pause();
+        tl.Tick(500);
+        Check(tl.EntryCount() == 1 && tw.currentVal == 0.0f, "Paused tween not evicted from timeline");
+        tw.Resume();
+        tl.Tick(120);
+        Check(tw.currentVal > 45.0f && tw.currentVal < 55.0f, "Resumed tween advances cleanly");
+
+        // AnimGroup Sequence
+        AnimGroup seq = AnimGroup.Sequence();
+        Tween a = Tween.Create(0.0f, 10.0f, 100, EaseType.Linear, null);
+        Tween b = Tween.Create(0.0f, 20.0f, 100, EaseType.Linear, null);
+        seq.Add(a).Add(b);
+        seq.Play();
+        seq.Step(50);
+        Check(a.currentVal > 4.5f && a.currentVal < 5.5f && b.currentVal == 0.0f, "Sequence plays item 0 first");
+        seq.Step(50);
+        Check(a.finished && b.active, "Sequence hands off to item 1");
+        seq.Step(50);
+        Check(b.currentVal > 9.0f && b.currentVal < 11.0f, "Sequence advances into item 1");
+        seq.Step(50);
+        Check(seq.finished && b.currentVal == 20.0f, "Sequence completes cleanly");
+    }
+
+    static void TestKeyframesAndTransition() {
+        string css =
+            ":root { --hi: #ff0000; }\n"
+            + "@keyframes pulse-slide {\n"
+            + "  0%, 100% { opacity: 0.2; transform: translateX(0px) rotate(0deg); background: #000000; }\n"
+            + "  50% { opacity: 1.0; transform: translateX(40px) rotate(90deg); background: var(--hi); }\n"
+            + "}\n"
+            + ".box {\n"
+            + "  animation: pulse-slide 400ms cubic-bezier(0.25, 0.1, 0.25, 1.0) 100ms 2 alternate forwards;\n"
+            + "  transition: opacity 200ms cubic-bezier(0.0, 0.0, 1.0, 1.0) 50ms;\n"
+            + "}\n";
+        StyleSheet sheet = Css.Parse(css);
+        Check(sheet.atRulesDropped == 0, "@keyframes not dropped");
+        CssKeyframeRule kf = sheet.FindKeyframes("pulse-slide");
+        Check(kf != null && kf.stops.Count == 3, "keyframes stop count == 3");
+
+        StyleBox baseBox = new StyleBox();
+        sheet.ApplyBox(baseBox, ".box");
+        Check(baseBox.motion != null, "MotionSpec allocated");
+        Check(baseBox.motion.animName == "pulse-slide" && baseBox.animMs == 400, "anim name & duration");
+        Check(baseBox.motion.animDelayMs == 100 && baseBox.motion.animIterations == 2, "anim delay & iterations");
+        Check(baseBox.motion.animDirection == 2 && baseBox.motion.animFillMode == 1, "anim direction & fill");
+        Check(baseBox.motion.transitionDelayMs == 50 && baseBox.motion.transitionPropMask == MotionSpec.PropOpacity(), "transition delay & mask");
+
+        StyleBox mid = kf.Evaluate(baseBox, 500);
+        Check(mid.opacity == 1000 && mid.tx == 40 && mid.rotate == 90, "50% stop evaluation");
+        StyleBox quarter = kf.Evaluate(baseBox, 250);
+        Check(quarter.opacity >= 590 && quarter.opacity <= 610 && quarter.tx == 20 && quarter.rotate == 45, "25% stop interpolation");
+
+        Dispatcher.Init();
+        App app = App.CreateOffscreen("motion-trans", 120, 80);
+        Button btn = new Button("");
+        btn.ClassName = "step-btn";
+        app.sheet = Css.Parse(
+            "button.step-btn { background: #000000; opacity: 0.2; border: 0; border-radius: 0;"
+            + " transition: opacity 200ms steps(4, end) 50ms; }\n"
+            + "button.step-btn:hover { background: #00ff00; opacity: 1.0; }\n"
+        );
+        app.SetRootControl(btn);
+
+        app.FreezeAnimClock(1000);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        btn.RenderInside(app, new Rect(10, 10, 60, 40));
+        app.EndOffscreenFrame();
+
+        app.ProcessOffscreenInput(1, 30, 30, 0, 0, 0, 0);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        btn.RenderInside(app, new Rect(10, 10, 60, 40));
+        app.EndOffscreenFrame();
+
+        app.FreezeAnimClock(1030);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        btn.RenderInside(app, new Rect(10, 10, 60, 40));
+        app.EndOffscreenFrame();
+        int gDelay = (app.canvas.GetPixel(30, 30) >> 8) & 255;
+        Check(gDelay >= 45 && gDelay <= 60, "transition delay holds opacity while bg snaps");
+
+        app.FreezeAnimClock(1110);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        btn.RenderInside(app, new Rect(10, 10, 60, 40));
+        app.EndOffscreenFrame();
+        int gStep = (app.canvas.GetPixel(30, 30) >> 8) & 255;
+        Check(gStep >= 95 && gStep <= 112, "steps(4,end) advances at step 1/4");
+
+        app.FreezeAnimClock(1300);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        btn.RenderInside(app, new Rect(10, 10, 60, 40));
+        app.EndOffscreenFrame();
+        Check(((app.canvas.GetPixel(30, 30) >> 8) & 255) == 255, "transition finishes at full green");
+    }
+
+    static void TestRuntimeKeyframesAndLayers() {
+        App app = App.CreateOffscreen("motion-layers", 120, 120);
+        app.sheet = Css.Parse(
+            "@keyframes shift {\n"
+            + "  from { background: #ff0000; transform: translateX(0px); }\n"
+            + "  to   { background: #ff0000; transform: translateX(40px); }\n"
+            + "}\n"
+            + ".anim-box { animation: shift 200ms linear 50ms 1 normal forwards; background: #ff0000; border: 0; border-radius: 0; }\n"
+        );
+        Panel item = new Panel();
+        item.ClassName = "anim-box";
+        app.SetRootControl(item);
+
+        app.FreezeAnimClock(1000);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        item.RenderInside(app, new Rect(10, 10, 20, 20));
+        app.EndOffscreenFrame();
+        Check(((app.canvas.GetPixel(15, 20) >> 16) & 255) > 200, "kf start pos");
+
+        app.FreezeAnimClock(1150);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        item.RenderInside(app, new Rect(10, 10, 20, 20));
+        app.EndOffscreenFrame();
+        Check(((app.canvas.GetPixel(15, 20) >> 16) & 255) == 0, "kf mid left cleared");
+        Check(((app.canvas.GetPixel(40, 20) >> 16) & 255) > 200, "kf mid shifted");
+
+        app.FreezeAnimClock(1300);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        item.RenderInside(app, new Rect(10, 10, 20, 20));
+        app.EndOffscreenFrame();
+        Check(((app.canvas.GetPixel(60, 20) >> 16) & 255) > 200, "kf forwards hold");
+
+        Canvas c = app.canvas;
+        c.Clear(0xff000000);
+        Check(c.PushLayerOpacity(10, 10, 40, 40, 500), "PushLayerOpacity");
+        c.FillRect(0, 0, 40, 40, 0xffff0000);
+        c.FillRect(0, 0, 40, 40, 0xff00ff00);
+        c.PopLayer();
+        int px = c.GetPixel(25, 25);
+        Check(((px >> 16) & 255) == 0 && ((px >> 8) & 255) >= 120 && ((px >> 8) & 255) <= 135, "true group opacity");
+
+        c.Clear(0xff000000);
+        Check(c.PushLayer(20, 20, 20, 20, 1000, 1000, 90), "PushLayer rotate 90");
+        c.FillRect(0, 0, 20, 4, 0xff0000ff);
+        c.PopLayer();
+        Check((c.GetPixel(38, 30) & 255) > 200 && (c.GetPixel(22, 30) & 255) < 20, "90deg CW rotation");
+
+        c.Clear(0xff000000);
+        Check(c.PushLayer(40, 40, 20, 20, 1000, 2000, 0), "PushLayer scale 2x");
+        c.FillRect(0, 0, 20, 20, 0xffff00ff);
+        c.PopLayer();
+        Check(((c.GetPixel(32, 32) >> 16) & 255) > 200, "2x layer scale");
+
+        IconView icon = new IconView("refresh", 20);
+        icon.ClassName = "spin-icon";
+        app.sheet = Css.Parse(".spin-icon { animation: spin 900ms linear infinite; color: #ffffff; }");
+        app.SetRootControl(icon);
+        app.FreezeAnimClock(1225);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        icon.RenderInside(app, new Rect(20, 20, 24, 24));
+        app.EndOffscreenFrame();
+    }
+
+    static void Main() {
+        TestAnimationEngine();
+        TestKeyframesAndTransition();
+        TestRuntimeKeyframesAndLayers();
+        Console.WriteLine("MOTION_LAYER_TEST_OK");
+    }
+}

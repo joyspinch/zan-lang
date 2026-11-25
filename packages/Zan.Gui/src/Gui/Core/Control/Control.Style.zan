@@ -275,6 +275,9 @@ public partial class Control {
         if (computedStyle == null) { return 0; }
         return computedStyle.flexDir;
     }
+    public virtual bool StyleFlexReverse() {
+        return computedStyle != null && computedStyle.flexReverse != 0;
+    }
     int StyleOverflowX() {
         if (computedStyle == null) { return 0; }
         int x = computedStyle.overflowX;
@@ -461,6 +464,7 @@ public partial class Control {
             surfaceNormal = box;
             surfaceTarget = box;
             surfaceState = state;
+            box = this.ApplyKeyframeAnimation(app, box);
             paintedStyle = box;
             if (box != null) { box.treeComposite = treeCompositing; }
             return box;
@@ -468,6 +472,7 @@ public partial class Control {
         if (state != normalState || surfaceNormal != box || surfaceFrom != null || key != 0) {
             box = this.PaintSurface(app, box, normalState, state, key);
         }
+        box = this.ApplyKeyframeAnimation(app, box);
         paintedStyle = box;
         if (box != null) { box.treeComposite = treeCompositing; }
         return box;
@@ -493,8 +498,14 @@ public partial class Control {
     private StyleBox surfaceFrom;
     private StyleBox surfaceBlend;
     private int surfaceDuration;
+    private int surfaceDelay;
+    private int surfacePropMask;
     private int surfaceState;
     private int surfaceStartMs;
+    private string kfAnimName;
+    private int kfStartMs;
+    private int kfPausedElapsed;
+    private bool kfWasPaused;
     protected void SetSurfaceTransitionKey(int key) {
         if (key == 0 && this.extra == null) { return; }
         this.EnsureExtra().surfaceTransitionKey = key;
@@ -515,9 +526,12 @@ public partial class Control {
                 ? (surfaceNormal != null ? surfaceNormal : normal)
                 : this.SurfaceSample(app);
             surfaceDuration = target.transitionMs;
-            surfaceFrom = hadSurface && surfaceDuration > 0 && !app.reducedMotion
-                && (state & Style.SDisabled()) == 0 && !previous.SameSurface(target)
-                ? previous : null;
+            surfaceDelay = target.motion != null ? target.motion.transitionDelayMs : 0;
+            surfacePropMask = target.motion != null ? target.motion.transitionPropMask : 0;
+            bool allowTrans = hadSurface && surfaceDuration > 0 && surfacePropMask != MotionSpec.PropNone()
+                && !app.reducedMotion && (state & Style.SDisabled()) == 0
+                && !previous.SameSurface(target);
+            surfaceFrom = allowTrans ? previous : null;
             surfaceStartMs = app.nowMs;
             surfaceBlend = null;
             surfaceNormal = normal;
@@ -537,16 +551,116 @@ public partial class Control {
         StyleBox target = surfaceTarget;
         if (surfaceFrom == null) { return target; }
         int elapsed = app.nowMs - surfaceStartMs;
-        if (app.reducedMotion || elapsed >= surfaceDuration) {
+        if (app.reducedMotion || elapsed >= surfaceDelay + surfaceDuration) {
             surfaceFrom = null;
             surfaceBlend = null;
             return target;
         }
-        if (elapsed <= 0) { return surfaceFrom; }
-        int progress = (int)((long)elapsed * 1000 / surfaceDuration);
+        if (elapsed <= surfaceDelay) {
+            if (surfacePropMask == 0) { return surfaceFrom; }
+            if (surfaceBlend == null) { surfaceBlend = target.Clone(); }
+            StyleBox.BlendSurfaceInto(surfaceBlend, surfaceFrom, target, 0, surfacePropMask);
+            return surfaceBlend;
+        }
+        int activeElapsed = elapsed - surfaceDelay;
+        int progress = (int)((long)activeElapsed * 1000 / surfaceDuration);
+        int curved = target.motion != null
+            ? target.motion.EvalTransitionCurve(target.easing, progress)
+            : Style.Curve(target.easing, progress);
         if (surfaceBlend == null) { surfaceBlend = target.Clone(); }
-        StyleBox.BlendSurfaceInto(surfaceBlend, surfaceFrom, target, Style.Curve(target.easing, progress));
+        StyleBox.BlendSurfaceInto(surfaceBlend, surfaceFrom, target, curved, surfacePropMask);
         return surfaceBlend;
+    }
+    private StyleBox ApplyKeyframeAnimation(App app, StyleBox box) {
+        if (box == null || box.motion == null || box.motion.animName == "" || app == null) {
+            kfAnimName = "";
+            kfWasPaused = false;
+            return box;
+        }
+        MotionSpec m = box.motion;
+        CssKeyframeRule rule = Style.FindKeyframes(app, m.animName);
+        if (rule == null || rule.stops.Count == 0) {
+            return box;
+        }
+        if (kfAnimName != m.animName) {
+            kfAnimName = m.animName;
+            kfStartMs = app.nowMs;
+            kfPausedElapsed = 0;
+            kfWasPaused = false;
+        }
+        int elapsed = 0;
+        if (m.animPaused) {
+            if (!kfWasPaused) {
+                kfPausedElapsed = app.nowMs - kfStartMs;
+                kfWasPaused = true;
+            }
+            elapsed = kfPausedElapsed;
+        } else {
+            if (kfWasPaused) {
+                kfStartMs = app.nowMs - kfPausedElapsed;
+                kfWasPaused = false;
+            }
+            elapsed = app.nowMs - kfStartMs;
+        }
+        int delay = m.animDelayMs;
+        int dur = box.animMs;
+        int iters = m.animIterations;
+        int dir = m.animDirection;
+        int fill = m.animFillMode;
+
+        if (app.reducedMotion) {
+            if (fill == 1 || fill == 3) {
+                int endP = (dir == 1 || (dir == 3 && (iters < 0 || (iters % 2) == 1))
+                    || (dir == 2 && iters > 0 && (iters % 2) == 0)) ? 0 : 1000;
+                return rule.Evaluate(box, endP);
+            }
+            return box;
+        }
+
+        if (iters == 0) { return box; }
+
+        if (elapsed < delay) {
+            if (!m.animPaused) { app.RequestAnimationFrameIn(bx, by, bw, bh); }
+            if (fill == 2 || fill == 3) {
+                int startP = (dir == 1 || dir == 3) ? 1000 : 0;
+                return rule.Evaluate(box, startP);
+            }
+            return box;
+        }
+
+        int active = elapsed - delay;
+        if (dur <= 0) {
+            if (fill == 1 || fill == 3) {
+                int endP = (dir == 1 || (dir == 3 && (iters < 0 || (iters % 2) == 1))
+                    || (dir == 2 && iters > 0 && (iters % 2) == 0)) ? 0 : 1000;
+                return rule.Evaluate(box, endP);
+            }
+            return box;
+        }
+
+        int cycle = active / dur;
+        bool finished = iters > 0 && cycle >= iters;
+        if (finished) {
+            if (fill == 1 || fill == 3) {
+                int lastCycle = iters - 1;
+                bool rev = dir == 1 || (dir == 2 && (lastCycle % 2) == 1) || (dir == 3 && (lastCycle % 2) == 0);
+                return rule.Evaluate(box, rev ? 0 : 1000);
+            }
+            return box;
+        }
+
+        int inCycle = active % dur;
+        int rawP = (int)((long)inCycle * 1000 / dur);
+        bool reverse = dir == 1 || (dir == 2 && (cycle % 2) == 1) || (dir == 3 && (cycle % 2) == 0);
+        int directedP = reverse ? 1000 - rawP : rawP;
+        int curvedP = m.EvalAnimCurve(box.easing, directedP);
+        StyleBox sampled = rule.Evaluate(box, curvedP);
+        if (!m.animPaused) {
+            int padX = (int)Math.Abs(sampled.tx) + 8;
+            int padY = (int)Math.Abs(sampled.ty) + 8;
+            app.RequestAnimationFrameIn(bx - padX, by - padY, bw + padX * 2, bh + padY * 2);
+        }
+        return sampled;
     }
     Control Prefer(int w, int h) {
         prefW = w;

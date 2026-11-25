@@ -1,0 +1,294 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui;
+
+public partial class Canvas {
+    private List<CanvasLayerFrame> layerStack;
+    private int[] layerPoolIds;
+    private int[] layerPoolW;
+    private int[] layerPoolH;
+    private int xformSurfaceId;
+    private int xformSurfaceW;
+    private int xformSurfaceH;
+
+    private int AcquirePooledSurface(int slot, int needW, int needH) {
+        if (this.layerPoolIds == null) {
+            this.layerPoolIds = new int[] { -1, -1, -1, -1 };
+            this.layerPoolW = new int[] { 0, 0, 0, 0 };
+            this.layerPoolH = new int[] { 0, 0, 0, 0 };
+        }
+        int cur = this.layerPoolIds[slot];
+        if (cur >= 0 && this.layerPoolW[slot] >= needW && this.layerPoolH[slot] >= needH) {
+            return cur;
+        }
+        if (cur >= 0) {
+            zan_gui_destroy_surface(cur);
+            this.layerPoolIds[slot] = 0 - 1;
+        }
+        int allocW = ((needW + 63) / 64) * 64;
+        int allocH = ((needH + 63) / 64) * 64;
+        if (allocW < 64) { allocW = 64; }
+        if (allocH < 64) { allocH = 64; }
+        int sid = zan_gui_create_surface(allocW, allocH);
+        if (sid < 0) { return 0 - 1; }
+        this.layerPoolIds[slot] = sid;
+        this.layerPoolW[slot] = allocW;
+        this.layerPoolH[slot] = allocH;
+        return sid;
+    }
+
+    private int AcquireXformSurface(int needW, int needH) {
+        if (this.xformSurfaceId > 0 && this.xformSurfaceW >= needW && this.xformSurfaceH >= needH) {
+            return this.xformSurfaceId;
+        }
+        if (this.xformSurfaceId > 0) {
+            zan_gui_destroy_surface(this.xformSurfaceId);
+            this.xformSurfaceId = 0;
+        }
+        int allocW = ((needW + 63) / 64) * 64;
+        int allocH = ((needH + 63) / 64) * 64;
+        if (allocW < 64) { allocW = 64; }
+        if (allocH < 64) { allocH = 64; }
+        int sid = zan_gui_create_surface(allocW, allocH);
+        if (sid <= 0) { return 0 - 1; }
+        this.xformSurfaceId = sid;
+        this.xformSurfaceW = allocW;
+        this.xformSurfaceH = allocH;
+        return sid;
+    }
+
+    internal void DisposeLayers() {
+        if (this.layerPoolIds != null) {
+            for (int i = 0; i < this.layerPoolIds.Length; i = i + 1) {
+                if (this.layerPoolIds[i] >= 0) {
+                    zan_gui_destroy_surface(this.layerPoolIds[i]);
+                    this.layerPoolIds[i] = 0 - 1;
+                }
+            }
+        }
+        if (this.xformSurfaceId > 0) {
+            zan_gui_destroy_surface(this.xformSurfaceId);
+            this.xformSurfaceId = 0;
+        }
+        if (this.layerStack != null) { this.layerStack.Clear(); }
+    }
+
+    // 开启离屏分组透明图层（不缩放不旋转，纯组合成透明度）。
+    public bool PushLayerOpacity(int x, int y, int w, int h, int opacityPm) {
+        return this.PushLayer(x, y, w, h, opacityPm, 1000, 0);
+    }
+
+    // 开启离屏图层：将后续绘制隔离到 (0..w, 0..h)，在 PopLayer 时按分组透明度 + 2D 仿射缩放/旋转合成回父表面。
+    public bool PushLayer(int x, int y, int w, int h, int opacityPm, int scalePm, int angleDeg) {
+        if (w <= 0 || h <= 0) { return false; }
+        if (this.layerStack == null) { this.layerStack = new List<CanvasLayerFrame>(); }
+        int depth = this.layerStack.Count;
+        if (depth >= 4) { return false; }
+        int layerSid = this.AcquirePooledSurface(depth, w, h);
+        if (layerSid < 0) { return false; }
+        zan_gui_reset_clip(layerSid);
+        zan_gui_clear_rect(layerSid, 0, 0, w, h, 0);
+        zan_gui_push_clip(layerSid, 0, 0, w, h);
+        CanvasLayerFrame frame = new CanvasLayerFrame(
+            this.surfaceId, layerSid, x, y, w, h,
+            opacityPm, scalePm, angleDeg, this.opacityPm);
+        this.layerStack.Add(frame);
+        this.surfaceId = layerSid;
+        this.opacityPm = 1000;
+        return true;
+    }
+
+    // 结束当前离屏图层并将其合成回父表面。
+    public void PopLayer() {
+        if (this.layerStack == null || this.layerStack.Count == 0) { return; }
+        int topIdx = this.layerStack.Count - 1;
+        CanvasLayerFrame frame = this.layerStack[topIdx];
+        this.layerStack.RemoveAt(topIdx);
+
+        int layerSid = frame.layerSurfaceId;
+        int parentSid = frame.parentSurfaceId;
+        this.surfaceId = parentSid;
+        this.opacityPm = frame.prevOpacityPm;
+
+        int op = frame.opacityPm;
+        if (op < 0) { op = 0; }
+        if (op > 1000) { op = 1000; }
+        int effOp = this.opacityPm >= 1000 ? op : (op * this.opacityPm) / 1000;
+        if (effOp <= 0 || frame.scalePm <= 0) { return; }
+
+        int deg = frame.angleDeg % 360;
+        if (deg < 0) { deg = deg + 360; }
+
+        if (deg == 0) {
+            if (effOp < 1000) {
+                Canvas.ScaleSurfaceAlpha(layerSid, frame.w, frame.h, effOp);
+            }
+            int dw = frame.scalePm == 1000 ? frame.w : (frame.w * frame.scalePm + 500) / 1000;
+            int dh = frame.scalePm == 1000 ? frame.h : (frame.h * frame.scalePm + 500) / 1000;
+            if (dw <= 0 || dh <= 0) { return; }
+            int dx = frame.x + (frame.w - dw) / 2;
+            int dy = frame.y + (frame.h - dh) / 2;
+            zan_gui_blit_surface_scaled(parentSid, layerSid, dx, dy, dw, dh, 0, 0, frame.w, frame.h);
+            return;
+        }
+
+        this.CompositeTransformedLayer(parentSid, layerSid, frame, effOp, deg);
+    }
+
+    private static void ScaleSurfaceAlpha(int sid, int w, int h, int opacityPm) {
+        nint ptr = zan_gui_get_pixels(sid);
+        if (ptr == 0) { return; }
+        int stride = zan_gui_surface_width(sid);
+        if (stride < w) { return; }
+        Span<int> pix = new Span<int>(ptr, stride * h);
+        for (int y = 0; y < h; y = y + 1) {
+            int row = y * stride;
+            for (int x = 0; x < w; x = x + 1) {
+                int p = pix[row + x];
+                int a = (p >> 24) & 255;
+                if (a == 0) { continue; }
+                int na = (a * opacityPm + 500) / 1000;
+                pix[row + x] = (na << 24) | (p & 0x00FFFFFF);
+            }
+        }
+    }
+
+    private void CompositeTransformedLayer(int parentSid, int layerSid,
+                                           CanvasLayerFrame frame, int effOp, int deg) {
+        nint srcPtr = zan_gui_get_pixels(layerSid);
+        if (srcPtr == 0) { return; }
+        int srcStride = zan_gui_surface_width(layerSid);
+        int w = frame.w;
+        int h = frame.h;
+        if (srcStride < w) { return; }
+
+        double sc = (double)frame.scalePm / 1000.0;
+        double rad = (double)deg * 3.141592653589793 / 180.0;
+        double cosA = Math.Cos(rad);
+        double sinA = Math.Sin(rad);
+        double absCos = cosA < 0.0 ? -cosA : cosA;
+        double absSin = sinA < 0.0 ? -sinA : sinA;
+
+        double halfOutW = ((double)w * 0.5 * absCos + (double)h * 0.5 * absSin) * sc;
+        double halfOutH = ((double)w * 0.5 * absSin + (double)h * 0.5 * absCos) * sc;
+        int outW = (int)Math.Ceiling(halfOutW * 2.0) + 2;
+        int outH = (int)Math.Ceiling(halfOutH * 2.0) + 2;
+        if (outW <= 0 || outH <= 0) { return; }
+
+        double cx = (double)frame.x + (double)w * 0.5;
+        double cy = (double)frame.y + (double)h * 0.5;
+        int outX = (int)Math.Floor(cx - (double)outW * 0.5 + 0.5);
+        int outY = (int)Math.Floor(cy - (double)outH * 0.5 + 0.5);
+
+        int xformSid = this.AcquireXformSurface(outW, outH);
+        if (xformSid < 0) { return; }
+        nint dstPtr = zan_gui_get_pixels(xformSid);
+        if (dstPtr == 0) { return; }
+        int dstStride = zan_gui_surface_width(xformSid);
+        if (dstStride < outW) { return; }
+
+        Span<int> src = new Span<int>(srcPtr, srcStride * h);
+        Span<int> dst = new Span<int>(dstPtr, dstStride * outH);
+        double invSc = 1.0 / sc;
+        double pivX = cx - (double)outX;
+        double pivY = cy - (double)outY;
+        double srcHalfW = (double)w * 0.5 - 0.5;
+        double srcHalfH = (double)h * 0.5 - 0.5;
+        double opScale = (double)effOp / 1000.0;
+
+        for (int oy = 0; oy < outH; oy = oy + 1) {
+            double dy = (double)oy + 0.5 - pivY;
+            int dstRow = oy * dstStride;
+            for (int ox = 0; ox < outW; ox = ox + 1) {
+                double dx = (double)ox + 0.5 - pivX;
+                double sx = (dx * cosA + dy * sinA) * invSc + srcHalfW;
+                double sy = (-dx * sinA + dy * cosA) * invSc + srcHalfH;
+
+                int ix = (int)Math.Floor(sx);
+                int iy = (int)Math.Floor(sy);
+                if (ix < -1 || iy < -1 || ix >= w || iy >= h) {
+                    dst[dstRow + ox] = 0;
+                    continue;
+                }
+                double fx = sx - (double)ix;
+                double fy = sy - (double)iy;
+                double w00 = (1.0 - fx) * (1.0 - fy);
+                double w10 = fx * (1.0 - fy);
+                double w01 = (1.0 - fx) * fy;
+                double w11 = fx * fy;
+
+                double sumA = 0.0;
+                double sumR = 0.0;
+                double sumG = 0.0;
+                double sumB = 0.0;
+
+                if (ix >= 0 && iy >= 0) {
+                    int p = src[iy * srcStride + ix];
+                    int a = (p >> 24) & 255;
+                    if (a > 0) {
+                        double wa = (double)a * w00;
+                        sumA = sumA + wa;
+                        sumR = sumR + (double)((p >> 16) & 255) * wa;
+                        sumG = sumG + (double)((p >> 8) & 255) * wa;
+                        sumB = sumB + (double)(p & 255) * wa;
+                    }
+                }
+                if (ix + 1 < w && iy >= 0) {
+                    int p = src[iy * srcStride + ix + 1];
+                    int a = (p >> 24) & 255;
+                    if (a > 0) {
+                        double wa = (double)a * w10;
+                        sumA = sumA + wa;
+                        sumR = sumR + (double)((p >> 16) & 255) * wa;
+                        sumG = sumG + (double)((p >> 8) & 255) * wa;
+                        sumB = sumB + (double)(p & 255) * wa;
+                    }
+                }
+                if (ix >= 0 && iy + 1 < h) {
+                    int p = src[(iy + 1) * srcStride + ix];
+                    int a = (p >> 24) & 255;
+                    if (a > 0) {
+                        double wa = (double)a * w01;
+                        sumA = sumA + wa;
+                        sumR = sumR + (double)((p >> 16) & 255) * wa;
+                        sumG = sumG + (double)((p >> 8) & 255) * wa;
+                        sumB = sumB + (double)(p & 255) * wa;
+                    }
+                }
+                if (ix + 1 < w && iy + 1 < h) {
+                    int p = src[(iy + 1) * srcStride + ix + 1];
+                    int a = (p >> 24) & 255;
+                    if (a > 0) {
+                        double wa = (double)a * w11;
+                        sumA = sumA + wa;
+                        sumR = sumR + (double)((p >> 16) & 255) * wa;
+                        sumG = sumG + (double)((p >> 8) & 255) * wa;
+                        sumB = sumB + (double)(p & 255) * wa;
+                    }
+                }
+
+                if (sumA < 0.5) {
+                    dst[dstRow + ox] = 0;
+                    continue;
+                }
+                int ia = (int)(sumA * opScale + 0.5);
+                if (ia <= 0) {
+                    dst[dstRow + ox] = 0;
+                    continue;
+                }
+                if (ia > 255) { ia = 255; }
+                double invA = 1.0 / sumA;
+                int ir = (int)(sumR * invA + 0.5);
+                int ig = (int)(sumG * invA + 0.5);
+                int ib = (int)(sumB * invA + 0.5);
+                if (ir > 255) { ir = 255; }
+                if (ig > 255) { ig = 255; }
+                if (ib > 255) { ib = 255; }
+                dst[dstRow + ox] = (ia << 24) | (ir << 16) | (ig << 8) | ib;
+            }
+        }
+
+        zan_gui_blit_surface_scaled(parentSid, xformSid, outX, outY, outW, outH, 0, 0, outW, outH);
+    }
+}

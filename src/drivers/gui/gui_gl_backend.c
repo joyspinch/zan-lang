@@ -70,8 +70,13 @@ static void zgl_snapshots_drop_surface(int sid) {
 
 static struct {
     zgl_uint prog_shape, prog_text, vao, vbo;
+    zgl_uint prog_blur, prog_blur_comp, blur_vao;
     zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
              u_destination;
+    zgl_int  u_blur_tex, u_blur_uvrect, u_blur_step, u_blur_clamp, u_blur_mode;
+    zgl_int  u_bcomp_tex, u_bcomp_vp, u_bcomp_rect, u_bcomp_uvrect, u_bcomp_shape, u_bcomp_clip;
+    zgl_uint blur_tex[2], blur_fbo[2];
+    int      blur_cap_w, blur_cap_h;
     zgl_uint atlas1, atlas4;
     zgl_int  u_atlas2;
     zgl_uint bitmap_tex;
@@ -929,6 +934,173 @@ static void zgl_blit_pixels(zan_surface_t *s, const zan_bitmap *img,
     zgl_blit_pixels_batch(s, img, quad, 1);
 }
 
+static int zgl_ensure_blur_targets(int need_w, int need_h) {
+    if (need_w <= 0 || need_h <= 0) return 0;
+    if (g_zgl.blur_fbo[0] && g_zgl.blur_fbo[1]
+        && g_zgl.blur_cap_w >= need_w && g_zgl.blur_cap_h >= need_h) {
+        return 1;
+    }
+    int cw = ((need_w + 63) / 64) * 64;
+    int ch = ((need_h + 63) / 64) * 64;
+    if (cw < 64) cw = 64;
+    if (ch < 64) ch = 64;
+    for (int i = 0; i < 2; i++) {
+        if (g_zgl.blur_fbo[i]) gl.DeleteFramebuffers(1, &g_zgl.blur_fbo[i]);
+        if (g_zgl.blur_tex[i]) gl.DeleteTextures(1, &g_zgl.blur_tex[i]);
+        g_zgl.blur_fbo[i] = 0;
+        g_zgl.blur_tex[i] = 0;
+    }
+    zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
+    for (int i = 0; i < 2; i++) {
+        gl.GenTextures(1, &g_zgl.blur_tex[i]);
+        gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[i]);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, cw, ch, 0,
+                      color_fmt, ZGL_UNSIGNED_BYTE, NULL);
+        gl.GenFramebuffers(1, &g_zgl.blur_fbo[i]);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[i]);
+        gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+                                ZGL_TEXTURE_2D, g_zgl.blur_tex[i], 0);
+        if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE) {
+            for (int j = 0; j <= i; j++) {
+                if (g_zgl.blur_fbo[j]) gl.DeleteFramebuffers(1, &g_zgl.blur_fbo[j]);
+                if (g_zgl.blur_tex[j]) gl.DeleteTextures(1, &g_zgl.blur_tex[j]);
+                g_zgl.blur_fbo[j] = 0;
+                g_zgl.blur_tex[j] = 0;
+            }
+            g_zgl.blur_cap_w = 0;
+            g_zgl.blur_cap_h = 0;
+            return 0;
+        }
+    }
+    g_zgl.blur_cap_w = cw;
+    g_zgl.blur_cap_h = ch;
+    return 1;
+}
+
+static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
+                    int radius, int slot, int dirty,
+                    int corner_radius, int corner_mask) {
+    (void)slot;
+    (void)dirty;
+    if (!s || w <= 0 || h <= 0 || radius <= 0) return;
+    if (g_gl_state <= 0 || !g_zgl.prog_blur || !g_zgl.prog_blur_comp
+        || !zan_gl_ctx_make_current()) {
+        gl_sync_to_cpu(s);
+        cpu_blur(s, x, y, w, h, radius, slot, dirty, corner_radius, corner_mask);
+        return;
+    }
+    int x0 = clamp_i(x, 0, s->width);
+    int y0 = clamp_i(y, 0, s->height);
+    int x1 = zgl_snap_edge(x, w, s->width);
+    int y1 = zgl_snap_edge(y, h, s->height);
+    if (x1 <= x0 || y1 <= y0) return;
+
+    zgl_flush();
+    zgl_target *t = zgl_target_of(s);
+    if (!t) return;
+    zgl_upload(s, t);
+
+    int pad = clamp_i(radius, 2, 32);
+    int sx0 = clamp_i(x0 - pad, 0, s->width);
+    int sy0 = clamp_i(y0 - pad, 0, s->height);
+    int sx1 = clamp_i(x1 + pad, 0, s->width);
+    int sy1 = clamp_i(y1 + pad, 0, s->height);
+    int sw = sx1 - sx0;
+    int sh = sy1 - sy0;
+    int bw = (sw + 1) / 2;
+    int bh = (sh + 1) / 2;
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+    if (!zgl_ensure_blur_targets(bw, bh)) {
+        gl_sync_to_cpu(s);
+        cpu_blur(s, x, y, w, h, radius, slot, dirty, corner_radius, corner_mask);
+        return;
+    }
+
+    float inv_tw = 1.0f / (float)t->w;
+    float inv_th = 1.0f / (float)t->h;
+    float inv_cw = 1.0f / (float)g_zgl.blur_cap_w;
+    float inv_ch = 1.0f / (float)g_zgl.blur_cap_h;
+
+    /* Pass 0: Downsample t->tex sub-rect into blur_fbo[0] */
+    gl.Disable(ZGL_BLEND);
+    gl.Disable(ZGL_SCISSOR_TEST);
+    gl.BindVertexArray(g_zgl.blur_vao);
+    gl.UseProgram(g_zgl.prog_blur);
+    gl.ActiveTexture(ZGL_TEXTURE0);
+    gl.BindTexture(ZGL_TEXTURE_2D, t->tex);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
+
+    float src_u0 = (float)sx0 * inv_tw;
+    float src_u1 = (float)sx1 * inv_tw;
+    float src_v0 = (float)(s->height - sy1) * inv_th;
+    float src_v1 = (float)(s->height - sy0) * inv_th;
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[0]);
+    gl.Viewport(0, 0, bw, bh);
+    gl.Uniform1i(g_zgl.u_blur_tex, 0);
+    gl.Uniform4f(g_zgl.u_blur_uvrect, src_u0, src_v0, src_u1, src_v1);
+    gl.Uniform2f(g_zgl.u_blur_step, inv_tw, inv_th);
+    gl.Uniform4f(g_zgl.u_blur_clamp, src_u0 + 0.5f * inv_tw, src_v0 + 0.5f * inv_th,
+                 src_u1 - 0.5f * inv_tw, src_v1 - 0.5f * inv_th);
+    gl.Uniform1i(g_zgl.u_blur_mode, 0);
+    gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
+
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
+    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
+
+    /* Passes 1..K: Dual-Kawase ping-pong tent filter */
+    int passes = (radius <= 5) ? 1 : (radius <= 14) ? 2 : 3;
+    int cur = 0;
+    float max_u = (float)bw * inv_cw;
+    float max_v = (float)bh * inv_ch;
+    float base_off = (float)radius * 0.16f + 0.5f;
+    for (int i = 0; i < passes; i++) {
+        int nxt = 1 - cur;
+        float off = base_off * (1.0f + (float)i * 0.6f);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, g_zgl.blur_fbo[nxt]);
+        gl.Viewport(0, 0, bw, bh);
+        gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[cur]);
+        gl.Uniform4f(g_zgl.u_blur_uvrect, 0.0f, 0.0f, max_u, max_v);
+        gl.Uniform2f(g_zgl.u_blur_step, off * inv_cw, off * inv_ch);
+        gl.Uniform4f(g_zgl.u_blur_clamp, 0.5f * inv_cw, 0.5f * inv_ch,
+                     max_u - 0.5f * inv_cw, max_v - 0.5f * inv_ch);
+        gl.Uniform1i(g_zgl.u_blur_mode, 1);
+        gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
+        cur = nxt;
+    }
+
+    /* Final composite back onto t->fbo with rounded-corner SDF mask & clip */
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    gl.Viewport(0, 0, t->w, t->h);
+    gl.Enable(ZGL_BLEND);
+    gl.BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
+    gl.UseProgram(g_zgl.prog_blur_comp);
+    gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.blur_tex[cur]);
+    gl.Uniform1i(g_zgl.u_bcomp_tex, 0);
+    gl.Uniform2f(g_zgl.u_bcomp_vp, (float)t->w, (float)t->h);
+    gl.Uniform4f(g_zgl.u_bcomp_rect, (float)x, (float)y, (float)w, (float)h);
+    float cu0 = ((float)(x - sx0) / (float)sw) * max_u;
+    float cu1 = ((float)(x + w - sx0) / (float)sw) * max_u;
+    float cv0 = ((float)(sy1 - (y + h)) / (float)sh) * max_v;
+    float cv1 = ((float)(sy1 - y) / (float)sh) * max_v;
+    gl.Uniform4f(g_zgl.u_bcomp_uvrect, cu0, cv0, cu1, cv1);
+    gl.Uniform4f(g_zgl.u_bcomp_shape, (float)corner_radius, (float)corner_mask, 0.0f, 0.0f);
+    gl.Uniform4f(g_zgl.u_bcomp_clip, (float)s->clip_x0, (float)s->clip_y0,
+                 (float)s->clip_x1, (float)s->clip_y1);
+    gl.DrawArrays(ZGL_TRIANGLES, 0, 6);
+
+    gl.BindVertexArray(g_zgl.vao);
+    gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
+    g_zgl.mode = ZGL_MODE_NONE;
+    t->gpu_ahead = 1;
+    s->painted = 1;
+}
+
 static const zan_gui_backend zan_gl_backend = {
     .name         = "gl",
     .clear_rect   = gl_clear_rect,
@@ -946,7 +1118,7 @@ static const zan_gui_backend zan_gl_backend = {
     .draw_line    = gl_draw_line,
     .polyline     = gl_polyline,
     .polybatch    = gl_polybatch,
-    .blur         = NULL,
+    .blur         = gl_blur,
     .snapshot     = gl_snapshot,
     .snapshot_patch = gl_snapshot_patch,
     .restore      = gl_restore,
@@ -977,6 +1149,14 @@ void zan_gui_internal_gl_drop_present(void) {
     zgl_cleanup_extensions(-1);
     ++g_gpu_epoch;
     for (int i = 0; i < ZGL_BITMAP_CAP; i++) zgl_bitmap_drop(i);
+    for (int i = 0; i < 2; i++) {
+        if (g_zgl.blur_fbo[i]) gl.DeleteFramebuffers(1, &g_zgl.blur_fbo[i]);
+        if (g_zgl.blur_tex[i]) gl.DeleteTextures(1, &g_zgl.blur_tex[i]);
+        g_zgl.blur_fbo[i] = 0;
+        g_zgl.blur_tex[i] = 0;
+    }
+    g_zgl.blur_cap_w = 0;
+    g_zgl.blur_cap_h = 0;
     for (int i = 0; i < g_surface_count; i++)
         if (g_surfaces[i]) gl_drop_surface(g_surfaces[i]);
     zan_gl_ctx_present_drop_all();

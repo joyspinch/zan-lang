@@ -8,9 +8,23 @@ public class Tween {
     public int durationMs;
     public float invDurationMs;
     public int elapsedMs;
+    public int delayMs;
+    public int delayRemainingMs;
+    public int repeatCount;
+    public int completedRepeats;
+    public bool yoyo;
+    public bool reversed;
     public int easeType;
+    public float bezX1;
+    public float bezY1;
+    public float bezX2;
+    public float bezY2;
+    public int stepCount;
+    public bool stepJumpEnd;
     public bool active;
+    public bool paused;
     public bool finished;
+    public float currentVal;
     public TweenUpdate updateAction;
     public TweenCallback completeAction;
     int playback;
@@ -20,15 +34,30 @@ public class Tween {
         this.durationMs = 300;
         this.invDurationMs = 1.0f / 300.0f;
         this.elapsedMs = 0;
+        this.delayMs = 0;
+        this.delayRemainingMs = 0;
+        this.repeatCount = 0;
+        this.completedRepeats = 0;
+        this.yoyo = false;
+        this.reversed = false;
         this.easeType = EaseType.QuadOut;
+        this.bezX1 = 0.25f;
+        this.bezY1 = 0.1f;
+        this.bezX2 = 0.25f;
+        this.bezY2 = 1.0f;
+        this.stepCount = 1;
+        this.stepJumpEnd = true;
         this.active = false;
+        this.paused = false;
         this.finished = false;
+        this.currentVal = 0.0f;
     }
     public static Tween Create(float fromVal, float toVal, int durationMs,
-                                int easeType, TweenUpdate onUpdate) {
+                               int easeType, TweenUpdate onUpdate) {
         Tween t = new Tween();
         t.fromVal = fromVal;
         t.toVal = toVal;
+        t.currentVal = fromVal;
         int dur = durationMs > 0 ? durationMs : 1;
         t.durationMs = dur;
         t.invDurationMs = 1.0f / (float)dur;
@@ -36,42 +65,138 @@ public class Tween {
         t.updateAction = onUpdate;
         return t;
     }
+    public Tween WithDelay(int ms) {
+        this.delayMs = ms > 0 ? ms : 0;
+        return this;
+    }
+    public Tween WithRepeat(int count) {
+        this.repeatCount = count;
+        return this;
+    }
+    public Tween WithYoyo(bool enable) {
+        this.yoyo = enable;
+        return this;
+    }
+    public Tween WithBezier(float x1, float y1, float x2, float y2) {
+        this.easeType = EaseType.CubicBezier;
+        this.bezX1 = x1;
+        this.bezY1 = y1;
+        this.bezX2 = x2;
+        this.bezY2 = y2;
+        return this;
+    }
+    public Tween WithSteps(int count, bool jumpEnd) {
+        this.easeType = EaseType.Steps;
+        this.stepCount = count > 0 ? count : 1;
+        this.stepJumpEnd = jumpEnd;
+        return this;
+    }
     public void OnComplete(TweenCallback onComplete) { this.completeAction = onComplete; }
+    public float EvaluateCurve(float progress) {
+        if (this.easeType == EaseType.CubicBezier) {
+            return Easing.CubicBezier(this.bezX1, this.bezY1, this.bezX2, this.bezY2, progress);
+        }
+        if (this.easeType == EaseType.Steps) {
+            return Easing.Steps(this.stepCount, this.stepJumpEnd, progress);
+        }
+        return Easing.Evaluate(this.easeType, progress);
+    }
     public void Play() {
         this.playback = this.playback + 1;
         this.active = true;
+        this.paused = false;
         this.finished = false;
         this.elapsedMs = 0;
-        if (this.updateAction != null) {
-            float k = Easing.Evaluate(this.easeType, 0.0f);
-            this.updateAction(this.fromVal + (this.toVal - this.fromVal) * k);
+        this.delayRemainingMs = this.delayMs;
+        this.completedRepeats = 0;
+        this.reversed = false;
+        this.currentVal = this.fromVal;
+        if (this.delayRemainingMs == 0 && this.updateAction != null) {
+            float k = this.EvaluateCurve(0.0f);
+            this.currentVal = this.fromVal + (this.toVal - this.fromVal) * k;
+            this.updateAction(this.currentVal);
         }
     }
-    public void Pause() { this.active = false; }
+    public void Pause() {
+        if (this.active && !this.finished) {
+            this.active = false;
+            this.paused = true;
+        }
+    }
     public void Resume() {
-        if (!this.finished) { this.active = true; }
+        if (this.paused && !this.finished) {
+            this.paused = false;
+            this.active = true;
+        }
     }
     public void Stop() {
         this.playback = this.playback + 1;
         this.active = false;
+        this.paused = false;
         this.finished = false;
         this.elapsedMs = 0;
+        this.delayRemainingMs = 0;
+        this.completedRepeats = 0;
+        this.reversed = false;
+    }
+    public void Retarget(float newTarget, int newDurationMs) {
+        this.fromVal = this.currentVal;
+        this.toVal = newTarget;
+        if (newDurationMs > 0) {
+            this.durationMs = newDurationMs;
+            this.invDurationMs = 1.0f / (float)newDurationMs;
+        }
+        this.elapsedMs = 0;
+        this.delayRemainingMs = 0;
+        this.reversed = false;
+        this.finished = false;
+        this.paused = false;
+        this.active = true;
     }
     public bool Step(int deltaMs) {
-        if (!this.active || this.finished) { return false; }
-        long elapsed = (long)this.elapsedMs + deltaMs;
-        this.elapsedMs = elapsed >= this.durationMs ? this.durationMs : (int)elapsed;
+        if (!this.active || this.finished || deltaMs <= 0) { return false; }
+        int rem = deltaMs;
+        if (this.delayRemainingMs > 0) {
+            if (rem < this.delayRemainingMs) {
+                this.delayRemainingMs = this.delayRemainingMs - rem;
+                return true;
+            }
+            rem = rem - this.delayRemainingMs;
+            this.delayRemainingMs = 0;
+            if (rem == 0) {
+                if (this.updateAction != null) {
+                    float k0 = this.EvaluateCurve(0.0f);
+                    this.currentVal = this.fromVal + (this.toVal - this.fromVal) * k0;
+                    this.updateAction(this.currentVal);
+                }
+                return true;
+            }
+        }
+        long elapsed = (long)this.elapsedMs + rem;
+        while (elapsed >= this.durationMs) {
+            if (this.repeatCount < 0 || this.completedRepeats < this.repeatCount) {
+                elapsed = elapsed - this.durationMs;
+                this.completedRepeats = this.completedRepeats + 1;
+                if (this.yoyo) { this.reversed = !this.reversed; }
+            } else {
+                elapsed = this.durationMs;
+                this.finished = true;
+                this.active = false;
+                this.paused = false;
+                break;
+            }
+        }
+        this.elapsedMs = (int)elapsed;
         float progress = (float)this.elapsedMs * this.invDurationMs;
-        if (elapsed >= this.durationMs || progress >= 1.0f) {
-            this.finished = true;
-            this.active = false;
-        }
+        if (progress > 1.0f) { progress = 1.0f; }
+        float effectiveT = this.reversed ? (1.0f - progress) : progress;
         int run = this.playback;
-        if (this.updateAction != null) {
-            float current = this.finished ? this.toVal
-                : this.fromVal + (this.toVal - this.fromVal) * Easing.Evaluate(this.easeType, progress);
-            this.updateAction(current);
+        if (this.finished) {
+            this.currentVal = this.reversed ? this.fromVal : this.toVal;
+        } else {
+            this.currentVal = this.fromVal + (this.toVal - this.fromVal) * this.EvaluateCurve(effectiveT);
         }
+        if (this.updateAction != null) { this.updateAction(this.currentVal); }
         if (this.playback == run && this.finished && this.completeAction != null) { this.completeAction(); }
         return this.active && !this.finished;
     }

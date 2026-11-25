@@ -67,12 +67,32 @@ public partial class Control {
         int offX = prevOffX + localDx;
         int offY = prevOffY + localDy;
         int localOpacity = surface != null ? surface.opacity : 1000;
-        int effOpacity = localOpacity >= 1000 ? prevOpacity : (prevOpacity * localOpacity) / 1000;
-        app.paintOffsetX = offX;
-        app.paintOffsetY = offY;
-        app.canvas.opacityPm = effOpacity;
-        bx = origX + offX;
-        by = origY + offY;
+        int localScale = surface != null && surface.scale > 0 ? surface.scale : 1000;
+        int localRotate = surface != null ? surface.rotate : 0;
+        bool hasTransform = localScale != 1000 || (localRotate % 360) != 0;
+        bool wantGroupOpacity = localOpacity < 1000 && localOpacity > 0 && childNodes.Count > 0;
+        bool pushedLayer = false;
+        if ((hasTransform || wantGroupOpacity) && bw > 0 && bh > 0 && prevOpacity > 0) {
+            pushedLayer = app.canvas.PushLayer(origX + offX, origY + offY, bw, bh,
+                localOpacity, localScale, localRotate);
+        }
+        int effOpacity = pushedLayer
+            ? 1000
+            : (localOpacity >= 1000 ? prevOpacity : (prevOpacity * localOpacity) / 1000);
+        if (pushedLayer) {
+            if (surface != null) { surface.layerTransformOwned = true; }
+            app.paintOffsetX = 0 - origX;
+            app.paintOffsetY = 0 - origY;
+            app.canvas.opacityPm = 1000;
+            bx = 0;
+            by = 0;
+        } else {
+            app.paintOffsetX = offX;
+            app.paintOffsetY = offY;
+            app.canvas.opacityPm = effOpacity;
+            bx = origX + offX;
+            by = origY + offY;
+        }
         try {
             if (effOpacity <= 0) { return; }
             Control ownerParent = parent;
@@ -122,8 +142,10 @@ public partial class Control {
                     if (scrollC) {
                         Rect viewport = this.ScrollViewport();
                         app.canvas.PushClip(viewport.x, viewport.y, viewport.width, viewport.height);
+                        app.PushNativeClip(viewport.x, viewport.y, viewport.width, viewport.height);
                     } else {
                         app.canvas.PushClip(bx, by, bw, bh);
+                        app.PushNativeClip(bx, by, bw, bh);
                     }
                 }
                 try {
@@ -136,18 +158,30 @@ public partial class Control {
                         bx = origX;
                         by = origY;
                         bool inView = this.ChildInViewport(child);
-                        bx = origX + offX;
-                        by = origY + offY;
+                        bx = pushedLayer ? 0 : origX + offX;
+                        by = pushedLayer ? 0 : origY + offY;
                         if (!inView) { continue; }
                         child.RenderTree(app);
                         if (!this.PaintNodeCurrent(app, ownerParent, revision, root, generation, sequence, phase, frame)) { return; }
                     }
-                } finally { if (clipKids) { app.canvas.PopClip(); } }
+                } finally {
+                    if (clipKids) {
+                        app.PopNativeClip();
+                        app.canvas.PopClip();
+                    }
+                }
             }
             if (scrollC) { this.PaintScrollBars(app); }
         } finally {
-            if (surface != null) { surface.treeComposite = false; }
-            if (paintedStyle != null) { paintedStyle.treeComposite = false; }
+            if (surface != null) {
+                surface.treeComposite = false;
+                surface.layerTransformOwned = false;
+            }
+            if (paintedStyle != null) {
+                paintedStyle.treeComposite = false;
+                paintedStyle.layerTransformOwned = false;
+            }
+            if (pushedLayer) { app.canvas.PopLayer(); }
             treeCompositing = prevCompositing;
             bx = origX;
             by = origY;

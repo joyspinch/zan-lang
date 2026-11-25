@@ -3,12 +3,55 @@ using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 namespace Gui.Animation;
-internal struct TimelineTween {
+internal struct TimelineEntry {
     internal Tween tween;
+    internal SpringAnim spring;
+    internal AnimGroup group;
     internal int addedAtMs;
-    internal TimelineTween(Tween tween, int addedAtMs) {
-        this.tween = tween;
-        this.addedAtMs = addedAtMs;
+    internal bool IsEmpty() { return this.tween == null && this.spring == null && this.group == null; }
+    internal bool IsActive() {
+        if (this.tween != null) { return this.tween.active && !this.tween.finished; }
+        if (this.spring != null) { return this.spring.active && !this.spring.finished; }
+        if (this.group != null) { return this.group.active && !this.group.finished; }
+        return false;
+    }
+    internal bool IsRetained() {
+        if (this.tween != null) { return !this.tween.finished && (this.tween.active || this.tween.paused); }
+        if (this.spring != null) { return !this.spring.finished && (this.spring.active || this.spring.paused); }
+        if (this.group != null) { return !this.group.finished && (this.group.active || this.group.paused); }
+        return false;
+    }
+    internal void Stop() {
+        if (this.tween != null) { this.tween.Stop(); }
+        if (this.spring != null) { this.spring.Stop(); }
+        if (this.group != null) { this.group.Stop(); }
+    }
+    internal void Step(int stepMs) {
+        if (this.tween != null) { this.tween.Step(stepMs); }
+        else if (this.spring != null) { this.spring.Step(stepMs); }
+        else if (this.group != null) { this.group.Step(stepMs); }
+    }
+    internal static TimelineEntry Empty() {
+        TimelineEntry e = new TimelineEntry();
+        return e;
+    }
+    internal static TimelineEntry OfTween(Tween t, int atMs) {
+        TimelineEntry e = new TimelineEntry();
+        e.tween = t;
+        e.addedAtMs = atMs;
+        return e;
+    }
+    internal static TimelineEntry OfSpring(SpringAnim s, int atMs) {
+        TimelineEntry e = new TimelineEntry();
+        e.spring = s;
+        e.addedAtMs = atMs;
+        return e;
+    }
+    internal static TimelineEntry OfGroup(AnimGroup g, int atMs) {
+        TimelineEntry e = new TimelineEntry();
+        e.group = g;
+        e.addedAtMs = atMs;
+        return e;
     }
 }
 public class AnimationTimeline : AppLoopOwner, AppLoopParticipant, AppLoopStopped {
@@ -19,7 +62,7 @@ public class AnimationTimeline : AppLoopOwner, AppLoopParticipant, AppLoopStoppe
             return shared;
         }
     }
-    List<TimelineTween> tweens = new List<TimelineTween>();
+    List<TimelineEntry> entries = new List<TimelineEntry>();
     FrameCadence cadence = new FrameCadence();
     weak App boundApp;
     weak AppLoopRegistration registration;
@@ -35,6 +78,13 @@ public class AnimationTimeline : AppLoopOwner, AppLoopParticipant, AppLoopStoppe
             this.EnsureRegistration();
             app.RequestRedraw();
         }
+    }
+    // 窗口启动时自动挂接：仅在尚未绑定运行中的 App 时接管，避免覆盖测试里显式 BindApp。
+    public void AutoBind(App app) {
+        if (app == null || !app.isRunning) { return; }
+        App cur = this.boundApp;
+        if (cur != null && cur.isRunning) { return; }
+        this.BindApp(app);
     }
     private void EnsureRegistration() {
         App app = this.boundApp;
@@ -53,19 +103,19 @@ public class AnimationTimeline : AppLoopOwner, AppLoopParticipant, AppLoopStoppe
         this.Clear();
     }
     public bool HasActive() {
-        for (int i = 0; i < this.tweens.Count; i = i + 1) {
-            Tween t = this.tweens[i].tween;
-            if (t != null && t.active && !t.finished) { return true; }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].IsActive()) { return true; }
         }
         return false;
     }
+    public int EntryCount() { return this.entries.Count; }
     private void ResetClock(App app, int now) {
         this.cadence.Reset();
         this.lastTickMs = now;
-        for (int i = 0; i < this.tweens.Count; i = i + 1) {
-            TimelineTween entry = this.tweens[i];
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            TimelineEntry entry = this.entries[i];
             entry.addedAtMs = now;
-            this.tweens[i] = entry;
+            this.entries[i] = entry;
         }
         this.Schedule(app, now);
     }
@@ -101,74 +151,142 @@ public class AnimationTimeline : AppLoopOwner, AppLoopParticipant, AppLoopStoppe
         catch (Exception error) { timeline.Remove(t); throw error; }
         return t;
     }
+    public static SpringAnim Spring(float fromVal, float toVal, float stiffness,
+                                    float damping, float mass, TweenUpdate onUpdate) {
+        AnimationTimeline timeline = AnimationTimeline.Shared;
+        SpringAnim s = SpringAnim.Create(fromVal, toVal, stiffness, damping, mass, onUpdate);
+        timeline.AddSpring(s);
+        try { s.Play(); }
+        catch (Exception error) { timeline.RemoveSpring(s); throw error; }
+        return s;
+    }
+    public static SpringAnim SpringBounce(float fromVal, float toVal, float durationSec,
+                                          float bounce, TweenUpdate onUpdate) {
+        AnimationTimeline timeline = AnimationTimeline.Shared;
+        SpringAnim s = SpringAnim.FromDurationBounce(fromVal, toVal, durationSec, bounce, onUpdate);
+        timeline.AddSpring(s);
+        try { s.Play(); }
+        catch (Exception error) { timeline.RemoveSpring(s); throw error; }
+        return s;
+    }
+    public static AnimGroup PlayGroup(AnimGroup group) {
+        if (group == null) { return null; }
+        AnimationTimeline timeline = AnimationTimeline.Shared;
+        timeline.AddGroup(group);
+        try { group.Play(); }
+        catch (Exception error) { timeline.RemoveGroup(group); throw error; }
+        return group;
+    }
     private int FindTween(Tween tween) {
-        for (int i = 0; i < this.tweens.Count; i = i + 1) {
-            if (this.tweens[i].tween == tween) { return i; }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].tween == tween) { return i; }
         }
         return -1;
     }
-    public void Add(Tween t) {
-        if (t == null) { return; }
-        if (this.FindTween(t) < 0) { this.tweens.Add(new TimelineTween(t, Window.GetTickMs())); }
+    private int FindSpring(SpringAnim spring) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].spring == spring) { return i; }
+        }
+        return -1;
+    }
+    private int FindGroup(AnimGroup group) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].group == group) { return i; }
+        }
+        return -1;
+    }
+    private void NotifyAdded() {
         this.EnsureRegistration();
         App app = this.boundApp;
         if (!this.ticking && app != null && app.isRunning) { app.RequestRedraw(); }
     }
-    public void Remove(Tween t) {
+    public void Add(Tween t) {
         if (t == null) { return; }
-        int index = this.FindTween(t);
-        if (index < 0) { return; }
-        t.Stop();
-        if (this.ticking) { this.tweens[index] = new TimelineTween(null, 0); }
+        if (this.FindTween(t) < 0) { this.entries.Add(TimelineEntry.OfTween(t, Window.GetTickMs())); }
+        this.NotifyAdded();
+    }
+    public void AddSpring(SpringAnim s) {
+        if (s == null) { return; }
+        if (this.FindSpring(s) < 0) { this.entries.Add(TimelineEntry.OfSpring(s, Window.GetTickMs())); }
+        this.NotifyAdded();
+    }
+    public void AddGroup(AnimGroup g) {
+        if (g == null) { return; }
+        if (this.FindGroup(g) < 0) { this.entries.Add(TimelineEntry.OfGroup(g, Window.GetTickMs())); }
+        this.NotifyAdded();
+    }
+    private void RemoveAtIndex(int index) {
+        if (index < 0 || index >= this.entries.Count) { return; }
+        this.entries[index].Stop();
+        if (this.ticking) { this.entries[index] = TimelineEntry.Empty(); }
         else {
-            this.tweens.RemoveAt(index);
-            if (this.tweens.Count == 0) { this.Unregister(); }
+            this.entries.RemoveAt(index);
+            if (this.entries.Count == 0) { this.Unregister(); }
         }
     }
+    public void Remove(Tween t) {
+        if (t == null) { return; }
+        this.RemoveAtIndex(this.FindTween(t));
+    }
+    public void RemoveSpring(SpringAnim s) {
+        if (s == null) { return; }
+        this.RemoveAtIndex(this.FindSpring(s));
+    }
+    public void RemoveGroup(AnimGroup g) {
+        if (g == null) { return; }
+        this.RemoveAtIndex(this.FindGroup(g));
+    }
     public void Clear() {
-        for (int i = 0; i < this.tweens.Count; i = i + 1) {
-            Tween t = this.tweens[i].tween;
-            if (t != null) { t.Stop(); }
-            if (this.ticking) { this.tweens[i] = new TimelineTween(null, 0); }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            this.entries[i].Stop();
+            if (this.ticking) { this.entries[i] = TimelineEntry.Empty(); }
         }
-        if (!this.ticking) { this.tweens.Clear(); }
+        if (!this.ticking) { this.entries.Clear(); }
         this.Unregister();
     }
     public void Tick(int deltaMs) { this.Advance(deltaMs, 0, false); }
     private void Advance(int deltaMs, int now, bool appClock) {
-        if (deltaMs <= 0 || this.ticking || this.tweens.Count == 0) { return; }
+        if (deltaMs <= 0 || this.ticking || this.entries.Count == 0) { return; }
         App app = this.boundApp;
         bool updated = false;
         this.ticking = true;
         try {
-            for (int i = this.tweens.Count - 1; i >= 0 && this.boundApp == app; i = i - 1) {
-                TimelineTween entry = this.tweens[i];
-                Tween t = entry.tween;
-                if (t == null) { continue; }
-                if (t.active && !t.finished) {
+            for (int i = this.entries.Count - 1; i >= 0 && this.boundApp == app; i = i - 1) {
+                TimelineEntry entry = this.entries[i];
+                if (entry.IsEmpty()) { continue; }
+                if (entry.IsActive()) {
                     int stepMs = appClock ? now - Math.Max(now - deltaMs, entry.addedAtMs) : deltaMs;
                     if (stepMs > 0) {
                         updated = true;
-                        t.Step(stepMs);
+                        entry.Step(stepMs);
                     }
                 }
-                if (!t.active || t.finished) { this.tweens[i] = new TimelineTween(null, 0); }
+                // 暂停中的动画必须保留，只有完成或显式 Stop 后才移出时间线。
+                if (!entry.IsRetained()) { this.entries[i] = TimelineEntry.Empty(); }
             }
         } finally {
             this.ticking = false;
             this.Compact();
-            if (this.tweens.Count == 0) { this.Unregister(); }
+            if (this.entries.Count == 0 || !this.HasActive()) { this.Unregister(); }
             if (updated && app != null && app.isRunning) { app.RequestRedraw(); }
+        }
+    }
+    // 恢复已暂停的动画后调用，若当前循环参与者已休眠则立即重新唤醒调度。
+    public void Wake() {
+        if (this.HasActive()) {
+            this.EnsureRegistration();
+            App app = this.boundApp;
+            if (!this.ticking && app != null && app.isRunning) { app.RequestRedraw(); }
         }
     }
     private void Compact() {
         int count = 0;
-        for (int i = 0; i < this.tweens.Count; i = i + 1) {
-            TimelineTween entry = this.tweens[i];
-            if (entry.tween == null) { continue; }
-            if (count != i) { this.tweens[count] = entry; }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            TimelineEntry entry = this.entries[i];
+            if (entry.IsEmpty()) { continue; }
+            if (count != i) { this.entries[count] = entry; }
             count = count + 1;
         }
-        while (this.tweens.Count > count) { this.tweens.RemoveAt(this.tweens.Count - 1); }
+        while (this.entries.Count > count) { this.entries.RemoveAt(this.entries.Count - 1); }
     }
 }

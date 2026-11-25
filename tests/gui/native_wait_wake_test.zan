@@ -128,8 +128,36 @@ class NativeWaitWakeTest {
         File.WriteAllText("native_wait_wake.txt", report);
         File.WriteAllText("/sdcard/Android/data/com.zan.nativewait/files/native_wait_wake.txt", report);
         #else
-        NativeWaitWakeTest.Check(!window.RequestDisplayFrame() && !window.TakeDisplayFrame(),
-            "unsupported display callback uses cadence fallback");
+        if (window.RequestDisplayFrame()) {
+            // DWM VSync on Windows (or other platform with live display callback):
+            // verify the exact same readiness & one-shot delivery contract.
+            window.TakeDisplayFrame();
+            NativeWaitWakeTest.Drain();
+            NativeWaitWakeTest.Check(window.RequestDisplayFrame(), "ready-frame request is supported");
+            Thread.Sleep(40);
+            for (int j = 0; j < 16; j++) { window.PollEvent(); }
+            start = Stopwatch.GetMicroseconds();
+            result = window.WaitEventTimeout(200);
+            long readyWait = Stopwatch.GetMicroseconds() - start;
+            bool ready = window.TakeDisplayFrame();
+            NativeWaitWakeTest.Check(result == 0 && readyWait < 80000 && ready,
+                "unconsumed display readiness interrupts another wait");
+            NativeWaitWakeTest.Check(!window.TakeDisplayFrame(), "ready-frame wait does not duplicate the frame");
+            for (int i = 0; i < 6; i++) {
+                NativeWaitWakeTest.Check(window.RequestDisplayFrame(), "display callback is supported");
+                start = Stopwatch.GetMicroseconds();
+                bool got = false;
+                while (!got && Stopwatch.GetMicroseconds() - start < 500000) {
+                    window.WaitEventTimeout(100);
+                    got = window.TakeDisplayFrame();
+                }
+                NativeWaitWakeTest.Check(got, "one-shot display callback arrives");
+                NativeWaitWakeTest.Check(!window.TakeDisplayFrame(), "display readiness consumed once");
+            }
+        } else {
+            NativeWaitWakeTest.Check(!window.TakeDisplayFrame(),
+                "unsupported display callback uses cadence fallback");
+        }
         window.Destroy();
         app.canvas.Destroy();
         Console.WriteLine("NATIVE_WAIT_WAKE_OK");

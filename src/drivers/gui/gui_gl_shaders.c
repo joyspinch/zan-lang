@@ -234,6 +234,91 @@ ZGL_FS_COMMON
 "    o_color = vec4(v_col0.rgb, v_col0.a * a);\n"
 "}\n";
 
+/* GPU Dual-Kawase Blur shaders (GL 3.3 Core & GLES 3.0 compatible) */
+static const char *ZGL_VS_BLUR_BODY =
+"uniform vec4 uUvRect;\n"
+"out vec2 v_uv;\n"
+"void main() {\n"
+"    vec2 p = vec2((gl_VertexID == 1 || gl_VertexID == 4 || gl_VertexID == 5) ? 1.0 : 0.0,\n"
+"                  (gl_VertexID == 2 || gl_VertexID == 3 || gl_VertexID == 5) ? 1.0 : 0.0);\n"
+"    v_uv = mix(uUvRect.xy, uUvRect.zw, p);\n"
+"    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"}\n";
+
+static const char *ZGL_FS_KAWASE_BODY =
+"uniform sampler2D uTex;\n"
+"uniform vec2 uStep;\n"
+"uniform vec4 uClamp;\n"
+"uniform int uMode;\n"
+"in vec2 v_uv;\n"
+"out vec4 o_color;\n"
+"vec4 smp(vec2 uv) { return texture(uTex, clamp(uv, uClamp.xy, uClamp.zw)); }\n"
+"void main() {\n"
+"    if (uMode == 0) {\n"
+"        vec4 sum = smp(v_uv) * 4.0;\n"
+"        sum += smp(v_uv + vec2(-uStep.x, -uStep.y));\n"
+"        sum += smp(v_uv + vec2( uStep.x, -uStep.y));\n"
+"        sum += smp(v_uv + vec2(-uStep.x,  uStep.y));\n"
+"        sum += smp(v_uv + vec2( uStep.x,  uStep.y));\n"
+"        o_color = sum * 0.125;\n"
+"    } else {\n"
+"        vec4 sum = smp(v_uv + vec2(-uStep.x * 2.0, 0.0));\n"
+"        sum += smp(v_uv + vec2( uStep.x * 2.0, 0.0));\n"
+"        sum += smp(v_uv + vec2(0.0, -uStep.y * 2.0));\n"
+"        sum += smp(v_uv + vec2(0.0,  uStep.y * 2.0));\n"
+"        sum += smp(v_uv + vec2(-uStep.x, -uStep.y)) * 2.0;\n"
+"        sum += smp(v_uv + vec2( uStep.x, -uStep.y)) * 2.0;\n"
+"        sum += smp(v_uv + vec2(-uStep.x,  uStep.y)) * 2.0;\n"
+"        sum += smp(v_uv + vec2( uStep.x,  uStep.y)) * 2.0;\n"
+"        o_color = sum / 12.0;\n"
+"    }\n"
+"}\n";
+
+static const char *ZGL_VS_BLUR_COMP_BODY =
+"uniform vec2 uViewport;\n"
+"uniform vec4 uRect;\n"
+"uniform vec4 uUvRect;\n"
+"out vec2 v_uv;\n"
+"void main() {\n"
+"    vec2 p = vec2((gl_VertexID == 1 || gl_VertexID == 4 || gl_VertexID == 5) ? 1.0 : 0.0,\n"
+"                  (gl_VertexID == 2 || gl_VertexID == 3 || gl_VertexID == 5) ? 1.0 : 0.0);\n"
+"    vec2 px = uRect.xy + p * uRect.zw;\n"
+"    v_uv = vec2(mix(uUvRect.x, uUvRect.z, p.x), mix(uUvRect.w, uUvRect.y, p.y));\n"
+"    vec2 ndc = vec2(px.x / uViewport.x * 2.0 - 1.0,\n"
+"                    1.0 - px.y / uViewport.y * 2.0);\n"
+"    gl_Position = vec4(ndc, 0.0, 1.0);\n"
+"}\n";
+
+static const char *ZGL_FS_BLUR_COMP_BODY =
+"uniform sampler2D uTex;\n"
+"uniform vec2 uViewport;\n"
+"uniform vec4 uRect;\n"
+"uniform vec4 uShape;\n"
+"uniform vec4 uClip;\n"
+"in vec2 v_uv;\n"
+"out vec4 o_color;\n"
+"float sd_round(vec2 p, vec2 half_, float r, int mask) {\n"
+"    float rr = r;\n"
+"    int bit = (p.x < 0.0) ? ((p.y < 0.0) ? 1 : 8) : ((p.y < 0.0) ? 2 : 4);\n"
+"    if ((mask & bit) == 0) rr = 0.0;\n"
+"    vec2 q = abs(p) - half_ + rr;\n"
+"    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr;\n"
+"}\n"
+"void main() {\n"
+"    vec2 p = vec2(gl_FragCoord.x, uViewport.y - gl_FragCoord.y);\n"
+"    if (p.x < uClip.x || p.y < uClip.y || p.x >= uClip.z || p.y >= uClip.w) discard;\n"
+"    float cov = 1.0;\n"
+"    if (uShape.x > 0.0) {\n"
+"        vec2 half_ = uRect.zw * 0.5;\n"
+"        vec2 lp = p - (uRect.xy + half_);\n"
+"        float sd = sd_round(lp, half_, uShape.x, int(uShape.y + 0.5));\n"
+"        cov = clamp(0.5 - sd, 0.0, 1.0);\n"
+"        if (cov <= 0.0) discard;\n"
+"    }\n"
+"    vec4 c = texture(uTex, v_uv);\n"
+"    o_color = vec4(c.rgb, cov);\n"
+"}\n";
+
 /* GL bootstrap */
 
 static zgl_uint zgl_compile_parts(zgl_enum type, const char *header, const char *body) {
@@ -350,6 +435,23 @@ static int zgl_init(void) {
     g_zgl.prog_shape = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, ZGL_FS_SHAPE_BODY);
     g_zgl.prog_text  = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, fs_text_body);
     if (!g_zgl.prog_shape || !g_zgl.prog_text) { zan_gl_ctx_destroy(); return 0; }
+
+    g_zgl.prog_blur = zgl_link_parts(vs_head, ZGL_VS_BLUR_BODY, fs_head, ZGL_FS_KAWASE_BODY);
+    g_zgl.prog_blur_comp = zgl_link_parts(vs_head, ZGL_VS_BLUR_COMP_BODY, fs_head, ZGL_FS_BLUR_COMP_BODY);
+    if (g_zgl.prog_blur && g_zgl.prog_blur_comp) {
+        gl.GenVertexArrays(1, &g_zgl.blur_vao);
+        g_zgl.u_blur_tex = gl.GetUniformLocation(g_zgl.prog_blur, "uTex");
+        g_zgl.u_blur_uvrect = gl.GetUniformLocation(g_zgl.prog_blur, "uUvRect");
+        g_zgl.u_blur_step = gl.GetUniformLocation(g_zgl.prog_blur, "uStep");
+        g_zgl.u_blur_clamp = gl.GetUniformLocation(g_zgl.prog_blur, "uClamp");
+        g_zgl.u_blur_mode = gl.GetUniformLocation(g_zgl.prog_blur, "uMode");
+        g_zgl.u_bcomp_tex = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uTex");
+        g_zgl.u_bcomp_vp = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uViewport");
+        g_zgl.u_bcomp_rect = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uRect");
+        g_zgl.u_bcomp_uvrect = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uUvRect");
+        g_zgl.u_bcomp_shape = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uShape");
+        g_zgl.u_bcomp_clip = gl.GetUniformLocation(g_zgl.prog_blur_comp, "uClip");
+    }
 
     gl.GenVertexArrays(1, &g_zgl.vao);
     gl.GenBuffers(1, &g_zgl.vbo);

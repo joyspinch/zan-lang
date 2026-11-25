@@ -1,8 +1,56 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using Gui;
 namespace Gui.Backend;
 public partial class Win32Shell {
+    static bool RequestDisplayFrame(nint hwnd) {
+        if (hwnd == 0 || Window.frozenTick || Win32Shell.vsyncFailed) { return false; }
+        if (!Win32Shell.DwmComposited()) { return false; }
+        if (!Win32Shell.vsyncStarted) {
+            nint ev = Win32Shell.CreateEventW(0, 0, 0, 0);
+            nint readyAtom = AtomicInt.NativeCreate(0);
+            nint armedAtom = AtomicInt.NativeCreate(0);
+            if (ev == 0 || readyAtom == 0 || armedAtom == 0) {
+                Win32Shell.vsyncFailed = true;
+                return false;
+            }
+            Win32Shell.vsyncEvent = ev;
+            Win32Shell.vsyncReadyAtom = readyAtom;
+            Win32Shell.vsyncArmedAtom = armedAtom;
+            Win32Shell.vsyncStarted = true;
+            ThreadStart vsyncBody = Win32Shell.VsyncLoop;
+            if (!Thread.Start(vsyncBody)) {
+                Win32Shell.vsyncFailed = true;
+                return false;
+            }
+        }
+        if (AtomicInt.NativeExchange(Win32Shell.vsyncArmedAtom, 1) == 0) {
+            Win32Shell.SetEvent(Win32Shell.vsyncEvent);
+        }
+        return true;
+    }
+    static bool HasDisplayFrameReady() {
+        return Win32Shell.vsyncReadyAtom != 0 && AtomicInt.NativeLoad(Win32Shell.vsyncReadyAtom) != 0;
+    }
+    static bool TakeDisplayFrame(nint hwnd) {
+        if (Win32Shell.vsyncReadyAtom == 0) { return false; }
+        return AtomicInt.NativeExchange(Win32Shell.vsyncReadyAtom, 0) != 0;
+    }
+    static void VsyncLoop() {
+        while (true) {
+            Win32Shell.WaitForSingleObject(Win32Shell.vsyncEvent, 0 - 1);
+            int hr = Win32Shell.DwmFlush();
+            AtomicInt.NativeStore(Win32Shell.vsyncArmedAtom, 0);
+            if (hr != 0) {
+                Win32Shell.vsyncFailed = true;
+                Win32Shell.Wake();
+                return;
+            }
+            AtomicInt.NativeStore(Win32Shell.vsyncReadyAtom, 1);
+            Win32Shell.Wake();
+        }
+    }
     static int SurfaceOf(nint hwnd) {
         if (Win32Shell.surfaceBindings != null) {
             for (int i = 0; i < Win32Shell.surfaceBindings.Count; i = i + 1) {
@@ -143,6 +191,10 @@ public partial class Win32Shell {
     }
     static bool PresentLayered(nint hwnd, int surface) {
         if (Win32Shell.IsLayerHost(hwnd)) { return false; }
+        if (Win32Shell.shapeMode == 0 && !Win32Shell.glassOn && Win32Shell.winOpacityPercent >= 100) {
+            if (Win32Shell.zan_gui_surface_painted(surface) == 0) { return false; }
+            return Win32Shell.zan_gui_atomic_present(hwnd, surface) != 0;
+        }
         nint pixels = Win32Shell.zan_gui_get_pixels(surface);
         if (pixels == 0) { return false; }
         if (Win32Shell.zan_gui_surface_painted(surface) == 0) { return false; }
@@ -165,8 +217,13 @@ public partial class Win32Shell {
         int oy = 0;
         int wx = 0;
         int wy = 0;
-        nint wrect = NativeMemory.Alloc(16);
-        nint cpt = NativeMemory.Alloc(8);
+        if (Win32Shell.layeredScratch == 0) { Win32Shell.layeredScratch = NativeMemory.Alloc(64); }
+        nint sc = Win32Shell.layeredScratch;
+        if (sc == 0) { return false; }
+        nint wrect = sc;
+        nint cpt = sc + 16;
+        new Span<int>(cpt, 2)[0] = 0;
+        new Span<int>(cpt, 2)[1] = 0;
         if (Win32Shell.GetWindowRect(hwnd, wrect) != 0
                 && Win32Shell.ClientToScreen(hwnd, cpt) != 0) {
             wx = Win32Shell.S32(wrect, 0);
@@ -183,8 +240,6 @@ public partial class Win32Shell {
                 oy = ty;
             }
         }
-        NativeMemory.Free(wrect);
-        NativeMemory.Free(cpt);
         if (Win32Shell.lwDc == 0 || Win32Shell.lwW != ww
                 || Win32Shell.lwH != wh) {
             if (Win32Shell.lwDc != 0) {
@@ -219,13 +274,13 @@ public partial class Win32Shell {
         pixels, copyW, copyH, sw * 4, ox, oy, mask, pw, maskLength,
         Win32Shell.hasShadowBand ? 1 : 0) == 0) { return false; }
         nint screenDc = Win32Shell.GetDC(0);
-        nint size = NativeMemory.Alloc(8);
+        nint size = sc + 24;
         new Span<int>(size, 1)[0] = ww;
         new Span<int>(size + 4, 1)[0] = wh;
-        nint src = NativeMemory.Alloc(8);
+        nint src = sc + 32;
         new Span<int>(src, 1)[0] = 0;
         new Span<int>(src + 4, 1)[0] = 0;
-        nint blend = NativeMemory.Alloc(4);
+        nint blend = sc + 40;
         new Span<byte>(blend, 1)[0] = 0;         // AC_SRC_OVER
         new Span<byte>(blend + 1, 1)[0] = 0;
         int constAlpha = (Win32Shell.winOpacityPercent * 255) / 100;
@@ -233,15 +288,11 @@ public partial class Win32Shell {
         if (constAlpha > 255) { constAlpha = 255; }
         new Span<byte>(blend + 2, 1)[0] = (byte)constAlpha;
         new Span<byte>(blend + 3, 1)[0] = 1;         // AC_SRC_ALPHA
-        nint dstPt = NativeMemory.Alloc(8);
+        nint dstPt = sc + 48;
         new Span<int>(dstPt, 1)[0] = wx;
         new Span<int>(dstPt + 4, 1)[0] = wy;
         int ulw = Win32Shell.UpdateLayeredWindow(hwnd, screenDc, dstPt, size,
             Win32Shell.lwDc, src, 0, blend, 2);
-        NativeMemory.Free(dstPt);
-        NativeMemory.Free(blend);
-        NativeMemory.Free(src);
-        NativeMemory.Free(size);
         Win32Shell.ReleaseDC(0, screenDc);
         return ulw != 0;
     }

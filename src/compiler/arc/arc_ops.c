@@ -627,6 +627,12 @@ void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
            LLVMGetTypeKind(value_llvm) == LLVMIntegerTypeKind &&
            LLVMTypeOf(stored) != value_llvm)
     stored = coerce_int_to(g, stored, value_llvm);
+  else if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMDoubleTypeKind &&
+           LLVMGetTypeKind(value_llvm) == LLVMFloatTypeKind)
+    stored = LLVMBuildFPTrunc(g->builder, stored, value_llvm, "out.fptrunc");
+  else if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMFloatTypeKind &&
+           LLVMGetTypeKind(value_llvm) == LLVMDoubleTypeKind)
+    stored = LLVMBuildFPExt(g->builder, stored, value_llvm, "out.fpext");
   LLVMBuildStore(g->builder, stored, out_ptr);
   emit_collection_value_release(g, value_type, old, 0);
 }

@@ -4,12 +4,24 @@ using Gui;
 namespace Gui;
 public partial class StyleSheet {
     static bool DeclMotion(StyleBox b, string k, string v) {
-        if (k == "transition" || k == "transition-duration") {
+        if (k == "transition") {
             StyleSheet.DeclTransition(b, v);
             return true;
         }
+        if (k == "transition-duration") {
+            b.transitionMs = StyleSheet.Ms(v);
+            return true;
+        }
+        if (k == "transition-delay") {
+            b.EnsureMotion().transitionDelayMs = StyleSheet.Ms(v);
+            return true;
+        }
+        if (k == "transition-property") {
+            b.EnsureMotion().transitionPropMask = MotionSpec.ParsePropMask(v);
+            return true;
+        }
         if (k == "transition-timing-function") {
-            b.easing = StyleSheet.Easing(v);
+            StyleSheet.ApplyTimingFunction(b, v, false);
             return true;
         }
         if (k == "transform") { StyleSheet.DeclTransform(b, v); return true; }
@@ -21,11 +33,41 @@ public partial class StyleSheet {
             b.ty = StyleSheet.LenField(b, t.Count >= 2 ? t[1] : "0", StyleBox.SourceTy());
             return true;
         }
-        if (k == "animation" || k == "animation-name") {
+        if (k == "animation") {
             StyleSheet.DeclAnimation(b, v);
             return true;
         }
+        if (k == "animation-name") {
+            StyleSheet.DeclAnimationName(b, v);
+            return true;
+        }
         if (k == "animation-duration") { b.animMs = StyleSheet.Ms(v); return true; }
+        if (k == "animation-delay") { b.EnsureMotion().animDelayMs = StyleSheet.Ms(v); return true; }
+        if (k == "animation-timing-function") {
+            StyleSheet.ApplyTimingFunction(b, v, true);
+            return true;
+        }
+        if (k == "animation-iteration-count") {
+            string lo = StyleSheet.Lower(StyleSheet.Trim(v));
+            if (lo == "infinite") { b.EnsureMotion().animIterations = 0 - 1; }
+            else {
+                int cnt = StyleSheet.Num(lo);
+                b.EnsureMotion().animIterations = cnt >= 0 ? cnt : 1;
+            }
+            return true;
+        }
+        if (k == "animation-direction") {
+            b.EnsureMotion().animDirection = StyleSheet.ParseAnimDirection(v);
+            return true;
+        }
+        if (k == "animation-fill-mode") {
+            b.EnsureMotion().animFillMode = StyleSheet.ParseAnimFillMode(v);
+            return true;
+        }
+        if (k == "animation-play-state") {
+            b.EnsureMotion().animPaused = StyleSheet.Lower(StyleSheet.Trim(v)) == "paused";
+            return true;
+        }
         return false;
     }
     static void DeclBackground(StyleBox b, string val) {
@@ -321,15 +363,144 @@ public partial class StyleSheet {
             b.marL = StyleSheet.SideLength(b, StyleSheet.SideToken(toks, 3), true, StyleBox.SourceMarL());
         }
     }
+    static List<string> SplitSpaceTop(string val) {
+        List<string> outp = new List<string>();
+        int depth = 0;
+        int start = 0 - 1;
+        for (int i = 0; i < val.Length; i = i + 1) {
+            int ch = val[i] & 255;
+            if (ch == 40) { depth = depth + 1; }
+            else if (ch == 41 && depth > 0) { depth = depth - 1; }
+            bool ws = depth == 0 && (ch == 32 || ch == 9 || ch == 10 || ch == 13);
+            if (ws) {
+                if (start >= 0) {
+                    outp.Add(val.Substring(start, i - start));
+                    start = 0 - 1;
+                }
+            } else if (start < 0) {
+                start = i;
+            }
+        }
+        if (start >= 0) { outp.Add(val.Substring(start, val.Length - start)); }
+        return outp;
+    }
+    static bool ApplyTimingFunction(StyleBox b, string raw, bool forAnim) {
+        string s = StyleSheet.Lower(StyleSheet.Trim(raw));
+        int e = StyleSheet.Easing(s);
+        if (e >= 0) {
+            if (forAnim) { b.EnsureMotion().animEasing = e; }
+            else { b.easing = e; }
+            return true;
+        }
+        if (s == "step-start" || s == "step-end") {
+            MotionSpec m = b.EnsureMotion();
+            bool jumpEnd = s == "step-end";
+            if (forAnim) {
+                m.animEasing = 6; m.animStepsCount = 1; m.animStepsJumpEnd = jumpEnd;
+            } else {
+                b.easing = 6; m.stepsCount = 1; m.stepsJumpEnd = jumpEnd;
+            }
+            return true;
+        }
+        if (StyleSheet.StartsWith(s, "cubic-bezier(") && StyleSheet.EndsWith(s, ")")) {
+            string inner = s.Substring(13, s.Length - 14);
+            List<string> args = Css.SplitTopTrim(inner, ",");
+            if (args.Count == 4) {
+                float x1 = 0.0f; float y1 = 0.0f; float x2 = 0.0f; float y2 = 0.0f;
+                if (float.TryParse(args[0], out x1) && float.TryParse(args[1], out y1)
+                    && float.TryParse(args[2], out x2) && float.TryParse(args[3], out y2)) {
+                    MotionSpec m = b.EnsureMotion();
+                    if (forAnim) {
+                        m.animEasing = 5;
+                        m.animBezX1 = x1; m.animBezY1 = y1; m.animBezX2 = x2; m.animBezY2 = y2;
+                    } else {
+                        b.easing = 5;
+                        m.bezX1 = x1; m.bezY1 = y1; m.bezX2 = x2; m.bezY2 = y2;
+                    }
+                    return true;
+                }
+            }
+        }
+        if (StyleSheet.StartsWith(s, "steps(") && StyleSheet.EndsWith(s, ")")) {
+            string inner = s.Substring(6, s.Length - 7);
+            List<string> args = Css.SplitTopTrim(inner, ",");
+            if (args.Count >= 1) {
+                int cnt = StyleSheet.Num(args[0]);
+                if (cnt < 1) { cnt = 1; }
+                bool jumpEnd = true;
+                if (args.Count >= 2) {
+                    string mode = StyleSheet.Lower(args[1]);
+                    if (mode == "start" || mode == "jump-start") { jumpEnd = false; }
+                }
+                MotionSpec m = b.EnsureMotion();
+                if (forAnim) {
+                    m.animEasing = 6; m.animStepsCount = cnt; m.animStepsJumpEnd = jumpEnd;
+                } else {
+                    b.easing = 6; m.stepsCount = cnt; m.stepsJumpEnd = jumpEnd;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+    static int ParseAnimDirection(string val) {
+        string lo = StyleSheet.Lower(StyleSheet.Trim(val));
+        if (lo == "reverse") { return 1; }
+        if (lo == "alternate") { return 2; }
+        if (lo == "alternate-reverse") { return 3; }
+        return 0;
+    }
+    static int ParseAnimFillMode(string val) {
+        string lo = StyleSheet.Lower(StyleSheet.Trim(val));
+        if (lo == "forwards") { return 1; }
+        if (lo == "backwards") { return 2; }
+        if (lo == "both") { return 3; }
+        return 0;
+    }
     static void DeclTransition(StyleBox b, string val) {
-        List<string> toks = StyleSheet.Tokens(val);
-        int i = 0;
-        while (i < toks.Count) {
-            string tk = toks[i];
-            i = i + 1;
-            if (StyleSheet.IsNumeric(tk)) { b.transitionMs = StyleSheet.Ms(tk); continue; }
-            int e = StyleSheet.Easing(tk);
-            if (e >= 0) { b.easing = e; }
+        string trimmed = StyleSheet.Lower(StyleSheet.Trim(val));
+        if (trimmed == "none") {
+            b.transitionMs = 0;
+            b.EnsureMotion().transitionPropMask = MotionSpec.PropNone();
+            return;
+        }
+        List<string> items = Css.SplitTopTrim(val, ",");
+        int propMask = 0;
+        bool hasExplicitProp = false;
+        bool hasAll = false;
+        for (int it = 0; it < items.Count; it = it + 1) {
+            List<string> toks = StyleSheet.SplitSpaceTop(items[it]);
+            int timeIdx = 0;
+            for (int i = 0; i < toks.Count; i = i + 1) {
+                string tk = toks[i];
+                if (StyleSheet.IsNumeric(tk)) {
+                    int ms = StyleSheet.Ms(tk);
+                    if (timeIdx == 0) {
+                        if (it == 0 || ms > b.transitionMs) { b.transitionMs = ms; }
+                    } else if (timeIdx == 1) {
+                        b.EnsureMotion().transitionDelayMs = ms;
+                    }
+                    timeIdx = timeIdx + 1;
+                    continue;
+                }
+                if (StyleSheet.ApplyTimingFunction(b, tk, false)) { continue; }
+                int bit = MotionSpec.PropBit(tk);
+                if (bit == MotionSpec.PropAll()) {
+                    hasAll = true;
+                } else if (bit == MotionSpec.PropNone()) {
+                    b.transitionMs = 0;
+                    propMask = MotionSpec.PropNone();
+                    hasExplicitProp = true;
+                } else if (bit > 0) {
+                    propMask = propMask | bit;
+                    hasExplicitProp = true;
+                }
+            }
+        }
+        if (hasAll) {
+            if (b.motion != null) { b.motion.transitionPropMask = MotionSpec.PropAll(); }
+        } else if (hasExplicitProp) {
+            b.EnsureMotion().transitionPropMask = propMask;
         }
     }
     static void DeclTransform(StyleBox b, string val) {
@@ -363,24 +534,81 @@ public partial class StyleSheet {
             }
         }
     }
+    static void DeclAnimationName(StyleBox b, string val) {
+        string trimmed = StyleSheet.Trim(val);
+        string lo = StyleSheet.Lower(trimmed);
+        if (lo == "" || lo == "none") {
+            b.anim = 0;
+            if (b.motion != null) { b.motion.animName = ""; }
+            return;
+        }
+        int kind = Style.AnimKind(lo);
+        if (kind != 0) {
+            b.anim = kind;
+            if (b.motion != null) { b.motion.animName = ""; }
+            return;
+        }
+        b.anim = 0;
+        b.EnsureMotion().animName = trimmed;
+    }
+    static bool IsTimeToken(string tk) {
+        string lo = StyleSheet.Lower(tk);
+        return StyleSheet.EndsWith(lo, "ms") || StyleSheet.EndsWith(lo, "s");
+    }
     static void DeclAnimation(StyleBox b, string val) {
-        List<string> toks = StyleSheet.Tokens(val);
+        List<string> toks = StyleSheet.SplitSpaceTop(val);
+        int timeIdx = 0;
         int i = 0;
         while (i < toks.Count) {
             string tk = toks[i];
             i = i + 1;
             string lo = StyleSheet.Lower(tk);
-            if (lo == "none") { b.anim = 0; continue; }
-            if (lo == "infinite" || lo == "linear" || lo == "ease"
-                || lo == "ease-in" || lo == "ease-out" || lo == "ease-in-out"
-                || lo == "alternate" || lo == "forwards") {
+            if (lo == "none") {
+                b.anim = 0;
+                if (b.motion != null) { b.motion.animName = ""; }
+                continue;
+            }
+            if (lo == "infinite") {
+                b.EnsureMotion().animIterations = 0 - 1;
+                continue;
+            }
+            if (lo == "normal" || lo == "reverse" || lo == "alternate" || lo == "alternate-reverse") {
+                b.EnsureMotion().animDirection = StyleSheet.ParseAnimDirection(lo);
+                continue;
+            }
+            if (lo == "forwards" || lo == "backwards" || lo == "both") {
+                b.EnsureMotion().animFillMode = StyleSheet.ParseAnimFillMode(lo);
+                continue;
+            }
+            if (lo == "running" || lo == "paused") {
+                b.EnsureMotion().animPaused = lo == "paused";
+                continue;
+            }
+            if (StyleSheet.ApplyTimingFunction(b, tk, true)) {
                 int e = StyleSheet.Easing(lo);
                 if (e >= 0) { b.easing = e; }
                 continue;
             }
-            if (StyleSheet.IsNumeric(tk)) { b.animMs = StyleSheet.Ms(tk); continue; }
+            if (StyleSheet.IsNumeric(tk)) {
+                if (StyleSheet.IsTimeToken(tk)) {
+                    int ms = StyleSheet.Ms(tk);
+                    if (timeIdx == 0) { b.animMs = ms; }
+                    else if (timeIdx == 1) { b.EnsureMotion().animDelayMs = ms; }
+                    timeIdx = timeIdx + 1;
+                } else {
+                    int cnt = StyleSheet.Num(tk);
+                    b.EnsureMotion().animIterations = cnt >= 0 ? cnt : 1;
+                }
+                continue;
+            }
             int kind = Style.AnimKind(lo);
-            if (kind != 0) { b.anim = kind; }
+            if (kind != 0) {
+                b.anim = kind;
+                if (b.motion != null) { b.motion.animName = ""; }
+            } else {
+                b.anim = 0;
+                b.EnsureMotion().animName = tk;
+            }
         }
     }
     static int BlurArg(StyleBox b, string val) {

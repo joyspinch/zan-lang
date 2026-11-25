@@ -1,0 +1,189 @@
+using System;
+using System.Collections.Generic;
+namespace Gui.Animation;
+// 复合动画编排器：支持 Sequence（顺序）、Parallel（并行）、Stagger（交错延迟）与递归嵌套。
+public class AnimGroup {
+    public const int ModeSequence = 0;
+    public const int ModeParallel = 1;
+    public const int ModeStagger = 2;
+    public int mode;
+    public int staggerMs;
+    public int delayMs;
+    public int delayRemainingMs;
+    public int repeatCount;
+    public int completedRepeats;
+    public bool active;
+    public bool paused;
+    public bool finished;
+    public TweenCallback completeAction;
+    List<AnimTrackItem> items = new List<AnimTrackItem>();
+    int cursor;
+    int groupElapsedMs;
+    int playback;
+    public AnimGroup(int mode, int staggerMs) {
+        this.mode = mode;
+        this.staggerMs = staggerMs > 0 ? staggerMs : 0;
+        this.delayMs = 0;
+        this.delayRemainingMs = 0;
+        this.repeatCount = 0;
+        this.completedRepeats = 0;
+        this.active = false;
+        this.paused = false;
+        this.finished = false;
+        this.cursor = 0;
+        this.groupElapsedMs = 0;
+    }
+    public static AnimGroup Sequence() { return new AnimGroup(ModeSequence, 0); }
+    public static AnimGroup Parallel() { return new AnimGroup(ModeParallel, 0); }
+    public static AnimGroup Stagger(int stepMs) { return new AnimGroup(ModeStagger, stepMs); }
+    public AnimGroup Add(Tween t) {
+        if (t == null) { return this; }
+        AnimTrackItem item = new AnimTrackItem();
+        item.tween = t;
+        item.offsetMs = this.mode == ModeStagger ? this.items.Count * this.staggerMs : 0;
+        this.items.Add(item);
+        return this;
+    }
+    public AnimGroup AddSpring(SpringAnim s) {
+        if (s == null) { return this; }
+        AnimTrackItem item = new AnimTrackItem();
+        item.spring = s;
+        item.offsetMs = this.mode == ModeStagger ? this.items.Count * this.staggerMs : 0;
+        this.items.Add(item);
+        return this;
+    }
+    public AnimGroup AddGroup(AnimGroup g) {
+        if (g == null || g == this) { return this; }
+        AnimTrackItem item = new AnimTrackItem();
+        item.group = g;
+        item.offsetMs = this.mode == ModeStagger ? this.items.Count * this.staggerMs : 0;
+        this.items.Add(item);
+        return this;
+    }
+    public AnimGroup WithDelay(int ms) {
+        this.delayMs = ms > 0 ? ms : 0;
+        return this;
+    }
+    public AnimGroup WithRepeat(int count) {
+        this.repeatCount = count;
+        return this;
+    }
+    public void OnComplete(TweenCallback onComplete) { this.completeAction = onComplete; }
+    void StartIteration() {
+        this.cursor = 0;
+        this.groupElapsedMs = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) { this.items[i].Reset(); }
+        if (this.items.Count == 0) {
+            this.finished = true;
+            this.active = false;
+            return;
+        }
+        if (this.mode == ModeSequence) {
+            this.items[0].Start();
+        } else {
+            for (int i = 0; i < this.items.Count; i = i + 1) {
+                if (this.items[i].offsetMs == 0) { this.items[i].Start(); }
+            }
+        }
+    }
+    public void Play() {
+        this.playback = this.playback + 1;
+        this.active = true;
+        this.paused = false;
+        this.finished = false;
+        this.completedRepeats = 0;
+        this.delayRemainingMs = this.delayMs;
+        if (this.delayRemainingMs == 0) { this.StartIteration(); }
+    }
+    public void Pause() {
+        if (!this.active || this.finished) { return; }
+        this.active = false;
+        this.paused = true;
+        for (int i = 0; i < this.items.Count; i = i + 1) { this.items[i].Pause(); }
+    }
+    public void Resume() {
+        if (!this.paused || this.finished) { return; }
+        this.paused = false;
+        this.active = true;
+        for (int i = 0; i < this.items.Count; i = i + 1) { this.items[i].Resume(); }
+    }
+    public void Stop() {
+        this.playback = this.playback + 1;
+        this.active = false;
+        this.paused = false;
+        this.finished = false;
+        this.delayRemainingMs = 0;
+        this.completedRepeats = 0;
+        this.cursor = 0;
+        this.groupElapsedMs = 0;
+        for (int i = 0; i < this.items.Count; i = i + 1) { this.items[i].Reset(); }
+    }
+    public bool Step(int deltaMs) {
+        if (!this.active || this.finished || deltaMs <= 0) { return false; }
+        int rem = deltaMs;
+        if (this.delayRemainingMs > 0) {
+            if (rem < this.delayRemainingMs) {
+                this.delayRemainingMs = this.delayRemainingMs - rem;
+                return true;
+            }
+            rem = rem - this.delayRemainingMs;
+            this.delayRemainingMs = 0;
+            this.StartIteration();
+            if (this.finished || rem == 0) { return this.active && !this.finished; }
+        }
+        bool iterationDone = false;
+        if (this.mode == ModeSequence) {
+            if (this.cursor < this.items.Count) {
+                AnimTrackItem cur = this.items[this.cursor];
+                if (!cur.started) { cur.Start(); }
+                if (!cur.Step(rem)) {
+                    this.cursor = this.cursor + 1;
+                    if (this.cursor < this.items.Count) {
+                        this.items[this.cursor].Start();
+                    } else {
+                        iterationDone = true;
+                    }
+                }
+            } else {
+                iterationDone = true;
+            }
+        } else {
+            int prevElapsed = this.groupElapsedMs;
+            this.groupElapsedMs = this.groupElapsedMs + rem;
+            bool anyRunning = false;
+            for (int i = 0; i < this.items.Count; i = i + 1) {
+                AnimTrackItem it = this.items[i];
+                if (it.done) { continue; }
+                if (!it.started) {
+                    if (this.groupElapsedMs >= it.offsetMs) {
+                        it.Start();
+                        int slice = this.groupElapsedMs - it.offsetMs;
+                        if (slice > 0) {
+                            if (it.Step(slice)) { anyRunning = true; }
+                        } else {
+                            anyRunning = true;
+                        }
+                    } else {
+                        anyRunning = true;
+                    }
+                } else {
+                    if (it.Step(rem)) { anyRunning = true; }
+                }
+            }
+            if (!anyRunning) { iterationDone = true; }
+        }
+        if (iterationDone) {
+            if (this.repeatCount < 0 || this.completedRepeats < this.repeatCount) {
+                this.completedRepeats = this.completedRepeats + 1;
+                this.StartIteration();
+            } else {
+                this.finished = true;
+                this.active = false;
+                this.paused = false;
+                int run = this.playback;
+                if (this.playback == run && this.completeAction != null) { this.completeAction(); }
+            }
+        }
+        return this.active && !this.finished;
+    }
+}

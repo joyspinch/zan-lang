@@ -1,14 +1,137 @@
 using System;
 using Gui;
+using Gui.Backend;
+using Gui.Core;
 namespace Gui;
-public class ScrollState {
+public class ScrollState : AppLoopOwner, AppLoopParticipant, AppLoopStopped {
     int dragAxis;
     int dragMouse0;
     int dragOffset0;
     int dragMax0;
     int dragTravel0;
     int barW;
-    ScrollState() { barW = 4; }
+    internal SpringState smoothX;
+    internal SpringState smoothY;
+    internal int smoothTargetX;
+    internal int smoothTargetY;
+    internal FlingState flingX;
+    internal FlingState flingY;
+    internal float flingPosX;
+    internal float flingPosY;
+    weak Control animHost;
+    weak App animApp;
+    weak AppLoopRegistration animReg;
+    FrameCadence animCadence;
+    int animLastMs;
+    int animNextMs;
+    ScrollState() {
+        barW = 4;
+        animNextMs = 0 - 1;
+    }
+    internal bool HasMotion() {
+        return smoothX != null || smoothY != null
+            || (flingX != null && flingX.velocity != 0.0f)
+            || (flingY != null && flingY.velocity != 0.0f);
+    }
+    internal void AttachMotion(Control host) {
+        if (host == null) { return; }
+        animHost = host;
+        App app = host.App;
+        if (app == null || !app.isRunning) { return; }
+        if (animApp != app || animReg == null) {
+            this.DetachLoop();
+            animApp = app;
+            if (animCadence == null) { animCadence = new FrameCadence(); }
+            animCadence.Reset();
+            animCadence.SetRate(app.RefreshRate());
+            int now = Window.GetTickMs();
+            animLastMs = now;
+            long nowUs = (long)now * 1000;
+            animCadence.Begin(nowUs);
+            animNextMs = now + animCadence.WaitMilliseconds(nowUs);
+            animReg = app.RegisterLoopParticipant(this, this);
+        }
+        app.RequestRedraw();
+    }
+    void DetachLoop() {
+        if (animReg != null) { animReg.Invalidate(); }
+        animReg = null;
+        animApp = null;
+        animNextMs = 0 - 1;
+    }
+    internal void StopMotion() {
+        smoothX = null;
+        smoothY = null;
+        flingX = null;
+        flingY = null;
+        this.DetachLoop();
+    }
+    public void Stopped(App app) {
+        if (app == animApp) { this.StopMotion(); }
+    }
+    public int NextDeadline() { return animNextMs; }
+    public void Tick(App app, int now) {
+        if (app != animApp || animNextMs < 0) { return; }
+        Control c = animHost;
+        if (c == null || !this.HasMotion()) {
+            this.StopMotion();
+            return;
+        }
+        int dt = now - animLastMs;
+        if (dt <= 0) { dt = 16; }
+        if (dt > 50) { dt = 50; }
+        animLastMs = now;
+        Rect view = c.ScrollViewport();
+        int nextX = c.scrollX;
+        int nextY = c.scrollY;
+        if (smoothX != null) {
+            bool done = ScrollPhysics.StepSpringState(smoothX, dt);
+            int curX = smoothTargetX + (int)(smoothX.displacement + (smoothX.displacement >= 0.0f ? 0.5f : -0.5f));
+            nextX = this.Clamp(curX, c.scrollExtentX, view.width);
+            if (done) { nextX = this.Clamp(smoothTargetX, c.scrollExtentX, view.width); smoothX = null; }
+        } else if (flingX != null && flingX.velocity != 0.0f) {
+            float dx = ScrollPhysics.StepFlingState(flingX, dt);
+            flingPosX = flingPosX + dx;
+            int clampedX = this.Clamp((int)(flingPosX + 0.5f), c.scrollExtentX, view.width);
+            int maxX = this.Clamp(c.scrollExtentX, c.scrollExtentX, view.width);
+            if ((float)clampedX != flingPosX && (clampedX == 0 || clampedX == maxX)) {
+                flingX.velocity = 0.0f;
+                flingPosX = (float)clampedX;
+            }
+            nextX = clampedX;
+            if (flingX.velocity == 0.0f) { flingX = null; }
+        }
+        if (smoothY != null) {
+            bool done = ScrollPhysics.StepSpringState(smoothY, dt);
+            int curY = smoothTargetY + (int)(smoothY.displacement + (smoothY.displacement >= 0.0f ? 0.5f : -0.5f));
+            nextY = this.Clamp(curY, c.scrollExtent, view.height);
+            if (done) { nextY = this.Clamp(smoothTargetY, c.scrollExtent, view.height); smoothY = null; }
+        } else if (flingY != null && flingY.velocity != 0.0f) {
+            float dy = ScrollPhysics.StepFlingState(flingY, dt);
+            flingPosY = flingPosY + dy;
+            int clampedY = this.Clamp((int)(flingPosY + 0.5f), c.scrollExtent, view.height);
+            int maxY = this.Clamp(c.scrollExtent, c.scrollExtent, view.height);
+            if ((float)clampedY != flingPosY && (clampedY == 0 || clampedY == maxY)) {
+                flingY.velocity = 0.0f;
+                flingPosY = (float)clampedY;
+            }
+            nextY = clampedY;
+            if (flingY.velocity == 0.0f) { flingY = null; }
+        }
+        if (nextX != c.scrollX || nextY != c.scrollY) {
+            c.ScrollDamage(app);
+            c.CommitScrollOffset(nextX, nextY);
+        }
+        if (!this.HasMotion()) {
+            this.DetachLoop();
+            return;
+        }
+        animCadence.SetRate(app.RefreshRate());
+        long nowUs = (long)now * 1000;
+        animCadence.Begin(nowUs);
+        animNextMs = now + animCadence.WaitMilliseconds(nowUs);
+        app.RequestRedraw();
+    }
     bool WantsBar(int extent, int client, int mode) { return mode == 3 || (mode == 2 && extent > client); }
     int Clamp(int offset, int extent, int client) {
         int maximum = extent - client;
