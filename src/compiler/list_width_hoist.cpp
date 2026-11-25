@@ -113,12 +113,16 @@ const llvm::Value *strip(const llvm::Value *v, const llvm::DataLayout &dl, int64
     return base;
 }
 
-/* Match the tag-check shape around a repack call. */
+/* Match the tag-check shape around a repack call. The repack must open the
+ * block taken when the tag differs; what follows it there does not matter.
+ * Jump threading often merges that block with the code after the check
+ * (foreach's collection-modified test and the element load), and once the
+ * check is hoisted the block is simply unreachable: with the tag equal to C
+ * the in-loop branch always took %ok anyway. */
 bool match_check(llvm::CallBase *call, const llvm::DataLayout &dl, Check &out) {
     if (call->arg_size() < 1) return false;
     llvm::BasicBlock *fix = call->getParent();
-    llvm::Instruction *fix_br = fix->getTerminator();
-    if (!fix_br || !is_br(fix_br, 1)) return false;
+    if (&*fix->getFirstNonPHIOrDbg() != call) return false;
     llvm::BasicBlock *x = fix->getSinglePredecessor();
     if (!x) return false;
     llvm::Instruction *br = x->getTerminator();
@@ -131,7 +135,7 @@ bool match_check(llvm::CallBase *call, const llvm::DataLayout &dl, Check &out) {
     /* eq: true → ok, false → fix; ne: the other way round */
     bool eq = cmp->getPredicate() == llvm::ICmpInst::ICMP_EQ;
     llvm::BasicBlock *ok = br->getSuccessor(eq ? 0 : 1);
-    if (br->getSuccessor(eq ? 1 : 0) != fix || fix_br->getSuccessor(0) != ok) return false;
+    if (br->getSuccessor(eq ? 1 : 0) != fix || ok == fix) return false;
     if (call->arg_size() >= 2) {
         auto *w = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
         if (!w || w->getZExtValue() != cst->getZExtValue()) return false;
@@ -184,6 +188,23 @@ bool invariant_operand(llvm::Loop *loop, llvm::Value *v) {
     return loop->makeLoopInvariant(v, changed);
 }
 
+/* Does `ph` (or a block on its single-predecessor chain) load from the
+ * list that check `c` repacks? */
+bool list_read_before(llvm::BasicBlock *ph, const Check &c, const llvm::DataLayout &dl) {
+    int64_t off = 0;
+    const llvm::Value *list = strip(c.repack->getArgOperand(0), dl, off);
+    llvm::BasicBlock *b = ph;
+    for (int depth = 0; b && depth < 4; depth++, b = b->getSinglePredecessor()) {
+        for (llvm::Instruction &inst : *b) {
+            auto *ld = llvm::dyn_cast<llvm::LoadInst>(&inst);
+            if (!ld || ld->isVolatile()) continue;
+            int64_t o = 0;
+            if (strip(ld->getPointerOperand(), dl, o) == list) return true;
+        }
+    }
+    return false;
+}
+
 bool hoist_one(llvm::Function &fn, const llvm::DataLayout &dl) {
     llvm::SmallVector<llvm::CallBase *, 8> calls;
     for (llvm::BasicBlock &bb : fn)
@@ -215,7 +236,12 @@ bool hoist_one(llvm::Function &fn, const llvm::DataLayout &dl) {
             if (live_exit) dominated &= dt.dominates(c.x, b);
         }
         for (llvm::BasicBlock *b : latches) dominated &= dt.dominates(c.x, b);
-        if (!dominated) continue;
+        /* An unrotated loop (foreach: the header tests "any left?" before the
+         * body) need not run the check on a zero-trip entry. Hoisting is still
+         * sound when the list is already dereferenced on the way into the
+         * loop (foreach loads Count from it in the preheader): lp is valid
+         * there, and repacking early only changes the slot width. */
+        if (!dominated && !(ph && list_read_before(ph, c, dl))) continue;
         if (!loop_keeps_width(loop, c.want, dl)) continue;
         if (!ph) ph = llvm::InsertPreheaderForLoop(loop, &dt, &li, nullptr, false);
         if (!ph) continue;

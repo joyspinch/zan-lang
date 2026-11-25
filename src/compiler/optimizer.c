@@ -1930,8 +1930,12 @@ bool zan_opt_plan_finish(zan_irgen_t *g, zan_opt_level_t level) {
 }
 
 /* 外提后清掉死 repack 块、把循环里重读的 Count/数据指针提出去。 */
+/* loop-rotate: a foreach loop whose check was lifted from an unrotated
+ * header-exits-first shape must be rotated before the second pipeline half,
+ * or the vectorizer skips it (foreach over List<int> 0.17 s -> vectorised). */
 #define LIST_HOIST_CLEANUP                                                                         \
-    "function(simplifycfg,instcombine<no-verify-fixpoint>,loop-mssa(licm),gvn,simplifycfg)"
+    "function(simplifycfg,instcombine<no-verify-fixpoint>,loop(loop-rotate),loop-mssa(licm),gvn,"  \
+    "simplifycfg)"
 
 /* ZAN_NO_LIST_HOIST=1 关断 List 槽宽检查外提（红绿对照用）。 */
 static bool list_hoist_wanted(zan_opt_level_t level) {
@@ -1979,9 +1983,10 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
         /* List 槽宽检查提出循环（见 zan_opt_run_passes_on_module 同名步骤）。
          * 放在两半之间：后半段只有 LICM 没有 GVN，循环里重读的 Count/数据指针
          * 要先在这里外提，后半段的向量化才看得到干净循环。 */
-        if (status == ZAN_OK && list_hoist_wanted(level) &&
-            zan_opt_hoist_list_width_checks(g->mod) > 0)
-            status = run_checked_passes(g->mod, tm, LIST_HOIST_CLEANUP);
+        if (status == ZAN_OK && list_hoist_wanted(level)) {
+            if (zan_opt_hoist_list_width_checks(g->mod) > 0)
+                status = run_checked_passes(g->mod, tm, LIST_HOIST_CLEANUP);
+        }
         /* Drop bodies the inliner left dead now, so extern-library pruning
          * between here and object emission sees the final call graph. */
         if (status == ZAN_OK) status = run_checked_passes(g->mod, NULL, "globaldce");
