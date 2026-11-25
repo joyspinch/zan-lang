@@ -4,13 +4,16 @@
  * 每个匹配一行 JSON（JSON Lines，末行 summary，与 --diag=json 同一约定）：
  *   allocates     方法体里直接的分配：new 对象/数组/集合初始化、lambda 闭包记录
  *   captures      方法体里每个 lambda 用到的 this 与外层局部量/形参
- *   throws        直接 `throw new X` + 经已解析调用可达的方法里的 throw（上界：
- *                 不扣除 catch；每个异常类型给一条示例调用链）
+ *   throws        direct：方法体里没被本方法 catch 住的 `throw new X`；escapes：可能
+ *                 逃出本方法的异常类型（经已解析调用传递，扣除沿途 try 的 catch——
+ *                 catch 基类型也算、裸 catch 与 catch (Exception) 全收、catch 体里
+ *                 rethrow 的不算），每种给一条真能逃出来的示例调用链
  *   capabilities  可达调用里用到的能力（§2.2 S7 口径）：Net、File、Process、
  *                 Registry、Clipboard、Native（标准库之外的 extern/DllImport），
  *                 每项给一条证据调用链
  *   calls         直接调用的方法；callers：全程序里解析到它的调用点
- * 调用图来自 checker 写在调用节点上的 call.resolved_sym；`new T(...)` 连到 T 的
+ * 调用图来自 checker 写在调用节点上的 call.resolved_sym；每个调用点与 throw 点记下
+ * 所处的 catch 上下文（只有 try 体受保护；lambda 体不受外层 try 保护）。`new T(...)` 连到 T 的
  * 同元数构造器。虚调用按静态目标连边（不展开覆盖），委托调用不连边（目标在运行期
  * 才定），lambda 里的调用算宿主方法的。各列表最多 64 项，callers 截断时
  * callers_truncated 为 true。
@@ -28,11 +31,35 @@
 
 #define Q_MAX_LIST 64
 
+/* 调用点 / throw 点所处的 catch 上下文：一条 catch 子句 + 外层上下文（链表，
+ * 下标进 q_prog_t.filters；-1 = 不在任何 try 体内） */
+typedef struct {
+    int             parent;
+    zan_ast_node_t *catch_type;   /* NULL = 裸 catch */
+    bool            all;          /* 裸 catch 或 catch (Exception) */
+} q_filter_t;
+
+typedef struct {
+    int             callee;
+    int             filt;
+    bool            deferred;     /* 在 lambda 体里：委托被调用时才执行 */
+} q_site_t;
+
+typedef struct {
+    zan_ast_node_t *node;         /* AST_THROW_STMT */
+    int             filt;
+    bool            deferred;
+} q_throw_t;
+
 typedef struct {
     zan_ast_node_t *decl;   /* AST_METHOD_DECL / AST_CONSTRUCTOR_DECL */
     zan_ast_node_t *owner;  /* 类型声明 */
     int            *callees;
     int             callee_count, callee_cap;
+    q_site_t       *sites;
+    int             site_count, site_cap;
+    q_throw_t      *throws;
+    int             throw_count, throw_cap;
 } q_method_t;
 
 typedef struct {
@@ -44,6 +71,8 @@ typedef struct {
     size_t          mask;
     FILE           *out;
     const zan_diag_t *diag;
+    q_filter_t     *filters;
+    int             filter_count, filter_cap;
 } q_prog_t;
 
 /* ---------- JSON ---------- */
@@ -169,9 +198,154 @@ static void q_visit_calls(q_prog_t *P, zan_ast_node_t *n, q_site_fn fn, void *ud
     for (int i = 0; i < cc; i++) q_visit_calls(P, zan_ast_child_at(n, i), fn, ud);
 }
 
-static void q_edge_cb(q_prog_t *P, int callee, zan_ast_node_t *site, void *ud) {
-    (void)site;
-    q_add_edge(&P->m[*(int *)ud], callee);
+/* ---------- catch 上下文 ---------- */
+
+static int q_filter_push(q_prog_t *P, int parent, zan_ast_node_t *catch_type) {
+    if (P->filter_count == P->filter_cap) {
+        int ncap = P->filter_cap ? P->filter_cap * 2 : 256;
+        q_filter_t *nf = (q_filter_t *)realloc(P->filters, (size_t)ncap * sizeof(*nf));
+        if (!nf) return parent;
+        P->filters = nf;
+        P->filter_cap = ncap;
+    }
+    q_filter_t *f = &P->filters[P->filter_count];
+    f->parent = parent;
+    f->catch_type = catch_type;
+    f->all = !catch_type ||
+             (catch_type->kind == AST_TYPE_REF && catch_type->type_ref.name.len == 9 &&
+              memcmp(catch_type->type_ref.name.str, "Exception", 9) == 0);
+    return P->filter_count++;
+}
+
+/* catch 体里 `throw;` 或把捕获变量原样抛出：异常照样逃出，这条 catch 不算收住 */
+static bool q_catch_rethrows(zan_ast_node_t *n, zan_istr_t var) {
+    if (!n || n->kind == AST_LAMBDA) return false;
+    if (n->kind == AST_THROW_STMT) {
+        zan_ast_node_t *v = n->throw_stmt.value;
+        if (!v) return true;
+        if (v->kind == AST_IDENTIFIER && var.len && v->ident.name.len == var.len &&
+            memcmp(v->ident.name.str, var.str, var.len) == 0)
+            return true;
+    }
+    int cc = zan_ast_child_count(n);
+    for (int i = 0; i < cc; i++)
+        if (q_catch_rethrows(zan_ast_child_at(n, i), var)) return true;
+    return false;
+}
+
+static void q_add_site(q_method_t *m, int callee, int filt, bool deferred) {
+    if (m->site_count == m->site_cap) {
+        int ncap = m->site_cap ? m->site_cap * 2 : 8;
+        q_site_t *ns = (q_site_t *)realloc(m->sites, (size_t)ncap * sizeof(*ns));
+        if (!ns) return;
+        m->sites = ns;
+        m->site_cap = ncap;
+    }
+    m->sites[m->site_count].callee = callee;
+    m->sites[m->site_count].filt = filt;
+    m->sites[m->site_count].deferred = deferred;
+    m->site_count++;
+    q_add_edge(m, callee);
+}
+
+static void q_add_throw(q_method_t *m, zan_ast_node_t *node, int filt, bool deferred) {
+    if (m->throw_count == m->throw_cap) {
+        int ncap = m->throw_cap ? m->throw_cap * 2 : 4;
+        q_throw_t *nt = (q_throw_t *)realloc(m->throws, (size_t)ncap * sizeof(*nt));
+        if (!nt) return;
+        m->throws = nt;
+        m->throw_cap = ncap;
+    }
+    m->throws[m->throw_count].node = node;
+    m->throws[m->throw_count].filt = filt;
+    m->throws[m->throw_count].deferred = deferred;
+    m->throw_count++;
+}
+
+/* 方法体扫描：调用点与 throw 点连同所处的 catch 上下文记下来。只有 try 体受
+ * 本 try 的 catch 保护；catch 体与 finally 在外层上下文里；lambda 体是委托被调用
+ * 时才执行的代码（deferred）：不算本方法会抛的异常，但算本方法代码用到的能力。 */
+static void q_scan(q_prog_t *P, int mi, zan_ast_node_t *n, int filt, bool deferred) {
+    if (!n) return;
+    switch (n->kind) {
+    case AST_TRY_STMT: {
+        int f = filt;
+        for (int i = 0; i < n->try_stmt.catches.count; i++) {
+            zan_ast_node_t *c = n->try_stmt.catches.items[i];
+            if (!c || q_catch_rethrows(c->catch_clause.body, c->catch_clause.var_name)) continue;
+            f = q_filter_push(P, f, c->catch_clause.type);
+        }
+        q_scan(P, mi, n->try_stmt.try_body, f, deferred);
+        for (int i = 0; i < n->try_stmt.catches.count; i++) {
+            zan_ast_node_t *c = n->try_stmt.catches.items[i];
+            if (c) q_scan(P, mi, c->catch_clause.body, filt, deferred);
+        }
+        q_scan(P, mi, n->try_stmt.finally_body, filt, deferred);
+        return;
+    }
+    case AST_LAMBDA:
+        q_scan(P, mi, n->lambda.body, -1, true);
+        return;
+    case AST_THROW_STMT:
+        q_add_throw(&P->m[mi], n, filt, deferred);
+        break;
+    case AST_CALL:
+        if (n->call.resolved_sym && n->call.resolved_sym->decl) {
+            int to = q_find(P, n->call.resolved_sym->decl);
+            if (to >= 0) q_add_site(&P->m[mi], to, filt, deferred);
+        }
+        break;
+    case AST_NEW_EXPR:
+        if (!n->new_expr.is_array) {
+            zan_ast_node_t *td = q_type_decl_of_ref(P, n->new_expr.type);
+            for (int j = 0; td && j < td->type_decl.members.count; j++) {
+                zan_ast_node_t *c = td->type_decl.members.items[j];
+                if (c && c->kind == AST_CONSTRUCTOR_DECL &&
+                    c->method_decl.params.count == n->new_expr.args.count) {
+                    int to = q_find(P, c);
+                    if (to >= 0) q_add_site(&P->m[mi], to, filt, deferred);
+                }
+            }
+        }
+        break;
+    default:
+        break;
+    }
+    int cc = zan_ast_child_count(n);
+    for (int i = 0; i < cc; i++) q_scan(P, mi, zan_ast_child_at(n, i), filt, deferred);
+}
+
+/* 异常类型名 tname 是否是（或派生自）catch 类型 */
+static bool q_is_subtype(const q_prog_t *P, const char *tname, zan_istr_t cname) {
+    size_t tl = strlen(tname);
+    if (tl == cname.len && memcmp(tname, cname.str, tl) == 0) return true;
+    zan_istr_t key = { (char *)tname, (uint32_t)tl };
+    zan_symbol_t *s = zan_binder_lookup(P->binder, key);
+    for (int guard = 0; s && s->type && guard < 32; guard++) {
+        zan_type_t *b = s->type->base_type;
+        if (!b || !b->sym) break;
+        s = b->sym;
+        if (s->name.len == cname.len && memcmp(s->name.str, cname.str, cname.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool q_caught(const q_prog_t *P, const char *tname, int filt) {
+    for (int f = filt; f >= 0; f = P->filters[f].parent) {
+        const q_filter_t *F = &P->filters[f];
+        if (F->all) return true;
+        if (F->catch_type && F->catch_type->kind == AST_TYPE_REF &&
+            q_is_subtype(P, tname, F->catch_type->type_ref.name))
+            return true;
+    }
+    return false;
+}
+
+static bool q_filter_all(const q_prog_t *P, int filt) {
+    for (int f = filt; f >= 0; f = P->filters[f].parent)
+        if (P->filters[f].all) return true;
+    return false;
 }
 
 /* ---------- 标签与能力 ---------- */
@@ -267,20 +441,6 @@ static void q_emit_allocs(FILE *f, zan_ast_node_t *n, q_list_t *l) {
     for (int i = 0; i < cc; i++) q_emit_allocs(f, zan_ast_child_at(n, i), l);
 }
 
-static void q_emit_direct_throws(FILE *f, zan_ast_node_t *n, q_list_t *l) {
-    if (!n || l->n >= Q_MAX_LIST) return;
-    if (n->kind == AST_THROW_STMT) {
-        char t[256];
-        q_throw_name(n, t, sizeof(t));
-        q_item_sep(l);
-        fprintf(f, "{\"type\":");
-        q_json_cstr(f, t);
-        fprintf(f, ",\"line\":%u}", n->loc.line);
-    }
-    int cc = zan_ast_child_count(n);
-    for (int i = 0; i < cc; i++) q_emit_direct_throws(f, zan_ast_child_at(n, i), l);
-}
-
 /* 外层名字：形参 + 方法体里声明的局部量（不分位置，近似） */
 typedef struct {
     zan_istr_t names[256];
@@ -371,6 +531,252 @@ static void q_emit_captures(FILE *f, zan_ast_node_t *n, const q_names_t *outer,
     for (int i = 0; i < cc; i++) q_emit_captures(f, zan_ast_child_at(n, i), outer, owner, l);
 }
 
+/* ===================================================================
+ * 效果表（--summary 的效果列与 --query 的 escapes 共用）
+ *
+ * 逐方法 BFS 对几千个公开成员太贵；改为全程序一遍：Tarjan 求调用图强连通
+ * 分量定出"被调先完成"的顺序，集合按方法记（同一分量里的方法各有各的 catch，
+ * 不能合并）。方法的异常集 = 自身没被本方法 catch 住的 throw ∪ 各调用点上被调
+ * 方法的异常集减去该调用点所处 catch 上下文收住的类型；分量完成时在分量内迭代
+ * 到不动点。lambda 体里的调用与 throw（deferred）不算本方法会抛的，但算能力。
+ * 每方法最多记 FX_MAX 个类型，超出记 more（只有裸 catch / catch (Exception)
+ * 拦得住）。rethrow 不计类型；虚调用按静态目标、委托不连边——所以仍是上界。
+ * =================================================================== */
+
+#define FX_MAX 32
+#define FX_SHOW 6
+
+static bool q_prog_build(q_prog_t *P, zan_ast_node_t *unit, zan_binder_t *binder);
+static void q_prog_free(q_prog_t *P);
+
+struct zan_effects {
+    q_prog_t   P;
+    char     **names;      /* 异常类型名驻留表 */
+    int        name_count, name_cap;
+    int       *comp;       /* 方法 -> 分量（只用于定顺序） */
+    int        comp_count;
+    int       *throws;     /* 方法数 * FX_MAX */
+    uint8_t   *nthrows;    /* 以下均按方法下标 */
+    uint8_t   *more;
+    uint32_t  *caps;
+    /* Tarjan */
+    int       *index, *low, *stack;
+    uint8_t   *on_stack;
+    int        sp, next;
+    int       *direct_first, *direct_ids; /* 方法 -> 未被本方法收住的 throw 类型 id */
+};
+
+static int fx_intern(zan_effects_t *E, const char *name) {
+    for (int i = 0; i < E->name_count; i++) if (strcmp(E->names[i], name) == 0) return i;
+    if (E->name_count == E->name_cap) {
+        int ncap = E->name_cap ? E->name_cap * 2 : 64;
+        char **nn = (char **)realloc(E->names, (size_t)ncap * sizeof(char *));
+        if (!nn) return -1;
+        E->names = nn;
+        E->name_cap = ncap;
+    }
+    size_t n = strlen(name);
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return -1;
+    memcpy(copy, name, n + 1);
+    E->names[E->name_count] = copy;
+    return E->name_count++;
+}
+
+static bool fx_has(const zan_effects_t *E, int c, int id) {
+    const int *set = &E->throws[(size_t)c * FX_MAX];
+    for (int i = 0; i < E->nthrows[c]; i++) if (set[i] == id) return true;
+    return false;
+}
+
+/* 返回 true = 集合变了 */
+static bool fx_add(zan_effects_t *E, int c, int id) {
+    if (id < 0 || fx_has(E, c, id)) return false;
+    if (E->nthrows[c] < FX_MAX) {
+        E->throws[(size_t)c * FX_MAX + E->nthrows[c]++] = id;
+        return true;
+    }
+    if (!E->more[c]) { E->more[c] = 1; return true; }
+    return false;
+}
+
+/* 被调方法 wc 的异常集经调用点（catch 上下文 filt）流进方法 c */
+static bool fx_flow(zan_effects_t *E, int c, int wc, int filt) {
+    bool changed = false;
+    int n = E->nthrows[wc];
+    for (int i = 0; i < n; i++) {
+        int id = E->throws[(size_t)wc * FX_MAX + i];
+        if (!q_caught(&E->P, E->names[id], filt)) changed |= fx_add(E, c, id);
+    }
+    if (E->more[wc] && !E->more[c] && !q_filter_all(&E->P, filt)) {
+        E->more[c] = 1;
+        changed = true;
+    }
+    return changed;
+}
+
+static void fx_strongconnect(zan_effects_t *E, int v) {
+    q_prog_t *P = &E->P;
+    E->index[v] = E->low[v] = E->next++;
+    E->stack[E->sp++] = v;
+    E->on_stack[v] = 1;
+    for (int e = 0; e < P->m[v].callee_count; e++) {
+        int w = P->m[v].callees[e];
+        if (E->index[w] < 0) {
+            fx_strongconnect(E, w);
+            if (E->low[w] < E->low[v]) E->low[v] = E->low[w];
+        } else if (E->on_stack[w] && E->index[w] < E->low[v]) {
+            E->low[v] = E->index[w];
+        }
+    }
+    if (E->low[v] != E->index[v]) return;
+    int c = E->comp_count++;
+    int start = E->sp;
+    do { start--; } while (E->stack[start] != v);
+    for (int k = start; k < E->sp; k++) E->comp[E->stack[k]] = c;
+    /* 被调分量都已完成：先放各成员自身的直接效果，再沿调用点在分量内迭代到不动点 */
+    for (int k = start; k < E->sp; k++) {
+        int u = E->stack[k];
+        for (int j = E->direct_first[u]; j < E->direct_first[u + 1]; j++)
+            fx_add(E, u, E->direct_ids[j]);
+        int cap = q_capability(P, u);
+        if (cap >= 0) E->caps[u] |= 1u << cap;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (int k = start; k < E->sp; k++) {
+            int u = E->stack[k];
+            for (int e = 0; e < P->m[u].site_count; e++) {
+                const q_site_t *st = &P->m[u].sites[e];
+                if (!st->deferred) changed |= fx_flow(E, u, st->callee, st->filt);
+                uint32_t nc = E->caps[u] | E->caps[st->callee];
+                if (nc != E->caps[u]) { E->caps[u] = nc; changed = true; }
+            }
+        }
+    }
+    for (int k = start; k < E->sp; k++) E->on_stack[E->stack[k]] = 0;
+    E->sp = start;
+}
+
+zan_effects_t *zan_effects_build(zan_ast_node_t *unit, zan_binder_t *binder) {
+    zan_effects_t *E = (zan_effects_t *)calloc(1, sizeof(*E));
+    if (!E) return NULL;
+    if (!q_prog_build(&E->P, unit, binder)) { zan_effects_free(E); return NULL; }
+    int n = E->P.count;
+    size_t sz = (size_t)(n ? n : 1);
+    E->comp = (int *)malloc(sz * sizeof(int));
+    E->index = (int *)malloc(sz * sizeof(int));
+    E->low = (int *)malloc(sz * sizeof(int));
+    E->stack = (int *)malloc(sz * sizeof(int));
+    E->on_stack = (uint8_t *)calloc(sz, 1);
+    E->throws = (int *)calloc(sz * FX_MAX, sizeof(int));
+    E->nthrows = (uint8_t *)calloc(sz, 1);
+    E->more = (uint8_t *)calloc(sz, 1);
+    E->caps = (uint32_t *)calloc(sz, sizeof(uint32_t));
+    E->direct_first = (int *)calloc(sz + 1, sizeof(int));
+    if (!E->comp || !E->index || !E->low || !E->stack || !E->on_stack || !E->throws ||
+        !E->nthrows || !E->more || !E->caps || !E->direct_first) {
+        zan_effects_free(E);
+        return NULL;
+    }
+    int cap = 0, count = 0;
+    for (int i = 0; i < n; i++) {
+        E->direct_first[i] = count;
+        q_method_t *m = &E->P.m[i];
+        for (int t = 0; t < m->throw_count; t++) {
+            if (m->throws[t].deferred) continue;
+            zan_ast_node_t *v = m->throws[t].node->throw_stmt.value;
+            if (!v || v->kind != AST_NEW_EXPR) continue;   /* rethrow 不计类型 */
+            char tn[128];
+            q_throw_name(m->throws[t].node, tn, sizeof(tn));
+            if (q_caught(&E->P, tn, m->throws[t].filt)) continue;
+            int id = fx_intern(E, tn);
+            if (id < 0) continue;
+            if (count == cap) {
+                int ncap = cap ? cap * 2 : 256;
+                int *ni = (int *)realloc(E->direct_ids, (size_t)ncap * sizeof(int));
+                if (!ni) break;
+                E->direct_ids = ni;
+                cap = ncap;
+            }
+            E->direct_ids[count++] = id;
+        }
+        E->comp[i] = -1;
+        E->index[i] = -1;
+    }
+    E->direct_first[n] = count;
+    for (int v = 0; v < n; v++)
+        if (E->index[v] < 0) fx_strongconnect(E, v);
+    return E;
+}
+
+int zan_effects_describe(const zan_effects_t *E, const zan_ast_node_t *method_decl,
+                         char *buf, size_t cap) {
+    buf[0] = '\0';
+    if (!E || cap < 16) return 0;
+    int c = q_find(&E->P, method_decl);
+    if (c < 0) return 0;
+    size_t o = 0;
+    int n = E->nthrows[c];
+    if (n) {
+        o += (size_t)snprintf(buf + o, cap - o, "throws ");
+        for (int k = 0; k < n && k < FX_SHOW && o < cap - 32; k++)
+            o += (size_t)snprintf(buf + o, cap - o, "%s%s", k ? ", " : "",
+                                  E->names[E->throws[(size_t)c * FX_MAX + k]]);
+        if ((E->more[c] || n > FX_SHOW) && o < cap - 8)
+            o += (size_t)snprintf(buf + o, cap - o, ", ...");
+    }
+    if (E->caps[c]) {
+        o += (size_t)snprintf(buf + o, cap - o, "%suses ", o ? "; " : "");
+        int first = 1;
+        for (int k = 0; k < Q_CAP_COUNT && o < cap - 16; k++) {
+            if (!(E->caps[c] & (1u << k))) continue;
+            o += (size_t)snprintf(buf + o, cap - o, "%s%s", first ? "" : ", ", Q_CAPS[k]);
+            first = 0;
+        }
+    }
+    return (int)o;
+}
+
+void zan_effects_free(zan_effects_t *E) {
+    if (!E) return;
+    q_prog_free(&E->P);
+    for (int i = 0; i < E->name_count; i++) free(E->names[i]);
+    free(E->names);
+    free(E->comp); free(E->index); free(E->low); free(E->stack); free(E->on_stack);
+    free(E->throws); free(E->nthrows); free(E->more); free(E->caps);
+    free(E->direct_first); free(E->direct_ids);
+    free(E);
+}
+
+/* 方法 v 自身未收住的 throw 里有类型 id 吗 */
+static bool fx_direct_has(const zan_effects_t *E, int v, int id) {
+    for (int j = E->direct_first[v]; j < E->direct_first[v + 1]; j++)
+        if (E->direct_ids[j] == id) return true;
+    return false;
+}
+
+/* 类型 id 从 t 逃出来的一条示例链：只走不收住该类型的调用点，停在自己 throw 它的方法 */
+static int fx_example(const zan_effects_t *E, int t, int id, int *parent, int *queue) {
+    const q_prog_t *P = &E->P;
+    for (int i = 0; i < P->count; i++) parent[i] = -2;
+    int qh = 0, qt = 0;
+    parent[t] = -1;
+    queue[qt++] = t;
+    while (qh < qt) {
+        int u = queue[qh++];
+        if (fx_direct_has(E, u, id)) return u;
+        for (int e = 0; e < P->m[u].site_count; e++) {
+            int v = P->m[u].sites[e].callee;
+            if (parent[v] != -2 || P->m[u].sites[e].deferred) continue;
+            if (q_caught(P, E->names[id], P->m[u].sites[e].filt)) continue;
+            parent[v] = u;
+            queue[qt++] = v;
+        }
+    }
+    return -1;
+}
+
 /* ---------- 单个匹配的报告 ---------- */
 
 typedef struct {
@@ -396,7 +802,8 @@ static void q_caller_cb(q_prog_t *P, int callee, zan_ast_node_t *site, void *ud)
     fprintf(c->f, ",\"line\":%u}", site->loc.line);
 }
 
-static void q_report(q_prog_t *P, int t) {
+static void q_report(zan_effects_t *E, int t) {
+    q_prog_t *P = &E->P;
     FILE *f = P->out;
     q_method_t *M = &P->m[t];
     char lab[512];
@@ -445,48 +852,43 @@ static void q_report(q_prog_t *P, int t) {
         }
     }
 
+    /* throws：direct = 本方法没 catch 住的；escapes = 可能逃出本方法的类型（效果表），
+     * 每种一条只走"不收住它"的调用点的示例链 */
     l.n = 0;
     fprintf(f, ",\"throws\":{\"direct\":[");
-    q_emit_direct_throws(f, body, &l);
-    fprintf(f, "],\"reachable\":[");
-    /* 可达方法里的 throw：按异常类型去重，留第一条（最短）链 */
-    char seen[Q_MAX_LIST][128];
-    int nseen = 0;
-    for (int k = 1; k < qt && nseen < Q_MAX_LIST; k++) {
-        int v = queue[k];
-        zan_ast_node_t *vb = P->m[v].decl->method_decl.body;
-        /* 小栈遍历方法体找 throw */
-        zan_ast_node_t *stack[512];
-        int sp = 0;
-        if (vb) stack[sp++] = vb;
-        while (sp > 0 && nseen < Q_MAX_LIST) {
-            zan_ast_node_t *n = stack[--sp];
-            if (n->kind == AST_THROW_STMT) {
-                char tn[128];
-                q_throw_name(n, tn, sizeof(tn));
-                bool dup = false;
-                for (int s = 0; s < nseen; s++) if (strcmp(seen[s], tn) == 0) { dup = true; break; }
-                if (!dup) {
-                    snprintf(seen[nseen], sizeof(seen[0]), "%s", tn);
-                    char path[2048];
-                    q_path(P, parent, v, path, sizeof(path));
-                    if (nseen) fputc(',', f);
-                    fprintf(f, "{\"type\":");
-                    q_json_cstr(f, tn);
-                    fprintf(f, ",\"via\":");
-                    q_json_cstr(f, path);
-                    fputc('}', f);
-                    nseen++;
-                }
-            }
-            int cc = zan_ast_child_count(n);
-            for (int i = 0; i < cc && sp < 512; i++) {
-                zan_ast_node_t *ch = zan_ast_child_at(n, i);
-                if (ch) stack[sp++] = ch;
-            }
-        }
+    for (int k = 0; k < M->throw_count && l.n < Q_MAX_LIST; k++) {
+        zan_ast_node_t *tn = M->throws[k].node;
+        char name[128];
+        q_throw_name(tn, name, sizeof(name));
+        bool typed = tn->throw_stmt.value && tn->throw_stmt.value->kind == AST_NEW_EXPR;
+        if (M->throws[k].deferred) continue;
+        if (typed && q_caught(P, name, M->throws[k].filt)) continue;
+        q_item_sep(&l);
+        fprintf(f, "{\"type\":");
+        q_json_cstr(f, name);
+        fprintf(f, ",\"line\":%u}", tn->loc.line);
     }
-    fprintf(f, "],\"note\":\"upper bound: catch clauses are not subtracted\"}");
+    fprintf(f, "],\"escapes\":[");
+    int c = t;   /* 效果表按方法下标 */
+    int *par2 = (int *)malloc((size_t)P->count * sizeof(int));
+    int *q2 = (int *)malloc((size_t)P->count * sizeof(int));
+    for (int k = 0; c >= 0 && par2 && q2 && k < E->nthrows[c]; k++) {
+        int id = E->throws[(size_t)c * FX_MAX + k];
+        int end = fx_example(E, t, id, par2, q2);
+        char path[2048] = "";
+        if (end >= 0) q_path(P, par2, end, path, sizeof(path));
+        if (k) fputc(',', f);
+        fprintf(f, "{\"type\":");
+        q_json_cstr(f, E->names[id]);
+        fprintf(f, ",\"via\":");
+        q_json_cstr(f, path);
+        fputc('}', f);
+    }
+    free(par2);
+    free(q2);
+    fprintf(f, "],\"escapes_truncated\":%s,\"note\":\"upper bound: virtual overrides "
+               "and delegate targets are not followed\"}",
+            (c >= 0 && E->more[c]) ? "true" : "false");
 
     fprintf(f, ",\"capabilities\":[");
     int capn = 0;
@@ -541,12 +943,17 @@ static bool q_prog_build(q_prog_t *P, zan_ast_node_t *unit, zan_binder_t *binder
     }
     if (!q_build_map(P)) return false;
     for (int i = 0; i < P->count; i++)
-        q_visit_calls(P, P->m[i].decl->method_decl.body, q_edge_cb, &i);
+        q_scan(P, i, P->m[i].decl->method_decl.body, -1, false);
     return true;
 }
 
 static void q_prog_free(q_prog_t *P) {
-    for (int i = 0; i < P->count; i++) free(P->m[i].callees);
+    for (int i = 0; i < P->count; i++) {
+        free(P->m[i].callees);
+        free(P->m[i].sites);
+        free(P->m[i].throws);
+    }
+    free(P->filters);
     free(P->m);
     free(P->keys);
     free(P->vals);
@@ -554,12 +961,17 @@ static void q_prog_free(q_prog_t *P) {
 
 int zan_query_emit(zan_ast_node_t *unit, zan_binder_t *binder, const zan_diag_t *diag,
                    const char *query, FILE *out) {
-    q_prog_t P;
-    memset(&P, 0, sizeof(P));
-    P.out = out;
-    P.diag = diag;
     int matches = 0;
-    if (!q_prog_build(&P, unit, binder)) goto done;
+    zan_effects_t *E = zan_effects_build(unit, binder);
+    if (!E) {
+        fprintf(out, "{\"kind\":\"summary\",\"query\":");
+        q_json_cstr(out, query);
+        fprintf(out, ",\"matches\":0}\n");
+        return 1;
+    }
+    E->P.out = out;
+    E->P.diag = diag;
+    q_prog_t P = E->P;   /* 名字匹配用的只读视图（与 E->P 共享数组） */
 
     const char *dot = strrchr(query, '.');
     const char *mname = dot ? dot + 1 : query;
@@ -576,7 +988,7 @@ int zan_query_emit(zan_ast_node_t *unit, zan_binder_t *binder, const zan_diag_t 
     if (!dot) {
         for (int i = 0; i < P.count; i++) {
             if (!q_istr_eq(P.m[i].owner->type_decl.name, query, strlen(query))) continue;
-            q_report(&P, i);
+            q_report(E, i);
             matches++;
         }
         if (matches > 0) goto done;
@@ -590,201 +1002,13 @@ int zan_query_emit(zan_ast_node_t *unit, zan_binder_t *binder, const zan_diag_t 
              (mlen == 4 && memcmp(mname, "ctor", 4) == 0)))
             hit = true;
         if (!hit) continue;
-        q_report(&P, i);
+        q_report(E, i);
         matches++;
     }
 done:
     fprintf(out, "{\"kind\":\"summary\",\"query\":");
     q_json_cstr(out, query);
     fprintf(out, ",\"matches\":%d}\n", matches);
-    q_prog_free(&P);
+    zan_effects_free(E);
     return matches > 0 ? 0 : 1;
-}
-
-/* ===================================================================
- * 效果摘要（S4 --summary 的效果列）
- *
- * 逐方法 BFS 对几千个公开成员太贵；改为全程序一遍：Tarjan 求调用图强连通
- * 分量，分量按"被调先完成"的顺序产出，每个分量的效果 = 成员自身（直接 throw
- * 的异常类型、自身所属能力）∪ 已完成的被调分量的效果。异常类型每个分量最多记
- * FX_MAX 个，超出记 more。口径与 --query 相同：throw 是上界（不扣 catch），
- * rethrow 不计类型；能力见 q_capability。
- * =================================================================== */
-
-#define FX_MAX 6
-
-struct zan_effects {
-    q_prog_t   P;
-    char     **names;      /* 异常类型名驻留表 */
-    int        name_count, name_cap;
-    int       *comp;       /* 方法 -> 分量 */
-    int        comp_count;
-    int       *throws;     /* comp_count * FX_MAX */
-    uint8_t   *nthrows;
-    uint8_t   *more;
-    uint32_t  *caps;
-    /* Tarjan */
-    int       *index, *low, *stack;
-    uint8_t   *on_stack;
-    int        sp, next;
-    int       *direct_first, *direct_ids; /* 方法 -> 直接 throw 的类型 id 列表 */
-};
-
-static int fx_intern(zan_effects_t *E, const char *name) {
-    for (int i = 0; i < E->name_count; i++) if (strcmp(E->names[i], name) == 0) return i;
-    if (E->name_count == E->name_cap) {
-        int ncap = E->name_cap ? E->name_cap * 2 : 64;
-        char **nn = (char **)realloc(E->names, (size_t)ncap * sizeof(char *));
-        if (!nn) return -1;
-        E->names = nn;
-        E->name_cap = ncap;
-    }
-    size_t n = strlen(name);
-    char *copy = (char *)malloc(n + 1);
-    if (!copy) return -1;
-    memcpy(copy, name, n + 1);
-    E->names[E->name_count] = copy;
-    return E->name_count++;
-}
-
-static void fx_add(zan_effects_t *E, int c, int id) {
-    if (id < 0) return;
-    int *set = &E->throws[(size_t)c * FX_MAX];
-    for (int i = 0; i < E->nthrows[c]; i++) if (set[i] == id) return;
-    if (E->nthrows[c] < FX_MAX) set[E->nthrows[c]++] = id;
-    else E->more[c] = 1;
-}
-
-static void fx_direct_scan(zan_effects_t *E, zan_ast_node_t *n, int **ids, int *count, int *cap) {
-    if (!n) return;
-    if (n->kind == AST_THROW_STMT && n->throw_stmt.value &&
-        n->throw_stmt.value->kind == AST_NEW_EXPR) {
-        char tn[128];
-        q_throw_name(n, tn, sizeof(tn));
-        int id = fx_intern(E, tn);
-        if (id >= 0) {
-            if (*count == *cap) {
-                int ncap = *cap ? *cap * 2 : 256;
-                int *ni = (int *)realloc(*ids, (size_t)ncap * sizeof(int));
-                if (!ni) return;
-                *ids = ni;
-                *cap = ncap;
-            }
-            (*ids)[(*count)++] = id;
-        }
-    }
-    int cc = zan_ast_child_count(n);
-    for (int i = 0; i < cc; i++) fx_direct_scan(E, zan_ast_child_at(n, i), ids, count, cap);
-}
-
-static void fx_strongconnect(zan_effects_t *E, int v) {
-    q_prog_t *P = &E->P;
-    E->index[v] = E->low[v] = E->next++;
-    E->stack[E->sp++] = v;
-    E->on_stack[v] = 1;
-    for (int e = 0; e < P->m[v].callee_count; e++) {
-        int w = P->m[v].callees[e];
-        if (E->index[w] < 0) {
-            fx_strongconnect(E, w);
-            if (E->low[w] < E->low[v]) E->low[v] = E->low[w];
-        } else if (E->on_stack[w] && E->index[w] < E->low[v]) {
-            E->low[v] = E->index[w];
-        }
-    }
-    if (E->low[v] != E->index[v]) return;
-    int c = E->comp_count++;
-    int start = E->sp;
-    do { start--; } while (E->stack[start] != v);
-    for (int k = start; k < E->sp; k++) E->comp[E->stack[k]] = c;
-    /* 被调分量都已完成（编号更小）：自身直接效果 + 被调分量的效果 */
-    for (int k = start; k < E->sp; k++) {
-        int u = E->stack[k];
-        for (int j = E->direct_first[u]; j < E->direct_first[u + 1]; j++)
-            fx_add(E, c, E->direct_ids[j]);
-        int cap = q_capability(P, u);
-        if (cap >= 0) E->caps[c] |= 1u << cap;
-        for (int e = 0; e < P->m[u].callee_count; e++) {
-            int wc = E->comp[P->m[u].callees[e]];
-            if (wc == c || wc < 0) continue;
-            for (int i = 0; i < E->nthrows[wc]; i++)
-                fx_add(E, c, E->throws[(size_t)wc * FX_MAX + i]);
-            if (E->more[wc]) E->more[c] = 1;
-            E->caps[c] |= E->caps[wc];
-        }
-    }
-    for (int k = start; k < E->sp; k++) E->on_stack[E->stack[k]] = 0;
-    E->sp = start;
-}
-
-zan_effects_t *zan_effects_build(zan_ast_node_t *unit, zan_binder_t *binder) {
-    zan_effects_t *E = (zan_effects_t *)calloc(1, sizeof(*E));
-    if (!E) return NULL;
-    if (!q_prog_build(&E->P, unit, binder)) { zan_effects_free(E); return NULL; }
-    int n = E->P.count;
-    size_t sz = (size_t)(n ? n : 1);
-    E->comp = (int *)malloc(sz * sizeof(int));
-    E->index = (int *)malloc(sz * sizeof(int));
-    E->low = (int *)malloc(sz * sizeof(int));
-    E->stack = (int *)malloc(sz * sizeof(int));
-    E->on_stack = (uint8_t *)calloc(sz, 1);
-    E->throws = (int *)calloc(sz * FX_MAX, sizeof(int));
-    E->nthrows = (uint8_t *)calloc(sz, 1);
-    E->more = (uint8_t *)calloc(sz, 1);
-    E->caps = (uint32_t *)calloc(sz, sizeof(uint32_t));
-    E->direct_first = (int *)calloc(sz + 1, sizeof(int));
-    if (!E->comp || !E->index || !E->low || !E->stack || !E->on_stack || !E->throws ||
-        !E->nthrows || !E->more || !E->caps || !E->direct_first) {
-        zan_effects_free(E);
-        return NULL;
-    }
-    int cap = 0, count = 0;
-    for (int i = 0; i < n; i++) {
-        E->direct_first[i] = count;
-        fx_direct_scan(E, E->P.m[i].decl->method_decl.body, &E->direct_ids, &count, &cap);
-        E->comp[i] = -1;
-        E->index[i] = -1;
-    }
-    E->direct_first[n] = count;
-    for (int v = 0; v < n; v++)
-        if (E->index[v] < 0) fx_strongconnect(E, v);
-    return E;
-}
-
-int zan_effects_describe(const zan_effects_t *E, const zan_ast_node_t *method_decl,
-                         char *buf, size_t cap) {
-    buf[0] = '\0';
-    if (!E || cap < 16) return 0;
-    int i = q_find(&E->P, method_decl);
-    if (i < 0) return 0;
-    int c = E->comp[i];
-    if (c < 0) return 0;
-    size_t o = 0;
-    if (E->nthrows[c]) {
-        o += (size_t)snprintf(buf + o, cap - o, "throws ");
-        for (int k = 0; k < E->nthrows[c] && o < cap - 32; k++)
-            o += (size_t)snprintf(buf + o, cap - o, "%s%s", k ? ", " : "",
-                                  E->names[E->throws[(size_t)c * FX_MAX + k]]);
-        if (E->more[c] && o < cap - 8) o += (size_t)snprintf(buf + o, cap - o, ", ...");
-    }
-    if (E->caps[c]) {
-        o += (size_t)snprintf(buf + o, cap - o, "%suses ", o ? "; " : "");
-        int first = 1;
-        for (int k = 0; k < Q_CAP_COUNT && o < cap - 16; k++) {
-            if (!(E->caps[c] & (1u << k))) continue;
-            o += (size_t)snprintf(buf + o, cap - o, "%s%s", first ? "" : ", ", Q_CAPS[k]);
-            first = 0;
-        }
-    }
-    return (int)o;
-}
-
-void zan_effects_free(zan_effects_t *E) {
-    if (!E) return;
-    q_prog_free(&E->P);
-    for (int i = 0; i < E->name_count; i++) free(E->names[i]);
-    free(E->names);
-    free(E->comp); free(E->index); free(E->low); free(E->stack); free(E->on_stack);
-    free(E->throws); free(E->nthrows); free(E->more); free(E->caps);
-    free(E->direct_first); free(E->direct_ids);
-    free(E);
 }

@@ -60,7 +60,7 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 | 编号 | 能力 | 说明 |
 |---|---|---|
 | S1 | `zanc --diag=json` | **第一刀已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置、fix-it 框架，首个补丁 E0032 缺 `;`）。余：更多诊断接 fix-it（`zan_diag_emit_fix`）、结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
-| S2 | `zanc query <符号>` | 第一刀已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a；余：catch 扣除、虚调用/委托目标展开 |
+| S2 | `zanc query <符号>` | 第一刀已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a；余：虚调用/委托目标展开 |
 | S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
 | S4 | `zanc --summary <包>` | 已落地，见 docs/ZANC_CLI.md §1.7：公开签名 + 效果列（S2 的 throws/能力）+ 一行文档；余：契约列（P4） |
 | S5 | `zan check` | 第一刀已落地为 `scripts/zan_check.py`，见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；余：ui/replay 步骤（随 P2/P3）、SDK 原生命令形态 |
@@ -123,7 +123,7 @@ AI 生成代码中最常见的注入类漏洞在语言层消失。
 
 | 编号 | 能力 | 说明 |
 |---|---|---|
-| S10 | 泄漏门禁 | 已落地，见 docs/ZANC_CLI.md「泄漏门禁（S10）」：run_case 默认 `--check-leaks`，基线 `tests/leak_baseline.txt` 只减不增（上线 12 例） |
+| S10 | 泄漏门禁 | 已落地，见 docs/ZANC_CLI.md「泄漏门禁（S10）」：run_case 默认 `--check-leaks`，基线 `tests/leak_baseline.txt` 已清零（上线 12 例：7 例 Exit 误报由 S13 剔除、5 例修掉），此后泄漏一律要修 |
 | S11 | 类型图强环检查 | 已落地，见 docs/SPEC.md §6.4：W2111 报用户类之间的强引用环（含经集合/数组），fix-it 给回指针加 `weak`；委托边留给 S12/S13 |
 | S12 | 事件订阅绑定订阅者生命周期 | 已落地，见 docs/SPEC.md §6.4：`+=` 目标以 this 为根时 lambda 弱捕获 this，订阅者释放即失效；其余目标保持强捕获 |
 | S13 | debug 环诊断 | 已落地，见 docs/ZANC_CLI.md §1.5：`--check-leaks` 退出报告试探删除残留对象，逐条打印孤儿环路径；`Environment.Exit` 只计孤儿环 |

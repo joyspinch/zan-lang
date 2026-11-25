@@ -1,8 +1,10 @@
 """S2（docs/ZAN_STANDARD.md §1）：zanc --query 的 JSON Lines 契约。
 
 夹具 tests/query/query_store.zan：Store.Load 直接抛 ArgumentException，经 Check()
-可达 InvalidOperationException，经 File.ReadAllText 用到 File 能力（并可达
+逃出 InvalidOperationException，经 File.ReadAllText 用到 File 能力（并逃出
 FileNotFoundException），lambda 捕获 this 与形参 path，Main 里两个调用点。
+夹具 tests/query/query_catch.zan：catch 扣除（具体/基类型/裸 catch 收住，rethrow 与
+catch 体里新抛的逃出，lambda 体不算外层方法会抛，互递归各算各的 catch）。
 另核对单名按类型名优先（Store 列出它的方法，而不是 Vector128.Store）、
 无匹配退出码 1。"""
 import argparse
@@ -35,9 +37,11 @@ def main():
     assert any(x['what'] == 'closure' for x in q['allocates']), q['allocates']
     assert q['captures'] == [{'line': 14, 'this': True, 'locals': ['path']}], q['captures']
     assert q['throws']['direct'] == [{'type': 'ArgumentException', 'line': 12}], q['throws']
-    reach = {t['type']: t['via'] for t in q['throws']['reachable']}
-    assert reach.get('InvalidOperationException') == 'Store.Load(string path) -> Store.Check()', reach
-    assert 'FileNotFoundException' in reach, reach
+    esc = {t['type']: t['via'] for t in q['throws']['escapes']}
+    assert esc.get('InvalidOperationException') == 'Store.Load(string path) -> Store.Check()', esc
+    assert esc.get('ArgumentException') == 'Store.Load(string path)', esc
+    assert esc.get('FileNotFoundException', '').endswith('File.ReadAllText(string path)'), esc
+    assert q['throws']['escapes_truncated'] is False
     caps = {c['capability']: c['via'] for c in q['capabilities']}
     assert list(caps) == ['File'], caps
     assert caps['File'].endswith('File.ReadAllText(string path)'), caps
@@ -51,6 +55,29 @@ def main():
 
     rc, hits, summary = query(a.zanc, src, 'Store.Nope')
     assert rc == 1 and summary['matches'] == 0 and not hits, summary
+
+    csrc = os.path.join(os.path.dirname(src), 'query_catch.zan')
+    want = {
+        'Specific': ([], []),
+        'Base': ([], []),
+        'All': ([], []),
+        'Rethrow': (['(rethrow)'], ['FileNotFoundException']),
+        'InCatch': (['ArgumentException'], ['ArgumentException']),
+        'Later': ([], []),
+        'A': ([], []),
+        'B': (['InvalidOperationException'], ['InvalidOperationException']),
+    }
+    for name, (direct, escapes) in want.items():
+        rc, hits, _ = query(a.zanc, csrc, 'Svc.' + name)
+        assert rc == 0 and len(hits) == 1, (name, hits)
+        t = hits[0]['throws']
+        got = ([d['type'] for d in t['direct']], sorted(e['type'] for e in t['escapes']))
+        assert got == (direct, sorted(escapes)), (name, got)
+    rc, hits, _ = query(a.zanc, csrc, 'Svc.Rethrow')
+    via = hits[0]['throws']['escapes'][0]['via']
+    assert via == 'Svc.Rethrow(string p) -> File.ReadAllText(string path)', via
+    rc, hits, _ = query(a.zanc, csrc, 'Svc.Specific')
+    assert [c['capability'] for c in hits[0]['capabilities']] == ['File'], hits[0]['capabilities']
     print('query: JSON contracts passed')
 
 

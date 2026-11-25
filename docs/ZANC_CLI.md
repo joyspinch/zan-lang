@@ -230,9 +230,9 @@ public class OrderLine  // A priced line in an order.
 - 文档：声明上方紧邻注释块（`//`、`///`，跳过 `[特性]` 行）的第一句，剥 XML
   标签，截到第一个 `。` 或 `. `。
 - 效果列 `[throws …; uses …]`（方法与构造器，有才出）：与 §1.7a `--query` 同一
-  口径——经已解析调用传递的可能抛出的异常类型（上界，不扣 catch，rethrow 不计，
-  每个成员最多 6 个、超出记 `...`）与用到的能力（Net/File/Process/Registry/
-  Clipboard/Native）。全程序一遍：调用图强连通分量按被调先完成的顺序合并效果。
+  口径——可能逃出该成员的异常类型（扣除沿途 catch，rethrow 不计，每个成员最多
+  列 6 个、超出记 `...`）与用到的能力（Net/File/Process/Registry/Clipboard/
+  Native）。全程序一遍：调用图强连通分量定顺序，集合按方法记、分量内迭代到不动点。
   分配不进摘要（几乎每个方法都分配，只是噪音）；契约列待 P4。
 - 首行 `// zan-summary 1: …` 是格式版本；末行给类型/成员计数。
 - 实测：`packages/Zan.Gui/src` 460 个类型、6350 个成员（1421 行带效果列），约 1.4 秒。
@@ -249,13 +249,18 @@ public class OrderLine  // A priced line in an order.
 | `symbol` / `file` / `line` | `Type.Name(参数)` 与声明位置 |
 | `allocates` | 方法体里直接的分配：`new` 对象/数组、集合初始化、lambda 闭包 |
 | `captures` | 每个 lambda 是否用到 `this`、捕获了哪些外层局部量/形参 |
-| `throws` | `direct`：方法体里的 `throw`；`reachable`：经已解析调用可达方法里的异常类型，每种一条示例链（**上界**，不扣除 catch） |
+| `throws` | `direct`：方法体里**没被本方法 catch 住**的 `throw`；`escapes`：可能逃出本方法的异常类型，每种一条真能逃出来的示例链（只走不收住它的调用点）；`escapes_truncated`：超过 32 种时为 true |
 | `capabilities` | 可达调用里用到的能力（S7 口径）：`Net`、`File`、`Process`、`Registry`、`Clipboard`、`Native`（标准库之外的 extern/DllImport），每项一条证据链 |
 | `calls` / `callers` | 直接调用的方法；全程序里解析到它的调用点（各最多 64 条，`callers_truncated` 标出截断） |
 | `reachable_methods` | 经调用图可达的方法数 |
 
-调用图来自类型检查写在调用节点上的解析结果；`new T(...)` 连到 T 的同元数构造器；
-虚调用按静态目标连边、不展开覆盖；委托调用不连边（目标运行期才定）。单名先当类型名
+catch 扣除：只有 `try` 体受本 try 的 catch 保护（catch 体与 finally 不受）；catch
+基类型也收（`catch (IOException)` 收 `FileNotFoundException`），裸 `catch` 与
+`catch (Exception)` 全收；catch 体里 `throw;` 或把捕获变量原样抛出的不算收住。
+lambda 体是委托被调用时才执行的代码：里面的调用与 throw 不算外层方法会抛，但
+算它用到的能力。调用图来自类型检查写在调用节点上的解析结果；`new T(...)` 连到
+T 的同元数构造器；虚调用按静态目标连边、不展开覆盖；委托调用不连边（目标运行期
+才定）——所以 `escapes` 仍是上界。单名先当类型名
 列出它的全部方法，没有该类型再按方法名找。实测 702 文件的 GUI 程序查询 < 1 秒。
 钉：`query_symbol_facts`（`tests/test_query.py`）。
 
