@@ -9,9 +9,14 @@ namespace Gui.Testing;
 // 窗体离屏装配（不建系统窗口），按设计尺寸在给定 DPI 下排一帧，再对控件树查：
 //   offscreen     可见控件超出窗口（起点在窗外即算，不论尺寸；滚动容器内的内容不算）
 //   collapsed     可交互控件被挤成 0 宽或 0 高——标记里有，用户却用不了
-//   truncated     带文本的叶子控件比它的首选尺寸窄/矮——文字被截
-//   small_target  可交互控件小于 24 逻辑像素（按当前 DPI 折算）
+//   truncated     带文本的叶子控件比它的首选尺寸窄/矮超过 2 逻辑像素——文字被截
+//                 （容差与 Control.LayoutLint 的「裁剪」同口径，按 DPI 折算）
+//   small_target  可交互控件小于 24 逻辑像素，且不满足 WCAG 2.5.8 的间距豁免：以它为
+//                 中心的 24px 圆碰到别的目标（或别的小目标的圆）
 //   overlap       两个可交互控件相交且互不包含——点击会落到错的那个
+// 口径与 Control.LayoutLint 一致：挂了 FreeLayout()/NoOverlapCheck()（标记里 free-layout
+// 属性）的控件及其子树不查重叠/尺寸——刻意叠放（牌堆、角标）要明说；
+// 禁用控件（工具条分隔条）不算交互目标；<template> 行模板子树不排版，不查。
 // pseudo=true 时先把静态文本拉长 40%（伪本地化，模拟译文变长）。绑定的文本在同步时会
 // 被模型覆盖，伪本地化只作用于静态文本。
 //
@@ -43,14 +48,15 @@ public class UiCheck {
         }
         List<UiIssue> issues = new List<UiIssue>();
         Control top = form;
-        UiCheck.Walk(top, top, false, scale, pseudo, issues);
         List<Control> targets = new List<Control>();
         UiCheck.CollectTargets(top, targets);
+        UiCheck.Walk(top, top, false, scale, pseudo, issues, targets);
         for (int i = 0; i < targets.Count; i = i + 1) {
             for (int j = i + 1; j < targets.Count; j = j + 1) {
                 Control a = targets[i];
                 Control b = targets[j];
                 if (UiCheck.IsAncestor(a, b) || UiCheck.IsAncestor(b, a)) { continue; }
+                if (UiCheck.OverlapExempt(a) || UiCheck.OverlapExempt(b)) { continue; }
                 int ix = UiCheck.Min(a.bx + a.bw, b.bx + b.bw) - UiCheck.Max(a.bx, b.bx);
                 int iy = UiCheck.Min(a.by + a.bh, b.by + b.bh) - UiCheck.Max(a.by, b.by);
                 if (ix > 1 && iy > 1) {
@@ -86,18 +92,60 @@ public class UiCheck {
     }
 
     static bool Shown(Control c) {
+        if (c.Kind() == "template") { return false; }
         string v = c.GetProp("visible");
         return v != "0" && v != "false";
     }
 
+    static bool Disabled(Control c) {
+        string d = c.GetProp("disabled");
+        return d == "1" || d == "true";
+    }
+
     static bool Interactive(Control c) {
+        if (UiCheck.Disabled(c)) { return false; }
         return c.HasInputClick() || (c.InputFocusCapabilities() & 1) != 0;
     }
 
+    // 刻意叠放（牌堆、角标）：控件或其祖先挂了免检牌——FreeLayout() / NoOverlapCheck()，
+    // 标记里写 free-layout 属性。与 LayoutLint 同口径：脱流（absolute）本身不豁免。
+    static bool OverlapExempt(Control c) {
+        for (Control a = c; a != null; a = a.parent) {
+            if (a.overlapExempt) { return true; }
+        }
+        return false;
+    }
+
+    // WCAG 2.5.8 间距豁免：以小目标为中心、直径 24px 的圆不碰别的目标、也不碰别的
+    // 小目标的圆
+    static bool SpacedEnough(Control c, List<Control> targets, int min) {
+        int r = min / 2;
+        int cx = c.bx + c.bw / 2;
+        int cy = c.by + c.bh / 2;
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            Control o = targets[i];
+            if (o == c || UiCheck.IsAncestor(o, c) || UiCheck.IsAncestor(c, o)) { continue; }
+            bool small = o.bw < min || o.bh < min;
+            if (small) {
+                int dx = (o.bx + o.bw / 2) - cx;
+                int dy = (o.by + o.bh / 2) - cy;
+                if (dx * dx + dy * dy < 4 * r * r) { return false; }
+            } else {
+                int nx = UiCheck.Max(o.bx, UiCheck.Min(cx, o.bx + o.bw));
+                int ny = UiCheck.Max(o.by, UiCheck.Min(cy, o.by + o.bh));
+                int dx = nx - cx;
+                int dy = ny - cy;
+                if (dx * dx + dy * dy < r * r) { return false; }
+            }
+        }
+        return true;
+    }
+
     static void Walk(Control c, Control top, bool inScroll, int scale, bool pseudo,
-                     List<UiIssue> issues) {
+                     List<UiIssue> issues, List<Control> targets) {
         if (!UiCheck.Shown(c)) { return; }
-        if (c != top && !inScroll) {
+        bool exempt = UiCheck.OverlapExempt(c);
+        if (c != top && !inScroll && !exempt && !(c.bw == 0 && c.bh == 0 && !UiCheck.Interactive(c))) {
             bool startOut = c.bx >= top.bx + top.bw || c.by >= top.by + top.bh
                 || c.bx < top.bx || c.by < top.by;
             bool extentOut = c.bw > 0 && c.bh > 0
@@ -109,8 +157,9 @@ public class UiCheck {
                     + "x" + Convert.ToString(top.bh) + ")", scale, pseudo);
             }
         }
-        if (c.ChildCount() == 0 && c.GetProp("text") != "" && c.bw > 0
-            && (c.prefW > c.bw + 1 || c.prefH > c.bh + 1)) {
+        int tol = 2 * scale / 100;
+        if (!exempt && c.ChildCount() == 0 && c.GetProp("text") != "" && c.bw > 0
+            && (c.prefW > c.bw + tol || c.prefH > c.bh + tol)) {
             UiCheck.Add(issues, "truncated", c, "needs " + Convert.ToString(c.prefW) + "x"
                 + Convert.ToString(c.prefH) + "px, has " + Convert.ToString(c.bw) + "x"
                 + Convert.ToString(c.bh), scale, pseudo);
@@ -118,17 +167,18 @@ public class UiCheck {
         if (UiCheck.Interactive(c) && (c.bw == 0 || c.bh == 0)) {
             UiCheck.Add(issues, "collapsed", c, "laid out at " + Convert.ToString(c.bw) + "x"
                 + Convert.ToString(c.bh) + "px", scale, pseudo);
-        } else if (UiCheck.Interactive(c)) {
+        } else if (UiCheck.Interactive(c) && !exempt) {
             int min = MinTarget * scale / 100;
-            if (c.bw < min || c.bh < min) {
+            if ((c.bw < min || c.bh < min) && !UiCheck.SpacedEnough(c, targets, min)) {
                 UiCheck.Add(issues, "small_target", c, Convert.ToString(c.bw) + "x"
-                    + Convert.ToString(c.bh) + "px is below " + Convert.ToString(min) + "px",
+                    + Convert.ToString(c.bh) + "px is below " + Convert.ToString(min)
+                    + "px and closer than that to another target",
                     scale, pseudo);
             }
         }
         bool scroll = inScroll || c.IsScrollContainer();
         for (int i = 0; i < c.ChildCount(); i = i + 1) {
-            UiCheck.Walk(c.ChildAt(i), top, scroll, scale, pseudo, issues);
+            UiCheck.Walk(c.ChildAt(i), top, scroll, scale, pseudo, issues, targets);
         }
     }
 

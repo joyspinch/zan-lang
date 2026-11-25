@@ -299,7 +299,7 @@ stdout（与 `--out`）输出**单份 JSON 报告**；退出码 0 = 没有失败
 |---|---|---|
 | `compile` | `zanc … --auto-stdlib --check-leaks --diag=json`：全部诊断原样收进 `diagnostics`（§1.6，含 fix-it 与 `end`），`errors`/`warnings` 计数；失败时附 `other_output`（非 JSON 输出的最后 20 行） | 编译失败 |
 | `leaks` | 运行产物（默认 60 秒超时）并解析退出报告：`leaked`、`sites[{count,site}]`、`cycles[]`（S13 路径）、`mode`（`strict` = Main 正常返回，`early-exit` = 提前退出只计不可达环）；退出码非 0 时附 `output_tail` | 有泄漏、退出码非 0 或超时 |
-| `ui` | S22 布局不变量：在输入里找 `class X : Form` 且同目录有 `X.html` 的窗体，生成检查程序（排在用户源文件之前，它的 `Main` 是入口）离屏装配每个窗体（`Gui.Testing.UiCheck`），100%/150%/200% DPI 各排一帧、再各做一遍伪本地化（静态文本拉长 40%）。问题种类：`truncated`（文字比首选尺寸窄/矮）、`small_target`（可交互控件小于 24 逻辑像素）、`overlap`（两个可交互控件相交且互不包含）、`offscreen`（出窗口，滚动容器内不算）、`collapsed`（可交互控件被挤成 0 宽/高）。报告 `forms`、`issues`、`pseudo_issues` 与逐次 `checks[{form,scale,pseudo,issues}]`；没有窗体时 `skipped`，`--no-ui` 跳过。GUI 程序需要的 `--driver-dir` 等经 `--zanc-arg` 传 | 真实尺寸（非伪本地化）下有问题、检查程序编不过或没跑完；伪本地化的问题只计数（告警） |
+| `ui` | S22 布局不变量：在输入里找 `class X : Form` 且同目录有 `X.html` 的窗体，生成检查程序（排在用户源文件之前，它的 `Main` 是入口）离屏装配每个窗体（`Gui.Testing.UiCheck`），100%/150%/200% DPI 各排一帧、再各做一遍伪本地化（静态文本拉长 40%）。问题种类：`truncated`（文字比首选尺寸窄/矮超过 2 逻辑像素，同 `Control.LayoutLint` 的裁剪容差）、`small_target`（可交互控件小于 24 逻辑像素且不满足 WCAG 2.5.8 间距豁免——以它为中心的 24px 圆碰到别的目标）、`overlap`（两个可交互控件相交且互不包含）、`offscreen`（出窗口，滚动容器内不算）、`collapsed`（可交互控件被挤成 0 宽/高）。禁用控件不算交互目标；挂了 `FreeLayout()`（标记 `free-layout` 属性）的子树不查重叠/尺寸——刻意叠放要明说；`<template>` 行模板不查；自己装载标记（`Html.Load`/`HtmlDocs.Read`）的窗体不走声明式装配，跳过。报告 `forms`、`issues`、`pseudo_issues` 与逐次 `checks[{form,scale,pseudo,issues}]`；没有窗体时 `skipped`，`--no-ui` 跳过。GUI 程序需要的 `--driver-dir` 等经 `--zanc-arg` 传 | 真实尺寸（非伪本地化）下有问题、检查程序编不过或没跑完；伪本地化的问题只计数（告警） |
 | `replay` | 回放比对与不变量（S26/S27，P3） | 未实现，恒 `skipped` |
 
 编译失败时后续步骤记 `skipped` 并写明原因，报告形状不变：

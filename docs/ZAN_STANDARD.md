@@ -206,7 +206,7 @@ zan run app.zan --ui-dump json   # 输出当前窗口语义树快照
 无障碍、UI 测试、AI agent 共用同一棵树。**AI 读文本即可理解界面，无需截图。**
 
 **S22 `zan ui check` 布局不变量。**（已落地：`Gui.Testing.UiCheck` + `zan-check` 的 ui 步，
-见 docs/ZANC_CLI.md §1.8；对比度暂未检查；`templates/` 全部过检待模板脚手架接入） 无头运行，自动遍历项目所有窗体：
+见 docs/ZANC_CLI.md §1.8；对比度暂未检查；`templates/gui` 按 IDE 方式脚手架后全部过检，钉 full 档 `template_ui_check`） 无头运行，自动遍历项目所有窗体：
 
 - 文字截断、可交互控件重叠、超出窗口、点击区域过小、对比度不足；
 - 100% / 150% / 200% DPI 各跑一遍；

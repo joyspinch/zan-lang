@@ -8813,6 +8813,14 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/markup-check)
   set_tests_properties(markup_check_compile PROPERTIES TIMEOUT 600)
+  # P2 验收（ZAN_STANDARD §8）：全部 templates/gui 按 IDE 方式脚手架后通过 zan-check
+  # 的 ui 步（S22，三档 DPI）。每个模板编两次，约一小时——只进 full 档。
+  add_test(NAME template_ui_check
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_template_ui.py
+      --zanc $<TARGET_FILE:zanc> --check ${CMAKE_BINARY_DIR}/zan-check${_exe_ext}
+      --drivers ${CMAKE_BINARY_DIR} --root ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out/template-ui)
+  set_tests_properties(template_ui_check PROPERTIES TIMEOUT 7200 LABELS "full")
   # S21（docs/ZAN_STANDARD.md §5）：启用了 UiDriver 的 GUI 程序（模板默认启用）在
   # ZAN_UI_DUMP=<文件> 下首帧后导出语义树（角色/名字/文本/值/勾选/enabled/区间）并退出。
   add_test(NAME gui_ui_dump_semantic_tree
