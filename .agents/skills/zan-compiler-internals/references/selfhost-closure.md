@@ -3332,3 +3332,31 @@ irgen_resolve.zan 同时承载 round9+round11 未提交改动）stash 不出干�
 nofix——改用**功能级禁用**（注释单钩子）做 nofix 对照；③自举 gen1 的
 `-o` 直连模式链的 rt 桩集在 build/ 清理后 LNK1120——复验一律走官方
 驱动（显式 rtobjs），不走 gen1 裸 `-o`。
+
+## 自举产物与宿主同链 M:N 调度器（B-ID199 round 6，2026-11-25）
+
+**事实**：宿主在桌面目标上给每个程序链 `zanrt_io_mt`（`rt_io.c` 以
+`-DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER` 编译的工作线程池调度器）。自举的
+sh/shd 运行时束同样把 `rt_io.c` 按这一口味编译，强符号覆盖自举发射的弱 co
+兜底——两侧调度语义一致。单线程兜底下"阻塞型 spawn 协程（accept、
+Thread.Sleep）冻住整个程序"正是旧网络挂死簇的根因。
+
+**协程代码在工作线程上必须守的三条**（违反即并发 UAF / 死锁，宿主早已守）：
+1. **协程步内不泵调度器**：`zan_co_sched_run` 在 worker 上等全池空闲，而调用
+   方自己这一步就算"在跑"——永不返回。`Task.IsDone` 是纯查询；协程内
+   `await <已存句柄>` 用"测 done → 让出（Task.Yield 式重排）→ 复测"，同步
+   上下文才保留泵循环（宿主 `construct_await.c` 的 stored-handle 分支同口径；
+   这条分支此前因 `await_target_is_async` 对 Task 恒真而是死代码，句柄被当
+   子帧读出垃圾结果）。
+2. **完成序：先清自身，再发布 DONE**：DONE 一可见，等待者就可能在另一
+   worker 上读结果并 `zexc_frame_free` 本帧（展开槽 18 所有者链）。所以写结
+   果、`zan_timer_cancel_delay(self)`、读 awaiter 槽、展开自身所有者链、归还
+   线程 owners 全在 DONE（release store）之前；之后只用 SSA 值唤醒。
+3. **`await` 运算对象的"已存句柄"只认局部变量（或局部列表按局部/字面量下
+   标）**：`tcs.Task` 之类属性读出的是可 await 的帧，走帧等待路径。
+
+**诊断法**：gen1 IR 链 ASan 时 clang 不给 `.ll` 函数加 `sanitize_address`
+属性，检查不插桩——先 `perl -pe 's/^(define [^{]*\))\s*\{\s*$/$1 sanitize_address {\n/'`
+再 `-fsanitize=address` 链接，heap-use-after-free 的分配/释放线程一目了然。
+测试里 `x = x + 1` / 共享 `List.Add` 在 M:N 下是真数据竞争（宿主同样偶发），
+修测试加锁而不是让编译器背锅；判据是宿主多轮循环也能复现。

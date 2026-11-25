@@ -968,22 +968,13 @@ partial class Irgen {
         return new ExprVal("0", MkType("void"));
     }
 
-    // Task.IsDone(handle)：裸句柄是否已经跑完（done 标志是否置位）。
-    //
-    // 两条规则，对应两种执行上下文：
-    //   ① 在协程执行栈上（@__zan_co_depth > 0）——**纯查询**，与宿主一致
-    //      （src/compiler/call_builtins/builtin_sys.c 的 Task.IsDone 分支就
-    //      只是一次 zan_task_isdone）。泵这里会重入调度器：WhenAny 竞速时
-    //      慢任务被 IsDone 提前跑完（async_when_all 的 slowRanYet 观察因此
-    //      由 0 变 1），先完成者/取消时机全被改写。
-    //   ② 在同步上下文（depth == 0）——泵一次。自举是单线程协作式运行时，
-    //      任务只在泵调度器时前进，宿主靠工作线程推进；这里不泵，
-    //      `while (Task.IsDone(h) == 0) {}` 这种忙等就永远推不动
-    //      （task_run_action_handle 会挂死）。调用方没有别的办法让出，所以
-    //      泵是这一侧唯一可行的推进手段。
-    // 这是自举相对宿主唯一保留的语义偏差，判据见
-    // tests/conformance/task_isdone_pure_query.zan 与 diff_cases 里的
-    // async_when_all / task_run_action_handle 两条。
+    // Task.IsDone(handle)：裸句柄是否已经跑完（done 标志是否置位）——**纯查询**，
+    // 与宿主一致（src/compiler/call_builtins/builtin_sys.c 的 Task.IsDone 分支
+    // 只是一次 zan_task_isdone）。自举产物与宿主同链 M:N 工作线程调度器
+    // （ZAN_CO_DRIVER 版 rt_io），任务由工作线程推进，同步忙等
+    // `while (Task.IsDone(h) == 0) {}` 也能前进；这里再泵调度器反而会在工作
+    // 线程的协程步里重入 zan_co_sched_run 永不返回（TaskJoin.WhenAllPoll
+    // 挂死 tcp_listener_cancel 的根因）。
     ExprVal EmitTaskIsDone(Node e) {
         ExprVal h = GenExpr(e.kids[0]);
         string fp;
@@ -994,25 +985,7 @@ partial class Irgen {
         }
         string token = TaskTokenBits(fp);
         string dn = NT(); L("  " + dn + " = call i32 @zan_task_isdone(i64 " + token + ")");
-        string c = NT(); L("  " + c + " = icmp ne i32 " + dn + ", 0");
-        string lentry = curLbl;
-        int ldone = NL(); int lpure = NL(); int lpump = NL();
-        L("  br i1 " + c + ", label %L" + ldone + ", label %L" + lpure);
-        // Not done yet. Inside a coroutine the query stays pure.
-        Label(lpure);
-        string dp = NT(); L("  " + dp + " = load i32, i32* @__zan_co_depth");
-        string inCoro = NT(); L("  " + inCoro + " = icmp ne i32 " + dp + ", 0");
-        L("  br i1 " + inCoro + ", label %L" + ldone + ", label %L" + lpump);
-        // Synchronous caller: pump once, then re-read the flag.
-        Label(lpump);
-        L("  call void @zan_co_sched_run()");
-        string dn2 = NT(); L("  " + dn2 + " = call i32 @zan_task_isdone(i64 " + token + ")");
-        string c2 = NT(); L("  " + c2 + " = icmp ne i32 " + dn2 + ", 0");
-        L("  br label %L" + ldone);
-        Label(ldone);
-        string cphi = NT();
-        L("  " + cphi + " = phi i1 [ true, %" + lentry + " ], [ false, %L" + lpure + " ], [ " + c2 + ", %L" + lpump + " ]");
-        string r = NT(); L("  " + r + " = zext i1 " + cphi + " to i64");
+        string r = NT(); L("  " + r + " = zext i32 " + dn + " to i64");
         return new ExprVal(r, MkType("int"));
     }
 

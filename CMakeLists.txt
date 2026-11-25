@@ -4378,9 +4378,13 @@ if(SELFHOST_CLANG)
   # runtime (FileStream, Environment, embedded resources). The objects are built
   # with SELFHOST_CLANG -- the same linker the test drives -- so the C runtime
   # matches (the host-toolchain object may target a different C runtime, e.g.
-  # mingw vs MSVC). rt_co.c is deliberately absent: rt_io.c already provides
-  # the coroutine scheduler, and the self-host emits its own copy as a weak
-  # fallback (mirroring the host's zan_runtime_fallback).
+  # mingw vs MSVC). rt_co.c is deliberately absent: rt_io.c is built in its
+  # ZAN_CO_DRIVER flavour -- the M:N worker-pool scheduler the host links into
+  # every desktop program (zanrt_io_mt) -- and its strong co/timer/io entry
+  # points override the weak fallback the self-host emits (mirroring the
+  # host's zan_runtime_fallback). Same runtime, same scheduling semantics: a
+  # spawned coroutine that blocks (accept, Thread.Sleep) runs on a worker
+  # instead of freezing the program.
   # NativeMemory's zan_hw_* references need an archive built with this clang's
   # ABI, which may differ from the host runtime compiler. Keep the same feature
   # members here instead of bare-linking the old aggregate object.
@@ -4392,9 +4396,13 @@ if(SELFHOST_CLANG)
   foreach(_sh_src IN LISTS _sh_rt_srcs)
     get_filename_component(_sh_stem ${_sh_src} NAME_WE)
     set(_sh_obj "${CMAKE_BINARY_DIR}/zanrt_sh_${_sh_stem}${CMAKE_C_OUTPUT_EXTENSION}")
+    set(_sh_flavour)
+    if(_sh_stem STREQUAL "rt_io")
+      set(_sh_flavour -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER)
+    endif()
     add_custom_command(
       OUTPUT ${_sh_obj}
-      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_sh_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} ${_sh_flavour} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_sh_src}
               -MMD -MF "${_sh_obj}.d" -MT "${_sh_obj}" -o ${_sh_obj}
       DEPENDS ${CMAKE_SOURCE_DIR}/src/${_sh_src}
       DEPFILE "${_sh_obj}.d"
@@ -4452,18 +4460,14 @@ if(SELFHOST_CLANG)
   # host's golden file. Cases that still differ are listed in
   # tests/selfhost/diff_known_gaps.txt (reported, not failed) until fixed.
   #
-  # The link set is the fixed point's runtime, deliberately WITHOUT rt_co.c:
-  # rt_co.c's ready queue is a plain FIFO with no timer wait, so a program
-  # that awaits Task.Delay would park forever (the timer fires into a queue
-  # nobody drains). The self-host emits a *complete* weak co runtime of its
-  # own (ready queue + timer list + pump, irgen_async.zan), and mixing it
-  # with rt_co.c's strong zan_co_ready/zan_co_sched_run would leave the
-  # timers stranded. So the weak set stays coherent and wins here.
-  #
-  # Consequence: the two sides of the comparison run different co runtimes
-  # (the C host links the shipped mt runtime, the self-host links its own
-  # emitted fallback). The gate therefore compares *compiler* behaviour --
-  # the stdout a program produces -- not runtime internals.
+  # The link set is the fixed point's runtime, deliberately WITHOUT rt_co.c
+  # (its ready queue is a plain FIFO with no timer wait: a program awaiting
+  # Task.Delay would park forever). rt_io.c is built in its ZAN_CO_DRIVER
+  # flavour, the same M:N scheduler the C host links (zanrt_io_mt), so both
+  # sides of the comparison run one co runtime and the self-host's emitted
+  # weak fallback is fully overridden. With the single-thread fallback a
+  # spawned coroutine that blocked (accept, Thread.Sleep) froze the whole
+  # program -- the network-hang cluster of B-ID199 round 6.
   set(_shd_crypto_archive "${CMAKE_BINARY_DIR}/libzancrypto_shd.a")
   zan_add_crypto_archive("${_shd_crypto_archive}" "${SELFHOST_CLANG}")
   set(_shd_rt_srcs runtime/rt_file.c runtime/rt_io.c runtime/rt_crash.c runtime/rt_timer.c
@@ -4472,9 +4476,13 @@ if(SELFHOST_CLANG)
   foreach(_shd_src IN LISTS _shd_rt_srcs)
     get_filename_component(_shd_stem ${_shd_src} NAME_WE)
     set(_shd_obj "${CMAKE_BINARY_DIR}/zanrt_shd_${_shd_stem}${CMAKE_C_OUTPUT_EXTENSION}")
+    set(_shd_flavour)
+    if(_shd_stem STREQUAL "rt_io")
+      set(_shd_flavour -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER)
+    endif()
     add_custom_command(
       OUTPUT ${_shd_obj}
-      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_shd_src}
+      COMMAND ${SELFHOST_CLANG} ${ZAN_RT_OBJ_DEFS} ${_shd_flavour} -I ${CMAKE_SOURCE_DIR}/src/runtime -I ${CMAKE_SOURCE_DIR}/src/accel -I ${CMAKE_SOURCE_DIR}/src/embed -O2 -c ${CMAKE_SOURCE_DIR}/src/${_shd_src}
               -MMD -MF "${_shd_obj}.d" -MT "${_shd_obj}" -o ${_shd_obj}
       DEPENDS ${CMAKE_SOURCE_DIR}/src/${_shd_src}
       DEPFILE "${_shd_obj}.d"

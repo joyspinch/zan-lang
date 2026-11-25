@@ -546,9 +546,78 @@ static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     return false;
 }
+/* A Task handle read from a local (or a local list's element at a local /
+ * literal index), so re-reading it after a suspension has no side effects.
+ * Property reads such as `tcs.Task` are not stored handles: they yield an
+ * awaitable frame and keep the frame-await path. gen1 applies the same rule
+ * (src/selfhost/irgen/irgen_async.zan IsStoredTaskHandle). */
+static bool await_operand_is_stored_handle(zan_ast_node_t *e, local_scope_t *locals) {
+    if (!e || !locals) return false;
+    if (e->kind == AST_IDENTIFIER) return local_find(locals, e->ident.name) != NULL;
+    if (e->kind == AST_INDEX) {
+        zan_ast_node_t *o = e->index.object, *ix = e->index.index;
+        return e->index.extra.count == 0 && o && o->kind == AST_IDENTIFIER &&
+               local_find(locals, o->ident.name) != NULL && ix &&
+               (ix->kind == AST_IDENTIFIER || ix->kind == AST_INT_LITERAL);
+    }
+    return false;
+}
+
 LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         zan_type_t *public_task = infer_expr_type(g, expr->await_expr.expr, locals);
+        /* `await h` on a stored Task handle (`Task<int> t = Task.Run(..);
+         * await t;`). await_target_is_async() is true for every Task-typed
+         * operand, so this branch used to be unreachable: the handle fell to
+         * the frame-await path, which treats the registry token as a child
+         * frame -- no wait, and a garbage result (B-ID199 round 6).
+         *
+         * Inside a coroutine the wait must suspend, not pump: pumping
+         * re-enters zan_co_sched_run from a worker's coroutine step, and on
+         * the M:N pool that waits for every worker -- this step included --
+         * to go idle, which never happens. So: test, and while the task is
+         * not done requeue this frame (the Task.Yield suspension) and re-read
+         * the handle on resume. A synchronous caller keeps the pump loop. */
+        if (public_task && public_task->kind == TYPE_TASK &&
+            await_operand_is_stored_handle(expr->await_expr.expr, locals)) {
+            LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+            LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+            LLVMValueRef token;
+            if (g->current_async_frame && g->current_async_switch) {
+                LLVMValueRef fn = g->current_fn;
+                LLVMBasicBlockRef test_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aw.h.test");
+                LLVMBasicBlockRef wait_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aw.h.wait");
+                LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "aw.h.done");
+                LLVMBuildBr(g->builder, test_bb);
+                LLVMPositionBuilderAtEnd(g->builder, test_bb);
+                token = emit_expr(g, expr->await_expr.expr, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(token)) == LLVMPointerTypeKind)
+                    token = LLVMBuildPtrToInt(g->builder, token, i64, "await.token");
+                LLVMValueRef dn = emit_task_runtime_call(g, "zan_task_isdone", i32, &token, 1);
+                LLVMValueRef ok = zan_icmp(g->builder, LLVMIntNE, dn,
+                                           LLVMConstInt(i32, 0, 0), "aw.h.dn");
+                LLVMBuildCondBr(g->builder, ok, done_bb, wait_bb);
+                LLVMPositionBuilderAtEnd(g->builder, wait_bb);
+                int k = g->current_async_next_state++;
+                zan_store_fit(g, LLVMConstInt(i32, (unsigned)k, 0), get_async_state_ptr(g));
+                LLVMBuildBr(g->builder, get_async_requeue_bb(g));
+                LLVMBasicBlockRef rk = LLVMAppendBasicBlockInContext(g->ctx,
+                    g->current_async_resume_fn, "co.resume");
+                LLVMAddCase(g->current_async_switch, LLVMConstInt(i32, (unsigned)k, 0), rk);
+                LLVMPositionBuilderAtEnd(g->builder, rk);
+                LLVMBuildBr(g->builder, test_bb);
+                LLVMPositionBuilderAtEnd(g->builder, done_bb);
+            } else {
+                token = emit_expr(g, expr->await_expr.expr, locals);
+                if (LLVMGetTypeKind(LLVMTypeOf(token)) == LLVMPointerTypeKind)
+                    token = LLVMBuildPtrToInt(g->builder, token, i64, "await.token");
+            }
+            LLVMValueRef handle = LLVMBuildIntToPtr(g->builder, token, ptr, "await.handle");
+            return emit_task_member(g, handle,
+                public_task->type_arg_count ? public_task->type_args[0] : NULL,
+                public_task->type_arg_count ? 1 : 0);
+        }
         if (public_task && public_task->kind == TYPE_TASK &&
             !await_target_is_async(g, expr->await_expr.expr, locals)) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);

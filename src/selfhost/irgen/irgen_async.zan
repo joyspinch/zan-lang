@@ -29,6 +29,7 @@ partial class Irgen {
             }
         }
         if (curAsync && IsSocketIntrinsic(callExpr)) { return EmitSocketIntrinsic(callExpr); }
+        if (curAsync && IsStoredTaskHandle(callExpr)) { return EmitAwaitStoredHandle(callExpr); }
         ExprVal sub = GenExpr(callExpr);
         // The awaited operand has to be a coroutine frame: the lowering reads
         // the frame's slot 9 (the resume entry) and hands the frame to the
@@ -172,6 +173,62 @@ partial class Irgen {
     // is already available synchronously and passes through directly.
     void EmitAwaitNoSuspend() { }
 
+    // A Task handle read from a local (or a local list's element at a local /
+    // literal index): re-reading it after a suspension has no side effects.
+    // Property reads such as `tcs.Task` are NOT stored handles -- they yield
+    // an awaitable frame and keep the frame-await path. Same operand rule as
+    // the C host's await_operand_is_stored_handle (construct_await.c).
+    bool IsStoredTaskHandle(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Index()) {
+            if (e.a == null || e.a.kind != AK.Ident() || LocalIdx(e.a.sval) < 0) { return false; }
+            Node ix = e.b;
+            if (ix == null || (ix.kind != AK.Ident() && ix.kind != AK.IntLit())) { return false; }
+        } else if (e.kind != AK.Ident() || LocalIdx(e.sval) < 0) {
+            return false;
+        }
+        Node t = ArgTypeNode(e);
+        return t != null && t.sval == "Task";
+    }
+
+    // `await h` inside a coroutine, h a stored Task handle: suspend -- requeue
+    // this frame (the Task.Yield suspension) and re-test -- until the task is
+    // done, then take its result. Pumping the scheduler here instead would
+    // re-enter zan_co_sched_run from a worker's coroutine step, which waits
+    // for the whole pool (this step included) to go idle: a deadlock
+    // (async_sync_fast_path). Same lowering as the C host
+    // (construct_await.c, the stored-handle branch).
+    ExprVal EmitAwaitStoredHandle(Node operand) {
+        int ltest = NL(); int lwait = NL(); int ldone = NL();
+        L("  br label %L" + ltest);
+        Label(ltest);
+        ExprVal h = GenExpr(operand);
+        string fp = h.op;
+        if (MapType(h.ty) == "i64") {
+            fp = NT(); L("  " + fp + " = inttoptr i64 " + h.op + " to i8*");
+        }
+        string token = TaskTokenBits(fp);
+        string dn = NT(); L("  " + dn + " = call i32 @zan_task_isdone(i64 " + token + ")");
+        string c = NT(); L("  " + c + " = icmp ne i32 " + dn + ", 0");
+        L("  br i1 " + c + ", label %L" + ldone + ", label %L" + lwait);
+        Label(lwait);
+        int seq = curAwaitSeq; curAwaitSeq = curAwaitSeq + 1;
+        int st = seq + 1;
+        EmitAsyncSaveSlots();
+        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
+        L("  call void @zan_co_ready(i8* %fp, void(i8*)* @" + curResumeSym + ")");
+        EmitAsyncSuspend();
+        L("  ret void");
+        L("resume_" + st + ":");
+        term = false; curLbl = "resume_" + st;
+        EmitAsyncReloadSlots();
+        EmitAsyncRearm();
+        L("  br label %L" + ltest);
+        term = true;
+        Label(ldone);
+        return EmitAwaitTaskHandle(new ExprVal(fp, h.ty));
+    }
+
     // `await <task handle>`: the handle is a frame pointer -- pump the
     // cooperative scheduler until the frame is done, then take its result
     // (the frame is reaped by the reader, the same protocol as `t.Result`).
@@ -213,13 +270,25 @@ partial class Irgen {
     }
     // Terminal completion: write result, mark done, wake the awaiter, return.
     // Caller must have already run EmitAsyncEpilogue and ensured a +1 result.
+    //
+    // Order matters on the M:N worker pool (the runtime the host links): the
+    // moment DONE is visible another worker may run the awaiter, which reads
+    // the result and frees this frame -- unwinding the frame's owner chain
+    // (slot 18) through zexc_frame_free. So everything this invocation still
+    // has to do with the frame happens BEFORE DONE is published: cancel its
+    // pending delay timers (the host's emit_co_cancel_delay), read the
+    // awaiter slots, unwind its own owner chain and hand the thread's chain
+    // back. DONE is a release store; after it only SSA values are touched.
+    // (Unwinding after the wake let two workers free the same owner nodes:
+    // mqtt_concurrency_resilience heap-use-after-free, B-ID199 round 6.)
     void EmitAsyncComplete(string resi) {
         string rp = FrameGep("%ff", 6);
         L("  store i64 " + resi + ", i64* " + rp);
-        string dp = FrameGep("%ff", 3);
-        L("  store i64 1, i64* " + dp);
-        string sp = FrameGep("%ff", 2);
-        L("  store i64 -1, i64* " + sp);
+        if (!ExternSeen("zan_timer_cancel_delay")) {
+            externDecls.Add("zan_timer_cancel_delay");
+            H("declare i32 @zan_timer_cancel_delay(i8*)");
+        }
+        string cdl = NT(); L("  " + cdl + " = call i32 @zan_timer_cancel_delay(i8* %fp)");
         string awp = FrameGep("%ff", 4);
         string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
         // B-ID64 镜像：自等待者（Task.Spawn 写 AWAITER=自身）即 fire-and-forget
@@ -235,23 +304,27 @@ partial class Irgen {
             L("  br label %L" + lgo);
             Label(lgo);
         }
-        string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
-        string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
-        int lw = NL(); int lr = NL();
-        L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
-        Label(lw);
         string asp = FrameGep("%ff", 5);
         string asi = NT(); L("  " + asi + " = load i64, i64* " + asp);
-        string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
-        L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
-        L("  br label %L" + lr);
-        Label(lr);
         L("  call void @zexc_unwind(i8* null)");
         L("  store i64 0, i64* " + FrameGep("%ff", 18));
         string ownerParentBits = NT();
         L("  " + ownerParentBits + " = load i64, i64* " + FrameGep("%ff", 19));
         string ownerParent = FromI64(ownerParentBits, "i8*");
         L("  store i8* " + ownerParent + ", i8** @zexc_owners");
+        string sp = FrameGep("%ff", 2);
+        L("  store i64 -1, i64* " + sp);
+        string dp = FrameGep("%ff", 3);
+        L("  store atomic i64 1, i64* " + dp + " release, align 8");
+        string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
+        string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
+        int lw = NL(); int lr = NL();
+        L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
+        Label(lw);
+        string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
+        L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
+        L("  br label %L" + lr);
+        Label(lr);
         // Completion ends this invocation just like suspension: its trampoline
         // must never remain armed after the resume function returns.
         string handlerDepth = NT();
