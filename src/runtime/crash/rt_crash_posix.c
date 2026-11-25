@@ -113,18 +113,11 @@ static long zan__crash_tz_off;
 static int zan__crash_err_fd = -1;
 
 static void zan__crash_cache_handler_state(void) {
-    time_t now = time(NULL);
-    struct tm g, l;
-    if (gmtime_r(&now, &g) && localtime_r(&now, &l)) {
-        long day_diff = (long)l.tm_yday - (long)g.tm_yday;
-        if (l.tm_year > g.tm_year) day_diff = 1;
-        else if (l.tm_year < g.tm_year) day_diff = -1;
-        zan__crash_tz_off =
-            day_diff * 86400L +
-            ((long)(l.tm_hour) - (long)(g.tm_hour)) * 3600L +
-            ((long)(l.tm_min) - (long)(g.tm_min)) * 60L +
-            ((long)(l.tm_sec) - (long)(g.tm_sec));
-    }
+    /* Crash stamps are UTC (marked " UTC"). A local-time stamp needs the
+     * timezone offset, and localtime_r cannot run in the signal handler, so
+     * it used to be computed here -- at every program start, where loading
+     * the tz database cost 0.5-5 ms (most of a hello-world's startup over C).
+     * zan__crash_tz_off stays 0. */
 #if defined(F_DUPFD_CLOEXEC)
     int fd = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 100);
 #else
@@ -153,6 +146,7 @@ static void zan__crash_civil(long long z, int *y, unsigned *m, unsigned *d) {
     unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     unsigned mp = (5 * doy + 2) / 153;
     unsigned dd = doy - (153 * mp + 2) / 5 + 1;
+    *d = dd; /* was computed but never stored: every crash stamp said day 01 */
     *m = (unsigned)(mp < 10 ? mp + 3 : mp - 9);
     *y = (int)(yy + (*m <= 2));
 }
@@ -354,7 +348,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
         p = zan__crash_put2(p, mi);
         *p++ = ':';
         p = zan__crash_put2(p, ss);
-        *p = '\0';
+        memcpy(p, " UTC", 5);
     }
 
     /* 优先输出至 stderr，供外部进程守护者重定向捕获 */

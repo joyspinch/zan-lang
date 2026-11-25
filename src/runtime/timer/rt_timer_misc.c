@@ -175,6 +175,9 @@ int64_t __zan_dict_hash(const void *key, int64_t is_str) {
 #include "../rt_siphash.h"
 #if defined(_WIN32)
 #include <time.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 static uint64_t zan_hash_salt_k0 = 0, zan_hash_salt_k1 = 0;
@@ -196,6 +199,26 @@ static void zan_hash_salt_fill(uint64_t *k0, uint64_t *k1) {
     *k0 = pc.QuadPart ^ ((uint64_t)(uintptr_t)&pc << 17);
     *k1 = (uint64_t)(uintptr_t)zan_hash_salt_fill ^ ((uint64_t)GetCurrentProcessId() << 32);
 #else
+    /* One syscall, no FILE: fopen/fread/fclose of /dev/urandom cost ~155 us
+     * in this constructor, which every program runs at startup. */
+#if defined(__APPLE__)
+    {
+        uint64_t keys[2];
+        arc4random_buf(keys, sizeof(keys));
+        *k0 = keys[0];
+        *k1 = keys[1];
+        return;
+    }
+#elif defined(__linux__) && defined(SYS_getrandom)
+    {
+        uint64_t keys[2];
+        if (syscall(SYS_getrandom, keys, sizeof(keys), 0) == (long)sizeof(keys)) {
+            *k0 = keys[0];
+            *k1 = keys[1];
+            return;
+        }
+    }
+#endif
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) {
         uint64_t keys[2];

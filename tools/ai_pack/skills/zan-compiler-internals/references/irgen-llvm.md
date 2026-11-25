@@ -1053,3 +1053,14 @@ EH 状态查找（原子读 TSD 键 + mrs + 判空 + 慢路径调用，前后还
    写回的就是原值。`drop_unused_ctor_mark`：槽位的读者只用来写回栈顶时，删掉入口
    读、槽位与全部写回（有 unwind 调用读它就保留）。
 structs 0.34 → 0.17s（C 0.15）。
+
+## 48. 启动开销看运行时构造函数：时区库与 /dev/urandom（2026-11-25）
+
+hello 启动 5.9ms vs C 4.6ms。C 版只链 Zan 运行时目标文件就同样慢——差额全在运行时
+构造函数。逐项计时：崩溃处理器为了信号安全在启动时就 `localtime_r` 算时区偏移，
+首次调用加载 tz 数据库 0.5–5ms；哈希盐 `fopen("/dev/urandom")` 155µs（getentropy 1µs）。
+改为：崩溃时间戳用 UTC（带 " UTC"），启动不再碰时区；哈希盐 Apple 用
+`arc4random_buf`、Linux 用 `syscall(SYS_getrandom)`，失败回退 urandom。启动 5.9 → 5.2ms。
+顺修：`zan__crash_civil` 算出的日 `dd` 从未写回 `*d`，崩溃日期恒为 01 号（编译器
+"unused variable 'dd'" 警告早就指着它）。教训：给每个进程都跑的构造函数计时，
+别假设 libc 调用便宜；未用变量警告要看。
