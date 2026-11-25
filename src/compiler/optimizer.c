@@ -1139,6 +1139,324 @@ zan_status_t zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level
     return status;
 }
 
+/* ===================== Late ARC pass: pairs exposed by inlining =====================
+ * The early zan_opt_arc only sees a retain and its release when both sit in
+ * one function before inlining. The common shape -- a callee returns +1
+ * (`Make()` retains a field), the caller uses it as a temporary and releases
+ * it -- only meets after LLVM inlines the callee, and by then retain/release
+ * are themselves inlined atomics nobody can match. So the ARC and temp-stack
+ * helpers stay out of line through the main pipeline, then:
+ *   1. a temp push(v) followed in the same block by its pop with nothing in
+ *      between that can unwind is dead (the entry is only read on unwind);
+ *   2. retain(x) ... release(x) in one block with only ARC-neutral code in
+ *      between (is_safe_arc_intermediate: no call except pure ones and other
+ *      objects' ARC, no store of x or into its source slot) cancel out;
+ *   3. the helpers are inlined (alwaysinline) and the result cleaned up.
+ * ZAN_NO_LATE_ARC=1 restores the old pipeline (A/B). */
+static const char *const late_arc_helpers[] = {
+    "zan_rt_retain",      "zan_rt_release",    "zan_rt_release_dyn", "zan_rt_str_retain",
+    "zan_rt_str_release", "__zan_eh_tmp_push", "__zan_eh_tmp_pop",   NULL};
+
+static unsigned late_attr_kind(const char *name) {
+    return LLVMGetEnumAttributeKindForName(name, strlen(name));
+}
+
+/* Bit i set: helper i carried alwaysinline before the pipeline (the temp
+ * push/pop do; retain/release are left to the cost model). Restored after the
+ * late pass so the final inlining decisions match the old pipeline. */
+static unsigned late_arc_outline(LLVMModuleRef mod) {
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    unsigned k_always = late_attr_kind("alwaysinline"), k_never = late_attr_kind("noinline");
+    unsigned mask = 0;
+    bool any = false;
+    for (int i = 0; late_arc_helpers[i]; i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(mod, late_arc_helpers[i]);
+        if (!fn || LLVMIsDeclaration(fn)) continue;
+        if (LLVMGetEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, k_always)) {
+            mask |= 1u << i;
+            LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, k_always);
+        }
+        LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                LLVMCreateEnumAttribute(ctx, k_never, 0));
+        any = true;
+    }
+    return any ? (mask | 0x80000000u) : 0;
+}
+
+static void late_arc_restore(LLVMModuleRef mod, unsigned mask) {
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    unsigned k_always = late_attr_kind("alwaysinline"), k_never = late_attr_kind("noinline");
+    for (int i = 0; late_arc_helpers[i]; i++) {
+        LLVMValueRef fn = LLVMGetNamedFunction(mod, late_arc_helpers[i]);
+        if (!fn || LLVMIsDeclaration(fn)) continue;
+        LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, k_never);
+        if (mask & (1u << i))
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(ctx, k_always, 0));
+    }
+}
+
+static const char *late_callee_name(LLVMValueRef call) {
+    LLVMValueRef callee = LLVMGetCalledValue(call);
+    if (!callee || !LLVMIsAFunction(callee)) return NULL;
+    return LLVMGetValueName(callee);
+}
+
+static bool late_call_nounwind(LLVMValueRef call) {
+    unsigned k = late_attr_kind("nounwind");
+    if (LLVMGetCallSiteEnumAttribute(call, LLVMAttributeFunctionIndex, k)) return true;
+    LLVMValueRef callee = LLVMGetCalledValue(call);
+    return callee && LLVMIsAFunction(callee) &&
+           LLVMGetEnumAttributeAtIndex(callee, LLVMAttributeFunctionIndex, k);
+}
+
+/* A window instruction keeps x alive and its count unchanged. Releases of any
+ * other value close the window too (B-ID96: alias analysis here is SSA/slot
+ * identity only, so another value may be the same object at run time). */
+#define LATE_ARC_WINDOW 64
+static bool late_window_ok(LLVMValueRef c, LLVMValueRef obj) {
+    zan_arc_call_kind_t k = get_arc_call_kind(c);
+    if (k == ARC_RELEASE_OBJ || k == ARC_RELEASE_STR) return false;
+    return is_safe_arc_intermediate(c, obj);
+}
+
+/* Pass 1: drop push(v)/pop pairs whose window cannot unwind. */
+static int late_drop_tmp_pairs(LLVMValueRef fn) {
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            const char *n =
+                LLVMGetInstructionOpcode(inst) == LLVMCall ? late_callee_name(inst) : NULL;
+            if (n && strcmp(n, "__zan_eh_tmp_push") == 0) {
+                LLVMValueRef pop = NULL;
+                for (LLVMValueRef c = next; c && !LLVMIsATerminatorInst(c);
+                     c = LLVMGetNextInstruction(c)) {
+                    if (LLVMGetInstructionOpcode(c) != LLVMCall) continue;
+                    const char *cn = late_callee_name(c);
+                    if (cn && strcmp(cn, "__zan_eh_tmp_pop") == 0) {
+                        pop = c;
+                        break;
+                    }
+                    if (cn && strncmp(cn, "__zan_eh_", 9) == 0) break;
+                    if (!late_call_nounwind(c)) break;
+                }
+                if (pop) {
+                    if (next == pop) next = LLVMGetNextInstruction(pop);
+                    LLVMInstructionEraseFromParent(pop);
+                    LLVMInstructionEraseFromParent(inst);
+                    dropped++;
+                }
+            }
+            inst = next;
+        }
+    }
+    return dropped;
+}
+
+/* Pass 2: cancel retain(x) ... release(x) inside one block. */
+static int late_drop_arc_pairs(LLVMValueRef fn) {
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            zan_arc_call_kind_t k = get_arc_call_kind(inst);
+            if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) {
+                zan_arc_call_kind_t want = k == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
+                LLVMValueRef obj = get_arc_operand(inst);
+                LLVMValueRef rel = NULL;
+                int steps = 0;
+                for (LLVMValueRef c = next; c && steps < LATE_ARC_WINDOW;
+                     c = LLVMGetNextInstruction(c), steps++) {
+                    zan_arc_call_kind_t ck = get_arc_call_kind(c);
+                    if (ck == want && are_same_arc_object(get_arc_operand(c), obj)) {
+                        rel = c;
+                        break;
+                    }
+                    if (!late_window_ok(c, obj)) break;
+                }
+                if (rel) {
+                    if (next == rel) next = LLVMGetNextInstruction(rel);
+                    LLVMInstructionEraseFromParent(rel);
+                    LLVMInstructionEraseFromParent(inst);
+                    dropped++;
+                }
+            }
+            inst = next;
+        }
+    }
+    return dropped;
+}
+
+/* Pass 2b: retain(x) at the end of block B, release in a successor S --
+ * the shape every soft null-receiver guard produces (B branches to a cold
+ * report block and S merges `phi [x, B], [scratch, report]`). The retain is
+ * removed; each other successor T (single predecessor B, no phis) gets the
+ * retain back at its top; S releases a new phi that is null on the B edge and
+ * unchanged on the others. Every path keeps its count; the hot one drops the
+ * pair. */
+static LLVMValueRef late_first_non_phi(LLVMBasicBlockRef bb) {
+    LLVMValueRef i = LLVMGetFirstInstruction(bb);
+    while (i && LLVMIsAPHINode(i)) i = LLVMGetNextInstruction(i);
+    return i;
+}
+
+static LLVMValueRef late_phi_in(LLVMValueRef phi, LLVMBasicBlockRef from) {
+    unsigned n = LLVMCountIncoming(phi);
+    for (unsigned i = 0; i < n; i++)
+        if (LLVMGetIncomingBlock(phi, i) == from) return LLVMGetIncomingValue(phi, i);
+    return NULL;
+}
+
+static bool late_try_cross(LLVMBuilderRef b, LLVMValueRef retain, shrink_map_t *preds) {
+    LLVMBasicBlockRef bb = LLVMGetInstructionParent(retain);
+    LLVMValueRef obj = get_arc_operand(retain);
+    zan_arc_call_kind_t want =
+        get_arc_call_kind(retain) == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
+    LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+#if ZAN_LLVM_MAJOR >= 23
+    if (!term || (LLVMGetInstructionOpcode(term) != LLVMUncondBr &&
+                  LLVMGetInstructionOpcode(term) != LLVMCondBr))
+        return false;
+#else
+    if (!term || LLVMGetInstructionOpcode(term) != LLVMBr) return false;
+#endif
+    int steps = 0;
+    for (LLVMValueRef c = LLVMGetNextInstruction(retain); c && c != term;
+         c = LLVMGetNextInstruction(c))
+        if (++steps > LATE_ARC_WINDOW || !late_window_ok(c, obj)) return false;
+    unsigned ns = LLVMGetNumSuccessors(term);
+    if (ns < 1 || ns > 2) return false;
+    if (ns == 2 && LLVMGetSuccessor(term, 0) == LLVMGetSuccessor(term, 1)) return false;
+    LLVMBasicBlockRef s_bb = NULL, other = NULL;
+    LLVMValueRef rel = NULL, rel_phi = NULL;
+    for (unsigned si = 0; si < ns; si++) {
+        LLVMBasicBlockRef sb = LLVMGetSuccessor(term, si);
+        if (s_bb) {
+            other = sb;
+            continue;
+        }
+        int sw = 0;
+        for (LLVMValueRef c = late_first_non_phi(sb); c && sw < LATE_ARC_WINDOW;
+             c = LLVMGetNextInstruction(c), sw++) {
+            if (get_arc_call_kind(c) == want) {
+                LLVMValueRef v = get_arc_operand(c);
+                LLVMValueRef in = LLVMIsAPHINode(v) && LLVMGetInstructionParent(v) == sb
+                                      ? late_phi_in(v, bb)
+                                      : NULL;
+                int np = *shrink_map_slot(preds, LLVMBasicBlockAsValue(sb), NULL);
+                /* A direct release of x in a merge block is fine when its only
+                 * other predecessor is B's other successor (x dominates it). */
+                bool via_other = false;
+                if (np == 2 && ns == 2) {
+                    LLVMBasicBlockRef t = LLVMGetSuccessor(term, si == 0 ? 1 : 0);
+                    LLVMValueRef tt = LLVMGetBasicBlockTerminator(t);
+                    via_other = tt && LLVMGetNumSuccessors(tt) == 1 &&
+                                LLVMGetSuccessor(tt, 0) == sb &&
+                                *shrink_map_slot(preds, LLVMBasicBlockAsValue(t), NULL) == 1;
+                }
+                if (in && are_same_arc_object(in, obj)) {
+                    rel = c;
+                    rel_phi = v;
+                    s_bb = sb;
+                } else if (are_same_arc_object(v, obj) && (np == 1 || via_other)) {
+                    rel = c;
+                    rel_phi = np == 1 ? NULL : v; /* v == x: phi built below */
+                    s_bb = sb;
+                }
+                break;
+            }
+            /* The window must keep both x and (through the phi) the merged value. */
+            if (!is_safe_arc_intermediate(c, obj)) break;
+            if (get_arc_call_kind(c) != ARC_NONE) break;
+        }
+        if (!s_bb) other = sb;
+    }
+    if (!s_bb) return false;
+    if (other) {
+        if (*shrink_map_slot(preds, LLVMBasicBlockAsValue(other), NULL) != 1) return false;
+        if (LLVMIsAPHINode(LLVMGetFirstInstruction(other))) return false;
+    }
+    if (rel_phi) {
+        /* Release a copy of the phi that is null on the hot edge. */
+        LLVMPositionBuilderBefore(b, LLVMGetFirstInstruction(s_bb));
+        LLVMValueRef np = LLVMBuildPhi(b, LLVMTypeOf(rel_phi), "late.arc.rel");
+        if (LLVMIsAPHINode(rel_phi) && LLVMGetInstructionParent(rel_phi) == s_bb) {
+            unsigned n = LLVMCountIncoming(rel_phi);
+            for (unsigned i = 0; i < n; i++) {
+                LLVMBasicBlockRef ib = LLVMGetIncomingBlock(rel_phi, i);
+                LLVMValueRef iv = ib == bb ? LLVMConstNull(LLVMTypeOf(rel_phi))
+                                           : LLVMGetIncomingValue(rel_phi, i);
+                LLVMAddIncoming(np, &iv, &ib, 1);
+            }
+        } else {
+            /* Direct release of x: null on B's edge, x on the edge from `other`. */
+            LLVMValueRef iv[2] = {LLVMConstNull(LLVMTypeOf(rel_phi)), rel_phi};
+            LLVMBasicBlockRef ib[2] = {bb, other};
+            LLVMAddIncoming(np, iv, ib, 2);
+        }
+        LLVMSetOperand(rel, 0, np);
+    } else {
+        LLVMInstructionEraseFromParent(rel);
+    }
+    if (other) {
+        LLVMPositionBuilderBefore(b, LLVMGetFirstInstruction(other));
+        LLVMValueRef again = LLVMInstructionClone(retain);
+        LLVMInsertIntoBuilder(b, again);
+    }
+    LLVMInstructionEraseFromParent(retain);
+    return true;
+}
+
+static int late_drop_cross_pairs(LLVMValueRef fn) {
+    unsigned nblocks = LLVMCountBasicBlocks(fn);
+    if (nblocks < 2) return 0;
+    shrink_map_t preds;
+    if (!shrink_map_init(&preds, nblocks)) return 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+        if (!term) continue;
+        unsigned ns = LLVMGetNumSuccessors(term);
+        for (unsigned i = 0; i < ns; i++)
+            (*shrink_map_slot(&preds, LLVMBasicBlockAsValue(LLVMGetSuccessor(term, i)), NULL))++;
+    }
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(LLVMGetModuleContext(LLVMGetGlobalParent(fn)));
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        /* Only the last retain of a block can reach the terminator safely. */
+        LLVMValueRef last = NULL;
+        for (LLVMValueRef c = LLVMGetFirstInstruction(bb); c; c = LLVMGetNextInstruction(c)) {
+            zan_arc_call_kind_t k = get_arc_call_kind(c);
+            if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) last = c;
+        }
+        if (last && late_try_cross(b, last, &preds)) dropped++;
+    }
+    LLVMDisposeBuilder(b);
+    shrink_map_free(&preds);
+    return dropped;
+}
+
+static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, unsigned mask) {
+    int tmp = 0, arc = 0;
+    const char *dump = getenv("ZAN_DUMP_LATE_ARC_IR");
+    if (dump && dump[0]) LLVMPrintModuleToFile(mod, dump, NULL);
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        if (LLVMIsDeclaration(fn)) continue;
+        tmp += late_drop_tmp_pairs(fn);
+        arc += late_drop_arc_pairs(fn);
+        arc += late_drop_cross_pairs(fn);
+    }
+    if (getenv("ZAN_LATE_ARC_STATS"))
+        fprintf(stderr, "late-arc: %d temp push/pop pairs, %d retain/release pairs removed\n", tmp,
+                arc);
+    late_arc_restore(mod, mask);
+    return run_checked_passes(mod, tm,
+                              "cgscc(inline),function(sroa,early-cse<memssa>,instcombine<no-"
+                              "verify-fixpoint>,simplifycfg)");
+}
+
 zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
     if (zan_opt_verify_module(mod, "before optimization") != ZAN_OK) return ZAN_ERROR;
     if (level == ZAN_OPT_NONE) return ZAN_OK;
@@ -1198,6 +1516,11 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
         LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
     }
 
+    bool late_arc = (level == ZAN_OPT_FULL || level == ZAN_OPT_AGGRESSIVE ||
+                     level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) &&
+                    !getenv("ZAN_NO_LATE_ARC") && !getenv("ZAN_OPT_PIPELINE");
+    unsigned late_mask = late_arc ? late_arc_outline(mod) : 0;
+    late_arc = late_mask != 0;
     LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
     LLVMDisposePassBuilderOptions(opts);
     if (err) {
@@ -1208,6 +1531,7 @@ zan_status_t zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRe
     }
     if (zan_opt_verify_module(mod, "after pass pipeline") != ZAN_OK)
         return ZAN_ERROR;
+    if (late_arc && late_arc_finish(mod, tm, late_mask) != ZAN_OK) return ZAN_ERROR;
     /* 调试旋钮：ZAN_DUMP_OPT_IR=<路径> 落盘优化后的模块 IR（A595 二分用） */
     {
         const char *dump = getenv("ZAN_DUMP_OPT_IR");

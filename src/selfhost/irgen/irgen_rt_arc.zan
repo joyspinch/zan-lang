@@ -580,8 +580,11 @@ partial class Irgen {
         // unwound thread or scope holds nothing: a node released on another
         // thread (async hand-off) can no longer grow that thread's list
         // without limit, and thread exit leaks no cached nodes.
+        // The cache depth lives in the free head node itself (word 1 of a
+        // free node), not in another thread_local: on Mach-O every
+        // thread_local access is a _tlv_get_addr call, and arm/retire sit on
+        // hot paths (firebird_wire).
         H("@zexc_node_free = internal thread_local global i8* null");
-        H("@zexc_node_count = internal thread_local global i64 0");
         H("define internal i8* @zexc_node_alloc() {");
         H("entry:");
         H("  %head = load i8*, i8** @zexc_node_free");
@@ -591,9 +594,6 @@ partial class Irgen {
         H("  %hp = bitcast i8* %head to i8**");
         H("  %next = load i8*, i8** %hp");
         H("  store i8* %next, i8** @zexc_node_free");
-        H("  %c = load i64, i64* @zexc_node_count");
-        H("  %c1 = sub i64 %c, 1");
-        H("  store i64 %c1, i64* @zexc_node_count");
         H("  ret i8* %head");
         H("fresh:");
         H("  %raw = call i8* @malloc(i64 40)");
@@ -604,30 +604,36 @@ partial class Irgen {
         H("entry:");
         H("  %owners = load i8*, i8** @zexc_owners");
         H("  %idle = icmp eq i8* %owners, null");
+        H("  %head = load i8*, i8** @zexc_node_free");
         H("  br i1 %idle, label %drain, label %check");
         H("check:");
-        H("  %c = load i64, i64* @zexc_node_count");
+        H("  %hnil = icmp eq i8* %head, null");
+        H("  br i1 %hnil, label %keep, label %depth");
+        H("depth:");
+        H("  %hcp = getelementptr i8, i8* %head, i64 8");
+        H("  %hc = bitcast i8* %hcp to i64*");
+        H("  %c = load i64, i64* %hc");
         H("  %full = icmp uge i64 %c, 64");
         H("  br i1 %full, label %drop, label %keep");
         H("keep:");
-        H("  %head = load i8*, i8** @zexc_node_free");
+        H("  %c0 = phi i64 [ 0, %check ], [ %c, %depth ]");
         H("  %np = bitcast i8* %n to i8**");
         H("  store i8* %head, i8** %np");
+        H("  %ncp = getelementptr i8, i8* %n, i64 8");
+        H("  %nc = bitcast i8* %ncp to i64*");
+        H("  %c1 = add i64 %c0, 1");
+        H("  store i64 %c1, i64* %nc");
         H("  store i8* %n, i8** @zexc_node_free");
-        H("  %c1 = add i64 %c, 1");
-        H("  store i64 %c1, i64* @zexc_node_count");
         H("  ret void");
         H("drop:");
         H("  call void @free(i8* %n)");
         H("  ret void");
         H("drain:");
         H("  call void @free(i8* %n)");
-        H("  %first = load i8*, i8** @zexc_node_free");
         H("  store i8* null, i8** @zexc_node_free");
-        H("  store i64 0, i64* @zexc_node_count");
         H("  br label %loop");
         H("loop:");
-        H("  %cur = phi i8* [ %first, %drain ], [ %nx, %body ]");
+        H("  %cur = phi i8* [ %head, %drain ], [ %nx, %body ]");
         H("  %end = icmp eq i8* %cur, null");
         H("  br i1 %end, label %done, label %body");
         H("body:");

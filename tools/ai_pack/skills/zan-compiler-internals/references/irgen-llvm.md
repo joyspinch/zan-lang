@@ -850,3 +850,29 @@ zanc 默认开 LLVM 后端缓存（`docs/BUILD_CACHE.md`）：优化前模块与
   （实例：`zan_strip_unused_co_sched_init` 用 `g->rt_co_sched_init`，缓存构建不删调用，
   exe 比关缓存大 38 KB，`build_cache_memo` 的"关缓存产物相同"抓到）。
 验证三件套：冷/热/`--no-build-cache` 三次产物 `cmp` 逐字节相同；用例 `build_cache_memo`。
+
+## 39. 内联后才相遇的 retain/release 要在内联后消（2026-11-24 Mac arm64 实证）
+
+`Make(i).Get()`（Make 返回静态字段，+1）100M 次循环 1.0s，换成局部变量也一样——
+不是临时栈的锅：每轮两次原子 retain/release。早期 `zan_opt_arc` 在内联前跑，
+retain 在 Make 里、release 在调用方；内联后 retain/release 自己也被内联成原子
+指令，没人能配对。做法：主管线期间 `zan_rt_retain/release[_dyn]`、`zan_rt_str_*`、
+`__zan_eh_tmp_push/pop` 加 noinline（记下原 alwaysinline），管线后：
+1. push(v)…pop 同块且窗口无可展开调用 → 删（临时栈条目只在展开时读）；
+2. 同块 retain(x)…release(x)，窗口满足 `is_safe_arc_intermediate` 且**不含任何
+   异对象 release**（B-ID96 别名规则，同早期 pass）→ 删；
+3. 软空守卫形态：retain(x) 在 B 末尾，B 分叉到冷报告块 T 与合流块 S，S 里
+   release(phi[x,B][scratch,T]) 或 release(x)：删 retain，T 顶部补回 retain，S 改
+   release 一个 B 边为 null 的新 phi；
+4. 恢复原内联属性，跑 `cgscc(inline)` + 轻量清理。
+结果 1.0s → 0.03–0.11s，`--publish`（-Os）同样受益。
+
+踩坑：第 4 步一开始给所有助手加 alwaysinline，把原本冷路径上外联的大 release
+全内联了，自举编译器 54s/1.6GB/8.3MB → 160s/4.2GB/23MB。必须恢复**原**属性交给
+代价模型。真实程序命中少（自举 17 对、gui_tabs 29 对），收益集中在 getter/属性
+链热循环；编译时间与产物大小不变。
+
+另：`selfhost_diff` 的 firebird_wire 5s 超时在机器 load 25+ 时必然抖（3s user
+→ 5–6s wall，无界空闲链版本同样超时）；先看 user 时间再下结论。owner 节点
+缓存深度改存在空闲链头节点里，少一个 thread_local（Mach-O 每次访问都是
+`_tlv_get_addr`）。

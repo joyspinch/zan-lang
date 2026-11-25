@@ -404,6 +404,9 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_HUGE_FN` | `-O2`/`-O3` 时，优化前指令数超过此值（默认 4000，`0` 关闭）的函数加 `optsize`，降低往超大分派函数里内联的阈值 |
 | `ZAN_DIAG_LIB_BODIES` | `=1` 时普通（封闭世界）构建也为未达到的标准库/`packages/` 方法生成一遍代码以报代码生成诊断（默认只诊断用户源码里未达到的方法；库由自身构建与测试覆盖） |
 | `ZAN_EH_FN_MARK` | `=1` 时每个方法/lambda 入口都记临时栈标记、落地垫都回卷到它（旧行为）。默认只有函数体压过临时（`__zan_eh_tmp_push`）的函数才记，其余函数省掉入口线程 EH 状态读取与回卷调用，仅供 A/B |
+| `ZAN_NO_LATE_ARC` | `=1` 关闭内联后 ARC 收尾（默认 `-O2`/`-O3`/`-Os`/`-Oz` 开启：retain/release 与临时栈 push/pop 助手在 LLVM 主管线中保持外联，管线后消去同块或经软空守卫分叉的 retain/release 对、窗口内不会展开的 push/pop 对，再按原内联属性内联助手），仅供 A/B |
+| `ZAN_LATE_ARC_STATS` | 非空时在 stderr 打印内联后 ARC 收尾消去的 push/pop 对与 retain/release 对数 |
+| `ZAN_DUMP_LATE_ARC_IR` | `=<路径>` 落盘内联后 ARC 收尾之前的模块 IR（排查消对是否命中） |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断；设置时自动关闭构建缓存（命中会吞掉旁路输出，`ZAN_DUMP_OPT_IR` 同理） |
 | `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |

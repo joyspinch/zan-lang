@@ -878,6 +878,14 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     g->class_release = NULL;
     g->class_release_count = g->class_release_cap = 0;
     class_index_reset();
+    /* The context owns every type, constant and metadata node (~36 MB for
+     * the self-hosted compiler); it outlived the module until process exit. */
+    if (g->ctx) {
+        LLVMContextDispose(g->ctx);
+        g->ctx = NULL;
+    }
+    g->eh_state_owner = g->eh_state_cached = NULL;
+    memset(g->eh_state_fields, 0, sizeof(g->eh_state_fields));
 }
 
 void zan_irgen_destroy(zan_irgen_t *g) {
