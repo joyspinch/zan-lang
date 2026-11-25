@@ -213,6 +213,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 | E1005 未定义的类型 | 换成作用域里拼写最近的类型名（类/结构/接口/枚举/委托） |
 | E2073 条件里写成赋值 | 普通 `=` 换成 `==`（复合赋值不给） |
 | W2111 类之间的强引用环（S11） | 在回指针字段的类型前插入 `weak ` |
+| E2112 / E2113 / E2114 窗体标记里的处理器名 / 绑定路径 / 挂载字段不存在（S20） | 换成窗体类（含基类）里拼写最近的方法 / 字段或属性；补丁的 `file` 是那个 `.html` |
 
 zan-lsp 同口径：诊断的 range 用同一个结束位置，带 `code`（如 `E2085`）；有补丁的
 诊断在 `data.fix` 里带上补丁的 LSP range 与 `newText`，`textDocument/codeAction`

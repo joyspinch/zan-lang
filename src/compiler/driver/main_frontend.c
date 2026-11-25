@@ -350,6 +350,11 @@
     zan_checker_init(&checker, &binder, arena, diag);
     zan_compile_trace("check");
     zan_checker_check(&checker, ast);
+    /* S20：窗体标记（同名 .html）的处理器名与绑定路径对照类型检查——只在类型
+     * 检查通过时跑（符号表完整才不误报）。 */
+    if (!zan_diag_has_errors(diag))
+        zan_markup_check(ast, &binder, diag, explicit_input_count,
+                         (const char *const *)embed_specs, embed_spec_count);
 
     if (do_dump_ast) {
     }

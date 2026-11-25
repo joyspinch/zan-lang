@@ -21,6 +21,7 @@
 #include "embedres.h"
 #include "symbols.h"
 #include "query.h"
+#include "markup_check.h"
 #include "package.h"
 #include "win_utf8.h"
 #include "apk.h"

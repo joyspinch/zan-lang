@@ -205,6 +205,7 @@ add_executable(zanc
     src/compiler/builtin_api.c
     src/compiler/symbols.c
     src/compiler/query.c
+    src/compiler/markup_check.c
     src/compiler/suggest.c
     src/runtime/rt_decimal.c
     # compressor side of embedded resources (embedres.c embed_maybe_compress)
@@ -1757,7 +1758,7 @@ set_tests_properties(conformance_gui_cw_docscan PROPERTIES
 add_test(NAME diag_cw_missing_handler
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_missing_handler.zan
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/rt/diag_missing_handler.zan
     "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_missing_handler.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_missing_handler${_exe_ext}
@@ -1772,7 +1773,7 @@ set_tests_properties(diag_cw_missing_handler PROPERTIES
 add_test(NAME diag_cw_bad_mount
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_mount.zan
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/rt/diag_bad_mount.zan
     "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_mount.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_bad_mount${_exe_ext}
@@ -1787,7 +1788,7 @@ set_tests_properties(diag_cw_bad_mount PROPERTIES
 add_test(NAME diag_cw_bad_bindprop
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_bindprop.zan
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/rt/diag_bad_bindprop.zan
     "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/cwdocscan/diag_bad_bindprop.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cw_bad_bindprop${_exe_ext}
@@ -8795,6 +8796,13 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/diag-fixits)
   set_tests_properties(diag_fixits_apply PROPERTIES TIMEOUT 600)
+  # S20（docs/ZAN_STANDARD.md §5）：窗体同名 .html 里写错的处理器名/绑定路径/挂载字段
+  # 编译期报在属性值上（E2112/E2113/E2114）并给补丁；应用后通过，--embed 的标记同样配对。
+  add_test(NAME markup_check_compile
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_markup_check.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out/markup-check)
+  set_tests_properties(markup_check_compile PROPERTIES TIMEOUT 600)
   # S21（docs/ZAN_STANDARD.md §5）：启用了 UiDriver 的 GUI 程序（模板默认启用）在
   # ZAN_UI_DUMP=<文件> 下首帧后导出语义树（角色/名字/文本/值/勾选/enabled/区间）并退出。
   add_test(NAME gui_ui_dump_semantic_tree
