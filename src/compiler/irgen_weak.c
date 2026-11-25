@@ -56,6 +56,9 @@ static LLVMValueRef weak_atomic_count_add(zan_irgen_t *g, LLVMAtomicRMWBinOp op,
 }
 
 static LLVMBasicBlockRef emit_weak_lock(zan_irgen_t *g, LLVMValueRef fn) {
+  LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+  LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+  LLVMValueRef one = LLVMConstInt(i32, 1, 0);
   LLVMBasicBlockRef try_bb =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "weak.try");
   LLVMBasicBlockRef spin_bb =
@@ -65,23 +68,29 @@ static LLVMBasicBlockRef emit_weak_lock(zan_irgen_t *g, LLVMValueRef fn) {
   LLVMBuildBr(g->builder, try_bb);
   LLVMPositionBuilderAtEnd(g->builder, try_bb);
   LLVMValueRef old =
-      LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, g->weak_lock,
-                         LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0),
+      LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, g->weak_lock, one,
                          LLVMAtomicOrderingAcquire, 0);
-  LLVMValueRef held = LLVMBuildICmp(
-      g->builder, LLVMIntNE, old,
-      LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "weak.held");
+  LLVMValueRef held =
+      LLVMBuildICmp(g->builder, LLVMIntNE, old, zero, "weak.held");
   LLVMBuildCondBr(g->builder, held, spin_bb, got_bb);
   LLVMPositionBuilderAtEnd(g->builder, spin_bb);
-  LLVMBuildBr(g->builder, try_bb);
+  LLVMValueRef cur =
+      LLVMBuildLoad2(g->builder, i32, g->weak_lock, "weak.lock.cur");
+  LLVMSetAlignment(cur, 4);
+  LLVMSetOrdering(cur, LLVMAtomicOrderingMonotonic);
+  LLVMValueRef busy =
+      LLVMBuildICmp(g->builder, LLVMIntNE, cur, zero, "weak.busy");
+  LLVMBuildCondBr(g->builder, busy, spin_bb, try_bb);
   LLVMPositionBuilderAtEnd(g->builder, got_bb);
   return got_bb;
 }
 
 static void emit_weak_unlock(zan_irgen_t *g) {
-  LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpXchg, g->weak_lock,
-                     LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
-                     LLVMAtomicOrderingRelease, 0);
+  LLVMValueRef st = LLVMBuildStore(
+      g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0),
+      g->weak_lock);
+  LLVMSetAlignment(st, 4);
+  LLVMSetOrdering(st, LLVMAtomicOrderingRelease);
 }
 
 static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
@@ -248,7 +257,6 @@ static void emit_weak_nil_scan(zan_irgen_t *g, LLVMValueRef fn,
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMValueRef null = LLVMConstPointerNull(i8ptr);
 
-  emit_weak_lock(g, fn);
   LLVMValueRef buckets = weak_buckets_ensure(g, fn, weak_calloc);
   LLVMValueRef bucket = weak_bucket_for(g, buckets, obj, "weak.nil.bucket");
   LLVMValueRef head = LLVMBuildLoad2(b, i8ptr, bucket, "weak.nil.head");
@@ -347,6 +355,7 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
   LLVMBuildRetVoid(b);
 
   LLVMPositionBuilderAtEnd(b, lock_bb);
+  emit_weak_lock(g, g->rt_weak_nil_all);
   emit_weak_nil_scan(g, g->rt_weak_nil_all, weak_calloc, obj, done_bb);
 
   LLVMPositionBuilderAtEnd(b, done_bb);
@@ -357,58 +366,116 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
 static void emit_weak_destroy_begin_body(zan_irgen_t *g,
                                          LLVMValueRef weak_calloc) {
   LLVMBuilderRef b = g->builder;
-  LLVMTypeRef i8ptr = weak_i8ptr(g);
   LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
   LLVMValueRef obj = LLVMGetParam(g->rt_weak_destroy_begin, 0);
 
   LLVMBasicBlockRef true_bb = LLVMAppendBasicBlockInContext(
       g->ctx, g->rt_weak_destroy_begin, "weak.begin.empty");
   LLVMBasicBlockRef lock_bb = LLVMAppendBasicBlockInContext(
       g->ctx, g->rt_weak_destroy_begin, "weak.begin.lock");
+  LLVMBasicBlockRef scan_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_destroy_begin, "weak.begin.scan");
+  LLVMBasicBlockRef abort_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_destroy_begin, "weak.begin.abort");
   LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(
       g->ctx, g->rt_weak_destroy_begin, "weak.begin.done");
   emit_weak_count_check(g, g->rt_weak_destroy_begin, true_bb, lock_bb);
   LLVMPositionBuilderAtEnd(b, true_bb);
-  LLVMBuildRet(b, LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0));
+  LLVMBuildRet(b, LLVMConstInt(i1, 1, 0));
 
   LLVMPositionBuilderAtEnd(b, lock_bb);
-  emit_weak_nil_scan(g, g->rt_weak_destroy_begin, weak_calloc, obj, done_bb);
-
-  LLVMPositionBuilderAtEnd(b, done_bb);
+  emit_weak_lock(g, g->rt_weak_destroy_begin);
   LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
   LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj,
                                    &neg16, 1, "weak.begin.rcp");
   LLVMValueRef rcip =
       LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "weak.begin.rcip");
-  LLVMValueRef rc = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, rcip,
-                                       LLVMConstInt(i64, 0, 0),
-                                       LLVMAtomicOrderingMonotonic, 0);
-  LLVMValueRef ok =
+  LLVMValueRef rc = LLVMBuildLoad2(b, i64, rcip, "weak.begin.rc");
+  LLVMSetAlignment(rc, 8);
+  LLVMSetOrdering(rc, LLVMAtomicOrderingAcquire);
+  LLVMValueRef is_dead =
       LLVMBuildICmp(b, LLVMIntEQ, rc, LLVMConstInt(i64, 0, 0), "weak.begin.ok");
+  LLVMBuildCondBr(b, is_dead, scan_bb, abort_bb);
+
+  LLVMPositionBuilderAtEnd(b, scan_bb);
+  emit_weak_nil_scan(g, g->rt_weak_destroy_begin, weak_calloc, obj, done_bb);
+
+  LLVMPositionBuilderAtEnd(b, done_bb);
   emit_weak_unlock(g);
-  LLVMBuildRet(b, ok);
+  LLVMBuildRet(b, LLVMConstInt(i1, 1, 0));
+
+  LLVMPositionBuilderAtEnd(b, abort_bb);
+  emit_weak_unlock(g);
+  LLVMBuildRet(b, LLVMConstInt(i1, 0, 0));
 }
 
 static void emit_weak_load_retain_body(zan_irgen_t *g) {
   LLVMBuilderRef b = g->builder;
   LLVMTypeRef i8ptr = weak_i8ptr(g);
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
   LLVMValueRef slot = LLVMGetParam(g->rt_weak_load_retain, 0);
   LLVMValueRef null = LLVMConstPointerNull(i8ptr);
 
-  emit_weak_lock(g, g->rt_weak_load_retain);
+  LLVMBasicBlockRef locked_bb = emit_weak_lock(g, g->rt_weak_load_retain);
   LLVMValueRef v = LLVMBuildLoad2(b, i8ptr, slot, "weak.ld.val");
-  LLVMBasicBlockRef do_ret = LLVMAppendBasicBlockInContext(
-      g->ctx, g->rt_weak_load_retain, "weak.ld.retain");
+  LLVMBasicBlockRef check_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_load_retain, "weak.ld.check");
+  LLVMBasicBlockRef cas_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_load_retain, "weak.ld.cas");
+  LLVMBasicBlockRef alive_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_load_retain, "weak.ld.alive");
+  LLVMBasicBlockRef try_cas_bb = LLVMAppendBasicBlockInContext(
+      g->ctx, g->rt_weak_load_retain, "weak.ld.trycas");
   LLVMBasicBlockRef unlock_bb = LLVMAppendBasicBlockInContext(
       g->ctx, g->rt_weak_load_retain, "weak.ld.unlock");
   LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, v, null, "weak.ld.isnull"),
-                  unlock_bb, do_ret);
-  LLVMPositionBuilderAtEnd(b, do_ret);
-  zan_call2(b, LLVMGlobalGetValueType(g->rt_retain), g->rt_retain, &v, 1, "");
-  LLVMBuildBr(b, unlock_bb);
+                  unlock_bb, check_bb);
+
+  LLVMPositionBuilderAtEnd(b, check_bb);
+  LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+  LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), v, &neg16,
+                                   1, "weak.ld.rcp");
+  LLVMValueRef rcip =
+      LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "weak.ld.rcip");
+  LLVMValueRef rc0 = LLVMBuildLoad2(b, i64, rcip, "weak.ld.rc0");
+  LLVMSetAlignment(rc0, 8);
+  LLVMSetOrdering(rc0, LLVMAtomicOrderingMonotonic);
+  LLVMBuildBr(b, cas_bb);
+
+  LLVMPositionBuilderAtEnd(b, cas_bb);
+  LLVMValueRef rc_phi = LLVMBuildPhi(b, i64, "weak.ld.rc");
+  LLVMValueRef is_immortal = LLVMBuildICmp(
+      b, LLVMIntEQ, rc_phi, LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+      "weak.ld.immortal");
+  LLVMBuildCondBr(b, is_immortal, unlock_bb, alive_bb);
+
+  LLVMPositionBuilderAtEnd(b, alive_bb);
+  LLVMValueRef is_alive = LLVMBuildICmp(
+      b, LLVMIntSGT, rc_phi, LLVMConstInt(i64, 0, 0), "weak.ld.isalive");
+  LLVMBuildCondBr(b, is_alive, try_cas_bb, unlock_bb);
+
+  LLVMPositionBuilderAtEnd(b, try_cas_bb);
+  LLVMValueRef rc_next =
+      LLVMBuildAdd(b, rc_phi, LLVMConstInt(i64, 1, 0), "weak.ld.rcnext");
+  LLVMValueRef cas = LLVMBuildAtomicCmpXchg(
+      b, rcip, rc_phi, rc_next, LLVMAtomicOrderingMonotonic,
+      LLVMAtomicOrderingMonotonic, 0);
+  LLVMValueRef rc_prev = LLVMBuildExtractValue(b, cas, 0, "weak.ld.rcprev");
+  LLVMValueRef ok = LLVMBuildExtractValue(b, cas, 1, "weak.ld.casok");
+  LLVMBuildCondBr(b, ok, unlock_bb, cas_bb);
+
+  LLVMValueRef rc_in_vals[] = {rc0, rc_prev};
+  LLVMBasicBlockRef rc_in_bbs[] = {check_bb, try_cas_bb};
+  LLVMAddIncoming(rc_phi, rc_in_vals, rc_in_bbs, 2);
+
   LLVMPositionBuilderAtEnd(b, unlock_bb);
+  LLVMValueRef res_phi = LLVMBuildPhi(b, i8ptr, "weak.ld.res");
+  LLVMValueRef res_in_vals[] = {null, v, null, v};
+  LLVMBasicBlockRef res_in_bbs[] = {locked_bb, cas_bb, alive_bb, try_cas_bb};
+  LLVMAddIncoming(res_phi, res_in_vals, res_in_bbs, 4);
   emit_weak_unlock(g);
-  LLVMBuildRet(b, v);
+  LLVMBuildRet(b, res_phi);
 }
 static void emit_live_registry_fallback(zan_irgen_t *g);
 void emit_weak_runtime(zan_irgen_t *g) {

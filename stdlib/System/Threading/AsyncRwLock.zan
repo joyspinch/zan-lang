@@ -43,11 +43,17 @@ public class AsyncRwLock : IDisposable {
 
     // 释放共享访问。
     public void ExitRead() {
+        if (this.mtx == 0) {
+            return;
+        }
         Mutex.Lock(this.mtx);
-        this.readers = this.readers - 1;
-        bool wakeWriter = (this.readers == 0);
+        bool wakeWriter = false;
+        if (this.readers > 0) {
+            this.readers = this.readers - 1;
+            wakeWriter = (this.readers == 0);
+        }
         Mutex.Unlock(this.mtx);
-        if (wakeWriter) {
+        if (wakeWriter && this.writeGate != null) {
             this.writeGate.Signal();
         }
     }
@@ -75,15 +81,25 @@ public class AsyncRwLock : IDisposable {
     // 释放排他访问，先唤醒排队的写线程，
     // 然后唤醒排队的读线程。
     public void ExitWrite() {
+        if (this.mtx == 0) {
+            return;
+        }
         Mutex.Lock(this.mtx);
         this.writer = false;
         Mutex.Unlock(this.mtx);
-        this.writeGate.Signal();
-        this.readGate.Signal();
+        if (this.writeGate != null) {
+            this.writeGate.Signal();
+        }
+        if (this.readGate != null) {
+            this.readGate.Signal();
+        }
     }
 
     // 当前读线程数（诊断用）。
     public int ReaderCount() {
+        if (this.mtx == 0) {
+            return 0;
+        }
         Mutex.Lock(this.mtx);
         int r = this.readers;
         Mutex.Unlock(this.mtx);
@@ -92,6 +108,9 @@ public class AsyncRwLock : IDisposable {
 
     // 当前是否有写线程持有锁（诊断用）。
     public bool IsWriteLocked() {
+        if (this.mtx == 0) {
+            return false;
+        }
         Mutex.Lock(this.mtx);
         bool w = this.writer;
         Mutex.Unlock(this.mtx);
@@ -102,13 +121,16 @@ public class AsyncRwLock : IDisposable {
     public void Close() {
         if (this.readGate != null) {
             this.readGate.Close();
+            this.readGate = null;
         }
         if (this.writeGate != null) {
             this.writeGate.Close();
+            this.writeGate = null;
         }
         if (this.mtx != 0) {
-            Mutex.Destroy(this.mtx);
+            nint m = this.mtx;
             this.mtx = 0;
+            Mutex.Destroy(m);
         }
     }
 

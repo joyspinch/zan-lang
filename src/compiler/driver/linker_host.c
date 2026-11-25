@@ -42,6 +42,9 @@ if (target.os == ZAN_OS_WINDOWS) {
   argv[a++] = (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep";
   argv[a++] = "-shared";
   argv[a++] = "-Bdynamic";
+  argv[a++] = "--dynamicbase";
+  argv[a++] = "--nxcompat";
+  argv[a++] = "--high-entropy-va";
   if (dll_is_lld) {
     argv[a++] = "--gc-sections";
     if (publish_mode || strip_symbols)
@@ -167,7 +170,8 @@ if (target.os == ZAN_OS_WINDOWS) {
 #else
   const char *wsub = (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep";
   snprintf(cmd, sizeof(cmd),
-           "ld.lld -m %s -shared --gc-sections%s -e DllMain -o \"%s\" \"%s\""
+           "ld.lld -m %s -shared --dynamicbase --nxcompat --high-entropy-va"
+           " --gc-sections%s -e DllMain -o \"%s\" \"%s\""
            " -out-implib \"%s\"",
            wsub, (publish_mode || strip_symbols) ? " -s --icf=safe -O2" : "",
            obj_path, obj_tmp, implib);
@@ -204,7 +208,9 @@ if (target.os == ZAN_OS_WINDOWS) {
   lib_spawned = true;
 #endif
 } else if (target.os == ZAN_OS_LINUX) {
-  snprintf(cmd, sizeof(cmd), "ld.lld -shared --gc-sections%s -o \"%s\" \"%s\"",
+  snprintf(cmd, sizeof(cmd),
+           "ld.lld -shared -z relro -z now -z noexecstack --gc-sections%s -o "
+           "\"%s\" \"%s\"",
            (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "",
            shared_out, obj_tmp);
   if (rt_io_obj) {

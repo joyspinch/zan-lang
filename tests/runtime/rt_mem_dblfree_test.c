@@ -11,6 +11,7 @@
 void *__wrap_malloc(size_t n);
 void __wrap_free(void *p);
 void *__wrap_calloc(size_t n, size_t m);
+void *__wrap_realloc(void *p, size_t n);
 
 #include "src/runtime/rt_timer.h"
 
@@ -94,6 +95,13 @@ static void interior_free_child(void) {
     __wrap_free(p + 8);
 }
 
+static void realloc_after_free_child(void) {
+    void *p = __wrap_malloc(64);
+    if (!p) _exit(2);
+    __wrap_free(p);
+    (void)__wrap_realloc(p, 32);
+}
+
 
 static void takeover_handler(const char *category, const char *message) {
     fprintf(stderr, "fatal-handler-saw: %s: %s\n", category, message);
@@ -139,6 +147,7 @@ int main(void) {
 
     expect_abort(double_free_child, "double free");
     expect_abort(interior_free_child, "invalid free");
+    expect_abort(realloc_after_free_child, "realloc of freed block");
 
     expect_exit(takeover_child, 71, "fatal-handler-saw: mem: double free");
     expect_abort(returning_handler_child, "double free");

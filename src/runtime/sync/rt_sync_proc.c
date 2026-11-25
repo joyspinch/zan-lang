@@ -863,26 +863,52 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     flags = CREATE_NO_WINDOW;
   }
 
-  /* 路径安全转义包装防注入 */
-  int wexe_len = MultiByteToWideChar(CP_UTF8, 0, exe, -1, NULL, 0);
-  if (wexe_len <= 0) {
+  /* 路径安全转义包装防注入：显式路径同时传 lpApplicationName 锁死目标程序 */
+  char *cmdline = zan_win_quote_cmdline(exe, NULL, 0);
+  if (!cmdline) {
     if (hLog != INVALID_HANDLE_VALUE)
       CloseHandle(hLog);
     return -1;
   }
-  wchar_t *wcmd = (wchar_t *)malloc((wexe_len + 4) * sizeof(wchar_t));
+  int wcmd_len = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
+  if (wcmd_len <= 0) {
+    free(cmdline);
+    if (hLog != INVALID_HANDLE_VALUE)
+      CloseHandle(hLog);
+    return -1;
+  }
+  wchar_t *wcmd = (wchar_t *)malloc((size_t)wcmd_len * sizeof(wchar_t));
   if (!wcmd) {
+    free(cmdline);
     if (hLog != INVALID_HANDLE_VALUE)
       CloseHandle(hLog);
     return -1;
   }
-  wcmd[0] = L'"';
-  MultiByteToWideChar(CP_UTF8, 0, exe, -1, wcmd + 1, wexe_len);
-  wcmd[wexe_len] = L'"';
-  wcmd[wexe_len + 1] = L'\0';
+  MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, wcmd, wcmd_len);
+  free(cmdline);
 
-  BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit, flags, NULL, NULL,
+  wchar_t *wapp = NULL;
+  if (strchr(exe, '\\') || strchr(exe, '/') || strchr(exe, ':')) {
+    int wapp_len = MultiByteToWideChar(CP_UTF8, 0, exe, -1, NULL, 0);
+    if (wapp_len <= 0) {
+      free(wcmd);
+      if (hLog != INVALID_HANDLE_VALUE)
+        CloseHandle(hLog);
+      return -1;
+    }
+    wapp = (wchar_t *)malloc((size_t)wapp_len * sizeof(wchar_t));
+    if (!wapp) {
+      free(wcmd);
+      if (hLog != INVALID_HANDLE_VALUE)
+        CloseHandle(hLog);
+      return -1;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, exe, -1, wapp, wapp_len);
+  }
+
+  BOOL ok = CreateProcessW(wapp, wcmd, NULL, NULL, inherit, flags, NULL, NULL,
                            &si, &pi);
+  free(wapp);
   free(wcmd);
   if (hLog != INVALID_HANDLE_VALUE)
     CloseHandle(hLog);
@@ -1122,7 +1148,13 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     return -1;
   }
   int wlen = MultiByteToWideChar(CP_UTF8, 0, cmdline, -1, NULL, 0);
-  wchar_t *wcmd = (wchar_t *)malloc(wlen * sizeof(wchar_t));
+  if (wlen <= 0) {
+    free(cmdline);
+    CloseHandle(hRead);
+    CloseHandle(hWrite);
+    return -1;
+  }
+  wchar_t *wcmd = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
   if (!wcmd) {
     free(cmdline);
     CloseHandle(hRead);
@@ -1147,31 +1179,50 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
   char *buf = (char *)malloc(cap);
   if (!buf) {
     CloseHandle(hRead);
+    WaitForSingleObject(pi.hProcess, INFINITE);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     return -1;
   }
 
   DWORD bytesRead = 0;
+  int read_err = 0;
   while (ReadFile(hRead, buf + len, (DWORD)(cap - len - 1), &bytesRead, NULL) &&
          bytesRead > 0) {
     len += bytesRead;
+    if (len >= (size_t)INT32_MAX) {
+      read_err = 1;
+      break;
+    }
     if (len + 1024 >= cap) {
-      cap *= 2;
-      char *nb = (char *)realloc(buf, cap);
-      if (!nb)
+      size_t max_cap = (size_t)INT32_MAX + 1u;
+      size_t next_cap = cap <= max_cap / 2 ? cap * 2 : max_cap;
+      if (next_cap <= cap) {
+        read_err = 1;
         break;
+      }
+      char *nb = (char *)realloc(buf, next_cap);
+      if (!nb) {
+        read_err = 1;
+        break;
+      }
       buf = nb;
+      cap = next_cap;
     }
   }
   CloseHandle(hRead);
-  buf[len] = '\0';
 
   WaitForSingleObject(pi.hProcess, INFINITE);
   DWORD code = 0;
   GetExitCodeProcess(pi.hProcess, &code);
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
+
+  if (read_err) {
+    free(buf);
+    return -1;
+  }
+  buf[len] = '\0';
 
   *out_buf = buf;
   *out_len = (int32_t)len;

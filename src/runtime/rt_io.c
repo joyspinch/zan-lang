@@ -738,34 +738,41 @@ int32_t zan_io_set_nonblocking(intptr_t fd) {
 }
 
 static zan_io_slot_t *io_slot(int fd) {
-  if (fd < 0 || fd >= g_slots_cap)
+  int cap = __atomic_load_n(&g_slots_cap, __ATOMIC_ACQUIRE);
+  if (fd < 0 || fd >= cap)
     return NULL;
-  return &g_slots[fd];
+  zan_io_slot_t *slots = __atomic_load_n(&g_slots, __ATOMIC_ACQUIRE);
+  return slots ? &slots[fd] : NULL;
 }
 
 static int io_slots_ensure(int need) {
-  if (need <= g_slots_cap)
+  if (need <= __atomic_load_n(&g_slots_cap, __ATOMIC_ACQUIRE))
     return 1;
-  int cap = g_slots_cap ? g_slots_cap : 256;
-  while (cap > 0 && cap < need)
-    cap *= 2;
-  if (cap <= 0)
-    return 0;
   int n = io_shard_count();
   for (int i = 0; i < n; i++)
     shard_lock(&g_ioshard[i]);
-  if (need <= g_slots_cap) {
+  int cur_cap = __atomic_load_n(&g_slots_cap, __ATOMIC_RELAXED);
+  if (need <= cur_cap) {
     for (int i = n - 1; i >= 0; i--)
       shard_unlock(&g_ioshard[i]);
     return 1;
   }
+  int cap = cur_cap ? cur_cap : 256;
+  while (cap > 0 && cap < need)
+    cap = (cap <= INT_MAX / 2) ? cap * 2 : 0;
+  if (cap <= 0 || (size_t)cap > SIZE_MAX / sizeof(zan_io_slot_t)) {
+    for (int i = n - 1; i >= 0; i--)
+      shard_unlock(&g_ioshard[i]);
+    return 0;
+  }
+  zan_io_slot_t *old_slots = __atomic_load_n(&g_slots, __ATOMIC_RELAXED);
   zan_io_slot_t *ns =
-      (zan_io_slot_t *)realloc(g_slots, (size_t)cap * sizeof(*ns));
+      (zan_io_slot_t *)realloc(old_slots, (size_t)cap * sizeof(*ns));
   int ok = ns != NULL;
   if (ok) {
-    memset(ns + g_slots_cap, 0, (size_t)(cap - g_slots_cap) * sizeof(*ns));
-    g_slots = ns;
-    g_slots_cap = cap;
+    memset(ns + cur_cap, 0, (size_t)(cap - cur_cap) * sizeof(*ns));
+    __atomic_store_n(&g_slots, ns, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_slots_cap, cap, __ATOMIC_RELEASE);
   }
   for (int i = n - 1; i >= 0; i--)
     shard_unlock(&g_ioshard[i]);
@@ -798,6 +805,10 @@ static int io_deliver_waiter(int fd, zan_io_waiter_t *w) {
   }
   if (!w->out_n)
     return 1;
+  if (!w->rbuf || w->rlen <= 0) {
+    *w->out_n = 0;
+    return 1;
+  }
   ssize_t rn;
 #if defined(__linux__)
   const int flags = MSG_DONTWAIT;

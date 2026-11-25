@@ -102,11 +102,15 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
   }
 }
 
-/* 编译器在大量普通函数里插这条调用取软失败暂存区：返回的是常量指针，
- * 只需首次初始化。曾每次都拿全局 timer_lock——Web 压测下多 worker 在这把锁
- * 上排队，锁等待占 CPU 采样的四成以上（psynch_mutexwait 归因 ~6000/19000）。
- * 改为 acquire 读快路径；未发布时进锁双检、初始化后 release 发布。 */
-unsigned char *zan_rt_soft_scratch(void) {
+static void zan_init_soft_scratch_buf(unsigned char *hdr) {
+  memset(hdr, 0, 40 + ZAN_SOFT_SCRATCH_PAYLOAD);
+  store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
+  store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
+  store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
+  store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);     /* P-8:  discriminator */
+}
+
+static unsigned char *zan_rt_soft_scratch_fallback(void) {
   unsigned char *scratch = __atomic_load_n(&g_soft_scratch, __ATOMIC_ACQUIRE);
   if (__builtin_expect(scratch != NULL, 1))
     return scratch;
@@ -114,16 +118,83 @@ unsigned char *zan_rt_soft_scratch(void) {
   scratch = g_soft_scratch;
   if (!scratch) {
     unsigned char *hdr = g_soft_scratch_store.bytes;
-    memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
-    store_u64_le(hdr + 0, ZAN_SOFT_SCRATCH_RC); /* P-32: array rc */
-    store_u64_le(hdr + 8, ZAN_ARRAY_RC_MAGIC);
-    store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC); /* P-16: object rc */
-    store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);     /* P-8:  discriminator */
+    zan_init_soft_scratch_buf(hdr);
     scratch = hdr + 32;
     __atomic_store_n(&g_soft_scratch, scratch, __ATOMIC_RELEASE);
   }
   timer_unlock();
   return scratch;
+}
+
+#if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
+static __thread unsigned char *t_soft_scratch;
+static __thread int t_soft_scratch_exiting;
+#if defined(_WIN32)
+static INIT_ONCE g_soft_fls_once = INIT_ONCE_STATIC_INIT;
+static DWORD g_soft_fls_slot = FLS_OUT_OF_INDEXES;
+static void CALLBACK zan_soft_scratch_dtor(void *raw) {
+  t_soft_scratch = NULL;
+  t_soft_scratch_exiting = 1;
+  free(raw);
+}
+static BOOL CALLBACK zan_soft_fls_init(PINIT_ONCE once, PVOID param,
+                                       PVOID *ctx) {
+  (void)once;
+  (void)param;
+  (void)ctx;
+  g_soft_fls_slot = FlsAlloc(zan_soft_scratch_dtor);
+  return g_soft_fls_slot != FLS_OUT_OF_INDEXES;
+}
+#else
+static pthread_once_t g_soft_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_soft_key;
+static int g_soft_key_ready;
+static void zan_soft_scratch_dtor(void *raw) {
+  t_soft_scratch = NULL;
+  t_soft_scratch_exiting = 1;
+  free(raw);
+}
+static void zan_soft_key_init(void) {
+  if (pthread_key_create(&g_soft_key, zan_soft_scratch_dtor) == 0)
+    g_soft_key_ready = 1;
+}
+#endif
+#endif
+
+/* 编译器在大量普通函数里插这条调用取软失败暂存区：每线程独立分配一份
+ * 4 KiB 暂存区，快路径仅一次 TLS 读、零锁且无跨线程写冲突；OOM 或线程
+ * 析构期安全回退到静态副本。 */
+unsigned char *zan_rt_soft_scratch(void) {
+#if defined(__wasm__) || defined(ZAN_BARE_METAL)
+  return zan_rt_soft_scratch_fallback();
+#else
+  unsigned char *scratch = t_soft_scratch;
+  if (__builtin_expect(scratch != NULL, 1))
+    return scratch;
+  if (t_soft_scratch_exiting)
+    return zan_rt_soft_scratch_fallback();
+  unsigned char *hdr =
+      (unsigned char *)calloc(1, 40 + ZAN_SOFT_SCRATCH_PAYLOAD);
+  if (!hdr)
+    return zan_rt_soft_scratch_fallback();
+  zan_init_soft_scratch_buf(hdr);
+#if defined(_WIN32)
+  if (!InitOnceExecuteOnce(&g_soft_fls_once, zan_soft_fls_init, NULL, NULL) ||
+      !FlsSetValue(g_soft_fls_slot, hdr)) {
+    free(hdr);
+    return zan_rt_soft_scratch_fallback();
+  }
+#else
+  pthread_once(&g_soft_key_once, zan_soft_key_init);
+  if (!g_soft_key_ready || pthread_setspecific(g_soft_key, hdr) != 0) {
+    free(hdr);
+    return zan_rt_soft_scratch_fallback();
+  }
+#endif
+  scratch = hdr + 32;
+  t_soft_scratch = scratch;
+  return scratch;
+#endif
 }
 
 static int zan_soft_seen(const char *text) {

@@ -454,18 +454,33 @@ typedef struct {
 static zan_tr_ent *g_tr_ring;
 static volatile long long g_tr_seq = -1;
 static int g_co_trace = -1;
-static void co_trace(const char *what, const void *fp) {
-  if (g_co_trace < 0) {
-    const char *e = getenv("ZAN_CO_TRACE");
-    g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-    if (g_co_trace && !g_tr_ring) {
-      g_tr_ring = (zan_tr_ent *)calloc(ZAN_TR_RING, sizeof(zan_tr_ent));
+static int co_trace_enabled(void) {
+  int st = __atomic_load_n(&g_co_trace, __ATOMIC_ACQUIRE);
+  if (st >= 0)
+    return st;
+  const char *e = getenv("ZAN_CO_TRACE");
+  int want = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+  if (want && !__atomic_load_n(&g_tr_ring, __ATOMIC_ACQUIRE)) {
+    zan_tr_ent *ring = (zan_tr_ent *)calloc(ZAN_TR_RING, sizeof(zan_tr_ent));
+    if (ring) {
+      zan_tr_ent *expected = NULL;
+      if (!__atomic_compare_exchange_n(&g_tr_ring, &expected, ring, 0,
+                                       __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        free(ring);
+      }
     }
   }
-  if (!g_co_trace || !g_tr_ring)
+  __atomic_store_n(&g_co_trace, want, __ATOMIC_RELEASE);
+  return want;
+}
+static void co_trace(const char *what, const void *fp) {
+  if (!co_trace_enabled())
+    return;
+  zan_tr_ent *ring = __atomic_load_n(&g_tr_ring, __ATOMIC_ACQUIRE);
+  if (!ring)
     return;
   long long i = InterlockedIncrement64(&g_tr_seq);
-  zan_tr_ent *e = &g_tr_ring[i & (ZAN_TR_RING - 1)];
+  zan_tr_ent *e = &ring[i & (ZAN_TR_RING - 1)];
   e->seq = i;
   e->tid = GetCurrentThreadId();
   e->tag = what;
@@ -473,11 +488,10 @@ static void co_trace(const char *what, const void *fp) {
 }
 
 static void co_trace_dump(long long live) {
-  if (g_co_trace < 0) {
-    const char *e = getenv("ZAN_CO_TRACE");
-    g_co_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
-  }
-  if (!g_co_trace || !g_tr_ring)
+  if (!co_trace_enabled())
+    return;
+  zan_tr_ent *ring = __atomic_load_n(&g_tr_ring, __ATOMIC_ACQUIRE);
+  if (!ring)
     return;
   long long total = g_tr_seq;
   long long first = total - ZAN_TR_RING;
@@ -485,7 +499,7 @@ static void co_trace_dump(long long live) {
     first = -1;
   fprintf(stderr, "[cot DUMP live=%lld seq=%lld]\n", live, total);
   for (long long s = (first > 0 ? first : 0) + 1; s <= total; s++) {
-    zan_tr_ent *e = &g_tr_ring[s & (ZAN_TR_RING - 1)];
+    zan_tr_ent *e = &ring[s & (ZAN_TR_RING - 1)];
     if (e->seq != s)
       continue;
     fprintf(stderr, "[cot %lld %lu %s %p]\n", e->seq, (unsigned long)e->tid,

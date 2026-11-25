@@ -312,6 +312,9 @@ else {
     argv[a++] = "-Bdynamic";
     argv[a++] = "--stack";
     argv[a++] = "268435456";
+    argv[a++] = "--dynamicbase";
+    argv[a++] = "--nxcompat";
+    argv[a++] = "--high-entropy-va";
     if (publish_mode || strip_symbols) {
       argv[a++] = "-s";
     }
@@ -433,7 +436,8 @@ else {
     char link_cmd[32768];
     snprintf(link_cmd, sizeof(link_cmd),
              "clang --target=x86_64-w64-windows-gnu --ld-path=\"%s\" "
-             "\"%s\" -o \"%s\" -Wl,--stack,268435456 -Wl,--gc-sections%s",
+             "\"%s\" -o \"%s\" -Wl,--stack,268435456 -Wl,--gc-sections"
+             " -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va%s",
              lld_path, generated_objects.paths[0], obj_path,
              publish_mode ? " -O2 -s -Wl,--icf=safe -Wl,-O2" : "");
     for (int oi = 1; oi < generated_objects.count; oi++) {
@@ -516,11 +520,14 @@ else {
 #else
   if (publish_mode || strip_symbols) {
     snprintf(link_cmd, sizeof(link_cmd),
-             "cc \"%s\" -o \"%s\" -lm -O2 -s -Wl,--gc-sections", obj_tmp,
-             obj_path);
+             "cc \"%s\" -o \"%s\" -lm -O2 -s -Wl,--gc-sections"
+             " -Wl,-z,relro,-z,now -Wl,-z,noexecstack",
+             obj_tmp, obj_path);
   } else {
     snprintf(link_cmd, sizeof(link_cmd),
-             "cc \"%s\" -o \"%s\" -lm -Wl,--gc-sections", obj_tmp, obj_path);
+             "cc \"%s\" -o \"%s\" -lm -Wl,--gc-sections"
+             " -Wl,-z,relro,-z,now -Wl,-z,noexecstack",
+             obj_tmp, obj_path);
   }
 #endif
   /* Publish sharding (shard_emit.c) moves most functions into extra

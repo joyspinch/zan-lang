@@ -142,6 +142,8 @@ void zan_co_sched_init(void) {
   }
   if (!g_wk) {
     g_wk = (zan_co_worker_t *)calloc(ZAN_CO_MAXW, sizeof(zan_co_worker_t));
+    if (!g_wk)
+      zan_rt_fatal("oom", "co_sched: worker table alloc failed");
     for (int i = 0; i < ZAN_CO_MAXW; i++)
       InitializeCriticalSection(&g_wk[i].queue_lock);
   }
@@ -154,7 +156,7 @@ void zan_co_sched_init(void) {
   g_co_searching = 0;
   InterlockedExchange(&g_co_stop, 0);
   InterlockedExchange(&g_co_pool_live, 0);
-  g_co_pool_gen = 0;
+  __atomic_store_n(&g_co_pool_gen, 0, __ATOMIC_RELEASE);
   g_io_shards_live = 0;
   g_timer_owner = 0;
   g_timer_pumped_us = 0;
@@ -603,7 +605,9 @@ void zan_co_sync_sleep(long long ms) {
 static void co_worker(int worker) {
   co_timeperiod_raise();
   zan_co_worker_t *w = &g_wk[worker];
-  w->bg_gen = g_co_pool_gen;
+  __atomic_store_n(&w->bg_gen,
+                   __atomic_load_n(&g_co_pool_gen, __ATOMIC_ACQUIRE),
+                   __ATOMIC_RELEASE);
   t_co_self = w;
   LONG idle_seen = -1;
   long long idle_since_us = 0;
@@ -767,12 +771,13 @@ static void co_pool_start_background(void) {
     io_shards_start(w);
     g_io_shards_live = 1;
   }
-  g_co_pool_gen = g_co_pool_gen + 1;
+  int next_gen = __atomic_load_n(&g_co_pool_gen, __ATOMIC_ACQUIRE) + 1;
+  __atomic_store_n(&g_co_pool_gen, next_gen, __ATOMIC_RELEASE);
   g_co_pool_out = w;
   co_trace("start", NULL);
   int made = 0;
   for (int i = 0; i < w; i++) {
-    g_wk[i].bg_gen = g_co_pool_gen;
+    __atomic_store_n(&g_wk[i].bg_gen, next_gen, __ATOMIC_RELEASE);
 #if defined(_WIN32)
     HANDLE th =
         CreateThread(NULL, 0, co_worker_thunk, (LPVOID)(uintptr_t)i, 0, NULL);
@@ -805,7 +810,9 @@ static void co_pool_retire(zan_co_worker_t *w) {
 #if defined(_WIN32) && defined(ZAN_CO_DRIVER)
   io_op_pool_flush_tls();
 #endif
-  if (w->bg_gen != g_co_pool_gen || g_co_pool_gen == 0) {
+  int pool_gen = __atomic_load_n(&g_co_pool_gen, __ATOMIC_ACQUIRE);
+  if (__atomic_load_n(&w->bg_gen, __ATOMIC_ACQUIRE) != pool_gen ||
+      pool_gen == 0) {
     return;
   }
   co_trace("retire", w);

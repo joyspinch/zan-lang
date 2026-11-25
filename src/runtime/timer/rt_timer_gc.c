@@ -444,8 +444,23 @@ typedef struct {
 } zan_obj_map_t;
 
 static inline void zan_obj_map_init(zan_obj_map_t *map, size_t min_cap) {
+    if (min_cap > SIZE_MAX / (2 * sizeof(zan_map_entry_t))) {
+        map->capacity = 0;
+        map->mask = 0;
+        map->entries = NULL;
+        return;
+    }
+    size_t target = min_cap * 2;
     size_t cap = 64;
-    while (cap < min_cap * 2) cap *= 2;
+    while (cap < target) {
+        if (cap > SIZE_MAX / (2 * sizeof(zan_map_entry_t))) {
+            map->capacity = 0;
+            map->mask = 0;
+            map->entries = NULL;
+            return;
+        }
+        cap *= 2;
+    }
     map->capacity = cap;
     map->mask = cap - 1;
     map->entries = (zan_map_entry_t *)ZAN_GC_CALLOC(cap, sizeof(zan_map_entry_t));

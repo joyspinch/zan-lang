@@ -51,18 +51,41 @@ static int zan_header_geometry_ok(const zan_shared_header *header) {
     return 0;
   for (uint32_t i = 0; i < header->column_count; i++) {
     const zan_shared_column *c = &header->columns[i];
-    if (c->type != ZAN_TABLE_INT && c->type != ZAN_TABLE_STRING &&
-        c->type != ZAN_TABLE_FLOAT)
+    if (c->type == ZAN_TABLE_INT || c->type == ZAN_TABLE_FLOAT) {
+      if (c->size != 8)
+        return 0;
+    } else if (c->type == ZAN_TABLE_STRING) {
+      if (c->size < 2 || c->size > ZAN_TABLE_MAX_STRING + 1u)
+        return 0;
+    } else {
       return 0;
-    if (c->size == 0 || (uint64_t)c->offset + c->size > header->row_stride)
+    }
+    if (c->offset < min_stride ||
+        (uint64_t)c->offset + c->size > header->row_stride)
       return 0;
     if (!memchr(c->name, '\0', sizeof(c->name)))
       return 0;
   }
+  if (header->capacity >
+      (UINT64_MAX - (uint64_t)rows_offset) /
+          ((uint64_t)header->row_stride + sizeof(uint64_t)))
+    return 0;
   uint64_t expected = (uint64_t)rows_offset +
                       header->capacity * (uint64_t)header->row_stride +
                       header->capacity * sizeof(uint64_t);
   return expected == header->total_size;
+}
+
+static int zan_table_snapshot_validate(zan_shared_table *table) {
+  memcpy(&table->snap, table->header, sizeof(table->snap));
+  if (table->snap.ready != 1 || table->snap.magic != ZAN_TABLE_MAGIC ||
+      table->snap.version != ZAN_TABLE_VERSION ||
+      table->snap.total_size < sizeof(zan_shared_header) ||
+      table->snap.total_size > table->mapped_size ||
+      !zan_header_geometry_ok(&table->snap)) {
+    return 0;
+  }
+  return 1;
 }
 
 /* 初始化并发布共享内存表头部结构 */
@@ -85,6 +108,7 @@ static void zan_table_init_header(zan_shared_table *table,
   __sync_synchronize();
 #endif
   table->header->ready = 1;
+  memcpy(&table->snap, table->header, sizeof(table->snap));
 }
 
 static zan_shared_table *zan_table_alloc(void) {
@@ -229,11 +253,7 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
 #else
   __sync_synchronize();
 #endif
-  if (table->header->ready != 1 || table->header->magic != ZAN_TABLE_MAGIC ||
-      table->header->version != ZAN_TABLE_VERSION ||
-      table->header->total_size < sizeof(zan_shared_header) ||
-      table->header->total_size > table->mapped_size ||
-      !zan_header_geometry_ok(table->header)) {
+  if (!zan_table_snapshot_validate(table)) {
     zan_shared_table_free(table);
     return 0;
   }
@@ -362,16 +382,12 @@ int64_t zan_shared_table_open(const char *name) {
 #else
   __sync_synchronize();
 #endif
-  if (table->header->ready != 1 || table->header->magic != ZAN_TABLE_MAGIC ||
-      table->header->version != ZAN_TABLE_VERSION ||
-      table->header->total_size < sizeof(zan_shared_header) ||
-      table->header->total_size > table->mapped_size ||
-      !zan_header_geometry_ok(table->header)) {
+  if (!zan_table_snapshot_validate(table)) {
     zan_shared_table_free(table);
     return 0;
   }
 #ifndef _WIN32
-  if (table->header->total_size != table->mapped_size) {
+  if (table->snap.total_size != table->mapped_size) {
     zan_shared_table_free(table);
     return 0;
   }
@@ -596,23 +612,23 @@ int32_t zan_shared_table_edit_ints(int64_t handle, const char *key,
   uint32_t offsets[ZAN_TABLE_MAX_COLUMNS];
   uint64_t selected = 0;
   for (uint32_t i = 0; i < column_count; i++) {
-    zan_shared_column *column =
-        zan_find_column(header, columns[i], ZAN_TABLE_INT);
+    const zan_shared_column *column =
+        zan_find_column(table, columns[i], ZAN_TABLE_INT);
     if (!column)
       return 0;
-    uint64_t bit = UINT64_C(1) << (column - header->columns);
+    uint64_t bit = UINT64_C(1) << (column - table->snap.columns);
     if (selected & bit)
       return 0;
     selected |= bit;
     offsets[i] = column->offset;
   }
 
-  size_t key_len = zan_strnlen(key, header->key_size + 1u);
+  size_t key_len = zan_strnlen(key, table->snap.key_size + 1u);
   zan_struct_lock(header);
   if (now_ms < 0)
     now_ms = zan_time_epoch_ms();
   zan_purge_expired_locked(header, now_ms, purge_limit);
-  if (key_len == 0 || key_len > header->key_size) {
+  if (key_len == 0 || key_len > table->snap.key_size) {
     zan_struct_unlock(header);
     return 0;
   }

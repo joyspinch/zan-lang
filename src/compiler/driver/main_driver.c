@@ -1318,11 +1318,11 @@ static void zan_request_live_registry(zan_irgen_t *g) {
     LLVMSetInitializer(flag, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0));
   if (!uses && (!flag || (!g->check_leaks && !g->emit_lib)))
     return;
-    LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
-    LLVMTypeRef vfn = LLVMFunctionType(voidt, NULL, 0, 0);
-    LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
-    LLVMValueRef ctor = LLVMAddFunction(g->mod, "__zan_live_registry_ctor", vfn);
-    LLVMSetLinkage(ctor, LLVMInternalLinkage);
+  LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
+  LLVMTypeRef vfn = LLVMFunctionType(voidt, NULL, 0, 0);
+  LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+  LLVMValueRef ctor = LLVMAddFunction(g->mod, "__zan_live_registry_ctor", vfn);
+  LLVMSetLinkage(ctor, LLVMInternalLinkage);
     if (uses) {
         LLVMValueRef en = LLVMGetNamedFunction(g->mod, "zan_rt_live_enable");
         if (!en) {

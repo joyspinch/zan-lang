@@ -18,6 +18,9 @@
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #define ZAN_MEM_HAVE_MMAP 1
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
@@ -381,9 +384,9 @@ static zan_mem_cache *zan_mem_cache_get(void) {
     return NULL;
 #endif
   zan_mem_lock();
-  c = g_cache_pool;
+  c = __atomic_load_n(&g_cache_pool, __ATOMIC_RELAXED);
   if (c)
-    g_cache_pool = c->next_free;
+    __atomic_store_n(&g_cache_pool, c->next_free, __ATOMIC_RELEASE);
   zan_mem_unlock();
   if (!c) {
     c = (zan_mem_cache *)__real_malloc(sizeof *c);
@@ -437,13 +440,13 @@ static void zan_mem_retire(zan_mem_cache *c) {
     }
   }
   zan_mem_lock();
-  c->next_free = g_cache_pool;
-  g_cache_pool = c;
+  c->next_free = __atomic_load_n(&g_cache_pool, __ATOMIC_RELAXED);
+  __atomic_store_n(&g_cache_pool, c, __ATOMIC_RELEASE);
   zan_mem_unlock();
 }
 
 static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
-  if (!g_cache_pool)
+  if (!__atomic_load_n(&g_cache_pool, __ATOMIC_ACQUIRE))
     return NULL;
   zan_mem_lock();
   for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
@@ -464,7 +467,7 @@ static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
  * 线程使用；并发远端释放读到旧属主只会推进它的远端队列，之后被收割）。
  * 否则线程池频繁起落时每个退役线程都留下若干半空页。 */
 static int zan_mem_adopt_retired_page(zan_mem_cache *c, int cls) {
-    if (!g_cache_pool) return 0;
+    if (!__atomic_load_n(&g_cache_pool, __ATOMIC_ACQUIRE)) return 0;
     size_t sz = k_class_size[cls];
     zan_mem_lock();
     for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
@@ -486,7 +489,7 @@ static int zan_mem_adopt_retired_page(zan_mem_cache *c, int cls) {
 }
 
 static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
-  if (!g_cache_pool)
+  if (!__atomic_load_n(&g_cache_pool, __ATOMIC_ACQUIRE))
     return 0;
   zan_mem_lock();
   for (zan_mem_cache *rc = g_cache_pool; rc; rc = rc->next_free) {
@@ -505,12 +508,48 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
   return 0;
 }
 
+static uintptr_t zan_mem_os_entropy(void) {
+  uintptr_t ent = 0;
+#if defined(_WIN32)
+  /* Do not call LoadLibrary inside malloc lock; query already-loaded DLLs only. */
+  HMODULE adv = GetModuleHandleA("advapi32.dll");
+  if (adv) {
+    typedef BOOLEAN(WINAPI * rtl_gen_random_fn)(PVOID, ULONG);
+    rtl_gen_random_fn fn =
+        (rtl_gen_random_fn)(void *)GetProcAddress(adv, "SystemFunction036");
+    if (fn)
+      (void)fn(&ent, (ULONG)sizeof(ent));
+  }
+  LARGE_INTEGER qpc;
+  QueryPerformanceCounter(&qpc);
+  ent ^= (uintptr_t)qpc.QuadPart ^
+         ((uintptr_t)GetCurrentProcessId() << 32) ^
+         (uintptr_t)GetCurrentThreadId();
+#elif defined(__APPLE__)
+  arc4random_buf(&ent, sizeof(ent));
+#elif defined(__linux__) && defined(SYS_getrandom)
+  (void)syscall(SYS_getrandom, &ent, sizeof(ent), 1u /* GRND_NONBLOCK */);
+  ent ^= ((uintptr_t)getpid() << 16);
+#elif defined(ZAN_MEM_HAVE_MMAP)
+  ent ^= ((uintptr_t)getpid() << 16);
+#endif
+  return ent;
+}
+
 static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
+  uintptr_t ent = 0;
+  if (!__atomic_load_n(&g_mem_secret, __ATOMIC_RELAXED))
+    ent = zan_mem_os_entropy();
   zan_mem_lock();
   if (!g_mem_secret) {
-    uintptr_t x =
-        (uintptr_t)&g_mem_secret ^ (base * 0x9E3779B97F4A7C15ull) ^ (uintptr_t)c;
-    g_mem_secret = x | 1;
+    uint64_t x = (uint64_t)ent ^ (uint64_t)(uintptr_t)&g_mem_secret ^
+                 ((uint64_t)base * UINT64_C(0x9E3779B97F4A7C15)) ^
+                 (uint64_t)(uintptr_t)c;
+    x = (x ^ (x >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94D049BB133111EB);
+    x = x ^ (x >> 31);
+    __atomic_store_n(&g_mem_secret, (uintptr_t)x | (uintptr_t)1,
+                     __ATOMIC_RELEASE);
   }
   unsigned i = zan_mem_hash(base);
   unsigned n = 0;
@@ -809,6 +848,11 @@ void *__wrap_realloc(void *p, size_t n) {
   int cls = zan_mem_class_or_die(p);
   if (cls < 0)
     return NULL;
+  if (__atomic_load_n((const uintptr_t *)p + 1, __ATOMIC_ACQUIRE) ==
+      zan_mem_cookie(p)) {
+    zan_mem_fatal_block("realloc of freed block", p);
+    return NULL;
+  }
   size_t old = k_class_size[cls];
   if (n <= old)
     return p;

@@ -37,7 +37,8 @@ else if (cross_compiling && target.os == ZAN_OS_LINUX) {
   char cmd[4096];
   snprintf(
       cmd, sizeof(cmd),
-      "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\" \"%s/crt1.o\"",
+      "ld.lld -static -z relro -z now -z noexecstack%s --eh-frame-hdr"
+      " --gc-sections -o \"%s\" \"%s/crt1.o\"",
       (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path,
       sys);
   /* Zig musl on RISC-V does not use the legacy .init/.fini objects. */
@@ -224,7 +225,8 @@ else if (cross_compiling && target.os == ZAN_OS_OHOS) {
   }
   /* libunwind locates the executable's tables through PT_GNU_EH_FRAME. */
   snprintf(cmd, sizeof(cmd),
-           "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\""
+           "ld.lld -static -z relro -z now -z noexecstack%s --eh-frame-hdr"
+           " --gc-sections -o \"%s\""
            " \"%s/crt1.o\" \"%s/crti.o\" \"%s/clang_rt.crtbegin.o\" \"%s\"",
            (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path,
            sys, sys, sys, obj_tmp);
@@ -303,14 +305,16 @@ else if (cross_compiling && target.os == ZAN_OS_ANDROID) {
   if (dynamic_link) {
     snprintf(
         cmd, sizeof(cmd),
-        "ld.lld -pie%s --dynamic-linker=/system/bin/linker64 --eh-frame-hdr"
+        "ld.lld -pie -z relro -z now -z noexecstack%s"
+        " --dynamic-linker=/system/bin/linker64 --eh-frame-hdr"
         " --gc-sections -o \"%s\" \"%s/crtbegin_dynamic.o\""
         " \"%s\"",
         (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "", obj_path,
         sys, obj_tmp);
   } else {
     snprintf(cmd, sizeof(cmd),
-             "ld.lld -static%s --eh-frame-hdr --gc-sections -o \"%s\""
+             "ld.lld -static -z relro -z now -z noexecstack%s --eh-frame-hdr"
+             " --gc-sections -o \"%s\""
              " \"%s/crtbegin_static.o\""
              " \"%s\"",
              (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "",
@@ -466,7 +470,8 @@ else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
 
   char cmd[8192];
   snprintf(cmd, sizeof(cmd),
-           "ld.lld -m %s --stack 268435456%s --gc-sections%s -o \"%s\" "
+           "ld.lld -m %s --stack 268435456 --dynamicbase --nxcompat"
+           " --high-entropy-va%s --gc-sections%s -o \"%s\" "
            "\"%s/crt2.o\" \"%s/crtbegin.o\"",
            (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
            (publish_mode || strip_symbols) ? " -s --icf=all -O2" : "",

@@ -42,6 +42,7 @@ typedef struct {
 
 typedef struct {
   zan_shared_header *header;
+  zan_shared_header snap;
   size_t mapped_size;
   char map_name[256];
   int anonymous;
@@ -351,12 +352,13 @@ static void zan_struct_unlock(zan_shared_header *header) {
 static unsigned char *zan_row_for(zan_shared_header *header, const char *key,
                                   int create);
 
-static zan_shared_column *zan_find_column(zan_shared_header *header,
-                                          const char *name, uint32_t type) {
-  if (!name)
+static const zan_shared_column *zan_find_column(const zan_shared_table *table,
+                                                const char *name,
+                                                uint32_t type) {
+  if (!table || !name)
     return NULL;
-  for (uint32_t i = 0; i < header->column_count; i++) {
-    zan_shared_column *column = &header->columns[i];
+  for (uint32_t i = 0; i < table->snap.column_count; i++) {
+    const zan_shared_column *column = &table->snap.columns[i];
     if (column->type == type && strcmp(column->name, name) == 0) {
       return column;
     }

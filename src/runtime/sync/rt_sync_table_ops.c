@@ -5,14 +5,14 @@ int32_t zan_shared_table_set_int(int64_t handle, const char *key,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
   if (!row)
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -27,14 +27,14 @@ int64_t zan_shared_table_get_int(int64_t handle, const char *key,
   if (!table)
     return 0;
   int64_t value = 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
   if (!row)
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -51,14 +51,14 @@ int32_t zan_shared_table_try_get_int(int64_t handle, const char *key,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table || !out_value)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
   if (!row)
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -72,14 +72,14 @@ int32_t zan_shared_table_set_float(int64_t handle, const char *key,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_FLOAT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_FLOAT);
   unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
   if (!row)
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -94,14 +94,14 @@ double zan_shared_table_get_float(int64_t handle, const char *key,
   if (!table)
     return 0.0;
   double value = 0.0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_FLOAT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_FLOAT);
   unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
   if (!row)
     return 0.0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0.0;
   }
@@ -116,8 +116,8 @@ int32_t zan_shared_table_set_string(int64_t handle, const char *key,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table || !value)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_STRING);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_STRING);
   size_t value_len = column ? strlen(value) : 0;
   unsigned char *row = column && value_len < column->size
                            ? zan_row_for(table->header, key, 1)
@@ -126,7 +126,7 @@ int32_t zan_shared_table_set_string(int64_t handle, const char *key,
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -144,15 +144,15 @@ const char *zan_shared_table_get_string(int64_t handle, const char *key,
   result[0] = '\0';
   if (!table)
     return result;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_STRING);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_STRING);
   unsigned char *row = column ? zan_row_for(table->header, key, 0) : NULL;
   if (!row)
     return result;
   zan_row_lock(row);
   size_t max_len = 0;
   if (zan_row_revalidate(row, zan_hash_bytes(key), key,
-                         table->header->key_size)) {
+                         table->snap.key_size)) {
     max_len = column->size - 1u;
     size_t len = zan_strnlen((const char *)(row + column->offset), max_len);
     memcpy(result, row + column->offset, len);
@@ -168,14 +168,14 @@ int64_t zan_shared_table_increment(int64_t handle, const char *key,
   if (!table)
     return 0;
   int64_t value = 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row = column ? zan_row_for(table->header, key, 1) : NULL;
   if (!row)
     return 0;
   zan_row_lock(row);
   if (!zan_row_revalidate(row, zan_hash_bytes(key), key,
-                          table->header->key_size)) {
+                          table->snap.key_size)) {
     zan_row_unlock(row);
     return 0;
   }
@@ -195,8 +195,8 @@ int32_t zan_shared_table_set_int_at(int64_t handle, int64_t key_hash,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
   if (!row)
@@ -217,8 +217,8 @@ int64_t zan_shared_table_get_int_at(int64_t handle, int64_t key_hash,
   if (!table)
     return 0;
   int64_t value = 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
   if (!row)
@@ -240,8 +240,8 @@ int32_t zan_shared_table_try_get_int_at(int64_t handle, int64_t key_hash,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table || !out_value)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
   if (!row)
@@ -262,8 +262,8 @@ int64_t zan_shared_table_increment_at(int64_t handle, int64_t key_hash,
   if (!table)
     return 0;
   int64_t value = 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
   if (!row)
@@ -287,8 +287,8 @@ int64_t zan_shared_table_extreme_at(int64_t handle, int64_t key_hash,
   if (!table)
     return 0;
   int64_t stored = 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_INT);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_INT);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 1) : NULL;
   if (!row)
@@ -315,8 +315,8 @@ int32_t zan_shared_table_set_string_at(int64_t handle, int64_t key_hash,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table || !value)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_STRING);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_STRING);
   size_t value_len = column ? strlen(value) : 0;
   unsigned char *row =
       column && value_len < column->size
@@ -343,8 +343,8 @@ const char *zan_shared_table_get_string_at(int64_t handle, int64_t key_hash,
   result[0] = '\0';
   if (!table)
     return result;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_STRING);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_STRING);
   unsigned char *row =
       column ? zan_row_for_hash(table->header, (uint64_t)key_hash, 0) : NULL;
   if (!row)
@@ -366,8 +366,8 @@ int32_t zan_shared_table_match_at(int64_t handle, int64_t key_hash,
   zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
   if (!table || !text)
     return 0;
-  zan_shared_column *column =
-      zan_find_column(table->header, column_name, ZAN_TABLE_STRING);
+  const zan_shared_column *column =
+      zan_find_column(table, column_name, ZAN_TABLE_STRING);
   unsigned char *row =
       column ? zan_find_row_hash(table->header, (uint64_t)key_hash, 0) : NULL;
   if (!row)

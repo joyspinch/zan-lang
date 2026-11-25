@@ -6,7 +6,21 @@ static const char *zan_android_shm_dir(void) {
     return (d && d[0]) ? d : "/data/local/tmp";
 }
 static int zan_android_shm_path(const char *name, char *path, size_t cap) {
+    if (!name) {
+        errno = EINVAL;
+        return -1;
+    }
     if (name[0] == '/') name++;
+    if (!name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (const char *p = name; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            errno = EINVAL;
+            return -1;
+        }
+    }
     int n = snprintf(path, cap, "%s/%s", zan_android_shm_dir(), name);
     if (n < 0 || (size_t)n >= cap) {
         errno = ENAMETOOLONG;
@@ -17,7 +31,7 @@ static int zan_android_shm_path(const char *name, char *path, size_t cap) {
 static int zan_android_shm_open(const char *name, int flags, mode_t mode) {
     char path[1024];
     if (zan_android_shm_path(name, path, sizeof(path)) != 0) return -1;
-    return open(path, flags | O_CLOEXEC, mode);
+    return open(path, flags | O_CLOEXEC | O_NOFOLLOW, mode);
 }
 static int zan_android_shm_unlink(const char *name) {
     char path[1024];
@@ -63,7 +77,8 @@ long long zan_mmap_create(const char *name, long long size) {
     return (long long)(intptr_t)named;
 #else
     char shm_name[256];
-    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    int sn = snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    if (sn < 0 || (size_t)sn >= sizeof(shm_name)) return 0;
     int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) return 0;
     if (ftruncate(fd, (off_t)size) != 0) {
@@ -96,7 +111,8 @@ long long zan_mmap_open(const char *name, long long size) {
     return (long long)(intptr_t)h;
 #else
     char shm_name[256];
-    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    int sn = snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    if (sn < 0 || (size_t)sn >= sizeof(shm_name)) return 0;
     int fd = shm_open(shm_name, O_RDWR, 0600);
     if (fd < 0) return 0;
     if (size > 0) {
@@ -138,7 +154,7 @@ long long zan_mmap_from_file(const char *path, long long size) {
     if (!h) return 0;
     return (long long)(intptr_t)h;
 #else
-    int fd = open(path, O_RDWR);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0) return 0;
     zan_mmap_handle *h = (zan_mmap_handle *)calloc(1, sizeof(zan_mmap_handle));
     if (!h) { close(fd); return 0; }
@@ -169,15 +185,18 @@ long long zan_mmap_unmap(long long ptr, long long size) {
     (void)size;
     return UnmapViewOfFile((void *)(intptr_t)ptr) ? 1 : 0;
 #else
+    if (size <= 0) return 0;
     return munmap((void *)(intptr_t)ptr, (size_t)size) == 0 ? 1 : 0;
 #endif
 }
 
 long long zan_mmap_flush(long long ptr, long long size) {
     if (!ptr) return 1;
+    if (size < 0) return 0;
 #ifdef _WIN32
     return FlushViewOfFile((void *)(intptr_t)ptr, (size_t)size) ? 1 : 0;
 #else
+    if (size == 0) return 1;
     return msync((void *)(intptr_t)ptr, (size_t)size, MS_SYNC) == 0 ? 1 : 0;
 #endif
 }
@@ -203,7 +222,8 @@ long long zan_mmap_unlink(const char *name) {
     return 1;
 #else
     char shm_name[256];
-    snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    int sn = snprintf(shm_name, sizeof(shm_name), "/%s", name);
+    if (sn < 0 || (size_t)sn >= sizeof(shm_name)) return 0;
     return shm_unlink(shm_name) == 0 ? 1 : 0;
 #endif
 }

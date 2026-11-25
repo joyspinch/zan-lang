@@ -117,6 +117,7 @@ static void zan_leak_edge_cb(const zan_live_entry_t *from, void *to,
     int j = zan_obj_map_get(c->map, to);
     if (j < 0 || c->nodes[j].marked) return;
     if (c->count == c->cap) {
+        if (c->cap > SIZE_MAX / (2 * sizeof(zan_leak_edge_t))) return;
         size_t ncap = c->cap ? c->cap * 2 : 64;
         zan_leak_edge_t *ne = (zan_leak_edge_t *)ZAN_GC_REALLOC(c->edges, ncap * sizeof(zan_leak_edge_t));
         if (!ne) return;
