@@ -751,25 +751,76 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
  * string building reached 85k IR instructions, and LLVM's time and memory
  * follow IR size. Emit one call to a shared internal helper per use instead;
  * the optimizer still inlines it where that pays off. */
+/* The helper is split in two: a tiny entry (null / header-readable / cached
+ * length probe, ~8 instructions) that LLVM inlines at hot sites, and the
+ * full body (array count, strlen + stamp, foreign pointer, null report)
+ * kept out of line. A string loop calling .Length used to pay a call per
+ * use even though the cached-length hit is three loads and two compares. */
 static LLVMValueRef get_string_len_helper(zan_irgen_t *g, int array_count) {
     const char *name = array_count ? "__zan_str_len_arr" : "__zan_str_len";
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
     if (fn) return fn;
-    LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+    LLVMTypeRef i8p = LLVMPointerType(i8, 0);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef fty = LLVMFunctionType(i64, (LLVMTypeRef[]){i8p, i8p, i32t, i32t}, 4, 0);
+    char slow_name[48];
+    snprintf(slow_name, sizeof slow_name, "%s.slow", name);
+    LLVMValueRef slow = LLVMAddFunction(g->mod, slow_name, fty);
+    LLVMSetLinkage(slow, LLVMInternalLinkage);
+    LLVMSetFunctionCallConv(slow, LLVMFastCallConv);
+    LLVMAddAttributeAtIndex(
+        slow, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(g->ctx, LLVMGetEnumAttributeKindForName("noinline", 8), 0));
     fn = LLVMAddFunction(g->mod, name, fty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     LLVMValueRef saved_fn = g->current_fn;
-    g->current_fn = fn;
-    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(g->ctx, fn, "entry"));
-    strlen_site_args_t site = {LLVMGetParam(fn, 1), LLVMGetParam(fn, 2), LLVMGetParam(fn, 3)};
+
+    g->current_fn = slow;
+    LLVMPositionBuilderAtEnd(g->builder, LLVMAppendBasicBlockInContext(g->ctx, slow, "entry"));
+    strlen_site_args_t site = {LLVMGetParam(slow, 1), LLVMGetParam(slow, 2), LLVMGetParam(slow, 3)};
     LLVMValueRef len =
-        emit_string_len_inline(g, LLVMGetParam(fn, 0), array_count, zan_loc(0, 0, 0, 0), &site);
+        emit_string_len_inline(g, LLVMGetParam(slow, 0), array_count, zan_loc(0, 0, 0, 0), &site);
     LLVMBuildRet(g->builder, len);
+
+    g->current_fn = fn;
+    LLVMValueRef p = LLVMGetParam(fn, 0);
+    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMBasicBlockRef chk = LLVMAppendBasicBlockInContext(g->ctx, fn, "chk");
+    LLVMBasicBlockRef probe = LLVMAppendBasicBlockInContext(g->ctx, fn, "probe");
+    LLVMBasicBlockRef hit = LLVMAppendBasicBlockInContext(g->ctx, fn, "hit");
+    LLVMBasicBlockRef miss = LLVMAppendBasicBlockInContext(g->ctx, fn, "miss");
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+    LLVMBuildCondBr(g->builder, zan_icmp(g->builder, LLVMIntNE, p, LLVMConstNull(i8p), "nonnull"),
+                    chk, miss);
+    LLVMPositionBuilderAtEnd(g->builder, chk);
+    LLVMValueRef read_ok = zan_hdr_read_ok(g, p);
+    if (read_ok) LLVMBuildCondBr(g->builder, read_ok, probe, miss);
+    else LLVMBuildBr(g->builder, probe);
+    LLVMPositionBuilderAtEnd(g->builder, probe);
+    LLVMValueRef word = LLVMBuildLoad2(
+        g->builder, i64,
+        LLVMBuildGEP2(g->builder, i8, p,
+                      &(LLVMValueRef){LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1)}, 1, "hdrp"),
+        "hdr");
+    LLVMValueRef cached =
+        LLVMBuildAnd(g->builder, word, LLVMConstInt(i64, ZAN_STR_LEN_MASK, 0), "cached");
+    LLVMValueRef known = zan_and(g->builder, zan_hdr_is_string(g, word, "isstr"),
+                                 zan_icmp(g->builder, LLVMIntNE, cached,
+                                          LLVMConstInt(i64, ZAN_STR_LEN_UNKNOWN, 0), "measured"),
+                                 "known");
+    LLVMBuildCondBr(g->builder, known, hit, miss);
+    LLVMPositionBuilderAtEnd(g->builder, hit);
+    LLVMBuildRet(g->builder, cached);
+    LLVMPositionBuilderAtEnd(g->builder, miss);
+    LLVMValueRef args[4] = {p, LLVMGetParam(fn, 1), LLVMGetParam(fn, 2), LLVMGetParam(fn, 3)};
+    LLVMValueRef r = zan_call2(g->builder, fty, slow, args, 4, "slowlen");
+    LLVMSetInstructionCallConv(r, LLVMFastCallConv);
+    LLVMBuildRet(g->builder, r);
+
     g->current_fn = saved_fn;
     if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
     return fn;

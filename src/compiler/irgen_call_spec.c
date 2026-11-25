@@ -302,6 +302,34 @@ int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e,
 /* 发射`e` as a C string */
 LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
                                          local_scope_t *locals, int *owned) {
+    /* 字符字面量（Split(',')、Replace('a', 'b')…）直接取不朽串字面量：
+       每次调用不再把 char 物化成堆上的 1 字节串再释放。owned=2 = 无需释放。 */
+    if (e && e->kind == AST_CHAR_LITERAL && e->int_val > 0 && e->int_val <= 0x10FFFF) {
+        uint32_t cp = (uint32_t)e->int_val;
+        char u8[4];
+        int n;
+        if (cp < 0x80) {
+            u8[0] = (char)cp;
+            n = 1;
+        } else if (cp < 0x800) {
+            u8[0] = (char)(0xC0 | (cp >> 6));
+            u8[1] = (char)(0x80 | (cp & 0x3F));
+            n = 2;
+        } else if (cp < 0x10000) {
+            u8[0] = (char)(0xE0 | (cp >> 12));
+            u8[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            u8[2] = (char)(0x80 | (cp & 0x3F));
+            n = 3;
+        } else {
+            u8[0] = (char)(0xF0 | (cp >> 18));
+            u8[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            u8[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            u8[3] = (char)(0x80 | (cp & 0x3F));
+            n = 4;
+        }
+        *owned = 2;
+        return emit_string_literal_rc(g, (zan_istr_t){u8, n});
+    }
     LLVMValueRef v = emit_expr(g, e, locals);
     *owned = 0;
     if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
@@ -314,8 +342,8 @@ LLVMValueRef emit_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
 void release_string_like_arg(zan_irgen_t *g, zan_ast_node_t *e,
                                     LLVMValueRef v, int owned,
                                     local_scope_t *locals) {
-    if (owned) emit_string_release(g, v);
-    else emit_release_owned_call_temp(g, e, v, locals);
+    if (owned == 1) emit_string_release(g, v);
+    else if (owned == 0) emit_release_owned_call_temp(g, e, v, locals);
 }
 int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
                               long long *out_vals, int cap) {

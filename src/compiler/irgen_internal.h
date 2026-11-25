@@ -564,6 +564,8 @@ LLVMValueRef get_str_join_fn(zan_irgen_t *g);
 LLVMValueRef get_str_last_index_of_fn(zan_irgen_t *g);
 LLVMValueRef get_str_replace_fn(zan_irgen_t *g);
 LLVMValueRef get_str_split_fn(zan_irgen_t *g);
+LLVMValueRef get_strtoll10_fn(zan_irgen_t *g);
+LLVMValueRef get_memchr_fn(zan_irgen_t *g);
 LLVMValueRef get_str_trim_fn(zan_irgen_t *g);
 void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call, zan_symbol_t *method_sym, local_scope_t *locals);
 void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args, zan_loc_t loc, zan_ast_node_t *decl);

@@ -751,9 +751,9 @@
             (LLVMTypeRef[]){ i8p }, 1, 0);
         if (g->arc_guard) emit_arc_quarantine(g, obj, rc_iptr, rc_ty);
         else zan_call2(g->builder, free_fn_type, g->fn_free, &header_ptr, 1, "");
-        {
-            emit_leak_counter_add(g, g->g_live, -1);
-        }
+        /* 与 zan_rt_str_alloc 的 +1 同口径：只有 --check-leaks 才计数——曾无条件
+           原子减，每次释放串都对同一全局缓存行做一次 RMW。 */
+        if (g->check_leaks) { emit_leak_counter_add(g, g->g_live, -1); }
         LLVMBuildBr(g->builder, ret_bb);
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);

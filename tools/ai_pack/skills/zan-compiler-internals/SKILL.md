@@ -791,6 +791,27 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
   `zan_mem_cache_get` 拆成内联 TLS 快路径 + noinline 慢路径——它被多处内联
   后编译器会把整函数外提，分配热路径多一次调用。
 
+**串助手一律以串头长度为界，新串必须记长度**（实证，2026-11-25）：
+strops（Split/IndexOf/Replace）0.13 → 0.07 s（C++ 0.07），numfmt 0.08 → 0.05 s。病根：
+- 产串助手（`__zan_list_push_strn` 即 Split 的每段、Replace、Trim、ToUpper/ToLower）
+  只补 `\0` 不调 `emit_string_len_set`：头里是"未测量"，此后每个 `.Length` /
+  `IndexOf` 都 strlen 一遍再盖戳。新增任何产串路径：分配 → 拷贝 → `\0` →
+  **`emit_string_len_set`**，缺一步就是隐性 O(n)。
+- Split/Replace 曾走 strlen + strstr，单字符实参（`Split(',')`）先物化成堆上 1 字节串。
+  现在 `builtin_str_scan.c`：调用点用 `emit_string_length` 取长度传进助手，查找走
+  `__zan_mem_find`（`__zan_memchr` 首字节 + memcmp 余下，支持串内 `\0`、无需 memmem），
+  `__zan_memchr` 跨度 < 32 字节逐字节扫（libc memchr 调用 + SIMD 起步在短字段上更贵）。
+  字符**字面量**实参在 `emit_string_like_arg` 直接取不朽串字面量（owned=2，不释放）。
+- `.Length` 的 `__zan_str_len_arr` 拆成小入口（空/页首/缓存命中）+ noinline `.slow`，
+  LLVM 才会把命中路径内联——整块助手太大，热循环里每次 `.Length` 一次调用。
+- `int.Parse`/`Convert.ToInt*` 的 strtoll 走 locale（numfmt 45% 采样）：`__zan_strtoll10`
+  吃掉"可选 '-' + ≤18 位"，其余（空白、'+'、≥19 位、非数字）原样交 strtoll，endp/errno 契约不变。
+- `zan_rt_str_release` 曾无条件对 `__zan_live` 原子减（加一只在 `--check-leaks`）；
+  rt_mem `free` 的块边界校验 `off % sz` 是一条 udiv（改 Lemire 整除判定表
+  `k_class_divm`），`zan_mem_fatal_block` 内联进 free 带来栈保护帧（改 noinline cold）。
+- 钉子用例 `tests/conformance/string_scan_fastpaths.zan`（多字节/重叠分隔符、UTF-8 字符
+  分隔符、短/长区间两条扫描路、等长/变长替换、解析快慢路径边界）。
+
 **分配密集代码的四道税：S-UNWIND 最小不动点、实参后于分配、构造体旧值读、48 字节类**（实证，2026-11-24）：
 binary-trees（`new Node(Make(d-1), Make(d-1))`）1.86 s → 0.9 s（C malloc/free 1.1 s），
 53 → 45 MiB。逐层病根：

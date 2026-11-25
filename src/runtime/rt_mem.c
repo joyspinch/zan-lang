@@ -147,14 +147,19 @@ static uintptr_t g_mem_secret;
  * 给 Zan 对象/闭包/装箱分配时调它。块 8 字节对齐（页首 + 40*i），比 malloc
  * 契约的 16 弱，所以绝不进 g_size_class（通用 malloc 永远拿不到）。两指针
  * 字段的类：16 头 + vptr + 2 字段 = 40 字节一块（通用类得 48）。 */
-static const uint16_t k_class_size[] = {
-      16,   32,   48,   64,   80,   96,  112,  128,
-     160,  192,  224,  256,  320,  384,  448,  512,
-     640,  768,  896, 1024, 1280, 1536, 1792, 2048,
-      24,   40,   56,   72,   88,  104,  120,
-      24,   32,   40,   48,   56,   64,   72,   80,
-      88,   96,  104,  112,  120,  128
-};
+#define ZAN_MEM_CLASS_SIZES(X)                                                                     \
+    X(16)                                                                                          \
+    X(32) X(48) X(64) X(80) X(96) X(112) X(128) X(160) X(192) X(224) X(256) X(320) X(384) X(448)   \
+        X(512) X(640) X(768) X(896) X(1024) X(1280) X(1536) X(1792) X(2048) X(24) X(40) X(56)      \
+            X(72) X(88) X(104) X(120) X(24) X(32) X(40) X(48) X(56) X(64) X(72) X(80) X(88) X(96)  \
+                X(104) X(112) X(120) X(128)
+#define ZAN_MEM_SZ_ELEM(n) n,
+#define ZAN_MEM_DIVM_ELEM(n) (UINT64_MAX / (uint64_t)(n) + 1u),
+static const uint16_t k_class_size[] = {ZAN_MEM_CLASS_SIZES(ZAN_MEM_SZ_ELEM)};
+/* free 校验"页内偏移是块尺寸整数倍"用 Lemire 整除判定（off * M <= M - 1，
+ * M = ceil(2^64 / sz)，对任意 32 位 off 精确）：曾是一条 udiv，每次释放
+ * 都付 ~10 周期的除法延迟。 */
+static const uint64_t k_class_divm[] = {ZAN_MEM_CLASS_SIZES(ZAN_MEM_DIVM_ELEM)};
 #define ZAN_MEM_NCLASS ((int)(sizeof(k_class_size) / sizeof(k_class_size[0])))
 #define ZAN_MEM_OBJ_CLS0     24          /* 第一个对象页类（24 字节）的下标 */
 #define ZAN_MEM_OBJ_MAX      120u
@@ -342,7 +347,8 @@ static int zan_mem_block_class(const void *p) {
     int cls = (int)c1 - 1;
     uintptr_t off = (uintptr_t)p & (uintptr_t)(ZAN_MEM_PAGE - 1);
     size_t sz = k_class_size[cls];
-    if (off % sz != 0 || off + sz > zan_mem_page_span(cls)) return -1;
+    uint64_t dm = k_class_divm[cls];
+    if ((uint64_t)off * dm > dm - 1u || off + sz > zan_mem_page_span(cls)) return -1;
     return cls;
 }
 
@@ -781,7 +787,9 @@ void *zan_mem_obj_malloc(size_t n) {
     return __wrap_malloc(n);
 }
 
-static void zan_mem_fatal_block(const char *what, const void *p) {
+/* 冷路径单独成函数：内联进 free 会把 snprintf 缓冲带进热路径（栈保护 +
+ * 栈帧开销每次释放都付）。 */
+static __attribute__((noinline, cold)) void zan_mem_fatal_block(const char *what, const void *p) {
     char msg[80];
     snprintf(msg, sizeof msg, "%s of block %p", what, p);
     zan_rt_fatal("mem", msg);

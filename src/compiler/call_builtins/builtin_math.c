@@ -501,7 +501,7 @@
                                (rn.len == 5 && memcmp(rn.str, "Int64", 5) == 0);
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
                         (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
-                    LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
+                    LLVMValueRef f = get_strtoll10_fn(g);
                     LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "parse.endp");
                     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
                     LLVMValueRef s_safe = emit_parse_str_guard(g, s, expr->loc);
@@ -646,7 +646,7 @@
                     LLVMValueRef errnop = emit_errno_preset(g, i32t);
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
                         (LLVMTypeRef[]){ i8ptr, i8pp, i32t }, 3, 0);
-                    LLVMValueRef f = get_libc_fn(g, "strtoll", strtoll_ty);
+                    LLVMValueRef f = get_strtoll10_fn(g);
                     v = zan_call2(g->builder, strtoll_ty, f,
                         (LLVMValueRef[]){ s_safe, endp, LLVMConstInt(i32t, 10, 0) }, 3, "tp");
                     LLVMValueRef er = LLVMBuildLoad2(g->builder, i32t, errnop, "tp.errno");
