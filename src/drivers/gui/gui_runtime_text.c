@@ -79,10 +79,112 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
     }
 }
 
+static HBITMAP g_scratch_bmp = NULL;
+static u32 *g_scratch_bits = NULL;
+static int g_scratch_w = 0;
+static int g_scratch_h = 0;
+
 static void ensure_text_dc(void) {
     if (!g_text_dc) {
         g_text_dc = CreateCompatibleDC(NULL);
         SetBkMode(g_text_dc, TRANSPARENT);
+        SetTextColor(g_text_dc, RGB(255, 255, 255));
+    }
+}
+
+/* Single-pass ASCII fast path into caller's stack wchar_t buffer; falls back to
+ * MultiByteToWideChar for non-ASCII UTF-8 or long strings. Returns character
+ * count (excluding NUL) in *out_len, or NULL on allocation failure. */
+static wchar_t *win_utf8_to_wide_fast(const char *text, wchar_t *stack_buf,
+                                      int stack_cap, int *out_len) {
+    int i = 0;
+    for (; i < stack_cap - 1; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch == 0) {
+            stack_buf[i] = 0;
+            *out_len = i;
+            return stack_buf;
+        }
+        if (ch >= 0x80) break;
+        stack_buf[i] = (wchar_t)ch;
+    }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
+    if (wlen <= 0) {
+        *out_len = 0;
+        return NULL;
+    }
+    wchar_t *wtext = stack_buf;
+    if (wlen > stack_cap) {
+        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+        if (!wtext) {
+            *out_len = 0;
+            return NULL;
+        }
+    }
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    *out_len = wlen - 1;
+    return wtext;
+}
+
+/* Persistent reusable top-down 32-bit DIBSection permanently selected into
+ * g_text_dc (avoids per-string CreateDIBSection/DeleteObject kernel round-trips).
+ * Oversized runs (>4096x512) fall back to a temporary DIBSection. */
+static u32 *win_acquire_scratch_dib(int need_w, int need_h, int *out_stride,
+                                    HBITMAP *out_temp_bmp, HBITMAP *out_old_bmp) {
+    *out_temp_bmp = NULL;
+    *out_old_bmp = NULL;
+    if (need_w <= 4096 && need_h <= 512) {
+        if (!g_scratch_bmp || need_w > g_scratch_w || need_h > g_scratch_h) {
+            int nw = g_scratch_w ? g_scratch_w : 512;
+            int nh = g_scratch_h ? g_scratch_h : 64;
+            while (nw < need_w) nw = nw < 2048 ? nw * 2 : 4096;
+            while (nh < need_h) nh = nh < 256 ? nh * 2 : 512;
+            BITMAPINFO bmi = {0};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = nw;
+            bmi.bmiHeader.biHeight = -nh;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            void *bits = NULL;
+            HBITMAP bmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+            if (!bmp) return NULL;
+            SelectObject(g_text_dc, bmp);
+            if (g_scratch_bmp) DeleteObject(g_scratch_bmp);
+            g_scratch_bmp = bmp;
+            g_scratch_bits = (u32 *)bits;
+            g_scratch_w = nw;
+            g_scratch_h = nh;
+        }
+        *out_stride = g_scratch_w;
+        return g_scratch_bits;
+    }
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = need_w;
+    bmi.bmiHeader.biHeight = -need_h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HBITMAP bmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bmp) return NULL;
+    *out_old_bmp = (HBITMAP)SelectObject(g_text_dc, bmp);
+    *out_temp_bmp = bmp;
+    *out_stride = need_w;
+    return (u32 *)bits;
+}
+
+static void win_clear_scratch_rect(u32 *bits, int stride, int w, int h) {
+    int cw = w + 2;
+    if (cw > stride) cw = stride;
+    if (cw == stride) {
+        memset(bits, 0, (size_t)stride * (size_t)h * sizeof(u32));
+        return;
+    }
+    size_t row_bytes = (size_t)cw * sizeof(u32);
+    for (int r = 0; r < h; r++) {
+        memset(bits + (size_t)r * (size_t)stride, 0, row_bytes);
     }
 }
 
@@ -275,14 +377,10 @@ static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
     if (cached) return cached;
 
     ensure_text_dc();
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     wchar_t stack_wtext[256];
-    wchar_t *wtext = stack_wtext;
-    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
-        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-        if (!wtext) return NULL;
-    }
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    int text_len = 0;
+    wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
+    if (!wtext) return NULL;
     HFONT font = get_or_create_font(size, bold);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     wchar_t family[LF_FACESIZE];
@@ -291,7 +389,7 @@ static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
 
     unsigned char *px = NULL;
     int tw = 0, th = 0, adv = 0;
-    int ok = zan_dw_render(wtext, wlen - 1, family, (float)size,
+    int ok = zan_dw_render(wtext, text_len, family, (float)size,
                            bold ? 1 : 0, &px, &tw, &th, &adv);
     if (wtext != stack_wtext) free(wtext);
     if (!ok || !px) return NULL;
@@ -322,15 +420,10 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
         zan_atlas_find(ZAN_TILE_RUN, ksize, text, key_len);
     if (cached) return cached;
 
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
     wchar_t stack_wtext[256];
-    wchar_t *wtext = stack_wtext;
-    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
-        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-        if (!wtext) return NULL;
-    }
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
-    int text_len = wlen - 1;
+    int text_len = 0;
+    wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
+    if (!wtext) return NULL;
 
     HFONT font = get_or_create_font(size, bold);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
@@ -342,29 +435,27 @@ static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) 
         if (wtext != stack_wtext) free(wtext); SelectObject(g_text_dc, old_font); return NULL;
     }
 
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = tw;
-    bmi.bmiHeader.biHeight = -th;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    void *dbits = NULL;
-    HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS, &dbits, NULL, 0);
-    if (!hbmp) { if (wtext != stack_wtext) free(wtext); SelectObject(g_text_dc, old_font); return NULL; }
-    HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
-    memset(dbits, 0, (size_t)(tw * th * 4));
-    SetTextColor(g_text_dc, RGB(255, 255, 255));
+    int dib_stride = 0;
+    HBITMAP temp_bmp = NULL, old_bmp = NULL;
+    u32 *dbits = win_acquire_scratch_dib(tw, th, &dib_stride, &temp_bmp, &old_bmp);
+    if (!dbits) {
+        if (wtext != stack_wtext) free(wtext);
+        SelectObject(g_text_dc, old_font);
+        return NULL;
+    }
+    win_clear_scratch_rect(dbits, dib_stride, tw, th);
     TextOutW(g_text_dc, 0, 0, wtext, text_len);
     GdiFlush();
 
     const zan_glyph_tile *tile =
-        zan_atlas_store(ZAN_TILE_RUN, ksize, text, key_len,
-                        tw, th, 0, 0, (int)ts.cx, dbits, 4);
+        zan_atlas_store_strided(ZAN_TILE_RUN, ksize, text, key_len,
+                                tw, th, 0, 0, (int)ts.cx, dbits, 4, dib_stride);
 
-    SelectObject(g_text_dc, old_bmp);
+    if (temp_bmp) {
+        SelectObject(g_text_dc, old_bmp);
+        DeleteObject(temp_bmp);
+    }
     SelectObject(g_text_dc, old_font);
-    DeleteObject(hbmp);
     if (wtext != stack_wtext) free(wtext);
     return tile;
 }
@@ -450,8 +541,12 @@ EXPORT void zan_gui_draw_text_rot(
     if (size < 8) size = 8;
 
     int klen = (int)strlen(text) + 3;
-    char *key = (char *)malloc((size_t)klen);
-    if (!key) return;
+    char stack_key[256];
+    char *key = stack_key;
+    if (klen > (int)sizeof(stack_key)) {
+        key = (char *)malloc((size_t)klen);
+        if (!key) return;
+    }
     key[0] = (char)0xFF;
     key[1] = (char)(angle & 0xFF);
     key[2] = (char)((angle >> 8) & 0xFF);
@@ -467,15 +562,10 @@ EXPORT void zan_gui_draw_text_rot(
 
     const zan_glyph_tile *tile = zan_atlas_find(ZAN_TILE_RUN, size, key, klen);
     if (!tile) {
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
         wchar_t stack_wtext[256];
-        wchar_t *wtext = stack_wtext;
-        if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
-            wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-            if (!wtext) { free(key); return; }
-        }
-        MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
-        int text_len = wlen - 1;
+        int text_len = 0;
+        wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
+        if (!wtext) { if (key != stack_key) free(key); return; }
 
         HFONT font = get_or_create_font(size, 0);
         HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
@@ -512,28 +602,20 @@ EXPORT void zan_gui_draw_text_rot(
         if (bw <= 0 || bh <= 0 || bw > 16384 || bh > 16384) {
             if (wtext != stack_wtext) free(wtext);
             SelectObject(g_text_dc, old_font);
-            free(key);
+            if (key != stack_key) free(key);
             return;
         }
 
-        BITMAPINFO bmi = {0};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = bw;
-        bmi.bmiHeader.biHeight = -bh;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        void *dbits = NULL;
-        HBITMAP hbmp = CreateDIBSection(g_text_dc, &bmi, DIB_RGB_COLORS,
-                                        &dbits, NULL, 0);
-        if (!hbmp) {
+        int dib_stride = 0;
+        HBITMAP temp_bmp = NULL, old_bmp = NULL;
+        u32 *dbits = win_acquire_scratch_dib(bw, bh, &dib_stride, &temp_bmp, &old_bmp);
+        if (!dbits) {
             if (wtext != stack_wtext) free(wtext);
             SelectObject(g_text_dc, old_font);
-            free(key);
+            if (key != stack_key) free(key);
             return;
         }
-        HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
-        memset(dbits, 0, (size_t)bw * (size_t)bh * 4);
+        win_clear_scratch_rect(dbits, dib_stride, bw, bh);
 
         XFORM xf;
         xf.eM11 = (FLOAT)cs;   xf.eM12 = (FLOAT)sn;
@@ -542,21 +624,21 @@ EXPORT void zan_gui_draw_text_rot(
         xf.eDy = (FLOAT)(-mny + 1.0);
         SetGraphicsMode(g_text_dc, GM_ADVANCED);
         SetWorldTransform(g_text_dc, &xf);
-        SetTextColor(g_text_dc, RGB(255, 255, 255));
-        SetBkMode(g_text_dc, TRANSPARENT);
         TextOutW(g_text_dc, 0, 0, wtext, text_len);
         GdiFlush();
         ModifyWorldTransform(g_text_dc, NULL, MWT_IDENTITY);
         SetGraphicsMode(g_text_dc, GM_COMPATIBLE);
 
-        tile = zan_atlas_store(ZAN_TILE_RUN, size, key, klen,
-                               bw, bh, left, top, (int)ts.cx, dbits, 4);
-        SelectObject(g_text_dc, old_bmp);
-        DeleteObject(hbmp);
+        tile = zan_atlas_store_strided(ZAN_TILE_RUN, size, key, klen,
+                                       bw, bh, left, top, (int)ts.cx, dbits, 4, dib_stride);
+        if (temp_bmp) {
+            SelectObject(g_text_dc, old_bmp);
+            DeleteObject(temp_bmp);
+        }
         SelectObject(g_text_dc, old_font);
         if (wtext != stack_wtext) free(wtext);
     }
-    free(key);
+    if (key != stack_key) free(key);
     if (tile) {
         zan_glyph_item item;
         item.tile = tile;
@@ -588,24 +670,19 @@ static zan_measure_cache_t g_mcache[ZAN_MEAS_CACHE_CAP];
 static uint64_t g_mcache_clock = 0;
 
 static int measure_text_gdi(const char *text, int size) {
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    if (wlen <= 0) return 0;
     wchar_t stack_wtext[256];
-    wchar_t *wtext = stack_wtext;
-    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
-        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-        if (!wtext) return 0;
-    }
-    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
+    int text_len = 0;
+    wchar_t *wtext = win_utf8_to_wide_fast(text, stack_wtext, 256, &text_len);
+    if (!wtext) return 0;
     HFONT font = get_or_create_font(size, 0);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     SIZE text_size;
-    GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
-    int missing = win_run_has_emoji(wtext, wlen - 1);
+    GetTextExtentPoint32W(g_text_dc, wtext, text_len, &text_size);
+    int missing = win_run_has_emoji(wtext, text_len);
     SelectObject(g_text_dc, old_font);
     int w = 0;
     if (missing) {
-        w = win_dw_text_width(wtext, wlen - 1, size, 0);
+        w = win_dw_text_width(wtext, text_len, size, 0);
     }
     if (wtext != stack_wtext) {
         free(wtext);

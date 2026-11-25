@@ -173,10 +173,10 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
     return NULL;
 }
 
-static const zan_glyph_tile *zan_atlas_store(
+static const zan_glyph_tile *zan_atlas_store_strided(
     int kind, int size, const char *key, int key_len,
     int w, int h, int left, int top, int advance,
-    const void *cov, int bpp) {
+    const void *cov, int bpp, int src_stride_px) {
     if (w < 0 || h < 0) return NULL;
     if (w == 0 || h == 0) { w = 0; h = 0; cov = NULL; }
     uint64_t hv = zan_atlas_hash(kind, size, key, key_len);
@@ -204,7 +204,19 @@ static const zan_glyph_tile *zan_atlas_store(
             return NULL;
         }
     }
-    if (bytes) memcpy(cov_copy, cov, bytes);
+    if (bytes) {
+        if (src_stride_px <= 0 || src_stride_px == w) {
+            memcpy(cov_copy, cov, bytes);
+        } else {
+            size_t row_bytes = (size_t)w * (size_t)bpp;
+            size_t src_stride_bytes = (size_t)src_stride_px * (size_t)bpp;
+            const unsigned char *sp = (const unsigned char *)cov;
+            unsigned char *dp = (unsigned char *)cov_copy;
+            for (int r = 0; r < h; r++) {
+                memcpy(dp + (size_t)r * row_bytes, sp + (size_t)r * src_stride_bytes, row_bytes);
+            }
+        }
+    }
 
     if (g_atlas_last_tile == &victim->tile) {
         g_atlas_last_tile = NULL;
@@ -245,6 +257,14 @@ static const zan_glyph_tile *zan_atlas_store(
         g_atlas_last_tile = &victim->tile;
     }
     return &victim->tile;
+}
+
+static const zan_glyph_tile *zan_atlas_store(
+    int kind, int size, const char *key, int key_len,
+    int w, int h, int left, int top, int advance,
+    const void *cov, int bpp) {
+    return zan_atlas_store_strided(kind, size, key, key_len,
+                                   w, h, left, top, advance, cov, bpp, w);
 }
 
 #define ZAN_GLYPH_BATCH 128

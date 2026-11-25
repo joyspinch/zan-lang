@@ -760,25 +760,98 @@ static void cpu_draw_circle(zan_surface_t *s, int cx, int cy, int radius, u32 c,
                             int thickness) {
   region_write_clip(s);
   int r = radius;
-  if (r <= 0)
+  u32 sa = (c >> 24) & 0xFFu;
+  if (r <= 0 || sa == 0)
     return;
-  double half = (double)(thickness > 0 ? thickness : 1) / 2.0;
+  u32 rgb = c & 0x00FFFFFFu;
+  double rr = (double)r;
+  double half = (double)(thickness > 0 ? thickness : 1) * 0.5;
+  double rout = rr + half + 0.5;
+  double rin_out = rr - half - 0.5;
+  double rout2 = rout * rout;
+  double rin_out2 = rin_out > 0.0 ? rin_out * rin_out : -1.0;
+  double solid_hi = rr + half - 0.5;
+  double solid_lo = rr - half + 0.5;
+  double solid_hi2 = solid_hi > 0.0 ? solid_hi * solid_hi : -1.0;
+  double solid_lo2 = solid_lo > 0.0 ? solid_lo * solid_lo : -1.0;
+  int has_solid = (half >= 0.5);
   int ext = r + (int)half + 2;
 
-  for (int py = cy - ext; py <= cy + ext; py++) {
-    if (py < s->clip_y0 || py >= s->clip_y1)
-      continue;
+  int ylo = cy - ext, yhi = cy + ext;
+  if (ylo < s->clip_y0)
+    ylo = s->clip_y0;
+  if (yhi >= s->clip_y1)
+    yhi = s->clip_y1 - 1;
+  if (ylo > yhi)
+    return;
+
+  for (int py = ylo; py <= yhi; py++) {
     double wy = (double)py + 0.5 - (double)cy;
-    for (int px = cx - ext; px <= cx + ext; px++) {
-      if (px < s->clip_x0 || px >= s->clip_x1)
-        continue;
-      double wx = (double)px + 0.5 - (double)cx;
-      double d = fabs(sqrt(wx * wx + wy * wy) - (double)r);
-      if (d <= half - 0.5) {
-        set_pixel(s, px, py, c);
-      } else if (d <= half + 0.5) {
-        int cov = (int)((half + 0.5 - d) * 255.0);
-        set_pixel_aa(s, px, py, c, cov);
+    double wy2 = wy * wy;
+    if (wy2 > rout2)
+      continue;
+    double out_hs = sqrt(rout2 - wy2);
+    int xlo = cx + (int)floor(-out_hs - 0.5);
+    int xhi = cx + (int)ceil(out_hs - 0.5);
+    if (xlo < cx - ext)
+      xlo = cx - ext;
+    if (xhi > cx + ext)
+      xhi = cx + ext;
+    if (xlo < s->clip_x0)
+      xlo = s->clip_x0;
+    if (xhi >= s->clip_x1)
+      xhi = s->clip_x1 - 1;
+    if (xlo > xhi)
+      continue;
+
+    int spans[2][2];
+    int nspan = 0;
+    if (rin_out > 0.0 && wy2 < rin_out2) {
+      double in_hs = sqrt(rin_out2 - wy2);
+      int hx0 = cx + (int)floor(-in_hs - 0.5);
+      int hx1 = cx + (int)ceil(in_hs - 0.5);
+      if (xlo <= hx0) {
+        spans[nspan][0] = xlo;
+        spans[nspan][1] = hx0 < xhi ? hx0 : xhi;
+        nspan++;
+      }
+      if (hx1 <= xhi) {
+        spans[nspan][0] = hx1 > xlo ? hx1 : xlo;
+        spans[nspan][1] = xhi;
+        nspan++;
+      }
+    } else {
+      spans[0][0] = xlo;
+      spans[0][1] = xhi;
+      nspan = 1;
+    }
+
+    u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
+    for (int si = 0; si < nspan; si++) {
+      int sx0 = spans[si][0], sx1 = spans[si][1];
+      for (int px = sx0; px <= sx1; px++) {
+        double wx = (double)px + 0.5 - (double)cx;
+        double d2 = wx * wx + wy2;
+        if (d2 > rout2 || (rin_out > 0.0 && d2 < rin_out2))
+          continue;
+        if (has_solid && d2 <= solid_hi2 &&
+            (solid_lo <= 0.0 || d2 >= solid_lo2)) {
+          row[px] = (sa == 255u) ? c : blend_over(row[px], c);
+          continue;
+        }
+        double d = fabs(sqrt(d2) - rr);
+        if (d <= half - 0.5) {
+          row[px] = (sa == 255u) ? c : blend_over(row[px], c);
+        } else if (d <= half + 0.5) {
+          int cov = (int)((half + 0.5 - d) * 255.0);
+          if (cov > 0) {
+            if (cov > 255)
+              cov = 255;
+            u32 a = (sa * (u32)cov) / 255u;
+            if (a)
+              row[px] = blend_over(row[px], (a << 24) | rgb);
+          }
+        }
       }
     }
   }
@@ -810,6 +883,11 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
   if (peak <= 0)
     return;
   int r2 = r * r;
+  /* 48-bit reciprocal is 0-LSB exact vs ((r2 - d2) << 8) / r2 for all r <= 1024 */
+  int use_recip = (r <= 1024);
+  uint64_t inv_r2 = use_recip
+                        ? (((1ULL << 48) + (uint64_t)r2 - 1ULL) / (uint64_t)r2)
+                        : 0ULL;
   ZAN_STAT(g_st_radial, (long long)(2 * r + 1) * (long long)(2 * r + 1));
   int y_lo = icy - r, y_hi = icy + r;
   if (y_lo < s->clip_y0)
@@ -833,14 +911,26 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
     if (x_hi > s->clip_x1 - 1)
       x_hi = s->clip_x1 - 1;
     u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
-    for (int px = x_lo; px <= x_hi; px++) {
-      int dx = px - icx;
-      int d2 = dx * dx + dy2;
-      int t = ((r2 - d2) << 8) / r2;
-      int a = (peak * t * t) >> 16;
-      if (a <= 0)
-        continue;
-      row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
+    if (use_recip) {
+      for (int px = x_lo; px <= x_hi; px++) {
+        int dx = px - icx;
+        int rem = span - dx * dx;
+        int t = (int)(((uint64_t)rem * inv_r2) >> 40);
+        int a = (peak * t * t) >> 16;
+        if (a <= 0)
+          continue;
+        row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
+      }
+    } else {
+      for (int px = x_lo; px <= x_hi; px++) {
+        int dx = px - icx;
+        int d2 = dx * dx + dy2;
+        int t = ((r2 - d2) << 8) / r2;
+        int a = (peak * t * t) >> 16;
+        if (a <= 0)
+          continue;
+        row[px] = blend_over(row[px], ((u32)a << 24) | rgb);
+      }
     }
   }
 }
@@ -1161,6 +1251,9 @@ EXPORT void zan_gui_fill_sector(i32 surface_id, i32 cx, i32 cy, i32 r_inner,
 static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
                           u32 c, int thickness) {
   int t = thickness;
+  u32 sa = (c >> 24) & 0xFFu;
+  if (sa == 0)
+    return;
 
   if (s->region.state >= REGION_WATCHING) {
     int64_t pad = (int64_t)(t > 1 ? t : 1) + 2;
@@ -1169,6 +1262,41 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
                  (x0 > x1 ? x0 : x1) + pad, (y0 > y1 ? y0 : y1) + pad);
   }
   if (t <= 1) {
+    /* Fast axis-aligned 1px paths (SIMD span for horizontal, direct stride for vertical) */
+    if (y0 == y1) {
+      if (y0 < s->clip_y0 || y0 >= s->clip_y1)
+        return;
+      int lx = x0 < x1 ? x0 : x1;
+      int rx = x0 > x1 ? x0 : x1;
+      if (lx < s->clip_x0)
+        lx = s->clip_x0;
+      if (rx >= s->clip_x1)
+        rx = s->clip_x1 - 1;
+      if (lx <= rx) {
+        u32 *dst = s->pixels + (size_t)y0 * (size_t)s->stride + lx;
+        int n = rx - lx + 1;
+        if (sa == 255u)
+          fill_run_const(dst, n, c);
+        else
+          blend_run_const(dst, n, c);
+      }
+      return;
+    }
+    if (x0 == x1) {
+      if (x0 < s->clip_x0 || x0 >= s->clip_x1)
+        return;
+      int ty = y0 < y1 ? y0 : y1;
+      int by = y0 > y1 ? y0 : y1;
+      if (ty < s->clip_y0)
+        ty = s->clip_y0;
+      if (by >= s->clip_y1)
+        by = s->clip_y1 - 1;
+      for (int py = ty; py <= by; py++) {
+        u32 *dst = s->pixels + (size_t)py * (size_t)s->stride + x0;
+        *dst = (sa == 255u) ? c : blend_over(*dst, c);
+      }
+      return;
+    }
     int steep = abs(y1 - y0) > abs(x1 - x0);
     double fx0 = (double)x0, fy0 = (double)y0, fx1 = (double)x1,
            fy1 = (double)y1;
@@ -1219,8 +1347,10 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
     }
   } else {
     /* 宽线圆头抗锯齿几何光栅化 */
+    u32 rgb = c & 0x00FFFFFFu;
     double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
     double len2 = dx * dx + dy * dy;
+    double inv_len2 = len2 > 0.0001 ? 1.0 / len2 : 0.0;
     double half = t * 0.5;
     int lox = (x0 < x1 ? x0 : x1);
     int hix = (x0 > x1 ? x0 : x1);
@@ -1234,6 +1364,9 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
       uy = dy / seglen;
     }
     double rr = half + 0.5;
+    double rr2 = rr * rr;
+    double in_r = half - 0.5;
+    double in_r2 = in_r > 0.0 ? in_r * in_r : -1.0;
     if (miny < s->clip_y0)
       miny = s->clip_y0;
     if (maxy > s->clip_y1 - 1)
@@ -1249,9 +1382,10 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         double ecx = e ? (double)x1 : (double)x0;
         double ecy = e ? (double)y1 : (double)y0;
         double dyc = yc - ecy;
-        if (dyc * dyc > rr * rr)
+        double dyc2 = dyc * dyc;
+        if (dyc2 > rr2)
           continue;
-        double half_w = sqrt(rr * rr - dyc * dyc);
+        double half_w = sqrt(rr2 - dyc2);
         if (ecx - half_w < lo)
           lo = ecx - half_w;
         if (ecx + half_w > hi)
@@ -1283,28 +1417,38 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         rowLo = minx;
       if (rowHi > maxx)
         rowHi = maxx;
+      u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
+      double py_dy = (yc - (double)y0) * dy;
       for (int px = rowLo; px <= rowHi; px++) {
-        double pxc = (double)px + 0.5, pyc = (double)py + 0.5;
+        double pxc = (double)px + 0.5;
         double proj = 0.0;
-        if (len2 > 0.0001) {
-          proj = ((pxc - (double)x0) * dx + (pyc - (double)y0) * dy) / len2;
+        if (inv_len2 > 0.0) {
+          proj = ((pxc - (double)x0) * dx + py_dy) * inv_len2;
           if (proj < 0.0)
             proj = 0.0;
-          if (proj > 1.0)
+          else if (proj > 1.0)
             proj = 1.0;
         }
-        double cxp = (double)x0 + proj * dx;
-        double cyp = (double)y0 + proj * dy;
-        double ddx = pxc - cxp, ddy = pyc - cyp;
-        double dist = sqrt(ddx * ddx + ddy * ddy);
-        double cov = half + 0.5 - dist;
+        double ddx = pxc - ((double)x0 + proj * dx);
+        double ddy = yc - ((double)y0 + proj * dy);
+        double d2 = ddx * ddx + ddy * ddy;
+        if (d2 >= rr2)
+          continue;
+        if (d2 <= in_r2) {
+          row[px] = (sa == 255u) ? c : blend_over(row[px], c);
+          continue;
+        }
+        double cov = rr - sqrt(d2);
         if (cov <= 0.0)
           continue;
         int icov = aa_coverage(cov);
-        if (icov >= 255)
-          set_pixel(s, px, py, c);
-        else
-          set_pixel_aa(s, px, py, c, icov);
+        if (icov >= 255) {
+          row[px] = (sa == 255u) ? c : blend_over(row[px], c);
+        } else if (icov > 0) {
+          u32 a = (sa * (u32)icov) / 255u;
+          if (a)
+            row[px] = blend_over(row[px], (a << 24) | rgb);
+        }
       }
     }
   }
@@ -1329,12 +1473,20 @@ static i32 *g_poly_dirty = NULL;
 static i32 g_poly_dirty_n = 0;
 static i32 g_poly_dirty_cap = 0;
 
-/* 连续折线批处理光栅化 */
+/* 连续折线批处理光栅化（逐行精确水平跨度 + 裁剪交集 + 平方距离早退） */
 static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n, u32 c,
                               int t, int shift) {
   int W = s->width, H = s->height;
-  if (W <= 0 || H <= 0)
+  u32 sa = (c >> 24) & 0xFFu;
+  if (W <= 0 || H <= 0 || sa == 0)
     return;
+  int cx0 = s->clip_x0 > 0 ? s->clip_x0 : 0;
+  int cy0 = s->clip_y0 > 0 ? s->clip_y0 : 0;
+  int cx1 = s->clip_x1 < W ? s->clip_x1 - 1 : W - 1;
+  int cy1 = s->clip_y1 < H ? s->clip_y1 - 1 : H - 1;
+  if (cx0 > cx1 || cy0 > cy1)
+    return;
+  u32 rgb = c & 0x00FFFFFFu;
   double scale = shift == 0 ? 1.0 : (1.0 / 256.0);
 
   if (g_poly_cov_w < W || g_poly_cov_h < H) {
@@ -1353,6 +1505,11 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n, u32 c,
   g_poly_dirty_n = 0;
 
   double half = t * 0.5;
+  double rr = half + 0.5;
+  double rr2 = rr * rr;
+  double in_r = half - 0.5;
+  double in_r2 = in_r > 0.0 ? in_r * in_r : -1.0;
+
   for (i32 i = 0; i + 1 < n; i++) {
     double x0 = pts[i * 2] * scale, y0 = pts[i * 2 + 1] * scale;
     double x1 = pts[i * 2 + 2] * scale, y1 = pts[i * 2 + 3] * scale;
@@ -1362,37 +1519,92 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n, u32 c,
     double len2 = dx * dx + dy * dy;
     if (len2 < 0.0001)
       continue;
+    double inv_len2 = 1.0 / len2;
+    double seglen = sqrt(len2);
+    double ux = dx / seglen, uy = dy / seglen;
+    double nx = -uy * rr, ny = ux * rr;
     int minx = (int)floor(x0 < x1 ? x0 : x1) - t - 2;
     int maxx = (int)ceil(x0 > x1 ? x0 : x1) + t + 2;
     int miny = (int)floor(y0 < y1 ? y0 : y1) - t - 2;
     int maxy = (int)ceil(y0 > y1 ? y0 : y1) + t + 2;
-    if (minx < 0)
-      minx = 0;
-    if (miny < 0)
-      miny = 0;
-    if (maxx >= W)
-      maxx = W - 1;
-    if (maxy >= H)
-      maxy = H - 1;
+    if (minx < cx0)
+      minx = cx0;
+    if (miny < cy0)
+      miny = cy0;
+    if (maxx > cx1)
+      maxx = cx1;
+    if (maxy > cy1)
+      maxy = cy1;
+    if (minx > maxx || miny > maxy)
+      continue;
+
     for (int py = miny; py <= maxy; py++) {
       double pyc = (double)py + 0.5;
-      for (int px = minx; px <= maxx; px++) {
+      double lo = 1e30, hi = -1e30;
+      for (int e = 0; e < 2; e++) {
+        double ecx = e ? x1 : x0;
+        double ecy = e ? y1 : y0;
+        double dyc = pyc - ecy;
+        double dyc2 = dyc * dyc;
+        if (dyc2 > rr2)
+          continue;
+        double hw = sqrt(rr2 - dyc2);
+        if (ecx - hw < lo)
+          lo = ecx - hw;
+        if (ecx + hw > hi)
+          hi = ecx + hw;
+      }
+      for (int e = 0; e < 2; e++) {
+        double sgn = e ? -1.0 : 1.0;
+        double ax = x0 + sgn * nx, ay = y0 + sgn * ny;
+        double bx = x1 + sgn * nx, by = y1 + sgn * ny;
+        double span = by - ay;
+        if (span > -0.0001 && span < 0.0001)
+          continue;
+        double tt = (pyc - ay) / span;
+        if (tt < 0.0 || tt > 1.0)
+          continue;
+        double xs = ax + (bx - ax) * tt;
+        if (xs < lo)
+          lo = xs;
+        if (xs > hi)
+          hi = xs;
+      }
+      if (lo > hi)
+        continue;
+      int rowLo = (int)floor(lo) - 1, rowHi = (int)ceil(hi) + 1;
+      if (rowLo < minx)
+        rowLo = minx;
+      if (rowHi > maxx)
+        rowHi = maxx;
+      double py_dy = (pyc - y0) * dy;
+      int row_off = py * W;
+      for (int px = rowLo; px <= rowHi; px++) {
         double pxc = (double)px + 0.5;
-        double proj = ((pxc - x0) * dx + (pyc - y0) * dy) / len2;
+        double proj = ((pxc - x0) * dx + py_dy) * inv_len2;
         if (proj < 0.0)
           proj = 0.0;
-        if (proj > 1.0)
+        else if (proj > 1.0)
           proj = 1.0;
-        double cxp = x0 + proj * dx;
-        double cyp = y0 + proj * dy;
-        double ddx = pxc - cxp, ddy = pyc - cyp;
-        double dist = sqrt(ddx * ddx + ddy * ddy);
-        double cov = half + 0.5 - dist;
-        if (cov <= 0.0)
+        double ddx = pxc - (x0 + proj * dx);
+        double ddy = pyc - (y0 + proj * dy);
+        double d2 = ddx * ddx + ddy * ddy;
+        if (d2 >= rr2)
           continue;
-        int icov = aa_coverage(cov);
-        int idx = py * W + px;
-        if (g_poly_cov[idx] == 0) {
+        int icov;
+        if (d2 <= in_r2) {
+          icov = 255;
+        } else {
+          double cov = rr - sqrt(d2);
+          if (cov <= 0.0)
+            continue;
+          icov = aa_coverage(cov);
+          if (icov <= 0)
+            continue;
+        }
+        int idx = row_off + px;
+        u8 prev = g_poly_cov[idx];
+        if (prev == 0) {
           if (g_poly_dirty_n >= g_poly_dirty_cap) {
             i32 cap2 = g_poly_dirty_cap ? g_poly_dirty_cap * 2 : 1024;
             i32 *nd = (i32 *)realloc(g_poly_dirty, (size_t)cap2 * sizeof(i32));
@@ -1405,9 +1617,10 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n, u32 c,
             g_poly_dirty_cap = cap2;
           }
           g_poly_dirty[g_poly_dirty_n++] = (py << 16) | (px & 0xFFFF);
-        }
-        if (icov > g_poly_cov[idx])
           g_poly_cov[idx] = (u8)icov;
+        } else if (icov > prev) {
+          g_poly_cov[idx] = (u8)icov;
+        }
       }
     }
   }
@@ -1418,10 +1631,14 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n, u32 c,
     int idx = py * W + px;
     int cov = g_poly_cov[idx];
     g_poly_cov[idx] = 0;
-    if (cov >= 255)
-      set_pixel(s, px, py, c);
-    else
-      set_pixel_aa(s, px, py, c, cov);
+    u32 *dst = s->pixels + (size_t)py * (size_t)s->stride + px;
+    if (cov >= 255) {
+      *dst = (sa == 255u) ? c : blend_over(*dst, c);
+    } else {
+      u32 a = (sa * (u32)cov) / 255u;
+      if (a)
+        *dst = blend_over(*dst, (a << 24) | rgb);
+    }
   }
 }
 

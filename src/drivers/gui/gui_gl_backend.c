@@ -91,7 +91,26 @@ static struct {
     zgl_mode mode;
     zan_surface_t *target;
     int      is_gles;
+    /* Lightweight GL state cache to avoid redundant driver calls across flushes */
+    zgl_uint st_prog;
+    zgl_uint st_vao;
+    int      st_vp_w, st_vp_h;
+    int      st_shape_vp_w, st_shape_vp_h;
+    int      st_text_vp_w, st_text_vp_h;
+    int      st_blend;     /* 0=unknown, 1=off, 2=alpha, 3=text, 4=union_max */
 } g_zgl;
+
+static void zgl_invalidate_state(void) {
+    g_zgl.st_prog = 0;
+    g_zgl.st_vao = 0;
+    g_zgl.st_vp_w = 0;
+    g_zgl.st_vp_h = 0;
+    g_zgl.st_shape_vp_w = 0;
+    g_zgl.st_shape_vp_h = 0;
+    g_zgl.st_text_vp_w = 0;
+    g_zgl.st_text_vp_h = 0;
+    g_zgl.st_blend = 0;
+}
 
 #include "gui_gl_shaders.c"
 
@@ -271,12 +290,18 @@ static void zgl_flush(void) {
         return;
     }
 
-    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-    if (g_zgl.mode == ZGL_MODE_UNION)
-        gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->cov_fbo);
-    zgl_blend_equation(g_zgl.mode == ZGL_MODE_UNION ? ZGL_MAX : ZGL_FUNC_ADD);
-    gl.Viewport(0, 0, t->w, t->h);
-    gl.BindVertexArray(g_zgl.mode == ZGL_MODE_TEXT ? g_zgl.vao_text : g_zgl.vao);
+    zgl_uint want_fbo = (g_zgl.mode == ZGL_MODE_UNION) ? t->cov_fbo : t->fbo;
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, want_fbo);
+    if (g_zgl.st_vp_w != t->w || g_zgl.st_vp_h != t->h) {
+        gl.Viewport(0, 0, t->w, t->h);
+        g_zgl.st_vp_w = t->w;
+        g_zgl.st_vp_h = t->h;
+    }
+    zgl_uint want_vao = (g_zgl.mode == ZGL_MODE_TEXT) ? g_zgl.vao_text : g_zgl.vao;
+    if (g_zgl.st_vao != want_vao) {
+        gl.BindVertexArray(want_vao);
+        g_zgl.st_vao = want_vao;
+    }
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
     size_t vbytes = g_zgl.count * sizeof(float);
     if (gl.BufferSubData && vbytes <= g_zgl.vbo_bytes) {
@@ -292,23 +317,41 @@ static void zgl_flush(void) {
     static zgl_uint snap_tex, snap_fbo; static int snap_w, snap_h;
 
     if (g_zgl.mode == ZGL_MODE_TEXT) {
-        gl.UseProgram(g_zgl.prog_text);
-        gl.Uniform2f(g_zgl.u_viewport_text, (float)t->w, (float)t->h);
+        if (g_zgl.st_prog != g_zgl.prog_text) {
+            gl.UseProgram(g_zgl.prog_text);
+            g_zgl.st_prog = g_zgl.prog_text;
+        }
+        if (g_zgl.st_text_vp_w != t->w || g_zgl.st_text_vp_h != t->h) {
+            gl.Uniform2f(g_zgl.u_viewport_text, (float)t->w, (float)t->h);
+            g_zgl.st_text_vp_w = t->w;
+            g_zgl.st_text_vp_h = t->h;
+        }
         gl.ActiveTexture(ZGL_TEXTURE0);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas1);
         gl.ActiveTexture(ZGL_TEXTURE1);
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
-        gl.Enable(ZGL_BLEND);
-        if (g_zgl.is_gles) {
-            gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
-                                 ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
-        } else {
-            gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
-                                 ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
+        if (g_zgl.st_blend != 3) {
+            zgl_blend_equation(ZGL_FUNC_ADD);
+            gl.Enable(ZGL_BLEND);
+            if (g_zgl.is_gles) {
+                gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                     ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
+                                     ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
+            }
+            g_zgl.st_blend = 3;
         }
     } else {
-        gl.UseProgram(g_zgl.prog_shape);
-        gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
+        if (g_zgl.st_prog != g_zgl.prog_shape) {
+            gl.UseProgram(g_zgl.prog_shape);
+            g_zgl.st_prog = g_zgl.prog_shape;
+        }
+        if (g_zgl.st_shape_vp_w != t->w || g_zgl.st_shape_vp_h != t->h) {
+            gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
+            g_zgl.st_shape_vp_w = t->w;
+            g_zgl.st_shape_vp_h = t->h;
+        }
         gl.ActiveTexture(ZGL_TEXTURE0);
         if (g_zgl.mode == ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, 0);
@@ -365,12 +408,28 @@ static void zgl_flush(void) {
             gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
             gl.ActiveTexture(ZGL_TEXTURE0);
         }
-        if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
-            gl.Disable(ZGL_BLEND);
+        if (g_zgl.mode == ZGL_MODE_UNION) {
+            if (g_zgl.st_blend != 4) {
+                gl.Enable(ZGL_BLEND);
+                zgl_blend_equation(ZGL_MAX);
+                gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                     ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+                g_zgl.st_blend = 4;
+            }
+        } else if (g_zgl.mode == ZGL_MODE_REPLACE || shader_over) {
+            if (g_zgl.st_blend != 1) {
+                zgl_blend_equation(ZGL_FUNC_ADD);
+                gl.Disable(ZGL_BLEND);
+                g_zgl.st_blend = 1;
+            }
         } else {
-            gl.Enable(ZGL_BLEND);
-            gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
-                                 ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+            if (g_zgl.st_blend != 2) {
+                zgl_blend_equation(ZGL_FUNC_ADD);
+                gl.Enable(ZGL_BLEND);
+                gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                     ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+                g_zgl.st_blend = 2;
+            }
         }
     }
 
@@ -378,8 +437,6 @@ static void zgl_flush(void) {
     g_zgl.count = 0;
     g_zgl.has_shader_over = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
-    zgl_blend_equation(ZGL_FUNC_ADD);
-    gl.Enable(ZGL_BLEND);
 }
 
 static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
@@ -1222,6 +1279,7 @@ static void gl_blur(zan_surface_t *s, int x, int y, int w, int h,
 
     gl.BindVertexArray(g_zgl.vao);
     gl.BindBuffer(ZGL_ARRAY_BUFFER, g_zgl.vbo);
+    zgl_invalidate_state();
     g_zgl.mode = ZGL_MODE_NONE;
     t->gpu_ahead = 1;
     s->painted = 1;
@@ -1286,6 +1344,7 @@ void zan_gui_internal_gl_drop_present(void) {
     g_zgl.blur_cap_h = 0;
     for (int i = 0; i < g_surface_count; i++)
         if (g_surfaces[i]) gl_drop_surface(g_surfaces[i]);
+    zgl_invalidate_state();
     zan_gl_ctx_present_drop_all();
 }
 
@@ -1325,6 +1384,7 @@ EXPORT void zan_gui_gpu_end(i32 surface_id) {
                           ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
     gl.BindVertexArray(0);
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    zgl_invalidate_state();
     t->opaque_dst = 0;
     t->gpu_ahead = 1;
     s->painted = 1;

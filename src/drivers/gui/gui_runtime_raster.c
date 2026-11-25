@@ -1086,11 +1086,11 @@ static void cpu_snapshot(zan_surface_t *s, int x, int y, int w, int h,
     c->pixels = np;
     c->cap = n;
   }
+  size_t row_bytes = (size_t)rw * sizeof(u32);
   for (int j = 0; j < rh; j++) {
-    u32 *row = s->pixels + (y0 + j) * s->stride + x0;
-    u32 *dst = c->pixels + (size_t)j * rw;
-    for (int i = 0; i < rw; i++)
-      dst[i] = row[i];
+    memcpy(c->pixels + (size_t)j * (size_t)rw,
+           s->pixels + (size_t)(y0 + j) * (size_t)s->stride + x0,
+           row_bytes);
   }
   c->x0 = x0;
   c->y0 = y0;
@@ -1139,11 +1139,11 @@ static void cpu_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h,
     return;
   }
   region_read(s, x0, y0, x1, y1);
+  size_t row_bytes = (size_t)(x1 - x0) * sizeof(u32);
   for (int j = y0; j < y1; j++) {
-    u32 *row = s->pixels + j * s->stride + x0;
-    u32 *dst = c->pixels + (size_t)(j - c->y0) * c->rw + (x0 - c->x0);
-    for (int i = 0; i < x1 - x0; i++)
-      dst[i] = row[i];
+    memcpy(c->pixels + (size_t)(j - c->y0) * (size_t)c->rw + (x0 - c->x0),
+           s->pixels + (size_t)j * (size_t)s->stride + x0,
+           row_bytes);
   }
 }
 
@@ -1170,11 +1170,11 @@ static int cpu_restore_rect(zan_surface_t *s, int x, int y, int w, int h,
   if (cx1 <= cx0 || cy1 <= cy0)
     return 1;
   ZAN_STAT(g_st_restore, (long long)(cx1 - cx0) * (long long)(cy1 - cy0));
+  size_t row_bytes = (size_t)(cx1 - cx0) * sizeof(u32);
   for (int j = cy0; j < cy1; j++) {
-    u32 *row = s->pixels + j * s->stride + cx0;
-    u32 *src = c->pixels + (size_t)(j - y0) * rw + (cx0 - x0);
-    for (int i = 0; i < cx1 - cx0; i++)
-      row[i] = src[i];
+    memcpy(s->pixels + (size_t)j * (size_t)s->stride + cx0,
+           c->pixels + (size_t)(j - y0) * (size_t)rw + (cx0 - x0),
+           row_bytes);
   }
   return 1;
 }
@@ -1208,11 +1208,11 @@ static int cpu_restore_sub_rect(zan_surface_t *s, int x, int y, int w, int h,
   if (x1 <= x0 || y1 <= y0)
     return 1;
   ZAN_STAT(g_st_restore, (long long)(x1 - x0) * (long long)(y1 - y0));
+  size_t row_bytes = (size_t)(x1 - x0) * sizeof(u32);
   for (int j = y0; j < y1; j++) {
-    u32 *row = s->pixels + j * s->stride + x0;
-    u32 *src = c->pixels + (size_t)(j - c->y0) * c->rw + (x0 - c->x0);
-    for (int i = 0; i < x1 - x0; i++)
-      row[i] = src[i];
+    memcpy(s->pixels + (size_t)j * (size_t)s->stride + x0,
+           c->pixels + (size_t)(j - c->y0) * (size_t)c->rw + (x0 - c->x0),
+           row_bytes);
   }
   return 1;
 }
