@@ -71,6 +71,14 @@ static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     if (n < cap - 1) { buf[n++] = ')'; buf[n] = 0; }
 }
 
+/* S2：query.c 复用同一套签名打印 */
+int zan_symbols_type_name(const zan_ast_node_t *t, char *buf, int cap) {
+    return type_name(t, buf, cap);
+}
+void zan_symbols_method_sig(const zan_ast_node_t *m, char *buf, int cap) {
+    method_sig(m, buf, cap);
+}
+
 static int is_extern_decl(const zan_ast_node_t *m) {
     return m->kind == AST_METHOD_DECL && !m->method_decl.body &&
            (zan_ast_method_extern_lib(m).str != NULL ||

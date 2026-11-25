@@ -32,6 +32,7 @@ typedef struct zan_options {
     const char *emit_symbols_path;
     bool do_summary;               /* S4 --summary */
     const char *emit_deps_path;    /* S3 --emit-deps <file> */
+    const char *query_name;        /* S2 --query <symbol> */
     const char *gen_meta_path;
     bool do_emit_ir;
     int check_leaks_opt;

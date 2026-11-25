@@ -398,6 +398,14 @@
         }
     }
 
+    /* S2：符号查询——类型检查通过、调用已解析之后输出并退出，不生成代码 */
+    if (query_name) {
+        int qrc = zan_query_emit(ast, &binder, diag, query_name, stdout);
+        fflush(stdout);
+        zan_arena_free(arena);
+        return qrc;
+    }
+
     zan_irgen_t irgen;
     const char *irgen_triple = NULL;
     if (cross_compiling) {

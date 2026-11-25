@@ -19,6 +19,7 @@
 #include "winres.h"
 #include "embedres.h"
 #include "symbols.h"
+#include "query.h"
 #include "package.h"
 #include "win_utf8.h"
 #include "apk.h"
@@ -569,6 +570,7 @@ int main(int argc, char **argv) {
     const char *emit_symbols_path = opts.emit_symbols_path;
     bool do_summary = opts.do_summary;
     const char *emit_deps_path = opts.emit_deps_path;
+    const char *query_name = opts.query_name;
     const char *gen_meta_path = opts.gen_meta_path;
     bool do_emit_ir = opts.do_emit_ir;
     int check_leaks_opt = opts.check_leaks_opt;

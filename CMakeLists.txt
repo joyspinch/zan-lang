@@ -200,6 +200,7 @@ add_executable(zanc
     src/compiler/ipa.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
+    src/compiler/query.c
     src/runtime/rt_decimal.c
     # compressor side of embedded resources (embedres.c embed_maybe_compress)
     src/common/miniz.c
@@ -8710,6 +8711,11 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_zan_check.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR})
   set_tests_properties(zan_check_report PROPERTIES TIMEOUT 600)
+  # S2（docs/ZAN_STANDARD.md §1）：zanc --query——分配、捕获、可能抛出、能力、调用者。
+  add_test(NAME query_symbol_facts
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_query.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR})
+  set_tests_properties(query_symbol_facts PROPERTIES TIMEOUT 300)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

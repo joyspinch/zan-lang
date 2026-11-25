@@ -13,4 +13,8 @@ int zan_symbols_emit(zan_ast_node_t *unit, const char *path);
 int zan_summary_emit(zan_ast_node_t *unit, const zan_diag_t *diag, int explicit_count,
                      FILE *out);
 
+/* 签名打印（S2 query 复用）：类型引用节点 → "List<int>[]?"；方法 → "ret Name(T a, ...)" */
+int  zan_symbols_type_name(const zan_ast_node_t *t, char *buf, int cap);
+void zan_symbols_method_sig(const zan_ast_node_t *m, char *buf, int cap);
+
 #endif /* ZAN_SYMBOLS_H */

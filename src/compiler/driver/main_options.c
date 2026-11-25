@@ -86,6 +86,9 @@ void print_usage(void) {
                     "                     per member, signature + first doc sentence) and exit\n");
     fprintf(stderr, "    --emit-deps <f>  Write the source files this program compiled from\n"
                     "                     (after stdlib pull-in), one absolute path per line\n");
+    fprintf(stderr, "    --query <sym>    After type checking, report what Type.Method allocates,\n"
+                    "                     captures, may throw, which capabilities it reaches and\n"
+                    "                     who calls it (JSON Lines) and exit\n");
     fprintf(stderr, "    --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "    --api <symbol>   Query member signatures and types from API index\n");
     fprintf(stderr, "  Packaging:\n");

@@ -232,6 +232,27 @@ public class UiEvent  // 控件事件：单一订阅通道。
 - 实测：`packages/Zan.Gui/src` 460 个类型、6349 个成员，约 1.5 秒。
 - 钉：`summary_surface`（`tests/summary/`）。
 
+### 1.7a 符号查询（`--query`，S2）
+
+`zanc <入口...> --auto-stdlib --query <Type.Method | Type.Type | Type | Method>`
+在类型检查通过后回答"这个方法会干什么"，不生成代码；每个匹配一行 JSON，末行
+`{"kind":"summary","matches":N}`（无匹配退出码 1）：
+
+| 字段 | 内容 |
+|---|---|
+| `symbol` / `file` / `line` | `Type.Name(参数)` 与声明位置 |
+| `allocates` | 方法体里直接的分配：`new` 对象/数组、集合初始化、lambda 闭包 |
+| `captures` | 每个 lambda 是否用到 `this`、捕获了哪些外层局部量/形参 |
+| `throws` | `direct`：方法体里的 `throw`；`reachable`：经已解析调用可达方法里的异常类型，每种一条示例链（**上界**，不扣除 catch） |
+| `capabilities` | 可达调用里用到的能力（S7 口径）：`Net`、`File`、`Process`、`Registry`、`Clipboard`、`Native`（标准库之外的 extern/DllImport），每项一条证据链 |
+| `calls` / `callers` | 直接调用的方法；全程序里解析到它的调用点（各最多 64 条，`callers_truncated` 标出截断） |
+| `reachable_methods` | 经调用图可达的方法数 |
+
+调用图来自类型检查写在调用节点上的解析结果；`new T(...)` 连到 T 的同元数构造器；
+虚调用按静态目标连边、不展开覆盖；委托调用不连边（目标运行期才定）。单名先当类型名
+列出它的全部方法，没有该类型再按方法名找。实测 702 文件的 GUI 程序查询 < 1 秒。
+钉：`query_symbol_facts`（`tests/test_query.py`）。
+
 ### 1.8 一条命令的检查报告（`zan check`，S5）
 
 `python3 scripts/zan_check.py <入口.zan|目录...> [--timeout 60] [--no-run]
@@ -321,6 +342,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--summary` | — | 打印显式输入源文件的公开接口摘要后退出（S4，见 §1.7） |
+| `--query <sym>` | — | 类型检查后输出方法的分配/捕获/抛出/能力/调用者（JSON Lines）并退出（S2，见 §1.7a） |
 | `--emit-deps <f>` | — | 类型检查通过后把实际编进程序的源文件（拉入过滤之后，绝对路径一行一个）写到 `<f>`，照常继续编译（S3，见 §5） |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 
