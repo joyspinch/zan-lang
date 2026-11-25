@@ -995,3 +995,19 @@ mandel 的 1.28× 全是 FMA：C 去掉 `-ffp-contract` 正好与 Zan 同速。�
 是前端在同一表达式内直接出 `llvm.fmuladd`；Zan 在优化前（局部仍在 alloca、尚未 CSE）
 把"单用途 fmul 喂 fadd/fsub"改写为 fmuladd，等价于不跨语句。`--fp-contract` 开启，
 默认关（末位结果随 CPU 变，默认保持 C# 式逐位一致）。
+
+## 45. 泛型容器的字段数组接收者别钉住：`items[i].M()` 34× → ~1×（2026-11-25）
+
+`Box<T>.Total()` 里 `items[i].Score()`（items 是 this 的字段）每次调用都钉住接收者：
+带闭包标签判定的 retain、临时栈 push/pop（两次 TSD）、"是串还是对象"的动态探测
+再外联 `zan_rt_release_dyn`——late ARC 认不出这种形态，内联后也消不掉。已有
+`zan_elem_receiver_needs_no_pin`（简单下标/实参 + leaf 被调者 = 窗口内无任何释放）
+只认**局部**数组基址；字段读同样无副作用，`this` 由调用者保活，leaf 规则也保证
+字段不会在窗口里被换掉，于是放宽到 this 的实例字段（裸 `items` 或 `this.items`）。
+generic 基准 1.01 → 0.04s。非 leaf 被调者（会改写字段数组）照旧钉住——新用例
+`elem_receiver_field_array` 两种都覆盖并开泄漏检查。
+
+另记：异常基准内存随抛出次数线性增长（150k → 10MB，1.5M → 39MB）而泄漏检查
+无报告——编译器从不调用 `__cxa_begin_catch/__cxa_end_catch`，每个被 Zan catch 的
+C++ 异常对象都没释放。修法要区分"匹配的 catch 进入"与"同函数直接跳 catch"、
+重抛走新对象、外来 C++ 异常，另案处理。

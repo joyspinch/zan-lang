@@ -419,6 +419,29 @@ static bool sym_derives_from(zan_symbol_t *cls, zan_symbol_t *base) {
     return false;
 }
 
+/* The array base is read without side effects: a local/parameter, or an
+ * instance field of `this` (bare `items` or `this.items`). Reading a field
+ * releases nothing and the caller keeps `this` alive; the leaf-callee rule
+ * below guarantees nothing in the window can replace the field either.
+ * (Generic containers keep their arrays in fields: `items[i].Score()` in a
+ * Box<T> paid a full pin per element -- 34x C++.) */
+static bool elem_base_is_stable_read(zan_irgen_t *g, zan_ast_node_t *base, local_scope_t *locals) {
+    if (!base) return false;
+    zan_istr_t fname;
+    if (base->kind == AST_IDENTIFIER) {
+        if (local_find(locals, base->ident.name)) return true;
+        fname = base->ident.name;
+    } else if (base->kind == AST_MEMBER_ACCESS && base->member.object &&
+               base->member.object->kind == AST_THIS_EXPR && !base->member.null_cond) {
+        fname = base->member.name;
+    } else {
+        return false;
+    }
+    if (!g->current_type_sym || !g->current_this) return false;
+    zan_symbol_t *fs = get_field_sym(g->current_type_sym, fname);
+    return fs && fs->kind == SYM_FIELD && !field_member_is_static(fs);
+}
+
 bool zan_elem_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
                                     zan_ast_node_t *call, local_scope_t *locals) {
     if (!object || object->kind != AST_INDEX || !call || call->kind != AST_CALL ||
@@ -431,8 +454,7 @@ bool zan_elem_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
      * in that window (simple index/arguments, leaf callee) can release any
      * object: a plain local or parameter read is enough, borrowed or not. */
     zan_ast_node_t *base = object->index.object;
-    if (!base || base->kind != AST_IDENTIFIER || !local_find(locals, base->ident.name))
-        return false;
+    if (!elem_base_is_stable_read(g, base, locals)) return false;
     zan_type_t *at = infer_expr_type(g, object->index.object, locals);
     if (!at || at->kind != TYPE_ARRAY) return false;
     if (!caller_simple_expr(g, object->index.index, locals) ||
