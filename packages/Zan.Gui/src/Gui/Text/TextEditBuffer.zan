@@ -1,0 +1,372 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui;
+
+// 通用 UTF-8 文本编辑缓冲区（Layer 2 Text）：
+// 统一单行 Input、多行 TextArea 及派生编辑控件的文本状态、选区、过滤、长度计数、
+// 剪贴板、按词跳转/删除以及有限深度 Undo/Redo 历史。
+public class TextEditBuffer {
+    public string text;
+    public int cursorPos;
+    public int selAnchor;
+
+    private List<string> undoTexts;
+    private List<int> undoCursors;
+    private List<string> redoTexts;
+    private List<int> redoCursors;
+    private int maxUndo;
+
+    public TextEditBuffer() : this("") { }
+
+    public TextEditBuffer(string initial) {
+        this.text = initial != null ? initial : "";
+        this.cursorPos = 0;
+        this.selAnchor = 0 - 1;
+        this.undoTexts = new List<string>();
+        this.undoCursors = new List<int>();
+        this.redoTexts = new List<string>();
+        this.redoCursors = new List<int>();
+        this.maxUndo = 64;
+    }
+
+    public static int CountOf(string s, bool countGraphemes) {
+        if (s == null) { return 0; }
+        if (countGraphemes) { return Gui.Text.Graphemes(s); }
+        return Gui.Text.Chars(s);
+    }
+
+    public static bool IsWordByte(int b) {
+        if (b >= 48 && b <= 57) { return true; }   // 0-9
+        if (b >= 65 && b <= 90) { return true; }   // A-Z
+        if (b >= 97 && b <= 122) { return true; }  // a-z
+        if (b == 95 || b >= 128) { return true; }  // _ or UTF-8 non-ASCII
+        return false;
+    }
+
+    public static int PrevWordStart(string s, int pos) {
+        if (s == null || pos <= 0) { return 0; }
+        int p = pos > s.Length ? s.Length : pos;
+        while (p > 0) {
+            int prev = Gui.Text.PrevCharStart(s, p);
+            int b = s[prev] & 255;
+            if (b == 32 || b == 9 || b == 10 || b == 13) { p = prev; }
+            else { break; }
+        }
+        if (p <= 0) { return 0; }
+        int firstPrev = Gui.Text.PrevCharStart(s, p);
+        bool wantWord = TextEditBuffer.IsWordByte(s[firstPrev] & 255);
+        p = firstPrev;
+        while (p > 0) {
+            int prev = Gui.Text.PrevCharStart(s, p);
+            int b = s[prev] & 255;
+            if (b == 32 || b == 9 || b == 10 || b == 13) { break; }
+            if (TextEditBuffer.IsWordByte(b) != wantWord) { break; }
+            p = prev;
+        }
+        return p;
+    }
+
+    public static int NextWordEnd(string s, int pos) {
+        if (s == null) { return 0; }
+        int n = s.Length;
+        int p = pos < 0 ? 0 : pos;
+        if (p >= n) { return n; }
+        bool startWord = TextEditBuffer.IsWordByte(s[p] & 255);
+        bool startSpace = (s[p] & 255) == 32 || (s[p] & 255) == 9
+            || (s[p] & 255) == 10 || (s[p] & 255) == 13;
+        if (!startSpace) {
+            while (p < n) {
+                int b = s[p] & 255;
+                if (b == 32 || b == 9 || b == 10 || b == 13) { break; }
+                if (TextEditBuffer.IsWordByte(b) != startWord) { break; }
+                p = Gui.Text.NextCharEnd(s, p);
+            }
+        }
+        while (p < n) {
+            int b = s[p] & 255;
+            if (b == 32 || b == 9 || b == 10 || b == 13) { p = Gui.Text.NextCharEnd(s, p); }
+            else { break; }
+        }
+        return p;
+    }
+
+    public void SyncFrom(string value, int cursor, int anchor) {
+        this.text = value != null ? value : "";
+        this.cursorPos = cursor;
+        this.selAnchor = anchor;
+        this.Clamp();
+    }
+
+    public void Clamp() {
+        if (this.text == null) { this.text = ""; }
+        int n = this.text.Length;
+        if (this.cursorPos > n) { this.cursorPos = n; }
+        if (this.cursorPos < 0) { this.cursorPos = 0; }
+        if (this.selAnchor > n) { this.selAnchor = n; }
+    }
+
+    public bool HasSel() { return this.selAnchor >= 0 && this.selAnchor != this.cursorPos; }
+    public int SelStart() {
+        if (this.selAnchor >= 0 && this.selAnchor < this.cursorPos) { return this.selAnchor; }
+        return this.cursorPos;
+    }
+    public int SelEnd() {
+        if (this.selAnchor > this.cursorPos) { return this.selAnchor; }
+        return this.cursorPos;
+    }
+    public string SelText() {
+        if (!this.HasSel()) { return ""; }
+        int s = this.SelStart();
+        return this.text.Substring(s, this.SelEnd() - s);
+    }
+
+    public void SelectAll() {
+        this.selAnchor = 0;
+        this.cursorPos = this.text.Length;
+    }
+
+    public void ClearSelection() { this.selAnchor = 0 - 1; }
+
+    public void SetText(string v) {
+        this.text = v != null ? v : "";
+        this.cursorPos = this.text.Length;
+        this.selAnchor = 0 - 1;
+        this.undoTexts.Clear();
+        this.undoCursors.Clear();
+        this.redoTexts.Clear();
+        this.redoCursors.Clear();
+    }
+
+    private void PushUndoSnapshot(string prevText, int prevCursor) {
+        if (this.undoTexts.Count > 0 && this.undoTexts[this.undoTexts.Count - 1] == prevText) {
+            this.undoCursors[this.undoCursors.Count - 1] = prevCursor;
+            this.redoTexts.Clear();
+            this.redoCursors.Clear();
+            return;
+        }
+        if (this.undoTexts.Count >= this.maxUndo) {
+            this.undoTexts.RemoveAt(0);
+            this.undoCursors.RemoveAt(0);
+        }
+        this.undoTexts.Add(prevText);
+        this.undoCursors.Add(prevCursor);
+        this.redoTexts.Clear();
+        this.redoCursors.Clear();
+    }
+
+    public bool CanUndo() { return this.undoTexts.Count > 0; }
+    public bool CanRedo() { return this.redoTexts.Count > 0; }
+
+    public bool Undo() {
+        if (this.undoTexts.Count == 0) { return false; }
+        int last = this.undoTexts.Count - 1;
+        this.redoTexts.Add(this.text);
+        this.redoCursors.Add(this.cursorPos);
+        this.text = this.undoTexts[last];
+        this.cursorPos = this.undoCursors[last];
+        this.undoTexts.RemoveAt(last);
+        this.undoCursors.RemoveAt(last);
+        this.selAnchor = 0 - 1;
+        this.Clamp();
+        return true;
+    }
+
+    public bool Redo() {
+        if (this.redoTexts.Count == 0) { return false; }
+        int last = this.redoTexts.Count - 1;
+        this.undoTexts.Add(this.text);
+        this.undoCursors.Add(this.cursorPos);
+        this.text = this.redoTexts[last];
+        this.cursorPos = this.redoCursors[last];
+        this.redoTexts.RemoveAt(last);
+        this.redoCursors.RemoveAt(last);
+        this.selAnchor = 0 - 1;
+        this.Clamp();
+        return true;
+    }
+
+    public bool DeleteSelection() {
+        if (!this.HasSel()) { return false; }
+        string prev = this.text;
+        int prevCursor = this.cursorPos;
+        int s = this.SelStart();
+        int e = this.SelEnd();
+        this.text = prev.Substring(0, s) + prev.Substring(e, prev.Length - e);
+        this.cursorPos = s;
+        this.selAnchor = 0 - 1;
+        this.PushUndoSnapshot(prev, prevCursor);
+        return true;
+    }
+
+    public bool Insert(string s, int maxLen, bool countGraphemes, Func<string, string> filter) {
+        if (s == null) { return false; }
+        this.Clamp();
+        string orig = this.text;
+        int origCursor = this.cursorPos;
+        int origAnchor = this.selAnchor;
+        bool hadSel = this.HasSel();
+        if (hadSel) {
+            int ss = this.SelStart();
+            int se = this.SelEnd();
+            this.text = orig.Substring(0, ss) + orig.Substring(se, orig.Length - se);
+            this.cursorPos = ss;
+            this.selAnchor = 0 - 1;
+        }
+        string txt = this.text;
+        string cand = Gui.Text.InsertAt(txt, this.cursorPos, s);
+        string final = filter != null ? filter(cand) : cand;
+        if (final == null || (maxLen > 0 && TextEditBuffer.CountOf(final, countGraphemes) > maxLen)) {
+            this.text = orig;
+            this.cursorPos = origCursor;
+            this.selAnchor = origAnchor;
+            return false;
+        }
+        int delta = final.Length - cand.Length;
+        int cp = this.cursorPos + s.Length + delta;
+        if (cp < 0) { cp = 0; }
+        if (cp > final.Length) { cp = final.Length; }
+        if (final == txt && cp == this.cursorPos && !hadSel) {
+            this.selAnchor = 0 - 1;
+            return false;
+        }
+        this.PushUndoSnapshot(orig, origCursor);
+        this.text = final;
+        this.cursorPos = cp;
+        this.selAnchor = 0 - 1;
+        return true;
+    }
+
+    public bool DeleteCandidate(string cand, Func<string, string> filter) {
+        string final = filter != null ? filter(cand) : cand;
+        if (final == null || final == this.text) { return false; }
+        this.PushUndoSnapshot(this.text, this.cursorPos);
+        this.text = final;
+        if (this.cursorPos > final.Length) { this.cursorPos = final.Length; }
+        if (this.selAnchor > final.Length) { this.selAnchor = final.Length; }
+        return true;
+    }
+
+    public bool Backspace(bool byWord, Func<string, string> filter) {
+        this.Clamp();
+        if (this.HasSel()) {
+            return this.DeleteSelection();
+        }
+        if (this.cursorPos <= 0) { return false; }
+        int start = byWord
+            ? TextEditBuffer.PrevWordStart(this.text, this.cursorPos)
+            : Gui.Text.PrevCharStart(this.text, this.cursorPos);
+        string cand = this.text.Substring(0, start)
+            + this.text.Substring(this.cursorPos, this.text.Length - this.cursorPos);
+        if (this.DeleteCandidate(cand, filter)) {
+            this.cursorPos = start > this.text.Length ? this.text.Length : start;
+            return true;
+        }
+        return false;
+    }
+
+    public bool DeleteForward(bool byWord, Func<string, string> filter) {
+        this.Clamp();
+        if (this.HasSel()) {
+            return this.DeleteSelection();
+        }
+        if (this.cursorPos >= this.text.Length) { return false; }
+        int end = byWord
+            ? TextEditBuffer.NextWordEnd(this.text, this.cursorPos)
+            : Gui.Text.NextCharEnd(this.text, this.cursorPos);
+        string cand = this.text.Substring(0, this.cursorPos)
+            + this.text.Substring(end, this.text.Length - end);
+        return this.DeleteCandidate(cand, filter);
+    }
+
+    // 处理通用按键（Ctrl+A/C/X/V/Z/Y、Delete、左右移动与按词跳转、单行 Home/End）。
+    // 返回 true 表示事件已消费；textChanged 为 true 表示文本已修改（需要触发 Edited）。
+    public bool HandleCommonKeyDown(int kc, int mods, bool readOnly, bool handleHomeEnd,
+                                    int maxLen, bool countGraphemes,
+                                    Func<string, string> filter, out bool textChanged) {
+        textChanged = false;
+        this.Clamp();
+        bool shift = Modifiers.HasShift(mods);
+        bool ctrl = Modifiers.HasCtrl(mods);
+        if (ctrl && kc == 65) { // Ctrl+A
+            this.SelectAll();
+            return true;
+        }
+        if (ctrl && kc == 67) { // Ctrl+C
+            if (this.HasSel()) { Clipboard.SetText(this.SelText()); }
+            else { Clipboard.SetText(this.text); }
+            return true;
+        }
+        if (ctrl && kc == 88) { // Ctrl+X
+            if (readOnly) { return false; }
+            if (this.HasSel()) {
+                Clipboard.SetText(this.SelText());
+                if (this.DeleteSelection()) { textChanged = true; }
+            }
+            return true;
+        }
+        if (ctrl && kc == 86) { // Ctrl+V
+            if (readOnly) { return false; }
+            string clip = Clipboard.GetText();
+            if (clip.Length > 0 && this.Insert(clip, maxLen, countGraphemes, filter)) {
+                textChanged = true;
+            }
+            return true;
+        }
+        if (ctrl && kc == 90) { // Ctrl+Z / Ctrl+Shift+Z
+            if (readOnly) { return false; }
+            textChanged = shift ? this.Redo() : this.Undo();
+            return true;
+        }
+        if (ctrl && kc == 89) { // Ctrl+Y
+            if (readOnly) { return false; }
+            textChanged = this.Redo();
+            return true;
+        }
+        if (kc == 8 && ctrl) { // Ctrl+Backspace
+            if (readOnly) { return false; }
+            textChanged = this.Backspace(true, filter);
+            return true;
+        }
+        if (kc == 46) { // Delete / Ctrl+Delete
+            if (readOnly) { return false; }
+            textChanged = this.DeleteForward(ctrl, filter);
+            return true;
+        }
+        if (kc == 37 || kc == 39 || (handleHomeEnd && (kc == 36 || kc == 35))) {
+            if (shift) {
+                if (this.selAnchor < 0) { this.selAnchor = this.cursorPos; }
+            } else if (this.HasSel()) {
+                if (kc == 37) { this.cursorPos = this.SelStart(); }
+                else if (kc == 39) { this.cursorPos = this.SelEnd(); }
+                else if (kc == 36) { this.cursorPos = 0; }
+                else if (kc == 35) { this.cursorPos = this.text.Length; }
+                this.selAnchor = 0 - 1;
+                return true;
+            } else {
+                this.selAnchor = 0 - 1;
+            }
+            if (kc == 37) {
+                if (this.cursorPos > 0) {
+                    this.cursorPos = ctrl
+                        ? TextEditBuffer.PrevWordStart(this.text, this.cursorPos)
+                        : Gui.Text.PrevCharStart(this.text, this.cursorPos);
+                }
+            } else if (kc == 39) {
+                if (this.cursorPos < this.text.Length) {
+                    this.cursorPos = ctrl
+                        ? TextEditBuffer.NextWordEnd(this.text, this.cursorPos)
+                        : Gui.Text.NextCharEnd(this.text, this.cursorPos);
+                }
+            } else if (kc == 36) {
+                this.cursorPos = 0;
+            } else if (kc == 35) {
+                this.cursorPos = this.text.Length;
+            }
+            return true;
+        }
+        return false;
+    }
+}

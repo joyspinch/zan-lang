@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace GuiPhase3Test;
+
+class Program {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + msg);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestTextEditBufferAndWidgets() {
+        TextEditBuffer buf = new TextEditBuffer("hello world foo");
+        buf.cursorPos = buf.text.Length;
+        Check(TextEditBuffer.PrevWordStart(buf.text, buf.cursorPos) == 12, "prev word -> foo");
+        Check(TextEditBuffer.PrevWordStart(buf.text, 12) == 6, "prev word -> world");
+        Check(TextEditBuffer.NextWordEnd(buf.text, 0) == 6, "next word -> past hello ");
+
+        // Ctrl+Backspace 删除一个词，再 Undo/Redo
+        bool changed = false;
+        Check(buf.HandleCommonKeyDown(8, 1 /* Ctrl */, false, true, 0, false, null, out changed) && changed,
+            "Ctrl+Backspace deletes word");
+        Check(buf.text == "hello world ", "text after Ctrl+Backspace");
+        Check(buf.Undo() && buf.text == "hello world foo", "Undo restores deleted word");
+        Check(buf.Redo() && buf.text == "hello world ", "Redo reapplies word delete");
+
+        // Input 集成 Undo / Redo / Filter / MaxLen
+        Input inp = new Input("hint");
+        inp.MaxLen = 10;
+        Check(inp.Insert("abc"), "input insert abc");
+        Check(inp.Insert("123"), "input insert 123");
+        Check(inp.GetText() == "abc123", "input text abc123");
+        Check(inp.Undo() && inp.GetText() == "abc", "input Undo -> abc");
+        Check(inp.Redo() && inp.GetText() == "abc123", "input Redo -> abc123");
+        Check(!inp.Insert("99999"), "input rejects exceeding MaxLen=10");
+
+        // TextArea 集成 Undo / Redo / ReadOnly 保护
+        TextArea area = new TextArea("notes");
+        Check(area.Insert("line1\nline2"), "textarea insert");
+        Check(area.Insert("\nline3"), "textarea insert 2");
+        Check(area.Undo() && area.GetText() == "line1\nline2", "textarea Undo");
+        Check(area.Redo() && area.GetText() == "line1\nline2\nline3", "textarea Redo");
+        area.ReadOnly(true);
+        Check(!area.Undo(), "readonly textarea blocks Undo");
+    }
+
+    static void TestSelectionModelAndVirtualHost() {
+        SelectionModel sm = new SelectionModel();
+        int p = sm.ToggleCtrl(1, 0 - 1);
+        Check(p == 1, "first Ctrl toggle sets primary 1");
+        p = sm.ToggleCtrl(3, p);
+        Check(p == 1 && sm.IsMarked(1, p) && sm.IsMarked(3, p), "second Ctrl toggle adds 3");
+        sm.SelectRange(1, 4, p, (int r) => r != 2);
+        List<int> idxs = sm.SelectedIndices(5, p);
+        Check(idxs.Count == 3 && idxs[0] == 1 && idxs[1] == 3 && idxs[2] == 4,
+            "SelectRange skips non-selectable row 2");
+        sm.Prune(3);
+        Check(!sm.IsMarked(3, p) && !sm.IsMarked(4, p), "Prune removes out-of-range marks");
+
+        Check(SelectionModel.StepIndex(0, 1, 5, (int r) => r != 1) == 2, "StepIndex skips row 1");
+        Check(SelectionModel.EdgeIndex(true, 5, (int r) => r != 4) == 3, "EdgeIndex finds last selectable");
+
+        int first = 0;
+        int last = 0;
+        VisibleRowHost.ComputeVisibleWindow(100, 200, 25, 50, out first, out last);
+        Check(first == 4 && last == 14, "ComputeVisibleWindow [4, 14)");
+    }
+
+    static RoutedEventArgs KeyEvent(Control c, int kc) {
+        RoutedEventArgs e = new RoutedEventArgs("KeyDown", c, 0, 0);
+        e.keyCode = kc;
+        return e;
+    }
+
+    static void TestListTreeKeyboardAndTransfer() {
+        List<string> items = new List<string>{ "alpha", "beta", "gamma", "delta" };
+        ListView<string> lv = new ListView<string>();
+        lv.Bind(items);
+        lv.WithMultiSelect();
+        lv.OnKeyDown(KeyEvent(lv, 40)); // Down -> 0
+        Check(lv.SelectedIndex() == 0, "ListView Down selects 0");
+        lv.OnKeyDown(KeyEvent(lv, 35)); // End -> 3
+        Check(lv.SelectedIndex() == 3, "ListView End selects 3");
+        lv.OnKeyDown(KeyEvent(lv, 36)); // Home -> 0
+        Check(lv.SelectedIndex() == 0, "ListView Home selects 0");
+
+        TreeNode dir = new TreeNode();
+        dir.label = "src"; dir.isDir = true; dir.expanded = false; dir.depth = 0;
+        TreeNode child = new TreeNode();
+        child.label = "main.zan"; child.isDir = false; child.depth = 1;
+        TreeNode readme = new TreeNode();
+        readme.label = "README.md"; readme.isDir = false; readme.depth = 0;
+        TreeView tv = new TreeView();
+        tv.Bind(new List<TreeNode>{ dir, child, readme });
+        tv.SelectIndex(0);
+        // 折叠态下 Down 跳过隐藏子节点直接到 readme (index 2)
+        tv.OnKeyDown(KeyEvent(tv, 40));
+        Check(tv.SelectedIndex() == 2, "TreeView Down skips collapsed child to index 2");
+        tv.SelectIndex(0);
+        // Right 展开目录，再 Down 进入子节点 index 1
+        tv.OnKeyDown(KeyEvent(tv, 39));
+        Check(dir.expanded, "TreeView Right expands dir");
+        tv.OnKeyDown(KeyEvent(tv, 40));
+        Check(tv.SelectedIndex() == 1, "TreeView Down enters expanded child 1");
+
+        List<string> left = new List<string>{ "a", "b", "c" };
+        List<string> right = new List<string>();
+        Transfer<string> tr = new Transfer<string>(left, right);
+        tr.SelectAllVisible(true);
+        Check(tr.CheckedSource() == 3, "Transfer SelectAllVisible checks all 3");
+        tr.MoveRight();
+        Check(left.Count == 0 && right.Count == 3, "Transfer MoveRight moves 3 items");
+    }
+
+    static int Main() {
+        TestTextEditBufferAndWidgets();
+        TestSelectionModelAndVirtualHost();
+        TestListTreeKeyboardAndTransfer();
+        Console.WriteLine("WIDGET_INFRA_PHASE3_OK");
+        return 0;
+    }
+}

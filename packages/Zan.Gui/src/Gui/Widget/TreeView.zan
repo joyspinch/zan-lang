@@ -13,6 +13,7 @@ public partial class TreeView : Control {
     public bool checks;
     public bool multi;
     public List<int> marks;
+    private SelectionModel selection;
     public NodeOf tpl;
     public bool rowsStale;
     public int builtFor;
@@ -91,7 +92,8 @@ public partial class TreeView : Control {
         filter = null;
         checks = false;
         multi = false;
-        marks = new List<int>();
+        selection = new SelectionModel();
+        marks = selection.marks;
         tpl = null;
         rowsStale = true;
         builtFor = 0 - 1;
@@ -236,20 +238,11 @@ public partial class TreeView : Control {
         Control ownerParent = parent;
         int ticket = rowsRevision;
         Rect view = rowsBody.ScrollViewport();
-        rowsBody.scrollExtent = this.ContentHeight(app);
-        rowsBody.scrollExtentX = view.width;
-        scrollExtent = rowsBody.scrollExtent;
-        scrollExtentX = rowsBody.scrollExtentX;
-        int max = rowsBody.scrollExtent - view.height;
-        if (max < 0) { max = 0; }
-        int off = rowsBody.ScrollTop();
-        if (off > max) { off = max; }
-        if (off < 0) { off = 0; }
-        if (off != rowsBody.ScrollTop()) { rowsBody.CommitScrollOffset(0, off); }
+        int width = 0;
+        int off = VisibleRowHost.ClampScrollViewport(
+            this, rowsBody, this.ContentHeight(app), view,
+            app != null ? app.Scale(12) : 12, out width);
         if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-        int width = view.width;
-        if (rowsBody.scrollExtent > view.height) { width = width - (app != null ? app.Scale(12) : 12); }
-        if (width < 0) { width = 0; }
         if (fixedRowHeight > 0) {
             if (scroll.Get() != off) { scroll.Set(off); }
             if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
@@ -297,7 +290,7 @@ public partial class TreeView : Control {
         App app = this.App;
         if (app.window.EventButton() == 1) {
             if (!(multi && this.IsMarked(index))) {
-                if (multi) { marks = new List<int>(); }
+                if (multi) { selection.Clear(); marks = selection.marks; }
                 Value.Set(index);
             }
             ctxRow = index; ctxX = e.x; ctxY = e.y;
@@ -374,34 +367,19 @@ public partial class TreeView : Control {
             TreeNode n = data[index];
             int mods = e.modifiers;
             if (multi && Modifiers.HasCtrl(mods)) {
-                bool was = false;
-                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
-                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
-                }
-                if (Value.Get() == index) { Value.Set(0 - 1); was = true; }
-                if (!was) {
-                    if (Value.Get() < 0) { Value.Set(index); }
-                    else { marks.Add(index); }
-                }
+                Value.Set(selection.ToggleCtrl(index, Value.Get()));
                 ctxRow = index;
                 this.NoteSelfDamage(app);
                 return;
             }
             if (multi && Modifiers.HasShift(mods) && Value.Get() >= 0) {
-                int a = Value.Get();
-                int b = index;
-                if (b < a) { int tmp = a; a = b; b = tmp; }
-                int r = a;
-                while (r <= b) {
-                    if (!this.IsMarked(r) && this.Shown(r)) { marks.Add(r); }
-                    r = r + 1;
-                }
+                selection.SelectRange(Value.Get(), index, Value.Get(), (int r) => this.Shown(r));
                 ctxRow = index;
                 this.NoteSelfDamage(app);
                 return;
             }
             bool moved = Value.Get() != index;
-            if (multi) { marks = new List<int>(); }
+            if (multi) { selection.Clear(); marks = selection.marks; }
             Value.Set(index);
             ctxRow = index;
             if (n.isDir) {
@@ -414,12 +392,65 @@ public partial class TreeView : Control {
             this.NoteSelfDamage(app);
         e.Handle();
     }
+    public override void OnKeyDown(RoutedEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        int n = data.Count;
+        if (n <= 0) { return; }
+        int cur = Value.Get();
+        int kc = e.keyCode;
+        if (kc == 39 && this.Has(cur) && data[cur].isDir && !data[cur].expanded) {
+            data[cur].expanded = true;
+            this.LayoutBody();
+            Expand.Post(this);
+            App app = this.FindApp();
+            if (app != null) { this.NoteSelfDamage(app); }
+            e.Handle();
+            return;
+        }
+        if (kc == 37 && this.Has(cur) && data[cur].isDir && data[cur].expanded) {
+            data[cur].expanded = false;
+            this.LayoutBody();
+            Collapse.Post(this);
+            App app = this.FindApp();
+            if (app != null) { this.NoteSelfDamage(app); }
+            e.Handle();
+            return;
+        }
+        if (kc == 13 && this.Has(cur)) {
+            Activate.Post(this);
+            e.Handle();
+            return;
+        }
+        int next = 0 - 1;
+        if (kc == 38) { next = SelectionModel.StepIndex(cur, 0 - 1, n, (int r) => this.Shown(r)); }
+        else if (kc == 40) { next = SelectionModel.StepIndex(cur, 1, n, (int r) => this.Shown(r)); }
+        else if (kc == 33) { next = SelectionModel.StepIndex(cur, 0 - 10, n, (int r) => this.Shown(r)); }
+        else if (kc == 34) { next = SelectionModel.StepIndex(cur, 10, n, (int r) => this.Shown(r)); }
+        else if (kc == 36) { next = SelectionModel.EdgeIndex(false, n, (int r) => this.Shown(r)); }
+        else if (kc == 35) { next = SelectionModel.EdgeIndex(true, n, (int r) => this.Shown(r)); }
+        else { return; }
+        if (next >= 0 && next != cur) {
+            if (multi && Modifiers.HasShift(e.modifiers) && cur >= 0) {
+                selection.SelectRange(cur, next, cur, (int r) => this.Shown(r));
+            } else if (multi) {
+                selection.Clear();
+                marks = selection.marks;
+            }
+            Value.Set(next);
+            ctxRow = next;
+            Select.Post(this);
+            App app = this.FindApp();
+            if (app != null) { this.NoteSelfDamage(app); }
+        }
+        e.Handle();
+    }
     public override void OnRoutedEvent(RoutedEventArgs e) {
         if (!e.handled && e.eventName == "LongPress" && !this.IsDisabled()) {
             int index = this.DataIndexAt(e.x, e.y);
             if (index >= 0) {
                 if (!(multi && this.IsMarked(index))) {
-                    if (multi) { marks = new List<int>(); }
+                    if (multi) { selection.Clear(); marks = selection.marks; }
                     Value.Set(index);
                 }
                 ctxRow = index; ctxX = e.x; ctxY = e.y;
@@ -462,11 +493,7 @@ public partial class TreeView : Control {
         else { data = nodes; }
         this.RetireRows();
         if (Value.Get() >= data.Count) { Value.Set(0 - 1); }
-        int mi = marks.Count - 1;
-        while (mi >= 0) {
-            if (marks[mi] >= data.Count) { marks.RemoveAt(mi); }
-            mi = mi - 1;
-        }
+        selection.Prune(data.Count);
     }
     public void Refresh() {
         if (!Dispatcher.CheckUiThread()) {
@@ -519,24 +546,11 @@ public partial class TreeView : Control {
     }
     public void ClearSelection() {
         Value.Set(0 - 1);
-        marks = new List<int>();
+        selection.Clear();
+        marks = selection.marks;
     }
-    public bool IsMarked(int row) {
-        if (row < 0) { return false; }
-        if (row == Value.Get()) { return true; }
-        for (int i = 0; i < marks.Count; i = i + 1) {
-            if (marks[i] == row) { return true; }
-        }
-        return false;
-    }
-    public List<int> SelectedIndices() {
-        List<int> outp = new List<int>();
-        int n = data.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (this.IsMarked(i)) { outp.Add(i); }
-        }
-        return outp;
-    }
+    public bool IsMarked(int row) { return selection.IsMarked(row, Value.Get()); }
+    public List<int> SelectedIndices() { return selection.SelectedIndices(data.Count, Value.Get()); }
     public int SelectionCount() { return this.SelectedIndices().Count; }
     public int ContextRow() { return ctxRow; }
     public int ContextX() { return ctxX; }

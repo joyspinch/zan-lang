@@ -28,6 +28,7 @@ public partial class ListView<T> : Control {
     public int hover;
     public bool multi;
     public List<int> marks;
+    private SelectionModel selection;
     public RowGate<T> onlySelectable;
     public Binding<int> scroll;
     public bool rowsStale;
@@ -76,7 +77,8 @@ public partial class ListView<T> : Control {
         sel = -1;
         hover = -1;
         multi = false;
-        marks = new List<int>();
+        selection = new SelectionModel();
+        marks = selection.marks;
         onlySelectable = null;
         scroll = 0;
         rowsStale = true;
@@ -262,20 +264,11 @@ public partial class ListView<T> : Control {
                 }
             }
         }
-        rowsBody.scrollExtent = this.ContentHeight(app);
-        rowsBody.scrollExtentX = view.width;
-        scrollExtent = rowsBody.scrollExtent;
-        scrollExtentX = rowsBody.scrollExtentX;
-        int max = rowsBody.scrollExtent - view.height;
-        if (max < 0) { max = 0; }
-        int off = rowsBody.ScrollTop();
-        if (off > max) { off = max; }
-        if (off < 0) { off = 0; }
-        if (off != rowsBody.ScrollTop()) { rowsBody.CommitScrollOffset(0, off); }
+        int width = 0;
+        int off = VisibleRowHost.ClampScrollViewport(
+            this, rowsBody, this.ContentHeight(app), view,
+            app != null ? app.Scale(12) : 12, out width);
         if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
-        int width = view.width;
-        if (rowsBody.scrollExtent > view.height) { width = width - (app != null ? app.Scale(12) : 12); }
-        if (width < 0) { width = 0; }
         if (fixedRowHeight > 0) {
             if (scroll.Get() != off) { scroll.Set(off); }
             if (ticket != rowsRevision || this.FindApp() != app || parent != ownerParent) { return; }
@@ -374,31 +367,53 @@ public partial class ListView<T> : Control {
         App app = this.App;
             int mods = e.modifiers;
             if (multi && Modifiers.HasCtrl(mods)) {
-                bool was = false;
-                for (int mi = 0; mi < marks.Count; mi = mi + 1) {
-                    if (marks[mi] == index) { marks.RemoveAt(mi); was = true; break; }
-                }
-                if (sel == index) { sel = -1; was = true; }
-                if (!was) { marks.Add(index); if (sel < 0) { sel = index; } }
+                sel = selection.ToggleCtrl(index, sel);
                 Select.Post(this);
             } else if (multi && Modifiers.HasShift(mods) && sel >= 0) {
-                int a = sel;
-                int b = index;
-                if (b < a) { int tmp = a; a = b; b = tmp; }
-                int r = a;
-                while (r <= b) {
-                    if (this.Selectable(r) && !this.IsMarked(r)) { marks.Add(r); }
-                    r = r + 1;
-                }
+                selection.SelectRange(sel, index, sel, (int r) => this.Selectable(r));
                 Select.Post(this);
             } else {
                 bool again = (sel == index) || (sel < 0 && e.isDoubleClick);
-                if (multi) { marks = new List<int>(); }
+                if (multi) { selection.Clear(); marks = selection.marks; }
                 sel = index;
                 if (again) { Activate.Post(this); }
                 else { Select.Post(this); }
             }
             this.NoteSelfDamage(app);
+        e.Handle();
+    }
+    public override void OnKeyDown(RoutedEventArgs e) {
+        base.OnKeyDown(e);
+        if (e.handled || this.IsDisabled()) { return; }
+        int n = this.Count();
+        if (n <= 0) { return; }
+        int kc = e.keyCode;
+        int next = 0 - 1;
+        if (kc == 38) { next = SelectionModel.StepIndex(sel, 0 - 1, n, (int r) => this.Selectable(r)); }
+        else if (kc == 40) { next = SelectionModel.StepIndex(sel, 1, n, (int r) => this.Selectable(r)); }
+        else if (kc == 33) { next = SelectionModel.StepIndex(sel, 0 - 10, n, (int r) => this.Selectable(r)); }
+        else if (kc == 34) { next = SelectionModel.StepIndex(sel, 10, n, (int r) => this.Selectable(r)); }
+        else if (kc == 36) { next = SelectionModel.EdgeIndex(false, n, (int r) => this.Selectable(r)); }
+        else if (kc == 35) { next = SelectionModel.EdgeIndex(true, n, (int r) => this.Selectable(r)); }
+        else if (kc == 13 && this.HasSelection()) {
+            Activate.Post(this);
+            e.Handle();
+            return;
+        } else {
+            return;
+        }
+        if (next >= 0 && next != sel) {
+            if (multi && Modifiers.HasShift(e.modifiers) && sel >= 0) {
+                selection.SelectRange(sel, next, sel, (int r) => this.Selectable(r));
+            } else if (multi) {
+                selection.Clear();
+                marks = selection.marks;
+            }
+            sel = next;
+            Select.Post(this);
+            App app = this.FindApp();
+            if (app != null) { this.NoteSelfDamage(app); }
+        }
         e.Handle();
     }
     public override void OnRoutedEvent(RoutedEventArgs e) {
@@ -436,11 +451,7 @@ public partial class ListView<T> : Control {
         data = src;
         this.RetireRows();
         if (sel >= this.Count()) { sel = -1; }
-        int mi = marks.Count - 1;
-        while (mi >= 0) {
-            if (marks[mi] >= this.Count()) { marks.RemoveAt(mi); }
-            mi = mi - 1;
-        }
+        selection.Prune(this.Count());
     }
     public void Refresh() {
         if (!Dispatcher.CheckUiThread()) {
@@ -468,24 +479,11 @@ public partial class ListView<T> : Control {
         sel = row;
         Select.Post(this);
     }
-    public void ClearSelection() { sel = -1; marks = new List<int>(); }
+    public void ClearSelection() { sel = -1; selection.Clear(); marks = selection.marks; }
     public void WithMultiSelect() { multi = true; }
     public void WithSelectable(RowGate<T> gate) { onlySelectable = gate; }
-    public bool IsMarked(int row) {
-        if (row == sel && sel >= 0) { return true; }
-        for (int i = 0; i < marks.Count; i = i + 1) {
-            if (marks[i] == row) { return true; }
-        }
-        return false;
-    }
-    public List<int> SelectedIndices() {
-        List<int> outp = new List<int>();
-        int n = this.Count();
-        for (int i = 0; i < n; i = i + 1) {
-            if (this.IsMarked(i)) { outp.Add(i); }
-        }
-        return outp;
-    }
+    public bool IsMarked(int row) { return selection.IsMarked(row, sel); }
+    public List<int> SelectedIndices() { return selection.SelectedIndices(this.Count(), sel); }
     public int SelectionCount() { return this.SelectedIndices().Count; }
     // ---- 处理器 ----
 
