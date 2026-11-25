@@ -65,10 +65,81 @@ public class Fx {
         if (r <= 0 || maxAlpha <= 0) { return; }
         c.FillRadial(cx, cy, r, color, maxAlpha);
     }
+    static int ClampRadius(int w, int h, int radius) {
+        int r = radius;
+        if (r < 0) { r = 0; }
+        int maxR = (w < h ? w : h) / 2;
+        if (r > maxR) { r = maxR; }
+        return r;
+    }
+    // 圆角矩形周长（直线段 + 4 段四分之一圆弧）。
+    static int PerimeterLength(int w, int h, int radius) {
+        if (w <= 0 || h <= 0) { return 0; }
+        int r = Fx.ClampRadius(w, h, radius);
+        if (r <= 0) { return 2 * (w + h); }
+        double arc = 1.5707963268 * (double)r;
+        return (int)(2.0 * (double)(w - 2 * r) + 2.0 * (double)(h - 2 * r) + 4.0 * arc + 0.5);
+    }
+    // 沿圆角矩形周长按弧长 d 采样真实边界坐标（含四角圆弧）。
+    static void PerimeterPoint(int x, int y, int w, int h, int radius, int d,
+                               out int px, out int py) {
+        int r = Fx.ClampRadius(w, h, radius);
+        if (r <= 0) {
+            int per = 2 * (w + h);
+            int dd = per > 0 ? (d % per) : 0;
+            if (dd < 0) { dd = dd + per; }
+            if (dd < w) { px = x + dd; py = y; return; }
+            if (dd < w + h) { px = x + w; py = y + (dd - w); return; }
+            if (dd < w + h + w) { px = x + w - (dd - w - h); py = y + h; return; }
+            px = x; py = y + h - (dd - w - h - w);
+            return;
+        }
+        double sw = (double)(w - 2 * r);
+        double sh = (double)(h - 2 * r);
+        double arc = 1.5707963268 * (double)r;
+        double total = 2.0 * (sw + sh) + 4.0 * arc;
+        double s = (double)d;
+        if (total > 0.0) {
+            while (s < 0.0) { s = s + total; }
+            while (s >= total) { s = s - total; }
+        }
+        if (s < sw) { px = x + r + (int)(s + 0.5); py = y; return; }
+        s = s - sw;
+        if (s < arc) {
+            double ang = -1.5707963268 + s / (double)r;
+            px = x + w - r + (int)((double)r * Math.Cos(ang) + 0.5);
+            py = y + r + (int)((double)r * Math.Sin(ang) + 0.5);
+            return;
+        }
+        s = s - arc;
+        if (s < sh) { px = x + w; py = y + r + (int)(s + 0.5); return; }
+        s = s - sh;
+        if (s < arc) {
+            double ang = s / (double)r;
+            px = x + w - r + (int)((double)r * Math.Cos(ang) + 0.5);
+            py = y + h - r + (int)((double)r * Math.Sin(ang) + 0.5);
+            return;
+        }
+        s = s - arc;
+        if (s < sw) { px = x + w - r - (int)(s + 0.5); py = y + h; return; }
+        s = s - sw;
+        if (s < arc) {
+            double ang = 1.5707963268 + s / (double)r;
+            px = x + r + (int)((double)r * Math.Cos(ang) + 0.5);
+            py = y + h - r + (int)((double)r * Math.Sin(ang) + 0.5);
+            return;
+        }
+        s = s - arc;
+        if (s < sh) { px = x; py = y + h - r - (int)(s + 0.5); return; }
+        s = s - sh;
+        double angTL = 3.1415926536 + s / (double)r;
+        px = x + r + (int)((double)r * Math.Cos(angTL) + 0.5);
+        py = y + r + (int)((double)r * Math.Sin(angTL) + 0.5);
+    }
     static void BorderGlow(RenderHost app, int x, int y, int w, int h,
                            int radius, int color, int periodMs, int intensity) {
         Canvas c = app.HostCanvas();
-        int per = 2 * (w + h);
+        int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
         int gr = app.HostScale(3);  // 细：约为边框线宽
@@ -91,15 +162,7 @@ public class Fx {
             }
             if (a > 0) {
                 int px = x; int py = y;
-                if (d < w) {
-                    px = x + d; py = y;
-                } else if (d < w + h) {
-                    px = x + w; py = y + (d - w);
-                } else if (d < w + h + w) {
-                    px = x + w - (d - w - h); py = y + h;
-                } else {
-                    px = x; py = y + h - (d - w - h - w);
-                }
+                Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
                 c.FillRadial(px, py, gr, color, a);
             }
         }
@@ -147,7 +210,7 @@ public class Fx {
     static void SpecularRun(RenderHost app, int x, int y, int w, int h,
                             int radius, int color, int periodMs) {
         Canvas c = app.HostCanvas();
-        int per = 2 * (w + h);
+        int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
         int head = Fx.Saw(app, periodMs) * per / 1000;
         int half = per / 2;
@@ -171,23 +234,12 @@ public class Fx {
             }
             if (a > 0) {
                 int px = x; int py = y;
-                if (d < w) {
-                    px = x + d; py = y;
-                } else if (d < w + h) {
-                    px = x + w; py = y + (d - w);
-                } else if (d < w + h + w) {
-                    px = x + w - (d - w - h); py = y + h;
-                } else {
-                    px = x; py = y + h - (d - w - h - w);
-                }
+                Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
                 c.FillRadial(px, py, gr, color, a);
             }
         }
         int hx = x; int hy = y;
-        if (head < w) { hx = x + head; hy = y; }
-        else if (head < w + h) { hx = x + w; hy = y + (head - w); }
-        else if (head < w + h + w) { hx = x + w - (head - w - h); hy = y + h; }
-        else { hx = x; hy = y + h - (head - w - h - w); }
+        Fx.PerimeterPoint(x, y, w, h, radius, head, out hx, out hy);
         c.FillRadial(hx, hy, gr * 6 / 10, ColorMath.LerpColor(color, (int)4294967295, 700), 235);
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
@@ -197,7 +249,7 @@ public class Fx {
         if (hv <= 0) { return; }
         Canvas c = app.HostCanvas();
         int mx = app.HostMouseX(); int my = app.HostMouseY();
-        int per = 2 * (w + h);
+        int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
         int half = per / 2;
         int reach = per * 15 / 100;  // 弧段半长
@@ -210,10 +262,7 @@ public class Fx {
         for (int j = 0; j < steps; j = j + 1) {
             int d = j * per / steps;
             int px = x; int py = y;
-            if (d < w) { px = x + d; py = y; }
-            else if (d < w + h) { px = x + w; py = y + (d - w); }
-            else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
-            else { px = x; py = y + h - (d - w - h - w); }
+            Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
             int dx = px - mx;
             int dx2 = dx * dx;
             if (dx2 < best) {
@@ -240,10 +289,7 @@ public class Fx {
             }
             if (a > 0) {
                 int px = x; int py = y;
-                if (d < w) { px = x + d; py = y; }
-                else if (d < w + h) { px = x + w; py = y + (d - w); }
-                else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
-                else { px = x; py = y + h - (d - w - h - w); }
+                Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
                 c.FillRadial(px, py, gr, color, a);
             }
         }
@@ -264,19 +310,18 @@ public class Fx {
         app.RequestAnimationFrameIn(x, y, w, h);
     }
     static void CardSheen(RenderHost app, int x, int y, int w, int h, int color, int periodMs) {
+        if (w <= 0 || h <= 0) { return; }
         Canvas c = app.HostCanvas();
+        int bandW = w * 45 / 100;
+        int minBand = app.HostScale(56);
+        if (bandW < minBand) { bandW = minBand; }
+        int span = w + bandW * 2;
+        int bx = x - bandW + Fx.Saw(app, periodMs) * span / 1000;
+        int tint = ColorMath.LerpColor(color, (int)4294967295, 650);
+        int edge = Fx.WithAlpha(tint, 0);
+        int peak = Fx.WithAlpha(tint, 44);
         c.PushClip(x, y, w, h);
-        int span = w + h + h;  // 行程包含屏幕外的两端
-        int pos = Fx.Saw(app, periodMs) * span / 1000 - h;  // 45 度扫描
-        int gr = app.HostScale(22);
-        int col = ColorMath.LerpColor(color, (int)4294967295, 600);
-        int steps = h / app.HostScale(18);
-        if (steps < 5) { steps = 5; }
-        for (int i = 0; i <= steps; i = i + 1) {
-            int yy = y + h * i / steps;
-            int xx = x + pos + (yy - y);  // 45 度光带
-            Fx.PointGlow(c, xx, yy, gr, col, 28);
-        }
+        c.FillGradMask(bx, y, bandW, h, 0, Corner.All(), 2, edge, peak, edge);
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
@@ -296,25 +341,103 @@ public class Fx {
         app.RequestAnimationFrameIn(x, y, w, h);
     }
     static void CardBreath(RenderHost app, int x, int y, int w, int h, int color, int periodMs) {
+        Fx.CardBreath(app, x, y, w, h, 0, color, periodMs);
+    }
+    static void CardBreath(RenderHost app, int x, int y, int w, int h,
+                           int radius, int color, int periodMs) {
+        if (w <= 0 || h <= 0) { return; }
         Canvas c = app.HostCanvas();
-        int per = 2 * (w + h);
+        int pulse = Fx.Pulse(app, periodMs);
+        int outerA = 18 + 54 * pulse / 1000;
+        int innerA = 42 + 128 * pulse / 1000;
+        int haloW = app.HostScale(3);
+        int rimW = app.HostScale(1);
+        if (haloW < 2) { haloW = 2; }
+        if (rimW < 1) { rimW = 1; }
+        c.DrawRoundRect(x, y, w, h, radius, Fx.WithAlpha(color, outerA), haloW);
+        c.DrawRoundRect(x, y, w, h, radius, Fx.WithAlpha(color, innerA), rimW);
+        app.RequestAnimationFrameIn(x, y, w, h);
+    }
+    // 现代点击水波纹：从点击点 (cx, cy) 缓出扩散并平滑淡出，裁切在控件边界内。
+    public static void Ripple(RenderHost app, int x, int y, int w, int h, int radius,
+                              int cx, int cy, int progressPm, int color) {
+        if (w <= 0 || h <= 0 || progressPm <= 0 || progressPm >= 1000) { return; }
+        Canvas c = app.HostCanvas();
+        int p = Fx.Ease(progressPm);
+        int dx0 = cx - x; int dx1 = (x + w) - cx;
+        int dy0 = cy - y; int dy1 = (y + h) - cy;
+        int mx = dx0 > dx1 ? dx0 : dx1;
+        int my = dy0 > dy1 ? dy0 : dy1;
+        int maxR = Fx.Isqrt(mx * mx + my * my) + app.HostScale(8);
+        int r = maxR * p / 1000;
+        if (r < 2) { r = 2; }
+        int baseAlpha = (color >> 24) & 255;
+        if (baseAlpha == 0) { baseAlpha = 88; }
+        int alpha = baseAlpha * (1000 - progressPm) / 1000;
+        if (alpha <= 0) { return; }
+        c.PushClip(x, y, w, h);
+        c.FillRadial(cx, cy, r, color, alpha);
+        c.PopClip();
+    }
+    // 骨架屏扫光占位符：圆角底面 + 平滑斜向高光波，替代生硬闪烁。
+    public static void ShimmerSkeleton(RenderHost app, int x, int y, int w, int h, int radius,
+                                       int baseColor, int highlightColor, int periodMs) {
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = app.HostCanvas();
+        if (baseColor != 0) {
+            if (radius > 0) { c.FillRoundRect(x, y, w, h, radius, baseColor); }
+            else { c.FillRect(x, y, w, h, baseColor); }
+        }
+        int bandW = w * 55 / 100;
+        int minBand = app.HostScale(64);
+        if (bandW < minBand) { bandW = minBand; }
+        int span = w + bandW * 2;
+        int bx = x - bandW + Fx.Saw(app, periodMs > 0 ? periodMs : 1600) * span / 1000;
+        int hi = highlightColor != 0 ? highlightColor : (int)0x40FFFFFFu;
+        int clear = Fx.WithAlpha(hi, 0);
+        c.PushClip(x, y, w, h);
+        c.FillGradMask(bx, y, bandW, h, 0, Corner.All(), 1, clear, hi, clear);
+        c.PopClip();
+        app.RequestAnimationFrameIn(x, y, w, h);
+    }
+    // 双色旋转轨道光边框（Apple Intelligence / Linear / Raycast 风格），贴合真实圆角周长。
+    public static void GradientBorder(RenderHost app, int x, int y, int w, int h, int radius,
+                                      int colorA, int colorB, int periodMs) {
+        if (w <= 0 || h <= 0) { return; }
+        Canvas c = app.HostCanvas();
+        int per = Fx.PerimeterLength(w, h, radius);
         if (per <= 0) { return; }
-        int gr = app.HostScale(4);
-        int a = 26 + 96 * Fx.Pulse(app, periodMs) / 1000;
+        int ms = periodMs > 0 ? periodMs : 2800;
+        int headA = Fx.Saw(app, ms) * per / 1000;
+        int half = per / 2;
+        int headB = (headA + half) % per;
+        int reach = per * 36 / 100;
+        if (reach < 1) { reach = 1; }
+        int gr = app.HostScale(3);
+        if (gr < 2) { gr = 2; }
         int steps = per / app.HostScale(5);
         if (steps < 48) { steps = 48; }
-        if (steps > 200) { steps = 200; }
-        c.PushClip(x, y, w, h);
+        if (steps > 180) { steps = 180; }
         for (int i = 0; i < steps; i = i + 1) {
             int d = i * per / steps;
+            int dA = d - headA;
+            if (dA < 0) { dA = dA + per; }
+            if (dA > half) { dA = per - dA; }
+            int dB = d - headB;
+            if (dB < 0) { dB = dB + per; }
+            if (dB > half) { dB = per - dB; }
+            int col = colorA;
+            int dist = dA;
+            if (dB < dA) { col = colorB; dist = dB; }
+            int a = 24;
+            if (dist < reach) {
+                int p = Fx.Ease((reach - dist) * 1000 / reach);
+                a = 24 + 216 * p / 1000;
+            }
             int px = x; int py = y;
-            if (d < w) { px = x + d; py = y; }
-            else if (d < w + h) { px = x + w; py = y + (d - w); }
-            else if (d < w + h + w) { px = x + w - (d - w - h); py = y + h; }
-            else { px = x; py = y + h - (d - w - h - w); }
-            c.FillRadial(px, py, gr, color, a);
+            Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
+            c.FillRadial(px, py, gr, col, a);
         }
-        c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
     }
     static void CardMotes(RenderHost app, int x, int y, int w, int h, int color) {
@@ -340,7 +463,7 @@ public class Fx {
         if (o.aurora) { Fx.CardAurora(app, x, y, w, h, col); }
         if (o.sheen) { Fx.CardSheen(app, x, y, w, h, col, o.glowPeriodMs * 2); }
         if (o.motes) { Fx.CardMotes(app, x, y, w, h, col); }
-        if (o.breath) { Fx.CardBreath(app, x, y, w, h, col, o.glowPeriodMs); }
+        if (o.breath) { Fx.CardBreath(app, x, y, w, h, radius, col, o.glowPeriodMs); }
         if (o.borderGlow) { Fx.BorderGlow(app, x, y, w, h, radius, col, o.glowPeriodMs, 220); }
         if (o.spotlight) {
             int mx = app.HostMouseX(); int my = app.HostMouseY();

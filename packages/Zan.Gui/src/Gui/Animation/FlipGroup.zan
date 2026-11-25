@@ -1,0 +1,240 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+namespace Gui.Animation;
+internal class FlipSnapshot {
+    internal weak Control control;
+    internal int x;
+    internal int y;
+    internal FlipSnapshot(Control c, int sx, int sy) {
+        this.control = c;
+        this.x = sx;
+        this.y = sy;
+    }
+}
+internal class FlipTrack {
+    internal weak Control control;
+    internal weak App host;
+    internal float curX;
+    internal float curY;
+    internal bool doneX;
+    internal bool doneY;
+    internal SpringAnim animX;
+    internal SpringAnim animY;
+    internal FlipTrack(Control c, App app, int dx, int dy) {
+        this.control = c;
+        this.host = app;
+        this.curX = (float)dx;
+        this.curY = (float)dy;
+        this.doneX = dx == 0;
+        this.doneY = dy == 0;
+    }
+    internal void Apply() {
+        Control c = this.control;
+        if (c == null) { this.Stop(); return; }
+        int ix = (int)(this.curX >= 0.0f ? this.curX + 0.5f : this.curX - 0.5f);
+        int iy = (int)(this.curY >= 0.0f ? this.curY + 0.5f : this.curY - 0.5f);
+        c.SetMotionOffset(ix, iy);
+        App a = this.host;
+        if (a != null) { a.RequestRedraw(); }
+    }
+    internal void OnX(float v) {
+        this.curX = v;
+        this.Apply();
+    }
+    internal void OnY(float v) {
+        this.curY = v;
+        this.Apply();
+    }
+    internal void OnDoneX() {
+        this.curX = 0.0f;
+        this.doneX = true;
+        this.animX = null;
+        this.FinishIfReady();
+    }
+    internal void OnDoneY() {
+        this.curY = 0.0f;
+        this.doneY = true;
+        this.animY = null;
+        this.FinishIfReady();
+    }
+    internal void FinishIfReady() {
+        if (!this.doneX || !this.doneY) { return; }
+        Control c = this.control;
+        if (c != null) { c.ResetMotion(); }
+        App a = this.host;
+        if (a != null) { a.RequestRedraw(); }
+    }
+    internal void Stop() {
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (this.animX != null) { tl.RemoveSpring(this.animX); this.animX = null; }
+        if (this.animY != null) { tl.RemoveSpring(this.animY); this.animY = null; }
+    }
+}
+internal class PresenceTrack {
+    internal weak Control control;
+    internal weak App host;
+    internal int fromDx;
+    internal int fromDy;
+    internal int fromScale;
+    internal int fromOpacity;
+    internal int toDx;
+    internal int toDy;
+    internal int toScale;
+    internal int toOpacity;
+    internal bool resetOnDone;
+    internal TweenCallback onDone;
+    internal void OnProgress(float p) {
+        Control c = this.control;
+        if (c == null) { return; }
+        float cp = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
+        int dx = this.fromDx + (int)((float)(this.toDx - this.fromDx) * p);
+        int dy = this.fromDy + (int)((float)(this.toDy - this.fromDy) * p);
+        int sc = this.fromScale + (int)((float)(this.toScale - this.fromScale) * p);
+        int op = this.fromOpacity + (int)((float)(this.toOpacity - this.fromOpacity) * cp);
+        c.SetMotionTransform(dx, dy, sc, 0);
+        c.SetMotionOpacity(op);
+        App a = this.host;
+        if (a != null) { a.RequestRedraw(); }
+    }
+    internal void OnComplete() {
+        Control c = this.control;
+        if (c != null && this.resetOnDone) { c.ResetMotion(); }
+        App a = this.host;
+        if (a != null) { a.RequestRedraw(); }
+        TweenCallback cb = this.onDone;
+        if (cb != null) { cb(); }
+    }
+}
+// FLIP (First-Last-Invert-Play) 布局过渡与通用入场/退场动效编排器。
+// 通过 Control 零分配瞬态 motion 通道驱动，不污染 inlineStyleCss，且支持中途打断续接。
+public class FlipGroup {
+    List<FlipSnapshot> snapshots = new List<FlipSnapshot>();
+    List<FlipTrack> activeTracks = new List<FlipTrack>();
+    public FlipGroup() {}
+    public void Capture(Control container) {
+        this.snapshots.Clear();
+        if (container == null) { return; }
+        int count = container.ChildCount();
+        for (int i = 0; i < count; i = i + 1) {
+            Control child = container.ChildAt(i);
+            if (child != null && child.Visible) {
+                this.snapshots.Add(new FlipSnapshot(child, child.bx + child.MotionTx(), child.by + child.MotionTy()));
+            }
+        }
+    }
+    public void CaptureList(List<Control> items) {
+        this.snapshots.Clear();
+        if (items == null) { return; }
+        for (int i = 0; i < items.Count; i = i + 1) {
+            Control c = items[i];
+            if (c != null && c.Visible) {
+                this.snapshots.Add(new FlipSnapshot(c, c.bx + c.MotionTx(), c.by + c.MotionTy()));
+            }
+        }
+    }
+    public void Cancel() {
+        for (int i = 0; i < this.activeTracks.Count; i = i + 1) {
+            this.activeTracks[i].Stop();
+            Control c = this.activeTracks[i].control;
+            if (c != null) { c.ResetMotion(); }
+        }
+        this.activeTracks.Clear();
+    }
+    public int Play(App app) { return this.Play(app, 0.34f, 0.14f); }
+    public int Play(App app, float durationSec, float bounce) {
+        for (int i = 0; i < this.activeTracks.Count; i = i + 1) {
+            this.activeTracks[i].Stop();
+        }
+        this.activeTracks.Clear();
+        int moved = 0;
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (app != null) { tl.AutoBind(app); }
+        for (int i = 0; i < this.snapshots.Count; i = i + 1) {
+            FlipSnapshot snap = this.snapshots[i];
+            Control c = snap.control;
+            if (c == null || !c.Visible) { continue; }
+            int dx = snap.x - c.bx;
+            int dy = snap.y - c.by;
+            if (dx == 0 && dy == 0) {
+                c.ResetMotion();
+                continue;
+            }
+            moved = moved + 1;
+            FlipTrack track = new FlipTrack(c, app, dx, dy);
+            c.SetMotionOffset(dx, dy);
+            if (dx != 0) {
+                SpringAnim sx = SpringAnim.FromDurationBounce((float)dx, 0.0f, durationSec, bounce, track.OnX);
+                sx.OnComplete(track.OnDoneX);
+                track.animX = sx;
+                tl.AddSpring(sx);
+                sx.Play();
+            }
+            if (dy != 0) {
+                SpringAnim sy = SpringAnim.FromDurationBounce((float)dy, 0.0f, durationSec, bounce, track.OnY);
+                sy.OnComplete(track.OnDoneY);
+                track.animY = sy;
+                tl.AddSpring(sy);
+                sy.Play();
+            }
+            this.activeTracks.Add(track);
+        }
+        this.snapshots.Clear();
+        if (moved > 0 && app != null) { app.RequestRedraw(); }
+        return moved;
+    }
+    // 通用物理入场动效：从 (fromDx, fromDy, fromScalePm, fromOpacityPm) 弹性过渡到自然态。
+    public static SpringAnim Enter(App app, Control target, int fromDx, int fromDy,
+                                   int fromScalePm, int fromOpacityPm,
+                                   float durationSec, float bounce, TweenCallback onDone) {
+        if (target == null) { return null; }
+        PresenceTrack tr = new PresenceTrack();
+        tr.control = target;
+        tr.host = app;
+        tr.fromDx = fromDx;
+        tr.fromDy = fromDy;
+        tr.fromScale = fromScalePm > 0 ? fromScalePm : 1000;
+        tr.fromOpacity = fromOpacityPm;
+        tr.toDx = 0;
+        tr.toDy = 0;
+        tr.toScale = 1000;
+        tr.toOpacity = 1000;
+        tr.resetOnDone = true;
+        tr.onDone = onDone;
+        target.SetMotionTransform(tr.fromDx, tr.fromDy, tr.fromScale, 0);
+        target.SetMotionOpacity(tr.fromOpacity);
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (app != null) { tl.AutoBind(app); }
+        SpringAnim s = SpringAnim.FromDurationBounce(0.0f, 1.0f, durationSec, bounce, tr.OnProgress);
+        s.OnComplete(tr.OnComplete);
+        tl.AddSpring(s);
+        s.Play();
+        return s;
+    }
+    // 通用物理退场动效：从当前态弹性过渡到目标退场态，结束后回调 onDone（可用于关闭/移除）。
+    public static SpringAnim Exit(App app, Control target, int toDx, int toDy,
+                                  int toScalePm, int toOpacityPm,
+                                  float durationSec, float bounce, TweenCallback onDone) {
+        if (target == null) { return null; }
+        PresenceTrack tr = new PresenceTrack();
+        tr.control = target;
+        tr.host = app;
+        tr.fromDx = target.MotionTx();
+        tr.fromDy = target.MotionTy();
+        tr.fromScale = 1000;
+        tr.fromOpacity = 1000;
+        tr.toDx = toDx;
+        tr.toDy = toDy;
+        tr.toScale = toScalePm > 0 ? toScalePm : 1000;
+        tr.toOpacity = toOpacityPm;
+        tr.resetOnDone = false;
+        tr.onDone = onDone;
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (app != null) { tl.AutoBind(app); }
+        SpringAnim s = SpringAnim.FromDurationBounce(0.0f, 1.0f, durationSec, bounce, tr.OnProgress);
+        s.OnComplete(tr.OnComplete);
+        tl.AddSpring(s);
+        s.Play();
+        return s;
+    }
+}

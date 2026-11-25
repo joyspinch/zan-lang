@@ -207,10 +207,121 @@ class MotionLayerTest {
         app.EndOffscreenFrame();
     }
 
+    static bool exitCallbackFired;
+    static void OnExitDone() { exitCallbackFired = true; }
+
+    static void TestSpringFlipAndFx() {
+        // 1. CSS spring(...) parsing + analytical underdamped overshoot
+        StyleSheet sh = Css.Parse(
+            ".sp1 { transition: transform 400ms spring(0.45); }\n"
+            + ".sp2 { transition-timing-function: spring(300, 18); }\n"
+            + ".sp3 { transition-timing-function: spring-bouncy; }\n"
+            + ".sp4 { animation: orbit 2200ms; }\n"
+            + ".sp5 { animation: skeleton 1400ms; }\n"
+        );
+        StyleBox b1 = new StyleBox(); sh.ApplyBox(b1, ".sp1");
+        Check(b1.easing == 7 && b1.motion != null, "CSS spring(bounce) parsed");
+        int peak = 0;
+        for (int p = 50; p <= 950; p = p + 50) {
+            int v = b1.motion.EvalTransitionCurve(b1.easing, p);
+            if (v > peak) { peak = v; }
+        }
+        Check(peak > 1020, "underdamped spring overshoots > 1000");
+        Check(b1.motion.EvalTransitionCurve(b1.easing, 1000) == 1000, "spring settles at 1000");
+
+        StyleBox b2 = new StyleBox(); sh.ApplyBox(b2, ".sp2");
+        Check(b2.easing == 7 && b2.motion.springStiffness > 299.0f && b2.motion.springDamping < 19.0f, "CSS spring(k,c) parsed");
+        StyleBox b3 = new StyleBox(); sh.ApplyBox(b3, ".sp3");
+        Check(b3.easing == 7, "CSS spring-bouncy preset parsed");
+        StyleBox b4 = new StyleBox(); sh.ApplyBox(b4, ".sp4");
+        Check(b4.anim == Style.AnimOrbit(), "CSS animation: orbit parsed");
+        StyleBox b5 = new StyleBox(); sh.ApplyBox(b5, ".sp5");
+        Check(b5.anim == Style.AnimSkeleton(), "CSS animation: skeleton parsed");
+
+        // 2. Overshoot-safe StyleBox.Blend + shadow2 transition
+        StyleBox fromB = new StyleBox();
+        fromB.bg = (int)0xFF102030u; fromB.tx = 0; fromB.scale = 1000; fromB.opacity = 1000;
+        fromB.shadow2 = (int)0x40000000u; fromB.shadow2Dy = 4; fromB.shadow2Blur = 12;
+        StyleBox toB = new StyleBox();
+        toB.bg = (int)0xFFF0F4FFu; toB.tx = 100; toB.scale = 1100; toB.opacity = 1000;
+        toB.shadow2 = (int)0x80102030u; toB.shadow2Dy = 12; toB.shadow2Blur = 24;
+        StyleBox overB = StyleBox.Blend(fromB, toB, 1150);
+        Check(overB.tx == 115 && overB.scale == 1115, "transform overshoots organically");
+        Check(overB.bg == toB.bg && overB.opacity == 1000, "color & opacity clamp safely on overshoot");
+        StyleBox midB = StyleBox.Blend(fromB, toB, 500);
+        Check(midB.shadow2Dy == 8 && midB.shadow2Blur == 18, "shadow2 interpolates under Blend");
+
+        // 3. SpringAnim presets & Spring2D
+        SpringAnim sn = SpringAnim.Snappy(0.0f, 50.0f, null);
+        sn.Play();
+        for (int i = 0; i < 60; i = i + 1) { sn.Step(32); }
+        Check(sn.finished && sn.value > 49.5f && sn.value < 50.5f, "SpringAnim.Snappy converges");
+
+        Spring2D s2 = Spring2D.Bouncy(0.0f, 0.0f, 80.0f, -40.0f, null);
+        s2.Play();
+        for (int i = 0; i < 80; i = i + 1) { s2.Step(32); }
+        Check(s2.finished && s2.x.value > 79.5f && s2.y.value < -39.5f, "Spring2D converges");
+        s2.Retarget(10.0f, 20.0f);
+        for (int i = 0; i < 80; i = i + 1) { s2.Step(32); }
+        Check(s2.finished && s2.x.value > 9.5f && s2.x.value < 10.5f && s2.y.value > 19.5f, "Spring2D retarget converges");
+
+        // 4. Zero-alloc motion transform + FlipGroup FLIP & Presence Enter/Exit
+        App app = App.CreateOffscreen("flip-fx", 160, 120);
+        Panel host = new Panel();
+        Panel cA = new Panel();
+        Panel cB = new Panel();
+        cA.InlineStyle("background: #3366ff; border-radius: 8px;");
+        host.Add(cA); host.Add(cB);
+        cA.bx = 10; cA.by = 10; cA.bw = 40; cA.bh = 30;
+        cB.bx = 10; cB.by = 50; cB.bw = 40; cB.bh = 30;
+
+        FlipGroup flip = new FlipGroup();
+        flip.Capture(host);
+        // Simulate reorder (swap vertical positions)
+        cA.by = 50; cB.by = 10;
+        int moved = flip.Play(app, 0.25f, 0.10f);
+        Check(moved == 2, "FlipGroup detects 2 moved children");
+        Check(cA.MotionTy() == -40 && cB.MotionTy() == 40, "FlipGroup inverts immediately");
+        Check(cA.InlineStyleCss() == "background: #3366ff; border-radius: 8px;", "FlipGroup does not mutate inlineStyleCss");
+        StyleBox resolved = cA.Box(app);
+        Check(resolved.ty == -40, "zero-alloc motion composes into StyleBox");
+        for (int i = 0; i < 80; i = i + 1) { AnimationTimeline.Shared.Tick(25); }
+        Check(!cA.HasMotion() && !cB.HasMotion(), "FlipGroup resets motion on settle");
+
+        // Presence Enter & Exit
+        exitCallbackFired = false;
+        FlipGroup.Enter(app, cA, 0, 24, 920, 0, 0.22f, 0.05f, null);
+        Check(cA.HasMotion() && cA.MotionTy() == 24, "Presence Enter starts offset");
+        for (int i = 0; i < 80; i = i + 1) { AnimationTimeline.Shared.Tick(25); }
+        Check(!cA.HasMotion(), "Presence Enter settles and resets motion");
+
+        FlipGroup.Exit(app, cA, 0, -16, 940, 0, 0.20f, 0.0f, OnExitDone);
+        for (int i = 0; i < 80; i = i + 1) { AnimationTimeline.Shared.Tick(25); }
+        Check(exitCallbackFired, "Presence Exit fires onDone callback");
+        cA.ResetMotion();
+
+        // 5. Fx rounded perimeter + Ripple + ShimmerSkeleton + GradientBorder + CardBreath + CardSheen
+        app.FreezeAnimClock(1400);
+        app.canvas.Clear((int)0xFF0F172Au);
+        Fx.Ripple(app, 10, 10, 80, 40, 10, 50, 30, 350, (int)0x8038BDF8u);
+        Check(app.canvas.GetPixel(50, 30) != (int)0xFF0F172Au, "Fx.Ripple paints inside bounds");
+        app.canvas.Clear((int)0xFF0F172Au);
+        Fx.ShimmerSkeleton(app, 10, 10, 120, 30, 8, (int)0xFF1E293Bu, (int)0x60FFFFFFu, 1600);
+        Check(app.canvas.GetPixel(40, 25) != (int)0xFF0F172Au, "Fx.ShimmerSkeleton renders");
+        app.canvas.Clear((int)0xFF0F172Au);
+        Fx.GradientBorder(app, 10, 10, 100, 60, 14, (int)0xFF6366F1u, (int)0xFF06B6D4u, 2400);
+        // Verify corner pixel (10,10) stays dark because perimeter traces the 14px rounded arc!
+        Check(app.canvas.GetPixel(10, 10) == (int)0xFF0F172Au, "Fx.GradientBorder traces rounded corner arc");
+        Fx.CardBreath(app, 10, 10, 100, 60, 14, (int)0xFF38BDF8u, 2000);
+        Fx.CardSheen(app, 10, 10, 100, 60, (int)0xFFFFFFFFu, 2000);
+        app.canvas.Destroy();
+    }
+
     static void Main() {
         TestAnimationEngine();
         TestKeyframesAndTransition();
         TestRuntimeKeyframesAndLayers();
+        TestSpringFlipAndFx();
         Console.WriteLine("MOTION_LAYER_TEST_OK");
     }
 }

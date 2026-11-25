@@ -24,6 +24,9 @@ public class MotionSpec {
     public float bezY2;
     public int stepsCount;
     public bool stepsJumpEnd;
+    public float springStiffness;
+    public float springDamping;
+    public float springMass;
 
     public string animName;
     public int animDelayMs;
@@ -31,13 +34,16 @@ public class MotionSpec {
     public int animDirection;  // 0 normal, 1 reverse, 2 alternate, 3 alternate-reverse
     public int animFillMode;   // 0 none, 1 forwards, 2 backwards, 3 both
     public bool animPaused;
-    public int animEasing;     // -1 = inherit StyleBox.easing, 0..6
+    public int animEasing;     // -1 = inherit StyleBox.easing, 0..7
     public float animBezX1;
     public float animBezY1;
     public float animBezX2;
     public float animBezY2;
     public int animStepsCount;
     public bool animStepsJumpEnd;
+    public float animSpringStiffness;
+    public float animSpringDamping;
+    public float animSpringMass;
 
     public MotionSpec() {
         this.transitionDelayMs = 0;
@@ -48,6 +54,9 @@ public class MotionSpec {
         this.bezY2 = 1.0f;
         this.stepsCount = 1;
         this.stepsJumpEnd = true;
+        this.springStiffness = 260.0f;
+        this.springDamping = 22.0f;
+        this.springMass = 1.0f;
 
         this.animName = "";
         this.animDelayMs = 0;
@@ -62,6 +71,9 @@ public class MotionSpec {
         this.animBezY2 = 1.0f;
         this.animStepsCount = 1;
         this.animStepsJumpEnd = true;
+        this.animSpringStiffness = 260.0f;
+        this.animSpringDamping = 22.0f;
+        this.animSpringMass = 1.0f;
     }
 
     public MotionSpec Clone() {
@@ -74,6 +86,9 @@ public class MotionSpec {
         c.bezY2 = this.bezY2;
         c.stepsCount = this.stepsCount;
         c.stepsJumpEnd = this.stepsJumpEnd;
+        c.springStiffness = this.springStiffness;
+        c.springDamping = this.springDamping;
+        c.springMass = this.springMass;
 
         c.animName = this.animName;
         c.animDelayMs = this.animDelayMs;
@@ -88,6 +103,9 @@ public class MotionSpec {
         c.animBezY2 = this.animBezY2;
         c.animStepsCount = this.animStepsCount;
         c.animStepsJumpEnd = this.animStepsJumpEnd;
+        c.animSpringStiffness = this.animSpringStiffness;
+        c.animSpringDamping = this.animSpringDamping;
+        c.animSpringMass = this.animSpringMass;
         return c;
     }
 
@@ -139,6 +157,51 @@ public class MotionSpec {
         return (float)step / (float)count;
     }
 
+    public static void SpringFromBounce(float durationSec, float bounce, out float k, out float c) {
+        float dur = durationSec > 0.05f ? durationSec : 0.05f;
+        float b = bounce;
+        if (b < -0.95f) { b = -0.95f; }
+        if (b > 0.95f) { b = 0.95f; }
+        double omega = (2.0 * 3.1415926535) / (double)dur;
+        k = (float)(omega * omega);
+        double zeta = b >= 0.0f ? (1.0 - (double)b) : (1.0 / (1.0 + (double)b));
+        c = (float)(2.0 * zeta * omega);
+    }
+
+    // 解析阻尼谐振子阶跃响应，支持欠阻尼（物理回弹 > 1.0）、临界阻尼与过阻尼。
+    public static float SpringCurve(float stiffness, float damping, float mass, float t) {
+        if (t <= 0.0f) { return 0.0f; }
+        if (t >= 1.0f) { return 1.0f; }
+        double k = stiffness > 1.0f ? (double)stiffness : 1.0;
+        double m = mass > 0.01f ? (double)mass : 1.0;
+        double c = damping >= 0.0f ? (double)damping : 0.0;
+        double w0 = Math.Sqrt(k / m);
+        double zeta = c / (2.0 * Math.Sqrt(k * m));
+        double decayRate = zeta * w0;
+        double settleT = decayRate > 0.25 ? (4.8 / decayRate) : 2.0;
+        if (settleT < 0.25) { settleT = 0.25; }
+        if (settleT > 2.5) { settleT = 2.5; }
+        double tau = (double)t * settleT;
+        double y = 1.0;
+        if (zeta < 0.999) {
+            double root = Math.Sqrt(1.0 - zeta * zeta);
+            double wd = w0 * root;
+            double env = Math.Exp(-decayRate * tau);
+            y = 1.0 - env * (Math.Cos(wd * tau) + (zeta / root) * Math.Sin(wd * tau));
+        } else if (zeta <= 1.001) {
+            double env = Math.Exp(-w0 * tau);
+            y = 1.0 - env * (1.0 + w0 * tau);
+        } else {
+            double root = Math.Sqrt(zeta * zeta - 1.0);
+            double r1 = -w0 * (zeta - root);
+            double r2 = -w0 * (zeta + root);
+            double e1 = Math.Exp(r1 * tau);
+            double e2 = Math.Exp(r2 * tau);
+            y = 1.0 - ((r2 * e1 - r1 * e2) / (r2 - r1));
+        }
+        return (float)y;
+    }
+
     public int EvalTransitionCurve(int baseEasing, int p) {
         if (p <= 0) { return 0; }
         if (p >= 1000) { return 1000; }
@@ -149,6 +212,10 @@ public class MotionSpec {
         if (baseEasing == 6) {
             float y = MotionSpec.Steps(this.stepsCount, this.stepsJumpEnd, (float)p / 1000.0f);
             return (int)(y * 1000.0f + 0.5f);
+        }
+        if (baseEasing == 7) {
+            float y = MotionSpec.SpringCurve(this.springStiffness, this.springDamping, this.springMass, (float)p / 1000.0f);
+            return (int)(y * 1000.0f + (y >= 0.0f ? 0.5f : -0.5f));
         }
         return Style.Curve(baseEasing, p);
     }
@@ -164,6 +231,10 @@ public class MotionSpec {
         if (e == 6) {
             float y = MotionSpec.Steps(this.animStepsCount, this.animStepsJumpEnd, (float)p / 1000.0f);
             return (int)(y * 1000.0f + 0.5f);
+        }
+        if (e == 7) {
+            float y = MotionSpec.SpringCurve(this.animSpringStiffness, this.animSpringDamping, this.animSpringMass, (float)p / 1000.0f);
+            return (int)(y * 1000.0f + (y >= 0.0f ? 0.5f : -0.5f));
         }
         return Style.Curve(e, p);
     }
