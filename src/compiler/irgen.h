@@ -484,6 +484,7 @@ struct zan_irgen {
      * module's malloc/free/calloc/realloc declarations to rt_mem.c's
      * zan_mem_* entry points (zan_irgen_prepare_object_sections). */
     bool         route_fast_alloc;
+    bool         str_pages;          /* rt_mem 在场：串走 zan_mem_str_malloc 的 12 字节头串页 */
     /* Executable builds without -g (publish or not) use closed-world rules:
      * demand-driven method bodies and reflection thunks only for what the
      * reflection runtime can reach. -g, libraries and ZAN_NO_DEV_PRUNE=1 keep
@@ -878,7 +879,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *target_triple,
                             bool target_is_windows, bool external_async_executor,
                             bool check_leaks, bool runtime_checks,
-                            bool arc_guard, bool arc_net);
+                            bool arc_guard, bool arc_net,
+                            bool str_pages);
 void zan_irgen_destroy(zan_irgen_t *g);
 void zan_irgen_release_llvm(zan_irgen_t *g);
 

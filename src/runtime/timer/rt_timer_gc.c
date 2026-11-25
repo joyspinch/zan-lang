@@ -263,7 +263,7 @@ static void zan_walk_object_edges(void *obj, zan_edge_cb_t cb, void *ctx) {
     uint64_t arr_rc_magic = *(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF);
     if (arr_rc_magic == ZAN_ARRAY_RC_MAGIC) {
         if (site == ZAN_ARRAY_MAGIC) return;
-        int64_t count = *(int64_t *)((char *)obj + ZAN_OBJ_RC_OFF);
+        int64_t count = *(int64_t *)((char *)obj + ZAN_ARR_COUNT_OFF);
         if (count <= 0) return;
         void **elems = (void **)obj;
         for (int64_t i = 0; i < count; i++) {
@@ -391,11 +391,11 @@ static void zan_cycle_bfs_cb(void *from, void *to, void *ctx) {
     }
 }
 
-/* 数组的引用计数在 -32（-16 是长度）；其余对象在 -16 */
+/* 数组的引用计数在 -32（i64；-16 是长度）；其余对象与字符串在 -12（u32） */
 static int64_t zan_gc_read_rc(void *obj) {
     if (*(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF) == ZAN_ARRAY_RC_MAGIC)
         return *(int64_t *)((char *)obj + ZAN_ARR_RC_OFF);
-    return *(int64_t *)((char *)obj + ZAN_OBJ_RC_OFF);
+    return ZAN_RC_LOAD(obj);
 }
 
 int64_t zan_gc_detect_cycles(void) {
@@ -629,7 +629,7 @@ int64_t zan_gc_collect_cycles(void) {
                     nd->obj = e->obj;
                     nd->dtor = NULL;
                     nd->fg = zan_gc_collectable_graph(e->obj, &nd->dtor);
-                    nd->rc = nd->fg ? *(int64_t *)((char *)e->obj + ZAN_OBJ_RC_OFF) : 0;
+                    nd->rc = nd->fg ? ZAN_RC_LOAD(e->obj) : 0;
                     nd->internal = 0;
                     nd->marked = 0;
                     zan_obj_map_put(&map, e->obj, (int)n);
@@ -669,7 +669,7 @@ int64_t zan_gc_collect_cycles(void) {
     for (size_t i = 0; i < n; i++) {
         if (nodes[i].marked) continue;
         void *obj = nodes[i].obj;
-        __atomic_store_n((int64_t *)((char *)obj + ZAN_OBJ_RC_OFF), 1, __ATOMIC_RELEASE);
+        __atomic_store_n(ZAN_RC_PTR(obj), 1u, __ATOMIC_RELEASE);
         ((void (*)(void *))nodes[i].dtor)(obj);
         freed++;
     }

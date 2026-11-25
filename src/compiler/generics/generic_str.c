@@ -269,18 +269,12 @@ LLVMValueRef emit_widen_i64_for_print(zan_irgen_t *g, LLVMValueRef v) {
 }
 LLVMValueRef emit_string_alloc_rc(zan_irgen_t *g, LLVMValueRef payload_size) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
-    /* 负载按 16 取整、下限 16：头 16 + 负载恰是 malloc 的 16 字节档，不留
-     * 尾巴。原先按 32 取整且下限 32——"k1" 这样的短串也占 48 字节，
-     * 40 字节的请求被抬到 64。没有任何路径依赖这段富余（无原地增长、无
-     * 按块越读），写入一律以请求尺寸为界。 */
-    LLVMValueRef fifteen = LLVMConstInt(i64, 15, 0);
-    LLVMValueRef padded = zan_add(g->builder, payload_size, fifteen, "str.pad");
-    LLVMValueRef aligned = zan_and(g->builder, padded,
-        LLVMConstInt(i64, ~UINT64_C(15), 0), "str.align");
-    LLVMValueRef min_payload = LLVMConstInt(i64, 16, 0);
-    LLVMValueRef payload = LLVMBuildSelect(g->builder,
-        zan_icmp(g->builder, LLVMIntULT, aligned, min_payload, "str.small"),
-        min_payload, aligned, "str.payload");
+    /* 负载按请求原样交给 zan_rt_str_alloc：串头 12 字节 + 负载由分配器按
+     * 8 字节粒度取整（--fast-alloc 串页）或交 malloc 取整。曾在这里先按
+     * 16 取整、下限 16——"item1234567" 头 16 + 负载 16 = 32 字节；现 24。
+     * 没有任何路径依赖这段富余（无原地增长、无按块越写），写入一律以
+     * 请求尺寸为界。 */
+    LLVMValueRef payload = payload_size;
     LLVMValueRef user_ptr = zan_call2(g->builder,
         LLVMFunctionType(LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0),
                          (LLVMTypeRef[]){ i64 }, 1, 0),

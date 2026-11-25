@@ -790,7 +790,7 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
         LLVMBuildCondBr(g->builder, is_array, arr_bb, slow_bb);
         LLVMPositionBuilderAtEnd(g->builder, arr_bb);
         LLVMValueRef cnt_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-            &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
+            &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_ARR_COUNT_OFF, 1) }, 1,
             "strbuf.countp");
         count = LLVMBuildLoad2(g->builder,
             i64, LLVMBuildBitCast(g->builder, cnt_ptr, i64p, "strbuf.countip"),
@@ -812,14 +812,12 @@ static LLVMValueRef emit_string_len_inline(zan_irgen_t *g, LLVMValueRef payload,
                     stamp_bb, slow_end_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, stamp_bb);
-    LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
-        "strbuf.rcp");
-    LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strbuf.rcip"), "strbuf.rc");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, rc_ty,
+        zan_rc_ptr(g, g->builder, payload, "strbuf.rcp"), "strbuf.rc");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntNE, rc,
-                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+                 LLVMConstInt(rc_ty, ZAN_RC_IMMORTAL, 0),
                  "strbuf.writable"),
         stamp_do_bb, slow_end_bb);
 
@@ -910,15 +908,13 @@ void emit_string_len_invalidate(zan_irgen_t *g, LLVMValueRef payload) {
     LLVMBuildCondBr(g->builder, stale, clear_bb, done_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, clear_bb);
-    LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, i8, payload,
-        &(LLVMValueRef){ LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1) }, 1,
-        "strinv.rcp");
-    LLVMValueRef rc = LLVMBuildLoad2(g->builder, i64,
-        LLVMBuildBitCast(g->builder, rc_ptr, i64p, "strinv.rcip"), "strinv.rc");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef rc = LLVMBuildLoad2(g->builder, rc_ty,
+        zan_rc_ptr(g, g->builder, payload, "strinv.rcp"), "strinv.rc");
     LLVMBasicBlockRef store_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "strinv.store");
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntNE, rc,
-                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
+                 LLVMConstInt(rc_ty, ZAN_RC_IMMORTAL, 0),
                  "strinv.writable"),
         store_bb, done_bb);
     LLVMPositionBuilderAtEnd(g->builder, store_bb);

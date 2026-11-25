@@ -728,10 +728,11 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      （`llvm_scalar_size` 为 0）必须报错拒绝，而不是悄悄退化成 1 字。
 36. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
    - 动作：字符串字面量等编译期常量不是堆对象，它们的引用计数用哨兵值
-     `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写"对象前 16 字节计数头"
-     （`ZAN_OBJ_RC_OFF = -16`）的 ARC 路径——通用 retain / 通用 release、字符串
-     retain、动态释放——都必须**先判哨兵再动计数**。静态对象在只读段，对它做
-     原子加一/减一就是访问冲突。
+     `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写计数头
+     （2026-11-24 起：`ZAN_RC_OFF = -12` 的 **u32**，immortal = `ZAN_RC_IMMORTAL`
+     0xffffffff；静态数据仍在 [-16] 写 i64 -1，小端下 [-12] 恰是它）的 ARC
+     路径——通用 retain / 通用 release、字符串 retain、动态释放——都必须
+     **先判哨兵再动计数**。静态对象在只读段，对它做原子加一/减一就是访问冲突。
    - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
      retain/release 漏了；而"字面量存进 `object` 槽"走的正是通用 retain
      （槽的静态类型是 object 不是 string），于是对只读段做原子加一 → 0xC0000005。
@@ -742,6 +743,25 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      计数头）。崩溃现场在 `<exe_dir>/zan_crash.log`（含 fault/rip/rax/raw stack），
      先读它再决定要不要上调试器；最小探针二分（`object o = "字面量"` vs
      `string s = "字面量"`）通常一步就切到根因。
+
+**ARC 头：RC 是 [p-12] 的 u32，字符串头只有 12 字节——绝不碰串的 [p-16]**（实证，2026-11-24）：
+- 布局（`src/common/zan_abi.h`）：对象 `[-16]` 4 字节空位 | `[-12]` u32 rc | `[-8]` 站点字；
+  字符串 `[-12]` u32 rc | `[-8]` `(ZANS<<32)|len`。对象与串 RC 同址同宽，通用
+  retain/release 不分辨种类。数组不变（i64 rc 在 -32、计数 `ZAN_ARR_COUNT_OFF` -16）。
+- 链了 rt_mem（`g->str_pages`，Apple/ELF/Windows 原生且非 `--emit-lib`）时串经
+  `zan_mem_str_malloc` 进 8 字节粒度"串页"：块真起点在 4 mod 8，交出的是虚基址
+  V = 用户指针 - 16（释放照旧传 p-16）。**V[0..3] 是相邻串的尾巴**：任何对串写
+  `[-16]`（旧式 `store i64 1` 初始化 rc、i64 原子加减）都会悄悄改坏邻居的最后
+  4 字节——表现为别的串尾字符变了，不崩。新增串分配/RC 路径一律用 `zan_rc_ptr`
+  （i32），C 侧用 `ZAN_RC_PTR`/`ZAN_RC_LOAD`。
+- 收益：`"item"+i` 一千万个串 392 MiB → 315 MiB（每串 32 → 24 字节）。钉子用例
+  `tests/conformance/string_header_pages.zan`。
+- 自举后端自有串/对象 ABI（串头 32 字节、对象 rc i64 在 -16、delegate 钩子强覆盖），
+  不受影响；改 C 运行时读写 RC 的代码时别把它当成同一 ABI。
+- rt_mem 分配器性能坑：空闲链空时曾每次都进慢路径做 8 次远端条带原子交换
+  （全新分配为主的程序每次分配白付）；现快路径先切当前页、慢路径先读后换。
+  `zan_mem_cache_get` 拆成内联 TLS 快路径 + noinline 慢路径——它被多处内联
+  后编译器会把整函数外提，分配热路径多一次调用。
 
 **弱字段存储不接管所有权——右值是 +1 临时时存储后必须释放**（实证，2026-11-02）：
 `emit_rc_store_field` 的 weak 路径经 `emit_weak_store` 落槽后，若右值属于 owned

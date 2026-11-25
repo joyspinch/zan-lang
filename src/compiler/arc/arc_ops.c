@@ -884,12 +884,11 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         zan_emit_call_if(g, zan_emit_live_on(g), g->rt_live_unregister, &obj, 1);
     }
     if (g->arc_guard) {
-        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-        LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
-        LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-        emit_arc_quarantine(g, obj, rcip);
+        emit_arc_quarantine(g, obj, zan_rc_ptr(g, b, obj, "rcp"),
+                            LLVMInt32TypeInContext(c));
     } else {
-        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+        /* 释放传虚基址 obj-16（对象的真块起点；串页的串分配器也认它） */
+        LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)-(long long)ZAN_OBJ_HDR_SIZE, 1);
         LLVMValueRef header_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
         zan_call2(b, free_fn_type, g->fn_free, &header_ptr, 1, "");

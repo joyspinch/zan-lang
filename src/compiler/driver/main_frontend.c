@@ -485,11 +485,32 @@
         free(source);
         return 1;
     }
+    /* rt_mem.o 是否会链入（linker_setup.c 同判据）：决定串分配走不走它的
+     * 12 字节头串页（zan_mem_str_malloc），也决定 Apple 的分配调用改指 */
+    bool have_rt_mem = false, apple_route_fast_alloc = false;
+#ifdef ZAN_RT_MEM_OBJ
+    if (fast_alloc_opt >= 0 && !emit_lib) {
+        char fa_obj[1200];
+        if (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS) {
+            apple_route_fast_alloc =
+                zan_apple_rt_mem_path(&target, cross_compiling, fa_obj, sizeof(fa_obj));
+            /* 交叉 Apple 链的是 toolchain/ 里预编的 rt_mem.o，可能还没有
+             * zan_mem_str_malloc：串页只给本机构建 */
+            have_rt_mem = apple_route_fast_alloc && !cross_compiling;
+        } else if (!cross_compiling) {
+            char fa_dir[1024];
+            zan_exe_dir(fa_dir, sizeof(fa_dir));
+            snprintf(fa_obj, sizeof(fa_obj), "%s/%s", fa_dir,
+                     zan_path_basename(ZAN_RT_MEM_OBJ));
+            have_rt_mem = zan_file_exists(fa_obj);
+        }
+    }
+#endif
     if (zan_irgen_init(&irgen, ir_arena, diag, &binder, input_file,
                        irgen_triple,
                        target.os == ZAN_OS_WINDOWS, external_async_executor,
                        check_leaks, runtime_checks, arc_guard,
-                       arc_net) != ZAN_OK) {
+                       arc_net, have_rt_mem) != ZAN_OK) {
         fprintf(stderr, "error: failed to initialize code generator\n");
         zan_diag_free_buffers(diag);
         zan_arena_free(ir_arena);
@@ -505,12 +526,7 @@
      * zan_mem_*；只有分配器对象确实在场才改，链接段（linker_setup.c）同判。
      * --emit-lib 不改：静态库只装用户对象、由外部宿主链接，拿不到 rt_mem.o。 */
 #ifdef ZAN_RT_MEM_OBJ
-    if (fast_alloc_opt >= 0 && !emit_lib &&
-        (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-        char fa_obj[1200];
-        irgen.route_fast_alloc =
-            zan_apple_rt_mem_path(&target, cross_compiling, fa_obj, sizeof(fa_obj));
-    }
+    irgen.route_fast_alloc = apple_route_fast_alloc;
 #endif
     if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
         char handler_root[1024];

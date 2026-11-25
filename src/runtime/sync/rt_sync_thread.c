@@ -486,13 +486,13 @@ static void *zan_delegate_record(void *d) {
 ZAN_DELEGATE_HOOK(retain)(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
-    volatile int64_t *rc = (volatile int64_t *)((char *)rec + ZAN_OBJ_RC_OFF);
+    volatile uint32_t *rc = ZAN_RC_PTR(rec);
 #ifdef _WIN32
-    if (InterlockedCompareExchange64((volatile LONG64 *)rc, 0, 0) == -1) return;
-    InterlockedIncrement64((volatile LONG64 *)rc);
+    if ((uint32_t)InterlockedCompareExchange((volatile LONG *)rc, 0, 0) == ZAN_RC_IMMORTAL) return;
+    InterlockedIncrement((volatile LONG *)rc);
 #else
-    if (__atomic_load_n((int64_t *)rc, __ATOMIC_SEQ_CST) == -1) return;
-    __atomic_add_fetch((int64_t *)rc, (int64_t)1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n((uint32_t *)rc, __ATOMIC_SEQ_CST) == ZAN_RC_IMMORTAL) return;
+    __atomic_add_fetch((uint32_t *)rc, 1u, __ATOMIC_SEQ_CST);
 #endif
 }
 
@@ -514,8 +514,8 @@ ZAN_DELEGATE_HOOK(release)(void *d) {
  * 低位 ZNST），自举在自己内部内联判别，不走这个 helper。 */
 int zan_obj_slot_is_string(const void *p) {
     if (!p) return 0;
-    const uint64_t *w = (const uint64_t *)((const char *)p + ZAN_OBJ_RC_OFF);
-    return (w[1] >> 32) == ZAN_STRING_TAG;
+    const uint64_t *w = (const uint64_t *)((const char *)p + ZAN_OBJ_SITE_OFF);
+    return (w[0] >> 32) == ZAN_STRING_TAG;
 }
 
 static int zan_dispatch_grow(void) {

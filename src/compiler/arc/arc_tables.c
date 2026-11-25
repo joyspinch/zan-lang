@@ -5,7 +5,6 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(c);
     LLVMTypeRef structT = get_struct_llvm_type(g, sym);
     LLVMValueRef obj = LLVMGetParam(fn, 0);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
@@ -17,13 +16,12 @@ void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
-    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
+    LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "rcp");
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
-    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
-    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+        LLVMConstInt(rc_ty, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1");
+    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over");
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBuildCondBr(b, over, dorel, last_bb);
     LLVMPositionBuilderAtEnd(b, last_bb);
@@ -136,13 +134,12 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMValueRef isnull = zan_icmp(b, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
     LLVMBuildCondBr(b, isnull, ret, cont);
     LLVMPositionBuilderAtEnd(b, cont);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
-    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
+    LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "rcp");
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
-    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
-    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over");
+        LLVMConstInt(rc_ty, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+    LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1");
+    LLVMValueRef over = zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over");
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBuildCondBr(b, over, dorel, last_bb);
     LLVMPositionBuilderAtEnd(b, last_bb);

@@ -424,19 +424,18 @@ static LLVMValueRef build_closure_dtor(zan_irgen_t *g, const char *lname,
     LLVMBasicBlockRef dec   = LLVMAppendBasicBlockInContext(c, fn, "dec");
     LLVMValueRef rec = LLVMGetParam(fn, 0);
     LLVMPositionBuilderAtEnd(b, entry);
-    LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), rec, &neg16, 1, "rcp");
-    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(c);
+    LLVMValueRef rcip = zan_rc_ptr(g, b, rec, "rcp");
     /* 析构防重入：原子声明防止并发二次释放 */
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
-        LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
+        LLVMConstInt(rc_ty, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
     LLVMBasicBlockRef last_bb = LLVMAppendBasicBlockInContext(c, fn, "last");
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(c, fn, "done");
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(i64, 0, 0), "over"),
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntSLE, rc_old, LLVMConstInt(rc_ty, 0, 0), "over"),
                     dec, last_bb);
     LLVMPositionBuilderAtEnd(b, last_bb);
-    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1"),
+    LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(rc_ty, 1, 0), "is1"),
                     drop, done_bb);
     LLVMPositionBuilderAtEnd(b, drop);
     /* 方法组绑定的接收者引用释放 */

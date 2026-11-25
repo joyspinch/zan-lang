@@ -369,16 +369,12 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
     emit_weak_nil_scan(g, g->rt_weak_destroy_begin, weak_calloc, obj, done_bb);
 
     LLVMPositionBuilderAtEnd(b, done_bb);
-    LLVMValueRef neg16 = LLVMConstInt(i64,
-        (unsigned long long)ZAN_OBJ_RC_OFF, 1);
-    LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(g->ctx), obj,
-        &neg16, 1, "weak.begin.rcp");
-    LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0),
-        "weak.begin.rcip");
+    LLVMTypeRef rc_ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMValueRef rcip = zan_rc_ptr(g, b, obj, "weak.begin.rcp");
     LLVMValueRef rc = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, rcip,
-        LLVMConstInt(i64, 0, 0), LLVMAtomicOrderingMonotonic, 0);
+        LLVMConstInt(rc_ty, 0, 0), LLVMAtomicOrderingMonotonic, 0);
     LLVMValueRef ok = LLVMBuildICmp(b, LLVMIntEQ, rc,
-        LLVMConstInt(i64, 0, 0), "weak.begin.ok");
+        LLVMConstInt(rc_ty, 0, 0), "weak.begin.ok");
     emit_weak_unlock(g);
     LLVMBuildRet(b, ok);
 }

@@ -40,7 +40,7 @@ static void zan_leak_walk_edges(void *obj, zan_leak_edge_cb_t cb, void *ctx) {
     if (*(uint64_t *)((char *)obj + ZAN_ARR_RC_MAGIC_OFF) == ZAN_ARRAY_RC_MAGIC) {
         site = *(uint64_t *)((char *)obj + ZAN_OBJ_SITE_OFF) & ~ZAN_OBJ_STACK_FLAG;
         if (site == ZAN_ARRAY_MAGIC) return;
-        int64_t count = *(int64_t *)((char *)obj + ZAN_OBJ_RC_OFF);
+        int64_t count = *(int64_t *)((char *)obj + ZAN_ARR_COUNT_OFF);
         void **elems = (void **)obj;
         for (int64_t i = 0; i < count; i++)
             if (elems[i]) cb(obj, elems[i], 1, (uint32_t)i, ctx);

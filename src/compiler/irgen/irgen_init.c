@@ -4,7 +4,8 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                             const char *target_triple,
                             bool target_is_windows, bool external_async_executor,
                             bool check_leaks, bool runtime_checks,
-                            bool arc_guard, bool arc_net) {
+                            bool arc_guard, bool arc_net,
+                            bool str_pages) {
     memset(g, 0, sizeof(*g));
     class_index_reset();
     s_current_irgen = g;
@@ -15,6 +16,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->arc_guard = arc_guard;
     g->arc_net = arc_net;
     g->check_leaks = check_leaks;
+    g->str_pages = str_pages;
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;

@@ -1345,10 +1345,10 @@ zan_escape_stats_t zan_opt_escape(zan_irgen_t *g) {
                                 LLVMBuilderRef b_inst = LLVMCreateBuilderInContext(ctx);
                                 LLVMPositionBuilderBefore(b_inst, inst);
 
-                                /* rc = 1 at raw[0..7] */
+                                /* raw[0..3] 清零、raw[4..7]（obj-12）rc = 1 */
                                 LLVMValueRef rc_ptr = LLVMBuildBitCast(b_inst, alloca_buf,
                                     LLVMPointerType(i64, 0), "stk.rcp");
-                                LLVMBuildStore(b_inst, LLVMConstInt(i64, 1, 0), rc_ptr);
+                                LLVMBuildStore(b_inst, LLVMConstInt(i64, ZAN_OBJ_RC_INIT_WORD, 0), rc_ptr);
 
                                 /* site = site | ZAN_OBJ_STACK_FLAG at raw[8..15] */
                                 LLVMValueRef site_marked = LLVMBuildOr(b_inst, site_val,

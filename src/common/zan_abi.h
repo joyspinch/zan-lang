@@ -6,9 +6,25 @@
 #include <stdint.h>
 
 
+/* ARC 头（2026-11-24 起）：引用计数是 32 位，住在 [p-12]——对象与字符串
+ * 同址同宽，通用 retain/release 不必先分辨是哪一种。
+ *   对象：[-16] 4 字节空位（分配时清零）| [-12] u32 rc | [-8] 站点/析构字
+ *   字符串：[-12] u32 rc | [-8] (ZANS<<32)|len —— 串头实占 12 字节
+ * 静态（immortal）对象/字面量仍按旧写法在 [-16] 放 i64 -1：小端下 [-12]
+ * 的 u32 恰是 0xffffffff，即 ZAN_RC_IMMORTAL，静态数据布局不用改。
+ * 字符串从 [-16] 起的 4 字节可能不属于它（--fast-alloc 的串页把串块排在
+ * 4 mod 8 地址上，好让 [-8] 头字仍 8 字节对齐），故绝不能读写串的 [-16]；
+ * 释放仍传 p-16（分配器认得这个"虚基址"）。 */
 #define ZAN_OBJ_HDR_SIZE  16
+#define ZAN_STR_HDR_SIZE  12
 
-#define ZAN_OBJ_RC_OFF    (-16)
+#define ZAN_RC_OFF        (-12)
+#define ZAN_RC_IMMORTAL   UINT32_C(0xffffffff)
+/* 新对象 [-16] 处的 64 位初值：低 32 位空位清零，高 32 位（即 [-12] 的 rc）= 1 */
+#define ZAN_OBJ_RC_INIT_WORD (UINT64_C(1) << 32)
+/* C 侧读对象/字符串 RC：有符号读出，immortal 读作 -1（与旧 i64 哨兵同口径） */
+#define ZAN_RC_PTR(obj)   ((uint32_t *)((char *)(obj) + ZAN_RC_OFF))
+#define ZAN_RC_LOAD(obj)  ((int64_t)(int32_t)*ZAN_RC_PTR(obj))
 
 #define ZAN_OBJ_SITE_OFF  (-8)
 #define ZAN_OBJ_STACK_FLAG     UINT64_C(0x8000000000000000) /* 栈上提升对象标记 (免 free) */
@@ -25,6 +41,7 @@
 #define ZAN_ARRAY_MAGIC        UINT64_C(0x5a414e4152524159) /* "ZANARRAY" */
 
 #define ZAN_ARR_HDR_SIZE       32
+#define ZAN_ARR_COUNT_OFF      (-16)  /* 数组元素个数（i64） */
 #define ZAN_ARR_RC_OFF         (-32)
 #define ZAN_ARR_RC_MAGIC_OFF   (-24)
 #define ZAN_ARRAY_RC_MAGIC     UINT64_C(0x5a414e41525243) /* "ZANARRC" */

@@ -278,7 +278,7 @@ static LLVMValueRef zan_array_alloc_impl(zan_irgen_t *g, LLVMValueRef total,
                       LLVMConstInt(i64, 1, 0), "arr.rc");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                       LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "arr.rcmagic");
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, count, "arr.count");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_COUNT_OFF, count, "arr.count");
     if (elem_type && is_rc_managed_type(elem_type)) {
         LLVMValueRef desc = get_array_desc(g, elem_type);
         LLVMValueRef desc_i64 = LLVMBuildPtrToInt(g->builder, desc, i64, "arr.desci");
@@ -307,7 +307,7 @@ LLVMValueRef zan_array_alloc(zan_irgen_t *g, LLVMValueRef total,
 LLVMValueRef zan_array_len(zan_irgen_t *g, LLVMValueRef arr) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
+    LLVMValueRef off = LLVMConstInt(i64, (unsigned long long)ZAN_ARR_COUNT_OFF, 1);
     LLVMValueRef hdr = LLVMBuildGEP2(g->builder, i8, arr, &off, 1, "arr.hdrp");
     return LLVMBuildLoad2(g->builder, i64,
         LLVMBuildBitCast(g->builder, hdr, LLVMPointerType(i64, 0), "arr.hdrc"),
@@ -347,7 +347,7 @@ LLVMValueRef zan_mdarray_alloc(zan_irgen_t *g, LLVMValueRef *dims,
                       LLVMConstInt(i64, 1, 0), "md.rc");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_RC_MAGIC_OFF,
                       LLVMConstInt(i64, ZAN_ARRAY_RC_MAGIC, 0), "md.rcmagic");
-    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_RC_OFF, total, "md.count");
+    zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_ARR_COUNT_OFF, total, "md.count");
     zan_arr_hdr_store(g, raw, ZAN_ARR_HDR_SIZE + ZAN_OBJ_SITE_OFF,
                       LLVMConstInt(i64, rank, 0), "md.rank");
     for (int d = 0; d < rank; d++) {

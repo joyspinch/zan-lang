@@ -280,7 +280,11 @@ void di_set_loc(zan_irgen_t *g, zan_loc_t loc);
 int eh_slot_kind_of(zan_type_t *t);
 unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem);
 LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr, long size, int coll_kind, zan_type_t *elem_type);
-void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj, LLVMValueRef rc_iptr);
+void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj, LLVMValueRef rc_iptr,
+                         LLVMTypeRef rc_ty);
+/* 对象/字符串的 32 位 RC 槽地址：obj + ZAN_RC_OFF（见 zan_abi.h） */
+LLVMValueRef zan_rc_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
+                        const char *name);
 LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty);
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap, LLVMValueRef v);
 LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name);
