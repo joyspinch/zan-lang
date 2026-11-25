@@ -8697,6 +8697,13 @@ if(Python3_Interpreter_FOUND)
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_gui_optional_features_ir.cmake)
   set_tests_properties(gui_optional_features_ir PROPERTIES TIMEOUT 240)
+  # S3（docs/ZAN_STANDARD.md §1）：zanc --emit-deps 记下真实依赖，scripts/affected.py
+  # 据此把改动文件映射到用例（det 孪生跳过、原生源码只报不猜、超预算不给命令）。
+  add_test(NAME affected_selection
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_affected.py
+      --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
+      --work ${CMAKE_BINARY_DIR}/test-out/affected)
+  set_tests_properties(affected_selection PROPERTIES TIMEOUT 300)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

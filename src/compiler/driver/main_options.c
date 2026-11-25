@@ -84,6 +84,8 @@ void print_usage(void) {
     fprintf(stderr, "    --emit-symbols <f> Write the type/member index (IDE completion) and exit\n");
     fprintf(stderr, "    --summary        Print the public surface of the given sources (one line\n"
                     "                     per member, signature + first doc sentence) and exit\n");
+    fprintf(stderr, "    --emit-deps <f>  Write the source files this program compiled from\n"
+                    "                     (after stdlib pull-in), one absolute path per line\n");
     fprintf(stderr, "    --gen-meta <f>   Export compilation-unit metadata JSON to <f> and exit\n");
     fprintf(stderr, "    --api <symbol>   Query member signatures and types from API index\n");
     fprintf(stderr, "  Packaging:\n");

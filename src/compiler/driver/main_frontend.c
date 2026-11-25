@@ -380,6 +380,24 @@
     phase("check");
     probe_phase_mem("check");
 
+    /* S3：本程序实际编进来的源文件清单（拉入过滤之后），每行一个绝对路径。
+     * 测试驱动写到 <用例产物>.deps，scripts/affected.py 据此把改动文件映射到
+     * 受影响用例。<...> 形式的合成源不是文件，跳过。 */
+    if (emit_deps_path) {
+        FILE *df = fopen(emit_deps_path, "wb");
+        if (!df) {
+            fprintf(stderr, "error: cannot write dependency list '%s'\n", emit_deps_path);
+        } else {
+            for (int i = 0; i < diag->file_count; i++) {
+                const char *fn = diag->file_names ? diag->file_names[i] : NULL;
+                if (!fn || !fn[0] || fn[0] == '<') continue;
+                char real[4096];
+                fprintf(df, "%s\n", pi_realpath(fn, real, sizeof(real)) ? real : fn);
+            }
+            fclose(df);
+        }
+    }
+
     zan_irgen_t irgen;
     const char *irgen_triple = NULL;
     if (cross_compiling) {

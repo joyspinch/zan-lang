@@ -302,6 +302,7 @@ public class UiEvent  // 控件事件：单一订阅通道。
 | `--emit-ir` | — | IR 到 stdout 后退出，不链接 |
 | `--emit-symbols <f>` / `--gen-meta <f>` | — | 输出索引/元数据后退出（IDE/LSP 用） |
 | `--summary` | — | 打印显式输入源文件的公开接口摘要后退出（S4，见 §1.7） |
+| `--emit-deps <f>` | — | 类型检查通过后把实际编进程序的源文件（拉入过滤之后，绝对路径一行一个）写到 `<f>`，照常继续编译（S3，见 §5） |
 | `--api <symbol>` | — | 从知识库检索 API 符号并打印签名与位置（无需编译，极速响应） |
 
 ### 2.4 打包（Packaging）
@@ -411,6 +412,16 @@ stamp，并发构建会让无关用例成批假红）。
 2. **重新 configure**（`cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`）
    ——GLOB 在 configure 期展开，不重跑 ctest 看不到新用例。
 3. `ctest -R conformance_<name>` 验证。
+
+**受影响用例（S3）**：`python3 scripts/affected.py <改动文件...>`（或 `--git` 取
+工作区改动、`--diff x.patch`）列出受影响的 ctest 用例并给出锚定的 `ctest -R`
+命令。用例引用的文件 = 注册参数里的源文件/夹具/金样/驱动脚本 + 编译器记下的真实
+依赖——`tests/run_case.cmake` 与 `run_case_modes.cmake` 以
+`zanc --emit-deps <产物>.deps` 编译，拉入过滤后实际编进程序的每个标准库/包文件都在
+里面。默认避开 det 孪生（`--with-det` 包含），超过预算（`--budget`，默认 80）只报
+数量；编译器/运行时原生源码、`CMakeLists.txt`、文档不猜名单，在 notes 里说明
+怎么办。从未带依赖记录编过的用例只按注册参数匹配（notes 报数量），跑过一次即补齐。
+`--json` 输出 `{tests, count, over_budget, det_skipped, ctest_regex, notes}`。
 
 **泄漏门禁（S10）**：经 `tests/run_case.cmake` 的用例默认追加 `--check-leaks` 编译，
 退出时仍可达对象数必须为 0——泄漏报表从 stdout 尾部切下单独判定，不进金样对账。
