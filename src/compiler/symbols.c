@@ -1,5 +1,6 @@
 
 #include "symbols.h"
+#include "query.h"
 #include "builtin_api.h"
 #include "win_utf8.h"
 
@@ -220,6 +221,7 @@ typedef struct {
     int                explicit_count;
     int                types;
     int                members;
+    const zan_effects_t *fx;    /* S2 效果列；NULL 则不出 */
 } zan_summary_ctx_t;
 
 /* 声明上方紧邻的注释块的第一句（跳过特性行 `[...]` 与空注释行） */
@@ -307,11 +309,15 @@ static void summary_type_params(const zan_ast_list_t *tps, char *buf, size_t cap
 }
 
 static void summary_line(zan_summary_ctx_t *cx, const char *indent, const char *sig,
-                         zan_loc_t loc) {
-    char doc[256];
+                         zan_loc_t loc, const zan_ast_node_t *method) {
+    char doc[256], fx[256];
     summary_doc(cx, loc, doc, sizeof(doc));
-    if (doc[0]) fprintf(cx->out, "%s%s  // %s\n", indent, sig, doc);
-    else fprintf(cx->out, "%s%s\n", indent, sig);
+    fx[0] = '\0';
+    if (method && cx->fx) zan_effects_describe(cx->fx, method, fx, sizeof(fx));
+    fprintf(cx->out, "%s%s", indent, sig);
+    if (fx[0]) fprintf(cx->out, "  [%s]", fx);
+    if (doc[0]) fprintf(cx->out, "  // %s", doc);
+    fputc('\n', cx->out);
 }
 
 static bool summary_member_visible(const zan_ast_node_t *owner, uint32_t mods) {
@@ -360,7 +366,7 @@ static void summary_type(zan_summary_ctx_t *cx, zan_ast_node_t *d) {
     char ns_buf[256];
     snprintf(ns_buf, sizeof(ns_buf), "%.*s", (int)ns.len, ns.len ? ns.str : "");
     fprintf(cx->out, "\n");
-    summary_line(cx, "", head, d->loc);
+    summary_line(cx, "", head, d->loc, NULL);
     if (ns_buf[0]) fprintf(cx->out, "  // namespace %s\n", ns_buf);
     cx->types++;
 
@@ -423,7 +429,8 @@ static void summary_type(zan_summary_ctx_t *cx, zan_ast_node_t *d) {
         default:
             continue;
         }
-        summary_line(cx, "  ", sig, m->loc);
+        summary_line(cx, "  ", sig, m->loc,
+                     (m->kind == AST_METHOD_DECL || m->kind == AST_CONSTRUCTOR_DECL) ? m : NULL);
         cx->members++;
     }
 }
@@ -438,8 +445,8 @@ static void summary_decls(zan_summary_ctx_t *cx, zan_ast_list_t *decls) {
 }
 
 int zan_summary_emit(zan_ast_node_t *unit, const zan_diag_t *diag, int explicit_count,
-                     FILE *out) {
-    zan_summary_ctx_t cx = { out, diag, explicit_count, 0, 0 };
+                     const zan_effects_t *fx, FILE *out) {
+    zan_summary_ctx_t cx = { out, diag, explicit_count, 0, 0, fx };
     fprintf(out, "// zan-summary 1: public surface of %d source file(s)\n", explicit_count);
     if (unit && unit->kind == AST_COMPILATION_UNIT) {
         if (unit->comp_unit.ns)

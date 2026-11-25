@@ -209,7 +209,7 @@ build/zanc tests/diag/diag_json_missing_semicolon.zan --diag=json -o out 2> diag
 ### 1.7 接口摘要（`--summary`，S4）
 
 `zanc <文件|目录...> --summary [--auto-stdlib]` 打印**命令行显式给出的源文件**的
-公开面后退出（不做类型检查、不生成代码；有语法错误时不出摘要、退出码 1）。
+公开面后退出（类型检查之后、不生成代码；有编译错误时不出摘要、退出码 1）。
 `--auto-stdlib`/包发现拉进来的库只用于解析，不进摘要。供 AI 一次装入一个包的
 接口，替代逐文件翻源码：
 
@@ -218,6 +218,8 @@ public class UiEvent  // 控件事件：单一订阅通道。
   // namespace Gui
   public static UiEvent op_add(UiEvent self, Action handler)  // 支持 event += handler（追加，多播）。
   public int Count()  // 全部订阅数（两种处理器形状合计）。
+public class OrderLine  // A priced line in an order.
+  public static string LoadPrices(string path)  [throws FileNotFoundException; uses File]  // Reads a price list.
 ```
 
 - 每个类型一行头（修饰、种类、名字与类型参数、基类型）+ 一行 `// namespace`；
@@ -227,9 +229,13 @@ public class UiEvent  // 控件事件：单一订阅通道。
   接口与枚举成员全列。属性降解出的 `get_X`/`set_X` 不重复列。
 - 文档：声明上方紧邻注释块（`//`、`///`，跳过 `[特性]` 行）的第一句，剥 XML
   标签，截到第一个 `。` 或 `. `。
-- 首行 `// zan-summary 1: …` 是格式版本；末行给类型/成员计数。效果（分配、
-  抛出、能力）与契约列待 S2 `zanc query` 提供后补进来。
-- 实测：`packages/Zan.Gui/src` 460 个类型、6349 个成员，约 1.5 秒。
+- 效果列 `[throws …; uses …]`（方法与构造器，有才出）：与 §1.7a `--query` 同一
+  口径——经已解析调用传递的可能抛出的异常类型（上界，不扣 catch，rethrow 不计，
+  每个成员最多 6 个、超出记 `...`）与用到的能力（Net/File/Process/Registry/
+  Clipboard/Native）。全程序一遍：调用图强连通分量按被调先完成的顺序合并效果。
+  分配不进摘要（几乎每个方法都分配，只是噪音）；契约列待 P4。
+- 首行 `// zan-summary 1: …` 是格式版本；末行给类型/成员计数。
+- 实测：`packages/Zan.Gui/src` 460 个类型、6350 个成员（1421 行带效果列），约 1.4 秒。
 - 钉：`summary_surface`（`tests/summary/`）。
 
 ### 1.7a 符号查询（`--query`，S2）

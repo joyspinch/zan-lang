@@ -60,9 +60,9 @@ AI 时代写代码的边际成本趋近于零，瓶颈转移到两处：
 | 编号 | 能力 | 说明 |
 |---|---|---|
 | S1 | `zanc --diag=json` | **第一刀已落地，见 `docs/ZANC_CLI.md` §1.6**（JSON Lines、编号、位置、fix-it 框架，首个补丁 E0032 缺 `;`）。余：更多诊断接 fix-it（`zan_diag_emit_fix`）、结束位置区间、LSP capture 携带补丁、指向 SPEC 小节与 conformance 用例的链接 |
-| S2 | `zanc query <符号>` | 第一刀已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a；余：catch 扣除、虚调用/委托目标展开、接入 S4 摘要的效果列 |
+| S2 | `zanc query <符号>` | 第一刀已落地为 `zanc --query`，见 docs/ZANC_CLI.md §1.7a；余：catch 扣除、虚调用/委托目标展开 |
 | S3 | `zanc --affected <diff>` | 已落地为 `scripts/affected.py`（映射要读 ctest 注册信息，不归编译器）+ `zanc --emit-deps` 记真实依赖，见 docs/ZANC_CLI.md §5 |
-| S4 | `zanc --summary <包>` | 第一刀已落地，见 docs/ZANC_CLI.md §1.7（公开签名 + 一行文档）；余：效果与契约列（依赖 S2） |
+| S4 | `zanc --summary <包>` | 已落地，见 docs/ZANC_CLI.md §1.7：公开签名 + 效果列（S2 的 throws/能力）+ 一行文档；余：契约列（P4） |
 | S5 | `zan check` | 第一刀已落地为 `scripts/zan_check.py`，见 docs/ZANC_CLI.md §1.8：编译诊断 + 泄漏门禁合成单份 JSON；余：ui/replay 步骤（随 P2/P3）、SDK 原生命令形态 |
 
 AI 工作循环收敛为：**改代码 → `zan check` → 应用 fix-it**。

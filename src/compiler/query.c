@@ -532,21 +532,34 @@ static bool q_istr_eq(zan_istr_t a, const char *s, size_t n) {
     return a.len == n && memcmp(a.str, s, n) == 0;
 }
 
+/* 全程序方法索引 + 调用图（--query 与 --summary 的效果列共用） */
+static bool q_prog_build(q_prog_t *P, zan_ast_node_t *unit, zan_binder_t *binder) {
+    P->binder = binder;
+    if (unit && unit->kind == AST_COMPILATION_UNIT) {
+        if (unit->comp_unit.ns) q_collect_types(P, &unit->comp_unit.ns->namespace_decl.members);
+        q_collect_types(P, &unit->comp_unit.decls);
+    }
+    if (!q_build_map(P)) return false;
+    for (int i = 0; i < P->count; i++)
+        q_visit_calls(P, P->m[i].decl->method_decl.body, q_edge_cb, &i);
+    return true;
+}
+
+static void q_prog_free(q_prog_t *P) {
+    for (int i = 0; i < P->count; i++) free(P->m[i].callees);
+    free(P->m);
+    free(P->keys);
+    free(P->vals);
+}
+
 int zan_query_emit(zan_ast_node_t *unit, zan_binder_t *binder, const zan_diag_t *diag,
                    const char *query, FILE *out) {
     q_prog_t P;
     memset(&P, 0, sizeof(P));
-    P.binder = binder;
     P.out = out;
     P.diag = diag;
-    if (unit && unit->kind == AST_COMPILATION_UNIT) {
-        if (unit->comp_unit.ns) q_collect_types(&P, &unit->comp_unit.ns->namespace_decl.members);
-        q_collect_types(&P, &unit->comp_unit.decls);
-    }
     int matches = 0;
-    if (!q_build_map(&P)) goto done;
-    for (int i = 0; i < P.count; i++)
-        q_visit_calls(&P, P.m[i].decl->method_decl.body, q_edge_cb, &i);
+    if (!q_prog_build(&P, unit, binder)) goto done;
 
     const char *dot = strrchr(query, '.');
     const char *mname = dot ? dot + 1 : query;
@@ -584,9 +597,194 @@ done:
     fprintf(out, "{\"kind\":\"summary\",\"query\":");
     q_json_cstr(out, query);
     fprintf(out, ",\"matches\":%d}\n", matches);
-    for (int i = 0; i < P.count; i++) free(P.m[i].callees);
-    free(P.m);
-    free(P.keys);
-    free(P.vals);
+    q_prog_free(&P);
     return matches > 0 ? 0 : 1;
+}
+
+/* ===================================================================
+ * 效果摘要（S4 --summary 的效果列）
+ *
+ * 逐方法 BFS 对几千个公开成员太贵；改为全程序一遍：Tarjan 求调用图强连通
+ * 分量，分量按"被调先完成"的顺序产出，每个分量的效果 = 成员自身（直接 throw
+ * 的异常类型、自身所属能力）∪ 已完成的被调分量的效果。异常类型每个分量最多记
+ * FX_MAX 个，超出记 more。口径与 --query 相同：throw 是上界（不扣 catch），
+ * rethrow 不计类型；能力见 q_capability。
+ * =================================================================== */
+
+#define FX_MAX 6
+
+struct zan_effects {
+    q_prog_t   P;
+    char     **names;      /* 异常类型名驻留表 */
+    int        name_count, name_cap;
+    int       *comp;       /* 方法 -> 分量 */
+    int        comp_count;
+    int       *throws;     /* comp_count * FX_MAX */
+    uint8_t   *nthrows;
+    uint8_t   *more;
+    uint32_t  *caps;
+    /* Tarjan */
+    int       *index, *low, *stack;
+    uint8_t   *on_stack;
+    int        sp, next;
+    int       *direct_first, *direct_ids; /* 方法 -> 直接 throw 的类型 id 列表 */
+};
+
+static int fx_intern(zan_effects_t *E, const char *name) {
+    for (int i = 0; i < E->name_count; i++) if (strcmp(E->names[i], name) == 0) return i;
+    if (E->name_count == E->name_cap) {
+        int ncap = E->name_cap ? E->name_cap * 2 : 64;
+        char **nn = (char **)realloc(E->names, (size_t)ncap * sizeof(char *));
+        if (!nn) return -1;
+        E->names = nn;
+        E->name_cap = ncap;
+    }
+    size_t n = strlen(name);
+    char *copy = (char *)malloc(n + 1);
+    if (!copy) return -1;
+    memcpy(copy, name, n + 1);
+    E->names[E->name_count] = copy;
+    return E->name_count++;
+}
+
+static void fx_add(zan_effects_t *E, int c, int id) {
+    if (id < 0) return;
+    int *set = &E->throws[(size_t)c * FX_MAX];
+    for (int i = 0; i < E->nthrows[c]; i++) if (set[i] == id) return;
+    if (E->nthrows[c] < FX_MAX) set[E->nthrows[c]++] = id;
+    else E->more[c] = 1;
+}
+
+static void fx_direct_scan(zan_effects_t *E, zan_ast_node_t *n, int **ids, int *count, int *cap) {
+    if (!n) return;
+    if (n->kind == AST_THROW_STMT && n->throw_stmt.value &&
+        n->throw_stmt.value->kind == AST_NEW_EXPR) {
+        char tn[128];
+        q_throw_name(n, tn, sizeof(tn));
+        int id = fx_intern(E, tn);
+        if (id >= 0) {
+            if (*count == *cap) {
+                int ncap = *cap ? *cap * 2 : 256;
+                int *ni = (int *)realloc(*ids, (size_t)ncap * sizeof(int));
+                if (!ni) return;
+                *ids = ni;
+                *cap = ncap;
+            }
+            (*ids)[(*count)++] = id;
+        }
+    }
+    int cc = zan_ast_child_count(n);
+    for (int i = 0; i < cc; i++) fx_direct_scan(E, zan_ast_child_at(n, i), ids, count, cap);
+}
+
+static void fx_strongconnect(zan_effects_t *E, int v) {
+    q_prog_t *P = &E->P;
+    E->index[v] = E->low[v] = E->next++;
+    E->stack[E->sp++] = v;
+    E->on_stack[v] = 1;
+    for (int e = 0; e < P->m[v].callee_count; e++) {
+        int w = P->m[v].callees[e];
+        if (E->index[w] < 0) {
+            fx_strongconnect(E, w);
+            if (E->low[w] < E->low[v]) E->low[v] = E->low[w];
+        } else if (E->on_stack[w] && E->index[w] < E->low[v]) {
+            E->low[v] = E->index[w];
+        }
+    }
+    if (E->low[v] != E->index[v]) return;
+    int c = E->comp_count++;
+    int start = E->sp;
+    do { start--; } while (E->stack[start] != v);
+    for (int k = start; k < E->sp; k++) E->comp[E->stack[k]] = c;
+    /* 被调分量都已完成（编号更小）：自身直接效果 + 被调分量的效果 */
+    for (int k = start; k < E->sp; k++) {
+        int u = E->stack[k];
+        for (int j = E->direct_first[u]; j < E->direct_first[u + 1]; j++)
+            fx_add(E, c, E->direct_ids[j]);
+        int cap = q_capability(P, u);
+        if (cap >= 0) E->caps[c] |= 1u << cap;
+        for (int e = 0; e < P->m[u].callee_count; e++) {
+            int wc = E->comp[P->m[u].callees[e]];
+            if (wc == c || wc < 0) continue;
+            for (int i = 0; i < E->nthrows[wc]; i++)
+                fx_add(E, c, E->throws[(size_t)wc * FX_MAX + i]);
+            if (E->more[wc]) E->more[c] = 1;
+            E->caps[c] |= E->caps[wc];
+        }
+    }
+    for (int k = start; k < E->sp; k++) E->on_stack[E->stack[k]] = 0;
+    E->sp = start;
+}
+
+zan_effects_t *zan_effects_build(zan_ast_node_t *unit, zan_binder_t *binder) {
+    zan_effects_t *E = (zan_effects_t *)calloc(1, sizeof(*E));
+    if (!E) return NULL;
+    if (!q_prog_build(&E->P, unit, binder)) { zan_effects_free(E); return NULL; }
+    int n = E->P.count;
+    size_t sz = (size_t)(n ? n : 1);
+    E->comp = (int *)malloc(sz * sizeof(int));
+    E->index = (int *)malloc(sz * sizeof(int));
+    E->low = (int *)malloc(sz * sizeof(int));
+    E->stack = (int *)malloc(sz * sizeof(int));
+    E->on_stack = (uint8_t *)calloc(sz, 1);
+    E->throws = (int *)calloc(sz * FX_MAX, sizeof(int));
+    E->nthrows = (uint8_t *)calloc(sz, 1);
+    E->more = (uint8_t *)calloc(sz, 1);
+    E->caps = (uint32_t *)calloc(sz, sizeof(uint32_t));
+    E->direct_first = (int *)calloc(sz + 1, sizeof(int));
+    if (!E->comp || !E->index || !E->low || !E->stack || !E->on_stack || !E->throws ||
+        !E->nthrows || !E->more || !E->caps || !E->direct_first) {
+        zan_effects_free(E);
+        return NULL;
+    }
+    int cap = 0, count = 0;
+    for (int i = 0; i < n; i++) {
+        E->direct_first[i] = count;
+        fx_direct_scan(E, E->P.m[i].decl->method_decl.body, &E->direct_ids, &count, &cap);
+        E->comp[i] = -1;
+        E->index[i] = -1;
+    }
+    E->direct_first[n] = count;
+    for (int v = 0; v < n; v++)
+        if (E->index[v] < 0) fx_strongconnect(E, v);
+    return E;
+}
+
+int zan_effects_describe(const zan_effects_t *E, const zan_ast_node_t *method_decl,
+                         char *buf, size_t cap) {
+    buf[0] = '\0';
+    if (!E || cap < 16) return 0;
+    int i = q_find(&E->P, method_decl);
+    if (i < 0) return 0;
+    int c = E->comp[i];
+    if (c < 0) return 0;
+    size_t o = 0;
+    if (E->nthrows[c]) {
+        o += (size_t)snprintf(buf + o, cap - o, "throws ");
+        for (int k = 0; k < E->nthrows[c] && o < cap - 32; k++)
+            o += (size_t)snprintf(buf + o, cap - o, "%s%s", k ? ", " : "",
+                                  E->names[E->throws[(size_t)c * FX_MAX + k]]);
+        if (E->more[c] && o < cap - 8) o += (size_t)snprintf(buf + o, cap - o, ", ...");
+    }
+    if (E->caps[c]) {
+        o += (size_t)snprintf(buf + o, cap - o, "%suses ", o ? "; " : "");
+        int first = 1;
+        for (int k = 0; k < Q_CAP_COUNT && o < cap - 16; k++) {
+            if (!(E->caps[c] & (1u << k))) continue;
+            o += (size_t)snprintf(buf + o, cap - o, "%s%s", first ? "" : ", ", Q_CAPS[k]);
+            first = 0;
+        }
+    }
+    return (int)o;
+}
+
+void zan_effects_free(zan_effects_t *E) {
+    if (!E) return;
+    q_prog_free(&E->P);
+    for (int i = 0; i < E->name_count; i++) free(E->names[i]);
+    free(E->names);
+    free(E->comp); free(E->index); free(E->low); free(E->stack); free(E->on_stack);
+    free(E->throws); free(E->nthrows); free(E->more); free(E->caps);
+    free(E->direct_first); free(E->direct_ids);
+    free(E);
 }

@@ -309,18 +309,6 @@
         return 3;
     }
 
-    /* S4：只摘显式输入文件的公开接口，不做类型检查与代码生成 */
-    if (do_summary) {
-        if (zan_diag_has_errors(diag)) {   /* 半截 AST 的摘要会误导，宁可不出 */
-            zan_arena_free(arena);
-            return 1;
-        }
-        zan_summary_emit(ast, diag, explicit_input_count, stdout);
-        fflush(stdout);
-        zan_arena_free(arena);
-        return 0;
-    }
-
     if (emit_symbols_path) {
         int srv = zan_symbols_emit(ast, emit_symbols_path);
         if (srv != 0)
@@ -396,6 +384,18 @@
             }
             fclose(df);
         }
+    }
+
+    /* S4：显式输入文件的公开接口摘要。放在类型检查之后：效果列（S2 的
+     * throws/能力）要用 checker 解析好的调用目标。有错误时上面已返回 1——
+     * 半截程序的摘要会误导，宁可不出。不生成代码。 */
+    if (do_summary) {
+        zan_effects_t *fx = zan_effects_build(ast, &binder);
+        zan_summary_emit(ast, diag, explicit_input_count, fx, stdout);
+        zan_effects_free(fx);
+        fflush(stdout);
+        zan_arena_free(arena);
+        return 0;
     }
 
     /* S2：符号查询——类型检查通过、调用已解析之后输出并退出，不生成代码 */
