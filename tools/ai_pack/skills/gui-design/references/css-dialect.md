@@ -53,9 +53,20 @@
   `transition-timing-function`(内置 8 曲线)、`animation: <name> <dur> <easing>`
   (只认内置曲线,@keyframes 不解析)。现代独立写法同样认:
   `rotate: 90`/`scale: 1.2`/`translate: 10px 20px` 可脱离 transform 单发。
-- **视觉效果**:`backdrop-filter`/`filter` 认 `blur(Npx)`(玻璃拟态主通道)、
+- **视觉效果与现代材质原语**:`backdrop-filter`/`filter` 认 `blur(Npx)`(玻璃拟态主通道)、
   `opacity`、`aspect-ratio`(定宽推高/定高推宽)、`text-shadow`(取第一层
   几何,≥3 层零模糊)、`border` 的 `dashed/dotted` 走虚线描边。
+  - **双层 `box-shadow` 原生支持**:逗号分隔最多 2 层(`box-shadow: dx1 dy1 blur1 color1, dx2 dy2 blur2 color2;`),
+    绘制序按 CSS 标准先画第 2 层再画第 1 层(Contact+Ambient 抬升影,或柔陶左上亮影+右下暗影);
+    `none` 或单层声明会清零第 2 层;`--brutal: 1` 下强制单层硬影;超过 2 层静默忽略。
+  - **`-zan-sheen: <0..400> [<color>]` 折光高光棱**:绘制顶部柔和反光带 + 1px 内环高光 +
+    1px 顶沿镜面棱;当 `strength >= 220` 且高度 `>= 18` 时额外激活**底部光学焦散折光棱**,
+    用于液态/磨砂玻璃(`liquid`/`frosted`)的通透折光效果。
+  - **皮肤两阶段级联红线**:`skin.css` 在 `base.css` 之后合并——卡片规则写
+    `card, panel.card:not(.drawer-surface)`、主按钮写
+    `button.primary:not(.ghost):not(.secondary):not(.text):not(.outline):not(.dashed):not(.tertiary):not(.quaternary)`、
+    覆写 `input` 背景必须配 `input:disabled` 兜底、禁止裸写 `label { color: ... }` 破坏按钮/标签页前景继承。
+    材质配方与 OKLab 派生详见 `references/skin-materials.md`。
 - **`position`/`z-index`/`order`/`overflow` 现在真的生效**(此前解析进样式盒
   但布局/绘制不读=写而不读):`position: absolute` 脱流(不占停靠/flex 的流
   空间),包含块是父 **padding box**,`top`/`right`/`bottom`/`left`/`inset`

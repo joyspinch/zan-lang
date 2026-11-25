@@ -9,8 +9,11 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 间距三套全库统一的阶梯 token,永远从档位里取值,界面就自动"齐";克制靠取舍:
 一个画面只有一个视觉重心;方向靠配方:选定风格方向后,一切从那张配方卡推导。
 
-- 主流风格九张配方卡:`references/style-directions.md`(用户点名风格、
+- 主流风格十三张配方卡:`references/style-directions.md`(用户点名风格、
   或要求"好看一点"而现有皮肤不对味时,写码前先选卡)
+- 现代皮肤材质与工程不变量(16 套内置皮肤目录/表面明度阶梯/OKLab 派生/
+  双层投影与柔陶浮雕/液态玻璃焦散棱/对比度底线/`skin.css` 两阶段级联红线):
+  `references/skin-materials.md`(设计/调校皮肤、做现代材质前必读)
 - 页面搭配模式与反模式:`references/composition.md`(写页面布局前先读)
 - 一张截图严格还原布局:`references/screenshot-restore.md`(用户给截图要
   求"照这个做/还原/复刻这个界面"时先读——测量转写→布局账本→原语映射
@@ -73,7 +76,7 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 值就是错。
 - 主题内边距 `var(--padding-tiny/small/medium/large)` = 4/8/12/16
 - 主题间距 `var(--gap-small/medium/large)` = 4/8/12
-- 原子类阶梯 `var(--space-xs/s/sm/m/l/xl)` = 4/8/12/16/24/32
+- 扩展间距令牌 `var(--space-xs/s/sm/m/l/xl)` = 4/8/12/16/24/32
 - 图标/指示器 `var(--icon-size-small/medium/large)` = 16/20/24
 - 惯例:卡片内边距 `var(--padding-medium)`/`--padding-large`,紧凑工具条
   `var(--padding-tiny)`,节与节之间 `var(--gap-large)`(12)再往上只有
@@ -143,11 +146,11 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
   同一列宽、所有输入框同高同档。模式示例见 `references/composition.md`。
 - **数字右对齐**(金额/计数/尺寸),**标题左对齐**,**操作按钮右对齐**
   (工具条、弹窗脚部一律右侧,主按钮在最右)。
-- **垂直居中**:同行图标+文字组合挂类串 `flex items-center gap-2`
-  (经 `Control.Class` 字段或 `AddClass` 挂上);控件混排靠高度档一致
-  保证基线齐,不靠逐个调 y。
-- **网格对齐**:等宽卡片用 `grid`(`grid-cols-3 gap-3` 原子类或
-  `Grid.Of(n).Gap(px)`),不要手摆 x/y。
+- **垂直居中**:同行图标+文字组合用 `Flex.Row().AlignCenter().Gap(8)` 或
+  CSS `display: flex; align-items: center; gap: var(--gap-medium);`;
+  控件混排靠高度档一致保证基线齐,不靠逐个调 y。
+- **网格对齐**:等宽卡片用 `Grid.Of(n).Gap(px)` 或 CSS `display: grid;
+  grid-template-columns: repeat(3, 1fr); gap: var(--gap-large);`,不要手摆 x/y。
 - **一排控件两端留白要相等**(如一排按钮右端与左端对齐):行首/行末各放一条
   **同宽撑条**,容器挂 `display: flex`,要"各宽几像素"的子控件挂
   `flex-grow: 1` —— 剩余宽度平摊到控件本身,余数由引擎给最后一个可增长项
@@ -164,22 +167,26 @@ description: Zan GUI（Zan.Gui 包）审美与排版规范——对齐、间距�
 - **颜色必须走样式层**:控件代码禁直读主题语义色、禁裸 `0xAARRGGBB`、
   禁直读字号——取色/取字一律走 StyleBox(`Style.Of(app, type, cls, ...)`,
   属性带兜底如 `s.FgOr(...)`/`s.FontOr(...)`)。
-- Tailwind 原子类只用于布局/间距/圆角/阴影,**不用它的调色板**
-  (`bg-slate-500` 会绕开皮肤主题,换肤即脏);要颜色写语义类或 `var(--token)`。
+- **禁止写死裸调色板色与已移除的 Tailwind 工具类**(如 `bg-slate-500`/`p-3`/`flex-1`
+  这类绕开主题或无效的类名);布局与留白走 `Flex`/`Grid`/CSS 声明与 `var(--token)`,
+  颜色走语义类或 `var(--*)`。
 - 圆角同档:`var(--border-radius-small/medium/large)`;同一画面出现 3 种
-  圆角就是没设计。阴影只用小/中档,弹层才允许大阴影。
+  圆角就是没设计。阴影支持双层(Contact+Ambient 抬升或柔陶双侧浮雕),卡片轻影、
+  弹层才允许大阴影。
 
 ## 风格方向(先选卡,再写码)
 
 统一档位解决"任何风格都不塌";风格本身走**皮肤配方**:一个皮肤包 = 一个
-`skins/<name>/skin.css` 的 `:root` token 覆写,零代码,随应用发布
-(应用自带 `skins/` 优先于内置皮肤)。
+`skins/<name>/skin.css` 的 `:root` 令牌与少量受限材质规则,零业务代码,随应用发布
+(应用自带 `skins/` 优先于内置 16 套皮肤)。
 
-九张现成配方卡(商务/街头嘻哈/赛博朋克/暗金豪华/国风/极简日式/玻璃拟态/
-新拟态/卡通波普)在 `references/style-directions.md`,含可粘贴的 `:root`
-覆写、排版/动效/文案性格、能力边界与验收点。选卡前过"选型三问":题材的
-身体记忆、签名元素只放一处、拒绝 AI 模板脸(米色+衬线+赤陶、纯黑+荧光绿、
-报纸细线)。
+内置 16 套皮肤目录、表面明度阶梯、OKLab 感知派生、双层投影、液态玻璃焦散折光、
+对比度底线与 `skin.css` 两阶段级联红线见 `references/skin-materials.md`;
+十三张现成配方卡(商务/街头嘻哈/赛博朋克/暗金豪华/国风/极简日式/暗色磨砂玻璃/
+新拟态/卡通波普/液态玻璃/极夜工程/极光氛围/柔陶浮雕)在
+`references/style-directions.md`,含可粘贴的 `:root` 覆写、排版/动效/文案性格、
+能力边界与验收点。选卡前过"选型三问":题材的身体记忆、签名元素只放一处、
+拒绝 AI 模板脸(米色+衬线+赤陶、纯黑+荧光绿、报纸细线)。
 
 ## 游戏素材的硬判据（模板与正式项目通用）
 
@@ -242,7 +249,7 @@ DPI 逐坑:见 [references/render-anim.md](references/render-anim.md)。
 
 ## 收尾自查(逐条过)
 
-1. 字号只来自阶梯(含 Tailwind `text-*` 档),没有即兴值。
+1. 字号只来自主题阶梯(`--font-size-*`),没有即兴值。
 2. 同排/同组控件高度同档;按钮不再三种高度并存。
 3. 一切间距 ∈ 4 的倍数;gap 用档位类;区块间隙全画面一致。
 4. 相邻区块左边界共线;表单列宽全表统一。
@@ -266,6 +273,9 @@ DPI 逐坑:见 [references/render-anim.md](references/render-anim.md)。
     刻意叠放的装饰)。
 18. `ZAN_GUI_LAYOUTLINT=1` 跑过一遍,`gui-lint` 命中为 0;按钮/勾选框
     代码里没有 `Prefer` 写死的宽高(免检牌只给图标钮/画布图元)。
+19. 交互状态与对比度完备:正文对比度 ≥ 4.5:1,主按钮反色文字可读,输入框/可聚焦
+    控件有清晰 `:focus` 聚焦环,禁用态与常态明显区分;改动过皮肤时
+    `composed.Lint()` 为 0 且已逐张肉眼验收。
 
 ## 浮层与模态:下层内容必须停手(弹层点击穿透的根因)
 

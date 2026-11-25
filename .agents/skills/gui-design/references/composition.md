@@ -7,7 +7,7 @@ SKILL.md 是规则主干;这里是可以直接照抄的组合模式(全部用 Za
 
 ```text
 ┌─ RenderChrome(标题栏,App 负责)──────────────┐
-│ ToolStrip(工具条,small 档,px-2)             │
+│ ToolStrip(工具条,small 档,水平内边距 small) │
 │ ┌──────────────────────────────────────────┐ │
 │ │ 内容区:一行一节,节间 gap-large(12)      │ │
 │ └──────────────────────────────────────────┘ │
@@ -39,10 +39,10 @@ form.Add(row1);
 或使用 HTML 模板声明（推荐）：
 
 ```html
-<div class="flex flex-col gap-2">
-  <div class="flex flex-row items-center gap-2">
-    <label class="w-24 text-secondary">名称:</label>
-    <input class="flex-1" placeholder="请输入..." />
+<div style="display: flex; flex-direction: column; gap: var(--gap-medium);">
+  <div style="display: flex; flex-direction: row; align-items: center; gap: var(--gap-medium);">
+    <label style="width: 90px; color: var(--text-secondary);">名称:</label>
+    <input style="flex-grow: 1;" placeholder="请输入..." />
   </div>
 </div>
 ```
@@ -53,7 +53,7 @@ form.Add(row1);
 ### 工具条(左功能右动作)
 
 左组放导航/视图工具(ghost 变体),右组放动作;主按钮唯一、最右、
-primary 变体,次动作 secondary/ghost。全部 small 档 + `px-2`。
+primary 变体,次动作 secondary/ghost。全部 small 档 + `padding: 0 var(--padding-small)`。
 
 ### 卡片网格
 
@@ -64,7 +64,7 @@ g.Add(new Card("卡片2"));
 g.Add(new Card("卡片3"));
 ```
 
-卡片内边距统一 `p-3`,标题 small + text-secondary,正文 medium,
+卡片内边距统一 `var(--padding-medium)`(12),标题 `var(--font-size-large)` 或 `var(--text-secondary)`,正文 medium,
 底部动作行右对齐。卡片高度由网格拉齐,不要逐卡 Prefer。
 
 ### 明细布局(上列表下详情)
@@ -75,16 +75,16 @@ g.Add(new Card("卡片3"));
 ### 弹窗脚部
 
 右侧按钮组:取消(ghost)在左,主按钮(primary)在右;与正文之间
-`gap-large`,脚部自身 `p-3`。弹层底色不透明(select::popup 先例),
+`var(--gap-large)`,脚部自身 `padding: var(--padding-medium)`。弹层底色不透明(`select::popup` 先例),
 不要在弹层里再垫一层不透明底。
 
 ## 密度三档(同画面取一档)
 
 | 档   | 卡片内边距 | 区块间隙     | 控件档  | 适用               |
 | ---- | ---------- | ------------ | ------- | ------------------ |
-| 舒适 | p-4(16)  | gap-large+16 | medium  | 展示页/设置页      |
-| 标准 | p-3(12)  | gap-large    | medium  | 常规业务页         |
-| 紧凑 | p-2(8)   | gap-medium   | small   | 工具条/表格/IDE    |
+| 舒适 | `--padding-large`(16)  | `--gap-large`+16 | medium  | 展示页/设置页      |
+| 标准 | `--padding-medium`(12) | `--gap-large`    | medium  | 常规业务页         |
+| 紧凑 | `--padding-small`(8)   | `--gap-medium`   | small   | 工具条/表格/IDE    |
 
 密度混用只允许发生在"主从"结构(紧凑列表 + 标准详情),不允许发生在
 同级卡片之间。
@@ -115,7 +115,7 @@ g.Add(new Card("卡片3"));
 gallery 支持深链直达任一演示页 + 指定皮肤/语言/玻璃:
 
 ```bash
-./gui_gallery Slider liquidglass zh     # 组件名 皮肤 语言
+./gui_gallery Slider liquid zh          # 组件名 皮肤(16套之一) 语言
 ```
 
 构建与启动注意本机环境差异(Linux 的显示/依赖坑)。改完先过自查清单,

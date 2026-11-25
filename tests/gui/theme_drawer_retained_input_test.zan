@@ -81,16 +81,18 @@ class ThemeDrawerTestForm : Form {
             "porcelain", "graphite", "navy",
             "linen", "sage", "sakura",
             "lavender", "starlight", "cyber",
-            "luxe", "frosted", "brutal"
+            "luxe", "frosted", "brutal",
+            "liquid", "obsidian", "aurora", "clay"
         };
         List<string> expectedLabels = new List<string>{
             "浅色", "石墨", "深蓝",
             "暖纸", "森雾", "樱粉",
             "香芋", "星梦", "霓虹",
-            "暗金", "琉璃", "波普"
+            "暗金", "琉璃", "波普",
+            "液态", "极夜", "极光", "柔陶"
         };
         Check(app.SkinCount() == expectedNames.Count,
-        "the shipped catalog contains all 12 skins in 4x3 product order");
+        "the shipped catalog contains all 16 skins in 4x4 product order");
         for (int n = 0; n < expectedNames.Count; n = n + 1) {
             Check(app.SkinNameAt(n) == expectedNames[n],
             "catalog order matches " + expectedNames[n]);
@@ -101,10 +103,14 @@ class ThemeDrawerTestForm : Form {
         for (int i = 0; i < app.SkinCount(); i = i + 1) {
             string name = app.SkinNameAt(i);
             Theme candidate = app.SkinThemeAt(i);
-            if (name == "frosted") {
+            if (name == "frosted" || name == "liquid") {
                 Check(candidate.glass == 1 && candidate.gradient == 1 && candidate.fx == 0
                 && candidate.neu == 0 && candidate.brutal == 0,
-                "frosted skin enables glass and gradient showcase without idle fx");
+                name + " skin enables glass and gradient showcase without idle fx");
+            } else if (name == "aurora") {
+                Check(candidate.gradient == 1 && candidate.glass == 0 && candidate.fx == 0
+                && candidate.neu == 0 && candidate.brutal == 0,
+                "aurora skin enables atmospheric gradient showcase without idle fx");
             } else if (name == "brutal") {
                 Check(candidate.brutal == 1 && candidate.glass == 0 && candidate.gradient == 0
                 && candidate.fx == 0 && candidate.neu == 0,
@@ -126,7 +132,10 @@ class ThemeDrawerTestForm : Form {
             && candidate.borderRadiusMedium == baseline.borderRadiusMedium
             && candidate.borderRadiusLarge == baseline.borderRadiusLarge,
             "skin choice preserves spacing and corner metrics");
+            int cssBefore = app.cssApplyCount;
             app.ApplySkin(i);
+            Check(app.cssApplyCount == cssBefore + 1,
+            "ApplySkin rebuilds CSS exactly once per skin switch: " + name);
             Check(app.Density() == 1, "a new skin does not change the user's selected density");
             Check(Style.Full(app, "button", "primary", "", Style.SNormal()).BgOr(0) == candidate.primary
             && Style.Full(app, "button", "primary", "", Style.SHover()).BgOr(0) == candidate.primaryHover
@@ -200,6 +209,9 @@ class ThemeDrawerTestForm : Form {
     }
 
     private void StableDrawerFrames(App app, ThemeDrawer drawer) {
+        Check(Style.Full(app, "button", "theme-choice", "", Style.SNormal()).transitionMs == 0
+            && Style.Full(app, "button", "drawer-close", "", Style.SNormal()).transitionMs == 0,
+            "drawer choice and close buttons disable CSS hover transitions");
         for (int i = 0; i < 2; i = i + 1) {
             app.SetPartialFrames(i == 1);
             Click(app, Named(drawer, "theme-tab-" + Convert.ToString(i)));
@@ -215,13 +227,68 @@ class ThemeDrawerTestForm : Form {
             Control tab = Named(drawer, "theme-tab-" + Convert.ToString(i));
             int x = tab.bx + tab.bw / 2;
             int y = tab.by + tab.bh / 2;
+            int skipsBefore = app.hostLayoutSkipCount;
             app.ProcessOffscreenInput(1, x, y, 0, 0, 0, 0);
             Check(app.needsRedraw, "entering a drawer button queues its hover frame");
+            if (i == 1) {
+                Check(app.Damage.partialPending && !app.Damage.partialBlocked
+                && app.Damage.dmgW > 0 && app.Damage.dmgH > 0
+                && app.Damage.dmgW < app.canvas.Width(),
+                "entering a drawer button in PartialFrames queues bounded partial damage instead of full repaint");
+            }
             this.CaptureSnapshot();
+            Check(app.hostLayoutSkipCount > skipsBefore,
+            "paint-phase background Form layout is skipped during steady ThemeDrawer hover");
+            if (i == 1) {
+                int culledBefore = app.culledControlPaints;
+                app.Damage.partialFrame = true;
+                app.Damage.presentX = tab.bx;
+                app.Damage.presentY = tab.by;
+                app.Damage.presentW = tab.bw;
+                app.Damage.presentH = tab.bh;
+                app.overlayHost.RenderAll(app);
+                app.Damage.partialFrame = false;
+                Check(app.culledControlPaints > culledBefore,
+                "partial-frame overlay render culls non-intersecting drawer controls");
+            }
             app.ProcessOffscreenInput(1, x + 1, y, 0, 0, 0, 0);
             Check(!app.needsRedraw, "moving on the same drawer button keeps its hover frame");
             app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
             Check(app.needsRedraw, "leaving a drawer button queues its hover frame");
+            if (i == 1) {
+                Check(app.Damage.partialPending && !app.Damage.partialBlocked,
+                "leaving a drawer button in PartialFrames queues partial damage");
+                this.CaptureSnapshot();
+                Control close = Named(drawer, "theme-drawer-close");
+                app.ProcessOffscreenInput(1, close.bx + close.bw / 2, close.by + close.bh / 2, 0, 0, 0, 0);
+                Check(app.needsRedraw && !app.Damage.partialPending,
+                "hovering a tooltip-bearing drawer button keeps full-frame damage so tooltip is not clipped");
+                this.CaptureSnapshot();
+                app.ProcessOffscreenInput(1, 0, 0, 0, 0, 0, 0);
+                this.CaptureSnapshot();
+            }
+            if (i == 0) {
+                Control preview = Named(drawer, "theme-skin-preview-0");
+                Control rail = preview.ChildAt(0);
+                Control accent = preview.ChildAt(2);
+                app.ProcessOffscreenInput(1, rail.bx + rail.bw / 2, rail.by + rail.bh / 2, 0, 0, 0, 0);
+                Check(app.needsRedraw, "entering a skin card queues its hover frame");
+                this.CaptureSnapshot();
+                app.ProcessOffscreenInput(1, accent.bx + accent.bw / 2, accent.by + accent.bh / 2, 0, 0, 0, 0);
+                Check(!app.needsRedraw,
+                "moving between sub-controls of the same skin card does not queue redundant redraws");
+                Control skin0 = Named(drawer, "theme-skin-0");
+                Control skin1 = Named(drawer, "theme-skin-1");
+                Control accentsGrid = Named(drawer, "theme-accents-grid");
+                int gapX = (skin0.bx + skin0.bw + skin1.bx) / 2;
+                int gapY = skin0.by + skin0.bh / 2;
+                app.ProcessOffscreenInput(1, gapX, gapY, 0, 0, 0, 0);
+                Check(app.needsRedraw, "leaving a skin card onto grid gap clears its hover frame");
+                this.CaptureSnapshot();
+                app.ProcessOffscreenInput(1, accentsGrid.bx + 4, accentsGrid.by - 4, 0, 0, 0, 0);
+                Check(!app.needsRedraw,
+                "moving across non-interactive drawer panels and labels does not queue redundant redraws");
+            }
         }
         app.SetPartialFrames(false);
     }
@@ -356,8 +423,13 @@ class ThemeDrawerTestForm : Form {
         int cyber = app.SkinIndexOf("cyber");
         int frosted = app.SkinIndexOf("frosted");
         int brutal = app.SkinIndexOf("brutal");
-        Check(sakura >= 0 && cyber >= 0 && frosted >= 0 && brutal >= 0,
-        "new feminine, anime, frosted glass and brutalist skins are available");
+        int liquid = app.SkinIndexOf("liquid");
+        int obsidian = app.SkinIndexOf("obsidian");
+        int aurora = app.SkinIndexOf("aurora");
+        int clay = app.SkinIndexOf("clay");
+        Check(sakura >= 0 && cyber >= 0 && frosted >= 0 && brutal >= 0
+            && liquid >= 0 && obsidian >= 0 && aurora >= 0 && clay >= 0,
+        "all modern material skins including liquid glass, obsidian, aurora and clay are available");
         Click(app, Named(drawer, "theme-tab-0"));
         DrawerGeometry(app, drawer);
         DrawerPixels(app, drawer, graphite);
@@ -381,6 +453,22 @@ class ThemeDrawerTestForm : Form {
         Check(app.SkinName() == "brutal" && app.theme.brutal == 1 && app.theme.borderWidth == 2,
         "brutal skin activates hard-shadow brutal tokens");
         DrawerPixels(app, drawer, brutal);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(liquid), false);
+        Check(app.SkinName() == "liquid" && app.theme.glass == 1 && app.theme.gradient == 1,
+        "liquid skin activates light liquid glass and prism gradient tokens");
+        DrawerSurfacePixels(app, drawer);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(obsidian), false);
+        Check(app.SkinName() == "obsidian" && app.theme.glass == 0 && app.theme.gradient == 0,
+        "obsidian skin applies via drawer grid");
+        DrawerSurfacePixels(app, drawer);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(aurora), false);
+        Check(app.SkinName() == "aurora" && app.theme.gradient == 1 && app.theme.glass == 0,
+        "aurora skin activates atmospheric gradient token");
+        DrawerSurfacePixels(app, drawer);
+        Setting(app, drawer, "theme-skin-" + Convert.ToString(clay), false);
+        Check(app.SkinName() == "clay" && app.theme.glass == 0 && app.theme.brutal == 0,
+        "clay skin applies via drawer grid");
+        DrawerSurfacePixels(app, drawer);
         Setting(app, drawer, "theme-skin-" + Convert.ToString(porcelain), false);
         Click(app, Named(drawer, "theme-tab-1"));
         DrawerSurfacePixels(app, drawer);
