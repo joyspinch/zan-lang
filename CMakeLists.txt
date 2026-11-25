@@ -6017,6 +6017,21 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_strongfor PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  # S23 / S24（docs/ZAN_STANDARD.md §5）：Gui.Testing.UiTest 脱窗 UI 测试——不起窗口、
+  # 不建 App，按类型名取 --embed 的标记建树绑定，操作/断言/语义树快照对账。
+  add_test(NAME conformance_gui_uitest_login
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/uitest_login_test.zan
+      "-DZANC_ARGS=--embed;tests/gui/uitest/LoginForm.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_uitest_login.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_uitest_login${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_uitest_login PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   add_test(NAME conformance_gui_designer_interaction
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
@@ -8780,7 +8795,7 @@ if(Python3_Interpreter_FOUND)
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}
       --work ${CMAKE_BINARY_DIR}/test-out/diag-fixits)
   set_tests_properties(diag_fixits_apply PROPERTIES TIMEOUT 600)
-  # S21（docs/ZAN_STANDARD.md §5）：-DZAN_UI_AUTOMATION 编译的 GUI 程序在
+  # S21（docs/ZAN_STANDARD.md §5）：启用了 UiDriver 的 GUI 程序（模板默认启用）在
   # ZAN_UI_DUMP=<文件> 下首帧后导出语义树（角色/名字/文本/值/勾选/enabled/区间）并退出。
   add_test(NAME gui_ui_dump_semantic_tree
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_ui_dump.py

@@ -89,3 +89,25 @@ GUI 的"标准库"就是本包 `packages/Zan.Gui`——`using X.Y;` 按路径按
      引用对应的 `Zan.Game.<类目>` 独立包（Arpg/Idle/Board/Match3 等）。
 2. **纯算法与专用工具就近放置**：
    - 二维码矩阵编码等仅为特定控件服务的算法，统一收敛在 `Gui.Widget`（如 `QrEncoder.zan`），避免在根目录平铺杂质。
+
+## 脱窗 UI 测试（`Gui.Testing.UiTest`，ZAN_STANDARD S23/S24）
+
+窗体（ViewModel）不起窗口、不建 App 就能测：`UiTest.Open(vm)` 按类型名取 `--embed`
+进来的同名标记（与 `Form.Show` 同一查找）建树、绑定到这个实例、按名接上处理器。
+
+```csharp
+LoginForm vm = new LoginForm();          // 声明式窗体 new 出来不建 App
+UiTest t = UiTest.Open(vm);              // 或 UiTest.OpenMarkup(vm, html)
+t.Type("UserName", "admin");             // 写入视图 → 回写模型
+t.Click("Login");                        // 触发 @click 处理器，再刷回视图
+t.Expect("Error").Hidden();              // Text/Value/Visible/Hidden/Enabled/Disabled/Checked
+t.MatchSnapshot("tests/gui/snapshots/login_ok.json");   // 语义树快照，首次录制
+```
+
+- 名字在用到时对照真实控件树校验：写错立刻抛 `UiTestException`，并给出最接近的名字
+  （"did you mean 'Login'?"）；禁用控件拒绝输入与点击。
+- 每次操作后做一次完整双向同步（一帧绑定泵做的事），断言看到的就是用户会看到的。
+- 快照与 `ZAN_UI_DUMP`（S21）同一格式；脱窗时没有布局，区间为 0，快照因此稳定。
+- 依赖 App 的服务（`GetApp()` 返回 null）在脱窗时不可用：处理器里重绘用
+  `RequestRedraw()`（无宿主时安全），不要直接 `GetApp().X`。
+

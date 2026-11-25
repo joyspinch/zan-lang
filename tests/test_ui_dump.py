@@ -1,6 +1,6 @@
 """S21（docs/ZAN_STANDARD.md §5）：语义树一次性导出（ZAN_UI_DUMP）的契约。
 
-夹具以 -DZAN_UI_AUTOMATION 编译（普通构建不带 UiDriver），ZAN_UI_DUMP=<文件> 运行：
+夹具在 OnLoad 里启用 UiDriver（与模板生成的应用相同），ZAN_UI_DUMP=<文件> 运行：
 首帧完整呈现后写出语义树并以 0 退出。逐项核对：角色（kind）、名字、文本、值、勾选态、
 按祖先链折算的 enabled（禁用按钮及其内部标签都为 0），以及非零的布局区间。"""
 import argparse
@@ -33,7 +33,7 @@ def main():
     exe = os.path.join(work, 'ui_dump_probe' + ('.exe' if os.name == 'nt' else ''))
     r = subprocess.run([os.path.realpath(a.zanc), 'UiDumpProbe.zan', '--embed', 'UiDumpProbe.html',
                         '--auto-stdlib', '--driver-dir', os.path.realpath(a.drivers),
-                        '--package-project', root, '-DZAN_UI_AUTOMATION', '-o', exe],
+                        '--package-project', root, '-o', exe],
                        cwd=fixture, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stdout + r.stderr
     tree_path = os.path.join(work, 'tree.json')

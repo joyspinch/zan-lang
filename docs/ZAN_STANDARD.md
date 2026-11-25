@@ -191,7 +191,7 @@ S11 + S12 预计覆盖 GUI 场景绝大部分泄漏来源（父子节点、事�
 - 与 GUI_REFACTOR 保留的「元数据驱动按名路径」兼容：设计器仍可按名操作，但编译期
   已验证名字存在。
 
-**S21 语义树为唯一事实来源。**（已落地：以 `-DZAN_UI_AUTOMATION` 编译的程序在
+**S21 语义树为唯一事实来源。**（已落地：启用了 UiDriver 的程序——模板默认启用——在
 `ZAN_UI_DUMP=<文件>` 下首帧后导出，字段见 docs/ZANC_CLI.md 环境变量表；`zan run` 子命令
 尚不存在，以环境变量代替。）每个控件暴露 role / name / state / bounds / enabled：
 
@@ -209,7 +209,9 @@ zan run app.zan --ui-dump json   # 输出当前窗口语义树快照
 
 复用现有预算类测试的基础设施。
 
-**S23 强类型 UI 测试 API**（由 S20 生成的类型驱动，替代字符串脚本）：
+**S23 强类型 UI 测试 API**（已落地为 `Gui.Testing.UiTest`，与 S24 同一套：S20 定为只做
+编译期检查、不生成类型化字段，所以按名操作、在用到时对照真实控件树校验，写错给
+"did you mean"；用法见 `packages/Zan.Gui/src/Gui/README.md`「脱窗 UI 测试」）（由 S20 生成的类型驱动，替代字符串脚本）：
 
 ```csharp
 var f = ui.Open<LoginForm>();
@@ -219,7 +221,8 @@ ui.Expect(f.Error).Hidden();
 ui.Snapshot("login_ok");   // 语义树快照为主（文本、可 diff），像素比对为辅
 ```
 
-**S24 模型可脱窗测试。** 绑定的 ViewModel 不依赖 `App` 即可实例化与断言，
+**S24 模型可脱窗测试。**（已落地：声明式窗体 `new X()` 不建 App；`UiTest.Open(vm)`
+脱窗建树绑定，处理器、双向绑定、可见性与启用态都能断言，钉 `conformance_gui_uitest_login`） 绑定的 ViewModel 不依赖 `App` 即可实例化与断言，
 窗体逻辑的大部分测试不需要起窗口。
 
 ---

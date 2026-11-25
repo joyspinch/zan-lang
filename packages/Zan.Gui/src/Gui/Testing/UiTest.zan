@@ -1,0 +1,280 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Testing;
+
+// S23 / S24（docs/ZAN_STANDARD.md §5）：脱窗 UI 测试。
+//
+// 窗体（ViewModel）不起窗口、不建 App：按窗体类型名取同名标记（与 Form.Show 同一
+// 查找 HtmlDocs.Find），建树、绑定到这个实例、按名接上处理器，之后像用户一样操作：
+//
+//   UiTest t = UiTest.Open(new LoginForm());
+//   t.Type("UserName", "admin");
+//   t.Click("Login");
+//   t.Expect("Error").Hidden();
+//   t.MatchSnapshot("tests/gui/snapshots/login_ok.json");
+//
+// 名字在用到时对照真实控件树校验：写错立刻失败并给出最接近的名字（"did you mean"），
+// 而不是静默什么也不做。每次操作后做一次完整的双向同步（视图 → 模型 → 视图），
+// 与一帧里绑定泵做的事相同。失败抛 UiTestException，消息说明期望与实际。
+public class UiTestException : Exception {
+    public UiTestException(string message) : base(message) { }
+}
+
+public class UiTest {
+    object vm;
+    Control root;
+    ModelBinder binder;
+
+    UiTest(object vm, Control root, ModelBinder binder) {
+        this.vm = vm;
+        this.root = root;
+        this.binder = binder;
+    }
+
+    // 按窗体类型名找同名标记（--embed 进来的 <类型名>.html）。
+    public static UiTest Open(object vm) {
+        if (vm == null) { throw new UiTestException("UiTest.Open: view model is null"); }
+        string name = vm.GetType().Name;
+        string html = HtmlDocs.Find(name);
+        if (html == null) {
+            throw new UiTestException("UiTest.Open: no markup named '" + name
+                + ".html' (embed it with --embed " + name + ".html, or use OpenMarkup)");
+        }
+        return UiTest.OpenMarkup(vm, html);
+    }
+
+    // 直接给标记文本（测试内联标记时用）。
+    public static UiTest OpenMarkup(object vm, string html) {
+        Html.Install();
+        HtmlDoc doc = Html.Parse(html, "", null);
+        Control tree = doc.root;
+        ModelBinder b = new ModelBinder();
+        b.SetRoot(tree, vm);
+        DocWire.AutoWire(tree, vm, b);
+        b.Wire();
+        b.SyncFromModel();
+        return new UiTest(vm, tree, b);
+    }
+
+    public Control Root() { return this.root; }
+    public object ViewModel() { return this.vm; }
+
+    // ---- 查找：名字写错立刻失败，并建议最接近的名字 ----
+
+    public Control Get(string name) {
+        Control c = this.root.Find(name);
+        if (c != null) { return c; }
+        List<string> names = new List<string>();
+        UiTest.CollectNames(this.root, names);
+        string hint = UiTest.Nearest(name, names);
+        throw new UiTestException("UiTest: no control named '" + name + "'"
+            + (hint != "" ? " -- did you mean '" + hint + "'?" : ""));
+    }
+
+    public bool Has(string name) { return this.root.Find(name) != null; }
+
+    static void CollectNames(Control c, List<string> names) {
+        if (c.name != null && c.name != "" && !names.Contains(c.name)) { names.Add(c.name); }
+        for (int i = 0; i < c.ChildCount(); i = i + 1) { UiTest.CollectNames(c.ChildAt(i), names); }
+    }
+
+    // 编辑距离最近且唯一的名字（相邻换位算一次；≤4 字符最多差 1 处，更长最多 2 处）
+    static string Nearest(string typo, List<string> names) {
+        int cap = typo.Length <= 4 ? 1 : 2;
+        string best = "";
+        int bestD = cap + 1;
+        bool tie = false;
+        for (int i = 0; i < names.Count; i = i + 1) {
+            int d = UiTest.Distance(typo.ToLower(), names[i].ToLower());
+            if (d < bestD) { best = names[i]; bestD = d; tie = false; }
+            else if (d == bestD && best != names[i]) { tie = true; }
+        }
+        return (bestD <= cap && !tie) ? best : "";
+    }
+
+    static int Distance(string a, string b) {
+        int n = a.Length;
+        int m = b.Length;
+        if (n > 64 || m > 64) { return 99; }
+        int[] prev2 = new int[m + 1];
+        int[] prev = new int[m + 1];
+        int[] cur = new int[m + 1];
+        for (int j = 0; j <= m; j = j + 1) { prev[j] = j; }
+        for (int i = 1; i <= n; i = i + 1) {
+            cur[0] = i;
+            for (int j = 1; j <= m; j = j + 1) {
+                int cost = a.Substring(i - 1, 1) == b.Substring(j - 1, 1) ? 0 : 1;
+                int v = prev[j] + 1;
+                if (cur[j - 1] + 1 < v) { v = cur[j - 1] + 1; }
+                if (prev[j - 1] + cost < v) { v = prev[j - 1] + cost; }
+                if (i > 1 && j > 1 && a.Substring(i - 1, 1) == b.Substring(j - 2, 1)
+                    && a.Substring(i - 2, 1) == b.Substring(j - 1, 1) && prev2[j - 2] + 1 < v) {
+                    v = prev2[j - 2] + 1;
+                }
+                cur[j] = v;
+            }
+            int[] t = prev2;
+            prev2 = prev;
+            prev = cur;
+            cur = t;
+        }
+        return prev[m];
+    }
+
+    // ---- 操作：之后做一次完整同步 ----
+
+    // 视图改动写回模型，处理器改的模型再刷回视图（一帧绑定泵做的事）
+    public UiTest Sync() {
+        this.binder.SyncChangedValues();
+        this.binder.SyncFromModel();
+        return this;
+    }
+
+    public UiTest Type(string name, string text) {
+        Control c = this.Get(name);
+        UiTest.RequireEnabled(c, name, "type into");
+        c.SetProp("value", text);
+        return this.Sync();
+    }
+
+    public UiTest Click(string name) {
+        return this.Raise(name, "Click");
+    }
+
+    public UiTest Check(string name, bool on) {
+        Control c = this.Get(name);
+        UiTest.RequireEnabled(c, name, "check");
+        c.SetProp("checked", on ? "true" : "false");
+        return this.Sync();
+    }
+
+    // 按事件名触发（Click / Change / Submit 等，与标记里 @事件 同名）
+    public UiTest Raise(string name, string evt) {
+        Control c = this.Get(name);
+        UiTest.RequireEnabled(c, name, evt == "Click" ? "click" : "raise " + evt + " on");
+        UiEvent e = c.EventOf(evt, false);
+        if (e == null) {
+            throw new UiTestException("UiTest: '" + name + "' (" + c.Kind() + ") has no "
+                + evt + " handler bound");
+        }
+        e.Raise(c);
+        return this.Sync();
+    }
+
+    static bool EnabledOf(Control c) {
+        for (Control a = c; a != null; a = a.parent) {
+            string d = a.GetProp("disabled");
+            if (d == "1" || d == "true") { return false; }
+        }
+        return true;
+    }
+
+    static void RequireEnabled(Control c, string name, string verb) {
+        if (!UiTest.EnabledOf(c)) {
+            throw new UiTestException("UiTest: cannot " + verb + " '" + name + "': it is disabled");
+        }
+    }
+
+    // ---- 读取 ----
+
+    public string Text(string name) { return this.Get(name).GetProp("text"); }
+    public string Value(string name) { return this.Get(name).GetProp("value"); }
+
+    public bool Visible(string name) {
+        for (Control a = this.Get(name); a != null; a = a.parent) {
+            string v = a.GetProp("visible");
+            if (v == "0" || v == "false") { return false; }
+        }
+        return true;
+    }
+
+    public bool Enabled(string name) { return UiTest.EnabledOf(this.Get(name)); }
+
+    public UiExpect Expect(string name) { return new UiExpect(this, name); }
+
+    // ---- 语义树快照（与 S21 的 ZAN_UI_DUMP 同一格式；脱窗时没有布局，区间为 0） ----
+
+    public string Snapshot() {
+        return Json.Serialize<ControlNode>(UiDriver.SemanticNode(this.root));
+    }
+
+    // 与快照文件对账：文件不存在时写入并通过（首次录制）；不一致时把实际写到
+    // <路径>.actual 并失败，便于 diff。
+    public UiTest MatchSnapshot(string path) {
+        string actual = this.Snapshot();
+        if (!File.Exists(path)) {
+            File.WriteAllText(path, actual);
+            return this;
+        }
+        string expected = File.ReadAllText(path).Replace("\r", "").Trim();
+        if (expected != actual.Trim()) {
+            File.WriteAllText(path + ".actual", actual);
+            throw new UiTestException("UiTest: snapshot differs from " + path
+                + " (actual written to " + path + ".actual)");
+        }
+        return this;
+    }
+}
+
+// t.Expect("Error").Hidden()：链式断言，失败抛 UiTestException
+public class UiExpect {
+    UiTest t;
+    string name;
+
+    public UiExpect(UiTest t, string name) {
+        this.t = t;
+        this.name = name;
+        t.Get(name);   // 名字在这里就校验
+    }
+
+    void Fail(string what, string actual) {
+        throw new UiTestException("UiTest: expected '" + this.name + "' " + what
+            + ", but " + actual);
+    }
+
+    public UiExpect Text(string want) {
+        string got = this.t.Text(this.name);
+        if (got != want) { this.Fail("text '" + want + "'", "it is '" + got + "'"); }
+        return this;
+    }
+
+    public UiExpect Value(string want) {
+        string got = this.t.Value(this.name);
+        if (got != want) { this.Fail("value '" + want + "'", "it is '" + got + "'"); }
+        return this;
+    }
+
+    public UiExpect Visible() {
+        if (!this.t.Visible(this.name)) { this.Fail("visible", "it is hidden"); }
+        return this;
+    }
+
+    public UiExpect Hidden() {
+        if (this.t.Visible(this.name)) { this.Fail("hidden", "it is visible"); }
+        return this;
+    }
+
+    public UiExpect Enabled() {
+        if (!this.t.Enabled(this.name)) { this.Fail("enabled", "it is disabled"); }
+        return this;
+    }
+
+    public UiExpect Disabled() {
+        if (this.t.Enabled(this.name)) { this.Fail("disabled", "it is enabled"); }
+        return this;
+    }
+
+    public UiExpect Checked(bool want) {
+        string got = this.t.Get(this.name).GetProp("checked");
+        bool on = got == "1" || got == "true";
+        if (on != want) {
+            this.Fail(want ? "checked" : "unchecked", "it is " + (on ? "checked" : "unchecked"));
+        }
+        return this;
+    }
+}
