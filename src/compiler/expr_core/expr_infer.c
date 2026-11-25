@@ -128,6 +128,11 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
         return NULL;
     }
+    case AST_IS_EXPR:
+        /* `o is T` 是 bool（checker 同口径）：缺这一支时推断落到默认，
+         * Console.WriteLine(o is T) 按整数打印 1/0，而存进 bool 变量
+         * 再打印是 true/false——同一个值两种输出。 */
+        return g->binder->type_bool;
     case AST_THIS_EXPR:
         return g->current_type_sym ? g->current_type_sym->type : NULL;
     case AST_BASE_EXPR:

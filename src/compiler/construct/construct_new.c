@@ -186,10 +186,22 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                     continue;
                 }
-                /* 普通字段/属性写入：通过合成访问器 */
+                /* 普通字段/属性写入：作用在**已求值**的工厂返回对象上。
+                 * 以前接收者写成 call_init 本身——每个成员写都把工厂调用
+                 * 再求值一次，写进新造的对象后丢弃（标量成员全丢，工厂
+                 * 副作用重复）。经隐藏局部引用 obj，与集合分支同法。 */
+                LLVMTypeRef obj_lt = LLVMTypeOf(obj);
+                LLVMValueRef oslot = emit_entry_alloca(g, obj_lt, "finit.obj");
+                zan_store_fit(g, obj, oslot);
+                static const char finit_name[] = "\x01finit.obj";
+                zan_istr_t oname = { (char *)finit_name, (uint32_t)(sizeof(finit_name) - 1) };
+                local_add(locals, oname, oslot, otype);
+                zan_ast_node_t *orecv = zan_ast_new(g->arena, AST_IDENTIFIER,
+                                                    arg->loc);
+                orecv->ident.name = oname;
                 zan_ast_node_t *mref = zan_ast_new(g->arena,
                     AST_MEMBER_ACCESS, arg->loc);
-                mref->member.object = expr->new_expr.call_init;
+                mref->member.object = orecv;
                 mref->member.name = mname;
                 mref->member.null_cond = 0;
                 zan_ast_node_t *setn = zan_ast_new(g->arena,
@@ -198,6 +210,14 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                 setn->binary.left = mref;
                 setn->binary.right = arg->binary.right;
                 emit_expr(g, setn, locals);
+                for (int lv = locals->count - 1; lv >= 0; lv--) {
+                    if (locals->vars[lv].name.str == oname.str) {
+                        for (int sh = lv; sh < locals->count - 1; sh++)
+                            locals->vars[sh] = locals->vars[sh + 1];
+                        locals->count--;
+                        break;
+                    }
+                }
             }
             return obj;
         }

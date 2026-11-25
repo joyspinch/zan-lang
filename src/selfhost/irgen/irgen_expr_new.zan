@@ -515,7 +515,10 @@ partial class Irgen {
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
         // a struct-typed field points at a nested instance: allocate it
         InitNestedFields(obj, cls);
-        if (IsPolyClass(cls)) {
+        // a struct has NO vtable slot (FieldBase: value types keep slot 0
+        // for their first field) -- an interface-implementing struct used
+        // to get the vtable pointer written over its first field
+        if (IsPolyClass(cls) && cls.kind != AK.StructDecl()) {
             List<string> vslots = new List<string>();
             CollectVSlots(cls, vslots);
             // B-ID218: an instantiation whose virtual bodies mention the type
@@ -668,76 +671,103 @@ partial class Irgen {
             }
         }
         // object initializer: store each `Field = value` into the instance
-        if (e.ival == 2) {
-            int j = 0;
-            while (j < e.kids.Count) {
-                Node it = e.kids[j];
-                if (it.kind == AK.Assignment() && it.a != null
-                && it.a.kind == AK.Ident()) {
-                    if (it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
-                    && it.b.type == null) {
-                        ExprVal collObj = null;
-                        if (FindMethodUp(cls, "get_" + it.a.sval) != null) {
-                            collObj = EmitInstanceCall(new ExprVal(obj, ty), cn, "get_" + it.a.sval, new Node(AK.Call()));
-                        } else {
-                            collObj = LoadField(obj, ty, it.a.sval);
-                        }
-                        if (collObj != null && collObj.ty != null) {
-                            Node ccls = ClassOf(collObj.ty);
-                            int k = 0;
-                            while (k < it.b.kids.Count) {
-                                if (IsListType(collObj.ty)) {
-                                    ExprVal itemVal = GenExpr(it.b.kids[k]);
-                                    string sv = StructElemSlot(itemVal, ListElem(collObj.ty));
-                                    L("  call void @zlist_add(i8* " + collObj.op + ", i64 " + sv + ")");
-                                } else if (IsDictType(collObj.ty)) {
-                                    Node pair = it.b.kids[k];
-                                    if (pair.kids.Count >= 2) {
-                                        ExprVal key = GenExpr(pair.kids[0]);
-                                        ExprVal val = GenExpr(pair.kids[1]);
-                                        string sv = StructElemSlot(val, DictVal(collObj.ty));
-                                        L("  call void @zdict_set(i8* " + collObj.op + ", i8* " + DictKeyOp(key, collObj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(collObj.ty) + ")");
-                                    } else if (k + 1 < it.b.kids.Count) {
-                                        ExprVal key = GenExpr(it.b.kids[k]);
-                                        ExprVal val = GenExpr(it.b.kids[k + 1]);
-                                        string sv = StructElemSlot(val, DictVal(collObj.ty));
-                                        L("  call void @zdict_set(i8* " + collObj.op + ", i8* " + DictKeyOp(key, collObj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(collObj.ty) + ")");
-                                        k = k + 1;
-                                    }
-                                } else if (ccls != null && FindMethodUp(ccls, "Add") != null) {
-                                    Node callN = new Node(AK.Call());
-                                    callN.Add(it.b.kids[k]);
-                                    EmitInstanceCall(collObj, collObj.ty.sval, "Add", callN);
-                                }
-                                k = k + 1;
-                            }
-                        }
-                        j = j + 1;
-                        continue;
-                    }
-                    // A Binding-typed field takes a fresh Binding object, not
-                    // the raw value (the C host's emit_binding_value): the
-                    // initializer's value replaces the one the constructor put
-                    // into the slot.
-                    Node fty0 = FieldType(cls, it.a.sval);
-                    ExprVal fv = null;
-                    if (fty0 != null && IsBindingTy(fty0)) {
-                        fv = GenBindingValue(it.b, fty0);
-                    }
-                    if (fv == null) { fv = GenExpr(it.b); }
-                    // A property in the initializer goes through its setter:
-                    // `new A { Mixed = 50 }` calls `set_Mixed(50)`. Storing it
-                    // as a field wrote into a field slot that does not exist
-                    // (index -1 -> invalid IR).
-                    if (EmitPropSet(obj, ty, it.a.sval, fv)) { j = j + 1; continue; }
-                    StoreField(obj, cn, it.a.sval, fv);
-                }
-                j = j + 1;
-            }
-        }
+        if (e.ival == 2) { ApplyObjInit(e, obj, ty, cls, cn); }
         // preserve generic type arguments (ty may carry <...>) for the result
         AddTemp(obj, ty);
         return new ExprVal(obj, ty);
+    }
+
+    // The `{ Field = value, Coll = { items } }` items of an initializer,
+    // applied to the object `obj` (type `ty`, class `cls` named `cn`) --
+    // shared by `new T { ... }` and the factory continuation
+    // `T.Make() { ... }` (CallInit).
+    void ApplyObjInit(Node e, string obj, Node ty, Node cls, string cn) {
+        int j = 0;
+        while (j < e.kids.Count) {
+            Node it = e.kids[j];
+            if (it.kind == AK.Assignment() && it.a != null
+            && it.a.kind == AK.Ident()) {
+                if (it.b != null && it.b.kind == AK.NewExpr() && it.b.ival == 2
+                && it.b.type == null) {
+                    ExprVal collObj = null;
+                    if (FindMethodUp(cls, "get_" + it.a.sval) != null) {
+                        collObj = EmitInstanceCall(new ExprVal(obj, ty), cn, "get_" + it.a.sval, new Node(AK.Call()));
+                    } else {
+                        collObj = LoadField(obj, ty, it.a.sval);
+                    }
+                    if (collObj != null && collObj.ty != null) {
+                        Node ccls = ClassOf(collObj.ty);
+                        int k = 0;
+                        while (k < it.b.kids.Count) {
+                            if (IsListType(collObj.ty)) {
+                                ExprVal itemVal = GenExpr(it.b.kids[k]);
+                                string sv = StructElemSlot(itemVal, ListElem(collObj.ty));
+                                L("  call void @zlist_add(i8* " + collObj.op + ", i64 " + sv + ")");
+                            } else if (IsDictType(collObj.ty)) {
+                                Node pair = it.b.kids[k];
+                                if (pair.kids.Count >= 2) {
+                                    ExprVal key = GenExpr(pair.kids[0]);
+                                    ExprVal val = GenExpr(pair.kids[1]);
+                                    string sv = StructElemSlot(val, DictVal(collObj.ty));
+                                    L("  call void @zdict_set(i8* " + collObj.op + ", i8* " + DictKeyOp(key, collObj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(collObj.ty) + ")");
+                                } else if (k + 1 < it.b.kids.Count) {
+                                    ExprVal key = GenExpr(it.b.kids[k]);
+                                    ExprVal val = GenExpr(it.b.kids[k + 1]);
+                                    string sv = StructElemSlot(val, DictVal(collObj.ty));
+                                    L("  call void @zdict_set(i8* " + collObj.op + ", i8* " + DictKeyOp(key, collObj.ty) + ", i64 " + sv + ", i64 " + DictKeyStrFlag(collObj.ty) + ")");
+                                    k = k + 1;
+                                }
+                            } else if (ccls != null && FindMethodUp(ccls, "Add") != null) {
+                                Node callN = new Node(AK.Call());
+                                callN.Add(it.b.kids[k]);
+                                EmitInstanceCall(collObj, collObj.ty.sval, "Add", callN);
+                            }
+                            k = k + 1;
+                        }
+                    }
+                    j = j + 1;
+                    continue;
+                }
+                // A Binding-typed field takes a fresh Binding object, not
+                // the raw value (the C host's emit_binding_value): the
+                // initializer's value replaces the one the constructor put
+                // into the slot.
+                Node fty0 = FieldType(cls, it.a.sval);
+                ExprVal fv = null;
+                if (fty0 != null && IsBindingTy(fty0)) {
+                    fv = GenBindingValue(it.b, fty0);
+                }
+                if (fv == null) { fv = GenExpr(it.b); }
+                // A property in the initializer goes through its setter:
+                // `new A { Mixed = 50 }` calls `set_Mixed(50)`. Storing it
+                // as a field wrote into a field slot that does not exist
+                // (index -1 -> invalid IR).
+                if (EmitPropSet(obj, ty, it.a.sval, fv)) { j = j + 1; continue; }
+                StoreField(obj, cn, it.a.sval, fv);
+            }
+            j = j + 1;
+        }
+    }
+
+    // `Factory() { Field = v, Coll = { ... } }`: the call's result receives
+    // the initializer (the host's construct_new factory path) -- every item
+    // acts on the ONE evaluated object.
+    ExprVal GenCallInit(Node e) {
+        ExprVal r = GenExpr(e.a);
+        Node cls = ClassOf(r.ty);
+        if (cls == null || r.ty == null) {
+            diags.Error("[E3022] object initializer can only continue a call that returns a class instance", e.line, e.col);
+            return r;
+        }
+        string cn = cls.sval;
+        // a fresh alias of the object: the call result is a statement temp,
+        // and a receiver that IS a temp is handed over (and released) by the
+        // member calls the items make -- `new T { }` registers its object
+        // only after the items, so it never meets this
+        string obj = NT();
+        L("  " + obj + " = bitcast " + MapType(r.ty) + " " + r.op + " to %" + cn + "*");
+        ApplyObjInit(e, obj, r.ty, cls, cn);
+        return r;
     }
 
     int CtorParamCount(Node ctor) {
