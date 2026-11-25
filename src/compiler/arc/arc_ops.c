@@ -554,8 +554,10 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
    * Dict 的内联快路径不经过 emit_arg_typed，在此统一收口。箱 fresh
    * owned（rhs 节点进 boxed 集合），元素槽捕获协议不再 retain。 */
   value = emit_implicit_box(g, elem_type, value, rhs, locals);
+  bool slot_has_rc =
+      !elem_type || type_contains_collection_rc(g, elem_type, 0);
   LLVMValueRef old = NULL;
-  if (overwrite_old) {
+  if (overwrite_old && slot_has_rc) {
     if (elem_kind == LLVMStructTypeKind) {
       old = load_struct_from_slot(g, slot_ptr, elem_llvm);
     } else {
@@ -627,7 +629,7 @@ void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     }
     zan_tbaa_tag_elem(g, LLVMBuildStore(g->builder, stored, slot_ptr));
   }
-  if (overwrite_old) {
+  if (overwrite_old && slot_has_rc) {
     LLVMValueRef old_value = old;
     if (elem_kind == LLVMPointerTypeKind &&
         LLVMGetTypeKind(LLVMTypeOf(old)) == LLVMIntegerTypeKind)
@@ -640,8 +642,11 @@ void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
   if (!value_type || !out_ptr || !value)
     return;
   LLVMTypeRef value_llvm = map_type(g, value_type);
-  LLVMValueRef old = LLVMBuildLoad2(g->builder, value_llvm, out_ptr, "out.old");
-  emit_collection_value_retain(g, value_type, value, 0);
+  bool has_rc = type_contains_collection_rc(g, value_type, 0);
+  LLVMValueRef old = has_rc
+      ? LLVMBuildLoad2(g->builder, value_llvm, out_ptr, "out.old") : NULL;
+  if (has_rc)
+    emit_collection_value_retain(g, value_type, value, 0);
   LLVMValueRef stored = value;
   if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMPointerTypeKind &&
       LLVMGetTypeKind(value_llvm) == LLVMPointerTypeKind &&
@@ -658,7 +663,8 @@ void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
            LLVMGetTypeKind(value_llvm) == LLVMDoubleTypeKind)
     stored = LLVMBuildFPExt(g->builder, stored, value_llvm, "out.fpext");
   LLVMBuildStore(g->builder, stored, out_ptr);
-  emit_collection_value_release(g, value_type, old, 0);
+  if (has_rc)
+    emit_collection_value_release(g, value_type, old, 0);
 }
 void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
                                       LLVMValueRef raw, LLVMTypeRef slot_ty) {

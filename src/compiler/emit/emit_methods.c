@@ -273,7 +273,6 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         int saved_eh_lb = g->eh_armed_loop_base;
         int saved_lpad_depth = g->lpad_depth;
         LLVMBasicBlockRef fn_cleanup_bb = NULL;
-        LLVMValueRef fn_tmp_mark = NULL;
         if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
             fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "fn.lpad");
             g->lpad_stack[g->lpad_depth].fn = fn;
@@ -291,10 +290,9 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
                 if (local_needs_cleanup(&locals->vars[pi]))
                     lpad_register_local(g, &locals->vars[pi]);
             }
-            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-            fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
-            zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
-            init_fn_lpad(g, &g->lpad_stack[saved_lpad_depth], locals, fn_tmp_mark);
+            /* 延迟到 finish_fn_lpad：仅当函数确有 landing pad 变体时才在入口
+             * 分配 fn.tmp.mark 并读 EH tmp_top，免去纯函数/无 invoke 函数的 TLS 入口开销。 */
+            init_fn_lpad(g, &g->lpad_stack[saved_lpad_depth], locals, NULL);
         }
         g->throw_locals_base = 0;
         g->catch_cleanup_count = 0;
@@ -1168,7 +1166,6 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     int saved_eh_lb = g->eh_armed_loop_base;
     int saved_lpad_depth = g->lpad_depth;
     LLVMBasicBlockRef fn_cleanup_bb = NULL;
-    LLVMValueRef fn_tmp_mark = NULL;
     if (!g->current_async_frame && g->lpad_depth < ZAN_MAX_ARMED_TRY) {
         fn_cleanup_bb = LLVMAppendBasicBlockInContext(g->ctx, sp.fn, "fn.lpad");
         g->lpad_stack[g->lpad_depth].fn = sp.fn;
@@ -1186,10 +1183,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
             if (local_needs_cleanup(&locals->vars[pi]))
                 lpad_register_local(g, &locals->vars[pi]);
         }
-        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-        fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
-        zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t, get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
-        init_fn_lpad(g, &g->lpad_stack[saved_lpad_depth], locals, fn_tmp_mark);
+        init_fn_lpad(g, &g->lpad_stack[saved_lpad_depth], locals, NULL);
     }
     g->throw_locals_base = 0;
     g->catch_cleanup_count = 0;

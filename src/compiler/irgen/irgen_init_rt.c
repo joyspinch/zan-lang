@@ -282,22 +282,145 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
   LLVMTypeRef reld_type =
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
   g->rt_release_dyn = LLVMAddFunction(g->mod, "zan_rt_release_dyn", reld_type);
+  {
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    if (nw) {
+      LLVMAttributeRef nwa = LLVMCreateEnumAttribute(g->ctx, nw, 0);
+      LLVMAddAttributeAtIndex(g->rt_retain, LLVMAttributeFunctionIndex, nwa);
+      LLVMAddAttributeAtIndex(g->rt_release, LLVMAttributeFunctionIndex, nwa);
+      LLVMAddAttributeAtIndex(g->rt_release_dyn, LLVMAttributeFunctionIndex, nwa);
+    }
+  }
+  /* 无锁快慢分裂（desc_hdr 且非调试守卫模式）：rc > 1 的非原始数组对象在
+   * zan_rt_release_dyn 内联快路径用强 cmpxchg 原子减 1 即返回，免去 desc/dtor
+   * 间接加载、跨函数调用与 TLS 延迟队列开销；仅 rc == 1 / 竞态失败 / 原始数组
+   * 落入冷 noinline zan_rt_release_dyn_slow。 */
+  int use_dyn_split = (g->desc_hdr && !g->arc_guard && !arc_trace_ev);
+  LLVMValueRef rel_body_fn = g->rt_release_dyn;
+  if (use_dyn_split) {
+    rel_body_fn =
+        LLVMAddFunction(g->mod, "zan_rt_release_dyn_slow", reld_type);
+    LLVMSetLinkage(rel_body_fn, LLVMInternalLinkage);
+    unsigned ck = LLVMGetEnumAttributeKindForName("cold", 4);
+    unsigned nk = LLVMGetEnumAttributeKindForName("noinline", 8);
+    unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+    unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+    if (ck)
+      LLVMAddAttributeAtIndex(rel_body_fn, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, ck, 0));
+    if (nk)
+      LLVMAddAttributeAtIndex(rel_body_fn, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nk, 0));
+    if (nw)
+      LLVMAddAttributeAtIndex(rel_body_fn, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, nw, 0));
+    if (ih)
+      LLVMAddAttributeAtIndex(g->rt_release_dyn, LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(g->ctx, ih, 0));
+
+    LLVMBasicBlockRef f_ent =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
+    LLVMBasicBlockRef f_cnt =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "cont");
+    LLVMBasicBlockRef f_chk =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "chk");
+    LLVMBasicBlockRef f_dec =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fast.dec");
+    LLVMBasicBlockRef f_slw =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "slow");
+    LLVMBasicBlockRef f_ret =
+        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
+
+    LLVMPositionBuilderAtEnd(g->builder, f_ent);
+    LLVMValueRef f_obj = LLVMGetParam(g->rt_release_dyn, 0);
+    LLVMBuildCondBr(
+        g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, f_obj, LLVMConstNull(i8ptr), "isnull"),
+        f_ret, f_cnt);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_cnt);
+    LLVMValueRef f_n16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
+    LLVMValueRef f_rcp = LLVMBuildBitCast(
+        g->builder,
+        LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), f_obj, &f_n16,
+                      1, "rcp"),
+        LLVMPointerType(i64, 0), "rcip");
+    LLVMValueRef f_rc = LLVMBuildLoad2(g->builder, i64, f_rcp, "rc");
+    LLVMSetOrdering(f_rc, LLVMAtomicOrderingMonotonic);
+    LLVMSetAlignment(f_rc, 8);
+    LLVMBuildCondBr(
+        g->builder,
+        zan_icmp(g->builder, LLVMIntEQ, f_rc,
+                 LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "issent"),
+        f_ret, f_chk);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_chk);
+    LLVMValueRef f_n8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
+    LLVMValueRef f_hdr = LLVMBuildLoad2(
+        g->builder, i64,
+        LLVMBuildBitCast(
+            g->builder,
+            LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), f_obj,
+                          &f_n8, 1, "hp"),
+            LLVMPointerType(i64, 0), "hip"),
+        "hdr");
+    LLVMValueRef f_desc =
+        zan_and(g->builder, f_hdr, LLVMConstInt(i64, ~ZAN_OBJ_STACK_FLAG, 0),
+                "desc");
+    LLVMValueRef f_is_am =
+        zan_icmp(g->builder, LLVMIntEQ, f_desc,
+                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.am");
+    LLVMValueRef f_dm1 =
+        zan_sub(g->builder, f_desc, LLVMConstInt(i64, 1, 0), "dm1");
+    LLVMValueRef f_is_rk =
+        zan_icmp(g->builder, LLVMIntULT, f_dm1,
+                 LLVMConstInt(i64, 4095, 0), "is.rk");
+    LLVMValueRef f_not_arr = LLVMBuildNot(
+        g->builder, zan_or(g->builder, f_is_am, f_is_rk, "is.arr"), "not.arr");
+    LLVMValueRef f_shared =
+        zan_icmp(g->builder, LLVMIntSGT, f_rc, LLVMConstInt(i64, 1, 0),
+                 "shared");
+    LLVMValueRef br_fast = LLVMBuildCondBr(
+        g->builder, zan_and(g->builder, f_not_arr, f_shared, "can.fast"), f_dec,
+        f_slw);
+    zan_set_branch_weights(g, br_fast, 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_dec);
+    LLVMValueRef f_rc1 =
+        zan_sub(g->builder, f_rc, LLVMConstInt(i64, 1, 0), "rc1");
+    LLVMValueRef f_cx = LLVMBuildAtomicCmpXchg(
+        g->builder, f_rcp, f_rc, f_rc1, LLVMAtomicOrderingRelease,
+        LLVMAtomicOrderingMonotonic, 0);
+    LLVMSetAlignment(f_cx, 8);
+    LLVMValueRef f_ok = LLVMBuildExtractValue(g->builder, f_cx, 1, "cx.ok");
+    LLVMValueRef br_ok = LLVMBuildCondBr(g->builder, f_ok, f_ret, f_slw);
+    zan_set_branch_weights(g, br_ok, 2000, 1);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_slw);
+    LLVMValueRef sc =
+        zan_call2(g->builder, reld_type, rel_body_fn, &f_obj, 1, "");
+    LLVMSetTailCall(sc, 1);
+    LLVMBuildBr(g->builder, f_ret);
+
+    LLVMPositionBuilderAtEnd(g->builder, f_ret);
+    LLVMBuildRetVoid(g->builder);
+  }
   LLVMBasicBlockRef bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "entry");
   LLVMPositionBuilderAtEnd(g->builder, bb);
-  LLVMValueRef obj = LLVMGetParam(g->rt_release_dyn, 0);
+  LLVMValueRef obj = LLVMGetParam(rel_body_fn, 0);
   LLVMValueRef is_null =
       zan_icmp(g->builder, LLVMIntEQ, obj, LLVMConstNull(i8ptr), "isnull");
   LLVMBasicBlockRef cont =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "cont");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "cont");
   LLVMBasicBlockRef lookup =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "lookup");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "lookup");
   LLVMBasicBlockRef calld =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "calld");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "calld");
   LLVMBasicBlockRef fb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "fallback");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "fallback");
   LLVMBasicBlockRef ret_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "ret");
   LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
   LLVMPositionBuilderAtEnd(g->builder, cont);
   LLVMValueRef sent16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
@@ -311,7 +434,7 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
   LLVMSetOrdering(sent_rc, LLVMAtomicOrderingMonotonic);
   LLVMSetAlignment(sent_rc, 8);
   LLVMBasicBlockRef literal =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "islit");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "islit");
   LLVMBuildCondBr(g->builder,
                   zan_icmp(g->builder, LLVMIntEQ, sent_rc,
                            LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0),
@@ -326,9 +449,9 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
   LLVMValueRef raw_hdr = LLVMBuildLoad2(g->builder, i64, siptr, "hdr.raw");
   LLVMValueRef is_str_hdr = zan_hdr_is_string(g, raw_hdr, "is.str");
   LLVMBasicBlockRef rel_str_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "relstr");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "relstr");
   LLVMBasicBlockRef non_str_bb =
-      LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "nonstr");
+      LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "nonstr");
   LLVMBuildCondBr(g->builder, is_str_hdr, rel_str_bb, non_str_bb);
   LLVMPositionBuilderAtEnd(g->builder, rel_str_bb);
   zan_call2(g->builder,
@@ -383,9 +506,9 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     LLVMValueRef is_raw_arr =
         zan_or(g->builder, is_arr_magic, is_rank, "is.rawarr");
     LLVMBasicBlockRef rel_arr_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "relarr");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "relarr");
     LLVMBasicBlockRef not_raw =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "notraw");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "notraw");
     LLVMBuildCondBr(g->builder, is_raw_arr, rel_arr_bb, not_raw);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_arr_bb);
@@ -412,16 +535,11 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
       LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
   LLVMValueRef dfn =
       LLVMBuildBitCast(g->builder, dpp, LLVMPointerType(dfnty, 0), "dfn");
-  /* 快路径：入口读到的计数 > 1 时这次释放只是减一，不会析构——直接调
-   * 类释放函数（它自己做原子减），跳过下面的线程局部深度记账与延迟队列
-   * 询问。Mac 上每次 TLS 访问都是一次 _tlv_get_addr 调用：集合析构逐元素
-   * release_dyn，特化后的 List<类> 拆除里它占采样的近一成。与并发释放赛跑
-   * 到 0 的罕见情形照常析构，只是这一层不计深度（深度只防极深级联）。 */
   if (!g->target_is_wasm) {
     LLVMBasicBlockRef fast_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "rel.fast");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "rel.fast");
     LLVMBasicBlockRef slow_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "rel.slow");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "rel.slow");
     LLVMBuildCondBr(g->builder,
                     zan_icmp(g->builder, LLVMIntSGT, sent_rc,
                              LLVMConstInt(i64, 1, 0), "rel.shared"),
@@ -457,9 +575,6 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
           LLVMAddFunction(g->mod, "__zan_arc_defer_drain", drain_ty);
     }
     enum { ZAN_ARC_DEFER_DEPTH = 100 };
-    /* 线程局部地址只算一次：macOS 每次 TLS 访问都是一次 _tlv_get_addr
-     * 调用，读/加/读回减三次访问夹着一次 dtor 调用，后端不会跨调用
-     * 复用地址。release_dyn 不挂起、不换线程，同一指针全程有效。 */
     LLVMValueRef depth_p = g->arc_defer_depth;
     if (LLVMIsThreadLocal(g->arc_defer_depth)) {
       unsigned tla = LLVMLookupIntrinsicID("llvm.threadlocal.address",
@@ -471,17 +586,13 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     }
     LLVMValueRef dcur = LLVMBuildLoad2(g->builder, i32t, depth_p, "adepth");
     LLVMBasicBlockRef defer_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adefer");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "adefer");
     LLVMBasicBlockRef sync_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "async2");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "async2");
     LLVMBasicBlockRef drain_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "adrain");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "adrain");
     LLVMBasicBlockRef tail_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "atail");
-    /* Escape analysis treats release_dyn as non-escaping. A promoted
-     * object's storage belongs to its caller's frame, so even at the
-     * depth limit its destructor must finish before this call returns.
-     * Reuse raw_hdr already loaded from siptr above instead of reloading. */
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "atail");
     LLVMValueRef is_heap = zan_icmp(
         g->builder, LLVMIntEQ,
         zan_and(g->builder, raw_hdr,
@@ -493,14 +604,10 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     LLVMBuildCondBr(g->builder,
                     zan_and(g->builder, is_deep, is_heap, "adefer.allowed"),
                     defer_bb, sync_bb);
-    /* 超阈值的堆对象：挂队列立即返回，不同步下钻 */
     LLVMPositionBuilderAtEnd(g->builder, defer_bb);
     zan_call2(g->builder, LLVMGlobalGetValueType(g->rt_defer_push),
               g->rt_defer_push, (LLVMValueRef[]){dpp, obj}, 2, "");
     LLVMBuildBr(g->builder, ret_bb);
-    /* 同步路径：深度 +1 → 调类释放 → 读回实际值 -1（嵌套内层
-     * 会在本层 call 期间涨落，入口快照不可复用）→ 归零且有
-     * 欠账则排空 */
     LLVMPositionBuilderAtEnd(g->builder, sync_bb);
     LLVMBuildStore(g->builder,
                    zan_add(g->builder, dcur, LLVMConstInt(i32t, 1, 0), "aup"),
@@ -512,11 +619,8 @@ g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
     LLVMBuildStore(g->builder, ddown, depth_p);
     LLVMValueRef dzero = zan_icmp(g->builder, LLVMIntEQ, ddown,
                                   LLVMConstInt(i32t, 0, 0), "azero");
-    /* 只在回到最外层（深度归零）时才问队列：曾每次释放都无条件调
-     * zan_rt_defer_pending（运行时里一把互斥锁），对象密集代码每个
-     * 对象白付一次加解锁。 */
     LLVMBasicBlockRef pchk_bb =
-        LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "apchk");
+        LLVMAppendBasicBlockInContext(g->ctx, rel_body_fn, "apchk");
     LLVMBuildCondBr(g->builder, dzero, pchk_bb, tail_bb);
     LLVMPositionBuilderAtEnd(g->builder, pchk_bb);
     LLVMValueRef pend =

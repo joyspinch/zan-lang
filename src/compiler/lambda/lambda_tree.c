@@ -557,11 +557,7 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         .lpad_bb = LLVMAppendBasicBlockInContext(g->ctx, lambda_fn, "fn.lpad"),
         .fin_idx = -1
     };
-    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
-    LLVMValueRef fn_tmp_mark = emit_entry_alloca(g, i32t, "fn.tmp.mark");
-    zan_store_fit(g, LLVMBuildLoad2(g->builder, i32t,
-        get_eh_tmp_top_global(g), "fn.tmp.top0"), fn_tmp_mark);
-    init_fn_lpad(g, lambda_lpad, &lambda_locals, fn_tmp_mark);
+    init_fn_lpad(g, lambda_lpad, &lambda_locals, NULL);
 
     /* 捕获变量排布于闭包首部，进入函数体时从环境记录中重载为局部变量 */
     if (is_closure) {

@@ -991,6 +991,29 @@ void finish_fn_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
   LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef lp_type =
       LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i8ptr, i32t}, 2, 0);
+  if (state->variants && !state->tmp_mark) {
+    /* 惰性生成函数入口 fn.tmp.mark：在 entry 首条指令前插 alloca，再借首个
+     * variant 块调 get_eh_tmp_top_global 把 eh.st + eh.tmptopp 置入 entry 首部
+     * 紧随 alloca 之后、任何 push 之前，最后紧跟 eh.tmptopp 插 load+store。 */
+    g->current_fn = entry->fn;
+    LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(entry->fn);
+    LLVMValueRef first_i = LLVMGetFirstInstruction(entry_bb);
+    if (first_i)
+      LLVMPositionBuilderBefore(g->builder, first_i);
+    else
+      LLVMPositionBuilderAtEnd(g->builder, entry_bb);
+    state->tmp_mark = LLVMBuildAlloca(g->builder, i32t, "fn.tmp.mark");
+    LLVMPositionBuilderAtEnd(g->builder, state->variants->landing.lpad_bb);
+    LLVMValueRef top_p = get_eh_tmp_top_global(g);
+    LLVMValueRef after_top = LLVMGetNextInstruction(top_p);
+    if (after_top)
+      LLVMPositionBuilderBefore(g->builder, after_top);
+    else
+      LLVMPositionBuilderAtEnd(g->builder, LLVMGetInstructionParent(top_p));
+    LLVMValueRef top0 =
+        LLVMBuildLoad2(g->builder, i32t, top_p, "fn.tmp.top0");
+    zan_store_fit(g, top0, state->tmp_mark);
+  }
   for (fn_cleanup_variant_t *v = state->variants; v; v = v->next) {
     LLVMPositionBuilderAtEnd(g->builder, v->landing.lpad_bb);
     LLVMValueRef lp = NULL;

@@ -589,6 +589,403 @@ static bool try_cross_block_arc(LLVMBasicBlockRef b0, LLVMValueRef retain_inst,
   return true;
 }
 
+/* 只读借用游标循环 ARC 消除（Wave 8C）：
+ * 识别纯只读遍历循环（例如 while (cur != null) { ...; cur = cur.Next; }）：
+ *   pre:   retain(seed); [if (seed == null) goto exit;] goto H;
+ *   H:     P = phi [seed, pre], [next, latch]
+ *          ... 无堆写、无逃逸、无异对象释放的纯读体 ...
+ *   latch: next = load(gep(P, ...)); retain(next); release(P);
+ *          br (next == null), exit, H
+ * 数学不变式：循环内不修改任何堆字段也不释放任何外部对象，seed 所可达对象图在
+ * 整个循环期间恒存活且 rc >= 1；每次迭代 +1(next) - 1(cur) 望远镜相消，总净
+ * 引用计数增量为 0。安全擦除 retain(seed)、retain(next)、release(P) 及匹配早退 release。 */
+static bool arc_val_derived_from_load_of(LLVMValueRef v, LLVMValueRef root,
+                                         LLVMBasicBlockRef *loop_bbs,
+                                         int loop_cnt, int depth) {
+  if (!v || depth > 8)
+    return false;
+  v = strip_pointer_casts(v);
+  if (v == root)
+    return true;
+  if (!LLVMIsAInstruction(v))
+    return false;
+  LLVMOpcode op = LLVMGetInstructionOpcode(v);
+  if (op == LLVMGetElementPtr)
+    return arc_val_derived_from_load_of(LLVMGetOperand(v, 0), root, loop_bbs,
+                                        loop_cnt, depth + 1);
+  if (op == LLVMLoad) {
+    if (find_bb_in_list(loop_bbs, loop_cnt, LLVMGetInstructionParent(v)) < 0)
+      return false;
+    return arc_val_derived_from_load_of(LLVMGetOperand(v, 0), root, loop_bbs,
+                                        loop_cnt, depth + 1);
+  }
+  if (op == LLVMSelect) {
+    if (find_bb_in_list(loop_bbs, loop_cnt, LLVMGetInstructionParent(v)) < 0)
+      return false;
+    LLVMValueRef t = LLVMGetOperand(v, 1);
+    LLVMValueRef f = LLVMGetOperand(v, 2);
+    bool tok = LLVMIsAConstantPointerNull(t) ||
+               arc_val_derived_from_load_of(t, root, loop_bbs, loop_cnt,
+                                            depth + 1);
+    bool fok = LLVMIsAConstantPointerNull(f) ||
+               arc_val_derived_from_load_of(f, root, loop_bbs, loop_cnt,
+                                            depth + 1);
+    return tok && fok;
+  }
+  return false;
+}
+
+static bool arc_edge_proves_null(LLVMValueRef br, LLVMBasicBlockRef target_bb,
+                                 LLVMValueRef ptr_val) {
+  if (!br || LLVMGetInstructionOpcode(br) != LLVMBr || !LLVMIsConditional(br))
+    return false;
+  LLVMValueRef cond = LLVMGetCondition(br);
+  if (!cond || !LLVMIsAICmpInst(cond))
+    return false;
+  LLVMIntPredicate pred = LLVMGetICmpPredicate(cond);
+  LLVMValueRef a = LLVMGetOperand(cond, 0);
+  LLVMValueRef b = LLVMGetOperand(cond, 1);
+  bool matches = (a == ptr_val && LLVMIsAConstantPointerNull(b)) ||
+                 (b == ptr_val && LLVMIsAConstantPointerNull(a));
+  if (!matches)
+    return false;
+  LLVMBasicBlockRef tbb = LLVMGetSuccessor(br, 0);
+  LLVMBasicBlockRef fbb = LLVMGetSuccessor(br, 1);
+  if (pred == LLVMIntEQ && target_bb == tbb && tbb != fbb)
+    return true;
+  if (pred == LLVMIntNE && target_bb == fbb && tbb != fbb)
+    return true;
+  return false;
+}
+
+static bool arc_loop_inst_is_pure_read(LLVMValueRef inst, LLVMValueRef phi_val,
+                                       LLVMValueRef next_val) {
+  LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+  if (LLVMIsATerminatorInst(inst))
+    return op == LLVMBr;
+  if (op == LLVMPHI || op == LLVMGetElementPtr || op == LLVMBitCast ||
+      op == LLVMICmp || op == LLVMFCmp || op == LLVMSelect || op == LLVMZExt ||
+      op == LLVMSExt || op == LLVMTrunc || op == LLVMFPTrunc ||
+      op == LLVMFPExt || op == LLVMUIToFP || op == LLVMSIToFP ||
+      op == LLVMFPToUI || op == LLVMFPToSI || op == LLVMAdd || op == LLVMSub ||
+      op == LLVMMul || op == LLVMUDiv || op == LLVMSDiv || op == LLVMURem ||
+      op == LLVMSRem || op == LLVMShl || op == LLVMLShr || op == LLVMAShr ||
+      op == LLVMAnd || op == LLVMOr || op == LLVMXor || op == LLVMFAdd ||
+      op == LLVMFSub || op == LLVMFMul || op == LLVMFDiv || op == LLVMFRem ||
+      op == LLVMFNeg || op == LLVMFreeze || op == LLVMExtractValue)
+    return true;
+  if (op == LLVMLoad) {
+    return !LLVMGetVolatile(inst) &&
+           LLVMGetOrdering(inst) == LLVMAtomicOrderingNotAtomic;
+  }
+  if (op == LLVMCall) {
+    LLVMValueRef callee = LLVMGetCalledValue(inst);
+    const char *cn = callee ? LLVMGetValueName(callee) : NULL;
+    if (!cn || !is_safe_pure_function(cn))
+      return false;
+    int nargs = (int)LLVMGetNumArgOperands(inst);
+    for (int i = 0; i < nargs; i++) {
+      LLVMValueRef a = strip_pointer_casts(LLVMGetArgOperand(inst, (unsigned)i));
+      if (a == phi_val || a == next_val)
+        return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+static bool arc_value_used_outside_loop(LLVMValueRef val,
+                                        LLVMBasicBlockRef *loop_bbs,
+                                        int loop_cnt,
+                                        LLVMValueRef *allowed_ext,
+                                        int n_allowed_ext) {
+  for (LLVMUseRef u = LLVMGetFirstUse(val); u; u = LLVMGetNextUse(u)) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (!LLVMIsAInstruction(user))
+      return true;
+    if (find_bb_in_list(loop_bbs, loop_cnt, LLVMGetInstructionParent(user)) >= 0)
+      continue;
+    bool ok = false;
+    for (int i = 0; i < n_allowed_ext; i++) {
+      if (allowed_ext[i] == user) {
+        ok = true;
+        break;
+      }
+    }
+    if (!ok)
+      return true;
+  }
+  return false;
+}
+
+static bool try_elide_loop_borrow_cursor(LLVMValueRef fn, LLVMBasicBlockRef H,
+                                         LLVMValueRef phi,
+                                         zan_arc_opt_stats_t *stats) {
+  if (!phi || !LLVMIsAPHINode(phi))
+    return false;
+  if (LLVMGetTypeKind(LLVMTypeOf(phi)) != LLVMPointerTypeKind)
+    return false;
+  if (LLVMCountIncoming(phi) != 2)
+    return false;
+
+  LLVMBasicBlockRef inc_bb[2] = {LLVMGetIncomingBlock(phi, 0),
+                                 LLVMGetIncomingBlock(phi, 1)};
+  LLVMValueRef inc_val[2] = {LLVMGetIncomingValue(phi, 0),
+                             LLVMGetIncomingValue(phi, 1)};
+  if (inc_bb[0] == inc_bb[1])
+    return false;
+
+  /* 尝试两种 (pre_bb, latch_bb) 角色指派 */
+  enum { MAX_LOOP_BBS = 16, MAX_EXIT_RELS = 8 };
+  for (int back_idx = 0; back_idx < 2; back_idx++) {
+    int pre_idx = 1 - back_idx;
+    LLVMBasicBlockRef pre_bb = inc_bb[pre_idx];
+    LLVMBasicBlockRef latch_bb = inc_bb[back_idx];
+    LLVMValueRef seed = inc_val[pre_idx];
+    LLVMValueRef next_val = inc_val[back_idx];
+    if (pre_bb == H || !seed || !next_val || LLVMIsAConstantPointerNull(next_val))
+      continue;
+
+    /* 收集自然循环块：从 latch_bb 沿前驱反搜到 H */
+    LLVMBasicBlockRef loop_bbs[MAX_LOOP_BBS];
+    int loop_cnt = 0;
+    loop_bbs[loop_cnt++] = H;
+    if (latch_bb != H)
+      loop_bbs[loop_cnt++] = latch_bb;
+
+    bool valid_loop = true;
+    LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(fn);
+    if (latch_bb != H) {
+      int qi = 1;
+      while (qi < loop_cnt && valid_loop) {
+        LLVMBasicBlockRef cur = loop_bbs[qi++];
+        if (cur == entry_bb) {
+          valid_loop = false;
+          break;
+        }
+        /* 扫描函数所有块找 cur 的前驱（块数很少，循环规模受限） */
+        int n_preds = 0;
+        for (LLVMBasicBlockRef b = LLVMGetFirstBasicBlock(fn); b;
+             b = LLVMGetNextBasicBlock(b)) {
+          LLVMValueRef t = LLVMGetBasicBlockTerminator(b);
+          if (!t)
+            continue;
+          unsigned ns = LLVMGetNumSuccessors(t);
+          bool is_pred = false;
+          for (unsigned s = 0; s < ns; s++) {
+            if (LLVMGetSuccessor(t, s) == cur) {
+              is_pred = true;
+              break;
+            }
+          }
+          if (!is_pred)
+            continue;
+          n_preds++;
+          if (b == pre_bb) {
+            valid_loop = false;
+            break;
+          }
+          if (find_bb_in_list(loop_bbs, loop_cnt, b) < 0) {
+            if (loop_cnt >= MAX_LOOP_BBS) {
+              valid_loop = false;
+              break;
+            }
+            loop_bbs[loop_cnt++] = b;
+          }
+        }
+        if (n_preds == 0)
+          valid_loop = false;
+      }
+    }
+    if (!valid_loop)
+      continue;
+
+    /* 验证 H 的前驱只有 pre_bb 和 latch_bb，且 pre_bb 不在循环内 */
+    if (find_bb_in_list(loop_bbs, loop_cnt, pre_bb) >= 0)
+      continue;
+    int h_preds = 0;
+    for (LLVMBasicBlockRef b = LLVMGetFirstBasicBlock(fn); b;
+         b = LLVMGetNextBasicBlock(b)) {
+      LLVMValueRef t = LLVMGetBasicBlockTerminator(b);
+      if (!t)
+        continue;
+      unsigned ns = LLVMGetNumSuccessors(t);
+      for (unsigned s = 0; s < ns; s++) {
+        if (LLVMGetSuccessor(t, s) == H) {
+          if (b != pre_bb && b != latch_bb)
+            valid_loop = false;
+          h_preds++;
+        }
+      }
+    }
+    if (!valid_loop || h_preds != 2)
+      continue;
+
+    /* 验证 next_val 是从 phi 派生的循环内 load（保证由 seed 对象图保活） */
+    if (!LLVMIsAInstruction(next_val) ||
+        find_bb_in_list(loop_bbs, loop_cnt,
+                        LLVMGetInstructionParent(next_val)) < 0 ||
+        !arc_val_derived_from_load_of(next_val, phi, loop_bbs, loop_cnt, 0))
+      continue;
+
+    /* 在 pre_bb 中反向寻找匹配的 retain(seed) */
+    LLVMValueRef pre_term = LLVMGetBasicBlockTerminator(pre_bb);
+    if (!pre_term || LLVMGetInstructionOpcode(pre_term) != LLVMBr)
+      continue;
+    if (LLVMIsConditional(pre_term)) {
+      LLVMBasicBlockRef other =
+          (LLVMGetSuccessor(pre_term, 0) == H) ? LLVMGetSuccessor(pre_term, 1)
+                                               : LLVMGetSuccessor(pre_term, 0);
+      if (!arc_edge_proves_null(pre_term, other, seed))
+        continue;
+    }
+    LLVMValueRef retain_seed = NULL;
+    zan_arc_call_kind_t retain_kind = ARC_NONE;
+    int pre_steps = 0;
+    for (LLVMValueRef c = LLVMGetPreviousInstruction(pre_term);
+         c && pre_steps < 32; c = LLVMGetPreviousInstruction(c), pre_steps++) {
+      zan_arc_call_kind_t k = get_arc_call_kind(c);
+      if (k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) {
+        if (are_same_arc_object(get_arc_operand(c), seed)) {
+          retain_seed = c;
+          retain_kind = k;
+          break;
+        }
+        continue;
+      }
+      if (k != ARC_NONE)
+        break;
+      if (!arc_loop_inst_is_pure_read(c, phi, next_val))
+        break;
+    }
+    if (!retain_seed)
+      continue;
+    zan_arc_call_kind_t want_rel_kind =
+        (retain_kind == ARC_RETAIN_OBJ) ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
+
+    /* 扫描整个循环：要求唯一一对 (retain_next, release_cur) 位于 latch_bb，
+     * 其余所有指令均满足纯只读不变量（无 store、无外部调用、无其他 ARC 调用）。 */
+    LLVMValueRef retain_next = NULL;
+    LLVMValueRef release_cur = NULL;
+    bool body_ok = true;
+    for (int bi = 0; bi < loop_cnt && body_ok; bi++) {
+      for (LLVMValueRef c = LLVMGetFirstInstruction(loop_bbs[bi]); c;
+           c = LLVMGetNextInstruction(c)) {
+        zan_arc_call_kind_t k = get_arc_call_kind(c);
+        if (k != ARC_NONE) {
+          if (loop_bbs[bi] != latch_bb) {
+            body_ok = false;
+            break;
+          }
+          LLVMValueRef op = get_arc_operand(c);
+          if (k == retain_kind && !retain_next &&
+              are_same_arc_object(op, next_val)) {
+            retain_next = c;
+            continue;
+          }
+          if (k == want_rel_kind && !release_cur &&
+              are_same_arc_object(op, phi)) {
+            release_cur = c;
+            continue;
+          }
+          body_ok = false;
+          break;
+        }
+        if (!arc_loop_inst_is_pure_read(c, phi, next_val)) {
+          body_ok = false;
+          break;
+        }
+      }
+    }
+    if (!body_ok || !retain_next || !release_cur)
+      continue;
+
+    /* 检查每一条离环边：
+     * - latch_bb 离环边（已执行 retain_next + release_cur）：必须证 next_val == null
+     * - 非 latch_bb 离环边（尚未执行 retain_next/release_cur）：目标块须独占前驱且
+     *   在任何副作用前执行 release(phi) */
+    LLVMValueRef exit_rels[MAX_EXIT_RELS];
+    int n_exit_rels = 0;
+    bool exits_ok = true;
+    for (int bi = 0; bi < loop_cnt && exits_ok; bi++) {
+      LLVMBasicBlockRef b = loop_bbs[bi];
+      LLVMValueRef term = LLVMGetBasicBlockTerminator(b);
+      if (!term || LLVMGetInstructionOpcode(term) != LLVMBr) {
+        exits_ok = false;
+        break;
+      }
+      unsigned ns = LLVMGetNumSuccessors(term);
+      for (unsigned s = 0; s < ns; s++) {
+        LLVMBasicBlockRef succ = LLVMGetSuccessor(term, s);
+        if (find_bb_in_list(loop_bbs, loop_cnt, succ) >= 0)
+          continue;
+        if (b == latch_bb) {
+          if (!arc_edge_proves_null(term, succ, next_val)) {
+            exits_ok = false;
+            break;
+          }
+        } else {
+          /* 早退块：确认 succ 唯一前驱是 b，并寻找匹配的 release(phi) */
+          int succ_preds = 0;
+          for (LLVMBasicBlockRef pb = LLVMGetFirstBasicBlock(fn); pb;
+               pb = LLVMGetNextBasicBlock(pb)) {
+            LLVMValueRef pt = LLVMGetBasicBlockTerminator(pb);
+            if (!pt)
+              continue;
+            unsigned pns = LLVMGetNumSuccessors(pt);
+            for (unsigned ps = 0; ps < pns; ps++) {
+              if (LLVMGetSuccessor(pt, ps) == succ)
+                succ_preds++;
+            }
+          }
+          if (succ_preds != 1) {
+            exits_ok = false;
+            break;
+          }
+          LLVMValueRef erel = NULL;
+          int esteps = 0;
+          for (LLVMValueRef ec = LLVMGetFirstInstruction(succ);
+               ec && esteps < 32; ec = LLVMGetNextInstruction(ec), esteps++) {
+            if (LLVMIsAPHINode(ec))
+              continue;
+            zan_arc_call_kind_t ek = get_arc_call_kind(ec);
+            if (ek == want_rel_kind &&
+                are_same_arc_object(get_arc_operand(ec), phi)) {
+              erel = ec;
+              break;
+            }
+            if (ek != ARC_NONE || !arc_loop_inst_is_pure_read(ec, phi, next_val))
+              break;
+          }
+          if (!erel || n_exit_rels >= MAX_EXIT_RELS) {
+            exits_ok = false;
+            break;
+          }
+          exit_rels[n_exit_rels++] = erel;
+        }
+      }
+    }
+    if (!exits_ok)
+      continue;
+
+    /* 验证 phi 与 next_val 不向循环外逃逸（允许的环外使用仅限 exit_rels） */
+    if (arc_value_used_outside_loop(phi, loop_bbs, loop_cnt, exit_rels,
+                                    n_exit_rels) ||
+        arc_value_used_outside_loop(next_val, loop_bbs, loop_cnt, NULL, 0))
+      continue;
+
+    /* 全部不变式得证：安全擦除循环借用游标的全部 ARC 流量 */
+    LLVMInstructionEraseFromParent(retain_seed);
+    LLVMInstructionEraseFromParent(retain_next);
+    LLVMInstructionEraseFromParent(release_cur);
+    for (int ei = 0; ei < n_exit_rels; ei++)
+      LLVMInstructionEraseFromParent(exit_rels[ei]);
+    stats->pairs_elided += 2 + n_exit_rels;
+    return true;
+  }
+  return false;
+}
+
 static zan_arc_opt_stats_t zan_opt_arc_mod(LLVMModuleRef mod,
                                            zan_opt_level_t level) {
   zan_arc_opt_stats_t stats = {0, 0, 0};
@@ -609,6 +1006,13 @@ static zan_arc_opt_stats_t zan_opt_arc_mod(LLVMModuleRef mod,
       fn_pass++;
       LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
       while (bb) {
+        LLVMValueRef p = LLVMGetFirstInstruction(bb);
+        while (p && LLVMIsAPHINode(p)) {
+          LLVMValueRef pnext = LLVMGetNextInstruction(p);
+          if (try_elide_loop_borrow_cursor(fn, bb, p, &stats))
+            fn_changed = true;
+          p = pnext;
+        }
         LLVMValueRef inst = LLVMGetFirstInstruction(bb);
         while (inst) {
           LLVMValueRef next = LLVMGetNextInstruction(inst);
@@ -1226,7 +1630,7 @@ static zan_dce_stats_t zan_opt_dce_mod(LLVMModuleRef mod) {
     }
     bool changed = true;
     int pass = 0;
-    while (changed && pass < 4) {
+    while (changed && pass < 8) {
       changed = false;
       pass++;
       LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
@@ -1236,11 +1640,22 @@ static zan_dce_stats_t zan_opt_dce_mod(LLVMModuleRef mod) {
           LLVMValueRef next = LLVMGetNextInstruction(inst);
           unsigned opcode = LLVMGetInstructionOpcode(inst);
 
-          if (opcode == LLVMAlloca || opcode == LLVMAdd || opcode == LLVMSub ||
+          bool dead_eh_call = false;
+          if (opcode == LLVMCall && !LLVMGetFirstUse(inst)) {
+            LLVMValueRef callee = LLVMGetCalledValue(inst);
+            const char *cn = callee ? LLVMGetValueName(callee) : NULL;
+            if (cn && strcmp(cn, "__zan_eh_state_fast") == 0)
+              dead_eh_call = true;
+          }
+          bool dead_plain_load =
+              (opcode == LLVMLoad && !LLVMGetVolatile(inst) &&
+               LLVMGetOrdering(inst) == LLVMAtomicOrderingNotAtomic);
+          if (dead_eh_call || dead_plain_load ||
+              opcode == LLVMAlloca || opcode == LLVMAdd || opcode == LLVMSub ||
               opcode == LLVMMul || opcode == LLVMBitCast ||
               opcode == LLVMAddrSpaceCast || opcode == LLVMZExt ||
               opcode == LLVMSExt || opcode == LLVMTrunc ||
-              opcode == LLVMICmp) {
+              opcode == LLVMICmp || opcode == LLVMGetElementPtr) {
             if (!LLVMGetFirstUse(inst)) {
               LLVMInstructionEraseFromParent(inst);
               stats.dead_stores++;
@@ -1827,6 +2242,21 @@ static void shrink_collapse_invoke(LLVMBuilderRef b, LLVMValueRef inv) {
   LLVMBuildBr(b, norm);
 }
 
+static bool shrink_is_arc_release_fn(const char *name) {
+  if (!name)
+    return false;
+  return strcmp(name, "zan_rt_release_dyn") == 0 ||
+         strcmp(name, "zan_rt_release_dyn_slow") == 0 ||
+         strcmp(name, "zan_rt_release") == 0 ||
+         strcmp(name, "zan_rt_retain") == 0 ||
+         strcmp(name, "zan_rt_str_release") == 0 ||
+         strcmp(name, "zan_rt_str_retain") == 0 ||
+         strcmp(name, "zan_rt_arr_release") == 0 ||
+         strcmp(name, "zan_rt_arr_retain") == 0 ||
+         strcmp(name, "__zan_arc_defer_drain") == 0 ||
+         strncmp(name, "__zan_release_", 14) == 0;
+}
+
 static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
   unsigned nfn = 0;
   for (LLVMValueRef f = LLVMGetFirstFunction(mod); f;
@@ -1864,6 +2294,10 @@ static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
     for (unsigned i = 0; i < nfn; i++) {
       LLVMValueRef f = fns[i];
       if (LLVMIsDeclaration(f))
+        continue;
+      /* 编译器生成的 ARC 释放器/延迟排空函数只释放字段与 free，绝不调用用户代码或抛异常；
+       * 其内部对描述符 dtor/闭包 dtor 的间接调用不构成 may_throw 种子。 */
+      if (shrink_is_arc_release_fn(LLVMGetValueName(f)))
         continue;
       for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
            bb = LLVMGetNextBasicBlock(bb)) {
@@ -2349,16 +2783,17 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
    * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
    * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
   static const char *const k_rt_defer_inline[] = {
-      "zan_rt_alloc",       "zan_rt_retain",     "zan_rt_release",
-      "zan_rt_release_dyn", "zan_rt_str_retain", "zan_rt_str_release",
+      "zan_rt_alloc",       "zan_rt_retain",      "zan_rt_release",
+      "zan_rt_release_dyn", "zan_rt_str_retain",  "zan_rt_str_release",
+      "__zan_eh_state_fast",
   };
-  bool marked_rt[6] = {false};
+  bool marked_rt[7] = {false};
   int marked_count = 0;
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   unsigned noinline_kind = LLVMGetEnumAttributeKindForName("noinline", 8);
   if (!custom_pipe && noinline_kind != 0 && level != ZAN_OPT_BASIC) {
     LLVMAttributeRef noinl_attr = LLVMCreateEnumAttribute(ctx, noinline_kind, 0);
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
       if (fn && !LLVMIsDeclaration(fn) &&
           !LLVMGetEnumAttributeAtIndex(
@@ -2386,7 +2821,7 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
   LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
   LLVMDisposePassBuilderOptions(opts);
   if (err) {
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
       if (!marked_rt[i])
         continue;
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
@@ -2401,9 +2836,14 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     return ZAN_ERROR;
   }
 
-  /* Post-inline Zan 优化 pass：主内联与 SROA 完成后再次消除栈逃逸、ARC 冗余、虚调用、常量与死代码 */
+  /* Post-inline Zan 优化 pass：先塌缩新暴露的 nothrow invoke，再消除栈逃逸、ARC 冗余、
+   * 虚调用、常量与死代码（含已失活的 __zan_eh_state_fast TLS 调用）。 */
   bool post_changed = false;
   if (!custom_pipe) {
+    if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
+      if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
+        post_changed = true;
+    }
     if (!zan_opt_knob_off(knobs->no_escape, "ZAN_NO_OPT_ESCAPE")) {
       zan_escape_stats_t es = zan_opt_escape_mod(mod);
       if (es.stack_promoted > 0)
@@ -2442,19 +2882,21 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
         report_out->dce.dead_stores += ds2.dead_stores;
     }
 
-    if (!zan_opt_knob_off(knobs->no_shrink, "ZAN_NO_UNWIND_SHRINK")) {
-      if (zan_shrink_collapse_invokes_impl(mod, false) > 0)
-        post_changed = true;
-    }
-
     bool rt_unmarked = false;
-    for (int i = 0; i < 6; i++) {
+    unsigned alwaysinl_kind =
+        LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+    for (int i = 0; i < 7; i++) {
       if (!marked_rt[i])
         continue;
       LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
       if (fn && !LLVMIsDeclaration(fn)) {
         LLVMRemoveEnumAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, noinline_kind);
+        if (i == 6 && alwaysinl_kind != 0) {
+          LLVMAddAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+              LLVMCreateEnumAttribute(ctx, alwaysinl_kind, 0));
+        }
         rt_unmarked = true;
       }
     }
@@ -2468,8 +2910,9 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
             "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),"
             "globaldce";
     } else if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {
-      if (post_changed)
+      if (rt_unmarked || post_changed)
         cleanup =
+            "always-inline,"
             "function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse),mergefunc,"
             "globaldce";
     } else if (post_changed) {

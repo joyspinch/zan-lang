@@ -271,9 +271,11 @@ static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
   LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
   LLVMBasicBlockRef entry =
       LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur));
-  LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
-  if (term && entry != cur)
-    LLVMPositionBuilderBefore(g->builder, term);
+  LLVMValueRef inst = LLVMGetFirstInstruction(entry);
+  while (inst && LLVMGetInstructionOpcode(inst) == LLVMAlloca)
+    inst = LLVMGetNextInstruction(inst);
+  if (inst)
+    LLVMPositionBuilderBefore(g->builder, inst);
   else
     LLVMPositionBuilderAtEnd(g->builder, entry);
   return cur;
@@ -505,7 +507,7 @@ static LLVMValueRef get_eh_state_fast_tsd_fn(zan_irgen_t *g) {
     LLVMValueRef key_gv = get_eh_tsd_key(g);
     LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_eh_state_fast", fnty);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
-    add_enum_attr(g, fn, NULL, "alwaysinline");
+    add_enum_attr(g, fn, NULL, "inlinehint");
     add_enum_attr(g, fn, NULL, "nounwind");
     add_ret_enum_attr(g, fn, "nonnull");
     LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
@@ -558,7 +560,7 @@ static LLVMValueRef get_eh_state_fast_fn(zan_irgen_t *g) {
   LLVMTypeRef fnty = LLVMFunctionType(i8ptr, NULL, 0, 0);
   fn = LLVMAddFunction(g->mod, "__zan_eh_state_fast", fnty);
   LLVMSetLinkage(fn, LLVMInternalLinkage);
-  add_enum_attr(g, fn, NULL, "alwaysinline");
+  add_enum_attr(g, fn, NULL, "inlinehint");
   add_enum_attr(g, fn, NULL, "nounwind");
   add_ret_enum_attr(g, fn, "nonnull");
   LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
@@ -589,7 +591,12 @@ static LLVMValueRef emit_eh_field_ptr(zan_irgen_t *g, unsigned field,
   LLVMValueRef st = emit_eh_state(g);
   if (g->eh_state_fields[field])
     return g->eh_state_fields[field];
-  LLVMBasicBlockRef cur = eh_enter_entry_block(g);
+  LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
+  LLVMValueRef after_st = LLVMGetNextInstruction(st);
+  if (after_st)
+    LLVMPositionBuilderBefore(g->builder, after_st);
+  else
+    LLVMPositionBuilderAtEnd(g->builder, LLVMGetInstructionParent(st));
   LLVMValueRef p =
       LLVMBuildStructGEP2(g->builder, get_eh_state_ty(g), st, field, name);
   LLVMPositionBuilderAtEnd(g->builder, cur);

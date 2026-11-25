@@ -46,9 +46,34 @@ static LLVMValueRef hdr_readable_fn(zan_irgen_t *g, LLVMTypeRef *out_ty) {
     LLVMDisposeBuilder(b);
     return fn;
 }
+static int zan_ptr_has_known_hdr(LLVMValueRef obj) {
+    if (!obj) return 0;
+    if (LLVMIsAConstantExpr(obj)) {
+        LLVMOpcode opc = LLVMGetConstOpcode(obj);
+        if (opc == LLVMGetElementPtr || opc == LLVMBitCast) {
+            LLVMValueRef base = LLVMGetOperand(obj, 0);
+            if (base && LLVMIsAGlobalVariable(base)) {
+                const char *gn = LLVMGetValueName(base);
+                if (gn && (strncmp(gn, "__zan.strlit.", 13) == 0 ||
+                           strcmp(gn, "__zan.ascii128") == 0))
+                    return 1;
+            }
+        }
+    }
+    if (LLVMIsACallInst(obj)) {
+        LLVMValueRef callee = LLVMGetCalledValue(obj);
+        const char *cn = callee ? LLVMGetValueName(callee) : NULL;
+        if (cn && (strcmp(cn, "zan_rt_str_alloc") == 0 ||
+                   strcmp(cn, "__zan_itoa_str") == 0))
+            return 1;
+    }
+    return 0;
+}
 static LLVMValueRef zan_hdr_page_ok(zan_irgen_t *g, LLVMValueRef obj,
                                     int64_t need) {
     if (LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) return NULL;
+    if (need <= 16 && zan_ptr_has_known_hdr(obj))
+        return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0);
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     if (!cur) return NULL;
     LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
