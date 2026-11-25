@@ -1,0 +1,569 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Animation;
+namespace Gui.Widget;
+
+public class SegmentedItem {
+    public string Label;
+    public string Icon;
+    public string Tip;
+    public bool Disabled;
+    public SegmentedItem(string label) {
+        this.Label = label != null ? label : "";
+        this.Icon = "";
+        this.Tip = "";
+        this.Disabled = false;
+    }
+    public SegmentedItem(string icon, string label) {
+        this.Icon = icon != null ? icon : "";
+        this.Label = label != null ? label : "";
+        this.Tip = "";
+        this.Disabled = false;
+    }
+}
+
+internal class SegmentedSpringRelay {
+    internal weak Segmented owner;
+    internal SegmentedSpringRelay(Segmented s) { this.owner = s; }
+    internal void OnLeft(float v) {
+        Segmented s = this.owner;
+        if (s != null) { s.ApplySpringEdge(true, v); }
+    }
+    internal void OnRight(float v) {
+        Segmented s = this.owner;
+        if (s != null) { s.ApplySpringEdge(false, v); }
+    }
+    internal void OnDoneLeft() {
+        Segmented s = this.owner;
+        if (s != null) { s.FinishSpringEdge(true); }
+    }
+    internal void OnDoneRight() {
+        Segmented s = this.owner;
+        if (s != null) { s.FinishSpringEdge(false); }
+    }
+}
+
+// 液态玻璃分段选中控件：当前项以半透明玻璃胶囊为底，切换时前后沿双弹簧错速追踪，
+// 胶囊在飞行中自然拉长、纵向微收再弹性回弹，中途点击可无缝打断续接。
+public class Segmented : Control {
+    public override Control CreateCloneShell() { return new Segmented(); }
+    public List<SegmentedItem> Items;
+    public Binding<int> SelectedIndex;
+    public Binding<string> Size;
+    public bool Glass;
+    public bool Block;
+
+    [Event(Alias = "Change")]
+    public UiEvent SelectionChanged;
+
+    private int hoverIndex = 0 - 1;
+    private int pressedIndex = 0 - 1;
+    private int[] slotX;
+    private int[] slotW;
+    private int lastSelected = 0 - 1;
+
+    private bool pillReady;
+    private float pillLeft;
+    private float pillRight;
+    private float targetLeft;
+    private float targetRight;
+    private SpringAnim leftSpring;
+    private SpringAnim rightSpring;
+
+    public Segmented() {
+        this.InitControl("segmented");
+        this.Items = new List<SegmentedItem>();
+        this.SelectedIndex = 0;
+        this.Size = "medium";
+        this.Glass = true;
+        this.Block = false;
+        this.SelectionChanged = new UiEvent();
+        this.wiresOwnEvents = true;
+        this.styleSurfaceOwned = true;
+        this.ClassName = "segmented glass";
+    }
+    public Segmented(string optionsSpec) : this() {
+        this.SetOptionsText(optionsSpec);
+    }
+
+    public Segmented Add(string label) {
+        this.Items.Add(new SegmentedItem(label));
+        this.RequestRedraw();
+        return this;
+    }
+    public Segmented Add(string icon, string label) {
+        this.Items.Add(new SegmentedItem(icon, label));
+        this.RequestRedraw();
+        return this;
+    }
+    public Segmented Add(SegmentedItem item) {
+        if (item != null) {
+            this.Items.Add(item);
+            this.RequestRedraw();
+        }
+        return this;
+    }
+    public void Clear() {
+        this.StopSprings();
+        this.Items.Clear();
+        this.SelectedIndex.Set(0);
+        this.pillReady = false;
+        this.lastSelected = 0 - 1;
+        this.RequestRedraw();
+    }
+    public int Count() { return this.Items.Count; }
+    public int Selected() { return this.SelectedIndex.Get(); }
+
+    public string OptionsText() {
+        string text = "";
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            if (i > 0) { text = text + "|"; }
+            text = text + this.Items[i].Label;
+        }
+        return text;
+    }
+    public void SetOptionsText(string spec) {
+        this.StopSprings();
+        this.Items.Clear();
+        this.pillReady = false;
+        this.lastSelected = 0 - 1;
+        if (spec != null && spec != "") {
+            List<string> parts = spec.Split("|");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                this.Items.Add(new SegmentedItem(parts[i]));
+            }
+        }
+        if (this.SelectedIndex.Get() >= this.Items.Count) { this.SelectedIndex.Set(0); }
+        this.RequestRedraw();
+    }
+
+    public void Select(int idx) {
+        if (idx < 0 || idx >= this.Items.Count) { return; }
+        if (this.Items[idx].Disabled) { return; }
+        int prev = this.SelectedIndex.Get();
+        if (prev == idx && this.lastSelected == idx) { return; }
+        this.SelectedIndex.Set(idx);
+        this.lastSelected = idx;
+        this.AnimatePillTo(idx);
+        this.SelectionChanged.Raise(this);
+        this.RequestRedraw();
+    }
+
+    // 探针/测试可读当前液态胶囊实时几何（像素坐标，相对于窗口）。
+    public float PillLeftPx() { return this.pillLeft; }
+    public float PillRightPx() { return this.pillRight; }
+    public float PillWidthPx() { return this.pillRight - this.pillLeft; }
+    public bool IsAnimatingPill() {
+        return (this.leftSpring != null && this.leftSpring.active && !this.leftSpring.finished)
+            || (this.rightSpring != null && this.rightSpring.active && !this.rightSpring.finished);
+    }
+
+    public override Binding<string> SizeOf() { return this.Size; }
+    public override string EffectiveClass() {
+        string baseCls = this.Glass ? Control.ClassWith(this.Class, "glass") : this.Class;
+        return this.SizeClassIn(baseCls);
+    }
+    public override int InputFocusCapabilities() { return 1; }
+    protected override bool PaintWithinBounds() { return true; }
+
+    private int FontPxFor(App app) {
+        string sz = this.Size.Get();
+        if (sz == "tiny") { return app.theme.fontSizeTiny; }
+        if (sz == "small") { return app.theme.fontSizeSmall; }
+        if (sz == "large") { return app.theme.fontSizeLarge; }
+        return app.theme.fontSizeMedium;
+    }
+    private int HeightPxFor(App app) {
+        string sz = this.Size.Get();
+        if (sz == "tiny") { return app.theme.heightTiny; }
+        if (sz == "small") { return app.theme.heightSmall; }
+        if (sz == "large") { return app.theme.heightLarge; }
+        return app.theme.heightMedium;
+    }
+    private int PadPxFor(App app) {
+        int p = app.Scale(3);
+        return p > 1 ? p : 2;
+    }
+    private int ItemPadXFor(App app) {
+        string sz = this.Size.Get();
+        if (sz == "tiny" || sz == "small") { return app.Scale(11); }
+        if (sz == "large") { return app.Scale(18); }
+        return app.Scale(14);
+    }
+    private int IconPxFor(App app) {
+        string sz = this.Size.Get();
+        if (sz == "tiny" || sz == "small") { return app.Scale(13); }
+        if (sz == "large") { return app.Scale(17); }
+        return app.Scale(15);
+    }
+
+    private void ComputeSlots(App app, int totalW) {
+        int n = this.Items.Count;
+        if (n <= 0) {
+            this.slotX = null;
+            this.slotW = null;
+            return;
+        }
+        if (this.slotX == null || this.slotX.Length != n) {
+            this.slotX = new int[n];
+            this.slotW = new int[n];
+        }
+        int pad = this.PadPxFor(app);
+        int innerW = totalW - pad * 2;
+        if (innerW < n) { innerW = n; }
+        int fs = this.FontPxFor(app);
+        int itemPadX = this.ItemPadXFor(app);
+        int iconPx = this.IconPxFor(app);
+        int iconGap = app.Scale(6);
+
+        if (this.Block) {
+            int cx = pad;
+            for (int i = 0; i < n; i = i + 1) {
+                int sw = (i == n - 1) ? (pad + innerW - cx) : (innerW / n);
+                this.slotX[i] = cx;
+                this.slotW[i] = sw;
+                cx = cx + sw;
+            }
+            return;
+        }
+
+        int sumW = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            SegmentedItem it = this.Items[i];
+            int tw = it.Label != "" ? Canvas.MeasureText(it.Label, fs) : 0;
+            int iw = it.Icon != "" ? (iconPx + (tw > 0 ? iconGap : 0)) : 0;
+            int w = itemPadX * 2 + iw + tw;
+            int minSlot = app.Scale(36);
+            if (w < minSlot) { w = minSlot; }
+            this.slotW[i] = w;
+            sumW = sumW + w;
+        }
+        int cx0 = pad;
+        if (sumW > 0 && innerW > sumW) {
+            int extra = innerW - sumW;
+            for (int i = 0; i < n; i = i + 1) {
+                int add = (i == n - 1) ? extra : (extra / (n - i));
+                this.slotW[i] = this.slotW[i] + add;
+                extra = extra - add;
+            }
+        }
+        for (int i = 0; i < n; i = i + 1) {
+            this.slotX[i] = cx0;
+            cx0 = cx0 + this.slotW[i];
+        }
+    }
+
+    public override void OnMeasure(App app) {
+        int n = this.Items.Count;
+        int pad = this.PadPxFor(app);
+        int h = this.HeightPxFor(app) + pad * 2;
+        int fs = this.FontPxFor(app);
+        int itemPadX = this.ItemPadXFor(app);
+        int iconPx = this.IconPxFor(app);
+        int iconGap = app.Scale(6);
+        int sumW = pad * 2;
+        for (int i = 0; i < n; i = i + 1) {
+            SegmentedItem it = this.Items[i];
+            int tw = it.Label != "" ? Canvas.MeasureText(it.Label, fs) : 0;
+            int iw = it.Icon != "" ? (iconPx + (tw > 0 ? iconGap : 0)) : 0;
+            int w = itemPadX * 2 + iw + tw;
+            int minSlot = app.Scale(36);
+            if (w < minSlot) { w = minSlot; }
+            sumW = sumW + w;
+        }
+        if (sumW < app.Scale(64)) { sumW = app.Scale(64); }
+        prefW = sumW;
+        prefH = h;
+    }
+
+    public override void Arrange(int x, int y, int width, int height) {
+        bool sizeChanged = width != bw || height != bh;
+        base.Arrange(x, y, width, height);
+        App host = this.FindApp();
+        if (host == null) { return; }
+        this.ComputeSlots(host, bw);
+        int sel = this.SelectedIndex.Get();
+        if (sel >= 0 && sel < this.Items.Count && this.slotX != null) {
+            float tx0 = (float)this.slotX[sel];
+            float tx1 = (float)(this.slotX[sel] + this.slotW[sel]);
+            if (!this.pillReady || (sizeChanged && !this.IsAnimatingPill())) {
+                this.pillLeft = tx0;
+                this.pillRight = tx1;
+                this.targetLeft = tx0;
+                this.targetRight = tx1;
+                this.pillReady = true;
+                this.lastSelected = sel;
+            }
+        }
+    }
+
+    private void StopSprings() {
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (this.leftSpring != null) { tl.RemoveSpring(this.leftSpring); this.leftSpring = null; }
+        if (this.rightSpring != null) { tl.RemoveSpring(this.rightSpring); this.rightSpring = null; }
+    }
+
+    private void AnimatePillTo(int idx) {
+        App host = this.FindApp();
+        if (host == null || this.Items.Count == 0) { return; }
+        if (this.slotX == null || this.slotX.Length != this.Items.Count) {
+            this.ComputeSlots(host, bw > 0 ? bw : prefW);
+        }
+        if (this.slotX == null || idx < 0 || idx >= this.slotX.Length) { return; }
+        float tx0 = (float)this.slotX[idx];
+        float tx1 = (float)(this.slotX[idx] + this.slotW[idx]);
+        this.targetLeft = tx0;
+        this.targetRight = tx1;
+        if (!this.pillReady || host.HostReducedMotion()) {
+            this.StopSprings();
+            this.pillLeft = tx0;
+            this.pillRight = tx1;
+            this.pillReady = true;
+            return;
+        }
+        // 水滴拉长核心：前沿高刚度先冲出，后沿低刚度缓追，形成水滴拉长再弹性回缩。
+        bool movingRight = (tx0 + tx1) >= (this.pillLeft + this.pillRight);
+        float leadK = 540.0f; float leadD = 29.0f;
+        float trailK = 265.0f; float trailD = 24.0f;
+        float leftK = movingRight ? trailK : leadK;
+        float leftD = movingRight ? trailD : leadD;
+        float rightK = movingRight ? leadK : trailK;
+        float rightD = movingRight ? leadD : trailD;
+
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        tl.AutoBind(host);
+        if (this.leftSpring != null && !this.leftSpring.finished) {
+            this.leftSpring.stiffness = leftK;
+            this.leftSpring.damping = leftD;
+            this.leftSpring.Retarget(tx0);
+        } else {
+            if (this.leftSpring != null) { tl.RemoveSpring(this.leftSpring); }
+            SegmentedSpringRelay relayL = new SegmentedSpringRelay(this);
+            this.leftSpring = SpringAnim.Create(this.pillLeft, tx0, leftK, leftD, 1.0f, relayL.OnLeft);
+            this.leftSpring.WithPrecision(0.2f, 0.8f);
+            this.leftSpring.OnComplete(relayL.OnDoneLeft);
+            tl.AddSpring(this.leftSpring);
+            this.leftSpring.Play();
+        }
+        if (this.rightSpring != null && !this.rightSpring.finished) {
+            this.rightSpring.stiffness = rightK;
+            this.rightSpring.damping = rightD;
+            this.rightSpring.Retarget(tx1);
+        } else {
+            if (this.rightSpring != null) { tl.RemoveSpring(this.rightSpring); }
+            SegmentedSpringRelay relayR = new SegmentedSpringRelay(this);
+            this.rightSpring = SpringAnim.Create(this.pillRight, tx1, rightK, rightD, 1.0f, relayR.OnRight);
+            this.rightSpring.WithPrecision(0.2f, 0.8f);
+            this.rightSpring.OnComplete(relayR.OnDoneRight);
+            tl.AddSpring(this.rightSpring);
+            this.rightSpring.Play();
+        }
+    }
+
+    internal void ApplySpringEdge(bool isLeft, float v) {
+        if (isLeft) { this.pillLeft = v; }
+        else { this.pillRight = v; }
+        this.RequestRedraw();
+    }
+
+    internal void FinishSpringEdge(bool isLeft) {
+        if (isLeft) {
+            this.pillLeft = this.targetLeft;
+            this.leftSpring = null;
+        } else {
+            this.pillRight = this.targetRight;
+            this.rightSpring = null;
+        }
+        this.RequestRedraw();
+    }
+
+    public override void SyncBinding() {
+        base.SyncBinding();
+        int sel = this.SelectedIndex.Get();
+        if (sel != this.lastSelected && sel >= 0 && sel < this.Items.Count) {
+            this.lastSelected = sel;
+            this.AnimatePillTo(sel);
+        }
+    }
+
+    private int IndexAtX(int x) {
+        if (this.slotX == null || this.Items.Count == 0) { return 0 - 1; }
+        int lx = x - bx;
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            if (lx >= this.slotX[i] && lx < this.slotX[i] + this.slotW[i]) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        base.OnPointerMove(e);
+        int idx = this.IndexAtX(e.x);
+        if (idx != this.hoverIndex) {
+            this.hoverIndex = idx;
+            this.RequestRedraw();
+        }
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        if (this.hoverIndex >= 0 || this.pressedIndex >= 0) {
+            this.hoverIndex = 0 - 1;
+            this.pressedIndex = 0 - 1;
+            this.RequestRedraw();
+        }
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        int idx = this.IndexAtX(e.x);
+        if (idx >= 0 && !this.Items[idx].Disabled) {
+            this.pressedIndex = idx;
+            this.RequestRedraw();
+            e.Handle();
+        }
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        int idx = this.IndexAtX(e.x);
+        int wasPressed = this.pressedIndex;
+        this.pressedIndex = 0 - 1;
+        if (wasPressed >= 0 && idx == wasPressed) {
+            this.Select(idx);
+            e.Handle();
+        } else if (wasPressed >= 0) {
+            this.RequestRedraw();
+        }
+    }
+
+    public override void OnKeyDown(RoutedEventArgs e) {
+        if (this.IsDisabled() || this.Items.Count == 0) { base.OnKeyDown(e); return; }
+        int sel = this.SelectedIndex.Get();
+        if (e.keyCode == 37) { // Left
+            int next = sel - 1;
+            while (next >= 0 && this.Items[next].Disabled) { next = next - 1; }
+            if (next >= 0) { this.Select(next); e.Handle(); return; }
+        } else if (e.keyCode == 39) { // Right
+            int next = sel + 1;
+            while (next < this.Items.Count && this.Items[next].Disabled) { next = next + 1; }
+            if (next < this.Items.Count) { this.Select(next); e.Handle(); return; }
+        } else if (e.keyCode == 36) { // Home
+            for (int i = 0; i < this.Items.Count; i = i + 1) {
+                if (!this.Items[i].Disabled) { this.Select(i); e.Handle(); return; }
+            }
+        } else if (e.keyCode == 35) { // End
+            for (int i = this.Items.Count - 1; i >= 0; i = i - 1) {
+                if (!this.Items[i].Disabled) { this.Select(i); e.Handle(); return; }
+            }
+        }
+        base.OnKeyDown(e);
+    }
+
+    public override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0) { return; }
+        this.SyncBinding();
+        if (this.slotX == null || this.slotX.Length != this.Items.Count) {
+            this.ComputeSlots(app, bw);
+        }
+        StyleBox trackBox = paintedStyle != null ? paintedStyle : this.Box(app);
+        if (trackBox != null) {
+            trackBox.Paint(app, bx, by, bw, bh);
+        }
+        if (this.Items.Count == 0 || this.slotX == null) { return; }
+
+        int pad = this.PadPxFor(app);
+        int sel = this.SelectedIndex.Get();
+        if (sel < 0 || sel >= this.Items.Count) { sel = 0; }
+        if (!this.pillReady) {
+            this.pillLeft = (float)this.slotX[sel];
+            this.pillRight = (float)(this.slotX[sel] + this.slotW[sel]);
+            this.targetLeft = this.pillLeft;
+            this.targetRight = this.pillRight;
+            this.pillReady = true;
+            this.lastSelected = sel;
+        }
+
+        // 绘制液态玻璃滑动胶囊（含速度耦合纵向微收与顶部/底部折光棱）
+        float pl = this.pillLeft;
+        float pr = this.pillRight;
+        if (pr < pl + 8.0f) { pr = pl + 8.0f; }
+        int px = bx + (int)(pl + 0.5f);
+        int pw = (int)(pr - pl + 0.5f);
+        if (px < bx + pad) {
+            pw = pw - (bx + pad - px);
+            px = bx + pad;
+        }
+        if (px + pw > bx + bw - pad) { pw = bx + bw - pad - px; }
+        int targetW = (int)(this.targetRight - this.targetLeft + 0.5f);
+        float stretchExcess = (float)(pw - targetW);
+        int squashY = 0;
+        if (stretchExcess > 2.0f && targetW > 0) {
+            float ratio = stretchExcess / (float)targetW;
+            if (ratio > 0.65f) { ratio = 0.65f; }
+            int maxSquash = (bh - pad * 2) * 14 / 100;
+            squashY = (int)((float)maxSquash * ratio + 0.5f);
+        }
+        if (this.pressedIndex == sel && squashY < app.Scale(1)) {
+            squashY = app.Scale(1);
+        }
+        int py = by + pad + squashY;
+        int ph = bh - pad * 2 - squashY * 2;
+        if (ph < 4) { ph = 4; }
+        if (pw > 2 && ph > 2) {
+            StyleBox pillBox = Style.Part(app, "segmented", "pill", "panel", this.EffectiveClass(), this.name, Style.SSelected());
+            pillBox.Paint(app, px, py, pw, ph);
+            // 飞行拉伸瞬间补强液态棱光
+            if (stretchExcess > 3.0f && ph >= 12) {
+                int r = ph / 2;
+                int lipW = pw - r * 2;
+                if (lipW > 2) {
+                    int gleam = ColorMath.WithAlpha((int)4294967295, 130);
+                    app.canvas.FillRect(px + r, py + 1, lipW, 1, gleam);
+                    app.canvas.FillRect(px + r, py + ph - 2, lipW, 1, ColorMath.WithAlpha((int)4294967295, 85));
+                }
+            }
+        }
+
+        // 绘制每个选项的图标与标题
+        int fs = this.FontPxFor(app);
+        int fh = Canvas.FontHeight(fs);
+        int iconPx = this.IconPxFor(app);
+        int iconGap = app.Scale(6);
+        StyleBox itemNormal = Style.Part(app, "segmented", "item", "label", this.EffectiveClass(), this.name, Style.SNormal());
+        StyleBox itemHover = Style.Part(app, "segmented", "item", "label", this.EffectiveClass(), this.name, Style.SHover());
+        StyleBox itemSel = Style.Part(app, "segmented", "item", "label", this.EffectiveClass(), this.name, Style.SSelected());
+
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            SegmentedItem it = this.Items[i];
+            int sx = bx + this.slotX[i];
+            int sw = this.slotW[i];
+            bool isSel = i == sel;
+            bool isHov = i == this.hoverIndex && !it.Disabled;
+            StyleBox ib = isSel ? itemSel : (isHov ? itemHover : itemNormal);
+            int fg = it.Disabled ? app.theme.textDisabled : ib.FgOr(isSel ? app.theme.textPrimary : app.theme.textSecondary);
+
+            // 未选中项悬停时给微弱胶囊底反馈
+            if (isHov && !isSel) {
+                int hovBg = ColorMath.ScaleAlpha(app.theme.textPrimary, app.isDark ? 95 : 55);
+                app.canvas.FillRoundRect(sx + 1, by + pad + 1, sw - 2, bh - pad * 2 - 2, (bh - pad * 2) / 2, hovBg);
+            }
+
+            int tw = it.Label != "" ? Canvas.MeasureText(it.Label, fs) : 0;
+            bool hasIcon = it.Icon != "";
+            int totalContent = (hasIcon ? iconPx : 0) + (hasIcon && tw > 0 ? iconGap : 0) + tw;
+            int cx = sx + (sw - totalContent) / 2;
+            if (hasIcon) {
+                IconSvg.Draw(app.canvas, it.Icon, cx, by + (bh - iconPx) / 2, iconPx, fg);
+                cx = cx + iconPx + iconGap;
+            }
+            if (tw > 0) {
+                int ty = by + (bh - fh) / 2;
+                app.canvas.DrawText(cx, ty, it.Label, fg, fs);
+                if (isSel && ib.fontWeight >= 600) {
+                    app.canvas.DrawText(cx + 1, ty, it.Label, fg, fs);
+                }
+            }
+        }
+    }
+}

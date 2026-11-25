@@ -1,0 +1,281 @@
+using System;
+using Gui;
+using Gui.Animation;
+using Gui.Backend;
+using Gui.Widget;
+
+class TactileMotionWidgetsTest {
+    static void Check(bool cond, string msg) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + msg);
+            throw new Exception("TactileMotionWidgetsTest: " + msg);
+        }
+    }
+
+    static int Luma(int px) {
+        int r = (px >> 16) & 255;
+        int g = (px >> 8) & 255;
+        int b = px & 255;
+        return (r * 3 + g * 6 + b) / 10;
+    }
+
+    static void TestSpotlightAndBeam() {
+        Fx.ResetSpotlightCache();
+        App app = App.CreateOffscreen("tactile-spot", 320, 220);
+        app.UseSkin("obsidian");
+        Card spotCard = new Card();
+        spotCard.ClassName = "spotlight";
+        spotCard.inlineStyleCss = "background: #10121a; border: 1 #202430; border-radius: 12;";
+        app.SetRootControl(spotCard);
+
+        Rect area = new Rect(20, 20, 240, 140);
+        app.FreezeAnimClock(1000);
+        app.ProcessOffscreenInput(1, 5, 5, 0, 0, 0, 0);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        spotCard.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        int baseInner = Luma(app.canvas.GetPixel(42, 90));
+        int baseLeftEdge = Luma(app.canvas.GetPixel(21, 90));
+        int baseRightEdge = Luma(app.canvas.GetPixel(258, 90));
+
+        app.ProcessOffscreenInput(1, 34, 90, 0, 0, 0, 0);
+        for (int f = 0; f < 12; f = f + 1) {
+            app.FreezeAnimClock(1016 + f * 16);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xff000000);
+            spotCard.RenderInside(app, area);
+            app.EndOffscreenFrame();
+        }
+        int hovInner = Luma(app.canvas.GetPixel(42, 90));
+        int hovLeftEdge = Luma(app.canvas.GetPixel(21, 90));
+        int hovRightEdge = Luma(app.canvas.GetPixel(258, 90));
+        Check(hovInner > baseInner + 15, "spotlight inner glow brightens under cursor");
+        Check(hovLeftEdge > baseLeftEdge + 20, "spotlight near border brightens");
+        Check(hovRightEdge - baseRightEdge < 8, "spotlight opposite border stays unlit");
+
+        app.ProcessOffscreenInput(1, 5, 5, 0, 0, 0, 0);
+        app.FreezeAnimClock(1280);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        spotCard.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        int midFadeInner = Luma(app.canvas.GetPixel(42, 90));
+        Check(midFadeInner > baseInner && midFadeInner < hovInner, "spotlight fades out smoothly on leave");
+
+        for (int f = 0; f < 16; f = f + 1) {
+            app.FreezeAnimClock(1310 + f * 20);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xff000000);
+            spotCard.RenderInside(app, area);
+            app.EndOffscreenFrame();
+        }
+        int settledInner = Luma(app.canvas.GetPixel(42, 90));
+        Check(settledInner <= baseInner + 1, "spotlight settles cleanly to zero residual");
+
+        Card beamCard = new Card();
+        beamCard.ClassName = "border-beam";
+        beamCard.inlineStyleCss = "background: #0d1018; border: 1 #1a1e2a; border-radius: 10; accent-color: #38bdf8; animation: beam 2000ms;";
+        app.SetRootControl(beamCard);
+        app.FreezeAnimClock(250);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        beamCard.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        int topAtEarly = Luma(app.canvas.GetPixel(140, 21));
+        int botAtEarly = Luma(app.canvas.GetPixel(140, 158));
+
+        app.FreezeAnimClock(1250);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xff000000);
+        beamCard.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        int topAtLate = Luma(app.canvas.GetPixel(140, 21));
+        int botAtLate = Luma(app.canvas.GetPixel(140, 158));
+        Check(topAtEarly > botAtEarly + 20 || botAtLate > topAtLate + 20, "border-beam orbits perimeter");
+    }
+
+    static void TestSegmentedAndTabs() {
+        App app = App.CreateOffscreen("tactile-seg", 420, 180);
+        app.UseSkin("liquid");
+        Segmented seg = new Segmented("Overview|Analytics|Perf|Settings");
+        seg.Block = true;
+        app.SetRootControl(seg);
+
+        Rect area = new Rect(10, 10, 360, 40);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xffffffff);
+        seg.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        float restW = seg.PillWidthPx();
+        Check(restW > 60.0f && restW < 110.0f, "segmented rest pill width valid");
+
+        seg.Select(3);
+        Check(seg.IsAnimatingPill(), "segmented animates pill on select");
+        float maxW = restW;
+        for (int i = 0; i < 18; i = i + 1) {
+            AnimationTimeline.Shared.Tick(16);
+            float cw = seg.PillWidthPx();
+            if (cw > maxW) { maxW = cw; }
+        }
+        Check(maxW > restW * 1.18f, "liquid glass pill stretches like droplet mid-flight");
+
+        seg.Select(1);
+        for (int i = 0; i < 60; i = i + 1) { AnimationTimeline.Shared.Tick(20); }
+        Check(!seg.IsAnimatingPill(), "segmented settles cleanly after mid-flight retarget");
+        float settledW = seg.PillWidthPx();
+        Check(settledW > restW - 3.0f && settledW < restW + 3.0f, "segmented pill rebounds to slot width");
+
+        Tabs tabs = new Tabs(Tabs.Segment());
+        tabs.Add("Home");
+        tabs.Add("Design");
+        tabs.Add("Code");
+        app.SetRootControl(tabs);
+        app.BeginOffscreenFrame();
+        tabs.RenderInside(app, new Rect(10, 10, 360, 120));
+        app.EndOffscreenFrame();
+        tabs.Select(2);
+        app.BeginOffscreenFrame();
+        tabs.RenderInside(app, new Rect(10, 10, 360, 120));
+        app.EndOffscreenFrame();
+        Check(tabs.IsSlidingIndicator(), "tabs segment activates spring sliding indicator");
+        for (int i = 0; i < 60; i = i + 1) { AnimationTimeline.Shared.Tick(20); }
+        Check(!tabs.IsSlidingIndicator(), "tabs sliding indicator settles cleanly");
+    }
+
+    static void TestExpandableHeroMorph() {
+        App app = App.CreateOffscreen("tactile-morph", 640, 480);
+        app.UseSkin("frosted");
+        bool gotExpand = false;
+        bool gotCollapse = false;
+
+        Panel root = Panel.Root("root");
+        Button triggerBtn = new Button("Expand");
+        Label detailLbl = new Label("Expanded detail content");
+        ExpandableCard exp = new ExpandableCard(triggerBtn, detailLbl)
+            .WithTitle("Details")
+            .WithDetailSize(420, 280);
+        exp.Expanded.Add(() => { gotExpand = true; });
+        exp.Collapsed.Add(() => { gotCollapse = true; });
+        root.Add(exp);
+        app.SetRootControl(root);
+
+        app.BeginOffscreenFrame();
+        root.MeasureTree(app, 640);
+        root.Arrange(0, 0, 640, 480);
+        exp.Arrange(24, 24, 140, 44);
+        root.RenderTree(app);
+        app.EndOffscreenFrame();
+
+        exp.Expand();
+        Check(gotExpand && exp.IsExpanded(), "expandable opens overlay");
+        AnimationTimeline.Shared.Tick(80);
+        int mx = 0; int my = 0; int mw = 0; int mh = 0;
+        exp.MorphRect(out mx, out my, out mw, out mh);
+        Check(mw > 150 && mw < 410 && mh > 55 && mh < 275, "morph interpolates intermediate rect");
+
+        for (int i = 0; i < 60; i = i + 1) { AnimationTimeline.Shared.Tick(20); }
+        exp.MorphRect(out mx, out my, out mw, out mh);
+        Check(mw >= 415 && mh >= 275, "morph settles at target detail size");
+
+        exp.Collapse();
+        AnimationTimeline.Shared.Tick(60);
+        int cx = 0; int cy = 0; int cw = 0; int ch = 0;
+        exp.MorphRect(out cx, out cy, out cw, out ch);
+        Check(cw < mw && ch < mh, "collapse shrinks back toward source rect");
+        for (int i = 0; i < 60; i = i + 1) { AnimationTimeline.Shared.Tick(20); }
+        Check(!exp.IsExpanded() && gotCollapse, "collapse unmounts overlay and raises Collapsed");
+    }
+
+    static void TestGlassDock() {
+        App app = App.CreateOffscreen("tactile-dock", 560, 180);
+        app.UseSkin("liquid");
+        int clicked = 0 - 1;
+        Dock dock = new Dock()
+            .Add("home", "Home")
+            .Add("search", "Search")
+            .Add("star", "Featured")
+            .Add("settings", "Settings")
+            .Add("user", "Profile")
+            .SetActive(2, true);
+        dock.ItemClicked.Add(() => { clicked = dock.ClickedIndex(); });
+        app.SetRootControl(dock);
+
+        Rect area = new Rect(40, 20, 480, 140);
+        app.FreezeAnimClock(2000);
+        app.BeginOffscreenFrame();
+        app.canvas.Clear(0xffffffff);
+        dock.RenderInside(app, area);
+        app.EndOffscreenFrame();
+        Check(dock.ItemScale(2) > 0.99f && dock.ItemScale(2) < 1.01f, "dock starts at rest scale 1.0");
+
+        int ix = 0; int iy = 0; int iw = 0; int ih = 0;
+        dock.ItemRect(2, out ix, out iy, out iw, out ih);
+        app.ProcessOffscreenInput(1, ix + iw / 2, iy + ih / 2, 0, 0, 0, 0);
+        for (int f = 0; f < 20; f = f + 1) {
+            app.FreezeAnimClock(2016 + f * 16);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xffffffff);
+            dock.RenderInside(app, area);
+            app.EndOffscreenFrame();
+        }
+        float s0 = dock.ItemScale(0);
+        float s1 = dock.ItemScale(1);
+        float s2 = dock.ItemScale(2);
+        float s3 = dock.ItemScale(3);
+        Check(dock.HoveredIndex() == 2, "dock detects hovered center icon");
+        Check(s2 > 1.45f && s2 > s1 && s1 > s0, "dock fish-eye curve: center > neighbor > far");
+        Check(s1 > 1.15f && s3 > 1.15f, "dock neighbors magnify sympathetically");
+
+        int px0 = 0; int py0 = 0; int pw0 = 0; int ph0 = 0;
+        for (int i = 0; i < 5; i = i + 1) {
+            int x1 = 0; int y1 = 0; int w1 = 0; int h1 = 0;
+            dock.ItemRect(i, out x1, out y1, out w1, out h1);
+            if (i > 0) {
+                Check(px0 + pw0 <= x1, "dock magnified neighbors never overlap");
+            }
+            px0 = x1; py0 = y1; pw0 = w1; ph0 = h1;
+        }
+
+        dock.ItemRect(2, out ix, out iy, out iw, out ih);
+        app.ProcessOffscreenInput(2, ix + iw / 2, iy + ih / 2, 0, 0, 0, 0);
+        Check(clicked == 2, "dock click fires ItemClicked for index 2");
+
+        app.ProcessOffscreenInput(1, 5, 5, 0, 0, 0, 0);
+        for (int f = 0; f < 45; f = f + 1) {
+            app.FreezeAnimClock(2400 + f * 20);
+            app.BeginOffscreenFrame();
+            app.canvas.Clear(0xffffffff);
+            dock.RenderInside(app, area);
+            app.EndOffscreenFrame();
+        }
+        Check(dock.ItemScale(2) < 1.02f && !dock.IsAnimating(), "dock settles smoothly back to 1.0x");
+        dock.ItemClicked.Clear();
+    }
+
+    static void TestSkinsParseClean() {
+        App app = App.CreateOffscreen("tactile-skins", 200, 120);
+        string[] names = new string[] {
+            "liquid", "frosted", "obsidian", "aurora", "cyber", "luxe", "starlight", "clay"
+        };
+        for (int i = 0; i < names.Length; i = i + 1) {
+            app.UseSkin(names[i]);
+            StyleBox sp = Style.Full(app, "card", "spotlight", "", 0);
+            Check((sp.specular & 2) != 0, "skin " + names[i] + " enables spotlight class");
+            StyleBox bm = Style.Full(app, "card", "border-beam", "", 0);
+            Check(bm.anim == Style.AnimBeam(), "skin " + names[i] + " enables border-beam class");
+        }
+    }
+
+    static void Main() {
+        Dispatcher.Init();
+        TestSpotlightAndBeam();
+        TestSegmentedAndTabs();
+        TestExpandableHeroMorph();
+        TestGlassDock();
+        TestSkinsParseClean();
+        Fx.ResetSpotlightCache();
+        Skin.ClearCache();
+        Console.WriteLine("TACTILE_MOTION_WIDGETS_PASS");
+    }
+}

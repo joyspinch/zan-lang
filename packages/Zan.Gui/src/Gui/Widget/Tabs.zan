@@ -1,7 +1,39 @@
 using System;
 using System.Collections.Generic;
 using Gui;
+using Gui.Animation;
 namespace Gui.Widget;
+internal class TabsIndicatorRelay {
+    internal weak Tabs owner;
+    internal TabsIndicatorRelay(Tabs t) { this.owner = t; }
+    internal void OnStart(float v) {
+        Tabs t = this.owner;
+        if (t != null) { t.ApplyIndicatorEdge(true, v); }
+    }
+    internal void OnEnd(float v) {
+        Tabs t = this.owner;
+        if (t != null) { t.ApplyIndicatorEdge(false, v); }
+    }
+    internal void OnDoneStart() {
+        Tabs t = this.owner;
+        if (t != null) { t.FinishIndicatorEdge(true); }
+    }
+    internal void OnDoneEnd() {
+        Tabs t = this.owner;
+        if (t != null) { t.FinishIndicatorEdge(false); }
+    }
+}
+internal class TabsNavStrip : Control {
+    internal weak Tabs owner;
+    internal TabsNavStrip(Tabs t) {
+        this.owner = t;
+    }
+    public override void OnPaint(App app) {
+        Tabs t = this.owner;
+        if (t == null || bw <= 0 || bh <= 0) { return; }
+        t.PaintSlidingIndicator(app, this);
+    }
+}
 public partial class Tabs : Control {
     public override Control CreateCloneShell() { return new Tabs(); }
     public List<TabItem> tabs;
@@ -92,6 +124,14 @@ public partial class Tabs : Control {
     private int appliedOrient;
     private bool appliedShowAdd;
     private bool appliedClosable;
+    private bool indReady;
+    private int indLastIdx = 0 - 1;
+    private float indStart;
+    private float indEnd;
+    private float indTargetStart;
+    private float indTargetEnd;
+    private SpringAnim indStartSpring;
+    private SpringAnim indEndSpring;
     public override int StyleDisplay() { return 1; } // Flex
     public override int StyleFlexDir() { return orient == 1 ? 0 : 1; }
     public void SetShowAdd(bool on) {
@@ -355,7 +395,7 @@ public partial class Tabs : Control {
         Control ownerParent = parent;
         this.RemoveAll();
         if (treeGeneration != ticket || this.FindApp() != host || parent != ownerParent) { return; }
-        navStrip = new Control();
+        navStrip = new TabsNavStrip(this);
         string orientClass = (orient == 1) ? "col tabs-nav-vertical" : "row tabs-nav-horizontal align-center";
         string styleClass = (style == 1) ? "card" : (style == 2 ? "segment" : "line");
         navStrip.ClassName = "tabs-nav " + orientClass + " " + styleClass;
@@ -430,6 +470,129 @@ public partial class Tabs : Control {
             navStrip.SetScrollTop(offset);
         }
         navStrip.Arrange(navStrip.bx, navStrip.by, navStrip.bw, navStrip.bh);
+        this.SyncSlidingIndicator(selected);
+    }
+    private void StopIndicatorSprings() {
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (this.indStartSpring != null) { tl.RemoveSpring(this.indStartSpring); this.indStartSpring = null; }
+        if (this.indEndSpring != null) { tl.RemoveSpring(this.indEndSpring); this.indEndSpring = null; }
+    }
+    public bool IsSlidingIndicator() {
+        return (this.indStartSpring != null && this.indStartSpring.active && !this.indStartSpring.finished)
+            || (this.indEndSpring != null && this.indEndSpring.active && !this.indEndSpring.finished);
+    }
+    private void SyncSlidingIndicator(Control selected) {
+        if (selected == null || navStrip == null || style == 1) { return; }
+        int active = ActiveIndex.Get();
+        float t0 = orient == 1 ? (float)(selected.by - navStrip.by) : (float)(selected.bx - navStrip.bx);
+        float t1 = orient == 1 ? (float)(selected.by + selected.bh - navStrip.by) : (float)(selected.bx + selected.bw - navStrip.bx);
+        if (t1 <= t0) { return; }
+        App host = this.FindApp();
+        if (!this.indReady || this.indLastIdx < 0 || host == null || host.HostReducedMotion()) {
+            this.StopIndicatorSprings();
+            this.indStart = t0;
+            this.indEnd = t1;
+            this.indTargetStart = t0;
+            this.indTargetEnd = t1;
+            this.indReady = true;
+            this.indLastIdx = active;
+            return;
+        }
+        if (active == this.indLastIdx) {
+            this.indTargetStart = t0;
+            this.indTargetEnd = t1;
+            if (!this.IsSlidingIndicator()) {
+                this.indStart = t0;
+                this.indEnd = t1;
+            }
+            return;
+        }
+        this.indLastIdx = active;
+        this.indTargetStart = t0;
+        this.indTargetEnd = t1;
+        bool forward = (t0 + t1) >= (this.indStart + this.indEnd);
+        float leadK = 520.0f; float leadD = 29.0f;
+        float trailK = 270.0f; float trailD = 24.0f;
+        float startK = forward ? trailK : leadK;
+        float startD = forward ? trailD : leadD;
+        float endK = forward ? leadK : trailK;
+        float endD = forward ? leadD : trailD;
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        tl.AutoBind(host);
+        if (this.indStartSpring != null && !this.indStartSpring.finished) {
+            this.indStartSpring.stiffness = startK;
+            this.indStartSpring.damping = startD;
+            this.indStartSpring.Retarget(t0);
+        } else {
+            if (this.indStartSpring != null) { tl.RemoveSpring(this.indStartSpring); }
+            TabsIndicatorRelay r0 = new TabsIndicatorRelay(this);
+            this.indStartSpring = SpringAnim.Create(this.indStart, t0, startK, startD, 1.0f, r0.OnStart);
+            this.indStartSpring.WithPrecision(0.2f, 0.8f);
+            this.indStartSpring.OnComplete(r0.OnDoneStart);
+            tl.AddSpring(this.indStartSpring);
+            this.indStartSpring.Play();
+        }
+        if (this.indEndSpring != null && !this.indEndSpring.finished) {
+            this.indEndSpring.stiffness = endK;
+            this.indEndSpring.damping = endD;
+            this.indEndSpring.Retarget(t1);
+        } else {
+            if (this.indEndSpring != null) { tl.RemoveSpring(this.indEndSpring); }
+            TabsIndicatorRelay r1 = new TabsIndicatorRelay(this);
+            this.indEndSpring = SpringAnim.Create(this.indEnd, t1, endK, endD, 1.0f, r1.OnEnd);
+            this.indEndSpring.WithPrecision(0.2f, 0.8f);
+            this.indEndSpring.OnComplete(r1.OnDoneEnd);
+            tl.AddSpring(this.indEndSpring);
+            this.indEndSpring.Play();
+        }
+    }
+    internal void ApplyIndicatorEdge(bool isStart, float v) {
+        if (isStart) { this.indStart = v; }
+        else { this.indEnd = v; }
+        this.RequestRedraw();
+    }
+    internal void FinishIndicatorEdge(bool isStart) {
+        if (isStart) {
+            this.indStart = this.indTargetStart;
+            this.indStartSpring = null;
+        } else {
+            this.indEnd = this.indTargetEnd;
+            this.indEndSpring = null;
+        }
+        this.RequestRedraw();
+    }
+    internal void PaintSlidingIndicator(App app, Control strip) {
+        if (!this.indReady || strip == null || style == 1) { return; }
+        int s0 = (int)(this.indStart + 0.5f);
+        int s1 = (int)(this.indEnd + 0.5f);
+        if (s1 <= s0 + 2) { return; }
+        if (style == 0) {
+            int barT = app.Scale(2);
+            if (barT < 2) { barT = 2; }
+            int col = app.theme.primary;
+            if (orient == 0) {
+                app.canvas.FillRoundRect(strip.bx + s0, strip.by + strip.bh - barT, s1 - s0, barT, barT / 2, col);
+            } else {
+                app.canvas.FillRoundRect(strip.bx, strip.by + s0, barT, s1 - s0, barT / 2, col);
+            }
+            return;
+        }
+        if (style == 2) {
+            int pad = app.Scale(2);
+            if (pad < 1) { pad = 1; }
+            StyleBox pill = Style.Part(app, "segmented", "pill", "panel", this.EffectiveClass(), this.name, Style.SSelected());
+            if (orient == 0) {
+                int pw = s1 - s0;
+                int targetW = (int)(this.indTargetEnd - this.indTargetStart + 0.5f);
+                int squash = (pw > targetW + 3 && targetW > 0) ? app.Scale(1) : 0;
+                int ph = strip.bh - pad * 2 - squash * 2;
+                if (ph > 4) { pill.Paint(app, strip.bx + s0, strip.by + pad + squash, pw, ph); }
+            } else {
+                int ph = s1 - s0;
+                int pw = strip.bw - pad * 2;
+                if (pw > 4) { pill.Paint(app, strip.bx + pad, strip.by + s0, pw, ph); }
+            }
+        }
     }
     public override void OnPointerDown(RoutedEventArgs e) {
         base.OnPointerDown(e);

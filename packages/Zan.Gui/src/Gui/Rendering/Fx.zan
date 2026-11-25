@@ -168,6 +168,61 @@ public class Fx {
         }
         app.RequestAnimationFrameIn(x, y, w, h);
     }
+    // 边缘流光（Border Beam）：带白热彗星头与渐隐长尾的单向沿边流光。
+    static void BorderBeam(RenderHost app, int x, int y, int w, int h,
+                           int radius, int color, int periodMs, int intensity) {
+        if (w <= 2 || h <= 2) { return; }
+        Canvas c = app.HostCanvas();
+        int per = Fx.PerimeterLength(w, h, radius);
+        if (per <= 0) { return; }
+        if (periodMs <= 0) { periodMs = 3000; }
+        int head = Fx.Saw(app, periodMs) * per / 1000;
+        int tailLen = per * 26 / 100;
+        if (tailLen < 12) { tailLen = 12; }
+        int leadLen = per * 3 / 100;
+        if (leadLen < 2) { leadLen = 2; }
+        int baseR = app.HostScale(3);
+        if (baseR < 2) { baseR = 2; }
+        int stepPx = app.HostScale(3);
+        if (stepPx < 2) { stepPx = 2; }
+        int steps = per / stepPx;
+        if (steps < 64) { steps = 64; }
+        if (steps > 240) { steps = 240; }
+        int hotCol = ColorMath.LerpColor(color, (int)4294967295, 620);
+        int rimA = intensity * 10 / 100;
+        c.PushClip(x, y, w, h);
+        if (rimA > 0) {
+            c.DrawRoundRect(x, y, w, h, radius, Fx.WithAlpha(color, rimA), 1);
+        }
+        for (int i = 0; i < steps; i = i + 1) {
+            int d = i * per / steps;
+            int behind = head - d;
+            if (behind < 0) { behind = behind + per; }
+            int ahead = d - head;
+            if (ahead < 0) { ahead = ahead + per; }
+            int p = 0;
+            if (behind <= tailLen) {
+                int t = (tailLen - behind) * 1000 / tailLen;
+                // 平方衰减拉出锐利彗尾
+                p = t * t / 1000;
+            } else if (ahead <= leadLen) {
+                int t = (leadLen - ahead) * 1000 / leadLen;
+                p = Fx.Ease(t);
+            }
+            if (p <= 15) { continue; }
+            int a = intensity * p / 1000;
+            int gr = baseR + (baseR * p / 1500);
+            int col = p > 720 ? ColorMath.LerpColor(color, hotCol, (p - 720) * 1000 / 280) : color;
+            int px = x; int py = y;
+            Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
+            c.FillRadial(px, py, gr, col, a);
+        }
+        int hx = x; int hy = y;
+        Fx.PerimeterPoint(x, y, w, h, radius, head, out hx, out hy);
+        c.FillRadial(hx, hy, baseR + 1, (int)4294967295, intensity * 92 / 100);
+        c.PopClip();
+        app.RequestAnimationFrameIn(x, y, w, h);
+    }
     static void Emboss(RenderHost app, int x, int y, int w, int h, int radius,
                        bool pressed, int bgPrimary) {
         Canvas c = app.HostCanvas();
@@ -308,6 +363,161 @@ public class Fx {
         Fx.PointGlow(c, mx, my, r, color, a);
         c.PopClip();
         app.RequestAnimationFrameIn(x, y, w, h);
+    }
+    // 单侧近光标边框提亮（不在对侧画假镜像点）：靠近光标处的边框平滑亮起。
+    static void SpecularBorderPointHv(RenderHost app, int x, int y, int w, int h,
+                                      int radius, int color, int mx, int my,
+                                      int hv, int strength) {
+        if (hv <= 0 || w <= 2 || h <= 2) { return; }
+        Canvas c = app.HostCanvas();
+        int per = Fx.PerimeterLength(w, h, radius);
+        if (per <= 0) { return; }
+        int half = per / 2;
+        int reach = per * 18 / 100;
+        if (reach < 12) { reach = 12; }
+        int gr = app.HostScale(4);
+        if (gr < 2) { gr = 2; }
+        int stepPx = app.HostScale(4);
+        if (stepPx < 3) { stepPx = 3; }
+        int steps = per / stepPx;
+        if (steps < 48) { steps = 48; }
+        if (steps > 220) { steps = 220; }
+        int md = 0; int best = 2147483647;
+        for (int j = 0; j < steps; j = j + 1) {
+            int d = j * per / steps;
+            int px = x; int py = y;
+            Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
+            int dx = px - mx;
+            int dx2 = dx * dx;
+            if (dx2 < best) {
+                int dy = py - my;
+                int dd = dx2 + dy * dy;
+                if (dd < best) { best = dd; md = d; }
+            }
+        }
+        // 光标越贴近边框，局部边框越亮；在卡片中央时保持柔和提示
+        int maxDist = (w < h ? w : h) * 65 / 100;
+        if (maxDist < 40) { maxDist = 40; }
+        int dist = (int)Math.Sqrt((double)best);
+        int prox = dist >= maxDist ? 360 : (1000 - (dist * 640 / maxDist));
+        int peakA = 225 * strength / 1000 * hv / 1000 * prox / 1000;
+        if (peakA <= 1) { return; }
+        int rimCol = ColorMath.LerpColor(color, (int)4294967295, 580);
+        c.PushClip(x, y, w, h);
+        for (int i = 0; i < steps; i = i + 1) {
+            int d = i * per / steps;
+            int e1 = d - md;
+            if (e1 < 0) { e1 = e1 + per; }
+            if (e1 > half) { e1 = per - e1; }
+            if (e1 >= reach) { continue; }
+            int p = Fx.Ease((reach - e1) * 1000 / reach);
+            int a = peakA * p / 1000;
+            if (a <= 1) { continue; }
+            int px = x; int py = y;
+            Fx.PerimeterPoint(x, y, w, h, radius, d, out px, out py);
+            c.FillRadial(px, py, gr, rimCol, a);
+        }
+        c.PopClip();
+    }
+    static int[] spotKeys;
+    static int[] spotHv;
+    static int[] spotMx;
+    static int[] spotMy;
+    static int[] spotTick;
+    static void EnsureSpotlightSlots() {
+        if (Fx.spotKeys != null) { return; }
+        Fx.spotKeys = new int[64];
+        Fx.spotHv = new int[64];
+        Fx.spotMx = new int[64];
+        Fx.spotMy = new int[64];
+        Fx.spotTick = new int[64];
+    }
+    public static void ResetSpotlightCache() {
+        if (Fx.spotKeys == null) { return; }
+        for (int i = 0; i < 64; i = i + 1) {
+            Fx.spotKeys[i] = 0;
+            Fx.spotHv[i] = 0;
+            Fx.spotTick[i] = 0;
+        }
+    }
+    static int SpotlightSlot(int key, int nowMs) {
+        Fx.EnsureSpotlightSlots();
+        int freeIdx = 0 - 1;
+        int oldestIdx = 0;
+        int oldestTick = Fx.spotTick[0];
+        for (int i = 0; i < 64; i = i + 1) {
+            if (Fx.spotKeys[i] == key) { return i; }
+            if (Fx.spotKeys[i] == 0 && freeIdx < 0) { freeIdx = i; }
+            if (Fx.spotTick[i] < oldestTick) {
+                oldestTick = Fx.spotTick[i];
+                oldestIdx = i;
+            }
+        }
+        int idx = freeIdx >= 0 ? freeIdx : oldestIdx;
+        Fx.spotKeys[idx] = key;
+        Fx.spotHv[idx] = 0;
+        Fx.spotMx[idx] = 0;
+        Fx.spotMy[idx] = 0;
+        Fx.spotTick[idx] = nowMs;
+        return idx;
+    }
+    // 聚光卡片效果：悬停时内部跟随光标柔和径向光斑 + 靠近光标的单侧边框局部提亮，
+    // 移出后在离场点平滑淡出复原，移到卡片内部子控件上不中断。
+    static void Spotlight(RenderHost app, int key, int x, int y, int w, int h,
+                          int radius, int color, int strength) {
+        if (w <= 2 || h <= 2 || strength <= 0) { return; }
+        if (key == 0) { key = ((x * 31) ^ (y * 131)) ^ ((w * 977) ^ (h * 4099)); }
+        if (key == 0) { key = 1; }
+        int mx = app.HostMouseX();
+        int my = app.HostMouseY();
+        bool inside = mx >= x && mx < x + w && my >= y && my < y + h;
+        int nowMs = app.HostNowMs();
+        int slot = Fx.SpotlightSlot(key, nowMs);
+        int hv = Fx.spotHv[slot];
+        int dt = nowMs - Fx.spotTick[slot];
+        if (dt < 0 || dt > 120) { dt = 16; }
+        Fx.spotTick[slot] = nowMs;
+        if (inside) {
+            Fx.spotMx[slot] = mx;
+            Fx.spotMy[slot] = my;
+            int step = dt > 0 ? (dt * 1000 / 140) : 240;
+            if (step < 1) { step = 1; }
+            if (hv == 0 && step < 220) { step = 220; }
+            hv = hv + step;
+            if (hv > 1000) { hv = 1000; }
+        } else if (hv > 0) {
+            int step = dt > 0 ? (dt * 1000 / 240) : 0;
+            hv = hv - step;
+            if (hv < 0) { hv = 0; }
+        }
+        Fx.spotHv[slot] = hv;
+        if (hv <= 0) { return; }
+        int px = Fx.spotMx[slot];
+        int py = Fx.spotMy[slot];
+        if (px < x) { px = x; } if (px > x + w) { px = x + w; }
+        if (py < y) { py = y; } if (py > y + h) { py = y + h; }
+        int eased = Fx.Ease(hv);
+        Canvas c = app.HostCanvas();
+        int reach = (w < h ? w : h) * 65 / 100;
+        int minReach = app.HostScale(108);
+        if (reach < minReach) { reach = minReach; }
+        int maxReach = app.HostScale(240);
+        if (reach > maxReach) { reach = maxReach; }
+        int r = reach * (760 + 240 * eased / 1000) / 1000;
+        int innerA = 78 * strength / 1000 * eased / 1000;
+        int coreA = 44 * strength / 1000 * eased / 1000;
+        c.PushClip(x, y, w, h);
+        if (innerA > 0) {
+            c.FillRadial(px, py, r, color, innerA);
+        }
+        if (coreA > 0) {
+            c.FillRadial(px, py, r * 45 / 100, ColorMath.LerpColor(color, (int)4294967295, 500), coreA);
+        }
+        c.PopClip();
+        Fx.SpecularBorderPointHv(app, x, y, w, h, radius, color, px, py, eased, strength);
+        if (inside || hv > 0) {
+            app.RequestAnimationFrameIn(x, y, w, h);
+        }
     }
     static void CardSheen(RenderHost app, int x, int y, int w, int h, int color, int periodMs) {
         if (w <= 0 || h <= 0) { return; }
@@ -464,12 +674,10 @@ public class Fx {
         if (o.sheen) { Fx.CardSheen(app, x, y, w, h, col, o.glowPeriodMs * 2); }
         if (o.motes) { Fx.CardMotes(app, x, y, w, h, col); }
         if (o.breath) { Fx.CardBreath(app, x, y, w, h, radius, col, o.glowPeriodMs); }
-        if (o.borderGlow) { Fx.BorderGlow(app, x, y, w, h, radius, col, o.glowPeriodMs, 220); }
+        if (o.borderGlow) { Fx.BorderBeam(app, x, y, w, h, radius, col, o.glowPeriodMs, 225); }
         if (o.spotlight) {
-            int mx = app.HostMouseX(); int my = app.HostMouseY();
-            if (mx >= x && mx < x + w && my >= y && my < y + h) {
-                Fx.SpotlightHv(app, x, y, w, h, col, (w + h) / 4, 46, 1000);
-            }
+            int skey = ((x * 31) ^ (y * 131)) ^ ((w * 977) ^ (h * 4099));
+            Fx.Spotlight(app, skey, x, y, w, h, radius, col, 620);
         }
     }
     static void BgLightPillar(RenderHost app, int x, int y, int w, int h, int color) {

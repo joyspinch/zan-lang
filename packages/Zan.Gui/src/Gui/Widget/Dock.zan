@@ -1,0 +1,458 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+namespace Gui.Widget;
+
+public class DockItem {
+    public string Icon;
+    public string Label;
+    public bool Active;
+    public int Badge;
+    public int AccentColor;
+    public UiEvent Click;
+    public DockItem(string icon, string label) {
+        this.Icon = icon != null ? icon : "";
+        this.Label = label != null ? label : "";
+        this.Active = false;
+        this.Badge = 0;
+        this.AccentColor = 0;
+        this.Click = new UiEvent();
+    }
+}
+
+// 玻璃鱼眼停靠栏：底部居中放置图标，悬停时当前图标按余弦钟形曲线平滑放大、
+// 相邻图标跟随放大并动态让位不重叠，上方浮现玻璃名称胶囊，点击带弹性轻跳反馈。
+public class Dock : Control {
+    public override Control CreateCloneShell() { return new Dock(); }
+    public List<DockItem> Items;
+    public int BaseIconSize;
+    public float MaxScale;
+    public int InfluenceRadius;
+    public int IconGap;
+    public int LiftPx;
+    public bool ShowLabels;
+
+    [Event(Alias = "Click")]
+    public UiEvent ItemClicked;
+
+    private float[] curScales;
+    private float[] jumpY;
+    private float[] jumpVel;
+    private int[] drawX;
+    private int[] drawY;
+    private int[] drawS;
+    private bool pointerOver;
+    private int pointerX;
+    private int hoverIndex = 0 - 1;
+    private int clickedIndex = 0 - 1;
+    private float tooltipAlpha;
+    private int lastTooltipIdx = 0 - 1;
+    private int lastTickMs;
+    private bool animating;
+
+    public Dock() {
+        this.InitControl("dock");
+        this.Items = new List<DockItem>();
+        this.BaseIconSize = 44;
+        this.MaxScale = 1.62f;
+        this.InfluenceRadius = 118;
+        this.IconGap = 10;
+        this.LiftPx = 14;
+        this.ShowLabels = true;
+        this.ItemClicked = new UiEvent();
+        this.wiresOwnEvents = true;
+        this.styleSurfaceOwned = true;
+        this.ClassName = "dock";
+    }
+
+    public Dock Add(string icon, string label) {
+        this.Items.Add(new DockItem(icon, label));
+        this.SyncArrays();
+        this.RequestRedraw();
+        return this;
+    }
+    public Dock Add(string icon, string label, Action onClick) {
+        DockItem it = new DockItem(icon, label);
+        if (onClick != null) { it.Click.Add(onClick); }
+        this.Items.Add(it);
+        this.SyncArrays();
+        this.RequestRedraw();
+        return this;
+    }
+    public Dock Add(DockItem item) {
+        if (item != null) {
+            this.Items.Add(item);
+            this.SyncArrays();
+            this.RequestRedraw();
+        }
+        return this;
+    }
+    public void Clear() {
+        this.Items.Clear();
+        this.curScales = null;
+        this.jumpY = null;
+        this.jumpVel = null;
+        this.drawX = null;
+        this.drawY = null;
+        this.drawS = null;
+        this.hoverIndex = 0 - 1;
+        this.RequestRedraw();
+    }
+    public int Count() { return this.Items.Count; }
+    public int ClickedIndex() { return this.clickedIndex; }
+    public int HoveredIndex() { return this.hoverIndex; }
+    public bool IsAnimating() { return this.animating; }
+
+    public Dock SetActive(int idx, bool active) {
+        if (idx >= 0 && idx < this.Items.Count) {
+            this.Items[idx].Active = active;
+            this.RequestRedraw();
+        }
+        return this;
+    }
+    public Dock SetBadge(int idx, int count) {
+        if (idx >= 0 && idx < this.Items.Count) {
+            this.Items[idx].Badge = count;
+            this.RequestRedraw();
+        }
+        return this;
+    }
+
+    public float ItemScale(int idx) {
+        if (this.curScales == null || idx < 0 || idx >= this.curScales.Length) { return 1.0f; }
+        return this.curScales[idx];
+    }
+    public void ItemRect(int idx, out int x, out int y, out int w, out int h) {
+        if (this.drawX == null || idx < 0 || idx >= this.drawX.Length) {
+            x = 0; y = 0; w = 0; h = 0; return;
+        }
+        x = this.drawX[idx];
+        y = this.drawY[idx];
+        w = this.drawS[idx];
+        h = this.drawS[idx];
+    }
+
+    private void SyncArrays() {
+        int n = this.Items.Count;
+        if (n <= 0) { return; }
+        if (this.curScales != null && this.curScales.Length == n) { return; }
+        float[] oldS = this.curScales;
+        this.curScales = new float[n];
+        this.jumpY = new float[n];
+        this.jumpVel = new float[n];
+        this.drawX = new int[n];
+        this.drawY = new int[n];
+        this.drawS = new int[n];
+        for (int i = 0; i < n; i = i + 1) {
+            this.curScales[i] = (oldS != null && i < oldS.Length) ? oldS[i] : 1.0f;
+            this.jumpY[i] = 0.0f;
+            this.jumpVel[i] = 0.0f;
+        }
+    }
+
+    private int HeadroomPx(App app) {
+        int baseSz = app.Scale(this.BaseIconSize);
+        int grow = (int)((float)baseSz * (this.MaxScale - 1.0f) + 0.5f);
+        int lift = app.Scale(this.LiftPx);
+        int tipH = this.ShowLabels ? app.Scale(30) : app.Scale(6);
+        return grow + lift + tipH;
+    }
+    private int TrayPadX(App app) { return app.Scale(12); }
+    private int TrayPadTop(App app) { return app.Scale(8); }
+    private int TrayPadBottom(App app) { return app.Scale(11); }
+
+    public override void OnMeasure(App app) {
+        int n = this.Items.Count;
+        int baseSz = app.Scale(this.BaseIconSize);
+        int gap = app.Scale(this.IconGap);
+        int padX = this.TrayPadX(app);
+        int restW = n > 0 ? (n * baseSz + (n - 1) * gap + padX * 2) : app.Scale(80);
+        // 预留两侧对称扩张空间，保证鱼眼放大时图标与玻璃托盘居中舒展不裁切
+        int extraW = (int)((float)baseSz * (this.MaxScale - 1.0f) * 2.2f + 0.5f);
+        prefW = restW + extraW;
+        prefH = this.HeadroomPx(app) + baseSz + this.TrayPadTop(app) + this.TrayPadBottom(app);
+    }
+
+    private float TargetScaleFor(App app, int idx, int restLeft, int baseSz, int gap) {
+        if (!this.pointerOver || app.HostReducedMotion()) { return 1.0f; }
+        int restCenter = restLeft + idx * (baseSz + gap) + baseSz / 2;
+        int dist = this.pointerX - restCenter;
+        if (dist < 0) { dist = 0 - dist; }
+        int rad = app.Scale(this.InfluenceRadius);
+        if (rad < baseSz) { rad = baseSz; }
+        if (dist >= rad) { return 1.0f; }
+        // 余弦钟形曲线：中心达 MaxScale，相邻平滑衰减，边界 C1 连续无硬折点
+        double t = 1.0 - (double)dist / (double)rad;
+        double bell = 0.5 * (1.0 - Math.Cos(3.1415926536 * t));
+        return 1.0f + (this.MaxScale - 1.0f) * (float)bell;
+    }
+
+    private void StepPhysics(App app) {
+        int n = this.Items.Count;
+        if (n <= 0) { this.animating = false; return; }
+        this.SyncArrays();
+        int nowMs = app.HostNowMs();
+        int dtMs = this.lastTickMs > 0 ? (nowMs - this.lastTickMs) : 16;
+        if (dtMs <= 0) { dtMs = 16; }
+        if (dtMs > 50) { dtMs = 50; }
+        this.lastTickMs = nowMs;
+        float dt = (float)dtMs / 1000.0f;
+
+        int baseSz = app.Scale(this.BaseIconSize);
+        int gap = app.Scale(this.IconGap);
+        int restRowW = n * baseSz + (n - 1) * gap;
+        int restLeft = bx + (bw - restRowW) / 2;
+
+        // 确定当前最接近光标的悬停图标
+        int nextHover = 0 - 1;
+        if (this.pointerOver) {
+            int bestD = baseSz * 9 / 10;
+            for (int i = 0; i < n; i = i + 1) {
+                int cx = (this.drawS[i] > 0) ? (this.drawX[i] + this.drawS[i] / 2)
+                                             : (restLeft + i * (baseSz + gap) + baseSz / 2);
+                int d = this.pointerX - cx;
+                if (d < 0) { d = 0 - d; }
+                if (d < bestD) { bestD = d; nextHover = i; }
+            }
+        }
+        this.hoverIndex = nextHover;
+        if (nextHover >= 0) { this.lastTooltipIdx = nextHover; }
+
+        // 指数阻尼平滑缩放 + 点击弹性轻跳
+        float blend = 1.0f - (float)Math.Exp((double)(-18.0f * dt));
+        if (blend < 0.15f) { blend = 0.15f; }
+        if (blend > 1.0f) { blend = 1.0f; }
+
+        bool moving = false;
+        for (int i = 0; i < n; i = i + 1) {
+            float want = this.TargetScaleFor(app, i, restLeft, baseSz, gap);
+            float diff = want - this.curScales[i];
+            float adiff = diff < 0.0f ? (0.0f - diff) : diff;
+            if (adiff > 0.002f) {
+                this.curScales[i] = this.curScales[i] + diff * blend;
+                moving = true;
+            } else {
+                this.curScales[i] = want;
+            }
+            // 点击弹性轻跳（欠阻尼弹簧回归 0）
+            float jy = this.jumpY[i];
+            float jv = this.jumpVel[i];
+            float ajy = jy < 0.0f ? (0.0f - jy) : jy;
+            float ajv = jv < 0.0f ? (0.0f - jv) : jv;
+            if (ajy > 0.15f || ajv > 1.0f) {
+                float acc = (0.0f - 380.0f * jy) - 18.0f * jv;
+                jv = jv + acc * dt;
+                jy = jy + jv * dt;
+                if (jy > 0.0f) { jy = 0.0f; jv = 0.0f - jv * 0.25f; }
+                this.jumpY[i] = jy;
+                this.jumpVel[i] = jv;
+                moving = true;
+            } else {
+                this.jumpY[i] = 0.0f;
+                this.jumpVel[i] = 0.0f;
+            }
+        }
+
+        // 名称胶囊平滑淡入淡出
+        float tipWant = (this.ShowLabels && this.hoverIndex >= 0) ? 1.0f : 0.0f;
+        float tipDiff = tipWant - this.tooltipAlpha;
+        float atip = tipDiff < 0.0f ? (0.0f - tipDiff) : tipDiff;
+        if (atip > 0.01f) {
+            this.tooltipAlpha = this.tooltipAlpha + tipDiff * blend;
+            moving = true;
+        } else {
+            this.tooltipAlpha = tipWant;
+            if (this.tooltipAlpha <= 0.01f) { this.lastTooltipIdx = 0 - 1; }
+        }
+
+        this.animating = moving;
+    }
+
+    private void ComputeIconGeometry(App app, out int trayX, out int trayY, out int trayW, out int trayH) {
+        int n = this.Items.Count;
+        int baseSz = app.Scale(this.BaseIconSize);
+        int gap = app.Scale(this.IconGap);
+        int padX = this.TrayPadX(app);
+        int padTop = this.TrayPadTop(app);
+        int padBot = this.TrayPadBottom(app);
+        int totalRowW = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int sz = (int)((float)baseSz * this.curScales[i] + 0.5f);
+            this.drawS[i] = sz;
+            totalRowW = totalRowW + sz;
+            if (i + 1 < n) { totalRowW = totalRowW + gap; }
+        }
+        trayW = totalRowW + padX * 2;
+        trayH = baseSz + padTop + padBot;
+        trayX = bx + (bw - trayW) / 2;
+        trayY = by + bh - trayH;
+        int baseBottomY = trayY + padTop + baseSz;
+        int liftMax = app.Scale(this.LiftPx);
+        int cx = trayX + padX;
+        float scaleSpan = this.MaxScale - 1.0f;
+        if (scaleSpan < 0.01f) { scaleSpan = 0.01f; }
+        for (int i = 0; i < n; i = i + 1) {
+            int sz = this.drawS[i];
+            float norm = (this.curScales[i] - 1.0f) / scaleSpan;
+            if (norm < 0.0f) { norm = 0.0f; }
+            if (norm > 1.0f) { norm = 1.0f; }
+            int lift = (int)((float)liftMax * norm + 0.5f);
+            int hop = (int)(this.jumpY[i] + 0.5f);
+            this.drawX[i] = cx;
+            this.drawY[i] = baseBottomY - sz - lift + hop;
+            cx = cx + sz + gap;
+        }
+    }
+
+    private int HitItemAt(int x, int y) {
+        if (this.drawX == null) { return 0 - 1; }
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            int ix = this.drawX[i];
+            int iy = this.drawY[i];
+            int isz = this.drawS[i];
+            if (x >= ix && x < ix + isz && y >= iy && y < iy + isz) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.StyleVisible() || bw <= 0 || bh <= 0) { return null; }
+        if (x < bx || x >= bx + bw || y < by || y >= by + bh) { return null; }
+        App host = this.FindApp();
+        int baseSz = host != null ? host.Scale(this.BaseIconSize) : this.BaseIconSize;
+        int trayH = baseSz + (host != null ? (this.TrayPadTop(host) + this.TrayPadBottom(host)) : 19);
+        int activeTop = by + bh - trayH;
+        if (this.pointerOver) {
+            int extra = (int)((float)baseSz * (this.MaxScale - 1.0f) + 0.5f)
+                + (host != null ? host.Scale(this.LiftPx) : this.LiftPx);
+            activeTop = activeTop - extra;
+        }
+        if (y < activeTop) { return null; }
+        return this;
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        base.OnPointerMove(e);
+        this.pointerOver = true;
+        this.pointerX = e.x;
+        this.RequestRedraw();
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        this.pointerOver = false;
+        this.hoverIndex = 0 - 1;
+        this.RequestRedraw();
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        this.pointerOver = true;
+        this.pointerX = e.x;
+        int idx = this.HitItemAt(e.x, e.y);
+        if (idx < 0 && this.hoverIndex >= 0) { idx = this.hoverIndex; }
+        if (idx >= 0 && idx < this.Items.Count) {
+            this.clickedIndex = idx;
+            App host = this.FindApp();
+            if (host != null && !host.HostReducedMotion() && this.jumpVel != null) {
+                this.jumpVel[idx] = (float)(0 - host.Scale(260));
+                this.animating = true;
+            }
+            this.Items[idx].Click.Raise(this);
+            this.ItemClicked.Raise(this);
+            this.RequestRedraw();
+            e.Handle();
+        }
+    }
+
+    public override void OnPaint(App app) {
+        if (bw <= 0 || bh <= 0 || this.Items.Count == 0) { return; }
+        this.StepPhysics(app);
+
+        int trayX = 0; int trayY = 0; int trayW = 0; int trayH = 0;
+        this.ComputeIconGeometry(app, out trayX, out trayY, out trayW, out trayH);
+
+        // 1. 底部毛玻璃托盘（宽度随放大图标弹性伸展）
+        StyleBox trayBox = paintedStyle != null ? paintedStyle : this.Box(app);
+        if (trayBox != null) {
+            trayBox.Paint(app, trayX, trayY, trayW, trayH);
+        }
+
+        // 2. 逐项绘制图标容器、矢量图标、角标与底部运行圆点
+        StyleBox itemNormal = Style.Part(app, "dock", "item", "button", this.EffectiveClass(), this.name, Style.SNormal());
+        StyleBox itemHover = Style.Part(app, "dock", "item", "button", this.EffectiveClass(), this.name, Style.SHover());
+        StyleBox dotStyle = Style.Part(app, "dock", "dot", "panel", this.EffectiveClass(), this.name, Style.SNormal());
+        int dotCol = dotStyle.BgOr(app.theme.primary);
+        int dotR = app.Scale(2);
+        if (dotR < 2) { dotR = 2; }
+        int dotY = trayY + trayH - app.Scale(5);
+
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            DockItem it = this.Items[i];
+            int ix = this.drawX[i];
+            int iy = this.drawY[i];
+            int isz = this.drawS[i];
+            bool isHov = i == this.hoverIndex;
+            StyleBox ib = isHov ? itemHover : itemNormal;
+            ib.Paint(app, ix, iy, isz, isz);
+
+            int iconD = isz * 56 / 100;
+            if (iconD < 12) { iconD = 12; }
+            int fg = it.AccentColor != 0 ? it.AccentColor : ib.FgOr(app.theme.textPrimary);
+            if (it.Icon != "") {
+                IconSvg.Draw(app.canvas, it.Icon, ix + (isz - iconD) / 2, iy + (isz - iconD) / 2, iconD, fg);
+            }
+
+            // 未读角标
+            if (it.Badge > 0) {
+                int bsz = app.Scale(16);
+                int bx0 = ix + isz - bsz + app.Scale(2);
+                int by0 = iy - app.Scale(2);
+                app.canvas.FillRoundRect(bx0, by0, bsz, bsz, bsz / 2, app.theme.error);
+                string btxt = it.Badge > 99 ? "99+" : Convert.ToString(it.Badge);
+                int bfs = app.theme.fontSizeTiny;
+                int btw = Canvas.MeasureText(btxt, bfs);
+                int bfh = Canvas.FontHeight(bfs);
+                app.canvas.DrawText(bx0 + (bsz - btw) / 2, by0 + (bsz - bfh) / 2, btxt, app.theme.textInverse, bfs);
+            }
+
+            // 活动运行指示点
+            if (it.Active) {
+                app.canvas.FillCircle(ix + isz / 2, dotY, dotR, dotCol);
+            }
+        }
+
+        // 3. 悬停图标上方玻璃名称胶囊
+        if (this.ShowLabels && this.tooltipAlpha > 0.02f
+            && this.lastTooltipIdx >= 0 && this.lastTooltipIdx < this.Items.Count) {
+            string label = this.Items[this.lastTooltipIdx].Label;
+            if (label != "") {
+                StyleBox tipStyle = Style.Part(app, "dock", "tooltip", "tooltip", this.EffectiveClass(), this.name, Style.SNormal());
+                int fs = tipStyle.FontOr(app.theme.fontSizeSmall);
+                int tw = Canvas.MeasureText(label, fs);
+                int fh = Canvas.FontHeight(fs);
+                int px = app.Scale(10);
+                int py = app.Scale(4);
+                int pw = tw + px * 2;
+                int ph = fh + py * 2;
+                int ix = this.drawX[this.lastTooltipIdx];
+                int iy = this.drawY[this.lastTooltipIdx];
+                int isz = this.drawS[this.lastTooltipIdx];
+                int tx = ix + (isz - pw) / 2;
+                if (tx < bx + 2) { tx = bx + 2; }
+                if (tx + pw > bx + bw - 2) { tx = bx + bw - 2 - pw; }
+                int ty = iy - ph - app.Scale(8);
+                if (ty < by + 2) { ty = by + 2; }
+                int tipOp = (int)(this.tooltipAlpha * 1000.0f + 0.5f);
+                tipStyle.opacity = tipOp;
+                tipStyle.Paint(app, tx, ty, pw, ph);
+                int tipFg = ColorMath.ScaleAlpha(tipStyle.FgOr(app.theme.tooltipText), tipOp);
+                app.canvas.DrawText(tx + px, ty + py, label, tipFg, fs);
+            }
+        }
+
+        if (this.animating) {
+            app.RequestAnimationFrameIn(bx, by, bw, bh);
+        }
+    }
+}

@@ -1,0 +1,352 @@
+using System;
+using Gui;
+namespace Gui.Animation;
+
+internal class HeroMorphRelay {
+    internal weak HeroMorphOverlay owner;
+    internal HeroMorphRelay(HeroMorphOverlay o) { this.owner = o; }
+    internal void OnProgress(float v) {
+        HeroMorphOverlay o = this.owner;
+        if (o != null) { o.ApplyProgress(v); }
+    }
+    internal void OnDone() {
+        HeroMorphOverlay o = this.owner;
+        if (o != null) { o.OnSpringComplete(); }
+    }
+}
+
+// 全窗自管理弹层：把源控件原位矩形以弹簧平滑变形为居中详情卡片，
+// 关闭时重新采样源控件实时矩形并原路收回（支持中途打断折返）。
+internal class HeroMorphOverlay : Control {
+    internal weak App hostApp;
+    internal weak Control sourceControl;
+    internal Control detailContent;
+    internal bool maskClosable;
+    internal int targetLogicalW;
+    internal int targetLogicalH;
+    internal Action onClosed;
+
+    internal int srcX;
+    internal int srcY;
+    internal int srcW;
+    internal int srcH;
+    internal int dstX;
+    internal int dstY;
+    internal int dstW;
+    internal int dstH;
+    internal int curX;
+    internal int curY;
+    internal int curW;
+    internal int curH;
+
+    internal float progress;
+    internal bool expanding;
+    internal bool active;
+    internal SpringAnim spring;
+
+    internal HeroMorphOverlay() {
+        this.InitControl("expandable-overlay");
+        this.wiresOwnEvents = true;
+        this.styleSurfaceOwned = true;
+        this.maskClosable = true;
+    }
+
+    public override bool SelfManagesOverlayLayout() { return true; }
+
+    internal void ViewportBounds(App app, out int cx, out int cy, out int cw, out int ch) {
+        cx = 0;
+        cy = 0;
+        cw = app != null ? app.ClientWidth() : 640;
+        ch = app != null ? app.ClientHeight() : 480;
+        if (cw <= 0) { cw = 640; }
+        if (ch <= 0) { ch = 480; }
+    }
+
+    internal void CaptureSourceRect(App app) {
+        Control src = this.sourceControl;
+        if (src != null && src.bw > 0 && src.bh > 0) {
+            this.srcX = src.bx;
+            this.srcY = src.by;
+            this.srcW = src.bw;
+            this.srcH = src.bh;
+            return;
+        }
+        int cx = 0; int cy = 0; int cw = 0; int ch = 0;
+        this.ViewportBounds(app, out cx, out cy, out cw, out ch);
+        this.srcW = app.Scale(140);
+        this.srcH = app.Scale(44);
+        this.srcX = cx + (cw - this.srcW) / 2;
+        this.srcY = cy + (ch - this.srcH) / 2;
+    }
+
+    internal void ComputeDestRect(App app) {
+        int cx = 0; int cy = 0; int cw = 0; int ch = 0;
+        this.ViewportBounds(app, out cx, out cy, out cw, out ch);
+        int margin = app.Scale(24);
+        int maxW = cw - margin * 2;
+        int maxH = ch - margin * 2;
+        if (maxW < 120) { maxW = cw > 40 ? cw : 120; }
+        if (maxH < 100) { maxH = ch > 40 ? ch : 100; }
+        int w = this.targetLogicalW > 0 ? app.Scale(this.targetLogicalW) : app.Scale(520);
+        int h = this.targetLogicalH > 0 ? app.Scale(this.targetLogicalH) : app.Scale(360);
+        if (w > maxW) { w = maxW; }
+        if (h > maxH) { h = maxH; }
+        this.dstW = w;
+        this.dstH = h;
+        this.dstX = cx + (cw - w) / 2;
+        this.dstY = cy + (ch - h) / 2;
+        this.bx = cx;
+        this.by = cy;
+        this.bw = cw;
+        this.bh = ch;
+    }
+
+    internal void UpdateInterpolatedRect() {
+        float p = this.progress;
+        int x = this.srcX + (int)((float)(this.dstX - this.srcX) * p + 0.5f);
+        int y = this.srcY + (int)((float)(this.dstY - this.srcY) * p + 0.5f);
+        int w = this.srcW + (int)((float)(this.dstW - this.srcW) * p + 0.5f);
+        int h = this.srcH + (int)((float)(this.dstH - this.srcH) * p + 0.5f);
+        if (w < 16) { w = 16; }
+        if (h < 16) { h = 16; }
+        this.curX = x;
+        this.curY = y;
+        this.curW = w;
+        this.curH = h;
+        App app = this.hostApp;
+        if (this.detailContent != null && app != null) {
+            this.detailContent.InheritApp(app);
+            int pad = app.Scale(16);
+            int iw = w - pad * 2;
+            int ih = h - pad * 2;
+            if (iw < 1) { iw = 1; }
+            if (ih < 1) { ih = 1; }
+            this.detailContent.MeasureTree(app, iw);
+            this.detailContent.Arrange(x + pad, y + pad, iw, ih);
+            float opF = (p - 0.18f) / 0.62f;
+            if (opF < 0.0f) { opF = 0.0f; }
+            if (opF > 1.0f) { opF = 1.0f; }
+            this.detailContent.SetMotionOpacity((int)(opF * 1000.0f + 0.5f));
+        }
+        Control src = this.sourceControl;
+        if (src != null) {
+            int srcOp = p <= 0.04f ? 1000 : (p >= 0.25f ? 0 : (int)((1.0f - (p - 0.04f) / 0.21f) * 1000.0f));
+            if (srcOp < 0) { srcOp = 0; }
+            if (srcOp > 1000) { srcOp = 1000; }
+            src.SetMotionOpacity(srcOp);
+        }
+    }
+
+    internal void StartExpand(App app) {
+        this.hostApp = app;
+        this.CaptureSourceRect(app);
+        this.ComputeDestRect(app);
+        if (this.detailContent != null && this.detailContent.parent != this) {
+            this.Add(this.detailContent);
+        }
+        this.expanding = true;
+        this.active = true;
+        this.progress = 0.0f;
+        this.UpdateInterpolatedRect();
+        app.overlayHost.Push(app, null, this, true);
+        if (app.HostReducedMotion()) {
+            this.progress = 1.0f;
+            this.UpdateInterpolatedRect();
+            app.RequestRedraw();
+            return;
+        }
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        tl.AutoBind(app);
+        if (this.spring != null) { tl.RemoveSpring(this.spring); this.spring = null; }
+        HeroMorphRelay relay = new HeroMorphRelay(this);
+        this.spring = SpringAnim.FromDurationBounce(0.0f, 1.0f, 0.36f, 0.14f, relay.OnProgress);
+        this.spring.WithPrecision(0.002f, 0.008f);
+        this.spring.OnComplete(relay.OnDone);
+        tl.AddSpring(this.spring);
+        this.spring.Play();
+        app.RequestRedraw();
+    }
+
+    internal void StartCollapse() {
+        if (!this.active) { return; }
+        App app = this.hostApp;
+        if (app == null) { this.FinalizeClose(); return; }
+        this.CaptureSourceRect(app);
+        this.expanding = false;
+        if (app.HostReducedMotion()) {
+            this.progress = 0.0f;
+            this.FinalizeClose();
+            return;
+        }
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        tl.AutoBind(app);
+        if (this.spring != null && !this.spring.finished) {
+            float k = 360.0f; float c = 30.0f;
+            this.spring.stiffness = k;
+            this.spring.damping = c;
+            this.spring.Retarget(0.0f);
+        } else {
+            if (this.spring != null) { tl.RemoveSpring(this.spring); }
+            HeroMorphRelay relay = new HeroMorphRelay(this);
+            this.spring = SpringAnim.Create(this.progress, 0.0f, 360.0f, 30.0f, 1.0f, relay.OnProgress);
+            this.spring.WithPrecision(0.002f, 0.008f);
+            this.spring.OnComplete(relay.OnDone);
+            tl.AddSpring(this.spring);
+            this.spring.Play();
+        }
+        app.RequestRedraw();
+    }
+
+    internal void ApplyProgress(float v) {
+        this.progress = v;
+        this.UpdateInterpolatedRect();
+        App app = this.hostApp;
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    internal void OnSpringComplete() {
+        this.spring = null;
+        if (this.expanding) {
+            this.progress = 1.0f;
+            this.UpdateInterpolatedRect();
+            App app = this.hostApp;
+            if (app != null) { app.RequestRedraw(); }
+        } else {
+            this.progress = 0.0f;
+            this.FinalizeClose();
+        }
+    }
+
+    internal void FinalizeClose() {
+        AnimationTimeline tl = AnimationTimeline.Shared;
+        if (this.spring != null) { tl.RemoveSpring(this.spring); this.spring = null; }
+        Control src = this.sourceControl;
+        if (src != null) { src.ResetMotion(); }
+        if (this.detailContent != null) {
+            this.detailContent.ResetMotion();
+            this.Remove(this.detailContent);
+        }
+        bool wasActive = this.active;
+        this.active = false;
+        App app = this.hostApp;
+        if (app != null) {
+            app.overlayHost.Hide(this);
+            app.RequestRedraw();
+        }
+        Action cb = this.onClosed;
+        this.onClosed = null;
+        if (wasActive && cb != null) { cb(); }
+    }
+
+    public override bool OnPopupEscape(App app) {
+        if (!this.active) { return false; }
+        this.StartCollapse();
+        return true;
+    }
+
+    public override void OnPopupDismissed() {
+        if (this.active) { this.FinalizeClose(); }
+    }
+
+    public override Control HitTest(int x, int y, int pointerType) {
+        if (!this.active) { return null; }
+        if (this.detailContent != null && this.expanding && this.progress >= 0.45f
+            && x >= this.curX && x < this.curX + this.curW
+            && y >= this.curY && y < this.curY + this.curH) {
+            Control hit = this.detailContent.HitTest(x, y, pointerType);
+            if (hit != null) { return hit; }
+        }
+        return this;
+    }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        if (!this.active) { return; }
+        bool insideSheet = e.x >= this.curX && e.x < this.curX + this.curW
+            && e.y >= this.curY && e.y < this.curY + this.curH;
+        if (!insideSheet && this.maskClosable) {
+            this.StartCollapse();
+            e.Handle();
+        }
+    }
+
+    public override bool ChildControlsRenderedByOwner() { return true; }
+
+    public override void OnPaint(App app) {
+        if (!this.active) { return; }
+        int cx = 0; int cy = 0; int cw = 0; int ch = 0;
+        this.ViewportBounds(app, out cx, out cy, out cw, out ch);
+        if (cw != bw || ch != bh || cx != bx || cy != by) {
+            this.ComputeDestRect(app);
+            this.UpdateInterpolatedRect();
+        }
+        float cp = this.progress < 0.0f ? 0.0f : (this.progress > 1.0f ? 1.0f : this.progress);
+        StyleBox maskStyle = Style.Part(app, "expandable", "mask", "panel", "", "", Style.SNormal());
+        int maskCol = maskStyle.BgOr(app.theme.overlay);
+        if (maskCol != 0 && cp > 0.01f) {
+            int fadeMask = ColorMath.ScaleAlpha(maskCol, (int)(cp * 1000.0f));
+            app.canvas.FillRect(bx, by, bw, bh, fadeMask);
+        }
+        StyleBox sheetStyle = Style.Part(app, "expandable", "sheet", "card", "", "", Style.SNormal());
+        sheetStyle.Paint(app, this.curX, this.curY, this.curW, this.curH);
+        if (this.detailContent != null && cp > 0.16f) {
+            app.canvas.PushClip(this.curX, this.curY, this.curW, this.curH);
+            try {
+                this.detailContent.RenderTree(app);
+            } finally {
+                app.canvas.PopClip();
+            }
+        }
+    }
+}
+
+// 共享元素原位展开/原路收回控制器：可独立复用在任意按钮/卡片上。
+public class HeroMorph {
+    private HeroMorphOverlay overlay;
+
+    public HeroMorph() {}
+
+    public void Open(App app, Control source, Control detailContent,
+                     int targetWidth, int targetHeight, bool maskClosable, Action onClosed) {
+        if (app == null) { return; }
+        if (this.overlay != null && this.overlay.active) {
+            this.overlay.FinalizeClose();
+        }
+        HeroMorphOverlay ov = new HeroMorphOverlay();
+        ov.sourceControl = source;
+        ov.detailContent = detailContent;
+        ov.targetLogicalW = targetWidth;
+        ov.targetLogicalH = targetHeight;
+        ov.maskClosable = maskClosable;
+        ov.onClosed = onClosed;
+        this.overlay = ov;
+        ov.StartExpand(app);
+    }
+
+    public void Close() {
+        if (this.overlay != null && this.overlay.active) {
+            this.overlay.StartCollapse();
+        }
+    }
+
+    public bool IsOpen() {
+        return this.overlay != null && this.overlay.active;
+    }
+    public bool IsExpanding() {
+        return this.overlay != null && this.overlay.active && this.overlay.expanding;
+    }
+    public bool IsAnimating() {
+        return this.overlay != null && this.overlay.spring != null
+            && this.overlay.spring.active && !this.overlay.spring.finished;
+    }
+    public float Progress() {
+        return this.overlay != null ? this.overlay.progress : 0.0f;
+    }
+    public void CurrentRect(out int x, out int y, out int w, out int h) {
+        if (this.overlay == null) { x = 0; y = 0; w = 0; h = 0; return; }
+        x = this.overlay.curX;
+        y = this.overlay.curY;
+        w = this.overlay.curW;
+        h = this.overlay.curH;
+    }
+}

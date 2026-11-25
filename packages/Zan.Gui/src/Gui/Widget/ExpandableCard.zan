@@ -1,0 +1,168 @@
+using System;
+using Gui;
+using Gui.Animation;
+namespace Gui.Widget;
+
+internal class ExpandableCloseRelay {
+    internal weak ExpandableCard owner;
+    internal ExpandableCloseRelay(ExpandableCard c) { this.owner = c; }
+    internal void OnExpandClick() {
+        ExpandableCard c = this.owner;
+        if (c != null && !c.IsDisabled()) { c.Expand(); }
+    }
+    internal void OnCloseClick() {
+        ExpandableCard c = this.owner;
+        if (c != null) { c.Collapse(); }
+    }
+    internal void OnMorphClosed() {
+        ExpandableCard c = this.owner;
+        if (c != null) { c.NotifyCollapsed(); }
+    }
+}
+
+// 点击原位展开控件：点击触发视图（按钮或摘要卡）即从原位平滑放大为详情视图，
+// 关闭（点遮罩 / 按 Esc / 点关闭按钮 / Collapse()）时沿原路弹簧收回。
+public class ExpandableCard : Control {
+    public override Control CreateCloneShell() { return new ExpandableCard(); }
+    public Control TriggerContent;
+    public Control DetailContent;
+    public string DetailTitle;
+    public int DetailWidth;
+    public int DetailHeight;
+    public bool MaskClosable;
+    public bool ShowCloseButton;
+
+    [Event]
+    public UiEvent Expanded;
+    [Event]
+    public UiEvent Collapsed;
+
+    private HeroMorph morph;
+    private Flex sheetContainer;
+
+    public ExpandableCard() {
+        this.InitControl("expandable");
+        this.wiresOwnEvents = true;
+        this.DetailTitle = "";
+        this.DetailWidth = 520;
+        this.DetailHeight = 360;
+        this.MaskClosable = true;
+        this.ShowCloseButton = true;
+        this.Expanded = new UiEvent();
+        this.Collapsed = new UiEvent();
+        this.morph = new HeroMorph();
+        this.ClassName = "expandable";
+    }
+    public ExpandableCard(Control trigger, Control detail) : this() {
+        this.SetTrigger(trigger);
+        this.SetDetail(detail);
+    }
+
+    public override int StyleDisplay() { return 1; }
+    public override int StyleFlexDir() { return 1; }
+
+    public ExpandableCard SetTrigger(Control trigger) {
+        if (this.TriggerContent != null) { this.Remove(this.TriggerContent); }
+        this.TriggerContent = trigger;
+        if (trigger != null) {
+            if (trigger is Button) {
+                ExpandableCloseRelay relay = new ExpandableCloseRelay(this);
+                ((Button)trigger).Click.Add(relay.OnExpandClick);
+            }
+            base.Add(trigger);
+        }
+        this.RequestRedraw();
+        return this;
+    }
+
+    public ExpandableCard SetDetail(Control detail) {
+        this.DetailContent = detail;
+        return this;
+    }
+
+    public ExpandableCard WithDetailSize(int width, int height) {
+        this.DetailWidth = width;
+        this.DetailHeight = height;
+        return this;
+    }
+
+    public ExpandableCard WithTitle(string title) {
+        this.DetailTitle = title != null ? title : "";
+        return this;
+    }
+
+    public override Control Add(Control child) {
+        if (child == null) { return null; }
+        if (this.TriggerContent == null) {
+            this.SetTrigger(child);
+            return child;
+        }
+        return base.Add(child);
+    }
+
+    private Control BuildSheetRoot() {
+        if (!this.ShowCloseButton && this.DetailTitle == "" && this.DetailContent != null) {
+            return this.DetailContent;
+        }
+        Flex root = new Flex();
+        root.ClassName = "col";
+        root.inlineStyleCss = "display: flex; flex-direction: column; gap: 12; flex-grow: 1; min-width: 0; min-height: 0;";
+        Flex hdr = new Flex();
+        hdr.ClassName = "row justify-between align-center";
+        hdr.inlineStyleCss = "display: flex; flex-direction: row; align-items: center; justify-content: space-between; flex-shrink: 0;";
+        Label ttl = new Label(this.DetailTitle);
+        ttl.ClassName = "strong";
+        hdr.Add(ttl);
+        if (this.ShowCloseButton) {
+            Button closeBtn = new Button(new IconView("x", 14));
+            closeBtn.ClassName = "ghost small round";
+            ExpandableCloseRelay relay = new ExpandableCloseRelay(this);
+            closeBtn.Click.Add(relay.OnCloseClick);
+            hdr.Add(closeBtn);
+        }
+        root.Add(hdr);
+        if (this.DetailContent != null) {
+            root.Add(this.DetailContent);
+        }
+        this.sheetContainer = root;
+        return root;
+    }
+
+    public void Expand() {
+        App host = this.FindApp();
+        if (host == null || this.morph.IsOpen()) { return; }
+        Control sheet = this.BuildSheetRoot();
+        ExpandableCloseRelay relay = new ExpandableCloseRelay(this);
+        this.morph.Open(host, this, sheet, this.DetailWidth, this.DetailHeight,
+                        this.MaskClosable, relay.OnMorphClosed);
+        this.Expanded.Raise(this);
+    }
+
+    public void Collapse() {
+        if (this.morph != null && this.morph.IsOpen()) {
+            this.morph.Close();
+        }
+    }
+
+    internal void NotifyCollapsed() {
+        if (this.sheetContainer != null && this.DetailContent != null) {
+            this.sheetContainer.Remove(this.DetailContent);
+        }
+        this.sheetContainer = null;
+        this.Collapsed.Raise(this);
+    }
+
+    public bool IsExpanded() { return this.morph != null && this.morph.IsOpen(); }
+    public bool IsAnimating() { return this.morph != null && this.morph.IsAnimating(); }
+    public float MorphProgress() { return this.morph != null ? this.morph.Progress() : 0.0f; }
+    public void MorphRect(out int x, out int y, out int w, out int h) {
+        if (this.morph == null) { x = 0; y = 0; w = 0; h = 0; return; }
+        this.morph.CurrentRect(out x, out y, out w, out h);
+    }
+
+    public override void OnClick(RoutedEventArgs e) {
+        if (this.IsDisabled()) { return; }
+        this.Expand();
+        e.Handle();
+    }
+}
