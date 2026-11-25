@@ -876,3 +876,27 @@ retain 在 Make 里、release 在调用方；内联后 retain/release 自己也�
 → 5–6s wall，无界空闲链版本同样超时）；先看 user 时间再下结论。owner 节点
 缓存深度改存在空闲链头节点里，少一个 thread_local（Mach-O 每次访问都是
 `_tlv_get_addr`）。
+
+## 40. 对齐 C 先建对照基准，再逐项拆因（2026-11-24 Mac arm64 实证）
+
+`_scratch/bench_suite/`（Zan 与 C/C++ 成对、`run.py` 比 user+sys）一次找出 7 个
+差距。先用 `--no-runtime-checks` 把"守卫"与"其余"分开，再对 C 侧做反向实验
+（`-ffp-contract=off`、`-fno-strict-aliasing`、把常量 n 改 volatile、结构数组改
+指针数组）定位到底是哪一个语言/编译器差异——比读汇编猜快得多。
+
+- **委托调用 10×**：每次经 Func 形参调用都 retain 闭包 + 临时栈 push/pop
+  （两次原子 + 两次 TSD 查找）。形参/局部若函数内从不写、不按 ref 传、不被
+  lambda 捕获（`body_writes_ident` + 按名 `local_is_lambda_captured`；形参没有
+  binding_decl，按名构造 AST_PARAM 查即可），槽位自身的引用保证闭包存活，
+  省掉整套簿记：1.48s → 0.15s（= C 函数指针）。
+- **nbody 去守卫后仍 2.2×**：C 加 `-fno-strict-aliasing` 正好慢到 Zan 的水平——
+  缺 TBAA。`emit_field_ptr` 给字段地址打 `!zan.fo`（字段字节偏移），`opt_tbaa.c`
+  在优化前把它转成 load/store 的 `!tbaa`。按**偏移**而非类做键：不同对象不重叠，
+  派生类前缀布局相同，同对象不同偏移的标量字段不重叠——这三条成立就安全；
+  显式布局（可重叠）、聚合类型字段、访问类型≠字段类型一律不打（不打=与谁都
+  可能别名）。0.79s → 0.41s（= C 指针版）。`ZAN_NO_TBAA=1` 做 A/B。
+- 内联后 ARC 收尾扩到跨循环区域：`Body a = bs[i]` 的 retain 在外层、release 在
+  内层循环之后；区域内无调用/指针存储/异对象 release、所有路径都到 release、
+  区域块只从区域内进入，才可消。
+- 守卫（软失败 phi(x, scratch) 让 LLVM 无法证明非空）、Dictionary、Array.Sort、
+  分配器是独立根因，各自另开任务。

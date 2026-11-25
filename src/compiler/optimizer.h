@@ -95,4 +95,8 @@ zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod);
 /* Shared gate for optimizer stages and artifact writers. */
 zan_status_t zan_opt_verify_module(LLVMModuleRef mod, const char *stage);
 
+/* opt_tbaa.c: field-offset TBAA (see file comment). */
+void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st, int fi);
+int zan_opt_tbaa(LLVMModuleRef mod);
+
 #endif /* ZAN_OPTIMIZER_H */

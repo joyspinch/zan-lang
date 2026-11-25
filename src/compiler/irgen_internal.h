@@ -289,6 +289,7 @@ LLVMValueRef zan_irgen_returnaddress_fn(zan_irgen_t *g, LLVMTypeRef *out_ty);
 void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap, LLVMValueRef v);
 LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char *name);
 LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym, LLVMTypeRef st, LLVMValueRef base, int fi, const char *name);
+void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st, int fi);
 void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb);
 LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef v, int is_unsigned);
 LLVMValueRef emit_itoa_string(zan_irgen_t *g, LLVMValueRef v, int is_unsigned);

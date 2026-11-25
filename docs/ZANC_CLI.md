@@ -407,6 +407,8 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_NO_LATE_ARC` | `=1` 关闭内联后 ARC 收尾（默认 `-O2`/`-O3`/`-Os`/`-Oz` 开启：retain/release 与临时栈 push/pop 助手在 LLVM 主管线中保持外联，管线后消去同块或经软空守卫分叉的 retain/release 对、窗口内不会展开的 push/pop 对，再按原内联属性内联助手），仅供 A/B |
 | `ZAN_LATE_ARC_STATS` | 非空时在 stderr 打印内联后 ARC 收尾消去的 push/pop 对与 retain/release 对数 |
 | `ZAN_DUMP_LATE_ARC_IR` | `=<路径>` 落盘内联后 ARC 收尾之前的模块 IR（排查消对是否命中） |
+| `ZAN_NO_TBAA` | `=1` 关闭字段别名元数据（默认优化构建给经 `emit_field_ptr` 的标量字段读写打按字段字节偏移的 TBAA 标签，告诉 LLVM 同一对象不同偏移的字段互不别名；显式布局结构不打），仅供 A/B 与排查疑似误编译 |
+| `ZAN_DLG_PIN_ALL` | `=1` 时每次委托调用都 retain 闭包并压临时栈（旧行为）。默认对函数内从不写、不按 ref 传、不被 lambda 捕获的局部/形参委托省掉这套簿记，仅供 A/B |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
 | `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断；设置时自动关闭构建缓存（命中会吞掉旁路输出，`ZAN_DUMP_OPT_IR` 同理） |
 | `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |

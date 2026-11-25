@@ -191,6 +191,7 @@ add_executable(zanc
     src/compiler/codegen_split.cpp
     src/compiler/build_cache.cpp
     src/compiler/optimizer.c
+    src/compiler/opt_tbaa.c
     src/compiler/incremental.c
     src/compiler/package.c
     src/compiler/stdlib_ext.c

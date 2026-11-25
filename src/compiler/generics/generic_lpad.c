@@ -400,6 +400,31 @@ int call_consumes_free_arg(LLVMValueRef callee) {
 }
 void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
                                          local_scope_t *locals);
+/* A delegate held in a local or parameter that the function never writes,
+ * never passes by ref and no lambda captures cannot lose its owner during
+ * the call: neither argument evaluation nor the callback can reach that
+ * slot. The slot's own reference keeps the closure alive, so the call needs
+ * no retain/temp-push/pop/release around it (an indirect call through a
+ * Func parameter used to pay two atomics and two EH-state lookups). */
+static bool delegate_callee_is_stable_local(zan_irgen_t *g, zan_ast_node_t *callee,
+                                            local_scope_t *locals) {
+    static int pin_all = -1;
+    if (pin_all < 0) pin_all = getenv("ZAN_DLG_PIN_ALL") != NULL;
+    if (pin_all) return false;
+    if (!callee || callee->kind != AST_IDENTIFIER || !locals || !g->current_fn_body) return false;
+    if (g->current_async_frame) return false;
+    local_var_t *v = local_find(locals, callee->ident.name);
+    if (!v || v->byref_slot || v->box_cell) return false;
+    if (body_writes_ident(g, g->current_fn_body, callee->ident.name)) return false;
+    /* Parameters carry no binding_decl; the capture scan only needs the
+     * name (and matching by name is conservative). */
+    zan_ast_node_t by_name;
+    memset(&by_name, 0, sizeof(by_name));
+    by_name.kind = AST_PARAM;
+    by_name.param.name = callee->ident.name;
+    return !local_is_lambda_captured(g, locals, g->current_fn_body, &by_name);
+}
+
 LLVMValueRef emit_delegate_call(zan_irgen_t *g,
                                        zan_type_t *delegate_type,
                                        LLVMValueRef fn_ptr,
@@ -434,9 +459,10 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
     /* The callee is borrowed from its local/field slot. Argument evaluation
      * or the callback may overwrite that last owner, so keep the selected
      * delegate alive until the invocation and argument cleanup finish. */
-    emit_closure_retain(g, fn_ptr);
+    bool stable = delegate_callee_is_stable_local(g, call->call.callee, locals);
+    if (!stable) emit_closure_retain(g, fn_ptr);
     int eh_pushed = 0;
-    if (!g->current_fn_no_runtime) {
+    if (!stable && !g->current_fn_no_runtime) {
         emit_eh_tmp_push_slot(g, fn_ptr, ZAN_EH_SLOT_DLG);
         eh_pushed = 1;
     }
@@ -466,7 +492,7 @@ LLVMValueRef emit_delegate_call(zan_irgen_t *g,
             g, call->call.args.items[k], call_args[k], locals);
     }
     if (eh_pushed) emit_eh_tmp_pop(g);
-    emit_closure_release(g, fn_ptr);
+    if (!stable) emit_closure_release(g, fn_ptr);
     free(call_args);
     free(param_types);
     return result;

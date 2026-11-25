@@ -221,7 +221,9 @@ LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
         LLVMTypeRef wrap = LLVMStructTypeInContext(g->ctx, &e->field_llvm[fi], 1, 0);
         return LLVMBuildStructGEP2(g->builder, wrap, raw, 0, name);
     }
-    return LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
+    LLVMValueRef p = LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
+    zan_tbaa_mark_field(g, p, st, fi);
+    return p;
 }
 bool field_member_is_static(zan_symbol_t *m) {
     if (m->modifiers & MOD_STATIC) return true;

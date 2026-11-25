@@ -880,6 +880,10 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     class_index_reset();
     /* The context owns every type, constant and metadata node (~36 MB for
      * the self-hosted compiler); it outlived the module until process exit. */
+    if (g->tbaa_td) {
+        LLVMDisposeTargetData(g->tbaa_td);
+        g->tbaa_td = NULL;
+    }
     if (g->ctx) {
         LLVMContextDispose(g->ctx);
         g->ctx = NULL;

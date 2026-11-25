@@ -759,6 +759,8 @@ struct zan_irgen {
     /* Bumped by every emitted temp-stack push. A function whose body emitted
      * none needs no entry mark and no landing-pad unwind (finish_fn_lpad). */
     unsigned eh_tmp_push_seq;
+    /* Data layout for field-offset TBAA tags (opt_tbaa.c); lazily created. */
+    LLVMTargetDataRef tbaa_td;
 
     char target_triple[128];
     /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */

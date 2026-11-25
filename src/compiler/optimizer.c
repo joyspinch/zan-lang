@@ -1438,6 +1438,128 @@ static int late_drop_cross_pairs(LLVMValueRef fn) {
     return dropped;
 }
 
+/* Pass 2c: retain(x) whose releases lie further away, across a loop -- the
+ * shape of `Body a = bs[i]` held while an inner loop works on its fields.
+ * Walk forward from the retain; every path must reach a release of x before
+ * leaving the region (no return/resume/unreachable/invoke), may not loop
+ * back into the retain's block, and every instruction on the way must be
+ * ARC-neutral (late_window_ok) and store no pointer (a pointer store could
+ * replace x in its owning slot through an alias). Every region block must be
+ * entered only from inside the region. Then the retain and the releases
+ * that end the region cancel out on every path. */
+#define LATE_REGION_BLOCKS 64
+#define LATE_REGION_INSTS 4096
+
+typedef struct {
+    LLVMBasicBlockRef blocks[LATE_REGION_BLOCKS];
+    int nblocks;
+    LLVMValueRef rels[LATE_REGION_BLOCKS];
+    int nrels;
+    int insts;
+} late_region_t;
+
+static int late_region_index(late_region_t *r, LLVMBasicBlockRef bb) {
+    for (int i = 0; i < r->nblocks; i++)
+        if (r->blocks[i] == bb) return i;
+    return -1;
+}
+
+/* Scan `bb` from `start`; returns false to abort. Successors are queued. */
+static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRef start,
+                             LLVMValueRef obj, zan_arc_call_kind_t want) {
+    for (LLVMValueRef c = start; c; c = LLVMGetNextInstruction(c)) {
+        if (++r->insts > LATE_REGION_INSTS) return false;
+        zan_arc_call_kind_t ck = get_arc_call_kind(c);
+        if (ck == want && are_same_arc_object(get_arc_operand(c), obj)) {
+            if (r->nrels >= LATE_REGION_BLOCKS) return false;
+            r->rels[r->nrels++] = c;
+            return true; /* this path ends here */
+        }
+        if (LLVMIsATerminatorInst(c)) {
+            LLVMOpcode op = LLVMGetInstructionOpcode(c);
+#if ZAN_LLVM_MAJOR >= 23
+            bool branch = op == LLVMUncondBr || op == LLVMCondBr || op == LLVMSwitch;
+#else
+            bool branch = op == LLVMBr || op == LLVMSwitch;
+#endif
+            if (!branch) return false;
+            unsigned ns = LLVMGetNumSuccessors(c);
+            for (unsigned i = 0; i < ns; i++) {
+                LLVMBasicBlockRef sb = LLVMGetSuccessor(c, i);
+                if (sb == r->blocks[0]) return false; /* loops back to the retain */
+                if (late_region_index(r, sb) >= 0) continue;
+                if (r->nblocks >= LATE_REGION_BLOCKS) return false;
+                r->blocks[r->nblocks++] = sb;
+            }
+            return true;
+        }
+        if (!late_window_ok(c, obj)) return false;
+        if (LLVMIsAStoreInst(c) &&
+            LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(c, 0))) == LLVMPointerTypeKind)
+            return false;
+        if (LLVMIsAPHINode(c) && LLVMGetInstructionParent(c) != bb) return false;
+    }
+    return false;
+}
+
+static bool late_try_region(LLVMValueRef retain, shrink_map_t *preds) {
+    LLVMValueRef obj = get_arc_operand(retain);
+    zan_arc_call_kind_t want =
+        get_arc_call_kind(retain) == ARC_RETAIN_OBJ ? ARC_RELEASE_OBJ : ARC_RELEASE_STR;
+    late_region_t r;
+    memset(&r, 0, sizeof(r));
+    r.blocks[r.nblocks++] = LLVMGetInstructionParent(retain);
+    if (!late_region_scan(&r, r.blocks[0], LLVMGetNextInstruction(retain), obj, want)) return false;
+    for (int bi = 1; bi < r.nblocks; bi++)
+        if (!late_region_scan(&r, r.blocks[bi], LLVMGetFirstInstruction(r.blocks[bi]), obj, want))
+            return false;
+    if (r.nrels == 0 || r.nblocks < 2) return false; /* single-block cases: passes 2/2b */
+    /* Every non-entry region block is entered only from inside the region. */
+    for (int bi = 1; bi < r.nblocks; bi++) {
+        int inside = 0;
+        for (int pj = 0; pj < r.nblocks; pj++) {
+            LLVMValueRef t = LLVMGetBasicBlockTerminator(r.blocks[pj]);
+            unsigned ns = t ? LLVMGetNumSuccessors(t) : 0;
+            for (unsigned k = 0; k < ns; k++)
+                if (LLVMGetSuccessor(t, k) == r.blocks[bi]) inside++;
+        }
+        if (inside != *shrink_map_slot(preds, LLVMBasicBlockAsValue(r.blocks[bi]), NULL))
+            return false;
+    }
+    for (int i = 0; i < r.nrels; i++) LLVMInstructionEraseFromParent(r.rels[i]);
+    LLVMInstructionEraseFromParent(retain);
+    return true;
+}
+
+static int late_drop_region_pairs(LLVMValueRef fn) {
+    unsigned nblocks = LLVMCountBasicBlocks(fn);
+    if (nblocks < 3) return 0;
+    shrink_map_t preds;
+    if (!shrink_map_init(&preds, nblocks)) return 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(bb);
+        if (!term) continue;
+        unsigned ns = LLVMGetNumSuccessors(term);
+        for (unsigned i = 0; i < ns; i++)
+            (*shrink_map_slot(&preds, LLVMBasicBlockAsValue(LLVMGetSuccessor(term, i)), NULL))++;
+    }
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef c = LLVMGetFirstInstruction(bb);
+        while (c) {
+            LLVMValueRef next = LLVMGetNextInstruction(c);
+            zan_arc_call_kind_t k = get_arc_call_kind(c);
+            if ((k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) && late_try_region(c, &preds)) {
+                dropped++;
+                break; /* releases may have been erased; rescan from the next block */
+            }
+            c = next;
+        }
+    }
+    shrink_map_free(&preds);
+    return dropped;
+}
+
 static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, unsigned mask) {
     int tmp = 0, arc = 0;
     const char *dump = getenv("ZAN_DUMP_LATE_ARC_IR");
@@ -1447,6 +1569,7 @@ static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, 
         tmp += late_drop_tmp_pairs(fn);
         arc += late_drop_arc_pairs(fn);
         arc += late_drop_cross_pairs(fn);
+        arc += late_drop_region_pairs(fn);
     }
     if (getenv("ZAN_LATE_ARC_STATS"))
         fprintf(stderr, "late-arc: %d temp push/pop pairs, %d retain/release pairs removed\n", tmp,
@@ -1724,6 +1847,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
     double t0 = get_time_ms();
 
     /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
+    zan_opt_tbaa(g->mod);
     if (!getenv("ZAN_NO_OPT_EARLY") && zan_opt_early_mem2reg(g) != ZAN_OK) {
         report.success = false;
         return report;
