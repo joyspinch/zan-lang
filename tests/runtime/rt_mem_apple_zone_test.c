@@ -6,6 +6,7 @@
  * back to rt_mem.c. */
 #include <malloc/malloc.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@ void *zan_mem_malloc(size_t n);
 void zan_mem_free(void *p);
 void *zan_mem_calloc(size_t n, size_t m);
 void *zan_mem_realloc(void *p, size_t n);
+void *zan_mem_obj_malloc(size_t n);
 size_t zan_mem_slabs(void);
 
 static int failures;
@@ -53,6 +55,29 @@ int main(void) {
     void *b = zan_mem_malloc(24);
     CHECK(b == a, "libc free returned the block to the Zan free list");
     zan_mem_free(b);
+
+    /* Object pages: zan_rt_alloc's n % 16 == 8 sizes get exact 8-granular
+     * blocks (a 16-byte header + vptr + two fields = 40, not 48); sizes that
+     * are multiples of 16 keep the 16-aligned general classes. */
+    unsigned char *o1 = zan_mem_obj_malloc(40);
+    unsigned char *o2 = zan_mem_obj_malloc(40);
+    CHECK(o1 && o2 && malloc_size(o1) == 40, "40-byte object block is exact");
+    CHECK(((uintptr_t)o1 & 7) == 0, "object block is 8-aligned");
+    CHECK(o2 == o1 + 40 || o1 == o2 + 40, "object blocks are packed 40 apart");
+    memset(o1, 0xab, 40);
+    memset(o2, 0xcd, 40);
+    CHECK(o1[39] == 0xab && o2[0] == 0xcd, "neighbouring object blocks do not overlap");
+    zan_mem_free(o1);
+    CHECK(zan_mem_obj_malloc(40) == o1, "freed object block is reused");
+    free(o2);                     /* libc free of an object-page block */
+    unsigned char *o3 = zan_mem_obj_malloc(48);
+    CHECK(o3 && ((uintptr_t)o3 & 15) == 0 && malloc_size(o3) == 48,
+          "16-multiple object size stays 16-aligned");
+    unsigned char *o4 = zan_mem_obj_malloc(136);
+    CHECK(o4 && ((uintptr_t)o4 & 15) == 0, "large object falls back to malloc");
+    zan_mem_free(o1);
+    zan_mem_free(o3);
+    zan_mem_free(o4);
 
     /* Zan freeing / growing libc-owned buffers (strdup, driver strings). */
     char *s = strdup("driver string");

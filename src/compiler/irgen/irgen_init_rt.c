@@ -142,6 +142,7 @@
     LLVMTypeRef release_args[] = { i8ptr };
     LLVMTypeRef release_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
     g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
+    zan_mark_nounwind(g, g->rt_release);
 
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "entry");
@@ -222,6 +223,7 @@
         }
         LLVMTypeRef reld_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
         g->rt_release_dyn = LLVMAddFunction(g->mod, "zan_rt_release_dyn", reld_type);
+        zan_mark_nounwind(g, g->rt_release_dyn);
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_release_dyn, 0);
@@ -326,7 +328,7 @@
                          LLVMConstInt(i64, 1, 0), "rel.shared"),
                 fast_bb, slow_bb);
             LLVMPositionBuilderAtEnd(g->builder, fast_bb);
-            zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
+            zan_mark_nounwind(g, zan_call2(g->builder, dfnty, dfn, &obj, 1, ""));
             LLVMBuildBr(g->builder, ret_bb);
             LLVMPositionBuilderAtEnd(g->builder, slow_bb);
         }
@@ -394,7 +396,7 @@
             LLVMBuildStore(g->builder,
                 zan_add(g->builder, dcur, LLVMConstInt(i32t, 1, 0), "aup"),
                 depth_p);
-            zan_call2(g->builder, dfnty, dfn, &obj, 1, "");
+            zan_mark_nounwind(g, zan_call2(g->builder, dfnty, dfn, &obj, 1, ""));
             LLVMValueRef dnow = LLVMBuildLoad2(g->builder, i32t, depth_p, "adnow");
             LLVMValueRef ddown = zan_add(g->builder, dnow,
                 LLVMConstInt(i32t, (unsigned)-1, 0), "adown");
@@ -443,7 +445,22 @@
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
         LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
-        LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
+        /* 链了 rt_mem（同 str_pages 的口径）：对象走 zan_mem_obj_malloc，
+         * total 为 16 的奇数倍 8 时进 8 字节粒度的对象页（40 字节对象不再
+         * 占 48 字节块）。对齐 16 的字段让 LLVM 尺寸成为 16 的倍数，自动
+         * 落回通用类。 */
+        LLVMValueRef obj_malloc = g->fn_malloc;
+        if (g->str_pages) {
+            obj_malloc = LLVMGetNamedFunction(g->mod, "zan_mem_obj_malloc");
+            if (!obj_malloc) {
+                obj_malloc = LLVMAddFunction(g->mod, "zan_mem_obj_malloc", malloc_fn_type);
+                LLVMAddAttributeAtIndex(obj_malloc, LLVMAttributeReturnIndex,
+                    LLVMCreateEnumAttribute(g->ctx,
+                        LLVMGetEnumAttributeKindForName("noalias", 7), 0));
+                zan_mark_nounwind(g, obj_malloc);
+            }
+        }
+        LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, obj_malloc, &total, 1, "raw");
         zan_irgen_emit_oom_check(g, g->rt_alloc, raw);
         emit_rt_alloc_add(g, total);
         /* raw[0..3] 空位清零、raw[4..7]（= obj-12）refcount = 1：一次 64 位写 */
@@ -741,4 +758,5 @@
         LLVMPositionBuilderAtEnd(g->builder, ret_bb);
         LLVMBuildRetVoid(g->builder);
     }
+
 

@@ -282,6 +282,10 @@ unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem);
 LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr, long size, int coll_kind, zan_type_t *elem_type);
 void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj, LLVMValueRef rc_iptr,
                          LLVMTypeRef rc_ty);
+/* 释放链不跑用户代码（析构器被 E1016 拒收）：类/集合/数组释放函数、
+ * zan_rt_release(_dyn) 与经描述符的析构间接调用都不会展开。v 是函数则挂
+ * 函数属性，是调用指令则挂调用点属性。 */
+void zan_mark_nounwind(zan_irgen_t *g, LLVMValueRef v);
 /* 对象/字符串的 32 位 RC 槽地址：obj + ZAN_RC_OFF（见 zan_abi.h） */
 LLVMValueRef zan_rc_ptr(zan_irgen_t *g, LLVMBuilderRef b, LLVMValueRef obj,
                         const char *name);

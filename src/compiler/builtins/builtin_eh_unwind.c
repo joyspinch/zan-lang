@@ -557,7 +557,7 @@ LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, rel_arr_call);
     LLVMTypeRef adfnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     LLVMValueRef adfn = LLVMBuildBitCast(g->builder, adtor, LLVMPointerType(adfnty, 0), "adfn");
-    zan_call2(g->builder, adfnty, adfn, &vobj, 1, "");
+    zan_mark_nounwind(g, zan_call2(g->builder, adfnty, adfn, &vobj, 1, ""));
     LLVMBuildBr(g->builder, head);
 
     LLVMPositionBuilderAtEnd(g->builder, rel_arr_plain);

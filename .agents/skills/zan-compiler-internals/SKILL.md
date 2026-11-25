@@ -764,6 +764,38 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
   `zan_mem_cache_get` 拆成内联 TLS 快路径 + noinline 慢路径——它被多处内联
   后编译器会把整函数外提，分配热路径多一次调用。
 
+**分配密集代码的四道税：S-UNWIND 最小不动点、实参后于分配、构造体旧值读、48 字节类**（实证，2026-11-24）：
+binary-trees（`new Node(Make(d-1), Make(d-1))`）1.86 s → 0.9 s（C malloc/free 1.1 s），
+53 → 45 MiB。逐层病根：
+- **收缩 pass 取了最小不动点**：被调者全部已证 nothrow 才记 nothrow，递归函数
+  （Make 调 Make）永远停在 UNKNOWN，invoke、landing pad 与 EH 临时栈簿记全保留。
+  改为最大不动点（先记 nothrow，只沿调用边传播"可抛"）。同时三处假"可抛"源：
+  `mrs` 内联汇编（读 TSD）被当成未知间接调用；`pthread_*`/`getenv` 不在 native 名表；
+  释放链（`zan_rt_release(_dyn)`、类/集合/数组释放、`__zan_arc_free`、经描述符/闭包
+  头的析构间接调用）没标 nounwind——析构器被 E1016 拒收，释放链不跑用户代码，
+  现由 `zan_mark_nounwind` 统一挂属性，证得 nothrow 的函数也挂 nounwind。
+- **`new T(args)` 曾先分配再求实参**：新对象要进 EH 临时栈，实参调用又"看得见"它，
+  内联构造体 `this.l = a` 的 `old = load` 折不成 null，`release_dyn(old)` 卡住
+  retain(a)/release(临时量) 配对。现实参先求值（C# 同序；`emit_new_storage`），
+  分配点索引仍在原位置预留（`emit_new_site`，站点编号不漂）。
+- **GVN 折不掉新对象字段旧值**：活对象注册表调用与返回值捕获了指针，AA 认为任何
+  调用都可能写它。晚期 ARC 收尾补了块内精确折叠 `late_fold_fresh_loads`（只跨
+  不重叠的同对象 store、对分配前已存在值的 retain、不写内存的指令）。同处：
+  `late_drop_tmp_pairs` 迭代到不动点（嵌套临时量一趟只配最内层）；nounwind 且无
+  invoke/landingpad/tmp_unwind 的函数整体删 push/pop（`late_drop_dead_tmp`，跨块）；
+  窗口允许"存 x 本身"（所有权转移）；`retain/release(null)` 直接删。
+- **对象 40 字节进 48 字节类**：rt_mem 加 8 字节粒度"对象页"类（24..120 的奇数倍 8），
+  只经 `zan_mem_obj_malloc`（`g->str_pages` 时 zan_rt_alloc 调它）。判据靠 LLVM 不变式：
+  对齐 16 的类型尺寸必是 16 的倍数，`n % 16 == 8` 的对象天然只要 8 对齐。
+- 内存余量是 ABI 地板：16 字节头（4 空位 + u32 rc + 描述符）+ 每个类都有的 vptr 槽
+  （`class_vptr_offset` 恒 1，无虚方法的类该槽恒 null）+ 载荷。两指针节点 40 字节 vs
+  C 16 字节；去 vptr 槽要改所有经 offset 0 做 object 虚分派的路径，未做。
+- 顺带修了 `zan_rt_defer_push` IR 弱回退把 (fn, obj) 调反成 obj(fn) 的潜伏崩溃。
+- 钉子用例 `tests/conformance/arc_new_args_first.zan`（实参/构造体抛异常的释放）、
+  `tests/runtime/rt_mem_apple_zone_test.c`（对象页）。排查手法：`ZAN_DUMP_LATE_ARC_IR`
+  看晚期收尾前的 IR，`ZAN_LATE_ARC_STATS=1` 看配对数；分配器本身的份额用
+  "C 版基准改链 zanrt_mem.o"单独量（0.68 s，比 libc 快一倍——瓶颈不在分配器）。
+
 **弱字段存储不接管所有权——右值是 +1 临时时存储后必须释放**（实证，2026-11-02）：
 `emit_rc_store_field` 的 weak 路径经 `emit_weak_store` 落槽后，若右值属于 owned
 形态（`expr_yields_owned_rc_value`：弱字段读取提升出的 +1 强引用、`new`、无主

@@ -840,6 +840,13 @@ static const char *const shrink_native_names[] = {
     "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "InitializeSRWLock",
     "GetCurrentThreadId", "CancelIoEx", "DestroyWindow", "GetWindowLongPtrW",
     "SetFocus", "SetForegroundWindow", "ShowWindow", "UpdateWindow",
+    /* POSIX：EH 线程状态（__zan_eh_state_tsd）与运行时锁用到的 libc/
+     * libpthread 函数，纯 C 不展开。曾缺席时每个读 EH 状态的 Zan 函数
+     * 都被判可抛——macOS/Linux 上几乎没有 invoke 能塌缩。 */
+    "pthread_getspecific", "pthread_setspecific", "pthread_key_create",
+    "pthread_key_delete", "pthread_self", "pthread_mutex_lock",
+    "pthread_mutex_unlock", "getenv", "TlsGetValue", "TlsSetValue",
+    "TlsAlloc", "FlsGetValue", "FlsSetValue", "FlsAlloc",
 };
 
 /* declaration 的 nothrow 白名单（严格，宁漏勿错）：
@@ -872,6 +879,10 @@ static bool shrink_extern_nothrow(const char *n) {
     return false;
 }
 
+
+static unsigned shrink_nounwind_kind(void) {
+    return LLVMGetEnumAttributeKindForName("nounwind", 8);
+}
 
 /* 调用站点的直接被调者（穿透常量 bitcast 到 Function），无则 NULL */
 static LLVMValueRef shrink_callee_fn(LLVMValueRef inst) {
@@ -1046,8 +1057,17 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
                     if (!c) {
                         /* Unknown indirect targets may unwind. Skipping the
                          * edge without this mark incorrectly proves wrappers
-                         * (reflection/delegates/vtables) nothrow. */
-                        has_raise[i] = true;
+                         * (reflection/delegates/vtables) nothrow. The one
+                         * exception is a site the emitter itself stamped
+                         * nounwind: the class/collection/array release call
+                         * through an ARC descriptor (no user code runs on
+                         * release -- destructors are rejected, E1016). */
+                        LLVMValueRef cv = LLVMGetCalledValue(inst);
+                        bool asm_site = cv && LLVMIsAInlineAsm(cv); /* mrs/TLS 读，不展开 */
+                        if (!asm_site &&
+                            !LLVMGetCallSiteEnumAttribute(inst, LLVMAttributeFunctionIndex,
+                                                          shrink_nounwind_kind()))
+                            has_raise[i] = true;
                         continue;
                     }
                     bool fresh = false;
@@ -1065,8 +1085,16 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
                 }
             }
         }
-        /* 不动点（round-robin）：nothrow ⇔ 无 raise 源 ∧ 全部被调者
-         * nothrow。extern 种子已定，传播至闭包。 */
+        /* 不动点（round-robin）：可抛 ⇔ 有 raise 源 ∨ 某被调者可抛。
+         * 取最大不动点：定义函数先记 nothrow，只把"可抛"沿调用边反向
+         * 传播——递归环（Make 调 Make）里没有 raise 源就整环 nothrow。
+         * 曾取最小不动点（全部被调者已证 nothrow 才记 nothrow），任何
+         * 递归函数都永远停在 UNKNOWN，其 invoke 与临时栈簿记全保留。 */
+        for (unsigned i = 0; i < nfn; i++) {
+            if (LLVMIsDeclaration(fns[i])) continue;
+            *shrink_map_slot(&st, fns[i], NULL) =
+                has_raise[i] ? SHRINK_MAYTHROW : SHRINK_NOTHROW;
+        }
         bool changed = true;
         while (changed) {
             changed = false;
@@ -1074,13 +1102,15 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
                 LLVMValueRef f = fns[i];
                 if (LLVMIsDeclaration(f)) continue;
                 int *sp = shrink_map_slot(&st, f, NULL);
-                if (*sp == SHRINK_NOTHROW || has_raise[i]) continue;
-                bool all_nt = true;
+                if (*sp == SHRINK_MAYTHROW) continue;
                 for (unsigned k = 0; k < callees[i].n; k++) {
                     int cs = *shrink_map_slot(&st, fns[callees[i].v[k]], NULL);
-                    if (cs != SHRINK_NOTHROW) { all_nt = false; break; }
+                    if (cs != SHRINK_NOTHROW) {
+                        *sp = SHRINK_MAYTHROW;
+                        changed = true;
+                        break;
+                    }
                 }
-                if (all_nt) { *sp = SHRINK_NOTHROW; changed = true; }
             }
         }
         /* 塌缩：被调者 nothrow 且可解析为 Function 的 invoke → call+br。
@@ -1114,8 +1144,16 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
                 }
             }
         }
+        /* 证得 nothrow 的定义函数挂上 nounwind：LLVM 内联它时不再把体内
+         * 调用改写成 invoke，晚期 ARC 收尾（late_drop_tmp_pairs）也据此
+         * 认出跨这类调用的临时栈 push/pop 窗口不会展开。 */
+        LLVMContextRef sctx = LLVMGetModuleContext(mod);
         for (unsigned i = 0; i < nfn; i++) {
-            if (*shrink_map_slot(&st, fns[i], NULL) == SHRINK_NOTHROW) nthr++;
+            if (*shrink_map_slot(&st, fns[i], NULL) != SHRINK_NOTHROW) continue;
+            nthr++;
+            if (!LLVMIsDeclaration(fns[i]))
+                LLVMAddAttributeAtIndex(fns[i], LLVMAttributeFunctionIndex,
+                    LLVMCreateEnumAttribute(sctx, shrink_nounwind_kind(), 0));
         }
         LLVMDisposeBuilder(b);
         zan_opt_verify_module(mod, "after shrink collapse");
@@ -1208,7 +1246,40 @@ static bool late_call_nounwind(LLVMValueRef call) {
 static bool late_window_ok(LLVMValueRef c, LLVMValueRef obj) {
     zan_arc_call_kind_t k = get_arc_call_kind(c);
     if (k == ARC_RELEASE_OBJ || k == ARC_RELEASE_STR) return false;
+    /* Storing x itself is the ownership transfer the pair exists for
+     * (`this.l = a` inlined from a constructor: retain(a); store a; ...;
+     * the caller's release(a) of its temporary). The window already admits
+     * no release and no call that could run code, so nothing can drop the
+     * stored reference before the release; the store's slot simply inherits
+     * the temporary's +1. */
+    if (LLVMGetInstructionOpcode(c) == LLVMStore &&
+        strip_pointer_casts(LLVMGetOperand(c, 0)) == obj) {
+        LLVMValueRef dst = strip_pointer_casts(LLVMGetOperand(c, 1));
+        return dst != obj;
+    }
     return is_safe_arc_intermediate(c, obj);
+}
+
+/* Pass 0: retain/release of a constant null is a no-op (inlining a
+ * constructor `this.l = null`, or `old` folded to null on a fresh object);
+ * left in place it closes every ARC window around it. */
+static int late_drop_null_arc(LLVMValueRef fn) {
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            if (get_arc_call_kind(inst) != ARC_NONE) {
+                LLVMValueRef v = get_arc_operand(inst);
+                if (v && LLVMIsAConstantPointerNull(v)) {
+                    LLVMInstructionEraseFromParent(inst);
+                    dropped++;
+                }
+            }
+            inst = next;
+        }
+    }
+    return dropped;
 }
 
 /* Pass 1: drop push(v)/pop pairs whose window cannot unwind. */
@@ -1244,6 +1315,166 @@ static int late_drop_tmp_pairs(LLVMValueRef fn) {
         }
     }
     return dropped;
+}
+
+/* Pass 1b: a function that nothing can unwind into or out of never has its
+ * temp-stack entries read. Entries are consumed only by
+ * __zan_eh_tmp_unwind(mark), which runs in this frame's landing pads / catch
+ * paths (none here) or in a caller's pad (which this nounwind frame can never
+ * propagate to), and every unwind stops at its own frame's mark, above
+ * anything a live callee pushed. So once the S-UNWIND shrink has proved the
+ * function nothrow, every push/pop in it is dead -- even when they sit in
+ * different blocks, which pass 1 cannot see (the inlined allocation's OOM
+ * branch splits `new T(Make(), Make())` between the argument pushes and the
+ * pops). Pushes and pops are emitted balanced on every path, so removing all
+ * of them keeps the stack depth unchanged at every exit. */
+static int late_drop_dead_tmp(LLVMValueRef fn) {
+    if (!LLVMGetEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, late_attr_kind("nounwind")))
+        return 0;
+    int n = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+             inst = LLVMGetNextInstruction(inst)) {
+            LLVMOpcode op = LLVMGetInstructionOpcode(inst);
+            if (op == LLVMInvoke || op == LLVMLandingPad || op == LLVMResume) return 0;
+            if (op != LLVMCall) continue;
+            const char *cn = late_callee_name(inst);
+            if (!cn) continue;
+            if (strcmp(cn, "__zan_eh_tmp_unwind") == 0) return 0;
+            if (strcmp(cn, "__zan_eh_tmp_push") == 0 || strcmp(cn, "__zan_eh_tmp_pop") == 0) n++;
+        }
+    }
+    if (n == 0) return 0;
+    int dropped = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            const char *cn =
+                LLVMGetInstructionOpcode(inst) == LLVMCall ? late_callee_name(inst) : NULL;
+            if (cn && (strcmp(cn, "__zan_eh_tmp_push") == 0 ||
+                       strcmp(cn, "__zan_eh_tmp_pop") == 0)) {
+                LLVMInstructionEraseFromParent(inst);
+                dropped++;
+            }
+            inst = next;
+        }
+    }
+    return dropped / 2;
+}
+
+/* Pass 1c: fold loads from a freshly zeroed allocation.
+ * `new T(a, b)` with T's constructor inlined reads each field's old value
+ * (`this.l = a` releases what was there) right after the allocation zeroed
+ * the object. GVN cannot see that: the live-object registry call and the
+ * returned pointer capture the object, so every call in between -- even
+ * retain(a) -- may clobber it as far as alias analysis knows. Here the
+ * reasoning is local and exact: walking back from the load inside its block
+ * to `memset(obj, 0, n)` covering it, only allow
+ *   - stores into the same allocation at non-overlapping constant offsets,
+ *   - retain(v) of a value that existed before the allocation call (an
+ *     argument, or an instruction ahead of the malloc in the malloc's block):
+ *     retain writes only v's own count word and v is not the new object,
+ *   - instructions that do not write memory.
+ * Anything else stops the walk. */
+static LLVMValueRef late_fresh_root(LLVMValueRef p, long long *off) {
+    long long o = 0;
+    for (int d = 0; d < 8 && p; d++) {
+        if (LLVMIsAGetElementPtrInst(p) && LLVMGetNumOperands(p) == 2 &&
+            LLVMGetGEPSourceElementType(p) == LLVMInt8TypeInContext(LLVMGetTypeContext(LLVMTypeOf(p)))) {
+            LLVMValueRef idx = LLVMGetOperand(p, 1);
+            if (!LLVMIsAConstantInt(idx)) return NULL;
+            o += LLVMConstIntGetSExtValue(idx);
+            p = LLVMGetOperand(p, 0);
+            continue;
+        }
+        if (LLVMIsACallInst(p)) {
+            const char *n = late_callee_name(p);
+            if (n && (strcmp(n, "malloc") == 0 || strcmp(n, "zan_mem_malloc") == 0 ||
+                      strcmp(n, "zan_mem_obj_malloc") == 0)) {
+                *off = o;
+                return p;
+            }
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+static bool late_value_predates(LLVMValueRef v, LLVMValueRef root) {
+    if (LLVMIsAArgument(v) || LLVMIsAConstant(v)) return true;
+    if (!LLVMIsAInstruction(v) || LLVMGetInstructionParent(v) != LLVMGetInstructionParent(root))
+        return false;
+    for (LLVMValueRef i = LLVMGetPreviousInstruction(root); i; i = LLVMGetPreviousInstruction(i))
+        if (i == v) return true;
+    return false;
+}
+
+static unsigned long long late_store_size(LLVMTypeRef t) {
+    switch (LLVMGetTypeKind(t)) {
+    case LLVMPointerTypeKind: case LLVMDoubleTypeKind: return 8;
+    case LLVMFloatTypeKind: return 4;
+    case LLVMIntegerTypeKind: return (LLVMGetIntTypeWidth(t) + 7) / 8;
+    default: return 0;
+    }
+}
+
+static int late_fold_fresh_loads(LLVMValueRef fn) {
+    int folded = 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+        while (inst) {
+            LLVMValueRef next = LLVMGetNextInstruction(inst);
+            long long loff = 0;
+            unsigned long long lsz = 0;
+            LLVMValueRef root = NULL;
+            if (LLVMIsALoadInst(inst) && !LLVMGetVolatile(inst) &&
+                LLVMGetOrdering(inst) == LLVMAtomicOrderingNotAtomic &&
+                (lsz = late_store_size(LLVMTypeOf(inst))) != 0)
+                root = late_fresh_root(LLVMGetOperand(inst, 0), &loff);
+            for (LLVMValueRef c = root ? LLVMGetPreviousInstruction(inst) : NULL; c;
+                 c = LLVMGetPreviousInstruction(c)) {
+                if (LLVMIsAStoreInst(c)) {
+                    long long soff = 0;
+                    LLVMValueRef sr = late_fresh_root(LLVMGetOperand(c, 1), &soff);
+                    unsigned long long ssz = late_store_size(LLVMTypeOf(LLVMGetOperand(c, 0)));
+                    if (sr != root || !ssz || LLVMGetVolatile(c)) break;
+                    if (soff < loff + (long long)lsz && loff < soff + (long long)ssz) break;
+                    continue;
+                }
+                if (LLVMIsACallInst(c)) {
+                    const char *n = late_callee_name(c);
+                    if (n && strncmp(n, "llvm.memset.", 12) == 0) {
+                        long long moff = 0;
+                        LLVMValueRef mr = late_fresh_root(LLVMGetOperand(c, 0), &moff);
+                        LLVMValueRef val = LLVMGetOperand(c, 1), len = LLVMGetOperand(c, 2);
+                        if (mr == root && LLVMIsAConstantInt(val) &&
+                            LLVMConstIntGetZExtValue(val) == 0 && LLVMIsAConstantInt(len) &&
+                            moff <= loff &&
+                            loff + (long long)lsz <= moff + (long long)LLVMConstIntGetZExtValue(len)) {
+                            LLVMReplaceAllUsesWith(inst, LLVMConstNull(LLVMTypeOf(inst)));
+                            LLVMInstructionEraseFromParent(inst);
+                            folded++;
+                        }
+                        break;
+                    }
+                    zan_arc_call_kind_t k = get_arc_call_kind(c);
+                    if ((k == ARC_RETAIN_OBJ || k == ARC_RETAIN_STR) &&
+                        late_value_predates(get_arc_operand(c), root))
+                        continue;
+                    if (n && strncmp(n, "llvm.lifetime.", 14) == 0) continue;
+                    break;
+                }
+                if (c == root) break;
+                LLVMOpcode op = LLVMGetInstructionOpcode(c);
+                if (op == LLVMAtomicRMW || op == LLVMAtomicCmpXchg || op == LLVMFence ||
+                    op == LLVMInvoke || op == LLVMCallBr)
+                    break;
+            }
+            inst = next;
+        }
+    }
+    return folded;
 }
 
 /* Pass 2: cancel retain(x) ... release(x) inside one block. */
@@ -1557,7 +1788,15 @@ static zan_status_t late_arc_finish(LLVMModuleRef mod, LLVMTargetMachineRef tm, 
     if (dump && dump[0]) LLVMPrintModuleToFile(mod, dump, NULL);
     for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
         if (LLVMIsDeclaration(fn)) continue;
-        tmp += late_drop_tmp_pairs(fn);
+        /* Nested temporaries (`new T(Make(), Make())`: the new object, then
+         * each argument) pop innermost-first; one sweep only matches the
+         * innermost pair, so repeat until nothing moves. */
+        int ftmp = 0;
+        for (int d; (d = late_drop_tmp_pairs(fn)) > 0;) ftmp += d;
+        ftmp += late_drop_dead_tmp(fn);
+        tmp += ftmp;
+        late_drop_null_arc(fn);
+        while (late_fold_fresh_loads(fn) > 0) late_drop_null_arc(fn);
         arc += late_drop_arc_pairs(fn);
         arc += late_drop_cross_pairs(fn);
         arc += late_drop_region_pairs(fn);

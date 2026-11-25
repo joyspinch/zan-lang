@@ -193,6 +193,7 @@ LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
     LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
+    zan_mark_nounwind(g, fn);
     build_collection_release_body(g, g->site_coll[site], g->site_coll_elem[site], fn);
     return fn;
 }

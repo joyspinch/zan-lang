@@ -490,6 +490,9 @@ void emit_defer_fallback(zan_irgen_t *g) {
     LLVMSetLinkage(g->rt_defer_push, LLVMWeakAnyLinkage);
     LLVMSetLinkage(g->rt_defer_pending, LLVMWeakAnyLinkage);
     LLVMSetLinkage(g->rt_defer_drain, LLVMWeakAnyLinkage);
+    zan_mark_nounwind(g, g->rt_defer_push);
+    zan_mark_nounwind(g, g->rt_defer_pending);
+    zan_mark_nounwind(g, g->rt_defer_drain);
 
     /* push(fn, obj)：回退即同步析构（fail-open，同真实现分配失败路径） */
     LLVMBasicBlockRef push_entry = LLVMAppendBasicBlockInContext(g->ctx,
@@ -497,10 +500,13 @@ void emit_defer_fallback(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, push_entry);
     LLVMTypeRef dfn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
         (LLVMTypeRef[]){ i8ptr }, 1, 0);
+    /* 形参序 (fn, obj)，同 rt_timer_defer.c 的真实现：调 fn(obj)。曾把两者
+     * 对调成 obj(fn)——无 rt_timer.o 的形态（dylib/DLL、Android、selfhost
+     * 对象束）一旦释放深度过阈值就跳进对象内存。 */
     LLVMValueRef dfn = LLVMBuildBitCast(g->builder,
-        LLVMGetParam(g->rt_defer_push, 1), LLVMPointerType(dfn_ty, 0), "dfn");
-    zan_call2(g->builder, dfn_ty, dfn,
-        (LLVMValueRef[]){ LLVMGetParam(g->rt_defer_push, 0) }, 1, "");
+        LLVMGetParam(g->rt_defer_push, 0), LLVMPointerType(dfn_ty, 0), "dfn");
+    zan_mark_nounwind(g, zan_call2(g->builder, dfn_ty, dfn,
+        (LLVMValueRef[]){ LLVMGetParam(g->rt_defer_push, 1) }, 1, ""));
     LLVMBuildRetVoid(g->builder);
 
     /* pending()：回退形态无队列，恒 0 */

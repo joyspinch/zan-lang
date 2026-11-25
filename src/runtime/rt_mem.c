@@ -142,21 +142,31 @@ static uintptr_t g_mem_secret;
  * （= 用户指针 - 16，编译器的 free 一向传它）。V 处 4 字节属于前一块的
  * 尾巴，分配器自己的空闲链/ cookie 字放在 V+8 / V+16（都在本块内、8 对齐）。
  * "item1234567"：12 + 12 = 24 字节一块（通用类得 32）。 */
+/* 通用类之后、串页类之前是"对象页"类（2026-11-24）：16 字节粒度之间的
+ * 奇数倍 8（24..120），只经 zan_mem_obj_malloc 取用——编译器的 zan_rt_alloc
+ * 给 Zan 对象/闭包/装箱分配时调它。块 8 字节对齐（页首 + 40*i），比 malloc
+ * 契约的 16 弱，所以绝不进 g_size_class（通用 malloc 永远拿不到）。两指针
+ * 字段的类：16 头 + vptr + 2 字段 = 40 字节一块（通用类得 48）。 */
 static const uint16_t k_class_size[] = {
       16,   32,   48,   64,   80,   96,  112,  128,
      160,  192,  224,  256,  320,  384,  448,  512,
      640,  768,  896, 1024, 1280, 1536, 1792, 2048,
+      24,   40,   56,   72,   88,  104,  120,
       24,   32,   40,   48,   56,   64,   72,   80,
       88,   96,  104,  112,  120,  128
 };
 #define ZAN_MEM_NCLASS ((int)(sizeof(k_class_size) / sizeof(k_class_size[0])))
-#define ZAN_MEM_STR_CLS0     24          /* 第一个串页类（24 字节）的下标 */
+#define ZAN_MEM_OBJ_CLS0     24          /* 第一个对象页类（24 字节）的下标 */
+#define ZAN_MEM_OBJ_MAX      120u
+#define ZAN_MEM_STR_CLS0     31          /* 第一个串页类（24 字节）的下标 */
 #define ZAN_MEM_STR_MIN      24u
 #define ZAN_MEM_STR_MAX      128u
 #define ZAN_MEM_STR_SKEW     4u          /* 串块真起点 = V + 4 */
 
 _Static_assert(ZAN_MEM_STR_CLS0 + (ZAN_MEM_STR_MAX - ZAN_MEM_STR_MIN) / 8 + 1
                == ZAN_MEM_NCLASS, "string page classes must end the class table");
+_Static_assert(ZAN_MEM_OBJ_CLS0 + (ZAN_MEM_OBJ_MAX - 24u) / 16 + 1 == ZAN_MEM_STR_CLS0,
+               "object page classes sit between the general and string classes");
 
 static inline int zan_mem_is_str_cls(int cls) { return cls >= ZAN_MEM_STR_CLS0; }
 /* 空闲块的链字与 cookie 字相对块地址 p（串页类为 V）的偏移 */
@@ -757,6 +767,18 @@ void *zan_mem_str_malloc(size_t n) {
         if (p) return p;
     }
     return __wrap_malloc(n + ZAN_MEM_STR_SKEW);
+}
+
+/* Zan 对象分配（编译器的 zan_rt_alloc 在链了本对象时调它）：n = 16 字节对象
+ * 头 + 载荷。n 是 16 的奇数倍 8 时进 8 字节粒度的对象页类，否则同 malloc。
+ * 8 字节对齐只在 n % 16 == 8 时出现，而 LLVM 里对齐要求 16 的类型尺寸必是
+ * 16 的倍数——含这类字段的对象 n % 16 == 0，照旧拿 16 对齐的通用类块。 */
+void *zan_mem_obj_malloc(size_t n) {
+    if (n <= ZAN_MEM_OBJ_MAX && (n & 15u) == 8u) {
+        void *p = zan_mem_small_cls(ZAN_MEM_OBJ_CLS0 + (int)(n >> 4) - 1);
+        if (p) return p;
+    }
+    return __wrap_malloc(n);
 }
 
 static void zan_mem_fatal_block(const char *what, const void *p) {

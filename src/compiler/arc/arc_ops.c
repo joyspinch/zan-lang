@@ -142,9 +142,10 @@ void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec) {
     LLVMTypeRef hdr = closure_header_type(g);
     LLVMValueRef dp = LLVMBuildStructGEP2(g->builder, hdr, rec, 1, "clo.dtorp");
     LLVMValueRef dtor = LLVMBuildLoad2(g->builder, i8ptr, dp, "clo.dtor");
-    zan_call2(g->builder,
+    /* 闭包析构只释放捕获，不跑用户代码 */
+    zan_mark_nounwind(g, zan_call2(g->builder,
         LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
-        dtor, &rec, 1, "");
+        dtor, &rec, 1, ""));
 }
 void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
     if (g->current_fn_no_runtime) return;
@@ -517,6 +518,16 @@ void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_type,
         value = LLVMBuildBitCast(g->builder, raw, elem_llvm, "slot.old");
     emit_collection_value_release(g, elem_type, value, 0);
 }
+void zan_mark_nounwind(zan_irgen_t *g, LLVMValueRef v) {
+    if (!v) return;
+    LLVMAttributeRef a = LLVMCreateEnumAttribute(g->ctx,
+        LLVMGetEnumAttributeKindForName("nounwind", 8), 0);
+    if (LLVMIsAFunction(v))
+        LLVMAddAttributeAtIndex(v, LLVMAttributeFunctionIndex, a);
+    else if (LLVMIsACallInst(v))
+        LLVMAddCallSiteAttribute(v, LLVMAttributeFunctionIndex, a);
+}
+
 LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
                                           zan_type_t *inst) {
     if (!sym) return NULL;
@@ -538,6 +549,7 @@ LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, name, ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
+    zan_mark_nounwind(g, fn);
     g->class_release[g->class_release_count].sym = sym;
     g->class_release[g->class_release_count].inst = inst;
     g->class_release[g->class_release_count].fn = fn;
@@ -751,6 +763,7 @@ LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMValueRef fn = LLVMAddFunction(g->mod, name,
         LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0));
     LLVMSetLinkage(fn, LLVMInternalLinkage);
+    zan_mark_nounwind(g, fn);
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
     zan_builder_point_t pt = zan_builder_save(g);
@@ -851,6 +864,7 @@ LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
     LLVMValueRef fn = LLVMAddFunction(g->mod, "__zan_arc_free", ft);
     LLVMSetLinkage(fn, LLVMInternalLinkage);
+    zan_mark_nounwind(g, fn);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(b);
     LLVMValueRef saved_fn = g->current_fn;
     di_clear(g);
