@@ -980,3 +980,18 @@ instructions retired 就能差 10%（程序行为依赖地址）。单个二进�
   （粘滞位除外），读前逐条确认属主与权限，不满足即未命中重建。
 - **内联后 ARC 消对**只在同线程推理；源自 volatile/atomic load 的对象（无锁发布）一律
   不消。Zan 没有 Volatile/Interlocked，同步靠锁（调用）——调用本就截断窗口。
+
+## 44. 内联后 ARC 区域：遇到不安全点就地补回 retain，别整片放弃（2026-11-24）
+
+guard 版本化后 nbody 的快循环有若干出口进带检查的原循环（含 guard_raise 调用），
+区域消对原先"任一路径遇不安全指令就放弃"，外层 `Body a` 的 retain/release 留着。
+改为：路径遇到调用/invoke/返回/指针存储等非 ARC 中性点时，在该指令前**克隆一条
+retain** 结束此路径——此后与原程序完全一致；到达 release 的路径消掉这对。区域块
+仍须只从区域内进入、不得回到 retain 所在块，补回点上限 8。nbody 带检查 0.55 →
+0.44s（C 0.37）。
+
+mandel 的 1.28× 全是 FMA：C 去掉 `-ffp-contract` 正好与 Zan 同速。只给浮点指令加
+`contract` 标志不够——LLVM 先把 `zr*zr` CSE 成多用途，后端就不融合了。clang 的做法
+是前端在同一表达式内直接出 `llvm.fmuladd`；Zan 在优化前（局部仍在 alloca、尚未 CSE）
+把"单用途 fmul 喂 fadd/fsub"改写为 fmuladd，等价于不跨语句。`--fp-contract` 开启，
+默认关（末位结果随 CPU 变，默认保持 C# 式逐位一致）。

@@ -577,6 +577,7 @@ int main(int argc, char **argv) {
     bool do_emit_ir = opts.do_emit_ir;
     int check_leaks_opt = opts.check_leaks_opt;
     bool checked_arith = opts.checked_arith;
+    bool fp_contract = opts.fp_contract;
     int arc_guard_opt = opts.arc_guard_opt;
     int runtime_checks_opt = opts.runtime_checks_opt;
     bool runtime_checks = opts.runtime_checks;

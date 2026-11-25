@@ -37,6 +37,7 @@ typedef struct zan_options {
     bool do_emit_ir;
     int check_leaks_opt;
     bool checked_arith;
+    bool fp_contract; /* --fp-contract: allow fused multiply-add */
     int arc_guard_opt;
     int runtime_checks_opt;
     bool runtime_checks;

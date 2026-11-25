@@ -768,6 +768,8 @@ struct zan_irgen {
     unsigned eh_tmp_push_seq;
     /* Data layout for field-offset TBAA tags (opt_tbaa.c); lazily created. */
     LLVMTargetDataRef tbaa_td;
+    /* --fp-contract: mark float add/sub/mul contractible (FMA) before optimizing. */
+    bool fp_contract;
 
     char target_triple[128];
     /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */

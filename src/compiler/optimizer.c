@@ -1685,15 +1685,24 @@ static int late_drop_cross_pairs(LLVMValueRef fn) {
  * ARC-neutral (late_window_ok) and store no pointer (a pointer store could
  * replace x in its owning slot through an alias). Every region block must be
  * entered only from inside the region. Then the retain and the releases
- * that end the region cancel out on every path. */
+ * that end the region cancel out on every path.
+ *
+ * A path that meets something that is not ARC-neutral (a call, an invoke, a
+ * return, a pointer store -- e.g. the exit from a guard-versioned fast loop
+ * into its checked twin) does not abort the region: the retain is re-issued
+ * right before that instruction, so the rest of that path runs exactly as
+ * before, while paths that reach a release lose the pair. */
 #define LATE_REGION_BLOCKS 64
 #define LATE_REGION_INSTS 4096
+#define LATE_REGION_COMPS 8
 
 typedef struct {
     LLVMBasicBlockRef blocks[LATE_REGION_BLOCKS];
     int nblocks;
     LLVMValueRef rels[LATE_REGION_BLOCKS];
     int nrels;
+    LLVMValueRef comps[LATE_REGION_COMPS]; /* re-issue the retain before these */
+    int ncomps;
     int insts;
 } late_region_t;
 
@@ -1703,9 +1712,17 @@ static int late_region_index(late_region_t *r, LLVMBasicBlockRef bb) {
     return -1;
 }
 
+/* End this path at `c`: the retain is re-issued right before it. */
+static bool late_region_comp(late_region_t *r, LLVMValueRef c) {
+    if (r->ncomps >= LATE_REGION_COMPS) return false;
+    r->comps[r->ncomps++] = c;
+    return true;
+}
+
 /* Scan `bb` from `start`; returns false to abort. Successors are queued. */
 static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRef start,
                              LLVMValueRef obj, zan_arc_call_kind_t want) {
+    (void)bb;
     for (LLVMValueRef c = start; c; c = LLVMGetNextInstruction(c)) {
         if (++r->insts > LATE_REGION_INSTS) return false;
         zan_arc_call_kind_t ck = get_arc_call_kind(c);
@@ -1721,7 +1738,7 @@ static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRe
 #else
             bool branch = op == LLVMBr || op == LLVMSwitch;
 #endif
-            if (!branch) return false;
+            if (!branch) return late_region_comp(r, c);
             unsigned ns = LLVMGetNumSuccessors(c);
             for (unsigned i = 0; i < ns; i++) {
                 LLVMBasicBlockRef sb = LLVMGetSuccessor(c, i);
@@ -1732,11 +1749,11 @@ static bool late_region_scan(late_region_t *r, LLVMBasicBlockRef bb, LLVMValueRe
             }
             return true;
         }
-        if (!late_window_ok(c, obj)) return false;
+        if (LLVMIsAPHINode(c)) continue;
+        if (!late_window_ok(c, obj)) return late_region_comp(r, c);
         if (LLVMIsAStoreInst(c) &&
             LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(c, 0))) == LLVMPointerTypeKind)
-            return false;
-        if (LLVMIsAPHINode(c) && LLVMGetInstructionParent(c) != bb) return false;
+            return late_region_comp(r, c);
     }
     return false;
 }
@@ -1765,6 +1782,14 @@ static bool late_try_region(LLVMValueRef retain, shrink_map_t *preds) {
         }
         if (inside != *shrink_map_slot(preds, LLVMBasicBlockAsValue(r.blocks[bi]), NULL))
             return false;
+    }
+    if (r.ncomps) {
+        LLVMBuilderRef b = LLVMCreateBuilderInContext(LLVMGetTypeContext(LLVMTypeOf(retain)));
+        for (int i = 0; i < r.ncomps; i++) {
+            LLVMPositionBuilderBefore(b, r.comps[i]);
+            LLVMInsertIntoBuilder(b, LLVMInstructionClone(retain));
+        }
+        LLVMDisposeBuilder(b);
     }
     for (int i = 0; i < r.nrels; i++) LLVMInstructionEraseFromParent(r.rels[i]);
     LLVMInstructionEraseFromParent(retain);
@@ -2214,6 +2239,66 @@ static zan_status_t zan_opt_early_mem2reg(zan_irgen_t *g) {
                              (early && early[0]) ? early : "sroa,early-cse");
 }
 
+/* --fp-contract: fuse `a*b + c` written in one expression into
+ * llvm.fmuladd, as clang does for -ffp-contract=on (mandel 0.60 s -> C's
+ * 0.45 s). Run right after irgen, before any CSE: a single-use fmul feeding
+ * an fadd/fsub is then exactly a product inside the same source expression
+ * (locals still live in allocas, so nothing is fused across statements).
+ * Off by default: a fused result can differ in the last bit from the
+ * separately rounded one, and Zan, like C#, otherwise gives the same float
+ * results on every CPU. */
+static LLVMValueRef fpc_single_mul(LLVMValueRef v) {
+    if (!LLVMIsAInstruction(v) || LLVMGetInstructionOpcode(v) != LLVMFMul) return NULL;
+    LLVMUseRef u = LLVMGetFirstUse(v);
+    return u && !LLVMGetNextUse(u) ? v : NULL;
+}
+
+static int zan_opt_fp_contract(LLVMModuleRef mod) {
+    LLVMContextRef ctx = LLVMGetModuleContext(mod);
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+    unsigned id = LLVMLookupIntrinsicID("llvm.fmuladd", 12);
+    int n = 0;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn))
+        for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            LLVMValueRef i = LLVMGetFirstInstruction(bb);
+            while (i) {
+                LLVMValueRef next = LLVMGetNextInstruction(i);
+                LLVMOpcode op = LLVMGetInstructionOpcode(i);
+                LLVMTypeRef ty = LLVMTypeOf(i);
+                LLVMTypeKind tk = LLVMGetTypeKind(ty);
+                if ((op == LLVMFAdd || op == LLVMFSub) &&
+                    (tk == LLVMDoubleTypeKind || tk == LLVMFloatTypeKind)) {
+                    LLVMValueRef l = LLVMGetOperand(i, 0), r = LLVMGetOperand(i, 1);
+                    LLVMValueRef mul = fpc_single_mul(l);
+                    bool mul_left = mul != NULL;
+                    if (!mul) mul = fpc_single_mul(r);
+                    if (mul) {
+                        LLVMPositionBuilderBefore(b, i);
+                        LLVMValueRef x = LLVMGetOperand(mul, 0), y = LLVMGetOperand(mul, 1);
+                        LLVMValueRef addend = mul_left ? r : l;
+                        if (op == LLVMFSub) {
+                            if (mul_left)
+                                addend = LLVMBuildFNeg(b, addend, "fpc.neg"); /* a*b - c */
+                            else x = LLVMBuildFNeg(b, x, "fpc.neg"); /* c - a*b */
+                        }
+                        LLVMValueRef fma = LLVMGetIntrinsicDeclaration(mod, id, &ty, 1);
+                        LLVMValueRef args[3] = {x, y, addend};
+                        LLVMValueRef call =
+                            LLVMBuildCall2(b, LLVMGlobalGetValueType(fma), fma, args, 3, "fpc.fma");
+                        LLVMReplaceAllUsesWith(i, call);
+                        LLVMInstructionEraseFromParent(i);
+                        LLVMInstructionEraseFromParent(mul);
+                        n++;
+                    }
+                }
+                i = next;
+            }
+        }
+    LLVMDisposeBuilder(b);
+    return n;
+}
+
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
     zan_opt_report_t report;
     memset(&report, 0, sizeof(report));
@@ -2225,6 +2310,7 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 
     /* 调试旋钮：ZAN_NO_OPT_<NAME>=1 跳过对应自定义 pass（A595 二分） */
     zan_opt_tbaa(g->mod);
+    if (g->fp_contract) zan_opt_fp_contract(g->mod);
     if (!getenv("ZAN_NO_OPT_EARLY") && zan_opt_early_mem2reg(g) != ZAN_OK) {
         report.success = false;
         return report;

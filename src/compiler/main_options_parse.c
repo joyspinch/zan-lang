@@ -59,6 +59,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     bool do_emit_ir = false;
     int check_leaks_opt = -1;
     bool checked_arith = false; /* B-ID76：--checked 全局算术溢出守卫 */
+    bool fp_contract = false;
     int arc_guard_opt = -1;
     int runtime_checks_opt = -1;
     bool runtime_checks = true;
@@ -145,6 +146,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
             runtime_checks_opt = 0;
             runtime_checks = false;
+        } else if (strcmp(argv[i], "--fp-contract") == 0) {
+            fp_contract = true;
         } else if (strcmp(argv[i], "--checked") == 0) {
             checked_arith = true; /* B-ID76：全局算术 checked（C# /checked+） */
         } else if (strcmp(argv[i], "--runtime-checks") == 0) {
@@ -421,6 +424,7 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
     opts->do_emit_ir = do_emit_ir;
     opts->check_leaks_opt = check_leaks_opt;
     opts->checked_arith = checked_arith;
+    opts->fp_contract = fp_contract;
     opts->arc_guard_opt = arc_guard_opt;
     opts->runtime_checks_opt = runtime_checks_opt;
     opts->runtime_checks = runtime_checks;

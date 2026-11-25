@@ -537,6 +537,7 @@
                 irgen.html_handler_count, handler_root);
     }
     irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
+    irgen.fp_contract = fp_contract;
     irgen.rt_guard_split = !cross_compiling;
     const char *obf_env = getenv("ZAN_OBF");
     const char *no_obf_env = getenv("ZAN_NO_OBF");

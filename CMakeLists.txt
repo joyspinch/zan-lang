@@ -3902,6 +3902,17 @@ add_test(NAME case_checked_arith_flag
     "-DZANC_ARGS=--checked"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# --fp-contract fuses a*b+c within one expression into llvm.fmuladd; the
+# rounded results must match the default build.
+add_test(NAME case_fp_contract_flag
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/fp_contract.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/fp_contract.out
+    -DOUT_EXE=${CMAKE_CURRENT_BINARY_DIR}/cases/fp_contract_flag${_exe_ext}
+    "-DZANC_ARGS=--fp-contract"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # datetime_now pins the local wall-clock semantics with a fixed POSIX timezone:
 # EST/EDT with the US 2007+ transition rules, so winter/summer offsets and both
 # DST boundaries are deterministic on every machine. Without TZ the case would

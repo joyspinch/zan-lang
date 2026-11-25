@@ -356,6 +356,7 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `--no-arc-guard` | — | 关检疫，同时关掉 `--publish` 默认的 over-release 网 |
 | `--runtime-checks` | **开** | 启用运行时守卫（如数组/切片越界、除零）；发布档也默认开 |
 | `--no-runtime-checks` | — | 关运行时守卫；与 `--runtime-checks` 同现时后写的生效 |
+| `--fp-contract` | 关 | 允许把同一表达式里的 `a*b+c` / `a*b-c` / `c-a*b` 融合为一条 FMA（`llvm.fmuladd`，同 clang 默认的 `-ffp-contract=on`：不跨语句）。浮点密集循环可快 20–30%（mandel 0.52 → 0.40s，与 C 持平）；代价是结果末位可能因 CPU 而异，故默认关（默认与 C# 一样跨平台逐位一致）。钉：`case_fp_contract` / `case_fp_contract_flag` |
 | `--checked` | 关 | 全局 checked 算术（C# `/checked+` 等价）：全部整型算术溢出抛 `OverflowException`（含 `-` 取负、`++`/`--`、窄化强转）；`unchecked(){ }` 块局部豁免。默认（关）为 C# 默认的 unchecked 环绕语义。钉：`case_checked_arith_default`/`case_checked_arith_flag` |
 | `--strict-runtime` | 关 | 守卫失败直接 `exit(70)`；`ZAN_RT_HARD` 非空且非 `0` 等效；`ZAN_RT_HARD=0` 显式压回软模式 |
 | `--deny-warnings` | 关 | 将编译警告视为致命错误（阻断构建） |
