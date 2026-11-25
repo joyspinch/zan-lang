@@ -214,6 +214,44 @@ static zan_type_t *leaf_place(leaf_scan_t *L, zan_ast_node_t *n) {
     return NULL;
 }
 
+/* A call into the C runtime that runs no user code and releases no Zan
+ * object: an extern `[DllImport("crt")]` method of the scanned class whose
+ * entry point is a plain runtime primitive (atomics, clocks) and whose
+ * arguments/result are primitive. AtomicInt.Add is `NativeAdd(handle, d)`:
+ * without this, every `counter.Add(1)` on a shared counter paid a pin --
+ * two extra contended RC atomics and a temp-stack push (threads bench 2x Go). */
+static bool leaf_runtime_entry(zan_istr_t e) {
+    static const char *const prefixes[] = {"zan_atomic_", "zan_stopwatch_", "zan_monotonic_", NULL};
+    for (int i = 0; prefixes[i]; i++) {
+        size_t n = strlen(prefixes[i]);
+        if (e.len >= n && memcmp(e.str, prefixes[i], n) == 0) return true;
+    }
+    return false;
+}
+
+static zan_symbol_t *leaf_runtime_callee(leaf_scan_t *L, zan_ast_node_t *call) {
+    zan_ast_node_t *c = call->call.callee;
+    if (!c || !L->cls || call->call.type_args.count > 0) return NULL;
+    zan_istr_t name;
+    if (c->kind == AST_IDENTIFIER) {
+        name = c->ident.name;
+    } else if (c->kind == AST_MEMBER_ACCESS && c->member.object &&
+               c->member.object->kind == AST_IDENTIFIER && !c->member.null_cond &&
+               borrow_name_eq(c->member.object->ident.name, L->cls->name)) {
+        name = c->member.name;
+    } else {
+        return NULL;
+    }
+    zan_symbol_t *m = get_method_sym(L->cls, name);
+    if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return NULL;
+    zan_istr_t lib = zan_ast_method_extern_lib(m->decl);
+    if (lib.len != 3 || memcmp(lib.str, "crt", 3) != 0) return NULL;
+    zan_istr_t *ep = zan_ast_method_entry_point(m->decl);
+    if (!leaf_runtime_entry(ep ? *ep : m->name)) return NULL;
+    if (m->decl->method_decl.params.count != call->call.args.count) return NULL;
+    return m;
+}
+
 static zan_type_t *leaf_expr(leaf_scan_t *L, zan_ast_node_t *n) {
     if (!n || !L->ok) { L->ok = false; return NULL; }
     zan_type_t *t = NULL;
@@ -267,6 +305,19 @@ static zan_type_t *leaf_expr(leaf_scan_t *L, zan_ast_node_t *n) {
         zan_type_t *a = leaf_expr(L, n->conditional.then_expr);
         zan_type_t *b = leaf_expr(L, n->conditional.else_expr);
         if (leaf_prim(ct) && leaf_prim(a) && leaf_prim(b)) t = a;
+        break;
+    }
+    case AST_CALL: {
+        zan_symbol_t *m = leaf_runtime_callee(L, n);
+        if (!m) break;
+        bool args_ok = true;
+        for (int i = 0; i < n->call.args.count; i++)
+            if (!leaf_prim(leaf_expr(L, n->call.args.items[i]))) args_ok = false;
+        zan_type_t *rt =
+            m->decl->method_decl.return_type
+                ? zan_binder_resolve_type(L->g->binder, m->decl->method_decl.return_type)
+                : NULL;
+        if (args_ok && leaf_prim(rt)) t = rt;
         break;
     }
     case AST_CAST_EXPR: {
@@ -419,6 +470,34 @@ static bool sym_derives_from(zan_symbol_t *cls, zan_symbol_t *base) {
     return false;
 }
 
+/* Every possible implementation of `object.M(...)` (all subclasses of the
+ * static type / all implementers of the interface) is a leaf body. */
+static bool call_targets_are_leaf(zan_irgen_t *g, zan_ast_node_t *object, zan_ast_node_t *call,
+                                  int argc, local_scope_t *locals) {
+    zan_type_t *st = infer_expr_type(g, object, locals);
+    if (!st || !st->sym || (st->kind != TYPE_CLASS && st->kind != TYPE_INTERFACE)) return false;
+    zan_istr_t name = call->call.callee->member.name;
+    int cands = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int n = pass == 0 ? g->struct_type_count : g->generic_inst_count;
+        for (int i = 0; i < n; i++) {
+            zan_symbol_t *cls = pass == 0 ? g->struct_types[i].sym : g->generic_insts[i].type_sym;
+            if (!cls) continue;
+            bool related = st->kind == TYPE_INTERFACE ? class_implements_iface(cls, st->sym)
+                                                      : sym_derives_from(cls, st->sym);
+            if (!related) continue;
+            zan_symbol_t *impl = resolve_overload(cls, name, argc, 0);
+            if (!impl) {
+                if (st->kind == TYPE_INTERFACE) continue;
+                return false;
+            }
+            if (!method_is_leaf(g, impl)) return false;
+            cands++;
+        }
+    }
+    return cands > 0;
+}
+
 /* The array base is read without side effects: a local/parameter, or an
  * instance field of `this` (bare `items` or `this.items`). Reading a field
  * releases nothing and the caller keeps `this` alive; the leaf-callee rule
@@ -463,29 +542,40 @@ bool zan_elem_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object,
     int argc = call->call.args.count;
     for (int i = 0; i < argc; i++)
         if (!caller_simple_expr(g, call->call.args.items[i], locals)) return false;
-    zan_type_t *st = infer_expr_type(g, object, locals);
-    if (!st || !st->sym || (st->kind != TYPE_CLASS && st->kind != TYPE_INTERFACE))
+    return call_targets_are_leaf(g, object, call, argc, locals);
+}
+
+/* `field.M(...)` with a static field or a field of `this` as receiver, simple
+ * arguments and a leaf callee: nothing in the call window can release any
+ * object or replace the field, so the receiver needs no pin. (A shared
+ * `static AtomicInt counter; counter.Add(1)` otherwise paid two contended RC
+ * atomics plus a temp-stack push per call.) */
+bool zan_field_receiver_needs_no_pin(zan_irgen_t *g, zan_ast_node_t *object, zan_ast_node_t *call,
+                                     local_scope_t *locals) {
+    if (!object || !call || call->kind != AST_CALL || !call->call.callee ||
+        call->call.callee->kind != AST_MEMBER_ACCESS ||
+        call->call.callee->member.object != object || call->call.callee->member.null_cond ||
+        call->call.type_args.count > 0)
         return false;
-    zan_istr_t name = call->call.callee->member.name;
-    int cands = 0;
-    for (int pass = 0; pass < 2; pass++) {
-        int n = pass == 0 ? g->struct_type_count : g->generic_inst_count;
-        for (int i = 0; i < n; i++) {
-            zan_symbol_t *cls = pass == 0 ? g->struct_types[i].sym
-                                          : g->generic_insts[i].type_sym;
-            if (!cls) continue;
-            bool related = st->kind == TYPE_INTERFACE
-                ? class_implements_iface(cls, st->sym)
-                : sym_derives_from(cls, st->sym);
-            if (!related) continue;
-            zan_symbol_t *impl = resolve_overload(cls, name, argc, 0);
-            if (!impl) {
-                if (st->kind == TYPE_INTERFACE) continue;
-                return false;
-            }
-            if (!method_is_leaf(g, impl)) return false;
-            cands++;
-        }
+    bool field = false;
+    if (object->kind == AST_IDENTIFIER && !local_find(locals, object->ident.name)) {
+        zan_symbol_t *fs =
+            g->current_type_sym ? get_field_sym(g->current_type_sym, object->ident.name) : NULL;
+        field = fs && fs->kind == SYM_FIELD;
+    } else if (object->kind == AST_MEMBER_ACCESS && object->member.object &&
+               !object->member.null_cond) {
+        zan_ast_node_t *o = object->member.object;
+        zan_symbol_t *owner = NULL;
+        if (o->kind == AST_THIS_EXPR) owner = g->current_type_sym;
+        else if (o->kind == AST_IDENTIFIER && !local_find(locals, o->ident.name))
+            owner = zan_binder_lookup(g->binder, o->ident.name); /* ClassName.field */
+        zan_symbol_t *fs = owner ? get_field_sym(owner, object->member.name) : NULL;
+        field =
+            fs && fs->kind == SYM_FIELD && (o->kind == AST_THIS_EXPR || field_member_is_static(fs));
     }
-    return cands > 0;
+    if (!field || member_field_is_weak(g, object, locals)) return false;
+    int argc = call->call.args.count;
+    for (int i = 0; i < argc; i++)
+        if (!caller_simple_expr(g, call->call.args.items[i], locals)) return false;
+    return call_targets_are_leaf(g, object, call, argc, locals);
 }

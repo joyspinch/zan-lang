@@ -1064,3 +1064,22 @@ hello 启动 5.9ms vs C 4.6ms。C 版只链 Zan 运行时目标文件就同样�
 顺修：`zan__crash_civil` 算出的日 `dd` 从未写回 `*d`，崩溃日期恒为 01 号（编译器
 "unused variable 'dd'" 警告早就指着它）。教训：给每个进程都跑的构造函数计时，
 别假设 libc 调用便宜；未用变量警告要看。
+
+## 49. 生产型负载基准：栈溢出、共享计数器钉住、await 走调度器（2026-11-25）
+
+JSON / 文件 / 线程 / async 四项对 Go 跑出三个问题：
+1. **fileio 段错误**：`StringBuilder.Append(char)` 的 i64 临时 `ch.tmp` 在使用点
+   `LLVMBuildAlloca`——非入口块的定长 alloca 对 LLVM 是动态分配，嵌套循环里每次
+   append 栈涨 16 字节，5×20 万次撑爆 8MB 主栈。扫语料还有约 20 处同类（反射实参槽、
+   弱引用链表游标、GC 遍历、原生委托缓冲……）。`zan_hoist_static_allocas`：优化前
+   （含 -O0）把所有常量大小 alloca 挪进入口块（Zan 无用户 stackalloc，全是编译器
+   临时）。踩坑：`LLVMGetEntryBasicBlock` 对声明返回垃圾指针而非 NULL，先判
+   `LLVMIsDeclaration`/块数。
+2. **共享 `static AtomicInt` 的 `.Add(1)`** 每次两次竞争 RC 原子 + 临时栈 push：静态
+   字段接收者被钉住，而 `AtomicInt.Add` 只调 `[DllImport("crt")] NativeAdd`、本不算
+   leaf。leaf 扫描接受本类 crt 外部方法（入口 `zan_atomic_*`/`zan_stopwatch_*`/
+   `zan_monotonic_*`、实参与返回皆原始类型）；新增 `zan_field_receiver_needs_no_pin`
+   （静态字段或 this 字段 + 简单实参 + leaf 被调者）。threads 2.08× → 0.70× Go。
+3. **await 一个立即完成的 async 方法** 2M 次 3.5s、内核态 4.8s：每次都经协程调度器
+   派给工作线程（互斥量/条件变量/kevent/管道）。应像 C# 那样同步跑到第一个真正
+   挂起的 await——另案。

@@ -164,6 +164,9 @@ LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
                                         zan_ast_node_t *, local_scope_t *);
     if (zan_elem_receiver_needs_no_pin(g, object, g->hold_call_expr, locals))
         return NULL;
+    bool zan_field_receiver_needs_no_pin(zan_irgen_t *, zan_ast_node_t *, zan_ast_node_t *,
+                                         local_scope_t *);
+    if (zan_field_receiver_needs_no_pin(g, object, g->hold_call_expr, locals)) return NULL;
     /* Protect the loaded value before null guards substitute scratch. Even an
      * owned local's slot can be cleared by a ref argument before dispatch. */
     emit_retain_obj_value(g, value);

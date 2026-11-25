@@ -735,7 +735,8 @@ LLVMValueRef emit_char_to_cstr(zan_irgen_t *g, LLVMValueRef val) {
             LLVMBuildSelect(bd, lt10000, LLVMConstInt(i64t, 3, 0),
                             LLVMConstInt(i64t, 4, 0), "ch.n3"), "ch.n2"), "ch.len");
 
-    LLVMValueRef tmp = LLVMBuildAlloca(g->builder, i64t, "ch.tmp");
+    LLVMValueRef tmp = emit_entry_alloca(
+        g, i64t, "ch.tmp"); /* in a loop an in-place alloca grows the stack every append */
     LLVMBuildStore(bd, packed, tmp);
     LLVMValueRef buf = emit_string_alloc_rc(g, zan_add(bd, len, LLVMConstInt(i64t, 1, 0), "ch.sz"));
     LLVMTypeRef memcpy_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i8ptr, i8ptr, i64t }, 3, 0);

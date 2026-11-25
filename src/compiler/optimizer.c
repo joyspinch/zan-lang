@@ -2347,11 +2347,48 @@ static int zan_opt_drop_dead_eh_state(LLVMModuleRef mod) {
     return n;
 }
 
+/* Fixed-size allocas emitted mid-function (a temp built at its use: char
+ * append, reflection argument slots, weak-list walkers, ...) are dynamic
+ * allocations to LLVM: inside a loop each iteration grows the stack, and
+ * 5 x 200k StringBuilder.Append(char) overflowed the 8 MB main stack. Every
+ * such alloca is a compiler temporary (Zan has no user stackalloc), so move
+ * it to the entry block, where it is a static frame slot. Runs at every
+ * optimization level, -O0 included. */
+static int zan_hoist_static_allocas(LLVMModuleRef mod) {
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(LLVMGetModuleContext(mod));
+    int moved = 0;
+    for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn; fn = LLVMGetNextFunction(fn)) {
+        /* LLVMGetEntryBasicBlock on a declaration is not null but garbage. */
+        if (LLVMIsDeclaration(fn) || LLVMCountBasicBlocks(fn) < 2) continue;
+        LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+        LLVMValueRef at = LLVMGetFirstInstruction(entry);
+        while (at && LLVMIsAAllocaInst(at)) at = LLVMGetNextInstruction(at);
+        if (!at) continue;
+        for (LLVMBasicBlockRef bb = LLVMGetNextBasicBlock(entry); bb;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            LLVMValueRef i = LLVMGetFirstInstruction(bb);
+            while (i) {
+                LLVMValueRef next = LLVMGetNextInstruction(i);
+                if (LLVMIsAAllocaInst(i) && LLVMIsAConstantInt(LLVMGetOperand(i, 0))) {
+                    LLVMInstructionRemoveFromParent(i);
+                    LLVMPositionBuilderBefore(b, at);
+                    LLVMInsertIntoBuilder(b, i);
+                    moved++;
+                }
+                i = next;
+            }
+        }
+    }
+    LLVMDisposeBuilder(b);
+    return moved;
+}
+
 zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_level_t level) {
     zan_opt_report_t report;
     memset(&report, 0, sizeof(report));
     if (zan_opt_verify_module(g->mod, "before optimizer") != ZAN_OK) return report;
     report.success = true;
+    zan_hoist_static_allocas(g->mod);
     if (level == ZAN_OPT_NONE) return report;
 
     double t0 = get_time_ms();
