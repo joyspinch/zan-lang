@@ -2,6 +2,7 @@
 #include "optimizer.h"
 #include "irgen_compact.h"
 #include "codegen_split.h"
+#include "build_cache.h"
 #ifndef _WIN32
 #include <unistd.h>
 #endif

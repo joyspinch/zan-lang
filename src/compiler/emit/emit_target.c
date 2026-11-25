@@ -1198,6 +1198,10 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     }
     char *error = NULL;
     int parts = 0, threads = 1;
+    /* Build cache (docs/BUILD_CACHE.md): the key is this exact module plus
+     * the target machine and partition count, so a hit is the object(s) the
+     * same module produced before. */
+    zan_bcache_key_t obj_key = {{0}, false};
     if (zan_codegen_split_plan(g, &parts, &threads)) {
         size_t plen = strlen(path);
         char **paths = (char **)calloc((size_t)parts, sizeof(char *));
@@ -1210,6 +1214,13 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             }
             if (i == 0) memcpy(paths[i], path, plen + 1);
             else snprintf(paths[i], plen + 24, "%s.p%d.o", path, i);
+        }
+        if (ok && zan_bcache_obj_key(g->mod, tm, parts, &obj_key) &&
+            zan_bcache_obj_load(&obj_key, parts, (const char *const *)paths)) {
+            LLVMDisposeTargetMachine(tm);
+            g->split_objs = paths;
+            g->split_obj_count = parts;
+            return ZAN_OK;
         }
         if (ok) {
             LLVMModuleRef mod = g->mod;
@@ -1228,6 +1239,7 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
                 free(paths);
                 return ZAN_ERROR;
             }
+            zan_bcache_obj_store(&obj_key, parts, (const char *const *)paths);
             g->split_objs = paths;
             g->split_obj_count = parts;
             return ZAN_OK;
@@ -1236,6 +1248,11 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             for (int i = 0; i < parts; i++) free(paths[i]);
             free(paths);
         }
+    }
+    const char *one_path[1] = {path};
+    if (zan_bcache_obj_key(g->mod, tm, 1, &obj_key) && zan_bcache_obj_load(&obj_key, 1, one_path)) {
+        LLVMDisposeTargetMachine(tm);
+        return ZAN_OK;
     }
     if (LLVMTargetMachineEmitToFile(tm, g->mod, (char *)path,
                                      LLVMObjectFile, &error)) {
@@ -1248,5 +1265,6 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     }
 
     LLVMDisposeTargetMachine(tm);
+    zan_bcache_obj_store(&obj_key, 1, one_path);
     return ZAN_OK;
 }

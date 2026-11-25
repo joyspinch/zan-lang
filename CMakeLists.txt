@@ -189,6 +189,7 @@ add_executable(zanc
     src/compiler/irgen_weak.c
     src/compiler/irgen_compact.cpp
     src/compiler/codegen_split.cpp
+    src/compiler/build_cache.cpp
     src/compiler/optimizer.c
     src/compiler/incremental.c
     src/compiler/package.c
@@ -8735,6 +8736,12 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_query.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR})
   set_tests_properties(query_symbol_facts PROPERTIES TIMEOUT 300)
+  # docs/BUILD_CACHE.md 阶段 1：LLVM 后端记忆化——重复构建两表命中且产物逐字节相同，
+  # 关闭开关/改源码/改 -O/坏条目/切分代码生成都不返回陈旧目标码。
+  add_test(NAME build_cache_memo
+    COMMAND ${Python3_EXECUTABLE} -I -B -X utf8 ${CMAKE_SOURCE_DIR}/tests/test_build_cache.py
+      --zanc $<TARGET_FILE:zanc> --work ${CMAKE_BINARY_DIR}/test-out/build-cache)
+  set_tests_properties(build_cache_memo PROPERTIES TIMEOUT 300)
   add_test(NAME embed_resource_owner
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_embed_resource_owner.py
       --zanc $<TARGET_FILE:zanc> --root ${CMAKE_SOURCE_DIR}

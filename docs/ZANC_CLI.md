@@ -302,7 +302,8 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `--no-icon` | — | 不嵌入任何图标（跳过 `--icon` 与内建默认）；仅 Windows PE |
 | `--default-icon` | — | 显式嵌入内建图标；只有 `--publish` 需要它（非发布档本来就嵌内建图标） |
 | `--quiet, -q` | — | 静默 stdout 进度行（驱动装运、APK 打包、`Compiled N files` 汇总） |
-| `--time` | — | 打印各阶段耗时与规模统计 |
+| `--time` | — | 打印各阶段耗时与规模统计（含一行 `build cache:` 命中/未命中与耗时） |
+| `--no-build-cache` | 缓存**开** | 关闭 LLVM 后端构建缓存（[`BUILD_CACHE.md`](BUILD_CACHE.md)）：优化前模块与最终模块按内容哈希记忆化优化结果和目标文件，重复构建跳过优化与后端，产物与关缓存逐字节相同。键含 zanc 二进制（路径/大小/mtime）、除 `-o`/`--emit-deps`/`--time` 外的全部参数与全部 `ZAN_*` 环境变量；`ZAN_BUILD_CACHE=0` 等效；`--emit-ir` 不走优化表 |
 | `-D<name>[=v]` | — | 预处理符号 |
 | `@<file>` | — | 响应文件（一行一个或空白分隔，带空格路径用引号，`#` 起注释，最多嵌套 8 层）——**超长命令行/含空格路径用它** |
 | （位置参数，文件/目录） | — | `.zan` 文件，或**目录**（递归展开 `*.zan`，按路径排序）。目录输入跳过 `.` 前缀与 `.git/build/publish/bin/obj/node_modules/_scratch/dist/out/vendor/.zan-packages` 等目录；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：显式给 `.html`/`.htm` 会被 "the compile-time HTML channel has been removed" 拒绝——界面用 Gui 组件搭骨架、运行期 `Gui.App.LoadHtml` 装载标记（内嵌资源走 `--embed`） |
@@ -398,7 +399,10 @@ GUI 或常驻进程用 `--no-run` 只做编译诊断，或用 `--timeout` 给出
 | `ZAN_DIAG_LIB_BODIES` | `=1` 时普通（封闭世界）构建也为未达到的标准库/`packages/` 方法生成一遍代码以报代码生成诊断（默认只诊断用户源码里未达到的方法；库由自身构建与测试覆盖） |
 | `ZAN_EH_FN_MARK` | `=1` 时每个方法/lambda 入口都记临时栈标记、落地垫都回卷到它（旧行为）。默认只有函数体压过临时（`__zan_eh_tmp_push`）的函数才记，其余函数省掉入口线程 EH 状态读取与回卷调用，仅供 A/B |
 | `ZAN_INLINE_STRLEN` | 非空时恢复字符串长度探测逐点内联展开（默认调用共享内部函数 `__zan_str_len[_arr]`），仅供 IR 体积 A/B |
-| `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断 |
+| `ZAN_LLVM_ARGS` | 空格分隔的额外 LLVM 选项（如 `-time-passes`），编译器性能诊断；设置时自动关闭构建缓存（命中会吞掉旁路输出，`ZAN_DUMP_OPT_IR` 同理） |
+| `ZAN_BUILD_CACHE` | `=0`/`off`/`false` 关闭构建缓存（同 `--no-build-cache`） |
+| `ZAN_CACHE_DIR` | 构建缓存根目录（条目在其下 `backend/`）；缺省为平台用户缓存目录下 `zan/backend`（macOS `~/Library/Caches`、Linux `$XDG_CACHE_HOME` 或 `~/.cache`、Windows `%LOCALAPPDATA%`） |
+| `ZAN_CACHE_PRUNE` | 构建缓存清理策略（LLVM `pruneCache` 语法），缺省 `prune_interval=20m:prune_after=168h:cache_size_bytes=4g` |
 | `ZAN_NO_PULLIN_FILTER` / `ZAN_NO_PRUNE` | 拉入调试：关过滤 / 关裁剪 |
 | `ZAN_NO_DEV_PRUNE` | `=1` 时普通（非 `-g`、非库）构建恢复旧行为：发射全部方法体、为每个方法生成反射调用桩。默认普通构建与 `--publish` 同用封闭世界规则（按需方法体；反射只对属性访问器、带特性方法、设计稿事件处理器、框架钩子与被 Invoke 点名的方法可调用；计算名 Invoke 只能选中名字在程序中以字符串字面量出现过的方法），开发期能反射调用的就是发布后能调用的；`-g` 仍保留全部方法与反射桩 |
 | `ZAN_NO_PUBLISH_REFLECT_DEMAND` | `=1` 时禁用发布反射需求裁剪，恢复全分配点元数据、既有可调用钩子及完整成员签名元数据；仅影响 `--publish` 且非调试、非库构建，用于同源体积对照和回归定位 |

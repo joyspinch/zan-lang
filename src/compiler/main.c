@@ -14,6 +14,7 @@
 #include "attr_routes.h"
 #include "irgen.h"
 #include "optimizer.h"
+#include "build_cache.h"
 #include "procmem.h"
 #include "crosscomp.h"
 #include "winres.h"
@@ -553,7 +554,8 @@ int main(int argc, char **argv) {
         LLVMParseCommandLineOptions(ncl, cl, "");
     }
     expand_arg_files(&argc, &argv);
-        zan_options_t opts;
+    zan_bcache_init(argc, argv);
+    zan_options_t opts;
     zan_options_status_t opt_st = zan_options_parse(argc, argv, &opts);
     if (opt_st != ZAN_OPTIONS_OK) {
         return opts.exit_code;

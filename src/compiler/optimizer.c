@@ -1,5 +1,6 @@
 
 #include "optimizer.h"
+#include "build_cache.h"
 #include "irgen.h"
 #include "binder.h"
 #include "zan_abi.h"
@@ -1117,9 +1118,8 @@ int zan_shrink_collapse_invokes(LLVMModuleRef mod) {
         }
         LLVMDisposeBuilder(b);
         zan_opt_verify_module(mod, "after shrink collapse");
-        fprintf(stderr,
-                "shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
-                collapsed, total_inv, nthr, nfn);
+        zan_bcache_logf("shrink: nounwind: %d/%d invokes collapsed (%d/%u fns nothrow)\n",
+                        collapsed, total_inv, nthr, nfn);
     }
 oom:
 fail:
@@ -1419,18 +1419,19 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
 }
 
 void zan_opt_report_print(const zan_opt_report_t *report) {
-    fprintf(stderr, "Optimization report (%.1f ms):\n", report->time_ms);
+    zan_bcache_logf("Optimization report (%.1f ms):\n", report->time_ms);
     if (report->escape.stack_promoted > 0)
-        fprintf(stderr, "  Escape: %d objects promoted to stack (of %d analyzed)\n",
-                report->escape.stack_promoted, report->escape.objects_analyzed);
+        zan_bcache_logf("  Escape: %d objects promoted to stack (of %d analyzed)\n",
+                        report->escape.stack_promoted, report->escape.objects_analyzed);
     if (report->arc.pairs_elided > 0)
-        fprintf(stderr, "  ARC: %d retain/release pairs elided\n", report->arc.pairs_elided);
+        zan_bcache_logf("  ARC: %d retain/release pairs elided\n", report->arc.pairs_elided);
     if (report->devirt.calls_devirtualized > 0)
-        fprintf(stderr, "  Devirt: %d virtual calls resolved\n", report->devirt.calls_devirtualized);
+        zan_bcache_logf("  Devirt: %d virtual calls resolved\n",
+                        report->devirt.calls_devirtualized);
     if (report->constfold.constants_folded > 0)
-        fprintf(stderr, "  Const: %d expressions folded\n", report->constfold.constants_folded);
+        zan_bcache_logf("  Const: %d expressions folded\n", report->constfold.constants_folded);
     if (report->dce.dead_stores > 0)
-        fprintf(stderr, "  DCE: %d dead stores removed\n", report->dce.dead_stores);
+        zan_bcache_logf("  DCE: %d dead stores removed\n", report->dce.dead_stores);
     if (report->inlining.functions_inlined > 0)
-        fprintf(stderr, "  Inline: %d functions inlined\n", report->inlining.functions_inlined);
+        zan_bcache_logf("  Inline: %d functions inlined\n", report->inlining.functions_inlined);
 }

@@ -829,3 +829,24 @@ awaiter 或最近的 catch 回卷到更低的 mark。fib 0.24s → 0.18s（与 C
 1GHz——调用变快后 `case_bench_suite` 的"measured time is positive"大概率读到 0。
 Apple 上改用 `clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)`（41.7ns 分辨率，含睡眠）。
 测试"变快后才失败"先怀疑测量工具的分辨率，别回退优化。
+
+## 38. 构建缓存：计时先关缓存；按模块字节做键要先读回（2026-11-24 Mac arm64 实证）
+
+zanc 默认开 LLVM 后端缓存（`docs/BUILD_CACHE.md`）：优化前模块与最终模块的 bitcode
+哈希命中时直接取优化结果与目标文件，`--time` 里 optimize/write obj 几乎归零。
+**给优化器或后端做 A/B 计时，一律加 `--no-build-cache`**（或重建/`touch` zanc——
+二进制 mtime 在键里）；`--time` 末尾的 `build cache:` 行能看出这次是否命中。
+
+键只认"闭世界、泛型、反射决定完之后的模块字节"，不重做任何决策，所以正确性不靠缓存
+理解这些规则。踩过的两个坑：
+- **bitcode writer 不是模块语义的函数**：同一个模块，优化后在内存里直接写，与读回后
+  再写，字节不同——函数内符号表按 StringMap 的插入历史排序，`mustprogress` 读回时被丢。
+  未命中路径存档后必须**改用读回的模块**继续，下一次构建的对象键才对得上。
+- **结构体类型名在 LLVMContext 里**：读进 irgen 同一个上下文，同名类型会变成
+  `String.1`，字节又不同。存档前把结构体类型去名（优化后没有按名找类型的代码）。
+- **优化之后 `irgen.mod` 是另一个模块**（命中换入缓存模块，未命中换入读回模块）。
+  优化后跑的代码只能按名字找函数/全局（`LLVMGetNamedFunction`），不能用 irgen 缓存的
+  `g->rt_*`、`g->functions` 等 LLVMValueRef——那是悬垂指针，不崩但判断静默出错
+  （实例：`zan_strip_unused_co_sched_init` 用 `g->rt_co_sched_init`，缓存构建不删调用，
+  exe 比关缓存大 38 KB，`build_cache_memo` 的"关缓存产物相同"抓到）。
+验证三件套：冷/热/`--no-build-cache` 三次产物 `cmp` 逐字节相同；用例 `build_cache_memo`。

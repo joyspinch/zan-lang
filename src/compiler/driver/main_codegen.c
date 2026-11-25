@@ -213,9 +213,38 @@
     }
 
     if (effective_opt > ZAN_OPT_NONE) {
-        zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
-        if (!opt_report.success) goto codegen_failed;
-        zan_opt_report_print(&opt_report);
+        /* Build cache (docs/BUILD_CACHE.md): the optimizer is a pure function
+         * of this module and the options, so a hit swaps in the optimized
+         * module the same input produced before and replays its report. A
+         * miss also continues with the stored module read back. Either way
+         * irgen.mod is a new module from here on: code after this point must
+         * find functions/globals by name, never through LLVMValueRefs that
+         * irgen cached (g->rt_*, g->functions, ...). */
+        zan_bcache_key_t opt_key = {{0}, false};
+        char *opt_log = NULL;
+        LLVMModuleRef cached_mod = NULL;
+        /* --emit-ir prints the optimized module itself: keep its type names. */
+        if (!do_emit_ir && zan_bcache_opt_key(irgen.mod, (int)effective_opt, &opt_key)) {
+            if (irgen.builder) LLVMClearInsertionPosition(irgen.builder);
+            cached_mod = zan_bcache_opt_load(&opt_key, irgen.mod, &opt_log);
+        }
+        if (cached_mod) {
+            irgen.mod = cached_mod;
+            if (opt_log) fputs(opt_log, stderr);
+        } else {
+            if (opt_key.valid) zan_bcache_capture_begin();
+            zan_opt_report_t opt_report = zan_optimize(&irgen, NULL, effective_opt);
+            if (!opt_report.success) {
+                free(opt_key.valid ? zan_bcache_capture_end() : NULL);
+                goto codegen_failed;
+            }
+            zan_opt_report_print(&opt_report);
+            if (opt_key.valid) {
+                opt_log = zan_bcache_capture_end();
+                irgen.mod = zan_bcache_opt_store(&opt_key, irgen.mod, opt_log);
+            }
+        }
+        free(opt_log);
         phase("optimize");
         probe_phase_mem("optimize");
         if (shard_n == 0)
@@ -950,6 +979,7 @@ codegen_ready:
         irgen.split_objs = NULL;
         irgen.split_obj_count = 0;
         phase("write obj");
+        if (g_time_phases) zan_bcache_print_stats();
         probe_phase_mem("write obj");
 
         zan_irgen_release_llvm(&irgen);

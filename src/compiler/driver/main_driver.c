@@ -1145,7 +1145,10 @@ static void zan_strip_alloc_counter(zan_irgen_t *g) {
  * 定时器不走就绪钩子）。库保留：宿主可能跑异步。 */
 static void zan_strip_unused_co_sched_init(zan_irgen_t *g) {
     if (g->emit_lib) return;
-    LLVMValueRef init = g->rt_co_sched_init;
+    /* By name, not g->rt_co_sched_init: this runs after optimization, and the
+     * build cache (docs/BUILD_CACHE.md) replaces g->mod there, so values
+     * cached during irgen point into a module that no longer exists. */
+    LLVMValueRef init = LLVMGetNamedFunction(g->mod, "zan_co_sched_init");
     if (!init) return;
     static const char *const prefixes[] = {
         "zan_co_", "zan_io_", "zan_timer_", "zan_task_", "zan_async_",

@@ -265,6 +265,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv, zan_options_t *opt
             error_limit = (int)lv;
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
             link_subsystem = argv[++i];
+        } else if (strcmp(argv[i], "--no-build-cache") == 0) {
+            /* consumed by zan_bcache_init (build_cache.h) */
         } else if (strcmp(argv[i], "--time") == 0) {
             g_time_phases = true;
             g_phase_start = now_ms();

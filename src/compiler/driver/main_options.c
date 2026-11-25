@@ -35,6 +35,8 @@ void print_usage(void) {
     fprintf(stderr, "    --quiet, -q      Suppress progress lines on stdout (driver bundling,\n");
     fprintf(stderr, "                     APK packaging, the \"Compiled N files\" summary)\n");
     fprintf(stderr, "    --time           Report how long each compiler phase took\n");
+    fprintf(stderr,
+            "    --no-build-cache Recompute optimization and object code (docs/BUILD_CACHE.md)\n");
     fprintf(stderr, "    -D<name>[=value] Define preprocessor symbol\n");
     fprintf(stderr, "    @<file>          Read further arguments from <file> (one per line or\n");
     fprintf(stderr, "                     whitespace separated, \"quoted\" for paths with spaces)\n");
