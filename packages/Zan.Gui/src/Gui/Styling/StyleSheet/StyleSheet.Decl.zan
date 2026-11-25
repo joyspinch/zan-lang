@@ -3,6 +3,237 @@ using System.Collections.Generic;
 using Gui;
 namespace Gui;
 public partial class StyleSheet {
+    static Dict<string, long> sourceMap;
+    static Dict<string, int> inertMap;
+
+    static List<CompiledDecl> CompileBlock(JsonValue block, bool important) {
+        if (block == null) { return null; }
+        JsonValue values = important ? block.Get("__zan_important") : block;
+        if (values == null || !values.IsObject() || values.Count() == 0) { return null; }
+        JsonValue lengths = block.Get(important
+            ? "__zan_important_lengths" : "__zan_lengths");
+        bool hasLengths = lengths != null && lengths.IsObject();
+        List<CompiledDecl> list = new List<CompiledDecl>();
+        int n = values.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            string rawKey = values.KeyAt(i);
+            if (!important && StyleSheet.InternalKey(rawKey)) { continue; }
+            string k = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(rawKey)));
+            if (k == "" || StyleSheet.InertNormalized(k)) { continue; }
+            string val = StyleSheet.ValStr(values.ValAt(i));
+            if (hasLengths) {
+                JsonValue resolved = lengths.Get(rawKey);
+                if (resolved != null) { val = StyleSheet.ValStr(resolved); }
+            }
+            string v = StyleSheet.Trim(val);
+            if (v == "") { continue; }
+            CompiledDecl d = StyleSheet.CompileSingle(k, v,
+                StyleSheet.IsPrescaled(block, rawKey, important));
+            list.Add(d);
+        }
+        return list.Count > 0 ? list : null;
+    }
+
+    static CompiledDecl CompileSingle(string k, string v, bool prescaled) {
+        CompiledDecl d = new CompiledDecl();
+        d.key = k;
+        d.val = v;
+        d.prescaled = prescaled;
+        if (v.Length >= 12) {
+            string lov = StyleSheet.Lower(v);
+            if (lov.IndexOf("currentcolor") >= 0) {
+                d.ccBits = StyleSheet.CcBits(k);
+                if (lov == "currentcolor") {
+                    d.isPureCurrentColor = true;
+                    return d;
+                }
+            }
+        }
+        // 高频无单位/无上下文依赖属性在索引期完成整型预求值
+        if (k == "color") {
+            d.propId = CompiledPropId.Color;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "background-color"
+            || ((k == "background" || k == "bg") && !StyleSheet.StartsWith(v, "linear-gradient("))) {
+            d.propId = CompiledPropId.BgColor;
+            d.intVal = (v == "none" || v == "transparent") ? 0 : StyleSheet.ParseColor(v);
+        } else if (k == "accent-color") {
+            d.propId = CompiledPropId.AccentColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "border-color") {
+            d.propId = CompiledPropId.BorderColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "border-top-color") {
+            d.propId = CompiledPropId.BorderTopColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "border-right-color") {
+            d.propId = CompiledPropId.BorderRightColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "border-bottom-color") {
+            d.propId = CompiledPropId.BorderBottomColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "border-left-color") {
+            d.propId = CompiledPropId.BorderLeftColor;
+            d.intVal = StyleSheet.ParseColor(v);
+        } else if (k == "opacity") {
+            d.propId = CompiledPropId.Opacity;
+            d.intVal = StyleSheet.Perm(v);
+        } else if (k == "display") {
+            d.propId = CompiledPropId.Display;
+            int disp = 0;
+            int flags = 0; // bit0: inlineLevel, bit1: setsBfc
+            if (v == "flex") { disp = 1; }
+            else if (v == "inline-flex") { disp = 1; flags = 3; }
+            else if (v == "none") { disp = 2; }
+            else if (v == "block") { disp = 3; }
+            else if (v == "flow-root") { disp = 3; flags = 2; }
+            else if (v == "grid") { disp = 4; }
+            else if (v == "inline-grid") { disp = 4; flags = 3; }
+            else if (v == "inline" || v == "inline-block") { disp = 3; flags = 3; }
+            d.intVal = disp;
+            d.auxVal = flags;
+        } else if (k == "flex-direction") {
+            d.propId = CompiledPropId.FlexDir;
+            d.intVal = (v == "column" || v == "column-reverse") ? 1 : 0;
+            d.auxVal = (v == "row-reverse" || v == "column-reverse") ? 1 : 0;
+        } else if (k == "justify-content") {
+            d.propId = CompiledPropId.Justify;
+            d.intVal = StyleSheet.JustifyCode(v);
+        } else if (k == "align-items") {
+            d.propId = CompiledPropId.AlignItems;
+            d.intVal = StyleSheet.AlignItemCode(v);
+        } else if (k == "font-weight") {
+            d.propId = CompiledPropId.FontWeight;
+            d.intVal = StyleSheet.Weight(v);
+        } else if (k == "text-align") {
+            d.propId = CompiledPropId.TextAlign;
+            int al = 0;
+            if (v == "center") { al = 1; }
+            else if (v == "right" || v == "end") { al = 2; }
+            d.intVal = al;
+        } else if (k == "cursor") {
+            d.propId = CompiledPropId.Cursor;
+            d.intVal = StyleSheet.CursorCode(v);
+        } else if (k == "visibility") {
+            d.propId = CompiledPropId.Visibility;
+            d.intVal = (v == "hidden" || v == "collapse") ? 0 : 1;
+        } else if (k == "position") {
+            d.propId = CompiledPropId.Position;
+            int pos = 0;
+            if (v == "relative") { pos = 1; }
+            else if (v == "absolute" || v == "fixed") { pos = 2; }
+            d.intVal = pos;
+        } else if (k == "overflow" || k == "overflow-x" || k == "overflow-y") {
+            int ocode = 0;
+            if (v == "hidden" || v == "clip") { ocode = 1; }
+            else if (v == "auto") { ocode = 2; }
+            else if (v == "scroll") { ocode = 3; }
+            d.propId = k == "overflow" ? CompiledPropId.Overflow
+                : (k == "overflow-x" ? CompiledPropId.OverflowX : CompiledPropId.OverflowY);
+            d.intVal = ocode;
+        } else if (k == "z-index") {
+            d.propId = CompiledPropId.ZIndex;
+            d.intVal = StyleSheet.Num(v);
+        } else if (k == "box-sizing") {
+            d.propId = CompiledPropId.BoxSizing;
+            d.intVal = v == "content-box" ? 1 : 0;
+        } else if (k == "flex-wrap") {
+            d.propId = CompiledPropId.FlexWrap;
+            d.intVal = (v == "wrap" || v == "wrap-reverse") ? 1 : 0;
+        } else if (k == "flex-grow") {
+            d.propId = CompiledPropId.FlexGrow;
+            d.intVal = StyleSheet.Num(v);
+        } else if (k == "flex-shrink") {
+            d.propId = CompiledPropId.FlexShrink;
+            d.intVal = StyleSheet.Num(v);
+        }
+        return d;
+    }
+
+    static void ApplyCompiledList(StyleBox b, List<CompiledDecl> decls) {
+        if (decls == null) { return; }
+        int n = decls.Count;
+        bool savedPrescaled = b.declPrescaled;
+        for (int i = 0; i < n; i = i + 1) {
+            CompiledDecl d = decls[i];
+            if (d.ccBits != 0) {
+                b.ccMask = b.ccMask | d.ccBits;
+                if (d.isPureCurrentColor) { continue; }
+            }
+            switch (d.propId) {
+                case CompiledPropId.Color:
+                    b.fg = d.intVal;
+                    b.foregroundDeclared = true;
+                    break;
+                case CompiledPropId.BgColor:
+                    b.bg = d.intVal;
+                    b.bgTo = 0;
+                    b.bgVia = 0;
+                    break;
+                case CompiledPropId.AccentColor: b.accent = d.intVal; break;
+                case CompiledPropId.BorderColor: b.borderColor = d.intVal; break;
+                case CompiledPropId.BorderTopColor: b.borderTopColor = d.intVal; break;
+                case CompiledPropId.BorderRightColor: b.borderRightColor = d.intVal; break;
+                case CompiledPropId.BorderBottomColor: b.borderBottomColor = d.intVal; break;
+                case CompiledPropId.BorderLeftColor: b.borderLeftColor = d.intVal; break;
+                case CompiledPropId.Opacity: b.opacity = d.intVal; break;
+                case CompiledPropId.Display:
+                    b.display = d.intVal;
+                    b.inlineLevel = d.auxVal & 1;
+                    if ((d.auxVal & 2) != 0) { b.bfc = 1; }
+                    break;
+                case CompiledPropId.FlexDir:
+                    b.flexDir = d.intVal;
+                    b.flexReverse = d.auxVal;
+                    break;
+                case CompiledPropId.Justify: b.justify = d.intVal; break;
+                case CompiledPropId.AlignItems: b.alignItems = d.intVal; break;
+                case CompiledPropId.FontWeight: b.fontWeight = d.intVal; break;
+                case CompiledPropId.TextAlign: b.align = d.intVal; break;
+                case CompiledPropId.Cursor: b.cursor = d.intVal; break;
+                case CompiledPropId.Visibility: b.visible = d.intVal; break;
+                case CompiledPropId.Position: b.position = d.intVal; break;
+                case CompiledPropId.Overflow:
+                    b.overflowX = d.intVal;
+                    b.overflowY = d.intVal;
+                    b.overflow = d.intVal != 0 ? 1 : 0;
+                    b.overflowCss = b.overflow;
+                    break;
+                case CompiledPropId.OverflowX:
+                    b.overflowX = d.intVal;
+                    b.overflow = (b.overflowX != 0 || b.overflowY != 0) ? 1 : 0;
+                    b.overflowCss = b.overflow;
+                    break;
+                case CompiledPropId.OverflowY:
+                    b.overflowY = d.intVal;
+                    b.overflow = (b.overflowX != 0 || b.overflowY != 0) ? 1 : 0;
+                    b.overflowCss = b.overflow;
+                    break;
+                case CompiledPropId.ZIndex: b.zIndex = d.intVal; break;
+                case CompiledPropId.BoxSizing: b.boxSizing = d.intVal; break;
+                case CompiledPropId.FlexWrap: b.wrap = d.intVal; break;
+                case CompiledPropId.FlexGrow: b.grow = d.intVal; break;
+                case CompiledPropId.FlexShrink: b.shrink = d.intVal; break;
+                default:
+                    b.declPrescaled = d.prescaled;
+                    StyleSheet.DeclNormalized(b, d.key, d.val);
+                    break;
+            }
+        }
+        b.declPrescaled = savedPrescaled;
+    }
+
+    static bool DeclNormalized(StyleBox b, string k, string v) {
+        if (StyleSheet.DeclFill(b, k, v)) { return true; }
+        if (StyleSheet.DeclText(b, k, v)) { return true; }
+        if (StyleSheet.DeclBorderBox(b, k, v)) { return true; }
+        if (StyleSheet.DeclBoxMetrics(b, k, v)) { return true; }
+        if (StyleSheet.DeclLayout(b, k, v)) { return true; }
+        if (StyleSheet.DeclMotion(b, k, v)) { return true; }
+        if (k == "content") { b.contentRaw = v; return true; }
+        return false;
+    }
+
     static bool DeclBlock(StyleBox b, JsonValue block, string key, bool important) {
         if (block == null) { return false; }
         JsonValue values = important ? block.Get("__zan_important") : block;
@@ -24,7 +255,7 @@ public partial class StyleSheet {
         string v = StyleSheet.Trim(val);
         if (k == "" || v == "") { return false; }
         k = StyleSheet.StripVendor(k);
-        if (StyleSheet.Inert(k)) { return true; }
+        if (StyleSheet.InertNormalized(k)) { return true; }
         if (v.Length >= 12) {
             string lov = StyleSheet.Lower(v);
             if (lov.IndexOf("currentcolor") >= 0) {
@@ -33,14 +264,7 @@ public partial class StyleSheet {
                 if (lov == "currentcolor") { return true; }
             }
         }
-        if (StyleSheet.DeclFill(b, k, v)) { return true; }
-        if (StyleSheet.DeclText(b, k, v)) { return true; }
-        if (StyleSheet.DeclBorderBox(b, k, v)) { return true; }
-        if (StyleSheet.DeclBoxMetrics(b, k, v)) { return true; }
-        if (StyleSheet.DeclLayout(b, k, v)) { return true; }
-        if (StyleSheet.DeclMotion(b, k, v)) { return true; }
-        if (k == "content") { b.contentRaw = v; return true; }
-        return false;
+        return StyleSheet.DeclNormalized(b, k, v);
     }
     static int CcBits(string key) {
         if (key == "background" || key == "background-color"
@@ -85,67 +309,73 @@ public partial class StyleSheet {
         b.declPrescaled = previous;
         return ok;
     }
+    static Dict<string, long> EnsureSourceMap() {
+        if (StyleSheet.sourceMap != null) { return StyleSheet.sourceMap; }
+        Dict<string, long> m = new Dict<string, long>();
+        m.Add("font-size", StyleBox.SourceFont());
+        m.Add("font", StyleBox.SourceFont());
+        m.Add("width", StyleBox.SourceWidth());
+        m.Add("height", StyleBox.SourceHeight());
+        m.Add("min-width", StyleBox.SourceMinW());
+        m.Add("min-height", StyleBox.SourceMinH());
+        m.Add("max-width", StyleBox.SourceMaxW());
+        m.Add("max-height", StyleBox.SourceMaxH());
+        m.Add("flex-basis", StyleBox.SourceBasis());
+        m.Add("flex", StyleBox.SourceBasis());
+        m.Add("gap", StyleBox.SourceGap());
+        m.Add("row-gap", StyleBox.SourceRowGap());
+        m.Add("column-gap", StyleBox.SourceColGap());
+        m.Add("padding-left", StyleBox.SourcePadL());
+        m.Add("padding-top", StyleBox.SourcePadT());
+        m.Add("padding-right", StyleBox.SourcePadR());
+        m.Add("padding-bottom", StyleBox.SourcePadB());
+        m.Add("margin-left", StyleBox.SourceMarL());
+        m.Add("margin-top", StyleBox.SourceMarT());
+        m.Add("margin-right", StyleBox.SourceMarR());
+        m.Add("margin-bottom", StyleBox.SourceMarB());
+        m.Add("border-top-left-radius", StyleBox.SourceRadiusTL());
+        m.Add("border-top-right-radius", StyleBox.SourceRadiusTR());
+        m.Add("border-bottom-right-radius", StyleBox.SourceRadiusBR());
+        m.Add("border-bottom-left-radius", StyleBox.SourceRadiusBL());
+        m.Add("line-height", StyleBox.SourceLineHeight());
+        m.Add("letter-spacing", StyleBox.SourceLetterSpacing());
+        m.Add("border", StyleBox.SourceBorder());
+        m.Add("border-width", StyleBox.SourceBorder());
+        m.Add("border-top", StyleBox.SourceBorderTop());
+        m.Add("border-top-width", StyleBox.SourceBorderTop());
+        m.Add("border-right", StyleBox.SourceBorderRight());
+        m.Add("border-right-width", StyleBox.SourceBorderRight());
+        m.Add("border-bottom", StyleBox.SourceBorderBottom());
+        m.Add("border-bottom-width", StyleBox.SourceBorderBottom());
+        m.Add("border-left", StyleBox.SourceBorderLeft());
+        m.Add("border-left-width", StyleBox.SourceBorderLeft());
+        m.Add("top", StyleBox.SourcePosT());
+        m.Add("right", StyleBox.SourcePosR());
+        m.Add("bottom", StyleBox.SourcePosB());
+        m.Add("left", StyleBox.SourcePosL());
+        long padAll = StyleBox.SourcePadL() | StyleBox.SourcePadT()
+            | StyleBox.SourcePadR() | StyleBox.SourcePadB();
+        m.Add("padding", padAll);
+        m.Add("pad", padAll);
+        m.Add("margin", StyleBox.SourceMarL() | StyleBox.SourceMarT()
+            | StyleBox.SourceMarR() | StyleBox.SourceMarB());
+        long radAll = StyleBox.SourceRadius() | StyleBox.SourceRadiusTL()
+            | StyleBox.SourceRadiusTR() | StyleBox.SourceRadiusBR()
+            | StyleBox.SourceRadiusBL();
+        m.Add("radius", radAll);
+        m.Add("border-radius", radAll);
+        m.Add("inset", StyleBox.SourcePosT() | StyleBox.SourcePosR()
+            | StyleBox.SourcePosB() | StyleBox.SourcePosL());
+        long txTy = StyleBox.SourceTx() | StyleBox.SourceTy();
+        m.Add("translate", txTy);
+        m.Add("transform", txTy);
+        StyleSheet.sourceMap = m;
+        return m;
+    }
     static long SourceFor(string key) {
         string k = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(key)));
-        if (k == "font-size") { return StyleBox.SourceFont(); }
-        if (k == "font") { return StyleBox.SourceFont(); }
-        if (k == "width") { return StyleBox.SourceWidth(); }
-        if (k == "height") { return StyleBox.SourceHeight(); }
-        if (k == "min-width") { return StyleBox.SourceMinW(); }
-        if (k == "min-height") { return StyleBox.SourceMinH(); }
-        if (k == "max-width") { return StyleBox.SourceMaxW(); }
-        if (k == "max-height") { return StyleBox.SourceMaxH(); }
-        if (k == "flex-basis") { return StyleBox.SourceBasis(); }
-        if (k == "flex") { return StyleBox.SourceBasis(); }
-        if (k == "gap") { return StyleBox.SourceGap(); }
-        if (k == "row-gap") { return StyleBox.SourceRowGap(); }
-        if (k == "column-gap") { return StyleBox.SourceColGap(); }
-        if (k == "padding-left") { return StyleBox.SourcePadL(); }
-        if (k == "padding-top") { return StyleBox.SourcePadT(); }
-        if (k == "padding-right") { return StyleBox.SourcePadR(); }
-        if (k == "padding-bottom") { return StyleBox.SourcePadB(); }
-        if (k == "margin-left") { return StyleBox.SourceMarL(); }
-        if (k == "margin-top") { return StyleBox.SourceMarT(); }
-        if (k == "margin-right") { return StyleBox.SourceMarR(); }
-        if (k == "margin-bottom") { return StyleBox.SourceMarB(); }
-        if (k == "border-top-left-radius") { return StyleBox.SourceRadiusTL(); }
-        if (k == "border-top-right-radius") { return StyleBox.SourceRadiusTR(); }
-        if (k == "border-bottom-right-radius") { return StyleBox.SourceRadiusBR(); }
-        if (k == "border-bottom-left-radius") { return StyleBox.SourceRadiusBL(); }
-        if (k == "line-height") { return StyleBox.SourceLineHeight(); }
-        if (k == "letter-spacing") { return StyleBox.SourceLetterSpacing(); }
-        if (k == "border") { return StyleBox.SourceBorder(); }
-        if (k == "border-width") { return StyleBox.SourceBorder(); }
-        if (k == "border-top") { return StyleBox.SourceBorderTop(); }
-        if (k == "border-top-width") { return StyleBox.SourceBorderTop(); }
-        if (k == "border-right") { return StyleBox.SourceBorderRight(); }
-        if (k == "border-right-width") { return StyleBox.SourceBorderRight(); }
-        if (k == "border-bottom") { return StyleBox.SourceBorderBottom(); }
-        if (k == "border-bottom-width") { return StyleBox.SourceBorderBottom(); }
-        if (k == "border-left") { return StyleBox.SourceBorderLeft(); }
-        if (k == "border-left-width") { return StyleBox.SourceBorderLeft(); }
-        if (k == "top") { return StyleBox.SourcePosT(); }
-        if (k == "right") { return StyleBox.SourcePosR(); }
-        if (k == "bottom") { return StyleBox.SourcePosB(); }
-        if (k == "left") { return StyleBox.SourcePosL(); }
-        if (k == "padding" || k == "pad") {
-            return StyleBox.SourcePadL() | StyleBox.SourcePadT()
-                | StyleBox.SourcePadR() | StyleBox.SourcePadB();
-        }
-        if (k == "margin") {
-            return StyleBox.SourceMarL() | StyleBox.SourceMarT()
-                | StyleBox.SourceMarR() | StyleBox.SourceMarB();
-        }
-        if (k == "radius" || k == "border-radius") {
-            return StyleBox.SourceRadius() | StyleBox.SourceRadiusTL()
-                | StyleBox.SourceRadiusTR() | StyleBox.SourceRadiusBR()
-                | StyleBox.SourceRadiusBL();
-        }
-        if (k == "inset") {
-            return StyleBox.SourcePosT() | StyleBox.SourcePosR()
-                | StyleBox.SourcePosB() | StyleBox.SourcePosL();
-        }
-        if (k == "translate" || k == "transform") { return StyleBox.SourceTx() | StyleBox.SourceTy(); }
+        long found;
+        if (StyleSheet.EnsureSourceMap().TryGetValue(k, out found)) { return found; }
         return 0;
     }
     static bool DeclFill(StyleBox b, string k, string v) {
@@ -399,7 +629,9 @@ public partial class StyleSheet {
         }
         if (k == "flex-direction") {
             b.flexDir = 0;
+            b.flexReverse = 0;
             if (v == "column" || v == "column-reverse") { b.flexDir = 1; }
+            if (v == "row-reverse" || v == "column-reverse") { b.flexReverse = 1; }
             return true;
         }
         if (k == "justify-content") { b.justify = StyleSheet.JustifyCode(v); return true; }
@@ -408,8 +640,13 @@ public partial class StyleSheet {
             List<string> ff = StyleSheet.Tokens(v);
             for (int i = 0; i < ff.Count; i = i + 1) {
                 string t = StyleSheet.Lower(ff[i]);
-                if (t == "row" || t == "row-reverse") { b.flexDir = 0; }
-                else if (t == "column" || t == "col" || t == "column-reverse") { b.flexDir = 1; }
+                if (t == "row" || t == "row-reverse") {
+                    b.flexDir = 0;
+                    b.flexReverse = t == "row-reverse" ? 1 : 0;
+                } else if (t == "column" || t == "col" || t == "column-reverse") {
+                    b.flexDir = 1;
+                    b.flexReverse = t == "column-reverse" ? 1 : 0;
+                }
                 else if (t == "wrap" || t == "wrap-reverse") { b.wrap = 1; }
                 else if (t == "nowrap") { b.wrap = 0; }
             }
@@ -500,68 +737,47 @@ public partial class StyleSheet {
         }
         return false;
     }
+    static Dict<string, int> EnsureInertMap() {
+        if (StyleSheet.inertMap != null) { return StyleSheet.inertMap; }
+        Dict<string, int> m = new Dict<string, int>();
+        string table = "font-family,font-style,font-variant,font-stretch,font-kerning,"
+            + "font-feature-settings,font-variation-settings,font-size-adjust,font-language-override,"
+            + "font-optical-sizing,font-palette,-webkit-font-smoothing,-moz-osx-font-smoothing,"
+            + "text-decoration,text-decoration-line,text-decoration-style,text-decoration-color,"
+            + "text-decoration-thickness,text-underline-offset,text-emphasis,text-justify,text-indent,"
+            + "word-spacing,word-break,line-break,overflow-wrap,hyphens,tab-size,text-rendering,"
+            + "text-orientation,user-select,caret-color,writing-mode,direction,"
+            + "outline,outline-width,outline-style,outline-color,outline-offset,quotes,"
+            + "counter-reset,counter-increment,list-style,list-style-type,list-style-position,"
+            + "list-style-image,table-layout,border-collapse,border-spacing,empty-cells,caption-side,"
+            + "object-fit,object-position,image-rendering,image-orientation,"
+            + "mix-blend-mode,background-blend-mode,isolation,clip-path,mask,mask-image,"
+            + "shape-outside,shape-margin,will-change,all,appearance,zoom,resize,"
+            + "scroll-behavior,overscroll-behavior,touch-action,pointer-events,"
+            + "scroll-snap-type,scroll-snap-align,scroll-margin,scroll-padding,"
+            + "background-position,background-size,background-repeat,background-attachment,"
+            + "background-origin,background-clip,background-blend,"
+            + "column-width,column-count,column-rule,column-rule-width,column-rule-style,"
+            + "column-rule-color,column-span,column-fill,widows,orphans,"
+            + "color-scheme,forced-color-adjust,print-color-adjust";
+        int start = 0;
+        int n = table.Length;
+        for (int i = 0; i <= n; i = i + 1) {
+            if (i == n || (table[i] & 255) == 44) {
+                if (i > start) {
+                    m.Add(table.Substring(start, i - start), 1);
+                }
+                start = i + 1;
+            }
+        }
+        StyleSheet.inertMap = m;
+        return m;
+    }
+    static bool InertNormalized(string k) {
+        return StyleSheet.EnsureInertMap().ContainsKey(k);
+    }
     static bool Inert(string key) {
-        string k = StyleSheet.Lower(StyleSheet.Trim(key));
-        if (k == "font-family" || k == "font-style" || k == "font-variant"
-            || k == "font-stretch" || k == "font-kerning"
-            || k == "font-feature-settings" || k == "font-variation-settings"
-            || k == "font-size-adjust" || k == "font-language-override"
-            || k == "font-optical-sizing" || k == "font-palette"
-            || k == "-webkit-font-smoothing" || k == "-moz-osx-font-smoothing") {
-            return true;
-        }
-        if (k == "text-decoration" || k == "text-decoration-line"
-            || k == "text-decoration-style" || k == "text-decoration-color"
-            || k == "text-decoration-thickness" || k == "text-underline-offset"
-            || k == "text-emphasis" || k == "text-justify" || k == "text-indent"
-            || k == "word-spacing" || k == "word-break" || k == "line-break"
-            || k == "overflow-wrap" || k == "hyphens" || k == "tab-size"
-            || k == "text-rendering" || k == "text-orientation"
-            || k == "user-select" || k == "caret-color") {
-            return true;
-        }
-        if (k == "writing-mode" || k == "direction") { return true; }
-        if (k == "outline" || k == "outline-width" || k == "outline-style"
-            || k == "outline-color" || k == "outline-offset"
-            || k == "quotes" || k == "counter-reset"
-            || k == "counter-increment") {
-            return true;
-        }
-        if (k == "list-style" || k == "list-style-type"
-            || k == "list-style-position" || k == "list-style-image"
-            || k == "table-layout" || k == "border-collapse"
-            || k == "border-spacing" || k == "empty-cells" || k == "caption-side"
-            || k == "object-fit" || k == "object-position"
-            || k == "image-rendering" || k == "image-orientation") {
-            return true;
-        }
-        if (k == "mix-blend-mode" || k == "background-blend-mode"
-            || k == "isolation" || k == "clip-path" || k == "mask"
-            || k == "mask-image" || k == "shape-outside" || k == "shape-margin"
-            || k == "will-change" || k == "all" || k == "appearance"
-            || k == "zoom" || k == "resize") {
-            return true;
-        }
-        if (k == "scroll-behavior" || k == "overscroll-behavior"
-            || k == "touch-action" || k == "pointer-events"
-            || k == "scroll-snap-type" || k == "scroll-snap-align"
-            || k == "scroll-margin" || k == "scroll-padding") {
-            return true;
-        }
-        if (k == "background-position" || k == "background-size"
-            || k == "background-repeat" || k == "background-attachment"
-            || k == "background-origin" || k == "background-clip"
-            || k == "background-blend") {
-            return true;
-        }
-        if (k == "column-width" || k == "column-count" || k == "column-rule"
-            || k == "column-rule-width" || k == "column-rule-style"
-            || k == "column-rule-color" || k == "column-span" || k == "column-fill"
-            || k == "widows" || k == "orphans" || k == "color-scheme"
-            || k == "forced-color-adjust" || k == "print-color-adjust") {
-            return true;
-        }
-        return false;
+        return StyleSheet.InertNormalized(StyleSheet.Lower(StyleSheet.Trim(key)));
     }
     static int AlignItemCode(string v) {
         if (v == "flex-start" || v == "start" || v == "top") { return 1; }
@@ -573,15 +789,17 @@ public partial class StyleSheet {
         if (v == "center") { return 1; }
         if (v == "flex-end" || v == "end" || v == "right") { return 2; }
         if (v == "space-between") { return 3; }
-        if (v == "space-around" || v == "space-evenly") { return 4; }
+        if (v == "space-around") { return 4; }
+        if (v == "space-evenly") { return 5; }
         return 0;
     }
     static int AlignContentCode(string v) {
         if (v == "center") { return 1; }
         if (v == "flex-end" || v == "end" || v == "bottom") { return 2; }
         if (v == "space-between") { return 3; }
-        if (v == "space-around" || v == "space-evenly") { return 4; }
+        if (v == "space-around") { return 4; }
         if (v == "stretch") { return 5; }
+        if (v == "space-evenly") { return 6; }
         return 0;
     }
     static void DeclFlex(StyleBox b, string val) {
