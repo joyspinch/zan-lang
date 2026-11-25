@@ -1004,6 +1004,16 @@ binding_lowered:
                             "'%.*s' has no member '%.*s'",
                             (int)acls->name.len, acls->name.str,
                             (int)an.len, an.str);
+                    } else if (!stored && obj_expr->kind == AST_THIS_EXPR) {
+                        /* `this.S = v` 而 S 是静态字段：读路径同口径报 E3009
+                         * （实例引用不能访问静态成员）。以前这里什么都不存，
+                         * 赋值静默丢失。 */
+                        zan_symbol_t *sf = get_field_sym(acls, an);
+                        if (sf && field_member_is_static(sf))
+                            zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3009,
+                                "'%.*s' has no member '%.*s'",
+                                (int)acls->name.len, acls->name.str,
+                                (int)an.len, an.str);
                     }
                 }
                 /* 命名空间/静态类型字段赋值错误防护 */

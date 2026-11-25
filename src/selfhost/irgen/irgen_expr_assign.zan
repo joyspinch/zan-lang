@@ -300,11 +300,35 @@ partial class Irgen {
                     }
                 }
             }
+            // `base.P = v`: the base class' own setter (direct dispatch)
+            if (lhs.a.kind == AK.BaseExpr() && curHasThis) {
+                Node bc = BaseClassOf(binder.FindType(curClass));
+                if (bc != null && FieldIndex(bc, lhs.sval) < 0 && FindMethodUp(bc, "set_" + lhs.sval) != null) {
+                    Node bget = FindMethodUp(bc, "get_" + lhs.sval);
+                    Node sty = bget != null && bget.type != null ? bget.type : v.ty;
+                    string breg = AddLocal("__qdotbase" + lhs.line + "_" + lhs.col, sty);
+                    EA(breg, MapType(sty));
+                    L("  store " + MapType(sty) + " " + Coerce(v, MapType(sty)) + ", " + MapType(sty) + "* " + breg);
+                    Node sc = new Node(AK.Call());
+                    sc.line = lhs.line; sc.col = lhs.col;
+                    Node arg = new Node(AK.Ident());
+                    arg.sval = "__qdotbase" + lhs.line + "_" + lhs.col;
+                    sc.Add(arg);
+                    if (EmitBaseCall("set_" + lhs.sval, sc) != null) { return; }
+                }
+            }
             ExprVal obj = GenExpr(lhs.a);
             string cn = obj.ty.sval;
             Node ocls = binder.FindType(cn);
             if (ocls != null && FieldIndex(ocls, lhs.sval) < 0
                 && EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
+            // `this.S = v` with S static: the instance reference cannot reach
+            // a static member (the host's E3009, same as the read path)
+            if (ocls != null && lhs.a.kind == AK.ThisExpr() && FieldIndex(ocls, lhs.sval) < 0
+                && FindStaticField(ocls, lhs.sval) != null) {
+                diags.Error("[E3009] '" + cn + "' has no member '" + lhs.sval + "'", lhs.line, lhs.col);
+                return;
+            }
             if (ocls != null) {
                 // Convert to the field's type on this receiver. StoreField
                 // still uses the declared type for the physical slot layout.

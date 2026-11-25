@@ -155,6 +155,15 @@ partial class Irgen {
                 fcls = c;
             }
         }
+        // `base.P`: the base class' read-write property, dispatched DIRECTLY
+        // (the host's base_dispatch accessors)
+        if (fcls == null && src.kind == AK.MemberAccess() && src.a != null
+            && src.a.kind == AK.BaseExpr() && curHasThis) {
+            Node bc = BaseClassOf(binder.FindType(curClass));
+            if (bc != null && FieldIndex(bc, src.sval) < 0 && LiveProperty(bc, src.sval, elem, MkType(bc.sval))) {
+                fcls = bc;
+            }
+        }
         if (fcls != null && YieldsOwnedTemp(src.a)) { fcls = null; }
         if (fcls == null) { return GenConstBinding(src, elem, bcls); }
         return GenLiveBinding(src, fcls, bcls);
@@ -163,16 +172,19 @@ partial class Irgen {
     // A live binding: the target object plus the accessor pair that reads
     // and writes the bound field.
     ExprVal GenLiveBinding(Node src, Node fcls, Node bcls) {
-        ExprVal recv = GenExpr(src.a);
+        // `base.P` binds `this` (the accessors dispatch directly to the base)
+        ExprVal recv = src.a != null && src.a.kind == AK.BaseExpr()
+            ? new ExprVal("%this", CurThisTy()) : GenExpr(src.a);
         ExprVal obj = NewBindingObject(bcls);
         // the target is a NON-OWNING reference: a strong one would keep the
         // model alive through the binding (a model <-> view cycle)
         string tgt = ToI8Ptr(recv.op, MapType(recv.ty));
         StoreBindingField(obj, bcls, "target", tgt);
         // the accessor pair: the getter reads the field, the setter writes it
-        Node recvTy = ArgTypeNode(src.a);
-        string gfn = BindingAccFn(fcls, src.sval, false, recvTy);
-        string sfn = BindingAccFn(fcls, src.sval, true, recvTy);
+        bool direct = src.a != null && src.a.kind == AK.BaseExpr();
+        Node recvTy = direct ? MkType(fcls.sval) : ArgTypeNode(src.a);
+        string gfn = BindingAccFn(fcls, src.sval, false, recvTy, direct);
+        string sfn = BindingAccFn(fcls, src.sval, true, recvTy, direct);
         StoreBindingField(obj, bcls, "getter", AccDelegate(gfn, "i64 (i8*, i8*)*"));
         StoreBindingField(obj, bcls, "setter", AccDelegate(sfn, "void (i8*, i8*, i64)*"));
         StoreBindingField(obj, bcls, "live", "1");
@@ -229,9 +241,9 @@ partial class Irgen {
 
     // The accessor function for a live binding of `cls.field`; one shared
     // function per (class, field, direction).
-    string BindingAccFn(Node cls, string field, bool isSet, Node recvTy) {
+    string BindingAccFn(Node cls, string field, bool isSet, Node recvTy, bool direct) {
         InitBinding();
-        string key = cls.sval + "#" + field + (isSet ? "#s" : "#g");
+        string key = cls.sval + "#" + field + (isSet ? "#s" : "#g") + (direct ? "#base" : "");
         // a property accessor calls through the receiver's instantiation:
         // one accessor pair per instantiation (the host keys its cache on
         // recv_type/value_type too)
@@ -244,7 +256,7 @@ partial class Irgen {
         string fn = "__zbind_" + (isSet ? "set" : "get") + "_" + bindAccKeys.Count;
         bindAccKeys.Add(key);
         bindAccFns.Add(fn);
-        EmitBindingAcc(cls, field, isSet, fn, recvTy);
+        EmitBindingAcc(cls, field, isSet, fn, recvTy, direct);
         return fn;
     }
 
@@ -272,11 +284,11 @@ partial class Irgen {
     // Emit the accessor function: the delegate invoke ABI (the env pointer
     // first, then the declared arguments), the field word moved through the
     // erased i64 slot.
-    void EmitBindingAcc(Node cls, string field, bool isSet, string fn, Node recvTy) {
+    void EmitBindingAcc(Node cls, string field, bool isSet, string fn, Node recvTy, bool direct) {
         // a property, or a field of a generic class (an erased slot whose
         // ownership follows the instantiation): the ordinary member codegen
         if (FieldIndex(cls, field) < 0 || TParams(cls).Count > 0) {
-            EmitBindingPropAcc(cls, field, isSet, fn, recvTy);
+            EmitBindingPropAcc(cls, field, isSet, fn, recvTy, direct);
             return;
         }
         int idx = FieldIndex(cls, field);
@@ -327,7 +339,7 @@ partial class Irgen {
     // override -- the C host's emit_property_getter_call/setter_call). The
     // getter hands back +1 like any delegate body (the lambda convention);
     // the setter borrows the incoming slot value.
-    void EmitBindingPropAcc(Node cls, string field, bool isSet, string fn, Node recvTy) {
+    void EmitBindingPropAcc(Node cls, string field, bool isSet, string fn, Node recvTy, bool direct) {
         bool isField = FieldIndex(cls, field) >= 0;
         Node pg = FindMethodUp(cls, "get_" + field);
         Node pty = isField ? FieldType(cls, field) : (pg != null ? pg.type : null);
@@ -390,13 +402,13 @@ partial class Irgen {
                 GenExpr(asg);
             } else {
                 call.Add(arg);
-                EmitInstanceCall(recv, cname, "set_" + field, call);
+                EmitInstanceCallAs(recv, cname, "set_" + field, call, direct);
             }
             EmitTempReleases();
             ReleaseLocalsFrom(0);
             L("  ret void");
         } else {
-            ExprVal rv = isField ? GenExpr(fma) : EmitInstanceCall(recv, cname, "get_" + field, call);
+            ExprVal rv = isField ? GenExpr(fma) : EmitInstanceCallAs(recv, cname, "get_" + field, call, direct);
             if (ArcManaged(rv.ty)) { EmitArcRetain(rv.op, rv.ty); }
             string slot = ToSlot(rv, pty);
             EmitTempReleases();

@@ -956,7 +956,18 @@ Node ArgTypeNode(Node e) {
     if (k == AK.BoolLit()) { return MkType("bool"); }
     if (k == AK.ThisExpr()) { return CurThisTy(); }
     if (k == AK.CastExpr()) { return e.type; }
-    if (k == AK.NewExpr()) { return e.type; }
+    if (k == AK.NewExpr()) {
+        // `new T[n]` is an ARRAY of T (the checker's InferType does the
+        // same): e.type names only the element, the ranks ride on the node
+        if (e.ival == 1 && e.type != null) {
+            string rk = e.arrRanks != null && e.arrRanks != "" ? e.arrRanks : "1";
+            Node at = CopyType(e.type);
+            at.ival = e.type.ival + rk.Split(',').Count;
+            at.arrRanks = e.type.arrRanks != null && e.type.arrRanks != "" ? rk + "," + e.type.arrRanks : rk;
+            return at;
+        }
+        return e.type;
+    }
     if (k == AK.IsExpr()) { return MkType("bool"); }
     if (k == AK.Ident()) {
         int li = LocalIdx(e.sval);
@@ -1522,29 +1533,36 @@ int LambdaArity(Node lam) {
 // `new Bag<Item>(i => i.name)`, the lambda's parameter stays untyped and
 // its body does not compile.
 bool CtorArgFits(Node ctor, Node e) {
-    int argc = e.kids.Count;
-    int j = 0;
+    // each argument meets ITS parameter: a named argument (`cell: Cells.Of`)
+    // the parameter of that name, a positional one the next in order
+    List<Node> ps = new List<Node>();
     int i = 0;
     while (i < ctor.kids.Count) {
-        Node p = ctor.kids[i];
-        if (p.kind == AK.Param()) {
-            if (j < argc) {
-                Node arg = e.kids[j];
-                Node pt = p.type;
-                if (arg != null && arg.kind == AK.Lambda()) {
-                    if (pt == null || !IsDelegate(pt)) { return false; }
-                    if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
-                }
-                else {
-                    if (IsMethodGroup(arg)) {
-                        Node target = MethodGroupCallParam(ctor, e, j);
-                        if (target == null || ResolveMethodGroup(arg, target).method == null) { return false; }
-                    }
-                }
-            }
-            j = j + 1;
-        }
+        if (ctor.kids[i].kind == AK.Param()) { ps.Add(ctor.kids[i]); }
         i = i + 1;
+    }
+    int j = 0;
+    while (j < e.kids.Count) {
+        Node arg = e.kids[j];
+        int pi = j;
+        if (arg != null && arg.argName != null && arg.argName != "") {
+            pi = -1;
+            int k = 0;
+            while (k < ps.Count) { if (ps[k].sval == arg.argName) { pi = k; } k = k + 1; }
+            if (pi < 0) { return false; }
+        }
+        if (pi < ps.Count && arg != null) {
+            Node pt = ps[pi].type;
+            if (arg.kind == AK.Lambda()) {
+                if (pt == null || !IsDelegate(pt)) { return false; }
+                if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
+            }
+            else if (IsMethodGroup(arg)) {
+                Node target = MethodGroupCallParam(ctor, e, pi);
+                if (target == null || ResolveMethodGroup(arg, target).method == null) { return false; }
+            }
+        }
+        j = j + 1;
     }
     return true;
 }
@@ -1649,6 +1667,10 @@ int VSlotIndexM(Node cls, Node m) {
         if (VSlotMatches(cls, ms[i], m)) { return i; }
         i = i + 1;
     }
+    // a NON-virtual method never occupies a slot: the parent's plain
+    // `OnClick(Action)` must not dispatch through the child's virtual
+    // `OnClick(ChainEventValue)` just because the names agree
+    if (!IsVSlotIntro(m) && !IsOverride(m) && !IsAbstract(m)) { return -1; }
     int hit = 0 - 1;
     int n = 0;
     i = 0;
