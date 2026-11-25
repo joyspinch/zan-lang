@@ -969,6 +969,16 @@ b.weakF` 每执行一次泄漏一个对象，stdlib `LinkedList.Remove` 的
 `build/zan-lsp`。改前端后验证要 `cmake --build build --target zanc zan-lsp`，
 LSP 用例必须用**新编**的 zan-lsp 跑——旧产物照样"通过"，什么也证明不了。
 
+**普通构建也是 closed-world 反射：只经 Invoke 按名调用的方法须显式保留**（实证，2026-11-25）：
+非 `-g` 的普通构建与 `--publish` 同口径裁剪反射桩（`emit_target.c` 的 `closed_world`），
+静态上没人调用、只在标记里 `@click="HitMe"` 按名出现的方法，桩被裁掉后 `HasMethod`
+仍为真（对账通过），`Invoke` 却静默什么也不做——症状是"点了没反应"、不报错。
+`On<大写>` 名字被 `refl_is_framework_hook_name` 兜住，所以多数窗体看不出来。
+设计稿处理器名由 `zan_embed_collect_html_handlers_ex` 收集（工程 `src/` 递归 + 普通构建
+另扫显式输入所在目录本层，对齐运行期 `HtmlDocs.Find` 的查找面）；新增"只按名调用"的
+入口时同样要进这张保留表。探针写法注意：探针里顺手写一句 `obj.Invoke("名字")` 会
+让该名字静态可见、问题消失——复现要去掉一切同名字面量。
+
 ## 五、内建类型成员表与代码生成的一致性契约
 
 43. **内建成员表签名必须与实际发射的返回类型一致**：

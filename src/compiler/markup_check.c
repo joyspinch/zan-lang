@@ -262,12 +262,58 @@ static void mk_path(mk_t *M, const char *v, size_t vl, size_t voff, int code, co
     }
 }
 
-static void mk_attr(mk_t *M, const char *k, size_t kl, const char *v, size_t vl,
+/* 与运行期 ModelBindingDeclaration.ValidPath 同口径：点分标识符，字节 ≥128
+ * 算标识符字符，段首不能是数字，不去空白。 */
+static bool mk_valid_path(const char *v, size_t vl) {
+    size_t seg = 0;
+    for (size_t i = 0; i < vl; i++) {
+        unsigned char c = (unsigned char)v[i];
+        if (c == '.') {
+            if (seg == 0) return false;
+            seg = 0;
+            continue;
+        }
+        bool ident = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '_' || c >= 128;
+        if (!ident || (seg == 0 && c >= '0' && c <= '9')) return false;
+        seg++;
+    }
+    return seg > 0;
+}
+
+/* 运行期建树时 DeclareBinding 对非法路径/属性名抛 ArgumentException（开窗即崩）：
+ * 编译期先报。模板行内同样建绑定，一并查。 */
+static bool mk_binding_syntax(mk_t *M, const char *k, size_t kl, size_t koff,
+                              const char *v, size_t vl, size_t voff) {
+    size_t pstart = k[0] == ':' ? 1 : (kl > 4 ? 5 : kl);
+    const char *prop = k + pstart;
+    size_t pl = kl - pstart;
+    if (pl > 0 && (!mk_valid_path(prop, pl) || memchr(prop, '.', pl))) {
+        zan_diag_emit_code(M->diag, DIAG_ERROR, mk_loc(M, koff + pstart), 2115,
+                           "binding property '%.*s' in %s must be an identifier "
+                           "(write a static value as a plain attribute)",
+                           (int)pl, prop, M->shown);
+        M->errors++;
+        return false;
+    }
+    if (!mk_valid_path(v, vl)) {
+        zan_diag_emit_code(M->diag, DIAG_ERROR, mk_loc(M, voff), 2115,
+                           "binding '%.*s=\"%.*s\"' in %s must be a dotted model path, "
+                           "not an expression or literal",
+                           (int)kl, k, (int)vl, v, M->shown);
+        M->errors++;
+        return false;
+    }
+    return true;
+}
+
+static void mk_attr(mk_t *M, const char *k, size_t kl, size_t koff, const char *v, size_t vl,
                     size_t voff, bool in_template) {
     if (mk_is_event_attr(k, kl)) { mk_handler(M, v, vl, voff); return; }
-    if (in_template) return;  /* 模板行内绑定以行项为作用域 */
     bool bind = mk_ieq(k, kl, "bind") || (kl > 5 && mk_ieq(k, 5, "bind:")) ||
                 (kl > 1 && k[0] == ':');
+    if (bind && !mk_binding_syntax(M, k, kl, koff, v, vl, voff)) return;
+    if (in_template) return;  /* 模板行内绑定以行项为作用域 */
     if (bind && M->check_binds) { mk_path(M, v, vl, voff, 2113, "bind path segment"); return; }
     if (mk_ieq(k, kl, "z-mount") || mk_ieq(k, kl, "data-mount")) {
         size_t a = 0, b = vl;
@@ -338,7 +384,7 @@ static void mk_scan(mk_t *M) {
                     ve++;
                 p = ve;
             }
-            mk_attr(M, s + ks, ke - ks, s + vs, ve - vs, vs, tdepth > 0 || is_template);
+            mk_attr(M, s + ks, ke - ks, ks, s + vs, ve - vs, vs, tdepth > 0 || is_template);
         }
         i = p < len ? p + 1 : len;
         if (mk_ieq(s + t, te - t, "script")) { i = mk_skip_past(s, len, i, "</script"); continue; }

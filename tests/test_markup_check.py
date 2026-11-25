@@ -4,8 +4,9 @@ tests/diag/markup/TypoForm.zan 的同名 TypoForm.html 里写错了处理器名�
 （含下钻到用户类的第二段）与挂载字段：编译期必须逐条报在 .html 的属性值上
 （诊断码、行列、区间正好盖住写错的名字），补丁是拼写最近的成员；把补丁按 offset
 应用回 .html 后再编译必须通过。夹具里不该报的写法（注释、路由动作、带参调用、
-表达式、模板行内绑定、字符串登记的处理器、非窗体类、自定义 ViewModel 的子窗）
-一条都不能报。另验 --embed 配对：标记不在源文件旁边、经 --embed 给出时同样检查。"""
+模板行内绑定、字符串登记的处理器、非窗体类、自定义 ViewModel 的子窗）
+一条都不能报。另验 --embed 配对（标记不在源文件旁边、经 --embed 给出时同样检查），
+以及 ExprForm 的 E2115：绑定值是表达式/字面量、属性名带连字符（运行期建树会抛异常）。"""
 import argparse
 import json
 import os
@@ -18,7 +19,7 @@ WANT = [
     ('E2112', 5, 'OnLgin', 'OnLogin'),
     ('E2113', 9, 'showEror', 'showError'),
     ('E2113', 10, 'cty', 'city'),
-    ('E2114', 13, 'slott', 'slot'),
+    ('E2114', 12, 'slott', 'slot'),
 ]
 
 
@@ -76,8 +77,14 @@ def main():
     rc, diags = check(zanc, work, ['TypoForm.zan', '--embed', 'ui/TypoForm.html=TypoForm.html'])
     assert rc != 0 and [d['code'] for d in diags] == [w[0] for w in WANT], \
         [d['message'] for d in diags]
-    print('markup check: %d typos reported with fix-its, fixed markup compiles, --embed paired'
-          % len(WANT))
+    # E2115：表达式/字面量/带连字符的属性名/空段——运行期建树时 DeclareBinding 会抛异常
+    rc, diags = check(zanc, work, ['ExprForm.zan'])
+    got = [(d['code'], d['line']) for d in diags]
+    assert rc != 0 and got == [('E2115', 2), ('E2115', 3), ('E2115', 4), ('E2115', 5)], \
+        [d['message'] for d in diags]
+    assert not any(d.get('fixits') for d in diags), diags
+    print('markup check: %d typos reported with fix-its, fixed markup compiles, --embed paired,'
+          ' %d invalid bindings rejected' % (len(WANT), len(got)))
 
 
 if __name__ == '__main__':

@@ -533,13 +533,34 @@
 #ifdef ZAN_RT_MEM_OBJ
     irgen.route_fast_alloc = apple_route_fast_alloc;
 #endif
-    if (publish_mode && zan_inputs_use_design_doc(input_files, input_count)) {
+    /* 设计稿处理器只经 Invoke 按名调用、静态上不可见：closed-world 发射（publish
+     * 与普通构建同口径，见 emit_target.c）须按名保留反射桩，否则 HasMethod 对账
+     * 通过、点击却静默不执行。普通构建另扫显式输入所在目录本层——运行期
+     * HtmlDocs.Find 也认工作目录/源文件旁的裸名标记。 */
+    if (zan_inputs_use_design_doc(input_files, input_count)) {
         char handler_root[1024];
         zan_design_root_for(input_files[0], handler_root, sizeof(handler_root));
-        irgen.html_handler_count =
-            zan_embed_collect_html_handlers(handler_root, &irgen.html_handlers);
-        fprintf(stderr, "note: retained %d html event handler name(s) from %s/src\n",
-                irgen.html_handler_count, handler_root);
+        char input_dirs[8][1024];
+        const char *dir_list[8];
+        int dir_count = 0;
+        for (int fi = 0; !publish_mode && fi < explicit_input_count && dir_count < 8; fi++) {
+            if (zan_is_zcomp_path(input_files[fi])) continue;
+            const char *base = zan_path_basename(input_files[fi]);
+            size_t dl = (size_t)(base - input_files[fi]);
+            if (dl >= sizeof(input_dirs[0])) continue;
+            if (dl == 0) snprintf(input_dirs[dir_count], sizeof(input_dirs[0]), ".");
+            else snprintf(input_dirs[dir_count], sizeof(input_dirs[0]), "%.*s",
+                          (int)(dl - 1), input_files[fi]);
+            bool dup = false;
+            for (int k = 0; k < dir_count; k++)
+                if (strcmp(input_dirs[k], input_dirs[dir_count]) == 0) dup = true;
+            if (!dup) { dir_list[dir_count] = input_dirs[dir_count]; dir_count++; }
+        }
+        irgen.html_handler_count = zan_embed_collect_html_handlers_ex(
+            handler_root, dir_list, dir_count, &irgen.html_handlers);
+        if (publish_mode)
+            fprintf(stderr, "note: retained %d html event handler name(s) from %s/src\n",
+                    irgen.html_handler_count, handler_root);
     }
     irgen.irgen_checked_depth = checked_arith ? 1 : 0; /* B-ID76 */
     irgen.fp_contract = fp_contract;

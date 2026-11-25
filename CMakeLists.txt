@@ -1784,7 +1784,8 @@ set_tests_properties(diag_cw_bad_mount PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 # 运行期诊断：:prop="field" 引用不存在的字段 → 启动期 bind 对账 exit 1
-# （DocWire.CheckBinds；字面量/关键字/表达式不校验）。
+# （DocWire.CheckBinds）。静态值写普通属性（data-tip="literal"）——:属性 只收
+# 模型路径，表达式/字面量由 S20 编译期 E2115 拒绝、运行期建树抛异常。
 add_test(NAME diag_cw_bad_bindprop
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

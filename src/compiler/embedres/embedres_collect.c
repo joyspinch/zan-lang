@@ -245,11 +245,12 @@ typedef struct {
     int max_specs;
     int count;
     int truncated;
+    int max_depth;  /* 0 = 默认 24 层；1 = 只扫给定目录本层 */
 } design_scan_t;
 
 static void design_scan_impl(design_scan_t *s, const char *dir,
                              const char *rel, int depth) {
-    if (s->truncated || depth > 24) return;
+    if (s->truncated || depth > (s->max_depth ? s->max_depth : 24)) return;
 #ifdef _WIN32
     char pattern[1024];
     snprintf(pattern, sizeof(pattern), "%s\\*", dir);
@@ -385,9 +386,29 @@ static void handler_scan_text(const char *t, size_t len, char ***names,
 }
 
 int zan_embed_collect_html_handlers(const char *project_root, char ***out_names) {
+    return zan_embed_collect_html_handlers_ex(project_root, NULL, 0, out_names);
+}
+
+int zan_embed_collect_html_handlers_ex(const char *project_root,
+                                       const char *const *extra_dirs,
+                                       int extra_count, char ***out_names) {
     static char specs[256][1300];
-    int nd = zan_embed_collect_design_html(project_root, specs, 256);
-    if (nd < 0) nd = 256;
+    int nd = 0;
+    if (project_root) {
+        nd = zan_embed_collect_design_html(project_root, specs, 256);
+        if (nd < 0) nd = 256;
+    }
+    /* 运行期 HtmlDocs.Find 也认工作目录/源文件旁的裸名标记：输入所在目录本层 */
+    for (int k = 0; k < extra_count && nd < 256; k++) {
+        if (!extra_dirs[k]) continue;
+        design_scan_t s;
+        memset(&s, 0, sizeof(s));
+        s.specs = specs + nd;
+        s.max_specs = 256 - nd;
+        s.max_depth = 1;
+        design_scan_impl(&s, extra_dirs[k], "", 1);
+        nd += s.count;
+    }
     char **names = NULL;
     int count = 0, cap = 0;
     for (int i = 0; i < nd; i++) {

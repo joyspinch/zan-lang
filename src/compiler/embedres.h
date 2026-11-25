@@ -38,4 +38,9 @@ int zan_embed_collect_design_html(const char *project_root,
  * 静态上不可见，publish 须据此保留反射条目与 thunk。返回个数。 */
 int zan_embed_collect_html_handlers(const char *project_root, char ***out_names);
 
+/* 同上，另扫 extra_dirs 各目录本层的 *.html（不递归）；project_root 可为 NULL。 */
+int zan_embed_collect_html_handlers_ex(const char *project_root,
+                                       const char *const *extra_dirs,
+                                       int extra_count, char ***out_names);
+
 #endif /* ZAN_EMBEDRES_H */
